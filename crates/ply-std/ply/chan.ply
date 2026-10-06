@@ -1,0 +1,797 @@
+//! Channels between tasks: choosing among several, pipelines over them, and lists and sequences
+//! through them.
+//!
+//! The language makes a channel with `task.channel(n)`, which holds up to `n` values no receiver
+//! has taken (`0` hands each value from sender to receiver), and works it with `task.send`,
+//! `task.recv` and `task.close`. This module is what a program writes over those.
+//!
+//! Closing, once. A channel is closed by whoever sends on it, when there is no more to send:
+//! every function here that starts the tasks that send on a channel closes it when they have
+//! ended, and one that only receives never closes. A send on a closed channel is refused: `send`
+//! raises `chan.closed`, `try_send` answers `Refused`, and a select says `Closed`. A receive
+//! from a closed channel takes what was queued before the close, in order, and then answers the
+//! end, `None`, as often as it is asked.
+//!
+//! `select` goes on one of several channel operations, the first in the order its arms are
+//! given that can go. `select_from` is the fair one: it looks first at the arm a caller names,
+//! which is the one after the arm that went last, so an arm that stays ready goes within as many
+//! selects as there are arms. Nothing is drawn to decide it, so it is decided the same under
+//! `simulate` and under the scheduler a program runs on. The arms of one select carry one type;
+//! channels of different types are selected over as channels of one sum.
+//!
+//! A pipeline is tasks joined by channels, and each function here that starts one runs the rest
+//! of the pipeline as `inside`, handed the channel it writes: `from_list`, `stage`, `fan_out`,
+//! `in_order` and `merge` each end the tasks they started before they answer, as `std.task`'s
+//! `scoped` does. A task cancelled with a value in hand takes the value with it: one a sender
+//! was waiting to send, and one a receiver was answered and had not yet run on. The channel is
+//! as it would be had that send or that receive not been made, so what the other tasks send and
+//! receive is unchanged.
+
+import std.list (concat, drop, sort, take)
+import std.seq
+import std.seq (Seq, Done, Skip, Yield)
+import std.task
+import std.time (between, nanos_at)
+
+// --- Sending and receiving --------------------------------------------------
+
+/// How a channel operation of this module fails.
+pub effect chan {
+  /// The channel a value was sent on is closed.
+  raise closed()
+}
+
+/// Sends `x` on `c`, waiting for room. Raises `chan.closed` where `c` is closed.
+pub fn send<a>(c: Chan<a>, x: a) -> Unit / {task.send, chan.closed} =
+  if task.send(c, x) { () } else { chan.closed() }
+
+/// Sends each of `xs` on `c` in order, waiting for room for each. Raises `chan.closed` at the
+/// first that finds `c` closed; those before it were sent.
+pub fn send_all<a>(c: Chan<a>, xs: List<a>) -> Unit / {task.send, chan.closed} =
+  fold(xs, (), |_u: Unit, x: a| send(c, x))
+
+/// Sends each element of `s` on `c` in order, pulling at most `budget` elements and skips.
+/// Raises `seq.spent` where `s` has more, and `chan.closed` where `c` is closed.
+pub fn send_seq<a | e>(
+  c: Chan<a>,
+  s: Seq<a | e>,
+  budget: Int,
+) -> Unit / {task.send, chan.closed, seq::seq.spent | e} =
+  if fed(c, s, budget, budget) { () } else { chan.closed() }
+
+/// Sends the elements of `s` on `c` in order, pulling at most `left` more of `budget` elements
+/// and skips; whether `c` took them all.
+fn fed<a | e>(
+  c: Chan<a>,
+  s: Seq<a | e>,
+  budget: Int,
+  left: Int,
+) -> Bool / {task.send, seq::seq.spent | e} =
+  match s() {
+    Done -> true,
+    Skip(rest) -> if left <= 0 { seq::seq.spent(budget) } else { fed(c, rest, budget, left - 1) },
+    Yield(x, rest) -> if left <= 0 { seq::seq.spent(budget) }
+    else if task.send(c, x) { fed(c, rest, budget, left - 1) }
+    else { false },
+  }
+
+/// The values `c` carries from here until it is closed, as a sequence: each pull receives one,
+/// waiting for it.
+pub fn receiving<a>(c: Chan<a>) -> Seq<a | {task.recv}> =
+  seq::unfold((), |_u: Unit|
+    match task.recv(c) { Some(x) -> Some({ value: x, next: () }), None -> None })
+
+/// Every value `c` carries until it is closed, in order: at most `limit` of them, and
+/// `seq.spent` where it carries more.
+pub fn drain<a>(c: Chan<a>, limit: Int) -> List<a> / {task.recv, seq::seq.spent} =
+  seq::to_list(receiving(c), limit)
+
+/// What a receive that does not wait found.
+pub type Polled<a> =
+  /// A value was there.
+  | Got(a)
+  /// None was, and the channel is open.
+  | Empty
+  /// The channel is closed and holds nothing.
+  | Ended
+
+/// A value from `c` if one is there now.
+pub fn try_recv<a>(c: Chan<a>) -> Polled<a> / {task.select} =
+  match task.select([(c, None)], false) {
+    Some((_, Some(x))) -> Got(x),
+    Some((_, None)) -> Ended,
+    None -> Empty,
+  }
+
+/// What a send that does not wait met.
+pub type Offered =
+  /// The value was queued, or handed to a waiting receiver.
+  | Accepted
+  /// The channel had no room, and no receiver was waiting.
+  | Full
+  /// The channel is closed.
+  | Refused
+
+/// Sends `x` on `c` if it can go now.
+pub fn try_send<a>(c: Chan<a>, x: a) -> Offered / {task.select} =
+  match task.select([(c, Some(x))], false) {
+    Some((_, Some(_))) -> Accepted,
+    Some((_, None)) -> Refused,
+    None -> Full,
+  }
+
+// --- Choosing among channels ------------------------------------------------
+
+/// One thing a select may do: `receive` from a channel, or `sending` a value to one.
+pub type Arm<a> = (Chan<a>, Option<a>)
+
+/// The arm that receives from `c`.
+pub fn receive<a>(c: Chan<a>) -> Arm<a> = (c, None)
+
+/// The arm that sends `x` to `c`.
+pub fn sending<a>(c: Chan<a>, x: a) -> Arm<a> = (c, Some(x))
+
+/// What a select did, with the place of the arm that went among those it was given.
+pub type Selected<a> =
+  /// A receive took this value.
+  | Received(Int, a)
+  /// A send's value went.
+  | Sent(Int)
+  /// The arm's channel was closed: a receive found it closed and empty, or a send was refused.
+  | Closed(Int)
+
+/// Goes on the first of `arms`, in their order, that can go, waiting for one where none can. No
+/// arms at all is a wait nothing ends.
+pub fn select<a>(arms: List<Arm<a>>) -> Selected<a> / {task.select, abort.raise} =
+  select_from(0, arms)
+
+/// `select`, looking first at the arm at `first`, then at those after it, and then at those
+/// before. Handed `next_turn` of what it last answered, it gives every arm its turn: an arm that
+/// stays able to go goes within as many selects as there are arms.
+pub fn select_from<a>(first: Int, arms: List<Arm<a>>) -> Selected<a> / {task.select, abort.raise} =
+  match chosen(first, arms, [], true) {
+    Some(went) -> went,
+    None -> panic("a select that waits answers with the arm that went"),
+  }
+
+/// `select`, answering `None` at once where no arm can go.
+pub fn try_select<a>(arms: List<Arm<a>>) -> Option<Selected<a>> / {task.select, abort.raise} =
+  chosen(0, arms, [], false)
+
+/// `select_from`, answering `None` at once where no arm can go.
+pub fn try_select_from<a>(
+  first: Int,
+  arms: List<Arm<a>>,
+) -> Option<Selected<a>> / {task.select, abort.raise} = chosen(first, arms, [], false)
+
+/// Where `select_from` should look first after `went`: the arm after it.
+pub fn next_turn<a>(went: Selected<a>) -> Int =
+  match went { Received(at, _) -> at + 1, Sent(at) -> at + 1, Closed(at) -> at + 1 }
+
+/// `select_from`, giving up at `at`: `TimedOut` where no arm could go by then, though an arm
+/// that can go at that instant may still be the one that goes. Where the deadline around the
+/// call is no later than `at`, that deadline is the one that stops it, as it stops any wait.
+pub fn select_until<a>(
+  at: Instant,
+  first: Int,
+  arms: List<Arm<a>>,
+) -> task::Timed<Selected<a>> / {task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+  match task::deadline.at() {
+    // What set a deadline at or before `at` stops this call's task at it.
+    Some(outer) if nanos_at(outer) <= nanos_at(at) -> task::Done(select_from(first, arms)),
+    _ -> {
+      let left = between(clock.now(), at);
+      let bell: Chan<a> = task.channel(0);
+      task::scoped(
+        [
+          || {
+            clock.sleep(left);
+            task.close(bell)
+          },
+        ],
+        |_timer: List<Task<Unit>>|
+          match chosen(first, arms, [(bell, None)], true) {
+            Some(Closed(rang)) -> if rang == len(arms) { task::TimedOut }
+            else { task::Done(Closed(rang)) },
+            Some(went) -> task::Done(went),
+            None -> panic("a select that waits answers with the arm that went"),
+          },
+      )
+    },
+  }
+
+/// The select over `arms` turned to start at `first`, with `last` after them all, each arm
+/// reported at its own place: `last`'s are past the end of `arms`.
+fn chosen<a>(
+  first: Int,
+  arms: List<Arm<a>>,
+  last: List<Arm<a>>,
+  wait: Bool,
+) -> Option<Selected<a>> / {task.select, abort.raise} = {
+  let n = len(arms);
+  let turn = if n == 0 { 0 } else { (first % n + n) % n };
+  let turned = concat(concat(drop(arms, turn), take(arms, turn)), last);
+  match task.select(turned, wait) {
+    None -> None,
+    Some((went, got)) -> {
+      let at = if went >= n { went } else { (went + turn) % n };
+      Some(match ((got, list_at(turned, went))) {
+        (None, _) -> Closed(at),
+        (Some(x), Some((_, None))) -> Received(at, x),
+        (Some(_), _) -> Sent(at),
+      })
+    },
+  }
+}
+
+// --- Pipelines --------------------------------------------------------------
+
+/// What `inside` answers, handed a channel of room `capacity` that a task feeds each of `xs` in
+/// order and then closes. The task has ended when this answers.
+pub fn from_list<a, r | e>(
+  xs: List<a>,
+  capacity: Int,
+  inside: (Chan<a>) -> r / {task.write, abort.raise | e},
+) -> r / {task.write, abort.raise | e} = {
+  let out = task.channel(capacity);
+  task::scoped(
+    [
+      || {
+        fold(xs, true, |open: Bool, x: a| open && task.send(out, x));
+        task.close(out)
+      },
+    ],
+    |_feeder: List<Task<Unit>>| inside(out),
+  )
+}
+
+/// `from_list` of the elements of `s`, pulled as the channel takes them: at most `budget`
+/// elements and skips, the feeding task raising `seq.spent` where `s` has more.
+pub fn from_seq<a, r | e>(
+  s: Seq<a | e>,
+  budget: Int,
+  capacity: Int,
+  inside: (Chan<a>) -> r / {task.write, abort.raise, seq::seq.spent | e},
+) -> r / {task.write, abort.raise, seq::seq.spent | e} = {
+  let out = task.channel(capacity);
+  task::scoped(
+    [
+      || {
+        fed(out, s, budget, budget);
+        task.close(out)
+      },
+    ],
+    |_feeder: List<Task<Unit>>| inside(out),
+  )
+}
+
+/// What `inside` answers, handed a channel of room `capacity` that carries `f` of each value
+/// `input` does, in order: one task receives, applies `f` and sends, and closes the channel when
+/// `input` ends. The task has ended when this answers.
+pub fn stage<a, b, r | e>(
+  input: Chan<a>,
+  capacity: Int,
+  f: (a) -> b / e,
+  inside: (Chan<b>) -> r / {task.write, abort.raise, diverges | e},
+) -> r / {task.write, abort.raise, diverges | e} = {
+  let out = task.channel(capacity);
+  task::scoped(
+    [
+      || {
+        worked(input, out, f);
+        task.close(out)
+      },
+    ],
+    |_worker: List<Task<Unit>>| inside(out),
+  )
+}
+
+/// `stage` by `workers` tasks that share `input`: `f` runs on at most that many values at once,
+/// and its answers are carried in the order they are finished. The channel is closed when
+/// `input` has ended and every worker has sent what it had. Raises for no workers.
+pub fn fan_out<a, b, r | e>(
+  input: Chan<a>,
+  workers: Int,
+  capacity: Int,
+  f: (a) -> b / e,
+  inside: (Chan<b>) -> r / {task.write, abort.raise, diverges | e},
+) -> r / {task.write, abort.raise, diverges | e} =
+  if workers < 1 { panic("a channel is worked by at least one task") } else {
+    let out = task.channel(capacity);
+    task::scoped(
+      [
+        || {
+          task::all(map(range(0, workers), |_i: Int| || worked(input, out, f)));
+          task.close(out)
+        },
+      ],
+      |_pool: List<Task<Unit>>| inside(out),
+    )
+  }
+
+/// `fan_out` whose answers are carried in the order their values came on `input`. At most
+/// `workers + capacity` values are between being taken from `input` and being sent on, so that
+/// many answers at most wait out of order for an earlier one.
+pub fn in_order<a, b, r | e>(
+  input: Chan<a>,
+  workers: Int,
+  capacity: Int,
+  f: (a) -> b / e,
+  inside: (Chan<b>) -> r / {task.write, abort.raise, diverges | e},
+) -> r / {task.write, abort.raise, diverges | e} =
+  if workers < 1 { panic("a channel is worked by at least one task") } else {
+    let out = task.channel(capacity);
+    let numbered = task.channel(0);
+    let finished = task.channel(0);
+    let taken = task.channel(workers + capacity);
+    task::scoped(
+      [
+        || {
+          numbering(input, numbered, taken, 0);
+          task.close(numbered)
+        },
+        || {
+          task::all(
+            map(range(0, workers), |_i: Int|
+              || worked(numbered, finished, |job: (Int, a)| (job._0, f(job._1)))),
+          );
+          task.close(finished)
+        },
+        || {
+          ordering(finished, out, taken, map_new(), 0);
+          task.close(out)
+        },
+      ],
+      |_tasks: List<Task<Unit>>| inside(out),
+    )
+  }
+
+/// What `inside` answers, handed a channel of room `capacity` that carries every value of every
+/// one of `inputs`, each input's in its own order, taking from them in turn. One task moves
+/// them, and closes the channel when every input has ended.
+pub fn merge<a, r | e>(
+  inputs: List<Chan<a>>,
+  capacity: Int,
+  inside: (Chan<a>) -> r / {task.write, abort.raise, diverges | e},
+) -> r / {task.write, abort.raise, diverges | e} = {
+  let out = task.channel(capacity);
+  task::scoped(
+    [
+      || {
+        merged(inputs, out, 0);
+        task.close(out)
+      },
+    ],
+    |_merger: List<Task<Unit>>| inside(out),
+  )
+}
+
+/// Sends `f` of each value of `input` on `out` until `input` ends or `out` is closed.
+fn worked<a, b | e>(
+  input: Chan<a>,
+  out: Chan<b>,
+  f: (a) -> b / e,
+) -> Unit / {task.write, diverges | e} =
+  match task.recv(input) {
+    Some(x) -> if task.send(out, f(x)) { worked(input, out, f) } else { () },
+    None -> (),
+  }
+
+/// Sends each value of `input` on `out` beside its place, from `next`, after taking room for it
+/// in `taken`.
+fn numbering<a>(
+  input: Chan<a>,
+  out: Chan<(Int, a)>,
+  taken: Chan<Unit>,
+  next: Int,
+) -> Unit / {task.write, diverges} =
+  match task.recv(input) {
+    Some(x) -> if task.send(taken, ()) && task.send(out, (next, x)) {
+      numbering(input, out, taken, next + 1)
+    } else { () },
+    None -> (),
+  }
+
+/// Sends the values of `finished` on `out` in the order of their places, from `next`, holding
+/// those that came early in `held`, and gives back the room in `taken` of each one sent.
+fn ordering<b>(
+  finished: Chan<(Int, b)>,
+  out: Chan<b>,
+  taken: Chan<Unit>,
+  held: Map<Int, b>,
+  next: Int,
+) -> Unit / {task.write, diverges} =
+  match map_get(held, next) {
+    Some(ready) -> if task.send(out, ready) {
+      task.recv(taken);
+      ordering(finished, out, taken, map_remove(held, next), next + 1)
+    } else { () },
+    None -> match task.recv(finished) {
+      Some(done) -> ordering(finished, out, taken, map_insert(held, done._0, done._1), next),
+      None -> (),
+    },
+  }
+
+/// Moves every value of `inputs` to `out`, looking first at the input at `turn`, until all have
+/// ended or `out` is closed.
+fn merged<a>(
+  inputs: List<Chan<a>>,
+  out: Chan<a>,
+  turn: Int,
+) -> Unit / {task.write, abort.raise, diverges} =
+  if len(inputs) == 0 { () } else {
+    match select_from(turn, map(inputs, |input: Chan<a>| receive(input))) {
+      Received(at, x) -> if task.send(out, x) { merged(inputs, out, at + 1) } else { () },
+      Closed(at) -> merged(concat(take(inputs, at), drop(inputs, at + 1)), out, at),
+      Sent(_) -> (),
+    }
+  }
+
+// --- Tests: what the language's channels do ---------------------------------
+
+test "a sender to a full channel waits until a receive makes room" {
+  with_cell[seen]([]) { c -> {
+    simulate {
+      let ch = task.channel(1);
+      let sender = task.spawn(|| {
+        task.send(ch, 1);
+        cell_set(c, push(cell_get(c), "sent 1"));
+        task.send(ch, 2);
+        cell_set(c, push(cell_get(c), "sent 2"))
+      });
+      clock.sleep(Duration(1));
+      assert_eq(cell_get(c), ["sent 1"]);
+      assert_eq(try_send(ch, 9), Full);
+      assert_eq(task.recv(ch), Some(1));
+      task.join(sender);
+      assert_eq(cell_get(c), ["sent 1", "sent 2"]);
+      assert_eq(task.recv(ch), Some(2))
+    }
+  } }
+}
+
+test "a closed channel refuses a send, gives up what was queued in order, and then answers the end" {
+  simulate {
+    let ch = task.channel(2);
+    assert_eq(try { send_all(ch, [1, 2]) }, Ok(()));
+    task.close(ch);
+    assert_eq(try { send(ch, 3) }, Err(()));
+    assert_eq(try_send(ch, 3), Refused);
+    assert_eq(task.recv(ch), Some(1));
+    assert_eq(try_recv(ch), Got(2));
+    assert_eq(task.recv(ch), None);
+    assert_eq(try_recv(ch), Ended)
+  }
+}
+
+/// A count small enough that a law runs every interleaving at each one.
+type Few = | Zero | One | Two
+
+fn count(n: Few) -> Int = match n { Zero -> 0, One -> 1, Two -> 2 }
+
+fn sent_from(from: Int, n: Int) -> List<Int> = map(range(0, n), |i: Int| from + i)
+
+law "every value sent is received once, each sender's in the order it sent them, in every interleaving"
+  forall (room: Few, first: Few, second: Few) where count(first) + count(second) <= 2 {
+    simulate {
+      let ch = task.channel(count(room));
+      let low = sent_from(0, count(first));
+      let high = sent_from(100, count(second));
+      let sender = |xs: List<Int>|
+        ||
+          fold(xs, (), |_u: Unit, x: Int| {
+            task.send(ch, x);
+            ()
+          });
+      let got = task::scoped([sender(low), sender(high)], |_senders: List<Task<Unit>>|
+        map(range(0, len(low) + len(high)), |_i: Int|
+          match task.recv(ch) { Some(x) -> x, None -> 0 - 1 }));
+      filter(got, |x: Int| x < 100) == low && filter(got, |x: Int| x >= 100) == high
+    }
+  }
+
+law "a channel never holds more values than its capacity, in every interleaving"
+  forall (room: Few, values: Few) {
+    simulate {
+      with_cell[held]({ sent: 0, asked: 0, most: 0 }) { h -> {
+        let ch = task.channel(count(room));
+        let n = count(values);
+        task::scoped(
+          [
+            ||
+              fold(range(0, n), (), |_u: Unit, i: Int| {
+                task.send(ch, i);
+                let now = cell_get(h);
+                cell_set(h, {
+                  ..now,
+                  sent: now.sent + 1,
+                  most: max(now.most, now.sent + 1 - now.asked),
+                })
+              }),
+          ],
+          |_sender: List<Task<Unit>>|
+            fold(range(0, n), (), |_u: Unit, _i: Int| {
+              cell_set(h, { ..cell_get(h), asked: cell_get(h).asked + 1 });
+              task.recv(ch);
+              ()
+            }),
+        );
+        cell_get(h).most <= count(room)
+      } }
+    }
+  }
+
+test "a task cancelled while it waits to send or to receive leaves the channel as it was" {
+  simulate {
+    let ch = task.channel(1);
+    assert_eq(try_send(ch, 1), Accepted);
+    let sender = task.spawn(|| task.send(ch, 2));
+    clock.sleep(Duration(1));
+    assert(task.cancel(sender));
+    assert_eq(task.await(sender), None);
+    assert_eq(try_recv(ch), Got(1));
+    assert_eq(try_recv(ch), Empty);
+    let receiver = task.spawn(|| task.recv(ch));
+    clock.sleep(Duration(1));
+    assert(task.cancel(receiver));
+    assert_eq(task.await(receiver), None);
+    assert_eq(try_send(ch, 3), Accepted);
+    assert_eq(try_recv(ch), Got(3))
+  }
+}
+
+test "a sender cancelled anywhere has sent its value whole or not at all, in every interleaving" {
+  simulate {
+    let ch = task.channel(1);
+    let sender = task.spawn(|| task.send(ch, 1));
+    task.cancel(sender);
+    let sent = task.await(sender);
+    let held = try_recv(ch);
+    assert(held == Empty || held == Got(1));
+    assert(sent != Some(true) || held == Got(1));
+    assert_eq(try_send(ch, 2), Accepted);
+    assert_eq(try_recv(ch), Got(2));
+    assert_eq(try_recv(ch), Empty)
+  }
+}
+
+// --- Tests of choosing ------------------------------------------------------
+
+test "a select says which arm went and what it did there" {
+  simulate {
+    let a = task.channel(1);
+    let b = task.channel(1);
+    assert_eq(try_select([receive(a), receive(b)]), None);
+    assert_eq(select([receive(a), sending(b, 5)]), Sent(1));
+    assert_eq(select([receive(a), receive(b)]), Received(1, 5));
+    assert_eq(try_send(a, 7), Accepted);
+    assert_eq(select([receive(b), receive(a)]), Received(1, 7));
+    task.close(a);
+    assert_eq(select([receive(b), sending(a, 8)]), Closed(1));
+    assert_eq(select([receive(b), receive(a)]), Closed(1))
+  }
+}
+
+test "a select takes its arms in the order given: the first that can go, each time" {
+  simulate {
+    let a = task.channel(3);
+    let b = task.channel(3);
+    send_all(a, [1, 2, 3]);
+    send_all(b, [4, 5, 6]);
+    let went = map(range(0, 3), |_i: Int| select([receive(a), receive(b)]));
+    assert_eq(went, [Received(0, 1), Received(0, 2), Received(0, 3)])
+  }
+}
+
+law "an arm that stays ready goes within as many fair selects as there are arms"
+  forall (others: Few, start: Few) {
+    simulate {
+      let n = count(others) + 1;
+      let ready = map(range(0, n), |i: Int| {
+        let c = task.channel(n);
+        fold(range(0, n), (), |_u: Unit, _j: Int| {
+          task.send(c, i);
+          ()
+        });
+        c
+      });
+      let went = fold(
+        range(0, n),
+        { turn: count(start), seen: [] },
+        |so_far: { turn: Int, seen: List<Int> }, _i: Int| {
+          let chose = select_from(so_far.turn, map(ready, |c: Chan<Int>| receive(c)));
+          match chose {
+            Received(at, from) ->
+              { turn: next_turn(chose), seen: if at == from { push(so_far.seen, at) } else { [] } },
+            _ -> { turn: so_far.turn, seen: [] },
+          }
+        },
+      );
+      sort(went.seen) == range(0, n)
+    }
+  }
+
+test "a select with a deadline gives up at it on the virtual clock" {
+  simulate {
+    task::unbounded(|| {
+      let quiet: Chan<Int> = task.channel(0);
+      assert_eq(select_until(Instant(30), 0, [receive(quiet)]), task::TimedOut);
+      assert_eq(clock.now(), Instant(30))
+    })
+  }
+}
+
+test "a select with a deadline goes on an arm made ready before it" {
+  simulate {
+    task::unbounded(|| {
+      let c = task.channel(0);
+      let late = task.spawn(|| {
+        clock.sleep(Duration(10));
+        task.send(c, 4)
+      });
+      assert_eq(select_until(Instant(30), 0, [receive(c)]), task::Done(Received(0, 4)));
+      assert_eq(clock.now(), Instant(10));
+      assert(task.join(late))
+    })
+  }
+}
+
+test "a select with a deadline is held to an earlier deadline around it" {
+  simulate {
+    task::unbounded(|| {
+      let quiet: Chan<Int> = task.channel(0);
+      let held = task::until(Instant(20), || select_until(Instant(90), 0, [receive(quiet)]));
+      assert_eq((held, clock.now()), (task::TimedOut, Instant(20)))
+    })
+  }
+}
+
+// --- Tests of lists, sequences and pipelines --------------------------------
+
+/// A closed channel holding `xs`, so a test of one pipeline step runs that step's tasks alone.
+fn filled(xs: List<Int>) -> Chan<Int> / {task.write, abort.raise} = {
+  let c = task.channel(len(xs));
+  fold(xs, (), |_u: Unit, x: Int| {
+    task.send(c, x);
+    ()
+  });
+  task.close(c);
+  c
+}
+
+test "a producer and a consumer pass every value in order, in every interleaving" {
+  simulate { assert_eq(from_list([1, 2, 3], 0, |c: Chan<Int>| drain(c, 10)), [1, 2, 3]) }
+}
+
+test "a sequence goes through a channel and comes out a list" {
+  simulate {
+    let squares = seq::map(seq::range(0, 3), |i: Int| i * i);
+    assert_eq(from_seq(squares, 10, 1, |c: Chan<Int>| drain(c, 10)), [0, 1, 4])
+  }
+}
+
+test "a drain past its limit raises rather than answer part of what the channel carries" {
+  simulate { assert_eq(try { drain(filled([1, 2, 3]), 2) }, Err(2)) }
+}
+
+test "a stage carries its function of each value in order, in every interleaving" {
+  simulate {
+    let got = stage(filled([1, 2, 3]), 0, |x: Int| x * 2, |doubled: Chan<Int>| drain(doubled, 10));
+    assert_eq(got, [2, 4, 6])
+  }
+}
+
+law "a pipeline of a source, a stage and a drain carries every value through in order"
+  forall (values: Few) {
+    simulate {
+      let sent = sent_from(1, count(values));
+      let got = from_list(sent, 0, |input: Chan<Int>|
+        stage(input, 0, |x: Int| x * 2, |doubled: Chan<Int>| drain(doubled, 10)));
+      got == map(sent, |x: Int| x * 2)
+    }
+  }
+
+test "a stage whose reader leaves early is ended, and takes nothing more" {
+  simulate {
+    let input = filled([1, 2, 3]);
+    let first = stage(input, 0, |x: Int| x * 2, |doubled: Chan<Int>| task.recv(doubled));
+    assert_eq(first, Some(2));
+    let left = drain(input, 10);
+    clock.sleep(Duration(100));
+    assert(left == [2, 3] || left == [3]);
+    assert_eq(try_recv(input), Ended)
+  }
+}
+
+law "merge carries every value of every input once, each input's in its order, in every interleaving"
+  forall (first: Few, second: Few) {
+    simulate {
+      let low = sent_from(0, count(first));
+      let high = sent_from(100, count(second));
+      let got = merge([filled(low), filled(high)], 0, |out: Chan<Int>| drain(out, 10));
+      filter(got, |x: Int| x < 100) == low && filter(got, |x: Int| x >= 100) == high
+    }
+  }
+
+test "merge takes from its inputs in turn while each has a value" {
+  simulate {
+    let got = merge([filled([1, 2]), filled([10, 20])], 4, |out: Chan<Int>| {
+      clock.sleep(Duration(1));
+      drain(out, 10)
+    });
+    assert_eq(got, [1, 10, 2, 20])
+  }
+}
+
+law "fan_out runs its function on no more values at once than it has workers, and carries every answer"
+  forall (jobs: Few, workers: Few) where workers != Zero && (jobs != Two || workers != Two) {
+    simulate {
+      with_cell[gauge]({ inside: 0, most: 0 }) { g -> {
+        let n = count(jobs);
+        let got = fan_out(
+          filled(range(0, n)),
+          count(workers),
+          n,
+          |x: Int| {
+            let now = cell_get(g);
+            cell_set(g, { inside: now.inside + 1, most: max(now.most, now.inside + 1) });
+            task.yield();
+            cell_set(g, { ..cell_get(g), inside: cell_get(g).inside - 1 });
+            x * 2
+          },
+          |out: Chan<Int>| drain(out, 10),
+        );
+        sort(got) == map(range(0, n), |x: Int| x * 2) && cell_get(g).most <= count(workers)
+      } }
+    }
+  }
+
+test "fan_out carries its answers in the order the workers finish them" {
+  simulate {
+    let got = fan_out(
+      filled([20, 10]),
+      2,
+      2,
+      |takes: Int| {
+        clock.sleep(Duration(takes));
+        takes + 1
+      },
+      |out: Chan<Int>| {
+        clock.sleep(Duration(100));
+        drain(out, 10)
+      },
+    );
+    assert_eq(got, [11, 21])
+  }
+}
+
+test "what the workers of in_order finish out of order is sent on in the order of its places" {
+  simulate {
+    let finished = task.channel(3);
+    fold([(2, 30), (0, 10), (1, 20)], (), |_u: Unit, done: (Int, Int)| {
+      task.send(finished, done);
+      ()
+    });
+    task.close(finished);
+    let taken = task.channel(3);
+    fold(range(0, 3), (), |_u: Unit, _i: Int| {
+      task.send(taken, ());
+      ()
+    });
+    let out = task.channel(3);
+    ordering(finished, out, taken, map_new(), 0);
+    task.close(out);
+    assert_eq(drain(out, 10), [10, 20, 30]);
+    assert_eq(try_recv(taken), Empty)
+  }
+}
+
+law "in_order carries the answer to every value in the order the values came"
+  forall (values: Few, workers: Few) where workers != Zero {
+    simulate {
+      let sent = sent_from(1, count(values));
+      let got = in_order(filled(sent), count(workers), 1, |x: Int| x * 2, |out: Chan<Int>|
+        drain(out, 10));
+      got == map(sent, |x: Int| x * 2)
+    }
+  }

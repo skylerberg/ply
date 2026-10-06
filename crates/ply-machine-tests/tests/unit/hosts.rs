@@ -186,14 +186,24 @@ fn the_digest_moves_when_a_flag_alone_moves() {
     assert!(secrets.rows[0].secrets);
 }
 
+/// A credential crosses the boundary to these and to nothing else: each hashes the password it is
+/// handed and answers the hash, which is one-way in it.
 #[test]
-fn no_shipped_registration_declares_that_it_may_receive_a_credential() {
+fn only_the_password_hashes_declare_that_they_may_receive_a_credential() {
     let claiming: Vec<&str> = ply_machine::hosts::registry()
         .ops()
         .filter(|op| op.secrets)
         .map(|op| op.path)
         .collect();
-    assert!(claiming.is_empty(), "{claiming:?}");
+    assert_eq!(
+        claiming,
+        [
+            "ply_host::password::argon2",
+            "ply_host::password::scrypt",
+            "ply_host::password::bcrypt",
+            "ply_host::password::pbkdf2",
+        ]
+    );
 }
 
 /// A registry with nothing in it and one nothing in the program reaches are both empty listings,
