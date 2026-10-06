@@ -36,6 +36,18 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
         [
             // A socket's port is fixed while it is open, so reading it again reads the same one.
             "std.net.net.local_port[..]",
+            // So are its two addresses and who holds its far end; its options are read as they
+            // stand, and reading them sets none.
+            "std.net.net.local_address[..]",
+            "std.net.net.peer_address[..]",
+            "std.net.net.peer_credentials[..]",
+            "std.net.net.options[..]",
+            // A question to a resolver changes nothing it asks about.
+            "std.dns.dns.lookup[..]",
+            "std.dns.dns.reverse[..]",
+            "std.dns.dns.servers[..]",
+            "std.udp.udp.local_address[..]",
+            "std.udp.udp.options[..]",
             "std.config.config.get[..]",
             "std.config.config.secret[..]",
             "task.spawn[..]",

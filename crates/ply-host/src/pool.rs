@@ -62,6 +62,8 @@ pub enum JobOutput {
     /// `None` when the child was still running at the deadline.
     MaybeFinished(Option<Finished>),
     Heard(Heard),
+    /// An answer of the facility's own shape, built where the `Value` will live.
+    Made(Box<dyn FnOnce() -> Value + Send>),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
@@ -368,6 +370,7 @@ fn take(state: &mut State, token: u64) -> Taken {
         JobOutput::Finished(exit) => Ok(finished(exit)),
         JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
         JobOutput::Heard(heard) => Ok(heard_value(heard)),
+        JobOutput::Made(make) => Ok(make()),
         JobOutput::Refused(diagnostic) => Err(diagnostic),
         JobOutput::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,

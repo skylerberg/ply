@@ -1,0 +1,249 @@
+//! Names looked up: what the system's resolver answers, as an effect of its own.
+//!
+//! `dns.lookup` asks the system's resolver for a name's addresses, as a connection by name does,
+//! so it reads the hosts file and whatever else the machine is configured with. The addresses come
+//! back as `std.ip` values in the order the resolver gave them, which is its policy's order; a
+//! text that is already an address answers itself and asks nothing. `dns.reverse` is the names an
+//! address answers to. The system's resolver says nothing of how long an answer holds, so a
+//! `Found` from it has no `ttl`; a record read off the wire by `std.resolver` has one. Each
+//! operation takes its deadline in milliseconds, and one at or below zero is a runtime error.
+//!
+//! A lookup is a `read` with no label: a row that names `dns.lookup` says a definition may ask a
+//! resolver, and a deterministic test answers it from a `Table`, a resolver as a value, with
+//! `on_table`. `std.net`'s `dial` looks a name up through this effect, so the table a test hands
+//! it decides where a name connects, and `net::on_mem` answers both from one.
+//!
+//! `interleave` orders addresses the way a connector should try them: the families alternating
+//! from the resolver's first choice, each family in the order it was given (RFC 8305 §4), so one
+//! family that does not route costs one attempt and not a list of them.
+//!
+//! Records the system's resolver does not offer (MX, TXT, SRV, CNAME) are `std.resolver`'s, which
+//! asks a server itself.
+
+import std.ip
+import std.ip (Ip, SocketAddress, ip)
+import std.list (concat, sort, take)
+import std.string (ascii_lower)
+
+/// One address a name resolves to, and how long the answer holds where the resolver says.
+pub type Found = { address: Ip, ttl: Option<Duration> }
+
+/// Why a lookup has no answer.
+pub type Failure =
+  /// No such name.
+  | NoSuchName
+  /// The name is there and holds nothing of the kind asked for.
+  | NoData
+  /// A server failed or refused the question.
+  | ServerFailure
+  /// No answer came before the deadline.
+  | TimedOut
+  /// The resolver failed for a reason of its own: its code, and what it says.
+  | Other(Int, String)
+
+/// The system's resolver.
+pub nondet effect dns {
+  /// The addresses of `name`, in the order the system's resolver gives them. An address written
+  /// as text answers itself. Never an empty `Ok`: a name with no address is `NoData` or
+  /// `NoSuchName`.
+  read lookup(name: String, timeout_ms: Int) -> Result<List<Found>, Failure>
+  /// The names `address` answers to, most often one.
+  read reverse(address: Ip, timeout_ms: Int) -> Result<List<String>, Failure>
+  /// The servers the system's resolver is configured to ask, in its order; empty where the host
+  /// has no list to read.
+  read servers() -> List<SocketAddress>
+}
+
+/// The addresses of `found`, without their lifetimes.
+pub fn addresses(found: List<Found>) -> List<Ip> = map(found, |f: Found| f.address)
+
+/// `addresses` in the order to try them: the first as given, then the families alternating, each
+/// in the order it was given.
+pub fn interleave(addresses: List<Ip>) -> List<Ip> =
+  match addresses {
+    [] -> [],
+    [first, ..] -> {
+      let same = filter(addresses, |a: Ip| same_family(a, first));
+      let other = filter(addresses, |a: Ip| !same_family(a, first));
+      alternated(same, other)
+    },
+  }
+
+fn same_family(a: Ip, b: Ip) -> Bool = ip::bit_width(a) == ip::bit_width(b)
+
+fn alternated(first: List<Ip>, second: List<Ip>) -> List<Ip> =
+  match first { [] -> second, [head, ..rest] -> concat([head], alternated(second, rest)) }
+
+// --- The twin ---------------------------------------------------------------
+
+/// A resolver as a value: what each name and each address answers, and the servers it says it
+/// asks. A name is held in lower case without a final dot, which is how it is looked up.
+pub type Table = {
+  names: Map<String, Result<List<Found>, Failure>>,
+  reversed: Map<Ip, List<String>>,
+  servers: List<SocketAddress>,
+}
+
+/// A resolver that knows no name.
+pub fn table() -> Table = { names: map_new(), reversed: map_new(), servers: [] }
+
+/// The name as a table holds it.
+fn held(name: String) -> String / {abort.raise} = {
+  let lower = ascii_lower(name);
+  if string_ends_with(lower, ".") { string_slice(lower, 0, string_len(lower) - 1) } else { lower }
+}
+
+/// The table with `name` resolving to `addresses` in that order, none of them with a lifetime.
+/// A name given no address answers `NoData`.
+pub fn with_name(t: Table, name: String, addresses: List<Ip>) -> Table / {abort.raise} =
+  with_found(t, name, map(addresses, |a: Ip| { address: a, ttl: None }))
+
+/// The table with `name` resolving to `found`, each with the lifetime it says.
+pub fn with_found(t: Table, name: String, found: List<Found>) -> Table / {abort.raise} =
+  {
+    ..t,
+    names: map_insert(t.names, held(name), if len(found) == 0 { Err(NoData) } else { Ok(found) }),
+  }
+
+/// The table with a lookup of `name` failing with `why`.
+pub fn with_failure(t: Table, name: String, why: Failure) -> Table / {abort.raise} =
+  { ..t, names: map_insert(t.names, held(name), Err(why)) }
+
+/// The table with `address` answering to `names`.
+pub fn with_reverse(t: Table, address: Ip, names: List<String>) -> Table =
+  { ..t, reversed: map_insert(t.reversed, address, names) }
+
+/// The table saying it asks `servers`.
+pub fn with_servers(t: Table, servers: List<SocketAddress>) -> Table = { ..t, servers: servers }
+
+/// What `dns.lookup` answers over the table: an address written as text is itself, a name the
+/// table holds is what it was given, and any other is `NoSuchName`.
+pub fn table_lookup(t: Table, name: String) -> Result<List<Found>, Failure> / {abort.raise} =
+  match ip::parse(name) {
+    Ok(address) -> Ok([{ address: address, ttl: None }]),
+    Err(_) -> match map_get(t.names, held(name)) {
+      Some(answer) -> answer,
+      None -> Err(NoSuchName),
+    },
+  }
+
+/// What `dns.reverse` answers over the table.
+pub fn table_reverse(t: Table, address: Ip) -> Result<List<String>, Failure> =
+  match map_get(t.reversed, address) {
+    Some(names) -> if len(names) == 0 { Err(NoData) } else { Ok(names) },
+    None -> Err(NoSuchName),
+  }
+
+/// A deadline the host would refuse is refused in its words, so a twin run fails where a host run
+/// would.
+fn bounded(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
+  if timeout_ms <= 0 {
+    panic(
+      "`dns." ++ operation ++ "` was given a timeout of " ++ int_to_string(timeout_ms)
+        ++ " milliseconds",
+    )
+  } else { () }
+
+/// `go` with every lookup answered by the table.
+pub fn on_table<a | e>(
+  t: Table,
+  go: () -> a / {dns.lookup, dns.reverse, dns.servers | e},
+) -> a / {abort.raise | e bounded} =
+  handle {
+    go()
+  } with {
+    dns.lookup(name, timeout_ms) -> {
+      bounded("lookup", timeout_ms);
+      table_lookup(t, name)
+    },
+    dns.reverse(address, timeout_ms) -> {
+      bounded("reverse", timeout_ms);
+      table_reverse(t, address)
+    },
+    dns.servers() -> t.servers,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn interleaved(written: List<String>) -> List<String> / {ip.refused, abort.raise} =
+  map(interleave(map(written, ip::read)), ip::render)
+
+test "the families alternate from the resolver's first choice, each in its own order" {
+  assert_eq(interleaved([]), []);
+  assert_eq(interleaved(["192.0.2.1"]), ["192.0.2.1"]);
+  assert_eq(
+    interleaved(["2001:db8::1", "2001:db8::2", "2001:db8::3", "192.0.2.1", "192.0.2.2"]),
+    ["2001:db8::1", "192.0.2.1", "2001:db8::2", "192.0.2.2", "2001:db8::3"],
+  );
+  assert_eq(interleaved(["192.0.2.1", "192.0.2.2", "2001:db8::1"]), [
+    "192.0.2.1",
+    "2001:db8::1",
+    "192.0.2.2",
+  ]);
+  assert_eq(interleaved(["192.0.2.1", "192.0.2.2"]), ["192.0.2.1", "192.0.2.2"])
+}
+
+law "interleaving keeps every address, and the first one first"
+  forall (addresses: List<Ip>) {
+    let ordered = interleave(addresses);
+    sort(ordered) == sort(addresses) && take(ordered, 1) == take(addresses, 1)
+  }
+
+fn example() -> Table / {ip.refused, abort.raise} =
+  with_reverse(
+    with_failure(
+      with_name(
+        with_name(table(), "Example.ORG.", [ip::read("2001:db8::7"), ip::read("192.0.2.7")]),
+        "empty.example",
+        [],
+      ),
+      "slow.example",
+      TimedOut,
+    ),
+    ip::read("192.0.2.7"),
+    ["example.org"],
+  )
+
+test "a table answers a name whatever its case and final dot, an address as itself, and no other" {
+  let found = on_table(example(), ||
+    [
+      dns.lookup("example.org", 1000),
+      dns.lookup("EXAMPLE.org.", 1000),
+      dns.lookup("192.0.2.9", 1000),
+      dns.lookup("empty.example", 1000),
+      dns.lookup("slow.example", 1000),
+      dns.lookup("absent.example", 1000),
+    ]);
+  let both = Ok([
+    { address: ip::read("2001:db8::7"), ttl: None },
+    { address: ip::read("192.0.2.7"), ttl: None },
+  ]);
+  assert_eq(found, [
+    both,
+    both,
+    Ok([{ address: ip::read("192.0.2.9"), ttl: None }]),
+    Err(NoData),
+    Err(TimedOut),
+    Err(NoSuchName),
+  ])
+}
+
+test "a table answers an address's names and the servers it was given" {
+  let asked = on_table(with_servers(example(), [ip::read_socket("192.0.2.53:53")]), || {
+    {
+      known: dns.reverse(ip::read("192.0.2.7"), 1000),
+      unknown: dns.reverse(ip::read("192.0.2.8"), 1000),
+      servers: dns.servers(),
+    }
+  });
+  assert_eq(asked.known, Ok(["example.org"]));
+  assert_eq(asked.unknown, Err(NoSuchName));
+  assert_eq(map(asked.servers, ip::render_socket), ["192.0.2.53:53"])
+}
+
+test "a table refuses a deadline the host would" {
+  let refused: Result<Result<List<Found>, Failure>, String> = try[abort.raise] {
+    on_table(table(), || dns.lookup("example.org", 0))
+  };
+  assert_eq(refused, Err("`dns.lookup` was given a timeout of 0 milliseconds"))
+}

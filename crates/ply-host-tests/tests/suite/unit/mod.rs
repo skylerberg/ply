@@ -10,6 +10,7 @@ mod process;
 mod registry;
 mod sched;
 mod signal;
+mod sockets;
 mod tcp;
 mod time;
 mod tls;

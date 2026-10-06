@@ -2,7 +2,7 @@
 
 use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
+use crate::{certgen, config, dns, fs, process, random, sched, tcp, time, trace, udp};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
 use std::rc::Rc;
@@ -55,6 +55,7 @@ impl Host {
     }
 
     pub fn rooted(self, roots: fs::Roots) -> Host {
+        self.net.rooted(roots.clone());
         let fs = fs::FsHost::new(roots);
         fs.ring(&self.bell);
         Host {
@@ -109,6 +110,8 @@ impl Host {
     pub fn registry(&self) -> HostRegistry {
         let mut registry = HostRegistry::new();
         tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
+        dns::register(&mut registry, Arc::clone(&self.net));
+        udp::register(&mut registry, Arc::clone(&self.net));
         config::register(&mut registry, Arc::clone(&self.config));
         trace::register(&mut registry, Arc::clone(&self.trace));
         for (op, handler) in sched::registrations() {
