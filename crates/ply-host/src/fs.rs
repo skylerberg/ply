@@ -7,6 +7,7 @@ use ply_eval::host::{
 };
 use ply_eval::{Diagnostic, Pending, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -107,6 +108,47 @@ impl Op {
             Op::Scan => "fs-scan",
             Op::Space => "fs-space",
             Op::Link => "fs-link",
+        }
+    }
+
+    /// Whether the operation follows a link that is the last name of its path. `open` keeps one
+    /// when it is asked to create, which `run` knows.
+    fn last(self) -> Last {
+        match self {
+            Op::Kind
+            | Op::Exists
+            | Op::Remove
+            | Op::Rename
+            | Op::Lock
+            | Op::Unlock
+            | Op::RemoveTree
+            | Op::Symlink
+            | Op::ReadLink
+            | Op::Stat
+            | Op::Link => Last::Kept,
+            Op::ReadFile
+            | Op::ReadAt
+            | Op::ListDir
+            | Op::Resolved
+            | Op::FileSize
+            | Op::ModifiedMs
+            | Op::WriteFile
+            | Op::Append
+            | Op::CreateDir
+            | Op::Sync
+            | Op::Copy
+            | Op::TempDir
+            | Op::Canonical
+            | Op::Mode
+            | Op::SetMode
+            | Op::Walk
+            | Op::SetModified
+            | Op::Open
+            | Op::ReadChunk
+            | Op::WriteChunk
+            | Op::Close
+            | Op::Scan
+            | Op::Space => Last::Followed,
         }
     }
 
@@ -401,7 +443,7 @@ impl HostHandler for Operation {
             op.what(),
             Box::new(move || {
                 let done = run(op, &root, &first, second, &held, &descriptors, span);
-                observed(op, &root, &first, &done, machine, span);
+                observed(op, &root, &first, &done, machine);
                 done
             }),
         )?;
@@ -478,7 +520,8 @@ fn open_file(
 ) -> Result<i64, Refusal> {
     use std::os::unix::fs::OpenOptionsExt;
     // A directory opens for reading, and only its first read says it is one.
-    if how != Opening::Create && std::fs::metadata(target).is_ok_and(|meta| !meta.is_file()) {
+    if how != Opening::Create && std::fs::symlink_metadata(target).is_ok_and(|meta| !meta.is_file())
+    {
         return Err(Refusal::NotAFile);
     }
     let mut options = OpenOptions::new();
@@ -489,7 +532,7 @@ fn open_file(
         // `O_EXCL` refuses whatever is at the name, a link included, so nothing is written through one.
         Opening::Create => options.write(true).create_new(true).mode(0o600),
     };
-    let file = options.open(target).map_err(|e| refusal(&e))?;
+    let file = unfollowed(&mut options, target).map_err(|e| refusal(&e))?;
     let mut held = descriptors
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -541,9 +584,13 @@ fn run(
     descriptors: &Mutex<Descriptors>,
     span: Span,
 ) -> JobOutput {
-    let target = match confine(root, path, span) {
+    let last = match second {
+        Second::Opening(Opening::Create) => Last::Kept,
+        _ => op.last(),
+    };
+    let target = match located(op, root, path, last, span) {
         Ok(target) => target,
-        Err(refusal) => return JobOutput::Refused(refusal),
+        Err(answer) => return answer,
     };
     match op {
         Op::Open => match second {
@@ -556,16 +603,18 @@ fn run(
         Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
             "an operation on an open file reached the pool as one on a path".into(),
         ),
-        Op::ReadFile => match std::fs::metadata(&target) {
+        Op::ReadFile => match std::fs::symlink_metadata(&target) {
             Err(_) => JobOutput::MaybeBytes(None),
             Ok(meta) if !meta.is_file() => JobOutput::MaybeBytes(None),
             Ok(meta) if meta.len() > MAX_READ_BYTES => {
                 JobOutput::Refused(too_large(meta.len(), path, span))
             }
-            Ok(_) => match std::fs::read(&target) {
-                Ok(bytes) => JobOutput::MaybeBytes(Some(bytes)),
-                Err(_) => JobOutput::MaybeBytes(None),
-            },
+            Ok(_) => {
+                let mut bytes = Vec::new();
+                let read = unfollowed(OpenOptions::new().read(true), &target)
+                    .and_then(|mut file| file.read_to_end(&mut bytes));
+                JobOutput::MaybeBytes(read.ok().map(|_| bytes))
+            }
         },
         Op::ListDir => match std::fs::read_dir(&target) {
             Err(_) => JobOutput::MaybeStrings(None),
@@ -586,29 +635,35 @@ fn run(
             Ok(meta) if meta.is_file() => "std.fs.File",
             _ => "std.fs.Missing",
         }),
-        // `metadata` follows, so this answers what the path resolves to. `confine` has already
-        // refused a target that resolves outside the root, so following one cannot leave it.
-        Op::Resolved => JobOutput::Ctor(match std::fs::metadata(&target) {
+        // The walk followed every link to here, so what is at the path is what it resolves to.
+        Op::Resolved => JobOutput::Ctor(match std::fs::symlink_metadata(&target) {
             Ok(meta) if meta.is_dir() => "std.fs.Dir",
             Ok(meta) if meta.is_file() => "std.fs.File",
             _ => "std.fs.Missing",
         }),
         Op::Exists => JobOutput::Bool(std::fs::symlink_metadata(&target).is_ok()),
         Op::FileSize => JobOutput::MaybeInt(
-            std::fs::metadata(&target)
+            std::fs::symlink_metadata(&target)
                 .ok()
                 .filter(|m| m.is_file())
                 .and_then(|m| i64::try_from(m.len()).ok()),
         ),
         Op::ModifiedMs => JobOutput::MaybeInt(
-            std::fs::metadata(&target)
+            std::fs::symlink_metadata(&target)
                 .ok()
                 .and_then(|m| m.modified().ok())
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .and_then(|d| i64::try_from(d.as_millis()).ok()),
         ),
         Op::WriteFile => match second {
-            Second::Body(body) => JobOutput::Bool(std::fs::write(&target, &body[..]).is_ok()),
+            Second::Body(body) => JobOutput::Bool(
+                unfollowed(
+                    OpenOptions::new().write(true).create(true).truncate(true),
+                    &target,
+                )
+                .and_then(|mut file| file.write_all(&body))
+                .is_ok(),
+            ),
             _ => JobOutput::Failed("a write with no body reached the pool".into()),
         },
         // Idempotent, so a cache writer need not check first and race with itself.
@@ -620,9 +675,9 @@ fn run(
             Ok(_) => JobOutput::Bool(std::fs::remove_file(&target).is_ok()),
         },
         Op::Rename => match second {
-            Second::Path(to) => match confine(root, &to, span) {
+            Second::Path(to) => match located(op, root, &to, Last::Kept, span) {
                 // Both paths are under one label, which makes this the atomic cache write.
-                Err(refusal) => JobOutput::Refused(refusal),
+                Err(answer) => answer,
                 Ok(destination) => JobOutput::Bool(std::fs::rename(&target, &destination).is_ok()),
             },
             _ => JobOutput::Failed("a rename with no destination reached the pool".into()),
@@ -641,8 +696,8 @@ fn run(
         Op::Lock => JobOutput::Bool(take_lock(&target, held)),
         Op::Unlock => JobOutput::Bool(drop_lock(&target, held)),
         Op::Copy => match second {
-            Second::Path(to) => match confine(root, &to, span) {
-                Err(refusal) => JobOutput::Refused(refusal),
+            Second::Path(to) => match located(op, root, &to, Last::Followed, span) {
+                Err(answer) => answer,
                 Ok(destination) => JobOutput::Bool(copy_file(&target, &destination)),
             },
             _ => JobOutput::Failed("a copy with no destination reached the pool".into()),
@@ -655,6 +710,7 @@ fn run(
         Op::Canonical => JobOutput::MaybeString(
             std::fs::canonicalize(&target)
                 .ok()
+                .filter(|real| real.starts_with(root))
                 .and_then(|real| real.to_str().map(str::to_string)),
         ),
         Op::Mode => JobOutput::MaybeMode(mode_of(&target)),
@@ -663,7 +719,7 @@ fn run(
             _ => JobOutput::Failed("a mode change with no mode reached the pool".into()),
         },
         Op::Symlink => match second {
-            Second::Target(to) => match link_stays(root, path, &to, span) {
+            Second::Target(to) => match link_stays(root, &target, &to, span) {
                 Err(refusal) => JobOutput::Refused(refusal),
                 Ok(()) => JobOutput::Bool(std::os::unix::fs::symlink(&to, &target).is_ok()),
             },
@@ -692,8 +748,8 @@ fn run(
         },
         Op::Space => JobOutput::MaybeSpace(space_of(&target)),
         Op::Link => match second {
-            Second::Path(to) => match confine(root, &to, span) {
-                Err(refusal) => JobOutput::Refused(refusal),
+            Second::Path(to) => match located(op, root, &to, Last::Kept, span) {
+                Err(answer) => answer,
                 Ok(existing) => JobOutput::Done(hard_link(&existing, &target)),
             },
             _ => JobOutput::Failed("a link with no file to name reached the pool".into()),
@@ -703,11 +759,13 @@ fn run(
 
 /// What `op` read of the world or wrote to it, for the record of the test whose machine asked. Taken
 /// after the operation, so a directory `temp_dir` made is known by the name it got.
-fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineId, span: Span) {
+fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineId) {
     use crate::observe::{Read, read, wrote};
-    let Ok(target) = confine(root, path, span) else {
+    if matches!(done, JobOutput::Refused(_)) {
         return;
-    };
+    }
+    // The path as the program named it: where a link in it leads is read again when the record is.
+    let target = root.join(path);
     match op {
         Op::ReadFile | Op::ReadAt | Op::FileSize | Op::Mode | Op::ReadLink => {
             read(machine, Read::File, &target)
@@ -740,10 +798,8 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineI
         | Op::Rename
         | Op::Copy => wrote(machine, &target),
         Op::TempDir => {
-            if let JobOutput::MaybeString(Some(made)) = done
-                && let Ok(made) = confine(root, made, span)
-            {
-                wrote(machine, &made)
+            if let JobOutput::MaybeString(Some(made)) = done {
+                wrote(machine, &root.join(made))
             }
         }
     }
@@ -929,7 +985,7 @@ fn unique_suffix() -> String {
 
 fn mode_of(target: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(target)
+    std::fs::symlink_metadata(target)
         .ok()
         .map(|meta| meta.permissions().mode() & 0o777)
 }
@@ -948,9 +1004,10 @@ fn set_mode(target: &Path, bits: u32) -> bool {
     .is_ok()
 }
 
-/// Read from the link's own directory, a target must stay under the root: one that names another
-/// root or climbs out of this one would hand whoever follows the link a path outside it.
-fn link_stays(root: &Path, link: &str, target: &str, span: Span) -> Result<(), Diagnostic> {
+/// Read from the directory the link is made in, which is where `link` stands once every link
+/// above it is followed, a target must stay under the root: one that names another root or climbs
+/// out of this one would hand whoever follows the link a path outside it.
+fn link_stays(root: &Path, link: &Path, target: &str, span: Span) -> Result<(), Diagnostic> {
     let to = Path::new(target);
     if to.is_absolute() {
         return Err(escapes(
@@ -960,11 +1017,10 @@ fn link_stays(root: &Path, link: &str, target: &str, span: Span) -> Result<(), D
             span,
         ));
     }
-    let mut depth = Path::new(link)
-        .components()
-        .filter(|c| matches!(c, Component::Normal(_)))
-        .count()
-        .saturating_sub(1);
+    let mut depth = link
+        .parent()
+        .and_then(|dir| dir.strip_prefix(root).ok())
+        .map_or(0, |below| below.components().count());
     for component in to.components() {
         match component {
             Component::Normal(_) => depth += 1,
@@ -1091,7 +1147,7 @@ fn scan_into(
 
 /// A directory is opened as a file to stamp it, which `futimens` allows its owner.
 fn set_modified(target: &Path, ms: i64) -> bool {
-    File::open(target)
+    unfollowed(OpenOptions::new().read(true), target)
         .and_then(|file| file.set_modified(UNIX_EPOCH + Duration::from_millis(ms as u64)))
         .is_ok()
 }
@@ -1127,11 +1183,7 @@ fn mode_bits(mode: &Value, span: Span) -> Result<u32, Diagnostic> {
 /// descriptor's position afterwards is the end of what *this* write produced, so a second appender
 /// racing this one moves neither the bytes nor the answer.
 fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(target)
-        .ok()?;
+    let mut file = unfollowed(OpenOptions::new().append(true).create(true), target).ok()?;
     // A write of nothing writes nothing, leaving the descriptor at 0 rather than at the end.
     if body.is_empty() {
         return i64::try_from(file.metadata().ok()?.len()).ok();
@@ -1145,7 +1197,7 @@ fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
 /// a reader that recorded an offset cannot be told its cache is short by a diagnostic it cannot
 /// catch. `None` keeps the meaning it has for `read_file`: this path names nothing to read.
 fn read_range(target: &Path, offset: i64, len: i64) -> Option<Vec<u8>> {
-    let mut file = File::open(target).ok()?;
+    let mut file = unfollowed(OpenOptions::new().read(true), target).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
@@ -1158,16 +1210,19 @@ fn read_range(target: &Path, offset: i64, len: i64) -> Option<Vec<u8>> {
 /// A file's own bytes, or — for a directory — the names in it, which is what makes a rename
 /// durable. Both are what an append-only store fsyncs before an index is allowed to name them.
 fn sync_path(target: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(target) else {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
         return false;
     };
     // A directory cannot be opened for writing, and its entries are what fsync flushes either way.
-    let opened = if meta.is_dir() {
-        File::open(target)
+    let mut how = OpenOptions::new();
+    if meta.is_dir() {
+        how.read(true);
     } else {
-        OpenOptions::new().write(true).open(target)
-    };
-    opened.and_then(|file| file.sync_all()).is_ok()
+        how.write(true);
+    }
+    unfollowed(&mut how, target)
+        .and_then(|file| file.sync_all())
+        .is_ok()
 }
 
 /// `O_CREAT|O_EXCL` on a lock file, waiting out a holder and breaking one a dead run left behind.
@@ -1208,7 +1263,7 @@ pub fn drop_lock(target: &Path, held: &Mutex<BTreeSet<PathBuf>>) -> bool {
 }
 
 fn is_older_than(path: &Path, age: Duration) -> bool {
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
         .and_then(|m| m.modified())
         .is_ok_and(|m| m.elapsed().is_ok_and(|elapsed| elapsed >= age))
 }
@@ -1218,7 +1273,30 @@ fn lock(held: &Mutex<BTreeSet<PathBuf>>) -> MutexGuard<'_, BTreeSet<PathBuf>> {
     held.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnostic> {
+/// As many links as one path may pass through before it is a loop, where `ELOOP` stops.
+const LINK_HOPS: usize = 40;
+
+/// Whether an operation acts on what a link that is the last name of its path leads to, or on the
+/// link.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Last {
+    Followed,
+    Kept,
+}
+
+/// Where `path` leads under `root` with every link along it followed, the last included: the path
+/// to hand a system call, which had no link in it when this looked. `E0452` where it leads out of
+/// the root, whether or not anything is where it leads, and `None` where it leads nowhere.
+pub fn confine(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
+    walked(root, path, Last::Followed, span)
+}
+
+/// The walk behind [`confine`]: each name looked at in turn and each link followed here rather
+/// than by the system, so that a link to where nothing is has somewhere it leads. Under
+/// `Last::Kept` the last name is not looked at, and a link there is the answer's last name.
+/// `None` for more links than a path may pass through, and for a link that steps back out of a
+/// name that is not there, which the system resolves to nothing.
+fn walked(root: &Path, path: &str, last: Last, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
     let relative = Path::new(path);
     if relative.is_absolute() {
         return Err(escapes(
@@ -1240,29 +1318,112 @@ pub fn confine(root: &Path, path: &str, span: Span) -> Result<PathBuf, Diagnosti
         ));
     }
 
-    let target = root.join(relative);
-    let mut existing = target.as_path();
-    loop {
-        match existing.canonicalize() {
-            Ok(real) => {
-                if !real.starts_with(root) {
-                    return Err(escapes(
-                        root,
-                        path,
-                        &format!("it resolves to `{}`", real.display()),
-                        span,
-                    ));
-                }
-                return Ok(target);
+    let mut at = root.to_path_buf();
+    // The next name is the last one; a link's target goes on above what came after the link.
+    let mut ahead: Vec<OsString> = steps(relative).rev().collect();
+    let mut hops = 0;
+    // Nothing is below a name that is not there, so from one on the walk only spells the path.
+    let mut missing = false;
+    while let Some(name) = ahead.pop() {
+        if name == ".." {
+            if missing {
+                return Ok(None);
             }
-            // Not there yet: check the nearest existing ancestor, where a symlink could escape.
-            Err(_) => match existing.parent() {
-                Some(parent) if parent.starts_with(root) => existing = parent,
-                // No existing ancestor inside the root, so the lexical checks suffice.
-                _ => return Ok(target),
-            },
+            at.pop();
+            continue;
+        }
+        at.push(&name);
+        if missing || (last == Last::Kept && ahead.is_empty()) {
+            continue;
+        }
+        match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_symlink() => {
+                hops += 1;
+                let target = match std::fs::read_link(&at) {
+                    Ok(target) if hops <= LINK_HOPS && !target.as_os_str().is_empty() => target,
+                    _ => return Ok(None),
+                };
+                if target.is_absolute() {
+                    at = PathBuf::from("/");
+                } else {
+                    at.pop();
+                }
+                ahead.extend(steps(&target).rev());
+            }
+            Ok(_) => {}
+            Err(_) => missing = true,
         }
     }
+    if at.starts_with(root) {
+        Ok(Some(at))
+    } else {
+        Err(escapes(
+            root,
+            path,
+            &format!("it leads to `{}`", at.display()),
+            span,
+        ))
+    }
+}
+
+/// A path's names in order, a step back to the directory above as `..`.
+fn steps(path: &Path) -> impl DoubleEndedIterator<Item = OsString> + '_ {
+    path.components().filter_map(|c| match c {
+        Component::Normal(name) => Some(name.to_os_string()),
+        Component::ParentDir => Some(OsString::from("..")),
+        _ => None,
+    })
+}
+
+/// Where an operation's path leads, or what the operation answers without looking: the refusal of
+/// a path that leaves the root, or its answer for a path that leads nowhere.
+fn located(op: Op, root: &Path, path: &str, last: Last, span: Span) -> Result<PathBuf, JobOutput> {
+    match walked(root, path, last, span) {
+        Ok(Some(at)) => Ok(at),
+        Ok(None) => Err(nothing(op)),
+        Err(refusal) => Err(JobOutput::Refused(refusal)),
+    }
+}
+
+/// What `op` answers of a path that leads nowhere: what it answers where nothing is.
+fn nothing(op: Op) -> JobOutput {
+    match op {
+        Op::ReadFile | Op::ReadAt => JobOutput::MaybeBytes(None),
+        Op::ListDir => JobOutput::MaybeStrings(None),
+        Op::Kind | Op::Resolved => JobOutput::Ctor("std.fs.Missing"),
+        Op::Exists
+        | Op::WriteFile
+        | Op::CreateDir
+        | Op::Remove
+        | Op::Rename
+        | Op::Sync
+        | Op::Lock
+        | Op::Unlock
+        | Op::Copy
+        | Op::RemoveTree
+        | Op::SetMode
+        | Op::Symlink
+        | Op::SetModified => JobOutput::Bool(false),
+        Op::FileSize | Op::ModifiedMs | Op::Append => JobOutput::MaybeInt(None),
+        Op::TempDir | Op::Canonical | Op::ReadLink => JobOutput::MaybeString(None),
+        Op::Mode => JobOutput::MaybeMode(None),
+        Op::Walk => JobOutput::MaybeEntries(None),
+        Op::Open => JobOutput::Opened(Err(Refusal::NotFound), false),
+        Op::Stat => JobOutput::MaybeStat(None),
+        Op::Scan => JobOutput::MaybeScan(None),
+        Op::Space => JobOutput::MaybeSpace(None),
+        Op::Link => JobOutput::Done(Err(Refusal::NotFound)),
+        Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
+            "an operation on an open file reached the pool as one on a path".into(),
+        ),
+    }
+}
+
+/// The file at `target` opened as `options` ask, and refused where its name is a link: the path a
+/// walk answered had none there, so one there now was put there since.
+fn unfollowed(options: &mut OpenOptions, target: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW).open(target)
 }
 
 #[cold]
