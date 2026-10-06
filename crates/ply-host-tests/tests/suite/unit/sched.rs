@@ -7,6 +7,7 @@ use ply_eval::{
     Resource, SimId, Span, Symbol, TaskHandle, TaskId, Value, codes,
 };
 use ply_host::sched::*;
+use ply_host::signal::{Bounds, Shutdown, ShutdownSignal};
 use ply_host::trace::sink::Recording;
 use ply_host::trace::{self, Level, Outcome, RecordKind, Sink, Trace};
 use std::collections::{BTreeMap, BTreeSet};
@@ -365,18 +366,106 @@ fn a_bound_binding_opens_a_production_region() {
     assert!(!sched.records_steps());
 }
 
+/// A sleep is a wait of one task, so it is the scheduler's; a reading is a handler's.
 #[test]
-fn a_production_region_answers_task_and_not_the_clock() {
+fn a_production_region_answers_task_and_the_sleep_and_no_reading() {
     let sched = production();
     for op in TASK_OPS {
         assert!(sched.answers("task", op), "task.{op}");
     }
-    for (effect, op) in [("clock", "now"), ("clock", "sleep"), ("random", "next")] {
+    assert!(sched.answers("clock", "sleep"));
+    for (effect, op) in [("clock", "now"), ("random", "next"), ("random", "below")] {
         assert!(
             !sched.answers(effect, op),
             "a production region claimed to answer {effect}.{op}"
         );
     }
+}
+
+/// Through the runtime the host itself builds, on the host's own clock.
+#[test]
+fn a_sleeper_wakes_near_its_deadline_while_the_task_beside_it_keeps_running() {
+    let rt = ply_host::Host::new().runtime();
+    let mut sched = production();
+    let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
+        panic!("expected the root's step");
+    };
+    let beside = sched.spawn(Value::Unit, Span::DUMMY);
+    let started = std::time::Instant::now();
+    sched
+        .sleep_on_host(suspended(), 30_000_000, Span::DUMMY, &*rt)
+        .expect("the root is running");
+    let mut turns = 0u32;
+    loop {
+        let Turn::Run { task, .. } = sched.next_host(&*rt).expect("a task is enabled") else {
+            panic!("the region ended while its root slept");
+        };
+        if task == ply_eval::sched::ROOT {
+            break;
+        }
+        assert_eq!(task, beside.id());
+        turns += 1;
+        sched.suspend(suspended(), Value::Unit).expect("running");
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(30),
+        "woke after {took:?}, before its deadline"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "woke after {took:?}, far past its deadline"
+    );
+    assert!(
+        turns > 10,
+        "the task beside the sleeper had {turns} turns in {took:?}"
+    );
+}
+
+#[test]
+fn with_every_task_asleep_the_thread_waits_for_the_deadline() {
+    let rt = ply_host::Host::new().runtime();
+    let before = rt.now().expect("the host keeps time");
+    rt.park_until(before + 20_000_000)
+        .expect("a wait on time needs no token outstanding");
+    let after = rt.now().expect("the host keeps time");
+    assert!(
+        after - before >= 20_000_000,
+        "{before} to {after} is not a 20ms wait"
+    );
+
+    let started = std::time::Instant::now();
+    rt.park_until(before).expect("a deadline already past");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a deadline already past was waited on"
+    );
+}
+
+/// A service whose every task sleeps hears a stop when it is asked for, not at its next deadline.
+#[test]
+fn a_stop_wakes_a_thread_that_waits_on_a_deadline() {
+    let shutdown = Shutdown::new(Bounds::default());
+    let rt = ply_host::Host::new()
+        .stopping_on(Arc::clone(&shutdown))
+        .runtime();
+    let stopper = {
+        let shutdown = Arc::clone(&shutdown);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            shutdown.request(ShutdownSignal::Terminate);
+        })
+    };
+    let started = std::time::Instant::now();
+    let far = rt.now().expect("the host keeps time") + 60_000_000_000;
+    while !rt.stopping() {
+        rt.park_until(far).expect("a wait on time");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait slept through the stop"
+        );
+    }
+    stopper.join().expect("the stop was requested");
 }
 
 #[test]

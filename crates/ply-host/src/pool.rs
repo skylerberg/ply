@@ -55,6 +55,9 @@ pub enum JobOutput {
     MaybeMode(Option<u32>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
+    /// A file's descriptor, or the `std.fs.Refused` that says why it did not open; and whether
+    /// it was opened to be written.
+    Opened(Result<i64, &'static str>, bool),
     Finished(Finished),
     /// `None` when the child was still running at the deadline.
     MaybeFinished(Option<Finished>),
@@ -66,8 +69,8 @@ pub enum JobOutput {
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
-/// Rung by every pool it is handed to whenever one of their operations finishes, so one wait can
-/// cover several pools: separate condition variables cannot be waited on together.
+/// Rung by every pool it is handed to whenever one of their operations finishes, and by a stop, so
+/// one wait can cover them all: separate condition variables cannot be waited on together.
 #[derive(Default)]
 pub struct Bell {
     rung: Mutex<u64>,
@@ -89,7 +92,15 @@ impl Bell {
         }
     }
 
-    fn ring(&self) {
+    /// The same, for at most `bound`.
+    pub fn wait_past_for(&self, seen: u64, bound: Duration) {
+        let rung = lock(&self.rung);
+        if *rung == seen {
+            drop(wait_timeout(&self.heard, rung, bound));
+        }
+    }
+
+    pub(crate) fn ring(&self) {
         *lock(&self.rung) += 1;
         self.heard.notify_all();
     }
@@ -358,6 +369,10 @@ fn take(state: &mut State, token: u64) -> Taken {
         }))),
         JobOutput::MaybeMode(bits) => Ok(option(bits.map(mode))),
         JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
+        JobOutput::Opened(Ok(descriptor), _) => Ok(Value::ctor("Ok", vec![Value::Int(descriptor)])),
+        JobOutput::Opened(Err(why), _) => {
+            Ok(Value::ctor("Err", vec![Value::ctor(why, Vec::new())]))
+        }
         JobOutput::Finished(exit) => Ok(finished(exit)),
         JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
         JobOutput::Heard(heard) => Ok(heard_value(heard)),

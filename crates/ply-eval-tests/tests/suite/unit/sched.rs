@@ -2184,3 +2184,257 @@ fn a_task_cannot_park_on_a_token_its_runtime_did_not_mint() {
         "the refused task was parked anyway"
     );
 }
+
+/// A runtime whose clock a test reads and moves. A park on a deadline moves it there, as the
+/// host's would wait.
+#[derive(Default)]
+struct Ticking {
+    now: std::cell::Cell<i64>,
+    /// Each deadline the region parked until, in order.
+    parked_until: std::cell::RefCell<Vec<i64>>,
+}
+
+impl HostRuntime for Ticking {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("nothing here parks on a token, yet `{pending}` was watched"),
+        ))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a region with a sleeper was parked on no deadline",
+        ))
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "nothing here waits",
+        ))
+    }
+
+    fn now(&self) -> Result<i64, Diagnostic> {
+        Ok(self.now.get())
+    }
+
+    fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
+        self.parked_until.borrow_mut().push(deadline);
+        self.now.set(self.now.get().max(deadline));
+        Ok(())
+    }
+}
+
+fn sleeps(sched: &mut Sched, nanos: i64, rt: &dyn HostRuntime) {
+    sched
+        .sleep_on_host(suspended(), nanos, Span::DUMMY, rt)
+        .expect("the task is running");
+}
+
+fn next_task(sched: &mut Sched, rt: &dyn HostRuntime) -> (TaskId, Resumption<usize, Value>) {
+    match sched.next_host(rt) {
+        Ok(Turn::Run { task, resumption }) => (task, resumption),
+        Ok(Turn::Complete(_)) => panic!("the region ended with a task still to run"),
+        Err(d) => panic!("no task could run: {}", d.message),
+    }
+}
+
+#[test]
+fn a_sleeping_production_task_is_parked_alone_and_the_others_run() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let beside = sched.spawn(Value::Unit, Span::DUMMY);
+    sleeps(&mut sched, 100, &rt);
+    for _ in 0..5 {
+        let (task, _) = next_task(&mut sched, &rt);
+        assert_eq!(task, beside.id(), "the sleeper ran before its deadline");
+        sched.suspend(suspended(), Value::Unit).expect("running");
+    }
+
+    // The deadline comes while the other task is still runnable, and the sleeper has the next turn.
+    rt.now.set(100);
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, ROOT);
+    assert!(
+        matches!(
+            resumption,
+            Resumption::Resume {
+                value: Value::Unit,
+                ..
+            }
+        ),
+        "a sleep answers `Unit`"
+    );
+    assert!(
+        rt.parked_until.borrow().is_empty(),
+        "the thread waited while a task could run: {:?}",
+        rt.parked_until.borrow()
+    );
+}
+
+#[test]
+fn with_nothing_runnable_a_production_region_waits_for_its_earliest_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let late = sched.spawn(Value::Unit, Span::DUMMY);
+    let early = sched.spawn(Value::Unit, Span::DUMMY);
+    sleeps(&mut sched, 300, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, late.id());
+    sleeps(&mut sched, 200, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, early.id());
+    sleeps(&mut sched, 100, &rt);
+
+    let mut woke = Vec::new();
+    loop {
+        match sched.next_host(&rt).expect("each sleeper wakes") {
+            Turn::Complete(_) => break,
+            Turn::Run { task, .. } => {
+                woke.push((task, rt.now.get()));
+                sched.finish(Value::Unit).expect("the task is running");
+            }
+        }
+    }
+    assert_eq!(woke, vec![(early.id(), 100), (late.id(), 200), (ROOT, 300)]);
+    assert_eq!(*rt.parked_until.borrow(), vec![100, 200, 300]);
+}
+
+#[test]
+fn cancelling_a_sleeping_production_task_lets_go_of_its_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let sleeper = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    assert_eq!(next_task(&mut sched, &rt).0, sleeper.id());
+    sleeps(&mut sched, 1_000, &rt);
+
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    let stopped = sched
+        .cancel(suspended(), &sleeper, Span::DUMMY, None)
+        .expect("the root is running");
+    assert!(stopped.stopped);
+    assert_eq!(stopped.let_go, LetGo::Nothing);
+
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, sleeper.id());
+    assert!(
+        matches!(resumption, Resumption::Cancel { .. }),
+        "a cancelled sleeper only unwinds"
+    );
+    sched.finish_cancelled().expect("the sleeper is running");
+
+    // The root sleeps past where the cancelled task would have woken.
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    sleeps(&mut sched, 2_000, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    assert_eq!(
+        *rt.parked_until.borrow(),
+        vec![2_000],
+        "the region waited on a deadline nothing sleeps until"
+    );
+}
+
+#[test]
+fn a_cancel_inside_a_release_leaves_a_production_sleeper_asleep_until_its_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let sleeper = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    assert_eq!(next_task(&mut sched, &rt).0, sleeper.id());
+    assert_eq!(sched.shield(Shield::Release), Some(sleeper.id()));
+    sleeps(&mut sched, 500, &rt);
+
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    let stopped = sched
+        .cancel(suspended(), &sleeper, Span::DUMMY, None)
+        .expect("the root is running");
+    assert!(stopped.stopped);
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    sched
+        .await_task(suspended(), &sleeper, Span::DUMMY)
+        .expect("the root is running");
+
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, sleeper.id());
+    assert!(
+        matches!(resumption, Resumption::Resume { .. }),
+        "the release's sleep was cut short"
+    );
+    assert_eq!(*rt.parked_until.borrow(), vec![500]);
+    assert!(
+        sched.unshield(sleeper.id(), Shield::Release),
+        "the cancel lands when the release returns"
+    );
+    sched.finish_cancelled().expect("the sleeper is running");
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, ROOT);
+    assert!(
+        matches!(&resumption, Resumption::Resume { value, .. } if *value == Value::ctor("None", Vec::new())),
+        "an await of a cancelled task hears `None`"
+    );
+}
+
+#[test]
+fn a_production_sleep_of_no_span_is_a_yield() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let beside = sched.spawn(Value::Unit, Span::DUMMY);
+    for nanos in [0, -5] {
+        sleeps(&mut sched, nanos, &rt);
+        assert_eq!(next_task(&mut sched, &rt).0, beside.id());
+        sched.suspend(suspended(), Value::Unit).expect("running");
+        assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    }
+    assert!(rt.parked_until.borrow().is_empty());
+}
+
+#[test]
+fn a_production_sleep_needs_a_runtime_that_keeps_time() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let err = sched
+        .sleep_on_host(suspended(), 5, Span::DUMMY, &Idle)
+        .expect_err("the idle runtime reads no clock");
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert_eq!(
+        sched.current(),
+        Some(ROOT),
+        "the refused task was put to sleep anyway"
+    );
+}
+
+/// Virtual time is the seed's: a seeded region that slept on the host's clock would stop being a
+/// function of it.
+#[test]
+fn a_seeded_region_refuses_a_sleep_on_the_hosts_clock() {
+    let (mut sched, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = sched
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the root's step");
+    };
+    let err = sched
+        .sleep_on_host(suspended(), 5, Span::DUMMY, &Ticking::default())
+        .expect_err("a simulated region may not wait on the host's clock");
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert!(err.message.contains("seeded region"), "{}", err.message);
+    assert!(
+        sched.current().is_some(),
+        "the task was put to sleep anyway"
+    );
+}

@@ -273,6 +273,16 @@ builtins! { $
     /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
     MapRange = "map_range", 6, ends;
     MapSplit = "map_split", 2, ends;
+    /// What a hold holds, while its region has not let it go.
+    HoldGet = "hold_get", 1, ends;
+    /// A hold's contents moved out for its release, so the next read finds them gone. No source
+    /// can spell it; the lowering of `with_hold` writes it.
+    HoldTake = "?hold_take", 1, ends;
+    /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
+    HoldBracket = "?hold_bracket", 3, ends;
+    /// [`Builtin::CellSet`] under such a name: the lowering puts what `acquire` answered into the
+    /// hold inside the bracket's own acquire, where a cancel takes no answer.
+    HoldPut = "?hold_put", 2, ends;
 }
 
 impl Builtin {
@@ -488,7 +498,11 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::CellGet
         | Builtin::CellSet
         | Builtin::CellUpdate
-        | Builtin::Bracket => Err(answered_by_the_backend(b, span)),
+        | Builtin::Bracket
+        | Builtin::HoldGet
+        | Builtin::HoldTake
+        | Builtin::HoldBracket
+        | Builtin::HoldPut => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
@@ -1822,6 +1836,19 @@ pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     )
     .primary(span, "this cell was made by a different run")
     .note("please report this: a cell value escaped the region that allocated it")
+}
+
+/// A hold reached after its region let it go, which only a continuation captured inside the region
+/// and resumed after the release can do.
+#[cold]
+pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOLD_RELEASED,
+        format!("a hold is {doing} after its region released what it held"),
+    )
+    .primary(span, "the hold holds nothing now")
+    .note("a `with_hold` releases what it holds once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a hold already let go")
+    .note("resume a continuation captured inside a `with_hold` at most once, or open the `with_hold` after the choice the continuation replays")
 }
 
 /// The C backend answers every builtin that calls back into the program or reads a cell.
