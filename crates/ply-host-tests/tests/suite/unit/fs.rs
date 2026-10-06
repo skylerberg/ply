@@ -4,6 +4,7 @@ use ply_eval::{
     Value, codes,
 };
 use ply_host::fs::*;
+use ply_host::pool::Pooled;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -259,7 +260,7 @@ fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Valu
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => fs.block_on(pending),
+        HostAnswer::Pending(pending) => fs.pool().block_on(pending),
         HostAnswer::Value(v) => Ok(v),
     }
 }
