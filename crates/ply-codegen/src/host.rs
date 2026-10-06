@@ -139,6 +139,15 @@ pub unsafe fn perform(
         }
         return unsafe { crate::simulate::perform(ctx, effect, op, &words) };
     }
+    // Inside an open production region a sleep is the scheduler's, which parks the task alone;
+    // outside, no task could run meanwhile, and it is the host's.
+    if effect.as_str() == "clock"
+        && op.as_str() == "sleep"
+        && crate::simulate::running_task_of_production(c).is_some()
+    {
+        let words: Vec<Word> = values.iter().map(|v| c.word(v)).collect();
+        return unsafe { crate::simulate::perform(ctx, effect, op, &words) };
+    }
     let atom = bound.atom.clone();
     let declaration = bound.op.clone();
     let handler = Arc::clone(bound.handler);

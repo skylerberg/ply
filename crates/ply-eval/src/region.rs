@@ -174,13 +174,17 @@ impl Trail {
         }
     }
 
-    /// Adds `access` to every step `task` of `region` has taken so far: a cancel is known only once
-    /// it happens, and each of the task's earlier steps could have been after it instead.
-    pub fn mark_steps_of(&mut self, region: SimId, task: TaskId, access: Access) {
-        for step in self.steps.iter_mut() {
-            if step.region == region && step.task == task {
-                step.accesses.insert(access.clone());
-            }
+    /// Adds `access` to the last step `task` of `region` has taken so far: a cancel is known only
+    /// once it happens, and that step could have been after it instead. The run in which it is
+    /// says the same of the step before, so the search walks the cancel back a step at a time.
+    pub fn mark_last_step_of(&mut self, region: SimId, task: TaskId, access: Access) {
+        if let Some(step) = self
+            .steps
+            .iter_mut()
+            .rev()
+            .find(|step| step.region == region && step.task == task)
+        {
+            step.accesses.insert(access);
         }
     }
 
