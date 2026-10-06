@@ -1,0 +1,2513 @@
+//! X.509 certificates as RFC 5280 defines them: read, verified to a trust anchor at a given time,
+//! and built, with certificate requests (PKCS #10) beside them.
+//!
+//! A `Certificate` exists only once read. `read` holds the bytes to DER and to the certificate's
+//! structure, keeps the exact bytes its signature is over, and reads each extension it knows into
+//! a `Content`; any other is kept as its DER with its criticality. `Strict` is RFC 5280 to the
+//! letter. `Tolerant` is for certificates as they are served: a root still trusted carries a
+//! serial number of zero, and some certificates write a `critical` of false out.
+//!
+//! `verify` is a function of what it is handed: the leaf, the certificates offered beside it, the
+//! anchors trusted, the time, who is expected, what for, and a `Policy`. Time is an argument, so a
+//! test of an expiry passes on any day. It builds a path, trying every issuer of the right name
+//! until one holds, so a certificate cross-signed by a root that has expired does not hide the
+//! path through one that has not; a policy bounds the signatures it checks and the names it
+//! compares, so a crafted bundle costs a bounded amount. What stops a path is answered as the
+//! certificate at fault and a `Fault`.
+//!
+//! Names are RFC 9525's. A certificate is for a host by its subject alternative names alone; the
+//! subject's common name is never read. A wildcard is a whole first label, stands for exactly one
+//! label, and is refused over fewer than two labels, which is every name of a top-level domain:
+//! no list of public suffixes is consulted, so `*.co.uk` is taken as written. A host given in
+//! another script is taken through `std.idna` and compared as its A-labels; an address is
+//! compared as an address and never as text.
+//!
+//! What verifies is what the runtime has: RSA PKCS #1 and PSS of 2048 bits and up over SHA-256,
+//! SHA-384 and SHA-512; ECDSA on P-256 and P-384 over SHA-256 and SHA-384; Ed25519. MD5, SHA-1,
+//! DSA and any other curve are `Unverifiable`, under every policy.
+//!
+//! Revocation is not checked: nothing here fetches, and a CRL or an OCSP response is not read. A
+//! path that holds says the certificate was good when it was issued. `AuthorityAccess` and
+//! `CrlPoints` say where a caller would ask; checking what comes back takes a reader of CRLs and
+//! OCSP responses and a time by which each is fresh, and both would be arguments as the time here
+//! is.
+//!
+//! `certificate` and `request` build. Each signs through `std.crypto`, and `certificate` answers
+//! what `read` makes of its own bytes, so a built certificate is one that reads.
+
+import std.asn1
+import std.asn1 (asn1, Bits, Read, Reader, Ia5String, Value)
+import std.bytes (hex_of)
+import std.crypto
+import std.crypto (Digest, Sha256, Sha384, Sha512, VerifyingKey)
+import std.date
+import std.date (OffsetDateTime)
+import std.hash (sha256)
+import std.idna
+import std.ip
+import std.ip (Ip, Prefix)
+import std.list (all, any, concat, contains, count, find, flat_map)
+import std.oid
+import std.oid (Oid)
+import std.pem
+import std.result (result_err, result_ok)
+import std.show (show)
+import std.string (ascii_lower, is_ascii)
+import std.time (nanos_at)
+
+// --- What a certificate holds ----------------------------------------------------
+
+/// The most a reader takes of one certificate.
+pub type Limits = new {
+  /// Its bytes.
+  bytes: Int,
+  /// Its extensions.
+  extensions: Int,
+  /// The attributes of one name, and the names of one extension.
+  names: Int,
+  /// How deep its DER nests.
+  depth: Int,
+}
+
+/// Limits no certificate of the public web comes near: 64 KiB, 64 extensions, 1024 names, 16
+/// levels.
+pub fn limits() -> Limits = { bytes: 65536, extensions: 64, names: 1024, depth: 16 }
+
+/// One attribute of a name: its type and its text, whatever string type wrote it. A value that is
+/// no string is `#` and its DER in hex.
+pub type Attribute = new { id: Oid, value: String }
+
+/// A distinguished name: its relative names, outermost first, each a set of attributes, and the
+/// DER it was read from, which is what two names are compared by.
+pub type Name = new { rdns: List<List<Attribute>>, der: Bytes }
+
+/// One name of a `GeneralName`.
+pub type GeneralName =
+  /// A DNS name, as written: a wildcard is still `*.`.
+  | Dns(String)
+  /// A mailbox.
+  | Email(String)
+  /// A URI.
+  | Uri(String)
+  /// An IP address.
+  | Address(Ip)
+  /// A directory name.
+  | Directory(Name)
+  /// An `otherName`: its type and its value's DER.
+  | Other(Oid, Bytes)
+  /// A registered identifier.
+  | Registered(Oid)
+  /// A name of a kind nothing here reads, `x400Address` (3) or `ediPartyName` (5): its DER.
+  | Unread(Int, Bytes)
+
+/// What a name constraint is on.
+pub type Subtree =
+  /// A DNS name and every name under it; the empty name is every name.
+  | DnsTree(String)
+  /// A mailbox, every mailbox of a host, or with a leading `.` every mailbox of a domain's hosts.
+  | EmailTree(String)
+  /// A URI's host, or with a leading `.` every host of a domain.
+  | UriTree(String)
+  /// A network.
+  | Network(Prefix)
+  /// Every directory name that starts with this one.
+  | DirectoryTree(Name)
+  /// A kind of name nothing here compares, by its tag number.
+  | OtherTree(Int)
+
+/// A use a key is certified for.
+pub type Usage =
+  | DigitalSignature
+  | ContentCommitment
+  | KeyEncipherment
+  | DataEncipherment
+  | KeyAgreement
+  | KeyCertSign
+  | CrlSign
+  | EncipherOnly
+  | DecipherOnly
+
+/// Where something about a certificate is fetched: the access method and the place.
+pub type Access = new { method: Oid, location: GeneralName }
+
+/// What an extension says, for the extensions this module reads.
+pub type Content =
+  /// `basicConstraints`: whether the subject is a CA, and how many CAs may follow it.
+  | Basic(Bool, Option<Int>)
+  | KeyUsage(List<Usage>)
+  | ExtendedKeyUsage(List<Oid>)
+  | SubjectAltName(List<GeneralName>)
+  | IssuerAltName(List<GeneralName>)
+  /// `nameConstraints`: the permitted subtrees, then the excluded.
+  | NameConstraints(List<Subtree>, List<Subtree>)
+  | SubjectKeyId(Bytes)
+  /// `authorityKeyIdentifier`: the key identifier, and whether it names an issuer and serial too.
+  | AuthorityKeyId(Option<Bytes>, Bool)
+  /// `authorityInfoAccess`: where the issuer's certificate and its OCSP responder are.
+  | AuthorityAccess(List<Access>)
+  /// `cRLDistributionPoints`: the full names of the points.
+  | CrlPoints(List<GeneralName>)
+  /// `certificatePolicies`: the policies' identifiers.
+  | Policies(List<Oid>)
+  /// An extension this module does not read: `value` is all there is.
+  | Unparsed
+
+/// An extension: its type, whether a verifier that does not understand it must refuse, the DER
+/// its `OCTET STRING` holds, and what that says.
+pub type Extension = new { id: Oid, critical: Bool, value: Bytes, content: Content }
+
+/// A subject's public key.
+pub type Key =
+  /// RSA: a PKCS #1 `RSAPublicKey`.
+  | RsaKey(Bytes)
+  /// An elliptic-curve key: the named curve and the point.
+  | EcKey(Oid, Bytes)
+  /// Ed25519: 32 bytes.
+  | Ed25519Key(Bytes)
+  /// A key of an algorithm nothing here verifies under, or written a way nothing here reads: the
+  /// algorithm and the key's bits.
+  | OtherKey(Oid, Bytes)
+
+/// How a certificate is signed.
+pub type Algorithm =
+  | RsaPkcs1(Digest)
+  | RsaPss(Digest)
+  | Ecdsa(Digest)
+  | Ed25519
+  /// An algorithm nothing here verifies: MD5 and SHA-1 are these.
+  | OtherAlgorithm(Oid)
+
+/// What a certificate says.
+pub type Info = new {
+  /// 1, 2 or 3.
+  version: Int,
+  /// The serial number: an `INTEGER`'s content.
+  serial: Bytes,
+  algorithm: Algorithm,
+  issuer: Name,
+  subject: Name,
+  not_before: OffsetDateTime,
+  not_after: OffsetDateTime,
+  key: Key,
+  /// The `SubjectPublicKeyInfo`, in DER.
+  spki: Bytes,
+  extensions: List<Extension>,
+}
+
+/// A certificate that was read: what it says, and the bytes that say it.
+pub opaque type Certificate = new { der: Bytes, tbs: Bytes, signature: Bytes, info: Info }
+
+/// Why bytes are no certificate this module reads.
+pub type Refusal =
+  /// More bytes than the limit: how many.
+  | TooLong(Int)
+  /// Not DER, or not a certificate's structure.
+  | NotDer(asn1::Refusal)
+  /// A version other than 1, 2 or 3, or one that does not allow the fields written.
+  | BadVersion(Int)
+  /// A serial number that is negative, or to the letter one that is zero or over twenty octets.
+  | BadSerial
+  /// The signature algorithm is written two ways.
+  | AlgorithmMismatch
+  /// A signature that is not whole octets.
+  | BadSignature
+  /// An extension this module reads whose value is not its type's.
+  | Malformed(Oid)
+  /// A name that is none: a relative name of no attributes, an IP address that is not four or
+  /// sixteen octets, a network whose mask has a hole.
+  | BadName
+  /// An extension written twice.
+  | Duplicate(Oid)
+  /// More extensions or names than the limit.
+  | TooMany
+  /// A PEM text that is not certificates.
+  | NotPem
+  /// A request not signed by the key it carries.
+  | Unproven
+  /// A draft with text no string type holds, or an instant no time writes.
+  | Unwritable
+
+/// What this module raises where it refuses.
+pub effect x509 {
+  /// The bytes are no certificate.
+  raise refused(e: Refusal)
+}
+
+/// What `c` says.
+pub fn info(c: Certificate) -> Info = c.info
+
+/// The certificate, in DER.
+pub fn der(c: Certificate) -> Bytes = c.der
+
+/// The bytes the signature is over: the `TBSCertificate`, in DER.
+pub fn signed_bytes(c: Certificate) -> Bytes = c.tbs
+
+/// The signature.
+pub fn signature(c: Certificate) -> Bytes = c.signature
+
+/// SHA-256 of the certificate.
+pub fn fingerprint(c: Certificate) -> Bytes / {abort.raise} = sha256(c.der)
+
+/// SHA-256 of the `SubjectPublicKeyInfo`: what a pin is.
+pub fn key_pin(c: Certificate) -> Bytes / {abort.raise} = sha256(c.info.spki)
+
+/// What the extension `id` says, or `None` where the certificate has none.
+pub fn extension(c: Certificate, id: Oid) -> Option<Extension> =
+  find(c.info.extensions, |e: Extension| e.id == id)
+
+/// The subject alternative names.
+pub fn alt_names(c: Certificate) -> List<GeneralName> =
+  flat_map(c.info.extensions, |e: Extension|
+    match e.content { SubjectAltName(names) -> names, _ -> [] })
+
+/// Whether `basicConstraints` says the subject is a CA.
+pub fn is_ca(c: Certificate) -> Bool =
+  any(c.info.extensions, |e: Extension| match e.content { Basic(ca, _) -> ca, _ -> false })
+
+/// Whether the subject and the issuer are one name.
+pub fn is_self_issued(c: Certificate) -> Bool = c.info.subject.der == c.info.issuer.der
+
+// --- Identifiers -----------------------------------------------------------------
+
+fn ext(last: Int) -> Oid = oid::Oid([2, 5, 29, last])
+
+fn pkix(arcs: List<Int>) -> Oid = oid::Oid(concat([1, 3, 6, 1, 5, 5, 7], arcs))
+
+/// `id-kp-serverAuth`.
+pub fn server_auth() -> Oid = pkix([3, 1])
+
+/// `id-kp-clientAuth`.
+pub fn client_auth() -> Oid = pkix([3, 2])
+
+/// `anyExtendedKeyUsage`.
+pub fn any_purpose() -> Oid = oid::Oid([2, 5, 29, 37, 0])
+
+/// `id-ad-ocsp`: the access method of an OCSP responder.
+pub fn ocsp() -> Oid = pkix([48, 1])
+
+/// `id-ad-caIssuers`: the access method of the issuer's certificate.
+pub fn ca_issuers() -> Oid = pkix([48, 2])
+
+// --- Reading ---------------------------------------------------------------------
+
+/// How closely a certificate is held to RFC 5280 as it is read.
+pub type Reading =
+  /// To all of it.
+  | Strict
+  /// But for what certificates in use get wrong: a serial number that is zero, as a root still
+  /// trusted has, or over twenty octets, and an extension whose `critical` is written out as
+  /// false. A negative serial number is refused all the same.
+  | Tolerant
+
+effect set Row = {asn1.refused, x509.refused, abort.raise}
+
+/// The certificate `data` is, in DER and nothing else: RFC 5280's structure, with the version, the
+/// serial number, the two writings of the signature algorithm and every extension read here held
+/// to it. Raises `x509.refused`.
+pub fn read(
+  data: Bytes,
+  limits: Limits,
+  mode: Reading,
+) -> Certificate / {x509.refused, abort.raise} =
+  if bytes_len(data) > limits.bytes { x509.refused(TooLong(bytes_len(data))) } else {
+    match asn1::decode_with(data, limits.depth, |r: Reader| certificate_at(r, data, limits, mode)) {
+      Ok(c) -> c,
+      Err(e) -> x509.refused(NotDer(e)),
+    }
+  }
+
+/// `read`, answering a refusal as an `Err`.
+pub fn parse(
+  data: Bytes,
+  limits: Limits,
+  mode: Reading,
+) -> Result<Certificate, Refusal> / {abort.raise} = try { read(data, limits, mode) }
+
+/// The certificates a PEM text holds, in order, each read as `read` reads one. Raises `NotPem`
+/// for a text that is not PEM or holds a block that is no `CERTIFICATE`.
+pub fn read_pem(
+  text: String,
+  limits: Limits,
+  mode: Reading,
+) -> List<Certificate> / {x509.refused, abort.raise} =
+  match pem::decode(text, limits.bytes * 64) {
+    Err(_) -> x509.refused(NotPem),
+    Ok(items) ->
+      map(items, |item: pem::Item|
+        match item {
+          pem::Open(block) -> if pem::label_text(block.label) == "CERTIFICATE" {
+            read(block.data, limits, mode)
+          } else { x509.refused(NotPem) },
+          pem::Sealed(_) -> x509.refused(NotPem),
+        }),
+  }
+
+/// `certificates` as PEM, a `CERTIFICATE` block each, in order: what `read_pem` reads back, and a
+/// leaf then its intermediates is the chain file a server is given.
+pub fn write_pem(certificates: List<Certificate>) -> String / {abort.raise} =
+  fold(certificates, "", |text: String, c: Certificate| {
+    let block: pem::Block = { label: pem::Certificate, headers: [], data: c.der };
+    match pem::encode(block) {
+      Ok(written) -> text ++ written,
+      Err(_) -> panic("a certificate's label is written"),
+    }
+  })
+
+fn certificate_at(
+  r: Reader,
+  data: Bytes,
+  limits: Limits,
+  mode: Reading,
+) -> Read<Certificate> / {Row} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let tbs = asn1::read_raw(fields);
+    let body = asn1::within(asn1::read_sequence(fields), |t: Reader| body_at(t, limits, mode));
+    let outer = asn1::read_raw(body.rest);
+    let signature = asn1::read_bit_string(outer.rest);
+    if outer.value != body.value.algorithm { x509.refused(AlgorithmMismatch) }
+    else if signature.value.unused != 0 { x509.refused(BadSignature) } else {
+      {
+        value: {
+          der: data,
+          tbs: tbs.value,
+          signature: signature.value.bytes,
+          info: body.value.info,
+        },
+        rest: signature.rest,
+      }
+    }
+  })
+
+fn body_at(
+  t: Reader,
+  limits: Limits,
+  mode: Reading,
+) -> Read<{ info: Info, algorithm: Bytes }> / {Row} = {
+  let version = asn1::read_default(t, asn1::context(0), 0, |r: Reader|
+    asn1::read_explicit(r, asn1::context(0), asn1::read_int));
+  let serial = asn1::read_integer(version.rest);
+  let written = asn1::read_raw(serial.rest);
+  let algorithm = algorithm_at(serial.rest);
+  let issuer = name_at(algorithm.rest, limits);
+  let validity = asn1::within(asn1::read_sequence(issuer.rest), |v: Reader| {
+    let from = asn1::read_time(v);
+    let until = asn1::read_time(from.rest);
+    { value: { from: from.value, until: until.value }, rest: until.rest }
+  });
+  let subject = name_at(validity.rest, limits);
+  let spki = asn1::read_raw(subject.rest);
+  let key = key_at(subject.rest);
+  let issuer_id = asn1::read_optional(key.rest, asn1::context(1), |r: Reader|
+    asn1::read_implicit(r, asn1::context(1), asn1::read_bit_string));
+  let subject_id = asn1::read_optional(issuer_id.rest, asn1::context(2), |r: Reader|
+    asn1::read_implicit(r, asn1::context(2), asn1::read_bit_string));
+  let extensions = asn1::read_optional(subject_id.rest, asn1::context(3), |r: Reader|
+    asn1::read_explicit(r, asn1::context(3), |x: Reader|
+      asn1::read_sequence_of(x, |e: Reader| extension_at(e, limits, mode))));
+  let ids = issuer_id.value != None || subject_id.value != None;
+  let listed = match extensions.value { Some(list) -> list, None -> [] };
+  if version.value < 0 || version.value > 2 { x509.refused(BadVersion(version.value + 1)) }
+  else if (version.value < 2 && extensions.value != None) || (version.value < 1 && ids)
+      || extensions.value == Some([]) { x509.refused(BadVersion(version.value + 1)) }
+  else if !serial_held(serial.value, mode) { x509.refused(BadSerial) }
+  else if len(listed) > limits.extensions { x509.refused(TooMany) } else {
+    unrepeated(listed);
+    {
+      value: {
+        info: {
+          version: version.value + 1,
+          serial: serial.value,
+          algorithm: algorithm.value,
+          issuer: issuer.value,
+          subject: subject.value,
+          not_before: validity.value.from,
+          not_after: validity.value.until,
+          key: key.value,
+          spki: spki.value,
+          extensions: listed,
+        },
+        algorithm: written.value,
+      },
+      rest: extensions.rest,
+    }
+  }
+}
+
+/// Whether a serial number is one `mode` takes: never a negative one, and to the letter a positive
+/// one of at most twenty octets.
+fn serial_held(serial: Bytes, mode: Reading) -> Bool / {abort.raise} =
+  bytes_at(serial, 0) < 0x80 && (mode == Tolerant || (bytes_len(serial) <= 20 && serial != b"\x00"))
+
+fn unrepeated(extensions: List<Extension>) -> Unit / {x509.refused} = {
+  fold(extensions, [], |seen: List<Oid>, e: Extension|
+    if contains(seen, e.id) { x509.refused(Duplicate(e.id)) } else { push(seen, e.id) });
+  ()
+}
+
+/// An `AlgorithmIdentifier`'s type and parameters.
+fn identified(r: Reader) -> Read<{ id: Oid, parameters: Option<Value> }> / {Row} =
+  asn1::within(asn1::read_sequence(r), |a: Reader| {
+    let id = asn1::read_oid(a);
+    if asn1::is_empty(id.rest) { { value: { id: id.value, parameters: None }, rest: id.rest } }
+    else {
+      let parameters = asn1::read_any(id.rest);
+      { value: { id: id.value, parameters: Some(parameters.value) }, rest: parameters.rest }
+    }
+  })
+
+fn digest_of(id: Oid) -> Option<Digest> =
+  if id == oid::sha256() { Some(Sha256) }
+  else if id == oid::sha384() { Some(Sha384) }
+  else if id == oid::sha512() { Some(Sha512) }
+  else { None }
+
+fn digest_bytes(d: Digest) -> Int = match d { Sha256 -> 32, Sha384 -> 48, Sha512 -> 64 }
+
+/// The hash of an `AlgorithmIdentifier` that names one, with a `NULL` or with nothing.
+fn hash_named(v: Value) -> Option<Digest> =
+  match v {
+    asn1::Sequence([asn1::ObjectId(id)]) -> digest_of(id),
+    asn1::Sequence([asn1::ObjectId(id), asn1::Null]) -> digest_of(id),
+    _ -> None,
+  }
+
+/// The hash of RSASSA-PSS parameters that are one hash, MGF1 over it and a salt of its length.
+fn pss_digest(parameters: Value) -> Option<Digest> / {abort.raise} =
+  match parameters {
+    asn1::Sequence([asn1::Constructed(_, [hash]), asn1::Constructed(_, [asn1::Sequence([asn1::ObjectId(mgf), masked])]), asn1::Constructed(_, [asn1::Integer(salt)])]) -> match hash_named(
+        hash,
+      ) {
+      Some(d) -> if mgf == oid::Oid([1, 2, 840, 113549, 1, 1, 8]) && hash_named(masked) == Some(d)
+          && asn1::int_of_integer(salt) == Some(digest_bytes(d)) { Some(d) }
+      else { None },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn algorithm_at(r: Reader) -> Read<Algorithm> / {Row} = {
+  let found = identified(r);
+  let id = found.value.id;
+  let bare = found.value.parameters == None;
+  let null = found.value.parameters == Some(asn1::Null);
+  let rsa = |d: Digest| if null { RsaPkcs1(d) } else { OtherAlgorithm(id) };
+  let ec = |d: Digest| if bare { Ecdsa(d) } else { OtherAlgorithm(id) };
+  let algorithm = if id == oid::sha256_with_rsa_encryption() { rsa(Sha256) }
+  else if id == oid::sha384_with_rsa_encryption() { rsa(Sha384) }
+  else if id == oid::sha512_with_rsa_encryption() { rsa(Sha512) }
+  else if id == oid::ecdsa_with_sha256() { ec(Sha256) }
+  else if id == oid::ecdsa_with_sha384() { ec(Sha384) }
+  else if id == oid::Oid([1, 2, 840, 10045, 4, 3, 4]) { ec(Sha512) }
+  else if id == oid::ed25519() && bare { Ed25519 } else if id == oid::rsassa_pss() {
+    match found.value.parameters {
+      Some(parameters) -> match pss_digest(parameters) {
+        Some(d) -> RsaPss(d),
+        None -> OtherAlgorithm(id),
+      },
+      None -> OtherAlgorithm(id),
+    }
+  } else { OtherAlgorithm(id) };
+  { value: algorithm, rest: found.rest }
+}
+
+fn key_at(r: Reader) -> Read<Key> / {Row} =
+  asn1::within(asn1::read_sequence(r), |s: Reader| {
+    let found = identified(s);
+    let bits = asn1::read_bit_string(found.rest);
+    let id = found.value.id;
+    let whole = bits.value.unused == 0;
+    let key = if id == oid::rsa_encryption() && found.value.parameters == Some(asn1::Null) && whole
+        && crypto::rsa_modulus_bits(bits.value.bytes) != None { RsaKey(bits.value.bytes) }
+    else if id == oid::ed25519() && found.value.parameters == None && whole
+        && bytes_len(bits.value.bytes) == 32 { Ed25519Key(bits.value.bytes) }
+    else if id == oid::ec_public_key() && whole {
+      match found.value.parameters {
+        Some(asn1::ObjectId(curve)) -> EcKey(curve, bits.value.bytes),
+        _ -> OtherKey(id, bits.value.bytes),
+      }
+    } else { OtherKey(id, bits.value.bytes) };
+    { value: key, rest: bits.rest }
+  })
+
+fn latin1(bytes: Bytes) -> String / {abort.raise} =
+  string_of_chars(
+    flat_map(range(0, bytes_len(bytes)), |i: Int|
+      match char_of_int(bytes_at(bytes, i)) { Some(c) -> [c], None -> [] }),
+  )
+
+fn attribute_at(r: Reader) -> Read<Attribute> / {Row} =
+  asn1::within(asn1::read_sequence(r), |a: Reader| {
+    let id = asn1::read_oid(a);
+    let raw = asn1::read_raw(id.rest);
+    let value = asn1::read_any(id.rest);
+    let text = match value.value {
+      asn1::Text(_, text) -> text,
+      asn1::Primitive(tag, content) -> if tag == asn1::universal(20) { latin1(content) }
+      else { "#" ++ hex_of(raw.value) },
+      _ -> "#" ++ hex_of(raw.value),
+    };
+    { value: { id: id.value, value: text }, rest: value.rest }
+  })
+
+fn name_at(r: Reader, limits: Limits) -> Read<Name> / {Row} = {
+  let raw = asn1::read_raw(r);
+  let rdns = asn1::read_sequence_of(r, |rdn: Reader| asn1::read_set_of(rdn, attribute_at));
+  if fold(rdns.value, 0, |n: Int, rdn: List<Attribute>| n + len(rdn)) > limits.names {
+    x509.refused(TooMany)
+  } else if any(rdns.value, |rdn: List<Attribute>| len(rdn) == 0) { x509.refused(BadName) }
+  else { { value: { rdns: rdns.value, der: raw.value }, rest: rdns.rest } }
+}
+
+fn ia5(r: Reader, number: Int) -> Read<String> / {Row} =
+  asn1::read_implicit(r, asn1::context(number), |x: Reader| asn1::read_string(x, Ia5String))
+
+fn general_name_at(r: Reader, limits: Limits) -> Read<GeneralName> / {Row} = {
+  let number = match asn1::peek(r) { Some(tag) -> tag.number, None -> 0 - 1 };
+  if number == 1 {
+    let text = ia5(r, 1);
+    { value: Email(text.value), rest: text.rest }
+  } else if number == 2 {
+    let text = ia5(r, 2);
+    { value: Dns(text.value), rest: text.rest }
+  } else if number == 6 {
+    let text = ia5(r, 6);
+    { value: Uri(text.value), rest: text.rest }
+  } else if number == 7 {
+    let octets = asn1::read_primitive(r, asn1::context(7));
+    match ip::of_bytes(octets.value) {
+      Some(address) -> { value: Address(address), rest: octets.rest },
+      None -> x509.refused(BadName),
+    }
+  } else if number == 4 {
+    let name = asn1::read_explicit(r, asn1::context(4), |x: Reader| name_at(x, limits));
+    { value: Directory(name.value), rest: name.rest }
+  } else if number == 8 {
+    let id = asn1::read_implicit(r, asn1::context(8), asn1::read_oid);
+    { value: Registered(id.value), rest: id.rest }
+  } else if number == 0 {
+    let other = asn1::within(asn1::read_constructed(r, asn1::context(0)), |x: Reader| {
+      let id = asn1::read_oid(x);
+      let value = asn1::read_raw(id.rest);
+      { value: Other(id.value, value.value), rest: value.rest }
+    });
+    other
+  } else {
+    let raw = asn1::read_raw(r);
+    { value: Unread(number, raw.value), rest: raw.rest }
+  }
+}
+
+fn general_names_at(r: Reader, limits: Limits) -> Read<List<GeneralName>> / {Row} = {
+  let names = asn1::read_sequence_of(r, |x: Reader| general_name_at(x, limits));
+  if len(names.value) > limits.names { x509.refused(TooMany) } else { names }
+}
+
+/// The length of a mask that is ones then zeros, or `None` for any other.
+fn mask_length(mask: Bytes) -> Option<Int> / {abort.raise} = {
+  let bits = flat_map(range(0, bytes_len(mask)), |i: Int|
+    map(range(0, 8), |b: Int| bytes_at(mask, i) >>> 7 - b & 1));
+  let ones = count(bits, |b: Int| b == 1);
+  if fold(range(0, len(bits)), true, |ok: Bool, i: Int|
+      ok && list_at(bits, i) == Some(if i < ones { 1 } else { 0 })) { Some(ones) }
+  else { None }
+}
+
+fn subtree_at(r: Reader, limits: Limits) -> Read<Subtree> / {Row} =
+  asn1::within(asn1::read_sequence(r), |s: Reader| {
+    if asn1::peek(s) == Some(asn1::context(7)) {
+      let octets = asn1::read_primitive(s, asn1::context(7));
+      let half = bytes_len(octets.value) / 2;
+      let network = match ((
+          ip::of_bytes(bytes_slice(octets.value, 0, half)),
+          mask_length(bytes_slice(octets.value, half, 2 * half)),
+        )) {
+        (Some(address), Some(length)) -> ip::prefix_holding(address, length),
+        _ -> None,
+      };
+      match network {
+        Some(p) -> { value: Network(p), rest: octets.rest },
+        None -> x509.refused(BadName),
+      }
+    } else {
+      let base = general_name_at(s, limits);
+      let tree = match base.value {
+        Dns(name) -> DnsTree(name),
+        Email(mailbox) -> EmailTree(mailbox),
+        Uri(host) -> UriTree(host),
+        Directory(name) -> DirectoryTree(name),
+        Address(_) -> x509.refused(BadName),
+        Other(_, _) -> OtherTree(0),
+        Registered(_) -> OtherTree(8),
+        Unread(number, _) -> OtherTree(number),
+      };
+      { value: tree, rest: base.rest }
+    }
+  })
+
+fn subtrees_at(r: Reader, number: Int, limits: Limits) -> Read<Option<List<Subtree>>> / {Row} =
+  asn1::read_optional(r, asn1::context(number), |x: Reader| {
+    let trees = asn1::read_implicit(x, asn1::context(number), |y: Reader|
+      asn1::read_sequence_of(y, |s: Reader| subtree_at(s, limits)));
+    if len(trees.value) == 0 { x509.refused(BadName) }
+    else if len(trees.value) > limits.names { x509.refused(TooMany) }
+    else { trees }
+  })
+
+fn usage_at(bit: Int) -> Option<Usage> =
+  list_at(
+    [
+      DigitalSignature,
+      ContentCommitment,
+      KeyEncipherment,
+      DataEncipherment,
+      KeyAgreement,
+      KeyCertSign,
+      CrlSign,
+      EncipherOnly,
+      DecipherOnly,
+    ],
+    bit,
+  )
+
+/// What the value of the extension `id` says, read from the reader over it.
+fn content_at(id: Oid, r: Reader, limits: Limits) -> Read<Content> / {Row} =
+  if id == oid::basic_constraints() {
+    asn1::within(asn1::read_sequence(r), |s: Reader| {
+      let ca = asn1::read_default(s, asn1::universal(1), false, asn1::read_boolean);
+      let length = asn1::read_optional(ca.rest, asn1::universal(2), asn1::read_int);
+      { value: Basic(ca.value, length.value), rest: length.rest }
+    })
+  } else if id == oid::key_usage() {
+    let bits = asn1::read_named_bits(r);
+    let width = bytes_len(bits.value.bytes) * 8 - bits.value.unused;
+    {
+      value: KeyUsage(
+        flat_map(range(0, min(width, 9)), |i: Int|
+          if asn1::bit_at(bits.value, i) { match usage_at(i) { Some(u) -> [u], None -> [] } }
+          else { [] }),
+      ),
+      rest: bits.rest,
+    }
+  } else if id == oid::ext_key_usage() {
+    let purposes = asn1::read_sequence_of(r, asn1::read_oid);
+    if len(purposes.value) == 0 { x509.refused(Malformed(id)) }
+    else { { value: ExtendedKeyUsage(purposes.value), rest: purposes.rest } }
+  } else if id == oid::subject_alt_name() || id == ext(18) {
+    let names = general_names_at(r, limits);
+    if len(names.value) == 0 { x509.refused(Malformed(id)) }
+    else if id == ext(18) { { value: IssuerAltName(names.value), rest: names.rest } }
+    else { { value: SubjectAltName(names.value), rest: names.rest } }
+  } else if id == ext(30) {
+    asn1::within(asn1::read_sequence(r), |s: Reader| {
+      let permitted = subtrees_at(s, 0, limits);
+      let excluded = subtrees_at(permitted.rest, 1, limits);
+      if permitted.value == None && excluded.value == None { x509.refused(Malformed(id)) } else {
+        {
+          value: NameConstraints(
+            match permitted.value { Some(trees) -> trees, None -> [] },
+            match excluded.value { Some(trees) -> trees, None -> [] },
+          ),
+          rest: excluded.rest,
+        }
+      }
+    })
+  } else if id == oid::subject_key_identifier() {
+    let key = asn1::read_octet_string(r);
+    { value: SubjectKeyId(key.value), rest: key.rest }
+  } else if id == oid::authority_key_identifier() {
+    asn1::within(asn1::read_sequence(r), |s: Reader| {
+      let key = asn1::read_optional(s, asn1::context(0), |x: Reader|
+        asn1::read_implicit(x, asn1::context(0), asn1::read_octet_string));
+      let issuer = asn1::read_optional(key.rest, asn1::context(1), asn1::read_raw);
+      let serial = asn1::read_optional(issuer.rest, asn1::context(2), asn1::read_raw);
+      {
+        value: AuthorityKeyId(key.value, issuer.value != None || serial.value != None),
+        rest: serial.rest,
+      }
+    })
+  } else if id == pkix([1, 1]) {
+    let places = asn1::read_sequence_of(r, |x: Reader|
+      asn1::within(asn1::read_sequence(x), |a: Reader| {
+        let method = asn1::read_oid(a);
+        let location = general_name_at(method.rest, limits);
+        let access: Access = { method: method.value, location: location.value };
+        { value: access, rest: location.rest }
+      }));
+    if len(places.value) == 0 { x509.refused(Malformed(id)) }
+    else { { value: AuthorityAccess(places.value), rest: places.rest } }
+  } else if id == ext(31) {
+    let points = asn1::read_sequence_of(r, |x: Reader|
+      asn1::within(asn1::read_sequence(x), |p: Reader| {
+        let named = asn1::read_optional(p, asn1::context(0), |n: Reader|
+          asn1::read_explicit(n, asn1::context(0), |full: Reader|
+            if asn1::peek(full) == Some(asn1::context(0)) {
+              asn1::read_implicit(full, asn1::context(0), |g: Reader| general_names_at(g, limits))
+            } else {
+              let relative = asn1::read_raw(full);
+              { value: [], rest: relative.rest }
+            }));
+        let reasons = asn1::read_optional(named.rest, asn1::context(1), asn1::read_raw);
+        let issuer = asn1::read_optional(reasons.rest, asn1::context(2), asn1::read_raw);
+        { value: match named.value { Some(names) -> names, None -> [] }, rest: issuer.rest }
+      }));
+    {
+      value: CrlPoints(flat_map(points.value, |names: List<GeneralName>| names)),
+      rest: points.rest,
+    }
+  } else if id == ext(32) {
+    let policies = asn1::read_sequence_of(r, |x: Reader|
+      asn1::within(asn1::read_sequence(x), |p: Reader| {
+        let policy = asn1::read_oid(p);
+        let qualifiers = asn1::read_optional(policy.rest, asn1::universal(16), asn1::read_raw);
+        { value: policy.value, rest: qualifiers.rest }
+      }));
+    { value: Policies(policies.value), rest: policies.rest }
+  } else {
+    let whole = asn1::read_raw(r);
+    { value: Unparsed, rest: whole.rest }
+  }
+
+/// Whether this module reads the extension `id`.
+fn is_read(id: Oid) -> Bool =
+  contains(
+    [
+      oid::basic_constraints(),
+      oid::key_usage(),
+      oid::ext_key_usage(),
+      oid::subject_alt_name(),
+      ext(18),
+      ext(30),
+      oid::subject_key_identifier(),
+      oid::authority_key_identifier(),
+      pkix([1, 1]),
+      ext(31),
+      ext(32),
+    ],
+    id,
+  )
+
+fn extension_at(r: Reader, limits: Limits, mode: Reading) -> Read<Extension> / {Row} =
+  asn1::within(asn1::read_sequence(r), |e: Reader| {
+    let id = asn1::read_oid(e);
+    let critical = if mode == Strict {
+      asn1::read_default(id.rest, asn1::universal(1), false, asn1::read_boolean)
+    } else {
+      let written = asn1::read_optional(id.rest, asn1::universal(1), asn1::read_boolean);
+      { value: written.value == Some(true), rest: written.rest }
+    };
+    let value = asn1::read_octet_string(critical.rest);
+    let content = if !is_read(id.value) { Unparsed } else {
+      match asn1::decode_with(value.value, limits.depth, |x: Reader|
+          content_at(id.value, x, limits)) {
+        Ok(content) -> content,
+        Err(_) -> x509.refused(Malformed(id.value)),
+      }
+    };
+    {
+      value: { id: id.value, critical: critical.value, value: value.value, content: content },
+      rest: value.rest,
+    }
+  })
+
+// --- Names -----------------------------------------------------------------------
+
+fn label_held(label: String) -> Bool / {abort.raise} = {
+  let b = bytes_of_string(label);
+  let n = bytes_len(b);
+  n >= 1 && n <= 63 && bytes_scan(b, 0, b"abcdefghijklmnopqrstuvwxyz0123456789-", n) == n
+    && bytes_at(b, 0) != b'-'
+    && bytes_at(b, n - 1) != b'-'
+}
+
+fn all_digits(label: String) -> Bool / {abort.raise} = {
+  let b = bytes_of_string(label);
+  bytes_scan(b, 0, b"0123456789", bytes_len(b)) == bytes_len(b)
+}
+
+/// The labels of a host's name in lower case, or `None` for a text that is none: a label that is
+/// empty, over 63 octets, not letters, digits and inner hyphens, or a last label of digits alone,
+/// which is how an IP address ends.
+fn labels_of(name: String) -> Option<List<String>> / {abort.raise} =
+  if !is_ascii(name) || string_len(name) == 0 || string_len(name) > 253 { None } else {
+    let labels = string_split(ascii_lower(name), ".");
+    let numeric = match list_at(labels, len(labels) - 1) { Some(l) -> all_digits(l), None -> true };
+    if all(labels, label_held) && !numeric { Some(labels) } else { None }
+  }
+
+/// A DNS name a certificate presents: its labels, less a leading `*` it may stand a wildcard for.
+type Pattern = { wildcard: Bool, labels: List<String> }
+
+/// `None` for a name that is none, for a `*` anywhere but alone in the first label, and for a
+/// wildcard over fewer than two labels, which is every name of a top-level domain.
+fn pattern_of(name: String) -> Option<Pattern> / {abort.raise} = {
+  let wildcard = string_starts_with(name, "*.");
+  match labels_of(if wildcard { string_slice(name, 2, string_len(name)) } else { name }) {
+    Some(labels) -> if wildcard && len(labels) < 2 { None }
+    else { Some({ wildcard: wildcard, labels: labels }) },
+    None -> None,
+  }
+}
+
+/// The labels of the host a caller expects, a name of another script taken through `std.idna`.
+fn host_labels(host: String) -> Option<List<String>> / {abort.raise} = {
+  let bare = if string_ends_with(host, ".") { string_slice(host, 0, string_len(host) - 1) }
+  else { host };
+  if is_ascii(bare) { labels_of(bare) } else {
+    match idna::to_ascii(bare, idna::strict()) { Ok(name) -> labels_of(name), Err(_) -> None }
+  }
+}
+
+fn tail_of(labels: List<String>, n: Int) -> List<String> =
+  fold(range(max(len(labels) - n, 0), len(labels)), [], |tail: List<String>, i: Int|
+    match list_at(labels, i) { Some(l) -> push(tail, l), None -> tail })
+
+fn ends_with(labels: List<String>, tail: List<String>) -> Bool =
+  len(labels) >= len(tail) && tail_of(labels, len(tail)) == tail
+
+/// Who a certificate is expected to be for.
+pub type Identity =
+  /// A host, by its DNS name, in ASCII or not.
+  | Host(String)
+  /// A host, by its address.
+  | At(Ip)
+  /// Whoever the certificate names: no name is checked.
+  | Anyone
+
+/// Whether `c` is for `who`, as RFC 9525 reads a certificate: by its subject alternative names
+/// alone, never the subject's common name. A DNS name matches a host without regard to case, a
+/// wildcard standing for exactly one label, the first; an IP address matches an address.
+pub fn names(c: Certificate, who: Identity) -> Bool / {abort.raise} =
+  match who {
+    Anyone -> true,
+    At(address) -> any(alt_names(c), |n: GeneralName| n == Address(address)),
+    Host(host) -> match host_labels(host) {
+      None -> false,
+      Some(labels) ->
+        any(alt_names(c), |n: GeneralName|
+          match n {
+            Dns(presented) -> match pattern_of(presented) {
+              Some(p) -> if p.wildcard {
+                len(labels) == len(p.labels) + 1 && ends_with(labels, p.labels)
+              } else { labels == p.labels },
+              None -> false,
+            },
+            _ -> false,
+          }),
+    },
+  }
+
+// --- Name constraints ---------------------------------------------------------------
+
+/// Where a name stands to a subtree.
+type Held = | Inside | Elsewhere | Garbled
+
+fn held_if(inside: Bool) -> Held = if inside { Inside } else { Elsewhere }
+
+/// The host of a mailbox or of a URI's authority, as labels.
+fn mailbox_of(mailbox: String) -> Option<{ local: String, host: List<String> }> / {abort.raise} =
+  match string_split(mailbox, "@") {
+    [local, host] -> match labels_of(host) {
+      Some(labels) -> if local == "" { None } else { Some({ local: local, host: labels }) },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn uri_host(uri: String) -> Option<List<String>> / {abort.raise} =
+  match string_split(uri, "://") {
+    [_, rest, ..] -> {
+      let authority = match string_split(rest, "/") { [a, ..] -> a, [] -> rest };
+      let unqueried = match string_split(authority, "?") { [a, ..] -> a, [] -> authority };
+      let host = match string_split(unqueried, "@") { [_, h] -> h, [h] -> h, _ -> "" };
+      labels_of(match string_split(host, ":") { [h, ..] -> h, [] -> host })
+    },
+    _ -> None,
+  }
+
+/// A host against a constraint on hosts: the host itself, or with a leading `.` any host under it.
+fn host_held(host: List<String>, tree: String) -> Held / {abort.raise} =
+  if string_starts_with(tree, ".") {
+    match labels_of(string_slice(tree, 1, string_len(tree))) {
+      Some(domain) -> held_if(len(host) > len(domain) && ends_with(host, domain)),
+      None -> Garbled,
+    }
+  } else { match labels_of(tree) { Some(exact) -> held_if(host == exact), None -> Garbled } }
+
+/// Where `name` stands to `tree`, which is on names of its kind. A wildcard is inside a subtree
+/// that holds what follows its `*`; `excluding`, it is also inside one that a name it stands for
+/// would be in.
+fn held(name: GeneralName, tree: Subtree, excluding: Bool) -> Held / {abort.raise} =
+  match ((name, tree)) {
+    (Dns(presented), DnsTree(base)) -> match ((pattern_of(presented), labels_of(base))) {
+      (Some(p), None) -> if base == "" { Inside } else { Garbled },
+      (Some(p), Some(under)) ->
+        held_if(
+          ends_with(p.labels, under)
+            || (excluding && p.wildcard && len(under) == len(p.labels) + 1
+            && ends_with(under, p.labels)),
+        ),
+      _ -> Garbled,
+    },
+    (Email(mailbox), EmailTree(base)) -> match mailbox_of(mailbox) {
+      None -> Garbled,
+      Some(m) -> if string_contains(base, "@") {
+        match mailbox_of(base) {
+          Some(exact) -> held_if(m.local == exact.local && m.host == exact.host),
+          None -> Garbled,
+        }
+      } else { host_held(m.host, base) },
+    },
+    (Uri(uri), UriTree(base)) -> match uri_host(uri) {
+      Some(host) -> host_held(host, base),
+      None -> Garbled,
+    },
+    (Address(address), Network(net)) -> held_if(ip::contains(net, address)),
+    (Directory(found), DirectoryTree(base)) ->
+      held_if(
+        len(found.rdns) >= len(base.rdns)
+          && fold(range(0, len(base.rdns)), true, |same: Bool, i: Int|
+            same && list_at(found.rdns, i) == list_at(base.rdns, i)),
+      ),
+    _ -> Garbled,
+  }
+
+fn name_kind(name: GeneralName) -> Int =
+  match name {
+    Other(_, _) -> 0,
+    Email(_) -> 1,
+    Dns(_) -> 2,
+    Unread(number, _) -> number,
+    Directory(_) -> 4,
+    Uri(_) -> 6,
+    Address(_) -> 7,
+    Registered(_) -> 8,
+  }
+
+fn tree_kind(tree: Subtree) -> Int =
+  match tree {
+    OtherTree(number) -> number,
+    EmailTree(_) -> 1,
+    DnsTree(_) -> 2,
+    DirectoryTree(_) -> 4,
+    UriTree(_) -> 6,
+    Network(_) -> 7,
+  }
+
+/// The names of `c` a constraint is checked against: its alternative names, and its subject.
+fn constrained_names(c: Certificate) -> List<GeneralName> =
+  if len(c.info.subject.rdns) == 0 { alt_names(c) }
+  else { push(alt_names(c), Directory(c.info.subject)) }
+
+// --- Verifying -------------------------------------------------------------------
+
+/// What a certificate's key is to be used for.
+pub type Purpose =
+  /// Proving a server's name to a client: `id-kp-serverAuth`.
+  | ServerAuth
+  /// Proving a client to a server: `id-kp-clientAuth`.
+  | ClientAuth
+
+/// What a verification spends at most, and what it holds a path to.
+pub type Policy = new {
+  /// The most signatures checked.
+  signatures: Int,
+  /// The most CAs between the leaf and the anchor, one that is self-issued not counted.
+  depth: Int,
+  /// The most comparisons of a name with a constraint.
+  comparisons: Int,
+  /// The fewest bits of an RSA modulus.
+  rsa_bits: Int,
+  /// Whether a path is held to what the CA/Browser Forum requires of a public one beyond RFC
+  /// 5280: version 3 throughout, key identifiers present and not critical, a CA's
+  /// `basicConstraints` critical, no empty issuer or CA subject, and alternative names critical
+  /// exactly where the subject is empty.
+  web: Bool,
+}
+
+/// What a public certificate is held to: 100 signatures, 6 CAs between leaf and anchor, 100000
+/// comparisons, RSA of 2048 bits, and the web's profile.
+pub fn strict() -> Policy =
+  { signatures: 100, depth: 6, comparisons: 100000, rsa_bits: 2048, web: true }
+
+/// `strict` without the web's profile, for a CA of one's own that was not made to it.
+pub fn private() -> Policy = { ..strict(), web: false }
+
+/// Why a path is none.
+pub type Fault =
+  /// The time is before the certificate's first instant.
+  | NotYetValid
+  /// The time is after its last.
+  | Expired
+  /// It is not for who was expected.
+  | Unnamed
+  /// Its extended key usage does not hold the purpose.
+  | WrongPurpose
+  /// Its key usage does not allow what it is used for: signing certificates, for one that is no
+  /// CA.
+  | WrongUsage
+  /// A leaf that says it is a CA.
+  | LeafIsCa
+  /// An issuer that is no CA: no `basicConstraints` saying so, or a key usage without
+  /// `keyCertSign`.
+  | NotACa
+  /// More CAs follow it than its path length allows.
+  | PathLength
+  /// Nothing offered and nothing trusted issued it: no certificate of its issuer's name whose key
+  /// its signature verifies under.
+  | Unissued
+  /// A critical extension this module does not read.
+  | UnknownCritical(Oid)
+  /// An RSA key under the policy's bits, or not whole octets.
+  | WeakKey
+  /// A key or a signature of an algorithm nothing here verifies: MD5, SHA-1, DSA, a curve other
+  /// than P-256 and P-384.
+  | Unverifiable
+  /// A name a CA above it excludes, or one whose constraint could not be compared.
+  | Excluded(GeneralName)
+  /// A name outside what a CA above it permits.
+  | NotPermitted(GeneralName)
+  /// An extension its place or its profile does not allow as written, or one it requires that is
+  /// missing.
+  | Misplaced(Oid)
+  /// The path is longer than the policy's depth.
+  | TooDeep
+  /// The policy's signatures or comparisons were spent.
+  | Spent
+
+/// A path that is none: the certificate at fault, and why.
+pub type Failure = new { certificate: Certificate, why: Fault }
+
+fn first_fault(faults: List<Option<Fault>>) -> Option<Fault> =
+  fold(faults, None, |found: Option<Fault>, next: Option<Fault>|
+    if found == None { next } else { found })
+
+fn when(fault: Fault, holds: Bool) -> Option<Fault> = if holds { Some(fault) } else { None }
+
+fn timely(c: Certificate, seconds: Int) -> Option<Fault> =
+  if seconds < date::unix_seconds(c.info.not_before) { Some(NotYetValid) }
+  else if seconds > date::unix_seconds(c.info.not_after) { Some(Expired) }
+  else { None }
+
+fn unknown_critical(c: Certificate) -> Option<Fault> =
+  match find(c.info.extensions, |e: Extension| e.critical && e.content == Unparsed) {
+    Some(e) -> Some(UnknownCritical(e.id)),
+    None -> None,
+  }
+
+fn key_fault(key: Key, policy: Policy) -> Option<Fault> =
+  match key {
+    RsaKey(public) -> match crypto::rsa_modulus_bits(public) {
+      Some(bits) -> when(WeakKey, bits < policy.rsa_bits || bits % 8 != 0),
+      None -> Some(Unverifiable),
+    },
+    EcKey(curve, point) ->
+      when(
+        Unverifiable,
+        !((curve == oid::prime256v1() && bytes_len(point) == 65)
+          || (curve == oid::secp384r1() && bytes_len(point) == 97)),
+      ),
+    Ed25519Key(_) -> None,
+    OtherKey(_, _) -> Some(Unverifiable),
+  }
+
+/// The key that verifies a signature made by `algorithm` under `key`.
+fn verifier(key: Key, algorithm: Algorithm, policy: Policy) -> Result<VerifyingKey, Fault> =
+  match key_fault(key, policy) {
+    Some(fault) -> Err(fault),
+    None -> {
+      let made = match ((key, algorithm)) {
+        (RsaKey(public), RsaPkcs1(d)) -> crypto::rsa_pkcs1_verifying(public, d),
+        (RsaKey(public), RsaPss(d)) -> crypto::rsa_pss_verifying(public, d),
+        (EcKey(_, point), Ecdsa(d)) -> crypto::ecdsa_verifying(point, d, crypto::Der),
+        (Ed25519Key(public), Ed25519) -> crypto::ed25519_verifying(public),
+        _ -> None,
+      };
+      match made { Some(k) -> Ok(k), None -> Err(Unverifiable) }
+    },
+  }
+
+fn purpose_id(purpose: Purpose) -> Oid =
+  match purpose { ServerAuth -> server_auth(), ClientAuth -> client_auth() }
+
+/// Whether an extended key usage, where `c` has one, holds `purpose`, or for a CA any purpose.
+fn purposed(c: Certificate, purpose: Purpose, ca: Bool) -> Bool =
+  all(c.info.extensions, |e: Extension|
+    match e.content {
+      ExtendedKeyUsage(held) ->
+        contains(held, purpose_id(purpose)) || (ca && contains(held, any_purpose())),
+      _ -> true,
+    })
+
+fn usages(c: Certificate) -> Option<List<Usage>> =
+  fold(c.info.extensions, None, |found: Option<List<Usage>>, e: Extension|
+    match e.content { KeyUsage(held) -> Some(held), _ -> found })
+
+fn has(c: Certificate, id: Oid) -> Bool = extension(c, id) != None
+
+fn is_critical(c: Certificate, id: Oid) -> Bool =
+  match extension(c, id) { Some(e) -> e.critical, None -> false }
+
+/// What the leaf itself gets wrong, before any path is sought.
+fn leaf_fault(
+  leaf: Certificate,
+  seconds: Int,
+  who: Identity,
+  purpose: Purpose,
+  policy: Policy,
+) -> Option<Fault> / {abort.raise} =
+  first_fault([
+    timely(leaf, seconds),
+    unknown_critical(leaf),
+    when(LeafIsCa, is_ca(leaf)),
+    when(WrongUsage, match usages(leaf) {
+      Some(held) -> contains(held, KeyCertSign),
+      None -> false,
+    }),
+    when(Misplaced(ext(30)), has(leaf, ext(30))),
+    when(WrongPurpose, !purposed(leaf, purpose, false)),
+    when(Unnamed, !names(leaf, who)),
+    key_fault(leaf.info.key, policy),
+  ])
+
+/// What `c` gets wrong of the web's profile, at its place in a path.
+fn profile_fault(c: Certificate, leaf: Bool, anchor: Bool) -> Option<Fault> = {
+  let aki = oid::authority_key_identifier();
+  let ski = oid::subject_key_identifier();
+  let san = oid::subject_alt_name();
+  let unnamed = len(c.info.subject.rdns) == 0;
+  let key_id = match extension(c, aki) {
+    Some(e) -> match e.content { AuthorityKeyId(Some(id), false) -> Some(id), _ -> None },
+    None -> None,
+  };
+  let own_id = match extension(c, ski) {
+    Some(e) -> match e.content { SubjectKeyId(id) -> Some(id), _ -> None },
+    None -> None,
+  };
+  let root = anchor && is_self_issued(c);
+  first_fault([
+    when(Misplaced(oid::basic_constraints()), c.info.version != 3),
+    when(Misplaced(aki), is_critical(c, aki) || (!anchor && key_id == None)),
+    when(Misplaced(aki), root && has(c, aki) && (key_id == None || key_id != own_id)),
+    when(Misplaced(ski), is_critical(c, ski) || (!leaf && own_id == None)),
+    when(Misplaced(oid::basic_constraints()), !leaf && !is_critical(c, oid::basic_constraints())),
+    when(Misplaced(pkix([1, 1])), is_critical(c, pkix([1, 1]))),
+    when(Unissued, len(c.info.issuer.rdns) == 0),
+    when(NotACa, !leaf && unnamed),
+    when(Misplaced(san), leaf && has(c, san) && is_critical(c, san) != unnamed),
+  ])
+}
+
+type Case = {
+  offered: List<Certificate>,
+  anchors: List<Certificate>,
+  seconds: Int,
+  purpose: Purpose,
+  policy: Policy,
+}
+
+/// A search: the path once one is found, the signatures checked, and the fault of the attempt
+/// that reached furthest from the leaf.
+type Hunt = { path: Option<List<Certificate>>, checks: Int, failure: Failure, reached: Int }
+
+fn failed(c: Certificate, why: Fault) -> Failure = { certificate: c, why: why }
+
+fn blamed(h: Hunt, c: Certificate, why: Fault, reached: Int) -> Hunt =
+  if reached > h.reached { { ..h, failure: failed(c, why), reached: reached } } else { h }
+
+/// What `issuer` gets wrong as the signer of the path so far, other than its signature.
+fn issuer_fault(case: Case, path: List<Certificate>, issuer: Certificate) -> Option<Fault> = {
+  let following = count(path, |c: Certificate| !is_self_issued(c)) - 1;
+  let basic = fold(issuer.info.extensions, None, |found: Option<Content>, e: Extension|
+    match e.content { Basic(_, _) -> Some(e.content), _ -> found });
+  first_fault([
+    timely(issuer, case.seconds),
+    match basic {
+      Some(Basic(true, None)) -> None,
+      Some(Basic(true, Some(most))) -> when(PathLength, max(following, 0) > most),
+      _ -> Some(NotACa),
+    },
+    when(NotACa, match usages(issuer) {
+      Some(held) -> !contains(held, KeyCertSign),
+      None -> false,
+    }),
+  ])
+}
+
+/// What a whole path gets wrong: each certificate's own extensions and key, each CA's purposes,
+/// and every name against every constraint above it.
+fn path_fault(case: Case, path: List<Certificate>) -> Option<Failure> / {abort.raise} = {
+  let last = len(path) - 1;
+  let own = fold(range(0, len(path)), None, |found: Option<Failure>, i: Int|
+    match ((found, list_at(path, i))) {
+      (None, Some(c)) -> {
+        let fault = first_fault([
+          unknown_critical(c),
+          key_fault(c.info.key, case.policy),
+          when(WrongPurpose, i > 0 && i < last && !purposed(c, case.purpose, true)),
+          if case.policy.web { profile_fault(c, i == 0, i == last) } else { None },
+        ]);
+        match fault { Some(why) -> Some(failed(c, why)), None -> None }
+      },
+      _ -> found,
+    });
+  if own != None { own } else { constraints_fault(case, path) }
+}
+
+fn trees_of(c: Certificate) -> { permitted: List<Subtree>, excluded: List<Subtree> } =
+  fold(
+    c.info.extensions,
+    { permitted: [], excluded: [] },
+    |found: { permitted: List<Subtree>, excluded: List<Subtree> }, e: Extension|
+      match e.content {
+        NameConstraints(permitted, excluded) -> { permitted: permitted, excluded: excluded },
+        _ -> found,
+      },
+  )
+
+/// The fault of the first name below a CA that its constraints refuse. A self-issued CA's names
+/// are not held to them; the leaf's always are.
+fn constraints_fault(case: Case, path: List<Certificate>) -> Option<Failure> / {abort.raise} = {
+  let pairs = flat_map(range(1, len(path)), |above: Int|
+    flat_map(range(0, above), |below: Int|
+      match ((list_at(path, above), list_at(path, below))) {
+        (Some(ca), Some(c)) -> {
+          let trees = trees_of(ca);
+          if len(trees.permitted) + len(trees.excluded) == 0 || (below > 0 && is_self_issued(c)) {
+            []
+          } else { [{ trees: trees, certificate: c, names: constrained_names(c) }] }
+        },
+        _ -> [],
+      }));
+  let cost = fold(pairs, 0, |n: Int, p: Checked|
+    n + len(p.names) * (len(p.trees.permitted) + len(p.trees.excluded)));
+  if cost > case.policy.comparisons {
+    match list_at(path, 0) { Some(leaf) -> Some(failed(leaf, Spent)), None -> None }
+  } else {
+    fold(pairs, None, |found: Option<Failure>, p: Checked|
+      if found != None { found } else {
+        match first_fault(
+            map(p.names, |n: GeneralName| name_fault(n, p.trees.permitted, p.trees.excluded)),
+          ) {
+          Some(why) -> Some(failed(p.certificate, why)),
+          None -> None,
+        }
+      })
+  }
+}
+
+type Checked = {
+  trees: { permitted: List<Subtree>, excluded: List<Subtree> },
+  certificate: Certificate,
+  names: List<GeneralName>,
+}
+
+fn name_fault(
+  name: GeneralName,
+  permitted: List<Subtree>,
+  excluded: List<Subtree>,
+) -> Option<Fault> / {abort.raise} = {
+  let kind = name_kind(name);
+  let open = filter(permitted, |t: Subtree| tree_kind(t) == kind);
+  let shut = filter(excluded, |t: Subtree| tree_kind(t) == kind);
+  if any(shut, |t: Subtree| held(name, t, true) != Elsewhere) { Some(Excluded(name)) }
+  else if len(open) > 0 && !any(open, |t: Subtree| held(name, t, false) == Inside) {
+    Some(NotPermitted(name))
+  } else { None }
+}
+
+fn in_path(path: List<Certificate>, c: Certificate) -> Bool =
+  any(path, |p: Certificate|
+    p.der == c.der || (p.info.subject.der == c.info.subject.der && p.info.spki == c.info.spki))
+
+/// Every way up from the last certificate of `path`, `room` more certificates at most: each
+/// trusted certificate of its issuer's name, then each offered one, none of them a certificate or
+/// a CA already in the path.
+fn climbed(case: Case, path: List<Certificate>, hunt: Hunt, room: Int) -> Hunt / {abort.raise} =
+  match list_at(path, len(path) - 1) {
+    None -> hunt,
+    Some(current) -> {
+      let issued = |c: Certificate|
+        c.info.subject.der == current.info.issuer.der && !in_path(path, c);
+      let ways = concat(
+        map(filter(case.anchors, issued), |c: Certificate| { issuer: c, trusted: true }),
+        map(filter(case.offered, issued), |c: Certificate| { issuer: c, trusted: false }),
+      );
+      fold(ways, hunt, |h: Hunt, way: { issuer: Certificate, trusted: Bool }|
+        if h.path != None { h } else {
+          match tried(case, path, current, way.issuer, way.trusted, h) {
+            Settled(after) -> after,
+            Onward(after) -> {
+              let longer = push(path, way.issuer);
+              let between = count(longer, |c: Certificate| !is_self_issued(c)) - 1;
+              if room <= 1 || between > case.policy.depth {
+                blamed(after, way.issuer, TooDeep, len(path))
+              } else { climbed(case, longer, after, room - 1) }
+            },
+          }
+        })
+    },
+  }
+
+/// What trying one issuer came to: an end of that way, or a certificate to climb on from.
+type Step = | Settled(Hunt) | Onward(Hunt)
+
+fn tried(
+  case: Case,
+  path: List<Certificate>,
+  current: Certificate,
+  issuer: Certificate,
+  trusted: Bool,
+  h: Hunt,
+) -> Step / {abort.raise} = {
+  let reached = len(path);
+  if h.checks >= case.policy.signatures {
+    // Spent outranks whatever a way that was tried came to: the search is not over.
+    Settled(blamed(h, current, Spent, h.reached + 1))
+  } else {
+    match issuer_fault(case, path, issuer) {
+      Some(why) -> Settled(blamed(h, issuer, why, reached)),
+      None -> match verifier(issuer.info.key, current.info.algorithm, case.policy) {
+        Err(why) -> Settled(blamed(h, current, why, reached)),
+        Ok(key) -> {
+          let checked = { ..h, checks: h.checks + 1 };
+          if !crypto::verify(key, current.tbs, current.signature) {
+            Settled(blamed(checked, current, Unissued, reached))
+          } else if !trusted { Onward(checked) } else {
+            let whole = push(path, issuer);
+            match path_fault(case, whole) {
+              None -> Settled({ ..checked, path: Some(whole) }),
+              Some(failure) ->
+                Settled(blamed(checked, failure.certificate, failure.why, reached + 1)),
+            }
+          }
+        },
+      },
+    }
+  }
+}
+
+/// The path from `leaf` to one of `anchors` through `offered`, the leaf first, or the certificate
+/// that stops there being one and why.
+///
+/// A path holds at `at`: every certificate in it is within its validity, each is signed by the
+/// next, each issuer is a CA whose path length allows what follows, no certificate carries a
+/// critical extension this module does not read, every name is within every constraint above it,
+/// every CA's extended key usage allows `purpose`, and the leaf is for `who` and for `purpose`.
+/// Every path is tried, trusted issuers first, until one holds or `policy` is spent; the failure
+/// answered is of the attempt that reached furthest. A leaf that is itself an anchor is its own
+/// path. Nothing is fetched and nothing is revoked: see the module.
+pub fn verify(
+  leaf: Certificate,
+  offered: List<Certificate>,
+  anchors: List<Certificate>,
+  at: Instant,
+  who: Identity,
+  purpose: Purpose,
+  policy: Policy,
+) -> Result<List<Certificate>, Failure> / {abort.raise} = {
+  let seconds = nanos_at(at) / 1000000000;
+  let case = {
+    offered: offered,
+    anchors: anchors,
+    seconds: seconds,
+    purpose: purpose,
+    policy: policy,
+  };
+  match leaf_fault(leaf, seconds, who, purpose, policy) {
+    Some(why) -> Err(failed(leaf, why)),
+    None -> if any(anchors, |a: Certificate| a.der == leaf.der) { Ok([leaf]) } else {
+      let start = { path: None, checks: 0, failure: failed(leaf, Unissued), reached: 0 };
+      let hunt = climbed(case, [leaf], start, len(offered) + 2);
+      match hunt.path { Some(path) -> Ok(path), None -> Err(hunt.failure) }
+    },
+  }
+}
+
+// --- Building --------------------------------------------------------------------
+
+/// What a certificate or a request to be made says of its subject.
+pub type Draft = new {
+  /// The subject's name, an attribute to a relative name, outermost first.
+  subject: List<Attribute>,
+  alt_names: List<GeneralName>,
+  /// `Some` for a CA, holding its path length where it has one.
+  ca: Option<Option<Int>>,
+  usages: List<Usage>,
+  purposes: List<Oid>,
+  /// The subtrees a CA's name constraints permit, and those they exclude.
+  permitted: List<Subtree>,
+  excluded: List<Subtree>,
+  /// Extensions written as they are given: the type, the criticality and the value.
+  extra: List<Extension>,
+}
+
+/// A draft that says nothing: no name, no alternative names, no extensions.
+pub fn draft() -> Draft =
+  {
+    subject: [],
+    alt_names: [],
+    ca: None,
+    usages: [],
+    purposes: [],
+    permitted: [],
+    excluded: [],
+    extra: [],
+  }
+
+/// A certificate request, PKCS #10, that was read: who asks, their key, and the extensions asked
+/// for. One exists only where the request is signed by the key it carries.
+pub opaque type Request = new {
+  der: Bytes,
+  subject: Name,
+  key: Key,
+  spki: Bytes,
+  extensions: List<Extension>,
+}
+
+/// The request, in DER.
+pub fn request_der(r: Request) -> Bytes = r.der
+
+/// Who asks.
+pub fn request_subject(r: Request) -> Name = r.subject
+
+/// The key asked about.
+pub fn request_key(r: Request) -> Key = r.key
+
+/// The extensions asked for.
+pub fn request_extensions(r: Request) -> List<Extension> = r.extensions
+
+effect set Written = {asn1.unwritable, abort.raise}
+
+fn text_der(text: String) -> Bytes / {Written} =
+  handle {
+    asn1::string(asn1::PrintableString, text)
+  } with {
+    asn1.unwritable(_) -> asn1::string(asn1::Utf8String, text),
+  }
+
+fn name_der(attributes: List<Attribute>) -> Bytes / {Written} =
+  asn1::sequence(
+    map(attributes, |a: Attribute|
+      asn1::set_of([asn1::sequence([asn1::oid(a.id), text_der(a.value)])])),
+  )
+
+fn general_name_der(name: GeneralName) -> Bytes / {Written} =
+  match name {
+    Email(text) -> asn1::implicit(asn1::context(1), asn1::string(Ia5String, text)),
+    Dns(text) -> asn1::implicit(asn1::context(2), asn1::string(Ia5String, text)),
+    Uri(text) -> asn1::implicit(asn1::context(6), asn1::string(Ia5String, text)),
+    Address(address) -> asn1::primitive(asn1::context(7), ip::to_bytes(address)),
+    Directory(found) -> asn1::explicit(asn1::context(4), found.der),
+    Registered(id) -> asn1::implicit(asn1::context(8), asn1::oid(id)),
+    Other(id, value) -> asn1::constructed(asn1::context(0), [asn1::oid(id), value]),
+    Unread(_, written) -> written,
+  }
+
+fn extension_der(id: Oid, critical: Bool, value: Bytes) -> Bytes / {Written} =
+  asn1::sequence(
+    concat(
+      [asn1::oid(id)],
+      concat(if critical { [asn1::boolean(true)] } else { [] }, [asn1::octet_string(value)]),
+    ),
+  )
+
+fn usage_bit(usage: Usage) -> Int =
+  match usage {
+    DigitalSignature -> 0,
+    ContentCommitment -> 1,
+    KeyEncipherment -> 2,
+    DataEncipherment -> 3,
+    KeyAgreement -> 4,
+    KeyCertSign -> 5,
+    CrlSign -> 6,
+    EncipherOnly -> 7,
+    DecipherOnly -> 8,
+  }
+
+/// The extensions a draft asks for, in DER.
+fn drafted(draft: Draft) -> List<Bytes> / {Written} =
+  concat(
+    match draft.ca {
+      Some(length) ->
+        [
+          extension_der(
+            oid::basic_constraints(),
+            true,
+            asn1::sequence(
+              concat([asn1::boolean(true)], match length {
+                Some(most) -> [asn1::int(most)],
+                None -> [],
+              }),
+            ),
+          ),
+        ],
+      None -> [],
+    },
+    concat(
+      if len(draft.usages) == 0 { [] } else {
+        [extension_der(oid::key_usage(), true, asn1::named_bits(map(draft.usages, usage_bit)))]
+      },
+      concat(
+        if len(draft.purposes) == 0 { [] } else {
+          [
+            extension_der(
+              oid::ext_key_usage(),
+              false,
+              asn1::sequence(map(draft.purposes, |id: Oid| asn1::oid(id))),
+            ),
+          ]
+        },
+        concat(
+          if len(draft.alt_names) == 0 { [] } else {
+            [
+              extension_der(
+                oid::subject_alt_name(),
+                len(draft.subject) == 0,
+                asn1::sequence(map(draft.alt_names, general_name_der)),
+              ),
+            ]
+          },
+          concat(
+            constraints_der(draft.permitted, draft.excluded),
+            map(draft.extra, |e: Extension| extension_der(e.id, e.critical, e.value)),
+          ),
+        ),
+      ),
+    ),
+  )
+
+fn mask_bytes(bits: Int, octets: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    map(range(0, octets), |i: Int| {
+      let ones = min(max(bits - 8 * i, 0), 8);
+      byte_of_int(0xFF << 8 - ones & 0xFF)
+    }),
+  )
+
+fn subtree_der(tree: Subtree) -> Bytes / {Written} =
+  asn1::sequence([
+    match tree {
+      EmailTree(mailbox) -> asn1::implicit(asn1::context(1), asn1::string(Ia5String, mailbox)),
+      DnsTree(name) -> asn1::implicit(asn1::context(2), asn1::string(Ia5String, name)),
+      UriTree(host) -> asn1::implicit(asn1::context(6), asn1::string(Ia5String, host)),
+      Network(net) -> {
+        let address = ip::to_bytes(ip::network(net));
+        asn1::primitive(
+          asn1::context(7),
+          bytes_concat(address, mask_bytes(ip::bits(net), bytes_len(address))),
+        )
+      },
+      DirectoryTree(name) -> asn1::explicit(asn1::context(4), name.der),
+      OtherTree(_) -> asn1.unwritable(asn1::BadTag),
+    },
+  ])
+
+fn constraints_der(permitted: List<Subtree>, excluded: List<Subtree>) -> List<Bytes> / {Written} = {
+  let trees = |number: Int, list: List<Subtree>|
+    if len(list) == 0 { [] }
+    else { [asn1::implicit(asn1::context(number), asn1::sequence(map(list, subtree_der)))] };
+  if len(permitted) + len(excluded) == 0 { [] } else {
+    [extension_der(ext(30), true, asn1::sequence(concat(trees(0, permitted), trees(1, excluded))))]
+  }
+}
+
+fn spki_der(key: VerifyingKey) -> Bytes / {Written} = {
+  let public = crypto::verifying_bytes(key);
+  let algorithm = match crypto::signature_of(key) {
+    crypto::Ed25519Signature -> [asn1::oid(oid::ed25519())],
+    crypto::EcdsaSignature(_, _) ->
+      [
+        asn1::oid(oid::ec_public_key()),
+        asn1::oid(if bytes_len(public) == 65 { oid::prime256v1() } else { oid::secp384r1() }),
+      ],
+    _ -> [asn1::oid(oid::rsa_encryption()), asn1::null()],
+  };
+  asn1::sequence([asn1::sequence(algorithm), asn1::bit_string({ unused: 0, bytes: public })])
+}
+
+fn signing_der(key: VerifyingKey) -> Bytes / {Written} =
+  asn1::sequence(match crypto::signature_of(key) {
+    crypto::Ed25519Signature -> [asn1::oid(oid::ed25519())],
+    crypto::EcdsaSignature(Sha256, _) -> [asn1::oid(oid::ecdsa_with_sha256())],
+    crypto::EcdsaSignature(Sha384, _) -> [asn1::oid(oid::ecdsa_with_sha384())],
+    crypto::EcdsaSignature(Sha512, _) -> [asn1::oid(oid::Oid([1, 2, 840, 10045, 4, 3, 4]))],
+    crypto::RsaPkcs1Signature(Sha256) ->
+      [asn1::oid(oid::sha256_with_rsa_encryption()), asn1::null()],
+    crypto::RsaPkcs1Signature(Sha384) ->
+      [asn1::oid(oid::sha384_with_rsa_encryption()), asn1::null()],
+    crypto::RsaPkcs1Signature(Sha512) ->
+      [asn1::oid(oid::sha512_with_rsa_encryption()), asn1::null()],
+    crypto::RsaPssSignature(_) -> panic("no key signs RSA PSS"),
+  })
+
+/// `signer`'s signature over `message`, as a certificate carries one: an ECDSA signature in DER
+/// whichever way the key writes its own.
+fn signed(signer: crypto::SigningKey, message: Bytes) -> Bytes / {abort.raise} = {
+  let made = crypto::sign(signer, message);
+  match crypto::signature_of(crypto::verifying_key(signer)) {
+    crypto::EcdsaSignature(_, crypto::Raw) -> {
+      let half = bytes_len(made) / 2;
+      asn1::sequence([
+        asn1::unsigned(bytes_slice(made, 0, half)),
+        asn1::unsigned(bytes_slice(made, half, 2 * half)),
+      ])
+    },
+    _ -> made,
+  }
+}
+
+/// The body, the algorithm and the signature, as a certificate and a request both wrap theirs.
+fn sealed(body: Bytes, signer: crypto::SigningKey) -> Bytes / {Written} =
+  asn1::sequence([
+    body,
+    signing_der(crypto::verifying_key(signer)),
+    asn1::bit_string({ unused: 0, bytes: signed(signer, body) }),
+  ])
+
+/// The first twenty bytes of SHA-256 of a key's bits: RFC 7093's first method.
+fn key_id(spki: Bytes) -> Bytes / {abort.raise} = bytes_slice(sha256(spki), 0, 20)
+
+fn written<a>(
+  body: () -> a / {asn1.unwritable, x509.refused, abort.raise},
+) -> a / {x509.refused, abort.raise} =
+  handle { body() } with { asn1.unwritable(_) -> x509.refused(Unwritable) }
+
+/// The certificate of `draft` for the key `subject`, under `serial`, valid from `not_before` to
+/// `not_after`, signed by `signer`: as `issuer`, or for no issuer by the subject itself.
+///
+/// Version 3, with the draft's extensions, a subject key identifier and, under an issuer that has
+/// one, an authority key identifier. `basicConstraints` and the key usage are critical, and the
+/// alternative names are where the subject is empty. What is answered was read back, `Strict`, so
+/// a draft that makes no certificate raises what `read` would: a serial that is zero or over
+/// twenty octets, a name that is none. `Unwritable` for text no string type holds and an instant
+/// no time writes. Nothing is checked of `issuer` and `signer` being one CA.
+pub fn certificate(
+  draft: Draft,
+  subject: VerifyingKey,
+  serial: Bytes,
+  not_before: OffsetDateTime,
+  not_after: OffsetDateTime,
+  issuer: Option<Certificate>,
+  signer: crypto::SigningKey,
+) -> Certificate / {x509.refused, abort.raise} =
+  written(|| {
+    let name = name_der(draft.subject);
+    let spki = spki_der(subject);
+    let above = match issuer {
+      Some(ca) ->
+        fold(ca.info.extensions, [], |found: List<Bytes>, e: Extension|
+          match e.content {
+            SubjectKeyId(id) ->
+              [
+                extension_der(
+                  oid::authority_key_identifier(),
+                  false,
+                  asn1::sequence([asn1::implicit(asn1::context(0), asn1::octet_string(id))]),
+                ),
+              ],
+            _ -> found,
+          }),
+      None -> [],
+    };
+    let extensions = concat(
+      drafted(draft),
+      concat(
+        [extension_der(oid::subject_key_identifier(), false, asn1::octet_string(key_id(spki)))],
+        above,
+      ),
+    );
+    let body = asn1::sequence([
+      asn1::explicit(asn1::context(0), asn1::int(2)),
+      asn1::unsigned(serial),
+      signing_der(crypto::verifying_key(signer)),
+      match issuer { Some(ca) -> ca.info.subject.der, None -> name },
+      asn1::sequence([asn1::time(not_before), asn1::time(not_after)]),
+      name,
+      spki,
+      asn1::explicit(asn1::context(3), asn1::sequence(extensions)),
+    ]);
+    read(sealed(body, signer), limits(), Strict)
+  })
+
+/// `certificate` for the key that signs it: a root, or a certificate trusted by itself.
+pub fn self_signed(
+  draft: Draft,
+  serial: Bytes,
+  not_before: OffsetDateTime,
+  not_after: OffsetDateTime,
+  key: crypto::SigningKey,
+) -> Certificate / {x509.refused, abort.raise} =
+  certificate(draft, crypto::verifying_key(key), serial, not_before, not_after, None, key)
+
+/// A certificate request for `draft`, signed by the key it asks about: PKCS #10, in DER, with the
+/// draft's extensions as an extension request.
+pub fn request(draft: Draft, key: crypto::SigningKey) -> Bytes / {x509.refused, abort.raise} =
+  written(|| {
+    let asked = drafted(draft);
+    let attributes = if len(asked) == 0 { [] } else {
+      [
+        asn1::sequence([
+          asn1::oid(oid::Oid([1, 2, 840, 113549, 1, 9, 14])),
+          asn1::set_of([asn1::sequence(asked)]),
+        ]),
+      ]
+    };
+    let body = asn1::sequence([
+      asn1::int(0),
+      name_der(draft.subject),
+      spki_der(crypto::verifying_key(key)),
+      asn1::implicit(asn1::context(0), asn1::set_of(attributes)),
+    ]);
+    sealed(body, key)
+  })
+
+fn request_at(r: Reader, data: Bytes, limits: Limits) -> Read<Request> / {Row} =
+  asn1::within(asn1::read_sequence(r), |fields: Reader| {
+    let body = asn1::read_raw(fields);
+    let info = asn1::within(asn1::read_sequence(fields), |i: Reader| {
+      let version = asn1::read_int(i);
+      let subject = name_at(version.rest, limits);
+      let spki = asn1::read_raw(subject.rest);
+      let key = key_at(subject.rest);
+      let attributes = asn1::read_implicit(key.rest, asn1::context(0), |x: Reader|
+        asn1::read_set_of(x, |a: Reader|
+          asn1::within(asn1::read_sequence(a), |one: Reader| {
+            let id = asn1::read_oid(one);
+            if id.value != oid::Oid([1, 2, 840, 113549, 1, 9, 14]) {
+              let values = asn1::read_raw(id.rest);
+              { value: [], rest: values.rest }
+            } else {
+              let asked = asn1::read_set_of(id.rest, |v: Reader|
+                asn1::read_sequence_of(v, |e: Reader| extension_at(e, limits, Strict)));
+              { value: flat_map(asked.value, |list: List<Extension>| list), rest: asked.rest }
+            }
+          })));
+      if version.value != 0 { x509.refused(BadVersion(version.value + 1)) } else {
+        {
+          value: {
+            subject: subject.value,
+            key: key.value,
+            spki: spki.value,
+            extensions: flat_map(attributes.value, |list: List<Extension>| list),
+          },
+          rest: attributes.rest,
+        }
+      }
+    });
+    let algorithm = algorithm_at(info.rest);
+    let signature = asn1::read_bit_string(algorithm.rest);
+    let proven = match verifier(info.value.key, algorithm.value, strict()) {
+      Ok(key) ->
+        signature.value.unused == 0 && crypto::verify(key, body.value, signature.value.bytes),
+      Err(_) -> false,
+    };
+    if !proven { x509.refused(Unproven) } else {
+      {
+        value: {
+          der: data,
+          subject: info.value.subject,
+          key: info.value.key,
+          spki: info.value.spki,
+          extensions: info.value.extensions,
+        },
+        rest: signature.rest,
+      }
+    }
+  })
+
+/// The request `data` is, in DER. Raises `Unproven` unless it is signed by the key it carries,
+/// under an algorithm and a key `strict` takes.
+pub fn read_request(data: Bytes, limits: Limits) -> Request / {x509.refused, abort.raise} =
+  if bytes_len(data) > limits.bytes { x509.refused(TooLong(bytes_len(data))) } else {
+    match asn1::decode_with(data, limits.depth, |r: Reader| request_at(r, data, limits)) {
+      Ok(found) -> found,
+      Err(e) -> x509.refused(NotDer(e)),
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------
+//
+// Every certificate here is built here, under Ed25519 keys of fixed seeds and at days counted
+// from 1970, so nothing is read from a file or a clock. What other software wrote is the corpus's.
+
+fn key_of(seed: Int) -> crypto::SigningKey / {abort.raise} =
+  match crypto::ed25519_signing(
+      secret_of_bytes(bytes_concat_all(map(range(0, 32), |i: Int| byte_of_int(seed + i & 0xFF)))),
+    ) {
+    Some(key) -> key,
+    None -> panic("thirty-two bytes are a seed"),
+  }
+
+fn day(n: Int) -> OffsetDateTime =
+  match date::of_unix_seconds(n * 86400) { Some(t) -> t, None -> date::of_instant(Instant(0)) }
+
+fn at_day(n: Int) -> Instant = Instant(n * 86400000000000)
+
+fn called(name: String) -> List<Attribute> = [{ id: oid::common_name(), value: name }]
+
+fn ca_draft(name: String, length: Option<Int>) -> Draft =
+  { ..draft(), subject: called(name), ca: Some(length), usages: [KeyCertSign, CrlSign] }
+
+fn leaf_draft(host: String) -> Draft =
+  {
+    ..draft(),
+    subject: called(host),
+    alt_names: [Dns(host)],
+    usages: [DigitalSignature],
+    purposes: [server_auth()],
+  }
+
+/// `draft` certified for the key of seed `key`, from day 100 to day 900 unless `days` says
+/// otherwise, by `issuer` under the key of seed `signer`.
+fn issued(
+  d: Draft,
+  key: Int,
+  issuer: Option<Certificate>,
+  signer: Int,
+) -> Certificate / {x509.refused, abort.raise} =
+  certificate(
+    d,
+    crypto::verifying_key(key_of(key)),
+    byte_of_int(key),
+    day(100),
+    day(900),
+    issuer,
+    key_of(signer),
+  )
+
+type Pki = { root: Certificate, middle: Certificate, leaf: Certificate }
+
+/// A root (key 1), a CA under it that no CA may follow (key 2), and a leaf for `www.example.com`
+/// (key 3) valid from day 300 to day 400.
+fn pki() -> Pki / {x509.refused, abort.raise} = {
+  let root = issued(ca_draft("Root", None), 1, None, 1);
+  let middle = issued(ca_draft("Middle", Some(0)), 2, Some(root), 1);
+  let leaf = certificate(
+    leaf_draft("www.example.com"),
+    crypto::verifying_key(key_of(3)),
+    b"\x03",
+    day(300),
+    day(400),
+    Some(middle),
+    key_of(2),
+  );
+  { root: root, middle: middle, leaf: leaf }
+}
+
+fn checked(
+  leaf: Certificate,
+  offered: List<Certificate>,
+  anchors: List<Certificate>,
+  on: Int,
+  host: String,
+) -> Result<Int, Fault> / {abort.raise} =
+  match verify(leaf, offered, anchors, at_day(on), Host(host), ServerAuth, strict()) {
+    Ok(path) -> Ok(len(path)),
+    Err(failure) -> Err(failure.why),
+  }
+
+fn made<a>(body: () -> a / {x509.refused, abort.raise}) -> a / {abort.raise} =
+  match try { body() } { Ok(x) -> x, Err(refusal) -> panic("the fixture is refused") }
+
+test "a built chain verifies to its root, and the path is the leaf, the CA and the root" {
+  let p = made(pki);
+  assert_eq(
+    result_ok(
+      verify(
+        p.leaf,
+        [p.middle],
+        [p.root],
+        at_day(350),
+        Host("www.example.com"),
+        ServerAuth,
+        strict(),
+      ),
+    ),
+    Some([p.leaf, p.middle, p.root]),
+  );
+  assert_eq(checked(p.leaf, [p.middle, p.root, p.leaf], [p.root], 350, "WWW.Example.COM."), Ok(3));
+  assert_eq(
+    try { read_pem(write_pem([p.leaf, p.middle]), limits(), Strict) },
+    Ok([p.leaf, p.middle]),
+  );
+  assert_eq(write_pem([]), "");
+  assert_eq(info(p.leaf).version, 3);
+  assert_eq(info(p.leaf).serial, b"\x03");
+  assert_eq(info(p.leaf).issuer, info(p.middle).subject);
+  assert_eq(alt_names(p.leaf), [Dns("www.example.com")]);
+  assert_eq(bytes_len(fingerprint(p.leaf)), 32);
+  assert_eq(key_pin(p.middle), sha256(info(p.middle).spki));
+  assert(is_ca(p.root) && is_self_issued(p.root) && !is_ca(p.leaf))
+}
+
+test "a chain is refused out of its time, for another name, without its CA, and for another purpose" {
+  let p = made(pki);
+  let blamed = |on: Int, host: String, offered: List<Certificate>|
+    match verify(p.leaf, offered, [p.root], at_day(on), Host(host), ServerAuth, strict()) {
+      Ok(_) -> None,
+      Err(failure) -> Some({ leaf: failure.certificate == p.leaf, why: failure.why }),
+    };
+  assert_eq(blamed(401, "www.example.com", [p.middle]), Some({ leaf: true, why: Expired }));
+  assert_eq(blamed(299, "www.example.com", [p.middle]), Some({ leaf: true, why: NotYetValid }));
+  assert_eq(blamed(350, "example.com", [p.middle]), Some({ leaf: true, why: Unnamed }));
+  assert_eq(blamed(350, "www.example.org", [p.middle]), Some({ leaf: true, why: Unnamed }));
+  assert_eq(blamed(350, "www.example.com", []), Some({ leaf: true, why: Unissued }));
+  assert_eq(
+    result_err(
+      verify(
+        p.leaf,
+        [p.middle],
+        [p.root],
+        at_day(350),
+        Host("www.example.com"),
+        ClientAuth,
+        strict(),
+      ),
+    ),
+    Some({ certificate: p.leaf, why: WrongPurpose }),
+  );
+  assert_eq(checked(p.leaf, [p.middle], [], 350, "www.example.com"), Err(Unissued));
+  assert_eq(checked(p.leaf, [p.middle], [p.middle], 350, "www.example.com"), Ok(2))
+}
+
+test "a CA out of its time is the certificate at fault, and another way round it is taken" {
+  let p = made(pki);
+  let lapsed = made(||
+    certificate(
+      ca_draft("Middle", Some(0)),
+      crypto::verifying_key(key_of(2)),
+      b"\x09",
+      day(100),
+      day(320),
+      Some(p.root),
+      key_of(1),
+    ));
+  assert_eq(
+    result_err(
+      verify(
+        p.leaf,
+        [lapsed],
+        [p.root],
+        at_day(350),
+        Host("www.example.com"),
+        ServerAuth,
+        strict(),
+      ),
+    ),
+    Some({ certificate: lapsed, why: Expired }),
+  );
+  assert_eq(checked(p.leaf, [lapsed, p.middle], [p.root], 350, "www.example.com"), Ok(3));
+  assert_eq(checked(p.leaf, [p.middle, lapsed], [p.root], 350, "www.example.com"), Ok(3))
+}
+
+test "a leaf is no CA: what it signs for another name is refused, and so is a CA past its path length" {
+  let p = made(pki);
+  let forged = made(|| issued(leaf_draft("bank.example"), 4, Some(p.leaf), 3));
+  assert_eq(
+    result_err(
+      verify(
+        forged,
+        [p.leaf, p.middle],
+        [p.root],
+        at_day(350),
+        Host("bank.example"),
+        ServerAuth,
+        strict(),
+      ),
+    ),
+    Some({ certificate: p.leaf, why: NotACa }),
+  );
+  let lower = made(|| issued(ca_draft("Lower", None), 5, Some(p.middle), 2));
+  let below = made(|| issued(leaf_draft("deep.example"), 6, Some(lower), 5));
+  assert_eq(
+    result_err(
+      verify(
+        below,
+        [lower, p.middle],
+        [p.root],
+        at_day(350),
+        Host("deep.example"),
+        ServerAuth,
+        strict(),
+      ),
+    ),
+    Some({ certificate: p.middle, why: PathLength }),
+  );
+  assert_eq(checked(p.root, [], [p.root], 350, "www.example.com"), Err(LeafIsCa))
+}
+
+test "a self-signed certificate that is trusted is its own path, and one that is not has none" {
+  let alone = made(|| issued(leaf_draft("localhost"), 7, None, 7));
+  assert_eq(checked(alone, [], [alone], 350, "localhost"), Ok(1));
+  assert_eq(checked(alone, [], [alone], 350, "example.com"), Err(Unnamed));
+  assert_eq(checked(alone, [], [], 350, "localhost"), Err(Unissued));
+  assert_eq(checked(alone, [], [alone], 901, "localhost"), Err(Expired))
+}
+
+/// A name a certificate presents, a host asked for, and whether the one is for the other.
+type Named = { presented: GeneralName, host: String, matches: Bool }
+
+fn named_cases() -> List<Named> =
+  [
+    { presented: Dns("example.com"), host: "example.com", matches: true },
+    { presented: Dns("EXAMPLE.com"), host: "example.COM", matches: true },
+    { presented: Dns("example.com"), host: "example.com.", matches: true },
+    { presented: Dns("example.com"), host: "www.example.com", matches: false },
+    { presented: Dns("*.example.com"), host: "www.example.com", matches: true },
+    { presented: Dns("*.example.com"), host: "example.com", matches: false },
+    { presented: Dns("*.example.com"), host: "a.b.example.com", matches: false },
+    { presented: Dns("w*.example.com"), host: "www.example.com", matches: false },
+    { presented: Dns("www.*.com"), host: "www.example.com", matches: false },
+    { presented: Dns("*.com"), host: "example.com", matches: false },
+    { presented: Dns("*"), host: "example", matches: false },
+    { presented: Dns("under_score.example.com"), host: "under_score.example.com", matches: false },
+    { presented: Dns("192.0.2.1"), host: "192.0.2.1", matches: false },
+    { presented: Dns("xn--mnchen-3ya.de"), host: "münchen.de", matches: true },
+    { presented: Dns("xn--mnchen-3ya.de"), host: "XN--MNCHEN-3YA.de", matches: true },
+    { presented: Dns("*.xn--mnchen-3ya.de"), host: "www.münchen.de", matches: true },
+    { presented: Dns("muenchen.de"), host: "münchen.de", matches: false },
+    { presented: Email("www@example.com"), host: "example.com", matches: false },
+    { presented: Uri("https://example.com/"), host: "example.com", matches: false },
+  ]
+
+test "{show(c.presented)} is for {c.host}: {c.matches}" for c: Named in named_cases() {
+  let leaf = made(|| issued({ ..leaf_draft("any"), alt_names: [c.presented] }, 8, None, 8));
+  assert_eq(names(leaf, Host(c.host)), c.matches)
+}
+
+test "an address is matched by an address and by nothing written like one, and a common name by nothing" {
+  let four = ip_of("192.0.2.1");
+  let six = ip_of("2001:db8::1");
+  let leaf = made(||
+    issued(
+      { ..leaf_draft("192.0.2.9"), alt_names: [Address(four), Address(six), Dns("a.example")] },
+      8,
+      None,
+      8,
+    ));
+  assert(names(leaf, At(four)) && names(leaf, At(six)) && names(leaf, Anyone));
+  assert(!names(leaf, At(ip_of("192.0.2.2"))));
+  assert(!names(leaf, Host("192.0.2.1")) && !names(leaf, Host("192.0.2.9")));
+  let bare = made(|| issued({ ..leaf_draft("cn.example"), alt_names: [] }, 8, None, 8));
+  assert(!names(bare, Host("cn.example")) && names(bare, Anyone))
+}
+
+/// What a CA's constraints say, a name under it, and what that comes to.
+type Constrained = {
+  name: String,
+  permitted: List<Subtree>,
+  excluded: List<Subtree>,
+  presented: GeneralName,
+  fault: Option<Fault>,
+}
+
+fn ip_of(text: String) -> Ip / {abort.raise} =
+  match ip::parse(text) { Ok(a) -> a, Err(_) -> panic("an address") }
+
+fn net(text: String, bits: Int) -> Subtree / {abort.raise} =
+  match ip::prefix_holding(ip_of(text), bits) { Some(p) -> Network(p), None -> panic("a prefix") }
+
+fn address(text: String) -> GeneralName / {abort.raise} = Address(ip_of(text))
+
+fn constrained_cases() -> List<Constrained> / {abort.raise} = {
+  let on = |name: String, permitted: List<Subtree>, excluded: List<Subtree>, presented: GeneralName, fault: Option<Fault>|
+    { name: name, permitted: permitted, excluded: excluded, presented: presented, fault: fault };
+  let host = Dns("www.example.com");
+  [
+    on("a name under a permitted one", [DnsTree("example.com")], [], host, None),
+    on("the permitted name itself", [DnsTree("www.example.com")], [], host, None),
+    on("every name, under the empty one", [DnsTree("")], [], host, None),
+    on(
+      "a name beside a permitted one",
+      [DnsTree("example.org")],
+      [],
+      host,
+      Some(NotPermitted(host)),
+    ),
+    on(
+      "a name that only ends like one",
+      [DnsTree("ample.com")],
+      [],
+      host,
+      Some(NotPermitted(host)),
+    ),
+    on("a name under an excluded one", [], [DnsTree("example.com")], host, Some(Excluded(host))),
+    on("a name beside an excluded one", [], [DnsTree("example.org")], host, None),
+    on(
+      "a name both permitted and excluded",
+      [DnsTree("example.com")],
+      [DnsTree("www.example.com")],
+      host,
+      Some(Excluded(host)),
+    ),
+    on(
+      "a constraint with a leading dot",
+      [DnsTree(".example.com")],
+      [],
+      host,
+      Some(NotPermitted(host)),
+    ),
+    on(
+      "an excluded constraint that is no name",
+      [],
+      [DnsTree("*.example.org")],
+      host,
+      Some(Excluded(host)),
+    ),
+    on(
+      "a wildcard under a permitted name",
+      [DnsTree("example.com")],
+      [],
+      Dns("*.example.com"),
+      None,
+    ),
+    on(
+      "a wildcard over an excluded name",
+      [],
+      [DnsTree("www.example.com")],
+      Dns("*.example.com"),
+      Some(Excluded(Dns("*.example.com"))),
+    ),
+    on(
+      "a name of a kind not constrained",
+      [EmailTree("example.org")],
+      [net("10.0.0.0", 8)],
+      host,
+      None,
+    ),
+    on(
+      "an address in a permitted network",
+      [net("192.0.2.0", 24)],
+      [],
+      address("192.0.2.77"),
+      None,
+    ),
+    on(
+      "an address outside it",
+      [net("192.0.2.0", 24)],
+      [],
+      address("192.0.3.1"),
+      Some(NotPermitted(address("192.0.3.1"))),
+    ),
+    on(
+      "an address of the other family",
+      [net("192.0.2.0", 24)],
+      [],
+      address("2001:db8::1"),
+      Some(NotPermitted(address("2001:db8::1"))),
+    ),
+    on(
+      "an address in an excluded network",
+      [],
+      [net("2001:db8::", 32)],
+      address("2001:db8::1"),
+      Some(Excluded(address("2001:db8::1"))),
+    ),
+    on(
+      "a mailbox that is the permitted one",
+      [EmailTree("a@example.com")],
+      [],
+      Email("a@example.com"),
+      None,
+    ),
+    on(
+      "another mailbox of its host",
+      [EmailTree("a@example.com")],
+      [],
+      Email("b@example.com"),
+      Some(NotPermitted(Email("b@example.com"))),
+    ),
+    on(
+      "a mailbox of a permitted host",
+      [EmailTree("example.com")],
+      [],
+      Email("b@EXAMPLE.com"),
+      None,
+    ),
+    on(
+      "a mailbox of a host under it",
+      [EmailTree("example.com")],
+      [],
+      Email("b@mail.example.com"),
+      Some(NotPermitted(Email("b@mail.example.com"))),
+    ),
+    on(
+      "a mailbox of a host under a domain",
+      [EmailTree(".example.com")],
+      [],
+      Email("b@mail.example.com"),
+      None,
+    ),
+    on(
+      "a mailbox of the domain's own host",
+      [EmailTree(".example.com")],
+      [],
+      Email("b@example.com"),
+      Some(NotPermitted(Email("b@example.com"))),
+    ),
+    on(
+      "a URI of a permitted host",
+      [UriTree("example.com")],
+      [],
+      Uri("https://user@example.com:8443/a?b"),
+      None,
+    ),
+    on(
+      "a URI of a host under it",
+      [UriTree("example.com")],
+      [],
+      Uri("https://www.example.com/"),
+      Some(NotPermitted(Uri("https://www.example.com/"))),
+    ),
+    on(
+      "a URI with no host",
+      [UriTree("example.com")],
+      [],
+      Uri("urn:example"),
+      Some(NotPermitted(Uri("urn:example"))),
+    ),
+    on(
+      "a URI of an address, excluded for not being compared",
+      [],
+      [UriTree("example.com")],
+      Uri("https://192.0.2.1/"),
+      Some(Excluded(Uri("https://192.0.2.1/"))),
+    ),
+  ]
+}
+
+test "{c.name} is {show(c.fault)}" for c: Constrained in constrained_cases() {
+  let root = made(||
+    issued({ ..ca_draft("Root", None), permitted: c.permitted, excluded: c.excluded }, 1, None, 1));
+  let leaf = made(||
+    issued({ ..leaf_draft("leaf"), subject: [], alt_names: [c.presented] }, 3, Some(root), 1));
+  assert_eq(
+    result_err(verify(leaf, [], [root], at_day(350), Anyone, ServerAuth, strict())),
+    match c.fault { Some(why) -> Some({ certificate: leaf, why: why }), None -> None },
+  )
+}
+
+fn organization() -> List<Attribute> = [{ id: oid::organization_name(), value: "Example" }]
+
+fn org(name: String) -> List<Attribute> =
+  push(organization(), { id: oid::common_name(), value: name })
+
+test "a constraint holds every certificate below it, by its names and by its subject" {
+  let tree = DirectoryTree(
+    info(made(|| issued({ ..leaf_draft("x"), subject: organization() }, 9, None, 9))).subject,
+  );
+  let root = made(||
+    issued({ ..ca_draft("Root", None), permitted: [DnsTree("example.com"), tree] }, 1, None, 1));
+  let middle = made(||
+    issued({ ..ca_draft("Middle", None), subject: org("Middle") }, 2, Some(root), 1));
+  let leaf = |host: String, subject: List<Attribute>|
+    made(|| issued({ ..leaf_draft(host), subject: subject }, 3, Some(middle), 2));
+  let fault = |c: Certificate|
+    match verify(c, [middle], [root], at_day(350), Anyone, ServerAuth, strict()) {
+      Ok(_) -> None,
+      Err(failure) -> Some(failure.why),
+    };
+  assert_eq(fault(leaf("www.example.com", org("www"))), None);
+  assert_eq(fault(leaf("www.example.org", org("www"))), Some(NotPermitted(Dns("www.example.org"))));
+  assert(fault(leaf("www.example.com", called("www"))) != None);
+  let outside = made(|| issued(ca_draft("Middle", None), 2, Some(root), 1));
+  assert(
+    result_err(
+        verify(
+          leaf("www.example.com", org("www")),
+          [outside],
+          [root],
+          at_day(350),
+          Anyone,
+          ServerAuth,
+          strict(),
+        ),
+      )
+      != None,
+  )
+}
+
+test "a critical extension nobody reads refuses the path it is in, and one not in it refuses nothing" {
+  let odd: Extension = {
+    id: oid::Oid([1, 3, 6, 1, 4, 1, 99999, 1]),
+    critical: true,
+    value: b"\x05\x00",
+    content: Unparsed,
+  };
+  let p = made(pki);
+  let marked = made(||
+    issued({ ..leaf_draft("www.example.com"), extra: [odd] }, 3, Some(p.middle), 2));
+  assert_eq(
+    checked(marked, [p.middle], [p.root], 350, "www.example.com"),
+    Err(UnknownCritical(odd.id)),
+  );
+  let quiet = made(||
+    issued(
+      { ..leaf_draft("www.example.com"), extra: [{ ..odd, critical: false }] },
+      3,
+      Some(p.middle),
+      2,
+    ));
+  assert_eq(checked(quiet, [p.middle], [p.root], 350, "www.example.com"), Ok(3));
+  let stray = made(|| issued({ ..ca_draft("Stray", None), extra: [odd] }, 5, Some(p.root), 1));
+  assert_eq(checked(p.leaf, [stray, p.middle], [p.root], 350, "www.example.com"), Ok(3));
+  let above = made(|| issued({ ..ca_draft("Middle", Some(0)), extra: [odd] }, 2, Some(p.root), 1));
+  assert_eq(
+    result_err(
+      verify(p.leaf, [above], [p.root], at_day(350), Host("www.example.com"), ServerAuth, strict()),
+    ),
+    Some({ certificate: above, why: UnknownCritical(odd.id) }),
+  )
+}
+
+test "a certificate is refused where it is not RFC 5280's, and a request where it is not signed by its key" {
+  let p = made(pki);
+  let whole = der(p.leaf);
+  assert_eq(parse(whole, limits(), Strict), Ok(p.leaf));
+  assert_eq(parse(whole, limits(), Tolerant), Ok(p.leaf));
+  assert_eq(
+    parse(whole, { ..limits(), bytes: bytes_len(whole) - 1 }, Strict),
+    Err(TooLong(bytes_len(whole))),
+  );
+  assert_eq(result_ok(parse(whole, { ..limits(), extensions: 3 }, Strict)), None);
+  assert_eq(result_ok(parse(bytes_concat(whole, b"\x00"), limits(), Strict)), None);
+  assert_eq(result_ok(parse(bytes_slice(whole, 0, bytes_len(whole) - 1), limits(), Strict)), None);
+  assert_eq(result_ok(parse(b"", limits(), Strict)), None);
+  let zero = try {
+    certificate(
+      leaf_draft("a.example"),
+      crypto::verifying_key(key_of(3)),
+      b"\x00",
+      day(1),
+      day(2),
+      None,
+      key_of(3),
+    )
+  };
+  assert_eq(result_err(zero), Some(BadSerial));
+  let long = try {
+    certificate(
+      leaf_draft("a.example"),
+      crypto::verifying_key(key_of(3)),
+      bytes_concat_all(map(range(0, 21), |_: Int| b"\x01")),
+      day(1),
+      day(2),
+      None,
+      key_of(3),
+    )
+  };
+  assert_eq(result_err(long), Some(BadSerial));
+  let asked = made(||
+    request(
+      {
+        ..leaf_draft("www.example.com"),
+        subject: [{ id: oid::organization_name(), value: "Exämple" }],
+      },
+      key_of(3),
+    ));
+  let read_back = made(|| read_request(asked, limits()));
+  assert_eq(request_der(read_back), asked);
+  assert_eq(request_key(read_back), info(p.leaf).key);
+  assert_eq(
+    map(request_subject(read_back).rdns, |rdn: List<Attribute>| map(rdn, |a: Attribute| a.value)),
+    [["Exämple"]],
+  );
+  assert_eq(map(request_extensions(read_back), |e: Extension| e.content), [
+    KeyUsage([DigitalSignature]),
+    ExtendedKeyUsage([server_auth()]),
+    SubjectAltName([Dns("www.example.com")]),
+  ]);
+  let n = bytes_len(asked);
+  let forged = bytes_concat_all([
+    bytes_slice(asked, 0, n - 1),
+    byte_of_int(bytes_at(asked, n - 1) ^ 1),
+  ]);
+  assert_eq(result_err(try { read_request(forged, limits()) }), Some(Unproven))
+}
+
+/// `k` certificates of one name under `k` keys, none of which signed anything: every one is a
+/// way up that a signature check closes.
+fn decoys(k: Int, root: Certificate) -> List<Certificate> / {abort.raise} =
+  map(range(0, k), |i: Int| made(|| issued(ca_draft("Middle", None), 40 + i, Some(root), 1)))
+
+test "a verification checks no more signatures than its policy allows, and says so" {
+  let p = made(pki);
+  let crowd = decoys(12, p.root);
+  let spent = |most: Int|
+    result_err(
+      verify(p.leaf, crowd, [p.root], at_day(350), Host("www.example.com"), ServerAuth, {
+        ..strict(),
+        signatures: most,
+      }),
+    );
+  assert_eq(spent(5), Some({ certificate: p.leaf, why: Spent }));
+  assert_eq(spent(100), Some({ certificate: p.leaf, why: Unissued }));
+  assert_eq(checked(p.leaf, push(crowd, p.middle), [p.root], 350, "www.example.com"), Ok(3))
+}
+
+law "a search checks no more signatures than its policy allows, whatever is offered"
+  forall (decoy: Int, budget: Int) {
+    let p = made(pki);
+    let most = (budget & 15) + 1;
+    let case = {
+      offered: push(decoys(decoy & 7, p.root), p.middle),
+      anchors: [p.root],
+      seconds: 350 * 86400,
+      purpose: ServerAuth,
+      policy: { ..strict(), signatures: most },
+    };
+    let start = { path: None, checks: 0, failure: failed(p.leaf, Unissued), reached: 0 };
+    climbed(case, [p.leaf], start, 12).checks <= most
+  }
+
+law "a chain verifies at exactly the times every certificate in it is valid"
+  forall (t: Int) {
+    let p = made(pki);
+    let on = (t % 1000 + 1000) % 1000;
+    checked(p.leaf, [p.middle], [p.root], on, "www.example.com") == Ok(3)
+      == (on >= 300 && on <= 400)
+  }
+
+law "a certificate with one byte altered is refused, or verifies under nothing"
+  forall (at: Int, to: Int) {
+    let p = made(pki);
+    let whole = der(p.leaf);
+    let i = (at % bytes_len(whole) + bytes_len(whole)) % bytes_len(whole);
+    let altered = bytes_concat_all([
+      bytes_slice(whole, 0, i),
+      byte_of_int(to & 0xFF),
+      bytes_slice(whole, i + 1, bytes_len(whole)),
+    ]);
+    altered == whole
+      || (match parse(altered, limits(), Tolerant) {
+        Err(_) -> true,
+        Ok(c) ->
+          result_ok(verify(c, [p.middle], [p.root], at_day(350), Anyone, ServerAuth, strict()))
+            == None,
+      })
+  }
+
+law "bytes are read as a certificate or refused, and never raised over"
+  forall (data: Bytes) {
+    let p = made(pki);
+    all(
+      [data, bytes_concat(data, der(p.leaf)), bytes_concat(bytes_slice(der(p.leaf), 0, 40), data)],
+      |candidate: Bytes|
+        match parse(candidate, limits(), Tolerant) { Ok(_) -> true, Err(_) -> true },
+    )
+  }
+
+law "a built certificate and a built request read back as what was built"
+  forall (seed: Int, hosts: List<Bool>, ca: Bool) {
+    let names = map(range(0, len(hosts) & 3), |i: Int|
+      Dns("h" ++ int_to_string(i) ++ ".example.com"));
+    let d = if ca { ca_draft("CA " ++ int_to_string(seed & 7), Some(seed & 3)) }
+    else { { ..leaf_draft("leaf.example.com"), alt_names: push(names, Dns("leaf.example.com")) } };
+    let key = key_of(seed & 0xFF);
+    let built = made(|| self_signed(d, b"\x05", day(1), day(2), key));
+    let asked = made(|| read_request(request(d, key), limits()));
+    parse(der(built), limits(), Strict) == Ok(built) && alt_names(built) == d.alt_names
+      && is_ca(built) == ca
+      && request_subject(asked) == info(built).subject
+      && request_key(asked) == info(built).key
+  }

@@ -1,0 +1,156 @@
+//! A program at a real terminal under `ply run --host`: the pseudo-terminal `script` makes, with
+//! this test typing at it. What the terminal's settings are is what `stty` says of them, asked
+//! from inside the run and again once it is over. A system with no `script` has no terminal to
+//! give a test, and each test here then asserts nothing.
+
+import harness (program, at_terminal, Shell)
+import std.process (process, Said, Kill)
+import std.string
+
+/// Reads a secret with the terminal silent, then a key with it raw, saying what `stty` reports of
+/// the terminal at each step.
+fn at_a_terminal() -> String =
+  \\import std.process
+  \\import std.process (process, pipe)
+  \\import std.term
+  \\import std.term (term, tty)
+  \\
+  \\fn settings() -> String / {process.spawn[sh]} = {
+  \\  let said = process.spawn[sh](["-c", "stty -a < /dev/tty | tr '\\n\\t;' '   '"], "", [
+  \\    process::var("PATH", "/usr/bin:/bin"),
+  \\  ]);
+  \\  let flags = " " ++ string_of_bytes_lossy(said.out) ++ " ";
+  \\  let off = |name: String| string_contains(flags, " -" ++ name ++ " ");
+  \\  (if off("echo") { "echo off" } else { "echo on" })
+  \\    ++ (if off("icanon") { " icanon off" } else { " icanon on" })
+  \\}
+  \\
+  \\fn main() -> Unit / {process.spawn[sh], process.write[proc], pipe.broken, term.read, term.write, tty.missing, abort.raise} = {
+  \\  process.out[proc]("terminal " ++ (if term.is_terminal(process::Stdin) { "yes" } else { "no" }));
+  \\  process.out[proc](match term.size() {
+  \\    Some(s) -> "size " ++ int_to_string(s.columns) ++ " by " ++ int_to_string(s.rows),
+  \\    None -> "size unknown",
+  \\  });
+  \\  process.out[proc]("start: " ++ settings());
+  \\  let secret = with_hold[quiet](term::entered(term::Silent), term::restored) { was -> {
+  \\    process.out[proc]("silent: " ++ settings());
+  \\    term.secret_line()
+  \\  } };
+  \\  process.out[proc](match secret {
+  \\    Some(s) -> if secret_verify(s, "hunter2") { "secret verified" } else { "secret wrong" },
+  \\    None -> "secret missing",
+  \\  });
+  \\  process.out[proc]("between: " ++ settings());
+  \\  let key = term::raw(|| {
+  \\    process::write_out[proc](bytes_of_string("raw: " ++ settings() ++ "\r\n"));
+  \\    process::flush_out[proc]();
+  \\    term::next_event(term::pending(), 60000, 64).event
+  \\  });
+  \\  process.out[proc](match key {
+  \\    Some(term::Pressed(c)) -> if c.key == term::Up { "key up" } else { "another key" },
+  \\    _ -> "no key",
+  \\  });
+  \\  process.out[proc]("end: " ++ settings());
+  \\  process.exit[proc](0)
+  \\}
+  \\
+
+/// Puts the terminal in raw mode behind no bracket and gives up, leaving the host to put it back.
+fn leaves_it_raw() -> String =
+  \\import std.process (process)
+  \\import std.term
+  \\import std.term (term)
+  \\
+  \\fn main() -> Unit / {process.out[proc], term.mode, abort.raise} = {
+  \\  let was = term.mode(term::Raw);
+  \\  process.out[proc](if was == Some(term::Cooked) { "raw now\r" } else { "no terminal\r" });
+  \\  panic("gave up in raw mode")
+  \\}
+  \\
+
+/// `ply run m.ply --host` at a terminal, the program able to start the shell it asks `stty` by.
+fn run_at_a_terminal() -> Option<Int> / {Shell, abort.raise} =
+  at_terminal(["run", "m.ply", "--host", "--exec", "sh=/bin/sh"])
+
+/// The terminal's lines up to the first that holds `wanted`, each as it was said; the test fails
+/// with them if the terminal ends or falls silent first.
+fn until_line(
+  child: Int,
+  wanted: String,
+  seen: List<String>,
+  tries: Int,
+) -> List<String> / {process.output_line[sh], process.signal[sh], abort.raise} =
+  if tries <= 0 { gave_up(child, wanted, seen) } else {
+    match process.output_line[sh](child, 120000) {
+      Said(line) -> if string_contains(line, wanted) { push(seen, line) }
+      else { until_line(child, wanted, push(seen, line), tries - 1) },
+      _ -> gave_up(child, wanted, seen),
+    }
+  }
+
+fn gave_up(
+  child: Int,
+  wanted: String,
+  seen: List<String>,
+) -> List<String> / {process.signal[sh], abort.raise} = {
+  let _ = process.signal[sh](child, Kill);
+  panic("the terminal never said `" ++ wanted ++ "`; it said:\n" ++ string::join(seen, "\n"))
+}
+
+fn typed(child: Int, bytes: Bytes) -> Unit / {process.input[sh], abort.raise} =
+  if !process.input[sh](child, bytes) { panic("the terminal stopped taking what was typed") }
+
+fn ended_cleanly(
+  child: Int,
+) -> Unit / {process.end_input[sh], process.wait[sh], process.signal[sh], abort.raise} = {
+  process.end_input[sh](child);
+  match process.wait[sh](child, 60000) {
+    Some(_) -> (),
+    None -> {
+      let _ = process.signal[sh](child, Kill);
+      panic("`script` was still running a minute after its command ended")
+    },
+  }
+}
+
+/// Whether a line of `stty -a`, its line ends and semicolons made blanks, says echo and canonical
+/// input are both on.
+fn as_found(line: String) -> Bool =
+  !string_contains(line, " -echo ") && !string_contains(line, " -icanon ")
+
+fn secret_then_key(child: Int) -> Unit / {Shell, abort.raise} = {
+  let opening = string::join(until_line(child, "silent: ", [], 40), "\n");
+  assert(string::contains(opening, "terminal yes"), Some(opening));
+  assert(string::contains(opening, "size 80 by 24"), Some(opening));
+  assert(string::contains(opening, "start: echo on icanon on"), Some(opening));
+  assert(string::contains(opening, "silent: echo off icanon on"), Some(opening));
+  typed(child, b"hunter2\n");
+  let said = string::join(until_line(child, "raw: ", [], 40), "\n");
+  assert(!string::contains(said, "hunter2"), Some("the secret was echoed:\n" ++ said));
+  assert(string::contains(said, "secret verified"), Some(said));
+  assert(string::contains(said, "between: echo on icanon on"), Some(said));
+  assert(string::contains(said, "raw: echo off icanon off"), Some(said));
+  typed(child, b"\x1b[A");
+  let closing = string::join(until_line(child, "after: ", [], 40), "\n");
+  assert(string::contains(closing, "key up"), Some(closing));
+  assert(string::contains(closing, "end: echo on icanon on"), Some(closing));
+  assert(as_found(closing), Some("the terminal was not left as it was found:\n" ++ closing));
+  ended_cleanly(child)
+}
+
+test/nondet "at a terminal a secret is typed unseen and a key read raw, and each mode is left as it ends" {
+  program(at_a_terminal());
+  match run_at_a_terminal() { Some(child) -> secret_then_key(child), None -> () }
+}
+
+fn left_raw(child: Int) -> Unit / {Shell, abort.raise} = {
+  let said = string::join(until_line(child, "after: ", [], 40), "\n");
+  assert(string::contains(said, "raw now"), Some(said));
+  assert(as_found(said), Some("the terminal was left raw:\n" ++ said));
+  ended_cleanly(child)
+}
+
+test/nondet "a run that ends with the terminal raw leaves it as it was found" {
+  program(leaves_it_raw());
+  match run_at_a_terminal() { Some(child) -> left_raw(child), None -> () }
+}

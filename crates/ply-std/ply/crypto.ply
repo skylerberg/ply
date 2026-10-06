@@ -252,6 +252,7 @@ pub opaque type SigningKey =
 pub opaque type VerifyingKey =
   | Ed25519Verifying(Bytes)
   | EcdsaP256Verifying(Bytes, Encoding)
+  | EcdsaVerifying(Bytes, Digest, Encoding)
   | RsaPkcs1Verifying(Bytes, Digest)
   | RsaPssVerifying(Bytes, Digest)
 
@@ -260,11 +261,19 @@ show for VerifyingKey by verifying_text
 fn digest_name(d: Digest) -> String =
   match d { Sha256 -> "sha256", Sha384 -> "sha384", Sha512 -> "sha512" }
 
+/// The scheme a point's curve and a digest name: P-256 for a 65-byte point, P-384 for any other.
+fn ecdsa_scheme(point: Bytes, digest: Digest) -> String =
+  (if bytes_len(point) == 65 { "ecdsa-p256-" } else { "ecdsa-p384-" }) ++ digest_name(digest)
+
+fn encoding_name(encoding: Encoding) -> String = match encoding { Der -> "der", Raw -> "raw" }
+
 fn verifying_text(key: VerifyingKey) -> String =
   match key {
     Ed25519Verifying(public) -> "ed25519:" ++ hex(public),
     EcdsaP256Verifying(point, Der) -> "ecdsa-p256-der:" ++ hex(point),
     EcdsaP256Verifying(point, Raw) -> "ecdsa-p256-raw:" ++ hex(point),
+    EcdsaVerifying(point, digest, encoding) ->
+      ecdsa_scheme(point, digest) ++ "-" ++ encoding_name(encoding) ++ ":" ++ hex(point),
     RsaPkcs1Verifying(public, d) -> "rsa-pkcs1-" ++ digest_name(d) ++ ":" ++ hex(public),
     RsaPssVerifying(public, d) -> "rsa-pss-" ++ digest_name(d) ++ ":" ++ hex(public),
   }
@@ -345,6 +354,20 @@ fn on_p256(point: Bytes) -> Bool =
 pub fn ecdsa_p256_verifying(point: Bytes, encoding: Encoding) -> Option<VerifyingKey> =
   if on_p256(point) { Some(EcdsaP256Verifying(point, encoding)) } else { None }
 
+/// The ECDSA key a point is, verifying signatures over `digest` written in `encoding`, as a
+/// certificate pairs a curve with a hash: P-256 for a 65-byte uncompressed point and P-384 for a
+/// 97-byte one, over SHA-256 or SHA-384. P-256 over SHA-256 is `ecdsa_p256_verifying`'s key.
+/// `None` for any other length or form and for SHA-512. A P-384 point off its curve is a key that
+/// verifies nothing.
+pub fn ecdsa_verifying(point: Bytes, digest: Digest, encoding: Encoding) -> Option<VerifyingKey> = {
+  let size = bytes_len(point);
+  if digest == Sha512 || (size != 65 && size != 97) || or_else(0, || bytes_at(point, 0)) != 4 {
+    None
+  } else if size == 65 && digest == Sha256 { ecdsa_p256_verifying(point, encoding) }
+  else if size == 65 && !on_p256(point) { None }
+  else { Some(EcdsaVerifying(point, digest, encoding)) }
+}
+
 /// The bits of the modulus a PKCS #1 `RSAPublicKey` holds, or `None` for bytes that are not one
 /// in DER: what a caller reads to say why a key is refused.
 pub fn rsa_modulus_bits(public: Bytes) -> Option<Int> =
@@ -386,12 +409,33 @@ pub fn rsa_pkcs1_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey
 pub fn rsa_pss_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey> =
   match rsa_public(public) { Some(key) -> Some(RsaPssVerifying(key, digest)), None -> None }
 
-/// The public key's bytes: 32 for Ed25519, the 65-byte point for P-256, a PKCS #1 `RSAPublicKey`
-/// for RSA.
+/// How a key's signatures are made, which a document that carries one names beside it.
+pub type Signature =
+  | Ed25519Signature
+  /// ECDSA over this hash, written this way, on the curve the key's point is of.
+  | EcdsaSignature(Digest, Encoding)
+  /// RSA PKCS #1 v1.5 over this hash.
+  | RsaPkcs1Signature(Digest)
+  /// RSA PSS over this hash, its salt as long as the digest.
+  | RsaPssSignature(Digest)
+
+/// How the signatures `key` verifies are made.
+pub fn signature_of(key: VerifyingKey) -> Signature =
+  match key {
+    Ed25519Verifying(_) -> Ed25519Signature,
+    EcdsaP256Verifying(_, encoding) -> EcdsaSignature(Sha256, encoding),
+    EcdsaVerifying(_, digest, encoding) -> EcdsaSignature(digest, encoding),
+    RsaPkcs1Verifying(_, digest) -> RsaPkcs1Signature(digest),
+    RsaPssVerifying(_, digest) -> RsaPssSignature(digest),
+  }
+
+/// The public key's bytes: 32 for Ed25519, the uncompressed point for ECDSA, a PKCS #1
+/// `RSAPublicKey` for RSA.
 pub fn verifying_bytes(key: VerifyingKey) -> Bytes =
   match key {
     Ed25519Verifying(public) -> public,
     EcdsaP256Verifying(point, _) -> point,
+    EcdsaVerifying(point, _, _) -> point,
     RsaPkcs1Verifying(public, _) -> public,
     RsaPssVerifying(public, _) -> public,
   }
@@ -413,11 +457,14 @@ fn raw_of_der(der: Bytes) -> Option<Bytes> / {abort.raise} =
     Err(_) -> None,
   }
 
-fn der_of_raw(raw: Bytes) -> Bytes / {abort.raise} =
+/// The DER signature of `r` then `s`, each half of `raw`.
+fn der_of_raw(raw: Bytes) -> Bytes / {abort.raise} = {
+  let half = bytes_len(raw) / 2;
   asn1::sequence([
-    asn1::unsigned(bytes_slice(raw, 0, 32)),
-    asn1::unsigned(bytes_slice(raw, 32, 64)),
+    asn1::unsigned(bytes_slice(raw, 0, half)),
+    asn1::unsigned(bytes_slice(raw, half, 2 * half)),
   ])
+}
 
 fn made(signature: Option<Bytes>) -> Bytes / {abort.raise} =
   match signature { Some(bytes) -> bytes, None -> panic("a key its maker checked signs") }
@@ -446,6 +493,11 @@ pub fn verify(key: VerifyingKey, message: Bytes, signature: Bytes) -> Bool =
         Some(raw) -> crypto_verify("ecdsa-p256-sha256", point, message, raw),
         None -> false,
       },
+      EcdsaVerifying(point, digest, Der) ->
+        crypto_verify(ecdsa_scheme(point, digest), point, message, signature),
+      EcdsaVerifying(point, digest, Raw) ->
+        bytes_len(signature) == bytes_len(point) - 1
+          && crypto_verify(ecdsa_scheme(point, digest), point, message, der_of_raw(signature)),
       RsaPkcs1Verifying(public, digest) ->
         crypto_verify("rsa-pkcs1-" ++ digest_name(digest), public, message, signature),
       RsaPssVerifying(public, digest) ->

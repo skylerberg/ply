@@ -541,8 +541,13 @@ pub(crate) fn sign(
     Ok(option(out))
 }
 
-fn rsa_verifying(scheme: &str) -> Option<&'static ring::signature::RsaParameters> {
+/// What `ring` checks whole: RSA, and the ECDSA pairs a certificate is signed under beside
+/// P-256 with SHA-256, each over a signature in DER.
+fn ring_verifying(scheme: &str) -> Option<&'static dyn ring::signature::VerificationAlgorithm> {
     match scheme {
+        "ecdsa-p256-sha384" => Some(&ring::signature::ECDSA_P256_SHA384_ASN1),
+        "ecdsa-p384-sha256" => Some(&ring::signature::ECDSA_P384_SHA256_ASN1),
+        "ecdsa-p384-sha384" => Some(&ring::signature::ECDSA_P384_SHA384_ASN1),
         "rsa-pkcs1-sha256" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA256),
         "rsa-pkcs1-sha384" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA384),
         "rsa-pkcs1-sha512" => Some(&ring::signature::RSA_PKCS1_2048_8192_SHA512),
@@ -569,7 +574,7 @@ pub(crate) fn verify(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
             .ok()
             .zip(p256::ecdsa::Signature::from_slice(signature).ok())
             .is_some_and(|(key, signature)| key.verify(message, &signature).is_ok()),
-        other => match rsa_verifying(other) {
+        other => match ring_verifying(other) {
             Some(parameters) => ring::signature::UnparsedPublicKey::new(parameters, &public[..])
                 .verify(message, signature)
                 .is_ok(),

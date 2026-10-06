@@ -6,7 +6,7 @@
 
 use crate::fs::{FsHost, confine};
 use crate::observe::{self, Read};
-use crate::pool::JobOutput;
+use crate::pool::{JobOutput, Pooled};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
@@ -120,18 +120,16 @@ struct Connections {
     open: BTreeMap<i64, Handle>,
 }
 
+/// The connections a run holds open. Its databases lie under the roots of the `FsHost` it is
+/// registered with, and its operations wait on that host's pool.
+#[derive(Default)]
 pub struct SqliteHost {
-    fs: Arc<FsHost>,
     connections: Arc<Mutex<Connections>>,
 }
 
 impl SqliteHost {
-    /// Databases under `fs`'s roots, their operations waiting on its pool.
-    pub fn new(fs: Arc<FsHost>) -> SqliteHost {
-        SqliteHost {
-            fs,
-            connections: Arc::new(Mutex::new(Connections::default())),
-        }
+    pub fn new() -> SqliteHost {
+        SqliteHost::default()
     }
 
     /// Closes every connection `machine` opened and did not close.
@@ -154,12 +152,16 @@ impl SqliteHost {
     }
 }
 
-pub fn registrations(host: &Arc<SqliteHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+pub fn registrations(
+    fs: &Arc<FsHost>,
+    host: &Arc<SqliteHost>,
+) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     Op::ALL
         .iter()
         .map(|op| {
             let handler: Arc<dyn HostHandler> = Arc::new(Operation {
                 op: *op,
+                fs: Arc::clone(fs),
                 host: Arc::clone(host),
             });
             (op.declaration(), handler)
@@ -167,14 +169,15 @@ pub fn registrations(host: &Arc<SqliteHost>) -> Vec<(HostOp, Arc<dyn HostHandler
         .collect()
 }
 
-pub fn register(registry: &mut HostRegistry, host: Arc<SqliteHost>) {
-    for (op, handler) in registrations(&host) {
+pub fn register(registry: &mut HostRegistry, fs: Arc<FsHost>, host: Arc<SqliteHost>) {
+    for (op, handler) in registrations(&fs, &host) {
         registry.register(op, handler);
     }
 }
 
 struct Operation {
     op: Op,
+    fs: Arc<FsHost>,
     host: Arc<SqliteHost>,
 }
 
@@ -186,7 +189,7 @@ impl HostHandler for Operation {
             return Err(arity(self.op, req.args.len(), span));
         }
         let at = &req.atom.resource;
-        let root = match self.host.fs.roots().get(at) {
+        let root = match self.fs.roots().get(at) {
             Some(root) => root.to_path_buf(),
             None => return Err(unbound(self.op, at, span)),
         };
@@ -218,22 +221,24 @@ impl HostHandler for Operation {
                 let id = req.args[0].as_int(span, "a connection")?;
                 let path = req.args[1].as_str(span, "a path")?.to_string();
                 Box::new(move || {
-                    let to = match confine(&root, &path, span) {
-                        Ok(to) => to,
+                    let to = match placed(&root, &path, span) {
+                        Ok(Some(to)) if std::fs::symlink_metadata(&to).is_err() => to,
+                        Ok(_) => {
+                            return replied(Reply::failed(Failure::new(
+                                "exists",
+                                "",
+                                format!(
+                                    "`{path}` is there already, and a backup writes a new file"
+                                ),
+                            )));
+                        }
                         Err(refusal) => return JobOutput::Refused(refusal),
                     };
-                    if std::fs::symlink_metadata(&to).is_ok() {
-                        return JobOutput::Reply(Reply::failed(Failure::new(
-                            "exists",
-                            "",
-                            format!("`{path}` is there already, and a backup writes a new file"),
-                        )));
-                    }
                     let reply = reply_of(&connections, &root, id, Ask::Backup(to.clone()));
                     if reply.failure.is_none() {
                         observe::wrote(machine, &to);
                     }
-                    JobOutput::Reply(reply)
+                    replied(reply)
                 })
             }
             Op::Finish => {
@@ -268,15 +273,35 @@ impl HostHandler for Operation {
                         }
                     }
                 };
-                Box::new(move || JobOutput::Reply(reply_of(&connections, &root, id, ask)))
+                Box::new(move || replied(reply_of(&connections, &root, id, ask)))
             }
         };
         let pending = self
-            .host
             .fs
+            .pool()
             .submit(span, self.op.label(), self.op.what(), job)?;
         Ok(HostAnswer::Pending(pending))
     }
+}
+
+/// What a statement answered, built where it is polled.
+fn replied(reply: Reply) -> JobOutput {
+    JobOutput::built(move || reply.into_value())
+}
+
+/// A connection's number, or why its database did not open.
+fn connected(answer: Result<i64, Failure>) -> JobOutput {
+    JobOutput::built(move || match answer {
+        Ok(id) => Value::ctor("Ok", vec![Value::Int(id)]),
+        Err(failure) => Value::ctor("Err", vec![failure.into_value()]),
+    })
+}
+
+/// Where `path` lies under `root`: `None` where a link along it leads anywhere but where it is
+/// spelled, which a database's path may not, and where it leads nowhere.
+fn placed(root: &Path, path: &str, span: Span) -> Result<Option<PathBuf>, Diagnostic> {
+    let spelled = root.join(path);
+    Ok(confine(root, path, span)?.filter(|target| *target == spelled))
 }
 
 /// The connection `id` names under `root`. One another root opened is not open under this one,
@@ -348,8 +373,15 @@ fn open(
     machine: MachineId,
     span: Span,
 ) -> JobOutput {
-    let target = match confine(root, path, span) {
-        Ok(target) => target,
+    let target = match placed(root, path, span) {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            return connected(Err(Failure::new(
+                "unopened",
+                "",
+                format!("`{path}` passes through a symbolic link"),
+            )));
+        }
         Err(refusal) => return JobOutput::Refused(refusal),
     };
     let beside = |suffix: &str| {
@@ -361,7 +393,7 @@ fn open(
     // the link leads.
     for suffix in SIDE_FILES {
         if std::fs::symlink_metadata(beside(suffix)).is_ok_and(|meta| meta.is_symlink()) {
-            return JobOutput::Connected(Err(Failure::new(
+            return connected(Err(Failure::new(
                 "unopened",
                 "",
                 format!(
@@ -371,7 +403,7 @@ fn open(
         }
     }
     if lock(connections).open.len() >= MAX_CONNECTIONS {
-        return JobOutput::Connected(Err(Failure::new(
+        return connected(Err(Failure::new(
             "unopened",
             "",
             format!("a run holds {MAX_CONNECTIONS} connections open at most"),
@@ -396,7 +428,7 @@ fn open(
     }
     match opening.recv() {
         Ok(Ok(())) => {}
-        Ok(Err(failure)) => return JobOutput::Connected(Err(failure)),
+        Ok(Err(failure)) => return connected(Err(failure)),
         Err(_) => return JobOutput::Failed("the connection's thread ended as it opened".into()),
     }
     if mode == Mode::ReadOnly {
@@ -419,7 +451,7 @@ fn open(
             commands,
         },
     );
-    JobOutput::Connected(Ok(id))
+    connected(Ok(id))
 }
 
 /// A connection's thread: one operation at a time until it is closed or its run lets go of it.
