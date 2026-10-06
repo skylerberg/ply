@@ -2,7 +2,7 @@
 
 use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, config, fs, os, process, random, sched, tcp, term, time, trace};
+use crate::{certgen, clock, config, fs, os, process, random, sched, tcp, term, time, trace};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_eval::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
@@ -19,7 +19,8 @@ pub struct Host {
     fs: Arc<fs::FsHost>,
     /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
-    /// The two readings `std.time` answers, counting from when this host was built.
+    /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
+    /// region's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
     /// Rung by every pool above, so a park can wait on all of them at once.
     bell: Arc<Bell>,
@@ -118,6 +119,7 @@ impl Host {
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         time::register(&mut registry, Arc::clone(&self.time));
+        clock::register(&mut registry, Arc::clone(&self.time));
         os::register(&mut registry);
         certgen::register(&mut registry);
         signal::register(&mut registry, self.shutdown.as_ref());
@@ -134,6 +136,7 @@ impl Host {
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
+            time: Arc::clone(&self.time),
             bell: Arc::clone(&self.bell),
             inboxes: Inboxes::default(),
         })
@@ -149,6 +152,7 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
+        shutdown.attach_bell(&self.bell);
         if let Some(process) = &self.process {
             shutdown.attach_children(process.children());
         }
@@ -188,8 +192,16 @@ struct Facilities {
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
+    time: Arc<time::TimeHost>,
     bell: Arc<Bell>,
     inboxes: Inboxes,
+}
+
+impl Facilities {
+    /// Whether some pool holds an operation that has finished and not been collected.
+    fn ready(&self) -> bool {
+        self.net.ready() || self.fs.ready() || self.process.as_ref().is_some_and(|p| p.ready())
+    }
 }
 
 /// Per facility, the tokens this runtime watches, as they resolve.
@@ -257,15 +269,34 @@ impl HostRuntime for Facilities {
             // of them rings is waited on instead.
             _ => {
                 let seen = self.bell.rung();
-                let ready = self.net.ready()
-                    || self.fs.ready()
-                    || self.process.as_ref().is_some_and(|p| p.ready());
-                if !ready {
+                if !self.ready() {
                     self.bell.wait_past(seen);
                 }
                 Ok(())
             }
         }
+    }
+
+    fn now(&self) -> Result<i64, Diagnostic> {
+        Ok(self.time.elapsed_ns())
+    }
+
+    fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
+        // Read before the stop and the pools are looked at, so a ring after either look ends the
+        // wait at once.
+        let seen = self.bell.rung();
+        let Ok(left) = u64::try_from(deadline.saturating_sub(self.time.elapsed_ns())) else {
+            return Ok(());
+        };
+        let mut bound = std::time::Duration::from_nanos(left);
+        // A drain parks in bounded steps, so its deadline is seen while every task sleeps.
+        if self.stopping() {
+            bound = bound.min(signal::DRAIN_POLL);
+        }
+        if !self.ready() {
+            self.bell.wait_past_for(seen, bound);
+        }
+        Ok(())
     }
 
     fn stopping(&self) -> bool {

@@ -148,7 +148,7 @@ fn the_family_and_the_architecture_are_the_ones_this_binary_was_built_for() {
 fn the_process_and_the_machine_answer_as_the_systems_own_tools_do() {
     assert_eq!(int(&answer(Op::Pid)), i64::from(std::process::id()));
     assert_eq!(text(&answer(Op::Name)), said("uname", &["-sr"]));
-    assert_eq!(text(&answer(Op::Hostname)), said("hostname", &[]));
+    assert_eq!(text(&answer(Op::Hostname)), said("uname", &["-n"]));
     let answered = answer(Op::User);
     let Value::Record(user) = &answered else {
         panic!("a user is a record");

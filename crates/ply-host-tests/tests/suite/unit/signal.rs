@@ -333,12 +333,13 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     }
 }
 
-/// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler.
+/// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler. The
+/// shell's own `kill` sends it, which every system has.
 fn send_user2() {
-    let sent = std::process::Command::new("kill")
-        .args(["-USR2", &std::process::id().to_string()])
+    let sent = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -USR2 {}", std::process::id())])
         .status()
-        .expect("`kill` runs");
+        .expect("a shell runs");
     assert!(sent.success());
 }
 

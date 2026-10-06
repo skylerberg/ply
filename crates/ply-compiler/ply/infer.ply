@@ -871,6 +871,12 @@ fn prelude_op(
     }),
   }
 
+fn pair_type(first: Type, second: Type) -> Type =
+  TyRecord([{ name: b"_0", ty: first }, { name: b"_1", ty: second }])
+
+/// The operations whose place in a closure's row shows a channel it captured.
+fn channel_ops() -> List<Bytes> = [b"send", b"recv", b"close", b"select"]
+
 pub fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
   let body = fn_type([], ta, row_open(0));
@@ -899,6 +905,17 @@ pub fn prelude_effects() -> List<EffectInfo> = {
         // `None` once the channel is closed and empty.
         prelude_op(b"recv", MWrite, [0], [], [chan], option_type(ta), row_empty()),
         prelude_op(b"close", MWrite, [0], [], [chan], unit_type(), row_empty()),
+        // An arm is a channel beside `Some` of what to send on it, or `None` to receive; the
+        // answer is the arm that went beside what it took or sent, `None` for a closed channel.
+        prelude_op(
+          b"select",
+          MWrite,
+          [0],
+          [],
+          [list_type(pair_type(chan, option_type(ta))), bool_type()],
+          option_type(pair_type(int_type(), option_type(ta))),
+          row_empty(),
+        ),
       ],
     },
     {
@@ -11332,29 +11349,28 @@ type Blocked = { ty: Type, why: DeriveRefusal }
 /// use's arguments ride.
 type AlgebraicShape = { name: Bytes, params: List<Int>, rows: List<Int>, fields: List<Type> }
 
-/// Every sum type this run declared, flattened: its parameters and every field of every variant.
-fn algebraic_shapes(checker: Checker) -> List<AlgebraicShape> / {abort.raise} =
-  fold(checker.ctors, [], |acc: List<AlgebraicShape>, ctor_info: CtorInfo| {
-    let i = fold(range(0, len(acc)), 0 - 1, |p: Int, j: Int|
-      if p >= 0 { p } else if at(acc, j).name == ctor_info.type_name { j } else { p });
-    if i < 0 {
-      let scheme = ctor_info.scheme;
-      push(acc, {
-        name: ctor_info.type_name,
-        params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
-        else { concat(scheme.ty_vars, scheme.label_vars) },
-        rows: scheme.row_vars,
-        fields: ctor_info.fields,
-      })
-    } else {
-      let a = at(acc, i);
-      list_set(acc, i, { ..a, fields: concat(a.fields, ctor_info.fields) })
-    }
-  })
+/// Each sum type's shape by the type's name.
+type Shapes = Map<Bytes, AlgebraicShape>
 
-fn find_adt(adts: List<AlgebraicShape>, name: Bytes) -> Option<AlgebraicShape> =
-  fold(adts, None, |acc: Option<AlgebraicShape>, a: AlgebraicShape|
-    match acc { Some(_) -> acc, None -> if a.name == name { Some(a) } else { None } })
+/// Every sum type this run declared, flattened: its parameters and every field of every variant.
+fn algebraic_shapes(checker: Checker) -> Shapes / {abort.raise} =
+  fold(checker.ctors, map_new(), |acc: Shapes, ctor_info: CtorInfo|
+    match map_get(acc, ctor_info.type_name) {
+      None -> {
+        let scheme = ctor_info.scheme;
+        map_insert(acc, ctor_info.type_name, {
+          name: ctor_info.type_name,
+          params: if len(scheme.label_vars) == 0 { scheme.ty_vars }
+          else { concat(scheme.ty_vars, scheme.label_vars) },
+          rows: scheme.row_vars,
+          fields: ctor_info.fields,
+        })
+      },
+      Some(a) ->
+        map_insert(acc, ctor_info.type_name, { ..a, fields: concat(a.fields, ctor_info.fields) }),
+    })
+
+fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = map_get(adts, name)
 
 fn json_null_encoded(ty: Type) -> Bool =
   match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
@@ -11362,14 +11378,15 @@ fn json_null_encoded(ty: Type) -> Bool =
 fn derivable(
   deriver: Deriver,
   ty: Type,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
-) -> Option<Blocked> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], len(adts))
+) -> Option<Blocked> / {abort.raise} =
+  derivable_within(deriver, ty, adts, assumed, [], map_len(adts))
 
 fn first_blocked(
   deriver: Deriver,
   tys: List<Type>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
@@ -11384,7 +11401,7 @@ fn first_blocked(
 fn derivable_within(
   deriver: Deriver,
   ty: Type,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
@@ -11655,13 +11672,13 @@ fn witnessing(checker: Checker, cs: List<Constraint>) -> Checker =
     })
 
 fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
-  let adts = algebraic_shapes(checker);
+  let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), DOrd);
   let walked = fold(
     checker.map_keys,
     { checker: { ..checker, map_keys: [] }, seen: [] },
     |acc: { checker: Checker, seen: List<{ scope: Int, text: Bytes }> }, site: MapKeySite| {
       let key = resolve(acc.checker, site.key);
-      match derivable(DOrd, key, instance_shapes(checker.instances, adts, DOrd), site.assumed) {
+      match derivable(DOrd, key, ordered, site.assumed) {
         None -> acc,
         Some(blocked) -> if skipped_flexible(acc.checker, blocked) { acc } else {
           let pr = print_ty(printer_new(), key);
@@ -11713,6 +11730,7 @@ fn of_case(site: ConstraintSite) -> Bool =
 
 fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   let adts = algebraic_shapes(checker);
+  let shapes = deriver_shapes(checker.instances, adts);
   let walked = fold(
     checker.constrained_uses,
     { checker: { ..checker, constrained_uses: [] }, seen: [] },
@@ -11721,7 +11739,7 @@ fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
       if is_predicate(site.deriver) {
         { checker: check_predicate(acc.checker, site, ty), seen: acc.seen }
       } else {
-        let through = instance_shapes(checker.instances, adts, site.deriver);
+        let through = shapes_for(shapes, site.deriver);
         match derivable(
             site.deriver,
             ty,
@@ -12028,7 +12046,7 @@ fn why_notes_for_derive(
 
 /// `derivable(D, T)` over each `derive`'s target as a solved type.
 fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
-  let adts = algebraic_shapes(checker);
+  let shapes = deriver_shapes(checker.instances, algebraic_shapes(checker));
   fold(range(0, len(checker.modules)), checker, |c: Checker, i: Int| {
     let m = at(c.modules, i);
     fold(m.module.items, c, |cc: Checker, item: Item|
@@ -12036,12 +12054,7 @@ fn check_derives(checker: Checker) -> Checker / {abort.raise} = {
         IDerive(def) -> if !expanded_here(m, def) { cc } else {
           match derive_target({ ..cc, module: i }, m, def.target.name) {
             None -> cc,
-            Some(o) -> match derivable(
-                def.deriver,
-                o.ty,
-                instance_shapes(checker.instances, adts, def.deriver),
-                [],
-              ) {
+            Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
               None -> o.checker,
               Some(blocked) -> match blocked.why {
                 Unconstrained(_) -> o.checker,
@@ -12093,30 +12106,52 @@ fn instance_of(instances: List<InstanceInfo>, type_name: Bytes, key: Bool) -> Op
       None -> if x.type_name == type_name && is_key(x.kind) == key { Some(x) } else { None },
     })
 
+/// Whether a type that states a `key` is read through it for `deriver`: compared, ordered and hashed
+/// as what its key answers is, whatever it holds.
+fn through_key(deriver: Deriver) -> Bool =
+  same_deriver(deriver, DEq) || same_deriver(deriver, DOrd) || same_deriver(deriver, DHash)
+
+/// Each type's first statement of one kind, by the type's name.
+fn stated_by_type(instances: List<InstanceInfo>, key: Bool) -> Map<Bytes, InstanceInfo> =
+  fold(instances, map_new(), |acc: Map<Bytes, InstanceInfo>, x: InstanceInfo|
+    if is_key(x.kind) != key || map_contains(acc, x.type_name) { acc }
+    else { map_insert(acc, x.type_name, x) })
+
 /// The shapes `derivable` reads for one deriver. A type that states a `key` is compared, ordered and
 /// hashed as what its key answers is, whatever it holds, and one that states a `show` is always shown.
-fn instance_shapes(
-  instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
-  deriver: Deriver,
-) -> List<AlgebraicShape> =
+fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
   if len(instances) == 0 { adts } else {
-    let through_key = same_deriver(deriver, DEq) || same_deriver(deriver, DOrd)
-      || same_deriver(deriver, DHash);
-    if !through_key && !same_deriver(deriver, DShow) { adts } else {
-      map(adts, |shape: AlgebraicShape|
-        match instance_of(instances, shape.name, through_key) {
+    let keyed = through_key(deriver);
+    if !keyed && !same_deriver(deriver, DShow) { adts } else {
+      let stated = stated_by_type(instances, keyed);
+      map_fold(adts, adts, |acc: Shapes, name: Bytes, shape: AlgebraicShape|
+        match map_get(stated, name) {
           Some(x) ->
-            {
+            map_insert(acc, name, {
               name: shape.name,
               params: x.params,
               rows: x.rows,
-              fields: if through_key { [x.answers] } else { [] },
-            },
-          None -> shape,
+              fields: if keyed { [x.answers] } else { [] },
+            }),
+          None -> acc,
         })
     }
   }
+
+/// The shapes each deriver reads, worked out once for a pass that asks `derivable` of many sites.
+type DeriverShapes = { plain: Shapes, keyed: Shapes, shown: Shapes }
+
+fn deriver_shapes(instances: List<InstanceInfo>, adts: Shapes) -> DeriverShapes =
+  {
+    plain: adts,
+    keyed: instance_shapes(instances, adts, DEq),
+    shown: instance_shapes(instances, adts, DShow),
+  }
+
+fn shapes_for(shapes: DeriverShapes, deriver: Deriver) -> Shapes =
+  if through_key(deriver) { shapes.keyed }
+  else if same_deriver(deriver, DShow) { shapes.shown }
+  else { shapes.plain }
 
 type OwnParams = { params: List<Int>, rows: List<Int> }
 
@@ -12693,7 +12728,7 @@ fn numeric_fitted(
 fn first_key_loop(
   tys: List<Type>,
   instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   path: List<Bytes>,
   room: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
@@ -12706,7 +12741,7 @@ fn first_key_loop(
 fn key_loop(
   ty: Type,
   instances: List<InstanceInfo>,
-  adts: List<AlgebraicShape>,
+  adts: Shapes,
   path: List<Bytes>,
   room: Int,
 ) -> Option<List<Bytes>> / {abort.raise} =
@@ -12758,10 +12793,11 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   });
   if len(stated.instances) == 0 { { ..stated, module: checker.module } } else {
     let adts = algebraic_shapes(stated);
+    let shapes = deriver_shapes(stated.instances, adts);
     let judged: Checker = fold(stated.instances, stated, |c: Checker, x: InstanceInfo|
       if !is_key(x.kind) { c } else {
         let simple = simple_name_of(x.type_name);
-        match key_loop(x.answers, stated.instances, adts, [x.type_name], len(adts) + 1) {
+        match key_loop(x.answers, stated.instances, adts, [x.type_name], map_len(adts) + 1) {
           Some(path) ->
             report(
               c,
@@ -12793,12 +12829,7 @@ fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
           None ->
             fold([DOrd, DHash], c, |cc: Checker, deriver: Deriver|
               if len(cc.diags) > len(c.diags) { cc } else {
-                match derivable(
-                    deriver,
-                    x.answers,
-                    instance_shapes(stated.instances, adts, deriver),
-                    x.params,
-                  ) {
+                match derivable(deriver, x.answers, shapes_for(shapes, deriver), x.params) {
                   None -> cc,
                   Some(blocked) -> {
                     let blocker = type_text(blocked.ty);
@@ -13240,7 +13271,7 @@ fn holds_con(t: Type, name: Bytes) -> Bool =
     TyNominal(n) -> fold(n.fields, false, |b: Bool, f: Field| b || holds_con(f.ty, name)),
     TyFn(f) ->
       fold(
-        if name == b"Task" { [b"join", b"await", b"cancel"] } else { [b"send", b"recv", b"close"] },
+        if name == b"Task" { [b"join", b"await", b"cancel"] } else { channel_ops() },
         fold(f.params, holds_con(f.ret, name), |b: Bool, p: Type| b || holds_con(p, name)),
         |b: Bool, op: Bytes| b || atoms_covered(f.effects.atoms, task_op(op)),
       ),
@@ -13524,7 +13555,7 @@ fn task_op(op: Bytes) -> Atom =
   { effect: b"task", resource: RSingleton, mode: MWrite, op: Some(op) }
 
 /// A cell is reached by atoms naming its region; a task only by a join, an await or a cancel, a
-/// channel by a send, a receive or a close, and either by a `simulate` around one.
+/// channel by a send, a receive, a close or a select, and either by a `simulate` around one.
 fn row_brands(row: Row, brand: Brand) -> Bool =
   match brand {
     CellsOf(r) ->
@@ -13534,7 +13565,7 @@ fn row_brands(row: Row, brand: Brand) -> Bool =
     HoldsOf(_) -> fold(row.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()),
     Tasks ->
       fold(
-        [b"join", b"await", b"cancel", b"send", b"recv", b"close"],
+        concat([b"join", b"await", b"cancel"], channel_ops()),
         atoms_covered(row.atoms, seed_atom()),
         |b: Bool, op: Bytes| b || atoms_covered(row.atoms, task_op(op)),
       ),
@@ -14186,15 +14217,6 @@ fn facts_of(checker: Checker) -> EmitFacts / {abort.raise} =
 
 fn operand_name(ty: Type) -> Bytes =
   match ty { TyCon(k) -> if len(k.args) == 0 { k.name } else { b"" }, _ -> b"" }
-
-/// The record-update shapes of a checked program, for a caller that lowers bodies but emits no C.
-pub fn elaboration(
-  resolved: Resolved,
-  mods: List<ParsedModule>,
-) -> Option<Elaboration> / {abort.raise} = {
-  let out = check_program(resolved, mods);
-  if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
-}
 
 /// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
 /// ones a proof may unroll.

@@ -1,6 +1,8 @@
 //! `bracket(acquire, release, body)` runs `body` on what `acquire` answered, then `release` on it,
 //! however `body` ends: by returning, by a raise or a clause that does not resume unwinding through
-//! it, or by a cancel. `release` runs where the bracket stands, with the handlers around it.
+//! it, or by a cancel. `release` runs where the bracket stands, with the handlers around it. A
+//! cancel takes no answer from `acquire` and no wait from `release`: it lands when that one
+//! returns.
 
 effect log {
   write note[l](s: String) -> Unit
@@ -121,5 +123,113 @@ test "a cancelled task releases what it holds, in every interleaving" {
       log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
     };
     assert_eq(cell_get(c), ["open a", "close a"])
+  } }
+}
+
+fn with_token(tokens: Chan<Unit>) -> Unit / {task.write} =
+  bracket(
+    || task.recv(tokens),
+    |held: Option<Unit>| {
+      task.send(tokens, ());
+      ()
+    },
+    |held: Option<Unit>| task.yield(),
+  )
+
+test "a cancel takes no answer from an acquire, so the token it took goes back, in every interleaving" {
+  simulate {
+    let tokens = task.channel(1);
+    assert(task.send(tokens, ()));
+    let holder = task.spawn(|| with_token(tokens));
+    task.cancel(holder);
+    task.await(holder);
+    assert_eq(task.recv(tokens), Some(()))
+  }
+}
+
+test "a cancel lets go of a wait an acquire stands in, and nothing is released" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      simulate {
+        let never: Chan<String> = task.channel(0);
+        let t = task.spawn(||
+          bracket(
+            || task.recv(never),
+            |held: Option<String>| closed("a"),
+            |held: Option<String>| (),
+          ));
+        clock.sleep(Duration(1));
+        assert(task.cancel(t));
+        assert_eq(task.await(t), None)
+      }
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), [])
+  } }
+}
+
+fn late(name: String) -> Unit / {clock.write, log.write[l]} = {
+  clock.sleep(Duration(10));
+  log.note[l](name)
+}
+
+fn stopped(kids: List<Task<Unit>>) -> Unit / {task.write} = {
+  fold(kids, (), |u: Unit, kid: Task<Unit>| {
+    task.cancel(kid);
+    ()
+  });
+  fold(kids, (), |u: Unit, kid: Task<Unit>| {
+    task.await(kid);
+    ()
+  })
+}
+
+test "an acquire that spawns is cancelled whole: every task it spawned is there to stop" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      simulate {
+        let parent = task.spawn(||
+          bracket(
+            || [task.spawn(|| late("a")), task.spawn(|| late("b"))],
+            stopped,
+            |kids: List<Task<Unit>>| clock.sleep(Duration(100)),
+          ));
+        task.cancel(parent);
+        task.await(parent);
+        clock.sleep(Duration(20))
+      }
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), [])
+  } }
+}
+
+test "a cancel does not stop a release: it lands when the release returns" {
+  with_cell[seen]([]) { c -> {
+    handle {
+      simulate {
+        let gate = task.channel(0);
+        let t = task.spawn(||
+          bracket(
+            || (),
+            |u: Unit| {
+              task.recv(gate);
+              log.note[l]("released")
+            },
+            |u: Unit| (),
+          ));
+        clock.sleep(Duration(1));
+        assert(task.cancel(t));
+        assert(!task.cancel(t));
+        log.note[l]("cancelled");
+        assert(task.send(gate, 1));
+        assert_eq(task.await(t), None)
+      }
+    } with {
+      log.note[l](s) -> cell_set(c, push(cell_get(c), s)),
+    };
+    assert_eq(cell_get(c), ["cancelled", "released"])
   } }
 }

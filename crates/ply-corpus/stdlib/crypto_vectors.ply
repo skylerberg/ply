@@ -1,0 +1,503 @@
+//! `std.crypto` against Project Wycheproof's test vectors, vendored under `crypto/` with the
+//! licence they are passed on by: one file a primitive, each as `testvectors_v1` publishes it. A
+//! shipped module embeds no file, so the tests that read files stand here, with the tests that
+//! sign under the keys `asn1/` holds.
+//!
+//! Every vector is run, or set aside by a rule, and a test holds each file's counts:
+//!
+//! - AES-GCM under a 128-bit or a 192-bit key, which `std.crypto` has no key for;
+//! - AES-GCM under a nonce that is not twelve bytes, which GCM defines and `seal_at` refuses.
+//!
+//! A vector Wycheproof calls `acceptable` is one a library may take or refuse, and each flag that
+//! marks one has an answer here:
+//!
+//! - X25519 `Twist`, `NonCanonicalPublic`, `SpecialPublicKey`, `EdgeCaseShared`,
+//!   `EdgeCaseMultiplication` and `Ktv`: taken, and the secret is RFC 7748's;
+//! - X25519 `LowOrderPublic`, `SmallPublicKey` and `ZeroSharedSecret`, whose secret is all zeros:
+//!   refused as `SmallOrder`;
+//! - ECDH `CompressedPublic` and `CompressedPoint`: refused, since a peer's key is the
+//!   uncompressed point;
+//! - RSA `MissingNull`, a PKCS #1 v1.5 digest whose algorithm leaves its parameters out: refused.
+
+import std.bytes (bytes_of_hex, repeat, strip_leading_zeros)
+import std.crypto
+import std.crypto (Aes256Gcm, ChaCha20Poly1305, Der, Raw, Sha256, Sha384, Sha512, SmallOrder)
+import std.ed25519
+import std.hash (OutputLength, hkdf, hmac_sha256, sha256_hash, tags_match)
+import std.json
+import std.json (Json)
+import std.list (contains)
+import std.pem
+
+fn member(j: Json, name: String) -> Json =
+  match json::get(j, name) { Some(v) -> v, None -> json::Null }
+
+fn text(j: Json, name: String) -> String = match member(j, name) { json::Str(s) -> s, _ -> "" }
+
+fn count(j: Json, name: String) -> Int =
+  match member(j, name) {
+    json::Number(n) -> match int_of_decimal(n, Down) { Some(i) -> i, None -> 0 },
+    _ -> 0,
+  }
+
+fn items(j: Json, name: String) -> List<Json> =
+  match member(j, name) { json::Array(xs) -> xs, _ -> [] }
+
+fn unhex(j: Json, name: String) -> Bytes / {abort.raise} = bytes_of_hex(text(j, name))
+
+fn flags(j: Json) -> List<String> =
+  map(items(j, "flags"), |f: Json| match f { json::Str(s) -> s, _ -> "" })
+
+fn read(file: Bytes) -> Json / {abort.raise} =
+  match json::parse(file) { Ok(j) -> j, Err(e) -> panic(json::error_to_string(e)) }
+
+/// Every test of every group of a file, each made by `of` from its group and itself.
+fn cases<a>(file: Bytes, of: (Json, Json) -> a / {abort.raise}) -> List<a> / {abort.raise} =
+  fold(items(read(file), "testGroups"), [], |all: List<a>, group: Json|
+    fold(items(group, "tests"), all, |acc: List<a>, t: Json| push(acc, of(group, t))))
+
+fn tally(results: List<String>) -> { valid: Int, acceptable: Int, invalid: Int } =
+  fold(
+    results,
+    { valid: 0, acceptable: 0, invalid: 0 },
+    |n: { valid: Int, acceptable: Int, invalid: Int }, r: String|
+      match r {
+        "valid" -> { ..n, valid: n.valid + 1 },
+        "acceptable" -> { ..n, acceptable: n.acceptable + 1 },
+        _ -> { ..n, invalid: n.invalid + 1 },
+      },
+  )
+
+// --- Authenticated encryption -----------------------------------------------
+
+type Aead = {
+  id: Int,
+  comment: String,
+  result: String,
+  key_bits: Int,
+  nonce_bits: Int,
+  key: Bytes,
+  nonce: Bytes,
+  associated: Bytes,
+  plaintext: Bytes,
+  ciphertext: Bytes,
+  tag: Bytes,
+}
+
+fn aead(file: Bytes) -> List<Aead> / {abort.raise} =
+  cases(file, |group: Json, t: Json|
+    {
+      id: count(t, "tcId"),
+      comment: text(t, "comment"),
+      result: text(t, "result"),
+      key_bits: count(group, "keySize"),
+      nonce_bits: count(group, "ivSize"),
+      key: unhex(t, "key"),
+      nonce: unhex(t, "iv"),
+      associated: unhex(t, "aad"),
+      plaintext: unhex(t, "msg"),
+      ciphertext: unhex(t, "ct"),
+      tag: unhex(t, "tag"),
+    })
+
+fn aes_gcm_all() -> List<Aead> / {abort.raise} = aead(embed("crypto/aes_gcm_test.json"))
+
+fn aes_gcm() -> List<Aead> / {abort.raise} =
+  filter(aes_gcm_all(), |c: Aead| c.key_bits == 256 && c.nonce_bits == 96)
+
+fn chacha20() -> List<Aead> / {abort.raise} = aead(embed("crypto/chacha20_poly1305_test.json"))
+
+fn xchacha20() -> List<Aead> / {abort.raise} = aead(embed("crypto/xchacha20_poly1305_test.json"))
+
+/// A vector under a nonce the caller names: a valid one seals to its ciphertext and tag and opens
+/// to its plaintext, and an invalid one opens to nothing.
+fn counted(cipher: crypto::Cipher, c: Aead) -> Unit / {abort.raise} = {
+  let key = match crypto::counted_key(cipher, secret_of_bytes(c.key)) {
+    Some(k) -> k,
+    None -> panic("a key"),
+  };
+  let text = bytes_concat(c.ciphertext, c.tag);
+  if c.result == "valid" {
+    assert_eq(crypto::unwatched(|| crypto::seal_at(key, c.nonce, c.plaintext, c.associated)), text);
+    assert_eq(crypto::open_at(key, c.nonce, text, c.associated), Some(c.plaintext))
+  } else { assert_eq(crypto::open_at(key, c.nonce, text, c.associated), None) }
+}
+
+test "Wycheproof AES-256-GCM {c.id}: {c.comment}" for c: Aead in aes_gcm() { counted(Aes256Gcm, c) }
+
+test "Wycheproof ChaCha20-Poly1305 {c.id}: {c.comment}" for c: Aead in chacha20() {
+  counted(ChaCha20Poly1305, c)
+}
+
+test "Wycheproof XChaCha20-Poly1305 {c.id}: {c.comment}" for c: Aead in xchacha20() {
+  let key = match crypto::seal_key(secret_of_bytes(c.key)) { Some(k) -> k, None -> panic("a key") };
+  let text = bytes_concat_all([c.nonce, c.ciphertext, c.tag]);
+  if c.result == "valid" {
+    assert_eq(crypto::seal_under(key, c.nonce, c.plaintext, c.associated), text);
+    assert_eq(crypto::open(key, text, c.associated), Some(c.plaintext))
+  } else { assert_eq(crypto::open(key, text, c.associated), None) }
+}
+
+test "the AEAD files are run but for AES-GCM's other keys and nonces, to the count" {
+  let gcm = aes_gcm_all();
+  assert_eq(len(gcm), 316);
+  assert_eq(len(filter(gcm, |c: Aead| c.key_bits != 256)), 211);
+  assert_eq(len(filter(gcm, |c: Aead| c.key_bits == 256 && c.nonce_bits != 96)), 39);
+  assert_eq(tally(map(aes_gcm(), |c: Aead| c.result)), { valid: 39, acceptable: 0, invalid: 27 });
+  assert_eq(tally(map(chacha20(), |c: Aead| c.result)), { valid: 256, acceptable: 0, invalid: 69 });
+  assert_eq(tally(map(xchacha20(), |c: Aead| c.result)), { valid: 246, acceptable: 0, invalid: 69 })
+}
+
+// --- Signatures -------------------------------------------------------------
+
+type Signed = {
+  id: Int,
+  comment: String,
+  result: String,
+  flags: List<String>,
+  public: Bytes,
+  message: Bytes,
+  signature: Bytes,
+}
+
+fn signed(file: Bytes, public: (Json) -> Bytes / {abort.raise}) -> List<Signed> / {abort.raise} =
+  cases(file, |group: Json, t: Json|
+    {
+      id: count(t, "tcId"),
+      comment: text(t, "comment"),
+      result: text(t, "result"),
+      flags: flags(t),
+      public: public(group),
+      message: unhex(t, "msg"),
+      signature: unhex(t, "sig"),
+    })
+
+fn eddsa() -> List<Signed> / {abort.raise} =
+  signed(embed("crypto/ed25519_test.json"), |group: Json| unhex(member(group, "publicKey"), "pk"))
+
+fn point(group: Json) -> Bytes / {abort.raise} = unhex(member(group, "publicKey"), "uncompressed")
+
+fn ecdsa_raw() -> List<Signed> / {abort.raise} =
+  signed(embed("crypto/ecdsa_secp256r1_sha256_p1363_test.json"), point)
+
+fn ecdsa_der() -> List<Signed> / {abort.raise} =
+  signed(embed("crypto/ecdsa_secp256r1_sha256_test.json"), point)
+
+fn rsa_pkcs1() -> List<Signed> / {abort.raise} =
+  signed(embed("crypto/rsa_signature_2048_sha256_test.json"), |group: Json|
+    unhex(group, "publicKeyAsn"))
+
+fn rsa_pss() -> List<Signed> / {abort.raise} =
+  signed(embed("crypto/rsa_pss_2048_sha256_mgf1_32_test.json"), |group: Json|
+    unhex(group, "publicKeyAsn"))
+
+fn checked(key: Option<crypto::VerifyingKey>, c: Signed) -> Unit / {abort.raise} =
+  match key {
+    None -> panic("a vector's key is a key"),
+    Some(k) -> assert_eq(crypto::verify(k, c.message, c.signature), c.result == "valid"),
+  }
+
+test "Wycheproof Ed25519 {c.id}: {c.comment}" for c: Signed in eddsa() {
+  checked(crypto::ed25519_verifying(c.public), c);
+  assert_eq(ed25519::verify(c.public, c.message, c.signature), c.result == "valid")
+}
+
+test "Wycheproof ECDSA P-256, r and s: {c.id}: {c.comment}" for c: Signed in ecdsa_raw() {
+  checked(crypto::ecdsa_p256_verifying(c.public, Raw), c)
+}
+
+test "Wycheproof ECDSA P-256, DER: {c.id}: {c.comment}" for c: Signed in ecdsa_der() {
+  checked(crypto::ecdsa_p256_verifying(c.public, Der), c)
+}
+
+test "Wycheproof RSA PKCS #1 v1.5 {c.id}: {c.comment}" for c: Signed in rsa_pkcs1() {
+  checked(crypto::rsa_pkcs1_verifying(c.public, Sha256), c)
+}
+
+test "Wycheproof RSA PSS {c.id}: {c.comment}" for c: Signed in rsa_pss() {
+  checked(crypto::rsa_pss_verifying(c.public, Sha256), c)
+}
+
+test "the signature files are run whole, and the one acceptable signature is refused" {
+  assert_eq(tally(map(eddsa(), |c: Signed| c.result)), { valid: 88, acceptable: 0, invalid: 63 });
+  assert_eq(tally(map(ecdsa_raw(), |c: Signed| c.result)), {
+    valid: 173,
+    acceptable: 0,
+    invalid: 89,
+  });
+  assert_eq(tally(map(ecdsa_der(), |c: Signed| c.result)), {
+    valid: 174,
+    acceptable: 0,
+    invalid: 310,
+  });
+  assert_eq(tally(map(rsa_pkcs1(), |c: Signed| c.result)), {
+    valid: 9,
+    acceptable: 1,
+    invalid: 249,
+  });
+  assert_eq(map(filter(rsa_pkcs1(), |c: Signed| c.result == "acceptable"), |c: Signed| c.flags), [
+    ["MissingNull"],
+  ]);
+  assert_eq(tally(map(rsa_pss(), |c: Signed| c.result)), { valid: 63, acceptable: 0, invalid: 45 })
+}
+
+// --- Agreement --------------------------------------------------------------
+
+type Shared = {
+  id: Int,
+  comment: String,
+  result: String,
+  flags: List<String>,
+  private: Bytes,
+  public: Bytes,
+  shared: Bytes,
+}
+
+fn shared(file: Bytes) -> List<Shared> / {abort.raise} =
+  cases(file, |_group: Json, t: Json|
+    {
+      id: count(t, "tcId"),
+      comment: text(t, "comment"),
+      result: text(t, "result"),
+      flags: flags(t),
+      private: unhex(t, "private"),
+      public: unhex(t, "public"),
+      shared: unhex(t, "shared"),
+    })
+
+fn xdh() -> List<Shared> / {abort.raise} = shared(embed("crypto/x25519_test.json"))
+
+fn ecdh() -> List<Shared> / {abort.raise} = shared(embed("crypto/ecdh_secp256r1_ecpoint_test.json"))
+
+/// The flags of an X25519 vector whose peer is refused.
+fn refused_flags() -> List<String> = ["LowOrderPublic", "SmallPublicKey", "ZeroSharedSecret"]
+
+fn refused(c: Shared) -> Bool =
+  fold(c.flags, false, |any: Bool, f: String| any || contains(refused_flags(), f))
+
+test "Wycheproof X25519 {c.id}: {c.comment}" for c: Shared in xdh() {
+  let key = match crypto::x25519_key(secret_of_bytes(c.private)) {
+    Some(k) -> k,
+    None -> panic("a key"),
+  };
+  let peer = match crypto::x25519_peer(c.public) { Some(p) -> p, None -> panic("a peer") };
+  // A refused flag and a secret of zeros are one thing, told two ways.
+  assert_eq(refused(c), c.shared == repeat(b"\x00", 32));
+  if refused(c) { assert_eq(crypto::agree(key, peer), Err(SmallOrder)) }
+  else { assert_eq(crypto::agree(key, peer), Ok(secret_of_bytes(c.shared))) }
+}
+
+/// A scalar as Wycheproof writes one, a number in hex, in the 32 bytes a key is.
+fn scalar(number: Bytes) -> Bytes / {abort.raise} = {
+  let digits = strip_leading_zeros(number);
+  bytes_concat(repeat(b"\x00", 32 - bytes_len(digits)), digits)
+}
+
+test "Wycheproof ECDH P-256 {c.id}: {c.comment}" for c: Shared in ecdh() {
+  let key = match crypto::p256_key(secret_of_bytes(scalar(c.private))) {
+    Some(k) -> k,
+    None -> panic("a key"),
+  };
+  match crypto::p256_peer(c.public) {
+    Some(peer) -> {
+      assert_eq(c.result, "valid");
+      assert_eq(crypto::agree(key, peer), Ok(secret_of_bytes(c.shared)))
+    },
+    None -> assert(c.result != "valid"),
+  }
+}
+
+test "the agreement files are run whole, each acceptable vector by its flags' answer" {
+  let x = xdh();
+  assert_eq(tally(map(x, |c: Shared| c.result)), { valid: 264, acceptable: 254, invalid: 0 });
+  assert_eq(len(filter(x, refused)), 31);
+  assert_eq(len(filter(x, |c: Shared| c.result == "acceptable" && !refused(c))), 223);
+  assert_eq(len(filter(x, |c: Shared| c.result == "valid" && refused(c))), 0);
+  let p = ecdh();
+  assert_eq(tally(map(p, |c: Shared| c.result)), { valid: 330, acceptable: 1, invalid: 24 });
+  assert_eq(map(filter(p, |c: Shared| c.result == "acceptable"), |c: Shared| c.flags), [
+    ["CompressedPublic", "CompressedPoint"],
+  ])
+}
+
+// --- Keyed hashing under a secret -------------------------------------------
+
+type Mac = { id: Int, comment: String, result: String, key: Bytes, message: Bytes, tag: Bytes }
+
+fn macs() -> List<Mac> / {abort.raise} =
+  cases(embed("crypto/hmac_sha256_test.json"), |_group: Json, t: Json|
+    {
+      id: count(t, "tcId"),
+      comment: text(t, "comment"),
+      result: text(t, "result"),
+      key: unhex(t, "key"),
+      message: unhex(t, "msg"),
+      tag: unhex(t, "tag"),
+    })
+
+test "Wycheproof HMAC-SHA-256 {c.id}: {c.comment}" for c: Mac in macs() {
+  let whole = hmac_sha256(secret_of_bytes(c.key), c.message);
+  assert_eq(tags_match(bytes_slice(whole, 0, bytes_len(c.tag)), c.tag), c.result == "valid")
+}
+
+type Derived = {
+  id: Int,
+  comment: String,
+  result: String,
+  key: Bytes,
+  salt: Bytes,
+  info: Bytes,
+  size: Int,
+  output: Bytes,
+}
+
+fn derivations() -> List<Derived> / {abort.raise} =
+  cases(embed("crypto/hkdf_sha256_test.json"), |_group: Json, t: Json|
+    {
+      id: count(t, "tcId"),
+      comment: text(t, "comment"),
+      result: text(t, "result"),
+      key: unhex(t, "ikm"),
+      salt: unhex(t, "salt"),
+      info: unhex(t, "info"),
+      size: count(t, "size"),
+      output: unhex(t, "okm"),
+    })
+
+test "Wycheproof HKDF-SHA-256 {c.id}: {c.comment}" for c: Derived in derivations() {
+  let made = try { hkdf(sha256_hash(), c.salt, secret_of_bytes(c.key), c.info, c.size) };
+  if c.result == "valid" { assert_eq(made, Ok(secret_of_bytes(c.output))) }
+  else { assert_eq(made, Err(OutputLength(c.size))) }
+}
+
+test "the keyed hashing files are run whole" {
+  assert_eq(tally(map(macs(), |c: Mac| c.result)), { valid: 66, acceptable: 0, invalid: 108 });
+  assert_eq(tally(map(derivations(), |c: Derived| c.result)), {
+    valid: 83,
+    acceptable: 0,
+    invalid: 3,
+  })
+}
+
+// --- The keys this suite holds ----------------------------------------------
+
+fn rsa_document() -> Bytes = embed("asn1/rsa_key.der")
+
+fn ec_document() -> Bytes = embed("asn1/ec_key.der")
+
+fn message() -> Bytes = b"what was built"
+
+type RsaSigned = { digest: crypto::Digest, name: String, signature: String }
+
+/// What `openssl dgst -sign` writes of `message()` under the RSA key, a digest each.
+fn rsa_signed() -> List<RsaSigned> =
+  [
+    {
+      digest: Sha256,
+      name: "SHA-256",
+      signature: "06a24fcb8cae2be7cca4e8bb612b518a49629fef8002f3a51fe0b18ac0d0276d357be34a032560cd93c1d1f16cdb07e746e71cb54453d06fcf3c9a8c28a846b7ae012b68728ebaa37a59bdebae23c42b6738e74da0c858890079c2c634816cdf718ea1dca70a9d8bbc3ee714261263ba82faa3865cd7f4c4a9aaab3409f2c30c5ffbddb875444337ea1e1ca7ece051de77a93dbb394f615a2ebf3770e95a82e9fee35c6671c969726e30d8850f9988cf96b6db124d219e5288badde453de15d62b55bbac3a4c7ae2645644b2c9fb9a5786f6a7aa7e431dd4916f451a632a2d86911ce3a19a693029fe5e40924cd8650814e83d7f641a50e6c98bd74472092f6c",
+    },
+    {
+      digest: Sha384,
+      name: "SHA-384",
+      signature: "0e6775979696f70a5242cac00c91942affbe433e0b986490fcf5a6e65781a176483118be48ef2fec889429f68e043d8a8f1ab407112661879379dfe674a5a2fb1beda384a0ec50dbfcc10c0656f8641639d60decc0eb0d92164fad92e85d476a29e56eefae36da6d79bf6dc45d436294a83eee807240685e46d135757f592adca4086697ce2736a043fb8e0a2ea7187e4ec0041bb4e56be654093e0c1edd2f39c34456e783ec8da1f7690bbf60f393f56c4db6bd967a46e0a7416fa468a890f652e88e0eef99550f61fd3fd1de5b7bd107fee532c2706612a96bd14d893f03e2ae5165732ec104ecbe1c4b097046e8a8a36013305814658ebbd54385b9ad6bda",
+    },
+    {
+      digest: Sha512,
+      name: "SHA-512",
+      signature: "5e798d4df520222d341988e6530459da22bb555b7e9769401e0e33d013c6e7534e46f3d0a2c91259307fc27937ea5a7852145678bf1222a8a55fdb8a08b894955f794bafa3d46c7d2f7b48a293884397bd83333d995bb8611205817b6bc30e2ee4b5c65b68b72adec88b2e30e13c6424a92b9b27cdc8770992289cf68dee9027fa6776c88a2030b3f1bfdc9a040b37c8962ee674251e5a49bd7d5c8101e51922bb4dac191b2c02489796b4455f326e53fe2f3e7318a42507d80b66c582f3b6dfc53c262f307b76372790fb57b0fe15d49b29c55815dd84630e44e68121a3fda384500efc955ec98cb2761735320e322dfa72a7239fdd49bd91c3d84efb5ae451",
+    },
+  ]
+
+test "the suite's RSA key signs PKCS #1 v1.5 over {c.name} as openssl does" for c: RsaSigned in rsa_signed(
+  ) {
+  let key = match crypto::rsa_pkcs1_signing(secret_of_bytes(rsa_document()), c.digest) {
+    Some(k) -> k,
+    None -> panic("an RSA key"),
+  };
+  let signature = crypto::sign(key, message());
+  assert_eq(signature, bytes_of_hex(c.signature));
+  assert(crypto::verify(crypto::verifying_key(key), message(), signature));
+  assert(!crypto::verify(crypto::verifying_key(key), b"what was not", signature));
+  assert_eq(
+    Some(crypto::verifying_key(key)),
+    crypto::rsa_pkcs1_verifying(crypto::verifying_bytes(crypto::verifying_key(key)), c.digest),
+  )
+}
+
+test "a private key is read from its document without being opened" {
+  // The RSA key is PKCS #1, and the document is what signs.
+  assert(
+    crypto::private_key_of_der(secret_of_bytes(rsa_document()))
+      == Some(crypto::RsaPrivate(secret_of_bytes(rsa_document()))),
+  );
+  // The EC key is PKCS #8 over SEC 1: its scalar is the 32 bytes at 36.
+  let scalar = bytes_slice(ec_document(), 36, 68);
+  assert(
+    crypto::private_key_of_der(secret_of_bytes(ec_document()))
+      == Some(crypto::P256Private(secret_of_bytes(scalar))),
+  );
+  // RFC 8410, section 10.3: an Ed25519 key, and the same bytes named an X25519 one.
+  let seed = bytes_of_hex("d4ee72dbf913584ad5b6d8f1f769f8ad3afe7c28cbf1d4fbe097a88f44755842");
+  let ed = bytes_concat(bytes_of_hex("302e020100300506032b657004220420"), seed);
+  assert(
+    crypto::private_key_of_der(secret_of_bytes(ed))
+      == Some(crypto::Ed25519Private(secret_of_bytes(seed))),
+  );
+  let x = bytes_concat(bytes_of_hex("302e020100300506032b656e04220420"), seed);
+  assert(
+    crypto::private_key_of_der(secret_of_bytes(x))
+      == Some(crypto::X25519Private(secret_of_bytes(seed))),
+  );
+  assert(crypto::private_key_of_der(secret_of_bytes(b"")) == None);
+  assert(crypto::private_key_of_der(secret_of_bytes(bytes_slice(ed, 0, 47))) == None);
+  assert(crypto::private_key_of_der(secret_of_bytes(bytes_concat(ed, b"\x00"))) == None)
+}
+
+test "the suite's EC key signs as openssl does under RFC 6979, and its document's public key verifies" {
+  let scalar = match crypto::private_key_of_der(secret_of_bytes(ec_document())) {
+    Some(crypto::P256Private(s)) -> s,
+    _ -> panic("a P-256 key"),
+  };
+  let key = match crypto::ecdsa_p256_signing(scalar, Der) { Some(k) -> k, None -> panic("a key") };
+  // `openssl pkeyutl -sign -rawin -digest sha256 -pkeyopt nonce-type:1`.
+  let signature = bytes_of_hex(
+    "3044022023f774b41482f28d905375ddc0ba396eae186775a7696ac4c39574f33b50daea02202fbf60c0a422d528bc83da32db56a742227b96b3d5df36356c82259573059ec1",
+  );
+  assert_eq(crypto::sign(key, message()), signature);
+  // `openssl pkey -pubout` of the same document.
+  let spki = bytes_of_hex(
+    "3059301306072a8648ce3d020106082a8648ce3d03010703420004c5cba56fc8f39f5e9e8f2b3bef4ffcaf1823b22ca88604f93fe3b37e44e30c954e79edb1bc8a0c0f54e6251339eedadb37478139c4a56e19b29f7adbfe637a98",
+  );
+  match crypto::spki_decode(spki) {
+    Some(crypto::P256Public(found)) -> {
+      assert_eq(Some(crypto::verifying_key(key)), crypto::ecdsa_p256_verifying(found, Der));
+      assert_eq(crypto::spki_encode(crypto::P256Public(found)), spki)
+    },
+    _ -> panic("a P-256 public key"),
+  };
+  assert(crypto::verify(crypto::verifying_key(key), message(), signature))
+}
+
+test "a private key read from PEM signs without its bytes leaving their secret" {
+  // RFC 8410, section 10.3, and the public key of section 10.1.
+  let text = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEINTuctv5E1hK1bbY8fdp+K06/nwoy/HU++CXqI9EdVhC\n-----END PRIVATE KEY-----\n";
+  let public = bytes_of_hex("19bf44096984cdfe8541bac167dc3b96c85086aa30b6b6cb0c5c38ad703166e1");
+  match pem::decode(text, 4096) {
+    Ok([pem::Sealed(key)]) -> match crypto::private_key_of_der(key.material) {
+      Some(crypto::Ed25519Private(seed)) -> {
+        assert_eq(ed25519::public_key(seed), public);
+        assert(ed25519::verify(public, message(), ed25519::sign(seed, message())));
+        match crypto::ed25519_signing(seed) {
+          Some(signer) -> {
+            assert_eq(crypto::verifying_bytes(crypto::verifying_key(signer)), public);
+            assert_eq(crypto::sign(signer, message()), ed25519::sign(seed, message()))
+          },
+          None -> panic("a seed is a signing key"),
+        }
+      },
+      _ -> panic("an Ed25519 key"),
+    },
+    _ -> panic("one sealed key"),
+  }
+}

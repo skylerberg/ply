@@ -68,6 +68,7 @@ macro_rules! operations {
 }
 
 pub mod certgen;
+pub mod clock;
 pub mod config;
 pub mod fs;
 pub mod observe;
