@@ -239,10 +239,11 @@ it stands and nothing a hole holds is read as text:
 
 ```ply
 import std.html
-import std.html (Html, text)
+import std.html (Html, html, text)
 import std.sh
 
-fn row(name: String, kind: String) -> Html = html"<li class={text(kind)}>{text(name)}</li>"
+fn row(name: String, kind: String) -> Html / {html.unsafe_url, abort.raise} =
+  html"<li class={text(kind)}>{text(name)}</li>"
 
 fn search(pattern: String, file: String) -> List<String> = sh"-n --color=never {pattern} {file}"
 ```
