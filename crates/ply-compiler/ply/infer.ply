@@ -30,12 +30,12 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               atoms_sorted, atoms_union, atoms_difference, resource_covers, row_empty, row_open,
               row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_raises,
               run_needs, is_diverges, row_union, row_without, row_without_covered, atom_conflicts,
-              atom_covers, named_type, applied_type, int_type, bool_type, string_type, bytes_type,
-              float_type, decimal_type, unit_type, list_type, option_type, map_type, iter_type,
-              secret_type, fn_type, monomorphic, fields_sorted, field_get, mentions_secret,
-              ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var, fresh_ty,
-              fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_ty,
-              is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
+              atom_covers, placed_labels, named_type, applied_type, int_type, bool_type,
+              string_type, bytes_type, float_type, decimal_type, unit_type, list_type, option_type,
+              map_type, iter_type, secret_type, fn_type, monomorphic, fields_sorted, field_get,
+              mentions_secret, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
+              fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
+              is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
               solve_continuation_row, free_vars, unify, unify_row, covariant_con, env_new, env_push,
               env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_depth_of,
               env_locals, instantiate_with, instantiate, rename_scheme, generalize, region_prefix,
@@ -56,7 +56,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
                 expand_tagged, takes_gen)
-import embed (EmbedAt, embed_tables, rewritten)
+import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
                NullInsideOption, HoldsSecret, ConstructorShape, Leaf, Structural, Refused, Nominal,
@@ -8501,33 +8501,41 @@ fn check_component(
       let def = at(fns, at(comp, slot));
       let sig = at(sigs.sigs, slot);
       let handed = seeded_rows(acc.checker, at(qualified, slot), at(checks, slot));
+      let labels = at(grouped.group_defs, slot).labels;
       let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
         None -> None,
-        Some(rows) -> {
-          // The rows handed in carry atoms alone; a row ends in what the signature writes, the
-          // definition's own row parameter when it is generic over one.
-          let u = unify_row(acc.checker.subst, acc.checker.fresh, sig.published_row, {
-            ..settled_row(acc.checker, rows.footprint),
-            tail: resolve_row_in(acc.checker, sig.published_row).tail,
-          });
-          // Left uninstalled when it failed, so a walk starts from the substitution it would have.
-          match u.error {
-            Some(_) -> None,
-            None -> {
-              let c: Checker = with_unified(acc.checker, u);
-              Some({
-                checker: c,
-                row: settled_row(c, rows.performed),
-                count: {
-                  scaling: settled_row(c, rows.scaling).atoms,
-                  sites: [],
-                  repeats: rows.repeats,
-                  tail_over: None,
-                  recursed: None,
-                },
-              })
-            },
-          }
+        Some(rows) -> match ((
+            placed_labels(rows.footprint, labels),
+            placed_labels(rows.performed, labels),
+            placed_labels(rows.scaling, labels),
+          )) {
+          (Some(footprint), Some(performed), Some(scaling)) -> {
+            // The rows handed in carry atoms alone; a row ends in what the signature writes, the
+            // definition's own row parameter when it is generic over one.
+            let u = unify_row(acc.checker.subst, acc.checker.fresh, sig.published_row, {
+              ..settled_row(acc.checker, footprint),
+              tail: resolve_row_in(acc.checker, sig.published_row).tail,
+            });
+            // Left uninstalled when it failed, so a walk starts from the substitution it would have.
+            match u.error {
+              Some(_) -> None,
+              None -> {
+                let c: Checker = with_unified(acc.checker, u);
+                Some({
+                  checker: c,
+                  row: settled_row(c, performed),
+                  count: {
+                    scaling: settled_row(c, scaling).atoms,
+                    sites: [],
+                    repeats: rows.repeats,
+                    tail_over: None,
+                    recursed: None,
+                  },
+                })
+              },
+            }
+          },
+          _ -> None,
         },
       };
       let stepped: { checker: Checker, row: Row, count: Count } = match taken {
@@ -14290,10 +14298,8 @@ fn dedup_diags(diags: List<Diag>) -> List<Diag> =
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
 
-/// Each source parsed with the rewrites, every `derive` expanded, and what a driver read for its
-/// embeds written out.
-fn parsed_all(sources: List<Source>, embeds: List<EmbedAt>) -> List<Parsed> / {abort.raise} = {
-  let tables = embed_tables(embeds);
+/// Each source parsed with the rewrites and every `derive` expanded, with no embed read for it.
+fn parsed_all(sources: List<Source>) -> List<Parsed> / {abort.raise} =
   map(range(0, len(sources)), |i: Int| {
     let s = at(sources, i);
     let r = parse(s.src);
@@ -14301,27 +14307,37 @@ fn parsed_all(sources: List<Source>, embeds: List<EmbedAt>) -> List<Parsed> / {a
     let d: Expansion = expand_derives(i, s.name, x.module);
     {
       name: s.name,
-      module: rewritten(tables, s.name, d.module).module,
+      module: rewritten(map_new(), s.name, d.module).module,
       derived: d.derived,
       diags: d.diags,
     }
   })
-}
 
-/// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. A reporting expansion stops there.
-pub fn check_dump(sources: List<Source>, embeds: List<EmbedAt> = []) -> String / {abort.raise} = {
-  let parsed = parsed_all(sources, embeds);
+/// The driver's order: parse with the rewrites, expand every `derive`, resolve. The dump of the
+/// stage that reported, where one did.
+fn resolved_all(sources: List<Source>) -> Result<Expanded, Bytes> / {abort.raise} = {
+  let parsed = parsed_all(sources);
   let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"]);
-  let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
+  if len(expansion) > 0 { Err(bytes_concat(b"X;", dump_diags(expansion))) } else {
     match resolve_modules(mods) {
-      ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
-      ResolveSucceeded(x) -> dump_outcome(check_program(x.r, x.mods)),
+      ResolveFailed(ds) -> Err(bytes_concat(b"X;", dump_diags(ds))),
+      ResolveSucceeded(x) -> Ok(x),
     }
-  };
-  string_of_bytes(bytes_concat(head, body))
+  }
 }
+
+fn dump_head(sources: List<Source>) -> Bytes =
+  bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"])
+
+/// The driver's order, then the check.
+pub fn check_dump(sources: List<Source>) -> String / {abort.raise} =
+  string_of_bytes(
+    bytes_concat(dump_head(sources), match resolved_all(sources) {
+      Err(refused) -> refused,
+      Ok(x) -> dump_outcome(check_program(x.r, x.mods)),
+    }),
+  )
 
 fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
   if out.ok { dump_checked(out.checker) }
@@ -14367,26 +14383,30 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
   { defs: defs, tests: walked.tests, root: checker.known.root, keying: None }
 }
 
-/// The program checked twice, the second time from what the first published.
-pub fn check_dump_known(
-  sources: List<Source>,
-  embeds: List<EmbedAt> = [],
-) -> String / {abort.raise} = {
-  let parsed = parsed_all(sources, embeds);
-  let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| concat(acc, p.diags));
-  let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-  let head = bytes_concat_all([b"K;", ascii_of_int(len(sources)), b";"]);
-  let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
-    match resolve_modules(mods) {
-      ResolveFailed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
-      ResolveSucceeded(x) -> {
-        let first = check_program(x.r, x.mods);
-        if !first.ok { dump_outcome(first) }
-        else { dump_outcome(check_program_with(x.r, x.mods, known_of(first.checker))) }
-      },
-    }
+/// `check_dump`'s answer, and the program's checked a second time from the interfaces the first
+/// published. The two agree wherever those interfaces are all a caller reads of a definition.
+pub type Dumps = { walked: String, seeded: String }
+
+/// The program walked once and checked again from what that walk published; a program that does not
+/// check is not checked again.
+pub fn check_dumps(sources: List<Source>) -> Dumps / {abort.raise} = {
+  let head = dump_head(sources);
+  let both = match resolved_all(sources) {
+    Err(refused) -> { walked: refused, seeded: refused },
+    Ok(x) -> {
+      let first = check_program(x.r, x.mods);
+      let walked = dump_outcome(first);
+      {
+        walked: walked,
+        seeded: if !first.ok { walked }
+        else { dump_outcome(check_program_with(x.r, x.mods, known_of(first.checker))) },
+      }
+    },
   };
-  string_of_bytes(bytes_concat(head, body))
+  {
+    walked: string_of_bytes(bytes_concat(head, both.walked)),
+    seeded: string_of_bytes(bytes_concat(head, both.seeded)),
+  }
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -16086,7 +16106,9 @@ test "a program checked from its own published interfaces publishes the same thi
       src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\nfn show<a>(x: a) -> Int where derivable(eq, a) = 1\ntest \"says\" { say(b\"x\") }",
     },
   ];
-  assert_eq(check_dump_known(src), check_dump(src))
+  let dumps = check_dumps(src);
+  assert_eq(dumps.seeded, dumps.walked);
+  assert_eq(dumps.walked, check_dump(src))
 }
 
 test "a spec clause that reaches an effect through a call is refused at the call" {
@@ -17889,7 +17911,6 @@ fn gen_checked(sources: List<Source>) -> List<Diag> / {abort.raise} = {
         { name: s.name, src: bytes_concat(b"import std.gen (Gen, constant)\n", s.src) }),
       gen_shipped(),
     ),
-    [],
   );
   let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
   match resolve_modules(mods) {
