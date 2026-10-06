@@ -2742,6 +2742,9 @@ definitions printed back to source without tests, laws, comments or anything
 unreached, and the runnable `ply run` loads — that source checked again, its
 front end's answer and its compiled unit, which holds the value of each
 `const fn` (§3.5) — so a run of it runs no front end and evaluates none of them.
+What is reached is what each definition refers to: an effect or a type that
+shares a function's name is another definition, so a program that names the
+effect holds nothing the function calls.
 The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
 part that does not agree with the rest — a body under a hash that does not name
