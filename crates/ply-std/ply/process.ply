@@ -2,7 +2,28 @@
 //!
 //! The operations on the program's own process take its label, `[proc]` by convention; they are bound
 //! only by `ply run --host`, and `ply test` withholds them even with `--host` (`E0424`). Under
-//! `ply run --json` the lines `out` writes go to stderr, so stdout still carries the one object.
+//! `ply run --json` what the program writes to standard output goes to stderr, lines and bytes
+//! alike and each at once, so stdout still carries the one object.
+//!
+//! Standard output is buffered and standard error is not. `out_bytes` adds to the buffer, which
+//! is written when it holds 64 KiB, when `flush` asks, when `out` writes a line, before anything
+//! is written to standard error, before standard input is read, before a child that inherits a
+//! stream is started, and when the program ends, however it ends: by returning, by a raise or by
+//! `exit`. So the two streams carry what was written in the order it was written, a prompt is
+//! seen before its answer is waited for, and nothing written is lost; what `flush` adds is the
+//! moment, for a partial line that should be seen while the program computes or sleeps.
+//!
+//! Standard input has one buffer, which `line` and `in_bytes` both read: a read of bytes after a
+//! line starts where that line ended, and a line after a read of bytes where those bytes did.
+//!
+//! A stream whose reader has gone away, as when the program writes into `head`, takes nothing
+//! more. `out_bytes`, `err_bytes` and `flush` answer `false` then; `write_out`, `write_err` and
+//! `flush_out` raise `pipe.broken` in its place, which a program answers as any raise. Unanswered,
+//! and for a line written with `out` or `err`, which answer nothing, the run ends there quietly
+//! with the status a shell reports for `SIGPIPE`, 141.
+//!
+//! `std.io` has the three streams as a `Source` and two `Sink`s (`io::stdin`, `io::stdout`,
+//! `io::stderr`), for what reads and writes any stream.
 //!
 //! The operations that run another program take an executable as their label: `--exec cc=/usr/bin/cc`
 //! binds one program to `cc`, and `process.spawn[cc](..)` can start that program and no other, so the
@@ -16,8 +37,8 @@
 //! No child outlives the run that started it: however the run ends, every child still running is
 //! killed with `SIGKILL` and reaped by the host.
 //!
-//! A test handles the program's own process over `Captured`, spawns over `Runs`, and started children
-//! over `Children`.
+//! A test handles the program's own process over `Captured`, which `over` does for a whole
+//! program, spawns over `Runs`, and started children over `Children`.
 
 /// The program's own process, and the children it runs; `spawn` runs another to its end, and `start`
 /// runs one beside the program.
@@ -26,13 +47,26 @@ pub nondet effect process {
   read args[p]() -> List<String>
   /// Whether the run bound an executable to the label, which is settled before anything runs.
   read bound[e]() -> Bool
-  /// Writes one line to standard output.
+  /// Writes one line to standard output, after whatever its buffer held.
   write out[p](text: String) -> Unit
   /// Writes one line to standard error.
   write err[p](text: String) -> Unit
+  /// Adds `bytes` to standard output's buffer as they are, with no line ending. `false` once the
+  /// stream's reader has gone away, when the bytes go nowhere.
+  write out_bytes[p](bytes: Bytes) -> Bool
+  /// Writes `bytes` to standard error as they are, with no line ending. `false` once the stream's
+  /// reader has gone away.
+  write err_bytes[p](bytes: Bytes) -> Bool
+  /// Writes what standard output's buffer holds. `false` when its reader has gone away.
+  write flush[p]() -> Bool
   /// One line of the program's standard input, without its line ending, or `None` at end of input.
   /// A write rather than a read: each line is consumed, so two readers of one input race for it.
+  /// A line that is not UTF-8 is `E0502`: `in_bytes` reads one.
   write line[p]() -> Option<String>
+  /// What comes next on standard input, at most `max` bytes, waiting until there is something. An
+  /// answer shorter than `max` is not the end; an empty one is. One read answers at most 1 MiB,
+  /// and a negative `max` is `E0502`.
+  write in_bytes[p](max: Int) -> Bytes
   /// Ends the program here with `code`, `0` to `125` (else `E0502`): nothing after it runs and no value
   /// is printed.
   write exit[p](code: Int) -> Unit
@@ -55,6 +89,28 @@ pub nondet effect process {
   /// its `\n` or `\r\n` and with anything not UTF-8 read as U+FFFD.
   write output_line[e](child: Int, timeout_ms: Int) -> Heard
 }
+
+/// What a write to one of the program's own streams refuses.
+pub effect pipe {
+  /// The stream's reader went away, so it takes nothing more. Unanswered under `ply run --host`,
+  /// it ends the run quietly with status 141, as the closed pipe ends a program that never asked.
+  raise broken(stream: Stream)
+}
+
+/// One of the three streams a process is started with.
+pub type Stream = | Stdin | Stdout | Stderr
+
+/// Writes `bytes` to standard output as they are, with no line ending.
+pub fn write_out<[p]>(bytes: Bytes) -> Unit / {process.out_bytes[p], pipe.broken} =
+  if process.out_bytes[p](bytes) { () } else { pipe.broken(Stdout) }
+
+/// Writes `bytes` to standard error as they are, with no line ending.
+pub fn write_err<[p]>(bytes: Bytes) -> Unit / {process.err_bytes[p], pipe.broken} =
+  if process.err_bytes[p](bytes) { () } else { pipe.broken(Stderr) }
+
+/// Writes what standard output's buffer holds.
+pub fn flush_out<[p]>() -> Unit / {process.flush[p], pipe.broken} =
+  if process.flush[p]() { () } else { pipe.broken(Stdout) }
 
 /// One environment variable. A child is given the whole environment and inherits none of the run's.
 pub type Var = { name: String, value: String }
@@ -82,8 +138,8 @@ pub type Output = | Keep | Discard | Inherit | Lines | File(String)
 /// output streams goes.
 pub type Io = { input: Bool, out: Output, err: Output }
 
-/// `SIGHUP`, `SIGINT`, `SIGTERM` or `SIGKILL`.
-pub type Signal = | Hangup | Interrupt | Terminate | Kill
+/// `SIGHUP`, `SIGINT`, `SIGTERM`, `SIGKILL`, `SIGUSR1`, `SIGUSR2` or `SIGWINCH`.
+pub type Signal = | Hangup | Interrupt | Terminate | Kill | User1 | User2 | WindowChange
 
 /// What `output_line` heard: the next line of any `Lines` stream without its ending, nothing before
 /// the timeout, or the end of every `Lines` stream once each line has been read.
@@ -91,23 +147,52 @@ pub type Heard = | Said(String) | Quiet | Closed
 
 // --- The twin ---------------------------------------------------------------
 
-/// What a test hands the clauses below in place of the host: the arguments the
-/// program was started with, the lines it may read, each stream's lines, and the code it asked to
-/// exit with. `input` runs out into end of input, which is what a console does.
+/// One write the twin took: the stream, and the bytes exactly, a line with the `\n` that ends it.
+pub type Written = { stream: Stream, bytes: Bytes }
+
+/// What a test hands the clauses below in place of the host: the arguments the program was started
+/// with, what it may read, what it wrote, and the code it asked to exit with.
 pub type Captured = {
   args: List<String>,
-  input: List<String>,
+  /// What the input still holds, in the chunks its reads are answered from. A read of bytes takes
+  /// from the first chunk and never past it, so a chunk is the most one read answers; an empty
+  /// chunk is an end the input goes on after, as a terminal's is; running out is the end.
+  input: List<Bytes>,
+  /// Each text `out` wrote.
   out: List<String>,
+  /// Each text `err` wrote.
   err: List<String>,
+  /// Every write to either stream in the order it was made, lines and bytes alike.
+  written: List<Written>,
+  /// The streams whose reader has gone away, which take nothing more.
+  gone: List<Stream>,
   code: Option<Int>,
 }
 
 /// A twin started with these arguments, with no input.
 pub fn captured(args: List<String>) -> Captured =
-  { args: args, input: [], out: [], err: [], code: None }
+  { args: args, input: [], out: [], err: [], written: [], gone: [], code: None }
 
-/// The same twin, reading the given lines before end of input.
-pub fn with_input(c: Captured, lines: List<String>) -> Captured = { ..c, input: lines }
+/// The same twin, reading the given lines before end of input, a chunk each.
+pub fn with_input(c: Captured, lines: List<String>) -> Captured =
+  { ..c, input: map(lines, |line: String| bytes_of_string(line ++ "\n")) }
+
+/// The same twin, its input handed out in these chunks, so a test names the short reads a pipe
+/// or a terminal gives.
+pub fn with_chunks(c: Captured, chunks: List<Bytes>) -> Captured = { ..c, input: chunks }
+
+/// The same twin once `stream`'s reader has gone away.
+pub fn hung_up(c: Captured, stream: Stream) -> Captured = { ..c, gone: push(c.gone, stream) }
+
+/// Everything `stream` was written, byte for byte.
+pub fn written_to(c: Captured, stream: Stream) -> Bytes =
+  bytes_concat_all(
+    fold(c.written, [], |parts: List<Bytes>, w: Written|
+      if w.stream == stream { push(parts, w.bytes) } else { parts }),
+  )
+
+/// The status a shell reports of a program a closed pipe ended.
+pub fn broken_pipe_status() -> Int = 141
 
 /// What `process.args` answers over `c`.
 pub fn args_step(c: Captured) -> List<String> = c.args
@@ -115,22 +200,155 @@ pub fn args_step(c: Captured) -> List<String> = c.args
 /// One scripted line and the twin with it consumed; `None` once the script is empty.
 pub type Line = { captured: Captured, line: Option<String> }
 
-/// What `process.line` answers over `c`.
-pub fn line_step(c: Captured) -> Line =
-  match c.input {
-    [] -> { captured: c, line: None },
-    [first, ..rest] -> { captured: { ..c, input: rest }, line: Some(first) },
+type Cut = { before: List<Bytes>, after: List<Bytes>, ended: Bool }
+
+/// The chunks cut at their first `\n`: what comes before it, what follows it, and whether there
+/// was one.
+fn cut_at_newline(chunks: List<Bytes>) -> Cut / {abort.raise} =
+  fold(chunks, { before: [], after: [], ended: false }, |cut: Cut, chunk: Bytes|
+    if cut.ended { { ..cut, after: push(cut.after, chunk) } } else {
+      match bytes_index_of_byte(chunk, b'\n') {
+        None -> { ..cut, before: push(cut.before, chunk) },
+        Some(i) -> {
+          let rest = bytes_slice(chunk, i + 1, bytes_len(chunk));
+          {
+            before: push(cut.before, bytes_slice(chunk, 0, i)),
+            after: if bytes_len(rest) == 0 { cut.after } else { push(cut.after, rest) },
+            ended: true,
+          }
+        },
+      }
+    })
+
+/// Where a line ends once the `\r`s before its `\n` are dropped.
+fn before_returns(line: Bytes, n: Int) -> Int / {abort.raise} =
+  if n <= 0 { 0 } else if bytes_at(line, n - 1) == b'\r' { before_returns(line, n - 1) } else { n }
+
+/// What `process.line` answers over `c`: what the input holds up to its first `\n`, over as many
+/// chunks as that takes, and what follows stays for the next read, of a line or of bytes. A last
+/// line needs no `\n`. A line that is not UTF-8 panics, as the host refuses one.
+pub fn line_step(c: Captured) -> Line / {abort.raise} = {
+  let cut = cut_at_newline(c.input);
+  let line = bytes_concat_all(cut.before);
+  if !cut.ended && bytes_len(line) == 0 { { captured: { ..c, input: [] }, line: None } } else {
+    {
+      captured: { ..c, input: cut.after },
+      line: Some(string_of_bytes(bytes_slice(line, 0, before_returns(line, bytes_len(line))))),
+    }
+  }
+}
+
+/// One read's answer and the twin with it consumed.
+pub type Read = { captured: Captured, bytes: Bytes }
+
+/// What `process.in_bytes` answers over `c`: at most `max` bytes of the input's first chunk, the
+/// rest of which stays first, and nothing once the input has run out. A negative `max` panics, as
+/// the host refuses one.
+pub fn in_bytes_step(c: Captured, max: Int) -> Read / {abort.raise} =
+  if max < 0 { panic("a read's length cannot be negative") } else {
+    match c.input {
+      [] -> { captured: c, bytes: b"" },
+      [chunk, ..later] -> {
+        let n = min(max, bytes_len(chunk));
+        let left = bytes_slice(chunk, n, bytes_len(chunk));
+        {
+          captured: {
+            ..c,
+            input: if bytes_len(left) == 0 { later } else { fold(later, [left], push) },
+          },
+          bytes: bytes_slice(chunk, 0, n),
+        }
+      },
+    }
   }
 
-/// What `process.out` records.
-pub fn out_step(c: Captured, text: String) -> Captured = { ..c, out: push(c.out, text) }
+/// Whether `stream`'s reader has gone away.
+fn reader_gone(c: Captured, stream: Stream) -> Bool =
+  fold(c.gone, false, |gone: Bool, s: Stream| gone || s == stream)
 
-/// What `process.err` records.
-pub fn err_step(c: Captured, text: String) -> Captured = { ..c, err: push(c.err, text) }
+fn line_written(c: Captured, stream: Stream, text: String) -> List<Written> =
+  push(c.written, { stream: stream, bytes: bytes_of_string(text ++ "\n") })
+
+/// What `process.out` records; nothing, once the stream's reader has gone.
+pub fn out_step(c: Captured, text: String) -> Captured =
+  if reader_gone(c, Stdout) { c }
+  else { { ..c, out: push(c.out, text), written: line_written(c, Stdout, text) } }
+
+/// What `process.err` records; nothing, once the stream's reader has gone.
+pub fn err_step(c: Captured, text: String) -> Captured =
+  if reader_gone(c, Stderr) { c }
+  else { { ..c, err: push(c.err, text), written: line_written(c, Stderr, text) } }
+
+/// One write of bytes: the twin after it, and whether the stream took them.
+pub type Wrote = { captured: Captured, taken: Bool }
+
+fn bytes_written(c: Captured, stream: Stream, bytes: Bytes) -> Wrote =
+  if reader_gone(c, stream) { { captured: c, taken: false } } else {
+    { captured: { ..c, written: push(c.written, { stream: stream, bytes: bytes }) }, taken: true }
+  }
+
+/// What `process.out_bytes` answers over `c`, and records.
+pub fn out_bytes_step(c: Captured, bytes: Bytes) -> Wrote = bytes_written(c, Stdout, bytes)
+
+/// What `process.err_bytes` answers over `c`, and records.
+pub fn err_bytes_step(c: Captured, bytes: Bytes) -> Wrote = bytes_written(c, Stderr, bytes)
+
+/// What `process.flush` answers over `c`. The twin holds nothing back, so a flush moves nothing.
+pub fn flush_step(c: Captured) -> Bool = !reader_gone(c, Stdout)
 
 /// The first code wins, as it does under the host: the program has stopped by the time a second could run.
 pub fn exit_step(c: Captured, code: Int) -> Captured =
   match c.code { Some(_) -> c, None -> { ..c, code: Some(code) } }
+
+/// What a program answered over a twin, and the twin it left. `value` is `None` where the program
+/// ended itself: by `process.exit`, or by a line written to a stream whose reader had gone, which
+/// leaves the code 141.
+pub type Over<a> = { value: Option<a>, captured: Captured }
+
+/// `go` run as the program whose process `c` is: every operation on its own streams, arguments
+/// and exit code answered by the twin, as the host answers them.
+pub fn over<a, [p] | e>(
+  c: Captured,
+  go: () -> a / {process.args[p], process.out[p], process.err[p], process.out_bytes[p], process.err_bytes[p], process.flush[p], process.line[p], process.in_bytes[p], process.exit[p] | e},
+) -> Over<a> / {abort.raise | e} =
+  with_cell[process_twin](c) { io -> {
+    let lined = |stream: Stream, after: Captured| {
+      let gone = reader_gone(cell_get(io), stream);
+      cell_set(io, if gone { exit_step(cell_get(io), broken_pipe_status()) } else { after });
+      !gone
+    };
+    let wrote = |w: Wrote| {
+      cell_set(io, w.captured);
+      w.taken
+    };
+    let value = handle {
+      Some(go())
+    } with {
+      process.args[p]() -> args_step(cell_get(io)),
+      process.out[p](text) resume k -> if lined(Stdout, out_step(cell_get(io), text)) { k(()) }
+      else { None },
+      process.err[p](text) resume k -> if lined(Stderr, err_step(cell_get(io), text)) { k(()) }
+      else { None },
+      process.out_bytes[p](bytes) -> wrote(out_bytes_step(cell_get(io), bytes)),
+      process.err_bytes[p](bytes) -> wrote(err_bytes_step(cell_get(io), bytes)),
+      process.flush[p]() -> flush_step(cell_get(io)),
+      process.line[p]() -> {
+        let read = line_step(cell_get(io));
+        cell_set(io, read.captured);
+        read.line
+      },
+      process.in_bytes[p](max) -> {
+        let read = in_bytes_step(cell_get(io), max);
+        cell_set(io, read.captured);
+        read.bytes
+      },
+      process.exit[p](code) resume k -> {
+        cell_set(io, exit_step(cell_get(io), code));
+        None
+      },
+    };
+    { value: value, captured: cell_get(io) }
+  } }
 
 /// What one spawn or start asked for. The executable is not here: the label names it, and the host
 /// binds that.
@@ -649,3 +867,135 @@ test "a label stays bound however its twin moves, and a test may say otherwise" 
   assert(!bound_step({ ..planned, bound: false }));
   assert(runs_bound_step({ ..runs([]), bound: true }))
 }
+
+/// Asks a question and reads the answer from the line the question is on.
+fn ask(
+  question: String,
+) -> Option<String> / {process.out_bytes[proc], process.line[proc], pipe.broken} = {
+  write_out[proc](bytes_of_string(question));
+  process.line[proc]()
+}
+
+test "a prompt is written without a newline, and its answer read from the same line" {
+  let ran = over[proc](with_input(captured([]), ["ada"]), || ask("name: "));
+  assert_eq(ran.value, Some(Some("ada")));
+  assert_eq(written_to(ran.captured, Stdout), b"name: ");
+  assert_eq(ran.captured.out, []);
+  assert_eq(ran.captured.input, [])
+}
+
+test "bytes read after a line start where the line ended, and a line after bytes where they did" {
+  let first = line_step(with_chunks(captured([]), [b"head", b"er\r\nbo", b"dy\nlast"]));
+  assert_eq(first.line, Some("header"));
+  let some = in_bytes_step(first.captured, 100);
+  assert_eq(some.bytes, b"bo");
+  let more = in_bytes_step(some.captured, 1);
+  assert_eq(more.bytes, b"d");
+  let second = line_step(more.captured);
+  assert_eq(second.line, Some("y"));
+  let last = line_step(second.captured);
+  assert_eq(last.line, Some("last"));
+  assert_eq(line_step(last.captured).line, None);
+  assert_eq(in_bytes_step(last.captured, 8).bytes, b"")
+}
+
+test "a read answers no more than it asks for or than its chunk holds, and an empty chunk is an end the input goes on after" {
+  let c = with_chunks(captured([]), [b"abc", b"", b"de"]);
+  let none = in_bytes_step(c, 0);
+  assert_eq(none.bytes, b"");
+  assert_eq(none.captured.input, c.input);
+  let two = in_bytes_step(c, 2);
+  assert_eq(two.bytes, b"ab");
+  let short = in_bytes_step(two.captured, 100);
+  assert_eq(short.bytes, b"c");
+  let ended = in_bytes_step(short.captured, 100);
+  assert_eq(ended.bytes, b"");
+  assert_eq(in_bytes_step(ended.captured, 100).bytes, b"de")
+}
+
+test "the twin keeps what each stream was written, and both in the order it was written" {
+  let ran = over[proc](captured([]), || {
+    write_out[proc](b"a");
+    process.err[proc]("warn");
+    process.out[proc]("b");
+    write_err[proc](b"\x00\xff")
+  });
+  assert_eq(ran.captured.written, [
+    { stream: Stdout, bytes: b"a" },
+    { stream: Stderr, bytes: b"warn\n" },
+    { stream: Stdout, bytes: b"b\n" },
+    { stream: Stderr, bytes: b"\x00\xff" },
+  ]);
+  assert_eq(written_to(ran.captured, Stdout), b"ab\n");
+  assert_eq(written_to(ran.captured, Stderr), b"warn\n\x00\xff");
+  assert_eq(ran.captured.out, ["b"]);
+  assert_eq(ran.captured.err, ["warn"])
+}
+
+test "a reader that went away is a raise a program answers, and a line written to it ends the program" {
+  let closed = hung_up(captured([]), Stdout);
+  let answered = over[proc](closed, || {
+    let wrote: Result<Unit, Stream> = try[pipe.broken] { write_out[proc](b"x") };
+    wrote
+  });
+  assert_eq(answered.value, Some(Err(Stdout)));
+  assert_eq(answered.captured.code, None);
+  let flushed = over[proc](closed, || {
+    let wrote: Result<Unit, Stream> = try[pipe.broken] { flush_out[proc]() };
+    wrote
+  });
+  assert_eq(flushed.value, Some(Err(Stdout)));
+  let ended = over[proc](closed, || {
+    process.err[proc]("still read");
+    process.out[proc]("into nothing");
+    process.err[proc]("never written")
+  });
+  assert_eq(ended.value, None);
+  assert_eq(ended.captured.code, Some(broken_pipe_status()));
+  assert_eq(ended.captured.err, ["still read"]);
+  assert_eq(written_to(ended.captured, Stdout), b"")
+}
+
+test "an exit under `over` ends the program there, with what it had written" {
+  let ran = over[proc](captured(["x"]), || {
+    process.out[proc](at_first(process.args[proc]()));
+    process.exit[proc](3);
+    process.out[proc]("after the exit")
+  });
+  assert_eq(ran.value, None);
+  assert_eq(ran.captured.out, ["x"]);
+  assert_eq(ran.captured.code, Some(3))
+}
+
+fn at_first(args: List<String>) -> String = match args { [first, ..] -> first, [] -> "" }
+
+type Fed = { head: List<Int>, tail: List<Int>, ask: Int }
+
+/// Bytes a reader of lines and a reader of bytes both care about, one for each of `picks`.
+fn fed(picks: List<Int>) -> Bytes =
+  bytes_concat_all(
+    map(picks, |p: Int| if p % 3 == 0 { b"\n" } else if p % 3 == 1 { b"\x00" } else { b"\xff" }),
+  )
+
+fn read_in_pieces(f: Fed) -> Bytes / {abort.raise} = {
+  let chunks = filter([fed(f.head), fed(f.tail)], |chunk: Bytes| bytes_len(chunk) > 0);
+  let most = (f.ask % 5 + 5) % 5 + 1;
+  bytes_concat_all(
+    iterate(
+      { twin: with_chunks(captured([]), chunks), parts: [] },
+      len(f.head) + len(f.tail) + 2,
+      |s: { twin: Captured, parts: List<Bytes> }| {
+        let read = in_bytes_step(s.twin, most);
+        if bytes_len(read.bytes) == 0 { Stop(s.parts) }
+        else { Continue({ twin: read.captured, parts: push(s.parts, read.bytes) }) }
+      },
+    ),
+  )
+}
+
+fn read_whole(f: Fed) -> Bytes = bytes_concat(fed(f.head), fed(f.tail))
+
+law "what a program reads is what its input held, whatever the chunks and however much each read asks for"
+  forall (f: Fed) {
+    read_in_pieces(f) == read_whole(f)
+  }

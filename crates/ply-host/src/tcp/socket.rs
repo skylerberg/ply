@@ -1,7 +1,7 @@
 //! `net` over loopback TCP, plaintext or TLS.
 
 use super::{Handles, Net, Op, not_a_listener, not_a_stream, unknown_handle};
-use crate::pool::{Bell, Inbox, JobOutput, NET_FIRST_TOKEN, Pool};
+use crate::pool::{Inbox, JobOutput, Pool, Pooled};
 use crate::tls::{self, Credentials, Handshakes};
 use ply_eval::{Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Value};
 use rustls::pki_types::ServerName;
@@ -107,7 +107,7 @@ impl TcpHost {
                 open: Mutex::new(BTreeMap::new()),
                 handles: Handles::new(),
             }),
-            pool: Pool::new(NET_FIRST_TOKEN),
+            pool: Pool::new(),
             credentials,
             handshakes: Arc::new(Handshakes::default()),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -133,38 +133,6 @@ impl TcpHost {
         }
     }
 
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
-    }
-
     fn waiting(
         &self,
         span: Span,
@@ -175,6 +143,12 @@ impl TcpHost {
         self.pool
             .submit(span, label, what, Box::new(job))
             .map(HostAnswer::Pending)
+    }
+}
+
+impl Pooled for TcpHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
     }
 }
 
