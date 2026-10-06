@@ -1046,16 +1046,11 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
     })
 }
 
-/// Byte equality whose time depends on the lengths, not on where they first differ.
+/// Byte equality whose time depends on the lengths, not on where they first differ: two of one
+/// length are read to their ends whatever they hold, and two of different lengths differ at once.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u64;
-    for i in 0..a.len().max(b.len()) {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= u64::from(x ^ y);
-        diff = std::hint::black_box(diff);
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// Where two unequal values first part, and what each holds there.
