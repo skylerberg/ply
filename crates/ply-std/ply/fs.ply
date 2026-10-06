@@ -4,12 +4,16 @@
 //! leads outside) is `E0452`, refused before any operation runs, so following a symlink can never leave
 //! the root. Different roots never conflict. `kind`, `exists`, `remove`, `remove_tree`, `rename`,
 //! `symlink` and `read_link` act on a link itself; every other operation follows one. `E0453` bounds one
-//! call rather than a file: `read_file`, `read_at` and `walk` refuse an answer above 64 MiB, so a
-//! larger file is read a range at a time and a larger tree a directory at a time.
+//! call rather than a file: `read_file`, `read_at`, `read_chunk` and `walk` refuse an answer above
+//! 64 MiB, so a larger file is read a range or a chunk at a time and a larger tree a directory at a
+//! time.
 //!
 //! `append` and `read_at` are what make a file a log rather than a value, and `sync` and `lock` what
 //! make a paired cache honest: sync the data file before the index that names it, and serialise a
-//! read-merge-write across processes with `lock`.
+//! read-merge-write across processes with `lock`. `open` answers a descriptor a file is read or
+//! written through a chunk at a time until `close`; every operation on one is a `write` of its root,
+//! so two tasks with descriptors under one root contend. `std.io` opens one under a `with_hold`,
+//! which closes it however its body ends, and reads and writes through the hold.
 //!
 //! The twin is `MemFs`, with a `mem_` function for every operation, and `on_mem` runs code written
 //! against any root over one. It follows symlinks and refuses paths that leave its root as the host
@@ -32,6 +36,13 @@ pub type Mode = { owner: Access, group: Access, other: Access }
 
 /// Whether a class of user may read, write and execute.
 pub type Access = { read: Bool, write: Bool, execute: Bool }
+
+/// How `open` opens a file: to read from its start, to write over what it held, or to write after it.
+pub type Opening = | ToRead | ToWrite | ToAppend
+
+/// Why a file did not open: nothing is at the path, this run may not open it so, it is not a file, or
+/// the host refused for a reason of its own.
+pub type Refused = | NotFound | Denied | NotAFile | Unopened
 
 /// The files under the root the label names.
 pub nondet effect fs {
@@ -101,6 +112,23 @@ pub nondet effect fs {
   read walk[r](path: String) -> Option<List<Entry>>
   /// Stamps the path's modification time in milliseconds since the epoch; a negative one is `E0502`.
   write set_modified[r](path: String, ms: Int) -> Bool
+  /// Opens a file and answers the descriptor it is read or written through until `close`, which no
+  /// later `open` of this run answers again. `ToRead` opens a file that is there; `ToWrite` empties
+  /// it, or makes it; `ToAppend` makes it if it is not there, and every write through it lands at the
+  /// file's end. A descriptor is open under the label that opened it and under no other.
+  write open[r](path: String, how: Opening) -> Result<Int, Refused>
+  /// What comes next in a file open `ToRead`, at most `max` bytes, and moves past it. An answer
+  /// shorter than `max` is not the file's end; an empty one is. It costs the bytes it answers, never
+  /// the file's size. `None` for a descriptor not open to read under this label; a negative `max` is
+  /// `E0502`, and one over the bound of a single read `E0453`.
+  write read_chunk[r](file: Int, max: Int) -> Option<Bytes>
+  /// Writes all of `body` where the descriptor stands: after what it last wrote, or at the file's end
+  /// when it was opened `ToAppend`. Nothing is buffered: the bytes are the file's when it answers, and
+  /// `sync` of the path makes them durable. `false` for a descriptor not open to write under this
+  /// label, or when the write failed.
+  write write_chunk[r](file: Int, body: Bytes) -> Bool
+  /// Lets a descriptor go; `false` for one that is not open under this label.
+  write close[r](file: Int) -> Bool
 }
 
 /// The nine letters `ls -l` spells a mode with, `rwxr-xr-x`.
@@ -131,7 +159,8 @@ fn flag(b: Bytes, i: Int, letter: Int) -> Option<Bool> / {abort.raise} =
   else { None }
 
 /// One directory tree, as a value. A link maps to its target as written; a path `modes` holds no
-/// entry for has the mode a fresh file or directory gets.
+/// entry for has the mode a fresh file or directory gets. `opened` holds each descriptor not yet
+/// closed, and `short` is the most bytes one `read_chunk` answers, zero for as many as it is asked.
 pub type MemFs = {
   files: Map<String, Bytes>,
   dirs: Map<String, Int>,
@@ -139,8 +168,20 @@ pub type MemFs = {
   modes: Map<String, Mode>,
   modified: Map<String, Int>,
   locks: Map<String, Int>,
+  opened: Map<Int, MemOpen>,
+  short: Int,
   clock: Int,
 }
+
+/// A file a tree holds open: the key it was opened at, how, and how far into it the descriptor
+/// stands.
+pub type MemOpen = { key: String, how: Opening, at: Int }
+
+/// An open's two answers: the tree it produced, and the descriptor or why there is none.
+pub type Opened = { fs: MemFs, file: Result<Int, Refused> }
+
+/// A chunk read's two answers: the tree it produced, and the bytes.
+pub type Chunk = { fs: MemFs, bytes: Option<Bytes> }
 
 /// A write's two answers: the tree it produced and whether it happened.
 pub type Written = { fs: MemFs, ok: Bool }
@@ -160,6 +201,8 @@ pub fn mem_empty() -> MemFs =
     modes: map_new(),
     modified: map_new(),
     locks: map_new(),
+    opened: map_new(),
+    short: 0,
     clock: 1,
   }
 
@@ -507,6 +550,117 @@ pub fn mem_set_modified(tree: MemFs, path: String, ms: Int) -> Written / {abort.
     }
   }
 
+/// What `fs.open` answers over the tree: a descriptor for a file its owner may read, or for one it
+/// may write, made when it is not there and emptied by `ToWrite`. A descriptor names its path, not
+/// the file that was there, so one whose file was removed or renamed reads as ended and writes
+/// nothing, where a disk keeps the file until it is closed.
+pub fn mem_open(tree: MemFs, path: String, how: Opening) -> Opened / {abort.raise} =
+  match key_of(tree, path, true) {
+    None -> { fs: tree, file: Err(NotFound) },
+    Some(key) -> match kind_at(tree, key) {
+      Dir -> { fs: tree, file: Err(NotAFile) },
+      File -> match how {
+        ToRead -> if readable(tree, key) { descriptor(tree, key, how) }
+        else { { fs: tree, file: Err(Denied) } },
+        ToWrite -> if writable(tree, key) { descriptor(emptied(tree, key), key, how) }
+        else { { fs: tree, file: Err(Denied) } },
+        ToAppend -> if writable(tree, key) { descriptor(tree, key, how) }
+        else { { fs: tree, file: Err(Denied) } },
+      },
+      _ -> match how {
+        ToRead -> { fs: tree, file: Err(NotFound) },
+        _ -> if placeable(tree, key) { descriptor(emptied(tree, key), key, how) }
+        else if kind_at(tree, parent_of(key)) == Dir { { fs: tree, file: Err(Denied) } }
+        else { { fs: tree, file: Err(NotFound) } },
+      },
+    },
+  }
+
+/// The tree with an empty file at `key`, stamped now.
+fn emptied(tree: MemFs, key: String) -> MemFs =
+  {
+    ..tree,
+    files: map_insert(tree.files, key, b""),
+    modified: map_insert(tree.modified, key, tree.clock),
+    clock: tree.clock + 1,
+  }
+
+/// The tree's clock names the descriptor, so none is answered twice.
+fn descriptor(tree: MemFs, key: String, how: Opening) -> Opened =
+  {
+    fs: {
+      ..tree,
+      opened: map_insert(tree.opened, tree.clock, { key: key, how: how, at: 0 }),
+      clock: tree.clock + 1,
+    },
+    file: Ok(tree.clock),
+  }
+
+/// What `fs.read_chunk` answers over the tree: what comes next, at most `max` bytes and at most the
+/// tree's `short` when that is set, so an answer shorter than `max` is not the end and an empty one
+/// is. A negative `max` panics, as the host refuses one.
+pub fn mem_read_chunk(tree: MemFs, file: Int, max: Int) -> Chunk / {abort.raise} =
+  if max < 0 { panic("a chunk's length cannot be negative") } else {
+    match map_get(tree.opened, file) {
+      Some(o) -> if o.how != ToRead { { fs: tree, bytes: None } } else {
+        let body = match map_get(tree.files, o.key) { Some(b) -> b, None -> b"" };
+        let size = bytes_len(body);
+        let from = at_most(o.at, size);
+        let wanted = if tree.short > 0 { at_most(max, tree.short) } else { max };
+        let to = at_most(from + wanted, size);
+        {
+          fs: { ..tree, opened: map_insert(tree.opened, file, { ..o, at: to }) },
+          bytes: Some(bytes_slice(body, from, to)),
+        }
+      },
+      None -> { fs: tree, bytes: None },
+    }
+  }
+
+/// What `fs.write_chunk` does to the tree: `body` where the descriptor stands, which is the file's
+/// end for one opened `ToAppend`.
+pub fn mem_write_chunk(tree: MemFs, file: Int, body: Bytes) -> Written / {abort.raise} =
+  match map_get(tree.opened, file) {
+    Some(o) -> match map_get(tree.files, o.key) {
+      Some(had) -> if o.how == ToRead { { fs: tree, ok: false } } else {
+        let size = bytes_len(had);
+        let from = if o.how == ToAppend { size } else { at_most(o.at, size) };
+        let to = from + bytes_len(body);
+        {
+          fs: {
+            ..tree,
+            files: map_insert(
+              tree.files,
+              o.key,
+              bytes_concat_all([
+                bytes_slice(had, 0, from),
+                body,
+                bytes_slice(had, at_most(to, size), size),
+              ]),
+            ),
+            modified: map_insert(tree.modified, o.key, tree.clock),
+            opened: map_insert(tree.opened, file, { ..o, at: to }),
+            clock: tree.clock + 1,
+          },
+          ok: true,
+        }
+      },
+      None -> { fs: tree, ok: false },
+    },
+    None -> { fs: tree, ok: false },
+  }
+
+/// What `fs.close` does to the tree.
+pub fn mem_close(tree: MemFs, file: Int) -> Written =
+  if map_contains(tree.opened, file) {
+    { fs: { ..tree, opened: map_remove(tree.opened, file) }, ok: true }
+  } else { { fs: tree, ok: false } }
+
+/// The tree answering at most `n` bytes to each `read_chunk` from here on, and as many as it is
+/// asked for when `n` is zero: the short reads a pipe or a socket gives, which a file on a disk
+/// seldom does, so a test of a reader runs it over a tree that gives them.
+pub fn mem_short_reads(tree: MemFs, n: Int) -> MemFs = { ..tree, short: n }
+
 /// What `go` answered over a twin, and the tree it left.
 pub type Over<a> = { value: a, tree: MemFs }
 
@@ -558,6 +712,18 @@ pub fn on_mem<a, [l] | e>(
       fs.read_link[l](p) -> mem_read_link(cell_get(t), p),
       fs.walk[l](p) -> mem_walk(cell_get(t), p),
       fs.set_modified[l](p, ms) -> kept(mem_set_modified(cell_get(t), p, ms)),
+      fs.open[l](p, how) -> {
+        let o = mem_open(cell_get(t), p, how);
+        cell_set(t, o.fs);
+        o.file
+      },
+      fs.read_chunk[l](file, max) -> {
+        let c = mem_read_chunk(cell_get(t), file, max);
+        cell_set(t, c.fs);
+        c.bytes
+      },
+      fs.write_chunk[l](file, body) -> kept(mem_write_chunk(cell_get(t), file, body)),
+      fs.close[l](file) -> kept(mem_close(cell_get(t), file)),
     };
     { value: value, tree: cell_get(t) }
   } }
@@ -1202,4 +1368,56 @@ test "a body that may perform any operation of its root runs over the twin whole
   let over = on_mem(mem_of([{ path: "a.txt", body: b"x" }]), || rearranged());
   assert_eq(over.value, Some("b.txt"));
   assert_eq(mem_read(over.tree, "t-2/b.txt"), Some(b"x"))
+}
+
+fn descriptor_of(o: Opened) -> Int / {abort.raise} =
+  match o.file { Ok(file) -> file, Err(_) -> panic("the file opens") }
+
+test "a descriptor reads what comes next a chunk at a time, and an empty chunk is its file's end" {
+  let o = mem_open(mem_of([{ path: "log", body: b"abcdefg" }]), "log", ToRead);
+  let file = descriptor_of(o);
+  let first = mem_read_chunk(o.fs, file, 3);
+  let short = mem_read_chunk(mem_short_reads(first.fs, 2), file, 100);
+  let rest = mem_read_chunk(mem_short_reads(short.fs, 0), file, 100);
+  let ended = mem_read_chunk(rest.fs, file, 100);
+  assert_eq([first.bytes, short.bytes, rest.bytes, ended.bytes], [
+    Some(b"abc"),
+    Some(b"de"),
+    Some(b"fg"),
+    Some(b""),
+  ]);
+  assert(!mem_write_chunk(ended.fs, file, b"x").ok);
+  let closed = mem_close(ended.fs, file);
+  assert(closed.ok);
+  assert(!mem_close(closed.fs, file).ok);
+  assert_eq(mem_read_chunk(closed.fs, file, 1).bytes, None)
+}
+
+test "a descriptor opened to write empties its file, and one opened to append writes at its end" {
+  let w = mem_open(mem_of([{ path: "log", body: b"old" }]), "log", ToWrite);
+  let file = descriptor_of(w);
+  let written = mem_write_chunk(mem_write_chunk(w.fs, file, b"ab").fs, file, b"cd").fs;
+  assert_eq(mem_read(written, "log"), Some(b"abcd"));
+  assert_eq(mem_read_chunk(written, file, 1).bytes, None);
+  let a = mem_open(mem_close(written, file).fs, "log", ToAppend);
+  assert(a.file != w.file);
+  let appended = mem_write_chunk(a.fs, descriptor_of(a), b"ef").fs;
+  assert_eq(mem_read(appended, "log"), Some(b"abcdef"));
+  let made = mem_open(appended, "new", ToAppend);
+  assert_eq(mem_read(mem_write_chunk(made.fs, descriptor_of(made), b"x").fs, "new"), Some(b"x"))
+}
+
+test "an open says why a file did not open" {
+  let none = access(false, false, false);
+  let fixture = mem_set_mode(mem_of([{ path: "d/f", body: b"x" }]), "d/f", {
+    owner: none,
+    group: none,
+    other: none,
+  }).fs;
+  assert_eq(mem_open(fixture, "absent", ToRead).file, Err(NotFound));
+  assert_eq(mem_open(fixture, "d", ToRead).file, Err(NotAFile));
+  assert_eq(mem_open(fixture, "d", ToWrite).file, Err(NotAFile));
+  assert_eq(mem_open(fixture, "no/f", ToWrite).file, Err(NotFound));
+  assert_eq(mem_open(fixture, "d/f", ToRead).file, Err(Denied));
+  assert_eq(mem_open(fixture, "d/f", ToAppend).file, Err(Denied))
 }

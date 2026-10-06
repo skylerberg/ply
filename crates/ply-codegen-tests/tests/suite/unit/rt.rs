@@ -314,6 +314,16 @@ fn here(which: Int, n: Int) -> Int =
 
 pub fn refused_here(n: Int, spin: Int) -> Int / {diverges} =
   ended(fold(range(0, n), 0, |acc: Int, i: Int| acc + here(i % 7, i)), spin)
+
+pub fn refused_held(n: Int, spin: Int) -> Int / {diverges} =
+  ended(
+    fold(range(0, n), 0, |acc: Int, i: Int|
+      acc
+        + (handle {
+          with_hold[slot](i, |held: Int| ()) { h -> falls(hold_get(h) % 7, hold_get(h), 100) }
+        } with { abort.raise(m) -> i })),
+    spin,
+  )
 "#;
 
 /// The nested calls an entry below is allowed. The rounds leave through far more frames than
@@ -432,6 +442,7 @@ const WAYS: &[Way] = &[
     // What a builtin raises, by each of them in turn: far down, and in the `handle`'s own body.
     ("m.refused", triangle),
     ("m.refused_here", triangle),
+    ("m.refused_held", triangle),
 ];
 
 /// A frame a failure returns through gives its call back where the failure is caught, and a body

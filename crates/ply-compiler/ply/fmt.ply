@@ -14,9 +14,9 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, ty_span, mode_text, is_raise, angled, generics_text, ident_names)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt, SLet,
-              SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt,
+              SLet, SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
               ETagged, Tagged, Hole, written_operator, call_operator)
 import rewrite (map_expr, map_item)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
@@ -701,6 +701,7 @@ fn runs_on(expr: Expr) -> Bool =
     EMatch(_) -> true,
     EHandle(_) -> true,
     EWithCell(_) -> true,
+    EWithHold(_) -> true,
     ESimulate(_) -> true,
     ETryBlock(_) -> true,
     _ -> false,
@@ -1052,6 +1053,16 @@ fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
         flat_expr(input, v.body),
         Some(b" }"),
       ]),
+    EWithHold(v) ->
+      cat([
+        Some(bytes_concat_all([b"with_hold[", v.resource.name, b"]("])),
+        flat_expr(input, v.acquire),
+        Some(b", "),
+        flat_expr(input, v.release),
+        Some(bytes_concat_all([b") { ", v.binder.name, b" -> "])),
+        flat_expr(input, v.body),
+        Some(b" }"),
+      ]),
     ESimulate(v) -> cat([Some(b"simulate "), flat_expr(input, v.body)]),
     ETryBlock(v) -> cat([Some(try_head(v.raise)), flat_expr(input, v.body)]),
     EParallel(v) ->
@@ -1249,6 +1260,22 @@ fn broken_node(
       ),
     EHandle(v) -> handle_expr(input, printer, v.body, v.clauses, v.ret, v.span, indent),
     EWithCell(v) -> cell_expr(input, printer, v.resource, v.init, v.binder, v.body, v.span, indent),
+    EWithHold(v) -> {
+      let head = emit(printer, bytes_concat_all([b"with_hold[", v.resource.name, b"]"]));
+      let opened = emit(
+        call(
+          input,
+          head,
+          [v.acquire, v.release],
+          [],
+          { ..v.span, end: expr_span(v.release).end },
+          indent,
+          bytes_len(v.binder.name) + 7,
+        ),
+        bytes_concat_all([b" { ", v.binder.name, b" ->"]),
+      );
+      region_body(input, opened, v.body, v.span, indent)
+    },
     ESimulate(v) -> block(input, emit(printer, b"simulate "), v.body, indent),
     ETryBlock(v) -> block(input, emit(printer, try_head(v.raise)), v.body, indent),
     // Trailing comments are read from the end of the keyword, where the braces' own span would start.
@@ -1360,6 +1387,9 @@ fn head_width(input: PrintInput, expr: Expr) -> Int / {abort.raise} =
     EHandle(_) -> 8,
     EWithCell(v) ->
       16 + bytes_len(v.resource.name) + flat_len(input, v.init) + bytes_len(v.binder.name),
+    EWithHold(v) ->
+      18 + bytes_len(v.resource.name) + flat_len(input, v.acquire) + flat_len(input, v.release)
+        + bytes_len(v.binder.name),
     _ -> 1,
   }
 
@@ -1765,13 +1795,24 @@ fn cell_expr(
     expr(input, s1, init, indent + 2, 1),
     bytes_concat_all([b") { ", binder.name, b" ->"]),
   );
+  region_body(input, s2, body, span, indent)
+}
+
+/// A region's body after its `binder ->`, through the `}` that closes the region.
+fn region_body(
+  input: PrintInput,
+  printer: Printer,
+  body: Expr,
+  span: Span,
+  indent: Int,
+) -> Printer / {abort.raise} = {
   let bsp = expr_span(body);
   match body {
-    EBlock(_) -> emit(block(input, emit(s2, b" "), body, indent), b" }"),
-    _ -> match try_flat(input, s2, flat_expr(input, body), bsp.end, 3) {
-      Some(f) -> emit(s2, bytes_concat_all([b" ", f, b" }"])),
+    EBlock(_) -> emit(block(input, emit(printer, b" "), body, indent), b" }"),
+    _ -> match try_flat(input, printer, flat_expr(input, body), bsp.end, 3) {
+      Some(f) -> emit(printer, bytes_concat_all([b" ", f, b" }"])),
       None -> {
-        let s3 = expr(input, nl(s2, indent + 2, false), body, indent + 2, 0);
+        let s3 = expr(input, nl(printer, indent + 2, false), body, indent + 2, 0);
         emit(nl(flush_comments(input, s3, span.end, indent + 2, false), indent, false), b"}")
       },
     },
@@ -3114,6 +3155,7 @@ test "every expression kind prints back to the same tree" {
     b"  let z = (r.a)(1)? + m::g(1, k: 2);\n",
     b"  let c = handle { db.get[users](1) } with { db.get[users](k) resume q -> q(Some(k)), return x -> x };\n",
     b"  let d = with_cell[work](0) { cell -> { cell_set(cell, 1); cell_get(cell) } };\n",
+    b"  let o = with_hold[file](opened(a), |x: Int| closed(x)) { h -> { used(h); hold_get(h) } };\n",
     b"  simulate { a };\n",
     b"  let e = parallel { a + 1, b };\n",
     b"  match [a, b] { [x, ..rest] if x > 0 -> x, [..] -> 0 }\n",

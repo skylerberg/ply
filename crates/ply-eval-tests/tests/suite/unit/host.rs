@@ -128,6 +128,42 @@ fn an_unknown_operation_is_e0421_and_lists_the_declared_ones() {
     );
 }
 
+/// A program built before `fetch` joined `db` binds to the operations it declares, and what was
+/// withheld from it stays withheld.
+#[test]
+fn a_registry_kept_to_what_a_program_declares_drops_the_operations_its_effect_lacks() {
+    let mut kept = registry(vec![
+        op("db", "fetch", HostResource::Any),
+        op("db", "get", HostResource::Any),
+    ]);
+    kept.register_withheld(op("db", "put", HostResource::Any), Arc::new(Never), "a run");
+    kept.retain_declared(&check(DB));
+    assert_eq!(kept.len(), 2);
+
+    let binding = kept.bind(&check(DB)).expect("what is left is declared");
+    let (db, users, orders) = (
+        Symbol::new("db"),
+        Symbol::new("users"),
+        Symbol::new("orders"),
+    );
+    assert_eq!(
+        binding.would_serve(&db, &Symbol::new("fetch"), Some(&users)),
+        None
+    );
+    assert_eq!(
+        binding.would_serve(&db, &Symbol::new("get"), Some(&users)),
+        Some("test::handler")
+    );
+    assert_eq!(
+        binding.withholds(&db, &Symbol::new("put"), Some(&orders)),
+        Some("a run")
+    );
+    assert_eq!(
+        binding.withholds(&db, &Symbol::new("get"), Some(&users)),
+        None
+    );
+}
+
 /// A resource label the program never performs is a rename the Rust side did not follow.
 #[test]
 fn an_unperformed_resource_is_e0421_but_an_idle_any_is_not() {
