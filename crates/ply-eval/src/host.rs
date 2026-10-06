@@ -318,7 +318,12 @@ fn resolve(
         };
         let name = &effect.name;
         let Some(decl) = effect.ops.get(&op.op) else {
-            diagnostics.push(err_unknown_op(op, effect));
+            // An effect the language declares is as the compiler that checked the program had it,
+            // and the builder was checked by an earlier one: an operation added since is one it
+            // cannot perform, so there is nothing to bind.
+            if !effect.module.is_anonymous() {
+                diagnostics.push(err_unknown_op(op, effect));
+            }
             continue;
         };
         if op.determinism == Determinism::Nondeterministic && !effect.nondet {

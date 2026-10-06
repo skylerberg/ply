@@ -128,6 +128,17 @@ fn an_unknown_operation_is_e0421_and_lists_the_declared_ones() {
     );
 }
 
+/// The builder is a program an earlier compiler checked, and a later runtime enters it: an
+/// operation the language's own effect gained since is one it cannot perform, where an operation a
+/// module's effect lacks is a rename the Rust side did not follow.
+#[test]
+fn an_operation_the_languages_own_effect_does_not_declare_binds_nothing() {
+    let binding = registry(vec![op("task", "nonesuch", HostResource::Any)])
+        .bind(&check(DB))
+        .expect("the program's `task` is as its compiler declared it");
+    assert!(binding.listing().is_empty());
+}
+
 /// A resource label the program never performs is a rename the Rust side did not follow.
 #[test]
 fn an_unperformed_resource_is_e0421_but_an_idle_any_is_not() {
