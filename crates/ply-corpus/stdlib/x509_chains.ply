@@ -1,0 +1,436 @@
+//! `std.x509` against what real sites served. Under `x509/chains` a file is one site's answer, the
+//! leaf and then what came with it in the order it came, as the wire had them at `captured()`;
+//! under `x509/roots` are the roots those end at, out of one system's store, each named by the
+//! first eight bytes of its fingerprint. A shipped module embeds no file, so these stand here.
+//!
+//! No site's key is held, so what a leaf is made to sign below is signed by a key made here: the
+//! verifier refuses it before any signature is looked at, which is the point.
+
+import std.bytes (hex_of, repeat)
+import std.crypto
+import std.crypto (Sha256, Sha384, Sha512)
+import std.date
+import std.ip
+import std.list (concat, flat_map, last, sort, unique)
+import std.oid
+import std.result (result_err)
+import std.show (show)
+import std.string (strip_suffix)
+import std.time (nanos_at)
+import std.x509
+import std.x509 (x509, Certificate, Fault)
+
+type File = { name: String, bytes: Bytes }
+
+fn chain_files() -> List<File> = embed_dir("x509/chains")
+
+fn root_files() -> List<File> = embed_dir("x509/roots")
+
+/// When the chains were served: each is verified as of then, whatever the day the test runs.
+fn captured() -> Instant / {abort.raise} =
+  match date::parse_rfc3339("2026-10-06T14:54:16+00:00") {
+    Some(t) -> match date::instant(t) { Some(i) -> i, None -> panic("an instant") },
+    None -> panic("a time"),
+  }
+
+fn read_all(
+  file: File,
+  mode: x509::Reading,
+) -> Result<List<Certificate>, x509::Refusal> / {abort.raise} =
+  try { x509::read_pem(string_of_bytes(file.bytes), x509::limits(), mode) }
+
+fn certificates(file: File) -> List<Certificate> / {abort.raise} =
+  match read_all(file, x509::Tolerant) {
+    Ok(found) -> found,
+    Err(refusal) -> panic(f"{file.name}: {show(refusal)}"),
+  }
+
+fn root_name(c: Certificate) -> String / {abort.raise} =
+  hex_of(bytes_slice(x509::fingerprint(c), 0, 8))
+
+fn roots() -> List<Certificate> / {abort.raise} = flat_map(root_files(), certificates)
+
+type Served = { leaf: Certificate, rest: List<Certificate> }
+
+fn served(file: String) -> Served / {abort.raise} =
+  match flat_map(filter(chain_files(), |f: File| f.name == file), certificates) {
+    [leaf, ..rest] -> { leaf: leaf, rest: rest },
+    [] -> panic(f"no chain {file}"),
+  }
+
+/// A host, or an address where the text is one.
+fn identity(who: String) -> x509::Identity / {abort.raise} =
+  match ip::parse(who) { Ok(address) -> x509::At(address), Err(_) -> x509::Host(who) }
+
+fn digest_text(d: crypto::Digest) -> String =
+  match d { Sha256 -> "SHA-256", Sha384 -> "SHA-384", Sha512 -> "SHA-512" }
+
+/// A certificate's key and how the certificate is signed.
+fn shape(c: Certificate) -> String = {
+  let key = match x509::info(c).key {
+    x509::RsaKey(public) -> match crypto::rsa_modulus_bits(public) {
+      Some(bits) -> f"RSA {bits}",
+      None -> "RSA",
+    },
+    x509::EcKey(_, point) -> if bytes_len(point) == 65 { "P-256" }
+    else if bytes_len(point) == 97 { "P-384" }
+    else { "a curve" },
+    x509::Ed25519Key(_) -> "Ed25519",
+    x509::OtherKey(id, _) -> oid::to_string(id),
+  };
+  let signed = match x509::info(c).algorithm {
+    x509::RsaPkcs1(d) -> "RSA " ++ digest_text(d),
+    x509::RsaPss(d) -> "RSA-PSS " ++ digest_text(d),
+    x509::Ecdsa(d) -> "ECDSA " ++ digest_text(d),
+    x509::Ed25519 -> "Ed25519",
+    x509::OtherAlgorithm(id) -> oid::to_string(id),
+  };
+  f"{key}, {signed}"
+}
+
+/// A site: its file, who it was asked for, and a name it is not for.
+type Site = { file: String, who: String, other: String }
+
+fn sites() -> List<Site> =
+  [
+    { file: "letsencrypt.pem", who: "letsencrypt.org", other: "letsencrypt.org.example.com" },
+    { file: "google.pem", who: "www.google.com", other: "google.com" },
+    { file: "github.pem", who: "github.com", other: "api.github.com" },
+    { file: "cloudflare.pem", who: "www.cloudflare.com", other: "cloudflare.com" },
+    { file: "amazon.pem", who: "www.amazon.com", other: "www.amazon.example" },
+    { file: "microsoft.pem", who: "www.microsoft.com", other: "www.microsoft.example" },
+    { file: "apple.pem", who: "www.apple.com", other: "apple.com" },
+    { file: "bbc.pem", who: "www.bbc.co.uk", other: "www.bbc.example" },
+    { file: "sectigo.pem", who: "www.sectigo.com", other: "www.sectigo.example" },
+    { file: "idn-muenchen.pem", who: "münchen.de", other: "munchen.de" },
+    { file: "idn-buecher.pem", who: "www.bücher.de", other: "a.b.bücher.de" },
+    { file: "ip-cloudflare-dns.pem", who: "1.1.1.1", other: "1.1.1.2" },
+    { file: "ip-google-dns.pem", who: "8.8.8.8", other: "8.8.8.9" },
+  ]
+
+/// A site's chain under one root alone: the path it verifies by, each certificate's `shape`.
+type Way = { file: String, who: String, root: String, path: List<String> }
+
+fn ways() -> List<Way> =
+  [
+    {
+      file: "letsencrypt.pem",
+      who: "letsencrypt.org",
+      root: "96bcec06264976f3",
+      path: [
+        "P-256, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+        "P-384, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+      ],
+    },
+    {
+      file: "google.pem",
+      who: "www.google.com",
+      root: "2a575471e31340bc",
+      path: ["P-256, RSA SHA-256", "RSA 2048, RSA SHA-256", "RSA 4096, RSA SHA-384"],
+    },
+    {
+      file: "google.pem",
+      who: "www.google.com",
+      root: "ebd41040e4bb3ec7",
+      path: [
+        "P-256, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+        "RSA 2048, 1.2.840.113549.1.1.5",
+      ],
+    },
+    {
+      file: "github.pem",
+      who: "github.com",
+      root: "4ff460d54b9c86da",
+      path: [
+        "P-256, ECDSA SHA-256",
+        "P-256, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+      ],
+    },
+    {
+      file: "cloudflare.pem",
+      who: "www.cloudflare.com",
+      root: "71cca5391f9e794b",
+      path: ["P-256, ECDSA SHA-256", "P-256, ECDSA SHA-384", "P-384, ECDSA SHA-384"],
+    },
+    {
+      file: "cloudflare.pem",
+      who: "www.cloudflare.com",
+      root: "ebd41040e4bb3ec7",
+      path: [
+        "P-256, ECDSA SHA-256",
+        "P-256, ECDSA SHA-384",
+        "P-384, RSA SHA-256",
+        "RSA 2048, 1.2.840.113549.1.1.5",
+      ],
+    },
+    {
+      file: "amazon.pem",
+      who: "www.amazon.com",
+      root: "8ecde6884f3d87b1",
+      path: ["RSA 2048, RSA SHA-256", "RSA 2048, RSA SHA-256", "RSA 2048, RSA SHA-256"],
+    },
+    {
+      file: "amazon.pem",
+      who: "www.amazon.com",
+      root: "568d6905a2c88708",
+      path: [
+        "RSA 2048, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+      ],
+    },
+    {
+      file: "microsoft.pem",
+      who: "www.microsoft.com",
+      root: "cb3ccbb76031e5e0",
+      path: [
+        "RSA 2048, RSA SHA-384",
+        "RSA 4096, RSA SHA-384",
+        "RSA 4096, RSA SHA-384",
+        "RSA 2048, RSA SHA-256",
+      ],
+    },
+    {
+      file: "apple.pem",
+      who: "www.apple.com",
+      root: "cb3ccbb76031e5e0",
+      path: ["RSA 2048, RSA SHA-256", "RSA 2048, RSA SHA-256", "RSA 2048, RSA SHA-256"],
+    },
+    {
+      file: "bbc.pem",
+      who: "www.bbc.co.uk",
+      root: "cbb522d7b7f127ad",
+      path: [
+        "RSA 2048, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 4096, RSA SHA-384",
+        "RSA 2048, RSA SHA-256",
+      ],
+    },
+    {
+      file: "sectigo.pem",
+      who: "www.sectigo.com",
+      root: "e793c9b02fd8aa13",
+      path: [
+        "RSA 2048, RSA SHA-256",
+        "RSA 3072, RSA SHA-384",
+        "RSA 4096, RSA SHA-384",
+        "RSA 4096, RSA SHA-384",
+      ],
+    },
+    {
+      file: "idn-muenchen.pem",
+      who: "xn--mnchen-3ya.de",
+      root: "96bcec06264976f3",
+      path: [
+        "RSA 2048, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+      ],
+    },
+    {
+      file: "idn-buecher.pem",
+      who: "xn--bcher-kva.de",
+      root: "96bcec06264976f3",
+      path: [
+        "P-256, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+        "P-384, ECDSA SHA-384",
+        "P-384, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+      ],
+    },
+    {
+      file: "ip-cloudflare-dns.pem",
+      who: "cloudflare-dns.com",
+      root: "3417bb06cc6007da",
+      path: ["P-256, ECDSA SHA-384", "P-384, ECDSA SHA-384", "P-384, ECDSA SHA-256"],
+    },
+    {
+      file: "ip-google-dns.pem",
+      who: "dns.google",
+      root: "2a575471e31340bc",
+      path: ["P-256, RSA SHA-256", "RSA 2048, RSA SHA-256", "RSA 4096, RSA SHA-384"],
+    },
+    {
+      file: "ip-google-dns.pem",
+      who: "dns.google",
+      root: "ebd41040e4bb3ec7",
+      path: [
+        "P-256, RSA SHA-256",
+        "RSA 2048, RSA SHA-256",
+        "RSA 4096, RSA SHA-256",
+        "RSA 2048, 1.2.840.113549.1.1.5",
+      ],
+    },
+  ]
+
+fn checked(
+  leaf: Certificate,
+  offered: List<Certificate>,
+  anchors: List<Certificate>,
+  at: Instant,
+  who: String,
+) -> Result<List<Certificate>, { leaf: Bool, why: Fault }> / {abort.raise} =
+  match x509::verify(leaf, offered, anchors, at, identity(who), x509::ServerAuth, x509::strict()) {
+    Ok(path) -> Ok(path),
+    Err(failure) -> Err({ leaf: failure.certificate == leaf, why: failure.why }),
+  }
+
+test "{w.file} verifies for {w.who} to the root {w.root} alone, as of its capture" for w: Way in ways(
+  ) {
+  let s = served(w.file);
+  let anchor = filter(roots(), |r: Certificate| root_name(r) == w.root);
+  assert_eq(len(anchor), 1);
+  match checked(s.leaf, s.rest, anchor, captured(), w.who) {
+    Ok(path) -> {
+      assert_eq(map(path, shape), w.path);
+      assert_eq(list_at(path, 0), Some(s.leaf));
+      assert_eq(last(path), list_at(anchor, 0))
+    },
+    Err(refused) -> panic(show(refused.why)),
+  }
+}
+
+fn forger() -> crypto::SigningKey / {abort.raise} =
+  match crypto::ed25519_signing(secret_of_bytes(repeat(b"\x07", 32))) {
+    Some(key) -> key,
+    None -> panic("thirty-two bytes are a seed"),
+  }
+
+fn called(name: String) -> List<x509::Attribute> = [{ id: oid::common_name(), value: name }]
+
+/// A certificate for `bank.example` that says `leaf` issued it, over `leaf`'s own validity.
+fn forged(leaf: Certificate) -> Certificate / {abort.raise} = {
+  let asked = {
+    ..x509::draft(),
+    subject: called("bank.example"),
+    alt_names: [x509::Dns("bank.example")],
+    usages: [x509::DigitalSignature],
+    purposes: [x509::server_auth()],
+  };
+  let made = try {
+    x509::certificate(
+      asked,
+      crypto::verifying_key(forger()),
+      b"\x01",
+      x509::info(leaf).not_before,
+      x509::info(leaf).not_after,
+      Some(leaf),
+      forger(),
+    )
+  };
+  match made { Ok(c) -> c, Err(refusal) -> panic(show(refusal)) }
+}
+
+test "{s.file} verifies for {s.who}, and is refused once expired, for {s.other}, without its issuer, and as a CA" for s: Site in sites(
+  ) {
+  let c = served(s.file);
+  let anchors = roots();
+  assert_eq(result_err(checked(c.leaf, c.rest, anchors, captured(), s.who)), None);
+  let after = match date::instant(x509::info(c.leaf).not_after) {
+    Some(end) -> Instant(nanos_at(end) + 1000000000),
+    None -> panic("an instant"),
+  };
+  assert_eq(
+    result_err(checked(c.leaf, c.rest, anchors, after, s.who)),
+    Some({ leaf: true, why: x509::Expired }),
+  );
+  assert_eq(
+    result_err(checked(c.leaf, c.rest, anchors, captured(), s.other)),
+    Some({ leaf: true, why: x509::Unnamed }),
+  );
+  let orphaned = filter(c.rest, |above: Certificate|
+    x509::info(above).subject != x509::info(c.leaf).issuer);
+  assert(len(orphaned) < len(c.rest));
+  assert_eq(
+    result_err(checked(c.leaf, orphaned, anchors, captured(), s.who)),
+    Some({ leaf: true, why: x509::Unissued }),
+  );
+  let bank = forged(c.leaf);
+  match x509::verify(
+      bank,
+      concat([c.leaf], c.rest),
+      anchors,
+      captured(),
+      x509::Host("bank.example"),
+      x509::ServerAuth,
+      x509::strict(),
+    ) {
+    Ok(_) -> panic("a leaf signed as a CA"),
+    Err(failure) -> {
+      assert(failure.certificate == c.leaf);
+      assert_eq(failure.why, x509::NotACa)
+    },
+  }
+}
+
+test "an address a certificate names is matched as an address, and never as a host written like one" {
+  let cloudflare = served("ip-cloudflare-dns.pem");
+  let google = served("ip-google-dns.pem");
+  let anchors = roots();
+  let named = |c: Served, who: x509::Identity| x509::names(c.leaf, who);
+  assert(named(cloudflare, identity("1.0.0.1")) && named(cloudflare, identity("1.1.1.1")));
+  assert(named(google, identity("8.8.4.4")) && named(google, identity("2001:4860:4860::8888")));
+  assert(!named(cloudflare, x509::Host("1.1.1.1")) && !named(google, x509::Host("8.8.8.8")));
+  assert(!named(cloudflare, identity("8.8.8.8")) && !named(google, identity("1.1.1.1")));
+  assert_eq(
+    result_err(checked(google.leaf, google.rest, anchors, captured(), "dns.google.example")),
+    Some({ leaf: true, why: x509::Unnamed }),
+  )
+}
+
+test "a host in another script is the A-labels its certificate names, and a wildcard is one label of them" {
+  let muenchen = served("idn-muenchen.pem").leaf;
+  let buecher = served("idn-buecher.pem").leaf;
+  assert_eq(x509::alt_names(muenchen), [
+    x509::Dns("www.xn--mnchen-3ya.de"),
+    x509::Dns("xn--mnchen-3ya.de"),
+  ]);
+  assert_eq(x509::alt_names(buecher), [
+    x509::Dns("*.xn--bcher-kva.de"),
+    x509::Dns("xn--bcher-kva.de"),
+  ]);
+  let named = |c: Certificate, host: String| x509::names(c, x509::Host(host));
+  assert(named(muenchen, "münchen.de") && named(muenchen, "WWW.MÜNCHEN.DE"));
+  assert(named(muenchen, "xn--mnchen-3ya.de") && !named(muenchen, "mail.münchen.de"));
+  assert(named(buecher, "bücher.de") && named(buecher, "shop.bücher.de"));
+  assert(!named(buecher, "a.shop.bücher.de") && !named(buecher, "bucher.de"))
+}
+
+type Unread = { name: String, why: x509::Refusal }
+
+fn unread(files: List<File>) -> List<Unread> / {abort.raise} =
+  flat_map(files, |f: File|
+    match read_all(f, x509::Strict) { Ok(_) -> [], Err(why) -> [{ name: f.name, why: why }] })
+
+test "what was served reads to the letter of RFC 5280, and every root but the one numbered zero" {
+  assert_eq(unread(chain_files()), []);
+  assert_eq(unread(root_files()), [{ name: "568d6905a2c88708.pem", why: x509::BadSerial }]);
+  assert_eq(
+    map(
+      flat_map(filter(root_files(), |f: File| f.name == "568d6905a2c88708.pem"), certificates),
+      |c: Certificate| x509::info(c).serial,
+    ),
+    [b"\x00"],
+  )
+}
+
+test "every chain is a site here, and every root is one a chain ends at" {
+  assert_eq(map(chain_files(), |f: File| f.name), sort(map(sites(), |s: Site| s.file)));
+  assert_eq(unique(sort(map(ways(), |w: Way| w.file))), sort(map(sites(), |s: Site| s.file)));
+  assert_eq(
+    map(root_files(), |f: File| f.name),
+    unique(sort(map(ways(), |w: Way| w.root ++ ".pem"))),
+  );
+  assert_eq(map(roots(), root_name), map(root_files(), |f: File| strip_suffix(f.name, ".pem")))
+}
