@@ -1,0 +1,190 @@
+//! `std.syntax` over the repository's own sources: each maintained module formats to itself, as
+//! `ply fmt` leaves it, and a walk of its tree meets every name, binding and type the compiler's
+//! own listing of the tree holds, and no other.
+
+import compiler.items
+import std.bytes (hex_of, int_of_ascii_radix)
+import std.list (at_or, concat, flatten)
+import std.syntax
+import std.syntax (Binding, Name, Node, TypeName, TypeVariable)
+
+type File = { name: String, bytes: Bytes }
+
+/// One maintained source: the path it is committed at, and its text.
+type Case = { path: String, text: Bytes }
+
+fn under(dir: String, files: List<File>) -> List<Case> =
+  fold(files, [], |cases: List<Case>, f: File|
+    if string_ends_with(f.name, ".ply") {
+      push(cases, { path: dir ++ "/" ++ f.name, text: f.bytes })
+    } else { cases })
+
+fn sources() -> List<Case> =
+  flatten([
+    under("crates/ply-std/ply", embed_dir("../../ply-std/ply")),
+    under("crates/ply-compiler/ply", embed_dir("../../ply-compiler/ply")),
+    under("crates/ply-cli/ply", embed_dir("../../ply-cli/ply")),
+    under("crates/ply-prove/ply", embed_dir("../../ply-prove/ply")),
+    under("crates/ply-store/ply", embed_dir("../../ply-store/ply")),
+    under("crates/ply-test/ply", embed_dir("../../ply-test/ply")),
+    under("crates/ply-sim/ply", embed_dir("../../ply-sim/ply")),
+    under("crates/ply-registry/ply", embed_dir("../../ply-registry/ply")),
+    under("crates/ply-cli-tests/ply", embed_dir("../../ply-cli-tests/ply")),
+    under("tests/lang", embed_dir("../../../tests/lang")),
+  ])
+
+test "{c.path} formats to itself, as `ply fmt` leaves it" for c: Case in sources() {
+  assert(
+    syntax::format(c.text) == Ok(c.text),
+    Some(c.path ++ " is committed as `ply fmt` writes it, and `std.syntax` formats it otherwise"),
+  )
+}
+
+/// The places a tree's names stand at, each as `start:end`, sorted, by what the name is.
+type Places = {
+  names: List<Bytes>,
+  bindings: List<Bytes>,
+  types: List<Bytes>,
+  variables: List<Bytes>,
+}
+
+fn place_key(start: Int, end: Int) -> Bytes =
+  bytes_concat_all([
+    bytes_of_string(int_to_string(start)),
+    b":",
+    bytes_of_string(int_to_string(end)),
+  ])
+
+fn once(keys: List<Bytes>) -> List<Bytes> =
+  map_keys(fold(keys, map_new(), |held: Map<Bytes, Bool>, key: Bytes| map_insert(held, key, true)))
+
+fn settled(places: Places) -> Places =
+  {
+    names: once(places.names),
+    bindings: once(places.bindings),
+    types: once(places.types),
+    variables: once(places.variables),
+  }
+
+/// Where a walk of `tree` meets a name of each kind.
+fn walked(tree: Node) -> Places / {abort.raise} =
+  settled(
+    fold(
+      syntax::walk(tree),
+      { names: [], bindings: [], types: [], variables: [] },
+      |found: Places, node: Node|
+        match syntax::name(node) {
+          None -> found,
+          Some(ident) -> {
+            let key = place_key(ident.span.start, ident.span.end);
+            match syntax::kind(node) {
+              Name -> { ..found, names: push(found.names, key) },
+              Binding -> { ..found, bindings: push(found.bindings, key) },
+              TypeName -> { ..found, types: push(found.types, key) },
+              TypeVariable -> { ..found, variables: push(found.variables, key) },
+              _ -> found,
+            }
+          },
+        },
+    ),
+  )
+
+/// A unit of the compiler's dump of a tree that is a node: its span as `start:end`, and its tag.
+fn node_of(unit: Bytes) -> Option<{ key: Bytes, tag: Bytes }> / {abort.raise} =
+  match bytes_split(unit, b":") {
+    [start, end, tag] -> Some({ key: bytes_concat_all([start, b":", end]), tag: tag }),
+    _ -> None,
+  }
+
+/// Whether the name a dump holds at `key`, as the payload `held`, is the text the source has there:
+/// a name the parser wrote for itself stands at a span that reads otherwise.
+fn is_written(source: Bytes, key: Bytes, held: Bytes) -> Bool / {abort.raise} =
+  match bytes_split(key, b":") {
+    [start, end] -> match ((int_of_ascii_radix(start, 10), int_of_ascii_radix(end, 10))) {
+      (Some(from), Some(to)) ->
+        from <= to && to <= bytes_len(source)
+          && bytes_concat(b"@", bytes_of_string(hex_of(bytes_slice(source, from, to)))) == held,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// The key of the identifier a qualified name's dump holds as its own, the dump's units from
+/// `at` on being the name's: its node, whether it is qualified, the qualifier where it is, then the
+/// identifier and its text.
+fn named_at(units: List<Bytes>, at: Int) -> { key: Bytes, held: Bytes } / {abort.raise} = {
+  let own = if at_or(units, at + 1, b"") == b"?1" { at + 4 } else { at + 2 };
+  {
+    key: match node_of(at_or(units, own, b"")) { Some(n) -> n.key, None -> b"" },
+    held: at_or(units, own + 1, b""),
+  }
+}
+
+/// Where the compiler's dump of `source`'s tree holds a name of each kind that the source writes.
+fn listed(source: Bytes) -> Places / {abort.raise} = {
+  let units = bytes_split(items::dump_module(items::parse(source).node), b";");
+  settled(
+    fold(
+      range(0, len(units)),
+      { names: [], bindings: [], types: [], variables: [] },
+      |found: Places, i: Int|
+        match node_of(at_or(units, i, b"")) {
+          None -> found,
+          Some(node) -> if node.tag == b"evar" {
+            let named = named_at(units, i + 1);
+            if is_written(source, named.key, named.held) {
+              { ..found, names: push(found.names, named.key) }
+            } else { found }
+          } else if node.tag == b"pvar" {
+            match node_of(at_or(units, i + 1, b"")) {
+              Some(ident) -> { ..found, bindings: push(found.bindings, ident.key) },
+              None -> found,
+            }
+          } else if node.tag == b"tcon" {
+            { ..found, types: push(found.types, named_at(units, i + 1).key) }
+          } else if node.tag == b"tvar" { { ..found, variables: push(found.variables, node.key) } }
+          else { found },
+        },
+    ),
+  )
+}
+
+fn missing(wanted: List<Bytes>, among: List<Bytes>) -> List<Bytes> = {
+  let held = fold(among, map_new(), |acc: Map<Bytes, Bool>, key: Bytes| map_insert(acc, key, true));
+  filter(wanted, |key: Bytes| !map_contains(held, key))
+}
+
+fn differing(what: String, listed_at: List<Bytes>, walked_at: List<Bytes>) -> List<String> =
+  concat(
+    map(missing(listed_at, walked_at), |key: Bytes|
+      what ++ " at " ++ string_of_bytes_lossy(key) ++ " is in the tree and not walked"),
+    map(missing(walked_at, listed_at), |key: Bytes|
+      what ++ " at " ++ string_of_bytes_lossy(key) ++ " is walked and not in the tree"),
+  )
+
+test "a walk of {c.path} meets every name, binding and type its tree holds" for c: Case in sources(
+  ) {
+  let read = syntax::parse(c.text);
+  assert_eq(read.diagnostics, []);
+  let tree = listed(c.text);
+  let walk = walked(read.tree);
+  assert_eq(
+    flatten([
+      differing("a name", tree.names, walk.names),
+      differing("a binding", tree.bindings, walk.bindings),
+      differing("a type", tree.types, walk.types),
+      differing("a type variable", tree.variables, walk.variables),
+    ]),
+    [],
+  )
+}
+
+test "the listing the walks are held to reads a name, a binding, a type and a variable where each is written" {
+  let source = b"fn first<a>(xs: List<a>, spare: a) -> a = match xs { [x, ..] -> x, _ -> f\"{spare}\" }\n";
+  let tree = listed(source);
+  assert_eq(tree.names, [b"48:50", b"64:65", b"75:80"]);
+  assert_eq(tree.bindings, [b"54:55"]);
+  assert_eq(tree.types, [b"16:20"]);
+  assert_eq(tree.variables, [b"21:22", b"32:33", b"38:39"]);
+  assert_eq(walked(syntax::parse(source).tree), tree)
+}
