@@ -1955,6 +1955,18 @@ macro_rules! builtin_helper {
             builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
         }
     };
+    ($variant:ident 5) => {
+        pub unsafe extern "C" fn $variant(
+            ctx: *mut Ctx,
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+        ) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d, e])
+        }
+    };
     ($variant:ident 6) => {
         pub unsafe extern "C" fn $variant(
             ctx: *mut Ctx,
