@@ -42,8 +42,9 @@ fn a_checkout_packs_the_shipped_modules_the_builder_and_the_program() {
     assert!(
         paths.iter().all(|path| path.ends_with(".ply")
             || path.ends_with("ply.pkg")
-            || path.contains("/bootstrap/")),
-        "the pack holds something that is neither a source, a manifest nor what `ply bootstrap` wrote: {paths:?}"
+            || path.contains("/bootstrap/")
+            || path.starts_with("crates/ply-std/ply/")),
+        "the pack holds something that is neither a source, a manifest, what `ply bootstrap` wrote nor data a shipped module embeds: {paths:?}"
     );
     assert!(
         !paths.iter().any(|path| path.contains("/.")),
@@ -184,6 +185,117 @@ fn a_file_ply_bootstrap_does_not_write_is_refused() {
         .err()
         .expect("a stray file is refused");
     assert!(refused.contains("notes.txt"), "{refused}");
+}
+
+/// The checkout's pack laid out under `fake`, as the checkout it was packed from.
+fn copied(fake: &Path) {
+    for path in Pack::of_checkout(&repo())
+        .expect("the checkout packs")
+        .paths()
+    {
+        let to = fake.join(path);
+        std::fs::create_dir_all(to.parent().expect("a parent")).expect("made");
+        std::fs::copy(repo().join(path), to).expect("copied");
+    }
+}
+
+#[test]
+fn the_data_below_the_shipped_modules_is_packed_and_nothing_else_there_is() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let fake = dir.path().join("checkout");
+    copied(&fake);
+    let before: Vec<String> = Pack::of_checkout(&fake)
+        .expect("the copy packs")
+        .data_below(ply_pack::STD)
+        .map(str::to_string)
+        .collect();
+    let std = fake.join(ply_pack::STD);
+    let write = |below: &str, bytes: &[u8]| {
+        let at = std.join(below);
+        std::fs::create_dir_all(at.parent().expect("a parent")).expect("made");
+        std::fs::write(at, bytes).expect("written");
+    };
+    write("words/list.txt", b"one\ntwo\n");
+    write("words/deep/more.bin", &[0, 159, 146, 150]);
+    write("beside.txt", b"beside the modules");
+    // A module below is no data, and a hidden name is read by no walk.
+    write("words/nested.ply", b"pub fn one() -> Int = 1\n");
+    write("words/.cache/kept.txt", b"not shipped");
+    write(".hidden.txt", b"not shipped");
+    let pack = Pack::of_checkout(&fake).expect("the copy packs");
+    let added: Vec<&str> = pack
+        .data_below(ply_pack::STD)
+        .filter(|path| !before.iter().any(|was| was == path))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "crates/ply-std/ply/beside.txt",
+            "crates/ply-std/ply/words/deep/more.bin",
+            "crates/ply-std/ply/words/list.txt",
+        ]
+    );
+    assert!(
+        !pack
+            .paths()
+            .any(|path| path.ends_with("nested.ply") || path.contains("/.")),
+        "a module below the shipped modules, or a hidden file, was packed"
+    );
+    let binary = runtime(dir.path());
+    ply_pack::append(&binary, &pack).expect("the binary is packed");
+    let read = Pack::of_binary(&binary)
+        .expect("the binary reads")
+        .expect("the binary carries a pack");
+    assert_eq!(
+        read.bytes("crates/ply-std/ply/words/deep/more.bin"),
+        Some(&[0u8, 159, 146, 150][..])
+    );
+    assert_eq!(
+        read.data_below(ply_pack::STD).collect::<Vec<_>>(),
+        pack.data_below(ply_pack::STD).collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        ply_pack::check(&binary, &pack).expect("the binary reads"),
+        ply_pack::Checked::Same
+    ));
+    // Edited data is another pack, named by the file that differs.
+    write("words/list.txt", b"one\ntwo\nthree\n");
+    match ply_pack::check(&binary, &Pack::of_checkout(&fake).expect("the copy packs"))
+        .expect("the binary reads")
+    {
+        ply_pack::Checked::Differs(path) => assert_eq!(path, "crates/ply-std/ply/words/list.txt"),
+        _ => panic!("a pack of other data passed as this checkout's"),
+    }
+}
+
+#[test]
+fn a_listing_of_the_data_is_a_trace_line_that_moves_when_a_data_file_comes_or_goes() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let fake = dir.path().join("checkout");
+    copied(&fake);
+    let pack = Pack::of_checkout(&fake).expect("the copy packs");
+    ply_pack::record();
+    let _ = pack.data_below(ply_pack::STD).count();
+    let listed = pack
+        .asked_lines()
+        .into_iter()
+        .find(|l| l.starts_with("packed\tcrates/ply-std/ply/**\t"))
+        .expect("the listing is a line");
+    assert_eq!(pack.stands(&listed), Some(true));
+    let at = fake.join(ply_pack::STD).join("words/list.txt");
+    std::fs::create_dir_all(at.parent().expect("a parent")).expect("made");
+    std::fs::write(at, b"one\n").expect("written");
+    let grown = Pack::of_checkout(&fake).expect("the copy packs");
+    assert_eq!(grown.stands(&listed), Some(false));
+    // A module that comes is no data: the listing of the modules moves, and this one stands.
+    std::fs::remove_dir_all(fake.join(ply_pack::STD).join("words")).expect("removed");
+    std::fs::write(
+        fake.join(ply_pack::STD).join("fresh.ply"),
+        b"pub fn one() -> Int = 1\n",
+    )
+    .expect("written");
+    let moduled = Pack::of_checkout(&fake).expect("the copy packs");
+    assert_eq!(moduled.stands(&listed), Some(true));
 }
 
 #[test]

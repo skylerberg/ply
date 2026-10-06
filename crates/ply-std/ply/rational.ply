@@ -1,0 +1,694 @@
+//! Exact fractions: a ratio of two `BigInt`s in lowest terms.
+//!
+//! A `Rational`'s numerator carries its sign and its denominator is above zero, so each number has
+//! one representation. The type is opaque, so only this module builds one, and every function here
+//! answers one in that form; a law over the type draws its fractions through `arbitrary`.
+//!
+//! The order of two fractions is not their pairs', so the type states a `key`, the terms of the
+//! continued fraction: `==`, `<`, the language's `compare`, `digest` and a `Map` take the numbers
+//! in their own order. Reading a key costs what a greatest common divisor does, and `compare` here
+//! cross-multiplies, which is cheaper. The type states `numeric` too: `a + b`, `a - b`, `a * b` and
+//! `-a` are `add`, `sub`, `mul` and `neg`, and a definition over `numeric(a)`, as `std.math.sum`,
+//! takes a `Rational`. Division is `div`, and a zero divisor is `None` rather than a raise.
+//!
+//! A fraction is written `3/4`, or `3` where it is whole, and read from either and from a decimal
+//! such as `0.75`; `rational"3/4"` is one checked when the program is. A `Float` and a `Decimal`
+//! each convert to the fraction they are, exactly; the other way rounds, to the nearest `Float` or
+//! to a scale by a `Rounding`.
+
+import std.bigint
+import std.bigint (BigInt)
+import std.bytes (peek, scan)
+import std.decimal
+import std.float (pow2)
+import std.gen
+import std.gen (Gen)
+import std.laws (monoid, round_trip, total_order)
+import std.list (slice)
+import std.math
+import std.option (option_map)
+import std.result (result_ok)
+
+/// A fraction in lowest terms: the numerator, which carries the sign, and the denominator, which
+/// is above zero.
+pub opaque type Rational = | Rational(BigInt, BigInt)
+
+key for Rational by order_key
+
+gen for Rational by arbitrary
+
+show for Rational by to_string
+
+numeric for Rational by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }
+
+/// Why a text names no fraction.
+pub type Why =
+  /// A character that is no part of a fraction, or the text ending where a digit is due.
+  | Stray
+  /// A denominator of zero.
+  | ZeroDenominator
+
+/// A refusal, and the character of the text it is about.
+pub type Refusal = new { at: Int, why: Why }
+
+/// What this module raises where it refuses.
+pub effect rational {
+  /// The text names no fraction.
+  raise refused(e: Refusal)
+}
+
+// --- Making and reading one -------------------------------------------------
+
+/// A fraction of two whole numbers as `std.bigint` draws them, or one of small parts, which is
+/// often equal to another or shares the first terms of its continued fraction with it.
+pub fn arbitrary() -> Gen<Rational> =
+  gen::one_of([
+    gen::map2(bigint::arbitrary(), bigint::arbitrary(), |n: BigInt, d: BigInt|
+      reduced(n, bigint::abs_value(d) + bigint::one())),
+    gen::map2(gen::int_between(0 - 64, 64), gen::int_between(1, 16), |n: Int, d: Int|
+      reduced(bigint::of_int(n), bigint::of_int(d))),
+  ])
+
+/// Zero.
+pub fn zero() -> Rational = Rational(bigint::zero(), bigint::one())
+
+/// One.
+pub fn one() -> Rational = Rational(bigint::one(), bigint::one())
+
+/// The whole number `n`.
+pub fn of_int(n: Int) -> Rational = Rational(bigint::of_int(n), bigint::one())
+
+/// The whole number `n`.
+pub fn of_bigint(n: BigInt) -> Rational = Rational(n, bigint::one())
+
+/// `numerator / denominator` in lowest terms; `None` for a zero denominator.
+pub fn ratio(numerator: BigInt, denominator: BigInt) -> Option<Rational> =
+  if bigint::is_zero(denominator) { None } else { Some(reduced(numerator, denominator)) }
+
+/// `numerator / denominator` in lowest terms; `None` for a zero denominator.
+pub fn of_ints(numerator: Int, denominator: Int) -> Option<Rational> =
+  ratio(bigint::of_int(numerator), bigint::of_int(denominator))
+
+/// The numerator of the lowest terms, which has the fraction's sign.
+pub fn numerator(r: Rational) -> BigInt = match r { Rational(n, _) -> n }
+
+/// The denominator of the lowest terms, which is above zero.
+pub fn denominator(r: Rational) -> BigInt = match r { Rational(_, d) -> d }
+
+/// Whether the fraction is zero.
+pub fn is_zero(r: Rational) -> Bool = bigint::is_zero(numerator(r))
+
+/// Whether the fraction is below zero.
+pub fn is_negative(r: Rational) -> Bool = bigint::is_negative(numerator(r))
+
+/// Whether the fraction is a whole number.
+pub fn is_integer(r: Rational) -> Bool = bigint::compare(denominator(r), bigint::one()) == Equal
+
+/// `-1`, `0` or `1`.
+pub fn sign(r: Rational) -> Int = bigint::sign(numerator(r))
+
+// --- Arithmetic -------------------------------------------------------------
+
+/// `a + b`.
+pub fn add(a: Rational, b: Rational) -> Rational =
+  reduced(
+    numerator(a) * denominator(b) + numerator(b) * denominator(a),
+    denominator(a) * denominator(b),
+  )
+
+/// `a - b`.
+pub fn sub(a: Rational, b: Rational) -> Rational = add(a, neg(b))
+
+/// `a * b`.
+pub fn mul(a: Rational, b: Rational) -> Rational =
+  reduced(numerator(a) * numerator(b), denominator(a) * denominator(b))
+
+/// The fraction with its sign flipped.
+pub fn neg(r: Rational) -> Rational = Rational(bigint::neg(numerator(r)), denominator(r))
+
+/// The distance from zero.
+pub fn abs(r: Rational) -> Rational = Rational(bigint::abs_value(numerator(r)), denominator(r))
+
+/// `1 / r`; `None` for zero, which has none.
+pub fn reciprocal(r: Rational) -> Option<Rational> = ratio(denominator(r), numerator(r))
+
+/// `a / b`; `None` for a zero divisor.
+pub fn div(a: Rational, b: Rational) -> Option<Rational> =
+  match reciprocal(b) { Some(inverse) -> Some(mul(a, inverse)), None -> None }
+
+/// `r` to a whole power. A negative exponent is the reciprocal's power, so zero has none there and
+/// answers `None`; anything to the power zero is one.
+pub fn pow(r: Rational, exponent: Int) -> Option<Rational> / {abort.raise} =
+  if exponent >= 0 {
+    Some(Rational(bigint::pow(numerator(r), exponent), bigint::pow(denominator(r), exponent)))
+  } else {
+    match reciprocal(r) {
+      Some(inverse) ->
+        Some(
+          Rational(
+            bigint::pow(numerator(inverse), 0 - exponent),
+            bigint::pow(denominator(inverse), 0 - exponent),
+          ),
+        ),
+      None -> None,
+    }
+  }
+
+/// The order of the numbers, by cross-multiplying.
+pub fn compare(a: Rational, b: Rational) -> Ordering =
+  bigint::compare(numerator(a) * denominator(b), numerator(b) * denominator(a))
+
+// --- Whole numbers ----------------------------------------------------------
+
+/// The whole number `mode` rounds the fraction to, which is the prelude's `Rounding` and means
+/// what it does for a `Decimal`.
+pub fn round(r: Rational, mode: Rounding) -> BigInt =
+  match bigint::div_round(numerator(r), denominator(r), mode) {
+    Some(whole) -> whole,
+    None -> bigint::zero(),
+  }
+
+/// The greatest whole number at or below the fraction.
+pub fn floor(r: Rational) -> BigInt = round(r, Floor)
+
+/// The least whole number at or above the fraction.
+pub fn ceil(r: Rational) -> BigInt = round(r, Ceiling)
+
+/// The fraction without what follows its point: the whole number toward zero.
+pub fn truncate(r: Rational) -> BigInt = round(r, Down)
+
+/// The fraction nearest `r` whose denominator is at most `max`, by the continued fraction's
+/// convergents and the one semiconvergent that can beat the last of them, as Python's
+/// `limit_denominator` finds it. `None` for a `max` below one.
+pub fn limit_denominator(r: Rational, max: BigInt) -> Option<Rational> =
+  if bigint::compare(max, bigint::one()) == Less { None }
+  else if bigint::compare(denominator(r), max) != Greater { Some(r) } else {
+    Some(
+      nearest(
+        r,
+        max,
+        numerator(r),
+        denominator(r),
+        { p: bigint::zero(), q: bigint::one() },
+        { p: bigint::one(), q: bigint::zero() },
+        2 * bigint::bit_length(denominator(r)) + 3,
+      ),
+    )
+  }
+
+// --- Other numbers ----------------------------------------------------------
+
+/// The fraction a `Decimal` is, exactly.
+pub fn of_decimal(d: Decimal) -> Rational / {abort.raise} =
+  match parse(decimal_to_string(d)) { Ok(r) -> r, Err(_) -> zero() }
+
+/// The fraction at `scale` digits after the point, rounded by `mode`: exact where the fraction has
+/// no more digits than that. `None` for a scale outside `0..=28` and for a value past what a
+/// `Decimal` holds.
+pub fn to_decimal(r: Rational, scale: Int, mode: Rounding) -> Option<Decimal> / {abort.raise} =
+  if scale < 0 || scale > 28 { None } else {
+    let unscaled = round(mul(r, of_bigint(bigint::pow(bigint::of_int(10), scale))), mode);
+    decimal_of_string(bigint::to_string(unscaled) ++ "e-" ++ int_to_string(scale))
+  }
+
+/// The fraction a `Float` is, exactly: every finite one is a whole number over a power of two.
+/// `None` for a `NaN` and for an infinity.
+pub fn of_float(f: Float) -> Option<Rational> = {
+  let bits = bits_of_float(f);
+  let exponent = bits >> 52 & 0x7FF;
+  let fraction = bits & 0xF_FFFF_FFFF_FFFF;
+  if exponent == 0x7FF { None } else {
+    let mantissa = bigint::of_int(if exponent == 0 { fraction } else { fraction | 1 << 52 });
+    let signed = if bits < 0 { bigint::neg(mantissa) } else { mantissa };
+    let power = if exponent == 0 { 0 - 1074 } else { exponent - 1075 };
+    if power >= 0 { Some(of_bigint(signed * two_to(power))) }
+    else { ratio(signed, two_to(0 - power)) }
+  }
+}
+
+/// The `Float` nearest the fraction, a tie going to the one whose last bit is zero, as IEEE 754
+/// rounds: an infinity past the greatest `Float`, and zero below half the least.
+pub fn to_float(r: Rational) -> Float = {
+  let n = bigint::abs_value(numerator(r));
+  let d = denominator(r);
+  if bigint::is_zero(n) { 0.0 } else {
+    let above = bigint::bit_length(n) - bigint::bit_length(d);
+    let reaches = if above >= 0 { bigint::compare(n, d * two_to(above)) != Less }
+    else { bigint::compare(n * two_to(0 - above), d) != Less };
+    let shift = min(if reaches { 52 - above } else { 53 - above }, 1074);
+    let rounded = if shift >= 0 { bigint::div_round(n * two_to(shift), d, HalfEven) }
+    else { bigint::div_round(n, d * two_to(0 - shift), HalfEven) };
+    let magnitude = if shift < 0 - 971 { pow2(1024) } else {
+      match rounded {
+        Some(whole) -> match bigint::to_int(whole) {
+          Some(mantissa) -> float_of_int(mantissa) * pow2(0 - shift),
+          None -> pow2(1024),
+        },
+        None -> 0.0,
+      }
+    };
+    if is_negative(r) { 0.0 - magnitude } else { magnitude }
+  }
+}
+
+// --- Text -------------------------------------------------------------------
+
+/// `3/4`, or `3` for a whole number, with a leading `-` when negative.
+pub fn to_string(r: Rational) -> String =
+  if is_integer(r) { bigint::to_string(numerator(r)) }
+  else { bigint::to_string(numerator(r)) ++ "/" ++ bigint::to_string(denominator(r)) }
+
+/// The fraction a text names: a whole number `-3`, a ratio `3/4` or a decimal `0.75`, with an
+/// optional sign first and at least one digit on each side of a `/` or a point. The ratio need
+/// not be in lowest terms. Raises `refused` for anything else, at the character that is no part
+/// of one, and for a zero denominator.
+pub fn read(text: String) -> Rational / {rational.refused, abort.raise} = {
+  let bytes = bytes_of_string(text);
+  let n = bytes_len(bytes);
+  let from = if peek(bytes, 0) == 45 || peek(bytes, 0) == 43 { 1 } else { 0 };
+  let whole_end = scan(bytes, from, b"0123456789");
+  let mark = peek(bytes, whole_end);
+  let part_end = scan(bytes, whole_end + 1, b"0123456789");
+  if whole_end == from { refuse(whole_end, Stray) }
+  else if whole_end == n { of_bigint(number(bytes, 0, n)) }
+  else if mark != 47 && mark != 46 { refuse(whole_end, Stray) }
+  else if part_end == whole_end + 1 || part_end != n { refuse(part_end, Stray) }
+  else if mark == 47 {
+    match ratio(number(bytes, 0, whole_end), number(bytes, whole_end + 1, n)) {
+      Some(r) -> r,
+      None -> refuse(whole_end + 1, ZeroDenominator),
+    }
+  } else {
+    let part = number(bytes, whole_end + 1, n);
+    let unit = bigint::pow(bigint::of_int(10), n - whole_end - 1);
+    reduced(
+      number(bytes, 0, whole_end) * unit
+        + (if peek(bytes, 0) == 45 { bigint::neg(part) } else { part }),
+      unit,
+    )
+  }
+}
+
+/// The fraction a text names, as `read` reads one, or why it names none.
+pub fn parse(text: String) -> Result<Rational, Refusal> / {abort.raise} = try { read(text) }
+
+/// What a `rational"..."` literal is checked by: the fraction `read` reads, or why the text is
+/// none and the character it stops being one at.
+pub fn literal(text: String) -> Result<Rational, { message: String, offset: Int }> / {abort.raise} =
+  match parse(text) {
+    Ok(r) -> Ok(r),
+    Err(e) ->
+      Err({
+        message: match e.why {
+          Stray -> "a fraction is a whole number, a ratio `3/4` or a decimal `0.75`",
+          ZeroDenominator -> "a denominator is not zero",
+        },
+        offset: e.at,
+      }),
+  }
+
+// --- The parts --------------------------------------------------------------
+
+fn refuse<a>(at: Int, why: Why) -> a / {rational.refused} = rational.refused({ at: at, why: why })
+
+/// A ratio in lowest terms with its denominator above zero, of a denominator that is not zero.
+fn reduced(n: BigInt, d: BigInt) -> Rational = {
+  let shared = bigint::gcd(n, d);
+  if bigint::is_negative(d) {
+    Rational(bigint::neg(exact(n, shared)), bigint::neg(exact(d, shared)))
+  } else { Rational(exact(n, shared), exact(d, shared)) }
+}
+
+/// `a / b` for a `b` the caller has found to divide `a`.
+fn exact(a: BigInt, b: BigInt) -> BigInt = match bigint::div(a, b) { Some(q) -> q, None -> a }
+
+/// `n / d` rounded toward negative infinity and what is left, which is not negative, for a `d`
+/// above zero.
+fn floored(n: BigInt, d: BigInt) -> { q: BigInt, r: BigInt } =
+  match bigint::div_mod(n, d) {
+    Some(split) -> if bigint::is_negative(split.r) {
+      { q: split.q - bigint::one(), r: split.r + d }
+    } else { split },
+    None -> { q: bigint::zero(), r: bigint::zero() },
+  }
+
+/// What orders as the numbers do: the terms of the continued fraction, each second one negated
+/// since a larger term there makes a smaller number, and then a mark past every term on the side
+/// a fraction that has ended lies.
+fn order_key(r: Rational) -> List<(Int, BigInt)> =
+  terms(numerator(r), denominator(r), 0, [], 2 * bigint::bit_length(denominator(r)) + 3)
+
+/// Euclid's algorithm, a quotient a term. Every second remainder is under half the one two steps
+/// before, so twice the denominator's bits bound the steps: `left`.
+fn terms(n: BigInt, d: BigInt, i: Int, out: List<(Int, BigInt)>, left: Int) -> List<(Int, BigInt)> =
+  if left <= 0 { out } else {
+    let split = floored(n, d);
+    let term = (0, if i % 2 == 0 { split.q } else { bigint::neg(split.q) });
+    if bigint::is_zero(split.r) {
+      push(push(out, term), (if i % 2 == 0 { 0 - 1 } else { 1 }, bigint::zero()))
+    } else { terms(d, split.r, i + 1, push(out, term), left - 1) }
+  }
+
+/// Two convergents back, `before` and `last`, and what is left of the fraction as `n / d`. The
+/// walk stops at the first convergent whose denominator is past `max`.
+fn nearest(
+  r: Rational,
+  max: BigInt,
+  n: BigInt,
+  d: BigInt,
+  before: { p: BigInt, q: BigInt },
+  last: { p: BigInt, q: BigInt },
+  left: Int,
+) -> Rational = {
+  let term = floored(n, d).q;
+  let next = before.q + term * last.q;
+  if left <= 0 || bigint::compare(next, max) == Greater {
+    let most = floored(max - before.q, last.q).q;
+    let between = { p: before.p + most * last.p, q: before.q + most * last.q };
+    if bigint::compare(bigint::of_int(2) * d * between.q, denominator(r)) != Greater {
+      Rational(last.p, last.q)
+    } else { Rational(between.p, between.q) }
+  } else {
+    nearest(r, max, d, n - term * d, last, { p: before.p + term * last.p, q: next }, left - 1)
+  }
+}
+
+/// `2^k`, for a `k` that is not negative.
+fn two_to(k: Int) -> BigInt = bigint::set_bit(bigint::zero(), k)
+
+/// The whole number the bytes from `from` up to `to` spell, which the caller has found to be
+/// digits behind an optional sign.
+fn number(bytes: Bytes, from: Int, to: Int) -> BigInt / {abort.raise} =
+  match bigint::of_string(string_of_bytes(bytes_slice(bytes, from, to))) {
+    Some(n) -> n,
+    None -> bigint::zero(),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+/// The fraction of two `Int`s, for a test that writes one.
+fn frac(n: Int, d: Int) -> Rational / {abort.raise} =
+  match of_ints(n, d) { Some(r) -> r, None -> panic("a denominator that is not zero") }
+
+/// Whether a fraction is in the form every function here answers: lowest terms, over a denominator
+/// above zero.
+fn in_lowest_terms(r: Rational) -> Bool =
+  bigint::sign(denominator(r)) == 1
+    && bigint::compare(bigint::gcd(numerator(r), denominator(r)), bigint::one()) == Equal
+
+test "a fraction is kept in lowest terms over a denominator above zero" {
+  assert_eq(frac(16, 0 - 10), Rational(bigint::of_int(0 - 8), bigint::of_int(5)));
+  assert_eq(frac(0, 0 - 7), zero());
+  assert_eq(frac(6, 3), of_int(2));
+  assert_eq(of_ints(1, 0), None);
+  assert_eq(ratio(bigint::one(), bigint::zero()), None);
+  assert_eq(numerator(frac(6, 0 - 4)), bigint::of_int(0 - 3));
+  assert_eq(denominator(frac(6, 0 - 4)), bigint::of_int(2));
+  assert(is_integer(frac(6, 3)) && !is_integer(frac(6, 4)));
+  assert(is_zero(zero()) && is_negative(frac(1, 0 - 2)) && !is_negative(zero()));
+  assert_eq(map([frac(0 - 1, 2), zero(), frac(1, 2)], sign), [0 - 1, 0, 1])
+}
+
+test "arithmetic is exact, and the operators are the functions" {
+  assert_eq(frac(1, 3) + frac(1, 6), frac(1, 2));
+  assert_eq(frac(1, 3) - frac(1, 2), frac(0 - 1, 6));
+  assert_eq(frac(3, 4) * frac(2, 3), frac(1, 2));
+  assert_eq(-frac(3, 4), frac(0 - 3, 4));
+  assert_eq(div(frac(3, 4), frac(0 - 9, 8)), Some(frac(0 - 2, 3)));
+  assert_eq(div(frac(3, 4), zero()), None);
+  assert_eq(reciprocal(frac(0 - 2, 3)), Some(frac(0 - 3, 2)));
+  assert_eq(reciprocal(zero()), None);
+  assert_eq(abs(frac(0 - 2, 3)), frac(2, 3));
+  assert_eq(pow(frac(2, 3), 5), Some(frac(32, 243)));
+  assert_eq(pow(frac(2, 3), 0 - 3), Some(frac(27, 8)));
+  assert_eq(pow(frac(0 - 2, 3), 0 - 3), Some(frac(0 - 27, 8)));
+  assert_eq(pow(zero(), 0), Some(one()));
+  assert_eq(pow(zero(), 0 - 1), None);
+  // A tenth is no `Float`, and ten of them are one here.
+  assert_eq(fold(range(0, 10), zero(), |sum: Rational, _i: Int| sum + frac(1, 10)), one())
+}
+
+test "a fraction orders as its number, through the key and by cross-multiplying" {
+  let ordered = [
+    frac(0 - 7, 2),
+    frac(0 - 10, 3),
+    of_int(0 - 3),
+    frac(0 - 1, 2),
+    frac(0 - 1, 3),
+    zero(),
+    frac(1, 3),
+    frac(1, 2),
+    frac(2, 3),
+    one(),
+    frac(3, 2),
+    frac(355, 113),
+    frac(22, 7),
+  ];
+  let pairs = map(range(0, len(ordered) - 1), |i: Int| slice(ordered, i, i + 2));
+  assert(
+    fold(pairs, true, |ok: Bool, pair: List<Rational>|
+      match pair { [low, high] -> ok && low < high && compare(low, high) == Less, _ -> false }),
+  );
+  let keyed = fold(ordered, map_new(), |m: Map<Rational, Int>, r: Rational| map_insert(m, r, 0));
+  assert_eq(map_keys(keyed), ordered);
+  assert_eq(map_get(keyed, frac(44, 14)), Some(0));
+  assert_eq(digest(frac(2, 4)), digest(frac(1, 2)));
+  assert_eq(max(frac(1, 2), frac(2, 3)), frac(2, 3))
+}
+
+test "a definition over a numeric type takes a Rational" {
+  assert_eq(math::sum([frac(1, 2), frac(1, 3), frac(1, 6)]), one());
+  assert_eq(math::product([frac(2, 3), frac(3, 4)]), frac(1, 2));
+  assert_eq(math::abs(frac(0 - 1, 2)), frac(1, 2));
+  assert_eq(math::clamp(frac(5, 2), zero(), one()), one())
+}
+
+test "a fraction rounds to a whole number as each mode rounds a Decimal" {
+  let by_mode = |r: Rational|
+    map([HalfEven, HalfUp, Down, Up, Ceiling, Floor], |mode: Rounding|
+      bigint::to_int(round(r, mode)));
+  assert_eq(by_mode(frac(5, 2)), map([2, 3, 2, 3, 3, 2], |n: Int| Some(n)));
+  assert_eq(
+    by_mode(frac(0 - 7, 2)),
+    map([0 - 4, 0 - 4, 0 - 3, 0 - 4, 0 - 3, 0 - 4], |n: Int| Some(n)),
+  );
+  assert_eq(by_mode(frac(1, 3)), map([0, 0, 0, 1, 1, 0], |n: Int| Some(n)));
+  assert_eq(floor(frac(0 - 7, 2)), bigint::of_int(0 - 4));
+  assert_eq(ceil(frac(0 - 7, 2)), bigint::of_int(0 - 3));
+  assert_eq(truncate(frac(0 - 7, 2)), bigint::of_int(0 - 3));
+  assert_eq(floor(frac(355, 113)), bigint::of_int(3))
+}
+
+test "a fraction is written as a ratio or a whole number, and read from those and a decimal" {
+  assert_eq(to_string(frac(3, 4)), "3/4");
+  assert_eq(to_string(frac(0 - 3, 4)), "-3/4");
+  assert_eq(to_string(frac(6, 3)), "2");
+  assert_eq(f"{frac(1, 3)} of {of_int(6)}", "1/3 of 6");
+  assert_eq(parse("3/4"), Ok(frac(3, 4)));
+  assert_eq(parse("-3"), Ok(of_int(0 - 3)));
+  assert_eq(parse("+3/7"), Ok(frac(3, 7)));
+  assert_eq(parse("007/014"), Ok(frac(1, 2)));
+  assert_eq(parse("0.75"), Ok(frac(3, 4)));
+  assert_eq(parse("-0.75"), Ok(frac(0 - 3, 4)));
+  assert_eq(parse("1.50"), Ok(frac(3, 2)));
+  assert_eq(parse("1.414213"), Ok(frac(1414213, 1000000)));
+  assert_eq(parse("-0.0"), Ok(zero()))
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+fn refusals() -> List<Refused> =
+  [
+    { text: "", at: 0, why: Stray },
+    { text: "-", at: 1, why: Stray },
+    { text: "x", at: 0, why: Stray },
+    { text: "3/", at: 2, why: Stray },
+    { text: "/4", at: 0, why: Stray },
+    { text: "3/-4", at: 2, why: Stray },
+    { text: "3/4/5", at: 3, why: Stray },
+    { text: "3 /4", at: 1, why: Stray },
+    { text: ".5", at: 0, why: Stray },
+    { text: "5.", at: 2, why: Stray },
+    { text: "1.5e3", at: 3, why: Stray },
+    { text: "1.2.3", at: 3, why: Stray },
+    { text: "3/0", at: 2, why: ZeroDenominator },
+    { text: "-3/000", at: 3, why: ZeroDenominator },
+  ]
+
+test "`{c.text}` names no fraction" for c: Refused in refusals() {
+  assert_eq(parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "a literal's check answers the fraction, or where the text stops being one" {
+  assert_eq(literal("-6/8"), Ok(frac(0 - 3, 4)));
+  assert_eq(
+    literal("3/x"),
+    Err({ message: "a fraction is a whole number, a ratio `3/4` or a decimal `0.75`", offset: 2 }),
+  );
+  assert_eq(literal("3/0"), Err({ message: "a denominator is not zero", offset: 2 }))
+}
+
+test "a Decimal is the fraction it names, and a fraction a Decimal at a scale" {
+  assert_eq(of_decimal(0.75m), frac(3, 4));
+  assert_eq(of_decimal(0m - 1.50m), frac(0 - 3, 2));
+  assert_eq(of_decimal(3m), of_int(3));
+  assert_eq(option_map(to_decimal(frac(3, 4), 2, HalfEven), decimal_to_string), Some("0.75"));
+  assert_eq(option_map(to_decimal(frac(3, 4), 4, HalfEven), decimal_to_string), Some("0.7500"));
+  assert_eq(option_map(to_decimal(frac(1, 3), 5, HalfEven), decimal_to_string), Some("0.33333"));
+  assert_eq(option_map(to_decimal(frac(2, 3), 5, HalfEven), decimal_to_string), Some("0.66667"));
+  assert_eq(option_map(to_decimal(frac(0 - 2, 3), 5, Down), decimal_to_string), Some("-0.66666"));
+  assert_eq(option_map(to_decimal(frac(0 - 1, 8), 2, HalfEven), decimal_to_string), Some("-0.12"));
+  assert_eq(option_map(to_decimal(frac(0 - 1, 8), 2, HalfUp), decimal_to_string), Some("-0.13"));
+  assert_eq(option_map(to_decimal(frac(5, 1), 0, Down), decimal_to_string), Some("5"));
+  assert_eq(to_decimal(frac(1, 3), 29, Down), None);
+  assert_eq(to_decimal(frac(1, 3), 0 - 1, Down), None);
+  // 2^96 is one past the greatest mantissa a Decimal holds.
+  assert_eq(to_decimal(of_bigint(two_to(96)), 0, Down), None);
+  assert_eq(
+    option_map(to_decimal(of_bigint(two_to(96) - bigint::one()), 0, Down), decimal_to_string),
+    Some("79228162514264337593543950335"),
+  )
+}
+
+test "a Float is the fraction it names, as Python's fractions reads the same ones" {
+  assert_eq(of_float(2.25), Some(frac(9, 4)));
+  assert_eq(of_float(0.0 - 0.1), Some(frac(0 - 3602879701896397, 36028797018963968)));
+  assert_eq(of_float(1.1), Some(frac(2476979795053773, 2251799813685248)));
+  assert_eq(of_float(0.0), Some(zero()));
+  assert_eq(of_float(0.0 - 0.0), Some(zero()));
+  assert_eq(of_float(5e-324), ratio(bigint::one(), two_to(1074)));
+  assert_eq(of_float(1.7976931348623157e308), Some(of_bigint(two_to(1024) - two_to(971))));
+  assert_eq(of_float(float_of_bits(0x7FF0_0000_0000_0000)), None);
+  assert_eq(of_float(float_of_bits(0x7FF8_0000_0000_0000)), None)
+}
+
+test "a fraction's nearest Float rounds once, ties to even, into the subnormals and past the top" {
+  assert_eq(to_float(frac(1, 3)), 0.3333333333333333);
+  assert_eq(to_float(frac(0 - 2, 3)), 0.0 - 0.6666666666666666);
+  assert_eq(to_float(frac(9, 4)), 2.25);
+  assert_eq(to_float(zero()), 0.0);
+  let ten_30 = bigint::pow(bigint::of_int(10), 30);
+  assert_eq(option_float(ratio(ten_30, bigint::of_int(7))), 1.4285714285714285e29);
+  assert_eq(option_float(ratio(bigint::one(), ten_30)), 1e-30);
+  assert_eq(option_float(ratio(bigint::one(), two_to(1074))), 5e-324);
+  // Halfway between two subnormals goes to the even one, and under half the least is zero.
+  assert_eq(option_float(ratio(bigint::of_int(3), two_to(1075))), 1e-323);
+  assert_eq(option_float(ratio(bigint::one(), two_to(1075))), 0.0);
+  assert_eq(option_float(ratio(bigint::of_int(5), two_to(1076))), 5e-324);
+  assert_eq(to_float(of_bigint(two_to(1024) - two_to(971))), 1.7976931348623157e308);
+  // Halfway from the greatest Float to 2^1024 rounds up, to an infinity.
+  assert_eq(to_float(of_bigint(two_to(1024) - two_to(970))), pow2(1024));
+  assert_eq(to_float(of_bigint(bigint::neg(two_to(2000)))), 0.0 - pow2(1024));
+  assert_eq(option_float(ratio(bigint::one(), two_to(2000))), 0.0)
+}
+
+fn option_float(r: Option<Rational>) -> Float =
+  match r { Some(x) -> to_float(x), None -> 0.0 / 0.0 }
+
+test "the nearest fraction under a denominator is the one Python's limit_denominator finds" {
+  let pi = of_decimal(3.141592653589793m);
+  let limited = |r: Rational, max: Int| limit_denominator(r, bigint::of_int(max));
+  assert_eq(limited(pi, 10), Some(frac(22, 7)));
+  assert_eq(limited(pi, 100), Some(frac(311, 99)));
+  assert_eq(limited(pi, 1000), Some(frac(355, 113)));
+  assert_eq(limited(frac(355, 113), 100), Some(frac(311, 99)));
+  assert_eq(limited(frac(0 - 355, 113), 7), Some(frac(0 - 22, 7)));
+  assert_eq(limited(frac(1, 3), 2), Some(frac(1, 2)));
+  assert_eq(limited(frac(2, 3), 2), Some(frac(1, 2)));
+  assert_eq(limited(frac(5, 7), 1), Some(one()));
+  assert_eq(limited(frac(5, 7), 7), Some(frac(5, 7)));
+  assert_eq(limited(frac(5, 7), 0), None);
+  // A half as cosine computes it, and a tenth as a Float holds it.
+  assert_eq(limited(frac(4503599627370497, 9007199254740992), 1000000), Some(frac(1, 2)));
+  assert_eq(limited(frac(2476979795053773, 2251799813685248), 1000000), Some(frac(11, 10)))
+}
+
+law "addition is a monoid over zero" = monoid(add, zero())
+
+law "multiplication is a monoid over one" = monoid(mul, one())
+
+law "addition and multiplication take their operands in either order"
+  forall (x: Rational, y: Rational) {
+    x + y == y + x && x * y == y * x
+  }
+
+law "multiplication distributes over addition"
+  forall (x: Rational, y: Rational, z: Rational) {
+    x * (y + z) == x * y + x * z
+  }
+
+law "a fraction and its negation make zero, and a fraction and its reciprocal one"
+  forall (x: Rational) {
+    x + -x == zero() && x - x == zero()
+      && (match reciprocal(x) { Some(inverse) -> x * inverse == one(), None -> is_zero(x) })
+  }
+
+law "division undoes multiplication"
+  forall (x: Rational, y: Rational) {
+    match div(x * y, y) { Some(q) -> q == x, None -> is_zero(y) }
+  }
+
+law "every answer is in lowest terms over a denominator above zero"
+  forall (x: Rational, y: Rational) {
+    in_lowest_terms(x) && in_lowest_terms(x + y) && in_lowest_terms(x * y) && in_lowest_terms(-x)
+      && (match div(x, y) { Some(q) -> in_lowest_terms(q), None -> true })
+  }
+
+law "cross-multiplying is a total order" = total_order(compare)
+
+law "the key orders fractions, and tells them apart, as cross-multiplying does"
+  forall (x: Rational, y: Rational) {
+    compare_values(x, y) == compare(x, y) && x < y == (compare(x, y) == Less)
+      && x == y == (compare(x, y) == Equal)
+  }
+
+law "whole fractions add and multiply as Int does wherever it can"
+  forall (a: Int, b: Int) {
+    (match checked_add(a, b) { Some(s) -> of_int(a) + of_int(b) == of_int(s), None -> true })
+      && (match checked_mul(a, b) { Some(p) -> of_int(a) * of_int(b) == of_int(p), None -> true })
+  }
+
+law "a fraction reads back from its text" =
+  round_trip(to_string, |text: String| result_ok(parse(text)))
+
+law "a fraction lies from its floor up to its ceiling, which are a whole number or one apart"
+  forall (r: Rational) {
+    compare(of_bigint(floor(r)), r) != Greater && compare(r, of_bigint(ceil(r))) != Greater
+      && ceil(r) - floor(r) == (if is_integer(r) { bigint::zero() } else { bigint::one() })
+  }
+
+law "a Decimal's fraction rounds to the whole number the Decimal rounds to"
+  forall (d: Decimal, mode: Rounding) {
+    bigint::to_int(round(of_decimal(d), mode)) == int_of_decimal(d, mode)
+  }
+
+law "a Decimal reads back from its fraction at its own scale"
+  forall (d: Decimal) {
+    to_decimal(of_decimal(d), decimal::scale(d), Down) == Some(d)
+  }
+
+law "a finite Float reads back from its fraction, and no other Float has one"
+  forall (f: Float) {
+    match of_float(f) { Some(r) -> to_float(r) == f, None -> f != f || f - f != 0.0 }
+  }
+
+law "the nearest Float to a ratio of whole Floats is their quotient"
+  forall (a: Int, b: Int) {
+    let n = a >> 11;
+    let d = if b >> 11 == 0 { 1 } else { b >> 11 };
+    to_float(frac(n, d)) == float_of_int(n) / float_of_int(d)
+  }
+
+law "no fraction under the denominator is nearer than the one limit_denominator finds"
+  forall (r: Rational, n: Int, d: Int, bound: Int) {
+    let max = (bound & 1023) + 1;
+    match of_ints(n, (d & 1023) % max + 1) {
+      None -> false,
+      Some(other) -> match limit_denominator(r, bigint::of_int(max)) {
+        Some(found) ->
+          bigint::compare(denominator(found), bigint::of_int(max)) != Greater
+            && compare(abs(found - r), abs(other - r)) != Greater,
+        None -> false,
+      },
+    }
+  }
