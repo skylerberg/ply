@@ -355,9 +355,19 @@ fn shipped_trees() -> List<{ prefix: String, dir: String }> =
     { prefix: "compiler.", dir: "crates/ply-compiler/ply" },
   ]
 
-/// The shipped modules as the launcher lays them out: one flat directory of `<dotted name>.ply`.
-fn shipped_names() -> Option<List<String>> / {Shipped} =
-  Some(map(shipped.names(), |n: String| n ++ ".ply"))
+/// The shipped modules as the launcher lays them out, one flat directory of `<dotted name>.ply`,
+/// with each module of `standing` this binary does not ship among them.
+fn shipped_names_with(standing: List<Source>) -> Option<List<String>> / {Shipped} =
+  Some(
+    fold(
+      standing,
+      map(shipped.names(), |n: String| n ++ ".ply"),
+      |names: List<String>, source: Source|
+        if !string_ends_with(source.path, ".ply") || string_contains(source.path, "/")
+            || contains(names, source.path) { names }
+        else { push(names, source.path) },
+    ),
+  )
 
 /// Every shipped module, by the name it is filed under.
 pub fn shipped_sources() -> List<Source> / {Shipped, abort.raise} =
@@ -368,13 +378,15 @@ pub fn shipped_sources() -> List<Source> / {Shipped, abort.raise} =
     })
 
 /// This binary's stamps and its program's definitions, so a store filed in process and one a
-/// spawned `ply` files agree.
+/// spawned `ply` files agree; a module as `<name>.ply`; and a data file one embeds, which lies
+/// below them under its own name.
 fn shipped_file(name: String) -> Option<Bytes> / {Shipped, abort.raise} =
   if name == "stamps" { Some(bytes_of_string(shipped.stamps())) }
   else if name == "definitions" { Some(shipped.definitions()) }
   else if string_ends_with(name, ".ply") {
     shipped.module(string_slice(name, 0, string_len(name) - 4))
-  } else { None }
+  } else if string_contains(name, "/") { shipped.module(name) }
+  else { None }
 
 /// The trees the shipped modules are built from, which `shipped_drift` holds the binary to.
 pub fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../ply-std/ply")
@@ -409,19 +421,37 @@ fn tree_module(name: String) -> Option<Bytes> / {abort.raise} =
     }
   }
 
-/// Each module the binary ships other than as its tree holds it, and each a tree holds that it lacks.
+/// The data files the standard library's tree holds for its modules to embed, each by the name the
+/// shipped modules hold it under: every file of the tree that is no module.
+pub fn std_data() -> List<{ name: String, bytes: Bytes }> =
+  map(
+    filter(std_tree(), |f: { name: String, bytes: Bytes }| !string_ends_with(f.name, ".ply")),
+    |f: { name: String, bytes: Bytes }| { name: "std/" ++ f.name, bytes: f.bytes },
+  )
+
+/// Each module or data file the binary ships other than as its tree holds it, and each module a tree
+/// holds that it lacks.
 pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
   let named = shipped.names();
+  let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
+    map(
+      filter(files, |f: { name: String, bytes: Bytes }| string_ends_with(f.name, ".ply")),
+      |f: { name: String, bytes: Bytes }| prefix ++ f.name,
+    );
   let held = push(
-    concat(
-      map(std_tree(), |f: { name: String, bytes: Bytes }| "std." ++ f.name),
-      map(compiler_tree(), |f: { name: String, bytes: Bytes }| "compiler." ++ f.name),
-    ),
+    concat(modules("std.", std_tree()), modules("compiler.", compiler_tree())),
     prelude_name() ++ ".ply",
   );
   concat(
-    filter(named, |n: String| shipped.module(n) != tree_module(n)),
-    filter(held, |h: String| len(filter(named, |n: String| n ++ ".ply" == h)) == 0),
+    concat(
+      filter(named, |n: String| shipped.module(n) != tree_module(n)),
+      filter(held, |h: String| len(filter(named, |n: String| n ++ ".ply" == h)) == 0),
+    ),
+    map(
+      filter(std_data(), |d: { name: String, bytes: Bytes }|
+        shipped.module(d.name) != Some(d.bytes)),
+      |d: { name: String, bytes: Bytes }| d.name,
+    ),
   )
 }
 
@@ -700,7 +730,8 @@ pub fn on_disk_with(
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_over(argv, vars, stdin, [])
 
 /// `ply` handed shipped modules in which each of `shipped`, named as it is filed, stands in for the
-/// module this binary ships: what a compiler that shipped those would have run.
+/// module or data file this binary ships, or is one more: what a compiler that shipped those would
+/// have run. A module is filed as `<name>.ply` and a data file under its own name.
 pub fn on_disk_shipping(
   argv: List<String>,
   shipped: List<Source>,
@@ -739,7 +770,7 @@ fn on_disk_over(
         cell_set(io, read.captured);
         read.line
       },
-      fs.list_dir[shipped](_) -> shipped_names(),
+      fs.list_dir[shipped](_) -> shipped_names_with(shipped),
       fs.read_file[shipped](name) -> match filter(shipped, |source: Source| source.path == name) {
         [source, ..] -> Some(bytes_of_string(source.text)),
         [] -> shipped_file(name),

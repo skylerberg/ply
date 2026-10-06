@@ -259,6 +259,20 @@ builtins! { $
     Atan = "atan", 1, ends;
     Atan2 = "atan2", 2, ends;
     Hypot = "hypot", 2, ends;
+    /// The entry at an end of a map's key order, as `Some({key, value})`.
+    MapFirst = "map_first", 1, ends;
+    MapLast = "map_last", 1, ends;
+    /// The entry nearest a key from one side, the key's own counted or not.
+    MapFloor = "map_floor", 2, ends;
+    MapCeiling = "map_ceiling", 2, ends;
+    MapBelow = "map_below", 2, ends;
+    MapAbove = "map_above", 2, ends;
+    /// An end's entry with the map that is left, in place while the map has one holder.
+    MapPopFirst = "map_pop_first", 1, ends;
+    MapPopLast = "map_pop_last", 1, ends;
+    /// `map_range(m, lo, lo_inclusive, hi, hi_inclusive, limit)`.
+    MapRange = "map_range", 6, ends;
+    MapSplit = "map_split", 2, ends;
 }
 
 impl Builtin {
@@ -1180,6 +1194,16 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::MapEntries => Ok(map::entries(&args[0], span)?),
         Builtin::MapOfEntries => Ok(map::of_entries(&args[0], span)?),
         Builtin::MapMerge => Ok(map::merge(&args[0], &args[1], span)?),
+        Builtin::MapFirst | Builtin::MapLast => Ok(map::end(&args[0], b, span)?),
+        Builtin::MapFloor | Builtin::MapCeiling | Builtin::MapBelow | Builtin::MapAbove => {
+            Ok(map::beside(&args[0], &args[1], b, span)?)
+        }
+        Builtin::MapPopFirst | Builtin::MapPopLast => Ok(map::pop(args.remove(0), b, span)?),
+        Builtin::MapRange => Ok(map::range(args, span)?),
+        Builtin::MapSplit => {
+            let k = args.remove(1);
+            Ok(map::split(args.remove(0), &k, span)?)
+        }
 
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`decimal_div`")?;

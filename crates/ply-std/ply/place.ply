@@ -1,0 +1,238 @@
+//! Where in a document: a path of steps into its value, a line and column of its text, and the
+//! error a decoder answers with both.
+//!
+//! `std.toml` and `std.yaml` address, place and refuse by these, so a caller of either writes one
+//! kind of path and reads one kind of error. A path is a list of steps, each into a table or a
+//! mapping by a string key or into an array or a sequence by an index. A place counts lines and
+//! columns from 1, the column in characters. A `DecodeError` is built inside out: a leaf decoder
+//! says what was wrong, each decoder around it prefixes the step it took, and the reader that had
+//! the text at hand adds the place.
+
+import std.list (prepend)
+import std.string (join)
+import std.text (closest)
+
+/// One step from a value to a value inside it.
+pub type Step =
+  /// Into a table or a mapping, by a string key.
+  | Key(String)
+  /// Into an array or a sequence, by an index from 0.
+  | Index(Int)
+
+/// A key as a path writes it: bare where it is letters, digits, `_` and `-`, and otherwise
+/// between double quotes, a quote, a backslash and a line break in it after a backslash.
+pub fn key_to_string(name: String) -> String = {
+  let bare = string_len(name) > 0
+    && fold(string_chars(name), true, |so_far: Bool, c: Char|
+      so_far
+        && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+        || c == '-'));
+  if bare { name } else {
+    "\""
+      ++ join(
+        map(string_chars(name), |c: Char|
+          if c == '"' { "\\\"" }
+          else if c == '\\' { "\\\\" }
+          else if c == '\n' { "\\n" }
+          else if c == '\r' { "\\r" }
+          else { string_of_chars([c]) }),
+        "",
+      )
+      ++ "\""
+  }
+}
+
+/// A path as text, its keys parted by dots and an index in brackets: `servers.alpha[2]."a b"`.
+pub fn path_to_string(path: List<Step>) -> String =
+  fold(path, "", |written: String, step: Step|
+    match step {
+      Key(name) -> (if written == "" { "" } else { written ++ "." }) ++ key_to_string(name),
+      Index(i) -> written ++ "[" ++ int_to_string(i) ++ "]",
+    })
+
+/// A line and a column of a text, both from 1, the column counted in characters.
+pub type Place = new { line: Int, column: Int }
+
+/// Where the byte at `offset` of `src` stands; an offset outside the text is its nearest end.
+pub fn place_at(src: Bytes, offset: Int) -> Place = {
+  let n = bytes_len(src);
+  let upto = if offset < 0 { 0 } else if offset > n { n } else { offset };
+  let before = handle { bytes_slice(src, 0, upto) } with { abort.raise(_) -> src };
+  let lines = handle { bytes_split(before, b"\n") } with { abort.raise(_) -> [before] };
+  let last = match list_at(lines, len(lines) - 1) { Some(line) -> line, None -> b"" };
+  { line: len(lines), column: string_len(string_of_bytes_lossy(last)) + 1 }
+}
+
+/// Where the first byte stands that is no part of a UTF-8 character: the length of `src` where
+/// all of it is UTF-8.
+pub fn utf8_end(src: Bytes) -> Int / {abort.raise} = first_invalid(src, 0, bytes_len(src))
+
+/// Each character takes a byte, so the bytes bound them: `left`.
+fn first_invalid(src: Bytes, i: Int, left: Int) -> Int / {abort.raise} = {
+  let n = bytes_len(src);
+  let lead = if i < n { bytes_at(src, i) } else { -1 };
+  let width = if lead < 128 { 1 } else if lead < 224 { 2 } else if lead < 240 { 3 } else { 4 };
+  if lead < 0 || left <= 0 || i + width > n || !bytes_is_utf8(bytes_slice(src, i, i + width)) { i }
+  else { first_invalid(src, i + width, left - 1) }
+}
+
+/// `src` with `text` in place of its bytes from `from` to `to`: what an edit of a document's text is.
+pub fn spliced(src: Bytes, from: Int, to: Int, text: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([bytes_slice(src, 0, from), text, bytes_slice(src, to, bytes_len(src))])
+
+/// Why a value did not decode: the path to what was wrong, the line and column it is written at
+/// where the text was at hand, and what was wrong.
+pub type DecodeError = new { path: List<Step>, place: Option<Place>, message: String }
+
+/// An error with no path yet; the decoders around it add the steps.
+pub fn decode_error(message: String) -> DecodeError = { path: [], place: None, message: message }
+
+/// A path is built inside out: each enclosing decoder prefixes the step it took.
+pub fn in_field(name: String, e: DecodeError) -> DecodeError =
+  { path: prepend(Key(name), e.path), place: e.place, message: e.message }
+
+/// `e`, one index further in.
+pub fn in_index(index: Int, e: DecodeError) -> DecodeError =
+  { path: prepend(Index(index), e.path), place: e.place, message: e.message }
+
+/// The error for the key `name` where a record has only `names`: at the key, saying what the
+/// record has, and which of them the key is one or two slips of the hand from, where one is.
+pub fn unknown_key(name: String, names: List<String>) -> DecodeError =
+  in_field(
+    name,
+    decode_error(
+      "this key is not one of " ++ join(map(names, key_to_string), ", ")
+        ++ (match closest(name, names, 2) {
+          Some(near) -> "; did you mean " ++ key_to_string(near) ++ "?",
+          None -> "",
+        }),
+    ),
+  )
+
+/// `line 4, column 8: servers.alpha.port: expected an integer, found a string`, without the place
+/// or the path where the error has none.
+pub fn error_to_string(e: DecodeError) -> String =
+  (match e.place {
+      Some(stood) ->
+        "line " ++ int_to_string(stood.line) ++ ", column " ++ int_to_string(stood.column) ++ ": ",
+      None -> "",
+    })
+    ++ (if len(e.path) == 0 { "" } else { path_to_string(e.path) ++ ": " })
+    ++ e.message
+
+/// Every item decoded, in order, or the first error with the index it stood at.
+pub fn decode_items<v, a | e>(
+  items: List<v>,
+  decode: (v) -> Result<a, DecodeError> / e,
+) -> Result<List<a>, DecodeError> / e = items_from(items, decode, 0, [])
+
+fn items_from<v, a | e>(
+  items: List<v>,
+  decode: (v) -> Result<a, DecodeError> / e,
+  index: Int,
+  acc: List<a>,
+) -> Result<List<a>, DecodeError> / e =
+  match items {
+    [] -> Ok(acc),
+    [x, ..rest] -> match decode(x) {
+      Err(err) -> Err(in_index(index, err)),
+      Ok(made) -> items_from(rest, decode, index + 1, push(acc, made)),
+    },
+  }
+
+/// Every entry's value decoded into a map under its key, or the first error with the key it
+/// stood under.
+pub fn decode_fields<v, a | e>(
+  entries: List<{ key: String, value: v }>,
+  decode: (v) -> Result<a, DecodeError> / e,
+) -> Result<Map<String, a>, DecodeError> / e = fields_from(entries, decode, map_new())
+
+fn fields_from<v, a | e>(
+  entries: List<{ key: String, value: v }>,
+  decode: (v) -> Result<a, DecodeError> / e,
+  acc: Map<String, a>,
+) -> Result<Map<String, a>, DecodeError> / e =
+  match entries {
+    [] -> Ok(acc),
+    [entry, ..rest] -> match decode(entry.value) {
+      Err(err) -> Err(in_field(entry.key, err)),
+      Ok(made) -> fields_from(rest, decode, map_insert(acc, entry.key, made)),
+    },
+  }
+
+test "a path is written with dots and brackets, a key that is no bare word between quotes" {
+  assert_eq(
+    path_to_string([Key("servers"), Key("a b"), Index(2), Key("port")]),
+    "servers.\"a b\"[2].port",
+  );
+  assert_eq(path_to_string([]), "");
+  assert_eq(path_to_string([Index(0), Key("")]), "[0].\"\"");
+  assert_eq(
+    path_to_string([Key("a.b"), Key("say \"hi\"\\\n")]),
+    "\"a.b\".\"say \\\"hi\\\"\\\\\\n\"",
+  );
+  assert_eq(key_to_string("plain_key-1"), "plain_key-1")
+}
+
+test "a place counts lines and characters from 1, and an offset outside the text is its end" {
+  let text = b"a = 1\nb = \"\xc3\xa9\" x\n";
+  assert_eq(place_at(text, 0), { line: 1, column: 1 });
+  assert_eq(place_at(text, 6), { line: 2, column: 1 });
+  assert_eq(place_at(text, 14), { line: 2, column: 8 });
+  assert_eq(place_at(text, 999), { line: 3, column: 1 });
+  assert_eq(place_at(text, -1), { line: 1, column: 1 });
+  assert_eq(place_at(b"", 0), { line: 1, column: 1 })
+}
+
+test "a text stops being UTF-8 at the first byte that is part of no character" {
+  assert_eq(utf8_end(b"abc"), 3);
+  assert_eq(utf8_end(b"a\xc3\xa9\xffb"), 3);
+  assert_eq(utf8_end(b"\xed\xa0\x80"), 0);
+  assert_eq(utf8_end(b"ab\xe2\x82"), 2);
+  assert_eq(utf8_end(b""), 0)
+}
+
+test "a splice replaces a range of bytes and leaves the rest" {
+  assert_eq(spliced(b"a = 1 # one", 4, 5, b"22"), b"a = 22 # one");
+  assert_eq(spliced(b"abc", 3, 3, b"d"), b"abcd");
+  assert_eq(spliced(b"abc", 0, 3, b""), b"")
+}
+
+test "a decode error is built inside out and says its place, its path and what was wrong" {
+  let inner = in_field("servers", in_index(2, in_field("port", decode_error("wrong"))));
+  assert_eq(inner.path, [Key("servers"), Index(2), Key("port")]);
+  assert_eq(error_to_string(inner), "servers[2].port: wrong");
+  assert_eq(
+    error_to_string({ path: inner.path, place: Some({ line: 4, column: 8 }), message: "wrong" }),
+    "line 4, column 8: servers[2].port: wrong",
+  );
+  assert_eq(error_to_string(decode_error("wrong")), "wrong")
+}
+
+test "an unknown key says the keys there are, and the one it is a slip from" {
+  assert_eq(
+    error_to_string(unknown_key("wieght", ["name", "port", "weight"])),
+    "wieght: this key is not one of name, port, weight; did you mean weight?",
+  );
+  assert_eq(
+    error_to_string(unknown_key("colour scheme", ["name", "a b"])),
+    "\"colour scheme\": this key is not one of name, \"a b\"",
+  )
+}
+
+test "a list and the fields of a record decode in order, an error under where it stood" {
+  let whole = |n: Int| if n >= 0 { Ok(n) } else { Err(decode_error("below zero")) };
+  assert_eq(decode_items([1, 2, 3], whole), Ok([1, 2, 3]));
+  assert_eq(result_err_text(decode_items([1, -2, -3], whole)), "[1]: below zero");
+  assert_eq(
+    decode_fields([{ key: "b", value: 2 }, { key: "a", value: 1 }], whole),
+    Ok(#{"a": 1, "b": 2}),
+  );
+  assert_eq(
+    result_err_text(decode_fields([{ key: "a b", value: -1 }], whole)),
+    "\"a b\": below zero",
+  )
+}
+
+fn result_err_text<a>(r: Result<a, DecodeError>) -> String =
+  match r { Ok(_) -> "", Err(e) -> error_to_string(e) }

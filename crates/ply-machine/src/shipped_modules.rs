@@ -36,9 +36,9 @@ pub fn is_shipped_name(name: &str) -> bool {
 pub fn names() -> Vec<String> {
     let pack = ply_pack::installed();
     let named = |root: &'static str, dir: &'static str| {
-        pack.files_in(dir).map(move |path| {
-            let stem = path[dir.len() + 1..].trim_end_matches(".ply");
-            format!("{root}.{stem}")
+        pack.files_in(dir).filter_map(move |path| {
+            let stem = path[dir.len() + 1..].strip_suffix(".ply")?;
+            Some(format!("{root}.{stem}"))
         })
     };
     named(STD_ROOT, ply_pack::STD)
@@ -84,6 +84,53 @@ pub fn source(module: &ModuleName) -> Option<&'static str> {
         std::str::from_utf8(text)
             .unwrap_or_else(|e| panic!("`{path}` in the pack is not UTF-8: {e}")),
     )
+}
+
+/// The name a data file a standard-library module embeds is asked for under: its place below the
+/// library's directory, after the library's root.
+fn data_name(path: &str) -> String {
+    format!("{STD_ROOT}{}", &path[ply_pack::STD.len()..])
+}
+
+/// Where the pack would carry the data file `name`: no module's path is one.
+fn data_path_of(name: &str) -> Option<String> {
+    let below = name.strip_prefix(STD_ROOT)?.strip_prefix('/')?;
+    (!below.ends_with(".ply")).then(|| format!("{}/{below}", ply_pack::STD))
+}
+
+/// Every data file the shipped modules embed, by name, ascending. No bytes are read.
+pub fn data_names() -> Vec<String> {
+    ply_pack::installed()
+        .data_below(ply_pack::STD)
+        .map(data_name)
+        .collect()
+}
+
+pub fn data(name: &str) -> Option<&'static [u8]> {
+    ply_pack::installed().bytes(&data_path_of(name)?)
+}
+
+/// What `name` is of the shipped modules, as a trace holds it: a module's text or a data file's
+/// bytes, digested.
+pub fn digest_of(name: &str) -> Option<String> {
+    let path = data_path_of(name).or_else(|| path_of(name))?;
+    let digest = ply_pack::installed().digest_of(&path)?;
+    Some(blake3::Hash::from(digest).to_hex().to_string())
+}
+
+/// What everything shipped is: every module's text, then each data file by its name and the digest
+/// the pack holds of its bytes, so no data file is read for it.
+pub fn digest() -> String {
+    let pack = ply_pack::installed();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(crate::builds::digest_of(&sources()).as_bytes());
+    for path in pack.data_below(ply_pack::STD) {
+        hasher.update(&[0]);
+        hasher.update(data_name(path).as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&pack.digest_of(path).expect("a listed path is carried"));
+    }
+    hasher.finalize().to_hex()[..16].to_string()
 }
 
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {
