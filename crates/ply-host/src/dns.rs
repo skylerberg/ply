@@ -1,5 +1,6 @@
-//! The `dns` effect: the system's resolver, asked off the machine's thread and abandoned at its
-//! deadline, since the resolver has none of its own.
+//! The `dns` effect: the system's resolver, asked off the machine's thread. The resolver has its
+//! own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s `resolve`
+//! cancels the task that asked) leaves the question on its thread until the system answers it.
 
 use crate::pool::JobOutput;
 use crate::tcp::TcpHost;
@@ -11,7 +12,6 @@ use ply_eval::{
 };
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 pub const MODULE: &str = "std.dns";
 
@@ -26,10 +26,15 @@ const PORT: u16 = 53;
 operations! {
     what "dns";
     path "dns";
-    Lookup = "lookup" / 2,
-    Reverse = "reverse" / 2,
+    Lookup = "lookup" / 1,
+    Reverse = "reverse" / 1,
     Servers = "servers" / 0,
 }
+
+/// What a name that is not ASCII is refused with: an internationalized name is looked up by its
+/// A-labels, and which those are is not the resolver's to decide.
+pub const NOT_ASCII: &str =
+    "a name is ASCII: an internationalized name is looked up by its A-labels";
 
 impl Op {
     pub fn declaration(self) -> HostOp {
@@ -47,13 +52,12 @@ impl Op {
     }
 }
 
-/// A `std.dns.Failure`.
+/// A `std.dns.Failure` the system's resolver can answer with: a deadline is its caller's.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Failure {
     NoSuchName,
     NoData,
     ServerFailure,
-    TimedOut,
     Other(i64, String),
 }
 
@@ -64,7 +68,6 @@ impl Failure {
             Failure::NoSuchName => named("NoSuchName", Vec::new()),
             Failure::NoData => named("NoData", Vec::new()),
             Failure::ServerFailure => named("ServerFailure", Vec::new()),
-            Failure::TimedOut => named("TimedOut", Vec::new()),
             Failure::Other(code, text) => named("Other", vec![Value::Int(*code), Value::str(text)]),
         }
     }
@@ -107,11 +110,11 @@ impl HostHandler for Operation {
         match self.op {
             Op::Lookup => {
                 let name = req.args[0].as_str(span, "a name")?.to_string();
-                let timeout = deadline(self.op, req.args[1].as_int(span, "a timeout")?, span)?;
                 self.net.waiting(span, "lookup", self.op.what(), move || {
                     let answer = match name.parse::<IpAddr>() {
                         Ok(address) => Ok(vec![address]),
-                        Err(_) => within(timeout, move || system::addresses(&name)),
+                        Err(_) if !name.is_ascii() => Err(Failure::Other(0, NOT_ASCII.to_string())),
+                        Err(_) => system::addresses(&name),
                     };
                     JobOutput::Made(Box::new(move || match answer {
                         Ok(addresses) => {
@@ -123,9 +126,8 @@ impl HostHandler for Operation {
             }
             Op::Reverse => {
                 let address = wire::ip_of(&req.args[0], span)?;
-                let timeout = deadline(self.op, req.args[1].as_int(span, "a timeout")?, span)?;
                 self.net.waiting(span, "reverse", self.op.what(), move || {
-                    let answer = within(timeout, move || system::names(address));
+                    let answer = system::names(address);
                     JobOutput::Made(Box::new(move || match answer {
                         Ok(names) => {
                             wire::ok(Value::list(names.into_iter().map(Value::str).collect()))
@@ -144,24 +146,6 @@ impl HostHandler for Operation {
             ))),
         }
     }
-}
-
-/// `work` on a thread of its own, given up on at the deadline: the resolver cannot be interrupted,
-/// so a late answer is dropped with the thread that carries it.
-fn within<T: Send + 'static>(
-    timeout: Duration,
-    work: impl FnOnce() -> Result<T, Failure> + Send + 'static,
-) -> Result<T, Failure> {
-    let (answered, answer) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("ply-host-dns".to_string())
-        .spawn(move || {
-            let _ = answered.send(work());
-        })
-        .map_err(|e| Failure::Other(0, format!("a lookup could not start: {e}")))?;
-    answer
-        .recv_timeout(timeout)
-        .unwrap_or(Err(Failure::TimedOut))
 }
 
 /// The servers a `resolv.conf` names, in its order, each at the port a server answers on.
@@ -184,17 +168,6 @@ pub fn servers(configuration: &str) -> Vec<Endpoint> {
             })
         })
         .collect()
-}
-
-fn deadline(op: Op, ms: i64, span: Span) -> Result<Duration, Diagnostic> {
-    if ms <= 0 {
-        return Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("{} was given a timeout of {ms} milliseconds", op.what()),
-        )
-        .primary(span, "a deadline must be positive"));
-    }
-    Ok(Duration::from_millis(ms as u64))
 }
 
 #[cold]

@@ -271,8 +271,11 @@ fn a_declaration_without_nondet_refuses_the_handler() {
     );
 }
 
+/// A declaration that lacks an operation the host registers is a program checked before the
+/// operation was added, or after it was renamed: either way it performs none of it, and the rest
+/// binds. That the registry names only what this tree declares is `unit::registry`'s to hold.
 #[test]
-fn an_operation_renamed_in_the_declaration_is_refused_at_bind_time() {
+fn an_operation_the_declaration_lacks_binds_nothing_and_the_rest_binds() {
     let mut renamed = check(&fixture());
     let net = declared(&mut renamed);
     let recv = net
@@ -280,16 +283,17 @@ fn an_operation_renamed_in_the_declaration_is_refused_at_bind_time() {
         .shift_remove(&Symbol::new("recv"))
         .expect("`net.recv` is declared");
     net.ops.insert(Symbol::new("read_bytes"), recv);
-    let diagnostics = registry(Arc::new(TcpHost::new()))
+    let binding = registry(Arc::new(TcpHost::new()))
         .bind(&renamed)
-        .expect_err("`net.recv` is no longer declared");
-    assert!(
-        diagnostics
-            .iter()
-            .any(|d| d.code == codes::HOST_OPERATION_UNKNOWN),
-        "{:?}",
-        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
-    );
+        .expect("what the declaration still holds binds");
+    let served: Vec<&str> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.op.as_str())
+        .collect();
+    assert!(served.contains(&"send"), "{served:?}");
+    assert!(!served.contains(&"recv"), "{served:?}");
 }
 
 #[test]

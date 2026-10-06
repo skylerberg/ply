@@ -17,7 +17,10 @@
 //! would and tries each address in turn. `dial` is that loop written here: it performs
 //! `dns.lookup`, orders the addresses with `dns::interleave`, and connects with `connect_to`, so a
 //! test's table decides where a name connects and a caller that validated an address connects to
-//! that address. Every connection has `NoDelay` on; a `SocketOption` is set as a connection or a
+//! that address. Its `timeout_ms` is one deadline on the clock for the lookup and every attempt,
+//! and it is held to a `std.task` deadline around it, so it runs under `simulate` or `--host` with
+//! `task::unbounded` or a deadline above it. It tries one address at a time and races none.
+//! Every connection has `NoDelay` on; a `SocketOption` is set as a connection or a
 //! listener opens, or later with `set_option`, and `options` reads each back.
 //!
 //! `start_tls` secures a connection that is already open, as SMTP's `STARTTLS` and Postgres's
@@ -47,7 +50,9 @@ import std.io
 import std.io (Sink, Source)
 import std.ip
 import std.ip (Ip, SocketAddress, ip)
-import std.list (concat, contains)
+import std.list (concat, contains, take)
+import std.task
+import std.time (after, as_millis, between, millis)
 
 /// Why a socket operation did not do what it was asked.
 pub type Refusal =
@@ -244,17 +249,51 @@ pub fn dial_address<[l]>(
   match net.connect_to[l](to, options, timeout_ms) { Ok(c) -> c, Err(why) -> socket.refused(why) }
 
 /// A connection to `name` at `port`: its addresses looked up through `dns`, ordered by
-/// `dns::interleave`, and tried one at a time, each within `timeout_ms`, until one connects. A
-/// name with no address raises `NameNotFound`, and a name none of whose addresses connects raises
-/// what the last one was refused with.
+/// `dns::interleave`, and tried one at a time until one connects. `timeout_ms` is one deadline on
+/// the clock for all of it, the lookup and every attempt, held to the deadline already around
+/// this call where that is earlier; each attempt is given an even share of what is left, so an
+/// address that does not answer costs its share and not the rest. A name with no address raises
+/// `NameNotFound`, a name that is not ASCII raises `Other`, and a name none of whose addresses
+/// connects raises what the last one was refused with.
 pub fn dial<[l]>(
   name: String,
   port: Int,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Int / {dns.lookup, net.connect_to[l], socket.refused} =
-  match dns.lookup(name, timeout_ms) {
-    Ok(found) -> reached[l](dns::interleave(dns::addresses(found)), port, options, timeout_ms),
+) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+  dialled[l](name, port, options, ending("dial", timeout_ms))
+
+/// The instant `timeout_ms` from now, or the deadline around this call where that is earlier.
+fn ending(
+  function: String,
+  timeout_ms: Int,
+) -> Instant / {clock.read, task::deadline.at, abort.raise} =
+  if timeout_ms <= 0 {
+    panic(
+      "`net::" ++ function ++ "` was given a timeout of " ++ int_to_string(timeout_ms)
+        ++ " milliseconds",
+    )
+  } else {
+    let own = after(clock.now(), millis(timeout_ms));
+    match task::earliest(Some(own), task::deadline.at()) { Some(earlier) -> earlier, None -> own }
+  }
+
+/// The `timeout_ms` of an operation that must end by `end`: the whole milliseconds left before it,
+/// `None` where there is none.
+pub fn ms_left(end: Instant) -> Option<Int> / {clock.read} = {
+  let left = as_millis(between(clock.now(), end));
+  if left > 0 { Some(left) } else { None }
+}
+
+/// `dial` by the instant `end`.
+fn dialled<[l]>(
+  name: String,
+  port: Int,
+  options: List<SocketOption>,
+  end: Instant,
+) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+  match dns::resolve(name, between(clock.now(), end)) {
+    Ok(found) -> reached[l](dns::interleave(dns::addresses(found)), port, options, end),
     Err(dns::TimedOut) -> socket.refused(TimedOut),
     Err(dns::Other(code, text)) -> socket.refused(Other(code, text)),
     Err(_) -> socket.refused(NameNotFound),
@@ -264,16 +303,19 @@ fn reached<[l]>(
   addresses: List<Ip>,
   port: Int,
   options: List<SocketOption>,
-  timeout_ms: Int,
-) -> Int / {net.connect_to[l], socket.refused} =
+  end: Instant,
+) -> Int / {net.connect_to[l], socket.refused, clock.read, abort.raise} =
   match addresses {
     [] -> socket.refused(NameNotFound),
     [address, ..rest] -> match ip::socket_address(address, port) {
       None -> socket.refused(Other(0, "a port is 0 to 65535")),
-      Some(to) -> match net.connect_to[l](to, options, timeout_ms) {
-        Ok(c) -> c,
-        Err(why) -> if len(rest) == 0 { socket.refused(why) }
-        else { reached(rest, port, options, timeout_ms) },
+      Some(to) -> match ms_left(end) {
+        None -> socket.refused(TimedOut),
+        Some(left) -> match net.connect_to[l](to, options, max(left / len(addresses), 1)) {
+          Ok(c) -> c,
+          Err(why) -> if len(rest) == 0 { socket.refused(why) }
+          else { reached(rest, port, options, end) },
+        },
       },
     },
   }
@@ -305,17 +347,22 @@ pub fn secure_accepted<[l]>(
   }
 
 /// A TLS connection to `name` at `port`, dialled as `dial` dials and then secured as `name`,
-/// offering `alpn`. The handshake is complete when this answers; a connection that does not
-/// secure is closed before its refusal is raised.
+/// offering `alpn`, the handshake under the same deadline as the dial. The handshake is complete
+/// when this answers; a connection that does not secure is closed before its refusal is raised.
 pub fn dial_tls<[l]>(
   name: String,
   port: Int,
   alpn: List<String>,
   options: List<SocketOption>,
   timeout_ms: Int,
-) -> Int / {dns.lookup, net.connect_to[l], net.start_tls[l], net.close[l], socket.refused} = {
-  let c = dial[l](name, port, options, timeout_ms);
-  match net.start_tls[l](c, name, alpn, b"", timeout_ms) {
+) -> Int / {dns.lookup, net.connect_to[l], net.start_tls[l], net.close[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+  let end = ending("dial_tls", timeout_ms);
+  let c = dialled[l](name, port, options, end);
+  let secured = match ms_left(end) {
+    None -> Err(TimedOut),
+    Some(left) -> net.start_tls[l](c, name, alpn, b"", left),
+  };
+  match secured {
     Ok(_) -> c,
     Err(why) -> {
       net.close[l](c);
@@ -1215,7 +1262,8 @@ pub type Over<a> = { value: a, net: MemNet }
 
 /// `go` run over `start`, every `net` operation under every label answered by the twin and every
 /// `dns` operation by the table the twin holds: what a test hands code that opens, serves or
-/// secures connections.
+/// secures connections. Code that starts tasks, as `dial` does to bound its lookup, runs in a
+/// `simulate` region opened inside `go`, so that the twin is older than the scheduler.
 pub fn on_mem<a | e>(
   start: MemNet,
   go: () -> a / {net.read[*], net.write[*], dns.lookup, dns.reverse, dns.servers | e},
@@ -1306,8 +1354,8 @@ pub fn on_mem<a | e>(
       net.peer_address[*label](conn) -> mem_peer_address(cell_get(t), label, conn),
       net.peer_credentials[*label](conn) -> mem_peer_credentials(cell_get(t), label, conn),
       net.options[*label](socket) -> mem_options(cell_get(t), label, socket),
-      dns.lookup(name, _timeout_ms) -> dns::table_lookup(cell_get(t).names, name),
-      dns.reverse(address, _timeout_ms) -> dns::table_reverse(cell_get(t).names, address),
+      dns.lookup(name) -> dns::table_lookup(cell_get(t).names, name),
+      dns.reverse(address) -> dns::table_reverse(cell_get(t).names, address),
       dns.servers() -> cell_get(t).names.servers,
     };
     { value: value, net: cell_get(t) }
@@ -1692,30 +1740,80 @@ test "a name connects where the network's table says, each address tried in the 
     ip::read_socket("[2001:db8::5]:5432"),
     Unreachable,
   );
-  let ran = on_mem(world, || {
-    let by_host = net.connect[db]("db.example", 5432, 1000);
-    let tls = net.connect_tls[db]("db.example", 5432, 1000);
-    let dialled = dial[db]("DB.example.", 5432, [], 1000);
-    let nowhere = net.connect[db]("other.example", 5432, 1000);
-    let unknown: Result<Int, Refusal> = try { dial[db]("other.example", 5432, [], 1000) };
-    let spent: Result<Int, Refusal> = try { dial[db]("db.example", 5432, [], 1000) };
-    {
-      by_host: by_host,
-      tls: tls,
-      peer: net.peer_address[db](dialled),
-      nowhere: nowhere,
-      unknown: unknown,
-      spent: spent,
-    }
-  });
+  let ran = on_mem(world, ||
+    simulate {
+      task::unbounded(|| {
+        let by_host = net.connect[db]("db.example", 5432, 1000);
+        let tls = net.connect_tls[db]("db.example", 5432, 1000);
+        let dialled = dial[db]("DB.example.", 5432, [], 1000);
+        let nowhere = net.connect[db]("other.example", 5432, 1000);
+        let unknown: Result<Int, Refusal> = try { dial[db]("other.example", 5432, [], 1000) };
+        let foreign: Result<Int, Refusal> = try { dial[db]("b\u{fc}cher.example", 5432, [], 1000) };
+        let spent: Result<Int, Refusal> = try { dial[db]("db.example", 5432, [], 1000) };
+        {
+          by_host: by_host,
+          tls: tls,
+          peer: net.peer_address[db](dialled),
+          nowhere: nowhere,
+          unknown: unknown,
+          foreign: foreign,
+          spent: spent,
+        }
+      })
+    });
   assert_eq(ran.value.by_host, Some(1));
   assert_eq(ran.value.tls, Some(2));
   assert_eq(mem_secured(ran.net, 2), Some("db.example"));
   assert_eq(ran.value.peer, Some(ip::read_socket("192.0.2.5:5432")));
   assert_eq(ran.value.nowhere, None);
   assert_eq(ran.value.unknown, Err(NameNotFound));
+  // A name that is not ASCII is refused as `dns.lookup` refuses it, and nothing is looked up.
+  assert_eq(
+    ran.value.foreign,
+    Err(Other(0, "a name is ASCII: an internationalized name is looked up by its A-labels")),
+  );
   // The last address tried is the one whose refusal is raised: the peer has no script left.
   assert_eq(ran.value.spent, Err(Refused))
+}
+
+/// `go` over a network where a connection to one of `dead` is never answered, which costs its
+/// caller the whole of the deadline it gave, and one to any other address is answered at once.
+fn unanswered<a | e>(
+  dead: List<SocketAddress>,
+  go: () -> a / {net.connect_to[db] | e},
+) -> a / {clock.write | e} =
+  handle {
+    go()
+  } with {
+    net.connect_to[db](to, _options, timeout_ms) -> if contains(dead, to) {
+      clock.sleep(millis(timeout_ms));
+      Err(TimedOut)
+    } else { Ok(7) },
+  }
+
+test "a dial is one deadline: an address that does not answer costs its share of what is left" {
+  let hosts = [ip::read("192.0.2.5"), ip::read("192.0.2.6"), ip::read("192.0.2.7")];
+  let names = dns::with_name(dns::table(), "db.example", hosts);
+  let at = |n: Int| map(take(hosts, n), |host: Ip| ip::socket_at(host, 5432));
+  simulate {
+    let began = clock.now();
+    let since = || as_millis(between(began, clock.now()));
+    dns::on_table(names, ||
+      task::unbounded(|| {
+        // The first of three is given a third, and the second answers.
+        assert_eq(unanswered(at(1), || dial[db]("db.example", 5432, [], 900)), 7);
+        assert_eq(since(), 300);
+        // Half of what the first left, then all of what the second left: the deadline and no more.
+        let none: Result<Int, Refusal> = try {
+          unanswered(at(3), || dial[db]("db.example", 5432, [], 1000))
+        };
+        assert_eq((none, since()), (Err(TimedOut), 1300));
+        // Under a deadline that is earlier than its own, the shares are of that one.
+        let held = task::timeout(millis(300), ||
+          unanswered(at(1), || dial[db]("db.example", 5432, [], 900)));
+        assert_eq((held, since()), (task::Done(7), 1400))
+      }))
+  }
 }
 
 test "a TLS connection by name is dialled, secured, and closed when it does not secure" {
@@ -1724,11 +1822,14 @@ test "a TLS connection by name is dialled, secured, and closed when it does not 
     [Upgrades, Says(b"ok")],
     [Refuses(Untrusted)],
   ]);
-  let ran = on_mem(world, || {
-    let c = dial_tls[api]("api.example", 443, ["h2"], [], 1000);
-    let refused: Result<Int, Refusal> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
-    { c: c, read: net.recv[api](c, 16, 1000), refused: refused }
-  });
+  let ran = on_mem(world, ||
+    simulate {
+      task::unbounded(|| {
+        let c = dial_tls[api]("api.example", 443, ["h2"], [], 1000);
+        let refused: Result<Int, Refusal> = try { dial_tls[api]("api.example", 443, [], [], 1000) };
+        { c: c, read: net.recv[api](c, 16, 1000), refused: refused }
+      })
+    });
   assert_eq(ran.value.read, Some(b"ok"));
   assert_eq(mem_secured(ran.net, ran.value.c), Some("api.example"));
   assert_eq(ran.value.refused, Err(Untrusted));

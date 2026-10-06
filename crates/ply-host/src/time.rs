@@ -1,5 +1,6 @@
 //! The `time` effect: a wall-clock reading, a monotonic one and a wait, all of the host's real
-//! time.
+//! time. Its wait is the thread's, so every task of the run waits with it; the wait that parks one
+//! task is the language's `clock.sleep`.
 
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -91,10 +92,21 @@ impl TimeHost {
         i64::try_from(self.started.elapsed().as_micros()).unwrap_or(i64::MAX)
     }
 
+    /// Nanoseconds since this run's clock was started: what the language's `clock.now` reads, and
+    /// what a production region's sleeps are deadlines on.
+    pub fn elapsed_ns(&self) -> i64 {
+        i64::try_from(self.started.elapsed().as_nanos()).unwrap_or(i64::MAX)
+    }
+
     /// Parks this thread for `ms`; a span no clock can run backwards over, so a negative one is no
     /// wait at all rather than a refusal.
     pub fn sleep_ms(&self, ms: i64) {
         std::thread::sleep(Duration::from_millis(u64::try_from(ms).unwrap_or(0)));
+    }
+
+    /// The same wait, of `nanos`.
+    pub fn sleep_ns(&self, nanos: i64) {
+        std::thread::sleep(Duration::from_nanos(u64::try_from(nanos).unwrap_or(0)));
     }
 }
 

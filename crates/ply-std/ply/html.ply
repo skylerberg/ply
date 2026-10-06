@@ -1,4 +1,5 @@
-//! HTML as a value in which no text can be markup, and the tag that writes it.
+//! HTML as a value in which no text can be markup, the tag that writes it, and the character
+//! references text is written in and read back from.
 //!
 //! With `import std.html`, `html"<p class={kind}>{name}</p>"` is an `Html`. The literal's own text
 //! is markup, read when the program is checked as the HTML Living Standard's syntax (§13.1) reads
@@ -12,19 +13,42 @@
 //!
 //! A hole stands nowhere a value's characters would be read as another language: not in a tag
 //! outside an attribute's value, in a comment, a `script` or a `style`, nor in an event handler, a
-//! `style` or a `srcdoc` attribute. What a URL names is not judged: `href={text(u)}` keeps `u`
-//! inside the attribute, and whether `u` is a `javascript:` URL is the program's to say.
+//! `style` or a `srcdoc` attribute. What a URL names is not judged by the literal: `href={text(u)}`
+//! keeps `u` inside the attribute, and whether `u` is a `javascript:` URL is the program's to say.
+//!
+//! `escape` writes a text for any place a hole stands in, and `escape_text` and `escape_attribute`
+//! for one. `unescape` reads character references back as the standard's tokenizer does
+//! (§13.2.5.72 to §13.2.5.80), by the standard's own table of names, `entities.json`, which the
+//! module ships beside it and a build reads once; `license` is the notice the table is passed on
+//! under.
+//!
+//! The reader behind the literal is open to markup read at run time, which is how `std.template`
+//! fills one: `reader` is where a reading starts, `run` reads a text from where another ended,
+//! `hole` says how a value stands there, `joined` is where two readings of one place agree, and a
+//! `Draft` is written of runs and holes in the order they were read, so what it finishes as is
+//! still an `Html` in which no text is markup. Asked to, the reader follows the URL of each
+//! attribute that holds one, and `url_value` writes a value into it: percent-encoded, and refused
+//! where it would give the URL a scheme other than `http`, `https`, `mailto` or `tel`.
 
-import std.bytes (peek, is_digit, hex_value)
-import std.list (at_or, concat, flat_map)
+import std.bytes (hex_value, is_digit, peek, scan, scan_until)
+import std.gen
+import std.gen (Gen)
+import std.json
+import std.json (Json)
+import std.laws (agrees, idempotent, inverse, round_trip)
+import std.list (at_or, concat, contains, flat_map)
+import std.option (option_traverse)
 import std.string (join, replace)
+import std.url (url_encode)
+import std.value (VCtor, VList, VRecord, VStr, Value)
 
 /// A part of a document: markup as it is written out, or characters that are escaped where they
-/// are written.
-pub type Piece = | Markup(String) | Chars(String)
+/// are written. Only this module makes one, so no caller's text is markup.
+pub opaque type Piece = | Markup(String) | Chars(String)
 
 /// A fragment of a document's content, in the order it is written. Only this module builds one,
-/// so its markup is a literal's own text and every string in it came through `text`.
+/// so its markup is text this module read as markup and every other string in it came through
+/// `text`.
 pub opaque type Html = new { pieces: List<Piece> }
 
 /// `s` as character data: whatever it holds is read as text, in content and in an attribute alike.
@@ -33,42 +57,366 @@ pub fn text(s: String) -> Html = { pieces: [Chars(s)] }
 /// The fragments one after another, with nothing between them.
 pub fn fragment(parts: List<Html>) -> Html = { pieces: flat_map(parts, |h: Html| h.pieces) }
 
+/// The document text of `h`: its markup as it is, and its characters escaped.
+pub fn render(h: Html) -> String / {abort.raise} =
+  string_of_bytes(
+    bytes_concat_all(
+      map(h.pieces, |piece: Piece|
+        bytes_of_string(match piece { Markup(m) -> m, Chars(s) -> escape(s) })),
+    ),
+  )
+
+/// The bytes of `h` as its pieces hold them, markup and characters alike.
+fn held_bytes(h: Html) -> List<Bytes> =
+  map(h.pieces, |piece: Piece| bytes_of_string(match piece { Markup(m) -> m, Chars(s) -> s }))
+
+/// What `h` is as characters: its text as given, and its markup as its source.
+fn plain(h: Html) -> String = string_of_bytes_lossy(bytes_concat_all(held_bytes(h)))
+
+/// How many bytes `h` holds, of markup and of characters before they are escaped: no more than
+/// its document text has, and no less than a sixth of it.
+pub fn size(h: Html) -> Int = fold(held_bytes(h), 0, |n: Int, held: Bytes| n + bytes_len(held))
+
+/// The fragment `v` shows, where `v` is what `reflect` answers of an `Html`, and `None` for any
+/// other value: how a fragment held in data is told from a text there. A `Value` is data anyone
+/// may write out, so this takes `v` as `reflect`'s; one read from outside a program, as a JSON
+/// document's is, holds no constructor and is never a fragment.
+pub fn reflected(v: Value) -> Option<Html> =
+  match v { VRecord([{ name: "pieces", value: VList(shown) }]) -> pieces_shown(shown), _ -> None }
+
+fn pieces_shown(shown: List<Value>) -> Option<Html> =
+  match option_traverse(shown, piece_shown) {
+    Some(pieces) -> Some({ pieces: pieces }),
+    None -> None,
+  }
+
+fn piece_shown(v: Value) -> Option<Piece> =
+  match v {
+    VCtor("std.html.Markup", [VStr(markup)]) -> Some(Markup(markup)),
+    VCtor("std.html.Chars", [VStr(chars)]) -> Some(Chars(chars)),
+    _ -> None,
+  }
+
+// --- Character references ------------------------------------------------------
+
+type Reference = { raw: String, written: String }
+
+/// `&` first, so the `&` of a reference written for another character is not written again.
+fn marks() -> List<Reference> =
+  [{ raw: "&", written: "&amp;" }, { raw: "<", written: "&lt;" }, { raw: ">", written: "&gt;" }]
+
+fn double_quote() -> Reference = { raw: "\"", written: "&quot;" }
+
+fn referenced(s: String, references: List<Reference>) -> String / {abort.raise} =
+  fold(references, s, |out: String, r: Reference| replace(out, r.raw, r.written))
+
 /// `s` with `&`, `<`, `>`, `"` and `'` as character references, which is text in an element's
 /// content and in an attribute value quoted either way.
 pub fn escape(s: String) -> String / {abort.raise} =
-  fold(references(), s, |out: String, r: { raw: String, written: String }|
-    replace(out, r.raw, r.written))
+  referenced(s, push(push(marks(), double_quote()), { raw: "'", written: "&#39;" }))
 
-/// `&` first, so the `&` of a reference written for another character is not written again.
-fn references() -> List<{ raw: String, written: String }> =
+/// `s` with `&`, `<` and `>` as character references: text in an element's content, where a quote
+/// is a character like any other. It is no attribute's value: `escape_attribute` writes one.
+pub fn escape_text(s: String) -> String / {abort.raise} = referenced(s, marks())
+
+/// `s` with `&`, `<`, `>` and `"` as character references: the value of an attribute written
+/// between double quotes. Between single quotes a `'` would end it, and there `escape` is the
+/// text.
+pub fn escape_attribute(s: String) -> String / {abort.raise} =
+  referenced(s, push(marks(), double_quote()))
+
+/// `s` with each character reference read as the character it names, as the standard reads text
+/// in an element's content. A reference is a name of the standard's table with its `;`, or the
+/// longest of the names the table admits without one, so `&notit;` is `¬it;`; or a number, in
+/// decimal or after an `x` in hexadecimal, with its `;` or without. A number that is zero, a
+/// surrogate or past U+10FFFF is U+FFFD, and one from 0x80 to 0x9F the character Windows-1252 has
+/// there. An `&` that begins none of these is the character, so every text has an answer.
+pub fn unescape(s: String) -> String / {abort.raise} = unescaped(s, false)
+
+/// As `unescape`, for the value of an attribute: there a name without its `;` is left as it is
+/// written where a letter, a digit or `=` follows it, so `?a=1&not=2` keeps its `&not`.
+pub fn unescape_attribute(s: String) -> String / {abort.raise} = unescaped(s, true)
+
+/// The notice the table of named character references is passed on under: who made it, where it
+/// is published and the licences that let it be copied.
+pub fn license() -> String / {abort.raise} = string_of_bytes(embed("html/LICENSE"))
+
+/// The standard's named character references, each by its name as the table spells it after the
+/// `&`: with its `;`, and for the names admitted without one also bare. `bare` is the length of
+/// the longest of those.
+type Names = { named: Map<Bytes, Bytes>, bare: Int }
+
+const fn names() -> Names = names_in(embed("html/entities.json"))
+
+fn names_in(file: Bytes) -> Names / {abort.raise} =
+  match json::parse(file) {
+    Ok(json::Object(entries)) ->
+      map_fold(entries, { named: map_new(), bare: 0 }, |table: Names, name: String, entry: Json| {
+        let key = bytes_of_string(string_slice(name, 1, string_len(name)));
+        match json::get(entry, "characters") {
+          Some(json::Str(characters)) ->
+            {
+              named: map_insert(table.named, key, bytes_of_string(characters)),
+              bare: if bytes_ends_with(key, b";") { table.bare }
+              else { max(table.bare, bytes_len(key)) },
+            },
+          _ -> panic("`" ++ name ++ "` names no characters"),
+        }
+      }),
+    _ -> panic("the table of named character references is no JSON object"),
+  }
+
+/// The characters a reference stands for, and where the text goes on after it.
+type Read = { characters: Bytes, next: Int }
+
+type Reading = { from: Int, amp: Option<Int>, pieces: List<Bytes> }
+
+fn unescaped(s: String, attribute: Bool) -> String / {abort.raise} = {
+  let text = bytes_of_string(s);
+  match bytes_index_of(text, b"&") {
+    None -> s,
+    Some(first) -> {
+      let table = names();
+      let pieces = iterate(
+        { from: 0, amp: Some(first), pieces: [] },
+        bytes_len(text) + 1,
+        |at: Reading|
+          match at.amp {
+            None -> Stop(push(at.pieces, bytes_slice(text, at.from, bytes_len(text)))),
+            Some(amp) -> match reference(text, amp, table, attribute) {
+              None -> Continue({ ..at, amp: bytes_index_of_from(text, b"&", amp + 1) }),
+              Some(read) ->
+                Continue({
+                  from: read.next,
+                  amp: bytes_index_of_from(text, b"&", read.next),
+                  pieces: push(push(at.pieces, bytes_slice(text, at.from, amp)), read.characters),
+                }),
+            },
+          },
+      );
+      string_of_bytes(bytes_concat_all(pieces))
+    },
+  }
+}
+
+/// The reference the `&` at `amp` begins, if it begins one.
+fn reference(text: Bytes, amp: Int, table: Names, attribute: Bool) -> Option<Read> / {abort.raise} = {
+  let c = peek(text, amp + 1);
+  if c == b'#' { numbered(text, amp) }
+  else if is_letter(c) || is_digit(c) { named(text, amp, table, attribute) }
+  else { None }
+}
+
+fn numbered(text: Bytes, amp: Int) -> Option<Read> / {abort.raise} = {
+  let hex = peek(text, amp + 2) == b'x' || peek(text, amp + 2) == b'X';
+  let from = if hex { amp + 3 } else { amp + 2 };
+  let to = scan(text, from, if hex { b"0123456789abcdefABCDEF" } else { b"0123456789" });
+  if to == from { None } else {
+    // Held at one past the last code point, so no run of digits overflows.
+    let code = fold(range(from, to), 0, |n: Int, i: Int|
+      min(n * (if hex { 16 } else { 10 }) + hex_value(bytes_at(text, i)), 0x110000));
+    Some({
+      characters: character(numbered_character(code)),
+      next: if peek(text, to) == b';' { to + 1 } else { to },
+    })
+  }
+}
+
+/// The code point a numeric reference to `code` is read as.
+fn numbered_character(code: Int) -> Int =
+  if code == 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF) { 0xFFFD }
+  else if code >= 0x80 && code <= 0x9F {
+    match at_or(windows_1252(), code - 0x80, 0) { 0 -> code, mapped -> mapped }
+  } else { code }
+
+/// What Windows-1252 has at 0x80 to 0x9F, and 0 where it has nothing.
+fn windows_1252() -> List<Int> =
   [
-    { raw: "&", written: "&amp;" },
-    { raw: "<", written: "&lt;" },
-    { raw: ">", written: "&gt;" },
-    { raw: "\"", written: "&quot;" },
-    { raw: "'", written: "&#39;" },
+    0x20AC,
+    0,
+    0x201A,
+    0x0192,
+    0x201E,
+    0x2026,
+    0x2020,
+    0x2021,
+    0x02C6,
+    0x2030,
+    0x0160,
+    0x2039,
+    0x0152,
+    0,
+    0x017D,
+    0,
+    0,
+    0x2018,
+    0x2019,
+    0x201C,
+    0x201D,
+    0x2022,
+    0x2013,
+    0x2014,
+    0x02DC,
+    0x2122,
+    0x0161,
+    0x203A,
+    0x0153,
+    0,
+    0x017E,
+    0x0178,
   ]
 
-/// The document text of `h`: its markup as it is, and its characters escaped.
-pub fn render(h: Html) -> String / {abort.raise} =
-  join(map(h.pieces, |piece: Piece| match piece { Markup(m) -> m, Chars(s) -> escape(s) }), "")
+fn character(code: Int) -> Bytes =
+  match char_of_int(code) {
+    Some(c) -> bytes_of_string(string_of_chars([c])),
+    None -> b"\xef\xbf\xbd",
+  }
 
-/// What `h` is as characters: its text as given, and its markup as its source.
-fn plain(h: Html) -> String =
-  join(map(h.pieces, |piece: Piece| match piece { Markup(m) -> m, Chars(s) -> s }), "")
+/// The longest name of the table that stands after the `&` at `amp`: the letters and digits
+/// there with the `;` after them, or else the longest start of them the table admits bare.
+fn named(text: Bytes, amp: Int, table: Names, attribute: Bool) -> Option<Read> / {abort.raise} = {
+  let from = amp + 1;
+  let to = scan(text, from, b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+  let whole = if peek(text, to) == b';' { map_get(table.named, bytes_slice(text, from, to + 1)) }
+  else { None };
+  match whole {
+    Some(characters) -> Some({ characters: characters, next: to + 1 }),
+    None -> {
+      let bare = iterate(min(to - from, table.bare), table.bare + 1, |n: Int|
+        if n < 1 { Stop(None) } else {
+          match map_get(table.named, bytes_slice(text, from, from + n)) {
+            Some(characters) -> Stop(Some({ characters: characters, next: from + n })),
+            None -> Continue(n - 1),
+          }
+        });
+      match bare {
+        None -> None,
+        Some(read) -> {
+          let after = peek(text, read.next);
+          if attribute && (after == b'=' || is_letter(after) || is_digit(after)) { None }
+          else { Some(read) }
+        },
+      }
+    },
+  }
+}
 
-// --- The literal --------------------------------------------------------------
+// --- URLs in attributes --------------------------------------------------------
 
-/// Where a hole stands: in an element's content; inside a quoted attribute value, a `title` or a
-/// `textarea`, where only characters stand; or as the whole of an attribute's value.
-pub type Place = | Content | Characters | Value
+/// What a value written into an attribute's URL comes after: nothing of the URL, so the value may
+/// open it with a scheme; some of its first part, where a scheme could still end; its path; or
+/// its `?` or `#`.
+pub type UrlPart = | Start | First | Path | Query
 
-/// A literal's markup once read: its texts as written, and where the hole after each stands. Only
-/// `compile` answers one, so `fill` never writes a hole where the markup was not read to hold it.
-pub opaque type Template = new { texts: List<String>, places: List<Place> }
+/// `value` as it is written at `part` of a URL. After a `?` or a `#` it is percent-encoded whole,
+/// one piece of the query or the fragment. Anywhere else only what no URL holds raw is encoded
+/// (RFC 3986 §2), so its own `/`, `?` and `%XX` read as they did. At `Start` and at `First` a
+/// scheme could end in the value, and the scheme it would give the URL is answered as `Err`
+/// unless `trusted`: any at `First`, and at `Start` any but `http`, `https`, `mailto` and `tel`,
+/// written in letters of either case. A value with no `:` before its first `/`, `?` or `#` gives
+/// none.
+pub fn url_value(
+  part: UrlPart,
+  value: String,
+  trusted: Bool,
+) -> Result<String, String> / {abort.raise} =
+  match part {
+    Query -> Ok(url_encode(value)),
+    Path -> Ok(raw_encoded(value)),
+    Start -> schemed(raw_encoded(value), trusted, true),
+    First -> schemed(raw_encoded(value), trusted, false),
+  }
 
-/// Why a literal's markup is refused, and at which character of which text.
-pub type Refusal = { message: String, offset: Int, part: Int }
+fn schemed(url: String, trusted: Bool, opens: Bool) -> Result<String, String> / {abort.raise} = {
+  let text = bytes_of_string(url);
+  let stop = scan_until(text, 0, b":/?#");
+  if peek(text, stop) != b':' || trusted { Ok(url) } else {
+    let scheme = bytes_slice(text, 0, stop);
+    let folded = bytes_concat_all(map(range(0, stop), |i: Int| lower(bytes_at(text, i))));
+    if opens && allowed(folded) { Ok(url) } else { Err(string_of_bytes(scheme)) }
+  }
+}
+
+/// The schemes a value may give a URL, and a literal's own text may give one a hole stands in.
+fn allowed(scheme: Bytes) -> Bool =
+  scheme == b"http" || scheme == b"https" || scheme == b"mailto" || scheme == b"tel"
+
+type Naming = { name: Bytes, open: Bool, colon: Bool }
+
+/// The scheme a browser takes `url` to have, in lower case, or `None` where it takes it to have
+/// none. It reads as the URL Standard's parser does: the blanks and controls before the URL are
+/// dropped, and a tab or a line end anywhere in it, so `java\tscript:` names `javascript`; then a
+/// scheme is a letter and the letters, digits, `+`, `-` and `.` after it, up to a `:`. What a
+/// program asks of a URL it was handed before it writes one as trusted.
+pub fn browser_scheme(url: String) -> Option<String> / {abort.raise} = {
+  let bytes = bytes_of_string(url);
+  let read = fold(
+    range(0, bytes_len(bytes)),
+    { name: b"", open: true, colon: false },
+    |s: Naming, i: Int| {
+      let c = bytes_at(bytes, i);
+      if !s.open || c == 9 || c == 10 || c == 13 || (s.name == b"" && c <= 32) { s }
+      else if c == b':' { { ..s, open: false, colon: true } }
+      else if schemes(c) { { ..s, name: bytes_concat(s.name, lower(c)) } }
+      else { { ..s, open: false } }
+    },
+  );
+  if read.colon && is_letter(peek(read.name, 0)) { Some(string_of_bytes(read.name)) } else { None }
+}
+
+/// `value` with every byte no URL holds raw as `%XX`: RFC 3986's unreserved and reserved
+/// characters stay, and a `%` before two hex digits.
+fn raw_encoded(value: String) -> String / {abort.raise} = {
+  let text = bytes_of_string(value);
+  let digit = |n: Int| bytes_slice(b"0123456789ABCDEF", n, n + 1);
+  string_of_bytes(
+    bytes_concat_all(
+      map(range(0, bytes_len(text)), |i: Int| {
+        let c = bytes_at(text, i);
+        let escaped = c == b'%' && hex_value(peek(text, i + 1)) >= 0
+          && hex_value(peek(text, i + 2)) >= 0;
+        if is_letter(c) || is_digit(c) || escaped
+            || bytes_index_of_byte(b"-._~:/?#[]@!$&'()*+,;=", c) != None { byte_of_int(c) }
+        else { bytes_concat_all([b"%", digit(c / 16), digit(c % 16)]) }
+      }),
+    ),
+  )
+}
+
+/// The attributes whose value is a URL.
+fn url_attributes() -> List<Bytes> =
+  [
+    b"href",
+    b"src",
+    b"action",
+    b"formaction",
+    b"cite",
+    b"data",
+    b"poster",
+    b"background",
+    b"manifest",
+    b"icon",
+    b"longdesc",
+    b"codebase",
+    b"classid",
+    b"archive",
+    b"profile",
+    b"usemap",
+  ]
+
+/// Whether an attribute of this name holds a URL, read past a `data-` or a namespace before it,
+/// which a script or an SVG reads the same way.
+fn links(attr: Bytes) -> Bool / {abort.raise} = {
+  let named = if bytes_starts_with(attr, b"data-") { bytes_slice(attr, 5, bytes_len(attr)) } else {
+    match bytes_index_of(attr, b":") {
+      Some(colon) -> bytes_slice(attr, colon + 1, bytes_len(attr)),
+      None -> attr,
+    }
+  };
+  contains(url_attributes(), named)
+}
+
+// --- The reader -----------------------------------------------------------------
 
 type Mode =
   | Between
@@ -90,10 +438,22 @@ type Mode =
   | Declared
   | Raw
 
+/// How much of its URL a quoted value holds so far: `Plain` in an attribute that holds none, and
+/// where the reader follows none. `Fresh` is nothing but blanks; `Word` the letters of what may be
+/// a scheme, kept in the scan's `word`; `Held` a first part some hole stands in; `Pathed` past
+/// that part and `Queried` past a `?` or a `#`. `Coded` is past a scheme no hole stands under.
+/// `Mixed` is what two readings left at different parts, none of them `Coded`, and `Barred` what
+/// they left where one was, or where a character reference stands in the first part and could
+/// spell any character of a scheme.
+type Url = | Plain | Fresh | Word | Held | Pathed | Queried | Coded | Mixed | Barred
+
 /// `word` is the name being read, in lower case; `element` the start tag's, which says how its
-/// content is read; `attr` the attribute whose value is being read; and `at` how many characters
-/// of the text are passed.
-type Scan = { mode: Mode, word: Bytes, element: Bytes, attr: Bytes, at: Int }
+/// content is read; `attr` the attribute whose value is being read; `url` how much of a URL that
+/// value holds; and `urls` whether the reader follows one.
+type Scan = { mode: Mode, word: Bytes, element: Bytes, attr: Bytes, url: Url, urls: Bool }
+
+/// A character the markup cannot hold where it stands, by its place in its text.
+type Stray = { message: String, offset: Int }
 
 fn is_space(c: Int) -> Bool = c == 32 || c == 9 || c == 10 || c == 12 || c == 13
 
@@ -140,95 +500,125 @@ fn coded(element: Bytes) -> Bool =
 fn lettered(element: Bytes) -> Bool = element == b"title" || element == b"textarea"
 
 /// A start tag closed: its element's content follows, which for some is not markup.
-fn opened(scan: Scan, part: Int, offset: Int) -> Result<Scan, Refusal> =
+fn opened(scan: Scan, offset: Int) -> Result<Scan, Stray> =
   if scan.element == b"plaintext" {
     Err({
-      message: "nothing after `<plaintext>` is markup, so no literal holds one",
+      message: "nothing after `<plaintext>` is markup, so no markup holds one",
       offset: offset,
-      part: part,
     })
   } else if coded(scan.element) || lettered(scan.element) { Ok({ ..scan, mode: Raw }) }
   else { Ok({ ..scan, mode: Between }) }
 
 /// What a `/` or a `>` does inside a start tag; `None` for any other character.
-fn tag_end(scan: Scan, c: Int, part: Int, offset: Int) -> Option<Result<Scan, Refusal>> =
+fn tag_end(scan: Scan, c: Int, offset: Int) -> Option<Result<Scan, Stray>> =
   if c == 47 { Some(Ok({ ..scan, mode: Slashed })) }
-  else if c == 62 { Some(opened(scan, part, offset)) }
+  else if c == 62 { Some(opened(scan, offset)) }
   else { None }
 
-/// The scan past the character at `i`, or why the markup cannot hold it there.
-fn step(s: Scan, text: Bytes, i: Int, part: Int) -> Result<Scan, Refusal> / {abort.raise} = {
+/// A letter, a digit, `+`, `-` or `.`: what a URL's scheme is written in.
+fn schemes(c: Int) -> Bool = is_letter(c) || is_digit(c) || c == b'+' || c == b'-' || c == b'.'
+
+/// What the first part of a URL gives way to at a character no scheme holds.
+fn past(c: Int) -> Url =
+  if c == b'?' || c == b'#' { Queried } else if c == b'&' { Barred } else { Pathed }
+
+/// How much of a URL the value of the attribute being read holds as it opens.
+fn opening(s: Scan) -> Url / {abort.raise} = if s.urls && links(s.attr) { Fresh } else { Plain }
+
+/// The scan past `c` inside a quoted value, with the URL the value holds followed.
+fn valued(s: Scan, c: Int, at: Int) -> Result<Scan, Stray> / {abort.raise} = {
+  let schemed = Err({
+    message: "a `:` here makes the value before it the URL's scheme: write the scheme out, or let one hole hold the whole URL",
+    offset: at,
+  });
+  match s.url {
+    Plain | Queried | Coded -> Ok(s),
+    Fresh -> if c <= 32 { Ok(s) }
+    else if schemes(c) { Ok({ ..s, url: Word, word: lower(c) }) }
+    else { Ok({ ..s, url: past(c) }) },
+    Word -> if c == 9 || c == 10 || c == 13 { Ok(s) }
+    else if schemes(c) { Ok({ ..s, word: bytes_concat(s.word, lower(c)) }) }
+    else if c == b':' { Ok({ ..s, url: if allowed(s.word) { Pathed } else { Coded } }) }
+    else { Ok({ ..s, url: past(c) }) },
+    Held -> if c == b':' { schemed }
+    else if c == b'/' || c == b'\\' || c == b'?' || c == b'#' || c == b'&' {
+      Ok({ ..s, url: past(c) })
+    } else { Ok(s) },
+    Pathed -> if c == b'?' || c == b'#' { Ok({ ..s, url: Queried }) } else { Ok(s) },
+    Mixed -> if c == b':' { schemed }
+    else if c == b'?' || c == b'#' { Ok({ ..s, url: Queried }) }
+    else { Ok(s) },
+    Barred -> if c == b':' { schemed } else { Ok(s) },
+  }
+}
+
+/// The scan past the character at `i`, the `at`th of its text, or why the markup cannot hold it
+/// there.
+fn step(s: Scan, text: Bytes, i: Int, at: Int) -> Result<Scan, Stray> / {abort.raise} = {
   let c = bytes_at(text, i);
-  let on: Scan = { ..s, at: if c & 192 == 128 { s.at } else { s.at + 1 } };
-  let to = |mode: Mode| Ok({ ..on, mode: mode });
-  let no = |message: String| Err({ message: message, offset: s.at, part: part });
-  let ended = |scan: Scan| tag_end(scan, c, part, s.at);
+  let to = |mode: Mode| Ok({ ..s, mode: mode });
+  let no = |message: String| Err({ message: message, offset: at });
+  let ended = |scan: Scan| tag_end(scan, c, at);
   let reference = "an `&` begins a character reference: write `&amp;` for the character";
   match s.mode {
     Between -> if c == 60 { to(Opened) }
     else if c == 38 && !refers(text, i + 1) { no(reference) }
-    else { Ok(on) },
-    Opened -> if is_letter(c) { Ok({ ..on, mode: Named, word: lower(c) }) }
+    else { Ok(s) },
+    Opened -> if is_letter(c) { Ok({ ..s, mode: Named, word: lower(c) }) }
     else if c == 47 { to(Closing) }
-    else if c == 33 { Ok({ ..on, mode: Banged, word: b"" }) } else {
-      Err({
-        message: "a `<` opens a tag: write `&lt;` for the character",
-        offset: s.at - 1,
-        part: part,
-      })
-    },
+    else if c == 33 { Ok({ ..s, mode: Banged, word: b"" }) }
+    else { Err({ message: "a `<` opens a tag: write `&lt;` for the character", offset: at - 1 }) },
     Closing -> if is_letter(c) { to(EndNamed) } else { no("an end tag is `</` and a name") },
-    Named -> if names_tag(c) { Ok({ ..on, word: bytes_concat(s.word, lower(c)) }) } else {
-      let named: Scan = { ..on, element: s.word };
+    Named -> if names_tag(c) { Ok({ ..s, word: bytes_concat(s.word, lower(c)) }) } else {
+      let named: Scan = { ..s, element: s.word };
       match ended(named) {
         Some(end) -> end,
         None -> if is_space(c) { Ok({ ..named, mode: Inside }) }
         else { no("a tag's name is letters, digits and `-`") },
       }
     },
-    Inside -> match ended(on) {
+    Inside -> match ended(s) {
       Some(end) -> end,
-      None -> if is_space(c) { Ok(on) }
+      None -> if is_space(c) { Ok(s) }
       else if breaks(c) { no("an attribute begins with its name") }
-      else { Ok({ ..on, mode: AttrNamed, word: lower(c) }) },
+      else { Ok({ ..s, mode: AttrNamed, word: lower(c) }) },
     },
-    AttrNamed -> match ended(on) {
+    AttrNamed -> match ended(s) {
       Some(end) -> end,
-      None -> if is_space(c) { Ok({ ..on, mode: AfterAttr, attr: s.word }) }
-      else if c == 61 { Ok({ ..on, mode: Valued, attr: s.word }) }
+      None -> if is_space(c) { Ok({ ..s, mode: AfterAttr, attr: s.word }) }
+      else if c == 61 { Ok({ ..s, mode: Valued, attr: s.word }) }
       else if breaks(c) { no("an attribute's name holds no quote and no `<`") }
-      else { Ok({ ..on, word: bytes_concat(s.word, lower(c)) }) },
+      else { Ok({ ..s, word: bytes_concat(s.word, lower(c)) }) },
     },
-    AfterAttr -> match ended(on) {
+    AfterAttr -> match ended(s) {
       Some(end) -> end,
-      None -> if is_space(c) { Ok(on) }
+      None -> if is_space(c) { Ok(s) }
       else if c == 61 { to(Valued) }
       else if breaks(c) { no("an attribute begins with its name") }
-      else { Ok({ ..on, mode: AttrNamed, word: lower(c) }) },
+      else { Ok({ ..s, mode: AttrNamed, word: lower(c) }) },
     },
-    Valued -> if is_space(c) { Ok(on) }
-    else if c == 34 || c == 39 { to(Quoted(c)) }
+    Valued -> if is_space(c) { Ok(s) }
+    else if c == 34 || c == 39 { Ok({ ..s, mode: Quoted(c), word: b"", url: opening(s) }) }
     else if c == 62 { no("an attribute's value is missing") }
     else if breaks(c) { no("an unquoted value holds no quote, `<`, `=` or backtick") }
     else { to(Bare) },
     Quoted(quote) -> if c == quote { to(AfterValue) }
     else if c == 38 && !refers(text, i + 1) { no(reference) }
-    else { Ok(on) },
-    Bare -> if c == 62 { opened(on, part, s.at) }
+    else { valued(s, c, at) },
+    Bare -> if c == 62 { opened(s, at) }
     else if is_space(c) { to(Inside) }
     else if breaks(c) { no("an unquoted value holds no quote, `<`, `=` or backtick") }
-    else { Ok(on) },
-    AfterValue -> match ended(on) {
+    else { Ok(s) },
+    AfterValue -> match ended(s) {
       Some(end) -> end,
       None -> if is_space(c) { to(Inside) } else { no("a space goes between attributes") },
     },
-    Slashed -> if c == 62 { opened(on, part, s.at) }
-    else { no("a `/` in a tag is followed by `>`") },
-    EndNamed -> if names_tag(c) { Ok(on) }
+    Slashed -> if c == 62 { opened(s, at) } else { no("a `/` in a tag is followed by `>`") },
+    EndNamed -> if names_tag(c) { Ok(s) }
     else if is_space(c) { to(EndTail) }
     else if c == 62 { to(Between) }
     else { no("a tag's name is letters, digits and `-`") },
-    EndTail -> if is_space(c) { Ok(on) }
+    EndTail -> if is_space(c) { Ok(s) }
     else if c == 62 { to(Between) }
     else { no("an end tag holds only its name") },
     Banged -> {
@@ -236,7 +626,7 @@ fn step(s: Scan, text: Bytes, i: Int, part: Int) -> Result<Scan, Refusal> / {abo
       if word == b"--" { to(Commented(0)) }
       else if word == b"doctype" { to(Declared) }
       else if bytes_starts_with(b"--", word) || bytes_starts_with(b"doctype", word) {
-        Ok({ ..on, word: word })
+        Ok({ ..s, word: word })
       } else { no("`<!` opens a comment or a doctype") }
     },
     Commented(dashes) -> if c == 45 { to(Commented(min(dashes + 1, 2))) }
@@ -244,30 +634,75 @@ fn step(s: Scan, text: Bytes, i: Int, part: Int) -> Result<Scan, Refusal> / {abo
     else { to(Commented(0)) },
     Declared -> if c == 62 { to(Between) }
     else if c == 60 { no("a doctype ends with `>`") }
-    else { Ok(on) },
-    Raw -> if c == 60 && closes(text, i, s.element) { to(Opened) } else { Ok(on) },
+    else { Ok(s) },
+    Raw -> if c == 60 && closes(text, i, s.element) { to(Opened) } else { Ok(s) },
+  }
+}
+
+type Passing = { scan: Scan, at: Int }
+
+/// The scan past all of `text`, or the first character the markup cannot hold where it stands.
+fn passed(from: Scan, text: Bytes) -> Result<Scan, Stray> / {abort.raise} = {
+  let read = fold(
+    range(0, bytes_len(text)),
+    Ok({ scan: from, at: 0 }),
+    |passing: Result<Passing, Stray>, i: Int|
+      match passing {
+        Err(_) -> passing,
+        Ok(p) -> match step(p.scan, text, i, p.at) {
+          Err(stray) -> Err(stray),
+          Ok(scan) ->
+            Ok({ scan: scan, at: if bytes_at(text, i) & 192 == 128 { p.at } else { p.at + 1 } }),
+        },
+      },
+  );
+  match read { Err(stray) -> Err(stray), Ok(p) -> Ok(p.scan) }
+}
+
+/// A hole as the scan before it reads it, and the scan past it.
+type Stand = { place: Place, url: Option<UrlPart>, scan: Scan }
+
+/// A hole in an attribute's value, which holds `url` of a URL so far.
+fn in_value(url: Url, place: Place, after: Scan) -> Result<Stand, String> / {abort.raise} = {
+  let at = |part: UrlPart, next: Url|
+    Ok({ place: place, url: Some(part), scan: { ..after, url: next } });
+  match url {
+    Plain -> Ok({ place: place, url: None, scan: after }),
+    Fresh -> at(Start, Held),
+    Word | Held -> at(First, Held),
+    Pathed -> at(Path, Pathed),
+    Queried -> at(Query, Queried),
+    Coded ->
+      Err(
+        "a hole stands in a URL with no scheme, or with `http`, `https`, `mailto` or `tel`: this one's is `"
+          ++ string_of_bytes(after.word)
+          ++ "`",
+      ),
+    Mixed -> Err("the markup before this hole leaves its URL at more than one part"),
+    Barred ->
+      Err(
+        "the markup before this hole leaves its URL's scheme unsettled: one way here wrote a scheme no hole stands under, or a character reference where a scheme is read",
+      ),
   }
 }
 
 /// Where a hole stands after the text the scan has passed, and the scan past the hole.
-fn held(scan: Scan, part: Int) -> Result<{ place: Place, scan: Scan }, Refusal> / {abort.raise} = {
-  let no = |message: String| Err({ message: message, offset: scan.at, part: part });
+fn stood(scan: Scan) -> Result<Stand, String> / {abort.raise} = {
   let scripted = bytes_starts_with(scan.attr, b"on") || scan.attr == b"style"
     || scan.attr == b"srcdoc";
   let attribute = "a hole in `" ++ string_of_bytes(scan.attr)
     ++ "` would be read as code, which no escaping makes text";
   match scan.mode {
-    Between -> Ok({ place: Content, scan: scan }),
-    Quoted(_) -> if scripted { no(attribute) } else { Ok({ place: Characters, scan: scan }) },
-    Valued -> if scripted { no(attribute) }
-    else { Ok({ place: Value, scan: { ..scan, mode: AfterValue } }) },
-    Raw -> if lettered(scan.element) { Ok({ place: Characters, scan: scan }) }
-    else { no("a hole in `<" ++ string_of_bytes(scan.element) ++ ">` would be read as its code") },
-    Bare -> no("quote the value: a hole stands inside its quotes, or as the whole of it"),
-    Banged -> no("a comment holds no hole"),
-    Commented(_) -> no("a comment holds no hole"),
-    Declared -> no("a doctype holds no hole"),
-    _ -> no("a hole stands in an element's content or in an attribute's value"),
+    Between -> Ok({ place: Content, url: None, scan: scan }),
+    Quoted(_) -> if scripted { Err(attribute) } else { in_value(scan.url, Characters, scan) },
+    Valued -> if scripted { Err(attribute) }
+    else { in_value(opening(scan), Value, { ..scan, mode: AfterValue }) },
+    Raw -> if lettered(scan.element) { Ok({ place: Characters, url: None, scan: scan }) }
+    else { Err("a hole in `<" ++ string_of_bytes(scan.element) ++ ">` would be read as its code") },
+    Bare -> Err("quote the value: a hole stands inside its quotes, or as the whole of it"),
+    Banged | Commented(_) -> Err("a comment holds no hole"),
+    Declared -> Err("a doctype holds no hole"),
+    _ -> Err("a hole stands in an element's content or in an attribute's value"),
   }
 }
 
@@ -275,14 +710,144 @@ fn held(scan: Scan, part: Int) -> Result<{ place: Place, scan: Scan }, Refusal> 
 fn unclosed(scan: Scan) -> Option<String> / {abort.raise} =
   match scan.mode {
     Between -> None,
-    Raw -> Some("`<" ++ string_of_bytes(scan.element) ++ ">` is not closed in this literal"),
+    Raw -> Some("`<" ++ string_of_bytes(scan.element) ++ ">` is not closed"),
     Quoted(_) -> Some("an attribute's value is not closed"),
-    Banged -> Some("a comment is not closed"),
-    Commented(_) -> Some("a comment is not closed"),
+    Banged | Commented(_) -> Some("a comment is not closed"),
     _ -> Some("a tag is not closed"),
   }
 
-type Reading = { scan: Scan, places: List<Place> }
+/// A scan with what no later character reads set aside, and a tag's gaps told apart only by
+/// whether a space has been passed: after a name or a value a space must come before the next
+/// attribute, and after a space an attribute may.
+fn level(s: Scan) -> Scan = {
+  let cleared: Scan = { ..s, word: b"", attr: b"", url: Plain };
+  match s.mode {
+    Between -> { ..cleared, element: b"" },
+    Named -> { ..cleared, mode: AfterValue, element: s.word },
+    AttrNamed | AfterValue -> { ..cleared, mode: AfterValue },
+    AfterAttr | Inside -> { ..cleared, mode: Inside },
+    Raw -> cleared,
+    Quoted(_) -> match s.url { Word | Coded -> s, _ -> { ..s, word: b"" } },
+    _ -> s,
+  }
+}
+
+// --- Markup read at run time ----------------------------------------------------
+
+/// Where a reader of markup stands after the text it has passed: in an element's content, in a
+/// tag, in an attribute's value, in a comment.
+pub opaque type Context = | Context(Scan)
+
+fn scan_of(c: Context) -> Scan = match c { Context(scan) -> scan }
+
+/// Where a reader starts: in an element's content. With `urls` it follows the URL of each
+/// attribute that holds one, so `hole` says how much of it stands before a hole, and refuses a
+/// hole under a scheme other than `url_value` allows and a `:` that would make a hole's value
+/// the scheme. Without, it reads as the literal does, and what a URL names is not judged.
+pub fn reader(urls: Bool) -> Context =
+  Context({ mode: Between, word: b"", element: b"", attr: b"", url: Plain, urls: urls })
+
+/// A text read as markup from one place to another. Only `run` answers one, so its text is markup
+/// the reader passed whole from where it says.
+pub opaque type Run = new { markup: String, from: Context, to: Context }
+
+/// `text` read as markup from `from`, or the first character the markup cannot hold where it
+/// stands, by its place in `text`.
+pub fn run(
+  from: Context,
+  text: String,
+) -> Result<Run, { message: String, offset: Int }> / {abort.raise} =
+  match passed(scan_of(from), bytes_of_string(text)) {
+    Err(stray) -> Err(stray),
+    Ok(to) -> Ok({ markup: text, from: from, to: Context(to) }),
+  }
+
+/// A hole where the reader stood at `from`: how its value is written; how much of a URL stands
+/// before it, where the reader follows one and the hole's attribute holds one; and where the
+/// reader stands past it.
+pub opaque type Hole = new { place: Place, url: Option<UrlPart>, from: Context, to: Context }
+
+/// The hole a value may stand in at `at`, or why none stands there.
+pub fn hole(at: Context) -> Result<Hole, String> / {abort.raise} =
+  match stood(scan_of(at)) {
+    Err(message) -> Err(message),
+    Ok(stand) -> Ok({ place: stand.place, url: stand.url, from: at, to: Context(stand.scan) }),
+  }
+
+/// What markup that ends at `at` lacks, if anything: `None` in an element's content.
+pub fn unfinished(at: Context) -> Option<String> / {abort.raise} = unclosed(scan_of(at))
+
+/// Where a reader stands that may have come to either place: every text it reads from there it
+/// reads alike from `a` and from `b`, and a hole there stands in both as it does there. `None`
+/// where no one place is both, as the content of an element and the inside of a tag are not.
+/// Inside a tag it is past a space only if both are, and in an attribute's URL the part is one
+/// no hole stands at unless both hold as much, until a `?` or a `#` puts both in its query.
+pub fn joined(a: Context, b: Context) -> Option<Context> = {
+  let x = level(scan_of(a));
+  let y = level(scan_of(b));
+  let gap = |s: Scan| s.mode == AfterValue || s.mode == Inside;
+  let tight = |s: Scan| { ..s, mode: AfterValue };
+  let barred = |s: Scan| s.url == Coded || s.url == Barred;
+  let mixed = |s: Scan|
+    { ..s, word: b"", url: if barred(x) || barred(y) { Barred } else { Mixed } };
+  if x == y { Some(Context(x)) }
+  else if gap(x) && gap(y) && tight(x) == tight(y) { Some(Context(tight(x))) }
+  else if x.url != Plain && mixed(x) == mixed(y) { Some(Context(mixed(x))) }
+  else { None }
+}
+
+/// Whether what was read from `from` reads the same after `at`: `from` is `at`, or a place
+/// `joined` answered for it and another. A place that only levels to one `joined` answers is
+/// not enough: a tag's name being read takes letters that the same tag past an attribute does
+/// not.
+fn follows(at: Context, from: Context) -> Bool = at == from || joined(at, from) == Some(from)
+
+/// A fragment being written: its pieces so far, and where a reader of them stands.
+pub opaque type Draft = new { pieces: List<Piece>, at: Context }
+
+/// A draft with nothing written, where `reader(urls)` starts.
+pub fn draft(urls: Bool) -> Draft = { pieces: [], at: reader(urls) }
+
+/// The draft with `r` written after it, or `None` where `r` was not read from where the draft
+/// stands.
+pub fn write(d: Draft, r: Run) -> Option<Draft> =
+  if follows(d.at, r.from) { Some({ pieces: push(d.pieces, Markup(r.markup)), at: r.to }) }
+  else { None }
+
+/// The draft with `value` in `h` after it, written as the hole's place reads it, or `None` where
+/// `h` is no hole of the place the draft stands at.
+pub fn place(d: Draft, h: Hole, value: Html) -> Option<Draft> =
+  if follows(d.at, h.from) { Some({ pieces: concat(d.pieces, placed(h.place, value)), at: h.to }) }
+  else { None }
+
+/// The fragment a draft is, or `None` where it does not stand in an element's content: in a tag,
+/// a value or a comment left open.
+pub fn finish(d: Draft) -> Option<Html> =
+  if scan_of(d.at).mode == Between { Some({ pieces: d.pieces }) } else { None }
+
+// --- The literal --------------------------------------------------------------
+
+/// Where a hole stands: in an element's content; inside a quoted attribute value, a `title` or a
+/// `textarea`, where only characters stand; or as the whole of an attribute's value.
+pub type Place = | Content | Characters | Value
+
+/// A literal's markup once read: its texts as written, and where the hole after each stands. Only
+/// `compile` answers one, so `fill` never writes a hole where the markup was not read to hold it.
+pub opaque type Template = new { texts: List<String>, places: List<Place> }
+
+/// Why a literal's markup is refused, and at which character of which text.
+pub type Refusal = { message: String, offset: Int, part: Int }
+
+/// What a hole's value is written as where it stands: markup in content, characters in an
+/// attribute's quotes, and a quoted value where it is the whole of one.
+fn placed(place: Place, value: Html) -> List<Piece> =
+  match place {
+    Content -> value.pieces,
+    Characters -> [Chars(plain(value))],
+    Value -> [Markup("\""), Chars(plain(value)), Markup("\"")],
+  }
+
+type Compiling = { scan: Scan, places: List<Place> }
 
 /// What an `html"..."` literal with holes is checked by: the texts around its holes read as
 /// markup, or the first character, hole or end the markup cannot have where it stands. A refusal
@@ -291,28 +856,24 @@ pub fn compile(parts: List<String>) -> Result<Template, Refusal> / {abort.raise}
   let last = len(parts) - 1;
   let read = fold(
     range(0, len(parts)),
-    Ok({ scan: { mode: Between, word: b"", element: b"", attr: b"", at: 0 }, places: [] }),
-    |acc: Result<Reading, Refusal>, part: Int|
+    Ok({ scan: scan_of(reader(false)), places: [] }),
+    |acc: Result<Compiling, Refusal>, part: Int|
       match acc {
         Err(_) -> acc,
         Ok(r) -> {
-          let text = bytes_of_string(at_or(parts, part, ""));
-          let passed = fold(
-            range(0, bytes_len(text)),
-            Ok({ ..r.scan, at: 0 }),
-            |s: Result<Scan, Refusal>, i: Int|
-              match s { Err(_) -> s, Ok(scan) -> step(scan, text, i, part) },
-          );
-          match passed {
-            Err(refused) -> Err(refused),
+          let text = at_or(parts, part, "");
+          let ends = |message: String|
+            Err({ message: message, offset: string_len(text), part: part });
+          match passed(r.scan, bytes_of_string(text)) {
+            Err(stray) -> Err({ message: stray.message, offset: stray.offset, part: part }),
             Ok(scan) -> if part < last {
-              match held(scan, part) {
-                Err(refused) -> Err(refused),
-                Ok(h) -> Ok({ scan: h.scan, places: push(r.places, h.place) }),
+              match stood(scan) {
+                Err(message) -> ends(message),
+                Ok(stand) -> Ok({ scan: stand.scan, places: push(r.places, stand.place) }),
               }
             } else {
               match unclosed(scan) {
-                Some(message) -> Err({ message: message, offset: scan.at, part: part }),
+                Some(message) -> ends(message),
                 None -> Ok({ scan: scan, places: r.places }),
               }
             },
@@ -330,12 +891,9 @@ pub fn fill(t: Template, holes: List<Html>) -> Html =
   {
     pieces: fold(range(0, len(t.texts)), [], |out: List<Piece>, i: Int| {
       let written = push(out, Markup(at_or(t.texts, i, "")));
-      let hole = match list_at(holes, i) { Some(h) -> h, None -> fragment([]) };
       match list_at(t.places, i) {
         None -> written,
-        Some(Content) -> concat(written, hole.pieces),
-        Some(Characters) -> push(written, Chars(plain(hole))),
-        Some(Value) -> push(push(push(written, Markup("\"")), Chars(plain(hole))), Markup("\"")),
+        Some(place) -> concat(written, placed(place, at_or(holes, i, fragment([])))),
       }
     }),
   }
@@ -346,6 +904,63 @@ pub fn literal(text: String) -> Result<Html, { message: String, offset: Int }> /
     Ok(t) -> Ok(fill(t, [])),
     Err(refused) -> Err({ message: refused.message, offset: refused.offset }),
   }
+
+// --- Sampling -------------------------------------------------------------------
+
+/// A text made of what markup, a URL and a character reference are written in, for a claim about
+/// escaping to be sampled over: `forall (h: Hostile)` draws quotes, angle brackets, ampersands,
+/// schemes and the names of references far more often than a `String` does.
+pub type Hostile = | Hostile(String)
+
+gen for Hostile by hostile
+
+fn hostile() -> Gen<Hostile> =
+  gen::map(gen::list_of(gen::elements(hostile_parts()), 12), |parts: List<String>|
+    Hostile(join(parts, "")))
+
+fn hostile_parts() -> List<String> =
+  [
+    "a",
+    "<",
+    ">",
+    "&",
+    "\"",
+    "'",
+    " ",
+    "=",
+    "/",
+    ":",
+    ";",
+    "?",
+    "#",
+    "%",
+    "`",
+    "\\",
+    "-",
+    "!",
+    "x",
+    "0",
+    "amp",
+    "lt",
+    "not",
+    "#38",
+    "#x3c",
+    "script",
+    "javascript",
+    "http",
+    "data",
+    "onclick",
+    "%0A",
+    "{{",
+    "}}",
+    "\t",
+    "\n",
+    "\u{e9}",
+    "\u{0}",
+  ]
+
+/// The text a `Hostile` holds.
+pub fn hostile_text(h: Hostile) -> String = match h { Hostile(s) -> s }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -413,7 +1028,10 @@ test "a hole stands in content, in an attribute's value, and nowhere a value wou
   assert_eq(refused(["<a OnClick=", ">"]), Some({ offset: 11, part: 0 }));
   assert_eq(refused(["<p style='color: ", "'>"]), Some({ offset: 17, part: 0 }));
   assert_eq(refused(["<iframe srcdoc=", "></iframe>"]), Some({ offset: 15, part: 0 }));
-  assert_eq(refused(["<textarea>", "</textarea><script>x</script>"]), None)
+  assert_eq(refused(["<textarea>", "</textarea><script>x</script>"]), None);
+  // The literal judges no URL: its reader follows none.
+  assert_eq(refused(["<a href='javascript:go(", ")'>x</a>"]), None);
+  assert_eq(refused(["<a href='", "://", "'>x</a>"]), None)
 }
 
 test "markup that is not well formed is refused at the character that makes it so" {
@@ -438,15 +1056,462 @@ test "markup that is not well formed is refused at the character that makes it s
     Err({ message: "an attribute's value is not closed", offset: 11 }),
   );
   assert_eq(literal("<!-- a"), Err({ message: "a comment is not closed", offset: 6 }));
-  assert_eq(
-    literal("<script>x"),
-    Err({ message: "`<script>` is not closed in this literal", offset: 9 }),
-  );
+  assert_eq(literal("<script>x"), Err({ message: "`<script>` is not closed", offset: 9 }));
   assert_eq(refused(["<plaintext>"]), Some({ offset: 10, part: 0 }));
   assert_eq(refused(["<!DOCTYPE html><p>a</p ><br />"]), None)
 }
 
 test "a literal with no hole is its text as markup" {
-  assert_eq(match literal("<br>") { Ok(h) -> render(h), Err(refused) -> refused.message }, "<br>");
-  assert_eq(escape("a & <b> \"c\" 'd'"), "a &amp; &lt;b&gt; &quot;c&quot; &#39;d&#39;")
+  assert_eq(match literal("<br>") { Ok(h) -> render(h), Err(refused) -> refused.message }, "<br>")
+}
+
+test "each escape writes the references its place needs, and no other" {
+  let s = "a & <b> \"c\" 'd'";
+  assert_eq(escape(s), "a &amp; &lt;b&gt; &quot;c&quot; &#39;d&#39;");
+  assert_eq(escape_text(s), "a &amp; &lt;b&gt; \"c\" 'd'");
+  assert_eq(escape_attribute(s), "a &amp; &lt;b&gt; &quot;c&quot; 'd'");
+  assert_eq(escape("&amp;"), "&amp;amp;");
+  assert_eq(escape(""), "")
+}
+
+/// A text, what it is read as in an element's content, and what it is read as in an attribute.
+type Referring = { text: String, content: String, value: String }
+
+fn alike(text: String, read: String) -> Referring = { text: text, content: read, value: read }
+
+/// The standard's own examples of a name without its `;` (§13.2.5.73), and a case for each rule
+/// of its states for a reference.
+fn referrings() -> List<Referring> =
+  [
+    {
+      text: "I'm &notit; I tell you",
+      content: "I'm \u{ac}it; I tell you",
+      value: "I'm &notit; I tell you",
+    },
+    alike("I'm &notin; I tell you", "I'm \u{2209} I tell you"),
+    alike("&lt;p&gt; &amp; &quot;q&quot; &apos;", "<p> & \"q\" '"),
+    alike("&amp;lt;", "&lt;"),
+    alike("&amp", "&"),
+    alike("&amp &amp. &amp; &amp<", "& &. & &<"),
+    { text: "&ampx", content: "&x", value: "&ampx" },
+    { text: "&amp=1", content: "&=1", value: "&amp=1" },
+    { text: "&copy2024", content: "\u{a9}2024", value: "&copy2024" },
+    { text: "?a=1&not=2&lt=3", content: "?a=1\u{ac}=2<=3", value: "?a=1&not=2&lt=3" },
+    alike("&copy 2024", "\u{a9} 2024"),
+    alike("&AMP; &LT &GT; &QUOT", "& < > \""),
+    alike("&Amp; &unknown; &a; &;", "&Amp; &unknown; &a; &;"),
+    alike("&notin; &notindot; &notinE;", "\u{2209} \u{22f5}\u{338} \u{22f9}\u{338}"),
+    alike("&NotEqualTilde; &fjlig;", "\u{2242}\u{338} fj"),
+    alike("&CounterClockwiseContourIntegral;", "\u{2233}"),
+    alike("&CounterClockwiseContourIntegralx;", "&CounterClockwiseContourIntegralx;"),
+    alike("&#65;&#x42;&#X43;&#x6a;&#x6A;", "ABCjj"),
+    alike("&#65 &#x42 &#65", "A B A"),
+    alike("&#x41g &#65a", "Ag Aa"),
+    alike("&#; &#x; &#xg; &#a; &# &#x", "&#; &#x; &#xg; &#a; &# &#x"),
+    alike("&#0; &#x0; &#00", "\u{fffd} \u{fffd} \u{fffd}"),
+    alike("&#xD800; &#xDFFF; &#55296;", "\u{fffd} \u{fffd} \u{fffd}"),
+    alike("&#x110000; &#1114112; &#99999999999999999999999999;", "\u{fffd} \u{fffd} \u{fffd}"),
+    alike("&#x10FFFF; &#xFFFF; &#xFDD0;", "\u{10ffff} \u{ffff} \u{fdd0}"),
+    alike("&#x80; &#x82; &#x8C; &#x9F; &#150;", "\u{20ac} \u{201a} \u{152} \u{178} \u{2013}"),
+    alike("&#x81; &#x8D; &#x8F; &#x90; &#x9D;", "\u{81} \u{8d} \u{8f} \u{90} \u{9d}"),
+    alike("&#x7F; &#xA0; &#x1; &#xD;", "\u{7f} \u{a0} \u{1} \r"),
+    alike("& && &&amp; a&b", "& && && a&b"),
+    alike("caf\u{e9} &eacute; \u{1F600} &#x1F600;", "caf\u{e9} \u{e9} \u{1F600} \u{1F600}"),
+    alike("", ""),
+  ]
+
+test "`{c.text}` is read as the standard reads it" for c: Referring in referrings() {
+  assert_eq(unescape(c.text), c.content);
+  assert_eq(unescape_attribute(c.text), c.value)
+}
+
+fn code_points(entry: Json) -> String / {abort.raise} =
+  match json::get(entry, "codepoints") {
+    Some(json::Array(points)) ->
+      string_of_bytes(
+        bytes_concat_all(
+          map(points, |point: Json|
+            match point {
+              json::Number(n) -> match int_of_decimal(n, Down) {
+                Some(code) -> character(code),
+                None -> panic("a code point past an `Int`"),
+              },
+              _ -> panic("a code point that is no number"),
+            }),
+        ),
+      ),
+    _ -> panic("an entry with no code points"),
+  }
+
+test "every name of the standard's table is read as the code points the table gives it" {
+  let published = match json::parse(embed("html/entities.json")) {
+    Ok(json::Object(entries)) -> entries,
+    _ -> panic("the table is no JSON object"),
+  };
+  assert_eq(map_len(published), 2231);
+  assert_eq(map_len(names().named), 2231);
+  assert_eq(names().bare, 6);
+  map_fold(published, (), |u: Unit, name: String, entry: Json| {
+    let points = code_points(entry);
+    assert_eq(unescape(name), points);
+    assert_eq(unescape(name ++ " "), points ++ " ");
+    if string_ends_with(name, ";") { assert_eq(unescape_attribute(name ++ "x=1"), points ++ "x=1") }
+    else {
+      assert(map_contains(published, name ++ ";"), Some(name));
+      assert_eq(unescape_attribute(name ++ "=1"), name ++ "=1");
+      assert_eq(unescape_attribute(name ++ "/"), points ++ "/")
+    }
+  })
+}
+
+test "the notice of the table names who made it and the licences it is passed on under" {
+  assert(string_contains(license(), "Copyright © WHATWG (Apple, Google, Mozilla, Microsoft)"));
+  assert(string_contains(license(), "https://creativecommons.org/licenses/by/4.0/legalcode"));
+  assert(string_contains(license(), "BSD 3-Clause License"));
+  assert(string_contains(license(), "https://html.spec.whatwg.org/entities.json"))
+}
+
+law "a text reads back from its escape" =
+  inverse(|h: Hostile| escape(hostile_text(h)), |s: String| Hostile(unescape(s)))
+
+law "a text reads back from its escape as content" =
+  inverse(|h: Hostile| escape_text(hostile_text(h)), |s: String| Hostile(unescape(s)))
+
+law "a value reads back from its escape as an attribute's" =
+  inverse(|h: Hostile| escape_attribute(hostile_text(h)), |s: String|
+    Hostile(unescape_attribute(s)))
+
+law "a value reads back from the escape that is text anywhere" =
+  inverse(|h: Hostile| escape(hostile_text(h)), |s: String| Hostile(unescape_attribute(s)))
+
+law "any text reads back from its escape" = inverse(escape, unescape)
+
+fn without_ampersands(h: Hostile) -> String / {abort.raise} = replace(hostile_text(h), "&", "")
+
+law "a text with no `&` is what it unescapes to" =
+  agrees(|h: Hostile| unescape(without_ampersands(h)), without_ampersands)
+
+law "unescaping a text with no `&` a second time changes nothing" =
+  idempotent(|s: String| unescape(replace(s, "&", "")))
+
+law "an escape holds no character that opens a tag or closes a value"
+  forall (h: Hostile) {
+    let content = escape_text(hostile_text(h));
+    let value = escape_attribute(hostile_text(h));
+    let anywhere = escape(hostile_text(h));
+    !string_contains(content, "<") && !string_contains(value, "<") && !string_contains(value, "\"")
+      && !string_contains(anywhere, "\"")
+      && !string_contains(anywhere, "'")
+      && !string_contains(anywhere, "<")
+  }
+
+law "a fragment reads back from what reflect shows of it" =
+  round_trip(|h: Html| reflect(h), reflected)
+
+test "only what reflect shows of a fragment is one" {
+  let page = fill(match compile(["<b>", "</b>"]) { Ok(t) -> t, Err(_) -> panic("refused") }, [
+    text("a < b"),
+  ]);
+  assert_eq(reflected(reflect(page)), Some(page));
+  assert_eq(reflected(reflect(fragment([]))), Some(fragment([])));
+  assert_eq(reflected(reflect("<b>")), None);
+  assert_eq(reflected(reflect({ pieces: ["<b>"] })), None);
+  assert_eq(reflected(reflect(#{"pieces": [Markup("<b>")]})), None);
+  assert_eq(reflected(reflect({ pieces: [Markup("<b>")], more: 1 })), None)
+}
+
+// --- Tests of the reader ----------------------------------------------------
+
+/// The hole after `text`, read from the start with URLs followed: the part of a URL before it,
+/// or why no hole stands there.
+fn url_hole(text: String) -> Result<Option<UrlPart>, String> / {abort.raise} =
+  match run(reader(true), text) {
+    Err(stray) -> Err(stray.message),
+    Ok(r) -> match hole(r.to) { Err(message) -> Err(message), Ok(h) -> Ok(h.url) },
+  }
+
+type UrlHole = { markup: String, part: Option<UrlPart> }
+
+fn url_holes() -> List<UrlHole> =
+  [
+    { markup: "<a href=\"", part: Some(Start) },
+    { markup: "<a href='  ", part: Some(Start) },
+    { markup: "<a href=", part: Some(Start) },
+    { markup: "<a HREF = \"", part: Some(Start) },
+    { markup: "<a href=\"page-", part: Some(First) },
+    { markup: "<a href=\"x", part: Some(First) },
+    { markup: "<a href=\"/users/", part: Some(Path) },
+    { markup: "<a href=\"./", part: Some(Path) },
+    { markup: "<a href=\"https://example.com/", part: Some(Path) },
+    { markup: "<a href=\"HTTPS://", part: Some(Path) },
+    { markup: "<a href=\"mailto:", part: Some(Path) },
+    { markup: "<a href=\"tel:", part: Some(Path) },
+    { markup: "<a href=\"/search?q=", part: Some(Query) },
+    { markup: "<a href=\"?", part: Some(Query) },
+    { markup: "<a href=\"#", part: Some(Query) },
+    { markup: "<a href=\"/a?b=1&amp;c=", part: Some(Query) },
+    { markup: "<a href=\"/a#top-", part: Some(Query) },
+    { markup: "<img src=\"", part: Some(Start) },
+    { markup: "<form action=\"", part: Some(Start) },
+    { markup: "<button formaction=\"", part: Some(Start) },
+    { markup: "<div data-href=\"", part: Some(Start) },
+    { markup: "<use xlink:href=\"", part: Some(Start) },
+    { markup: "<a title=\"", part: None },
+    { markup: "<a class=\"a b ", part: None },
+    { markup: "<a hreflang=\"", part: None },
+    { markup: "<p>", part: None },
+    { markup: "<title>", part: None },
+  ]
+
+test "a hole after `{c.markup}` stands at its part of a URL" for c: UrlHole in url_holes() {
+  assert_eq(url_hole(c.markup), Ok(c.part))
+}
+
+fn no_url_hole() -> List<String> =
+  [
+    "<a href=\"javascript:",
+    "<a href=\"JavaScript:go(",
+    "<a href=\" java\tscript:",
+    "<a href=\"data:text/html,",
+    "<a href=\"vbscript:",
+    "<a href=\"ftp://",
+    "<a href=\"&#106;avascript:",
+    "<a href=\"x&amp;",
+    "<a href=\"javascript&#58;?x=",
+  ]
+
+test "no hole stands in a URL after `{c}`" for c: String in no_url_hole() {
+  assert(match url_hole(c) { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a hole's value is never the scheme of the URL it stands in" {
+  let after = |markup: String, more: String|
+    match run(reader(true), markup) {
+      Err(stray) -> Err(stray.message),
+      Ok(r) -> match hole(r.to) {
+        Err(message) -> Err(message),
+        Ok(h) -> match run(h.to, more) {
+          Err(stray) -> Err(int_to_string(stray.offset)),
+          Ok(next) -> match hole(next.to) {
+            Err(message) -> Err(message),
+            Ok(second) -> Ok(second.url),
+          },
+        },
+      },
+    };
+  assert_eq(after("<a href=\"", ""), Ok(Some(First)));
+  assert_eq(after("<a href=\"", "/"), Ok(Some(Path)));
+  assert_eq(after("<a href=\"", "?next="), Ok(Some(Query)));
+  assert_eq(after("<a href=\"", ".html#"), Ok(Some(Query)));
+  assert_eq(after("<a href=\"", "://"), Err("0"));
+  assert_eq(after("<a href=\"page", "s:"), Err("1"));
+  assert_eq(after("<a href=", " href=\""), Ok(Some(Start)));
+  assert_eq(after("<a title=\"", ":"), Ok(None))
+}
+
+type Written = { part: UrlPart, value: String, url: Result<String, String> }
+
+fn url_values() -> List<Written> =
+  [
+    { part: Start, value: "/a b?c=d&e=\"f\"#g", url: Ok("/a%20b?c=d&e=%22f%22#g") },
+    { part: Start, value: "https://example.com/?q=a%20b", url: Ok("https://example.com/?q=a%20b") },
+    { part: Start, value: "HTTP://example.com", url: Ok("HTTP://example.com") },
+    { part: Start, value: "mailto:a@example.com", url: Ok("mailto:a@example.com") },
+    { part: Start, value: "tel:+15550100", url: Ok("tel:+15550100") },
+    { part: Start, value: "page.html", url: Ok("page.html") },
+    { part: Start, value: "a/b:c", url: Ok("a/b:c") },
+    { part: Start, value: "?next=x:y", url: Ok("?next=x:y") },
+    { part: Start, value: "", url: Ok("") },
+    { part: Start, value: "100%", url: Ok("100%25") },
+    { part: Start, value: "caf\u{e9}<\\>", url: Ok("caf%C3%A9%3C%5C%3E") },
+    { part: Start, value: "javascript:alert(1)", url: Err("javascript") },
+    { part: Start, value: "JaVaScRiPt:alert(1)", url: Err("JaVaScRiPt") },
+    { part: Start, value: " javascript:alert(1)", url: Err("%20javascript") },
+    { part: Start, value: "java\tscript:alert(1)", url: Err("java%09script") },
+    { part: Start, value: "\u{1}javascript:alert(1)", url: Err("%01javascript") },
+    { part: Start, value: "data:text/html,<script>", url: Err("data") },
+    { part: Start, value: "vbscript:x", url: Err("vbscript") },
+    { part: Start, value: ":x", url: Err("") },
+    { part: First, value: "7", url: Ok("7") },
+    { part: First, value: "s/x:y", url: Ok("s/x:y") },
+    { part: First, value: "script:alert(1)", url: Err("script") },
+    { part: First, value: "s://example.com", url: Err("s") },
+    { part: First, value: ":80", url: Err("") },
+    { part: Path, value: "a b/../c:d?e#f", url: Ok("a%20b/../c:d?e#f") },
+    { part: Path, value: "\"><script>", url: Ok("%22%3E%3Cscript%3E") },
+    { part: Query, value: "a b&c=d/e:f", url: Ok("a%20b%26c%3Dd%2Fe%3Af") },
+    { part: Query, value: "javascript:alert(1)", url: Ok("javascript%3Aalert%281%29") },
+  ]
+
+test "`{c.value}` is written into a URL as its part reads it" for c: Written in url_values() {
+  assert_eq(url_value(c.part, c.value, false), c.url)
+}
+
+test "a trusted value is written as it is encoded, whatever scheme it gives" {
+  assert_eq(url_value(Start, "javascript:void(0)", true), Ok("javascript:void(0)"));
+  assert_eq(url_value(Start, "sms:+15550100?body=a b", true), Ok("sms:+15550100?body=a%20b"));
+  assert_eq(url_value(First, "x:y", true), Ok("x:y"));
+  assert_eq(url_value(Query, "a:b", true), Ok("a%3Ab"))
+}
+
+test "a browser's scheme is read past the blanks and line ends it drops" {
+  assert_eq(browser_scheme("https://example.com"), Some("https"));
+  assert_eq(browser_scheme(" \u{1}JavaScript:alert(1)"), Some("javascript"));
+  assert_eq(browser_scheme("java\tscr\nipt:alert(1)"), Some("javascript"));
+  assert_eq(browser_scheme("x-app+v1.2:open"), Some("x-app+v1.2"));
+  assert_eq(browser_scheme("/a:b"), None);
+  assert_eq(browser_scheme("a b:c"), None);
+  assert_eq(browser_scheme("%20javascript:x"), None);
+  assert_eq(browser_scheme("1a:b"), None);
+  assert_eq(browser_scheme(":b"), None);
+  assert_eq(browser_scheme("page"), None);
+  assert_eq(browser_scheme(""), None)
+}
+
+law "a value written where a URL starts gives it no scheme but one allowed"
+  forall (h: Hostile) {
+    match url_value(Start, hostile_text(h), false) {
+      Err(_) -> true,
+      Ok(url) -> match browser_scheme(unescape_attribute(escape(url))) {
+        None -> true,
+        Some(scheme) -> allowed(bytes_of_string(scheme)),
+      },
+    }
+  }
+
+law "a value written after a URL's first letters or its `?` ends no scheme"
+  forall (h: Hostile, n: Int) {
+    match url_value(at_or([First, Query], n & 1, First), hostile_text(h), false) {
+      Err(_) -> true,
+      Ok(url) -> browser_scheme("x" ++ url) == None,
+    }
+  }
+
+law "a value written into a URL a second time is the URL it was"
+  forall (h: Hostile, n: Int) {
+    let part = at_or([Start, First, Path], n & 3, Path);
+    match url_value(part, hostile_text(h), true) {
+      Err(_) -> false,
+      Ok(url) -> url_value(part, url, true) == Ok(url),
+    }
+  }
+
+fn drafted(steps: List<Result<String, Html>>, urls: Bool) -> Option<String> / {abort.raise} = {
+  let end = fold(steps, Some(draft(urls)), |d: Option<Draft>, s: Result<String, Html>|
+    match d {
+      None -> None,
+      Some(so_far) -> match s {
+        Ok(markup) -> match run(so_far.at, markup) { Ok(r) -> write(so_far, r), Err(_) -> None },
+        Err(value) -> match hole(so_far.at) { Ok(h) -> place(so_far, h, value), Err(_) -> None },
+      },
+    });
+  match end {
+    None -> None,
+    Some(d) -> match finish(d) { Some(page) -> Some(render(page)), None -> None },
+  }
+}
+
+test "a draft written of runs and holes in the order they were read is the literal's fragment" {
+  let value = text("a\"<b>&");
+  assert_eq(
+    drafted(
+      [Ok("<p class="), Err(value), Ok(" id='x-"), Err(value), Ok("'>"), Err(value), Ok("</p>")],
+      false,
+    ),
+    Some(written(["<p class=", " id='x-", "'>", "</p>"], [value, value, value])),
+  );
+  assert_eq(drafted([], false), Some(""));
+  assert_eq(drafted([Ok("<p"), Ok(">x</p>")], true), Some("<p>x</p>"));
+  // Left in a tag, a value or a comment, it is no fragment.
+  assert_eq(drafted([Ok("<p")], false), None);
+  assert_eq(drafted([Ok("<p title='"), Err(value)], false), None);
+  assert_eq(drafted([Ok("<!-- ")], false), None)
+}
+
+test "a draft takes no run and no hole read from another place than it stands at" {
+  let start = reader(true);
+  let tag = match run(start, "<p ") { Ok(r) -> r, Err(_) -> panic("refused") };
+  let more = match run(tag.to, "class='a'>") { Ok(r) -> r, Err(_) -> panic("refused") };
+  let content = match hole(start) { Ok(h) -> h, Err(_) -> panic("refused") };
+  let d = draft(true);
+  assert(write(d, more) == None);
+  assert(write(d, tag) != None);
+  let in_tag = match write(d, tag) { Some(next) -> next, None -> d };
+  assert(place(in_tag, content, text("x")) == None);
+  assert(write(in_tag, tag) == None);
+  assert(write(in_tag, more) != None);
+  // A reader that follows URLs and one that does not stand at different places.
+  assert(write(draft(false), tag) == None)
+}
+
+fn read_from(from: Context, markup: String) -> Run / {abort.raise} =
+  match run(from, markup) { Ok(r) -> r, Err(stray) -> panic(stray.message) }
+
+test "what was read as more of a tag's name is not written after an attribute of the tag" {
+  let named = read_from(reader(false), "<script");
+  let longer = read_from(named.to, "x>");
+  let attribute = read_from(named.to, " id='1'");
+  // Read on from the name, `x>` ends a `scriptx` and a hole after it stands in content.
+  assert(match hole(longer.to) { Ok(h) -> h.place == Content, Err(_) -> false });
+  let written = |runs: List<Run>|
+    fold(runs, Some(draft(false)), |d: Option<Draft>, r: Run|
+      match d { Some(so_far) -> write(so_far, r), None -> None });
+  assert(written([named, longer]) != None);
+  assert(written([named, attribute]) != None);
+  assert(written([named, attribute, longer]) == None);
+  // What was read from where the two are joined is written after either.
+  let either = match joined(named.to, attribute.to) { Some(c) -> c, None -> panic("apart") };
+  let closed = read_from(either, " class='a'>");
+  assert(written([named, closed]) != None);
+  assert(written([named, attribute, closed]) != None);
+  assert(match run(either, "x>") { Err(_) -> true, Ok(_) -> false })
+}
+
+fn at(markup: String) -> Context / {abort.raise} =
+  match run(reader(true), markup) { Ok(r) -> r.to, Err(stray) -> panic(stray.message) }
+
+/// What a hole after `more` is, read from where `a` and `b` are joined: `None` where they are
+/// not, or where `more` or the hole is refused there.
+fn joined_hole(a: String, b: String, more: String) -> Option<Hole> / {abort.raise} =
+  match joined(at(a), at(b)) {
+    None -> None,
+    Some(both) -> match run(both, more) {
+      Err(_) -> None,
+      Ok(r) -> match hole(r.to) { Ok(h) -> Some(h), Err(_) -> None },
+    },
+  }
+
+test "two places are joined where every text after them is read alike" {
+  let same = |a: String, b: String| joined(at(a), at(b)) != None;
+  assert(same("<b>x</b>", "<i class='y'>z</i> w"));
+  assert(same("", "<br>"));
+  assert(!same("<p", "<p>"));
+  assert(!same("<p title='", "<p title=\""));
+  assert(!same("<p title='", "<p class='"));
+  assert(!same("<textarea>", "<title>"));
+  assert(same("<textarea>", "<textarea rows='2'>x"));
+  // In a tag, a name or a value joins a space as a place where a space must come next.
+  assert(same("<p", "<p class='a'"));
+  assert(same("<p", "<p hidden"));
+  assert(same("<p class='a'", "<p class='a' "));
+  assert(!same("<p", "<q"));
+  assert(joined_hole("<p", "<p hidden", " title='") != None);
+  assert(joined_hole("<p", "<p hidden", "x title='") == None);
+  assert(joined_hole("<p ", "<p hidden ", "title='") != None);
+  assert(joined_hole("<p ", "<p hidden ", "='") == None);
+  assert(joined_hole("<p hidden", "<p hidden", "='") == None);
+  // In a URL, parts that differ are one no hole stands at.
+  assert(same("<a href='/a", "<a href='/b/"));
+  assert(joined_hole("<a href='/a", "<a href='/b/", "") != None);
+  assert(same("<a href='/a", "<a href='?"));
+  assert(joined_hole("<a href='/a", "<a href='?", "") == None);
+  // A `?` or a `#` after them puts every way there in the query, where a hole stands again.
+  assert(joined_hole("<a href='/a", "<a href='?", "#") != None);
+  assert(joined_hole("<a href='", "<a href='x", "/y?q=") != None);
+  assert(joined_hole("<a href='", "<a href='x", "y:") == None);
+  assert(joined_hole("<a href='javascript:", "<a href='/a", "?q=") == None);
+  assert(joined_hole("<a href='javascript:", "<a href='data:", "?q=") == None);
+  assert(joined_hole("<a href='https:", "<a href='http:", "//example.com/") != None);
+  assert(joined_hole("<a href='", "<a href='/a", "'>") != None);
+  assert(joined_hole("<a title='a", "<a title='b?", "") != None)
 }

@@ -1,0 +1,94 @@
+//! `std.unicode`'s normalization against `NormalizationTest.txt`, the database's conformance test
+//! of the four forms: every line of every part, a few hundred lines to a case, and the rule the
+//! file states for the code points it does not list. The quick checks are held to
+//! `DerivedNormalizationProps.txt` over every code point, since a check that says `Yes` too often
+//! answers a text unchanged.
+
+import std.list (flat_map, sort_by, take)
+import std.unicode
+import std.unicode (Form, Maybe, Nfc, Nfd, Nfkc, Nfkd, No, Quick, Yes)
+import ucd_files
+import ucd_files (Block, Row, Span, Stretch, hexes, rows_under, spelled, text, unlike, unlisted)
+
+/// A line of the test: a source text and what each form makes of it.
+pub type Line = { source: String, nfc: String, nfd: String, nfkc: String, nfkd: String }
+
+/// Every line of every part of the test.
+pub fn lines() -> List<Line> / {abort.raise} =
+  fold(bytes_split(ucd_files::normalization_test(), b"\n"), [], |found: List<Line>, line: Bytes|
+    if bytes_len(line) == 0 || bytes_at(line, 0) == b'#' || bytes_at(line, 0) == b'@' { found }
+    else {
+      match map(take(bytes_split(line, b";"), 5), |column: Bytes| text(hexes(column))) {
+        [source, nfc, nfd, nfkc, nfkd] ->
+          push(found, { source: source, nfc: nfc, nfd: nfd, nfkc: nfkc, nfkd: nfkd }),
+        _ -> panic(f"`{string_of_bytes_lossy(line)}` is no line of the test"),
+      }
+    })
+
+/// Whether the four forms of a line's five texts are what the test's conformance clause says.
+fn conforms(l: Line) -> Bool = {
+  let all = [l.source, l.nfc, l.nfd, l.nfkc, l.nfkd];
+  map([l.source, l.nfc, l.nfd], unicode::nfc) == [l.nfc, l.nfc, l.nfc]
+    && map([l.nfkc, l.nfkd], unicode::nfc) == [l.nfkc, l.nfkc]
+    && map([l.source, l.nfc, l.nfd], unicode::nfd) == [l.nfd, l.nfd, l.nfd]
+    && map([l.nfkc, l.nfkd], unicode::nfd) == [l.nfkd, l.nfkd]
+    && map(all, unicode::nfkc) == map(all, |_: String| l.nfkc)
+    && map(all, unicode::nfkd) == map(all, |_: String| l.nfkd)
+}
+
+fn blocks() -> List<Block<Line>> / {abort.raise} =
+  ucd_files::blocks(lines(), 256, |l: Line| spelled(l.source))
+
+test "the {len(b.lines)} lines of NormalizationTest.txt from {b.from} normalize as they say" for b: Block<Line> in blocks(
+  ) { assert_eq(map(filter(b.lines, |l: Line| !conforms(l)), |l: Line| spelled(l.source)), []) }
+
+// Nothing composes with `U+0000` or is ordered across it, so a text of them is normal when each is.
+test "a code point the test does not list is its own normal form in all four" {
+  let listed = map(
+    map_keys(
+      fold(lines(), map_new(), |seen: Map<Int, Unit>, c: Line|
+        match string_chars(c.source) {
+          [one] -> map_insert(seen, int_of_char(one), ()),
+          _ -> seen,
+        }),
+    ),
+    |cp: Int| { first: cp, last: cp, said: () },
+  );
+  assert(len(listed) > 10000);
+  let moved = filter(unlisted(listed, 4096), |span: Span| {
+    let apart = text(flat_map(range(span.first, span.last + 1), |cp: Int| [0, cp]));
+    unicode::nfc(apart) != apart || unicode::nfd(apart) != apart || unicode::nfkc(apart) != apart
+      || unicode::nfkd(apart) != apart
+  });
+  assert_eq(moved, [])
+}
+
+type Check = { property: String, form: Form }
+
+fn checks() -> List<Check> =
+  [
+    { property: "NFC_QC", form: Nfc },
+    { property: "NFD_QC", form: Nfd },
+    { property: "NFKC_QC", form: Nfkc },
+    { property: "NFKD_QC", form: Nfkd },
+  ]
+
+test "the quick check of every one-character text is the database's {c.property}" for c: Check in checks(
+  ) {
+  let props = ucd_files::derived_normalization_props();
+  let valued = |value: String, said: Quick|
+    map(rows_under(props, [c.property, value]), |row: Row|
+      { first: row.first, last: row.last, said: said });
+  let stretches = sort_by(
+    fold(valued("M", Maybe), valued("N", No), |all: List<Stretch<Quick>>, s: Stretch<Quick>|
+      push(all, s)),
+    |a: Stretch<Quick>, b: Stretch<Quick>| a.first < b.first,
+  );
+  assert(len(stretches) > 0);
+  // A surrogate is in no text.
+  let wrong = unlike(stretches, |cp: Int, said: Option<Quick>|
+    (cp >= 0xD800 && cp <= 0xDFFF)
+      || unicode::quick_check(text([cp]), c.form)
+      == (match said { Some(quick) -> quick, None -> Yes }));
+  assert_eq(wrong, [])
+}

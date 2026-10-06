@@ -4,11 +4,12 @@
 //! `dns.lookup` asks the system's resolver, which answers addresses and nothing else. The records
 //! mail and service discovery need (MX, TXT, SRV), and those behind an address (CNAME, PTR, NS),
 //! are asked here. `ask` sends a question to each of the servers it is given in turn, `attempts`
-//! times round, each wait bounded by `timeout_ms`, and answers the records of the kind asked for,
-//! each with how long it holds; `ask_system` asks the servers `dns.servers` lists. A question's
-//! id is drawn from `entropy`, and an answer is believed only when it comes from the server
-//! asked, carries that id, and repeats the question, so a datagram from anywhere else is passed
-//! over. An answer too long for a datagram says so, and is asked for again over TCP.
+//! times round, each exchange under a deadline of `timeout_ms` on the clock, and answers the
+//! records of the kind asked for, each with how long it holds; `ask_system` asks the servers
+//! `dns.servers` lists. A question's id is drawn from `entropy`, and an answer is believed only
+//! when it comes from the server asked, carries that id, and repeats the question, so a datagram
+//! from anywhere else is passed over and does not lengthen the wait. An answer too long for a
+//! datagram says so, and is asked for again over TCP.
 //!
 //! A failure is `std.dns`'s `Failure`: `NoSuchName` where the server says the name is not there,
 //! `NoData` where it is there and holds nothing of the kind, `ServerFailure` where every server
@@ -27,9 +28,10 @@ import std.ip
 import std.ip (Ip, SocketAddress, V4, V6, ip)
 import std.list (all, sort_by)
 import std.net
-import std.net (Hears, MemNet, Says, net, send_all)
+import std.net (Hears, MemNet, Refusal, Says, ms_left, net, send_all)
 import std.random (entropy, rand, rand_below, with_rand)
-import std.string (eq_ignore_ascii_case, join)
+import std.string (eq_ignore_ascii_case, is_ascii, join)
+import std.time (after, millis)
 import std.udp
 import std.udp (Dropped, MemUdp, udp)
 
@@ -408,70 +410,93 @@ fn same_name(a: String, b: String) -> Bool / {abort.raise} =
 fn rooted(name: String) -> String / {abort.raise} =
   if string_ends_with(name, ".") { string_slice(name, 0, string_len(name) - 1) } else { name }
 
-/// As many datagrams as one wait reads past: answers to other questions, late or forged.
+/// As many datagrams as one exchange reads past: answers to other questions, late or forged.
 fn strays() -> Int = 8
 
-/// The answer to `asked` among the datagrams `socket` receives from `server`, each wait bounded
-/// by `timeout_ms`.
+/// The answer to `asked` among the datagrams `socket` receives from `server` before `end`.
 fn heard<[l]>(
   socket: Int,
   server: SocketAddress,
   asked: Message,
-  timeout_ms: Int,
-) -> Option<Message> / {udp.recv_from[l], abort.raise} =
+  end: Instant,
+) -> Option<Message> / {udp.recv_from[l], clock.read, abort.raise} =
   iterate(0, strays() + 1, |read: Int|
     if read >= strays() { Stop(None) } else {
-      match udp.recv_from[l](socket, 65535, timeout_ms) {
-        Err(_) -> Stop(None),
-        Ok(d) -> if d.from != server { Continue(read + 1) } else {
-          match decode(d.payload) {
-            Some(m) -> if answers_to(m, asked) { Stop(Some(m)) } else { Continue(read + 1) },
-            None -> Continue(read + 1),
-          }
+      match ms_left(end) {
+        None -> Stop(None),
+        Some(left) -> match udp.recv_from[l](socket, 65535, left) {
+          Err(_) -> Stop(None),
+          Ok(d) -> if d.from != server { Continue(read + 1) } else {
+            match decode(d.payload) {
+              Some(m) -> if answers_to(m, asked) { Stop(Some(m)) } else { Continue(read + 1) },
+              None -> Continue(read + 1),
+            }
+          },
         },
       }
     })
 
-/// One question put to one server over a datagram socket of its own, closed however it ends.
+/// One question put to one server over a datagram socket of its own, closed however it ends,
+/// and its answer where one comes before `end`.
 fn exchanged<[l]>(
   server: SocketAddress,
   asked: Message,
   query: Bytes,
-  timeout_ms: Int,
-) -> Option<Message> / {udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], abort.raise} =
-  match udp.bind[l](ip::socket_at(ip::unspecified_like(ip::socket_ip(server)), 0), []) {
-    Err(_) -> None,
-    Ok(opened) ->
-      bracket(|| opened, |socket: Int| udp.close[l](socket), |socket: Int|
-        match udp.send_to[l](socket, server, query, timeout_ms) {
-          Err(_) -> None,
-          Ok(_) -> heard[l](socket, server, asked, timeout_ms),
-        }),
-  }
+  end: Instant,
+) -> Option<Message> / {udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], clock.read, abort.raise} =
+  bracket(
+    || udp.bind[l](ip::socket_at(ip::unspecified_like(ip::socket_ip(server)), 0), []),
+    |opened: Result<Int, Refusal>|
+      match opened { Ok(socket) -> udp.close[l](socket), Err(_) -> () },
+    |opened: Result<Int, Refusal>|
+      match opened {
+        Err(_) -> None,
+        Ok(socket) -> match ms_left(end) {
+          None -> None,
+          Some(left) -> match udp.send_to[l](socket, server, query, left) {
+            Err(_) -> None,
+            Ok(_) -> heard[l](socket, server, asked, end),
+          },
+        },
+      },
+  )
 
-/// The next `n` bytes of a connection, or `None` where it ends or stalls first.
-fn filled<[k]>(conn: Int, n: Int, timeout_ms: Int) -> Option<Bytes> / {net.recv[k], abort.raise} =
+/// The next `n` bytes of a connection, or `None` where it ends, or `end` comes, first.
+fn filled<[k]>(
+  conn: Int,
+  n: Int,
+  end: Instant,
+) -> Option<Bytes> / {net.recv[k], clock.read, abort.raise} =
   iterate(b"", n + 1, |got: Bytes|
     if bytes_len(got) >= n { Stop(Some(got)) } else {
-      match net.recv[k](conn, n - bytes_len(got), timeout_ms) {
+      match ms_left(end) {
         None -> Stop(None),
-        Some(more) -> if bytes_len(more) == 0 { Stop(None) }
-        else { Continue(bytes_concat(got, more)) },
+        Some(left) -> match net.recv[k](conn, n - bytes_len(got), left) {
+          None -> Stop(None),
+          Some(more) -> if bytes_len(more) == 0 { Stop(None) }
+          else { Continue(bytes_concat(got, more)) },
+        },
       }
     })
 
-/// The same question over a connection, where a message goes under its length.
+/// The same question over a connection, where a message goes under its length, and its answer
+/// where the whole of it comes before `end`.
 fn exchanged_whole<[k]>(
   server: SocketAddress,
   asked: Message,
   query: Bytes,
-  timeout_ms: Int,
-) -> Option<Message> / {net.connect_to[k], net.send[k], net.recv[k], net.close[k], abort.raise} =
-  match net.connect_to[k](server, [], timeout_ms) {
-    Err(_) -> None,
-    Ok(opened) ->
-      bracket(|| opened, |conn: Int| net.close[k](conn), |conn: Int|
-        framed[k](conn, asked, query, timeout_ms)),
+  end: Instant,
+) -> Option<Message> / {net.connect_to[k], net.send[k], net.recv[k], net.close[k], clock.read, abort.raise} =
+  match ms_left(end) {
+    None -> None,
+    Some(left) ->
+      bracket(
+        || net.connect_to[k](server, [], left),
+        |opened: Result<Int, Refusal>|
+          match opened { Ok(conn) -> net.close[k](conn), Err(_) -> () },
+        |opened: Result<Int, Refusal>|
+          match opened { Ok(conn) -> framed[k](conn, asked, query, end), Err(_) -> None },
+      ),
   }
 
 /// A question sent under its length on an open connection, and the answer read under its own.
@@ -479,26 +504,36 @@ fn framed<[k]>(
   conn: Int,
   asked: Message,
   query: Bytes,
-  timeout_ms: Int,
-) -> Option<Message> / {net.send[k], net.recv[k], abort.raise} =
-  if !send_all[k](conn, bytes_concat(u16_be(bytes_len(query)), query), timeout_ms) { None } else {
-    let size = u16_be_at(filled[k](conn, 2, timeout_ms)?, 0)?;
-    let m = decode(filled[k](conn, size, timeout_ms)?)?;
+  end: Instant,
+) -> Option<Message> / {net.send[k], net.recv[k], clock.read, abort.raise} = {
+  let left = ms_left(end)?;
+  if !send_all[k](conn, bytes_concat(u16_be(bytes_len(query)), query), left) { None } else {
+    let size = u16_be_at(filled[k](conn, 2, end)?, 0)?;
+    let m = decode(filled[k](conn, size, end)?)?;
     if answers_to(m, asked) { Some(m) } else { None }
   }
+}
+
+/// The instant an exchange begun now must end by.
+fn ending(timeout_ms: Int) -> Instant / {clock.read} = after(clock.now(), millis(timeout_ms))
 
 /// The records of `kind` at `name`, asked of `servers` in turn, the whole list `attempts`
-/// times, each wait bounded by `timeout_ms`. Datagrams go under the label `l`, and the
-/// connection a cut answer is asked for again over under `k`.
+/// times. `timeout_ms` is a deadline on the clock for each exchange, the datagram one and the
+/// one over a connection alike: whatever else a socket hears in that time, the wait is no
+/// longer. Datagrams go under the label `l`, and the connection a cut answer is asked for again
+/// over under `k`. A name that is not ASCII is refused as `dns.lookup` refuses one, and
+/// `timeout_ms <= 0` is a runtime error.
 pub fn ask<[l], [k]>(
   servers: List<SocketAddress>,
   name: String,
   kind: Kind,
   attempts: Int,
   timeout_ms: Int,
-) -> Result<List<Record>, Failure> / {udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], net.connect_to[k], net.send[k], net.recv[k], net.close[k], entropy.below, abort.raise} = {
+) -> Result<List<Record>, Failure> / {udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], net.connect_to[k], net.send[k], net.recv[k], net.close[k], entropy.below, clock.read, abort.raise} = {
   let tries = max(attempts, 0) * len(servers);
-  if name_bytes(name) == None {
+  if timeout_ms <= 0 {
+    panic("`resolver::ask` was given a timeout of " ++ int_to_string(timeout_ms) ++ " milliseconds")
+  } else if !is_ascii(name) { Err(dns::not_ascii()) } else if name_bytes(name) == None {
     Err(dns::Other(0, "a name's labels are 1 to 63 bytes each and the name at most 253"))
   } else if len(servers) == 0 { Err(dns::Other(0, "there is no server to ask")) } else {
     iterate({ tried: 0, worst: TimedOut }, tries + 1, |s: { tried: Int, worst: Failure }|
@@ -509,9 +544,10 @@ pub fn ask<[l], [k]>(
             let asked = question(entropy.below(65536), name, kind);
             let reply = match encode(asked) {
               None -> None,
-              Some(query) -> match exchanged[l](server, asked, query, timeout_ms) {
-                Some(m) -> if m.truncated { exchanged_whole[k](server, asked, query, timeout_ms) }
-                else { Some(m) },
+              Some(query) -> match exchanged[l](server, asked, query, ending(timeout_ms)) {
+                Some(m) -> if m.truncated {
+                  exchanged_whole[k](server, asked, query, ending(timeout_ms))
+                } else { Some(m) },
                 None -> None,
               },
             };
@@ -535,7 +571,7 @@ pub fn ask_system<[l], [k]>(
   kind: Kind,
   attempts: Int,
   timeout_ms: Int,
-) -> Result<List<Record>, Failure> / {dns.servers, udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], net.connect_to[k], net.send[k], net.recv[k], net.close[k], entropy.below, abort.raise} =
+) -> Result<List<Record>, Failure> / {dns.servers, udp.bind[l], udp.send_to[l], udp.recv_from[l], udp.close[l], net.connect_to[k], net.send[k], net.recv[k], net.close[k], entropy.below, clock.read, abort.raise} =
   ask[l, k](dns.servers(), name, kind, attempts, timeout_ms)
 
 /// The addresses among `records`, each with how long it holds, in the order they came.
@@ -710,7 +746,7 @@ fn asked_over(
   kind: Kind,
   attempts: Int,
   seed: Int,
-) -> Ran / {abort.raise} = {
+) -> Ran / {clock.read, abort.raise} = {
   let ran = net::on_mem(streams, ||
     udp::on_mem(datagrams, ||
       with_rand(rand(seed), ||
@@ -719,81 +755,135 @@ fn asked_over(
 }
 
 test "a name's mail exchanges are asked for and come back with how long they hold" {
-  let world = udp::mem_answering(udp::mem_empty(), server(), mail_server);
-  let ran = asked_over(world, net::mem_empty(), [server()], Mx, 1, 7);
-  assert_eq(ran.answer, Ok(mail()));
-  assert_eq(exchanges(mail()), [
-    { preference: 10, host: "mail.example.org" },
-    { preference: 20, host: "backup.example.org" },
-  ]);
-  // One question and its answer crossed, and the socket that asked is closed.
-  assert_eq(len(ran.udp.met), 2);
-  assert_eq(ran.udp.closed, [1])
+  simulate {
+    let world = udp::mem_answering(udp::mem_empty(), server(), mail_server);
+    let ran = asked_over(world, net::mem_empty(), [server()], Mx, 1, 7);
+    assert_eq(ran.answer, Ok(mail()));
+    assert_eq(exchanges(mail()), [
+      { preference: 10, host: "mail.example.org" },
+      { preference: 20, host: "backup.example.org" },
+    ]);
+    // One question and its answer crossed, and the socket that asked is closed.
+    assert_eq(len(ran.udp.met), 2);
+    assert_eq(ran.udp.closed, [1])
+  }
 }
 
 test "a question that is lost is asked again, as often as it may be and no more" {
-  let world = udp::mem_fated(udp::mem_answering(udp::mem_empty(), server(), mail_server), [
-    Dropped,
-    Dropped,
-  ]);
-  assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 3, 7).answer, Ok(mail()));
-  assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 2, 7).answer, Err(TimedOut))
+  simulate {
+    let world = udp::mem_fated(udp::mem_answering(udp::mem_empty(), server(), mail_server), [
+      Dropped,
+      Dropped,
+    ]);
+    assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 3, 7).answer, Ok(mail()));
+    assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 2, 7).answer, Err(TimedOut))
+  }
 }
 
+/// What a server that sends `strays` answers to other questions ahead of its own sends back.
+fn forging(strays: Int, query: Bytes) -> List<Bytes> / {abort.raise} =
+  match decode(query) {
+    Some(asked) -> {
+      let other = { ..asked, id: (asked.id + 1) % 65536 };
+      let elsewhere = answer(question(asked.id, "example.net", Mx), 0, [
+        held("example.net", 300, Exchange(0, "mallory.example")),
+      ]);
+      push(
+        map(range(0, strays), |i: Int|
+          if i % 2 == 0 {
+            sent(answer(other, 0, [held("example.org", 300, Exchange(0, "mallory.example"))]))
+          } else { sent(elsewhere) }),
+        sent(answer(asked, 0, mail())),
+      )
+    },
+    None -> [],
+  }
+
 test "an answer under another id is passed over for the one that answers the question" {
-  let forged = |query: Bytes|
-    match decode(query) {
-      Some(asked) -> {
-        let other = { ..asked, id: (asked.id + 1) % 65536 };
-        [
-          sent(answer(other, 0, [held("example.org", 300, Exchange(0, "mallory.example"))])),
-          sent(
-            answer(question(asked.id, "example.net", Mx), 0, [
-              held("example.net", 300, Exchange(0, "mallory.example")),
-            ]),
-          ),
-          sent(answer(asked, 0, mail())),
-        ]
-      },
-      None -> [],
-    };
-  let world = udp::mem_answering(udp::mem_empty(), server(), forged);
-  assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 1, 7).answer, Ok(mail()))
+  simulate {
+    let world = udp::mem_answering(udp::mem_empty(), server(), |query: Bytes| forging(2, query));
+    assert_eq(asked_over(world, net::mem_empty(), [server()], Mx, 1, 7).answer, Ok(mail()))
+  }
+}
+
+/// `go` over sockets each of whose datagrams takes `each` to arrive.
+fn arriving<a | e>(
+  each: Duration,
+  go: () -> a / {udp.recv_from[lookup] | e},
+) -> a / {udp.recv_from[lookup], clock.write | e} =
+  handle {
+    go()
+  } with {
+    udp.recv_from[lookup](socket, most, timeout_ms) -> {
+      clock.sleep(each);
+      udp.recv_from[lookup](socket, most, timeout_ms)
+    },
+  }
+
+test "what a socket hears that is no answer does not lengthen the wait for one" {
+  simulate {
+    let world = udp::mem_answering(udp::mem_empty(), server(), |query: Bytes| forging(3, query));
+    let asked = |timeout_ms: Int|
+      net::on_mem(net::mem_empty(), ||
+        udp::on_mem(world, ||
+          with_rand(rand(7), ||
+            arriving(millis(200), ||
+              ask[lookup, fallback](
+                [server()],
+                "example.org",
+                Mx,
+                1,
+                timeout_ms,
+              ))).value).value).value;
+    let began = clock.now();
+    // The answer is the fourth datagram, 800 milliseconds in: past one deadline, inside the other.
+    assert_eq(asked(500), Err(TimedOut));
+    assert_eq(clock.now(), after(began, millis(600)));
+    assert_eq(asked(1000), Ok(mail()))
+  }
 }
 
 test "what a server says of a name is told apart: not there, nothing of the kind, a failure" {
-  let told = |code: Int, records: List<Record>| {
-    asked_over(
-      udp::mem_answering(udp::mem_empty(), server(), |query: Bytes| replies(query, code, records)),
-      net::mem_empty(),
-      [server()],
-      Mx,
-      3,
-      7,
-    )
-  };
-  let absent = told(3, []);
-  assert_eq(absent.answer, Err(NoSuchName));
-  // The server's word that a name is not there is final: it is not asked again.
-  assert_eq(len(absent.udp.met), 2);
-  assert_eq(told(0, []).answer, Err(NoData));
-  assert_eq(told(0, [held("example.org", 60, Alias("example.net"))]).answer, Err(NoData));
-  let failing = told(2, []);
-  assert_eq(failing.answer, Err(ServerFailure));
-  assert_eq(len(failing.udp.met), 6)
+  simulate {
+    let told = |code: Int, records: List<Record>| {
+      asked_over(
+        udp::mem_answering(udp::mem_empty(), server(), |query: Bytes|
+          replies(query, code, records)),
+        net::mem_empty(),
+        [server()],
+        Mx,
+        3,
+        7,
+      )
+    };
+    let absent = told(3, []);
+    assert_eq(absent.answer, Err(NoSuchName));
+    // The server's word that a name is not there is final: it is not asked again.
+    assert_eq(len(absent.udp.met), 2);
+    assert_eq(told(0, []).answer, Err(NoData));
+    assert_eq(told(0, [held("example.org", 60, Alias("example.net"))]).answer, Err(NoData));
+    let failing = told(2, []);
+    assert_eq(failing.answer, Err(ServerFailure));
+    assert_eq(len(failing.udp.met), 6)
+  }
 }
 
 test "a server that fails is passed over for the next one" {
-  let world = udp::mem_answering(
-    udp::mem_answering(udp::mem_empty(), server(), failing_server),
-    second(),
-    mail_server,
-  );
-  assert_eq(asked_over(world, net::mem_empty(), [server(), second()], Mx, 1, 7).answer, Ok(mail()));
-  assert_eq(
-    asked_over(udp::mem_empty(), net::mem_empty(), [server(), second()], Mx, 2, 7).answer,
-    Err(TimedOut),
-  )
+  simulate {
+    let world = udp::mem_answering(
+      udp::mem_answering(udp::mem_empty(), server(), failing_server),
+      second(),
+      mail_server,
+    );
+    assert_eq(
+      asked_over(world, net::mem_empty(), [server(), second()], Mx, 1, 7).answer,
+      Ok(mail()),
+    );
+    assert_eq(
+      asked_over(udp::mem_empty(), net::mem_empty(), [server(), second()], Mx, 2, 7).answer,
+      Err(TimedOut),
+    )
+  }
 }
 
 test "an answer cut to fit a datagram is asked for again over a connection" {
@@ -819,26 +909,33 @@ test "an answer cut to fit a datagram is asked for again over a connection" {
     3,
   );
   let world = udp::mem_answering(udp::mem_empty(), server(), cut);
-  let ran = asked_over(world, streams, [server()], Txt, 1, 7);
-  assert_eq(ran.answer, Ok(long));
-  assert_eq(texts(long), [b"v=spf1 include:_spf.example.net ~all"]);
-  assert_eq(net::mem_unmet(ran.net, 1), []);
-  assert_eq(ran.net.closed, [1]);
-  // With no one answering the connection, the cut answer is no answer.
-  assert_eq(asked_over(world, net::mem_empty(), [server()], Txt, 1, 7).answer, Err(TimedOut))
+  simulate {
+    let ran = asked_over(world, streams, [server()], Txt, 1, 7);
+    assert_eq(ran.answer, Ok(long));
+    assert_eq(texts(long), [b"v=spf1 include:_spf.example.net ~all"]);
+    assert_eq(net::mem_unmet(ran.net, 1), []);
+    assert_eq(ran.net.closed, [1]);
+    // With no one answering the connection, the cut answer is no answer.
+    assert_eq(asked_over(world, net::mem_empty(), [server()], Txt, 1, 7).answer, Err(TimedOut))
+  }
 }
 
-test "a question that cannot be asked is refused before anything is sent" {
-  let ran = asked_over(udp::mem_empty(), net::mem_empty(), [], Mx, 3, 7);
-  assert_eq(ran.answer, Err(dns::Other(0, "there is no server to ask")));
-  let unnamed = net::on_mem(net::mem_empty(), ||
-    udp::on_mem(udp::mem_empty(), ||
-      with_rand(rand(7), || ask[lookup, fallback]([server()], "a..b", Mx, 1, 500)).value));
-  assert_eq(
-    unnamed.value.value,
-    Err(dns::Other(0, "a name's labels are 1 to 63 bytes each and the name at most 253")),
-  );
-  assert_eq(unnamed.value.udp.met, [])
+test "a question that cannot be asked is refused before anything is sent: {c.name}" for c: { name: String, why: Failure } in [
+    {
+      name: "a..b",
+      why: dns::Other(0, "a name's labels are 1 to 63 bytes each and the name at most 253"),
+    },
+    { name: "b\u{fc}cher.example", why: dns::not_ascii() },
+  ] {
+  simulate {
+    let ran = asked_over(udp::mem_empty(), net::mem_empty(), [], Mx, 3, 7);
+    assert_eq(ran.answer, Err(dns::Other(0, "there is no server to ask")));
+    let unnamed = net::on_mem(net::mem_empty(), ||
+      udp::on_mem(udp::mem_empty(), ||
+        with_rand(rand(7), || ask[lookup, fallback]([server()], c.name, Mx, 1, 500)).value));
+    assert_eq(unnamed.value.value, Err(c.why));
+    assert_eq(unnamed.value.udp.met, [])
+  }
 }
 
 test "the system's servers are the ones asked" {
@@ -856,12 +953,14 @@ test "the system's servers are the ones asked" {
   ];
   let streams = net::mem_resolving(net::mem_empty(), dns::with_servers(dns::table(), [second()]));
   let world = udp::mem_answering(udp::mem_empty(), second(), |query: Bytes| replies(query, 0, srv));
-  let ran = net::on_mem(streams, ||
-    udp::on_mem(world, ||
-      with_rand(rand(7), ||
-        ask_system[lookup, fallback]("_imaps._tcp.example.org", Srv, 1, 500)).value));
-  assert_eq(ran.value.value, Ok(srv));
-  assert_eq(map(services(srv), |s: Service| s.target), ["a.example.org", "b.example.org"])
+  simulate {
+    let ran = net::on_mem(streams, ||
+      udp::on_mem(world, ||
+        with_rand(rand(7), ||
+          ask_system[lookup, fallback]("_imaps._tcp.example.org", Srv, 1, 500)).value));
+    assert_eq(ran.value.value, Ok(srv));
+    assert_eq(map(services(srv), |s: Service| s.target), ["a.example.org", "b.example.org"])
+  }
 }
 
 test "the addresses of an answer carry how long they hold" {

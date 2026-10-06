@@ -5,8 +5,14 @@
 //! back as `std.ip` values in the order the resolver gave them, which is its policy's order; a
 //! text that is already an address answers itself and asks nothing. `dns.reverse` is the names an
 //! address answers to. The system's resolver says nothing of how long an answer holds, so a
-//! `Found` from it has no `ttl`; a record read off the wire by `std.resolver` has one. Each
-//! operation takes its deadline in milliseconds, and one at or below zero is a runtime error.
+//! `Found` from it has no `ttl`; a record read off the wire by `std.resolver` has one. A name is
+//! ASCII: an internationalized one is looked up by its A-labels, which `std.idna`'s `ascii`
+//! makes, and any other is refused (`not_ascii`) without a question asked.
+//!
+//! Neither operation takes a deadline, because the system's resolver has its own patience and
+//! cannot be hurried. `resolve` and `names` bound the wait on the clock instead, as `std.task`
+//! bounds anything: the task that asked is stopped at the deadline and the answer is `TimedOut`,
+//! under `simulate` in virtual time and under `--host` on the run's clock.
 //!
 //! A lookup is a `read` with no label: a row that names `dns.lookup` says a definition may ask a
 //! resolver, and a deterministic test answers it from a `Table`, a resolver as a value, with
@@ -23,7 +29,10 @@
 import std.ip
 import std.ip (Ip, SocketAddress, ip)
 import std.list (concat, sort, take)
-import std.string (ascii_lower)
+import std.string (ascii_lower, is_ascii)
+import std.task
+import std.task (deadline)
+import std.time (after, seconds)
 
 /// One address a name resolves to, and how long the answer holds where the resolver says.
 pub type Found = { address: Ip, ttl: Option<Duration> }
@@ -45,14 +54,41 @@ pub type Failure =
 pub nondet effect dns {
   /// The addresses of `name`, in the order the system's resolver gives them. An address written
   /// as text answers itself. Never an empty `Ok`: a name with no address is `NoData` or
-  /// `NoSuchName`.
-  read lookup(name: String, timeout_ms: Int) -> Result<List<Found>, Failure>
-  /// The names `address` answers to, most often one.
-  read reverse(address: Ip, timeout_ms: Int) -> Result<List<String>, Failure>
+  /// `NoSuchName`. It waits as long as the system's resolver does; `resolve` bounds it.
+  read lookup(name: String) -> Result<List<Found>, Failure>
+  /// The names `address` answers to, most often one; `names` bounds the wait.
+  read reverse(address: Ip) -> Result<List<String>, Failure>
   /// The servers the system's resolver is configured to ask, in its order; empty where the host
   /// has no list to read.
   read servers() -> List<SocketAddress>
 }
+
+/// What a name that is not ASCII is refused with.
+pub fn not_ascii() -> Failure =
+  Other(0, "a name is ASCII: an internationalized name is looked up by its A-labels")
+
+/// The addresses of `name` as `dns.lookup` answers them, or `TimedOut` where the resolver has
+/// not answered within `wait`. The lookup runs as a task of its own, stopped at the deadline or
+/// at the one already around this call where that is earlier.
+pub fn resolve(
+  name: String,
+  wait: Duration,
+) -> Result<List<Found>, Failure> / {dns.lookup, task.write, clock.read, clock.write, deadline.at} =
+  match task::timeout(wait, || dns.lookup(name)) {
+    task::Done(answer) -> answer,
+    task::TimedOut -> Err(TimedOut),
+  }
+
+/// The names `address` answers to as `dns.reverse` answers them, or `TimedOut` where the
+/// resolver has not answered within `wait`.
+pub fn names(
+  address: Ip,
+  wait: Duration,
+) -> Result<List<String>, Failure> / {dns.reverse, task.write, clock.read, clock.write, deadline.at} =
+  match task::timeout(wait, || dns.reverse(address)) {
+    task::Done(answer) -> answer,
+    task::TimedOut -> Err(TimedOut),
+  }
 
 /// The addresses of `found`, without their lifetimes.
 pub fn addresses(found: List<Found>) -> List<Ip> = map(found, |f: Found| f.address)
@@ -116,15 +152,14 @@ pub fn with_reverse(t: Table, address: Ip, names: List<String>) -> Table =
 /// The table saying it asks `servers`.
 pub fn with_servers(t: Table, servers: List<SocketAddress>) -> Table = { ..t, servers: servers }
 
-/// What `dns.lookup` answers over the table: an address written as text is itself, a name the
-/// table holds is what it was given, and any other is `NoSuchName`.
+/// What `dns.lookup` answers over the table: an address written as text is itself, a name that
+/// is not ASCII is refused as the host refuses it, a name the table holds is what it was given,
+/// and any other is `NoSuchName`.
 pub fn table_lookup(t: Table, name: String) -> Result<List<Found>, Failure> / {abort.raise} =
   match ip::parse(name) {
     Ok(address) -> Ok([{ address: address, ttl: None }]),
-    Err(_) -> match map_get(t.names, held(name)) {
-      Some(answer) -> answer,
-      None -> Err(NoSuchName),
-    },
+    Err(_) -> if !is_ascii(name) { Err(not_ascii()) }
+    else { match map_get(t.names, held(name)) { Some(answer) -> answer, None -> Err(NoSuchName) } },
   }
 
 /// What `dns.reverse` answers over the table.
@@ -134,17 +169,7 @@ pub fn table_reverse(t: Table, address: Ip) -> Result<List<String>, Failure> =
     None -> Err(NoSuchName),
   }
 
-/// A deadline the host would refuse is refused in its words, so a twin run fails where a host run
-/// would.
-fn bounded(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
-  if timeout_ms <= 0 {
-    panic(
-      "`dns." ++ operation ++ "` was given a timeout of " ++ int_to_string(timeout_ms)
-        ++ " milliseconds",
-    )
-  } else { () }
-
-/// `go` with every lookup answered by the table.
+/// `go` with every lookup answered by the table, at once.
 pub fn on_table<a | e>(
   t: Table,
   go: () -> a / {dns.lookup, dns.reverse, dns.servers | e},
@@ -152,14 +177,8 @@ pub fn on_table<a | e>(
   handle {
     go()
   } with {
-    dns.lookup(name, timeout_ms) -> {
-      bounded("lookup", timeout_ms);
-      table_lookup(t, name)
-    },
-    dns.reverse(address, timeout_ms) -> {
-      bounded("reverse", timeout_ms);
-      table_reverse(t, address)
-    },
+    dns.lookup(name) -> table_lookup(t, name),
+    dns.reverse(address) -> table_reverse(t, address),
     dns.servers() -> t.servers,
   }
 
@@ -207,12 +226,12 @@ fn example() -> Table / {ip.refused, abort.raise} =
 test "a table answers a name whatever its case and final dot, an address as itself, and no other" {
   let found = on_table(example(), ||
     [
-      dns.lookup("example.org", 1000),
-      dns.lookup("EXAMPLE.org.", 1000),
-      dns.lookup("192.0.2.9", 1000),
-      dns.lookup("empty.example", 1000),
-      dns.lookup("slow.example", 1000),
-      dns.lookup("absent.example", 1000),
+      dns.lookup("example.org"),
+      dns.lookup("EXAMPLE.org."),
+      dns.lookup("192.0.2.9"),
+      dns.lookup("empty.example"),
+      dns.lookup("slow.example"),
+      dns.lookup("absent.example"),
     ]);
   let both = Ok([
     { address: ip::read("2001:db8::7"), ttl: None },
@@ -231,8 +250,8 @@ test "a table answers a name whatever its case and final dot, an address as itse
 test "a table answers an address's names and the servers it was given" {
   let asked = on_table(with_servers(example(), [ip::read_socket("192.0.2.53:53")]), || {
     {
-      known: dns.reverse(ip::read("192.0.2.7"), 1000),
-      unknown: dns.reverse(ip::read("192.0.2.8"), 1000),
+      known: dns.reverse(ip::read("192.0.2.7")),
+      unknown: dns.reverse(ip::read("192.0.2.8")),
       servers: dns.servers(),
     }
   });
@@ -241,9 +260,68 @@ test "a table answers an address's names and the servers it was given" {
   assert_eq(map(asked.servers, ip::render_socket), ["192.0.2.53:53"])
 }
 
-test "a table refuses a deadline the host would" {
-  let refused: Result<Result<List<Found>, Failure>, String> = try[abort.raise] {
-    on_table(table(), || dns.lookup("example.org", 0))
-  };
-  assert_eq(refused, Err("`dns.lookup` was given a timeout of 0 milliseconds"))
+test "a name that is not ASCII is refused and not looked up" {
+  let named = with_name(table(), "bücher.example", [ip::read("192.0.2.7")]);
+  assert_eq(on_table(named, || dns.lookup("bücher.example")), Err(not_ascii()));
+  assert_eq(on_table(named, || dns.lookup("xn--bcher-kva.example")), Err(NoSuchName))
+}
+
+/// `go` over a resolver that takes `takes` to answer `at` to any name and `example.org` to any
+/// address.
+fn slowly<a | e>(
+  takes: Duration,
+  at: Ip,
+  go: () -> a / {dns.lookup, dns.reverse | e},
+) -> a / {clock.write | e} =
+  handle {
+    go()
+  } with {
+    dns.lookup(name) -> {
+      clock.sleep(takes);
+      Ok([{ address: at, ttl: None }])
+    },
+    dns.reverse(address) -> {
+      clock.sleep(takes);
+      Ok(["example.org"])
+    },
+  }
+
+type Waited = { wait: Int, told: String }
+
+/// A wait longer than the three seconds the resolver takes, and one shorter.
+fn waits() -> List<Waited> =
+  [
+    { wait: 5, told: "is answered when it answers" },
+    { wait: 2, told: "is given up on at the deadline" },
+  ]
+
+test "a lookup that takes three seconds, waited on for {c.wait}, {c.told}" for c: Waited in waits(
+  ) {
+  simulate {
+    let at = ip::read("192.0.2.7");
+    let began = clock.now();
+    let found = slowly(seconds(3), at, ||
+      task::unbounded(|| resolve("example.org", seconds(c.wait))));
+    assert_eq(found, if c.wait > 3 { Ok([{ address: at, ttl: None }]) } else { Err(TimedOut) });
+    assert_eq(clock.now(), after(began, seconds(min(c.wait, 3))))
+  }
+}
+
+test "a reverse lookup that takes three seconds, waited on for {c.wait}, {c.told}" for c: Waited in waits(
+  ) {
+  simulate {
+    let at = ip::read("192.0.2.7");
+    let began = clock.now();
+    let named = slowly(seconds(3), at, || task::unbounded(|| names(at, seconds(c.wait))));
+    assert_eq(named, if c.wait > 3 { Ok(["example.org"]) } else { Err(TimedOut) });
+    assert_eq(clock.now(), after(began, seconds(min(c.wait, 3))))
+  }
+}
+
+test "a lookup under a deadline that is earlier than its own is stopped by that one" {
+  simulate {
+    let asked = slowly(seconds(3), ip::read("192.0.2.7"), ||
+      task::unbounded(|| task::timeout(seconds(1), || resolve("example.org", seconds(5)))));
+    assert_eq(asked, task::TimedOut)
+  }
 }

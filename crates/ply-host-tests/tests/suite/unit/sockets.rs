@@ -1150,7 +1150,7 @@ fn a_stream_operation_refuses_a_datagram_socket_and_a_datagram_one_a_stream() {
 
 fn lookup(b: &Bound, name: &str) -> Result<Vec<IpAddr>, String> {
     let answer = b
-        .perform(DNS, "lookup", None, vec![text(name), Value::Int(10_000)])
+        .perform(DNS, "lookup", None, vec![text(name)])
         .expect("a lookup is served");
     result(answer).map(|found| {
         found
@@ -1203,10 +1203,50 @@ fn localhost_resolves_to_loopback_and_each_address_once() {
 #[test]
 fn a_name_that_cannot_exist_is_a_failure_and_not_an_empty_answer() {
     let b = bound(Host::new());
-    let failed = lookup(&b, "no-such-host.invalid").expect_err("`.invalid` never resolves");
-    assert!(
-        ["NoSuchName", "NoData", "ServerFailure", "TimedOut"].contains(&failed.as_str()),
-        "{failed}"
+    // Which failure is the machine's resolver's to say: no such name where one answers, a server
+    // failure where none can be asked.
+    lookup(&b, "no-such-host.invalid").expect_err("`.invalid` never resolves");
+}
+
+/// `localhost` under a fullwidth `l`, which a resolver that maps one to ASCII finds at loopback.
+const FULLWIDTH_LOCALHOST: &str = "\u{ff4c}ocalhost";
+
+#[test]
+fn a_connection_by_a_name_that_is_not_ascii_is_not_made() {
+    let b = bound(Host::new());
+    let (listener, here) = b.listening(loopback());
+    let reached = b.net(
+        "connect",
+        "client",
+        vec![
+            text(FULLWIDTH_LOCALHOST),
+            Value::Int(i64::from(here.port)),
+            Value::Int(1000),
+        ],
+    );
+    assert!(maybe(reached).is_none());
+    b.close("listener", listener);
+}
+
+#[test]
+fn a_name_that_is_not_ascii_is_refused_and_not_looked_up() {
+    let b = bound(Host::new());
+    let answer = b
+        .perform(DNS, "lookup", None, vec![text(FULLWIDTH_LOCALHOST)])
+        .expect("a lookup is served");
+    let Value::Ctor { name, args } = &answer else {
+        panic!("not a `Result`: {answer:?}");
+    };
+    assert_eq!(name.as_str(), "Err");
+    let Value::Ctor { name, args } = &args[0] else {
+        panic!("not a `Failure`: {answer:?}");
+    };
+    assert_eq!(name.as_str(), "std.dns.Other");
+    assert_eq!(
+        args[1]
+            .as_str(Span::DUMMY, "what it says")
+            .expect("a String"),
+        ply_host::dns::NOT_ASCII
     );
 }
 
@@ -1218,23 +1258,17 @@ fn an_address_answers_to_a_name_or_says_it_has_none() {
             DNS,
             "reverse",
             None,
-            vec![
-                ply_host::tcp::wire::ip_value(loopback()),
-                Value::Int(10_000),
-            ],
+            vec![ply_host::tcp::wire::ip_value(loopback())],
         )
         .expect("a reverse lookup is served");
-    match result(answer) {
-        Ok(names) => assert!(
+    // A machine that names its loopback answers the name; one that does not says why.
+    if let Ok(names) = result(answer) {
+        assert!(
             !names
                 .as_list(Span::DUMMY, "names")
                 .expect("a List")
                 .is_empty()
-        ),
-        Err(why) => assert!(
-            ["NoSuchName", "ServerFailure", "TimedOut"].contains(&why.as_str()),
-            "{why}"
-        ),
+        );
     }
 }
 
@@ -1424,7 +1458,6 @@ fn the_shapes_the_handlers_build_are_the_ones_the_library_declares() {
         ("std.dns.NoSuchName", 0),
         ("std.dns.NoData", 0),
         ("std.dns.ServerFailure", 0),
-        ("std.dns.TimedOut", 0),
         ("std.dns.Other", 2),
     ] {
         assert_eq!(
