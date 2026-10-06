@@ -2436,7 +2436,9 @@ and its doc.
 
 The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
-std.<name>`. Its tests and obligations are skipped unless you pass `--std`.
+std.<name>`. Its tests and obligations are no project's: `ply test`, `ply prove`
+and `ply review` skip them unless you pass `--std`, which adds those of every
+module `ply std` lists, whichever of them the project imports.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one
@@ -2452,7 +2454,8 @@ counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
-dependent's proof is owed; `--std` reads each one whole.
+dependent's proof is owed; `--std` reads every module of the library, each one
+whole.
 
 ## 14. The host boundary
 
@@ -2732,7 +2735,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none, and the value of each `const fn` the program holds (§3.5), evaluated as `ply build` evaluates them; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
 | `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
 
