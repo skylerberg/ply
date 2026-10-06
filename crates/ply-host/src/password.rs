@@ -8,15 +8,14 @@
 //! Every number that multiplies the work is bounded before a thread is started: a program may
 //! perform these directly, and the parameters of a stored hash are whatever its writer chose.
 
-use crate::pool::{Bell, Inbox, JobOutput, PASSWORD_FIRST_TOKEN, Pool};
+use crate::pool::{JobOutput, Pool, Pooled};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
-use ply_eval::{Diagnostic, Pending, Span, Symbol, Value, codes};
+use ply_eval::{Diagnostic, Span, Symbol, Value, codes};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// Must match the effect `std.password` declares.
@@ -518,48 +517,14 @@ impl PasswordHost {
     pub fn new() -> PasswordHost {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         PasswordHost {
-            pool: Pool::queued(PASSWORD_FIRST_TOKEN, cores),
+            pool: Pool::queued(cores),
         }
     }
+}
 
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn park(&self) -> Result<(), Diagnostic> {
-        self.pool.park()
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        self.pool.block_on(pending)
+impl Pooled for PasswordHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
     }
 }
 

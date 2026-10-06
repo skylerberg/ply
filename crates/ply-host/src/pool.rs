@@ -1,8 +1,8 @@
 //! Where a host operation goes when it has to wait.
-//! One [`Pool`] per facility, minting in disjoint token ranges.
+//! One [`Pool`] per facility, all minting from one count of tokens.
 
 use ply_eval::{Diagnostic, Pending, Span, Symbol, Value, codes};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -10,66 +10,44 @@ use std::time::Duration;
 /// How many operations of a pool that gives each a thread may be outstanding at once.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 
-pub const NET_FIRST_TOKEN: u64 = 1;
+/// The token the next operation of any pool is given: one count for them all, so no two pools
+/// mint the same one, and none mints 0, which a zeroed `Pending` carries.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// Far enough above [`NET_FIRST_TOKEN`] that the two ranges never meet.
-pub const FS_FIRST_TOKEN: u64 = 1 << 62;
-
-/// Far enough above [`FS_FIRST_TOKEN`] that the two ranges never meet.
-pub const PROCESS_FIRST_TOKEN: u64 = 1 << 63;
-
-/// As far above [`PROCESS_FIRST_TOKEN`] as that is above [`FS_FIRST_TOKEN`].
-pub const PASSWORD_FIRST_TOKEN: u64 = 3 << 62;
-
-/// How a spawned process ended: its own code, or the signal that killed it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ended {
-    Exited(i64),
-    Signalled(i64),
+/// A facility whose operations wait on a pool of its own, which is all the runtime needs of it to
+/// route a token there.
+pub trait Pooled {
+    fn pool(&self) -> &Pool;
 }
 
-/// A `std.process.Finished`: how a child ended and what it left in each stream.
-pub struct Finished {
-    pub ended: Ended,
-    pub out: Vec<u8>,
-    pub err: Vec<u8>,
-}
-
-/// A `std.process.Heard`: what `process.output_line` answers.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Heard {
-    Said(String),
-    Quiet,
-    Closed,
-}
-
+/// What a job answered, in a form that crosses threads: the `Value` is built where it is polled.
 pub enum JobOutput {
-    Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
     Bool(bool),
+    /// What a read of a stream answered: empty at its end.
     Bytes(Vec<u8>),
-    MaybeBytes(Option<Vec<u8>>),
-    MaybeInt(Option<i64>),
-    /// `None` when it is not a directory this run can read.
-    MaybeStrings(Option<Vec<String>>),
-    /// `None` at end of input, which is what reading a line past the last one answers.
-    MaybeString(Option<String>),
-    /// A walk's entries, each a path and the kind constructor it names; `None` for no directory.
-    MaybeEntries(Option<Vec<(String, &'static str)>>),
-    /// A path's nine permission bits, as `std.fs.Mode` holds them.
-    MaybeMode(Option<u32>),
+    /// An answer in a shape of the facility's own.
+    Built(Box<dyn FnOnce() -> Value + Send>),
     /// A constructor with no fields, by the program-wide name the declaring module gives it.
     Ctor(&'static str),
-    /// A file's descriptor, or the `std.fs.Refused` that says why it did not open; and whether
-    /// it was opened to be written.
-    Opened(Result<i64, &'static str>, bool),
-    Finished(Finished),
-    /// `None` when the child was still running at the deadline.
-    MaybeFinished(Option<Finished>),
-    Heard(Heard),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
+    Int(i64),
+    MaybeBytes(Option<Vec<u8>>),
+    MaybeInt(Option<i64>),
+    /// `None` at end of input, which is what reading a line past the last one answers.
+    MaybeString(Option<String>),
+    /// `None` when it is not a directory this run can read.
+    MaybeStrings(Option<Vec<String>>),
     Refused(Diagnostic),
+}
+
+impl JobOutput {
+    /// An answer no variant here holds: `build` makes it on the thread that polls, from what the
+    /// job sends there.
+    pub fn built(build: impl FnOnce() -> Value + Send + 'static) -> JobOutput {
+        JobOutput::Built(Box::new(build))
+    }
 }
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
@@ -144,7 +122,6 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled by a job finishing, so neither `park` nor `block_on` spins.
     finished: Condvar,
-    next: AtomicU64,
     bell: OnceLock<Arc<Bell>>,
     /// Where jobs wait for a thread; `None` for a pool that starts one for each.
     queue: Option<Queue>,
@@ -181,35 +158,35 @@ impl Drop for Pool {
     }
 }
 
+impl Default for Pool {
+    fn default() -> Pool {
+        Pool::new()
+    }
+}
+
 impl Pool {
     /// A pool that starts a thread for each operation, [`MAX_BLOCKING_OPERATIONS`] at most.
-    /// `first` starts this pool's token range, which must not overlap another pool's.
-    pub fn new(first: u64) -> Pool {
-        Pool::over(first, None)
+    pub fn new() -> Pool {
+        Pool::over(None)
     }
 
     /// A pool whose operations wait their turn for one of `threads` threads, however many are
     /// submitted: for work that fills a core, where a thread each would finish none sooner and a
     /// bound on how many wait would refuse a burst. A thread is started when an operation first
     /// needs one, and ends when the pool is dropped.
-    pub fn queued(first: u64, threads: usize) -> Pool {
-        Pool::over(
-            first,
-            Some(Queue {
-                line: Mutex::new(Line::default()),
-                posted: Condvar::new(),
-                threads: threads.max(1),
-            }),
-        )
+    pub fn queued(threads: usize) -> Pool {
+        Pool::over(Some(Queue {
+            line: Mutex::new(Line::default()),
+            posted: Condvar::new(),
+            threads: threads.max(1),
+        }))
     }
 
-    fn over(first: u64, queue: Option<Queue>) -> Pool {
+    fn over(queue: Option<Queue>) -> Pool {
         Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 finished: Condvar::new(),
-                // Token 0 is never minted, so a zeroed `Pending` belongs to no pool.
-                next: AtomicU64::new(first),
                 bell: OnceLock::new(),
                 queue,
             }),
@@ -233,7 +210,7 @@ impl Pool {
         what: &'static str,
         job: Job,
     ) -> Result<Pending, Diagnostic> {
-        let token = self.shared.next.fetch_add(1, Ordering::Relaxed);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         if let Some(queue) = &self.shared.queue {
             return self.enqueue(queue, token, span, label, what, job);
         }
@@ -483,104 +460,43 @@ fn take(state: &mut State, token: u64) -> Taken {
         None => (Span::DUMMY, "a host operation"),
     };
     Taken::Ready(match done {
-        JobOutput::Int(i) => Ok(Value::Int(i)),
         JobOutput::Bool(b) => Ok(Value::Bool(b)),
         JobOutput::Bytes(b) => Ok(Value::bytes(b)),
-        JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
-        JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
-        JobOutput::MaybeStrings(names) => {
-            Ok(option(names.map(|names| {
-                Value::list(names.into_iter().map(Value::str).collect())
-            })))
-        }
-        JobOutput::MaybeString(text) => Ok(option(text.map(Value::str))),
-        JobOutput::MaybeEntries(entries) => Ok(option(entries.map(|entries| {
-            Value::list(
-                entries
-                    .into_iter()
-                    .map(|(path, kind)| entry(path, kind))
-                    .collect(),
-            )
-        }))),
-        JobOutput::MaybeMode(bits) => Ok(option(bits.map(mode))),
+        JobOutput::Built(build) => Ok(build()),
         JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
-        JobOutput::Opened(Ok(descriptor), _) => Ok(Value::ctor("Ok", vec![Value::Int(descriptor)])),
-        JobOutput::Opened(Err(why), _) => {
-            Ok(Value::ctor("Err", vec![Value::ctor(why, Vec::new())]))
-        }
-        JobOutput::Finished(exit) => Ok(finished(exit)),
-        JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
-        JobOutput::Heard(heard) => Ok(heard_value(heard)),
-        JobOutput::Refused(diagnostic) => Err(diagnostic),
         JobOutput::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!("{what} failed: {message}"),
         )
         .primary(span, "this operation reached the host and the host refused")),
+        JobOutput::Int(i) => Ok(Value::Int(i)),
+        JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
+        JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
+        JobOutput::MaybeString(text) => Ok(option(text.map(Value::str))),
+        JobOutput::MaybeStrings(names) => {
+            Ok(option(names.map(|names| {
+                Value::list(names.into_iter().map(Value::str).collect())
+            })))
+        }
+        JobOutput::Refused(diagnostic) => Err(diagnostic),
     })
 }
 
-/// The record `std.process.Finished` names, built where the `Value` will live.
-fn finished(exit: Finished) -> Value {
-    let ended = match exit.ended {
-        Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
-        Ended::Signalled(signal) => Value::ctor("std.process.Signalled", vec![Value::Int(signal)]),
-    };
-    let fields: BTreeMap<Symbol, Value> = BTreeMap::from([
-        (Symbol::new("ended"), ended),
-        (Symbol::new("err"), Value::bytes(exit.err)),
-        (Symbol::new("out"), Value::bytes(exit.out)),
-    ]);
-    Value::Record(Arc::new(fields.into_iter().collect()))
+/// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.
+pub(crate) fn option(v: Option<Value>) -> Value {
+    match v {
+        Some(v) => Value::ctor("Some", vec![v]),
+        None => Value::ctor("None", Vec::new()),
+    }
 }
 
-/// The record `std.fs.Entry` names.
-fn entry(path: String, kind: &'static str) -> Value {
-    record([
-        ("kind", Value::ctor(kind, Vec::new())),
-        ("path", Value::str(path)),
-    ])
-}
-
-/// The record `std.fs.Mode` names, each `std.fs.Access` one triple of its bits.
-fn mode(bits: u32) -> Value {
-    let access = |triple: u32| {
-        record([
-            ("execute", Value::Bool(triple & 1 != 0)),
-            ("read", Value::Bool(triple & 4 != 0)),
-            ("write", Value::Bool(triple & 2 != 0)),
-        ])
-    };
-    record([
-        ("group", access(bits >> 3 & 7)),
-        ("other", access(bits & 7)),
-        ("owner", access(bits >> 6 & 7)),
-    ])
-}
-
-fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
+pub(crate) fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
     Value::Record(Arc::new(
         fields
             .into_iter()
             .map(|(name, value)| (Symbol::new(name), value))
             .collect(),
     ))
-}
-
-fn heard_value(heard: Heard) -> Value {
-    match heard {
-        Heard::Said(line) => Value::ctor("std.process.Said", vec![Value::str(line)]),
-        Heard::Quiet => Value::ctor("std.process.Quiet", Vec::new()),
-        Heard::Closed => Value::ctor("std.process.Closed", Vec::new()),
-    }
-}
-
-/// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.
-fn option(v: Option<Value>) -> Value {
-    match v {
-        Some(v) => Value::ctor("Some", vec![v]),
-        None => Value::ctor("None", Vec::new()),
-    }
 }
 
 #[cold]
