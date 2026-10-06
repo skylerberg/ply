@@ -29,6 +29,54 @@ fn plain() -> String =
   \\}
   \\
 
+/// Opens a connection to its own listener and secures it at both ends, as a `STARTTLS` does, the
+/// server's half in a task of its own since each half waits on the other. It ends by a panic
+/// that says which half refused, and why: the client's where both did, since a client that
+/// refuses its server is what the server then fails on.
+fn upgrading() -> String =
+  \\import std.ip
+  \\import std.net
+  \\import std.net (net)
+  \\
+  \\fn served(s: Int) -> Result<Bytes, String> / {net.write[conn]} =
+  \\  match net.serve_tls[conn](s, "api", [], b"", 5000) {
+  \\    Err(why) -> Err("the server's half: " ++ net::refusal_message(why)),
+  \\    Ok(_) -> match net.recv[conn](s, 64, 5000) {
+  \\      Some(heard) -> Ok(heard),
+  \\      None -> Err("nothing came over the secured connection"),
+  \\    },
+  \\  }
+  \\
+  \\fn main() -> Int / {net.read[listener], net.write[listener], net.write[conn], net.write[client], task.write, abort.raise} = {
+  \\  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+  \\    Ok(l) -> l,
+  \\    Err(why) -> panic("no listener: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let here = match net.local_address[listener](l) {
+  \\    Some(here) -> here,
+  \\    None -> panic("a listener has an address"),
+  \\  };
+  \\  let c = match net.connect_to[client](here, [], 5000) {
+  \\    Ok(c) -> c,
+  \\    Err(why) -> panic("no connection: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let s = net.accept[listener](l);
+  \\  let serving = task.spawn(|| served(s));
+  \\  let secured = net.start_tls[client](c, "localhost", [], b"", 5000);
+  \\  let sent = match secured { Ok(_) -> net.send[client](c, b"secured", 5000), Err(_) -> None };
+  \\  net.close[client](c);
+  \\  let heard = task.join(serving);
+  \\  net.close[conn](s);
+  \\  net.close[listener](l);
+  \\  match ((secured, heard)) {
+  \\    (Err(why), _) -> panic("the client's half: " ++ net::refusal_message(why)),
+  \\    (Ok(_), Err(why)) -> panic(why),
+  \\    (Ok(_), Ok(bytes)) -> if sent == Some(7) && bytes == b"secured" { 0 }
+  \\    else { panic("the secured connection carried something else") },
+  \\  }
+  \\}
+  \\
+
 /// Reaches the boundary without touching a socket.
 fn no_socket() -> String = "fn main() -> Int = simulate { spawn { 1 }; 2 }\n"
 
@@ -67,6 +115,23 @@ test/nondet "the listing discloses the TLS stack and the credential it was given
     Some("the credential must be named with its fingerprint:\n" ++ text),
   );
   assert(string_contains(text, "digest: b3:"), Some(text))
+}
+
+test/nondet "an open connection is secured at both ends by a run that holds and trusts the credential" {
+  program(upgrading());
+  let api = credential("api");
+  let r = on_disk(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
+  assert(r.code == 0, Some(said(r)));
+  // The same run without the certificate trusted: the client's half refuses it, typed.
+  let untrusted = on_disk(["run", "--host", "--tls", spec("api", api)]);
+  assert(untrusted.code != 0, Some(said(untrusted)));
+  assert(
+    string_contains(
+      said(untrusted),
+      "the client's half: the peer's certificate is not trusted for that name",
+    ),
+    Some(said(untrusted)),
+  )
 }
 
 test "a program that touches no socket reports no transport" {

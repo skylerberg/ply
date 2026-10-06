@@ -2703,9 +2703,9 @@ checked against that declaration, so it performs none of it.
 
 | flag | meaning |
 | --- | --- |
-| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")`; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` accepts beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
-| `--fs NAME=PATH` | repeatable filesystem root; `E0454` if not a directory |
+| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--fs NAME=PATH` | repeatable filesystem root, which is also where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
@@ -2867,7 +2867,7 @@ machine. Each package's token is the configuration key `token.<name>` — one ex
 name per key, so a `--config` file of `token.orders=...` lines is the whole of
 who may publish what. It serves one connection at a time, and takes a package's
 lock around every write, so two registries over one store never interleave one.
-Like every Ply listener it binds `127.0.0.1`: another machine reaches it through a
+Like every Ply listener it binds loopback, here `127.0.0.1`: another machine reaches it through a
 proxy in front of it, one that passes TLS through to a `--tls` registry or
 terminates it for a plain one.
 
