@@ -1707,7 +1707,9 @@ raise in another clause goes to a `handle` further out than the one whose
 clause raised. A clause answers the raise it names and leaves the effect's
 others to pass. A raise no clause answers ends the run with `E0502`, naming the
 operation and what it carried; a test's is its failure, which is why a raise is
-in no footprint (§8.4).
+in no footprint (§8.4). One raise is the host's own under `ply run --host`:
+`std.process`'s `pipe.broken`, unanswered, ends the run as the closed pipe it
+reports would have, with nothing written and status 141 (§16).
 
 `try { body }` answers `Ok` of what `body` answers, or `Err` of what a raise in
 it carried: the value for a raise of one parameter, `()` for one of none, and
@@ -2671,7 +2673,7 @@ deterministic handlers, whose answers are a function of what they are handed, as
 `std.password`'s hashes are, is cached like any other. An operation performed
 inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.signal` and `std.process` are bound only
+once per interleaving. `std.signal`, `std.process` and `std.term` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
 test run binds `process.bound`, `process.spawn`, `process.start` and the
 operations on a started child, which reach only the programs `--exec` names. All
@@ -2901,11 +2903,17 @@ not hold, is `E0461`.
 ## 16. The `ply` command
 
 `ply [--color auto|always|never] <command> [path] [options]`. `--color` is
-global; `auto` colours only a terminal with `NO_COLOR` unset. The path defaults
+global and outranks the environment; `auto` decides as `std.term`'s `decide`
+does (`ply doc std.term`), each variable counting where it is set and not
+empty, whatever its value: colour where `FORCE_COLOR` is set (force-color.org);
+else none where `NO_COLOR` is set (no-color.org); else colour where
+`CLICOLOR_FORCE` is set (bixense.com/clicolors); else colour only on a terminal
+whose `TERM` is not `dumb`. The path defaults
 to `.`. Every command takes `--json` and then prints exactly one JSON object on
 stdout, compact and with its keys sorted.
 
-The command reads its own environment: `NO_COLOR`, `PLY_CACHE_UPSTREAM` (§1),
+The command reads its own environment: `NO_COLOR`, `FORCE_COLOR`,
+`CLICOLOR_FORCE`, `TERM`, `COLORTERM`, `PLY_CACHE_UPSTREAM` (§1),
 `PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the backend's `PLY_C_*`
 (§8.6), and `PLY_TRUST` — PEM files, colon-separated, whose certificates the
 command's own HTTPS connections (a registry's, for `ply publish`, `ply yank` and
@@ -2921,6 +2929,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 3 | the drain deadline expired with requests in flight |
 | 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
+| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
 and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,

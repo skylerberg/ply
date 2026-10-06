@@ -116,24 +116,24 @@ impl HostHandler for Operation {
                         Err(_) if !name.is_ascii() => Err(Failure::Other(0, NOT_ASCII.to_string())),
                         Err(_) => system::addresses(&name),
                     };
-                    JobOutput::Made(Box::new(move || match answer {
+                    JobOutput::built(move || match answer {
                         Ok(addresses) => {
                             wire::ok(Value::list(addresses.into_iter().map(found).collect()))
                         }
                         Err(failure) => failed(&failure),
-                    }))
+                    })
                 })
             }
             Op::Reverse => {
                 let address = wire::ip_of(&req.args[0], span)?;
                 self.net.waiting(span, "reverse", self.op.what(), move || {
                     let answer = system::names(address);
-                    JobOutput::Made(Box::new(move || match answer {
+                    JobOutput::built(move || match answer {
                         Ok(names) => {
                             wire::ok(Value::list(names.into_iter().map(Value::str).collect()))
                         }
                         Err(failure) => failed(&failure),
-                    }))
+                    })
                 })
             }
             Op::Servers => Ok(HostAnswer::Value(Value::list(

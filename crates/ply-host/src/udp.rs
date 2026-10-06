@@ -79,10 +79,10 @@ fn settled<T: Send + 'static>(
     outcome: Result<T, Refusal>,
     value: impl FnOnce(T) -> Value + Send + 'static,
 ) -> JobOutput {
-    JobOutput::Made(Box::new(move || match outcome {
+    JobOutput::built(move || match outcome {
         Ok(found) => wire::ok(value(found)),
         Err(refusal) => wire::err(&refusal),
-    }))
+    })
 }
 
 impl HostHandler for Operation {

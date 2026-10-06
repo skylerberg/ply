@@ -1,0 +1,212 @@
+//! What the machine and the process a program runs in say of themselves, as an effect.
+//!
+//! Every answer is the host's and none is a function of the program, so the effect is `nondet`:
+//! an answer differs from one machine to the next, and `pid`, `hostname` and `cpus` from one run
+//! to the next, so a test fixes them over a `Machine` with `on`, and can run the branch for a
+//! system it is not on. None of them reads the environment, which is `std.config`'s: `user`
+//! asks the system's own records for the name of the process's user id, and `hostname` asks the
+//! kernel and no resolver.
+//!
+//! They describe the machine a program runs on, never the one that built it. A `const fn`
+//! performs nothing, so no build keeps an answer, and a built artifact asks again where it runs:
+//! `endian` and `pointer_bits` are operations for that reason.
+
+/// The facts. `family`, `arch`, `endian`, `pointer_bits`, `pid`, `user` and `executable` hold
+/// for a whole run; `name`, `hostname` and `cpus` are what the system says when it is asked.
+pub nondet effect os {
+  /// The operating system.
+  read family() -> Family
+  /// The system's own name for itself and its release, as `uname -sr` prints them:
+  /// `Darwin 24.6.0`, `Linux 6.8.0-45-generic`.
+  read name() -> String
+  /// The processor architecture the running `ply` was built for.
+  read arch() -> Arch
+  /// How many processors the process may run on at once, at least one: what its affinity mask
+  /// and its control group's quota leave it of the machine's, where the system says. It is how
+  /// many workers to start, not how many processors the machine has.
+  read cpus() -> Int
+  /// The name the kernel holds for the machine, as `gethostname` answers it.
+  read hostname() -> String
+  /// The user the process runs as.
+  read user() -> User
+  /// The process's id.
+  read pid() -> Int
+  /// The absolute path of the executable the process is running, its links followed, which under
+  /// `ply run` is `ply` itself; `None` where the system does not say.
+  read executable() -> Option<String>
+  /// The byte order of the machine's words.
+  read endian() -> Endian
+  /// The width of an address on the machine, in bits: 64 or 32.
+  read pointer_bits() -> Int
+}
+
+/// An operating system, with `OtherFamily` holding the toolchain's name for one not listed.
+pub type Family = | Linux | MacOs | Windows | FreeBsd | OpenBsd | NetBsd | OtherFamily(String)
+
+/// A processor architecture, with `OtherArch` holding the toolchain's name for one not listed.
+pub type Arch = | X86_64 | Aarch64 | X86 | Arm | Riscv64 | OtherArch(String)
+
+/// A byte order.
+pub type Endian = | Little | Big
+
+/// A user: its numeric id, and the name the system's records give that id, which a container
+/// run under an arbitrary id has none of.
+pub type User = { id: Int, name: Option<String> }
+
+/// The name tools give an operating system: `linux`, `macos`, `windows`, `freebsd`, `openbsd`,
+/// `netbsd`.
+pub fn family_name(f: Family) -> String =
+  match f {
+    Linux -> "linux",
+    MacOs -> "macos",
+    Windows -> "windows",
+    FreeBsd -> "freebsd",
+    OpenBsd -> "openbsd",
+    NetBsd -> "netbsd",
+    OtherFamily(name) -> name,
+  }
+
+/// The name tools give an architecture: `x86_64`, `aarch64`, `x86`, `arm`, `riscv64`.
+pub fn arch_name(a: Arch) -> String =
+  match a {
+    X86_64 -> "x86_64",
+    Aarch64 -> "aarch64",
+    X86 -> "x86",
+    Arm -> "arm",
+    Riscv64 -> "riscv64",
+    OtherArch(name) -> name,
+  }
+
+/// Whether a system is one of the Unix family: every listed one but Windows.
+pub fn is_unix(f: Family) -> Bool = match f { Windows -> false, OtherFamily(_) -> false, _ -> true }
+
+// --- The twin ---------------------------------------------------------------
+
+/// What a test hands `on` in place of the host: an answer for each operation.
+pub type Machine = {
+  family: Family,
+  name: String,
+  arch: Arch,
+  cpus: Int,
+  hostname: String,
+  user: User,
+  pid: Int,
+  executable: Option<String>,
+  endian: Endian,
+  pointer_bits: Int,
+}
+
+/// A machine to start a test's from: an x86-64 Linux of four processors, a test updating the
+/// facts it is about.
+pub fn machine() -> Machine =
+  {
+    family: Linux,
+    name: "Linux 6.8.0",
+    arch: X86_64,
+    cpus: 4,
+    hostname: "host",
+    user: { id: 1000, name: Some("user") },
+    pid: 4242,
+    executable: Some("/usr/local/bin/ply"),
+    endian: Little,
+    pointer_bits: 64,
+  }
+
+/// `go` run on the machine `m`: every operation answered from it.
+pub fn on<a | e>(m: Machine, go: () -> a / {os.read | e}) -> a / e =
+  handle {
+    go()
+  } with {
+    os.family() -> m.family,
+    os.name() -> m.name,
+    os.arch() -> m.arch,
+    os.cpus() -> m.cpus,
+    os.hostname() -> m.hostname,
+    os.user() -> m.user,
+    os.pid() -> m.pid,
+    os.executable() -> m.executable,
+    os.endian() -> m.endian,
+    os.pointer_bits() -> m.pointer_bits,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+/// A log line's prefix, as a service names where it runs.
+fn origin() -> String / {os.hostname, os.pid, os.user} =
+  match os.user().name {
+    Some(name) -> name ++ "@" ++ os.hostname() ++ "[" ++ int_to_string(os.pid()) ++ "]",
+    None ->
+      int_to_string(os.user().id) ++ "@" ++ os.hostname() ++ "[" ++ int_to_string(os.pid()) ++ "]",
+  }
+
+/// Where a tool keeps its settings, by the system's convention.
+fn settings_dir(home: String) -> String / {os.family} =
+  match os.family() {
+    Windows -> home ++ "\\AppData\\Roaming\\tool",
+    MacOs -> home ++ "/Library/Application Support/tool",
+    _ -> home ++ "/.config/tool",
+  }
+
+/// One worker for each processor the process may use, keeping one free where there are several.
+fn workers() -> Int / {os.cpus} = max(1, os.cpus() - 1)
+
+test "a test fixes every fact, so what reads them is det" {
+  let m = machine();
+  on(m, || {
+    assert_eq(os.family(), Linux);
+    assert_eq(os.name(), "Linux 6.8.0");
+    assert_eq(os.arch(), X86_64);
+    assert_eq(os.cpus(), 4);
+    assert_eq(os.hostname(), "host");
+    assert_eq(os.user(), { id: 1000, name: Some("user") });
+    assert_eq(os.pid(), 4242);
+    assert_eq(os.executable(), Some("/usr/local/bin/ply"));
+    assert_eq(os.endian(), Little);
+    assert_eq(os.pointer_bits(), 64)
+  });
+  assert_eq(on(m, origin), "user@host[4242]");
+  assert_eq(on({ ..m, user: { id: 70123, name: None } }, origin), "70123@host[4242]")
+}
+
+test "the branch for another system runs on any machine" for f: Family in [
+    Linux,
+    MacOs,
+    Windows,
+    FreeBsd,
+    OtherFamily("plan9"),
+  ] {
+  let dir = on({ ..machine(), family: f }, || settings_dir("/home/ada"));
+  assert_eq(dir, match f {
+    Windows -> "/home/ada\\AppData\\Roaming\\tool",
+    MacOs -> "/home/ada/Library/Application Support/tool",
+    _ -> "/home/ada/.config/tool",
+  })
+}
+
+test "work is sized by the processors the process may use" {
+  assert_eq(on({ ..machine(), cpus: 16 }, workers), 15);
+  assert_eq(on({ ..machine(), cpus: 1 }, workers), 1)
+}
+
+test "a family and an architecture have the names tools give them, and an unlisted one its own" {
+  assert_eq(map([Linux, MacOs, Windows, FreeBsd, OpenBsd, NetBsd], family_name), [
+    "linux",
+    "macos",
+    "windows",
+    "freebsd",
+    "openbsd",
+    "netbsd",
+  ]);
+  assert_eq(family_name(OtherFamily("illumos")), "illumos");
+  assert_eq(map([X86_64, Aarch64, X86, Arm, Riscv64], arch_name), [
+    "x86_64",
+    "aarch64",
+    "x86",
+    "arm",
+    "riscv64",
+  ]);
+  assert_eq(arch_name(OtherArch("s390x")), "s390x");
+  assert(is_unix(MacOs));
+  assert(!is_unix(Windows));
+  assert(!is_unix(OtherFamily("wasi")))
+}
