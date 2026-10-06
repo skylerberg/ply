@@ -30,11 +30,12 @@ import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOut
              NodeFn, NodeType, NodeEffect)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
-              WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
-              root_facts_bin, test_owner, cases_root, listing_ty, witness_order_bin, elaborated,
-              ended, stated, elaboration_with, updated_mods, check_front_with, is_prelude_effect,
-              Builtin, builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin,
-              written_counts, InstanceInfo, NumericInfo)
+              WitnessOrder, LabelSite, OperandSite, TrySite, UpdateShape, WitnessOp, WitnessRef,
+              facts_at, facts_by_owner, filed_facts, foreign_facts, no_root_facts, root_facts_bin,
+              test_owner, cases_root, listing_ty, witness_order_bin, elaborated, ended, stated,
+              elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
+              builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts,
+              InstanceInfo, NumericInfo)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -1772,6 +1773,159 @@ fn walked_of(mods: List<ParsedModule>, checked: CheckOutput) -> WalkedFacts =
       None -> no_root_facts(),
     },
   }
+
+/// What an analysis's check read beside each body's own row, as its answer carries it.
+pub fn walked_facts(analysis: Analysis) -> WalkedFacts = walked_of(analysis.mods, analysis.checked)
+
+/// The modules a wanted root is in, which are the only ones lowered; `None` lowers them all.
+pub fn lowered_modules(
+  wanted: Option<Map<Bytes, Bool>>,
+) -> Option<Map<Bytes, Bool>> / {abort.raise} =
+  match wanted {
+    None -> None,
+    Some(w) ->
+      Some(
+        map_fold(w, map_new(), |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
+          map_insert(acc, module_of_root(root), true)),
+      ),
+  }
+
+pub fn lowers(lowered: Option<Map<Bytes, Bool>>, module: Bytes) -> Bool =
+  match lowered { None -> true, Some(m) -> map_contains(m, module) }
+
+/// A clause's, test's or law's root is its owner's name then `#`; a module is a name less its last
+/// segment.
+pub fn module_of_root(root: Bytes) -> Bytes / {abort.raise} = {
+  let owner = match bytes_index_of(root, b"#") { Some(i) -> bytes_slice(root, 0, i), None -> root };
+  let dot = fold(range(0, bytes_len(owner)), 0 - 1, |acc: Int, i: Int|
+    if bytes_at(owner, i) == 46 { i } else { acc });
+  if dot < 0 { b"" } else { bytes_slice(owner, 0, dot) }
+}
+
+type Gathered = { facts: RootFacts, missing: Option<Bytes> }
+
+fn gathered(
+  g: Gathered,
+  owner: Bytes,
+  filed: Option<Bytes>,
+  module: Int,
+  start: Int,
+) -> Gathered / {abort.raise} =
+  match g.missing {
+    Some(_) -> g,
+    None -> match filed {
+      None -> { ..g, missing: Some(owner) },
+      Some(bytes) -> match facts_at(bytes, module, start, owner) {
+        None -> { ..g, missing: Some(owner) },
+        Some(f) ->
+          {
+            ..g,
+            facts: {
+              label_sites: concat(g.facts.label_sites, f.label_sites),
+              updates: concat(g.facts.updates, f.updates),
+              ops: concat(g.facts.ops, f.ops),
+              refs: concat(g.facts.refs, f.refs),
+              operands: concat(g.facts.operands, f.operands),
+              tries: concat(g.facts.tries, f.tries),
+            },
+          },
+      },
+    },
+  }
+
+/// What the front end's check read of the bodies lowered here, on the indices their modules have
+/// here: each wanted body's facts from its row, placed where its definition now starts, and what
+/// the answer carries beside the rows. A wanted body the answer holds no facts for is not lowered
+/// from a guess; one that is not wanted needs none, and a module the front end read through its
+/// stub has tests the answer never held.
+pub fn facts_read(
+  rows: Rows,
+  w: WalkedFacts,
+  wanted: Option<Map<Bytes, Bool>>,
+  mods: List<ParsedModule>,
+) -> Result<EmitFacts, Bytes> / {abort.raise} = {
+  let here = fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(mods, i).name, i));
+  let moved = fold(range(0, len(w.modules)), map_new(), |acc: Map<Int, Int>, i: Int|
+    match map_get(here, at(w.modules, i)) { Some(j) -> map_insert(acc, i, j), None -> acc });
+  let defs = fold(rows.defs, map_new(), |acc: Map<Bytes, Bytes>, row: KnownDefRow|
+    map_insert(acc, row.name, row.facts));
+  let tests = fold(rows.tests, map_new(), |acc: Map<Bytes, Bytes>, row: KnownTestRow|
+    map_insert(acc, row.owner, row.facts));
+  // A clause's and a law's sites are walked afresh by every check, so they come as they stand.
+  let loose: RootFacts = {
+    label_sites: fold(w.loose.label_sites, [], |acc: List<LabelSite>, x: LabelSite|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+    updates: fold(w.loose.updates, [], |acc: List<UpdateShape>, x: UpdateShape|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+    ops: fold(w.loose.ops, [], |acc: List<WitnessOp>, x: WitnessOp|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+    refs: fold(w.loose.refs, [], |acc: List<WitnessRef>, x: WitnessRef|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+    operands: fold(w.loose.operands, [], |acc: List<OperandSite>, x: OperandSite|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+    tries: fold(w.loose.tries, [], |acc: List<TrySite>, x: TrySite|
+      match map_get(moved, x.module) { Some(j) -> push(acc, { ..x, module: j }), None -> acc }),
+  };
+  let lowered = lowered_modules(wanted);
+  let read = fold(range(0, len(mods)), { facts: loose, missing: None }, |g: Gathered, i: Int| {
+    let m = at(mods, i);
+    if !lowers(lowered, m.name) { g } else {
+      fold(
+        m.module.items,
+        { g: g, position: 0 },
+        |acc: { g: Gathered, position: Int }, item: Item|
+          match item {
+            IFn(d) -> {
+              let owner = qualify(m.name, d.name.name);
+              if !wants(wanted, owner) { acc }
+              else { { ..acc, g: gathered(acc.g, owner, map_get(defs, owner), i, d.span.start) } }
+            },
+            ITest(d) -> {
+              let owner = test_owner(m.name, acc.position);
+              let listed = d.cases != None && wants(wanted, cases_root(owner));
+              {
+                g: if !wants(wanted, owner) && !listed { acc.g }
+                else { gathered(acc.g, owner, map_get(tests, owner), i, d.span.start) },
+                position: acc.position + 1,
+              }
+            },
+            _ -> acc,
+          },
+      ).g
+    }
+  });
+  match read.missing {
+    Some(owner) ->
+      Err(
+        bytes_concat_all([
+          b"the front end's answer holds nothing its check read of `",
+          owner,
+          b"`, so it is not lowered",
+        ]),
+      ),
+    None ->
+      Ok({
+        pure: w.pure,
+        label_sites: read.facts.label_sites,
+        elaboration: {
+          updates: read.facts.updates,
+          ops: read.facts.ops,
+          refs: read.facts.refs,
+          orders: fold(w.orders, [], |acc: List<WitnessOrder>, x: WitnessOrder|
+            match map_get(moved, x.module) {
+              Some(j) -> push(acc, { ..x, module: j }),
+              None -> acc,
+            }),
+          tries: read.facts.tries,
+        },
+        operands: read.facts.operands,
+      }),
+  }
+}
+
+pub fn wants(wanted: Option<Map<Bytes, Bool>>, name: Bytes) -> Bool =
+  match wanted { None -> true, Some(m) -> map_contains(m, name) }
 
 /// What each definition's rows are filed under: the check key the checker gave it, and its hash
 /// where the checker had nothing to key it by.
