@@ -1,0 +1,126 @@
+//! `std.idna` against `IdnaTestV2.txt`, the conformance test of UTS #46: every line of it, a
+//! hundred or so to a case, converted both ways under every check. The test asks that a
+//! conversion fail exactly where a line lists a status, and that what it makes of the name be
+//! the line's; `X4_2`, which the file keeps for an empty label where `to_unicode` measures none,
+//! is no failure of `to_unicode`'s. Transitional processing is not offered, and its columns are
+//! not read.
+
+import std.idna
+import std.list (at, take)
+import std.utf16
+import ucd_files
+import ucd_files (Block, spelled, trimmed)
+
+/// A line of the test: a name, what `to_unicode` and `to_ascii` make of it, and the statuses
+/// each is listed with.
+type Line = {
+  source: String,
+  unicode: String,
+  unicode_status: List<String>,
+  ascii: String,
+  ascii_status: List<String>,
+}
+
+/// The sixteen-bit units read so far, and how many characters of an escape are still to pass.
+type Unescaping = { units: List<Int>, passing: Int }
+
+/// A column's text, its `\uXXXX` escapes read as the units they name: `None` where they pair off
+/// into no text, as a test of a lone surrogate's does.
+fn unescaped(column: String) -> Option<String> / {abort.raise} = {
+  let chars = array_of_list(string_chars(column));
+  let read = fold(
+    range(0, array_len(chars)),
+    { units: [], passing: 0 },
+    |so_far: Unescaping, i: Int|
+      if so_far.passing > 0 { { units: so_far.units, passing: so_far.passing - 1 } }
+      else if array_at(chars, i) == Some('\\') && array_at(chars, i + 1) == Some('u') {
+        {
+          units: push(
+            so_far.units,
+            ucd_files::hex(bytes_of_string(string_slice(column, i + 2, i + 6))),
+          ),
+          passing: 5,
+        }
+      } else {
+        {
+          units: fold(
+            utf16::units(string_slice(column, i, i + 1)),
+            so_far.units,
+            |all: List<Int>, unit: Int| push(all, unit),
+          ),
+          passing: 0,
+        }
+      },
+  );
+  match try { utf16::of_units(read.units) } { Ok(text) -> Some(text), Err(_) -> None }
+}
+
+/// The statuses a column lists between its brackets; none for a blank column or an empty pair.
+fn statuses(column: String) -> List<String> / {abort.raise} =
+  if string_len(column) < 2 { [] } else {
+    filter(
+      map(string_split(string_slice(column, 1, string_len(column) - 1), ","), string_trim),
+      |status: String| status != "",
+    )
+  }
+
+/// A column of text as the file writes one: `""` for the empty text, and blank for `otherwise`.
+fn column(written: String, otherwise: Option<String>) -> Option<String> / {abort.raise} =
+  if written == "" { otherwise } else if written == "\"\"" { Some("") } else { unescaped(written) }
+
+/// Every line of the test whose texts are texts.
+fn lines() -> List<Line> / {abort.raise} =
+  fold(bytes_split(ucd_files::idna_test(), b"\n"), [], |found: List<Line>, line: Bytes| {
+    let data = match bytes_index_of_byte(line, b'#') {
+      Some(i) -> bytes_slice(line, 0, i),
+      None -> line,
+    };
+    let columns = map(bytes_split(data, b";"), |part: Bytes| string_of_bytes(trimmed(part)));
+    if len(columns) < 6 { found } else {
+      let source = column(at(columns, 0), Some(""));
+      let unicode = column(at(columns, 1), source);
+      let ascii = column(at(columns, 3), unicode);
+      match ((source, unicode, ascii)) {
+        (Some(s), Some(u), Some(a)) ->
+          push(found, {
+            source: s,
+            unicode: u,
+            unicode_status: statuses(at(columns, 2)),
+            ascii: a,
+            ascii_status: if at(columns, 4) == "" { statuses(at(columns, 2)) }
+            else { statuses(at(columns, 4)) },
+          }),
+        _ -> found,
+      }
+    }
+  })
+
+fn blocks() -> List<Block<Line>> / {abort.raise} =
+  ucd_files::blocks(lines(), 128, |l: Line| spelled(l.source))
+
+/// Whether both conversions of a line's name are what the line says.
+fn conforms(l: Line) -> Bool / {abort.raise} = {
+  let shown = idna::to_unicode(l.source, idna::strict());
+  let fails = len(filter(l.unicode_status, |status: String| status != "X4_2")) > 0;
+  shown.name == l.unicode && len(shown.problems) > 0 == fails
+    && (match idna::to_ascii(l.source, idna::strict()) {
+      Ok(name) -> len(l.ascii_status) == 0 && name == l.ascii,
+      Err(_) -> len(l.ascii_status) > 0,
+    })
+}
+
+test "the {len(b.lines)} lines of IdnaTestV2.txt from {b.from} convert as they say" for b: Block<Line> in blocks(
+  ) {
+  assert_eq(map(take(filter(b.lines, |l: Line| !conforms(l)), 8), |l: Line| spelled(l.source)), [])
+}
+
+test "a name the test converts with no status converts to itself again, and is shown as itself" {
+  let strict = idna::strict();
+  let wrong = filter(lines(), |l: Line|
+    len(l.unicode_status) == 0 && len(l.ascii_status) == 0
+      && !(idna::to_ascii(l.ascii, strict) == Ok(l.ascii)
+        && idna::to_unicode(l.ascii, strict) == { name: l.unicode, problems: [] }
+        && idna::to_unicode(l.unicode, strict) == { name: l.unicode, problems: [] }
+        && idna::to_ascii(l.unicode, strict) == Ok(l.ascii)));
+  assert_eq(map(take(wrong, 8), |l: Line| spelled(l.source)), [])
+}

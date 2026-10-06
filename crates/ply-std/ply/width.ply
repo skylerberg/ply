@@ -1,0 +1,307 @@
+//! How many columns a text takes in a terminal or any other grid of fixed cells.
+//!
+//! A character is zero, one or two columns wide. Two for the East Asian wide and fullwidth
+//! characters, most emoji among them; none for what is not drawn in a cell of its own: a
+//! combining mark, a control, a format character, the conjoining Hangul vowels and trailing
+//! consonants, and what the database calls default-ignorable; one for the rest. A character the
+//! database calls ambiguous, a Greek or Cyrillic letter or a box-drawing line, is one column in
+//! most terminals and two in those set up for East Asian text, so every function takes which as
+//! an argument and none reads it from where it runs.
+//!
+//! A text is measured by its grapheme clusters, since what is drawn as one takes the cells of
+//! one. A cluster is as wide as its characters together, with three exceptions for emoji: a
+//! character joined to the one before it by `U+200D`, and an emoji modifier after its base, add
+//! nothing; `U+FE0F` makes two columns of an emoji that is otherwise drawn as text, a keycap's
+//! digit among them; and `U+FE0E` makes one column of an emoji that is otherwise drawn as one.
+//! So a family of four joined emoji and a flag are two columns each, and a Hangul syllable
+//! written as its letters is the two columns of its first. Terminals do not agree on all of
+//! this, and one that draws a joined emoji as its parts will take more columns than is answered
+//! here.
+//!
+//! A control character and a line break count for nothing: a text of several lines is measured
+//! line by line by whoever splits it. The table is `std.ucd`'s, of the Unicode version it names.
+
+import std.char (drawn_text)
+import std.laws (agrees)
+import std.segment
+import std.ucd
+import std.ucd (Table)
+
+/// How wide a character of ambiguous width counts.
+pub type Ambiguous =
+  /// One column, as terminals draw them unless set up for East Asian text.
+  | Narrow
+  /// Two columns, as a terminal with an East Asian legacy font draws them.
+  | Wide
+
+fn is_emoji() -> Int = 4
+
+fn is_emoji_presentation() -> Int = 8
+
+fn is_modifier() -> Int = 16
+
+/// The word of one line of `ucd/width.txt`, `columns;flags`: in its low two bits `1` for no
+/// column, `2` for two and `3` for an ambiguous one, then a bit a flag.
+fn width_word(fields: List<Bytes>) -> Int / {abort.raise} = {
+  let field = |i: Int| match list_at(fields, i) { Some(text) -> text, None -> b"" };
+  let columns = match field(0) {
+    b"" -> 0,
+    b"0" -> 1,
+    b"2" -> 2,
+    b"A" -> 3,
+    _ -> panic("a width is 0, 2 or A"),
+  };
+  fold(range(0, bytes_len(field(1))), columns, |bits: Int, i: Int|
+    bits
+      | (match bytes_at(field(1), i) {
+        b'e' -> is_emoji(),
+        b'p' -> is_emoji_presentation(),
+        b'm' -> is_modifier(),
+        _ -> panic("a width flag is e, p or m"),
+      }))
+}
+
+const fn widths() -> Table = ucd::table(embed("ucd/width.txt"), 0, width_word)
+
+/// The columns a word says its character takes alone.
+fn columns_of(word: Int, ambiguous: Ambiguous) -> Int =
+  match word & 3 { 0 -> 1, 1 -> 0, 2 -> 2, _ -> if ambiguous == Wide { 2 } else { 1 } }
+
+/// The columns `c` takes standing alone: none, one or two. Adding these up over a text counts a
+/// joined emoji as its parts and a modifier beside its base; `columns` measures a text.
+pub fn char_columns(c: Char, ambiguous: Ambiguous = Narrow) -> Int =
+  if c >= ' ' && c <= '~' { 1 }
+  else { columns_of(ucd::lookup(widths(), int_of_char(c)), ambiguous) }
+
+/// The columns counted so far, the word of the last character and the columns it was counted
+/// for, and whether it was the joiner `U+200D`.
+type Measuring = { total: Int, last: Int, counted: Int, joined: Bool }
+
+fn opening() -> Measuring = { total: 0, last: 0, counted: 0, joined: false }
+
+/// `so_far` and then the code point `cp` of the same cluster.
+fn measured(
+  held: Table,
+  so_far: Measuring,
+  cp: Int,
+  first: Bool,
+  ambiguous: Ambiguous,
+) -> Measuring =
+  if cp == 0xFE0F && so_far.last & is_emoji() != 0 && so_far.counted < 2 {
+    { total: so_far.total + 2 - so_far.counted, last: so_far.last, counted: 2, joined: false }
+  } else if cp == 0xFE0E && so_far.last & is_emoji_presentation() != 0 && so_far.counted == 2 {
+    { total: so_far.total - 1, last: so_far.last, counted: 1, joined: false }
+  } else {
+    let word = ucd::lookup(held, cp);
+    let own = if !first && (so_far.joined || word & is_modifier() != 0) { 0 }
+    else { columns_of(word, ambiguous) };
+    { total: so_far.total + own, last: word, counted: own, joined: cp == 0x200D }
+  }
+
+/// The columns `cluster` takes as one grapheme cluster, whatever it holds: its characters'
+/// together, but for those that add nothing where they stand and for what the two variation
+/// selectors change.
+pub fn cluster_columns(cluster: String, ambiguous: Ambiguous = Narrow) -> Int = {
+  let held = widths();
+  fold(
+    string_chars(cluster),
+    { so_far: opening(), first: true },
+    |m: { so_far: Measuring, first: Bool }, c: Char|
+      { so_far: measured(held, m.so_far, int_of_char(c), m.first, ambiguous), first: false },
+  ).so_far.total
+}
+
+/// Whether `text` is printable ASCII alone, which is a column a character.
+fn is_plain(text: String) -> Bool =
+  string_len(text) == bytes_len(bytes_of_string(text))
+    && fold(string_chars(text), true, |plain: Bool, c: Char| plain && c >= ' ' && c <= '~')
+
+/// The columns counted, the measure of the cluster being read, the place of the next character
+/// and the boundaries still ahead.
+type Walking = { total: Int, cluster: Measuring, place: Int, ahead: List<Int> }
+
+/// `walk` after the character `c`, which opens a cluster where the next boundary is its place.
+fn walked(held: Table, walk: Walking, c: Char, ambiguous: Ambiguous) -> Walking =
+  match walk.ahead {
+    [next, ..rest] -> if next == walk.place {
+      {
+        total: walk.total + walk.cluster.total,
+        cluster: measured(held, opening(), int_of_char(c), true, ambiguous),
+        place: walk.place + 1,
+        ahead: rest,
+      }
+    } else {
+      {
+        total: walk.total,
+        cluster: measured(held, walk.cluster, int_of_char(c), false, ambiguous),
+        place: walk.place + 1,
+        ahead: walk.ahead,
+      }
+    },
+    [] -> walk,
+  }
+
+/// The columns `text` takes on one line: the sum of its grapheme clusters', each measured as
+/// `cluster_columns` measures one.
+pub fn columns(text: String, ambiguous: Ambiguous = Narrow) -> Int =
+  if is_plain(text) { string_len(text) } else {
+    let held = widths();
+    let done = fold(
+      string_chars(text),
+      { total: 0, cluster: opening(), place: 0, ahead: segment::grapheme_boundaries(text) },
+      |walk: Walking, c: Char| walked(held, walk, c, ambiguous),
+    );
+    done.total + done.cluster.total
+  }
+
+/// The longest opening of `text`, cut between grapheme clusters, that takes at most `room`
+/// columns: what fits a cell of that width without parting an emoji or a letter from its accent.
+/// Clusters of no width that follow what fits are kept with it.
+pub fn fitting(text: String, room: Int, ambiguous: Ambiguous = Narrow) -> String =
+  fold(
+    segment::graphemes(text),
+    { kept: "", left: room, open: true },
+    |so_far: { kept: String, left: Int, open: Bool }, cluster: String| {
+      let wide = cluster_columns(cluster, ambiguous);
+      if so_far.open && wide <= so_far.left {
+        { kept: so_far.kept ++ cluster, left: so_far.left - wide, open: true }
+      } else { { kept: so_far.kept, left: so_far.left, open: false } }
+    },
+  ).kept
+
+// --- Laws -------------------------------------------------------------------------
+
+law "a text's columns are its clusters' together" =
+  agrees(|seed: Int| columns(drawn_text(seed)), |seed: Int|
+    fold(segment::graphemes(drawn_text(seed)), 0, |sum: Int, cluster: String|
+      sum + cluster_columns(cluster)))
+
+// `U+FE0F` opening the second text widens an emoji closing the first: the sum's one exception.
+law "two texts joined take at most their columns together, and a column more where the second opens by widening an emoji"
+  forall (seed: Int, other: Int) {
+    let a = drawn_text(seed);
+    let b = drawn_text(other);
+    columns(a ++ b)
+      <= columns(a) + columns(b) + (if string_starts_with(b, "\u{FE0F}") { 1 } else { 0 })
+  }
+
+law "an ambiguous character counted wide never narrows a text, and no text takes fewer than no columns"
+  forall (seed: Int) {
+    let text = drawn_text(seed);
+    columns(text) >= 0 && columns(text, Wide) >= columns(text)
+      && columns(text, Wide) <= 2 * string_len(text)
+  }
+
+law "what fits a room opens the text and takes no more than the room"
+  forall (seed: Int, room: Int) {
+    let text = drawn_text(seed);
+    let kept = fitting(text, room & 31);
+    string_starts_with(text, kept) && columns(kept) <= room & 31
+      && (kept != text || columns(text) <= room & 31)
+  }
+
+law "a text is measured in steps that grow with its length alone"
+  forall (n: Int) where n > 0 cost n {
+    columns(
+      string_of_chars(map(range(0, n), |i: Int| if i % 3 == 0 { '\u{301}' } else { '\u{4E2D}' })),
+    )
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+type Measured = { text: String, columns: Int }
+
+fn measures() -> List<Measured> =
+  [
+    { text: "", columns: 0 },
+    { text: "plain", columns: 5 },
+    { text: "e\u{301}", columns: 1 },
+    { text: "\u{4E2D}\u{6587}", columns: 4 },
+    { text: "\u{FF21}\u{FF11}", columns: 4 },
+    { text: "\u{FF76}", columns: 1 },
+    { text: "\u{AC00}", columns: 2 },
+    { text: "\u{1100}\u{1161}\u{11A8}", columns: 2 },
+    { text: "\u{1F600}", columns: 2 },
+    { text: "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}", columns: 2 },
+    { text: "\u{1F44D}\u{1F3FD}", columns: 2 },
+    { text: "\u{1F3FD}", columns: 2 },
+    { text: "\u{1F1E9}\u{1F1EA}", columns: 2 },
+    { text: "\u{1F1E9}", columns: 1 },
+    { text: "\u{2764}", columns: 1 },
+    { text: "\u{2764}\u{FE0F}", columns: 2 },
+    { text: "1\u{FE0F}\u{20E3}", columns: 2 },
+    { text: "1\u{20E3}", columns: 1 },
+    { text: "\u{231A}", columns: 2 },
+    { text: "\u{231A}\u{FE0E}", columns: 1 },
+    { text: "a\u{FE0F}", columns: 1 },
+    { text: "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}", columns: 2 },
+    { text: "\u{915}\u{94D}\u{937}\u{93F}", columns: 3 },
+    { text: "a\u{200B}b", columns: 2 },
+    { text: "a\tb\n", columns: 2 },
+    { text: "\u{AD}", columns: 1 },
+    { text: "\u{301}", columns: 0 },
+    { text: "\u{600}1", columns: 2 },
+    { text: "a\u{4E2D}b\u{1F600}!", columns: 7 },
+  ]
+
+test "the text of {map(string_chars(c.text), int_of_char)} takes {c.columns} columns" for c: Measured in measures(
+  ) { assert_eq(columns(c.text), c.columns) }
+
+test "an ambiguous character is one column or two as the caller says" {
+  assert_eq(columns("\u{3B1}\u{2500}\u{A1}"), 3);
+  assert_eq(columns("\u{3B1}\u{2500}\u{A1}", Wide), 6);
+  assert_eq(columns("\u{3B1}\u{2500}\u{A1}", Narrow), 3);
+  assert_eq(char_columns('\u{3B1}', Wide), 2);
+  assert_eq(char_columns('\u{3B1}'), 1);
+  assert_eq(columns("a\u{4E2D}", Wide), 3);
+  assert_eq(cluster_columns("\u{AD}", Wide), 2)
+}
+
+test "a character alone takes none, one or two columns" {
+  assert_eq(
+    map(
+      [
+        'a',
+        ' ',
+        '~',
+        '\u{E9}',
+        '\u{4E2D}',
+        '\u{1F600}',
+        '\u{301}',
+        '\0',
+        '\n',
+        '\u{7F}',
+        '\u{200D}',
+        '\u{1F3FD}',
+      ],
+      |c: Char| char_columns(c),
+    ),
+    [1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 2],
+  )
+}
+
+test "what fits a room is whole clusters, and marks of no width stay with what they follow" {
+  assert_eq(fitting("a\u{4E2D}b", 3), "a\u{4E2D}");
+  assert_eq(fitting("a\u{4E2D}b", 2), "a");
+  assert_eq(fitting("\u{4E2D}", 1), "");
+  assert_eq(fitting("e\u{301}\u{301}x", 1), "e\u{301}\u{301}");
+  assert_eq(
+    fitting("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}ab", 3),
+    "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}a",
+  );
+  assert_eq(fitting("ab\u{200B}c", 2), "ab\u{200B}");
+  assert_eq(fitting("abc", 0), "");
+  assert_eq(fitting("abc", -1), "");
+  assert_eq(fitting("abc", 10), "abc")
+}
+
+test "a text's columns are its clusters' together" {
+  let texts = map(measures(), |m: Measured| m.text);
+  assert_eq(
+    filter(texts, |text: String|
+      columns(text)
+        != fold(segment::graphemes(text), 0, |sum: Int, cluster: String|
+          sum + cluster_columns(cluster))),
+    [],
+  )
+}
