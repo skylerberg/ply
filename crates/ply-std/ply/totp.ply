@@ -11,19 +11,21 @@
 //! then refuses that step and every one before it. That record, and counting failed attempts so a
 //! guesser is slowed, are the caller's state, and both RFCs require them.
 //!
-//! A key is `Bytes` and a provisioning URI holds it in the clear, since nothing written in Ply
-//! reads a `Secret`: keep both out of logs. A code is made for a key of any length, because an
-//! authenticator answers for the key it was given and many services give ten bytes. RFC 4226 asks
-//! for sixteen at least and recommends twenty, which is what `new_key` draws, and `uri` refuses to
-//! provision fewer than sixteen.
+//! A key that makes or checks codes is a `Secret`, and the HMAC under it is the runtime's.
+//! `sealed_key` reads one from a sealed base32 text, as a configuration holds it. A key being
+//! provisioned is `Bytes`, because a provisioning URI is the key in the clear, for a person to
+//! scan: `new_key` draws one, `uri` writes it, and both stay out of logs. A code is made for a key
+//! of any length, because an authenticator answers for the key it was given and many services give
+//! ten bytes. RFC 4226 asks for sixteen at least and recommends twenty, which is what `new_key`
+//! draws, and `uri` refuses to provision fewer than sixteen.
 //!
 //! Many authenticator apps make SHA-1 codes of six digits every thirty seconds whatever a URI
 //! asks for, so `standard` is the only form every one of them answers.
 
 import std.base32
 import std.bytes (u64_be)
-import std.hash (Hash, hmac, sha256_hash, sha512_hash, tags_match)
-import std.hash_legacy (sha1_hash)
+import std.hash (hmac_sha256, hmac_sha512, tags_match)
+import std.hash_legacy (hmac_sha1)
 import std.laws (agrees)
 import std.list (last)
 import std.math (max_int, pow)
@@ -118,17 +120,30 @@ pub effect totp {
 pub fn standard() -> Config =
   { form: { algorithm: Sha1, digits: 6 }, step: seconds(30), epoch: Instant(0) }
 
-/// Twenty bytes of the operating system's entropy: the key RFC 4226 recommends.
+/// Twenty bytes of the operating system's entropy: the key RFC 4226 recommends. It is plain, to
+/// be provisioned; what checks codes afterwards holds `secret_of_bytes` of it.
 pub fn new_key() -> Bytes / {entropy.next, abort.raise} = token_bytes(20)
+
+/// The key a sealed `secret` names, read as a person typed it: base32 in either case, with or
+/// without its spaces, hyphens and padding. Raises `Malformed(BadSecret)` for any other text and
+/// `Malformed(NoSecret)` for an empty one, and says nothing more of either.
+pub fn sealed_key(secret: Secret<String>) -> Secret<Bytes> / {totp.refused, abort.raise} = {
+  let key = needed(base32::decode_typed_secret(secret), BadSecret);
+  if secret_is_empty(key) { malformed(NoSecret) } else { key }
+}
 
 // --- Codes ------------------------------------------------------------------
 
 /// The HOTP code of `counter` under `key`: `form.digits` decimal digits, zeros leading. Raises
 /// for a count of digits outside six to ten and for a counter below zero.
-pub fn hotp(form: Form, key: Bytes, counter: Int) -> String / {totp.refused, abort.raise} =
+pub fn hotp(form: Form, key: Secret<Bytes>, counter: Int) -> String / {totp.refused, abort.raise} =
   if form.digits < 6 || form.digits > 10 { totp.refused(Digits(form.digits)) }
   else if counter < 0 { totp.refused(Counter(counter)) } else {
-    let mac = hmac(hash_of(form.algorithm), key, u64_be(counter));
+    let mac = match form.algorithm {
+      Sha1 -> hmac_sha1(key, u64_be(counter)),
+      Sha256 -> hmac_sha256(key, u64_be(counter)),
+      Sha512 -> hmac_sha512(key, u64_be(counter)),
+    };
     let at = bytes_at(mac, bytes_len(mac) - 1) & 0x0F;
     let cut = (bytes_at(mac, at) & 0x7F) << 24 | bytes_at(mac, at + 1) << 16
       | bytes_at(mac, at + 2) << 8
@@ -150,7 +165,7 @@ pub fn step_at(c: Config, now: Instant) -> Int / {totp.refused} = {
 
 /// The TOTP code at `now`: the HOTP code of the step `now` falls in. Raises as `hotp` and
 /// `step_at` do.
-pub fn code(c: Config, key: Bytes, now: Instant) -> String / {totp.refused, abort.raise} =
+pub fn code(c: Config, key: Secret<Bytes>, now: Instant) -> String / {totp.refused, abort.raise} =
   hotp(c.form, key, step_at(c, now))
 
 // --- Verifying --------------------------------------------------------------
@@ -164,7 +179,7 @@ pub fn code(c: Config, key: Bytes, now: Instant) -> String / {totp.refused, abor
 /// and on lengths and not on where a guess goes wrong. Raises as `code` does.
 pub fn verify(
   c: Config,
-  key: Bytes,
+  key: Secret<Bytes>,
   typed: String,
   now: Instant,
   window: Window,
@@ -174,7 +189,7 @@ pub fn verify(
 /// used once, and any older one, is `None`. Store what this answers as the next `last`.
 pub fn verify_after(
   c: Config,
-  key: Bytes,
+  key: Secret<Bytes>,
   typed: String,
   now: Instant,
   window: Window,
@@ -187,7 +202,7 @@ pub fn verify_after(
 /// in `verify`. A server keeps one past the answer as its next counter. Raises as `hotp` does.
 pub fn hotp_verify(
   form: Form,
-  key: Bytes,
+  key: Secret<Bytes>,
   typed: String,
   counter: Int,
   ahead: Int,
@@ -209,7 +224,7 @@ fn around(at: Int, window: Window) -> List<Int> =
 /// The last of `counters` past `last` whose code is `typed`.
 fn matched(
   form: Form,
-  key: Bytes,
+  key: Secret<Bytes>,
   typed: String,
   counters: List<Int>,
   last: Option<Int>,
@@ -224,9 +239,6 @@ fn matched(
 
 fn past(counter: Int, last: Option<Int>) -> Bool =
   match last { Some(accepted) -> counter > accepted, None -> true }
-
-fn hash_of(a: Algorithm) -> Hash =
-  match a { Sha1 -> sha1_hash(), Sha256 -> sha256_hash(), Sha512 -> sha512_hash() }
 
 // --- Provisioning URIs ------------------------------------------------------
 
@@ -428,10 +440,10 @@ fn rfc_4226() -> List<CounterVector> =
   ]
 
 test "RFC 4226's code at counter {c.counter}" for c: CounterVector in rfc_4226() {
-  assert_eq(hotp({ algorithm: Sha1, digits: 6 }, rfc_key(), c.counter), c.code);
+  assert_eq(hotp({ algorithm: Sha1, digits: 6 }, secret_of_bytes(rfc_key()), c.counter), c.code);
   // Ten digits are the whole cut, zeros leading.
   assert_eq(
-    hotp({ algorithm: Sha1, digits: 10 }, rfc_key(), c.counter),
+    hotp({ algorithm: Sha1, digits: 10 }, secret_of_bytes(rfc_key()), c.counter),
     pad_left(int_to_string(c.cut), 10, "0"),
   )
 }
@@ -473,9 +485,11 @@ fn rfc_6238_key(a: Algorithm) -> Bytes =
 test "RFC 6238's {c.algorithm} code at {c.at} seconds" for c: TimeVector in rfc_6238() {
   let config: Config = { ..standard(), form: { algorithm: c.algorithm, digits: 8 } };
   let key = rfc_6238_key(c.algorithm);
-  assert_eq(hotp(config.form, key, c.at / 30), c.code);
+  assert_eq(hotp(config.form, secret_of_bytes(key), c.at / 30), c.code);
   // An `Instant` ends in 2262 and the last vector is in 2603, so that one has only its step.
-  if c.at <= max_int() / 1000000000 { assert_eq(code(config, key, at_second(c.at)), c.code) }
+  if c.at <= max_int() / 1000000000 {
+    assert_eq(code(config, secret_of_bytes(key), at_second(c.at)), c.code)
+  }
 }
 
 /// `secs` seconds past the Unix epoch.
@@ -492,11 +506,11 @@ test "a step is thirty seconds from the epoch unless the config says otherwise" 
 }
 
 test "a form, a counter, a step or a reading outside what is defined is refused by name" {
-  let five = try { hotp({ algorithm: Sha1, digits: 5 }, rfc_key(), 0) };
+  let five = try { hotp({ algorithm: Sha1, digits: 5 }, secret_of_bytes(rfc_key()), 0) };
   assert_eq(five, Err(Digits(5)));
-  let eleven = try { hotp({ algorithm: Sha1, digits: 11 }, rfc_key(), 0) };
+  let eleven = try { hotp({ algorithm: Sha1, digits: 11 }, secret_of_bytes(rfc_key()), 0) };
   assert_eq(eleven, Err(Digits(11)));
-  let negative = try { hotp({ algorithm: Sha1, digits: 6 }, rfc_key(), 0 - 1) };
+  let negative = try { hotp({ algorithm: Sha1, digits: 6 }, secret_of_bytes(rfc_key()), 0 - 1) };
   assert_eq(negative, Err(Counter(0 - 1)));
   let still: Config = { ..standard(), step: seconds(0) };
   assert_eq(try { step_at(still, at_second(5)) }, Err(Step(seconds(0))));
@@ -507,45 +521,60 @@ test "a form, a counter, a step or a reading outside what is defined is refused 
 
 test "a code verifies in its window and nowhere else" {
   let made = at_second(1111111109);
-  let typed = code(standard(), rfc_key(), made);
+  let typed = code(standard(), secret_of_bytes(rfc_key()), made);
   let exact: Window = { before: 0, after: 0 };
   let either: Window = { before: 1, after: 1 };
   assert_eq(typed, "081804");
-  assert_eq(verify(standard(), rfc_key(), typed, made, exact), Some(0x23523EC));
-  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111139), exact), None);
-  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111139), either), Some(0x23523EC));
-  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111079), either), Some(0x23523EC));
-  assert_eq(verify(standard(), rfc_key(), typed, at_second(1111111169), either), None);
-  assert_eq(verify(standard(), rfc_key(), "81804", made, either), None);
-  assert_eq(verify(standard(), rfc_key(), "", made, either), None)
+  assert_eq(verify(standard(), secret_of_bytes(rfc_key()), typed, made, exact), Some(0x23523EC));
+  assert_eq(
+    verify(standard(), secret_of_bytes(rfc_key()), typed, at_second(1111111139), exact),
+    None,
+  );
+  assert_eq(
+    verify(standard(), secret_of_bytes(rfc_key()), typed, at_second(1111111139), either),
+    Some(0x23523EC),
+  );
+  assert_eq(
+    verify(standard(), secret_of_bytes(rfc_key()), typed, at_second(1111111079), either),
+    Some(0x23523EC),
+  );
+  assert_eq(
+    verify(standard(), secret_of_bytes(rfc_key()), typed, at_second(1111111169), either),
+    None,
+  );
+  assert_eq(verify(standard(), secret_of_bytes(rfc_key()), "81804", made, either), None);
+  assert_eq(verify(standard(), secret_of_bytes(rfc_key()), "", made, either), None)
 }
 
 test "a code accepted once is refused the second time, and so is an older one" {
   let now = at_second(1111111109);
   let either: Window = { before: 1, after: 1 };
-  let typed = code(standard(), rfc_key(), now);
-  let first = verify_after(standard(), rfc_key(), typed, now, either, None);
+  let typed = code(standard(), secret_of_bytes(rfc_key()), now);
+  let first = verify_after(standard(), secret_of_bytes(rfc_key()), typed, now, either, None);
   assert_eq(first, Some(0x23523EC));
-  assert_eq(verify_after(standard(), rfc_key(), typed, now, either, first), None);
-  let older = code(standard(), rfc_key(), at_second(1111111079));
-  assert_eq(verify_after(standard(), rfc_key(), older, now, either, first), None);
-  assert_eq(verify_after(standard(), rfc_key(), older, now, either, None), Some(0x23523EB))
+  assert_eq(verify_after(standard(), secret_of_bytes(rfc_key()), typed, now, either, first), None);
+  let older = code(standard(), secret_of_bytes(rfc_key()), at_second(1111111079));
+  assert_eq(verify_after(standard(), secret_of_bytes(rfc_key()), older, now, either, first), None);
+  assert_eq(
+    verify_after(standard(), secret_of_bytes(rfc_key()), older, now, either, None),
+    Some(0x23523EB),
+  )
 }
 
 test "a counter-based code verifies within the look-ahead, and the counter it was made at is answered" {
   let form: Form = { algorithm: Sha1, digits: 6 };
-  assert_eq(hotp_verify(form, rfc_key(), "969429", 0, 5), Some(3));
-  assert_eq(hotp_verify(form, rfc_key(), "969429", 3, 0), Some(3));
-  assert_eq(hotp_verify(form, rfc_key(), "969429", 0, 2), None);
-  assert_eq(hotp_verify(form, rfc_key(), "969429", 4, 5), None)
+  assert_eq(hotp_verify(form, secret_of_bytes(rfc_key()), "969429", 0, 5), Some(3));
+  assert_eq(hotp_verify(form, secret_of_bytes(rfc_key()), "969429", 3, 0), Some(3));
+  assert_eq(hotp_verify(form, secret_of_bytes(rfc_key()), "969429", 0, 2), None);
+  assert_eq(hotp_verify(form, secret_of_bytes(rfc_key()), "969429", 4, 5), None)
 }
 
 test "a right code and a wrong one of its length take the same steps to judge" {
   let now = at_second(1111111109);
   let either: Window = { before: 1, after: 1 };
-  let right = metered(|| verify(standard(), rfc_key(), "081804", now, either));
-  let wrong = metered(|| verify(standard(), rfc_key(), "081805", now, either));
-  let other = metered(|| verify(standard(), rfc_key(), "999999", now, either));
+  let right = metered(|| verify(standard(), secret_of_bytes(rfc_key()), "081804", now, either));
+  let wrong = metered(|| verify(standard(), secret_of_bytes(rfc_key()), "081805", now, either));
+  let other = metered(|| verify(standard(), secret_of_bytes(rfc_key()), "999999", now, either));
   assert_eq(right.value, Some(0x23523EC));
   assert_eq(wrong.value, None);
   assert_eq(wrong.steps, right.steps);
@@ -560,6 +589,27 @@ test "a new key is twenty bytes of the entropy it is handed" {
 
 /// Google Authenticator's own example key: `Hello!` and four bytes more.
 fn hello() -> Bytes = b"Hello!\xDE\xAD\xBE\xEF"
+
+test "a sealed secret is read as typed, and a refusal says only that it is none" {
+  let read = |text: String| try { sealed_key(secret_of_string(text)) };
+  assert_eq(read("jbsw y3dp-ehpk 3pxp"), Ok(secret_of_bytes(hello())));
+  assert_eq(read("JBSWY3DPEHPK3PXP===="), Ok(secret_of_bytes(hello())));
+  assert_eq(read(""), Err(Malformed(NoSecret)));
+  assert_eq(read(" - "), Err(Malformed(NoSecret)));
+  assert_eq(read("JBSWY3DPEHPK3PX1"), Err(Malformed(BadSecret)));
+  assert_eq(read("J"), Err(Malformed(BadSecret)));
+  // RFC 4226, appendix D: the key `12345678901234567890`, sealed, at count zero.
+  assert_eq(
+    try {
+      hotp(
+        { algorithm: Sha1, digits: 6 },
+        sealed_key(secret_of_string("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")),
+        0,
+      )
+    },
+    Ok("755224"),
+  )
+}
 
 test "the key URI format's examples are read as it reads them" {
   assert_eq(
@@ -721,7 +771,7 @@ fn form_of(n: Int) -> Form =
 
 law "a code is as many digits as its form asks"
   forall (key: Bytes, counter: Int, n: Int) {
-    let made = hotp(form_of(n), key, counter & max_int());
+    let made = hotp(form_of(n), secret_of_bytes(key), counter & max_int());
     string_len(made) == form_of(n).digits && int_of_string(made) != None
   }
 
@@ -736,7 +786,10 @@ law "a code verifies at the time it was made"
   forall (key: Bytes, ticks: Int, n: Int) {
     let config: Config = { ..standard(), form: form_of(n) };
     let now = reading(ticks);
-    verify(config, key, code(config, key, now), now, { before: 0, after: 0 })
+    verify(config, secret_of_bytes(key), code(config, secret_of_bytes(key), now), now, {
+        before: 0,
+        after: 0,
+      })
       == Some(step_at(config, now))
   }
 
@@ -746,12 +799,12 @@ law "a code verifies while its step is in the window, and its step is not answer
     let by = (drift & 7) - 4;
     let window: Window = { before: before & 3, after: after & 3 };
     let step = step_at(standard(), made);
-    let typed = code(standard(), key, made);
+    let typed = code(standard(), secret_of_bytes(key), made);
     let later = Instant(nanos_at(made) + by * 30000000000);
-    let answer = verify(standard(), key, typed, later, window);
+    let answer = verify(standard(), secret_of_bytes(key), typed, later, window);
     if by <= window.before && 0 - by <= window.after {
       match answer {
-        Some(found) -> found >= step && hotp(standard().form, key, found) == typed,
+        Some(found) -> found >= step && hotp(standard().form, secret_of_bytes(key), found) == typed,
         None -> false,
       }
     } else { answer != Some(step) }
@@ -768,7 +821,7 @@ fn last_typed(
   let at = step_at(standard(), now);
   last(
     filter(range(max(at - window.before, 0), at + window.after + 1), |step: Int|
-      past(step, accepted) && hotp(standard().form, key, step) == typed),
+      past(step, accepted) && hotp(standard().form, secret_of_bytes(key), step) == typed),
   )
 }
 
@@ -776,10 +829,14 @@ law "verifying answers the last step of its window, past the one accepted, whose
   forall (key: Bytes, ticks: Int, drift: Int, before: Int, after: Int, accepted: Int) {
     let now = reading(ticks);
     let window: Window = { before: before & 3, after: after & 3 };
-    let typed = code(standard(), key, Instant(nanos_at(now) + ((drift & 7) - 4) * 30000000000));
+    let typed = code(
+      standard(),
+      secret_of_bytes(key),
+      Instant(nanos_at(now) + ((drift & 7) - 4) * 30000000000),
+    );
     let last_accepted = if accepted & 1 == 0 { None }
     else { Some(step_at(standard(), now) + (accepted >>> 1 & 7) - 4) };
-    verify_after(standard(), key, typed, now, window, last_accepted)
+    verify_after(standard(), secret_of_bytes(key), typed, now, window, last_accepted)
       == last_typed(key, typed, now, window, last_accepted)
   }
 
@@ -787,9 +844,10 @@ law "a code accepted once is not accepted again"
   forall (key: Bytes, ticks: Int, before: Int, after: Int) {
     let now = reading(ticks);
     let window: Window = { before: before & 3, after: after & 3 };
-    let typed = code(standard(), key, now);
-    let first = verify_after(standard(), key, typed, now, window, None);
-    first != None && verify_after(standard(), key, typed, now, window, first) == None
+    let typed = code(standard(), secret_of_bytes(key), now);
+    let first = verify_after(standard(), secret_of_bytes(key), typed, now, window, None);
+    first != None
+      && verify_after(standard(), secret_of_bytes(key), typed, now, window, first) == None
   }
 
 law "a counter-based code verifies within the look-ahead and its counter is not answered past it"
@@ -797,11 +855,12 @@ law "a counter-based code verifies within the look-ahead and its counter is not 
     let form: Form = { algorithm: Sha1, digits: 6 };
     let counter = start & 0xFFFF_FFFF;
     let reach = ahead & 3;
-    let typed = hotp(form, key, counter + (by & 7));
-    let answer = hotp_verify(form, key, typed, counter, reach);
+    let typed = hotp(form, secret_of_bytes(key), counter + (by & 7));
+    let answer = hotp_verify(form, secret_of_bytes(key), typed, counter, reach);
     if by & 7 <= reach {
       match answer {
-        Some(found) -> found >= counter + (by & 7) && hotp(form, key, found) == typed,
+        Some(found) ->
+          found >= counter + (by & 7) && hotp(form, secret_of_bytes(key), found) == typed,
         None -> false,
       }
     } else { answer != Some(counter + (by & 7)) }
