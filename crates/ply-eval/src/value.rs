@@ -55,6 +55,35 @@ impl Map {
         Arc::make_mut(&mut self.0).remove(k)
     }
 
+    /// The entries whose keys `bounds` admits, ascending; panics on bounds that cross, as
+    /// `BTreeMap::range` does.
+    pub fn range<R: std::ops::RangeBounds<Value>>(
+        &self,
+        bounds: R,
+    ) -> std::collections::btree_map::Range<'_, Value, Value> {
+        self.0.range(bounds)
+    }
+
+    /// Removes and answers the least entry, or the greatest.
+    pub fn pop(&mut self, greatest: bool) -> Option<(Value, Value)> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let entries = Arc::make_mut(&mut self.0);
+        if greatest {
+            entries.pop_last()
+        } else {
+            entries.pop_first()
+        }
+    }
+
+    /// Keeps the entries below `k`, and answers the value at `k` with the map of those above it.
+    pub fn split(&mut self, k: &Value) -> (Option<Value>, Map) {
+        let mut above = Arc::make_mut(&mut self.0).split_off(k);
+        let at = above.remove(k);
+        (at, Map(Arc::new(above)))
+    }
+
     pub fn keys(&self) -> std::collections::btree_map::Keys<'_, Value, Value> {
         self.0.keys()
     }

@@ -8,7 +8,10 @@ pub fn unit(source: &str) -> (&'static Analysis, &'static Unit) {
 }
 
 fn unit_of(modules: &[(&str, &str)]) -> (&'static Analysis, &'static Unit) {
-    let answer = fixture::answered(modules);
+    unit_from(fixture::answered(modules))
+}
+
+fn unit_from(answer: ply_machine::runnable::Runnable) -> (&'static Analysis, &'static Unit) {
     let front: &'static Analysis = Box::leak(Box::new(answer.front.answer));
     let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
     let _ = unit.bodies();
@@ -704,6 +707,160 @@ fn a_callback_builtin_answers_named_and_as_a_value() {
     );
 }
 
+const CASES: &str = r#"
+fn lowered(s: String) -> String = string_lower(s)
+
+fn raised(s: String) -> String = string_upper(s)
+"#;
+
+/// The runtime answers `string_lower` and `string_upper` over its own words, so it is held to
+/// the evaluator's answers outside ASCII: longer than the text, a final sigma, an ASCII letter
+/// from a character that is not one.
+#[test]
+fn the_case_builtins_answer_as_the_evaluator_does_outside_ascii() {
+    let (_, unit) = unit(CASES);
+    for (text, lower, upper) in [
+        ("AbC1 é", "abc1 é", "ABC1 É"),
+        ("straße", "straße", "STRASSE"),
+        ("İ", "i\u{307}", "İ"),
+        ("ΟΔΟΣ", "οδος", "ΟΔΟΣ"),
+        ("Σ", "σ", "Σ"),
+        ("\u{212A}", "k", "\u{212A}"),
+        ("ſ", "ſ", "S"),
+        ("ŉ", "ŉ", "\u{2BC}N"),
+        ("ﬁ", "ﬁ", "FI"),
+        ("ǆ", "ǆ", "Ǆ"),
+        ("", "", ""),
+    ] {
+        for (name, builtin, want) in [
+            ("m.lowered", ply_eval::builtins::Builtin::StringLower, lower),
+            ("m.raised", ply_eval::builtins::Builtin::StringUpper, upper),
+        ] {
+            let args = [Value::str(text)];
+            let got = call(unit, name, &args);
+            assert_eq!(got, Some(Value::str(want)), "`{name}({text:?})`");
+            let evaluated =
+                ply_eval::builtins::call(builtin, args.to_vec(), ply_eval::Span::DUMMY).ok();
+            assert_eq!(got, evaluated, "`{name}({text:?})` against the evaluator");
+        }
+    }
+}
+
+/// A `Decimal` does not cross the seam, so each answers as its text, which shows its scale.
+const SCALES: &str = r#"
+fn mode(pick: Int) -> Rounding =
+  match pick { 0 -> HalfEven, 1 -> HalfUp, 2 -> Down, 3 -> Up, 4 -> Ceiling, _ -> Floor }
+
+fn quotient(a: String, b: String, places: Int, pick: Int) -> String / {abort.raise} =
+  match (decimal_of_string(a), decimal_of_string(b)) {
+    (Some(x), Some(y)) -> decimal_to_string(decimal_div(x, y, places, mode(pick))),
+    _ -> "",
+  }
+
+fn rounded(d: String, places: Int, pick: Int) -> String / {abort.raise} =
+  match decimal_of_string(d) {
+    Some(x) -> decimal_to_string(decimal_round(x, places, mode(pick))),
+    None -> "",
+  }
+"#;
+
+/// A quotient and a rounding answer at the scale asked for, rounded once, as the evaluator's do,
+/// and a decimal with no room for that scale is the same raise.
+#[test]
+fn a_decimal_quotient_and_rounding_have_the_scale_asked_for_as_the_evaluator_has_them() {
+    use ply_eval::builtins::Builtin;
+    const MODES: [&str; 6] = ["HalfEven", "HalfUp", "Down", "Up", "Ceiling", "Floor"];
+    const MOST: &str = "79228162514264337593543950335";
+    const DIVISION: Result<&str, &str> = Err("`Decimal` overflow in division");
+    const ROUNDING: Result<&str, &str> = Err("`Decimal` overflow in rounding");
+    type Case = (
+        &'static str,
+        Builtin,
+        &'static [&'static str],
+        i64,
+        usize,
+        Result<&'static str, &'static str>,
+    );
+    let (_, unit) = unit(SCALES);
+    let (quotient, rounded) = ("m.quotient", "m.rounded");
+    let (div, round) = (Builtin::DecimalDiv, Builtin::DecimalRound);
+    let cases: Vec<Case> = vec![
+        (quotient, div, &["3", "2"], 3, 0, Ok("1.500")),
+        (quotient, div, &["100", "100"], 2, 2, Ok("1.00")),
+        (quotient, div, &["-1", "3"], 2, 5, Ok("-0.34")),
+        (
+            quotient,
+            div,
+            &["2", "3"],
+            28,
+            2,
+            Ok("0.6666666666666666666666666666"),
+        ),
+        (
+            quotient,
+            div,
+            &["2", "3"],
+            28,
+            0,
+            Ok("0.6666666666666666666666666667"),
+        ),
+        (
+            quotient,
+            div,
+            &["4.9999999999999999999999999995", "10"],
+            0,
+            1,
+            Ok("0"),
+        ),
+        (quotient, div, &[MOST, "1"], 1, 2, DIVISION),
+        (quotient, div, &["1", "0.1"], 28, 2, DIVISION),
+        (rounded, round, &["1.5"], 3, 0, Ok("1.500")),
+        (rounded, round, &["1.50"], 1, 0, Ok("1.5")),
+        (rounded, round, &["2.5"], 0, 0, Ok("2")),
+        (rounded, round, &["2.5"], 0, 1, Ok("3")),
+        (rounded, round, &["-0.001"], 2, 5, Ok("-0.01")),
+        (
+            rounded,
+            round,
+            &["7"],
+            28,
+            2,
+            Ok("7.0000000000000000000000000000"),
+        ),
+        (rounded, round, &["8"], 28, 2, ROUNDING),
+        (rounded, round, &[MOST], 1, 2, ROUNDING),
+    ];
+    for (name, builtin, numbers, places, pick, want) in cases {
+        let want = want.map(str::to_string).map_err(str::to_string);
+        let mut args: Vec<Value> = numbers.iter().map(Value::str).collect();
+        args.extend([Value::Int(places), Value::Int(pick as i64)]);
+        match &want {
+            Ok(text) => assert_eq!(
+                call(unit, name, &args),
+                Some(Value::str(text)),
+                "`{name}{args:?}`"
+            ),
+            Err(message) => assert_eq!(
+                &raised(unit, name, &args).message,
+                message,
+                "`{name}{args:?}`"
+            ),
+        }
+
+        let mut values: Vec<Value> = numbers
+            .iter()
+            .map(|n| Value::Decimal(n.parse().expect("a decimal")))
+            .collect();
+        values.extend([Value::Int(places), Value::ctor(MODES[pick], Vec::new())]);
+        let evaluated = match ply_eval::builtins::call(builtin, values, ply_eval::Span::DUMMY) {
+            Ok(Value::Decimal(d)) => Ok(d.to_string()),
+            Ok(other) => panic!("`{name}{args:?}` evaluated to {other:?}"),
+            Err(raised) => Err(raised.message),
+        };
+        assert_eq!(evaluated, want, "`{name}{args:?}` in the evaluator");
+    }
+}
+
 #[test]
 fn a_definition_the_fragment_has_no_body_for_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
@@ -772,7 +929,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
 
 #[test]
 fn the_census_over_the_standard_library() {
-    let (front, unit) = unit_of(&fixture::standard_library());
+    let (front, unit) = unit_from(fixture::standard_library());
     let functions = front.emitter_roots.len();
     let mut by_construct: std::collections::BTreeMap<&str, usize> = Default::default();
     for (_, construct) in unit.refusals() {

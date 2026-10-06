@@ -1,0 +1,1349 @@
+//! Media types: the `type/subtype; name=value` a `Content-Type` field carries, and the table from a
+//! file name's extension to one and back.
+//!
+//! A `MediaType` is read and written as RFC 9110 §8.3 has it: tokens, and a parameter's value a
+//! token or a quoted string. The type, the subtype and a parameter's name are case-insensitive and
+//! kept in lower case; a value is kept as written, without its quotes. Two media types are `==`
+//! when they name one type and subtype with the same parameters in any order, and `show` writes
+//! the canonical text, quoting a value that is no token. `read` raises a `Refusal` saying where a
+//! text stops being a media type and why, `parse` answers it as an `Err`, and with
+//! `import std.mime`, `mime"text/html; charset=utf-8"` is the literal, checked with the program. A
+//! text is refused rather than repaired: whitespace around `=`, a parameter named twice and
+//! anything after the last parameter are each a refusal.
+//!
+//! A `MediaType` is also a range: `text/*` and `*/*` read as any other, `matches` says whether a
+//! range covers a type, `quality` reads the weight an `Accept` field gives one and `read_list`
+//! reads such a field. Choosing among ranges is `std.http`'s.
+//!
+//! `of_extension` and `of_path` answer the type a file name's extension names, and `extension` and
+//! `extensions` the extensions a type is written under. The table is this module's own, never the
+//! host's, so an answer is the same on every machine: about four hundred types a web server or an
+//! upload handler meets, taken from jshttp's `mime-db` 1.54.0, which gathers the IANA registry and
+//! the Apache and nginx tables. The whole registry arrives when a shipped module can embed a data
+//! file. An extension names what the bytes are and says nothing of what they hold: a browser that
+//! sniffs can be told another type by the bytes, which is what `X-Content-Type-Options: nosniff`
+//! turns off.
+
+import std.bytes (peek, scan, scan_until)
+import std.laws (agrees, idempotent)
+import std.list (contains, sort)
+import std.path
+import std.show (show)
+import std.string (ascii_lower, ascii_upper, int_of_string, pad_right)
+
+/// One parameter of a media type: its name in lower case, and its value as written without quotes.
+pub type Param = { name: String, value: String }
+
+/// A media type: its type, its subtype, and its parameters in the order written.
+///
+/// `media_type`, `with_param` and the readers make one whose type, subtype and names are tokens in
+/// lower case; the constructor written by hand checks nothing, and `==`, `compare`, `digest` and
+/// `show` read such a value in lower case too.
+pub type MediaType = | MediaType(String, String, List<Param>)
+
+key for MediaType by identity
+
+show for MediaType by render
+
+/// Why a text is no media type.
+pub type Why =
+  /// No token where a type, a subtype, a parameter's name or its value must stand.
+  | NoToken
+  /// No `/` after the type.
+  | NoSlash
+  /// No `=` after a parameter's name; whitespace before one is this too.
+  | NoEquals
+  /// A quoted string that never closes.
+  | Unclosed
+  /// A control byte in a quoted string, which holds none but a tab.
+  | Control
+  /// A parameter named twice, with its name.
+  | Repeated(String)
+  /// Text after the media type that is no parameter.
+  | Trailing
+
+/// A refusal, and the byte of the text's UTF-8 it was found at.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect mime {
+  /// The text is no media type.
+  raise refused(e: Refusal)
+}
+
+// --- Reading ----------------------------------------------------------------
+
+/// The media type `text` is, raising `mime.refused` where `parse` answers `Err`. Blanks around it
+/// are passed over.
+pub fn read(text: String) -> MediaType / {mime.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let one = read_at(b, scan(b, 0, blanks()));
+  let end = scan(b, one.at, blanks());
+  if end < bytes_len(b) { refuse(end, Trailing) } else { one.value }
+}
+
+/// The media type `text` is, or where it stops being one and why.
+pub fn parse(text: String) -> Result<MediaType, Refusal> / {abort.raise} = try { read(text) }
+
+/// The media types of a comma-separated list, as an `Accept` field carries its ranges, in the
+/// order written; an empty element is passed over (RFC 9110 §5.6.1). Raises `mime.refused` where
+/// `parse_list` answers `Err`.
+pub fn read_list(text: String) -> List<MediaType> / {mime.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  listed(b, 0, [], bytes_len(b) + 1)
+}
+
+/// The media types of a comma-separated list, or where it stops being one and why.
+pub fn parse_list(text: String) -> Result<List<MediaType>, Refusal> / {abort.raise} =
+  try { read_list(text) }
+
+/// The parameters `text` holds from its byte `at` on, each after a `;` as a media type's are: what
+/// follows the first word of a field such as `Content-Disposition`. Raises `mime.refused` as
+/// `read` does.
+pub fn read_params(text: String, at: Int) -> List<Param> / {mime.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  let held = parameters(b, { at: at, params: [], seen: map_new() }, bytes_len(b) + 1);
+  let end = scan(b, held.at, blanks());
+  if end < bytes_len(b) { refuse(end, Trailing) } else { held.params }
+}
+
+/// What a `mime"..."` literal is checked by: the media type `read` answers, or why the text is
+/// none and the character it stops being one at.
+pub fn literal(
+  text: String,
+) -> Result<MediaType, { message: String, offset: Int }> / {abort.raise} =
+  match parse(text) {
+    Ok(m) -> Ok(m),
+    Err(r) ->
+      Err({
+        message: explained(r.why),
+        offset: string_len(string_of_bytes_lossy(bytes_slice(bytes_of_string(text), 0, r.at))),
+      }),
+  }
+
+fn explained(why: Why) -> String =
+  match why {
+    NoToken -> "a name is expected here",
+    NoSlash -> "a `/` is expected between the type and the subtype",
+    NoEquals -> "a `=` is expected after a parameter's name",
+    Unclosed -> "the quoted string never closes",
+    Control -> "a quoted string holds no control character but a tab",
+    Repeated(name) -> "the parameter `" ++ name ++ "` is given twice",
+    Trailing -> "nothing follows a media type but `;` and a parameter",
+  }
+
+fn refuse<a>(at: Int, why: Why) -> a / {mime.refused} = mime.refused({ at: at, why: why })
+
+/// RFC 9110's `tchar`: what a token is made of.
+fn tchars() -> Bytes =
+  b"!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+fn blanks() -> Bytes = b" \t"
+
+/// What ends a run of plain text in a quoted string: its quote, a backslash, and each control byte
+/// but a tab.
+fn quoted_stops() -> Bytes =
+  b"\"\\\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
+
+fn lowered(b: Bytes, from: Int, to: Int) -> String / {abort.raise} =
+  ascii_lower(string_of_bytes(bytes_slice(b, from, to)))
+
+type One = { value: MediaType, at: Int }
+
+/// The media type that starts at `at`, and where the text stands after its last parameter.
+fn read_at(b: Bytes, at: Int) -> One / {mime.refused, abort.raise} = {
+  let slash = scan(b, at, tchars());
+  if slash == at { refuse(at, NoToken) }
+  else if peek(b, slash) != b'/' { refuse(slash, NoSlash) } else {
+    let end = scan(b, slash + 1, tchars());
+    if end == slash + 1 { refuse(end, NoToken) } else {
+      let held = parameters(b, { at: end, params: [], seen: map_new() }, bytes_len(b) + 1);
+      {
+        value: MediaType(lowered(b, at, slash), lowered(b, slash + 1, end), held.params),
+        at: held.at,
+      }
+    }
+  }
+}
+
+fn listed(
+  b: Bytes,
+  at: Int,
+  acc: List<MediaType>,
+  left: Int,
+) -> List<MediaType> / {mime.refused, abort.raise} = {
+  let start = scan(b, at, b" \t,");
+  if left <= 0 { acc }
+  else if start >= bytes_len(b) { acc } else {
+    let one = read_at(b, start);
+    let end = scan(b, one.at, blanks());
+    if end < bytes_len(b) && bytes_at(b, end) != b',' { refuse(end, Trailing) }
+    else { listed(b, end, push(acc, one.value), left - 1) }
+  }
+}
+
+type Held = { at: Int, params: List<Param>, seen: Map<String, Unit> }
+
+/// The parameters from `held.at` on. `left` bounds the rounds: each takes a `;` at least.
+fn parameters(b: Bytes, held: Held, left: Int) -> Held / {mime.refused, abort.raise} = {
+  let semi = scan(b, held.at, blanks());
+  if left <= 0 { held }
+  else if peek(b, semi) != b';' { held } else {
+    let start = scan(b, semi + 1, blanks());
+    let equals = scan(b, start, tchars());
+    if equals == start { parameters(b, { ..held, at: start }, left - 1) }
+    else if peek(b, equals) != b'=' { refuse(equals, NoEquals) }
+    else { parameters(b, with_parameter(b, held, start, equals), left - 1) }
+  }
+}
+
+fn with_parameter(
+  b: Bytes,
+  held: Held,
+  start: Int,
+  equals: Int,
+) -> Held / {mime.refused, abort.raise} = {
+  let name = lowered(b, start, equals);
+  if map_contains(held.seen, name) { refuse(start, Repeated(name)) } else {
+    let value = value_at(b, equals + 1);
+    {
+      at: value.at,
+      params: push(held.params, { name: name, value: value.text }),
+      seen: map_insert(held.seen, name, ()),
+    }
+  }
+}
+
+type Text = { text: String, at: Int }
+
+fn value_at(b: Bytes, at: Int) -> Text / {mime.refused, abort.raise} =
+  if peek(b, at) == b'"' { quoted(b, at + 1, [], bytes_len(b) + 1) } else {
+    let end = scan(b, at, tchars());
+    if end == at { refuse(at, NoToken) }
+    else { { text: string_of_bytes(bytes_slice(b, at, end)), at: end } }
+  }
+
+/// The quoted string whose opening quote stands just before `at`, without its quotes and with each
+/// backslash pair as the byte it holds. `left` bounds the rounds: each takes a pair.
+fn quoted(b: Bytes, at: Int, kept: List<Bytes>, left: Int) -> Text / {mime.refused, abort.raise} = {
+  let stop = scan_until(b, at, quoted_stops());
+  let so_far = push(kept, bytes_slice(b, at, stop));
+  let c = peek(b, stop);
+  if left <= 0 { refuse(stop, Unclosed) }
+  else if c == b'"' { { text: string_of_bytes(bytes_concat_all(so_far)), at: stop + 1 } }
+  else if c < 0 { refuse(stop, Unclosed) }
+  else if c != b'\\' { refuse(stop, Control) }
+  else if stop + 1 >= bytes_len(b) { refuse(stop + 1, Unclosed) }
+  else if !pairs(bytes_at(b, stop + 1)) { refuse(stop + 1, Control) }
+  else { quoted(b, stop + 2, push(so_far, bytes_slice(b, stop + 1, stop + 2)), left - 1) }
+}
+
+/// Whether a backslash may stand before the byte `c`: a tab, or anything that is no control.
+fn pairs(c: Int) -> Bool = c == b'\t' || (c >= b' ' && c != 0x7F)
+
+// --- Writing ----------------------------------------------------------------
+
+/// The canonical text: the type and subtype in lower case, then each parameter as `; name=value`
+/// in the order held, a value that is no token in quotes with a backslash before each quote and
+/// backslash in it. What `read` reads back for any value the makers and readers answer.
+pub fn render(m: MediaType) -> String =
+  match m {
+    MediaType(top, subtype, held) ->
+      fold(held, ascii_lower(top) ++ "/" ++ ascii_lower(subtype), |acc: String, p: Param|
+        acc ++ "; " ++ ascii_lower(p.name) ++ "=" ++ written(p.value)),
+  }
+
+fn written(value: String) -> String =
+  if is_token(value) { value } else {
+    "\""
+      ++ string_of_chars(
+        fold(string_chars(value), [], |acc: List<Char>, c: Char|
+          if c == '"' || c == '\\' { push(push(acc, '\\'), c) } else { push(acc, c) }),
+      )
+      ++ "\""
+  }
+
+/// Whether `text` is a token of RFC 9110 §5.6.2: one or more of the letters, the digits and
+/// ``!#$%&'*+-.^_`|~``.
+pub fn is_token(text: String) -> Bool =
+  string_len(text) > 0
+    && fold(string_chars(text), true, |ok: Bool, c: Char|
+      ok && string_contains(token_chars(), string_of_chars([c])))
+
+/// Where the token that starts at `at` in `b` ends: `at` itself where none starts there.
+pub fn token_end(b: Bytes, at: Int) -> Int / {abort.raise} = scan(b, at, tchars())
+
+fn token_chars() -> String =
+  "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+/// Whether a quoted string, or a header field's value, can hold `text`: no control character but
+/// a tab.
+pub fn is_quotable(text: String) -> Bool =
+  fold(string_chars(text), true, |ok: Bool, c: Char|
+    ok && (c == '\t' || (int_of_char(c) >= 32 && int_of_char(c) != 127)))
+
+type Identity = { top: String, subtype: String, params: List<Param> }
+
+/// What two media types are compared by: the names in lower case, and the parameters by name, a
+/// `charset`'s value in lower case too.
+fn identity(m: MediaType) -> Identity =
+  match m {
+    MediaType(top, subtype, held) ->
+      {
+        top: ascii_lower(top),
+        subtype: ascii_lower(subtype),
+        params: ordered(
+          map(held, |p: Param| {
+            let name = ascii_lower(p.name);
+            { name: name, value: if name == "charset" { ascii_lower(p.value) } else { p.value } }
+          }),
+        ),
+      },
+  }
+
+fn ordered(held: List<Param>) -> List<Param> = if len(held) < 2 { held } else { sort(held) }
+
+// --- Making and asking ------------------------------------------------------
+
+/// The media type `top/subtype` with no parameter, in lower case; `None` unless both are tokens.
+pub fn media_type(top: String, subtype: String) -> Option<MediaType> =
+  if is_token(top) && is_token(subtype) {
+    Some(MediaType(ascii_lower(top), ascii_lower(subtype), []))
+  } else { None }
+
+/// `m` with the parameter `name` set to `value`: in place of the one it has under that name, or
+/// after its last. `None` where `name` is no token or `value` holds a control character other
+/// than a tab, which no text of a media type can carry.
+pub fn with_param(m: MediaType, name: String, value: String) -> Option<MediaType> = {
+  let lower = ascii_lower(name);
+  if !is_token(name) || !is_quotable(value) { None } else {
+    match m {
+      MediaType(top, subtype, held) ->
+        Some(
+          MediaType(top, subtype, if has_param(held, lower) {
+            map(held, |p: Param|
+              if ascii_lower(p.name) == lower { { name: lower, value: value } } else { p })
+          } else { push(held, { name: lower, value: value }) }),
+        ),
+    }
+  }
+}
+
+fn has_param(held: List<Param>, lower: String) -> Bool =
+  fold(held, false, |found: Bool, p: Param| found || ascii_lower(p.name) == lower)
+
+/// `m` with no parameter.
+pub fn without_params(m: MediaType) -> MediaType =
+  match m { MediaType(top, subtype, _) -> MediaType(top, subtype, []) }
+
+/// The type before the `/`, in lower case: `text` of `text/html`.
+pub fn top_level(m: MediaType) -> String = match m { MediaType(top, _, _) -> ascii_lower(top) }
+
+/// The subtype after the `/`, in lower case: `svg+xml` of `image/svg+xml`.
+pub fn subtype(m: MediaType) -> String =
+  match m { MediaType(_, subtype, _) -> ascii_lower(subtype) }
+
+/// The structured syntax a subtype ends with, after its last `+`: `xml` of `image/svg+xml`, and
+/// `None` of `text/html`.
+pub fn suffix(m: MediaType) -> Option<String> / {abort.raise} = {
+  let pieces = string_split(subtype(m), "+");
+  if len(pieces) < 2 { None } else { list_at(pieces, len(pieces) - 1) }
+}
+
+/// The type and subtype alone, `text/html`, in lower case.
+pub fn essence(m: MediaType) -> String = top_level(m) ++ "/" ++ subtype(m)
+
+/// The parameters in the order held.
+pub fn params(m: MediaType) -> List<Param> = match m { MediaType(_, _, held) -> held }
+
+/// The value of the parameter `name`, whatever case either is written in.
+pub fn param(m: MediaType, name: String) -> Option<String> = {
+  let lower = ascii_lower(name);
+  fold(params(m), None, |found: Option<String>, p: Param|
+    match found {
+      Some(_) -> found,
+      None -> if ascii_lower(p.name) == lower { Some(p.value) } else { None },
+    })
+}
+
+/// The `charset` parameter in lower case, as a charset's name is case-insensitive.
+pub fn charset(m: MediaType) -> Option<String> =
+  match param(m, "charset") { Some(name) -> Some(ascii_lower(name)), None -> None }
+
+/// The `boundary` parameter, which delimits the parts of a `multipart` body.
+pub fn boundary(m: MediaType) -> Option<String> = param(m, "boundary")
+
+/// Whether the range `range` covers `m`: `*/*` covers every type, `text/*` every subtype of
+/// `text`, and any other range the one type and subtype it names. Each parameter of the range but
+/// `q` must be `m`'s too, with the same value.
+pub fn matches(range: MediaType, m: MediaType) -> Bool = {
+  let want = identity(range);
+  let have = identity(m);
+  (want.top == "*" || want.top == have.top) && (want.subtype == "*" || want.subtype == have.subtype)
+    && fold(want.params, true, |ok: Bool, p: Param|
+      ok && (p.name == "q" || contains(have.params, p)))
+}
+
+/// How much of a type a range pins down, for ranking the ranges that cover one: 0 for `*/*`, 1 for
+/// `text/*`, 2 for `text/html`, and 3 for one with a parameter other than `q`.
+pub fn specificity(range: MediaType) -> Int = {
+  let want = identity(range);
+  if want.top == "*" { 0 }
+  else if want.subtype == "*" { 1 }
+  else if len(filter(want.params, |p: Param| p.name != "q")) == 0 { 2 }
+  else { 3 }
+}
+
+/// The weight an `Accept` field gives a range, in thousandths: 1000 where it has no `q`, and
+/// `None` where its `q` is no weight of RFC 9110 §12.4.2, `0` to `1` with at most three decimals.
+pub fn quality(range: MediaType) -> Option<Int> / {abort.raise} =
+  match param(range, "q") { None -> Some(1000), Some(q) -> weight(q) }
+
+fn weight(q: String) -> Option<Int> / {abort.raise} = {
+  let b = bytes_of_string(q);
+  let n = bytes_len(b);
+  let digits = scan(b, 2, b"0123456789");
+  if n == 0 || n > 5 || (n > 1 && (bytes_at(b, 1) != b'.' || digits < n)) { None } else {
+    let whole = bytes_at(b, 0) - b'0';
+    match int_of_string(pad_right(string_slice(q, if n > 1 { 2 } else { 1 }, n), 3, "0")) {
+      Some(part) -> if (whole == 0 || whole == 1) && whole * 1000 + part <= 1000 {
+        Some(whole * 1000 + part)
+      } else { None },
+      None -> None,
+    }
+  }
+}
+
+// --- Extensions -------------------------------------------------------------
+
+/// The media type a file name's extension names, written with or without its dot and in any
+/// case: `text/html` for `html`, `.html` and `HTML`. `None` for one the table does not hold.
+pub fn of_extension(ext: String) -> Option<MediaType> / {abort.raise}
+  cost string_len(ext)
+=
+  match map_get(table().types, undotted(ascii_lower(ext))) {
+    Some(named) -> Some(bare(named)),
+    None -> None,
+  }
+
+/// The media type of a path by its file name's last extension, so `a/b.tar.gz` is
+/// `application/gzip`: what the bytes are, whatever they unpack to. `None` for a name with no
+/// extension, a dotfile among them, and for an extension the table does not hold.
+pub fn of_path(file: String) -> Option<MediaType> / {abort.raise} =
+  match path::extension(file) { Some(ext) -> of_extension(ext), None -> None }
+
+/// The extension a type is most often written under, without a dot: `jpg` for `image/jpeg`.
+/// Parameters are passed over. `None` for a type the table does not hold.
+pub fn extension(m: MediaType) -> Option<String> = list_at(extensions(m), 0)
+
+/// Every extension the table holds for a type, the preferred one first; none for a type it does
+/// not hold.
+pub fn extensions(m: MediaType) -> List<String> =
+  match map_get(table().extensions, essence(m)) { Some(found) -> found, None -> [] }
+
+fn undotted(ext: String) -> String / {abort.raise} =
+  if string_starts_with(ext, ".") { string_slice(ext, 1, string_len(ext)) } else { ext }
+
+/// A media type of the table's text, which has no parameter.
+fn bare(named: String) -> MediaType / {abort.raise} = {
+  let slash = string_find(named, "/");
+  MediaType(string_slice(named, 0, slash), string_slice(named, slash + 1, string_len(named)), [])
+}
+
+type Table = { types: Map<String, String>, extensions: Map<String, List<String>> }
+
+/// Both directions of `rows`, built once: an extension several types list names the first of
+/// them.
+const fn table() -> Table =
+  fold(
+    string_split(rows(), "\n"),
+    { types: map_new(), extensions: map_new() },
+    |t: Table, row: String|
+      match string_split(row, " ") {
+        [named, ..exts] ->
+          {
+            types: fold(exts, t.types, |m: Map<String, String>, ext: String|
+              if map_contains(m, ext) { m } else { map_insert(m, ext, named) }),
+            extensions: map_insert(t.extensions, named, exts),
+          },
+        [] -> t,
+      },
+  )
+
+/// The table as `mime.types` files write one: a type, then its extensions with the preferred one
+/// first. The rows and their extensions are `mime-db` 1.54.0's; the order is this module's.
+fn rows() -> String =
+  \\text/html html htm shtml
+  \\text/css css
+  \\text/javascript js mjs
+  \\application/json json map
+  \\application/xml xml xsl xsd rng
+  \\text/plain txt text conf def list log in ini
+  \\text/csv csv
+  \\text/tab-separated-values tsv
+  \\text/markdown md markdown
+  \\text/calendar ics ifb
+  \\text/vcard vcard
+  \\text/vtt vtt
+  \\text/yaml yaml yml
+  \\text/xml xml
+  \\text/cache-manifest appcache manifest
+  \\text/uri-list uri uris urls
+  \\text/richtext rtx
+  \\text/sgml sgml sgm
+  \\text/turtle ttl
+  \\text/n3 n3
+  \\text/mathml mml
+  \\text/troff t tr roff man me ms
+  \\text/shex shex
+  \\text/spdx spdx
+  \\text/wgsl wgsl
+  \\text/vnd.graphviz gv
+  \\text/vnd.wap.wml wml
+  \\text/x-c c cc cxx cpp h hh dic
+  \\text/x-java-source java
+  \\text/x-asm s asm
+  \\text/x-fortran f for f77 f90
+  \\text/x-pascal p pas
+  \\text/x-lua lua
+  \\text/x-sass sass
+  \\text/x-scss scss
+  \\text/less less
+  \\text/stylus stylus styl
+  \\text/coffeescript coffee litcoffee
+  \\text/jsx jsx
+  \\text/mdx mdx
+  \\text/jade jade
+  \\text/slim slim slm
+  \\text/x-handlebars-template hbs
+  \\text/x-org org
+  \\text/x-opml opml
+  \\text/x-nfo nfo
+  \\text/x-sfv sfv
+  \\text/x-setext etx
+  \\text/x-uuencode uu
+  \\text/x-vcalendar vcs
+  \\text/x-vcard vcf
+  \\text/x-component htc
+  \\text/x-markdown mkd
+  \\text/x-processing pde
+  \\application/javascript js
+  \\application/ecmascript ecma
+  \\application/node cjs
+  \\application/json5 json5
+  \\application/ld+json jsonld
+  \\application/geo+json geojson
+  \\application/manifest+json webmanifest
+  \\application/hjson hjson
+  \\application/jsonml+json jsonml
+  \\application/x-ipynb+json ipynb
+  \\application/x-web-app-manifest+json webapp
+  \\application/toml toml
+  \\application/yang yang
+  \\application/sql sql
+  \\application/x-sql sql
+  \\application/x-sh sh
+  \\application/x-csh csh
+  \\application/x-perl pl pm
+  \\application/x-tcl tcl tk
+  \\application/x-httpd-php php
+  \\application/x-latex latex
+  \\application/x-tex tex
+  \\application/x-texinfo texinfo texi
+  \\application/wasm wasm
+  \\application/xhtml+xml xhtml xht
+  \\application/xml-dtd dtd
+  \\application/xslt+xml xsl xslt
+  \\application/atom+xml atom
+  \\application/rss+xml rss
+  \\application/rdf+xml rdf owl
+  \\application/rsd+xml rsd
+  \\application/mathml+xml mathml
+  \\application/xspf+xml xspf
+  \\application/xliff+xml xlf
+  \\application/gpx+xml gpx
+  \\application/gml+xml gml
+  \\application/dash+xml mpd
+  \\application/smil+xml smi smil
+  \\application/ssml+xml ssml
+  \\application/voicexml+xml vxml
+  \\application/wsdl+xml wsdl
+  \\application/xaml+xml xaml
+  \\application/xop+xml xop
+  \\application/docbook+xml dbk
+  \\application/tei+xml tei teicorpus
+  \\application/ttml+xml ttml
+  \\application/calendar+xml xcs
+  \\application/n-quads nq
+  \\application/n-triples nt
+  \\application/trig trig
+  \\application/sparql-query rq
+  \\application/sparql-results+xml srx
+  \\application/raml+yaml raml
+  \\application/cwl cwl
+  \\application/x-ns-proxy-autoconfig pac
+  \\application/x-subrip srt
+  \\application/x-chess-pgn pgn
+  \\application/x-bittorrent torrent
+  \\application/x-java-jnlp-file jnlp
+  \\image/png png
+  \\image/jpeg jpg jpeg jpe
+  \\image/gif gif
+  \\image/webp webp
+  \\image/svg+xml svg svgz
+  \\image/avif avif
+  \\image/apng apng
+  \\image/bmp bmp dib
+  \\image/vnd.microsoft.icon ico
+  \\image/x-icon ico
+  \\image/tiff tif tiff
+  \\image/heic heic
+  \\image/heif heif
+  \\image/heic-sequence heics
+  \\image/heif-sequence heifs
+  \\image/jxl jxl
+  \\image/jp2 jp2 jpg2
+  \\image/jpx jpx jpf
+  \\image/jpm jpm jpgm
+  \\image/jxr jxr
+  \\image/ktx ktx
+  \\image/ktx2 ktx2
+  \\image/vnd.adobe.photoshop psd
+  \\image/vnd.djvu djvu djv
+  \\image/vnd.dwg dwg
+  \\image/vnd.dxf dxf
+  \\image/vnd.ms-dds dds
+  \\image/vnd.wap.wbmp wbmp
+  \\image/emf emf
+  \\image/wmf wmf
+  \\image/x-tga tga
+  \\image/vnd.zbrush.pcx pcx
+  \\image/x-pcx pcx
+  \\image/x-pict pic pct
+  \\image/x-portable-anymap pnm
+  \\image/x-portable-bitmap pbm
+  \\image/x-portable-graymap pgm
+  \\image/x-portable-pixmap ppm
+  \\image/x-rgb rgb
+  \\image/x-xbitmap xbm
+  \\image/x-xpixmap xpm
+  \\image/x-xwindowdump xwd
+  \\image/x-cmu-raster ras
+  \\image/x-adobe-dng dng
+  \\image/x-ms-bmp bmp
+  \\image/pjpeg jfif
+  \\image/sgi sgi
+  \\image/fits fits
+  \\image/aces exr
+  \\image/cgm cgm
+  \\image/x-jng jng
+  \\image/x-3ds 3ds
+  \\audio/mpeg mp3 mpga mp2 mp2a m2a m3a
+  \\audio/mp4 m4a mp4a m4b
+  \\audio/aac aac adts
+  \\audio/ogg ogg oga spx opus
+  \\audio/wav wav
+  \\audio/wave wav
+  \\audio/x-wav wav
+  \\audio/webm weba
+  \\audio/x-flac flac
+  \\audio/midi mid midi kar rmi
+  \\audio/x-aiff aif aiff aifc
+  \\audio/basic au snd
+  \\audio/amr amr
+  \\audio/x-ms-wma wma
+  \\audio/x-ms-wax wax
+  \\audio/x-matroska mka
+  \\audio/x-mpegurl m3u
+  \\audio/x-pn-realaudio ram ra
+  \\audio/x-realaudio ra
+  \\audio/x-caf caf
+  \\audio/x-m4a m4a
+  \\audio/x-aac aac
+  \\audio/mp3 mp3
+  \\audio/xm xm
+  \\audio/s3m s3m
+  \\audio/silk sil
+  \\audio/adpcm adp
+  \\audio/vnd.dts dts
+  \\audio/vnd.dts.hd dtshd
+  \\audio/mobile-xmf mxmf
+  \\video/mp4 mp4 mp4v mpg4
+  \\video/webm webm
+  \\video/ogg ogv
+  \\video/mpeg mpeg mpg mpe m1v m2v
+  \\video/quicktime mov qt
+  \\video/x-msvideo avi
+  \\video/x-matroska mkv mk3d mks
+  \\video/x-flv flv
+  \\video/x-m4v m4v
+  \\video/x-ms-wmv wmv
+  \\video/x-ms-asf asf asx
+  \\video/x-ms-wm wm
+  \\video/x-ms-wmx wmx
+  \\video/x-ms-wvx wvx
+  \\video/x-ms-vob vob
+  \\video/mp2t ts m2t m2ts mts
+  \\video/3gpp 3gp 3gpp
+  \\video/3gpp2 3g2
+  \\audio/3gpp 3gpp
+  \\video/h261 h261
+  \\video/h263 h263
+  \\video/h264 h264
+  \\video/jpeg jpgv
+  \\video/mj2 mj2 mjp2
+  \\video/iso.segment m4s
+  \\video/x-f4v f4v
+  \\video/x-fli fli
+  \\video/x-mng mng
+  \\video/x-sgi-movie movie
+  \\video/x-smv smv
+  \\video/vnd.mpegurl mxu m4u
+  \\application/vnd.apple.mpegurl m3u8
+  \\application/ogg ogx
+  \\application/mp4 mp4 mpg4 mp4s m4p
+  \\application/mxf mxf
+  \\application/x-shockwave-flash swf
+  \\application/vnd.rn-realmedia rm
+  \\application/vnd.rn-realmedia-vbr rmvb
+  \\font/woff woff
+  \\font/woff2 woff2
+  \\font/ttf ttf
+  \\font/otf otf
+  \\font/collection ttc
+  \\application/vnd.ms-fontobject eot
+  \\application/x-font-type1 pfa pfb pfm afm
+  \\application/x-font-bdf bdf
+  \\application/x-font-pcf pcf
+  \\application/x-font-snf snf
+  \\application/x-font-ghostscript gsf
+  \\application/x-font-linux-psf psf
+  \\application/font-tdpfr pfr
+  \\application/pdf pdf
+  \\application/postscript ps ai eps
+  \\application/rtf rtf
+  \\text/rtf rtf
+  \\application/msword doc dot
+  \\application/vnd.openxmlformats-officedocument.wordprocessingml.document docx
+  \\application/vnd.openxmlformats-officedocument.wordprocessingml.template dotx
+  \\application/vnd.ms-word.document.macroenabled.12 docm
+  \\application/vnd.ms-word.template.macroenabled.12 dotm
+  \\application/vnd.ms-excel xls xlm xla xlc xlt xlw
+  \\application/vnd.openxmlformats-officedocument.spreadsheetml.sheet xlsx
+  \\application/vnd.openxmlformats-officedocument.spreadsheetml.template xltx
+  \\application/vnd.ms-excel.sheet.macroenabled.12 xlsm
+  \\application/vnd.ms-excel.template.macroenabled.12 xltm
+  \\application/vnd.ms-excel.addin.macroenabled.12 xlam
+  \\application/vnd.ms-excel.sheet.binary.macroenabled.12 xlsb
+  \\application/vnd.ms-powerpoint ppt pps pot
+  \\application/vnd.openxmlformats-officedocument.presentationml.presentation pptx
+  \\application/vnd.openxmlformats-officedocument.presentationml.slideshow ppsx
+  \\application/vnd.openxmlformats-officedocument.presentationml.template potx
+  \\application/vnd.openxmlformats-officedocument.presentationml.slide sldx
+  \\application/vnd.ms-powerpoint.presentation.macroenabled.12 pptm
+  \\application/vnd.ms-powerpoint.slideshow.macroenabled.12 ppsm
+  \\application/vnd.ms-powerpoint.template.macroenabled.12 potm
+  \\application/vnd.ms-powerpoint.addin.macroenabled.12 ppam
+  \\application/vnd.ms-powerpoint.slide.macroenabled.12 sldm
+  \\application/vnd.oasis.opendocument.text odt
+  \\application/vnd.oasis.opendocument.text-template ott
+  \\application/vnd.oasis.opendocument.text-master odm
+  \\application/vnd.oasis.opendocument.text-web oth
+  \\application/vnd.oasis.opendocument.spreadsheet ods
+  \\application/vnd.oasis.opendocument.spreadsheet-template ots
+  \\application/vnd.oasis.opendocument.presentation odp
+  \\application/vnd.oasis.opendocument.presentation-template otp
+  \\application/vnd.oasis.opendocument.graphics odg
+  \\application/vnd.oasis.opendocument.graphics-template otg
+  \\application/vnd.oasis.opendocument.chart odc
+  \\application/vnd.oasis.opendocument.formula odf
+  \\application/vnd.oasis.opendocument.database odb
+  \\application/vnd.oasis.opendocument.image odi
+  \\application/vnd.sun.xml.writer sxw
+  \\application/vnd.sun.xml.calc sxc
+  \\application/vnd.sun.xml.impress sxi
+  \\application/vnd.sun.xml.draw sxd
+  \\application/epub+zip epub
+  \\application/x-mobipocket-ebook mobi prc
+  \\application/vnd.amazon.ebook azw
+  \\application/vnd.ms-xpsdocument xps
+  \\application/oxps oxps
+  \\application/vnd.visio vsd vst vss vsw vsdx vtx
+  \\application/vnd.ms-project mpp mpt
+  \\application/vnd.ms-outlook msg
+  \\application/vnd.ms-works wps wks wcm wdb
+  \\application/vnd.ms-htmlhelp chm
+  \\application/vnd.ms-officetheme thmx
+  \\application/onenote onetoc onetoc2 onetmp onepkg one onea
+  \\application/x-abiword abw
+  \\application/x-gnumeric gnumeric
+  \\application/vnd.wordperfect wpd
+  \\application/vnd.lotus-1-2-3 123
+  \\application/vnd.apple.pages pages
+  \\application/vnd.apple.numbers numbers
+  \\application/vnd.apple.keynote key
+  \\application/x-iwork-pages-sffpages pages
+  \\application/x-iwork-numbers-sffnumbers numbers
+  \\application/x-iwork-keynote-sffkey key
+  \\application/x-dvi dvi
+  \\application/vnd.google-earth.kml+xml kml
+  \\application/vnd.google-earth.kmz kmz
+  \\application/vnd.mozilla.xul+xml xul
+  \\application/x-msaccess mdb
+  \\application/x-mspublisher pub
+  \\application/mathematica ma nb mb
+  \\message/rfc822 eml mime mht mhtml
+  \\application/mbox mbox
+  \\application/zip zip
+  \\application/gzip gz
+  \\application/x-tar tar
+  \\application/x-bzip bz
+  \\application/x-bzip2 bz2 boz
+  \\application/x-xz xz
+  \\application/x-7z-compressed 7z
+  \\application/vnd.rar rar
+  \\application/x-rar-compressed rar
+  \\application/java-archive jar war ear
+  \\application/x-debian-package deb udeb
+  \\application/x-redhat-package-manager rpm
+  \\application/vnd.android.package-archive apk
+  \\application/x-apple-diskimage dmg
+  \\application/x-iso9660-image iso
+  \\application/vnd.ms-cab-compressed cab
+  \\application/x-cpio cpio
+  \\application/x-shar shar
+  \\application/x-gtar gtar
+  \\application/x-ustar ustar
+  \\application/x-lzh-compressed lzh lha
+  \\application/x-stuffit sit
+  \\application/x-stuffitx sitx
+  \\application/x-ace-compressed ace
+  \\application/x-arj arj
+  \\application/x-cbr cbr cba cbt cbz cb7
+  \\application/x-zip-compressed zip
+  \\application/x-chrome-extension crx
+  \\application/x-xpinstall xpi
+  \\application/vnd.apple.installer+xml mpkg
+  \\application/x-msdownload exe dll com bat msi
+  \\application/x-msdos-program exe
+  \\application/x-ms-shortcut lnk
+  \\application/x-makeself run
+  \\application/appx appx
+  \\application/appxbundle appxbundle
+  \\application/msix msix
+  \\application/msixbundle msixbundle
+  \\application/appinstaller appinstaller
+  \\application/x-virtualbox-ova ova
+  \\application/x-virtualbox-ovf ovf
+  \\application/x-virtualbox-vdi vdi
+  \\application/x-virtualbox-vhd vhd
+  \\application/x-virtualbox-vmdk vmdk
+  \\application/x-virtualbox-hdd hdd
+  \\application/x-virtualbox-vbox vbox
+  \\application/x-hdf hdf
+  \\application/x-netcdf nc cdf
+  \\application/vnd.dbf dbf
+  \\application/vnd.tcpdump.pcap pcap cap dmp
+  \\application/dicom dcm
+  \\application/vnd.mapbox-vector-tile mvt
+  \\application/x-blender blend
+  \\application/vnd.iccprofile icc icm
+  \\application/x-keepass2 kdbx
+  \\application/x-lua-bytecode luac
+  \\application/java-vm class
+  \\application/java-serialized-object ser
+  \\application/ubjson ubj
+  \\application/vnd.unity unityweb
+  \\application/x-doom wad
+  \\application/pgp-encrypted pgp
+  \\application/pgp-keys asc
+  \\application/pgp-signature sig asc
+  \\application/pkcs10 p10
+  \\application/pkcs7-mime p7m p7c
+  \\application/pkcs7-signature p7s
+  \\application/pkcs8 p8
+  \\application/pkix-cert cer
+  \\application/pkix-crl crl
+  \\application/x-x509-ca-cert crt der pem
+  \\application/x-pkcs12 p12 pfx
+  \\application/x-pkcs7-certificates p7b spc
+  \\application/x-pkcs7-certreqresp p7r
+  \\application/vnd.apple.pkpass pkpass
+  \\application/vnd.age age
+  \\model/gltf+json gltf
+  \\model/gltf-binary glb
+  \\model/obj obj
+  \\model/stl stl
+  \\model/mtl mtl
+  \\model/3mf 3mf
+  \\model/vrml wrl vrml
+  \\model/iges igs iges
+  \\model/mesh msh mesh silo
+  \\model/step step stp stpnc p21 210
+  \\model/x3d+xml x3d x3dz
+  \\model/vnd.collada+xml dae
+  \\model/vnd.usdz+zip usdz
+  \\model/vnd.usda usda
+  \\model/u3d u3d
+  \\application/vnd.autodesk.fbx fbx
+  \\application/octet-stream bin dms lrf mar so dist distz pkg bpk dump elc deploy exe dll deb dmg iso img msi msp msm buffer
+
+// --- Tests ------------------------------------------------------------------
+
+type Written = { text: String, canonical: String }
+
+/// Texts that are media types, each with what `show` writes of it. The first four are RFC 9110
+/// §8.3.1's and the `multipart` ones RFC 2046 §5.1.1's.
+fn readable() -> List<Written> =
+  [
+    { text: "text/html;charset=utf-8", canonical: "text/html; charset=utf-8" },
+    { text: "Text/HTML;Charset=\"utf-8\"", canonical: "text/html; charset=utf-8" },
+    { text: "text/html; charset=\"utf-8\"", canonical: "text/html; charset=utf-8" },
+    { text: "text/html;charset=UTF-8", canonical: "text/html; charset=UTF-8" },
+    {
+      text: "multipart/mixed; boundary=gc0p4Jq0M2Yt08j34c0p",
+      canonical: "multipart/mixed; boundary=gc0p4Jq0M2Yt08j34c0p",
+    },
+    {
+      text: "multipart/mixed; boundary=\"gc0pJq0M:08jU534c0p\"",
+      canonical: "multipart/mixed; boundary=\"gc0pJq0M:08jU534c0p\"",
+    },
+    {
+      text: "multipart/mixed; boundary=\"simple boundary\"",
+      canonical: "multipart/mixed; boundary=\"simple boundary\"",
+    },
+    { text: "text/plain", canonical: "text/plain" },
+    { text: " \ttext/plain \t", canonical: "text/plain" },
+    { text: "APPLICATION/LD+JSON", canonical: "application/ld+json" },
+    { text: "*/*", canonical: "*/*" },
+    { text: "text/*;q=0.5", canonical: "text/*; q=0.5" },
+    { text: "text/html;;charset=utf-8 ; ", canonical: "text/html; charset=utf-8" },
+    { text: "text/plain; title=\"\"", canonical: "text/plain; title=\"\"" },
+    {
+      text: "text/plain; title=\"a \\\"b\\\" \\\\ \\c\"",
+      canonical: "text/plain; title=\"a \\\"b\\\" \\\\ c\"",
+    },
+    {
+      text: "text/plain; name=\"na\u{ef}ve.txt\"",
+      canonical: "text/plain; name=\"na\u{ef}ve.txt\"",
+    },
+    {
+      text: "text/plain; format=flowed; DelSp=yes",
+      canonical: "text/plain; format=flowed; delsp=yes",
+    },
+  ]
+
+test "reads {show(c.text)}" for c: Written in readable() {
+  assert_eq(match parse(c.text) { Ok(m) -> Some(render(m)), Err(_) -> None }, Some(c.canonical));
+  assert_eq(parse(c.canonical), parse(c.text))
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+/// Texts that are no media type, each with where it stops being one and why. The colon is RFC
+/// 2046 §5.1.1's boundary that must be quoted.
+fn unreadable() -> List<Refused> =
+  [
+    { text: "", at: 0, why: NoToken },
+    { text: "/html", at: 0, why: NoToken },
+    { text: "text", at: 4, why: NoSlash },
+    { text: "text html", at: 4, why: NoSlash },
+    { text: "text/", at: 5, why: NoToken },
+    { text: "text/ html", at: 5, why: NoToken },
+    { text: "text/html charset=utf-8", at: 10, why: Trailing },
+    { text: "text/html, text/plain", at: 9, why: Trailing },
+    { text: "multipart/mixed; boundary=gc0pJq0M:08jU534c0p", at: 34, why: Trailing },
+    { text: "text/html; charset", at: 18, why: NoEquals },
+    { text: "text/html; charset =utf-8", at: 18, why: NoEquals },
+    { text: "text/html; charset= utf-8", at: 19, why: NoToken },
+    { text: "text/html; charset=", at: 19, why: NoToken },
+    { text: "text/html; =utf-8", at: 11, why: Trailing },
+    { text: "text/html; charset=\"utf-8", at: 25, why: Unclosed },
+    { text: "text/html; a=\"x\\", at: 16, why: Unclosed },
+    { text: "text/html; a=\"x\\\"", at: 17, why: Unclosed },
+    { text: "text/html; a=\"x\u{7f}y\"", at: 15, why: Control },
+    { text: "text/html; a=\"x\\\u{7f}y\"", at: 16, why: Control },
+    { text: "text/html; a=1; b=2; A=3", at: 21, why: Repeated("a") },
+    { text: "text/html; a=\"x\"y", at: 16, why: Trailing },
+  ]
+
+test "refuses {show(c.text)}" for c: Refused in unreadable() {
+  assert_eq(parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "the raising reader raises what the other answers" {
+  assert_eq(try { read("text") }, Err({ at: 4, why: NoSlash }));
+  assert_eq(try { read_list("text/html, text") }, Err({ at: 15, why: NoSlash }))
+}
+
+test "a quoted string holds a blank after a backslash, and no NUL" {
+  assert_eq(parse("text/plain; t=\"a\\ b\\\tc\""), parse("text/plain; t=\"a b\tc\""));
+  assert_eq(parse("text/html; a=\"x\0y\""), Err({ at: 15, why: Control }));
+  assert_eq(parse("text/html; a=\"x\\\0y\""), Err({ at: 16, why: Control }))
+}
+
+test "the parameters after a field's first word are read as a media type's are" {
+  assert_eq(
+    try { read_params("attachment; filename=\"a b.txt\"; Size=12 ", 10) },
+    Ok([{ name: "filename", value: "a b.txt" }, { name: "size", value: "12" }]),
+  );
+  assert_eq(try { read_params("inline", 6) }, Ok([]));
+  assert_eq(try { read_params("inline", 9) }, Ok([]));
+  assert_eq(try { read_params("inline; a=1 b", 6) }, Err({ at: 12, why: Trailing }));
+  assert_eq(try { read_params("inline; a=1; A=2", 6) }, Err({ at: 13, why: Repeated("a") }))
+}
+
+test "RFC 9110's four spellings of one media type are equal, and a parameter's order is not read" {
+  let spellings = map(
+    ["text/html;charset=utf-8", "Text/HTML;Charset=\"utf-8\"", "text/html; charset=\"utf-8\""],
+    parse,
+  );
+  assert_eq(
+    spellings,
+    map(spellings, |_: Result<MediaType, Refusal>| parse("text/html;charset=UTF-8")),
+  );
+  assert_eq(parse("text/plain; a=1; b=2"), parse("TEXT/Plain; B=2; A=1"));
+  assert(parse("text/plain; a=1") != parse("text/plain; a=2"));
+  assert(parse("text/plain; a=x") != parse("text/plain; a=X"));
+  assert(parse("text/plain") != parse("text/plain; a=1"));
+  assert_eq(MediaType("Text", "HTML", [{ name: "Charset", value: "UTF-8" }]), html_utf8());
+  assert_eq(digest(MediaType("Text", "HTML", [])), digest(MediaType("text", "html", [])))
+}
+
+fn html_utf8() -> MediaType = MediaType("text", "html", [{ name: "charset", value: "utf-8" }])
+
+test "a media type is shown as its canonical text, and its parts are read in lower case" {
+  let m = MediaType("Image", "SVG+XML", [{ name: "Charset", value: "UTF-8" }]);
+  assert_eq(f"{m}", "image/svg+xml; charset=UTF-8");
+  assert_eq(top_level(m), "image");
+  assert_eq(subtype(m), "svg+xml");
+  assert_eq(suffix(m), Some("xml"));
+  assert_eq(suffix(html_utf8()), None);
+  assert_eq(essence(m), "image/svg+xml");
+  assert_eq(charset(m), Some("utf-8"));
+  assert_eq(param(m, "CHARSET"), Some("UTF-8"));
+  assert_eq(param(m, "boundary"), None);
+  assert_eq(params(m), [{ name: "Charset", value: "UTF-8" }]);
+  assert_eq(without_params(m), MediaType("image", "svg+xml", []));
+  // Lower case is ASCII's: the Kelvin sign is no `k`, in a name or in a charset.
+  let kelvin = MediaType("text", "MAR\u{212A}DOWN", [{ name: "charset", value: "\u{212A}OI8-R" }]);
+  assert_eq(subtype(kelvin), "mar\u{212A}down");
+  assert_eq(charset(kelvin), Some("\u{212A}oi8-r"));
+  assert(without_params(kelvin) != MediaType("text", "markdown", []));
+  assert_eq(
+    match parse("multipart/form-data; boundary=\"simple boundary\"") {
+      Ok(form) -> boundary(form),
+      Err(_) -> None,
+    },
+    Some("simple boundary"),
+  )
+}
+
+test "a maker answers a media type only of tokens and of values a text can carry" {
+  assert_eq(media_type("Text", "HTML"), Some(MediaType("text", "html", [])));
+  assert_eq(media_type("text", ""), None);
+  assert_eq(media_type("te xt", "html"), None);
+  assert_eq(media_type("text", "html/x"), None);
+  let plain = MediaType("text", "plain", []);
+  assert_eq(
+    with_param(plain, "Charset", "utf-8"),
+    Some(MediaType("text", "plain", [{ name: "charset", value: "utf-8" }])),
+  );
+  let two = MediaType("text", "plain", [{ name: "a", value: "1" }, { name: "b", value: "2" }]);
+  assert_eq(
+    match with_param(two, "A", "x y") { Some(m) -> render(m), None -> "" },
+    "text/plain; a=\"x y\"; b=2",
+  );
+  assert_eq(with_param(plain, "a b", "1"), None);
+  assert_eq(with_param(plain, "", "1"), None);
+  assert_eq(with_param(plain, "a", "line\nbreak"), None);
+  assert_eq(with_param(plain, "a", "nul\0"), None);
+  assert_eq(with_param(plain, "a", "del\u{7f}"), None);
+  assert(with_param(plain, "a", "next line\u{85}") != None);
+  assert(with_param(plain, "a", "tab\tand caf\u{e9}") != None);
+  assert(is_token("a.b-c_d~1"));
+  assert(!is_token("a/b"));
+  assert(!is_token(""))
+}
+
+fn range_of(text: String) -> MediaType / {abort.raise} =
+  match parse(text) { Ok(m) -> m, Err(_) -> panic("no media type: " ++ text) }
+
+test "a range covers the types it names, and a wider range is less specific" {
+  let html = range_of("text/html; charset=utf-8");
+  assert(matches(range_of("*/*"), html));
+  assert(matches(range_of("text/*"), html));
+  assert(matches(range_of("TEXT/HTML"), html));
+  assert(matches(range_of("text/html; q=0.2"), html));
+  assert(matches(range_of("text/html; charset=UTF-8"), html));
+  assert(!matches(range_of("text/html; level=1"), html));
+  assert(!matches(range_of("text/plain"), html));
+  assert(!matches(range_of("image/*"), html));
+  assert(!matches(html, range_of("text/*")));
+  assert_eq(
+    map(
+      ["*/*", "text/*", "text/plain", "text/plain;format=flowed", "text/plain;q=0.1"],
+      |t: String| specificity(range_of(t)),
+    ),
+    [0, 1, 2, 3, 2],
+  )
+}
+
+type Weighed = { text: String, weight: Option<Int> }
+
+fn weights() -> List<Weighed> =
+  [
+    { text: "text/html", weight: Some(1000) },
+    { text: "text/html;q=1", weight: Some(1000) },
+    { text: "text/html;q=1.000", weight: Some(1000) },
+    { text: "text/html;q=1.", weight: Some(1000) },
+    { text: "text/html;q=0", weight: Some(0) },
+    { text: "text/html;q=0.", weight: Some(0) },
+    { text: "text/html;q=0.5", weight: Some(500) },
+    { text: "text/html;q=0.25", weight: Some(250) },
+    { text: "text/html;Q=0.001", weight: Some(1) },
+    { text: "text/html;q=0.999", weight: Some(999) },
+    { text: "text/html;q=1.001", weight: None },
+    { text: "text/html;q=2", weight: None },
+    { text: "text/html;q=0.1234", weight: None },
+    { text: "text/html;q=0.0001", weight: None },
+    { text: "text/html;q=0.-1", weight: None },
+    { text: "text/html;q=.5", weight: None },
+    { text: "text/html;q=05", weight: None },
+    { text: "text/html;q=-1", weight: None },
+    { text: "text/html;q=\"\"", weight: None },
+    { text: "text/html;q=0.x", weight: None },
+  ]
+
+test "weighs {show(c.text)}" for c: Weighed in weights() {
+  assert_eq(quality(range_of(c.text)), c.weight)
+}
+
+type Listed = { text: String, canonical: List<String> }
+
+/// `Accept` fields, the first three RFC 9110 §12.5.1's, each with its ranges as `show` writes
+/// them.
+fn accepted() -> List<Listed> =
+  [
+    { text: "audio/*; q=0.2, audio/basic", canonical: ["audio/*; q=0.2", "audio/basic"] },
+    {
+      text: "text/plain; q=0.5, text/html, text/x-dvi; q=0.8, text/x-c",
+      canonical: ["text/plain; q=0.5", "text/html", "text/x-dvi; q=0.8", "text/x-c"],
+    },
+    {
+      text: "text/*, text/plain, text/plain;format=flowed, */*",
+      canonical: ["text/*", "text/plain", "text/plain; format=flowed", "*/*"],
+    },
+    { text: "", canonical: [] },
+    { text: " , ,", canonical: [] },
+    {
+      text: ",text/html,,text/plain; a=\"x,y\" ,",
+      canonical: ["text/html", "text/plain; a=\"x,y\""],
+    },
+  ]
+
+test "lists {show(c.text)}" for c: Listed in accepted() {
+  assert_eq(
+    match parse_list(c.text) { Ok(ms) -> Some(map(ms, render)), Err(_) -> None },
+    Some(c.canonical),
+  )
+}
+
+test "a list is refused where an element is no media type" {
+  assert_eq(parse_list("text/html text/plain"), Err({ at: 10, why: Trailing }));
+  assert_eq(parse_list("text/html, plain"), Err({ at: 16, why: NoSlash }));
+  assert_eq(parse_list("text/html; a=\"x, text/plain"), Err({ at: 27, why: Unclosed }))
+}
+
+test "the literal's check answers the media type, or the character the text stops being one at" {
+  assert_eq(literal("text/html; charset=utf-8"), Ok(html_utf8()));
+  assert_eq(
+    literal("text/html; charset"),
+    Err({ message: "a `=` is expected after a parameter's name", offset: 18 }),
+  );
+  assert_eq(
+    literal("text/plain; a=\"caf\u{e9}\"; a=1"),
+    Err({ message: "the parameter `a` is given twice", offset: 22 }),
+  )
+}
+
+/// A token made of `text`: its characters a token holds, or `x` where it has none.
+fn tokenized(text: String) -> String = {
+  let kept = string_of_chars(
+    filter(string_chars(text), |c: Char| string_contains(token_chars(), string_of_chars([c]))),
+  );
+  if kept == "" { "x" } else { kept }
+}
+
+/// What a law makes a media type of: any four texts.
+type Seed = { top: String, subtype: String, name: String, value: String }
+
+/// What of `text` a quoted string holds.
+fn quoted_text(text: String) -> String =
+  string_of_chars(filter(string_chars(text), |c: Char| is_quotable(string_of_chars([c]))))
+
+/// A media type of a seed, through the makers: its names the seed's token characters, and its
+/// parameter's value what of the seed's a quoted string holds.
+fn made(s: Seed) -> MediaType =
+  match media_type(tokenized(s.top), tokenized(s.subtype)) {
+    Some(m) -> match with_param(m, tokenized(s.name), quoted_text(s.value)) {
+      Some(set) -> set,
+      None -> m,
+    },
+    None -> MediaType("x", "x", []),
+  }
+
+/// The media type `made` makes of a seed, as the constructor holds it with its names in upper
+/// case.
+fn shouted(s: Seed) -> MediaType =
+  MediaType(ascii_upper(tokenized(s.top)), ascii_upper(tokenized(s.subtype)), [
+    { name: ascii_upper(tokenized(s.name)), value: quoted_text(s.value) },
+  ])
+
+/// The canonical text of `text` where it is a media type, and `text` where it is none.
+fn canonical(text: String) -> String / {abort.raise} =
+  match parse(text) { Ok(m) -> render(m), Err(_) -> text }
+
+law "a media type's canonical text reads back as it" =
+  agrees(|s: Seed| parse(render(made(s))), |s: Seed| Ok(made(s)))
+
+law "a media type is equal however its names are cased" = agrees(shouted, made)
+
+law "a canonical text is its own canonical text" = idempotent(canonical)
+
+type Named = { ext: String, named: String }
+
+/// Extensions and the types `mime-db` 1.54.0 lists them under, read from its `db.json`.
+fn sampled() -> List<Named> =
+  [
+    { ext: "html", named: "text/html" },
+    { ext: "htm", named: "text/html" },
+    { ext: "css", named: "text/css" },
+    { ext: "js", named: "text/javascript" },
+    { ext: "mjs", named: "text/javascript" },
+    { ext: "json", named: "application/json" },
+    { ext: "xml", named: "application/xml" },
+    { ext: "txt", named: "text/plain" },
+    { ext: "csv", named: "text/csv" },
+    { ext: "md", named: "text/markdown" },
+    { ext: "wasm", named: "application/wasm" },
+    { ext: "png", named: "image/png" },
+    { ext: "jpg", named: "image/jpeg" },
+    { ext: "jpeg", named: "image/jpeg" },
+    { ext: "gif", named: "image/gif" },
+    { ext: "webp", named: "image/webp" },
+    { ext: "svg", named: "image/svg+xml" },
+    { ext: "avif", named: "image/avif" },
+    { ext: "ico", named: "image/vnd.microsoft.icon" },
+    { ext: "bmp", named: "image/bmp" },
+    { ext: "mp3", named: "audio/mpeg" },
+    { ext: "wav", named: "audio/wav" },
+    { ext: "ogg", named: "audio/ogg" },
+    { ext: "mid", named: "audio/midi" },
+    { ext: "aiff", named: "audio/x-aiff" },
+    { ext: "mp4", named: "video/mp4" },
+    { ext: "webm", named: "video/webm" },
+    { ext: "avi", named: "video/x-msvideo" },
+    { ext: "mov", named: "video/quicktime" },
+    { ext: "woff", named: "font/woff" },
+    { ext: "woff2", named: "font/woff2" },
+    { ext: "ttf", named: "font/ttf" },
+    { ext: "otf", named: "font/otf" },
+    { ext: "ttc", named: "font/collection" },
+    { ext: "eot", named: "application/vnd.ms-fontobject" },
+    { ext: "pdf", named: "application/pdf" },
+    { ext: "ps", named: "application/postscript" },
+    { ext: "zip", named: "application/zip" },
+    { ext: "gz", named: "application/gzip" },
+    { ext: "tar", named: "application/x-tar" },
+    { ext: "rar", named: "application/vnd.rar" },
+    { ext: "7z", named: "application/x-7z-compressed" },
+    { ext: "doc", named: "application/msword" },
+    {
+      ext: "docx",
+      named: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    },
+    { ext: "xlsx", named: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+    { ext: "odt", named: "application/vnd.oasis.opendocument.text" },
+    { ext: "epub", named: "application/epub+zip" },
+    { ext: "eml", named: "message/rfc822" },
+    { ext: "ics", named: "text/calendar" },
+    { ext: "yaml", named: "text/yaml" },
+    { ext: "toml", named: "application/toml" },
+    { ext: "bin", named: "application/octet-stream" },
+    { ext: "exe", named: "application/x-msdownload" },
+    { ext: "glb", named: "model/gltf-binary" },
+  ]
+
+test "{c.ext} is {c.named}" for c: Named in sampled() {
+  assert_eq(match of_extension(c.ext) { Some(m) -> Some(render(m)), None -> None }, Some(c.named));
+  assert(match parse(c.named) { Ok(m) -> contains(extensions(m), c.ext), Err(_) -> false })
+}
+
+test "an extension is read with or without its dot and in any case, and a path by its last one" {
+  let html = Some(MediaType("text", "html", []));
+  assert_eq(of_extension("html"), html);
+  assert_eq(of_extension(".html"), html);
+  assert_eq(of_extension("HTML"), html);
+  assert_eq(of_extension(".HtM"), html);
+  assert_eq(of_extension("..html"), None);
+  assert_eq(of_extension(""), None);
+  assert_eq(of_extension("no-such-extension"), None);
+  // The Kelvin sign is `k` in Unicode's lower case, and is no letter of `mkv`.
+  assert_eq(of_extension("mkv"), Some(MediaType("video", "x-matroska", [])));
+  assert_eq(of_extension("m\u{212A}v"), None);
+  assert_eq(of_path("site/index.html"), html);
+  assert_eq(of_path("a/b.tar.gz"), Some(MediaType("application", "gzip", [])));
+  assert_eq(of_path("photo.JPG"), Some(MediaType("image", "jpeg", [])));
+  assert_eq(of_path("a.d/README"), None);
+  assert_eq(of_path(".gitignore"), None);
+  assert_eq(of_path("archive."), None);
+  assert_eq(of_path(""), None)
+}
+
+test "a type's extensions are its row, the preferred one first, whatever its case or parameters" {
+  let jpeg = MediaType("IMAGE", "JPEG", [{ name: "q", value: "0.5" }]);
+  assert_eq(extensions(jpeg), ["jpg", "jpeg", "jpe"]);
+  assert_eq(extension(jpeg), Some("jpg"));
+  assert_eq(extension(MediaType("audio", "mpeg", [])), Some("mp3"));
+  assert_eq(extension(MediaType("text", "plain", [])), Some("txt"));
+  assert_eq(extension(MediaType("application", "octet-stream", [])), Some("bin"));
+  // A type that shares its extension with an earlier row still names it.
+  assert_eq(extensions(MediaType("text", "xml", [])), ["xml"]);
+  assert_eq(of_extension("xml"), Some(MediaType("application", "xml", [])));
+  assert_eq(extensions(MediaType("application", "x-no-such-type", [])), []);
+  assert_eq(extension(MediaType("application", "x-no-such-type", [])), None)
+}
+
+test "every row is a media type in lower case, and every extension names a type that lists it" {
+  let t = table();
+  assert(map_len(t.extensions) > 400);
+  assert(map_len(t.types) > 550);
+  assert_eq(
+    filter(map_keys(t.extensions), |named: String|
+      match parse(named) {
+        Ok(m) -> render(m) != named || len(extensions(m)) == 0,
+        Err(_) -> true,
+      }),
+    [],
+  );
+  assert_eq(
+    filter(map_keys(t.types), |ext: String|
+      ext != ascii_lower(ext)
+        || (match of_extension(ext) { Some(m) -> !contains(extensions(m), ext), None -> true })),
+    [],
+  )
+}
+
+test "a lookup reads the table and does not walk it" {
+  let first = metered(|| of_extension("html"));
+  let last = metered(|| of_extension("buffer"));
+  let absent = metered(|| of_extension("no-such-extension"));
+  assert_eq(first.value, Some(MediaType("text", "html", [])));
+  assert_eq(last.value, Some(MediaType("application", "octet-stream", [])));
+  assert_eq(first.steps, last.steps);
+  assert(first.steps < 10 && absent.steps < 10);
+  let back = metered(|| extensions(MediaType("application", "octet-stream", [])));
+  assert_eq(list_at(back.value, 0), Some("bin"));
+  assert(back.steps < 10)
+}
