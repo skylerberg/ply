@@ -4,7 +4,9 @@
 import harness (scratch, Ran, Source, project, program, write, read, shipped_sources, in_memory,
                 one, tree, on_disk, warm_agrees, seeding, said, stdout, stderr, json_of, at, path,
                 nth, items, first, str, int, truth, shown, Hermetic, Reached, Repo, Shipped,
-                inspected, reader_source, repo_file, std_tree)
+                inspected, reader_source, repo_file, std_tree, std_data, on_disk_shipping,
+                over_tree, spawned, assert_ok, codes)
+import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, TDAlias,
                        is_pub)
 import compiler.parsing (Doc, Ident)
@@ -190,11 +192,15 @@ fn rendering(u: String) -> String =
     ++ u
     ++ " = { octets: b };\n  uuid_render(u)\n}\n"
 
-test "a record with a `Uuid`'s field is a `Uuid` only where one is expected" {
-  assert_eq(items(at(checked(app(rendering(": Uuid"))), "diagnostics")), []);
+test "a record with a `Uuid`'s field is no `Uuid`, and only `std.uuid` builds one" {
+  let closed = first(items(at(checked(app(rendering(": Uuid"))), "diagnostics")));
+  assert(str(at(closed, "code")) == "E0220", Some(shown(closed)));
+  assert(string_contains(shown(closed), "uuid_of_octets"), Some(shown(closed)));
   let d = first(items(at(checked(app(rendering(""))), "diagnostics")));
   assert(str(at(d, "code")) == "E0201", Some(shown(d)));
-  assert(string_contains(shown(d), "std.uuid.Uuid"), Some(shown(d)))
+  assert(string_contains(shown(d), "std.uuid.Uuid"), Some(shown(d)));
+  let built = "import std.uuid (uuid_of_octets, uuid_render)\npub fn shown(b: Bytes) -> Option<String> / {abort.raise} =\n  match uuid_of_octets(b) { Some(u) -> Some(uuid_render(u)), None -> None }\n";
+  assert_eq(items(at(checked(app(built)), "diagnostics")), [])
 }
 
 test "a program importing nothing from std loads nothing" {
@@ -614,6 +620,263 @@ test "a shipped definition the project never touched is not a suspect" {
     );
     assert(str(nth(path(failure, ["culprit", "definitions"]), 0)) == "app.slug", Some(shown(v)))
   })
+}
+
+// --- A shipped module's data --------------------------------------------------------------------
+
+/// A program over `std.oid`, which embeds `oid/names.txt`: `named` reaches the table a build makes
+/// of the file, and `plain` a constant of the module that reaches none of it.
+fn naming() -> String =
+  \\import std.oid
+  \\
+  \\pub fn named() -> Option<String> = oid::name(oid::common_name())
+  \\
+  \\pub fn plain() -> Int = len(oid::arcs(oid::common_name()))
+  \\
+  \\fn main() -> Int = match named() { Some(n) -> string_len(n), None -> 0 }
+  \\
+  \\test "named" { assert_eq(named(), Some("commonName")) }
+  \\
+
+fn last_line(ran: Ran) -> String =
+  string_trim(match list_at(ran.out, len(ran.out) - 1) { Some(l) -> l, None -> "" })
+
+/// The data file `std.oid` embeds, under the name the shipped modules hold it by, as the tree has it.
+fn oid_names() -> Source / {abort.raise} =
+  match filter(std_data(), |d: { name: String, bytes: Bytes }| d.name == "std/oid/names.txt") {
+    [d, ..] -> { path: d.name, text: string_of_bytes(d.bytes) },
+    [] -> panic("the standard library's tree holds no `oid/names.txt`"),
+  }
+
+test "a program runs what a shipped module embedded, from the binary and from a built artifact" {
+  scratch(|| {
+    program(naming());
+    assert_ok(on_disk(["check"]));
+    let ran = on_disk(["run"]);
+    assert(ran.code == 0 && last_line(ran) == "10", Some(said(ran)));
+    let tested = on_disk(["test"]);
+    assert(tested.code == 0 && string_contains(said(tested), "1 passed"), Some(said(tested)));
+    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
+    let built = on_disk(["run", "m.plyx"]);
+    assert(built.code == 0 && last_line(built) == "10", Some(said(built)))
+  })
+}
+
+// The launcher lays the file out below the modules, and the program reads it off that directory.
+test/nondet "a `ply` of its own reads the data file a shipped module embeds" {
+  program(naming());
+  let ran = spawned(["run"], []);
+  assert(ran.code == 0 && last_line(ran) == "10", Some(said(ran)));
+  let shown = spawned(["std", "--show", "std/oid/names.txt"], []);
+  assert(shown.code == 0 && stdout(shown) == oid_names().text, Some(said(shown)))
+}
+
+test "a warm check agrees with a cold one over a program that reaches a shipped data file" {
+  scratch(|| {
+    project([{ path: "app.ply", text: naming() }]);
+    let _ = warm_agrees("cold");
+    let warm = warm_agrees("warm");
+    assert(has_named(at(warm, "definitions"), "std.oid.registry"), Some(shown(warm)))
+  })
+}
+
+test "editing a shipped data file moves exactly the definitions that reach it" {
+  let renamed = {
+    path: oid_names().path,
+    text: string::replace(oid_names().text, "2.5.4.3 commonName", "2.5.4.3 cn"),
+  };
+  assert(renamed.text != oid_names().text, Some("the edit landed"));
+  let hashes = |shipped: List<Source>|
+    over_tree(app(naming()), || json_of(on_disk_shipping(["hash", "--json"], shipped))).value;
+  let before = hashes([]);
+  let after = hashes([renamed]);
+  fold(
+    ["std.oid.registry", "std.oid.name", "app.named", "app.main"],
+    (),
+    |u: Unit, name: String| assert(hash_of(before, name) != hash_of(after, name), Some(name)),
+  );
+  // The module's text did not move, and what reaches nothing of the file stands.
+  fold(["std.oid.common_name", "std.oid.arcs", "app.plain"], (), |u: Unit, name: String|
+    assert(hash_of(before, name) == hash_of(after, name), Some(name)));
+  assert(tests_hashed(before) != tests_hashed(after), Some("the test that reads a name reruns"));
+  // Handed the file as the binary ships it, a load answers as one handed nothing in its place.
+  assert_eq(hashes([oid_names()]), before)
+}
+
+test "copying a shipped module and its data file into a project produces identical hashes" {
+  let source = match filter(std_tree(), |f: { name: String, bytes: Bytes }| f.name == "oid.ply") {
+    [f, ..] -> string_of_bytes(f.bytes),
+    [] -> panic("the standard library's tree holds no `oid.ply`"),
+  };
+  let shipped = hashed(app(naming()));
+  let copied = hashed(
+    tree([
+      { path: "mine.ply", text: source },
+      { path: "oid/names.txt", text: oid_names().text },
+      { path: "app.ply", text: string::replace(naming(), "import std.oid", "import mine as oid") },
+    ]),
+  );
+  fold(["registry", "name", "common_name"], (), |u: Unit, name: String|
+    assert_eq(hash_of(shipped, "std.oid." ++ name), hash_of(copied, "mine." ++ name)));
+  assert_eq(hash_of(shipped, "app.named"), hash_of(copied, "app.named"))
+}
+
+test "a program that reaches nothing of a shipped module's data holds no definition the file moves" {
+  let idle = "import std.oid\n\npub fn plain() -> Int = len(oid::arcs(oid::common_name()))\n";
+  let answer = checked(app(idle));
+  assert(truth(at(answer, "ok")), Some(shown(answer)));
+  assert(has_named(at(answer, "definitions"), "std.oid.common_name"), Some(shown(answer)));
+  fold(["std.oid.registry", "std.oid.name", "std.oid.named"], (), |u: Unit, name: String|
+    assert(!has_named(at(answer, "definitions"), name), Some(name)));
+  let hashes = |shipped: List<Source>|
+    over_tree(app(idle), || json_of(on_disk_shipping(["hash", "--json"], shipped))).value;
+  assert_eq(hashes([{ path: oid_names().path, text: "2.5.4.3 cn\n" }]), hashes([]))
+}
+
+/// A shipped module this binary does not ship, whose table a build makes of a data file beside it.
+fn words() -> Source =
+  {
+    path: "std.words.ply",
+    text:
+      \\//! Words, one a line, for a test of a shipped table.
+      \\
+      \\fn parsed(text: Bytes) -> List<String> / {abort.raise} =
+      \\  map(
+      \\    filter(string_split(string_of_bytes(text), "\n"), |word: String| word != ""),
+      \\    |word: String|
+      \\      if string_contains(word, " ") { panic("`" ++ word ++ "` is two words") } else { word },
+      \\  )
+      \\
+      \\/// The words the file beside this module holds, made when a program is built.
+      \\pub const fn table() -> List<String> = parsed(embed("words/list.txt"))
+      \\
+      \\/// The same words, made where they are asked for.
+      \\pub fn computed() -> List<String> / {abort.raise} = parsed(embed("words/list.txt"))
+      \\
+  }
+
+fn word_list(text: String) -> Source = { path: "std/words/list.txt", text: text }
+
+fn counting() -> String =
+  \\import std.words
+  \\
+  \\fn main() -> Int = len(words::table())
+  \\
+  \\test "the table read is the table its body makes" {
+  \\  assert_eq(words::table(), words::computed())
+  \\}
+  \\
+  \\test "a second read of the table enters nothing of its body" {
+  \\  let first = words::table();
+  \\  let read = metered(|| words::table());
+  \\  let nothing = metered(|| 0);
+  \\  assert_eq(read.steps, nothing.steps);
+  \\  assert_eq(read.allocations, nothing.allocations);
+  \\  assert(metered(|| words::computed()).steps > read.steps);
+  \\  assert_eq(len(first), 3)
+  \\}
+  \\
+
+test "a shipped module's `const fn` over its data file is made by the build, and a run reads it at no cost" {
+  let shipped = [words(), word_list("one\ntwo\nthree\n")];
+  scratch(|| {
+    program(counting());
+    assert_ok(on_disk_shipping(["check"], shipped));
+    let ran = on_disk_shipping(["run"], shipped);
+    assert(ran.code == 0 && last_line(ran) == "3", Some(said(ran)));
+    let tested = json_of(on_disk_shipping(["test", "--json", "--no-cache"], shipped));
+    assert(int(path(tested, ["summary", "passed"])) == 2, Some(shown(tested)))
+  });
+  // Other bytes are another definition, so the build makes the table again.
+  scratch(|| {
+    program(counting());
+    let longer = on_disk_shipping(["run"], [words(), word_list("one\ntwo\nthree\nfour\n")]);
+    assert(longer.code == 0 && last_line(longer) == "4", Some(said(longer)))
+  })
+}
+
+// The module's text stands across these checks, and each reads it through what the last one kept.
+test "a check that kept a shipped module makes its table again when the data file moves" {
+  scratch(|| {
+    program(counting());
+    let check = |list: String|
+      on_disk_shipping(["check", "--explain", "--json"], [words(), word_list(list)]);
+    assert_ok(check("one\ntwo\nthree\n"));
+    assert_ok(check("one\ntwo\nthree\n"));
+    let refused = json_of(check("one\ntwo words\n"));
+    assert_eq(codes(refused), ["E0157"]);
+    assert(string_contains(shown(refused), "`two words` is two words"), Some(shown(refused)));
+    assert_ok(check("one\ntwo\nthree\n"))
+  })
+}
+
+test "a data file the shipped modules do not hold is refused in the module that asks for it" {
+  scratch(|| {
+    program(counting());
+    let v = json_of(on_disk_shipping(["check", "--json"], [words()]));
+    // One for each call that asks for it.
+    assert_eq(codes(v), ["E0146", "E0146"]);
+    fold(items(at(v, "diagnostics")), (), |u: Unit, d: Json| {
+      assert(string_contains(str(at(d, "message")), "words/list.txt"), Some(shown(d)));
+      assert_eq(map(items(at(d, "labels")), |l: Json| str(at(l, "file"))), ["<std>/words.ply"])
+    })
+  })
+}
+
+test "ply std names the data a module embeds, prints it by name, and its digest covers it" {
+  let t = app("fn f() -> Int = 1\n");
+  let v = json_of(in_memory(t, ["std", "--json"]));
+  let held = match named_module(v, "std.oid") {
+    Some(m) -> items(at(m, "data")),
+    None -> panic("`std.oid` is not listed: " ++ shown(v)),
+  };
+  assert_eq(map(held, |d: Json| str(at(d, "name"))), [oid_names().path]);
+  assert_eq(map(held, |d: Json| int(at(d, "bytes"))), [string_len(oid_names().text)]);
+  assert(
+    match named_module(v, "std.list") { Some(m) -> items(at(m, "data")) == [], None -> false },
+    Some("a module that embeds nothing lists no data"),
+  );
+  let listing = in_memory(t, ["std"]);
+  assert(
+    string_contains(said(listing), oid_names().path ++ " · ")
+      && string_contains(said(listing), "embedded by std.oid"),
+    Some(said(listing)),
+  );
+  let shown_data = in_memory(t, ["std", "--show", oid_names().path]);
+  assert(shown_data.code == 0 && stdout(shown_data) == oid_names().text, Some(said(shown_data)));
+  // Bare, it prints the modules' sources and no data file.
+  assert(!string_contains(stdout(in_memory(t, ["std", "--show"])), "2.5.4.3 commonName"), None);
+  let digest = |shipped: List<Source>|
+    over_tree(t, || stdout(on_disk_shipping(["std", "--digest"], shipped))).value;
+  assert_eq(digest([oid_names()]), digest([]));
+  assert(digest([{ path: oid_names().path, text: "2.5.4.3 cn\n" }]) != digest([]), None)
+}
+
+fn named_module(listing: Json, name: String) -> Option<Json> =
+  match filter(items(at(listing, "modules")), |m: Json| str(at(m, "module")) == name) {
+    [m, ..] -> Some(m),
+    [] -> None,
+  }
+
+test "ply doc documents a name of a shipped module that embeds a data file" {
+  let r = in_memory(app("fn f() -> Int = 1\n"), ["doc", "std.oid.name"]);
+  assert(r.code == 0 && string_contains(said(r), "well-known identifier"), Some(said(r)))
+}
+
+// A file the tree holds and no module embeds would ship in every binary and be read by nothing.
+test "each data file the standard library's tree holds is one a module of it embeds" {
+  let embedded = fold(std_tree(), [], |acc: List<String>, f: { name: String, bytes: Bytes }|
+    if !string_ends_with(f.name, ".ply") || string_contains(f.name, "/") { acc } else {
+      fold(
+        shipped_data_wanted({
+          name: bytes_of_string("std." ++ string_slice(f.name, 0, string_len(f.name) - 4)),
+          src: f.bytes,
+        }),
+        acc,
+        |a: List<String>, name: Bytes| push(a, string_of_bytes(name)),
+      )
+    });
+  assert_eq(sort(map(std_data(), |d: { name: String, bytes: Bytes }| d.name)), sort(embedded))
 }
 
 /// `std.http` with each run of whitespace squeezed to one space, and to none inside a brace, so that

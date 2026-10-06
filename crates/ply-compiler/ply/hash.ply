@@ -19,7 +19,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SpecClause, ReturnsFresh,
               ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal, test_listing,
               test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind, NKey, NShow,
-              instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
+              NGen, instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
@@ -364,16 +364,18 @@ pub fn build_index(
   { index: { ..index, effect_sketches: sketch_effects(index) }, diags: built.diags }
 }
 
-/// Each type's `key` before its `show`, whatever order the module wrote them in.
+/// Each type's `key` before its `show`, whatever order the module wrote them in. A `gen` is no part
+/// of what its type is: it decides what a sample draws and nothing a program computes.
 fn instances_in(items: List<Item>) -> Map<Bytes, List<InstanceDef>> =
   fold(items, map_new(), |acc: Map<Bytes, List<InstanceDef>>, item: Item|
     match item {
       IInstance(d) -> {
         let held = match map_get(acc, d.target.name) { Some(xs) -> xs, None -> [] };
-        map_insert(acc, d.target.name, match d.kind {
-          NKey -> concat([d], held),
-          NShow -> push(held, d),
-        })
+        match d.kind {
+          NKey -> map_insert(acc, d.target.name, concat([d], held)),
+          NShow -> map_insert(acc, d.target.name, push(held, d)),
+          NGen -> acc,
+        }
       },
       _ -> acc,
     })
@@ -606,6 +608,8 @@ fn tag_key() -> Int = 140
 fn tag_show() -> Int = 141
 /// One function a type's arithmetic is, after the operation it is.
 fn tag_numeric() -> Int = 142
+/// A type only its own module builds a value of.
+fn tag_opaque() -> Int = 161
 
 /// An explicit table: renumbering a row invalidates every cached result in every store.
 fn binop_byte(op: Bytes) -> Int =
@@ -951,16 +955,22 @@ fn type_def(encoder: Encoder, d: TypeDef) -> Encoder / {abort.raise} = {
       ),
     TDNominal(t) -> type_expr(put_text(put_tag(counted, tag_type_nominal()), d.name.name), t),
   };
+  // Unlike `pub`, `opaque` refuses bodies that name nothing of the type's: a literal where a
+  // closed record is expected. Only the type's own hash reaches each of them.
+  let closed: Encoder = match d.opaque {
+    Some(_) -> put_tag(declared, tag_opaque()),
+    None -> declared,
+  };
   // What a value of the type compares and shows through is part of what the type is: each function
   // is a reference, so the type's hash moves when the function it names does.
   let stated: Encoder = match map_get(
-      at(declared.index.items, declared.module).instances,
+      at(closed.index.items, closed.module).instances,
       d.name.name,
     ) {
-    None -> declared,
+    None -> closed,
     Some(stated) ->
-      fold(stated, declared, |acc: Encoder, x: InstanceDef|
-        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), NShow -> tag_show() }), {
+      fold(stated, closed, |acc: Encoder, x: InstanceDef|
+        value_ref(put_tag(acc, match x.kind { NKey -> tag_key(), _ -> tag_show() }), {
           module: None,
           name: x.by,
           span: x.by.span,
@@ -4771,12 +4781,13 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
     let fields = print_type(printer, read_text(k.decoder).decoder);
     { decoder: fields.decoder, text: bytes_concat(b"new ", fields.text) }
   } else { panic("a tag that does not begin a type body") };
-  let stated = instances_of(printer, body.decoder, name);
+  let closed = peek(body.decoder) == tag_opaque();
+  let stated = instances_of(printer, if closed { skip(body.decoder) } else { body.decoder }, name);
   let numeric = numeric_of(printer, stated.decoder);
   {
     decoder: numeric.decoder,
     text: bytes_concat_all([
-      b"type ",
+      if closed { b"opaque type " } else { b"type " },
       name,
       generic_list(n.value, ec.value, lc.value),
       b" = ",
@@ -6317,6 +6328,37 @@ test "a `new` record prints back as one and hashes back to what it was stored un
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
+test "a type's hash says whether it is opaque, what holds it moves with it, and it prints back" {
+  let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
+  let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
+  assert(map_get(open, b"m.Date") != map_get(closed, b"m.Date"));
+  assert(map_get(open, b"m.day") != map_get(closed, b"m.day"));
+  // `pub` is still no part of it.
+  let kept = m(b"opaque type Date = new { day: Int }\nfn day(d: Date) -> Int = d.day");
+  assert_eq(map_get(kept, b"m.Date"), map_get(closed, b"m.Date"));
+  let sum = m(b"pub type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  let closed_sum = m(b"pub opaque type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
+  assert(map_get(sum, b"m.Tok") != map_get(closed_sum, b"m.Tok"));
+  assert(map_get(sum, b"m.mk") != map_get(closed_sum, b"m.mk"));
+  let out = hash_index(
+    indexed([
+      {
+        name: b"m",
+        src: b"pub opaque type Tok = | Tok(Int)\nkey for Tok by n\nfn n(t: Tok) -> Int = match t { Tok(i) -> i }\npub opaque type Date = new { day: Int }\npub fn mk() -> Date = { day: n(Tok(1)) }",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Tok = | Tok(Int)"));
+  assert(bytes::contains(at(ms, 0).text, b"\nkey for Tok by n"));
+  assert(bytes::contains(at(ms, 0).text, b"pub opaque type Date = new {"));
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
 test "an alias is transparent, so its name is no part of it" {
   let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
   // `conv_type` expands an alias in place, so these two declare one type and use it alike.
@@ -6489,4 +6531,42 @@ test "a key and a show print back after their type and hash back to what they we
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a gen is no part of its type's hash, and its sampler's covers the generator" {
+  let stating = |stated: Bytes, drawn: Bytes|
+    by_name(
+      named_hashes(
+        hash_index(
+          indexed([
+            {
+              name: b"m",
+              src: bytes_concat_all([
+                b"import std.gen (Gen, constant)\npub type Box = | Box(Int)\n",
+                stated,
+                b"pub fn boxes() -> Gen<Box> = constant(Box(",
+                drawn,
+                b"))\npub fn make() -> Box = Box(1)\n",
+              ]),
+            },
+            {
+              name: b"std.gen",
+              src: b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
+            },
+          ]),
+        ),
+      ),
+    );
+  let plain = stating(b"", b"1");
+  let stated = stating(b"gen for Box by boxes\n", b"1");
+  let edited = stating(b"gen for Box by boxes\n", b"2");
+  let named = |m: Map<Bytes, Bytes>, n: Bytes| map_get(m, n);
+  // Stating one, and editing it, leave the type and what can hold it where they were.
+  assert_eq(named(plain, b"m.Box"), named(stated, b"m.Box"));
+  assert_eq(named(stated, b"m.Box"), named(edited, b"m.Box"));
+  assert_eq(named(plain, b"m.make"), named(edited, b"m.make"));
+  // The sampler is a definition beside the statement, and moves with the generator it samples.
+  assert_eq(named(plain, b"m._sample_Box"), None);
+  assert(named(stated, b"m._sample_Box") != None);
+  assert(named(stated, b"m._sample_Box") != named(edited, b"m._sample_Box"))
 }

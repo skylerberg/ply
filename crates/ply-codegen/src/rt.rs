@@ -1922,6 +1922,19 @@ macro_rules! builtin_helper {
             builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d])
         }
     };
+    ($variant:ident 6) => {
+        pub unsafe extern "C" fn $variant(
+            ctx: *mut Ctx,
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+        ) -> i64 {
+            builtin(unsafe { &mut *ctx }, Builtin::$variant, &[a, b, c, d, e, f])
+        }
+    };
 }
 
 macro_rules! builtin_helpers {
@@ -2747,17 +2760,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::MapEntries, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
-            let shape = ctx.tables.layouts.entry_shape();
             let mut items = Vec::with_capacity(map::len(o));
             for (k, v) in map::to_vec(o) {
-                heap::inc(k);
-                heap::inc(v);
-                let e = ctx.heap.alloc(KIND_RECORD, 0, 2, shape);
-                unsafe {
-                    set_word(e, 0, k);
-                    set_word(e, 1, v);
-                }
-                items.push(e as Word);
+                items.push(entry(ctx, k, v));
             }
             let out = ctx.heap.list_from(&items);
             heap::dec(*m);
@@ -2787,12 +2792,23 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 }
                 pairs.push((k, v));
             }
-            let mut m = ctx.heap.map_new();
-            for (k, v) in pairs {
-                heap::inc(k);
-                heap::inc(v);
-                m = ctx.heap.map_insert(&tables.layouts, m, k, v);
+            for (k, v) in &pairs {
+                heap::inc(*k);
+                heap::inc(*v);
             }
+            // Entries in key order, each key once, are the tree's leaves as they stand.
+            let ascending = pairs.windows(2).all(|w| {
+                heap::cmp_words(&tables.layouts, w[0].0, w[1].0) == std::cmp::Ordering::Less
+            });
+            let m = if ascending {
+                ctx.heap.map_from_sorted(&pairs)
+            } else {
+                let mut m = ctx.heap.map_new();
+                for (k, v) in pairs {
+                    m = ctx.heap.map_insert(&tables.layouts, m, k, v);
+                }
+                m
+            };
             heap::dec(*xs);
             Some(m)
         }
@@ -2800,6 +2816,19 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::kind(*a) == KIND_MAP && heap::kind(*bm) == KIND_MAP =>
         {
             let tables = Arc::clone(&ctx.tables);
+            // The smaller map's entries go into the larger, and `b`'s entry stands at a shared key.
+            if map::len(obj(*a)) < map::len(obj(*bm)) {
+                let mut m = *bm;
+                for (k, v) in map::to_vec(obj(*a)) {
+                    if map::get(&tables.layouts, obj(m), k).is_none() {
+                        heap::inc(k);
+                        heap::inc(v);
+                        m = ctx.heap.map_insert(&tables.layouts, m, k, v);
+                    }
+                }
+                heap::dec(*a);
+                return Some(m);
+            }
             let o = obj(*bm);
             let mut m = *a;
             for (k, v) in map::to_vec(o) {
@@ -2810,8 +2839,151 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*bm);
             Some(m)
         }
+        (Builtin::MapFirst | Builtin::MapLast, [m]) if heap::kind(*m) == KIND_MAP => {
+            let o = obj(*m);
+            let index = match which {
+                Builtin::MapFirst => Some(0),
+                _ => map::len(o).checked_sub(1),
+            };
+            let answer = entry_option(ctx, index.and_then(|i| map::at(o, i)))?;
+            heap::dec(*m);
+            Some(answer)
+        }
+        (
+            Builtin::MapFloor | Builtin::MapCeiling | Builtin::MapBelow | Builtin::MapAbove,
+            [m, k],
+        ) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let o = obj(*m);
+            let (below, found) = map::locate(&ctx.tables.layouts, o, *k);
+            let index = match which {
+                Builtin::MapCeiling => Some(below),
+                Builtin::MapAbove => Some(below + usize::from(found.is_some())),
+                Builtin::MapFloor if found.is_some() => Some(below),
+                _ => below.checked_sub(1),
+            };
+            let answer = entry_option(ctx, index.and_then(|i| map::at(o, i)))?;
+            heap::dec(*m);
+            heap::dec(*k);
+            Some(answer)
+        }
+        (Builtin::MapPopFirst | Builtin::MapPopLast, [m]) if heap::kind(*m) == KIND_MAP => {
+            let (some, none) = (ctx.tables.layouts.some?, ctx.tables.layouts.none?);
+            let tables = Arc::clone(&ctx.tables);
+            let greatest = which == Builtin::MapPopLast;
+            let (rest, taken) = ctx.heap.map_pop(&tables.layouts, *m, greatest);
+            let Some((k, v)) = taken else {
+                heap::dec(rest);
+                return Some(ctx.nullary(none));
+            };
+            let r = ctx
+                .heap
+                .alloc(KIND_RECORD, 0, 3, tables.layouts.popped_shape());
+            unsafe {
+                set_word(r, 0, k);
+                set_word(r, 1, rest);
+                set_word(r, 2, v);
+            }
+            Some(wrapped(ctx, some, r as Word))
+        }
+        (Builtin::MapRange, [m, lo, lo_inclusive, hi, hi_inclusive, limit])
+            if heap::kind(*m) == KIND_MAP =>
+        {
+            let tables = Arc::clone(&ctx.tables);
+            let layouts = &tables.layouts;
+            let (lo, hi) = (bound_key(layouts, *lo)?, bound_key(layouts, *hi)?);
+            let lo_inclusive = heap::as_bool(*lo_inclusive)?;
+            let hi_inclusive = heap::as_bool(*hi_inclusive)?;
+            let limit = usize::try_from(heap::as_int(*limit)?).unwrap_or(0);
+            let o = obj(*m);
+            let start = lo.map_or(0, |k| {
+                let (below, found) = map::locate(layouts, o, k);
+                below + usize::from(found.is_some() && !lo_inclusive)
+            });
+            let end = hi.map_or(map::len(o), |k| {
+                let (below, found) = map::locate(layouts, o, k);
+                below + usize::from(found.is_some() && hi_inclusive)
+            });
+            let most = end.saturating_sub(start).min(limit);
+            let mut items = Vec::with_capacity(most);
+            map::for_each_from(o, start, most, |k, v| items.push(entry(ctx, k, v)));
+            let out = ctx.heap.list_from(&items);
+            for w in args {
+                heap::dec(*w);
+            }
+            Some(out)
+        }
+        (Builtin::MapSplit, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let (some, none) = (ctx.tables.layouts.some?, ctx.tables.layouts.none?);
+            let tables = Arc::clone(&ctx.tables);
+            let (below, at, above) = ctx.heap.map_split(&tables.layouts, *m, *k);
+            heap::dec(*k);
+            let at = match at {
+                Some(v) => wrapped(ctx, some, v),
+                None => ctx.nullary(none),
+            };
+            let r = ctx
+                .heap
+                .alloc(KIND_RECORD, 0, 3, tables.layouts.split_shape());
+            unsafe {
+                set_word(r, 0, above);
+                set_word(r, 1, at);
+                set_word(r, 2, below);
+            }
+            Some(r as Word)
+        }
         _ => None,
     }
+}
+
+/// `Some(inner)`, which it takes.
+fn wrapped(ctx: &mut Ctx, some: u32, inner: Word) -> Word {
+    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+    unsafe { set_word(c, 0, inner) };
+    c as Word
+}
+
+/// A `{key, value}` entry of a key and a value a map still holds, each held once more.
+fn entry(ctx: &mut Ctx, k: Word, v: Word) -> Word {
+    heap::inc(k);
+    heap::inc(v);
+    let e = ctx
+        .heap
+        .alloc(KIND_RECORD, 0, 2, ctx.tables.layouts.entry_shape());
+    unsafe {
+        set_word(e, 0, k);
+        set_word(e, 1, v);
+    }
+    e as Word
+}
+
+/// `Some` of the entry, or `None`; nothing where the unit holds neither constructor.
+fn entry_option(ctx: &mut Ctx, found: Option<(Word, Word)>) -> Option<Word> {
+    let (some, none) = (ctx.tables.layouts.some?, ctx.tables.layouts.none?);
+    Some(match found {
+        Some((k, v)) => {
+            let e = entry(ctx, k, v);
+            wrapped(ctx, some, e)
+        }
+        None => ctx.nullary(none),
+    })
+}
+
+/// The key a bound of `map_range` holds, none for `None`; nothing where the word is neither, or
+/// holds a key no native map orders in place.
+fn bound_key(layouts: &Layouts, w: Word) -> Option<Option<Word>> {
+    if heap::kind(w) != KIND_CTOR {
+        return None;
+    }
+    let o = obj(w);
+    let (ctor, held) = unsafe { ((*o).layout, (*o).len) };
+    if Some(ctor) == layouts.none && held == 0 {
+        return Some(None);
+    }
+    if Some(ctor) == layouts.some && held == 1 {
+        let k = unsafe { word_at(o, 0) };
+        return heap::native_key(k).then_some(Some(k));
+    }
+    None
 }
 
 /// A slicing builtin's half-open range over `len`, never clamped: out of range is `None`.

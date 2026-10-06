@@ -51,8 +51,8 @@ pub fn program_digest() -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// The digest a trace holds of the shipped module `name`, or of the list of them for the empty
-/// name.
+/// The digest a trace holds of the shipped module or data file `name`, or of the list of modules
+/// for the empty name.
 pub fn module_digest(name: &str) -> Option<String> {
     if name.is_empty() {
         let mut hasher = blake3::Hasher::new();
@@ -62,8 +62,7 @@ pub fn module_digest(name: &str) -> Option<String> {
         }
         return Some(hasher.finalize().to_hex().to_string());
     }
-    crate::shipped_modules::source(&ply_eval::ModuleName::from_dotted(name))
-        .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string())
+    crate::shipped_modules::digest_of(name)
 }
 
 /// Every `fn` of a program, or each its `entry` reaches, and the hash its front end gave it, a
@@ -144,9 +143,13 @@ impl HostHandler for Shipped {
             ),
             ("module", [name]) => {
                 let name = name.as_str(span, "a module's name")?;
-                crate::payload::option(
+                let module =
                     crate::shipped_modules::source(&ply_eval::ModuleName::from_dotted(name))
-                        .map(|text| PlyValue::bytes(text.as_bytes())),
+                        .map(str::as_bytes);
+                crate::payload::option(
+                    module
+                        .or_else(|| crate::shipped_modules::data(name))
+                        .map(PlyValue::bytes),
                 )
             }
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),

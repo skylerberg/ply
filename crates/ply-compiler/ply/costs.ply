@@ -514,9 +514,11 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
         b"`cell_get` answers a clone the region's arena still holds \xe2\x80\x94 the append cannot be in place however the call is written; `cell_update` is the fix",
       )
     } else if b == b"hold_get" {
-      blocked(CCell, b"`hold_get` answers a clone the hold still holds")
-    } else if b == b"map_get" {
-      blocked(CMapEntry, b"`map_get` answers a clone the map still holds")
+      blocked(CElement, b"`hold_get` answers a clone the hold still holds")
+    } else if b == b"map_get" || reads_entries(b) {
+      blocked(CMapEntry, bytes_concat_all([b"`", b, b"` answers a clone the map still holds"]))
+    } else if b == b"map_pop_first" || b == b"map_pop_last" || b == b"map_split" {
+      owner_at(args, 0)
     } else if b == b"list_at" {
       blocked(CElement, b"`list_at` answers a clone the list still holds")
     } else if b == b"array_at" || b == b"array_get" {
@@ -525,6 +527,14 @@ fn result_owner(env: Env, builtin: Option<Bytes>, callee: Option<Int>, args: Lis
     else if b == b"bracket" { unknown(CCall, b"`bracket` answers whatever its body answered") }
     else { FreshOwner },
   }
+
+/// The builtins that answer entries the map goes on holding; a pop or a split hands over what the
+/// map held, so its answer is owned as the map was.
+fn reads_entries(b: Bytes) -> Bool =
+  b == b"map_first" || b == b"map_last" || b == b"map_floor" || b == b"map_ceiling"
+    || b == b"map_below"
+    || b == b"map_above"
+    || b == b"map_range"
 
 fn callback_owners(
   builtin: Option<Bytes>,
@@ -1105,6 +1115,29 @@ test "an update comes back with its place, its verdict, why, and the edit that w
   assert_eq(s.param, 0 - 1)
 }
 
+test "an entry read off a map is a clone, and one popped from it is owned as the map was" {
+  let src = b"fn peek(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_first(m) { Some(e) -> push(e.value, n), None -> [] }\nfn near(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_floor(m, n) { Some(e) -> push(e.value, n), None -> [] }\nfn take(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_pop_first(m) { Some(p) -> push(p.value, n), None -> [] }\nfn cut(m: Map<Int, List<Int>>, n: Int) -> List<Int> = match map_split(m, n).at { Some(xs) -> push(xs, n), None -> [] }\ntest \"fresh\" { assert_eq(take(map_insert(map_new(), 1, [1]), 2), [1, 2]); assert_eq(cut(map_insert(map_new(), 1, [1]), 1), [1, 1]) }\n";
+  let r = costs([b"m"], [src], [], [], 0);
+  assert(r.ok);
+  let site_of = |name: Bytes| at(at(filter(r.defs, |d: Costed| d.name == name), 0).sites, 0);
+  let peeked = site_of(b"peek");
+  assert_eq([peeked.verdict, peeked.reason, peeked.fix], [
+    b"copies",
+    b"`.value` was read out of a record something else still holds: `map_first` answers a clone the map still holds",
+    b"`map_update`",
+  ]);
+  assert_eq(
+    site_of(b"near").reason,
+    b"`.value` was read out of a record something else still holds: `map_floor` answers a clone the map still holds",
+  );
+  let taken = site_of(b"take");
+  assert_eq([taken.verdict, taken.reason], [
+    b"reuses",
+    b"the list is parameter 0, and every call site hands one over and stops reading it",
+  ]);
+  assert_eq(site_of(b"cut").verdict, b"reuses")
+}
+
 test "an array or list element replaced in place is an update, and one read out first is a copy" {
   let src = b"fn fill(xs: Array<Int>, i: Int) -> Array<Int> / {abort.raise} = if i <= 0 { xs } else { fill(array_set(xs, i - 1, i), i - 1) }\nfn twice(xs: Array<Int>) -> Array<Int> / {abort.raise} = { let n = array_get(xs, 0) + array_len(xs); array_set(xs, 0, n) }\nfn again(xs: Array<Int>) -> Array<Int> / {abort.raise} = array_set(xs, 0, array_len(xs))\nfn first(ys: List<Array<Int>>) -> Array<Int> / {abort.raise} = match list_at(ys, 0) { Some(a) -> array_set(a, 0, 1), None -> array_new(1, 0) }\nfn bump(zs: List<Int>) -> List<Int> / {abort.raise} = list_set(zs, 0, 1)\ntest \"fresh\" { assert_eq(array_len(fill(array_new(3, 0), 3)), 3); assert_eq(bump([0]), [1]) }\n";
   let r = costs([b"m"], [src], [], [], 0);
@@ -1132,6 +1165,22 @@ test "an array or list element replaced in place is an update, and one read out 
   ]);
   let bumped = site_of(b"bump");
   assert_eq([bumped.op, bumped.verdict], [b"list_set", b"reuses"])
+}
+
+// A region and its release are calls the reader cannot name, so what they answer has no known owner.
+test "a hold answers a clone, and what its region answers or hands its release is owned by no one known" {
+  let src = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_hold[r](xs, |l: List<Int>| ()) { h -> push(hold_get(h), n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = push(with_hold[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_hold[r](xs, |l: List<Int>| { let grown = push(l, n); () }) { h -> n }\n";
+  let r = costs([b"m"], [src], [], [], 0);
+  assert(r.ok);
+  let site_of = |name: Bytes| at(at(filter(r.defs, |d: Costed| d.name == name), 0).sites, 0);
+  let read = site_of(b"read");
+  assert_eq([read.verdict, read.reason, read.fix], [
+    b"copies",
+    b"`hold_get` answers a clone the hold still holds",
+    b"",
+  ]);
+  assert_eq(site_of(b"answered").verdict, b"unknown");
+  assert_eq(site_of(b"released").verdict, b"unknown")
 }
 
 fn verdicts(r: Report) -> List<Bytes> =
