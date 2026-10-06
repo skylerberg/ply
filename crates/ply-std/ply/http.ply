@@ -8,6 +8,10 @@
 import std.bytes (int_of_ascii, is_digit)
 import std.net (net, send_all)
 import std.list (contains)
+import std.option (option_unwrap_or)
+import std.url
+import std.url (Url, url_fragment, url_host, url_host_port, url_parse, url_path, url_query,
+                url_reason, url_render, url_scheme, url_userinfo)
 import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case)
 
 // --- The message ------------------------------------------------------------
@@ -399,55 +403,52 @@ fn origin_form(method: Method, target: Bytes, version: Version) -> Start / {abor
 }
 
 /// The target's authority is the request's (RFC 9112 §3.2.2); `Host` stays visible for comparison.
+/// `std.url` reads the target, so a request line and a URL are read one way.
 fn absolute_form(
   method: Method,
   target: Bytes,
   version: Version,
-) -> Result<Start, Refusal> / {abort.raise} = {
-  let n = bytes_len(target);
-  let after = if starts_with_ascii_ci(target, "http://") { 7 }
-  else if starts_with_ascii_ci(target, "https://") { 8 }
-  else { -1 };
-  if after < 0 {
-    Err({ status: 400, reason: "a request target must be origin-form, absolute-form, or `*`" })
-  } else { split_authority(method, target, version, after, n) }
-}
+) -> Result<Start, Refusal> / {abort.raise} =
+  match url_parse(string_of_bytes(target)) {
+    Err(refused) -> Err({ status: 400, reason: target_refusal(refused.why) }),
+    Ok(u) -> absolute_start(method, target, version, u),
+  }
 
-/// Whether `b` starts with `want`, which is ASCII, whatever the case of either's letters.
-fn starts_with_ascii_ci(b: Bytes, want: String) -> Bool / {abort.raise} = {
-  let n = string_len(want);
-  bytes_len(b) >= n && eq_ignore_ascii_case(string_of_bytes_lossy(bytes_slice(b, 0, n)), want)
-}
+fn target_refusal(why: url::Why) -> String =
+  match why {
+    url::NoScheme -> no_target_form(),
+    url::BadScheme -> no_target_form(),
+    _ -> "an absolute-form target is not a URL: " ++ url_reason(why),
+  }
 
-fn split_authority(
+fn no_target_form() -> String = "a request target must be origin-form, absolute-form, or `*`"
+
+fn absolute_start(
   method: Method,
   target: Bytes,
   version: Version,
-  after: Int,
-  n: Int,
-) -> Result<Start, Refusal> / {abort.raise} = {
-  let end = bytes_scan_until(target, after, b"/?", n - after);
-  let authority = bytes_slice(target, after, end);
-  let a = bytes_len(authority);
-  if a == 0 { Err({ status: 400, reason: "an absolute-form target needs an authority" }) }
-  else if bytes_scan_until(authority, 0, b"@", a) < a {
+  u: Url,
+) -> Result<Start, Refusal> / {abort.raise} =
+  if url_scheme(u) != "http" && url_scheme(u) != "https" {
+    Err({ status: 400, reason: no_target_form() })
+  } else if url_host(u) == None {
+    Err({ status: 400, reason: "an absolute-form target needs an authority" })
+  } else if url_userinfo(u) != None {
     // Refused so the authority a program compares against `Host` cannot be disguised.
     Err({ status: 400, reason: "a request target's authority carries no userinfo" })
   } else {
-    // The target holds no `#`, so the path always begins with `/`, which `std.router` relies on.
-    let rest = bytes_slice(target, end, n);
-    let m = bytes_len(rest);
-    let q = bytes_scan_until(rest, 0, b"?", m);
-    Ok({
-      method: method,
-      target: string_of_bytes(target),
-      path: if q == 0 { "/" } else { string_of_bytes(bytes_slice(rest, 0, q)) },
-      query: if q >= m { "" } else { string_of_bytes(bytes_slice(rest, q + 1, m)) },
-      authority: string_of_bytes(authority),
-      version: version,
-    })
+    // The path of a URL with an authority is empty or begins with `/`, which `std.router` relies on.
+    Ok(
+      start_of(
+        method,
+        target,
+        if url_path(u) == "" { "/" } else { url_path(u) },
+        option_unwrap_or(url_query(u), ""),
+        option_unwrap_or(url_host_port(u), ""),
+        version,
+      ),
+    )
   }
-}
 
 fn min_int(a: Int, b: Int) -> Int = if a < b { a } else { b }
 
@@ -1888,12 +1889,123 @@ test "an absolute-form target's authority is the request's, and Host stays visib
   assert_eq(h.request.query, "x=1");
   assert_eq(header(h.request.headers, "host"), Some("b.example"));
   assert_eq(parsed(b"GET http://a.example HTTP/1.1\r\nHost: a\r\n\r\n").request.path, "/");
-  // A scheme is case-insensitive and is compared as bytes, never decoded.
+  assert_eq(parsed(b"GET http://a.example?x=1 HTTP/1.1\r\nHost: a\r\n\r\n").request.path, "/");
+  // A scheme is case-insensitive, and the authority is kept as it was sent.
   assert_eq(
-    parsed(b"GET HTTPS://a.example/x HTTP/1.1\r\nHost: a\r\n\r\n").request.authority,
-    "a.example",
+    parsed(b"GET HTTPS://A.example:0443/x HTTP/1.1\r\nHost: a\r\n\r\n").request.authority,
+    "A.example:0443",
+  );
+  assert_eq(
+    parsed(b"GET http://[2001:DB8::1]:8080/x HTTP/1.1\r\nHost: a\r\n\r\n").request.authority,
+    "[2001:DB8::1]:8080",
   )
 }
+
+type Target = { target: String, reason: String }
+
+/// Targets `std.url` refuses, or reads as no `http` URL with a host.
+fn refused_targets() -> List<Target> =
+  [
+    {
+      target: "http://127.1/",
+      reason: "an absolute-form target is not a URL: the host is no address: an IPv4 address is four octets",
+    },
+    {
+      target: "http://0x7f.0.0.1/",
+      reason: "an absolute-form target is not a URL: a host that ends in a number is four decimal octets",
+    },
+    {
+      target: "http://a.example:port/",
+      reason: "an absolute-form target is not a URL: a port is decimal digits",
+    },
+    {
+      target: "http://a.example:65536/",
+      reason: "an absolute-form target is not a URL: a port is at most 65535",
+    },
+    {
+      target: "http://a.example:80:81/",
+      reason: "an absolute-form target is not a URL: a port is decimal digits",
+    },
+    {
+      target: "http://[::1/",
+      reason: "an absolute-form target is not a URL: a `]` closes the address a `[` opens",
+    },
+    {
+      target: "http://[::1%25eth0]/",
+      reason: "an absolute-form target is not a URL: the host is no address: a zone is no part of an address",
+    },
+    {
+      target: "http://ex%61mple/",
+      reason: "an absolute-form target is not a URL: a host holds no percent-encoding",
+    },
+    {
+      target: "http://a.example/x[1]",
+      reason: "an absolute-form target is not a URL: this character cannot stand here unencoded",
+    },
+    {
+      target: "http://a.example/x?y={z}",
+      reason: "an absolute-form target is not a URL: no part of a URL holds this character unencoded",
+    },
+    {
+      target: "http://a.example/\\x",
+      reason: "an absolute-form target is not a URL: no part of a URL holds this character unencoded",
+    },
+    {
+      target: "http://a.example/%zz",
+      reason: "an absolute-form target is not a URL: two hex digits follow a `%`",
+    },
+    {
+      target: "http://a.example/\u{E9}",
+      reason: "an absolute-form target is not a URL: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    },
+    {
+      target: "http://a@b@c/",
+      reason: "an absolute-form target is not a URL: an authority holds one `@` at most",
+    },
+    { target: "http://:80/x", reason: "an absolute-form target needs an authority" },
+    { target: "http:///x", reason: "an absolute-form target needs an authority" },
+    { target: "http:/x", reason: "an absolute-form target needs an authority" },
+    { target: "http:x", reason: "an absolute-form target needs an authority" },
+    { target: "http://u@a.example/x", reason: "a request target's authority carries no userinfo" },
+    {
+      target: "ftp://a.example/x",
+      reason: "a request target must be origin-form, absolute-form, or `*`",
+    },
+    {
+      target: "a.example:80",
+      reason: "a request target must be origin-form, absolute-form, or `*`",
+    },
+    { target: "a.example", reason: "a request target must be origin-form, absolute-form, or `*`" },
+    {
+      target: "1http://a.example/",
+      reason: "a request target must be origin-form, absolute-form, or `*`",
+    },
+  ]
+
+test "`{c.target}` is no absolute-form target: {c.reason}" for c: Target in refused_targets() {
+  let raw = bytes_of_string("GET " ++ c.target ++ " HTTP/1.1\r\nHost: h\r\n\r\n");
+  assert_eq(head_status(raw), 400);
+  assert_eq(head_reason(raw), c.reason)
+}
+
+law "an absolute-form target is read as `std.url` reads its URL, and refused where that names no host to serve"
+  forall (u: Url) {
+    let served = (url_scheme(u) == "http" || url_scheme(u) == "https") && url_host(u) != None
+      && url_userinfo(u) == None
+      && url_fragment(u) == None;
+    match parse_head(
+        bytes_of_string("GET " ++ url_render(u) ++ " HTTP/1.1\r\nHost: h\r\n\r\n"),
+        default_limits(),
+      ) {
+      Parsed(h) ->
+        served && Some(h.request.authority) == url_host_port(u)
+          && h.request.path == (if url_path(u) == "" { "/" } else { url_path(u) })
+          && h.request.query == option_unwrap_or(url_query(u), "")
+          && h.request.target == url_render(u),
+      Refused(r) -> !served && r.status == 400,
+      Incomplete -> false,
+    }
+  }
 
 test "a target that is not origin-form is refused rather than ending the run" {
   assert_eq(
