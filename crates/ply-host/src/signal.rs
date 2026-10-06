@@ -1,5 +1,6 @@
 //! The `signal` effect, and the coordinator that turns a stop into a shutdown.
 
+use crate::pool::Bell;
 use crate::process::Children;
 use ply_eval::host::HostRegistry;
 use ply_eval::{
@@ -106,6 +107,8 @@ pub struct Shutdown {
     net: Mutex<Option<Arc<dyn Accepting>>>,
     /// Weak, so the children still go when their host does.
     children: Mutex<Option<Weak<Children>>>,
+    /// Rung with `woke`, so a reactor parked on a sleeper's deadline wakes for the stop too.
+    bell: Mutex<Option<Arc<Bell>>>,
 }
 
 impl Shutdown {
@@ -120,7 +123,20 @@ impl Shutdown {
             signals: signals_of_this_platform(),
             net: Mutex::new(None),
             children: Mutex::new(None),
+            bell: Mutex::new(None),
         })
+    }
+
+    pub fn attach_bell(&self, bell: &Arc<Bell>) {
+        *lock(&self.bell) = Some(Arc::clone(bell));
+    }
+
+    /// Wakes whatever waits on the stop: the request and each phase end.
+    fn wake(&self) {
+        self.woke.notify_all();
+        if let Some(bell) = lock(&self.bell).as_ref() {
+            bell.ring();
+        }
     }
 
     pub fn bounds(&self) -> Bounds {
@@ -146,7 +162,7 @@ impl Shutdown {
         drop(slot);
         // An `accept` posted before the close may still be parked inside it.
         wake_parked_accepts(net.as_ref());
-        self.woke.notify_all();
+        self.wake();
     }
 
     /// The children a second signal ends before it exits, since that exit skips the teardown.
@@ -218,7 +234,7 @@ impl Shutdown {
     pub fn request(self: &Arc<Shutdown>, signal: ShutdownSignal) -> bool {
         if self.requested.swap(true, Ordering::AcqRel) {
             self.second.store(true, Ordering::Release);
-            self.woke.notify_all();
+            self.wake();
             return false;
         }
         {
@@ -226,7 +242,7 @@ impl Shutdown {
             state.signal = Some(signal);
             state.at = Some(Instant::now());
         }
-        self.woke.notify_all();
+        self.wake();
         // Phases run on their own thread so the reactor can still notice a second signal.
         let coordinator = Arc::clone(self);
         let spawned = std::thread::Builder::new()
@@ -261,11 +277,11 @@ impl Shutdown {
             state.deadline = Some(Instant::now() + self.bounds.drain);
             net
         };
-        self.woke.notify_all();
+        self.wake();
         if let Some(net) = &net {
             wake_parked_accepts(net.as_ref());
         }
-        self.woke.notify_all();
+        self.wake();
     }
 }
 
