@@ -30,6 +30,8 @@ import std.json (Json, Null, Number, Str, Array, Object)
 import std.list (sort_by, concat, contains)
 import std.net
 import std.net (net)
+import std.os
+import std.os (os)
 import std.random (entropy)
 import std.process (process, Var, Finished, Exited, Signalled, Captured, captured, args_step,
                     out_step, err_step, exit_step, with_input, line_step, Line, Keep, Lines,
@@ -37,6 +39,7 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
 import std.time (time)
 import std.path (segments)
 import std.string (unlines)
+import std.text (shell_join)
 
 // --- What a run said ---------------------------------------------------------
 
@@ -210,6 +213,10 @@ pub fn copy_from_repo(from: String, to: String) -> Unit / {Here, Repo, abort.rai
 
 /// The repository's examples, each file by its path below `examples/`.
 pub fn example_files() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../../examples")
+
+/// The language corpus, each file by its path below `tests/lang/`. Embedded, so a test over it is
+/// cached until a file in it changes.
+pub fn lang_corpus() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../../tests/lang")
 
 /// What `embed_dir` read, as sources under `dir`.
 pub fn embedded(
@@ -923,7 +930,15 @@ pub fn spawned_reading(
   argv: List<String>,
   vars: List<Var>,
   input: String,
-) -> Ran / {Spawned, abort.raise} =
+) -> Ran / {Spawned, abort.raise} = finished(spawned_fed(argv, vars, bytes_of_string(input)))
+
+/// As `spawned_reading`, for input and output that are not text: how the run ended, and each
+/// stream byte for byte.
+pub fn spawned_fed(
+  argv: List<String>,
+  vars: List<Var>,
+  input: Bytes,
+) -> Finished / {Spawned, abort.raise} =
   match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
       input: true,
       out: Keep,
@@ -931,13 +946,72 @@ pub fn spawned_reading(
     }) {
     Err(why) -> panic("`ply` did not start: " ++ why),
     Ok(child) -> {
-      let _ = process.input[ply](child, bytes_of_string(input));
+      let _ = process.input[ply](child, input);
       process.end_input[ply](child);
       match process.wait[ply](child, -1) {
-        Some(f) -> finished(f),
+        Some(f) -> f,
         None -> panic("a wait with no timeout came back with nothing"),
       }
     },
+  }
+
+// --- Through a shell ---------------------------------------------------------
+
+/// What a run of `ply` needs that only a shell gives it: a pipe whose reader leaves, and a
+/// terminal. The shell is the one `--exec sh` names, and the `ply` it starts is the one this run
+/// is, which a run of the suite also names `--exec ply`.
+pub effect set Shell = {config.get[env], process.read[sh], process.write[sh], os.read}
+
+/// The path of the `ply` this run is.
+pub fn this_ply() -> String / {os.executable, abort.raise} =
+  match os.executable() { Some(path) -> path, None -> panic("this `ply` has no path") }
+
+/// The words a shell starts `ply` with, as `spawned` starts it: `--color never` ahead of `argv`.
+/// `$PLY` is the binary, which `shell_environment` sets.
+fn shell_ply(argv: List<String>) -> String / {abort.raise} =
+  match shell_join(concat(["--color", "never"], argv)) {
+    Some(words) -> "\"$PLY\" " ++ words,
+    None -> panic("an argument no shell word spells"),
+  }
+
+fn shell_environment() -> List<Var> / {config.get[env], os.executable, abort.raise} =
+  push(environment([]), { name: "PLY", value: this_ply() })
+
+/// `ply` run with its output piped into `reader`, a shell command: what the reader wrote, and on
+/// stderr what the run wrote there and then `status` and the code it exited with.
+pub fn spawned_into(argv: List<String>, reader: String) -> Finished / {Shell, abort.raise} =
+  process.spawn[sh](
+    ["-c", "{ " ++ shell_ply(argv) ++ "; echo \"status $?\" >&2; } | " ++ reader],
+    "",
+    shell_environment(),
+  )
+
+/// `ply` started at a terminal of its own, 80 columns by 24 rows, echoing and a line at a time:
+/// the pseudo-terminal `script` makes. What is written to the terminal comes a line at a time
+/// from the child this answers, what the test writes to the child's input is typed at it, and
+/// once `ply` has ended a line that starts `after:` holds what `stty -a` says of the terminal as
+/// it was left, its line ends, tabs and semicolons made blanks. `None` where the system has no
+/// `script` to make a terminal with, when a test has nothing to assert.
+pub fn at_terminal(argv: List<String>) -> Option<Int> / {Shell, abort.raise} =
+  if process.spawn[sh](["-c", "command -v script >/dev/null 2>&1"], "", environment([])).ended
+      != Exited(0) { None } else {
+    let inside = "stty rows 24 columns 80 echo icanon; " ++ shell_ply(argv)
+      ++ "; echo \"after: $(stty -a | tr '\\n\\t;' '   ') \"";
+    // util-linux's `script` takes the command as one word after `-c`, and the BSDs' as the
+    // words after the file it writes its record to.
+    let made = match os.family() {
+      os::Linux -> "script -qec \"$INSIDE\" /dev/null",
+      _ -> "script -q /dev/null sh -c \"$INSIDE\"",
+    };
+    match process.start[sh](
+        ["-c", made],
+        "",
+        push(shell_environment(), { name: "INSIDE", value: inside }),
+        { input: true, out: Lines, err: Discard },
+      ) {
+      Ok(child) -> Some(child),
+      Err(why) -> panic("`script` did not start: " ++ why),
+    }
   }
 
 /// A connection to the server's port that `ready` accepts, or why none came within `ms`: the
