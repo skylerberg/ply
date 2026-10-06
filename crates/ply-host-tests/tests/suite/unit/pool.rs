@@ -1,6 +1,10 @@
 use ply_eval::{Diagnostic, Pending, Span, Value, codes};
-use ply_host::pool::{FS_FIRST_TOKEN, Inbox, JobOutput, NET_FIRST_TOKEN, Pool};
+use ply_host::pool::{
+    FS_FIRST_TOKEN, Inbox, JobOutput, MAX_BLOCKING_OPERATIONS, NET_FIRST_TOKEN,
+    PASSWORD_FIRST_TOKEN, PROCESS_FIRST_TOKEN, Pool,
+};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 fn submitted(pool: &Pool, answer: i64) -> Pending {
@@ -89,10 +93,82 @@ fn a_token_this_pool_did_not_mint_cannot_be_watched() {
     assert_eq!(refused.code, codes::INTERNAL_ERROR);
 }
 
+/// A pool that gives each operation a thread refuses the one past its bound; a queued one has no
+/// such bound, and answers each in its turn.
+#[test]
+fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
+    let pool = Pool::queued(PASSWORD_FIRST_TOKEN, 2);
+    let asked: Vec<(i64, Pending)> = (0..4 * MAX_BLOCKING_OPERATIONS as i64)
+        .map(|i| (i, submitted(&pool, i)))
+        .collect();
+    for (i, token) in asked {
+        assert_eq!(pool.block_on(token).expect("answered"), Value::Int(i));
+    }
+    assert_eq!(pool.outstanding(), 0);
+}
+
+#[test]
+fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
+    let pool = Pool::queued(PASSWORD_FIRST_TOKEN, 3);
+    let running = Arc::new(AtomicUsize::new(0));
+    let most = Arc::new(AtomicUsize::new(0));
+    let tokens: Vec<Pending> = (0..24)
+        .map(|_| {
+            let (running, most) = (Arc::clone(&running), Arc::clone(&most));
+            pool.submit(
+                Span::DUMMY,
+                "test",
+                "a test job",
+                Box::new(move || {
+                    most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    JobOutput::Int(0)
+                }),
+            )
+            .expect("the pool takes the job")
+        })
+        .collect();
+    for token in tokens {
+        pool.block_on(token).expect("answered");
+    }
+    let most = most.load(Ordering::SeqCst);
+    assert!(
+        (2..=3).contains(&most),
+        "{most} ran at once on three threads"
+    );
+}
+
+/// A queued pool's thread outlives the job it ran, so a job's panic must not take the thread, or
+/// the operations behind it would wait forever.
+#[test]
+fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
+    let pool = Pool::queued(PASSWORD_FIRST_TOKEN, 1);
+    let broken = pool
+        .submit(
+            Span::DUMMY,
+            "test",
+            "a test job",
+            Box::new(|| -> JobOutput { panic!("a job's own defect") }),
+        )
+        .expect("the pool takes the job");
+    let after = submitted(&pool, 7);
+    let failed = pool
+        .block_on(broken)
+        .expect_err("a panic is the operation's failure");
+    assert_eq!(failed.code, codes::RUNTIME_ERROR);
+    assert_eq!(pool.block_on(after).expect("answered"), Value::Int(7));
+}
+
 /// The first facility to claim a token answers it, so overlapping ranges would hang a poll forever.
 #[test]
 fn no_two_facilities_mint_the_same_token() {
-    let ranges = [("net", NET_FIRST_TOKEN), ("fs", FS_FIRST_TOKEN)];
+    let ranges = [
+        ("net", NET_FIRST_TOKEN),
+        ("fs", FS_FIRST_TOKEN),
+        ("process", PROCESS_FIRST_TOKEN),
+        ("password", PASSWORD_FIRST_TOKEN),
+    ];
     for (i, (whose, first)) in ranges.iter().enumerate() {
         assert!(
             *first > 0,
