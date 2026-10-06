@@ -427,28 +427,28 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
             vec![Value::Int(3)],
             Value::Int(6012),
             6,
-            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@1\"), mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@2\"), mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@0\"), mode: Write, op: None })})"]"#,
         ),
         (
             "m.timed",
             vec![Value::Int(1500)],
             Value::Int(1500),
             1500,
-            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@0\"), mode: Write, op: None })})"]"#,
         ),
         (
             "m.drawn",
             vec![Value::Int(100)],
             Value::Int(366),
             0,
-            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write, op: None })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@0\"), mode: Write, op: None })})"]"#,
         ),
         (
             "m.racing",
             vec![Value::Int(5)],
             Value::Int(60),
             0,
-            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@1\"), mode: Write, op: None }), Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"task.end\", resource: Named(\"@0\"), mode: Write, op: None }), Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#,
         ),
     ];
     for (name, args, want, want_time, want_shape) in cases {
@@ -886,6 +886,132 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
+        ctx.end();
+    }
+}
+
+const SLEEPS: &str = r#"
+fn stamp() -> Int / {clock.read} = match clock.now() { Instant(at) -> at }
+
+fn staggered() -> Int / {task.write, clock.read, clock.write, abort.raise} = {
+  let slow = task.spawn(|| { clock.sleep(Duration(500)); stamp() });
+  let quick = task.spawn(|| { clock.sleep(Duration(100)); stamp() });
+  task.join(quick) * 1000 + task.join(slow)
+}
+
+fn alone() -> Int / {clock.read, clock.write} = { clock.sleep(Duration(70)); stamp() }
+"#;
+
+/// A reactor whose clock stands still until something waits on it: a park on a deadline moves it
+/// there.
+#[derive(Default)]
+struct Ticking {
+    now: std::cell::Cell<i64>,
+}
+
+impl ply_eval::HostRuntime for Ticking {
+    fn watch(&self, _: &ply_eval::Pending) -> Result<(), ply_eval::Diagnostic> {
+        Ok(())
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, ply_eval::Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), ply_eval::Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, _: ply_eval::Pending) -> Result<Value, ply_eval::Diagnostic> {
+        Ok(Value::Unit)
+    }
+
+    fn now(&self) -> Result<i64, ply_eval::Diagnostic> {
+        Ok(self.now.get())
+    }
+
+    fn park_until(&self, deadline: i64) -> Result<(), ply_eval::Diagnostic> {
+        self.now.set(self.now.get().max(deadline));
+        Ok(())
+    }
+}
+
+/// The language's clock as a host serves it, over the reactor's: a reading, and the thread's wait.
+struct OnReactor;
+
+impl ply_eval::HostHandler for OnReactor {
+    fn call(
+        &self,
+        rt: &dyn ply_eval::HostRuntime,
+        req: &ply_eval::HostRequest<'_>,
+    ) -> Result<ply_eval::HostAnswer, ply_eval::Diagnostic> {
+        Ok(ply_eval::HostAnswer::Value(match req.args.first() {
+            None => Value::ctor("Instant", vec![Value::Int(rt.now()?)]),
+            Some(span) => {
+                let nanos = ply_eval::sim::nanos_of(span, req.span, "a sleep")?;
+                rt.park_until(rt.now()? + nanos)?;
+                Value::Unit
+            }
+        }))
+    }
+}
+
+/// Asleep together, two tasks wake at their own deadlines. A sleep that held the thread would
+/// wake the second one the first one's span late.
+#[test]
+fn a_sleep_in_a_production_region_parks_its_task_and_one_outside_waits_on_the_thread() {
+    let Some((source, native)) = built(SLEEPS) else {
+        return;
+    };
+    let mut registry = ply_eval::HostRegistry::new();
+    let clock: &[&str] = &["now", "sleep"];
+    for (effect, ops) in [("task", ply_eval::sim::TASK_OPS), ("clock", clock)] {
+        for op in ops {
+            registry.register(
+                ply_eval::HostOp {
+                    effect: ply_eval::Symbol::new(effect),
+                    op: ply_eval::Symbol::new(*op),
+                    resource: ply_eval::HostResource::Any,
+                    determinism: ply_eval::Determinism::Nondeterministic,
+                    linearity: ply_eval::Linearity::Repeatable,
+                    blocking: false,
+                    secrets: false,
+                    path: "test::on_reactor",
+                },
+                std::sync::Arc::new(OnReactor),
+            );
+        }
+    }
+    let bound = std::sync::Arc::new(
+        registry
+            .bind(&source.front.check)
+            .expect("the registry binds"),
+    );
+    for (name, want) in [("m.staggered", 100_500), ("m.alone", 70)] {
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.set_host(
+            std::sync::Arc::clone(&bound),
+            Some(std::rc::Rc::new(Ticking::default())),
+            None,
+        );
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = Vec::new();
+        let mut answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
+            answer = unsafe { ply_codegen::simulate::finish_root(&mut ctx, answer) };
+        }
+        assert_eq!(
+            ctx.failed,
+            0,
+            "`{name}` raised in the C backend: {:?}",
+            ctx.diagnostic.as_ref().map(|d| d.message.clone())
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        assert_eq!(got, Value::Int(want), "`{name}`");
         ctx.end();
     }
 }

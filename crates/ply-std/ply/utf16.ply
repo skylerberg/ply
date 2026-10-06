@@ -1,0 +1,250 @@
+//! UTF-16: text as sixteen-bit units, and the units as bytes in either order.
+//!
+//! A character up to `U+FFFF` is one unit and one past it is two, a high surrogate (`0xD800` to
+//! `0xDBFF`) and then a low one (`0xDC00` to `0xDFFF`). A `String` holds no surrogate, so every
+//! text encodes; units need not decode, since a surrogate may stand without its partner, as one
+//! does in a file name or a JavaScript string cut in the wrong place. A strict reader refuses that,
+//! saying where; a lossy one answers `U+FFFD` for each such unit and for half a unit at the end,
+//! and always answers.
+//!
+//! Bytes are read in the order the caller names. With `marked`, a byte-order mark opening the
+//! bytes decides instead and is no part of the text, and the named order stands where there is
+//! none; without it nothing is looked for, and `U+FEFF` at the start is a character like another.
+//! `encode` writes the mark only where asked to.
+
+/// The order of a unit's two bytes.
+pub type Order =
+  /// The high byte first: UTF-16BE, and the order the standard assumes where nothing says.
+  | BigEndian
+  /// The low byte first: UTF-16LE, the order of Windows and of most files.
+  | LittleEndian
+
+/// Why units or bytes are not UTF-16.
+pub type Refusal =
+  /// A surrogate without its partner: the unit, and where it stands, counted in units from the
+  /// start of units and in bytes from the start of bytes.
+  | Unpaired({ at: Int, unit: Int })
+  /// An odd number of bytes: the last one, at `at`, is half a unit.
+  | Halved({ at: Int })
+
+/// How reading UTF-16 fails.
+pub effect utf16 {
+  /// The units or bytes are not UTF-16.
+  raise refused(why: Refusal)
+}
+
+fn is_high(unit: Int) -> Bool = unit >= 0xD800 && unit <= 0xDBFF
+
+fn is_low(unit: Int) -> Bool = unit >= 0xDC00 && unit <= 0xDFFF
+
+/// The units of `text`, in order.
+pub fn units(text: String) -> List<Int> =
+  fold(string_chars(text), [], |all: List<Int>, c: Char| {
+    let cp = int_of_char(c);
+    if cp < 0x10000 { push(all, cp) }
+    else { push(push(all, 0xD800 + (cp - 0x10000 >> 10)), 0xDC00 + (cp - 0x10000 & 0x3FF)) }
+  })
+
+/// The code points read so far, the high surrogate waiting for its partner (`-1` for none), and
+/// how many units have been read.
+type Pairing = { out: List<Int>, high: Int, read: Int }
+
+/// The text of `units`, each taken as its low sixteen bits, with the code point `unpaired`
+/// answers in place of each surrogate that has no partner, handed where the unit stands and the
+/// unit.
+fn paired<| e>(units: List<Int>, unpaired: (Int, Int) -> Int / e) -> String / e = {
+  let done = fold(units, { out: [], high: -1, read: 0 }, |so_far: Pairing, wide: Int| {
+    let unit = wide & 0xFFFF;
+    let at = so_far.read;
+    if so_far.high >= 0 && is_low(unit) {
+      let cp = 0x10000 + (so_far.high - 0xD800 << 10) + (unit - 0xDC00);
+      { out: push(so_far.out, cp), high: -1, read: at + 1 }
+    } else {
+      let before = if so_far.high >= 0 { push(so_far.out, unpaired(at - 1, so_far.high)) }
+      else { so_far.out };
+      if is_high(unit) { { out: before, high: unit, read: at + 1 } }
+      else if is_low(unit) { { out: push(before, unpaired(at, unit)), high: -1, read: at + 1 } }
+      else { { out: push(before, unit), high: -1, read: at + 1 } }
+    }
+  });
+  let points = if done.high >= 0 { push(done.out, unpaired(done.read - 1, done.high)) }
+  else { done.out };
+  string_of_chars(
+    fold(points, [], |text: List<Char>, cp: Int|
+      match char_of_int(cp) { Some(c) -> push(text, c), None -> text }),
+  )
+}
+
+/// The text `units` encode, each unit read as its low sixteen bits. Raises `utf16.refused` at
+/// the first surrogate without its partner.
+pub fn of_units(units: List<Int>) -> String / {utf16.refused} =
+  paired(units, |at: Int, unit: Int| utf16.refused(Unpaired({ at: at, unit: unit })))
+
+/// The text `units` encode, with `U+FFFD` for each surrogate without its partner.
+pub fn of_units_lossy(units: List<Int>) -> String = paired(units, |_: Int, _: Int| 0xFFFD)
+
+fn unit_bytes(unit: Int, order: Order) -> Bytes / {abort.raise} =
+  match order {
+    BigEndian -> bytes_concat(byte_of_int(unit >> 8), byte_of_int(unit & 0xFF)),
+    LittleEndian -> bytes_concat(byte_of_int(unit & 0xFF), byte_of_int(unit >> 8)),
+  }
+
+/// `text` in UTF-16, two bytes a unit in `order`, after a byte-order mark where `marked` asks for
+/// one.
+pub fn encode(text: String, order: Order, marked: Bool = false) -> Bytes / {abort.raise} = {
+  let body = bytes_concat_all(map(units(text), |unit: Int| unit_bytes(unit, order)));
+  if marked { bytes_concat(unit_bytes(0xFEFF, order), body) } else { body }
+}
+
+/// Bytes as the units they hold: the order they are in, where the units start, and the units.
+type Read = { order: Order, from: Int, units: List<Int> }
+
+/// The whole units of `bytes`, in the order a mark opening them gives where `marked` looks for
+/// one, and in `order` otherwise.
+fn read_units(bytes: Bytes, order: Order, marked: Bool) -> Read / {abort.raise} = {
+  let opening = if marked && bytes_len(bytes) >= 2 { bytes_at(bytes, 0) << 8 | bytes_at(bytes, 1) }
+  else { 0 };
+  let found = if opening == 0xFEFF { Some(BigEndian) }
+  else if opening == 0xFFFE { Some(LittleEndian) }
+  else { None };
+  let reading = match found { Some(by_mark) -> by_mark, None -> order };
+  let from = if found == None { 0 } else { 2 };
+  {
+    order: reading,
+    from: from,
+    units: map(range(0, (bytes_len(bytes) - from) / 2), |i: Int| {
+      let first = bytes_at(bytes, from + 2 * i);
+      let second = bytes_at(bytes, from + 2 * i + 1);
+      match reading { BigEndian -> first << 8 | second, LittleEndian -> second << 8 | first }
+    }),
+  }
+}
+
+/// The text `bytes` hold in UTF-16. Raises `utf16.refused` at the first surrogate without its
+/// partner, and for an odd number of bytes; where it raises is counted in bytes from the start.
+pub fn read(
+  bytes: Bytes,
+  order: Order,
+  marked: Bool = false,
+) -> String / {utf16.refused, abort.raise} = {
+  let held = read_units(bytes, order, marked);
+  let text = paired(held.units, |at: Int, unit: Int|
+    utf16.refused(Unpaired({ at: held.from + 2 * at, unit: unit })));
+  if (bytes_len(bytes) - held.from) % 2 == 1 { utf16.refused(Halved({ at: bytes_len(bytes) - 1 })) }
+  else { text }
+}
+
+/// `read`, answering the refusal instead of raising it.
+pub fn decode(
+  bytes: Bytes,
+  order: Order,
+  marked: Bool = false,
+) -> Result<String, Refusal> / {abort.raise} = try { read(bytes, order, marked) }
+
+/// The text `bytes` hold in UTF-16, with `U+FFFD` for each surrogate without its partner and for
+/// half a unit at the end: every sequence of bytes has an answer.
+pub fn lossy(bytes: Bytes, order: Order, marked: Bool = false) -> String / {abort.raise} = {
+  let held = read_units(bytes, order, marked);
+  let text = of_units_lossy(held.units);
+  if (bytes_len(bytes) - held.from) % 2 == 1 { text ++ "\u{FFFD}" } else { text }
+}
+
+// --- Laws -------------------------------------------------------------------------
+
+law "a text's units read back as the text"
+  forall (text: String) {
+    (try { of_units(units(text)) }) == Ok(text) && of_units_lossy(units(text)) == text
+  }
+
+law "a text encoded in either order, marked or not, reads back as the text"
+  forall (text: String, little: Bool, marked: Bool) {
+    let order = if little { LittleEndian } else { BigEndian };
+    // Unmarked, a mark opening the text is the text's own, and reading for one would take it.
+    let own = string_starts_with(text, "\u{FEFF}") || string_starts_with(text, "\u{FFFE}");
+    decode(encode(text, order, marked), order, marked) == Ok(text)
+      && (own || marked || decode(encode(text, order), order, marked: true) == Ok(text))
+      && lossy(encode(text, order, marked), order, marked) == text
+  }
+
+law "a strict reading of any bytes answers, and agrees with the lossy one where it is a text"
+  forall (bytes: Bytes, little: Bool, marked: Bool) {
+    let order = if little { LittleEndian } else { BigEndian };
+    match decode(bytes, order, marked) {
+      Ok(text) -> lossy(bytes, order, marked) == text,
+      Err(Unpaired(lone)) ->
+        lone.at >= 0 && lone.at < bytes_len(bytes) && (is_high(lone.unit) || is_low(lone.unit)),
+      Err(Halved(half)) -> half.at == bytes_len(bytes) - 1,
+    }
+  }
+
+law "units of any numbers read lossily, and strictly unless a surrogate lacks its partner"
+  forall (wide: List<Int>) {
+    let text = of_units_lossy(wide);
+    match try { of_units(wide) } {
+      Ok(strict) -> strict == text && units(text) == map(wide, |unit: Int| unit & 0xFFFF),
+      Err(Unpaired(lone)) -> string_contains(text, "\u{FFFD}") && list_at(wide, lone.at) != None,
+      Err(Halved(_)) -> false,
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+test "a character past U+FFFF is a surrogate pair, and any other is its own unit" {
+  assert_eq(units("a\u{E9}\u{4E2D}"), [0x61, 0xE9, 0x4E2D]);
+  assert_eq(units("\u{10000}\u{1F600}\u{10FFFF}"), [
+    0xD800,
+    0xDC00,
+    0xD83D,
+    0xDE00,
+    0xDBFF,
+    0xDFFF,
+  ]);
+  assert_eq(units("\u{FFFF}\u{D7FF}\u{E000}"), [0xFFFF, 0xD7FF, 0xE000]);
+  assert_eq(try { of_units([0xD83D, 0xDE00, 0x61]) }, Ok("\u{1F600}a"));
+  assert_eq(units(""), [])
+}
+
+type Lone = { units: List<Int>, at: Int, lossy: String }
+
+fn lone() -> List<Lone> =
+  [
+    { units: [0xD800], at: 0, lossy: "\u{FFFD}" },
+    { units: [0xDC00], at: 0, lossy: "\u{FFFD}" },
+    { units: [0x61, 0xD83D], at: 1, lossy: "a\u{FFFD}" },
+    { units: [0x61, 0xDE00, 0x62], at: 1, lossy: "a\u{FFFD}b" },
+    { units: [0xD83D, 0x62], at: 0, lossy: "\u{FFFD}b" },
+    { units: [0xD83D, 0xD83D, 0xDE00], at: 0, lossy: "\u{FFFD}\u{1F600}" },
+    { units: [0xDE00, 0xD83D], at: 0, lossy: "\u{FFFD}\u{FFFD}" },
+    { units: [0xD83D, 0xDE00, 0xDE00], at: 2, lossy: "\u{1F600}\u{FFFD}" },
+  ]
+
+test "a surrogate without its partner at {c.at} of {c.units} is refused there, and lossily is U+FFFD" for c: Lone in lone(
+  ) {
+  let unit = match list_at(c.units, c.at) { Some(u) -> u, None -> -1 };
+  assert_eq(try { of_units(c.units) }, Err(Unpaired({ at: c.at, unit: unit })));
+  assert_eq(of_units_lossy(c.units), c.lossy);
+  let bytes = bytes_concat_all(map(c.units, |u: Int| unit_bytes(u, LittleEndian)));
+  assert_eq(decode(bytes, LittleEndian), Err(Unpaired({ at: 2 * c.at, unit: unit })));
+  assert_eq(lossy(bytes, LittleEndian), c.lossy)
+}
+
+test "bytes are read in the order named, or in the order a mark gives where one is looked for" {
+  assert_eq(encode("a\u{1F600}", BigEndian), b"\x00a\xd8\x3d\xde\x00");
+  assert_eq(encode("a\u{1F600}", LittleEndian), b"a\x00\x3d\xd8\x00\xde");
+  assert_eq(encode("a", LittleEndian, marked: true), b"\xff\xfea\x00");
+  assert_eq(encode("a", BigEndian, marked: true), b"\xfe\xff\x00a");
+  assert_eq(decode(b"\xff\xfea\x00", BigEndian, marked: true), Ok("a"));
+  assert_eq(decode(b"\xfe\xff\x00a", LittleEndian, marked: true), Ok("a"));
+  assert_eq(decode(b"\x00a", BigEndian, marked: true), Ok("a"));
+  assert_eq(decode(b"\xfe\xff\x00a", BigEndian), Ok("\u{FEFF}a"));
+  assert_eq(decode(b"", LittleEndian, marked: true), Ok(""));
+  assert_eq(decode(b"\xff\xfe", LittleEndian, marked: true), Ok(""))
+}
+
+test "an odd number of bytes is refused at the last, and lossily ends in U+FFFD" {
+  assert_eq(decode(b"a\x00b", LittleEndian), Err(Halved({ at: 2 })));
+  assert_eq(decode(b"a", BigEndian, marked: true), Err(Halved({ at: 0 })));
+  assert_eq(lossy(b"a\x00b", LittleEndian), "a\u{FFFD}");
+  assert_eq(decode(b"\x00\xd8b", LittleEndian), Err(Unpaired({ at: 0, unit: 0xD800 })));
+  assert_eq(lossy(b"\x00\xd8b", LittleEndian), "\u{FFFD}\u{FFFD}")
+}

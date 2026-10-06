@@ -1,0 +1,235 @@
+//! The Unicode Character Database as its Consortium published it for the version `std.ucd` names:
+//! `ucd/` holds the files, unchanged, with their licence beside them, and this is how each is
+//! read. What here derives a shipped table, or holds a module to the database, reads them through
+//! these.
+
+import std.bytes (int_of_ascii_radix)
+import std.list (at, chunks, flat_map, take)
+import std.math (to_radix_padded)
+import std.string (join)
+
+/// A row of code points a file says one thing of: `first` to `last`, and the fields beside them.
+pub type Row = { first: Int, last: Int, fields: List<Bytes> }
+
+/// `DerivedNormalizationProps.txt`: the quick checks and the composition exclusions.
+pub fn derived_normalization_props() -> Bytes = embed("ucd/DerivedNormalizationProps.txt")
+
+/// `SpecialCasing.txt`: the case mappings that are several characters or hold only somewhere.
+pub fn special_casing() -> Bytes = embed("ucd/SpecialCasing.txt")
+
+/// `CaseFolding.txt`: the common, full, simple and Turkic foldings.
+pub fn case_folding() -> Bytes = embed("ucd/CaseFolding.txt")
+
+/// `auxiliary/GraphemeBreakProperty.txt`: Grapheme_Cluster_Break.
+pub fn grapheme_break_property() -> Bytes = embed("ucd/GraphemeBreakProperty.txt")
+
+/// `auxiliary/WordBreakProperty.txt`: Word_Break.
+pub fn word_break_property() -> Bytes = embed("ucd/WordBreakProperty.txt")
+
+/// `emoji/emoji-data.txt`: Emoji, Emoji_Presentation and Extended_Pictographic among its
+/// properties.
+pub fn emoji_data() -> Bytes = embed("ucd/emoji-data.txt")
+
+/// `EastAsianWidth.txt`: East_Asian_Width.
+pub fn east_asian_width() -> Bytes = embed("ucd/EastAsianWidth.txt")
+
+/// `Scripts.txt`: Script.
+pub fn scripts() -> Bytes = embed("ucd/Scripts.txt")
+
+/// `auxiliary/GraphemeBreakTest.txt`: the conformance test of grapheme cluster boundaries.
+pub fn grapheme_break_test() -> Bytes = embed("ucd/GraphemeBreakTest.txt")
+
+/// `auxiliary/WordBreakTest.txt`: the conformance test of word boundaries.
+pub fn word_break_test() -> Bytes = embed("ucd/WordBreakTest.txt")
+
+/// `extracted/DerivedJoiningType.txt`: Joining_Type.
+pub fn derived_joining_type() -> Bytes = embed("ucd/DerivedJoiningType.txt")
+
+/// `idna/IdnaMappingTable.txt`: the status and mapping UTS #46 gives every code point.
+pub fn idna_mapping_table() -> Bytes = embed("ucd/IdnaMappingTable.txt")
+
+/// `idna/IdnaTestV2.txt`: the conformance test of UTS #46.
+pub fn idna_test() -> Bytes = embed("ucd/IdnaTestV2.txt")
+
+/// `NormalizationTest.txt`: the conformance test of the four normalization forms.
+pub fn normalization_test() -> Bytes = embed("ucd/NormalizationTest.txt")
+
+/// `UnicodeData.txt`: a line a code point, or two for a range, of fifteen fields.
+pub fn unicode_data_text() -> Bytes = embed("ucd/UnicodeData.txt")
+
+/// `DerivedCoreProperties.txt`: Alphabetic, Lowercase, Uppercase, the identifier properties and
+/// the Indic conjunct breaks among them.
+pub fn derived_core_properties() -> Bytes = embed("ucd/DerivedCoreProperties.txt")
+
+/// `PropList.txt`: White_Space among the properties it lists.
+pub fn prop_list() -> Bytes = embed("ucd/PropList.txt")
+
+/// The licence the files are distributed under, as `ucd/LICENSE` holds it.
+pub fn license() -> Bytes = embed("ucd/LICENSE")
+
+/// The number `text` writes in hexadecimal.
+pub fn hex(text: Bytes) -> Int / {abort.raise} =
+  match int_of_ascii_radix(text, 16) {
+    Some(n) -> n,
+    None -> panic(f"`{string_of_bytes_lossy(text)}` is no code point"),
+  }
+
+/// The code points a field lists in hexadecimal with blanks between them; none for a blank field.
+pub fn hexes(text: Bytes) -> List<Int> / {abort.raise} =
+  map(filter(bytes_split(text, b" "), |part: Bytes| bytes_len(part) > 0), hex)
+
+/// A field without the blanks around it.
+pub fn trimmed(field: Bytes) -> Bytes / {abort.raise} =
+  bytes_of_string(string_trim(string_of_bytes(field)))
+
+/// The rows read, with the code point a `First>` line opened a range at.
+type Reading = { rows: List<Row>, opened: Int }
+
+/// Every line of `UnicodeData.txt` in code point order, a `First>` and `Last>` pair being one row.
+/// A row's fields are the line's fifteen as the database numbers them, the code point field `0`.
+pub fn unicode_data() -> List<Row> / {abort.raise} =
+  fold(
+    bytes_split(unicode_data_text(), b"\n"),
+    { rows: [], opened: 0 },
+    |read: Reading, line: Bytes|
+      if bytes_len(line) == 0 { read } else {
+        let fields = bytes_split(line, b";");
+        let cp = hex(at(fields, 0));
+        if bytes_ends_with(at(fields, 1), b", First>") { { rows: read.rows, opened: cp } } else {
+          let first = if bytes_ends_with(at(fields, 1), b", Last>") { read.opened } else { cp };
+          { rows: push(read.rows, { first: first, last: cp, fields: fields }), opened: 0 }
+        }
+      },
+  ).rows
+
+/// The row a `first[..last]` span and the fields after it make.
+fn row_of(span: Bytes, fields: List<Bytes>) -> Row / {abort.raise} =
+  match bytes_split(span, b"..") {
+    [one] -> { first: hex(one), last: hex(one), fields: fields },
+    [first, last] -> { first: hex(first), last: hex(last), fields: fields },
+    _ -> panic(f"`{string_of_bytes_lossy(span)}` is no row of code points"),
+  }
+
+/// The rows of a file whose lines are `first[..last] ; field [; field..] # comment`, in the file's
+/// order, each field without the blanks around it. A line with nothing before its comment is none.
+pub fn rows(file: Bytes) -> List<Row> / {abort.raise} =
+  fold(bytes_split(file, b"\n"), [], |found: List<Row>, line: Bytes| {
+    let data = match bytes_index_of_byte(line, b'#') {
+      Some(i) -> bytes_slice(line, 0, i),
+      None -> line,
+    };
+    match map(bytes_split(data, b";"), trimmed) {
+      [span, ..fields] -> if bytes_len(span) == 0 { found }
+      else { push(found, row_of(span, fields)) },
+      [] -> found,
+    }
+  })
+
+/// The rows of `file` whose fields open with `under`: the code points of a binary property
+/// (`["Alphabetic"]`), or of one value of another (`["NFC_QC", "N"]`).
+pub fn rows_under(file: Bytes, under: List<String>) -> List<Row> / {abort.raise} = {
+  let opening = map(under, bytes_of_string);
+  filter(rows(file), |row: Row| take(row.fields, len(opening)) == opening)
+}
+
+/// The line of `file` at `index`, without the `# ` a comment opens with.
+fn heading(file: Bytes, index: Int) -> String / {abort.raise} = {
+  let line = at(bytes_split(file, b"\n"), index);
+  if !bytes_starts_with(line, b"# ") { panic("a published file opens with comments") }
+  else { string_of_bytes(bytes_slice(line, 2, bytes_len(line))) }
+}
+
+/// The version a published file says it is of, `17.0.0` for one that opens `# Name-17.0.0.txt`.
+pub fn version_of(file: Bytes) -> String / {abort.raise} = {
+  let name = heading(file, 0);
+  match string_split(name, "-") {
+    [_, tail] -> if string_ends_with(tail, ".txt") { string_slice(tail, 0, string_len(tail) - 4) }
+    else { panic(f"`{name}` names no version") },
+    _ -> panic(f"`{name}` names no version"),
+  }
+}
+
+/// The copyright line a published file carries, which is its third.
+pub fn notice_of(file: Bytes) -> String / {abort.raise} = heading(file, 2)
+
+/// The text of `points`, a surrogate among them being `U+FFFD`.
+pub fn text(points: List<Int>) -> String =
+  string_of_chars(map(points, |cp: Int| match char_of_int(cp) { Some(c) -> c, None -> '\u{FFFD}' }))
+
+/// `text` as the database's files spell one: each code point in hexadecimal, a blank between.
+pub fn spelled(text: String) -> String / {abort.raise} =
+  join(map(string_chars(text), |c: Char| string_upper(to_radix_padded(int_of_char(c), 16, 4))), " ")
+
+/// Lines of a conformance file that are checked as one case, and how the first of them is told
+/// from the rest of the file. A case a line files a pass a line, which for a file of twenty
+/// thousand is most of what a run then reads.
+pub type Block<a> = { from: String, lines: List<a> }
+
+/// `lines` as blocks of `size`, each named by what `name` writes of its first line.
+pub fn blocks<a | e>(lines: List<a>, size: Int, name: (a) -> String / e) -> List<Block<a>> / e =
+  fold(chunks(lines, size), [], |found: List<Block<a>>, chunk: List<a>|
+    match chunk { [first, ..] -> push(found, { from: name(first), lines: chunk }), [] -> found })
+
+/// A row of code points and what is said of each of them.
+pub type Stretch<a> = { first: Int, last: Int, said: a }
+
+/// The first few code points of `first` to `last` that `ok` refuses, after those in `wrong`.
+fn refused<| e>(wrong: List<Int>, first: Int, last: Int, ok: (Int) -> Bool / e) -> List<Int> / e =
+  fold(range(first, last + 1), wrong, |found: List<Int>, cp: Int|
+    if len(found) >= 8 || ok(cp) { found } else { push(found, cp) })
+
+/// The walk so far: the code points answered wrong, and the next one no stretch has covered.
+type Walk = { wrong: List<Int>, next: Int }
+
+/// The first few of all the code points there are that `ok` refuses, asked of each with what
+/// `stretches`, which rise and do not meet, say of it, or with `None` for one in no stretch.
+pub fn unlike<a | e>(
+  stretches: List<Stretch<a>>,
+  ok: (Int, Option<a>) -> Bool / e,
+) -> List<Int> / e = {
+  let walked = fold(stretches, { wrong: [], next: 0 }, |walk: Walk, stretch: Stretch<a>| {
+    let said = Some(stretch.said);
+    let before = refused(walk.wrong, walk.next, stretch.first - 1, |cp: Int| ok(cp, None));
+    {
+      wrong: refused(before, stretch.first, stretch.last, |cp: Int| ok(cp, said)),
+      next: stretch.last + 1,
+    }
+  });
+  refused(walked.wrong, walked.next, 0x10FFFF, |cp: Int| ok(cp, None))
+}
+
+/// The first few of the code points in `stretches` that `ok` refuses, asked of each with what its
+/// stretch says.
+pub fn listed_unlike<a | e>(
+  stretches: List<Stretch<a>>,
+  ok: (Int, a) -> Bool / e,
+) -> List<Int> / e =
+  fold(stretches, [], |wrong: List<Int>, stretch: Stretch<a>|
+    refused(wrong, stretch.first, stretch.last, |cp: Int| ok(cp, stretch.said)))
+
+/// Code points in a row, `first` to `last`.
+pub type Span = { first: Int, last: Int }
+
+/// The gaps so far, and the next code point no stretch has covered.
+type Gaps = { found: List<Span>, next: Int }
+
+/// The code points in none of `stretches`, which rise and do not meet, as spans of at most `size`:
+/// what a check of a whole text of them at once is handed, where one a code point would cost a
+/// call for each of a million.
+pub fn unlisted<a>(stretches: List<Stretch<a>>, size: Int) -> List<Span> / {abort.raise} = {
+  let walked = fold(stretches, { found: [], next: 0 }, |gaps: Gaps, stretch: Stretch<a>|
+    {
+      found: if stretch.first > gaps.next {
+        push(gaps.found, { first: gaps.next, last: stretch.first - 1 })
+      } else { gaps.found },
+      next: stretch.last + 1,
+    });
+  let gaps = if walked.next > 0x10FFFF { walked.found }
+  else { push(walked.found, { first: walked.next, last: 0x10FFFF }) };
+  flat_map(gaps, |gap: Span|
+    map(range(0, (gap.last - gap.first) / size + 1), |i: Int|
+      { first: gap.first + i * size, last: min(gap.last, gap.first + i * size + size - 1) }))
+}
+
+/// `span` as one text, a surrogate in it being `U+FFFD`.
+pub fn text_of(span: Span) -> String = text(range(span.first, span.last + 1))

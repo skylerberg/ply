@@ -3,13 +3,14 @@
 //! They are here for the protocols that still name them, such as a version 5 UUID, a one-time
 //! password or an old peer, and in a module of their own so that a use of either shows in an
 //! import. Neither is fit for a signature, a certificate or anything an adversary chooses the input
-//! of. Each is a `std.hash` `Hash`, so `std.hash`'s `hmac`, `hkdf`, `pbkdf2` and streaming take
-//! it; HMAC over either is not known to be broken.
+//! of. Each is a `std.hash` `Hash`, so `std.hash`'s streaming and `hmac_plain` take it, and the
+//! runtime keys SHA-1 under a `Secret`, so `hmac`, `hkdf` and `pbkdf2` take `sha1_hash()` too;
+//! HMAC over either is not known to be broken.
 
 import std.bytes (bytes_of_hex, hex_of, repeat, u32_be, u32_le, u64_be, u64_le)
 import std.float (abs)
-import std.hash (Hash, Hasher, any_split, digest_of, finish, hkdf_expand, hkdf_extract, hmac, init,
-                 md_closed, pbkdf2, update)
+import std.hash (Hash, Hasher, Unkeyed, any_split, digest_of, finish, hkdf_expand, hkdf_extract,
+                 hmac, hmac_plain, init, md_closed, pbkdf2, update)
 import std.list (all)
 
 // --- SHA-1 ------------------------------------------------------------------------
@@ -91,6 +92,13 @@ pub fn sha1(input: Bytes) -> Bytes / {abort.raise}
   cost bytes_len(input)
 = digest_of(sha1_hash(), input)
 
+/// HMAC-SHA-1 under a secret key, which a one-time password and an old peer still ask for.
+pub fn hmac_sha1(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
+  match secret_hmac("SHA-1", key, message) {
+    Some(tag) -> tag,
+    None -> panic("SHA-1 is a hash the runtime keys"),
+  }
+
 // --- MD5 --------------------------------------------------------------------------
 
 /// MD5 as RFC 1321 defines it. Broken for collisions.
@@ -171,7 +179,7 @@ pub fn md5(input: Bytes) -> Bytes / {abort.raise}
 type Digest = { message: String, input: Bytes, digest: String }
 
 /// RFC 1321's test suite, A.5.
-fn rfc_1321() -> List<Digest> / {abort.raise} =
+fn rfc_1321() -> List<Digest> =
   [
     { message: "the empty message", input: b"", digest: "d41d8cd98f00b204e9800998ecf8427e" },
     { message: "a", input: b"a", digest: "0cc175b9c0f1b6a831c399e269772661" },
@@ -200,7 +208,7 @@ fn rfc_1321() -> List<Digest> / {abort.raise} =
 
 /// FIPS 180-4's SHA-1 examples, and the empty and the million-byte messages NIST publishes beside
 /// them.
-fn fips_180() -> List<Digest> / {abort.raise} =
+fn fips_180() -> List<Digest> =
   [
     {
       message: "the empty message",
@@ -383,8 +391,15 @@ fn rfc_2202() -> List<Mac> / {abort.raise} =
 
 test "RFC 2202: HMAC-{v.hash}, case {v.case}" for v: Mac in rfc_2202() {
   let h = if v.hash == "MD5" { md5_hash() } else { sha1_hash() };
-  assert_eq(hex_of(hmac(h, v.key, v.data)), v.tag)
+  assert_eq(hex_of(hmac_plain(h, v.key, v.data)), v.tag);
+  if v.hash == "SHA-1" { assert_eq(hex_of(hmac_sha1(secret_of_bytes(v.key), v.data)), v.tag) }
+  else { assert_eq(try { hmac(h, secret_of_bytes(v.key), v.data) }, Err(Unkeyed("MD5"))) }
 }
+
+law "HMAC-SHA-1 under a secret key is HMAC over SHA-1 as Ply writes it"
+  forall (material: Bytes, message: Bytes) {
+    hmac_sha1(secret_of_bytes(material), message) == hmac_plain(sha1_hash(), material, message)
+  }
 
 /// One of RFC 5869's cases: what goes in, the pseudorandom key the first step makes of it, and the
 /// output.
@@ -446,9 +461,14 @@ fn rfc_5869() -> List<Derivation> / {abort.raise} =
   ]
 
 test "RFC 5869, case {v.case}" for v: Derivation in rfc_5869() {
-  let prk = hkdf_extract(sha1_hash(), v.salt, v.key);
-  assert_eq(hex_of(prk), v.prk);
-  assert_eq(hex_of(hkdf_expand(sha1_hash(), prk, v.info, v.length)), v.okm)
+  let derived = try {
+    let prk = hkdf_extract(sha1_hash(), v.salt, secret_of_bytes(v.key));
+    { prk: prk, okm: hkdf_expand(sha1_hash(), prk, v.info, v.length) }
+  };
+  assert_eq(
+    derived,
+    Ok({ prk: secret_of_bytes(bytes_of_hex(v.prk)), okm: secret_of_bytes(bytes_of_hex(v.okm)) }),
+  )
 }
 
 /// One published PBKDF2 key.
@@ -495,4 +515,9 @@ fn rfc_6070() -> List<Stretch> =
   ]
 
 test "RFC 6070: {v.password} and {v.salt}, {v.iterations} rounds to {v.length} bytes" for v: Stretch in rfc_6070(
-  ) { assert_eq(hex_of(pbkdf2(sha1_hash(), v.password, v.salt, v.iterations, v.length)), v.key) }
+  ) {
+  assert_eq(
+    try { pbkdf2(sha1_hash(), secret_of_bytes(v.password), v.salt, v.iterations, v.length) },
+    Ok(secret_of_bytes(bytes_of_hex(v.key))),
+  )
+}
