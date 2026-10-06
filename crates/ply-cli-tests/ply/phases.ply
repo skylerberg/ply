@@ -4,8 +4,10 @@
 
 import compiler.code
 import compiler.derive
-import compiler.front (Dump, Embedded, KnownDefRow, Analysed, Refused, checked_staged, dump_of,
-                       rows_of, shipped_pulled, staged_pulling_std_with)
+import compiler.embed (EmbedAt, want_of_key)
+import compiler.front (Dump, Embedded, KnownDefRow, ShippedData, Analysed, Refused, checked_staged,
+                       dump_of, rows_of, shipped_data_embeds, shipped_pulled,
+                       staged_pulling_std_with)
 import compiler.hash
 import compiler.infer
 import compiler.items
@@ -15,7 +17,7 @@ import compiler.resolve
 import compiler.resolve (Source, Diag)
 import compiler.rewrite
 import compiler.unit (shipped)
-import harness (compiler_tree, example_files, phase_files, prelude_file, std_tree)
+import harness (compiler_tree, example_files, phase_files, prelude_file, std_data, std_tree)
 import std.bytes
 import std.list (any, concat, find, flatten, last, somes, take)
 import std.show (show)
@@ -318,14 +320,23 @@ test "{string_of_bytes_lossy(s.name)}'s header holds the imports its whole parse
 }
 
 /// A program the checker is run over: a standard library module under its bare name, as no project
-/// module may be named under `std`, its imports pulled from the shipped modules for what it
-/// reaches; or the compiler with what it embeds.
+/// module may be named under `std`, with the data files it embeds, its imports pulled from the
+/// shipped modules for what it reaches; or the compiler with what it embeds.
 type Part = { name: String, modules: List<Source>, embeds: List<Embedded> }
 
-fn parts() -> List<Part> / {abort.raise} =
+fn parts() -> List<Part> / {abort.raise} = {
+  let data: List<ShippedData> = map(std_data(), |d: File|
+    { name: bytes_of_string(d.name), bytes: d.bytes });
   push(
-    map(modules_of(std_tree(), ""), |s: Source|
-      { name: "std." ++ string_of_bytes_lossy(s.name), modules: [s], embeds: [] }),
+    map(modules_of(std_tree(), "std."), |s: Source| {
+      let bare = bytes_slice(s.name, 4, bytes_len(s.name));
+      {
+        name: string_of_bytes_lossy(s.name),
+        modules: [{ name: bare, src: s.src }],
+        embeds: map(shipped_data_embeds(s, data), |e: EmbedAt|
+          { root: b"", module: bare, want: want_of_key(e.key), read: e.read }),
+      }
+    }),
     {
       name: "the compiler",
       modules: modules_of(compiler_tree(), ""),
@@ -339,6 +350,7 @@ fn parts() -> List<Part> / {abort.raise} =
       ],
     },
   )
+}
 
 fn refusal(diags: List<Diag>) -> String / {abort.raise} =
   string::join(
@@ -391,18 +403,15 @@ fn partings(walked: Dump, seeded: Dump) -> List<String> / {abort.raise} =
 test "{p.name} checked from the rows its walk published answers as the walk did" for p: Part in parts(
   ) {
   let pkgs = { root: b"", manifest: None, supplied: [] };
-  let shipping = shipped_pulled(
-    p.modules,
-    pkgs,
-    map(shipped.names(), bytes_of_string),
-    |name: Bytes| shipped.module(string_of_bytes_lossy(name)),
-  );
+  let held = |name: Bytes| shipped.module(string_of_bytes_lossy(name));
+  let shipping = shipped_pulled(p.modules, pkgs, map(shipped.names(), bytes_of_string), held, held);
   let staged = staged_pulling_std_with(
     p.modules,
     shipping.read,
     pkgs,
     embeds: p.embeds,
     unread: shipping.unread,
+    data: shipping.data,
   );
   tell_viewed(staged.viewed, true);
   match checked_staged(staged, [], []).out {
