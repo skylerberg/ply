@@ -1,0 +1,721 @@
+//! Datagrams: UDP sockets, as an effect whose label names what a socket is for.
+//!
+//! A socket is bound, then sends a datagram to an address and receives one from whoever sent it.
+//! `recv_from` takes the most bytes it will hold: a datagram longer than that is cut to it and
+//! answered `truncated`, since the rest is gone and a protocol that reads a cut message as a whole
+//! one is wrong. `connect` fixes a socket's far end, after which `send` goes there and only
+//! datagrams from there arrive. A deadline is milliseconds, and `timeout_ms <= 0` is a runtime
+//! error; a receive that hears nothing in time is `Err(TimedOut)`. Every refusal is `std.net`'s
+//! `Refusal`, and a socket's options are `std.net`'s `SocketOption`: `Broadcast`, `JoinGroup` and
+//! `LeaveGroup` beside the buffer sizes.
+//!
+//! A run binds a loopback address, or no address with port `0` for a socket that asks and hears
+//! answers; any other bind is `PermissionDenied`, as a listener beyond loopback is.
+//!
+//! A datagram may be lost, arrive twice or arrive out of order, and a protocol over UDP is right
+//! only if it is right when they do. The twin is `MemUdp`, with a `mem_` function for every
+//! operation, and `on_mem` runs code written against any labels over one. A far end is a function
+//! from a datagram to the datagrams it answers with, or another socket of the program's own. Each
+//! datagram the twin carries meets a `Fate`: the next of the fates a test wrote down
+//! (`mem_fated`), and after those one drawn from a seed at the chances given (`mem_lossy`), which
+//! under `simulate` is `sim.seed()`, so a run over many seeds is a run over many networks.
+//! Nothing waits in it: a receive with nothing to answer is a deadline.
+
+import std.ip
+import std.ip (Ip, SocketAddress, V4, V6, ip)
+import std.list (concat)
+import std.net
+import std.net (AddressInUse, Other, PermissionDenied, Refusal, Refused, SocketOption, TimedOut,
+                socket)
+import std.random (Rand, rand, rand_below)
+
+/// One datagram received: who sent it, what of it fit, and whether it was longer than that.
+pub type Datagram = { from: SocketAddress, payload: Bytes, truncated: Bool }
+
+/// Datagram sockets, under the label the caller names them by.
+pub nondet effect udp {
+  /// A socket bound at `at`, with `options` set before it binds; port `0` asks for any free one,
+  /// which `local_address` then names. A loopback address, or the unspecified one with port `0`;
+  /// any other is `PermissionDenied`.
+  write bind[s](at: SocketAddress, options: List<SocketOption>) -> Result<Int, Refusal>
+  /// Fixes the socket's far end: `send` goes to `to`, and only datagrams from `to` are received.
+  write connect[s](socket: Int, to: SocketAddress) -> Result<Unit, Refusal>
+  /// Sends `payload` to `to` as one datagram and answers its length. That it was sent says
+  /// nothing of its arriving.
+  write send_to[s](socket: Int, to: SocketAddress, payload: Bytes, timeout_ms: Int) -> Result<Int, Refusal>
+  /// `send_to` the far end `connect` fixed; a socket with none is a runtime error.
+  write send[s](socket: Int, payload: Bytes, timeout_ms: Int) -> Result<Int, Refusal>
+  /// The next datagram, at most `max` bytes of it. On a connected socket, `Refused` says the far
+  /// end answered an earlier send with no one listening.
+  write recv_from[s](socket: Int, max: Int, timeout_ms: Int) -> Result<Datagram, Refusal>
+  /// Sets one option of a socket.
+  write set_option[s](socket: Int, option: SocketOption) -> Result<Unit, Refusal>
+  /// Closes a socket.
+  write close[s](socket: Int) -> Unit
+  /// The address the socket is bound to.
+  read local_address[s](socket: Int) -> Option<SocketAddress>
+  /// Each option the socket has, as it stands now.
+  read options[s](socket: Int) -> List<SocketOption>
+}
+
+/// A socket bound at `at`, raising why there is none.
+pub fn bound<[l]>(
+  at: SocketAddress,
+  options: List<SocketOption>,
+) -> Int / {udp.bind[l], socket.refused} =
+  match udp.bind[l](at, options) { Ok(s) -> s, Err(why) -> socket.refused(why) }
+
+// --- The twin ---------------------------------------------------------------
+
+/// What becomes of one datagram on its way.
+pub type Fate =
+  /// It arrives, after everything sent before it.
+  | Delivered
+  /// It never arrives.
+  | Dropped
+  /// It arrives twice.
+  | Duplicated
+  /// It arrives ahead of everything still waiting where it is going.
+  | Overtaking
+
+/// How often, in a hundred datagrams, a twin drops one, delivers one twice and lets one overtake.
+pub type Faults = { drop: Int, duplicate: Int, reorder: Int }
+
+/// A socket a twin holds: where it is bound, the far end `connect` fixed, the groups it joined,
+/// what waits to be received, and whether a far end with no one listening has said so.
+pub type MemSocket = {
+  label: String,
+  at: SocketAddress,
+  peer: Option<SocketAddress>,
+  groups: List<Ip>,
+  waiting: List<Datagram>,
+  refused: Bool,
+  options: List<SocketOption>,
+}
+
+/// One network of datagrams, as a value. `answering` is each far end the twin was told of, by its
+/// address; `fates` is what becomes of the next datagrams, in order, and `faults` and `rand` what
+/// becomes of those after; `met` is every fate a datagram has met, in order.
+pub type MemUdp = {
+  next: Int,
+  port: Int,
+  sockets: Map<Int, MemSocket>,
+  answering: Map<String, (Bytes) -> List<Bytes> / {abort.raise}>,
+  fates: List<Fate>,
+  faults: Faults,
+  rand: Rand,
+  met: List<Fate>,
+  closed: List<Int>,
+}
+
+/// An operation's two answers: the network it left, and what the host would have answered.
+pub type Stepped<a> = { udp: MemUdp, answer: a }
+
+/// A network that loses nothing, with no one on it.
+pub fn mem_empty() -> MemUdp =
+  {
+    next: 1,
+    port: 49152,
+    sockets: map_new(),
+    answering: map_new(),
+    fates: [],
+    faults: { drop: 0, duplicate: 0, reorder: 0 },
+    rand: rand(0),
+    met: [],
+    closed: [],
+  }
+
+/// The network with a far end at `at` that answers each datagram it is sent with the datagrams
+/// `respond` makes of it.
+pub fn mem_answering(
+  u: MemUdp,
+  at: SocketAddress,
+  respond: (Bytes) -> List<Bytes> / {abort.raise},
+) -> MemUdp = { ..u, answering: map_insert(u.answering, ip::render_socket(at), respond) }
+
+/// The network with `fates` as what becomes of the next datagrams it carries, one each, in
+/// order, before any other.
+pub fn mem_fated(u: MemUdp, fates: List<Fate>) -> MemUdp = { ..u, fates: concat(u.fates, fates) }
+
+/// The network with each datagram past the fates written down meeting one drawn from `seed` at
+/// the chances `faults` gives.
+pub fn mem_lossy(u: MemUdp, seed: Int, faults: Faults) -> MemUdp =
+  { ..u, faults: faults, rand: rand(seed) }
+
+fn deadline(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
+  if timeout_ms <= 0 {
+    panic(
+      "`udp." ++ operation ++ "` was given a timeout of " ++ int_to_string(timeout_ms)
+        ++ " milliseconds",
+    )
+  } else { () }
+
+fn socket_of(u: MemUdp, label: String, id: Int) -> MemSocket / {abort.raise} =
+  match map_get(u.sockets, id) {
+    Some(s) -> if s.label == label { s } else {
+      panic(
+        "socket " ++ int_to_string(id) ++ " is being used as `net[" ++ label ++ "]` and `net["
+          ++ s.label
+          ++ "]`",
+      )
+    },
+    None -> panic("there is no open socket with handle " ++ int_to_string(id)),
+  }
+
+fn with_socket(u: MemUdp, id: Int, s: MemSocket) -> MemUdp =
+  { ..u, sockets: map_insert(u.sockets, id, s) }
+
+/// What `udp.bind` answers over the network.
+pub fn mem_bind(
+  u: MemUdp,
+  label: String,
+  at: SocketAddress,
+  options: List<SocketOption>,
+) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+  let address = ip::socket_ip(at);
+  let asked = ip::socket_port(at);
+  if !(ip::is_loopback(address) || (ip::is_unspecified(address) && asked == 0)) {
+    { udp: u, answer: Err(PermissionDenied) }
+  } else {
+    let here = ip::socket_at(address, if asked == 0 { u.port } else { asked });
+    let taken = map_fold(u.sockets, false, |found: Bool, _handle: Int, s: MemSocket|
+      found || s.at == here);
+    if taken { { udp: u, answer: Err(AddressInUse) } } else {
+      let s: MemSocket = {
+        label: label,
+        at: here,
+        peer: None,
+        groups: [],
+        waiting: [],
+        refused: false,
+        options: fold(options, [], net::with_option),
+      };
+      {
+        udp: {
+          ..u,
+          next: u.next + 1,
+          port: if asked == 0 { u.port + 1 } else { u.port },
+          sockets: map_insert(u.sockets, u.next, s),
+        },
+        answer: Ok(u.next),
+      }
+    }
+  }
+}
+
+/// What `udp.connect` answers over the network.
+pub fn mem_connect(
+  u: MemUdp,
+  label: String,
+  socket: Int,
+  to: SocketAddress,
+) -> Stepped<Result<Unit, Refusal>> / {abort.raise} = {
+  let s = socket_of(u, label, socket);
+  { udp: with_socket(u, socket, { ..s, peer: Some(to) }), answer: Ok(()) }
+}
+
+/// The fate of the next datagram and the network that has dealt it: the next one written down,
+/// else one drawn at the network's chances.
+fn fated(u: MemUdp) -> { udp: MemUdp, fate: Fate } / {abort.raise} =
+  match u.fates {
+    [fate, ..rest] -> { udp: { ..u, fates: rest, met: push(u.met, fate) }, fate: fate },
+    [] -> if u.faults.drop + u.faults.duplicate + u.faults.reorder <= 0 {
+      { udp: { ..u, met: push(u.met, Delivered) }, fate: Delivered }
+    } else {
+      match rand_below(u.rand, 100) {
+        None -> { udp: u, fate: Delivered },
+        Some(drawn) -> {
+          let fate = if drawn.value < u.faults.drop { Dropped }
+          else if drawn.value < u.faults.drop + u.faults.duplicate { Duplicated }
+          else if drawn.value < u.faults.drop + u.faults.duplicate + u.faults.reorder { Overtaking }
+          else { Delivered };
+          { udp: { ..u, rand: drawn.rand, met: push(u.met, fate) }, fate: fate }
+        },
+      }
+    },
+  }
+
+/// Whether a datagram sent to `to` is one the socket `s` hears: sent to its port at its address
+/// or at any address when it is bound to none, or to a group it joined.
+fn hears(s: MemSocket, to: SocketAddress) -> Bool =
+  ip::socket_port(s.at) == ip::socket_port(to)
+    && (ip::socket_ip(s.at) == ip::socket_ip(to) || ip::is_unspecified(ip::socket_ip(s.at))
+    || len(filter(s.groups, |group: Ip| group == ip::socket_ip(to))) > 0)
+
+/// The handles of the sockets that hear a datagram sent to `to`, ascending.
+fn hearers(u: MemUdp, to: SocketAddress) -> List<Int> =
+  map_fold(u.sockets, [], |found: List<Int>, id: Int, s: MemSocket|
+    if hears(s, to) { push(found, id) } else { found })
+
+/// The network with `datagram` put where the socket `to` will receive it, as its fate has it.
+fn arrived(u: MemUdp, to: Int, datagram: Datagram, fate: Fate) -> MemUdp =
+  match map_get(u.sockets, to) {
+    None -> u,
+    Some(s) -> {
+      let waiting = match fate {
+        Delivered -> push(s.waiting, datagram),
+        Dropped -> s.waiting,
+        Duplicated -> push(push(s.waiting, datagram), datagram),
+        Overtaking -> concat([datagram], s.waiting),
+      };
+      with_socket(u, to, { ..s, waiting: waiting })
+    },
+  }
+
+/// The network with one datagram from `from` carried to every socket that hears `to`, each
+/// copy meeting its own fate.
+fn carried(
+  u: MemUdp,
+  from: SocketAddress,
+  to: SocketAddress,
+  payload: Bytes,
+) -> MemUdp / {abort.raise} =
+  fold(hearers(u, to), u, |net: MemUdp, id: Int| {
+    let dealt = fated(net);
+    arrived(dealt.udp, id, { from: from, payload: payload, truncated: false }, dealt.fate)
+  })
+
+/// The address a datagram from the socket `s` to `to` is seen to come from: where it is bound, or
+/// loopback when it is bound to no address.
+fn source(s: MemSocket, to: SocketAddress) -> SocketAddress / {abort.raise} =
+  if ip::is_unspecified(ip::socket_ip(s.at)) {
+    ip::socket_at(ip::loopback_like(ip::socket_ip(to)), ip::socket_port(s.at))
+  } else { s.at }
+
+fn broadcasts(s: MemSocket) -> Bool =
+  len(filter(s.options, |held: SocketOption| match held { net::Broadcast(on) -> on, _ -> false }))
+    > 0
+
+fn is_broadcast(address: Ip) -> Bool =
+  match address { V4(four) -> ip::v4_to_int(four) == 4294967295, V6(_) -> false }
+
+/// What `udp.send_to` answers over the network: the datagram goes to each of the program's own
+/// sockets that hears `to`, or to the far end the network was told of there, whose answers come
+/// back the same way; each crossing meets a fate. No one at `to` is silence, and on a connected
+/// socket the refusal its next receive answers.
+pub fn mem_send_to(
+  u: MemUdp,
+  label: String,
+  socket: Int,
+  to: SocketAddress,
+  payload: Bytes,
+  timeout_ms: Int,
+) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+  deadline("send_to", timeout_ms);
+  let s = socket_of(u, label, socket);
+  let size = bytes_len(payload);
+  if size > 65507 { { udp: u, answer: Err(Other(0, "a datagram holds at most 65507 bytes")) } }
+  else if is_broadcast(ip::socket_ip(to)) && !broadcasts(s) {
+    { udp: u, answer: Err(PermissionDenied) }
+  } else {
+    let from = source(s, to);
+    let key = ip::render_socket(to);
+    if len(hearers(u, to)) > 0 { { udp: carried(u, from, to, payload), answer: Ok(size) } } else {
+      match map_get(u.answering, key) {
+        Some(respond) -> {
+          let dealt = fated(u);
+          let times = match dealt.fate { Dropped -> 0, Duplicated -> 2, _ -> 1 };
+          let replied = fold(range(0, times), dealt.udp, |net: MemUdp, _i: Int|
+            fold(respond(payload), net, |n: MemUdp, reply: Bytes| {
+              let back = fated(n);
+              arrived(back.udp, socket, { from: to, payload: reply, truncated: false }, back.fate)
+            }));
+          { udp: replied, answer: Ok(size) }
+        },
+        None ->
+          { udp: with_socket(u, socket, { ..s, refused: s.peer == Some(to) }), answer: Ok(size) },
+      }
+    }
+  }
+}
+
+/// What `udp.send` answers over the network; a socket with no far end fails as the host fails
+/// it.
+pub fn mem_send(
+  u: MemUdp,
+  label: String,
+  socket: Int,
+  payload: Bytes,
+  timeout_ms: Int,
+) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
+  deadline("send", timeout_ms);
+  match socket_of(u, label, socket).peer {
+    Some(to) -> mem_send_to(u, label, socket, to, payload, timeout_ms),
+    None -> panic("`udp.send` was given a socket with no far end"),
+  }
+}
+
+/// What `udp.recv_from` answers over the network: the next datagram waiting, cut to `max` bytes
+/// and saying so when it was longer; on a connected socket, only one from its far end. Nothing
+/// waiting is the deadline.
+pub fn mem_recv_from(
+  u: MemUdp,
+  label: String,
+  socket: Int,
+  max: Int,
+  timeout_ms: Int,
+) -> Stepped<Result<Datagram, Refusal>> / {abort.raise} = {
+  deadline("recv_from", timeout_ms);
+  if max <= 0 { panic("`udp.recv_from` was asked for " ++ int_to_string(max) ++ " bytes") } else {
+    let s = socket_of(u, label, socket);
+    let wanted = filter(s.waiting, |d: Datagram|
+      match s.peer { Some(peer) -> d.from == peer, None -> true });
+    if s.refused { { udp: with_socket(u, socket, { ..s, refused: false }), answer: Err(Refused) } }
+    else {
+      match wanted {
+        [] -> { udp: with_socket(u, socket, { ..s, waiting: [] }), answer: Err(TimedOut) },
+        [next, ..rest] -> {
+          let cut = bytes_len(next.payload) > max;
+          {
+            udp: with_socket(u, socket, { ..s, waiting: rest }),
+            answer: Ok({
+              from: next.from,
+              payload: if cut { bytes_slice(next.payload, 0, max) } else { next.payload },
+              truncated: cut,
+            }),
+          }
+        },
+      }
+    }
+  }
+}
+
+/// What `udp.set_option` answers over the network, which keeps each setting and each group
+/// joined: a group is what `send_to` delivers by. Leaving a group not joined is refused.
+pub fn mem_set_option(
+  u: MemUdp,
+  label: String,
+  socket: Int,
+  option: SocketOption,
+) -> Stepped<Result<Unit, Refusal>> / {abort.raise} = {
+  let s = socket_of(u, label, socket);
+  let joined = |group: Ip| len(filter(s.groups, |held: Ip| held == group)) > 0;
+  match option {
+    net::JoinGroup(group, _) -> if !ip::is_multicast(group) {
+      { udp: u, answer: Err(Other(0, "that address is no multicast group")) }
+    } else if joined(group) { { udp: u, answer: Err(AddressInUse) } } else {
+      { udp: with_socket(u, socket, { ..s, groups: push(s.groups, group) }), answer: Ok(()) }
+    },
+    net::LeaveGroup(group, _) -> if !joined(group) {
+      { udp: u, answer: Err(Other(0, "that group was not joined")) }
+    } else {
+      {
+        udp: with_socket(u, socket, { ..s, groups: filter(s.groups, |held: Ip| held != group) }),
+        answer: Ok(()),
+      }
+    },
+    _ ->
+      {
+        udp: with_socket(u, socket, { ..s, options: net::with_option(s.options, option) }),
+        answer: Ok(()),
+      },
+  }
+}
+
+/// What `udp.close` does over the network: the handle names nothing afterwards, and what waited
+/// on it is gone.
+pub fn mem_close(u: MemUdp, label: String, socket: Int) -> Stepped<Unit> / {abort.raise} = {
+  let _s = socket_of(u, label, socket);
+  {
+    udp: { ..u, sockets: map_remove(u.sockets, socket), closed: push(u.closed, socket) },
+    answer: (),
+  }
+}
+
+/// What `go` answered over a twin, and the network it left.
+pub type Over<a> = { value: a, udp: MemUdp }
+
+/// `go` run over `start`, every `udp` operation under every label answered by the twin.
+pub fn on_mem<a | e>(
+  start: MemUdp,
+  go: () -> a / {udp.read[*], udp.write[*] | e},
+) -> Over<a> / {abort.raise | e bounded} =
+  with_cell[mem_udp](start) { t -> {
+    let value = handle {
+      go()
+    } with {
+      udp.bind[*label](at, options) -> {
+        let s = mem_bind(cell_get(t), label, at, options);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.connect[*label](socket, to) -> {
+        let s = mem_connect(cell_get(t), label, socket, to);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.send_to[*label](socket, to, payload, timeout_ms) -> {
+        let s = mem_send_to(cell_get(t), label, socket, to, payload, timeout_ms);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.send[*label](socket, payload, timeout_ms) -> {
+        let s = mem_send(cell_get(t), label, socket, payload, timeout_ms);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.recv_from[*label](socket, max, timeout_ms) -> {
+        let s = mem_recv_from(cell_get(t), label, socket, max, timeout_ms);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.set_option[*label](socket, option) -> {
+        let s = mem_set_option(cell_get(t), label, socket, option);
+        cell_set(t, s.udp);
+        s.answer
+      },
+      udp.close[*label](socket) -> cell_set(t, mem_close(cell_get(t), label, socket).udp),
+      udp.local_address[*label](socket) -> Some(socket_of(cell_get(t), label, socket).at),
+      udp.options[*label](socket) -> socket_of(cell_get(t), label, socket).options,
+    };
+    { value: value, udp: cell_get(t) }
+  } }
+
+// --- Tests ------------------------------------------------------------------
+
+fn opened<[l]>(text: String) -> Int / {udp.bind[l], ip.refused, abort.raise} =
+  match udp.bind[l](ip::read_socket(text), []) {
+    Ok(s) -> s,
+    Err(_) -> panic("no socket at " ++ text),
+  }
+
+fn payload_of(received: Result<Datagram, Refusal>) -> Result<Bytes, Refusal> =
+  match received { Ok(d) -> Ok(d.payload), Err(why) -> Err(why) }
+
+test "a datagram goes from one socket of the program to another, and says who sent it" {
+  let ran = on_mem(mem_empty(), || {
+    let server = opened[server]("127.0.0.1:5353");
+    let client = opened[client]("127.0.0.1:0");
+    let sent = udp.send_to[client](client, ip::read_socket("127.0.0.1:5353"), b"ping", 1000);
+    let heard = udp.recv_from[server](server, 512, 1000);
+    let quiet = udp.recv_from[server](server, 512, 1000);
+    { sent: sent, heard: heard, quiet: quiet, here: udp.local_address[client](client) }
+  });
+  assert_eq(ran.value.sent, Ok(4));
+  assert_eq(
+    ran.value.heard,
+    Ok({ from: ip::read_socket("127.0.0.1:49152"), payload: b"ping", truncated: false }),
+  );
+  assert_eq(ran.value.quiet, Err(TimedOut));
+  assert_eq(ran.value.here, Some(ip::read_socket("127.0.0.1:49152")))
+}
+
+test "a datagram longer than its reader holds is cut and says so" {
+  let ran = on_mem(mem_empty(), || {
+    let server = opened[server]("127.0.0.1:7");
+    let client = opened[client]("127.0.0.1:0");
+    let _sent = udp.send_to[client](client, ip::read_socket("127.0.0.1:7"), b"0123456789", 1000);
+    let _again = udp.send_to[client](client, ip::read_socket("127.0.0.1:7"), b"0123", 1000);
+    [udp.recv_from[server](server, 4, 1000), udp.recv_from[server](server, 4, 1000)]
+  });
+  let from = ip::read_socket("127.0.0.1:49152");
+  assert_eq(ran.value, [
+    Ok({ from: from, payload: b"0123", truncated: true }),
+    Ok({ from: from, payload: b"0123", truncated: false }),
+  ])
+}
+
+test "a connected socket sends to its far end, hears only it, and learns no one was there" {
+  let ran = on_mem(mem_empty(), || {
+    let a = opened[a]("127.0.0.1:9001");
+    let b = opened[b]("127.0.0.1:9002");
+    let c = opened[c]("127.0.0.1:9003");
+    let _fixed = udp.connect[a](a, ip::read_socket("127.0.0.1:9002"));
+    let _stray = udp.send_to[c](c, ip::read_socket("127.0.0.1:9001"), b"stray", 1000);
+    let _reply = udp.send_to[b](b, ip::read_socket("127.0.0.1:9001"), b"reply", 1000);
+    let sent = udp.send[a](a, b"hello", 1000);
+    let heard = payload_of(udp.recv_from[a](a, 64, 1000));
+    let reached = payload_of(udp.recv_from[b](b, 64, 1000));
+    udp.close[b](b);
+    let _lost = udp.send[a](a, b"again", 1000);
+    { sent: sent, heard: heard, reached: reached, after: payload_of(udp.recv_from[a](a, 64, 1000)) }
+  });
+  assert_eq(ran.value.sent, Ok(5));
+  assert_eq(ran.value.heard, Ok(b"reply"));
+  assert_eq(ran.value.reached, Ok(b"hello"));
+  assert_eq(ran.value.after, Err(Refused))
+}
+
+test "a run binds loopback or nothing, and one address once" {
+  let ran = on_mem(mem_empty(), ||
+    [
+      udp.bind[a](ip::read_socket("192.0.2.1:53"), []),
+      udp.bind[a](ip::read_socket("0.0.0.0:53"), []),
+      udp.bind[a](ip::read_socket("0.0.0.0:0"), []),
+      udp.bind[a](ip::read_socket("[::1]:53"), []),
+      udp.bind[a](ip::read_socket("[::1]:53"), []),
+    ]);
+  assert_eq(ran.value, [
+    Err(PermissionDenied),
+    Err(PermissionDenied),
+    Ok(1),
+    Ok(2),
+    Err(AddressInUse),
+  ])
+}
+
+test "a broadcast needs its option, and a group hears what is sent to it once joined" {
+  let group = ip::read("239.1.2.3");
+  let ran = on_mem(mem_empty(), || {
+    let member = opened[member]("127.0.0.1:4000");
+    let sender = opened[sender]("127.0.0.1:0");
+    let barred = udp.send_to[sender](sender, ip::read_socket("255.255.255.255:4000"), b"all", 1000);
+    let allowed = udp.set_option[sender](sender, net::Broadcast(true));
+    let shouted = udp.send_to[sender](
+      sender,
+      ip::read_socket("255.255.255.255:4000"),
+      b"all",
+      1000,
+    );
+    let before = udp.send_to[sender](sender, ip::read_socket("239.1.2.3:4000"), b"early", 1000);
+    let joined = udp.set_option[member](member, net::JoinGroup(group, None));
+    let twice = udp.set_option[member](member, net::JoinGroup(group, None));
+    let _during = udp.send_to[sender](sender, ip::read_socket("239.1.2.3:4000"), b"news", 1000);
+    let heard = payload_of(udp.recv_from[member](member, 64, 1000));
+    let left = udp.set_option[member](member, net::LeaveGroup(group, None));
+    let again = udp.set_option[member](member, net::LeaveGroup(group, None));
+    let _after = udp.send_to[sender](sender, ip::read_socket("239.1.2.3:4000"), b"late", 1000);
+    {
+      barred: barred,
+      allowed: allowed,
+      shouted: shouted,
+      before: before,
+      joined: joined,
+      twice: twice,
+      heard: heard,
+      left: left,
+      again: again,
+      quiet: payload_of(udp.recv_from[member](member, 64, 1000)),
+      options: udp.options[sender](sender),
+    }
+  });
+  assert_eq(ran.value.barred, Err(PermissionDenied));
+  assert_eq(ran.value.allowed, Ok(()));
+  assert_eq(ran.value.shouted, Ok(3));
+  assert_eq(ran.value.before, Ok(5));
+  assert_eq(ran.value.joined, Ok(()));
+  assert_eq(ran.value.twice, Err(AddressInUse));
+  assert_eq(ran.value.heard, Ok(b"news"));
+  assert_eq(ran.value.left, Ok(()));
+  assert_eq(ran.value.again, Err(Other(0, "that group was not joined")));
+  assert_eq(ran.value.quiet, Err(TimedOut));
+  assert_eq(ran.value.options, [net::Broadcast(true)])
+}
+
+test "each datagram meets the fate written down for it" {
+  let ran = on_mem(mem_fated(mem_empty(), [Delivered, Dropped, Duplicated, Overtaking]), || {
+    let server = opened[server]("127.0.0.1:7");
+    let client = opened[client]("127.0.0.1:0");
+    let _sent = map([b"one", b"two", b"three", b"four", b"five"], |payload: Bytes|
+      udp.send_to[client](client, ip::read_socket("127.0.0.1:7"), payload, 1000));
+    map(range(0, 6), |_i: Int| payload_of(udp.recv_from[server](server, 64, 1000)))
+  });
+  assert_eq(ran.value, [
+    Ok(b"four"),
+    Ok(b"one"),
+    Ok(b"three"),
+    Ok(b"three"),
+    Ok(b"five"),
+    Err(TimedOut),
+  ]);
+  assert_eq(ran.udp.met, [Delivered, Dropped, Duplicated, Overtaking, Delivered])
+}
+
+/// A far end that answers a question with its bytes reversed, under the question's first byte.
+fn mirror(question: Bytes) -> List<Bytes> / {abort.raise} =
+  if bytes_len(question) == 0 { [] } else {
+    [
+      fold(range(1, bytes_len(question)), bytes_slice(question, 0, 1), |answer: Bytes, i: Int|
+        bytes_concat(
+          answer,
+          bytes_slice(question, bytes_len(question) - i, bytes_len(question) - i + 1),
+        )),
+    ]
+  }
+
+/// The answer to `question` from `server`, asked up to `attempts` times: an answer is one that
+/// carries the question's first byte, so an answer to an earlier question, late or doubled, is
+/// passed over.
+fn asked<[l]>(
+  socket: Int,
+  server: SocketAddress,
+  question: Bytes,
+  attempts: Int,
+) -> Option<Bytes> / {udp.send_to[l], udp.recv_from[l], abort.raise} =
+  iterate(0, attempts + 1, |attempt: Int|
+    if attempt >= attempts { Stop(None) } else {
+      let _sent = udp.send_to[l](socket, server, question, 250);
+      match answer_to[l](socket, question, 8) {
+        Some(answer) -> Stop(Some(answer)),
+        None -> Continue(attempt + 1),
+      }
+    })
+
+/// The first datagram waiting that answers `question`, of at most `most` read.
+fn answer_to<[l]>(
+  socket: Int,
+  question: Bytes,
+  most: Int,
+) -> Option<Bytes> / {udp.recv_from[l], abort.raise} =
+  iterate(0, most + 1, |read: Int|
+    if read >= most { Stop(None) } else {
+      match udp.recv_from[l](socket, 512, 250) {
+        Err(_) -> Stop(None),
+        Ok(d) -> if bytes_slice(d.payload, 0, 1) == bytes_slice(question, 0, 1) {
+          Stop(Some(d.payload))
+        } else { Continue(read + 1) },
+      }
+    })
+
+test "a request retried is answered whatever a network that drops, doubles and reorders does" {
+  simulate {
+    let server = ip::read_socket("192.0.2.53:53");
+    let lossy = mem_lossy(mem_answering(mem_empty(), server, mirror), sim.seed(), {
+      drop: 30,
+      duplicate: 20,
+      reorder: 20,
+    });
+    let ran = on_mem(lossy, || {
+      let socket = opened[resolver]("0.0.0.0:0");
+      map([b"1abc", b"2xyz", b"3pqr"], |question: Bytes|
+        asked[resolver](socket, server, question, 40))
+    });
+    assert_eq(ran.value, [Some(b"1cba"), Some(b"2zyx"), Some(b"3rqp")]);
+    assert(len(ran.udp.met) >= 6)
+  }
+}
+
+test "a request that is never answered gives up after its attempts" {
+  let ran = on_mem(
+    mem_fated(mem_answering(mem_empty(), ip::read_socket("192.0.2.53:53"), mirror), [
+      Dropped,
+      Dropped,
+      Dropped,
+    ]),
+    || {
+      let socket = opened[resolver]("0.0.0.0:0");
+      asked[resolver](socket, ip::read_socket("192.0.2.53:53"), b"1abc", 3)
+    },
+  );
+  assert_eq(ran.value, None);
+  assert_eq(ran.udp.met, [Dropped, Dropped, Dropped])
+}
+
+test "the twin refuses what the host refuses, in its words" {
+  let late: Result<Result<Datagram, Refusal>, String> = try[abort.raise] {
+    on_mem(mem_empty(), || udp.recv_from[a](opened[a]("127.0.0.1:0"), 64, 0)).value
+  };
+  assert_eq(late, Err("`udp.recv_from` was given a timeout of 0 milliseconds"));
+  let unconnected: Result<Result<Int, Refusal>, String> = try[abort.raise] {
+    on_mem(mem_empty(), || udp.send[a](opened[a]("127.0.0.1:0"), b"x", 1000)).value
+  };
+  assert_eq(unconnected, Err("`udp.send` was given a socket with no far end"));
+  let closed: Result<Option<SocketAddress>, String> = try[abort.raise] {
+    on_mem(mem_empty(), || {
+      let socket = opened[a]("127.0.0.1:0");
+      udp.close[a](socket);
+      udp.local_address[a](socket)
+    }).value
+  };
+  assert_eq(closed, Err("there is no open socket with handle 1"))
+}

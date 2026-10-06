@@ -265,18 +265,18 @@ pub fn build_by_own(
     landed(&fresh, out).map(|_| ())
 }
 
-/// What the front end and the emitter make of `files`, one package of `(path, text)` held in
+/// What the front end and the emitter make of `files`, one package of `(path, contents)` held in
 /// memory: the runnable the builder writes of it, a refusal's diagnostics and no unit included.
 /// Kept under the stage by what it is a function of, so a second asking reads it back.
-pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
+pub fn answered<T: AsRef<[u8]>>(files: &[(String, T)]) -> Result<Vec<u8>, Diagnostic> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ply answered 1\0");
     hasher.update(identity().as_bytes());
-    for (path, text) in files {
+    for (path, contents) in files {
         hasher.update(&[0]);
         hasher.update(path.as_bytes());
         hasher.update(&[0]);
-        hasher.update(text.as_bytes());
+        hasher.update(contents.as_ref());
     }
     let key = hasher.finalize().to_hex()[..32].to_string();
     let at = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.run"));
@@ -287,12 +287,12 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
         return Ok(bytes);
     }
     let src = stage::stage_dir(sweep::ANSWERED).join(format!("{key}.src.{}", aside()));
-    let written = files.iter().try_for_each(|(path, text)| {
+    let written = files.iter().try_for_each(|(path, contents)| {
         let file = src.join(path);
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(file, text)
+        std::fs::write(file, contents)
     });
     written.map_err(|e| {
         unbuilt(format!(
@@ -309,7 +309,7 @@ pub fn answered(files: &[(String, String)]) -> Result<Vec<u8>, Diagnostic> {
 }
 
 /// [`answered`] read back: the front end's answer, a refusal's included, and the unit's C.
-pub fn answered_program(files: &[(String, String)]) -> Result<Runnable, Diagnostic> {
+pub fn answered_program<T: AsRef<[u8]>>(files: &[(String, T)]) -> Result<Runnable, Diagnostic> {
     let bytes = answered(files)?;
     runnable::decode(&bytes)
         .map_err(|why| unbuilt(format!("what it answered does not read: {why}")))
@@ -317,7 +317,7 @@ pub fn answered_program(files: &[(String, String)]) -> Result<Runnable, Diagnost
 
 /// [`answered_program`] of a program that has to check: one the front end refused is the first
 /// error it was refused with, the rest as its notes.
-pub fn checked_program(files: &[(String, String)]) -> Result<Runnable, Diagnostic> {
+pub fn checked_program<T: AsRef<[u8]>>(files: &[(String, T)]) -> Result<Runnable, Diagnostic> {
     let program = answered_program(files)?;
     let mut errors = program
         .front
