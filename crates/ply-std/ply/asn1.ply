@@ -16,6 +16,10 @@
 //! BER, the looser encoding DER is a subset of, is refused, and some files called DER are BER: a
 //! PKCS #7 or PKCS #12 bundle from an older tool uses indefinite lengths.
 //!
+//! A time is an instant, `std.date`'s `OffsetDateTime`. DER writes one as UTC reads it and no
+//! other way, so a reader answers it at UTC and a builder writes the instant it is given,
+//! whatever offset that is held at. A `UTCTime`'s two-digit year is one of 1950 to 2049.
+//!
 //! The cursor is a `Reader`, a window onto the bytes. A read takes the element at its front and
 //! answers its value with the reader after it, so a parser threads one through a `SEQUENCE`'s
 //! fields; `read_sequence` answers a reader over the content, and `within` runs a parser on one and
@@ -33,12 +37,15 @@ import std.bigint
 import std.bigint (BigInt)
 import std.bytes (bytes_of_hex, hex_of, is_digit, repeat, scan, strip_leading_zeros, u16_be, u32_be,
                   u64_be, xor_byte)
+import std.date
+import std.date (DateTime, OffsetDateTime)
 import std.laws (agrees, round_trip)
-import std.list (concat, is_sorted, sort)
+import std.list (all, concat, is_sorted, sort)
 import std.oid
 import std.oid (Oid)
 import std.result (result_ok)
 import std.string (pad_left)
+import std.timestamp
 
 // --- Tags -----------------------------------------------------------------------
 
@@ -100,18 +107,6 @@ pub type StringKind =
 /// `unused` is 0 to 7, zero where there are no octets, and the bits it leaves out are zero.
 pub type Bits = new { unused: Int, bytes: Bytes }
 
-/// A time of day on a date, in UTC. A `UTCTime` holds the years 1950 to 2049 and no fraction of a
-/// second; a `GeneralizedTime` holds the years 0 to 9999.
-pub type Time = new {
-  year: Int,
-  month: Int,
-  day: Int,
-  hour: Int,
-  minute: Int,
-  second: Int,
-  nanosecond: Int,
-}
-
 /// A document, or one element of it.
 pub type Value =
   | Boolean(Bool)
@@ -126,8 +121,10 @@ pub type Value =
   | ObjectId(Oid)
   /// A string of one of the checked types.
   | Text(StringKind, String)
-  | UtcTime(Time)
-  | GeneralizedTime(Time)
+  /// A `UTCTime`: an instant of the years 1950 to 2049, to the second, at UTC.
+  | UtcTime(OffsetDateTime)
+  /// A `GeneralizedTime`: an instant of the years 0 to 9999, to the nanosecond, at UTC.
+  | GeneralizedTime(OffsetDateTime)
   | Sequence(List<Value>)
   /// A `SET OF`: its members in the order of their encodings.
   | Set(List<Value>)
@@ -182,7 +179,8 @@ pub type Why =
   | LongArc
   /// A string holding what its type does not: the kind, and for a reader the offset of the octet.
   | BadText(StringKind)
-  /// A time not in the one form DER writes it, or naming no real date or time of day.
+  /// A time not in the one form DER writes it or naming no real date or time of day, an instant
+  /// its type has no place for, or in a tree one that is not at UTC.
   | BadTime
   /// A `GeneralizedTime` where X.509 writes a `UTCTime`: a year from 1950 to 2049.
   | TimeChoice
@@ -271,47 +269,37 @@ pub fn bits_valid(b: Bits) -> Bool / {abort.raise} =
 pub fn bit_at(b: Bits, i: Int) -> Bool / {abort.raise} =
   i >= 0 && i < 8 * bytes_len(b.bytes) - b.unused && bytes_at(b.bytes, i / 8) & 0x80 >> i % 8 != 0
 
-/// Whether `t` names a real date and time of day in the years 0 to 9999. No second is a leap
-/// second.
-pub fn time_valid(t: Time) -> Bool =
-  t.year >= 0 && t.year <= 9999 && t.month >= 1 && t.month <= 12 && t.day >= 1
-    && t.day <= days_in(t.year, t.month)
-    && t.hour >= 0
-    && t.hour <= 23
-    && t.minute >= 0
-    && t.minute <= 59
-    && t.second >= 0
-    && t.second <= 59
-    && t.nanosecond >= 0
-    && t.nanosecond <= 999999999
+/// What UTC's clock read at the instant `t`, which is what DER writes of it.
+fn at_utc(t: OffsetDateTime) -> DateTime = date::local(date::in_utc(t))
 
-fn days_in(year: Int, month: Int) -> Int =
-  if month == 2 { if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 29 } else { 28 } }
-  else if month == 4 || month == 6 || month == 9 || month == 11 { 30 }
-  else { 31 }
+/// The year UTC's clock read at `t`.
+fn year_of(t: OffsetDateTime) -> Int = date::year(date::date_of(at_utc(t)))
 
-/// The text of the `UTCTime` `t`, `YYMMDDHHMMSSZ`; `None` where it has none: a year outside 1950
-/// to 2049, a fraction of a second, or no real time.
-pub fn utc_time_text(t: Time) -> Option<String> =
-  if time_valid(t) && t.year >= 1950 && t.year <= 2049 && t.nanosecond == 0 {
-    Some(two(t.year % 100) ++ clock_text(t) ++ "Z")
+/// The fraction of its second `t` falls at, in nanoseconds.
+fn nanosecond_of(t: OffsetDateTime) -> Int = date::nanosecond(date::time_of(at_utc(t)))
+
+/// The text of the `UTCTime` of the instant `t`, `YYMMDDHHMMSSZ` as UTC reads it; `None` where it
+/// has none: a year outside 1950 to 2049, or a fraction of a second.
+pub fn utc_time_text(t: OffsetDateTime) -> Option<String> =
+  if year_of(t) >= 1950 && year_of(t) <= 2049 && nanosecond_of(t) == 0 {
+    Some(two(year_of(t) % 100) ++ clock_text(at_utc(t)) ++ "Z")
   } else { None }
 
-/// The text of the `GeneralizedTime` `t`, `YYYYMMDDHHMMSSZ` with the fraction of its second
-/// before the `Z` where it has one; `None` for no real time.
-pub fn generalized_time_text(t: Time) -> Option<String> =
-  if time_valid(t) {
-    Some(
-      pad_left(int_to_string(t.year), 4, "0") ++ clock_text(t)
-        ++ (if t.nanosecond == 0 { "" } else { "." ++ significant(t.nanosecond, 9) })
-        ++ "Z",
-    )
-  } else { None }
+/// The text of the `GeneralizedTime` of the instant `t`, `YYYYMMDDHHMMSSZ` as UTC reads it, with
+/// the fraction of its second before the `Z` where it has one.
+pub fn generalized_time_text(t: OffsetDateTime) -> String =
+  pad_left(int_to_string(year_of(t)), 4, "0") ++ clock_text(at_utc(t))
+    ++ (if nanosecond_of(t) == 0 { "" } else { "." ++ significant(nanosecond_of(t), 9) })
+    ++ "Z"
 
 fn two(n: Int) -> String = pad_left(int_to_string(n), 2, "0")
 
-fn clock_text(t: Time) -> String =
-  two(t.month) ++ two(t.day) ++ two(t.hour) ++ two(t.minute) ++ two(t.second)
+fn clock_text(at: DateTime) -> String = {
+  let day = date::parts(date::date_of(at));
+  let time = date::time_of(at);
+  two(day.month) ++ two(day.day) ++ two(date::hour(time)) ++ two(date::minute(time))
+    ++ two(date::second(time))
+}
 
 /// `n` in `digits` digits, less its trailing zeros.
 fn significant(n: Int, digits: Int) -> String =
@@ -417,26 +405,24 @@ pub fn string(kind: StringKind, text: String) -> Bytes / {asn1.unwritable, abort
     },
   })
 
-/// A `UTCTime`. Raises `BadTime` where `utc_time_text` answers `None`.
-pub fn utc_time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
+/// A `UTCTime` of the instant `t`, whatever offset it is held at. Raises `BadTime` where
+/// `utc_time_text` answers `None`.
+pub fn utc_time(t: OffsetDateTime) -> Bytes / {asn1.unwritable, abort.raise} =
   match utc_time_text(t) {
     Some(text) -> element(0x17, bytes_of_string(text)),
     None -> asn1.unwritable(BadTime),
   }
 
-/// A `GeneralizedTime`. Raises `BadTime` where `generalized_time_text` answers `None`.
-pub fn generalized_time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
-  match generalized_time_text(t) {
-    Some(text) -> element(0x18, bytes_of_string(text)),
-    None -> asn1.unwritable(BadTime),
-  }
+/// A `GeneralizedTime` of the instant `t`, whatever offset it is held at.
+pub fn generalized_time(t: OffsetDateTime) -> Bytes / {abort.raise} =
+  element(0x18, bytes_of_string(generalized_time_text(t)))
 
-/// The `Time` of an X.509 certificate: a `UTCTime` for the years 1950 to 2049 and a
-/// `GeneralizedTime` for any other. Raises `BadTime` for a fraction of a second, which it has no
-/// place for, and for no real time.
-pub fn time(t: Time) -> Bytes / {asn1.unwritable, abort.raise} =
-  if t.nanosecond != 0 { asn1.unwritable(BadTime) }
-  else if t.year >= 1950 && t.year <= 2049 { utc_time(t) }
+/// The `Time` of an X.509 certificate, of the instant `t`: a `UTCTime` where UTC reads it in the
+/// years 1950 to 2049 and a `GeneralizedTime` in any other, as RFC 5280 has it. Raises `BadTime`
+/// for a fraction of a second, which it has no place for.
+pub fn time(t: OffsetDateTime) -> Bytes / {asn1.unwritable, abort.raise} =
+  if nanosecond_of(t) != 0 { asn1.unwritable(BadTime) }
+  else if year_of(t) >= 1950 && year_of(t) <= 2049 { utc_time(t) }
   else { generalized_time(t) }
 
 /// A `SEQUENCE` of the encoded elements `parts`, in order.
@@ -703,26 +689,27 @@ fn digits_at(content: Bytes, from: Int, n: Int) -> Option<Int> / {abort.raise} =
       _ -> None,
     })
 
-/// The time of `year` and the five two-digit fields at `from`, where they are a real one.
-fn moment(year: Int, content: Bytes, from: Int, nanosecond: Int) -> Option<Time> / {abort.raise} =
+/// The instant UTC reads as `year` and the five two-digit fields at `from`, where they are a
+/// real date and time of day. No second is a leap second.
+fn moment(
+  year: Int,
+  content: Bytes,
+  from: Int,
+  nanosecond: Int,
+) -> Option<OffsetDateTime> / {abort.raise} =
   match map(range(0, 5), |i: Int| digits_at(content, from + 2 * i, 2)) {
-    [Some(month), Some(day), Some(hour), Some(minute), Some(second)] -> {
-      let t: Time = {
-        year: year,
-        month: month,
-        day: day,
-        hour: hour,
-        minute: minute,
-        second: second,
-        nanosecond: nanosecond,
-      };
-      if time_valid(t) { Some(t) } else { None }
+    [Some(month), Some(day), Some(hour), Some(minute), Some(second)] -> match ((
+        date::of(year, month, day),
+        date::time(hour, minute, second, nanosecond),
+      )) {
+      (Some(on), Some(clock)) -> Some(date::utc(date::at(on, clock))),
+      _ -> None,
     },
     _ -> None,
   }
 
-/// A two-digit year is in 1950 to 2049, as X.509 reads one.
-fn utc_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.raise} = {
+/// A two-digit year is in 1950 to 2049, as RFC 5280 reads one.
+fn utc_time_of(content: Bytes, at: Int) -> OffsetDateTime / {asn1.refused, abort.raise} = {
   let read = if bytes_len(content) != 13 || bytes_at(content, 12) != 0x5A { None } else {
     match digits_at(content, 0, 2) {
       Some(year) -> moment(if year >= 50 { 1900 + year } else { 2000 + year }, content, 2, 0),
@@ -732,7 +719,7 @@ fn utc_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.raise} = 
   match read { Some(t) -> t, None -> refuse(at, BadTime) }
 }
 
-fn generalized_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.raise} = {
+fn generalized_time_of(content: Bytes, at: Int) -> OffsetDateTime / {asn1.refused, abort.raise} = {
   let z = bytes_len(content) - 1;
   if z < 14 || bytes_at(content, z) != 0x5A { refuse(at, BadTime) } else {
     let nanosecond = if z == 14 { 0 } else { fraction_of(content, at, z) };
@@ -745,7 +732,7 @@ fn generalized_time_of(content: Bytes, at: Int) -> Time / {asn1.refused, abort.r
 }
 
 /// The nanoseconds a fraction between the seconds and the `Z` at `z` names: a `.`, then digits
-/// that do not end in a zero, of which a `Time` holds nine.
+/// that do not end in a zero, of which an instant holds nine.
 fn fraction_of(content: Bytes, at: Int, z: Int) -> Int / {asn1.refused, abort.raise} =
   if bytes_at(content, 14) != 0x2E || z < 16 || scan(content, 15, b"0123456789") < z
       || bytes_at(content, z - 1) == 0x30 { refuse(at, BadTime) }
@@ -846,23 +833,23 @@ pub fn read_oid(r: Reader) -> Read<Oid> / {asn1.refused, abort.raise} = leaf(r, 
 pub fn read_string(r: Reader, kind: StringKind) -> Read<String> / {asn1.refused, abort.raise} =
   leaf(r, string_number(kind), |content: Bytes, at: Int| text_of(kind, content, at))
 
-/// A `UTCTime`.
-pub fn read_utc_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+/// A `UTCTime`: the instant it names, at UTC, its two-digit year read in 1950 to 2049.
+pub fn read_utc_time(r: Reader) -> Read<OffsetDateTime> / {asn1.refused, abort.raise} =
   leaf(r, 23, utc_time_of)
 
-/// A `GeneralizedTime`.
-pub fn read_generalized_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+/// A `GeneralizedTime`: the instant it names, at UTC.
+pub fn read_generalized_time(r: Reader) -> Read<OffsetDateTime> / {asn1.refused, abort.raise} =
   leaf(r, 24, generalized_time_of)
 
 /// The `Time` of an X.509 certificate: a `UTCTime`, or for a year outside 1950 to 2049 a
 /// `GeneralizedTime` without a fraction of a second. `TimeChoice` for a `GeneralizedTime` X.509
 /// writes the other way.
-pub fn read_time(r: Reader) -> Read<Time> / {asn1.refused, abort.raise} =
+pub fn read_time(r: Reader) -> Read<OffsetDateTime> / {asn1.refused, abort.raise} =
   if peek(r) != Some(universal(24)) { read_utc_time(r) } else {
     let read = read_generalized_time(r);
-    if (read.value.year >= 1950 && read.value.year <= 2049) || read.value.nanosecond != 0 {
-      refuse(r.at, TimeChoice)
-    } else { read }
+    if (year_of(read.value) >= 1950 && year_of(read.value) <= 2049)
+        || nanosecond_of(read.value) != 0 { refuse(r.at, TimeChoice) }
+    else { read }
   }
 
 /// The content of a primitive element of `tag`, whatever it holds.
@@ -1132,8 +1119,9 @@ pub fn write(v: Value) -> Bytes / {asn1.unwritable, abort.raise} =
     Null -> null(),
     ObjectId(o) -> oid(o),
     Text(kind, text) -> string(kind, text),
-    UtcTime(t) -> utc_time(t),
-    GeneralizedTime(t) -> generalized_time(t),
+    UtcTime(t) -> if date::offset_minutes(t) == 0 { utc_time(t) } else { asn1.unwritable(BadTime) },
+    GeneralizedTime(t) -> if date::offset_minutes(t) == 0 { generalized_time(t) }
+    else { asn1.unwritable(BadTime) },
     Sequence(held) -> sequence(map(held, write)),
     Set(held) -> {
       let parts = map(held, write);
@@ -1159,7 +1147,25 @@ fn height(v: Value) -> Int =
     _ -> 0,
   }
 
-fn writable(v: Value) -> Bool / {abort.raise} = match encode(v) { Ok(_) -> true, Err(_) -> false }
+/// Whether `t` is a day and a time of day `std.date` makes, which a law's draw of its
+/// constructors need not be.
+fn in_calendar(t: OffsetDateTime) -> Bool =
+  match t {
+    OffsetDateTime(DateTime(on, clock), _) ->
+      date::of_unix_days(date::unix_days(on)) == Some(on)
+        && date::time_of_nanos(date::nanos_of_day(clock)) == Some(clock),
+  }
+
+/// Whether every time in `v` is in the calendar.
+fn made(v: Value) -> Bool =
+  match v {
+    UtcTime(t) | GeneralizedTime(t) -> in_calendar(t),
+    Sequence(held) | Set(held) | Constructed(_, held) -> all(held, made),
+    _ -> true,
+  }
+
+fn writable(v: Value) -> Bool / {abort.raise} =
+  made(v) && (match encode(v) { Ok(_) -> true, Err(_) -> false })
 
 /// Whether `data` is refused, or read as a value that writes back as exactly `data`.
 fn rewritten(data: Bytes) -> Bool / {abort.raise} =
@@ -1203,6 +1209,54 @@ law "what the builders write is one value's encoding"
       explicit(context(n & 1023), null()),
     ]);
     match decode(der, 2) { Ok(v) -> encode(v) == Ok(der), Err(_) -> false }
+  }
+
+/// An instant a law draws, at UTC: `days` brought round into the `span` days from the day `first`,
+/// and `nanos` nanoseconds into that day, brought round into it.
+fn drawn(first: Int, span: Int, days: Int, nanos: Int) -> Option<OffsetDateTime> / {abort.raise} =
+  match ((
+      date::of_unix_days(first + (days % span + span) % span),
+      date::time_of_nanos((nanos % 86400000000000 + 86400000000000) % 86400000000000),
+    )) {
+    (Some(on), Some(clock)) -> Some(date::utc(date::at(on, clock))),
+    _ -> None,
+  }
+
+/// Any instant of the calendar's ten thousand years.
+fn any_instant(days: Int, nanos: Int) -> Option<OffsetDateTime> / {abort.raise} =
+  drawn(date::unix_days(date::earliest()), 3652425, days, nanos)
+
+law "an instant reads back from its GeneralizedTime, which is written as UTC reads it"
+  forall (days: Int, nanos: Int, minutes: Int) {
+    match any_instant(days, nanos) {
+      Some(t) ->
+        decode_with(generalized_time(t), 0, read_generalized_time) == Ok(t)
+          && (match date::in_offset(t, minutes % 1440) {
+            Some(held) -> generalized_time(held) == generalized_time(t),
+            None -> true,
+          }),
+      None -> false,
+    }
+  }
+
+law "a second of 1950 to 2049 reads back from its UTCTime, which a certificate writes of it"
+  forall (days: Int, second: Int) {
+    match drawn(-7305, 36525, days, second % 86400 * 1000000000) {
+      Some(t) ->
+        decode_with(utc_time(t), 0, read_utc_time) == Ok(t) && time(t) == utc_time(t)
+          && decode_with(time(t), 0, read_time) == Ok(t),
+      None -> false,
+    }
+  }
+
+law "a certificate's time is its second's UTCTime where it has one, and reads back either way"
+  forall (days: Int, second: Int) {
+    match any_instant(days, second % 86400 * 1000000000) {
+      Some(t) ->
+        decode_with(time(t), 0, read_time) == Ok(t)
+          && time(t) == (if utc_time_text(t) == None { generalized_time(t) } else { utc_time(t) }),
+      None -> false,
+    }
   }
 
 law "an Int reads back from the INTEGER written for it" =
@@ -1280,57 +1334,33 @@ fn vectors() -> List<Vector> / {abort.raise} =
     vector("a VisibleString", b"\x1a\x03a~ ", Text(VisibleString, "a~ ")),
     vector("a UniversalString", bytes_of_hex("1c040001f600"), Text(UniversalString, "\u{1F600}")),
     vector("a BMPString", bytes_of_hex("1e0203c0"), Text(BmpString, "\u{3c0}")),
-    vector(
-      "a UTCTime",
-      b"\x17\x0d191216030210Z",
-      UtcTime({ year: 2019, month: 12, day: 16, hour: 3, minute: 2, second: 10, nanosecond: 0 }),
-    ),
-    vector(
-      "a UTCTime of 1950",
-      b"\x17\x0d500101000000Z",
-      UtcTime({ year: 1950, month: 1, day: 1, hour: 0, minute: 0, second: 0, nanosecond: 0 }),
-    ),
+    vector("a UTCTime", b"\x17\x0d191216030210Z", UtcTime(timestamp"2019-12-16T03:02:10Z")),
+    vector("a UTCTime of 1950", b"\x17\x0d500101000000Z", UtcTime(timestamp"1950-01-01T00:00:00Z")),
+    vector("a UTCTime of 2049", b"\x17\x0d491231235959Z", UtcTime(timestamp"2049-12-31T23:59:59Z")),
     vector(
       "a GeneralizedTime",
       b"\x18\x0f20200229235959Z",
-      GeneralizedTime({
-        year: 2020,
-        month: 2,
-        day: 29,
-        hour: 23,
-        minute: 59,
-        second: 59,
-        nanosecond: 0,
-      }),
+      GeneralizedTime(timestamp"2020-02-29T23:59:59Z"),
+    ),
+    vector(
+      "a GeneralizedTime on the leap day of a century",
+      b"\x18\x0f20000229000000Z",
+      GeneralizedTime(timestamp"2000-02-29T00:00:00Z"),
     ),
     vector(
       "a GeneralizedTime with a fraction of its second",
       b"\x18\x1320191216030210.025Z",
-      GeneralizedTime({
-        year: 2019,
-        month: 12,
-        day: 16,
-        hour: 3,
-        minute: 2,
-        second: 10,
-        nanosecond: 25000000,
-      }),
+      GeneralizedTime(timestamp"2019-12-16T03:02:10.025Z"),
     ),
     vector(
       "a GeneralizedTime to the nanosecond",
       b"\x18\x1999991231235959.999999999Z",
-      GeneralizedTime({
-        ..day(9999, 12, 31),
-        hour: 23,
-        minute: 59,
-        second: 59,
-        nanosecond: 999999999,
-      }),
+      GeneralizedTime(timestamp"9999-12-31T23:59:59.999999999Z"),
     ),
     vector(
       "a GeneralizedTime of the year 0",
       b"\x18\x0f00000101000000Z",
-      GeneralizedTime(day(0, 1, 1)),
+      GeneralizedTime(timestamp"0000-01-01T00:00:00Z"),
     ),
     vector(
       "a SEQUENCE",
@@ -1487,6 +1517,8 @@ fn refusals() -> List<Refused> / {abort.raise} =
     refused("a UTCTime without its seconds", b"\x17\x0b1912160302Z", 2, BadTime),
     refused("a UTCTime with an offset for its Z", b"\x17\x11191216030210+0000", 2, BadTime),
     refused("a UTCTime on the 30th of February", b"\x17\x0d190230000000Z", 2, BadTime),
+    refused("a UTCTime on the 29th of February in 2023", b"\x17\x0d230229000000Z", 2, BadTime),
+    refused("a UTCTime in a month before the first", b"\x17\x0d230001000000Z", 2, BadTime),
     refused("a UTCTime at sixty seconds", b"\x17\x0d191216030260Z", 2, BadTime),
     refused("a UTCTime with a letter in it", b"\x17\x0d1912160302x0Z", 2, BadTime),
     refused("a GeneralizedTime without its Z", b"\x18\x0e20191216030210", 2, BadTime),
@@ -1504,6 +1536,9 @@ fn refusals() -> List<Refused> / {abort.raise} =
       2,
       BadTime,
     ),
+    refused("a GeneralizedTime in a thirteenth month", b"\x18\x0f20231301000000Z", 2, BadTime),
+    refused("a GeneralizedTime on the 31st of April", b"\x18\x0f20230431000000Z", 2, BadTime),
+    refused("a GeneralizedTime on a day before the first", b"\x18\x0f20230100000000Z", 2, BadTime),
     refused("a GeneralizedTime with a fraction of zero", b"\x18\x1120191216030210.0Z", 2, BadTime),
     refused(
       "a GeneralizedTime with a fraction ending in zero",
@@ -1842,47 +1877,82 @@ test "a string holds its type's characters, and a writer refuses one it does not
   assert_eq(try { string(BmpString, "\u{ffff}") }, Ok(bytes_of_hex("1e02ffff")))
 }
 
-fn day(year: Int, month: Int, day: Int) -> Time =
-  { year: year, month: month, day: day, hour: 0, minute: 0, second: 0, nanosecond: 0 }
-
 test "a time is written in the one form DER has, and a certificate's by its year" {
-  let t: Time = { year: 2019, month: 12, day: 16, hour: 3, minute: 2, second: 10, nanosecond: 0 };
+  let t = timestamp"2019-12-16T03:02:10Z";
   assert_eq(utc_time_text(t), Some("191216030210Z"));
-  assert_eq(generalized_time_text(t), Some("20191216030210Z"));
-  assert_eq(generalized_time_text({ ..t, nanosecond: 500000000 }), Some("20191216030210.5Z"));
-  assert_eq(generalized_time_text({ ..t, nanosecond: 1 }), Some("20191216030210.000000001Z"));
-  assert_eq(generalized_time_text({ ..t, year: 33 }), Some("00331216030210Z"));
-  assert_eq(utc_time_text({ ..t, nanosecond: 1 }), None);
-  assert_eq(utc_time_text(day(1949, 12, 31)), None);
-  assert_eq(utc_time_text(day(2050, 1, 1)), None);
-  assert_eq(utc_time_text(day(2049, 12, 31)), Some("491231000000Z"));
-  assert_eq(utc_time_text(day(1950, 1, 1)), Some("500101000000Z"));
-  assert(time_valid(day(2000, 2, 29)) && time_valid(day(2024, 2, 29)));
-  assert(!time_valid(day(1900, 2, 29)) && !time_valid(day(2023, 2, 29)));
-  let days = |year: Int|
-    map(range(1, 13), |month: Int|
-      len(filter(range(0, 40), |date: Int| time_valid(day(year, month, date)))));
-  assert_eq(days(2023), [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
-  assert_eq(days(2024), [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
-  assert(!time_valid(day(2023, 4, 31)) && !time_valid(day(2023, 13, 1)));
-  assert(!time_valid(day(2023, 1, 0)) && !time_valid(day(10000, 1, 1)));
-  assert(!time_valid({ ..t, hour: 24 }) && !time_valid({ ..t, second: 60 }));
-  assert(!time_valid({ ..t, minute: 60 }) && !time_valid({ ..t, nanosecond: 1000000000 }));
-  assert(!time_valid({ ..t, month: 0 }) && !time_valid({ ..t, year: 0 - 1 }));
-  assert_eq(try { generalized_time(day(2023, 2, 29)) }, Err(BadTime));
-  assert_eq(try { utc_time(day(2050, 1, 1)) }, Err(BadTime));
-  assert_eq(try { time(day(2049, 12, 31)) }, Ok(b"\x17\x0d491231000000Z"));
-  assert_eq(try { time(day(1950, 1, 1)) }, Ok(b"\x17\x0d500101000000Z"));
-  assert_eq(try { time(day(2050, 1, 1)) }, Ok(b"\x18\x0f20500101000000Z"));
-  assert_eq(try { time(day(1949, 12, 31)) }, Ok(b"\x18\x0f19491231000000Z"));
-  assert_eq(try { time({ ..t, nanosecond: 5 }) }, Err(BadTime));
-  assert_eq(decode_with(b"\x17\x0d491231000000Z", 0, read_time), Ok(day(2049, 12, 31)));
-  assert_eq(decode_with(b"\x18\x0f20500101000000Z", 0, read_time), Ok(day(2050, 1, 1)));
-  assert_eq(decode_with(b"\x18\x0f19491231000000Z", 0, read_time), Ok(day(1949, 12, 31)));
+  assert_eq(generalized_time_text(t), "20191216030210Z");
+  assert_eq(generalized_time_text(timestamp"2019-12-16T03:02:10.5Z"), "20191216030210.5Z");
+  assert_eq(
+    generalized_time_text(timestamp"2019-12-16T03:02:10.000000001Z"),
+    "20191216030210.000000001Z",
+  );
+  assert_eq(generalized_time_text(timestamp"0033-12-16T03:02:10Z"), "00331216030210Z");
+  assert_eq(utc_time_text(timestamp"2019-12-16T03:02:10.000000001Z"), None);
+  assert_eq(utc_time_text(timestamp"1949-12-31T23:59:59Z"), None);
+  assert_eq(utc_time_text(timestamp"2050-01-01T00:00:00Z"), None);
+  assert_eq(utc_time_text(timestamp"2049-12-31T00:00:00Z"), Some("491231000000Z"));
+  assert_eq(utc_time_text(timestamp"1950-01-01T00:00:00Z"), Some("500101000000Z"));
+  assert_eq(try { utc_time(timestamp"2050-01-01T00:00:00Z") }, Err(BadTime));
+  assert_eq(try { time(timestamp"2049-12-31T00:00:00Z") }, Ok(b"\x17\x0d491231000000Z"));
+  assert_eq(try { time(timestamp"1950-01-01T00:00:00Z") }, Ok(b"\x17\x0d500101000000Z"));
+  assert_eq(try { time(timestamp"2050-01-01T00:00:00Z") }, Ok(b"\x18\x0f20500101000000Z"));
+  assert_eq(try { time(timestamp"1949-12-31T00:00:00Z") }, Ok(b"\x18\x0f19491231000000Z"));
+  assert_eq(try { time(timestamp"2019-12-16T03:02:10.000000005Z") }, Err(BadTime));
+  assert_eq(
+    decode_with(b"\x17\x0d491231000000Z", 0, read_time),
+    Ok(timestamp"2049-12-31T00:00:00Z"),
+  );
+  assert_eq(
+    decode_with(b"\x18\x0f20500101000000Z", 0, read_time),
+    Ok(timestamp"2050-01-01T00:00:00Z"),
+  );
+  assert_eq(
+    decode_with(b"\x18\x0f19491231000000Z", 0, read_time),
+    Ok(timestamp"1949-12-31T00:00:00Z"),
+  );
   assert_eq(
     decode_with(b"\x18\x1120191216030210.5Z", 0, read_generalized_time),
-    Ok({ ..t, nanosecond: 500000000 }),
+    Ok(timestamp"2019-12-16T03:02:10.5Z"),
   )
+}
+
+test "a two-digit year is read in 1950 to 2049" {
+  let year = |digits: String|
+    match decode_with(element(0x17, bytes_of_string(digits ++ "0101000000Z")), 0, read_utc_time) {
+      Ok(t) -> date::year(date::date_of(date::local(t))),
+      Err(_) -> 0 - 1,
+    };
+  assert_eq(map(["50", "51", "99", "00", "01", "49"], year), [1950, 1951, 1999, 2000, 2001, 2049])
+}
+
+test "a time is written as UTC reads its instant, and a tree holds one only at UTC" {
+  let held = timestamp"2019-12-16T05:02:10+02:00";
+  assert_eq(utc_time_text(held), Some("191216030210Z"));
+  assert_eq(generalized_time_text(held), "20191216030210Z");
+  assert_eq(try { utc_time(held) }, Ok(b"\x17\x0d191216030210Z"));
+  // The year is UTC's: 2049 at this offset is 2050 there, and 1950 at that one is 1949.
+  let late = timestamp"2049-12-31T23:30:00-01:00";
+  assert_eq(utc_time_text(late), None);
+  assert_eq(try { time(late) }, Ok(b"\x18\x0f20500101003000Z"));
+  assert_eq(try { time(timestamp"1950-01-01T00:30:00+01:00") }, Ok(b"\x18\x0f19491231233000Z"));
+  assert_eq(encode(UtcTime(held)), Err(BadTime));
+  assert_eq(encode(GeneralizedTime(held)), Err(BadTime));
+  assert_eq(encode(UtcTime(timestamp"2050-01-01T00:00:00Z")), Err(BadTime));
+  assert_eq(encode(UtcTime(timestamp"2019-12-16T03:02:10.5Z")), Err(BadTime));
+  assert_eq(encode(GeneralizedTime(date::in_utc(held))), Ok(b"\x18\x0f20191216030210Z"))
+}
+
+test "a time is read only where its date is one the calendar has" {
+  let reads = |year: Int, month: Int, day: Int| {
+    let text = pad_left(int_to_string(year), 4, "0") ++ two(month) ++ two(day) ++ "000000Z";
+    result_ok(decode_with(element(0x18, bytes_of_string(text)), 0, read_generalized_time)) != None
+  };
+  let days = |year: Int|
+    map(range(1, 13), |month: Int| len(filter(range(0, 40), |day: Int| reads(year, month, day))));
+  assert_eq(days(2023), [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
+  assert_eq(days(2024), [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]);
+  assert(reads(2000, 2, 29) && !reads(1900, 2, 29));
+  assert(reads(0, 1, 1) && reads(9999, 12, 31) && !reads(2023, 0, 1) && !reads(2023, 13, 1))
 }
 
 test "bits are counted from the first octet's top, and named bits end at the last one set" {
