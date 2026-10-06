@@ -19,7 +19,10 @@
 //! again searches no part's data twice for its delimiter.
 //!
 //! A part whose own type is `multipart` is a part like any other, its data the nested body's
-//! bytes; `read_tree` follows such parts, as deep as `Limits.max_depth`.
+//! bytes; `read_tree` follows such parts, as deep as `Limits.max_depth`. `spans` answers where a
+//! body's parts lie and reads no header block, and `frame` writes parts whose header blocks are
+//! already bytes: what a reader and a writer of mail, whose fields fold and are kept as written,
+//! are made of.
 //!
 //! `read_form` reads a `multipart/form-data` body (RFC 7578) into its text fields and its files,
 //! and `form_data` writes one. A part's `filename` is data a client chose and never a path:
@@ -196,6 +199,8 @@ pub type Reader = new {
   phase: Phase,
   /// What a refusal adds to an offset: where these bytes start in the body they are a part of.
   origin: Int,
+  /// Whether a part's header block is left unread, as the start of its data.
+  whole: Bool,
 }
 
 /// What `step` found.
@@ -239,6 +244,7 @@ fn reader_at(
         parts: parts,
         phase: Opening(0),
         origin: origin,
+        whole: false,
       },
   }
 }
@@ -339,7 +345,8 @@ fn line_break(r: Reader, seen: Bytes, at: Int) -> Option<Int> / {multipart.refus
 }
 
 fn head(r: Reader, seen: Bytes) -> Step / {multipart.refused, abort.raise} =
-  if r.parts >= r.limits.max_parts { refuse(r, r.at, TooManyParts) } else {
+  if r.parts >= r.limits.max_parts { refuse(r, r.at, TooManyParts) }
+  else if r.whole { data(r, seen, [], r.at, r.at - 1) } else {
     match fields(r, seen, { at: r.at, headers: [] }, bytes_len(seen) - r.at + 2) {
       None -> More(r),
       Some(block) -> data(r, seen, block.headers, block.at, block.at - 1),
@@ -531,6 +538,32 @@ fn finished(r: Reader, body: Bytes) -> Reader / {multipart.refused, abort.raise}
       None -> r,
     }
   }
+
+/// Where one part lies in a body: its bytes at `[from, to)`, header block, blank line and data.
+pub type Span = { from: Int, to: Int }
+
+/// Where the parts of `body` lie, whose `Content-Type` names `boundary`, with no header block
+/// read: for a reader that takes a part's fields itself. Raises `multipart.refused` where
+/// `parse_spans` answers `Err`, as `read` does but for what a header block holds: a delimiter is
+/// looked for from a part's first line on, the limits on a part's header block bound nothing, and
+/// `Limits.max_part_bytes` bounds a part whole.
+pub fn spans(
+  body: Bytes,
+  boundary: String,
+  limits: Limits,
+  lines: Lines = Strict,
+) -> List<Span> / {multipart.refused, abort.raise} = {
+  let r: Reader = { ..reader(boundary, limits, lines), whole: true };
+  map(found_in(r, body).parts, |f: Found| { from: f.from, to: f.to })
+}
+
+/// Where the parts of `body` lie, or where it is refused and why.
+pub fn parse_spans(
+  body: Bytes,
+  boundary: String,
+  limits: Limits,
+  lines: Lines = Strict,
+) -> Result<List<Span>, Refusal> / {abort.raise} = try { spans(body, boundary, limits, lines) }
 
 /// A part of a body, or a part that is a body of parts itself.
 pub type Node =
@@ -886,32 +919,56 @@ fn field_text(r: Reader, e: Entry, fallback: Charset) -> String / {multipart.ref
 /// `Err`: each part after a delimiter line, its header names capitalized as `Content-Type` is, and
 /// the closing delimiter after the last. What `read` reads back as parts made by `part`.
 pub fn write(parts: List<Part>, boundary: String) -> Bytes / {multipart.unwritable, abort.raise} = {
-  let b = bytes_of_string(boundary);
-  let dash = bytes_concat(b"--", b);
-  if bytes_len(b) == 0 || bytes_len(b) > 70 || !fits(b) { multipart.unwritable(UnfitBoundary) }
-  else {
-    bytes_concat_all(
-      push(
-        map(enumerate(parts), |p: { index: Int, value: Part }| written(p.value, p.index, dash)),
-        bytes_concat(dash, b"--\r\n"),
-      ),
-    )
-  }
+  let dash = dashed(boundary);
+  framed(
+    map(enumerate(parts), |p: { index: Int, value: Part }|
+      { head: block(p.value, p.index), data: p.value.data }),
+    dash,
+  )
 }
 
 /// The body of `parts` under `boundary`, or why they have none.
 pub fn build(parts: List<Part>, boundary: String) -> Result<Bytes, Unwritable> / {abort.raise} =
   try { write(parts, boundary) }
 
-fn written(p: Part, index: Int, dash: Bytes) -> Bytes / {multipart.unwritable, abort.raise} = {
-  let block = bytes_concat_all(
+/// A part already written: its header block, each field with its line break and none blank, and
+/// its data.
+pub type Written = { head: Bytes, data: Bytes }
+
+/// The body of `parts` under `boundary`, each part's header block taken as it is written: what
+/// `write` is made of, for a writer that folds and encodes its own fields. Raises
+/// `multipart.unwritable` for a boundary that is unfit or occurs in a part; a header block is
+/// not looked into.
+pub fn frame(
+  parts: List<Written>,
+  boundary: String,
+) -> Bytes / {multipart.unwritable, abort.raise} = framed(parts, dashed(boundary))
+
+/// `--` and the boundary, where it is one a body can be written under.
+fn dashed(boundary: String) -> Bytes / {multipart.unwritable, abort.raise} = {
+  let b = bytes_of_string(boundary);
+  if bytes_len(b) == 0 || bytes_len(b) > 70 || !fits(b) { multipart.unwritable(UnfitBoundary) }
+  else { bytes_concat(b"--", b) }
+}
+
+fn framed(parts: List<Written>, dash: Bytes) -> Bytes / {multipart.unwritable, abort.raise} =
+  bytes_concat_all(
+    push(
+      map(enumerate(parts), |p: { index: Int, value: Written }|
+        if contains(p.value.head, dash) || contains(p.value.data, dash) {
+          multipart.unwritable(BoundaryInPart(p.index))
+        } else { bytes_concat_all([dash, b"\r\n", p.value.head, b"\r\n", p.value.data, b"\r\n"]) }),
+      bytes_concat(dash, b"--\r\n"),
+    ),
+  )
+
+/// A part's header block.
+fn block(p: Part, index: Int) -> Bytes / {multipart.unwritable, abort.raise} =
+  bytes_concat_all(
     map(p.headers, |h: Header|
       if !is_token(h.name) || !is_quotable(h.value) { multipart.unwritable(UnfitHeader(index)) }
       else { bytes_of_string(titled(h.name) ++ ": " ++ h.value ++ "\r\n") }),
-  );
-  if contains(block, dash) || contains(p.data, dash) { multipart.unwritable(BoundaryInPart(index)) }
-  else { bytes_concat_all([dash, b"\r\n", block, b"\r\n", p.data, b"\r\n"]) }
-}
+  )
 
 /// A header's name as it is customarily written: each word between its hyphens capitalized.
 fn titled(name: String) -> String / {abort.raise} =
@@ -1719,7 +1776,11 @@ fn dispositions() -> List<Disposed> =
     { value: "form-data; name=", read: None },
     { value: "form-data; name=\"a\" filename=\"b\"", read: None },
     { value: "form-data; filename*=UTF-8'unclosed", read: None },
-    { value: "form-data; filename*=KOI8-R''%C1", read: None },
+    { value: "form-data; filename*=Big5''%C1", read: None },
+    {
+      value: "form-data; filename*=KOI8-R''%C1",
+      read: Some({ kind: "form-data", name: None, filename: Some("\u{430}") }),
+    },
     { value: "; name=\"a\"", read: None },
     { value: "@form-data; name=\"a\"", read: None },
     { value: "x; name=\"a\"", read: Some({ kind: "x", name: Some("a"), filename: None }) },
@@ -1926,11 +1987,11 @@ fn form_refusals() -> List<Refused> =
     refusal(
       "a field in a charset that is not read",
       one_part(
-        "Content-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain; charset=KOI8-R\r\n",
+        "Content-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain; charset=Big5\r\n",
         b"x",
       ),
       5,
-      BadCharset("koi8-r"),
+      BadCharset("big5"),
     ),
     refusal(
       "a field that is not UTF-8",
@@ -2244,3 +2305,105 @@ test "a reader stops at a limit without reading the bytes past it" {
   assert_eq(stopped.value, Err({ at: 16005, why: TooManyParts }));
   assert(stopped.steps < read.steps + 50)
 }
+
+type Spanned = { what: String, body: Bytes, lines: Lines, parts: List<Bytes> }
+
+fn spanned() -> List<Spanned> =
+  [
+    {
+      what: "a header block and its data",
+      body: b"pre\r\n--b\r\nA: 1\r\n\r\ndata\r\n--b--\r\npost",
+      lines: Strict,
+      parts: [b"A: 1\r\n\r\ndata"],
+    },
+    {
+      what: "a part of data alone, one of a header block alone, and one of nothing",
+      body: b"--b\r\n\r\ndata\r\n--b\r\nA: 1\r\n\r\n--b\r\n--b--",
+      lines: Strict,
+      parts: [b"\r\ndata", b"A: 1\r\n", b""],
+    },
+    {
+      what: "a header block no header reader would take",
+      body: b"--b\r\nno colon\r\n folded\r\n\xff: \x00\r\n--b--",
+      lines: Strict,
+      parts: [b"no colon\r\n folded\r\n\xff: \x00"],
+    },
+    {
+      what: "bare line feeds where they are asked for",
+      body: b"--b\nA: 1\n\ndata\n--b\n\n--b--\n",
+      lines: Lenient,
+      parts: [b"A: 1\n\ndata", b""],
+    },
+    { what: "a body of no parts", body: b"--b--", lines: Strict, parts: [] },
+  ]
+
+test "spans {c.what}" for c: Spanned in spanned() {
+  assert_eq(
+    match parse_spans(c.body, "b", default_limits(), c.lines) {
+      Ok(found) -> Ok(map(found, |s: Span| bytes_slice(c.body, s.from, s.to))),
+      Err(r) -> Err(r),
+    },
+    Ok(c.parts),
+  )
+}
+
+test "a body's spans are refused as its parts are, but for what a header block holds" {
+  let limits: Limits = tight();
+  assert_eq(parse_spans(b"--b\r\nA: 1\r\n\r\ndata", "b", limits), Err({ at: 17, why: Truncated }));
+  assert_eq(parse_spans(b"--b\r\nA: 1\r\n--b--", "b", limits), Ok([{ from: 5, to: 9 }]));
+  assert_eq(
+    parse_spans(b"--b\r\n\r\n1\r\n--b\r\n\r\n2\r\n--b\r\n\r\n3\r\n--b--", "b", limits),
+    Err({ at: 25, why: TooManyParts }),
+  );
+  assert_eq(
+    parse_spans(b"--b\r\nA: 123456\r\n--b--", "b", limits),
+    Err({ at: 13, why: PartTooLarge }),
+  );
+  assert_eq(
+    parse_spans(b"--b\r\nA: 1\r\n\r\nx\n--b--", "b", limits),
+    Err({ at: 14, why: BareLineFeed }),
+  );
+  assert_eq(parse_spans(b"--bx\r\n--b--", "b", limits), Err({ at: 3, why: BadDelimiter }));
+  assert_eq(try { spans(b"", "", limits) }, Err({ at: 0, why: NoBoundary }))
+}
+
+test "parts already written are framed as they are, under a boundary none of them holds" {
+  let folded = { head: b"Content-Type: text/plain;\r\n charset=utf-8\r\n", data: b"data" };
+  assert_eq(
+    try { frame([folded, { head: b"", data: b"" }], "b") },
+    Ok(
+      b"--b\r\nContent-Type: text/plain;\r\n charset=utf-8\r\n\r\ndata\r\n--b\r\n\r\n\r\n--b--\r\n",
+    ),
+  );
+  assert_eq(
+    parse(
+      match try { frame([folded], "b") } { Ok(body) -> body, Err(_) -> b"" },
+      "b",
+      default_limits(),
+      Lenient,
+    ),
+    Ok([{ headers: [typed_as("text/plain; charset=utf-8")], data: b"data" }]),
+  );
+  assert_eq(try { frame([], "a b ") }, Err(UnfitBoundary));
+  assert_eq(
+    try { frame([folded, { head: b"X: --b\r\n", data: b"" }], "b") },
+    Err(BoundaryInPart(1)),
+  );
+  assert_eq(try { frame([{ head: b"", data: b"x--b" }], "b") }, Err(BoundaryInPart(0)))
+}
+
+law "the spans of a body written of parts are the parts as written"
+  forall (datas: List<Bytes>) {
+    let parts = map(datas, |d: Bytes| part([{ name: "a", value: "1" }], d));
+    match build(parts, "boundary") {
+      Ok(body) ->
+        parse_spans(body, "boundary", roomy())
+          == Ok(
+            fold(parts, { out: [], at: 12 }, |s: { out: List<Span>, at: Int }, p: Part| {
+              let to = s.at + 8 + bytes_len(p.data);
+              { out: push(s.out, { from: s.at, to: to }), at: to + 14 }
+            }).out,
+          ),
+      Err(_) -> true,
+    }
+  }
