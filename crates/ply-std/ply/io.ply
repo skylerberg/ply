@@ -17,11 +17,21 @@
 //!
 //! Code written against a root runs over `std.fs`'s twin unchanged (`fs::on_mem`), and over
 //! `fs::mem_short_reads` it is handed the short reads a file on a disk seldom gives.
+//!
+//! `stdin`, `stdout` and `stderr` are the process's own streams as a source and two sinks, so a
+//! filter is `copy(from, to, ..)` and a reader of lines `fold_lines` over standard input, under
+//! `with_hold` like any stream. Those streams are the process's and outlive every hold: letting
+//! standard output go writes what its buffer holds, and letting the other two go does nothing. A
+//! write whose reader has gone away raises `std.process`'s `pipe.broken`, and never answers
+//! `false`. Code written against them runs over `std.process`'s twin unchanged
+//! (`process::over`).
 
 import std.fs
 import std.fs (fs, files, Refused, ToRead, ToWrite, ToAppend)
 import std.laws (agrees)
 import std.list (at, concat, take)
+import std.process
+import std.process (process, pipe, Stdout, Stderr)
 import std.random (entropy, rand, with_rand)
 import std.seq
 import std.seq (Seq, seq)
@@ -89,6 +99,32 @@ fn written_through<[l]>(file: Int) -> Sink<| {fs.write_chunk[l], fs.close[l]}> =
       fs.close[l](file);
       ()
     },
+  }
+
+/// Standard input as a source. Letting it go does nothing.
+pub fn stdin<[p]>() -> Source<| {process.in_bytes[p]}> =
+  { pull: |max: Int| process.in_bytes[p](max), close: || () }
+
+/// Standard output as a sink. A write whose reader has gone away raises `pipe.broken`, and
+/// letting the sink go writes what the stream's buffer holds.
+pub fn stdout<[p]>() -> Sink<| {process.out_bytes[p], process.flush[p], pipe.broken}> =
+  {
+    push: |bytes: Bytes| {
+      process::write_out[p](bytes);
+      true
+    },
+    close: || process::flush_out[p](),
+  }
+
+/// Standard error as a sink. A write whose reader has gone away raises `pipe.broken`, and
+/// letting the sink go does nothing: the stream holds nothing back.
+pub fn stderr<[p]>() -> Sink<| {process.err_bytes[p], pipe.broken}> =
+  {
+    push: |bytes: Bytes| {
+      process::write_err[p](bytes);
+      true
+    },
+    close: || (),
   }
 
 /// `body` writing the file at `path` under the root `l` through a sink, whole or not at all, as
@@ -483,6 +519,63 @@ test "a sequence over a source reads as it is pulled, and a budget of one pull r
   // The pull past the budget read `thre` to learn the sequence had not ended.
   assert_eq(over.value.spent, Err(1));
   assert_eq(over.value.left, b"e")
+}
+
+/// `cat`: standard input to standard output, `chunk` bytes at a time.
+fn cat(
+  chunk: Int,
+) -> Int / {process.in_bytes[proc], process.out_bytes[proc], process.flush[proc], pipe.broken, io.too_long, io.unwritten, abort.raise} =
+  with_hold[input](
+    stdin[proc](),
+    shut,
+  ) { from ->
+    with_hold[output](stdout[proc](), shut_sink) { to -> copy(from, to, chunk, 1048576) }
+  }
+
+test "standard input is copied to standard output byte for byte, whatever the reads" for c: { chunks: List<Bytes>, chunk: Int } in [
+    { chunks: [b"\x00\xff\xfe\n\x80binary\x00"], chunk: 1 },
+    { chunks: [b"\x00\xff\xfe\n\x80binary\x00"], chunk: 4 },
+    { chunks: [b"\x00\xff", b"\xfe", b"\n\x80bin", b"ary\x00"], chunk: 64 },
+    { chunks: [b"\x00\xff", b"\xfe", b"\n\x80bin", b"ary\x00"], chunk: 3 },
+    { chunks: [], chunk: 8 },
+  ] {
+  let ran = process::over[proc](process::with_chunks(process::captured([]), c.chunks), ||
+    cat(c.chunk));
+  let all = bytes_concat_all(c.chunks);
+  assert_eq(ran.value, Some(bytes_len(all)));
+  assert_eq(process::written_to(ran.captured, Stdout), all);
+  assert_eq(process::written_to(ran.captured, Stderr), b"")
+}
+
+test "the lines of standard input are read as a file's are" {
+  let typed = process::with_chunks(process::captured([]), [b"one\ntw", b"o\n", b"three"]);
+  let ran = process::over[proc](typed, ||
+    with_hold[input](
+      stdin[proc](),
+      shut,
+    ) { source ->
+      fold_lines(source, 4, 1024, [], |lines: List<Bytes>, line: Bytes| push(lines, line))
+    });
+  assert_eq(ran.value, Some([b"one", b"two", b"three"]))
+}
+
+test "what is written to standard error goes there as it is, and letting standard output go flushes it" {
+  let ran = process::over[proc](process::captured([]), || {
+    with_hold[errors](stderr[proc](), shut_sink) { sink -> write(sink, b"\x00warn") };
+    with_hold[output](stdout[proc](), shut_sink) { sink -> write(sink, b"half a line") }
+  });
+  assert_eq(process::written_to(ran.captured, Stderr), b"\x00warn");
+  assert_eq(process::written_to(ran.captured, Stdout), b"half a line");
+  let closed = process::over[proc](process::hung_up(process::captured([]), Stdout), || {
+    let wrote: Result<Unit, process::Stream> = try[pipe.broken] {
+      with_hold[output](stdout[proc](), shut_sink) { sink -> write(sink, b"into nothing") }
+    };
+    let let_go: Result<Unit, process::Stream> = try[pipe.broken] {
+      with_hold[output](stdout[proc](), shut_sink) { unwritten -> () }
+    };
+    [wrote, let_go]
+  });
+  assert_eq(closed.value, Some([Err(Stdout), Err(Stdout)]))
 }
 
 test "a file replaced through a sink holds what it held until its body answers, and then every chunk" {

@@ -6,6 +6,7 @@ use ply_eval::host::{
 };
 use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
 use ply_host::config::{Entry, Snapshot};
+use ply_host::pool::Pooled;
 use ply_host::signal::{Accepting, Bounds, Shutdown, ShutdownSignal};
 use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
@@ -491,11 +492,11 @@ fn settle(host: &TcpHost, answered: Result<HostAnswer, Diagnostic>) -> Value {
         HostAnswer::Pending(pending) => {
             let until = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(value) = host.poll(&pending).expect("this host's token") {
+                if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
                     return value;
                 }
                 assert!(Instant::now() < until, "`{pending}` never resolved");
-                let _ = host.park_until(Duration::from_millis(20));
+                let _ = host.pool().park_until(Duration::from_millis(20));
             }
         }
     }
@@ -567,7 +568,7 @@ fn a_host_with_no_coordinator_is_never_stopping() {
 #[test]
 fn a_withheld_signal_handler_refuses_rather_than_answering() {
     let withheld = ply_host::signal::registrations(None);
-    assert_eq!(withheld.len(), 2);
+    assert_eq!(withheld.len(), ply_host::signal::Op::ALL.len());
     let (declaration, handler) = &withheld[0];
     assert_eq!(declaration.path, "ply_host::signal::stopping");
     let request = HostRequest {
