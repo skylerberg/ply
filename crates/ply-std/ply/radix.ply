@@ -13,19 +13,27 @@
 //! encode of a decode is the text. A text as a person typed it is made canonical first, by a
 //! function that says so, as `std.base32`'s `normalize` does.
 //!
-//! Either direction takes the same steps for any two inputs of one length, whatever they hold.
+//! An alphabet carries the tables both directions read, so it is made once and kept: the ones
+//! named here are constants a build keeps, and one of your own, made by `alphabet`, belongs in a
+//! `const fn`. At four, five and six bits a symbol a whole quantum is one step in either direction,
+//! and no step allocates but to grow the answer; a narrower alphabet takes a step a symbol. Either
+//! direction takes the same steps for any two inputs of one length, whatever they hold.
 //! `std.base64`, `std.base32`, `std.hex` and `std.bytes`'s `hex_of` are this module at one
 //! alphabet each.
 
-/// The symbols a text is written in, and how it ends. Only a `well_formed` one is a coding: over
-/// any other, `encode` and `decode` may raise or answer what does not read back.
-pub type Alphabet = new {
+/// The symbols a text is written in, how it ends, and the tables made of them. Only `alphabet`
+/// makes one, so every one is a coding.
+pub opaque type Alphabet = new {
   /// The symbol of each value, least first: `2^bits` printable ASCII bytes, each once, none `=`.
   symbols: Bytes,
   /// How many bits a symbol carries, one to six.
   bits: Int,
   /// Whether `=` fills a text to a whole number of quanta.
   padded: Bool,
+  /// The two symbols of each value of twice `bits` bits, which an encoder writes at once.
+  pairs: Array<Bytes>,
+  /// For each byte, the value of the symbol it is, and 255 for a byte that is none.
+  values: Bytes,
 }
 
 /// Why `parse` refused. `Stray` is a byte that is no symbol of the alphabet where one belongs,
@@ -37,52 +45,62 @@ pub type Why = | Stray | Ragged | Lone | Loose
 /// A refusal, and the offset of the character it is about: the length of the text for `Ragged`.
 pub type Refusal = new { why: Why, at: Int }
 
-/// Whether `a` is an alphabet: one to six bits a symbol and exactly `2^bits` symbols, each a
-/// printable ASCII byte other than `=` that appears once.
-pub fn well_formed(a: Alphabet) -> Bool / {abort.raise} =
-  a.bits >= 1 && a.bits <= 6 && bytes_len(a.symbols) == 1 << a.bits
-    && fold(range(0, bytes_len(a.symbols)), true, |ok: Bool, i: Int| {
-      let c = bytes_at(a.symbols, i);
-      ok && c > 32 && c < 127 && c != 61 && bytes_index_of_byte(a.symbols, c) == Some(i)
+/// The alphabet whose symbols, least value first, are `symbols`; `None` unless they are 2, 4, 8,
+/// 16, 32 or 64 printable ASCII bytes other than `=`, each once. Making one builds its tables, a
+/// step for each pair of symbols, so an alphabet is made once and kept.
+pub fn alphabet(symbols: Bytes, padded: Bool) -> Option<Alphabet> / {abort.raise} = {
+  let bits = fold(range(1, 7), 0, |found: Int, b: Int|
+    if bytes_len(symbols) == 1 << b { b } else { found });
+  let distinct = fold(range(0, bytes_len(symbols)), bits > 0, |ok: Bool, i: Int| {
+    let c = bytes_at(symbols, i);
+    ok && c > 32 && c < 127 && c != 61 && bytes_index_of_byte(symbols, c) == Some(i)
+  });
+  if !distinct { None } else {
+    Some({
+      symbols: symbols,
+      bits: bits,
+      padded: padded,
+      pairs: array_of_list(
+        map(range(0, 1 << 2 * bits), |v: Int|
+          bytes_concat(
+            bytes_slice(symbols, v >>> bits, (v >>> bits) + 1),
+            bytes_slice(symbols, v & (1 << bits) - 1, (v & (1 << bits) - 1) + 1),
+          )),
+      ),
+      values: bytes_concat_all(
+        map(range(0, 256), |c: Int|
+          byte_of_int(match bytes_index_of_byte(symbols, c) { Some(v) -> v, None -> 255 })),
+      ),
     })
+  }
+}
 
 /// RFC 4648 §8: hex in upper case.
-pub fn base16() -> Alphabet = { symbols: b"0123456789ABCDEF", bits: 4, padded: false }
+pub const fn base16() -> Alphabet = named(b"0123456789ABCDEF", false)
 
 /// Hex in lower case, as a hash is written.
-pub fn hex() -> Alphabet = { symbols: b"0123456789abcdef", bits: 4, padded: false }
+pub const fn hex() -> Alphabet = named(b"0123456789abcdef", false)
 
 /// RFC 4648 §6: `A-Z2-7`, padded.
-pub fn base32() -> Alphabet =
-  { symbols: b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", bits: 5, padded: true }
+pub const fn base32() -> Alphabet = named(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", true)
 
 /// RFC 4648 §7, base32hex: `0-9A-V`, padded. Its texts sort as their bytes do.
-pub fn base32hex() -> Alphabet =
-  { symbols: b"0123456789ABCDEFGHIJKLMNOPQRSTUV", bits: 5, padded: true }
+pub const fn base32hex() -> Alphabet = named(b"0123456789ABCDEFGHIJKLMNOPQRSTUV", true)
 
 /// Crockford's base32: `0-9A-Z` without `I`, `L`, `O` and `U`, unpadded.
 ///
 /// The bits are grouped from the first byte as every alphabet's here are, which is not how a
 /// ULID numbers them: its 26 characters fill from the last bit, so the two agree only for a
 /// multiple of five bytes.
-pub fn crockford() -> Alphabet =
-  { symbols: b"0123456789ABCDEFGHJKMNPQRSTVWXYZ", bits: 5, padded: false }
+pub const fn crockford() -> Alphabet = named(b"0123456789ABCDEFGHJKMNPQRSTVWXYZ", false)
 
 /// RFC 4648 §4: `A-Za-z0-9+/`, padded.
-pub fn base64() -> Alphabet =
-  {
-    symbols: b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
-    bits: 6,
-    padded: true,
-  }
+pub const fn base64() -> Alphabet =
+  named(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", true)
 
 /// RFC 4648 §5: `A-Za-z0-9-_`, unpadded, as a URL and a JWT carry it.
-pub fn base64url() -> Alphabet =
-  {
-    symbols: b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_",
-    bits: 6,
-    padded: false,
-  }
+pub const fn base64url() -> Alphabet =
+  named(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", false)
 
 /// `a`, its texts filled with `=`.
 pub fn padded(a: Alphabet) -> Alphabet = { ..a, padded: true }
@@ -92,15 +110,12 @@ pub fn unpadded(a: Alphabet) -> Alphabet = { ..a, padded: false }
 
 /// `data` in the alphabet's symbols.
 pub fn encode(a: Alphabet, data: Bytes) -> String / {abort.raise} = {
-  let count = (bytes_len(data) * 8 + a.bits - 1) / a.bits;
-  let fill = if a.padded { (quantum(a.bits) - count % quantum(a.bits)) % quantum(a.bits) }
-  else { 0 };
-  string_of_bytes(
-    bytes_concat(
-      bytes_concat_all(map(range(0, count), |j: Int| symbol(a, data, j * a.bits))),
-      bytes_slice(b"=======", 0, fill),
-    ),
-  )
+  let whole = whole_bytes(a.bits, bytes_len(data));
+  let head = if a.bits == 4 { write_ones(a.pairs, data, 0, whole, b"") }
+  else if a.bits == 6 { write_threes(a.pairs, data, 0, whole, b"") }
+  else if a.bits == 5 { write_fives(a.pairs, data, 0, whole, b"") }
+  else { b"" };
+  string_of_bytes(if whole == bytes_len(data) { head } else { spelled(a, data, whole, head) })
 }
 
 /// The bytes `text` is the encoding of; `None` for any other text.
@@ -113,7 +128,14 @@ pub fn parse(a: Alphabet, text: String) -> Result<Bytes, Refusal> / {abort.raise
   let body = bytes_len(t) - fill_of(a, t);
   match refusal(a, t, body) {
     Some(r) -> Err(r),
-    None -> Ok(bytes_concat_all(map(range(0, body * a.bits / 8), |k: Int| octet(a, t, k)))),
+    None -> {
+      let whole = whole_symbols(a.bits, body);
+      let head = if a.bits == 4 { read_twos(a.values, t, 0, whole, b"") }
+      else if a.bits == 6 { read_fours(a.values, t, 0, whole, b"") }
+      else if a.bits == 5 { read_eights(a.values, t, 0, whole, b"") }
+      else { b"" };
+      Ok(if whole == body { head } else { octets(a, t, whole, body, head) })
+    },
   }
 }
 
@@ -125,8 +147,89 @@ pub fn wrap(text: String, columns: Int) -> List<String> / {abort.raise} =
       string_slice(text, i * columns, min(string_len(text), (i + 1) * columns)))
   }
 
+fn named(symbols: Bytes, padded: Bool) -> Alphabet / {abort.raise} =
+  match alphabet(symbols, padded) { Some(a) -> a, None -> panic("these symbols are no alphabet") }
+
 /// How many symbols carry a whole number of bytes: the unit a padded text is filled to.
 fn quantum(bits: Int) -> Int = if bits % 4 == 0 { 2 } else if bits % 2 == 0 { 4 } else { 8 }
+
+/// How many of `n` bytes lie in quanta an encoder writes whole: every quantum at four, five and
+/// six bits a symbol, and none at a narrower width.
+fn whole_bytes(bits: Int, n: Int) -> Int =
+  if bits == 4 { n } else if bits == 6 { n - n % 3 } else if bits == 5 { n - n % 5 } else { 0 }
+
+/// How many of `n` symbols lie in quanta a decoder reads whole.
+fn whole_symbols(bits: Int, n: Int) -> Int =
+  if bits == 4 { n - n % 2 }
+  else if bits == 6 { n - n % 4 }
+  else if bits == 5 { n - n % 8 }
+  else { 0 }
+
+/// `out` and the symbols of the bytes from `at` up to `end`, at four bits: a byte is a pair.
+fn write_ones(
+  pairs: Array<Bytes>,
+  data: Bytes,
+  at: Int,
+  end: Int,
+  out: Bytes,
+) -> Bytes / {abort.raise} =
+  if at >= end { out }
+  else { write_ones(pairs, data, at + 1, end, out ++ array_get(pairs, bytes_at(data, at))) }
+
+/// `out` and the symbols of the bytes from `at` up to `end`, at six bits: three bytes are two
+/// pairs.
+fn write_threes(
+  pairs: Array<Bytes>,
+  data: Bytes,
+  at: Int,
+  end: Int,
+  out: Bytes,
+) -> Bytes / {abort.raise} =
+  if at >= end { out } else {
+    let w = bytes_at(data, at) << 16 | bytes_at(data, at + 1) << 8 | bytes_at(data, at + 2);
+    write_threes(
+      pairs,
+      data,
+      at + 3,
+      end,
+      out ++ array_get(pairs, w >>> 12) ++ array_get(pairs, w & 0xFFF),
+    )
+  }
+
+/// `out` and the symbols of the bytes from `at` up to `end`, at five bits: five bytes are four
+/// pairs.
+fn write_fives(
+  pairs: Array<Bytes>,
+  data: Bytes,
+  at: Int,
+  end: Int,
+  out: Bytes,
+) -> Bytes / {abort.raise} =
+  if at >= end { out } else {
+    let w = bytes_at(data, at) << 32 | bytes_at(data, at + 1) << 24 | bytes_at(data, at + 2) << 16
+      | bytes_at(data, at + 3) << 8
+      | bytes_at(data, at + 4);
+    write_fives(
+      pairs,
+      data,
+      at + 5,
+      end,
+      out ++ array_get(pairs, w >>> 30) ++ array_get(pairs, w >>> 20 & 0x3FF)
+        ++ array_get(pairs, w >>> 10 & 0x3FF)
+        ++ array_get(pairs, w & 0x3FF),
+    )
+  }
+
+/// `out`, the symbols of the bytes of `data` from `from` taken a symbol at a time, and the fill:
+/// what ends a text after its whole quanta, and all of one at a width that has none.
+fn spelled(a: Alphabet, data: Bytes, from: Int, out: Bytes) -> Bytes / {abort.raise} = {
+  let count = (bytes_len(data) * 8 + a.bits - 1) / a.bits;
+  let fill = if a.padded { (quantum(a.bits) - count % quantum(a.bits)) % quantum(a.bits) }
+  else { 0 };
+  fold(range(from * 8 / a.bits, count), out, |so_far: Bytes, j: Int|
+      so_far ++ symbol(a, data, j * a.bits))
+    ++ bytes_slice(b"=======", 0, fill)
+}
 
 /// The symbol of the `a.bits` bits of `data` from bit `at`, zeros past its end.
 fn symbol(a: Alphabet, data: Bytes, at: Int) -> Bytes / {abort.raise} = {
@@ -151,36 +254,93 @@ fn refusal(a: Alphabet, t: Bytes, body: Int) -> Option<Refusal> / {abort.raise} 
   else if a.padded && bytes_len(t) % quantum(a.bits) != 0 {
     Some({ why: Ragged, at: bytes_len(t) })
   } else if spare >= a.bits { Some({ why: Lone, at: body - 1 }) }
-  else if spare > 0 && value(a, bytes_at(t, body - 1)) & (1 << spare) - 1 != 0 {
+  else if spare > 0 && bytes_at(a.values, bytes_at(t, body - 1)) & (1 << spare) - 1 != 0 {
     Some({ why: Loose, at: body - 1 })
   } else { None }
 }
+
+/// `out` and the bytes of the symbols from `at` up to `end`, at four bits: two symbols are a
+/// byte. Every symbol read here and below is one `refusal` found in the alphabet.
+fn read_twos(values: Bytes, t: Bytes, at: Int, end: Int, out: Bytes) -> Bytes / {abort.raise} =
+  if at >= end { out } else {
+    let w = bytes_at(values, bytes_at(t, at)) << 4 | bytes_at(values, bytes_at(t, at + 1));
+    read_twos(values, t, at + 2, end, out ++ byte_of_int(w))
+  }
+
+/// `out` and the bytes of the symbols from `at` up to `end`, at six bits: four symbols are three
+/// bytes.
+fn read_fours(values: Bytes, t: Bytes, at: Int, end: Int, out: Bytes) -> Bytes / {abort.raise} =
+  if at >= end { out } else {
+    let w = bytes_at(values, bytes_at(t, at)) << 18 | bytes_at(values, bytes_at(t, at + 1)) << 12
+      | bytes_at(values, bytes_at(t, at + 2)) << 6
+      | bytes_at(values, bytes_at(t, at + 3));
+    read_fours(
+      values,
+      t,
+      at + 4,
+      end,
+      out ++ byte_of_int(w >>> 16) ++ byte_of_int(w >>> 8 & 0xFF) ++ byte_of_int(w & 0xFF),
+    )
+  }
+
+/// `out` and the bytes of the symbols from `at` up to `end`, at five bits: eight symbols are five
+/// bytes.
+fn read_eights(values: Bytes, t: Bytes, at: Int, end: Int, out: Bytes) -> Bytes / {abort.raise} =
+  if at >= end { out } else {
+    let w = bytes_at(values, bytes_at(t, at)) << 35 | bytes_at(values, bytes_at(t, at + 1)) << 30
+      | bytes_at(values, bytes_at(t, at + 2)) << 25
+      | bytes_at(values, bytes_at(t, at + 3)) << 20
+      | bytes_at(values, bytes_at(t, at + 4)) << 15
+      | bytes_at(values, bytes_at(t, at + 5)) << 10
+      | bytes_at(values, bytes_at(t, at + 6)) << 5
+      | bytes_at(values, bytes_at(t, at + 7));
+    read_eights(
+      values,
+      t,
+      at + 8,
+      end,
+      out ++ byte_of_int(w >>> 32) ++ byte_of_int(w >>> 24 & 0xFF) ++ byte_of_int(w >>> 16 & 0xFF)
+        ++ byte_of_int(w >>> 8 & 0xFF)
+        ++ byte_of_int(w & 0xFF),
+    )
+  }
+
+/// `out` and the bytes of the symbols from `at` up to `end`, a byte at a time: what ends a text
+/// after its whole quanta, and all of one at a width that has none.
+fn octets(a: Alphabet, t: Bytes, at: Int, end: Int, out: Bytes) -> Bytes / {abort.raise} =
+  fold(range(at * a.bits / 8, end * a.bits / 8), out, |so_far: Bytes, k: Int|
+    so_far ++ octet(a, t, k))
 
 /// Byte `k` of what the symbols of `t` spell: the eight bits from bit `8k` of their run.
 fn octet(a: Alphabet, t: Bytes, k: Int) -> Bytes / {abort.raise} = {
   let first = k * 8 / a.bits;
   let past = (k * 8 + 7) / a.bits + 1;
-  let window = fold(range(first, past), 0, |m: Int, i: Int| m << a.bits | value(a, bytes_at(t, i)));
+  let window = fold(range(first, past), 0, |m: Int, i: Int|
+    m << a.bits | bytes_at(a.values, bytes_at(t, i)));
   byte_of_int(window >>> past * a.bits - k * 8 - 8 & 0xFF)
 }
 
-/// The value of a symbol; zero for a byte that is none, which `refusal` has ruled out.
-fn value(a: Alphabet, symbol: Int) -> Int / {abort.raise} =
-  match bytes_index_of_byte(a.symbols, symbol) { Some(v) -> v, None -> 0 }
-
 // --- Tests ------------------------------------------------------------------
 
-/// Every alphabet this module names.
-fn named() -> List<Alphabet> =
-  [base16(), hex(), base32(), base32hex(), crockford(), base64(), base64url()]
+/// Every alphabet this module names, and one of each width it names none of.
+fn named_and_narrow() -> List<Alphabet> / {abort.raise} =
+  [
+    base16(),
+    hex(),
+    base32(),
+    base32hex(),
+    crockford(),
+    base64(),
+    base64url(),
+    named(b"01", false),
+    named(b"ACGT", false),
+    named(b"01234567", false),
+  ]
 
-/// `named`, each padded and unpadded.
-fn every() -> List<Alphabet> =
-  fold(named(), [], |all: List<Alphabet>, a: Alphabet| push(push(all, padded(a)), unpadded(a)))
-
-law "every alphabet this module names is well formed" {
-  fold(named(), true, |ok: Bool, a: Alphabet| ok && well_formed(a))
-}
+/// `named_and_narrow`, each padded and unpadded.
+fn every() -> List<Alphabet> / {abort.raise} =
+  fold(named_and_narrow(), [], |all: List<Alphabet>, a: Alphabet|
+    push(push(all, padded(a)), unpadded(a)))
 
 /// `text` with one byte made another: the byte at `at`, counted round its length, made the low
 /// seven bits of `to`.
@@ -195,11 +355,30 @@ fn altered(text: String, at: Int, to: Int) -> String / {abort.raise} = {
   }
 }
 
+/// `data` repeated to the length `n` counts round sixty-four, so quanta and what follows them are
+/// both drawn.
+fn stretched(data: Bytes, n: Int) -> Bytes / {abort.raise} = {
+  let want = (n % 64 + 64) % 64;
+  let seed = bytes_concat(data, b"\x00\xff\x5a");
+  bytes_slice(bytes_concat_all(map(range(0, want / bytes_len(seed) + 1), |_: Int| seed)), 0, want)
+}
+
 law "an encoding with one character altered is refused, or is what its bytes encode to"
   forall (data: Bytes, at: Int, to: Int) {
     fold(every(), true, |ok: Bool, a: Alphabet| {
-      let text = altered(encode(a, data), at, to);
+      let text = altered(encode(a, stretched(data, at)), at, to);
       ok && (match decode(a, text) { None -> true, Some(read) -> encode(a, read) == text })
+    })
+  }
+
+law "quanta written whole are the symbols one at a time would spell, and read back as the bytes"
+  forall (data: Bytes, n: Int) {
+    fold(every(), true, |ok: Bool, a: Alphabet| {
+      let bytes = stretched(data, n);
+      let text = string_of_bytes(spelled(a, bytes, 0, b""));
+      let body = bytes_len(bytes_of_string(text)) - fill_of(a, bytes_of_string(text));
+      ok && encode(a, bytes) == text && decode(a, text) == Some(bytes)
+        && octets(a, bytes_of_string(text), 0, body, b"") == bytes
     })
   }
 
@@ -211,24 +390,36 @@ law "a round trip is linear in the bytes"
     )
   }
 
-test "an alphabet is well formed only with distinct printable symbols, two to the bits of them" {
-  assert_eq(filter(named(), well_formed), named());
-  assert(well_formed({ symbols: b"01", bits: 1, padded: false }));
-  assert(well_formed({ symbols: b"!~", bits: 1, padded: true }));
-  assert(!well_formed({ symbols: b"=1", bits: 1, padded: false }));
-  assert(!well_formed({ symbols: b"0\x7f", bits: 1, padded: false }));
-  assert(!well_formed({ symbols: b"0123456789abcdef", bits: 5, padded: false }));
-  assert(!well_formed({ symbols: b"0123456789abcdeF0", bits: 4, padded: false }));
-  assert(!well_formed({ symbols: b"0123456789abcde0", bits: 4, padded: false }));
-  assert(!well_formed({ symbols: b"0123456789abcde=", bits: 4, padded: false }));
-  assert(!well_formed({ symbols: b"0123456789abcde ", bits: 4, padded: false }));
-  assert(!well_formed({ symbols: b"", bits: 0, padded: false }));
-  assert(!well_formed({ symbols: b"0", bits: 7, padded: false }))
+test "an alphabet is made only of distinct printable symbols, two to the bits of them" {
+  assert(alphabet(b"01", false) != None);
+  assert(alphabet(b"!~", true) != None);
+  assert_eq(alphabet(b"=1", false), None);
+  assert_eq(alphabet(b"0\x7f", false), None);
+  assert_eq(alphabet(b"0 ", false), None);
+  assert_eq(alphabet(b"012", false), None);
+  assert_eq(alphabet(b"0123456789abcdeF0", false), None);
+  assert_eq(alphabet(b"0123456789abcde0", false), None);
+  assert_eq(alphabet(b"0123456789abcde=", false), None);
+  assert_eq(alphabet(b"", false), None);
+  assert_eq(alphabet(b"0", false), None);
+  assert_eq(map(named_and_narrow(), |a: Alphabet| a.bits), [4, 4, 5, 5, 5, 6, 6, 1, 2, 3])
+}
+
+test "an alphabet's tables are its symbols: each pair, and each byte's value" {
+  let a = base32();
+  assert_eq(array_len(a.pairs), 1024);
+  assert_eq(array_get(a.pairs, 0), b"AA");
+  assert_eq(array_get(a.pairs, 33), b"BB");
+  assert_eq(array_get(a.pairs, 1023), b"77");
+  assert_eq(bytes_len(a.values), 256);
+  assert_eq(map([65, 90, 50, 55], |c: Int| bytes_at(a.values, c)), [0, 25, 26, 31]);
+  assert_eq(map([97, 61, 0, 255], |c: Int| bytes_at(a.values, c)), [255, 255, 255, 255]);
+  assert_eq(padded(unpadded(a)), a)
 }
 
 test "an alphabet of any width from one bit to six writes and reads" {
-  let binary: Alphabet = { symbols: b"01", bits: 1, padded: false };
-  let octal: Alphabet = { symbols: b"01234567", bits: 3, padded: true };
+  let binary = named(b"01", false);
+  let octal = named(b"01234567", true);
   assert_eq(encode(binary, b"\xa5"), "10100101");
   assert_eq(decode(binary, "10100101"), Some(b"\xa5"));
   assert_eq(encode(octal, b"\xff"), "776=====");
@@ -264,15 +455,50 @@ test "a refusal says where the text stops being an encoding, and why" {
   assert_eq(parse(base64(), "="), Err({ why: Ragged, at: 1 }))
 }
 
+test "quanta and what follows them read back at every length from none to forty" {
+  fold(every(), (), |_: Unit, a: Alphabet|
+    fold(range(0, 41), (), |_: Unit, n: Int| {
+      let bytes = stretched(b"\x01\x80\x7e", n);
+      assert_eq(decode(a, encode(a, bytes)), Some(bytes))
+    }))
+}
+
 test "two inputs of one length cost the same steps, whatever they hold" {
-  let zeros = b"\x00\x00\x00\x00\x00\x00\x00";
-  let mixed = b"\xff\x10\x80\x7f\x01\xaa\x55";
+  let zeros = stretched(b"\x00", 23);
+  let mixed = stretched(b"\xff\x10\x80\x7f\x01\xaa\x55", 23);
   fold(every(), (), |_: Unit, a: Alphabet| {
     assert_eq(metered(|| encode(a, zeros)).steps, metered(|| encode(a, mixed)).steps);
     let quiet = encode(a, zeros);
     let loud = encode(a, mixed);
     assert_eq(metered(|| decode(a, quiet)).steps, metered(|| decode(a, loud)).steps)
   })
+}
+
+/// What `f` costs over `long` beyond what it costs over `short`.
+fn growth<a, b | e>(f: (a) -> b / e, short: a, long: a) -> { steps: Int, allocations: Int } / e = {
+  let less = metered(|| f(short));
+  let more = metered(|| f(long));
+  { steps: more.steps - less.steps, allocations: more.allocations - less.allocations }
+}
+
+test "a whole quantum is at most a step either way, and none allocates but to grow the answer" {
+  let within = |got: Int, most: Int|
+    assert(got <= most, Some(int_to_string(got) ++ " is past " ++ int_to_string(most)));
+  fold(
+    [hex(), base16(), base32(), base32hex(), crockford(), base64(), base64url()],
+    (),
+    |_: Unit, a: Alphabet| {
+      let span = quantum(a.bits) * a.bits / 8;
+      let short = stretched(b"\x5a\xc3", 60);
+      let long = bytes_concat_all(map(range(0, 1024 * span / 60 + 1), |_: Int| short));
+      let written = growth(|d: Bytes| encode(a, d), short, long);
+      let read = growth(|t: String| decode(a, t), encode(a, short), encode(a, long));
+      within(written.steps, 1024);
+      within(read.steps, 1024);
+      within(written.allocations, 8);
+      within(read.allocations, 8)
+    },
+  )
 }
 
 test "a text wraps into lines of a width, the last one what is left" {
