@@ -1,0 +1,98 @@
+//! `task.select(arms, wait)` goes on one of several channel operations. An arm is a channel beside
+//! `None` to receive from it or `Some(x)` to send `x` to it, and the first arm, in the order given,
+//! that can go without waiting goes. The answer is the arm's index beside `Some` of what it
+//! received or sent, or `None` where its channel was closed. With no arm able to go, the select
+//! answers `None` at once, or with `wait` waits for the first that can.
+
+test "the first arm in the order given that can go is the one that goes" {
+  simulate {
+    let a = task.channel(1);
+    let b = task.channel(1);
+    assert(task.send(a, 1) && task.send(b, 2));
+    assert_eq(task.select([(b, None), (a, None)], true), Some((0, Some(2))));
+    assert_eq(task.select([(b, None), (a, None)], true), Some((1, Some(1))))
+  }
+}
+
+test "a select that does not wait answers None when no arm can go" {
+  simulate {
+    let meet: Chan<Int> = task.channel(0);
+    let one = task.channel(1);
+    assert_eq(task.select([(meet, None), (one, None), (meet, Some(5))], false), None);
+    assert_eq(task.select([(one, Some(6))], false), Some((0, Some(6))));
+    assert_eq(task.select([(one, Some(7))], false), None)
+  }
+}
+
+test "an arm on a closed channel goes at once: a send is refused and a receive drains, then ends" {
+  simulate {
+    let c = task.channel(1);
+    assert(task.send(c, 1));
+    task.close(c);
+    assert_eq(task.select([(c, Some(2))], true), Some((0, None)));
+    assert_eq(task.select([(c, None)], true), Some((0, Some(1))));
+    assert_eq(task.select([(c, None)], true), Some((0, None)))
+  }
+}
+
+test "a waiting select goes on whichever arm another task makes ready, in every interleaving" {
+  simulate {
+    let a: Chan<Int> = task.channel(0);
+    let b = task.channel(0);
+    let sender = task.spawn(|| task.send(b, 9));
+    assert_eq(task.select([(a, None), (b, None)], true), Some((1, Some(9))));
+    assert(task.join(sender));
+    assert_eq(task.select([(a, None), (b, None)], false), None)
+  }
+}
+
+test "a select that waits to send hands its value to the receiver that comes" {
+  simulate {
+    let c = task.channel(0);
+    let quiet: Chan<Int> = task.channel(0);
+    let receiver = task.spawn(|| task.recv(c));
+    assert_eq(task.select([(quiet, None), (c, Some(5))], true), Some((1, Some(5))));
+    assert_eq(task.join(receiver), Some(5))
+  }
+}
+
+fn taken(c: Chan<Int>, d: Chan<Int>) -> Int / {task.write} =
+  match task.select([(c, None), (d, None)], true) { Some((_, Some(x))) -> x, _ -> 0 - 1 }
+
+test "two selects on the same two channels take each value once, in every interleaving" {
+  simulate {
+    let c = task.channel(1);
+    let d = task.channel(1);
+    let first = task.spawn(|| taken(c, d));
+    let second = task.spawn(|| taken(c, d));
+    assert(task.send(c, 1) && task.send(d, 2));
+    let got = (task.join(first), task.join(second));
+    assert(got == (1, 2) || got == (2, 1))
+  }
+}
+
+test "a cancelled select is off every channel it waited on" {
+  simulate {
+    let a: Chan<Int> = task.channel(0);
+    let b: Chan<Int> = task.channel(0);
+    let waiter = task.spawn(|| task.select([(a, None), (b, Some(3))], true));
+    clock.sleep(Duration(1));
+    assert(task.cancel(waiter));
+    assert_eq(task.await(waiter), None);
+    let sender = task.spawn(|| task.send(a, 7));
+    assert_eq(task.recv(a), Some(7));
+    assert(task.join(sender));
+    assert_eq(task.select([(b, None)], false), None)
+  }
+}
+
+test "a select with no arm that waits is a wait nothing ends but a cancel" {
+  simulate {
+    let none: List<(Chan<Int>, Option<Int>)> = [];
+    assert_eq(task.select(none, false), None);
+    let stuck = task.spawn(|| task.select(none, true));
+    clock.sleep(Duration(1));
+    assert(task.cancel(stuck));
+    assert_eq(task.await(stuck), None)
+  }
+}

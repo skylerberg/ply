@@ -115,16 +115,53 @@ fn an_unknown_effect_is_e0421() {
     );
 }
 
+/// A program was checked against its own declaration of an effect, so it performs no operation
+/// that declaration lacks: a program built before the operation was added, a module's or the
+/// language's, binds as it did, and the registration serves nothing in it.
 #[test]
-fn an_unknown_operation_is_e0421_and_lists_the_declared_ones() {
-    let diagnostics = registry(vec![op("db", "fetch", named("users"))])
-        .bind(&check(DB))
-        .expect_err("`db` has no `fetch`");
-    assert_eq!(codes_of(&diagnostics), [codes::HOST_OPERATION_UNKNOWN]);
-    let notes = diagnostics[0].notes.join(" ");
-    assert!(
-        notes.contains("`get`") && notes.contains("`put`"),
-        "{notes}"
+fn an_operation_the_programs_declaration_lacks_binds_nothing() {
+    let binding = registry(vec![
+        op("db", "fetch", named("users")),
+        op("db", "fetch", HostResource::Any),
+        op("task", "nonesuch", HostResource::Any),
+        op("db", "get", HostResource::Any),
+    ])
+    .bind(&check(DB))
+    .expect("each declaration is what the program was checked against");
+    let served: Vec<&str> = binding
+        .listing()
+        .rows
+        .iter()
+        .map(|r| r.op.as_str())
+        .collect();
+    assert_eq!(served, ["get"]);
+}
+
+/// A registration by one of these names is matched by program-wide name, so the list must be the
+/// effects every program is checked with.
+#[test]
+fn the_language_effects_are_the_ones_a_program_that_declares_none_has() {
+    let check = check("fn f() -> Int = 1\n");
+    let mut declared: Vec<&str> = check.effects.values().map(|e| e.name.as_str()).collect();
+    declared.sort_unstable();
+    let mut listed = LANGUAGE_EFFECTS.to_vec();
+    listed.sort_unstable();
+    assert_eq!(declared, listed);
+}
+
+/// A module may declare an effect by a name the language declares one by, which hides the
+/// language's there. A registration by that name finds one declaration, the language's, and
+/// serves nothing of the module's.
+#[test]
+fn a_registration_by_a_language_effects_name_is_for_the_languages_alone() {
+    let own = "nondet effect clock {\n  read now() -> Int\n}\n\nfn stamp() -> Int / {clock.read} = clock.now()\n";
+    let binding = registry(vec![op("clock", "now", HostResource::Any)])
+        .bind(&check(own))
+        .expect("one declaration is the language's");
+    assert!(binding.listing().is_empty(), "{:?}", binding.listing());
+    assert_eq!(
+        binding.would_serve(&Symbol::new("m.clock"), &Symbol::new("now"), None),
+        None
     );
 }
 
@@ -564,9 +601,9 @@ fn a_row_carries_the_declaration_it_was_checked_against() {
 fn every_registration_failure_is_reported_at_once() {
     let mut unknown_effect = op("dbx", "get", named("users"));
     unknown_effect.path = "test::a";
-    let mut unknown_op = op("db", "fetch", named("users"));
-    unknown_op.path = "test::b";
-    let diagnostics = registry(vec![unknown_effect, unknown_op])
+    let mut unperformed = op("db", "get", named("customers"));
+    unperformed.path = "test::b";
+    let diagnostics = registry(vec![unknown_effect, unperformed])
         .bind(&check(DB))
         .expect_err("two mistakes");
     assert_eq!(diagnostics.len(), 2);
