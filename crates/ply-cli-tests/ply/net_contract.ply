@@ -11,6 +11,8 @@ import std.list (all, concat, contains)
 import std.net
 import std.net (net, Refusal)
 import std.show (show)
+import std.task
+import std.time (seconds)
 import std.udp
 import std.udp (udp, Datagram)
 
@@ -163,12 +165,16 @@ test/nondet "over IPv6 loopback a connection's far end is `::1`, where the machi
   }
 }
 
-/// A name looked up, and dialled to a listener that only one of its addresses reaches.
-fn by_name() -> List<String> / {Sockets, dns.lookup, ip.refused, abort.raise} = {
+/// A name looked up under a deadline, and dialled to a listener that only one of its addresses
+/// reaches.
+fn by_name() -> List<String> / {Sockets, dns.lookup, task.write, clock.read, clock.write, task::deadline.at, ip.refused, abort.raise} = {
   let l = listening("127.0.0.1:0");
-  let found = dns.lookup("localhost", 5000);
+  let found = dns::resolve("localhost", seconds(5));
   let dialled: Result<Int, Refusal> = try {
     net::dial[client]("localhost", ip::socket_port(l.here), [], 5000)
+  };
+  let foreign: Result<Int, Refusal> = try {
+    net::dial[client]("b\u{fc}cher.example", ip::socket_port(l.here), [], 5000)
   };
   let lines = [
     "localhost resolves to loopback and nothing else: "
@@ -181,12 +187,15 @@ fn by_name() -> List<String> / {Sockets, dns.lookup, ip.refused, abort.raise} = 
         Err(_) -> "no answer",
       }),
     "an address written as text answers itself: "
-      ++ show(dns.lookup("192.0.2.7", 5000) == Ok([{ address: ip::read("192.0.2.7"), ttl: None }])),
+      ++ show(dns.lookup("192.0.2.7") == Ok([{ address: ip::read("192.0.2.7"), ttl: None }])),
+    "a name that is not ASCII is refused and not looked up: "
+      ++ show(dns.lookup("b\u{fc}cher.example") == Err(dns::not_ascii())),
     "the name dials the address that listens: "
       ++ (match dialled {
         Ok(c) -> shown_ip(net.peer_address[client](c)),
         Err(why) -> shown_refusal(why),
       }),
+    "a name that is not ASCII dials nothing: " ++ shown_opened(foreign),
   ];
   match dialled { Ok(c) -> net.close[client](c), Err(_) -> () };
   net.close[listener](l.socket);
@@ -194,11 +203,17 @@ fn by_name() -> List<String> / {Sockets, dns.lookup, ip.refused, abort.raise} = 
 }
 
 test/nondet "a name is looked up and dialled over the twin as the system's resolver has it" {
-  let host = by_name();
+  let host = task::unbounded(|| by_name());
   // The order a resolver may give: the address nothing listens at first.
   let names = dns::with_name(dns::table(), "localhost", [ip::read("::1"), ip::read("127.0.0.1")]);
-  agreeing(host, net::on_mem(net::mem_resolving(net::mem_empty(), names), || by_name()).value);
-  assert_eq(list_at(host, 2), Some("the name dials the address that listens: 127.0.0.1"))
+  agreeing(
+    host,
+    net::on_mem(net::mem_resolving(net::mem_empty(), names), ||
+      task::unbounded(|| by_name())).value,
+  );
+  assert_eq(list_at(host, 2), Some("a name that is not ASCII is refused and not looked up: true"));
+  assert_eq(list_at(host, 3), Some("the name dials the address that listens: 127.0.0.1"));
+  assert_eq(list_at(host, 4), Some("a name that is not ASCII dials nothing: other"))
 }
 
 fn too_long() -> String = "the path is longer than a socket's address holds"

@@ -1041,9 +1041,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Resolution and the connect on the caller's thread; each address the name resolves to gets the
-/// deadline in turn.
+/// deadline in turn. A name is ASCII, as it is to `dns.lookup`, whatever the system's resolver
+/// would make of another.
 fn reach(host: &str, port: u16, timeout: Duration) -> Option<TcpStream> {
     use std::net::ToSocketAddrs;
+    if !host.is_ascii() {
+        return None;
+    }
     let addrs = (host, port).to_socket_addrs().ok()?;
     let stream = addrs
         .into_iter()
@@ -1082,7 +1086,9 @@ fn reach_unix(path: &Path, timeout: Duration) -> Result<UnixStream, Refusal> {
     let refusal = |e: io::Error| Refusal::of(&e);
     let address = SockAddr::unix(path).map_err(refusal)?;
     let socket = RawSocket::new(Domain::UNIX, Type::STREAM, None).map_err(refusal)?;
-    socket.connect_timeout(&address, timeout).map_err(|e| {
+    // Linux polls a non-blocking connect to a full queue as ready; a blocking one waits this out.
+    socket.set_write_timeout(Some(timeout)).map_err(refusal)?;
+    socket.connect(&address).map_err(|e| {
         // Nothing at the path is nothing listening there.
         if e.kind() == io::ErrorKind::NotFound {
             Refusal::Refused
