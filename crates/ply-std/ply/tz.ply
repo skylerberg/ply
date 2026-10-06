@@ -1,0 +1,2090 @@
+//! Time zones: what the clocks of a place read at an instant, and the instants a reading of them
+//! names.
+//!
+//! The IANA Time Zone Database ships with the library as the release publishes it, the text
+//! `tzdata.zi` of zone lines and rules, and `version` names the release. `zone("Europe/Paris")`
+//! finds a zone by its name there, written exactly as the database writes it, and makes it of the
+//! lines and rules that describe it; a link such as `US/Eastern` answers the zone it names, under
+//! that zone's own name. `tz"Europe/Paris"` is one checked when the program is. `utc` and `fixed`
+//! make a zone without the database, and `zone_in` one from a release a program embeds itself.
+//! Nothing here reads a clock or the host's own zone: an instant is an argument, and so is a
+//! zone.
+//!
+//! A `Zone` holds every change of its clocks from the first the database records to the end of
+//! what an `Instant` holds, the rules that run for ever written out year by year, so a question
+//! of it is a search and performs nothing. Before the first change a zone reads what the database
+//! starts it at, which for a place is its local mean time. `offset_at` answers the offset, the
+//! abbreviation and whether daylight time is in force, and `local` the wall-clock reading.
+//! Abbreviations are written and never read: several zones share `CST`.
+//!
+//! A wall-clock reading names one instant, none or two, and `resolve` says which: `Unique`, a
+//! `Gap` where the clocks were put forward over it, or an `Overlap` where they were put back
+//! through it. `earlier`, `later`, `compatible` and `unique` are the policies that choose an
+//! instant of one. `add` moves an instant by a calendar period on the zone's own clocks, so a day
+//! later is the same reading on the next date; an elapsed `Duration` is added to the instant
+//! itself, by `std.time`'s `after`, and the two differ across a change.
+
+import std.bytes (int_of_ascii, is_digit)
+import std.date
+import std.date (DateTime, Extended, OffsetDateTime, Overflow, Period)
+import std.gen
+import std.gen (Gen)
+import std.laws (agrees, round_trip)
+import std.list (at_or, concat, drop, find, last, sort_by, take)
+import std.option (option_and_then, option_expect, option_map)
+import std.result (result_map)
+import std.string (pad_left, split_once)
+import std.text (closest)
+import std.time
+
+/// What a zone's clocks stand at over a stretch of time.
+pub type Offset = new {
+  /// Seconds east of UTC, negative for west, under a day either way.
+  seconds: Int,
+  /// What the zone calls its time over the stretch, as the database abbreviates it: `CET`, `EDT`,
+  /// or the offset in digits, `+0530`, where the place has no name for it.
+  abbreviation: String,
+  /// Whether the database counts the stretch as daylight saving time.
+  daylight: Bool,
+}
+
+/// A time zone: a name, and every change of its clocks.
+pub opaque type Zone = | Zone(Table)
+
+/// The offset before the first change, the second of each change in order, and the offset after
+/// each. `stride` is the largest power of two no more than their count, which a search starts at.
+type Table = { name: String, initial: Offset, times: Array<Int>, after: List<Offset>, stride: Int }
+
+show for Zone by name
+
+gen for Zone by arbitrary
+
+/// The instants a wall-clock reading names in a zone.
+pub type Resolution =
+  /// The one instant the zone's clocks read it at.
+  | Unique(Instant)
+  /// No instant: the clocks were put forward over the reading. `before` is the instant the clocks
+  /// would have read it at had they been put forward already, which is before the change, and
+  /// `after` the instant they would have read it at had they not been, which is at or after it.
+  /// The two are as far apart as the clocks were moved.
+  | Gap({ before: Instant, after: Instant })
+  /// Two instants: the clocks were put back through the reading. `earlier` is before the change
+  /// and `later` at or after it.
+  | Overlap({ earlier: Instant, later: Instant })
+
+/// A change of a zone's clocks: the instant of it, and what they stood at either side.
+pub type Transition = new { at: Instant, before: Offset, after: Offset }
+
+/// A name the database keeps for a zone it lists under another.
+pub type Link = { name: String, target: String }
+
+/// How much a zone read from data a program supplies may hold.
+pub type Limits = {
+  /// The most changes of its clocks, counted before those that cancel are dropped.
+  transitions: Int,
+}
+
+/// Why a zone was refused.
+pub type Why =
+  /// No zone or link of the data has the name, and it is no offset written `+hh:mm`.
+  | Unknown
+  /// A line of the data is not one `tzdata.zi` holds: a field is missing, or is no number, month,
+  /// weekday or time of day.
+  | Malformed
+  /// A zone line names rules the data has none of.
+  | NoRules
+  /// Nothing settles the abbreviation a zone line starts with: its format takes a rule's letters,
+  /// and no rule is in force.
+  | NoAbbreviation
+  /// An offset a day or more from UTC.
+  | OffsetRange
+  /// More changes than the limit.
+  | TooMany
+
+/// A refusal, and the byte of the data its line starts at: zero where the name is unknown.
+pub type Refusal = new { why: Why, at: Int }
+
+/// What `zone` and `zone_in` raise where they refuse.
+pub effect tz {
+  /// The name is no zone's, or the data's lines for it are not ones to make a zone of.
+  raise refused(e: Refusal)
+}
+
+/// The sentence a refusal says.
+pub fn refusal_message(refused: Refusal) -> String =
+  match refused.why {
+    Unknown -> "no zone or link of the database has this name",
+    Malformed -> "a line of the data is not one a `tzdata.zi` holds",
+    NoRules -> "a zone line names rules the data has none of",
+    NoAbbreviation -> "nothing settles the abbreviation a zone line starts with",
+    OffsetRange -> "an offset a day or more from UTC",
+    TooMany -> "more changes of the zone's clocks than the limit",
+  }
+
+// --- The database ---------------------------------------------------------------
+
+fn shipped() -> Bytes = embed("tz/tzdata.zi")
+
+/// The release of the IANA Time Zone Database that ships, as the release names itself: a year
+/// and a letter.
+pub fn version() -> String =
+  match try[abort.raise] { version_of(shipped()) } { Ok(found) -> found, Err(_) -> "" }
+
+/// The notice the database is published under, which puts it in the public domain.
+pub fn license() -> String = string_of_bytes_lossy(embed("tz/LICENSE"))
+
+/// The name of every zone the database describes, in its order. A link is not among them.
+pub fn names() -> List<String> =
+  match try[abort.raise] { names_of(shipped()) } { Ok(found) -> found, Err(_) -> [] }
+
+/// Every link of the database, in its order: a name, and the zone it names.
+pub fn links() -> List<Link> =
+  match try[abort.raise] { links_of(shipped()) } { Ok(found) -> found, Err(_) -> [] }
+
+/// The zone of a name: one the database lists, a link to one, or an offset written `+05:30` or
+/// `-03:30:15`, a sign and `hh:mm` with seconds or none. A name is matched as written: the
+/// database's names differ in case from no other, and `europe/paris` is none of them. Raises
+/// `tz.refused` for a name that is none.
+pub fn zone(name: String) -> Zone / {tz.refused} =
+  match offset_named(name) {
+    Some(z) -> z,
+    None -> looked_up(shipped(), true, name, { transitions: 4096 }),
+  }
+
+/// `zone`, with its refusal as an `Err`.
+pub fn parse(name: String) -> Result<Zone, Refusal> = try { zone(name) }
+
+/// What a `tz"..."` literal is checked by: the zone `zone` answers, or why the text names none,
+/// with the nearest name the database has where one is near.
+pub fn literal(text: String) -> Result<Zone, { message: String, offset: Int }> =
+  match parse(text) {
+    Ok(z) -> Ok(z),
+    Err(refused) ->
+      Err({
+        message: match refused.why {
+          Unknown -> match closest(text, concat(names(), map(links(), |l: Link| l.name)), 3) {
+            Some(near) -> "no zone has this name: the nearest is `" ++ near ++ "`",
+            None -> refusal_message(refused),
+          },
+          _ -> refusal_message(refused),
+        },
+        offset: 0,
+      }),
+  }
+
+/// The zone of a name in a release of the database a program supplies: the bytes of a
+/// `tzdata.zi`, the one file each release publishes its zones and rules in, as `embed` reads
+/// them. A program that embeds a newer release than ships is held to that one, whatever its
+/// toolchain carries. Raises `tz.refused` as `zone` does, and where the zone has more changes
+/// than `limits` allows.
+pub fn zone_in(data: Bytes, name: String, limits: Limits) -> Zone / {tz.refused} =
+  match offset_named(name) { Some(z) -> z, None -> looked_up(data, false, name, limits) }
+
+/// The release a `tzdata.zi` names itself as in its first line, or `""` where it names none.
+pub fn version_in(data: Bytes) -> String =
+  match try[abort.raise] { version_of(data) } { Ok(found) -> found, Err(_) -> "" }
+
+/// UTC, as the database lists it: `Etc/UTC`, with no change ever.
+pub fn utc() -> Zone =
+  Zone({
+    name: "Etc/UTC",
+    initial: { seconds: 0, abbreviation: "UTC", daylight: false },
+    times: array_of_list([]),
+    after: [],
+    stride: 0,
+  })
+
+/// The zone that stands `seconds` east of UTC for ever, negative for west, named as `zone` reads
+/// it, `+05:30`; `None` for a day or more.
+pub fn fixed(seconds: Int) -> Option<Zone> =
+  if seconds <= 0 - 86400 || seconds >= 86400 { None } else {
+    Some(
+      Zone({
+        name: offset_name(seconds),
+        initial: { seconds: seconds, abbreviation: numeric(seconds), daylight: false },
+        times: array_of_list([]),
+        after: [],
+        stride: 0,
+      }),
+    )
+  }
+
+/// The zone's name: the database's own for it, whatever link it was asked for by, and `+05:30`
+/// for a fixed offset.
+pub fn name(z: Zone) -> String = table(z).name
+
+fn table(z: Zone) -> Table = match z { Zone(t) -> t }
+
+/// An offset in digits: a sign and two of hours, then two of minutes and two of seconds, each
+/// after `between`. The seconds are written where there are some, and the minutes where there are
+/// either or `whole` asks for them.
+fn in_digits(seconds: Int, between: String, whole: Bool) -> String = {
+  let east = if seconds < 0 { 0 - seconds } else { seconds };
+  let two = |n: Int| pad_left(int_to_string(n), 2, "0");
+  (if seconds < 0 { "-" } else { "+" }) ++ two(east / 3600)
+    ++ (if whole || east % 3600 != 0 { between ++ two(east / 60 % 60) } else { "" })
+    ++ (if east % 60 != 0 { between ++ two(east % 60) } else { "" })
+}
+
+/// `+hh:mm`, and `:ss` where there are seconds.
+fn offset_name(seconds: Int) -> String = in_digits(seconds, ":", true)
+
+/// An offset as the database abbreviates one with no name: `+hh`, then `mm` and `ss` where they
+/// are not zero.
+fn numeric(seconds: Int) -> String = in_digits(seconds, "", false)
+
+fn digit(c: Char) -> Option<Int> =
+  if c >= '0' && c <= '9' { Some(int_of_char(c) - 48) } else { None }
+
+fn pair(tens: Char, ones: Char, most: Int) -> Option<Int> =
+  match ((digit(tens), digit(ones))) {
+    (Some(a), Some(b)) -> if a * 10 + b <= most { Some(a * 10 + b) } else { None },
+    _ -> None,
+  }
+
+fn signed(sign: Char, seconds: Option<Int>) -> Option<Zone> =
+  match seconds {
+    Some(east) -> if sign == '+' { fixed(east) }
+    else if sign == '-' { fixed(0 - east) }
+    else { None },
+    None -> None,
+  }
+
+fn offset_named(name: String) -> Option<Zone> =
+  match string_chars(name) {
+    [sign, h1, h2, ':', m1, m2] ->
+      signed(sign, match ((pair(h1, h2, 23), pair(m1, m2, 59))) {
+        (Some(h), Some(m)) -> Some(h * 3600 + m * 60),
+        _ -> None,
+      }),
+    [sign, h1, h2, ':', m1, m2, ':', s1, s2] ->
+      signed(sign, match ((pair(h1, h2, 23), pair(m1, m2, 59), pair(s1, s2, 59))) {
+        (Some(h), Some(m), Some(s)) -> Some(h * 3600 + m * 60 + s),
+        _ -> None,
+      }),
+    _ -> None,
+  }
+
+// --- Reading `tzdata.zi` ---------------------------------------------------------
+
+/// A line of the data: the byte it starts at, the byte it ends before, and its fields.
+type Line = { at: Int, end: Int, fields: List<Bytes> }
+
+/// The clock a time of day is read on: the zone's own, its own without daylight time, or UTC's.
+type Clock = | Wall | Standard | Universal
+
+/// A day of a month: a date, or the first of a weekday on or after one, or the last on or before
+/// one. A weekday is Sunday 0 to Saturday 6.
+type Day = | DayOfMonth(Int) | OnOrAfter(Int, Int) | OnOrBefore(Int, Int)
+
+/// A rule line: the years it holds in, the month, day and time of day it takes effect at, and
+/// what it adds to standard time, with the letters it puts in an abbreviation.
+type Rule = {
+  from: Int,
+  to: Int,
+  month: Int,
+  day: Day,
+  at: Int,
+  clock: Clock,
+  save: Int,
+  daylight: Bool,
+  letter: String,
+}
+
+/// Where a zone line stops holding: the year, the second its date and time name on a clock that
+/// never changes, and the clock that time is read on.
+type Until = { year: Int, at: Int, clock: Clock }
+
+/// How a zone line keeps daylight time: a fixed amount, or by rules.
+type Regime = | Fixed(Int, Bool) | Ruled(List<Rule>)
+
+/// A zone line: standard time's offset, how daylight time is kept, the format of the
+/// abbreviation, and where the line stops holding.
+type Era = { at: Int, stdoff: Int, regime: Regime, format: String, until: Option<Until> }
+
+type Sets = Map<String, List<Rule>>
+
+fn refuse<a>(why: Why, at: Int) -> a / {tz.refused} = tz.refused({ why: why, at: at })
+
+fn want<a>(found: Option<a>, at: Int) -> a / {tz.refused} =
+  match found { Some(v) -> v, None -> refuse(Malformed, at) }
+
+/// The last year a rule that holds for ever is written out for: the one an `Instant` ends in.
+fn horizon() -> Int = 2262
+
+fn line_at(data: Bytes, at: Int) -> Line / {abort.raise} = {
+  let end = match bytes_index_of_from(data, b"\n", at) { Some(e) -> e, None -> bytes_len(data) };
+  { at: at, end: end, fields: bytes_split(bytes_slice(data, at, end), b" ") }
+}
+
+/// Each line that opens with what follows the line break in `needle`, in the data's order.
+fn lines_from(
+  data: Bytes,
+  needle: Bytes,
+  from: Int,
+  left: Int,
+  found: List<Line>,
+) -> List<Line> / {abort.raise} =
+  if left <= 0 { found } else {
+    match bytes_index_of_from(data, needle, from) {
+      None -> found,
+      Some(p) -> lines_from(data, needle, p + 1, left - 1, push(found, line_at(data, p + 1))),
+    }
+  }
+
+/// The line at `at` and each after it that opens with a digit or a `-`: a zone's lines.
+fn block(data: Bytes, at: Int, left: Int, found: List<Line>) -> List<Line> / {abort.raise} =
+  if left <= 0 || at >= bytes_len(data) { found } else {
+    let line = line_at(data, at);
+    let next = line.end + 1;
+    if next < bytes_len(data) && (is_digit(bytes_at(data, next)) || bytes_at(data, next) == b'-') {
+      block(data, next, left - 1, push(found, line))
+    } else { push(found, line) }
+  }
+
+fn version_of(data: Bytes) -> String / {abort.raise} =
+  if !bytes_starts_with(data, b"# version ") { "" } else {
+    match bytes_index_of(data, b"\n") {
+      Some(end) -> string_of_bytes_lossy(bytes_slice(data, 10, end)),
+      None -> "",
+    }
+  }
+
+fn text_at(fields: List<Bytes>, i: Int) -> String = string_of_bytes_lossy(at_or(fields, i, b""))
+
+fn names_of(data: Bytes) -> List<String> / {abort.raise} =
+  map(lines_from(data, b"\nZ ", 0, bytes_len(data), []), |l: Line| text_at(l.fields, 1))
+
+fn links_of(data: Bytes) -> List<Link> / {abort.raise} =
+  map(lines_from(data, b"\nL ", 0, bytes_len(data), []), |l: Line|
+    { name: text_at(l.fields, 2), target: text_at(l.fields, 1) })
+
+/// Hours, then minutes and seconds where they are written, as seconds: `2`, `2:30`, `-0:25:21`.
+fn hms(text: Bytes) -> Option<Int> / {abort.raise} =
+  if bytes_starts_with(text, b"-") {
+    option_map(unsigned_hms(bytes_slice(text, 1, bytes_len(text))), |n: Int| 0 - n)
+  } else { unsigned_hms(text) }
+
+fn unsigned_hms(text: Bytes) -> Option<Int> / {abort.raise} = {
+  let within = |n: Option<Int>, most: Int|
+    match n { Some(v) -> if v >= 0 && v <= most { Some(v) } else { None }, None -> None };
+  match map(bytes_split(text, b":"), int_of_ascii) {
+    [h] -> option_map(within(h, 999), |hours: Int| hours * 3600),
+    [h, m] -> match ((within(h, 999), within(m, 59))) {
+      (Some(hours), Some(minutes)) -> Some(hours * 3600 + minutes * 60),
+      _ -> None,
+    },
+    [h, m, s] -> match ((within(h, 999), within(m, 59), within(s, 59))) {
+      (Some(hours), Some(minutes), Some(seconds)) -> Some(hours * 3600 + minutes * 60 + seconds),
+      _ -> None,
+    },
+    _ -> None,
+  }
+}
+
+fn month_names() -> List<Bytes> =
+  [
+    b"January",
+    b"February",
+    b"March",
+    b"April",
+    b"May",
+    b"June",
+    b"July",
+    b"August",
+    b"September",
+    b"October",
+    b"November",
+    b"December",
+  ]
+
+fn weekday_names() -> List<Bytes> =
+  [b"Sunday", b"Monday", b"Tuesday", b"Wednesday", b"Thursday", b"Friday", b"Saturday"]
+
+/// Which of `names` a word shortens, counted from 0: the one name it starts, where it starts
+/// exactly one.
+fn shortened(word: Bytes, names: List<Bytes>) -> Option<Int> =
+  if bytes_len(word) == 0 { None } else {
+    match filter(range(0, len(names)), |i: Int| bytes_starts_with(at_or(names, i, b""), word)) {
+      [only] -> Some(only),
+      _ -> None,
+    }
+  }
+
+/// The days of a month in a leap year, which is the day `last` counts back from.
+fn longest(month: Int) -> Int =
+  if month == 2 { 29 }
+  else if month == 4 || month == 6 || month == 9 || month == 11 { 30 }
+  else { 31 }
+
+fn in_month(day: Option<Int>) -> Option<Int> =
+  match day { Some(d) -> if d >= 1 && d <= 31 { Some(d) } else { None }, None -> None }
+
+/// `8`, `lastSu`, `Su>=8` or `Sa<=30`.
+fn day_of(text: Bytes, month: Int) -> Option<Day> / {abort.raise} =
+  if bytes_starts_with(text, b"last") {
+    option_map(shortened(bytes_slice(text, 4, bytes_len(text)), weekday_names()), |w: Int|
+      OnOrBefore(w, longest(month)))
+  } else {
+    match bytes_index_of(text, b"=") {
+      None -> option_map(in_month(int_of_ascii(text)), |d: Int| DayOfMonth(d)),
+      Some(equals) -> if equals < 2 { None } else {
+        let weekday = shortened(bytes_slice(text, 0, equals - 1), weekday_names());
+        let day = in_month(int_of_ascii(bytes_slice(text, equals + 1, bytes_len(text))));
+        let sense = bytes_at(text, equals - 1);
+        match ((weekday, day)) {
+          (Some(w), Some(d)) -> if sense == b'>' { Some(OnOrAfter(w, d)) }
+          else if sense == b'<' { Some(OnOrBefore(w, d)) }
+          else { None },
+          _ -> None,
+        }
+      },
+    }
+  }
+
+type Timed = { seconds: Int, clock: Clock }
+
+/// A time of day and the clock it is read on: the zone's own unless it ends in `s` for standard
+/// time or in `u`, `g` or `z` for UTC.
+fn timed(text: Bytes) -> Option<Timed> / {abort.raise} = {
+  let n = bytes_len(text);
+  if n == 0 { None } else {
+    let end = bytes_at(text, n - 1);
+    let clock = if end == b'w' { Some(Wall) }
+    else if end == b's' { Some(Standard) }
+    else if end == b'u' || end == b'g' || end == b'z' { Some(Universal) }
+    else { None };
+    match clock {
+      Some(c) -> option_map(hms(bytes_slice(text, 0, n - 1)), |s: Int| { seconds: s, clock: c }),
+      None -> option_map(hms(text), |s: Int| { seconds: s, clock: Wall }),
+    }
+  }
+}
+
+type Saved = { seconds: Int, daylight: Bool }
+
+/// What a rule adds to standard time: daylight time unless it adds nothing, or as an `s` or a `d`
+/// after it says.
+fn saved(text: Bytes) -> Option<Saved> / {abort.raise} = {
+  let n = bytes_len(text);
+  if n == 0 { None } else {
+    let end = bytes_at(text, n - 1);
+    if end == b's' || end == b'd' {
+      option_map(hms(bytes_slice(text, 0, n - 1)), |s: Int| { seconds: s, daylight: end == b'd' })
+    } else { option_map(hms(text), |s: Int| { seconds: s, daylight: s != 0 }) }
+  }
+}
+
+fn year_of(text: Bytes) -> Option<Int> / {abort.raise} =
+  match int_of_ascii(text) {
+    Some(y) -> if y >= 1 && y <= 9999 { Some(y) } else { None },
+    None -> None,
+  }
+
+/// The last year of a rule: a year, `only` its first, or `max` for ever, each as shortened.
+fn last_year(text: Bytes, first: Int) -> Option<Int> / {abort.raise} =
+  if bytes_len(text) > 0 && bytes_starts_with(b"only", text) { Some(first) }
+  else if bytes_len(text) > 1 && bytes_starts_with(b"maximum", text) { Some(horizon()) }
+  else { option_map(year_of(text), |y: Int| min(y, horizon())) }
+
+fn rule_of(line: Line) -> Rule / {tz.refused, abort.raise} =
+  match line.fields {
+    [_, _, from, to, _, month, day, at, save, letter] -> {
+      let first = want(year_of(from), line.at);
+      let m = want(shortened(month, month_names()), line.at) + 1;
+      let time = want(timed(at), line.at);
+      let adds = want(saved(save), line.at);
+      {
+        from: first,
+        to: want(last_year(to, first), line.at),
+        month: m,
+        day: want(day_of(day, m), line.at),
+        at: time.seconds,
+        clock: time.clock,
+        save: adds.seconds,
+        daylight: adds.daylight,
+        letter: if letter == b"-" { "" } else { string_of_bytes_lossy(letter) },
+      }
+    },
+    _ -> refuse(Malformed, line.at),
+  }
+
+fn until_of(fields: List<Bytes>, at: Int) -> Option<Until> / {tz.refused, abort.raise} =
+  match fields {
+    [] -> None,
+    [year, ..rest] -> {
+      let y = want(year_of(year), at);
+      let month = match list_at(rest, 0) {
+        Some(m) -> want(shortened(m, month_names()), at) + 1,
+        None -> 1,
+      };
+      let day = match list_at(rest, 1) {
+        Some(d) -> want(day_of(d, month), at),
+        None -> DayOfMonth(1),
+      };
+      let time = match list_at(rest, 2) {
+        Some(t) -> want(timed(t), at),
+        None -> { seconds: 0, clock: Wall },
+      };
+      Some({ year: y, at: moment(y, month, day, time.seconds), clock: time.clock })
+    },
+  }
+
+type Read = { era: Era, sets: Sets }
+
+/// The zone line of these fields, with the rules it names read from the data where no line
+/// before it named them.
+fn era_of(
+  data: Bytes,
+  at: Int,
+  fields: List<Bytes>,
+  sets: Sets,
+) -> Read / {tz.refused, abort.raise} =
+  match fields {
+    [stdoff, rules, format, ..until] -> {
+      let offset = want(hms(stdoff), at);
+      let set = string_of_bytes_lossy(rules);
+      let made = |regime: Regime, known: Sets|
+        {
+          era: {
+            at: at,
+            stdoff: offset,
+            regime: regime,
+            format: string_of_bytes_lossy(format),
+            until: until_of(until, at),
+          },
+          sets: known,
+        };
+      if rules == b"-" { made(Fixed(0, false), sets) }
+      else if bytes_len(rules) == 0 { refuse(Malformed, at) }
+      else if is_digit(bytes_at(rules, 0)) || bytes_at(rules, 0) == b'-' {
+        let adds = want(saved(rules), at);
+        made(Fixed(adds.seconds, adds.daylight), sets)
+      } else {
+        match map_get(sets, set) {
+          Some(known) -> made(Ruled(known), sets),
+          None -> {
+            let lines = lines_from(
+              data,
+              bytes_concat_all([b"\nR ", rules, b" "]),
+              0,
+              bytes_len(data),
+              [],
+            );
+            let read = map(lines, rule_of);
+            if read == [] { refuse(NoRules, at) }
+            else { made(Ruled(read), map_insert(sets, set, read)) }
+          },
+        }
+      }
+    },
+    _ -> refuse(Malformed, at),
+  }
+
+/// Sunday 0 to Saturday 6 of a count of days from 1970-01-01, which was a Thursday.
+fn weekday_of(days: Int) -> Int = week_part(days + 4)
+
+/// `n` modulo seven, never negative.
+fn week_part(n: Int) -> Int = (n % 7 + 7) % 7
+
+/// The second a day of a month and a time of day name in a year, on a clock that never changes.
+fn moment(year: Int, month: Int, day: Day, at: Int) -> Int = {
+  let first = match date::of(year, month, 1) { Some(d) -> date::unix_days(d), None -> 0 };
+  let on = match day {
+    DayOfMonth(d) -> first + d - 1,
+    OnOrAfter(weekday, d) -> first + d - 1 + week_part(weekday - weekday_of(first + d - 1)),
+    OnOrBefore(weekday, d) -> {
+      let from = first + (if month == 2 && d == 29 && !date::is_leap_year(year) { 28 } else { d })
+        - 1;
+      from - week_part(weekday_of(from) - weekday)
+    },
+  };
+  on * 86400 + at
+}
+
+/// How far a clock stands from UTC where standard time is `stdoff` east and daylight time adds
+/// `save`.
+fn shift(clock: Clock, stdoff: Int, save: Int) -> Int =
+  match clock { Wall -> stdoff + save, Standard -> stdoff, Universal -> 0 }
+
+/// What a zone line's format writes: the half of `a/b` that suits, `%z` as the offset in digits,
+/// or `%s` as a rule's letters, and `None` where `%s` has none to take.
+fn designation(
+  format: String,
+  total: Int,
+  letters: Option<String>,
+  daylight: Bool,
+) -> Option<String> / {abort.raise} =
+  match split_once(format, "/") {
+    Some(halves) -> Some(if daylight { halves.tail } else { halves.head }),
+    None -> match split_once(format, "%z") {
+      Some(around) -> Some(around.head ++ numeric(total) ++ around.tail),
+      None -> match split_once(format, "%s") {
+        Some(around) -> option_map(letters, |l: String| around.head ++ l ++ around.tail),
+        None -> Some(format),
+      },
+    },
+  }
+
+// --- Making a zone of its lines ---------------------------------------------------
+
+/// A change: its second, and what the clocks stand at after it.
+type Stamp = { at: Int, kind: Offset }
+
+/// A rule in a year: the second it names on a clock that never changes, and what the clocks
+/// stand at once it has taken effect.
+type Due = { temp: Int, rule: Rule, kind: Offset }
+
+/// A zone line's rules being walked year by year: what daylight time adds now, whether the line's
+/// own start is still to be written, what the clocks stood at as it started and under which
+/// abbreviation where one is settled, and the changes written.
+type Walk = {
+  save: Int,
+  pending: Bool,
+  start_offset: Int,
+  start_name: Option<String>,
+  out: List<Stamp>,
+}
+
+/// A zone being made: the changes of the lines read, where the next line starts, and the offset
+/// before the first change where one is settled.
+type Making = {
+  out: List<Stamp>,
+  start: Option<Int>,
+  initial: Option<Offset>,
+  sets: Sets,
+  lines: Int,
+}
+
+type Pick = { index: Int, at: Int }
+
+/// The rule of `dues` that takes effect first, read on the clocks as they now stand.
+fn earliest(stdoff: Int, save: Int, dues: List<Due>) -> Option<Pick> =
+  fold(range(0, len(dues)), None, |best: Option<Pick>, i: Int|
+    match list_at(dues, i) {
+      None -> best,
+      Some(due) -> {
+        let at = due.temp - shift(due.rule.clock, stdoff, save);
+        match best {
+          Some(b) -> if at < b.at { Some({ index: i, at: at }) } else { best },
+          None -> Some({ index: i, at: at }),
+        }
+      },
+    })
+
+/// A year's rules taken in the order they take effect, each read on the clocks the one before
+/// left: one before the line's start settles what the line starts at, one at or after its end
+/// ends the year, and any other is a change.
+fn year_walked(
+  era: Era,
+  start: Option<Int>,
+  w: Walk,
+  dues: List<Due>,
+  left: Int,
+) -> Walk / {abort.raise} =
+  if left <= 0 { w } else {
+    match earliest(era.stdoff, w.save, dues) {
+      None -> w,
+      Some(pick) -> match list_at(dues, pick.index) {
+        None -> w,
+        Some(due) -> {
+          let rule = due.rule;
+          let total = due.kind.seconds;
+          let ended = match era.until {
+            Some(u) -> pick.at >= u.at - shift(u.clock, era.stdoff, w.save),
+            None -> false,
+          };
+          if ended {
+            if w.start_name == None && total == w.start_offset {
+              { ..w, start_name: Some(due.kind.abbreviation) }
+            } else { w }
+          } else {
+            let pending = w.pending && start != Some(pick.at);
+            let before = match start { Some(s) -> pending && pick.at < s, None -> false };
+            let rest = concat(take(dues, pick.index), drop(dues, pick.index + 1));
+            if before {
+              year_walked(
+                era,
+                start,
+                {
+                  ..w,
+                  save: rule.save,
+                  pending: pending,
+                  start_offset: total,
+                  start_name: Some(due.kind.abbreviation),
+                },
+                rest,
+                left - 1,
+              )
+            } else {
+              year_walked(
+                era,
+                start,
+                {
+                  save: rule.save,
+                  pending: pending,
+                  start_offset: w.start_offset,
+                  start_name: if pending && w.start_name == None && w.start_offset == total {
+                    Some(due.kind.abbreviation)
+                  } else { w.start_name },
+                  out: push(w.out, { at: pick.at, kind: due.kind }),
+                },
+                rest,
+                left - 1,
+              )
+            }
+          }
+        },
+      },
+    }
+  }
+
+/// How many times the rules take effect up to the year `top`.
+fn occasions(rules: List<Rule>, top: Int) -> Int =
+  fold(rules, 0, |n: Int, r: Rule| n + max(min(r.to, top) - r.from + 1, 0))
+
+/// The rules by the year they take effect in, each with its second there and what the line's
+/// clocks stand at after it.
+fn by_year(era: Era, rules: List<Rule>, top: Int) -> Map<Int, List<Due>> / {abort.raise} =
+  fold(rules, map_new(), |years: Map<Int, List<Due>>, r: Rule| {
+    let kind: Offset = {
+      seconds: era.stdoff + r.save,
+      abbreviation: match designation(era.format, era.stdoff + r.save, Some(r.letter), r.daylight) {
+        Some(written) -> written,
+        None -> "",
+      },
+      daylight: r.daylight,
+    };
+    fold(range(r.from, min(r.to, top) + 1), years, |m: Map<Int, List<Due>>, year: Int|
+      map_insert(
+        m,
+        year,
+        push(match map_get(m, year) { Some(dues) -> dues, None -> [] }, {
+          temp: moment(year, r.month, r.day, r.at),
+          rule: r,
+          kind: kind,
+        }),
+      ))
+  })
+
+/// The zone with one more line: the change the line starts with, the changes its rules make
+/// while it holds, and where the next line starts.
+fn era_made(m: Making, era: Era, limits: Limits) -> Making / {tz.refused, abort.raise} =
+  if m.lines > 0 && m.start == None { refuse(Malformed, era.at) } else { era_added(m, era, limits) }
+
+fn era_added(m: Making, era: Era, limits: Limits) -> Making / {tz.refused, abort.raise} =
+  match era.regime {
+    Fixed(save, daylight) -> {
+      let total = era.stdoff + save;
+      let kind: Offset = {
+        seconds: total,
+        abbreviation: match designation(era.format, total, Some(""), daylight) {
+          Some(written) -> written,
+          None -> "",
+        },
+        daylight: daylight,
+      };
+      {
+        out: match m.start { Some(at) -> push(m.out, { at: at, kind: kind }), None -> m.out },
+        start: next_start(era, save),
+        initial: if m.start == None { Some(kind) } else { m.initial },
+        sets: m.sets,
+        lines: m.lines + 1,
+      }
+    },
+    Ruled(rules) -> {
+      let top = match era.until { Some(u) -> u.year, None -> horizon() };
+      if occasions(rules, top) > limits.transitions { refuse(TooMany, era.at) } else {
+        let fresh: Walk = {
+          save: 0,
+          pending: m.start != None,
+          start_offset: era.stdoff,
+          start_name: None,
+          out: [],
+        };
+        let w = map_fold(
+          by_year(era, rules, top),
+          fresh,
+          |walk: Walk, _year: Int, dues: List<Due>|
+            year_walked(era, m.start, walk, dues, len(dues)),
+        );
+        let opening: List<Stamp> = match m.start {
+          Some(at) -> if !w.pending { [] } else {
+            let daylight = w.start_offset != era.stdoff;
+            let written = match w.start_name {
+              Some(settled) -> Some(settled),
+              None -> designation(era.format, era.stdoff + w.save, None, daylight),
+            };
+            match written {
+              Some(abbreviation) ->
+                [
+                  {
+                    at: at,
+                    kind: {
+                      seconds: w.start_offset,
+                      abbreviation: abbreviation,
+                      daylight: daylight,
+                    },
+                  },
+                ],
+              None -> refuse(NoAbbreviation, era.at),
+            }
+          },
+          None -> [],
+        };
+        let out = concat(opening, w.out);
+        {
+          out: concat(m.out, out),
+          start: next_start(era, w.save),
+          initial: match m.initial {
+            Some(settled) -> Some(settled),
+            None -> option_map(find(out, |s: Stamp| !s.kind.daylight), |s: Stamp| s.kind),
+          },
+          sets: m.sets,
+          lines: m.lines + 1,
+        }
+      }
+    },
+  }
+
+fn next_start(era: Era, save: Int) -> Option<Int> =
+  match era.until { Some(u) -> Some(u.at - shift(u.clock, era.stdoff, save)), None -> None }
+
+/// The changes in order of time, where a line's start came out before the last change of the
+/// line before it.
+fn ordered(stamps: List<Stamp>) -> List<Stamp> = {
+  let sorted = fold(
+    stamps,
+    { last: None, ok: true },
+    |so: { last: Option<Int>, ok: Bool }, s: Stamp|
+      {
+        last: Some(s.at),
+        ok: so.ok && (match so.last { Some(before) -> before <= s.at, None -> true }),
+      },
+  );
+  if sorted.ok { stamps } else { sort_by(stamps, |a: Stamp, b: Stamp| a.at <= b.at) }
+}
+
+/// The changes kept with one more: it takes the place of the change before it where it comes no
+/// later on the clocks than that one did, and is dropped where it changes nothing.
+fn kept(so_far: List<Stamp>, next: Stamp, initial: Offset) -> List<Stamp> / {abort.raise} =
+  match last(so_far) {
+    None -> push(so_far, next),
+    Some(previous) -> {
+      let n = len(so_far);
+      let earlier = match list_at(so_far, n - 2) {
+        Some(s) -> s.kind.seconds,
+        None -> initial.seconds,
+      };
+      if next.at + previous.kind.seconds <= previous.at + earlier {
+        list_set(so_far, n - 1, { at: previous.at, kind: next.kind })
+      } else if previous.kind == next.kind { so_far }
+      else { push(so_far, next) }
+    },
+  }
+
+/// The changes that change something, each a day or less from UTC.
+fn told(stamps: List<Stamp>, initial: Offset, at: Int) -> List<Stamp> / {tz.refused} = {
+  let ranged = |k: Offset| k.seconds > 0 - 86400 && k.seconds < 86400;
+  if !ranged(initial) { refuse(OffsetRange, at) } else {
+    fold(stamps, { out: [], now: initial }, |so: { out: List<Stamp>, now: Offset }, s: Stamp|
+      if !ranged(s.kind) { refuse(OffsetRange, at) }
+      else if s.kind == so.now { so }
+      else { { out: push(so.out, s), now: s.kind } }).out
+  }
+}
+
+fn stride_of(count: Int) -> Int =
+  fold(
+    [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      32768,
+      65536,
+      131072,
+      262144,
+      524288,
+      1048576,
+    ],
+    0,
+    |best: Int, power: Int| if power <= count { power } else { best },
+  )
+
+/// The zone the block of lines at `at` describes.
+fn made(data: Bytes, name: String, at: Int, limits: Limits) -> Table / {tz.refused, abort.raise} = {
+  let lines = block(data, at, bytes_len(data), []);
+  let empty: Making = { out: [], start: None, initial: None, sets: map_new(), lines: 0 };
+  let m = fold(lines, empty, |so: Making, line: Line| {
+    let read = era_of(
+      data,
+      line.at,
+      if line.at == at { drop(line.fields, 2) } else { line.fields },
+      so.sets,
+    );
+    era_made({ ..so, sets: read.sets }, read.era, limits)
+  });
+  let stamps = if m.start == None { ordered(m.out) } else { refuse(Malformed, at) };
+  let initial = match m.initial {
+    Some(settled) -> settled,
+    None -> match stamps { [first, ..] -> first.kind, [] -> refuse(Malformed, at) },
+  };
+  let changes = told(
+    fold(stamps, [], |so_far: List<Stamp>, next: Stamp| kept(so_far, next, initial)),
+    initial,
+    at,
+  );
+  if len(changes) > min(limits.transitions, 1048576) { refuse(TooMany, at) } else {
+    {
+      name: name,
+      initial: initial,
+      times: array_of_list(map(changes, |s: Stamp| s.at)),
+      after: map(changes, |s: Stamp| s.kind),
+      stride: stride_of(len(changes)),
+    }
+  }
+}
+
+fn zone_key(name: String) -> Bytes = bytes_concat_all([b"\nZ ", bytes_of_string(name), b" "])
+
+/// Whether a text could be a name: something, and nothing but printable ASCII.
+fn is_name(name: String) -> Bool / {abort.raise} =
+  name != "" && bytes_position(bytes_of_string(name), 0, |c: Int| c <= 32 || c >= 127) == None
+
+fn found(
+  data: Bytes,
+  ours: Bool,
+  name: String,
+  limits: Limits,
+) -> Table / {tz.refused, abort.raise} =
+  if !is_name(name) { refuse(Unknown, 0) } else {
+    match bytes_index_of(data, zone_key(name)) {
+      Some(p) -> made(data, name, p + 1, limits),
+      None -> match find(if ours { links() } else { links_of(data) }, |l: Link| l.name == name) {
+        None -> refuse(Unknown, 0),
+        Some(link) -> match bytes_index_of(data, zone_key(link.target)) {
+          Some(p) -> made(data, link.target, p + 1, limits),
+          None -> refuse(Unknown, 0),
+        },
+      },
+    }
+  }
+
+fn looked_up(data: Bytes, ours: Bool, name: String, limits: Limits) -> Zone / {tz.refused} =
+  match try[abort.raise] { found(data, ours, name, limits) } {
+    Ok(t) -> Zone(t),
+    Err(_) -> refuse(Malformed, 0),
+  }
+
+// --- Asking a zone ----------------------------------------------------------------
+
+/// How many of `times` are at or before `t`, counted on from `base`, where `step` is a power of
+/// two and no more than twice `step` less one of them are left to count.
+fn below(times: Array<Int>, t: Int, base: Int, step: Int) -> Int =
+  if step <= 0 { base } else {
+    below(
+      times,
+      t,
+      match array_at(times, base + step - 1) {
+        Some(at) -> if at <= t { base + step } else { base },
+        None -> base,
+      },
+      step / 2,
+    )
+  }
+
+fn count_at(z: Table, t: Int) -> Int = below(z.times, t, 0, z.stride)
+
+/// What the clocks stand at before the change numbered `index`, from 0: after the one before it.
+fn kind_before(z: Table, index: Int) -> Offset =
+  if index <= 0 { z.initial }
+  else { match list_at(z.after, index - 1) { Some(kind) -> kind, None -> z.initial } }
+
+/// The whole seconds from 1970-01-01T00:00:00Z to an instant, counted down before it.
+fn seconds_of(at: Instant) -> Int =
+  match at { Instant(n) -> if n >= 0 { n / 1000000000 } else { (n + 1) / 1000000000 - 1 } }
+
+/// The instant `part` nanoseconds after a second, where an `Instant` holds it.
+fn instant_at(seconds: Int, part: Int) -> Option<Instant> = {
+  let whole = if seconds >= 0 { seconds } else { seconds + 1 };
+  let rest = if seconds >= 0 { part } else { part - 1000000000 };
+  match checked_mul(whole, 1000000000) {
+    Some(n) -> match checked_add(n, rest) { Some(nanos) -> Some(Instant(nanos)), None -> None },
+    None -> None,
+  }
+}
+
+/// What the zone's clocks stand at at an instant: the offset, the abbreviation, and whether
+/// daylight time is in force.
+pub fn offset_at(z: Zone, at: Instant) -> Offset =
+  kind_before(table(z), count_at(table(z), seconds_of(at)))
+
+/// What the zone's clocks read at an instant, to the nanosecond.
+pub fn local(z: Zone, at: Instant) -> DateTime = {
+  let universal = date::local(date::of_instant(at));
+  match date::date_time_after(universal, time::nanos(offset_at(z, at).seconds * 1000000000)) {
+    Some(reading) -> reading,
+    None -> universal,
+  }
+}
+
+/// The instant as the zone's clocks read it, at their offset. An `OffsetDateTime` holds an offset
+/// of whole minutes, which is all RFC 3339 writes, so an offset with seconds, as local mean time
+/// has, is the nearest minute: `local` is what the clocks read there.
+pub fn of_instant(z: Zone, at: Instant) -> OffsetDateTime = {
+  let seconds = offset_at(z, at).seconds;
+  let minutes = if seconds >= 0 { (seconds + 30) / 60 } else { 0 - (30 - seconds) / 60 };
+  match date::in_offset(date::of_instant(at), max(min(minutes, 1439), 0 - 1439)) {
+    Some(reading) -> reading,
+    None -> date::of_instant(at),
+  }
+}
+
+/// The instant with the zone named after it, which `std.date`'s `rfc9557` writes as
+/// `2026-10-25T01:30:00+01:00[Europe/Paris]`.
+pub fn extended(z: Zone, at: Instant) -> Extended =
+  { instant: of_instant(z, at), zone: Some({ name: name(z), critical: false }), tags: [] }
+
+/// The seconds that read `wall` on the zone's clocks, and the change that skipped it where one
+/// did: the stretch before the change numbered `index`, over which the clocks stand at `kind`,
+/// and each stretch after it that starts within a day of the reading.
+type Scan = { seconds: List<Int>, gap: Option<{ before: Int, after: Int }> }
+
+fn scanned(z: Table, wall: Int, index: Int, kind: Offset, found: Scan) -> Scan = {
+  let t = wall - kind.seconds;
+  let begun = if index <= 0 { true }
+  else { match array_at(z.times, index - 1) { Some(from) -> from <= t, None -> true } };
+  match array_at(z.times, index) {
+    None -> if begun { { ..found, seconds: push(found.seconds, t) } } else { found },
+    Some(next) -> {
+      let here = if begun && t < next { { ..found, seconds: push(found.seconds, t) } }
+      else { found };
+      if next > wall + 86400 { here } else {
+        let after = kind_before(z, index + 1);
+        scanned(
+          z,
+          wall,
+          index + 1,
+          after,
+          if here.gap == None && next + kind.seconds <= wall && wall < next + after.seconds {
+            { ..here, gap: Some({ before: wall - after.seconds, after: t }) }
+          } else { here },
+        )
+      }
+    },
+  }
+}
+
+/// The instants a wall-clock reading names in the zone: one, none or two. `None` where an
+/// instant it names is outside what an `Instant` holds, 1677-09-21 to 2262-04-11.
+pub fn resolve(z: Zone, reading: DateTime) -> Option<Resolution> = {
+  let wall = date::unix_seconds(date::utc(reading));
+  let part = date::nanosecond(date::time_of(reading));
+  let from = count_at(table(z), wall - 86400);
+  let found = scanned(table(z), wall, from, kind_before(table(z), from), {
+    seconds: [],
+    gap: None,
+  });
+  match found.seconds {
+    [] -> match found.gap {
+      Some(skipped) -> match ((instant_at(skipped.before, part), instant_at(skipped.after, part))) {
+        (Some(before), Some(after)) -> Some(Gap({ before: before, after: after })),
+        _ -> None,
+      },
+      None -> None,
+    },
+    [only] -> option_map(instant_at(only, part), |at: Instant| Unique(at)),
+    [first, ..rest] -> match ((
+        instant_at(first, part),
+        option_map(last(rest), |s: Int| instant_at(s, part)),
+      )) {
+      (Some(earlier), Some(Some(later))) -> Some(Overlap({ earlier: earlier, later: later })),
+      _ -> None,
+    },
+  }
+}
+
+/// The earlier instant: of an overlap the one before the clocks were put back, and of a gap the
+/// one before they were put forward.
+pub fn earlier(found: Resolution) -> Instant =
+  match found { Unique(at) -> at, Gap(skipped) -> skipped.before, Overlap(both) -> both.earlier }
+
+/// The later instant: of an overlap the one after the clocks were put back, and of a gap the one
+/// after they were put forward.
+pub fn later(found: Resolution) -> Instant =
+  match found { Unique(at) -> at, Gap(skipped) -> skipped.after, Overlap(both) -> both.later }
+
+/// The instant most calendars choose: the earlier of an overlap, and for a gap the reading moved
+/// forward by as much as the clocks were, which is its later instant. It is what RFC 5545 asks of
+/// a calendar and what `java.time` and Temporal do unless told otherwise.
+pub fn compatible(found: Resolution) -> Instant =
+  match found { Unique(at) -> at, Gap(skipped) -> skipped.after, Overlap(both) -> both.earlier }
+
+/// The instant, where the reading names exactly one: `None` for a gap and for an overlap.
+pub fn unique(found: Resolution) -> Option<Instant> =
+  match found { Unique(at) -> Some(at), Gap(_) -> None, Overlap(_) -> None }
+
+/// What the zone's clocks read a calendar period after they read what they do at an instant, as
+/// `std.date`'s `date_time_add` moves a reading: a day later is the same time on the next date,
+/// however many hours that is, and so it may be a reading the clocks skip or show twice. `None`
+/// where the date is past an end of the calendar or of what an `Instant` holds.
+pub fn add(z: Zone, at: Instant, span: Period, overflow: Overflow) -> Option<Resolution> =
+  match date::date_time_add(local(z, at), span, overflow) {
+    Some(moved) -> resolve(z, moved),
+    None -> None,
+  }
+
+fn transition_at(z: Table, index: Int) -> Option<Transition> =
+  match array_at(z.times, index) {
+    None -> None,
+    Some(t) -> match instant_at(t, 0) {
+      Some(at) -> Some({ at: at, before: kind_before(z, index), after: kind_before(z, index + 1) }),
+      None -> None,
+    },
+  }
+
+/// The first change of the zone's clocks after an instant, or `None` where there is none an
+/// `Instant` holds.
+pub fn next_transition(z: Zone, after: Instant) -> Option<Transition> =
+  transition_at(table(z), count_at(table(z), seconds_of(after)))
+
+/// The last change of the zone's clocks at or before an instant: the one that set them as they
+/// stand there. `None` before the first.
+pub fn previous_transition(z: Zone, at: Instant) -> Option<Transition> =
+  transition_at(table(z), count_at(table(z), seconds_of(at)) - 1)
+
+// --- Generators -------------------------------------------------------------------
+
+/// A zone of the database three times in five, else a fixed offset or UTC.
+pub fn arbitrary() -> Gen<Zone> = {
+  let listed = gen::map(gen::elements(names()), |named: String|
+    match parse(named) { Ok(z) -> z, Err(_) -> utc() });
+  gen::one_of([
+    listed,
+    listed,
+    listed,
+    gen::map(gen::int_between(0 - 86399, 86399), |seconds: Int|
+      match fixed(seconds) { Some(z) -> z, None -> utc() }),
+    gen::constant(utc()),
+  ])
+}
+
+/// A zone and an instant a law draws.
+type Sighting = | Sighting(Zone, Instant)
+
+gen for Sighting by sightings
+
+/// A zone and a wall-clock reading a law draws.
+type Reading = | Reading(Zone, DateTime)
+
+gen for Reading by readings
+
+/// A fixed offset in seconds and an instant a law draws.
+type Stood = | Stood(Int, Instant)
+
+gen for Stood by standings
+
+fn anywhere() -> Gen<Instant> =
+  gen::one_of([
+    gen::map(gen::int_between(0 - 9223372036, 9223372036), |s: Int| Instant(s * 1000000000)),
+    gen::map(gen::int(), |n: Int| Instant(n)),
+  ])
+
+/// An instant anywhere an `Instant` goes, or beside a change of the zone's clocks: the second
+/// either side of one, or within two days of one.
+fn moments(z: Table) -> Gen<Instant> = {
+  let beside = |span: Int|
+    gen::map2(
+      gen::below(array_len(z.times)),
+      gen::int_between(0 - span, span),
+      |i: Int, by: Int|
+        match array_at(z.times, i) {
+          Some(t) -> match instant_at(t + by, 0) { Some(at) -> at, None -> Instant(0) },
+          None -> Instant(0),
+        },
+    );
+  if array_len(z.times) == 0 { anywhere() }
+  else { gen::one_of([anywhere(), beside(1), beside(172800)]) }
+}
+
+fn sightings() -> Gen<Sighting> =
+  gen::and_then(arbitrary(), |z: Zone| gen::map(moments(table(z)), |at: Instant| Sighting(z, at)))
+
+/// What a clock that never changes reads at a second.
+fn reading_of(wall: Int) -> DateTime =
+  match date::of_unix_seconds(wall) {
+    Some(read) -> date::local(read),
+    None -> date::at(date::earliest(), date::midnight()),
+  }
+
+/// A reading anywhere an `Instant` goes, or within two hours of what the zone's clocks read as
+/// one of their changes began, which is where the readings a change skips or repeats are.
+fn walls(z: Table) -> Gen<Int> = {
+  let anywhere = gen::int_between(0 - 9223372036, 9223372036);
+  let beside = gen::map2(
+    gen::below(array_len(z.times)),
+    gen::int_between(0 - 7200, 7200),
+    |i: Int, by: Int|
+      match array_at(z.times, i) { Some(t) -> t + kind_before(z, i).seconds + by, None -> by },
+  );
+  if array_len(z.times) == 0 { anywhere } else { gen::one_of([anywhere, beside, beside]) }
+}
+
+fn readings() -> Gen<Reading> =
+  gen::and_then(arbitrary(), |z: Zone|
+    gen::map(walls(table(z)), |wall: Int| Reading(z, reading_of(wall))))
+
+fn standings() -> Gen<Stood> =
+  gen::map2(gen::int_between(0 - 86399, 86399), anywhere(), |east: Int, at: Instant|
+    Stood(east, at))
+
+fn standing(east: Int) -> Zone = match fixed(east) { Some(z) -> z, None -> utc() }
+
+fn stood_reading(s: Stood) -> { east: Int, reading: DateTime } =
+  match s { Stood(east, at) -> { east: east, reading: local(standing(east), at) } }
+
+fn stood_back(read: { east: Int, reading: DateTime }) -> Option<Stood> =
+  match resolve(standing(read.east), read.reading) {
+    Some(Unique(at)) -> Some(Stood(read.east, at)),
+    _ -> None,
+  }
+
+/// The offset a walk through every change of the zone finds in force at the instant.
+fn walked(s: Sighting) -> Offset =
+  match s {
+    Sighting(z, at) ->
+      kind_before(
+        table(z),
+        fold(array_to_list(table(z).times), 0, |passed: Int, t: Int|
+          if t <= seconds_of(at) { passed + 1 } else { passed }),
+      ),
+  }
+
+fn searched(s: Sighting) -> Offset = match s { Sighting(z, at) -> offset_at(z, at) }
+
+/// Whether the two instants lie either side of one change that put the clocks forward over the
+/// reading: the clocks read as much before it at the first as they read after it at the second,
+/// which is as far as the change moved them.
+fn straddles(z: Zone, reading: DateTime, before: Instant, after: Instant) -> Bool = {
+  let width = time::between(before, after);
+  time::as_nanos(width) > 0 && date::date_time_after(local(z, before), width) == Some(reading)
+    && date::date_time_after(reading, width) == Some(local(z, after))
+    && (match next_transition(z, before) {
+      Some(change) ->
+        compare(change.at, after) != Greater
+          && (change.after.seconds - change.before.seconds) * 1000000000 == time::as_nanos(width),
+      None -> false,
+    })
+}
+
+/// Whether a reading is within a day of an end of what an `Instant` holds, or past one.
+fn out_of_reach(reading: DateTime) -> Bool = {
+  let wall = date::unix_seconds(date::utc(reading));
+  wall < 86400 - 9223372036 || wall > 9223372036 - 86400
+}
+
+law "an instant is one of those its reading names"
+  forall (s: Sighting) {
+    match s {
+      Sighting(z, at) -> match resolve(z, local(z, at)) {
+        Some(Unique(found)) -> found == at,
+        Some(Overlap(both)) ->
+          (both.earlier == at || both.later == at) && compare(both.earlier, both.later) == Less,
+        Some(Gap(_)) -> false,
+        None -> false,
+      },
+    }
+  }
+
+law "a reading names the instants that read it, or lies in the change that skipped it"
+  forall (r: Reading) {
+    match r {
+      Reading(z, reading) -> match resolve(z, reading) {
+        Some(Unique(at)) -> local(z, at) == reading,
+        Some(Overlap(both)) ->
+          local(z, both.earlier) == reading && local(z, both.later) == reading
+            && compare(both.earlier, both.later) == Less
+            && offset_at(z, both.earlier).seconds > offset_at(z, both.later).seconds,
+        Some(Gap(skipped)) -> straddles(z, reading, skipped.before, skipped.after),
+        None -> out_of_reach(reading),
+      },
+    }
+  }
+
+law "a zone's clocks stand under a day from UTC"
+  forall (s: Sighting) {
+    searched(s).seconds > 0 - 86400 && searched(s).seconds < 86400
+  }
+
+law "a second later a zone's clocks read a second later, but for a change in that second"
+  forall (s: Sighting) {
+    match s {
+      Sighting(z, Instant(n)) -> match checked_add(n, 1000000000) {
+        None -> true,
+        Some(m) -> {
+          let moved = match previous_transition(z, Instant(m)) {
+            Some(change) -> if compare(change.at, Instant(n)) == Greater {
+              change.after.seconds - change.before.seconds
+            } else { 0 },
+            None -> 0,
+          };
+          date::date_time_between(local(z, Instant(n)), local(z, Instant(m)))
+            == Some(time::nanos((1 + moved) * 1000000000))
+        },
+      },
+    }
+  }
+
+law "a search for the offset finds what a walk through every change finds" =
+  agrees(searched, walked)
+
+law "a fixed offset reads every instant back, and skips and repeats no reading" =
+  round_trip(stood_reading, stood_back)
+
+law "a zone's name names the zone" = agrees(|z: Zone| parse(name(z)), |z: Zone| Ok(z))
+
+law "the changes either side of an instant are next to each other"
+  forall (s: Sighting) {
+    match s {
+      Sighting(z, at) -> match previous_transition(z, at) {
+        None -> match next_transition(z, at) {
+          Some(first) -> first.before == offset_at(z, at),
+          None -> true,
+        },
+        Some(set) ->
+          set.after == offset_at(z, at) && set.before != set.after && compare(set.at, at) != Greater
+            && (match next_transition(z, at) {
+              Some(next) -> next.before == set.after && compare(next.at, at) == Greater,
+              None -> true,
+            }),
+      },
+    }
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+fn the_zone(named: String) -> Zone / {abort.raise} =
+  match parse(named) {
+    Ok(z) -> z,
+    Err(refused) -> panic(named ++ ": " ++ refusal_message(refused)),
+  }
+
+fn the_instant(text: String) -> Instant / {abort.raise} =
+  option_expect(option_and_then(date::parse_rfc3339(text), date::instant), text)
+
+fn the_reading(text: String) -> DateTime / {abort.raise} =
+  match date::date_time_literal(text) {
+    Ok(read) -> read,
+    Err(why) -> panic(text ++ ": " ++ why.message),
+  }
+
+test "the database is release 2026e, of 345 zones and 253 links" {
+  assert_eq(version(), "2026e");
+  assert_eq(len(names()), 345);
+  assert_eq(len(links()), 253);
+  assert_eq(version_in(shipped()), "2026e");
+  assert(string_contains(license(), "public domain"))
+}
+
+test "a link names a zone the database lists, and no zone" {
+  let listed = fold(names(), map_new(), |known: Map<String, Unit>, named: String|
+    map_insert(known, named, ()));
+  assert_eq(map_len(listed), 345);
+  assert_eq(filter(links(), |l: Link| !map_contains(listed, l.target)), []);
+  assert_eq(filter(links(), |l: Link| map_contains(listed, l.name)), [])
+}
+
+test "a zone is found by its name or a link's, and is named as the database names it" {
+  let new_york = the_zone("America/New_York");
+  assert_eq(name(new_york), "America/New_York");
+  assert_eq(f"{new_york}", "America/New_York");
+  assert_eq(the_zone("US/Eastern"), new_york);
+  assert_eq(name(the_zone("Asia/Calcutta")), "Asia/Kolkata");
+  assert_eq(name(the_zone("UTC")), "Etc/UTC");
+  assert_eq(name(the_zone("Etc/GMT+10")), "Etc/GMT+10");
+  assert_eq(offset_at(the_zone("Etc/GMT+10"), Instant(0)), {
+    seconds: 0 - 36000,
+    abbreviation: "-10",
+    daylight: false,
+  })
+}
+
+fn unknown() -> List<String> =
+  [
+    "",
+    "Europe/Pariss",
+    "europe/paris",
+    "EUROPE/PARIS",
+    "Europe/Paris ",
+    " Europe/Paris",
+    "Europe",
+    "Europe/",
+    "Paris",
+    "Europe/Paris\nZ",
+    "Z",
+    "L",
+    "CEST",
+    "+5:30",
+    "+05",
+    "+0530",
+    "+24:00",
+    "+05:60",
+    "05:30",
+  ]
+
+test "`{c}` names no zone" for c: String in unknown() {
+  assert_eq(parse(c), Err({ why: Unknown, at: 0 }));
+  assert_eq(try { zone(c) }, Err({ why: Unknown, at: 0 }))
+}
+
+test "a literal's check answers the zone, or the nearest name the database has" {
+  assert_eq(literal("Europe/Paris"), Ok(the_zone("Europe/Paris")));
+  assert_eq(
+    literal("europe/paris"),
+    Err({ message: "no zone has this name: the nearest is `Europe/Paris`", offset: 0 }),
+  );
+  assert_eq(
+    literal("Amerika/New_York"),
+    Err({ message: "no zone has this name: the nearest is `America/New_York`", offset: 0 }),
+  );
+  assert_eq(
+    literal("US/Estern"),
+    Err({ message: "no zone has this name: the nearest is `US/Eastern`", offset: 0 }),
+  );
+  assert_eq(
+    literal("Middle/Earth"),
+    Err({ message: "no zone or link of the database has this name", offset: 0 }),
+  )
+}
+
+test "UTC and a fixed offset are made without the database, and read as the database's do" {
+  assert_eq(utc(), the_zone("Etc/UTC"));
+  assert_eq(name(utc()), "Etc/UTC");
+  assert_eq(offset_at(utc(), Instant(0)), { seconds: 0, abbreviation: "UTC", daylight: false });
+  let india = option_expect(fixed(19800), "five and a half hours");
+  assert_eq(name(india), "+05:30");
+  assert_eq(the_zone("+05:30"), india);
+  assert_eq(offset_at(india, Instant(0)), {
+    seconds: 19800,
+    abbreviation: "+0530",
+    daylight: false,
+  });
+  assert_eq(option_map(fixed(0 - 12615), name), Some("-03:30:15"));
+  assert_eq(parse("-03:30:15"), Ok(option_expect(fixed(0 - 12615), "newfoundland")));
+  assert_eq(option_map(fixed(0), name), Some("+00:00"));
+  assert_eq(parse("-00:00"), Ok(option_expect(fixed(0), "no offset")));
+  assert_eq(option_map(fixed(86399), name), Some("+23:59:59"));
+  assert_eq(fixed(86400), None);
+  assert_eq(fixed(0 - 86400), None);
+  assert_eq(next_transition(india, Instant(0)), None);
+  assert_eq(previous_transition(india, Instant(0)), None)
+}
+
+type Sight = {
+  zone: String,
+  at: String,
+  reads: String,
+  seconds: Int,
+  abbreviation: String,
+  daylight: Bool,
+}
+
+fn seen(
+  zone: String,
+  at: String,
+  reads: String,
+  seconds: Int,
+  abbreviation: String,
+  daylight: Bool,
+) -> Sight =
+  {
+    zone: zone,
+    at: at,
+    reads: reads,
+    seconds: seconds,
+    abbreviation: abbreviation,
+    daylight: daylight,
+  }
+
+fn sighted(z: Zone, c: Sight) -> Unit / {abort.raise} = {
+  let at = the_instant(c.at);
+  assert_eq(offset_at(z, at), {
+    seconds: c.seconds,
+    abbreviation: c.abbreviation,
+    daylight: c.daylight,
+  });
+  assert_eq(local(z, at), the_reading(c.reads))
+}
+
+/// The second before each change of 2026 in four zones and the second of it, among them a half
+/// hour's change and one a minute past midnight, as `zdump` reads them.
+fn changes() -> List<Sight> =
+  [
+    seen("Europe/Paris", "2026-03-29T00:59:59Z", "2026-03-29T01:59:59", 3600, "CET", false),
+    seen("Europe/Paris", "2026-03-29T01:00:00Z", "2026-03-29T03:00:00", 7200, "CEST", true),
+    seen("Europe/Paris", "2026-10-25T00:59:59Z", "2026-10-25T02:59:59", 7200, "CEST", true),
+    seen("Europe/Paris", "2026-10-25T01:00:00Z", "2026-10-25T02:00:00", 3600, "CET", false),
+    seen("America/New_York", "2026-03-08T06:59:59Z", "2026-03-08T01:59:59", -18000, "EST", false),
+    seen("America/New_York", "2026-03-08T07:00:00Z", "2026-03-08T03:00:00", -14400, "EDT", true),
+    seen("America/New_York", "2026-11-01T05:59:59Z", "2026-11-01T01:59:59", -14400, "EDT", true),
+    seen("America/New_York", "2026-11-01T06:00:00Z", "2026-11-01T01:00:00", -18000, "EST", false),
+    seen("Australia/Lord_Howe", "2026-04-04T14:59:59Z", "2026-04-05T01:59:59", 39600, "+11", true),
+    seen(
+      "Australia/Lord_Howe",
+      "2026-04-04T15:00:00Z",
+      "2026-04-05T01:30:00",
+      37800,
+      "+1030",
+      false,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "2026-10-03T15:29:59Z",
+      "2026-10-04T01:59:59",
+      37800,
+      "+1030",
+      false,
+    ),
+    seen("Australia/Lord_Howe", "2026-10-03T15:30:00Z", "2026-10-04T02:30:00", 39600, "+11", true),
+    seen("America/St_Johns", "2006-04-02T03:30:59Z", "2006-04-02T00:00:59", -12600, "NST", false),
+    seen("America/St_Johns", "2006-04-02T03:31:00Z", "2006-04-02T01:01:00", -9000, "NDT", true),
+    seen("America/St_Johns", "2006-10-29T02:30:59Z", "2006-10-29T00:00:59", -9000, "NDT", true),
+    seen("America/St_Johns", "2006-10-29T02:31:00Z", "2006-10-28T23:01:00", -12600, "NST", false),
+  ]
+
+test "{c.zone} reads {c.reads} {c.abbreviation} at {c.at}" for c: Sight in changes() {
+  sighted(the_zone(c.zone), c)
+}
+
+/// Before a zone's first change, where it reads local mean time; after its last, where its rules
+/// run on; and the first and last seconds an `Instant` holds.
+fn ends() -> List<Sight> =
+  [
+    seen("Europe/Paris", "1700-01-01T00:00:00Z", "1700-01-01T00:09:21", 561, "LMT", false),
+    seen("America/New_York", "1800-01-01T00:00:00Z", "1799-12-31T19:03:58", -17762, "LMT", false),
+    seen("Asia/Kolkata", "1850-01-01T00:00:00Z", "1850-01-01T05:53:28", 21208, "LMT", false),
+    seen("Pacific/Kosrae", "1700-01-01T00:00:00Z", "1699-12-31T10:51:56", -47284, "LMT", false),
+    seen("Asia/Tokyo", "2200-01-01T00:00:00Z", "2200-01-01T09:00:00", 32400, "JST", false),
+    seen("Europe/Paris", "2261-03-31T00:59:59Z", "2261-03-31T01:59:59", 3600, "CET", false),
+    seen("Europe/Paris", "2261-03-31T01:00:00Z", "2261-03-31T03:00:00", 7200, "CEST", true),
+    seen("Europe/Paris", "2261-10-27T00:59:59Z", "2261-10-27T02:59:59", 7200, "CEST", true),
+    seen("Europe/Paris", "2261-10-27T01:00:00Z", "2261-10-27T02:00:00", 3600, "CET", false),
+    seen("America/New_York", "2262-03-09T06:59:59Z", "2262-03-09T01:59:59", -18000, "EST", false),
+    seen("America/New_York", "2262-03-09T07:00:00Z", "2262-03-09T03:00:00", -14400, "EDT", true),
+    seen("Europe/Paris", "2262-04-11T23:47:16Z", "2262-04-12T01:47:16", 7200, "CEST", true),
+    seen("Europe/Paris", "1677-09-21T00:12:44Z", "1677-09-21T00:22:05", 561, "LMT", false),
+  ]
+
+test "far from now, {c.zone} reads {c.reads} {c.abbreviation} at {c.at}" for c: Sight in ends() {
+  sighted(the_zone(c.zone), c)
+}
+
+/// Zones whose rules changed: Moscow in 2011 and 2014, São Paulo's last daylight time in 2019,
+/// Pyongyang's half hour of 2015 to 2018, Apia's skipped 30 December 2011, Dublin's winter
+/// counted as daylight time, Casablanca's Ramadan, Lord Howe's half hour, and the days Manila
+/// and Alaska crossed the date line.
+fn history() -> List<Sight> =
+  [
+    seen("Europe/Moscow", "2010-03-27T22:59:59Z", "2010-03-28T01:59:59", 10800, "MSK", false),
+    seen("Europe/Moscow", "2010-03-27T23:00:00Z", "2010-03-28T03:00:00", 14400, "MSD", true),
+    seen("Europe/Moscow", "2010-10-30T22:59:59Z", "2010-10-31T02:59:59", 14400, "MSD", true),
+    seen("Europe/Moscow", "2010-10-30T23:00:00Z", "2010-10-31T02:00:00", 10800, "MSK", false),
+    seen("Europe/Moscow", "2011-03-26T22:59:59Z", "2011-03-27T01:59:59", 10800, "MSK", false),
+    seen("Europe/Moscow", "2011-03-26T23:00:00Z", "2011-03-27T03:00:00", 14400, "MSK", false),
+    seen("Europe/Moscow", "2014-10-25T21:59:59Z", "2014-10-26T01:59:59", 14400, "MSK", false),
+    seen("Europe/Moscow", "2014-10-25T22:00:00Z", "2014-10-26T01:00:00", 10800, "MSK", false),
+    seen("America/Sao_Paulo", "2018-02-18T01:59:59Z", "2018-02-17T23:59:59", -7200, "-02", true),
+    seen("America/Sao_Paulo", "2018-02-18T02:00:00Z", "2018-02-17T23:00:00", -10800, "-03", false),
+    seen("America/Sao_Paulo", "2018-11-04T02:59:59Z", "2018-11-03T23:59:59", -10800, "-03", false),
+    seen("America/Sao_Paulo", "2018-11-04T03:00:00Z", "2018-11-04T01:00:00", -7200, "-02", true),
+    seen("America/Sao_Paulo", "2019-02-17T01:59:59Z", "2019-02-16T23:59:59", -7200, "-02", true),
+    seen("America/Sao_Paulo", "2019-02-17T02:00:00Z", "2019-02-16T23:00:00", -10800, "-03", false),
+    seen("America/Sao_Paulo", "2019-11-03T03:00:00Z", "2019-11-03T00:00:00", -10800, "-03", false),
+    seen("America/Sao_Paulo", "2200-01-01T00:00:00Z", "2199-12-31T21:00:00", -10800, "-03", false),
+    seen("Asia/Pyongyang", "2015-08-14T14:59:59Z", "2015-08-14T23:59:59", 32400, "KST", false),
+    seen("Asia/Pyongyang", "2015-08-14T15:00:00Z", "2015-08-14T23:30:00", 30600, "KST", false),
+    seen("Asia/Pyongyang", "2018-05-04T14:59:59Z", "2018-05-04T23:29:59", 30600, "KST", false),
+    seen("Asia/Pyongyang", "2018-05-04T15:00:00Z", "2018-05-05T00:00:00", 32400, "KST", false),
+    seen("Pacific/Apia", "2011-12-30T09:59:59Z", "2011-12-29T23:59:59", -36000, "-10", true),
+    seen("Pacific/Apia", "2011-12-30T10:00:00Z", "2011-12-31T00:00:00", 50400, "+14", true),
+    seen("Europe/Dublin", "1971-10-31T01:59:59Z", "1971-10-31T02:59:59", 3600, "IST", false),
+    seen("Europe/Dublin", "1971-10-31T02:00:00Z", "1971-10-31T02:00:00", 0, "GMT", true),
+    seen("Europe/Dublin", "2026-03-29T00:59:59Z", "2026-03-29T00:59:59", 0, "GMT", true),
+    seen("Europe/Dublin", "2026-03-29T01:00:00Z", "2026-03-29T02:00:00", 3600, "IST", false),
+    seen("Europe/Dublin", "2026-10-25T00:59:59Z", "2026-10-25T01:59:59", 3600, "IST", false),
+    seen("Europe/Dublin", "2026-10-25T01:00:00Z", "2026-10-25T01:00:00", 0, "GMT", true),
+    seen("Africa/Casablanca", "2018-10-28T01:59:59Z", "2018-10-28T02:59:59", 3600, "+01", true),
+    seen("Africa/Casablanca", "2018-10-28T02:00:00Z", "2018-10-28T03:00:00", 3600, "+01", false),
+    seen("Africa/Casablanca", "2026-02-15T01:59:59Z", "2026-02-15T02:59:59", 3600, "+01", false),
+    seen("Africa/Casablanca", "2026-02-15T02:00:00Z", "2026-02-15T02:00:00", 0, "+00", true),
+    seen("Africa/Casablanca", "2026-03-22T01:59:59Z", "2026-03-22T01:59:59", 0, "+00", true),
+    seen("Africa/Casablanca", "2026-03-22T02:00:00Z", "2026-03-22T03:00:00", 3600, "+01", false),
+    seen("Africa/Casablanca", "2026-09-20T00:59:59Z", "2026-09-20T01:59:59", 3600, "+01", false),
+    seen("Africa/Casablanca", "2026-09-20T01:00:00Z", "2026-09-20T01:00:00", 0, "+00", false),
+    seen("Africa/Casablanca", "2200-01-01T00:00:00Z", "2200-01-01T00:00:00", 0, "+00", false),
+    seen(
+      "Australia/Lord_Howe",
+      "1981-02-28T13:59:59Z",
+      "1981-02-28T23:59:59",
+      36000,
+      "AEST",
+      false,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "1981-02-28T14:00:00Z",
+      "1981-03-01T00:30:00",
+      37800,
+      "+1030",
+      false,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "1981-10-24T15:29:59Z",
+      "1981-10-25T01:59:59",
+      37800,
+      "+1030",
+      false,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "1981-10-24T15:30:00Z",
+      "1981-10-25T03:00:00",
+      41400,
+      "+1130",
+      true,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "1985-03-02T14:29:59Z",
+      "1985-03-03T01:59:59",
+      41400,
+      "+1130",
+      true,
+    ),
+    seen(
+      "Australia/Lord_Howe",
+      "1985-03-02T14:30:00Z",
+      "1985-03-03T01:00:00",
+      37800,
+      "+1030",
+      false,
+    ),
+    seen("Asia/Manila", "1844-12-31T15:56:07Z", "1844-12-30T23:59:59", -57368, "LMT", false),
+    seen("Asia/Manila", "1844-12-31T15:56:08Z", "1845-01-01T00:00:00", 29032, "LMT", false),
+    seen("America/Juneau", "1867-10-19T00:31:12Z", "1867-10-19T15:33:31", 54139, "LMT", false),
+    seen("America/Juneau", "1867-10-19T00:31:13Z", "1867-10-18T15:33:32", -32261, "LMT", false),
+  ]
+
+test "in its history, {c.zone} reads {c.reads} {c.abbreviation} at {c.at}" for c: Sight in history(
+  ) { sighted(the_zone(c.zone), c) }
+
+type Named = { zone: String, reading: String, names: Resolution }
+
+/// The instant a clock that stands `east` seconds east of UTC reads `reading` at.
+fn read_at(reading: String, east: Int) -> Instant / {abort.raise} = {
+  let read = the_reading(reading);
+  option_expect(
+    instant_at(date::unix_seconds(date::utc(read)) - east, date::nanosecond(date::time_of(read))),
+    reading,
+  )
+}
+
+/// A reading the zone's clocks show once, standing `east` seconds east of UTC.
+fn once(zone: String, reading: String, east: Int) -> Named / {abort.raise} =
+  { zone: zone, reading: reading, names: Unique(read_at(reading, east)) }
+
+/// A reading a change skips: the offset after the change, and the one before it.
+fn skipped(zone: String, reading: String, after: Int, before: Int) -> Named / {abort.raise} =
+  {
+    zone: zone,
+    reading: reading,
+    names: Gap({ before: read_at(reading, after), after: read_at(reading, before) }),
+  }
+
+/// A reading a change repeats: the offset before the change, and the one after it.
+fn twice(zone: String, reading: String, before: Int, after: Int) -> Named / {abort.raise} =
+  {
+    zone: zone,
+    reading: reading,
+    names: Overlap({ earlier: read_at(reading, before), later: read_at(reading, after) }),
+  }
+
+fn named_readings() -> List<Named> / {abort.raise} =
+  [
+    once("Europe/Paris", "2026-03-29T01:59:59.999999999", 3600),
+    skipped("Europe/Paris", "2026-03-29T02:00:00", 7200, 3600),
+    skipped("Europe/Paris", "2026-03-29T02:30:00", 7200, 3600),
+    skipped("Europe/Paris", "2026-03-29T02:59:59.999999999", 7200, 3600),
+    once("Europe/Paris", "2026-03-29T03:00:00", 7200),
+    once("Europe/Paris", "2026-10-25T01:59:59.999999999", 7200),
+    twice("Europe/Paris", "2026-10-25T02:00:00", 7200, 3600),
+    twice("Europe/Paris", "2026-10-25T02:30:00.5", 7200, 3600),
+    twice("Europe/Paris", "2026-10-25T02:59:59.999999999", 7200, 3600),
+    once("Europe/Paris", "2026-10-25T03:00:00", 3600),
+    skipped("America/New_York", "2026-03-08T02:30:00", -14400, -18000),
+    twice("America/New_York", "2026-11-01T01:30:00", -14400, -18000),
+    skipped("Pacific/Apia", "2011-12-30T12:00:00", 50400, -36000),
+    once("Pacific/Apia", "2011-12-29T23:59:59", -36000),
+    once("Pacific/Apia", "2011-12-31T00:00:00", 50400),
+    skipped("Australia/Lord_Howe", "2026-10-04T02:15:00", 39600, 37800),
+    twice("Australia/Lord_Howe", "2026-04-05T01:45:00", 39600, 37800),
+    twice("America/St_Johns", "2006-10-29T00:00:30", -9000, -12600),
+    skipped("America/St_Johns", "2006-04-02T00:30:00", -9000, -12600),
+    skipped("Europe/Dublin", "2026-03-29T01:30:00", 3600, 0),
+    twice("Europe/Dublin", "2026-10-25T01:30:00", 3600, 0),
+    twice("Africa/Casablanca", "2026-02-15T02:30:00", 3600, 0),
+    skipped("Africa/Casablanca", "2026-03-22T02:30:00", 3600, 0),
+    twice("Asia/Pyongyang", "2015-08-14T23:45:00", 32400, 30600),
+    skipped("Asia/Pyongyang", "2018-05-04T23:45:00", 32400, 30600),
+    skipped("Europe/Moscow", "2011-03-27T02:30:00", 14400, 10800),
+    twice("Europe/Moscow", "2014-10-26T01:30:00", 14400, 10800),
+    skipped("America/Sao_Paulo", "2018-11-04T00:30:00", -7200, -10800),
+    once("America/Sao_Paulo", "2019-11-03T00:30:00", -10800),
+    skipped("Asia/Manila", "1844-12-31T12:00:00", 29032, -57368),
+    twice("America/Juneau", "1867-10-18T20:00:00", 54139, -32261),
+    once("Europe/Paris", "1700-06-01T12:00:00", 561),
+    skipped("Europe/Paris", "2262-03-30T02:30:00", 7200, 3600),
+    once("Asia/Tokyo", "2200-01-01T00:00:00", 32400),
+  ]
+
+test "what {c.reading} names in {c.zone}" for c: Named in named_readings() {
+  assert_eq(resolve(the_zone(c.zone), the_reading(c.reading)), Some(c.names))
+}
+
+test "a policy chooses an instant of what a reading names" {
+  let paris = the_zone("Europe/Paris");
+  let noon = option_expect(resolve(paris, the_reading("2026-06-01T12:00:00")), "noon");
+  let skipped = option_expect(resolve(paris, the_reading("2026-03-29T02:30:00")), "a gap");
+  let twice = option_expect(resolve(paris, the_reading("2026-10-25T02:30:00")), "an overlap");
+  let at = the_instant("2026-06-01T10:00:00Z");
+  assert_eq([earlier(noon), later(noon), compatible(noon)], [at, at, at]);
+  assert_eq(unique(noon), Some(at));
+  assert_eq(earlier(skipped), the_instant("2026-03-29T00:30:00Z"));
+  assert_eq(later(skipped), the_instant("2026-03-29T01:30:00Z"));
+  assert_eq(compatible(skipped), the_instant("2026-03-29T01:30:00Z"));
+  assert_eq(unique(skipped), None);
+  assert_eq(local(paris, earlier(skipped)), the_reading("2026-03-29T01:30:00"));
+  assert_eq(local(paris, later(skipped)), the_reading("2026-03-29T03:30:00"));
+  assert_eq(earlier(twice), the_instant("2026-10-25T00:30:00Z"));
+  assert_eq(later(twice), the_instant("2026-10-25T01:30:00Z"));
+  assert_eq(compatible(twice), the_instant("2026-10-25T00:30:00Z"));
+  assert_eq(unique(twice), None);
+  assert_eq(offset_at(paris, earlier(twice)).abbreviation, "CEST");
+  assert_eq(offset_at(paris, later(twice)).abbreviation, "CET")
+}
+
+test "a reading whose instant an `Instant` does not hold names nothing" {
+  let paris = the_zone("Europe/Paris");
+  assert_eq(
+    resolve(paris, the_reading("2262-04-12T01:47:16")),
+    Some(Unique(Instant(9223372036000000000))),
+  );
+  assert_eq(resolve(paris, the_reading("2262-04-12T01:47:17")), None);
+  assert_eq(resolve(paris, the_reading("2300-01-01T00:00:00")), None);
+  assert_eq(resolve(paris, the_reading("1500-01-01T00:00:00")), None);
+  assert_eq(
+    resolve(utc(), the_reading("1677-09-21T00:12:43.145224192")),
+    Some(Unique(Instant(0 - 9223372036854775807 - 1))),
+  );
+  assert_eq(resolve(utc(), the_reading("1677-09-21T00:12:43.145224191")), None);
+  assert_eq(
+    resolve(utc(), the_reading("2262-04-11T23:47:16.854775807")),
+    Some(Unique(Instant(9223372036854775807))),
+  );
+  assert_eq(resolve(utc(), the_reading("9999-12-31T23:59:59")), None);
+  assert_eq(resolve(utc(), the_reading("0000-01-01T00:00:00")), None)
+}
+
+test "a calendar day and twenty-four hours part at a change of the clocks" {
+  let paris = the_zone("Europe/Paris");
+  let before = the_instant("2026-03-28T11:00:00Z");
+  assert_eq(local(paris, before), the_reading("2026-03-28T12:00:00"));
+  let a_day_on = option_expect(add(paris, before, date::days(1), date::Clamp), "a day on");
+  assert_eq(a_day_on, Unique(the_instant("2026-03-29T10:00:00Z")));
+  assert_eq(local(paris, earlier(a_day_on)), the_reading("2026-03-29T12:00:00"));
+  let hours_on = time::after(before, time::hours(24));
+  assert_eq(local(paris, hours_on), the_reading("2026-03-29T13:00:00"));
+  assert_eq(time::as_nanos(time::between(before, earlier(a_day_on))), 23 * 3600000000000);
+  let autumn = the_instant("2026-10-24T10:00:00Z");
+  assert_eq(
+    option_map(add(paris, autumn, date::days(1), date::Clamp), earlier),
+    Some(the_instant("2026-10-25T11:00:00Z")),
+  );
+  assert_eq(
+    option_map(
+      add(paris, the_instant("2026-01-31T11:00:00Z"), date::months(1), date::Clamp),
+      |found: Resolution| local(paris, earlier(found)),
+    ),
+    Some(the_reading("2026-02-28T12:00:00")),
+  );
+  assert_eq(add(paris, the_instant("2026-01-31T11:00:00Z"), date::months(1), date::Reject), None);
+  assert_eq(add(paris, before, date::years(300), date::Clamp), None)
+}
+
+test "a day added to a reading may land in a gap or an overlap, and says so" {
+  let paris = the_zone("Europe/Paris");
+  let night = the_instant("2026-03-28T01:30:00Z");
+  assert_eq(local(paris, night), the_reading("2026-03-28T02:30:00"));
+  assert_eq(
+    add(paris, night, date::days(1), date::Clamp),
+    Some(
+      Gap({
+        before: the_instant("2026-03-29T00:30:00Z"),
+        after: the_instant("2026-03-29T01:30:00Z"),
+      }),
+    ),
+  );
+  assert_eq(
+    add(paris, the_instant("2026-10-24T00:30:00Z"), date::days(1), date::Clamp),
+    Some(
+      Overlap({
+        earlier: the_instant("2026-10-25T00:30:00Z"),
+        later: the_instant("2026-10-25T01:30:00Z"),
+      }),
+    ),
+  )
+}
+
+test "a schedule kept by its first reading comes back to it after a gap" {
+  let paris = the_zone("Europe/Paris");
+  let first = the_instant("2026-03-27T01:30:00Z");
+  let nights = map(range(0, 4), |n: Int|
+    match add(paris, first, date::days(n), date::Clamp) {
+      Some(found) -> date::date_time_text(local(paris, compatible(found))),
+      None -> "",
+    });
+  assert_eq(nights, [
+    "2026-03-27T02:30:00",
+    "2026-03-28T02:30:00",
+    "2026-03-29T03:30:00",
+    "2026-03-30T02:30:00",
+  ])
+}
+
+test "the changes of a zone's clocks are found from either side" {
+  let paris = the_zone("Europe/Paris");
+  let winter: Offset = { seconds: 3600, abbreviation: "CET", daylight: false };
+  let summer: Offset = { seconds: 7200, abbreviation: "CEST", daylight: true };
+  let spring = the_instant("2026-03-29T01:00:00Z");
+  let autumn = the_instant("2025-10-26T01:00:00Z");
+  assert_eq(
+    next_transition(paris, the_instant("2026-01-01T00:00:00Z")),
+    Some({ at: spring, before: winter, after: summer }),
+  );
+  assert_eq(
+    previous_transition(paris, the_instant("2026-01-01T00:00:00Z")),
+    Some({ at: autumn, before: summer, after: winter }),
+  );
+  assert_eq(
+    option_map(previous_transition(paris, spring), |change: Transition| change.at),
+    Some(spring),
+  );
+  assert_eq(
+    option_map(next_transition(paris, spring), |change: Transition| change.at),
+    Some(the_instant("2026-10-25T01:00:00Z")),
+  );
+  assert_eq(
+    option_map(next_transition(paris, Instant(spring_nanos() - 1)), |change: Transition| change.at),
+    Some(spring),
+  );
+  assert_eq(previous_transition(paris, the_instant("1800-01-01T00:00:00Z")), None);
+  assert_eq(
+    next_transition(paris, the_instant("1800-01-01T00:00:00Z")),
+    Some({
+      at: the_instant("1891-03-15T23:50:39Z"),
+      before: { seconds: 561, abbreviation: "LMT", daylight: false },
+      after: { seconds: 561, abbreviation: "PMT", daylight: false },
+    }),
+  );
+  assert_eq(next_transition(paris, the_instant("2262-04-01T00:00:00Z")), None);
+  assert_eq(
+    option_map(previous_transition(paris, Instant(9223372036854775807)), |change: Transition|
+      change.at),
+    Some(the_instant("2262-03-30T01:00:00Z")),
+  );
+  assert_eq(next_transition(the_zone("Asia/Tokyo"), the_instant("2026-01-01T00:00:00Z")), None)
+}
+
+fn spring_nanos() -> Int / {abort.raise} =
+  match the_instant("2026-03-29T01:00:00Z") { Instant(n) -> n }
+
+test "an instant is written with its zone as RFC 9557 does, at an offset of whole minutes" {
+  let paris = the_zone("Europe/Paris");
+  let at = the_instant("2026-10-25T00:30:00Z");
+  assert_eq(date::rfc3339(of_instant(paris, at)), "2026-10-25T02:30:00+02:00");
+  assert_eq(date::rfc9557(extended(paris, at)), "2026-10-25T02:30:00+02:00[Europe/Paris]");
+  assert_eq(
+    date::rfc9557(extended(the_zone("US/Eastern"), at)),
+    "2026-10-24T20:30:00-04:00[America/New_York]",
+  );
+  assert_eq(
+    date::rfc9557(extended(option_expect(fixed(31500), "eight and three quarters"), at)),
+    "2026-10-25T09:15:00+08:45[+08:45]",
+  );
+  let long_ago = the_instant("1890-01-01T12:00:00Z");
+  assert_eq(local(paris, long_ago), the_reading("1890-01-01T12:09:21"));
+  assert_eq(date::rfc3339(of_instant(paris, long_ago)), "1890-01-01T12:09:00+00:09");
+  assert_eq(
+    date::rfc3339(of_instant(the_zone("Africa/Monrovia"), the_instant("1960-01-01T12:00:00Z"))),
+    "1960-01-01T11:15:00-00:45",
+  )
+}
+
+/// A `tzdata.zi` of one zone that uses each form a rule and a zone line take.
+fn sample() -> Bytes =
+  bytes_of_string(
+    \\# version sample
+    \\R X 1990 1995 - Mar lastSu 2 1 S
+    \\R X 1990 1995 - O lastSu 3 0 -
+    \\R X 1996 ma - Ap Su>=1 1u 1 S
+    \\R X 1996 ma - S Sa<=30 24 0 -
+    \\R Y 2000 o - Jun 15 25 0:30 H
+    \\R Y 2000 o - Jul 1 0s 0 -
+    \\R N 2005 ma - O lastSu 1 0 IST
+    \\R N 2005 ma - Mar lastSu 1 -1 GMT
+    \\Z Sample/Rules 1:30:15 - LMT 1990
+    \\1 X C%sT 2000
+    \\2 Y %z 2001
+    \\2 1 EEST 2002 Mar 3 4:15u
+    \\-3 - A/B 2003 O Su>=8 2s
+    \\-3 -1 A/B 2004
+    \\1 N %s
+    \\Z Sample/Fixed -9:30 - %z
+    \\L Sample/Rules Sample/Link
+    \\
+  )
+
+fn roomy() -> Limits = { transitions: 4096 }
+
+/// The sample's changes to 1991, of 1995 and 1996 and from mid 2000 to 2005, as `zic` and `zdump`
+/// make them of the same text.
+fn sampled() -> List<Sight> =
+  [
+    seen("Sample/Rules", "1989-12-31T22:29:45Z", "1989-12-31T23:29:45", 3600, "CT", false),
+    seen("Sample/Rules", "1990-03-25T01:00:00Z", "1990-03-25T03:00:00", 7200, "CST", true),
+    seen("Sample/Rules", "1990-10-28T01:00:00Z", "1990-10-28T02:00:00", 3600, "CT", false),
+    seen("Sample/Rules", "1995-03-26T01:00:00Z", "1995-03-26T03:00:00", 7200, "CST", true),
+    seen("Sample/Rules", "1995-10-29T01:00:00Z", "1995-10-29T02:00:00", 3600, "CT", false),
+    seen("Sample/Rules", "1996-04-07T01:00:00Z", "1996-04-07T03:00:00", 7200, "CST", true),
+    seen("Sample/Rules", "1996-09-28T22:00:00Z", "1996-09-28T23:00:00", 3600, "CT", false),
+    seen("Sample/Rules", "1999-09-25T22:00:00Z", "1999-09-25T23:00:00", 3600, "CT", false),
+    seen("Sample/Rules", "1999-12-31T23:00:00Z", "2000-01-01T01:00:00", 7200, "+02", false),
+    seen("Sample/Rules", "2000-06-15T23:00:00Z", "2000-06-16T01:30:00", 9000, "+0230", true),
+    seen("Sample/Rules", "2000-06-30T22:00:00Z", "2000-07-01T00:00:00", 7200, "+02", false),
+    seen("Sample/Rules", "2000-12-31T22:00:00Z", "2001-01-01T01:00:00", 10800, "EEST", true),
+    seen("Sample/Rules", "2002-03-03T04:15:00Z", "2002-03-03T01:15:00", -10800, "A", false),
+    seen("Sample/Rules", "2003-10-12T05:00:00Z", "2003-10-12T01:00:00", -14400, "B", true),
+    seen("Sample/Rules", "2004-01-01T04:00:00Z", "2004-01-01T05:00:00", 3600, "IST", false),
+    seen("Sample/Rules", "2005-03-27T00:00:00Z", "2005-03-27T00:00:00", 0, "GMT", true),
+    seen("Sample/Rules", "2005-10-30T01:00:00Z", "2005-10-30T02:00:00", 3600, "IST", false),
+    seen("Sample/Rules", "1800-01-01T00:00:00Z", "1800-01-01T01:30:15", 5415, "LMT", false),
+    seen("Sample/Rules", "2262-01-01T00:00:00Z", "2262-01-01T01:00:00", 3600, "IST", false),
+    seen("Sample/Fixed", "1970-01-01T00:00:00Z", "1969-12-31T14:30:00", -34200, "-0930", false),
+  ]
+
+test "supplied data's {c.zone} reads {c.reads} {c.abbreviation} at {c.at}" for c: Sight in sampled(
+  ) {
+  match try { zone_in(sample(), c.zone, roomy()) } {
+    Ok(z) -> sighted(z, c),
+    Err(refused) -> panic(refusal_message(refused)),
+  }
+}
+
+test "a zone of supplied data is named, linked and versioned by that data" {
+  assert_eq(version_in(sample()), "sample");
+  assert_eq(version_in(b"Z A 1 - X\n"), "");
+  let rules = try { zone_in(sample(), "Sample/Rules", roomy()) };
+  assert_eq(result_map(rules, name), Ok("Sample/Rules"));
+  assert_eq(try { zone_in(sample(), "Sample/Link", roomy()) }, rules);
+  assert_eq(result_map(try { zone_in(sample(), "+01:00", roomy()) }, name), Ok("+01:00"));
+  assert_eq(try { zone_in(sample(), "Europe/Paris", roomy()) }, Err({ why: Unknown, at: 0 }));
+  assert_eq(try { zone_in(b"", "Europe/Paris", roomy()) }, Err({ why: Unknown, at: 0 }))
+}
+
+type Refused = { data: String, why: Why, at: Int }
+
+fn refusals() -> List<Refused> =
+  [
+    { data: "#\nZ A 1 Nope X\n", why: NoRules, at: 2 },
+    { data: "#\nZ A 1 - X 1990\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X\n2 - Y\n", why: Malformed, at: 12 },
+    { data: "#\nZ A 1\n", why: Malformed, at: 2 },
+    { data: "#\nZ A one - X\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1:60 - X\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X 1990 Foo\n2 - Y\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X 19900\n2 - Y\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X 1990 Mar 32\n2 - Y\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X 1990 Mar lastXy\n2 - Y\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 1 - X 1990 Mar 1 2:00q\n2 - Y\n", why: Malformed, at: 2 },
+    { data: "#\nR r 2000 ma - Mar lastSu 2 1\nZ A 1 r X\n", why: Malformed, at: 2 },
+    { data: "#\nR r 2000 ma - J 1 2 1 S\nZ A 1 r X\n", why: Malformed, at: 2 },
+    { data: "#\nR r 2000 1999x - Mar 1 2 1 S\nZ A 1 r X\n", why: Malformed, at: 2 },
+    { data: "#\nR r 0 ma - Mar 1 2 1 S\nZ A 1 r X\n", why: Malformed, at: 2 },
+    { data: "#\nR r 2000 ma - Mar Su>=x 2 1 S\nZ A 1 r X\n", why: Malformed, at: 2 },
+    { data: "#\nZ A 24 - X\n", why: OffsetRange, at: 2 },
+    { data: "#\nZ A -23 -1 X\n", why: OffsetRange, at: 2 },
+    {
+      data: "#\nZ A 1 - LMT 1990\n1 r C%sT\nR r 1995 2000 - Mar 1 0 1 S\n",
+      why: NoAbbreviation,
+      at: 19,
+    },
+    {
+      data: "#\nR r 1900 ma - Mar 1 2 1 S\nR r 1900 ma - O 1 2 0 -\nZ A 1 r C%sT\n",
+      why: TooMany,
+      at: 52,
+    },
+  ]
+
+test "supplied data `{c.data}` is refused: {c.why}" for c: Refused in refusals() {
+  assert_eq(
+    try { zone_in(bytes_of_string(c.data), "A", { transitions: 100 }) },
+    Err({ why: c.why, at: c.at }),
+  )
+}
+
+test "a refusal says why in a sentence" {
+  assert_eq(
+    map([Unknown, Malformed, NoRules, NoAbbreviation, OffsetRange, TooMany], |why: Why|
+      refusal_message({ why: why, at: 0 })),
+    [
+      "no zone or link of the database has this name",
+      "a line of the data is not one a `tzdata.zi` holds",
+      "a zone line names rules the data has none of",
+      "nothing settles the abbreviation a zone line starts with",
+      "an offset a day or more from UTC",
+      "more changes of the zone's clocks than the limit",
+    ],
+  )
+}
+
+test "the generators draw zones of the database and instants beside their changes" {
+  let drawn = map(range(0, 40), |i: Int|
+    gen::sample(sightings(), 7, bytes_of_string(int_to_string(i)), 30, None).value);
+  assert_eq(len(filter(drawn, |s: Option<Sighting>| s == None)), 0);
+  assert(
+    len(
+        filter(drawn, |s: Option<Sighting>|
+          match s {
+            Some(Sighting(z, at)) -> match previous_transition(z, at) {
+              Some(change) -> time::as_nanos(time::between(change.at, at)) <= 172800000000000,
+              None -> false,
+            },
+            None -> false,
+          }),
+      )
+      > 5,
+  )
+}

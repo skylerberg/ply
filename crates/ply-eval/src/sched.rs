@@ -232,7 +232,8 @@ enum Wait {
         task: TaskId,
         span: Span,
     },
-    /// The [`Clock`] owns the timer; `until` is kept so a diagnostic can name it after it fires.
+    /// A seeded region's timer is the [`Clock`]'s, and `until` virtual time; a production region's
+    /// is the scheduler's, and `until` a reading of the host's clock.
     Timer {
         until: i64,
         span: Span,
@@ -351,6 +352,9 @@ pub struct Scheduler<K, B> {
     ready: BTreeSet<TaskId>,
     /// Each host token a task waits on, and the task.
     parked: BTreeMap<u64, TaskId>,
+    /// A production region's sleepers, each beside the reading of the host's clock that wakes it;
+    /// a seeded region's are the [`Clock`]'s.
+    timers: BTreeSet<(i64, TaskId)>,
     channels: BTreeMap<ChanId, Channel>,
     unfinished: usize,
     /// The next spawn's id: ids are never reused, so host state keyed on one never passes on.
@@ -400,6 +404,7 @@ impl<K, B> Scheduler<K, B> {
             )]),
             ready: BTreeSet::from([ROOT]),
             parked: BTreeMap::new(),
+            timers: BTreeSet::new(),
             channels: BTreeMap::new(),
             unfinished: 1,
             next_id: ROOT.0 + 1,
@@ -440,10 +445,16 @@ impl<K, B> Scheduler<K, B> {
         self.policy == Policy::Seeded
     }
 
+    /// A production region answers no reading: the host's clock and its entropy are handlers'. Of
+    /// the clock it answers the sleep alone, which is a wait of one task.
     pub fn answers(&self, effect: &str, op: &str) -> bool {
         match self.policy {
             Policy::Seeded => crate::sim::is_scheduled(effect, op),
-            Policy::Host => effect == "task" && crate::sim::TASK_OPS.contains(&op),
+            Policy::Host => match effect {
+                "task" => crate::sim::TASK_OPS.contains(&op),
+                "clock" => op == "sleep",
+                _ => false,
+            },
         }
     }
 
@@ -544,6 +555,8 @@ impl<K, B> Scheduler<K, B> {
 
         let mut fruitless = 0u32;
         let task = loop {
+            // Ahead of the ready, so a task that never waits starves no sleeper.
+            self.wake_due(rt)?;
             if let Some(task) = self.round_robin() {
                 break task;
             }
@@ -554,20 +567,29 @@ impl<K, B> Scheduler<K, B> {
             if self.unfinished == 0 {
                 return self.complete();
             }
-            // Under a stop, closing listeners is about to resolve pending `accept`s, so wait.
-            if self.parked.is_empty() && !rt.stopping() {
-                return Err(self.err_host_deadlock());
-            }
-            rt.park()?;
+            let Some(&(deadline, _)) = self.timers.first() else {
+                // Under a stop, closing listeners is about to resolve pending `accept`s, so wait.
+                if self.parked.is_empty() && !rt.stopping() {
+                    return Err(self.err_host_deadlock());
+                }
+                rt.park()?;
+                if let Some(expired) = rt.drain_expired() {
+                    return Err(expired);
+                }
+                // A park woken by a stop is how an idle service sees a signal, so it is not
+                // fruitless.
+                if !rt.stopping() {
+                    fruitless += 1;
+                    if fruitless > FRUITLESS_PARKS {
+                        return Err(self.err_park_made_no_progress());
+                    }
+                }
+                continue;
+            };
+            // Bounded by the deadline, so a return that woke nothing cannot go on for ever.
+            rt.park_until(deadline)?;
             if let Some(expired) = rt.drain_expired() {
                 return Err(expired);
-            }
-            // A park woken by a stop is how an idle service sees a signal, so it is not fruitless.
-            if !rt.stopping() {
-                fruitless += 1;
-                if fruitless > FRUITLESS_PARKS {
-                    return Err(self.err_park_made_no_progress());
-                }
             }
         };
 
@@ -608,6 +630,52 @@ impl<K, B> Scheduler<K, B> {
         };
         self.current = None;
         Ok(())
+    }
+
+    /// Parks the running task until the host's clock has run `nanos` on, the region's other tasks
+    /// running meanwhile. No span or less is a yield, as it is on virtual time.
+    pub fn sleep_on_host(
+        &mut self,
+        k: K,
+        nanos: i64,
+        span: Span,
+        rt: &dyn HostRuntime,
+    ) -> Result<(), Diagnostic> {
+        if let Err(d) = self.require(Policy::Host) {
+            return Err(d.secondary(span, "this sleep would have waited on the host's clock"));
+        }
+        if nanos <= 0 {
+            return self.suspend(k, Value::Unit);
+        }
+        let task = self.running()?;
+        let until = rt
+            .now()
+            .map_err(|d| d.primary(span, "slept here"))?
+            .saturating_add(nanos);
+        self.timers.insert((until, task));
+        self.task_mut(task)?.state = TaskState::Blocked {
+            wait: Wait::Timer { until, span },
+            k,
+        };
+        self.current = None;
+        Ok(())
+    }
+
+    /// Readies each sleeper whose deadline the host's clock has reached, earliest first.
+    fn wake_due(&mut self, rt: &dyn HostRuntime) -> Result<(), Diagnostic> {
+        if self.timers.is_empty() {
+            return Ok(());
+        }
+        let now = rt.now()?;
+        let mut due = Vec::new();
+        while let Some(&(until, task)) = self.timers.first() {
+            if until > now {
+                break;
+            }
+            self.timers.remove(&(until, task));
+            due.push(task);
+        }
+        self.wake(&due)
     }
 
     /// Readies each task whose token resolved since the last look; answers whether any had.
@@ -926,9 +994,12 @@ impl<K, B> Scheduler<K, B> {
     /// Takes `target` off whatever `wait` had it waiting on.
     fn let_go(&mut self, target: TaskId, wait: Wait, clock: Option<&mut Clock>) -> LetGo {
         match wait {
-            Wait::Timer { .. } => {
-                if let Some(clock) = clock {
-                    clock.cancel(target);
+            Wait::Timer { until, .. } => {
+                match clock {
+                    Some(clock) => clock.cancel(target),
+                    None => {
+                        self.timers.remove(&(until, target));
+                    }
                 }
                 LetGo::Nothing
             }
@@ -1440,11 +1511,11 @@ impl<K, B> Scheduler<K, B> {
         if self.policy != Policy::Seeded {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                "`clock.sleep` was answered by a production region, which has no virtual clock",
+                "`clock.sleep` was answered on virtual time by a production region, which has none",
             )
             .primary(span, "performed here")
             .secondary(self.span, "this region schedules against the host runtime")
-            .note("under `--host` a sleep is a host operation answering `Pending`, not a timer this scheduler owns"));
+            .note("under `--host` a sleep is a deadline on the host's clock, which `sleep_on_host` takes"));
         }
         let task = self.running()?;
         self.task_mut(task)?.state = TaskState::Blocked {

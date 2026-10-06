@@ -67,6 +67,8 @@ enum Request {
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
+    /// The nanoseconds a production task waits on the host's clock.
+    Sleep(i64),
     Finished(Word),
     Failed,
     /// The task unwound after a cancel.
@@ -448,6 +450,10 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
             None => sim.sched.park_on_host(k, pending, site, &Unbound),
         },
+        Request::Sleep(nanos) => match &runtime {
+            Some(rt) => sim.sched.sleep_on_host(k, nanos, site, rt.as_ref()),
+            None => sim.sched.sleep_on_host(k, nanos, site, &Unbound),
+        },
         Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
             Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
             Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),
@@ -700,6 +706,15 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
             }
         }
         ("task", "yield") => Request::Yield,
+        // A seeded region's sleep is its virtual clock's, below.
+        ("clock", "sleep") if c.sims.last().is_some_and(|sim| sim.is_production()) => {
+            let span = c.value(args[0]);
+            heap::dec(args[0]);
+            match ply_eval::sim::nanos_of(&span, c.site(), "`clock.sleep`") {
+                Ok(nanos) => Request::Sleep(nanos),
+                Err(d) => return c.fail(d),
+            }
+        }
         _ => {
             let Some(sig) = signature(effect.as_str(), op.as_str()) else {
                 let d = Diagnostic::error(
@@ -780,8 +795,10 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::{Builtin, Mode};
     let mode = match b {
-        Builtin::CellGet => Mode::Read,
-        Builtin::CellSet | Builtin::CellUpdate => Mode::Write,
+        Builtin::CellGet | Builtin::HoldGet => Mode::Read,
+        Builtin::CellSet | Builtin::CellUpdate | Builtin::HoldTake | Builtin::HoldPut => {
+            Mode::Write
+        }
         _ => return None,
     };
     let Value::Cell(slot) = ctx.value(*args.first()?) else {
