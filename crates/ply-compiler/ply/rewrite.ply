@@ -655,9 +655,10 @@ pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Modu
   }
 
 // --- The hold --------------------------------------------------------------------------------
-// `with_hold[r](acquire, release) { h -> body }` is a cell of region `r` holding what `acquire`
-// answered, around a bracket whose release takes it out of the cell and hands it to `release`.
-// The two builtins it calls have names no source can spell, so no module rebinds them.
+// `with_hold[r](acquire, release) { h -> body }` is a cell of region `r` around a bracket: the
+// bracket's acquire runs `acquire` and puts what it answered into the cell, so a cancel takes no
+// answer from it, and its release takes that out of the cell and hands it to `release`. The
+// builtins it calls have names no source can spell, so no module rebinds them.
 
 fn unwritten_param(name: Bytes, span: Span) -> Param =
   { name: { name: name, span: span }, ty: None, cost: None, default: None, span: span }
@@ -669,7 +670,9 @@ fn expanded_hold(expr: Expr) -> Expr =
   match expr {
     EWithHold(h) -> {
       let held = { name: b"?held", span: h.span };
+      let acquire = { name: b"?acquire", span: h.span };
       let release = { name: b"?release", span: h.span };
+      let thunk = |body: Expr| ELambda({ span: h.span, body: body, params: [], ret: None });
       let over_held = |body: Expr|
         ELambda({
           span: h.span,
@@ -677,31 +680,36 @@ fn expanded_hold(expr: Expr) -> Expr =
           params: [unwritten_param(held.name, h.span)],
           ret: None,
         });
+      let bound = |name: Ident, value: Expr|
+        SLet({ span: h.span, pat: var_pattern(name), ty: None, value: value });
+      let acquired = EApp({ span: h.span, func: var_of(acquire), named: [], args: [], labels: [] });
       let region = EWithCell({
         span: h.span,
         resource: h.resource,
-        init: h.acquire,
+        init: ELit({ span: h.span, lit: LUnit }),
         binder: h.binder,
         body: hidden_call(h.span, b"?hold_bracket", [
-          ELambda({ span: h.span, body: var_of(h.binder), params: [], ret: None }),
+          thunk(
+            EBlock({
+              span: h.span,
+              tail: Some(var_of(h.binder)),
+              stmts: [SExpr(hidden_call(h.span, b"?hold_put", [var_of(h.binder), acquired]))],
+            }),
+          ),
           over_held(
             applied_to(var_of(release), hidden_call(h.span, b"?hold_take", [var_of(held)]), h.span),
           ),
           over_held(h.body),
         ]),
       });
-      // `release` is written outside the hold's binder, so it is bound outside it: a name it
-      // shares with the binder is the one around the region.
+      // `acquire` and `release` are written outside the hold's binder, so they are bound outside
+      // it: a name either shares with the binder is the one around the region.
       EBlock({
         span: h.span,
         tail: Some(region),
         stmts: [
-          SLet({
-            span: h.span,
-            pat: var_pattern(release),
-            ty: None,
-            value: over_held(applied_to(h.release, var_of(held), h.span)),
-          }),
+          bound(acquire, thunk(h.acquire)),
+          bound(release, over_held(applied_to(h.release, var_of(held), h.span))),
         ],
       })
     },
