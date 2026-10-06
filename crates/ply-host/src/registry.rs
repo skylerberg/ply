@@ -2,7 +2,7 @@
 
 use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
+use crate::{certgen, clock, config, fs, password, process, random, sched, tcp, time, trace};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
 use std::rc::Rc;
@@ -19,8 +19,11 @@ pub struct Host {
     fs: Arc<fs::FsHost>,
     /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
-    /// The two readings `std.time` answers, counting from when this host was built.
+    /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
+    /// region's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
+    /// The pool `std.password`'s hashes are made on.
+    password: Arc<password::PasswordHost>,
     /// Rung by every pool above, so a park can wait on all of them at once.
     bell: Arc<Bell>,
 }
@@ -42,6 +45,8 @@ impl Host {
         net.ring(&bell);
         let fs = fs::FsHost::new(fs::Roots::new());
         fs.ring(&bell);
+        let password = password::PasswordHost::new();
+        password.ring(&bell);
         Host {
             net: Arc::new(net),
             config: Arc::new(config::Snapshot::unopened()),
@@ -50,6 +55,7 @@ impl Host {
             fs: Arc::new(fs),
             process: None,
             time: Arc::new(time::TimeHost::new()),
+            password: Arc::new(password),
             bell,
         }
     }
@@ -118,6 +124,8 @@ impl Host {
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         time::register(&mut registry, Arc::clone(&self.time));
+        clock::register(&mut registry, Arc::clone(&self.time));
+        password::register(&mut registry, Arc::clone(&self.password));
         certgen::register(&mut registry);
         signal::register(&mut registry, self.shutdown.as_ref());
         process::register(&mut registry, self.process.as_ref());
@@ -130,8 +138,10 @@ impl Host {
             net: Arc::clone(&self.net),
             fs: Arc::clone(&self.fs),
             process: self.process.clone(),
+            password: Arc::clone(&self.password),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
+            time: Arc::clone(&self.time),
             bell: Arc::clone(&self.bell),
             inboxes: Inboxes::default(),
         })
@@ -147,6 +157,7 @@ impl Host {
 
     pub fn stopping_on(self, shutdown: Arc<Shutdown>) -> Host {
         shutdown.attach_net(Arc::clone(&self.net) as Arc<dyn signal::Accepting>);
+        shutdown.attach_bell(&self.bell);
         if let Some(process) = &self.process {
             shutdown.attach_children(process.children());
         }
@@ -184,10 +195,22 @@ struct Facilities {
     net: Arc<tcp::TcpHost>,
     fs: Arc<fs::FsHost>,
     process: Option<Arc<process::ProcessHost>>,
+    password: Arc<password::PasswordHost>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
+    time: Arc<time::TimeHost>,
     bell: Arc<Bell>,
     inboxes: Inboxes,
+}
+
+impl Facilities {
+    /// Whether some pool holds an operation that has finished and not been collected.
+    fn ready(&self) -> bool {
+        self.net.ready()
+            || self.fs.ready()
+            || self.process.as_ref().is_some_and(|p| p.ready())
+            || self.password.ready()
+    }
 }
 
 /// Per facility, the tokens this runtime watches, as they resolve.
@@ -196,6 +219,7 @@ struct Inboxes {
     net: Arc<Inbox>,
     fs: Arc<Inbox>,
     process: Arc<Inbox>,
+    password: Arc<Inbox>,
 }
 
 impl HostRuntime for Facilities {
@@ -211,6 +235,9 @@ impl HostRuntime for Facilities {
         {
             return process.watch_into(pending, &self.inboxes.process);
         }
+        if self.password.owns(pending) {
+            return self.password.watch_into(pending, &self.inboxes.password);
+        }
         Err(err_unowned(pending))
     }
 
@@ -220,6 +247,7 @@ impl HostRuntime for Facilities {
         if let Some(process) = &self.process {
             resolved.extend(process.collect(&self.inboxes.process));
         }
+        resolved.extend(self.password.collect(&self.inboxes.password));
         resolved
     }
 
@@ -238,6 +266,9 @@ impl HostRuntime for Facilities {
             {
                 return process.park_until(bound);
             }
+            if self.password.outstanding() > 0 {
+                return self.password.park_until(bound);
+            }
             if let Some(shutdown) = &self.shutdown {
                 shutdown.park(bound);
             }
@@ -246,24 +277,45 @@ impl HostRuntime for Facilities {
         let net = self.net.outstanding() > 0;
         let fs = self.fs.outstanding() > 0;
         let process = self.process.as_ref().filter(|p| p.outstanding() > 0);
-        match (net, fs, process) {
-            (false, false, None) => Err(err_nothing_outstanding()),
-            (true, false, None) => self.net.park(),
-            (false, true, None) => self.fs.park(),
-            (false, false, Some(process)) => process.park(),
+        let password = self.password.outstanding() > 0;
+        match (net, fs, process, password) {
+            (false, false, None, false) => Err(err_nothing_outstanding()),
+            (true, false, None, false) => self.net.park(),
+            (false, true, None, false) => self.fs.park(),
+            (false, false, Some(process), false) => process.park(),
+            (false, false, None, true) => self.password.park(),
             // Several pools' condition variables cannot be waited on together, so the bell each
             // of them rings is waited on instead.
             _ => {
                 let seen = self.bell.rung();
-                let ready = self.net.ready()
-                    || self.fs.ready()
-                    || self.process.as_ref().is_some_and(|p| p.ready());
-                if !ready {
+                if !self.ready() {
                     self.bell.wait_past(seen);
                 }
                 Ok(())
             }
         }
+    }
+
+    fn now(&self) -> Result<i64, Diagnostic> {
+        Ok(self.time.elapsed_ns())
+    }
+
+    fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
+        // Read before the stop and the pools are looked at, so a ring after either look ends the
+        // wait at once.
+        let seen = self.bell.rung();
+        let Ok(left) = u64::try_from(deadline.saturating_sub(self.time.elapsed_ns())) else {
+            return Ok(());
+        };
+        let mut bound = std::time::Duration::from_nanos(left);
+        // A drain parks in bounded steps, so its deadline is seen while every task sleeps.
+        if self.stopping() {
+            bound = bound.min(signal::DRAIN_POLL);
+        }
+        if !self.ready() {
+            self.bell.wait_past_for(seen, bound);
+        }
+        Ok(())
     }
 
     fn stopping(&self) -> bool {
@@ -309,6 +361,9 @@ impl HostRuntime for Facilities {
             {
                 return process.block_on(pending);
             }
+            if self.password.owns(&pending) {
+                return self.password.block_on(pending);
+            }
             return Err(err_unowned(&pending));
         };
         loop {
@@ -327,6 +382,11 @@ impl HostRuntime for Facilities {
                     return Ok(value);
                 }
                 process.park_until(signal::DRAIN_POLL)?;
+            } else if self.password.owns(&pending) {
+                if let Some(value) = self.password.poll(&pending)? {
+                    return Ok(value);
+                }
+                self.password.park_until(signal::DRAIN_POLL)?;
             } else {
                 return Err(err_unowned(&pending));
             }

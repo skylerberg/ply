@@ -3,7 +3,7 @@ use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::region::{StepSite, Trail};
 use ply_eval::sched::*;
 use ply_eval::sim::{Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
-use ply_eval::sim::{Answer, Handlers, signature};
+use ply_eval::sim::{Answer, Handlers, channel_access, ended, liveness, signature};
 use ply_eval::{
     Diagnostic, EffectAtom, Mode, Resource, SimId, SourceId, Span, Symbol, TaskHandle, Value, codes,
 };
@@ -33,6 +33,14 @@ enum Act {
     Send(u64, i64),
     Recv(u64),
     Close(u64),
+    Cancel(u64),
+    Await(u64),
+    /// Each arm a channel beside what it sends, and whether to wait when none can go.
+    Select(Vec<(u64, Option<i64>)>, bool),
+    /// Enter a bracket's `acquire` or `release`, without ending the step.
+    Enter(Shield),
+    /// Leave one; a cancel that was held back lands here.
+    Leave(Shield),
 }
 
 /// A whole program: script 0 is the region's body and every other script is something spawned.
@@ -64,8 +72,11 @@ struct Run {
     steps: Vec<(u64, Vec<u64>, u16)>,
     /// `(task, stamp)` per step, which the search reads to decide whether two steps could reorder.
     stamps: Vec<(TaskId, Stamp)>,
-    /// `(task, answer)` for each send and receive, in the order the tasks heard them.
+    /// `(task, answer)` for each send, receive, select, cancel and await, in the order the tasks
+    /// heard them.
     heard: Vec<(u64, Value)>,
+    /// `(task, accesses)` per step, each access as it prints.
+    touched: Vec<(u64, Vec<String>)>,
 }
 
 fn chan(n: u64) -> ChanHandle {
@@ -77,6 +88,27 @@ fn chan(n: u64) -> ChanHandle {
 
 fn run(program: &Program, seed: Seed) -> Result<Run, Diagnostic> {
     run_with(program, seed, DEFAULT_STEPS)
+}
+
+/// These scripts have no source, so an access is placed nowhere.
+fn nowhere() -> StepSite {
+    StepSite {
+        definition: None,
+        span: Span::DUMMY,
+    }
+}
+
+/// What a region records of a cancel beside the liveness it writes.
+fn record_let_go(trail: &mut Trail, let_go: LetGo) {
+    match let_go {
+        LetGo::Nothing => {}
+        LetGo::Task(on) => trail.record_access(ended(on), nowhere()),
+        LetGo::Chans(chans) => {
+            for chan in chans {
+                trail.record_access(channel_access(chan), nowhere());
+            }
+        }
+    }
 }
 
 /// Drives the scheduler as the machine's seeded prompt does: a perform ends a step.
@@ -117,10 +149,27 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                         .map(|s| (s.task, s.stamp.clone()))
                         .collect(),
                     heard,
+                    touched: trail
+                        .steps()
+                        .iter()
+                        .map(|s| {
+                            (
+                                s.task.0,
+                                s.accesses.accesses().map(|a| a.to_string()).collect(),
+                            )
+                        })
+                        .collect(),
                 });
             }
             Turn::Run { task, resumption } => {
                 let at = task.0 as usize;
+                // A cancelled task only unwinds: nothing of its script runs again.
+                if let Resumption::Cancel { .. } = &resumption {
+                    marks.push((task.0, "stopped"));
+                    trail.record_access(ended(task), nowhere());
+                    sched.finish_cancelled()?;
+                    continue;
+                }
                 if let Resumption::Start { body, .. } = &resumption {
                     let index = match body {
                         Value::Int(i) => *i as usize,
@@ -144,6 +193,7 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                 // One step: act until something suspends this task.
                 loop {
                     let Some(act) = program[script[at]].get(pc[at]).cloned() else {
+                        trail.record_access(ended(task), nowhere());
                         sched.finish(Value::Int(task.0 as i64))?;
                         break;
                     };
@@ -202,6 +252,55 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             sched.recv(suspended(), &chan(n), Span::DUMMY)?
                         }
                         Act::Close(n) => sched.close(suspended(), &chan(n), Span::DUMMY)?,
+                        Act::Cancel(id) => {
+                            asked[at] = true;
+                            let stopped = sched.cancel(
+                                suspended(),
+                                &TaskHandle::unowned(SimId(0), TaskId(id)),
+                                Span::DUMMY,
+                                Some(handlers.clock_mut()),
+                            )?;
+                            if stopped.ended {
+                                trail.record_access(ended(TaskId(id)), nowhere());
+                            } else {
+                                trail.record_access(liveness(TaskId(id), Mode::Write), nowhere());
+                                trail.mark_last_step_of(
+                                    SimId(0),
+                                    TaskId(id),
+                                    liveness(TaskId(id), Mode::Read),
+                                );
+                                record_let_go(&mut trail, stopped.let_go);
+                            }
+                        }
+                        Act::Await(id) => {
+                            asked[at] = true;
+                            sched.await_task(
+                                suspended(),
+                                &TaskHandle::unowned(SimId(0), TaskId(id)),
+                                Span::DUMMY,
+                            )?
+                        }
+                        Act::Select(arms, wait) => {
+                            asked[at] = true;
+                            let arms = arms
+                                .into_iter()
+                                .map(|(n, send)| (chan(n), send.map(Value::Int)))
+                                .collect();
+                            sched.select(suspended(), arms, wait, Span::DUMMY)?
+                        }
+                        Act::Enter(shield) => {
+                            sched.shield(shield).expect("a task is running");
+                            continue;
+                        }
+                        Act::Leave(shield) => {
+                            if sched.unshield(task, shield) {
+                                marks.push((task.0, "landed"));
+                                trail.record_access(ended(task), nowhere());
+                                sched.finish_cancelled()?;
+                                break;
+                            }
+                            continue;
+                        }
                         Act::Fail => {
                             return Err(sched.fail(
                                 Diagnostic::error(codes::RUNTIME_ERROR, "the task failed")
@@ -210,6 +309,8 @@ fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnosti
                             ));
                         }
                     }
+                    let let_go = sched.refuse_wait(task, Some(handlers.clock_mut()));
+                    record_let_go(&mut trail, let_go);
                     break;
                 }
             }
@@ -592,6 +693,322 @@ fn a_negative_capacity_is_refused() {
     let program: Program = vec![vec![Act::Channel(-1)]];
     let err = run(&program, Seed::at(0, Vec::new())).expect_err("no channel holds -1 values");
     assert_eq!(err.code, codes::RUNTIME_ERROR);
+}
+
+/// What a select heard: `None` where no arm could go, else the arm that went and what it took or
+/// sent, `None` there for a closed channel.
+fn selected(heard: &Value) -> Option<Option<(i64, Option<i64>)>> {
+    let Value::Ctor { name, args } = heard else {
+        return None;
+    };
+    match (name.as_str(), args.as_slice()) {
+        ("None", []) => Some(None),
+        ("Some", [Value::Record(fields)]) => {
+            let Value::Int(at) = fields.named("_0")? else {
+                return None;
+            };
+            let Value::Ctor { name, args } = fields.named("_1")? else {
+                return None;
+            };
+            let got = match (name.as_str(), args.as_slice()) {
+                ("Some", [Value::Int(n)]) => Some(*n),
+                _ => None,
+            };
+            Some(Some((*at, got)))
+        }
+        _ => None,
+    }
+}
+
+fn selects(run: &Run, task: u64) -> Vec<Option<(i64, Option<i64>)>> {
+    received(run, task).iter().filter_map(selected).collect()
+}
+
+#[test]
+fn a_select_goes_on_the_first_arm_that_can_in_the_order_its_arms_are_given() {
+    let program: Program = vec![vec![
+        Act::Channel(1),
+        Act::Channel(1),
+        Act::Send(0, 10),
+        Act::Send(1, 11),
+        Act::Select(vec![(1, None), (0, None)], true),
+        Act::Select(vec![(1, None), (0, None)], true),
+    ]];
+    let run = run(&program, Seed::at(0, Vec::new())).expect("completes");
+    assert_eq!(
+        selects(&run, 0),
+        vec![Some((0, Some(11))), Some((1, Some(10)))]
+    );
+}
+
+#[test]
+fn a_select_that_does_not_wait_answers_at_once_whatever_its_arms_can_do() {
+    let program: Program = vec![vec![
+        Act::Channel(0),
+        Act::Channel(1),
+        // Nothing to receive, and a rendezvous with no receiver.
+        Act::Select(vec![(0, None), (1, None), (0, Some(5))], false),
+        // Room for one, then none.
+        Act::Select(vec![(1, Some(6))], false),
+        Act::Select(vec![(1, Some(7))], false),
+        Act::Close(1),
+        // A closed channel refuses a send, gives up what it held, and then is at its end.
+        Act::Select(vec![(1, Some(8))], false),
+        Act::Select(vec![(1, None)], false),
+        Act::Select(vec![(1, None)], false),
+        Act::Select(vec![], false),
+    ]];
+    let run = run(&program, Seed::at(0, Vec::new())).expect("completes");
+    assert_eq!(
+        selects(&run, 0),
+        vec![
+            None,
+            Some((0, Some(6))),
+            None,
+            Some((0, None)),
+            Some((0, Some(6))),
+            Some((0, None)),
+            None,
+        ]
+    );
+}
+
+#[test]
+fn a_waiting_select_goes_on_the_arm_another_task_makes_ready_and_leaves_the_others() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Select(vec![(0, None), (1, None)], true),
+            // Were the select still waiting on channel 0, this send would be handed to it.
+            Act::Spawn(2),
+            Act::Recv(0),
+            Act::Join(1),
+            Act::Join(2),
+        ],
+        vec![Act::Send(1, 9)],
+        vec![Act::Send(0, 4)],
+    ];
+    for root in 0..16 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(selects(&run, 0), vec![Some((1, Some(9)))], "seed {root}");
+        assert_eq!(received(&run, 0).last(), Some(&some_int(4)), "seed {root}");
+        assert_eq!(received(&run, 1), vec![Value::Bool(true)], "seed {root}");
+    }
+}
+
+#[test]
+fn a_select_that_waits_to_send_hands_its_value_to_the_receiver_that_comes() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Select(vec![(1, None), (0, Some(5))], true),
+            Act::Join(1),
+        ],
+        vec![Act::Recv(0)],
+    ];
+    for root in 0..16 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(selects(&run, 0), vec![Some((1, Some(5)))], "seed {root}");
+        assert_eq!(received(&run, 1), vec![some_int(5)], "seed {root}");
+    }
+}
+
+/// A select may wait on both sides of one channel, and a close reaches it once.
+#[test]
+fn a_close_reaches_a_select_waiting_on_both_sides_of_the_channel_once() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Sleep(1),
+            Act::Close(0),
+            Act::Join(1),
+        ],
+        vec![Act::Select(vec![(0, Some(1)), (0, None)], true)],
+    ];
+    for root in 0..8 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(selects(&run, 1), vec![Some((1, None))], "seed {root}");
+    }
+}
+
+#[test]
+fn cancelling_a_waiting_select_takes_it_off_every_channel_it_waited_on() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Sleep(1),
+            Act::Cancel(1),
+            Act::Await(1),
+            Act::Spawn(2),
+            Act::Recv(0),
+            Act::Join(2),
+        ],
+        vec![Act::Select(vec![(0, None), (1, Some(3))], true)],
+        vec![Act::Send(0, 7)],
+    ];
+    for root in 0..8 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(
+            received(&run, 0),
+            vec![Value::Bool(true), Value::ctor("None", vec![]), some_int(7)],
+            "seed {root}"
+        );
+        // The cancel is ordered against every other step on either channel.
+        let cancel = run
+            .touched
+            .iter()
+            .find(|(task, touched)| *task == 0 && touched.iter().any(|a| a.contains("task.alive")))
+            .expect("the root's cancel is a step");
+        for chan in ["#0", "#1"] {
+            assert!(
+                cancel.1.iter().any(|a| a.contains(chan)),
+                "seed {root}: the cancel touched {:?}",
+                cancel.1
+            );
+        }
+    }
+}
+
+/// The search orders two steps only where it has both, so a task cancelled before it ran still
+/// takes one, which reads what the cancel wrote and is not ordered after it.
+#[test]
+fn a_task_cancelled_before_it_starts_takes_one_step_the_cancel_is_ordered_against() {
+    let program: Program = vec![
+        vec![Act::Spawn(1), Act::Cancel(1), Act::Await(1)],
+        vec![Act::Mark("ran")],
+    ];
+    let run = run(&program, Seed::at(0, vec![0, 0])).expect("completes");
+    assert!(run.marks.is_empty(), "{:?}", run.marks);
+    assert_eq!(
+        received(&run, 0),
+        vec![Value::Bool(true), Value::ctor("None", vec![])]
+    );
+    let dropped = run
+        .touched
+        .iter()
+        .position(|(task, _)| *task == 1)
+        .expect("the cancelled task takes a step");
+    assert!(
+        run.touched[dropped]
+            .1
+            .iter()
+            .any(|a| a.contains("task.alive")),
+        "{:?}",
+        run.touched[dropped].1
+    );
+    assert!(
+        !happens_before(&run.stamps[1].1, TaskId(0), &run.stamps[dropped].1),
+        "a task that could have run before its cancel is ordered after it"
+    );
+}
+
+/// The script of task 1 here stands in a bracket: `Enter` and `Leave` are where its `acquire` or
+/// its `release` begins and returns.
+fn bracketed(shield: Shield, inside: Vec<Act>) -> Vec<Act> {
+    let mut script = vec![Act::Enter(shield)];
+    script.extend(inside);
+    script.extend([
+        Act::Mark("returned"),
+        Act::Leave(shield),
+        Act::Mark("after"),
+    ]);
+    script
+}
+
+#[test]
+fn a_cancel_takes_no_answer_from_an_acquire_and_lands_when_it_returns() {
+    let root = vec![
+        Act::Channel(1),
+        Act::Send(0, 4),
+        Act::Spawn(1),
+        Act::Cancel(1),
+        Act::Await(1),
+    ];
+    // The root makes, sends and spawns; the task's receive is answered; then the cancel.
+    let seed = || Seed::at(0, vec![0, 0, 0, 1, 0]);
+    let held: Program = vec![root.clone(), bracketed(Shield::Acquire, vec![Act::Recv(0)])];
+    let run_held = run(&held, seed()).expect("completes");
+    assert_eq!(received(&run_held, 1), vec![some_int(4)]);
+    assert_eq!(run_held.marks, vec![(1, "returned"), (1, "landed")]);
+    assert_eq!(
+        received(&run_held, 0),
+        vec![
+            Value::Bool(true),
+            Value::Bool(true),
+            Value::ctor("None", vec![])
+        ]
+    );
+
+    let bare: Program = vec![root, vec![Act::Recv(0), Act::Mark("after")]];
+    let run_bare = run(&bare, seed()).expect("completes");
+    assert_eq!(received(&run_bare, 1), Vec::<Value>::new());
+    assert_eq!(run_bare.marks, vec![(1, "stopped")]);
+}
+
+#[test]
+fn a_cancel_lets_go_of_a_wait_inside_an_acquire_whenever_the_wait_begins() {
+    let root = vec![
+        Act::Channel(0),
+        Act::Spawn(1),
+        Act::Cancel(1),
+        Act::Await(1),
+    ];
+    // Waiting already when the cancel comes.
+    let waiting: Program = vec![root.clone(), bracketed(Shield::Acquire, vec![Act::Recv(0)])];
+    let run_waiting = run(&waiting, Seed::at(0, vec![0, 0, 1, 0])).expect("completes");
+    assert_eq!(run_waiting.marks, vec![(1, "stopped")]);
+
+    // Answered when the cancel comes, and then asking for something it would wait on.
+    let later: Program = vec![
+        root,
+        bracketed(Shield::Acquire, vec![Act::Yield, Act::Recv(0)]),
+    ];
+    let run_later = run(&later, Seed::at(0, vec![0, 0, 1, 0, 1])).expect("completes");
+    assert_eq!(run_later.marks, vec![(1, "stopped")]);
+    assert_eq!(received(&run_later, 1), Vec::<Value>::new());
+}
+
+#[test]
+fn a_cancel_waits_for_a_release_and_a_second_cancel_changes_nothing() {
+    let program: Program = vec![
+        vec![
+            Act::Channel(0),
+            Act::Spawn(1),
+            Act::Sleep(1),
+            Act::Cancel(1),
+            Act::Cancel(1),
+            Act::Mark("cancelled"),
+            Act::Send(0, 1),
+            Act::Await(1),
+        ],
+        bracketed(Shield::Release, vec![Act::Recv(0)]),
+    ];
+    for root in 0..8 {
+        let run = run(&program, Seed::at(root, Vec::new())).expect("completes");
+        assert_eq!(
+            run.marks,
+            vec![(0, "cancelled"), (1, "returned"), (1, "landed")],
+            "seed {root}"
+        );
+        assert_eq!(received(&run, 1), vec![some_int(1)], "seed {root}");
+        assert_eq!(
+            received(&run, 0),
+            vec![
+                Value::Bool(true),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::ctor("None", vec![])
+            ],
+            "seed {root}"
+        );
+    }
 }
 
 /// A livelock shares the deadlock's code, with a different message.
@@ -1432,6 +1849,64 @@ fn a_retired_tasks_id_is_never_handed_out_again() {
     }
 }
 
+/// The production region runs the one scheduler a seeded region does, so a select waits, is woken
+/// and answers there as it does under a seed.
+#[test]
+fn a_production_region_selects_as_a_seeded_one_does() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    sched.channel(suspended(), 0).expect("the root is running");
+    let Resumption::Resume {
+        value: Value::Chan(meet),
+        ..
+    } = until_root(&mut sched, &Idle)
+    else {
+        panic!("the root resumes from making a channel");
+    };
+    sched
+        .select(suspended(), vec![(meet, None)], false, Span::DUMMY)
+        .expect("the root is running");
+    let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
+        panic!("the root resumes from a select that does not wait");
+    };
+    assert_eq!(selected(&value), Some(None));
+
+    // The root waits to send, and the receive of the task it spawned is what wakes it.
+    let receiver = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .select(
+            suspended(),
+            vec![(meet, Some(Value::Int(5)))],
+            true,
+            Span::DUMMY,
+        )
+        .expect("the root is running");
+    let Turn::Run { task, .. } = sched.next_host(&Idle).expect("the receiver is enabled") else {
+        panic!("the region ended with its root waiting");
+    };
+    assert_eq!(task, receiver.id());
+    sched
+        .recv(suspended(), &meet, Span::DUMMY)
+        .expect("the receiver is running");
+    let mut heard = Vec::new();
+    for _ in 0..2 {
+        let Turn::Run { task, resumption } = sched.next_host(&Idle).expect("a task is enabled")
+        else {
+            panic!("the region ended before both had heard");
+        };
+        let Resumption::Resume { value, .. } = resumption else {
+            panic!("{task} was not answered");
+        };
+        heard.push((task == ROOT, value));
+        sched
+            .suspend(suspended(), Value::Unit)
+            .expect("the task is running");
+    }
+    heard.sort_by_key(|(root, _)| *root);
+    assert_eq!(heard[0].1, some_int(5), "the receiver takes what was sent");
+    assert_eq!(selected(&heard[1].1), Some(Some((0, Some(5)))));
+}
+
 /// A task cancelled before its join and one cancelled under it fail the join alike: as a raise in
 /// the joiner, whose own handlers answer it, and never as the region's failure.
 #[test]
@@ -1439,10 +1914,14 @@ fn joining_a_task_already_cancelled_resumes_the_joiner_with_a_raise() {
     let mut sched = production();
     root_step(&mut sched, &Idle);
     let target = sched.spawn(Value::Unit, Span::DUMMY);
-    let unstarted = sched
+    let stopped = sched
         .cancel(suspended(), &target, Span::DUMMY, None)
         .expect("the root is running");
-    assert_eq!(unstarted, Some(Value::Unit), "the task never started");
+    assert_eq!(
+        stopped.unstarted,
+        Some(Value::Unit),
+        "the task never started"
+    );
     let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
         panic!("the root resumes from its cancel");
     };
@@ -1703,5 +2182,259 @@ fn a_task_cannot_park_on_a_token_its_runtime_did_not_mint() {
         sched.current(),
         Some(ROOT),
         "the refused task was parked anyway"
+    );
+}
+
+/// A runtime whose clock a test reads and moves. A park on a deadline moves it there, as the
+/// host's would wait.
+#[derive(Default)]
+struct Ticking {
+    now: std::cell::Cell<i64>,
+    /// Each deadline the region parked until, in order.
+    parked_until: std::cell::RefCell<Vec<i64>>,
+}
+
+impl HostRuntime for Ticking {
+    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("nothing here parks on a token, yet `{pending}` was watched"),
+        ))
+    }
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a region with a sleeper was parked on no deadline",
+        ))
+    }
+
+    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+        Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "nothing here waits",
+        ))
+    }
+
+    fn now(&self) -> Result<i64, Diagnostic> {
+        Ok(self.now.get())
+    }
+
+    fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
+        self.parked_until.borrow_mut().push(deadline);
+        self.now.set(self.now.get().max(deadline));
+        Ok(())
+    }
+}
+
+fn sleeps(sched: &mut Sched, nanos: i64, rt: &dyn HostRuntime) {
+    sched
+        .sleep_on_host(suspended(), nanos, Span::DUMMY, rt)
+        .expect("the task is running");
+}
+
+fn next_task(sched: &mut Sched, rt: &dyn HostRuntime) -> (TaskId, Resumption<usize, Value>) {
+    match sched.next_host(rt) {
+        Ok(Turn::Run { task, resumption }) => (task, resumption),
+        Ok(Turn::Complete(_)) => panic!("the region ended with a task still to run"),
+        Err(d) => panic!("no task could run: {}", d.message),
+    }
+}
+
+#[test]
+fn a_sleeping_production_task_is_parked_alone_and_the_others_run() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let beside = sched.spawn(Value::Unit, Span::DUMMY);
+    sleeps(&mut sched, 100, &rt);
+    for _ in 0..5 {
+        let (task, _) = next_task(&mut sched, &rt);
+        assert_eq!(task, beside.id(), "the sleeper ran before its deadline");
+        sched.suspend(suspended(), Value::Unit).expect("running");
+    }
+
+    // The deadline comes while the other task is still runnable, and the sleeper has the next turn.
+    rt.now.set(100);
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, ROOT);
+    assert!(
+        matches!(
+            resumption,
+            Resumption::Resume {
+                value: Value::Unit,
+                ..
+            }
+        ),
+        "a sleep answers `Unit`"
+    );
+    assert!(
+        rt.parked_until.borrow().is_empty(),
+        "the thread waited while a task could run: {:?}",
+        rt.parked_until.borrow()
+    );
+}
+
+#[test]
+fn with_nothing_runnable_a_production_region_waits_for_its_earliest_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let late = sched.spawn(Value::Unit, Span::DUMMY);
+    let early = sched.spawn(Value::Unit, Span::DUMMY);
+    sleeps(&mut sched, 300, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, late.id());
+    sleeps(&mut sched, 200, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, early.id());
+    sleeps(&mut sched, 100, &rt);
+
+    let mut woke = Vec::new();
+    loop {
+        match sched.next_host(&rt).expect("each sleeper wakes") {
+            Turn::Complete(_) => break,
+            Turn::Run { task, .. } => {
+                woke.push((task, rt.now.get()));
+                sched.finish(Value::Unit).expect("the task is running");
+            }
+        }
+    }
+    assert_eq!(woke, vec![(early.id(), 100), (late.id(), 200), (ROOT, 300)]);
+    assert_eq!(*rt.parked_until.borrow(), vec![100, 200, 300]);
+}
+
+#[test]
+fn cancelling_a_sleeping_production_task_lets_go_of_its_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let sleeper = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    assert_eq!(next_task(&mut sched, &rt).0, sleeper.id());
+    sleeps(&mut sched, 1_000, &rt);
+
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    let stopped = sched
+        .cancel(suspended(), &sleeper, Span::DUMMY, None)
+        .expect("the root is running");
+    assert!(stopped.stopped);
+    assert_eq!(stopped.let_go, LetGo::Nothing);
+
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, sleeper.id());
+    assert!(
+        matches!(resumption, Resumption::Cancel { .. }),
+        "a cancelled sleeper only unwinds"
+    );
+    sched.finish_cancelled().expect("the sleeper is running");
+
+    // The root sleeps past where the cancelled task would have woken.
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    sleeps(&mut sched, 2_000, &rt);
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    assert_eq!(
+        *rt.parked_until.borrow(),
+        vec![2_000],
+        "the region waited on a deadline nothing sleeps until"
+    );
+}
+
+#[test]
+fn a_cancel_inside_a_release_leaves_a_production_sleeper_asleep_until_its_deadline() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let sleeper = sched.spawn(Value::Unit, Span::DUMMY);
+    sched
+        .suspend(suspended(), Value::Unit)
+        .expect("the root is running");
+    assert_eq!(next_task(&mut sched, &rt).0, sleeper.id());
+    assert_eq!(sched.shield(Shield::Release), Some(sleeper.id()));
+    sleeps(&mut sched, 500, &rt);
+
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    let stopped = sched
+        .cancel(suspended(), &sleeper, Span::DUMMY, None)
+        .expect("the root is running");
+    assert!(stopped.stopped);
+    assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    sched
+        .await_task(suspended(), &sleeper, Span::DUMMY)
+        .expect("the root is running");
+
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, sleeper.id());
+    assert!(
+        matches!(resumption, Resumption::Resume { .. }),
+        "the release's sleep was cut short"
+    );
+    assert_eq!(*rt.parked_until.borrow(), vec![500]);
+    assert!(
+        sched.unshield(sleeper.id(), Shield::Release),
+        "the cancel lands when the release returns"
+    );
+    sched.finish_cancelled().expect("the sleeper is running");
+    let (task, resumption) = next_task(&mut sched, &rt);
+    assert_eq!(task, ROOT);
+    assert!(
+        matches!(&resumption, Resumption::Resume { value, .. } if *value == Value::ctor("None", Vec::new())),
+        "an await of a cancelled task hears `None`"
+    );
+}
+
+#[test]
+fn a_production_sleep_of_no_span_is_a_yield() {
+    let rt = Ticking::default();
+    let mut sched = production();
+    root_step(&mut sched, &rt);
+    let beside = sched.spawn(Value::Unit, Span::DUMMY);
+    for nanos in [0, -5] {
+        sleeps(&mut sched, nanos, &rt);
+        assert_eq!(next_task(&mut sched, &rt).0, beside.id());
+        sched.suspend(suspended(), Value::Unit).expect("running");
+        assert_eq!(next_task(&mut sched, &rt).0, ROOT);
+    }
+    assert!(rt.parked_until.borrow().is_empty());
+}
+
+#[test]
+fn a_production_sleep_needs_a_runtime_that_keeps_time() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let err = sched
+        .sleep_on_host(suspended(), 5, Span::DUMMY, &Idle)
+        .expect_err("the idle runtime reads no clock");
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert_eq!(
+        sched.current(),
+        Some(ROOT),
+        "the refused task was put to sleep anyway"
+    );
+}
+
+/// Virtual time is the seed's: a seeded region that slept on the host's clock would stop being a
+/// function of it.
+#[test]
+fn a_seeded_region_refuses_a_sleep_on_the_hosts_clock() {
+    let (mut sched, mut clock, mut trail) = solo(0);
+    let Turn::Run { .. } = sched
+        .next(&mut clock, &mut trail)
+        .expect("the root is enabled")
+    else {
+        panic!("expected the root's step");
+    };
+    let err = sched
+        .sleep_on_host(suspended(), 5, Span::DUMMY, &Ticking::default())
+        .expect_err("a simulated region may not wait on the host's clock");
+    assert_eq!(err.code, codes::INTERNAL_ERROR);
+    assert!(err.message.contains("seeded region"), "{}", err.message);
+    assert!(
+        sched.current().is_some(),
+        "the task was put to sleep anyway"
     );
 }

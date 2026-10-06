@@ -97,15 +97,16 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     }
 }
 
-/// The language's `clock` is virtual time, which `simulate` answers by name; this is the host's
-/// real time, so its name must not be one the simulator claims or a file would have two of them.
+/// Inside `simulate` the language's `clock` is virtual time, which the region answers by name;
+/// this is the host's time wherever it is performed, so its name must not be one the simulator
+/// claims.
 #[test]
 fn the_simulator_answers_no_effect_this_module_declares() {
     let simple = EFFECT.rsplit('.').next().expect("a dotted effect name");
     assert_eq!(simple, "time");
     assert!(
         !ply_eval::SEEDED_EFFECTS.contains(&simple),
-        "`{simple}` is answered by `simulate`, so binding a host handler to it would be a second clock"
+        "`{simple}` is answered by `simulate`, where this module's effect is the host's"
     );
     let time = Arc::new(TimeHost::new());
     for (op, _) in registrations(&time) {
