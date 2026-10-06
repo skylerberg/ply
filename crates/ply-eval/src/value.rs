@@ -238,7 +238,41 @@ pub enum Value {
     Task(TaskHandle),
     Chan(ChanHandle),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
-    Secret(Arc<Value>),
+    Secret(Arc<Sealed>),
+}
+
+/// A credential's bytes in memory nothing else points at: a `Secret<String>` holds its UTF-8 and
+/// a `Secret<Bytes>` its bytes. Each maker copies what it is handed, so a secret never shares an
+/// allocation with a plain value, and the bytes are overwritten with zeros before their memory is
+/// given back, when the last `Value` holding the secret is dropped.
+pub struct Sealed {
+    text: bool,
+    bytes: Box<[u8]>,
+}
+
+impl Sealed {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The text a `Secret<String>` holds; `None` for a `Secret<Bytes>`.
+    pub fn text(&self) -> Option<&str> {
+        if self.text {
+            std::str::from_utf8(&self.bytes).ok()
+        } else {
+            None
+        }
+    }
+
+    pub fn is_text(&self) -> bool {
+        self.text
+    }
+}
+
+impl Drop for Sealed {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.bytes);
+    }
 }
 
 pub struct Closure {
@@ -416,8 +450,20 @@ impl Value {
         }
     }
 
-    pub fn secret(inner: Value) -> Value {
-        Value::Secret(Arc::new(inner))
+    /// A `Secret<String>` holding a copy of `text`.
+    pub fn secret_text(text: &str) -> Value {
+        Value::Secret(Arc::new(Sealed {
+            text: true,
+            bytes: Box::from(text.as_bytes()),
+        }))
+    }
+
+    /// A `Secret<Bytes>` holding a copy of `bytes`.
+    pub fn secret_bytes(bytes: &[u8]) -> Value {
+        Value::Secret(Arc::new(Sealed {
+            text: false,
+            bytes: Box::from(bytes),
+        }))
     }
 
     pub fn as_int(&self, span: Span, what: &str) -> Result<i64, Diagnostic> {
@@ -552,7 +598,6 @@ fn nests(v: &Value) -> bool {
         Value::Map(m) => !m.is_empty(),
         Value::Record(fields) => !fields.is_empty(),
         Value::Ctor { args, .. } => !args.is_empty(),
-        Value::Secret(inner) => nests(inner),
         _ => false,
     }
 }
@@ -578,14 +623,6 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
             if let Some(entries) = Arc::get_mut(&mut m.0) {
                 let taken = std::mem::take(entries);
                 out.extend(taken.into_iter().flat_map(|(k, v)| [k, v]).filter(nests));
-            }
-        }
-        Value::Secret(inner) => {
-            if let Some(v) = Arc::get_mut(inner) {
-                let taken = std::mem::replace(v, Value::Unit);
-                if nests(&taken) {
-                    out.push(taken);
-                }
             }
         }
         _ => {}
@@ -813,7 +850,7 @@ impl Ord for Value {
             (Value::Task(x), Value::Task(y)) => (x.region(), x.id()).cmp(&(y.region(), y.id())),
             (Value::Chan(x), Value::Chan(y)) => x.cmp(y),
             // Unreachable from a well-typed program: a `Secret` has no order.
-            (Value::Secret(x), Value::Secret(y)) => grow(|| x.cmp(y)),
+            (Value::Secret(x), Value::Secret(y)) => (x.text, &x.bytes).cmp(&(y.text, &y.bytes)),
             (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
             _ => Ordering::Equal,
         }
@@ -1027,12 +1064,7 @@ fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diag
         (Value::Task(x), Value::Task(y)) => x.region() == y.region() && x.id() == y.id(),
         (Value::Chan(x), Value::Chan(y)) => x == y,
         (Value::Secret(x), Value::Secret(y)) => {
-            return descend(span, depth, || match (&**x, &**y) {
-                (Value::Str(p), Value::Str(q)) => Ok(constant_time_eq(p.as_bytes(), q.as_bytes())),
-                (Value::Bytes(p), Value::Bytes(q)) => Ok(constant_time_eq(p, q)),
-                // Structural, so a new payload type cannot silently make two secrets unequal.
-                (p, q) => equal_at(p, q, span, depth + 1),
-            });
+            x.text == y.text && constant_time_eq(&x.bytes, &y.bytes)
         }
         (Value::Closure(_), _) | (_, Value::Closure(_)) => {
             return Err(Diagnostic::error(

@@ -37,6 +37,27 @@ pub nondet effect net {
   /// The port this end of a socket is bound to: for a listener asked for port 0, the one it was
   /// given. `None` for a listener the drain has closed.
   read local_port[s](socket: Int) -> Option<Int>
+  /// Writes `before`, then `secret` in `encoding`, then `after`, every byte or `false`, framed as
+  /// `std.fs`'s `write_secret` frames a file: what puts a credential on a connection, as SASL's
+  /// PLAIN puts `\0user\0password` in base64 between `AUTH PLAIN ` and a line end, without it ever
+  /// being a plain value. An encoding `write_secret` does not name is a runtime error, and so is a
+  /// write of nothing at all. `false` is a deadline or a peer gone before every byte went, and
+  /// nothing says how many did.
+  write send_secret[s](conn: Int, before: Bytes, secret: Secret<Bytes>, encoding: String, after: Bytes, timeout_ms: Int) -> Bool
+}
+
+/// The bytes `send_secret` puts on a connection, sealed: what a peer reads, and what a handler of
+/// `send_secret` keeps in its place, since nothing in Ply opens it. Raises for an encoding
+/// `send_secret` does not write.
+pub fn sent_secret(
+  before: Bytes,
+  secret: Secret<Bytes>,
+  encoding: String,
+  after: Bytes,
+) -> Secret<Bytes> / {abort.raise} = {
+  let written = if encoding == "raw" { secret }
+  else { secret_bytes(secret_encode(encoding, secret)) };
+  secret_concat(secret_concat(secret_of_bytes(before), written), secret_of_bytes(after))
 }
 
 /// Reads until the peer is done sending (an empty answer); a `recv` shorter than `max` is not the end.
@@ -126,6 +147,28 @@ test "send_all loops over a partial write and stops at a dead peer" {
   } with {
     net.send[conn](c, payload, timeout_ms) -> None,
   }
+}
+
+test "a credential goes on a connection whole and sealed, framed by what is said before and after it" {
+  let password = secret_of_bytes(b"\x00ada\x00hunter2");
+  let sent = with_cell[wire]([]) { wire -> {
+    let went = handle {
+      net.send_secret[smtp](1, b"AUTH PLAIN ", password, "base64", b"\r\n", 1000)
+    } with {
+      net.send_secret[smtp](c, before, secret, encoding, after, timeout_ms) -> {
+        cell_set(wire, push(cell_get(wire), sent_secret(before, secret, encoding, after)));
+        true
+      },
+    };
+    { went: went, wire: cell_get(wire) }
+  } };
+  assert(sent.went);
+  assert(sent.wire == [secret_of_bytes(b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n")]);
+  assert(sent_secret(b"", password, "raw", b"") == password);
+  assert(
+    sent_secret(b"user=", secret_of_bytes(b"\xff\x01"), "hex", b";")
+      == secret_of_bytes(b"user=ff01;"),
+  )
 }
 
 // One definition serves two resources: a clause naming one label never sees the other's bytes.

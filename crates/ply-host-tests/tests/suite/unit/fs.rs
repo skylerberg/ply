@@ -977,6 +977,153 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
     );
 }
 
+fn maybe_sealed(v: &Value) -> Option<Vec<u8>> {
+    option(v).map(|inner| match inner {
+        Value::Secret(held) => held.bytes().to_vec(),
+        other => panic!("not a Secret: {}", other.type_name()),
+    })
+}
+
+fn write_secret(
+    fs: &Arc<FsHost>,
+    path: &str,
+    secret: &Value,
+    encoding: &str,
+) -> Result<Value, Diagnostic> {
+    perform(
+        fs,
+        Op::WriteSecret,
+        "cache",
+        &[
+            Value::str(path),
+            Value::bytes(b"key "),
+            secret.clone(),
+            Value::str(encoding),
+            Value::bytes(b"\n"),
+        ],
+    )
+}
+
+fn read_secret(
+    fs: &Arc<FsHost>,
+    path: &str,
+    before: &[u8],
+    encoding: &str,
+    after: &[u8],
+) -> Option<Vec<u8>> {
+    maybe_sealed(&done(perform(
+        fs,
+        Op::ReadSecret,
+        "cache",
+        &[
+            Value::str(path),
+            Value::bytes(before),
+            Value::str(encoding),
+            Value::bytes(after),
+        ],
+    )))
+}
+
+#[test]
+fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::write(real.join("old.key"), b"a longer plain file than the key").unwrap();
+    std::fs::set_permissions(real.join("old.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let key = Value::secret_bytes(b"\x01\x23\xab");
+
+    for (path, encoding, line) in [
+        ("new.key", "hex", &b"key 0123ab\n"[..]),
+        ("old.key", "base64", b"key ASOr\n"),
+        ("raw.key", "raw", b"key \x01\x23\xab\n"),
+    ] {
+        assert!(
+            boolean(&done(write_secret(&fs, path, &key, encoding))),
+            "{path}"
+        );
+        assert_eq!(std::fs::read(real.join(path)).unwrap(), line, "{path}");
+        assert_eq!(file_mode(&real.join(path)), 0o600, "{path}");
+        assert_eq!(
+            read_secret(&fs, path, b"key ", encoding, b"\n"),
+            Some(b"\x01\x23\xab".to_vec()),
+            "{path}"
+        );
+    }
+    assert!(!boolean(&done(write_secret(
+        &fs,
+        "no/new.key",
+        &key,
+        "hex"
+    ))));
+    assert!(!real.join("no").exists());
+}
+
+#[test]
+fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::write(real.join("a.key"), b"key 0123ab\n").unwrap();
+    std::fs::write(real.join("upper.key"), b"key 0123AB\n").unwrap();
+    std::fs::write(real.join("odd.key"), b"key 0123a\n").unwrap();
+
+    assert_eq!(read_secret(&fs, "a.key", b"key ", "hex", b""), None);
+    assert_eq!(read_secret(&fs, "a.key", b"kex ", "hex", b"\n"), None);
+    assert_eq!(
+        read_secret(&fs, "a.key", b"key 0123ab", "hex", b"\n"),
+        Some(Vec::new())
+    );
+    assert_eq!(
+        read_secret(&fs, "a.key", b"key 0123ab\n", "raw", b"\n"),
+        None
+    );
+    assert_eq!(read_secret(&fs, "upper.key", b"key ", "hex", b"\n"), None);
+    assert_eq!(read_secret(&fs, "odd.key", b"key ", "hex", b"\n"), None);
+    assert_eq!(read_secret(&fs, "none.key", b"", "raw", b""), None);
+    assert_eq!(
+        read_secret(&fs, "a.key", b"", "raw", b""),
+        Some(b"key 0123ab\n".to_vec())
+    );
+}
+
+#[test]
+fn a_secret_write_refuses_a_plain_body_an_unknown_encoding_and_a_path_out_of_the_root() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    let key = Value::secret_bytes(b"hunter2");
+
+    let plain = write_secret(&fs, "plain.key", &Value::bytes(b"hunter2"), "hex")
+        .expect_err("a plain body is not a secret");
+    assert!(!plain.message.contains("hunter2"), "{}", plain.message);
+    let unknown = write_secret(&fs, "a.key", &key, "rot13").expect_err("no such encoding");
+    assert_eq!(unknown.code, codes::RUNTIME_ERROR);
+    assert!(
+        unknown.message.contains("`fs.write_secret`"),
+        "{}",
+        unknown.message
+    );
+    assert!(!unknown.message.contains("hunter2"), "{}", unknown.message);
+    let unread = perform(
+        &fs,
+        Op::ReadSecret,
+        "cache",
+        &[
+            Value::str("a.key"),
+            Value::bytes(b""),
+            Value::str("base32-typed"),
+            Value::bytes(b""),
+        ],
+    )
+    .expect_err("a typed text is read by `secret_decode` alone");
+    assert_eq!(unread.code, codes::RUNTIME_ERROR);
+    let escaped = write_secret(&fs, "../out.key", &key, "hex").expect_err("it leaves the root");
+    assert_eq!(escaped.code, codes::FS_PATH_ESCAPES_ROOT);
+    assert!(std::fs::read_dir(&real).unwrap().next().is_none());
+}
+
 /// A `std.fs.Stat`, as a test reads one.
 #[derive(Debug, PartialEq)]
 struct Looked {
