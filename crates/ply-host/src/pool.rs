@@ -2,11 +2,12 @@
 //! One [`Pool`] per facility, minting in disjoint token ranges.
 
 use ply_eval::{Diagnostic, Pending, Span, Symbol, Value, codes};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
+/// How many operations of a pool that gives each a thread may be outstanding at once.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 
 pub const NET_FIRST_TOKEN: u64 = 1;
@@ -16,6 +17,9 @@ pub const FS_FIRST_TOKEN: u64 = 1 << 62;
 
 /// Far enough above [`FS_FIRST_TOKEN`] that the two ranges never meet.
 pub const PROCESS_FIRST_TOKEN: u64 = 1 << 63;
+
+/// As far above [`PROCESS_FIRST_TOKEN`] as that is above [`FS_FIRST_TOKEN`].
+pub const PASSWORD_FIRST_TOKEN: u64 = 3 << 62;
 
 /// How a spawned process ended: its own code, or the signal that killed it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,6 +47,7 @@ pub enum JobOutput {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
     Bool(bool),
+    Bytes(Vec<u8>),
     MaybeBytes(Option<Vec<u8>>),
     MaybeInt(Option<i64>),
     /// `None` when it is not a directory this run can read.
@@ -141,6 +146,25 @@ struct Shared {
     finished: Condvar,
     next: AtomicU64,
     bell: OnceLock<Arc<Bell>>,
+    /// Where jobs wait for a thread; `None` for a pool that starts one for each.
+    queue: Option<Queue>,
+}
+
+/// The jobs of a pool that runs them on a fixed number of threads, in the order submitted.
+struct Queue {
+    line: Mutex<Line>,
+    posted: Condvar,
+    threads: usize,
+}
+
+#[derive(Default)]
+struct Line {
+    jobs: VecDeque<(u64, Job)>,
+    started: usize,
+    /// The started threads that are waiting for a job.
+    idle: usize,
+    /// The pool is gone: a thread that finds no job ends.
+    closed: bool,
 }
 
 /// Not `Clone`: the handler owns it, and jobs hold an [`Arc`] of the shared state.
@@ -148,9 +172,38 @@ pub struct Pool {
     shared: Arc<Shared>,
 }
 
+impl Drop for Pool {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.shared.queue {
+            lock(&queue.line).closed = true;
+            queue.posted.notify_all();
+        }
+    }
+}
+
 impl Pool {
+    /// A pool that starts a thread for each operation, [`MAX_BLOCKING_OPERATIONS`] at most.
     /// `first` starts this pool's token range, which must not overlap another pool's.
     pub fn new(first: u64) -> Pool {
+        Pool::over(first, None)
+    }
+
+    /// A pool whose operations wait their turn for one of `threads` threads, however many are
+    /// submitted: for work that fills a core, where a thread each would finish none sooner and a
+    /// bound on how many wait would refuse a burst. A thread is started when an operation first
+    /// needs one, and ends when the pool is dropped.
+    pub fn queued(first: u64, threads: usize) -> Pool {
+        Pool::over(
+            first,
+            Some(Queue {
+                line: Mutex::new(Line::default()),
+                posted: Condvar::new(),
+                threads: threads.max(1),
+            }),
+        )
+    }
+
+    fn over(first: u64, queue: Option<Queue>) -> Pool {
         Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
@@ -158,6 +211,7 @@ impl Pool {
                 // Token 0 is never minted, so a zeroed `Pending` belongs to no pool.
                 next: AtomicU64::new(first),
                 bell: OnceLock::new(),
+                queue,
             }),
         }
     }
@@ -180,6 +234,9 @@ impl Pool {
         job: Job,
     ) -> Result<Pending, Diagnostic> {
         let token = self.shared.next.fetch_add(1, Ordering::Relaxed);
+        if let Some(queue) = &self.shared.queue {
+            return self.enqueue(queue, token, span, label, what, job);
+        }
         {
             let mut state = lock(&self.shared.state);
             if state.waiting.len() >= MAX_BLOCKING_OPERATIONS {
@@ -209,33 +266,55 @@ impl Pool {
         let shared = Arc::clone(&self.shared);
         let spawned = std::thread::Builder::new()
             .name(format!("ply-host-{label}-{token}"))
-            .spawn(move || {
-                let outcome = job();
-                let mut state = lock(&shared.state);
-                state.done.insert(token, outcome);
-                let inbox = state
-                    .waiting
-                    .get(&token)
-                    .and_then(|waiting| waiting.inbox.clone());
-                drop(state);
-                // Delivered before the wake, so a runtime that wakes finds its token.
-                if let Some(inbox) = inbox {
-                    inbox.deliver(token);
-                }
-                shared.finished.notify_all();
-                if let Some(bell) = shared.bell.get() {
-                    bell.ring();
-                }
-            });
+            .spawn(move || complete(&shared, token, job()));
 
         if let Err(e) = spawned {
             lock(&self.shared.state).waiting.remove(&token);
-            return Err(Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                format!("{what} could not start: {e}"),
-            )
-            .primary(span, "the host could not spawn a thread for this operation"));
+            return Err(err_no_thread(what, &e, span));
         }
+        Ok(Pending { token, label })
+    }
+
+    /// Puts `job` in line, and starts a thread for it if every started one is busy and the pool
+    /// may have another.
+    fn enqueue(
+        &self,
+        queue: &Queue,
+        token: u64,
+        span: Span,
+        label: &'static str,
+        what: &'static str,
+        job: Job,
+    ) -> Result<Pending, Diagnostic> {
+        lock(&self.shared.state).waiting.insert(
+            token,
+            Waiting {
+                span,
+                what,
+                inbox: None,
+            },
+        );
+        let mut line = lock(&queue.line);
+        line.jobs.push_back((token, job));
+        if line.jobs.len() > line.idle && line.started < queue.threads {
+            let shared = Arc::clone(&self.shared);
+            let spawned = std::thread::Builder::new()
+                .name(format!("ply-host-{label}-{}", line.started))
+                .spawn(move || work(&shared));
+            match spawned {
+                Ok(_) => line.started += 1,
+                // A thread that is running takes this in its turn.
+                Err(_) if line.started > 0 => {}
+                Err(e) => {
+                    line.jobs.pop_back();
+                    drop(line);
+                    lock(&self.shared.state).waiting.remove(&token);
+                    return Err(err_no_thread(what, &e, span));
+                }
+            }
+        }
+        drop(line);
+        queue.posted.notify_one();
         Ok(Pending { token, label })
     }
 
@@ -328,6 +407,61 @@ impl Pool {
     }
 }
 
+/// Files what a job answered and wakes whoever waits on it.
+fn complete(shared: &Shared, token: u64, outcome: JobOutput) {
+    let mut state = lock(&shared.state);
+    state.done.insert(token, outcome);
+    let inbox = state
+        .waiting
+        .get(&token)
+        .and_then(|waiting| waiting.inbox.clone());
+    drop(state);
+    // Delivered before the wake, so a runtime that wakes finds its token.
+    if let Some(inbox) = inbox {
+        inbox.deliver(token);
+    }
+    shared.finished.notify_all();
+    if let Some(bell) = shared.bell.get() {
+        bell.ring();
+    }
+}
+
+/// One thread of a queued pool: the next job in line, until the pool is gone and the line empty.
+fn work(shared: &Shared) {
+    let Some(queue) = &shared.queue else {
+        return;
+    };
+    loop {
+        let (token, job) = {
+            let mut line = lock(&queue.line);
+            loop {
+                if let Some(next) = line.jobs.pop_front() {
+                    break next;
+                }
+                if line.closed {
+                    return;
+                }
+                line.idle += 1;
+                line = wait(&queue.posted, line);
+                line.idle -= 1;
+            }
+        };
+        // A job that panics is answered as one that failed, and the thread takes the next.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+            .unwrap_or_else(|_| JobOutput::Failed("the host panicked computing it".to_string()));
+        complete(shared, token, outcome);
+    }
+}
+
+#[cold]
+fn err_no_thread(what: &str, why: &std::io::Error, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("{what} could not start: {why}"),
+    )
+    .primary(span, "the host could not spawn a thread for this operation")
+}
+
 enum Taken {
     Ready(Result<Value, Diagnostic>),
     Waiting,
@@ -351,6 +485,7 @@ fn take(state: &mut State, token: u64) -> Taken {
     Taken::Ready(match done {
         JobOutput::Int(i) => Ok(Value::Int(i)),
         JobOutput::Bool(b) => Ok(Value::Bool(b)),
+        JobOutput::Bytes(b) => Ok(Value::bytes(b)),
         JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
         JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
         JobOutput::MaybeStrings(names) => {
