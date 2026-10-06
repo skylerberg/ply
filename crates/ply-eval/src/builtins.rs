@@ -300,6 +300,10 @@ builtins! { $
     CryptoSign = "crypto_sign", 3, raises;
     CryptoVerify = "crypto_verify", 4, raises;
     CryptoAgree = "crypto_agree", 3, raises;
+    /// [`Builtin::CellSet`] under a name no module rebinds: the lowering of `with_hold` puts what
+    /// `acquire` answered into the hold inside the bracket's own acquire, where a cancel takes no
+    /// answer.
+    HoldPut = "?hold_put", 2, ends;
 }
 
 impl Builtin {
@@ -518,7 +522,8 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         | Builtin::Bracket
         | Builtin::HoldGet
         | Builtin::HoldTake
-        | Builtin::HoldBracket => Err(answered_by_the_backend(b, span)),
+        | Builtin::HoldBracket
+        | Builtin::HoldPut => Err(answered_by_the_backend(b, span)),
 
         Builtin::Range => {
             let lo = args[0].as_int(span, "`range`")?;
