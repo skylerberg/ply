@@ -1,0 +1,4375 @@
+//! Regular expressions that match in steps linear in the subject: RE2's syntax, without
+//! backreferences or lookaround, over a `String` a character at a time and over `Bytes` a byte
+//! at a time.
+//!
+//! A pattern is compiled once, by `compile` to a `Result` or by `read`, which raises
+//! `regex.refused`: a refusal says why, and at which character of the pattern. `compile_bytes`
+//! and `read_bytes` make a `ByteRegex`, whose pattern's characters are bytes. A pattern written
+//! in source is a literal, `re"a+b"`, compiled when the program is checked (`std.re`).
+//!
+//! What a search costs. No search goes back over its subject to try another way: it follows
+//! every state the pattern could be in at once, each entered once a position, so its steps grow
+//! as the subject's length times the pattern's size at most, and for no pattern do they double
+//! with a character more. `is_match`, `find` and `find_all` go one state at a time instead
+//! wherever a subject is longer than `Options.short`: each set of states met is kept and stepped
+//! by a table, a step a byte, up to `Options.state_limit` of them, past which the search goes on
+//! by every state at once. A search skips straight to the next byte a match can start with, or
+//! to the next place the text every match starts with stands; where every match holds some
+//! text, as one of `\w+@example\.com` holds `@example.com`, a subject without it is refused
+//! unread; and a pattern that is text alone is found as text. Groups are read only where they
+//! are asked for, and then over the match alone. A pattern compiles to at most
+//! `Options.size_limit` instructions, each counted repetition written out, and one past that is
+//! refused before it is built.
+//!
+//! The syntax is RE2's:
+//!
+//! - A character is itself; `.` is any but a line feed; `\` before punctuation is that
+//!   character; `\a \f \n \r \t \v`, `\0` and up to two octal digits more, `\xNN` and
+//!   `\x{N...}` write one by its number; `\Q...\E` is its text as it stands.
+//! - `[abc]`, `[a-z]` and `[^a-z]` are one character of a class. A `]` first in a class and a
+//!   `-` first or last are themselves. `\d`, `\w` and `\s` are a digit, a word's character
+//!   and white space, `\D`, `\W` and `\S` every other character, and `[[:alpha:]]` and
+//!   `[[:^alpha:]]` the POSIX classes, all of them in or out of a class.
+//! - `^` and `$` are the subject's start and its very end, never the place before a last line
+//!   feed, and `\A` and `\z` are those whatever the flags; `\b` is a word's edge and `\B` any
+//!   other place.
+//! - `xy` is `x` then `y`, and `x|y` either, `x` preferred.
+//! - `x*`, `x+`, `x?`, `x{n}`, `x{n,}` and `x{n,m}` repeat `x`, taking as much as they can, and
+//!   with a `?` after as little. A count is at most 1000, and a `{` that opens no count is
+//!   itself.
+//! - `(x)` is a group, numbered from 1 by where its `(` stands, `(?P<name>x)` or `(?<name>x)` one
+//!   with a name, and `(?:x)` no group at all.
+//! - `(?i)` ignores case, `(?m)` makes `^` and `$` a line's start and end, `(?s)` lets `.` be a
+//!   line feed and `(?U)` swaps which repetitions take little: each to the end of the group it
+//!   is written in, `(?i:x)` for `x` alone, and `(?-i)` to end one.
+//!
+//! What is refused, by name: a backreference (`\1`, `\k<name>`, `(?P=name)`) and lookahead or
+//! lookbehind, either of which would cost more than linear steps; a repetition of a repetition,
+//! which a possessive `a*+` writes; `\C`; and a Unicode property (`\pL`, `\p{Greek}`), which
+//! needs tables `std.unicode` is to carry. An octal escape opens with `\0`, so that `\1` to
+//! `\9` are always the backreferences they are elsewhere.
+//!
+//! Unicode. A character is a code point: `.`, a class written out and a negated class are over
+//! all of them, and a match never ends inside one. `\d`, `\w`, `\s`, `\b` and the POSIX
+//! classes are ASCII's, as they are in RE2. `(?i)` folds the ASCII letters alone, where RE2
+//! folds every letter Unicode pairs: when `std.unicode` carries the tables, `\p{...}` will be
+//! read, and `(?i)` will fold as Unicode's simple case folding does, so that `(?i)k` also
+//! matches the Kelvin sign and an accented letter its other case. Nothing else changes then.
+//!
+//! Which match. Of the matches that start leftmost, the one a search that tried each
+//! alternative in order, and each repetition's more before its less, would find first, as Perl
+//! and RE2 choose; `Options.longest` asks for the longest at the leftmost start instead, as
+//! POSIX has it, a group then being what the first such way to match gives it. `find_all`,
+//! `captures_all`, `replace_all` and `split` take matches in order, none overlapping: a search
+//! starts where the last match ended, and one character on from an empty one, and an empty
+//! match is passed over where the match before it ended.
+//!
+//! A `Span` counts characters of a `String` and bytes of a `Bytes`, as `string_slice` and
+//! `bytes_slice` do.
+//!
+//! When something else serves. A pattern over paths, with `**` and braces, is `std.glob`'s.
+//! Anything that nests, brackets that must balance or a grammar with a rule that names itself,
+//! is past what a regular expression can say, and text whose parts a program wants as values
+//! rather than spans is a parser's: `std.parse` builds one from smaller ones.
+
+import std.bytes (hex_value, is_digit, is_letter)
+import std.laws (agrees)
+import std.list (at_or, enumerate, index_of, reverse, sort, sort_by, take, unique)
+import std.math (ilog2)
+import std.string (code_points, join)
+
+// --- What a pattern is refused for --------------------------------------------
+
+/// Why a pattern, or a replacement template, is refused.
+pub type Why =
+  /// A `(` with no `)`.
+  | UnclosedGroup
+  /// A `)` with no `(`.
+  | UnopenedGroup
+  /// A `[` whose class the pattern ends inside.
+  | UnclosedClass
+  /// A range in a class whose ends stand out of order.
+  | BadRange
+  /// A `[:name:]` that names no class.
+  | BadClassName
+  /// A `\` with no character after it.
+  | TrailingEscape
+  /// A `\` before a letter or a digit that is no escape here.
+  | BadEscape
+  /// A `*`, `+`, `?` or `{n,m}` with nothing before it to repeat.
+  | NothingToRepeat
+  /// A repetition of a repetition, which `a**` and the possessive `a*+` both write.
+  | NestedRepeat
+  /// A count past 1000, or a `{n,m}` whose `n` is the greater.
+  | BadRepeat
+  /// A `(?` that opens nothing this dialect has.
+  | BadGroup
+  /// A group's name that is empty or holds more than letters, digits and `_`.
+  | BadGroupName
+  /// A name two groups are given.
+  | DuplicateName
+  /// `\1`, `\k<name>` or `(?P=name)`.
+  | Backreference
+  /// `(?=`, `(?!`, `(?<=` or `(?<!`.
+  | Lookaround
+  /// `\p` or `\P`.
+  | UnicodeProperty
+  /// `\C` in a pattern over text.
+  | HalfCharacter
+  /// A character past `U+00FF` in a pattern over bytes.
+  | NotAByte
+  /// A pattern whose program would hold more instructions than its limit.
+  | TooLarge
+  /// Groups nested more than 200 deep.
+  | TooDeep
+  /// A `$` in a template that no group's number or name, and no second `$`, follows.
+  | LoneDollar
+  /// A `${` in a template with no `}`.
+  | UnclosedName
+  /// A template that names a group its pattern lacks.
+  | NoSuchGroup
+
+/// A refusal, and the character of the pattern or template it is about.
+pub type Refusal = { at: Int, why: Why }
+
+/// What `read` and `read_template` raise where they refuse.
+pub effect regex {
+  /// The text is no pattern of this dialect, or no template for its pattern.
+  raise refused(e: Refusal)
+}
+
+/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+pub fn reason(why: Why) -> String =
+  match why {
+    UnclosedGroup -> "this `(` has no closing `)`",
+    UnopenedGroup -> "this `)` closes nothing: write `\\)` for the character",
+    UnclosedClass -> "this class has no closing `]`",
+    BadRange -> "a range in a class runs from the lesser character to the greater",
+    BadClassName -> "no class has this name: the names are those of POSIX, as in `[[:alpha:]]`",
+    TrailingEscape -> "a `\\` goes before a character",
+    BadEscape ->
+      "this escape means nothing here: a `\\` goes before punctuation or a letter that names an escape",
+    NothingToRepeat -> "nothing stands before this to repeat",
+    NestedRepeat ->
+      "a repetition repeats an operand, not another repetition: group the first as `(?:...)`, and possessive repetition is not supported",
+    BadRepeat -> "a count is at most 1000, and the first of two is the lesser",
+    BadGroup ->
+      "`(?` opens `(?:...)`, `(?P<name>...)`, `(?<name>...)` or the flags `i`, `m`, `s` and `U`",
+    BadGroupName -> "a group's name is letters, digits and `_`, and at least one of them",
+    DuplicateName -> "another group has this name",
+    Backreference -> "backreferences are not supported: matching would no longer be linear",
+    Lookaround -> "lookahead and lookbehind are not supported: matching would no longer be linear",
+    UnicodeProperty ->
+      "Unicode properties are not supported: they need the tables `std.unicode` will carry",
+    HalfCharacter -> "`\\C` is not supported over text: it would match part of a character",
+    NotAByte -> "a pattern over bytes holds no character past U+00FF: write a byte as `\\xNN`",
+    TooLarge -> "the pattern compiles to more instructions than its limit allows",
+    TooDeep -> "groups nest at most 200 deep",
+    LoneDollar -> "a `$` goes before a group's number or name, or is written `$$`",
+    UnclosedName -> "this `${` has no closing `}`",
+    NoSuchGroup -> "the pattern has no such group",
+  }
+
+fn refuse<a>(at: Int, why: Why) -> a / {regex.refused} = regex.refused({ at: at, why: why })
+
+// --- The tree a pattern parses to ----------------------------------------------
+
+/// The code points from `lo` through `hi`.
+type Interval = { lo: Int, hi: Int }
+
+/// A place a pattern asks about without taking a character.
+type Look = | LineStart | LineEnd | TextStart | TextEnd | WordEdge | NotWordEdge
+
+/// A parsed pattern, every flag already acted on.
+type Node =
+  /// Nothing, matched everywhere.
+  | Empty
+  /// One code point.
+  | Literal(Int)
+  /// One code point of these, which are in order and neither touch nor overlap.
+  | Class(List<Interval>)
+  | Looking(Look)
+  /// Two or more in a row, none of them a `Concat` or `Empty`.
+  | Concat(List<Node>)
+  /// Two or more, the leftmost preferred, none of them an `Alternate`.
+  | Alternate(List<Node>)
+  /// From the first count to the second, `-1` for no upper end, and whether more is preferred.
+  | Repeat(Node, Int, Int, Bool)
+  /// A group by its number, and its name where it has one.
+  | Capture(Int, Option<String>, Node)
+
+/// What is being parsed: its code points, whether it is a pattern over bytes, and the most
+/// instructions it may compile to.
+type Source = { text: Array<Int>, bytes: Bool, limit: Int }
+
+/// What one step of the parse read: the node, the instructions it will compile to, where the
+/// next character stands, the flags in force there, and every group opened so far by its name.
+type Parse = { node: Node, size: Int, at: Int, flags: Int, groups: List<Option<String>> }
+
+type Meta =
+  | Open
+  | Close
+  | Bar
+  | Star
+  | Plus
+  | Quest
+  | Brace
+  | Bracket
+  | Backslash
+  | Dot
+  | Caret
+  | Dollar
+  | Plain
+  | End
+
+fn meta(c: Int) -> Meta =
+  match c {
+    b'(' -> Open,
+    b')' -> Close,
+    b'[' -> Bracket,
+    b'{' -> Brace,
+    b'|' -> Bar,
+    b'*' -> Star,
+    b'+' -> Plus,
+    b'?' -> Quest,
+    b'\\' -> Backslash,
+    b'.' -> Dot,
+    b'^' -> Caret,
+    b'$' -> Dollar,
+    -1 -> End,
+    _ -> Plain,
+  }
+
+/// The code point at `at`, or `-1` past the end.
+fn code(s: Source, at: Int) -> Int = match array_at(s.text, at) { Some(c) -> c, None -> -1 }
+
+/// The greatest code point a character of the subject can be.
+fn top(s: Source) -> Int = if s.bytes { 0xFF } else { 0x10FFFF }
+
+fn folds(flags: Int) -> Bool = flags & 1 != 0
+
+fn multi_line(flags: Int) -> Bool = flags & 2 != 0
+
+fn dot_all(flags: Int) -> Bool = flags & 4 != 0
+
+fn swaps(flags: Int) -> Bool = flags & 8 != 0
+
+fn iv(lo: Int, hi: Int) -> Interval = { lo: lo, hi: hi }
+
+/// Intervals in order, with those that touch or overlap made one.
+fn canonical(items: List<Interval>) -> List<Interval> / {abort.raise} =
+  fold(
+    sort_by(items, |a: Interval, b: Interval| a.lo <= b.lo),
+    [],
+    |acc: List<Interval>, i: Interval|
+      match list_at(acc, len(acc) - 1) {
+        Some(last) if i.lo <= last.hi + 1 ->
+          list_set(acc, len(acc) - 1, iv(last.lo, max(last.hi, i.hi))),
+        _ -> push(acc, i),
+      },
+  )
+
+/// Every code point up to `most` that a canonical class leaves out.
+fn complement(set: List<Interval>, most: Int) -> List<Interval> = {
+  let walked = fold(
+    set,
+    { next: 0, out: [] },
+    |w: { next: Int, out: List<Interval> }, i: Interval|
+      {
+        next: i.hi + 1,
+        out: if i.lo > w.next { push(w.out, iv(w.next, i.lo - 1)) } else { w.out },
+      },
+  );
+  if walked.next <= most { push(walked.out, iv(walked.next, most)) } else { walked.out }
+}
+
+/// The intervals with the other case of each ASCII letter among them.
+fn folded(items: List<Interval>) -> List<Interval> =
+  fold(items, items, |acc: List<Interval>, i: Interval| {
+    let lower = if i.lo <= 122 && i.hi >= 97 {
+      push(acc, iv(max(i.lo, 97) - 32, min(i.hi, 122) - 32))
+    } else { acc };
+    if i.lo <= 90 && i.hi >= 65 { push(lower, iv(max(i.lo, 65) + 32, min(i.hi, 90) + 32)) }
+    else { lower }
+  })
+
+fn digits() -> List<Interval> = [iv(48, 57)]
+
+fn word() -> List<Interval> = [iv(48, 57), iv(65, 90), iv(95, 95), iv(97, 122)]
+
+fn space() -> List<Interval> = [iv(9, 10), iv(12, 13), iv(32, 32)]
+
+/// The class a Perl escape letter names, in either case, before any negation.
+fn perl(letter: Int) -> Option<List<Interval>> =
+  match letter {
+    b'd' | b'D' -> Some(digits()),
+    b'w' | b'W' -> Some(word()),
+    b's' | b'S' -> Some(space()),
+    _ -> None,
+  }
+
+fn posix(name: String) -> Option<List<Interval>> =
+  match name {
+    "alnum" -> Some([iv(48, 57), iv(65, 90), iv(97, 122)]),
+    "alpha" -> Some([iv(65, 90), iv(97, 122)]),
+    "ascii" -> Some([iv(0, 127)]),
+    "blank" -> Some([iv(9, 9), iv(32, 32)]),
+    "cntrl" -> Some([iv(0, 31), iv(127, 127)]),
+    "digit" -> Some(digits()),
+    "graph" -> Some([iv(33, 126)]),
+    "lower" -> Some([iv(97, 122)]),
+    "print" -> Some([iv(32, 126)]),
+    "punct" -> Some([iv(33, 47), iv(58, 64), iv(91, 96), iv(123, 126)]),
+    "space" -> Some([iv(9, 13), iv(32, 32)]),
+    "upper" -> Some([iv(65, 90)]),
+    "word" -> Some(word()),
+    "xdigit" -> Some([iv(48, 57), iv(65, 70), iv(97, 102)]),
+    _ -> None,
+  }
+
+fn is_name_char(c: Int) -> Bool = is_letter(c) || is_digit(c) || c == 95
+
+/// `set` as a pattern's class under these flags: folded where case is ignored, then negated
+/// where the escape or name was.
+fn grouped(
+  s: Source,
+  set: List<Interval>,
+  flags: Int,
+  negated: Bool,
+) -> List<Interval> / {abort.raise} = {
+  let cased = if folds(flags) { canonical(folded(set)) } else { set };
+  if negated { complement(cased, top(s)) } else { cased }
+}
+
+fn nullable(node: Node) -> Bool =
+  match node {
+    Empty | Looking(_) -> true,
+    Literal(_) | Class(_) -> false,
+    Concat(items) -> fold(items, true, |all: Bool, n: Node| all && nullable(n)),
+    Alternate(items) -> fold(items, false, |any: Bool, n: Node| any || nullable(n)),
+    Repeat(sub, least, _, _) -> least == 0 || nullable(sub),
+    Capture(_, _, sub) -> nullable(sub),
+  }
+
+/// `items` in a row as one node.
+fn concat(items: List<Node>) -> Node = match items { [] -> Empty, [one] -> one, _ -> Concat(items) }
+
+/// `items` with `node` after them: nothing for `Empty`, and a row's own items for a row.
+fn appended(items: List<Node>, node: Node) -> List<Node> =
+  match node {
+    Empty -> items,
+    Concat(more) -> fold(more, items, |acc: List<Node>, n: Node| push(acc, n)),
+    _ -> push(items, node),
+  }
+
+fn alternate(items: List<Node>) -> Node / {abort.raise} =
+  match items { [] -> panic("an alternation has a branch"), [one] -> one, _ -> Alternate(items) }
+
+fn branched(items: List<Node>, node: Node) -> List<Node> =
+  match node {
+    Alternate(more) -> fold(more, items, |acc: List<Node>, n: Node| push(acc, n)),
+    _ -> push(items, node),
+  }
+
+fn within(s: Source, at: Int, size: Int) -> Int / {regex.refused} =
+  if size > s.limit { refuse(at, TooLarge) } else { size }
+
+fn leaf(
+  s: Source,
+  node: Node,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+) -> Parse / {abort.raise} =
+  { node: node, size: weight(s, node), at: at, flags: flags, groups: groups }
+
+/// The instructions a node that takes one character, or none, compiles to.
+fn weight(s: Source, node: Node) -> Int / {abort.raise} =
+  match node {
+    Literal(c) -> if s.bytes { 1 } else { len(spelling(c)) },
+    Class(set) -> if is_flat(set, s.bytes) { 1 } else { len(stencil(set, s.bytes, false).insts) },
+    Looking(_) -> 1,
+    _ -> 0,
+  }
+
+fn alternation(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  branches(s, at, flags, groups, depth, [], 0, array_len(s.text) - at + 1)
+
+fn branches(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+  done: List<Node>,
+  size: Int,
+  left: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  if left <= 0 { panic("more alternatives than characters") } else {
+    let one = sequence(s, at, flags, groups, depth, [], 0, array_len(s.text) - at + 1);
+    let all = branched(done, one.node);
+    let total = within(s, at, size + one.size + (if len(done) == 0 { 0 } else { 1 }));
+    if meta(code(s, one.at)) == Bar {
+      branches(s, one.at + 1, one.flags, one.groups, depth, all, total, left - 1)
+    } else {
+      { node: alternate(all), size: total, at: one.at, flags: one.flags, groups: one.groups }
+    }
+  }
+
+fn sequence(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+  items: List<Node>,
+  size: Int,
+  left: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  if left <= 0 { panic("more pieces than characters") } else {
+    match meta(code(s, at)) {
+      End | Bar | Close ->
+        { node: concat(items), size: size, at: at, flags: flags, groups: groups },
+      _ -> {
+        let p = piece(s, at, flags, groups, depth);
+        sequence(
+          s,
+          p.at,
+          p.flags,
+          p.groups,
+          depth,
+          appended(items, p.node),
+          within(s, at, size + p.size),
+          left - 1,
+        )
+      },
+    }
+  }
+
+/// One operand and the repetition after it.
+fn piece(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  match meta(code(s, at)) {
+    Star | Plus | Quest -> refuse(at, NothingToRepeat),
+    Brace -> match counted(s, at + 1) {
+      Some(_) -> refuse(at, NothingToRepeat),
+      None -> repeated(s, leaf(s, Literal(code(s, at)), at + 1, flags, groups)),
+    },
+    Open -> repeated(s, parenthesis(s, at, flags, groups, depth)),
+    Bracket -> repeated(s, class(s, at, flags, groups)),
+    Backslash -> if code(s, at + 1) == b'Q' { quoted(s, at + 2, flags, groups) }
+    else { repeated(s, escaped(s, at, flags, groups)) },
+    Dot -> repeated(s, leaf(s, Class(any(s, flags)), at + 1, flags, groups)),
+    Caret ->
+      repeated(
+        s,
+        leaf(
+          s,
+          Looking(if multi_line(flags) { LineStart } else { TextStart }),
+          at + 1,
+          flags,
+          groups,
+        ),
+      ),
+    Dollar ->
+      repeated(
+        s,
+        leaf(s, Looking(if multi_line(flags) { LineEnd } else { TextEnd }), at + 1, flags, groups),
+      ),
+    _ -> repeated(s, leaf(s, character(s, at, code(s, at), flags), at + 1, flags, groups)),
+  }
+
+/// What `.` matches under these flags.
+fn any(s: Source, flags: Int) -> List<Interval> =
+  if dot_all(flags) { [iv(0, top(s))] } else { [iv(0, 9), iv(11, top(s))] }
+
+/// The node of one literal character, which is a class of two where its case is ignored.
+fn character(s: Source, at: Int, c: Int, flags: Int) -> Node / {regex.refused} =
+  if s.bytes && c > 0xFF { refuse(at, NotAByte) }
+  else if folds(flags) && is_letter(c) { Class([iv(c & 0x5F, c & 0x5F), iv(c | 0x20, c | 0x20)]) }
+  else { Literal(c) }
+
+/// A count read from just past a `{`: `n}`, `n,}` or `n,m}`, with `-1` for no upper end, and
+/// 1001 for any count past 1000. `None` where the text is no count, which leaves the `{` a
+/// character.
+fn counted(s: Source, at: Int) -> Option<{ least: Int, most: Int, at: Int }> = {
+  let first = number(s, at);
+  if first.at == at { None } else {
+    match code(s, first.at) {
+      b'}' -> Some({ least: first.value, most: first.value, at: first.at + 1 }),
+      b',' -> if code(s, first.at + 1) == b'}' {
+        Some({ least: first.value, most: -1, at: first.at + 2 })
+      } else {
+        let second = number(s, first.at + 1);
+        if second.at == first.at + 1 || code(s, second.at) != b'}' { None }
+        else { Some({ least: first.value, most: second.value, at: second.at + 1 }) }
+      },
+      _ -> None,
+    }
+  }
+}
+
+/// The decimal number at `at`, which opens with no zero another digit follows: what it counts,
+/// stopping at 1001, and where it ends, which is `at` itself where no number stands.
+fn number(s: Source, at: Int) -> { value: Int, at: Int } =
+  if !is_digit(code(s, at)) || (code(s, at) == 48 && is_digit(code(s, at + 1))) {
+    { value: 0, at: at }
+  } else { digits_from(s, at, 0) }
+
+fn digits_from(s: Source, at: Int, value: Int) -> { value: Int, at: Int } =
+  if at >= array_len(s.text) || !is_digit(code(s, at)) { { value: value, at: at } }
+  else { digits_from(s, at + 1, if value > 1000 { 1001 } else { value * 10 + code(s, at) - 48 }) }
+
+/// The repetition written after `p`, if one is.
+fn repeated(s: Source, p: Parse) -> Parse / {regex.refused, abort.raise} =
+  match meta(code(s, p.at)) {
+    Star -> quantified(s, p, 0, -1, p.at + 1),
+    Plus -> quantified(s, p, 1, -1, p.at + 1),
+    Quest -> quantified(s, p, 0, 1, p.at + 1),
+    Brace -> match counted(s, p.at + 1) {
+      None -> p,
+      Some(c) -> if c.least > 1000 || c.most > 1000 || (c.most >= 0 && c.least > c.most) {
+        refuse(p.at, BadRepeat)
+      } else { quantified(s, p, c.least, c.most, c.at) },
+    },
+    _ -> p,
+  }
+
+fn quantified(
+  s: Source,
+  p: Parse,
+  least: Int,
+  most: Int,
+  at: Int,
+) -> Parse / {regex.refused, abort.raise} = {
+  let lazy = meta(code(s, at)) == Quest;
+  let next = if lazy { at + 1 } else { at };
+  let stacked = match meta(code(s, next)) {
+    Star | Plus | Quest -> true,
+    Brace -> counted(s, next + 1) != None,
+    _ -> false,
+  };
+  if stacked { refuse(next, NestedRepeat) } else {
+    {
+      ..p,
+      node: Repeat(p.node, least, most, lazy == swaps(p.flags)),
+      size: within(s, p.at, repeat_size(p.node, p.size, least, most)),
+      at: next,
+    }
+  }
+}
+
+/// The instructions `least` to `most` of a node of `size` instructions compile to.
+fn repeat_size(node: Node, size: Int, least: Int, most: Int) -> Int =
+  if most >= 0 { least * size + (most - least) * (size + 1) }
+  else if least > 0 { least * size + 1 }
+  else if nullable(node) { size + 2 }
+  else { size + 1 }
+
+/// The characters from `at` to a `\E` or the end, each itself, and the repetition after the last.
+fn quoted(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+) -> Parse / {regex.refused, abort.raise} = {
+  let end = quote_end(s, at);
+  let after = if end < array_len(s.text) { end + 2 } else { end };
+  if end == at { no_operand(s, after, flags, groups) } else {
+    let front = fold(
+      range(at, end - 1),
+      { items: [], size: 0 },
+      |acc: { items: List<Node>, size: Int }, i: Int| {
+        let node = character(s, i, code(s, i), flags);
+        { items: push(acc.items, node), size: acc.size + weight(s, node) }
+      },
+    );
+    let last = repeated(
+      s,
+      leaf(s, character(s, end - 1, code(s, end - 1), flags), after, flags, groups),
+    );
+    {
+      ..last,
+      node: concat(appended(front.items, last.node)),
+      size: within(s, at, front.size + last.size),
+    }
+  }
+}
+
+/// Where the `\E` that ends a quotation opened before `at` stands, or the end of the pattern.
+fn quote_end(s: Source, at: Int) -> Int =
+  if at >= array_len(s.text) { at }
+  else if code(s, at) == b'\\' && code(s, at + 1) == b'E' { at }
+  else { quote_end(s, at + 1) }
+
+/// A `\` outside a class and what it escapes.
+fn escaped(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+) -> Parse / {regex.refused, abort.raise} = {
+  let c = code(s, at + 1);
+  match c {
+    b'A' -> leaf(s, Looking(TextStart), at + 2, flags, groups),
+    b'z' -> leaf(s, Looking(TextEnd), at + 2, flags, groups),
+    b'b' -> leaf(s, Looking(WordEdge), at + 2, flags, groups),
+    b'B' -> leaf(s, Looking(NotWordEdge), at + 2, flags, groups),
+    b'p' | b'P' -> refuse(at, UnicodeProperty),
+    b'k' -> refuse(at, Backreference),
+    b'C' -> if s.bytes { leaf(s, Class([iv(0, 0xFF)]), at + 2, flags, groups) }
+    else { refuse(at, HalfCharacter) },
+    _ -> match perl(c) {
+      Some(set) -> leaf(s, Class(grouped(s, set, 0, c < 97)), at + 2, flags, groups),
+      None -> {
+        let one = escape_code(s, at);
+        leaf(s, character(s, at, one.code, flags), one.at, flags, groups)
+      },
+    },
+  }
+}
+
+/// The one character the escape at `at` writes, and where the text goes on.
+fn escape_code(s: Source, at: Int) -> { code: Int, at: Int } / {regex.refused} = {
+  let c = code(s, at + 1);
+  match c {
+    -1 -> refuse(at, TrailingEscape),
+    b'a' -> { code: 7, at: at + 2 },
+    b'f' -> { code: 12, at: at + 2 },
+    b'n' -> { code: 10, at: at + 2 },
+    b'r' -> { code: 13, at: at + 2 },
+    b't' -> { code: 9, at: at + 2 },
+    b'v' -> { code: 11, at: at + 2 },
+    b'0' -> octal(s, at + 2, 0, 2),
+    b'1'..=b'9' -> refuse(at, Backreference),
+    b'x' -> hexadecimal(s, at),
+    _ -> if c < 128 && !is_letter(c) { { code: c, at: at + 2 } } else { refuse(at, BadEscape) },
+  }
+}
+
+/// Up to `left` more octal digits after a `\0`.
+fn octal(s: Source, at: Int, value: Int, left: Int) -> { code: Int, at: Int } = {
+  let c = code(s, at);
+  if left <= 0 || c < 48 || c > 55 { { code: value, at: at } }
+  else { octal(s, at + 1, value * 8 + c - 48, left - 1) }
+}
+
+/// `\xNN`, or `\x{N...}` of any number of digits that name a code point.
+fn hexadecimal(s: Source, at: Int) -> { code: Int, at: Int } / {regex.refused} =
+  if code(s, at + 2) == b'{' {
+    let read = hex_run(s, at + 3, 0);
+    if read.at == at + 3 || code(s, read.at) != b'}' || read.code > 0x10FFFF {
+      refuse(at, BadEscape)
+    } else { { code: read.code, at: read.at + 1 } }
+  } else {
+    let high = hex_value(code(s, at + 2));
+    let low = hex_value(code(s, at + 3));
+    if high < 0 || low < 0 { refuse(at, BadEscape) } else { { code: high * 16 + low, at: at + 4 } }
+  }
+
+/// The hex digits from `at`, their value stopping past the last code point.
+fn hex_run(s: Source, at: Int, value: Int) -> { code: Int, at: Int } = {
+  let digit = hex_value(code(s, at));
+  if at >= array_len(s.text) || digit < 0 { { code: value, at: at } }
+  else { hex_run(s, at + 1, if value > 0x10FFFF { value } else { value * 16 + digit }) }
+}
+
+// --- Groups ---------------------------------------------------------------------
+
+/// The group whose `(` stands at `at`.
+fn parenthesis(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  if depth <= 0 { refuse(at, TooDeep) }
+  else if meta(code(s, at + 1)) != Quest { capture(s, at, at + 1, flags, groups, depth - 1, None) }
+  else {
+    match code(s, at + 2) {
+      b':' -> closed(s, at, alternation(s, at + 3, flags, groups, depth - 1), flags),
+      b'=' | b'!' -> refuse(at, Lookaround),
+      b'P' -> match code(s, at + 3) {
+        b'<' -> named_group(s, at, at + 4, flags, groups, depth - 1),
+        b'=' -> refuse(at, Backreference),
+        _ -> refuse(at, BadGroup),
+      },
+      b'<' -> match code(s, at + 3) {
+        b'=' | b'!' -> refuse(at, Lookaround),
+        _ -> named_group(s, at, at + 3, flags, groups, depth - 1),
+      },
+      _ -> flagged(s, at, at + 2, flags, flags, false, false, groups, depth - 1),
+    }
+  }
+
+/// What a group read, once its `)` is: the node, with the flags the group was opened under.
+fn closed(s: Source, open: Int, inner: Parse, flags: Int) -> Parse / {regex.refused} =
+  if meta(code(s, inner.at)) != Close { refuse(open, UnclosedGroup) }
+  else { { ..inner, at: inner.at + 1, flags: flags } }
+
+fn capture(
+  s: Source,
+  open: Int,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+  name: Option<String>,
+) -> Parse / {regex.refused, abort.raise} = {
+  let index = len(groups);
+  let inner = closed(s, open, alternation(s, at, flags, push(groups, name), depth), flags);
+  { ..inner, node: Capture(index, name, inner.node), size: within(s, open, inner.size + 2) }
+}
+
+/// A named group whose name starts at `at`.
+fn named_group(
+  s: Source,
+  open: Int,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+  depth: Int,
+) -> Parse / {regex.refused, abort.raise} = {
+  let end = name_end(s.text, at);
+  if end == at || code(s, end) != b'>' { refuse(at, BadGroupName) } else {
+    let name = name_text(s.text, at, end);
+    if fold(groups, false, |found: Bool, g: Option<String>| found || g == Some(name)) {
+      refuse(at, DuplicateName)
+    } else { capture(s, open, end + 1, flags, groups, depth, Some(name)) }
+  }
+}
+
+/// Where the letters, digits and `_` from `at` end.
+fn name_end(text: Array<Int>, at: Int) -> Int =
+  match array_at(text, at) { Some(c) if is_name_char(c) -> name_end(text, at + 1), _ -> at }
+
+/// The characters from `from` up to `to`, which are a name's and so ASCII.
+fn name_text(text: Array<Int>, from: Int, to: Int) -> String / {abort.raise} =
+  string_of_bytes(bytes_concat_all(map(range(from, to), |i: Int| byte_of_int(array_get(text, i)))))
+
+/// The flags of a `(?flags)` or `(?flags:...)` read from `at`: `before` is what holds outside,
+/// `on` what they come to so far, `off` whether a `-` was passed, and `seen` whether a flag
+/// follows it.
+fn flagged(
+  s: Source,
+  open: Int,
+  at: Int,
+  before: Int,
+  on: Int,
+  off: Bool,
+  seen: Bool,
+  groups: List<Option<String>>,
+  depth: Int,
+) -> Parse / {regex.refused, abort.raise} =
+  if at >= array_len(s.text) { refuse(open, UnclosedGroup) } else {
+    let c = code(s, at);
+    let bit = match c { b'i' -> 1, b'm' -> 2, b's' -> 4, b'U' -> 8, _ -> 0 };
+    if bit != 0 {
+      flagged(
+        s,
+        open,
+        at + 1,
+        before,
+        if off { on & ~bit } else { on | bit },
+        off,
+        true,
+        groups,
+        depth,
+      )
+    } else if c == b'-' && !off { flagged(s, open, at + 1, before, on, true, false, groups, depth) }
+    else if off && !seen { refuse(at, BadGroup) }
+    else if c == b':' { closed(s, open, alternation(s, at + 1, on, groups, depth), before) }
+    else if meta(c) == Close { no_operand(s, at + 1, on, groups) }
+    else { refuse(at, BadGroup) }
+  }
+
+/// Nothing, where no operand stands for a repetition to follow: a `(?flags)`, whose flags hold
+/// from here to the end of the group it is in, or an empty quotation.
+fn no_operand(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+) -> Parse / {regex.refused} = {
+  let repeats = match meta(code(s, at)) {
+    Star | Plus | Quest -> true,
+    Brace -> counted(s, at + 1) != None,
+    _ -> false,
+  };
+  if repeats { refuse(at, NothingToRepeat) }
+  else { { node: Empty, size: 0, at: at, flags: flags, groups: groups } }
+}
+
+// --- Classes ----------------------------------------------------------------------
+
+/// The class whose `[` stands at `at`.
+fn class(
+  s: Source,
+  at: Int,
+  flags: Int,
+  groups: List<Option<String>>,
+) -> Parse / {regex.refused, abort.raise} = {
+  let negated = code(s, at + 1) == b'^';
+  let from = if negated { at + 2 } else { at + 1 };
+  let read = members(s, at, from, flags, [], true, array_len(s.text) - at + 1);
+  let set = canonical(read.items);
+  leaf(s, Class(if negated { complement(set, top(s)) } else { set }), read.at, flags, groups)
+}
+
+fn members(
+  s: Source,
+  open: Int,
+  at: Int,
+  flags: Int,
+  items: List<Interval>,
+  first: Bool,
+  left: Int,
+) -> { items: List<Interval>, at: Int } / {regex.refused, abort.raise} =
+  if left <= 0 { panic("more members than characters") } else {
+    let c = code(s, at);
+    if c == -1 { refuse(open, UnclosedClass) }
+    else if c == b']' && !first { { items: items, at: at + 1 } } else {
+      let one = member(s, at, flags);
+      members(
+        s,
+        open,
+        one.at,
+        flags,
+        fold(one.items, items, |acc: List<Interval>, i: Interval| push(acc, i)),
+        false,
+        left - 1,
+      )
+    }
+  }
+
+/// One member of a class from `at`: a named class, a Perl class, a character or a range.
+fn member(
+  s: Source,
+  at: Int,
+  flags: Int,
+) -> { items: List<Interval>, at: Int } / {regex.refused, abort.raise} = {
+  let c = code(s, at);
+  let next = code(s, at + 1);
+  if c == b'[' && next == b':' {
+    match posix_at(s, at, flags) { Some(found) -> found, None -> ranged(s, at, flags) }
+  } else if c == b'\\' {
+    if next == b'p' || next == b'P' { refuse(at, UnicodeProperty) } else {
+      match perl(next) {
+        Some(set) -> { items: grouped(s, set, flags, next < 97), at: at + 2 },
+        None -> ranged(s, at, flags),
+      }
+    }
+  } else { ranged(s, at, flags) }
+}
+
+/// A `[:name:]` or `[:^name:]` at `at`, if the text there closes as one.
+fn posix_at(
+  s: Source,
+  at: Int,
+  flags: Int,
+) -> Option<{ items: List<Interval>, at: Int }> / {regex.refused, abort.raise} = {
+  let negated = code(s, at + 2) == b'^';
+  let from = if negated { at + 3 } else { at + 2 };
+  let end = name_end(s.text, from);
+  if code(s, end) != b':' || code(s, end + 1) != b']' { None } else {
+    match posix(name_text(s.text, from, end)) {
+      Some(set) -> Some({ items: grouped(s, set, flags, negated), at: end + 2 }),
+      None -> refuse(at, BadClassName),
+    }
+  }
+}
+
+/// A character of a class, or the range it opens.
+fn ranged(
+  s: Source,
+  at: Int,
+  flags: Int,
+) -> { items: List<Interval>, at: Int } / {regex.refused, abort.raise} = {
+  let low = class_code(s, at);
+  if code(s, low.at) == b'-' && code(s, low.at + 1) != b']' && code(s, low.at + 1) != -1 {
+    let high = class_code(s, low.at + 1);
+    if high.code < low.code { refuse(at, BadRange) }
+    else { { items: grouped(s, [iv(low.code, high.code)], flags, false), at: high.at } }
+  } else { { items: grouped(s, [iv(low.code, low.code)], flags, false), at: low.at } }
+}
+
+fn class_code(s: Source, at: Int) -> { code: Int, at: Int } / {regex.refused} = {
+  let one = if code(s, at) == b'\\' { escape_code(s, at) }
+  else { { code: code(s, at), at: at + 1 } };
+  if s.bytes && one.code > 0xFF { refuse(at, NotAByte) } else { one }
+}
+
+// --- A tree as the pattern that parses to it -----------------------------------
+
+/// `node` as a pattern that reads back to it under no flag. `level` is what stands around it:
+/// 0 an alternation, 1 a row, 2 a repetition.
+fn written(node: Node, level: Int, bytes: Bool) -> String / {abort.raise} =
+  match node {
+    Empty -> "(?:)",
+    Literal(c) -> char_text(c, bytes, "\\.+*?()|[]{}^$"),
+    Class(set) -> class_text(set, bytes),
+    Looking(look) -> match look {
+      LineStart -> "(?m:^)",
+      LineEnd -> "(?m:$)",
+      TextStart -> "\\A",
+      TextEnd -> "\\z",
+      WordEdge -> "\\b",
+      NotWordEdge -> "\\B",
+    },
+    Concat(items) -> bracketed(join(map(items, |n: Node| written(n, 1, bytes)), ""), level >= 2),
+    Alternate(items) ->
+      bracketed(join(map(items, |n: Node| written(n, 0, bytes)), "|"), level >= 1),
+    Repeat(sub, least, most, greedy) ->
+      bracketed(
+        written(sub, 2, bytes) ++ count_text(least, most) ++ (if greedy { "" } else { "?" }),
+        level >= 2,
+      ),
+    Capture(_, name, sub) ->
+      "(" ++ (match name { Some(n) -> "?P<" ++ n ++ ">", None -> "" }) ++ written(sub, 0, bytes)
+        ++ ")",
+  }
+
+fn bracketed(text: String, wrap: Bool) -> String = if wrap { "(?:" ++ text ++ ")" } else { text }
+
+fn count_text(least: Int, most: Int) -> String =
+  if most == -1 { match least { 0 -> "*", 1 -> "+", _ -> "{" ++ int_to_string(least) ++ ",}" } }
+  else if least == 0 && most == 1 { "?" }
+  else if least == most { "{" ++ int_to_string(least) ++ "}" }
+  else { "{" ++ int_to_string(least) ++ "," ++ int_to_string(most) ++ "}" }
+
+/// One code point as a pattern writes it: after a `\` where it is one of `special`, as `\x{..}`
+/// where it is no character a text shows, and otherwise itself.
+fn char_text(c: Int, bytes: Bool, special: String) -> String / {abort.raise} =
+  if c < 32 || c == 127 || (bytes && c > 126) { "\\x{" ++ hex_text(c) ++ "}" } else {
+    match char_of_int(c) {
+      None -> "\\x{" ++ hex_text(c) ++ "}",
+      Some(ch) -> {
+        let text = string_of_chars([ch]);
+        if string_contains(special, text) { "\\" ++ text } else { text }
+      },
+    }
+  }
+
+fn hex_text(n: Int) -> String / {abort.raise} =
+  if n < 16 { string_slice("0123456789ABCDEF", n, n + 1) }
+  else { hex_text(n / 16) ++ string_slice("0123456789ABCDEF", n % 16, n % 16 + 1) }
+
+/// A class as a pattern writes it: by what it leaves out where it reaches the last code point.
+fn class_text(set: List<Interval>, bytes: Bool) -> String / {abort.raise} = {
+  let most = if bytes { 0xFF } else { 0x10FFFF };
+  if set == [iv(0, most)] { "(?s:.)" } else {
+    let negated = len(set) == 0
+      || (match list_at(set, len(set) - 1) { Some(last) -> last.hi == most, None -> false });
+    let shown = if negated { complement(set, most) } else { set };
+    "[" ++ (if negated { "^" } else { "" })
+      ++ join(
+        map(shown, |i: Interval|
+          if i.lo == i.hi { char_text(i.lo, bytes, "\\]^-[") }
+          else { char_text(i.lo, bytes, "\\]^-[") ++ "-" ++ char_text(i.hi, bytes, "\\]^-[") }),
+        "",
+      )
+      ++ "]"
+  }
+}
+
+// --- Instructions -----------------------------------------------------------------
+
+/// One instruction of a compiled pattern. A place is an index into the program.
+type Inst =
+  /// A byte from the first through the second, then the place.
+  | Range(Int, Int, Int)
+  /// A byte the table gives an arm, then that arm's place: the table holds, for each of the 256
+  /// bytes, an arm's number from 1, or 0 for a byte that is refused.
+  | Switch(Bytes, Array<Int>)
+  /// The first place, or failing that the second.
+  | Split(Int, Int)
+  /// The position kept in a slot, then the place.
+  | Save(Int, Int)
+  /// The place, where every look of the set holds.
+  | Check(Int, Int)
+  | Match
+  | Fail
+
+/// The instructions that take one character of a class, placed from 0 among themselves, with
+/// `-1` for the place that follows the character; `entry` is where they start, and `cuts` every
+/// byte at which what they take changes.
+type Stencil = { insts: List<Inst>, entry: Int, cuts: List<Int> }
+
+/// A code point's bytes in UTF-8.
+fn spelling(c: Int) -> List<Int> =
+  if c < 0x80 { [c] }
+  else if c < 0x800 { [0xC0 | c >> 6, 0x80 | c & 0x3F] }
+  else if c < 0x10000 { [0xE0 | c >> 12, 0x80 | c >> 6 & 0x3F, 0x80 | c & 0x3F] }
+  else { [0xF0 | c >> 18, 0x80 | c >> 12 & 0x3F, 0x80 | c >> 6 & 0x3F, 0x80 | c & 0x3F] }
+
+/// The runs of byte ranges, one range a byte, that between them spell every code point of a
+/// class and nothing else, in the class's order. Over bytes a code point is its own one byte, and
+/// over text the surrogates, which no text holds, are left out.
+fn sequences(set: List<Interval>, bytes: Bool) -> List<List<Interval>> / {abort.raise} =
+  if bytes { map(set, |i: Interval| [i]) } else {
+    fold(set, [], |acc: List<List<Interval>>, i: Interval|
+      runs(max(i.lo, 0xE000), i.hi, runs(i.lo, min(i.hi, 0xD7FF), acc, 32), 32))
+  }
+
+/// The runs for the code points from `lo` through `hi`, after `done`: the stretch is cut where
+/// the number of bytes changes, and then wherever its ends do not fill a whole trailing byte.
+fn runs(
+  lo: Int,
+  hi: Int,
+  done: List<List<Interval>>,
+  left: Int,
+) -> List<List<Interval>> / {abort.raise} =
+  if lo > hi { done }
+  else if left <= 0 { panic("a stretch of code points is cut a bounded number of times") }
+  else if lo <= 0x7F && hi > 0x7F { runs(0x80, hi, runs(lo, 0x7F, done, left - 1), left - 1) }
+  else if lo <= 0x7FF && hi > 0x7FF { runs(0x800, hi, runs(lo, 0x7FF, done, left - 1), left - 1) }
+  else if lo <= 0xFFFF && hi > 0xFFFF {
+    runs(0x10000, hi, runs(lo, 0xFFFF, done, left - 1), left - 1)
+  } else { aligned(lo, hi, 6, done, left - 1) }
+
+fn aligned(
+  lo: Int,
+  hi: Int,
+  bits: Int,
+  done: List<List<Interval>>,
+  left: Int,
+) -> List<List<Interval>> / {abort.raise} =
+  if bits > 18 || lo < 0x80 { push(done, spelled(lo, hi)) } else {
+    let low = (1 << bits) - 1;
+    if lo & ~low == hi & ~low { aligned(lo, hi, bits + 6, done, left) }
+    else if lo & low != 0 { runs((lo | low) + 1, hi, runs(lo, lo | low, done, left), left) }
+    else if hi & low != low { runs(hi & ~low, hi, runs(lo, (hi & ~low) - 1, done, left), left) }
+    else { aligned(lo, hi, bits + 6, done, left) }
+  }
+
+/// The run for two code points that spell in as many bytes and differ only in bytes a whole
+/// range of which lies between them.
+fn spelled(lo: Int, hi: Int) -> List<Interval> = {
+  let high = spelling(hi);
+  fold(spelling(lo), [], |acc: List<Interval>, b: Int| push(acc, iv(b, at_or(high, len(acc), b))))
+}
+
+/// A stencil being built: its instructions, the place already made for a set of runs, and the
+/// cuts so far.
+type Building = { insts: List<Inst>, known: Map<List<List<Interval>>, Int>, cuts: List<Int> }
+
+type Placed = { building: Building, place: Int }
+
+/// Runs that open with one range, and the place that takes what follows it: `-1` where nothing
+/// does.
+type Arm = { head: Interval, place: Int }
+
+/// Whether a class is one instruction: over bytes any is, and over text one within ASCII.
+fn is_flat(set: List<Interval>, bytes: Bool) -> Bool =
+  bytes || (match list_at(set, len(set) - 1) { Some(last) -> last.hi < 0x80, None -> false })
+
+/// The stencil of a class. One of a single byte is one instruction. Most that reach past ASCII
+/// are what a negated class of ASCII characters is, every character past ASCII and some of
+/// those within it, and such a one is the stencil of every character with its first table
+/// rewritten. Any other is built from the runs of bytes its characters spell.
+fn stencil(set: List<Interval>, bytes: Bool, reversed: Bool) -> Stencil / {abort.raise} =
+  if is_flat(set, bytes) {
+    match set {
+      [] -> { insts: [Fail], entry: 0, cuts: [] },
+      [one] -> { insts: [Range(one.lo, one.hi, -1)], entry: 0, cuts: [one.lo, one.hi + 1] },
+      _ -> {
+        let low = tabled(set, 1, 256, []);
+        {
+          insts: [Switch(bytes_concat_all(low.parts), array_of_list([-1]))],
+          entry: 0,
+          cuts: low.cuts,
+        }
+      },
+    }
+  } else {
+    match list_at(set, len(set) - 1) {
+      Some(last) if last.lo <= 0x80 && last.hi == 0x10FFFF ->
+        narrowed(if reversed { any_back() } else { any_ahead() }, set),
+      _ -> built(set, bytes, reversed),
+    }
+  }
+
+/// The first `size` bytes of a table that gives `arm` to the bytes of `set` below `size` and
+/// refuses the rest, as parts to join, with the bytes at which it changes after `cuts`.
+fn tabled(
+  set: List<Interval>,
+  arm: Int,
+  size: Int,
+  cuts: List<Int>,
+) -> { parts: List<Bytes>, cuts: List<Int> } / {abort.raise} = {
+  let w = fold(
+    set,
+    { at: 0, parts: [], cuts: cuts },
+    |w: { at: Int, parts: List<Bytes>, cuts: List<Int> }, i: Interval|
+      if i.lo >= size { w } else {
+        let hi = min(i.hi, size - 1);
+        {
+          at: hi + 1,
+          parts: push(push(w.parts, run_of(0, i.lo - w.at)), run_of(arm, hi - i.lo + 1)),
+          cuts: push(push(w.cuts, i.lo), hi + 1),
+        }
+      },
+  );
+  { parts: push(w.parts, run_of(0, size - w.at)), cuts: w.cuts }
+}
+
+const fn any_ahead() -> Stencil = built([iv(0, 0x10FFFF)], false, false)
+
+const fn any_back() -> Stencil = built([iv(0, 0x10FFFF)], false, true)
+
+/// The stencil of every character, with only those ASCII characters taken that `set` holds.
+fn narrowed(every: Stencil, set: List<Interval>) -> Stencil / {abort.raise} =
+  match list_at(every.insts, every.entry) {
+    Some(Switch(table, arms)) -> {
+      let low = tabled(set, bytes_at(table, 0), 128, every.cuts);
+      {
+        insts: list_set(
+          every.insts,
+          every.entry,
+          Switch(bytes_concat_all(push(low.parts, bytes_slice(table, 128, 256))), arms),
+        ),
+        entry: every.entry,
+        cuts: low.cuts,
+      }
+    },
+    _ -> panic("the stencil of every character opens with a table"),
+  }
+
+fn built(set: List<Interval>, bytes: Bool, reversed: Bool) -> Stencil / {abort.raise} = {
+  let forward = sequences(set, bytes);
+  let seqs = if reversed { sort(map(forward, |q: List<Interval>| reverse(q))) } else { forward };
+  if len(seqs) == 0 { { insts: [Fail], entry: 0, cuts: [] } } else {
+    let made = branch({ insts: [], known: map_new(), cuts: [] }, seqs, 4);
+    { insts: made.building.insts, entry: made.place, cuts: made.building.cuts }
+  }
+}
+
+/// The place, made once, of instructions that take any of `seqs`.
+fn branch(b: Building, seqs: List<List<Interval>>, depth: Int) -> Placed / {abort.raise} =
+  match map_get(b.known, seqs) {
+    Some(place) -> { building: b, place: place },
+    None -> if depth <= 0 { panic("a character is at most four bytes") } else {
+      let armed = fold(
+        headed(seqs),
+        { building: b, arms: [] },
+        |acc: { building: Building, arms: List<Arm> }, g: { head: Interval, tails: List<List<Interval>> }|
+          if len(g.tails) == 0 {
+            { building: acc.building, arms: push(acc.arms, { head: g.head, place: -1 }) }
+          } else {
+            let below = branch(acc.building, g.tails, depth - 1);
+            { building: below.building, arms: push(acc.arms, { head: g.head, place: below.place }) }
+          },
+      );
+      let made = dispatch(armed.building, armed.arms);
+      {
+        building: { ..made.building, known: map_insert(made.building.known, seqs, made.place) },
+        place: made.place,
+      }
+    },
+  }
+
+/// Runs gathered by the range each opens with, where neighbours open alike and both go on or
+/// both end: the range, and what follows it in each.
+fn headed(
+  seqs: List<List<Interval>>,
+) -> List<{ head: Interval, tails: List<List<Interval>> }> / {abort.raise} =
+  fold(seqs, [], |acc: List<{ head: Interval, tails: List<List<Interval>> }>, q: List<Interval>|
+    match q {
+      [] -> acc,
+      [head, ..rest] -> match list_at(acc, len(acc) - 1) {
+        Some(last) if last.head == head && len(rest) == 0 && len(last.tails) == 0 -> acc,
+        Some(last) if last.head == head && len(rest) > 0 && len(last.tails) > 0 ->
+          list_set(acc, len(acc) - 1, { head: head, tails: push(last.tails, rest) }),
+        _ -> push(acc, { head: head, tails: if len(rest) == 0 { [] } else { [rest] } }),
+      },
+    })
+
+/// The instruction that takes a byte of one of the arms and goes where that arm does: one
+/// `Range` for one arm, a `Switch` where no two arms share a byte, and otherwise a choice
+/// between a `Range` for each.
+fn dispatch(b: Building, arms: List<Arm>) -> Placed / {abort.raise} = {
+  let cut = {
+    ..b,
+    cuts: fold(arms, b.cuts, |cs: List<Int>, a: Arm| push(push(cs, a.head.lo), a.head.hi + 1)),
+  };
+  let sorted = sort_by(arms, |x: Arm, y: Arm| x.head.lo <= y.head.lo);
+  let apart = fold(sorted, { ok: true, next: 0 }, |w: { ok: Bool, next: Int }, a: Arm|
+    { ok: w.ok && a.head.lo >= w.next, next: a.head.hi + 1 }).ok;
+  match sorted {
+    [one] -> set_down(cut, Range(one.head.lo, one.head.hi, one.place)),
+    _ -> if apart { set_down(cut, switch(sorted)) } else {
+      fold(reverse(arms), { building: cut, place: -2 }, |acc: Placed, a: Arm| {
+        let one = set_down(acc.building, Range(a.head.lo, a.head.hi, a.place));
+        if acc.place == -2 { one } else { set_down(one.building, Split(one.place, acc.place)) }
+      })
+    },
+  }
+}
+
+fn set_down(b: Building, inst: Inst) -> Placed =
+  { building: { ..b, insts: push(b.insts, inst) }, place: len(b.insts) }
+
+/// A `Switch` over arms that are in order and share no byte.
+fn switch(arms: List<Arm>) -> Inst / {abort.raise} = {
+  let places = unique(map(arms, |a: Arm| a.place));
+  let filled = fold(arms, { at: 0, parts: [] }, |w: { at: Int, parts: List<Bytes> }, a: Arm| {
+    let arm = match index_of(places, a.place) { Some(i) -> i + 1, None -> 0 };
+    {
+      at: a.head.hi + 1,
+      parts: push(
+        push(w.parts, run_of(0, a.head.lo - w.at)),
+        run_of(arm, a.head.hi - a.head.lo + 1),
+      ),
+    }
+  });
+  Switch(bytes_concat_all(push(filled.parts, run_of(0, 256 - filled.at))), array_of_list(places))
+}
+
+/// `n` bytes, each `b`.
+fn run_of(b: Int, n: Int) -> Bytes / {abort.raise} =
+  if n <= 0 { b"" }
+  else if n == 1 { byte_of_int(b) } else {
+    let half = run_of(b, n / 2);
+    if n % 2 == 0 { half ++ half } else { half ++ half ++ byte_of_int(b) }
+  }
+
+// --- Compiling ----------------------------------------------------------------------
+
+/// A program being written, back to front: its instructions, every byte at which what some
+/// instruction takes changes, each class's stencil, and what kind of program it is.
+type Emitting = {
+  insts: List<Inst>,
+  cuts: Map<Int, Unit>,
+  classes: Map<List<Interval>, Stencil>,
+  bytes: Bool,
+  reversed: Bool,
+}
+
+/// A program so far, and where what was just written starts.
+type Emitted = { e: Emitting, entry: Int }
+
+fn put(e: Emitting, inst: Inst) -> Emitted =
+  { e: { ..e, insts: push(e.insts, inst) }, entry: len(e.insts) }
+
+fn fork(first: Int, other: Int, greedy: Bool) -> Inst =
+  if greedy { Split(first, other) } else { Split(other, first) }
+
+/// The looks an instruction checks, as a set of bits. A program read backwards swaps a start for
+/// an end.
+fn look_bits(look: Look, reversed: Bool) -> Int =
+  match look {
+    LineStart -> if reversed { 2 } else { 1 },
+    LineEnd -> if reversed { 1 } else { 2 },
+    TextStart -> if reversed { 8 } else { 4 },
+    TextEnd -> if reversed { 4 } else { 8 },
+    WordEdge -> 16,
+    NotWordEdge -> 32,
+  }
+
+/// Instructions for `node` that go on to `next`, written after those already there. `depth`
+/// is how much further the tree may nest, which a parsed one never reaches.
+fn emit(e: Emitting, node: Node, next: Int, depth: Int) -> Emitted / {abort.raise} =
+  if depth <= 0 { panic("a parsed pattern nests no deeper than its groups") } else {
+    match node {
+      Empty -> { e: e, entry: next },
+      Literal(c) -> spelt(e, c, next),
+      Class(set) -> classed(e, set, next),
+      Looking(look) -> put(e, Check(look_bits(look, e.reversed), next)),
+      Concat(items) ->
+        fold(
+          if e.reversed { items } else { reverse(items) },
+          { e: e, entry: next },
+          |acc: Emitted, n: Node| emit(acc.e, n, acc.entry, depth - 1),
+        ),
+      Alternate(items) -> {
+        let arms = fold(
+          items,
+          { e: e, entries: [] },
+          |acc: { e: Emitting, entries: List<Int> }, n: Node| {
+            let one = emit(acc.e, n, next, depth - 1);
+            { e: one.e, entries: push(acc.entries, one.entry) }
+          },
+        );
+        fold(reverse(arms.entries), { e: arms.e, entry: -1 }, |acc: Emitted, entry: Int|
+          if acc.entry < 0 { { e: acc.e, entry: entry } }
+          else { put(acc.e, Split(entry, acc.entry)) })
+      },
+      Capture(index, _, sub) -> if e.reversed { emit(e, sub, next, depth - 1) } else {
+        let close = put(e, Save(2 * index + 1, next));
+        let body = emit(close.e, sub, close.entry, depth - 1);
+        put(body.e, Save(2 * index, body.entry))
+      },
+      Repeat(sub, least, most, greedy) -> if most >= 0 {
+        let tail = optional(e, sub, greedy, next, next, most - least, depth - 1);
+        copies(tail.e, sub, tail.entry, least, depth - 1)
+      } else if least == 0 { star(e, sub, greedy, next, depth - 1) } else {
+        let last = plus(e, sub, greedy, next, depth - 1);
+        copies(last.e, sub, last.entry, least - 1, depth - 1)
+      },
+    }
+  }
+
+/// One literal code point: its bytes in a row, or nothing that can match for a surrogate.
+fn spelt(e: Emitting, c: Int, next: Int) -> Emitted =
+  if !e.bytes && c >= 0xD800 && c <= 0xDFFF { put(e, Fail) } else {
+    let bytes = if e.bytes { [c] } else { spelling(c) };
+    fold(
+      if e.reversed { bytes } else { reverse(bytes) },
+      { e: e, entry: next },
+      |acc: Emitted, b: Int|
+        put(
+          { ..acc.e, cuts: map_insert(map_insert(acc.e.cuts, b, ()), b + 1, ()) },
+          Range(b, b, acc.entry),
+        ),
+    )
+  }
+
+/// One character of a class: its stencil, made once a program, placed here.
+fn classed(e: Emitting, set: List<Interval>, next: Int) -> Emitted / {abort.raise} = {
+  let known = map_get(e.classes, set);
+  let t = match known { Some(t) -> t, None -> stencil(set, e.bytes, e.reversed) };
+  let base = len(e.insts);
+  let insts = fold(t.insts, e.insts, |acc: List<Inst>, i: Inst| push(acc, moved(i, base, next)));
+  {
+    e: match known {
+      Some(_) -> { ..e, insts: insts },
+      None ->
+        {
+          ..e,
+          insts: insts,
+          classes: map_insert(e.classes, set, t),
+          cuts: fold(t.cuts, e.cuts, |cuts: Map<Int, Unit>, c: Int| map_insert(cuts, c, ())),
+        },
+    },
+    entry: base + t.entry,
+  }
+}
+
+/// A stencil's instruction as the program holds it once the stencil starts at `base`.
+fn moved(i: Inst, base: Int, next: Int) -> Inst =
+  match i {
+    Range(lo, hi, to) -> Range(lo, hi, if to < 0 { next } else { base + to }),
+    Switch(table, arms) ->
+      Switch(
+        table,
+        array_of_list(map(array_to_list(arms), |to: Int| if to < 0 { next } else { base + to })),
+      ),
+    Split(x, y) -> Split(if x < 0 { next } else { base + x }, if y < 0 { next } else { base + y }),
+    other -> other,
+  }
+
+/// `sub` any number of times. One that can match nothing is repeated as one or more, optionally,
+/// so that a pass that takes nothing ends the loop instead of beating the way out of it.
+fn star(e: Emitting, sub: Node, greedy: Bool, next: Int, depth: Int) -> Emitted / {abort.raise} =
+  if nullable(sub) {
+    let more = plus(e, sub, greedy, next, depth);
+    put(more.e, fork(more.entry, next, greedy))
+  } else {
+    let hole = put(e, Fail);
+    let body = emit(hole.e, sub, hole.entry, depth);
+    {
+      e: { ..body.e, insts: list_set(body.e.insts, hole.entry, fork(body.entry, next, greedy)) },
+      entry: hole.entry,
+    }
+  }
+
+/// `sub` one or more times.
+fn plus(e: Emitting, sub: Node, greedy: Bool, next: Int, depth: Int) -> Emitted / {abort.raise} = {
+  let hole = put(e, Fail);
+  let body = emit(hole.e, sub, hole.entry, depth);
+  {
+    e: { ..body.e, insts: list_set(body.e.insts, hole.entry, fork(body.entry, next, greedy)) },
+    entry: body.entry,
+  }
+}
+
+/// `sub` up to `count` times, each further one inside the one before: `tail` is the place of
+/// those already written.
+fn optional(
+  e: Emitting,
+  sub: Node,
+  greedy: Bool,
+  next: Int,
+  tail: Int,
+  count: Int,
+  depth: Int,
+) -> Emitted / {abort.raise} =
+  if count <= 0 { { e: e, entry: tail } } else {
+    let body = emit(e, sub, tail, depth);
+    let fork = put(body.e, fork(body.entry, next, greedy));
+    optional(fork.e, sub, greedy, next, fork.entry, count - 1, depth)
+  }
+
+fn copies(e: Emitting, sub: Node, next: Int, count: Int, depth: Int) -> Emitted / {abort.raise} =
+  if count <= 0 { { e: e, entry: next } } else {
+    let one = emit(e, sub, next, depth);
+    copies(one.e, sub, one.entry, count - 1, depth)
+  }
+
+/// Whether every match of `node` starts where the subject does.
+fn anchored(node: Node) -> Bool =
+  match node {
+    Looking(TextStart) -> true,
+    Concat(items) -> match items { [first, ..] -> anchored(first), [] -> false },
+    Alternate(items) -> fold(items, true, |all: Bool, n: Node| all && anchored(n)),
+    Repeat(sub, least, _, _) -> least > 0 && anchored(sub),
+    Capture(_, _, sub) -> anchored(sub),
+    _ -> false,
+  }
+
+/// Every look `node` asks, as a set of bits.
+fn looks_of(node: Node) -> Int =
+  match node {
+    Looking(look) -> look_bits(look, false),
+    Concat(items) | Alternate(items) -> fold(items, 0, |all: Int, n: Node| all | looks_of(n)),
+    Repeat(sub, _, _, _) | Capture(_, _, sub) -> looks_of(sub),
+    _ -> 0,
+  }
+
+/// The class each byte falls in, bytes no instruction tells apart sharing one, and how many
+/// classes there are.
+fn byte_classes(cuts: Map<Int, Unit>) -> { classes: Bytes, count: Int } / {abort.raise} = {
+  let w = fold(
+    map_keys(cuts),
+    { at: 0, id: 0, parts: [] },
+    |w: { at: Int, id: Int, parts: List<Bytes> }, c: Int|
+      if c <= w.at || c > 255 { w }
+      else { { at: c, id: w.id + 1, parts: push(w.parts, run_of(w.id, c - w.at)) } },
+  );
+  { classes: bytes_concat_all(push(w.parts, run_of(w.id, 256 - w.at))), count: w.id + 1 }
+}
+
+/// What a search can skip to: `first` is every byte a match can start with, empty where a match
+/// may be empty, where a look stands before its first byte, or where any byte starts one; `lead`
+/// is the bytes every match starts with, and `exact` whether they are the whole of every match;
+/// `held` is a text every match holds somewhere, empty where none is known beyond `lead`.
+type Opening = { first: Bytes, lead: Bytes, exact: Bool, held: Bytes }
+
+fn opening(insts: Array<Inst>, start: Int, tree: Node, bytes: Bool) -> Opening / {abort.raise} = {
+  let n = array_len(insts);
+  let led = lead_from(insts, start, [], n + 1);
+  let firsts = first_from(
+    insts,
+    array_new(n, false),
+    array_set(array_new(2 * n + 2, 0), 0, start),
+    1,
+    [],
+    4 * n + 4,
+  );
+  let first = match firsts { Some(parts) -> bytes_concat_all(parts), None -> b"" };
+  let lead = bytes_concat_all(led.bytes);
+  let inside = held(tree, bytes);
+  {
+    first: if bytes_len(first) >= 256 { b"" } else { first },
+    lead: lead,
+    exact: led.whole,
+    held: if inside == lead { b"" } else { inside },
+  }
+}
+
+/// The longest text the tree shows every match of `node` to hold: characters set one after
+/// another, in a row, a group or a repetition no match goes around.
+fn held(node: Node, bytes: Bool) -> Bytes / {abort.raise} =
+  match node {
+    Literal(c) -> spelt_out(c, bytes),
+    Capture(_, _, sub) -> held(sub, bytes),
+    Repeat(sub, least, _, _) -> if least > 0 { held(sub, bytes) } else { b"" },
+    Concat(items) -> {
+      let w = fold(
+        items,
+        { run: [], best: b"" },
+        |w: { run: List<Bytes>, best: Bytes }, n: Node|
+          match n {
+            Literal(c) -> { run: push(w.run, spelt_out(c, bytes)), best: w.best },
+            _ -> { run: [], best: longer(longer(w.best, bytes_concat_all(w.run)), held(n, bytes)) },
+          },
+      );
+      longer(w.best, bytes_concat_all(w.run))
+    },
+    _ -> b"",
+  }
+
+/// One code point as the bytes a subject holds it in.
+fn spelt_out(c: Int, bytes: Bool) -> Bytes / {abort.raise} =
+  if bytes { byte_of_int(c) } else { bytes_concat_all(map(spelling(c), |b: Int| byte_of_int(b))) }
+
+fn longer(a: Bytes, b: Bytes) -> Bytes = if bytes_len(b) > bytes_len(a) { b } else { a }
+
+fn lead_from(
+  insts: Array<Inst>,
+  pc: Int,
+  bytes: List<Bytes>,
+  left: Int,
+) -> { bytes: List<Bytes>, whole: Bool } / {abort.raise} =
+  if left <= 0 { { bytes: bytes, whole: false } } else {
+    match array_get(insts, pc) {
+      Save(_, to) -> lead_from(insts, to, bytes, left - 1),
+      Range(lo, hi, to) if lo == hi -> lead_from(insts, to, push(bytes, byte_of_int(lo)), left - 1),
+      Match -> { bytes: bytes, whole: true },
+      _ -> { bytes: bytes, whole: false },
+    }
+  }
+
+/// The bytes the instructions reached from the stack without taking one can take, as stretches
+/// of all the bytes in order; `None` where a `Match` or a `Check` is reached.
+fn first_from(
+  insts: Array<Inst>,
+  seen: Array<Bool>,
+  stack: Array<Int>,
+  sp: Int,
+  parts: List<Bytes>,
+  left: Int,
+) -> Option<List<Bytes>> / {abort.raise} =
+  if sp <= 0 { Some(parts) }
+  else if left <= 0 { panic("a program is walked once") } else {
+    let pc = array_get(stack, sp - 1);
+    if array_get(seen, pc) { first_from(insts, seen, stack, sp - 1, parts, left - 1) } else {
+      let marked = array_set(seen, pc, true);
+      match array_get(insts, pc) {
+        Split(x, y) ->
+          first_from(
+            insts,
+            marked,
+            array_set(array_set(stack, sp - 1, y), sp, x),
+            sp + 1,
+            parts,
+            left - 1,
+          ),
+        Save(_, to) -> first_from(insts, marked, array_set(stack, sp - 1, to), sp, parts, left - 1),
+        Range(lo, hi, _) ->
+          first_from(
+            insts,
+            marked,
+            stack,
+            sp - 1,
+            push(parts, bytes_slice(every_byte(), lo, hi + 1)),
+            left - 1,
+          ),
+        Switch(table, _) ->
+          first_from(insts, marked, stack, sp - 1, taken(table, 0, parts, 257), left - 1),
+        Fail -> first_from(insts, marked, stack, sp - 1, parts, left - 1),
+        Match | Check(_, _) -> None,
+      }
+    }
+  }
+
+/// The bytes a `Switch`'s table gives an arm, after `parts`.
+fn taken(table: Bytes, at: Int, parts: List<Bytes>, left: Int) -> List<Bytes> / {abort.raise} =
+  if at >= 256 || left <= 0 { parts } else {
+    let from = bytes_scan(table, at, b"\x00", 256 - at);
+    if from >= 256 { parts } else {
+      let to = bytes_scan_until(table, from, b"\x00", 256 - from);
+      taken(table, to, push(parts, bytes_slice(every_byte(), from, to)), left - 1)
+    }
+  }
+
+/// The 256 bytes, in order.
+const fn every_byte() -> Bytes = bytes_concat_all(map(range(0, 256), |b: Int| byte_of_int(b)))
+
+/// How a pattern is compiled and searched with.
+pub type Options = {
+  /// Whether the match taken at the leftmost place one starts is the longest there, as POSIX
+  /// has it, where otherwise it is the one a backtracking search would find first, as Perl has it.
+  longest: Bool,
+  /// The most instructions the pattern may compile to, every counted repetition written out,
+  /// and 16777216 where more is asked. A pattern past it is refused as `TooLarge`. The program
+  /// that reads a match backwards is written from the same tree and is not counted.
+  size_limit: Int,
+  /// The most states a search keeps of the automaton it builds as it reads. A search that
+  /// would keep more goes on by following every state at once, which costs more a byte and
+  /// keeps nothing.
+  state_limit: Int,
+  /// A subject of no more bytes than this is short, and searched by following every state at
+  /// once from the start: a short search meets few states twice, so keeping them costs more
+  /// than it saves. A negative number has no subject short.
+  short: Int,
+}
+
+/// The first match a backtracking search would find, 100000 instructions, 4096 states, and a
+/// subject of 32 bytes or fewer short.
+pub fn options() -> Options = { longest: false, size_limit: 100000, state_limit: 4096, short: 32 }
+
+/// A program as a search by states reads it: its instructions, where a search enters them, the
+/// class each byte falls in, how many classes there are with one more for the subject's end,
+/// whether a match found ends what is tried after it, and whether any instruction asks about a
+/// line's end or a word's.
+type Automaton = {
+  insts: Array<Inst>,
+  entry: Int,
+  classes: Bytes,
+  stride: Int,
+  first_wins: Bool,
+  lines: Bool,
+  words: Bool,
+}
+
+/// A compiled pattern.
+type Compiled = {
+  pattern: String,
+  options: Options,
+  bytes: Bool,
+  tree: Node,
+  /// Each group's name, by its number.
+  names: List<Option<String>>,
+  /// The number of each named group.
+  numbers: Map<String, Int>,
+  /// The program a search runs, where a match is read from once its start is known, and where a
+  /// search for one starts.
+  insts: Array<Inst>,
+  start: Int,
+  search: Int,
+  opening: Opening,
+  /// The search for where the leftmost match ends, the one for the longest end from a known
+  /// start, and the one that reads a match backwards from its end to its start.
+  finder: Automaton,
+  stretcher: Automaton,
+  tracer: Automaton,
+}
+
+fn compiled(pattern: String, o: Options, bytes: Bool) -> Compiled / {regex.refused, abort.raise} = {
+  let s = {
+    text: array_of_list(code_points(pattern)),
+    bytes: bytes,
+    limit: max(0, min(o.size_limit, 0x1000000)),
+  };
+  let p = alternation(s, 0, 0, [None], 200);
+  if p.at < array_len(s.text) { refuse(p.at, UnopenedGroup) } else {
+    let ahead = emit(
+      { insts: [Match], cuts: map_new(), classes: map_new(), bytes: bytes, reversed: false },
+      Capture(0, None, p.node),
+      0,
+      1000,
+    );
+    let sought = if anchored(p.node) { ahead } else {
+      let hole = put(ahead.e, Fail);
+      let skip = classed(hole.e, [iv(0, top(s))], hole.entry);
+      {
+        e: { ..skip.e, insts: list_set(skip.e.insts, hole.entry, Split(ahead.entry, skip.entry)) },
+        entry: hole.entry,
+      }
+    };
+    let behind = emit(
+      { insts: [Match], cuts: sought.e.cuts, classes: map_new(), bytes: bytes, reversed: true },
+      p.node,
+      0,
+      1000,
+    );
+    let looks = looks_of(p.node);
+    let lined = if looks & 3 != 0 { map_insert(map_insert(behind.e.cuts, 10, ()), 11, ()) }
+    else { behind.e.cuts };
+    let cuts = if looks & 48 != 0 {
+      fold([48, 58, 65, 91, 95, 96, 97, 123], lined, |cuts: Map<Int, Unit>, c: Int|
+        map_insert(cuts, c, ()))
+    } else { lined };
+    let told = byte_classes(cuts);
+    let insts = array_of_list(sought.e.insts);
+    let finder = {
+      insts: insts,
+      entry: sought.entry,
+      classes: told.classes,
+      stride: told.count + 1,
+      first_wins: true,
+      lines: looks & 3 != 0,
+      words: looks & 48 != 0,
+    };
+    {
+      pattern: pattern,
+      options: o,
+      bytes: bytes,
+      tree: p.node,
+      names: p.groups,
+      numbers: fold(range(0, len(p.groups)), map_new(), |m: Map<String, Int>, i: Int|
+        match list_at(p.groups, i) { Some(Some(name)) -> map_insert(m, name, i), _ -> m }),
+      insts: insts,
+      start: ahead.entry,
+      search: sought.entry,
+      opening: opening(insts, ahead.entry, p.node, bytes),
+      finder: finder,
+      stretcher: { ..finder, entry: ahead.entry, first_wins: false },
+      tracer: {
+        ..finder,
+        insts: array_of_list(behind.e.insts),
+        entry: behind.entry,
+        first_wins: false,
+      },
+    }
+  }
+}
+
+// --- Every state at once -------------------------------------------------------------
+
+/// What a run that follows every state at once is given: the program, the subject, where the
+/// run takes no further byte, how many slots it keeps, and whether it wants the longest match.
+type Run = { insts: Array<Inst>, hay: Bytes, stop: Int, slots: Int, longest: Bool }
+
+fn is_word(b: Int) -> Bool =
+  (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || b == 95 || (b >= 97 && b <= 122)
+
+/// The looks that hold at `at`, as a set of bits.
+fn looks_at(hay: Bytes, at: Int) -> Int / {abort.raise} = {
+  let n = bytes_len(hay);
+  let before = if at > 0 { bytes_at(hay, at - 1) } else { -1 };
+  let after = if at < n { bytes_at(hay, at) } else { -1 };
+  (if at == 0 { 5 } else if before == 10 { 1 } else { 0 })
+    | (if at == n { 10 } else if after == 10 { 2 } else { 0 })
+    | (if is_word(before) != is_word(after) { 16 } else { 32 })
+}
+
+/// The slots of the match a run from `entry` at `from` finds, or no slots at all where there is
+/// none. A slot nothing was kept in holds `-1`.
+///
+/// Every state the program could be in is followed at once, in the order a backtracking search
+/// would try them, so each is entered once a position and a match found first is the one such a
+/// search finds first.
+fn run(r: Run, entry: Int, from: Int) -> Array<Int> / {abort.raise} = {
+  let n = array_len(r.insts);
+  let none = array_new(0, 0);
+  threads_add(
+    r,
+    (r.stop - from + 2) * (6 * n + 8),
+    from - 1,
+    array_new(n, -1),
+    array_set(array_new(2 * n + 2, 0), 0, entry),
+    array_set(array_new(2 * n + 2, none), 0, array_new(r.slots, -1)),
+    1,
+    array_new(n, 0),
+    array_new(n, none),
+    0,
+    0,
+    array_new(n, 0),
+    array_new(n, none),
+    0,
+    none,
+  )
+}
+
+/// Takes the byte at `pos` in thread `t` of the `nc` threads waiting there, each a place in
+/// `cpc` and its slots in `ccap`, and goes on to the next; past the last, the `nn` threads made
+/// for the next position take their turn. `best` is the match found so far.
+fn threads_step(
+  r: Run,
+  fuel: Int,
+  pos: Int,
+  seen: Array<Int>,
+  spc: Array<Int>,
+  scap: Array<Array<Int>>,
+  sp: Int,
+  cpc: Array<Int>,
+  ccap: Array<Array<Int>>,
+  nc: Int,
+  t: Int,
+  npc: Array<Int>,
+  ncap: Array<Array<Int>>,
+  nn: Int,
+  best: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if fuel <= 0 { panic("a run takes a bounded number of steps") } else if t >= nc {
+    if pos >= r.stop || nn == 0 { best } else {
+      threads_step(r, fuel - 1, pos + 1, seen, spc, scap, 0, npc, ncap, nn, 0, cpc, ccap, 0, best)
+    }
+  } else {
+    let cap = array_get(ccap, t);
+    if r.longest && array_len(best) > 0
+        && (array_get(cap, 0) < 0 || array_get(cap, 0) > array_get(best, 0)) {
+      threads_step(r, fuel - 1, pos, seen, spc, scap, sp, cpc, ccap, nc, t + 1, npc, ncap, nn, best)
+    } else {
+      match array_get(r.insts, array_get(cpc, t)) {
+        Range(lo, hi, to) -> {
+          let b = if pos < r.stop { bytes_at(r.hay, pos) } else { -1 };
+          if b >= lo && b <= hi {
+            threads_add(
+              r,
+              fuel - 1,
+              pos,
+              seen,
+              array_set(spc, 0, to),
+              array_set(scap, 0, cap),
+              1,
+              cpc,
+              ccap,
+              nc,
+              t,
+              npc,
+              ncap,
+              nn,
+              best,
+            )
+          } else {
+            threads_step(
+              r,
+              fuel - 1,
+              pos,
+              seen,
+              spc,
+              scap,
+              sp,
+              cpc,
+              ccap,
+              nc,
+              t + 1,
+              npc,
+              ncap,
+              nn,
+              best,
+            )
+          }
+        },
+        Switch(table, arms) -> {
+          let arm = if pos < r.stop { bytes_at(table, bytes_at(r.hay, pos)) } else { 0 };
+          if arm > 0 {
+            threads_add(
+              r,
+              fuel - 1,
+              pos,
+              seen,
+              array_set(spc, 0, array_get(arms, arm - 1)),
+              array_set(scap, 0, cap),
+              1,
+              cpc,
+              ccap,
+              nc,
+              t,
+              npc,
+              ncap,
+              nn,
+              best,
+            )
+          } else {
+            threads_step(
+              r,
+              fuel - 1,
+              pos,
+              seen,
+              spc,
+              scap,
+              sp,
+              cpc,
+              ccap,
+              nc,
+              t + 1,
+              npc,
+              ncap,
+              nn,
+              best,
+            )
+          }
+        },
+        Match -> if r.longest {
+          threads_step(
+            r,
+            fuel - 1,
+            pos,
+            seen,
+            spc,
+            scap,
+            sp,
+            cpc,
+            ccap,
+            nc,
+            t + 1,
+            npc,
+            ncap,
+            nn,
+            if array_len(best) == 0 || array_get(cap, 1) > array_get(best, 1) { cap } else { best },
+          )
+        } else {
+          threads_step(r, fuel - 1, pos, seen, spc, scap, sp, cpc, ccap, nc, nc, npc, ncap, nn, cap)
+        },
+        _ ->
+          threads_step(
+            r,
+            fuel - 1,
+            pos,
+            seen,
+            spc,
+            scap,
+            sp,
+            cpc,
+            ccap,
+            nc,
+            t + 1,
+            npc,
+            ncap,
+            nn,
+            best,
+          ),
+      }
+    }
+  }
+
+/// Follows the places on the stack, each with its slots, through every instruction that takes
+/// no byte, at the position after `pos`: a place not yet entered there joins the next
+/// position's threads, in the order a backtracking search would reach them.
+fn threads_add(
+  r: Run,
+  fuel: Int,
+  pos: Int,
+  seen: Array<Int>,
+  spc: Array<Int>,
+  scap: Array<Array<Int>>,
+  sp: Int,
+  cpc: Array<Int>,
+  ccap: Array<Array<Int>>,
+  nc: Int,
+  t: Int,
+  npc: Array<Int>,
+  ncap: Array<Array<Int>>,
+  nn: Int,
+  best: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if fuel <= 0 { panic("a run takes a bounded number of steps") } else if sp <= 0 {
+    threads_step(r, fuel - 1, pos, seen, spc, scap, 0, cpc, ccap, nc, t + 1, npc, ncap, nn, best)
+  } else {
+    let pc = array_get(spc, sp - 1);
+    if array_get(seen, pc) == pos + 1 {
+      threads_add(r, fuel - 1, pos, seen, spc, scap, sp - 1, cpc, ccap, nc, t, npc, ncap, nn, best)
+    } else {
+      let cap = array_get(scap, sp - 1);
+      let marked = array_set(seen, pc, pos + 1);
+      match array_get(r.insts, pc) {
+        Split(x, y) ->
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            array_set(array_set(spc, sp - 1, y), sp, x),
+            array_set(scap, sp, cap),
+            sp + 1,
+            cpc,
+            ccap,
+            nc,
+            t,
+            npc,
+            ncap,
+            nn,
+            best,
+          ),
+        Save(slot, to) ->
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            array_set(spc, sp - 1, to),
+            if slot < r.slots { array_set(scap, sp - 1, array_set(cap, slot, pos + 1)) }
+            else { scap },
+            sp,
+            cpc,
+            ccap,
+            nc,
+            t,
+            npc,
+            ncap,
+            nn,
+            best,
+          ),
+        Check(looks, to) -> if looks & ~looks_at(r.hay, pos + 1) == 0 {
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            array_set(spc, sp - 1, to),
+            scap,
+            sp,
+            cpc,
+            ccap,
+            nc,
+            t,
+            npc,
+            ncap,
+            nn,
+            best,
+          )
+        } else {
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            spc,
+            scap,
+            sp - 1,
+            cpc,
+            ccap,
+            nc,
+            t,
+            npc,
+            ncap,
+            nn,
+            best,
+          )
+        },
+        Fail ->
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            spc,
+            scap,
+            sp - 1,
+            cpc,
+            ccap,
+            nc,
+            t,
+            npc,
+            ncap,
+            nn,
+            best,
+          ),
+        _ ->
+          threads_add(
+            r,
+            fuel - 1,
+            pos,
+            marked,
+            spc,
+            scap,
+            sp - 1,
+            cpc,
+            ccap,
+            nc,
+            t,
+            array_set(npc, nn, pc),
+            array_set(ncap, nn, cap),
+            nn + 1,
+            best,
+          ),
+      }
+    }
+  }
+
+// --- One state at a time -------------------------------------------------------------
+
+/// The states a search has made of one automaton. A state is the places the program could be
+/// in, in order, kept under a number: `ids` finds a state's number and `keys` its places.
+/// `starts` holds the state a search starts in for each of the four things that can stand
+/// before it, `-1` for one not yet made. `room` is how many states fit, and `base` where the
+/// automaton's rows start in the table every automaton of a call shares.
+type Shelf = {
+  ids: Map<List<Int>, Int>,
+  keys: List<List<Int>>,
+  starts: List<Int>,
+  room: Int,
+  base: Int,
+}
+
+/// The states one call's searches have made of each automaton: the one that finds where the
+/// leftmost match ends, the one that reads it back to its start, and the one that stretches it
+/// to the longest. `stamp` is a number no walk of a program has yet marked its places with, and
+/// `spent` whether a search ran out of room, after which the call follows every state at once.
+type Book = { stamp: Int, ahead: Shelf, back: Shelf, stretch: Shelf, spent: Bool }
+
+fn shelf(room: Int, base: Int) -> Shelf =
+  { ids: map_new(), keys: [[], []], starts: [-1, -1, -1, -1], room: room + 2, base: base }
+
+/// A book no search has opened: its shelves are made with the table, by the first search that
+/// goes one state at a time.
+fn closed_book() -> Book =
+  { stamp: 1, ahead: shelf(0, 0), back: shelf(0, 0), stretch: shelf(0, 0), spent: false }
+
+/// What following places without taking a byte reached: the places that take one, ask a look or
+/// match, in order; every look asked; and whether a match ended the walk.
+type Closed = { seen: Array<Int>, stack: Array<Int>, out: List<Int>, needs: Int, sealed: Bool }
+
+/// Follows the places on the stack through every instruction that takes no byte, under the
+/// looks `have`: a place not yet reached under this `stamp` joins `out`. A look is kept where it
+/// is asked whether or not it holds, since the byte to come may change the answer. Where `cut`,
+/// a `Match` ends the walk, as nothing reached after it can be preferred.
+fn close(
+  insts: Array<Inst>,
+  have: Int,
+  cut: Bool,
+  stamp: Int,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  sp: Int,
+  out: List<Int>,
+  needs: Int,
+  fuel: Int,
+) -> Closed / {abort.raise} =
+  if sp <= 0 { { seen: seen, stack: stack, out: out, needs: needs, sealed: false } }
+  else if fuel <= 0 { panic("a program is walked once a state") } else {
+    let pc = array_get(stack, sp - 1);
+    if array_get(seen, pc) == stamp {
+      close(insts, have, cut, stamp, seen, stack, sp - 1, out, needs, fuel - 1)
+    } else {
+      let marked = array_set(seen, pc, stamp);
+      match array_get(insts, pc) {
+        Split(x, y) ->
+          close(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            array_set(array_set(stack, sp - 1, y), sp, x),
+            sp + 1,
+            out,
+            needs,
+            fuel - 1,
+          ),
+        Save(_, to) ->
+          close(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            array_set(stack, sp - 1, to),
+            sp,
+            out,
+            needs,
+            fuel - 1,
+          ),
+        Check(looks, to) -> if looks & ~have == 0 {
+          close(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            array_set(stack, sp - 1, to),
+            sp,
+            push(out, pc),
+            needs | looks,
+            fuel - 1,
+          )
+        } else {
+          close(
+            insts,
+            have,
+            cut,
+            stamp,
+            marked,
+            stack,
+            sp - 1,
+            push(out, pc),
+            needs | looks,
+            fuel - 1,
+          )
+        },
+        Fail -> close(insts, have, cut, stamp, marked, stack, sp - 1, out, needs, fuel - 1),
+        Match -> if cut {
+          { seen: marked, stack: stack, out: push(out, pc), needs: needs, sealed: true }
+        } else {
+          close(insts, have, cut, stamp, marked, stack, sp - 1, push(out, pc), needs, fuel - 1)
+        },
+        _ -> close(insts, have, cut, stamp, marked, stack, sp - 1, push(out, pc), needs, fuel - 1),
+      }
+    }
+  }
+
+/// A state's places from the `i`th on, each followed again under the looks `have`.
+fn reclose(
+  a: Automaton,
+  key: List<Int>,
+  i: Int,
+  have: Int,
+  stamp: Int,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  out: List<Int>,
+  needs: Int,
+) -> Closed / {abort.raise} =
+  match list_at(key, i) {
+    None -> { seen: seen, stack: stack, out: out, needs: needs, sealed: false },
+    Some(pc) -> {
+      let c = close(
+        a.insts,
+        have,
+        false,
+        stamp,
+        seen,
+        array_set(stack, 0, pc),
+        1,
+        out,
+        needs,
+        4 * array_len(a.insts) + 4,
+      );
+      reclose(a, key, i + 1, have, stamp, c.seen, c.stack, c.out, c.needs)
+    },
+  }
+
+/// What a state's places come to once each takes the byte `b`, or the subject's end for 256:
+/// the places reached, and whether one of them had matched before it.
+type Advanced = { seen: Array<Int>, stack: Array<Int>, out: List<Int>, needs: Int, matched: Bool }
+
+fn advance(
+  a: Automaton,
+  places: List<Int>,
+  i: Int,
+  b: Int,
+  after: Int,
+  stamp: Int,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  out: List<Int>,
+  needs: Int,
+  matched: Bool,
+) -> Advanced / {abort.raise} =
+  match list_at(places, i) {
+    None -> { seen: seen, stack: stack, out: out, needs: needs, matched: matched },
+    Some(pc) -> {
+      let to = match array_get(a.insts, pc) {
+        Range(lo, hi, to) -> if b >= lo && b <= hi { to } else { -1 },
+        Switch(table, arms) -> {
+          let arm = if b < 256 { bytes_at(table, b) } else { 0 };
+          if arm > 0 { array_get(arms, arm - 1) } else { -1 }
+        },
+        Match -> -2,
+        _ -> -1,
+      };
+      if to == -2 {
+        if a.first_wins { { seen: seen, stack: stack, out: out, needs: needs, matched: true } }
+        else { advance(a, places, i + 1, b, after, stamp, seen, stack, out, needs, true) }
+      } else if to < 0 {
+        advance(a, places, i + 1, b, after, stamp, seen, stack, out, needs, matched)
+      } else {
+        let c = close(
+          a.insts,
+          after,
+          a.first_wins,
+          stamp,
+          seen,
+          array_set(stack, 0, to),
+          1,
+          out,
+          needs,
+          4 * array_len(a.insts) + 4,
+        );
+        if c.sealed {
+          { seen: c.seen, stack: c.stack, out: c.out, needs: c.needs, matched: matched }
+        } else {
+          advance(a, places, i + 1, b, after, stamp, c.seen, c.stack, c.out, c.needs, matched)
+        }
+      }
+    },
+  }
+
+/// A shelf, and a state on it: twice its number, and one more where a match ended on the way
+/// in. `0` is a state not yet made, `2` the one nothing leaves, and `-1` one the shelf has no
+/// room for.
+type Shelved = { shelf: Shelf, to: Int }
+
+/// The state for these places, made if the shelf has not met them and has room.
+fn state_of(a: Automaton, s: Shelf, flags: Int, needs: Int, places: List<Int>) -> Shelved =
+  if len(places) == 0 { { shelf: s, to: 2 } } else {
+    let key = fold(
+      if a.first_wins { places } else { sort(places) },
+      [if needs == 0 { 0 } else { flags }, needs],
+      |k: List<Int>, pc: Int| push(k, pc),
+    );
+    match map_get(s.ids, key) {
+      Some(id) -> { shelf: s, to: id * 2 },
+      None -> if len(s.keys) >= s.room { { shelf: s, to: -1 } } else {
+        let id = len(s.keys);
+        { shelf: { ..s, ids: map_insert(s.ids, key, id), keys: push(s.keys, key) }, to: id * 2 }
+      },
+    }
+  }
+
+/// What making a state leaves: the table every state's row is in, the two arrays a walk of a
+/// program marks and stacks its places in, the shelf, and the state.
+type Made = { table: Array<Int>, seen: Array<Int>, stack: Array<Int>, shelf: Shelf, to: Int }
+
+/// Where state `h` goes on the byte `b`, or on the subject's end for 256, entered in the table.
+/// The walks it makes mark places with `stamp` and the number after it.
+fn transition(
+  a: Automaton,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  s: Shelf,
+  stamp: Int,
+  h: Int,
+  b: Int,
+) -> Made / {abort.raise} = {
+  let key = match list_at(s.keys, h >> 1) {
+    Some(k) -> k,
+    None -> panic("a state is one the shelf holds"),
+  };
+  let flags = at_or(key, 0, 0);
+  let needs = at_or(key, 1, 0);
+  let word = b < 256 && is_word(b);
+  let before = flags & 63 | (if b == 10 { 2 } else if b == 256 { 10 } else { 0 })
+    | (if word == (flags & 64 != 0) { 32 } else { 16 });
+  let after = if b == 10 && a.lines { 1 } else { 0 };
+  let again = needs & before & ~flags != 0;
+  let walked = if again { reclose(a, key, 2, before, stamp, seen, stack, [], 0) }
+  else { { seen: seen, stack: stack, out: key, needs: 0, sealed: false } };
+  let moved = advance(
+    a,
+    walked.out,
+    if again { 0 } else { 2 },
+    b,
+    after,
+    stamp + 1,
+    walked.seen,
+    walked.stack,
+    [],
+    0,
+    false,
+  );
+  let bit = if moved.matched { 1 } else { 0 };
+  let made = if b == 256 { { shelf: s, to: 2 } }
+  else { state_of(a, s, after | (if word && a.words { 64 } else { 0 }), moved.needs, moved.out) };
+  if made.to < 0 {
+    { table: table, seen: moved.seen, stack: moved.stack, shelf: made.shelf, to: -1 }
+  } else {
+    let class = if b == 256 { a.stride - 1 } else { bytes_at(a.classes, b) };
+    {
+      table: array_set(table, s.base + (h >> 1) * a.stride + class, made.to | bit),
+      seen: moved.seen,
+      stack: moved.stack,
+      shelf: made.shelf,
+      to: made.to | bit,
+    }
+  }
+}
+
+/// What finding the state a search starts in leaves.
+type Started = { seen: Array<Int>, stack: Array<Int>, shelf: Shelf, to: Int }
+
+/// The state a search entering at `at` starts in, which what stands before `at` decides: the
+/// subject's end, a line feed, a word's byte or any other. A search read backwards has what
+/// follows `at` before it. A walk it makes marks places with `stamp`.
+fn start_state(
+  a: Automaton,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  s: Shelf,
+  stamp: Int,
+  hay: Bytes,
+  at: Int,
+  backwards: Bool,
+) -> Started / {abort.raise} = {
+  let before = if backwards { if at < bytes_len(hay) { bytes_at(hay, at) } else { -1 } }
+  else if at > 0 { bytes_at(hay, at - 1) }
+  else { -1 };
+  let kind = if before < 0 { 0 }
+  else if before == 10 && a.lines { 1 }
+  else if a.words && is_word(before) { 2 }
+  else { 3 };
+  let known = at_or(s.starts, kind, -1);
+  if known >= 0 { { seen: seen, stack: stack, shelf: s, to: known } } else {
+    let have = match kind { 0 -> 5, 1 -> 1, _ -> 0 };
+    let walked = close(
+      a.insts,
+      have,
+      a.first_wins,
+      stamp,
+      seen,
+      array_set(stack, 0, a.entry),
+      1,
+      [],
+      0,
+      4 * array_len(a.insts) + 4,
+    );
+    let made = state_of(a, s, have | (if kind == 2 { 64 } else { 0 }), walked.needs, walked.out);
+    {
+      seen: walked.seen,
+      stack: walked.stack,
+      shelf: if made.to < 0 { made.shelf }
+      else { { ..made.shelf, starts: list_set(made.shelf.starts, kind, made.to) } },
+      to: made.to,
+    }
+  }
+}
+
+/// Where a scan of the table stopped: the position, the state there, where the last match seen
+/// ended, and why it stopped: `0` a state not yet made, `1` no bytes left, `2` a state nothing
+/// leaves, `3` a match found that nothing goes on from, or that was all the scan was asked for.
+type Scan = { at: Int, state: Int, last: Int, hit: Int }
+
+/// Reads the subject from `i` up to `stop`, from state `h`, by the table alone. A match is
+/// known one byte late, so one that ends at a position is recorded on the byte read there.
+/// In the state `home`, which is a search's start where every match opens with one of the bytes
+/// `first` or with all of `lead`, the scan skips to the next place one does.
+fn scan_ahead(
+  table: Array<Int>,
+  classes: Bytes,
+  hay: Bytes,
+  stride: Int,
+  base: Int,
+  i: Int,
+  stop: Int,
+  h: Int,
+  last: Int,
+  quick: Bool,
+  home: Int,
+  first: Bytes,
+  lead: Bytes,
+  left: Int,
+) -> Scan / {abort.raise} =
+  if i >= stop { { at: i, state: h, last: last, hit: 1 } }
+  else if left <= 0 { panic("a scan reads each byte once") } else {
+    let j = if h != home { i } else if bytes_len(lead) > 1 {
+      match bytes_index_of_from(hay, lead, i) { Some(found) -> found, None -> stop }
+    } else { bytes_scan_until(hay, i, first, stop - i) };
+    if j >= stop { { at: stop, state: h, last: last, hit: 1 } } else {
+      let to = array_get(table, base + (h >> 1) * stride + bytes_at(classes, bytes_at(hay, j)));
+      if to < 4 { { at: j, state: h, last: last, hit: to } } else if to & 1 == 0 {
+        scan_ahead(
+          table,
+          classes,
+          hay,
+          stride,
+          base,
+          j + 1,
+          stop,
+          to,
+          last,
+          quick,
+          home,
+          first,
+          lead,
+          left - 1,
+        )
+      } else if quick { { at: j, state: to, last: j, hit: 3 } } else {
+        scan_ahead(
+          table,
+          classes,
+          hay,
+          stride,
+          base,
+          j + 1,
+          stop,
+          to,
+          j,
+          quick,
+          home,
+          first,
+          lead,
+          left - 1,
+        )
+      }
+    }
+  }
+
+/// Reads the subject backwards from `i` down to `stop`, from state `h`, by the table alone.
+fn scan_back(
+  table: Array<Int>,
+  classes: Bytes,
+  hay: Bytes,
+  stride: Int,
+  base: Int,
+  i: Int,
+  stop: Int,
+  h: Int,
+  last: Int,
+) -> Scan / {abort.raise} =
+  if i <= stop { { at: i, state: h, last: last, hit: 1 } } else {
+    let to = array_get(table, base + (h >> 1) * stride + bytes_at(classes, bytes_at(hay, i - 1)));
+    if to < 4 { { at: i, state: h, last: last, hit: to } } else {
+      scan_back(table, classes, hay, stride, base, i - 1, stop, to, if to & 1 == 1 { i }
+      else { last })
+    }
+  }
+
+/// What a search by states leaves, and where it ended: the position the match it found ends
+/// at, `-1` for no match, and `-2` where the shelf ran out of room before the search could tell.
+type Sought = {
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  shelf: Shelf,
+  stamp: Int,
+  at: Int,
+}
+
+/// The search an automaton makes forwards from `i` in state `h`: the table is read until it
+/// lacks a state, which is then made, and read again.
+fn search_ahead(
+  a: Automaton,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  s: Shelf,
+  stamp: Int,
+  hay: Bytes,
+  i: Int,
+  h: Int,
+  last: Int,
+  quick: Bool,
+  home: Int,
+  o: Opening,
+  left: Int,
+) -> Sought / {abort.raise} = {
+  let n = bytes_len(hay);
+  let read = scan_ahead(
+    table,
+    a.classes,
+    hay,
+    a.stride,
+    s.base,
+    i,
+    n,
+    h,
+    last,
+    quick,
+    home,
+    o.first,
+    o.lead,
+    n - i + 1,
+  );
+  match read.hit {
+    2 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.last },
+    3 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.at },
+    1 -> {
+      let known = array_get(table, s.base + (read.state >> 1) * a.stride + a.stride - 1);
+      if known != 0 {
+        {
+          table: table,
+          seen: seen,
+          stack: stack,
+          shelf: s,
+          stamp: stamp,
+          at: if known & 1 == 1 { n } else { read.last },
+        }
+      } else {
+        let ended = transition(a, table, seen, stack, s, stamp, read.state, 256);
+        {
+          table: ended.table,
+          seen: ended.seen,
+          stack: ended.stack,
+          shelf: ended.shelf,
+          stamp: stamp + 2,
+          at: if ended.to & 1 == 1 { n } else { read.last },
+        }
+      }
+    },
+    _ -> if left <= 0 { panic("a search makes a state for each byte at most") } else {
+      let made = transition(a, table, seen, stack, s, stamp, read.state, bytes_at(hay, read.at));
+      if made.to < 0 {
+        {
+          table: made.table,
+          seen: made.seen,
+          stack: made.stack,
+          shelf: made.shelf,
+          stamp: stamp + 2,
+          at: -2,
+        }
+      } else {
+        search_ahead(
+          a,
+          made.table,
+          made.seen,
+          made.stack,
+          made.shelf,
+          stamp + 2,
+          hay,
+          read.at,
+          read.state,
+          read.last,
+          quick,
+          home,
+          o,
+          left - 1,
+        )
+      }
+    },
+  }
+}
+
+/// The search an automaton makes backwards from `i` down to `stop` in state `h`.
+fn search_back(
+  a: Automaton,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  s: Shelf,
+  stamp: Int,
+  hay: Bytes,
+  i: Int,
+  stop: Int,
+  h: Int,
+  last: Int,
+  left: Int,
+) -> Sought / {abort.raise} = {
+  let read = scan_back(table, a.classes, hay, a.stride, s.base, i, stop, h, last);
+  match read.hit {
+    2 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.last },
+    3 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.at },
+    1 -> {
+      let b = if stop > 0 { bytes_at(hay, stop - 1) } else { 256 };
+      let class = if b == 256 { a.stride - 1 } else { bytes_at(a.classes, b) };
+      let known = array_get(table, s.base + (read.state >> 1) * a.stride + class);
+      if known != 0 {
+        {
+          table: table,
+          seen: seen,
+          stack: stack,
+          shelf: s,
+          stamp: stamp,
+          at: if known & 1 == 1 { stop } else { read.last },
+        }
+      } else {
+        let ended = transition(a, table, seen, stack, s, stamp, read.state, b);
+        {
+          table: ended.table,
+          seen: ended.seen,
+          stack: ended.stack,
+          shelf: ended.shelf,
+          stamp: stamp + 2,
+          at: if ended.to < 0 { -2 } else if ended.to & 1 == 1 { stop } else { read.last },
+        }
+      }
+    },
+    _ -> if left <= 0 { panic("a search makes a state for each byte at most") } else {
+      let made = transition(
+        a,
+        table,
+        seen,
+        stack,
+        s,
+        stamp,
+        read.state,
+        bytes_at(hay, read.at - 1),
+      );
+      if made.to < 0 {
+        {
+          table: made.table,
+          seen: made.seen,
+          stack: made.stack,
+          shelf: made.shelf,
+          stamp: stamp + 2,
+          at: -2,
+        }
+      } else {
+        search_back(
+          a,
+          made.table,
+          made.seen,
+          made.stack,
+          made.shelf,
+          stamp + 2,
+          hay,
+          read.at,
+          stop,
+          read.state,
+          read.last,
+          left - 1,
+        )
+      }
+    },
+  }
+}
+
+// --- A search --------------------------------------------------------------------------
+
+/// What a search leaves and what it found: the table, the two arrays a walk uses, the book,
+/// and the match's slots, or none at all where there is no match.
+type Hit = { table: Array<Int>, seen: Array<Int>, stack: Array<Int>, book: Book, slots: Array<Int> }
+
+/// The leftmost match at or after `from`, with `want` slots kept: 2 for where it starts and
+/// ends, and two more for each group.
+fn search(
+  re: Compiled,
+  hay: Bytes,
+  from: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} =
+  if re.opening.exact {
+    let found = if bytes_len(re.opening.lead) == 0 { Some(from) }
+    else { bytes_index_of_from(hay, re.opening.lead, from) };
+    match found {
+      Some(at) ->
+        pinned(re, hay, at, at + bytes_len(re.opening.lead), table, seen, stack, book, want),
+      None -> { table: table, seen: seen, stack: stack, book: book, slots: array_of_list([]) },
+    }
+  } else if unheld(re, hay, from) {
+    { table: table, seen: seen, stack: stack, book: book, slots: array_of_list([]) }
+  } else if book.spent || re.options.state_limit <= 0 || bytes_len(hay) - from <= re.options.short {
+    by_threads(re, hay, from, table, seen, stack, book, want)
+  } else if array_len(table) > 0 { by_states(re, hay, from, table, seen, stack, book, want) } else {
+    let rows = room_for(re, hay) + 2;
+    let most = max(array_len(re.finder.insts), array_len(re.tracer.insts));
+    by_states(
+      re,
+      hay,
+      from,
+      array_new((if re.options.longest { 3 } else { 2 }) * rows * re.finder.stride, 0),
+      array_new(most, 0),
+      array_new(2 * most + 2, 0),
+      {
+        stamp: 1,
+        ahead: shelf(rows - 2, 0),
+        back: shelf(rows - 2, rows * re.finder.stride),
+        stretch: shelf(rows - 2, 2 * rows * re.finder.stride),
+        spent: false,
+      },
+      want,
+    )
+  }
+
+/// How many states a search of `hay` has room for: no more than the pattern's limit, than the
+/// subject has bytes and two, or than leave the table three automata share within what one
+/// array holds.
+fn room_for(re: Compiled, hay: Bytes) -> Int / {abort.raise} =
+  min(min(re.options.state_limit, bytes_len(hay) + 2), 0x4000000 / (3 * re.finder.stride) - 2)
+
+/// Whether the text every match holds stands nowhere from `from` on, so that no match does.
+fn unheld(re: Compiled, hay: Bytes, from: Int) -> Bool / {abort.raise} =
+  bytes_len(re.opening.held) > 0 && bytes_index_of_from(hay, re.opening.held, from) == None
+
+fn by_threads(
+  re: Compiled,
+  hay: Bytes,
+  from: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} =
+  {
+    table: table,
+    seen: seen,
+    stack: stack,
+    book: book,
+    slots: run(
+      { insts: re.insts, hay: hay, stop: bytes_len(hay), slots: want, longest: re.options.longest },
+      re.search,
+      from,
+    ),
+  }
+
+/// The match known to start at `start` and end at `end`, with its groups read where they are
+/// wanted and the pattern has any.
+fn pinned(
+  re: Compiled,
+  hay: Bytes,
+  start: Int,
+  end: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} =
+  {
+    table: table,
+    seen: seen,
+    stack: stack,
+    book: book,
+    slots: if want <= 2 || len(re.names) == 1 { array_of_list([start, end]) } else {
+      run(
+        { insts: re.insts, hay: hay, stop: end, slots: want, longest: re.options.longest },
+        re.start,
+        start,
+      )
+    },
+  }
+
+/// A search one state at a time: forwards for where the leftmost match ends, then backwards
+/// from there for where it starts.
+fn by_states(
+  re: Compiled,
+  hay: Bytes,
+  from: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} = {
+  let first = start_state(re.finder, seen, stack, book.ahead, book.stamp, hay, from, false);
+  if first.to < 0 {
+    by_threads(
+      re,
+      hay,
+      from,
+      table,
+      first.seen,
+      first.stack,
+      { ..book, stamp: book.stamp + 1, spent: true },
+      want,
+    )
+  } else {
+    let home = if bytes_len(re.opening.lead) > 1 || bytes_len(re.opening.first) > 0 { first.to }
+    else { -1 };
+    let end = search_ahead(
+      re.finder,
+      table,
+      first.seen,
+      first.stack,
+      first.shelf,
+      book.stamp + 1,
+      hay,
+      from,
+      first.to,
+      -1,
+      false,
+      home,
+      re.opening,
+      bytes_len(hay) - from + 3,
+    );
+    let kept = { ..book, stamp: end.stamp, ahead: end.shelf };
+    if end.at == -2 {
+      by_threads(re, hay, from, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
+    } else if end.at < 0 {
+      { table: end.table, seen: end.seen, stack: end.stack, book: kept, slots: array_of_list([]) }
+    } else { traced(re, hay, from, end.at, end.table, end.seen, end.stack, kept, want) }
+  }
+}
+
+/// The match that ends at `end`, read backwards to its start, which is no earlier than `from`.
+fn traced(
+  re: Compiled,
+  hay: Bytes,
+  from: Int,
+  end: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} = {
+  let first = start_state(re.tracer, seen, stack, book.back, book.stamp, hay, end, true);
+  if first.to < 0 {
+    by_threads(
+      re,
+      hay,
+      from,
+      table,
+      first.seen,
+      first.stack,
+      { ..book, stamp: book.stamp + 1, spent: true },
+      want,
+    )
+  } else {
+    let start = search_back(
+      re.tracer,
+      table,
+      first.seen,
+      first.stack,
+      first.shelf,
+      book.stamp + 1,
+      hay,
+      end,
+      from,
+      first.to,
+      -1,
+      end - from + 3,
+    );
+    let kept = { ..book, stamp: start.stamp, back: start.shelf };
+    if start.at == -2 {
+      by_threads(re, hay, from, start.table, start.seen, start.stack, { ..kept, spent: true }, want)
+    } else if start.at < 0 { panic("a match read backwards from its end has a start") }
+    else if re.options.longest {
+      stretched(re, hay, start.at, start.table, start.seen, start.stack, kept, want)
+    } else { pinned(re, hay, start.at, end, start.table, start.seen, start.stack, kept, want) }
+  }
+}
+
+/// The longest match that starts at `start`, where one is known to.
+fn stretched(
+  re: Compiled,
+  hay: Bytes,
+  start: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  want: Int,
+) -> Hit / {abort.raise} = {
+  let first = start_state(re.stretcher, seen, stack, book.stretch, book.stamp, hay, start, false);
+  if first.to < 0 {
+    by_threads(
+      re,
+      hay,
+      start,
+      table,
+      first.seen,
+      first.stack,
+      { ..book, stamp: book.stamp + 1, spent: true },
+      want,
+    )
+  } else {
+    let end = search_ahead(
+      re.stretcher,
+      table,
+      first.seen,
+      first.stack,
+      first.shelf,
+      book.stamp + 1,
+      hay,
+      start,
+      first.to,
+      -1,
+      false,
+      -1,
+      re.opening,
+      bytes_len(hay) - start + 3,
+    );
+    let kept = { ..book, stamp: end.stamp, stretch: end.shelf };
+    if end.at == -2 {
+      by_threads(re, hay, start, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
+    } else if end.at < 0 { panic("a match stretched from its start has an end") }
+    else { pinned(re, hay, start, end.at, end.table, end.seen, end.stack, kept, want) }
+  }
+}
+
+/// Whether a match stands anywhere in `hay`.
+fn matching(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
+  if re.opening.exact {
+    bytes_len(re.opening.lead) == 0 || bytes_index_of(hay, re.opening.lead) != None
+  } else { !unheld(re, hay, 0) && read_through(re, hay) }
+
+/// Whether the pattern's automaton finds a match in `hay`, nothing asked of the subject first:
+/// one state at a time, or by every state at once where the subject is short or the states
+/// run out.
+fn read_through(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
+  if re.options.state_limit <= 0 || bytes_len(hay) <= re.options.short {
+    matching_by_threads(re, hay)
+  } else {
+    let a = re.finder;
+    let room = room_for(re, hay);
+    let first = start_state(
+      a,
+      array_new(array_len(a.insts), 0),
+      array_new(2 * array_len(a.insts) + 2, 0),
+      shelf(room, 0),
+      1,
+      hay,
+      0,
+      false,
+    );
+    if first.to < 0 { matching_by_threads(re, hay) } else {
+      let home = if bytes_len(re.opening.lead) > 1 || bytes_len(re.opening.first) > 0 { first.to }
+      else { -1 };
+      let end = search_ahead(
+        a,
+        array_new((room + 2) * a.stride, 0),
+        first.seen,
+        first.stack,
+        first.shelf,
+        2,
+        hay,
+        0,
+        first.to,
+        -1,
+        true,
+        home,
+        re.opening,
+        bytes_len(hay) + 3,
+      );
+      if end.at == -2 { matching_by_threads(re, hay) } else { end.at >= 0 }
+    }
+  }
+
+fn matching_by_threads(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
+  array_len(
+      run(
+        { insts: re.insts, hay: hay, stop: bytes_len(hay), slots: 2, longest: false },
+        re.search,
+        0,
+      ),
+    )
+    > 0
+
+/// Where the character at `at` ends: the next byte over bytes, and the next character's first
+/// over text.
+fn past(re: Compiled, hay: Bytes, at: Int) -> Int / {abort.raise} =
+  if re.bytes || at >= bytes_len(hay) { at + 1 } else {
+    let lead = bytes_at(hay, at);
+    if lead < 0x80 { at + 1 }
+    else if lead < 0xE0 { at + 2 }
+    else if lead < 0xF0 { at + 3 }
+    else { at + 4 }
+  }
+
+/// The matches of `hay` in order, none overlapping another, each as its `want` slots, and no
+/// more than `most` of them where that is not negative.
+fn matches(re: Compiled, hay: Bytes, want: Int, most: Int) -> List<Array<Int>> / {abort.raise} =
+  matches_from(
+    re,
+    hay,
+    want,
+    most,
+    0,
+    -1,
+    array_of_list([]),
+    array_of_list([]),
+    array_of_list([]),
+    closed_book(),
+    [],
+    bytes_len(hay) + 2,
+  )
+
+/// A search starts where the last match ended, or one character on from an empty one, and an
+/// empty match is passed over where the match before it ended, so two matches never share a
+/// position unless one is empty and the other starts there.
+fn matches_from(
+  re: Compiled,
+  hay: Bytes,
+  want: Int,
+  most: Int,
+  from: Int,
+  ended: Int,
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  book: Book,
+  found: List<Array<Int>>,
+  left: Int,
+) -> List<Array<Int>> / {abort.raise} =
+  if from > bytes_len(hay) || len(found) == most || left <= 0 { found } else {
+    let hit = search(re, hay, from, table, seen, stack, book, want);
+    if array_len(hit.slots) == 0 { found } else {
+      let start = array_get(hit.slots, 0);
+      let end = array_get(hit.slots, 1);
+      if end == start && start == ended {
+        matches_from(
+          re,
+          hay,
+          want,
+          most,
+          past(re, hay, start),
+          ended,
+          hit.table,
+          hit.seen,
+          hit.stack,
+          hit.book,
+          found,
+          left - 1,
+        )
+      } else {
+        matches_from(
+          re,
+          hay,
+          want,
+          most,
+          if end == start { past(re, hay, end) } else { end },
+          end,
+          hit.table,
+          hit.seen,
+          hit.stack,
+          hit.book,
+          push(found, hit.slots),
+          left - 1,
+        )
+      }
+    }
+  }
+
+// --- Patterns over text -----------------------------------------------------------------
+
+/// A pattern compiled to search a `String`, a character at a time. Two are equal when their
+/// patterns and options are written alike, and one is shown as its pattern.
+pub type Regex = | Regex(Compiled)
+
+key for Regex by sameness
+
+show for Regex by pattern
+
+fn sameness(re: Regex) -> { pattern: String, options: Options } =
+  match re { Regex(c) -> { pattern: c.pattern, options: c.options } }
+
+/// The pattern `re` was compiled from, as it was written.
+pub fn pattern(re: Regex) -> String = match re { Regex(c) -> c.pattern }
+
+fn inner(re: Regex) -> Compiled = match re { Regex(c) -> c }
+
+/// Where a match, or a group of one, lies in its subject: from `start` up to `end`, counted in
+/// characters of a `String` and in bytes of a `Bytes`, as `string_slice` and `bytes_slice`
+/// count them.
+pub type Span = { start: Int, end: Int }
+
+/// What one match captured: each group's span by its number, the whole match being group 0,
+/// with `None` for a group the match went no way through.
+pub type Captures = new { groups: List<Option<Span>>, numbers: Map<String, Int> }
+
+/// The pattern compiled under `options()`, or where and why it is refused.
+pub fn compile(pattern: String) -> Result<Regex, Refusal> / {abort.raise} =
+  try { read(pattern, options()) }
+
+/// The pattern compiled as `o` says, or where and why it is refused.
+pub fn compile_with(pattern: String, o: Options) -> Result<Regex, Refusal> / {abort.raise} =
+  try { read(pattern, o) }
+
+/// The pattern compiled as `o` says, raising `regex.refused` where `compile_with` answers `Err`.
+pub fn read(pattern: String, o: Options) -> Regex / {regex.refused, abort.raise} =
+  Regex(compiled(pattern, o, false))
+
+/// The pattern as its parse reads back: every flag spelt out where it acts, every class by its
+/// ranges, and nothing a match does not turn on. It compiles to the program `re` is.
+pub fn printed(re: Regex) -> String / {abort.raise} = written(inner(re).tree, 0, false)
+
+/// How many groups the pattern has, the whole match counted as one.
+pub fn group_count(re: Regex) -> Int = len(inner(re).names)
+
+/// Each group's name by its number, `None` for one with none, as the whole match has none.
+pub fn group_names(re: Regex) -> List<Option<String>> = inner(re).names
+
+/// Whether a match stands anywhere in `text`.
+pub fn is_match(re: Regex, text: String) -> Bool / {abort.raise} =
+  matching(inner(re), bytes_of_string(text))
+
+/// The leftmost match in `text`.
+pub fn find(re: Regex, text: String) -> Option<Span> / {abort.raise} =
+  match list_at(shown_in(text, matches(inner(re), bytes_of_string(text), 2, 1)), 0) {
+    Some([Some(span), ..]) -> Some(span),
+    _ -> None,
+  }
+
+/// Every match in `text`, in order and none overlapping another. A search starts where the
+/// last match ended, and one character on from an empty one; an empty match is passed over where
+/// the match before it ended.
+pub fn find_all(re: Regex, text: String) -> List<Span> / {abort.raise} =
+  fold(
+    shown_in(text, matches(inner(re), bytes_of_string(text), 2, -1)),
+    [],
+    |spans: List<Span>, groups: List<Option<Span>>|
+      match groups { [Some(span), ..] -> push(spans, span), _ -> spans },
+  )
+
+/// The leftmost match in `text`, with what each group captured.
+pub fn captures(re: Regex, text: String) -> Option<Captures> / {abort.raise} =
+  list_at(captures_all_of(re, text, 1), 0)
+
+/// Every match in `text`, as `find_all` finds them, each with what its groups captured.
+pub fn captures_all(re: Regex, text: String) -> List<Captures> / {abort.raise} =
+  captures_all_of(re, text, -1)
+
+fn captures_all_of(re: Regex, text: String, most: Int) -> List<Captures> / {abort.raise} = {
+  let c = inner(re);
+  map(
+    shown_in(text, matches(c, bytes_of_string(text), 2 * len(c.names), most)),
+    |groups: List<Option<Span>>| -> Captures { { groups: groups, numbers: c.numbers } },
+  )
+}
+
+/// The span of the group numbered `index`, or `None` where the match went no way through it or
+/// the pattern has no such group.
+pub fn group(c: Captures, index: Int) -> Option<Span> =
+  match list_at(c.groups, index) { Some(span) -> span, None -> None }
+
+/// The span of the group named `name`, or `None` where the match went no way through it or the
+/// pattern has no such group.
+pub fn named(c: Captures, name: String) -> Option<Span> =
+  match map_get(c.numbers, name) { Some(index) -> group(c, index), None -> None }
+
+/// The part of `text` a span of it covers.
+pub fn slice(text: String, span: Span) -> String / {abort.raise} =
+  string_slice(text, span.start, span.end)
+
+/// Matches' slots, which count bytes of `text`'s UTF-8, as spans that count its characters.
+fn shown_in(text: String, found: List<Array<Int>>) -> List<List<Option<Span>>> / {abort.raise} = {
+  let hay = bytes_of_string(text);
+  let plain = bytes_len(hay) == string_len(text);
+  fold(
+    found,
+    { byte: 0, char: 0, all: [] },
+    |w: { byte: Int, char: Int, all: List<List<Option<Span>>> }, slots: Array<Int>| {
+      let start = if plain { array_get(slots, 0) }
+      else { w.char + chars_in(hay, w.byte, array_get(slots, 0)) };
+      let groups = map(range(0, array_len(slots) / 2), |g: Int| {
+        let from = array_get(slots, 2 * g);
+        let to = array_get(slots, 2 * g + 1);
+        if from < 0 || to < 0 { None }
+        else if plain { Some({ start: from, end: to }) } else {
+          let first = start + chars_in(hay, array_get(slots, 0), from);
+          Some({ start: first, end: first + chars_in(hay, from, to) })
+        }
+      });
+      {
+        byte: array_get(slots, 1),
+        char: if plain { 0 }
+        else { start + chars_in(hay, array_get(slots, 0), array_get(slots, 1)) },
+        all: push(w.all, groups),
+      }
+    },
+  ).all
+}
+
+/// How many characters the bytes from `from` up to `to` spell.
+fn chars_in(hay: Bytes, from: Int, to: Int) -> Int / {abort.raise} =
+  string_len(string_of_bytes(bytes_slice(hay, from, to)))
+
+// --- Replacing and splitting -------------------------------------------------------------
+
+/// One piece of a replacement: text to write as it stands, or the number of a group to write
+/// what it captured.
+type Part = | Verbatim(String) | Group(Int)
+
+/// What a match is replaced with, read from a text in which `$1` or `${1}` writes what a group
+/// captured by its number, `$name` or `${name}` by its name, the name running as far as letters,
+/// digits and `_` do, and `$$` writes a `$`. A group the match went no way through writes nothing.
+pub type Template = new { parts: List<Part> }
+
+/// The replacement `text` writes for matches of `re`, or where and why it is refused: a `$`
+/// that nothing a template reads follows, or a group `re` does not have.
+pub fn template(re: Regex, text: String) -> Result<Template, Refusal> / {abort.raise} =
+  try { read_template(re, text) }
+
+/// As `template`, raising `regex.refused` where that answers `Err`.
+pub fn read_template(re: Regex, text: String) -> Template / {regex.refused, abort.raise} =
+  templated(inner(re), text)
+
+fn templated(re: Compiled, text: String) -> Template / {regex.refused, abort.raise} = {
+  let src = array_of_list(code_points(text));
+  { parts: template_parts(re, text, src, 0, 0, [], array_len(src) + 1) }
+}
+
+/// The parts from `at` on, after `parts`: `from` is where the text not yet written begins.
+fn template_parts(
+  re: Compiled,
+  text: String,
+  src: Array<Int>,
+  from: Int,
+  at: Int,
+  parts: List<Part>,
+  left: Int,
+) -> List<Part> / {regex.refused, abort.raise} =
+  if left <= 0 { panic("more parts than characters") } else {
+    match array_at(src, at) {
+      None -> verbatim(text, from, at, parts),
+      Some(c) -> if c != b'$' { template_parts(re, text, src, from, at + 1, parts, left - 1) }
+      else {
+        let before = verbatim(text, from, at, parts);
+        let next = match array_at(src, at + 1) { Some(n) -> n, None -> -1 };
+        if next == b'$' {
+          template_parts(re, text, src, at + 2, at + 2, push(before, Verbatim("$")), left - 1)
+        } else {
+          let braced = meta(next) == Brace;
+          let open = if braced { at + 2 } else { at + 1 };
+          let end = name_end(src, open);
+          if braced && array_at(src, end) != Some(b'}') { refuse(at, UnclosedName) }
+          else if end == open { refuse(at, if braced { NoSuchGroup } else { LoneDollar }) } else {
+            let after = if braced { end + 1 } else { end };
+            template_parts(
+              re,
+              text,
+              src,
+              after,
+              after,
+              push(before, Group(group_called(re, name_text(src, open, end), at))),
+              left - 1,
+            )
+          }
+        }
+      },
+    }
+  }
+
+fn verbatim(text: String, from: Int, to: Int, parts: List<Part>) -> List<Part> / {abort.raise} =
+  if to > from { push(parts, Verbatim(string_slice(text, from, to))) } else { parts }
+
+/// The number of the group a template calls `name`: the number it writes, or the group it names.
+fn group_called(re: Compiled, name: String, at: Int) -> Int / {regex.refused, abort.raise} = {
+  let digits = bytes_of_string(name);
+  let number = if bytes_scan(digits, 0, b"0123456789", bytes_len(digits)) < bytes_len(digits) {
+    map_get(re.numbers, name)
+  } else {
+    Some(
+      fold(range(0, bytes_len(digits)), 0, |n: Int, i: Int|
+        if n > 100000 { n } else { n * 10 + bytes_at(digits, i) - 48 }),
+    )
+  };
+  match number { Some(index) if index < len(re.names) -> index, _ -> refuse(at, NoSuchGroup) }
+}
+
+fn uses_groups(t: Template) -> Bool =
+  fold(t.parts, false, |any: Bool, p: Part|
+    any || (match p { Group(index) -> index > 0, Verbatim(_) -> false }))
+
+/// What a template writes for the match with these slots.
+fn expanded(t: Template, hay: Bytes, slots: Array<Int>) -> Bytes / {abort.raise} =
+  bytes_concat_all(
+    map(t.parts, |p: Part|
+      match p {
+        Verbatim(text) -> bytes_of_string(text),
+        Group(index) -> {
+          let from = match array_at(slots, 2 * index) { Some(at) -> at, None -> -1 };
+          let to = match array_at(slots, 2 * index + 1) { Some(at) -> at, None -> -1 };
+          if from < 0 || to < 0 { b"" } else { bytes_slice(hay, from, to) }
+        },
+      }),
+  )
+
+/// `hay` with each of its first `most` matches, or all where `most` is negative, replaced by
+/// what the template writes for it.
+fn replaced(re: Compiled, hay: Bytes, t: Template, most: Int) -> Bytes / {abort.raise} = {
+  let want = if uses_groups(t) { 2 * len(re.names) } else { 2 };
+  let w = fold(
+    matches(re, hay, want, most),
+    { at: 0, parts: [] },
+    |w: { at: Int, parts: List<Bytes> }, slots: Array<Int>|
+      {
+        at: array_get(slots, 1),
+        parts: push(
+          push(w.parts, bytes_slice(hay, w.at, array_get(slots, 0))),
+          expanded(t, hay, slots),
+        ),
+      },
+  );
+  bytes_concat_all(push(w.parts, bytes_slice(hay, w.at, bytes_len(hay))))
+}
+
+/// `text` with its leftmost match replaced by what the template writes for it.
+pub fn replace(re: Regex, text: String, to: Template) -> String / {abort.raise} =
+  string_of_bytes(replaced(inner(re), bytes_of_string(text), to, 1))
+
+/// `text` with every match, as `find_all` finds them, replaced by what the template writes
+/// for it.
+pub fn replace_all(re: Regex, text: String, to: Template) -> String / {abort.raise} =
+  string_of_bytes(replaced(inner(re), bytes_of_string(text), to, -1))
+
+/// `text` with its leftmost match replaced by what `each` answers for what it captured.
+pub fn replace_with<| e>(
+  re: Regex,
+  text: String,
+  each: (Captures) -> String / e,
+) -> String / {abort.raise | e} = replaced_with(re, text, each, 1)
+
+/// `text` with every match, as `find_all` finds them, replaced by what `with` answers for what
+/// it captured.
+pub fn replace_all_with<| e>(
+  re: Regex,
+  text: String,
+  each: (Captures) -> String / e,
+) -> String / {abort.raise | e} = replaced_with(re, text, each, -1)
+
+fn replaced_with<| e>(
+  re: Regex,
+  text: String,
+  each: (Captures) -> String / e,
+  most: Int,
+) -> String / {abort.raise | e} = {
+  let w = fold(
+    captures_all_of(re, text, most),
+    { at: 0, parts: [] },
+    |w: { at: Int, parts: List<String> }, c: Captures|
+      match group(c, 0) {
+        Some(whole) ->
+          {
+            at: whole.end,
+            parts: push(push(w.parts, string_slice(text, w.at, whole.start)), each(c)),
+          },
+        None -> w,
+      },
+  );
+  join(push(w.parts, string_slice(text, w.at, string_len(text))), "")
+}
+
+/// The parts of `hay` between its first `most` matches, or all of them where `most` is
+/// negative: one more part than there are matches.
+fn parted(re: Compiled, hay: Bytes, most: Int) -> List<Bytes> / {abort.raise} = {
+  let w = fold(
+    matches(re, hay, 2, most),
+    { at: 0, parts: [] },
+    |w: { at: Int, parts: List<Bytes> }, slots: Array<Int>|
+      {
+        at: array_get(slots, 1),
+        parts: push(w.parts, bytes_slice(hay, w.at, array_get(slots, 0))),
+      },
+  );
+  push(w.parts, bytes_slice(hay, w.at, bytes_len(hay)))
+}
+
+/// The parts of `text` between its matches, as `find_all` finds them: one more part than there
+/// are matches, so the parts with the matches between them are `text`.
+pub fn split(re: Regex, text: String) -> List<String> / {abort.raise} =
+  map(parted(inner(re), bytes_of_string(text), -1), |part: Bytes| string_of_bytes(part))
+
+/// At most `limit` parts of `text`: those between its first matches, and for the last all that
+/// follows the match before it. No parts where `limit` is not positive.
+pub fn splitn(re: Regex, text: String, limit: Int) -> List<String> / {abort.raise} =
+  if limit <= 0 { [] } else {
+    map(parted(inner(re), bytes_of_string(text), limit - 1), |part: Bytes| string_of_bytes(part))
+  }
+
+/// `text` as the pattern that matches it and nothing else: each character a pattern reads as
+/// more than itself after a `\`.
+pub fn escape(text: String) -> String =
+  string_of_chars(
+    fold(string_chars(text), [], |acc: List<Char>, c: Char|
+      if special(int_of_char(c)) { push(push(acc, '\\'), c) } else { push(acc, c) }),
+  )
+
+fn special(c: Int) -> Bool = meta(c) != Plain || c == b']' || c == b'}'
+
+// --- Patterns over bytes ------------------------------------------------------------------
+
+/// A pattern compiled to search `Bytes`, a byte at a time: a character of the pattern is the
+/// byte of its number, so `\xFF` and `[\x80-\xFF]` are bytes, `.` is any byte but a line feed,
+/// and a character past `U+00FF` is refused. Two are equal when their patterns and options are
+/// written alike, and one is shown as its pattern.
+pub type ByteRegex = | ByteRegex(Compiled)
+
+key for ByteRegex by byte_sameness
+
+show for ByteRegex by byte_pattern
+
+fn byte_sameness(re: ByteRegex) -> { pattern: String, options: Options } =
+  match re { ByteRegex(c) -> { pattern: c.pattern, options: c.options } }
+
+/// The pattern `re` was compiled from, as it was written.
+pub fn byte_pattern(re: ByteRegex) -> String = match re { ByteRegex(c) -> c.pattern }
+
+fn byte_inner(re: ByteRegex) -> Compiled = match re { ByteRegex(c) -> c }
+
+/// The pattern compiled over bytes under `options()`, or where and why it is refused.
+pub fn compile_bytes(pattern: String) -> Result<ByteRegex, Refusal> / {abort.raise} =
+  try { read_bytes(pattern, options()) }
+
+/// The pattern compiled over bytes as `o` says, or where and why it is refused.
+pub fn compile_bytes_with(
+  pattern: String,
+  o: Options,
+) -> Result<ByteRegex, Refusal> / {abort.raise} = try { read_bytes(pattern, o) }
+
+/// The pattern compiled over bytes as `o` says, raising `regex.refused` where
+/// `compile_bytes_with` answers `Err`.
+pub fn read_bytes(pattern: String, o: Options) -> ByteRegex / {regex.refused, abort.raise} =
+  ByteRegex(compiled(pattern, o, true))
+
+/// The pattern as its parse reads back, as `printed` writes one over text, with a byte no text
+/// shows as `\x{NN}`.
+pub fn printed_bytes(re: ByteRegex) -> String / {abort.raise} =
+  written(byte_inner(re).tree, 0, true)
+
+/// Whether a match stands anywhere in `hay`.
+pub fn is_match_bytes(re: ByteRegex, hay: Bytes) -> Bool / {abort.raise} =
+  matching(byte_inner(re), hay)
+
+/// The leftmost match in `hay`.
+pub fn find_bytes(re: ByteRegex, hay: Bytes) -> Option<Span> / {abort.raise} =
+  match matches(byte_inner(re), hay, 2, 1) {
+    [slots] -> Some({ start: array_get(slots, 0), end: array_get(slots, 1) }),
+    _ -> None,
+  }
+
+/// Every match in `hay`, in order and none overlapping another, as `find_all` finds them in
+/// text, a byte standing where a character does there.
+pub fn find_all_bytes(re: ByteRegex, hay: Bytes) -> List<Span> / {abort.raise} =
+  map(matches(byte_inner(re), hay, 2, -1), |slots: Array<Int>|
+    { start: array_get(slots, 0), end: array_get(slots, 1) })
+
+/// The leftmost match in `hay`, with what each group captured.
+pub fn captures_bytes(re: ByteRegex, hay: Bytes) -> Option<Captures> / {abort.raise} =
+  list_at(captured_bytes(byte_inner(re), hay, 1), 0)
+
+/// Every match in `hay`, as `find_all_bytes` finds them, each with what its groups captured.
+pub fn captures_all_bytes(re: ByteRegex, hay: Bytes) -> List<Captures> / {abort.raise} =
+  captured_bytes(byte_inner(re), hay, -1)
+
+fn captured_bytes(re: Compiled, hay: Bytes, most: Int) -> List<Captures> / {abort.raise} =
+  map(matches(re, hay, 2 * len(re.names), most), |slots: Array<Int>| -> Captures {
+    {
+      groups: map(range(0, array_len(slots) / 2), |g: Int| {
+        let from = array_get(slots, 2 * g);
+        let to = array_get(slots, 2 * g + 1);
+        if from < 0 || to < 0 { None } else { Some({ start: from, end: to }) }
+      }),
+      numbers: re.numbers,
+    }
+  })
+
+/// The replacement `text` writes for matches of `re`, as `template` reads one, its text written
+/// as its UTF-8.
+pub fn template_bytes(re: ByteRegex, text: String) -> Result<Template, Refusal> / {abort.raise} =
+  try { read_template_bytes(re, text) }
+
+/// As `template_bytes`, raising `regex.refused` where that answers `Err`.
+pub fn read_template_bytes(re: ByteRegex, text: String) -> Template / {regex.refused, abort.raise} =
+  templated(byte_inner(re), text)
+
+/// `hay` with its leftmost match replaced by what the template writes for it.
+pub fn replace_bytes(re: ByteRegex, hay: Bytes, to: Template) -> Bytes / {abort.raise} =
+  replaced(byte_inner(re), hay, to, 1)
+
+/// `hay` with every match, as `find_all_bytes` finds them, replaced by what the template writes
+/// for it.
+pub fn replace_all_bytes(re: ByteRegex, hay: Bytes, to: Template) -> Bytes / {abort.raise} =
+  replaced(byte_inner(re), hay, to, -1)
+
+/// The parts of `hay` between its matches, as `find_all_bytes` finds them: one more part than
+/// there are matches.
+pub fn split_bytes(re: ByteRegex, hay: Bytes) -> List<Bytes> / {abort.raise} =
+  parted(byte_inner(re), hay, -1)
+
+/// At most `limit` parts of `hay`, as `splitn` parts a text.
+pub fn splitn_bytes(re: ByteRegex, hay: Bytes, limit: Int) -> List<Bytes> / {abort.raise} =
+  if limit <= 0 { [] } else { parted(byte_inner(re), hay, limit - 1) }
+
+// --- Tests ----------------------------------------------------------------------
+
+fn must_with(pattern: String, o: Options) -> Regex / {abort.raise} =
+  match compile_with(pattern, o) {
+    Ok(re) -> re,
+    Err(e) -> panic(f"`{pattern}` is refused at {e.at}: {reason(e.why)}"),
+  }
+
+fn must(pattern: String) -> Regex / {abort.raise} = must_with(pattern, options())
+
+fn must_bytes(pattern: String) -> ByteRegex / {abort.raise} =
+  match compile_bytes(pattern) {
+    Ok(re) -> re,
+    Err(e) -> panic(f"`{pattern}` is refused at {e.at}: {reason(e.why)}"),
+  }
+
+fn must_template(re: Regex, text: String) -> Template / {abort.raise} =
+  match template(re, text) {
+    Ok(t) -> t,
+    Err(e) -> panic(f"`{text}` is refused at {e.at}: {reason(e.why)}"),
+  }
+
+/// Every state at once, never one at a time.
+fn threads_only() -> Options = { ..options(), state_limit: 0 }
+
+/// One state at a time, however short the subject.
+fn states_always() -> Options = { ..options(), short: -1 }
+
+/// One state at a time with room for three, so a search runs out and goes on by threads.
+fn states_cramped() -> Options = { ..options(), short: -1, state_limit: 3 }
+
+type Written = { pattern: String, text: String }
+
+fn w(pattern: String, text: String) -> Written = { pattern: pattern, text: text }
+
+/// Patterns, and what each reads back as.
+fn rewrites() -> List<Written> =
+  [
+    w("abc", "abc"),
+    w("a|b|c", "a|b|c"),
+    w("a(?:b|c)d", "a(?:b|c)d"),
+    w("a|(?:b|c)", "a|b|c"),
+    w("a(?:bc)d", "abcd"),
+    w("(?:ab)*", "(?:ab)*"),
+    w("(?:a*)*", "(?:a*)*"),
+    w("(a)(?P<x>b)(?<y>c)", "(a)(?P<x>b)(?P<y>c)"),
+    w("a*b+c?d{2}e{2,}f{2,5}", "a*b+c?d{2}e{2,}f{2,5}"),
+    w("a{0,}b{1,}c{0,1}d{1}e{0}", "a*b+c?d{1}e{0}"),
+    w("a*?b+?c??d{2}?", "a*?b+?c??d{2}?"),
+    w("(?U)a*b*?", "a*?b*"),
+    w("(?i)ab1", "[Aa][Bb]1"),
+    w("(?i:a)b", "[Aa]b"),
+    w("a(?i)b|c", "a[Bb]|[Cc]"),
+    w("(?i)a(?-i)b", "[Aa]b"),
+    w("(?i)\u{e9}k", "\u{e9}[Kk]"),
+    w(".", "[^\\x{A}]"),
+    w("(?s).", "(?s:.)"),
+    w("^a$", "\\Aa\\z"),
+    w("(?m)^a$", "(?m:^)a(?m:$)"),
+    w("\\Aa\\z", "\\Aa\\z"),
+    w("\\bx\\B", "\\bx\\B"),
+    w("^*", "\\A*"),
+    w("[a-c]", "[a-c]"),
+    w("[^a-c]", "[^a-c]"),
+    w("[a]", "[a]"),
+    w("[]a]", "[\\]a]"),
+    w("[^]a]", "[^\\]a]"),
+    w("[a-]", "[\\-a]"),
+    w("[a-b-c]", "[\\-a-c]"),
+    w("[a\\-z]", "[\\-az]"),
+    w("[^\\x00-\\x{10FFFF}]", "[^\\x{0}-\u{10FFFF}]"),
+    w("\\d\\w\\s", "[0-9][0-9A-Z_a-z][\\x{9}-\\x{A}\\x{C}-\\x{D} ]"),
+    w("\\D", "[^0-9]"),
+    w("[\\d\\D]", "(?s:.)"),
+    w("[[:alpha:][:^digit:]]", "[^0-9]"),
+    w("[[:word:]]", "[0-9A-Z_a-z]"),
+    w("[[:alpha]", "[:\\[ahlp]"),
+    w("(?i)[k-m]", "[K-Mk-m]"),
+    w("(?i)[^k]", "[^Kk]"),
+    w("a{", "a\\{"),
+    w("a{1", "a\\{1"),
+    w("a{,2}", "a\\{,2\\}"),
+    w("a{01}", "a\\{01\\}"),
+    w("{", "\\{"),
+    w("}]", "\\}\\]"),
+    w("\\Qa.b\\E+", "a\\.b+"),
+    w("\\Qa|b", "a\\|b"),
+    w("\\Q\\Ea", "a"),
+    w("\\x41\\x{1F600}\\n\\0\\07\\011", "A\u{1F600}\\x{A}\\x{0}\\x{7}\\x{9}"),
+    w("\\a\\f\\t\\r\\v", "\\x{7}\\x{C}\\x{9}\\x{D}\\x{B}"),
+    w("\\.\\_\\-\\ ", "\\._- "),
+    w("\\x{D800}", "\\x{D800}"),
+    w("a|", "a|(?:)"),
+    w("|a", "(?:)|a"),
+    w("", "(?:)"),
+    w("()", "((?:))"),
+    w("(?:)", "(?:)"),
+    w("(?)a", "a"),
+    w("(|a)*", "((?:)|a)*"),
+    w("\u{65e5}\u{672c}+", "\u{65e5}\u{672c}+"),
+  ]
+
+test "`{c.pattern}` reads back as `{c.text}`, which reads back as itself and compiles alike" for c: Written in rewrites(
+  ) {
+  let re = must(c.pattern);
+  let again = must(printed(re));
+  assert_eq(printed(re), c.text);
+  assert_eq(printed(again), c.text);
+  assert_eq(inner(again).insts, inner(re).insts);
+  assert_eq(inner(again).tracer.insts, inner(re).tracer.insts)
+}
+
+type Refused = { pattern: String, at: Int, why: Why }
+
+fn no(pattern: String, at: Int, why: Why) -> Refused = { pattern: pattern, at: at, why: why }
+
+fn refusals() -> List<Refused> =
+  [
+    no("(a", 0, UnclosedGroup),
+    no("a(b(c)", 1, UnclosedGroup),
+    no("(?i", 0, UnclosedGroup),
+    no("(?:a", 0, UnclosedGroup),
+    no("a)", 1, UnopenedGroup),
+    no("(a))", 3, UnopenedGroup),
+    no("[a", 0, UnclosedClass),
+    no("[", 0, UnclosedClass),
+    no("[]", 0, UnclosedClass),
+    no("[^]", 0, UnclosedClass),
+    no("a[b-", 1, UnclosedClass),
+    no("[z-a]", 1, BadRange),
+    no("[a-\\x{10}]", 1, BadRange),
+    no("[[:nope:]]", 1, BadClassName),
+    no("[[:^nope:]]", 1, BadClassName),
+    no("a\\", 1, TrailingEscape),
+    no("[a\\", 2, TrailingEscape),
+    no("\\q", 0, BadEscape),
+    no("\\Z", 0, BadEscape),
+    no("\\E", 0, BadEscape),
+    no("\\x{110000}", 0, BadEscape),
+    no("\\x{}", 0, BadEscape),
+    no("\\xg0", 0, BadEscape),
+    no("\\\u{e9}", 0, BadEscape),
+    no("[a-\\d]", 3, BadEscape),
+    no("*a", 0, NothingToRepeat),
+    no("a|*", 2, NothingToRepeat),
+    no("(+)", 1, NothingToRepeat),
+    no("{2}", 0, NothingToRepeat),
+    no("(?i)*", 4, NothingToRepeat),
+    no("\\Q\\E*", 4, NothingToRepeat),
+    no("a**", 2, NestedRepeat),
+    no("a*+", 2, NestedRepeat),
+    no("a+?*", 3, NestedRepeat),
+    no("a{2}{3}", 4, NestedRepeat),
+    no("a{2,1}", 1, BadRepeat),
+    no("a{1001}", 1, BadRepeat),
+    no("a{2,1001}", 1, BadRepeat),
+    no("a{99999999999999999999}", 1, BadRepeat),
+    no("(?#note)", 2, BadGroup),
+    no("(?>a)", 2, BadGroup),
+    no("(?x)a", 2, BadGroup),
+    no("(?i-)a", 4, BadGroup),
+    no("(?i--s)a", 4, BadGroup),
+    no("(?P>a)", 0, BadGroup),
+    no("(?P<>a)", 4, BadGroupName),
+    no("(?<a-b>c)", 3, BadGroupName),
+    no("(?P<a", 4, BadGroupName),
+    no("(?<a>x)(?P<a>y)", 11, DuplicateName),
+    no("(a)\\1", 3, Backreference),
+    no("\\9", 0, Backreference),
+    no("\\141", 0, Backreference),
+    no("\\k<a>", 0, Backreference),
+    no("(?P<a>x)(?P=a)", 8, Backreference),
+    no("(?=a)", 0, Lookaround),
+    no("a(?!b)", 1, Lookaround),
+    no("(?<=a)b", 0, Lookaround),
+    no("(?<!a)b", 0, Lookaround),
+    no("\\pL", 0, UnicodeProperty),
+    no("\\P{Greek}", 0, UnicodeProperty),
+    no("[\\pN]", 1, UnicodeProperty),
+    no("a\\C", 1, HalfCharacter),
+    no("(a{1000}){1000}", 9, TooLarge),
+    no("((((((((((a{10}){10}){10}){10}){10}){10}){10}){10}){10}){10})", 31, TooLarge),
+  ]
+
+test "`{c.pattern}` is refused where it goes wrong" for c: Refused in refusals() {
+  assert_eq(compile(c.pattern), Err({ at: c.at, why: c.why }));
+  assert_eq(try { read(c.pattern, options()) }, Err({ at: c.at, why: c.why }))
+}
+
+fn nested(depth: Int) -> String =
+  fold(range(0, depth), "", |p: String, _: Int| p ++ "(") ++ "a"
+    ++ fold(range(0, depth), "", |p: String, _: Int| p ++ ")")
+
+test "groups nest two hundred deep and no deeper" {
+  assert_eq(group_count(must(nested(200))), 201);
+  assert_eq(find(must(nested(200)), "xa"), Some({ start: 1, end: 2 }));
+  assert_eq(compile(nested(201)), Err({ at: 200, why: TooDeep }))
+}
+
+test "a pattern is held to the instructions its limit allows, counted before any are written" {
+  let tight = { ..options(), size_limit: 8 };
+  assert(match compile_with("abcdefgh", tight) { Ok(_) -> true, Err(_) -> false });
+  assert_eq(compile_with("abcdefghi", tight), Err({ at: 8, why: TooLarge }));
+  assert_eq(compile_with("a{9}", tight), Err({ at: 1, why: TooLarge }));
+  assert_eq(compile_with("\u{65e5}{3}", tight), Err({ at: 1, why: TooLarge }));
+  let refused = metered(|| compile("(a{1000}){1000}"));
+  assert_eq(refused.value, Err({ at: 9, why: TooLarge }));
+  assert(refused.steps < 2000, Some(int_to_string(refused.steps)))
+}
+
+test "a pattern over bytes holds bytes and no character past them" {
+  assert_eq(compile_bytes("a\u{100}"), Err({ at: 1, why: NotAByte }));
+  assert_eq(compile_bytes("[a-\\x{100}]"), Err({ at: 3, why: NotAByte }));
+  assert_eq(compile_bytes("\\x{100}"), Err({ at: 0, why: NotAByte }));
+  assert_eq(find_bytes(must_bytes("\\xFF+"), b"a\xff\xffb"), Some({ start: 1, end: 3 }));
+  assert_eq(find_bytes(must_bytes("."), b"\n\xe9"), Some({ start: 1, end: 2 }));
+  assert_eq(find_bytes(must_bytes("\\C"), b"\n"), Some({ start: 0, end: 1 }));
+  assert_eq(find_bytes(must_bytes("[^a]+"), b"a\x00\x80\xffa"), Some({ start: 1, end: 4 }));
+  assert_eq(find_bytes(must_bytes("\u{e9}"), b"caf\xe9"), Some({ start: 3, end: 4 }));
+  assert_eq(find_bytes(must_bytes("(?i)\\xE9"), b"\xc9"), None);
+  assert_eq(printed_bytes(must_bytes("[^a]\\xFF")), "[^a]\\x{FF}");
+  assert_eq(printed_bytes(must_bytes(".")), "[^\\x{A}]");
+  assert_eq(byte_pattern(must_bytes("a|b")), "a|b")
+}
+
+/// The slots of the first match of a pattern compiled as `o` says.
+fn first_slots(pattern: String, o: Options, text: String) -> List<Int> / {abort.raise} = {
+  let c = inner(must_with(pattern, o));
+  match matches(c, bytes_of_string(text), 2 * len(c.names), 1) {
+    [slots] -> array_to_list(slots),
+    _ -> [],
+  }
+}
+
+type Sample = { pattern: String, text: String, slots: List<Int> }
+
+fn sample(pattern: String, text: String, slots: List<Int>) -> Sample =
+  { pattern: pattern, text: text, slots: slots }
+
+/// Patterns, texts, and the bytes at which the first match and each of its groups start and
+/// end, `-1` for a group that took no part.
+fn samples() -> List<Sample> =
+  [
+    sample("a+", "baaac", [1, 4]),
+    sample("a*", "baaac", [0, 0]),
+    sample("(a+)(b+)", "xaabbby", [1, 6, 1, 3, 3, 6]),
+    sample("a|ab", "xab", [1, 2]),
+    sample("ab|a", "xab", [1, 3]),
+    sample("(a*)*", "b", [0, 0, 0, 0]),
+    sample("(a*)+", "b", [0, 0, 0, 0]),
+    sample("(a|b)*c", "abcabc", [0, 3, 1, 2]),
+    sample("^abc$", "abc", [0, 3]),
+    sample("^abc$", "abcd", []),
+    sample("abc$", "abc\n", []),
+    sample("\\bfoo\\b", "a foo b", [2, 5]),
+    sample("\\bfoo\\b", "afoo b", []),
+    sample("(?m)^b$", "a\nb\nc", [2, 3]),
+    sample("x*", "\u{e9}", [0, 0]),
+    sample(".", "\u{e9}x", [0, 2]),
+    sample("[^a]", "a\u{1F600}", [1, 5]),
+    sample("[\u{3b1}-\u{3c9}]+", "abc \u{3b1}\u{3b2}\u{3b3} d", [4, 10]),
+    sample("\u{e9}", "cafe\u{301} caf\u{e9}", [10, 12]),
+    sample("\\B", "a\u{e9}", [3, 3]),
+    sample("\\x{D800}|b", "ab", [1, 2]),
+    sample("a.c", "a\nc abc", [4, 7]),
+    sample("(?s)a.c", "a\nc abc", [0, 3]),
+    sample("a{2,3}", "aaaa", [0, 3]),
+    sample("a{2,3}?", "aaaa", [0, 2]),
+    sample("(?U)a{2,3}", "aaaa", [0, 2]),
+    sample("(a)|(b)", "b", [0, 1, -1, -1, 0, 1]),
+    sample("(a){0}b", "ab", [1, 2, -1, -1]),
+    sample("(?i)straSSe", "STRASSE", [0, 7]),
+    sample("(?i)k", "\u{212a}K", [3, 4]),
+    sample("foo|bar|baz", "xx baz", [3, 6]),
+    sample("", "abc", [0, 0]),
+    sample("$", "abc", [3, 3]),
+    sample("\\d+-\\d+", "tel 555-1234 ok", [4, 12]),
+    sample("[[:upper:]][[:lower:]]+", "say Hello", [4, 9]),
+    sample("needle", "a haystack with a needle in it, and a second needle", [18, 24]),
+    sample("(\\w+)@(\\w+)\\.com", "write to someone@example.com today", [9, 28, 9, 16, 17, 24]),
+    sample("[0-9]+$", "one 1 two 22 three 333", [19, 22]),
+    sample("(?:x|y)*z", "the quick brown fox jumps over the lazy dog", [37, 38]),
+    sample("[a-z]+ing\\b", "the quick brown fox was jumping over the lazy dog", [24, 31]),
+    sample("[a-z]+ing\\b", "the quick brown fox jumps over the lazy dog, singly", []),
+    sample("(\\w+)@example\\.com", "from a@example.org and bee@example.com, both", [
+      23,
+      38,
+      23,
+      26,
+    ]),
+  ]
+
+test "`{c.pattern}` in `{c.text}`, by every state at once" for c: Sample in samples() {
+  assert_eq(first_slots(c.pattern, threads_only(), c.text), c.slots)
+}
+
+test "`{c.pattern}` in `{c.text}`, one state at a time" for c: Sample in samples() {
+  assert_eq(first_slots(c.pattern, states_always(), c.text), c.slots)
+}
+
+test "`{c.pattern}` in `{c.text}`, with room for three states" for c: Sample in samples() {
+  assert_eq(first_slots(c.pattern, states_cramped(), c.text), c.slots)
+}
+
+test "the longest match at the leftmost place is taken where it is asked for" {
+  let longest = { ..options(), longest: true };
+  assert_eq(first_slots("a|ab|abc", options(), "xabcd"), [1, 2]);
+  assert_eq(first_slots("a|ab|abc", longest, "xabcd"), [1, 4]);
+  assert_eq(first_slots("a|ab|abc", { ..longest, short: -1 }, "xabcd"), [1, 4]);
+  assert_eq(first_slots("a|ab|abc", { ..longest, short: -1, state_limit: 3 }, "xabcd"), [1, 4]);
+  assert_eq(first_slots("(a*?)(a*)", longest, "aaa"), [0, 3, 0, 0, 0, 3]);
+  assert_eq(first_slots("a*?", longest, "aaa"), [0, 3])
+}
+
+fn spans(pairs: List<Int>) -> List<Span> =
+  fold(range(0, len(pairs) / 2), [], |acc: List<Span>, i: Int|
+    push(acc, { start: at_or(pairs, 2 * i, 0), end: at_or(pairs, 2 * i + 1, 0) }))
+
+test "matches are found in order, none overlapping, an empty one never where the last ended" {
+  assert_eq(find_all(must("a"), "bababaab"), spans([1, 2, 3, 4, 5, 6, 6, 7]));
+  assert_eq(find_all(must("a*"), "baaab"), spans([0, 0, 1, 4, 5, 5]));
+  assert_eq(find_all(must(""), "ab"), spans([0, 0, 1, 1, 2, 2]));
+  assert_eq(find_all(must(""), "\u{e9}\u{1F600}"), spans([0, 0, 1, 1, 2, 2]));
+  assert_eq(find_all(must("\\b"), "x y"), spans([0, 0, 1, 1, 2, 2, 3, 3]));
+  assert_eq(find_all(must("x"), ""), []);
+  assert_eq(find_all(must("^a"), "aaa"), spans([0, 1]));
+  assert_eq(find_all(must("(?m)^."), "ab\ncd"), spans([0, 1, 3, 4]));
+  assert_eq(find_all(must("\u{e9}+"), "\u{e9}t\u{e9}\u{e9}"), spans([0, 1, 2, 4]));
+  assert_eq(find_all_bytes(must_bytes("a*"), b"baaab"), spans([0, 0, 1, 4, 5, 5]));
+  assert_eq(find_all_bytes(must_bytes(""), b"\xc3\xa9"), spans([0, 0, 1, 1, 2, 2]))
+}
+
+test "a match's groups are read by number and by name, in characters of the text" {
+  let re = must("(?P<year>\\d{4})-(?P<month>\\d{2})(-(?P<day>\\d{2}))?");
+  assert_eq(group_count(re), 5);
+  assert_eq(group_names(re), [None, Some("year"), Some("month"), None, Some("day")]);
+  let text = "\u{e9}t\u{e9} 2026-10, puis 2027-01-15";
+  let first = match captures(re, text) { Some(c) -> c, None -> panic("a date is there") };
+  assert_eq(group(first, 0), Some({ start: 4, end: 11 }));
+  assert_eq(named(first, "year"), Some({ start: 4, end: 8 }));
+  assert_eq(named(first, "month"), Some({ start: 9, end: 11 }));
+  assert_eq(named(first, "day"), None);
+  assert_eq(named(first, "hour"), None);
+  assert_eq(group(first, 5), None);
+  assert_eq(group(first, -1), None);
+  assert_eq(match named(first, "year") { Some(s) -> slice(text, s), None -> "" }, "2026");
+  let all = captures_all(re, text);
+  assert_eq(map(all, |c: Captures| named(c, "day")), [None, Some({ start: 26, end: 28 })]);
+  assert_eq(captures(re, "no date"), None);
+  let bytes = must_bytes("(a)(?P<rest>[\\x80-\\xFF]*)");
+  assert_eq(
+    match captures_bytes(bytes, b"xa\xff\xfe") { Some(c) -> named(c, "rest"), None -> None },
+    Some({ start: 2, end: 4 }),
+  );
+  assert_eq(len(captures_all_bytes(bytes, b"a a\x80")), 2)
+}
+
+test "a template writes groups by number and by name, and is held to the pattern's groups" {
+  let re = must("(?P<first>\\w+) (?P<last>\\w+)");
+  assert_eq(
+    replace(re, "ada lovelace, alan turing", must_template(re, "$last, $first")),
+    "lovelace, ada, alan turing",
+  );
+  assert_eq(
+    replace_all(re, "ada lovelace, alan turing", must_template(re, "${2}_$1")),
+    "lovelace_ada, turing_alan",
+  );
+  assert_eq(
+    replace_all(re, "ada lovelace", must_template(re, "<$0> costs $$5")),
+    "<ada lovelace> costs $5",
+  );
+  assert_eq(replace_all(re, "ada lovelace", must_template(re, "${first}s")), "adas");
+  assert_eq(replace_all(must("a(x)?"), "a ax", must_template(must("a(x)?"), "[$1]")), "[] [x]");
+  assert_eq(
+    replace_all(must("\u{e9}"), "\u{e9}t\u{e9}", must_template(must("\u{e9}"), "e")),
+    "ete",
+  );
+  assert_eq(replace_all(must("x*"), "abc", must_template(must("x*"), "-")), "-a-b-c-");
+  assert_eq(template(re, "$3"), Err({ at: 0, why: NoSuchGroup }));
+  assert_eq(template(re, "a $middle"), Err({ at: 2, why: NoSuchGroup }));
+  assert_eq(template(re, "$1st"), Err({ at: 0, why: NoSuchGroup }));
+  assert_eq(template(re, "${}"), Err({ at: 0, why: NoSuchGroup }));
+  assert_eq(template(re, "${first"), Err({ at: 0, why: UnclosedName }));
+  assert_eq(template(re, "cost: $"), Err({ at: 6, why: LoneDollar }));
+  assert_eq(template(re, "$ 1"), Err({ at: 0, why: LoneDollar }));
+  let bytes = must_bytes("(\\x00+)");
+  let wide = match template_bytes(bytes, "<$1>") { Ok(t) -> t, Err(_) -> panic("a template") };
+  assert_eq(replace_all_bytes(bytes, b"a\x00\x00b\x00", wide), b"a<\x00\x00>b<\x00>");
+  assert_eq(replace_bytes(bytes, b"a\x00\x00b\x00", wide), b"a<\x00\x00>b\x00")
+}
+
+test "a match is replaced by what a function answers for what it captured" {
+  let re = must("(\\d+)([a-z]?)");
+  let text = "1a 22 333c";
+  let doubled = replace_all_with(re, text, |c: Captures|
+    match group(c, 1) { Some(s) -> slice(text, s) ++ slice(text, s), None -> "" });
+  assert_eq(doubled, "11 2222 333333");
+  assert_eq(replace_with(re, text, |_: Captures| ""), " 22 333c");
+  assert_eq(replace_all_with(must("z"), text, |_: Captures| "!"), text)
+}
+
+test "a text is parted at its matches, into one part more than there are" {
+  assert_eq(split(must(","), "a,b,,c"), ["a", "b", "", "c"]);
+  assert_eq(split(must(",\\s*"), "a, b,c,   d"), ["a", "b", "c", "d"]);
+  assert_eq(split(must(","), ""), [""]);
+  assert_eq(split(must(","), ","), ["", ""]);
+  assert_eq(split(must("x*"), "abc"), ["", "a", "b", "c", ""]);
+  assert_eq(split(must(""), "\u{e9}a"), ["", "\u{e9}", "a", ""]);
+  assert_eq(splitn(must(","), "a,b,,c", 2), ["a", "b,,c"]);
+  assert_eq(splitn(must(","), "a,b,,c", 1), ["a,b,,c"]);
+  assert_eq(splitn(must(","), "a,b,,c", 9), ["a", "b", "", "c"]);
+  assert_eq(splitn(must(","), "a,b,,c", 0), []);
+  assert_eq(split_bytes(must_bytes("\\x00"), b"a\x00b\x00"), [b"a", b"b", b""]);
+  assert_eq(splitn_bytes(must_bytes("\\x00"), b"a\x00b\x00", 2), [b"a", b"b\x00"])
+}
+
+test "an escaped text is the pattern of that text alone" {
+  assert_eq(escape("a.b*c"), "a\\.b\\*c");
+  assert_eq(escape("\\.+*?()|[]{}^$"), "\\\\\\.\\+\\*\\?\\(\\)\\|\\[\\]\\{\\}\\^\\$");
+  assert_eq(escape("plain \u{e9} text"), "plain \u{e9} text");
+  assert_eq(find(must(escape("1+1=2?")), "is 1+1=2? yes"), Some({ start: 3, end: 9 }))
+}
+
+test "two patterns are one where they are written alike, and one is shown as written" {
+  assert(must("a+") == must("a+"));
+  assert(must("a+") != must("a+?"));
+  assert(must("a+") != must_with("a+", { ..options(), longest: true }));
+  assert_eq(f"{must("(?i)a|b")}", "(?i)a|b");
+  assert_eq(pattern(must("(?i)a|b")), "(?i)a|b")
+}
+
+test "a search skips to where a match can start, and a pattern that is plain text is searched as text" {
+  let anywhere = inner(must("[0-9]+x"));
+  assert_eq(anywhere.opening.first, b"0123456789");
+  assert_eq(anywhere.opening.lead, b"");
+  let led = inner(must("abc[0-9]"));
+  assert_eq(led.opening.lead, b"abc");
+  assert(!led.opening.exact);
+  let exact = inner(must("a\\.b"));
+  assert_eq(exact.opening.lead, b"a.b");
+  assert(exact.opening.exact);
+  assert_eq(inner(must("a*b")).opening.first, b"ab");
+  assert_eq(inner(must("a*")).opening.first, b"");
+  assert_eq(inner(must("\\ba")).opening.first, b"");
+  assert_eq(inner(must("(?i)k")).opening.first, b"Kk");
+  assert_eq(bytes_len(inner(must(".")).opening.first), 178);
+  assert_eq(inner(must("\\w+@example\\.com")).opening.held, b"@example.com");
+  assert_eq(inner(must("(\\d+)(?:ab)+\u{e9}|x")).opening.held, b"");
+  assert_eq(inner(must("\\d(?:ab)+c\u{e9}\\d")).opening.held, b"c\xc3\xa9");
+  assert_eq(inner(must("\\d(?:ab){0,2}(c)\\d")).opening.held, b"c");
+  assert_eq(inner(must("(?i)abc\\d")).opening.held, b"");
+  assert_eq(inner(must("abc\\d")).opening.held, b"");
+  assert_eq(byte_inner(must_bytes("\\d\\xFF\\x00")).opening.held, b"\xff\x00");
+  let mail = must("\\w+@example\\.com");
+  let absent = run_of_a(100000);
+  let searched = metered(|| find(mail, absent));
+  assert_eq(searched.value, None);
+  assert(searched.steps < 50, Some(int_to_string(searched.steps)));
+  assert_eq(find(mail, absent ++ "@example.com"), Some({ start: 0, end: 100012 }));
+  assert(!is_match(mail, absent));
+  assert_eq(len(find_all(mail, "a@example.com b@example.org c@example.com")), 2);
+  assert_eq(byte_inner(must_bytes("(?s).a")).opening.first, b"")
+}
+
+fn run_of_a(n: Int) -> String / {abort.raise} = string_of_bytes(run_of(97, n))
+
+/// The steps the automaton of `pattern` takes to read a run of `n` a's, in which it finds
+/// nothing. `is_match` would not read the run: each of these patterns ends in a character the
+/// run lacks, which is asked first.
+fn steps_to_fail(pattern: String, o: Options, n: Int) -> Int / {abort.raise} = {
+  let re = inner(must_with(pattern, o));
+  let hay = bytes_of_string(run_of_a(n));
+  let m = metered(|| read_through(re, hay));
+  if m.value { panic(f"`{pattern}` is to find nothing in a run of a's") } else { m.steps }
+}
+
+/// Patterns a search that goes back and tries again takes steps past any power of the
+/// subject's length to refuse in a run of a's.
+fn pathological() -> List<String> =
+  [
+    "(a*)*b",
+    "(a|aa)*b",
+    "(a+)+b",
+    "(.*)*x",
+    "(a*)*(a*)*(a*)*b",
+    "(?:a?){30}a{30}b",
+    "(a|a|a|a|a|a|a|a)*b",
+  ]
+
+test "`{pattern}` reads a run of a's and finds nothing in steps that grow as the run, by every state at once" for pattern: String in pathological(
+  ) {
+  let small = steps_to_fail(pattern, threads_only(), 1000);
+  let double = steps_to_fail(pattern, threads_only(), 2000);
+  let fourfold = steps_to_fail(pattern, threads_only(), 4000);
+  assert(double > small + 1000, Some(int_to_string(double - small)));
+  assert_eq(fourfold - double, 2 * (double - small))
+}
+
+test "`{pattern}` reads a run of a's and finds nothing in steps that grow as the run, one state at a time" for pattern: String in pathological(
+  ) {
+  let small = steps_to_fail(pattern, options(), 1000);
+  let double = steps_to_fail(pattern, options(), 2000);
+  let fourfold = steps_to_fail(pattern, options(), 4000);
+  assert(double >= small + 1000, Some(int_to_string(double - small)));
+  assert_eq(fourfold - double, 2 * (double - small));
+  assert(double - small <= 1100, Some(int_to_string(double - small)))
+}
+
+/// The steps `is_match` takes to find `pattern` nowhere in a run of `n` a's.
+fn steps_to_refuse(pattern: String, n: Int) -> Int / {abort.raise} = {
+  let re = must(pattern);
+  let text = run_of_a(n);
+  let m = metered(|| is_match(re, text));
+  if m.value { panic(f"`{pattern}` is to find nothing in a run of a's") } else { m.steps }
+}
+
+test "`{pattern}` is refused in a run of a's by `is_match` in steps that grow no faster than the run" for pattern: String in pathological(
+  ) {
+  let small = steps_to_refuse(pattern, 1000);
+  let double = steps_to_refuse(pattern, 2000);
+  let fourfold = steps_to_refuse(pattern, 4000);
+  assert_eq(fourfold - double, 2 * (double - small));
+  assert(double - small <= 1100, Some(int_to_string(double - small)))
+}
+
+test "`(a*)*b` is refused in a run of a's unread, since every match of it holds a `b`" {
+  assert_eq(inner(must("(a*)*b")).opening.held, b"b");
+  assert_eq(steps_to_refuse("(a*)*b", 100000), steps_to_refuse("(a*)*b", 1000));
+  assert(
+    steps_to_refuse("(a*)*b", 100000) < 20,
+    Some(int_to_string(steps_to_refuse("(a*)*b", 100000))),
+  )
+}
+
+law "the automaton of `(a*)*b` reads a run of a's in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    read_through(inner(must("(a*)*b")), bytes_of_string(run_of_a(n)))
+  }
+
+law "the automaton of `(a*)*b` reads a run of a's by every state at once in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    read_through(inner(must_with("(a*)*b", threads_only())), bytes_of_string(run_of_a(n)))
+  }
+
+law "the automaton of `(a|aa)*b` reads a run of a's by every state at once in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    read_through(inner(must_with("(a|aa)*b", threads_only())), bytes_of_string(run_of_a(n)))
+  }
+
+law "a search for `(a*)*[bc]` reads a run of a's and finds nothing in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    is_match(must("(a*)*[bc]"), run_of_a(n))
+  }
+
+law "a search for `(a|aa)*[bc]` by every state at once reads a run of a's in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    is_match(must_with("(a|aa)*[bc]", threads_only()), run_of_a(n))
+  }
+
+law "the groups of `(.*)*(a*)*` over a run of a's are read in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    captures(must("(.*)*(a*)*"), run_of_a(n))
+  }
+
+law "every match of `a?` in a run of a's is found in steps that grow as the run"
+  forall (n: Int) where n > 0 cost n {
+    len(find_all(must("a?"), run_of_a(n)))
+  }
+
+/// `n` words, each an alternative of one pattern.
+fn alternatives(n: Int) -> String = join(map(range(0, n), |i: Int| "w" ++ int_to_string(i)), "|")
+
+law "a search among n alternatives in a text of n bytes takes steps that grow as their product, by every state at once"
+  forall (n: Int) where n > 0 cost n * n {
+    is_match(must_with(alternatives(n) ++ "|x", threads_only()), run_of_a(n))
+  }
+
+law "a pattern of n alternatives compiles in steps that grow as their text"
+  forall (n: Int) where n > 0 cost n * ilog2(n + 1) {
+    compile(alternatives(n))
+  }
+
+/// A text of the characters a pattern reads as more than themselves, and a few it does not.
+fn tricky(seeds: List<Int>) -> String =
+  join(
+    map(seeds, |n: Int|
+      at_or(
+        [
+          "\\",
+          ".",
+          "+",
+          "*",
+          "?",
+          "(",
+          ")",
+          "|",
+          "[",
+          "]",
+          "{",
+          "}",
+          "^",
+          "$",
+          "-",
+          ",",
+          "a",
+          "b",
+          "E",
+          "Q",
+          "d",
+          "1",
+          " ",
+          "\n",
+          "\u{e9}",
+          "\u{1F600}",
+          ":",
+          "<",
+          ">",
+          "=",
+          "!",
+          "#",
+        ],
+        n & 31,
+        "a",
+      )),
+    "",
+  )
+
+law "an escaped text compiles, and matches that text and no other" =
+  agrees(
+    |d: { text: List<Int>, other: List<Int> }| {
+      let text = tricky(d.text);
+      let other = tricky(d.other);
+      let whole = must("\\A(?:" ++ escape(text) ++ ")\\z");
+      is_match(whole, text) && is_match(whole, other) == (other == text)
+        && find(must(escape(text)), text) == Some({ start: 0, end: string_len(text) })
+    },
+    |_: { text: List<Int>, other: List<Int> }| true,
+  )
+
+/// What a law draws a pattern and a text from.
+type Drawn = { pattern: List<Int>, text: List<Int> }
+
+/// A pattern grown from any integers, one step each: a step sets down a character, a class or,
+/// where `looks`, a look, or joins, alternates, repeats or groups what was set down before it.
+fn pattern_from(seeds: List<Int>, looks: Bool) -> String =
+  join(
+    fold(take(seeds, 10), [], |stack: List<String>, n: Int|
+      grown(stack, n & 15, n >> 4 & 3, looks)),
+    "",
+  )
+
+fn grown(stack: List<String>, step: Int, pick: Int, looks: Bool) -> List<String> = {
+  let last = at_or(stack, len(stack) - 1, "a");
+  let before = at_or(stack, len(stack) - 2, "b");
+  match step {
+    0 | 1 | 2 -> push(stack, at_or(["a", "b", "c", "ab"], pick, "a")),
+    3 -> push(stack, at_or([".", "[ab]", "[^a]", "\\w"], pick, ".")),
+    4 -> push(stack, if looks { at_or(["^", "$", "\\b", "\\B"], pick, "^") } else { "" }),
+    5 | 6 -> push(take(stack, len(stack) - 2), before ++ last),
+    7 | 8 -> push(take(stack, len(stack) - 2), "(?:" ++ before ++ "|" ++ last ++ ")"),
+    9 | 10 ->
+      push(
+        take(stack, len(stack) - 1),
+        "(?:" ++ last ++ ")" ++ at_or(["*", "+", "?", "{1,2}"], pick, "*"),
+      ),
+    11 ->
+      push(
+        take(stack, len(stack) - 1),
+        "(?:" ++ last ++ ")" ++ at_or(["*?", "+?", "??", "{2}"], pick, "*?"),
+      ),
+    12 | 13 -> push(take(stack, len(stack) - 1), "(" ++ last ++ ")"),
+    _ -> push(stack, if looks { "(?m:^)" } else { "a" }),
+  }
+}
+
+fn text_from(seeds: List<Int>) -> String =
+  join(
+    map(take(seeds, 10), |n: Int| at_or(["a", "a", "a", "b", "b", "c", " ", "\n"], n & 7, "a")),
+    "",
+  )
+
+/// Every match's slots, for a pattern compiled as `o` says.
+fn all_slots(pattern: String, o: Options, text: String) -> List<List<Int>> / {abort.raise} = {
+  let c = inner(must_with(pattern, o));
+  map(matches(c, bytes_of_string(text), 2 * len(c.names), -1), |slots: Array<Int>|
+    array_to_list(slots))
+}
+
+law "one state at a time finds the matches every state at once finds" =
+  agrees(
+    |d: Drawn| all_slots(pattern_from(d.pattern, true), states_always(), text_from(d.text)),
+    |d: Drawn| all_slots(pattern_from(d.pattern, true), threads_only(), text_from(d.text)),
+  )
+
+law "a search that runs out of room for states finds the matches every state at once finds" =
+  agrees(
+    |d: Drawn| all_slots(pattern_from(d.pattern, true), states_cramped(), text_from(d.text)),
+    |d: Drawn| all_slots(pattern_from(d.pattern, true), threads_only(), text_from(d.text)),
+  )
+
+law "one state at a time finds the longest matches every state at once finds" =
+  agrees(
+    |d: Drawn|
+      all_slots(
+        pattern_from(d.pattern, true),
+        { ..states_always(), longest: true },
+        text_from(d.text),
+      ),
+    |d: Drawn|
+      all_slots(
+        pattern_from(d.pattern, true),
+        { ..threads_only(), longest: true },
+        text_from(d.text),
+      ),
+  )
+
+law "whether a text matches is the same asked alone as found by a search, either way" =
+  agrees(
+    |d: Drawn|
+      is_match(must_with(pattern_from(d.pattern, true), states_always()), text_from(d.text)),
+    |d: Drawn|
+      find(must_with(pattern_from(d.pattern, true), threads_only()), text_from(d.text)) != None,
+  )
+
+law "over ASCII a pattern over bytes finds what the pattern over text finds" =
+  agrees(
+    |d: Drawn|
+      find_all_bytes(must_bytes(pattern_from(d.pattern, true)), bytes_of_string(text_from(d.text))),
+    |d: Drawn| find_all(must(pattern_from(d.pattern, true)), text_from(d.text)),
+  )
+
+/// Whether `node` matches the bytes of `hay` from `at` in some way that `then` accepts the end
+/// of: what a pattern means, read off its tree by trying every way to match.
+fn accepted(
+  node: Node,
+  hay: Bytes,
+  at: Int,
+  fuel: Int,
+  then: (Int) -> Bool / {abort.raise},
+) -> Bool / {abort.raise} =
+  if fuel <= 0 { panic("a drawn pattern nests a little") } else {
+    match node {
+      Empty -> then(at),
+      Literal(c) -> at < bytes_len(hay) && bytes_at(hay, at) == c && then(at + 1),
+      Class(set) ->
+        at < bytes_len(hay)
+          && fold(set, false, |within: Bool, i: Interval|
+            within || (bytes_at(hay, at) >= i.lo && bytes_at(hay, at) <= i.hi))
+          && then(at + 1),
+      Looking(look) -> look_bits(look, false) & ~looks_at(hay, at) == 0 && then(at),
+      Concat(items) -> in_a_row(items, 0, hay, at, fuel - 1, then),
+      Alternate(items) ->
+        fold(items, false, |any: Bool, n: Node| any || accepted(n, hay, at, fuel - 1, then)),
+      Repeat(sub, least, most, _) -> times(sub, least, most, hay, at, fuel - 1, then),
+      Capture(_, _, sub) -> accepted(sub, hay, at, fuel - 1, then),
+    }
+  }
+
+fn in_a_row(
+  items: List<Node>,
+  i: Int,
+  hay: Bytes,
+  at: Int,
+  fuel: Int,
+  then: (Int) -> Bool / {abort.raise},
+) -> Bool / {abort.raise} =
+  if fuel <= 0 { panic("a drawn pattern nests a little") } else {
+    match list_at(items, i) {
+      None -> then(at),
+      Some(n) ->
+        accepted(n, hay, at, fuel - 1, |next: Int|
+          in_a_row(items, i + 1, hay, next, fuel - 1, then)),
+    }
+  }
+
+/// `sub` from `least` to `most` times; a pass that takes nothing is not tried again, which
+/// loses no match.
+fn times(
+  sub: Node,
+  least: Int,
+  most: Int,
+  hay: Bytes,
+  at: Int,
+  fuel: Int,
+  then: (Int) -> Bool / {abort.raise},
+) -> Bool / {abort.raise} =
+  if fuel <= 0 { panic("a drawn pattern nests a little") } else if least > 0 {
+    accepted(sub, hay, at, fuel - 1, |next: Int|
+      times(sub, least - 1, if most < 0 { most } else { most - 1 }, hay, next, fuel - 1, then))
+  } else {
+    then(at)
+      || (most != 0
+      && accepted(sub, hay, at, fuel - 1, |next: Int|
+        next > at
+          && times(sub, 0, if most < 0 { most } else { most - 1 }, hay, next, fuel - 1, then)))
+  }
+
+law "a text is matched whole exactly when some way of reading the pattern's tree matches it" =
+  agrees(
+    |d: Drawn|
+      is_match(must("\\A(?:" ++ pattern_from(d.pattern, true) ++ ")\\z"), text_from(d.text)),
+    |d: Drawn| {
+      let hay = bytes_of_string(text_from(d.text));
+      accepted(inner(must(pattern_from(d.pattern, true))).tree, hay, 0, 2000, |end: Int|
+        end == bytes_len(hay))
+    },
+  )
+
+law "matches are in order, none overlaps another, and each is the pattern's whole match of its own text" =
+  agrees(
+    |d: Drawn| {
+      let text = text_from(d.text);
+      let whole = must("\\A(?:" ++ pattern_from(d.pattern, false) ++ ")\\z");
+      fold(
+        find_all(must(pattern_from(d.pattern, false)), text),
+        { ok: true, at: 0 },
+        |w: { ok: Bool, at: Int }, s: Span|
+          {
+            ok: w.ok && s.start >= w.at && s.end >= s.start && is_match(whole, slice(text, s)),
+            at: s.end,
+          },
+      ).ok
+    },
+    |_: Drawn| true,
+  )
+
+law "the parts a text is split into, with its matches between them, are the text" =
+  agrees(
+    |d: Drawn| {
+      let text = text_from(d.text);
+      let re = must(pattern_from(d.pattern, true));
+      let between = map(find_all(re, text), |s: Span| slice(text, s));
+      fold(enumerate(split(re, text)), "", |acc: String, part: { index: Int, value: String }|
+        acc ++ part.value ++ at_or(between, part.index, ""))
+    },
+    |d: Drawn| text_from(d.text),
+  )
+
+law "replacing every match with itself changes nothing" =
+  agrees(
+    |d: Drawn| {
+      let re = must(pattern_from(d.pattern, true));
+      replace_all(re, text_from(d.text), must_template(re, "$0"))
+        ++ replace_all_with(re, text_from(d.text), |c: Captures|
+          match group(c, 0) { Some(s) -> slice(text_from(d.text), s), None -> "" })
+    },
+    |d: Drawn| text_from(d.text) ++ text_from(d.text),
+  )
+
+law "a pattern as it reads back compiles to the program it compiled to" =
+  agrees(
+    |d: Drawn| {
+      let again = inner(must(printed(must(pattern_from(d.pattern, true)))));
+      { ahead: again.insts, back: again.tracer.insts, classes: again.finder.classes }
+    },
+    |d: Drawn| {
+      let first = inner(must(pattern_from(d.pattern, true)));
+      { ahead: first.insts, back: first.tracer.insts, classes: first.finder.classes }
+    },
+  )

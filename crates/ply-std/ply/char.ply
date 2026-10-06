@@ -1,0 +1,1001 @@
+//! Characters: what kind one is, its digit, and its other case.
+//!
+//! A `Char` is one Unicode scalar value, so every function here answers for every character, and
+//! none raises but the two that take a radix. Each predicate is one property of the Unicode
+//! Character Database, which its doc names, because languages differ exactly here: `is_numeric` is
+//! the General_Category N, as Rust's and Go's are and Python's `isnumeric` is not; `is_digit` is
+//! its decimal digits alone; `is_alphabetic` is the derived property Alphabetic, which holds of
+//! more than letters. The tables are `std.ucd`'s, of the Unicode version `std.ucd.version`
+//! answers. A code point that version assigns nothing to is `Unassigned` and has no property.
+//!
+//! An `is_ascii_` function is its Unicode form kept to ASCII: it reads no table and is false of
+//! every character past `U+007F`. The functions over all of Unicode answer an ASCII character
+//! the same way, and for any other read a table once, in steps that do not grow with anything.
+//!
+//! `to_uppercase`, `to_lowercase` and `to_titlecase` are the simple case mappings, one character
+//! to one. A character whose full mapping is several (`ß` to `SS`), or depends on what stands
+//! beside it (a final sigma) or on a language (a Turkish `i`), maps here to the one character the
+//! database gives for it alone, which may be itself. Those mappings and case folding are a
+//! string's to ask for: the builtins `string_upper` and `string_lower` map in full, and agree with
+//! these wherever they answer one character for one.
+
+import std.bytes (digit_value, int_of_ascii)
+import std.gen
+import std.gen (Gen)
+import std.laws (agrees, round_trip)
+import std.list (concat, count, find, flat_map)
+import std.math (to_radix_padded)
+import std.string (ascii_upper)
+import std.ucd
+import std.ucd (Table)
+
+// --- Categories -------------------------------------------------------------------
+
+/// A General_Category: the thirty kinds the Unicode Character Database sorts every code point
+/// into, under the names it gives them. `show` writes the two-letter abbreviation.
+pub type Category =
+  /// `Lu`: an uppercase letter.
+  | UppercaseLetter
+  /// `Ll`: a lowercase letter.
+  | LowercaseLetter
+  /// `Lt`: a digraph with its first part uppercase, as `U+01C5`.
+  | TitlecaseLetter
+  /// `Lm`: a modifier letter.
+  | ModifierLetter
+  /// `Lo`: any other letter, a syllable or an ideograph among them.
+  | OtherLetter
+  /// `Mn`: a mark that takes no room of its own, as a combining accent.
+  | NonspacingMark
+  /// `Mc`: a combining mark that takes room.
+  | SpacingMark
+  /// `Me`: a mark that encloses what it follows.
+  | EnclosingMark
+  /// `Nd`: a decimal digit.
+  | DecimalNumber
+  /// `Nl`: a number that looks like letters, as a Roman numeral.
+  | LetterNumber
+  /// `No`: any other number, a fraction or a superscript among them.
+  | OtherNumber
+  /// `Pc`: punctuation that joins, as `_`.
+  | ConnectorPunctuation
+  /// `Pd`: a dash or a hyphen.
+  | DashPunctuation
+  /// `Ps`: an opening bracket.
+  | OpenPunctuation
+  /// `Pe`: a closing bracket.
+  | ClosePunctuation
+  /// `Pi`: an opening quotation mark.
+  | InitialPunctuation
+  /// `Pf`: a closing quotation mark.
+  | FinalPunctuation
+  /// `Po`: any other punctuation.
+  | OtherPunctuation
+  /// `Sm`: a mathematical symbol.
+  | MathSymbol
+  /// `Sc`: a currency sign.
+  | CurrencySymbol
+  /// `Sk`: a modifier that stands alone, as `^`.
+  | ModifierSymbol
+  /// `So`: any other symbol.
+  | OtherSymbol
+  /// `Zs`: a space.
+  | SpaceSeparator
+  /// `Zl`: `U+2028`, the line separator.
+  | LineSeparator
+  /// `Zp`: `U+2029`, the paragraph separator.
+  | ParagraphSeparator
+  /// `Cc`: a control code.
+  | Control
+  /// `Cf`: a format control, which is not seen.
+  | Format
+  /// `Cs`: a surrogate code point, which no `Char` is.
+  | Surrogate
+  /// `Co`: a private-use character.
+  | PrivateUse
+  /// `Cn`: a code point this version of Unicode assigns no character to.
+  | Unassigned
+
+show for Category by abbreviation
+
+/// The seven classes the categories fall into, each the first letter of its categories'
+/// abbreviations.
+pub type Major =
+  /// `L`.
+  | Letter
+  /// `M`.
+  | Mark
+  /// `N`.
+  | Number
+  /// `P`.
+  | Punctuation
+  /// `S`.
+  | Symbol
+  /// `Z`.
+  | Separator
+  /// `C`: controls, surrogates, private-use characters and the unassigned.
+  | Other
+
+/// The class `category` falls in.
+pub fn major(category: Category) -> Major =
+  match category {
+    UppercaseLetter | LowercaseLetter | TitlecaseLetter | ModifierLetter | OtherLetter -> Letter,
+    NonspacingMark | SpacingMark | EnclosingMark -> Mark,
+    DecimalNumber | LetterNumber | OtherNumber -> Number,
+    ConnectorPunctuation | DashPunctuation | OpenPunctuation | ClosePunctuation -> Punctuation,
+    InitialPunctuation | FinalPunctuation | OtherPunctuation -> Punctuation,
+    MathSymbol | CurrencySymbol | ModifierSymbol | OtherSymbol -> Symbol,
+    SpaceSeparator | LineSeparator | ParagraphSeparator -> Separator,
+    Control | Format | Surrogate | PrivateUse | Unassigned -> Other,
+  }
+
+/// The two letters the Unicode Character Database abbreviates `category` to, `Lu` for
+/// `UppercaseLetter`.
+pub fn abbreviation(category: Category) -> String =
+  match category {
+    UppercaseLetter -> "Lu",
+    LowercaseLetter -> "Ll",
+    TitlecaseLetter -> "Lt",
+    ModifierLetter -> "Lm",
+    OtherLetter -> "Lo",
+    NonspacingMark -> "Mn",
+    SpacingMark -> "Mc",
+    EnclosingMark -> "Me",
+    DecimalNumber -> "Nd",
+    LetterNumber -> "Nl",
+    OtherNumber -> "No",
+    ConnectorPunctuation -> "Pc",
+    DashPunctuation -> "Pd",
+    OpenPunctuation -> "Ps",
+    ClosePunctuation -> "Pe",
+    InitialPunctuation -> "Pi",
+    FinalPunctuation -> "Pf",
+    OtherPunctuation -> "Po",
+    MathSymbol -> "Sm",
+    CurrencySymbol -> "Sc",
+    ModifierSymbol -> "Sk",
+    OtherSymbol -> "So",
+    SpaceSeparator -> "Zs",
+    LineSeparator -> "Zl",
+    ParagraphSeparator -> "Zp",
+    Control -> "Cc",
+    Format -> "Cf",
+    Surrogate -> "Cs",
+    PrivateUse -> "Co",
+    Unassigned -> "Cn",
+  }
+
+/// The category a class word numbers `number`, in the database's order; `Unassigned` for a number
+/// that is none.
+fn category_at(number: Int) -> Category =
+  match number {
+    0 -> UppercaseLetter,
+    1 -> LowercaseLetter,
+    2 -> TitlecaseLetter,
+    3 -> ModifierLetter,
+    4 -> OtherLetter,
+    5 -> NonspacingMark,
+    6 -> SpacingMark,
+    7 -> EnclosingMark,
+    8 -> DecimalNumber,
+    9 -> LetterNumber,
+    10 -> OtherNumber,
+    11 -> ConnectorPunctuation,
+    12 -> DashPunctuation,
+    13 -> OpenPunctuation,
+    14 -> ClosePunctuation,
+    15 -> InitialPunctuation,
+    16 -> FinalPunctuation,
+    17 -> OtherPunctuation,
+    18 -> MathSymbol,
+    19 -> CurrencySymbol,
+    20 -> ModifierSymbol,
+    21 -> OtherSymbol,
+    22 -> SpaceSeparator,
+    23 -> LineSeparator,
+    24 -> ParagraphSeparator,
+    25 -> Control,
+    26 -> Format,
+    27 -> Surrogate,
+    28 -> PrivateUse,
+    _ -> Unassigned,
+  }
+
+/// Every category, in the order the Unicode Character Database lists them.
+pub fn categories() -> List<Category> = map(range(0, 30), category_at)
+
+/// The category `text` abbreviates, as `Lu` does `UppercaseLetter`; `None` for any other text,
+/// one that differs only in case among them.
+pub fn category_named(text: String) -> Option<Category> =
+  find(categories(), |category: Category| abbreviation(category) == text)
+
+// --- The tables -------------------------------------------------------------------
+
+/// The bit of a class word that says Alphabetic. The word holds a category's number in its low
+/// five bits, then this bit and one for each property below, then four bits that are one more
+/// than a decimal digit's value, or zero.
+fn alphabetic() -> Int = 0x20
+
+fn lowercase() -> Int = 0x40
+
+fn uppercase() -> Int = 0x80
+
+fn white_space() -> Int = 0x100
+
+fn xid_start() -> Int = 0x200
+
+fn xid_continue() -> Int = 0x400
+
+/// The bit of the property a table's flag letter stands for.
+fn flag(letter: Int) -> Int / {abort.raise} =
+  match letter {
+    b'A' -> alphabetic(),
+    b'L' -> lowercase(),
+    b'U' -> uppercase(),
+    b'W' -> white_space(),
+    b'S' -> xid_start(),
+    b'C' -> xid_continue(),
+    _ -> panic("a class flags no property but A, L, U, W, S and C"),
+  }
+
+fn flags(letters: Bytes) -> Int / {abort.raise} =
+  fold(range(0, bytes_len(letters)), 0, |bits: Int, i: Int| bits | flag(bytes_at(letters, i)))
+
+/// The class word of one line of `ucd/classes.txt`: `category[;flags[;digit]]`.
+fn class_word(numbers: Map<Bytes, Int>, fields: List<Bytes>) -> Int / {abort.raise} = {
+  let numbered = |name: Bytes|
+    match map_get(numbers, name) {
+      Some(number) -> number,
+      None -> panic(f"`{string_of_bytes_lossy(name)}` abbreviates no category"),
+    };
+  match fields {
+    [name] -> numbered(name),
+    [name, letters] -> numbered(name) | flags(letters),
+    [name, letters, digit] -> match int_of_ascii(digit) {
+      Some(value) -> if value < 0 || value > 9 { panic("a decimal digit is 0 to 9") }
+      else { numbered(name) | flags(letters) | value + 1 << 11 },
+      None -> panic("a decimal digit is 0 to 9"),
+    },
+    _ -> panic("a class is a category, its flags and its digit"),
+  }
+}
+
+/// The class word of every code point, an unassigned one's being `Unassigned` and nothing more.
+const fn classes() -> Table = {
+  let numbers = fold(range(0, 30), map_new(), |known: Map<Bytes, Int>, number: Int|
+    map_insert(known, bytes_of_string(abbreviation(category_at(number))), number));
+  ucd::table(embed("ucd/classes.txt"), 29, |fields: List<Bytes>| class_word(numbers, fields))
+}
+
+fn class_of(c: Char) -> Int = ucd::lookup(classes(), int_of_char(c))
+
+fn holds(c: Char, property: Int) -> Bool = class_of(c) & property != 0
+
+/// A distance of a case mapping in twenty bits, two's complement.
+fn distance(text: Bytes) -> Int / {abort.raise} =
+  match int_of_ascii(text) {
+    Some(d) -> if d < -0x80000 || d > 0x7FFFF { panic("a case mapping lies within 2^19") }
+    else { d & 0xFFFFF },
+    None -> panic("a case mapping's distance is a number"),
+  }
+
+/// The case word of one line of `ucd/simple_case.txt`, `upper;lower;title`: the three distances,
+/// the uppercase one highest.
+fn case_word(fields: List<Bytes>) -> Int / {abort.raise} =
+  match fields {
+    [upper, lower, title] -> distance(upper) << 40 | distance(lower) << 20 | distance(title),
+    _ -> panic("a case mapping is three distances"),
+  }
+
+/// The case word of every code point, zero for one no mapping moves.
+const fn cases() -> Table = ucd::table(embed("ucd/simple_case.txt"), 0, case_word)
+
+/// The character `c` maps to by the distance its case word holds `shift` bits up.
+fn mapped(c: Char, shift: Int) -> Char = {
+  let field = ucd::lookup(cases(), int_of_char(c)) >> shift & 0xFFFFF;
+  match char_of_int(int_of_char(c) + (field ^ 0x80000) - 0x80000) { Some(to) -> to, None -> c }
+}
+
+// --- ASCII ------------------------------------------------------------------------
+
+/// Whether `c` is one of the 128 ASCII characters, `U+0000` to `U+007F`.
+pub fn is_ascii(c: Char) -> Bool = c <= '\u{7F}'
+
+/// Whether `c` is an ASCII capital, `A` to `Z`: `is_uppercase` kept to ASCII.
+pub fn is_ascii_uppercase(c: Char) -> Bool = 'A' <= c && c <= 'Z'
+
+/// Whether `c` is an ASCII small letter, `a` to `z`: `is_lowercase` kept to ASCII.
+pub fn is_ascii_lowercase(c: Char) -> Bool = 'a' <= c && c <= 'z'
+
+/// Whether `c` is an ASCII letter of either case: `is_alphabetic`, and `is_letter`, kept to ASCII.
+pub fn is_ascii_alphabetic(c: Char) -> Bool = is_ascii_uppercase(c) || is_ascii_lowercase(c)
+
+/// Whether `c` is one of `0` to `9`: `is_digit`, and `is_numeric`, kept to ASCII, whose only
+/// numbers are its decimal digits.
+pub fn is_ascii_digit(c: Char) -> Bool = '0' <= c && c <= '9'
+
+/// Whether `c` is an ASCII letter or digit: `is_alphanumeric` kept to ASCII.
+pub fn is_ascii_alphanumeric(c: Char) -> Bool = is_ascii_alphabetic(c) || is_ascii_digit(c)
+
+/// Whether `c` is a digit of radix sixteen in either case: `0` to `9`, `a` to `f` or `A` to `F`.
+pub fn is_ascii_hexdigit(c: Char) -> Bool =
+  is_ascii_digit(c) || ('a' <= c && c <= 'f') || ('A' <= c && c <= 'F')
+
+/// Whether `c` is a space, a tab, a line feed, a vertical tab, a form feed or a carriage return:
+/// `is_whitespace` kept to ASCII. The vertical tab is among them, as it is in White_Space and is
+/// not in some languages' ASCII sets.
+pub fn is_ascii_whitespace(c: Char) -> Bool = c == ' ' || ('\t' <= c && c <= '\r')
+
+/// Whether `c` is `U+0000` to `U+001F` or `U+007F`: `is_control` kept to ASCII.
+pub fn is_ascii_control(c: Char) -> Bool = c < ' ' || c == '\u{7F}'
+
+/// Whether `c` is one of the 32 ASCII characters that are seen and are neither letters nor digits:
+/// those `is_punctuation` or `is_symbol` holds of, kept to ASCII, as C's `ispunct` reads them.
+pub fn is_ascii_punctuation(c: Char) -> Bool =
+  ('!' <= c && c <= '/') || (':' <= c && c <= '@') || ('[' <= c && c <= '`')
+    || ('{' <= c && c <= '~')
+
+/// `c` as an ASCII capital where it is an ASCII small letter, and `c` itself otherwise.
+pub fn to_ascii_uppercase(c: Char) -> Char =
+  if is_ascii_lowercase(c) {
+    match char_of_int(int_of_char(c) - 32) { Some(upper) -> upper, None -> c }
+  } else { c }
+
+/// `c` as an ASCII small letter where it is an ASCII capital, and `c` itself otherwise.
+pub fn to_ascii_lowercase(c: Char) -> Char =
+  if is_ascii_uppercase(c) {
+    match char_of_int(int_of_char(c) + 32) { Some(lower) -> lower, None -> c }
+  } else { c }
+
+/// The category of the ASCII character whose code point is `code`.
+fn ascii_category(code: Int) -> Category =
+  match code {
+    b'a'..=b'z' -> LowercaseLetter,
+    b'A'..=b'Z' -> UppercaseLetter,
+    b'0'..=b'9' -> DecimalNumber,
+    b' ' -> SpaceSeparator,
+    0..=31 | 127 -> Control,
+    b'_' -> ConnectorPunctuation,
+    b'-' -> DashPunctuation,
+    b'(' | b'[' | b'{' -> OpenPunctuation,
+    b')' | b']' | b'}' -> ClosePunctuation,
+    b'$' -> CurrencySymbol,
+    b'+' | b'<' | b'=' | b'>' | b'|' | b'~' -> MathSymbol,
+    b'^' | b'`' -> ModifierSymbol,
+    _ -> OtherPunctuation,
+  }
+
+// --- What kind a character is -----------------------------------------------------
+
+/// The General_Category of `c`. Never `Surrogate`.
+pub fn general_category(c: Char) -> Category =
+  if is_ascii(c) { ascii_category(int_of_char(c)) } else { category_at(class_of(c) & 31) }
+
+/// Whether `c` is Alphabetic: a letter of any kind, a letter number such as a Roman numeral, or
+/// one of the marks and symbols the database counts as alphabetic, as a vowel sign that is part of
+/// a word.
+pub fn is_alphabetic(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_alphabetic(c) } else { holds(c, alphabetic()) }
+
+/// Whether `c` is a number of any kind, the General_Category N: a decimal digit, a letter number
+/// or another number such as a fraction. An ideograph that names a number is a letter, and is not
+/// one of these.
+pub fn is_numeric(c: Char) -> Bool = major(general_category(c)) == Number
+
+/// Whether `c` is Alphabetic or a number: `is_alphabetic` or `is_numeric`.
+pub fn is_alphanumeric(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_alphanumeric(c) } else {
+    let word = class_of(c);
+    word & alphabetic() != 0 || major(category_at(word & 31)) == Number
+  }
+
+/// Whether `c` is White_Space: a space of any width, a tab, or a line or paragraph break. A
+/// zero-width space is not.
+pub fn is_whitespace(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_whitespace(c) } else { holds(c, white_space()) }
+
+/// Whether `c` is Uppercase: an uppercase letter, or another character the database counts as
+/// one, as a circled capital. A titlecase letter is neither Uppercase nor Lowercase.
+pub fn is_uppercase(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_uppercase(c) } else { holds(c, uppercase()) }
+
+/// Whether `c` is Lowercase: a lowercase letter, or another character the database counts as
+/// one, as a feminine ordinal or a small modifier letter.
+pub fn is_lowercase(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_lowercase(c) } else { holds(c, lowercase()) }
+
+/// Whether `c` is a control code, the General_Category Cc: `U+0000` to `U+001F` and `U+007F` to
+/// `U+009F`.
+pub fn is_control(c: Char) -> Bool = general_category(c) == Control
+
+/// Whether `c` is a letter, the General_Category L. Narrower than `is_alphabetic`.
+pub fn is_letter(c: Char) -> Bool = major(general_category(c)) == Letter
+
+/// Whether `c` is a combining mark, the General_Category M.
+pub fn is_mark(c: Char) -> Bool = major(general_category(c)) == Mark
+
+/// Whether `c` is a decimal digit of any script, the General_Category Nd: a character
+/// `decimal_value` has an answer for.
+pub fn is_digit(c: Char) -> Bool = general_category(c) == DecimalNumber
+
+/// Whether `c` is punctuation, the General_Category P. `+`, `$` and `^` are symbols.
+pub fn is_punctuation(c: Char) -> Bool = major(general_category(c)) == Punctuation
+
+/// Whether `c` is a symbol, the General_Category S.
+pub fn is_symbol(c: Char) -> Bool = major(general_category(c)) == Symbol
+
+/// Whether `c` is a separator, the General_Category Z: a space, or the line or paragraph
+/// separator. A tab and a line feed are controls.
+pub fn is_separator(c: Char) -> Bool = major(general_category(c)) == Separator
+
+/// Whether this version of Unicode assigns `c` a character: any General_Category but Cn. A
+/// private-use character is assigned.
+pub fn is_assigned(c: Char) -> Bool = general_category(c) != Unassigned
+
+/// Whether `c` is XID_Start, what Unicode's identifier syntax lets a name begin with: a letter, a
+/// letter number, or one of the few characters the database adds to them. `_` is not.
+pub fn is_xid_start(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_alphabetic(c) } else { holds(c, xid_start()) }
+
+/// Whether `c` is XID_Continue, what Unicode's identifier syntax lets a name go on with: what
+/// begins one, and digits, marks and joining punctuation such as `_`.
+pub fn is_xid_continue(c: Char) -> Bool =
+  if is_ascii(c) { is_ascii_alphanumeric(c) || c == '_' } else { holds(c, xid_continue()) }
+
+// --- Digits -----------------------------------------------------------------------
+
+/// The value of `c` as a digit of `radix`: `0` to `9`, then `a` to `z` in either case for ten to
+/// thirty-five. `None` for a character that is no digit of the radix, a digit of another script
+/// among them. Raises for a radix outside `2..=36`.
+pub fn to_digit(c: Char, radix: Int) -> Option<Int> / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") } else {
+    let value = digit_value(int_of_char(c));
+    if value >= 0 && value < radix { Some(value) } else { None }
+  }
+
+/// The digit of `radix` whose value is `n`, a small letter from ten on; `None` for an `n` the
+/// radix has no digit for. Raises for a radix outside `2..=36`.
+pub fn of_digit(n: Int, radix: Int) -> Option<Char> / {abort.raise} =
+  if radix < 2 || radix > 36 { panic("a radix is 2 to 36") }
+  else if n < 0 || n >= radix { None }
+  else { char_of_int(if n < 10 { 48 + n } else { 87 + n }) }
+
+/// The value of `c` as a decimal digit of its script, `3` for `U+0663`: Numeric_Type Decimal,
+/// which is the characters `is_digit` holds of. `None` for any other character, a superscript
+/// digit, a fraction and a Roman numeral among them.
+pub fn decimal_value(c: Char) -> Option<Int> =
+  if is_ascii(c) { if is_ascii_digit(c) { Some(int_of_char(c) - 48) } else { None } } else {
+    let digit = class_of(c) >> 11 & 15;
+    if digit == 0 { None } else { Some(digit - 1) }
+  }
+
+// --- Case -------------------------------------------------------------------------
+
+/// The simple uppercase mapping of `c`: one character, `c` itself where it has none.
+pub fn to_uppercase(c: Char) -> Char =
+  if is_ascii(c) { to_ascii_uppercase(c) } else { mapped(c, 40) }
+
+/// The simple lowercase mapping of `c`: one character, `c` itself where it has none.
+pub fn to_lowercase(c: Char) -> Char =
+  if is_ascii(c) { to_ascii_lowercase(c) } else { mapped(c, 20) }
+
+/// The simple titlecase mapping of `c`, the form that begins a capitalized word: its uppercase
+/// for nearly every character, and the titlecase letter for a digraph that has one.
+pub fn to_titlecase(c: Char) -> Char =
+  if is_ascii(c) { to_ascii_uppercase(c) } else { mapped(c, 0) }
+
+// --- Code points ------------------------------------------------------------------
+
+/// The Unicode scalar value of `c`: `0` to `0x10FFFF`, never a surrogate.
+pub fn code_point(c: Char) -> Int = int_of_char(c)
+
+/// The character whose scalar value is `n`; `None` for a surrogate (`0xD800` to `0xDFFF`), a
+/// negative number and one past `0x10FFFF`.
+pub fn of_code_point(n: Int) -> Option<Char> = char_of_int(n)
+
+/// How many bytes `c` takes in UTF-8: one to four.
+pub fn utf8_len(c: Char) -> Int =
+  if c < '\u{80}' { 1 } else if c < '\u{800}' { 2 } else if c < '\u{10000}' { 3 } else { 4 }
+
+/// How many sixteen-bit units `c` takes in UTF-16: two for a character past `U+FFFF`, which is
+/// written as a surrogate pair, and one for any other.
+pub fn utf16_len(c: Char) -> Int = if c < '\u{10000}' { 1 } else { 2 }
+
+// --- Drawing characters -----------------------------------------------------------
+
+/// The character at `n`, and `U+FFFD` where `n` is a surrogate or no code point.
+fn scalar(n: Int) -> Char = match char_of_int(n) { Some(c) -> c, None -> '\u{FFFD}' }
+
+/// The characters a claim most easily gets wrong: either side of each change in a character's
+/// encoded length and of the surrogates, the first and last code point of every plane, and the
+/// characters whose case mappings do not pair off.
+fn edges() -> List<Char> =
+  concat(
+    string_chars(
+      "\u{7F}\u{80}\u{7FF}\u{800}\u{D7FF}\u{E000}\u{DF}\u{130}\u{131}\u{17F}\u{1C5}\u{345}\u{3C2}\u{3F4}\u{10D0}\u{1E9E}\u{1F88}\u{2126}\u{212A}\u{24B6}\u{A7AE}\u{10400}\u{1E922}",
+    ),
+    flat_map(range(0, 17), |plane: Int| [scalar(plane << 16), scalar(plane << 16 | 0xFFFF)]),
+  )
+
+/// A character from anywhere in Unicode, for a claim over characters: an ASCII one, one of the
+/// scripts below `U+3000` where most cased letters are, one of the characters at an edge (the
+/// ends of each plane and of each encoded length, and the letters whose case mappings do not
+/// pair off), or any code point of any of the seventeen planes, each a quarter of the time. It
+/// shrinks toward ASCII.
+pub fn arbitrary() -> Gen<Char> =
+  gen::one_of([
+    gen::map(gen::int_between(0, 0x7F), scalar),
+    gen::map(gen::int_between(0x80, 0x2FFF), scalar),
+    gen::elements(edges()),
+    gen::map2(gen::below(17), gen::below(0x10000), |plane: Int, low: Int|
+      scalar(plane << 16 | low)),
+  ])
+
+/// The character `arbitrary` draws for `seed`, which is how this module's laws draw one: a `Char`
+/// drawn by its type alone is an ASCII letter nearly every time, and a type stating the generator
+/// would hand it to every program that imports this module.
+fn drawn(seed: Int) -> Char / {abort.raise} =
+  match gen::sample(arbitrary(), 0, bytes_of_string(int_to_string(seed)), 32, None).value {
+    Some(c) -> c,
+    None -> panic("the generator gave up"),
+  }
+
+// --- Laws -------------------------------------------------------------------------
+
+law "a category's abbreviation names it" = round_trip(abbreviation, category_named)
+
+law "a character is the character of its code point"
+  forall (seed: Int) {
+    of_code_point(code_point(drawn(seed))) == Some(drawn(seed))
+  }
+
+law "is_ascii_alphabetic is is_alphabetic kept to ASCII" =
+  agrees(|seed: Int| is_ascii_alphabetic(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_alphabetic(drawn(seed)))
+
+law "is_ascii_alphabetic is is_letter kept to ASCII" =
+  agrees(|seed: Int| is_ascii_alphabetic(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_letter(drawn(seed)))
+
+law "is_ascii_digit is is_numeric kept to ASCII" =
+  agrees(|seed: Int| is_ascii_digit(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_numeric(drawn(seed)))
+
+law "is_ascii_digit is is_digit kept to ASCII" =
+  agrees(|seed: Int| is_ascii_digit(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_digit(drawn(seed)))
+
+law "is_ascii_alphanumeric is is_alphanumeric kept to ASCII" =
+  agrees(|seed: Int| is_ascii_alphanumeric(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_alphanumeric(drawn(seed)))
+
+law "is_ascii_whitespace is is_whitespace kept to ASCII" =
+  agrees(|seed: Int| is_ascii_whitespace(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_whitespace(drawn(seed)))
+
+law "is_ascii_uppercase is is_uppercase kept to ASCII" =
+  agrees(|seed: Int| is_ascii_uppercase(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_uppercase(drawn(seed)))
+
+law "is_ascii_lowercase is is_lowercase kept to ASCII" =
+  agrees(|seed: Int| is_ascii_lowercase(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_lowercase(drawn(seed)))
+
+law "is_ascii_control is is_control kept to ASCII" =
+  agrees(|seed: Int| is_ascii_control(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && is_control(drawn(seed)))
+
+law "is_ascii_punctuation is is_punctuation or is_symbol kept to ASCII" =
+  agrees(|seed: Int| is_ascii_punctuation(drawn(seed)), |seed: Int|
+    is_ascii(drawn(seed)) && (is_punctuation(drawn(seed)) || is_symbol(drawn(seed))))
+
+law "the ASCII case mappings are the simple ones kept to ASCII"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    to_ascii_uppercase(c) == (if is_ascii(c) { to_uppercase(c) } else { c })
+      && to_ascii_lowercase(c) == (if is_ascii(c) { to_lowercase(c) } else { c })
+  }
+
+law "a character is of one major class, the one its category falls in"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    let of_a_class = count(
+      [is_letter(c), is_mark(c), is_numeric(c), is_punctuation(c), is_symbol(c), is_separator(c)],
+      |yes: Bool| yes,
+    );
+    of_a_class == (if major(general_category(c)) == Other { 0 } else { 1 })
+      && is_control(c) == (general_category(c) == Control)
+      && is_assigned(c) == (general_category(c) != Unassigned)
+  }
+
+law "what is uppercase, lowercase or a letter is alphabetic, and nothing is of both cases"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    (is_alphabetic(c) || !(is_uppercase(c) || is_lowercase(c) || is_letter(c)))
+      && !(is_uppercase(c) && is_lowercase(c))
+      && is_alphanumeric(c) == (is_alphabetic(c) || is_numeric(c))
+  }
+
+law "what begins an identifier continues one, and an unassigned code point has no property"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    (is_xid_continue(c) || !is_xid_start(c))
+      && (is_assigned(c)
+      || !(is_alphabetic(c) || is_whitespace(c) || is_uppercase(c) || is_lowercase(c)
+        || is_xid_continue(c)))
+  }
+
+law "a decimal digit has a value, and nothing else has"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    match decimal_value(c) {
+      Some(value) -> is_digit(c) && value >= 0 && value <= 9,
+      None -> !is_digit(c),
+    }
+  }
+
+law "a digit written in a radix reads back in it"
+  forall (n: Int, r: Int) {
+    let radix = 2 + (r % 35 + 35) % 35;
+    let digit = (n % radix + radix) % radix;
+    match of_digit(digit, radix) { Some(c) -> to_digit(c, radix) == Some(digit), None -> false }
+  }
+
+law "a digit read in a radix is written back as its small letter"
+  forall (seed: Int) {
+    match to_digit(drawn(seed), 36) {
+      Some(n) -> of_digit(n, 36) == Some(to_ascii_lowercase(drawn(seed))),
+      None -> true,
+    }
+  }
+
+law "a case mapping answers a character it does not move again"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    to_uppercase(to_uppercase(c)) == to_uppercase(c)
+      && to_lowercase(to_lowercase(c)) == to_lowercase(c)
+      && to_titlecase(to_titlecase(c)) == to_titlecase(c)
+  }
+
+law "a case mapping moves only a character of the other case, or a titlecase letter"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    let titled = general_category(c) == TitlecaseLetter;
+    (to_uppercase(c) == c || is_lowercase(c) || titled)
+      && (to_lowercase(c) == c || is_uppercase(c) || titled)
+      && (to_titlecase(c) == c || is_lowercase(c) || is_uppercase(c))
+  }
+
+// `to_lowercase(to_uppercase(c)) == c` is false of the lowercase characters whose uppercase is
+// another's too, as the long s and the final sigma, so the claim is over the pairs.
+law "two characters that map to each other are a lowercase one and one that is not"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    let upper = to_uppercase(c);
+    let lower = to_lowercase(c);
+    (upper == c || to_lowercase(upper) != c || (is_lowercase(c) && !is_lowercase(upper)))
+      && (lower == c || to_uppercase(lower) != c || (!is_lowercase(c) && is_lowercase(lower)))
+  }
+
+law "the uppercase of a titlecase mapping is the uppercase mapping"
+  forall (seed: Int) {
+    to_uppercase(to_titlecase(drawn(seed))) == to_uppercase(drawn(seed))
+  }
+
+law "string_upper and string_lower, where they answer one character for one, answer the simple mappings"
+  forall (seed: Int) {
+    let c = drawn(seed);
+    let upper = string_upper(string_of_chars([c]));
+    let lower = string_lower(string_of_chars([c]));
+    (string_len(upper) != 1 || upper == string_of_chars([to_uppercase(c)]))
+      && (string_len(lower) != 1 || lower == string_of_chars([to_lowercase(c)]))
+  }
+
+law "utf8_len is the bytes a character takes" =
+  agrees(|seed: Int| utf8_len(drawn(seed)), |seed: Int|
+    bytes_len(bytes_of_string(string_of_chars([drawn(seed)]))))
+
+// A size is a code point past ASCII, from `U+010F` to plane sixteen: a table is read at each.
+law "a character is classified in the same steps wherever its code point lies"
+  forall (n: Int) where n > 0 cost 1 {
+    let c = scalar(n * 271);
+    {
+      category: general_category(c),
+      major: [is_letter(c), is_mark(c), is_numeric(c), is_punctuation(c), is_symbol(c)],
+      kind: [is_separator(c), is_control(c), is_digit(c), is_assigned(c)],
+      held: [is_alphabetic(c), is_whitespace(c), is_uppercase(c), is_lowercase(c)],
+      names: [is_xid_start(c), is_xid_continue(c)],
+      digit: decimal_value(c),
+    }
+  }
+
+law "a character is mapped to each case in the same steps wherever its code point lies"
+  forall (n: Int) where n > 0 cost 1 {
+    let c = scalar(n * 271);
+    [to_uppercase(c), to_lowercase(c), to_titlecase(c)]
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+type Sample = { c: Char, category: Category }
+
+fn samples() -> List<Sample> =
+  [
+    { c: 'A', category: UppercaseLetter },
+    { c: '\u{3A3}', category: UppercaseLetter },
+    { c: 'a', category: LowercaseLetter },
+    { c: '\u{DF}', category: LowercaseLetter },
+    { c: '\u{1C5}', category: TitlecaseLetter },
+    { c: '\u{2B0}', category: ModifierLetter },
+    { c: '\u{AA}', category: OtherLetter },
+    { c: '\u{4E2D}', category: OtherLetter },
+    { c: '\u{301}', category: NonspacingMark },
+    { c: '\u{903}', category: SpacingMark },
+    { c: '\u{20DD}', category: EnclosingMark },
+    { c: '5', category: DecimalNumber },
+    { c: '\u{663}', category: DecimalNumber },
+    { c: '\u{2167}', category: LetterNumber },
+    { c: '\u{BD}', category: OtherNumber },
+    { c: '_', category: ConnectorPunctuation },
+    { c: '-', category: DashPunctuation },
+    { c: '(', category: OpenPunctuation },
+    { c: ')', category: ClosePunctuation },
+    { c: '\u{AB}', category: InitialPunctuation },
+    { c: '\u{BB}', category: FinalPunctuation },
+    { c: '!', category: OtherPunctuation },
+    { c: '+', category: MathSymbol },
+    { c: '$', category: CurrencySymbol },
+    { c: '^', category: ModifierSymbol },
+    { c: '\u{A9}', category: OtherSymbol },
+    { c: ' ', category: SpaceSeparator },
+    { c: '\u{3000}', category: SpaceSeparator },
+    { c: '\u{2028}', category: LineSeparator },
+    { c: '\u{2029}', category: ParagraphSeparator },
+    { c: '\n', category: Control },
+    { c: '\u{85}', category: Control },
+    { c: '\u{AD}', category: Format },
+    { c: '\u{E000}', category: PrivateUse },
+    { c: '\u{10FFFD}', category: PrivateUse },
+    { c: '\u{378}', category: Unassigned },
+    { c: '\u{10FFFF}', category: Unassigned },
+  ]
+
+/// A character as its code point is written, `U+00E9`.
+fn spelled(c: Char) -> String / {abort.raise} =
+  "U+" ++ ascii_upper(to_radix_padded(int_of_char(c), 16, 4))
+
+test "{spelled(s.c)} is {s.category}" for s: Sample in samples() {
+  assert_eq(general_category(s.c), s.category)
+}
+
+test "every category but the surrogates' is some character's, and each is listed once" {
+  let sampled = map(samples(), |s: Sample| s.category);
+  assert_eq(
+    filter(categories(), |category: Category| count(sampled, |c: Category| c == category) == 0),
+    [Surrogate],
+  );
+  assert_eq(len(categories()), 30);
+  assert_eq(
+    map(categories(), |category: Category| count(categories(), |c: Category| c == category)),
+    map(range(0, 30), |_: Int| 1),
+  );
+  assert_eq(f"{general_category('A')}", "Lu");
+  assert_eq(category_named("Lu"), Some(UppercaseLetter));
+  assert_eq(category_named("lu"), None);
+  assert_eq(category_named("L"), None)
+}
+
+/// Every ASCII character.
+fn ascii() -> List<Char> = map(range(0, 128), scalar)
+
+// An ASCII character never reaches a table, so its answers are written twice: here they are held
+// to what the tables say of it.
+test "an ASCII character is answered as the tables would answer it" {
+  let unlike = filter(ascii(), |c: Char| {
+    let word = class_of(c);
+    general_category(c) != category_at(word & 31) || is_alphabetic(c) != holds(c, alphabetic())
+      || is_lowercase(c) != holds(c, lowercase())
+      || is_uppercase(c) != holds(c, uppercase())
+      || is_whitespace(c) != holds(c, white_space())
+      || is_xid_start(c) != holds(c, xid_start())
+      || is_xid_continue(c) != holds(c, xid_continue())
+      || is_alphanumeric(c) != (is_alphabetic(c) || is_numeric(c))
+      || decimal_value(c) != (if word >> 11 & 15 == 0 { None } else { Some((word >> 11 & 15) - 1) })
+      || to_uppercase(c) != mapped(c, 40)
+      || to_lowercase(c) != mapped(c, 20)
+      || to_titlecase(c) != mapped(c, 0)
+  });
+  assert_eq(unlike, [])
+}
+
+test "each ASCII predicate holds of the characters it names and of no other" {
+  let of = |named: (Char) -> Bool| string_of_chars(filter(ascii(), named));
+  assert_eq(of(is_ascii_uppercase), "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+  assert_eq(of(is_ascii_lowercase), "abcdefghijklmnopqrstuvwxyz");
+  assert_eq(of(is_ascii_digit), "0123456789");
+  assert_eq(of(is_ascii_hexdigit), "0123456789ABCDEFabcdef");
+  assert_eq(of(is_ascii_whitespace), "\t\n\u{B}\u{C}\r ");
+  assert_eq(of(is_ascii_punctuation), "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~");
+  assert_eq(len(filter(ascii(), is_ascii_control)), 33);
+  assert_eq(len(filter(ascii(), is_ascii_alphanumeric)), 62);
+  assert_eq(len(filter(ascii(), is_ascii)), 128);
+  assert(!is_ascii('\u{80}') && !is_ascii_alphabetic('\u{E9}') && !is_ascii_digit('\u{663}'))
+}
+
+test "a property holds of more than its category's letters" {
+  assert(is_alphabetic('\u{2167}') && !is_letter('\u{2167}'));
+  assert(is_alphabetic('\u{345}') && is_mark('\u{345}'));
+  assert(is_alphabetic('\u{4E2D}') && !is_uppercase('\u{4E2D}') && !is_lowercase('\u{4E2D}'));
+  assert(is_uppercase('\u{24B6}') && is_symbol('\u{24B6}'));
+  assert(is_lowercase('\u{AA}') && general_category('\u{AA}') == OtherLetter);
+  assert(!is_uppercase('\u{1C5}') && !is_lowercase('\u{1C5}') && is_letter('\u{1C5}'));
+  assert(is_numeric('\u{BD}') && !is_digit('\u{BD}') && is_alphanumeric('\u{BD}'));
+  assert(!is_numeric('\u{4E09}') && is_letter('\u{4E09}'));
+  assert(is_whitespace('\u{A0}') && is_whitespace('\u{2028}') && is_whitespace('\u{85}'));
+  assert(!is_whitespace('\u{200B}') && !is_separator('\u{200B}'));
+  assert(is_separator(' ') && !is_separator('\t') && is_control('\t'));
+  assert(is_punctuation('\u{2014}') && is_symbol('\u{20AC}') && !is_punctuation('+'));
+  assert(is_assigned('\u{E000}') && !is_assigned('\u{378}') && !is_alphabetic('\u{378}'))
+}
+
+test "an identifier begins with a letter and goes on with letters, digits, marks and `_`" {
+  assert(is_xid_start('x') && is_xid_start('\u{E9}') && is_xid_start('\u{4E2D}'));
+  assert(!is_xid_start('_') && !is_xid_start('7') && !is_xid_start('\u{301}'));
+  assert(is_xid_continue('_') && is_xid_continue('7') && is_xid_continue('\u{301}'));
+  assert(is_xid_continue('\u{663}') && !is_xid_continue('-') && !is_xid_continue(' '))
+}
+
+test "a digit of a radix is 0-9 and then the letters, in either case" {
+  assert_eq(to_digit('7', 10), Some(7));
+  assert_eq(to_digit('7', 7), None);
+  assert_eq(to_digit('f', 16), Some(15));
+  assert_eq(to_digit('F', 16), Some(15));
+  assert_eq(to_digit('g', 16), None);
+  assert_eq(to_digit('z', 36), Some(35));
+  assert_eq(to_digit('\u{663}', 10), None);
+  assert_eq(of_digit(7, 10), Some('7'));
+  assert_eq(of_digit(15, 16), Some('f'));
+  assert_eq(of_digit(35, 36), Some('z'));
+  assert_eq(of_digit(16, 16), None);
+  assert_eq(of_digit(-1, 10), None);
+  let pairs = flat_map(range(2, 37), |radix: Int|
+    map(range(0, radix), |n: Int| { n: n, radix: radix }));
+  assert_eq(
+    filter(pairs, |p: { n: Int, radix: Int }|
+      match of_digit(p.n, p.radix) { Some(c) -> to_digit(c, p.radix) != Some(p.n), None -> true }),
+    [],
+  )
+}
+
+test "a radix of {radix} is refused" for radix: Int in [-1, 0, 1, 37] {
+  assert_eq(try[abort.raise] { to_digit('1', radix) }, Err("a radix is 2 to 36"));
+  assert_eq(try[abort.raise] { of_digit(1, radix) }, Err("a radix is 2 to 36"))
+}
+
+test "a decimal digit of any script has its value, and no other number has one" {
+  assert_eq(decimal_value('7'), Some(7));
+  assert_eq(decimal_value('\u{663}'), Some(3));
+  assert_eq(decimal_value('\u{FF19}'), Some(9));
+  assert_eq(decimal_value('\u{1D7D8}'), Some(0));
+  assert_eq(decimal_value('\u{B2}'), None);
+  assert_eq(decimal_value('\u{BD}'), None);
+  assert_eq(decimal_value('\u{2167}'), None);
+  assert_eq(decimal_value('a'), None)
+}
+
+type Cased = { c: Char, upper: Char, lower: Char, title: Char }
+
+fn cased() -> List<Cased> =
+  [
+    { c: 'a', upper: 'A', lower: 'a', title: 'A' },
+    { c: 'Z', upper: 'Z', lower: 'z', title: 'Z' },
+    { c: '7', upper: '7', lower: '7', title: '7' },
+    { c: '\u{E9}', upper: '\u{C9}', lower: '\u{E9}', title: '\u{C9}' },
+    { c: '\u{FF}', upper: '\u{178}', lower: '\u{FF}', title: '\u{178}' },
+    { c: '\u{DF}', upper: '\u{DF}', lower: '\u{DF}', title: '\u{DF}' },
+    { c: '\u{1E9E}', upper: '\u{1E9E}', lower: '\u{DF}', title: '\u{1E9E}' },
+    { c: '\u{130}', upper: '\u{130}', lower: 'i', title: '\u{130}' },
+    { c: '\u{131}', upper: 'I', lower: '\u{131}', title: 'I' },
+    { c: '\u{3A3}', upper: '\u{3A3}', lower: '\u{3C3}', title: '\u{3A3}' },
+    { c: '\u{3C2}', upper: '\u{3A3}', lower: '\u{3C2}', title: '\u{3A3}' },
+    { c: '\u{1C4}', upper: '\u{1C4}', lower: '\u{1C6}', title: '\u{1C5}' },
+    { c: '\u{1C5}', upper: '\u{1C4}', lower: '\u{1C6}', title: '\u{1C5}' },
+    { c: '\u{1C6}', upper: '\u{1C4}', lower: '\u{1C6}', title: '\u{1C5}' },
+    { c: '\u{10D0}', upper: '\u{1C90}', lower: '\u{10D0}', title: '\u{10D0}' },
+    { c: '\u{212A}', upper: '\u{212A}', lower: 'k', title: '\u{212A}' },
+    { c: '\u{A7AE}', upper: '\u{A7AE}', lower: '\u{26A}', title: '\u{A7AE}' },
+    { c: '\u{10428}', upper: '\u{10400}', lower: '\u{10428}', title: '\u{10400}' },
+    { c: '\u{1E900}', upper: '\u{1E900}', lower: '\u{1E922}', title: '\u{1E900}' },
+    { c: '\u{4E2D}', upper: '\u{4E2D}', lower: '\u{4E2D}', title: '\u{4E2D}' },
+    { c: '\u{10FFFF}', upper: '\u{10FFFF}', lower: '\u{10FFFF}', title: '\u{10FFFF}' },
+  ]
+
+test "{spelled(k.c)} maps to its one character of each case" for k: Cased in cased() {
+  assert_eq(to_uppercase(k.c), k.upper);
+  assert_eq(to_lowercase(k.c), k.lower);
+  assert_eq(to_titlecase(k.c), k.title)
+}
+
+test "the ASCII mappings move ASCII letters and nothing else" {
+  assert_eq(
+    string_of_chars(map(string_chars("aZ9_\u{E9}\u{C9}"), to_ascii_uppercase)),
+    "AZ9_\u{E9}\u{C9}",
+  );
+  assert_eq(
+    string_of_chars(map(string_chars("aZ9_\u{E9}\u{C9}"), to_ascii_lowercase)),
+    "az9_\u{E9}\u{C9}",
+  )
+}
+
+/// Every character there is.
+fn scalars() -> List<Char> =
+  fold(range(0, 0x110000), [], |all: List<Char>, n: Int|
+    match char_of_int(n) { Some(c) -> push(all, c), None -> all })
+
+// The builtins map by the runtime's tables and these by the files under `ucd/`: one that moves
+// to another version of Unicode without the other fails here.
+test "over every character, string_upper and string_lower answer the simple mappings where they answer one character" {
+  let unlike = filter(scalars(), |c: Char| {
+    let upper = string_upper(string_of_chars([c]));
+    let lower = string_lower(string_of_chars([c]));
+    (string_len(upper) == 1 && upper != string_of_chars([to_uppercase(c)]))
+      || (string_len(lower) == 1 && lower != string_of_chars([to_lowercase(c)]))
+  });
+  assert_eq(unlike, [])
+}
+
+test "a character's length in UTF-8 and UTF-16 changes where the encodings do" {
+  assert_eq(
+    map(
+      ['\0', '\u{7F}', '\u{80}', '\u{7FF}', '\u{800}', '\u{FFFF}', '\u{10000}', '\u{10FFFF}'],
+      utf8_len,
+    ),
+    [1, 1, 2, 2, 3, 3, 4, 4],
+  );
+  assert_eq(
+    map(['\0', '\u{D7FF}', '\u{E000}', '\u{FFFF}', '\u{10000}', '\u{10FFFF}'], utf16_len),
+    [1, 1, 1, 1, 2, 2],
+  )
+}
+
+test "a code point is a character's unless it is a surrogate or past the last" {
+  assert_eq(code_point('A'), 65);
+  assert_eq(of_code_point(0x1F600), Some('\u{1F600}'));
+  assert_eq(map([-1, 0xD800, 0xDFFF, 0x110000], of_code_point), [None, None, None, None])
+}
+
+// A table a build did not keep is made where it is read, and `metered` charges that to each read:
+// an ASCII character's count is the same either way only because it reads none.
+test "an ASCII character is classified and mapped in a few calls, whatever it is" {
+  let idle = metered(|| true).steps;
+  let calls = |f: (Char) -> Bool|
+    map(['a', 'Z', '7', ' ', '\0'], |c: Char| metered(|| f(c)).steps - idle);
+  assert_eq(calls(is_whitespace), [3, 3, 3, 3, 3]);
+  assert_eq(calls(is_uppercase), [3, 3, 3, 3, 3]);
+  assert_eq(calls(is_numeric), [5, 5, 5, 5, 5]);
+  assert_eq(metered(|| is_alphabetic('a')).steps - idle, 5);
+  assert_eq(metered(|| general_category('a')).steps - idle, 3);
+  assert_eq(metered(|| to_uppercase('a')).steps - idle, 4);
+  assert_eq(metered(|| decimal_value('7')).steps - idle, 3)
+}
+
+// The count is past one read of the table, so it holds whether or not a build kept the table.
+test "a character past ASCII takes a few calls and one read of a table, wherever it lies" {
+  let read = metered(|| classes()).steps;
+  let calls = |c: Char| metered(|| is_alphabetic(c)).steps - read;
+  assert_eq(map(['\u{E9}', '\u{4E2D}', '\u{1F600}', '\u{10FFFF}'], calls), [6, 6, 6, 6]);
+  assert_eq(metered(|| general_category('\u{E9}')).steps - read, 5);
+  assert_eq(metered(|| decimal_value('\u{663}')).steps - read, 4);
+  assert_eq(metered(|| is_numeric('\u{BD}')).steps - read, 7);
+  assert_eq(metered(|| to_uppercase('\u{E9}')).steps - metered(|| cases()).steps, 4)
+}
+
+test "the generator draws ASCII, every plane, every edge and many cased letters" {
+  let seen = map(range(0, 4000), drawn);
+  assert_eq(
+    filter(range(0, 17), |plane: Int| count(seen, |c: Char| code_point(c) >> 16 == plane) == 0),
+    [],
+  );
+  assert_eq(filter(edges(), |edge: Char| count(seen, |c: Char| c == edge) == 0), []);
+  assert(count(seen, is_ascii) > 800);
+  assert(count(seen, |c: Char| to_uppercase(c) != c || to_lowercase(c) != c) > 400)
+}

@@ -388,8 +388,8 @@ Reach through a binder with `::` (`orders::place(...)`). `as` and a name list
 cannot be combined; write two imports. Imports precede every item.
 
 The first segment of a module path may be a package: a dependency declared in
-`ply.pkg` (§3.3) grants its own prefix, and `import cli.cmdline` reaches the
-`cmdline` module of the package `cli`. A path whose first segment is neither a
+`ply.pkg` (§3.3) grants its own prefix, and `import cli.surface` reaches the
+`surface` module of the package `cli`. A path whose first segment is neither a
 module of this package, the root of one, nor a granted prefix is `E0106`; a
 dependency's prefix used without the manifest declaring it is `E0132`. A bare
 import is always this package's own: inside a dependency, `import fmt` names
@@ -476,7 +476,7 @@ may be imported. A package's own modules answer to its sibling names:
 
 ```ply
 import store.orders        // a module of this package, as before
-import cli.cmdline         // a module of the declared dependency `cli`
+import cli.surface         // a module of the declared dependency `cli`
 ```
 
 A dependency is another package root: `Path("../cli")` names the directory
@@ -650,6 +650,12 @@ siblings raise (§6.8) when the value does not fit (mask to truncate:
 reads any of them as and `numeric_of_int` writes at any (§12), and a 128-bit
 value past `Int` through its decimal text (`u128_of_string`).
 `string_of_bytes` raises on invalid UTF-8.
+
+A `Decimal` is a 96-bit mantissa and a scale, the count of digits after its
+point, from 0 to 28: `1.5m == 1.50m`, and they print as written. `decimal_div`
+and `decimal_round` take the scale of their answer, and answer with exactly that
+many digits after the point, the exact value rounded once by the `Rounding`
+given; they raise where 96 bits do not hold the answer at that scale.
 
 ### 4.2 Records and tuples
 
@@ -1226,6 +1232,9 @@ a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell` or a lambda, and a call of another function.
+The depth is each task's own (§9): a task nests from where its region stands,
+whatever the tasks beside it hold, and so does the body of a `handle` whose
+clause resumes anywhere but its tail.
 Depth and work are two bounds: one entry may also make only so many calls — a
 billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
@@ -1789,7 +1798,7 @@ A test may range over a table, and is then a test for each of its elements, a
 type Resolution = { reference: String, target: String }
 
 test "resolves {c.reference}" for c: Resolution in resolutions() {
-  assert_eq(url_resolve(base(), c.reference), c.target)
+  assert_eq(url_join(base(), c.reference), url_parse(c.target))
 }
 ```
 
@@ -3175,6 +3184,8 @@ In `examples/`: `clock.ply` (a `nondet` effect, a handler, `test/nondet`);
 and `timeout.ply` (simulation, a race and its fix, a virtual clock); `echo.ply`
 and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 `relay.ply` (one forwarder generic over the label it writes under);
+`shout.ply` (a command line declared with `std.cli`, read into the program's
+own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
 answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose

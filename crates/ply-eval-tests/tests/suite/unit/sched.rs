@@ -1432,6 +1432,34 @@ fn a_retired_tasks_id_is_never_handed_out_again() {
     }
 }
 
+/// A task cancelled before its join and one cancelled under it fail the join alike: as a raise in
+/// the joiner, whose own handlers answer it, and never as the region's failure.
+#[test]
+fn joining_a_task_already_cancelled_resumes_the_joiner_with_a_raise() {
+    let mut sched = production();
+    root_step(&mut sched, &Idle);
+    let target = sched.spawn(Value::Unit, Span::DUMMY);
+    let unstarted = sched
+        .cancel(suspended(), &target, Span::DUMMY, None)
+        .expect("the root is running");
+    assert_eq!(unstarted, Some(Value::Unit), "the task never started");
+    let Resumption::Resume { value, .. } = until_root(&mut sched, &Idle) else {
+        panic!("the root resumes from its cancel");
+    };
+    assert_eq!(value, Value::Bool(true));
+    sched
+        .join(suspended(), &target, Span::DUMMY)
+        .expect("a join of a cancelled task is the joiner's to answer");
+    let Resumption::Raise { failure, .. } = until_root(&mut sched, &Idle) else {
+        panic!("the join of a cancelled task did not raise in the joiner");
+    };
+    assert!(
+        failure.message.contains("was cancelled"),
+        "{}",
+        failure.message
+    );
+}
+
 #[test]
 fn a_kept_handle_keeps_its_finished_task_joinable_and_every_join_answers() {
     let mut sched = production();

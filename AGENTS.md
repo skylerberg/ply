@@ -61,12 +61,6 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
   path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
   load reads it whenever it pulls the module, so a test's fixtures stay in
   `crates/ply-corpus/stdlib`.
-- The standard library's own tests and laws run as `ply test --std` and `ply prove --std` over
-  `crates/ply-corpus/stdlib`. `--std` takes every module the binary ships, whatever the project
-  imports, so a new module is listed nowhere.
-- The CLI's `semantics::version` is a `const fn` over `fingerprint.ply`: a build computes it, so a
-  change to what a hash, a checked answer, an interface or a verdict means moves it and no source
-  states it.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.
