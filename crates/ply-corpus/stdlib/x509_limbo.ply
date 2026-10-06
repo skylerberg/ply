@@ -1,0 +1,244 @@
+//! `std.x509` against x509-limbo, the cases verifiers are held to side by side, BetterTLS's among
+//! them. `x509/limbo.json` holds testcases as the project publishes them, with the licence they
+//! are passed on by beside it. The published file is too large to keep whole, and nearly all of
+//! it is BetterTLS's name-constraint cases, so what is kept is every case that is not BetterTLS's,
+//! its path-building cases whole, and every sixteenth of its name-constraint cases in the order
+//! published. A shipped module embeds no file, so the tests stand here.
+//!
+//! Every case kept is run, or left out by a rule, and a test holds the counts:
+//!
+//! - `has-crl`: revocation is not checked;
+//! - `has-mldsa`: ML-DSA is not verified;
+//! - `has-policy-constraints`: policies are not processed;
+//! - `pedantic-public-suffix-wildcard`: no list of public suffixes is consulted, so `*.co.uk` is
+//!   taken as written;
+//! - `pedantic-webpki-eku`: an extended key usage is held to RFC 5280, where the leaf may have
+//!   none, and not to the issuance rules of the CA/Browser Forum;
+//! - `webpki::cn::`: a subject's common name is not read, so it is not held to being one of the
+//!   alternative names either, a rule the suite's own accepted cases break;
+//! - `rfc5280::aki::cross-signed-root-missing-aki`: a trust anchor is not held to the profile of
+//!   what it signs.
+//!
+//! Where the suite holds two answers and says a verifier takes one (`conflicts_with`), the web's
+//! is taken, and RFC 5280's case is left out: a CA is not taken as a leaf (`rfc5280::ca-as-leaf`,
+//! and `pathlen::validation-ignores-pathlen-in-leaf`, which rests on it), and name constraints
+//! that are not critical are taken (`rfc5280::nc::permitted-dns-match-noncritical`).
+//!
+//! Certificates are read `Tolerant`, as a client of the web has to read them, but in the cases
+//! that are about a serial number. A case with no time of its own is judged on the day the file
+//! was cut.
+
+import std.date
+import std.ip
+import std.json
+import std.json (Json)
+import std.list (concat, contains, count, find_map, unique)
+import std.result (result_err)
+import std.show (show)
+import std.x509
+import std.x509 (x509, Certificate)
+
+fn member(j: Json, name: String) -> Json =
+  match json::get(j, name) { Some(v) -> v, None -> json::Null }
+
+fn text(j: Json, name: String) -> String = match member(j, name) { json::Str(s) -> s, _ -> "" }
+
+fn texts(j: Json, name: String) -> List<String> =
+  match member(j, name) {
+    json::Array(xs) -> map(xs, |x: Json| match x { json::Str(s) -> s, _ -> "" }),
+    _ -> [],
+  }
+
+/// One case, as published.
+type Case = {
+  id: String,
+  features: List<String>,
+  client: Bool,
+  trusted: List<String>,
+  untrusted: List<String>,
+  peer: String,
+  /// The time to judge at, or `""` for a case with none.
+  time: String,
+  purposes: List<String>,
+  succeeds: Bool,
+  /// `"DNS"`, `"IP"` or, for a case that expects nobody, `""`.
+  name_kind: String,
+  name: String,
+  depth: Option<Int>,
+}
+
+fn case_of(j: Json) -> Case =
+  {
+    id: text(j, "id"),
+    features: texts(j, "features"),
+    client: text(j, "validation_kind") == "CLIENT",
+    trusted: texts(j, "trusted_certs"),
+    untrusted: texts(j, "untrusted_intermediates"),
+    peer: text(j, "peer_certificate"),
+    time: text(j, "validation_time"),
+    purposes: texts(j, "extended_key_usage"),
+    succeeds: text(j, "expected_result") == "SUCCESS",
+    name_kind: text(member(j, "expected_peer_name"), "kind"),
+    name: text(member(j, "expected_peer_name"), "value"),
+    depth: match member(j, "max_chain_depth") {
+      json::Number(n) -> int_of_decimal(n, Down),
+      _ -> None,
+    },
+  }
+
+fn cases() -> List<Case> / {abort.raise} =
+  match json::parse(embed("x509/limbo.json")) {
+    Ok(j) -> match member(j, "testcases") { json::Array(xs) -> map(xs, case_of), _ -> [] },
+    Err(e) -> panic(json::error_to_string(e)),
+  }
+
+type Rule = { mark: String, rule: String }
+
+/// The features that leave a case out.
+fn by_feature() -> List<Rule> =
+  [
+    { mark: "has-crl", rule: "revocation is not checked" },
+    { mark: "has-mldsa", rule: "ML-DSA is not verified" },
+    { mark: "has-policy-constraints", rule: "policies are not processed" },
+    { mark: "pedantic-public-suffix-wildcard", rule: "no list of public suffixes is consulted" },
+    { mark: "pedantic-webpki-eku", rule: "an extended key usage is held to RFC 5280" },
+  ]
+
+/// The cases left out by name: a whole case, or with a trailing `::` every case under it.
+fn by_id() -> List<Rule> =
+  [
+    { mark: "webpki::cn::", rule: "a common name is not read" },
+    {
+      mark: "rfc5280::aki::cross-signed-root-missing-aki",
+      rule: "a trust anchor is not held to the profile of what it signs",
+    },
+    { mark: "rfc5280::ca-as-leaf", rule: "a CA is not taken as a leaf" },
+    { mark: "pathlen::validation-ignores-pathlen-in-leaf", rule: "a CA is not taken as a leaf" },
+    {
+      mark: "rfc5280::nc::permitted-dns-match-noncritical",
+      rule: "name constraints that are not critical are taken",
+    },
+  ]
+
+/// The rule that leaves a case out, or `None` for one that is run.
+fn left_out(c: Case) -> Option<String> =
+  match find_map(by_feature(), |r: Rule|
+      if contains(c.features, r.mark) { Some(r.rule) } else { None }) {
+    Some(rule) -> Some(rule),
+    None ->
+      find_map(by_id(), |r: Rule|
+        if c.id == r.mark || (string_ends_with(r.mark, "::") && string_starts_with(c.id, r.mark)) {
+          Some(r.rule)
+        } else { None }),
+  }
+
+fn run() -> List<Case> / {abort.raise} = filter(cases(), |c: Case| left_out(c) == None)
+
+fn certificates(
+  pems: List<String>,
+  mode: x509::Reading,
+) -> List<Certificate> / {x509.refused, abort.raise} =
+  fold(pems, [], |all: List<Certificate>, text: String|
+    fold(
+      x509::read_pem(text, x509::limits(), mode),
+      all,
+      |acc: List<Certificate>, c: Certificate| push(acc, c),
+    ))
+
+/// What a case came to: how long a path, or what refused it.
+fn outcome(c: Case) -> Result<Int, String> / {abort.raise} = {
+  let mode = if contains(c.features, "pedantic-serial-number") { x509::Strict }
+  else { x509::Tolerant };
+  let read = try {
+    {
+      leaf: certificates([c.peer], mode),
+      offered: certificates(c.untrusted, mode),
+      anchors: certificates(c.trusted, mode),
+    }
+  };
+  let at = match date::parse_rfc3339(if c.time == "" { "2026-10-06T00:00:00+00:00" }
+    else { c.time }) {
+    Some(t) -> date::instant(t),
+    None -> None,
+  };
+  let who = if c.name_kind == "DNS" { Some(x509::Host(c.name)) } else if c.name_kind == "IP" {
+    match ip::parse(c.name) { Ok(a) -> Some(x509::At(a)), Err(_) -> None }
+  } else { Some(x509::Anyone) };
+  let purpose = if contains(c.purposes, "clientAuth") || (c.client && len(c.purposes) == 0) {
+    x509::ClientAuth
+  } else { x509::ServerAuth };
+  let policy = match c.depth {
+    Some(most) -> { ..x509::strict(), depth: most },
+    None -> x509::strict(),
+  };
+  match ((read, at, who)) {
+    (Err(refusal), _, _) -> Err("unread: " ++ show(refusal)),
+    (Ok(found), Some(instant), Some(identity)) -> match list_at(found.leaf, 0) {
+      None -> Err("no leaf"),
+      Some(leaf) -> match x509::verify(
+          leaf,
+          found.offered,
+          found.anchors,
+          instant,
+          identity,
+          purpose,
+          policy,
+        ) {
+        Ok(path) -> Ok(len(path)),
+        Err(failure) -> Err(show(failure.why)),
+      },
+    },
+    _ -> panic(f"{c.id}: a time or a name that is not read"),
+  }
+}
+
+test "limbo {c.id}" for c: Case in run() {
+  match outcome(c) {
+    Ok(_) -> assert(c.succeeds),
+    Err(why) -> assert_eq(if c.succeeds { why } else { "" }, ""),
+  }
+}
+
+test "the cases kept are run but for those a rule leaves out, to the count" {
+  let all = cases();
+  let under = |prefix: String| count(all, |c: Case| string_starts_with(c.id, prefix));
+  assert_eq(len(all), 905);
+  assert_eq(under("bettertls::nameconstraints::"), 594);
+  assert_eq(under("bettertls::pathbuilding::"), 81);
+  let rules = unique(map(concat(by_feature(), by_id()), |r: Rule| r.rule));
+  assert_eq(
+    map(rules, |rule: String|
+      { rule: rule, cases: count(all, |c: Case| left_out(c) == Some(rule)) }),
+    [
+      { rule: "revocation is not checked", cases: 17 },
+      { rule: "ML-DSA is not verified", cases: 6 },
+      { rule: "policies are not processed", cases: 1 },
+      { rule: "no list of public suffixes is consulted", cases: 3 },
+      { rule: "an extended key usage is held to RFC 5280", cases: 4 },
+      { rule: "a common name is not read", cases: 9 },
+      { rule: "a trust anchor is not held to the profile of what it signs", cases: 1 },
+      { rule: "a CA is not taken as a leaf", cases: 2 },
+      { rule: "name constraints that are not critical are taken", cases: 1 },
+    ],
+  );
+  let ran = run();
+  assert_eq(len(ran), 861);
+  assert_eq(count(ran, |c: Case| c.succeeds), 159);
+  assert_eq(count(ran, |c: Case| contains(c.features, "pedantic-serial-number")), 3);
+  assert_eq(count(ran, |c: Case| c.time == ""), 156)
+}
+
+test "a negative serial number is refused however it is read, and zero or a long one only to the letter" {
+  let peer = |id: String, mode: x509::Reading|
+    match filter(cases(), |c: Case| c.id == id) {
+      [c, ..] -> result_err(try { certificates([c.peer], mode) }),
+      [] -> panic(f"no case {id}"),
+    };
+  let ids = ["rfc5280::serial::zero", "rfc5280::serial::too-long", "rfc5280::serial::negative"];
+  assert_eq(map(ids, |id: String| peer(id, x509::Strict)), [
+    Some(x509::BadSerial),
+    Some(x509::BadSerial),
+    Some(x509::BadSerial),
+  ]);
+  assert_eq(map(ids, |id: String| peer(id, x509::Tolerant)), [None, None, Some(x509::BadSerial)])
+}

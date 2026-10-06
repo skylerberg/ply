@@ -76,7 +76,17 @@ pub type Ip =
 /// past the length is zero.
 pub opaque type Prefix = | Prefix(Ip, Int)
 
+/// One end of a socket: an address, a port in `0..=65535`, and for an IPv6 address the zone that
+/// names the interface it is reached through, where there is one. An IPv4 address has no zone.
+pub opaque type SocketAddress = | SocketAddress(Ip, Int, Option<String>)
+
 key for Ip by order_key
+
+key for SocketAddress by socket_order
+
+show for SocketAddress by render_socket
+
+gen for SocketAddress by arbitrary_socket
 
 show for Ipv4 by render_v4
 
@@ -97,6 +107,13 @@ gen for Prefix by arbitrary_prefix
 /// What addresses order by: the family, then the address as a number.
 fn order_key(a: Ip) -> (Int, Int, U128) =
   match a { V4(Ipv4(n)) -> (4, n, 0u128), V6(Ipv6(v)) -> (6, 0, v) }
+
+/// What socket addresses order by: the address, then the port, then the zone, none before any.
+fn socket_order(a: SocketAddress) -> ((Int, Int, U128), Int, String) =
+  match a {
+    SocketAddress(address, port, zone) ->
+      (order_key(address), port, match zone { Some(name) -> name, None -> "" }),
+  }
 
 // --- Bits -------------------------------------------------------------------
 
@@ -233,6 +250,64 @@ pub fn render(a: Ip) -> String = match a { V4(four) -> render_v4(four), V6(six) 
 pub fn render_prefix(p: Prefix) -> String =
   match p { Prefix(net, length) -> render(net) ++ "/" ++ int_to_string(length) }
 
+/// The address, `:` and the port, an IPv6 address in brackets with its zone after a `%`:
+/// `192.0.2.1:80`, `[::1]:80`, `[fe80::1%eth0]:80`.
+pub fn render_socket(a: SocketAddress) -> String =
+  match a {
+    SocketAddress(V4(four), port, _) -> render_v4(four) ++ ":" ++ int_to_string(port),
+    SocketAddress(V6(six), port, zone) ->
+      "[" ++ render_v6(six) ++ (match zone { Some(name) -> "%" ++ name, None -> "" }) ++ "]:"
+        ++ int_to_string(port),
+  }
+
+/// The socket address of `address` and `port`, or `None` for a port outside `0..=65535`.
+pub fn socket_address(address: Ip, port: Int) -> Option<SocketAddress> =
+  if port < 0 || port > 65535 { None } else { Some(SocketAddress(address, port, None)) }
+
+/// The socket address of `address` and `port`, raising for a port outside `0..=65535`: for a
+/// port the caller already holds to that range.
+pub fn socket_at(address: Ip, port: Int) -> SocketAddress / {abort.raise} =
+  match socket_address(address, port) {
+    Some(at) -> at,
+    None -> panic("port " ++ int_to_string(port) ++ " is not a port"),
+  }
+
+/// IPv4's loopback address, `127.0.0.1`.
+pub fn loopback_v4() -> Ip = V4(Ipv4(0x7F00_0001))
+
+/// IPv6's loopback address, `::1`.
+pub fn loopback_v6() -> Ip = V6(Ipv6(1u128))
+
+/// The loopback address of `a`'s family.
+pub fn loopback_like(a: Ip) -> Ip = match a { V4(_) -> loopback_v4(), V6(_) -> loopback_v6() }
+
+/// The unspecified address of `a`'s family, `0.0.0.0` or `::`: what a socket that leaves its
+/// address to the host is bound at.
+pub fn unspecified_like(a: Ip) -> Ip = match a { V4(_) -> V4(Ipv4(0)), V6(_) -> V6(Ipv6(0u128)) }
+
+/// `a` reached through the interface `zone` names, or `None` where `a` is an IPv4 address or
+/// `zone` is not one or more letters, digits, `-`, `.`, `_` and `~`.
+pub fn in_zone(a: SocketAddress, zone: String) -> Option<SocketAddress> / {abort.raise} =
+  match a {
+    SocketAddress(V6(six), port, _) -> {
+      let b = bytes_of_string(zone);
+      if bytes_len(b) > 0 && scan(b, 0, zone_bytes()) == bytes_len(b) {
+        Some(SocketAddress(V6(six), port, Some(zone)))
+      } else { None }
+    },
+    SocketAddress(V4(_), _, _) -> None,
+  }
+
+/// The address of a socket address.
+pub fn socket_ip(a: SocketAddress) -> Ip = match a { SocketAddress(address, _, _) -> address }
+
+/// The port of a socket address.
+pub fn socket_port(a: SocketAddress) -> Int = match a { SocketAddress(_, port, _) -> port }
+
+/// The zone of a socket address, which only an IPv6 one may have.
+pub fn socket_zone(a: SocketAddress) -> Option<String> =
+  match a { SocketAddress(_, _, zone) -> zone }
+
 type Run = { start: Int, length: Int }
 
 /// The longest run of zero groups, and the leftmost of equal ones.
@@ -294,6 +369,12 @@ pub type Why =
   /// A bit past the prefix length is set, so the text names a host in the network and not the
   /// network.
   | HostBits
+  /// A socket address has no `:` and port after its address.
+  | NoPort
+  /// A port is above 65535.
+  | PortRange
+  /// An IPv6 address in a socket address stands in brackets, and one is missing or not closed.
+  | NoBracket
   /// A character that cannot stand here.
   | Stray
 
@@ -327,6 +408,9 @@ pub fn reason(why: Why) -> String =
     NoLength -> "a `/` and a prefix length go here",
     LengthRange -> "a prefix length is at most 32 for IPv4 and 128 for IPv6",
     HostBits -> "a bit past the prefix length is set",
+    NoPort -> "a `:` and a port go here",
+    PortRange -> "a port is at most 65535",
+    NoBracket -> "an IPv6 address stands between `[` and `]` before its port",
     Stray -> "this character cannot stand here",
   }
 
@@ -404,6 +488,49 @@ pub fn read_interface(text: String) -> Interface / {ip.refused, abort.raise} = {
   let read = slashed(bytes_of_string(text));
   { address: read.address, network: masked(read.address, read.length) }
 }
+
+/// The socket address `text` writes, or where and why it is not one. An IPv4 address is followed
+/// by `:` and its port, `192.0.2.1:80`; an IPv6 address stands in brackets, with its zone after
+/// a `%` where it has one, `[::1]:80` and `[fe80::1%eth0]:80`. A port is decimal digits with no
+/// leading zero, at most 65535.
+pub fn parse_socket(text: String) -> Result<SocketAddress, Refusal> / {abort.raise} =
+  try { read_socket(text) }
+
+/// The socket address `text` writes, raising `ip.refused` where `parse_socket` answers `Err`.
+pub fn read_socket(text: String) -> SocketAddress / {ip.refused, abort.raise} = {
+  let b = bytes_of_string(text);
+  if peek(b, 0) == b'[' { bracketed(b) } else {
+    let colon = scan_until(b, 0, b":");
+    if colon < bytes_len(b) && scan_until(b, colon + 1, b":") < bytes_len(b) {
+      refuse(0, NoBracket)
+    } else {
+      let four = Ipv4(dotted(bytes_slice(b, 0, colon), 0));
+      SocketAddress(V4(four), port_from(b, colon), None)
+    }
+  }
+}
+
+/// The socket address `b` writes from its `[`.
+fn bracketed(b: Bytes) -> SocketAddress / {ip.refused, abort.raise} = {
+  let close = scan_until(b, 1, b"]");
+  if close >= bytes_len(b) { refuse(close, NoBracket) } else {
+    let inner = string_of_bytes(bytes_slice(b, 1, close));
+    let scoped = handle { read_scoped(inner) } with { ip.refused(e) -> refuse(e.at + 1, e.why) };
+    SocketAddress(V6(scoped.address), port_from(b, close + 1), scoped.zone)
+  }
+}
+
+/// The port after the `:` at `at`, which ends the text.
+fn port_from(b: Bytes, at: Int) -> Int / {ip.refused, abort.raise} =
+  if at >= bytes_len(b) || bytes_at(b, at) != b':' { refuse(at, NoPort) } else {
+    let from = at + 1;
+    let end = scan(b, from, decimal_digits());
+    if end == from { refuse(from, if from >= bytes_len(b) { NoPort } else { Stray }) }
+    else if end < bytes_len(b) { refuse(end, Stray) }
+    else if end - from > 1 && bytes_at(b, from) == b'0' { refuse(from, LeadingZero) }
+    else if end - from > 5 || decimal_between(b, from, end) > 65535 { refuse(from, PortRange) }
+    else { decimal_between(b, from, end) }
+  }
 
 /// What an `ip"..."` literal is checked by: the address the text writes, or the character that
 /// keeps it from being one.
@@ -1019,6 +1146,15 @@ pub fn arbitrary_prefix() -> Gen<Prefix> / {abort.raise} =
   gen::and_then(arbitrary(), |a: Ip|
     gen::map(gen::int_between(0, bit_width(a)), |length: Int| masked(a, length)))
 
+/// Any socket address: any address at any port, an IPv6 one in a zone one time in four.
+pub fn arbitrary_socket() -> Gen<SocketAddress> / {abort.raise} =
+  gen::and_then(arbitrary(), |a: Ip|
+    gen::map2(gen::int_between(0, 65535), gen::below(4), |port: Int, zoned: Int|
+      SocketAddress(a, port, match a {
+        V6(_) -> if zoned == 0 { Some("eth0") } else { None },
+        V4(_) -> None,
+      })))
+
 /// A group that is zero two times in three, so runs of zeros are common.
 fn sparse_group() -> Gen<Int> =
   gen::map2(gen::below(3), gen::below(0x1_0000), |kind: Int, g: Int| if kind == 0 { g } else { 0 })
@@ -1072,6 +1208,69 @@ law "an address reads back from its text" =
 
 law "a network reads back from its text" =
   round_trip(render_prefix, |text: String| result_ok(parse_prefix(text)))
+
+law "a socket address reads back from its text" =
+  round_trip(render_socket, |text: String| result_ok(parse_socket(text)))
+
+test "a socket address is written `{c.text}`" for c: { text: String, address: String, port: Int, zone: Option<String> } in [
+    { text: "192.0.2.1:80", address: "192.0.2.1", port: 80, zone: None },
+    { text: "0.0.0.0:0", address: "0.0.0.0", port: 0, zone: None },
+    { text: "[::1]:65535", address: "::1", port: 65535, zone: None },
+    { text: "[fe80::1%eth0]:443", address: "fe80::1", port: 443, zone: Some("eth0") },
+    { text: "[::ffff:192.0.2.1]:8080", address: "::ffff:192.0.2.1", port: 8080, zone: None },
+  ] {
+  let read = match parse_socket(c.text) {
+    Ok(a) -> a,
+    Err(_) -> panic("not a socket address: " ++ c.text),
+  };
+  assert_eq(render(socket_ip(read)), c.address);
+  assert_eq(socket_port(read), c.port);
+  assert_eq(socket_zone(read), c.zone);
+  assert_eq(render_socket(read), c.text);
+  assert_eq(show(read), c.text)
+}
+
+test "`{c.text}` is no socket address" for c: { text: String, at: Int, why: Why } in [
+    { text: "", at: 0, why: Empty },
+    { text: "192.0.2.1", at: 9, why: NoPort },
+    { text: "192.0.2.1:", at: 10, why: NoPort },
+    { text: "192.0.2.1:080", at: 10, why: LeadingZero },
+    { text: "192.0.2.1:65536", at: 10, why: PortRange },
+    { text: "192.0.2.1:80 ", at: 12, why: Stray },
+    { text: "192.0.2.1:http", at: 10, why: Stray },
+    { text: "::1:80", at: 0, why: NoBracket },
+    { text: "[::1", at: 4, why: NoBracket },
+    { text: "[::1]", at: 5, why: NoPort },
+    { text: "[::1]80", at: 5, why: NoPort },
+    { text: "[192.0.2.1]:80", at: 10, why: FewGroups },
+    { text: "[fe80::1%]:80", at: 9, why: NoZone },
+    { text: "[::g]:80", at: 3, why: NoGroup },
+  ] { assert_eq(parse_socket(c.text), Err({ at: c.at, why: c.why })) }
+
+test "a socket address keeps a port in range and a zone only on an IPv6 address" {
+  assert_eq(socket_address(addr("192.0.2.1"), 65536), None);
+  assert_eq(socket_address(addr("192.0.2.1"), -1), None);
+  let four = match socket_address(addr("192.0.2.1"), 80) {
+    Some(a) -> a,
+    None -> panic("in range"),
+  };
+  let six = match socket_address(addr("fe80::1"), 80) { Some(a) -> a, None -> panic("in range") };
+  assert_eq(in_zone(four, "eth0"), None);
+  assert_eq(in_zone(six, ""), None);
+  assert_eq(in_zone(six, "eth 0"), None);
+  assert_eq(
+    match in_zone(six, "eth0") { Some(a) -> render_socket(a), None -> "" },
+    "[fe80::1%eth0]:80",
+  )
+}
+
+test "socket addresses order by address, then port, then zone" {
+  let sorted = sort(
+    map(["[::1]:1", "10.0.0.2:1", "10.0.0.1:9", "10.0.0.1:2"], |t: String|
+      match parse_socket(t) { Ok(a) -> a, Err(_) -> panic(t) }),
+  );
+  assert_eq(map(sorted, render_socket), ["10.0.0.1:2", "10.0.0.1:9", "10.0.0.2:1", "[::1]:1"])
+}
 
 law "an IPv4 address is the one its four octets make" = round_trip(v4_to_bytes, v4_of_bytes)
 

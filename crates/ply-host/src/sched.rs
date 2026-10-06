@@ -1,5 +1,6 @@
 //! The production task scheduler's half of the boundary.
 
+use ply_eval::host::HostRegistry;
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
@@ -29,6 +30,12 @@ pub fn registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
             )
         })
         .collect()
+}
+
+pub fn register(registry: &mut HostRegistry) {
+    for (op, handler) in registrations() {
+        registry.register(op, handler);
+    }
 }
 
 fn path_of(op: &str) -> &'static str {
