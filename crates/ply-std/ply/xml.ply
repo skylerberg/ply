@@ -34,10 +34,11 @@
 //! read as markup.
 
 import std.bytes
-import std.bytes (hex_value, peek, scan, scan_until)
+import std.bytes (hex_value, peek, scan, scan_until, starts_at)
 import std.laws (agrees, idempotent)
 import std.list (any, at_or, drop, find_index, first, flat_map, index_of, is_empty, take)
 import std.option (option_unwrap_or)
+import std.string (ascii_lower, ascii_trim)
 
 /// The namespace the prefix `xml` is bound to in every document.
 pub fn xml_namespace() -> String = "http://www.w3.org/XML/1998/namespace"
@@ -386,10 +387,6 @@ fn white() -> Bytes = b" \t\n\r"
 
 fn is_white(b: Int) -> Bool = b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
 
-/// Whether `word` stands at `i`.
-fn begins(data: Bytes, i: Int, word: Bytes) -> Bool / {abort.raise} =
-  i + bytes_len(word) <= bytes_len(data) && bytes_slice(data, i, i + bytes_len(word)) == word
-
 /// `b` with each carriage return, and the line feed after it where there is one, as a line feed.
 fn line_ends(b: Bytes) -> Bytes / {abort.raise} =
   if bytes::contains(b, b"\r") { bytes::replace(bytes::replace(b, b"\r\n", b"\n"), b"\r", b"\n") }
@@ -591,7 +588,7 @@ pub fn next(c: Cursor) -> Option<Step> / {xml.refused, abort.raise} =
   }
 
 fn before_root(c: Cursor) -> Step / {xml.refused, abort.raise} =
-  if c.events == 0 && begins(c.data, c.at, b"<?xml") && is_white(peek(c.data, c.at + 5)) {
+  if c.events == 0 && starts_at(c.data, c.at, b"<?xml") && is_white(peek(c.data, c.at + 5)) {
     declaration(c)
   } else {
     let i = scan(c.data, c.at, white());
@@ -612,7 +609,7 @@ fn after_root(c: Cursor) -> Option<Step> / {xml.refused, abort.raise} = {
 fn inside(c: Cursor) -> Step / {xml.refused, abort.raise} = {
   let b = peek(c.data, c.at);
   if b < 0 { refuse(c, c.at, Truncated) }
-  else if b == b'<' && !(peek(c.data, c.at + 1) == b'!' && begins(c.data, c.at, b"<![CDATA[")) {
+  else if b == b'<' && !(peek(c.data, c.at + 1) == b'!' && starts_at(c.data, c.at, b"<![CDATA[")) {
     markup(c, c.at)
   } else {
     let run = text_run(c, c.at, [], bytes_len(c.data) - c.at + 1);
@@ -630,11 +627,11 @@ fn markup(c: Cursor, i: Int) -> Step / {xml.refused, abort.raise} =
       let read = instruction(c, i);
       answer(c, i, Aside(Instruction(read.target, read.data)), { ..c, at: read.next })
     },
-    b'!' -> if begins(c.data, i, b"<!--") {
+    b'!' -> if starts_at(c.data, i, b"<!--") {
       let read = comment(c, i);
       answer(c, i, Aside(Comment(read.text)), { ..c, at: read.next })
-    } else if begins(c.data, i, b"<!DOCTYPE") { refuse(c, i, Doctype) }
-    else if begins(c.data, i, b"<![CDATA[") { refuse(c, i, OutsideRoot) }
+    } else if starts_at(c.data, i, b"<!DOCTYPE") { refuse(c, i, Doctype) }
+    else if starts_at(c.data, i, b"<![CDATA[") { refuse(c, i, OutsideRoot) }
     else { refuse(c, i, BadMarkup) },
     b'/' -> end_tag(c, i),
     _ -> start_tag(c, i),
@@ -660,7 +657,7 @@ fn text_run(c: Cursor, i: Int, pieces: List<Bytes>, left: Int) -> Run / {xml.ref
         let next = if peek(c.data, stop + 1) == b'\n' { stop + 2 } else { stop + 1 };
         text_run(c, next, push(held, b"\n"), left - 1)
       },
-      b'<' -> if begins(c.data, stop, b"<![CDATA[") { section(c, stop, held, left) }
+      b'<' -> if starts_at(c.data, stop, b"<![CDATA[") { section(c, stop, held, left) }
       else { { bytes: joined(held), next: stop } },
       _ -> { bytes: joined(held), next: stop },
     }
@@ -942,7 +939,7 @@ fn end_tag(c: Cursor, i: Int) -> Step / {xml.refused, abort.raise} =
       let after = i + 2 + bytes_len(top.tag);
       let close = scan(c.data, after, white());
       let longer = continues_name(point_before(c.data, after, c.sound).point);
-      if !begins(c.data, i + 2, top.tag) || longer {
+      if !starts_at(c.data, i + 2, top.tag) || longer {
         refuse(c, i, Mismatched(string_of_bytes(top.tag)))
       } else if peek(c.data, close) == b'>' { closed(c, i, close + 1) }
       else { refuse(c, close, if close >= bytes_len(c.data) { Truncated } else { BadTag }) }
@@ -984,8 +981,8 @@ fn instruction(c: Cursor, i: Int) -> Instructed / {xml.refused, abort.raise} = {
   let target = piece(c, i + 2, end);
   if end == i + 2 || !uncolonized(target) { refuse(c, i + 2, BadName) }
   else if end - i - 2 > c.limits.max_name_bytes { refuse(c, i + 2, NameTooLong) }
-  else if string_lower(string_of_bytes(target)) == "xml" { refuse(c, i, BadInstruction) }
-  else if begins(c.data, end, b"?>") {
+  else if ascii_lower(string_of_bytes(target)) == "xml" { refuse(c, i, BadInstruction) }
+  else if starts_at(c.data, end, b"?>") {
     { target: string_of_bytes(target), data: "", next: end + 2 }
   } else if end >= bytes_len(c.data) { refuse(c, end, Truncated) }
   else if !is_white(peek(c.data, end)) { refuse(c, end, BadInstruction) } else {
@@ -1012,7 +1009,7 @@ fn pseudo(c: Cursor, i: Int) -> Option<Pseudo> / {xml.refused, abort.raise} = {
   let equals = scan(c.data, end, white());
   let quote = scan(c.data, equals + 1, white());
   let mark = peek(c.data, quote);
-  if begins(c.data, from, b"?>") { None }
+  if starts_at(c.data, from, b"?>") { None }
   else if from == i || end == from || peek(c.data, equals) != b'=' {
     refuse(c, from, if from >= bytes_len(c.data) { Truncated } else { BadDeclaration })
   } else if mark != b'"' && mark != b'\'' { refuse(c, quote, BadDeclaration) } else {
@@ -1046,7 +1043,7 @@ fn declaration(c: Cursor) -> Step / {xml.refused, abort.raise} =
         None -> match encoding { Some(p) -> p.next, None -> version.next },
       };
       let close = scan(c.data, end, white());
-      if !begins(c.data, close, b"?>") { refuse(c, close, BadDeclaration) } else {
+      if !starts_at(c.data, close, b"?>") { refuse(c, close, BadDeclaration) } else {
         answer(
           c,
           c.at,
@@ -1074,7 +1071,7 @@ fn declared_encoding(c: Cursor, p: Option<Pseudo>) -> Option<String> / {xml.refu
       let text = string_of_bytes(named.value);
       if scan(named.value, 0, letters) == 0 || rest != bytes_len(named.value) {
         refuse(c, named.at, BadDeclaration)
-      } else if string_lower(text) != (if c.wide { "utf-16" } else { "utf-8" }) {
+      } else if ascii_lower(text) != (if c.wide { "utf-16" } else { "utf-8" }) {
         refuse(c, named.at, Encoding(text))
       } else { Some(text) }
     },
@@ -1287,7 +1284,7 @@ fn misc_out(m: Misc) -> Bytes / {xml.unwritable, abort.raise} =
     Instruction(target, data) -> {
       let raw = fitting(data);
       if !is_name(target) { xml.unwritable(NotAName(target)) }
-      else if string_lower(target) == "xml" || bytes::contains(raw, b"?>")
+      else if ascii_lower(target) == "xml" || bytes::contains(raw, b"?>")
           || is_white(peek(raw, 0)) { xml.unwritable(BadInstruction) }
       else if bytes::contains(raw, b"\r") { xml.unwritable(IllegalChar(b'\r')) }
       else if bytes_len(raw) == 0 { bytes_concat_all([b"<?", bytes_of_string(target), b"?>"]) }
@@ -1594,7 +1591,7 @@ fn steps(path: Bytes, i: Int, names: List<Name>, left: Int) -> Option<List<Name>
 /// `e` without the white space that only lays it out: in every element whose text is all white
 /// space, at any depth, that text is dropped. What `write` adds under `Indented` is such text.
 pub fn without_indentation(e: Element) -> Element = {
-  let blank = |n: Node| match n { Text(t) -> string_trim(t) == "", _ -> true };
+  let blank = |n: Node| match n { Text(t) -> ascii_trim(t) == "", _ -> true };
   let laid_out = fold(e.children, true, |all: Bool, n: Node| all && blank(n));
   {
     ..e,
