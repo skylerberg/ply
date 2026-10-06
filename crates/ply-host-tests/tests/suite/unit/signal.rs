@@ -2,6 +2,7 @@ use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity,
     Resource, Span, Symbol, Value, codes,
 };
+use ply_host::pool::Pooled;
 use ply_host::signal::*;
 use ply_host::tcp::{Net, TcpHost};
 use std::io::Read;
@@ -38,11 +39,15 @@ fn settle(host: &TcpHost, answered: Result<HostAnswer, Diagnostic>) -> Value {
         HostAnswer::Pending(pending) => {
             let until = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(value) = host.poll(&pending).expect("the token is this host's") {
+                if let Some(value) = host
+                    .pool()
+                    .poll(&pending)
+                    .expect("the token is this host's")
+                {
                     return value;
                 }
                 assert!(Instant::now() < until, "`{pending}` never resolved");
-                let _ = host.park_until(Duration::from_millis(20));
+                let _ = host.pool().park_until(Duration::from_millis(20));
             }
         }
     }
@@ -189,7 +194,7 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     }
     assert_eq!(host.accepts_in_flight(), 1, "the accept never parked");
     assert_eq!(
-        host.poll(&pending).expect("this host's token"),
+        host.pool().poll(&pending).expect("this host's token"),
         None,
         "nothing is connecting, so it is still waiting"
     );
@@ -201,14 +206,14 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let answered = loop {
-        if let Some(value) = host.poll(&pending).expect("this host's token") {
+        if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
             break int(&value);
         }
         assert!(
             Instant::now() < deadline,
             "the parked accept never returned, so an idle service would never observe a stop"
         );
-        let _ = host.park_until(Duration::from_millis(20));
+        let _ = host.pool().park_until(Duration::from_millis(20));
     };
     assert_eq!(
         answered, 0,
@@ -242,12 +247,12 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
         .or_else(|_| TcpStream::connect(address));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(value) = host.poll(&pending).expect("this host's token") {
+        if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
             assert_eq!(int(&value), 0);
             break;
         }
         assert!(Instant::now() < deadline, "the accept never returned");
-        let _ = host.park_until(Duration::from_millis(20));
+        let _ = host.pool().park_until(Duration::from_millis(20));
     }
     if let Ok(stream) = &mut client {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));

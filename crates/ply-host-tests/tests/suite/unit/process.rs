@@ -3,7 +3,7 @@ use ply_eval::{
     Determinism, Diagnostic, EffectAtom, Fields, HostAnswer, HostHandler, HostOp, HostRequest,
     HostRuntime, Linearity, Mode, Resource, Span, Symbol, Value, codes,
 };
-use ply_host::pool::Heard;
+use ply_host::pool::Pooled;
 use ply_host::process::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -345,7 +345,7 @@ fn spawn(
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => host.block_on(pending),
+        HostAnswer::Pending(pending) => host.pool().block_on(pending),
         // `blocking` is declared, so answering inline would be `E0428` in a real run.
         HostAnswer::Value(v) => panic!("a spawn waits in the pool: {}", v.type_name()),
     }
@@ -614,7 +614,7 @@ fn perform(
     match answer(host, op, label, &args)? {
         HostAnswer::Pending(pending) => {
             assert!(blocking, "{op:?} waited and is not declared to");
-            host.block_on(pending)
+            host.pool().block_on(pending)
         }
         HostAnswer::Value(v) => {
             assert!(!blocking, "{op:?} is declared to wait and did not");

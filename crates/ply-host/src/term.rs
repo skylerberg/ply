@@ -2,7 +2,7 @@
 //! mode, and what is typed at it. The terminal is the run's own process's, so the operations are
 //! served where `process`'s own are, and wait on that host's pool.
 
-use crate::pool::JobOutput;
+use crate::pool::{JobOutput, Pooled};
 use crate::process::ProcessHost;
 use crate::stdio::{self, Mode, Standard};
 use ply_eval::host::HostRegistry;
@@ -129,7 +129,7 @@ impl HostHandler for Operation {
                     return Err(negative_read(max, span));
                 };
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
-                let pending = host.waiting(
+                let pending = host.pool().submit(
                     span,
                     "term-input",
                     Op::Input.what(),
@@ -141,12 +141,15 @@ impl HostHandler for Operation {
                 Ok(HostAnswer::Pending(pending))
             }
             Op::SecretLine => {
-                let pending = host.waiting(
+                let pending = host.pool().submit(
                     span,
                     "term-secret-line",
                     Op::SecretLine.what(),
                     Box::new(|| match stdio::read_line() {
-                        Ok(line) => JobOutput::MaybeSecret(line),
+                        // A line nothing but `Secret`'s own readers may read; `None` at the end.
+                        Ok(line) => JobOutput::built(move || {
+                            option(line.map(|line| Value::secret(Value::str(line))))
+                        }),
                         Err(e) => {
                             JobOutput::Failed(format!("standard input could not be read: {e}"))
                         }

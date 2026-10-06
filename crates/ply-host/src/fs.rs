@@ -1,11 +1,11 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{Bell, FS_FIRST_TOKEN, Inbox, JobOutput, Pool};
+use crate::pool::{JobOutput, Pool, Pooled, option, record};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
 };
-use ply_eval::{Diagnostic, Pending, Resource, Span, Symbol, Value, codes};
+use ply_eval::{Diagnostic, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -248,7 +248,7 @@ impl FsHost {
     pub fn new(roots: Roots) -> FsHost {
         FsHost {
             roots,
-            pool: Pool::new(FS_FIRST_TOKEN),
+            pool: Pool::new(),
             held: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(Descriptors::default())),
         }
@@ -257,45 +257,11 @@ impl FsHost {
     pub fn roots(&self) -> &Roots {
         &self.roots
     }
+}
 
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn park(&self) -> Result<(), Diagnostic> {
-        self.pool.park()
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        self.pool.block_on(pending)
+impl Pooled for FsHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
     }
 }
 
@@ -383,13 +349,14 @@ impl HostHandler for Operation {
         let held = Arc::clone(&self.fs.held);
         let descriptors = Arc::clone(&self.fs.descriptors);
         let machine = req.machine;
+        let to_write = matches!(second, Second::Opening(how) if how != Opening::Read);
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
             Box::new(move || {
                 let done = run(op, &root, &first, second, &held, &descriptors, span);
-                observed(op, &root, &first, &done, machine, span);
+                observed(op, &root, &first, &done, to_write, machine, span);
                 done
             }),
         )?;
@@ -534,10 +501,13 @@ fn run(
     };
     match op {
         Op::Open => match second {
-            Second::Opening(how) => JobOutput::Opened(
-                open_file(descriptors, root, &target, how),
-                how != Opening::Read,
-            ),
+            Second::Opening(how) => {
+                let opened = open_file(descriptors, root, &target, how);
+                JobOutput::built(move || match opened {
+                    Ok(descriptor) => Value::ctor("Ok", vec![Value::Int(descriptor)]),
+                    Err(why) => Value::ctor("Err", vec![Value::ctor(why, Vec::new())]),
+                })
+            }
             _ => JobOutput::Failed("an open that does not say how reached the pool".into()),
         },
         Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
@@ -644,7 +614,10 @@ fn run(
                 .ok()
                 .and_then(|real| real.to_str().map(str::to_string)),
         ),
-        Op::Mode => JobOutput::MaybeMode(mode_of(&target)),
+        Op::Mode => {
+            let bits = mode_of(&target);
+            JobOutput::built(move || option(bits.map(mode_value)))
+        }
         Op::SetMode => match second {
             Second::Mode(bits) => JobOutput::Bool(set_mode(&target, bits)),
             _ => JobOutput::Failed("a mode change with no mode reached the pool".into()),
@@ -662,7 +635,16 @@ fn run(
                 .and_then(|to| to.to_str().map(str::to_string)),
         ),
         Op::Walk => match walk(path, &target) {
-            Ok(entries) => JobOutput::MaybeEntries(entries),
+            Ok(entries) => JobOutput::built(move || {
+                option(entries.map(|entries| {
+                    Value::list(
+                        entries
+                            .into_iter()
+                            .map(|(path, kind)| entry_value(path, kind))
+                            .collect(),
+                    )
+                }))
+            }),
             Err(bytes) => JobOutput::Refused(walk_too_large(bytes, path, span)),
         },
         Op::SetModified => match second {
@@ -672,9 +654,43 @@ fn run(
     }
 }
 
+/// The record `std.fs.Entry` names: a path and the kind constructor it names.
+fn entry_value(path: String, kind: &'static str) -> Value {
+    record([
+        ("kind", Value::ctor(kind, Vec::new())),
+        ("path", Value::str(path)),
+    ])
+}
+
+/// The record `std.fs.Mode` names, each `std.fs.Access` one triple of a path's nine permission
+/// bits.
+fn mode_value(bits: u32) -> Value {
+    let access = |triple: u32| {
+        record([
+            ("execute", Value::Bool(triple & 1 != 0)),
+            ("read", Value::Bool(triple & 4 != 0)),
+            ("write", Value::Bool(triple & 2 != 0)),
+        ])
+    };
+    record([
+        ("group", access(bits >> 3 & 7)),
+        ("other", access(bits & 7)),
+        ("owner", access(bits >> 6 & 7)),
+    ])
+}
+
 /// What `op` read of the world or wrote to it, for the record of the test whose machine asked. Taken
-/// after the operation, so a directory `temp_dir` made is known by the name it got.
-fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineId, span: Span) {
+/// after the operation, so a directory `temp_dir` made is known by the name it got. `to_write` is
+/// whether an open asked to write.
+fn observed(
+    op: Op,
+    root: &Path,
+    path: &str,
+    done: &JobOutput,
+    to_write: bool,
+    machine: MachineId,
+    span: Span,
+) {
     use crate::observe::{Read, read, wrote};
     let Ok(target) = confine(root, path, span) else {
         return;
@@ -689,10 +705,8 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineI
         // A stamp is when, not what; a sync and a lock change nothing a read answers.
         Op::ModifiedMs | Op::Sync | Op::Lock | Op::Unlock => {}
         // What an open file is read or written through is recorded when it opens.
-        Op::Open => match done {
-            JobOutput::Opened(_, true) => wrote(machine, &target),
-            _ => read(machine, Read::File, &target),
-        },
+        Op::Open if to_write => wrote(machine, &target),
+        Op::Open => read(machine, Read::File, &target),
         Op::ReadChunk | Op::WriteChunk | Op::Close => {}
         Op::WriteFile
         | Op::Append

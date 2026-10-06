@@ -7,6 +7,7 @@ mod config;
 mod fs;
 mod observe;
 mod os;
+mod password;
 mod pool;
 mod process;
 mod registry;
