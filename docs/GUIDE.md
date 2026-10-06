@@ -1229,6 +1229,9 @@ a `handle` in a member's body is compiled definition by definition and nests.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_cell`, `with_hold` or a lambda, and a call of another function.
+The depth is each task's own (§9): a task nests from where its region stands,
+whatever the tasks beside it hold, and so does the body of a `handle` whose
+clause resumes anywhere but its tail.
 Depth and work are two bounds: one entry may also make only so many calls — a
 billion by default, and none under `ply run`, where an entry that serves forever
 is a program — and a loop that never ends fails with `E0503` when that budget is
