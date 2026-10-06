@@ -1,0 +1,160 @@
+//! What the checker refuses of a hold: every way out of its region, a region name that is another's,
+//! and every use of it as data.
+
+import compiler.infer (check_dump)
+
+fn head() -> String =
+  \\effect box { write put<a>(x: a) -> Unit }
+  \\fn peek(h: Hold<Int>) -> Int / {hold.read} = hold_get(h)
+  \\fn free(x: Int) -> Unit = ()
+  \\
+
+fn checked(body: Bytes) -> String / {abort.raise} =
+  check_dump([{ name: b"m", src: bytes_concat(bytes_of_string(head()), body) }])
+
+fn accepted(body: Bytes) -> Bool / {abort.raise} = !string_starts_with(checked(body), "K;1;X;")
+
+fn refused(body: Bytes, code: String) -> Bool / {abort.raise} =
+  !accepted(body) && string_contains(checked(body), "!" ++ code ++ ":")
+
+test "a hold is read inside its region, by the body and by what the body hands it to" {
+  assert(accepted(b""));
+  assert(accepted(b"fn f() -> Int = with_hold[r](1, free) { h -> hold_get(h) + peek(h) }"));
+  assert(
+    accepted(
+      b"fn f() -> List<Int> = with_hold[r](1, free) { h -> map([1, 2], |n: Int| n + peek(h)) }",
+    ),
+  )
+}
+
+test "a hold, or a closure that reads one, is refused where it would leave the region" {
+  assert(refused(b"fn f() -> Int = { let k = with_hold[r](1, free) { h -> h }; 0 }", "E0446"));
+  assert(refused(b"fn f() -> Int = { let k = with_hold[r](1, free) { h -> [h] }; 0 }", "E0446"));
+  assert(
+    refused(
+      b"fn f() -> Int = { let k = with_hold[r](1, free) { h -> || hold_get(h) }; 0 }",
+      "E0446",
+    ),
+  );
+  assert(
+    refused(b"fn f() -> Int = { let k = with_hold[r](1, free) { h -> || peek(h) }; 0 }", "E0446"),
+  )
+}
+
+test "a hold is refused in a cell older than its region, in an operation, and in an older scheduler's task" {
+  assert(
+    refused(
+      b"fn f() -> Int = with_cell[o](None) { c -> { with_hold[r](1, free) { h -> cell_set(c, Some(h)) }; 0 } }",
+      "E0446",
+    ),
+  );
+  assert(
+    refused(b"fn f() -> Unit / {box.put} = with_hold[r](1, free) { h -> box.put(h) }", "E0446"),
+  );
+  assert(
+    refused(
+      b"fn f() -> Unit / {box.put} = with_hold[r](1, free) { h -> box.put(|| hold_get(h)) }",
+      "E0446",
+    ),
+  );
+  assert(
+    refused(
+      b"fn f() -> Int / {task.spawn} = with_hold[r](1, free) { h -> { let t = task.spawn(|| hold_get(h)); 0 } }",
+      "E0446",
+    ),
+  )
+}
+
+test "reading a hold is in the row of whatever does it, and only a region answers it" {
+  assert(refused(b"fn f(h: Hold<Int>) -> Int = hold_get(h)", "E0302"));
+  assert(refused(b"fn f(h: Hold<Int>) -> () -> Int = || hold_get(h)", "E0302"));
+  assert(refused(b"fn f() -> Unit / {hold.read} = hold.read()", "E0103"));
+  assert(refused(b"effect hold { read get() -> Int }", "E0105"))
+}
+
+test "a hold's region has a name of its own" {
+  assert(
+    refused(
+      b"fn f() -> Int = with_hold[r](1, free) { a -> with_hold[r](2, free) { b -> 0 } }",
+      "E0330",
+    ),
+  );
+  assert(
+    refused(b"fn f() -> Int = with_cell[r](1) { a -> with_hold[r](2, free) { b -> 0 } }", "E0330"),
+  );
+  assert(
+    refused(b"fn f() -> Int = with_hold[r](1, free) { a -> with_cell[r](2) { b -> 0 } }", "E0330"),
+  );
+  assert(
+    accepted(
+      b"fn f() -> Int = with_hold[r](1, free) { a -> with_hold[s](2, free) { b -> hold_get(a) + hold_get(b) } }",
+    ),
+  )
+}
+
+test "a declaration is outside every region, so none mentions a hold" {
+  assert(refused(b"type Kept = Kept(Hold<Int>)", "E0446"));
+  assert(refused(b"type Kept = new { held: Hold<Int> }", "E0446"));
+  assert(refused(b"effect io { write send(h: Hold<Int>) -> Unit }", "E0446"));
+  assert(refused(b"type Reader = Reader(() -> Int / {hold.read})", "E0446"));
+  assert(
+    accepted(
+      b"type Kept<t> = Kept(t)\nfn f() -> Int = with_hold[r](1, free) { h -> match Kept(h) { Kept(x) -> hold_get(x) } }",
+    ),
+  )
+}
+
+test "a function a hold holds may perform less than the type the hold meets says" {
+  let shared = |callback: Bytes|
+    bytes_concat_all([
+      b"effect a { write x() -> Unit }\neffect b { write y() -> Unit }\n",
+      b"fn both<| e>(h: Hold<() -> Unit / e>, g: () -> Unit / e) -> Unit / {hold.read | e} = { hold_get(h)(); g() }\n",
+      b"fn f() -> Unit / {a.x} = with_hold[r](|| a.x(), |k: () -> Unit / {a.x}| ()) { h -> both(h, ",
+      callback,
+      b") }",
+    ]);
+  assert(accepted(shared(b"|| a.x()")));
+  // The hold's function and the callback fill one row with both, which `f` did not write.
+  assert(refused(shared(b"|| b.y()"), "E0302"))
+}
+
+test "a lazy sequence whose steps read a hold is built and pulled inside the region, and refused leaving it" {
+  let stepped = |body: Bytes|
+    bytes_concat_all([
+      b"type Step<a | e> = | Done | Yield(a, () -> Step<a | e> / e)\n",
+      b"fn ended<a | e>() -> () -> Step<a | e> / e = || Done\n",
+      b"fn pulls(h: Hold<Int>) -> () -> Step<Int | {hold.read}> / {hold.read} = || Yield(hold_get(h), ended())\n",
+      body,
+    ]);
+  assert(
+    accepted(
+      stepped(
+        b"fn f() -> Int = with_hold[r](1, free) { h -> match pulls(h)() { Yield(x, _) -> x, Done -> 0 } }",
+      ),
+    ),
+  );
+  assert(
+    refused(
+      stepped(b"fn f() -> Int = { let s = with_hold[r](1, free) { h -> pulls(h) }; 0 }"),
+      "E0446",
+    ),
+  );
+  // A step it answered holds the rest of the sequence, and says so in the row it is given.
+  assert(
+    refused(
+      stepped(b"fn f() -> Int = { let s = with_hold[r](1, free) { h -> pulls(h)() }; 0 }"),
+      "E0446",
+    ),
+  )
+}
+
+test "a hold is not data: it is not compared, ordered, hashed or derived over" {
+  assert(refused(b"fn f(a: Hold<Int>, b: Hold<Int>) -> Bool = a == b", "E0201"));
+  assert(refused(b"fn f(a: Hold<Int>, b: Hold<Int>) -> Bool = [a] != [b]", "E0201"));
+  assert(refused(b"fn f(a: Hold<Int>, b: Hold<Int>) -> Bool = a < b", "E0201"));
+  assert(refused(b"fn f(a: Hold<Int>, b: Hold<Int>) -> Ordering = compare(a, b)", "E0206"));
+  assert(refused(b"fn f(a: Hold<Int>) -> Bytes = digest(a)", "E0206"));
+  assert(
+    refused(b"fn f(a: Hold<Int>) -> Map<Hold<Int>, Int> = map_insert(map_new(), a, 1)", "E0206"),
+  )
+}
