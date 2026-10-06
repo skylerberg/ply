@@ -1627,7 +1627,9 @@ go anyway: `release` runs on what `acquire` answered when `body` returns, when a
 clause unwinds through it this way or a raise does (§6.8), and when its task is
 cancelled (§9), where the bracket stands and with the handlers around it. A `release` that fails
 replaces whatever was unwinding. A runtime failure ends the run, so nothing more
-runs then, `release` included. Nested brackets release innermost first.
+runs then, `release` included. Nested brackets release innermost first. A cancel
+takes no answer from an `acquire` and no wait from a `release`: it lands when
+that one returns (§9), so what was acquired is released, and wholly.
 
 ### 6.7 Unhandled effects
 
@@ -2003,7 +2005,9 @@ nondet effect task   { write spawn<a | e>(body: () -> a / e) -> Task<a> / e
                        write channel<a>(capacity: Int) -> Chan<a>
                        write send<a>(c: Chan<a>, x: a) -> Bool
                        write recv<a>(c: Chan<a>) -> Option<a>
-                       write close<a>(c: Chan<a>) -> Unit }
+                       write close<a>(c: Chan<a>) -> Unit
+                       write select<a>(arms: List<(Chan<a>, Option<a>)>, wait: Bool)
+                         -> Option<(Int, Option<a>)> }
 nondet effect clock  { read  now() -> Instant
                        write sleep(d: Duration) -> Unit }
 nondet effect random { write next() -> Int
@@ -2021,7 +2025,8 @@ effect sim           { read  seed() -> Int }
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its
-  row, a captured channel as its `task.send`, `task.recv` or `task.close`, and
+  row, a captured channel as its `task.send`, `task.recv`, `task.close` or
+  `task.select`, and
   either as the `sim.read` of a `simulate` it opens to use one, so a function
   whose row carries any of these may not leave the region. A task or channel
   from outside may not come in either: the region may not name a binding from
@@ -2038,16 +2043,25 @@ effect sim           { read  seed() -> Int }
   scheduler sees nothing of it. A branch may not open a region (`E0309`): a
   region's schedule is drawn from its entry's seed in the order regions open.
 
-`task.cancel(t)` stops `t` where it stands: a sleep, a join or a host operation
-it waits on is let go, and it performs nothing more but the `release` of each
-`bracket` it stands in (§6.6). When it next runs it only unwinds, releasing what
-it holds. The cancel answers `false` for a task that had
-already ended and leaves its answer alone. `task.await(t)` is a join that answers
-`Some` of what `t` answered, or `None` once it was cancelled; `task.join` of a
-cancelled task has nothing to answer and raises (§6.8). A task cannot cancel
-itself or the region's body. A deadline is the two together: one task sleeps and
-cancels the other, which a third awaits. Every step a cancelled task took is read
-against the cancel, so the search tries cancelling it earlier and later.
+`task.cancel(t)` stops `t` where it stands: a sleep, a join, a channel or a host
+operation it waits on is let go, an operation that was answered and that it has
+not yet run on loses its answer, and it performs nothing more but the `release`
+of each `bracket` it stands in (§6.6). When it next runs it only unwinds,
+releasing what it holds. A bracket is where an answer is kept. Inside an
+`acquire` a cancel lets go of a wait and takes no answer: the `acquire` runs on,
+an operation that answers at once still answering and one that would wait
+ending it, and the cancel lands when it returns, with what it answered released.
+Inside a `release` a cancel lets go of nothing, and lands when the `release`
+returns. The cancel answers `false` for a task that had already ended, whose
+answer it leaves alone, and for one a cancel has already reached. `task.await(t)`
+is a join that answers `Some` of what `t` answered, or `None` once it was
+cancelled; `task.join` of a cancelled task has nothing to answer and raises
+(§6.8). A task cannot cancel itself or the region's body. A deadline is the two
+together: one task sleeps and cancels the other, which a third awaits. A cancel
+is read against the step its task took last and each step the task takes after
+it, and a task cancelled before it ran takes a step that runs nothing, so the
+search tries the cancel a step earlier and a step later, and from each of those
+runs the next, until it has landed everywhere it could.
 
 `task.channel(n)` makes a channel holding up to `n` values no receiver has taken;
 `0` is a rendezvous, where a send waits for the receive that takes it. A send
@@ -2057,11 +2071,27 @@ sent. `task.close(c)` ends sending: a waiting receiver hears `None` and a waitin
 sender `false`, a later send answers `false` without sending, and receives take
 what was queued before the close, then `None`. Closing twice changes nothing,
 and a negative capacity raises (§6.8). Cancelling a task that waits on a
-channel lets go of its wait, and a value it was sending is dropped. Every
+channel lets go of its wait, and a value it was sending is dropped; a value a
+receive was answered goes with a receiver cancelled before it ran on it, unless
+the receive is a bracket's `acquire`. Every
 operation on one channel is ordered against every other on it, so the search
 tries each order two senders or two receivers could take. A race is one channel:
 each worker sends what it answers, the first receive wins, and cancelling the
 others stops them.
+
+`task.select(arms, wait)` goes on one of several channel operations. An arm is a
+channel beside `None`, to receive from it, or `Some(x)`, to send `x` to it. The
+first arm, in the order given, that can go without waiting goes, and the select
+answers `Some((i, got))`: the arm's index, and `Some` of the value it received
+or sent, or `None` where its channel was closed, a receive finding it closed and
+empty and a send being refused. When no arm can go, `wait: false` answers `None`
+at once, and `wait: true` waits on every arm, standing in each channel's queue
+where a send or a receive would, and goes on the first another task makes ready,
+leaving the others as if it had not waited. The order of the arms is the only
+priority, so a caller that wants a later arm to have its turn rotates them, as
+`std.chan` does. The arms carry one type: channels of different types are
+selected over as channels of one sum. A select is ordered against every
+operation on each of its arms' channels.
 
 Tasks interleave only at `task`, `clock` and `random` operations; any two
 allocations, and two accesses to one cell with a write, are ordered. A

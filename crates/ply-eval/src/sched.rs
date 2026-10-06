@@ -3,9 +3,11 @@
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
 use crate::region::SimId;
 use crate::region::{StepSite, Trail};
-use crate::sim::{Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
-use crate::value::Value;
-use crate::{Diagnostic, Span, codes};
+use crate::sim::{
+    Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId, ended, liveness,
+};
+use crate::value::{Fields, Value};
+use crate::{Diagnostic, Mode, Span, Symbol, codes};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
@@ -44,6 +46,37 @@ pub fn capacity_of(capacity: i64, span: Span) -> Result<usize, Diagnostic> {
         .primary(span, "made here")
         .note("a capacity is how many sent values may wait for a receiver; `0` is a rendezvous")
     })
+}
+
+/// The arms `task.select` was handed: each a channel beside `None` to receive from it or `Some`
+/// of a value to send to it.
+pub fn select_arms(
+    arms: &Value,
+    span: Span,
+) -> Result<Vec<(ChanHandle, Option<Value>)>, Diagnostic> {
+    let what = "`task.select`";
+    let arm_error = |got: &Value| {
+        crate::value::type_error(span, what, "a channel beside what to send on it", got)
+    };
+    arms.as_list(span, what)?
+        .iter()
+        .map(|arm| {
+            let Value::Record(fields) = arm else {
+                return Err(arm_error(arm));
+            };
+            let (Some(chan), Some(Value::Ctor { name, args })) =
+                (fields.named("_0"), fields.named("_1"))
+            else {
+                return Err(arm_error(arm));
+            };
+            let send = match (name.as_str(), args.as_slice()) {
+                ("None", []) => None,
+                ("Some", [value]) => Some(value.clone()),
+                _ => return Err(arm_error(arm)),
+            };
+            Ok((chan.as_chan(span, what)?, send))
+        })
+        .collect()
 }
 
 pub enum Turn<K, B> {
@@ -138,10 +171,55 @@ struct Channel {
     closed: bool,
 }
 
+/// How a send that does not wait went: sent or refused by a closed channel, or the value back.
+enum Sent {
+    Went(bool),
+    Waits(Value),
+}
+
 fn release(released: &Released, id: TaskId) {
     let mut ids = released.take();
     ids.push(id);
     released.set(ids);
+}
+
+/// One arm of a `task.select`: a receive from `chan`, or a send of `send` to it.
+struct Arm {
+    chan: ChanId,
+    send: Option<Value>,
+}
+
+/// What a cancel let go of. Which of the cancel and another task's step on it comes first decides
+/// whether the cancelled task had its answer, so a seeded region records it against the cancel.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LetGo {
+    Nothing,
+    /// A join or an await of this task.
+    Task(TaskId),
+    /// A send, a receive or a select on these channels.
+    Chans(Vec<ChanId>),
+}
+
+/// What `task.cancel` did beside answering.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Stopped<B> {
+    /// Whether it stopped the task, which is what it answered.
+    pub stopped: bool,
+    /// The task had ended before the cancel came, so the cancel read only that.
+    pub ended: bool,
+    /// The body of a task that never started, for the caller to release.
+    pub unstarted: Option<B>,
+    pub let_go: LetGo,
+}
+
+/// A `bracket`'s `acquire` or its `release`: where a cancel does not take a task's answer from it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shield {
+    /// An operation that answers keeps its answer and a wait is let go; the cancel lands when the
+    /// `acquire` returns, so what it took is released.
+    Acquire,
+    /// Nothing is let go; the cancel lands when the `release` returns.
+    Release,
 }
 
 enum Wait {
@@ -173,6 +251,11 @@ enum Wait {
         chan: ChanId,
         span: Span,
     },
+    /// A select none of whose arms could go, waiting on every arm's channel at once.
+    Select {
+        arms: Vec<Arm>,
+        span: Span,
+    },
 }
 
 enum TaskState<K, B> {
@@ -186,6 +269,9 @@ enum TaskState<K, B> {
     Failed,
     /// Stopped by `task.cancel` before it finished: it answers nothing.
     Cancelled,
+    /// Cancelled before it started, in a seeded region: enabled for one turn that runs nothing, so
+    /// the search has a step of the task to order against the cancel.
+    Dropped,
 }
 
 struct Task<K, B> {
@@ -196,6 +282,13 @@ struct Task<K, B> {
     joiners: Vec<TaskId>,
     /// No handle to it is left, so a production region retires it once it is done.
     unheld: bool,
+    /// A cancel reached it: a later one changes nothing, and every step it still takes reads it.
+    cancelled: bool,
+    /// A cancel is held back while it stands in a bracket's `acquire` or `release`.
+    stopping: bool,
+    /// The `acquire`s and the `release`s it stands in.
+    acquiring: u32,
+    releasing: u32,
 }
 
 impl<K, B> Task<K, B> {
@@ -206,6 +299,10 @@ impl<K, B> Task<K, B> {
             stamp,
             joiners: Vec::new(),
             unheld: false,
+            cancelled: false,
+            stopping: false,
+            acquiring: 0,
+            releasing: 0,
         }
     }
 }
@@ -370,43 +467,61 @@ impl<K, B> Scheduler<K, B> {
             )));
         }
 
-        let enabled = loop {
-            let enabled: Vec<TaskId> = self.ready.iter().copied().collect();
-            if !enabled.is_empty() {
-                break enabled;
+        loop {
+            let enabled = loop {
+                let enabled: Vec<TaskId> = self.ready.iter().copied().collect();
+                if !enabled.is_empty() {
+                    break enabled;
+                }
+                if let Some(wake) = clock.advance() {
+                    self.wake(&wake.woken)?;
+                    continue;
+                }
+                return if self.unfinished == 0 {
+                    self.complete()
+                } else {
+                    Err(self.err_deadlock(clock.now(), trail.seed()))
+                };
+            };
+
+            if trail.point() as u32 >= self.max_steps {
+                return Err(self.err_step_budget(trail.seed()));
             }
-            if let Some(wake) = clock.advance() {
-                self.wake(&wake.woken)?;
+
+            let choice = self.choose(trail, &enabled)?;
+            let task = enabled[choice];
+            self.tick(task);
+            let t = self.task_mut(task)?;
+            let dropped = matches!(t.state, TaskState::Dropped);
+            // Each step a cancelled task takes could have come before its cancel instead.
+            let mut accesses = StepFootprint::new();
+            if t.cancelled {
+                accesses.insert(liveness(task, Mode::Read));
+            }
+            if dropped {
+                accesses.insert(ended(task));
+            }
+            let stamp = t.stamp.clone();
+            trail.push_step(StepRecord {
+                region: self.region,
+                task,
+                enabled,
+                choice: choice as u16,
+                at: clock.now(),
+                accesses,
+                site: None,
+                stamp,
+            });
+            if dropped {
+                self.ready.remove(&task);
+                self.task_mut(task)?.state = TaskState::Cancelled;
+                self.settle_cancelled(task)?;
                 continue;
             }
-            return if self.unfinished == 0 {
-                self.complete()
-            } else {
-                Err(self.err_deadlock(clock.now(), trail.seed()))
-            };
-        };
-
-        if trail.point() as u32 >= self.max_steps {
-            return Err(self.err_step_budget(trail.seed()));
+            let resumption = self.take_ready(task)?;
+            self.current = Some(task);
+            return Ok(Turn::Run { task, resumption });
         }
-
-        let choice = self.choose(trail, &enabled)?;
-        let task = enabled[choice];
-        let resumption = self.take_ready(task)?;
-
-        self.tick(task);
-        trail.push_step(StepRecord {
-            region: self.region,
-            task,
-            enabled,
-            choice: choice as u16,
-            at: clock.now(),
-            accesses: StepFootprint::new(),
-            site: None,
-            stamp: self.task_mut(task)?.stamp.clone(),
-        });
-        self.current = Some(task);
-        Ok(Turn::Run { task, resumption })
     }
 
     /// Costs what is ready and what resolved, never what the region has ever run.
@@ -720,15 +835,17 @@ impl<K, B> Scheduler<K, B> {
     }
 
     /// Stops `target` where it stands: whatever it waits on is let go, and when it next runs it
-    /// only unwinds. Answers whether it stopped anything, and a body never started, for the caller
-    /// to release; a task that already ended, or is already unwinding, answers `false`.
+    /// only unwinds. A task standing in a bracket's `acquire` keeps an answer it was already
+    /// given, and one standing in a `release` keeps its wait too; the cancel lands when that
+    /// returns. Answers whether it stopped anything; a task that already ended, or that a cancel
+    /// already reached, answers `false`.
     pub fn cancel(
         &mut self,
         k: K,
         target: &TaskHandle,
         span: Span,
         clock: Option<&mut Clock>,
-    ) -> Result<Option<B>, Diagnostic> {
+    ) -> Result<Stopped<B>, Diagnostic> {
         let task = self.running()?;
         if target.region() != self.region {
             return Err(err_foreign_task(span, target.id()));
@@ -742,73 +859,162 @@ impl<K, B> Scheduler<K, B> {
             .primary(span, "cancelled here")
             .note("a task cancels another one: the region's own body, and a task itself, are not cancelled"));
         }
-        let state = match self.tasks.get_mut(&target) {
-            None => return Err(err_unknown_task(span, target)),
-            Some(t) => std::mem::replace(&mut t.state, TaskState::Cancelled),
+        let seeded = self.policy == Policy::Seeded;
+        let Some(t) = self.tasks.get_mut(&target) else {
+            return Err(err_unknown_task(span, target));
         };
-        let (stopped, body) = match state {
-            TaskState::Ready(Resumption::Start { body, .. }) => {
-                self.ready.remove(&target);
-                self.settle_cancelled(target)?;
-                (true, Some(body))
-            }
-            TaskState::Ready(Resumption::Resume { k, .. }) => {
-                self.task_mut(target)?.state = TaskState::Ready(Resumption::Cancel { k });
-                (true, None)
-            }
-            TaskState::Blocked { wait, k } => {
-                match wait {
-                    Wait::Timer { .. } => {
-                        if let Some(clock) = clock {
-                            clock.cancel(target);
-                        }
-                    }
-                    Wait::Join { task: on, .. } | Wait::Await { task: on, .. } => {
-                        if let Some(t) = self.tasks.get_mut(&on) {
-                            t.joiners.retain(|j| *j != target);
-                        }
-                    }
-                    Wait::Host { pending, .. } => {
-                        self.parked.remove(&pending.token);
-                    }
-                    Wait::Send { chan, .. } => {
-                        if let Some(ch) = self.channels.get_mut(&chan) {
-                            ch.senders.retain(|t| *t != target);
-                        }
-                    }
-                    Wait::Recv { chan, .. } => {
-                        if let Some(ch) = self.channels.get_mut(&chan) {
-                            ch.receivers.retain(|t| *t != target);
-                        }
+        let ended = matches!(
+            t.state,
+            TaskState::Done(_) | TaskState::Failed | TaskState::Cancelled | TaskState::Dropped
+        );
+        let stops = !ended && !t.cancelled;
+        let mut stopped = Stopped {
+            stopped: stops,
+            ended,
+            unstarted: None,
+            let_go: LetGo::Nothing,
+        };
+        if stops {
+            t.cancelled = true;
+            let (acquiring, releasing) = (t.acquiring > 0, t.releasing > 0);
+            match std::mem::replace(&mut t.state, TaskState::Cancelled) {
+                TaskState::Ready(Resumption::Start { body, .. }) => {
+                    stopped.unstarted = Some(body);
+                    if seeded {
+                        t.state = TaskState::Dropped;
+                    } else {
+                        self.ready.remove(&target);
+                        self.settle_cancelled(target)?;
                     }
                 }
-                self.make_ready(target, Resumption::Cancel { k });
-                (true, None)
+                answered @ TaskState::Ready(
+                    Resumption::Resume { .. } | Resumption::Raise { .. },
+                ) if acquiring || releasing => {
+                    t.state = answered;
+                    t.stopping = true;
+                }
+                TaskState::Ready(Resumption::Resume { k, .. } | Resumption::Raise { k, .. }) => {
+                    t.state = TaskState::Ready(Resumption::Cancel { k });
+                }
+                waiting @ TaskState::Blocked { .. } if releasing => {
+                    t.state = waiting;
+                    t.stopping = true;
+                }
+                TaskState::Blocked { wait, k } => {
+                    stopped.let_go = self.let_go(target, wait, clock);
+                    self.make_ready(target, Resumption::Cancel { k });
+                    // The cancel is what woke it, where a task that could run was only overtaken.
+                    self.absorb(target, task);
+                }
+                other => {
+                    t.state = other;
+                    return Err(self.internal(format!("{target} was cancelled while running")));
+                }
             }
-            other @ (TaskState::Done(_)
-            | TaskState::Failed
-            | TaskState::Cancelled
-            | TaskState::Ready(Resumption::Cancel { .. } | Resumption::Raise { .. })) => {
-                self.task_mut(target)?.state = other;
-                (false, None)
-            }
-            other @ (TaskState::Running | TaskState::Ready(Resumption::Enter)) => {
-                self.task_mut(target)?.state = other;
-                return Err(self.internal(format!("{target} was cancelled while running")));
-            }
-        };
-        if stopped {
-            self.absorb(target, task);
         }
         self.make_ready(
             task,
             Resumption::Resume {
                 k,
-                value: Value::Bool(stopped),
+                value: Value::Bool(stops),
             },
         );
         self.current = None;
-        Ok(body)
+        Ok(stopped)
+    }
+
+    /// Takes `target` off whatever `wait` had it waiting on.
+    fn let_go(&mut self, target: TaskId, wait: Wait, clock: Option<&mut Clock>) -> LetGo {
+        match wait {
+            Wait::Timer { .. } => {
+                if let Some(clock) = clock {
+                    clock.cancel(target);
+                }
+                LetGo::Nothing
+            }
+            Wait::Join { task: on, .. } | Wait::Await { task: on, .. } => {
+                if let Some(t) = self.tasks.get_mut(&on) {
+                    t.joiners.retain(|j| *j != target);
+                }
+                LetGo::Task(on)
+            }
+            Wait::Host { pending, .. } => {
+                self.parked.remove(&pending.token);
+                LetGo::Nothing
+            }
+            Wait::Send { chan, .. } | Wait::Recv { chan, .. } => {
+                self.unwait(target, [chan]);
+                LetGo::Chans(vec![chan])
+            }
+            Wait::Select { arms, .. } => {
+                let mut chans: Vec<ChanId> = arms.iter().map(|arm| arm.chan).collect();
+                chans.sort();
+                chans.dedup();
+                self.unwait(target, chans.iter().copied());
+                LetGo::Chans(chans)
+            }
+        }
+    }
+
+    /// Takes `task` out of the queues of each of `chans`.
+    fn unwait(&mut self, task: TaskId, chans: impl IntoIterator<Item = ChanId>) {
+        for chan in chans {
+            if let Some(ch) = self.channels.get_mut(&chan) {
+                ch.senders.retain(|t| *t != task);
+                ch.receivers.retain(|t| *t != task);
+            }
+        }
+    }
+
+    /// The running task enters a bracket's `acquire` or `release`.
+    pub fn shield(&mut self, shield: Shield) -> Option<TaskId> {
+        let task = self.current?;
+        let t = self.tasks.get_mut(&task)?;
+        match shield {
+            Shield::Acquire => t.acquiring += 1,
+            Shield::Release => t.releasing += 1,
+        }
+        Some(task)
+    }
+
+    /// `task` leaves what [`Scheduler::shield`] entered. Answers whether a cancel was held back
+    /// and lands now: the task is to unwind from here.
+    pub fn unshield(&mut self, task: TaskId, shield: Shield) -> bool {
+        let Some(t) = self.tasks.get_mut(&task) else {
+            return false;
+        };
+        match shield {
+            Shield::Acquire => t.acquiring = t.acquiring.saturating_sub(1),
+            Shield::Release => t.releasing = t.releasing.saturating_sub(1),
+        }
+        let lands = t.stopping && t.acquiring == 0 && t.releasing == 0;
+        if lands {
+            t.stopping = false;
+        }
+        lands
+    }
+
+    /// Lets go of a wait `task` just began with a cancel held back for the `acquire` it stands
+    /// in: there an operation that answers keeps its answer, and a wait does not start.
+    pub fn refuse_wait(&mut self, task: TaskId, clock: Option<&mut Clock>) -> LetGo {
+        let Some(t) = self.tasks.get_mut(&task) else {
+            return LetGo::Nothing;
+        };
+        if !t.stopping || t.releasing > 0 || !matches!(t.state, TaskState::Blocked { .. }) {
+            return LetGo::Nothing;
+        }
+        t.stopping = false;
+        match std::mem::replace(&mut t.state, TaskState::Cancelled) {
+            TaskState::Blocked { wait, k } => {
+                let let_go = self.let_go(task, wait, clock);
+                self.make_ready(task, Resumption::Cancel { k });
+                let_go
+            }
+            other => {
+                t.state = other;
+                LetGo::Nothing
+            }
+        }
     }
 
     /// The running task finished unwinding after a cancel.
@@ -881,30 +1087,13 @@ impl<K, B> Scheduler<K, B> {
     ) -> Result<(), Diagnostic> {
         let task = self.running()?;
         let id = self.channel_of(chan, span)?;
-        let stamp = self.stamp_of(task);
-        let Some(ch) = self.channels.get_mut(&id) else {
-            return self.answer(task, k, Value::Bool(false));
+        let value = match self.send_now(task, id, value)? {
+            Sent::Went(sent) => return self.answer(task, k, Value::Bool(sent)),
+            Sent::Waits(value) => value,
         };
-        if ch.closed {
-            return self.answer(task, k, Value::Bool(false));
+        if let Some(ch) = self.channels.get_mut(&id) {
+            ch.senders.push_back(task);
         }
-        if let Some(receiver) = ch.receivers.pop_front() {
-            let kr = self.unblock(receiver)?;
-            self.absorb(receiver, task);
-            self.make_ready(
-                receiver,
-                Resumption::Resume {
-                    k: kr,
-                    value: some(value),
-                },
-            );
-            return self.answer(task, k, Value::Bool(true));
-        }
-        if ch.queue.len() < ch.capacity {
-            ch.queue.push_back((value, stamp));
-            return self.answer(task, k, Value::Bool(true));
-        }
-        ch.senders.push_back(task);
         self.task_mut(task)?.state = TaskState::Blocked {
             wait: Wait::Send {
                 chan: id,
@@ -917,11 +1106,143 @@ impl<K, B> Scheduler<K, B> {
         Ok(())
     }
 
+    /// A send that does not wait: handed to the longest-waiting receiver, queued while there is
+    /// room, or refused by a closed channel.
+    fn send_now(&mut self, task: TaskId, id: ChanId, value: Value) -> Result<Sent, Diagnostic> {
+        let stamp = self.stamp_of(task);
+        let Some(ch) = self.channels.get_mut(&id) else {
+            return Ok(Sent::Went(false));
+        };
+        if ch.closed {
+            return Ok(Sent::Went(false));
+        }
+        if let Some(receiver) = ch.receivers.pop_front() {
+            self.deliver(receiver, id, Some(value), task)?;
+            return Ok(Sent::Went(true));
+        }
+        if ch.queue.len() < ch.capacity {
+            ch.queue.push_back((value, stamp));
+            return Ok(Sent::Went(true));
+        }
+        Ok(Sent::Waits(value))
+    }
+
+    /// Readies `receiver`, which waited to receive on `chan`, with `value`, or with the close.
+    fn deliver(
+        &mut self,
+        receiver: TaskId,
+        chan: ChanId,
+        value: Option<Value>,
+        by: TaskId,
+    ) -> Result<(), Diagnostic> {
+        let t = self.task_mut(receiver)?;
+        let (k, answer) = match std::mem::replace(&mut t.state, TaskState::Running) {
+            TaskState::Blocked {
+                wait: Wait::Recv { .. },
+                k,
+            } => (k, value.map_or_else(none, some)),
+            TaskState::Blocked {
+                wait: Wait::Select { arms, .. },
+                k,
+            } => {
+                let at = arms
+                    .iter()
+                    .position(|arm| arm.chan == chan && arm.send.is_none());
+                self.unwait(receiver, arms.iter().map(|arm| arm.chan));
+                match at {
+                    Some(at) => (k, chosen(at, value)),
+                    None => {
+                        return Err(self.internal(format!(
+                            "{receiver} was taken as a receiver on {chan}, which its select does not receive from"
+                        )));
+                    }
+                }
+            }
+            other => {
+                t.state = other;
+                return Err(self.internal(format!(
+                    "{receiver} was taken as a receiver but was not receiving"
+                )));
+            }
+        };
+        self.absorb(receiver, by);
+        self.make_ready(receiver, Resumption::Resume { k, value: answer });
+        Ok(())
+    }
+
+    /// Readies `sender`, which waited to send on `chan`, with whether its value went, and
+    /// answers the value.
+    fn take_sent(
+        &mut self,
+        sender: TaskId,
+        chan: ChanId,
+        sent: bool,
+        by: TaskId,
+    ) -> Result<Value, Diagnostic> {
+        let t = self.task_mut(sender)?;
+        let (k, value, answer) = match std::mem::replace(&mut t.state, TaskState::Running) {
+            TaskState::Blocked {
+                wait: Wait::Send { value, .. },
+                k,
+            } => (k, value, Value::Bool(sent)),
+            TaskState::Blocked {
+                wait: Wait::Select { mut arms, .. },
+                k,
+            } => {
+                let at = arms
+                    .iter()
+                    .position(|arm| arm.chan == chan && arm.send.is_some());
+                self.unwait(sender, arms.iter().map(|arm| arm.chan));
+                match at.and_then(|at| arms[at].send.take().map(|value| (at, value))) {
+                    Some((at, value)) => {
+                        let answer = chosen(at, sent.then(|| value.clone()));
+                        (k, value, answer)
+                    }
+                    None => {
+                        return Err(self.internal(format!(
+                            "{sender} was taken as a sender on {chan}, which its select does not send to"
+                        )));
+                    }
+                }
+            }
+            other => {
+                t.state = other;
+                return Err(self.internal(format!(
+                    "{sender} was taken as a sender but was not sending"
+                )));
+            }
+        };
+        self.absorb(sender, by);
+        self.make_ready(sender, Resumption::Resume { k, value: answer });
+        Ok(value)
+    }
+
     /// Takes the oldest value sent, `None` once the channel is closed and empty; otherwise the task
     /// waits for a send.
     pub fn recv(&mut self, k: K, chan: &ChanHandle, span: Span) -> Result<(), Diagnostic> {
         let task = self.running()?;
         let id = self.channel_of(chan, span)?;
+        if let Some(taken) = self.receive_now(task, id)? {
+            return self.answer(task, k, taken.map_or_else(none, some));
+        }
+        if let Some(ch) = self.channels.get_mut(&id) {
+            ch.receivers.push_back(task);
+        }
+        self.task_mut(task)?.state = TaskState::Blocked {
+            wait: Wait::Recv { chan: id, span },
+            k,
+        };
+        self.current = None;
+        Ok(())
+    }
+
+    /// A receive that does not wait: `Some` of the oldest value sent, `Some(None)` from a channel
+    /// closed and empty, and `None` where it would wait.
+    fn receive_now(
+        &mut self,
+        task: TaskId,
+        id: ChanId,
+    ) -> Result<Option<Option<Value>>, Diagnostic> {
         enum Taken {
             Queued(Value, Stamp),
             From(TaskId),
@@ -938,7 +1259,6 @@ impl<K, B> Scheduler<K, B> {
                 } else if ch.closed {
                     Taken::Closed
                 } else {
-                    ch.receivers.push_back(task);
                     Taken::Waits
                 }
             }
@@ -952,45 +1272,22 @@ impl<K, B> Scheduler<K, B> {
                     .get_mut(&id)
                     .and_then(|ch| ch.senders.pop_front());
                 if let Some(sender) = waiting {
-                    let (ks, sent) = self.unblock_sender(sender)?;
                     let sent_at = self.stamp_of(sender);
+                    let sent = self.take_sent(sender, id, true, task)?;
                     if let Some(ch) = self.channels.get_mut(&id) {
                         ch.queue.push_back((sent, sent_at));
                     }
-                    self.absorb(sender, task);
-                    self.make_ready(
-                        sender,
-                        Resumption::Resume {
-                            k: ks,
-                            value: Value::Bool(true),
-                        },
-                    );
                 }
                 self.retire_if_spent(id);
-                self.answer(task, k, some(value))
+                Ok(Some(Some(value)))
             }
             Taken::From(sender) => {
-                let (ks, sent) = self.unblock_sender(sender)?;
                 self.absorb(task, sender);
-                self.absorb(sender, task);
-                self.make_ready(
-                    sender,
-                    Resumption::Resume {
-                        k: ks,
-                        value: Value::Bool(true),
-                    },
-                );
-                self.answer(task, k, some(sent))
+                let sent = self.take_sent(sender, id, true, task)?;
+                Ok(Some(Some(sent)))
             }
-            Taken::Closed => self.answer(task, k, none()),
-            Taken::Waits => {
-                self.task_mut(task)?.state = TaskState::Blocked {
-                    wait: Wait::Recv { chan: id, span },
-                    k,
-                };
-                self.current = None;
-                Ok(())
-            }
+            Taken::Closed => Ok(Some(None)),
+            Taken::Waits => Ok(None),
         }
     }
 
@@ -999,40 +1296,86 @@ impl<K, B> Scheduler<K, B> {
     pub fn close(&mut self, k: K, chan: &ChanHandle, span: Span) -> Result<(), Diagnostic> {
         let task = self.running()?;
         let id = self.channel_of(chan, span)?;
-        let (receivers, senders) = match self.channels.get_mut(&id) {
-            None => (VecDeque::new(), VecDeque::new()),
-            Some(ch) => {
-                ch.closed = true;
-                (
-                    std::mem::take(&mut ch.receivers),
-                    std::mem::take(&mut ch.senders),
-                )
-            }
-        };
-        for receiver in receivers {
-            let kr = self.unblock(receiver)?;
-            self.absorb(receiver, task);
-            self.make_ready(
-                receiver,
-                Resumption::Resume {
-                    k: kr,
-                    value: none(),
-                },
-            );
+        if let Some(ch) = self.channels.get_mut(&id) {
+            ch.closed = true;
         }
-        for sender in senders {
-            let (ks, _) = self.unblock_sender(sender)?;
-            self.absorb(sender, task);
-            self.make_ready(
-                sender,
-                Resumption::Resume {
-                    k: ks,
-                    value: Value::Bool(false),
-                },
-            );
+        // One at a time off the live queues: a select may wait on both sides of one channel.
+        while let Some(receiver) = self
+            .channels
+            .get_mut(&id)
+            .and_then(|ch| ch.receivers.pop_front())
+        {
+            self.deliver(receiver, id, None, task)?;
+        }
+        while let Some(sender) = self
+            .channels
+            .get_mut(&id)
+            .and_then(|ch| ch.senders.pop_front())
+        {
+            self.take_sent(sender, id, false, task)?;
         }
         self.retire_if_spent(id);
         self.answer(task, k, Value::Unit)
+    }
+
+    /// The first arm, in the order given, that can go without waiting goes, and the task hears
+    /// `Some((index, got))`: `got` is `Some` of the value received or sent, and `None` where the
+    /// arm's channel was closed. With no arm able to go the task hears `None` at once, or with
+    /// `wait` waits on every arm for the first that can.
+    pub fn select(
+        &mut self,
+        k: K,
+        arms: Vec<(ChanHandle, Option<Value>)>,
+        wait: bool,
+        span: Span,
+    ) -> Result<(), Diagnostic> {
+        let task = self.running()?;
+        let mut waiting = Vec::with_capacity(arms.len());
+        for (chan, send) in arms {
+            waiting.push(Arm {
+                chan: self.channel_of(&chan, span)?,
+                send,
+            });
+        }
+        for (at, arm) in waiting.iter_mut().enumerate() {
+            let got = match arm.send.take() {
+                None => self.receive_now(task, arm.chan)?,
+                Some(value) => match self.send_now(task, arm.chan, value.clone())? {
+                    Sent::Went(sent) => Some(sent.then_some(value)),
+                    Sent::Waits(value) => {
+                        arm.send = Some(value);
+                        None
+                    }
+                },
+            };
+            if let Some(got) = got {
+                return self.answer(task, k, chosen(at, got));
+            }
+        }
+        if !wait {
+            return self.answer(task, k, none());
+        }
+        for arm in &waiting {
+            if let Some(ch) = self.channels.get_mut(&arm.chan) {
+                let queue = if arm.send.is_some() {
+                    &mut ch.senders
+                } else {
+                    &mut ch.receivers
+                };
+                if !queue.contains(&task) {
+                    queue.push_back(task);
+                }
+            }
+        }
+        self.task_mut(task)?.state = TaskState::Blocked {
+            wait: Wait::Select {
+                arms: waiting,
+                span,
+            },
+            k,
+        };
+        self.current = None;
+        Ok(())
     }
 
     /// The channel a handle names in this region, which may be spent.
@@ -1052,21 +1395,6 @@ impl<K, B> Scheduler<K, B> {
             ch.closed && ch.queue.is_empty() && ch.senders.is_empty() && ch.receivers.is_empty()
         }) {
             self.channels.remove(&id);
-        }
-    }
-
-    /// A sender waiting on a full channel, resumed: its continuation and the value it held.
-    fn unblock_sender(&mut self, task: TaskId) -> Result<(K, Value), Diagnostic> {
-        let t = self.task_mut(task)?;
-        match std::mem::replace(&mut t.state, TaskState::Running) {
-            TaskState::Blocked {
-                wait: Wait::Send { value, .. },
-                k,
-            } => Ok((k, value)),
-            other => {
-                t.state = other;
-                Err(self.internal(format!("{task} was taken as a sender but was not sending")))
-            }
         }
     }
 
@@ -1291,29 +1619,7 @@ impl<K, B> Scheduler<K, B> {
         )
         .primary(self.span, "no task in this region can make progress");
         for (id, wait, origin) in &blocked {
-            let (span, message) = match wait {
-                Wait::Join { task, span } | Wait::Await { task, span } => {
-                    (*span, format!("{id} waits here for {task} to finish"))
-                }
-                // Unreachable while the clock has a timer: time would have advanced instead.
-                Wait::Timer { until, span } => (
-                    *span,
-                    format!("{id} sleeps here until {until}ns, and it is {now}ns"),
-                ),
-                // A seeded region never parks on one: `park_on_host` refuses.
-                Wait::Host { pending, span } => (
-                    *span,
-                    format!("{id} waits here on host operation {pending}"),
-                ),
-                Wait::Send { chan, span, .. } => (
-                    *span,
-                    format!("{id} waits here to send on channel {chan}, which is full"),
-                ),
-                Wait::Recv { chan, span } => (
-                    *span,
-                    format!("{id} waits here to receive from channel {chan}, which is empty"),
-                ),
-            };
+            let (span, message) = waiting(*id, wait, Some(now));
             diagnostic =
                 diagnostic.secondary(if span.is_dummy() { *origin } else { span }, message);
         }
@@ -1333,24 +1639,7 @@ impl<K, B> Scheduler<K, B> {
         )
         .primary(self.span, "no task in this region can make progress");
         for (id, wait, origin) in self.blocked() {
-            let (span, message) = match wait {
-                Wait::Join { task, span } | Wait::Await { task, span } => {
-                    (*span, format!("{id} waits here for {task} to finish"))
-                }
-                Wait::Timer { until, span } => (*span, format!("{id} sleeps here until {until}ns")),
-                Wait::Host { pending, span } => (
-                    *span,
-                    format!("{id} waits here on host operation {pending}"),
-                ),
-                Wait::Send { chan, span, .. } => (
-                    *span,
-                    format!("{id} waits here to send on channel {chan}, which is full"),
-                ),
-                Wait::Recv { chan, span } => (
-                    *span,
-                    format!("{id} waits here to receive from channel {chan}, which is empty"),
-                ),
-            };
+            let (span, message) = waiting(id, wait, None);
             diagnostic = diagnostic.secondary(if span.is_dummy() { origin } else { span }, message);
         }
         diagnostic
@@ -1446,6 +1735,57 @@ impl<K, B> Scheduler<K, B> {
     }
 }
 
+/// Where a blocked task waits and on what, for a deadlock's report; `now` is a seeded region's
+/// virtual time.
+fn waiting(id: TaskId, wait: &Wait, now: Option<i64>) -> (Span, String) {
+    match wait {
+        Wait::Join { task, span } | Wait::Await { task, span } => {
+            (*span, format!("{id} waits here for {task} to finish"))
+        }
+        // Unreachable in a seeded region while the clock has a timer: time would have advanced.
+        Wait::Timer { until, span } => (
+            *span,
+            match now {
+                Some(now) => format!("{id} sleeps here until {until}ns, and it is {now}ns"),
+                None => format!("{id} sleeps here until {until}ns"),
+            },
+        ),
+        // A seeded region never parks on one: `park_on_host` refuses.
+        Wait::Host { pending, span } => (
+            *span,
+            format!("{id} waits here on host operation {pending}"),
+        ),
+        Wait::Send { chan, span, .. } => (
+            *span,
+            format!("{id} waits here to send on channel {chan}, which is full"),
+        ),
+        Wait::Recv { chan, span } => (
+            *span,
+            format!("{id} waits here to receive from channel {chan}, which is empty"),
+        ),
+        Wait::Select { arms, span } => {
+            let on: Vec<String> = arms
+                .iter()
+                .map(|arm| match arm.send {
+                    Some(_) => format!("to send on {}", arm.chan),
+                    None => format!("to receive from {}", arm.chan),
+                })
+                .collect();
+            (
+                *span,
+                if on.is_empty() {
+                    format!("{id} waits here on a select with no arm")
+                } else {
+                    format!(
+                        "{id} waits here on a select, none of whose arms can go: {}",
+                        on.join(", ")
+                    )
+                },
+            )
+        }
+    }
+}
+
 fn out_of_order(span: Span, policy: Policy, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::INTERNAL_ERROR, message).primary(
         span,
@@ -1520,6 +1860,16 @@ fn err_joined_cancelled(span: Span, task: TaskId) -> Diagnostic {
 
 fn some(value: Value) -> Value {
     Value::ctor("Some", vec![value])
+}
+
+/// What a select hears of the arm that went: its index, and what it received or sent.
+fn chosen(at: usize, got: Option<Value>) -> Value {
+    some(Value::Record(std::sync::Arc::new(Fields::from_unsorted(
+        vec![
+            (Symbol::new("_0"), Value::Int(at as i64)),
+            (Symbol::new("_1"), got.map_or_else(none, some)),
+        ],
+    ))))
 }
 
 fn none() -> Value {

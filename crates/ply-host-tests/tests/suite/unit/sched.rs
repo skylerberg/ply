@@ -392,6 +392,7 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
             "task.close",
             "task.join",
             "task.recv",
+            "task.select",
             "task.send",
             "task.spawn",
             "task.yield"
