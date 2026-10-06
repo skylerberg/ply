@@ -2,138 +2,225 @@
 //!
 //! The prelude has the pieces (`map`, `filter`, `fold`, `iterate`, `range`, `push` and `list_at`) and
 //! not the wholes. A `List` is a vector, not a linked list, so the cheap end is the back: `push`
-//! appends, and `prepend` puts an element first by copying the list. Every function here folds left to
-//! right and appends, which is one pass and linear; building a list from the front copies the
+//! appends, and `prepend` puts an element first by copying the list. Every function here walks left
+//! to right and appends, which is one pass and linear; building a list from the front copies the
 //! accumulator every step and is quadratic, a shape to avoid in Ply generally. A callback may perform
-//! effects, as the prelude's `map` and `fold` allow: one given an element runs in list order, and
-//! `any`, `all`, `find` and `find_index` stop calling theirs once the answer is known.
+//! effects, as the prelude's `map` and `fold` allow: one given an element runs in list order,
+//! `fold_right`'s from the last element back, and `any`, `all`, `find`, `find_map`, `find_index`,
+//! `take_while`, `drop_while` and `span` stop calling theirs once the answer is known.
+//!
+//! Every function but `at` is total: a count below zero or past the end is cut to the list, and a
+//! search that may find nothing answers an `Option`. A `cost` clause bounds the calls a function
+//! makes by its lists' lengths and by `k`, the steps one call of its callback takes. `sort`,
+//! `sort_by` and `sort_by_key` take the length times its logarithm, and `binary_search` and
+//! `partition_point` the logarithm alone. A `reuse fn` appends in place.
+//!
+//! What a list folds into elsewhere: a `Map` in `std.map` (`group_by`, `index_by`, `count_by`,
+//! `frequencies`), a total in `std.math` (`sum`, `product`), and the selections whose number
+//! explodes in `std.seq`, one at a time (`combinations`, `permutations`, `cartesian`).
 
 /// The first element, or `None` for an empty list.
-pub fn first<a>(xs: List<a>) -> Option<a> = list_at(xs, 0)
+pub fn first<a>(xs: List<a>) -> Option<a>
+  cost 1
+= list_at(xs, 0)
 
 /// The last element, or `None` for an empty list.
-pub fn last<a>(xs: List<a>) -> Option<a> = list_at(xs, len(xs) - 1)
+pub fn last<a>(xs: List<a>) -> Option<a>
+  cost 1
+= list_at(xs, len(xs) - 1)
 
 /// The element at `i`. An index the list does not hold is the caller's mistake, and raises.
-pub fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise} =
-  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+pub fn at<a>(xs: List<a>, i: Int) -> a / {abort.raise}
+  cost 1
+= match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
 
 /// The element at `i`, or `spare` where the list holds no such index.
-pub fn at_or<a>(xs: List<a>, i: Int, spare: a) -> a =
-  match list_at(xs, i) { Some(x) -> x, None -> spare }
+pub fn at_or<a>(xs: List<a>, i: Int, spare: a) -> a
+  cost 1
+= match list_at(xs, i) { Some(x) -> x, None -> spare }
 
 /// The first `n` elements. A non-positive `n` is the empty list, and a list shorter than `n` is
 /// itself.
-pub fn take<a>(xs: List<a>, n: Int) -> List<a> =
-  fold(range(0, clamped(n, len(xs))), [], |acc: List<a>, i: Int| pushed_from(acc, xs, i))
+pub fn take<a>(xs: List<a>, n: Int) -> List<a>
+  cost len(xs)
+= fold(range(0, clamped(n, len(xs))), [], |acc: List<a>, i: Int| pushed_from(acc, xs, i))
 
 /// Everything but the first `n` elements. A non-positive `n` is the list itself.
-pub fn drop<a>(xs: List<a>, n: Int) -> List<a> =
-  fold(range(clamped(n, len(xs)), len(xs)), [], |acc: List<a>, i: Int| pushed_from(acc, xs, i))
+pub fn drop<a>(xs: List<a>, n: Int) -> List<a>
+  cost len(xs)
+= fold(range(clamped(n, len(xs)), len(xs)), [], |acc: List<a>, i: Int| pushed_from(acc, xs, i))
+
+/// The last `n` elements. A non-positive `n` is the empty list, and a list shorter than `n` is
+/// itself.
+pub fn take_last<a>(xs: List<a>, n: Int) -> List<a>
+  cost len(xs)
+= drop(xs, len(xs) - clamped(n, len(xs)))
+
+/// Everything but the last `n` elements. A non-positive `n` is the list itself.
+pub fn drop_last<a>(xs: List<a>, n: Int) -> List<a>
+  cost len(xs)
+= take(xs, len(xs) - clamped(n, len(xs)))
 
 /// The elements at the indexes from `from` up to `to`. An index the list does not hold adds
 /// nothing, so a range past either end is cut to the list and one that runs backwards is empty.
-pub fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a> =
-  fold(range(from, to), [], |acc: List<a>, i: Int| pushed_from(acc, xs, i))
+pub fn slice<a>(xs: List<a>, from: Int, to: Int) -> List<a>
+  cost len(xs)
+=
+  fold(range(clamped(from, len(xs)), clamped(to, len(xs))), [], |acc: List<a>, i: Int|
+    pushed_from(acc, xs, i))
 
 /// The longest prefix whose every element `ok` answers true for. `ok` is asked nothing past the
 /// first element it answers false for.
-pub fn take_while<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> List<a> / e =
-  fold(xs, { done: false, kept: [] }, |s: { done: Bool, kept: List<a> }, x: a|
-    if s.done { s }
-    else if ok(x) { { ..s, kept: push(s.kept, x) } }
-    else { { ..s, done: true } }).kept
+pub fn take_while<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> List<a> / e
+  cost len(xs) * k
+= take(xs, leading(xs, ok))
 
 /// Everything from the first element `ok` answers false for. `ok` is asked nothing past it.
-pub fn drop_while<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> List<a> / e =
-  fold(xs, { dropping: true, kept: [] }, |s: { dropping: Bool, kept: List<a> }, x: a|
-    if s.dropping && ok(x) { s } else { { dropping: false, kept: push(s.kept, x) } }).kept
+pub fn drop_while<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> List<a> / e
+  cost len(xs) * k
+= drop(xs, leading(xs, ok))
 
 /// `take_while` and `drop_while` at once: the longest prefix whose every element `ok` answers true
 /// for, and everything after it. `ok` is asked nothing past the first element it answers false for.
-pub fn span<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> { prefix: List<a>, rest: List<a> } / e = {
-  let s = fold(
-    xs,
-    { done: false, prefix: [], rest: [] },
-    |s: { done: Bool, prefix: List<a>, rest: List<a> }, x: a|
-      if s.done { { ..s, rest: push(s.rest, x) } }
-      else if ok(x) { { ..s, prefix: push(s.prefix, x) } }
-      else { { ..s, done: true, rest: push(s.rest, x) } },
-  );
-  { prefix: s.prefix, rest: s.rest }
+pub fn span<a | e>(
+  xs: List<a>,
+  ok: (a) -> Bool / e cost k,
+) -> { prefix: List<a>, rest: List<a> } / e
+  cost len(xs) * k
+= {
+  let n = leading(xs, ok);
+  { prefix: take(xs, n), rest: drop(xs, n) }
 }
 
 /// The list back to front. The index walks down while the accumulator appends, so nothing is
 /// prepended and the pass is linear.
-pub fn reverse<a>(xs: List<a>) -> List<a> =
-  fold(range(0, len(xs)), [], |acc: List<a>, i: Int| pushed_from(acc, xs, len(xs) - 1 - i))
+pub fn reverse<a>(xs: List<a>) -> List<a>
+  cost len(xs)
+= fold(range(0, len(xs)), [], |acc: List<a>, i: Int| pushed_from(acc, xs, len(xs) - 1 - i))
+
+/// The list turned `n` places toward its front, so the element at `n` comes first and those before
+/// it follow the last. Any `n` is counted around the length: a negative one turns the list toward
+/// its back, and one the length divides leaves it as it was.
+pub fn rotate<a>(xs: List<a>, n: Int) -> List<a>
+  cost len(xs)
+= {
+  let k = around(n, len(xs));
+  fold(range(0, len(xs)), [], |acc: List<a>, i: Int|
+    pushed_from(acc, xs, if i + k < len(xs) { i + k } else { i + k - len(xs) }))
+}
 
 /// `xs` followed by `ys`.
-pub fn concat<a>(xs: List<a>, ys: List<a>) -> List<a> =
-  fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
+pub fn concat<a>(xs: List<a>, ys: List<a>) -> List<a>
+  cost len(ys)
+= fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
 
 /// Every list `f` answers, one after another.
 pub fn flat_map<a, b | e>(xs: List<a>, f: (a) -> List<b> / e) -> List<b> / e =
   fold(xs, [], |acc: List<b>, x: a| concat(acc, f(x)))
 
 /// Each element with the one at its position in `ys`, up to the shorter of the two.
-pub fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<{ first: a, second: b }> =
+pub reuse fn zip<a, b>(xs: List<a>, ys: List<b>) -> List<{ first: a, second: b }>
+  cost len(xs)
+=
   fold(range(0, min(len(xs), len(ys))), [], |acc: List<{ first: a, second: b }>, i: Int|
     match ((list_at(xs, i), list_at(ys, i))) {
       (Some(x), Some(y)) -> push(acc, { first: x, second: y }),
       _ -> acc,
     })
 
+/// Each element with the one at its position in `ys`, or `None` unless the two are as long as each
+/// other, which `zip` does not ask.
+pub fn zip_strict<a, b>(xs: List<a>, ys: List<b>) -> Option<List<{ first: a, second: b }>>
+  cost len(xs)
+= if len(xs) == len(ys) { Some(zip(xs, ys)) } else { None }
+
 /// `f` of each pair of elements at one index, stopping at the shorter list.
-pub fn zip_with<a, b, c | e>(xs: List<a>, ys: List<b>, f: (a, b) -> c / e) -> List<c> / e =
+pub reuse fn zip_with<a, b, c | e>(
+  xs: List<a>,
+  ys: List<b>,
+  f: (a, b) -> c / e cost k,
+) -> List<c> / e
+  cost len(xs) * k
+=
   fold(range(0, min(len(xs), len(ys))), [], |acc: List<c>, i: Int|
     match ((list_at(xs, i), list_at(ys, i))) { (Some(x), Some(y)) -> push(acc, f(x, y)), _ -> acc })
 
 /// The pairs `zip` makes, split back into the list of their firsts and the list of their seconds.
-pub fn unzip<a, b>(pairs: List<{ first: a, second: b }>) -> { firsts: List<a>, seconds: List<b> } =
-  fold(
-    pairs,
-    { firsts: [], seconds: [] },
-    |acc: { firsts: List<a>, seconds: List<b> }, p: { first: a, second: b }|
-      { firsts: push(acc.firsts, p.first), seconds: push(acc.seconds, p.second) },
-  )
+pub fn unzip<a, b>(pairs: List<{ first: a, second: b }>) -> { firsts: List<a>, seconds: List<b> }
+  cost len(pairs)
+=
+  {
+    firsts: map(pairs, |p: { first: a, second: b }| p.first),
+    seconds: map(pairs, |p: { first: a, second: b }| p.second),
+  }
 
 /// Each element with its position, counting from zero.
-pub fn enumerate<a>(xs: List<a>) -> List<{ index: Int, value: a }> =
-  fold(xs, [], |acc: List<{ index: Int, value: a }>, x: a| push(acc, { index: len(acc), value: x }))
+pub reuse fn enumerate<a>(xs: List<a>) -> List<{ index: Int, value: a }>
+  cost len(xs)
+=
+  fold(xs, [], |acc: List<{ index: Int, value: a }>, x: a| {
+    let index = len(acc);
+    push(acc, { index: index, value: x })
+  })
+
+/// Each element with the one after it, so a list of fewer than two elements has none.
+pub reuse fn pairwise<a>(xs: List<a>) -> List<{ first: a, second: a }>
+  cost len(xs)
+=
+  fold(range(0, len(xs)), [], |acc: List<{ first: a, second: a }>, i: Int|
+    match ((list_at(xs, i), list_at(xs, i + 1))) {
+      (Some(x), Some(y)) -> push(acc, { first: x, second: y }),
+      _ -> acc,
+    })
+
+/// The lists read the other way: the first elements of every list, then the second elements, and
+/// so on for as many places as the shortest list holds, as `zip` stops at the shorter of two. No
+/// lists, or an empty one among them, read as none.
+pub fn transpose<a>(xss: List<List<a>>) -> List<List<a>> =
+  map(range(0, narrowest(xss)), |j: Int|
+    fold(xss, [], |column: List<a>, xs: List<a>| pushed_from(column, xs, j)))
 
 /// `x`, `n` times over; none where `n` is not positive.
 pub fn replicate<a>(x: a, n: Int) -> List<a> = map(range(0, n), |_: Int| x)
 
 /// Whether `ok` answers true for an element. An empty list is `false`.
-pub fn any<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Bool / e =
-  fold(xs, false, |acc: Bool, x: a| acc || ok(x))
+pub fn any<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Bool / e
+  cost len(xs) * k
+= fold(xs, false, |acc: Bool, x: a| acc || ok(x))
 
 /// Whether `ok` answers true for every element. An empty list is `true`.
-pub fn all<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Bool / e =
-  fold(xs, true, |acc: Bool, x: a| acc && ok(x))
+pub fn all<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Bool / e
+  cost len(xs) * k
+= fold(xs, true, |acc: Bool, x: a| acc && ok(x))
 
 /// How many elements `ok` answers true for.
-pub fn count<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Int / e =
-  fold(xs, 0, |acc: Int, x: a| if ok(x) { acc + 1 } else { acc })
+pub fn count<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Int / e
+  cost len(xs) * k
+= fold(xs, 0, |acc: Int, x: a| if ok(x) { acc + 1 } else { acc })
 
 /// The first element `ok` answers true for, or `None`. The first answer is kept, so the walk is a
 /// scan rather than a race.
-pub fn find<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<a> / e =
+pub fn find<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<a> / e
+  cost len(xs) * k
+=
   fold(xs, None, |found: Option<a>, x: a|
     match found { Some(_) -> found, None -> if ok(x) { Some(x) } else { None } })
 
 /// What `f` answers for the first element it answers `Some` for, or `None`. `f` is asked of no
 /// element after that one.
-pub fn find_map<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e) -> Option<b> / e =
-  fold(xs, None, |found: Option<b>, x: a| match found { Some(_) -> found, None -> f(x) })
+pub fn find_map<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e cost k) -> Option<b> / e
+  cost len(xs) * k
+= fold(xs, None, |found: Option<b>, x: a| match found { Some(_) -> found, None -> f(x) })
 
 /// The last element `ok` answers true for, or `None`. `ok` is asked of every element.
-pub fn find_last<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<a> / e =
-  fold(xs, None, |found: Option<a>, x: a| if ok(x) { Some(x) } else { found })
+pub fn find_last<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<a> / e
+  cost len(xs) * k
+= fold(xs, None, |found: Option<a>, x: a| if ok(x) { Some(x) } else { found })
 
 /// The position of the first element `ok` answers true for, or `None`.
-pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<Int> / e =
+pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<Int> / e
+  cost len(xs) * k
+=
   fold(xs, { at: 0, found: None }, |s: { at: Int, found: Option<Int> }, x: a|
     match s.found {
       Some(_) -> s,
@@ -143,46 +230,86 @@ pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Option<Int> / e =
 /// Whether `x` is one of the elements.
 pub fn contains<a>(xs: List<a>, x: a) -> Bool
   where derivable(eq, a)
+  cost len(xs)
 = any(xs, |y: a| y == x)
 
 /// `xs` with `x` pushed on, unless it already holds `x`.
 pub fn push_unique<a>(xs: List<a>, x: a) -> List<a>
   where derivable(eq, a)
+  cost len(xs)
 = if contains(xs, x) { xs } else { push(xs, x) }
 
 /// Whether the list holds nothing.
-pub fn is_empty<a>(xs: List<a>) -> Bool = len(xs) == 0
+pub fn is_empty<a>(xs: List<a>) -> Bool
+  cost 1
+= len(xs) == 0
 
 /// `x` and then `xs`. A `List` grows at the back, so this copies `xs`.
-pub fn prepend<a>(x: a, xs: List<a>) -> List<a> = fold(xs, [x], |acc: List<a>, y: a| push(acc, y))
+pub reuse fn prepend<a>(x: a, xs: List<a>) -> List<a>
+  cost len(xs)
+= fold(xs, [x], |acc: List<a>, y: a| push(acc, y))
 
 /// What the `Some`s hold, in order; every `None` is left out.
-pub fn somes<a>(xs: List<Option<a>>) -> List<a> =
-  fold(xs, [], |acc: List<a>, x: Option<a>| match x { Some(v) -> push(acc, v), None -> acc })
+pub reuse fn somes<a>(xs: List<Option<a>>) -> List<a>
+  cost len(xs)
+= fold(xs, [], |acc: List<a>, x: Option<a>| match x { Some(v) -> push(acc, v), None -> acc })
+
+/// What `f` answers `Some` of, for each element in order; an element it answers `None` for is left
+/// out.
+pub reuse fn filter_map<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e cost k) -> List<b> / e
+  cost len(xs) * k
+= fold(xs, [], |acc: List<b>, x: a| match f(x) { Some(y) -> push(acc, y), None -> acc })
 
 /// The position of the first `x`, or `None`.
 pub fn index_of<a>(xs: List<a>, x: a) -> Option<Int>
   where derivable(eq, a)
+  cost len(xs)
 = find_index(xs, |y: a| y == x)
 
 /// The position of the last `x`, or `None`.
 pub fn last_index_of<a>(xs: List<a>, x: a) -> Option<Int>
   where derivable(eq, a)
+  cost len(xs)
 =
   fold(range(0, len(xs)), None, |found: Option<Int>, i: Int|
     if list_at(xs, i) == Some(x) { Some(i) } else { found })
 
+/// The list without the element at `i`. An index the list does not hold leaves it as it is.
+pub fn remove_at<a>(xs: List<a>, i: Int) -> List<a>
+  cost len(xs)
+=
+  fold(range(0, len(xs)), [], |acc: List<a>, at: Int|
+    if at == i { acc } else { pushed_from(acc, xs, at) })
+
 /// `x` taken out once, at its first position; `None` if it is not there.
 pub fn remove_first<a>(xs: List<a>, x: a) -> Option<List<a>>
   where derivable(eq, a)
-= match index_of(xs, x) { None -> None, Some(i) -> Some(concat(take(xs, i), drop(xs, i + 1))) }
+  cost len(xs)
+= match index_of(xs, x) { None -> None, Some(i) -> Some(remove_at(xs, i)) }
 
-/// The sum of the elements. An empty list sums to zero, and the addition wraps at `Int`'s width.
-pub fn sum(xs: List<Int>) -> Int = fold(xs, 0, |acc: Int, x: Int| acc + x)
+/// What `f` answers after each element, each call handed what the last one answered, from `init`:
+/// the accumulators a `fold` passes through, of which the last is what it answers. `init` is not
+/// among them, so the answer is as long as `xs`.
+pub reuse fn scan<a, b | e>(xs: List<a>, init: b, f: (b, a) -> b / e cost k) -> List<b> / e
+  cost len(xs) * k
+=
+  fold(xs, [], |out: List<b>, x: a| {
+    let acc = match list_at(out, len(out) - 1) { Some(y) -> y, None -> init };
+    push(out, f(acc, x))
+  })
+
+/// A fold from the back: `f` of the last element and `init`, then of the one before it and that
+/// answer, down to the first, so `f` is called in the reverse of list order.
+pub fn fold_right<a, b | e>(xs: List<a>, init: b, f: (a, b) -> b / e cost k) -> b / e
+  cost len(xs) * k
+=
+  fold(xs, { acc: init, at: len(xs) - 1 }, |s: { acc: b, at: Int }, _: a|
+    match list_at(xs, s.at) { Some(x) -> { acc: f(x, s.acc), at: s.at - 1 }, None -> s }).acc
 
 /// The greatest element, or `None` for an empty list. Ties keep the first.
 pub fn max_of<a>(xs: List<a>) -> Option<a>
   where derivable(ord, a)
+  cost len(xs)
 =
   match xs {
     [] -> None,
@@ -193,6 +320,7 @@ pub fn max_of<a>(xs: List<a>) -> Option<a>
 /// The least element, or `None` for an empty list. Ties keep the first.
 pub fn min_of<a>(xs: List<a>) -> Option<a>
   where derivable(ord, a)
+  cost len(xs)
 =
   match xs {
     [] -> None,
@@ -200,10 +328,26 @@ pub fn min_of<a>(xs: List<a>) -> Option<a>
       Some(fold(rest, first, |best: a, x: a| match compare(x, best) { Less -> x, _ -> best })),
   }
 
+/// The element `key_of` answers the greatest key for, or `None` for an empty list. Of several with
+/// that key the first is answered, as `max_of` and the prelude's `max` keep the first. `key_of` is
+/// asked once of each element.
+pub fn max_by<a, k | e>(xs: List<a>, key_of: (a) -> k / e cost c) -> Option<a> / e
+  where derivable(ord, k)
+  cost len(xs) * c
+= best_by(xs, key_of, Greater)
+
+/// The element `key_of` answers the least key for, or `None` for an empty list. Of several with
+/// that key the first is answered. `key_of` is asked once of each element.
+pub fn min_by<a, k | e>(xs: List<a>, key_of: (a) -> k / e cost c) -> Option<a> / e
+  where derivable(ord, k)
+  cost len(xs) * c
+= best_by(xs, key_of, Less)
+
 /// Whether the elements are in ascending order. Equal neighbours are, and so is a list of fewer
 /// than two elements.
 pub fn is_sorted<a>(xs: List<a>) -> Bool
   where derivable(ord, a)
+  cost len(xs)
 =
   fold(range(0, len(xs) - 1), true, |acc: Bool, i: Int|
     acc
@@ -213,105 +357,263 @@ pub fn is_sorted<a>(xs: List<a>) -> Bool
       }))
 
 /// The elements in ascending order, by a merge sort: `n log n` comparisons whatever the input
-/// order is, and equal elements keep their relative order — the merge takes the right element only
-/// when it strictly precedes the left one.
+/// order is, and equal elements keep their relative order.
 pub fn sort<a>(xs: List<a>) -> List<a>
   where derivable(ord, a)
-= sort_by(xs, |x: a, y: a| !(compare(x, y) == Greater))
+= merge_sorted(xs, |later: a, earlier: a| compare(later, earlier) == Less)
 
 /// The elements ordered by `before`, which says whether its first argument is to come first. The
-/// order is total if `before` is, and equal elements keep their relative order either way.
+/// order is total if `before` is, and two elements it does not order, or orders both ways as `<=`
+/// does equals, keep their relative order. `before` is asked up to twice of a pair.
 pub fn sort_by<a | e>(xs: List<a>, before: (a, a) -> Bool / e) -> List<a> / e =
-  match merged_runs(map(xs, |x: a| [x]), before) { [] -> [], [run, ..] -> run }
+  merge_sorted(xs, |later: a, earlier: a| before(later, earlier) && !before(earlier, later))
+
+/// The elements in ascending order of what `key_of` answers for each, which it is asked once.
+/// Elements of equal keys keep their relative order.
+pub fn sort_by_key<a, k | e>(xs: List<a>, key_of: (a) -> k / e) -> List<a> / e
+  where derivable(ord, k)
+=
+  map(
+    merge_sorted(
+      map(xs, |x: a| { key: key_of(x), item: x }),
+      |later: { key: k, item: a }, earlier: { key: k, item: a }|
+        compare(later.key, earlier.key) == Less,
+    ),
+    |keyed: { key: k, item: a }| keyed.item,
+  )
+
+/// Where an element is in a list `order` sorts. `order` answers how an element stands to the one
+/// sought, `Less` for one that comes before it, and the list holds every `Less` element, then
+/// every `Equal` one, then every `Greater`. `Ok` of the first `Equal` element's index, or `Err` of
+/// the index one would go at to keep the order, which is how many are `Less`. `order` is asked of
+/// a logarithm of the elements, so in a list it does not sort an `Ok` still holds the index of an
+/// `Equal` element, and an `Err` says only that the search met none.
+pub fn binary_search<a | e>(xs: List<a>, order: (a) -> Ordering / e) -> Result<Int, Int> / e = {
+  let i = partition_point(xs, |x: a| order(x) == Less);
+  match list_at(xs, i) { Some(x) -> if order(x) == Equal { Ok(i) } else { Err(i) }, None -> Err(i) }
+}
+
+/// How many leading elements `ok` answers true for, in a list where no element it answers true for
+/// follows one it answers false for: the index of the first element it answers false for, or the
+/// length. `ok` is asked of a logarithm of the elements. In a list not so divided the answer is
+/// still a place where the list turns: `ok` answers true for the element before it and false for
+/// the element at it, where there is one.
+pub fn partition_point<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> Int / e =
+  held_from(xs, ok, 0, widest_stride(len(xs), 1))
 
 /// The lists of lists, one after another.
 pub fn flatten<a>(xss: List<List<a>>) -> List<a> = flat_map(xss, |xs: List<a>| xs)
 
-/// The elements `ok` answers true for, and the rest, in their original order.
-pub fn partition<a | e>(xs: List<a>, ok: (a) -> Bool / e) -> { yes: List<a>, no: List<a> } / e =
-  fold(xs, { yes: [], no: [] }, |acc: { yes: List<a>, no: List<a> }, x: a|
-    if ok(x) { { yes: push(acc.yes, x), no: acc.no } }
-    else { { yes: acc.yes, no: push(acc.no, x) } })
+/// The elements `ok` answers true for, and the rest, in their original order. `ok` is asked once of
+/// each element, in order.
+pub fn partition<a | e>(
+  xs: List<a>,
+  ok: (a) -> Bool / e cost k,
+) -> { yes: List<a>, no: List<a> } / e
+  cost len(xs) * k
+= parted(xs, ok, [], [])
 
 /// The list split at `n`: the first `n` elements and the rest, so the two are `take` and `drop`
 /// under one name. An `n` outside the list is the whole list on one side.
-pub fn split_at<a>(xs: List<a>, n: Int) -> { head: List<a>, tail: List<a> } =
-  { head: take(xs, n), tail: drop(xs, n) }
+pub fn split_at<a>(xs: List<a>, n: Int) -> { head: List<a>, tail: List<a> }
+  cost len(xs)
+= { head: take(xs, n), tail: drop(xs, n) }
 
 /// The elements in groups of `n`, the last one short. A non-positive `n` has no groups.
-pub fn chunks<a>(xs: List<a>, n: Int) -> List<List<a>> =
-  if n <= 0 { [] } else { chunks_from(xs, n, [], []) }
+pub fn chunks<a>(xs: List<a>, n: Int) -> List<List<a>>
+  cost len(xs)
+= if n <= 0 { [] } else { chunks_from(xs, n, [], []) }
+
+/// The elements in runs of neighbours `key_of` answers the same key for: a run ends where the next
+/// element's key differs, so two runs of one key may stand apart, where `std.map`'s `group_by`
+/// gathers a key's elements wherever they are. No run is empty. `key_of` is asked once of each
+/// element.
+pub fn chunk_by<a, k | e>(xs: List<a>, key_of: (a) -> k / e cost c) -> List<List<a>> / e
+  where derivable(eq, k)
+  cost len(xs) * c
+= runs_from(map(xs, |x: a| { key: key_of(x), item: x }), [], [], None)
 
 /// Every run of `n` neighbouring elements, in order. A non-positive `n`, or one past the length,
 /// has none.
-pub fn windows<a>(xs: List<a>, n: Int) -> List<List<a>> =
+pub fn windows<a>(xs: List<a>, n: Int) -> List<List<a>>
+  cost len(xs) * n
+=
   if n <= 0 || n > len(xs) { [] }
-  else { map(range(0, len(xs) - n + 1), |i: Int| take(drop(xs, i), n)) }
+  else { map(range(0, len(xs) - n + 1), |i: Int| slice(xs, i, i + n)) }
 
 /// `xs` with `sep` between each pair and nowhere else.
-pub fn intersperse<a>(xs: List<a>, sep: a) -> List<a> =
+pub reuse fn intersperse<a>(xs: List<a>, sep: a) -> List<a>
+  cost len(xs)
+=
   match xs {
     [] -> [],
     [first, ..rest] -> fold(rest, [first], |acc: List<a>, x: a| push(push(acc, sep), x)),
   }
 
+/// An element of `xs`, then one of `ys`, and so on in turn; once either has ended, the rest of the
+/// other.
+pub fn interleave<a>(xs: List<a>, ys: List<a>) -> List<a>
+  cost len(xs) + len(ys)
+= {
+  let paired = min(len(xs), len(ys));
+  fold(range(0, len(xs) + len(ys)), [], |acc: List<a>, i: Int|
+    if i < 2 * paired { pushed_from(acc, if i & 1 == 0 { xs } else { ys }, i >> 1) }
+    else { pushed_from(pushed_from(acc, xs, i - paired), ys, i - paired) })
+}
+
 /// The elements with duplicates removed, keeping each element's first occurrence. The order is the
 /// original one, and the membership test is a map's, so the pass is `n log n` rather than `n²`.
 pub fn unique<a>(xs: List<a>) -> List<a>
   where derivable(ord, a)
-= dedup_from(xs, map_new(), [])
+  cost len(xs)
+= unique_from(xs, map_new(), [])
 
-/// Neighbouring runs merged round after round, so equal elements keep their order: each round halves
-/// the runs, and 64 rounds take any list to one.
-fn merged_runs<a | e>(runs: List<List<a>>, before: (a, a) -> Bool / e) -> List<List<a>> / e =
-  fold(range(0, 64), runs, |rs: List<List<a>>, _round: Int|
-    if len(rs) <= 1 { rs } else {
-      map(range(0, (len(rs) + 1) / 2), |i: Int|
-        match ((list_at(rs, 2 * i), list_at(rs, 2 * i + 1))) {
-          (Some(left), Some(right)) -> merge(left, right, before),
-          (Some(left), None) -> left,
-          _ -> [],
-        })
-    })
+/// The elements with each run of equal neighbours cut to its first, so an element may still come
+/// again further on, where `unique` keeps one of each.
+pub reuse fn dedup<a>(xs: List<a>) -> List<a>
+  where derivable(eq, a)
+  cost len(xs)
+=
+  fold(xs, [], |kept: List<a>, x: a|
+    if list_at(kept, len(kept) - 1) == Some(x) { kept } else { push(kept, x) })
 
-fn merge<a | e>(a: List<a>, b: List<a>, before: (a, a) -> Bool / e) -> List<a> / e =
-  merge_into(a, b, [], before)
+/// The lists made single and merged round after round, so equal elements keep their order: each
+/// round halves the runs, and 64 rounds take any list to one. `precedes` says whether an element
+/// from further on must come before one from earlier, and only then does it.
+fn merge_sorted<a | e>(xs: List<a>, precedes: (a, a) -> Bool / e) -> List<a> / e =
+  match fold(range(0, 64), map(xs, |x: a| [x]), |runs: List<List<a>>, _round: Int|
+      if len(runs) <= 1 { runs } else {
+        map(range(0, (len(runs) + 1) / 2), |i: Int|
+          match ((list_at(runs, 2 * i), list_at(runs, 2 * i + 1))) {
+            (Some(left), Some(right)) -> merge_into(left, right, [], precedes),
+            (Some(left), None) -> left,
+            _ -> [],
+          })
+      }) {
+    [] -> [],
+    [run, ..] -> run,
+  }
 
-fn merge_into<a | e>(
+reuse fn merge_into<a | e>(
   a: List<a>,
   b: List<a>,
   acc: List<a>,
-  before: (a, a) -> Bool / e,
+  precedes: (a, a) -> Bool / e,
 ) -> List<a> / e =
   match a {
     [] -> concat(acc, b),
     [x, ..rest_a] -> match b {
       [] -> concat(acc, a),
-      [y, ..rest_b] -> if before(y, x) { merge_into(a, rest_b, push(acc, y), before) }
-      else { merge_into(rest_a, b, push(acc, x), before) },
+      [y, ..rest_b] -> if precedes(y, x) { merge_into(a, rest_b, push(acc, y), precedes) }
+      else { merge_into(rest_a, b, push(acc, x), precedes) },
     },
   }
 
+/// The first element whose key stands to the best one so far as `wanted` says, and so to every
+/// element before it.
+fn best_by<a, k | e>(xs: List<a>, key_of: (a) -> k / e cost c, wanted: Ordering) -> Option<a> / e
+  where derivable(ord, k)
+  cost len(xs) * c
+=
+  match fold(xs, None, |best: Option<{ key: k, item: a }>, x: a| {
+      let key = key_of(x);
+      match best {
+        None -> Some({ key: key, item: x }),
+        Some(held) -> if compare(key, held.key) == wanted { Some({ key: key, item: x }) }
+        else { best },
+      }
+    }) {
+    Some(held) -> Some(held.item),
+    None -> None,
+  }
+
+/// How many leading elements `ok` answers true for, asking nothing past the first it answers false
+/// for.
+fn leading<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Int / e
+  cost len(xs) * k
+= match find_index(xs, |x: a| !ok(x)) { Some(i) -> i, None -> len(xs) }
+
+/// `known` leading elements hold; whether `stride` more do, then half as many, down to one.
+fn held_from<a | e>(xs: List<a>, ok: (a) -> Bool / e, known: Int, stride: Int) -> Int / e =
+  if stride < 1 { known } else {
+    match list_at(xs, known + stride - 1) {
+      Some(x) -> if ok(x) { held_from(xs, ok, known + stride, stride / 2) }
+      else { held_from(xs, ok, known, stride / 2) },
+      None -> held_from(xs, ok, known, stride / 2),
+    }
+  }
+
+/// The greatest power of two that is at most `n`, times `stride`; `stride` itself below two.
+fn widest_stride(n: Int, stride: Int) -> Int =
+  if n <= 1 { stride } else { widest_stride(n / 2, stride * 2) }
+
+/// `yes` and `no` are the elements told apart so far: each is a parameter, so its append is in
+/// place, which a record holding both could not promise.
+reuse fn parted<a | e>(
+  xs: List<a>,
+  ok: (a) -> Bool / e cost k,
+  yes: List<a>,
+  no: List<a>,
+) -> { yes: List<a>, no: List<a> } / e =
+  match xs {
+    [] -> { yes: yes, no: no },
+    [x, ..rest] -> if ok(x) { parted(rest, ok, push(yes, x), no) }
+    else { parted(rest, ok, yes, push(no, x)) },
+  }
+
+/// The length of the shortest list, and zero where there is none.
+fn narrowest<a>(xss: List<List<a>>) -> Int =
+  match xss {
+    [] -> 0,
+    [first, ..rest] -> fold(rest, len(first), |least: Int, xs: List<a>| min(least, len(xs))),
+  }
+
+/// `n` counted around `size`: the index from zero up to `size` that `n` places on from the first
+/// comes to, and zero where `size` is.
+fn around(n: Int, size: Int) -> Int =
+  handle { (n % size + size) % size } with { abort.raise(_) -> 0 }
+
 fn clamped(n: Int, total: Int) -> Int = if n < 0 { 0 } else if n > total { total } else { n }
 
-fn chunks_from<a>(xs: List<a>, n: Int, acc: List<List<a>>, current: List<a>) -> List<List<a>> =
+reuse fn chunks_from<a>(
+  xs: List<a>,
+  n: Int,
+  acc: List<List<a>>,
+  current: List<a>,
+) -> List<List<a>> =
   match xs {
     [] -> if len(current) == 0 { acc } else { push(acc, current) },
     [x, ..rest] -> if len(current) == n { chunks_from(rest, n, push(acc, current), [x]) }
     else { chunks_from(rest, n, acc, push(current, x)) },
   }
 
-fn dedup_from<a>(xs: List<a>, seen: Map<a, Unit>, out: List<a>) -> List<a>
+/// `run` is the run being gathered, of the key `held`, and `runs` the ones before it.
+reuse fn runs_from<a, k>(
+  keyed: List<{ key: k, item: a }>,
+  runs: List<List<a>>,
+  run: List<a>,
+  held: Option<k>,
+) -> List<List<a>>
+  where derivable(eq, k)
+=
+  match keyed {
+    [] -> if len(run) == 0 { runs } else { push(runs, run) },
+    [next, ..rest] -> if len(run) == 0 || held == Some(next.key) {
+      runs_from(rest, runs, push(run, next.item), Some(next.key))
+    } else { runs_from(rest, push(runs, run), [next.item], Some(next.key)) },
+  }
+
+reuse fn unique_from<a>(xs: List<a>, seen: Map<a, Unit>, out: List<a>) -> List<a>
   where derivable(ord, a)
 =
   match xs {
     [] -> out,
-    [x, ..rest] -> if map_contains(seen, x) { dedup_from(rest, seen, out) }
-    else { dedup_from(rest, map_insert(seen, x, ()), push(out, x)) },
+    [x, ..rest] -> if map_contains(seen, x) { unique_from(rest, seen, out) }
+    else { unique_from(rest, map_insert(seen, x, ()), push(out, x)) },
   }
 
 /// Every index these walks ask for is inside the list; what is not, adds nothing.
-fn pushed_from<a>(acc: List<a>, xs: List<a>, i: Int) -> List<a> =
+reuse fn pushed_from<a>(acc: List<a>, xs: List<a>, i: Int) -> List<a> =
   match list_at(xs, i) { Some(x) -> push(acc, x), None -> acc }
 
 // --- Tests ------------------------------------------------------------------
@@ -329,6 +631,22 @@ test "take and drop are the two halves, and the edges are total" {
   assert_eq(concat(take([1, 2, 3], 2), drop([1, 2, 3], 2)), [1, 2, 3])
 }
 
+test "take_last and drop_last cut from the back, and the edges are total" {
+  assert_eq(take_last([1, 2, 3], 2), [2, 3]);
+  assert_eq(take_last([1, 2, 3], 0), []);
+  assert_eq(take_last([1, 2, 3], 0 - 1), []);
+  assert_eq(take_last([1, 2, 3], 9), [1, 2, 3]);
+  assert_eq(take_last([], 2), []);
+  assert_eq(drop_last([1, 2, 3], 1), [1, 2]);
+  assert_eq(drop_last([1, 2, 3], 0), [1, 2, 3]);
+  assert_eq(drop_last([1, 2, 3], 0 - 1), [1, 2, 3]);
+  assert_eq(drop_last([1, 2, 3], 9), []);
+  assert_eq(drop_last([], 1), []);
+  let least = 0 - 9223372036854775807 - 1;
+  assert_eq(take_last([1, 2, 3], least), []);
+  assert_eq(drop_last([1, 2, 3], least), [1, 2, 3])
+}
+
 test "slice is the elements between two indexes, cut to the list" {
   assert_eq(slice([1, 2, 3, 4], 1, 3), [2, 3]);
   assert_eq(slice([1, 2, 3, 4], 0, 4), [1, 2, 3, 4]);
@@ -336,7 +654,15 @@ test "slice is the elements between two indexes, cut to the list" {
   assert_eq(slice([1, 2, 3, 4], 3, 1), []);
   assert_eq(slice([1, 2, 3, 4], 0 - 2, 2), [1, 2]);
   assert_eq(slice([1, 2, 3, 4], 2, 9), [3, 4]);
+  assert_eq(slice([1, 2, 3, 4], 7, 9), []);
   assert_eq(slice([], 0, 3), [])
+}
+
+test "a slice far past the list walks the list and not the range" {
+  let far = 9223372036854775807;
+  assert_eq(slice([1, 2, 3], 1, far), [2, 3]);
+  assert_eq(slice([1, 2, 3], 0 - far, far), [1, 2, 3]);
+  assert(metered(|| slice([1, 2, 3], 0, far)).steps < 100)
 }
 
 test "drop_while drops the prefix that holds and asks nothing past it" {
@@ -392,6 +718,19 @@ test "reverse is the list back to front, and first and last are its ends" {
   assert_eq(last([]), None)
 }
 
+test "rotate turns the list toward its front, any count taken around the length" {
+  assert_eq(rotate([1, 2, 3, 4], 1), [2, 3, 4, 1]);
+  assert_eq(rotate([1, 2, 3, 4], 0 - 1), [4, 1, 2, 3]);
+  assert_eq(rotate([1, 2, 3, 4], 0), [1, 2, 3, 4]);
+  assert_eq(rotate([1, 2, 3, 4], 4), [1, 2, 3, 4]);
+  assert_eq(rotate([1, 2, 3, 4], 9), [2, 3, 4, 1]);
+  assert_eq(rotate([1, 2, 3, 4], 0 - 9), [4, 1, 2, 3]);
+  assert_eq(rotate([1], 5), [1]);
+  assert_eq(rotate([], 3), []);
+  assert_eq(rotate([1, 2, 3], 9223372036854775807), [2, 3, 1]);
+  assert_eq(rotate([1, 2, 3], 0 - 9223372036854775807 - 1), [2, 3, 1])
+}
+
 fn caught(xs: List<Int>, i: Int) -> Result<Int, String> =
   handle { at(xs, i) } with { abort.raise(m) -> Err(m), return v -> Ok(v) }
 
@@ -445,6 +784,14 @@ test "find_last answers the last element that matches, and none where nothing do
   assert_eq(find_last([2, 4], |n: Int| n % 2 == 1), None)
 }
 
+test "filter_map keeps what its function answers some of, in order" {
+  let halved = |xs: List<Int>| filter_map(xs, |n: Int| if n % 2 == 0 { Some(n / 2) } else { None });
+  assert_eq(halved([1, 2, 3, 4]), [1, 2]);
+  assert_eq(halved([1, 3]), []);
+  assert_eq(halved([]), []);
+  assert_eq(filter_map(["a", "b"], |s: String| Some(s ++ "!")), ["a!", "b!"])
+}
+
 test "replicate repeats its element, and a count that is not positive gives none" {
   assert_eq(replicate("a", 3), ["a", "a", "a"]);
   assert_eq(replicate(1, 0), []);
@@ -457,11 +804,34 @@ test "enumerate pairs each element with its position from zero" {
   assert_eq(enumerate(none), [])
 }
 
-test "zip stops at the shorter list" {
+test "zip stops at the shorter list, and the strict zip answers only for two of one length" {
   assert_eq(zip([1, 2], ["a", "b"]), [{ first: 1, second: "a" }, { first: 2, second: "b" }]);
   assert_eq(zip([1, 2, 3], ["a"]), [{ first: 1, second: "a" }]);
   assert_eq(zip([], ["a"]), []);
-  assert_eq(zip(["a"], []), [])
+  assert_eq(zip(["a"], []), []);
+  assert_eq(zip_strict([1, 2], ["a", "b"]), Some(zip([1, 2], ["a", "b"])));
+  assert_eq(zip_strict([1, 2, 3], ["a"]), None);
+  assert_eq(zip_strict([1], ["a", "b"]), None);
+  let none: List<Int> = [];
+  assert_eq(zip_strict(none, none), Some([]))
+}
+
+test "pairwise pairs each element with the next, and fewer than two have no pair" {
+  assert_eq(pairwise([1, 2, 3]), [{ first: 1, second: 2 }, { first: 2, second: 3 }]);
+  assert_eq(pairwise([1, 2]), [{ first: 1, second: 2 }]);
+  assert_eq(pairwise([1]), []);
+  let none: List<Int> = [];
+  assert_eq(pairwise(none), [])
+}
+
+test "transpose reads rows as columns, as far as the shortest row goes" {
+  assert_eq(transpose([[1, 2, 3], [4, 5, 6]]), [[1, 4], [2, 5], [3, 6]]);
+  assert_eq(transpose([[1, 2, 3]]), [[1], [2], [3]]);
+  assert_eq(transpose([[1], [2], [3]]), [[1, 2, 3]]);
+  assert_eq(transpose([[1, 2, 3], [4, 5], [6]]), [[1, 4, 6]]);
+  assert_eq(transpose([[1, 2], []]), []);
+  let none: List<List<Int>> = [];
+  assert_eq(transpose(none), [])
 }
 
 test "any, all, count and find answer about the elements" {
@@ -504,16 +874,53 @@ test "contains, index_of and remove_first are the equality question" {
   assert_eq(remove_first([1, 2, 3], 2), Some([1, 3]));
   assert_eq(remove_first([1, 2, 3], 1), Some([2, 3]));
   assert_eq(remove_first([1, 2, 3], 3), Some([1, 2]));
+  assert_eq(remove_first([1, 2, 3, 2], 2), Some([1, 3, 2]));
   assert_eq(remove_first([1, 2, 3], 9), None)
 }
 
-test "sum, max_of and min_of fold the elements, and an empty list has no extreme" {
-  assert_eq(sum([]), 0);
-  assert_eq(sum([1, 2, 3]), 6);
+test "remove_at takes out the element at an index, and no other index takes anything" {
+  assert_eq(remove_at([1, 2, 3], 0), [2, 3]);
+  assert_eq(remove_at([1, 2, 3], 1), [1, 3]);
+  assert_eq(remove_at([1, 2, 3], 2), [1, 2]);
+  assert_eq(remove_at([1, 2, 3], 3), [1, 2, 3]);
+  assert_eq(remove_at([1, 2, 3], 0 - 1), [1, 2, 3]);
+  assert_eq(remove_at([1], 0), []);
+  assert_eq(remove_at([], 0), [])
+}
+
+test "scan keeps each accumulator a fold passes through, and fold_right folds from the back" {
+  assert_eq(scan([1, 2, 3], 0, |acc: Int, x: Int| acc + x), [1, 3, 6]);
+  assert_eq(scan([1, 2, 3], "", |acc: String, x: Int| acc ++ int_to_string(x)), ["1", "12", "123"]);
+  assert_eq(scan([5], 10, |acc: Int, x: Int| acc - x), [5]);
+  assert_eq(scan([], 10, |acc: Int, x: Int| acc + x), []);
+  assert_eq(fold_right([1, 2, 3], "", |x: Int, acc: String| acc ++ int_to_string(x)), "321");
+  assert_eq(fold_right([1, 2, 3], 0, |x: Int, acc: Int| x - acc), 2);
+  assert_eq(fold_right([], 7, |x: Int, acc: Int| x - acc), 7)
+}
+
+test "max_of and min_of answer the extremes, and an empty list has none" {
   assert_eq(max_of([3, 9, 4]), Some(9));
   assert_eq(max_of([]), None);
   assert_eq(min_of([3, 9, 4]), Some(3));
   assert_eq(min_of([]), None)
+}
+
+test "max_by and min_by answer the first element of the extreme key, asking each key once" {
+  let words = ["pear", "fig", "plum", "kiwi", "yam"];
+  assert_eq(max_by(words, |w: String| string_len(w)), Some("pear"));
+  assert_eq(min_by(words, |w: String| string_len(w)), Some("fig"));
+  assert_eq(max_by(["one"], |w: String| string_len(w)), Some("one"));
+  let none: List<String> = [];
+  assert_eq(max_by(none, |w: String| string_len(w)), None);
+  assert_eq(min_by(none, |w: String| string_len(w)), None);
+  let asked = with_cell[asked](0) { c -> {
+    let least = min_by(words, |w: String| {
+      cell_set(c, cell_get(c) + 1);
+      string_len(w)
+    });
+    { least: least, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { least: Some("fig"), asked: 5 })
 }
 
 test "sort orders, and a long list exercises the merge rather than its base case" {
@@ -531,22 +938,108 @@ test "sort orders, and a long list exercises the merge rather than its base case
   assert(!is_sorted([1, 3, 2]))
 }
 
-test "sort_by is stable: equal elements keep the order they came in" {
-  let items = [{ k: 2, tag: "a" }, { k: 1, tag: "b" }, { k: 1, tag: "c" }];
-  assert_eq(sort_by(items, |l: { k: Int, tag: String }, r: { k: Int, tag: String }| l.k < r.k), [
+test "sort_by is stable whether its order calls equals before each other or not" {
+  let items = [
+    { k: 2, tag: "a" },
     { k: 1, tag: "b" },
     { k: 1, tag: "c" },
+    { k: 2, tag: "d" },
+    { k: 1, tag: "e" },
+  ];
+  let sorted = [
+    { k: 1, tag: "b" },
+    { k: 1, tag: "c" },
+    { k: 1, tag: "e" },
     { k: 2, tag: "a" },
-  ]);
+    { k: 2, tag: "d" },
+  ];
+  assert_eq(
+    sort_by(items, |l: { k: Int, tag: String }, r: { k: Int, tag: String }| l.k < r.k),
+    sorted,
+  );
+  assert_eq(
+    sort_by(items, |l: { k: Int, tag: String }, r: { k: Int, tag: String }| l.k <= r.k),
+    sorted,
+  );
   // The descending comparator is a comparator too.
   assert_eq(sort_by([1, 3, 2], |l: Int, r: Int| l > r), [3, 2, 1])
+}
+
+test "sort_by_key orders by the key, keeps the order of equal keys and asks each key once" {
+  let words = ["pear", "fig", "plum", "kiwi", "yam", "a"];
+  assert_eq(sort_by_key(words, |w: String| string_len(w)), [
+    "a",
+    "fig",
+    "yam",
+    "pear",
+    "plum",
+    "kiwi",
+  ]);
+  let none: List<String> = [];
+  assert_eq(sort_by_key(none, |w: String| string_len(w)), []);
+  let asked = with_cell[asked](0) { c -> {
+    let sorted = sort_by_key([3, 1, 2, 1], |n: Int| {
+      cell_set(c, cell_get(c) + 1);
+      0 - n
+    });
+    { sorted: sorted, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { sorted: [3, 2, 1, 1], asked: 4 })
+}
+
+test "a partition point is where a divided list turns, found without asking every element" {
+  let below = |limit: Int| |x: Int| x < limit;
+  assert_eq(partition_point([1, 2, 3, 10, 11], below(5)), 3);
+  assert_eq(partition_point([1, 2, 3], below(0)), 0);
+  assert_eq(partition_point([1, 2, 3], below(9)), 3);
+  assert_eq(partition_point([7], below(9)), 1);
+  assert_eq(partition_point([7], below(7)), 0);
+  assert_eq(partition_point([], below(5)), 0);
+  assert_eq(map(range(0, 9), |limit: Int| partition_point(range(0, 7), below(limit))), [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    7,
+  ]);
+  let asked = with_cell[asked](0) { c -> {
+    let point = partition_point(range(0, 1000), |x: Int| {
+      cell_set(c, cell_get(c) + 1);
+      x < 700
+    });
+    { point: point, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { point: 700, asked: 10 })
+}
+
+test "a binary search answers the first of the equals, or where the element would go" {
+  let seek = |xs: List<Int>, x: Int| binary_search(xs, |y: Int| compare(y, x));
+  assert_eq(seek([1, 3, 5, 7], 5), Ok(2));
+  assert_eq(seek([1, 3, 5, 7], 1), Ok(0));
+  assert_eq(seek([1, 3, 5, 7], 7), Ok(3));
+  assert_eq(seek([1, 3, 5, 7], 0), Err(0));
+  assert_eq(seek([1, 3, 5, 7], 4), Err(2));
+  assert_eq(seek([1, 3, 5, 7], 9), Err(4));
+  assert_eq(seek([2, 4, 4, 4, 6], 4), Ok(1));
+  assert_eq(seek([4, 4, 4], 4), Ok(0));
+  assert_eq(seek([], 4), Err(0));
+  let rows = [{ id: 10, name: "a" }, { id: 20, name: "b" }, { id: 30, name: "c" }];
+  assert_eq(binary_search(rows, |r: { id: Int, name: String }| compare(r.id, 20)), Ok(1));
+  assert_eq(binary_search(rows, |r: { id: Int, name: String }| compare(r.id, 25)), Err(2))
 }
 
 test "windows are the runs of neighbours, and none longer than the list" {
   assert_eq(windows([1, 2, 3, 4], 2), [[1, 2], [2, 3], [3, 4]]);
   assert_eq(windows([1, 2, 3], 3), [[1, 2, 3]]);
+  assert_eq(windows([1, 2, 3], 1), [[1], [2], [3]]);
   assert_eq(windows([1, 2], 3), []);
-  assert_eq(windows([1, 2], 0), [])
+  assert_eq(windows([1, 2], 0), []);
+  assert_eq(windows([1, 2], 0 - 1), []);
+  assert_eq(windows([], 1), [])
 }
 
 test "partition, split_at and chunks divide the list, and keep the order" {
@@ -561,6 +1054,37 @@ test "partition, split_at and chunks divide the list, and keep the order" {
   assert_eq(chunks([1, 2], 0), [])
 }
 
+test "partition asks once of each element, in order" {
+  let asked = with_cell[asked](0) { c -> {
+    let halves = partition([5, 1, 4], |n: Int| {
+      cell_set(c, cell_get(c) * 10 + n);
+      n > 3
+    });
+    { halves: halves, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { halves: { yes: [5, 4], no: [1] }, asked: 514 })
+}
+
+test "chunk_by cuts where the key changes, so a key that comes again starts another run" {
+  assert_eq(chunk_by([1, 3, 2, 4, 5], |n: Int| n % 2), [[1, 3], [2, 4], [5]]);
+  assert_eq(chunk_by(["a", "b", "cc", "d"], |s: String| string_len(s)), [
+    ["a", "b"],
+    ["cc"],
+    ["d"],
+  ]);
+  assert_eq(chunk_by([7], |n: Int| n), [[7]]);
+  assert_eq(chunk_by([7, 7, 7], |n: Int| n), [[7, 7, 7]]);
+  assert_eq(chunk_by([], |n: Int| n), []);
+  let asked = with_cell[asked](0) { c -> {
+    let runs = chunk_by([1, 1, 2], |n: Int| {
+      cell_set(c, cell_get(c) + 1);
+      n
+    });
+    { runs: runs, asked: cell_get(c) }
+  } };
+  assert_eq(asked, { runs: [[1, 1], [2]], asked: 3 })
+}
+
 test "flatten joins the lists, intersperse puts the separator between, unique keeps the first" {
   assert_eq(flatten([[1, 2], [], [3]]), [1, 2, 3]);
   assert_eq(flatten([[]]), []);
@@ -570,6 +1094,24 @@ test "flatten joins the lists, intersperse puts the separator between, unique ke
   assert_eq(unique([3, 1, 3, 2, 1]), [3, 1, 2]);
   assert_eq(unique([]), []);
   assert_eq(unique(["b", "a", "b"]), ["b", "a"])
+}
+
+test "dedup cuts each run of equal neighbours to one, and leaves a later return alone" {
+  assert_eq(dedup([1, 1, 2, 2, 2, 1, 3, 3]), [1, 2, 1, 3]);
+  assert_eq(dedup(["a"]), ["a"]);
+  assert_eq(dedup([4, 4, 4]), [4]);
+  let none: List<Int> = [];
+  assert_eq(dedup(none), [])
+}
+
+test "interleave takes turns, and the longer list's rest follows" {
+  assert_eq(interleave([1, 2, 3], [7, 8, 9, 10, 11]), [1, 7, 2, 8, 3, 9, 10, 11]);
+  assert_eq(interleave([7, 8, 9], [1]), [7, 1, 8, 9]);
+  assert_eq(interleave([1, 2], [8, 9]), [1, 8, 2, 9]);
+  assert_eq(interleave([], [1, 2]), [1, 2]);
+  assert_eq(interleave([1, 2], []), [1, 2]);
+  let none: List<Int> = [];
+  assert_eq(interleave(none, none), [])
 }
 
 test "is_empty, somes and push_unique answer what they say" {
