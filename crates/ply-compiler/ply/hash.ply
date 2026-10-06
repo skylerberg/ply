@@ -584,6 +584,8 @@ fn tag_p_record() -> Int = 84
 fn tag_p_list() -> Int = 85
 fn tag_p_or() -> Int = 86
 fn tag_p_range() -> Int = 87
+/// In a later alternative of an or-pattern: the first alternative's binder a variable there is.
+fn tag_p_again() -> Int = 162
 fn tag_row() -> Int = 90
 fn tag_atom() -> Int = 91
 fn tag_atom_op() -> Int = 97
@@ -1424,37 +1426,32 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
 
 fn block(encoder: Encoder, stmts: List<Stmt>, tail: Option<Expr>) -> Encoder / {abort.raise} = {
   let head: Encoder = put_u32(put_tag(encoder, tag_e_block()), len(stmts));
-  let ordered: { encoder: Encoder, order: List<Int> } = stmt_order(head, stmts);
-  let walked: Encoder = fold(ordered.order, ordered.encoder, |acc: Encoder, i: Int|
-    stmt(acc, at(stmts, i)));
-  let tailed: Encoder = opt_expr(walked, tail);
+  let tailed: Encoder = opt_expr(stmts_in_order(head, stmts), tail);
   { ..tailed, values: head.values }
 }
 
-/// Consecutive `let`s that commute are emitted in the order their own encodings sort in.
-fn stmt_order(
-  encoder: Encoder,
-  stmts: List<Stmt>,
-) -> { encoder: Encoder, order: List<Int> } / {abort.raise} = {
+/// Each statement in turn, consecutive `let`s that commute in the order their own encodings sort
+/// in. A run is ordered where it stands, after the statements before it are written, so what it
+/// reads of an earlier `let` of its block is that binder's level and never its name.
+fn stmts_in_order(encoder: Encoder, stmts: List<Stmt>) -> Encoder / {abort.raise} = {
   let n = len(stmts);
-  let walked = iterate(
-    { encoder: encoder, i: 0, order: [] },
-    n + 2,
-    |s: { encoder: Encoder, i: Int, order: List<Int> }|
-      if s.i >= n { Stop(s) } else {
-        let run = commutable_run(stmts, s.i);
-        if run < 2 { Continue({ ..s, i: s.i + 1, order: push(s.order, s.i) }) } else {
-          let sorted: { encoder: Encoder, order: List<Int> } = sorted_run(
-            s.encoder,
-            stmts,
-            s.i,
-            s.i + run,
-          );
-          Continue({ encoder: sorted.encoder, i: s.i + run, order: concat(s.order, sorted.order) })
-        }
-      },
-  );
-  { encoder: walked.encoder, order: walked.order }
+  iterate({ encoder: encoder, i: 0 }, n + 2, |s: { encoder: Encoder, i: Int }|
+    if s.i >= n { Stop(s) } else {
+      let run = commutable_run(stmts, s.i);
+      if run < 2 { Continue({ encoder: stmt(s.encoder, at(stmts, s.i)), i: s.i + 1 }) } else {
+        let sorted: { encoder: Encoder, order: List<Int> } = sorted_run(
+          s.encoder,
+          stmts,
+          s.i,
+          s.i + run,
+        );
+        Continue({
+          encoder: fold(sorted.order, sorted.encoder, |acc: Encoder, i: Int|
+            stmt(acc, at(stmts, i))),
+          i: s.i + run,
+        })
+      }
+    }).encoder
 }
 
 /// The members of the run, ordered by their encodings; ties keep their source order.
@@ -1525,12 +1522,30 @@ fn lit(encoder: Encoder, literal: Lit) -> Encoder / {abort.raise} =
     LBad -> panic("a placeholder literal reached the hasher"),
   }
 
-fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} =
+fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} = pattern_in(encoder, p, None)
+
+/// `again` is where the binders of an or-pattern's first alternative start, inside a later one: a
+/// variable there is that alternative's binder of its name, written by its level, and binds
+/// nothing more. So one binder stands for a name whichever alternative matched, and which binder
+/// each alternative gives it is part of the form.
+fn pattern_in(encoder: Encoder, p: Pattern, again: Option<Int>) -> Encoder / {abort.raise} =
   match p {
     PWild(_) -> put_tag(encoder, tag_p_wildcard()),
     PVar(v) -> {
-      let t: Encoder = put_tag(encoder, tag_p_var());
-      { ..t, values: push(t.values, v.name.name) }
+      let bound = match again {
+        None -> None,
+        Some(from) -> match rposition(encoder.values, v.name.name) {
+          Some(level) -> if level >= from { Some(level) } else { None },
+          None -> None,
+        },
+      };
+      match bound {
+        Some(level) -> put_u32(put_tag(encoder, tag_p_again()), level),
+        None -> {
+          let t: Encoder = put_tag(encoder, tag_p_var());
+          { ..t, values: push(t.values, v.name.name) }
+        },
+      }
     },
     PLit(l) -> lit(put_tag(encoder, tag_p_lit()), l.lit),
     PRange(r) -> lit(lit(put_tag(encoder, tag_p_range()), r.lo), r.hi),
@@ -1538,7 +1553,7 @@ fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} =
       fold(
         c.args,
         put_u32(ctor_ref(put_tag(encoder, tag_p_ctor()), c.name), len(c.args)),
-        |acc: Encoder, a: Pattern| pattern(acc, a),
+        |acc: Encoder, a: Pattern| pattern_in(acc, a, again),
       ),
     PRecord(r) ->
       put_bool(
@@ -1546,7 +1561,7 @@ fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} =
           r.fields,
           put_u32(put_tag(encoder, tag_p_record()), len(r.fields)),
           |acc: Encoder, f: { name: Ident, pat: Pattern }|
-            pattern(put_text(acc, f.name.name), f.pat),
+            pattern_in(put_text(acc, f.name.name), f.pat, again),
         ),
         r.rest,
       ),
@@ -1554,19 +1569,19 @@ fn pattern(encoder: Encoder, p: Pattern) -> Encoder / {abort.raise} =
       let items: Encoder = fold(
         l.items,
         put_u32(put_tag(encoder, tag_p_list()), len(l.items)),
-        |acc: Encoder, i: Pattern| pattern(acc, i),
+        |acc: Encoder, i: Pattern| pattern_in(acc, i, again),
       );
       match l.rest {
         None -> put_tag(items, tag_none()),
-        Some(rest) -> pattern(put_tag(items, tag_some()), rest),
+        Some(rest) -> pattern_in(put_tag(items, tag_some()), rest, again),
       }
     },
-    POr(o) ->
-      fold(
-        o.alts,
-        put_u32(put_tag(encoder, tag_p_or()), len(o.alts)),
-        |acc: Encoder, a: Pattern| pattern(acc, a),
-      ),
+    POr(o) -> {
+      let head: Encoder = put_u32(put_tag(encoder, tag_p_or()), len(o.alts));
+      let later = match again { Some(_) -> again, None -> Some(len(head.values)) };
+      fold(range(0, len(o.alts)), head, |acc: Encoder, i: Int|
+        pattern_in(acc, at(o.alts, i), if i == 0 { again } else { later }))
+    },
     PBad(_) -> panic("a placeholder pattern reached the hasher"),
   }
 
@@ -3430,7 +3445,13 @@ type Part = {
   printed: Bool,
 }
 type Slot = { part: Int, class: Int }
-type Layout = { parts: List<Part>, by_hash: Map<Bytes, List<Slot>>, relink: Map<Bytes, Bytes> }
+/// `apart` is a printing that sets each body in a module of its own, away from the one that wrote it.
+type Layout = {
+  parts: List<Part>,
+  by_hash: Map<Bytes, List<Slot>>,
+  relink: Map<Bytes, Bytes>,
+  apart: Bool,
+}
 /// The import graph the print has laid down so far travels with the printer: a home is chosen
 /// with it in view, so a reference never closes a cycle the source did not have. `room` is how
 /// much deeper a body may nest: each level reads a byte, so a definition's length is its room.
@@ -3846,7 +3867,7 @@ fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
       let lc = read_count(args.decoder);
       let labels = read_many(lc.decoder, lc.value, read_label);
       let rc = read_count(labels.decoder);
-      let rows = read_many(rc.decoder, rc.value, |e: Decoder| print_row(printer, e));
+      let rows = read_many(rc.decoder, rc.value, |e: Decoder| print_row(printer, e, false));
       {
         decoder: rows.decoder,
         text: bytes_concat(name.text, angled(args.texts, labels.texts, rows.texts)),
@@ -3855,7 +3876,7 @@ fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
       let n = read_count(t.decoder);
       let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
       let ret = print_ret(printer, ps.decoder);
-      let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e));
+      let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e, false));
       {
         decoder: row.decoder,
         text: bytes_concat_all([
@@ -3903,10 +3924,12 @@ fn read_label(decoder: Decoder) -> Decoded / {abort.raise} = {
   else { panic("a tag that is not a resource label") }
 }
 
-fn print_row(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
+/// `own` is a definition's own row, the only one whose row variable may be promised `bounded`: what
+/// follows any other row is not the row's to read.
+fn print_row(printer: BodyPrinter, d: Decoder, own: Bool) -> Decoded / {abort.raise} = {
   let n = read_count(expect(d, tag_row(), b"an effect row"));
   let atoms = read_many(n.decoder, n.value, |e: Decoder| {
-    if peek(e) == tag_atom_op() {
+    let named: Decoded = if peek(e) == tag_atom_op() {
       let eff = read_effect(printer, expect(e, tag_atom_op(), b"an operation atom"));
       let op = read_text(eff.decoder);
       let r = read_opt(op.decoder, read_label);
@@ -3916,7 +3939,10 @@ fn print_row(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
       let m = read_mode(eff.decoder);
       let r = read_opt(m.decoder, read_label);
       { decoder: r.decoder, text: bytes_concat_all([eff.text, b".", m.text, bracketed(r)]) }
-    }
+    };
+    if peek(named.decoder) == tag_bounded() {
+      { decoder: skip(named.decoder), text: bytes_concat(named.text, b" bounded") }
+    } else { named }
   });
   let tail = read_opt(atoms.decoder, |e: Decoder| {
     let k = read_u8(e);
@@ -3927,10 +3953,18 @@ fn print_row(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
     } else if k.value == tag_free() { read_text(k.decoder) }
     else { panic("a tag that is not a row tail") }
   });
+  let promised = own && tail.some && peek(tail.decoder) == tag_bounded();
+  let variable = if promised { bytes_concat(tail.text, b" bounded") } else { tail.text };
   {
-    decoder: tail.decoder,
-    text: if n.value == 0 && tail.some { tail.text }
-    else { bytes_concat_all([b"{", joined(atoms.texts, b", "), prefixed(tail, b" | "), b"}"]) },
+    decoder: if promised { skip(tail.decoder) } else { tail.decoder },
+    text: if n.value == 0 && tail.some { variable } else {
+      bytes_concat_all([
+        b"{",
+        joined(atoms.texts, b", "),
+        if tail.some { bytes_concat(b" | ", variable) } else { b"" },
+        b"}",
+      ])
+    },
   }
 }
 
@@ -4197,6 +4231,15 @@ fn print_pat(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
     let e: Decoder = t.decoder;
     if t.value == tag_p_wildcard() { { decoder: e, text: b"_" } } else if t.value == tag_p_var() {
       { decoder: { ..e, values: e.values + 1 }, text: local_name(e.values) }
+    } else if t.value == tag_p_again() {
+      let l = read_u32(e);
+      if l.value >= e.values { panic("an alternative names a binder that is not in scope") }
+      else { { decoder: l.decoder, text: local_name(l.value) } }
+    } else if t.value == tag_p_or() {
+      // Parenthesized wherever it stands: a choice nests only so, and reads the same at the top.
+      let n = read_count(e);
+      let alts = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
+      { decoder: alts.decoder, text: bytes_concat_all([b"(", joined(alts.texts, b" | "), b")"]) }
     } else if t.value == tag_p_lit() { print_lit(e) } else if t.value == tag_p_range() {
       let lo = print_lit(e);
       let hi = print_lit(lo.decoder);
@@ -4230,7 +4273,8 @@ fn print_pat(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
     } else if t.value == tag_p_list() {
       let n = read_count(e);
       let items = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-      let named = peek(skip(items.decoder)) == tag_p_var();
+      let held = peek(skip(items.decoder));
+      let named = held == tag_p_var() || held == tag_p_again();
       let rest = read_opt(items.decoder, |g: Decoder| print_pat(printer, g));
       {
         decoder: rest.decoder,
@@ -4605,7 +4649,9 @@ fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.ra
       let rest = read_many(head.decoder, n.value, |g: Decoder| {
         let hole = print_expr(printer, g, depth);
         let text = read_tag_text(hole.decoder);
-        { decoder: text.decoder, text: bytes_concat_all([b"{", hole.text, b"}", text.text]) }
+        // A hole that opens with a brace of its own is set off from it: `{{` is a brace of the text.
+        let open = if bytes_starts_with(hole.text, b"{") { b"{ " } else { b"{" };
+        { decoder: text.decoder, text: bytes_concat_all([open, hole.text, b"}", text.text]) }
       });
       {
         decoder: rest.decoder,
@@ -4629,6 +4675,25 @@ fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.
     {
       decoder: p.decoder,
       text: bytes_concat_all([b"let ", p.text, prefixed(ty, b": "), b" = ", v.text, b";"]),
+    }
+  } else if t.value == tag_s_let_else() {
+    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
+    // Parenthesized unless it is atomic: an `if` with no `else` would take the statement's.
+    let v = print_operand(printer, ty.decoder, depth);
+    let p = print_pat(printer, v.decoder);
+    let fallback = print_block(printer, p.decoder, depth);
+    {
+      decoder: fallback.decoder,
+      text: bytes_concat_all([
+        b"let ",
+        p.text,
+        prefixed(ty, b": "),
+        b" = ",
+        v.text,
+        b" else ",
+        fallback.text,
+        b";",
+      ]),
     }
   } else if t.value == tag_s_expr() {
     let g = print_expr(printer, t.decoder, depth);
@@ -4666,10 +4731,18 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
   let n = read_count({ ..lc.decoder, types: tc.value, rows: ec.value, labels: lc.value });
   let ps = read_many(n.decoder, n.value, |g: Decoder| print_param_slot(printer, g));
   let ret = read_opt(ps.decoder, |g: Decoder| print_ret(printer, g));
-  let row = read_opt(ret.decoder, |g: Decoder| print_row(printer, g));
+  let row = read_opt(ret.decoder, |g: Decoder| print_row(printer, g, true));
   let cs = read_count(row.decoder);
   let derives: DecodedList = read_many(cs.decoder, cs.value, print_constraint);
-  let scoped: Decoder = { ..derives.decoder, values: n.value };
+  let bound: Decoder = { ..derives.decoder, values: n.value };
+  let shared: Decoded = if peek(bound) == tag_returns_fresh() {
+    { decoder: skip(bound), text: b"\n  returns fresh" }
+  } else if peek(bound) == tag_returns_param() {
+    let i = read_u32(skip(bound));
+    if i.value >= n.value { panic("a `returns` clause names a parameter out of scope") }
+    else { { decoder: i.decoder, text: bytes_concat(b"\n  returns ", local_name(i.value)) } }
+  } else { { decoder: bound, text: b"" } };
+  let scoped: Decoder = shared.decoder;
   let measure: DecodedOption = if peek(scoped) != tag_decreases() {
     { decoder: scoped, text: b"", some: false }
   } else {
@@ -4690,6 +4763,7 @@ fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.r
       prefixed(ret, b" -> "),
       prefixed(row, b" / "),
       if cs.value > 0 { bytes_concat(b" where ", joined(derives.texts, b", ")) } else { b"" },
+      shared.text,
       if measure.some { bytes_concat(b"\n  decreases ", measure.text) } else { b"" },
       b" =\n  ",
       body.text,
@@ -4749,7 +4823,7 @@ fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {a
   {
     decoder: numeric.decoder,
     text: bytes_concat_all([
-      if closed { b"opaque type " } else { b"type " },
+      if closed && !printer.layout.apart { b"opaque type " } else { b"type " },
       name,
       generic_list(n.value, ec.value, lc.value),
       b" = ",
@@ -5121,7 +5195,7 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
   done.out
 }
 
-fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout / {abort.raise} = {
+fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>, apart: Bool) -> Layout / {abort.raise} = {
   let bound = binders(
     map_keys(
       fold(parts, map_new(), |acc: Map<Bytes, Bool>, part: Part|
@@ -5145,6 +5219,7 @@ fn layout_of(parts: List<Part>, relink: Map<Bytes, Bytes>) -> Layout / {abort.ra
         ))
     }),
     relink: relink,
+    apart: apart,
   }
 }
 
@@ -5250,12 +5325,17 @@ fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
 /// `public` is what the name's own module exports: a reference from a module that is printed reaches
 /// a shipped one only through it, so a name filed without it is never the one a reference is printed
 /// under.
+///
+/// `apart` says the names set each body in a module of its own, as a search's do. What only a
+/// type's module may write is then written wherever a body landed, so an `opaque` type is printed
+/// open; it runs as it did, and is no longer stored under the hash it was.
 pub fn print_bodies(
   bodies: List<Bytes>,
   names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
   tests: List<Bytes>,
   relink: List<{ from: Bytes, to: Bytes }>,
   shipped: List<Bytes>,
+  apart: Bool = false,
 ) -> Printing / {abort.raise} = {
   let comps = map(bodies, comp_of);
   let n = named_of(
@@ -5287,6 +5367,7 @@ pub fn print_bodies(
         parted.parts,
         fold(relink, map_new(), |acc: Map<Bytes, Bytes>, r: { from: Bytes, to: Bytes }|
           map_insert(acc, r.from, r.to)),
+        apart,
       );
       let printed = print_parts(l);
       let t = print_tests(l, printed.graph, tests, printed.missing);
@@ -5825,6 +5906,430 @@ test "a range pattern prints back to what it was stored under, at any integer ty
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
+/// A module of `src` stored and printed back: what it printed as, and whether what was printed is
+/// stored under the hashes `src` was.
+fn printed_back(src: Bytes) -> { text: Bytes, same: Bool } / {abort.raise} = {
+  let out = hash_index(indexed([{ name: b"m", src: src }]));
+  let ms = printed_of(out, []);
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  { text: at(ms, 0).text, same: by_name(named_hashes(again)) == by_name(named_hashes(out)) }
+}
+
+fn trees() -> Bytes =
+  b"pub type Tree = | Leaf | Node(Tree, Int) | Other(Int, Tree)\npub type Point = { at: Int, up: Int }\n"
+
+test "an or-pattern binds once, and which binder each alternative gives a name is part of its hash" {
+  let over = |arm: Bytes|
+    bytes_concat_all([trees(), b"pub fn f(t: Tree) -> Int = match t { ", arm, b", _ -> 0 }"]);
+  let one = |arm: Bytes| dumped_hash(hash_dump([{ name: b"m", src: over(arm) }]), b"m.f");
+  // Renaming a binder moves nothing, in whichever alternative it is renamed.
+  assert_eq(one(b"Node(_, x) | Other(x, _) -> x"), one(b"Node(_, n) | Other(n, _) -> n"));
+  // Giving a name another field of either alternative makes another definition.
+  let straight = one(b"Node(Node(_, x), y) | Other(x, Node(_, y)) -> x - y");
+  assert(straight != one(b"Node(Node(_, y), x) | Other(x, Node(_, y)) -> x - y"));
+  assert(straight != one(b"Node(Node(_, x), y) | Other(y, Node(_, x)) -> x - y"));
+  assert_eq(straight, one(b"Node(Node(_, a), b) | Other(a, Node(_, b)) -> a - b"));
+  // The body reads the one binder, so both spellings print back as one that checks.
+  let back = printed_back(over(b"Node(Node(_, x), y) | Other(y, Node(_, x)) -> x - y"));
+  assert(
+    bytes::contains(
+      back.text,
+      b"(Node(Node(_, _l1), _l2) | Other(_l2, Node(_, _l1))) -> _l1 - _l2",
+    ),
+    Some(string_of_bytes_lossy(back.text)),
+  );
+  assert(back.same);
+  // Two `let`s that commute are one definition in either order, each binding through a choice.
+  let lets = |first: Bytes, second: Bytes|
+    dumped_hash(
+      hash_dump([
+        {
+          name: b"m",
+          src: bytes_concat_all([
+            b"pub fn f(a: Result<Int, Int>, b: (Int, Int)) -> Int = { ",
+            first,
+            b" ",
+            second,
+            b" x - y }",
+          ]),
+        },
+      ]),
+      b"m.f",
+    );
+  assert_eq(
+    lets(b"let Ok(x) | Err(x) = a;", b"let (y, 1) | (_, y) = b;"),
+    lets(b"let (y, 1) | (_, y) = b;", b"let Ok(x) | Err(x) = a;"),
+  )
+}
+
+test "`let`s that commute are ordered by the levels they read, so renaming a `let` before them moves nothing" {
+  let spread = |first: Bytes, second: Bytes|
+    bytes_concat_all([
+      b"pub fn spread(a: Int, b: Int) -> Int = { let ",
+      first,
+      b" = a + 0; let ",
+      second,
+      b" = b + 0; let hw = ",
+      first,
+      b" / 2; let hh = ",
+      second,
+      b" / 2; hw - hh }",
+    ]);
+  let one = |src: Bytes| dumped_hash(hash_dump([{ name: b"m", src: src }]), b"m.spread");
+  assert_eq(one(spread(b"w", b"h")), one(spread(b"h", b"w")));
+  assert(printed_back(spread(b"w", b"h")).same);
+  assert(printed_back(spread(b"h", b"w")).same)
+}
+
+/// A pattern of each form, and of the forms nested in each other, with the type it is matched at.
+fn pattern_samples() -> List<{ of: Bytes, pattern: Bytes }> =
+  [
+    { of: b"Int", pattern: b"_" },
+    { of: b"Int", pattern: b"x" },
+    { of: b"Int", pattern: b"1" },
+    { of: b"Int", pattern: b"-1" },
+    { of: b"String", pattern: b"\"s\"" },
+    { of: b"Int", pattern: b"0..=9" },
+    { of: b"Int", pattern: b"b'a'..=b'z' | b'_'" },
+    { of: b"Int", pattern: b"0..=9 | 20..=29 | -5..=-1" },
+    { of: b"Int", pattern: b"1 | (2 | 3)" },
+    { of: b"Tree", pattern: b"Leaf" },
+    { of: b"Tree", pattern: b"Node(l, _)" },
+    { of: b"Tree", pattern: b"Node(_, (1 | 2))" },
+    { of: b"Tree", pattern: b"Node(Leaf, n) | Other(n, Leaf)" },
+    { of: b"Tree", pattern: b"Node(l, 0..=9) | Other(10..=19, l) | Node(l, 30 | 40..=49)" },
+    { of: b"Option<U8>", pattern: b"Some(1u8..=9u8 | 200u8..=255u8)" },
+    { of: b"Tree", pattern: b"Node(Node(_, a), b) | Other(b, Node(_, a)) | Node(Other(a, _), b)" },
+    { of: b"Point", pattern: b"{at: a, ..}" },
+    { of: b"Point", pattern: b"{at: 0, up: u} | {at: u, up: 0}" },
+    { of: b"(Int, Int)", pattern: b"(a, b)" },
+    { of: b"(Int, Int)", pattern: b"(1 | 2, x) | (x, 3 | 4)" },
+    { of: b"(Int, Tree)", pattern: b"(a, Leaf) | (_, (Node(_, a) | Other(a, _)))" },
+    { of: b"List<Int>", pattern: b"[]" },
+    { of: b"List<Int>", pattern: b"[h, ..]" },
+    { of: b"List<Int>", pattern: b"[h, ..rest] | [_, h, ..rest]" },
+    {
+      of: b"List<Tree>",
+      pattern: b"[(Node(_, x) | Other(x, _)), ..rest] | [_, Node(_, x), ..rest]",
+    },
+  ]
+
+type PatternForms = {
+  wildcard: Bool,
+  variable: Bool,
+  literal: Bool,
+  range: Bool,
+  constructor: Bool,
+  record: Bool,
+  list: Bool,
+  choice: Bool,
+}
+
+/// `seen` with the forms `p` and the patterns inside it are written in. A form added to `Pattern`
+/// is added here and to `pattern_samples`, which the test below stores and prints back.
+fn pattern_forms(p: Pattern, seen: PatternForms) -> PatternForms =
+  match p {
+    PWild(_) -> { ..seen, wildcard: true },
+    PVar(_) -> { ..seen, variable: true },
+    PLit(_) -> { ..seen, literal: true },
+    PRange(_) -> { ..seen, range: true },
+    PCtor(c) ->
+      fold(c.args, { ..seen, constructor: true }, |s: PatternForms, a: Pattern|
+        pattern_forms(a, s)),
+    PRecord(r) ->
+      fold(
+        r.fields,
+        { ..seen, record: true },
+        |s: PatternForms, f: { name: Ident, pat: Pattern }| pattern_forms(f.pat, s),
+      ),
+    PList(l) -> {
+      let items = fold(l.items, { ..seen, list: true }, |s: PatternForms, i: Pattern|
+        pattern_forms(i, s));
+      match l.rest { Some(rest) -> pattern_forms(rest, items), None -> items }
+    },
+    POr(o) ->
+      fold(o.alts, { ..seen, choice: true }, |s: PatternForms, a: Pattern| pattern_forms(a, s)),
+    PBad(_) -> seen,
+  }
+
+fn matching(sample: { of: Bytes, pattern: Bytes }) -> Bytes =
+  bytes_concat_all([
+    trees(),
+    b"pub fn f(v: ",
+    sample.of,
+    b") -> Int = match v { ",
+    sample.pattern,
+    b" -> 1, _ -> 0 }",
+  ])
+
+/// The first arm's pattern of the one function `matching` writes.
+fn sampled(sample: { of: Bytes, pattern: Bytes }) -> Pattern / {abort.raise} =
+  fold(
+    parse(matching(sample)).node.items,
+    PBad({ span: { start: 0, end: 0 } }),
+    |found: Pattern, it: Item|
+      match it {
+        IFn(d) -> match d.body {
+          EMatch(m) -> match list_at(m.arms, 0) { Some(arm) -> arm.pat, None -> found },
+          _ -> found,
+        },
+        _ -> found,
+      },
+  )
+
+fn each_pattern_form(seen: Bool) -> PatternForms =
+  {
+    wildcard: seen,
+    variable: seen,
+    literal: seen,
+    range: seen,
+    constructor: seen,
+    record: seen,
+    list: seen,
+    choice: seen,
+  }
+
+test "every form a pattern is written in is stored, and prints back to what it was stored under" {
+  let seen = fold(
+    pattern_samples(),
+    each_pattern_form(false),
+    |forms: PatternForms, sample: { of: Bytes, pattern: Bytes }|
+      pattern_forms(sampled(sample), forms),
+  );
+  assert_eq(seen, each_pattern_form(true));
+  fold(pattern_samples(), (), |_: Unit, sample: { of: Bytes, pattern: Bytes }|
+    assert(printed_back(matching(sample)).same, Some(string_of_bytes_lossy(sample.pattern))))
+}
+
+type StmtForms = { bound: Bool, bound_or_left: Bool, run: Bool }
+
+/// `seen` with the form `s` is written in. A form added to `Stmt` is added here and to the block
+/// the test below stores and prints back.
+fn stmt_forms(s: Stmt, seen: StmtForms) -> StmtForms =
+  match s {
+    SLet(_) -> { ..seen, bound: true },
+    SLetElse(_) -> { ..seen, bound_or_left: true },
+    SExpr(_) -> { ..seen, run: true },
+  }
+
+test "every form a statement is written in is stored, and prints back to what it was stored under" {
+  let src = bytes_concat(
+    trees(),
+    b"pub fn f(t: Tree, xs: List<Int>, c: Bool) -> Int / {abort.raise} = {\n  let Node(_, n) | Other(n, _) = t else { 0 - 1 };\n  let [h, ..] = xs else { if c { n } else { 0 } };\n  let () = (if c { assert(h > 0) }) else { 2 };\n  let (a, b): (Int, Int) = (n, h);\n  assert(a <= b);\n  a + b\n}",
+  );
+  let seen = fold(
+    parse(src).node.items,
+    { bound: false, bound_or_left: false, run: false },
+    |forms: StmtForms, it: Item|
+      match it {
+        IFn(d) -> match d.body {
+          EBlock(b) -> fold(b.stmts, forms, |f: StmtForms, s: Stmt| stmt_forms(s, f)),
+          _ -> forms,
+        },
+        _ -> forms,
+      },
+  );
+  assert_eq(seen, { bound: true, bound_or_left: true, run: true });
+  let back = printed_back(src);
+  assert(bytes::contains(back.text, b" else {"), Some(string_of_bytes_lossy(back.text)));
+  assert(back.same, Some(string_of_bytes_lossy(back.text)))
+}
+
+type ExprForms = {
+  literal: Bool,
+  variable: Bool,
+  binary: Bool,
+  unary: Bool,
+  lambda: Bool,
+  call: Bool,
+  conditional: Bool,
+  matched: Bool,
+  block: Bool,
+  record: Bool,
+  update: Bool,
+  field: Bool,
+  list: Bool,
+  performed: Bool,
+  handled: Bool,
+  cell: Bool,
+  simulated: Bool,
+  branched: Bool,
+  tagged: Bool,
+  filled: Bool,
+  attempted: Bool,
+}
+
+fn each_expr_form(seen: Bool) -> ExprForms =
+  {
+    literal: seen,
+    variable: seen,
+    binary: seen,
+    unary: seen,
+    lambda: seen,
+    call: seen,
+    conditional: seen,
+    matched: seen,
+    block: seen,
+    record: seen,
+    update: seen,
+    field: seen,
+    list: seen,
+    performed: seen,
+    handled: seen,
+    cell: seen,
+    simulated: seen,
+    branched: seen,
+    tagged: seen,
+    filled: seen,
+    attempted: seen,
+  }
+
+/// `seen` with the form `e` is written in. A form added to `Expr` is added here and to
+/// `expr_samples`, which the test below stores and prints back. A `?` is expanded away before a
+/// body is stored.
+fn expr_forms(e: Expr, seen: ExprForms) -> ExprForms =
+  match e {
+    ELit(_) -> { ..seen, literal: true },
+    EVar(_) -> { ..seen, variable: true },
+    EBinary(_) -> { ..seen, binary: true },
+    EUnary(_) -> { ..seen, unary: true },
+    ELambda(_) -> { ..seen, lambda: true },
+    EApp(_) -> { ..seen, call: true },
+    EIf(_) -> { ..seen, conditional: true },
+    EMatch(_) -> { ..seen, matched: true },
+    EBlock(_) -> { ..seen, block: true },
+    ERecord(_) -> { ..seen, record: true },
+    ERecordUpdate(_) -> { ..seen, update: true },
+    EField(_) -> { ..seen, field: true },
+    EList(_) -> { ..seen, list: true },
+    EPerform(_) -> { ..seen, performed: true },
+    EHandle(_) -> { ..seen, handled: true },
+    EWithCell(_) -> { ..seen, cell: true },
+    ESimulate(_) -> { ..seen, simulated: true },
+    EParallel(_) -> { ..seen, branched: true },
+    ETagged(t) -> if len(t.holes) == 0 { { ..seen, tagged: true } }
+    else { { ..seen, filled: true } },
+    ETryBlock(_) -> { ..seen, attempted: true },
+    ETry(_) -> seen,
+    EBad(_) -> seen,
+  }
+
+/// A body of each form an expression is written in, over what `expr_program` declares around it.
+fn expr_samples() -> List<Bytes> =
+  [
+    b"1",
+    b"x",
+    b"x + 1",
+    b"-x",
+    b"|y: Int| y + x",
+    b"relay[conn](g(x))",
+    b"if x > 0 { 1 } else { 2 }",
+    b"match x { 0 -> 1, _ -> 2 }",
+    b"{ let y = x; y }",
+    b"{ at: x, up: 1 }",
+    b"{ ..p, at: 1 }",
+    b"p.at",
+    b"[x, 1]",
+    b"net.send[conn](x)",
+    b"handle { net.send[conn](x) } with { net.send[conn](y) resume k -> k(y), return v -> v }",
+    b"with_cell[work](x) { c -> cell_get(c) }",
+    b"simulate { x }",
+    b"parallel { x, 1 }",
+    b"hex\"ff\"",
+    b"marks\"a {x} { { at: x, up: 1 } }\"",
+    b"try { g(x) }",
+    b"try[abort.raise] { g(x) }",
+  ]
+
+fn expr_program(body: Bytes) -> List<Source> =
+  [
+    {
+      name: b"hex",
+      src: b"pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = Ok(1)",
+    },
+    {
+      name: b"marks",
+      src: b"pub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<Int>) -> Int = c",
+    },
+    {
+      name: b"m",
+      src: bytes_concat_all([
+        b"import hex\nimport marks\n",
+        trees(),
+        b"pub effect net { write send[c](x: Int) -> Int }\npub fn g(x: Int) -> Int = x\npub fn relay<[l]>(x: Int) -> Int / {net.write[l]} = net.send[l](x)\npub fn f(x: Int, p: Point) -> Int = ",
+        body,
+      ]),
+    },
+  ]
+
+/// The body of `m.f` as the hasher reads it.
+fn read_body(index: Index) -> Expr =
+  fold(index.nodes, EBad({ span: { start: 0, end: 0 } }), |found: Expr, n: Node|
+    if n.name != b"m.f" { found } else { match n.body { NodeFn(d) -> d.body, _ -> found } })
+
+test "every form an expression is written in is stored, and prints back to what it was stored under" {
+  let seen = fold(expr_samples(), each_expr_form(false), |forms: ExprForms, body: Bytes|
+    expr_forms(read_body(indexed(expr_program(body))), forms));
+  assert_eq(seen, each_expr_form(true));
+  fold(expr_samples(), (), |_: Unit, body: Bytes| {
+    let out = hash_index(indexed(expr_program(body)));
+    let again = hash_index(
+      indexed(
+        map(printed_of(out, []), |m: { module: Bytes, text: Bytes }|
+          { name: m.module, src: m.text }),
+      ),
+    );
+    assert(
+      by_name(named_hashes(again)) == by_name(named_hashes(out)),
+      Some(string_of_bytes_lossy(body)),
+    )
+  })
+}
+
+test "a `returns` clause prints back to what it was stored under, naming the parameter it names" {
+  let back = printed_back(
+    b"pub fn kept(n: Int, xs: List<Int>) -> List<Int>\n  returns xs\n= xs\npub fn made(n: Int) -> List<Int>\n  returns fresh\n= [n]\npub fn down(n: Int, xs: List<Int>) -> List<Int>\n  returns xs\n  decreases n\n= if n <= 0 { xs } else { down(n - 1, xs) }",
+  );
+  assert(bytes::contains(back.text, b"\n  returns _l1 ="), Some(string_of_bytes_lossy(back.text)));
+  assert(
+    bytes::contains(back.text, b"\n  returns fresh ="),
+    Some(string_of_bytes_lossy(back.text)),
+  );
+  assert(
+    bytes::contains(back.text, b"\n  returns _l1\n  decreases _l0 ="),
+    Some(string_of_bytes_lossy(back.text)),
+  );
+  assert(back.same)
+}
+
+test "what a row promises `bounded` prints back to what it was stored under: an atom, its row variable, or both" {
+  let back = printed_back(
+    b"pub effect net { write send[c](x: Int) -> Int }\npub fn atom(x: Int) -> Int / {net.write[conn] bounded} = net.send[conn](x)\npub fn op(x: Int) -> Int / {net.send[conn] bounded, abort.raise} = net.send[conn](x)\npub fn tail<| e>(f: () -> Int / e) -> Int / e bounded = f()\npub fn both<a | e>(x: a, f: (a) -> Int / e) -> Int / {net.write[conn] bounded | e bounded} where derivable(eq, a) = net.send[conn](f(x))\npub fn neither<| e>(f: () -> Int / e, g: (() -> Int / e) -> Int / e) -> Int / e = g(f)",
+  );
+  let text = string_of_bytes_lossy(back.text);
+  assert(bytes::contains(back.text, b"/ {net.write[conn] bounded} ="), Some(text));
+  assert(bytes::contains(back.text, b"net.send[conn] bounded"), Some(text));
+  assert(bytes::contains(back.text, b"/ _e0 bounded ="), Some(text));
+  assert(
+    bytes::contains(back.text, b"/ {net.write[conn] bounded | _e0 bounded} where"),
+    Some(text),
+  );
+  assert(back.same, Some(text));
+  let plain = |row: Bytes|
+    dumped_hash(
+      hash_dump([
+        {
+          name: b"m",
+          src: bytes_concat_all([b"pub fn f<| e>(g: () -> Int / e) -> Int / ", row, b" = g()"]),
+        },
+      ]),
+      b"m.f",
+    );
+  assert(plain(b"e") != plain(b"e bounded"))
+}
+
 test "printed bodies hash back to what they were stored under, under their own names" {
   let out = hash_index(
     indexed([
@@ -5966,6 +6471,32 @@ test "a tagged literal's braces print doubled, and its holes under a binder that
     fold(ms, false, |found: Bool, m: { module: Bytes, text: Bytes }|
       found || bytes::contains(m.text, spelled)),
   );
+  let again = hash_index(
+    indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
+  );
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+}
+
+test "a hole that opens with a brace of its own prints apart from the brace that opens it" {
+  let out = hash_index(
+    indexed([
+      {
+        name: b"marks",
+        src: b"pub type Mark = { text: String }\npub fn compile(parts: List<String>) -> Result<Int, { message: String, offset: Int, part: Int }> = Ok(1)\npub fn fill(c: Int, holes: List<Mark>) -> Int = c + len(holes)",
+      },
+      {
+        name: b"app",
+        src: b"import marks\nimport marks (Mark)\npub fn two(n: Int, old: Mark) -> Int = marks\"a { { text: \"x\" } } { { ..old, text: \"y\" } }{ { let k = n + 1; { text: int_to_string(k) } } }{{}}\"",
+      },
+    ]),
+  );
+  let ms = printed_of(out, []);
+  let text = at(ms, 0).text;
+  assert(
+    bytes::contains(text, b"marks\"a { {text: \"x\"}} { {.._l1, text: \"y\"}}{ {"),
+    Some(string_of_bytes_lossy(text)),
+  );
+  assert(bytes::contains(text, b"}{{}}\""), Some(string_of_bytes_lossy(text)));
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
@@ -6293,7 +6824,21 @@ test "a type's hash says whether it is opaque, what holds it moves with it, and 
   let again = hash_index(
     indexed(map(ms, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text })),
   );
-  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
+  assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)));
+  // Set apart from the module that wrote them, its bodies build the type from wherever they are.
+  let apart = match print_bodies(
+      map(out.bodies, |b: { name: Bytes, body: Bytes }| b.body),
+      all_public(named_hashes(out)),
+      [],
+      [],
+      [],
+      true,
+    ) {
+    Printed(open) -> at(open, 0).text,
+    Unprintable(why) -> panic(string_of_bytes(why.message)),
+  };
+  assert(bytes::contains(apart, b"pub type Tok = | Tok(Int)"));
+  assert(!bytes::contains(apart, b"opaque"))
 }
 
 test "an alias is transparent, so its name is no part of it" {
