@@ -2,10 +2,13 @@
 
 mod sim;
 mod socket;
+pub mod wire;
 
 pub use crate::pool::MAX_BLOCKING_OPERATIONS;
 pub use sim::SimNet;
 pub use socket::TcpHost;
+pub(crate) use socket::apply;
+pub use wire::{Credentials, Endpoint, Probing, Refusal, SocketOption};
 
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -27,21 +30,50 @@ operations! {
     what "net";
     Listen = "listen" / 1,
     ListenTls = "listen_tls" / 2,
+    ListenOn = "listen_on" / 2,
+    ListenUnix = "listen_unix" / 2,
     Connect = "connect" / 3,
     ConnectTls = "connect_tls" / 3,
+    ConnectTo = "connect_to" / 3,
+    ConnectUnix = "connect_unix" / 3,
     Handshake = "handshake" / 1,
+    StartTls = "start_tls" / 5,
+    ServeTls = "serve_tls" / 5,
     Accept = "accept" / 1,
     Recv = "recv" / 3,
     Send = "send" / 3,
+    CloseWrite = "close_write" / 1,
     Close = "close" / 1,
+    SetOption = "set_option" / 2,
     LocalPort = "local_port" / 1,
+    LocalAddress = "local_address" / 1,
+    PeerAddress = "peer_address" / 1,
+    PeerCredentials = "peer_credentials" / 1,
+    Options = "options" / 1,
 }
 
 impl Op {
     fn waits(self) -> bool {
         matches!(
             self,
-            Op::Connect | Op::ConnectTls | Op::Handshake | Op::Accept | Op::Recv | Op::Send
+            Op::Connect
+                | Op::ConnectTls
+                | Op::ConnectTo
+                | Op::ConnectUnix
+                | Op::Handshake
+                | Op::StartTls
+                | Op::ServeTls
+                | Op::Accept
+                | Op::Recv
+                | Op::Send
+        )
+    }
+
+    /// Whether the operation only reads what a socket is: replaying it changes nothing.
+    fn reads(self) -> bool {
+        matches!(
+            self,
+            Op::LocalPort | Op::LocalAddress | Op::PeerAddress | Op::PeerCredentials | Op::Options
         )
     }
 
@@ -51,18 +83,10 @@ impl Op {
             op: Symbol::new(self.name()),
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
-            // Reading a port changes nothing; every other operation opens, moves or closes bytes.
-            linearity: match self {
-                Op::LocalPort => Linearity::Repeatable,
-                Op::Listen
-                | Op::ListenTls
-                | Op::Connect
-                | Op::ConnectTls
-                | Op::Handshake
-                | Op::Accept
-                | Op::Recv
-                | Op::Send
-                | Op::Close => Linearity::AtMostOnce,
+            linearity: if self.reads() {
+                Linearity::Repeatable
+            } else {
+                Linearity::AtMostOnce
             },
             blocking: self.waits() && net.waits(),
             // No expression turns a `Secret` into the `Bytes` a socket write takes.
@@ -70,6 +94,14 @@ impl Op {
             path: net.path(self),
         }
     }
+}
+
+/// What an upgrade to TLS is asked with: the protocols to offer or accept, how many bytes of
+/// plaintext the caller read and has not consumed, and the deadline of the whole handshake.
+pub struct Upgrade {
+    pub alpn: Vec<String>,
+    pub unread: usize,
+    pub timeout: Duration,
 }
 
 pub trait Net: Send + Sync {
@@ -84,6 +116,23 @@ pub trait Net: Send + Sync {
         at: &Resource,
         port: u16,
         credential: &str,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// A listener at exactly `to`, which is a loopback address, with `options` set before the
+    /// bind.
+    fn listen_on(
+        &self,
+        at: &Resource,
+        to: Endpoint,
+        options: Vec<SocketOption>,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// A listener on the Unix socket at `path` under the filesystem root named `root`.
+    fn listen_unix(
+        &self,
+        at: &Resource,
+        root: &str,
+        path: &str,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
     /// `None` is a host that could not be reached before the deadline, whatever the reason.
@@ -104,9 +153,45 @@ pub trait Net: Send + Sync {
         timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
+    /// A connection to exactly `to`, no name looked up, with `options` set before it connects.
+    fn connect_to(
+        &self,
+        at: &Resource,
+        to: Endpoint,
+        options: Vec<SocketOption>,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    fn connect_unix(
+        &self,
+        at: &Resource,
+        root: &str,
+        path: &str,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
     /// The TLS handshake, completed now rather than when a request needs it, answering what it took
     /// in microseconds. `None` for a connection with no handshake to complete.
     fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// An open plaintext connection secured as the client's end, verifying the server as `name`.
+    /// The handle is the secured connection afterwards.
+    fn start_tls(
+        &self,
+        at: &Resource,
+        conn: i64,
+        name: &str,
+        upgrade: Upgrade,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// The server's end of the same, with the credential named `credential`.
+    fn serve_tls(
+        &self,
+        at: &Resource,
+        conn: i64,
+        credential: &str,
+        upgrade: Upgrade,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
     fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
     /// `None` is the deadline expiring; `Some(b"")` is the peer having stopped sending.
     fn recv(
@@ -126,9 +211,36 @@ pub trait Net: Send + Sync {
         timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
+    /// Ends this end's sending and leaves its reading open.
+    fn close_write(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
     fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    fn set_option(
+        &self,
+        at: &Resource,
+        socket: i64,
+        option: SocketOption,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
     /// The port this end of a socket is bound to; `None` for a listener the drain has closed.
     fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// The address this end of a socket is bound to; `None` for one with no IP address.
+    fn local_address(
+        &self,
+        at: &Resource,
+        socket: i64,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// The address of a connection's far end; `None` for a listener and for a Unix socket.
+    fn peer_address(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
+    /// Who holds the far end of a Unix socket; `None` for any other.
+    fn peer_credentials(
+        &self,
+        at: &Resource,
+        conn: i64,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// Each option the socket has, as it stands.
+    fn options(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
 }
 
 /// The resource label each open socket is operated under.
@@ -228,6 +340,9 @@ impl HostHandler for Operation {
         }
         // The resolved atom's resource, never one the handler re-derives.
         let at = &req.atom.resource;
+        let handle = |index: usize| req.args[index].as_int(span, "a socket handle");
+        let timeout =
+            |index: usize| deadline(self.op, req.args[index].as_int(span, "a timeout")?, span);
         match self.op {
             Op::Listen => {
                 let port = port(self.op, req.args[0].as_int(span, "a port")?, span)?;
@@ -238,51 +353,81 @@ impl HostHandler for Operation {
                 let credential = req.args[1].as_str(span, "a credential name")?;
                 self.net.listen_tls(at, port, credential, span)
             }
+            Op::ListenOn => {
+                let to = Endpoint::read(&req.args[0], span)?;
+                let options = SocketOption::list(&req.args[1], span)?;
+                self.net.listen_on(at, to, options, span)
+            }
+            Op::ListenUnix => {
+                let root = req.args[0].as_str(span, "a root's name")?;
+                let path = req.args[1].as_str(span, "a path")?;
+                self.net.listen_unix(at, root, path, span)
+            }
             Op::Connect => {
                 let host = req.args[0].as_str(span, "a host name")?;
                 let port = port(self.op, req.args[1].as_int(span, "a port")?, span)?;
-                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
-                self.net.connect(at, host, port, timeout, span)
+                self.net.connect(at, host, port, timeout(2)?, span)
             }
             Op::ConnectTls => {
                 let host = req.args[0].as_str(span, "a host name")?;
                 let port = port(self.op, req.args[1].as_int(span, "a port")?, span)?;
-                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
-                self.net.connect_tls(at, host, port, timeout, span)
+                self.net.connect_tls(at, host, port, timeout(2)?, span)
             }
-            Op::Accept => {
-                let listener = req.args[0].as_int(span, "a socket handle")?;
-                self.net.accept(at, listener, span)
+            Op::ConnectTo => {
+                let to = Endpoint::read(&req.args[0], span)?;
+                let options = SocketOption::list(&req.args[1], span)?;
+                self.net.connect_to(at, to, options, timeout(2)?, span)
             }
-            Op::Handshake => {
-                let conn = req.args[0].as_int(span, "a socket handle")?;
-                self.net.handshake(at, conn, span)
+            Op::ConnectUnix => {
+                let root = req.args[0].as_str(span, "a root's name")?;
+                let path = req.args[1].as_str(span, "a path")?;
+                self.net.connect_unix(at, root, path, timeout(2)?, span)
+            }
+            Op::Accept => self.net.accept(at, handle(0)?, span),
+            Op::Handshake => self.net.handshake(at, handle(0)?, span),
+            Op::StartTls => {
+                let name = req.args[1].as_str(span, "a server name")?;
+                self.net
+                    .start_tls(at, handle(0)?, name, upgrade(req, timeout(4)?)?, span)
+            }
+            Op::ServeTls => {
+                let credential = req.args[1].as_str(span, "a credential name")?;
+                self.net
+                    .serve_tls(at, handle(0)?, credential, upgrade(req, timeout(4)?)?, span)
             }
             Op::Recv => {
-                let conn = req.args[0].as_int(span, "a socket handle")?;
                 let max = bound(req.args[1].as_int(span, "a byte count")?, span)?;
-                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
-                self.net.recv(at, conn, max, timeout, span)
+                self.net.recv(at, handle(0)?, max, timeout(2)?, span)
             }
             Op::Send => {
-                let conn = req.args[0].as_int(span, "a socket handle")?;
                 let payload = Arc::clone(req.args[1].as_bytes(span, "a payload")?);
-                let timeout = deadline(self.op, req.args[2].as_int(span, "a timeout")?, span)?;
                 if payload.is_empty() {
                     return Err(empty_payload(span));
                 }
-                self.net.send(at, conn, &payload, timeout, span)
+                self.net.send(at, handle(0)?, &payload, timeout(2)?, span)
             }
-            Op::Close => {
-                let socket = req.args[0].as_int(span, "a socket handle")?;
-                self.net.close(at, socket, span)
+            Op::CloseWrite => self.net.close_write(at, handle(0)?, span),
+            Op::Close => self.net.close(at, handle(0)?, span),
+            Op::SetOption => {
+                let option = SocketOption::read(&req.args[1], span)?;
+                self.net.set_option(at, handle(0)?, option, span)
             }
-            Op::LocalPort => {
-                let socket = req.args[0].as_int(span, "a socket handle")?;
-                self.net.local_port(at, socket, span)
-            }
+            Op::LocalPort => self.net.local_port(at, handle(0)?, span),
+            Op::LocalAddress => self.net.local_address(at, handle(0)?, span),
+            Op::PeerAddress => self.net.peer_address(at, handle(0)?, span),
+            Op::PeerCredentials => self.net.peer_credentials(at, handle(0)?, span),
+            Op::Options => self.net.options(at, handle(0)?, span),
         }
     }
+}
+
+/// The last four arguments of either upgrade: the protocols, the unread plaintext, the deadline.
+fn upgrade(req: &HostRequest<'_>, timeout: Duration) -> Result<Upgrade, Diagnostic> {
+    Ok(Upgrade {
+        alpn: wire::strings_of(&req.args[2], req.span, "an application protocol")?,
+        unread: req.args[3].as_bytes(req.span, "unread plaintext")?.len(),
+        timeout,
+    })
 }
 
 /// No value means `never`: an unbounded operation lets a peer hold a connection for the whole run.
@@ -386,6 +531,36 @@ fn not_a_stream(handle: i64, span: Span) -> Diagnostic {
         format!("socket {handle} is a listener, and this operation wants a connection"),
     )
     .primary(span, "this handle came from `net.listen`, not `net.accept`")
+}
+
+/// An upgrade of something that is not a plaintext TCP connection at rest.
+#[cold]
+fn not_upgradable(op: Op, handle: i64, why: &str, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("{} cannot secure socket {handle}: {why}", op.what()),
+    )
+    .primary(span, "an upgrade takes a plaintext connection nothing else is waiting on")
+    .note("the handle is the secured connection afterwards, so a read or a write still in flight on the plaintext would be one the upgrade could not account for")
+}
+
+#[cold]
+fn a_datagram_socket(handle: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("socket {handle} is a datagram socket, and this operation wants a `net` one"),
+    )
+    .primary(span, "this handle came from `udp.bind`")
+    .note("a datagram socket is read with `udp.recv_from` and written with `udp.send_to`")
+}
+
+#[cold]
+fn not_a_datagram_socket(handle: i64, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("socket {handle} is not a datagram socket, and this operation wants one"),
+    )
+    .primary(span, "this handle did not come from `udp.bind`")
 }
 
 /// Only the simulated network raises this; a real `accept` waits for a peer.
