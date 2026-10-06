@@ -1,6 +1,6 @@
 //! Every deterministic test of this suite runs over `MemFs`, so it must answer as the disk does.
 
-import harness (fresh)
+import harness (fresh, in_memory, one, json_of, codes)
 import std.fs
 import std.fs (fs, Entry)
 
@@ -156,4 +156,130 @@ test/nondet "the filesystem's twin answers every operation as the disk does" {
   let disk = script();
   let twin = fs::on_mem(fs::mem_empty(), || script()).value;
   match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+/// A descriptor is the run's own number, so only whether there is one is compared.
+fn shown_opened(o: Result<Int, fs::Refused>) -> String =
+  match o {
+    Ok(_) -> "open",
+    Err(fs::NotFound) -> "not found",
+    Err(fs::Denied) -> "denied",
+    Err(fs::NotAFile) -> "not a file",
+    Err(fs::Unopened) -> "unopened",
+  }
+
+fn through<| e>(o: Result<Int, fs::Refused>, f: (Int) -> String / e) -> String / e =
+  match o { Ok(file) -> f(file), Err(_) -> "no descriptor" }
+
+/// The operations on an open file, under `s/`.
+fn streamed() -> List<String> / {fs.read[cwd], fs.write[cwd]} = {
+  let made = fs.create_dir[cwd]("s");
+  let out = fs.open[cwd]("s/f", fs::ToWrite);
+  let wrote = through(out, |d: Int|
+    shown_bool(fs.write_chunk[cwd](d, b"hello ") && fs.write_chunk[cwd](d, b"world")));
+  let unread = through(out, |d: Int| shown_opt_text(fs.read_chunk[cwd](d, 4)));
+  let closed = through(out, |d: Int| shown_bool(fs.close[cwd](d)));
+  let again = through(out, |d: Int| shown_bool(fs.close[cwd](d)));
+  let late = through(out, |d: Int| shown_bool(fs.write_chunk[cwd](d, b"!")));
+  let more = fs.open[cwd]("s/f", fs::ToAppend);
+  let appended = through(more, |d: Int|
+    shown_bool(fs.write_chunk[cwd](d, b"!") && fs.close[cwd](d)));
+  let source = fs.open[cwd]("s/f", fs::ToRead);
+  let chunks = through(source, |d: Int|
+    shown_opt_text(fs.read_chunk[cwd](d, 5)) ++ " " ++ shown_opt_text(fs.read_chunk[cwd](d, 100))
+      ++ " "
+      ++ shown_opt_text(fs.read_chunk[cwd](d, 100))
+      ++ " "
+      ++ shown_opt_text(fs.read_chunk[cwd](d, 0)));
+  let unwritten = through(source, |d: Int| shown_bool(fs.write_chunk[cwd](d, b"x")));
+  let shut = through(source, |d: Int| shown_bool(fs.close[cwd](d)));
+  let after = through(source, |d: Int| shown_opt_text(fs.read_chunk[cwd](d, 1)));
+  [
+    "create_dir s -> " ++ shown_bool(made),
+    "open s/f to write -> " ++ shown_opened(out),
+    "write_chunk twice -> " ++ wrote,
+    "read_chunk of a file open to write -> " ++ unread,
+    "close -> " ++ closed,
+    "close again -> " ++ again,
+    "write_chunk after close -> " ++ late,
+    "open s/f to append -> " ++ shown_opened(more),
+    "write_chunk and close -> " ++ appended,
+    "open s/f to read -> " ++ shown_opened(source),
+    "read_chunk 5, 100, 100, 0 -> " ++ chunks,
+    "write_chunk of a file open to read -> " ++ unwritten,
+    "close -> " ++ shut,
+    "read_chunk after close -> " ++ after,
+    "open s/nope to read -> " ++ shown_opened(fs.open[cwd]("s/nope", fs::ToRead)),
+    "open s to read -> " ++ shown_opened(fs.open[cwd]("s", fs::ToRead)),
+    "open s to write -> " ++ shown_opened(fs.open[cwd]("s", fs::ToWrite)),
+    "open s/no/f to write -> " ++ shown_opened(fs.open[cwd]("s/no/f", fs::ToWrite)),
+    "read_file s/f -> " ++ shown_opt_text(fs.read_file[cwd]("s/f")),
+    "remove_tree s -> " ++ shown_bool(fs.remove_tree[cwd]("s")),
+  ]
+}
+
+test/nondet "the twin answers every operation on an open file as the disk does" {
+  fresh();
+  let disk = streamed();
+  let twin = fs::on_mem(fs::mem_empty(), || streamed()).value;
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+fn mebibyte() -> Int = 1048576
+
+/// One read answers at most 64 MiB (`E0453`), so this file is a mebibyte past what `read_file`
+/// would answer: written and read back through a descriptor, a chunk at a time.
+fn over_the_bound() -> List<String> / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let block = fold(range(0, 16), b"0123456789abcdef", |b: Bytes, i: Int| bytes_concat(b, b));
+  let blocks = 65;
+  let out = fs.open[cwd]("large", fs::ToWrite);
+  let wrote = through(out, |d: Int|
+    shown_bool(
+      fold(range(0, blocks), true, |ok: Bool, i: Int| ok && fs.write_chunk[cwd](d, block))
+        && fs.close[cwd](d),
+    ));
+  let size = fs.file_size[cwd]("large");
+  let source = fs.open[cwd]("large", fs::ToRead);
+  let read = through(source, |d: Int| {
+    let total = iterate({ bytes: 0, chunks: 0 }, blocks + 2, |s: { bytes: Int, chunks: Int }|
+      match fs.read_chunk[cwd](d, 8 * mebibyte()) {
+        Some(chunk) -> if bytes_len(chunk) == 0 { Stop(s) }
+        else { Continue({ bytes: s.bytes + bytes_len(chunk), chunks: s.chunks + 1 }) },
+        None -> Stop(s),
+      });
+    let closed = fs.close[cwd](d);
+    int_to_string(total.bytes) ++ " bytes in " ++ int_to_string(total.chunks) ++ " chunks, closed "
+      ++ shown_bool(closed)
+  });
+  assert(size == Some(blocks * mebibyte()) && blocks * mebibyte() > 64 * mebibyte());
+  [
+    "write 65 MiB -> " ++ wrote,
+    "file_size large -> " ++ shown_opt_int(size),
+    "read in 8 MiB chunks -> " ++ read,
+    "remove large -> " ++ shown_bool(fs.remove[cwd]("large")),
+  ]
+}
+
+test/nondet "a file over the bound of one read is read in chunks, on the disk and over the twin" {
+  fresh();
+  let disk = over_the_bound();
+  let twin = fs::on_mem(fs::mem_empty(), || over_the_bound()).value;
+  assert_eq(
+    list_at(disk, 2),
+    Some("read in 8 MiB chunks -> 68157440 bytes in 9 chunks, closed true"),
+  );
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// A descriptor has a place in its file that every read moves, so reading through one is a write
+// of its root: two under one root may not run at once, and two under two roots may.
+test "two open files under one root contend, and under two roots do not" {
+  let both = |row: String, other: String|
+    "import std.fs (fs)\n\npub fn both(a: Int, b: Int) -> (Option<Bytes>, Option<Bytes>) / {" ++ row
+      ++ "} =\n  parallel { fs.read_chunk[left](a, 1), fs.read_chunk["
+      ++ other
+      ++ "](b, 1) }\n";
+  let checked = |source: String| codes(json_of(in_memory(one(source), ["check", "--json"])));
+  assert_eq(checked(both("fs.read_chunk[left]", "left")), ["E0309"]);
+  assert_eq(checked(both("fs.read_chunk[left], fs.read_chunk[right]", "right")), [])
 }
