@@ -18,15 +18,15 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
              CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern, CodePatternField,
              Capture, PxCtor, PxRecord, PxList, lower_fn, dump)
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
-              atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
-              print_ty, Field, canonical_atoms, canonical_scheme, canonical_type, bool_type,
-              int_type, bytes_type, unit_type, named_type, TyNominal)
+              atoms_text, atoms_insert, filed_atoms_text, read_atoms, scheme_text, type_text,
+              Printer, printer_new, print_ty, Field, canonical_atoms, canonical_scheme,
+              canonical_type, bool_type, int_type, bytes_type, unit_type, named_type, TyNominal)
 import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, ResolveFailed,
                 Namespace, ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find,
                 error_at, backticked, import_module_name, path_span)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
-             rehash_index, by_name, tagged_target, closure_of, specified_closure_of, LawNode, Node,
+             rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode, Node,
              NodeFn, NodeType, NodeEffect)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
@@ -1686,9 +1686,9 @@ fn def_known_row(
     name: def_info.name,
     hash: hash,
     effect_hashes: row_effect_hashes(decls, concat(def_info.footprint, def_info.performed)),
-    footprint: atoms_text(def_info.footprint, b","),
-    performed: atoms_text(def_info.performed, b","),
-    scaling: atoms_text(def_info.scaling, b","),
+    footprint: filed_atoms_text(def_info.footprint, def_info.scheme.label_vars),
+    performed: filed_atoms_text(def_info.performed, def_info.scheme.label_vars),
+    scaling: filed_atoms_text(def_info.scaling, def_info.scheme.label_vars),
     repeats: def_info.repeats,
     ending: def_info.ending,
     summary: def_info.summary,
@@ -1823,7 +1823,7 @@ pub fn contracted_rows_of(analysis: Analysis) -> List<KnownDefRow> / {abort.rais
     match map_get(infos, row.name) {
       Some(d) -> {
         let c = written_counts(d.scheme.ty, d.footprint, d.bounded, d.tail_bounded);
-        { ..row, scaling: atoms_text(c.scaling, b","), repeats: c.repeats }
+        { ..row, scaling: filed_atoms_text(c.scaling, d.scheme.label_vars), repeats: c.repeats }
       },
       None -> row,
     })
@@ -3728,9 +3728,11 @@ fn shipped_functions(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} =
       match item { IFn(d) -> map_insert(a, qualify(m.name, d.name.name), true), _ -> a })
   })
 
-/// What a program reaches of the shipped modules it pulls: the closure of every other definition, of
-/// the tests and laws outside them, and of each name a module outside them imports. A reached
-/// definition's specifications are read with it, so what they name is reached too.
+/// The functions a program reaches of the shipped modules it pulls: those every other definition
+/// reaches, those the tests and laws outside them do, and those behind each name a module outside
+/// them imports. A reached definition's specifications are read with it, so what they name is
+/// reached too. A function is reached as itself: an effect or a type of its name reached without
+/// it leaves it, and what it calls, unread.
 fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
   let first = first_shipped(h);
   let candidates = shipped_functions(h);
@@ -3755,7 +3757,7 @@ fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
       match sampler_of(item) { Some(name) -> push(typed, qualify(m.name, name)), None -> typed }
     })
   });
-  specified_closure_of(
+  reached_functions(
     h.index,
     h.hashes,
     concat(
@@ -3783,8 +3785,8 @@ fn imported_module(h: Hashed, importer: Bytes, d: ImportDecl) -> Bytes / {abort.
 }
 
 /// The pulled shipped modules cut to what the program reaches: a function it does not reach, a name
-/// imported for one, and every test and law are left out, so they are neither checked nor counted,
-/// and the program does not depend on them. `None` when nothing is left out.
+/// imported for one alone, and every test and law are left out, so they are neither checked nor
+/// counted, and the program does not depend on them. `None` when nothing is left out.
 fn cut_to(
   parsed: List<ParsedSource>,
   h: Hashed,
@@ -3793,6 +3795,9 @@ fn cut_to(
   let first = first_shipped(h);
   let candidates = shipped_functions(h);
   let wanted = |name: Bytes| !map_contains(candidates, name) || map_contains(reach, name);
+  // An imported name still names a type or an effect of the module once its function is left out.
+  let declared = fold(h.index.nodes, map_new(), |acc: Map<Bytes, Bool>, n: Node|
+    match n.body { NodeFn(_) -> acc, _ -> map_insert(acc, n.name, true) });
   let kept = |p: ParsedSource, item: Item|
     match item {
       IFn(d) -> wanted(qualify(p.name, d.name.name)),
@@ -3805,7 +3810,15 @@ fn cut_to(
       match d.kind {
         INames(names) -> {
           let module = imported_module(h, p.name, d);
-          { ..d, kind: INames(filter(names, |n: Ident| wanted(qualify(module, n.name)))) }
+          {
+            ..d,
+            kind: INames(
+              filter(names, |n: Ident| {
+                let name = qualify(module, n.name);
+                wanted(name) || map_contains(declared, name)
+              }),
+            ),
+          }
         },
         _ -> d,
       });
@@ -5117,6 +5130,102 @@ test "a shipped type is read with what its module states of it, though the progr
   assert_eq(def_names(used), def_names(idle))
 }
 
+/// `std.z` declares an effect and a function named `pack`, and an effect, a type and a constructor
+/// named `Pack`; `std.y` imports both names for the effect and the type alone. `std.w` declares an
+/// effect named `table` beside a function of that name, which is a data file's bytes.
+fn namesakes() -> List<Source> =
+  [
+    {
+      name: b"std.z",
+      src: b"pub effect pack {\n  raise refused(at: Int)\n}\npub effect Pack {\n  raise spilled(at: Int)\n}\npub type Pack = | Pack(Int) | Loose\npub fn pack(n: Int) -> Pack = Pack(squeezed(n))\nfn squeezed(n: Int) -> Int = n + deeper()\nfn deeper() -> Int = 1\npub fn try_unpack(p: Pack) -> Int / {pack.refused, Pack.spilled} =\n  match p { Pack(n) -> if n < 0 { pack.refused(n) } else { n }, Loose -> Pack.spilled(0) }\npub fn idle() -> Int = 3\n",
+    },
+    {
+      name: b"std.y",
+      src: b"import std.z (pack, Pack, Loose)\npub fn guarded(n: Int) -> Int / {pack.refused} = if n < 0 { pack.refused(n) } else { n }\npub fn loose() -> Pack = Loose\n",
+    },
+    {
+      name: b"std.w",
+      src: b"pub effect table {\n  raise missing(at: Int)\n}\npub fn table() -> Bytes = embed(\"w/table.txt\")\npub fn rows() -> Int = bytes_len(table())\npub fn try_row(n: Int) -> Int / {table.missing} = if n < 0 { table.missing(n) } else { n }\n",
+    },
+  ]
+
+/// The data file `std.w` embeds, holding `bytes`.
+fn namesake_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/w/table.txt", bytes: bytes }]
+
+/// The functions a load of a module importing `imports` holds, read cold and then seeded with the
+/// rows and the hashes the cold load filed; what a refused load said in their place.
+fn loaded_twice(imports: Bytes) -> List<List<Bytes>> / {abort.raise} = {
+  let user = [{ name: b"m", src: bytes_concat(imports, b"\npub fn f() -> Int = 1\n") }];
+  let said = |diags: List<Diag>| map(diags, |d: Diag| bytes_concat_all([d.code, b": ", d.message]));
+  let data = namesake_data(b"one\n");
+  let cold = analyse_pulling_std_with(user, namesakes(), [], [], data: data);
+  match cold.out {
+    Refused(diags) -> [said(diags)],
+    Analysed(w) -> {
+      let rows = rows_of(w);
+      let warm = analyse_pulling_std_with(
+        user,
+        namesakes(),
+        rows.defs,
+        rows.tests,
+        priors: w.hashes.priors,
+        data: data,
+      );
+      [
+        def_names(cold),
+        match warm.out { Refused(diags) -> said(diags), Analysed(_) -> def_names(warm) },
+      ]
+    },
+  }
+}
+
+test "a shipped function is read for itself, not for an effect or a type that shares its name" {
+  let both = |names: List<Bytes>| [names, names];
+  // Nothing of the module is used: its types and effects stand, and no function does.
+  assert_eq(loaded_twice(b"import std.z"), both([b"m.f"]));
+  // `try_unpack` raises through the effect `pack` and matches the constructor `Pack`.
+  assert_eq(loaded_twice(b"import std.z (try_unpack)"), both([b"m.f", b"std.z.try_unpack"]));
+  // An imported name is every definition behind it, so the function comes with what it calls.
+  assert_eq(
+    loaded_twice(b"import std.z (pack)"),
+    both([b"m.f", b"std.z.deeper", b"std.z.pack", b"std.z.squeezed"]),
+  );
+  assert_eq(loaded_twice(b"import std.z (Pack)"), both([b"m.f"]));
+  assert_eq(loaded_twice(b"import std.z (Loose)"), both([b"m.f"]));
+  assert_eq(loaded_twice(b"import std.z (idle)"), both([b"m.f", b"std.z.idle"]));
+  // A shipped module's own import of the name keeps the effect once the function is left out.
+  assert_eq(loaded_twice(b"import std.y (guarded)"), both([b"m.f", b"std.y.guarded"]));
+  assert_eq(loaded_twice(b"import std.y (loose)"), both([b"m.f", b"std.y.loose"]));
+  assert_eq(loaded_twice(b"import std.y"), both([b"m.f"]));
+  // `try_row` raises through the effect `table`; the function of that name embeds a data file.
+  assert_eq(loaded_twice(b"import std.w (try_row)"), both([b"m.f", b"std.w.try_row"]));
+  assert_eq(loaded_twice(b"import std.w (rows)"), both([b"m.f", b"std.w.rows", b"std.w.table"]));
+  assert_eq(loaded_twice(b"import std.w (table)"), both([b"m.f", b"std.w.table"]))
+}
+
+test "a data file a shipped function embeds moves what reaches the function, and nothing that reaches an effect of its name" {
+  let over = |imports: Bytes, bytes: Bytes|
+    analyse_pulling_std_with(
+      [{ name: b"m", src: bytes_concat(imports, b"\npub fn f() -> Int = 1\n") }],
+      namesakes(),
+      [],
+      [],
+      data: namesake_data(bytes),
+    );
+  let reader = b"import std.w (try_row)";
+  assert_eq(def_names(over(reader, b"one\n")), [b"m.f", b"std.w.try_row"]);
+  assert_eq(pulled_hashes(over(reader, b"one\n")), pulled_hashes(over(reader, b"one\ntwo\n")));
+  let named = b"import std.w (table)";
+  let one = over(named, b"one\n");
+  assert(pulled_hash(one, b"std.w.table") != None);
+  assert(
+    pulled_hash(one, b"std.w.table") != pulled_hash(over(named, b"one\ntwo\n"), b"std.w.table"),
+  );
+  assert_eq(dump_of(one.out).embeds, [
+    { module: b"std.w", key: b"file:w/table.txt", read: Ok([{ name: b"", bytes: b"one\n" }]) },
+  ])
+}
+
 test "a shipped type's sampler is read with its generator, though the program reaches neither" {
   let stating = [
     {
@@ -5752,6 +5861,23 @@ test "an analysis seeded from its own filing answers exactly what a fresh one do
   assert_eq(published(seeded), published(analyse(parse_all(effectful()))));
   // The test is taken from its row too: the row carries the footprint the walk would find.
   assert_eq(test_footprint_of(seeded, b"app.says"), b"base.log.write")
+}
+
+/// Definitions generic over labels, one filling another's in the other order, and one filling a
+/// label with a resource.
+fn labelled() -> List<Source> =
+  [
+    {
+      name: b"m",
+      src: b"effect net { write send[r](Bytes) -> Unit }\npub fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)\npub fn both<[a], [c]>(b: Bytes) -> Unit / {net.send[a], net.send[c]} = { relay[c](b); relay[a](b) }\npub fn go(b: Bytes) -> Unit / {net.send[conn]} = both[conn, conn](b)\n",
+    },
+  ]
+
+test "a definition generic over labels is seeded from its rows, each label as its parameter" {
+  let rows = rows_of(analysis_of(labelled()));
+  let seeded = analyse_with(parse_all(labelled()), rows.defs, rows.tests);
+  assert_eq(seeded_of(seeded), [b"m.relay", b"m.both", b"m.go"]);
+  assert_eq(published(seeded), published(analyse(parse_all(labelled()))))
 }
 
 fn probed(body: Bytes) -> List<Source> =

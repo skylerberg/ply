@@ -1,8 +1,8 @@
 //! The type language, unification, the type environment and the type printer `infer.ply` checks with.
 
 import type_syntax (Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_text, angled)
-import std.list (at, concat, contains, drop, take)
-import std.bytes (join)
+import std.list (at, concat, contains, drop, find, index_of, take)
+import std.bytes (join, ascii_of_int)
 import std.option (option_traverse)
 
 // --- Atoms and rows ---------------------------------------------------------------
@@ -1498,6 +1498,41 @@ pub fn read_atoms(text: Bytes) -> Option<List<Atom>> / {abort.raise} =
   else if bytes_at(text, 0) == 60 { None }
   else { option_traverse(bytes_split(text, b","), read_atom) }
 
+/// How a filed row names the label parameter at `i`; no resource can be spelled so.
+fn label_place(i: Int) -> Bytes = bytes_concat(b"#", ascii_of_int(i))
+
+/// `atoms` as a definition's rows are filed: each label variable named by its place among `labels`,
+/// the definition's label parameters in the order it writes them, so the text reads back for any
+/// later check of it (`placed_labels`). A variable that is no parameter leaves the text one that
+/// reads as nothing.
+pub fn filed_atoms_text(atoms: List<Atom>, labels: List<Int>) -> Bytes / {abort.raise} =
+  atoms_text(
+    map(atoms, |atom: Atom|
+      match atom.resource {
+        RVar(v) -> match index_of(labels, v) {
+          Some(i) -> { ..atom, resource: RNamed(label_place(i)) },
+          None -> atom,
+        },
+        _ -> atom,
+      }),
+    b",",
+  )
+
+/// Filed atoms with each label parameter named by its place as the variable at that place of
+/// `labels`, the definition's label parameters as a check of it binds them now. None where a place
+/// is past them.
+pub fn placed_labels(atoms: List<Atom>, labels: List<Int>) -> Option<List<Atom>> / {abort.raise} =
+  option_traverse(atoms, |atom: Atom|
+    match atom.resource {
+      RNamed(n) -> if !bytes_starts_with(n, b"#") { Some(atom) } else {
+        match find(range(0, len(labels)), |i: Int| label_place(i) == n) {
+          Some(i) -> Some({ ..atom, resource: RVar(at(labels, i)) }),
+          None -> None,
+        }
+      },
+      _ -> Some(atom),
+    })
+
 pub fn print_row(printer: Printer, row: Row) -> { printer: Printer, text: Bytes } / {abort.raise} = {
   let out = print_atoms(printer, row.atoms, b", ");
   match row.tail {
@@ -1652,6 +1687,22 @@ test "atoms read back as the atoms they were printed from" {
   assert_eq(read_atoms(b".read"), None);
   assert_eq(read_atoms(b"m.db."), None);
   assert_eq(read_atoms(b"m.db.read[users"), None)
+}
+
+test "a filed row names a label parameter by its place, read back as that parameter's variable now" {
+  let send = |r: Resource| { effect: b"m.net", resource: r, mode: MWrite, op: Some(b"send") };
+  let rd = { effect: b"m.db", resource: RNamed(b"users"), mode: MRead, op: None };
+  let filed = filed_atoms_text([send(RVar(7)), rd, send(RVar(4))], [4, 7]);
+  assert_eq(filed, b"m.net.send[#1],m.db.read[users],m.net.send[#0]");
+  match read_atoms(filed) {
+    None -> panic("a filed row reads as nothing"),
+    Some(atoms) -> {
+      assert_eq(placed_labels(atoms, [12, 30]), Some([send(RVar(30)), rd, send(RVar(12))]));
+      assert_eq(placed_labels(atoms, [12]), None)
+    },
+  };
+  // A variable that is no parameter cannot be named, so its row is not filed readably.
+  assert_eq(read_atoms(filed_atoms_text([send(RVar(9))], [4])), None)
 }
 
 test "the printer names variables in the order it meets them, rows apart" {

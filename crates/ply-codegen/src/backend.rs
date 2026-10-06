@@ -437,7 +437,8 @@ impl Bodies {
             self.entered.set(self.entered.get() + 1);
             return EntryOutcome::Answered(value);
         }
-        ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
+        let calls = i64::try_from(fuel).unwrap_or(i64::MAX);
+        ctx.begin(calls);
         // Values are deep-converted in and out: nothing outside the entry ever holds a word.
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
@@ -506,6 +507,10 @@ impl Bodies {
                 None => EntryOutcome::Declined,
             };
         }
+        debug_assert_eq!(
+            ctx.fuel, calls,
+            "`{name}` returned without every call it made given back, or with more"
+        );
         crate::detached::release_all(&mut ctx);
         if !ctx.cells_balanced() {
             ctx.end();

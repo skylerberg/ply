@@ -1,0 +1,515 @@
+//! `std.zip` against archives other programs wrote, and against what another program makes of
+//! its own. `zip/` holds archives made for this suite: one tree as Info-ZIP's `zip`, macOS's
+//! `ditto` (what Finder's Compress writes, `__MACOSX` and all), bsdtar and the JDK's `jar` each
+//! wrote it, Python's `zipfile` in the forms it has, and archives assembled a record at a time
+//! for the forms no tool writes on request. `zip/refused/` holds the ones a reader must not
+//! believe. `written.zip` is what `std.zip` wrote, and `written.listing` what bsdtar listed of it.
+//! A shipped module embeds no file, so the tests that read files stand here.
+
+import std.bytes (repeat, u32_at)
+import std.date
+import std.date (Date, DateTime, Time)
+import std.list (sort)
+import std.option (option_map, option_unwrap_or)
+import std.result (result_err)
+import std.string (join)
+import std.tar (Absolute, Backslash, Danger, Drive, Escapes, LinkEscapes, MakeDirectory,
+                MakeSymlink, Special, ThroughLink, WriteFile)
+import std.zip
+import std.zip (zip, Declared, Directory, Entry, Found, Limits, Listed, Member, More, Names,
+                Utf8IfValid, Why)
+
+type Fixture = { name: String, bytes: Bytes }
+
+/// The archives a reader takes whole.
+fn archives() -> List<Fixture> =
+  filter(embed_dir("zip"), |f: Fixture|
+    string_ends_with(f.name, ".zip") && !string_starts_with(f.name, "refused/"))
+
+fn archive(name: String) -> Bytes / {abort.raise} =
+  match filter(embed_dir("zip"), |f: Fixture| f.name == name) {
+    [found, ..] -> found.bytes,
+    [] -> panic(f"no archive {name}"),
+  }
+
+fn roomy() -> Limits =
+  { entries: 100, total: 2000000, size: 2000000, ratio: 100, path: 4096, comment: 64, slack: 0 }
+
+// --- Every archive ----------------------------------------------------------------
+
+test "{f.name} reads, and is written and read back the same" for f: Fixture in archives() {
+  let entries = zip::read(f.bytes, roomy());
+  assert(len(entries) > 0);
+  assert_eq(zip::decode(zip::write(entries), roomy()), Ok(entries))
+}
+
+/// The directory a driver finds that reads an archive's end, a tail at a time as `locate` asks.
+fn located(whole: Bytes, asked: Int, budget: Int) -> Directory / {zip.refused, abort.raise} = {
+  let length = bytes_len(whole);
+  match zip::locate(bytes_slice(whole, length - asked, length), length, roomy()) {
+    Found(d) -> d,
+    More(more) -> if budget <= 0 || more <= asked { panic("a reader asks for more only so often") }
+    else { located(whole, more, budget - 1) },
+  }
+}
+
+/// The member a driver finds that reads from a member's offset as far as `open` asks.
+fn opened(whole: Bytes, l: Listed, asked: Int, budget: Int) -> Member / {zip.refused, abort.raise} =
+  match zip::open(l, bytes_slice(whole, l.at, l.at + asked), roomy()) {
+    Found(m) -> m,
+    More(more) -> if budget <= 0 || more <= asked { panic("a reader asks for more only so often") }
+    else { opened(whole, l, more, budget - 1) },
+  }
+
+/// What a driver reads of an archive it never holds whole: its end, its directory, and a member
+/// at a time.
+fn stepped(whole: Bytes) -> List<Entry> / {zip.refused, abort.raise} = {
+  let d = located(whole, 0, 3);
+  map(zip::listing(bytes_slice(whole, d.at, d.at + d.size), d, roomy()), |l: Listed| -> Entry {
+    let m = opened(whole, l, 0, 3);
+    { header: m.header, data: zip::unpack(m, bytes_slice(whole, m.data, m.data + m.stored)) }
+  })
+}
+
+test "{f.name} reads a step at a time, from what each step asks for" for f: Fixture in archives() {
+  assert_eq(stepped(f.bytes), zip::read(f.bytes, roomy()))
+}
+
+// --- One tree, as four programs wrote it ----------------------------------------------
+
+/// A member as one line: what it is, its mode in decimal, its size and its path.
+fn line(m: Member) -> String = {
+  let h = m.header;
+  f"{h.kind} {h.mode} {m.size} {h.path}"
+}
+
+/// The lines of the archive's members beneath `root`, without it, in their paths' order, a
+/// name no flag marks read as `names` says.
+fn lines(
+  name: String,
+  root: String,
+  names: Names = Utf8IfValid,
+) -> List<String> / {zip.refused, abort.raise} =
+  sort(
+    map(
+      filter(zip::members(archive(name), roomy(), names), |m: Member|
+        string_starts_with(m.header.path, root)),
+      |m: Member| line({ ..m, header: { ..m.header, path: strip(m.header.path, root) } }),
+    ),
+  )
+
+fn strip(path: String, root: String) -> String / {abort.raise} =
+  string_slice(path, string_len(root), string_len(path))
+
+/// The tree every program's archive was made of, as `line` writes it, the one name outside
+/// ASCII spelled as `spelled`.
+fn tree(spelled: String) -> List<String> =
+  sort([
+    f"File 420 6 {spelled}",
+    "Directory 493 0 docs",
+    "Directory 488 0 docs/deep",
+    "File 420 7 docs/deep/note.txt",
+    "File 420 11 docs/hello.txt",
+    "Symlink 493 9 docs/link",
+    "File 420 0 empty",
+    "File 420 1240 repeated.txt",
+    "File 493 20 run.sh",
+  ])
+
+/// The tree's one name outside ASCII, `café-水.txt`, and what its UTF-8 bytes spell in code
+/// page 437.
+fn accented() -> String = "caf\u{e9}-\u{6c34}.txt"
+
+fn misread() -> String = "caf\u{251c}\u{2310}-\u{b5}\u{2591}\u{2524}.txt"
+
+test "one tree reads alike as zip, Finder and bsdtar wrote it, the name no flag marks among it" {
+  assert_eq(lines("infozip.zip", ""), tree(accented()));
+  assert_eq(lines("finder.zip", "tree/"), tree(accented()));
+  assert_eq(lines("bsdtar.zip", "tree/"), tree(accented()));
+  // Read as the format declares, the name zip and Finder leave unflagged is code page 437;
+  // bsdtar flags its own.
+  assert_eq(lines("infozip.zip", "", names: Declared), tree(misread()));
+  assert_eq(lines("finder.zip", "tree/", names: Declared), tree(misread()));
+  assert_eq(lines("bsdtar.zip", "tree/", names: Declared), tree(accented()));
+  let data = |name: String, path: String|
+    map(filter(zip::read(archive(name), roomy()), |e: Entry| e.header.path == path), |e: Entry|
+      e.data);
+  assert_eq(data("infozip.zip", "docs/hello.txt"), [b"hello, zip\n"]);
+  assert_eq(data("finder.zip", "tree/docs/hello.txt"), [b"hello, zip\n"]);
+  assert_eq(data("bsdtar.zip", "tree/docs/link"), [b"hello.txt"]);
+  assert_eq(data("finder.zip", "tree/repeated.txt"), [
+    repeat(b"the same line, again and again\n", 40),
+  ])
+}
+
+test "a UTF-8 name no flag marks reads as UTF-8, or as declared, and its bytes are there to read" {
+  // Each member whose name's bytes are the accented name's: its flag, and its path as read.
+  let spelled = |name: String, names: Names|
+    map(
+      filter(zip::members(archive(name), roomy(), names), |m: Member|
+        bytes_ends_with(m.name, bytes_of_string(accented()))),
+      |m: Member| (m.flags & 0x800, m.header.path),
+    );
+  assert_eq(spelled("infozip.zip", Utf8IfValid), [(0, accented())]);
+  assert_eq(spelled("infozip.zip", Declared), [(0, misread())]);
+  assert_eq(spelled("finder.zip", Utf8IfValid), [
+    (0, "tree/" ++ accented()),
+    (0, "__MACOSX/tree/._" ++ accented()),
+  ]);
+  assert_eq(spelled("finder.zip", Declared), [
+    (0, "tree/" ++ misread()),
+    (0, "__MACOSX/tree/._" ++ misread()),
+  ]);
+  assert_eq(spelled("bsdtar.zip", Declared), [(0x800, "tree/" ++ accented())]);
+  // A name that is code page 437 and no UTF-8 is read as what it is by either rule.
+  let dos = |names: Names|
+    map(zip::read(archive("python_cp437.zip"), roomy(), names), |e: Entry|
+      (e.header.path, e.header.comment));
+  assert_eq(dos(Utf8IfValid), [("caf\u{e9}/\u{fc}ber \u{2592}.txt", "na\u{ef}ve")]);
+  assert_eq(dos(Declared), dos(Utf8IfValid));
+  assert_eq(
+    map(
+      filter(zip::members(archive("python_streamed.zip"), roomy()), |m: Member|
+        m.flags & 0x800 != 0),
+      |m: Member| m.header.path,
+    ),
+    ["stra\u{df}e.txt"],
+  )
+}
+
+test "Finder's archive holds an AppleDouble file for each member, beneath __MACOSX" {
+  let beside = lines("finder.zip", "__MACOSX/");
+  assert_eq(len(zip::members(archive("finder.zip"), roomy())), 23);
+  assert_eq(len(beside), 12);
+  assert_eq(filter(beside, |row: String| string_ends_with(row, "._hello.txt")), [
+    "File 420 211 tree/docs/._hello.txt",
+  ]);
+  assert_eq(
+    match zip::plan(zip::read(archive("finder.zip"), roomy())) {
+      Ok(steps) -> len(steps),
+      Err(_) -> -1,
+    },
+    23,
+  )
+}
+
+test "an archive with no modes reads a file as 0644 and a directory as 0755: jar's, and MS-DOS's" {
+  assert_eq(
+    lines("jar.zip", ""),
+    sort([
+      "Directory 493 0 META-INF",
+      "File 420 65 META-INF/MANIFEST.MF",
+      "Directory 493 0 docs",
+      "Directory 493 0 docs/deep",
+      "File 420 7 docs/deep/note.txt",
+      "File 420 11 docs/hello.txt",
+      "File 420 11 docs/link",
+      "File 420 0 empty",
+      "File 420 1240 repeated.txt",
+      "File 420 20 run.sh",
+    ]),
+  );
+  assert_eq(
+    map(zip::read(archive("fields.zip"), roomy()), |e: Entry|
+      (e.header.path, e.header.kind, e.header.mode)),
+    [
+      ("caf\u{e9}.txt", zip::File, 420),
+      ("stale.txt", zip::File, 420),
+      ("timed.txt", zip::File, 420),
+      ("dos.txt", zip::File, 292),
+      ("dosdir", zip::Directory, 493),
+    ],
+  )
+}
+
+// --- Times ------------------------------------------------------------------------
+
+test "a member's time is its writer's wall clock, and an instant where a field holds one" {
+  let times = |name: String, path: String|
+    map(filter(zip::read(archive(name), roomy()), |e: Entry| e.header.path == path), |e: Entry|
+      (e.header.modified, e.header.times, map(e.header.extra, |f: zip::Field| f.id)));
+  let unstamped: zip::Times = { modified: None, accessed: None, created: None };
+  let seven: zip::Times = { ..unstamped, modified: Some(Instant(1704222246000000000)) };
+  // Info-ZIP wrote under UTC, so its wall clock is its instant's; its owner is left a field.
+  assert_eq(times("infozip.zip", "empty"), [
+    (date::date_time(2024, 1, 2, 19, 4, 6), seven, [0x7875]),
+  ]);
+  assert_eq(times("bsdtar.zip", "tree/empty"), [
+    (date::date_time(2024, 1, 2, 19, 4, 6), seven, [0x7875]),
+  ]);
+  // Finder's instants are in a field older than the timestamp, which is carried as it is.
+  assert_eq(times("finder.zip", "tree/empty"), [
+    (date::date_time(2024, 1, 2, 19, 4, 6), unstamped, [0x5855]),
+  ]);
+  assert_eq(times("jar.zip", "empty"), [(date::date_time(2024, 1, 2, 11, 4, 6), unstamped, [])]);
+  assert_eq(times("fields.zip", "timed.txt"), [
+    (
+      date::date_time(2024, 1, 2, 11, 4, 6),
+      {
+        modified: Some(Instant(1704164645123456700)),
+        accessed: Some(Instant(1704164646000000000)),
+        created: Some(Instant(1704164640500000000)),
+      },
+      [],
+    ),
+  ])
+}
+
+// --- Forms of the format ------------------------------------------------------------
+
+test "zip64 numbers are read from a member's header, the directory and the end record alike" {
+  let read = |name: String|
+    map(zip::read(archive(name), roomy()), |e: Entry| (e.header.path, e.data));
+  assert_eq(read("zip64_small.zip"), [("wide.txt", b"wide\n"), ("narrow.txt", b"narrow\n")]);
+  assert_eq(map(read("python_zip64.zip"), |e: (String, Bytes)| (e._0, bytes_len(e._1))), [
+    ("repeated.txt", 1240),
+    ("word.txt", 5),
+  ]);
+  assert_eq(read("python_streamed_zip64.zip"), read("python_zip64.zip"))
+}
+
+test "a data descriptor is read after a signature or none, with sizes of four bytes or eight" {
+  assert_eq(
+    map(zip::members(archive("descriptors.zip"), roomy()), |m: Member|
+      (m.header.path, m.flags, m.data, m.stored)),
+    [("bare.txt", 8, 38, 10), ("long.txt", 8, 118, 10)],
+  );
+  assert_eq(map(zip::read(archive("descriptors.zip"), roomy()), |e: Entry| e.data), [
+    b"described\n",
+    b"described\n",
+  ]);
+  assert_eq(
+    map(zip::members(archive("python_streamed.zip"), roomy()), |m: Member|
+      (m.header.path, m.flags & 8, m.method)),
+    [
+      ("repeated.txt", 8, zip::Deflated),
+      ("stra\u{df}e.txt", 8, zip::Deflated),
+      ("empty", 8, zip::Stored),
+    ],
+  )
+}
+
+test "an archive's comment and a member's are read, each within the length a reader gives" {
+  let whole = archive("python_stored.zip");
+  let comment = |limits: Limits|
+    match try { zip::locate(whole, bytes_len(whole), limits) } {
+      Ok(Found(d)) -> Ok(d.comment),
+      Ok(More(_)) -> Ok(b""),
+      Err(refused) -> Err(refused.why),
+    };
+  assert_eq(comment(roomy()), Ok(b"stored by Python"));
+  assert_eq(comment({ ..roomy(), comment: 16 }), Ok(b"stored by Python"));
+  assert_eq(comment({ ..roomy(), comment: 15 }), Err(zip::NoEnd));
+  assert_eq(map(zip::read(whole, roomy()), |e: Entry| e.header.comment), [
+    "",
+    "a greeting",
+    "",
+    "",
+  ]);
+  assert_eq(result_err(zip::decode(whole, { ..roomy(), comment: 16 })), None);
+  assert_eq(
+    result_err(zip::decode(archive("python_cp437.zip"), { ..roomy(), comment: 4 })),
+    Some({ at: 49, why: zip::TooLong }),
+  )
+}
+
+// --- Archives a reader must not believe -----------------------------------------------
+
+/// An archive under `zip/refused`, where it is refused and why.
+type Case = { name: String, at: Int, why: Why }
+
+fn refusals() -> List<Case> =
+  [
+    { name: "appended.zip", at: 211, why: zip::NoEnd },
+    { name: "bomb.zip", at: 1068, why: zip::TooDense },
+    { name: "bzip2.zip", at: 127, why: zip::Method(12) },
+    { name: "duplicate.zip", at: 141, why: zip::Duplicate },
+    { name: "encrypted.zip", at: 83, why: zip::Encrypted },
+    { name: "fake_end.zip", at: 101, why: zip::ManyEnds },
+    { name: "local_name.zip", at: 0, why: zip::Disagrees },
+    { name: "local_size.zip", at: 0, why: zip::Disagrees },
+    { name: "lying_bomb.zip", at: 35, why: zip::BadData },
+    { name: "overflow.zip", at: 44, why: zip::BadNumber },
+    { name: "overlap.zip", at: 0, why: zip::Overlaps },
+    { name: "prepended.zip", at: 205, why: zip::BadDirectory },
+    { name: "second_disk.zip", at: 41, why: zip::Split },
+    { name: "stub.zip", at: 0, why: zip::Unclaimed },
+    { name: "truncated.zip", at: 180, why: zip::NoEnd },
+    { name: "truncated_directory.zip", at: 135, why: zip::Truncated },
+  ]
+
+test "{c.name} is refused for what it was made to say" for c: Case in refusals() {
+  assert_eq(zip::decode(archive("refused/" ++ c.name), roomy()), Err({ at: c.at, why: c.why }))
+}
+
+test "every archive a reader must not believe is one of the cases" {
+  assert_eq(
+    map(
+      filter(embed_dir("zip"), |f: Fixture| string_starts_with(f.name, "refused/")),
+      |f: Fixture| f.name,
+    ),
+    map(refusals(), |c: Case| "refused/" ++ c.name),
+  )
+}
+
+test "a megabyte of zeros in a kilobyte is refused by its ratio and its size, none of it unpacked" {
+  let bomb = archive("refused/bomb.zip");
+  let refused = |limits: Limits|
+    option_map(result_err(zip::decode(bomb, limits)), |r: zip::Refusal| r.why);
+  assert_eq(refused(roomy()), Some(zip::TooDense));
+  assert_eq(refused({ ..roomy(), ratio: 1015 }), Some(zip::TooDense));
+  assert_eq(refused({ ..roomy(), ratio: 1016, size: 1048575 }), Some(zip::TooLarge));
+  assert_eq(refused({ ..roomy(), ratio: 1016, total: 1048575 }), Some(zip::TooMuch));
+  assert_eq(map(zip::members(bomb, { ..roomy(), ratio: 1016 }), |m: Member| (m.stored, m.size)), [
+    (1033, 1048576),
+  ])
+}
+
+test "a stub before an archive that its offsets count is read by a reader that allows its bytes" {
+  let stubbed = archive("refused/stub.zip");
+  assert_eq(bytes_slice(stubbed, 0, 17), b"#!/bin/sh\nexit 0\n");
+  assert_eq(
+    result_err(zip::decode(stubbed, { ..roomy(), slack: 16 })),
+    Some({ at: 0, why: zip::Unclaimed }),
+  );
+  assert_eq(
+    map(zip::members(stubbed, { ..roomy(), slack: 17 }), |m: Member| (m.header.path, m.data)),
+    [("docs/hello.txt", 61), ("empty", 107)],
+  )
+}
+
+// --- Plans --------------------------------------------------------------------------
+
+test "an archive's plan makes its directories, files and links in the directory's order" {
+  assert_eq(
+    zip::plan(zip::read(archive("python_stored.zip"), roomy())),
+    Ok([
+      MakeDirectory("docs", 493),
+      WriteFile("docs/hello.txt", 420, b"hello, zip\n"),
+      MakeSymlink("docs/link", "hello.txt"),
+      WriteFile("empty", 420, b""),
+    ]),
+  )
+}
+
+/// An archive that reads, the entry of it no plan extracts, and why.
+type Trap = { name: String, index: Int, path: String, why: Danger }
+
+fn traps() -> List<Trap> =
+  [
+    { name: "traversal.zip", index: 1, path: "../outside.txt", why: Escapes },
+    { name: "absolute.zip", index: 0, path: "/etc/planted", why: Absolute },
+    { name: "backslash.zip", index: 1, path: "..\\outside.txt", why: Backslash },
+    { name: "drive.zip", index: 0, path: "C:/planted.txt", why: Drive },
+    { name: "link_escape.zip", index: 0, path: "way", why: LinkEscapes },
+    { name: "through_link.zip", index: 1, path: "way/planted.txt", why: ThroughLink },
+    { name: "fifo.zip", index: 0, path: "pipe", why: Special },
+  ]
+
+test "{t.name} reads, and is not planned" for t: Trap in traps() {
+  let read = zip::read(archive(t.name), roomy());
+  assert_eq(zip::plan(read), Err({ index: t.index, path: t.path, why: t.why }))
+}
+
+// --- What `std.zip` writes, and what bsdtar says of it ---------------------------------
+
+/// Entries that take every way a header is written: a directory, modes, a link, a deflated
+/// file and a stored one, a name outside ASCII, a comment, a time of each kind, and a field
+/// carried as it is.
+fn written_entries() -> List<Entry> = {
+  let at = DateTime(Date(19724), Time(39846000000000));
+  let script = zip::file("project/bin/run", b"#!/bin/sh\nexec true\n", mode: 493, modified: at);
+  let noted = zip::file("project/notes.txt", repeat(b"the same line, again and again\n", 40));
+  let timed = zip::file("project/timed.txt", b"when\n", mode: 384, modified: at);
+  let fine = zip::file("project/fine.txt", b"finer\n", modified: at);
+  [
+    zip::directory("project"),
+    zip::file("project/README.md", b"# project\n"),
+    zip::directory("project/bin", mode: 448, modified: at),
+    script,
+    zip::symlink("project/latest", "bin/run"),
+    { ..noted, header: { ..noted.header, comment: "said twice over" } },
+    zip::file("project/stra\u{df}e-\u{6c34}.txt", b"stra\xc3\x9fe\n", modified: at),
+    {
+      ..timed,
+      header: {
+        ..timed.header,
+        times: { modified: Some(Instant(1704164645000000000)), accessed: None, created: None },
+        extra: [{ id: 0x7875, data: b"\x01\x04\xe8\x03\x00\x00\x04\x64\x00\x00\x00" }],
+      },
+    },
+    {
+      ..fine,
+      header: {
+        ..fine.header,
+        times: {
+          modified: Some(Instant(1704164645123456700)),
+          accessed: Some(Instant(1704164646000000000)),
+          created: Some(Instant(1704164640500000000)),
+        },
+      },
+    },
+    zip::file("project/empty", b""),
+  ]
+}
+
+fn written_listing() -> Bytes = embed("zip/written.listing")
+
+/// The owner an Info-ZIP Unix field names: a user and a group of four bytes each.
+fn owner(e: Entry) -> List<String> / {abort.raise} =
+  match filter(e.header.extra, |f: zip::Field| f.id == 0x7875) {
+    [f, ..] ->
+      map([u32_at(f.data, 2), u32_at(f.data, 7)], |id: Option<Int>|
+        int_to_string(option_unwrap_or(id, 0))),
+    [] -> ["0", "0"],
+  }
+
+/// An entry as `bsdtar -tv` lists one under UTC, column by column.
+fn listed(e: Entry) -> List<String> / {abort.raise} = {
+  let h = e.header;
+  let letter = match h.kind { zip::Directory -> "d", zip::Symlink -> "l", _ -> "-" };
+  let bits = join(
+    map(range(0, 9), |i: Int|
+      if h.mode >> 8 - i & 1 == 0 { "-" } else { string_slice("rwxrwxrwx", i, i + 1) }),
+    "",
+  );
+  let day = match h.modified {
+    Some(clock) -> {
+      let on = date::date_of(clock);
+      [
+        date::month_abbreviation(date::month(on)),
+        int_to_string(date::day(on)),
+        int_to_string(date::year(on)),
+      ]
+    },
+    None -> [],
+  };
+  let after = match h.kind {
+    zip::Directory -> [h.path ++ "/"],
+    zip::Symlink -> [h.path, "->", string_of_bytes(e.data)],
+    _ -> [h.path],
+  };
+  let size = if h.kind == zip::Symlink { 0 } else { bytes_len(e.data) };
+  fold(
+    [[letter ++ bits, "0"], owner(e), [int_to_string(size)], day, after],
+    [],
+    |columns: List<String>, more: List<String>|
+      fold(more, columns, |so_far: List<String>, column: String| push(so_far, column)),
+  )
+}
+
+test "what write emits is the archive bsdtar listed, and lists as bsdtar listed it" {
+  let whole = zip::finish(
+    fold(written_entries(), zip::begin(), zip::add),
+    comment: b"made by std.zip",
+  );
+  assert_eq(whole, archive("written.zip"));
+  assert_eq(zip::read(whole, roomy()), written_entries());
+  assert_eq(
+    map(written_entries(), listed),
+    map(
+      filter(string_split(string_of_bytes(written_listing()), "\n"), |row: String| row != ""),
+      |row: String| filter(string_split(row, " "), |column: String| column != ""),
+    ),
+  )
+}
