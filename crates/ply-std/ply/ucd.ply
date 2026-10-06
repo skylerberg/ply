@@ -1,0 +1,299 @@
+//! The Unicode Character Database as `ply` ships it: one version of it, the form its tables are
+//! kept in, and how a module reads one.
+//!
+//! A table is a file under `ucd/`, made from the database's own files by keeping what a module
+//! reads of them. It is text. Its first line is `# Unicode` and the version; each line after it is
+//! `first[..last];field[;field..]`, a run of code points, written in hexadecimal, that the fields
+//! hold for, or a comment, which starts with `#`. The runs rise and do not meet, and a code point in
+//! none of them has whatever value its reader calls missing.
+//!
+//! `runs` reads the lines. `table` makes of them what `lookup` answers from in two reads, whatever
+//! the code point and however many runs there are. A module keeps a table in a `const fn`, so a
+//! build reads the file once and a run reads the table: `std.char` keeps the two it classifies and
+//! maps characters by, and a module with a property of its own adds a file and a `const fn`.
+//!
+//! Every table is of the version `version` answers, and `runs` refuses a file of another, so the
+//! modules over them cannot come to speak of two Unicodes. The files are the Unicode Consortium's
+//! data, distributed under the licence `license` answers.
+
+import std.bytes (hex_of, int_of_ascii_radix, u16_be, u32_be)
+import std.list (concat)
+
+/// The version of the Unicode Standard every table under `ucd/` is made from.
+pub fn version() -> { major: Int, minor: Int, update: Int } = { major: 17, minor: 0, update: 0 }
+
+/// The Unicode License v3: the copyright and permission notice that goes with every copy of the
+/// tables, a program built over them among the copies.
+pub const fn license() -> String = string_of_bytes(embed("ucd/LICENSE"))
+
+/// A run of code points one line of a table holds its fields for, `first` to `last` inclusive.
+pub type Run = { first: Int, last: Int, fields: List<Bytes> }
+
+/// A table made for `lookup`.
+pub opaque type Table = new {
+  /// For each 256 code points from zero, the block they read from.
+  index: Array<Int>,
+  /// The blocks one after another, 256 values each; code points that read alike share one.
+  blocks: Array<Int>,
+  /// What is not a code point reads as.
+  missing: Int,
+}
+
+/// The line every table opens with.
+fn heading() -> Bytes = {
+  let v = version();
+  bytes_of_string(f"# Unicode {v.major}.{v.minor}.{v.update}")
+}
+
+fn refused(line: Bytes, why: String) -> String = f"`{string_of_bytes_lossy(line)}` {why}"
+
+fn point(digits: Bytes, line: Bytes) -> Int / {abort.raise} =
+  match int_of_ascii_radix(digits, 16) {
+    Some(cp) -> if cp < 0 { panic(refused(line, "is no run of code points")) }
+    else if cp > 0x10FFFF { panic(refused(line, "is past U+10FFFF")) }
+    else { cp },
+    None -> panic(refused(line, "is no run of code points")),
+  }
+
+fn run_of(line: Bytes) -> Run / {abort.raise} =
+  match bytes_split(line, b";") {
+    [span, ..fields] -> if len(fields) == 0 { panic(refused(line, "holds no field")) } else {
+      match bytes_split(span, b"..") {
+        [one] -> { first: point(one, line), last: point(one, line), fields: fields },
+        [first, last] -> { first: point(first, line), last: point(last, line), fields: fields },
+        _ -> panic(refused(line, "is no run of code points")),
+      }
+    },
+    [] -> panic(refused(line, "is no run of code points")),
+  }
+
+/// The runs read so far, and the least code point the next may start at.
+type Reading = { runs: List<Run>, next: Int }
+
+/// The runs a table's text holds, in code point order. Raises for a text that does not open with
+/// this version's line, for a line that is neither a comment nor a run with a field, for a run
+/// past `U+10FFFF` or one that ends before it starts, and for one that does not lie after the run
+/// before it.
+pub fn runs(text: Bytes) -> List<Run> / {abort.raise} = {
+  let lines = bytes_split(text, b"\n");
+  if list_at(lines, 0) != Some(heading()) {
+    panic(f"a table opens with `{string_of_bytes(heading())}`")
+  } else {
+    fold(lines, { runs: [], next: 0 }, |read: Reading, line: Bytes|
+      if bytes_len(line) == 0 || bytes_at(line, 0) == b'#' { read } else {
+        let run = run_of(line);
+        if run.last < run.first { panic(refused(line, "ends before it starts")) }
+        else if run.first < read.next {
+          panic(refused(line, "does not lie after the run before it"))
+        } else { { runs: push(read.runs, run), next: run.last + 1 } }
+      }).runs
+  }
+}
+
+/// Code points in a row that share a value, by how many they are.
+type Span = { count: Int, value: Int }
+
+/// Every code point from zero as spans: each run's, with what lies in no run between them.
+type Covering = { spans: List<Span>, next: Int }
+
+fn covering(
+  held: List<Run>,
+  missing: Int,
+  value: (List<Bytes>) -> Int / {abort.raise},
+) -> List<Span> / {abort.raise} = {
+  let covered = fold(held, { spans: [], next: 0 }, |acc: Covering, run: Run| {
+    let before = if run.first > acc.next {
+      push(acc.spans, { count: run.first - acc.next, value: missing })
+    } else { acc.spans };
+    {
+      spans: push(before, { count: run.last - run.first + 1, value: value(run.fields) }),
+      next: run.last + 1,
+    }
+  });
+  if covered.next > 0x10FFFF { covered.spans }
+  else { push(covered.spans, { count: 0x110000 - covered.next, value: missing }) }
+}
+
+/// Each distinct value under a number of its own, in the order they first appear.
+type Numbered = { ids: Map<Int, Int>, values: List<Int> }
+
+fn numbered(spans: List<Span>) -> Numbered =
+  fold(spans, { ids: map_new(), values: [] }, |acc: Numbered, span: Span|
+    if map_contains(acc.ids, span.value) { acc } else {
+      {
+        ids: map_insert(acc.ids, span.value, len(acc.values)),
+        values: push(acc.values, span.value),
+      }
+    })
+
+/// `unit` written `n` times, in steps that grow with the logarithm of `n`.
+fn repeated(unit: Bytes, n: Int) -> Bytes =
+  if n <= 0 { b"" }
+  else if n == 1 { unit } else {
+    let half = repeated(unit, n / 2);
+    if n % 2 == 0 { bytes_concat(half, half) } else { bytes_concat_all([half, half, unit]) }
+  }
+
+/// The blocks met so far, each once, and the block every 256 code points read from.
+type Cut = { index: List<Int>, blocks: List<Bytes>, seen: Map<Bytes, Int> }
+
+/// The table of the runs `text` holds, each run's value what `value` makes of its fields and
+/// `missing` the value of a code point in no run. Raises where `runs` does and where `value`
+/// does, and for more than 65536 distinct values. Its steps grow with the runs and with the code
+/// points that do not read like 256 others, so it is for a `const fn`.
+pub fn table(
+  text: Bytes,
+  missing: Int,
+  value: (List<Bytes>) -> Int / {abort.raise},
+) -> Table / {abort.raise} = {
+  let spans = covering(runs(text), missing, value);
+  let known = numbered(spans);
+  if len(known.values) > 65536 { panic("a table holds at most 65536 distinct values") } else {
+    // Two bytes a code point, the number of its value, so that a block is compared as bytes.
+    let numbers = bytes_concat_all(
+      map(spans, |span: Span|
+        match map_get(known.ids, span.value) {
+          Some(id) -> repeated(u16_be(id), span.count),
+          None -> panic("a value with no number"),
+        }),
+    );
+    let cut = fold(
+      range(0, 4352),
+      { index: [], blocks: [], seen: map_new() },
+      |acc: Cut, i: Int| {
+        let block = bytes_slice(numbers, i * 512, i * 512 + 512);
+        match map_get(acc.seen, block) {
+          Some(at) -> { index: push(acc.index, at), blocks: acc.blocks, seen: acc.seen },
+          None ->
+            {
+              index: push(acc.index, len(acc.blocks)),
+              blocks: push(acc.blocks, block),
+              seen: map_insert(acc.seen, block, len(acc.blocks)),
+            },
+        }
+      },
+    );
+    let held = bytes_concat_all(cut.blocks);
+    let values = array_of_list(known.values);
+    {
+      index: array_of_list(cut.index),
+      blocks: array_of_list(
+        map(range(0, bytes_len(held) / 2), |i: Int|
+          array_get(values, bytes_at(held, 2 * i) << 8 | bytes_at(held, 2 * i + 1))),
+      ),
+      missing: missing,
+    }
+  }
+}
+
+/// The value `held` holds for the code point `cp`, and its missing value for an `Int` that is no
+/// code point. Two reads, whatever `cp` is.
+pub fn lookup(held: Table, cp: Int) -> Int
+  cost 1
+=
+  match array_at(held.index, cp >> 8) {
+    Some(block) -> match array_at(held.blocks, block << 8 | cp & 255) {
+      Some(value) -> value,
+      None -> held.missing,
+    },
+    None -> held.missing,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn text_of(lines: List<String>) -> Bytes =
+  bytes_concat_all(
+    map(concat([string_of_bytes_lossy(heading())], lines), |line: String|
+      bytes_of_string(line ++ "\n")),
+  )
+
+fn letters() -> Bytes =
+  text_of(["# a comment", "0041..005A;Lu;AU", "0061;Ll", "10FFFE..10FFFF;Co;;7"])
+
+test "a table's lines are its runs, comments apart" {
+  assert_eq(runs(letters()), [
+    { first: 0x41, last: 0x5A, fields: [b"Lu", b"AU"] },
+    { first: 0x61, last: 0x61, fields: [b"Ll"] },
+    { first: 0x10FFFE, last: 0x10FFFF, fields: [b"Co", b"", b"7"] },
+  ]);
+  assert_eq(runs(text_of([])), [])
+}
+
+type Stray = { line: String, why: String }
+
+fn strays() -> List<Stray> =
+  [
+    { line: "0041", why: "`0041` holds no field" },
+    { line: ";Lu", why: "`;Lu` is no run of code points" },
+    { line: "0041..005A..0060;Lu", why: "`0041..005A..0060;Lu` is no run of code points" },
+    { line: "004G;Lu", why: "`004G;Lu` is no run of code points" },
+    { line: "0041 ;Lu", why: "`0041 ;Lu` is no run of code points" },
+    { line: "110000;Cn", why: "`110000;Cn` is past U+10FFFF" },
+    { line: "-0041;Lu", why: "`-0041;Lu` is no run of code points" },
+    { line: "005A..0041;Lu", why: "`005A..0041;Lu` ends before it starts" },
+    { line: "0030;Nd", why: "`0030;Nd` does not lie after the run before it" },
+    { line: "005A;Lu", why: "`005A;Lu` does not lie after the run before it" },
+  ]
+
+test "a table whose line {c.line} follows 0041..005A is refused" for c: Stray in strays() {
+  assert_eq(try[abort.raise] { runs(text_of(["0041..005A;Lu", c.line])) }, Err(c.why))
+}
+
+test "a table of another version, or of none, is refused" {
+  let told = Err("a table opens with `# Unicode 17.0.0`");
+  assert_eq(try[abort.raise] { runs(b"# Unicode 16.0.0\n0041;Lu\n") }, told);
+  assert_eq(try[abort.raise] { runs(b"0041;Lu\n") }, told);
+  assert_eq(try[abort.raise] { runs(b"") }, told)
+}
+
+fn first_byte(fields: List<Bytes>) -> Int / {abort.raise} =
+  match fields { [field, ..] -> bytes_at(field, 0), [] -> panic("no field") }
+
+test "a lookup answers each run's value, and the missing value everywhere else" {
+  let held = table(letters(), -1, first_byte);
+  assert_eq(
+    map(
+      [0, 0x40, 0x41, 0x5A, 0x5B, 0x60, 0x61, 0x62, 0xFFFF, 0x10FFFD, 0x10FFFE, 0x10FFFF],
+      |cp: Int| lookup(held, cp),
+    ),
+    [-1, -1, 76, 76, -1, -1, 76, -1, -1, -1, 67, 67],
+  );
+  assert_eq(map([-1, -256, 0x110000, 9223372036854775807], |n: Int| lookup(held, n)), [
+    -1,
+    -1,
+    -1,
+    -1,
+  ])
+}
+
+/// A table of `count` runs, each 257 code points from the last and 256 long, run `i` holding `i`
+/// in decimal: no two blocks alike, and more values than a byte numbers.
+fn striped(count: Int) -> Bytes / {abort.raise} =
+  text_of(
+    map(range(0, count), |i: Int|
+      f"{hex_of(u32_be(i * 257))}..{hex_of(u32_be(i * 257 + 255))};{i}"),
+  )
+
+fn number(fields: List<Bytes>) -> Int / {abort.raise} =
+  match fields {
+    [field] -> match int_of_ascii_radix(field, 10) { Some(n) -> n, None -> panic("no number") },
+    _ -> panic("one field"),
+  }
+
+test "every code point of a table with more values than a byte numbers reads as its run says" {
+  let held = table(striped(1200), -7, number);
+  let wrong = filter(range(0, 1200 * 257 + 600), |cp: Int|
+    lookup(held, cp) != (if cp >= 1200 * 257 || cp % 257 == 256 { -7 } else { cp / 257 }));
+  assert_eq(wrong, [])
+}
+
+test "a lookup takes the same steps wherever the code point lies" {
+  let held = table(letters(), 0, first_byte);
+  let steps = map([0x41, 0x61, 0x10FFFF, 0x110000], |cp: Int| metered(|| lookup(held, cp)).steps);
+  assert_eq(steps, [2, 2, 2, 2])
+}
+
+test "the licence shipped is the Unicode License v3" {
+  assert(string_starts_with(license(), "UNICODE LICENSE V3\n"));
+  assert(string_contains(license(), "COPYRIGHT AND PERMISSION NOTICE"))
+}
