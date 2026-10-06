@@ -1,31 +1,45 @@
 //! The trusted computing base, as one list.
 
-use crate::pool::{Bell, Inbox};
+// A line for each family, here and wherever else they are listed, in alphabetical order: two
+// families added at once then touch different lines.
+use crate::certgen;
+use crate::clock;
+use crate::config;
+use crate::fs;
+use crate::os;
+use crate::password;
+use crate::pool::{Bell, Inbox, Pool, Pooled};
+use crate::process;
+use crate::random;
+use crate::sched;
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, clock, config, fs, password, process, random, sched, tcp, time, trace};
+use crate::tcp;
+use crate::term;
+use crate::time;
+use crate::trace;
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
-use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
+use ply_eval::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 
 pub struct Host {
-    net: Arc<tcp::TcpHost>,
+    /// Rung by every pool below, so a park can wait on all of them at once.
+    bell: Arc<Bell>,
     /// The run's configuration, read once before this `Host` existed and immutable thereafter.
     config: Arc<config::Snapshot>,
-    trace: Arc<trace::Trace>,
-    /// The stop flag and the phase machine, when this run listens for a signal.
-    shutdown: Option<Arc<Shutdown>>,
     /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
+    net: Arc<tcp::TcpHost>,
+    /// The pool `std.password`'s hashes are made on.
+    password: Arc<password::PasswordHost>,
     /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
+    /// The stop flag and the phase machine, when this run listens for a signal.
+    shutdown: Option<Arc<Shutdown>>,
     /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
     /// region's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
-    /// The pool `std.password`'s hashes are made on.
-    password: Arc<password::PasswordHost>,
-    /// Rung by every pool above, so a park can wait on all of them at once.
-    bell: Arc<Bell>,
+    trace: Arc<trace::Trace>,
 }
 
 impl Default for Host {
@@ -40,31 +54,37 @@ impl Host {
     }
 
     pub fn with_credentials(credentials: crate::tls::Credentials) -> Host {
-        let bell = Arc::new(Bell::default());
-        let net = tcp::TcpHost::with_credentials(credentials);
-        net.ring(&bell);
-        let fs = fs::FsHost::new(fs::Roots::new());
-        fs.ring(&bell);
-        let password = password::PasswordHost::new();
-        password.ring(&bell);
         Host {
-            net: Arc::new(net),
+            bell: Arc::new(Bell::default()),
             config: Arc::new(config::Snapshot::unopened()),
-            trace: Arc::new(trace::Trace::default()),
-            shutdown: None,
-            fs: Arc::new(fs),
+            fs: Arc::new(fs::FsHost::new(fs::Roots::new())),
+            net: Arc::new(tcp::TcpHost::with_credentials(credentials)),
+            password: Arc::new(password::PasswordHost::new()),
             process: None,
+            shutdown: None,
             time: Arc::new(time::TimeHost::new()),
-            password: Arc::new(password),
-            bell,
+            trace: Arc::new(trace::Trace::default()),
         }
     }
 
+    /// Every facility whose operations wait on a pool: a runtime routes a token to these and to
+    /// nothing else, and has each ring the bell.
+    fn pools(&self) -> Vec<Arc<dyn Pooled>> {
+        let mut pools: Vec<Arc<dyn Pooled>> = vec![
+            // A line each, as the families above are listed.
+            self.fs.clone(),
+            self.net.clone(),
+            self.password.clone(),
+        ];
+        if let Some(process) = &self.process {
+            pools.push(process.clone());
+        }
+        pools
+    }
+
     pub fn rooted(self, roots: fs::Roots) -> Host {
-        let fs = fs::FsHost::new(roots);
-        fs.ring(&self.bell);
         Host {
-            fs: Arc::new(fs),
+            fs: Arc::new(fs::FsHost::new(roots)),
             ..self
         }
     }
@@ -74,7 +94,6 @@ impl Host {
     }
 
     pub fn with_process(self, process: process::ProcessHost) -> Host {
-        process.ring(&self.bell);
         if let Some(shutdown) = &self.shutdown {
             shutdown.attach_children(process.children());
         }
@@ -114,36 +133,44 @@ impl Host {
 
     pub fn registry(&self) -> HostRegistry {
         let mut registry = HostRegistry::new();
-        tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
+        certgen::register(&mut registry);
+        clock::register(&mut registry, Arc::clone(&self.time));
         config::register(&mut registry, Arc::clone(&self.config));
-        trace::register(&mut registry, Arc::clone(&self.trace));
-        for (op, handler) in sched::registrations() {
-            registry.register(op, handler);
-        }
-        random::register(&mut registry);
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
-        time::register(&mut registry, Arc::clone(&self.time));
-        clock::register(&mut registry, Arc::clone(&self.time));
+        os::register(&mut registry);
         password::register(&mut registry, Arc::clone(&self.password));
-        certgen::register(&mut registry);
-        signal::register(&mut registry, self.shutdown.as_ref());
         process::register(&mut registry, self.process.as_ref());
+        random::register(&mut registry);
+        sched::register(&mut registry);
+        signal::register(&mut registry, self.shutdown.as_ref());
+        tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
+        term::register(&mut registry, self.process.as_ref());
+        time::register(&mut registry, Arc::clone(&self.time));
+        trace::register(&mut registry, Arc::clone(&self.trace));
         registry
     }
 
     /// One per machine: the pools are shared, but a runtime collects only the tokens it watches.
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
         Rc::new(Facilities {
+            pools: self
+                .pools()
+                .into_iter()
+                .map(|facility| {
+                    facility.pool().ring(&self.bell);
+                    Watched {
+                        facility,
+                        inbox: Arc::default(),
+                    }
+                })
+                .collect(),
             net: Arc::clone(&self.net),
-            fs: Arc::clone(&self.fs),
             process: self.process.clone(),
-            password: Arc::clone(&self.password),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
             time: Arc::clone(&self.time),
             bell: Arc::clone(&self.bell),
-            inboxes: Inboxes::default(),
         })
     }
 
@@ -192,101 +219,89 @@ pub fn registry_over(trace: Arc<trace::Trace>) -> HostRegistry {
 
 /// The runtime, routing each token to the facility that minted it.
 struct Facilities {
+    pools: Vec<Watched>,
+    /// The sockets, for the connections a drain that ran out of time abandoned.
     net: Arc<tcp::TcpHost>,
-    fs: Arc<fs::FsHost>,
+    /// The run's own process, for its children and its streams at the end.
     process: Option<Arc<process::ProcessHost>>,
-    password: Arc<password::PasswordHost>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
     time: Arc<time::TimeHost>,
     bell: Arc<Bell>,
-    inboxes: Inboxes,
+}
+
+/// A facility, and the tokens of its pool this runtime watches, as they resolve.
+struct Watched {
+    facility: Arc<dyn Pooled>,
+    inbox: Arc<Inbox>,
+}
+
+impl Watched {
+    fn pool(&self) -> &Pool {
+        self.facility.pool()
+    }
 }
 
 impl Facilities {
     /// Whether some pool holds an operation that has finished and not been collected.
     fn ready(&self) -> bool {
-        self.net.ready()
-            || self.fs.ready()
-            || self.process.as_ref().is_some_and(|p| p.ready())
-            || self.password.ready()
+        self.pools.iter().any(|watched| watched.pool().ready())
     }
-}
 
-/// Per facility, the tokens this runtime watches, as they resolve.
-#[derive(Default)]
-struct Inboxes {
-    net: Arc<Inbox>,
-    fs: Arc<Inbox>,
-    process: Arc<Inbox>,
-    password: Arc<Inbox>,
+    fn owner(&self, pending: &Pending) -> Result<&Watched, Diagnostic> {
+        self.pools
+            .iter()
+            .find(|watched| watched.pool().owns(pending))
+            .ok_or_else(|| err_unowned(pending))
+    }
 }
 
 impl HostRuntime for Facilities {
     fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
-        if self.net.owns(pending) {
-            return self.net.watch_into(pending, &self.inboxes.net);
-        }
-        if self.fs.owns(pending) {
-            return self.fs.watch_into(pending, &self.inboxes.fs);
-        }
-        if let Some(process) = &self.process
-            && process.owns(pending)
-        {
-            return process.watch_into(pending, &self.inboxes.process);
-        }
-        if self.password.owns(pending) {
-            return self.password.watch_into(pending, &self.inboxes.password);
-        }
-        Err(err_unowned(pending))
+        let owner = self.owner(pending)?;
+        owner.pool().watch(pending, &owner.inbox)
     }
 
     fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        let mut resolved = self.net.collect(&self.inboxes.net);
-        resolved.extend(self.fs.collect(&self.inboxes.fs));
-        if let Some(process) = &self.process {
-            resolved.extend(process.collect(&self.inboxes.process));
-        }
-        resolved.extend(self.password.collect(&self.inboxes.password));
-        resolved
+        self.pools
+            .iter()
+            .flat_map(|watched| watched.pool().collect(&watched.inbox))
+            .collect()
     }
 
     fn park(&self) -> Result<(), Diagnostic> {
+        let mut busy = self
+            .pools
+            .iter()
+            .filter(|watched| watched.pool().outstanding() > 0);
+        let waited_on = (busy.next(), busy.next());
         // A drain parks in bounded steps and never on a token.
         if self.stopping() {
             let bound = signal::DRAIN_POLL;
-            if self.net.outstanding() > 0 {
-                return self.net.park_until(bound);
-            }
-            if self.fs.outstanding() > 0 {
-                return self.fs.park_until(bound);
-            }
-            if let Some(process) = &self.process
-                && process.outstanding() > 0
-            {
-                return process.park_until(bound);
-            }
-            if self.password.outstanding() > 0 {
-                return self.password.park_until(bound);
-            }
-            if let Some(shutdown) = &self.shutdown {
-                shutdown.park(bound);
-            }
-            return Ok(());
+            return match waited_on {
+                (None, _) => {
+                    if let Some(shutdown) = &self.shutdown {
+                        shutdown.park(bound);
+                    }
+                    Ok(())
+                }
+                (Some(only), None) => only.pool().park_until(bound),
+                (Some(_), Some(_)) => {
+                    let seen = self.bell.rung();
+                    if !self.ready() {
+                        self.bell.wait_past_for(seen, bound);
+                    }
+                    Ok(())
+                }
+            };
         }
-        let net = self.net.outstanding() > 0;
-        let fs = self.fs.outstanding() > 0;
-        let process = self.process.as_ref().filter(|p| p.outstanding() > 0);
-        let password = self.password.outstanding() > 0;
-        match (net, fs, process, password) {
-            (false, false, None, false) => Err(err_nothing_outstanding()),
-            (true, false, None, false) => self.net.park(),
-            (false, true, None, false) => self.fs.park(),
-            (false, false, Some(process), false) => process.park(),
-            (false, false, None, true) => self.password.park(),
+        match waited_on {
+            (None, _) => Err(err_nothing_outstanding()),
+            // The pool's own wait, which only its operations end: the bell rings at a stop too.
+            (Some(only), None) => only.pool().park(),
             // Several pools' condition variables cannot be waited on together, so the bell each
             // of them rings is waited on instead.
-            _ => {
+            (Some(_), Some(_)) => {
                 let seen = self.bell.rung();
                 if !self.ready() {
                     self.bell.wait_past(seen);
@@ -342,6 +357,10 @@ impl HostRuntime for Facilities {
         }
         // The sink flushes before the run's own state is gone.
         self.trace.flush();
+        // Last, since a buffer whose reader has gone ends the process here.
+        if let Some(process) = &self.process {
+            process.settle();
+        }
         ShutdownReport {
             spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),
         }
@@ -349,50 +368,24 @@ impl HostRuntime for Facilities {
 
     /// Drive until this token resolves, or until the drain deadline says the run is out of time.
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        let Some(_) = &self.shutdown else {
-            if self.net.owns(&pending) {
-                return self.net.block_on(pending);
-            }
-            if self.fs.owns(&pending) {
-                return self.fs.block_on(pending);
-            }
-            if let Some(process) = &self.process
-                && process.owns(&pending)
-            {
-                return process.block_on(pending);
-            }
-            if self.password.owns(&pending) {
-                return self.password.block_on(pending);
-            }
-            return Err(err_unowned(&pending));
-        };
+        if self.shutdown.is_none() {
+            return self.owner(&pending)?.pool().block_on(pending);
+        }
         loop {
-            if self.net.owns(&pending) {
-                if let Some(value) = self.net.poll(&pending)? {
-                    return Ok(value);
-                }
-                self.net.park_until(signal::DRAIN_POLL)?;
-            } else if self.fs.owns(&pending) {
-                if let Some(value) = self.fs.poll(&pending)? {
-                    return Ok(value);
-                }
-                self.fs.park_until(signal::DRAIN_POLL)?;
-            } else if let Some(process) = self.process.as_ref().filter(|p| p.owns(&pending)) {
-                if let Some(value) = process.poll(&pending)? {
-                    return Ok(value);
-                }
-                process.park_until(signal::DRAIN_POLL)?;
-            } else if self.password.owns(&pending) {
-                if let Some(value) = self.password.poll(&pending)? {
-                    return Ok(value);
-                }
-                self.password.park_until(signal::DRAIN_POLL)?;
-            } else {
-                return Err(err_unowned(&pending));
+            let pool = self.owner(&pending)?.pool();
+            if let Some(value) = pool.poll(&pending)? {
+                return Ok(value);
             }
+            pool.park_until(signal::DRAIN_POLL)?;
             if let Some(expired) = self.drain_expired() {
                 return Err(expired);
             }
+        }
+    }
+
+    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+        if let Some(process) = &self.process {
+            process.unanswered(effect, op);
         }
     }
 

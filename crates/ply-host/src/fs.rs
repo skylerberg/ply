@@ -1,11 +1,11 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{self, Bell, FS_FIRST_TOKEN, Inbox, JobOutput, Pool, Refusal};
+use crate::pool::{JobOutput, Pool, Pooled, option, record};
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
 };
-use ply_eval::{Diagnostic, Pending, Resource, Span, Symbol, Value, codes};
+use ply_eval::{Diagnostic, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -257,7 +257,7 @@ impl FsHost {
     pub fn new(roots: Roots) -> FsHost {
         FsHost {
             roots,
-            pool: Pool::new(FS_FIRST_TOKEN),
+            pool: Pool::new(),
             held: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(Descriptors::default())),
         }
@@ -266,45 +266,11 @@ impl FsHost {
     pub fn roots(&self) -> &Roots {
         &self.roots
     }
+}
 
-    pub fn owns(&self, pending: &Pending) -> bool {
-        self.pool.owns(pending)
-    }
-
-    pub fn watch_into(&self, pending: &Pending, inbox: &Arc<Inbox>) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, inbox)
-    }
-
-    pub fn collect(&self, inbox: &Inbox) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(inbox)
-    }
-
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.pool.poll(pending)
-    }
-
-    pub fn park(&self) -> Result<(), Diagnostic> {
-        self.pool.park()
-    }
-
-    pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
-        self.pool.park_until(bound)
-    }
-
-    pub fn outstanding(&self) -> usize {
-        self.pool.outstanding()
-    }
-
-    pub fn ready(&self) -> bool {
-        self.pool.ready()
-    }
-
-    pub fn ring(&self, bell: &Arc<Bell>) {
-        self.pool.ring(bell);
-    }
-
-    pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        self.pool.block_on(pending)
+impl Pooled for FsHost {
+    fn pool(&self) -> &Pool {
+        &self.pool
     }
 }
 
@@ -395,13 +361,14 @@ impl HostHandler for Operation {
         let held = Arc::clone(&self.fs.held);
         let descriptors = Arc::clone(&self.fs.descriptors);
         let machine = req.machine;
+        let to_write = matches!(second, Second::Opening(how) if how != Opening::Read);
         let pending = self.fs.pool.submit(
             span,
             op.label(),
             op.what(),
             Box::new(move || {
                 let done = run(op, &root, &first, second, &held, &descriptors, span);
-                observed(op, &root, &first, &done, machine, span);
+                observed(op, &root, &first, &done, to_write, machine, span);
                 done
             }),
         )?;
@@ -547,10 +514,10 @@ fn run(
     };
     match op {
         Op::Open => match second {
-            Second::Opening(how) => JobOutput::Opened(
-                open_file(descriptors, root, &target, how),
-                how != Opening::Read,
-            ),
+            Second::Opening(how) => {
+                let opened = open_file(descriptors, root, &target, how);
+                JobOutput::built(move || tried(opened.map(Value::Int)))
+            }
             _ => JobOutput::Failed("an open that does not say how reached the pool".into()),
         },
         Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
@@ -657,7 +624,10 @@ fn run(
                 .ok()
                 .and_then(|real| real.to_str().map(str::to_string)),
         ),
-        Op::Mode => JobOutput::MaybeMode(mode_of(&target)),
+        Op::Mode => {
+            let bits = mode_of(&target);
+            JobOutput::built(move || option(bits.map(mode_value)))
+        }
         Op::SetMode => match second {
             Second::Mode(bits) => JobOutput::Bool(set_mode(&target, bits)),
             _ => JobOutput::Failed("a mode change with no mode reached the pool".into()),
@@ -675,35 +645,191 @@ fn run(
                 .and_then(|to| to.to_str().map(str::to_string)),
         ),
         Op::Walk => match walk(path, &target) {
-            Ok(entries) => JobOutput::MaybeEntries(entries),
+            Ok(entries) => JobOutput::built(move || {
+                option(entries.map(|entries| {
+                    Value::list(
+                        entries
+                            .into_iter()
+                            .map(|(path, kind)| entry_value(path, kind))
+                            .collect(),
+                    )
+                }))
+            }),
             Err(bytes) => JobOutput::Refused(walk_too_large(bytes, path, span)),
         },
         Op::SetModified => match second {
             Second::Millis(ms) => JobOutput::Bool(set_modified(&target, ms)),
             _ => JobOutput::Failed("a stamp with no time reached the pool".into()),
         },
-        Op::Stat => JobOutput::MaybeStat(stat_of(&target)),
+        Op::Stat => {
+            let found = stat_of(&target);
+            JobOutput::built(move || option(found.map(Stat::value)))
+        }
         Op::Scan => match second {
             Second::Deep(deep) => match scan(path, &target, deep) {
-                Ok(entries) => JobOutput::MaybeScan(entries),
+                Ok(entries) => JobOutput::built(move || {
+                    option(entries.map(|entries| {
+                        Value::list(
+                            entries
+                                .into_iter()
+                                .map(|(path, found)| {
+                                    record([("path", Value::str(path)), ("stat", found.value())])
+                                })
+                                .collect(),
+                        )
+                    }))
+                }),
                 Err(bytes) => JobOutput::Refused(walk_too_large(bytes, path, span)),
             },
             _ => JobOutput::Failed("a scan that does not say how deep reached the pool".into()),
         },
-        Op::Space => JobOutput::MaybeSpace(space_of(&target)),
+        Op::Space => {
+            let room = space_of(&target);
+            JobOutput::built(move || option(room.map(Space::value)))
+        }
         Op::Link => match second {
             Second::Path(to) => match confine(root, &to, span) {
                 Err(refusal) => JobOutput::Refused(refusal),
-                Ok(existing) => JobOutput::Done(hard_link(&existing, &target)),
+                Ok(existing) => {
+                    let linked = hard_link(&existing, &target);
+                    JobOutput::built(move || tried(linked.map(|()| Value::Unit)))
+                }
             },
             _ => JobOutput::Failed("a link with no file to name reached the pool".into()),
         },
     }
 }
 
+/// A `std.fs.Refused`: why the file system would not do what an operation asked.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Refusal {
+    NotFound,
+    Denied,
+    NotAFile,
+    NotADirectory,
+    Exists,
+    NoSpace,
+    /// The host's error number and its words for it.
+    Other(i64, String),
+}
+
+impl Refusal {
+    fn value(self) -> Value {
+        let named = |name: &str| Value::ctor(name, Vec::new());
+        match self {
+            Refusal::NotFound => named("std.fs.NotFound"),
+            Refusal::Denied => named("std.fs.Denied"),
+            Refusal::NotAFile => named("std.fs.NotAFile"),
+            Refusal::NotADirectory => named("std.fs.NotADirectory"),
+            Refusal::Exists => named("std.fs.Exists"),
+            Refusal::NoSpace => named("std.fs.NoSpace"),
+            Refusal::Other(code, text) => {
+                Value::ctor("std.fs.Other", vec![Value::Int(code), Value::str(text)])
+            }
+        }
+    }
+}
+
+/// What an operation the file system may refuse answers: `Ok` of what it made, or `Err` of why
+/// it made nothing.
+fn tried(made: Result<Value, Refusal>) -> Value {
+    match made {
+        Ok(made) => Value::ctor("Ok", vec![made]),
+        Err(why) => Value::ctor("Err", vec![why.value()]),
+    }
+}
+
+/// A `std.fs.Stat`: what one look at a path reads of it, a link as itself.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Stat {
+    /// The `std.fs.Kind` constructor the path names.
+    kind: &'static str,
+    size: i64,
+    /// Nanoseconds since the Unix epoch.
+    modified: i64,
+    mode: u32,
+    links: i64,
+    device: i64,
+    id: i64,
+}
+
+impl Stat {
+    /// The record `std.fs.Stat` names, its time the prelude's `Instant`.
+    fn value(self) -> Value {
+        record([
+            ("device", Value::Int(self.device)),
+            ("id", Value::Int(self.id)),
+            ("kind", Value::ctor(self.kind, Vec::new())),
+            ("links", Value::Int(self.links)),
+            ("mode", mode_value(self.mode)),
+            (
+                "modified",
+                Value::ctor("Instant", vec![Value::Int(self.modified)]),
+            ),
+            ("size", Value::Int(self.size)),
+        ])
+    }
+}
+
+/// A `std.fs.Space`: the room in the file system that holds a path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Space {
+    total: i64,
+    free: i64,
+    available: i64,
+    inodes: i64,
+    inodes_free: i64,
+}
+
+impl Space {
+    fn value(self) -> Value {
+        record([
+            ("available", Value::Int(self.available)),
+            ("free", Value::Int(self.free)),
+            ("inodes", Value::Int(self.inodes)),
+            ("inodes_free", Value::Int(self.inodes_free)),
+            ("total", Value::Int(self.total)),
+        ])
+    }
+}
+
+/// The record `std.fs.Entry` names: a path and the kind constructor it names.
+fn entry_value(path: String, kind: &'static str) -> Value {
+    record([
+        ("kind", Value::ctor(kind, Vec::new())),
+        ("path", Value::str(path)),
+    ])
+}
+
+/// The record `std.fs.Mode` names, each `std.fs.Access` one triple of a path's nine permission
+/// bits.
+fn mode_value(bits: u32) -> Value {
+    let access = |triple: u32| {
+        record([
+            ("execute", Value::Bool(triple & 1 != 0)),
+            ("read", Value::Bool(triple & 4 != 0)),
+            ("write", Value::Bool(triple & 2 != 0)),
+        ])
+    };
+    record([
+        ("group", access(bits >> 3 & 7)),
+        ("other", access(bits & 7)),
+        ("owner", access(bits >> 6 & 7)),
+    ])
+}
+
 /// What `op` read of the world or wrote to it, for the record of the test whose machine asked. Taken
-/// after the operation, so a directory `temp_dir` made is known by the name it got.
-fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineId, span: Span) {
+/// after the operation, so a directory `temp_dir` made is known by the name it got. `to_write` is
+/// whether an open asked to write.
+fn observed(
+    op: Op,
+    root: &Path,
+    path: &str,
+    done: &JobOutput,
+    to_write: bool,
+    machine: MachineId,
+    span: Span,
+) {
     use crate::observe::{Read, read, wrote};
     let Ok(target) = confine(root, path, span) else {
         return;
@@ -723,10 +849,8 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, machine: MachineI
         // file system has is the machine's, as the clock is.
         Op::ModifiedMs | Op::Sync | Op::Lock | Op::Unlock | Op::Space => {}
         // What an open file is read or written through is recorded when it opens.
-        Op::Open => match done {
-            JobOutput::Opened(_, true) => wrote(machine, &target),
-            _ => read(machine, Read::File, &target),
-        },
+        Op::Open if to_write => wrote(machine, &target),
+        Op::Open => read(machine, Read::File, &target),
         Op::ReadChunk | Op::WriteChunk | Op::Close => {}
         Op::WriteFile
         | Op::Append
@@ -764,7 +888,7 @@ fn refusal(e: &std::io::Error) -> Refusal {
 
 /// What one look reads of what `meta` describes: a file's length and how many names it has, and
 /// for anything else neither, since a directory's are the file system's own bookkeeping.
-fn stat_from(meta: &std::fs::Metadata) -> Option<pool::Stat> {
+fn stat_from(meta: &std::fs::Metadata) -> Option<Stat> {
     use std::os::unix::fs::MetadataExt;
     let kind = if meta.is_symlink() {
         KIND_SYMLINK
@@ -776,7 +900,7 @@ fn stat_from(meta: &std::fs::Metadata) -> Option<pool::Stat> {
         return None;
     };
     let file = kind == KIND_FILE;
-    Some(pool::Stat {
+    Some(Stat {
         kind,
         size: if file {
             i64::try_from(meta.len()).ok()?
@@ -805,14 +929,14 @@ fn stat_from(meta: &std::fs::Metadata) -> Option<pool::Stat> {
 }
 
 /// `symlink_metadata` does not follow, so a link is read as itself.
-fn stat_of(target: &Path) -> Option<pool::Stat> {
+fn stat_of(target: &Path) -> Option<Stat> {
     stat_from(&std::fs::symlink_metadata(target).ok()?)
 }
 
 /// The room in the file system that holds `target`, in bytes and in inodes.
 // Each field's width is the platform's, so a cast one target needs is a no-op on another.
 #[allow(clippy::unnecessary_cast)]
-fn space_of(target: &Path) -> Option<pool::Space> {
+fn space_of(target: &Path) -> Option<Space> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
     let mut held = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -825,7 +949,7 @@ fn space_of(target: &Path) -> Option<pool::Space> {
         held.assume_init()
     };
     let bytes = |blocks: u64| i64::try_from(blocks.saturating_mul(room.f_frsize as u64)).ok();
-    Some(pool::Space {
+    Some(Space {
         total: bytes(room.f_blocks as u64)?,
         free: bytes(room.f_bfree as u64)?,
         available: bytes(room.f_bavail as u64)?,
@@ -1041,7 +1165,7 @@ fn walk_into(
 
 /// Every entry under `dir` with what one look reads of it, in a walk's order: its own entries
 /// alone unless `deep`. `Err` as a walk's is.
-fn scan(dir: &str, target: &Path, deep: bool) -> Result<Option<Vec<(String, pool::Stat)>>, u64> {
+fn scan(dir: &str, target: &Path, deep: bool) -> Result<Option<Vec<(String, Stat)>>, u64> {
     if !std::fs::metadata(target).is_ok_and(|m| m.is_dir()) {
         return Ok(None);
     }
@@ -1055,7 +1179,7 @@ fn scan_into(
     prefix: &str,
     at: &Path,
     deep: bool,
-    out: &mut Vec<(String, pool::Stat)>,
+    out: &mut Vec<(String, Stat)>,
     bytes: &mut u64,
 ) -> Result<(), u64> {
     let Ok(entries) = std::fs::read_dir(at) else {

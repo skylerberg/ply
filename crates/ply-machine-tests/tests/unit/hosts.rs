@@ -190,18 +190,20 @@ fn the_digest_moves_when_a_flag_alone_moves() {
 /// handed and answers the hash, which is one-way in it.
 #[test]
 fn only_the_password_hashes_declare_that_they_may_receive_a_credential() {
-    let claiming: Vec<&str> = ply_machine::hosts::registry()
+    let mut claiming: Vec<&str> = ply_machine::hosts::registry()
         .ops()
         .filter(|op| op.secrets)
         .map(|op| op.path)
         .collect();
+    // Ascending, so a family's handlers are its own lines wherever it is registered.
+    claiming.sort_unstable();
     assert_eq!(
         claiming,
         [
             "ply_host::password::argon2",
-            "ply_host::password::scrypt",
             "ply_host::password::bcrypt",
             "ply_host::password::pbkdf2",
+            "ply_host::password::scrypt",
         ]
     );
 }
