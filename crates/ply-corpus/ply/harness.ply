@@ -1,17 +1,17 @@
 //! What the corpus drives in-process: the compiler's front end over sources the program read itself,
-//! with the checkout's standard library as the shipped modules the way `ply` reads a program and its
-//! shipped modules, and a fixture written, front-ended and loaded into the machine the program is
-//! lent. The two phases before a load are timed here, so an in-process number also says what it cost
+//! pulling the shipped modules they reach the way `ply` reads a program, and a fixture written,
+//! front-ended and loaded into the machine the program is lent. The two phases before a load are timed here, so an in-process number also says what it cost
 //! to get to it.
 
-import compiler.load (LoadedAnalysis)
+import compiler.load (LoadedAnalysis, tell_viewed)
 import cli.machine
 import cli.diagnostic (shown)
 import cli.machine (machine, default_options)
 import cli.program (pseudo_path)
 import cli.units (emit, whole)
-import compiler.front (Analysed, Pulled, Refused, Analysis, analyse_pulling_std_with, dump_of,
-                       module_of)
+import compiler.front (Analysed, Refused, Analysis, checked_staged, dump_of, module_of,
+                       shipped_pulled, staged_pulling_std_with)
+import compiler.unit (shipped)
 import compiler.resolve (Diag, ParsedModule, Source)
 import product (under)
 import std.fs (fs)
@@ -28,62 +28,6 @@ pub type Fronted = { front: LoadedAnalysis, whole: Analysis, loaded: Loaded }
 
 /// One source to front-end: its path under the `work` root, and the module it is.
 pub type Named = { path: String, module: String }
-
-/// Where the standard library the sources are checked against lives under the `repo` root.
-fn std_tree() -> String = "crates/ply-std/ply"
-
-// --- The shipped modules ------------------------------------------------------------
-
-/// Every `.ply` under `dir` of the `repo` root as the shipped module it is: `std.json` is `json.ply`,
-/// `std.http.server` is `http/server.ply`.
-fn shipped_in(
-  dir: String,
-  module: String,
-  acc: List<Source>,
-) -> List<Source> / {fs.read[repo], abort.raise} = shipped_within(dir, module, acc, 2048)
-
-/// `room`: a path the system opens is at most 4096 bytes, and each level adds two.
-fn shipped_within(
-  dir: String,
-  module: String,
-  acc: List<Source>,
-  room: Int,
-) -> List<Source> / {fs.read[repo], abort.raise} =
-  if room <= 0 { acc } else {
-    match fs.list_dir[repo](dir) {
-      None -> acc,
-      Some(names) ->
-        fold(sort(names), acc, |found: List<Source>, name: String| {
-          let path = under(dir, name);
-          match fs.kind[repo](path) {
-            fs::Dir -> shipped_within(path, module ++ "." ++ name, found, room - 1),
-            fs::File -> if !string_ends_with(name, ".ply") { found } else {
-              match fs.read_file[repo](path) {
-                None -> found,
-                Some(src) ->
-                  push(found, {
-                    name: bytes_of_string(
-                      module ++ "." ++ string_slice(name, 0, string_len(name) - 4),
-                    ),
-                    src: src,
-                  }),
-              }
-            },
-            _ -> found,
-          }
-        }),
-    }
-  }
-
-fn shipped_modules() -> Result<List<Source>, String> / {fs.read[repo], abort.raise} =
-  match shipped_in(std_tree(), "std", []) {
-    [] ->
-      Err(
-        "no standard library under `" ++ std_tree()
-          ++ "` of the `repo` root: bind the checkout as `--fs repo=PATH`",
-      ),
-    found -> Ok(found),
-  }
 
 pub fn joined_diags(diags: List<Diag>) -> String =
   fold(diags, "", |acc: String, d: Diag|
@@ -123,12 +67,13 @@ fn front_of(
   })
 }
 
-/// `sources` read back and the shipped modules beside them, through the compiler's own front end:
+/// `sources` read back and the shipped modules they reach, through the compiler's own front end:
 /// the LoadedAnalysis a machine or a prover is handed, the program it answers for, and what the two
-/// phases before it cost.
+/// phases before it cost. What it read of the shipped modules is told to whatever observes the run,
+/// so a pass stands on the definitions the sources reached.
 pub fn fronted(
   sources: List<Named>,
-) -> Result<Fronted, String> / {fs.read[work], fs.read[repo], time.elapsed_us, abort.raise} = {
+) -> Result<Fronted, String> / {fs.read[work], shipped.names, shipped.module, shipped.reached, time.elapsed_us, abort.raise} = {
   let started = time.elapsed_us();
   let read = fold(
     sources,
@@ -144,38 +89,46 @@ pub fn fronted(
   );
   match read {
     Err(why) -> Err(why),
-    Ok(texts) -> match shipped_modules() {
-      Err(why) -> Err(why),
-      Ok(shipped) -> {
-        let read_at = time.elapsed_us();
-        let user = map(range(0, len(sources)), |i: Int|
-          {
-            name: bytes_of_string(match list_at(sources, i) { Some(n) -> n.module, None -> "" }),
-            src: match list_at(texts, i) { Some(t) -> t.text, None -> b"" },
-          });
-        let pulled: Pulled = analyse_pulling_std_with(user, shipped, [], []);
-        let analysed_at = time.elapsed_us();
-        match pulled.out {
-          Refused(diags) -> Err(joined_diags(diags)),
-          Analysed(w) -> {
-            let loaded: Loaded = { read_us: read_at - started, front_us: analysed_at - read_at };
-            let front: LoadedAnalysis = {
-              dump: dump_of(Analysed(w)),
-              files: front_of(
-                texts,
-                shipped,
-                pulled.pulled,
-                map(w.mods, |mo: ParsedModule| mo.name),
-              ),
-              read_ms: loaded.read_us / 1000,
-              front_ms: loaded.front_us / 1000,
-              file_ms: 0,
-              cached: false,
-            };
-            Ok({ front: front, whole: w, loaded: loaded })
-          },
-        }
-      },
+    Ok(texts) -> {
+      let user = map(range(0, len(sources)), |i: Int|
+        {
+          name: bytes_of_string(match list_at(sources, i) { Some(n) -> n.module, None -> "" }),
+          src: match list_at(texts, i) { Some(t) -> t.text, None -> b"" },
+        });
+      let pkgs = { root: b"", manifest: None, supplied: [] };
+      let held = |name: Bytes| shipped.module(string_of_bytes_lossy(name));
+      let shipping = shipped_pulled(user, pkgs, map(shipped.names(), bytes_of_string), held, held);
+      let read_at = time.elapsed_us();
+      let staged = staged_pulling_std_with(
+        user,
+        shipping.read,
+        pkgs,
+        unread: shipping.unread,
+        data: shipping.data,
+      );
+      tell_viewed(staged.viewed, true);
+      let pulled = checked_staged(staged, [], []);
+      let analysed_at = time.elapsed_us();
+      match pulled.out {
+        Refused(diags) -> Err(joined_diags(diags)),
+        Analysed(w) -> {
+          let loaded: Loaded = { read_us: read_at - started, front_us: analysed_at - read_at };
+          let front: LoadedAnalysis = {
+            dump: dump_of(Analysed(w)),
+            files: front_of(
+              texts,
+              shipping.read,
+              pulled.pulled,
+              map(w.mods, |mo: ParsedModule| mo.name),
+            ),
+            read_ms: loaded.read_us / 1000,
+            front_ms: loaded.front_us / 1000,
+            file_ms: 0,
+            cached: false,
+          };
+          Ok({ front: front, whole: w, loaded: loaded })
+        },
+      }
     },
   }
 }
@@ -294,7 +247,7 @@ pub fn with_fixture<a | e>(
   source: String,
   entry: String,
   body: (Loaded) -> Result<a, String> / e,
-) -> Result<a, String> / {abort.raise, fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.drop[bench], emit.unit | e} =
+) -> Result<a, String> / {abort.raise, fs.read[work], fs.write[work], fs.read[repo], time.elapsed_us, machine.configure[bench], machine.load[bench], machine.bound[bench], machine.drop[bench], emit.unit, shipped.names, shipped.module, shipped.reached | e} =
   match written(dir, name, source) {
     Err(why) -> Err(why),
     Ok(scratch) -> {
