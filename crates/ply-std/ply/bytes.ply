@@ -308,6 +308,49 @@ pub fn cstring(s: String) -> Bytes = bytes_concat(bytes_of_string(s), b"\x00")
 pub fn repeat(b: Bytes, n: Int) -> Bytes =
   bytes_concat_all(map(range(0, if n > 0 { n } else { 0 }), |_: Int| b))
 
+fn doubled(pattern: Bytes, n: Int, left: Int) -> Bytes =
+  if left <= 0 || bytes_len(pattern) >= n { pattern }
+  else { doubled(bytes_concat(pattern, pattern), n, left - 1) }
+
+/// `pattern` over and over until it is `n` bytes, the last copy cut short: what a match copies
+/// that reaches into what it is itself writing. Empty for an empty pattern and for an `n` below
+/// one. It doubles what it has, so it takes steps in the logarithm of `n`.
+pub fn cycle(pattern: Bytes, n: Int) -> Bytes / {abort.raise} =
+  if n <= 0 || bytes_len(pattern) == 0 { b"" } else { bytes_slice(doubled(pattern, n, 62), 0, n) }
+
+/// `data` with the byte at `at` made `byte`. Raises where `data` has no such byte, or `byte` is
+/// none.
+pub fn with_byte(data: Bytes, at: Int, byte: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    bytes_slice(data, 0, at),
+    byte_of_int(byte),
+    bytes_slice(data, at + 1, bytes_len(data)),
+  ])
+
+/// How many bytes from `a` and from `b` are the same, up to `most`, given that the first `n`
+/// are: how long a match is. It compares four at a time while four remain, and raises where
+/// `most` bytes from either pass the end.
+pub fn agreeing(data: Bytes, a: Int, b: Int, most: Int, n: Int) -> Int / {abort.raise} =
+  if n + 4 <= most && bytes_u32_le(data, a + n) == bytes_u32_le(data, b + n) {
+    agreeing(data, a, b, most, n + 4)
+  } else { agreeing_bytes(data, a, b, most, n) }
+
+fn agreeing_bytes(data: Bytes, a: Int, b: Int, most: Int, n: Int) -> Int / {abort.raise} =
+  if n < most && bytes_at(data, a + n) == bytes_at(data, b + n) {
+    agreeing_bytes(data, a, b, most, n + 1)
+  } else { n }
+
+/// The eight bytes at `at` as the 64 bits of an `Int`, the first byte lowest, so the last byte's
+/// high bit is its sign. Raises unless all eight are there.
+pub fn word_at(b: Bytes, at: Int) -> Int / {abort.raise} =
+  int_of_u32(bytes_u32_le(b, at)) | int_of_u32(bytes_u32_le(b, at + 4)) << 32
+
+/// The `n` bits from bit `bit`, each byte's lowest bit first, as a bit stream that fills bytes
+/// from their low end reads them. `n` is at most 56, and the eight bytes from the one `bit` is in
+/// must be there.
+pub fn bits_at(b: Bytes, bit: Int, n: Int) -> Int / {abort.raise} =
+  word_at(b, bit >>> 3) >>> (bit & 7) & (1 << n) - 1
+
 /// `b` from its first byte that is not zero: a big-endian number in its fewest bytes, none for zero.
 pub fn strip_leading_zeros(b: Bytes) -> Bytes / {abort.raise} =
   bytes_slice(b, scan(b, 0, b"\x00"), bytes_len(b))
@@ -457,6 +500,52 @@ test "peek and the scans read the end of the bytes as where they stop" {
   assert_eq(scan(b"ab", 5, b" "), 2);
   assert_eq(scan_until(b"ab,c", 0, b","), 2);
   assert_eq(scan_until(b"abc", 1, b","), 3)
+}
+
+test "a pattern cycles to any length, in steps that do not grow with it" {
+  assert_eq(cycle(b"abc", 8), b"abcabcab");
+  assert_eq(cycle(b"abc", 3), b"abc");
+  assert_eq(cycle(b"abc", 2), b"ab");
+  assert_eq(cycle(b"x", 5), b"xxxxx");
+  assert_eq(cycle(b"", 5), b"");
+  assert_eq(cycle(b"abc", 0), b"");
+  assert_eq(cycle(b"abc", -1), b"");
+  assert_eq(cycle(b"ab", 100000), repeat(b"ab", 50000));
+  assert(metered(|| cycle(b"x", 1000000)).steps < 32)
+}
+
+test "one byte is changed, and a place the bytes do not hold is no place to change" {
+  assert_eq(with_byte(b"abc", 0, 120), b"xbc");
+  assert_eq(with_byte(b"abc", 2, 0), b"ab\x00");
+  let past: Result<Bytes, String> = try[abort.raise] { with_byte(b"abc", 3, 120) };
+  let wide: Result<Bytes, String> = try[abort.raise] { with_byte(b"abc", 1, 256) };
+  assert(match past { Err(_) -> true, Ok(_) -> false });
+  assert(match wide { Err(_) -> true, Ok(_) -> false })
+}
+
+test "two places agree for as long as their bytes do, and no longer than asked" {
+  let b = b"abcdefgh-abcdefgX-abcdefgh";
+  assert_eq(agreeing(b, 0, 9, 17, 0), 7);
+  assert_eq(agreeing(b, 0, 18, 8, 0), 8);
+  assert_eq(agreeing(b, 0, 18, 5, 0), 5);
+  assert_eq(agreeing(b, 0, 18, 8, 4), 8);
+  assert_eq(agreeing(b, 0, 1, 8, 0), 0);
+  assert_eq(agreeing(b, 3, 3, 0, 0), 0)
+}
+
+test "a word is eight bytes with the first lowest, and bits are read from a byte's low end" {
+  let b = b"\x01\x02\x03\x04\x05\x06\x07\x88\xff";
+  assert_eq(word_at(b, 0), 0x8807_0605_0403_0201);
+  assert(word_at(b, 0) < 0);
+  assert_eq(word_at(b, 1) & 0xFF, 2);
+  assert_eq(word_at(b, 1) >>> 56, 0xFF);
+  assert_eq(bits_at(b, 0, 1), 1);
+  assert_eq(bits_at(b, 0, 0), 0);
+  assert_eq(bits_at(b, 1, 8), 0);
+  assert_eq(bits_at(b, 4, 8), 0x20);
+  assert_eq(bits_at(b, 7, 56), word_at(b, 0) >>> 7 & 0xFF_FFFF_FFFF_FFFF);
+  let past: Result<Int, String> = try[abort.raise] { word_at(b, 2) };
+  assert(match past { Err(_) -> true, Ok(_) -> false })
 }
 
 test "a hex digit's value in either case, a decimal integer in ASCII, and a C string" {
