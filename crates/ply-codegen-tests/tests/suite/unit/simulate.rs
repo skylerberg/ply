@@ -23,7 +23,7 @@ fn built(text: &str) -> Option<(&'static Analysis, Native)> {
 }
 
 /// What `ply run --host` binds `task` to, which is what lets a `task` operation open a region.
-fn tasks_bound(front: &Analysis) -> HostBinding {
+pub(super) fn tasks_bound(front: &Analysis) -> HostBinding {
     let mut registry = HostRegistry::new();
     for op in ply_eval::sim::TASK_OPS {
         registry.register(

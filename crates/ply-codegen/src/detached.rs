@@ -4,6 +4,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{
     Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame,
+    switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_eval::arena::{Owner, Pin, RegionId};
@@ -73,12 +74,13 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
     let c = unsafe { &mut *ctx };
     let id = c.detached.len();
     let opener = c.current;
+    let fuel = c.fuel;
     let enclosing = pin_enclosing(c, opener);
     let frames = c.open_stack(Some(opener));
     c.stacks[frames].body = Some(id);
     c.stacks[frames]
         .list
-        .push(HandlerFrame::detached(clauses, id));
+        .push(HandlerFrame::detached(clauses, id, fuel));
     let stack = Stack::new();
     let sp = stack.prepare(entry, ctx as usize);
     let floor = stack.floor();
@@ -230,7 +232,7 @@ pub(crate) unsafe fn resume(
         c.starting_detached = Some(id);
     }
     let from = &mut c.detached[id].resumer_sp as *mut usize;
-    unsafe { switch(&mut *from, sp) };
+    unsafe { switch_keeping(ctx, from, sp) };
 
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
@@ -407,7 +409,7 @@ pub(crate) unsafe fn stop(
     d.saved_floor = c.stack_floor;
     let to = d.resumer_sp;
     let from = &mut d.sp as *mut usize;
-    unsafe { switch(&mut *from, to) };
+    unsafe { switch_keeping(ctx, from, to) };
     let c = unsafe { &mut *ctx };
     std::mem::take(&mut c.detached[id].answer)
 }
@@ -430,6 +432,9 @@ extern "C" fn entry(arg: usize) {
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let mut frame = c.stacks[frames].list.pop();
+    if let Some(f) = &frame {
+        f.land(c);
+    }
     // A zero-shot clause of this frame unwinds to it, and a raise its clause answers lands here;
     // `return` is applied to neither. What the body left open goes back in `finish`.
     let mut answered = false;
