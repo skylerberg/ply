@@ -21,13 +21,13 @@ import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyR
               atoms_text, atoms_insert, read_atoms, scheme_text, type_text, Printer, printer_new,
               print_ty, Field, canonical_atoms, canonical_scheme, canonical_type, bool_type,
               int_type, bytes_type, unit_type, named_type, TyNominal)
-import resolve (Source, ParsedModule, Diag, Resolved, ResolveSucceeded, ResolveFailed, Namespace,
-                ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find, error_at,
-                backticked, import_module_name, path_span)
+import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, ResolveFailed,
+                Namespace, ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find,
+                error_at, backticked, import_module_name, path_span)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, Prior, Rehash, Rehashed,
-             rehash_index, by_name, tagged_target, reached_functions, LawNode, Node, NodeFn,
-             NodeType, NodeEffect)
+             rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode, Node,
+             NodeFn, NodeType, NodeEffect)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, facts_by_owner, filed_facts, foreign_facts, no_root_facts,
@@ -1414,8 +1414,8 @@ pub fn tagged_sites(analysis: Analysis) -> List<TaggedSite> / {abort.raise} = {
     })
 }
 
-/// A `const` definition of a checked program: where it is written, and the hash of all it reaches,
-/// which a build keeps its value under.
+/// A `const` definition of a checked program: where it is written, and what a build keeps its value
+/// under (`kept_under`).
 pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
 
 /// Every `const` definition the program holds, whichever package declares it. One in a shipped
@@ -1431,13 +1431,33 @@ pub fn const_sites(
         IFn(d) -> if d.baked == None { sites } else {
           let name = qualify(at(mods, i).name, d.name.name);
           match map_get(hashed, name) {
-            Some(h) -> push(sites, { module: i, span: d.name.span, name: name, hash: h }),
+            Some(h) ->
+              push(sites, {
+                module: i,
+                span: d.name.span,
+                name: name,
+                hash: kept_under(hashes, name, h),
+              }),
             None -> sites,
           }
         },
         _ -> sites,
       }))
 }
+
+/// What a build keeps the value of the `const` definition `name` under: its hash, which covers all
+/// it reaches, with each name that spells. A kept value names its constructors as the program does
+/// and a hash names nothing, so the same definition in a module of another name is another value.
+fn kept_under(hashes: HashOutput, name: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
+  blake3(
+    bytes_concat_all(
+      fold(
+        map_keys(closure_of(hashes, [name])),
+        [b"ply const value 1\x00", hash],
+        |acc: List<Bytes>, reached: Bytes| push(push(acc, b"\x00"), reached),
+      ),
+    ),
+  )
 
 /// A definition's or a test's published rows as the last answer wrote them, under the check key it
 /// had then: the checker takes them wherever the item's own form and what it reads of the rest of
@@ -2407,8 +2427,10 @@ fn analyse_closure(
 
 /// Every table the answer holds, as rows.
 /// The answer as a program ships it: what a load walked and what it warned of are functions of the
-/// caches it read as much as of the program, and a program that checked runs without either.
-pub fn shipped_dump(d: Dump) -> Dump = { ..d, diags: [], walked: b"" }
+/// caches it read as much as of the program, and a program that checked runs without either. What
+/// its modules embed is for a pass that parses their text again, and its unit is emitted: a module
+/// it pulled and reaches no embed of would ship that file's bytes for nothing.
+pub fn shipped_dump(d: Dump) -> Dump = { ..d, diags: [], walked: b"", embeds: [] }
 
 pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
   match outcome {
@@ -3195,35 +3217,51 @@ fn unread_shipped(name: Bytes) -> Diag =
     [b"this is Ply's fault, not the program's"],
   )
 
-/// The shipped modules a load reads, and the names of the rest, of which it reads none.
-pub type Shipping = { read: List<Source>, unread: List<Bytes> }
+/// A data file a shipped module embeds: the name the shipped modules hold it under, which is its
+/// place below its package's root (`std/oid/names.txt`), and its bytes.
+pub type ShippedData = { name: Bytes, bytes: Bytes }
+
+/// The shipped modules a load reads, the names of the rest, of which it reads none, and the data
+/// files the read ones embed.
+pub type Shipping = { read: List<Source>, unread: List<Bytes>, data: List<ShippedData> }
 
 /// What a load of `user` and its package closure pulls, each module read once through `read`: what
-/// they import, what those import in turn, and what any of them embeds beside itself. Handed the
-/// read ones, and the rest as `unread`, the front end pulls what it would have pulled from every
-/// shipped module.
+/// they import, what those import in turn, and what any of them embeds beside itself, a data file
+/// read once through `read_data`. Handed the read ones, and the rest as `unread`, the front end
+/// pulls what it would have pulled from every shipped module.
 pub fn shipped_pulled<| e>(
   user: List<Source>,
   pkgs: PackageSources,
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
+  read_data: (Bytes) -> Option<Bytes> / e,
 ) -> Shipping / {abort.raise | e} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let own = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
   let parsed = map(range(0, len(own)), |i: Int| headed_at(i, at(own, i)));
-  let found = needing(
+  let needed = needing(
     len(own),
     listed,
     read,
-    { parsed: parsed, found: [], tried: map_new() },
+    read_data,
+    { parsed: parsed, found: [], data: [], tried: map_new() },
     len(listed) + 1,
-  ).found;
-  let held = fold(found, map_new(), |acc: Map<Bytes, Bool>, s: Source|
+  );
+  let held = fold(needed.found, map_new(), |acc: Map<Bytes, Bool>, s: Source|
     map_insert(acc, s.name, true));
-  { read: found, unread: filter(listed, |name: Bytes| !map_contains(held, name)) }
+  {
+    read: needed.found,
+    unread: filter(listed, |name: Bytes| !map_contains(held, name)),
+    data: needed.data,
+  }
 }
 
-type Needed = { parsed: List<ParsedSource>, found: List<Source>, tried: Map<Bytes, Bool> }
+type Needed = {
+  parsed: List<ParsedSource>,
+  found: List<Source>,
+  data: List<ShippedData>,
+  tried: Map<Bytes, Bool>,
+}
 
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
 /// `room` bounds the rounds, as each reads at least one module no earlier round did.
@@ -3231,6 +3269,7 @@ fn needing<| e>(
   users: Int,
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
+  read_data: (Bytes) -> Option<Bytes> / e,
   x: Needed,
   room: Int,
 ) -> Needed / {abort.raise | e} = {
@@ -3241,6 +3280,7 @@ fn needing<| e>(
       users,
       listed,
       read,
+      read_data,
       fold(names, x, |acc: Needed, name: Bytes| {
         let tried = map_insert(acc.tried, name, true);
         match read(name) {
@@ -3251,7 +3291,8 @@ fn needing<| e>(
             beside(
               listed,
               read,
-              { parsed: push(acc.parsed, p), found: push(acc.found, source), tried: tried },
+              read_data,
+              { ..acc, parsed: push(acc.parsed, p), found: push(acc.found, source), tried: tried },
               source,
             )
           },
@@ -3263,10 +3304,11 @@ fn needing<| e>(
 }
 
 /// What a pulled module embeds from beside itself, read once: the prelude beside the compiler's
-/// package is one, which no module imports.
+/// package is one, which no module imports, and a data file is another.
 fn beside<| e>(
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
+  read_data: (Bytes) -> Option<Bytes> / e,
   x: Needed,
   source: Source,
 ) -> Needed / {abort.raise | e} =
@@ -3274,7 +3316,6 @@ fn beside<| e>(
     fold(wants_of(parse(source.src).node), x, |acc: Needed, want: EmbedWant|
       if want.dir { acc } else {
         match shipped_name(source.name, want.path) {
-          None -> acc,
           Some(name) -> if map_contains(acc.tried, name) || !list::contains(listed, name) { acc }
           else {
             let tried = map_insert(acc.tried, name, true);
@@ -3283,6 +3324,17 @@ fn beside<| e>(
               Some(src) ->
                 { ..acc, found: push(acc.found, { name: name, src: src }), tried: tried },
             }
+          },
+          None -> match shipped_data_name(source.name, want.path) {
+            None -> acc,
+            Some(name) -> if map_contains(acc.tried, name) { acc } else {
+              let tried = map_insert(acc.tried, name, true);
+              match read_data(name) {
+                None -> { ..acc, tried: tried },
+                Some(bytes) ->
+                  { ..acc, data: push(acc.data, { name: name, bytes: bytes }), tried: tried },
+              }
+            },
           },
         }
       })
@@ -3309,6 +3361,69 @@ fn shipped_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} = {
       Some(join(push(without_last(walked), bytes_slice(file, 0, bytes_len(file) - 4)), b"."))
     },
   }
+}
+
+/// The name the shipped modules give the data file at `path` beside the shipped module `module`:
+/// its place below the package's root, `std/oid/names.txt` for `oid/names.txt` beside `std.oid`.
+/// `None` for a path that names a module, that is absolute, or that leaves the package.
+pub fn shipped_data_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} =
+  if bytes_starts_with(path, b"/") || bytes_ends_with(path, b".ply") { None } else {
+    let walked = fold(
+      bytes_split(path, b"/"),
+      Some(without_last(bytes_split(module, b"."))),
+      |inside: Option<List<Bytes>>, part: Bytes|
+        match inside {
+          None -> None,
+          Some(dir) -> if part == b"" || part == b"." { inside }
+          else if part != b".." { Some(push(dir, part)) }
+          else if len(dir) > 1 { Some(without_last(dir)) }
+          else { None },
+        },
+    );
+    match walked {
+      Some(parts) -> if len(parts) < 2 { None } else { Some(join(parts, b"/")) },
+      None -> None,
+    }
+  }
+
+/// Each data file `module` asks to embed: what it asks, and the file's name among the shipped
+/// modules.
+fn data_wants(module: Source) -> List<{ want: EmbedWant, name: Bytes }> / {abort.raise} =
+  if !names_embed(module.src) { [] } else {
+    fold(
+      wants_of(parse(module.src).node),
+      [],
+      |acc: List<{ want: EmbedWant, name: Bytes }>, want: EmbedWant|
+        if want.dir { acc } else {
+          match shipped_data_name(module.name, want.path) {
+            Some(name) -> push(acc, { want: want, name: name }),
+            None -> acc,
+          }
+        },
+    )
+  }
+
+/// The data files `module` embeds, each by its name among the shipped modules and once.
+pub fn shipped_data_wanted(module: Source) -> List<Bytes> / {abort.raise} =
+  fold(data_wants(module), [], |acc: List<Bytes>, w: { want: EmbedWant, name: Bytes }|
+    push_unique(acc, w.name))
+
+/// What `module` embeds of `data`, as the answer of a load that pulled it carries each read.
+pub fn shipped_data_embeds(
+  module: Source,
+  data: List<ShippedData>,
+) -> List<EmbedAt> / {abort.raise} = {
+  let held = data_held(data);
+  fold(data_wants(module), [], |acc: List<EmbedAt>, w: { want: EmbedWant, name: Bytes }|
+    match map_get(held, w.name) {
+      Some(bytes) ->
+        push(acc, {
+          module: module.name,
+          key: embed_key(w.want),
+          read: Ok([{ name: b"", bytes: bytes }]),
+        }),
+      None -> acc,
+    })
 }
 
 type Pull = {
@@ -3340,13 +3455,14 @@ fn untested(p: ParsedSource) -> ParsedSource =
     },
   }
 
-/// `shipped` is each shipped module as the analysis reads it, a stub where it has one, and `whole`
-/// the shipped modules as they stand. `room` is how many more rounds may pull: each pulls a shipped
-/// module not pulled before.
+/// `shipped` is each shipped module as the analysis reads it, a stub where it has one, `whole` the
+/// shipped modules as they stand and `data` the data files they embed. `room` is how many more
+/// rounds may pull: each pulls a shipped module not pulled before.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
+  data: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   stubs: Map<Bytes, Bytes>,
   tested: Bool,
@@ -3363,11 +3479,12 @@ fn pulling(
         users,
         shipped,
         whole,
+        data,
         listed,
         stubs,
         tested,
         map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes| {
-          let o = shipped_embedded(whole, len(acc.parsed), { name: name, src: src });
+          let o = shipped_embedded(whole, data, len(acc.parsed), { name: name, src: src });
           {
             ..acc,
             parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
@@ -3382,28 +3499,41 @@ fn pulling(
   }
 }
 
+/// What the shipped modules hold at `want` beside the shipped module `module`: another module's
+/// text out of `whole`, or a data file's bytes out of `data`.
 fn shipped_read(
   whole: Map<Bytes, Bytes>,
+  data: Map<Bytes, Bytes>,
   module: Bytes,
   want: EmbedWant,
 ) -> EmbedRead / {abort.raise} =
   if want.dir { Err(b"a shipped module embeds a file the shipped modules hold, never a directory") }
   else {
-    match shipped_name(module, want.path) {
+    let held = match shipped_name(module, want.path) {
+      Some(name) -> Some(map_get(whole, name)),
+      None -> match shipped_data_name(module, want.path) {
+        Some(name) -> Some(map_get(data, name)),
+        None -> None,
+      },
+    };
+    match held {
       None ->
         Err(bytes_concat_all([b"`", want.path, b"` names nothing shipped modules could hold"])),
-      Some(name) -> match map_get(whole, name) {
-        Some(text) -> Ok([{ name: b"", bytes: text }]),
-        None -> Err(bytes_concat_all([b"`", want.path, b"` is not among the shipped modules"])),
-      },
+      Some(None) ->
+        Err(bytes_concat_all([b"`", want.path, b"` is not among what the shipped modules hold"])),
+      Some(Some(bytes)) -> Ok([{ name: b"", bytes: bytes }]),
     }
   }
+
+fn data_held(data: List<ShippedData>) -> Map<Bytes, Bytes> =
+  fold(data, map_new(), |acc: Map<Bytes, Bytes>, d: ShippedData| map_insert(acc, d.name, d.bytes))
 
 /// A pulled module parsed, with what it embeds written out from the shipped modules: no driver reads
 /// beside a module that has no file. What it embeds is asked of its text as the shipped modules hold
 /// it: read as a stub it has no body left to ask, and the emitter may still lower the whole of it.
 fn shipped_embedded(
   whole: Map<Bytes, Bytes>,
+  data: Map<Bytes, Bytes>,
   index: Int,
   source: Source,
 ) -> { parsed: ParsedSource, embeds: List<EmbedAt> } / {abort.raise} = {
@@ -3413,7 +3543,7 @@ fn shipped_embedded(
     let wants = if text == source.src { wants_of(p.module.module) }
     else { wants_of(parse(text).node) };
     let table = fold(wants, map_new(), |acc: Map<Bytes, EmbedRead>, want: EmbedWant|
-      map_insert(acc, embed_key(want), shipped_read(whole, source.name, want)));
+      map_insert(acc, embed_key(want), shipped_read(whole, data, source.name, want)));
     let r = embedded(p.module.module, table, []);
     {
       parsed: {
@@ -3425,6 +3555,20 @@ fn shipped_embedded(
         push(acc, { module: source.name, key: key, read: read })),
     }
   }
+}
+
+/// Each of `modules` parsed as a load that pulls it parses it, what it embeds written out from what
+/// the shipped modules hold: `shipped` every module they hold and `data` each data file. What a
+/// listing analyses of shipped modules no program pulled.
+pub fn parse_shipped(
+  modules: List<Source>,
+  shipped: List<Source>,
+  data: List<ShippedData>,
+) -> List<ParsedSource> / {abort.raise} = {
+  let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let held = data_held(data);
+  map(range(0, len(modules)), |i: Int| shipped_embedded(whole, held, i, at(modules, i)).parsed)
 }
 
 /// `analyse` over `user` and the modules of `shipped` it imports, with those named in the order they
@@ -3500,6 +3644,8 @@ pub fn staged_pulling_std_with(
   // Whether a shipped module is read only for what the program reaches. `ply test --std` reads
   // every one whole, its tests and laws among them, and the toolchain's own tree always does.
   reached: Bool = true,
+  // The data files the modules of `shipped` embed (`shipped_pulled`).
+  data: List<ShippedData> = [],
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -3535,6 +3681,7 @@ pub fn staged_pulling_std_with(
     len(assembled),
     texts,
     whole,
+    data_held(data),
     listed,
     stubs,
     tested,
@@ -3774,6 +3921,7 @@ pub fn shipped_hashes(
   modules: List<Bytes>,
   shipped: List<Source>,
   unread: List<Bytes> = [],
+  data: List<ShippedData> = [],
 ) -> Map<Bytes, Bytes> / {abort.raise} =
   match staged_pulling_std_with(
       [shipped_viewer(modules)],
@@ -3781,6 +3929,7 @@ pub fn shipped_hashes(
       tested: false,
       unread: unread,
       reached: false,
+      data: data,
     ).hashed {
     Err(_) -> map_new(),
     Ok(h) ->
@@ -3797,6 +3946,7 @@ pub fn shipped_views(
   modules: List<Bytes>,
   shipped: List<Source>,
   unread: List<Bytes> = [],
+  data: List<ShippedData> = [],
 ) -> Result<List<ShippedView>, List<Diag>> / {abort.raise} =
   match staged_pulling_std_with(
       [shipped_viewer(modules)],
@@ -3804,6 +3954,7 @@ pub fn shipped_views(
       tested: false,
       unread: unread,
       reached: false,
+      data: data,
     ).hashed {
     Err(diags) -> Err(diags),
     Ok(h) -> Ok(views_of(h, |name: Bytes| true)),
@@ -3836,6 +3987,7 @@ pub fn analyse_pulling_std_with(
   priors: List<Prior> = [],
   unread: List<Bytes> = [],
   reached: Bool = true,
+  data: List<ShippedData> = [],
 ) -> Pulled / {abort.raise} =
   checked_staged(
     staged_pulling_std_with(
@@ -3847,6 +3999,7 @@ pub fn analyse_pulling_std_with(
       priors,
       unread: unread,
       reached: reached,
+      data: data,
     ),
     defs,
     tests,
@@ -3928,12 +4081,13 @@ fn past_spaces(src: Bytes, at: Int) -> Int / {abort.raise} =
   else { at }
 
 /// Of a module the driver read beside, what `embeds` holds; of a shipped one, what the shipped
-/// modules do.
+/// modules do, `data` being the data files they embed.
 pub fn embeds_now(
   pkgs: PackageSources,
   user: List<Source>,
   shipped: List<Source>,
   embeds: List<Embedded>,
+  data: List<ShippedData> = [],
 ) -> EmbedReader / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let names = concat(
@@ -3956,13 +4110,14 @@ pub fn embeds_now(
   );
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
+  let held = data_held(data);
   |module: Bytes, key: Bytes|
     match map_get(beside, module) {
       Some(table) -> match map_get(table, key) {
         Some(read) -> read,
         None -> Err(b"the module asks for no such embed now"),
       },
-      None -> if map_contains(whole, module) { shipped_read(whole, module, want_of_key(key)) }
+      None -> if map_contains(whole, module) { shipped_read(whole, held, module, want_of_key(key)) }
       else { Err(b"the module asks for no such embed now") },
     }
 }
@@ -4403,7 +4558,16 @@ test "a shipped answer carries neither what a load walked nor what it warned of"
   let shipped = shipped_dump(d);
   assert_eq(shipped.diags, []);
   assert_eq(shipped.walked, b"");
-  assert_eq(shipped_dump({ ..d, walked: b"another walk", diags: [] }), shipped)
+  assert_eq(shipped_dump({ ..d, walked: b"another walk", diags: [] }), shipped);
+  // Nor what its modules embed, which only a pass that parses them again reads.
+  let embedding = dump_of(
+    over_words(
+      b"import std.words\npub fn still() -> Int = words::idle()\n",
+      words_data(b"one\n"),
+    ).out,
+  );
+  assert_eq(len(embedding.embeds), 1);
+  assert_eq(shipped_dump(embedding).embeds, [])
 }
 
 test "a program's answer holds its warnings, its order, its packages and its modules" {
@@ -4964,7 +5128,8 @@ test "a shipped type is read with what its module states of it, though the progr
 }
 
 /// `std.z` declares an effect and a function named `pack`, and an effect, a type and a constructor
-/// named `Pack`; `std.y` imports both names for the effect and the type alone.
+/// named `Pack`; `std.y` imports both names for the effect and the type alone. `std.w` declares an
+/// effect named `table` beside a function of that name, which is a data file's bytes.
 fn namesakes() -> List<Source> =
   [
     {
@@ -4975,14 +5140,22 @@ fn namesakes() -> List<Source> =
       name: b"std.y",
       src: b"import std.z (pack, Pack, Loose)\npub fn guarded(n: Int) -> Int / {pack.refused} = if n < 0 { pack.refused(n) } else { n }\npub fn loose() -> Pack = Loose\n",
     },
+    {
+      name: b"std.w",
+      src: b"pub effect table {\n  raise missing(at: Int)\n}\npub fn table() -> Bytes = embed(\"w/table.txt\")\npub fn rows() -> Int = bytes_len(table())\npub fn try_row(n: Int) -> Int / {table.missing} = if n < 0 { table.missing(n) } else { n }\n",
+    },
   ]
+
+/// The data file `std.w` embeds, holding `bytes`.
+fn namesake_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/w/table.txt", bytes: bytes }]
 
 /// The functions a load of a module importing `imports` holds, read cold and then seeded with the
 /// rows and the hashes the cold load filed; what a refused load said in their place.
 fn loaded_twice(imports: Bytes) -> List<List<Bytes>> / {abort.raise} = {
   let user = [{ name: b"m", src: bytes_concat(imports, b"\npub fn f() -> Int = 1\n") }];
   let said = |diags: List<Diag>| map(diags, |d: Diag| bytes_concat_all([d.code, b": ", d.message]));
-  let cold = analyse_pulling_std_with(user, namesakes(), [], []);
+  let data = namesake_data(b"one\n");
+  let cold = analyse_pulling_std_with(user, namesakes(), [], [], data: data);
   match cold.out {
     Refused(diags) -> [said(diags)],
     Analysed(w) -> {
@@ -4993,6 +5166,7 @@ fn loaded_twice(imports: Bytes) -> List<List<Bytes>> / {abort.raise} = {
         rows.defs,
         rows.tests,
         priors: w.hashes.priors,
+        data: data,
       );
       [
         def_names(cold),
@@ -5019,7 +5193,34 @@ test "a shipped function is read for itself, not for an effect or a type that sh
   // A shipped module's own import of the name keeps the effect once the function is left out.
   assert_eq(loaded_twice(b"import std.y (guarded)"), both([b"m.f", b"std.y.guarded"]));
   assert_eq(loaded_twice(b"import std.y (loose)"), both([b"m.f", b"std.y.loose"]));
-  assert_eq(loaded_twice(b"import std.y"), both([b"m.f"]))
+  assert_eq(loaded_twice(b"import std.y"), both([b"m.f"]));
+  // `try_row` raises through the effect `table`; the function of that name embeds a data file.
+  assert_eq(loaded_twice(b"import std.w (try_row)"), both([b"m.f", b"std.w.try_row"]));
+  assert_eq(loaded_twice(b"import std.w (rows)"), both([b"m.f", b"std.w.rows", b"std.w.table"]));
+  assert_eq(loaded_twice(b"import std.w (table)"), both([b"m.f", b"std.w.table"]))
+}
+
+test "a data file a shipped function embeds moves what reaches the function, and nothing that reaches an effect of its name" {
+  let over = |imports: Bytes, bytes: Bytes|
+    analyse_pulling_std_with(
+      [{ name: b"m", src: bytes_concat(imports, b"\npub fn f() -> Int = 1\n") }],
+      namesakes(),
+      [],
+      [],
+      data: namesake_data(bytes),
+    );
+  let reader = b"import std.w (try_row)";
+  assert_eq(def_names(over(reader, b"one\n")), [b"m.f", b"std.w.try_row"]);
+  assert_eq(pulled_hashes(over(reader, b"one\n")), pulled_hashes(over(reader, b"one\ntwo\n")));
+  let named = b"import std.w (table)";
+  let one = over(named, b"one\n");
+  assert(pulled_hash(one, b"std.w.table") != None);
+  assert(
+    pulled_hash(one, b"std.w.table") != pulled_hash(over(named, b"one\ntwo\n"), b"std.w.table"),
+  );
+  assert_eq(dump_of(one.out).embeds, [
+    { module: b"std.w", key: b"file:w/table.txt", read: Ok([{ name: b"", bytes: b"one\n" }]) },
+  ])
 }
 
 test "a shipped type's sampler is read with its generator, though the program reaches neither" {
@@ -5187,6 +5388,7 @@ fn pulled_by(user: List<Source>) -> { shipping: Shipping, asked: List<Bytes> } /
         cell_update(c, |xs: List<Bytes>| push(xs, name));
         shipped_text(name)
       },
+      |name: Bytes| None,
     );
     { shipping: shipping, asked: cell_get(c) }
   } }
@@ -5215,13 +5417,60 @@ test "a load reads a compiler module's bare sibling imports and what it embeds b
     |name: Bytes|
       fold(texts, None, |acc: Option<Bytes>, t: Source|
         if t.name == name { Some(t.src) } else { acc }),
+    |name: Bytes| None,
   );
   assert_eq(map(s.read, |t: Source| t.name), [
     b"compiler.fmt",
     b"compiler.prelude",
     b"compiler.lexer",
   ]);
-  assert_eq(s.unread, [b"compiler.unit"])
+  assert_eq(s.unread, [b"compiler.unit"]);
+  assert_eq(s.data, [])
+}
+
+/// Shipped modules of which `std.words` embeds a data file twice over and `std.idle` embeds
+/// another, with what a load asked for of each kind.
+fn data_pulled_by(
+  user: List<Source>,
+) -> { shipping: Shipping, modules: List<Bytes>, data: List<Bytes> } / {abort.raise} = {
+  let texts = [
+    {
+      name: b"std.words",
+      src: b"pub fn list() -> Bytes = embed(\"words/list.txt\")\npub fn again() -> Bytes = embed(\"./words/list.txt\")\n",
+    },
+    { name: b"std.idle", src: b"pub fn rest() -> Bytes = embed(\"idle/rest.txt\")\n" },
+  ];
+  with_cell[asked]({ modules: [], data: [] }) { c -> {
+    let shipping = shipped_pulled(
+      user,
+      { root: b"", manifest: None, supplied: [] },
+      map(texts, |t: Source| t.name),
+      |name: Bytes| {
+        cell_update(c, |a: { modules: List<Bytes>, data: List<Bytes> }|
+          { ..a, modules: push(a.modules, name) });
+        fold(texts, None, |acc: Option<Bytes>, t: Source|
+          if t.name == name { Some(t.src) } else { acc })
+      },
+      |name: Bytes| {
+        cell_update(c, |a: { modules: List<Bytes>, data: List<Bytes> }|
+          { ..a, data: push(a.data, name) });
+        if name == b"std/words/list.txt" { Some(b"one\ntwo\n") } else { None }
+      },
+    );
+    let asked = cell_get(c);
+    { shipping: shipping, modules: asked.modules, data: asked.data }
+  } }
+}
+
+test "a load reads the data files the shipped modules it pulls embed, each once, and no other's" {
+  let p = data_pulled_by([{ name: b"m", src: b"import std.words\npub fn f() -> Int = 1" }]);
+  assert_eq(p.modules, [b"std.words"]);
+  assert_eq(p.data, [b"std/words/list.txt"]);
+  assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
+  assert_eq(p.shipping.unread, [b"std.idle"]);
+  let none = data_pulled_by([{ name: b"m", src: b"pub fn f() -> Int = 1" }]);
+  assert_eq(none.data, []);
+  assert_eq(none.shipping.data, [])
 }
 
 test "handed only what a load reads, the front end pulls and answers as it does over every module" {
@@ -6834,7 +7083,10 @@ test "a shipped module read as its stub still answers what the shipped modules' 
     map_new(),
     |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src),
   );
-  let stub = shipped_embedded(whole, 0, { name: b"std.a", src: b"pub fn text() -> Bytes = b\"\"" });
+  let stub = shipped_embedded(whole, map_new(), 0, {
+    name: b"std.a",
+    src: b"pub fn text() -> Bytes = b\"\"",
+  });
   assert_eq(stub.embeds, [
     { module: b"std.a", key: b"file:note.ply", read: Ok([{ name: b"", bytes: b"one" }]) },
   ])
@@ -6848,4 +7100,169 @@ test "a shipped module that embeds what the shipped modules do not hold is refus
     [],
   );
   assert_eq(map(a.dump.diags, |d: Diag| d.code), [b"E0146"])
+}
+
+test "a `const` definition is kept under the names it reaches as well as its hash" {
+  let kept = |module: Bytes| {
+    let outcome = analyse(
+      parse_all([
+        {
+          name: module,
+          src: b"pub type Kind = | Plain | Sized(Int)\npub const fn table() -> List<Kind> = [Plain, Sized(3)]\n",
+        },
+      ]),
+    );
+    let w = checked_analysis(outcome);
+    match const_sites(w.mods, w.hashes) {
+      [site] -> { hash: def_hash_in(outcome, qualify(module, b"table")), under: site.hash },
+      _ -> panic("the module holds one `const` definition"),
+    }
+  };
+  // One definition under two modules' names: a value of it names `m.Sized` in one and `n.Sized` in
+  // the other.
+  assert_eq(kept(b"n").hash, kept(b"m").hash);
+  assert(kept(b"n").under != kept(b"m").under);
+  assert_eq(kept(b"m"), kept(b"m"))
+}
+
+test "a data file beside a shipped module is named by its place below the package's root" {
+  assert_eq(shipped_data_name(b"std.oid", b"oid/names.txt"), Some(b"std/oid/names.txt"));
+  assert_eq(shipped_data_name(b"std.oid", b"./oid//names.txt"), Some(b"std/oid/names.txt"));
+  assert_eq(shipped_data_name(b"std.oid", b"names.txt"), Some(b"std/names.txt"));
+  assert_eq(shipped_data_name(b"std.deep.a", b"../b.txt"), Some(b"std/b.txt"));
+  // A path that leaves the package names nothing, however it gets there.
+  assert_eq(shipped_data_name(b"std.a", b"../b.txt"), None);
+  assert_eq(shipped_data_name(b"std.a", b"x/../../b.txt"), None);
+  assert_eq(shipped_data_name(b"std.a", b"/etc/hosts"), None);
+  assert_eq(shipped_data_name(b"std.a", b"b.ply"), None);
+  assert_eq(shipped_data_name(b"std.a", b"."), None);
+  assert_eq(shipped_data_name(b"std.a", b""), None)
+}
+
+/// A shipped module with a table made of a data file, a function that reaches it and one that
+/// reaches nothing of it.
+fn words_module(path: Bytes) -> Source =
+  {
+    name: b"std.words",
+    src: bytes_concat_all([
+      b"pub fn list() -> Bytes = embed(\"",
+      path,
+      b"\")\npub fn count() -> Int = bytes_len(list())\npub fn idle() -> Int = 7\n",
+    ]),
+  }
+
+fn words_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/words/list.txt", bytes: bytes }]
+
+fn over_words(user: Bytes, data: List<ShippedData>) -> Pulled / {abort.raise} =
+  analyse_pulling_std_with(
+    [{ name: b"m", src: user }],
+    [words_module(b"words/list.txt")],
+    [],
+    [],
+    data: data,
+  )
+
+fn pulled_hash(p: Pulled, name: Bytes) -> Option<Bytes> =
+  fold(pulled_hashes(p), None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
+    if d.name == name { Some(d.hash) } else { acc })
+
+test "a shipped module embeds a data file, and other bytes are another definition for exactly what reaches it" {
+  let user = b"import std.words\npub fn n() -> Int = words::count()\npub fn still() -> Int = words::idle()\n";
+  let one = over_words(user, words_data(b"one\n"));
+  let two = over_words(user, words_data(b"one\ntwo\n"));
+  assert_eq(refused_codes(one.out), []);
+  fold([b"std.words.list", b"std.words.count", b"m.n"], (), |u: Unit, name: Bytes| {
+    assert(pulled_hash(one, name) != None, Some(string_of_bytes(name)));
+    assert(pulled_hash(one, name) != pulled_hash(two, name), Some(string_of_bytes(name)))
+  });
+  fold([b"std.words.idle", b"m.still"], (), |u: Unit, name: Bytes|
+    assert_eq(pulled_hash(one, name), pulled_hash(two, name)));
+  // The call is the bytes, as a literal written in its place is.
+  let written = analyse_pulling_std_with(
+    [{ name: b"m", src: user }],
+    [
+      {
+        name: b"std.words",
+        src: b"pub fn list() -> Bytes = b\"one\\n\"\npub fn count() -> Int = bytes_len(list())\npub fn idle() -> Int = 7\n",
+      },
+    ],
+    [],
+    [],
+  );
+  assert_eq(pulled_hash(one, b"std.words.list"), pulled_hash(written, b"std.words.list"));
+  assert_eq(dump_of(one.out).embeds, [
+    {
+      module: b"std.words",
+      key: b"file:words/list.txt",
+      read: Ok([{ name: b"", bytes: b"one\n" }]),
+    },
+  ])
+}
+
+test "a program that reaches nothing a data file is in holds no definition its bytes move" {
+  let user = b"import std.words\npub fn still() -> Int = words::idle()\n";
+  let one = over_words(user, words_data(b"one\n"));
+  let two = over_words(user, words_data(b"one\ntwo\n"));
+  assert_eq(def_names(one), [b"m.still", b"std.words.idle"]);
+  assert_eq(pulled_hashes(one), pulled_hashes(two));
+  assert_eq(dump_of(one.out).hashes_digest, dump_of(two.out).hashes_digest)
+}
+
+test "a data file the shipped modules do not hold, or a path that leaves them, is refused in the module that asks" {
+  let src = b"import std.words\npub fn n() -> Int = words::count()\n";
+  let user = [{ name: b"m", src: src }];
+  let placed_at = |p: Pulled|
+    match p.out {
+      Analysed(_) -> [],
+      Refused(ds) ->
+        map(ds, |d: Diag| { code: d.code, modules: map(d.labels, |l: Label| l.module) }),
+    };
+  assert_eq(placed_at(over_words(src, [])), [{ code: b"E0146", modules: [1] }]);
+  let leaving = analyse_pulling_std_with(
+    user,
+    [words_module(b"../list.txt")],
+    [],
+    [],
+    data: [{ name: b"list.txt", bytes: b"x" }, { name: b"std/list.txt", bytes: b"x" }],
+  );
+  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [1] }]);
+  let directory = analyse_pulling_std_with(
+    user,
+    [{ name: b"std.words", src: b"pub fn count() -> Int = len(embed_dir(\"words\"))\n" }],
+    [],
+    [],
+    data: words_data(b"one\n"),
+  );
+  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [1] }])
+}
+
+test "a shipped module read as its stub still answers the data file its text embeds" {
+  let whole = map_insert(map_new(), b"std.words", words_module(b"words/list.txt").src);
+  let stub = shipped_embedded(whole, data_held(words_data(b"one\n")), 0, {
+    name: b"std.words",
+    src: b"pub fn list() -> Bytes = b\"\"",
+  });
+  assert_eq(stub.embeds, [
+    {
+      module: b"std.words",
+      key: b"file:words/list.txt",
+      read: Ok([{ name: b"", bytes: b"one\n" }]),
+    },
+  ])
+}
+
+test "the shipped modules parse for a listing with their data written out, as a load that pulls them does" {
+  let module = words_module(b"words/list.txt");
+  assert_eq(shipped_data_wanted(module), [b"std/words/list.txt"]);
+  assert_eq(shipped_data_wanted({ name: b"std.plain", src: b"pub fn one() -> Int = 1\n" }), []);
+  let pulled = over_words(
+    b"import std.words\npub fn n() -> Int = words::count()\n",
+    words_data(b"one\n"),
+  );
+  assert_eq(shipped_data_embeds(module, words_data(b"one\n")), dump_of(pulled.out).embeds);
+  assert_eq(shipped_data_embeds(module, []), []);
+  let listed = analyse(parse_shipped([module], [module], words_data(b"one\n")));
+  assert_eq(refused_codes(listed), []);
+  assert_eq(Some(def_hash_in(listed, b"std.words.list")), pulled_hash(pulled, b"std.words.list"));
+  assert_eq(refused_codes(analyse(parse_shipped([module], [module], []))), [b"E0146"])
 }
