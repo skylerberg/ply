@@ -1,0 +1,764 @@
+//! W3C Trace Context: the `traceparent` and `tracestate` headers a request carries its trace in.
+//!
+//! A `Traceparent` is the header as the Recommendation (level 1) reads it: a trace id of sixteen
+//! bytes and the caller's span id of eight, neither all zero, and eight flag bits, of which
+//! `sampled` is the first and level 2's `random` the second. `parse` takes version `00` exactly
+//! and any later version by the rule the Recommendation gives for one: its first 55 characters
+//! read as version `00`, and whatever follows a `-` after them is passed over. Anything else is
+//! refused, saying why and at which character. `render` always writes version `00`.
+//!
+//! A `Tracestate` is the vendors' entries in order, each key once. `parse_state` holds keys and
+//! values to the level 1 grammar (a key may be `tenant@system`) and refuses more than 32
+//! entries; `put` adds or replaces an entry at the front, which is where the Recommendation puts
+//! the one a participant last wrote, and `render_state` writes at most 512 characters, dropping
+//! entries past 128 characters first and then entries from the end.
+//!
+//! A refusal is not a failure of the request. The Recommendation says a participant that cannot
+//! read `traceparent` starts a new trace and does not read `tracestate`; `incoming` is that
+//! rule, answering the `Context` to continue or `None` to start one.
+//!
+//! Ids are drawn through `std.random`'s `entropy` (`new_trace_id`, `new_span_id`), so a test
+//! pins them by handling it, and `rand_trace_id` and `rand_span_id` draw the same ids from a
+//! `Rand`. An id made here sets the `random` flag: all of its bytes are drawn.
+
+import std.bytes (hex_of, scan)
+import std.gen
+import std.gen (Gen)
+import std.hex
+import std.laws (round_trip)
+import std.list (all, any, take)
+import std.random (Rand, entropy, rand, token_bytes, with_rand)
+import std.string (ascii_trim, join, repeat)
+
+// --- Ids --------------------------------------------------------------------
+
+/// A trace's id: sixteen bytes, not all zero.
+pub opaque type TraceId = | TraceId(Bytes)
+
+/// A span's id: eight bytes, not all zero.
+pub opaque type SpanId = | SpanId(Bytes)
+
+show for TraceId by trace_id_hex
+
+show for SpanId by span_id_hex
+
+gen for TraceId by trace_ids
+
+gen for SpanId by span_ids
+
+fn trace_ids() -> Gen<TraceId> = gen::map(gen::bytes_of(16), |raw: Bytes| TraceId(nonzero(raw)))
+
+fn span_ids() -> Gen<SpanId> = gen::map(gen::bytes_of(8), |raw: Bytes| SpanId(nonzero(raw)))
+
+/// The trace id these bytes are; `None` unless there are sixteen and one is not zero.
+pub fn trace_id(raw: Bytes) -> Option<TraceId> / {abort.raise} =
+  if bytes_len(raw) == 16 && !all_zero(raw) { Some(TraceId(raw)) } else { None }
+
+/// The span id these bytes are; `None` unless there are eight and one is not zero.
+pub fn span_id(raw: Bytes) -> Option<SpanId> / {abort.raise} =
+  if bytes_len(raw) == 8 && !all_zero(raw) { Some(SpanId(raw)) } else { None }
+
+/// A trace id's sixteen bytes.
+pub fn trace_id_bytes(id: TraceId) -> Bytes = match id { TraceId(raw) -> raw }
+
+/// A span id's eight bytes.
+pub fn span_id_bytes(id: SpanId) -> Bytes = match id { SpanId(raw) -> raw }
+
+/// A trace id as the header writes it: 32 lower-case hex digits.
+pub fn trace_id_hex(id: TraceId) -> String = lower_hex(trace_id_bytes(id))
+
+/// A span id as the header writes it: 16 lower-case hex digits.
+pub fn span_id_hex(id: SpanId) -> String = lower_hex(span_id_bytes(id))
+
+/// The trace id 32 lower-case hex digits name; `None` for any other text, and for all zeros.
+pub fn trace_id_of_hex(text: String) -> Option<TraceId> / {abort.raise} =
+  match hex::decode(text) { Some(raw) -> trace_id(raw), None -> None }
+
+/// The span id 16 lower-case hex digits name; `None` for any other text, and for all zeros.
+pub fn span_id_of_hex(text: String) -> Option<SpanId> / {abort.raise} =
+  match hex::decode(text) { Some(raw) -> span_id(raw), None -> None }
+
+/// A trace id of the operating system's entropy: three draws.
+pub fn new_trace_id() -> TraceId / {entropy.next, abort.raise} = TraceId(nonzero(token_bytes(16)))
+
+/// A span id of the operating system's entropy: two draws.
+pub fn new_span_id() -> SpanId / {entropy.next, abort.raise} = SpanId(nonzero(token_bytes(8)))
+
+/// The trace id `new_trace_id` makes of the next draws of `r`, and the stream after them.
+pub fn rand_trace_id(r: Rand) -> { value: TraceId, rand: Rand } / {abort.raise} =
+  with_rand(r, new_trace_id)
+
+/// The span id `new_span_id` makes of the next draws of `r`, and the stream after them.
+pub fn rand_span_id(r: Rand) -> { value: SpanId, rand: Rand } / {abort.raise} =
+  with_rand(r, new_span_id)
+
+/// No id is all zero, so the one draw in `2^64` or `2^128` that is ends in a one instead.
+fn nonzero(raw: Bytes) -> Bytes / {abort.raise} =
+  if all_zero(raw) { bytes_concat(bytes_slice(raw, 0, bytes_len(raw) - 1), b"\x01") } else { raw }
+
+fn all_zero(raw: Bytes) -> Bool / {abort.raise} = scan(raw, 0, b"\x00") >= bytes_len(raw)
+
+/// `hex_of` raises only for an alphabet it does not have.
+fn lower_hex(raw: Bytes) -> String =
+  match try[abort.raise] { hex_of(raw) } { Ok(text) -> text, Err(_) -> "" }
+
+// --- traceparent ------------------------------------------------------------
+
+/// The `traceparent` header: which trace a request belongs to, which span of it made the
+/// request, and the flags that span set.
+pub opaque type Traceparent = new { trace_id: TraceId, parent_id: SpanId, flags: Int }
+
+gen for Traceparent by traceparents
+
+fn traceparents() -> Gen<Traceparent> =
+  gen::and_then(trace_ids(), |trace: TraceId|
+    gen::map2(span_ids(), gen::below(256), |span: SpanId, flags: Int|
+      { trace_id: trace, parent_id: span, flags: flags }))
+
+/// The bit of the flags that says the caller recorded its span.
+pub fn sampled_flag() -> Int = 1
+
+/// The bit of the flags, defined by level 2, that says the trace id's last seven bytes are
+/// random.
+pub fn random_flag() -> Int = 2
+
+/// A `traceparent` of these parts; of `flags`, the low eight bits.
+pub fn of_ids(trace: TraceId, parent: SpanId, flags: Int) -> Traceparent =
+  { trace_id: trace, parent_id: parent, flags: flags & 0xFF }
+
+/// Whether the caller recorded its span.
+pub fn sampled(t: Traceparent) -> Bool = t.flags & sampled_flag() != 0
+
+/// Whether the trace id's last seven bytes are random, as level 2 says.
+pub fn random(t: Traceparent) -> Bool = t.flags & random_flag() != 0
+
+/// `t` saying its span was recorded, or was not.
+pub fn with_sampled(t: Traceparent, recorded: Bool) -> Traceparent =
+  {
+    ..t,
+    flags: if recorded { t.flags | sampled_flag() } else { t.flags & (0xFF ^ sampled_flag()) },
+  }
+
+/// What the span `span` of the same trace sends on: `t`'s trace and the flags this module knows,
+/// with `span` as the parent. A flag bit nothing defines yet is not passed on.
+pub fn child(t: Traceparent, span: SpanId) -> Traceparent =
+  { trace_id: t.trace_id, parent_id: span, flags: t.flags & (sampled_flag() | random_flag()) }
+
+/// The header's text, always as version `00`: `00-<trace id>-<parent id>-<flags>`.
+pub fn render(t: Traceparent) -> String =
+  "00-" ++ trace_id_hex(t.trace_id) ++ "-" ++ span_id_hex(t.parent_id) ++ "-"
+    ++ lower_hex(flag_byte(t.flags))
+
+fn flag_byte(flags: Int) -> Bytes =
+  match try[abort.raise] { byte_of_int(flags & 0xFF) } { Ok(b) -> b, Err(_) -> b"\x00" }
+
+/// Why a `traceparent` was refused.
+pub type Why =
+  /// Fewer than the 55 characters every version has.
+  | Short
+  /// Version `ff`, which the Recommendation forbids.
+  | Version
+  /// A character that is not a lower-case hex digit where one belongs.
+  | Digit
+  /// A character that is not `-` where one separates two fields.
+  | Dash
+  /// A trace id of all zeros.
+  | ZeroTrace
+  /// A parent id of all zeros.
+  | ZeroParent
+  /// Characters after the flags: any at all in version `00`, and in a later version any that
+  /// do not start with `-`.
+  | Trailing
+
+/// A refusal, and the character it was refused at.
+pub type Refusal = new { why: Why, at: Int }
+
+/// The `traceparent` a header's text is, or why it is none.
+pub fn parse(text: String) -> Result<Traceparent, Refusal> =
+  match try[abort.raise] { parsed(bytes_of_string(text)) } {
+    Ok(answer) -> answer,
+    Err(_) -> Err({ why: Short, at: 0 }),
+  }
+
+fn parsed(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
+  let n = bytes_len(raw);
+  if n < 55 { Err({ why: Short, at: n }) } else {
+    match first_misplaced(raw) {
+      Some(refusal) -> Err(refusal),
+      None -> {
+        let version = bytes_slice(raw, 0, 2);
+        if version == b"ff" { Err({ why: Version, at: 0 }) }
+        else if n > 55 && (version == b"00" || bytes_at(raw, 55) != b'-') {
+          Err({ why: Trailing, at: 55 })
+        } else { ids_of(raw) }
+      },
+    }
+  }
+}
+
+/// The first of the 55 characters that is not what version `00` has in its place.
+fn first_misplaced(raw: Bytes) -> Option<Refusal> / {abort.raise} =
+  fold(range(0, 55), None, |found: Option<Refusal>, i: Int| -> Option<Refusal> {
+    match found { Some(_) -> found, None -> misplaced(bytes_at(raw, i), i) }
+  })
+
+fn misplaced(c: Int, i: Int) -> Option<Refusal> =
+  if i == 2 || i == 35 || i == 52 { if c == b'-' { None } else { Some({ why: Dash, at: i }) } }
+  else if is_lower_hex(c) { None }
+  else { Some({ why: Digit, at: i }) }
+
+fn is_lower_hex(c: Int) -> Bool = match c { b'0'..=b'9' | b'a'..=b'f' -> true, _ -> false }
+
+fn ids_of(raw: Bytes) -> Result<Traceparent, Refusal> / {abort.raise} = {
+  let hex_at = |from: Int, to: Int|
+    match hex::decode(string_of_bytes(bytes_slice(raw, from, to))) { Some(b) -> b, None -> b"" };
+  match trace_id(hex_at(3, 35)) {
+    None -> Err({ why: ZeroTrace, at: 3 }),
+    Some(trace) -> match span_id(hex_at(36, 52)) {
+      None -> Err({ why: ZeroParent, at: 36 }),
+      Some(parent) ->
+        Ok({ trace_id: trace, parent_id: parent, flags: bytes_at(hex_at(53, 55), 0) }),
+    },
+  }
+}
+
+/// What a `traceparent"..."` literal is checked by.
+pub fn literal(text: String) -> Result<Traceparent, { message: String, offset: Int }> =
+  match parse(text) {
+    Ok(t) -> Ok(t),
+    Err(r) -> Err({ message: reason(r.why), offset: min(r.at, string_len(text)) }),
+  }
+
+/// A refusal in words.
+pub fn reason(why: Why) -> String =
+  match why {
+    Short -> "a traceparent is 55 characters: `00-`, 32 hex digits, `-`, 16, `-` and 2",
+    Version -> "version `ff` is not a version",
+    Digit -> "a lower-case hex digit goes here",
+    Dash -> "a `-` goes here",
+    ZeroTrace -> "a trace id is not all zeros",
+    ZeroParent -> "a parent id is not all zeros",
+    Trailing -> "nothing follows the flags of version `00`, and only a `-` those of a later one",
+  }
+
+// --- tracestate -------------------------------------------------------------
+
+/// One vendor's entry.
+pub type Entry = new { key: String, value: String }
+
+/// The `tracestate` header: entries in order, the one last written first, each key once.
+pub opaque type Tracestate = | Tracestate(List<Entry>)
+
+show for Tracestate by render_state
+
+gen for Tracestate by tracestates
+
+fn tracestates() -> Gen<Tracestate> =
+  gen::map(
+    gen::list_of(
+      gen::map2(
+        gen::elements(["rojo", "congo", "a", "fw529a3039@dt", "0tenant@sys", "a_b-c*d/e"]),
+        gen::elements(["00f067aa0ba902b7", "t61rcWkgMzE", "x", "a b", "!\"#$%&'()*+-./:;<>?@~"]),
+        |key: String, value: String| -> Entry { { key: key, value: value } },
+      ),
+      6,
+    ),
+    |entries: List<Entry>|
+      fold(entries, empty(), |state: Tracestate, e: Entry|
+        match put(state, e.key, e.value) { Some(next) -> next, None -> state }),
+  )
+
+/// The most entries a `tracestate` holds.
+pub fn max_entries() -> Int = 32
+
+/// The most characters `render_state` writes.
+pub fn max_length() -> Int = 512
+
+/// A `tracestate` with no entry, which is what a new trace starts with.
+pub fn empty() -> Tracestate = Tracestate([])
+
+/// The entries, the one last written first.
+pub fn entries(state: Tracestate) -> List<Entry> = match state { Tracestate(held) -> held }
+
+/// The value under `key`.
+pub fn get(state: Tracestate, key: String) -> Option<String> =
+  fold(entries(state), None, |found: Option<String>, e: Entry|
+    match found { Some(_) -> found, None -> if e.key == key { Some(e.value) } else { None } })
+
+/// `state` with `key` set to `value` and moved to the front, as a participant writes its own
+/// entry; past `max_entries`, the last entry is dropped. `None` for a key or a value outside
+/// the grammar.
+pub fn put(state: Tracestate, key: String, value: String) -> Option<Tracestate> =
+  if !is_key(key) || !is_value(value) { None } else {
+    let rest = entries(remove(state, key));
+    let entry: Entry = { key: key, value: value };
+    Some(
+      Tracestate(
+        take(fold(rest, [entry], |acc: List<Entry>, e: Entry| push(acc, e)), max_entries()),
+      ),
+    )
+  }
+
+/// `state` without the entry under `key`.
+pub fn remove(state: Tracestate, key: String) -> Tracestate =
+  Tracestate(filter(entries(state), |e: Entry| e.key != key))
+
+/// Whether `key` is one a `tracestate` may hold: a lower-case letter and then up to 255 of
+/// lower-case letters, digits and `_-*/`, or `tenant@system`, where the tenant may open with a
+/// digit and holds up to 241 characters and the system up to 14.
+pub fn is_key(key: String) -> Bool =
+  match try[abort.raise] { key_of(bytes_of_string(key)) } { Ok(answer) -> answer, Err(_) -> false }
+
+fn key_of(raw: Bytes) -> Bool / {abort.raise} =
+  match bytes_index_of_byte(raw, b'@') {
+    None -> key_part(raw, 256, false),
+    Some(at) ->
+      key_part(bytes_slice(raw, 0, at), 241, true)
+        && key_part(bytes_slice(raw, at + 1, bytes_len(raw)), 14, false),
+  }
+
+fn key_part(raw: Bytes, most: Int, digit_first: Bool) -> Bool / {abort.raise} = {
+  let n = bytes_len(raw);
+  n >= 1 && n <= most && is_key_start(bytes_at(raw, 0), digit_first)
+    && scan(raw, 0, b"abcdefghijklmnopqrstuvwxyz0123456789_-*/") >= n
+}
+
+fn is_key_start(c: Int, digit_first: Bool) -> Bool =
+  match c { b'a'..=b'z' -> true, b'0'..=b'9' -> digit_first, _ -> false }
+
+/// Whether `value` is one a `tracestate` may hold: up to 256 printable ASCII characters, none
+/// of them `,` or `=`, the last of them not a space.
+pub fn is_value(value: String) -> Bool =
+  match try[abort.raise] { value_of(bytes_of_string(value)) } {
+    Ok(answer) -> answer,
+    Err(_) -> false,
+  }
+
+fn value_of(raw: Bytes) -> Bool / {abort.raise} = {
+  let n = bytes_len(raw);
+  n >= 1 && n <= 256 && bytes_at(raw, n - 1) != b' '
+    && all(range(0, n), |i: Int| is_value_char(bytes_at(raw, i)))
+}
+
+fn is_value_char(c: Int) -> Bool = c >= 0x20 && c <= 0x7E && c != b',' && c != b'='
+
+/// Why a `tracestate` was refused.
+pub type StateWhy =
+  /// An entry with no `=`.
+  | NoValue
+  /// A key outside the grammar.
+  | BadKey
+  /// A value outside the grammar.
+  | BadValue
+  /// A key written twice.
+  | Twice
+  /// More than `max_entries` entries.
+  | TooMany
+
+/// A refusal, and which list member it was refused at, counted from zero.
+pub type StateRefusal = new { why: StateWhy, member: Int }
+
+/// The `tracestate` a header's text is, or why it is none. Several header lines are one text
+/// joined by commas; spaces and tabs around a member, and empty members, are passed over.
+pub fn parse_state(text: String) -> Result<Tracestate, StateRefusal> =
+  match try[abort.raise] { state_of(bytes_split(bytes_of_string(text), b",")) } {
+    Ok(answer) -> answer,
+    Err(_) -> Err({ why: NoValue, member: 0 }),
+  }
+
+fn state_of(members: List<Bytes>) -> Result<Tracestate, StateRefusal> / {abort.raise} = {
+  let start: Result<List<Entry>, StateRefusal> = Ok([]);
+  let read = fold(
+    range(0, len(members)),
+    start,
+    |acc: Result<List<Entry>, StateRefusal>, i: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(held) -> match list_at(members, i) {
+          None -> acc,
+          Some(member) ->
+            member_of(held, bytes_of_string(ascii_trim(string_of_bytes_lossy(member))), i),
+        },
+      },
+  );
+  match read { Ok(held) -> Ok(Tracestate(held)), Err(e) -> Err(e) }
+}
+
+fn member_of(
+  held: List<Entry>,
+  member: Bytes,
+  i: Int,
+) -> Result<List<Entry>, StateRefusal> / {abort.raise} =
+  if bytes_len(member) == 0 { Ok(held) } else {
+    match bytes_index_of_byte(member, b'=') {
+      None -> Err({ why: NoValue, member: i }),
+      Some(at) -> {
+        let key = string_of_bytes_lossy(bytes_slice(member, 0, at));
+        let value = string_of_bytes_lossy(bytes_slice(member, at + 1, bytes_len(member)));
+        if !is_key(key) { Err({ why: BadKey, member: i }) }
+        else if !is_value(value) { Err({ why: BadValue, member: i }) }
+        else if any(held, |e: Entry| e.key == key) { Err({ why: Twice, member: i }) }
+        else if len(held) >= max_entries() { Err({ why: TooMany, member: i }) }
+        else { Ok(push(held, { key: key, value: value })) }
+      },
+    }
+  }
+
+/// The header's text: `key=value` entries joined by commas, in at most `max_length`
+/// characters. Past that, entries longer than 128 characters go first, the last of them
+/// first, and then entries from the end, which is the order the Recommendation gives.
+pub fn render_state(state: Tracestate) -> String =
+  join(map(fitted(entries(state), len(entries(state))), written), ",")
+
+fn written(e: Entry) -> String = e.key ++ "=" ++ e.value
+
+fn length_of(held: List<Entry>) -> Int =
+  fold(held, 0, |n: Int, e: Entry| n + string_len(written(e))) + max(len(held) - 1, 0)
+
+fn fitted(held: List<Entry>, left: Int) -> List<Entry> =
+  if left <= 0 || length_of(held) <= max_length() { held } else {
+    let long = fold(range(0, len(held)), None, |found: Option<Int>, i: Int|
+      match list_at(held, i) {
+        Some(e) -> if string_len(written(e)) > 128 { Some(i) } else { found },
+        None -> found,
+      });
+    let drop = match long { Some(i) -> i, None -> len(held) - 1 };
+    fitted(
+      fold(range(0, len(held)), [], |acc: List<Entry>, i: Int|
+        match list_at(held, i) {
+          Some(e) -> if i == drop { acc } else { push(acc, e) },
+          None -> acc,
+        }),
+      left - 1,
+    )
+  }
+
+// --- A request's context ----------------------------------------------------
+
+/// What a request carries of its trace: both headers.
+pub type Context = new { parent: Traceparent, state: Tracestate }
+
+/// The context a request's `traceparent` and `tracestate` field lines carry, or `None` where it
+/// starts a new trace: no `traceparent`, more than one, or one that is refused. A `tracestate`
+/// that is refused is read as empty, which leaves the trace continued.
+pub fn incoming(traceparents: List<String>, tracestates: List<String>) -> Option<Context> =
+  match traceparents {
+    [only] -> match parse(only) {
+      Ok(parent) ->
+        Some({
+          parent: parent,
+          state: match parse_state(join(tracestates, ",")) {
+            Ok(state) -> state,
+            Err(_) -> empty(),
+          },
+        }),
+      Err(_) -> None,
+    },
+    _ -> None,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+law "a traceparent reads back from its text" forall (t: Traceparent) { parse(render(t)) == Ok(t) }
+
+law "a tracestate reads back from its text"
+  forall (s: Tracestate) {
+    parse_state(render_state(s)) == Ok(s)
+  }
+
+law "ids read back from their hex"
+  forall (t: TraceId, s: SpanId) {
+    (try[abort.raise] { trace_id_of_hex(trace_id_hex(t)) }) == Ok(Some(t))
+      && (try[abort.raise] { span_id_of_hex(span_id_hex(s)) }) == Ok(Some(s))
+  }
+
+law "an entry put is the first entry and the only one under its key"
+  forall (s: Tracestate) {
+    match put(s, "ply", "1") {
+      Some(next) ->
+        get(next, "ply") == Some("1") && len(entries(next)) <= max_entries()
+          && (match entries(next) { [first, ..] -> first.key == "ply", [] -> false })
+          && len(filter(entries(next), |e: Entry| e.key == "ply")) == 1,
+      None -> false,
+    }
+  }
+
+test "the Recommendation's example reads as its parts" {
+  let read = parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+  match read {
+    Ok(t) -> {
+      assert_eq(trace_id_hex(t.trace_id), "4bf92f3577b34da6a3ce929d0e0e4736");
+      assert_eq(span_id_hex(t.parent_id), "00f067aa0ba902b7");
+      assert(sampled(t));
+      assert(!random(t));
+      assert_eq(render(t), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+    },
+    Err(r) -> panic(reason(r.why)),
+  }
+}
+
+type Refused = { name: String, text: String, why: Why, at: Int }
+
+fn refused_parents() -> List<Refused> =
+  [
+    { name: "nothing", text: "", why: Short, at: 0 },
+    {
+      name: "a flag digit short",
+      text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0",
+      why: Short,
+      at: 54,
+    },
+    {
+      name: "version ff",
+      text: "ff-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      why: Version,
+      at: 0,
+    },
+    {
+      name: "an upper-case digit",
+      text: "00-4BF92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      why: Digit,
+      at: 4,
+    },
+    {
+      name: "a version that is no hex",
+      text: "0g-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      why: Digit,
+      at: 1,
+    },
+    {
+      name: "a field one digit long",
+      text: "00-4bf92f3577b34da6a3ce929d0e0e47360-0f067aa0ba902b7-01",
+      why: Dash,
+      at: 35,
+    },
+    {
+      name: "a trace id of zeros",
+      text: "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+      why: ZeroTrace,
+      at: 3,
+    },
+    {
+      name: "a parent id of zeros",
+      text: "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+      why: ZeroParent,
+      at: 36,
+    },
+    {
+      name: "version 00 with more after its flags",
+      text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+      why: Trailing,
+      at: 55,
+    },
+    {
+      name: "a later version with more that no dash opens",
+      text: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01extra",
+      why: Trailing,
+      at: 55,
+    },
+    {
+      name: "flags that are no hex",
+      text: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0x",
+      why: Digit,
+      at: 54,
+    },
+  ]
+
+test "a traceparent is refused: {c.name}" for c: Refused in refused_parents() {
+  assert_eq(parse(c.text), Err({ why: c.why, at: c.at }))
+}
+
+test "a later version is read by its first 55 characters and written back as version 00" {
+  let exact = parse("cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-09");
+  let longer = parse("cc-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-09-what-comes-next");
+  assert_eq(exact, longer);
+  match exact {
+    Ok(t) -> {
+      assert_eq(render(t), "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-09");
+      // A bit nothing defines is read and not passed on.
+      assert_eq(t.flags, 9);
+      match span_id_of_hex("b7ad6b7169203331") {
+        Some(span) ->
+          assert_eq(
+            render(child(t, span)),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+          ),
+        None -> panic("a span id"),
+      }
+    },
+    Err(r) -> panic(reason(r.why)),
+  }
+}
+
+test "the sampled flag is set and cleared without touching the others" {
+  match parse("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02") {
+    Ok(t) -> {
+      assert(random(t));
+      assert(!sampled(t));
+      assert_eq(with_sampled(t, true).flags, 3);
+      assert_eq(with_sampled(with_sampled(t, true), false), t)
+    },
+    Err(r) -> panic(reason(r.why)),
+  }
+}
+
+type KeyCase = { key: String, valid: Bool }
+
+fn keys() -> List<KeyCase> =
+  [
+    { key: "rojo", valid: true },
+    { key: "a", valid: true },
+    { key: "a_b-c*d/e9", valid: true },
+    { key: "fw529a3039@dt", valid: true },
+    { key: "0tenant@sys", valid: true },
+    { key: "", valid: false },
+    { key: "9rojo", valid: false },
+    { key: "Rojo", valid: false },
+    { key: "ro jo", valid: false },
+    { key: "tenant@", valid: false },
+    { key: "@sys", valid: false },
+    { key: "tenant@9sys", valid: false },
+    { key: "tenant@system-id-of-15", valid: false },
+    { key: "a@b@c", valid: false },
+  ]
+
+test "the key `{c.key}` is in the grammar or is not" for c: KeyCase in keys() {
+  assert_eq(is_key(c.key), c.valid)
+}
+
+test "a key and a value are held to their lengths" {
+  assert(is_key(repeat("a", 256)));
+  assert(!is_key(repeat("a", 257)));
+  assert(is_key(repeat("a", 241) ++ "@" ++ repeat("a", 14)));
+  assert(!is_key(repeat("a", 242) ++ "@" ++ repeat("a", 14)));
+  assert(is_value(repeat("a", 256)));
+  assert(!is_value(repeat("a", 257)));
+  assert(!is_value(""));
+  assert(!is_value("ends in a space "));
+  assert(is_value(" opens with one"));
+  assert(!is_value("a,b"));
+  assert(!is_value("a=b"));
+  assert(!is_value("tab\there"))
+}
+
+test "a tracestate is read in order, around its optional white space and empty members" {
+  let read = parse_state("rojo=00f067aa0ba902b7 ,\tcongo=t61rcWkgMzE,, ");
+  match read {
+    Ok(state) -> {
+      assert_eq(map(entries(state), |e: Entry| e.key), ["rojo", "congo"]);
+      assert_eq(get(state, "congo"), Some("t61rcWkgMzE"));
+      assert_eq(get(state, "absent"), None);
+      assert_eq(render_state(state), "rojo=00f067aa0ba902b7,congo=t61rcWkgMzE")
+    },
+    Err(_) -> panic("refused"),
+  }
+}
+
+type StateCase = { name: String, text: String, why: StateWhy, member: Int }
+
+fn refused_states() -> List<StateCase> =
+  [
+    { name: "a member with no value", text: "rojo=1,congo", why: NoValue, member: 1 },
+    { name: "a key in upper case", text: "Rojo=1", why: BadKey, member: 0 },
+    { name: "an empty value", text: "rojo=", why: BadValue, member: 0 },
+    { name: "a value holding an equals sign", text: "rojo=a=b", why: BadValue, member: 0 },
+    { name: "a key written twice", text: "rojo=1,congo=2,rojo=3", why: Twice, member: 2 },
+  ]
+
+test "a tracestate is refused: {c.name}" for c: StateCase in refused_states() {
+  assert_eq(parse_state(c.text), Err({ why: c.why, member: c.member }))
+}
+
+fn numbered(n: Int) -> String =
+  join(map(range(0, n), |i: Int| "k" ++ int_to_string(i) ++ "=v"), ",")
+
+test "a tracestate holds 32 entries and no more" {
+  assert_eq(match parse_state(numbered(32)) { Ok(state) -> len(entries(state)), Err(_) -> -1 }, 32);
+  assert_eq(parse_state(numbered(33)), Err({ why: TooMany, member: 32 }));
+  match parse_state(numbered(32)) {
+    Ok(full) -> match put(full, "mine", "1") {
+      Some(next) -> {
+        assert_eq(len(entries(next)), 32);
+        assert_eq(get(next, "k31"), None);
+        assert_eq(get(next, "mine"), Some("1"))
+      },
+      None -> panic("put"),
+    },
+    Err(_) -> panic("refused"),
+  }
+}
+
+test "an update moves its entry to the front and keeps the others in order" {
+  match parse_state("rojo=1,congo=2,ply=3") {
+    Ok(state) -> match put(state, "congo", "9") {
+      Some(next) -> assert_eq(render_state(next), "congo=9,rojo=1,ply=3"),
+      None -> panic("put"),
+    },
+    Err(_) -> panic("refused"),
+  }
+}
+
+fn wide(key: String, n: Int) -> String = key ++ "=" ++ repeat("a", n)
+
+test "a tracestate past 512 characters loses its long entries first, then its last ones" {
+  let text = join(
+    [wide("a", 120), wide("long", 200), wide("b", 120), wide("c", 120), wide("d", 120)],
+    ",",
+  );
+  match parse_state(text) {
+    Ok(state) -> {
+      assert_eq(len(entries(state)), 5);
+      let out = render_state(state);
+      assert(string_len(out) <= 512);
+      assert_eq(out, join([wide("a", 120), wide("b", 120), wide("c", 120), wide("d", 120)], ","))
+    },
+    Err(_) -> panic("refused"),
+  };
+  let even = join(map(range(0, 6), |i: Int| wide("k" ++ int_to_string(i), 100)), ",");
+  match parse_state(even) {
+    Ok(state) ->
+      assert_eq(
+        render_state(state),
+        join(map(range(0, 4), |i: Int| wide("k" ++ int_to_string(i), 100)), ","),
+      ),
+    Err(_) -> panic("refused"),
+  }
+}
+
+test "a request continues the trace its headers name, or starts one" {
+  let parent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+  match incoming([parent], ["rojo=1", "congo=2"]) {
+    Some(context) -> {
+      assert_eq(render(context.parent), parent);
+      assert_eq(render_state(context.state), "rojo=1,congo=2")
+    },
+    None -> panic("a context"),
+  };
+  // A tracestate that does not read leaves the trace continued, with no entries.
+  assert_eq(
+    match incoming([parent], ["Rojo=1"]) {
+      Some(context) -> len(entries(context.state)),
+      None -> -1,
+    },
+    0,
+  );
+  assert_eq(incoming([], ["rojo=1"]), None);
+  assert_eq(incoming([parent, parent], []), None);
+  assert_eq(incoming(["00-00000000000000000000000000000000-00f067aa0ba902b7-01"], []), None)
+}
+
+test "an id is drawn from entropy, and a seeded stream draws the same one" {
+  let first = try[abort.raise] { rand_trace_id(rand(7)) };
+  match first {
+    Ok(drawn) -> {
+      assert_eq(bytes_len(trace_id_bytes(drawn.value)), 16);
+      assert_eq(try[abort.raise] { with_rand(rand(7), new_trace_id).value }, Ok(drawn.value));
+      let span = try[abort.raise] { rand_span_id(drawn.rand).value };
+      assert_eq(match span { Ok(id) -> bytes_len(span_id_bytes(id)), Err(_) -> -1 }, 8)
+    },
+    Err(m) -> panic(m),
+  };
+  // The draw that is all zeros is answered as an id.
+  let zeros = try[abort.raise] { handle { new_span_id() } with { entropy.next() -> 0 } };
+  assert_eq(match zeros { Ok(id) -> span_id_hex(id), Err(_) -> "" }, "0000000000000001")
+}

@@ -1,0 +1,145 @@
+//! `std.unicode`'s case mappings and foldings against `SpecialCasing.txt`, `CaseFolding.txt` and
+//! `UnicodeData.txt`, over every code point, and against the prelude's `string_upper` and
+//! `string_lower` over the texts of the normalization test, which hold marks, ligatures and
+//! Greek in every arrangement; the same texts are held to what folding and caseless matching
+//! promise of any text. A code point the files give a mapping is asked alone; the rest, which
+//! map to themselves whatever stands beside them, are asked a few thousand to a text.
+
+import std.list (at)
+import std.unicode
+import std.utf16
+import std.utf16 (BigEndian, LittleEndian)
+import ucd_files
+import ucd_files (Row, Span, Stretch, hexes, listed_unlike, rows, text, text_of, unicode_data,
+                  unlisted)
+import unicode_normalization (Line, lines)
+
+/// The mappings of a code point: `None` for one that is the code point itself.
+type Mapped = { lower: Option<List<Int>>, title: Option<List<Int>>, upper: Option<List<Int>> }
+
+fn one(field: Bytes) -> Option<List<Int>> / {abort.raise} =
+  if bytes_len(field) == 0 { None } else { Some(hexes(field)) }
+
+/// What each code point with a mapping maps to in full: `SpecialCasing.txt`'s rows that hold
+/// under no condition, and for the rest the simple mappings of `UnicodeData.txt`.
+fn full_mappings() -> List<Stretch<Mapped>> / {abort.raise} = {
+  let special = fold(
+    rows(ucd_files::special_casing()),
+    map_new(),
+    |known: Map<Int, Mapped>, row: Row|
+      if len(row.fields) != 4 { known } else {
+        map_insert(known, row.first, {
+          lower: one(at(row.fields, 0)),
+          title: one(at(row.fields, 1)),
+          upper: one(at(row.fields, 2)),
+        })
+      },
+  );
+  fold(unicode_data(), [], |found: List<Stretch<Mapped>>, row: Row| {
+    let simple = {
+      lower: one(at(row.fields, 13)),
+      title: one(at(row.fields, 14)),
+      upper: one(at(row.fields, 12)),
+    };
+    match map_get(special, row.first) {
+      Some(mapped) -> push(found, { first: row.first, last: row.last, said: mapped }),
+      None -> if simple.lower == None && simple.title == None && simple.upper == None { found }
+      else { push(found, { first: row.first, last: row.last, said: simple }) },
+    }
+  })
+}
+
+test "every code point alone maps to each case in full as SpecialCasing.txt and UnicodeData.txt say" {
+  let mappings = full_mappings();
+  let wrong = listed_unlike(mappings, |cp: Int, mapped: Mapped| {
+    let alone = text([cp]);
+    let to = |mapping: Option<List<Int>>|
+      match mapping { Some(points) -> text(points), None -> alone };
+    unicode::lowercase(alone) == to(mapped.lower) && unicode::titlecase(alone) == to(mapped.title)
+      && unicode::uppercase(alone) == to(mapped.upper)
+  });
+  let moved = filter(unlisted(mappings, 4096), |span: Span| {
+    let whole = text_of(span);
+    unicode::lowercase(whole) != whole || unicode::uppercase(whole) != whole
+      || unicode::titlecase(whole) != whole
+  });
+  assert_eq({ wrong: wrong, moved: moved }, { wrong: [], moved: [] })
+}
+
+/// What a code point folds to, by each status of `CaseFolding.txt` that lists it.
+type Folded = {
+  common: Option<List<Int>>,
+  full: Option<List<Int>>,
+  simple: Option<List<Int>>,
+  turkic: Option<List<Int>>,
+}
+
+fn foldings() -> List<Stretch<Folded>> / {abort.raise} = {
+  let none = { common: None, full: None, simple: None, turkic: None };
+  let known = fold(rows(ucd_files::case_folding()), map_new(), |all: Map<Int, Folded>, row: Row| {
+    let so_far = match map_get(all, row.first) { Some(f) -> f, None -> none };
+    let to = Some(hexes(at(row.fields, 1)));
+    map_insert(all, row.first, match at(row.fields, 0) {
+      b"C" -> { ..so_far, common: to },
+      b"F" -> { ..so_far, full: to },
+      b"S" -> { ..so_far, simple: to },
+      b"T" -> { ..so_far, turkic: to },
+      _ -> panic("a folding's status is C, F, S or T"),
+    })
+  });
+  map(map_entries(known), |e: { key: Int, value: Folded }|
+    { first: e.key, last: e.key, said: e.value })
+}
+
+test "every code point alone folds as CaseFolding.txt says, in full, simply and for Turkic" {
+  let listed = foldings();
+  let wrong = listed_unlike(listed, |cp: Int, f: Folded| {
+    let alone = text([cp]);
+    let to = |choices: List<Option<List<Int>>>|
+      match fold(choices, None, |found: Option<List<Int>>, choice: Option<List<Int>>|
+          match found { Some(_) -> found, None -> choice }) {
+        Some(points) -> text(points),
+        None -> alone,
+      };
+    unicode::case_fold(alone) == to([f.common, f.full])
+      && unicode::simple_case_fold(alone) == to([f.common, f.simple])
+      && unicode::case_fold(alone, turkic: true) == to([f.turkic, f.common, f.full])
+      && unicode::simple_case_fold(alone, turkic: true) == to([f.turkic, f.common, f.simple])
+  });
+  let moved = filter(unlisted(listed, 4096), |span: Span| {
+    let whole = text_of(span);
+    unicode::case_fold(whole) != whole || unicode::simple_case_fold(whole) != whole
+      || unicode::case_fold(whole, turkic: true) != whole
+      || unicode::simple_case_fold(whole, turkic: true) != whole
+  });
+  assert_eq({ wrong: wrong, moved: moved }, { wrong: [], moved: [] })
+}
+
+test "the full mappings of the normalization test's texts are the prelude's" {
+  let unlike_prelude = |t: String|
+    unicode::uppercase(t) != string_upper(t) || unicode::lowercase(t) != string_lower(t);
+  let wrong = filter(lines(), |l: Line|
+    unlike_prelude(l.source) || unlike_prelude(l.nfd) || unlike_prelude(l.nfkc));
+  assert_eq(map(wrong, |l: Line| ucd_files::spelled(l.source)), [])
+}
+
+test "the caseless key of every code point, a few thousand to a text, is folded and decomposed" {
+  let every: List<Stretch<Unit>> = [];
+  let unsettled = filter(unlisted(every, 4096), |span: Span| {
+    let key = unicode::caseless_key(text_of(span));
+    unicode::case_fold(key) != key || unicode::nfd(key) != key
+  });
+  assert_eq(unsettled, [])
+}
+
+test "the normalization test's texts fold once, match their canonical forms whatever their case, and read back from UTF-16" {
+  let wrong = filter(lines(), |l: Line| {
+    let folded = unicode::case_fold(l.nfd);
+    unicode::case_fold(folded) != folded || !unicode::caseless(l.source, l.nfc)
+      || !unicode::caseless(l.source, folded)
+      || !unicode::caseless(l.nfd, l.nfc, turkic: true)
+      || utf16::decode(utf16::encode(l.source, LittleEndian, marked: true), BigEndian, marked: true)
+      != Ok(l.source)
+  });
+  assert_eq(map(wrong, |l: Line| ucd_files::spelled(l.source)), [])
+}

@@ -1,0 +1,488 @@
+//! Where a text may be cut: its grapheme clusters, which are what a reader takes for characters,
+//! and its words.
+//!
+//! A `Char` is a code point, and a reader's character is often several: a letter and its accents,
+//! a Hangul syllable written as its letters, an emoji joined of others, a flag, a consonant
+//! cluster of an Indic script. `graphemes` cuts a text into those, the extended grapheme clusters
+//! of UAX #29, so that reversing, truncating or counting a text by them never parts what is
+//! drawn as one. `split_words` cuts a text at the word boundaries of the same annex, every
+//! character falling in some segment, and `words` keeps the segments that hold a letter or a
+//! number. The rules are the default ones, tailored to no language: a script written without
+//! spaces between words, as Thai or Chinese is, is not divided into its words.
+//!
+//! A boundary is a place between characters, counted in characters from the start, as
+//! `string_slice` counts: a text of `n` has boundaries at `0` and `n` unless it is empty, and
+//! the segments between one boundary and the next are the text. The table is `std.ucd`'s, of
+//! the Unicode version it names.
+
+import std.char
+import std.char (drawn_text)
+import std.laws (agrees)
+import std.list (all, any)
+import std.ucd
+import std.ucd (Table)
+
+// --- The table --------------------------------------------------------------------
+
+/// A Grapheme_Cluster_Break, by the number a word holds in its low four bits. The last five are
+/// the conjoining Hangul letters and the syllables made of them, open (LV) and closed (LVT).
+type Grapheme =
+  | AnyGrapheme
+  | Cr
+  | Lf
+  | Control
+  | Extend
+  | Zwj
+  | Regional
+  | Prepend
+  | SpacingMark
+  | Leading
+  | Vowel
+  | Trailing
+  | Open
+  | Closed
+
+fn grapheme_number(name: Bytes) -> Int / {abort.raise} =
+  match name {
+    b"" -> 0,
+    b"CR" -> 1,
+    b"LF" -> 2,
+    b"Control" -> 3,
+    b"Extend" -> 4,
+    b"ZWJ" -> 5,
+    b"Regional_Indicator" -> 6,
+    b"Prepend" -> 7,
+    b"SpacingMark" -> 8,
+    b"L" -> 9,
+    b"V" -> 10,
+    b"T" -> 11,
+    b"LV" -> 12,
+    b"LVT" -> 13,
+    _ -> panic(f"`{string_of_bytes_lossy(name)}` is no Grapheme_Cluster_Break"),
+  }
+
+fn grapheme_at(number: Int) -> Grapheme =
+  match number {
+    1 -> Cr,
+    2 -> Lf,
+    3 -> Control,
+    4 -> Extend,
+    5 -> Zwj,
+    6 -> Regional,
+    7 -> Prepend,
+    8 -> SpacingMark,
+    9 -> Leading,
+    10 -> Vowel,
+    11 -> Trailing,
+    12 -> Open,
+    13 -> Closed,
+    _ -> AnyGrapheme,
+  }
+
+/// A Word_Break, by the number a word holds in the five bits above its grapheme's.
+type Word =
+  | AnyWord
+  | WCr
+  | WLf
+  | Newline
+  | WExtend
+  | WZwj
+  | WRegional
+  | Format
+  | Katakana
+  | HebrewLetter
+  | ALetter
+  | SingleQuote
+  | DoubleQuote
+  | MidNumLet
+  | MidLetter
+  | MidNum
+  | Numeric
+  | ExtendNumLet
+  | WSegSpace
+
+fn word_number(name: Bytes) -> Int / {abort.raise} =
+  match name {
+    b"" -> 0,
+    b"CR" -> 1,
+    b"LF" -> 2,
+    b"Newline" -> 3,
+    b"Extend" -> 4,
+    b"ZWJ" -> 5,
+    b"Regional_Indicator" -> 6,
+    b"Format" -> 7,
+    b"Katakana" -> 8,
+    b"Hebrew_Letter" -> 9,
+    b"ALetter" -> 10,
+    b"Single_Quote" -> 11,
+    b"Double_Quote" -> 12,
+    b"MidNumLet" -> 13,
+    b"MidLetter" -> 14,
+    b"MidNum" -> 15,
+    b"Numeric" -> 16,
+    b"ExtendNumLet" -> 17,
+    b"WSegSpace" -> 18,
+    _ -> panic(f"`{string_of_bytes_lossy(name)}` is no Word_Break"),
+  }
+
+fn word_at(number: Int) -> Word =
+  match number {
+    1 -> WCr,
+    2 -> WLf,
+    3 -> Newline,
+    4 -> WExtend,
+    5 -> WZwj,
+    6 -> WRegional,
+    7 -> Format,
+    8 -> Katakana,
+    9 -> HebrewLetter,
+    10 -> ALetter,
+    11 -> SingleQuote,
+    12 -> DoubleQuote,
+    13 -> MidNumLet,
+    14 -> MidLetter,
+    15 -> MidNum,
+    16 -> Numeric,
+    17 -> ExtendNumLet,
+    18 -> WSegSpace,
+    _ -> AnyWord,
+  }
+
+fn pictographic() -> Int = 0x200
+
+fn conjunct_consonant() -> Int = 0x400
+
+fn conjunct_extend() -> Int = 0x800
+
+fn conjunct_linker() -> Int = 0x1000
+
+/// The bit of the flag a table's letter stands for.
+fn flag(letter: Int) -> Int / {abort.raise} =
+  match letter {
+    b'P' -> pictographic(),
+    b'C' -> conjunct_consonant(),
+    b'E' -> conjunct_extend(),
+    b'L' -> conjunct_linker(),
+    _ -> panic("a break flag is P, C, E or L"),
+  }
+
+/// The word of one line of `ucd/breaks.txt`, `grapheme;word;flags`.
+fn break_word(fields: List<Bytes>) -> Int / {abort.raise} = {
+  let field = |i: Int| match list_at(fields, i) { Some(text) -> text, None -> b"" };
+  fold(
+    range(0, bytes_len(field(2))),
+    grapheme_number(field(0)) | word_number(field(1)) << 4,
+    |bits: Int, i: Int| bits | flag(bytes_at(field(2), i)),
+  )
+}
+
+/// A word a code point: its Grapheme_Cluster_Break, its Word_Break and its flags.
+const fn breaks() -> Table = ucd::table(embed("ucd/breaks.txt"), 0, break_word)
+
+/// The words of `text`'s characters.
+fn read(text: String) -> List<Int> = {
+  let held = breaks();
+  map(string_chars(text), |c: Char| ucd::lookup(held, int_of_char(c)))
+}
+
+// --- Grapheme clusters ------------------------------------------------------------
+
+/// What the rules have seen of a text up to a character: the break class of the last, whether
+/// the regional indicators ending there are an odd number, how far a pictograph's joiner has
+/// come (`1` after the pictograph and what extends it, `2` after its joiner), and how far a
+/// conjunct has (`1` after its consonant, `2` once a linker has followed).
+type Cluster = { last: Grapheme, odd: Bool, joining: Int, conjunct: Int }
+
+fn is_break(g: Grapheme) -> Bool = g == Control || g == Cr || g == Lf
+
+/// Whether a cluster ends between what `seen` describes and a character whose word is `word`:
+/// rules GB3 to GB999 of UAX #29, in their order.
+fn parts(seen: Cluster, word: Int) -> Bool = {
+  let next = grapheme_at(word & 15);
+  if seen.last == Cr && next == Lf { false }
+  else if is_break(seen.last) || is_break(next) { true }
+  else if seen.last == Leading
+      && (next == Leading || next == Vowel || next == Open || next == Closed) { false }
+  else if (seen.last == Open || seen.last == Vowel) && (next == Vowel || next == Trailing) { false }
+  else if (seen.last == Closed || seen.last == Trailing) && next == Trailing { false }
+  else if next == Extend || next == Zwj || next == SpacingMark || seen.last == Prepend { false }
+  else if seen.conjunct == 2 && word & conjunct_consonant() != 0 { false }
+  else if seen.joining == 2 && word & pictographic() != 0 { false }
+  else { !(seen.last == Regional && next == Regional && seen.odd) }
+}
+
+/// What the rules have seen once the character whose word is `word` is passed.
+fn past(seen: Cluster, word: Int) -> Cluster = {
+  let next = grapheme_at(word & 15);
+  {
+    last: next,
+    odd: next == Regional && !(seen.last == Regional && seen.odd),
+    joining: if word & pictographic() != 0 { 1 }
+    else if seen.joining == 1 && next == Extend { 1 }
+    else if seen.joining == 1 && next == Zwj { 2 }
+    else { 0 },
+    conjunct: if word & conjunct_consonant() != 0 { 1 }
+    else if seen.conjunct > 0 && word & conjunct_linker() != 0 { 2 }
+    else if seen.conjunct > 0 && word & conjunct_extend() != 0 { seen.conjunct }
+    else { 0 },
+  }
+}
+
+/// The boundaries found, the place of the next character, and what the rules have seen.
+type Cutting = { at: List<Int>, place: Int, seen: Cluster }
+
+/// The grapheme cluster boundaries of `text`, rising: the places, counted in characters, where
+/// one extended grapheme cluster ends and the next begins, the start and the end of the text
+/// among them. None for the empty text.
+pub fn grapheme_boundaries(text: String) -> List<Int> = {
+  let cut = fold(
+    read(text),
+    { at: [], place: 0, seen: { last: AnyGrapheme, odd: false, joining: 0, conjunct: 0 } },
+    |so_far: Cutting, word: Int|
+      {
+        at: if so_far.place == 0 || parts(so_far.seen, word) { push(so_far.at, so_far.place) }
+        else { so_far.at },
+        place: so_far.place + 1,
+        seen: past(so_far.seen, word),
+      },
+  );
+  if cut.place == 0 { [] } else { push(cut.at, cut.place) }
+}
+
+/// The pieces of `text` between each of `boundaries` and the next.
+fn pieces(text: String, boundaries: List<Int>) -> List<String> = {
+  let chars = array_of_list(string_chars(text));
+  match boundaries {
+    [] -> [],
+    [first, ..rest] ->
+      fold(
+        rest,
+        { out: [], from: first },
+        |so_far: { out: List<String>, from: Int }, to: Int|
+          {
+            out: push(
+              so_far.out,
+              string_of_chars(
+                fold(range(so_far.from, to), [], |piece: List<Char>, i: Int|
+                  match array_at(chars, i) { Some(c) -> push(piece, c), None -> piece }),
+              ),
+            ),
+            from: to,
+          },
+      ).out,
+  }
+}
+
+/// The extended grapheme clusters of `text`, in order: what a reader takes for its characters.
+/// Joined, they are the text.
+pub fn graphemes(text: String) -> List<String> = pieces(text, grapheme_boundaries(text))
+
+/// How many extended grapheme clusters `text` is: its length as a reader counts it.
+pub fn grapheme_count(text: String) -> Int = {
+  let boundaries = grapheme_boundaries(text);
+  if len(boundaries) == 0 { 0 } else { len(boundaries) - 1 }
+}
+
+// --- Words ------------------------------------------------------------------------
+
+fn is_newline(w: Word) -> Bool = w == Newline || w == WCr || w == WLf
+
+/// Whether a character of this class is passed over where it follows another, by rule WB4.
+fn is_ignored(w: Word) -> Bool = w == WExtend || w == Format || w == WZwj
+
+fn is_letter(w: Word) -> Bool = w == ALetter || w == HebrewLetter
+
+fn is_mid_letter(w: Word) -> Bool = w == MidLetter || w == MidNumLet || w == SingleQuote
+
+fn is_mid_number(w: Word) -> Bool = w == MidNum || w == MidNumLet || w == SingleQuote
+
+/// The class of the first character from `i` on that rule WB4 does not pass over, or `AnyWord`
+/// where there is none.
+fn following(words: Array<Int>, i: Int) -> Word =
+  match array_at(words, i) {
+    None -> AnyWord,
+    Some(word) -> {
+      let class = word_at(word >> 4 & 31);
+      if is_ignored(class) { following(words, i + 1) } else { class }
+    },
+  }
+
+/// What the rules have seen of a text up to a character: the class of the character itself, the
+/// classes of the last two that rule WB4 did not pass over, and whether the regional indicators
+/// ending there are an odd number.
+type Phrase = { raw: Word, last: Word, before: Word, odd: Bool }
+
+/// Whether a word ends between what `seen` describes and the character at `i`: rules WB3 to
+/// WB999 of UAX #29, in their order.
+fn ends(seen: Phrase, words: Array<Int>, i: Int, word: Int) -> Bool = {
+  let next = word_at(word >> 4 & 31);
+  if seen.raw == WCr && next == WLf { false }
+  else if is_newline(seen.raw) || is_newline(next) { true }
+  else if seen.raw == WZwj && word & pictographic() != 0 { false }
+  else if seen.raw == WSegSpace && next == WSegSpace { false }
+  else if is_ignored(next) { false }
+  else { ends_plainly(seen, next, following(words, i + 1)) }
+}
+
+/// Rules WB5 to WB999, between the last character not passed over, the one before it, the next
+/// and the one after that.
+fn ends_plainly(seen: Phrase, next: Word, after: Word) -> Bool =
+  if is_letter(seen.last) && is_letter(next) { false }
+  else if is_letter(seen.last) && is_mid_letter(next) && is_letter(after) { false }
+  else if is_letter(seen.before) && is_mid_letter(seen.last) && is_letter(next) { false }
+  else if seen.last == HebrewLetter && next == SingleQuote { false }
+  else if seen.last == HebrewLetter && next == DoubleQuote && after == HebrewLetter { false }
+  else if seen.before == HebrewLetter && seen.last == DoubleQuote && next == HebrewLetter { false }
+  else { ends_among_numbers(seen, next, after) }
+
+fn ends_among_numbers(seen: Phrase, next: Word, after: Word) -> Bool = {
+  let joins = |w: Word| is_letter(w) || w == Numeric || w == Katakana;
+  if seen.last == Numeric && (next == Numeric || is_letter(next)) { false }
+  else if is_letter(seen.last) && next == Numeric { false }
+  else if seen.before == Numeric && is_mid_number(seen.last) && next == Numeric { false }
+  else if seen.last == Numeric && is_mid_number(next) && after == Numeric { false }
+  else if seen.last == Katakana && next == Katakana { false }
+  else if (joins(seen.last) || seen.last == ExtendNumLet) && next == ExtendNumLet { false }
+  else if seen.last == ExtendNumLet && joins(next) { false }
+  else { !(seen.last == WRegional && next == WRegional && seen.odd) }
+}
+
+/// What the rules have seen once a character of class `next` is passed: one rule WB4 passes
+/// over changes nothing but the class of the last character, unless it opens a line.
+fn passed(seen: Phrase, next: Word, opens: Bool) -> Phrase =
+  if is_ignored(next) && !opens {
+    { raw: next, last: seen.last, before: seen.before, odd: seen.odd }
+  } else {
+    {
+      raw: next,
+      last: next,
+      before: seen.last,
+      odd: next == WRegional && !(seen.last == WRegional && seen.odd),
+    }
+  }
+
+/// The boundaries found, the place of the next character, and what the rules have seen.
+type Wording = { at: List<Int>, place: Int, seen: Phrase }
+
+/// The word boundaries of `text`, rising: the places, counted in characters, where the default
+/// word segmentation of UAX #29 allows a break, the start and the end of the text among them.
+/// None for the empty text.
+pub fn word_boundaries(text: String) -> List<Int> = {
+  let words = array_of_list(read(text));
+  let cut = fold(
+    range(0, array_len(words)),
+    { at: [], place: 0, seen: { raw: AnyWord, last: AnyWord, before: AnyWord, odd: false } },
+    |so_far: Wording, i: Int|
+      match array_at(words, i) {
+        None -> so_far,
+        Some(word) -> {
+          let opens = i == 0 || is_newline(so_far.seen.raw);
+          {
+            at: if i == 0 || ends(so_far.seen, words, i, word) { push(so_far.at, i) }
+            else { so_far.at },
+            place: i + 1,
+            seen: passed(so_far.seen, word_at(word >> 4 & 31), opens),
+          }
+        },
+      },
+  );
+  if cut.place == 0 { [] } else { push(cut.at, cut.place) }
+}
+
+/// The segments of `text` between its word boundaries, in order: words, and between them the
+/// spaces and punctuation, each a segment or several. Joined, they are the text.
+pub fn split_words(text: String) -> List<String> = pieces(text, word_boundaries(text))
+
+/// The words of `text`: the segments `split_words` answers that hold a letter or a number, in
+/// order, without what stands between them.
+pub fn words(text: String) -> List<String> =
+  filter(split_words(text), |segment: String| any(string_chars(segment), char::is_alphanumeric))
+
+// --- Laws -------------------------------------------------------------------------
+
+/// Whether `boundaries` are those of a text of `length` characters: none for the empty text,
+/// and otherwise rising from `0` to `length`.
+fn rise(boundaries: List<Int>, length: Int) -> Bool =
+  if length == 0 { len(boundaries) == 0 } else {
+    list_at(boundaries, 0) == Some(0) && list_at(boundaries, len(boundaries) - 1) == Some(length)
+      && all(range(1, len(boundaries)), |i: Int|
+        match ((list_at(boundaries, i - 1), list_at(boundaries, i))) {
+          (Some(before), Some(after)) -> before < after,
+          _ -> false,
+        })
+  }
+
+law "a text's clusters joined are the text, and so are its word segments"
+  forall (seed: Int) {
+    let text = drawn_text(seed);
+    let joined = |segments: List<String>| fold(segments, "", |all: String, s: String| all ++ s);
+    joined(graphemes(text)) == text && joined(split_words(text)) == text
+  }
+
+law "boundaries rise from the start of a text to its end"
+  forall (seed: Int) {
+    let text = drawn_text(seed);
+    rise(grapheme_boundaries(text), string_len(text))
+      && rise(word_boundaries(text), string_len(text))
+  }
+
+law "a cluster cut from a text is one cluster by itself"
+  forall (seed: Int) {
+    all(graphemes(drawn_text(seed)), |cluster: String| graphemes(cluster) == [cluster])
+  }
+
+law "a text is as many clusters as grapheme_count says" =
+  agrees(|seed: Int| grapheme_count(drawn_text(seed)), |seed: Int| len(graphemes(drawn_text(seed))))
+
+law "a text is cut in steps that grow with its length alone"
+  forall (n: Int) where n > 0 cost n {
+    let text = string_of_chars(map(range(0, n), |i: Int| if i % 3 == 0 { '\u{301}' } else { 'e' }));
+    [len(grapheme_boundaries(text)), len(word_boundaries(text))]
+  }
+
+// --- Tests ------------------------------------------------------------------------
+
+test "a cluster is a letter with its marks, a syllable of its letters, or a line break of two" {
+  assert_eq(graphemes("e\u{301}a"), ["e\u{301}", "a"]);
+  assert_eq(graphemes("\u{1100}\u{1161}\u{11A8}\u{AC00}"), [
+    "\u{1100}\u{1161}\u{11A8}",
+    "\u{AC00}",
+  ]);
+  assert_eq(graphemes("a\r\nb"), ["a", "\r\n", "b"]);
+  assert_eq(graphemes("\n\u{301}"), ["\n", "\u{301}"]);
+  assert_eq(graphemes("\u{915}\u{94D}\u{937}\u{93F}"), ["\u{915}\u{94D}\u{937}\u{93F}"]);
+  assert_eq(graphemes("\u{915}\u{937}"), ["\u{915}", "\u{937}"]);
+  assert_eq(graphemes(""), []);
+  assert_eq(grapheme_boundaries("e\u{301}a"), [0, 2, 3]);
+  assert_eq(grapheme_boundaries(""), []);
+  assert_eq(grapheme_count("e\u{301}a"), 2);
+  assert_eq(grapheme_count(""), 0)
+}
+
+test "an emoji joined of others, one with a modifier and a flag are each one cluster" {
+  assert_eq(graphemes("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}!"), [
+    "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+    "!",
+  ]);
+  assert_eq(graphemes("\u{1F44D}\u{1F3FD}"), ["\u{1F44D}\u{1F3FD}"]);
+  assert_eq(graphemes("\u{2764}\u{FE0F}x"), ["\u{2764}\u{FE0F}", "x"]);
+  assert_eq(graphemes("\u{1F1E9}\u{1F1EA}\u{1F1EB}\u{1F1F7}"), [
+    "\u{1F1E9}\u{1F1EA}",
+    "\u{1F1EB}\u{1F1F7}",
+  ]);
+  assert_eq(graphemes("\u{1F1E9}\u{1F1EA}\u{1F1EB}"), ["\u{1F1E9}\u{1F1EA}", "\u{1F1EB}"]);
+  assert_eq(graphemes("a\u{200D}\u{1F469}"), ["a\u{200D}", "\u{1F469}"])
+}
+
+test "words keep their apostrophes and decimal points, and what is between words is segments too" {
+  assert_eq(split_words("can't stop"), ["can't", " ", "stop"]);
+  assert_eq(split_words("3.14, 1,000"), ["3.14", ",", " ", "1,000"]);
+  assert_eq(split_words("a.b a. b"), ["a.b", " ", "a", ".", " ", "b"]);
+  assert_eq(split_words("snake_case x1"), ["snake_case", " ", "x1"]);
+  assert_eq(split_words("a  b\r\nc"), ["a", "  ", "b", "\r\n", "c"]);
+  assert_eq(words("Hello, wor\u{301}ld! 42"), ["Hello", "wor\u{301}ld", "42"]);
+  assert_eq(words("\u{4E2D}\u{6587}"), ["\u{4E2D}", "\u{6587}"]);
+  assert_eq(words(" ... "), []);
+  assert_eq(word_boundaries("can't stop"), [0, 5, 6, 10]);
+  assert_eq(word_boundaries(""), [])
+}

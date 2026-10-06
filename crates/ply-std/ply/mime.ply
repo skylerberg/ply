@@ -15,6 +15,11 @@
 //! range covers a type, `quality` reads the weight an `Accept` field gives one and `read_list`
 //! reads such a field. Choosing among ranges is `std.http`'s.
 //!
+//! Mail writes a parameter's value that is long or outside ASCII as RFC 2231 has it: in sections,
+//! `name*0`, `name*1`, and with a charset, `name*` or `name*0*`. A reader answers those parameters
+//! as they are written; `joined` answers each such value whole under its name, and `sectioned`
+//! writes one.
+//!
 //! `of_extension` and `of_path` answer the type a file name's extension names, and `extension` and
 //! `extensions` the extensions a type is written under. The table is this module's own, never the
 //! host's, so an answer is the same on every machine: about four hundred types a web server or an
@@ -24,9 +29,11 @@
 //! sniffs can be told another type by the bytes, which is what `X-Content-Type-Options: nosniff`
 //! turns off.
 
-import std.bytes (peek, scan, scan_until)
+import std.bytes (int_of_ascii, peek, scan, scan_until)
+import std.encoded_word
+import std.encoded_word (Section, decode_sections, encode_sections)
 import std.laws (agrees, idempotent)
-import std.list (contains, sort)
+import std.list (contains, enumerate, sort, sort_by)
 import std.path
 import std.show (show)
 import std.string (ascii_lower, ascii_upper, int_of_string, pad_right)
@@ -65,10 +72,20 @@ pub type Why =
 /// A refusal, and the byte of the text's UTF-8 it was found at.
 pub type Refusal = { at: Int, why: Why }
 
+/// Why parameters are not each one value, read as RFC 2231 writes a value in sections.
+pub type Unjoined =
+  /// The sections of the parameter of this name do not count up from `0` one at a time, or the
+  /// parameter is written both with a charset alone and in sections.
+  | BadSections(String)
+  /// The value of the parameter of this name cannot be read, and why `std.encoded_word` says so.
+  | BadValue(String, encoded_word::Why)
+
 /// What a reader of this module raises where it refuses.
 pub effect mime {
   /// The text is no media type.
   raise refused(e: Refusal)
+  /// The parameters are not each one value.
+  raise unjoined(e: Unjoined)
 }
 
 // --- Reading ----------------------------------------------------------------
@@ -250,8 +267,12 @@ pub fn render(m: MediaType) -> String =
   match m {
     MediaType(top, subtype, held) ->
       fold(held, ascii_lower(top) ++ "/" ++ ascii_lower(subtype), |acc: String, p: Param|
-        acc ++ "; " ++ ascii_lower(p.name) ++ "=" ++ written(p.value)),
+        acc ++ "; " ++ param_text(p)),
   }
+
+/// One parameter as `render` writes it: its name in lower case, `=`, and its value, in quotes
+/// where it is no token.
+pub fn param_text(p: Param) -> String = ascii_lower(p.name) ++ "=" ++ written(p.value)
 
 fn written(value: String) -> String =
   if is_token(value) { value } else {
@@ -413,6 +434,125 @@ fn weight(q: String) -> Option<Int> / {abort.raise} = {
     }
   }
 }
+
+// --- Values in sections -----------------------------------------------------
+
+/// `held` with each value RFC 2231 writes in sections or with a charset as one parameter under
+/// its name alone, raising `mime.unjoined` where `join` answers `Err`. `name*0`, `name*1` and on
+/// are one value's sections, in the order they count whatever order they are written in; a
+/// section named with a trailing `*`, and `name*` on its own, is percent-encoded, the first
+/// opening with the charset and the language its bytes are read in. The parameter stands where
+/// the first of its sections stood, and a parameter written under the plain name beside them is
+/// passed over, as RFC 6266 has a reader prefer the extended one. Every other parameter is
+/// answered as it is.
+pub fn joined(held: List<Param>) -> List<Param> / {mime.unjoined, abort.raise} = {
+  let read = map(held, sectioned_name);
+  let groups = fold(read, map_new(), |m: Map<String, List<Sectioned>>, n: Sectioned|
+    map_insert(m, n.base, push(match map_get(m, n.base) { Some(found) -> found, None -> [] }, n)));
+  fold(read, { out: [], seen: map_new() }, |j: Joining, n: Sectioned|
+    if map_contains(j.seen, n.base) { j } else {
+      {
+        out: push(
+          j.out,
+          whole(n.base, match map_get(groups, n.base) { Some(found) -> found, None -> [] }),
+        ),
+        seen: map_insert(j.seen, n.base, ()),
+      }
+    }).out
+}
+
+/// `held` with each value written in sections or with a charset as one parameter, or why they
+/// are not each one value.
+pub fn join(held: List<Param>) -> Result<List<Param>, Unjoined> / {abort.raise} =
+  try { joined(held) }
+
+/// A parameter as RFC 2231 reads its name: the name before any `*`, the section it is (`-1` for
+/// a value written whole), and whether it is extended. `starred` says the name was one of RFC
+/// 2231's at all.
+type Sectioned = { base: String, index: Int, extended: Bool, starred: Bool, value: String }
+
+type Joining = { out: List<Param>, seen: Map<String, Unit> }
+
+fn sectioned_name(p: Param) -> Sectioned / {abort.raise} = {
+  let plain = { base: p.name, index: -1, extended: false, starred: false, value: p.value };
+  match string_split(p.name, "*") {
+    [base, ""] -> if base == "" { plain }
+    else { { ..plain, base: base, extended: true, starred: true } },
+    [base, digits] -> numbered(plain, base, digits, false),
+    [base, digits, ""] -> numbered(plain, base, digits, true),
+    _ -> plain,
+  }
+}
+
+/// The section `digits` counts, where they are a count as RFC 2231 writes one, with no sign and
+/// no zero before another digit; `plain` otherwise.
+fn numbered(
+  plain: Sectioned,
+  base: String,
+  digits: String,
+  extended: Bool,
+) -> Sectioned / {abort.raise} =
+  match int_of_ascii(bytes_of_string(digits)) {
+    Some(n) -> if base == "" || n < 0 || int_to_string(n) != digits { plain }
+    else { { base: base, index: n, extended: extended, starred: true, value: plain.value } },
+    None -> plain,
+  }
+
+/// The one parameter the parameters named `base` are.
+fn whole(base: String, group: List<Sectioned>) -> Param / {mime.unjoined, abort.raise} =
+  match filter(group, |n: Sectioned| n.starred) {
+    [] -> { name: base, value: match group { [first, ..] -> first.value, [] -> "" } },
+    starred -> carried(base, starred),
+  }
+
+/// The parameter the sections `starred` carry: either one value written whole, or sections that
+/// count from `0`.
+fn carried(base: String, starred: List<Sectioned>) -> Param / {mime.unjoined, abort.raise} = {
+  let sections = sort_by(
+    filter(starred, |n: Sectioned| n.index >= 0),
+    |a: Sectioned, b: Sectioned| a.index < b.index,
+  );
+  let counted = fold(enumerate(sections), true, |ok: Bool, s: { index: Int, value: Sectioned }|
+    ok && s.value.index == s.index);
+  let wholes = len(starred) - len(sections);
+  if !counted || wholes > 1 || (wholes == 1 && len(sections) > 0) {
+    mime.unjoined(BadSections(base))
+  } else {
+    match decode_sections(
+        map(if wholes == 1 { starred } else { sections }, |n: Sectioned|
+          { text: n.value, extended: n.extended }),
+      ) {
+      Ok(value) -> { name: base, value: value },
+      Err(r) -> mime.unjoined(BadValue(base, r.why)),
+    }
+  }
+}
+
+/// The parameters that carry `value` under `name` as mail writes one: `name=value` where the
+/// value is printable ASCII that holds none of `"`, `\`, `'`, `%` and `*`, which readers of RFC
+/// 2231 take in more than one way, and, quoted if it must be, the parameter is at most `room`
+/// characters; and otherwise RFC 2231's extended sections, `name*` alone or `name*0*`, `name*1*`
+/// and on, each at most `room` characters wherever one character's escapes leave room. What
+/// `joined` answers `name=value` for.
+pub fn sectioned(name: String, value: String, room: Int) -> List<Param> / {abort.raise} = {
+  let b = bytes_of_string(value);
+  if scan(b, 0, unmarked()) == bytes_len(b)
+      && string_len(name) + 1 + string_len(written(value)) <= room {
+    [{ name: name, value: value }]
+  } else {
+    match encode_sections(value, room - string_len(name) - 6) {
+      [only] -> [{ name: name ++ "*", value: only }],
+      several ->
+        map(enumerate(several), |s: { index: Int, value: String }|
+          { name: name ++ "*" ++ int_to_string(s.index) ++ "*", value: s.value }),
+    }
+  }
+}
+
+/// Printable ASCII but the quote, the backslash and the three characters RFC 2231 gives a
+/// meaning of its own.
+fn unmarked() -> Bytes =
+  b" !#$&()+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_`abcdefghijklmnopqrstuvwxyz{|}~"
 
 // --- Extensions -------------------------------------------------------------
 
@@ -1347,3 +1487,102 @@ test "a lookup reads the table and does not walk it" {
   assert_eq(list_at(back.value, 0), Some("bin"));
   assert(back.steps < 10)
 }
+
+type Joined = { text: String, params: List<Param> }
+
+/// Media types whose parameters RFC 2231 writes in sections or with a charset, each with what
+/// they are once joined. The first three are RFC 2231 §3's and §4's.
+fn continued() -> List<Joined> =
+  [
+    {
+      text: "message/external-body; access-type=URL; URL*0=\"ftp://\"; URL*1=\"cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar\"",
+      params: [
+        { name: "access-type", value: "URL" },
+        { name: "url", value: "ftp://cs.utk.edu/pub/moore/bulk-mailer/bulk-mailer.tar" },
+      ],
+    },
+    {
+      text: "application/x-stuff; title*=us-ascii'en-us'This%20is%20%2A%2A%2Afun%2A%2A%2A",
+      params: [{ name: "title", value: "This is ***fun***" }],
+    },
+    {
+      text: "application/x-stuff; title*0*=us-ascii'en'This%20is%20even%20more%20; title*1*=%2A%2A%2Afun%2A%2A%2A%20; title*2=\"isn't it!\"",
+      params: [{ name: "title", value: "This is even more ***fun*** isn't it!" }],
+    },
+    {
+      text: "text/plain; a*1=two; b=1; a*0=one; c*=UTF-8''%E2%82%AC",
+      params: [
+        { name: "a", value: "onetwo" },
+        { name: "b", value: "1" },
+        { name: "c", value: "\u{20ac}" },
+      ],
+    },
+    {
+      text: "application/pdf; name=fallback.pdf; name*=UTF-8''na%C3%AFve.pdf",
+      params: [{ name: "name", value: "na\u{ef}ve.pdf" }],
+    },
+    {
+      text: "text/plain; a*b=1; *=2; x*01=3; y*-1=4; z**=5",
+      params: [
+        { name: "a*b", value: "1" },
+        { name: "*", value: "2" },
+        { name: "x*01", value: "3" },
+        { name: "y*-1", value: "4" },
+        { name: "z**", value: "5" },
+      ],
+    },
+    { text: "text/plain", params: [] },
+  ]
+
+test "joins the sections of {show(c.text)}" for c: Joined in continued() {
+  assert_eq(match parse(c.text) { Ok(m) -> join(params(m)), Err(_) -> Ok([]) }, Ok(c.params))
+}
+
+test "sections that do not count from zero, or cannot be read, are refused by name" {
+  let of = |text: String| join(params(range_of(text)));
+  assert_eq(of("text/plain; a*1=x"), Err(BadSections("a")));
+  assert_eq(of("text/plain; a*0=x; a*2=y"), Err(BadSections("a")));
+  assert_eq(of("text/plain; a*0=x; a*0*=y"), Err(BadSections("a")));
+  assert_eq(of("text/plain; a*=UTF-8''x; a*0=y"), Err(BadSections("a")));
+  assert_eq(of("text/plain; a*=plain"), Err(BadValue("a", encoded_word::NoCharset)));
+  assert_eq(
+    of("text/plain; a*0*=big5''x; a*1=y"),
+    Err(BadValue("a", encoded_word::UnknownCharset("big5"))),
+  );
+  assert_eq(of("text/plain; a*0=x; a*1*=%41"), Err(BadValue("a", encoded_word::NoCharset)));
+  assert_eq(of("text/plain; a*=UTF-8''%FF"), Err(BadValue("a", encoded_word::BadBytes)));
+  assert_eq(try { joined(params(range_of("text/plain; a*1=x"))) }, Err(BadSections("a")))
+}
+
+test "a value is written plain where it is short ASCII, and in extended sections otherwise" {
+  assert_eq(sectioned("filename", "report.pdf", 60), [{ name: "filename", value: "report.pdf" }]);
+  assert_eq(sectioned("filename", "my report.pdf", 60), [
+    { name: "filename", value: "my report.pdf" },
+  ]);
+  assert_eq(sectioned("filename", "it's 100%.txt", 60), [
+    { name: "filename*", value: "UTF-8''it%27s%20100%25.txt" },
+  ]);
+  assert_eq(sectioned("filename", "a\"b\\c*", 60), [
+    { name: "filename*", value: "UTF-8''a%22b%5Cc%2A" },
+  ]);
+  assert_eq(sectioned("filename", "na\u{ef}ve.pdf", 60), [
+    { name: "filename*", value: "UTF-8''na%C3%AFve.pdf" },
+  ]);
+  assert_eq(sectioned("filename", "\u{20ac}\u{20ac}\u{20ac}\u{20ac}.txt", 34), [
+    { name: "filename*0*", value: "UTF-8''%E2%82%AC" },
+    { name: "filename*1*", value: "%E2%82%AC%E2%82%AC" },
+    { name: "filename*2*", value: "%E2%82%AC.txt" },
+  ]);
+  assert_eq(sectioned("a", "line\r\nbreak", 60), [{ name: "a*", value: "UTF-8''line%0D%0Abreak" }]);
+  assert_eq(
+    render(MediaType("text", "plain", sectioned("name", "a b \u{e9}", 60))),
+    "text/plain; name*=UTF-8''a%20b%20%C3%A9",
+  )
+}
+
+law "a value written in sections joins back as it, under any name and room"
+  forall (s: Seed, room: Int) {
+    let name = ascii_lower(tokenized(s.name));
+    string_contains(name, "*")
+      || join(sectioned(name, s.value, room % 80)) == Ok([{ name: name, value: s.value }])
+  }
