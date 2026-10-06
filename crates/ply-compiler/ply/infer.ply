@@ -17,11 +17,11 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               InstanceDef, InstanceKind, NKey, NShow, NGen, instance_text, INumeric, NumericDef,
               NumericOp, numeric_ops, numeric_by, is_pub, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
-              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, ESimulate,
-              EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic, is_ordered,
-              ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at, case_identity,
-              call_operator, written_operator)
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
+              ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
+              is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
+              case_identity, call_operator, written_operator)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -55,7 +55,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find_module_binding)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, takes_gen)
+                expand_tagged, expand_holds, takes_gen)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -272,9 +272,11 @@ type ClauseSite = { span: Span, op: Atom, ty: Type }
 /// `around` holds the clauses of every `handle` between the spawn and the region's open.
 type SpawnSite = { span: Span, ty: Type, around: List<ClauseSite> }
 type HandoffSite = { span: Span, ty: Type, op: Bytes }
+/// `hold`: a `with_hold` opened it, which no other region of its name may nest in.
 type OpenRegion = {
   name: Bytes,
   span: Span,
+  hold: Bool,
   simulate_depth: Int,
   spawns: List<SpawnSite>,
   handoffs: List<HandoffSite>,
@@ -284,6 +286,7 @@ type RegionSite = {
   module: Int,
   name: Bytes,
   span: Span,
+  hold: Bool,
   body_span: Span,
   body_ty: Type,
   exits: List<Span>,
@@ -291,8 +294,9 @@ type RegionSite = {
   spawns: List<SpawnSite>,
   handoffs: List<HandoffSite>,
 }
-/// What may not outlive a region: a `with_cell[r]` region's cells, a `simulate` region's tasks.
-type Brand = | CellsOf(Bytes) | Tasks
+/// What may not outlive a region: a `with_cell[r]` region's cells, a `with_hold[r]` region's hold
+/// and every function that reads a hold, a `simulate` region's tasks.
+type Brand = | CellsOf(Bytes) | HoldsOf(Bytes) | Tasks
 type Opened = { name: Bytes, span: Span }
 /// A local bound outside the innermost `simulate` region, named inside it.
 type Crossing = { name: Bytes, span: Span }
@@ -556,6 +560,17 @@ type Counted = {
 type Generalized = { env: TypeEnv, scheme: Scheme }
 
 fn cell() -> Bytes = b"cell"
+
+/// The effect of reading a hold, which a `with_hold` region answers.
+fn hold() -> Bytes = b"hold"
+
+fn hold_atom() -> Atom = { effect: hold(), resource: RSingleton, mode: MRead, op: None }
+
+/// The effects a region answers and nothing declares.
+fn is_region_effect(name: Bytes) -> Bool = name == cell() || name == hold()
+
+/// A cell or a hold: each carries the region that made it as a first, unwritten argument.
+fn is_region_type(name: Bytes) -> Bool = name == b"Cell" || name == b"Hold"
 fn compare_values_name() -> Bytes = b"compare_values"
 fn result_name() -> Bytes = b"result"
 
@@ -695,6 +710,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Array", arity: 1 },
     { name: b"Map", arity: 2 },
     { name: b"Cell", arity: 1 },
+    { name: b"Hold", arity: 1 },
     { name: b"Secret", arity: 1 },
     { name: b"Task", arity: 1 },
     { name: b"Chan", arity: 1 },
@@ -1009,7 +1025,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
             let args = declared_types(d, c.args);
             if builtin_type_arity(name) != Some(len(args.tys)) {
               panic(misdeclared(b"names a type that is not the language's own at that arity", name))
-            } else if name == b"Cell" {
+            } else if is_region_type(name) {
               let region = fresh_ty(args.d.fresh);
               {
                 d: { ..args.d, fresh: region.fresh },
@@ -1022,7 +1038,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
     },
   }
 
-/// A declaration's row: `abort.raise`, a row variable, both or neither.
+/// A declaration's row: `abort.raise`, `hold.read`, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1032,7 +1048,12 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
           if is_bare(a.eff) && a.eff.name.name == b"abort"
               && (match a.op { Some(op) -> op.name == b"raise", None -> false }) {
             atoms_insert(acc, abort_atom())
-          } else { panic(misdeclared(b"performs more than `abort.raise`", a.eff.name.name)) }),
+          } else if is_bare(a.eff) && a.eff.name.name == hold()
+              && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
+            atoms_insert(acc, hold_atom())
+          } else {
+            panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
+          }),
         tail: match r.tail {
           None -> None,
           Some(v) -> match map_get(d.rows, v.name) {
@@ -1821,11 +1842,11 @@ fn conv_con(
         )
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
-      } else if name.name.name == b"Cell" {
+      } else if is_region_type(name.name.name) {
         let region: WithTy = new_ty(c);
         {
           checker: region.checker,
-          ty: TyCon({ name: b"Cell", args: [region.ty, at(converted.tys, 0)] }),
+          ty: TyCon({ name: name.name.name, args: [region.ty, at(converted.tys, 0)] }),
         }
       } else {
         let built = TyCon({ name: name.name.name, args: converted.tys });
@@ -2375,7 +2396,9 @@ fn effect_name(
   checker: Checker,
   qname: QName,
 ) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
-  if is_bare(qname) && qname.name.name == cell() { { checker: checker, name: Some(cell()) } } else {
+  if is_bare(qname) && is_region_effect(qname.name.name) {
+    { checker: checker, name: Some(qname.name.name) }
+  } else {
     let g: WithName = global(checker, EffectSpace, qname);
     match g.name {
       Some(n) -> match effect_of(g.checker, n) {
@@ -2484,10 +2507,10 @@ fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker =
   fold(parsed.module.items, checker, |c: Checker, item: Item|
     match item { IType(d) -> record_type(c, parsed, d), _ -> c })
 
-/// The first `Cell`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
+/// The first `Cell`, `Hold`, `Task` or `Chan` in `ty`: each is a key into the region that made it.
 fn region_brand(ty: Type) -> Option<Bytes> =
   match ty {
-    TyCon(c) -> if c.name == b"Cell" || scheduler_handle(c.name) { Some(c.name) }
+    TyCon(c) -> if is_region_type(c.name) || scheduler_handle(c.name) { Some(c.name) }
     else { first_reason(c.args, region_brand) },
     TyFn(f) -> match first_reason(f.params, region_brand) {
       Some(b) -> Some(b),
@@ -2540,6 +2563,8 @@ fn region_reach(ty: Type) -> Option<Bytes> =
     TyNominal(n) -> first_reason(n.fields, |f: Field| region_reach(f.ty)),
     TyFn(f) -> if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == cell()) {
       Some(b"`Cell`")
+    } else if fold(f.effects.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()) {
+      Some(b"`Hold`")
     } else if row_brands(f.effects, Tasks) { Some(b"`Task` or a `Chan`") } else {
       match first_reason(f.params, region_reach) { Some(b) -> Some(b), None -> region_reach(f.ret) }
     },
@@ -2582,13 +2607,13 @@ fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
     match item {
       IEffect(def) -> {
         let name = qualify(parsed.name, def.name.name);
-        if def.name.name == cell() {
+        if is_region_effect(def.name.name) {
           report_error_at(
             c,
             b"E0105",
             def.name.span,
-            b"`cell` is a builtin effect",
-            b"reserved for `with_cell` regions",
+            bytes_concat_all([b"`", def.name.name, b"` is a builtin effect"]),
+            bytes_concat_all([b"reserved for `with_", def.name.name, b"` regions"]),
             [b"rename this effect"],
           )
         } else if is_prelude_effect(name) {
@@ -3992,6 +4017,8 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
     EPerform(p) -> infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args),
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
+    EWithHold(c) ->
+      infer_with_hold(checker, c.span, c.resource, c.acquire, c.release, c.binder, c.body, hint),
     ESimulate(s) -> infer_simulate(checker, s.span, s.body, hint),
     EParallel(v) -> infer_parallel(checker, v.span, v.branches),
     ETryBlock(t) -> infer_try_block(checker, t.span, t.raise, t.body, hint),
@@ -6579,6 +6606,20 @@ fn resolve_op(
           ),
           hit: None,
         }
+      } else if name == hold() {
+        {
+          checker: report_error_at(
+            e.checker,
+            b"E0103",
+            eff.span,
+            b"`hold` is a builtin effect and cannot be performed directly",
+            b"not a declared effect",
+            [
+              b"read what a hold holds with `hold_get(h)`, inside `with_hold[r](..) { h -> .. }` or in a function it hands the hold to",
+            ],
+          ),
+          hit: None,
+        }
       } else { { checker: e.checker, hit: None } },
       Some(info) -> match op_named(info, ident.name) {
         Some(o) -> { checker: e.checker, hit: Some({ info: info, op: o }) },
@@ -6624,7 +6665,7 @@ fn resolve_op(
 /// How this module's source names an effect: by its imported name or through a module binder; none
 /// when it names it neither way, and a row it writes must import it first.
 fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise} =
-  if is_prelude_effect(eff) || eff == cell() { Some(eff) } else {
+  if is_prelude_effect(eff) || is_region_effect(eff) { Some(eff) } else {
     let scope = scope_of(checker);
     match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding|
         match acc {
@@ -7634,12 +7675,48 @@ fn cell_atoms(resource: Bytes) -> List<Atom> =
 fn region_is_open(checker: Checker, name: Bytes) -> Bool =
   fold(checker.open_regions, false, |acc: Bool, region: OpenRegion| acc || region.name == name)
 
-fn open_region(checker: Checker, name: Bytes, span: Span) -> Checker =
+/// The open region of this name, when there is one.
+fn open_region_named(checker: Checker, name: Bytes) -> Option<OpenRegion> =
+  fold(checker.open_regions, None, |acc: Option<OpenRegion>, region: OpenRegion|
+    if region.name == name { Some(region) } else { acc })
+
+/// A hold is let go at its own region's `}`, so that region is the one that brands it: a region
+/// of the name already open would brand it instead, and let it outlive its release.
+fn region_reopened(checker: Checker, resource: Ident, outer: OpenRegion, form: Bytes) -> Checker =
+  err_labels(
+    checker,
+    b"E0330",
+    bytes_concat_all([
+      b"`",
+      form,
+      b"[",
+      resource.name,
+      b"]` opens a region named `",
+      resource.name,
+      b"` inside one of that name",
+    ]),
+    [
+      label_at(checker.module, resource.span, true, b"this name is already a region's"),
+      label_at(
+        checker.module,
+        outer.span,
+        false,
+        bytes_concat_all([b"`", resource.name, b"` opens here and is still open"]),
+      ),
+    ],
+    [
+      b"a hold is let go at the `}` of the `with_hold` that made it, so the region that brands it has to be that one and no other",
+      b"give this region a name no region around it has",
+    ],
+  )
+
+fn open_region(checker: Checker, name: Bytes, span: Span, hold: Bool) -> Checker =
   {
     ..checker,
     open_regions: push(checker.open_regions, {
       name: name,
       span: span,
+      hold: hold,
       simulate_depth: checker.simulate_depth,
       spawns: [],
       handoffs: [],
@@ -7759,6 +7836,7 @@ fn region_exits(expr: Expr, out: List<Span>) -> List<Span> =
     EIf(i) -> region_exits(i.else_branch, region_exits(i.then_branch, out)),
     EMatch(m) -> fold(m.arms, out, |acc: List<Span>, arm: MatchArm| region_exits(arm.body, acc)),
     EWithCell(c) -> region_exits(c.body, out),
+    EWithHold(c) -> region_exits(c.body, out),
     ESimulate(s) -> region_exits(s.body, out),
     EHandle(h) -> {
       let through = match h.ret {
@@ -7783,16 +7861,21 @@ fn infer_with_cell(
   let i: Inferred = infer(checker, init);
   let cell_ty = TyCon({ name: b"Cell", args: [region_type(resource.name), i.ty] });
   if region_is_open(i.checker, resource.name) {
+    let nested: Checker = match open_region_named(i.checker, resource.name) {
+      Some(outer) -> if outer.hold { region_reopened(i.checker, resource, outer, b"with_cell") }
+      else { i.checker },
+      None -> i.checker,
+    };
     let pushed: Checker = {
-      ..i.checker,
-      env: env_bind(env_push(i.checker.env), binder.name, monomorphic(cell_ty)),
+      ..nested,
+      env: env_bind(env_push(nested.env), binder.name, monomorphic(cell_ty)),
     };
     let b: Inferred = infer(pushed, body, hint);
     let j: WithRow = join({ ..b.checker, env: env_pop(b.checker.env) }, span, i.row, b.row);
     { checker: j.checker, ty: b.ty, row: j.row }
   } else {
     let outer = outer_bindings(i.checker, body);
-    let opened: Checker = open_region(i.checker, resource.name, resource.span);
+    let opened: Checker = open_region(i.checker, resource.name, resource.span, false);
     let mark = len(opened.performs);
     let pushed: Checker = {
       ..opened,
@@ -7811,6 +7894,7 @@ fn infer_with_cell(
       module: discharged.module,
       name: resource.name,
       span: resource.span,
+      hold: false,
       body_span: expr_span(body),
       body_ty: b.ty,
       exits: region_exits(body, []),
@@ -7821,6 +7905,92 @@ fn infer_with_cell(
     let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
     { checker: j.checker, ty: b.ty, row: j.row }
+  }
+}
+
+/// `release` is read as a value: a function of what `acquire` answered, whose row the form performs
+/// when it lets the hold go. The body's reads of a hold end at the region's `}`.
+fn infer_with_hold(
+  checker: Checker,
+  span: Span,
+  resource: Ident,
+  acquire: Expr,
+  release: Expr,
+  binder: Ident,
+  body: Expr,
+  hint: Option<Hint>,
+) -> Inferred / {abort.raise} = {
+  let a: Inferred = infer(checker, acquire);
+  let r: Inferred = infer(a.checker, release);
+  let eff: WithRow = new_row(r.checker);
+  let typed: Checker = expect(
+    eff.checker,
+    expr_span(release),
+    fn_type([a.ty], unit_type(), eff.row),
+    r.ty,
+    b"function that releases what the hold acquired",
+  ).checker;
+  let let_go = resolve_row_in(typed, eff.row);
+  let source = callee_source(typed, release);
+  let performed: Checker = fold(let_go.atoms, typed, |c: Checker, atom: Atom|
+    record_site(c, atom, expr_span(release), source));
+  let before: WithRow = join(performed, span, a.row, r.row);
+  let entering: WithRow = join(before.checker, span, before.row, let_go);
+  let hold_ty = TyCon({ name: b"Hold", args: [region_type(resource.name), a.ty] });
+  match open_region_named(entering.checker, resource.name) {
+    Some(around) -> {
+      let refused: Checker = region_reopened(entering.checker, resource, around, b"with_hold");
+      let b: Inferred = infer(
+        { ..refused, env: env_bind(env_push(refused.env), binder.name, monomorphic(hold_ty)) },
+        body,
+        hint,
+      );
+      let j: WithRow = join(
+        { ..b.checker, env: env_pop(b.checker.env) },
+        span,
+        entering.row,
+        b.row,
+      );
+      { checker: j.checker, ty: b.ty, row: j.row }
+    },
+    None -> {
+      let outer = outer_bindings(entering.checker, body);
+      let opened: Checker = open_region(entering.checker, resource.name, resource.span, true);
+      let mark = len(opened.performs);
+      let b: Inferred = infer(
+        { ..opened, env: env_bind(env_push(opened.env), binder.name, monomorphic(hold_ty)) },
+        body,
+        hint,
+      );
+      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
+      let handled = [hold_atom()];
+      let discharged: Checker = discharge(
+        closed.checker,
+        mark,
+        len(closed.checker.performs),
+        handled,
+      );
+      let site: RegionSite = {
+        module: discharged.module,
+        name: resource.name,
+        span: resource.span,
+        hold: true,
+        body_span: expr_span(body),
+        body_ty: b.ty,
+        exits: region_exits(body, []),
+        outer: outer,
+        spawns: closed.spawns,
+        handoffs: closed.handoffs,
+      };
+      let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
+      let j: WithRow = join(
+        recorded,
+        span,
+        entering.row,
+        row_without_covered(resolve_row_in(recorded, b.row), handled),
+      );
+      { checker: j.checker, ty: b.ty, row: j.row }
+    },
   }
 }
 
@@ -8030,6 +8200,12 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     },
     EWithCell(c) ->
       collect_refs(c.body, push(bound, c.binder.name), collect_refs(c.init, bound, out)),
+    EWithHold(c) ->
+      collect_refs(
+        c.body,
+        push(bound, c.binder.name),
+        collect_refs(c.release, bound, collect_refs(c.acquire, bound, out)),
+      ),
     ESimulate(s) -> collect_refs(s.body, bound, out),
     EParallel(v) -> fold(v.branches, out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
     ETryBlock(t) -> collect_refs(t.body, bound, out),
@@ -10738,6 +10914,8 @@ fn ungeneratable_within(
     TyVar(_) -> None,
     TyCon(c) -> if c.name == b"Cell" {
       Some(b"a `Cell` is created by `with_cell` and exists only inside its region")
+    } else if c.name == b"Hold" {
+      Some(b"a `Hold` is created by `with_hold` and exists only inside its region")
     } else if c.name == b"Task" {
       Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
     } else if c.name == b"Chan" {
@@ -12844,6 +13022,20 @@ fn check_comparisons(checker: Checker) -> Checker / {abort.raise} =
             [b"compare the results of calling them instead"],
           ),
         )
+      } else if holds_con(resolved, b"Hold") {
+        report(
+          c,
+          error_at(
+            b"E0201",
+            site.module,
+            site.span,
+            b"a hold cannot be compared for equality",
+            bytes_concat_all([b"both sides have type `", type_text(resolved), b"`"]),
+            [
+              b"a hold is a key to what its region will release, not a value: compare what `hold_get` reads of each instead",
+            ],
+          ),
+        )
       } else { c }
     },
   )
@@ -13338,6 +13530,8 @@ fn row_brands(row: Row, brand: Brand) -> Bool =
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, atom: Atom|
         b || (atom.effect == cell() && atom.resource == RNamed(r))),
+    // A row does not say which hold it reads, so one that reads any may read this region's.
+    HoldsOf(_) -> fold(row.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()),
     Tasks ->
       fold(
         [b"join", b"await", b"cancel", b"send", b"recv", b"close"],
@@ -13351,7 +13545,11 @@ fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
   match t {
     TyVar(_) -> false,
     TyCon(c) ->
-      (match brand { CellsOf(r) -> region_of(t) == Some(r), Tasks -> scheduler_handle(c.name) })
+      (match brand {
+          CellsOf(r) -> region_of(t) == Some(r),
+          HoldsOf(r) -> region_of(t) == Some(r),
+          Tasks -> scheduler_handle(c.name),
+        })
         || fold(c.args, false, |b: Bool, a: Type| b || brand_in(a, brand)),
     TyFn(f) ->
       row_brands(f.effects, brand)
@@ -13382,11 +13580,36 @@ fn check_regions(checker: Checker) -> Checker / {abort.raise} =
       site,
     ))
 
+fn brand_of(site: RegionSite) -> Brand =
+  if site.hold { HoldsOf(site.name) } else { CellsOf(site.name) }
+
+fn region_form(site: RegionSite) -> Bytes = if site.hold { b"with_hold" } else { b"with_cell" }
+
 /// The value the region evaluates to; a `with_cell` reports the escape as `E0201`.
 fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.raise} = {
   let ty = resolve(checker, site.body_ty);
   let n = site.name;
-  if !brand_in(ty, CellsOf(n)) { checker } else {
+  if !brand_in(ty, brand_of(site)) { checker } else if site.hold {
+    err_labels(
+      checker,
+      b"E0446",
+      bytes_concat_all([b"a hold escapes its `with_hold[", n, b"]` region"]),
+      exit_labels(site.module, site.exits, site.body_span, ty),
+      if carries_brand_in_row(ty, brand_of(site)) {
+        [
+          b"the closure's row still carries `hold.read`, so calling it after the region reads a hold the region has let go",
+          b"call the closure inside the region and return what it answers instead",
+        ]
+      } else {
+        [
+          bytes_concat_all([
+            b"the region releases what the hold holds at its `}`, so the hold names nothing after it",
+          ]),
+          b"read the hold inside the region and return what the body made of it instead",
+        ]
+      },
+    )
+  } else {
     let carries = if carries_brand_in_row(ty, CellsOf(n)) {
       [
         bytes_concat_all([
@@ -13414,7 +13637,7 @@ fn opens_here(n: Bytes) -> Bytes =
 fn check_region_stores(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.outer, checker, |c: Checker, b: OuterBinding| {
     let ty = resolve(c, b.ty);
-    if brand_in(ty, CellsOf(site.name)) {
+    if brand_in(ty, brand_of(site)) {
       err_labels(
         c,
         b"E0446",
@@ -13462,7 +13685,7 @@ fn outlived() -> List<Bytes> =
 fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.spawns, checker, |c: Checker, s: SpawnSite| {
     let ty = resolve(c, s.ty);
-    if brand_in(ty, CellsOf(site.name)) {
+    if brand_in(ty, brand_of(site)) {
       err_labels(
         c,
         b"E0446",
@@ -13483,7 +13706,9 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
         push(
           outlived(),
           bytes_concat_all([
-            b"open the `simulate` region inside `with_cell[",
+            b"open the `simulate` region inside `",
+            region_form(site),
+            b"[",
             site.name,
             b"]`, or pass the task something that does not mention `",
             site.name,
@@ -13492,7 +13717,7 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
         ),
       )
     } else {
-      match reaching_clause(c, ty, s.around, site.name) {
+      match reaching_clause(c, ty, s.around, brand_of(site)) {
         None -> c,
         Some(cl) -> {
           let op = backticked_text(
@@ -13536,7 +13761,9 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
               push(
                 outlived(),
                 bytes_concat_all([
-                  b"open the `simulate` region inside `with_cell[",
+                  b"open the `simulate` region inside `",
+                  region_form(site),
+                  b"[",
                   site.name,
                   b"]`, or answer ",
                   op,
@@ -13552,19 +13779,18 @@ fn check_region_spawns(checker: Checker, site: RegionSite) -> Checker / {abort.r
     }
   })
 
-/// The first clause around a spawn that its task can perform against and that reaches region `n`.
+/// The first clause around a spawn that its task can perform against and that reaches the region.
 fn reaching_clause(
   checker: Checker,
   task: Type,
   around: List<ClauseSite>,
-  n: Bytes,
+  brand: Brand,
 ) -> Option<ClauseSite> / {abort.raise} =
   fold(around, None, |acc: Option<ClauseSite>, cl: ClauseSite|
     match acc {
       Some(_) -> acc,
-      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), CellsOf(n)) {
-        Some(cl)
-      } else { None },
+      None -> if may_perform(task, cl.op) && brand_in(resolve(checker, cl.ty), brand) { Some(cl) }
+      else { None },
     })
 
 /// On any label: an open row may perform anything.
@@ -13582,9 +13808,15 @@ fn may_perform(task: Type, op: Atom) -> Bool =
 fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort.raise} =
   fold(site.handoffs, checker, |c: Checker, h: HandoffSite| {
     let ty = resolve(c, h.ty);
-    if !brand_in(ty, CellsOf(site.name)) { c } else {
+    if !brand_in(ty, brand_of(site)) { c } else {
       let n = site.name;
-      let carries = if carries_brand_in_row(ty, CellsOf(n)) {
+      let carries = if site.hold {
+        if carries_brand_in_row(ty, brand_of(site)) {
+          [
+            b"the closure's row still carries `hold.read`, so whoever handles the operation can read a hold the region has let go",
+          ]
+        } else { [] }
+      } else if carries_brand_in_row(ty, CellsOf(n)) {
         [
           bytes_concat_all([
             b"the closure's row still carries `cell.read[",
@@ -14017,9 +14249,11 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
 /// the literal it stands for, and every `try` as its `handle`. The tagged literals go first: they
 /// need nothing of the checker, and what they become is forms the other two already walk.
 fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
-  expand_try_blocks(
-    expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
-    answered_in(elaboration.tries, i),
+  expand_holds(
+    expand_try_blocks(
+      expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
+      answered_in(elaboration.tries, i),
+    ),
   )
 
 /// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
@@ -14900,6 +15134,118 @@ fn checked_cx(src: Bytes) -> Checker / {abort.raise} = {
     ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
     ResolveSucceeded(y) -> check_program(y.r, y.mods).checker,
   }
+}
+
+fn held_io(body: Bytes) -> Bytes =
+  bytes_concat(
+    b"effect io {\n  write open(n: Int) -> Int\n  write close(h: Int) -> Unit\n  write pull(h: Int) -> Int\n}\n",
+    body,
+  )
+
+test "a hold is read inside its region, whose row is its acquire's, its release's and its body's" {
+  assert_eq(
+    check_codes(
+      held_io(
+        b"fn f() -> Int / {io.open, io.close, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      held_io(
+        b"fn f() -> Int / {io.open, io.pull} = with_hold[file](io.open(1), |h: Int| io.close(h)) { h -> io.pull(hold_get(h)) }",
+      ),
+    ),
+    [b"E0302"],
+  );
+  // The release is a function of what was acquired, answering nothing.
+  assert_eq(
+    check_codes(b"fn f() -> Int = with_hold[file](1, |h: String| ()) { h -> hold_get(h) }"),
+    [b"E0201"],
+  );
+  assert_eq(check_codes(b"fn f() -> Int = with_hold[file](1, |h: Int| h) { h -> hold_get(h) }"), [
+    b"E0201",
+  ])
+}
+
+test "a function handed a hold reads it under `hold.read`, which the region answers" {
+  assert_eq(
+    check_codes(
+      b"fn peek(h: Hold<Int>) -> Int / {hold.read} = hold_get(h)\nfn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn peek(h: Hold<Int>) -> Int = hold_get(h)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn f() -> Unit / {hold.read} = hold.read()"), [b"E0103"]);
+  assert_eq(check_codes(b"effect hold { read get() -> Int }"), [b"E0105"])
+}
+
+test "a hold that leaves its region is refused where it leaves" {
+  assert_eq(refusals(b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> h }; 0 }"), [
+    [b"E0446", b"a hold escapes its `with_hold[r]` region", b"h"],
+  ]);
+  assert_eq(
+    refusals(
+      b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> || hold_get(h) }; 0 }",
+    ),
+    [[b"E0446", b"a hold escapes its `with_hold[r]` region", b"|| hold_get(h)"]],
+  );
+  // A function that answers a closure over a hold says `hold.read` in the closure's row.
+  assert_eq(
+    check_codes(
+      b"fn later(h: Hold<Int>) -> () -> Int / {hold.read} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(check_codes(b"fn later(h: Hold<Int>) -> () -> Int = || hold_get(h)"), [b"E0302"])
+}
+
+test "a hold kept in an older cell, handed to an operation, or given an older scheduler's task is refused" {
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_cell[o](None) { c -> { with_hold[r](1, |x: Int| ()) { h -> cell_set(c, Some(h)) }; 0 } }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"effect box { write put<a>(x: a) -> Unit }\nfn f() -> Unit / {box.put} = with_hold[r](1, |x: Int| ()) { h -> box.put(h) }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int / {task.spawn} = with_hold[r](1, |x: Int| ()) { h -> { let t = task.spawn(|| hold_get(h)); 0 } }",
+    ),
+    [b"E0446"],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int / {sim.read, abort.raise} = with_hold[r](1, |x: Int| ()) { h -> simulate { task.join(task.spawn(|| hold_get(h))) } }",
+    ),
+    [],
+  )
+}
+
+test "a hold's region is its own: neither it nor a cell's reuses a name that is open" {
+  let nested = |outer: Bytes, inner: Bytes|
+    check_codes(
+      bytes_concat_all([b"fn f() -> Int = ", outer, b" { a -> ", inner, b" { b -> 0 } }"]),
+    );
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_hold[r](2, |x: Int| ())"), [b"E0330"]);
+  assert_eq(nested(b"with_cell[r](1)", b"with_hold[r](2, |x: Int| ())"), [b"E0330"]);
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_cell[r](2)"), [b"E0330"]);
+  assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_hold[s](2, |x: Int| ())"), []);
+  assert_eq(nested(b"with_cell[r](1)", b"with_cell[r](2)"), [])
+}
+
+test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
+  assert_eq(refusals(b"type Kept = Kept(Hold<Int>)"), [
+    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int>"],
+  ]);
+  assert_eq(check_codes(b"effect io { write put(h: Hold<Int>) -> Unit }"), [b"E0446"]);
+  assert_eq(check_codes(b"type Hidden = Hidden(() -> Int / {hold.read})"), [b"E0446"])
 }
 
 test "a bracket's closures run as one, so a body generic over its row admits the release's" {
@@ -18033,4 +18379,59 @@ test "a `forall` over an opaque type another module declares draws through the g
   // What the generator is handed for a parameter is still drawn where the law is.
   assert_eq(over(stated, b"law \"l\" forall (p: Purse<Int>) { p == p }"), []);
   assert_eq(over(stated, b"law \"l\" forall (p: Purse<Token>) { p == p }"), [b"E0418"])
+}
+
+test "a `Hold` is never drawn: not by a `forall`, not as what a stated generator is handed, and no `gen` is its own" {
+  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int>) { true }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int>>) { len(hs) >= 0 }"), [b"E0418"]);
+  assert_eq(
+    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int>>) { true }"),
+    [b"E0418"],
+  );
+  let purse = b"type Purse<a> = | Purse(List<a>)\nfn purses<a>(g: Gen<a>) -> Gen<Purse<a>> = constant(Purse([]))\ngen for Purse by purses\n";
+  assert_eq(gen_codes(bytes_concat(purse, b"law \"l\" forall (p: Purse<Int>) { p == p }")), []);
+  assert_eq(gen_codes(bytes_concat(purse, b"law \"l\" forall (p: Purse<Hold<Int>>) { true }")), [
+    b"E0418",
+  ]);
+  // A generator answers values, and a hold is one only inside the region that made it.
+  assert(
+    len(
+        gen_codes(
+          b"fn holds() -> Gen<Hold<Int>> = constant(with_hold[r](1, |x: Int| ()) { h -> h })",
+        ),
+      )
+      > 0,
+  )
+}
+
+test "a hold of an opaque value is read where the value's module is called, and released by it" {
+  let over = |app: Bytes|
+    map(
+      gen_checked([
+        {
+          name: b"vault",
+          src: b"pub opaque type Token = | Token(Int)\npub fn mint(n: Int) -> Token = Token(n)\npub fn spend(t: Token) -> Unit = ()\npub fn worth(t: Token) -> Int = match t { Token(n) -> n }\n",
+        },
+        { name: b"app", src: bytes_concat(b"import vault (Token, mint, spend, worth)\n", app) },
+      ]),
+      |d: Diag| d.code,
+    );
+  assert_eq(
+    over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(hold_get(h)) }"),
+    [],
+  );
+  assert_eq(over(b"fn peek(h: Hold<Token>) -> Int / {hold.read} = worth(hold_get(h))"), []);
+  // Holding one opens nothing: its constructor is still its module's alone.
+  assert_eq(
+    over(
+      b"fn opened(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> match hold_get(h) { Token(k) -> k } }",
+    ),
+    [b"E0107"],
+  );
+  // What `hold_get` answers is a value like any other, so it may leave where the hold may not: a
+  // module that must not see its value used after the release keeps the value's uses to itself.
+  assert_eq(
+    over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> hold_get(h) }"),
+    [],
+  )
 }
