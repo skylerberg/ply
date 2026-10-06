@@ -9,18 +9,16 @@
 //! `connect` gets a session to where the server answers a query, authenticating with a clear-text
 //! password or SCRAM-SHA-256 (md5 is refused with a message naming it); the client's SCRAM nonce is
 //! the caller's to draw, so a run's `random` seed decides it and a test can fix it. `simple_query` and
-//! `extended_query` answer the columns, the rows and the command tag. The SCRAM steps are exposed
-//! because they are pure, and RFC 7677's worked example is their test. A connection is `std.net`'s;
-//! which statements to send, what a transaction is and when to retry are `std.db`'s.
+//! `extended_query` answer the columns, the rows and the command tag. The SCRAM steps are
+//! `std.sasl`'s. A connection is `std.net`'s; which statements to send, what a transaction is and
+//! when to retry are `std.db`'s.
 
-import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice_at, xor, cstring,
-                  int_of_ascii)
-import std.hash (sha256, hmac_sha256, pbkdf2_sha256, tags_match)
-import std.json (base64_decode, base64_encode)
+import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice_at, cstring)
 import std.ip
 import std.net
 import std.net (Says, net, send_all)
 import std.list (concat)
+import std.sasl (scram_challenge, scram_final, scram_first, scram_first_bare, scram_verify)
 
 // --- Kinds --------------------------------------------------------------------
 
@@ -685,10 +683,7 @@ fn no_password(user: String, what: String) -> Server =
 pub fn password_message(text: String) -> Bytes / {abort.raise} =
   bytes_concat(byte_of_int(112), counted(cstring(text)))
 
-// --- SCRAM-SHA-256 --------------------------------------------------------------
-
-// RFC 5802's exchange with RFC 7677's SHA-256: the client proves it knows the password without
-// sending it, and then the server proves it knows the verifier. Four messages.
+// --- SASL -----------------------------------------------------------------------
 
 /// What the greeting has collected: the parameters the server set, and where SASL has got to.
 type Greeting = { settings: List<Set>, sasl: Sasl }
@@ -696,98 +691,6 @@ type Greeting = { settings: List<Set>, sasl: Sasl }
 type Sasl = { first_bare: String, expected: Option<Bytes> }
 
 fn nothing_said() -> Greeting = { settings: [], sasl: { first_bare: "", expected: None } }
-
-/// The GS2 header says no channel binding is in use, and the bare message names the user and the
-/// client's nonce. `=` and `,` are escaped, because they separate the fields.
-pub fn scram_first(user: String, nonce: String) -> String = "n,," ++ scram_first_bare(user, nonce)
-
-/// The client's first message without its GS2 header, which the signatures cover.
-pub fn scram_first_bare(user: String, nonce: String) -> String =
-  "n=" ++ scram_name(user) ++ ",r=" ++ nonce
-
-fn scram_name(user: String) -> String =
-  fold(range(0, string_len(user)), "", |acc: String, i: Int| {
-    let c = string_slice(user, i, i + 1);
-    if c == "=" { acc ++ "=3D" } else if c == "," { acc ++ "=2C" } else { acc ++ c }
-  })
-
-/// One `name=value` out of a comma-separated message, or `None` when it is not there.
-fn scram_attribute(text: String, name: String) -> Option<String> / {abort.raise} =
-  fold(string_split(text, ","), None, |acc: Option<String>, part: String|
-    match acc {
-      Some(found) -> Some(found),
-      None -> if string_starts_with(part, name ++ "=") {
-        Some(string_slice(part, string_len(name) + 1, string_len(part)))
-      } else { None },
-    })
-
-/// A decimal count, refused rather than defaulted when it is not one.
-fn nat_text(text: String) -> Option<Int> / {abort.raise} =
-  if string_starts_with(text, "-") { None } else { int_of_ascii(bytes_of_string(text)) }
-
-/// `r`, `s` and `i` out of the server's first message; the salt is base64 there.
-pub type Challenge = { nonce: String, salt: Bytes, iterations: Int }
-
-/// The nonce, salt and iteration count out of the server's first SCRAM message; `None` for one
-/// that lacks any of them or asks for no iterations.
-pub fn scram_challenge(server_first: String) -> Option<Challenge> / {abort.raise} =
-  match scram_attribute(server_first, "r") {
-    None -> None,
-    Some(nonce) -> match scram_attribute(server_first, "s") {
-      None -> None,
-      Some(salt) -> match scram_attribute(server_first, "i") {
-        None -> None,
-        Some(count) -> match base64_decode(salt) {
-          Err(_) -> None,
-          Ok(bytes) -> match nat_text(count) {
-            None -> None,
-            Some(iterations) -> if iterations < 1 { None }
-            else { Some({ nonce: nonce, salt: bytes, iterations: iterations }) },
-          },
-        },
-      },
-    },
-  }
-
-/// The two things the keys are for: the reply that carries the proof, and the signature the
-/// server is about to prove itself with.
-pub type Proof = { reply: String, expected: Bytes }
-
-/// What both sides sign: the client's bare message, the server's first message, and the final
-/// message without its proof, joined by commas.
-pub fn scram_final(
-  password: String,
-  first_bare: String,
-  server_first: String,
-  challenge: Challenge,
-) -> Proof / {abort.raise} = {
-  let without_proof = "c=biws,r=" ++ challenge.nonce;
-  let signed = first_bare ++ "," ++ server_first ++ "," ++ without_proof;
-  let salted = pbkdf2_sha256(
-    secret_bytes(secret_of_string(password)),
-    challenge.salt,
-    challenge.iterations,
-  );
-  let client_key = hmac_sha256(salted, b"Client Key");
-  let signature = hmac_sha256(secret_of_bytes(sha256(client_key)), bytes_of_string(signed));
-  {
-    reply: without_proof ++ ",p=" ++ base64_encode(xor(client_key, signature)),
-    expected: hmac_sha256(
-      secret_of_bytes(hmac_sha256(salted, b"Server Key")),
-      bytes_of_string(signed),
-    ),
-  }
-}
-
-/// `v=` out of the server's last message, checked against what the keys said it would be.
-pub fn scram_verify(server_final: String, expected: Bytes) -> Bool / {abort.raise} =
-  match scram_attribute(server_final, "v") {
-    None -> false,
-    Some(text) -> match base64_decode(text) {
-      Err(_) -> false,
-      Ok(got) -> tags_match(got, expected),
-    },
-  }
 
 /// The bytes after an authentication code, as the text a SASL step carries.
 fn auth_text(message: Message) -> Option<String> / {abort.raise} =
@@ -854,17 +757,24 @@ fn scram_continue<[l]>(
       None -> Err(Unexpected("a SASL continue that is not text")),
       Some(server_first) -> match scram_challenge(server_first) {
         None -> Err(Unexpected("a SASL continue this client cannot read: " ++ server_first)),
-        Some(challenge) -> {
-          let proof = scram_final(secret, acc.sasl.first_bare, server_first, challenge);
-          let raw = bytes_of_string(proof.reply);
-          if !send_all[l](s.conn, bytes_concat(byte_of_int(112), counted(raw)), client.write_ms) {
-            Err(NotSent)
-          } else {
-            greet[l](s, password, nonce, client, {
-              ..acc,
-              sasl: { first_bare: acc.sasl.first_bare, expected: Some(proof.expected) },
-            })
-          }
+        Some(challenge) -> match scram_final(
+            secret_bytes(secret_of_string(secret)),
+            acc.sasl.first_bare,
+            server_first,
+            challenge,
+          ) {
+          None -> Err(Unexpected("a SASL continue whose nonce is not the one this client sent")),
+          Some(proof) -> {
+            let raw = bytes_of_string(proof.reply);
+            if !send_all[l](s.conn, bytes_concat(byte_of_int(112), counted(raw)), client.write_ms) {
+              Err(NotSent)
+            } else {
+              greet[l](s, password, nonce, client, {
+                ..acc,
+                sasl: { first_bare: acc.sasl.first_bare, expected: Some(proof.expected) },
+              })
+            }
+          },
         },
       },
     },
@@ -1131,42 +1041,6 @@ test "a back end key is the two words a cancel needs" {
     Some({ pid: 4321, secret: 8765 }),
   );
   assert_eq(backend_key({ kind: BackendKeyData, body: b"abc" }), None)
-}
-
-// RFC 7677's worked example, in full: its nonce, salt, iteration count, client proof and
-// server signature. Anything wrong in the ladder changes the proof.
-test "scram, against the example RFC 7677 works out" {
-  let first_bare = scram_first_bare("user", "rOprNGfwEbeRWgbNEkqO");
-  assert_eq(first_bare, "n=user,r=rOprNGfwEbeRWgbNEkqO");
-  let server_first = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-  match scram_challenge(server_first) {
-    None -> panic("the example's challenge does not read"),
-    Some(challenge) -> {
-      assert_eq(challenge.iterations, 4096);
-      assert_eq(bytes_len(challenge.salt), 16);
-      let proof = scram_final("pencil", first_bare, server_first, challenge);
-      assert_eq(
-        proof.reply,
-        "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=",
-      );
-      assert(scram_verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", proof.expected));
-      assert(!scram_verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", proof.expected));
-      assert(!scram_verify("e=other", proof.expected))
-    },
-  }
-}
-
-test "a scram user name escapes what separates fields" {
-  assert_eq(scram_first_bare("a=b,c", "n"), "n=a=3Db=2Cc,r=n");
-  assert_eq(scram_first("user", "n1"), "n,,n=user,r=n1")
-}
-
-test "a challenge that is not one is refused rather than defaulted" {
-  assert_eq(scram_challenge("r=abc,s=!!,i=1"), None);
-  assert_eq(scram_challenge("r=abc,s=AAAA,i=x"), None);
-  assert_eq(scram_challenge("r=abc,s=AAAA,i=0"), None);
-  assert_eq(scram_challenge("s=AAAA,i=1"), None);
-  assert_eq(scram_challenge("r=abc,s=AAAA"), None)
 }
 
 test "the mechanisms an authentication message offers" {
