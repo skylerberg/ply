@@ -1,0 +1,595 @@
+//! The Protocol Buffers wire format: tags, varints, zigzag, the two fixed widths and
+//! length-delimited fields, written and read by field number.
+//!
+//! This is the encoding and no schema. A message is written as the fields its writer calls for,
+//! in the order it calls them, and read as the list of the fields it holds, each with its number,
+//! the offset of its tag and its payload as the wire frames it. What a payload means (which of
+//! `int64`, `sint64` or `bool` a varint is; whether a delimited one is text, bytes, a message or
+//! a packed run) is said by the function it is read through. A reader passes over a field number
+//! it does not name, which is how a message gains fields without breaking its readers.
+//!
+//! `fields` takes a `Message`, which only `message` and a delimited field make: bytes with the
+//! `Limits` they are read under. A nested message is a range of its parent's bytes and is never
+//! copied, so every offset in a refusal counts from the start of the outermost input. A reader
+//! refuses, saying why and at which byte: an input longer than the limit, a message nested past
+//! it, a truncated field, a varint past ten bytes or past 64 bits, a field number of zero or past
+//! 29 bits, a group (wire types 3 and 4, which proto3 never writes) and the two wire types
+//! nothing defines. `fields` and the readers of a field raise `protobuf.refused`; `parse` answers
+//! it as an `Err`.
+//!
+//! A 32-bit `float` is not here, since no `Float` has that width, and neither is a `.proto`
+//! reader: a message's field numbers are written where it is encoded.
+
+import std.bin (unzig, zig)
+import std.bytes (bytes_of_hex, hex_of, u32_at, u32_le, u64_le)
+import std.laws (inverse)
+
+// --- Writing ----------------------------------------------------------------
+
+/// `n` as a base-128 varint, least significant group first: its 64 bits read as unsigned, so a
+/// negative number takes ten bytes, as an `int64` does.
+pub fn varint(n: Int) -> Bytes / {abort.raise} = varint_groups(n, 10)
+
+fn varint_groups(n: Int, left: Int) -> Bytes / {abort.raise} =
+  if left <= 1 || n >>> 7 == 0 { byte_of_int(n & 0x7F) }
+  else { bytes_concat(byte_of_int(n & 0x7F | 0x80), varint_groups(n >>> 7, left - 1)) }
+
+/// The four wire types proto3 writes, as the number a tag carries in its low three bits.
+pub type Wire =
+  | VarintWire
+  /// Eight bytes, least significant first.
+  | Fixed64Wire
+  /// A varint length and that many bytes.
+  | DelimitedWire
+  /// Four bytes, least significant first.
+  | Fixed32Wire
+
+fn wire_number(w: Wire) -> Int =
+  match w { VarintWire -> 0, Fixed64Wire -> 1, DelimitedWire -> 2, Fixed32Wire -> 5 }
+
+/// The greatest field number a tag holds: 29 bits.
+pub fn max_field() -> Int = 536870911
+
+/// A field's tag. Panics for a field number below one or past `max_field`, which no message has.
+pub fn tag(field: Int, wire: Wire) -> Bytes / {abort.raise} =
+  if field < 1 || field > max_field() {
+    panic("a field number is from 1 to 536870911, and this one is " ++ int_to_string(field))
+  } else { varint(field << 3 | wire_number(wire)) }
+
+/// An `int32`, `int64`, `uint32`, `uint64` or enum field: the 64 bits of `n` as a varint.
+pub fn int_field(field: Int, n: Int) -> Bytes / {abort.raise} =
+  bytes_concat(tag(field, VarintWire), varint(n))
+
+/// A `sint32` or `sint64` field: the varint of its zigzag, which is `std.bin`'s `zig`.
+pub fn sint_field(field: Int, n: Int) -> Bytes / {abort.raise} = int_field(field, zig(n))
+
+/// A `bool` field.
+pub fn bool_field(field: Int, b: Bool) -> Bytes / {abort.raise} =
+  bytes_concat(tag(field, VarintWire), if b { b"\x01" } else { b"\x00" })
+
+/// A `fixed64` field.
+pub fn fixed64_field(field: Int, n: U64) -> Bytes / {abort.raise} =
+  bytes_concat(tag(field, Fixed64Wire), fixed64(n))
+
+/// An `sfixed64` field.
+pub fn sfixed64_field(field: Int, n: Int) -> Bytes / {abort.raise} =
+  bytes_concat(tag(field, Fixed64Wire), u64_le(n))
+
+/// A `double` field: the bits of `f`, so a NaN keeps its payload.
+pub fn double_field(field: Int, f: Float) -> Bytes / {abort.raise} =
+  sfixed64_field(field, bits_of_float(f))
+
+/// A `fixed32` field.
+pub fn fixed32_field(field: Int, n: U32) -> Bytes / {abort.raise} =
+  bytes_concat(tag(field, Fixed32Wire), u32_le(int_of_u32(n)))
+
+/// A `bytes` field.
+pub fn bytes_field(field: Int, b: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([tag(field, DelimitedWire), varint(bytes_len(b)), b])
+
+/// A `string` field: the text's UTF-8.
+pub fn string_field(field: Int, s: String) -> Bytes / {abort.raise} =
+  bytes_field(field, bytes_of_string(s))
+
+/// A field holding a message already encoded as `body`. It is written even where `body` is
+/// empty, which is how a message says a submessage is present and holds nothing.
+pub fn message_field(field: Int, body: Bytes) -> Bytes / {abort.raise} = bytes_field(field, body)
+
+/// A repeated varint field, packed: one delimited payload of the numbers in order. Nothing for
+/// an empty list, as proto3 writes it.
+pub fn packed_ints(field: Int, ns: List<Int>) -> Bytes / {abort.raise} =
+  packed(field, map(ns, varint))
+
+/// A repeated `fixed64` field, packed.
+pub fn packed_fixed64(field: Int, ns: List<U64>) -> Bytes / {abort.raise} =
+  packed(field, map(ns, fixed64))
+
+/// A repeated `double` field, packed.
+pub fn packed_doubles(field: Int, fs: List<Float>) -> Bytes / {abort.raise} =
+  packed(field, map(fs, |f: Float| u64_le(bits_of_float(f))))
+
+fn packed(field: Int, items: List<Bytes>) -> Bytes / {abort.raise} =
+  if len(items) == 0 { b"" } else { bytes_field(field, bytes_concat_all(items)) }
+
+fn fixed64(n: U64) -> Bytes / {abort.raise} =
+  bytes_concat(u32_le(int_of_u64(n & 0xFFFF_FFFFu64)), u32_le(int_of_u64(n >>> 32)))
+
+// --- Refusals ---------------------------------------------------------------
+
+/// Why a reader refused.
+pub type Why =
+  /// The input ends inside a field, or a length names more bytes than its message holds.
+  | Truncated
+  /// A varint of more than ten bytes, or one whose tenth byte holds bits past the sixty-fourth.
+  | Overflow
+  /// Wire type 3 or 4: a group, which proto2 wrote and proto3 does not.
+  | Group
+  /// Wire type 6 or 7, which it carries: nothing is defined for either.
+  | Reserved(Int)
+  /// A field number of zero, or one past `max_field`.
+  | NoField
+  /// A message nested deeper than `Limits.depth`.
+  | TooDeep
+  /// An input longer than `Limits.length`.
+  | TooLong
+  /// A field read as something its wire type does not frame: a varint read as a message, say.
+  | Mismatch
+  /// A `string` field that is not UTF-8.
+  | NotUtf8
+  /// A packed run of fixed-width numbers whose length is not a whole number of them.
+  | Ragged
+
+/// A refusal, and the offset in the outermost input of the byte the reader stood at.
+pub type Refusal = new { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect protobuf {
+  /// The bytes are not a message a reader can take, or a field is not what it was read as.
+  raise refused(e: Refusal)
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {protobuf.refused} = protobuf.refused({ at: at, why: why })
+
+// --- Reading ----------------------------------------------------------------
+
+/// What a reader holds an input to.
+pub type Limits = new {
+  /// How many messages may nest inside the outermost one.
+  depth: Int,
+  /// The most bytes the input may hold.
+  length: Int,
+}
+
+/// A message's bytes, where they stand in the input they were read from.
+pub opaque type Message = new { data: Bytes, from: Int, to: Int, room: Int }
+
+/// A field's payload, as its wire type frames it.
+pub type Value =
+  /// The 64 bits a varint spells.
+  | Varint(Int)
+  | Fixed64(U64)
+  | Delimited(Message)
+  | Fixed32(U32)
+
+/// One field of a message: its number, the offset of its tag, and its payload.
+pub type Field = new { number: Int, at: Int, value: Value }
+
+/// `data` as a message to read under `limits`. Refuses one longer than `limits.length`.
+pub fn message(data: Bytes, limits: Limits) -> Message / {protobuf.refused} =
+  if bytes_len(data) > limits.length { refuse(limits.length, TooLong) }
+  else { { data: data, from: 0, to: bytes_len(data), room: limits.depth } }
+
+/// The bytes a message is.
+pub fn payload(m: Message) -> Bytes / {abort.raise} = bytes_slice(m.data, m.from, m.to)
+
+/// Where a message starts in the outermost input.
+pub fn offset(m: Message) -> Int = m.from
+
+/// Every field of `m`, in the order the message holds them; a field written twice is there
+/// twice. Refuses a message nested past the limit it was made under.
+pub fn fields(m: Message) -> List<Field> / {protobuf.refused, abort.raise} =
+  if m.room < 0 { refuse(m.from, TooDeep) } else {
+    iterate({ at: m.from, acc: [] }, m.to - m.from + 1, |s: { at: Int, acc: List<Field> }|
+      if s.at >= m.to { Stop(s.acc) } else {
+        let read = field_at(m, s.at);
+        Continue({ at: read.next, acc: push(s.acc, read.field) })
+      })
+  }
+
+/// The fields of `data` read as one message, or why it is not one.
+pub fn parse(data: Bytes, limits: Limits) -> Result<List<Field>, Refusal> / {abort.raise} =
+  try { fields(message(data, limits)) }
+
+type FieldRead = { field: Field, next: Int }
+
+type VarintRead = { value: Int, next: Int }
+
+fn field_at(m: Message, at: Int) -> FieldRead / {protobuf.refused, abort.raise} = {
+  let key = varint_at(m, at);
+  let number = key.value >>> 3;
+  if number < 1 || number > max_field() { refuse(at, NoField) } else {
+    match key.value & 7 {
+      0 -> {
+        let v = varint_at(m, key.next);
+        { field: { number: number, at: at, value: Varint(v.value) }, next: v.next }
+      },
+      1 -> {
+        let low = word_at(m, key.next);
+        let high = word_at(m, key.next + 4);
+        {
+          field: {
+            number: number,
+            at: at,
+            value: Fixed64(u64_of_int(high) << 32 | u64_of_int(low)),
+          },
+          next: key.next + 8,
+        }
+      },
+      2 -> delimited_at(m, number, at, key.next),
+      5 ->
+        {
+          field: { number: number, at: at, value: Fixed32(u32_of_int(word_at(m, key.next))) },
+          next: key.next + 4,
+        },
+      3 | 4 -> refuse(at, Group),
+      wire -> refuse(at, Reserved(wire)),
+    }
+  }
+}
+
+fn delimited_at(
+  m: Message,
+  number: Int,
+  at: Int,
+  from: Int,
+) -> FieldRead / {protobuf.refused, abort.raise} = {
+  let length = varint_at(m, from);
+  if length.value < 0 || length.value > m.to - length.next { refuse(from, Truncated) } else {
+    let inner: Message = {
+      data: m.data,
+      from: length.next,
+      to: length.next + length.value,
+      room: m.room - 1,
+    };
+    { field: { number: number, at: at, value: Delimited(inner) }, next: length.next + length.value }
+  }
+}
+
+/// The four bytes at `at`, least significant first.
+fn word_at(m: Message, at: Int) -> Int / {protobuf.refused, abort.raise} =
+  if at + 4 > m.to { refuse(at, Truncated) }
+  else { match u32_at(m.data, at) { Some(n) -> n, None -> refuse(at, Truncated) } }
+
+fn varint_at(m: Message, at: Int) -> VarintRead / {protobuf.refused, abort.raise} =
+  iterate({ i: 0, value: 0 }, 11, |s: { i: Int, value: Int }|
+    if at + s.i >= m.to { refuse(at + s.i, Truncated) }
+    else if s.i >= 10 { refuse(at, Overflow) } else {
+      let b = bytes_at(m.data, at + s.i);
+      if s.i == 9 && b > 1 { refuse(at, Overflow) } else {
+        let value = s.value | (b & 0x7F) << 7 * s.i;
+        if b < 0x80 { Stop({ value: value, next: at + s.i + 1 }) }
+        else { Continue({ i: s.i + 1, value: value }) }
+      }
+    })
+
+// --- Reading a field ----------------------------------------------------------
+
+/// An `int32`, `int64`, `uint64` or enum field: the 64 bits its varint spells.
+pub fn int_of(f: Field) -> Int / {protobuf.refused} =
+  match f.value { Varint(n) -> n, _ -> refuse(f.at, Mismatch) }
+
+/// A `sint32` or `sint64` field.
+pub fn sint_of(f: Field) -> Int / {protobuf.refused} = unzig(int_of(f))
+
+/// A `bool` field: any varint but zero is true.
+pub fn bool_of(f: Field) -> Bool / {protobuf.refused} = int_of(f) != 0
+
+/// A `uint32` field: the low 32 bits of its varint, as every reader truncates one.
+pub fn uint32_of(f: Field) -> U32 / {protobuf.refused, abort.raise} =
+  u32_of_int(int_of(f) & 0xFFFF_FFFF)
+
+/// A `fixed64` field.
+pub fn fixed64_of(f: Field) -> U64 / {protobuf.refused} =
+  match f.value { Fixed64(n) -> n, _ -> refuse(f.at, Mismatch) }
+
+/// An `sfixed64` field.
+pub fn sfixed64_of(f: Field) -> Int / {protobuf.refused, abort.raise} = signed(fixed64_of(f))
+
+/// A `double` field.
+pub fn double_of(f: Field) -> Float / {protobuf.refused, abort.raise} =
+  float_of_bits(sfixed64_of(f))
+
+/// A `fixed32` field.
+pub fn fixed32_of(f: Field) -> U32 / {protobuf.refused} =
+  match f.value { Fixed32(n) -> n, _ -> refuse(f.at, Mismatch) }
+
+/// A field holding a message, to hand to `fields`.
+pub fn message_of(f: Field) -> Message / {protobuf.refused} =
+  match f.value { Delimited(m) -> m, _ -> refuse(f.at, Mismatch) }
+
+/// A `bytes` field.
+pub fn bytes_of(f: Field) -> Bytes / {protobuf.refused, abort.raise} = payload(message_of(f))
+
+/// A `string` field. Refuses bytes that are not UTF-8, at their first byte.
+pub fn string_of(f: Field) -> String / {protobuf.refused, abort.raise} = {
+  let m = message_of(f);
+  let raw = payload(m);
+  if bytes_is_utf8(raw) { string_of_bytes(raw) } else { refuse(m.from, NotUtf8) }
+}
+
+/// The numbers one occurrence of a repeated varint field holds: a packed run, or the one number
+/// an unpacked occurrence is. A reader takes either, whichever the writer chose.
+pub fn ints_of(f: Field) -> List<Int> / {protobuf.refused, abort.raise} =
+  match f.value {
+    Varint(n) -> [n],
+    Delimited(m) ->
+      iterate({ at: m.from, acc: [] }, m.to - m.from + 1, |s: { at: Int, acc: List<Int> }|
+        if s.at >= m.to { Stop(s.acc) } else {
+          let v = varint_at(m, s.at);
+          Continue({ at: v.next, acc: push(s.acc, v.value) })
+        }),
+    _ -> refuse(f.at, Mismatch),
+  }
+
+/// The numbers one occurrence of a repeated `fixed64` field holds, packed or not.
+pub fn fixed64s_of(f: Field) -> List<U64> / {protobuf.refused, abort.raise} =
+  match f.value {
+    Fixed64(n) -> [n],
+    Delimited(m) -> if (m.to - m.from) % 8 != 0 { refuse(m.from, Ragged) } else {
+      map(range(0, (m.to - m.from) / 8), |i: Int|
+        u64_of_int(word_at(m, m.from + 8 * i + 4)) << 32 | u64_of_int(word_at(m, m.from + 8 * i)))
+    },
+    _ -> refuse(f.at, Mismatch),
+  }
+
+/// The numbers one occurrence of a repeated `double` field holds, packed or not.
+pub fn doubles_of(f: Field) -> List<Float> / {protobuf.refused, abort.raise} =
+  map(fixed64s_of(f), |n: U64| float_of_bits(signed(n)))
+
+/// The `Int` whose 64 bits `n` is.
+fn signed(n: U64) -> Int / {abort.raise} =
+  int_of_u64(n >>> 32) << 32 | int_of_u64(n & 0xFFFF_FFFFu64)
+
+// --- Tests ------------------------------------------------------------------
+
+fn generous() -> Limits = { depth: 16, length: 1048576 }
+
+fn hex(b: Bytes) -> String / {abort.raise} = hex_of(b)
+
+fn read(data: Bytes) -> List<Field> / {protobuf.refused, abort.raise} =
+  fields(message(data, generous()))
+
+fn only(data: Bytes) -> Field / {protobuf.refused, abort.raise} =
+  match read(data) { [f] -> f, _ -> panic("expected one field") }
+
+fn refusal_of(text: String, limits: Limits) -> Option<Refusal> / {abort.raise} =
+  match parse(bytes_of_hex(text), limits) { Ok(_) -> None, Err(e) -> Some(e) }
+
+type Written = { name: String, bytes: Bytes, hex: String }
+
+/// The examples of the encoding guide (protobuf.dev/programming-guides/encoding), each as the
+/// guide writes its bytes.
+fn guide() -> List<Written> / {abort.raise} =
+  [
+    { name: "150 is two groups of seven bits", bytes: varint(150), hex: "9601" },
+    { name: "a varint field of 150", bytes: int_field(1, 150), hex: "089601" },
+    { name: "a string field", bytes: string_field(2, "testing"), hex: "120774657374696e67" },
+    { name: "a message in a field", bytes: message_field(3, int_field(1, 150)), hex: "1a03089601" },
+    {
+      name: "a packed run of varints",
+      bytes: packed_ints(6, [3, 270, 86942]),
+      hex: "3206038e029ea705",
+    },
+    {
+      name: "a negative int64 takes ten bytes",
+      bytes: int_field(1, -2),
+      hex: "08feffffffffffffffff01",
+    },
+    { name: "a sint64 of -500 is its zigzag", bytes: sint_field(1, -500), hex: "08e707" },
+    {
+      name: "a fixed32 holding the float 25.4",
+      bytes: fixed32_field(5, 0x41CB_CCCDu32),
+      hex: "2dcdcccb41",
+    },
+    { name: "a double of 25.4", bytes: double_field(1, 25.4), hex: "096666666666663940" },
+    { name: "a bool", bytes: bool_field(1, true), hex: "0801" },
+    { name: "an empty message is still written", bytes: message_field(4, b""), hex: "2200" },
+    { name: "an empty packed run is not", bytes: packed_ints(6, []), hex: "" },
+    {
+      name: "a field number past fifteen takes a two-byte tag",
+      bytes: int_field(16, 1),
+      hex: "800101",
+    },
+  ]
+
+test "the encoding guide: {c.name}" for c: Written in guide() { assert_eq(hex(c.bytes), c.hex) }
+
+type Zigzag = { number: Int, coded: Int }
+
+fn zigzags() -> List<Zigzag> =
+  [
+    { number: 0, coded: 0 },
+    { number: -1, coded: 1 },
+    { number: 1, coded: 2 },
+    { number: -2, coded: 3 },
+    { number: 2147483647, coded: 4294967294 },
+    { number: -2147483648, coded: 4294967295 },
+    { number: 0x7FFF_FFFF_FFFF_FFFF, coded: -2 },
+  ]
+
+test "zigzag of {c.number}" for c: Zigzag in zigzags() {
+  assert_eq(zig(c.number), c.coded);
+  assert_eq(unzig(c.coded), c.number)
+}
+
+law "a zigzag reads back" = inverse(zig, unzig)
+
+law "a varint field reads back, whatever its sign"
+  forall (n: Int) {
+    (try { int_of(only(int_field(1, n))) }) == Ok(n)
+  }
+
+law "a zigzag field reads back"
+  forall (n: Int) {
+    (try { sint_of(only(sint_field(7, n))) }) == Ok(n)
+  }
+
+law "the fixed widths read back"
+  forall (wide: U64, narrow: U32, signed: Int) {
+    (try { fixed64_of(only(fixed64_field(1, wide))) }) == Ok(wide)
+      && (try { fixed32_of(only(fixed32_field(2, narrow))) }) == Ok(narrow)
+      && (try { sfixed64_of(only(sfixed64_field(3, signed))) }) == Ok(signed)
+  }
+
+law "a double reads back bit for bit"
+  forall (bits: Int) {
+    (try { bits_of_float(double_of(only(double_field(1, float_of_bits(bits))))) })
+      == Ok(bits_of_float(float_of_bits(bits)))
+  }
+
+law "bytes and text read back"
+  forall (b: Bytes, s: String) {
+    (try { bytes_of(only(bytes_field(1, b))) }) == Ok(b)
+      && (try { string_of(only(string_field(2, s))) }) == Ok(s)
+  }
+
+law "a packed run reads back as the numbers it was written from"
+  forall (ns: List<Int>, wide: List<U64>) {
+    (try {
+        fold(read(packed_ints(1, ns)), [], |acc: List<Int>, f: Field|
+          fold(ints_of(f), acc, |inner: List<Int>, n: Int| push(inner, n)))
+      })
+      == Ok(ns)
+      && (try {
+        fold(read(packed_fixed64(2, wide)), [], |acc: List<U64>, f: Field|
+          fold(fixed64s_of(f), acc, |inner: List<U64>, n: U64| push(inner, n)))
+      })
+      == Ok(wide)
+  }
+
+law "a field's number and the fields after it survive any payload before them"
+  forall (k: Int, b: Bytes, n: Int) {
+    (try {
+        map(
+          read(bytes_concat(bytes_field(numbered(k), b), int_field(numbered(k), n))),
+          |f: Field| f.number,
+        )
+      })
+      == Ok([numbered(k), numbered(k)])
+  }
+
+/// A field number made of any `Int`.
+fn numbered(k: Int) -> Int = 1 + (k & 536870910)
+
+test "a reader takes a repeated number packed or one at a time" {
+  let unpacked = bytes_concat(int_field(6, 3), int_field(6, 270));
+  let packed = packed_ints(6, [3, 270]);
+  let numbers = |data: Bytes|
+    fold(read(data), [], |acc: List<Int>, f: Field|
+      fold(ints_of(f), acc, |inner: List<Int>, n: Int| push(inner, n)));
+  assert_eq(try { numbers(unpacked) }, Ok([3, 270]));
+  assert_eq(try { numbers(packed) }, Ok([3, 270]));
+  let doubles = bytes_concat(double_field(7, 1.5), packed_doubles(7, [2.5, -0.5]));
+  assert_eq(
+    try {
+      fold(read(doubles), [], |acc: List<Float>, f: Field|
+        fold(doubles_of(f), acc, |inner: List<Float>, x: Float| push(inner, x)))
+    },
+    Ok([1.5, 2.5, -0.5]),
+  )
+}
+
+test "a field a reader does not name is passed over, whatever its wire type" {
+  let data = bytes_concat_all([
+    int_field(1, 7),
+    fixed64_field(90, 5u64),
+    bytes_field(91, b"\xff\xfe"),
+    fixed32_field(92, 5u32),
+    string_field(2, "kept"),
+  ]);
+  let named = try {
+    fold(read(data), { a: 0, b: "" }, |acc: { a: Int, b: String }, f: Field|
+      match f.number { 1 -> { ..acc, a: int_of(f) }, 2 -> { ..acc, b: string_of(f) }, _ -> acc })
+  };
+  assert_eq(named, Ok({ a: 7, b: "kept" }))
+}
+
+test "a nested message is read in place, and its offsets count from the outermost input" {
+  let inner = bytes_concat(int_field(1, 150), string_field(2, "x"));
+  let outer = bytes_concat(string_field(1, "pad"), message_field(3, inner));
+  let read_inner = try {
+    match read(outer) {
+      [_, f] -> map(fields(message_of(f)), |g: Field| g.at),
+      _ -> panic("expected two fields"),
+    }
+  };
+  assert_eq(read_inner, Ok([7, 10]));
+  assert_eq(try { offset(message_of(only(message_field(3, inner)))) }, Ok(2))
+}
+
+type Refused = { name: String, hex: String, at: Int, why: Why }
+
+fn refusals() -> List<Refused> =
+  [
+    { name: "a tag and no payload", hex: "08", at: 1, why: Truncated },
+    { name: "a varint that never ends", hex: "08ffff", at: 3, why: Truncated },
+    { name: "a varint of eleven bytes", hex: "08ffffffffffffffffffff01", at: 1, why: Overflow },
+    { name: "a varint past 64 bits", hex: "08ffffffffffffffffff02", at: 1, why: Overflow },
+    { name: "a length past the end", hex: "120574657374", at: 1, why: Truncated },
+    { name: "a fixed64 cut short", hex: "0901020304", at: 5, why: Truncated },
+    { name: "a fixed32 cut short", hex: "2d0102", at: 1, why: Truncated },
+    { name: "field number zero", hex: "0001", at: 0, why: NoField },
+    { name: "a start group", hex: "0b", at: 0, why: Group },
+    { name: "an end group", hex: "0c", at: 0, why: Group },
+    { name: "wire type six", hex: "0e", at: 0, why: Reserved(6) },
+    { name: "wire type seven", hex: "0f", at: 0, why: Reserved(7) },
+  ]
+
+test "refused: {c.name}" for c: Refused in refusals() {
+  assert_eq(refusal_of(c.hex, generous()), Some({ at: c.at, why: c.why }))
+}
+
+test "an input past the length limit is refused before a byte of it is read" {
+  let limits: Limits = { depth: 4, length: 3 };
+  assert_eq(refusal_of("089601", limits), None);
+  assert_eq(refusal_of("08960108", limits), Some({ at: 3, why: TooLong }))
+}
+
+fn nested(levels: Int) -> Bytes / {abort.raise} =
+  fold(range(0, levels), int_field(1, 1), |body: Bytes, _: Int| message_field(2, body))
+
+fn deepest(m: Message, left: Int) -> Int / {protobuf.refused, abort.raise} =
+  if left <= 0 { 0 } else {
+    fold(fields(m), 0, |sum: Int, f: Field|
+      match f.number { 1 -> sum + int_of(f), _ -> sum + deepest(message_of(f), left - 1) })
+  }
+
+test "a message nested past the depth limit is refused where the limit ran out" {
+  let limits: Limits = { depth: 3, length: 1024 };
+  assert_eq(try { deepest(message(nested(3), limits), 16) }, Ok(1));
+  assert_eq(try { deepest(message(nested(4), limits), 16) }, Err({ at: 8, why: TooDeep }))
+}
+
+test "a field read as what its wire type does not frame is refused at its tag" {
+  assert_eq(try { offset(message_of(only(int_field(1, 5)))) }, Err({ at: 0, why: Mismatch }));
+  assert_eq(try { int_of(only(string_field(1, "x"))) }, Err({ at: 0, why: Mismatch }));
+  assert_eq(try { fixed64_of(only(fixed32_field(1, 1u32))) }, Err({ at: 0, why: Mismatch }));
+  assert_eq(try { string_of(only(bytes_field(1, b"\xff"))) }, Err({ at: 2, why: NotUtf8 }));
+  assert_eq(try { fixed64s_of(only(bytes_field(1, b"\x01\x02\x03"))) }, Err({ at: 2, why: Ragged }))
+}
+
+test "the raising reader raises what `parse` answers, and a task may perform it" {
+  let got = simulate {
+    let t = task.spawn(|| try { read(bytes_of_hex("0b")) });
+    task.join(t)
+  };
+  assert_eq(result_refusal(got), Some({ at: 0, why: Group }))
+}
+
+fn result_refusal(r: Result<List<Field>, Refusal>) -> Option<Refusal> =
+  match r { Ok(_) -> None, Err(e) -> Some(e) }
+
+law "a uint32 is the low 32 bits of its varint"
+  forall (n: Int) {
+    (try { to_int(uint32_of(only(int_field(1, n)))) }) == Ok(Some(n & 0xFFFF_FFFF))
+  }
