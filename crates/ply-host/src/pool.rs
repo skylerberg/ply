@@ -62,6 +62,10 @@ pub enum JobOutput {
     /// `None` when the child was still running at the deadline.
     MaybeFinished(Option<Finished>),
     Heard(Heard),
+    /// What a statement answered, as `std.sqlite` reads it.
+    Reply(ply_eval::sqlite::Reply),
+    /// A connection's number, or why its database did not open.
+    Connected(Result<i64, ply_eval::sqlite::Failure>),
     /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
     Refused(Diagnostic),
@@ -376,6 +380,9 @@ fn take(state: &mut State, token: u64) -> Taken {
         JobOutput::Finished(exit) => Ok(finished(exit)),
         JobOutput::MaybeFinished(exit) => Ok(option(exit.map(finished))),
         JobOutput::Heard(heard) => Ok(heard_value(heard)),
+        JobOutput::Reply(reply) => Ok(reply.into_value()),
+        JobOutput::Connected(Ok(connection)) => Ok(Value::ctor("Ok", vec![Value::Int(connection)])),
+        JobOutput::Connected(Err(failure)) => Ok(Value::ctor("Err", vec![failure.into_value()])),
         JobOutput::Refused(diagnostic) => Err(diagnostic),
         JobOutput::Failed(message) => Err(Diagnostic::error(
             codes::RUNTIME_ERROR,

@@ -297,6 +297,17 @@ impl FsHost {
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         self.pool.block_on(pending)
     }
+
+    /// Work on something under one of these roots, waited on with their own operations.
+    pub(crate) fn submit(
+        &self,
+        span: Span,
+        label: &'static str,
+        what: &'static str,
+        job: Box<dyn FnOnce() -> JobOutput + Send + 'static>,
+    ) -> Result<Pending, Diagnostic> {
+        self.pool.submit(span, label, what, job)
+    }
 }
 
 pub fn registrations(fs: &Arc<FsHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
