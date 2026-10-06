@@ -2,7 +2,7 @@
 
 use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, clock, config, fs, process, random, sched, tcp, time, trace};
+use crate::{certgen, clock, config, fs, process, random, sched, sqlite, tcp, time, trace};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
 use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
 use std::rc::Rc;
@@ -17,6 +17,8 @@ pub struct Host {
     shutdown: Option<Arc<Shutdown>>,
     /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
+    /// The database connections open under those roots.
+    sqlite: Arc<sqlite::SqliteHost>,
     /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
     /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
@@ -43,12 +45,14 @@ impl Host {
         net.ring(&bell);
         let fs = fs::FsHost::new(fs::Roots::new());
         fs.ring(&bell);
+        let fs = Arc::new(fs);
         Host {
             net: Arc::new(net),
             config: Arc::new(config::Snapshot::unopened()),
             trace: Arc::new(trace::Trace::default()),
             shutdown: None,
-            fs: Arc::new(fs),
+            sqlite: Arc::new(sqlite::SqliteHost::new(Arc::clone(&fs))),
+            fs,
             process: None,
             time: Arc::new(time::TimeHost::new()),
             bell,
@@ -58,8 +62,10 @@ impl Host {
     pub fn rooted(self, roots: fs::Roots) -> Host {
         let fs = fs::FsHost::new(roots);
         fs.ring(&self.bell);
+        let fs = Arc::new(fs);
         Host {
-            fs: Arc::new(fs),
+            sqlite: Arc::new(sqlite::SqliteHost::new(Arc::clone(&fs))),
+            fs,
             ..self
         }
     }
@@ -118,6 +124,7 @@ impl Host {
         random::register(&mut registry);
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
+        sqlite::register(&mut registry, Arc::clone(&self.sqlite));
         time::register(&mut registry, Arc::clone(&self.time));
         clock::register(&mut registry, Arc::clone(&self.time));
         certgen::register(&mut registry);
@@ -131,6 +138,7 @@ impl Host {
         Rc::new(Facilities {
             net: Arc::clone(&self.net),
             fs: Arc::clone(&self.fs),
+            sqlite: Arc::clone(&self.sqlite),
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
@@ -187,6 +195,7 @@ pub fn registry_over(trace: Arc<trace::Trace>) -> HostRegistry {
 struct Facilities {
     net: Arc<tcp::TcpHost>,
     fs: Arc<fs::FsHost>,
+    sqlite: Arc<sqlite::SqliteHost>,
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
@@ -367,8 +376,10 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Closes the spans this entry point left open, and warns of them.
+    /// Closes the spans this entry point left open, and warns of them, and the database
+    /// connections it left open.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
+        self.sqlite.end_machine(machine);
         self.trace.end_entry_point(machine).into_iter().collect()
     }
 

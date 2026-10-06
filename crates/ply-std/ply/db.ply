@@ -41,6 +41,7 @@ import std.string
 import std.list (concat, contains)
 import std.bytes
 import std.option (option_unwrap_or)
+import std.result (result_map, result_map_err)
 
 /// The database, one table per label.
 pub nondet effect db {
@@ -3958,12 +3959,29 @@ fn is_word_byte(c: Int) -> Bool =
 // one that under-reports. The reader is a tokenizer and a small parser over it, and it refuses far
 // more than it accepts: `with` is the only admitted construct that can hide a verb.
 
-/// What a statement does, which decides the operations that may perform it.
-pub type ScanKind = | KSelect | KInsert | KUpdate | KDelete | KValues
+/// The SQL a statement is written in, which decides how the reader lexes it and how far it reads.
+/// A `Postgres` statement is read whole, for the tables it reaches. A `Sqlite` statement is read
+/// for its verb and for the words that would read a clock or draw a random number: its label is
+/// its database, so its tables are no footprint, and the engine itself refuses the rest when it
+/// prepares the statement (`std.sqlite`).
+pub type Dialect = | Postgres | Sqlite
 
-/// Whether a statement of this kind writes.
+/// What a statement does, which decides the operations that may perform it. `KDefine` and
+/// `KPragma` are a `Sqlite` statement's alone: one that makes, drops or alters a schema object,
+/// and a pragma.
+pub type ScanKind = | KSelect | KInsert | KUpdate | KDelete | KValues | KDefine | KPragma
+
+/// Whether a statement of this kind writes. A pragma reads or sets, which only the engine says.
 pub fn kind_writes(k: ScanKind) -> Bool =
-  match k { KSelect -> false, KValues -> false, KInsert -> true, KUpdate -> true, KDelete -> true }
+  match k {
+    KSelect -> false,
+    KValues -> false,
+    KPragma -> false,
+    KInsert -> true,
+    KUpdate -> true,
+    KDelete -> true,
+    KDefine -> true,
+  }
 
 /// The verb a statement of this kind opens with.
 pub fn kind_text(k: ScanKind) -> String =
@@ -3973,6 +3991,8 @@ pub fn kind_text(k: ScanKind) -> String =
     KInsert -> "insert",
     KUpdate -> "update",
     KDelete -> "delete",
+    KDefine -> "create",
+    KPragma -> "pragma",
   }
 
 /// The tables a statement names, split by what it does to them and deduplicated: one name is one
@@ -4071,42 +4091,57 @@ pub fn sql_is_punct(t: SqlTok, p: String) -> Bool = match t { SqlPunct(x) -> x =
 /// Whether the token is a `;`.
 pub fn sql_is_semi(t: SqlTok) -> Bool = match t { SqlSemi -> true, _ -> false }
 
-/// The tokens of `sql`, in order. Whitespace and comments are dropped, and a quote that is never
-/// closed is refused rather than guessed at: past one, the reader cannot tell text from statement.
-pub fn tokenize(sql: String) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
+/// The tokens of `sql`, in order, as `dialect` lexes them. Whitespace and comments are dropped,
+/// and a quote that is never closed is refused rather than guessed at: past one, the reader cannot
+/// tell text from statement.
+pub fn tokenize(dialect: Dialect, sql: String) -> Result<List<SqlTokAt>, DbError> / {abort.raise} = {
   let b = bytes_of_string(sql);
-  sql_tokens_from(b, 0, [], bytes_len(b) + 1)
+  sql_tokens_from(dialect, b, 0, [], bytes_len(b) + 1)
 }
 
 /// `left` bounds the tokens: each takes a byte at least.
 fn sql_tokens_from(
+  dialect: Dialect,
   b: Bytes,
   at: Int,
   acc: List<SqlTokAt>,
   left: Int,
 ) -> Result<List<SqlTokAt>, DbError> / {abort.raise} =
   if left <= 0 { panic("more rounds than input") } else {
-    let i = sql_skip_trivia(b, at, bytes_len(b) + 1)?;
+    let i = sql_skip_trivia(dialect, b, at, bytes_len(b) + 1)?;
     if i >= bytes_len(b) { Ok(acc) } else {
-      let step = sql_next_token(b, i)?;
-      sql_tokens_from(b, step.next, push(acc, step.tok), left - 1)
+      let lexed = match dialect {
+        Postgres -> sql_next_token(b, i),
+        Sqlite -> sqlite_next_token(b, i),
+      };
+      let step = lexed?;
+      sql_tokens_from(dialect, b, step.next, push(acc, step.tok), left - 1)
     }
   }
 
 /// `left` bounds the rounds: each takes a byte at least.
-fn sql_skip_trivia(b: Bytes, at: Int, left: Int) -> Result<Int, DbError> / {abort.raise} =
+fn sql_skip_trivia(
+  dialect: Dialect,
+  b: Bytes,
+  at: Int,
+  left: Int,
+) -> Result<Int, DbError> / {abort.raise} =
   if left <= 0 { panic("more rounds than input") } else {
     if at >= bytes_len(b) { Ok(at) }
-    else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(b, at + 1, left - 1) }
+    else if is_space_byte(bytes_at(b, at)) { sql_skip_trivia(dialect, b, at + 1, left - 1) }
     else if bytes_at(b, at) == 45 && sql_byte_is(b, at + 1, 45) {
-      sql_skip_trivia(b, sql_past_line(b, at), left - 1)
+      sql_skip_trivia(dialect, b, sql_past_line(b, at), left - 1)
     } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
-      match sql_past_comment(b, at + 2, 1) {
+      match sql_past_comment(b, at + 2, 1, sql_comments_nest(dialect)) {
         Err(_) -> Err(sql_unclosed(b, at, "a block comment")),
-        Ok(e) -> sql_skip_trivia(b, e, left - 1),
+        Ok(e) -> sql_skip_trivia(dialect, b, e, left - 1),
       }
     } else { Ok(at) }
   }
+
+/// Postgres nests block comments and SQLite ends one at its first `*/`: read the other way, a
+/// comment would hide statement text from the reader that the engine runs.
+fn sql_comments_nest(dialect: Dialect) -> Bool = match dialect { Postgres -> true, Sqlite -> false }
 
 fn sql_byte_is(b: Bytes, at: Int, c: Int) -> Bool / {abort.raise} =
   at < bytes_len(b) && bytes_at(b, at) == c
@@ -4116,13 +4151,20 @@ fn sql_past_line(b: Bytes, at: Int) -> Int / {abort.raise} =
   else if bytes_at(b, at) == 10 { at + 1 }
   else { sql_past_line(b, at + 1) }
 
-/// Postgres nests block comments, so stopping at the first `*/` would leave statement text behind.
-fn sql_past_comment(b: Bytes, at: Int, depth: Int) -> Result<Int, Int> / {abort.raise} =
-  if at >= bytes_len(b) { Err(at) } else if bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
-    sql_past_comment(b, at + 2, depth + 1)
+/// Where a block comment ends. Where comments nest, stopping at the first `*/` would leave
+/// statement text behind.
+fn sql_past_comment(
+  b: Bytes,
+  at: Int,
+  depth: Int,
+  nests: Bool,
+) -> Result<Int, Int> / {abort.raise} =
+  if at >= bytes_len(b) { Err(at) }
+  else if nests && bytes_at(b, at) == 47 && sql_byte_is(b, at + 1, 42) {
+    sql_past_comment(b, at + 2, depth + 1, nests)
   } else if bytes_at(b, at) == 42 && sql_byte_is(b, at + 1, 47) {
-    if depth == 1 { Ok(at + 2) } else { sql_past_comment(b, at + 2, depth - 1) }
-  } else { sql_past_comment(b, at + 1, depth) }
+    if depth == 1 { Ok(at + 2) } else { sql_past_comment(b, at + 2, depth - 1, nests) }
+  } else { sql_past_comment(b, at + 1, depth, nests) }
 
 fn sql_next_token(
   b: Bytes,
@@ -4150,6 +4192,73 @@ fn sql_next_token(
   } else { Ok(sql_filled(b, at, at + 1, SqlPunct(string_of_bytes(bytes_slice(b, at, at + 1))))) }
 }
 
+/// One token as SQLite lexes it: no backslash escape and no dollar quote, a name quoted with
+/// `"`, `` ` `` or `[`, and a placeholder written `?` or `?3`. A named parameter is refused, since
+/// a statement's parameters are bound by their place.
+fn sqlite_next_token(
+  b: Bytes,
+  at: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} = {
+  let c = bytes_at(b, at);
+  if c == 59 { Ok(sql_filled(b, at, at + 1, SqlSemi)) }
+  else if c == 39 { sql_literal(b, at, at + 1, at, false) }
+  else if (c == 120 || c == 88) && sql_byte_is(b, at + 1, 39) {
+    sql_literal(b, at, at + 2, at + 1, false)
+  } else if c == 34 { sql_quoted_word(b, at, at + 1, at) }
+  else if c == 96 { sqlite_quoted_word(b, at, 96) }
+  else if c == 91 { sqlite_quoted_word(b, at, 93) }
+  else if c == 63 { Ok(sql_filled(b, at, sqlite_past_digits(b, at + 1), SqlPlaceholder)) }
+  else if c == 58 || c == 64 || c == 36 {
+    Err(
+      sql_refuse(
+        "`" ++ string_of_bytes(bytes_slice(b, at, at + 1)) ++ "`",
+        at,
+        "a named parameter is not bound: write `?1`, `?2` where the parameters go",
+      ),
+    )
+  } else if is_digit(c) { Ok(sql_filled(b, at, sql_past_number(b, at), SqlNumber)) }
+  else if sql_is_name_byte(c) {
+    let end = sql_past_word(b, at);
+    let word = string::ascii_lower(string_of_bytes(bytes_slice(b, at, end)));
+    Ok(sql_filled(b, at, end, SqlWord({ text: word, quoted: false })))
+  } else { Ok(sql_filled(b, at, at + 1, SqlPunct(string_of_bytes(bytes_slice(b, at, at + 1))))) }
+}
+
+/// A name SQLite quotes with `` ` `` or `[`, closed by `close`, where a doubled `` ` `` stands
+/// for one.
+fn sqlite_quoted_word(
+  b: Bytes,
+  at: Int,
+  close: Int,
+) -> Result<{ tok: SqlTokAt, next: Int }, DbError> / {abort.raise} =
+  match sqlite_end_of_quoted(b, at + 1, at, close) {
+    Err(e) -> Err(e),
+    Ok(e) ->
+      Ok(
+        sql_filled(
+          b,
+          at,
+          e,
+          SqlWord({ text: string_of_bytes(bytes_slice(b, at + 1, e - 1)), quoted: true }),
+        ),
+      ),
+  }
+
+fn sqlite_end_of_quoted(
+  b: Bytes,
+  at: Int,
+  open: Int,
+  close: Int,
+) -> Result<Int, DbError> / {abort.raise} =
+  if at >= bytes_len(b) { Err(sql_unclosed(b, open, "a quoted identifier")) }
+  else if close == 96 && bytes_at(b, at) == 96 && sql_byte_is(b, at + 1, 96) {
+    sqlite_end_of_quoted(b, at + 2, open, close)
+  } else if bytes_at(b, at) == close { Ok(at + 1) }
+  else { sqlite_end_of_quoted(b, at + 1, open, close) }
+
+fn sqlite_past_digits(b: Bytes, at: Int) -> Int / {abort.raise} =
+  if at < bytes_len(b) && is_digit(bytes_at(b, at)) { sqlite_past_digits(b, at + 1) } else { at }
+
 fn sql_filled(
   b: Bytes,
   at: Int,
@@ -4162,7 +4271,7 @@ fn sql_unclosed(b: Bytes, at: Int, what: String) -> DbError =
   db_error(
     "0A000",
     "",
-    what ++ " opened at byte " ++ int_to_string(at)
+    what ++ " opened" ++ sql_at_byte() ++ int_to_string(at)
       ++ " is never closed, and past one the reader cannot tell text from statement",
   )
 
@@ -4281,8 +4390,11 @@ pub fn sql_token_summary(t: SqlTokAt) -> String =
   }
 
 /// `tokenize`, each token as `sql_token_summary` writes it.
-pub fn sql_tokenize_summary(sql: String) -> Result<List<String>, DbError> / {abort.raise} =
-  match tokenize(sql) {
+pub fn sql_tokenize_summary(
+  dialect: Dialect,
+  sql: String,
+) -> Result<List<String>, DbError> / {abort.raise} =
+  match tokenize(dialect, sql) {
     Err(e) -> Err(e),
     Ok(ts) -> Ok(map(ts, |t: SqlTokAt| sql_token_summary(t))),
   }
@@ -4307,7 +4419,7 @@ fn sql_refuse(where_: String, at: Int, why: String) -> DbError =
   db_error(
     "0A000",
     "",
-    "the database driver refuses this statement: " ++ where_ ++ " at byte " ++ int_to_string(at)
+    "the database driver refuses this statement: " ++ where_ ++ sql_at_byte() ++ int_to_string(at)
       ++ ". "
       ++ why,
   )
@@ -4324,7 +4436,8 @@ fn sql_stacked(at: Int) -> DbError =
   db_error(
     "0A000",
     "",
-    "the database driver refuses this statement: `Stmt` holds more than one statement, and a `;` is at byte "
+    "the database driver refuses this statement: `Stmt` holds more than one statement, and a `;` is"
+      ++ sql_at_byte()
       ++ int_to_string(at)
       ++ ". One `Stmt` is one statement, which is what removes the stacked-statement payload an injected fragment would otherwise become",
   )
@@ -4629,24 +4742,25 @@ fn sql_check_call(parser: SqlParser) -> Result<SqlParser, DbError> =
   }
 
 fn sql_reject_nondeterministic(parser: SqlParser) -> Result<SqlParser, DbError> =
-  sql_reject_in(parser.toks, parser)
+  match sql_reject_in(sql_nondeterministic(), parser.toks) { Err(e) -> Err(e), Ok(_) -> Ok(parser) }
 
-fn sql_reject_in(toks: List<SqlTokAt>, parser: SqlParser) -> Result<SqlParser, DbError> =
+/// Refuses the first unquoted word of `toks` that is one of `words`.
+fn sql_reject_in(words: List<String>, toks: List<SqlTokAt>) -> Result<(), DbError> =
   match toks {
-    [] -> Ok(parser),
+    [] -> Ok(()),
     [t, ..rest] -> match t.tok {
-      SqlWord(w) -> if !w.quoted && contains(sql_nondeterministic(), w.text) {
-        Err(
-          sql_refuse_tok(
-            t,
-            "`" ++ w.text
-              ++ "` is not a function of the program's state, so it cannot be hidden in statement text: pass the value as a parameter, where the row the effect system sees says where it came from",
-          ),
-        )
-      } else { sql_reject_in(rest, parser) },
-      _ -> sql_reject_in(rest, parser),
+      SqlWord(w) -> if !w.quoted && contains(words, w.text) { Err(sql_not_of_state(t, w.text)) }
+      else { sql_reject_in(words, rest) },
+      _ -> sql_reject_in(words, rest),
     },
   }
+
+fn sql_not_of_state(t: SqlTokAt, word: String) -> DbError =
+  sql_refuse_tok(
+    t,
+    "`" ++ word
+      ++ "` is not a function of the program's state, so it cannot be hidden in statement text: pass the value as a parameter, where the row the effect system sees says where it came from",
+  )
 
 // --- The statement ------------------------------------------------------------------
 
@@ -5476,16 +5590,194 @@ fn reader_functions() -> Int = 30
 /// What `sql` does and which tables it reaches, or why it is refused. Nothing below the driver's
 /// own read of the verb depends on a guess: an unmodelled construct is a table set that would be
 /// wrong, and a wrong table set is a scheduler that runs two writers beside each other.
-pub fn scan_statement(sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
-  match tokenize(sql) {
+pub fn scan_statement(dialect: Dialect, sql: String) -> Result<SqlScan, DbError> / {abort.raise} =
+  match tokenize(dialect, sql) {
     Err(e) -> Err(e),
-    Ok(toks) -> match sql_statement(
-        { toks: toks, ctes: [], depth: 0, end_pos: bytes_len(bytes_of_string(sql)) },
-        (len(toks) + 1) * reader_functions(),
-      ) {
-      Err(e) -> Err(e),
-      Ok(s) -> match sql_nothing_left(s.parser) { Err(e) -> Err(e), Ok(_) -> Ok(s.scan) },
+    Ok(toks) -> match dialect {
+      Sqlite -> sqlite_shape(toks, bytes_len(bytes_of_string(sql))),
+      Postgres -> match sql_statement(
+          { toks: toks, ctes: [], depth: 0, end_pos: bytes_len(bytes_of_string(sql)) },
+          (len(toks) + 1) * reader_functions(),
+        ) {
+        Err(e) -> Err(e),
+        Ok(s) -> match sql_nothing_left(s.parser) { Err(e) -> Err(e), Ok(_) -> Ok(s.scan) },
+      },
     },
+  }
+
+/// The byte of its statement a refusal of the reader's stands at, which its words name; `None`
+/// for an error the reader did not make.
+pub fn refusal_byte(e: DbError) -> Option<Int> / {abort.raise} = {
+  let words = bytes_of_string(e.detail);
+  let marker = bytes_of_string(sql_at_byte());
+  // The last one: what a refusal quotes of the statement comes before the byte it stands at.
+  let last = iterate(
+    { from: 0, found: None },
+    bytes_len(words) + 1,
+    |s: { from: Int, found: Option<Int> }|
+      match bytes_index_of_from(words, marker, s.from) {
+        None -> Stop(s.found),
+        Some(i) -> Continue({ from: i + 1, found: Some(i) }),
+      },
+  );
+  match last {
+    None -> None,
+    Some(i) -> {
+      let from = i + bytes_len(marker);
+      let end = sqlite_past_digits(words, from);
+      if end == from { None }
+      else { Some(int_or_zero(string_of_bytes(bytes_slice(words, from, end)))) }
+    },
+  }
+}
+
+/// What every refusal of the reader's writes before the byte it stands at.
+fn sql_at_byte() -> String = " at byte "
+
+// --- A SQLite statement's shape ------------------------------------------------------------
+
+/// The words that read SQLite's clock wherever they stand: each is reserved, so none is a name.
+fn sqlite_clock_words() -> List<String> = ["current_timestamp", "current_date", "current_time"]
+
+/// SQLite's functions that draw a random number.
+fn sqlite_random_calls() -> List<String> = ["random", "randomblob"]
+
+/// SQLite's date and time functions, which read the clock for the time `now` or for none.
+fn sqlite_clocked_calls() -> List<String> =
+  ["date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff"]
+
+/// What a SQLite statement does, by the verb it opens with, or why it is refused. The engine
+/// refuses each of these too: said here, a tagged literal is refused when the program is checked.
+fn sqlite_shape(toks: List<SqlTokAt>, end: Int) -> Result<SqlScan, DbError> / {abort.raise} =
+  match toks {
+    [] -> Err(sql_refuse("the statement ends", end, "this statement is empty")),
+    [t, ..rest] -> {
+      let kind = sqlite_kind(t, rest)?;
+      sql_reject_in(sqlite_clock_words(), toks)?;
+      sqlite_calls(toks)?;
+      Ok({ kind: kind, tables: no_sql_tables() })
+    },
+  }
+
+fn sqlite_kind(t: SqlTokAt, rest: List<SqlTokAt>) -> Result<ScanKind, DbError> / {abort.raise} = {
+  let verb = match t.tok { SqlWord(w) -> if w.quoted { "" } else { w.text }, _ -> "" };
+  if verb == "select" { Ok(KSelect) }
+  else if verb == "values" { Ok(KValues) }
+  else if verb == "insert" || verb == "replace" { Ok(KInsert) }
+  else if verb == "update" { Ok(KUpdate) }
+  else if verb == "delete" { Ok(KDelete) }
+  else if verb == "with" { sqlite_after_with(t, rest, 0) }
+  else if verb == "pragma" { Ok(KPragma) }
+  else if verb == "create" { sqlite_created(t, rest) }
+  else if contains(["drop", "alter", "reindex", "analyze"], verb) { Ok(KDefine) }
+  else { Err(sql_refuse_tok(t, sqlite_verb_refusal(verb))) }
+}
+
+fn sqlite_verb_refusal(verb: String) -> String =
+  if contains(["attach", "detach", "vacuum"], verb) {
+    "a connection reaches its own database and no other file: `std.sqlite`'s `backup` writes a copy under a root"
+  } else if contains(["begin", "commit", "end", "rollback", "savepoint", "release"], verb) {
+    "a transaction is opened and closed by `std.sqlite`'s `transaction`, never by a statement"
+  } else {
+    "a statement begins with one of `select`, `insert`, `replace`, `update`, `delete`, `values`, `with`, `create`, `drop`, `alter`, `reindex`, `analyze` or `pragma`"
+  }
+
+/// The verb a `with` leads to: the first one outside its parentheses.
+fn sqlite_after_with(
+  with_: SqlTokAt,
+  toks: List<SqlTokAt>,
+  depth: Int,
+) -> Result<ScanKind, DbError> =
+  match toks {
+    [] -> Err(sql_refuse_tok(with_, "this `with` leads to no statement")),
+    [t, ..rest] -> if sql_is_punct(t.tok, "(") { sqlite_after_with(with_, rest, depth + 1) }
+    else if sql_is_punct(t.tok, ")") { sqlite_after_with(with_, rest, depth - 1) }
+    else if depth > 0 { sqlite_after_with(with_, rest, depth) }
+    else if sql_is_word(t.tok, "select") { Ok(KSelect) }
+    else if sql_is_word(t.tok, "values") { Ok(KValues) }
+    else if sql_is_word(t.tok, "insert") || sql_is_word(t.tok, "replace") { Ok(KInsert) }
+    else if sql_is_word(t.tok, "update") { Ok(KUpdate) }
+    else if sql_is_word(t.tok, "delete") { Ok(KDelete) }
+    else { sqlite_after_with(with_, rest, depth) },
+  }
+
+/// `create`, refused for what belongs to a connection and for a virtual table.
+fn sqlite_created(create: SqlTokAt, rest: List<SqlTokAt>) -> Result<ScanKind, DbError> =
+  match rest {
+    [t, ..] -> if sql_is_word(t.tok, "temp") || sql_is_word(t.tok, "temporary") {
+      Err(
+        sql_refuse_tok(
+          t,
+          "temporary tables, indexes, triggers and views belong to a connection, not to the database",
+        ),
+      )
+    } else if sql_is_word(t.tok, "virtual") {
+      Err(sql_refuse_tok(t, "virtual tables are not admitted"))
+    } else { Ok(KDefine) },
+    [] -> Err(sql_refuse_tok(create, "this `create` makes nothing")),
+  }
+
+/// Refuses a call that draws a random number, and a date or time function written with no time,
+/// with the time `'now'`, or with the modifier `'localtime'` or `'utc'`. A name is told from a
+/// call by the `(` after it, so a table named `random` is written `"random"`.
+fn sqlite_calls(toks: List<SqlTokAt>) -> Result<(), DbError> / {abort.raise} =
+  match toks {
+    [] -> Ok(()),
+    [t, ..rest] -> {
+      let called = match t.tok {
+        SqlWord(w) -> if !w.quoted && sql_opens(rest) { w.text } else { "" },
+        _ -> "",
+      };
+      if contains(sqlite_random_calls(), called) { Err(sql_not_of_state(t, called)) }
+      else if contains(sqlite_clocked_calls(), called) {
+        sqlite_clocked(t, called, sql_rest(rest), 1, true)?;
+        sqlite_calls(rest)
+      } else { sqlite_calls(rest) }
+    },
+  }
+
+fn sql_opens(toks: List<SqlTokAt>) -> Bool =
+  match toks { [t, ..] -> sql_is_punct(t.tok, "("), [] -> false }
+
+/// The arguments of a date or time call, from just past its `(`: `bare` while none has been read.
+fn sqlite_clocked(
+  call: SqlTokAt,
+  name: String,
+  toks: List<SqlTokAt>,
+  depth: Int,
+  bare: Bool,
+) -> Result<(), DbError> / {abort.raise} =
+  match toks {
+    [] -> Ok(()),
+    [t, ..rest] -> if sql_is_punct(t.tok, ")") {
+      if depth > 1 { sqlite_clocked(call, name, rest, depth - 1, false) } else if bare {
+        Err(
+          sql_refuse_tok(
+            call,
+            "`" ++ name
+              ++ "` with no time reads the clock: pass the time as a parameter, where the row the effect system sees says where it came from",
+          ),
+        )
+      } else { Ok(()) }
+    } else if sql_is_punct(t.tok, "(") { sqlite_clocked(call, name, rest, depth + 1, false) }
+    else if sqlite_reads_the_machine(t) {
+      Err(
+        sql_refuse_tok(
+          t,
+          "`" ++ name ++ "` of " ++ t.text
+            ++ " reads the machine's clock or its time zone: pass the time as a parameter, where the row the effect system sees says where it came from",
+        ),
+      )
+    } else { sqlite_clocked(call, name, rest, depth, false) },
+  }
+
+fn sqlite_reads_the_machine(t: SqlTokAt) -> Bool / {abort.raise} =
+  match t.tok {
+    SqlText -> {
+      let word = string::ascii_lower(t.text);
+      word == "'now'" || word == "'localtime'" || word == "'utc'"
+    },
+    _ -> false,
   }
 
 /// A statement ends where the first one does: a `;` after it is a second statement, and any other
@@ -5503,7 +5795,10 @@ type Ran = { session: pg::Session, answer: Answer }
 /// its text rather than of the call site's label, so a join reaches tables the label never named —
 /// and the atom the scheduler records is the label's, so the label has to be one of them.
 fn check_statement(s: Stmt, reads_only: Bool, label: String) -> Unit / {abort.raise} = {
-  let scanned = match scan_statement(s.sql) { Err(e) -> panic(e.detail), Ok(scanned) -> scanned };
+  let scanned = match scan_statement(Postgres, s.sql) {
+    Err(e) -> panic(e.detail),
+    Ok(scanned) -> scanned,
+  };
   if !contains(scan_table_names(scanned.tables), label) {
     panic(
       "this call site names `" ++ label ++ "`, and the statement touches "
@@ -5889,7 +6184,7 @@ fn coalesced(
   s: Stmt,
   each: List<List<Param>>,
 ) -> Option<{ s: Stmt, ps: List<Param> }> / {abort.raise} =
-  match tokenize(s.sql) {
+  match tokenize(Postgres, s.sql) {
     Err(_) -> None,
     Ok(ts) -> match statement_body(s.sql, ts) {
       None -> None,
@@ -6217,7 +6512,7 @@ pub fn with_server<a | e>(
 
 test "a statement's words fold and a quoted identifier keeps its case" {
   assert_eq(
-    sql_tokenize_summary("SELECT t.Sku FROM parts AS t"),
+    sql_tokenize_summary(Postgres, "SELECT t.Sku FROM parts AS t"),
     Ok([
       "word:select",
       "word:t",
@@ -6230,47 +6525,50 @@ test "a statement's words fold and a quoted identifier keeps its case" {
     ]),
   );
   assert_eq(
-    sql_tokenize_summary("select \"MiXeD\" from \"a\"\"b\""),
+    sql_tokenize_summary(Postgres, "select \"MiXeD\" from \"a\"\"b\""),
     Ok(["word:select", "quoted:MiXeD", "word:from", "quoted:a\"b"]),
   )
 }
 
 test "a comment is not a token, and a block comment nests" {
   assert_eq(
-    sql_tokenize_summary("select 1 -- and the rest\nfrom t"),
+    sql_tokenize_summary(Postgres, "select 1 -- and the rest\nfrom t"),
     Ok(["word:select", "number:1", "word:from", "word:t"]),
   );
-  assert_eq(sql_tokenize_summary("select /* a /* b */ c */ 1"), Ok(["word:select", "number:1"]))
+  assert_eq(
+    sql_tokenize_summary(Postgres, "select /* a /* b */ c */ 1"),
+    Ok(["word:select", "number:1"]),
+  )
 }
 
 test "a semicolon is its own token, and one inside a literal is text" {
   assert_eq(
-    sql_tokenize_summary("select 1; drop table t"),
+    sql_tokenize_summary(Postgres, "select 1; drop table t"),
     Ok(["word:select", "number:1", "semi", "word:drop", "word:table", "word:t"]),
   );
-  assert_eq(sql_tokenize_summary("select ';a'"), Ok(["word:select", "text:';a'"]));
+  assert_eq(sql_tokenize_summary(Postgres, "select ';a'"), Ok(["word:select", "text:';a'"]));
   assert_eq(
-    sql_tokenize_summary("select $tag$a;b$tag$"),
+    sql_tokenize_summary(Postgres, "select $tag$a;b$tag$"),
     Ok(["word:select", "text:$tag$a;b$tag$"]),
   );
-  assert_eq(sql_tokenize_summary("select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
+  assert_eq(sql_tokenize_summary(Postgres, "select 'it''s'"), Ok(["word:select", "text:'it''s'"]))
 }
 
 test "a placeholder is not a dollar quote, and a string may be escaped" {
   assert_eq(
-    sql_tokenize_summary("select $1, $23"),
+    sql_tokenize_summary(Postgres, "select $1, $23"),
     Ok(["word:select", "placeholder:$1", "punct:,", "placeholder:$23"]),
   );
-  assert_eq(sql_tokenize_summary("select e'a b'"), Ok(["word:select", "text:e'a b'"]));
+  assert_eq(sql_tokenize_summary(Postgres, "select e'a b'"), Ok(["word:select", "text:e'a b'"]));
   assert_eq(
-    sql_tokenize_summary("select b'0110', x'ff'"),
+    sql_tokenize_summary(Postgres, "select b'0110', x'ff'"),
     Ok(["word:select", "text:b'0110'", "punct:,", "text:x'ff'"]),
   )
 }
 
 test "a number is one token however it is written" {
   assert_eq(
-    sql_tokenize_summary("select 1, 1.5, 1e3, 0x1f, 12ab"),
+    sql_tokenize_summary(Postgres, "select 1, 1.5, 1e3, 0x1f, 12ab"),
     Ok([
       "word:select",
       "number:1",
@@ -6288,7 +6586,7 @@ test "a number is one token however it is written" {
 
 test "punctuation is one byte each, and a non-ascii name is one word" {
   assert_eq(
-    sql_tokenize_summary("a.b::int[] @ 1 <> 2"),
+    sql_tokenize_summary(Postgres, "a.b::int[] @ 1 <> 2"),
     Ok([
       "word:a",
       "punct:.",
@@ -6305,18 +6603,132 @@ test "punctuation is one byte each, and a non-ascii name is one word" {
       "number:2",
     ]),
   );
-  assert_eq(sql_tokenize_summary("select ünïcode"), Ok(["word:select", "word:ünïcode"]))
+  assert_eq(
+    sql_tokenize_summary(Postgres, "select ünïcode"),
+    Ok(["word:select", "word:ünïcode"]),
+  )
 }
 
 test "a quote that is never closed is refused, not guessed at" {
-  assert(refused(sql_tokenize_summary("select '")));
-  assert(refused(sql_tokenize_summary("select \"x")));
-  assert(refused(sql_tokenize_summary("select /* never")));
-  assert(refused(sql_tokenize_summary("select $tag$ never")));
-  assert(refused(sql_tokenize_summary("select $ ")))
+  assert(refused(sql_tokenize_summary(Postgres, "select '")));
+  assert(refused(sql_tokenize_summary(Postgres, "select \"x")));
+  assert(refused(sql_tokenize_summary(Postgres, "select /* never")));
+  assert(refused(sql_tokenize_summary(Postgres, "select $tag$ never")));
+  assert(refused(sql_tokenize_summary(Postgres, "select $ ")))
 }
 
 fn refused<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, Ok(_) -> false }
+
+test "SQLite's lexer is its own: no nested comment, no dollar quote, three quotes for a name" {
+  assert_eq(
+    sql_tokenize_summary(Sqlite, "select /* a /* b */ random() -- c\n"),
+    Ok(["word:select", "word:random", "punct:(", "punct:)"]),
+  );
+  assert_eq(
+    sql_tokenize_summary(Sqlite, "select `a``b`, [c d], \"e\" from t where x = ?1 or y = ?"),
+    Ok([
+      "word:select",
+      "quoted:a``b",
+      "punct:,",
+      "quoted:c d",
+      "punct:,",
+      "quoted:e",
+      "word:from",
+      "word:t",
+      "word:where",
+      "word:x",
+      "punct:=",
+      "placeholder:?1",
+      "word:or",
+      "word:y",
+      "punct:=",
+      "placeholder:?",
+    ]),
+  );
+  assert_eq(
+    sql_tokenize_summary(Sqlite, "select 'it''s', x'ff', e'a\\'"),
+    Ok(["word:select", "text:'it''s'", "punct:,", "text:x'ff'", "punct:,", "word:e", "text:'a\\'"]),
+  );
+  assert(refused(sql_tokenize_summary(Sqlite, "select $1")));
+  assert(refused(sql_tokenize_summary(Sqlite, "select :name")));
+  assert(refused(sql_tokenize_summary(Sqlite, "select @name")));
+  assert(refused(sql_tokenize_summary(Sqlite, "select [never")));
+  assert(refused(sql_tokenize_summary(Sqlite, "select `never")))
+}
+
+type Shaped = { sql: String, kind: ScanKind }
+
+fn sqlite_admitted() -> List<Shaped> =
+  [
+    { sql: "select 1", kind: KSelect },
+    { sql: "values (1), (2)", kind: KValues },
+    { sql: "insert or ignore into t (a) values (?1)", kind: KInsert },
+    { sql: "replace into t (a) values (?1)", kind: KInsert },
+    { sql: "insert into t (a) values (1) on conflict (a) do update set a = 2", kind: KInsert },
+    { sql: "update t set a = a + 1 returning a", kind: KUpdate },
+    { sql: "delete from t where a in (select a from u)", kind: KDelete },
+    { sql: "with n(i) as (select 1) select i from n", kind: KSelect },
+    { sql: "with n(i) as (select 1) insert into t select i from n", kind: KInsert },
+    { sql: "with n as (select 1 as i) delete from t where a in (select i from n)", kind: KDelete },
+    { sql: "create table t (a integer primary key, at text) strict", kind: KDefine },
+    {
+      sql: "create trigger tr after insert on t begin update t set a = 1; delete from u; end",
+      kind: KDefine,
+    },
+    { sql: "drop index t_a", kind: KDefine },
+    { sql: "alter table t rename column a to b", kind: KDefine },
+    { sql: "analyze", kind: KDefine },
+    { sql: "pragma user_version = 3", kind: KPragma },
+    { sql: "select datetime(at, '+1 day'), strftime('%Y', at) from t", kind: KSelect },
+    { sql: "select \"random\", [current_date] from \"time\"", kind: KSelect },
+    { sql: "insert into time (at) values (?1)", kind: KInsert },
+  ]
+
+test "the reader says what {c.sql} does" for c: Shaped in sqlite_admitted() {
+  assert_eq(result_map(scan_statement(Sqlite, c.sql), |s: SqlScan| s.kind), Ok(c.kind))
+}
+
+type Unread = { sql: String, at: Int }
+
+fn sqlite_refused() -> List<Unread> =
+  [
+    { sql: "", at: 0 },
+    { sql: "attach database '/etc/passwd' as other", at: 0 },
+    { sql: "detach database other", at: 0 },
+    { sql: "vacuum into '/tmp/copy.db'", at: 0 },
+    { sql: "begin immediate", at: 0 },
+    { sql: "commit", at: 0 },
+    { sql: "savepoint s", at: 0 },
+    { sql: "explain select 1", at: 0 },
+    { sql: "create temp table t (a)", at: 7 },
+    { sql: "create virtual table f using fts5(a)", at: 7 },
+    { sql: "with n as (select 1)", at: 0 },
+    { sql: "select random()", at: 7 },
+    { sql: "select randomblob(8)", at: 7 },
+    { sql: "insert into t values (CURRENT_TIMESTAMP)", at: 22 },
+    { sql: "select current_date", at: 7 },
+    { sql: "select datetime('now')", at: 16 },
+    { sql: "select datetime()", at: 7 },
+    { sql: "select strftime('%s', 'NOW')", at: 22 },
+    { sql: "select date(at, 'localtime') from t", at: 16 },
+    { sql: "select time('12:00', 'utc')", at: 21 },
+    { sql: "select 1 where a = $1", at: 19 },
+  ]
+
+test "the reader refuses {c.sql} where it stands" for c: Unread in sqlite_refused() {
+  assert_eq(
+    result_map_err(scan_statement(Sqlite, c.sql), |e: DbError| refusal_byte(e)),
+    Err(Some(c.at)),
+  )
+}
+
+test "a refusal's byte is the one after its last marker, whatever the statement quotes" {
+  assert_eq(
+    refusal_byte(db_error("0A000", "", "`' at byte 9'` at byte 31. the statement ends here")),
+    Some(31),
+  );
+  assert_eq(refusal_byte(db_error("23505", "items_pkey", "a duplicate key")), None)
+}
 
 // --- What the reader accepts and what it refuses ---------------------------------------
 //
@@ -6325,15 +6737,15 @@ fn refused<a>(r: Result<List<a>, DbError>) -> Bool = match r { Err(_) -> true, O
 // footprint that under-reports, which is the one failure that corrupts scheduling silently.
 
 fn scan_ok(sql: String) -> SqlScan / {abort.raise} =
-  match scan_statement(sql) { Err(e) -> panic(e.detail), Ok(s) -> s }
+  match scan_statement(Postgres, sql) { Err(e) -> panic(e.detail), Ok(s) -> s }
 
 fn scan_names(sql: String) -> List<String> / {abort.raise} = scan_table_names(scan_ok(sql).tables)
 
 fn scan_refused(sql: String) -> Bool / {abort.raise} =
-  match scan_statement(sql) { Err(_) -> true, Ok(_) -> false }
+  match scan_statement(Postgres, sql) { Err(_) -> true, Ok(_) -> false }
 
 fn scan_refused_at(sql: String, byte: Int) -> Bool / {abort.raise} =
-  match scan_statement(sql) {
+  match scan_statement(Postgres, sql) {
     Err(e) -> string_contains(e.detail, "byte " ++ int_to_string(byte)),
     Ok(_) -> false,
   }
@@ -6581,33 +6993,33 @@ fn nested_from(sql: String, n: Int) -> String =
 test "malformed input is answered and never a panic" {
   // A panic would fail this test, so calling the reader *is* the assertion: whatever it answers,
   // it answers, and a program that built the text is not killed by the driver's own check.
-  let _ = scan_statement("select");
-  let _ = scan_statement("select * from");
-  let _ = scan_statement("select * from (");
-  let _ = scan_statement("insert into");
-  let _ = scan_statement("update");
-  let _ = scan_statement("update t");
-  let _ = scan_statement("update t set");
-  let _ = scan_statement("delete");
-  let _ = scan_statement("delete from");
-  let _ = scan_statement("with");
-  let _ = scan_statement("with a");
-  let _ = scan_statement("with a as");
-  let _ = scan_statement("with a as (");
-  let _ = scan_statement("select * from a join");
-  let _ = scan_statement("select * from a join b on");
-  let _ = scan_statement("((((");
-  let _ = scan_statement("))))");
-  let _ = scan_statement("$");
-  let _ = scan_statement("$$");
-  let _ = scan_statement("'");
-  let _ = scan_statement("\"");
-  let _ = scan_statement("select * from items order by");
-  let _ = scan_statement("select * from items group by");
-  let _ = scan_statement("select ,,, from items");
-  let _ = scan_statement("select * from items where (");
-  let _ = scan_statement("натурально");
-  let _ = scan_statement("select * from ünïcode");
+  let _ = scan_statement(Postgres, "select");
+  let _ = scan_statement(Postgres, "select * from");
+  let _ = scan_statement(Postgres, "select * from (");
+  let _ = scan_statement(Postgres, "insert into");
+  let _ = scan_statement(Postgres, "update");
+  let _ = scan_statement(Postgres, "update t");
+  let _ = scan_statement(Postgres, "update t set");
+  let _ = scan_statement(Postgres, "delete");
+  let _ = scan_statement(Postgres, "delete from");
+  let _ = scan_statement(Postgres, "with");
+  let _ = scan_statement(Postgres, "with a");
+  let _ = scan_statement(Postgres, "with a as");
+  let _ = scan_statement(Postgres, "with a as (");
+  let _ = scan_statement(Postgres, "select * from a join");
+  let _ = scan_statement(Postgres, "select * from a join b on");
+  let _ = scan_statement(Postgres, "((((");
+  let _ = scan_statement(Postgres, "))))");
+  let _ = scan_statement(Postgres, "$");
+  let _ = scan_statement(Postgres, "$$");
+  let _ = scan_statement(Postgres, "'");
+  let _ = scan_statement(Postgres, "\"");
+  let _ = scan_statement(Postgres, "select * from items order by");
+  let _ = scan_statement(Postgres, "select * from items group by");
+  let _ = scan_statement(Postgres, "select ,,, from items");
+  let _ = scan_statement(Postgres, "select * from items where (");
+  let _ = scan_statement(Postgres, "натурально");
+  let _ = scan_statement(Postgres, "select * from ünïcode");
   // A statement cut short may be read as far as it goes; what must not happen is a panic.
   assert(scan_refused("with a as ("))
 }

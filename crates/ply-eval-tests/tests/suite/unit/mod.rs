@@ -22,5 +22,6 @@ mod region;
 mod sched;
 mod sim;
 mod span;
+mod sqlite;
 mod task_regions;
 mod value;

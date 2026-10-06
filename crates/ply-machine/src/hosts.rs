@@ -382,12 +382,12 @@ pub struct RootView {
 }
 
 impl Filesystem {
-    /// `Some` when the program can perform an `fs` operation or the run bound a root.
+    /// `Some` when the program can perform an operation under a root, a file's or a database's,
+    /// or the run bound one.
     pub fn of(listing: &HostListing, roots: Option<&ply_host::fs::Roots>) -> Option<Filesystem> {
-        let reachable = listing
-            .rows
-            .iter()
-            .any(|row| row.path.starts_with("ply_host::fs::"));
+        let reachable = listing.rows.iter().any(|row| {
+            row.path.starts_with("ply_host::fs::") || row.path.starts_with("ply_host::sqlite::")
+        });
         let configured = roots.is_some_and(|r| !r.is_empty());
         if !reachable && !configured {
             return None;
