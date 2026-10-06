@@ -1,0 +1,1679 @@
+//! Prometheus: metrics kept in a registry, and the page a scrape reads them from.
+//!
+//! A `Registry` is a value. `add`, `set` and `observe` answer the registry with a counter
+//! raised, a gauge set or a histogram's bucket counted, and `snapshot` is what it holds, its
+//! families in the order of their names and each family's series in the order of their labels,
+//! so two scrapes of one state are the same bytes. A metric's name and a label's are a `Name`
+//! and a `Label`, which only hold text the exposition formats allow; `name_like` and
+//! `label_like` make one of any text. A metric keeps at most the registry's `max_series` label
+//! sets, and a new one past that is dropped and counted: an unbounded label is how a registry
+//! outgrows its server.
+//!
+//! `render_text` writes a snapshot in the text format, version 0.0.4, and `render_openmetrics`
+//! in OpenMetrics 1.0, which also carries a unit, an exemplar beside a counter or a bucket, and
+//! `# EOF`. `parse` reads either back: `parse(render_openmetrics(s))` is `s`, and
+//! `parse(render_text(s))` is `plain(s)`, the snapshot without what the older format cannot
+//! say. A counter's family is named without `_total` and its sample with it, and a histogram's
+//! buckets are cumulative under `le`, ending in `+Inf`. A summary, an info and a state set are
+//! not modelled, and `parse` refuses one by name.
+//!
+//! `recording` is a `trace` handler: it answers `trace.count`, `trace.gauge` and `trace.time`
+//! on any channel into a registry, the channel as the label `channel`, the fields as labels,
+//! and a timing in seconds. `scrape` answers a `GET /metrics` from that registry in the format
+//! the request's `Accept` prefers.
+
+import std.bytes (hex_of, int_of_ascii, is_digit, scan)
+import std.float (infinity, is_nan, neg_infinity)
+import std.gen
+import std.gen (Gen)
+import std.http
+import std.http (Request, Response)
+import std.json
+import std.list (all, at_or, concat)
+import std.string (ascii_lower, ascii_trim, join, repeat)
+import std.telemetry
+import std.trace
+import std.trace (Fields, trace)
+
+// --- Names --------------------------------------------------------------------
+
+/// A metric's name: a letter, `_` or `:`, and then letters, digits, `_` and `:`.
+pub opaque type Name = | Name(String)
+
+/// A label's name: a letter or `_`, and then letters, digits and `_`, and not opening with
+/// `__`, which Prometheus keeps for itself.
+pub opaque type Label = | Label(String)
+
+show for Name by name_text
+
+show for Label by label_text
+
+gen for Name by names
+
+gen for Label by label_names
+
+fn names() -> Gen<Name> =
+  gen::map(gen::elements(["orders", "a", "http_requests", "queue:depth", "_x9"]), |text: String|
+    Name(text))
+
+fn label_names() -> Gen<Label> =
+  gen::map(gen::elements(["sku", "a", "status_code", "_x9"]), |text: String| Label(text))
+
+fn letters() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+fn name_bytes() -> Bytes = bytes_concat(letters(), b"0123456789_:")
+
+fn label_bytes() -> Bytes = bytes_concat(letters(), b"0123456789_")
+
+fn fits(text: String, allowed: Bytes) -> Bool =
+  match try[abort.raise] {
+      let raw = bytes_of_string(text);
+      bytes_len(raw) > 0 && !is_digit(bytes_at(raw, 0)) && scan(raw, 0, allowed) >= bytes_len(raw)
+    } {
+    Ok(answer) -> answer,
+    Err(_) -> false,
+  }
+
+/// The metric name `text` is, or `None` where it is not one.
+pub fn name(text: String) -> Option<Name> =
+  if fits(text, name_bytes()) { Some(Name(text)) } else { None }
+
+/// The label name `text` is, or `None` where it is not one.
+pub fn label(text: String) -> Option<Label> =
+  if fits(text, label_bytes()) && !string_starts_with(text, "__") { Some(Label(text)) }
+  else { None }
+
+/// A metric name made of any text: each character a name cannot hold becomes `_`, and a name
+/// that would open with a digit, or be empty, opens with `_`.
+pub fn name_like(text: String) -> Name = Name(shaped(text, name_bytes()))
+
+/// A label name made of any text, as `name_like` makes a metric's; one that would open with
+/// `__` opens with `_x`.
+pub fn label_like(text: String) -> Label = {
+  let made = shaped(text, label_bytes());
+  if string_starts_with(made, "__") {
+    Label(
+      "_x"
+        ++ (match try[abort.raise] { string_slice(made, 2, string_len(made)) } {
+          Ok(rest) -> rest,
+          Err(_) -> "",
+        }),
+    )
+  } else { Label(made) }
+}
+
+fn shaped(text: String, allowed: Bytes) -> String =
+  match try[abort.raise] {
+      let raw = bytes_of_string(text);
+      let kept = bytes_concat_all(
+        map(range(0, bytes_len(raw)), |i: Int|
+          if bytes_index_of_byte(allowed, bytes_at(raw, i)) == None { b"_" }
+          else { bytes_slice(raw, i, i + 1) }),
+      );
+      if bytes_len(kept) == 0 || is_digit(bytes_at(kept, 0)) {
+        string_of_bytes(bytes_concat(b"_", kept))
+      } else { string_of_bytes(kept) }
+    } {
+    Ok(made) -> made,
+    Err(_) -> "_",
+  }
+
+/// A metric name's text.
+pub fn name_text(n: Name) -> String = match n { Name(text) -> text }
+
+/// A label name's text.
+pub fn label_text(l: Label) -> String = match l { Label(text) -> text }
+
+/// One label and its value.
+pub type Pair = new { label: Label, value: String }
+
+/// A series' labels: in the order of their names, each name once.
+pub opaque type Labels = | Labels(List<Pair>)
+
+/// Labels of these pairs; where a name is given twice, its last value.
+pub fn labels(given: List<Pair>) -> Labels =
+  Labels(
+    map(
+      map_entries(
+        fold(given, map_new(), |held: Map<Label, String>, p: Pair|
+          map_insert(held, p.label, p.value)),
+      ),
+      |e: { key: Label, value: String }| -> Pair { { label: e.key, value: e.value } },
+    ),
+  )
+
+/// No labels.
+pub fn no_labels() -> Labels = Labels([])
+
+/// The pairs of a label set, in the order of their names.
+pub fn pairs(ls: Labels) -> List<Pair> = match ls { Labels(held) -> held }
+
+/// A label and its value.
+pub fn pair(l: Label, value: String) -> Pair = { label: l, value: value }
+
+// --- A snapshot -----------------------------------------------------------------
+
+/// What kind of metric a family is.
+pub type Kind = | Counter | Gauge | Histogram | Untyped
+
+/// An observation a sample points at: its labels, a trace id and a span id by convention, and
+/// its value.
+pub type Exemplar = new { labels: Labels, value: Float }
+
+/// One bucket of a histogram: how many observations were at most `le`, counting those of every
+/// bucket before it. The last bucket's `le` is infinity.
+pub type Bucket = new { le: Float, count: Int, exemplar: Option<Exemplar> }
+
+/// What one series holds.
+pub type Value =
+  | Total(Float, Option<Exemplar>)
+  | Level(Float)
+  /// The buckets, and the sum of everything observed.
+  | Spread(List<Bucket>, Float)
+
+/// One series of a family.
+pub type Series = new { labels: Labels, value: Value }
+
+/// One metric and its series. A counter's `name` is without `_total`, and a `unit`, where there
+/// is one, is what the name ends with after a `_`.
+pub type Family = new { name: Name, help: String, unit: String, kind: Kind, series: List<Series> }
+
+/// What a registry held at one moment.
+pub type Snapshot = new { families: List<Family> }
+
+/// `s` as the text format can say it: without units and exemplars.
+pub fn plain(s: Snapshot) -> Snapshot =
+  {
+    families: map(s.families, |f: Family| -> Family {
+      {
+        ..f,
+        unit: "",
+        series: map(f.series, |held: Series| -> Series {
+          {
+            labels: held.labels,
+            value: match held.value {
+              Total(v, _) -> Total(v, None),
+              Level(v) -> Level(v),
+              Spread(buckets, sum) ->
+                Spread(map(buckets, |b: Bucket| -> Bucket { { ..b, exemplar: None } }), sum),
+            },
+          }
+        }),
+      }
+    }),
+  }
+
+// --- The registry ---------------------------------------------------------------
+
+/// What one series has come to: a counter's total, a gauge's level, or a histogram's count in
+/// each bucket of its own, with the exemplar last seen there, and its sum.
+type Slot =
+  | Counted(Float, Option<Exemplar>)
+  | Set(Float)
+  | Observed(List<Int>, List<Option<Exemplar>>, Float)
+
+type Held = {
+  name: Name,
+  help: String,
+  unit: String,
+  kind: Kind,
+  bounds: List<Float>,
+  series: Map<Labels, Slot>,
+}
+
+/// Metrics as a value: families by name, each with its series by labels.
+pub opaque type Registry = new {
+  families: Map<String, Held>,
+  max_series: Int,
+  dropped: Int,
+  refused: Int,
+}
+
+/// A registry holding nothing, whose metrics each keep at most `max_series` label sets.
+pub fn registry(max_series: Int) -> Registry =
+  { families: map_new(), max_series: max_series, dropped: 0, refused: 0 }
+
+/// How many updates named a label set its metric had no room for.
+pub fn dropped(r: Registry) -> Int = r.dropped
+
+/// How many updates were not applied for what they were: one to a metric of another kind, a
+/// counter moved backwards or by a NaN, a unit its metric's name does not end with.
+pub fn refused(r: Registry) -> Int = r.refused
+
+/// A counter's family is named without the `_total` its samples carry.
+fn family_name(n: Name, kind: Kind) -> String = {
+  let text = name_text(n);
+  match kind {
+    Counter -> if string_ends_with(text, "_total") && string_len(text) > 6 {
+      match try[abort.raise] { string_slice(text, 0, string_len(text) - 6) } {
+        Ok(base) -> base,
+        Err(_) -> text,
+      }
+    } else { text },
+    _ -> text,
+  }
+}
+
+fn refusing(r: Registry) -> Registry = { ..r, refused: r.refused + 1 }
+
+/// `r` with the metric `n` said to be of `kind`, with this help and unit. A unit is what the
+/// name ends with after a `_`, as OpenMetrics asks; one that is not, and a kind other than the
+/// one the metric already has, is refused and counted.
+pub fn describe(r: Registry, n: Name, kind: Kind, help: String, unit: String) -> Registry = {
+  let key = family_name(n, kind);
+  if unit != "" && !string_ends_with(key, "_" ++ unit) { refusing(r) } else {
+    match map_get(r.families, key) {
+      Some(held) -> if held.kind != kind { refusing(r) }
+      else { { ..r, families: map_insert(r.families, key, { ..held, help: help, unit: unit }) } },
+      None ->
+        {
+          ..r,
+          families: map_insert(r.families, key, {
+            name: Name(key),
+            help: help,
+            unit: unit,
+            kind: kind,
+            bounds: telemetry::duration_bounds(),
+            series: map_new(),
+          }),
+        },
+    }
+  }
+}
+
+/// `r` with the histogram `n` counting under these upper bounds, which ascend. It is refused
+/// once the histogram has a series, since counts under other bounds cannot be told apart, and
+/// for bounds that do not ascend or hold a NaN or an infinity.
+pub fn with_bounds(r: Registry, n: Name, bounds: List<Float>) -> Registry = {
+  let described = match map_get(r.families, name_text(n)) {
+    Some(_) -> r,
+    None -> describe(r, n, Histogram, "", ""),
+  };
+  let ascending = all(range(0, len(bounds)), |i: Int|
+    match ((list_at(bounds, i), list_at(bounds, i + 1))) {
+      (Some(a), Some(b)) -> a < b,
+      (Some(a), None) -> a == a && a != infinity() && a != neg_infinity(),
+      _ -> true,
+    });
+  match map_get(described.families, name_text(n)) {
+    Some(held) -> if held.kind != Histogram || map_len(held.series) > 0 || !ascending {
+      refusing(r)
+    } else {
+      {
+        ..described,
+        families: map_insert(described.families, name_text(n), { ..held, bounds: bounds }),
+      }
+    },
+    None -> refusing(r),
+  }
+}
+
+/// `r` with the series of `n` under `ls` moved by `step`, which is handed what it held. The
+/// metric is made, of `kind`, where the registry has none of the name; an update to a metric
+/// of another kind is refused, and a label set past `max_series` dropped, each counted.
+fn moved(
+  r: Registry,
+  n: Name,
+  kind: Kind,
+  ls: Labels,
+  step: (Held, Option<Slot>) -> Slot,
+) -> Registry = {
+  let key = family_name(n, kind);
+  let known = match map_get(r.families, key) { Some(_) -> r, None -> describe(r, n, kind, "", "") };
+  match map_get(known.families, key) {
+    None -> refusing(r),
+    Some(held) -> if held.kind != kind { refusing(r) } else {
+      let before = map_get(held.series, ls);
+      if before == None && map_len(held.series) >= max(known.max_series, 1) {
+        { ..known, dropped: known.dropped + 1 }
+      } else {
+        {
+          ..known,
+          families: map_insert(known.families, key, {
+            ..held,
+            series: map_insert(held.series, ls, step(held, before)),
+          }),
+        }
+      }
+    },
+  }
+}
+
+/// An exemplar OpenMetrics can carry: its labels' names and values come to at most 128
+/// characters.
+fn carried(e: Option<Exemplar>) -> Option<Exemplar> =
+  match e {
+    Some(held) -> if fold(pairs(held.labels), 0, |n: Int, p: Pair|
+          n + string_len(label_text(p.label)) + string_len(p.value))
+        > 128 { None }
+    else { e },
+    None -> None,
+  }
+
+/// `r` with the counter `n` under `ls` raised by `delta`. A counter only rises: a delta below
+/// zero, or a NaN, is refused and counted.
+pub fn add(r: Registry, n: Name, ls: Labels, delta: Float) -> Registry =
+  add_with(r, n, ls, delta, None)
+
+/// `add`, with an exemplar that replaces the one the series had; `None` keeps it.
+pub fn add_with(
+  r: Registry,
+  n: Name,
+  ls: Labels,
+  delta: Float,
+  exemplar: Option<Exemplar>,
+) -> Registry =
+  if !(delta >= 0.0) { refusing(r) } else {
+    moved(r, n, Counter, ls, |_: Held, before: Option<Slot>|
+      match before {
+        Some(Counted(total, seen)) ->
+          Counted(total + delta, match carried(exemplar) { Some(e) -> Some(e), None -> seen }),
+        _ -> Counted(delta, carried(exemplar)),
+      })
+  }
+
+/// `r` with the gauge `n` under `ls` at `value`.
+pub fn set(r: Registry, n: Name, ls: Labels, value: Float) -> Registry =
+  moved(r, n, Gauge, ls, |_: Held, _: Option<Slot>| Set(value))
+
+/// `r` with `value` counted in the histogram `n` under `ls`. A NaN is refused and counted.
+pub fn observe(r: Registry, n: Name, ls: Labels, value: Float) -> Registry =
+  observe_with(r, n, ls, value, None)
+
+/// `observe`, with an exemplar for the bucket the value falls in.
+pub fn observe_with(
+  r: Registry,
+  n: Name,
+  ls: Labels,
+  value: Float,
+  exemplar: Option<Exemplar>,
+) -> Registry =
+  if is_nan(value) { refusing(r) } else {
+    moved(r, n, Histogram, ls, |held: Held, before: Option<Slot>| {
+      let at = telemetry::bucket_of(held.bounds, value);
+      let marked = |seen: List<Option<Exemplar>>|
+        map(range(0, len(held.bounds) + 1), |i: Int| -> Option<Exemplar> {
+          let old = match list_at(seen, i) { Some(e) -> e, None -> None };
+          if i == at { match carried(exemplar) { Some(e) -> Some(e), None -> old } } else { old }
+        });
+      match before {
+        Some(Observed(counts, seen, sum)) ->
+          Observed(telemetry::counted(held.bounds, counts, value), marked(seen), sum + value),
+        _ -> Observed(telemetry::counted(held.bounds, [], value), marked([]), value),
+      }
+    })
+  }
+
+/// What `r` holds: its families in the order of their names, each one's series in the order of
+/// their labels.
+pub fn snapshot(r: Registry) -> Snapshot =
+  {
+    families: map(map_values(r.families), |held: Held| -> Family {
+      {
+        name: held.name,
+        help: held.help,
+        unit: held.unit,
+        kind: held.kind,
+        series: map(map_entries(held.series), |e: { key: Labels, value: Slot }| -> Series {
+          { labels: e.key, value: shown_slot(held, e.value) }
+        }),
+      }
+    }),
+  }
+
+fn shown_slot(held: Held, slot: Slot) -> Value =
+  match slot {
+    Counted(total, seen) -> Total(total, seen),
+    Set(level) -> Level(level),
+    Observed(counts, seen, sum) ->
+      Spread(
+        fold(
+          range(0, len(held.bounds) + 1),
+          { total: 0, out: [] },
+          |acc: { total: Int, out: List<Bucket> }, i: Int| {
+            let total = acc.total + (match list_at(counts, i) { Some(n) -> n, None -> 0 });
+            let bucket: Bucket = {
+              le: match list_at(held.bounds, i) { Some(bound) -> bound, None -> infinity() },
+              count: total,
+              exemplar: match list_at(seen, i) { Some(e) -> e, None -> None },
+            };
+            { total: total, out: push(acc.out, bucket) }
+          },
+        ).out,
+        sum,
+      ),
+  }
+
+// --- Writing --------------------------------------------------------------------
+
+/// The `Content-Type` of the text format.
+pub fn text_content_type() -> String = "text/plain; version=0.0.4; charset=utf-8"
+
+/// The `Content-Type` of OpenMetrics.
+pub fn openmetrics_content_type() -> String =
+  "application/openmetrics-text; version=1.0.0; charset=utf-8"
+
+/// A number as Prometheus's own writers spell one, so a `le` reads the same from every
+/// process: its shortest digits, laid out as Go's `%g` lays them (`0.005`, `100000`, `1e+06`,
+/// `2.5e-05`), `+Inf`, `-Inf` and `NaN` by name, and in OpenMetrics a whole number with `.0`.
+fn number(f: Float, open: Bool) -> String =
+  if is_nan(f) { "NaN" }
+  else if f == infinity() { "+Inf" }
+  else if f == neg_infinity() { "-Inf" } else {
+    match try[abort.raise] { laid_out(float_to_string(f), open) } {
+      Ok(text) -> text,
+      Err(_) -> float_to_string(f),
+    }
+  }
+
+/// `written`, a number's shortest digits with or without an exponent, laid out again.
+fn laid_out(written: String, open: Bool) -> String / {abort.raise} = {
+  let negative = string_starts_with(written, "-");
+  let body = if negative { string_slice(written, 1, string_len(written)) } else { written };
+  let parts = string_split(body, "e");
+  let halves = string_split(at_or(parts, 0, "0"), ".");
+  let whole = at_or(halves, 0, "0");
+  let every = bytes_of_string(whole ++ at_or(halves, 1, ""));
+  let lead = scan(every, 0, b"0");
+  let digits = string_of_bytes(bytes_slice(every, lead, last_digit(every, lead)));
+  let point = string_len(whole) + exponent_of(at_or(parts, 1, "0")) - lead;
+  let n = string_len(digits);
+  let text = if n == 0 { if open { "0.0" } else { "0" } } else if point - 1 < -4 || point - 1 >= 6 {
+    string_slice(digits, 0, 1) ++ (if n > 1 { "." ++ string_slice(digits, 1, n) } else { "" })
+      ++ "e"
+      ++ (if point - 1 < 0 { "-" } else { "+" })
+      ++ (if abs_int(point - 1) < 10 { "0" } else { "" })
+      ++ int_to_string(abs_int(point - 1))
+  } else if point <= 0 { "0." ++ repeat("0", 0 - point) ++ digits }
+  else if n <= point { digits ++ repeat("0", point - n) ++ (if open { ".0" } else { "" }) }
+  else { string_slice(digits, 0, point) ++ "." ++ string_slice(digits, point, n) };
+  (if negative { "-" } else { "" }) ++ text
+}
+
+/// Where the digits of `every` end once the zeros at their end are left off.
+fn last_digit(every: Bytes, from: Int) -> Int / {abort.raise} =
+  fold(range(from, bytes_len(every)), from, |end: Int, i: Int|
+    if bytes_at(every, i) == b'0' { end } else { i + 1 })
+
+fn exponent_of(text: String) -> Int / {abort.raise} = {
+  let negative = string_starts_with(text, "-");
+  let signed = negative || string_starts_with(text, "+");
+  let digits = if signed { string_slice(text, 1, string_len(text)) } else { text };
+  let value = match int_of_ascii(bytes_of_string(digits)) { Some(n) -> n, None -> 0 };
+  if negative { 0 - value } else { value }
+}
+
+fn abs_int(n: Int) -> Int = if n < 0 { 0 - n } else { n }
+
+fn replaced(text: String, from: String, to: String) -> String =
+  join(string_split_whole(text, from), to)
+
+fn string_split_whole(text: String, sep: String) -> List<String> =
+  match try[abort.raise] { string_split(text, sep) } { Ok(parts) -> parts, Err(_) -> [text] }
+
+/// A label's value between its quotes: a backslash, a quote and a line feed escaped.
+fn escaped_value(text: String) -> String =
+  replaced(replaced(replaced(text, "\\", "\\\\"), "\"", "\\\""), "\n", "\\n")
+
+/// A help text: a backslash and a line feed escaped, and in OpenMetrics a quote too.
+fn escaped_help(text: String, open: Bool) -> String = {
+  let base = replaced(replaced(text, "\\", "\\\\"), "\n", "\\n");
+  if open { replaced(base, "\"", "\\\"") } else { base }
+}
+
+fn written_labels(held: List<Pair>, le: Option<Float>, open: Bool) -> String = {
+  let own = map(held, |p: Pair| label_text(p.label) ++ "=\"" ++ escaped_value(p.value) ++ "\"");
+  let every = match le {
+    Some(bound) -> push(own, "le=\"" ++ number(bound, open) ++ "\""),
+    None -> own,
+  };
+  if len(every) == 0 { "" } else { "{" ++ join(every, ",") ++ "}" }
+}
+
+fn written_exemplar(e: Option<Exemplar>, open: Bool) -> String =
+  match ((open, e)) {
+    (true, Some(held)) -> {
+      let inside = written_labels(pairs(held.labels), None, open);
+      " # " ++ (if inside == "" { "{}" } else { inside }) ++ " " ++ number(held.value, open)
+    },
+    _ -> "",
+  }
+
+fn kind_text(kind: Kind, open: Bool) -> String =
+  match kind {
+    Counter -> "counter",
+    Gauge -> "gauge",
+    Histogram -> "histogram",
+    Untyped -> if open { "unknown" } else { "untyped" },
+  }
+
+fn series_lines(base: String, held: Series, open: Bool) -> List<String> = {
+  let own = pairs(held.labels);
+  match held.value {
+    Total(total, seen) ->
+      [
+        base ++ "_total" ++ written_labels(own, None, open) ++ " " ++ number(total, open)
+          ++ written_exemplar(seen, open),
+      ],
+    Level(level) -> [base ++ written_labels(own, None, open) ++ " " ++ number(level, open)],
+    Spread(buckets, sum) ->
+      concat(
+        map(buckets, |b: Bucket|
+          base ++ "_bucket" ++ written_labels(own, Some(b.le), open) ++ " "
+            ++ int_to_string(b.count)
+            ++ written_exemplar(b.exemplar, open)),
+        [
+          base ++ "_sum" ++ written_labels(own, None, open) ++ " " ++ number(sum, open),
+          base ++ "_count" ++ written_labels(own, None, open) ++ " "
+            ++ int_to_string(match list_at(buckets, len(buckets) - 1) {
+              Some(b) -> b.count,
+              None -> 0,
+            }),
+        ],
+      ),
+  }
+}
+
+fn family_lines(f: Family, open: Bool) -> List<String> = {
+  let base = name_text(f.name);
+  // The text format names a counter's family as its samples are named.
+  let titled = match f.kind { Counter -> if open { base } else { base ++ "_total" }, _ -> base };
+  let head = concat(
+    concat(
+      if f.help == "" { [] } else { ["# HELP " ++ titled ++ " " ++ escaped_help(f.help, open)] },
+      ["# TYPE " ++ titled ++ " " ++ kind_text(f.kind, open)],
+    ),
+    if open && f.unit != "" { ["# UNIT " ++ titled ++ " " ++ f.unit] } else { [] },
+  );
+  fold(f.series, head, |lines: List<String>, held: Series|
+    concat(lines, series_lines(base, held, open)))
+}
+
+fn rendered(s: Snapshot, open: Bool) -> Bytes = {
+  let lines = fold(s.families, [], |acc: List<String>, f: Family|
+    concat(acc, family_lines(f, open)));
+  let every = if open { push(lines, "# EOF") } else { lines };
+  bytes_of_string(fold(every, "", |text: String, line: String| text ++ line ++ "\n"))
+}
+
+/// `s` in the text format, version 0.0.4.
+pub fn render_text(s: Snapshot) -> Bytes = rendered(s, false)
+
+/// `s` in OpenMetrics 1.0, ending in `# EOF`.
+pub fn render_openmetrics(s: Snapshot) -> Bytes = rendered(s, true)
+
+// --- Reading --------------------------------------------------------------------
+
+/// What `parse` holds a page to.
+pub type Limits = new {
+  /// The most bytes a page may be.
+  length: Int,
+  /// The most sample lines it may hold.
+  samples: Int,
+}
+
+/// Why a page was refused.
+pub type Why =
+  /// Longer than `Limits.length`.
+  | TooLong
+  /// More sample lines than `Limits.samples`.
+  | TooMany
+  /// Not UTF-8.
+  | NotText
+  /// A line that does not open with a metric's name.
+  | BadName
+  /// Labels that do not close, a label with no quoted value, or a name that is no label's.
+  | BadLabels
+  /// An escape other than `\\`, `\"` and `\n`.
+  | BadEscape
+  /// A value that is not a number, or a count that is not a whole one.
+  | BadValue
+  /// A `TYPE` this module does not model, which it carries: `summary`, `info`, `stateset`.
+  | Unsupported(String)
+  /// A `HELP`, `TYPE` or `UNIT` line without its parts.
+  | BadComment
+  /// A sample of a kind its family is not: a bucket with no `le`.
+  | Misplaced
+  /// A line after `# EOF`.
+  | AfterEnd
+
+/// A refusal, and the line it is on, counted from one.
+pub type Refusal = new { why: Why, line: Int }
+
+/// What `read` raises where it refuses.
+pub effect prometheus {
+  /// The page is not one this module reads.
+  raise refused(e: Refusal)
+  /// The registry the `recording` around the caller holds, as it stands.
+  read registry() -> Registry
+}
+
+/// Sixteen mebibytes and a million samples.
+pub fn default_limits() -> Limits = { length: 16777216, samples: 1000000 }
+
+/// The snapshot a page in either format holds, or why it is refused.
+pub fn parse(page: Bytes, limits: Limits) -> Result<Snapshot, Refusal> / {abort.raise} =
+  try { read(page, limits) }
+
+/// A family as it is read: its series in the order they first appear.
+type Draft = {
+  name: String,
+  help: String,
+  unit: String,
+  kind: Kind,
+  order: List<Labels>,
+  series: Map<Labels, Value>,
+}
+
+type Reading = { order: List<String>, drafts: Map<String, Draft>, samples: Int, ended: Bool }
+
+/// The snapshot a page in either format holds, raising `prometheus.refused` where `parse`
+/// answers `Err`. Timestamps and `_created` samples are passed over, and a sample of a name no
+/// `TYPE` line gave is a family of its own, untyped.
+pub fn read(page: Bytes, limits: Limits) -> Snapshot / {prometheus.refused, abort.raise} =
+  if bytes_len(page) > limits.length { prometheus.refused({ why: TooLong, line: 0 }) }
+  else if !bytes_is_utf8(page) { prometheus.refused({ why: NotText, line: 0 }) } else {
+    let lines = bytes_split(page, b"\n");
+    let start: Reading = { order: [], drafts: map_new(), samples: 0, ended: false };
+    let done = fold(range(0, len(lines)), start, |r: Reading, i: Int|
+      match list_at(lines, i) {
+        Some(line) -> line_read(r, trimmed_line(line), i + 1, limits),
+        None -> r,
+      });
+    {
+      families: fold(done.order, [], |acc: List<Family>, key: String|
+        match map_get(done.drafts, key) { Some(d) -> push(acc, family_of(d)), None -> acc }),
+    }
+  }
+
+fn family_of(d: Draft) -> Family =
+  {
+    name: Name(d.name),
+    help: d.help,
+    unit: d.unit,
+    kind: d.kind,
+    series: fold(d.order, [], |acc: List<Series>, ls: Labels|
+      match map_get(d.series, ls) { Some(v) -> push(acc, { labels: ls, value: v }), None -> acc }),
+  }
+
+fn trimmed_line(line: Bytes) -> Bytes / {abort.raise} =
+  if bytes_ends_with(line, b"\r") { bytes_slice(line, 0, bytes_len(line) - 1) } else { line }
+
+fn fail<a>(why: Why, line: Int) -> a / {prometheus.refused} =
+  prometheus.refused({ why: why, line: line })
+
+fn line_read(
+  r: Reading,
+  line: Bytes,
+  at: Int,
+  limits: Limits,
+) -> Reading / {prometheus.refused, abort.raise} =
+  if bytes_len(line) == 0 { r }
+  else if r.ended { fail(AfterEnd, at) }
+  else if line == b"# EOF" { { ..r, ended: true } }
+  else if bytes_starts_with(line, b"# HELP ") || bytes_starts_with(line, b"# TYPE ")
+      || bytes_starts_with(line, b"# UNIT ") { comment_read(r, line, at) }
+  else if bytes_starts_with(line, b"#") { r }
+  else if r.samples >= limits.samples { fail(TooMany, at) }
+  else { sample_read({ ..r, samples: r.samples + 1 }, line, at) }
+
+fn drafted(r: Reading, key: String, kind: Kind) -> Reading =
+  match map_get(r.drafts, key) {
+    Some(_) -> r,
+    None ->
+      {
+        ..r,
+        order: push(r.order, key),
+        drafts: map_insert(r.drafts, key, {
+          name: key,
+          help: "",
+          unit: "",
+          kind: kind,
+          order: [],
+          series: map_new(),
+        }),
+      },
+  }
+
+fn comment_read(r: Reading, line: Bytes, at: Int) -> Reading / {prometheus.refused, abort.raise} = {
+  let word = bytes_slice(line, 2, 6);
+  let rest = bytes_slice(line, 7, bytes_len(line));
+  let space = match bytes_index_of_byte(rest, b' ') { Some(i) -> i, None -> bytes_len(rest) };
+  let named = string_of_bytes(bytes_slice(rest, 0, space));
+  let said = string_of_bytes(bytes_slice(rest, min(space + 1, bytes_len(rest)), bytes_len(rest)));
+  if name(named) == None { fail(BadComment, at) } else if word == b"TYPE" {
+    let kind = kind_of(said, at);
+    let key = family_name(Name(named), kind);
+    // A `HELP` that came first made a family under the name it was written with.
+    let early = if key == named { None } else { map_get(r.drafts, named) };
+    let moved = match early {
+      Some(_) ->
+        {
+          ..r,
+          order: filter(r.order, |k: String| k != named),
+          drafts: map_remove(r.drafts, named),
+        },
+      None -> r,
+    };
+    let known = drafted(moved, key, kind);
+    match map_get(known.drafts, key) {
+      Some(d) ->
+        {
+          ..known,
+          drafts: map_insert(known.drafts, key, {
+            ..d,
+            kind: kind,
+            help: match early { Some(e) -> e.help, None -> d.help },
+          }),
+        },
+      None -> known,
+    }
+  } else {
+    // A `HELP` may come before its `TYPE`, under the name the samples of a counter carry.
+    let key = match map_get(r.drafts, named) {
+      Some(_) -> named,
+      None -> if map_contains(r.drafts, family_name(Name(named), Counter)) {
+        family_name(Name(named), Counter)
+      } else { named },
+    };
+    let known = drafted(r, key, Untyped);
+    match map_get(known.drafts, key) {
+      Some(d) ->
+        {
+          ..known,
+          drafts: map_insert(known.drafts, key, if word == b"HELP" {
+            { ..d, help: unescaped(bytes_of_string(said), at) }
+          } else { { ..d, unit: said } }),
+        },
+      None -> known,
+    }
+  }
+}
+
+fn kind_of(said: String, at: Int) -> Kind / {prometheus.refused} =
+  match said {
+    "counter" -> Counter,
+    "gauge" -> Gauge,
+    "histogram" -> Histogram,
+    "untyped" -> Untyped,
+    "unknown" -> Untyped,
+    other -> fail(Unsupported(other), at),
+  }
+
+/// A text with `\\`, `\"` and `\n` read as what they stand for.
+fn unescaped(raw: Bytes, at: Int) -> String / {prometheus.refused, abort.raise} = {
+  let n = bytes_len(raw);
+  let pieces = iterate({ i: 0, out: [] }, n + 1, |s: { i: Int, out: List<Bytes> }|
+    if s.i >= n { Stop(s.out) } else {
+      match bytes_index_of_from(raw, b"\\", s.i) {
+        None -> Stop(push(s.out, bytes_slice(raw, s.i, n))),
+        Some(slash) -> if slash + 1 >= n { fail(BadEscape, at) } else {
+          let piece = match bytes_at(raw, slash + 1) {
+            b'\\' -> b"\\",
+            b'"' -> b"\"",
+            b'n' -> b"\n",
+            _ -> fail(BadEscape, at),
+          };
+          Continue({ i: slash + 2, out: push(push(s.out, bytes_slice(raw, s.i, slash)), piece) })
+        },
+      }
+    });
+  string_of_bytes(bytes_concat_all(pieces))
+}
+
+type LabelsRead = { pairs: List<Pair>, le: Option<Float>, next: Int }
+
+/// Labels from the `{` at `from` through their `}`; `le` is taken out of them.
+fn labels_read(line: Bytes, from: Int, at: Int) -> LabelsRead / {prometheus.refused, abort.raise} = {
+  let n = bytes_len(line);
+  let start: LabelsRead = { pairs: [], le: None, next: from + 1 };
+  iterate(start, n + 2, |s: LabelsRead| {
+    let i = scan(line, s.next, b" ,");
+    if i >= n { fail(BadLabels, at) }
+    else if bytes_at(line, i) == b'}' { Stop({ ..s, next: i + 1 }) } else {
+      let equals = scan(line, i, label_bytes());
+      let named = string_of_bytes(bytes_slice(line, i, equals));
+      if equals + 1 >= n || bytes_at(line, equals) != b'=' || bytes_at(line, equals + 1) != b'"' {
+        fail(BadLabels, at)
+      } else {
+        let close = closing_quote(line, equals + 2, at);
+        let value = unescaped(bytes_slice(line, equals + 2, close), at);
+        if named == "le" {
+          Continue({ ..s, le: Some(number_of(bytes_of_string(value), at)), next: close + 1 })
+        } else {
+          match label(named) {
+            Some(l) -> Continue({ ..s, pairs: push(s.pairs, pair(l, value)), next: close + 1 }),
+            None -> fail(BadLabels, at),
+          }
+        }
+      }
+    }
+  })
+}
+
+/// Where the quote that ends a value opened at `from` stands: the first not behind a backslash.
+fn closing_quote(line: Bytes, from: Int, at: Int) -> Int / {prometheus.refused, abort.raise} = {
+  let n = bytes_len(line);
+  iterate(from, n + 1, |i: Int|
+    if i >= n { fail(BadLabels, at) }
+    else if bytes_at(line, i) == b'\\' { Continue(i + 2) }
+    else if bytes_at(line, i) == b'"' { Stop(i) }
+    else { Continue(i + 1) })
+}
+
+fn number_of(raw: Bytes, at: Int) -> Float / {prometheus.refused, abort.raise} =
+  if raw == b"+Inf" || raw == b"Inf" { infinity() }
+  else if raw == b"-Inf" { neg_infinity() }
+  else if raw == b"NaN" { float_of_bits(0x7FF8_0000_0000_0000) } else {
+    let unsigned = if bytes_starts_with(raw, b"+") { bytes_slice(raw, 1, bytes_len(raw)) }
+    else { raw };
+    let text = replaced(replaced(string_of_bytes(unsigned), "e+", "e"), "E+", "E");
+    match float_of_string(text) { Some(f) -> f, None -> fail(BadValue, at) }
+  }
+
+fn whole_of(raw: Bytes, at: Int) -> Int / {prometheus.refused, abort.raise} = {
+  let f = number_of(raw, at);
+  match int_of_float(f, Down) {
+    Some(n) -> if float_of_int(n) == f { n } else { fail(BadValue, at) },
+    None -> fail(BadValue, at),
+  }
+}
+
+type Token = { text: Bytes, next: Int }
+
+/// The run of bytes that are not spaces from the first that is not one at or after `from`.
+fn token(line: Bytes, from: Int) -> Token / {abort.raise} = {
+  let start = scan(line, from, b" ");
+  let stop = bytes_scan_until(line, start, b" ", max(bytes_len(line) - start, 0));
+  { text: bytes_slice(line, min(start, bytes_len(line)), min(stop, bytes_len(line))), next: stop }
+}
+
+type SampleRead = {
+  name: String,
+  labels: Labels,
+  le: Option<Float>,
+  value: Bytes,
+  exemplar: Option<Exemplar>,
+}
+
+fn sample_of(line: Bytes, at: Int) -> SampleRead / {prometheus.refused, abort.raise} = {
+  let stop = scan(line, 0, name_bytes());
+  let named = string_of_bytes(bytes_slice(line, 0, stop));
+  if name(named) == None { fail(BadName, at) } else {
+    let held = if stop < bytes_len(line) && bytes_at(line, stop) == b'{' {
+      labels_read(line, stop, at)
+    } else {
+      let none: LabelsRead = { pairs: [], le: None, next: stop };
+      none
+    };
+    let value = token(line, held.next);
+    if bytes_len(value.text) == 0 { fail(BadValue, at) } else {
+      {
+        name: named,
+        labels: labels(held.pairs),
+        le: held.le,
+        value: value.text,
+        exemplar: exemplar_of(line, value.next, at),
+      }
+    }
+  }
+}
+
+/// The exemplar after a sample's value: `# {labels} value`, behind a timestamp or not.
+fn exemplar_of(
+  line: Bytes,
+  from: Int,
+  at: Int,
+) -> Option<Exemplar> / {prometheus.refused, abort.raise} =
+  match bytes_index_of_from(line, b" # {", min(from, bytes_len(line))) {
+    None -> None,
+    Some(hash) -> {
+      let held = labels_read(line, hash + 3, at);
+      let value = token(line, held.next);
+      let made: Exemplar = { labels: labels(held.pairs), value: number_of(value.text, at) };
+      Some(made)
+    },
+  }
+
+fn base_of(named: String, suffix: String) -> Option<String> =
+  if string_ends_with(named, suffix) && string_len(named) > string_len(suffix) {
+    match try[abort.raise] { string_slice(named, 0, string_len(named) - string_len(suffix)) } {
+      Ok(base) -> Some(base),
+      Err(_) -> None,
+    }
+  } else { None }
+
+fn of_kind(r: Reading, key: Option<String>, kind: Kind) -> Option<Draft> =
+  match key {
+    Some(k) -> match map_get(r.drafts, k) {
+      Some(d) -> if d.kind == kind { Some(d) } else { None },
+      None -> None,
+    },
+    None -> None,
+  }
+
+fn stored(r: Reading, d: Draft, ls: Labels, step: (Option<Value>) -> Value) -> Reading = {
+  let before = map_get(d.series, ls);
+  {
+    ..r,
+    drafts: map_insert(r.drafts, d.name, {
+      ..d,
+      order: if before == None { push(d.order, ls) } else { d.order },
+      series: map_insert(d.series, ls, step(before)),
+    }),
+  }
+}
+
+fn sample_read(r: Reading, line: Bytes, at: Int) -> Reading / {prometheus.refused, abort.raise} = {
+  let s = sample_of(line, at);
+  match ((
+      of_kind(r, base_of(s.name, "_total"), Counter),
+      of_kind(r, base_of(s.name, "_bucket"), Histogram),
+      of_kind(r, base_of(s.name, "_sum"), Histogram),
+    )) {
+    (Some(d), _, _) -> {
+      let total = number_of(s.value, at);
+      stored(r, d, s.labels, |_: Option<Value>| Total(total, s.exemplar))
+    },
+    (_, Some(d), _) -> match s.le {
+      None -> fail(Misplaced, at),
+      Some(le) -> {
+        let bucket: Bucket = { le: le, count: whole_of(s.value, at), exemplar: s.exemplar };
+        stored(r, d, s.labels, |before: Option<Value>|
+          match before {
+            Some(Spread(buckets, sum)) -> Spread(push(buckets, bucket), sum),
+            _ -> Spread([bucket], 0.0),
+          })
+      },
+    },
+    (_, _, Some(d)) -> {
+      let sum = number_of(s.value, at);
+      stored(r, d, s.labels, |before: Option<Value>|
+        match before { Some(Spread(buckets, _)) -> Spread(buckets, sum), _ -> Spread([], sum) })
+    },
+    _ -> passed_or_level(r, s, at),
+  }
+}
+
+/// A histogram's `_count` and anything's `_created` say nothing a snapshot keeps; any other
+/// sample is a gauge's or an untyped family's level.
+fn passed_or_level(
+  r: Reading,
+  s: SampleRead,
+  at: Int,
+) -> Reading / {prometheus.refused, abort.raise} =
+  match of_kind(r, base_of(s.name, "_count"), Histogram) {
+    Some(_) -> r,
+    None -> match base_of(s.name, "_created") {
+      Some(base) -> if map_contains(r.drafts, base) { r } else { level_read(r, s, at) },
+      None -> level_read(r, s, at),
+    },
+  }
+
+fn level_read(r: Reading, s: SampleRead, at: Int) -> Reading / {prometheus.refused, abort.raise} = {
+  let known = drafted(r, s.name, Untyped);
+  let level = number_of(s.value, at);
+  match map_get(known.drafts, s.name) {
+    Some(d) -> match d.kind {
+      Gauge | Untyped -> stored(known, d, s.labels, |_: Option<Value>| Level(level)),
+      _ -> fail(Misplaced, at),
+    },
+    None -> known,
+  }
+}
+
+// --- The handler ----------------------------------------------------------------
+
+/// A field as a label's value.
+fn field_text(f: trace::Field) -> String =
+  match f {
+    trace::FInt(n) -> int_to_string(n),
+    trace::FBool(b) -> if b { "true" } else { "false" },
+    trace::FText(s) -> s,
+    trace::FFloat(x) -> number(x, false),
+    trace::FDecimal(d) -> decimal_to_string(d),
+    trace::FBytes(b) -> match try[abort.raise] { hex_of(b) } { Ok(text) -> text, Err(_) -> "" },
+    trace::FJson(j) -> match try[abort.raise] { json::to_string(j) } {
+      Ok(text) -> text,
+      Err(_) -> "",
+    },
+  }
+
+/// The label a metric's channel is written under.
+pub fn channel_label() -> Label = Label("channel")
+
+/// A metric's labels: its channel, and its fields but the two that name a span.
+fn labels_of(channel: String, fields: Fields) -> Labels =
+  labels(
+    fold(
+      map_entries(fields),
+      [pair(channel_label(), channel)],
+      |acc: List<Pair>, e: { key: String, value: trace::Field }|
+        if e.key == telemetry::trace_id_field() || e.key == telemetry::span_id_field() { acc }
+        else { push(acc, pair(label_like(e.key), field_text(e.value))) },
+    ),
+  )
+
+/// The exemplar a metric's fields carry, where `std.telemetry`'s `stamped` wrote a span's ids
+/// into them.
+fn exemplar_in(fields: Fields, value: Float) -> Option<Exemplar> =
+  match ((
+      map_get(fields, telemetry::trace_id_field()),
+      map_get(fields, telemetry::span_id_field()),
+    )) {
+    (Some(trace::FText(trace_hex)), Some(trace::FText(span_hex))) ->
+      Some({
+        labels: labels([pair(Label("trace_id"), trace_hex), pair(Label("span_id"), span_hex)]),
+        value: value,
+      }),
+    _ -> None,
+  }
+
+/// `r` with a `trace.count` counted: the counter named `name_like(name)`.
+pub fn counted(r: Registry, channel: String, name: String, delta: Int, fields: Fields) -> Registry =
+  add_with(
+    r,
+    name_like(name),
+    labels_of(channel, fields),
+    float_of_int(delta),
+    exemplar_in(fields, float_of_int(delta)),
+  )
+
+/// `r` with a `trace.gauge` set: the gauge named `name_like(name)`.
+pub fn gauged(
+  r: Registry,
+  channel: String,
+  name: String,
+  value: Decimal,
+  fields: Fields,
+) -> Registry = set(r, name_like(name), labels_of(channel, fields), float_of_decimal(value))
+
+/// `r` with a `trace.time` observed, in seconds: the histogram named `name_like(name)` with
+/// `_seconds` after it, whose unit that is.
+pub fn timed(r: Registry, channel: String, name: String, micros: Int, fields: Fields) -> Registry = {
+  let named = name_like(name ++ "_seconds");
+  let seconds = float_of_int(micros) / 1000000.0;
+  let known = match map_get(r.families, name_text(named)) {
+    Some(_) -> r,
+    None -> describe(r, named, Histogram, "", "seconds"),
+  };
+  observe_with(known, named, labels_of(channel, fields), seconds, exemplar_in(fields, seconds))
+}
+
+/// `body` with every `trace.count`, `trace.gauge` and `trace.time` it performs, on any channel,
+/// kept in a registry that starts as `start`: `counted`, `gauged` and `timed`. The other
+/// `trace` operations pass to whatever handles them outside, so an exporter of spans goes
+/// around this one. `prometheus.registry` answers the registry as it stands, which is what
+/// `scrape` serves.
+pub fn recording<a | e>(
+  start: Registry,
+  body: () -> a / {trace.count[*], trace.gauge[*], trace.time[*], prometheus.registry | e},
+) -> a / e =
+  with_cell[prometheus_registry](start) { held ->
+    handle {
+      body()
+    } with {
+      trace.count[*c](name, delta, fields) ->
+        cell_set(held, counted(cell_get(held), c, name, delta, fields)),
+      trace.gauge[*c](name, value, fields) ->
+        cell_set(held, gauged(cell_get(held), c, name, value, fields)),
+      trace.time[*c](name, micros, fields) ->
+        cell_set(held, timed(cell_get(held), c, name, micros, fields)),
+      prometheus.registry() -> cell_get(held),
+    }
+  }
+
+// --- The page -------------------------------------------------------------------
+
+/// Whether an `Accept` field prefers OpenMetrics to the text format: the one of
+/// `application/openmetrics-text` and `text/plain` with the higher `q`, the text format where
+/// they tie or neither is named.
+pub fn prefers_openmetrics(accept: String) -> Bool = {
+  let weights = fold(
+    string_split_whole(accept, ","),
+    { open: -1.0, text: -1.0 },
+    |best: { open: Float, text: Float }, range_text: String| {
+      let parts = map(string_split_whole(range_text, ";"), |part: String|
+        ascii_lower(ascii_trim(part)));
+      let q = fold(parts, 1.0, |held: Float, part: String|
+        if string_starts_with(part, "q=") {
+          match float_of_string(replaced(part, "q=", "")) { Some(weight) -> weight, None -> held }
+        } else { held });
+      match parts {
+        ["application/openmetrics-text", ..] -> { open: max_float(best.open, q), text: best.text },
+        ["text/plain", ..] -> { open: best.open, text: max_float(best.text, q) },
+        _ -> best,
+      }
+    },
+  );
+  weights.open > 0.0 && weights.open > weights.text
+}
+
+fn max_float(a: Float, b: Float) -> Float = if b > a { b } else { a }
+
+/// The page a scrape of `s` is answered with, in the format the request's `Accept` prefers.
+pub fn page(req: Request, s: Snapshot) -> Response = {
+  let open = fold(
+    http::header_lines(req.headers, "accept"),
+    false,
+    |any_open: Bool, line: String| any_open || prefers_openmetrics(line),
+  );
+  {
+    status: 200,
+    headers: http::set_header(http::empty_headers(), "content-type", if open {
+      openmetrics_content_type()
+    } else { text_content_type() }),
+    body: if open { render_openmetrics(s) } else { render_text(s) },
+  }
+}
+
+/// The answer to a scrape: for a `GET` or a `HEAD` of `/metrics`, the registry the `recording`
+/// around the caller holds, as `page` writes it; `None` for any other request, which is the
+/// program's own to answer.
+pub fn scrape(req: Request) -> Option<Response> / {prometheus.registry} =
+  match ((req.method, req.path)) {
+    (http::Get, "/metrics") -> Some(page(req, snapshot(prometheus.registry()))),
+    (http::Head, "/metrics") -> Some(page(req, snapshot(prometheus.registry()))),
+    _ -> None,
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+gen for Registry by registries
+
+type Step = { kind: Int, metric: Int, set: Int, value: Int, marked: Bool }
+
+fn steps() -> Gen<Step> =
+  gen::and_then(gen::list_of_length(gen::below(8), 4), |draws: List<Int>|
+    gen::map(gen::bool(), |marked: Bool| -> Step {
+      {
+        kind: at(draws, 0) % 3,
+        metric: at(draws, 1) % 2,
+        set: at(draws, 2) % 5,
+        value: at(draws, 3),
+        marked: marked,
+      }
+    }))
+
+fn at(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }
+
+fn named(text: String) -> Name = name_like(text)
+
+fn label_sets() -> List<Labels> =
+  [
+    no_labels(),
+    labels([pair(label_like("sku"), "BOLT-1")]),
+    labels([pair(label_like("sku"), "a\"b\\c\nd"), pair(label_like("zone"), "eu")]),
+    labels([pair(label_like("zone"), "us")]),
+    labels([pair(label_like("sku"), "\u{e9}t\u{e9} \\n")]),
+  ]
+
+fn values() -> List<Float> = [0.0, 1.0, 2.5, 0.1, 1e300, 7.0, 0.004, 12.0]
+
+fn sample_exemplar(value: Float) -> Exemplar =
+  {
+    labels: labels([
+      pair(label_like("trace_id"), "4bf92f3577b34da6a3ce929d0e0e4736"),
+      pair(label_like("span_id"), "00f067aa0ba902b7"),
+    ]),
+    value: value,
+  }
+
+/// A registry with a family of each kind described, one with a help no format writes as it is.
+fn described() -> Registry =
+  describe(
+    describe(
+      describe(
+        registry(3),
+        named("orders"),
+        Counter,
+        "Orders \"placed\", by sku.\nA \\ is a backslash.",
+        "",
+      ),
+      named("request_duration_seconds"),
+      Histogram,
+      "How long a request took.",
+      "seconds",
+    ),
+    named("shelf_level"),
+    Gauge,
+    "",
+    "",
+  )
+
+fn applied(r: Registry, s: Step) -> Registry = {
+  let ls = match list_at(label_sets(), s.set) { Some(held) -> held, None -> no_labels() };
+  let value = match list_at(values(), s.value) { Some(v) -> v, None -> 0.0 };
+  let seen = if s.marked { Some(sample_exemplar(value)) } else { None };
+  if s.kind == 0 {
+    add_with(r, named(if s.metric == 0 { "orders" } else { "http_requests" }), ls, value, seen)
+  } else if s.kind == 1 {
+    set(r, named(if s.metric == 0 { "shelf_level" } else { "queue:depth" }), ls, if s.value == 7 {
+      neg_infinity()
+    } else if s.value == 6 { infinity() }
+    else { value - 3.5 })
+  } else {
+    observe_with(
+      r,
+      named(if s.metric == 0 { "request_duration_seconds" } else { "payload_bytes" }),
+      ls,
+      value,
+      seen,
+    )
+  }
+}
+
+fn registries() -> Gen<Registry> =
+  gen::map(gen::list_of(steps(), 14), |ops: List<Step>| fold(ops, described(), applied))
+
+law "a snapshot reads back from OpenMetrics"
+  forall (r: Registry) {
+    parse(render_openmetrics(snapshot(r)), default_limits()) == Ok(snapshot(r))
+  }
+
+law "a snapshot reads back from the text format as what that format can say"
+  forall (r: Registry) {
+    parse(render_text(snapshot(r)), default_limits()) == Ok(plain(snapshot(r)))
+  }
+
+law "a registry keeps no more series of a metric than its bound, and counts every one it turned away"
+  forall (r: Registry) {
+    all(snapshot(r).families, |f: Family| len(f.series) <= 3) && dropped(r) >= 0
+  }
+
+fn sample_registry() -> Registry = {
+  let bolt = labels([pair(label_like("sku"), "BOLT-1")]);
+  let odd = labels([pair(label_like("sku"), "a\"b\\c\nd")]);
+  let counted = add(
+    add_with(
+      add(described(), named("orders"), bolt, 2.0),
+      named("orders"),
+      bolt,
+      1.0,
+      Some(sample_exemplar(1.0)),
+    ),
+    named("orders_total"),
+    odd,
+    4.0,
+  );
+  let gauged = set(counted, named("shelf_level"), no_labels(), 41.75);
+  let bounded = with_bounds(gauged, named("request_duration_seconds"), [0.1, 1.0]);
+  observe(
+    observe_with(
+      observe(bounded, named("request_duration_seconds"), bolt, 0.05),
+      named("request_duration_seconds"),
+      bolt,
+      0.5,
+      Some(sample_exemplar(0.5)),
+    ),
+    named("request_duration_seconds"),
+    bolt,
+    30.0,
+  )
+}
+
+fn text_page() -> String =
+  \\# HELP orders_total Orders "placed", by sku.\nA \\ is a backslash.
+  \\# TYPE orders_total counter
+  \\orders_total{sku="BOLT-1"} 3
+  \\orders_total{sku="a\"b\\c\nd"} 4
+  \\# HELP request_duration_seconds How long a request took.
+  \\# TYPE request_duration_seconds histogram
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="0.1"} 1
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="1"} 2
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="+Inf"} 3
+  \\request_duration_seconds_sum{sku="BOLT-1"} 30.55
+  \\request_duration_seconds_count{sku="BOLT-1"} 3
+  \\# TYPE shelf_level gauge
+  \\shelf_level 41.75
+  \\
+
+fn open_page() -> String =
+  \\# HELP orders Orders \"placed\", by sku.\nA \\ is a backslash.
+  \\# TYPE orders counter
+  \\orders_total{sku="BOLT-1"} 3.0 # {span_id="00f067aa0ba902b7",trace_id="4bf92f3577b34da6a3ce929d0e0e4736"} 1.0
+  \\orders_total{sku="a\"b\\c\nd"} 4.0
+  \\# HELP request_duration_seconds How long a request took.
+  \\# TYPE request_duration_seconds histogram
+  \\# UNIT request_duration_seconds seconds
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="0.1"} 1
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="1.0"} 2 # {span_id="00f067aa0ba902b7",trace_id="4bf92f3577b34da6a3ce929d0e0e4736"} 0.5
+  \\request_duration_seconds_bucket{sku="BOLT-1",le="+Inf"} 3
+  \\request_duration_seconds_sum{sku="BOLT-1"} 30.55
+  \\request_duration_seconds_count{sku="BOLT-1"} 3
+  \\# TYPE shelf_level gauge
+  \\shelf_level 41.75
+  \\# EOF
+  \\
+
+test "the text format: HELP and TYPE, _total, cumulative buckets under le, and its escapes" {
+  assert_eq(string_of_bytes(render_text(snapshot(sample_registry()))), text_page())
+}
+
+test "OpenMetrics: the family named without _total, a unit, exemplars and # EOF" {
+  assert_eq(string_of_bytes(render_openmetrics(snapshot(sample_registry()))), open_page())
+}
+
+test "two registries that came to one state by different orders are one page" {
+  let a = labels([pair(label_like("zone"), "eu"), pair(label_like("sku"), "x")]);
+  let b = labels([pair(label_like("sku"), "x"), pair(label_like("zone"), "us")]);
+  let one = set(
+    add(add(registry(10), named("orders"), a, 1.0), named("orders"), b, 2.0),
+    named("level"),
+    a,
+    5.0,
+  );
+  let other = add(
+    add(set(registry(10), named("level"), a, 5.0), named("orders"), b, 2.0),
+    named("orders"),
+    a,
+    1.0,
+  );
+  assert_eq(render_text(snapshot(one)), render_text(snapshot(other)));
+  assert_eq(render_openmetrics(snapshot(one)), render_openmetrics(snapshot(other)));
+  // Labels are written in the order of their names, whatever order they were given in.
+  assert(
+    string_contains(
+      string_of_bytes(render_text(snapshot(one))),
+      "orders_total{sku=\"x\",zone=\"eu\"} 1\n",
+    ),
+  )
+}
+
+type Named = { text: String, metric: Bool, label: Bool, like: String }
+
+fn name_cases() -> List<Named> =
+  [
+    { text: "orders", metric: true, label: true, like: "orders" },
+    { text: "http_requests:rate5m", metric: true, label: false, like: "http_requests:rate5m" },
+    { text: "_x9", metric: true, label: true, like: "_x9" },
+    { text: "__name__", metric: true, label: false, like: "__name__" },
+    { text: "9lives", metric: false, label: false, like: "_9lives" },
+    { text: "orders placed", metric: false, label: false, like: "orders_placed" },
+    { text: "http.server.duration", metric: false, label: false, like: "http_server_duration" },
+    { text: "", metric: false, label: false, like: "_" },
+    { text: "caf\u{e9}", metric: false, label: false, like: "caf__" },
+  ]
+
+test "the name `{c.text}` is a metric's, a label's, or made into one" for c: Named in name_cases() {
+  assert_eq(name(c.text) != None, c.metric);
+  assert_eq(label(c.text) != None, c.label);
+  assert_eq(name_text(name_like(c.text)), c.like);
+  assert(name(name_text(name_like(c.text))) != None);
+  assert(label(label_text(label_like(c.text))) != None)
+}
+
+test "a metric keeps the label sets it has room for, and counts the rest" {
+  let filled = fold(["a", "b", "c", "d", "a", "e"], registry(3), |r: Registry, sku: String|
+    add(r, named("orders"), labels([pair(label_like("sku"), sku)]), 1.0));
+  assert_eq(dropped(filled), 2);
+  match snapshot(filled).families {
+    [orders] ->
+      assert_eq(map(orders.series, |s: Series| s.value), [
+        Total(2.0, None),
+        Total(1.0, None),
+        Total(1.0, None),
+      ]),
+    _ -> panic("expected one family"),
+  }
+}
+
+test "an update that is not its metric's is refused and counted" {
+  let r = add(registry(3), named("orders"), no_labels(), 1.0);
+  let after = with_bounds(
+    describe(
+      observe(
+        add(
+          add(set(r, named("orders"), no_labels(), 5.0), named("orders"), no_labels(), -1.0),
+          named("orders"),
+          no_labels(),
+          float_of_bits(0x7FF8_0000_0000_0000),
+        ),
+        named("orders"),
+        no_labels(),
+        1.0,
+      ),
+      named("wait"),
+      Histogram,
+      "",
+      "seconds",
+    ),
+    named("orders"),
+    [1.0],
+  );
+  assert_eq(refused(after), 6);
+  assert_eq(snapshot(after), snapshot(r));
+  // A gauge named as a counter's samples are is its own family, and so is a histogram's.
+  assert_eq(len(snapshot(set(r, named("orders_total"), no_labels(), 1.0)).families), 2)
+}
+
+type Refused = { name: String, page: String, why: Why, line: Int }
+
+fn refused_pages() -> List<Refused> =
+  [
+    { name: "a line that opens with no name", page: "{a=\"b\"} 1\n", why: BadName, line: 1 },
+    { name: "a sample with no value", page: "orders\n", why: BadValue, line: 1 },
+    { name: "a value that is no number", page: "a 1\norders one\n", why: BadValue, line: 2 },
+    { name: "labels that never close", page: "orders{sku=\"x\" 1\n", why: BadLabels, line: 1 },
+    { name: "a label with no quotes", page: "orders{sku=x} 1\n", why: BadLabels, line: 1 },
+    {
+      name: "a label name Prometheus keeps",
+      page: "orders{__sku=\"x\"} 1\n",
+      why: BadLabels,
+      line: 1,
+    },
+    { name: "an escape no format has", page: "orders{sku=\"a\\tb\"} 1\n", why: BadEscape, line: 1 },
+    { name: "a summary", page: "# TYPE wait summary\n", why: Unsupported("summary"), line: 1 },
+    { name: "a TYPE of no name", page: "# TYPE 9 counter\n", why: BadComment, line: 1 },
+    {
+      name: "a bucket with no le",
+      page: "# TYPE wait histogram\nwait_bucket 1\n",
+      why: Misplaced,
+      line: 2,
+    },
+    {
+      name: "a bucket count that is not whole",
+      page: "# TYPE wait histogram\nwait_bucket{le=\"1\"} 1.5\n",
+      why: BadValue,
+      line: 2,
+    },
+    { name: "a line after the end", page: "# EOF\norders 1\n", why: AfterEnd, line: 2 },
+  ]
+
+test "a page is refused: {c.name}" for c: Refused in refused_pages() {
+  assert_eq(parse(bytes_of_string(c.page), default_limits()), Err({ why: c.why, line: c.line }))
+}
+
+test "a page past its limits is refused" {
+  let page = bytes_of_string("a 1\nb 2\nc 3\n");
+  assert_eq(parse(page, { length: 5, samples: 10 }), Err({ why: TooLong, line: 0 }));
+  assert_eq(parse(page, { length: 100, samples: 2 }), Err({ why: TooMany, line: 3 }));
+  assert_eq(parse(b"a \xff\n", default_limits()), Err({ why: NotText, line: 0 }))
+}
+
+test "a reader takes what other writers write: timestamps, _created, comments, CRLF and bare samples" {
+  let page =
+    \\# A comment.
+    \\# TYPE orders_total counter
+    \\# HELP orders_total Orders.
+    \\orders_total{sku="x",} 3 1712000000000
+    \\orders_created{sku="x"} 1.7e+09
+    \\# TYPE wait histogram
+    \\wait_bucket{le="1"} 1
+    \\wait_bucket{le="+Inf"} 2
+    \\wait_count 2
+    \\wait_sum 1.5
+    \\wait_created 1.7e+09
+    \\loose{a="b"} +Inf
+    \\
+  ;
+  let crlf = bytes_of_string(replaced(page, "\n", "\r\n"));
+  let want: Snapshot = {
+    families: [
+      {
+        name: named("orders"),
+        help: "Orders.",
+        unit: "",
+        kind: Counter,
+        series: [{ labels: labels([pair(label_like("sku"), "x")]), value: Total(3.0, None) }],
+      },
+      {
+        name: named("wait"),
+        help: "",
+        unit: "",
+        kind: Histogram,
+        series: [
+          {
+            labels: no_labels(),
+            value: Spread(
+              [{ le: 1.0, count: 1, exemplar: None }, { le: infinity(), count: 2, exemplar: None }],
+              1.5,
+            ),
+          },
+        ],
+      },
+      {
+        name: named("loose"),
+        help: "",
+        unit: "",
+        kind: Untyped,
+        series: [{ labels: labels([pair(label_like("a"), "b")]), value: Level(infinity()) }],
+      },
+    ],
+  };
+  assert_eq(parse(bytes_of_string(page), default_limits()), Ok(want));
+  assert_eq(parse(crlf, default_limits()), Ok(want))
+}
+
+fn traced<[c]>() -> Unit / {trace.count[c], trace.gauge[c], trace.time[c]} = {
+  trace.count[c](
+    "orders placed",
+    2,
+    #{
+      "sku": trace::FText("BOLT-1"),
+      "trace_id": trace::FText("4bf92f3577b34da6a3ce929d0e0e4736"),
+      "span_id": trace::FText("00f067aa0ba902b7"),
+    },
+  );
+  trace.count[c]("orders placed", 1, #{"sku": trace::FText("BOLT-1")});
+  trace.gauge[c]("shelf", 41.75m, #{"aisle": trace::FInt(7)});
+  trace.time[c]("checkout", 7000, map_new())
+}
+
+fn scraped(accept: Option<String>, path: String) -> Option<Response> / {abort.raise} = {
+  let req = http::request_to(http::Get, "shop.example", path, b"");
+  let asking = match accept {
+    Some(a) -> { ..req, headers: http::set_header(req.headers, "accept", a) },
+    None -> req,
+  };
+  recording(registry(100), || {
+    traced[orders]();
+    scrape(asking)
+  })
+}
+
+test "a trace's counts, gauges and timings are scraped as a page, in the format the scrape prefers" {
+  let text = match scraped(None, "/metrics") { Some(res) -> res, None -> panic("no page") };
+  assert_eq(http::header(text.headers, "content-type"), Some(text_content_type()));
+  assert_eq(
+    string_of_bytes(text.body),
+    "# TYPE checkout_seconds histogram\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.005\"} 0\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.01\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.025\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.05\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.075\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.1\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.25\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.5\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"0.75\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"1\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"2.5\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"5\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"7.5\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"10\"} 1\n"
+      ++ "checkout_seconds_bucket{channel=\"orders\",le=\"+Inf\"} 1\n"
+      ++ "checkout_seconds_sum{channel=\"orders\"} 0.007\n"
+      ++ "checkout_seconds_count{channel=\"orders\"} 1\n"
+      ++ "# TYPE orders_placed_total counter\n"
+      ++ "orders_placed_total{channel=\"orders\",sku=\"BOLT-1\"} 3\n"
+      ++ "# TYPE shelf gauge\n"
+      ++ "shelf{aisle=\"7\",channel=\"orders\"} 41.75\n",
+  );
+  let open = match scraped(
+      Some(
+        "application/openmetrics-text;version=1.0.0;q=0.5,text/plain;version=0.0.4;q=0.3,*/*;q=0.2",
+      ),
+      "/metrics",
+    ) {
+    Some(res) -> res,
+    None -> panic("no page"),
+  };
+  assert_eq(http::header(open.headers, "content-type"), Some(openmetrics_content_type()));
+  let page = string_of_bytes(open.body);
+  assert(string_contains(page, "# UNIT checkout_seconds seconds\n"));
+  assert(
+    string_contains(
+      page,
+      "orders_placed_total{channel=\"orders\",sku=\"BOLT-1\"} 3.0 # {span_id=\"00f067aa0ba902b7\",trace_id=\"4bf92f3577b34da6a3ce929d0e0e4736\"} 2.0\n",
+    ),
+  );
+  assert(string_ends_with(page, "# EOF\n"));
+  assert_eq(scraped(None, "/orders"), None)
+}
+
+type Accepting = { accept: String, open: Bool }
+
+fn accepts() -> List<Accepting> =
+  [
+    { accept: "", open: false },
+    { accept: "*/*", open: false },
+    { accept: "text/plain;version=0.0.4", open: false },
+    { accept: "application/openmetrics-text; version=1.0.0; charset=utf-8", open: true },
+    { accept: "Application/OpenMetrics-Text", open: true },
+    { accept: "text/plain;q=0.9, application/openmetrics-text;q=0.5", open: false },
+    { accept: "text/plain;q=0.5, application/openmetrics-text;q=0.9", open: true },
+    { accept: "application/openmetrics-text;q=0", open: false },
+    { accept: "application/openmetrics-text, text/plain", open: false },
+  ]
+
+test "an Accept of `{c.accept}` is answered in OpenMetrics, or in the text format" for c: Accepting in accepts(
+  ) { assert_eq(prefers_openmetrics(c.accept), c.open) }
+
+/// A number as a program writes it, and as each format does.
+type Written = { value: String, text: String, open: String }
+
+fn written_numbers() -> List<Written> =
+  [
+    { value: "0.0", text: "0", open: "0.0" },
+    { value: "1.0", text: "1", open: "1.0" },
+    { value: "-1.0", text: "-1", open: "-1.0" },
+    { value: "0.005", text: "0.005", open: "0.005" },
+    { value: "0.0001", text: "0.0001", open: "0.0001" },
+    { value: "0.00001", text: "1e-05", open: "1e-05" },
+    { value: "0.000025551", text: "2.5551e-05", open: "2.5551e-05" },
+    { value: "100000.0", text: "100000", open: "100000.0" },
+    { value: "1000000.0", text: "1e+06", open: "1e+06" },
+    { value: "4473520.0", text: "4.47352e+06", open: "4.47352e+06" },
+    { value: "1594239123.45", text: "1.59423912345e+09", open: "1.59423912345e+09" },
+    { value: "41.75", text: "41.75", open: "41.75" },
+    { value: "1e300", text: "1e+300", open: "1e+300" },
+    { value: "5e-324", text: "5e-324", open: "5e-324" },
+    { value: "-2.5", text: "-2.5", open: "-2.5" },
+    { value: "123456.789", text: "123456.789", open: "123456.789" },
+  ]
+
+test "a number is written as Prometheus writes {c.text}" for c: Written in written_numbers() {
+  let value = match float_of_string(c.value) { Some(f) -> f, None -> panic("a number") };
+  assert_eq(number(value, false), c.text);
+  assert_eq(number(value, true), c.open);
+  assert_eq(try { number_of(bytes_of_string(c.text), 1) }, Ok(value))
+}
+
+law "a number reads back from either spelling"
+  forall (bits: Int) {
+    let f = float_of_bits(bits);
+    is_nan(f)
+      || ((try { number_of(bytes_of_string(number(f, false)), 1) }) == Ok(f)
+      && (try { number_of(bytes_of_string(number(f, true)), 1) }) == Ok(f))
+  }
