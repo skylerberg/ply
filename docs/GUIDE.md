@@ -1003,10 +1003,33 @@ A module that declares or unqualified-imports its own `Ok`, `Err`, `Some` or
 tagged literals with its own `Ok` (§2.3), each `E0118`; one that declares its
 own `Stop` loses `iterate`.
 
-**`Secret<a>`** is made by `secret_of_string` and observed only by
-`secret_verify`, `secret_is_empty` and `==`. It cannot be rendered, encoded or
-ordered, and reaches a host operation only if that operation's registration
-allows it (`E0439`).
+**`Secret<a>`** holds a credential, a `String` or `Bytes`, that nothing written
+in Ply reads. `secret_of_string` and `secret_of_bytes` seal a value the program
+already holds, and `config.secret` (`std.config`) answers one it never held.
+These make a secret of a secret without opening it: `secret_bytes` (a string's
+UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
+hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
+give it), `secret_private_key` (the key a DER document holds) and the
+derivations `std.hash` names, `hkdf` and `pbkdf2`. None answers a part of a
+secret: a slice of one, compared with `==` against each of 256 guesses, would
+read it a byte at a time, so two keys out of one derivation are two `hkdf`
+calls under two `info`s.
+
+A secret is observed four ways: `==` and `!=` between two of them,
+`secret_verify` against a string, `secret_is_empty` and `secret_len`. A
+comparison takes time that follows the two lengths and never where the values
+first differ, and it says one thing, so a secret is read only by guessing it
+whole; a length is not kept secret. What a secret is used for is the runtime's
+to compute, in time that is no function of it: a MAC (`std.hash`), and a
+signature, a public key, a sealed or opened message and a key agreement
+(`std.crypto`). What those answer, a tag, a signature, a public key, is no
+secret: each is one-way in the key.
+
+A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
+a `forall`, and reaches a host operation only if that operation's registration
+allows it (`E0439`). No operation `ply` ships takes one, so a secret has no way
+out of a program: key material that is to be written down, as `ply keygen`'s
+is, is written by whoever drew it, before it is sealed.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -2776,7 +2799,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`,
 readable by its owner alone, and the public key at `PATH.pub`, each one line
 naming what it holds and 64 hex digits. It never writes over a file, and a key
-file that cannot be read, decoded or written is `E0462`.
+file that cannot be read, decoded or written is `E0462`. A secret key read back
+from its file is a `Secret` (§4.6) from then on.
 
 `ply build --sign KEY` signs what it writes, a program or a library, in
 `<artifact>.sig` beside it. A signature is detached, so the artifact's digest

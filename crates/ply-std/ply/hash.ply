@@ -1,19 +1,21 @@
 //! Hash functions as values, and what is written once over any of them: a digest, a digest of an
-//! input that arrives in parts, HMAC, HKDF and PBKDF2.
+//! input that arrives in parts, and HMAC; and HMAC, HKDF and PBKDF2 under a key that is a `Secret`.
 //!
-//! A `Hash` is a block size, a digest size and how a block is taken and a message ended, so `hmac`,
-//! `hkdf` and `pbkdf2` take any of them. The SHA-2 and SHA-3 families, SHAKE and BLAKE2b are here;
-//! MD5 and SHA-1, which are broken for collisions, are in `std.hash_legacy`, so a use of either
-//! shows in an import. `blake3` is the `bytes_blake3` builtin and is no `Hash`.
+//! A `Hash` is a block size, a digest size and how a block is taken and a message ended. The SHA-2
+//! and SHA-3 families, SHAKE and BLAKE2b are here; MD5 and SHA-1, which are broken for collisions,
+//! are in `std.hash_legacy`, so a use of either shows in an import. `blake3` is the `bytes_blake3`
+//! builtin and is no `Hash`.
 //!
-//! Everything else is written in Ply, and the vectors the standards publish are its tests. A round
+//! The digests are written in Ply, and the vectors the standards publish are their tests. A round
 //! keeps its working words in parameters and its state in an array it updates in place, so a digest
-//! takes steps linear in its input.
+//! takes steps linear in its input. None of it runs in constant time.
 //!
-//! Nothing here runs in constant time, and a key is `Bytes`, since nothing written in Ply reads a
-//! `Secret`.
+//! A key is a `Secret`, and what reads one is the runtime: `hmac`, `hkdf` and `pbkdf2` are its, in
+//! constant time, over the hash a `Hash`'s `name` says, which is SHA-1, SHA-256, SHA-384 or
+//! SHA-512; any other is refused as `Unkeyed`. `hmac_plain` is HMAC written in Ply over any `Hash`,
+//! for a key anyone may read: a salt, a published label, a standard's vector.
 
-import std.bytes (bytes_of_hex, hex_of, repeat, u32_be, u64_be, u64_le, xor, xor_byte)
+import std.bytes (bytes_of_hex, hex_of, repeat, u32_be, u64_be, u64_le, xor_byte)
 import std.list (all, find)
 
 /// The 32-byte BLAKE3 hash of `input`.
@@ -49,12 +51,14 @@ pub type Refusal =
   | OutputLength(Int)
   /// A key of a length the function does not take.
   | KeyLength(Int)
-  /// An iteration count below one.
+  /// An iteration count below one, or past `2^32 - 1`.
   | Iterations(Int)
+  /// A hash, by its name, that the runtime does not key under a `Secret`.
+  | Unkeyed(String)
 
 /// What a function of this module raises where it refuses its parameters.
 pub effect hash {
-  /// A length or a count is outside what the function defines.
+  /// A length, a count or a hash is outside what the function defines.
   raise refused(e: Refusal)
 }
 
@@ -1029,61 +1033,76 @@ fn continued(after: Hasher, pad: Bytes, data: Bytes) -> Bytes / {abort.raise} =
 fn tagged(k: Keyed, message: Bytes) -> Bytes / {abort.raise} =
   continued(k.outer, k.outer_pad, continued(k.inner, k.inner_pad, message))
 
-/// HMAC over `h`, as RFC 2104 defines it: a tag of `h.digest_size` bytes. Compare one with
-/// `tags_match`, never `==`.
-pub fn hmac(h: Hash, key: Bytes, message: Bytes) -> Bytes / {abort.raise} =
+/// HMAC over `h` under a key anyone may read, as RFC 2104 defines it: a tag of `h.digest_size`
+/// bytes, over any `Hash`. Its steps follow the key, so it is for one that is public by nature, a
+/// salt or a published label; a key worth keeping is a `Secret`, and `hmac`'s.
+pub fn hmac_plain(h: Hash, key: Bytes, message: Bytes) -> Bytes / {abort.raise} =
   tagged(keyed(h, key), message)
 
+/// HMAC over `h` under a secret key: a tag of `h.digest_size` bytes, which is no secret. Compare
+/// one with `tags_match`, never `==`.
+pub fn hmac(h: Hash, key: Secret<Bytes>, message: Bytes) -> Bytes / {hash.refused} =
+  match secret_hmac(h.name, key, message) {
+    Some(tag) -> tag,
+    None -> hash.refused(Unkeyed(h.name)),
+  }
+
 /// Whether `tag` is the HMAC of `message` under `key`, compared as `tags_match` compares.
-pub fn hmac_verify(h: Hash, key: Bytes, message: Bytes, tag: Bytes) -> Bool / {abort.raise} =
-  tags_match(hmac(h, key, message), tag)
+pub fn hmac_verify(
+  h: Hash,
+  key: Secret<Bytes>,
+  message: Bytes,
+  tag: Bytes,
+) -> Bool / {hash.refused} = tags_match(hmac(h, key, message), tag)
 
-/// Whether two tags are the same bytes.
-///
-/// Two of one length are read to their ends whatever they hold, so the calls made, which is what
-/// `metered` counts as steps, depend on the length alone and not on where they first differ. That
-/// is all it promises: the compiled code's time is not held constant, and two of different lengths
-/// answer `false` at once, a tag's length being no secret.
-pub fn tags_match(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
-  bytes_len(a) == bytes_len(b) && differing(a, b, 0, 0) == 0
+/// Whether two tags are the same bytes, in time that follows their lengths and never where they
+/// first differ: the runtime compares them, as it compares two secrets. A length is no secret.
+pub fn tags_match(a: Bytes, b: Bytes) -> Bool = secret_of_bytes(a) == secret_of_bytes(b)
 
-fn differing(a: Bytes, b: Bytes, i: Int, bits: Int) -> Int / {abort.raise} =
-  if i >= bytes_len(a) { bits }
-  else { differing(a, b, i + 1, bits | bytes_at(a, i) ^ bytes_at(b, i)) }
+fn keyed_tag(name: String, key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
+  match secret_hmac(name, key, message) {
+    Some(tag) -> tag,
+    None -> panic(name ++ " is a hash the runtime keys"),
+  }
 
 /// HMAC-SHA-256, as RFC 4231 publishes vectors for.
-pub fn hmac_sha256(key: Bytes, message: Bytes) -> Bytes / {abort.raise}
-  cost bytes_len(key) + bytes_len(message)
-= hmac(sha256_hash(), key, message)
+pub fn hmac_sha256(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
+  keyed_tag("SHA-256", key, message)
+
+/// HMAC-SHA-384.
+pub fn hmac_sha384(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
+  keyed_tag("SHA-384", key, message)
+
+/// HMAC-SHA-512.
+pub fn hmac_sha512(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
+  keyed_tag("SHA-512", key, message)
 
 // --- HKDF and PBKDF2 --------------------------------------------------------------
 
 /// HKDF's first step, as RFC 5869 defines it: a pseudorandom key of `h.digest_size` bytes out of
-/// `key`, which need not be uniform, and `salt`, which may be empty.
-pub fn hkdf_extract(h: Hash, salt: Bytes, key: Bytes) -> Bytes / {abort.raise} = hmac(h, salt, key)
+/// `key`, which need not be uniform, and `salt`, which is public and may be empty.
+pub fn hkdf_extract(h: Hash, salt: Bytes, key: Secret<Bytes>) -> Secret<Bytes> / {hash.refused} =
+  match secret_hkdf_extract(h.name, salt, key) {
+    Some(prk) -> prk,
+    None -> hash.refused(Unkeyed(h.name)),
+  }
 
 /// HKDF's second step: `length` bytes out of the pseudorandom key `prk`, bound to `info`. A length
 /// below zero or past 255 digests is refused as an `OutputLength`, and a `prk` shorter than a
-/// digest as a `KeyLength`.
+/// digest as a `KeyLength`. Two keys from one `prk` are two calls with two `info`s: a secret is
+/// not cut in pieces.
 pub fn hkdf_expand(
   h: Hash,
-  prk: Bytes,
+  prk: Secret<Bytes>,
   info: Bytes,
   length: Int,
-) -> Bytes / {hash.refused, abort.raise} =
+) -> Secret<Bytes> / {hash.refused} =
   if length < 0 || length > 255 * h.digest_size { hash.refused(OutputLength(length)) }
-  else if bytes_len(prk) < h.digest_size { hash.refused(KeyLength(bytes_len(prk))) }
-  else if length == 0 { b"" } else {
-    let k = keyed(h, prk);
-    let made = fold(
-      range(1, (length + h.digest_size - 1) / h.digest_size + 1),
-      { last: b"", all: [] },
-      |acc: { last: Bytes, all: List<Bytes> }, i: Int| {
-        let next = tagged(k, bytes_concat_all([acc.last, info, byte_of_int(i)]));
-        { last: next, all: push(acc.all, next) }
-      },
-    );
-    bytes_slice(bytes_concat_all(made.all), 0, length)
+  else if secret_len(prk) < h.digest_size { hash.refused(KeyLength(secret_len(prk))) } else {
+    match secret_hkdf_expand(h.name, prk, info, length) {
+      Some(key) -> key,
+      None -> hash.refused(Unkeyed(h.name)),
+    }
   }
 
 /// HKDF, both steps: `length` bytes of key out of `key`, `salt` and `info`. It refuses a length as
@@ -1091,42 +1110,39 @@ pub fn hkdf_expand(
 pub fn hkdf(
   h: Hash,
   salt: Bytes,
-  key: Bytes,
+  key: Secret<Bytes>,
   info: Bytes,
   length: Int,
-) -> Bytes / {hash.refused, abort.raise} = hkdf_expand(h, hkdf_extract(h, salt, key), info, length)
+) -> Secret<Bytes> / {hash.refused} = hkdf_expand(h, hkdf_extract(h, salt, key), info, length)
+
+/// The most bytes `pbkdf2` derives: a megabyte.
+pub fn pbkdf2_longest() -> Int = 1 << 20
 
 /// PBKDF2 over HMAC over `h`, as RFC 8018 defines it: `length` bytes out of a password, stretched
-/// by `iterations` rounds. An iteration count below one is refused as `Iterations`, and a length
-/// below one or past 2^32 - 1 digests as an `OutputLength`.
+/// by `iterations` rounds. An iteration count below one or past `2^32 - 1` is refused as
+/// `Iterations`, and a length below one or past `pbkdf2_longest()` as an `OutputLength`.
 pub fn pbkdf2(
   h: Hash,
-  password: Bytes,
+  password: Secret<Bytes>,
   salt: Bytes,
   iterations: Int,
   length: Int,
-) -> Bytes / {hash.refused, abort.raise} =
-  if iterations < 1 { hash.refused(Iterations(iterations)) }
-  else if length < 1 || length > 0xFFFF_FFFF * h.digest_size { hash.refused(OutputLength(length)) }
-  else {
-    let k = keyed(h, password);
-    let blocks = map(range(1, (length + h.digest_size - 1) / h.digest_size + 1), |i: Int| {
-      let first = tagged(k, bytes_concat(salt, u32_be(i)));
-      stretched(k, first, first, iterations - 1)
-    });
-    bytes_slice(bytes_concat_all(blocks), 0, length)
-  }
-
-/// `sum` xored with each of the `left` tags that follow `last`, each the tag of the one before.
-fn stretched(k: Keyed, last: Bytes, sum: Bytes, left: Int) -> Bytes / {abort.raise} =
-  if left <= 0 { sum } else {
-    let next = tagged(k, last);
-    stretched(k, next, xor(sum, next), left - 1)
+) -> Secret<Bytes> / {hash.refused} =
+  if iterations < 1 || iterations > 0xFFFF_FFFF { hash.refused(Iterations(iterations)) }
+  else if length < 1 || length > pbkdf2_longest() { hash.refused(OutputLength(length)) } else {
+    match secret_pbkdf2(h.name, password, salt, iterations, length) {
+      Some(key) -> key,
+      None -> hash.refused(Unkeyed(h.name)),
+    }
   }
 
 /// PBKDF2-HMAC-SHA-256 with one output block, which is thirty-two bytes: SCRAM's salted password.
 /// It raises for an iteration count below one.
-pub fn pbkdf2_sha256(password: Bytes, salt: Bytes, iterations: Int) -> Bytes / {abort.raise} =
+pub fn pbkdf2_sha256(
+  password: Secret<Bytes>,
+  salt: Bytes,
+  iterations: Int,
+) -> Secret<Bytes> / {abort.raise} =
   handle {
     pbkdf2(sha256_hash(), password, salt, iterations, 32)
   } with {
@@ -1726,33 +1742,43 @@ fn rfc_4231() -> List<Mac> / {abort.raise} =
 fn cut_to(tag: Bytes, published: String) -> String / {abort.raise} =
   hex_of(bytes_slice(tag, 0, string_len(published) / 2))
 
-test "RFC 4231, case {v.case}" for v: Mac in rfc_4231() {
-  assert_eq(cut_to(hmac(sha256_hash(), v.key, v.data), v.sha256), v.sha256);
-  assert_eq(cut_to(hmac(sha384_hash(), v.key, v.data), v.sha384), v.sha384);
-  assert_eq(cut_to(hmac(sha512_hash(), v.key, v.data), v.sha512), v.sha512);
-  assert_eq(cut_to(hmac_sha256(v.key, v.data), v.sha256), v.sha256)
+test "RFC 4231, case {v.case}, under a secret key and under a plain one" for v: Mac in rfc_4231() {
+  handle {
+    assert_eq(cut_to(hmac(sha256_hash(), secret_of_bytes(v.key), v.data), v.sha256), v.sha256);
+    assert_eq(cut_to(hmac(sha384_hash(), secret_of_bytes(v.key), v.data), v.sha384), v.sha384);
+    assert_eq(cut_to(hmac(sha512_hash(), secret_of_bytes(v.key), v.data), v.sha512), v.sha512)
+  } with {
+    hash.refused(_) -> panic("a hash the runtime keys was refused"),
+  };
+  assert_eq(cut_to(hmac_sha256(secret_of_bytes(v.key), v.data), v.sha256), v.sha256);
+  assert_eq(cut_to(hmac_sha384(secret_of_bytes(v.key), v.data), v.sha384), v.sha384);
+  assert_eq(cut_to(hmac_sha512(secret_of_bytes(v.key), v.data), v.sha512), v.sha512);
+  assert_eq(cut_to(hmac_plain(sha256_hash(), v.key, v.data), v.sha256), v.sha256);
+  assert_eq(cut_to(hmac_plain(sha384_hash(), v.key, v.data), v.sha384), v.sha384);
+  assert_eq(cut_to(hmac_plain(sha512_hash(), v.key, v.data), v.sha512), v.sha512)
 }
 
 test "HMAC of the empty message, and under the empty key" {
   assert_eq(
-    hex_of(hmac_sha256(b"", b"")),
+    hex_of(hmac_sha256(secret_of_bytes(b""), b"")),
     "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad",
   );
   assert_eq(
-    hex_of(hmac_sha256(b"key", b"")),
+    hex_of(hmac_sha256(secret_of_bytes(b"key"), b"")),
     "5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0",
   );
+  assert_eq(hmac_plain(sha256_hash(), b"", b""), hmac_sha256(secret_of_bytes(b""), b""));
   // BLAKE2b ends its last block as no other: an empty message leaves the pad as that block.
   assert_eq(
-    hex_of(hmac(blake2b_hash(), b"key", b"")),
+    hex_of(hmac_plain(blake2b_hash(), b"key", b"")),
     "019fe04bf010b8d72772e6b46897ecf74b4878c394ff2c4d5cfa0b7cc9bbefcb28c36de23cef03089db9c3d900468c89804f135e9fdef7ec9b3c7abe50ed33d3",
   );
   assert_eq(
-    hex_of(hmac(blake2b_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
+    hex_of(hmac_plain(blake2b_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
     "92294f92c0dfb9b00ec9ae8bd94d7e7d8a036b885a499f149dfe2fd2199394aaaf6b8894a1730cccb2cd050f9bcf5062a38b51b0dab33207f8ef35ae2c9df51b",
   );
   assert_eq(
-    hex_of(hmac(sha3_256_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
+    hex_of(hmac_plain(sha3_256_hash(), b"key", b"The quick brown fox jumps over the lazy dog")),
     "8c6e0683409427f8931711b10ca92a506eb1fafa48fadd66d76126f47ac2c333",
   )
 }
@@ -1762,35 +1788,46 @@ test "a key of a block's length is used as it is, and a longer one is its digest
     all(every(), |h: Hash| {
       let whole = varied(h.block_size);
       let long = varied(h.block_size + 1);
-      hmac(h, long, b"message") == hmac(h, digest_of(h, long), b"message")
-        && hmac(h, whole, b"message") != hmac(h, digest_of(h, whole), b"message")
+      hmac_plain(h, long, b"message") == hmac_plain(h, digest_of(h, long), b"message")
+        && hmac_plain(h, whole, b"message") != hmac_plain(h, digest_of(h, whole), b"message")
     }),
   )
 }
 
+law "HMAC-SHA-256 under a secret key is HMAC over SHA-256 as Ply writes it"
+  forall (material: Bytes, message: Bytes) {
+    hmac_sha256(secret_of_bytes(material), message) == hmac_plain(sha256_hash(), material, message)
+  }
+
+law "HMAC-SHA-384 under a secret key is HMAC over SHA-384 as Ply writes it"
+  forall (material: Bytes, message: Bytes) {
+    hmac_sha384(secret_of_bytes(material), message) == hmac_plain(sha384_hash(), material, message)
+  }
+
+law "HMAC-SHA-512 under a secret key is HMAC over SHA-512 as Ply writes it"
+  forall (material: Bytes, message: Bytes) {
+    hmac_sha512(secret_of_bytes(material), message) == hmac_plain(sha512_hash(), material, message)
+  }
+
 test "two tags match when every byte does, and never across a length" {
-  let tag = hmac_sha256(b"key", b"message");
-  assert(tags_match(tag, hmac_sha256(b"key", b"message")));
-  assert(!tags_match(tag, hmac_sha256(b"key", b"massage")));
+  let tag = hmac_sha256(secret_of_bytes(b"key"), b"message");
+  assert(tags_match(tag, hmac_sha256(secret_of_bytes(b"key"), b"message")));
+  assert(!tags_match(tag, hmac_sha256(secret_of_bytes(b"key"), b"massage")));
   assert(!tags_match(tag, bytes_slice(tag, 0, 31)));
   assert(!tags_match(b"", tag));
   assert(tags_match(b"", b""));
-  assert(hmac_verify(sha256_hash(), b"key", b"message", tag));
-  assert(!hmac_verify(sha256_hash(), b"kex", b"message", tag));
-  assert(!hmac_verify(sha512_hash(), b"key", b"message", tag))
+  assert_eq(try { hmac_verify(sha256_hash(), secret_of_bytes(b"key"), b"message", tag) }, Ok(true));
+  assert_eq(
+    try { hmac_verify(sha256_hash(), secret_of_bytes(b"kex"), b"message", tag) },
+    Ok(false),
+  );
+  assert_eq(try { hmac_verify(sha512_hash(), secret_of_bytes(b"key"), b"message", tag) }, Ok(false))
 }
 
-test "comparing two tags takes the same steps wherever they differ" {
-  let tag = hmac_sha256(b"key", b"message");
-  let early = bytes_concat(b"\x00", bytes_slice(tag, 1, 32));
-  let late = bytes_concat(bytes_slice(tag, 0, 31), b"\x00");
-  let same = metered(|| tags_match(tag, tag));
-  let first = metered(|| tags_match(tag, early));
-  let last = metered(|| tags_match(tag, late));
-  assert(same.value && !first.value && !last.value);
-  assert_eq(first.steps, same.steps);
-  assert_eq(last.steps, same.steps)
-}
+law "two tags match exactly when they are the same bytes"
+  forall (a: Bytes, b: Bytes) {
+    tags_match(a, b) == (a == b) && tags_match(a, a)
+  }
 
 /// One of RFC 5869's cases: what goes in, the pseudorandom key the first step makes of it, and the
 /// output.
@@ -1844,20 +1881,26 @@ fn rfc_5869() -> List<Derivation> / {abort.raise} =
 
 test "RFC 5869, case {v.case}" for v: Derivation in rfc_5869() {
   let h = sha256_hash();
-  let prk = hkdf_extract(h, v.salt, v.key);
-  assert_eq(hex_of(prk), v.prk);
-  assert_eq(hex_of(hkdf_expand(h, prk, v.info, v.length)), v.okm);
-  assert_eq(hex_of(hkdf(h, v.salt, v.key, v.info, v.length)), v.okm)
+  let derived = try {
+    let prk = hkdf_extract(h, v.salt, secret_of_bytes(v.key));
+    {
+      prk: prk,
+      expanded: hkdf_expand(h, prk, v.info, v.length),
+      whole: hkdf(h, v.salt, secret_of_bytes(v.key), v.info, v.length),
+    }
+  };
+  let okm = secret_of_bytes(bytes_of_hex(v.okm));
+  assert_eq(derived, Ok({ prk: secret_of_bytes(bytes_of_hex(v.prk)), expanded: okm, whole: okm }))
 }
 
-test "a shorter HKDF output is the start of a longer one, and its first digest is one HMAC" {
+test "HKDF's first step is one HMAC under the salt, and one digest of its second is one under the key" {
   let h = sha256_hash();
-  let prk = hkdf_extract(h, b"salt", b"key");
-  let long = hkdf_expand(h, prk, b"info", 65);
-  assert(
-    all([1, 31, 32, 33, 64], |n: Int| hkdf_expand(h, prk, b"info", n) == bytes_slice(long, 0, n)),
-  );
-  assert_eq(hkdf_expand(h, prk, b"info", 32), hmac(h, prk, b"info\x01"))
+  let prk = hmac_plain(h, b"salt", b"key");
+  assert_eq(try { hkdf_extract(h, b"salt", secret_of_bytes(b"key")) }, Ok(secret_of_bytes(prk)));
+  assert_eq(
+    try { hkdf_expand(h, secret_of_bytes(prk), b"info", 32) },
+    Ok(secret_of_bytes(hmac_plain(h, prk, b"info\x01"))),
+  )
 }
 
 /// One published PBKDF2 key.
@@ -1912,32 +1955,28 @@ fn pbkdf2_sha256_vectors() -> List<Stretch> =
   ]
 
 test "PBKDF2-HMAC-SHA-256 of {v.password} and {v.salt}, {v.iterations} rounds to {v.length} bytes" for v: Stretch in pbkdf2_sha256_vectors(
-  ) { assert_eq(hex_of(pbkdf2(sha256_hash(), v.password, v.salt, v.iterations, v.length)), v.key) }
+  ) {
+  assert_eq(
+    try { pbkdf2(sha256_hash(), secret_of_bytes(v.password), v.salt, v.iterations, v.length) },
+    Ok(secret_of_bytes(bytes_of_hex(v.key))),
+  )
+}
 
 test "pbkdf2_sha256 is PBKDF2 over SHA-256 to one digest, and raises for no iterations" {
+  assert_eq(Ok(pbkdf2_sha256(secret_of_bytes(b"password"), b"salt", 2)), try {
+    pbkdf2(sha256_hash(), secret_of_bytes(b"password"), b"salt", 2, 32)
+  });
   assert_eq(
-    pbkdf2_sha256(b"password", b"salt", 2),
-    pbkdf2(sha256_hash(), b"password", b"salt", 2, 32),
-  );
-  assert_eq(
-    try[abort.raise] { pbkdf2_sha256(b"password", b"salt", 0) },
+    try[abort.raise] { pbkdf2_sha256(secret_of_bytes(b"password"), b"salt", 0) },
     Err("PBKDF2 takes an iteration count of one or more"),
   )
 }
 
-test "a shorter PBKDF2 key is the start of a longer one" {
-  let long = pbkdf2(sha256_hash(), b"password", b"salt", 3, 65);
-  assert(
-    all([1, 32, 33, 64], |n: Int|
-      pbkdf2(sha256_hash(), b"password", b"salt", 3, n) == bytes_slice(long, 0, n)),
+test "PBKDF2's first round is one HMAC under the password" {
+  assert_eq(
+    try { pbkdf2(sha256_hash(), secret_of_bytes(b"password"), b"salt", 1, 32) },
+    Ok(secret_of_bytes(hmac_plain(sha256_hash(), b"password", b"salt\x00\x00\x00\x01"))),
   )
-}
-
-// A block too many gives the same key at twice the work, which only the steps show.
-test "PBKDF2 runs its rounds once for each digest of output" {
-  let steps = |rounds: Int, length: Int|
-    metered(|| pbkdf2(sha256_hash(), b"password", b"salt", rounds, length)).steps;
-  assert_eq(steps(21, 64) - steps(1, 64), 2 * (steps(21, 32) - steps(1, 32)))
 }
 
 test "zero bytes come in any number" {
@@ -1950,15 +1989,36 @@ fn refusal<a>(r: Result<a, Refusal>) -> Option<Refusal> =
 
 test "a length, a key or a count outside what a function defines is refused, with what was asked" {
   let h = sha256_hash();
-  let prk = repeat(b"\x0b", 32);
-  assert_eq(bytes_len(hkdf_expand(h, prk, b"", 255 * 32)), 255 * 32);
-  assert_eq(hkdf_expand(h, prk, b"", 0), b"");
+  let prk = secret_of_bytes(repeat(b"\x0b", 32));
+  assert_eq(try { secret_len(hkdf_expand(h, prk, b"", 255 * 32)) }, Ok(255 * 32));
+  assert_eq(try { hkdf_expand(h, prk, b"", 0) }, Ok(secret_of_bytes(b"")));
   assert_eq(try { hkdf_expand(h, prk, b"", 255 * 32 + 1) }, Err(OutputLength(255 * 32 + 1)));
   assert_eq(try { hkdf_expand(h, prk, b"", 0 - 1) }, Err(OutputLength(0 - 1)));
-  assert_eq(try { hkdf_expand(h, b"too short", b"", 32) }, Err(KeyLength(9)));
-  assert_eq(try { hkdf(h, b"", b"key", b"", 255 * 32 + 1) }, Err(OutputLength(255 * 32 + 1)));
-  assert_eq(try { pbkdf2(h, b"password", b"salt", 0, 32) }, Err(Iterations(0)));
-  assert_eq(try { pbkdf2(h, b"password", b"salt", 1, 0) }, Err(OutputLength(0)));
+  assert_eq(try { hkdf_expand(h, secret_of_bytes(b"too short"), b"", 32) }, Err(KeyLength(9)));
+  assert_eq(
+    try { hkdf(h, b"", secret_of_bytes(b"key"), b"", 255 * 32 + 1) },
+    Err(OutputLength(255 * 32 + 1)),
+  );
+  assert_eq(try { pbkdf2(h, secret_of_bytes(b"password"), b"salt", 0, 32) }, Err(Iterations(0)));
+  assert_eq(
+    try { pbkdf2(h, secret_of_bytes(b"password"), b"salt", 0x1_0000_0000, 32) },
+    Err(Iterations(0x1_0000_0000)),
+  );
+  assert_eq(try { pbkdf2(h, secret_of_bytes(b"password"), b"salt", 1, 0) }, Err(OutputLength(0)));
+  assert_eq(
+    try { pbkdf2(h, secret_of_bytes(b"password"), b"salt", 1, pbkdf2_longest() + 1) },
+    Err(OutputLength(pbkdf2_longest() + 1)),
+  );
+  assert_eq(try { hmac(sha3_256_hash(), secret_of_bytes(b"key"), b"") }, Err(Unkeyed("SHA3-256")));
+  assert_eq(
+    try { hkdf_extract(blake2b_hash(), b"", secret_of_bytes(b"key")) },
+    Err(Unkeyed("BLAKE2b")),
+  );
+  assert_eq(try { hkdf_expand(sha512_256_hash(), prk, b"", 16) }, Err(Unkeyed("SHA-512/256")));
+  assert_eq(
+    try { pbkdf2(sha3_512_hash(), secret_of_bytes(b"password"), b"salt", 1, 16) },
+    Err(Unkeyed("SHA3-512")),
+  );
   assert_eq(try { shake128(b"", 0 - 1) }, Err(OutputLength(0 - 1)));
   assert_eq(try { shake256(b"", 0 - 1) }, Err(OutputLength(0 - 1)));
   assert_eq(refusal(try { blake2b_with(b"", 0) }), Some(OutputLength(0)));
