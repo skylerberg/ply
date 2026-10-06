@@ -1,7 +1,8 @@
 //! JSON: the value, a parser, a serializer, and the codecs `derive json for T` builds on.
 //!
 //! Numbers are `Decimal`, so a document's numbers read back exactly, and objects are maps, so key order
-//! is canonical. A `JsonCodec<a>` pairs an encoder with a decoder; the codecs here are the ones a
+//! is canonical; a member named twice keeps its last value under `parse` and is refused by
+//! `parse_unique`. A `JsonCodec<a>` pairs an encoder with a decoder; the codecs here are the ones a
 //! derived codec is made of, and `decode_bytes`, `decode_string`, `encode_bytes` and `encode_string`
 //! run one end to end.
 //!
@@ -99,15 +100,29 @@ type Text = { text: String, next: Int }
 
 type Piece = { bytes: Bytes, next: Int }
 
+/// What a parse holds a document to past the grammar: how deep it may nest, and whether an object
+/// may name a member twice.
+type Rules = { limit: Int, unique: Bool }
+
 /// One JSON document: valid UTF-8, nested at most `max_depth` deep, with nothing but whitespace after
 /// its value. A byte order mark is no part of one, and is refused by name.
 pub fn parse(src: Bytes) -> Result<Json, DecodeError> / {abort.raise} =
-  parse_within(src, max_depth())
+  parse_within(src, max_depth(), false)
+
+/// `parse`, refusing an object that names a member twice, at the second writing of the name.
+///
+/// JSON leaves what a repeated name means to its reader, and `parse` keeps the last value as most
+/// readers do. Two readers that keep different ones have read two documents, so a reader that
+/// decides by a document another reader also judges, as the verifier of a signed token does,
+/// refuses it. Names are compared as the strings they spell, whatever escapes write them.
+pub fn parse_unique(src: Bytes) -> Result<Json, DecodeError> / {abort.raise} =
+  parse_within(src, max_depth(), true)
 
 /// `parse`, of a document nested at most `limit` deep; a `limit` past `max_depth` is `max_depth`.
-fn parse_within(src: Bytes, limit: Int) -> Result<Json, DecodeError> / {abort.raise} =
+fn parse_within(src: Bytes, limit: Int, unique: Bool) -> Result<Json, DecodeError> / {abort.raise} =
   if !bytes_is_utf8(src) { Err(error_at(0, "a JSON document must be valid UTF-8")) } else {
-    let step = value(src, skip_ws(src, 0), 0, min(limit, max_depth()))?;
+    let rules = { limit: min(limit, max_depth()), unique: unique };
+    let step = value(src, skip_ws(src, 0), 0, rules)?;
     parse_end(src, step)
   }
 
@@ -129,12 +144,17 @@ fn digits() -> Bytes = b"0123456789"
 fn skip_ws(src: Bytes, i: Int) -> Int / {abort.raise} = scan(src, i, ws())
 
 /// Tests are ordered by how often a payload holds them: strings and numbers first.
-fn value(src: Bytes, i: Int, depth: Int, limit: Int) -> Result<Step, DecodeError> / {abort.raise} = {
+fn value(
+  src: Bytes,
+  i: Int,
+  depth: Int,
+  rules: Rules,
+) -> Result<Step, DecodeError> / {abort.raise} = {
   let c = peek(src, i);
   if c == 34 { string_value(src, i) }
   else if c == 45 || (c >= 48 && c <= 57) { number(src, i) }
-  else if c == 123 { object_value(src, i, depth, limit) }
-  else if c == 91 { array_value(src, i, depth, limit) }
+  else if c == 123 { object_value(src, i, depth, rules) }
+  else if c == 91 { array_value(src, i, depth, rules) }
   else if c == 116 { keyword(src, i, b"true", Bool(true)) }
   else if c == 102 { keyword(src, i, b"false", Bool(false)) }
   else if c == 110 { keyword(src, i, b"null", Null) }
@@ -161,10 +181,10 @@ fn array_value(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
 ) -> Result<Step, DecodeError> / {abort.raise} =
-  if depth >= limit { Err(too_deep_at(i, limit)) }
-  else { array_start(src, skip_ws(src, i + 1), depth + 1, limit) }
+  if depth >= rules.limit { Err(too_deep_at(i, rules.limit)) }
+  else { array_start(src, skip_ws(src, i + 1), depth + 1, rules) }
 
 fn too_deep_at(i: Int, limit: Int) -> DecodeError =
   error_at(
@@ -178,28 +198,28 @@ fn array_start(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
 ) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 93 { Ok({ value: Array([]), next: i + 1 }) }
-  else { array_items(src, i, depth, limit, [], bytes_len(src) - i) }
+  else { array_items(src, i, depth, rules, [], bytes_len(src) - i) }
 
 reuse fn array_items(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   acc: List<Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
-  let step = value(src, i, depth, limit)?;
-  array_more(src, step, depth, limit, push(acc, step.value), left)
+  let step = value(src, i, depth, rules)?;
+  array_more(src, step, depth, rules, push(acc, step.value), left)
 }
 
 fn array_more(
   src: Bytes,
   step: Step,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   items: List<Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
@@ -207,7 +227,7 @@ fn array_more(
   let c = peek(src, j);
   if c == 44 {
     if left <= 0 { panic("more items than bytes") }
-    else { array_items(src, skip_ws(src, j + 1), depth, limit, items, left - 1) }
+    else { array_items(src, skip_ws(src, j + 1), depth, rules, items, left - 1) }
   } else if c == 93 { Ok({ value: Array(items), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `]` in an array")) }
 }
@@ -218,66 +238,68 @@ fn object_value(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
 ) -> Result<Step, DecodeError> / {abort.raise} =
-  if depth >= limit { Err(too_deep_at(i, limit)) }
-  else { object_start(src, skip_ws(src, i + 1), depth + 1, limit) }
+  if depth >= rules.limit { Err(too_deep_at(i, rules.limit)) }
+  else { object_start(src, skip_ws(src, i + 1), depth + 1, rules) }
 
 /// `left` as in `array_start`.
 fn object_start(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
 ) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) == 125 { Ok({ value: Object(map_new()), next: i + 1 }) }
-  else { object_members(src, i, depth, limit, map_new(), bytes_len(src) - i) }
+  else { object_members(src, i, depth, rules, map_new(), bytes_len(src) - i) }
 
 fn object_members(
   src: Bytes,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} =
   if peek(src, i) != 34 { Err(error_at(i, "an object key must be a quoted string")) } else {
     let key = string_body(src, i + 1)?;
-    object_colon(src, key, depth, limit, acc, left)
+    if rules.unique && map_contains(acc, key.text) {
+      Err(error_at(i, "this object already has a member named `" ++ key.text ++ "`"))
+    } else { object_colon(src, key, depth, rules, acc, left) }
   }
 
 fn object_colon(
   src: Bytes,
   key: Text,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
   let j = skip_ws(src, key.next);
   if peek(src, j) != 58 { Err(error_at(j, "expected `:` after an object key")) }
-  else { object_member(src, key.text, skip_ws(src, j + 1), depth, limit, acc, left) }
+  else { object_member(src, key.text, skip_ws(src, j + 1), depth, rules, acc, left) }
 }
 
-/// A repeated key keeps the last value, as every mainstream JSON parser does.
+/// A repeated key that got this far keeps the last value, as every mainstream JSON parser does.
 fn object_member(
   src: Bytes,
   key: String,
   i: Int,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   acc: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
-  let step = value(src, i, depth, limit)?;
-  object_more(src, step, depth, limit, map_insert(acc, key, step.value), left)
+  let step = value(src, i, depth, rules)?;
+  object_more(src, step, depth, rules, map_insert(acc, key, step.value), left)
 }
 
 fn object_more(
   src: Bytes,
   step: Step,
   depth: Int,
-  limit: Int,
+  rules: Rules,
   members: Map<String, Json>,
   left: Int,
 ) -> Result<Step, DecodeError> / {abort.raise} = {
@@ -285,7 +307,7 @@ fn object_more(
   let c = peek(src, j);
   if c == 44 {
     if left <= 0 { panic("more members than bytes") }
-    else { object_members(src, skip_ws(src, j + 1), depth, limit, members, left - 1) }
+    else { object_members(src, skip_ws(src, j + 1), depth, rules, members, left - 1) }
   } else if c == 125 { Ok({ value: Object(members), next: j + 1 }) }
   else { Err(error_at(j, "expected `,` or `}` in an object")) }
 }
@@ -1136,7 +1158,7 @@ fn carried(r: LineReader, piece: Bytes) -> Result<LineReader, LineError> =
 /// What the reader's line holds, read as a whole line.
 fn line_value(r: LineReader) -> Result<Option<Json>, LineError> / {abort.raise} =
   if skip_ws(r.partial, 0) == bytes_len(r.partial) { Ok(None) } else {
-    match parse_within(r.partial, r.max_depth) {
+    match parse_within(r.partial, r.max_depth, false) {
       Ok(j) -> Ok(Some(j)),
       Err(e) -> Err({ line: r.line, error: e }),
     }
@@ -1226,6 +1248,9 @@ law "parsing what was rendered gives back the value"
   forall (j: Json) {
     parse(to_bytes(j)) == Ok(j)
   }
+
+law "what was rendered names no member twice" =
+  agrees(|j: Json| parse_unique(to_bytes(j)), |j: Json| parse(to_bytes(j)))
 
 law "a string survives being escaped and unescaped"
   forall (s: String) {
@@ -1381,6 +1406,38 @@ test "an object is a map, so key order is the map's and not the document's" {
 test "a repeated key keeps the last value" {
   assert_eq(parsed(b"{\"a\":1,\"a\":2}"), Object(map_insert(map_new(), "a", int(2))));
   assert_eq(map_len(match parsed(b"{\"a\":1,\"a\":2}") { Object(m) -> m, _ -> map_new() }), 1)
+}
+
+type Repeated = { name: String, text: Bytes, at: Int, member: String }
+
+fn repeated() -> List<Repeated> =
+  [
+    { name: "at the top", text: b"{\"a\":1,\"a\":2}", at: 7, member: "a" },
+    { name: "with equal values", text: b"{\"a\":1,\"b\":2,\"a\":1}", at: 13, member: "a" },
+    { name: "inside an object", text: b"{\"x\":{\"k\":1, \"k\":2}}", at: 13, member: "k" },
+    { name: "inside an array", text: b"[1,{\"k\":null,\"k\":null}]", at: 13, member: "k" },
+    { name: "written with an escape", text: b"{\"alg\":1,\"\\u0061lg\":2}", at: 9, member: "alg" },
+    { name: "by the empty name", text: b"{\"\":1,\"\":2}", at: 6, member: "" },
+  ]
+
+test "a member named twice {c.name} is refused at its second name" for c: Repeated in repeated() {
+  assert_eq(
+    parse_unique(c.text),
+    Err(error_at(c.at, "this object already has a member named `" ++ c.member ++ "`")),
+  );
+  assert(match parse(c.text) { Ok(_) -> true, Err(_) -> false })
+}
+
+test "a name is an object's own, so two objects may share one" {
+  let text = b"{\"a\":{\"a\":1},\"b\":[{\"a\":2},{\"a\":3}]}";
+  assert_eq(parse_unique(text), parse(text));
+  assert_eq(parse_unique(b"{\"a\":1,\"A\":2}"), parse(b"{\"a\":1,\"A\":2}"));
+  // Everything else `parse` refuses is refused as it refuses it.
+  assert_eq(parse_unique(b"{\"a\":1,}"), parse(b"{\"a\":1,}"));
+  assert_eq(
+    parse_unique(nest(b"[", b"]", max_depth() + 1)),
+    parse(nest(b"[", b"]", max_depth() + 1)),
+  )
 }
 
 // --- Tests: strings and escapes ---------------------------------------------
