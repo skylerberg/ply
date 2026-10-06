@@ -300,6 +300,9 @@ pub struct HandlerFrame {
     /// `handle` closes that stack's back to here, since the body it abandons never reaches the
     /// closes below its jump.
     regions: usize,
+    /// The calls its stack had left when this frame went on, which its `handle` lands with: a
+    /// frame a failure returns through gives its call back nowhere else.
+    fuel: i64,
 }
 
 impl HandlerFrame {
@@ -309,25 +312,40 @@ impl HandlerFrame {
         self.clauses.swap_remove(at).closure
     }
 
-    fn simulate(regions: usize) -> HandlerFrame {
+    fn simulate(regions: usize, fuel: i64) -> HandlerFrame {
         HandlerFrame {
             clauses: Vec::new(),
             ret: 0,
             simulate: true,
             detached: None,
             regions,
+            fuel,
         }
     }
 
-    /// The bottom of a detached body's own stack, which holds no region yet.
-    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize) -> HandlerFrame {
+    /// The bottom of a detached body's own stack, which holds no region yet and starts with the
+    /// calls its opener had left.
+    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize, fuel: i64) -> HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
             simulate: false,
             detached: Some(id),
             regions: 0,
+            fuel,
         }
+    }
+
+    /// Puts its stack's count of calls left back where it stood when the frame went on: every
+    /// frame above the `handle` is gone by the time it lands.
+    pub(crate) fn land(&self, c: &mut Ctx) {
+        debug_assert!(
+            c.failed != 0 || c.fuel == self.fuel,
+            "a `handle` body that returned left {} calls where it found {}",
+            c.fuel,
+            self.fuel
+        );
+        c.fuel = self.fuel;
     }
 }
 
@@ -444,6 +462,7 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
                 simulate: f.simulate,
                 detached: f.detached,
                 regions: f.regions,
+                fuel: f.fuel,
             }
         })
         .collect()
@@ -524,7 +543,10 @@ static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
-    /// Nested native calls still allowed.
+    /// Nested native calls the running stack is still allowed. A call spends one and its return
+    /// gives it back; a frame a failure returns through gives nothing back, so whatever runs on
+    /// past a failure first puts this where it stood ([`HandlerFrame::land`]). It is the running
+    /// stack's own: a switch saves it with the stack it leaves and puts back the other's.
     pub fuel: i64,
     /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
     pub stack_floor: usize,
@@ -1460,6 +1482,17 @@ pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     c.stack_floor = floor;
     unsafe { (*handover).answer }
+}
+
+/// [`switch`] between two computations, each nesting on a stack of its own: returns when something
+/// switches back, with [`Ctx::fuel`] as this stack left it, whatever ran meanwhile.
+///
+/// # Safety
+/// As [`switch`], and `ctx` is the context both stacks run under.
+pub(crate) unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
+    let fuel = unsafe { (*ctx).fuel };
+    unsafe { switch(&mut *from, to) };
+    unsafe { (*ctx).fuel = fuel };
 }
 
 /// The callback the counter reaching [`Ctx::next_tick`] makes: the entry gets more work, or it
@@ -3128,6 +3161,7 @@ pub unsafe extern "C" fn rt_handle_push(
     let c = unsafe { &mut *ctx };
     let clauses = clauses_of(c, clauses, n);
     let regions = c.region_depth();
+    let fuel = c.fuel;
     let frames = c.frames();
     frames.push(HandlerFrame {
         clauses,
@@ -3135,6 +3169,7 @@ pub unsafe extern "C" fn rt_handle_push(
         simulate: false,
         detached: None,
         regions,
+        fuel,
     });
     (frames.len() - 1) as i64
 }
@@ -3419,7 +3454,8 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let stack = c.current;
     let depth = c.frames().len();
     let regions = c.region_depth();
-    c.frames().push(HandlerFrame::simulate(regions));
+    let fuel = c.fuel;
+    c.frames().push(HandlerFrame::simulate(regions, fuel));
     let sim = crate::simulate::Simulation::new(
         ply_eval::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
         site,
@@ -3454,6 +3490,9 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     };
     for f in popped {
         drop_frame(f);
+    }
+    if let Some(f) = &mine {
+        f.land(c);
     }
     if c.failed == FAILED_ABORT
         && let Some(a) = c.aborting.take_if(|a| a.stack == stack && a.depth == depth)
@@ -4035,9 +4074,12 @@ fn rt_bracket(ctx: *mut Ctx, acquire: Word, release: Word, body: Word) -> Word {
         return 0;
     }
     heap::inc(held);
+    let standing = c.fuel;
     let answer = call_value(ctx, body, &[held]);
     heap::dec(body);
     let c = unsafe { &mut *ctx };
+    // `release` runs as deep as the bracket stands, however deep the body was when it ended.
+    c.fuel = standing;
     let ending = c.failed;
     if ending != 0
         && ending != FAILED_UNWIND
