@@ -1,11 +1,20 @@
 //! The runtime's builtins and the compiler's prelude that types them: the same names, each call
-//! passing as many words as the checker binds it to, its witnesses first.
+//! passing as many words as the checker binds it to, its witnesses first, and none raising where
+//! its `requires` says it cannot or answering what its `ensures` rules out.
 
 import compiler.emit (builtin_helper)
+import compiler.exprs (Param, expr_span)
 import compiler.front (BuiltinRow, builtin_rows)
+import compiler.items (DNumeric, DOrd, ExternDef, IExtern, Item, SEnsures, SRequires, SpecClause,
+                       SpecKind, parse)
+import compiler.type_syntax (TypeExpr, TCon, TFn, TVar)
 import compiler.types (Atom, TyFn)
 import compiler.unit (Helper, shipped)
+import harness (in_memory, one, prelude_file, said, json_of, at, path, items, str, int)
 import std.bytes
+import std.json (Json)
+import std.list (any, concat, flat_map, reverse)
+import std.string
 
 fn named(name: Bytes) -> String / {abort.raise} = "`" ++ string_of_bytes(name) ++ "`"
 
@@ -100,4 +109,292 @@ test "every builtin has the helper the emitter calls it through, taking the word
           ),
         ),
     })
+}
+
+// --- What a `requires` and an `ensures` promise -------------------------------------------
+
+/// The types a builtin's type parameter is filled with, one test each: every numeric type the
+/// language has under `numeric`, and `Int` under an order, which is where a clause is read, or
+/// under no constraint.
+fn fillings(d: ExternDef) -> List<String> / {abort.raise} =
+  match d.constraints {
+    [] -> ["Int"],
+    [c] -> match c.deriver {
+      DNumeric ->
+        ["Int", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "U128", "Float", "Decimal"],
+      DOrd -> ["Int"],
+      _ ->
+        panic(named(d.name.name) ++ " states a clause under a constraint this test does not fill"),
+    },
+    _ -> panic(named(d.name.name) ++ " states a clause under more than one constraint"),
+  }
+
+/// A type as a program writes it, each type parameter of its builtin read as `fill`.
+fn written(t: TypeExpr, fill: String) -> String / {abort.raise} =
+  match t {
+    TVar(_) -> fill,
+    TCon(c) ->
+      string_of_bytes(c.name.name.name)
+        ++ (if len(c.args) == 0 { "" }
+        else { "<" ++ string::join(map(c.args, |a: TypeExpr| written(a, fill)), ", ") ++ ">" }),
+    TFn(f) ->
+      "(" ++ string::join(map(f.params, |p: TypeExpr| written(p, fill)), ", ") ++ ") -> "
+        ++ written(f.ret, fill),
+    _ -> panic("a builtin that states a clause takes a type this test does not write"),
+  }
+
+/// The list in `drawing` a parameter of the type takes each value of.
+fn drawn(ty: String) -> String / {abort.raise} = {
+  let lists = [
+    { ty: "Int", from: "ints()" },
+    { ty: "U8", from: "u8s()" },
+    { ty: "U16", from: "u16s()" },
+    { ty: "U32", from: "u32s()" },
+    { ty: "U64", from: "u64s()" },
+    { ty: "U128", from: "u128s()" },
+    { ty: "I8", from: "i8s()" },
+    { ty: "I16", from: "i16s()" },
+    { ty: "I32", from: "i32s()" },
+    { ty: "Char", from: "chars()" },
+    { ty: "Bytes", from: "buffers()" },
+    { ty: "String", from: "texts()" },
+    { ty: "List<Int>", from: "lists()" },
+    { ty: "Array<Int>", from: "arrays()" },
+    { ty: "Map<Int, Int>", from: "maps()" },
+    { ty: "Decimal", from: "decimals()" },
+    { ty: "Rounding", from: "modes()" },
+    { ty: "(Int) -> Bool", from: "predicates()" },
+  ];
+  match filter(lists, |l: { ty: String, from: String }| l.ty == ty) {
+    [l, ..] -> l.from,
+    [] -> panic("`drawing` lists no values of type `" ++ ty ++ "` for a builtin's parameter"),
+  }
+}
+
+/// What the tests written here draw from: for an integer the ends of every width and what lies
+/// either side of each, with every index into the rest; each narrower width's values among those,
+/// and its own ends; a buffer, a text, a list, an array and a map with nothing, one thing and
+/// several; for a decimal the greatest mantissa, a one and a zero at every scale, of either sign;
+/// and one value for a parameter of an unconstrained type parameter's own type, which no builtin
+/// can read.
+fn drawing() -> String =
+  \\import std.show (show)
+  \\
+  \\fn least() -> Int = 0 - 9223372036854775807 - 1
+  \\
+  \\fn ints() -> List<Int> =
+  \\  [
+  \\    least(), least() + 1, -4294967297, -4294967296, -2147483649, -2147483648, -32769, -32768,
+  \\    -129, -128, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 27, 28, 29, 127, 128, 255, 256, 32767, 32768,
+  \\    65535, 65536, 2147483647, 2147483648, 4294967295, 4294967296, 9223372036854775806,
+  \\    9223372036854775807,
+  \\  ]
+  \\
+  \\fn narrowed<a>(to: (Int) -> a / {abort.raise}) -> List<a> =
+  \\  fold(ints(), [], |acc: List<a>, n: Int|
+  \\    match try[abort.raise] { to(n) } { Ok(x) -> push(acc, x), Err(_) -> acc })
+  \\
+  \\fn u8s() -> List<U8> = narrowed(|n: Int| u8_of_int(n))
+  \\
+  \\fn u16s() -> List<U16> = narrowed(|n: Int| u16_of_int(n))
+  \\
+  \\fn u32s() -> List<U32> = narrowed(|n: Int| u32_of_int(n))
+  \\
+  \\fn u64s() -> List<U64> = push(narrowed(|n: Int| u64_of_int(n)), 0xFFFF_FFFF_FFFF_FFFFu64)
+  \\
+  \\fn u128s() -> List<U128> =
+  \\  push(narrowed(|n: Int| u128_of_int(n)), 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFu128)
+  \\
+  \\fn i8s() -> List<I8> = narrowed(|n: Int| i8_of_int(n))
+  \\
+  \\fn i16s() -> List<I16> = narrowed(|n: Int| i16_of_int(n))
+  \\
+  \\fn i32s() -> List<I32> = narrowed(|n: Int| i32_of_int(n))
+  \\
+  \\fn chars() -> List<Char> = ['\0', '\u{7f}', '\u{80}', '\u{d7ff}', '\u{e000}', '\u{10ffff}']
+  \\
+  \\fn buffers() -> List<Bytes> = [b"", b"a", b"ab c", b"\x00\xff abcde"]
+  \\
+  \\fn texts() -> List<String> = ["", "a", "a b", "\u{e9}", "a \u{e9} b c"]
+  \\
+  \\fn lists() -> List<List<Int>> = [[], [7], [7, 8, 9]]
+  \\
+  \\fn values() -> List<Int> = [7]
+  \\
+  \\fn arrays() -> List<Array<Int>> = map(lists(), |xs: List<Int>| array_of_list(xs))
+  \\
+  \\fn maps() -> List<Map<Int, Int>> =
+  \\  map(lists(), |xs: List<Int>| fold(xs, map_new(), |m: Map<Int, Int>, x: Int| map_insert(m, x, x)))
+  \\
+  \\fn modes() -> List<Rounding> = [HalfEven, HalfUp, Down, Up, Ceiling, Floor]
+  \\
+  \\fn predicates() -> List<(Int) -> Bool> = [|c: Int| c == 32, |c: Int| false]
+  \\
+  \\fn pointed(digits: String, s: Int) -> String / {abort.raise} = {
+  \\  let padded = fold(range(string_len(digits), s + 1), digits, |t: String, i: Int| "0" ++ t);
+  \\  let whole = string_len(padded) - s;
+  \\  if s == 0 { padded } else {
+  \\    string_slice(padded, 0, whole) ++ "." ++ string_slice(padded, whole, string_len(padded))
+  \\  }
+  \\}
+  \\
+  \\fn decimals() -> List<Decimal> / {abort.raise} =
+  \\  fold(range(0, 29), [], |acc: List<Decimal>, s: Int|
+  \\    fold(
+  \\      [pointed("79228162514264337593543950335", s), pointed("1", s), pointed("0", s)],
+  \\      acc,
+  \\      |ds: List<Decimal>, text: String|
+  \\        match decimal_of_string(text) {
+  \\          Some(d) -> push(push(ds, d), 0m - d),
+  \\          None -> panic("`" ++ text ++ "` is a decimal"),
+  \\        },
+  \\    ))
+  \\
+  \\fn each<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
+  \\  fold(xs, (), |u: Unit, x: a| f(x))
+  \\
+  \\fn calm(what: String, call: () -> Unit / {abort.raise}) -> Unit / {abort.raise} =
+  \\  match try[abort.raise] { call() } {
+  \\    Ok(_) -> (),
+  \\    Err(why) -> panic(what ++ " raised where its `requires` holds: " ++ why),
+  \\  }
+  \\
+  \\fn sure(what: String, call: () -> Bool / {abort.raise}) -> Unit / {abort.raise} =
+  \\  match try[abort.raise] { call() } {
+  \\    Ok(true) -> (),
+  \\    Ok(false) -> panic(what ++ " answered what its `ensures` rules out"),
+  \\    Err(_) -> (),
+  \\  }
+  \\
+  \\
+
+/// A parameter of a test's call: its type, the list in `drawing` it takes each value of, and
+/// whether a failure can print it.
+type Drawn = { name: String, ty: String, from: String, shown: Bool }
+
+/// The declarations of `prelude` that state a clause of `kind`.
+fn stating(prelude: Bytes, kind: SpecKind) -> List<ExternDef> / {abort.raise} =
+  fold(parse(prelude).node.items, [], |acc: List<ExternDef>, it: Item|
+    match it {
+      IExtern(d) -> if any(d.spec, |c: SpecClause| c.kind == kind) { push(acc, d) } else { acc },
+      _ -> acc,
+    })
+
+/// A builtin's parameters, its type parameter filled with `fill`. One an order is on is drawn at
+/// that type, since the order reads it.
+fn parameters(d: ExternDef, fill: String) -> List<Drawn> / {abort.raise} =
+  map(d.params, |p: Param|
+    match p.ty {
+      Some(t) ->
+        {
+          name: string_of_bytes(p.name.name),
+          ty: written(t, fill),
+          from: match t {
+            TVar(_) -> if len(d.constraints) == 0 { "values()" } else { drawn(fill) },
+            _ -> drawn(written(t, fill)),
+          },
+          shown: match t { TFn(_) -> false, _ -> true },
+        },
+      None -> panic(named(d.name.name) ++ " leaves a parameter's type out"),
+    })
+
+/// A builtin's clauses of `kind` as one condition a test evaluates, in the prelude's own words but
+/// for its arithmetic, which saturates: a clause is over the integers, and an `Int` at its end
+/// would overflow where the clause is only false.
+fn condition(prelude: Bytes, d: ExternDef, kind: SpecKind) -> String / {abort.raise} =
+  string::join(
+    map(filter(d.spec, |c: SpecClause| c.kind == kind), |c: SpecClause| {
+      let span = expr_span(c.expr);
+      let text = string_of_bytes(bytes_slice(prelude, span.start, span.end));
+      "(" ++ string::replace(string::replace(text, " + ", " +| "), " - ", " -| ") ++ ")"
+    }),
+    " && ",
+  )
+
+/// A test named for `d` and `what` it checks, whose body is `inner` once for every draw of the
+/// parameters. `inner` is handed the call as a failure prints it and as the program makes it.
+fn over_draws(
+  d: ExternDef,
+  fill: String,
+  what: String,
+  inner: (String, String) -> String,
+) -> String / {abort.raise} = {
+  let name = string_of_bytes(d.name.name);
+  let params = parameters(d, fill);
+  let printed = "\"" ++ name ++ "(\" ++ "
+    ++ string::join(
+      map(params, |p: Drawn| if p.shown { "show(" ++ p.name ++ ")" } else { "\"_\"" }),
+      " ++ \", \" ++ ",
+    )
+    ++ " ++ \")\"";
+  let call = name ++ "(" ++ string::join(map(params, |p: Drawn| p.name), ", ") ++ ")";
+  let body = fold(reverse(params), inner(printed, call), |nested: String, p: Drawn|
+    "each(" ++ p.from ++ ", |" ++ p.name ++ ": " ++ p.ty ++ "| " ++ nested ++ ")");
+  let at = if len(d.constraints) == 0 { "" } else { " at " ++ fill };
+  "test \"" ++ name ++ at ++ " " ++ what ++ "\" {\n  " ++ body ++ "\n}\n"
+}
+
+/// A test that calls `d` on every draw its `requires` holds of, and fails where a call raises.
+fn held(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.raise} = {
+  let holds = condition(prelude, d, SRequires);
+  let answer = written(d.ret, fill);
+  over_draws(
+    d,
+    fill,
+    "does not raise where its `requires` holds",
+    |printed: String, call: String|
+      "if " ++ holds ++ " {\n    calm(" ++ printed ++ ", || {\n      let answer: " ++ answer
+        ++ " = "
+        ++ call
+        ++ ";\n      ()\n    })\n  }",
+  )
+}
+
+/// A test that calls `d` on every draw, and fails where an answer is one its `ensures` rules out.
+fn answering(prelude: Bytes, d: ExternDef, fill: String) -> String / {abort.raise} = {
+  let ensured = condition(prelude, d, SEnsures);
+  let answer = written(d.ret, fill);
+  over_draws(d, fill, "answers what its `ensures` says", |printed: String, call: String|
+    "sure(" ++ printed ++ ", || {\n    let result: " ++ answer ++ " = " ++ call ++ ";\n    "
+      ++ ensured
+      ++ "\n  })")
+}
+
+/// A test of the one end no draw reaches, since a call at it builds a gigabyte: `array_new`'s
+/// `requires` holds up to the length the runtime's refusal names, and no further.
+fn array_limit(prelude: Bytes) -> String / {abort.raise} =
+  match filter(stating(prelude, SRequires), |d: ExternDef| d.name.name == b"array_new") {
+    [d, ..] -> match parameters(d, "Int") {
+      [length, ..] ->
+        "test \"array_new's `requires` ends where the runtime refuses\" {\n  let holds = |"
+          ++ length.name
+          ++ ": Int| "
+          ++ condition(prelude, d, SRequires)
+          ++ ";\n  assert(holds(67108864) && !holds(67108865));\n  assert_eq(\n"
+          ++ "    try[abort.raise] { array_len(array_new(67108865, 7)) },\n"
+          ++ "    Err(\"`array_new` of 67108865 elements is outside `0` to `67108864`\"),\n  )\n}\n",
+      [] -> panic("`array_new` takes a length"),
+    },
+    [] -> panic("the prelude states a `requires` of `array_new`"),
+  }
+
+// A row left without `abort.raise` rests on these clauses, so a builtin one is false of makes it a lie.
+test "no builtin raises where its `requires` holds or answers what its `ensures` rules out, at the ends of what its parameters take" {
+  let prelude = prelude_file();
+  let tests = push(
+    concat(
+      flat_map(stating(prelude, SRequires), |d: ExternDef|
+        map(fillings(d), |fill: String| held(prelude, d, fill))),
+      flat_map(stating(prelude, SEnsures), |d: ExternDef|
+        map(fillings(d), |fill: String| answering(prelude, d, fill))),
+    ),
+    array_limit(prelude),
+  );
+  let r = in_memory(one(drawing() ++ string::join(tests, "\n")), ["test", "--json"]);
+  let v = json_of(r);
+  let broken = map(items(at(v, "failures")), |f: Json|
+    str(at(f, "name")) ++ ": " ++ str(path(f, ["diagnostic", "message"])));
+  assert(broken == [], Some(string::join(broken, "\n")));
+  assert(r.code == 0, Some(said(r)));
+  assert_eq(int(path(v, ["summary", "passed"])), len(tests))
 }
