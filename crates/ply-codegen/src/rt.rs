@@ -2964,6 +2964,39 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             }
             Some(r as Word)
         }
+        // At `Int`, which is all a call from compiled code holds as a native integer: a narrower
+        // width is computed in place, and a 64-bit or wider one is no integer word.
+        (Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul, [x, y]) => {
+            let (a, b) = (heap::as_int(*x)?, heap::as_int(*y)?);
+            let n = match which {
+                Builtin::WrapAdd => a.wrapping_add(b),
+                Builtin::WrapSub => a.wrapping_sub(b),
+                _ => a.wrapping_mul(b),
+            };
+            heap::dec(*x);
+            heap::dec(*y);
+            Some(ctx.heap.boxed_int(n))
+        }
+        (Builtin::Rotr | Builtin::Rotl, [x, n]) => {
+            let (a, turn) = (heap::as_int(*x)?, heap::as_int(*n)?);
+            let k = turn.rem_euclid(64) as u32;
+            let right = if which == Builtin::Rotl {
+                (64 - k) % 64
+            } else {
+                k
+            };
+            heap::dec(*x);
+            heap::dec(*n);
+            Some(ctx.heap.boxed_int((a as u64).rotate_right(right) as i64))
+        }
+        (Builtin::Rotr32, [x, n]) => {
+            let (a, turn) = (heap::as_int(*x)?, heap::as_int(*n)?);
+            heap::dec(*x);
+            heap::dec(*n);
+            Some(heap::imm(i64::from(
+                (a as u32).rotate_right((turn & 31) as u32),
+            )))
+        }
         _ => None,
     }
 }
