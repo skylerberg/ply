@@ -73,6 +73,7 @@ pub mod config;
 pub mod dns;
 pub mod fs;
 pub mod observe;
+pub mod password;
 pub mod pool;
 pub mod process;
 pub mod random;

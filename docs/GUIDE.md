@@ -1027,9 +1027,10 @@ secret: each is one-way in the key.
 
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
-allows it (`E0439`). No operation `ply` ships takes one, so a secret has no way
-out of a program: key material that is to be written down, as `ply keygen`'s
-is, is written by whoever drew it, before it is sealed.
+allows it (`E0439`). The operations `ply` ships that take one are
+`std.password`'s, which hash a password and answer the hash, one-way in it; so
+a secret has no way out of a program: key material that is to be written down,
+as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -2587,8 +2588,9 @@ Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
 nondeterministic handler is cached with what it read and the binding it ran
 under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, is
-cached like any other. An operation performed inside a `simulate`
+deterministic handlers, whose answers are a function of what they are handed, as
+`std.password`'s hashes are, is cached like any other. An operation performed
+inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal` and `std.process` are bound only
 by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a

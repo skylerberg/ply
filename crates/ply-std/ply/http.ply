@@ -16,7 +16,7 @@ import std.option (option_unwrap_or)
 import std.url
 import std.url (Url, url_fragment, url_host, url_host_port, url_parse, url_path, url_query,
                 url_reason, url_render, url_scheme, url_userinfo)
-import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case)
+import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case, is_ascii)
 
 // --- The message ------------------------------------------------------------
 
@@ -445,6 +445,8 @@ fn absolute_start(
   } else if url_userinfo(u) != None {
     // Refused so the authority a program compares against `Host` cannot be disguised.
     Err({ status: 400, reason: "a request target's authority carries no userinfo" })
+  } else if !on_the_wire(u) {
+    Err({ status: 400, reason: "a request target's host is ASCII, a name as its A-labels" })
   } else {
     // The path of a URL with an authority is empty or begins with `/`, which `std.router` relies on.
     Ok(
@@ -457,6 +459,14 @@ fn absolute_start(
         version,
       ),
     )
+  }
+
+/// Whether the URL's host is written as a request carries one, in ASCII with no escape: `std.url`
+/// reads a name in its own script too, which no program's comparison with `Host` would match.
+fn on_the_wire(u: Url) -> Bool =
+  match url_host_port(u) {
+    Some(written) -> is_ascii(written) && !string_contains(written, "%"),
+    None -> true,
   }
 
 fn min_int(a: Int, b: Int) -> Int = if a < b { a } else { b }
@@ -2117,6 +2127,10 @@ test "an absolute-form target's authority is the request's, and Host stays visib
   assert_eq(
     parsed(b"GET http://[2001:DB8::1]:8080/x HTTP/1.1\r\nHost: a\r\n\r\n").request.authority,
     "[2001:DB8::1]:8080",
+  );
+  assert_eq(
+    parsed(b"GET http://xn--bcher-kva.example/x HTTP/1.1\r\nHost: a\r\n\r\n").request.authority,
+    "xn--bcher-kva.example",
   )
 }
 
@@ -2155,7 +2169,19 @@ fn refused_targets() -> List<Target> =
     },
     {
       target: "http://ex%61mple/",
-      reason: "an absolute-form target is not a URL: a host holds no percent-encoding",
+      reason: "an absolute-form target is not a URL: an escape in a host spells a character outside ASCII and nothing else",
+    },
+    {
+      target: "http://b\u{FC}cher.example/",
+      reason: "a request target's host is ASCII, a name as its A-labels",
+    },
+    {
+      target: "http://b%C3%BCcher.example/",
+      reason: "a request target's host is ASCII, a name as its A-labels",
+    },
+    {
+      target: "http://\u{FF11}\u{FF12}\u{FF17}.0.0.1/",
+      reason: "an absolute-form target is not a URL: a host that ends in a number is four decimal octets",
     },
     {
       target: "http://a.example/x[1]",
@@ -2175,7 +2201,7 @@ fn refused_targets() -> List<Target> =
     },
     {
       target: "http://a.example/\u{E9}",
-      reason: "an absolute-form target is not a URL: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+      reason: "an absolute-form target is not a URL: outside a host's name a URL is ASCII: write this percent-encoded",
     },
     {
       target: "http://a@b@c/",
@@ -2211,7 +2237,8 @@ law "an absolute-form target is read as `std.url` reads its URL, and refused whe
   forall (u: Url) {
     let served = (url_scheme(u) == "http" || url_scheme(u) == "https") && url_host(u) != None
       && url_userinfo(u) == None
-      && url_fragment(u) == None;
+      && url_fragment(u) == None
+      && on_the_wire(u);
     match parse_head(
         bytes_of_string("GET " ++ url_render(u) ++ " HTTP/1.1\r\nHost: h\r\n\r\n"),
         default_limits(),
