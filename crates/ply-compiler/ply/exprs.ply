@@ -43,6 +43,9 @@ pub type Expr =
   | EPerform({ span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr> })
   | EHandle({ span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause> })
   | EWithCell({ span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr })
+  /// `with_hold[r](acquire, release) { h -> body }`: `body` with `h` a hold on what `acquire`
+  /// answered, and `release` run on it however `body` ends.
+  | EWithHold({ span: Span, resource: Ident, acquire: Expr, release: Expr, binder: Ident, body: Expr })
   | ESimulate({ span: Span, body: Expr })
   /// `parallel { a, b }`: the branches' answers as a tuple, which means evaluating them left to right.
   | EParallel({ span: Span, branches: List<Expr> })
@@ -131,6 +134,7 @@ pub fn expr_span(expr: Expr) -> Span =
     EPerform(v) -> v.span,
     EHandle(v) -> v.span,
     EWithCell(v) -> v.span,
+    EWithHold(v) -> v.span,
     ESimulate(v) -> v.span,
     EParallel(v) -> v.span,
     ETagged(v) -> v.span,
@@ -206,6 +210,7 @@ fn set_span(expr: Expr, span: Span) -> Expr =
     EHandle(v) -> EHandle({ span: span, body: v.body, ret: v.ret, clauses: v.clauses }),
     EWithCell(v) ->
       EWithCell({ span: span, resource: v.resource, init: v.init, binder: v.binder, body: v.body }),
+    EWithHold(v) -> EWithHold({ ..v, span: span }),
     ESimulate(v) -> ESimulate({ span: span, body: v.body }),
     EParallel(v) -> EParallel({ span: span, branches: v.branches }),
     ETagged(v) -> ETagged({ ..v, span: span }),
@@ -221,6 +226,7 @@ pub fn is_block_like(expr: Expr) -> Bool =
     EMatch(v) -> true,
     EHandle(v) -> true,
     EWithCell(v) -> true,
+    EWithHold(v) -> true,
     ESimulate(v) -> true,
     EParallel(v) -> true,
     ETryBlock(v) -> true,
@@ -714,6 +720,8 @@ fn primary_ident(
 ) -> Result<Parsed<Expr>, Parser> / {abort.raise} =
   if name == b"with_cell" && token_kind_at(input, parser, 1) == token_lbracket() {
     with_cell_expr(input, parser)
+  } else if name == b"with_hold" && token_kind_at(input, parser, 1) == token_lbracket() {
+    with_hold_expr(input, parser)
   } else if name == b"simulate" && !parser.no_brace
       && token_kind_at(input, parser, 1) == token_lbrace() { simulate_expr(input, parser) }
   else if name == b"parallel" && !parser.no_brace
@@ -1906,6 +1914,75 @@ fn with_cell_rest(
   })
 }
 
+fn with_hold_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
+  let st = advance(input, parser);
+  let { parser, node: br } = expect(input, st.parser, token_lbracket(), b"`[` and a region name")?;
+  let { parser, node: resource } = expect_ident(input, parser, b"a region name inside `[..]`")?;
+  let { parser, .. } = expect_close(input, parser, token_rbracket(), br, b"`]`")?;
+  let saved = parser.no_brace;
+  match with_hold_rest(input, with_no_brace(parser, false), st.node, resource) {
+    Err(q) -> Err(with_no_brace(q, saved)),
+    Ok(r) -> Ok({ parser: with_no_brace(r.parser, saved), node: r.node }),
+  }
+}
+
+fn with_hold_rest(
+  input: Input,
+  parser: Parser,
+  span: Span,
+  resource: Ident,
+) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
+  let { parser, node: paren } = expect(
+    input,
+    parser,
+    token_lparen(),
+    b"`(` and what the hold acquires",
+  )?;
+  let { parser, node: acquire } = expr(input, parser)?;
+  let { parser, .. } = expect(
+    input,
+    parser,
+    token_comma(),
+    b"`,` and the function that releases what was acquired",
+  )?;
+  let { parser, node: release } = expr(input, parser)?;
+  let { parser, .. } = eat(input, parser, token_comma());
+  let { parser, .. } = expect_close(
+    input,
+    parser,
+    token_rparen(),
+    paren,
+    b"`)` after the release function",
+  )?;
+  let { parser, node: brace } = expect(
+    input,
+    parser,
+    token_lbrace(),
+    b"`{` to start the hold's region",
+  )?;
+  let { parser, node: binder } = expect_ident(input, parser, b"a name to bind the hold to")?;
+  let { parser, .. } = expect(input, parser, token_arrow(), b"`->` and the region body")?;
+  let { parser, node: body } = expr(input, parser)?;
+  let { parser, node: cl } = expect_close(
+    input,
+    parser,
+    token_rbrace(),
+    brace,
+    b"`}` to close the hold's region",
+  )?;
+  Ok({
+    parser: parser,
+    node: EWithHold({
+      span: span_to(span, cl),
+      resource: resource,
+      acquire: acquire,
+      release: release,
+      binder: binder,
+      body: body,
+    }),
+  })
+}
+
 fn simulate_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: body } = block_expr(input, st.parser)?;
@@ -2065,6 +2142,15 @@ pub fn dump_expr(expr: Expr) -> Bytes / {abort.raise} =
         dump_ident(v.binder),
         dump_expr(v.body),
       ]),
+    EWithHold(v) ->
+      bytes_concat_all([
+        dump_node(v.span, b"ehld"),
+        dump_ident(v.resource),
+        dump_expr(v.acquire),
+        dump_expr(v.release),
+        dump_ident(v.binder),
+        dump_expr(v.body),
+      ]),
     ESimulate(v) -> bytes_concat(dump_node(v.span, b"esim"), dump_expr(v.body)),
     EParallel(v) -> bytes_concat(dump_node(v.span, b"epar"), dump_list(v.branches, dump_expr)),
     ETagged(v) ->
@@ -2204,6 +2290,7 @@ pub fn node_count(expr: Expr) -> Int =
           n + 1 + len(clause.params) + node_count(clause.body))
         + (match v.ret { None -> 0, Some(r) -> 1 + node_count(r.body) }),
     EWithCell(v) -> 1 + node_count(v.init) + node_count(v.body),
+    EWithHold(v) -> 1 + node_count(v.acquire) + node_count(v.release) + node_count(v.body),
     ESimulate(v) -> 1 + node_count(v.body),
     EParallel(v) -> 1 + count_all(v.branches),
     ETagged(v) -> 1 + fold(v.holes, 0, |n: Int, h: Hole| n + node_count(h.value)),
@@ -2680,6 +2767,17 @@ test "`with_cell` and `simulate` are contextual" {
   // Each is an ordinary name wherever the shape does not hold.
   assert_eq(dump_expr_of(b"simulate"), "0:8:evar;0:8:qname;?0;0:8:ident;@73696d756c617465;#0;");
   assert_eq(dump_expr_of(b"with_cell"), "0:9:evar;0:9:qname;?0;0:9:ident;@776974685f63656c6c;#0;");
+}
+
+test "`with_hold` is contextual: a region, what it acquires, what releases that, and a body" {
+  let dump = dump_expr_of(b"with_hold[f](a, r) { h -> h }");
+  assert(string_starts_with(dump, "0:29:ehld;10:11:ident;@66;13:14:evar;"));
+  assert_eq(
+    dump_expr_of(b"with_hold[f](a, r,) { h -> h }"),
+    dump_expr_of(b"with_hold[f](a, r ) { h -> h }"),
+  );
+  assert_eq(dump_expr_of(b"with_hold"), "0:9:evar;0:9:qname;?0;0:9:ident;@776974685f686f6c64;#0;");
+  assert(string_contains(dump_expr_of(b"with_hold[f](a) { h -> h }"), "!E0001:"))
 }
 
 test "in a scrutinee a `{` is the arm block, so `simulate` is a name there" {
