@@ -6,8 +6,12 @@
 //! a clause unwinds out of included. There is no compression, `Upgrade` or `Content-Encoding`.
 
 import std.bytes (int_of_ascii, is_digit)
-import std.net (net, send_all)
-import std.list (contains)
+import std.dns
+import std.ip
+import std.ip (Ip, Prefix, SocketAddress, ip)
+import std.net
+import std.net (Blocks, Hears, Leaves, MemNet, Repeats, Says, Silent, Stalls, Step, net, send_all)
+import std.list (any, contains, drop, reverse)
 import std.option (option_unwrap_or)
 import std.url
 import std.url (Url, url_fragment, url_host, url_host_port, url_parse, url_path, url_query,
@@ -40,6 +44,10 @@ pub type Request = {
   /// The fields a chunked body sent after its last chunk.
   trailers: Headers,
   body: Bytes,
+  /// Where the connection that carried the request comes from, as its socket says: behind a
+  /// proxy that is the proxy, and `client_ip` reads past it. `None` for a request no TCP
+  /// connection carried: one a client built, a test's, or one from a Unix socket.
+  peer: Option<SocketAddress>,
 }
 
 /// A response to encode, or one a client read; `encode` adds the framing fields.
@@ -252,6 +260,7 @@ fn after_request_line(
                   headers: done.headers,
                   trailers: empty_headers(),
                   body: b"",
+                  peer: None,
                 },
                 framing: framing,
                 consumed: done.next,
@@ -594,6 +603,208 @@ fn list_field(headers: Headers, name: String) -> List<String> =
   fold(header_lines(headers, name), [], |acc: List<String>, line: String|
     fold(string_split(line, ","), acc, |inner: List<String>, part: String|
       push(inner, ascii_lower(ascii_trim(part)))))
+
+// --- Who a request came from ------------------------------------------------
+
+/// One hop a `Forwarded` or `X-Forwarded-For` field names: where a proxy saw its request come
+/// from.
+pub type Hop =
+  /// An address, and its port where the field gave one.
+  | From(Ip, Option<Int>)
+  /// An identifier a proxy wrote in place of an address, such as `_hidden`.
+  | Obscured(String)
+  /// `unknown`, a hop that says nothing of where it came from, or one that does not read.
+  | Unknown
+
+/// The hops a request's `Forwarded` fields name (RFC 7239), oldest first: the `for` of each
+/// element of each field line, in order. An element with no `for`, or whose `for` is no node, is
+/// `Unknown`. A line that is not a list of `;`-separated `name=value` pairs is one `Unknown`,
+/// since nothing left of where it stops reading can be placed.
+pub fn forwarded_for(headers: Headers) -> List<Hop> / {abort.raise} =
+  fold(header_lines(headers, "forwarded"), [], |hops: List<Hop>, line: String| {
+    let b = bytes_of_string(line);
+    match forwarded_elements(b, 0, [], [], bytes_len(b) + 1) {
+      None -> push(hops, Unknown),
+      Some(elements) ->
+        fold(elements, hops, |found: List<Hop>, pairs: List<ForwardedPair>|
+          if len(pairs) == 0 { found } else {
+            match filter(pairs, |p: ForwardedPair| p.name == "for") {
+              [only] -> push(found, hop_of(only.value)),
+              _ -> push(found, Unknown),
+            }
+          }),
+    }
+  })
+
+/// The hops a request's `X-Forwarded-For` fields name, oldest first: each comma-separated item of
+/// each field line, an address with or without a port, an IPv6 one bare or in brackets. An item
+/// that is none of them is `Unknown`.
+pub fn x_forwarded_for(headers: Headers) -> List<Hop> / {abort.raise} =
+  fold(header_lines(headers, "x-forwarded-for"), [], |hops: List<Hop>, line: String|
+    fold(string_split(line, ","), hops, |found: List<Hop>, item: String| {
+      let text = ascii_trim(item);
+      match ip::parse(text) {
+        Ok(address) -> push(found, From(address, None)),
+        Err(_) -> push(found, hop_of(text)),
+      }
+    }))
+
+/// The client a request came from, as far as proxies the caller trusts vouch for it. The
+/// connection's far end is what the socket says, and it alone is believed: `hops` is read only
+/// while the address in hand is inside one of `trusted`, from the newest hop back, each trusted
+/// address vouching for the hop before it, and the first address not trusted is the client. A
+/// far end that is not trusted is therefore the client whatever the request's fields say, which
+/// is what keeps a client from naming its own address. `None` where a trusted proxy's hop is
+/// `Unknown` or `Obscured`, and where there is no connection to start from. An IPv4-mapped IPv6
+/// address is read as the IPv4 address it holds.
+pub fn client_of(
+  peer: Option<SocketAddress>,
+  hops: List<Hop>,
+  trusted: List<Prefix>,
+) -> Option<Ip> =
+  match peer {
+    None -> None,
+    Some(at) -> vouched(ip::to_canonical(ip::socket_ip(at)), reverse(hops), trusted),
+  }
+
+fn vouched(current: Ip, back: List<Hop>, trusted: List<Prefix>) -> Option<Ip> =
+  if !any(trusted, |p: Prefix| ip::contains(p, current)) { Some(current) } else {
+    match back {
+      [] -> Some(current),
+      [From(address, _), ..rest] -> vouched(ip::to_canonical(address), rest, trusted),
+      _ -> None,
+    }
+  }
+
+/// The client `req` came from by its connection and its `Forwarded` fields, believing only the
+/// proxies in `trusted`: `client_of` over `forwarded_for`. A deployment whose proxies write
+/// `X-Forwarded-For` reads that instead, `client_of(req.peer, x_forwarded_for(req.headers), trusted)`,
+/// and one that reads the field its proxies do not write believes whatever a client put there.
+pub fn client_ip(req: Request, trusted: List<Prefix>) -> Option<Ip> / {abort.raise} =
+  client_of(req.peer, forwarded_for(req.headers), trusted)
+
+type ForwardedPair = { name: String, value: String }
+
+/// The elements of one `Forwarded` field value from `at`, each its pairs with lowercased names;
+/// `None` where it is not `forwarded-element`s in a list.
+fn forwarded_elements(
+  b: Bytes,
+  at: Int,
+  pairs: List<ForwardedPair>,
+  elements: List<List<ForwardedPair>>,
+  fuel: Int,
+) -> Option<List<List<ForwardedPair>>> / {abort.raise} = {
+  let n = bytes_len(b);
+  let i = if at >= n { n } else { bytes_scan(b, at, ows(), n) };
+  if i >= n { Some(push(elements, pairs)) }
+  else if fuel <= 0 { None } else if bytes_at(b, i) == b',' {
+    forwarded_elements(b, i + 1, [], push(elements, pairs), fuel - 1)
+  } else if bytes_at(b, i) == b';' { forwarded_elements(b, i + 1, pairs, elements, fuel - 1) }
+  else {
+    let name_end = bytes_scan(b, i, tchars(), n);
+    if name_end == i || name_end >= n || bytes_at(b, name_end) != b'=' { None } else {
+      let value = forwarded_value(b, name_end + 1)?;
+      let after = if value.next >= n { n } else { bytes_scan(b, value.next, ows(), n) };
+      if after < n && bytes_at(b, after) != b',' && bytes_at(b, after) != b';' { None } else {
+        let pair = {
+          name: ascii_lower(string_of_bytes_lossy(bytes_slice(b, i, name_end))),
+          value: value.text,
+        };
+        forwarded_elements(b, after, push(pairs, pair), elements, fuel - 1)
+      }
+    }
+  }
+}
+
+/// A pair's value from `at`: a token, or a quoted string with its escapes undone.
+fn forwarded_value(b: Bytes, at: Int) -> Option<{ text: String, next: Int }> / {abort.raise} = {
+  let n = bytes_len(b);
+  if at >= n { None }
+  else if bytes_at(b, at) == b'"' { quoted_from(b, at + 1, b"", n - at) } else {
+    let end = bytes_scan(b, at, tchars(), n);
+    if end == at { None }
+    else { Some({ text: string_of_bytes_lossy(bytes_slice(b, at, end)), next: end }) }
+  }
+}
+
+/// A quoted string's content from `at`, just past its opening quote or a pair it escaped.
+fn quoted_from(
+  b: Bytes,
+  at: Int,
+  so_far: Bytes,
+  fuel: Int,
+) -> Option<{ text: String, next: Int }> / {abort.raise} = {
+  let n = bytes_len(b);
+  let stop = if at >= n { n } else { bytes_scan_until(b, at, b"\"\\", n) };
+  if stop >= n || fuel <= 0 { None } else {
+    let read = bytes_concat(so_far, bytes_slice(b, at, stop));
+    if bytes_at(b, stop) == b'"' { Some({ text: string_of_bytes_lossy(read), next: stop + 1 }) }
+    else if stop + 1 >= n { None } else {
+      quoted_from(b, stop + 2, bytes_concat(read, bytes_slice(b, stop + 1, stop + 2)), fuel - 1)
+    }
+  }
+}
+
+/// RFC 7239's `obfnode` and `obfport`: `_`, then letters, digits, `.`, `_` and `-`.
+fn is_obscured(b: Bytes) -> Bool / {abort.raise} =
+  bytes_len(b) > 1 && bytes_at(b, 0) == b'_'
+    && bytes_scan(
+      b,
+      1,
+      b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-",
+      bytes_len(b),
+    )
+    == bytes_len(b)
+
+/// The hop a `node` names: an IPv4 address, an IPv6 address in brackets, `unknown` or an
+/// obscured identifier, each with or without a port.
+fn hop_of(node: String) -> Hop / {abort.raise} = {
+  let b = bytes_of_string(node);
+  let n = bytes_len(b);
+  if n == 0 { Unknown }
+  else if eq_ignore_ascii_case(node, "unknown") { Unknown } else if bytes_at(b, 0) == b'_' {
+    let end = bytes_scan_until(b, 0, b":", n);
+    if is_obscured(bytes_slice(b, 0, end)) && node_port(b, end) != None {
+      Obscured(string_of_bytes_lossy(bytes_slice(b, 0, end)))
+    } else { Unknown }
+  } else if bytes_at(b, 0) == b'[' {
+    let close = bytes_scan_until(b, 1, b"]", n);
+    if close >= n { Unknown } else {
+      match ip::parse_v6(string_of_bytes_lossy(bytes_slice(b, 1, close))) {
+        Ok(six) -> match node_port(b, close + 1) {
+          Some(port) -> From(ip::V6(six), port),
+          None -> Unknown,
+        },
+        Err(_) -> Unknown,
+      }
+    }
+  } else {
+    let colon = bytes_scan_until(b, 0, b":", n);
+    match ip::parse_v4(string_of_bytes_lossy(bytes_slice(b, 0, colon))) {
+      Ok(four) -> match node_port(b, colon) {
+        Some(port) -> From(ip::V4(four), port),
+        None -> Unknown,
+      },
+      Err(_) -> Unknown,
+    }
+  }
+}
+
+/// What follows a node's name from `at`: nothing, or `:` and a port, which is a number or an
+/// obscured one. `None` where it is neither.
+fn node_port(b: Bytes, at: Int) -> Option<Option<Int>> / {abort.raise} = {
+  let n = bytes_len(b);
+  if at >= n { Some(None) }
+  else if bytes_at(b, at) != b':' { None } else {
+    let rest = bytes_slice(b, at + 1, n);
+    if is_obscured(rest) { Some(None) } else if all_digits(rest) && bytes_len(rest) <= 5 {
+      match int_of_ascii(rest) {
+        Some(port) -> if port <= 65535 { Some(Some(port)) } else { None },
+        None -> None,
+      }
+    } else { None }
+  }
+}
 
 // --- Host -------------------------------------------------------------------
 
@@ -1387,6 +1598,7 @@ pub fn request_to(
     headers: empty_headers(),
     trailers: empty_headers(),
     body: body,
+    peer: None,
   }
 }
 
@@ -1556,19 +1768,21 @@ fn read_answer<[l]>(
 // --- Serving ----------------------------------------------------------------
 
 /// One connection: read a head, answer it, then close or go round again with the leftover bytes.
-/// The connection is closed however serving it ends, an `app` a clause unwinds out of included.
+/// Each request the `app` is handed carries the connection's far end as its `peer`, read once. The
+/// connection is closed however serving it ends, an `app` a clause unwinds out of included.
 pub fn serve_connection<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
-) -> Unit / {abort.raise, net.recv[l], net.send[l], net.close[l] | e} =
+) -> Unit / {abort.raise, net.peer_address[l], net.recv[l], net.send[l], net.close[l] | e} =
   bracket(|| c, |h: Int| net.close[l](h), |h: Int|
-    connection_loop[l](h, limits, app, b"", limits.max_keep_alive, false))
+    connection_loop[l](h, limits, app, net.peer_address[l](h), b"", limits.max_keep_alive, false))
 
 fn connection_loop<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  peer: Option<SocketAddress>,
   carried: Bytes,
   left: Int,
   reused: Bool,
@@ -1588,7 +1802,7 @@ fn connection_loop<[l] | e>(
           false,
           text_response(408, "the request head did not arrive\n"),
         ),
-      HeadBytes(read) -> after_head(c, limits, app, read, left - 1),
+      HeadBytes(read) -> after_head(c, limits, app, peer, read, left - 1),
     }
   }
 
@@ -1597,6 +1811,7 @@ fn after_head<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  peer: Option<SocketAddress>,
   read: { buf: Bytes, complete: Bool },
   left: Int,
 ) -> Unit / {abort.raise, net.recv[l], net.send[l] | e} =
@@ -1627,6 +1842,7 @@ fn after_head<[l] | e>(
         c,
         limits,
         app,
+        peer,
         head,
         bytes_slice(read.buf, head.consumed, bytes_len(read.buf)),
         left,
@@ -1637,6 +1853,7 @@ fn after_parse<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  peer: Option<SocketAddress>,
   head: Head,
   rest: Bytes,
   left: Int,
@@ -1666,7 +1883,7 @@ fn after_parse<[l] | e>(
           false,
           refusal_response(r),
         ),
-      Body(got) -> after_body(c, limits, app, head, got, left),
+      Body(got) -> after_body(c, limits, app, peer, head, got, left),
     }
   }
 
@@ -1674,6 +1891,7 @@ fn after_body<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  peer: Option<SocketAddress>,
   head: Head,
   got: { bytes: Bytes, rest: Bytes, trailers: Headers },
   left: Int,
@@ -1688,10 +1906,11 @@ fn after_body<[l] | e>(
     headers: head.request.headers,
     trailers: got.trailers,
     body: got.bytes,
+    peer: peer,
   };
   let keep = head.keep_alive && left > 0;
   write_response[l](c, limits, req.method, req.version, keep, app(req));
-  if keep { connection_loop(c, limits, app, got.rest, left, true) } else { () }
+  if keep { connection_loop(c, limits, app, peer, got.rest, left, true) } else { () }
 }
 
 fn write_response<[l]>(
@@ -1781,7 +2000,7 @@ pub fn serve<[l], [k] | e>(
   count: Int,
   limits: Limits,
   app: (Request) -> Response / e,
-) -> Int / {abort.raise, net.accept[l], net.recv[k], net.send[k], net.close[k] | e} =
+) -> Int / {abort.raise, net.accept[l], net.peer_address[k], net.recv[k], net.send[k], net.close[k] | e} =
   if count <= 0 { 0 } else {
     let c = net.accept[l](listener);
     if c == 0 { 0 } else {
@@ -1797,7 +2016,7 @@ pub fn listen_and_serve<[l], [k] | e>(
   count: Int,
   limits: Limits,
   app: (Request) -> Response / e,
-) -> Int / {abort.raise, net.listen[l], net.accept[l], net.close[l], net.recv[k], net.send[k], net.close[k] | e} = {
+) -> Int / {abort.raise, net.listen[l], net.accept[l], net.close[l], net.peer_address[k], net.recv[k], net.send[k], net.close[k] | e} = {
   check_limits(limits);
   bracket(|| net.listen[l](port), |s: Int| net.close[l](s), |s: Int|
     serve[l, k](s, count, limits, app))
@@ -2651,12 +2870,6 @@ law "a chunk-encoded body decodes back to itself"
 
 // --- Tests: the serve loop --------------------------------------------------
 
-fn next_answer(queued: List<Option<Bytes>>) -> Option<Bytes> =
-  match queued { [x, ..] -> x, _ -> Some(b"") }
-
-fn rest_answers(queued: List<Option<Bytes>>) -> List<Option<Bytes>> =
-  match queued { [_, ..rest] -> rest, _ -> [] }
-
 fn echo_app(req: Request) -> Response =
   text_response(
     200,
@@ -2674,167 +2887,113 @@ fn limits_keeping(n: Int) -> Limits = {
 fn answer_of(status: Int, body: String, keep: Bool) -> Bytes / {abort.raise} =
   encode(Get, Http11, keep, text_response(status, body))
 
+/// Where the client of a served connection calls from.
+fn caller() -> SocketAddress / {ip.refused, abort.raise} = ip::read_socket("203.0.113.9:4431")
+
+/// The handle of the connection `served` serves: the listener is the twin's first socket.
+fn served_conn() -> Int = 2
+
+/// What a connection whose client does `script` was written back, and the network that serving
+/// it left: `app` under `limits` on the one connection a listener takes.
+fn served(
+  script: List<Step>,
+  limits: Limits,
+  app: (Request) -> Response,
+) -> { out: Bytes, net: MemNet } / {ip.refused, abort.raise} = {
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), caller(), script), || {
+    let listener = net.listen[listener](0);
+    serve_connection[conn](net.accept[listener](listener), limits, app)
+  });
+  { out: net::mem_sent(ran.net, served_conn()), net: ran.net }
+}
+
 test "a 1.1 connection is reused and its requests are answered in order" {
-  with_cell[inbox]([
-      Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"),
-      Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      with_cell[closed](0) { closed -> {
-        handle {
-          serve_connection[conn](7, default_limits(), echo_app)
-        } with {
-          net.recv[conn](c, max, t) -> {
-            let queued = cell_get(inbox);
-            cell_set(inbox, rest_answers(queued));
-            next_answer(queued)
-          },
-          net.send[conn](c, payload, t) -> {
-            cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-            Some(bytes_len(payload))
-          },
-          net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
-        };
-        assert_eq(
-          cell_get(outbox),
-          bytes_concat(answer_of(200, "GET /a|", true), answer_of(200, "GET /b|", true)),
-        );
-        assert_eq(cell_get(closed), 1)
-      } }
-    } }
-  } }
+  let ran = served(
+    [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Says(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(
+    ran.out,
+    bytes_concat(answer_of(200, "GET /a|", true), answer_of(200, "GET /b|", true)),
+  );
+  assert_eq(ran.net.closed, [served_conn()])
 }
 
 // A loop bound to one label would make a program with two kinds of socket write it twice.
 test "a connection is served under whichever label the caller fills" {
-  with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), None]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      with_cell[closed](0) { closed -> {
-        handle {
-          serve_connection[upstream](7, default_limits(), echo_app)
-        } with {
-          net.recv[upstream](c, max, t) -> {
-            let queued = cell_get(inbox);
-            cell_set(inbox, rest_answers(queued));
-            next_answer(queued)
-          },
-          net.send[upstream](c, payload, t) -> {
-            cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-            Some(bytes_len(payload))
-          },
-          net.close[upstream](c) -> cell_set(closed, cell_get(closed) + 1),
-        };
-        assert_eq(cell_get(outbox), answer_of(200, "GET /a|", true));
-        assert_eq(cell_get(closed), 1)
-      } }
-    } }
-  } }
+  let script = [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Stalls];
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), caller(), script), || {
+    let listener = net.listen[listener](0);
+    serve_connection[upstream](net.accept[listener](listener), default_limits(), echo_app)
+  });
+  assert_eq(net::mem_sent(ran.net, served_conn()), answer_of(200, "GET /a|", true));
+  assert_eq(ran.net.closed, [served_conn()])
 }
 
 test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connection" {
+  let second = Says(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
   // Nothing is read after `Connection: close`, so the second scripted request is never seen.
-  with_cell[inbox]([
-      Some(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
-      Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), answer_of(200, "GET /a|", false));
-      // The second request is still queued: it was never read.
-      assert_eq(len(cell_get(inbox)), 1)
-    } }
-  } };
+  let closing = served(
+    [Says(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"), second],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(closing.out, answer_of(200, "GET /a|", false));
+  // The second request is still unsent: it was never read.
+  assert_eq(net::mem_unmet(closing.net, served_conn()), [second]);
   // The `max_keep_alive`th response says `close` and the connection ends there.
-  with_cell[inbox]([
-      Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"),
-      Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, limits_keeping(1), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), answer_of(200, "GET /a|", false));
-      assert_eq(len(cell_get(inbox)), 1)
-    } }
-  } }
+  let bounded = served(
+    [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), second],
+    limits_keeping(1),
+    echo_app,
+  );
+  assert_eq(bounded.out, answer_of(200, "GET /a|", false));
+  assert_eq(net::mem_unmet(bounded.net, served_conn()), [second])
 }
 
 test "a body the handler ignores is drained before the next request is framed" {
-  with_cell[inbox]([
-      Some(
+  let ran = served(
+    [
+      Says(
         b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n",
       ),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), ignore_body_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(
-        cell_get(outbox),
-        bytes_concat(answer_of(200, "/a", true), answer_of(200, "/b", true)),
-      )
-    } }
-  } }
+    ],
+    default_limits(),
+    ignore_body_app,
+  );
+  assert_eq(ran.out, bytes_concat(answer_of(200, "/a", true), answer_of(200, "/b", true)))
 }
 
 test "a chunked request is decoded and its trailers reach the handler separately" {
-  with_cell[inbox]([
-      Some(b"POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
-      Some(b"6\r\n world\r\n0\r\nX-Checksum: 7\r\n\r\n"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), trailer_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), answer_of(200, "hello world|7|none", true))
-    } }
-  } }
+  let ran = served(
+    [
+      Says(b"POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
+      Says(b"6\r\n world\r\n0\r\nX-Checksum: 7\r\n\r\n"),
+    ],
+    default_limits(),
+    trailer_app,
+  );
+  assert_eq(ran.out, answer_of(200, "hello world|7|none", true))
+}
+
+test "a request carries the address its connection came from" {
+  let ran = served(
+    [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Says(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")],
+    default_limits(),
+    |req: Request|
+      text_response(200, match req.peer {
+        Some(from) -> ip::render_socket(from),
+        None -> "nowhere",
+      }),
+  );
+  assert_eq(
+    ran.out,
+    bytes_concat(
+      answer_of(200, "203.0.113.9:4431", true),
+      answer_of(200, "203.0.113.9:4431", true),
+    ),
+  )
 }
 
 fn trailer_app(req: Request) -> Response =
@@ -2848,218 +3007,108 @@ fn trailer_app(req: Request) -> Response =
 
 test "a header timeout is 408, a body timeout is 408, and an idle timeout writes nothing" {
   // Nothing arrives at all.
-  with_cell[outbox](b"") { outbox -> {
-    handle {
-      serve_connection[conn](7, default_limits(), echo_app)
-    } with {
-      net.recv[conn](c, max, t) -> None,
-      net.send[conn](c, payload, t) -> {
-        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-        Some(bytes_len(payload))
-      },
-      net.close[conn](c) -> (),
-    };
-    assert_eq(
-      cell_get(outbox),
-      encode(Get, Http11, false, text_response(408, "the request head did not arrive\n")),
-    )
-  } };
+  let nothing = served([Silent], default_limits(), echo_app);
+  assert_eq(
+    nothing.out,
+    encode(Get, Http11, false, text_response(408, "the request head did not arrive\n")),
+  );
   // The head arrives and the body never does.
-  with_cell[reads](0) { reads -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let n = cell_get(reads);
-          cell_set(reads, n + 1);
-          if n == 0 { Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n") }
-          else { None }
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(
-        cell_get(outbox),
-        encode(Post, Http11, false, text_response(408, "the request body did not arrive\n")),
-      )
-    } }
-  } };
+  let headless = served(
+    [Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"), Silent],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(
+    headless.out,
+    encode(Post, Http11, false, text_response(408, "the request body did not arrive\n")),
+  );
   // One request answered, then silence between messages.
-  with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), None]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      with_cell[closed](0) { closed -> {
-        handle {
-          serve_connection[conn](7, default_limits(), echo_app)
-        } with {
-          net.recv[conn](c, max, t) -> {
-            let queued = cell_get(inbox);
-            cell_set(inbox, rest_answers(queued));
-            next_answer(queued)
-          },
-          net.send[conn](c, payload, t) -> {
-            cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-            Some(bytes_len(payload))
-          },
-          net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
-        };
-        assert_eq(cell_get(outbox), answer_of(200, "GET /a|", true));
-        assert_eq(cell_get(closed), 1)
-      } }
-    } }
-  } }
+  let idle = served(
+    [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Stalls],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(idle.out, answer_of(200, "GET /a|", true));
+  assert_eq(idle.net.closed, [served_conn()])
 }
 
+/// The milliseconds the reads of the served connection were given in all, past its first `skip`.
+fn granted(net: MemNet, skip: Int) -> Int =
+  fold(drop(net::mem_deadlines(net, served_conn()), skip), 0, |total: Int, ms: Int| total + ms)
+
 test "the whole head is bounded by header_timeout_ms and not by each read" {
-  with_cell[granted](0) { granted -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        // One byte per read, forever: the slow loris.
-        net.recv[conn](c, max, t) -> {
-          cell_set(granted, cell_get(granted) + t);
-          Some(b"a")
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert(cell_get(granted) <= default_limits().header_timeout_ms);
-      assert_eq(
-        cell_get(outbox),
-        encode(Get, Http11, false, text_response(408, "the request head did not arrive\n")),
-      )
-    } }
-  } };
-  // The same for the body.
-  with_cell[granted](0) { granted -> {
-    with_cell[reads](0) { reads -> {
-      with_cell[outbox](b"") { outbox -> {
-        handle {
-          serve_connection[conn](7, default_limits(), echo_app)
-        } with {
-          net.recv[conn](c, max, t) -> {
-            let n = cell_get(reads);
-            cell_set(reads, n + 1);
-            if n == 0 { Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n") }
-            else {
-              cell_set(granted, cell_get(granted) + t);
-              Some(b"a")
-            }
-          },
-          net.send[conn](c, payload, t) -> {
-            cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-            Some(bytes_len(payload))
-          },
-          net.close[conn](c) -> (),
-        };
-        assert(cell_get(granted) <= default_limits().body_timeout_ms);
-        assert_eq(
-          cell_get(outbox),
-          encode(Post, Http11, false, text_response(408, "the request body did not arrive\n")),
-        )
-      } }
-    } }
-  } }
+  // One byte per read, forever: the slow loris.
+  let slow = served([Repeats(b"a")], default_limits(), echo_app);
+  assert(granted(slow.net, 0) <= default_limits().header_timeout_ms);
+  assert_eq(
+    slow.out,
+    encode(Get, Http11, false, text_response(408, "the request head did not arrive\n")),
+  );
+  // The same for the body, whose reads are the ones after the head's.
+  let body = served(
+    [Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n"), Repeats(b"a")],
+    default_limits(),
+    echo_app,
+  );
+  assert(granted(body.net, 1) <= default_limits().body_timeout_ms);
+  assert_eq(
+    body.out,
+    encode(Post, Http11, false, text_response(408, "the request body did not arrive\n")),
+  )
 }
 
 test "a head arriving in pieces is read to its terminator" {
-  with_cell[inbox]([Some(b"GET /a HT"), Some(b"TP/1.1\r\nHost: x\r"), Some(b"\n\r\n")]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(cell_get(outbox), answer_of(200, "GET /a|", true))
-    } }
-  } }
+  let ran = served(
+    [Says(b"GET /a HT"), Says(b"TP/1.1\r\nHost: x\r"), Says(b"\n\r\n")],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(ran.out, answer_of(200, "GET /a|", true))
 }
 
 // After a refusal the next message's position is unknown, so there is nothing safe to resync from.
 test "a framing refusal is answered once and the connection is not reused" {
-  with_cell[inbox]([
-      Some(
+  let second = Says(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n");
+  let ran = served(
+    [
+      Says(
         b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello",
       ),
-      Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(
-        cell_get(outbox),
-        encode(
-          Get,
-          Http11,
-          false,
-          text_response(
-            400,
-            "a request carries `Content-Length` or `Transfer-Encoding`, never both\n",
-          ),
-        ),
-      );
-      assert_eq(len(cell_get(inbox)), 1)
-    } }
-  } }
+      second,
+    ],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(
+    ran.out,
+    encode(
+      Get,
+      Http11,
+      false,
+      text_response(400, "a request carries `Content-Length` or `Transfer-Encoding`, never both\n"),
+    ),
+  );
+  assert_eq(net::mem_unmet(ran.net, served_conn()), [second])
 }
 
 test "a 100-continue is written before the body is read" {
-  with_cell[inbox]([
-      Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"),
-      Some(b"hello"),
-    ]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      handle {
-        serve_connection[conn](7, default_limits(), echo_app)
-      } with {
-        net.recv[conn](c, max, t) -> {
-          let queued = cell_get(inbox);
-          cell_set(inbox, rest_answers(queued));
-          next_answer(queued)
-        },
-        net.send[conn](c, payload, t) -> {
-          cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-          Some(bytes_len(payload))
-        },
-        net.close[conn](c) -> (),
-      };
-      assert_eq(
-        cell_get(outbox),
-        bytes_concat(
-          continue_response(),
-          encode(Post, Http11, true, text_response(200, "POST /a|hello")),
-        ),
-      )
-    } }
-  } }
+  // The client holds its body until it has heard the interim response.
+  let ran = served(
+    [
+      Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"),
+      Hears(continue_response()),
+      Says(b"hello"),
+    ],
+    default_limits(),
+    echo_app,
+  );
+  assert_eq(
+    ran.out,
+    bytes_concat(
+      continue_response(),
+      encode(Post, Http11, true, text_response(200, "POST /a|hello")),
+    ),
+  )
 }
 
 // --- Tests: streaming a response --------------------------------------------
@@ -3068,86 +3117,68 @@ fn counted(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
   if seed >= 3 { None }
   else { Some({ chunk: bytes_of_string(int_to_string(seed)), next: seed + 1 }) }
 
+/// What `write` wrote to the one connection a listener takes, whose client does `script`, and
+/// what it answered.
+fn written(
+  script: List<Step>,
+  write: (Int) -> Bool / {net.send[conn], abort.raise},
+) -> { out: Bytes, reusable: Bool } / {ip.refused, abort.raise} = {
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), caller(), script), || {
+    let listener = net.listen[listener](0);
+    write(net.accept[listener](listener))
+  });
+  { out: net::mem_sent(ran.net, served_conn()), reusable: ran.value }
+}
+
+/// `counted`'s chunks streamed over a connection of `version` under `limits`.
+fn streamed(
+  script: List<Step>,
+  version: Version,
+  limits: Limits,
+  produce: (Int) -> Option<{ chunk: Bytes, next: Int }>,
+) -> { out: Bytes, reusable: Bool } / {ip.refused, abort.raise} =
+  written(script, |c: Int|
+    respond_chunked[conn](c, version, response(200, b""), true, limits, 0, produce))
+
 test "a streamed response is chunk-framed and ends with the terminating chunk" {
-  with_cell[outbox](b"") { outbox -> {
-    handle {
-      assert(
-        respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted),
-      )
-    } with {
-      net.send[conn](c, payload, t) -> {
-        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-        Some(bytes_len(payload))
-      },
-    };
-    let written = cell_get(outbox);
-    assert_eq(
-      written,
-      bytes_concat_all([
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-        b"1\r\n0\r\n",
-        b"1\r\n1\r\n",
-        b"1\r\n2\r\n",
-        b"0\r\n\r\n",
-      ]),
-    );
-    // What was streamed is what this module's own decoder reads back.
-    assert_eq(decoded(Chunked, bytes_slice(written, 47, bytes_len(written))).bytes, b"012")
-  } }
+  let ran = streamed([], Http11, default_limits(), counted);
+  assert(ran.reusable);
+  assert_eq(
+    ran.out,
+    bytes_concat_all([
+      b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+      b"1\r\n0\r\n",
+      b"1\r\n1\r\n",
+      b"1\r\n2\r\n",
+      b"0\r\n\r\n",
+    ]),
+  );
+  // What was streamed is what this module's own decoder reads back.
+  assert_eq(decoded(Chunked, bytes_slice(ran.out, 47, bytes_len(ran.out))).bytes, b"012")
 }
 
 test "a streamed response stops at a dead peer rather than writing into it" {
-  handle {
-    assert(
-      !respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted),
-    )
-  } with {
-    net.send[conn](c, payload, t) -> Some(0),
-  };
-  handle {
-    assert(
-      !respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted),
-    )
-  } with {
-    net.send[conn](c, payload, t) -> None,
-  }
+  // A peer that has gone takes nothing, and one that stops reading is a deadline.
+  assert(!streamed([Leaves], Http11, default_limits(), counted).reusable);
+  assert(!streamed([Blocks], Http11, default_limits(), counted).reusable)
 }
 
 /// A producer with more chunks than `max_stream_chunks`.
 fn endless(seed: Int) -> Option<{ chunk: Bytes, next: Int }> = Some({ chunk: b"x", next: seed + 1 })
 
 test "a streamed response always ends with its terminating chunk" {
-  let small = limits_streaming(4);
-  with_cell[outbox](b"") { outbox -> {
-    handle {
-      assert(!respond_chunked[conn](7, Http11, response(200, b""), true, small, 0, endless))
-    } with {
-      net.send[conn](c, payload, t) -> {
-        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-        Some(bytes_len(payload))
-      },
-    };
-    assert(bytes_ends_with(cell_get(outbox), last_chunk()))
-  } }
+  let ran = streamed([], Http11, limits_streaming(4), endless);
+  assert(!ran.reusable);
+  assert(bytes_ends_with(ran.out, last_chunk()))
 }
 
 test "a streamed response to an HTTP/1.0 peer is delimited by the close" {
-  with_cell[outbox](b"") { outbox -> {
-    handle {
-      assert(
-        !respond_chunked[conn](7, Http10, response(200, b""), true, default_limits(), 0, counted),
-      )
-    } with {
-      net.send[conn](c, payload, t) -> {
-        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-        Some(bytes_len(payload))
-      },
-    };
-    assert_eq(
-      cell_get(outbox),
-      bytes_concat_all([b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", b"0", b"1", b"2"]),
-    )
-  } }
+  let ran = streamed([], Http10, default_limits(), counted);
+  assert(!ran.reusable);
+  assert_eq(
+    ran.out,
+    bytes_concat_all([b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", b"0", b"1", b"2"]),
+  )
 }
 
 fn limits_streaming(n: Int) -> Limits = {
@@ -3257,113 +3288,77 @@ test "a request target splits into its path and query" {
   assert_eq(request_to(Get, "h", "/plain", b"").query, "")
 }
 
+/// A network on which `host` is one address, whose port 80 answers one connection with `script`.
+fn serving(host: String, script: List<Step>) -> MemNet / {ip.refused, abort.raise} =
+  net::mem_serving(
+    net::mem_resolving(
+      net::mem_empty(),
+      dns::with_name(dns::table(), host, [ip::read("192.0.2.80")]),
+    ),
+    ip::read_socket("192.0.2.80:80"),
+    [script],
+  )
+
 test "a request is sent, its answer read, and the connection closed" {
-  with_cell[inbox]([Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"), Some(b"lo")]) { inbox -> {
-    with_cell[outbox](b"") { outbox -> {
-      with_cell[closed](0) { closed -> {
-        let answer = handle {
-          request[conn](
-            "example.org",
-            80,
-            request_to(Get, "example.org", "/a", b""),
-            client_limits(),
-          )
-        } with {
-          net.connect[conn](host, port, t) -> if host == "example.org" && port == 80 { Some(7) }
-          else { None },
-          net.recv[conn](c, max, t) -> {
-            let queued = cell_get(inbox);
-            cell_set(inbox, rest_answers(queued));
-            next_answer(queued)
-          },
-          net.send[conn](c, payload, t) -> {
-            cell_set(outbox, bytes_concat(cell_get(outbox), payload));
-            Some(bytes_len(payload))
-          },
-          net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
-        };
-        assert_eq(
-          cell_get(outbox),
-          b"GET /a HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n",
-        );
-        assert_eq(
-          answer,
-          Ok({
-            status: 200,
-            headers: set_header(empty_headers(), "content-length", "5"),
-            body: b"hello",
-          }),
-        );
-        assert_eq(cell_get(closed), 1)
-      } }
-    } }
-  } }
+  let request_bytes = b"GET /a HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n";
+  let script = [
+    Hears(request_bytes),
+    Says(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"),
+    Says(b"lo"),
+  ];
+  let ran = net::on_mem(serving("example.org", script), ||
+    request[conn]("example.org", 80, request_to(Get, "example.org", "/a", b""), client_limits()));
+  assert_eq(net::mem_sent(ran.net, 1), request_bytes);
+  assert_eq(
+    ran.value,
+    Ok({
+      status: 200,
+      headers: set_header(empty_headers(), "content-length", "5"),
+      body: b"hello",
+    }),
+  );
+  assert_eq(ran.net.closed, [1])
 }
 
+/// What a request to `h` is answered with by a server that does `script`, or by none.
 fn fetched(
-  answers: List<Option<Bytes>>,
+  script: List<Step>,
   reached: Bool,
-) -> Result<Response, ClientError> / {abort.raise} =
-  with_cell[inbox](answers) { inbox -> {
-    handle {
-      request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())
-    } with {
-      net.connect[conn](host, port, t) -> if reached { Some(7) } else { None },
-      net.recv[conn](c, max, t) -> {
-        let queued = cell_get(inbox);
-        cell_set(inbox, rest_answers(queued));
-        next_answer(queued)
-      },
-      net.send[conn](c, payload, t) -> Some(bytes_len(payload)),
-      net.close[conn](c) -> (),
-    }
-  } }
+) -> Result<Response, ClientError> / {ip.refused, abort.raise} =
+  net::on_mem(if reached { serving("h", script) } else { net::mem_empty() }, ||
+    request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())).value
 
-fn body_fetched(answers: List<Option<Bytes>>) -> Bytes / {abort.raise} =
-  match fetched(answers, true) { Ok(r) -> r.body, Err(_) -> panic("no answer") }
+fn body_fetched(script: List<Step>) -> Bytes / {ip.refused, abort.raise} =
+  match fetched(script, true) { Ok(r) -> r.body, Err(_) -> panic("no answer") }
 
 test "a body without a length runs until the server closes" {
-  assert_eq(body_fetched([Some(b"HTTP/1.1 200 OK\r\n\r\nhel"), Some(b"lo")]), b"hello");
-  assert_eq(body_fetched([Some(b"HTTP/1.1 200 OK\r\n\r\n")]), b"");
+  assert_eq(body_fetched([Says(b"HTTP/1.1 200 OK\r\n\r\nhel"), Says(b"lo")]), b"hello");
+  assert_eq(body_fetched([Says(b"HTTP/1.1 200 OK\r\n\r\n")]), b"");
   assert_eq(
     body_fetched([
-      Some(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
-      Some(b"0\r\n\r\n"),
+      Says(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
+      Says(b"0\r\n\r\n"),
     ]),
     b"hello",
   );
-  assert_eq(body_fetched([Some(b"HTTP/1.1 204 No Content\r\n\r\n")]), b"")
+  assert_eq(body_fetched([Says(b"HTTP/1.1 204 No Content\r\n\r\n")]), b"")
 }
 
 test "each way an exchange can fail has its own error" {
   assert_eq(fetched([], false), Err(Unreachable));
-  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")], true), Err(Closed));
-  assert_eq(fetched([Some(b"HTTP/1.1 200 OK\r\nContent-Le")], true), Err(Closed));
-  assert_eq(fetched([None, None, None, None, None, None, None, None, None], true), Err(TimedOut));
+  assert_eq(fetched([Says(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel")], true), Err(Closed));
+  assert_eq(fetched([Says(b"HTTP/1.1 200 OK\r\nContent-Le")], true), Err(Closed));
+  assert_eq(fetched([Silent], true), Err(TimedOut));
   assert_eq(
-    fetched(
-      [
-        Some(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-      ],
-      true,
-    ),
+    fetched([Says(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"), Silent], true),
     Err(TimedOut),
   );
   assert_eq(
-    fetched([Some(b"HTTP/9.9 200 OK\r\n\r\n")], true),
+    fetched([Says(b"HTTP/9.9 200 OK\r\n\r\n")], true),
     Err(Malformed({ status: 502, reason: "a status line begins with `HTTP/1.1` or `HTTP/1.0`" })),
   );
   assert_eq(
-    fetched([Some(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")], true),
+    fetched([Says(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n")], true),
     Err(
       Malformed({
         status: 502,
@@ -3374,82 +3369,183 @@ test "each way an exchange can fail has its own error" {
 }
 
 test "a peer that stops taking bytes is reported as not sent" {
-  let answer = handle {
-    request[conn]("h", 80, request_to(Get, "h", "/", b""), client_limits())
-  } with {
-    net.connect[conn](host, port, t) -> Some(7),
-    net.recv[conn](c, max, t) -> Some(b""),
-    net.send[conn](c, payload, t) -> None,
-    net.close[conn](c) -> (),
-  };
-  assert_eq(answer, Err(NotSent))
+  assert_eq(fetched([Blocks], true), Err(NotSent))
 }
 
 test "a kept connection sends every request but the last without `Connection`" {
-  let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-  with_cell[inbox]([Some(answer), Some(answer), Some(answer)]) { inbox -> {
-    with_cell[sent](b"") { sent -> {
-      with_cell[dialled](0) { dialled -> {
-        with_cell[closed](0) { closed -> {
-          let answers = handle {
-            match dial[conn]("example.org", 80, client_limits()) {
-              Err(_) -> (Err(Unreachable), Err(Unreachable), Err(Unreachable)),
-              Ok(c) -> {
-                let first = ask[conn](
-                  c,
-                  request_to(Get, "example.org", "/a", b""),
-                  client_limits(),
-                );
-                let second = ask[conn](
-                  c,
-                  request_to(Get, "example.org", "/b", b""),
-                  client_limits(),
-                );
-                let last = ask_last[conn](
-                  c,
-                  request_to(Get, "example.org", "/c", b""),
-                  client_limits(),
-                );
-                close[conn](c);
-                (first, second, last)
-              },
-            }
-          } with {
-            net.connect[conn](host, port, t) -> {
-              cell_set(dialled, cell_get(dialled) + 1);
-              Some(7)
-            },
-            net.recv[conn](c, max, t) -> {
-              let queued = cell_get(inbox);
-              cell_set(inbox, rest_answers(queued));
-              next_answer(queued)
-            },
-            net.send[conn](c, payload, t) -> {
-              cell_set(sent, bytes_concat(cell_get(sent), payload));
-              Some(bytes_len(payload))
-            },
-            net.close[conn](c) -> cell_set(closed, cell_get(closed) + 1),
-          };
-          // One connection for all three exchanges, and closed once at the end.
-          assert_eq(cell_get(dialled), 1);
-          assert_eq(cell_get(closed), 1);
-          // HTTP/1.1 keeps a connection by default, so only the one that ends it says so.
-          assert_eq(
-            cell_get(sent),
-            bytes_concat_all([
-              b"GET /a HTTP/1.1\r\nHost: example.org\r\n\r\n",
-              b"GET /b HTTP/1.1\r\nHost: example.org\r\n\r\n",
-              b"GET /c HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n",
-            ]),
-          );
-          let expected = Ok({
-            status: 200,
-            headers: set_header(empty_headers(), "content-length", "5"),
-            body: b"hello",
-          });
-          assert_eq(answers, (expected, expected, expected))
-        } }
-      } }
-    } }
-  } }
+  let answer = Says(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+  // HTTP/1.1 keeps a connection by default, so only the request that ends it says so.
+  let script = [
+    Hears(b"GET /a HTTP/1.1\r\nHost: example.org\r\n\r\n"),
+    answer,
+    Hears(b"GET /b HTTP/1.1\r\nHost: example.org\r\n\r\n"),
+    answer,
+    Hears(b"GET /c HTTP/1.1\r\nHost: example.org\r\nConnection: close\r\n\r\n"),
+    answer,
+  ];
+  let ran = net::on_mem(serving("example.org", script), ||
+    match dial[conn]("example.org", 80, client_limits()) {
+      Err(_) -> (Err(Unreachable), Err(Unreachable), Err(Unreachable)),
+      Ok(c) -> {
+        let first = ask[conn](c, request_to(Get, "example.org", "/a", b""), client_limits());
+        let second = ask[conn](c, request_to(Get, "example.org", "/b", b""), client_limits());
+        let last = ask_last[conn](c, request_to(Get, "example.org", "/c", b""), client_limits());
+        close[conn](c);
+        (first, second, last)
+      },
+    });
+  // One connection for all three exchanges, played to its end and closed once.
+  assert_eq(map_len(ran.net.conns), 1);
+  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(ran.net.closed, [1]);
+  let expected = Ok({
+    status: 200,
+    headers: set_header(empty_headers(), "content-length", "5"),
+    body: b"hello",
+  });
+  assert_eq(ran.value, (expected, expected, expected))
+}
+
+fn shown_hop(hop: Hop) -> String =
+  match hop {
+    From(address, Some(port)) -> ip::render(address) ++ " port " ++ int_to_string(port),
+    From(address, None) -> ip::render(address),
+    Obscured(name) -> "obscured " ++ name,
+    Unknown -> "unknown",
+  }
+
+test "`Forwarded: {c.line}` names its hops" for c: { line: String, hops: List<String> } in [
+    { line: "for=192.0.2.43", hops: ["192.0.2.43"] },
+    { line: "For=\"[2001:db8:cafe::17]:4711\"", hops: ["2001:db8:cafe::17 port 4711"] },
+    {
+      line: "for=192.0.2.43, for=198.51.100.17;by=203.0.113.60;proto=http;host=example.com",
+      hops: ["192.0.2.43", "198.51.100.17"],
+    },
+    { line: "for=\"192.0.2.43:47011\"", hops: ["192.0.2.43 port 47011"] },
+    { line: "for=192.0.2.43:47011", hops: ["unknown"] },
+    { line: "for=_gazonk", hops: ["obscured _gazonk"] },
+    { line: "for=\"_hidden:_port\"", hops: ["obscured _hidden"] },
+    { line: "for=unknown", hops: ["unknown"] },
+    { line: "for=\"un\\known\"", hops: ["unknown"] },
+    { line: "proto=https", hops: ["unknown"] },
+    { line: "for=192.0.2.1;for=192.0.2.2", hops: ["unknown"] },
+    { line: "for=192.0.2.1,,  , for=192.0.2.2", hops: ["192.0.2.1", "192.0.2.2"] },
+    { line: "for=\"192.0.2.1, 203.0.113.9\"", hops: ["unknown"] },
+    { line: "for=2001:db8::1", hops: ["unknown"] },
+    { line: "for=\"[2001:db8::1\"", hops: ["unknown"] },
+    { line: "for=192.0.2.1:99999", hops: ["unknown"] },
+    { line: "for=192.0.2.1 for=192.0.2.2", hops: ["unknown"] },
+    { line: "for=\"192.0.2.1", hops: ["unknown"] },
+    { line: "for", hops: ["unknown"] },
+    { line: "", hops: [] },
+  ] {
+  assert_eq(map(forwarded_for(add_header(empty_headers(), "Forwarded", c.line)), shown_hop), c.hops)
+}
+
+test "the hops of several field lines are read in the order the lines came" {
+  let headers = add_header(
+    add_header(empty_headers(), "Forwarded", "for=192.0.2.1"),
+    "forwarded",
+    "for=192.0.2.2, for=192.0.2.3",
+  );
+  assert_eq(map(forwarded_for(headers), shown_hop), ["192.0.2.1", "192.0.2.2", "192.0.2.3"]);
+  let old = add_header(
+    empty_headers(),
+    "X-Forwarded-For",
+    "192.0.2.1, 2001:db8::1 ,[2001:db8::2]:80, 192.0.2.4:81, nonsense",
+  );
+  assert_eq(map(x_forwarded_for(old), shown_hop), [
+    "192.0.2.1",
+    "2001:db8::1",
+    "2001:db8::2 port 80",
+    "192.0.2.4 port 81",
+    "unknown",
+  ])
+}
+
+type Vouched = { peer: String, forwarded: String, trusted: List<String>, client: Option<String> }
+
+test "from {c.peer} with `{c.forwarded}` the client is read past the trusted proxies only" for c: Vouched in [
+    // No proxy is trusted, so the field is whatever a client wrote and is not read.
+    {
+      peer: "203.0.113.9:4000",
+      forwarded: "for=192.0.2.1",
+      trusted: [],
+      client: Some("203.0.113.9"),
+    },
+    {
+      peer: "203.0.113.9:4000",
+      forwarded: "for=192.0.2.1",
+      trusted: ["10.0.0.0/8"],
+      client: Some("203.0.113.9"),
+    },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=192.0.2.1",
+      trusted: ["10.0.0.0/8"],
+      client: Some("192.0.2.1"),
+    },
+    // The client wrote the first hop itself; the proxy appended what it saw.
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=127.0.0.1, for=198.51.100.7",
+      trusted: ["10.0.0.0/8"],
+      client: Some("198.51.100.7"),
+    },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=198.51.100.7, for=10.0.0.9",
+      trusted: ["10.0.0.0/8"],
+      client: Some("198.51.100.7"),
+    },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=10.0.0.8, for=10.0.0.9",
+      trusted: ["10.0.0.0/8"],
+      client: Some("10.0.0.8"),
+    },
+    { peer: "10.0.0.5:4000", forwarded: "", trusted: ["10.0.0.0/8"], client: Some("10.0.0.5") },
+    { peer: "10.0.0.5:4000", forwarded: "for=unknown", trusted: ["10.0.0.0/8"], client: None },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=198.51.100.7, for=_hidden",
+      trusted: ["10.0.0.0/8"],
+      client: None,
+    },
+    {
+      peer: "10.0.0.5:4000",
+      forwarded: "for=198.51.100.7, garbage",
+      trusted: ["10.0.0.0/8"],
+      client: None,
+    },
+    {
+      peer: "[::ffff:10.0.0.5]:4000",
+      forwarded: "for=\"[2001:db8::7]\"",
+      trusted: ["10.0.0.0/8"],
+      client: Some("2001:db8::7"),
+    },
+    {
+      peer: "[2001:db8:1::5]:4000",
+      forwarded: "for=192.0.2.1",
+      trusted: ["2001:db8:1::/48"],
+      client: Some("192.0.2.1"),
+    },
+  ] {
+  let bare = request_to(Get, "example.org", "/", b"");
+  let req = {
+    ..bare,
+    headers: add_header(empty_headers(), "Forwarded", c.forwarded),
+    peer: Some(ip::read_socket(c.peer)),
+  };
+  let client = match client_ip(req, map(c.trusted, ip::read_prefix)) {
+    Some(address) -> Some(ip::render(address)),
+    None -> None,
+  };
+  assert_eq(client, c.client)
+}
+
+test "a request no connection carried has no client" {
+  let bare = request_to(Get, "example.org", "/", b"");
+  let req = { ..bare, headers: add_header(empty_headers(), "Forwarded", "for=192.0.2.1") };
+  assert_eq(client_ip(req, [ip::read_prefix("0.0.0.0/0")]), None)
 }

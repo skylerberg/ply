@@ -447,10 +447,15 @@ pub struct CredentialView {
 impl Transport {
     /// `Some` when the program can create a TLS listener or the run was given credentials.
     pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
-        let reachable = listing
-            .rows
-            .iter()
-            .any(|row| row.path == tls::HANDLER || row.path == tls::CONNECT_HANDLER);
+        let reachable = listing.rows.iter().any(|row| {
+            [
+                tls::HANDLER,
+                tls::CONNECT_HANDLER,
+                tls::START_HANDLER,
+                tls::SERVE_HANDLER,
+            ]
+            .contains(&row.path)
+        });
         let configured = credentials.is_some_and(|c| !c.is_empty() || c.trusted() > 0);
         if !reachable && !configured {
             return None;

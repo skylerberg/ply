@@ -1,8 +1,9 @@
 //! Every deterministic test of this suite runs over `MemFs`, so it must answer as the disk does.
 
-import harness (fresh, in_memory, one, json_of, codes)
+import harness (fresh, in_memory, one, json_of, codes, write, tested, items, at, str, shown)
 import std.fs
 import std.fs (fs, files, Entry, Seen)
+import std.json (Json, Null)
 import std.io
 import std.io (io, Sink)
 import std.random (entropy)
@@ -879,4 +880,451 @@ test/nondet "an archive is packed from and extracted onto the twin as onto the d
   );
   assert_eq(list_at(disk, 23), Some("list_dir x/elsewhere -> [secret]"));
   match first_difference(disk, twin) { Some(why) -> panic(why), None -> () }
+}
+
+// --- Links that lead out of the root ---------------------------------------------
+
+/// What an attempt through a link that leads out of its root comes to.
+type Held =
+  /// It is refused, and the path below the attempt's own directory is what is said to leave.
+  | Leaves(String)
+  /// It is refused, and this text is what is said to leave.
+  | LeavesAs(String)
+  /// It acts on the link itself, reaches nothing through it, and answers this.
+  | Answers(String)
+
+/// One attempt: its name, the row its call performs under, the call, and what it comes to.
+type Attempt = { name: String, row: String, call: String, held: Held }
+
+fn reading() -> String = "fs.read[l]"
+
+fn writing() -> String = "fs.write[l]"
+
+fn both() -> String = "fs.read[l], fs.write[l]"
+
+/// Each under a directory `c` of its own that `planted` fills: `g(c)` is a link to a path outside
+/// the root where nothing is, `f(c)` a link to a file outside it, `o(c)` a link to a directory
+/// outside it, `p(c)` a file, and `c/a/b/up` a link to `c`.
+fn attempts() -> List<Attempt> =
+  [
+    {
+      name: "write_file",
+      row: writing(),
+      call: "yes(fs.write_file[l](g(c), b\"x\"))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "append",
+      row: writing(),
+      call: "yes(fs.append[l](g(c), b\"x\") != None)",
+      held: Leaves("gone"),
+    },
+    {
+      name: "open to write",
+      row: writing(),
+      call: "opened(fs.open[l](g(c), fs::ToWrite))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "open to append",
+      row: writing(),
+      call: "opened(fs.open[l](g(c), fs::ToAppend))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "open to create",
+      row: writing(),
+      call: "opened(fs.open[l](g(c), fs::ToCreate))",
+      held: Answers("exists"),
+    },
+    {
+      name: "create_dir",
+      row: writing(),
+      call: "yes(fs.create_dir[l](g(c)))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "copy onto it",
+      row: writing(),
+      call: "yes(fs.copy[l](p(c), g(c)))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "set_mode",
+      row: writing(),
+      call: "yes(fs.set_mode[l](g(c), fs::mode_of_bits(384)))",
+      held: Leaves("gone"),
+    },
+    {
+      name: "set_modified",
+      row: writing(),
+      call: "yes(fs.set_modified[l](g(c), 1000))",
+      held: Leaves("gone"),
+    },
+    { name: "sync", row: writing(), call: "yes(fs.sync[l](g(c)))", held: Leaves("gone") },
+    {
+      name: "temp_dir",
+      row: writing(),
+      call: "yes(fs.temp_dir[l](g(c), \"t-\") != None)",
+      held: Leaves("gone"),
+    },
+    { name: "lock", row: writing(), call: "yes(fs.lock[l](g(c)))", held: Answers("false") },
+    {
+      name: "symlink",
+      row: writing(),
+      call: "yes(fs.symlink[l](g(c), \"plain\"))",
+      held: Answers("false"),
+    },
+    {
+      name: "link as the new name",
+      row: writing(),
+      call: "linked(fs.link[l](g(c), p(c)))",
+      held: Answers("exists"),
+    },
+    {
+      name: "link as the file named",
+      row: writing(),
+      call: "linked(fs.link[l](c ++ \"/named\", g(c)))",
+      held: Answers("not a file"),
+    },
+    {
+      name: "rename onto it",
+      row: both(),
+      call: "yes(fs.rename[l](p(c), g(c))) ++ \" \" ++ kind(fs.kind[l](g(c)))",
+      held: Answers("true file"),
+    },
+    {
+      name: "rename",
+      row: both(),
+      call: "yes(fs.rename[l](g(c), c ++ \"/moved\")) ++ \" \" ++ kind(fs.kind[l](c ++ \"/moved\"))",
+      held: Answers("true symlink"),
+    },
+    {
+      name: "remove",
+      row: both(),
+      call: "yes(fs.remove[l](g(c))) ++ \" \" ++ kind(fs.kind[l](g(c)))",
+      held: Answers("true missing"),
+    },
+    {
+      name: "remove_tree",
+      row: both(),
+      call: "yes(fs.remove_tree[l](g(c))) ++ \" \" ++ kind(fs.kind[l](g(c)))",
+      held: Answers("true missing"),
+    },
+    {
+      name: "write_atomic",
+      row: both() ++ ", entropy.next, abort.raise",
+      call: "atomic[l](g(c)) ++ \" \" ++ kind(fs.kind[l](g(c)))",
+      held: Answers("written file"),
+    },
+    {
+      name: "copy_tree onto it",
+      row: both() ++ ", abort.raise",
+      call: "copied[l](c ++ \"/src\", g(c)) ++ \" \" ++ kind(fs.kind[l](g(c)))",
+      held: Answers("copied dir"),
+    },
+    {
+      name: "read_file",
+      row: reading(),
+      call: "text(fs.read_file[l](f(c)))",
+      held: Leaves("file"),
+    },
+    {
+      name: "read_at",
+      row: reading(),
+      call: "text(fs.read_at[l](f(c), 0, 4))",
+      held: Leaves("file"),
+    },
+    {
+      name: "open to read",
+      row: writing(),
+      call: "opened(fs.open[l](f(c), fs::ToRead))",
+      held: Leaves("file"),
+    },
+    { name: "resolved", row: reading(), call: "kind(fs.resolved[l](f(c)))", held: Leaves("file") },
+    {
+      name: "file_size",
+      row: reading(),
+      call: "yes(fs.file_size[l](f(c)) != None)",
+      held: Leaves("file"),
+    },
+    {
+      name: "canonical",
+      row: reading(),
+      call: "yes(fs.canonical[l](f(c)) != None)",
+      held: Leaves("file"),
+    },
+    {
+      name: "write_file over a file outside",
+      row: writing(),
+      call: "yes(fs.write_file[l](f(c), b\"x\"))",
+      held: Leaves("file"),
+    },
+    { name: "kind", row: reading(), call: "kind(fs.kind[l](f(c)))", held: Answers("symlink") },
+    {
+      name: "read_link",
+      row: reading(),
+      call: "match fs.read_link[l](f(c)) { Some(to) -> to, None -> \"none\" }",
+      held: Answers("../../out/secret"),
+    },
+    {
+      name: "stat",
+      row: reading(),
+      call: "match fs.stat[l](f(c)) { Some(found) -> kind(found.kind), None -> \"none\" }",
+      held: Answers("symlink"),
+    },
+    { name: "exists", row: reading(), call: "yes(fs.exists[l](f(c)))", held: Answers("true") },
+    {
+      name: "write_file below",
+      row: writing(),
+      call: "yes(fs.write_file[l](o(c) ++ \"/new\", b\"x\"))",
+      held: Leaves("out/new"),
+    },
+    {
+      name: "create_dir below",
+      row: writing(),
+      call: "yes(fs.create_dir[l](o(c) ++ \"/new\"))",
+      held: Leaves("out/new"),
+    },
+    {
+      name: "list_dir",
+      row: reading(),
+      call: "yes(fs.list_dir[l](o(c)) != None)",
+      held: Leaves("out"),
+    },
+    { name: "walk", row: reading(), call: "yes(fs.walk[l](o(c)) != None)", held: Leaves("out") },
+    {
+      name: "scan",
+      row: reading(),
+      call: "yes(fs.scan[l](o(c), true) != None)",
+      held: Leaves("out"),
+    },
+    {
+      name: "kind below",
+      row: reading(),
+      call: "kind(fs.kind[l](o(c) ++ \"/secret\"))",
+      held: Leaves("out/secret"),
+    },
+    {
+      name: "remove below",
+      row: writing(),
+      call: "yes(fs.remove[l](o(c) ++ \"/secret\"))",
+      held: Leaves("out/secret"),
+    },
+    {
+      name: "rename from below",
+      row: writing(),
+      call: "yes(fs.rename[l](o(c) ++ \"/secret\", c ++ \"/taken\"))",
+      held: Leaves("out/secret"),
+    },
+    {
+      name: "rename to below",
+      row: writing(),
+      call: "yes(fs.rename[l](p(c), o(c) ++ \"/put\"))",
+      held: Leaves("out/put"),
+    },
+    {
+      name: "link below",
+      row: writing(),
+      call: "linked(fs.link[l](o(c) ++ \"/named\", p(c)))",
+      held: Leaves("out/named"),
+    },
+    {
+      name: "link to below",
+      row: writing(),
+      call: "linked(fs.link[l](c ++ \"/named\", o(c) ++ \"/secret\"))",
+      held: Leaves("out/secret"),
+    },
+    {
+      name: "symlink below",
+      row: writing(),
+      call: "yes(fs.symlink[l](o(c) ++ \"/l\", \"x\"))",
+      held: Leaves("out/l"),
+    },
+    {
+      name: "lock below",
+      row: writing(),
+      call: "yes(fs.lock[l](o(c) ++ \"/held.lock\"))",
+      held: Leaves("out/held.lock"),
+    },
+    {
+      name: "temp_dir in it",
+      row: writing(),
+      call: "yes(fs.temp_dir[l](o(c), \"t-\") != None)",
+      held: Leaves("out"),
+    },
+    {
+      name: "copy_tree below",
+      row: both() ++ ", abort.raise",
+      call: "copied[l](c ++ \"/src\", o(c) ++ \"/copy\")",
+      held: Leaves("out/copy"),
+    },
+    {
+      name: "write_file after a link and a step back",
+      row: writing(),
+      call: "yes(fs.write_file[l](c ++ \"/a/b/up/../plain\", b\"x\"))",
+      held: Leaves("a/b/up/../plain"),
+    },
+    {
+      name: "a link made to lead out",
+      row: writing(),
+      call: "yes(fs.symlink[l](c ++ \"/esc\", \"../../elsewhere\"))",
+      held: LeavesAs("../../elsewhere"),
+    },
+    {
+      name: "a link made to lead out, below a link that leads up",
+      row: writing(),
+      call: "yes(fs.symlink[l](c ++ \"/a/b/up/esc\", \"../../x\"))",
+      held: LeavesAs("../../x"),
+    },
+  ]
+
+/// What the program a nested run tests begins with: how an answer is said, and the links every
+/// attempt goes through, each made where it stays inside the root and moved to where it leads out.
+fn escaping() -> String =
+  \\import std.fs
+  \\import std.fs (fs, files)
+  \\import std.random (entropy)
+  \\
+  \\fn yes(b: Bool) -> String = if b { "true" } else { "false" }
+  \\
+  \\fn kind(k: fs::Kind) -> String =
+  \\  match k { fs::File -> "file", fs::Dir -> "dir", fs::Symlink -> "symlink", fs::Missing -> "missing" }
+  \\
+  \\fn why(r: fs::Refused) -> String =
+  \\  match r { fs::NotFound -> "not found", fs::Exists -> "exists", fs::NotAFile -> "not a file", _ -> "refused" }
+  \\
+  \\fn opened(o: Result<Int, fs::Refused>) -> String = match o { Ok(_) -> "open", Err(r) -> why(r) }
+  \\
+  \\fn linked(o: Result<Unit, fs::Refused>) -> String = match o { Ok(_) -> "linked", Err(r) -> why(r) }
+  \\
+  \\fn text(b: Option<Bytes>) -> String = match b { Some(v) -> string_of_bytes_lossy(v), None -> "none" }
+  \\
+  \\fn g(c: String) -> String = c ++ "/gone"
+  \\
+  \\fn f(c: String) -> String = c ++ "/file"
+  \\
+  \\fn o(c: String) -> String = c ++ "/out"
+  \\
+  \\fn p(c: String) -> String = c ++ "/plain"
+  \\
+  \\fn atomic<[l]>(path: String) -> String / {fs.read[l], fs.write[l], entropy.next, abort.raise} = {
+  \\  let wrote: Result<Unit, (String, fs::Refused)> = try[files.refused] {
+  \\    fs::write_atomic[l](path, b"new", fs::Fast, None)
+  \\  };
+  \\  match wrote { Ok(_) -> "written", Err(_) -> "refused" }
+  \\}
+  \\
+  \\fn copied<[l]>(from: String, to: String) -> String / {fs.read[l], fs.write[l], abort.raise} = {
+  \\  let done: Result<fs::Copied<Int>, (String, fs::Refused)> = try[files.refused] {
+  \\    fs::copy_tree[l](
+  \\      from,
+  \\      to,
+  \\      { existing: fs::Merge, outside: fs::RefuseLink, entries: 100, bytes: 100000 },
+  \\      0,
+  \\      |n: Int, _told: fs::Progress| Continue(n + 1),
+  \\    )
+  \\  };
+  \\  match done { Ok(_) -> "copied", Err(_) -> "refused" }
+  \\}
+  \\
+  \\fn planted<[l]>(c: String) -> Unit / {fs.write[l], abort.raise} = {
+  \\  let made = fs.create_dir[l](c ++ "/a/b") && fs.create_dir[l](c ++ "/src")
+  \\    && fs.write_file[l](p(c), b"p")
+  \\    && fs.write_file[l](c ++ "/src/one", b"1")
+  \\    && fs.symlink[l](c ++ "/a/b/gone", "../../out/gone")
+  \\    && fs.symlink[l](c ++ "/a/b/file", "../../out/secret")
+  \\    && fs.symlink[l](c ++ "/a/b/out", "../../out")
+  \\    && fs.symlink[l](c ++ "/a/b/up", "../..")
+  \\    && fs.rename[l](c ++ "/a/b/gone", g(c))
+  \\    && fs.rename[l](c ++ "/a/b/file", f(c))
+  \\    && fs.rename[l](c ++ "/a/b/out", o(c));
+  \\  assert(made, Some("the links under `" ++ c ++ "` were not made"))
+  \\}
+  \\
+
+/// The attempt as two tests of one call: against the root `data`, and over the twin.
+fn tests_of(i: Int, a: Attempt) -> String = {
+  let n = int_to_string(i);
+  let dir = "\"k" ++ n ++ "\"";
+  let wanted = match a.held { Answers(said) -> said, _ -> "(refused)" };
+  "fn tried_" ++ n ++ "<[l]>(c: String) -> String / {" ++ a.row ++ "} =\n  " ++ a.call ++ "\n\n"
+    ++ "test/nondet \"disk "
+    ++ n
+    ++ ": "
+    ++ a.name
+    ++ "\" {\n  planted[data]("
+    ++ dir
+    ++ ");\n  assert_eq(tried_"
+    ++ n
+    ++ "[data]("
+    ++ dir
+    ++ "), \""
+    ++ wanted
+    ++ "\")\n}\n\n"
+    ++ "test/nondet \"twin "
+    ++ n
+    ++ ": "
+    ++ a.name
+    ++ "\" {\n  let over = fs::on_mem(fs::mem_empty(), || {\n    planted[data]("
+    ++ dir
+    ++ ");\n    tried_"
+    ++ n
+    ++ "[data]("
+    ++ dir
+    ++ ")\n  });\n  assert_eq(over.value, \""
+    ++ wanted
+    ++ "\")\n}\n\n"
+}
+
+/// The entry of a test report's list for the test whose name holds `name`.
+fn reported(list: Json, name: String) -> Json =
+  match filter(items(list), |r: Json| string_contains(str(at(r, "name")), name)) {
+    [r, ..] -> r,
+    [] -> Null,
+  }
+
+/// What is wrong with how one side of an attempt ended, if anything is.
+fn misjudged(report: Json, side: String, i: Int, a: Attempt) -> Option<String> / {abort.raise} = {
+  let n = int_to_string(i);
+  let name = side ++ " " ++ n ++ ": " ++ a.name;
+  let status = str(at(reported(at(report, "results"), name), "status"));
+  let failure = reported(at(report, "failures"), name);
+  let code = str(at(at(failure, "diagnostic"), "code"));
+  let said = name ++ ": " ++ status ++ " " ++ code ++ " "
+    ++ str(at(at(failure, "diagnostic"), "message"));
+  let refused = |what: String|
+    status == "failed" && (side != "disk" || code == "E0452")
+      && string_contains(shown(failure), "`" ++ what ++ "` leaves the root it was given");
+  let right = match a.held {
+    Answers(_) -> status == "passed",
+    Leaves(below) -> refused("k" ++ n ++ "/" ++ below),
+    LeavesAs(what) -> refused(what),
+  };
+  if right { None } else { Some(said) }
+}
+
+test/nondet "no operation reaches through a link that leads out of its root, on the disk or over the twin" {
+  fresh();
+  let tried = attempts();
+  let each = range(0, len(tried));
+  write(
+    "m.ply",
+    fold(each, escaping(), |text: String, i: Int|
+      match list_at(tried, i) { Some(a) -> text ++ tests_of(i, a), None -> text }),
+  );
+  write("out/secret", "s");
+  assert(fs.create_dir[cwd]("in"), None);
+  let report = tested(["--host", "--fs", "data=in"]);
+  assert(len(items(at(report, "results"))) == 2 * len(tried), Some(shown(report)));
+  let wrong = fold(each, [], |acc: List<String>, i: Int|
+    match list_at(tried, i) {
+      Some(a) ->
+        fold(["disk", "twin"], acc, |found: List<String>, side: String|
+          match misjudged(report, side, i, a) { Some(why) -> push(found, why), None -> found }),
+      None -> acc,
+    });
+  assert(len(wrong) == 0, Some(fold(wrong, "", |all: String, why: String| all ++ why ++ "\n")));
+  assert_eq(fs.list_dir[cwd]("out"), Some(["secret"]));
+  assert_eq(fs.read_file[cwd]("out/secret"), Some(b"s"))
 }
