@@ -476,6 +476,37 @@ fn every_map_operation_that_orders_a_key_refuses_a_secret() {
             ply_eval::Builtin::CompareValues,
             vec![secret.clone(), secret.clone()],
         ),
+        (
+            ply_eval::Builtin::MapFloor,
+            vec![Value::empty_map(), secret.clone()],
+        ),
+        (
+            ply_eval::Builtin::MapCeiling,
+            vec![Value::empty_map(), secret.clone()],
+        ),
+        (
+            ply_eval::Builtin::MapBelow,
+            vec![Value::empty_map(), secret.clone()],
+        ),
+        (
+            ply_eval::Builtin::MapAbove,
+            vec![Value::empty_map(), secret.clone()],
+        ),
+        (
+            ply_eval::Builtin::MapSplit,
+            vec![Value::empty_map(), secret.clone()],
+        ),
+        (
+            ply_eval::Builtin::MapRange,
+            vec![
+                Value::empty_map(),
+                Value::ctor("None", Vec::new()),
+                Value::Bool(true),
+                Value::ctor("Some", vec![secret.clone()]),
+                Value::Bool(true),
+                Value::Int(1),
+            ],
+        ),
     ];
     for (builtin, args) in cases {
         let refused = ply_eval::builtins::call(builtin, args, ply_eval::Span::DUMMY);
