@@ -1,0 +1,171 @@
+//! `std.kv` between processes: a directory has one store at a time, and what a writer had
+//! committed when it was killed is what the next process opens.
+
+import harness (program, spawned, speaking, listening, next_line, signal_to, ended, said, stdout,
+                Ran, Server, Here, Spawned, Clock)
+import std.fs (fs)
+import std.list (concat)
+import std.process (process, Kill)
+import std.string (int_of_string)
+import std.time (time)
+
+/// A program over the store in `db` of its root. `hold` commits two batches and keeps the store
+/// until it reads a line; `write` commits batches, saying each once it has answered, until it is
+/// killed; `ask N` asks for the lock `N` times and says what the store holds: how many batches,
+/// and whether both keys of each are there under its value and no other key is.
+fn source() -> String =
+  \\import std.kv
+  \\import std.kv (kv, Limits, Manual, Op, Put, Store, Why, Locked)
+  \\import std.bytes (repeat)
+  \\import std.fs (fs, Durable, Fast)
+  \\import std.process (process)
+  \\import std.random (entropy)
+  \\import std.string (int_of_string)
+  \\
+  \\fn limits() -> Limits = { key: 64, value: 8192, batch: 65536, file: 65536 }
+  \\
+  \\fn name(i: Int, side: String) -> Bytes = bytes_of_string("batch-" ++ int_to_string(i) ++ "-" ++ side)
+  \\
+  \\fn body(i: Int) -> Bytes / {abort.raise} = repeat(byte_of_int(97 + i % 26), 4096)
+  \\
+  \\fn pair_of(i: Int) -> List<Op> / {abort.raise} =
+  \\  [Put(name(i, "a"), body(i)), Put(name(i, "b"), body(i))]
+  \\
+  \\fn whole(s: Store) -> Bool / {fs.read[data], kv.refused, abort.raise} = {
+  \\  let snap = kv::snapshot(s);
+  \\  let batches = kv::stats(s).sequence;
+  \\  kv::count(snap) == 2 * batches
+  \\    && fold(range(1, batches + 1), true, |so_far: Bool, i: Int|
+  \\      so_far && kv::read[data](snap, name(i, "a")) == Some(body(i))
+  \\        && kv::read[data](snap, name(i, "b")) == Some(body(i)))
+  \\}
+  \\
+  \\fn run(
+  \\  mode: String,
+  \\  tries: Int,
+  \\) -> Unit / {fs.read[data], fs.write[data], process.read[proc], process.write[proc], entropy.next, kv.refused, abort.raise} =
+  \\  with_hold[store](
+  \\    kv::open[data]("db", limits(), Manual, kv::raw(), tries),
+  \\    |s: Store| kv::close[data](s),
+  \\  ) { opened -> {
+  \\    let s = hold_get(opened);
+  \\    let from = kv::stats(s).sequence;
+  \\    if mode == "hold" {
+  \\      kv::batch[data](kv::batch[data](s, pair_of(from + 1), Durable), pair_of(from + 2), Fast);
+  \\      process.out[proc]("holding");
+  \\      let _ = process.line[proc]();
+  \\      ()
+  \\    } else if mode == "write" {
+  \\      iterate({ store: s, i: from + 1 }, 1000000, |at: { store: Store, i: Int }| {
+  \\        let next = kv::batch[data](at.store, pair_of(at.i), if at.i % 2 == 0 { Durable } else { Fast });
+  \\        process.out[proc]("committed " ++ int_to_string(at.i));
+  \\        if at.i >= 999999 { Stop(()) } else { Continue({ store: next, i: at.i + 1 }) }
+  \\      })
+  \\    } else {
+  \\      process.out[proc]("opened " ++ int_to_string(from) ++ (if whole(s) { " whole" } else { " torn" }))
+  \\    }
+  \\  } }
+  \\
+  \\fn main() -> Unit / {fs.read[data], fs.write[data], process.read[proc], process.write[proc], entropy.next, abort.raise} = {
+  \\  let args = process.args[proc]();
+  \\  let mode = match list_at(args, 0) { Some(m) -> m, None -> "ask" };
+  \\  let tries = match list_at(args, 1) {
+  \\    Some(text) -> match int_of_string(text) { Some(count) -> count, None -> 1 },
+  \\    None -> 1,
+  \\  };
+  \\  let ran: Result<Unit, Why> = try[kv.refused] { run(mode, tries) };
+  \\  match ran {
+  \\    Ok(_) -> process.out[proc]("closed"),
+  \\    Err(Locked) -> process.out[proc]("refused: locked"),
+  \\    Err(_) -> process.out[proc]("refused"),
+  \\  }
+  \\}
+  \\
+
+fn run(args: List<String>) -> List<String> =
+  concat(["run", "m.ply", "--host", "--fs", "data=.", "--"], args)
+
+/// The next line the process writes that begins with `prefix`, with the prefix taken off.
+fn heard(server: Server, prefix: String) -> String / {Spawned, abort.raise, diverges} =
+  match next_line(server, 300000) {
+    Some(line) -> if string_starts_with(line, prefix) {
+      string_slice(line, string_len(prefix), string_len(line))
+    } else { heard(server, prefix) },
+    None ->
+      panic(
+        "the process ended, or wrote nothing in five minutes, before a line beginning `" ++ prefix
+          ++ "`",
+      ),
+  }
+
+/// What a process that asked for the store once says of it.
+fn asked() -> Ran / {Spawned, abort.raise} = spawned(run(["ask", "1"]), [])
+
+/// The batches a process found in the store it opened, and whether each was whole.
+fn opened(ran: Ran) -> Option<{ batches: Int, whole: Bool }> / {abort.raise} =
+  fold(ran.out, None, |found: Option<{ batches: Int, whole: Bool }>, line: String|
+    match string_split(string_trim(line), " ") {
+      ["opened", count, state] -> match int_of_string(count) {
+        Some(batches) -> Some({ batches: batches, whole: state == "whole" }),
+        None -> found,
+      },
+      _ -> found,
+    })
+
+test/nondet "a directory has one store at a time: a second process is refused it, or waits until the first has closed" {
+  program(source());
+  let holder = listening(run(["hold"]), []);
+  assert_eq(heard(holder, "holding"), "");
+  let refused = asked();
+  assert(string_contains(stdout(refused), "refused: locked"), Some(said(refused)));
+  let waiting = speaking(run(["ask", "60"]), []);
+  time.sleep_ms(2500);
+  let _ = process.input[ply](holder.child, b"go\n");
+  process.end_input[ply](holder.child);
+  assert_eq(heard(holder, "closed"), "");
+  assert_eq(heard(waiting, "opened "), "2 whole");
+  let _ = ended(holder, 60000, "the holder was still running a minute after it closed its store");
+  let _ = ended(
+    waiting,
+    60000,
+    "the second store was still running a minute after it said what it held",
+  );
+  ()
+}
+
+/// The greatest batch the writer says it committed in the lines it has yet to hand over, which
+/// is `so_far` where it says none.
+fn last_said(writer: Server, so_far: Int) -> Int / {Spawned, abort.raise, diverges} =
+  match next_line(writer, 2000) {
+    None -> so_far,
+    Some(line) ->
+      last_said(writer, if string_starts_with(line, "committed ") {
+        match int_of_string(string_slice(line, 10, string_len(line))) {
+          Some(i) -> i,
+          None -> so_far,
+        }
+      } else { so_far }),
+  }
+
+test/nondet "a store whose writer was killed opens, once its lock is old, to every batch the writer said it had committed, each whole" {
+  program(source());
+  let writer = speaking(run(["write"]), []);
+  assert_eq(heard(writer, "committed 40"), "");
+  signal_to(writer, Kill);
+  let said_last = last_said(writer, 40);
+  let _ = ended(writer, 60000, "the writer was still running a minute after it was killed");
+  let early = asked();
+  assert(string_contains(stdout(early), "refused: locked"), Some(said(early)));
+  assert(fs.set_modified[cwd]("db/lock", 0), Some("the dead writer left no lock to age"));
+  let after = asked();
+  let found = match opened(after) { Some(held) -> held, None -> panic(said(after)) };
+  assert(found.whole, Some(said(after)));
+  assert(
+    found.batches >= said_last && found.batches <= said_last + 1,
+    Some(
+      "the writer said it had committed " ++ int_to_string(said_last) ++ " and the store opened to "
+        ++ int_to_string(found.batches),
+    ),
+  );
+  assert_eq(opened(asked()), Some(found))
+}

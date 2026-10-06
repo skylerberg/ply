@@ -350,7 +350,8 @@ impl TcpHost {
             .note(format!("bind one beside the run: `--fs {root}=<directory>`"))
             .note("a Unix socket is a path, and a path is reached only under a root the run was given"));
         };
-        fs::confine(base, path, span)
+        // A path that leads nowhere goes to the system as written, which answers that nothing is there.
+        Ok(fs::confine(base, path, span)?.unwrap_or_else(|| base.join(path)))
     }
 
     /// The socket a handle names, for an operation that asks what it is.
