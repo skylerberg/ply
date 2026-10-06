@@ -1,0 +1,331 @@
+//! `std.net`'s and `std.udp`'s twins must answer as loopback does: each script here runs once over
+//! the sockets `--host` binds and once over the twin, and the two are compared line by line.
+
+import harness (fresh)
+import std.dns
+import std.dns (dns)
+import std.fs (fs)
+import std.ip
+import std.ip (SocketAddress, ip)
+import std.list (all, concat, contains)
+import std.net
+import std.net (net, Refusal)
+import std.show (show)
+import std.udp
+import std.udp (udp, Datagram)
+
+effect set Sockets = {net.read[listener], net.write[listener], net.read[conn], net.write[conn], net.read[client], net.write[client]}
+
+/// A refusal by its kind: what the host says of an `Other` is the platform's own.
+fn shown_refusal(why: Refusal) -> String =
+  match why {
+    net::Refused -> "refused",
+    net::Unreachable -> "unreachable",
+    net::TimedOut -> "timed out",
+    net::Reset -> "reset",
+    net::NameNotFound -> "no such name",
+    net::AddressInUse -> "address in use",
+    net::PermissionDenied -> "permission denied",
+    net::Injected -> "injected",
+    net::Untrusted -> "untrusted",
+    net::Handshake(_) -> "handshake",
+    net::Other(_, _) -> "other",
+  }
+
+/// A handle is the run's own number, so only whether there is one is compared.
+fn shown_opened(r: Result<Int, Refusal>) -> String =
+  match r { Ok(_) -> "open", Err(why) -> shown_refusal(why) }
+
+fn shown_set(r: Result<Unit, Refusal>) -> String =
+  match r { Ok(_) -> "ok", Err(why) -> shown_refusal(why) }
+
+fn shown_read(read: Option<Bytes>) -> String =
+  match read { Some(b) -> "\"" ++ string_of_bytes_lossy(b) ++ "\"", None -> "a deadline" }
+
+fn shown_sent(sent: Option<Int>) -> String =
+  match sent { Some(n) -> int_to_string(n), None -> "a deadline" }
+
+/// A port is the kernel's to choose, so only the address is compared.
+fn shown_ip(end: Option<SocketAddress>) -> String =
+  match end { Some(a) -> ip::render(ip::socket_ip(a)), None -> "none" }
+
+fn first_difference(host: List<String>, twin: List<String>) -> Option<String> =
+  fold(range(0, max(len(host), len(twin))), None, |found: Option<String>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> {
+        let h = match list_at(host, i) { Some(l) -> l, None -> "(nothing)" };
+        let t = match list_at(twin, i) { Some(l) -> l, None -> "(nothing)" };
+        if h == t { None } else { Some("the host answered\n  " ++ h ++ "\nand the twin\n  " ++ t) }
+      },
+    })
+
+fn agreeing(host: List<String>, twin: List<String>) -> Unit / {abort.raise} =
+  match first_difference(host, twin) { Some(why) -> panic(why), None -> () }
+
+/// A listener on a loopback port of the host's choosing, and where it is.
+fn listening(
+  text: String,
+) -> { socket: Int, here: SocketAddress } / {Sockets, ip.refused, abort.raise} = {
+  let socket = match net.listen_on[listener](ip::read_socket(text), []) {
+    Ok(l) -> l,
+    Err(why) -> panic("no listener at " ++ text ++ ": " ++ shown_refusal(why)),
+  };
+  match net.local_address[listener](socket) {
+    Some(here) -> { socket: socket, here: here },
+    None -> panic("a listener has an address"),
+  }
+}
+
+/// One connection over loopback, from its opening to a connection refused once its listener is
+/// closed.
+fn conversation() -> List<String> / {Sockets, ip.refused, abort.raise} = {
+  let l = listening("127.0.0.1:0");
+  let c = match net.connect_to[client](l.here, [], 5000) {
+    Ok(c) -> c,
+    Err(why) -> panic("the listener refused: " ++ shown_refusal(why)),
+  };
+  let s = net.accept[listener](l.socket);
+  let asked = net.send[client](c, b"ping", 5000);
+  let heard = net.recv[conn](s, 64, 5000);
+  net.close_write[client](c);
+  let ended = net.recv[conn](s, 64, 5000);
+  let after = net.send[client](c, b"more", 5000);
+  let answered = net.send[conn](s, b"pong", 5000);
+  let reply = net.recv[client](c, 64, 5000);
+  let opened = net.options[client](c);
+  let set = net.set_option[client](c, net::NoDelay(false));
+  let lines = [
+    "the listener is at " ++ shown_ip(Some(l.here)),
+    "its port is its address's: "
+      ++ show(net.local_port[listener](l.socket) == Some(ip::socket_port(l.here))),
+    "a client is seen from " ++ shown_ip(net.peer_address[conn](s)),
+    "the server sees the client's own end: "
+      ++ show(net.peer_address[conn](s) == net.local_address[client](c)),
+    "the client sees the listener's address: " ++ show(net.peer_address[client](c) == Some(l.here)),
+    "an accepted connection is at the listener's address: "
+      ++ show(net.local_address[conn](s) == Some(l.here)),
+    "a listener's far end is " ++ shown_ip(net.peer_address[listener](l.socket)),
+    "no one owns the far end of a TCP connection: " ++ show(net.peer_credentials[conn](s) == None),
+    "the client sent " ++ shown_sent(asked) ++ " and the server read " ++ shown_read(heard),
+    "after the client ends its sending the server reads " ++ shown_read(ended),
+    "and the client sends " ++ shown_sent(after),
+    "the server still sends " ++ shown_sent(answered) ++ ", read as " ++ shown_read(reply),
+    "a connection opens sending small writes at once: "
+      ++ show(contains(opened, net::NoDelay(true))),
+    "setting an option answers " ++ shown_set(set),
+    "and it reads back: " ++ show(contains(net.options[client](c), net::NoDelay(false))),
+    "a plaintext connection has a handshake to complete: "
+      ++ show(net.handshake[client](c) != None),
+    "a second listener at the address is " ++ shown_opened(net.listen_on[listener](l.here, [])),
+    "a listener beyond loopback is "
+      ++ shown_opened(net.listen_on[listener](ip::read_socket("192.0.2.1:8080"), [])),
+  ];
+  net.close[client](c);
+  net.close[conn](s);
+  net.close[listener](l.socket);
+  push(
+    lines,
+    "once its listener is closed a connection there is "
+      ++ shown_opened(net.connect_to[client](l.here, [], 5000)),
+  )
+}
+
+test/nondet "the network's twin answers a connection over loopback as the sockets do" {
+  let host = conversation();
+  agreeing(host, net::on_mem(net::mem_empty(), || conversation()).value);
+  assert_eq(list_at(host, 2), Some("a client is seen from 127.0.0.1"));
+  assert_eq(list_at(host, 3), Some("the server sees the client's own end: true"))
+}
+
+test/nondet "over IPv6 loopback a connection's far end is `::1`, where the machine has IPv6" {
+  match net.listen_on[listener](ip::read_socket("[::1]:0"), []) {
+    // No IPv6 on this machine: there is nothing to connect over.
+    Err(_) -> (),
+    Ok(socket) -> {
+      let here = match net.local_address[listener](socket) {
+        Some(here) -> here,
+        None -> panic("a listener has an address"),
+      };
+      let c = match net.connect_to[client](here, [], 5000) {
+        Ok(c) -> c,
+        Err(why) -> panic("the listener refused: " ++ shown_refusal(why)),
+      };
+      let s = net.accept[listener](socket);
+      let seen = net.peer_address[conn](s);
+      let own = net.local_address[client](c);
+      net.close[client](c);
+      net.close[conn](s);
+      net.close[listener](socket);
+      assert_eq(shown_ip(seen), "::1");
+      assert_eq(seen, own)
+    },
+  }
+}
+
+/// A name looked up, and dialled to a listener that only one of its addresses reaches.
+fn by_name() -> List<String> / {Sockets, dns.lookup, ip.refused, abort.raise} = {
+  let l = listening("127.0.0.1:0");
+  let found = dns.lookup("localhost", 5000);
+  let dialled: Result<Int, Refusal> = try {
+    net::dial[client]("localhost", ip::socket_port(l.here), [], 5000)
+  };
+  let lines = [
+    "localhost resolves to loopback and nothing else: "
+      ++ (match found {
+        Ok(addresses) ->
+          show(
+            len(addresses) > 0
+              && all(addresses, |f: dns::Found| ip::is_loopback(f.address) && f.ttl == None),
+          ),
+        Err(_) -> "no answer",
+      }),
+    "an address written as text answers itself: "
+      ++ show(dns.lookup("192.0.2.7", 5000) == Ok([{ address: ip::read("192.0.2.7"), ttl: None }])),
+    "the name dials the address that listens: "
+      ++ (match dialled {
+        Ok(c) -> shown_ip(net.peer_address[client](c)),
+        Err(why) -> shown_refusal(why),
+      }),
+  ];
+  match dialled { Ok(c) -> net.close[client](c), Err(_) -> () };
+  net.close[listener](l.socket);
+  lines
+}
+
+test/nondet "a name is looked up and dialled over the twin as the system's resolver has it" {
+  let host = by_name();
+  // The order a resolver may give: the address nothing listens at first.
+  let names = dns::with_name(dns::table(), "localhost", [ip::read("::1"), ip::read("127.0.0.1")]);
+  agreeing(host, net::on_mem(net::mem_resolving(net::mem_empty(), names), || by_name()).value);
+  assert_eq(list_at(host, 2), Some("the name dials the address that listens: 127.0.0.1"))
+}
+
+fn too_long() -> String = "the path is longer than a socket's address holds"
+
+/// One connection over a Unix socket under the working directory, whose `n` is there.
+fn over_a_path() -> List<String> / {Sockets, abort.raise} =
+  match net.listen_unix[listener]("cwd", "n/a.sock") {
+    Err(net::Other(_, _)) -> [too_long()],
+    Err(why) -> panic("no listener at the path: " ++ shown_refusal(why)),
+    Ok(l) -> {
+      let twice = net.listen_unix[listener]("cwd", "n/a.sock");
+      let c = match net.connect_unix[client]("cwd", "n/a.sock", 5000) {
+        Ok(c) -> c,
+        Err(why) -> panic("the listener refused: " ++ shown_refusal(why)),
+      };
+      let s = net.accept[listener](l);
+      let asked = net.send[client](c, b"over a path", 5000);
+      let heard = net.recv[conn](s, 64, 5000);
+      let lines = [
+        "a second listener at the path is " ++ shown_opened(twice),
+        "the client sent " ++ shown_sent(asked) ++ " and the server read " ++ shown_read(heard),
+        "neither end has an address: " ++ shown_ip(net.peer_address[conn](s)) ++ " and "
+          ++ shown_ip(net.local_address[client](c)),
+        "the listener has no port: " ++ show(net.local_port[listener](l) == None),
+      ];
+      net.close[client](c);
+      net.close[conn](s);
+      net.close[listener](l);
+      let nobody = net.connect_unix[client]("cwd", "n/a.sock", 5000);
+      let again = net.listen_unix[listener]("cwd", "n/a.sock");
+      match again { Ok(second) -> net.close[listener](second), Err(_) -> () };
+      concat(lines, [
+        "with its listener closed the path is " ++ shown_opened(nobody),
+        "and free to be listened at again: " ++ shown_opened(again),
+      ])
+    },
+  }
+
+test/nondet "the twin answers a Unix socket as a path under a root does" {
+  fresh();
+  assert(fs.create_dir[cwd]("n"));
+  let host = over_a_path();
+  // A working directory too deep for a socket's address is refused as `Other`, by the platform's
+  // limit and not by anything here, and there is no conversation to compare.
+  if host == [too_long()] { () }
+  else { agreeing(host, net::on_mem(net::mem_empty(), || over_a_path()).value) };
+  assert(!fs.exists[cwd]("n/a.sock"), Some("a closed listener leaves no socket behind"))
+}
+
+test/nondet "the far end of a Unix socket has an owner" {
+  fresh();
+  assert(fs.create_dir[cwd]("n"));
+  match net.listen_unix[listener]("cwd", "n/o.sock") {
+    Err(net::Other(_, _)) -> (),
+    Err(why) -> panic("no listener at the path: " ++ shown_refusal(why)),
+    Ok(l) -> {
+      let c = match net.connect_unix[client]("cwd", "n/o.sock", 5000) {
+        Ok(c) -> c,
+        Err(why) -> panic("the listener refused: " ++ shown_refusal(why)),
+      };
+      let s = net.accept[listener](l);
+      let owner = net.peer_credentials[conn](s);
+      net.close[client](c);
+      net.close[conn](s);
+      net.close[listener](l);
+      assert(owner != None, Some("the client is this process, which has a user"))
+    },
+  }
+}
+
+fn shown_datagram(received: Result<Datagram, Refusal>, sender: Option<SocketAddress>) -> String =
+  match received {
+    Ok(d) ->
+      "\"" ++ string_of_bytes_lossy(d.payload) ++ "\""
+        ++ (if Some(d.from) == sender { " from its sender" } else { " from elsewhere" })
+        ++ (if d.truncated { ", cut" } else { ", whole" }),
+    Err(why) -> shown_refusal(why),
+  }
+
+fn shown_count(sent: Result<Int, Refusal>) -> String =
+  match sent { Ok(n) -> int_to_string(n), Err(why) -> shown_refusal(why) }
+
+fn datagram_socket<[l]>(text: String) -> Int / {udp.bind[l], ip.refused, abort.raise} =
+  match udp.bind[l](ip::read_socket(text), []) {
+    Ok(socket) -> socket,
+    Err(why) -> panic("no socket at " ++ text ++ ": " ++ shown_refusal(why)),
+  }
+
+/// Datagrams between two sockets over loopback.
+fn datagrams() -> List<String> / {udp.read[near], udp.write[near], udp.read[far], udp.write[far], ip.refused, abort.raise} = {
+  let near = datagram_socket[near]("127.0.0.1:0");
+  let far = datagram_socket[far]("127.0.0.1:0");
+  let from = udp.local_address[near](near);
+  let to = match udp.local_address[far](far) {
+    Some(to) -> to,
+    None -> panic("a bound socket has an address"),
+  };
+  let long = udp.send_to[near](near, to, b"0123456789", 5000);
+  let cut = udp.recv_from[far](far, 4, 5000);
+  let short = udp.send_to[near](near, to, b"abcd", 5000);
+  let whole = udp.recv_from[far](far, 4, 5000);
+  let quiet = udp.recv_from[far](far, 64, 50);
+  let fixed = udp.connect[near](near, to);
+  let direct = udp.send[near](near, b"hello", 5000);
+  let heard = udp.recv_from[far](far, 64, 5000);
+  let allowed = udp.set_option[near](near, net::Broadcast(true));
+  let lines = [
+    "both sockets are at " ++ shown_ip(from) ++ " and " ++ shown_ip(Some(to)),
+    "sent " ++ shown_count(long) ++ " and received " ++ shown_datagram(cut, from),
+    "sent " ++ shown_count(short) ++ " and received " ++ shown_datagram(whole, from),
+    "nothing more arrives: " ++ shown_datagram(quiet, from),
+    "a socket's far end is fixed: " ++ shown_set(fixed),
+    "and it sends there, " ++ shown_count(direct) ++ ", received as "
+      ++ shown_datagram(heard, from),
+    "broadcast is set: " ++ shown_set(allowed) ++ ", and reads back: "
+      ++ show(contains(udp.options[near](near), net::Broadcast(true))),
+    "a second socket at the address is " ++ shown_opened(udp.bind[far](to, [])),
+    "a socket at every address and a port is "
+      ++ shown_opened(udp.bind[far](ip::read_socket("0.0.0.0:5353"), [])),
+  ];
+  udp.close[near](near);
+  udp.close[far](far);
+  lines
+}
+
+test/nondet "the datagram twin answers as loopback does" {
+  let host = datagrams();
+  agreeing(host, udp::on_mem(udp::mem_empty(), || datagrams()).value);
+  assert_eq(list_at(host, 1), Some("sent 10 and received \"0123\" from its sender, cut"))
+}
