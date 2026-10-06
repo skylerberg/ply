@@ -1,17 +1,124 @@
-//! Percent-encoding, the form dialect, and query strings.
+//! URLs as RFC 3986 writes them: reading, resolving, normalizing, percent-encoding and query
+//! strings.
 //!
-//! RFC 3986 §2.1 is `url_encode`/`url_decode`: every byte that is not unreserved (`A-Za-z0-9-._~`)
-//! becomes `%XX` with upper-case hex. `application/x-www-form-urlencoded` is `form_encode`/
-//! `form_decode`, which spells a space `+`; it is what a query string and a form body carry, and why
-//! `query_parse`/`query_build` use it. A decoder answers `None` for a `%` not followed by two hex
-//! digits or for bytes that are not UTF-8. Everything is pure and total.
+//! A `Url` is an absolute URI: a scheme, then an optional authority (userinfo, host, port), a
+//! path, an optional query and an optional fragment. A `Reference` is what a document writes
+//! where a URL is meant, which may leave the scheme and more to a base; `url_resolve` makes one
+//! a `Url` against a base (§5.2), so nothing that takes a `Url` can be handed a relative
+//! reference. Only this module builds either, by reading text.
+//!
+//! The grammar is RFC 3986's, exactly, and not the WHATWG URL Standard's, which is what browsers
+//! do: this reader repairs nothing. A backslash, a tab, a newline, a space, a byte outside ASCII
+//! and a `%` that is no escape are refused wherever they stand, a second `@` is refused, and
+//! nothing is trimmed, so a text is read one way or not at all. The two standards differ where
+//! a validator and a fetcher that read one text two ways are led to different hosts, which is
+//! how server-side request forgery and open redirects happen. A refusal says where and why:
+//! `url_parse` answers it as an `Err` and `url_read` raises it.
+//!
+//! A host is typed: a `Name`, an IPv4 address or an IPv6 address, the last two `std.ip`'s and
+//! read by its strict readers. RFC 3986 takes any host that is not four decimal octets for a
+//! registered name, and other readers take `127.1`, `0x7f.0.0.1` and `2130706433` for
+//! addresses; a host whose last label is a number is therefore an address or refused
+//! (`NumericHost`), never a name. A percent-encoded host is refused (`EncodedHost`), and so is
+//! one outside ASCII: an internationalized name is read once `std.unicode` can make its
+//! A-labels, and until then a caller writes them (`xn--...`). A zone in brackets and an address
+//! of a future version are refused. `[::ffff:127.0.0.1]` is the IPv6 address it writes;
+//! `std.ip`'s classifiers read it as the IPv4 address it maps.
+//!
+//! A `Url` keeps its text: `url_render` of what `url_parse` read is the text read, to the
+//! character, and two URLs are equal, and order, as their texts do. So a program that checks a
+//! URL and hands it on hands on what it checked. The accessors answer what comparing spellings
+//! gets wrong: `url_scheme` is in lower case, `url_host` is typed with its name in lower case,
+//! and `url_port` is a number. `url_normalized` is the URL RFC 3986 §6.2.2 and §6.2.3 call
+//! equivalent: scheme and host in lower case, escapes in upper case, escaped unreserved
+//! characters written plain, dot segments removed, an empty path beside an authority made `/`,
+//! and a port that is empty or its scheme's default (`http`, `https`, `ws`, `wss`, `ftp`)
+//! dropped. Nothing normalizes unasked, since what is equivalent depends on the scheme; compare
+//! `url_normalized` of each to ask whether two URLs are.
+//!
+//! `show`, and so an interpolated string, writes `url_redacted`: the text with a password in
+//! the userinfo hidden, as §3.2.1 asks. `url_render` writes it.
+//!
+//! The path is kept as written, and `url_path_segments` decodes it segment by segment, so an
+//! escaped `/` is never a separator. A query is text; `url_query_pairs` reads it as
+//! `query_parse` does, and `url_set_param` and its siblings write it back as `query_build` does.
+//!
+//! Percent-encoding: RFC 3986 §2.1 is `url_encode`/`url_decode`: every byte that is not
+//! unreserved (`A-Za-z0-9-._~`) becomes `%XX` with upper-case hex.
+//! `application/x-www-form-urlencoded` is `form_encode`/`form_decode`, which spells a space `+`;
+//! it is what a query string and a form body carry, and why `query_parse`/`query_build` use it.
+//! A decoder answers `None` for a `%` not followed by two hex digits or for bytes that are not
+//! UTF-8.
+//!
+//! With `import std.url`, `url"https://example.com/a?b#c"` is a URL checked when the program is.
 
+import std.bytes (peek, scan, scan_until)
+import std.gen
+import std.gen (Gen)
+import std.ip
+import std.ip (Ipv4, Ipv6)
+import std.laws (idempotent, round_trip)
+import std.list (all, any, at_or, concat, drop, find, take)
+import std.option (option_traverse, option_unwrap_or)
+import std.result (result_ok)
+import std.show (show)
 import std.string
-import std.laws (round_trip)
-import std.option (option_traverse)
 
 /// One `name=value` part of a query string, decoded.
 pub type Pair = { name: String, value: String }
+
+/// What a URL's authority names.
+pub type Host =
+  /// A registered name in lower case, never empty: usually a DNS name, though any text of RFC
+  /// 3986's unreserved characters and sub-delimiters is one.
+  | Name(String)
+  /// An IPv4 address, written as four decimal octets.
+  | V4(Ipv4)
+  /// An IPv6 address, written in brackets.
+  | V6(Ipv6)
+
+type Scheme = { written: String, name: String }
+
+type Authority = {
+  userinfo: Option<String>,
+  /// The userinfo with what follows its first `:` hidden.
+  discreet: Option<String>,
+  /// As written, brackets included.
+  host: String,
+  named: Option<Host>,
+  /// The digits after the host's `:`, as written.
+  port: Option<String>,
+  number: Option<Int>,
+}
+
+type Parts = {
+  scheme: Option<Scheme>,
+  authority: Option<Authority>,
+  path: String,
+  query: Option<String>,
+  fragment: Option<String>,
+}
+
+/// An absolute URL: RFC 3986's URI, which has a scheme. It holds its text as it was read.
+pub opaque type Url = | Url(String, Parts)
+
+/// A URI reference: a URL, or a relative reference that leaves its scheme, and perhaps its
+/// authority and part of its path, to the base it is resolved against.
+pub opaque type Reference = | Reference(String, Parts)
+
+key for Url by url_render
+
+show for Url by url_redacted
+
+gen for Url by url_gen
+
+key for Reference by reference_render
+
+show for Reference by reference_redacted
+
+gen for Reference by reference_gen
+
+// --- Percent-encoding -------------------------------------------------------
 
 /// RFC 3986 percent-encoding: every byte outside the unreserved set as `%XX`.
 pub fn url_encode(text: String) -> String / {abort.raise} =
@@ -38,6 +145,28 @@ pub fn query_parse(query: String) -> Option<List<Pair>> / {abort.raise} =
 /// The query string a list of pairs spells, in the order given, each side form-encoded.
 pub fn query_build(pairs: List<Pair>) -> String / {abort.raise} =
   string::join(map(pairs, |p: Pair| form_encode(p.name) ++ "=" ++ form_encode(p.value)), "&")
+
+/// The value of the first pair named `name`, or `None` where there is none.
+pub fn query_get(pairs: List<Pair>, name: String) -> Option<String> =
+  match find(pairs, |p: Pair| p.name == name) { Some(p) -> Some(p.value), None -> None }
+
+/// The pairs with `name` given `value`: the first pair of that name takes the value where it
+/// stands and any later one is dropped, and a name the pairs do not hold is added last.
+pub fn query_set(pairs: List<Pair>, name: String, value: String) -> List<Pair> = {
+  let set = fold(
+    pairs,
+    { seen: false, kept: [] },
+    |s: { seen: Bool, kept: List<Pair> }, p: Pair|
+      if p.name != name { { seen: s.seen, kept: push(s.kept, p) } }
+      else if s.seen { s }
+      else { { seen: true, kept: push(s.kept, { name: name, value: value }) } },
+  );
+  if set.seen { set.kept } else { push(set.kept, { name: name, value: value }) }
+}
+
+/// The pairs without any named `name`, the rest in their order.
+pub fn query_remove(pairs: List<Pair>, name: String) -> List<Pair> =
+  filter(pairs, |p: Pair| p.name != name)
 
 fn query_pair(part: String) -> Option<Pair> / {abort.raise} =
   if string_contains(part, "=") {
@@ -97,13 +226,1852 @@ fn hex_value(c: Int) -> Int =
   else if c >= 65 && c <= 70 { c - 55 }
   else { 0 - 1 }
 
+// --- Reading ----------------------------------------------------------------
+
+/// Why a text is refused.
+pub type Why =
+  /// A byte outside ASCII. A URL writes one percent-encoded, and an internationalized host as
+  /// its A-labels.
+  | NotAscii
+  /// A control character, a space, or one of `"<>\^{|}` and the backquote, which no part of a
+  /// URL holds unencoded.
+  | Forbidden
+  /// A `%` that two hex digits do not follow.
+  | BadEscape
+  /// No scheme: the text is a relative reference, which `reference_parse` reads.
+  | NoScheme
+  /// What stands before the first `:` is no scheme: a letter, then letters, digits, `+`, `-`
+  /// and `.`. A relative path whose first segment holds a `:` is written `./a:b`.
+  | BadScheme
+  /// A second `@` in the authority: userinfo holds none unencoded.
+  | SecondAt
+  /// A `[` opens an address and no `]` closes it.
+  | OpenBracket
+  /// The brackets hold an address of a future version (`[v1.x]`), which is not read.
+  | FutureAddress
+  /// The host is no IP address, and `std.ip` says why: in brackets it is no IPv6 address, and
+  /// outside them it is digits and dots that are not four decimal octets.
+  | Address(ip::Why)
+  /// The host's last label is a number and the host is not four decimal octets: other readers
+  /// take `127.1`, `0x7f.1` and `2130706433` for addresses.
+  | NumericHost
+  /// A `%` in the host. An internationalized name is written as its A-labels.
+  | EncodedHost
+  /// The port holds something other than decimal digits.
+  | BadPort
+  /// The port is past 65535.
+  | PortRange
+  /// A character that cannot stand here unencoded: a `[` or `]` outside a host's brackets, or a
+  /// `#` in a fragment.
+  | Stray
+
+/// A refusal, and the offset in the text the reader stood at. Nothing outside ASCII is passed
+/// over, so the offset counts bytes and characters alike.
+pub type Refusal = { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect url {
+  /// The text is not a URL, or not a reference.
+  raise refused(e: Refusal)
+}
+
+/// A refusal's reason as a sentence, which is what a literal's diagnostic says.
+pub fn url_reason(why: Why) -> String =
+  match why {
+    NotAscii -> "a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    Forbidden -> "no part of a URL holds this character unencoded",
+    BadEscape -> "two hex digits follow a `%`",
+    NoScheme -> "a URL starts with a scheme and a `:`",
+    BadScheme -> "a scheme is a letter, then letters, digits, `+`, `-` and `.`",
+    SecondAt -> "an authority holds one `@` at most",
+    OpenBracket -> "a `]` closes the address a `[` opens",
+    FutureAddress -> "an address of a future version is not read",
+    Address(inner) -> "the host is no address: " ++ ip::reason(inner),
+    NumericHost -> "a host that ends in a number is four decimal octets",
+    EncodedHost -> "a host holds no percent-encoding",
+    BadPort -> "a port is decimal digits",
+    PortRange -> "a port is at most 65535",
+    Stray -> "this character cannot stand here unencoded",
+  }
+
+fn refuse<a>(at: Int, why: Why) -> a / {url.refused} = url.refused({ at: at, why: why })
+
+/// The URL `text` writes, or where and why it is not one.
+pub fn url_parse(text: String) -> Result<Url, Refusal> / {abort.raise} = try { url_read(text) }
+
+/// The URL `text` writes, raising `url.refused` where `url_parse` answers `Err`.
+pub fn url_read(text: String) -> Url / {url.refused, abort.raise} = {
+  let parts = sectioned(text);
+  match parts.scheme { Some(_) -> Url(text, parts), None -> refuse(0, NoScheme) }
+}
+
+/// The reference `text` writes, a URL or a relative reference, or where and why it is neither.
+pub fn reference_parse(text: String) -> Result<Reference, Refusal> / {abort.raise} =
+  try { reference_read(text) }
+
+/// The reference `text` writes, raising `url.refused` where `reference_parse` answers `Err`.
+pub fn reference_read(text: String) -> Reference / {url.refused, abort.raise} =
+  Reference(text, sectioned(text))
+
+/// What a `url"..."` literal is checked by: the URL the text writes, or the character that keeps
+/// it from being one.
+pub fn literal(text: String) -> Result<Url, { message: String, offset: Int }> / {abort.raise} =
+  match url_parse(text) {
+    Ok(u) -> Ok(u),
+    Err(refused) -> Err({ message: url_reason(refused.why), offset: refused.at }),
+  }
+
+fn letters() -> Bytes = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+fn decimal_digits() -> Bytes = b"0123456789"
+
+fn scheme_bytes() -> Bytes = bytes_concat_all([letters(), decimal_digits(), b"+-."])
+
+/// RFC 3986's unreserved characters and sub-delimiters: what a registered name is made of.
+fn name_bytes() -> Bytes = bytes_concat_all([letters(), decimal_digits(), b"-._~!$&'()*+,;="])
+
+fn userinfo_bytes() -> Bytes = bytes_concat(name_bytes(), b":%")
+
+fn path_bytes() -> Bytes = bytes_concat(name_bytes(), b":@%/")
+
+fn query_bytes() -> Bytes = bytes_concat(path_bytes(), b"?")
+
+/// Every byte some part of a URL holds.
+fn url_bytes() -> Bytes = bytes_concat(query_bytes(), b"#[]")
+
+/// The parts of a URL or a relative reference, each checked against its own grammar.
+fn sectioned(text: String) -> Parts / {url.refused, abort.raise} = {
+  let b = vetted(bytes_of_string(text));
+  let n = bytes_len(b);
+  let hier = scheme_end(b);
+  let slashed = bytes_starts_with(bytes_slice(b, hier, n), b"//");
+  let path_from = if slashed { scan_until(b, hier + 2, b"/?#") } else { hier };
+  let path_to = scan_until(b, path_from, b"?#");
+  let query_to = if peek(b, path_to) == b'?' { scan_until(b, path_to, b"#") } else { path_to };
+  {
+    scheme: if hier == 0 { None }
+    else { Some(scheme_of(string_of_bytes(bytes_slice(b, 0, hier - 1)))) },
+    authority: if slashed { Some(authority_of(bytes_slice(b, hier + 2, path_from), hier + 2)) }
+    else { None },
+    path: part(b, path_from, path_to, path_bytes(), 0),
+    query: if query_to > path_to { Some(part(b, path_to + 1, query_to, query_bytes(), 0)) }
+    else { None },
+    fragment: if query_to < n { Some(part(b, query_to + 1, n, query_bytes(), 0)) } else { None },
+  }
+}
+
+/// `b`, refusing the first byte no URL holds and the first `%` that is no escape.
+fn vetted(b: Bytes) -> Bytes / {url.refused, abort.raise} = {
+  let n = bytes_len(b);
+  let stop = scan(b, 0, url_bytes());
+  if stop < n { refuse(stop, if bytes_at(b, stop) >= 128 { NotAscii } else { Forbidden }) } else {
+    let bad = iterate(0, n + 1, |at: Int| {
+      let mark = scan_until(b, at, b"%");
+      if mark >= n { Stop(n) }
+      else if hex_value(peek(b, mark + 1)) < 0 || hex_value(peek(b, mark + 2)) < 0 { Stop(mark) }
+      else { Continue(mark + 3) }
+    });
+    if bad < n { refuse(bad, BadEscape) } else { b }
+  }
+}
+
+/// Just past the `:` that ends a scheme, or 0 where the text has none.
+fn scheme_end(b: Bytes) -> Int / {url.refused, abort.raise} = {
+  let stop = scan_until(b, 0, b":/?#");
+  if peek(b, stop) != b':' { 0 }
+  else if stop > 0 && scan(b, 0, letters()) > 0 && scan(b, 0, scheme_bytes()) == stop { stop + 1 }
+  else { refuse(0, BadScheme) }
+}
+
+fn scheme_of(written: String) -> Scheme / {abort.raise} =
+  { written: written, name: string::to_lower(written) }
+
+/// The text of `b` from `from` to `to`, every byte of which is in `set`; `b` stands at `base` in
+/// its text.
+fn part(
+  b: Bytes,
+  from: Int,
+  to: Int,
+  set: Bytes,
+  base: Int,
+) -> String / {url.refused, abort.raise} =
+  if scan(b, from, set) < to { refuse(base + scan(b, from, set), Stray) }
+  else { string_of_bytes(bytes_slice(b, from, to)) }
+
+/// The authority `a` writes, which stands at `base` in its text.
+fn authority_of(a: Bytes, base: Int) -> Authority / {url.refused, abort.raise} = {
+  let n = bytes_len(a);
+  let at = scan_until(a, 0, b"@");
+  let from = if at < n { at + 1 } else { 0 };
+  let userinfo = if at < n { Some(part(a, 0, at, userinfo_bytes(), base)) } else { None };
+  if scan_until(a, from, b"@") < n { refuse(base + scan_until(a, from, b"@"), SecondAt) } else {
+    let to = if peek(a, from) == b'[' { bracket_end(a, from, base) }
+    else { scan_until(a, from, b":") };
+    {
+      userinfo: userinfo,
+      discreet: match userinfo { Some(written) -> Some(discreet_of(written)), None -> None },
+      host: string_of_bytes(bytes_slice(a, from, to)),
+      named: host_of(a, from, to, base),
+      port: if to < n { Some(string_of_bytes(bytes_slice(a, to + 1, n))) } else { None },
+      number: if to < n { port_of(a, to + 1, base) } else { None },
+    }
+  }
+}
+
+/// Just past the `]` of the address that opens at `from`, where a `:` or the end stands.
+fn bracket_end(a: Bytes, from: Int, base: Int) -> Int / {url.refused, abort.raise} = {
+  let close = scan_until(a, from, b"]");
+  if close >= bytes_len(a) { refuse(base + from, OpenBracket) }
+  else if close + 1 < bytes_len(a) && bytes_at(a, close + 1) != b':' {
+    refuse(base + close + 1, Stray)
+  } else { close + 1 }
+}
+
+fn host_of(a: Bytes, from: Int, to: Int, base: Int) -> Option<Host> / {url.refused, abort.raise} =
+  if from == to { None } else if bytes_at(a, from) == b'[' {
+    Some(V6(bracketed(bytes_slice(a, from + 1, to - 1), base + from + 1)))
+  } else { Some(named_host(bytes_slice(a, from, to), base + from)) }
+
+fn bracketed(inside: Bytes, base: Int) -> Ipv6 / {url.refused, abort.raise} =
+  if peek(inside, 0) | 32 == b'v' { refuse(base, FutureAddress) } else {
+    match ip::parse_v6(string_of_bytes(inside)) {
+      Ok(six) -> six,
+      Err(refused) -> refuse(base + refused.at, Address(refused.why)),
+    }
+  }
+
+/// The host a text with no brackets names: four decimal octets, or a registered name no reader
+/// takes for a number.
+fn named_host(h: Bytes, base: Int) -> Host / {url.refused, abort.raise} = {
+  let n = bytes_len(h);
+  let stop = scan(h, 0, name_bytes());
+  if stop < n { refuse(base + stop, if bytes_at(h, stop) == b'%' { EncodedHost } else { Stray }) }
+  else {
+    match ip::parse_v4(string_of_bytes(h)) {
+      Ok(four) -> V4(four),
+      Err(refused) -> if scan(h, 0, b"0123456789.") >= n {
+        refuse(base + refused.at, Address(refused.why))
+      } else if ends_in_number(h) { refuse(base, NumericHost) }
+      else { Name(string::to_lower(string_of_bytes(h))) },
+    }
+  }
+}
+
+/// Whether the host's last label, a final `.` aside, is decimal digits or `0x` and hex digits.
+fn ends_in_number(h: Bytes) -> Bool / {abort.raise} = {
+  let n = bytes_len(h);
+  let labels = bytes_split(
+    if bytes_ends_with(h, b".") { bytes_slice(h, 0, n - 1) } else { h },
+    b".",
+  );
+  let last = at_or(labels, len(labels) - 1, b"");
+  let m = bytes_len(last);
+  m > 0
+    && (scan(last, 0, decimal_digits()) == m
+    || (m >= 2 && bytes_at(last, 0) == b'0' && bytes_at(last, 1) | 32 == b'x'
+    && scan(last, 2, b"0123456789abcdefABCDEF") == m))
+}
+
+/// The port the digits from `from` to the end of `a` write, or `None` where there are none.
+fn port_of(a: Bytes, from: Int, base: Int) -> Option<Int> / {url.refused, abort.raise} = {
+  let n = bytes_len(a);
+  let digits = scan(a, from, b"0");
+  if scan(a, from, decimal_digits()) < n { refuse(base + scan(a, from, decimal_digits()), BadPort) }
+  else if from >= n { None }
+  else if n - digits > 5 { refuse(base + from, PortRange) } else {
+    let number = fold(range(digits, n), 0, |acc: Int, i: Int| acc * 10 + bytes_at(a, i) - b'0');
+    if number > 65535 { refuse(base + from, PortRange) } else { Some(number) }
+  }
+}
+
+/// Userinfo with what follows its first `:` hidden, unless nothing follows it.
+fn discreet_of(userinfo: String) -> String / {abort.raise} = {
+  let b = bytes_of_string(userinfo);
+  let colon = scan_until(b, 0, b":");
+  if colon + 1 >= bytes_len(b) { userinfo }
+  else { string_of_bytes(bytes_slice(b, 0, colon + 1)) ++ "xxxxx" }
+}
+
+// --- Writing ----------------------------------------------------------------
+
+/// RFC 3986 §5.3: the parts written one after another.
+fn composed(parts: Parts, discreet: Bool) -> String =
+  (match parts.scheme { Some(scheme) -> scheme.written ++ ":", None -> "" })
+    ++ (match parts.authority { Some(a) -> "//" ++ authority_text(a, discreet), None -> "" })
+    ++ parts.path
+    ++ (match parts.query { Some(query) -> "?" ++ query, None -> "" })
+    ++ (match parts.fragment { Some(fragment) -> "#" ++ fragment, None -> "" })
+
+fn authority_text(a: Authority, discreet: Bool) -> String =
+  (match if discreet { a.discreet } else { a.userinfo } { Some(u) -> u ++ "@", None -> "" })
+    ++ a.host
+    ++ (match a.port { Some(port) -> ":" ++ port, None -> "" })
+
+/// The URL's text, which is the text it was read from.
+pub fn url_render(u: Url) -> String = match u { Url(text, _) -> text }
+
+/// The URL's text with a password hidden: what follows the first `:` of its userinfo is written
+/// `xxxxx`. This is what `show` writes.
+pub fn url_redacted(u: Url) -> String = match u { Url(_, parts) -> composed(parts, true) }
+
+/// The reference's text, which is the text it was read from.
+pub fn reference_render(r: Reference) -> String = match r { Reference(text, _) -> text }
+
+/// The reference's text with a password hidden, as `url_redacted` hides one.
+pub fn reference_redacted(r: Reference) -> String =
+  match r { Reference(_, parts) -> composed(parts, true) }
+
+/// The URL as a reference, which resolves to it against any base, dot segments aside.
+pub fn reference_of(u: Url) -> Reference = match u { Url(text, parts) -> Reference(text, parts) }
+
+/// The URL a reference is where it has a scheme, and `None` for a relative reference.
+pub fn reference_url(r: Reference) -> Option<Url> =
+  match r {
+    Reference(text, parts) -> match parts.scheme {
+      Some(_) -> Some(Url(text, parts)),
+      None -> None,
+    },
+  }
+
+// --- The parts --------------------------------------------------------------
+
+fn parts_of(u: Url) -> Parts = match u { Url(_, parts) -> parts }
+
+/// The scheme in lower case, whatever case it was written in.
+pub fn url_scheme(u: Url) -> String =
+  match parts_of(u).scheme { Some(scheme) -> scheme.name, None -> "" }
+
+/// The authority as written, without its `//`: userinfo, host and port. `None` where the URL
+/// has none, as `mailto:a@example.com` has none.
+pub fn url_authority(u: Url) -> Option<String> =
+  match parts_of(u).authority { Some(a) -> Some(authority_text(a, false)), None -> None }
+
+/// The userinfo as written, without its `@`. `None` where the URL has none.
+pub fn url_userinfo(u: Url) -> Option<String> =
+  match parts_of(u).authority { Some(a) -> a.userinfo, None -> None }
+
+/// The host the authority names. `None` where the URL has no authority or its host is empty, as
+/// in `file:///etc/hosts`.
+pub fn url_host(u: Url) -> Option<Host> =
+  match parts_of(u).authority { Some(a) -> a.named, None -> None }
+
+/// The host and port as written, without userinfo: what an HTTP `Host` field carries. `None`
+/// where the URL has no authority.
+pub fn url_host_port(u: Url) -> Option<String> =
+  match parts_of(u).authority {
+    Some(a) -> Some(a.host ++ (match a.port { Some(port) -> ":" ++ port, None -> "" })),
+    None -> None,
+  }
+
+/// The port the authority writes, from 0 to 65535. `None` where it writes none, a `:` with no
+/// digits included.
+pub fn url_port(u: Url) -> Option<Int> =
+  match parts_of(u).authority { Some(a) -> a.number, None -> None }
+
+/// The port a scheme's URLs mean when they write none: 80 for `http` and `ws`, 443 for `https`
+/// and `wss`, 21 for `ftp`, and `None` for any other scheme. The scheme is given in lower case.
+pub fn url_default_port(scheme: String) -> Option<Int> =
+  match scheme {
+    "http" -> Some(80),
+    "ws" -> Some(80),
+    "https" -> Some(443),
+    "wss" -> Some(443),
+    "ftp" -> Some(21),
+    _ -> None,
+  }
+
+/// The port the URL writes, or its scheme's default where it writes none.
+pub fn url_port_or_default(u: Url) -> Option<Int> =
+  match url_port(u) { Some(port) -> Some(port), None -> url_default_port(url_scheme(u)) }
+
+/// The path as written, escapes and all. Empty, or starting with `/`, where the URL has an
+/// authority.
+pub fn url_path(u: Url) -> String = parts_of(u).path
+
+/// The path's segments, each percent-decoded, so an escaped `/` is part of its segment. The
+/// `/` that starts a path starts its first segment: `/a/b` is `a` and `b`, `/a/` ends with an
+/// empty segment, `/` is one empty segment, and the empty path is none. `None` where a segment
+/// decodes to bytes that are not UTF-8.
+pub fn url_path_segments(u: Url) -> Option<List<String>> / {abort.raise} = {
+  let path = url_path(u);
+  if path == "" { Some([]) } else {
+    let split = string_split(path, "/");
+    option_traverse(if string_starts_with(path, "/") { drop(split, 1) } else { split }, url_decode)
+  }
+}
+
+/// The query as written, without its `?`. `None` where the URL has none; `Some("")` for a `?`
+/// with nothing after it.
+pub fn url_query(u: Url) -> Option<String> = parts_of(u).query
+
+/// The fragment as written, without its `#`. `None` where the URL has none.
+pub fn url_fragment(u: Url) -> Option<String> = parts_of(u).fragment
+
+/// A scheme, a host and a port: what two URLs share when a browser calls them the same origin
+/// (RFC 6454).
+pub type Origin = { scheme: String, host: Host, port: Int }
+
+/// The URL's origin: its scheme, its host and the port it writes or its scheme's default.
+/// `None` where it has no host, or neither a port nor a scheme this module knows the default
+/// of.
+pub fn url_origin(u: Url) -> Option<Origin> =
+  match url_host(u) {
+    None -> None,
+    Some(host) -> match url_port_or_default(u) {
+      None -> None,
+      Some(port) -> Some({ scheme: url_scheme(u), host: host, port: port }),
+    },
+  }
+
+// --- Making -----------------------------------------------------------------
+
+/// The URL `text` writes. Every text made here is read back, so a URL's parts are always what
+/// its text says.
+fn reread(text: String) -> Url / {abort.raise} =
+  match url_parse(text) {
+    Ok(u) -> u,
+    Err(_) -> panic("std.url wrote a text it does not read: " ++ text),
+  }
+
+/// A path that reads back as a path: one that starts `//` beside no authority would read as an
+/// authority, and is written `/.//`.
+fn guarded(parts: Parts) -> Parts =
+  match parts.authority {
+    Some(_) -> parts,
+    None -> if string_starts_with(parts.path, "//") { { ..parts, path: "/." ++ parts.path } }
+    else { parts },
+  }
+
+/// `u` with `query` for its query.
+fn with_query(u: Url, query: Option<String>) -> Url / {abort.raise} =
+  reread(composed({ ..parts_of(u), query: query }, false))
+
+/// The query as `name`/`value` pairs, as `query_parse` reads them; no pairs where the URL has no
+/// query. `None` where the query is not valid form encoding.
+pub fn url_query_pairs(u: Url) -> Option<List<Pair>> / {abort.raise} =
+  match url_query(u) { Some(query) -> query_parse(query), None -> Some([]) }
+
+/// The URL with its query made the one `query_build` writes of `pairs`, and no query where
+/// there are none.
+pub fn url_with_query_pairs(u: Url, pairs: List<Pair>) -> Url / {abort.raise} =
+  with_query(u, if len(pairs) == 0 { None } else { Some(query_build(pairs)) })
+
+/// The value of the URL's first query parameter named `name`. `None` where it has none, or its
+/// query is not valid form encoding.
+pub fn url_param(u: Url, name: String) -> Option<String> / {abort.raise} =
+  match url_query_pairs(u) { Some(pairs) -> query_get(pairs, name), None -> None }
+
+/// The values of every query parameter named `name`, in order; none where the query is not
+/// valid form encoding.
+pub fn url_params(u: Url, name: String) -> List<String> / {abort.raise} =
+  match url_query_pairs(u) {
+    Some(pairs) -> map(filter(pairs, |p: Pair| p.name == name), |p: Pair| p.value),
+    None -> [],
+  }
+
+/// The URL with its query parameter `name` given `value`, as `query_set` places it, and the
+/// query written as `query_build` writes one. `None` where the query is not valid form encoding.
+pub fn url_set_param(u: Url, name: String, value: String) -> Option<Url> / {abort.raise} =
+  match url_query_pairs(u) {
+    Some(pairs) -> Some(url_with_query_pairs(u, query_set(pairs, name, value))),
+    None -> None,
+  }
+
+/// The URL with a query parameter added after those it has, which stay. `None` where the query
+/// is not valid form encoding.
+pub fn url_add_param(u: Url, name: String, value: String) -> Option<Url> / {abort.raise} =
+  match url_query_pairs(u) {
+    Some(pairs) -> Some(url_with_query_pairs(u, push(pairs, { name: name, value: value }))),
+    None -> None,
+  }
+
+/// The URL without any query parameter named `name`. `None` where the query is not valid form
+/// encoding.
+pub fn url_remove_param(u: Url, name: String) -> Option<Url> / {abort.raise} =
+  match url_query_pairs(u) {
+    Some(pairs) -> Some(url_with_query_pairs(u, query_remove(pairs, name))),
+    None -> None,
+  }
+
+/// The URL with `segments` added to its path, each percent-encoded whole, so no segment adds a
+/// `/` of its own, and its query and fragment dropped. `None` where a segment is empty, `.` or
+/// `..`: what is added names something below the path and cannot climb out of it.
+pub fn url_join_path(u: Url, segments: List<String>) -> Option<Url> / {abort.raise} =
+  if any(segments, |s: String| s == "" || s == "." || s == "..") { None } else {
+    let parts = parts_of(u);
+    let stem = if string_ends_with(parts.path, "/") {
+      string_slice(parts.path, 0, string_len(parts.path) - 1)
+    } else { parts.path };
+    let path = fold(segments, stem, |acc: String, s: String| acc ++ "/" ++ url_encode(s));
+    Some(reread(composed({ ..parts, path: path, query: None, fragment: None }, false)))
+  }
+
+// --- Resolving --------------------------------------------------------------
+
+/// RFC 3986 §5.2.2: the URL `reference` means where `base` is the URL of what wrote it. A
+/// reference with a scheme is itself, its dot segments removed; any other takes the base's
+/// scheme, then its authority, then its path up to the last `/`, as far as it leaves them out.
+/// The base's fragment is never kept. A reference with a scheme is never read as a relative one,
+/// whatever its scheme: `http:g` against an `http` base is `http:g`.
+pub fn url_resolve(base: Url, reference: Reference) -> Url / {abort.raise} =
+  match reference { Reference(_, r) -> reread(composed(guarded(target(parts_of(base), r)), false)) }
+
+/// The URL `reference` writes or means against `base`: `reference_parse`, then `url_resolve`.
+pub fn url_join(base: Url, reference: String) -> Result<Url, Refusal> / {abort.raise} =
+  match reference_parse(reference) {
+    Ok(r) -> Ok(url_resolve(base, r)),
+    Err(refused) -> Err(refused),
+  }
+
+fn target(base: Parts, r: Parts) -> Parts / {abort.raise} =
+  match r.scheme {
+    Some(_) -> { ..r, path: without_dots(r.path) },
+    None -> match r.authority {
+      Some(_) -> { ..r, scheme: base.scheme, path: without_dots(r.path) },
+      None -> if r.path == "" {
+        {
+          ..base,
+          query: match r.query { Some(_) -> r.query, None -> base.query },
+          fragment: r.fragment,
+        }
+      } else {
+        {
+          ..base,
+          path: without_dots(if string_starts_with(r.path, "/") { r.path }
+          else { merged(base, r.path) }),
+          query: r.query,
+          fragment: r.fragment,
+        }
+      },
+    },
+  }
+
+/// RFC 3986 §5.2.3: a relative path beside the base's path up to its last `/`.
+fn merged(base: Parts, path: String) -> String / {abort.raise} =
+  match base.authority {
+    Some(_) -> if base.path == "" { "/" ++ path } else { stem(base.path) ++ path },
+    None -> stem(base.path) ++ path,
+  }
+
+/// `path` up to and with its last `/`, and nothing where it has none.
+fn stem(path: String) -> String / {abort.raise} = {
+  let pieces = string_split(path, "/");
+  fold(range(0, len(pieces) - 1), "", |acc: String, i: Int| acc ++ at_or(pieces, i, "") ++ "/")
+}
+
+type Walk = { at: Int, out: List<Bytes> }
+
+/// RFC 3986 §5.2.4, as written: `path` with each `.` segment dropped and each `..` segment
+/// dropped with the segment before it.
+fn without_dots(path: String) -> String / {abort.raise} = {
+  let b = bytes_of_string(path);
+  let start: Walk = { at: 0, out: [] };
+  string_of_bytes(bytes_concat_all(iterate(start, bytes_len(b) + 2, |w: Walk| dot_step(b, w))))
+}
+
+fn dot_step(b: Bytes, w: Walk) -> Iter<Walk, List<Bytes>> / {abort.raise} =
+  if w.at >= bytes_len(b) { Stop(w.out) }
+  else if leads(b, w.at, b"../") { Continue({ at: w.at + 3, out: w.out }) }
+  else if leads(b, w.at, b"./") || leads(b, w.at, b"/./") { Continue({ at: w.at + 2, out: w.out }) }
+  else if rest_is(b, w.at, b"/.") { Stop(push(w.out, b"/")) }
+  else if leads(b, w.at, b"/../") { Continue({ at: w.at + 3, out: take(w.out, len(w.out) - 1) }) }
+  else if rest_is(b, w.at, b"/..") { Stop(push(take(w.out, len(w.out) - 1), b"/")) }
+  else if rest_is(b, w.at, b".") || rest_is(b, w.at, b"..") { Stop(w.out) } else {
+    let end = scan_until(b, if bytes_at(b, w.at) == b'/' { w.at + 1 } else { w.at }, b"/");
+    Continue({ at: end, out: push(w.out, bytes_slice(b, w.at, end)) })
+  }
+
+fn leads(b: Bytes, at: Int, prefix: Bytes) -> Bool / {abort.raise} =
+  at + bytes_len(prefix) <= bytes_len(b) && bytes_slice(b, at, at + bytes_len(prefix)) == prefix
+
+fn rest_is(b: Bytes, at: Int, whole: Bytes) -> Bool / {abort.raise} =
+  bytes_len(b) - at == bytes_len(whole) && leads(b, at, whole)
+
+// --- Normalizing ------------------------------------------------------------
+
+/// The URL RFC 3986 §6.2.2 and §6.2.3 hold equivalent to `u`: its scheme and host in lower
+/// case, an address as `std.ip` writes it, every escape in upper case, an escaped unreserved
+/// character written plain, dot segments removed (§5.2.4), an empty path beside an authority
+/// made `/`, and a port that is empty or its scheme's default dropped. Normalizing again
+/// changes nothing. A query's `+` and `%20`, the order of its parameters, and a trailing `/`
+/// are left as written.
+pub fn url_normalized(u: Url) -> Url / {abort.raise} = {
+  let parts = parts_of(u);
+  let path = without_dots(plain_escapes(parts.path));
+  let authority = match parts.authority {
+    Some(a) -> "//" ++ normal_authority(a, url_default_port(url_scheme(u))),
+    None -> "",
+  };
+  let rooted = if path == "" && authority != "" { "/" }
+  else if authority == "" && string_starts_with(path, "//") { "/." ++ path }
+  else { path };
+  reread(
+    url_scheme(u) ++ ":" ++ authority ++ rooted
+      ++ (match parts.query { Some(query) -> "?" ++ plain_escapes(query), None -> "" })
+      ++ (match parts.fragment { Some(fragment) -> "#" ++ plain_escapes(fragment), None -> "" }),
+  )
+}
+
+fn normal_authority(a: Authority, default: Option<Int>) -> String / {abort.raise} =
+  (match a.userinfo { Some(userinfo) -> plain_escapes(userinfo) ++ "@", None -> "" })
+    ++ (match a.named {
+      Some(Name(name)) -> name,
+      Some(V4(four)) -> ip::render_v4(four),
+      Some(V6(six)) -> "[" ++ ip::render_v6(six) ++ "]",
+      None -> "",
+    })
+    ++ (match a.number {
+      Some(port) -> if Some(port) == default { "" } else { ":" ++ int_to_string(port) },
+      None -> "",
+    })
+
+/// `text` with each escape in upper case, and each escape of an unreserved character replaced by
+/// the character (§6.2.2.1, §6.2.2.2).
+fn plain_escapes(text: String) -> String / {abort.raise} = {
+  let pieces = bytes_split(bytes_of_string(text), b"%");
+  string_of_bytes(
+    fold(range(1, len(pieces)), at_or(pieces, 0, b""), |acc: Bytes, i: Int| {
+      let piece = at_or(pieces, i, b"");
+      let byte = hex_value(bytes_at(piece, 0)) * 16 + hex_value(bytes_at(piece, 1));
+      bytes_concat_all([
+        acc,
+        if unreserved(byte) { byte_of_int(byte) }
+        else { bytes_of_string("%" ++ hex_digit(byte / 16) ++ hex_digit(byte % 16)) },
+        bytes_slice(piece, 2, bytes_len(piece)),
+      ])
+    }),
+  )
+}
+
+// --- Generators -------------------------------------------------------------
+
+/// Any URL: a scheme this module knows the port of or another, with or without an authority, a
+/// path of plain, escaped and dot segments, and a query and a fragment or neither.
+pub fn url_gen() -> Gen<Url> / {abort.raise} =
+  gen::and_then(written(true), |text: String|
+    match url_parse(text) { Ok(u) -> gen::constant(u), Err(_) -> gen::elements([]) })
+
+/// Any reference: a URL, or a relative reference of each kind §4.2 names.
+pub fn reference_gen() -> Gen<Reference> / {abort.raise} =
+  gen::and_then(gen::one_of([written(false), written(true)]), |text: String|
+    match reference_parse(text) { Ok(r) -> gen::constant(r), Err(_) -> gen::elements([]) })
+
+/// The text of a URL, or with no scheme that of a relative reference.
+fn written(absolute: Bool) -> Gen<String> / {abort.raise} =
+  gen::and_then(gen::bool(), |with_authority: Bool|
+    gen::map2(
+      gen::map2(
+        if absolute { gen::elements(schemes()) } else { gen::constant("") },
+        if with_authority { gen::map(authority_text_gen(), |a: String| "//" ++ a) }
+        else { gen::constant("") },
+        |scheme: String, authority: String| scheme ++ authority,
+      ),
+      gen::map2(path_gen(with_authority, absolute), tail_gen(), |path: String, tail: String|
+        path ++ tail),
+      |front: String, back: String| front ++ back,
+    ))
+
+fn schemes() -> List<String> =
+  [
+    "http:",
+    "https:",
+    "ws:",
+    "wss:",
+    "ftp:",
+    "file:",
+    "mailto:",
+    "urn:",
+    "HTTP:",
+    "hTTps:",
+    "a+b-c.d:",
+    "x1:",
+  ]
+
+fn authority_text_gen() -> Gen<String> / {abort.raise} =
+  gen::map2(
+    gen::map2(
+      gen::elements(["", "", "user@", "user:pass@", "u%41:%7e@", ":@", "@", "a;b=c:d:e@"]),
+      host_text_gen(),
+      |userinfo: String, host: String| userinfo ++ host,
+    ),
+    gen::elements([
+      "",
+      "",
+      ":",
+      ":80",
+      ":443",
+      ":8080",
+      ":0",
+      ":65535",
+      ":0080",
+      ":21",
+      ":00000443",
+    ]),
+    |front: String, port: String| front ++ port,
+  )
+
+fn host_text_gen() -> Gen<String> / {abort.raise} =
+  gen::one_of([
+    gen::elements([
+      "example.com",
+      "EXAMPLE.Com",
+      "a",
+      "localhost",
+      "xn--bcher-kva.example",
+      "a-b.c_d",
+      "sub.Example.ORG.",
+      "1.2.3.4.example",
+      "a!$&'()*+,;=b",
+      "",
+      "0x7f.example",
+      "1e3",
+    ]),
+    gen::map(ip::arbitrary_v4(), ip::render_v4),
+    gen::map(ip::arbitrary_v6(), |six: Ipv6| "[" ++ ip::render_v6(six) ++ "]"),
+    gen::elements([
+      "[2001:DB8::1]",
+      "[::FFFF:192.0.2.1]",
+      "[0:0:0:0:0:0:0:1]",
+      "[::ffff:c000:201]",
+    ]),
+  ])
+
+fn segment_texts() -> List<String> =
+  [
+    "a",
+    "b",
+    "",
+    ".",
+    "..",
+    "%7Euser",
+    "%7euser",
+    "a%2Fb",
+    "%41",
+    "c;p=1",
+    "x:y",
+    "@",
+    "%2e",
+    "%2E%2e",
+    "g.",
+    "..g",
+    "%C3%A9",
+    "-._~",
+    "!$&'()*+,;=",
+    "%00",
+  ]
+
+/// A path that reads as one: rooted or empty beside an authority; and beside none never
+/// starting `//`, nor, with no scheme before it, holding a `:` in its first segment.
+fn path_gen(with_authority: Bool, absolute: Bool) -> Gen<String> =
+  gen::map2(
+    gen::bool(),
+    gen::list_of(gen::elements(segment_texts()), 6),
+    |rooted: Bool, parts: List<String>|
+      if len(parts) == 0 { if rooted { "/" } else { "" } }
+      else if with_authority { "/" ++ string::join(parts, "/") } else {
+        let first = at_or(parts, 0, "");
+        let safe = if first == "" || (!absolute && !rooted && first == "x:y") { "s" }
+        else { first };
+        (if rooted { "/" } else { "" }) ++ string::join(concat([safe], drop(parts, 1)), "/")
+      },
+  )
+
+fn tail_gen() -> Gen<String> =
+  gen::map2(
+    gen::elements([
+      "",
+      "",
+      "?",
+      "?q",
+      "?a=1&b=2",
+      "?a=%20b+c",
+      "?/?",
+      "?a=1&a=2",
+      "?k=%7E&%41=%7e",
+      "?a&&b=",
+      "?%FF=1",
+    ]),
+    gen::elements(["", "", "#", "#f", "#/?", "#%7E", "#a:b@c"]),
+    |query: String, fragment: String| query ++ fragment,
+  )
+
 // --- Tests ------------------------------------------------------------------
+
+fn read(text: String) -> Url / {abort.raise} =
+  match url_parse(text) { Ok(u) -> u, Err(_) -> panic("not a URL: " ++ text) }
+
+fn refer(text: String) -> Reference / {abort.raise} =
+  match reference_parse(text) { Ok(r) -> r, Err(_) -> panic("not a reference: " ++ text) }
 
 law "a percent-decode of an encode is the text encoded" = round_trip(url_encode, url_decode)
 
 law "a form-decode of an encode is the text encoded" = round_trip(form_encode, form_decode)
 
 law "a query string parses back to the pairs it was built of" = round_trip(query_build, query_parse)
+
+law "a URL reads back from its text" =
+  round_trip(url_render, |text: String| result_ok(url_parse(text)))
+
+law "a reference reads back from its text" =
+  round_trip(reference_render, |text: String| result_ok(reference_parse(text)))
+
+law "a text that reads as a URL is written back as it was, and any text is read or refused"
+  forall (text: String) {
+    (match url_parse(text) { Ok(u) -> url_render(u) == text, Err(_) -> true })
+      && (match reference_parse(text) { Ok(r) -> reference_render(r) == text, Err(_) -> true })
+  }
+
+/// What the accessors say of a URL, in the order RFC 3986 §5.3 writes the parts.
+fn anatomy(
+  u: Url,
+) -> (String, Option<String>, Option<Host>, Option<Int>, String, Option<String>, Option<String>) =
+  (
+    url_scheme(u),
+    url_userinfo(u),
+    url_host(u),
+    url_port(u),
+    url_path(u),
+    url_query(u),
+    url_fragment(u),
+  )
+
+/// Whether a URL made by this module is the one its text reads as, part for part.
+fn sound(u: Url) -> Bool / {abort.raise} =
+  match url_parse(url_render(u)) { Ok(again) -> anatomy(again) == anatomy(u), Err(_) -> false }
+
+law "a URL's parts, written in order, are its text"
+  forall (u: Url) {
+    let text = url_render(u);
+    let rest = (match url_authority(u) { Some(a) -> "//" ++ a, None -> "" }) ++ url_path(u)
+      ++ (match url_query(u) { Some(q) -> "?" ++ q, None -> "" })
+      ++ (match url_fragment(u) { Some(f) -> "#" ++ f, None -> "" });
+    let scheme = string_slice(text, 0, string_len(url_scheme(u)) + 1);
+    text == scheme ++ rest && string::to_lower(scheme) == url_scheme(u) ++ ":"
+  }
+
+law "a URL's authority is its userinfo, its host and its port as they were written"
+  forall (u: Url) {
+    match url_authority(u) {
+      None -> url_userinfo(u) == None && url_host(u) == None && url_port(u) == None,
+      Some(a) ->
+        Some(a)
+          == (match url_host_port(u) {
+            Some(host_port) ->
+              Some((match url_userinfo(u) { Some(info) -> info ++ "@", None -> "" }) ++ host_port),
+            None -> None,
+          }),
+    }
+  }
+
+law "a normalized URL is sound, and normalizing it again changes nothing"
+  forall (u: Url) {
+    let normal = url_normalized(u);
+    sound(normal) && url_normalized(normal) == normal && url_scheme(normal) == url_scheme(u)
+      && url_host(normal) == url_host(u)
+      && url_port_or_default(normal) == url_port_or_default(u)
+      && (url_port(normal) == None || url_port(normal) != url_default_port(url_scheme(normal)))
+      && string_starts_with(url_render(normal), url_scheme(normal) ++ ":")
+  }
+
+law "normalizing twice is normalizing once" = idempotent(url_normalized)
+
+fn dot_free(path: String) -> Bool / {abort.raise} =
+  !any(string_split(path, "/"), |segment: String| segment == "." || segment == "..")
+
+law "a normalized URL's path holds no dot segment, escaped or not, past the one that guards `//`"
+  forall (u: Url) {
+    let path = url_path(url_normalized(u));
+    dot_free(if string_starts_with(path, "/.//") { string_slice(path, 2, string_len(path)) }
+      else { path })
+      && !string_contains(path, "%2E")
+      && !string_contains(path, "%2e")
+  }
+
+law "a resolved URL is sound, and has the reference's fragment and no other"
+  forall (base: Url, r: Reference) {
+    let resolved = url_resolve(base, r);
+    sound(resolved)
+      && Some(resolved)
+      == (match reference_parse(reference_render(r)) {
+        Ok(again) -> Some(url_resolve(base, again)),
+        Err(_) -> None,
+      })
+      && (match reference_url(r) {
+        Some(whole) ->
+          url_fragment(resolved) == url_fragment(whole)
+            && url_scheme(resolved) == url_scheme(whole),
+        None -> url_scheme(resolved) == url_scheme(base),
+      })
+  }
+
+law "a URL resolves to itself against any base, its dot segments removed"
+  forall (base: Url, u: Url) {
+    let resolved = url_resolve(base, reference_of(u));
+    url_authority(resolved) == url_authority(u) && url_query(resolved) == url_query(u)
+      && url_fragment(resolved) == url_fragment(u)
+      && (url_path(resolved) == url_path(u) || !dot_free(url_path(u))
+      || string_starts_with(url_path(resolved), "/./"))
+  }
+
+law "the empty reference is its base without a fragment"
+  forall (base: Url) {
+    let resolved = url_resolve(base, refer(""));
+    url_fragment(resolved) == None
+      && url_render(resolved)
+      == (match url_fragment(base) {
+        Some(f) ->
+          string_slice(url_render(base), 0, string_len(url_render(base)) - string_len(f) - 1),
+        None -> url_render(base),
+      })
+  }
+
+law "removing dot segments twice is removing them once, and none is left in a rooted path"
+  forall (u: Url) {
+    let once = without_dots(url_path(u));
+    without_dots(once) == once && (!string_starts_with(url_path(u), "/") || dot_free(once))
+  }
+
+law "a query written from pairs reads back as them, in a URL that is otherwise as it was"
+  forall (u: Url, pairs: List<Pair>) {
+    let changed = url_with_query_pairs(u, pairs);
+    sound(changed) && url_query_pairs(changed) == Some(pairs) && url_path(changed) == url_path(u)
+      && url_authority(changed) == url_authority(u)
+      && url_fragment(changed) == url_fragment(u)
+  }
+
+/// A name `pairs` holds, chosen by `n`, or `spare` once in each turn through them.
+fn name_among(pairs: List<Pair>, n: Int, spare: String) -> String / {abort.raise} =
+  match list_at(pairs, (n & 255) % (len(pairs) + 1)) { Some(p) -> p.name, None -> spare }
+
+law "a parameter set is the one read, once; one added is read last; one removed is gone"
+  forall (u: Url, n: Int, spare: String, value: String) {
+    let name = name_among(option_unwrap_or(url_query_pairs(u), []), n, spare);
+    match url_query_pairs(u) {
+      None ->
+        url_set_param(u, name, value) == None && url_add_param(u, name, value) == None
+          && url_remove_param(u, name) == None,
+      Some(pairs) -> {
+        let others = filter(pairs, |p: Pair| p.name != name);
+        (match url_set_param(u, name, value) {
+            Some(set) ->
+              url_params(set, name) == [value] && url_param(set, name) == Some(value)
+                && (match url_remove_param(set, name) {
+                  Some(gone) -> url_query_pairs(gone) == Some(others),
+                  None -> false,
+                }),
+            None -> false,
+          })
+          && (match url_add_param(u, name, value) {
+            Some(added) ->
+              url_query_pairs(added) == Some(push(pairs, { name: name, value: value })),
+            None -> false,
+          })
+      },
+    }
+  }
+
+law "pairs set, got and removed agree with one another"
+  forall (pairs: List<Pair>, n: Int, spare: String, value: String) {
+    let name = name_among(pairs, n, spare);
+    let set = query_set(pairs, name, value);
+    query_get(set, name) == Some(value) && len(filter(set, |p: Pair| p.name == name)) == 1
+      && query_get(query_remove(pairs, name), name) == None
+      && query_remove(set, name) == query_remove(pairs, name)
+      && filter(set, |p: Pair| p.name != name) == query_remove(pairs, name)
+      && query_get(pairs, name)
+      == (match filter(pairs, |p: Pair| p.name == name) {
+        [first, ..] -> Some(first.value),
+        [] -> None,
+      })
+  }
+
+law "a redacted URL is a URL with the same parts but its userinfo"
+  forall (u: Url) {
+    match url_parse(url_redacted(u)) {
+      Err(_) -> false,
+      Ok(hidden) ->
+        url_host(hidden) == url_host(u) && url_path(hidden) == url_path(u)
+          && url_query(hidden) == url_query(u)
+          && show(u) == url_redacted(u)
+          && (match password_of(url_userinfo(u)) {
+            Some(written) ->
+              url_userinfo(hidden) == Some(written.head ++ ":xxxxx") && written.tail != "",
+            None -> url_redacted(u) == url_render(u),
+          }),
+    }
+  }
+
+/// Userinfo around its first `:`, where something follows it.
+fn password_of(userinfo: Option<String>) -> Option<{ head: String, tail: String }> / {abort.raise} =
+  match userinfo {
+    None -> None,
+    Some(info) -> match string::split_once(info, ":") {
+      Some(parts) -> if parts.tail == "" { None } else { Some(parts) },
+      None -> None,
+    },
+  }
+
+law "a path joined to a URL adds its segments as they are, below the path it had"
+  forall (u: Url, segments: List<String>) {
+    match url_join_path(u, segments) {
+      None -> any(segments, |s: String| s == "" || s == "." || s == ".."),
+      Some(joined) ->
+        sound(joined) && url_authority(joined) == url_authority(u)
+          && (match url_path_segments(joined) {
+            Some(all_segments) -> drop(all_segments, len(all_segments) - len(segments)) == segments,
+            None -> false,
+          }),
+    }
+  }
+
+test "the generators draw a URL and a reference every time, of every shape" {
+  let urls = map(range(0, 300), |i: Int| _sample_Url(i, b"urls", i % 40, None).value);
+  let references = map(range(0, 300), |i: Int| _sample_Reference(i, b"refs", i % 40, None).value);
+  assert(all(urls, |u: Option<Url>| u != None));
+  assert(all(references, |r: Option<Reference>| r != None));
+  let some = |keep: (Url) -> Bool / {abort.raise}|
+    any(urls, |drawn: Option<Url>| match drawn { Some(u) -> keep(u), None -> false });
+  assert(some(|u: Url| url_authority(u) == None));
+  assert(some(|u: Url| match url_host(u) { Some(V6(_)) -> true, _ -> false }));
+  assert(some(|u: Url| match url_host(u) { Some(V4(_)) -> true, _ -> false }));
+  assert(some(|u: Url| match url_host(u) { Some(Name(_)) -> true, _ -> false }));
+  assert(some(|u: Url| url_userinfo(u) != None && url_redacted(u) != url_render(u)));
+  assert(some(|u: Url| url_normalized(u) != u));
+  assert(some(|u: Url| url_query_pairs(u) == None));
+  assert(
+    any(references, |drawn: Option<Reference>|
+      match drawn { Some(r) -> reference_url(r) == None, None -> false }),
+  )
+}
+
+type Resolution = { reference: String, target: String }
+
+/// RFC 3986 §5.4.1, against the base `http://a/b/c/d;p?q`.
+fn normal_examples() -> List<Resolution> =
+  [
+    { reference: "g:h", target: "g:h" },
+    { reference: "g", target: "http://a/b/c/g" },
+    { reference: "./g", target: "http://a/b/c/g" },
+    { reference: "g/", target: "http://a/b/c/g/" },
+    { reference: "/g", target: "http://a/g" },
+    { reference: "//g", target: "http://g" },
+    { reference: "?y", target: "http://a/b/c/d;p?y" },
+    { reference: "g?y", target: "http://a/b/c/g?y" },
+    { reference: "#s", target: "http://a/b/c/d;p?q#s" },
+    { reference: "g#s", target: "http://a/b/c/g#s" },
+    { reference: "g?y#s", target: "http://a/b/c/g?y#s" },
+    { reference: ";x", target: "http://a/b/c/;x" },
+    { reference: "g;x", target: "http://a/b/c/g;x" },
+    { reference: "g;x?y#s", target: "http://a/b/c/g;x?y#s" },
+    { reference: "", target: "http://a/b/c/d;p?q" },
+    { reference: ".", target: "http://a/b/c/" },
+    { reference: "./", target: "http://a/b/c/" },
+    { reference: "..", target: "http://a/b/" },
+    { reference: "../", target: "http://a/b/" },
+    { reference: "../g", target: "http://a/b/g" },
+    { reference: "../..", target: "http://a/" },
+    { reference: "../../", target: "http://a/" },
+    { reference: "../../g", target: "http://a/g" },
+  ]
+
+/// RFC 3986 §5.4.2, against the same base. `http:g` is the strict answer.
+fn abnormal_examples() -> List<Resolution> =
+  [
+    { reference: "../../../g", target: "http://a/g" },
+    { reference: "../../../../g", target: "http://a/g" },
+    { reference: "/./g", target: "http://a/g" },
+    { reference: "/../g", target: "http://a/g" },
+    { reference: "g.", target: "http://a/b/c/g." },
+    { reference: ".g", target: "http://a/b/c/.g" },
+    { reference: "g..", target: "http://a/b/c/g.." },
+    { reference: "..g", target: "http://a/b/c/..g" },
+    { reference: "./../g", target: "http://a/b/g" },
+    { reference: "./g/.", target: "http://a/b/c/g/" },
+    { reference: "g/./h", target: "http://a/b/c/g/h" },
+    { reference: "g/../h", target: "http://a/b/c/h" },
+    { reference: "g;x=1/./y", target: "http://a/b/c/g;x=1/y" },
+    { reference: "g;x=1/../y", target: "http://a/b/c/y" },
+    { reference: "g?y/./x", target: "http://a/b/c/g?y/./x" },
+    { reference: "g?y/../x", target: "http://a/b/c/g?y/../x" },
+    { reference: "g#s/./x", target: "http://a/b/c/g#s/./x" },
+    { reference: "g#s/../x", target: "http://a/b/c/g#s/../x" },
+    { reference: "http:g", target: "http:g" },
+  ]
+
+test "`{c.reference}` against `http://a/b/c/d;p?q` is `{c.target}`" for c: Resolution in concat(
+    normal_examples(),
+    abnormal_examples(),
+  ) {
+  let base = read("http://a/b/c/d;p?q");
+  assert_eq(url_render(url_resolve(base, refer(c.reference))), c.target);
+  assert_eq(url_join(base, c.reference), Ok(read(c.target)))
+}
+
+type Resolved = { base: String, reference: String, target: String }
+
+/// Bases and references §5.4 does not hold: a base with no path, one with no authority, and the
+/// paths that would read back as something else.
+fn resolutions() -> List<Resolved> =
+  [
+    { base: "http://a", reference: "g", target: "http://a/g" },
+    { base: "http://a", reference: "", target: "http://a" },
+    { base: "http://a?q#f", reference: "", target: "http://a?q" },
+    { base: "http://a/b?q#f", reference: "#", target: "http://a/b?q#" },
+    { base: "http://a/b?q#f", reference: "?", target: "http://a/b?" },
+    { base: "http://u:p@a:81/b", reference: "/c", target: "http://u:p@a:81/c" },
+    { base: "http://u:p@a:81/b", reference: "//h", target: "http://h" },
+    { base: "HTTP://A/b", reference: "c", target: "HTTP://A/c" },
+    { base: "mailto:a@example.com", reference: "b@example.com", target: "mailto:b@example.com" },
+    { base: "urn:a:b", reference: "c", target: "urn:c" },
+    { base: "file:///a/b", reference: "../../../c", target: "file:///c" },
+    { base: "a:/b", reference: ".//c", target: "a:/.//c" },
+    { base: "a:b/c", reference: "..//d", target: "a:/.//d" },
+    { base: "a:/b", reference: "//c", target: "a://c" },
+    { base: "a:b", reference: "c:d/../e", target: "c:/e" },
+    { base: "http://a/b/c", reference: "%2e%2e/d", target: "http://a/b/%2e%2e/d" },
+    { base: "http://a/b/c", reference: "./x:y", target: "http://a/b/x:y" },
+    { base: "http://a/b/c/", reference: "..", target: "http://a/b/" },
+    { base: "http://a/b/c/", reference: "", target: "http://a/b/c/" },
+    {
+      base: "http://a/b/c",
+      reference: "http://[::1]:8080/x?y#z",
+      target: "http://[::1]:8080/x?y#z",
+    },
+  ]
+
+test "`{c.reference}` against `{c.base}` is `{c.target}`" for c: Resolved in resolutions() {
+  assert_eq(url_render(url_resolve(read(c.base), refer(c.reference))), c.target)
+}
+
+type Anatomy = {
+  text: String,
+  scheme: String,
+  userinfo: Option<String>,
+  host: String,
+  port: Option<Int>,
+  path: String,
+  query: Option<String>,
+  fragment: Option<String>,
+}
+
+fn host_text(host: Option<Host>) -> String =
+  match host {
+    Some(Name(name)) -> "name " ++ name,
+    Some(V4(four)) -> "v4 " ++ ip::render_v4(four),
+    Some(V6(six)) -> "v6 " ++ ip::render_v6(six),
+    None -> "none",
+  }
+
+/// RFC 3986 §1.1.2 and §3's examples, and one of each shape an authority and a path take.
+fn anatomies() -> List<Anatomy> =
+  [
+    {
+      text: "ftp://ftp.is.co.za/rfc/rfc1808.txt",
+      scheme: "ftp",
+      userinfo: None,
+      host: "name ftp.is.co.za",
+      port: None,
+      path: "/rfc/rfc1808.txt",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "http://www.ietf.org/rfc/rfc2396.txt",
+      scheme: "http",
+      userinfo: None,
+      host: "name www.ietf.org",
+      port: None,
+      path: "/rfc/rfc2396.txt",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "ldap://[2001:db8::7]/c=GB?objectClass?one",
+      scheme: "ldap",
+      userinfo: None,
+      host: "v6 2001:db8::7",
+      port: None,
+      path: "/c=GB",
+      query: Some("objectClass?one"),
+      fragment: None,
+    },
+    {
+      text: "mailto:John.Doe@example.com",
+      scheme: "mailto",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "John.Doe@example.com",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "news:comp.infosystems.www.servers.unix",
+      scheme: "news",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "comp.infosystems.www.servers.unix",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "tel:+1-816-555-1212",
+      scheme: "tel",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "+1-816-555-1212",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "telnet://192.0.2.16:80/",
+      scheme: "telnet",
+      userinfo: None,
+      host: "v4 192.0.2.16",
+      port: Some(80),
+      path: "/",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "urn:oasis:names:specification:docbook:dtd:xml:4.1.2",
+      scheme: "urn",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "oasis:names:specification:docbook:dtd:xml:4.1.2",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "foo://example.com:8042/over/there?name=ferret#nose",
+      scheme: "foo",
+      userinfo: None,
+      host: "name example.com",
+      port: Some(8042),
+      path: "/over/there",
+      query: Some("name=ferret"),
+      fragment: Some("nose"),
+    },
+    {
+      text: "urn:example:animal:ferret:nose",
+      scheme: "urn",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "example:animal:ferret:nose",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "HTTPS://User:Pass@WWW.Example.COM:0443/A%2fB/?Q=1#F",
+      scheme: "https",
+      userinfo: Some("User:Pass"),
+      host: "name www.example.com",
+      port: Some(443),
+      path: "/A%2fB/",
+      query: Some("Q=1"),
+      fragment: Some("F"),
+    },
+    {
+      text: "http://[::FFFF:192.0.2.1]:8080",
+      scheme: "http",
+      userinfo: None,
+      host: "v6 ::ffff:192.0.2.1",
+      port: Some(8080),
+      path: "",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "file:///etc/hosts",
+      scheme: "file",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "/etc/hosts",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "http://example.com:/?#",
+      scheme: "http",
+      userinfo: None,
+      host: "name example.com",
+      port: None,
+      path: "/",
+      query: Some(""),
+      fragment: Some(""),
+    },
+    {
+      text: "http://@example.com",
+      scheme: "http",
+      userinfo: Some(""),
+      host: "name example.com",
+      port: None,
+      path: "",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "localhost:8080/x",
+      scheme: "localhost",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "8080/x",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "http:g",
+      scheme: "http",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "g",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "x:",
+      scheme: "x",
+      userinfo: None,
+      host: "none",
+      port: None,
+      path: "",
+      query: None,
+      fragment: None,
+    },
+    {
+      text: "http://1.2.3.4.example.com./",
+      scheme: "http",
+      userinfo: None,
+      host: "name 1.2.3.4.example.com.",
+      port: None,
+      path: "/",
+      query: None,
+      fragment: None,
+    },
+  ]
+
+test "`{c.text}` is read as its parts" for c: Anatomy in anatomies() {
+  let u = read(c.text);
+  assert_eq(url_scheme(u), c.scheme);
+  assert_eq(url_userinfo(u), c.userinfo);
+  assert_eq(host_text(url_host(u)), c.host);
+  assert_eq(url_port(u), c.port);
+  assert_eq(url_path(u), c.path);
+  assert_eq(url_query(u), c.query);
+  assert_eq(url_fragment(u), c.fragment);
+  assert_eq(url_render(u), c.text)
+}
+
+type Refused = { text: String, at: Int, why: Why }
+
+fn refused_urls() -> List<Refused> =
+  [
+    { text: "", at: 0, why: NoScheme },
+    { text: "example.com/path", at: 0, why: NoScheme },
+    { text: "//example.com/path", at: 0, why: NoScheme },
+    { text: "/path", at: 0, why: NoScheme },
+    { text: "?q", at: 0, why: NoScheme },
+    { text: "1http://a/", at: 0, why: BadScheme },
+    { text: "://a/", at: 0, why: BadScheme },
+    { text: "ht_tp://a/", at: 0, why: BadScheme },
+    { text: "ht%74p://a/", at: 0, why: BadScheme },
+    { text: "http://a b/", at: 8, why: Forbidden },
+    { text: " http://a/", at: 0, why: Forbidden },
+    { text: "http://a/ ", at: 9, why: Forbidden },
+    { text: "http://a/\tb", at: 9, why: Forbidden },
+    { text: "ht\ttp://a/", at: 2, why: Forbidden },
+    { text: "http://a/\nb", at: 9, why: Forbidden },
+    { text: "http://a/b\r\n", at: 10, why: Forbidden },
+    { text: "http://a\\b/", at: 8, why: Forbidden },
+    { text: "http:\\\\a/", at: 5, why: Forbidden },
+    { text: "http://a/<b>", at: 9, why: Forbidden },
+    { text: "http://a/{b}", at: 9, why: Forbidden },
+    { text: "http://a/b|c", at: 10, why: Forbidden },
+    { text: "http://a/b^c", at: 10, why: Forbidden },
+    { text: "http://a/\"b\"", at: 9, why: Forbidden },
+    { text: "http://a/b`c", at: 10, why: Forbidden },
+    { text: "http://a/\0", at: 9, why: Forbidden },
+    { text: "http://a/\u{7F}", at: 9, why: Forbidden },
+    { text: "http://a/\u{E9}", at: 9, why: NotAscii },
+    { text: "http://b\u{FC}cher.example/", at: 8, why: NotAscii },
+    { text: "http://\u{4F8B}\u{3048}.jp/", at: 7, why: NotAscii },
+    { text: "http://a/%", at: 9, why: BadEscape },
+    { text: "http://a/%2", at: 9, why: BadEscape },
+    { text: "http://a/%zz", at: 9, why: BadEscape },
+    { text: "http://a/%2%41", at: 9, why: BadEscape },
+    { text: "http://a/?q=%G0", at: 12, why: BadEscape },
+    { text: "http://a/#%", at: 10, why: BadEscape },
+    { text: "http://a@b@c/", at: 10, why: SecondAt },
+    { text: "http://a:b@c:d@e/", at: 14, why: SecondAt },
+    { text: "http://user@@host/", at: 12, why: SecondAt },
+    { text: "http://[::1/", at: 7, why: OpenBracket },
+    { text: "http://[::1", at: 7, why: OpenBracket },
+    { text: "http://[::1]x/", at: 12, why: Stray },
+    { text: "http://[v1.fe80]/", at: 8, why: FutureAddress },
+    { text: "http://[V7.a]/", at: 8, why: FutureAddress },
+    { text: "http://[::1%25eth0]/", at: 11, why: Address(ip::Zone) },
+    { text: "http://[fe80::1%eth0]/", at: 15, why: BadEscape },
+    { text: "http://[1.2.3.4]/", at: 15, why: Address(ip::FewGroups) },
+    { text: "http://[::g]/", at: 10, why: Address(ip::NoGroup) },
+    { text: "http://[]/", at: 8, why: Address(ip::Empty) },
+    { text: "http://[::ffff:010.0.0.1]/", at: 15, why: Address(ip::LeadingZero) },
+    { text: "http://[1:2:3:4:5:6:7:8:9]/", at: 24, why: Address(ip::ManyGroups) },
+    { text: "http://a[b]/", at: 8, why: Stray },
+    { text: "http://a]/", at: 8, why: Stray },
+    { text: "http://127.1/", at: 12, why: Address(ip::FewOctets) },
+    { text: "http://127.0.0.1./", at: 16, why: Address(ip::ManyOctets) },
+    { text: "http://010.0.0.1/", at: 7, why: Address(ip::LeadingZero) },
+    { text: "http://0177.0.0.1/", at: 7, why: Address(ip::LeadingZero) },
+    { text: "http://2130706433/", at: 7, why: Address(ip::OctetRange) },
+    { text: "http://1.2.3.256/", at: 13, why: Address(ip::OctetRange) },
+    { text: "http://1.2.3/", at: 12, why: Address(ip::FewOctets) },
+    { text: "http://1.2.3.4.5/", at: 14, why: Address(ip::ManyOctets) },
+    { text: "http://0x7f.0.0.1/", at: 7, why: NumericHost },
+    { text: "http://0x7f000001/", at: 7, why: NumericHost },
+    { text: "http://0X7F.1/", at: 7, why: NumericHost },
+    { text: "http://example.0x10/", at: 7, why: NumericHost },
+    { text: "http://example.123/", at: 7, why: NumericHost },
+    { text: "http://example.123./", at: 7, why: NumericHost },
+    { text: "http://a.0x/", at: 7, why: NumericHost },
+    { text: "http://1.2.3.04a.5/", at: 7, why: NumericHost },
+    { text: "http://ex%61mple.com/", at: 9, why: EncodedHost },
+    { text: "http://%31%32%37.0.0.1/", at: 7, why: EncodedHost },
+    { text: "http://%E4%BE%8B.jp/", at: 7, why: EncodedHost },
+    { text: "http://a:b/", at: 9, why: BadPort },
+    { text: "http://a:80:443/", at: 11, why: BadPort },
+    { text: "http://a:-1/", at: 9, why: BadPort },
+    { text: "http://a:+80/", at: 9, why: BadPort },
+    { text: "http://a:8%30/", at: 10, why: BadPort },
+    { text: "http://a:65536/", at: 9, why: PortRange },
+    { text: "http://a:99999999999999999999/", at: 9, why: PortRange },
+    { text: "http://[::1]:65536/", at: 13, why: PortRange },
+    { text: "http://a/b[c]", at: 10, why: Stray },
+    { text: "http://a/?q[]=1", at: 11, why: Stray },
+    { text: "http://a/#f#g", at: 11, why: Stray },
+    { text: "http://a/#[", at: 10, why: Stray },
+    { text: "http://u[@a/", at: 8, why: Stray },
+    { text: "mailto:a[b]", at: 8, why: Stray },
+  ]
+
+fn visible(text: String) -> String / {abort.raise} =
+  string::replace(
+    string::replace(string::replace(string::replace(text, "\n", "\\n"), "\t", "\\t"), "\r", "\\r"),
+    "\0",
+    "\\0",
+  )
+
+test "`{visible(c.text)}` is no URL" for c: Refused in refused_urls() {
+  assert_eq(url_parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+fn refused_references() -> List<Refused> =
+  [
+    { text: "1a:b", at: 0, why: BadScheme },
+    { text: ":b", at: 0, why: BadScheme },
+    { text: "a b", at: 1, why: Forbidden },
+    { text: "a\\b", at: 1, why: Forbidden },
+    { text: "\\\\evil.example/x", at: 0, why: Forbidden },
+    { text: "/\\evil.example/x", at: 1, why: Forbidden },
+    { text: "//a@b@c", at: 5, why: SecondAt },
+    { text: "//127.1/x", at: 7, why: Address(ip::FewOctets) },
+    { text: "/a%", at: 2, why: BadEscape },
+    { text: "?a[b]", at: 2, why: Stray },
+    { text: "\u{E9}", at: 0, why: NotAscii },
+  ]
+
+test "`{c.text}` is no reference" for c: Refused in refused_references() {
+  assert_eq(reference_parse(c.text), Err({ at: c.at, why: c.why }))
+}
+
+test "a relative reference is read as its parts, and is no URL" {
+  let texts = [
+    "",
+    "g",
+    "./g",
+    "../g",
+    "/g",
+    "//g",
+    "//g/h?i#j",
+    "?y",
+    "#s",
+    "g;x?y#s",
+    "./a:b",
+    "a/b:c",
+    "//u@h:1",
+  ];
+  assert(all(texts, |text: String| reference_parse(text) != Err({ at: 0, why: NoScheme })));
+  assert(all(texts, |text: String| reference_render(refer(text)) == text));
+  assert(all(texts, |text: String| reference_url(refer(text)) == None));
+  assert_eq(reference_url(refer("a:b")), Some(read("a:b")));
+  assert_eq(reference_of(read("http://a/b")), refer("http://a/b"));
+  assert_eq(show(refer("//u:secret@h/p")), "//u:xxxxx@h/p")
+}
+
+type Answer = { text: String, answer: String }
+
+fn answered(text: String) -> String / {abort.raise} =
+  match url_parse(text) {
+    Ok(u) ->
+      host_text(url_host(u))
+        ++ (match url_userinfo(u) { Some(info) -> ", userinfo " ++ info, None -> "" })
+        ++ ", path "
+        ++ url_path(u),
+    Err(refused) -> "refused at " ++ int_to_string(refused.at) ++ ": " ++ url_reason(refused.why),
+  }
+
+/// Texts two URL readers are known to read two ways, and the one answer this reader gives.
+fn confusions() -> List<Answer> =
+  [
+    { text: "http://a@b@c/", answer: "refused at 10: an authority holds one `@` at most" },
+    {
+      text: "http://a\\@b/",
+      answer: "refused at 8: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://127.1/",
+      answer: "refused at 12: the host is no address: an IPv4 address is four octets",
+    },
+    { text: "http://[::ffff:127.0.0.1]/", answer: "v6 ::ffff:127.0.0.1, path /" },
+    { text: "http://example.com#@evil.com/", answer: "name example.com, path " },
+    {
+      text: "http://user@evil.com@example.com/",
+      answer: "refused at 20: an authority holds one `@` at most",
+    },
+    {
+      text: "http://example.com:80@evil.com/",
+      answer: "name evil.com, userinfo example.com:80, path /",
+    },
+    {
+      text: "http://example.com\\@evil.com/",
+      answer: "refused at 18: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://example.com\\.evil.com/",
+      answer: "refused at 18: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://evil.com\\@example.com/",
+      answer: "refused at 15: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://example.com/\\evil.com",
+      answer: "refused at 19: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http:\\\\evil.com/",
+      answer: "refused at 5: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http:/\\evil.com/",
+      answer: "refused at 6: no part of a URL holds this character unencoded",
+    },
+    { text: "http:///evil.com/", answer: "none, path /evil.com/" },
+    { text: "http:evil.com", answer: "none, path evil.com" },
+    { text: "http:/evil.com", answer: "none, path /evil.com" },
+    { text: "http://example.com?@evil.com/", answer: "name example.com, path " },
+    { text: "http://example.com/@evil.com/", answer: "name example.com, path /@evil.com/" },
+    {
+      text: "http://example.com&@evil.com/",
+      answer: "name evil.com, userinfo example.com&, path /",
+    },
+    {
+      text: "http://example.com;@evil.com/",
+      answer: "name evil.com, userinfo example.com;, path /",
+    },
+    {
+      text: "http://example.com%2F@evil.com/",
+      answer: "name evil.com, userinfo example.com%2F, path /",
+    },
+    {
+      text: "http://example.com%23@evil.com/",
+      answer: "name evil.com, userinfo example.com%23, path /",
+    },
+    {
+      text: "http://evil.com%2F@example.com/",
+      answer: "name example.com, userinfo evil.com%2F, path /",
+    },
+    {
+      text: "http://127.0.0.1%2F@evil.example/",
+      answer: "name evil.example, userinfo 127.0.0.1%2F, path /",
+    },
+    {
+      text: "http://0x7f.1/",
+      answer: "refused at 7: a host that ends in a number is four decimal octets",
+    },
+    {
+      text: "http://0177.0.0.1/",
+      answer: "refused at 7: the host is no address: a number is written with no leading zero",
+    },
+    {
+      text: "http://2130706433/",
+      answer: "refused at 7: the host is no address: an octet is at most 255",
+    },
+    { text: "http://127.0.0.1.nip.io/", answer: "name 127.0.0.1.nip.io, path /" },
+    {
+      text: "http://127.0.0.1:80\\@evil.com/",
+      answer: "refused at 19: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://[::1]@evil.com/",
+      answer: "refused at 7: this character cannot stand here unencoded",
+    },
+    { text: "http://evil.com@[::1]/", answer: "v6 ::1, userinfo evil.com, path /" },
+    {
+      text: "http://[::1]:80@evil.com/",
+      answer: "refused at 7: this character cannot stand here unencoded",
+    },
+    {
+      text: "http://example.com\t.evil.com/",
+      answer: "refused at 18: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://example.com\n@evil.com/",
+      answer: "refused at 18: no part of a URL holds this character unencoded",
+    },
+    {
+      text: " http://example.com/",
+      answer: "refused at 0: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://example.com/ ",
+      answer: "refused at 19: no part of a URL holds this character unencoded",
+    },
+    {
+      text: "http://ex\u{AD}ample.com/",
+      answer: "refused at 9: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    },
+    {
+      text: "http://\u{FF45}xample.com/",
+      answer: "refused at 7: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    },
+    {
+      text: "http://example.com\u{FF0F}@evil.com/",
+      answer: "refused at 18: a URL is ASCII: write this percent-encoded, or a host as its A-labels",
+    },
+    {
+      text: "http://1.1.1.1 &@2.2.2.2# @3.3.3.3/",
+      answer: "refused at 14: no part of a URL holds this character unencoded",
+    },
+    { text: "javascript:alert(1)", answer: "none, path alert(1)" },
+    { text: "data:text/html,x", answer: "none, path text/html,x" },
+    { text: "//evil.com/x", answer: "refused at 0: a URL starts with a scheme and a `:`" },
+    {
+      text: "/\\evil.com",
+      answer: "refused at 1: no part of a URL holds this character unencoded",
+    },
+    { text: "https:evil.com", answer: "none, path evil.com" },
+    {
+      text: "http://example.com:@evil.com/",
+      answer: "name evil.com, userinfo example.com:, path /",
+    },
+    { text: "http://example.com.:80/", answer: "name example.com., path /" },
+    { text: "http://EXAMPLE.com/", answer: "name example.com, path /" },
+    { text: "http://xn--bcher-kva.example/", answer: "name xn--bcher-kva.example, path /" },
+  ]
+
+test "`{visible(c.text)}` is {c.answer}" for c: Answer in confusions() {
+  assert_eq(answered(c.text), c.answer)
+}
+
+type Normal = { text: String, normal: String }
+
+/// RFC 3986 §6.2.2 and §6.2.3's equivalences, and each rule alone.
+fn normals() -> List<Normal> =
+  [
+    { text: "example://a/b/c/%7Bfoo%7D", normal: "example://a/b/c/%7Bfoo%7D" },
+    { text: "eXAMPLE://a/./b/../b/%63/%7bfoo%7d", normal: "example://a/b/c/%7Bfoo%7D" },
+    { text: "http://example.com", normal: "http://example.com/" },
+    { text: "http://example.com/", normal: "http://example.com/" },
+    { text: "http://example.com:/", normal: "http://example.com/" },
+    { text: "http://example.com:80/", normal: "http://example.com/" },
+    { text: "HTTP://www.EXAMPLE.com/", normal: "http://www.example.com/" },
+    { text: "http://example.com:0080", normal: "http://example.com/" },
+    { text: "http://example.com:8080", normal: "http://example.com:8080/" },
+    { text: "https://example.com:443/a", normal: "https://example.com/a" },
+    { text: "https://example.com:80/a", normal: "https://example.com:80/a" },
+    { text: "ws://h:80", normal: "ws://h/" },
+    { text: "wss://h:443", normal: "wss://h/" },
+    { text: "ftp://h:21/x", normal: "ftp://h/x" },
+    { text: "foo://h:80", normal: "foo://h:80/" },
+    { text: "http://[2001:DB8:0:0:0:0:0:1]/", normal: "http://[2001:db8::1]/" },
+    { text: "http://[::FFFF:C000:201]:080/", normal: "http://[::ffff:192.0.2.1]/" },
+    {
+      text: "http://USER:Pass@Host/%7euser/%2e%2E/x?%7e=%2f#%7E%2f",
+      normal: "http://USER:Pass@host/x?~=%2F#~%2F",
+    },
+    { text: "http://h/a/%2e/b", normal: "http://h/a/b" },
+    { text: "http://h/a%2Fb/../c", normal: "http://h/c" },
+    { text: "http://h/..", normal: "http://h/" },
+    { text: "http://h/a?b/../c#d/./e", normal: "http://h/a?b/../c#d/./e" },
+    { text: "mailto:John.Doe@Example.COM", normal: "mailto:John.Doe@Example.COM" },
+    { text: "URN:ISBN:0-395-36341-1", normal: "urn:ISBN:0-395-36341-1" },
+    { text: "file:///a/../b", normal: "file:///b" },
+    { text: "a:/..//b", normal: "a:/.//b" },
+    { text: "http://h?", normal: "http://h/?" },
+    { text: "http://@h", normal: "http://@h/" },
+    { text: "http://h/a+b%20c?d+e%20f", normal: "http://h/a+b%20c?d+e%20f" },
+  ]
+
+test "`{c.text}` normalizes to `{c.normal}`" for c: Normal in normals() {
+  assert_eq(url_render(url_normalized(read(c.text))), c.normal);
+  assert_eq(url_normalized(read(c.normal)), read(c.normal))
+}
+
+test "URLs are equal as their texts are, and equivalent as their normal forms are" {
+  assert(read("http://example.com/") != read("HTTP://EXAMPLE.COM:80/"));
+  assert_eq(
+    url_normalized(read("http://example.com/")),
+    url_normalized(read("HTTP://EXAMPLE.COM:80/")),
+  );
+  assert_eq(compare(read("http://a/"), read("http://b/")), Less);
+  let seen: Map<Url, Int> = map_insert(
+    map_insert(map_new(), read("http://b/"), 2),
+    read("http://a/"),
+    1,
+  );
+  assert_eq(map(map_keys(seen), url_render), ["http://a/", "http://b/"])
+}
+
+test "a URL is shown with its password hidden, and rendered with it" {
+  let u = read("https://alice:s3cret@example.com/x");
+  assert_eq(show(u), "https://alice:xxxxx@example.com/x");
+  assert_eq(f"{u}", "https://alice:xxxxx@example.com/x");
+  assert_eq(url_redacted(u), "https://alice:xxxxx@example.com/x");
+  assert_eq(url_render(u), "https://alice:s3cret@example.com/x");
+  assert_eq(url_userinfo(u), Some("alice:s3cret"));
+  assert_eq(url_redacted(read("https://alice@example.com/")), "https://alice@example.com/");
+  assert_eq(url_redacted(read("https://alice:@example.com/")), "https://alice:@example.com/");
+  assert_eq(url_redacted(read("https://:pw@example.com/")), "https://:xxxxx@example.com/");
+  assert_eq(url_redacted(read("https://a:b:c@example.com/")), "https://a:xxxxx@example.com/")
+}
+
+test "a path's segments are decoded one by one, so an escaped slash separates nothing" {
+  let decoded = |text: String| url_path_segments(read(text));
+  assert_eq(decoded("http://h/a/b"), Some(["a", "b"]));
+  assert_eq(decoded("http://h/a%2Fb/c"), Some(["a/b", "c"]));
+  assert_eq(decoded("http://h/a/"), Some(["a", ""]));
+  assert_eq(decoded("http://h/"), Some([""]));
+  assert_eq(decoded("http://h"), Some([]));
+  assert_eq(decoded("http://h//a"), Some(["", "a"]));
+  assert_eq(decoded("mailto:a@b/c%20d"), Some(["a@b", "c d"]));
+  assert_eq(decoded("http://h/%C3%A9"), Some(["\u{E9}"]));
+  assert_eq(decoded("http://h/%FF"), None)
+}
+
+test "a port is a number in range, and a scheme's default where none is written" {
+  assert_eq(url_port(read("http://h:8080/")), Some(8080));
+  assert_eq(url_port(read("http://h:0/")), Some(0));
+  assert_eq(url_port(read("http://h:65535/")), Some(65535));
+  assert_eq(url_port(read("http://h:000000080/")), Some(80));
+  assert_eq(url_port(read("http://h:/")), None);
+  assert_eq(url_port(read("http://h/")), None);
+  assert_eq(url_port_or_default(read("http://h/")), Some(80));
+  assert_eq(url_port_or_default(read("HTTPS://h/")), Some(443));
+  assert_eq(url_port_or_default(read("ws://h")), Some(80));
+  assert_eq(url_port_or_default(read("wss://h")), Some(443));
+  assert_eq(url_port_or_default(read("ftp://h")), Some(21));
+  assert_eq(url_port_or_default(read("gopher://h")), None);
+  assert_eq(url_port_or_default(read("gopher://h:70")), Some(70));
+  assert_eq(url_host_port(read("http://u@H:080/")), Some("H:080"));
+  assert_eq(url_host_port(read("http://[::1]/")), Some("[::1]"));
+  assert_eq(url_host_port(read("mailto:a@b")), None)
+}
+
+test "an origin is a scheme, a host and a port, and two URLs of one are of one origin" {
+  assert_eq(
+    url_origin(read("https://Example.com/a?b")),
+    Some({ scheme: "https", host: Name("example.com"), port: 443 }),
+  );
+  assert_eq(
+    url_origin(read("HTTPS://example.com:443/x")),
+    url_origin(read("https://EXAMPLE.com/y")),
+  );
+  assert(url_origin(read("https://example.com/")) != url_origin(read("http://example.com/")));
+  assert(url_origin(read("https://example.com/")) != url_origin(read("https://example.com:8443/")));
+  assert_eq(url_origin(read("file:///etc/hosts")), None);
+  assert_eq(url_origin(read("gopher://h/")), None);
+  assert_eq(url_origin(read("mailto:a@b")), None)
+}
+
+test "query parameters are read, set, added and removed in their order" {
+  let u = read("https://example.com/search?q=two%20words&page=2&q=again#top");
+  assert_eq(url_param(u, "q"), Some("two words"));
+  assert_eq(url_params(u, "q"), ["two words", "again"]);
+  assert_eq(url_param(u, "missing"), None);
+  assert_eq(
+    url_query_pairs(u),
+    Some([
+      { name: "q", value: "two words" },
+      { name: "page", value: "2" },
+      { name: "q", value: "again" },
+    ]),
+  );
+  let rendered = |changed: Option<Url>| match changed { Some(c) -> url_render(c), None -> "" };
+  assert_eq(
+    rendered(url_set_param(u, "page", "3")),
+    "https://example.com/search?q=two+words&page=3&q=again#top",
+  );
+  assert_eq(rendered(url_set_param(u, "q", "one")), "https://example.com/search?q=one&page=2#top");
+  assert_eq(
+    rendered(url_set_param(u, "lang", "en")),
+    "https://example.com/search?q=two+words&page=2&q=again&lang=en#top",
+  );
+  assert_eq(
+    rendered(url_add_param(u, "q", "a&b=c")),
+    "https://example.com/search?q=two+words&page=2&q=again&q=a%26b%3Dc#top",
+  );
+  assert_eq(rendered(url_remove_param(u, "q")), "https://example.com/search?page=2#top");
+  assert_eq(
+    rendered(url_remove_param(read("https://example.com/?a=1#f"), "a")),
+    "https://example.com/#f",
+  );
+  assert_eq(
+    rendered(url_add_param(read("mailto:a@b"), "subject", "hi there")),
+    "mailto:a@b?subject=hi+there",
+  );
+  assert_eq(url_query_pairs(read("http://h/")), Some([]));
+  assert_eq(url_query_pairs(read("http://h/?")), Some([]));
+  assert_eq(url_query_pairs(read("http://h/?a=%FF")), None);
+  assert_eq(url_set_param(read("http://h/?a=%FF"), "a", "1"), None);
+  assert_eq(url_params(read("http://h/?a=%FF"), "a"), [])
+}
+
+test "a path is joined below the one a URL has, and no segment climbs or splits" {
+  let joined = |text: String, segments: List<String>|
+    match url_join_path(read(text), segments) { Some(u) -> url_render(u), None -> "refused" };
+  assert_eq(joined("https://h/api", ["users", "42"]), "https://h/api/users/42");
+  assert_eq(joined("https://h/api/", ["users"]), "https://h/api/users");
+  assert_eq(joined("https://h", ["a b", "c/d"]), "https://h/a%20b/c%2Fd");
+  assert_eq(joined("https://h/x?q#f", ["y"]), "https://h/x/y");
+  assert_eq(joined("https://h/x", ["..", "y"]), "refused");
+  assert_eq(joined("https://h/x", ["."]), "refused");
+  assert_eq(joined("https://h/x", [""]), "refused");
+  assert_eq(joined("https://h/x", ["%2e%2e", "..."]), "https://h/x/%252e%252e/...");
+  assert_eq(joined("https://h/x", []), "https://h/x")
+}
+
+test "a literal's check answers the URL, or the character that keeps the text from being one" {
+  assert_eq(literal("https://example.com/a?b#c"), Ok(read("https://example.com/a?b#c")));
+  assert_eq(
+    literal("https://exa mple.com/"),
+    Err({ message: "no part of a URL holds this character unencoded", offset: 11 }),
+  );
+  assert_eq(
+    literal("example.com"),
+    Err({ message: "a URL starts with a scheme and a `:`", offset: 0 }),
+  );
+  assert_eq(
+    literal("http://[::1%25eth0]/"),
+    Err({ message: "the host is no address: a zone is no part of an address", offset: 11 }),
+  )
+}
 
 test "percent-encoding leaves the unreserved set and upper-cases the rest" {
   assert_eq(url_encode("a-b_c.d~e"), "a-b_c.d~e");
@@ -145,4 +2113,14 @@ test "a query string parses to pairs and builds back to itself" {
     "a=1&b=two+words",
   );
   assert_eq(query_parse("a=%zz"), None)
+}
+
+test "pairs are got, set and removed by name, the rest left where they stand" {
+  let pairs = [{ name: "a", value: "1" }, { name: "b", value: "2" }, { name: "a", value: "3" }];
+  assert_eq(query_get(pairs, "a"), Some("1"));
+  assert_eq(query_get(pairs, "c"), None);
+  assert_eq(query_set(pairs, "a", "9"), [{ name: "a", value: "9" }, { name: "b", value: "2" }]);
+  assert_eq(query_set(pairs, "c", "9"), push(pairs, { name: "c", value: "9" }));
+  assert_eq(query_remove(pairs, "a"), [{ name: "b", value: "2" }]);
+  assert_eq(query_remove(pairs, "c"), pairs)
 }
