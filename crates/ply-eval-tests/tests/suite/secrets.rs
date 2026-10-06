@@ -198,6 +198,59 @@ test "the three builtins" {
     );
 }
 
+#[test]
+fn a_secret_of_bytes_is_made_joined_measured_and_compared_and_never_read() {
+    passes(
+        r#"
+test "bytes behind a secret" {
+  let a = secret_of_bytes(b"hunter2");
+  assert(a == secret_of_bytes(b"hunter2"));
+  assert(a != secret_of_bytes(b"hunter3"));
+  assert(a != secret_of_bytes(b"hunter"));
+  assert(a != secret_of_bytes(b"hunter22"));
+  assert(a == secret_bytes(secret_of_string("hunter2")));
+  assert_eq(secret_len(a), 7);
+  assert(secret_concat(secret_of_bytes(b"hun"), secret_of_bytes(b"ter2")) == a);
+  assert(secret_decode("hex", secret_of_string("68756e74657232")) == Some(a));
+  assert(secret_decode("hex", secret_of_string("68756e7465723")) == None);
+  assert(!secret_is_empty(a));
+  assert(secret_is_empty(secret_of_bytes(b"")));
+  assert_eq({k: a}, {k: secret_of_bytes(b"hunter2")})
+}
+"#,
+    );
+}
+
+#[test]
+fn a_failing_assertion_over_bytes_prints_no_payload() {
+    let d = fails(
+        r#"
+test "two keys differ" {
+  assert_eq(secret_of_bytes(b"hunter2"), secret_concat(secret_of_bytes(b"correct-"), secret_of_bytes(b"horse")))
+}
+"#,
+    );
+    let text = format!("{d:#?}");
+    assert!(!text.contains("hunter2"), "{text}");
+    assert!(!text.contains("horse"), "{text}");
+}
+
+#[test]
+fn a_secret_of_bytes_is_no_more_shown_ordered_or_matched_than_one_of_a_string() {
+    for source in [
+        "fn f(s: Secret<Bytes>) -> String = f\"{s}\"",
+        "fn f(a: Secret<Bytes>, b: Secret<Bytes>) -> Ordering = compare(a, b)",
+        "fn f(m: Map<Secret<Bytes>, Int>) -> Int = map_len(m)",
+        "fn f(s: Secret<Bytes>) -> Bytes = digest(s)",
+    ] {
+        let diagnostics = Compiled::rejected(source);
+        assert!(
+            diagnostics.iter().any(|d| d.code == codes::NOT_DERIVABLE),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+}
+
 /// A route secrets do not close: the plaintext is still in scope as a `String`.
 #[test]
 fn the_plaintext_the_secret_was_built_from_is_not_consumed() {

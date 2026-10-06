@@ -7,6 +7,7 @@ mod builtins;
 mod carry;
 mod codec;
 mod compiled;
+mod crypto;
 mod decode;
 mod escape;
 mod evaluator;
