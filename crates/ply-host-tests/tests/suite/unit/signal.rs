@@ -303,18 +303,126 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     );
 }
 
-/// Both are flag reads: replaying changes nothing outside the program and neither waits on a peer.
+/// The stop's two are flag reads: replaying changes nothing outside the program. An ask takes the
+/// arrival it answers, so a second one answers otherwise. None waits on a peer.
 #[test]
 fn the_registrations_declare_what_a_reviewer_relies_on() {
     let shutdown = Shutdown::new(Bounds::default());
+    let declaration =
+        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.signal"))
+            .expect("std.signal ships");
     for (op, _) in registrations(Some(&shutdown)) {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
-        assert_eq!(op.linearity, Linearity::Repeatable);
+        let reads = matches!(op.op.as_str(), "stopping" | "deadline_ms");
+        let expected = if reads {
+            Linearity::Repeatable
+        } else {
+            Linearity::AtMostOnce
+        };
+        assert_eq!(op.linearity, expected, "{op}");
         assert!(!op.blocking);
         assert!(!op.secrets, "a stop flag is handed no value at all");
         assert!(op.path.starts_with("ply_host::signal::"));
+        let mode = if reads { "read" } else { "write" };
+        assert!(
+            declaration.contains(&format!("  {mode} {}() ->", op.op)),
+            "`{}` is not declared a `{mode}` in std.signal",
+            op.op
+        );
     }
+}
+
+/// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler.
+fn send_user2() {
+    let sent = std::process::Command::new("kill")
+        .args(["-USR2", &std::process::id().to_string()])
+        .status()
+        .expect("`kill` runs");
+    assert!(sent.success());
+}
+
+fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if shutdown.arrived(which).expect("the handler is installed") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
+    let shutdown = Shutdown::new(Bounds::default());
+    assert!(
+        !shutdown
+            .arrived(Asked::User2)
+            .expect("the first ask installs the handler"),
+        "nothing arrived before anybody asked"
+    );
+    send_user2();
+    assert!(arrives(&shutdown, Asked::User2), "one arrival is seen");
+    send_user2();
+    send_user2();
+    assert!(arrives(&shutdown, Asked::User2), "two arrivals are seen");
+    std::thread::sleep(Duration::from_millis(200));
+    // The second of the two may have landed after the ask that saw the first.
+    let _ = shutdown.arrived(Asked::User2);
+    assert!(
+        !shutdown.arrived(Asked::User2).expect("installed"),
+        "arrivals are not counted: nothing is owed once they were answered"
+    );
+    assert!(
+        !shutdown.stopping(),
+        "a signal asked about is no request to stop"
+    );
+}
+
+#[test]
+fn an_ask_is_answered_through_its_handler() {
+    let shutdown = Shutdown::new(Bounds::default());
+    let handlers = registrations(Some(&shutdown));
+    let (declaration, handler) = handlers
+        .iter()
+        .find(|(op, _)| op.op.as_str() == "resized")
+        .expect("`resized` is registered");
+    let atom = ply_eval::EffectAtom::new(
+        Symbol::new(EFFECT),
+        Resource::Singleton,
+        ply_eval::Mode::Write,
+    );
+    struct Nothing;
+    impl HostRuntime for Nothing {
+        fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            Vec::new()
+        }
+        fn park(&self) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+        fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+            Ok(Value::Unit)
+        }
+    }
+    let answered = handler
+        .call(
+            &Nothing,
+            &HostRequest {
+                atom,
+                op: declaration,
+                args: &[],
+                span: Span::DUMMY,
+                machine: ply_eval::host::MachineId(0),
+                task: None,
+                declared: None,
+            },
+        )
+        .expect("an ask is answered");
+    assert!(matches!(answered, HostAnswer::Value(Value::Bool(false))));
 }
 
 #[test]

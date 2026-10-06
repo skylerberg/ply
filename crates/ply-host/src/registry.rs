@@ -2,9 +2,9 @@
 
 use crate::pool::{Bell, Inbox};
 use crate::signal::{self, Accepting, Shutdown};
-use crate::{certgen, config, fs, process, random, sched, tcp, time, trace};
+use crate::{certgen, config, fs, os, process, random, sched, tcp, term, time, trace};
 use ply_eval::host::{HostRegistry, HostRuntime, MachineId, Pending, ShutdownReport};
-use ply_eval::{Diagnostic, Span, TaskId, Value, codes};
+use ply_eval::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -118,9 +118,11 @@ impl Host {
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
         time::register(&mut registry, Arc::clone(&self.time));
+        os::register(&mut registry);
         certgen::register(&mut registry);
         signal::register(&mut registry, self.shutdown.as_ref());
         process::register(&mut registry, self.process.as_ref());
+        term::register(&mut registry, self.process.as_ref());
         registry
     }
 
@@ -290,6 +292,10 @@ impl HostRuntime for Facilities {
         }
         // The sink flushes before the run's own state is gone.
         self.trace.flush();
+        // Last, since a buffer whose reader has gone ends the process here.
+        if let Some(process) = &self.process {
+            process.settle();
+        }
         ShutdownReport {
             spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),
         }
@@ -333,6 +339,12 @@ impl HostRuntime for Facilities {
             if let Some(expired) = self.drain_expired() {
                 return Err(expired);
             }
+        }
+    }
+
+    fn unanswered(&self, effect: &Symbol, op: &Symbol) {
+        if let Some(process) = &self.process {
+            process.unanswered(effect, op);
         }
     }
 

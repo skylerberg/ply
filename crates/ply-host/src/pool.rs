@@ -43,12 +43,16 @@ pub enum JobOutput {
     Int(i64),
     /// Whether a write happened; a filesystem's state is not the program's error.
     Bool(bool),
+    /// What a read of a stream answered: empty at its end.
+    Bytes(Vec<u8>),
     MaybeBytes(Option<Vec<u8>>),
     MaybeInt(Option<i64>),
     /// `None` when it is not a directory this run can read.
     MaybeStrings(Option<Vec<String>>),
     /// `None` at end of input, which is what reading a line past the last one answers.
     MaybeString(Option<String>),
+    /// A line nothing but `Secret`'s own readers may read; `None` at end of input.
+    MaybeSecret(Option<String>),
     /// A walk's entries, each a path and the kind constructor it names; `None` for no directory.
     MaybeEntries(Option<Vec<(String, &'static str)>>),
     /// A path's nine permission bits, as `std.fs.Mode` holds them.
@@ -343,6 +347,7 @@ fn take(state: &mut State, token: u64) -> Taken {
     Taken::Ready(match done {
         JobOutput::Int(i) => Ok(Value::Int(i)),
         JobOutput::Bool(b) => Ok(Value::Bool(b)),
+        JobOutput::Bytes(b) => Ok(Value::bytes(b)),
         JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
         JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
         JobOutput::MaybeStrings(names) => {
@@ -351,6 +356,9 @@ fn take(state: &mut State, token: u64) -> Taken {
             })))
         }
         JobOutput::MaybeString(text) => Ok(option(text.map(Value::str))),
+        JobOutput::MaybeSecret(text) => {
+            Ok(option(text.map(|text| Value::secret(Value::str(text)))))
+        }
         JobOutput::MaybeEntries(entries) => Ok(option(entries.map(|entries| {
             Value::list(
                 entries

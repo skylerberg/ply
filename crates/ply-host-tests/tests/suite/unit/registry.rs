@@ -53,12 +53,26 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
             "std.time.time.now_ms[..]",
             "std.time.time.elapsed_ms[..]",
             "std.time.time.elapsed_us[..]",
+            // What the machine says of itself is read, never taken.
+            "std.os.os.family[..]",
+            "std.os.os.name[..]",
+            "std.os.os.arch[..]",
+            "std.os.os.cpus[..]",
+            "std.os.os.hostname[..]",
+            "std.os.os.user[..]",
+            "std.os.os.pid[..]",
+            "std.os.os.executable[..]",
+            "std.os.os.endian[..]",
+            "std.os.os.pointer_bits[..]",
             "certgen.issue[..]",
             "std.signal.signal.stopping[..]",
             "std.signal.signal.deadline_ms[..]",
             "std.process.process.args[..]",
             // `--exec` is resolved once, before anything runs.
             "std.process.process.bound[..]",
+            // Asking what a stream is, or how large the terminal is, changes neither.
+            "std.term.term.is_terminal[..]",
+            "std.term.term.size[..]",
         ]
     );
 }

@@ -96,7 +96,7 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         // child drains at its own pace, so each goes to the pool rather than parking the machine.
         let waits = matches!(
             op.op.as_str(),
-            "spawn" | "line" | "wait" | "input" | "output_line"
+            "spawn" | "line" | "in_bytes" | "wait" | "input" | "output_line"
         );
         assert_eq!(op.blocking, waits, "{op}");
         assert!(!op.secrets, "a line or a code is never a credential");
@@ -163,12 +163,68 @@ fn a_captured_sink_collects_both_streams_in_order() {
     assert_eq!(
         host.captured(),
         [
-            (Stream::Out, "one".to_string()),
-            (Stream::Err, "two".to_string()),
-            (Stream::Out, "three".to_string()),
+            (Stream::Out, b"one\n".to_vec()),
+            (Stream::Err, b"two\n".to_vec()),
+            (Stream::Out, b"three\n".to_vec()),
         ]
     );
     assert_eq!(host.requested_exit(), None);
+}
+
+#[test]
+fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
+    let host = host(&[]);
+    let handlers = registrations(Some(&host));
+    let raw = Value::bytes(b"\x00\xff no newline");
+    assert_eq!(
+        value(call(&handlers, Op::OutBytes, std::slice::from_ref(&raw))),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        value(call(&handlers, Op::Err, &[text("warn")])),
+        Value::Unit
+    );
+    assert_eq!(
+        value(call(&handlers, Op::ErrBytes, &[raw])),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        value(call(&handlers, Op::Out, &[text("done")])),
+        Value::Unit
+    );
+    assert_eq!(value(call(&handlers, Op::Flush, &[])), Value::Bool(true));
+    assert_eq!(
+        host.captured(),
+        [
+            (Stream::Out, b"\x00\xff no newline".to_vec()),
+            (Stream::Err, b"warn\n".to_vec()),
+            (Stream::Err, b"\x00\xff no newline".to_vec()),
+            (Stream::Out, b"done\n".to_vec()),
+        ]
+    );
+}
+
+/// Only a host that writes the process's own streams ends the process over them.
+#[test]
+fn a_host_whose_streams_are_captured_leaves_an_unanswered_raise_to_the_run() {
+    let host = host(&[]);
+    host.unanswered(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
+    host.settle();
+    let declaration =
+        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.process"))
+            .expect("std.process ships");
+    assert!(declaration.contains("pub effect pipe {"));
+    assert!(declaration.contains("  raise broken(stream: Stream)"));
+    assert_eq!(PIPE_EFFECT, format!("{MODULE}.pipe"));
+}
+
+#[test]
+fn a_read_of_a_negative_length_is_refused_before_anything_waits() {
+    let host = host(&[]);
+    let handlers = registrations(Some(&host));
+    let refused = call(&handlers, Op::InBytes, &[Value::Int(-1)]).expect_err("no such read");
+    assert_eq!(refused.code, codes::RUNTIME_ERROR);
+    assert!(refused.message.contains("-1"), "{}", refused.message);
 }
 
 #[test]
@@ -1086,8 +1142,8 @@ fn an_inheriting_child_writes_where_the_program_does() {
     assert_eq!(
         lines,
         [
-            (Stream::Out, "from-child".to_string()),
-            (Stream::Err, "complaint".to_string()),
+            (Stream::Out, b"from-child\n".to_vec()),
+            (Stream::Err, b"complaint\n".to_vec()),
         ]
     );
 }

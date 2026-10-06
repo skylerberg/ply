@@ -1,0 +1,1745 @@
+//! The terminal a program talks to: whether there is one, how text is styled for it, what is
+//! typed at it, and progress drawn on it.
+//!
+//! `term.is_terminal` says whether one of the process's streams is a terminal and `term.size`
+//! how large it is; `std.signal`'s `resized` says when the size has changed. `term.mode` changes
+//! how the terminal hands over what is typed, `term.input` reads it, and `term.secret_line`
+//! reads a line no part of the program can show. They are the run's own process's, so they are
+//! bound only by `ply run --host`, and `ply test` withholds them even with `--host` (`E0424`):
+//! a test answers them over a `Screen` with `over`, a scripted terminal that hands out what was
+//! typed and keeps the modes it was put in. What a program writes to a terminal it writes to
+//! standard output or standard error, so what was written is `std.process`'s `Captured`'s to
+//! keep, and a test of a prompt or of progress runs under both twins.
+//!
+//! Everything else here is pure. A `Style` says how much colour a stream takes, and every
+//! function that paints is handed one, so whether to style is decided once, where the facts
+//! are, and passed in. `decide` makes that decision from what the caller asked for, whether the
+//! stream is a terminal, and five variables of the environment, which `style_for` reads through
+//! `std.config`. In order, the first that applies:
+//!
+//! 1. `Never` is no styling and `Always` is styling, whatever follows: a flag outranks the
+//!    environment.
+//! 2. `NO_COLOR` set and not empty is no styling.
+//! 3. `FORCE_COLOR` or `CLICOLOR_FORCE` set, not empty and not `0`, is styling even where the
+//!    stream is no terminal. `FORCE_COLOR=2` asks for 256 colours and `FORCE_COLOR=3` for all
+//!    of them.
+//! 4. A stream that is no terminal is not styled, nor is a terminal whose `TERM` is `dumb`.
+//! 5. A terminal is styled, with the colours it says it has: all of them where `COLORTERM` is
+//!    `truecolor` or `24bit` or `TERM` ends `-direct`, 256 where `TERM` holds `256color`, and
+//!    sixteen otherwise.
+//!
+//! A colour past what the style takes is painted as the nearest one it does take: a
+//! `Rgb` as one of the 256 and either as one of the sixteen.
+//!
+//! `strip` takes the styling back out, and `visible_width` counts the columns what is left
+//! prints in. A character is one column unless a `std.text` `Measure` says otherwise: a wide or
+//! a combining character needs one that knows it, passed in.
+//!
+//! What a terminal sends is bytes, and `decode` reads them as `Event`s: keys with the modifiers
+//! held, a bracketed paste as one event, focus and size reports. A terminal sends a key's whole
+//! sequence at once and a person does not type that fast, so an escape that nothing follows for
+//! `escape_timeout_ms` is the Escape key, which is how `next_event` reads one.
+//!
+//! A `Writer` is the one writer of standard error where progress is drawn on it: the program's
+//! own lines go through it too, so none lands in the middle of a status. On a terminal it redraws
+//! one line in place, no more often than it was told; anywhere else it writes the status as plain
+//! lines, as seldom.
+
+import std.bytes (int_of_ascii)
+import std.config
+import std.config (config)
+import std.list (at_or, contains)
+import std.laws (agrees)
+import std.process
+import std.process (process, pipe, Stream, Stdin, Stdout, Stderr, write_err)
+import std.string (ascii_lower, repeat)
+import std.text
+import std.text (Measure)
+import std.time (time)
+
+/// The terminal the process's streams are, if they are one.
+pub nondet effect term {
+  /// Whether `stream` is a terminal.
+  read is_terminal(stream: Stream) -> Bool
+  /// The columns and rows of the terminal: standard output's if that is one, else standard
+  /// error's, else standard input's; `None` where none is.
+  read size() -> Option<Size>
+  /// Puts the terminal standard input is in `mode` and answers the mode it was in, so a bracket
+  /// puts that back; `None`, and nothing changes, where standard input is no terminal. However
+  /// the run ends, the host leaves the terminal as it found it.
+  write mode(mode: Mode) -> Option<Mode>
+  /// What has been typed, at most `max` bytes, waiting at most `timeout_ms` for the first of
+  /// them and as long as it takes where that is negative. `None` when nothing came in time, and
+  /// empty at the end of input. It reads the buffer `process.line` and `process.in_bytes` read.
+  write input(max: Int, timeout_ms: Int) -> Option<Bytes>
+  /// One line of standard input, without its ending, that nothing but a `Secret`'s own readers
+  /// can read; `None` at the end of input.
+  write secret_line() -> Option<Secret<String>>
+}
+
+/// What asking for a terminal refuses.
+pub effect tty {
+  /// `stream` is not a terminal, and what was asked needs one.
+  raise missing(stream: Stream)
+}
+
+/// A terminal's size in character cells.
+pub type Size = { columns: Int, rows: Int }
+
+/// How a terminal hands over what is typed.
+pub type Mode =
+  /// A line at a time, echoed, as a terminal is found.
+  | Cooked
+  /// A line at a time, with nothing typed shown.
+  | Silent
+  /// Each byte as it is typed, none echoed and none read as a signal, so `ctrl-C` is a key.
+  /// Output is not translated either: a line ends `\r\n`.
+  | Raw
+
+// --- Style ------------------------------------------------------------------
+
+/// How much colour a stream takes.
+pub type Colors =
+  /// No styling at all: text is written as it is.
+  | NoColors
+  /// The eight colours and their bright forms.
+  | Ansi16
+  /// The 256-colour palette.
+  | Ansi256
+  /// Any colour, by its red, green and blue.
+  | TrueColor
+
+/// What decides how text is painted for one stream.
+pub type Style = new { colors: Colors }
+
+/// A style that paints nothing: text is written as it is.
+pub fn plain() -> Style = { colors: NoColors }
+
+/// A style of the sixteen colours, which every terminal that takes any takes.
+pub fn ansi() -> Style = { colors: Ansi16 }
+
+/// A style that takes `colors`.
+pub fn style_of(colors: Colors) -> Style = { colors: colors }
+
+/// Whether the style paints at all.
+pub fn styles(style: Style) -> Bool = style.colors != NoColors
+
+/// What a caller asks of colour.
+pub type Choice =
+  /// Styled where the stream and the environment say so.
+  | Auto
+  | Always
+  | Never
+
+/// What the environment says of colour: each variable as the caller read it, `None` where it is
+/// not set.
+pub type Environment = {
+  no_color: Option<String>,
+  force_color: Option<String>,
+  clicolor_force: Option<String>,
+  term: Option<String>,
+  colorterm: Option<String>,
+}
+
+/// An environment that says nothing.
+pub fn silent_environment() -> Environment =
+  { no_color: None, force_color: None, clicolor_force: None, term: None, colorterm: None }
+
+/// What the run's environment says of colour, read through `std.config` under the label `k`:
+/// `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM` and `COLORTERM`.
+pub fn environment<[k]>() -> Environment / {config.get[k]} =
+  {
+    no_color: config.get[k]("NO_COLOR"),
+    force_color: config.get[k]("FORCE_COLOR"),
+    clicolor_force: config.get[k]("CLICOLOR_FORCE"),
+    term: config.get[k]("TERM"),
+    colorterm: config.get[k]("COLORTERM"),
+  }
+
+/// The style for `stream` as the run finds it: `decide` over what the caller asked for, whether
+/// the stream is a terminal, and the run's environment. A program asks once and hands the style
+/// to whatever paints.
+pub fn style_for<[k]>(choice: Choice, stream: Stream) -> Style / {term.is_terminal, config.get[k]} =
+  decide(choice, term.is_terminal(stream), environment[k]())
+
+fn given(variable: Option<String>) -> Bool = match variable { Some(v) -> v != "", None -> false }
+
+fn forces(variable: Option<String>) -> Bool =
+  match variable { Some(v) -> v != "" && v != "0", None -> false }
+
+/// The colours a terminal says it has.
+fn stated(env: Environment) -> Colors = {
+  let term = match env.term { Some(t) -> ascii_lower(t), None -> "" };
+  let colorterm = match env.colorterm { Some(c) -> ascii_lower(c), None -> "" };
+  if colorterm == "truecolor" || colorterm == "24bit" || string_ends_with(term, "-direct") {
+    TrueColor
+  } else if string_contains(term, "256color") { Ansi256 }
+  else { Ansi16 }
+}
+
+/// The style for a stream: what `choice` asked for, whether the stream is a `terminal`, and
+/// what the environment says, by the precedence this module's head gives.
+pub fn decide(choice: Choice, terminal: Bool, env: Environment) -> Style =
+  match choice {
+    Never -> plain(),
+    Always -> style_of(stated(env)),
+    Auto -> if given(env.no_color) { plain() }
+    else if forces(env.force_color) || forces(env.clicolor_force) {
+      match env.force_color {
+        Some("2") -> style_of(Ansi256),
+        Some("3") -> style_of(TrueColor),
+        _ -> style_of(stated(env)),
+      }
+    } else if !terminal || env.term == Some("dumb") { plain() }
+    else { style_of(stated(env)) },
+  }
+
+/// A colour: one of the eight and their bright forms, one of the 256 by its index, or any by
+/// its red, green and blue, each `0` to `255`. An index or a part outside that is its nearest end.
+pub type Color =
+  | Black
+  | Red
+  | Green
+  | Yellow
+  | Blue
+  | Magenta
+  | Cyan
+  | White
+  | BrightBlack
+  | BrightRed
+  | BrightGreen
+  | BrightYellow
+  | BrightBlue
+  | BrightMagenta
+  | BrightCyan
+  | BrightWhite
+  | Indexed(Int)
+  | Rgb(Int, Int, Int)
+
+/// How a run of text looks: its colours, where it sets them, and its attributes.
+pub type Look = {
+  fg: Option<Color>,
+  bg: Option<Color>,
+  bold: Bool,
+  dim: Bool,
+  italic: Bool,
+  underline: Bool,
+  reverse: Bool,
+  strike: Bool,
+}
+
+/// The look of text nothing was done to.
+pub fn look() -> Look =
+  {
+    fg: None,
+    bg: None,
+    bold: false,
+    dim: false,
+    italic: false,
+    underline: false,
+    reverse: false,
+    strike: false,
+  }
+
+/// The look of text in `color`.
+pub fn colored(color: Color) -> Look = { ..look(), fg: Some(color) }
+
+/// `inner` over `outer`: a colour `inner` sets replaces `outer`'s, and an attribute either has
+/// is kept.
+pub fn over_look(outer: Look, inner: Look) -> Look =
+  {
+    fg: match inner.fg { Some(_) -> inner.fg, None -> outer.fg },
+    bg: match inner.bg { Some(_) -> inner.bg, None -> outer.bg },
+    bold: outer.bold || inner.bold,
+    dim: outer.dim || inner.dim,
+    italic: outer.italic || inner.italic,
+    underline: outer.underline || inner.underline,
+    reverse: outer.reverse || inner.reverse,
+    strike: outer.strike || inner.strike,
+  }
+
+fn byte(n: Int) -> Int = max(0, min(n, 255))
+
+/// The index of one of the sixteen, `None` for a colour that is not one of them.
+fn basic(color: Color) -> Option<Int> =
+  match color {
+    Black -> Some(0),
+    Red -> Some(1),
+    Green -> Some(2),
+    Yellow -> Some(3),
+    Blue -> Some(4),
+    Magenta -> Some(5),
+    Cyan -> Some(6),
+    White -> Some(7),
+    BrightBlack -> Some(8),
+    BrightRed -> Some(9),
+    BrightGreen -> Some(10),
+    BrightYellow -> Some(11),
+    BrightBlue -> Some(12),
+    BrightMagenta -> Some(13),
+    BrightCyan -> Some(14),
+    BrightWhite -> Some(15),
+    Indexed(n) -> if byte(n) < 16 { Some(byte(n)) } else { None },
+    Rgb(_, _, _) -> None,
+  }
+
+type Parts = { r: Int, g: Int, b: Int }
+
+/// What xterm paints each of the sixteen as.
+fn basic_parts() -> List<Parts> =
+  [
+    { r: 0, g: 0, b: 0 },
+    { r: 205, g: 0, b: 0 },
+    { r: 0, g: 205, b: 0 },
+    { r: 205, g: 205, b: 0 },
+    { r: 0, g: 0, b: 238 },
+    { r: 205, g: 0, b: 205 },
+    { r: 0, g: 205, b: 205 },
+    { r: 229, g: 229, b: 229 },
+    { r: 127, g: 127, b: 127 },
+    { r: 255, g: 0, b: 0 },
+    { r: 0, g: 255, b: 0 },
+    { r: 255, g: 255, b: 0 },
+    { r: 92, g: 92, b: 255 },
+    { r: 255, g: 0, b: 255 },
+    { r: 0, g: 255, b: 255 },
+    { r: 255, g: 255, b: 255 },
+  ]
+
+/// What one step of the 256's colour cube paints a part as.
+fn cube_part(step: Int) -> Int = if step == 0 { 0 } else { 55 + 40 * step }
+
+/// What an index of the 256 paints.
+fn indexed_parts(n: Int) -> Parts =
+  if n < 16 { at_or(basic_parts(), n, { r: 0, g: 0, b: 0 }) } else if n < 232 {
+    let c = n - 16;
+    { r: cube_part(c / 36), g: cube_part(c / 6 % 6), b: cube_part(c % 6) }
+  } else {
+    let grey = 8 + 10 * (n - 232);
+    { r: grey, g: grey, b: grey }
+  }
+
+fn distance(a: Parts, b: Parts) -> Int =
+  (a.r - b.r) * (a.r - b.r) + (a.g - b.g) * (a.g - b.g) + (a.b - b.b) * (a.b - b.b)
+
+/// The step of the colour cube nearest a part.
+fn cube_step(part: Int) -> Int =
+  if part < 48 { 0 } else if part < 115 { 1 } else { (part - 35) / 40 }
+
+/// The index among the 240 past the sixteen that paints nearest `p`: the cube's, or a grey's
+/// where that is nearer.
+fn nearest_indexed(p: Parts) -> Int = {
+  let cube = 16 + 36 * cube_step(p.r) + 6 * cube_step(p.g) + cube_step(p.b);
+  let grey = 232 + max(0, min((p.r + p.g + p.b) / 3 - 3, 239)) / 10;
+  if distance(p, indexed_parts(grey)) < distance(p, indexed_parts(cube)) { grey } else { cube }
+}
+
+/// The index among the sixteen that paints nearest `p`, the first of two as near.
+fn nearest_basic(p: Parts) -> Int =
+  fold(range(0, 16), 0, |best: Int, n: Int|
+    if distance(p, indexed_parts(n)) < distance(p, indexed_parts(best)) { n } else { best })
+
+fn parts_of(color: Color) -> Parts =
+  match color {
+    Rgb(r, g, b) -> { r: byte(r), g: byte(g), b: byte(b) },
+    Indexed(n) -> indexed_parts(byte(n)),
+    _ -> match basic(color) { Some(n) -> indexed_parts(n), None -> { r: 0, g: 0, b: 0 } },
+  }
+
+fn basic_code(n: Int, base: Int) -> String =
+  int_to_string(if n < 8 { base + n } else { base + 60 + n - 8 })
+
+/// The parameters that set `color`, on text where `base` is 30 and behind it where it is 40, as
+/// near as `colors` takes.
+fn color_code(colors: Colors, color: Color, base: Int) -> String =
+  match basic(color) {
+    Some(n) -> basic_code(n, base),
+    None -> match colors {
+      NoColors -> "",
+      Ansi16 -> basic_code(nearest_basic(parts_of(color)), base),
+      Ansi256 ->
+        int_to_string(base + 8) ++ ";5;"
+          ++ int_to_string(match color {
+            Indexed(n) -> byte(n),
+            _ -> nearest_indexed(parts_of(color)),
+          }),
+      TrueColor -> match color {
+        Indexed(n) -> int_to_string(base + 8) ++ ";5;" ++ int_to_string(byte(n)),
+        _ -> {
+          let p = parts_of(color);
+          int_to_string(base + 8) ++ ";2;" ++ int_to_string(p.r) ++ ";" ++ int_to_string(p.g) ++ ";"
+            ++ int_to_string(p.b)
+        },
+      },
+    },
+  }
+
+/// The parameters of the sequence that gives text `look`, attributes first; empty for a look
+/// that sets nothing.
+fn codes(colors: Colors, look: Look) -> String = {
+  let attributes = fold(
+    [
+      { on: look.bold, code: "1" },
+      { on: look.dim, code: "2" },
+      { on: look.italic, code: "3" },
+      { on: look.underline, code: "4" },
+      { on: look.reverse, code: "7" },
+      { on: look.strike, code: "9" },
+    ],
+    [],
+    |acc: List<String>, a: { on: Bool, code: String }| if a.on { push(acc, a.code) } else { acc },
+  );
+  let fg = match look.fg {
+    Some(c) -> push(attributes, color_code(colors, c, 30)),
+    None -> attributes,
+  };
+  let all = match look.bg { Some(c) -> push(fg, color_code(colors, c, 40)), None -> fg };
+  fold(all, "", |acc: String, code: String| if acc == "" { code } else { acc ++ ";" ++ code })
+}
+
+fn escape() -> String = "\u{1b}"
+
+/// `text` with `look`, as `style` takes it: the sequence that sets the look, the text, and the
+/// reset. A style that paints nothing, and a look that sets nothing, answer the text as it is.
+pub fn paint(style: Style, look: Look, text: String) -> String =
+  if !styles(style) { text } else {
+    let set = codes(style.colors, look);
+    if set == "" { text } else { escape() ++ "[" ++ set ++ "m" ++ text ++ escape() ++ "[0m" }
+  }
+
+/// `text` in bold.
+pub fn bold(style: Style, text: String) -> String = paint(style, { ..look(), bold: true }, text)
+
+/// `text` dimmed.
+pub fn dim(style: Style, text: String) -> String = paint(style, { ..look(), dim: true }, text)
+
+/// `text` in red.
+pub fn red(style: Style, text: String) -> String = paint(style, colored(Red), text)
+
+/// `text` in green.
+pub fn green(style: Style, text: String) -> String = paint(style, colored(Green), text)
+
+/// `text` in yellow.
+pub fn yellow(style: Style, text: String) -> String = paint(style, colored(Yellow), text)
+
+/// Text whose parts look different: a run of it, or parts under one look, which each part's own
+/// look is laid over.
+pub type Span = | Run(String) | Painted(Look, List<Span>)
+
+fn rendered(style: Style, under: Look, span: Span) -> String =
+  match span {
+    Run(text) -> paint(style, under, text),
+    Painted(inner, parts) ->
+      fold(parts, "", |acc: String, part: Span|
+        acc ++ rendered(style, over_look(under, inner), part)),
+  }
+
+/// The span as text for a stream that takes `style`. Each run is painted whole, with every look
+/// over it, so where a part ends the look around it is what the next run has.
+pub fn render(style: Style, span: Span) -> String = rendered(style, look(), span)
+
+/// What the span says, with no styling.
+pub fn text_of(span: Span) -> String = rendered(plain(), look(), span)
+
+// --- Reading styled text ----------------------------------------------------
+
+/// Where the escape sequence that starts at `i` ends: past a control sequence's final byte, past
+/// the bell or the `ESC \` that ends an operating-system command, and past the one byte after any
+/// other escape.
+fn sequence_end(b: Bytes, i: Int) -> Int / {abort.raise} = {
+  let n = bytes_len(b);
+  if i + 1 >= n { n } else {
+    match bytes_at(b, i + 1) {
+      b'[' -> {
+        let last = bytes_scan(b, i + 2, b"0123456789:;<=>? !\"#$%&'()*+,-./", n - (i + 2));
+        if last < n && bytes_at(b, last) >= 0x40 && bytes_at(b, last) <= 0x7e { last + 1 }
+        else { last }
+      },
+      b']' -> {
+        let bell = bytes_index_of_from(b, b"\x07", i + 2);
+        let st = bytes_index_of_from(b, b"\x1b\\", i + 2);
+        match bell {
+          Some(at) -> match st { Some(s) -> if s < at { s + 2 } else { at + 1 }, None -> at + 1 },
+          None -> match st { Some(s) -> s + 2, None -> n },
+        }
+      },
+      _ -> i + 2,
+    }
+  }
+}
+
+/// `text` with every escape sequence taken out: what a stream that takes no styling should be
+/// written.
+pub fn strip(text: String) -> String / {abort.raise} = {
+  let b = bytes_of_string(text);
+  let n = bytes_len(b);
+  let kept = iterate({ at: 0, parts: [] }, n + 1, |s: { at: Int, parts: List<Bytes> }|
+    if s.at >= n { Stop(s.parts) } else {
+      match bytes_index_of_from(b, b"\x1b", s.at) {
+        None -> Stop(push(s.parts, bytes_slice(b, s.at, n))),
+        Some(esc) ->
+          Continue({ at: sequence_end(b, esc), parts: push(s.parts, bytes_slice(b, s.at, esc)) }),
+      }
+    });
+  string_of_bytes_lossy(bytes_concat_all(kept))
+}
+
+/// The columns `text` prints in once its escape sequences are taken out, each character one
+/// column unless `measure` says otherwise.
+pub fn visible_width(text: String, measure: Measure = None) -> Int / {abort.raise} =
+  text::width(strip(text), measure)
+
+// --- Keys -------------------------------------------------------------------
+
+/// A key, apart from what was held with it.
+pub type Key =
+  /// A character typed, as the terminal sent it: a held shift is in the character, not the chord.
+  | Character(Char)
+  | Enter
+  | Tab
+  | Backspace
+  | Escape
+  | Up
+  | Down
+  | Left
+  | Right
+  | Home
+  | End
+  | PageUp
+  | PageDown
+  | Insert
+  | Delete
+  /// A function key by its number, `F(1)` to `F(20)`.
+  | F(Int)
+
+/// A key and what was held as it was pressed. A terminal says only what its sequences can: a
+/// control character is `ctrl` and its letter in lower case, and an escape before a key is `alt`.
+pub type Chord = { key: Key, ctrl: Bool, alt: Bool, shift: Bool }
+
+/// What a terminal sends.
+pub type Event =
+  | Pressed(Chord)
+  /// What was pasted between the marks of a bracketed paste, which a terminal sends once
+  /// `\x1b[?2004h` has asked it to.
+  | Pasted(Bytes)
+  /// The terminal's window took the focus or lost it, reported once `\x1b[?1004h` has asked.
+  | Focused(Bool)
+  /// The terminal's size, where it reports one in its input.
+  | Resized(Size)
+  /// A sequence this module has no name for, or bytes that are no character.
+  | Unknown(Bytes)
+
+/// `key` with nothing held.
+pub fn chord(key: Key) -> Chord = { key: key, ctrl: false, alt: false, shift: false }
+
+/// How long nothing may follow an escape before it is the Escape key, in milliseconds.
+pub fn escape_timeout_ms() -> Int = 50
+
+/// What `decode` made of some bytes: the events they hold, and the bytes of a sequence that had
+/// not all arrived.
+pub type Decoded = { events: List<Event>, rest: Bytes }
+
+type Got = { event: Event, next: Int }
+
+fn letter(c: Int) -> Char = match char_of_int(c) { Some(ch) -> ch, None -> '?' }
+
+/// The key one byte below `0x80` is, the escape apart.
+fn ascii_key(c: Int) -> Chord =
+  match c {
+    0x0d | 0x0a -> chord(Enter),
+    0x09 -> chord(Tab),
+    0x7f -> chord(Backspace),
+    0x00 -> { ..chord(Character(' ')), ctrl: true },
+    0x01..=0x1a -> { ..chord(Character(letter(c + 0x60))), ctrl: true },
+    0x1c..=0x1f -> { ..chord(Character(letter(c + 0x40))), ctrl: true },
+    _ -> chord(Character(letter(c))),
+  }
+
+fn unknown(b: Bytes, from: Int, to: Int) -> Got / {abort.raise} =
+  { event: Unknown(bytes_slice(b, from, to)), next: to }
+
+/// How many bytes the character a lead byte starts takes; zero for a byte that starts none.
+fn utf8_len(lead: Int) -> Int =
+  if lead >= 0xc2 && lead < 0xe0 { 2 }
+  else if lead >= 0xe0 && lead < 0xf0 { 3 }
+  else if lead >= 0xf0 && lead <= 0xf4 { 4 }
+  else { 0 }
+
+/// The key at `i`, which is no escape: `None` where a character's bytes have not all arrived.
+fn keyed(b: Bytes, i: Int, settled: Bool) -> Option<Got> / {abort.raise} = {
+  let c = bytes_at(b, i);
+  let need = utf8_len(c);
+  let have = bytes_len(b) - i;
+  if c < 0x80 { Some({ event: Pressed(ascii_key(c)), next: i + 1 }) }
+  else if need == 0 { Some(unknown(b, i, i + 1)) }
+  else if have < need { if settled { Some(unknown(b, i, bytes_len(b))) } else { None } } else {
+    let piece = bytes_slice(b, i, i + need);
+    if !bytes_is_utf8(piece) { Some(unknown(b, i, i + 1)) } else {
+      match string_chars(string_of_bytes(piece)) {
+        [ch, ..] -> Some({ event: Pressed(chord(Character(ch))), next: i + need }),
+        [] -> Some(unknown(b, i, i + 1)),
+      }
+    }
+  }
+}
+
+/// `key` with what a sequence's modifier parameter says was held: one more than the sum of 1
+/// for shift, 2 for alt and 4 for control.
+fn held(key: Key, modifier: Int) -> Chord = {
+  let bits = max(modifier, 1) - 1;
+  { key: key, shift: bits & 1 != 0, alt: bits & 2 != 0, ctrl: bits & 4 != 0 }
+}
+
+/// The key a control sequence ending `~` names by its first parameter.
+fn tilde_key(n: Int) -> Option<Key> =
+  match n {
+    1 | 7 -> Some(Home),
+    2 -> Some(Insert),
+    3 -> Some(Delete),
+    4 | 8 -> Some(End),
+    5 -> Some(PageUp),
+    6 -> Some(PageDown),
+    11..=15 -> Some(F(n - 10)),
+    17..=21 -> Some(F(n - 11)),
+    23..=26 -> Some(F(n - 12)),
+    28 | 29 -> Some(F(n - 13)),
+    31..=34 -> Some(F(n - 14)),
+    _ -> None,
+  }
+
+/// The key a sequence's final letter names, in a control sequence or after a single shift.
+fn letter_key(last: Int) -> Option<Key> =
+  match last {
+    b'A' -> Some(Up),
+    b'B' -> Some(Down),
+    b'C' -> Some(Right),
+    b'D' -> Some(Left),
+    b'H' -> Some(Home),
+    b'F' -> Some(End),
+    b'P' -> Some(F(1)),
+    b'Q' -> Some(F(2)),
+    b'R' -> Some(F(3)),
+    b'S' -> Some(F(4)),
+    _ -> None,
+  }
+
+/// A sequence's parameters as numbers, one that is empty or no number being zero.
+fn numbers(params: Bytes) -> List<Int> / {abort.raise} =
+  map(bytes_split(params, b";"), |field: Bytes|
+    match int_of_ascii(field) { Some(n) -> n, None -> 0 })
+
+/// What follows a paste's opening mark, to its closing one.
+fn pasted(b: Bytes, from: Int, settled: Bool) -> Option<Got> / {abort.raise} =
+  match bytes_index_of_from(b, b"\x1b[201~", from) {
+    Some(end) -> Some({ event: Pasted(bytes_slice(b, from, end)), next: end + 6 }),
+    None -> if settled {
+      Some({ event: Pasted(bytes_slice(b, from, bytes_len(b))), next: bytes_len(b) })
+    } else { None },
+  }
+
+/// The event a whole control sequence is: its parameters, its final byte, and where it ends.
+fn controlled(
+  b: Bytes,
+  start: Int,
+  params: Bytes,
+  last: Int,
+  next: Int,
+  settled: Bool,
+) -> Option<Got> / {abort.raise} = {
+  let ps = numbers(params);
+  let first = at_or(ps, 0, 0);
+  let modifier = at_or(ps, 1, 1);
+  let pressed = |key: Key| Some({ event: Pressed(held(key, modifier)), next: next });
+  let private = bytes_len(params) > 0 && bytes_at(params, 0) >= b'<';
+  if private { Some(unknown(b, start, next)) } else {
+    match last {
+      b'~' -> if first == 200 { pasted(b, next, settled) } else {
+        match tilde_key(first) { Some(key) -> pressed(key), None -> Some(unknown(b, start, next)) }
+      },
+      b'Z' -> Some({ event: Pressed({ ..chord(Tab), shift: true }), next: next }),
+      b'I' -> Some({ event: Focused(true), next: next }),
+      b'O' -> Some({ event: Focused(false), next: next }),
+      b'u' -> match char_of_int(first) {
+        Some(ch) -> pressed(Character(ch)),
+        None -> Some(unknown(b, start, next)),
+      },
+      b't' -> if (first == 8 || first == 48) && len(ps) >= 3 {
+        Some({ event: Resized({ columns: at_or(ps, 2, 0), rows: at_or(ps, 1, 0) }), next: next })
+      } else { Some(unknown(b, start, next)) },
+      _ -> match letter_key(last) {
+        Some(key) -> pressed(key),
+        None -> Some(unknown(b, start, next)),
+      },
+    }
+  }
+}
+
+/// The event the escape at `i` starts: `None` where its sequence has not all arrived.
+fn escaped(b: Bytes, i: Int, settled: Bool) -> Option<Got> / {abort.raise} = {
+  let n = bytes_len(b);
+  let alone = |key: Key|
+    if settled { Some({ event: Pressed({ ..chord(key), alt: key != Escape }), next: n }) }
+    else { None };
+  if i + 1 >= n { alone(Escape) } else {
+    match bytes_at(b, i + 1) {
+      b'[' -> {
+        let params_end = bytes_scan(b, i + 2, b"0123456789:;<=>?", n - (i + 2));
+        let last = bytes_scan(b, params_end, b" !\"#$%&'()*+,-./", n - params_end);
+        if last >= n {
+          if i + 2 >= n { alone(Character('[')) }
+          else if settled { Some(unknown(b, i, n)) }
+          else { None }
+        } else if bytes_at(b, last) < 0x40 || bytes_at(b, last) > 0x7e { Some(unknown(b, i, last)) }
+        else {
+          controlled(b, i, bytes_slice(b, i + 2, params_end), bytes_at(b, last), last + 1, settled)
+        }
+      },
+      b'O' -> if i + 2 >= n { alone(Character('O')) } else {
+        match letter_key(bytes_at(b, i + 2)) {
+          Some(key) -> Some({ event: Pressed(chord(key)), next: i + 3 }),
+          None -> if bytes_at(b, i + 2) == b'M' {
+            Some({ event: Pressed(chord(Enter)), next: i + 3 })
+          } else { Some(unknown(b, i, i + 3)) },
+        }
+      },
+      0x1b -> Some({ event: Pressed({ ..chord(Escape), alt: true }), next: i + 2 }),
+      _ -> match keyed(b, i + 1, settled) {
+        None -> None,
+        Some(got) -> match got.event {
+          Pressed(c) -> Some({ event: Pressed({ ..c, alt: true }), next: got.next }),
+          _ -> Some(unknown(b, i, got.next)),
+        },
+      },
+    }
+  }
+}
+
+/// The events `bytes` hold, in order. Where `settled` is false, more bytes may be on their way,
+/// and what could be the start of a longer sequence is left in `rest` for them to join; where it
+/// is true nothing more is coming, so a lone escape is the Escape key and an escape before a key
+/// is that key with `alt`.
+pub fn decode(bytes: Bytes, settled: Bool) -> Decoded / {abort.raise} = {
+  let n = bytes_len(bytes);
+  let read = iterate({ at: 0, events: [] }, n + 1, |s: { at: Int, events: List<Event> }|
+    if s.at >= n { Stop(s) } else {
+      let got = if bytes_at(bytes, s.at) == 0x1b { escaped(bytes, s.at, settled) }
+      else { keyed(bytes, s.at, settled) };
+      match got {
+        None -> Stop(s),
+        Some(g) -> Continue({ at: g.next, events: push(s.events, g.event) }),
+      }
+    });
+  { events: read.events, rest: bytes_slice(bytes, read.at, n) }
+}
+
+/// What a reader of events holds between reads: the bytes of a sequence still arriving, the
+/// events read and not yet handed out, and whether the input has ended.
+pub type Pending = { rest: Bytes, ready: List<Event>, ended: Bool }
+
+/// A reader that has read nothing.
+pub fn pending() -> Pending = { rest: b"", ready: [], ended: false }
+
+/// One event, or none, and the reader after it.
+pub type Next = { event: Option<Event>, pending: Pending }
+
+fn handed(p: Pending) -> Next =
+  match p.ready {
+    [first, ..rest] -> { event: Some(first), pending: { ..p, ready: rest } },
+    [] -> { event: None, pending: p },
+  }
+
+/// The next event: one already read, else what the terminal sends within `wait_ms`, or however
+/// long it takes where that is negative. `None` when nothing came in time, and from then on once
+/// the input has ended. A sequence is waited for `escape_timeout_ms` a read, and one longer than
+/// `limit` bytes, as an endless paste would be, is handed out as far as it got.
+pub fn next_event(p: Pending, wait_ms: Int, limit: Int) -> Next / {term.input, abort.raise} =
+  if len(p.ready) > 0 || p.ended { handed(p) } else {
+    handed(
+      iterate(p, max(limit, 0) + 2, |s: Pending| {
+        let partial = bytes_len(s.rest) > 0;
+        let heard = term.input(256, if partial { escape_timeout_ms() } else { wait_ms });
+        let more = match heard { Some(bytes) -> bytes, None -> b"" };
+        let ended = heard == Some(b"");
+        let quiet = bytes_len(more) == 0;
+        let all = bytes_concat(s.rest, more);
+        let read = decode(all, quiet || bytes_len(all) > limit);
+        let now = { rest: read.rest, ready: read.events, ended: ended };
+        if len(read.events) > 0 || quiet { Stop(now) } else { Continue(now) }
+      }),
+    )
+  }
+
+// --- Modes ------------------------------------------------------------------
+
+/// Puts the terminal in `mode` and answers the mode it was in: what a `with_hold` acquires, with
+/// `restored` to let it go.
+pub fn entered(mode: Mode) -> Mode / {term.mode, tty.missing} =
+  match term.mode(mode) { Some(was) -> was, None -> tty.missing(Stdin) }
+
+/// Puts the terminal back in the mode `entered` found it in.
+pub fn restored(was: Mode) -> Unit / {term.mode} = {
+  let _ = term.mode(was);
+  ()
+}
+
+/// `body` with the terminal in raw mode, and in the mode it was found in however `body` ends.
+pub fn raw<a | e>(body: () -> a / e) -> a / {term.mode, tty.missing | e} =
+  with_hold[term_raw](entered(Raw), restored) { was -> body() }
+
+/// What reads a secret where standard input is no terminal.
+pub type Unseen =
+  /// Nothing: a secret is typed where nobody sees it, or not read.
+  | TypedOnly
+  /// The next line of whatever standard input is, as a script pipes one in.
+  | OrPiped
+
+/// A line typed with nothing of it shown, after `prompt` on standard error; `None` at the end of
+/// input. The terminal echoes again however the read ends. Where standard input is no terminal
+/// there is nothing to hide the line from: `TypedOnly` raises `tty.missing`, and `OrPiped` reads
+/// the next line as it is, with no prompt.
+pub fn read_secret<[p]>(
+  prompt: String,
+  unseen: Unseen,
+) -> Option<Secret<String>> / {term.is_terminal, term.mode, term.secret_line, process.err_bytes[p], pipe.broken, tty.missing} =
+  if term.is_terminal(Stdin) {
+    write_err[p](bytes_of_string(prompt));
+    let secret = with_hold[term_silent](entered(Silent), restored) { was -> term.secret_line() };
+    write_err[p](b"\n");
+    secret
+  } else { match unseen { TypedOnly -> tty.missing(Stdin), OrPiped -> term.secret_line() } }
+
+// --- Progress ---------------------------------------------------------------
+
+/// `done` of `total` as a bar `width` columns wide with the share beside it:
+/// `[#####.....]  50%`. A `total` below one is a bar that is full, and one past 2^52 counts as
+/// that.
+pub fn bar(done: Int, total: Int, width: Int) -> String / {abort.raise} = {
+  let whole = min(total, 4503599627370496);
+  let share = if whole < 1 { 100 } else { max(0, min(done, whole)) * 100 / whole };
+  let cells = max(min(width, 4096) - 7, 0);
+  let filled = cells * share / 100;
+  "[" ++ repeat("#", filled) ++ repeat(".", cells - filled) ++ "] "
+    ++ text::aligned(int_to_string(share), 3, text::Right)
+    ++ "%"
+}
+
+/// The mark a spinner shows on its `tick`th turn.
+pub fn spinner(tick: Int) -> String = at_or(["|", "/", "-", "\\"], (tick % 4 + 4) % 4, "|")
+
+/// The one writer of standard error while progress is shown on it.
+pub type Writer = {
+  /// Whether the stream is a terminal, where a status is one line redrawn in place.
+  live: Bool,
+  /// The columns a status may take.
+  columns: Int,
+  /// The least milliseconds between two writes of a status.
+  every_ms: Int,
+  /// The columns each character of a status prints in, one where there is none.
+  measure: Measure,
+  /// The clock's reading when a status was last written.
+  wrote_ms: Option<Int>,
+  /// The status last asked for.
+  status: String,
+  /// Whether that status is still to be written: the interval kept it back.
+  unsaid: Bool,
+  /// Whether a status is on the terminal's line.
+  shown: Bool,
+}
+
+/// A writer for a stream that is `live` where it is a terminal, `columns` wide, writing a status
+/// no more often than every `every_ms` milliseconds. A status is measured a column a character
+/// unless `measure` says otherwise.
+pub fn writer(live: Bool, columns: Int, every_ms: Int, measure: Measure = None) -> Writer =
+  {
+    live: live,
+    columns: columns,
+    every_ms: every_ms,
+    measure: measure,
+    wrote_ms: None,
+    status: "",
+    unsaid: false,
+    shown: false,
+  }
+
+/// What a step of a writer writes, and the writer after it.
+pub type Step = { writer: Writer, bytes: Bytes }
+
+/// The sequence that returns to the line's start and clears it.
+fn cleared() -> String = "\r" ++ escape() ++ "[K"
+
+/// The status on a line of its own, short of the terminal's last column so the line never
+/// wraps. One too wide is cut, and loses its styling, since a cut could fall inside a sequence.
+fn drawn(w: Writer) -> String / {abort.raise} = {
+  let room = max(w.columns - 1, 0);
+  cleared()
+    ++ (if visible_width(w.status, w.measure) <= room { w.status }
+    else { text::truncate(strip(w.status), room, "", w.measure) })
+}
+
+fn due(w: Writer, now_ms: Int) -> Bool =
+  match w.wrote_ms { None -> true, Some(at) -> now_ms -| at >= w.every_ms }
+
+/// The status becomes `status` at `now_ms` on the caller's clock. It is written if none was
+/// written within the writer's interval, and is otherwise kept for the next step that may write:
+/// redrawn in place on a terminal, cut to its width, and as a line of its own anywhere else. A
+/// status that is already written is not written again.
+pub fn status_step(w: Writer, now_ms: Int, status: String) -> Step / {abort.raise} = {
+  let asked = { ..w, status: status, unsaid: w.unsaid || status != w.status };
+  if !asked.unsaid || !due(w, now_ms) { { writer: asked, bytes: b"" } } else {
+    {
+      writer: { ..asked, unsaid: false, wrote_ms: Some(now_ms), shown: w.live },
+      bytes: bytes_of_string(if w.live { drawn(asked) } else { lined(status) }),
+    }
+  }
+}
+
+/// A status as a line of its own, an empty one being no line.
+fn lined(status: String) -> String = if status == "" { "" } else { status ++ "\n" }
+
+/// A line of the program's own: on a terminal the status makes way for it and is drawn again
+/// below it, and anywhere else it is the line.
+pub fn line_step(w: Writer, line: String) -> Step / {abort.raise} =
+  {
+    writer: w,
+    bytes: bytes_of_string(if w.live && w.shown { cleared() ++ line ++ "\n" ++ drawn(w) }
+    else { line ++ "\n" }),
+  }
+
+/// The end of the progress: on a terminal the status is cleared away, and anywhere else the last
+/// status is written if the interval kept it back.
+pub fn finish_step(w: Writer) -> Step = {
+  let ended = { ..w, status: "", unsaid: false, shown: false };
+  if w.live { { writer: ended, bytes: bytes_of_string(if w.shown { cleared() } else { "" }) } }
+  else { { writer: ended, bytes: bytes_of_string(if w.unsaid { lined(w.status) } else { "" }) } }
+}
+
+/// A writer for standard error as the run finds it: live where it is a terminal, as wide as the
+/// terminal is, or 80 columns where it does not say.
+pub fn stderr_writer(
+  every_ms: Int,
+  measure: Measure = None,
+) -> Writer / {term.is_terminal, term.size} =
+  writer(
+    term.is_terminal(Stderr),
+    match term.size() { Some(size) -> size.columns, None -> 80 },
+    every_ms,
+    measure,
+  )
+
+fn stepped<[p]>(step: Step) -> Writer / {process.err_bytes[p], pipe.broken} = {
+  if bytes_len(step.bytes) > 0 { write_err[p](step.bytes) };
+  step.writer
+}
+
+/// Shows `status`, as `status_step` does at the clock's reading.
+pub fn status<[p]>(
+  w: Writer,
+  text: String,
+) -> Writer / {process.err_bytes[p], pipe.broken, time.elapsed_ms, abort.raise} =
+  stepped[p](status_step(w, time.elapsed_ms(), text))
+
+/// Writes a line of the program's own, as `line_step` does.
+pub fn say<[p]>(
+  w: Writer,
+  line: String,
+) -> Writer / {process.err_bytes[p], pipe.broken, abort.raise} = stepped[p](line_step(w, line))
+
+/// Ends the progress, as `finish_step` does.
+pub fn finish<[p]>(w: Writer) -> Writer / {process.err_bytes[p], pipe.broken} =
+  stepped[p](finish_step(w))
+
+// --- The twin ---------------------------------------------------------------
+
+/// What a test hands `over` in place of the host: a scripted terminal.
+pub type Screen = {
+  /// The streams that are a terminal.
+  terminals: List<Stream>,
+  size: Option<Size>,
+  mode: Mode,
+  /// Every mode the terminal was put in, in order.
+  modes: List<Mode>,
+  /// What each `input` is answered with, in order, `None` being a wait that timed out; running
+  /// out is the end of input.
+  typed: List<Option<Bytes>>,
+  /// The lines `secret_line` hands out, in order; running out is the end of input.
+  lines: List<String>,
+}
+
+/// A terminal `columns` by `rows` on all three streams, with nothing typed at it.
+pub fn screen(columns: Int, rows: Int) -> Screen =
+  {
+    terminals: [Stdin, Stdout, Stderr],
+    size: Some({ columns: columns, rows: rows }),
+    mode: Cooked,
+    modes: [],
+    typed: [],
+    lines: [],
+  }
+
+/// No terminal at all: every stream a pipe or a file.
+pub fn no_screen() -> Screen =
+  { terminals: [], size: None, mode: Cooked, modes: [], typed: [], lines: [] }
+
+/// The same terminal, sending these reads' worth of input.
+pub fn typing(s: Screen, typed: List<Option<Bytes>>) -> Screen = { ..s, typed: typed }
+
+/// The same terminal, handing these lines to `secret_line`.
+pub fn answering(s: Screen, lines: List<String>) -> Screen = { ..s, lines: lines }
+
+/// What `go` answered over a twin, and the terminal it left.
+pub type Over<a> = { value: a, screen: Screen }
+
+/// `go` run at the terminal `s`: every operation answered from it, as the host answers them.
+pub fn over<a | e>(s: Screen, go: () -> a / {term.read, term.write | e}) -> Over<a> / e =
+  with_cell[term_twin](s) { twin -> {
+    let value = handle {
+      go()
+    } with {
+      term.is_terminal(stream) -> contains(cell_get(twin).terminals, stream),
+      term.size() -> cell_get(twin).size,
+      term.mode(mode) -> {
+        let was = cell_get(twin);
+        if contains(was.terminals, Stdin) {
+          cell_set(twin, { ..was, mode: mode, modes: push(was.modes, mode) });
+          Some(was.mode)
+        } else { None }
+      },
+      term.input(_, _) -> {
+        let was = cell_get(twin);
+        match was.typed {
+          [] -> Some(b""),
+          [first, ..rest] -> {
+            cell_set(twin, { ..was, typed: rest });
+            first
+          },
+        }
+      },
+      term.secret_line() -> {
+        let was = cell_get(twin);
+        match was.lines {
+          [] -> None,
+          [first, ..rest] -> {
+            cell_set(twin, { ..was, lines: rest });
+            Some(secret_of_string(first))
+          },
+        }
+      },
+    };
+    { value: value, screen: cell_get(twin) }
+  } }
+
+// --- Tests ------------------------------------------------------------------
+
+type Decision = { why: String, choice: Choice, terminal: Bool, env: Environment, colors: Colors }
+
+fn on_xterm() -> Environment = { ..silent_environment(), term: Some("xterm") }
+
+fn decisions() -> List<Decision> =
+  [
+    { why: "a terminal is styled", choice: Auto, terminal: true, env: on_xterm(), colors: Ansi16 },
+    { why: "a pipe is not", choice: Auto, terminal: false, env: on_xterm(), colors: NoColors },
+    {
+      why: "NO_COLOR set leaves a terminal plain",
+      choice: Auto,
+      terminal: true,
+      env: { ..on_xterm(), no_color: Some("1") },
+      colors: NoColors,
+    },
+    {
+      why: "NO_COLOR set to nothing is not set",
+      choice: Auto,
+      terminal: true,
+      env: { ..on_xterm(), no_color: Some("") },
+      colors: Ansi16,
+    },
+    {
+      why: "NO_COLOR outranks FORCE_COLOR",
+      choice: Auto,
+      terminal: true,
+      env: { ..on_xterm(), no_color: Some("1"), force_color: Some("1") },
+      colors: NoColors,
+    },
+    {
+      why: "a flag outranks NO_COLOR",
+      choice: Always,
+      terminal: false,
+      env: { ..on_xterm(), no_color: Some("1") },
+      colors: Ansi16,
+    },
+    {
+      why: "a flag outranks FORCE_COLOR",
+      choice: Never,
+      terminal: true,
+      env: { ..on_xterm(), force_color: Some("1") },
+      colors: NoColors,
+    },
+    {
+      why: "FORCE_COLOR styles a pipe",
+      choice: Auto,
+      terminal: false,
+      env: { ..silent_environment(), force_color: Some("1") },
+      colors: Ansi16,
+    },
+    {
+      why: "CLICOLOR_FORCE styles a pipe",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), clicolor_force: Some("1") },
+      colors: Ansi16,
+    },
+    {
+      why: "CLICOLOR_FORCE of 0 forces nothing",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), clicolor_force: Some("0") },
+      colors: NoColors,
+    },
+    {
+      why: "FORCE_COLOR of 0 forces nothing",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), force_color: Some("0") },
+      colors: NoColors,
+    },
+    {
+      why: "FORCE_COLOR of 2 asks for 256 colours",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), force_color: Some("2") },
+      colors: Ansi256,
+    },
+    {
+      why: "FORCE_COLOR of 3 asks for every colour",
+      choice: Auto,
+      terminal: false,
+      env: { ..on_xterm(), force_color: Some("3") },
+      colors: TrueColor,
+    },
+    {
+      why: "a dumb terminal is not styled",
+      choice: Auto,
+      terminal: true,
+      env: { ..silent_environment(), term: Some("dumb") },
+      colors: NoColors,
+    },
+    {
+      why: "FORCE_COLOR styles a dumb terminal",
+      choice: Auto,
+      terminal: true,
+      env: { ..silent_environment(), term: Some("dumb"), force_color: Some("1") },
+      colors: Ansi16,
+    },
+    {
+      why: "a terminal that names 256 colours has them",
+      choice: Auto,
+      terminal: true,
+      env: { ..silent_environment(), term: Some("xterm-256color") },
+      colors: Ansi256,
+    },
+    {
+      why: "COLORTERM says a terminal has every colour",
+      choice: Auto,
+      terminal: true,
+      env: { ..silent_environment(), term: Some("xterm-256color"), colorterm: Some("truecolor") },
+      colors: TrueColor,
+    },
+    {
+      why: "a direct-colour terminal has every colour",
+      choice: Auto,
+      terminal: true,
+      env: { ..silent_environment(), term: Some("xterm-direct") },
+      colors: TrueColor,
+    },
+    {
+      why: "a terminal that names no type is styled",
+      choice: Auto,
+      terminal: true,
+      env: silent_environment(),
+      colors: Ansi16,
+    },
+    {
+      why: "a flag styles at what the terminal says it has",
+      choice: Always,
+      terminal: false,
+      env: { ..silent_environment(), colorterm: Some("24bit") },
+      colors: TrueColor,
+    },
+  ]
+
+test "{d.why}" for d: Decision in decisions() {
+  assert_eq(decide(d.choice, d.terminal, d.env), style_of(d.colors))
+}
+
+/// The style for standard output over a terminal and an environment a test names.
+fn found(s: Screen, set: List<{ key: String, value: String }>) -> Style =
+  over(s, ||
+    handle {
+      style_for[env](Auto, Stdout)
+    } with {
+      config.get[env](key) -> config::get_step(config::values(set, []), key),
+    }).value
+
+test "a program's style is decided from its stream and its environment, once" {
+  assert_eq(found(screen(80, 24), [{ key: "TERM", value: "xterm-256color" }]), style_of(Ansi256));
+  assert_eq(found(screen(80, 24), [{ key: "NO_COLOR", value: "1" }]), plain());
+  assert_eq(found(no_screen(), [{ key: "TERM", value: "xterm-256color" }]), plain());
+  assert_eq(
+    found(no_screen(), [
+      { key: "CLICOLOR_FORCE", value: "1" },
+      { key: "COLORTERM", value: "truecolor" },
+    ]),
+    style_of(TrueColor),
+  );
+  assert_eq(found({ ..screen(80, 24), terminals: [Stdin, Stderr] }, []), plain())
+}
+
+test "an unstyled stream is written the text and nothing around it" {
+  assert_eq(bold(plain(), "E0001"), "E0001");
+  assert_eq(dim(plain(), "at"), "at");
+  assert_eq(red(plain(), "error"), "error");
+  assert_eq(green(plain(), "checked"), "checked");
+  assert_eq(yellow(plain(), "warning"), "warning");
+  assert_eq(paint(plain(), { ..colored(Rgb(1, 2, 3)), bold: true }, "x"), "x");
+  assert(!styles(plain()));
+  assert(styles(ansi()))
+}
+
+test "a styled stream is written the text between the look's sequence and the reset" {
+  let on = ansi();
+  assert_eq(bytes_of_string(bold(on, "x")), b"\x1b[1mx\x1b[0m");
+  assert_eq(bytes_of_string(dim(on, "x")), b"\x1b[2mx\x1b[0m");
+  assert_eq(bytes_of_string(red(on, "x")), b"\x1b[31mx\x1b[0m");
+  assert_eq(bytes_of_string(green(on, "x")), b"\x1b[32mx\x1b[0m");
+  assert_eq(bytes_of_string(yellow(on, "x")), b"\x1b[33mx\x1b[0m");
+  assert_eq(bytes_of_string(bold(on, "")), b"\x1b[1m\x1b[0m");
+  assert_eq(paint(on, look(), "x"), "x");
+  let every = {
+    fg: Some(BrightWhite),
+    bg: Some(Blue),
+    bold: true,
+    dim: true,
+    italic: true,
+    underline: true,
+    reverse: true,
+    strike: true,
+  };
+  assert_eq(bytes_of_string(paint(on, every, "x")), b"\x1b[1;2;3;4;7;9;97;44mx\x1b[0m")
+}
+
+type Shade = { color: Color, colors: Colors, code: String }
+
+fn shades() -> List<Shade> =
+  [
+    { color: Red, colors: Ansi16, code: "31" },
+    { color: BrightRed, colors: Ansi16, code: "91" },
+    { color: Red, colors: TrueColor, code: "31" },
+    { color: Indexed(3), colors: Ansi256, code: "33" },
+    { color: Indexed(12), colors: Ansi16, code: "94" },
+    { color: Indexed(196), colors: TrueColor, code: "38;5;196" },
+    { color: Indexed(196), colors: Ansi256, code: "38;5;196" },
+    { color: Indexed(196), colors: Ansi16, code: "91" },
+    { color: Indexed(244), colors: Ansi16, code: "90" },
+    { color: Indexed(999), colors: Ansi256, code: "38;5;255" },
+    { color: Rgb(255, 0, 0), colors: TrueColor, code: "38;2;255;0;0" },
+    { color: Rgb(255, 0, 0), colors: Ansi256, code: "38;5;196" },
+    { color: Rgb(255, 0, 0), colors: Ansi16, code: "91" },
+    { color: Rgb(0, 0, 0), colors: Ansi256, code: "38;5;16" },
+    { color: Rgb(128, 128, 128), colors: Ansi256, code: "38;5;244" },
+    { color: Rgb(95, 135, 175), colors: Ansi256, code: "38;5;67" },
+    { color: Rgb(96, 136, 176), colors: Ansi256, code: "38;5;67" },
+    { color: Rgb(300, -5, 12), colors: TrueColor, code: "38;2;255;0;12" },
+    { color: Rgb(10, 200, 10), colors: Ansi16, code: "32" },
+  ]
+
+test "a colour is painted as the nearest one the stream takes" for s: Shade in shades() {
+  assert_eq(paint(style_of(s.colors), colored(s.color), "x"), "\u{1b}[" ++ s.code ++ "mx\u{1b}[0m")
+}
+
+test "a colour behind the text is painted forty and up" {
+  assert_eq(
+    bytes_of_string(paint(style_of(TrueColor), { ..look(), bg: Some(Rgb(1, 2, 3)) }, "x")),
+    b"\x1b[48;2;1;2;3mx\x1b[0m",
+  );
+  assert_eq(
+    bytes_of_string(paint(ansi(), { ..look(), bg: Some(BrightGreen) }, "x")),
+    b"\x1b[102mx\x1b[0m",
+  )
+}
+
+fn nested() -> Span =
+  Painted({ ..look(), bold: true }, [
+    Run("a "),
+    Painted(colored(Red), [Run("b"), Painted({ ..look(), underline: true }, [Run("c")])]),
+    Run(" d"),
+  ])
+
+test "where a part ends, the look around it is the next run's" {
+  assert_eq(
+    bytes_of_string(render(ansi(), nested())),
+    b"\x1b[1ma \x1b[0m\x1b[1;31mb\x1b[0m\x1b[1;4;31mc\x1b[0m\x1b[1m d\x1b[0m",
+  );
+  assert_eq(render(plain(), nested()), "a bc d");
+  assert_eq(text_of(nested()), "a bc d")
+}
+
+test "stripping takes the styling out and leaves the text" {
+  assert_eq(strip(render(style_of(TrueColor), nested())), "a bc d");
+  assert_eq(strip("plain"), "plain");
+  assert_eq(strip(""), "");
+  assert_eq(strip("\u{1b}]8;;https://example.com\u{7}link\u{1b}]8;;\u{7}!"), "link!");
+  assert_eq(strip("\u{1b}]0;title\u{1b}\\shown"), "shown");
+  assert_eq(strip("a\u{1b}[2Kb\u{1b}"), "ab");
+  assert_eq(strip("caf\u{e9} \u{1b}[31m\u{4e16}\u{754c}\u{1b}[0m"), "caf\u{e9} \u{4e16}\u{754c}")
+}
+
+test "a width counts what is seen, a character a column unless a measure says otherwise" {
+  let painted = red(ansi(), "\u{4e16}\u{754c}!");
+  assert_eq(visible_width(painted), 3);
+  assert_eq(visible_width(painted, Some(|c: Char| if int_of_char(c) > 0x2e80 { 2 } else { 1 })), 5);
+  assert_eq(visible_width(""), 0)
+}
+
+type Painting = { picks: List<Int>, colors: Int, parts: List<Int>, bold: Bool, behind: Bool }
+
+/// A text of letters, blanks and characters past ASCII, one for each of `picks`.
+fn lettered(p: Painting) -> String =
+  fold(p.picks, "", |acc: String, pick: Int|
+    acc ++ at_or(["a", "B", " ", "\u{e9}", "\u{4e16}", "[", "m", ";"], (pick % 8 + 8) % 8, "a"))
+
+fn painted_and_stripped(p: Painting) -> String / {abort.raise} = {
+  let colors = at_or([NoColors, Ansi16, Ansi256, TrueColor], (p.colors % 4 + 4) % 4, NoColors);
+  let color = match p.parts {
+    [] -> Red,
+    [n] -> Indexed(n),
+    [r, g, ..rest] -> Rgb(r, g, at_or(rest, 0, 0)),
+  };
+  let colored = if p.behind { { ..look(), bg: Some(color) } } else { colored(color) };
+  strip(paint(style_of(colors), { ..colored, bold: p.bold }, lettered(p)))
+}
+
+law "stripping what was painted leaves the text, whatever the look and whatever colours the stream takes" =
+  agrees(painted_and_stripped, lettered)
+
+type Typed = { said: String, bytes: Bytes, events: List<Event> }
+
+fn press(key: Key) -> Event = Pressed(chord(key))
+
+fn with_held(key: Key, ctrl: Bool, alt: Bool, shift: Bool) -> Event =
+  Pressed({ key: key, ctrl: ctrl, alt: alt, shift: shift })
+
+/// What xterm sends for each key, by its control-sequence documentation.
+fn sequences() -> List<Typed> =
+  [
+    { said: "a letter", bytes: b"a", events: [press(Character('a'))] },
+    { said: "a capital", bytes: b"A", events: [press(Character('A'))] },
+    { said: "enter", bytes: b"\r", events: [press(Enter)] },
+    { said: "a line feed", bytes: b"\n", events: [press(Enter)] },
+    { said: "tab", bytes: b"\t", events: [press(Tab)] },
+    { said: "backspace", bytes: b"\x7f", events: [press(Backspace)] },
+    { said: "ctrl-a", bytes: b"\x01", events: [with_held(Character('a'), true, false, false)] },
+    { said: "ctrl-c", bytes: b"\x03", events: [with_held(Character('c'), true, false, false)] },
+    { said: "ctrl-h", bytes: b"\x08", events: [with_held(Character('h'), true, false, false)] },
+    { said: "ctrl-z", bytes: b"\x1a", events: [with_held(Character('z'), true, false, false)] },
+    { said: "ctrl-space", bytes: b"\x00", events: [with_held(Character(' '), true, false, false)] },
+    {
+      said: "ctrl-backslash",
+      bytes: b"\x1c",
+      events: [with_held(Character('\\'), true, false, false)],
+    },
+    {
+      said: "ctrl-underscore",
+      bytes: b"\x1f",
+      events: [with_held(Character('_'), true, false, false)],
+    },
+    { said: "escape", bytes: b"\x1b", events: [press(Escape)] },
+    { said: "alt-a", bytes: b"\x1ba", events: [with_held(Character('a'), false, true, false)] },
+    { said: "alt-enter", bytes: b"\x1b\r", events: [with_held(Enter, false, true, false)] },
+    {
+      said: "alt-ctrl-a",
+      bytes: b"\x1b\x01",
+      events: [with_held(Character('a'), true, true, false)],
+    },
+    { said: "alt-escape", bytes: b"\x1b\x1b", events: [with_held(Escape, false, true, false)] },
+    {
+      said: "alt-bracket",
+      bytes: b"\x1b[",
+      events: [with_held(Character('['), false, true, false)],
+    },
+    { said: "alt-O", bytes: b"\x1bO", events: [with_held(Character('O'), false, true, false)] },
+    { said: "up", bytes: b"\x1b[A", events: [press(Up)] },
+    { said: "down", bytes: b"\x1b[B", events: [press(Down)] },
+    { said: "right", bytes: b"\x1b[C", events: [press(Right)] },
+    { said: "left", bytes: b"\x1b[D", events: [press(Left)] },
+    { said: "up in application mode", bytes: b"\x1bOA", events: [press(Up)] },
+    { said: "left in application mode", bytes: b"\x1bOD", events: [press(Left)] },
+    { said: "home", bytes: b"\x1b[H", events: [press(Home)] },
+    { said: "end", bytes: b"\x1b[F", events: [press(End)] },
+    { said: "home in application mode", bytes: b"\x1bOH", events: [press(Home)] },
+    { said: "end in application mode", bytes: b"\x1bOF", events: [press(End)] },
+    { said: "home as a VT220 sends it", bytes: b"\x1b[1~", events: [press(Home)] },
+    { said: "end as a VT220 sends it", bytes: b"\x1b[4~", events: [press(End)] },
+    { said: "home as rxvt sends it", bytes: b"\x1b[7~", events: [press(Home)] },
+    { said: "end as rxvt sends it", bytes: b"\x1b[8~", events: [press(End)] },
+    { said: "insert", bytes: b"\x1b[2~", events: [press(Insert)] },
+    { said: "delete", bytes: b"\x1b[3~", events: [press(Delete)] },
+    { said: "page up", bytes: b"\x1b[5~", events: [press(PageUp)] },
+    { said: "page down", bytes: b"\x1b[6~", events: [press(PageDown)] },
+    { said: "F1", bytes: b"\x1bOP", events: [press(F(1))] },
+    { said: "F2", bytes: b"\x1bOQ", events: [press(F(2))] },
+    { said: "F3", bytes: b"\x1bOR", events: [press(F(3))] },
+    { said: "F4", bytes: b"\x1bOS", events: [press(F(4))] },
+    { said: "F1 as a VT220 sends it", bytes: b"\x1b[11~", events: [press(F(1))] },
+    { said: "F5", bytes: b"\x1b[15~", events: [press(F(5))] },
+    { said: "F6", bytes: b"\x1b[17~", events: [press(F(6))] },
+    { said: "F7", bytes: b"\x1b[18~", events: [press(F(7))] },
+    { said: "F8", bytes: b"\x1b[19~", events: [press(F(8))] },
+    { said: "F9", bytes: b"\x1b[20~", events: [press(F(9))] },
+    { said: "F10", bytes: b"\x1b[21~", events: [press(F(10))] },
+    { said: "F11", bytes: b"\x1b[23~", events: [press(F(11))] },
+    { said: "F12", bytes: b"\x1b[24~", events: [press(F(12))] },
+    { said: "F13", bytes: b"\x1b[25~", events: [press(F(13))] },
+    { said: "F15", bytes: b"\x1b[28~", events: [press(F(15))] },
+    { said: "F20", bytes: b"\x1b[34~", events: [press(F(20))] },
+    { said: "shift-up", bytes: b"\x1b[1;2A", events: [with_held(Up, false, false, true)] },
+    { said: "alt-up", bytes: b"\x1b[1;3A", events: [with_held(Up, false, true, false)] },
+    { said: "ctrl-right", bytes: b"\x1b[1;5C", events: [with_held(Right, true, false, false)] },
+    { said: "ctrl-shift-left", bytes: b"\x1b[1;6D", events: [with_held(Left, true, false, true)] },
+    { said: "ctrl-alt-shift-end", bytes: b"\x1b[1;8F", events: [with_held(End, true, true, true)] },
+    { said: "shift-F1", bytes: b"\x1b[1;2P", events: [with_held(F(1), false, false, true)] },
+    { said: "ctrl-delete", bytes: b"\x1b[3;5~", events: [with_held(Delete, true, false, false)] },
+    { said: "shift-F5", bytes: b"\x1b[15;2~", events: [with_held(F(5), false, false, true)] },
+    { said: "shift-tab", bytes: b"\x1b[Z", events: [with_held(Tab, false, false, true)] },
+    { said: "keypad enter", bytes: b"\x1bOM", events: [press(Enter)] },
+    {
+      said: "ctrl-i as CSI u tells it from tab",
+      bytes: b"\x1b[105;5u",
+      events: [with_held(Character('i'), true, false, false)],
+    },
+    { said: "an accented letter", bytes: b"\xc3\xa9", events: [press(Character('\u{e9}'))] },
+    { said: "a wide character", bytes: b"\xe4\xb8\x96", events: [press(Character('\u{4e16}'))] },
+    { said: "an emoji", bytes: b"\xf0\x9f\x98\x80", events: [press(Character('\u{1F600}'))] },
+    { said: "a paste", bytes: b"\x1b[200~ls\r\x1b[A\x1b[201~", events: [Pasted(b"ls\r\x1b[A")] },
+    { said: "an empty paste", bytes: b"\x1b[200~\x1b[201~", events: [Pasted(b"")] },
+    { said: "focus gained", bytes: b"\x1b[I", events: [Focused(true)] },
+    { said: "focus lost", bytes: b"\x1b[O", events: [Focused(false)] },
+    {
+      said: "a size report",
+      bytes: b"\x1b[8;24;80t",
+      events: [Resized({ columns: 80, rows: 24 })],
+    },
+    {
+      said: "a size reported as it changes",
+      bytes: b"\x1b[48;50;132;1000;1320t",
+      events: [Resized({ columns: 132, rows: 50 })],
+    },
+    {
+      said: "a device report this module has no name for",
+      bytes: b"\x1b[?1;2c",
+      events: [Unknown(b"\x1b[?1;2c")],
+    },
+    { said: "a sequence with an unknown end", bytes: b"\x1b[5x", events: [Unknown(b"\x1b[5x")] },
+    { said: "a byte that starts no character", bytes: b"\xff", events: [Unknown(b"\xff")] },
+    { said: "a character cut short", bytes: b"\xe4\xb8", events: [Unknown(b"\xe4\xb8")] },
+    {
+      said: "keys one after another",
+      bytes: b"hi\x1b[A\r",
+      events: [press(Character('h')), press(Character('i')), press(Up), press(Enter)],
+    },
+  ]
+
+test "{t.said} is read as its key" for t: Typed in sequences() {
+  let read = decode(t.bytes, true);
+  assert_eq(read.events, t.events);
+  assert_eq(read.rest, b"")
+}
+
+test "a sequence that has not all arrived waits for the rest, and is read once nothing more is coming" {
+  let waiting = [b"\x1b", b"\x1b[", b"\x1b[1;", b"\x1b[200~half", b"\x1bO", b"\xe4\xb8"];
+  fold(waiting, (), |_: Unit, bytes: Bytes| {
+    let read = decode(bytes, false);
+    assert_eq(read.events, []);
+    assert_eq(read.rest, bytes)
+  });
+  let after = decode(b"ab\x1b[1", false);
+  assert_eq(after.events, [press(Character('a')), press(Character('b'))]);
+  assert_eq(after.rest, b"\x1b[1");
+  assert_eq(decode(bytes_concat(after.rest, b";5C"), false).events, [
+    with_held(Right, true, false, false),
+  ]);
+  assert_eq(decode(b"\x1b[200~half", true).events, [Pasted(b"half")]);
+  assert_eq(decode(b"\x1b[1;", true).events, [Unknown(b"\x1b[1;")])
+}
+
+type Cut = { picks: List<Int>, at: Int }
+
+/// A stream of the bytes sequences are made of, one for each of `picks`.
+fn typed_bytes(picks: List<Int>) -> Bytes =
+  bytes_concat_all(
+    map(picks, |p: Int|
+      at_or(
+        [b"\x1b", b"[", b"O", b"A", b"1", b";", b"~", b"a", b"\xc3", b"\xa9"],
+        (p % 10 + 10) % 10,
+        b"a",
+      )),
+  )
+
+fn read_in_two(c: Cut) -> List<Event> / {abort.raise} = {
+  let all = typed_bytes(c.picks);
+  let n = bytes_len(all);
+  let at = if n == 0 { 0 } else { (c.at % n + n) % n };
+  let first = decode(bytes_slice(all, 0, at), false);
+  let second = decode(bytes_concat(first.rest, bytes_slice(all, at, n)), true);
+  fold(second.events, first.events, |events: List<Event>, e: Event| push(events, e))
+}
+
+fn read_at_once(c: Cut) -> List<Event> / {abort.raise} = decode(typed_bytes(c.picks), true).events
+
+law "what was typed is read the same wherever a read ends" = agrees(read_in_two, read_at_once)
+
+fn events_of(s: Screen, limit: Int) -> Over<List<Event>> / {abort.raise} =
+  over(s, || {
+    let read = iterate(
+      { pending: pending(), events: [] },
+      64,
+      |r: { pending: Pending, events: List<Event> }| {
+        let next = next_event(r.pending, 1000, limit);
+        match next.event {
+          Some(e) -> Continue({ pending: next.pending, events: push(r.events, e) }),
+          None -> if next.pending.ended { Stop(r.events) }
+          else { Continue({ pending: next.pending, events: r.events }) },
+        }
+      },
+    );
+    read
+  })
+
+test "events are read as they arrive, an escape nothing follows being the key" {
+  let typed = [
+    Some(b"a\x1b"),
+    Some(b"[A"),
+    None,
+    Some(b"\x1b"),
+    None,
+    Some(b"\x1b[200~pas"),
+    Some(b"ted\x1b[201~z"),
+  ];
+  let ran = events_of(typing(screen(80, 24), typed), 4096);
+  assert_eq(ran.value, [
+    press(Character('a')),
+    press(Up),
+    press(Escape),
+    Pasted(b"pasted"),
+    press(Character('z')),
+  ]);
+  assert_eq(ran.screen.typed, [])
+}
+
+test "a sequence longer than a reader's limit is handed out as far as it got" {
+  let ran = events_of(
+    typing(screen(80, 24), [Some(b"\x1b[200~0123"), Some(b"4567"), Some(b"89")]),
+    12,
+  );
+  assert_eq(ran.value, [Pasted(b"01234567"), press(Character('8')), press(Character('9'))])
+}
+
+test "raw mode is left however its body ends: by returning, by a raise, and by a clause that does not resume" {
+  let returned = over(screen(80, 24), || raw(|| term.mode(Raw)));
+  assert_eq(returned.value, Some(Raw));
+  assert_eq(returned.screen.modes, [Raw, Raw, Cooked]);
+  assert_eq(returned.screen.mode, Cooked);
+  let raised = over(screen(80, 24), || {
+    let ended: Result<Int, String> = try[abort.raise] { raw(|| panic("mid-key")) };
+    ended
+  });
+  assert_eq(raised.value, Err("mid-key"));
+  assert_eq(raised.screen.modes, [Raw, Cooked]);
+  let abandoned = over(screen(80, 24), ||
+    handle {
+      raw(|| bytes_len(match term.input(1, -1) { Some(b) -> b, None -> b"" }))
+    } with {
+      term.mode(mode) -> term.mode(mode),
+      term.input(_, _) resume k -> -1,
+    });
+  assert_eq(abandoned.value, -1);
+  assert_eq(abandoned.screen.modes, [Raw, Cooked]);
+  let silenced = over({ ..screen(80, 24), mode: Silent }, || raw(|| 0));
+  assert_eq(silenced.screen.modes, [Raw, Silent])
+}
+
+test "raw mode needs a terminal to be in" {
+  let piped = over(no_screen(), || {
+    let entered: Result<Int, Stream> = try[tty.missing] { raw(|| 1) };
+    entered
+  });
+  assert_eq(piped.value, Err(Stdin));
+  assert_eq(piped.screen.modes, [])
+}
+
+type Asked = { secret: Option<Bool>, screen: Screen, err: Bytes }
+
+/// A password asked for at `s`, whether what came back is `expected`, and what was written.
+fn asked(
+  s: Screen,
+  unseen: Unseen,
+  expected: String,
+) -> Asked / {abort.raise, tty.missing, pipe.broken} = {
+  let ran = process::over[proc](process::captured([]), ||
+    over(s, || read_secret[proc]("Password: ", unseen)));
+  match ran.value {
+    None -> panic("the prompt ended the program"),
+    Some(at) ->
+      {
+        secret: match at.value { Some(s) -> Some(secret_verify(s, expected)), None -> None },
+        screen: at.screen,
+        err: process::written_to(ran.captured, Stderr),
+      },
+  }
+}
+
+test "a secret is typed unseen, and the terminal echoes again after it" {
+  let read = asked(answering(screen(80, 24), ["hunter2"]), TypedOnly, "hunter2");
+  assert_eq(read.secret, Some(true));
+  assert_eq(read.screen.modes, [Silent, Cooked]);
+  assert_eq(read.err, b"Password: \n");
+  let ended = asked(screen(80, 24), TypedOnly, "");
+  assert_eq(ended.secret, None);
+  assert_eq(ended.screen.modes, [Silent, Cooked])
+}
+
+test "a secret is not read from a pipe unless the caller says a pipe will do" {
+  let piped = answering(no_screen(), ["from-a-script"]);
+  let refused: Result<Asked, Stream> = try[tty.missing] { asked(piped, TypedOnly, "") };
+  assert_eq(refused, Err(Stdin));
+  let read = asked(piped, OrPiped, "from-a-script");
+  assert_eq(read.secret, Some(true));
+  assert_eq(read.screen.modes, []);
+  assert_eq(read.err, b"")
+}
+
+test "the terminal echoes again when the read of a secret is cut short" {
+  let cut = over(answering(screen(80, 24), ["never read"]), || {
+    let ended: Result<Bool, String> = try[abort.raise] {
+      handle {
+        with_hold[term_silent](entered(Silent), restored) { was -> term.secret_line() == None }
+      } with {
+        term.mode(mode) -> term.mode(mode),
+        term.secret_line() -> panic("interrupted"),
+      }
+    };
+    ended
+  });
+  assert_eq(cut.value, Err("interrupted"));
+  assert_eq(cut.screen.modes, [Silent, Cooked]);
+  assert_eq(cut.screen.mode, Cooked)
+}
+
+test "a bar fills with its share, and a spinner turns" {
+  assert_eq(bar(0, 10, 17), "[..........]   0%");
+  assert_eq(bar(5, 10, 17), "[#####.....]  50%");
+  assert_eq(bar(10, 10, 17), "[##########] 100%");
+  assert_eq(bar(99, 10, 17), "[##########] 100%");
+  assert_eq(bar(-3, 10, 17), "[..........]   0%");
+  assert_eq(bar(1, 0, 17), "[##########] 100%");
+  assert_eq(bar(1, 3, 7), "[]  33%");
+  assert_eq(map(range(-1, 5), spinner), ["\\", "|", "/", "-", "\\", "|"])
+}
+
+fn said(steps: List<Step>) -> List<Bytes> = map(steps, |s: Step| s.bytes)
+
+test "on a terminal a status is one line redrawn in place, no more often than its interval" {
+  let w = writer(true, 12, 100);
+  let first = status_step(w, 1000, "copying 1/3");
+  let early = status_step(first.writer, 1050, "copying 2/3");
+  let later = status_step(early.writer, 1100, "copying 3/3 of them all");
+  let same = status_step(later.writer, 1300, "copying 3/3 of them all");
+  assert_eq(said([first, early, later, same]), [
+    b"\r\x1b[Kcopying 1/3",
+    b"",
+    b"\r\x1b[Kcopying 3/3",
+    b"",
+  ]);
+  let line = line_step(later.writer, "wrote a.txt");
+  assert_eq(line.bytes, b"\r\x1b[Kwrote a.txt\n\r\x1b[Kcopying 3/3");
+  let done = finish_step(line.writer);
+  assert_eq(done.bytes, b"\r\x1b[K");
+  assert_eq(line_step(done.writer, "done").bytes, b"done\n");
+  assert_eq(finish_step(done.writer).bytes, b"")
+}
+
+test "off a terminal a status is a line of its own, as seldom, and the last one is not lost" {
+  let w = writer(false, 80, 1000);
+  let first = status_step(w, 0, "1 of 3");
+  let early = status_step(first.writer, 10, "2 of 3");
+  let line = line_step(early.writer, "wrote a.txt");
+  let later = status_step(line.writer, 1000, "3 of 3");
+  let done = finish_step(later.writer);
+  assert_eq(said([first, early, line, later, done]), [
+    b"1 of 3\n",
+    b"",
+    b"wrote a.txt\n",
+    b"3 of 3\n",
+    b"",
+  ]);
+  let quick = finish_step(writer(false, 80, 1000));
+  assert_eq(quick.bytes, b"");
+  assert_eq(finish_step(early.writer).bytes, b"2 of 3\n");
+  assert_eq(status_step(w, 0, "").bytes, b"")
+}
+
+test "a status too wide for the terminal is cut to it, by what is seen, and one that fits keeps its styling" {
+  let w = writer(true, 8, 0);
+  assert_eq(status_step(w, 0, green(ansi(), "copying")).bytes, b"\r\x1b[K\x1b[32mcopying\x1b[0m");
+  assert_eq(status_step(w, 0, green(ansi(), "copying it")).bytes, b"\r\x1b[Kcopying");
+  let wide = writer(true, 8, 0, Some(|c: Char| if int_of_char(c) > 0x2e80 { 2 } else { 1 }));
+  assert_eq(
+    status_step(wide, 0, "\u{4e16}\u{754c}\u{4e16}\u{754c}").bytes,
+    bytes_of_string("\r\u{1b}[K\u{4e16}\u{754c}\u{4e16}"),
+  );
+  assert_eq(status_step(writer(true, 0, 0), 0, "anything").bytes, b"\r\x1b[K")
+}
+
+test "progress is written to standard error through one writer, on the host's clock" {
+  let ran = process::over[proc](process::captured([]), ||
+    over(screen(40, 10), ||
+      with_cell[ticks](0) { clock ->
+        handle {
+          let w = stderr_writer(100);
+          let one = status[proc](w, bar(1, 2, 17));
+          let two = say[proc](one, "half way");
+          let three = status[proc](two, bar(2, 2, 17));
+          let ended = finish[proc](three);
+          ended.shown
+        } with {
+          time.elapsed_ms() -> {
+            cell_set(clock, cell_get(clock) + 100);
+            cell_get(clock)
+          },
+        }
+      }));
+  assert_eq(
+    process::written_to(ran.captured, Stderr),
+    bytes_concat_all([
+      b"\r\x1b[K[#####.....]  50%",
+      b"\r\x1b[Khalf way\n\r\x1b[K[#####.....]  50%",
+      b"\r\x1b[K[##########] 100%",
+      b"\r\x1b[K",
+    ]),
+  );
+  assert_eq(process::written_to(ran.captured, Stdout), b"")
+}
+
+test "a stream that is no terminal gets its progress as lines" {
+  let ran = process::over[proc](process::captured([]), ||
+    over(no_screen(), || {
+      let w = stderr_writer(0);
+      w.live || w.columns != 80
+    }));
+  assert_eq(ran.value, Some({ value: false, screen: no_screen() }))
+}
+
+test "a terminal says which streams it is and how large it is" {
+  let ran = over({ ..screen(132, 43), terminals: [Stdin, Stderr] }, ||
+    { streams: map([Stdin, Stdout, Stderr], |s: Stream| term.is_terminal(s)), size: term.size() });
+  assert_eq(ran.value.streams, [true, false, true]);
+  assert_eq(ran.value.size, Some({ columns: 132, rows: 43 }))
+}

@@ -567,7 +567,7 @@ fn a_host_with_no_coordinator_is_never_stopping() {
 #[test]
 fn a_withheld_signal_handler_refuses_rather_than_answering() {
     let withheld = ply_host::signal::registrations(None);
-    assert_eq!(withheld.len(), 2);
+    assert_eq!(withheld.len(), ply_host::signal::Op::ALL.len());
     let (declaration, handler) = &withheld[0];
     assert_eq!(declaration.path, "ply_host::signal::stopping");
     let request = HostRequest {
