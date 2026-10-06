@@ -976,7 +976,7 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
 /// offers every root it holds. Its tests compile under `ply test --std`.
 #[test]
 fn the_emitter_refuses_no_body_of_the_standard_library() {
-    let answer = fixture::answered(&fixture::standard_library());
+    let answer = fixture::standard_library();
     assert!(
         answer
             .front

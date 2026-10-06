@@ -694,6 +694,179 @@ fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list(
     }
 }
 
+fn record(fields: Vec<(&str, Value)>) -> Value {
+    Value::Record(std::sync::Arc::new(
+        fields
+            .into_iter()
+            .map(|(name, v)| (ply_eval::Symbol::new(name), v))
+            .collect(),
+    ))
+}
+
+fn option(v: Option<Value>) -> Value {
+    Value::ctor(
+        if v.is_some() { "Some" } else { "None" },
+        v.into_iter().collect(),
+    )
+}
+
+fn entry(e: &(i64, i64)) -> Value {
+    record(vec![("key", Value::Int(e.0)), ("value", Value::Int(e.1))])
+}
+
+fn int_map(entries: &[(i64, i64)]) -> Value {
+    Value::map(
+        entries
+            .iter()
+            .map(|(k, v)| (Value::Int(*k), Value::Int(*v))),
+    )
+}
+
+/// The model is the entries in key order, read with nothing but comparisons.
+#[test]
+fn the_ordered_map_queries_answer_what_a_walk_of_the_entries_answers() {
+    let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..300 {
+        let written: Vec<(i64, i64)> = (0..rng.below(40))
+            .map(|_| (rng.below(60) as i64, rng.below(1000) as i64))
+            .collect();
+        let m = int_map(&written);
+        let model: Vec<(i64, i64)> = written
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeMap<i64, i64>>()
+            .into_iter()
+            .collect();
+        let asked = |b: Builtin, probe: i64| found(b, vec![m.clone(), Value::Int(probe)]);
+        let some_entry = |e: Option<&(i64, i64)>| option(e.map(entry));
+
+        assert_eq!(
+            found(Builtin::MapFirst, vec![m.clone()]),
+            some_entry(model.first())
+        );
+        assert_eq!(
+            found(Builtin::MapLast, vec![m.clone()]),
+            some_entry(model.last())
+        );
+        for (b, last) in [(Builtin::MapPopFirst, false), (Builtin::MapPopLast, true)] {
+            let taken = if last { model.last() } else { model.first() };
+            let rest: Vec<(i64, i64)> =
+                model.iter().copied().filter(|e| Some(e) != taken).collect();
+            let want = option(taken.map(|e| {
+                record(vec![
+                    ("key", Value::Int(e.0)),
+                    ("value", Value::Int(e.1)),
+                    ("rest", int_map(&rest)),
+                ])
+            }));
+            assert_eq!(found(b, vec![m.clone()]), want, "{}", b.name());
+        }
+        for probe in -2..62 {
+            assert_eq!(
+                asked(Builtin::MapFloor, probe),
+                some_entry(model.iter().rfind(|e| e.0 <= probe)),
+                "floor {probe}"
+            );
+            assert_eq!(
+                asked(Builtin::MapBelow, probe),
+                some_entry(model.iter().rfind(|e| e.0 < probe)),
+                "below {probe}"
+            );
+            assert_eq!(
+                asked(Builtin::MapCeiling, probe),
+                some_entry(model.iter().find(|e| e.0 >= probe)),
+                "ceiling {probe}"
+            );
+            assert_eq!(
+                asked(Builtin::MapAbove, probe),
+                some_entry(model.iter().find(|e| e.0 > probe)),
+                "above {probe}"
+            );
+            let side = |keep: fn(i64, i64) -> bool| {
+                let kept: Vec<(i64, i64)> =
+                    model.iter().copied().filter(|e| keep(e.0, probe)).collect();
+                int_map(&kept)
+            };
+            assert_eq!(
+                asked(Builtin::MapSplit, probe),
+                record(vec![
+                    ("below", side(|k, p| k < p)),
+                    (
+                        "at",
+                        option(model.iter().find(|e| e.0 == probe).map(|e| Value::Int(e.1)))
+                    ),
+                    ("above", side(|k, p| k > p)),
+                ]),
+                "split {probe}"
+            );
+        }
+        for _ in 0..40 {
+            let end = |rng: &mut Xorshift| {
+                let key = (rng.below(4) > 0).then(|| rng.below(64) as i64 - 2);
+                (key, rng.below(2) == 0)
+            };
+            let ((lo, lo_inclusive), (hi, hi_inclusive)) = (end(&mut rng), end(&mut rng));
+            let limit = rng.below(45) as i64 - 2;
+            let want: Vec<Value> = model
+                .iter()
+                .filter(|e| lo.is_none_or(|k| e.0 > k || (lo_inclusive && e.0 == k)))
+                .filter(|e| hi.is_none_or(|k| e.0 < k || (hi_inclusive && e.0 == k)))
+                .take(limit.max(0) as usize)
+                .map(entry)
+                .collect();
+            let got = found(
+                Builtin::MapRange,
+                vec![
+                    m.clone(),
+                    option(lo.map(Value::Int)),
+                    Value::Bool(lo_inclusive),
+                    option(hi.map(Value::Int)),
+                    Value::Bool(hi_inclusive),
+                    Value::Int(limit),
+                ],
+            );
+            assert_eq!(
+                got,
+                Value::list(want),
+                "{lo:?} ({lo_inclusive}) to {hi:?} ({hi_inclusive}), at most {limit}"
+            );
+        }
+    }
+}
+
+/// `1.50` and `1.5` are one key, which a probe finds whichever way it is written.
+#[test]
+fn an_ordered_map_query_reads_a_decimal_key_by_its_value() {
+    let dec = |s: &str| Value::Decimal(s.parse().unwrap());
+    let m = Value::map([
+        (dec("1.50"), Value::Int(1)),
+        (dec("2.5"), Value::Int(2)),
+        (dec("3.500"), Value::Int(3)),
+    ]);
+    let held = |k: &str, v: i64| {
+        option(Some(record(vec![
+            ("key", dec(k)),
+            ("value", Value::Int(v)),
+        ])))
+    };
+    for probe in ["2.5", "2.50", "2.5000"] {
+        let asked = |b: Builtin| found(b, vec![m.clone(), dec(probe)]);
+        assert_eq!(asked(Builtin::MapFloor), held("2.5", 2), "{probe}");
+        assert_eq!(asked(Builtin::MapCeiling), held("2.5", 2), "{probe}");
+        assert_eq!(asked(Builtin::MapBelow), held("1.5", 1), "{probe}");
+        assert_eq!(asked(Builtin::MapAbove), held("3.5", 3), "{probe}");
+        assert_eq!(
+            asked(Builtin::MapSplit),
+            record(vec![
+                ("below", Value::map([(dec("1.5"), Value::Int(1))])),
+                ("at", option(Some(Value::Int(2)))),
+                ("above", Value::map([(dec("3.5"), Value::Int(3))])),
+            ]),
+            "{probe}"
+        );
+    }
+}
+
 fn array(xs: &[i64]) -> Value {
     Value::array(xs.iter().copied().map(Value::Int).collect())
 }

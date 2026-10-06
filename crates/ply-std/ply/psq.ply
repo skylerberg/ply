@@ -1,0 +1,427 @@
+//! A keyed priority queue: keys under priorities, the key of least priority leaving first, and a
+//! key's priority read, changed or dropped by the key.
+//!
+//! A key is in a queue once. Keys of one priority leave in the order they came to it, so a
+//! scheduler built on a queue is deterministic; a key put again under the priority it has keeps its
+//! turn, and one given another priority goes behind the keys already there. `std.heap` is the queue
+//! for entries nothing names: this one is for the entries a program finds again, a node whose
+//! distance drops, a task whose time moves, a cache entry that is touched.
+//!
+//! A `Psq` is two maps, each key's place and the keys by place, so `insert`, `adjust`, `remove`,
+//! `priority_of`, `peek_min` and `pop_min` each walk one path of each. A queue nothing else holds
+//! is written where it stands: a loop that pops hands `rest` on as an argument of its own.
+//!
+//! A queue is what it would pop: `to_list` is its `key`, so two queues holding the same keys in
+//! the same order are `==`, share a `digest` and are one `Map` key however each was built.
+
+import std.laws (agrees)
+import std.list as list
+
+/// A key and the priority it is queued under.
+pub type Entry<k, p> = { key: k, priority: p }
+
+/// A queue of keys `k`, each once, under priorities `p`.
+///
+/// What it holds, and the reader that lists it. A `key` function is handed the queue alone and may
+/// promise nothing of `k` or `p`, so the queue carries the reader its maker, who promised their
+/// order, could write.
+pub type Psq<k, p> = | Psq(Held<k, p>, (Held<k, p>) -> List<Entry<k, p>>)
+
+key for Psq by to_list
+
+/// Each key's place, the keys by place, and the turn the next key to take a place is given. A
+/// place is a priority and the turn it was taken at.
+type Held<k, p> = new { places: Map<k, (p, Int)>, order: Map<(p, Int), k>, next: Int }
+
+/// What `q` holds, the queue let go: a write reads each field of this into a name of its own
+/// before it writes, so the record is let go too and each map is then held once.
+fn held<k, p>(q: Psq<k, p>) -> Held<k, p> = match q { Psq(held, _) -> held }
+
+fn reader<k, p>(q: Psq<k, p>) -> (Held<k, p>) -> List<Entry<k, p>> =
+  match q { Psq(_, listed) -> listed }
+
+/// The queue holding nothing.
+pub fn empty<k, p>() -> Psq<k, p>
+  where derivable(ord, k), derivable(ord, p)
+=
+  Psq({ places: map_new(), order: map_new(), next: 0 }, |held: Held<k, p>|
+    map_fold(held.order, [], |out: List<Entry<k, p>>, place: (p, Int), key: k|
+      push(out, { key: key, priority: place._0 })))
+
+/// The queue of `entries`, an earlier one leaving before a later one of its priority. A key that
+/// comes again takes the later priority, as `insert` gives it one.
+pub fn of_list<k, p>(entries: List<Entry<k, p>>) -> Psq<k, p>
+  where derivable(ord, k), derivable(ord, p)
+= fold(entries, empty(), |q: Psq<k, p>, entry: Entry<k, p>| insert(q, entry.key, entry.priority))
+
+/// How many keys the queue holds.
+pub fn size<k, p>(q: Psq<k, p>) -> Int
+  where derivable(ord, k), derivable(ord, p)
+= match q { Psq(held, _) -> map_len(held.order) }
+
+/// Whether the queue holds nothing.
+pub fn is_empty<k, p>(q: Psq<k, p>) -> Bool
+  where derivable(ord, k), derivable(ord, p)
+= size(q) == 0
+
+/// Whether `key` is in the queue.
+pub fn contains<k, p>(q: Psq<k, p>, key: k) -> Bool
+  where derivable(ord, k), derivable(ord, p)
+= match q { Psq(held, _) -> map_contains(held.places, key) }
+
+/// The priority `key` is queued under, or `None` for a key the queue does not hold.
+pub fn priority_of<k, p>(q: Psq<k, p>, key: k) -> Option<p>
+  where derivable(ord, k), derivable(ord, p)
+=
+  match q {
+    Psq(held, _) -> match map_get(held.places, key) { Some(place) -> Some(place._0), None -> None },
+  }
+
+/// `q` with `key` under `priority`, behind every key already under it. A key the queue holds
+/// under another priority moves; one it holds under `priority` keeps its turn.
+pub fn insert<k, p>(q: Psq<k, p>, key: k, priority: p) -> Psq<k, p>
+  where derivable(ord, k), derivable(ord, p)
+= {
+  let listed = reader(q);
+  let was = held(q);
+  let next = was.next;
+  let places = was.places;
+  let order = was.order;
+  match map_get(places, key) {
+    None -> Psq(placed(places, order, next, key, priority), listed),
+    Some(place) -> if place._0 == priority {
+      Psq({ places: places, order: order, next: next }, listed)
+    } else { Psq(placed(places, map_remove(order, place), next, key, priority), listed) },
+  }
+}
+
+fn placed<k, p>(
+  places: Map<k, (p, Int)>,
+  order: Map<(p, Int), k>,
+  next: Int,
+  key: k,
+  priority: p,
+) -> Held<k, p>
+  where derivable(ord, k), derivable(ord, p)
+=
+  {
+    places: map_insert(places, key, (priority, next)),
+    order: map_insert(order, (priority, next), key),
+    next: next + 1,
+  }
+
+/// `q` with `key` under `f` of its priority, as `insert` would put it there; a key the queue does
+/// not hold is the queue itself.
+pub fn adjust<k, p | e>(q: Psq<k, p>, key: k, f: (p) -> p / e) -> Psq<k, p> / e
+  where derivable(ord, k), derivable(ord, p)
+= match priority_of(q, key) { Some(priority) -> insert(q, key, f(priority)), None -> q }
+
+/// `q` without `key`; removing one it does not hold is the queue itself.
+pub fn remove<k, p>(q: Psq<k, p>, key: k) -> Psq<k, p>
+  where derivable(ord, k), derivable(ord, p)
+= {
+  let listed = reader(q);
+  let was = held(q);
+  let next = was.next;
+  let places = was.places;
+  let order = was.order;
+  match map_get(places, key) {
+    None -> Psq({ places: places, order: order, next: next }, listed),
+    Some(place) ->
+      Psq({ places: map_remove(places, key), order: map_remove(order, place), next: next }, listed),
+  }
+}
+
+/// The entry `pop_min` would take, or `None` for an empty queue.
+pub fn peek_min<k, p>(q: Psq<k, p>) -> Option<Entry<k, p>>
+  where derivable(ord, k), derivable(ord, p)
+=
+  match q {
+    Psq(held, _) -> match map_first(held.order) {
+      Some(first) -> Some({ key: first.value, priority: first.key._0 }),
+      None -> None,
+    },
+  }
+
+/// The key that leaves first, the earliest to come to the least priority, with that priority and
+/// the queue without it; `None` for an empty queue.
+pub fn pop_min<k, p>(q: Psq<k, p>) -> Option<{ key: k, priority: p, rest: Psq<k, p> }>
+  where derivable(ord, k), derivable(ord, p)
+= {
+  let listed = reader(q);
+  let was = held(q);
+  let next = was.next;
+  let places = was.places;
+  match map_pop_first(was.order) {
+    None -> None,
+    Some(first) -> {
+      let key = first.value;
+      let priority = first.key._0;
+      Some({
+        key: key,
+        priority: priority,
+        rest: Psq({ places: map_remove(places, key), order: first.rest, next: next }, listed),
+      })
+    },
+  }
+}
+
+/// The entries in the order `pop_min` would answer them, which is what a queue is compared,
+/// ordered and digested by.
+pub fn to_list<k, p>(q: Psq<k, p>) -> List<Entry<k, p>> =
+  match q { Psq(held, listed) -> listed(held) }
+
+// --- Tests ------------------------------------------------------------------
+
+fn jobs() -> Psq<String, Int> =
+  insert(insert(insert(insert(empty(), "b", 2), "a", 1), "c", 2), "d", 1)
+
+test "keys leave least priority first, and those of one priority in the order they came to it" {
+  let q = jobs();
+  assert_eq(size(q), 4);
+  assert(!is_empty(q));
+  assert_eq(to_list(q), [
+    { key: "a", priority: 1 },
+    { key: "d", priority: 1 },
+    { key: "b", priority: 2 },
+    { key: "c", priority: 2 },
+  ]);
+  assert_eq(peek_min(q), Some({ key: "a", priority: 1 }));
+  match pop_min(q) {
+    None -> assert(false),
+    Some(top) -> {
+      assert_eq({ key: top.key, priority: top.priority }, { key: "a", priority: 1 });
+      assert_eq(size(top.rest), 3);
+      assert_eq(peek_min(top.rest), Some({ key: "d", priority: 1 }));
+      assert(!contains(top.rest, "a"))
+    },
+  }
+}
+
+test "an empty queue has nothing to answer" {
+  let none: Psq<String, Int> = empty();
+  assert(is_empty(none));
+  assert_eq(size(none), 0);
+  assert_eq(peek_min(none), None);
+  assert(pop_min(none) == None);
+  assert_eq(to_list(none), []);
+  assert_eq(priority_of(none, "a"), None);
+  assert_eq(remove(none, "a"), none);
+  assert_eq(adjust(none, "a", |p: Int| p + 1), none)
+}
+
+test "a key is found by itself: its priority is read, changed and dropped" {
+  let q = jobs();
+  assert_eq(priority_of(q, "c"), Some(2));
+  assert_eq(priority_of(q, "z"), None);
+  assert(contains(q, "c"));
+  assert(!contains(q, "z"));
+  assert_eq(to_list(insert(q, "c", 0)), [
+    { key: "c", priority: 0 },
+    { key: "a", priority: 1 },
+    { key: "d", priority: 1 },
+    { key: "b", priority: 2 },
+  ]);
+  assert_eq(to_list(adjust(q, "a", |p: Int| p + 1)), [
+    { key: "d", priority: 1 },
+    { key: "b", priority: 2 },
+    { key: "c", priority: 2 },
+    { key: "a", priority: 2 },
+  ]);
+  assert_eq(adjust(q, "z", |p: Int| p + 1), q);
+  assert_eq(to_list(remove(q, "d")), [
+    { key: "a", priority: 1 },
+    { key: "b", priority: 2 },
+    { key: "c", priority: 2 },
+  ]);
+  assert_eq(remove(q, "z"), q);
+  assert_eq(size(insert(q, "c", 0)), 4)
+}
+
+test "a key put again under the priority it has keeps its turn" {
+  let q = jobs();
+  assert_eq(to_list(insert(q, "a", 1)), to_list(q));
+  assert_eq(insert(q, "a", 1), q);
+  assert_eq(to_list(insert(insert(q, "a", 5), "a", 1)), [
+    { key: "d", priority: 1 },
+    { key: "a", priority: 1 },
+    { key: "b", priority: 2 },
+    { key: "c", priority: 2 },
+  ])
+}
+
+test "a queue is what it would pop: two built differently are equal, digest alike and are one key" {
+  let one = of_list([
+    { key: "x", priority: 3 },
+    { key: "y", priority: 1 },
+    { key: "z", priority: 3 },
+  ]);
+  let other = insert(insert(remove(insert(insert(empty(), "y", 9), "x", 3), "y"), "y", 1), "z", 3);
+  assert_eq(to_list(one), to_list(other));
+  assert(one == other);
+  assert_eq(digest(one), digest(other));
+  assert_eq(map_len(#{one: 1, other: 2}), 1);
+  assert(one != insert(other, "z", 0));
+  // The turn two keys of one priority took is part of what a queue would pop.
+  assert(
+    one
+      != of_list([{ key: "z", priority: 3 }, { key: "y", priority: 1 }, { key: "x", priority: 3 }]),
+  )
+}
+
+test "of_list takes a key's last priority, and the order the entries came in within one" {
+  assert_eq(
+    to_list(
+      of_list([
+        { key: 1, priority: "m" },
+        { key: 2, priority: "a" },
+        { key: 3, priority: "m" },
+        { key: 1, priority: "a" },
+      ]),
+    ),
+    [{ key: 2, priority: "a" }, { key: 1, priority: "a" }, { key: 3, priority: "m" }],
+  );
+  let none: List<Entry<Int, String>> = [];
+  assert(is_empty(of_list(none)))
+}
+
+/// `n` keys under ninety-seven priorities, so most priorities hold several.
+fn numbered(n: Int) -> Psq<Int, Int> =
+  fold(range(0, n), empty(), |q: Psq<Int, Int>, i: Int| insert(q, i, i * 7919 % 97))
+
+/// The keys a queue gives up, summed, in a loop that hands `rest` on as its own argument.
+fn drained(q: Psq<Int, Int>, left: Int, sum: Int) -> Int =
+  if left <= 0 { sum }
+  else { match pop_min(q) { None -> sum, Some(top) -> drained(top.rest, left - 1, sum + top.key) } }
+
+/// `q` with each of its first `n` keys fifty lower.
+fn lowered(q: Psq<Int, Int>, n: Int) -> Psq<Int, Int> =
+  fold(range(0, n), q, |acc: Psq<Int, Int>, i: Int| adjust(acc, i, |p: Int| p - 50))
+
+/// `q` without its first `n` keys.
+fn dropped(q: Psq<Int, Int>, n: Int) -> Psq<Int, Int> =
+  fold(range(0, n), q, |acc: Psq<Int, Int>, i: Int| remove(acc, i))
+
+test "a queue nothing else holds is written where it stands, by every write" {
+  let n = 3000;
+  let built = metered(|| size(numbered(n))).allocations;
+  let popped = metered(|| drained(numbered(n), n, 0)).allocations - built;
+  let moved = metered(|| size(lowered(numbered(n), n))).allocations - built;
+  let cut = metered(|| size(dropped(numbered(n), n))).allocations - built;
+  // A write builds its answer and the places it writes, never a copy of a map's path: the paths
+  // of both maps copied would be six objects or more a write.
+  assert(built <= 5 * n, Some(int_to_string(built)));
+  assert(popped <= 6 * n + 8, Some(int_to_string(popped)));
+  assert(moved <= 7 * n + 8, Some(int_to_string(moved)));
+  assert(cut <= 3 * n + 8, Some(int_to_string(cut)))
+}
+
+test "a write takes the same steps on a queue of ten keys and of ten thousand" {
+  let steps = |n: Int| {
+    let q = numbered(n);
+    metered(||
+      size(remove(adjust(insert(q, n, 3), 1, |p: Int| p + 1), 2))
+        + (match pop_min(q) { Some(top) -> top.key, None -> 0 })
+        + (match priority_of(q, 5) { Some(p) -> p, None -> 0 })).steps
+  };
+  assert_eq(steps(10), steps(10000));
+  assert(steps(10) <= 24, Some(int_to_string(steps(10))))
+}
+
+/// A write of a script: which write, on which key, with which priority.
+type Step = { kind: Int, key: Int, priority: Int }
+
+/// The queue a script leaves, each write on a key and a priority brought within eight of zero.
+fn played(script: List<Step>, i: Int, q: Psq<Int, Int>) -> Psq<Int, Int> =
+  match list_at(script, i) {
+    None -> q,
+    Some(step) -> {
+      let key = step.key % 8;
+      let priority = step.priority % 4;
+      let kind = step.kind % 4;
+      played(script, i + 1, if kind == 0 || kind == -1 { remove(q, key) }
+      else if kind == 1 || kind == -2 { adjust(q, key, |p: Int| p - priority) }
+      else if kind == 2 { match pop_min(q) { Some(top) -> top.rest, None -> q } }
+      else { insert(q, key, priority) })
+    },
+  }
+
+/// The same script over an association list kept in the order it would be popped.
+fn modelled(script: List<Step>, i: Int, model: List<Entry<Int, Int>>) -> List<Entry<Int, Int>> =
+  match list_at(script, i) {
+    None -> model,
+    Some(step) -> {
+      let key = step.key % 8;
+      let priority = step.priority % 4;
+      let kind = step.kind % 4;
+      modelled(script, i + 1, if kind == 0 || kind == -1 { removed_from(model, key) }
+      else if kind == 1 || kind == -2 {
+        match list::find(model, |e: Entry<Int, Int>| e.key == key) {
+          Some(held) -> inserted_in(model, key, held.priority - priority),
+          None -> model,
+        }
+      } else if kind == 2 { list::drop(model, 1) }
+      else { inserted_in(model, key, priority) })
+    },
+  }
+
+fn removed_from(model: List<Entry<Int, Int>>, key: Int) -> List<Entry<Int, Int>> =
+  list::partition(model, |e: Entry<Int, Int>| e.key != key).yes
+
+/// `key` under `priority` behind every entry of that priority or less, unless it is there already.
+fn inserted_in(model: List<Entry<Int, Int>>, key: Int, priority: Int) -> List<Entry<Int, Int>> =
+  if list::contains(model, { key: key, priority: priority }) { model } else {
+    let rest = removed_from(model, key);
+    let ahead = list::partition(rest, |e: Entry<Int, Int>| e.priority <= priority);
+    list::concat(push(ahead.yes, { key: key, priority: priority }), ahead.no)
+  }
+
+law "a queue is the association list its writes would leave, in the order it would be popped" =
+  agrees(|script: List<Step>| to_list(played(script, 0, empty())), |script: List<Step>|
+    modelled(script, 0, []))
+
+law "what a queue answers of a key and of its least is what its list says" =
+  agrees(
+    |script: List<Step>| {
+      let q = played(script, 0, empty());
+      { size: size(q), least: peek_min(q), third: priority_of(q, 3), holds: contains(q, 3) }
+    },
+    |script: List<Step>| {
+      let model = modelled(script, 0, []);
+      let third = list::find(model, |e: Entry<Int, Int>| e.key == 3);
+      {
+        size: len(model),
+        least: list::first(model),
+        third: match third { Some(e) -> Some(e.priority), None -> None },
+        holds: third != None,
+      }
+    },
+  )
+
+/// The entries with each key and priority brought within eight of zero, as a script's are.
+fn near(entries: List<Entry<Int, Int>>) -> List<Entry<Int, Int>> =
+  map(entries, |entry: Entry<Int, Int>| { key: entry.key % 8, priority: entry.priority % 4 })
+
+law "a queue of a list is the queue of inserting each entry in turn" =
+  agrees(
+    |entries: List<Entry<Int, Int>>| to_list(of_list(near(entries))),
+    |entries: List<Entry<Int, Int>>|
+      modelled(
+        map(near(entries), |entry: Entry<Int, Int>|
+          { kind: 3, key: entry.key, priority: entry.priority }),
+        0,
+        [],
+      ),
+  )
+
+law "n inserts take n steps" forall (n: Int) where n > 0 cost n { size(numbered(n)) }
+
+law "n inserts and n pops take n steps"
+  forall (n: Int) where n > 0 cost n {
+    drained(numbered(n), n, 0)
+  }
+
+law "n changes of priority and n removals take n steps"
+  forall (n: Int) where n > 0 cost n {
+    size(dropped(lowered(numbered(n), n), n))
+  }
