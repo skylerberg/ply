@@ -4,7 +4,7 @@
 import std.bin
 import std.hash (blake3)
 import std.list (at, concat, contains, take)
-import resolve (Source, ParsedModule)
+import resolve (Source, ParsedModule, Diag)
 import diagnostics (parse_all)
 import pkg (PackageSources)
 import hash (Contract, Fixed, FixedTest, FixedLaw, closure_of, fixed_items, fixed_nodes, fixed_bin,
@@ -14,7 +14,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_inter
               analyse_with, dump_of, test_owners, test_check_key, known_def_row_bin, Cut, cut_bin,
               cuts_of, body_cuts_of, Dump, ModuleRow, Rows, checked_staged, no_rows, rows_of,
               staged_pulling_std_with, embed_slot, shipped_hashes, analyse_pulling_std_with,
-              ShippedData, embeds_now)
+              ShippedData, embeds_now, Moved)
 
 import infer (DefInfo, test_owner)
 import rewrite (has_tagged, has_statements)
@@ -619,7 +619,8 @@ pub fn kept_modules(
 /// kept, which another checkout may have: a row is this module's where it was filed under the key
 /// kept here, and a module one of whose blanked definitions or tests has no such row, or whose test
 /// has no hash its run fixed, is read from its source. `read` is what a module embeds, as it reads
-/// now, and `held` the moved modules a stub may still reach.
+/// now, and `held` the moved modules a stub may still reach. A stub reaching a module of `deferred`
+/// stands on it here whatever its text: the load judges it by what the stub references there.
 pub fn standing_modules(
   kept: KeptModules,
   sources: List<Original>,
@@ -628,6 +629,7 @@ pub fn standing_modules(
   held: Map<Bytes, Bool>,
   // The shipped modules the load pulls, whose functions a stub may blank with no row.
   pulled: List<Bytes> = [],
+  deferred: List<Bytes> = [],
 ) -> List<CompiledPackage> / {abort.raise} = {
   let rowless_ok = rowless_in(pulled);
   let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
@@ -641,6 +643,7 @@ pub fn standing_modules(
       read,
     ),
     held,
+    deferred,
   );
   let checks = fold(
     kept.checks,
@@ -697,22 +700,27 @@ pub fn standing_modules(
 
 /// The part of `package` that still stands, given each module's current key and what each embed
 /// reads now (`with_embeds`): a module whose key moved, or that reaches a module or an embed whose
-/// key moved and that `held` does not hold (`held_moved`), is read from its source again.
+/// key moved and that `held` does not hold (`held_moved`), is read from its source again. What it
+/// reaches of `deferred` is the load's to judge.
 pub fn valid_part(
   package: CompiledPackage,
   keys: Map<Bytes, Bytes>,
   held: Map<Bytes, Bool>,
+  deferred: List<Bytes> = [],
 ) -> CompiledPackage / {abort.raise} = {
   let stands = |name: Bytes, key: Bytes| map_get(keys, name) == Some(key);
+  let judged = fold(deferred, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+    map_insert(acc, n, true));
   let standing = fold(
     package.modules,
     map_new(),
     |acc: Map<Bytes, Bool>, compiled: CompiledModule|
       if stands(compiled.name, compiled.key)
           && fold(compiled.reaches, true, |all: Bool, r: Reached|
-            all && (stands(r.name, r.key) || map_contains(held, r.name))) {
-        map_insert(acc, compiled.name, true)
-      } else { acc },
+            all
+              && (stands(r.name, r.key) || map_contains(held, r.name)
+              || map_contains(judged, r.name))) { map_insert(acc, compiled.name, true) }
+      else { acc },
   );
   let here = |name: Bytes| map_contains(standing, module_of(name));
   {
@@ -1230,6 +1238,163 @@ pub fn unread(module: Bytes, key: Bytes) -> EmbedRead / {abort.raise} = Err(b"no
 fn standing_names(through: List<CompiledPackage>) -> List<Bytes> =
   fold(through, [], |acc: List<Bytes>, p: CompiledPackage|
     concat(acc, map(p.modules, |m: CompiledModule| m.name)))
+
+/// What a load of the program's own modules as a check makes of them, through `through`, seeded with
+/// `rows`, told what was kept of the modules it reads whole again.
+fn own_outcome(
+  sources: List<Source>,
+  through: List<CompiledPackage>,
+  rows: Rows,
+  moved: List<Moved>,
+) -> AnalysisOutcome / {abort.raise} =
+  checked_staged(
+    staged_pulling_std_with(
+      sources,
+      [],
+      { root: b"", manifest: None, supplied: [] },
+      merged_interfaces(through),
+      [],
+      [],
+      true,
+      moved: moved,
+    ),
+    rows.defs,
+    rows.tests,
+  ).out
+
+/// `edited` read through what a load of `sources` kept of its own modules, each module that stands
+/// read as its stub whatever of the program it imports moved, beside `edited` read from source.
+fn own_outcomes(
+  sources: List<Source>,
+  edited: List<Source>,
+) -> { via: AnalysisOutcome, fresh: AnalysisOutcome } / {abort.raise} = {
+  let first = whole_of(own_outcome(sources, [], no_rows(), []));
+  let kept = kept_modules(map(sources, original), first, [], true);
+  let rows = rows_of(first);
+  let names = map(kept.modules, |m: CompiledModule| m.name);
+  let through = standing_modules(
+    kept,
+    map(edited, original),
+    rows,
+    unread,
+    map_new(),
+    deferred: names,
+  );
+  let standing = standing_names(through);
+  let moved = fold(kept.modules, [], |acc: List<Moved>, m: CompiledModule|
+    if contains(standing, m.name) { acc } else {
+      push(acc, {
+        module: m.name,
+        form: match map_get(first.forms, m.name) { Some(f) -> f, None -> b"" },
+        fixed: filter(kept.fixed, |f: Fixed| module_of(f.name) == m.name),
+      })
+    });
+  { via: own_outcome(edited, through, rows, moved), fresh: own_outcome(edited, [], no_rows(), []) }
+}
+
+fn own_through(
+  sources: List<Source>,
+  edited: List<Source>,
+) -> { via: Analysis, fresh: Analysis, stubs: List<Bytes>, restored: List<Bytes> } / {abort.raise} = {
+  let o = own_outcomes(sources, edited);
+  let via = whole_of(o.via);
+  { via: via, fresh: whole_of(o.fresh), stubs: via.stubs, restored: via.restored }
+}
+
+fn answers_alike(
+  x: { via: Analysis, fresh: Analysis, stubs: List<Bytes>, restored: List<Bytes> },
+) -> Unit / {abort.raise} = {
+  assert_eq(shipped_answer(x.via), shipped_answer(x.fresh));
+  assert_eq(rows_of(x.via), rows_of(x.fresh))
+}
+
+test "a stub stands on what it references of a module read whole, which a moved body there it reaches restores" {
+  let lib: Source = {
+    name: b"lib",
+    src: b"pub type Shape = | Dot | Line(Int)\npub fn one() -> Int = 1\npub fn two() -> Int = 2\nfn helper() -> Int = 3\n",
+  };
+  let mid: Source = {
+    name: b"mid",
+    src: b"import lib (one, Shape, Dot)\npub fn uses() -> Int = one() + 1\npub fn dot() -> Shape = Dot\n",
+  };
+  let far: Source = { name: b"far", src: b"import mid (uses)\npub fn top() -> Int = uses() * 2\n" };
+  let side: Source = { name: b"side", src: b"import lib (two)\npub fn other() -> Int = two()\n" };
+  let sources = [lib, mid, far, side];
+  // A function gained: every importer stands.
+  let gained = own_through(sources, [
+    { ..lib, src: bytes_concat(lib.src, b"pub fn three() -> Int = 3\n") },
+    mid,
+    far,
+    side,
+  ]);
+  assert_eq(gained.restored, []);
+  assert_eq(gained.stubs, [b"mid", b"far", b"side"]);
+  answers_alike(gained);
+  // A body `mid` reaches moved: `mid` and `far`, which reaches it through `mid`, are read whole;
+  // `side` references nothing that moved.
+  let body = own_through(sources, [
+    {
+      ..lib,
+      src: b"pub type Shape = | Dot | Line(Int)\npub fn one() -> Int = 10\npub fn two() -> Int = 2\nfn helper() -> Int = 3\n",
+    },
+    mid,
+    far,
+    side,
+  ]);
+  assert_eq(body.restored, [b"mid", b"far"]);
+  assert_eq(body.stubs, [b"side"]);
+  answers_alike(body);
+  // A private helper's body moved, which nothing outside `lib` reaches.
+  let private = own_through(sources, [
+    {
+      ..lib,
+      src: b"pub type Shape = | Dot | Line(Int)\npub fn one() -> Int = 1\npub fn two() -> Int = 2\nfn helper() -> Int = 4\n",
+    },
+    mid,
+    far,
+    side,
+  ]);
+  assert_eq(private.restored, []);
+  answers_alike(private)
+}
+
+test "a stub that imports what a module read whole no longer exports, or a form that moved, is read whole again" {
+  let lib: Source = {
+    name: b"lib",
+    src: b"pub effect log { write emit(Bytes) -> Unit }\npub effect set logs = {log.write}\npub fn one() -> Int = 1\npub fn two() -> Int = 2\n",
+  };
+  let user: Source = { name: b"user", src: b"import lib (one)\npub fn uses() -> Int = one()\n" };
+  let setter: Source = {
+    name: b"setter",
+    src: b"import lib (logs, log)\npub fn says(b: Bytes) -> Unit / {logs} = log.emit(b)\n",
+  };
+  let sources = [lib, user, setter];
+  // `one` is no longer exported: `user`, which imports it by name, is read whole and refused as a
+  // load from source refuses it.
+  let hidden = own_outcomes(sources, [
+    {
+      ..lib,
+      src: b"pub effect log { write emit(Bytes) -> Unit }\npub effect set logs = {log.write}\nfn one() -> Int = 1\npub fn two() -> Int = 2\n",
+    },
+    user,
+    setter,
+  ]);
+  let codes = |o: AnalysisOutcome|
+    match o { Refused(ds) -> map(ds, |d: Diag| d.code), Analysed(_) -> [] };
+  assert(len(codes(hidden.fresh)) > 0, None);
+  assert_eq(codes(hidden.via), codes(hidden.fresh));
+  // The effect set moved: its form did, and every importer of `lib` is read whole.
+  let reset = own_through(sources, [
+    {
+      ..lib,
+      src: b"pub effect log { write emit(Bytes) -> Unit read peek() -> Int }\npub effect set logs = {log.write, log.read}\npub fn one() -> Int = 1\npub fn two() -> Int = 2\n",
+    },
+    user,
+    setter,
+  ]);
+  assert_eq(reset.restored, [b"user", b"setter"]);
+  answers_alike(reset)
+}
 
 test "a program read through what its last load kept answers what its source does" {
   let sources = [dependent(), depends()];
