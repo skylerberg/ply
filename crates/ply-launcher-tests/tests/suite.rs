@@ -295,6 +295,12 @@ fn the_sample_does_not_fall_on_one_period_of_the_window() {
 /// run its test.
 #[test]
 fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
+    // Safety: the test is alone in its process (nextest), so the variables are its own. A builder
+    // that refuses then says what each step took and what it refused.
+    unsafe {
+        std::env::set_var("PLY_C_PHASES", "1");
+        std::env::set_var("PLY_C_REFUSALS", "1");
+    }
     let runnable = ply_launcher::shipped::program_by_own_builder()
         .unwrap_or_else(|d| panic!("this tree's builder builds the program: {d}"));
     let project = tempfile::tempdir().expect("a scratch directory");
