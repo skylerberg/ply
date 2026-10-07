@@ -4,10 +4,10 @@ import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_lab
                 is_bare, no_module)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
               VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
-              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub,
+              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub, DRow,
               spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, NGen,
               stated_type, sampler_of, item_span, IAlias)
-import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
+import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
@@ -27,7 +27,8 @@ import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, R
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, FixedTest, FixedLaw, Prior,
              Rehash, Rehashed, rehash_index, by_name, tagged_target, closure_of, reached_functions,
-             LawNode, Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem)
+             LawNode, Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted,
+             DenotesFn, DenotesCtor, DenotesNothing, effect_called, type_named)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, LabelSite, OperandSite, TrySite, UpdateShape, WitnessOp, WitnessRef,
@@ -46,7 +47,8 @@ import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
-import rewrite (fn_has_update, tagged_in)
+import rewrite (fn_has_update, tagged_in, picked_in)
+import derive (RowField, row_shape, generated_name, same_deriver)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_want_bin, embed_key, embed_tables,
               embedded, rewritten, wants_of, want_of_key)
 import items (parse, import_decl_bin)
@@ -1523,6 +1525,167 @@ fn kept_under(hashes: HashOutput, name: Bytes, hash: Bytes) -> Bytes / {abort.ra
       ),
     ),
   )
+
+/// Every `const` definition the root package's modules hold whose declared type is the type named
+/// `type_name` program-wide.
+pub fn consts_of_type(analysis: Analysis, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
+  let named = fold(range(0, len(analysis.mods)), [], |acc: List<Bytes>, i: Int|
+    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
+      fold(at(analysis.mods, i).module.items, acc, |names: List<Bytes>, item: Item|
+        match item {
+          IFn(d) -> match ((d.baked, d.ret)) {
+            (Some(_), Some(TCon(c))) -> if type_named(analysis.index, i, c.name)
+                == Some(type_name) { push(names, qualify(at(analysis.mods, i).name, d.name.name)) }
+            else { names },
+            _ -> names,
+          },
+          _ -> names,
+        })
+    });
+  filter(const_sites(analysis.mods, analysis.hashes), |site: ConstSite| contains(named, site.name))
+}
+
+/// An argument as a check reads it before anything runs: text as written, literals joined by `++`
+/// included; the call of a definition, by its program-wide name and the hash of all it reaches, on
+/// arguments read the same way; the call of a row codec `derive row` wrote, by the fields it reads;
+/// a tagged literal, by its parser and its texts; a list; a constructor applied, by its type's
+/// program-wide name and its own; or anything else.
+pub type Argument =
+  | AText(Bytes)
+  | ACall({ callee: Bytes, hash: Bytes, args: List<Argument> })
+  | ARow(List<RowField>)
+  | ATagged({ callee: Bytes, hash: Bytes, parts: List<Bytes>, holes: List<Argument> })
+  | AList(List<Argument>)
+  | ACtor({ type_name: Bytes, name: Bytes })
+  | AOther
+
+/// A call that runs a statement, as `statement_sites` finds it: where it is, the operation or the
+/// definition it calls by program-wide name, the label written at it, and its arguments.
+pub type StatementSite = {
+  module: Int,
+  span: Span,
+  callee: Bytes,
+  label: Bytes,
+  args: List<Argument>,
+}
+
+/// What reading an argument looks names up in: the scopes, each definition's hash, and each row
+/// codec a module derives, by the program-wide name of the function that answers it.
+type Reading = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
+
+fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
+  fold(mods, map_new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
+    fold(parsed.derived, acc, |rows: Map<Bytes, List<RowField>>, d: Derived|
+      if !same_deriver(d.deriver, DRow) { rows } else {
+        match row_shape(parsed.module, d.target) {
+          Some(fields) ->
+            map_insert(rows, qualify(parsed.name, generated_name(DRow, d.target)), fields),
+          None -> rows,
+        }
+      }))
+
+/// Every perform of an operation, and every call of a definition with a label written at it, whose
+/// program-wide name is one of `callees`, in the root package's modules. An operation is named by
+/// its effect's name and its own: `std.db.db.query`.
+pub fn statement_sites(
+  analysis: Analysis,
+  callees: List<Bytes>,
+) -> List<StatementSite> / {abort.raise} = {
+  let reading = {
+    index: analysis.index,
+    hashes: by_name(analysis.hashes.defs),
+    rows: derived_rows(analysis.mods),
+  };
+  fold(range(0, len(analysis.mods)), [], |acc: List<StatementSite>, i: Int|
+    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
+      let calls = picked_in(at(analysis.mods, i).module, |e: Expr|
+        match e { EPerform(_) -> true, EApp(a) -> len(a.labels) > 0, _ -> false });
+      fold(calls, acc, |sites: List<StatementSite>, e: Expr|
+        match statement_site(reading, i, e) {
+          Some(site) -> if contains(callees, site.callee) { push(sites, site) } else { sites },
+          None -> sites,
+        })
+    })
+}
+
+fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSite> / {abort.raise} = {
+  let args = |xs: List<Expr>| map(xs, |x: Expr| argument(reading, module, x));
+  match e {
+    EPerform(p) -> match ((effect_called(reading.index, module, p.eff), p.resource)) {
+      (Some(named), Some(label)) ->
+        Some({
+          module: module,
+          span: p.span,
+          callee: bytes_concat_all([named, b".", p.op.name]),
+          label: label.name,
+          args: args(p.args),
+        }),
+      _ -> None,
+    },
+    EApp(a) -> match ((a.func, list_at(a.labels, 0))) {
+      (EVar(v), Some(label)) -> match denoted(reading.index, module, v.name) {
+        DenotesFn(callee) ->
+          Some({
+            module: module,
+            span: a.span,
+            callee: callee,
+            label: label.name,
+            args: args(a.args),
+          }),
+        _ -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+}
+
+fn argument(reading: Reading, module: Int, e: Expr) -> Argument / {abort.raise} = {
+  let hash_of = |name: Bytes| match map_get(reading.hashes, name) { Some(h) -> h, None -> b"" };
+  match e {
+    ELit(l) -> match l.lit { LStr(s) -> AText(s), _ -> AOther },
+    EBinary(b) -> if b.op != b"++" { AOther } else {
+      match ((argument(reading, module, b.lhs), argument(reading, module, b.rhs))) {
+        (AText(x), AText(y)) -> AText(bytes_concat(x, y)),
+        _ -> AOther,
+      }
+    },
+    EVar(v) -> match denoted(reading.index, module, v.name) {
+      DenotesCtor(c) -> ACtor(c),
+      _ -> AOther,
+    },
+    EApp(a) -> if len(a.labels) > 0 || len(a.named) > 0 { AOther } else {
+      match a.func {
+        EVar(v) -> match denoted(reading.index, module, v.name) {
+          DenotesFn(callee) -> match map_get(reading.rows, callee) {
+            Some(fields) -> if len(a.args) == 0 { ARow(fields) } else { AOther },
+            None ->
+              ACall({
+                callee: callee,
+                hash: hash_of(callee),
+                args: map(a.args, |x: Expr| argument(reading, module, x)),
+              }),
+          },
+          DenotesCtor(c) -> ACtor(c),
+          DenotesNothing -> AOther,
+        },
+        _ -> AOther,
+      }
+    },
+    EList(l) -> AList(map(l.items, |x: Expr| argument(reading, module, x))),
+    ETagged(t) -> match tagged_target(reading.index, module, t) {
+      Some(callee) ->
+        ATagged({
+          callee: callee,
+          hash: hash_of(callee),
+          parts: map(tagged_parts(t), |part: TaggedPart| part.text),
+          holes: map(t.holes, |h: Hole| argument(reading, module, h.value)),
+        }),
+      None -> AOther,
+    },
+    _ -> AOther,
+  }
+}
 
 /// A definition's or a test's published rows as the last answer wrote them, under the check key it
 /// had then: the checker takes them wherever the item's own form and what it reads of the rest of
@@ -6310,6 +6473,40 @@ test "a refused program's answer is its diagnostics, placed where it went wrong,
 
 fn analysis_of(sources: List<Source>) -> Analysis / {abort.raise} =
   match analyse(parse_all(sources)) { Refused(_) -> panic("the program checks"), Analysed(w) -> w }
+
+test "a statement site is a perform or a labelled call, its arguments read as a check computes them" {
+  let w = analysis_of([
+    {
+      name: b"store",
+      src: b"pub type Param = | PInt(Int) | PNull\npub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt, ps: List<Param>) -> Int }\npub fn run<[t]>(s: Stmt) -> Int / {db.query[t]} = db.query[t](s, [])\n",
+    },
+    {
+      name: b"app",
+      src: b"import store\nimport store (db)\nfn q() -> store::Stmt = store::stmt(\"select \" ++ \"sku from items\")\npub fn f(n: Int, p: store::Param) -> Int / {db.query[items]} = db.query[items](q(), [store::PInt(n), store::PNull, p])\npub fn g() -> Int / {db.query[items]} = store::run[items](store::stmt(\"select 1\"))\n",
+    },
+  ]);
+  let hash_of = |name: Bytes|
+    match map_get(by_name(w.hashes.defs), name) { Some(h) -> h, None -> b"" };
+  let sites = statement_sites(w, [b"store.db.query", b"store.run"]);
+  assert_eq(map(sites, |s: StatementSite| (s.callee, s.label)), [
+    (b"store.db.query", b"t"),
+    (b"store.db.query", b"items"),
+    (b"store.run", b"items"),
+  ]);
+  assert_eq(map(sites, |s: StatementSite| s.args), [
+    [AOther, AList([])],
+    [
+      ACall({ callee: b"app.q", hash: hash_of(b"app.q"), args: [] }),
+      AList([
+        ACtor({ type_name: b"store.Param", name: b"PInt" }),
+        ACtor({ type_name: b"store.Param", name: b"PNull" }),
+        AOther,
+      ]),
+    ],
+    [ACall({ callee: b"store.stmt", hash: hash_of(b"store.stmt"), args: [AText(b"select 1")] })],
+  ]);
+  assert_eq(len(statement_sites(w, [b"store.other"])), 0)
+}
 
 fn seeded_of(outcome: AnalysisOutcome) -> List<Bytes> / {abort.raise} =
   match outcome { Refused(_) -> panic("the program checks"), Analysed(w) -> w.checked.seeded }

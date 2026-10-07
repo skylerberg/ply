@@ -1,5 +1,10 @@
 name: The built suite
 description: tcc, nextest, the build job's archive unpacked in place and packed, and the run's emitted stage
+inputs:
+  stage:
+    description: the artifact `build-ply` handed the run's stage over in, or empty where it saved it to the cache
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -16,10 +21,24 @@ runs:
     - uses: ./.github/actions/rust-key
       id: rust
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: archive
       with:
         path: nextest.tar.zst
         key: nextest-archive-${{ steps.rust.outputs.key }}
-        fail-on-cache-miss: true
+    # The repository's other runs may evict the archive while this job waits for a runner. A pull
+    # request's run that built it uploaded it too.
+    - name: The archive a run uploaded, where the cache gave it up
+      if: steps.archive.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NAME: nextest-archive-${{ steps.rust.outputs.key }}
+      run: |
+        set -euo pipefail
+        run=$(.github/artifact-run.sh "$NAME")
+        [ -n "$run" ] || { echo "the cache gave up $NAME and no run uploaded it: re-run the whole run, whose build job builds it" >&2; exit 1; }
+        gh run download "$run" -n "$NAME"
+        echo "$NAME came back from run $run"
     # Unpacked where it was built, so paths compiled into test binaries still resolve. Removed
     # after, since the runner's disk is small.
     - name: Unpack the archive where it was built
@@ -36,19 +55,26 @@ runs:
     # What this run emitted: the emitted bodies under `ply-c-cache` and the native stage they were
     # built from under `ply-c-stage`. Both are content-addressed, so one copy serves every job,
     # and both are restored here rather than rebuilt by the warm-up below. `build-ply`'s first `ply`
-    # emits the emitter's own unit and saves it under the run's emitter key, or on main under the
-    # tree's own key, which it also leaves alone when it found it. A last resort is what any run
-    # left: a mismatched stage gives up the buckets of emitted C that did not move, which is most
-    # of them.
+    # emits the emitter's own unit and hands it over in the artifact `stage` names, or on main
+    # saves it under the tree's own key, which it also leaves alone when it found it. A last
+    # resort is what any run left: a mismatched stage gives up the buckets of emitted C that did
+    # not move, which is most of them.
+    - name: The stage this run's `build-ply` handed over
+      id: handed
+      if: inputs.stage != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        STAGE: ${{ inputs.stage }}
+      run: .github/ci-warm.sh handed "$STAGE"
     - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: steps.handed.outputs.found != 'true'
       with:
         path: |
           /tmp/ply-c-cache
           /tmp/ply-c-stage
-        key: ply-c-stage-emitter-${{ github.run_id }}
-        restore-keys: |
-          ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
-          ply-c-stage-
+        key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+        restore-keys: ply-c-stage-
     # `build-ply` has already built both, so this finds them and returns; it stays because the
     # tests and lanes after it start at once, and each that found nothing would build them itself.
     - name: Warm the emitter's stage and the `ply` program

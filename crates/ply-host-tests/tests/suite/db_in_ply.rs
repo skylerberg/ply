@@ -13,8 +13,8 @@ const PROGRAM: &str = r#"
 import std.net (net)
 import std.random (entropy)
 import std.db
-import std.db (db, with_server, stmt, transaction, is_retryable, PInt, PText, CInt, CText, Answer,
-               Rows, Count, Failed, ReadCommitted, ReadWrite, Serializable, Row, Rollback)
+import std.db (db, with_server, transaction, is_retryable, ReadCommitted, ReadWrite, Serializable, Rollback)
+import std.sql (stmt, PInt, PText, CInt, CText, Answer, Rows, Count, Failed, Row)
 
 pub fn run(url: String) -> Result<String, String>
   / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
