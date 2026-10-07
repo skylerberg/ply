@@ -74,7 +74,9 @@ const REPEATABLE: &Rows = &[
             "local_port",
             "options",
             "peer_address",
+            "peer_certificate",
             "peer_credentials",
+            "protocol",
         ],
     ),
     // What the machine says of itself is read, never taken.

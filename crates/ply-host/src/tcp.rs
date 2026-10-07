@@ -51,6 +51,8 @@ operations! {
     LocalAddress = "local_address" / 1,
     PeerAddress = "peer_address" / 1,
     PeerCredentials = "peer_credentials" / 1,
+    PeerCertificate = "peer_certificate" / 1,
+    Protocol = "protocol" / 1,
     Options = "options" / 1,
     SendSecret = "send_secret" / 6,
 }
@@ -77,7 +79,13 @@ impl Op {
     fn reads(self) -> bool {
         matches!(
             self,
-            Op::LocalPort | Op::LocalAddress | Op::PeerAddress | Op::PeerCredentials | Op::Options
+            Op::LocalPort
+                | Op::LocalAddress
+                | Op::PeerAddress
+                | Op::PeerCredentials
+                | Op::PeerCertificate
+                | Op::Protocol
+                | Op::Options
         )
     }
 
@@ -256,6 +264,17 @@ pub trait Net: Send + Sync {
         conn: i64,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
+    /// The far end's certificate on a secured connection once its handshake completed: the
+    /// server's to a client, the client's to a server where it presented one; `None` for any other.
+    fn peer_certificate(
+        &self,
+        at: &Resource,
+        conn: i64,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// The application protocol a secured connection's handshake agreed, once it completed;
+    /// `None` for any other.
+    fn protocol(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
     /// Each option the socket has, as it stands.
     fn options(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic>;
 }
@@ -448,6 +467,8 @@ impl HostHandler for Operation {
             Op::LocalAddress => self.net.local_address(at, handle(0)?, span),
             Op::PeerAddress => self.net.peer_address(at, handle(0)?, span),
             Op::PeerCredentials => self.net.peer_credentials(at, handle(0)?, span),
+            Op::PeerCertificate => self.net.peer_certificate(at, handle(0)?, span),
+            Op::Protocol => self.net.protocol(at, handle(0)?, span),
             Op::Options => self.net.options(at, handle(0)?, span),
         }
     }

@@ -10,12 +10,13 @@ import pkg (PackageSources)
 import hash (Contract, Fixed, FixedTest, FixedLaw, closure_of, fixed_items, fixed_nodes, fixed_bin,
              fixed_test_bin, fixed_law_bin, public_contracts)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_interfaces,
-              contracted_rows_of, KnownDefRow, EmitterRoot, KeyRow, analyse, analyse_with, dump_of,
-              known_def_row_bin, Cut, cut_bin, cuts_of, body_cuts_of, Dump, ModuleRow, Rows,
-              checked_staged, no_rows, rows_of, staged_pulling_std_with, embed_slot, shipped_hashes,
-              analyse_pulling_std_with, ShippedData, embeds_now)
+              contracted_rows_of, KnownDefRow, KnownTestRow, EmitterRoot, KeyRow, analyse,
+              analyse_with, dump_of, test_owners, test_check_key, known_def_row_bin, Cut, cut_bin,
+              cuts_of, body_cuts_of, Dump, ModuleRow, Rows, checked_staged, no_rows, rows_of,
+              staged_pulling_std_with, embed_slot, shipped_hashes, analyse_pulling_std_with,
+              ShippedData, embeds_now)
 
-import infer (DefInfo)
+import infer (DefInfo, test_owner)
 import rewrite (has_tagged)
 import types (Scheme, canonical_scheme)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile, EmbedWant, embed_key, wants_by_item)
@@ -458,19 +459,23 @@ pub fn compile_package(
 /// its hashing fixed, and the check key each definition's row was filed under. A stub's text is its
 /// source cut again, a row is the build's own and a body is read by nothing a build makes, so none
 /// of the three is kept.
+/// `checks` are the keys each definition's row was filed under, and `test_checks` each test's, by
+/// its owner.
 pub type KeptModules = {
   modules: List<CompiledModule>,
   fixed: List<Fixed>,
   checks: List<{ name: Bytes, hash: Bytes }>,
+  test_checks: List<{ name: Bytes, hash: Bytes }>,
   tests: List<FixedTest>,
   laws: List<FixedLaw>,
 }
 
 derive bin for KeptModules
 
-/// `own`, where it is given, keeps the root package's modules alone, each cut at its bodies with
-/// its tests and laws left standing: what a load that answers for its own tests reads back. A module
-/// read through `through` keeps what that package fixed of it, as `compile_package` does.
+/// `own`, where it is given, keeps the root package's modules alone, each cut at its function and
+/// test bodies with the rest of its tests, and its laws, left standing: what a load that answers for
+/// its own tests reads back. A module read through `through` keeps what that package fixed of it, as
+/// `compile_package` does.
 pub fn kept_modules(
   sources: List<Original>,
   analysis: Analysis,
@@ -538,6 +543,15 @@ pub fn kept_modules(
       filter(analysis.checked.checks, |c: { name: Bytes, hash: Bytes }|
         map_contains(members, module_of(c.name)))
     },
+    test_checks: if !own { [] } else {
+      let owners = test_owners(analysis.checked.tests);
+      fold(range(0, len(owners)), [], |acc: List<{ name: Bytes, hash: Bytes }>, k: Int| {
+        let owner = at(owners, k);
+        if !map_contains(members, module_of(owner)) { acc } else {
+          push(acc, { name: owner, hash: test_check_key(analysis.checked, analysis.hashes, k) })
+        }
+      })
+    },
     tests: items.tests,
     laws: items.laws,
   }
@@ -547,12 +561,13 @@ pub fn kept_modules(
 /// from its source again, and of `rows` each fixed definition's under the hash it was fixed with,
 /// which is how a load takes a row with a stub. `rows` are whatever the last build to write them
 /// kept, which another checkout may have: a row is this module's where it was filed under the key
-/// kept here, and a module one of whose definitions has no such row is read from its source. `read`
-/// is what a module embeds, as it reads now, and `held` the moved modules a stub may still reach.
+/// kept here, and a module one of whose blanked definitions or tests has no such row, or whose test
+/// has no hash its run fixed, is read from its source. `read` is what a module embeds, as it reads
+/// now, and `held` the moved modules a stub may still reach.
 pub fn standing_modules(
   kept: KeptModules,
   sources: List<Original>,
-  rows: List<KnownDefRow>,
+  rows: Rows,
   read: EmbedReader,
   held: Map<Bytes, Bool>,
 ) -> List<CompiledPackage> / {abort.raise} = {
@@ -573,12 +588,26 @@ pub fn standing_modules(
     map_new(),
     |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }| map_insert(acc, c.name, c.hash),
   );
-  let filed = fold(rows, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
+  let filed = fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
     if map_get(checks, row.name) == Some(row.hash) { map_insert(acc, row.name, row) } else { acc });
+  let test_checks = fold(
+    kept.test_checks,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, c: { name: Bytes, hash: Bytes }| map_insert(acc, c.name, c.hash),
+  );
+  let tests_filed = fold(rows.tests, map_new(), |acc: Map<Bytes, Bool>, row: KnownTestRow|
+    if map_get(test_checks, row.owner) == Some(row.hash) { map_insert(acc, row.owner, true) }
+    else { acc });
+  let tests_held = fold(valid.tests, map_new(), |acc: Map<Bytes, Bool>, t: FixedTest|
+    map_insert(acc, test_owner(t.module, t.position), true));
   let rowless = fold(valid.fixed, map_new(), |acc: Map<Bytes, Bool>, fixed: Fixed|
     if fixed.decl || map_contains(filed, fixed.name) { acc }
     else { map_insert(acc, module_of(fixed.name), true) });
-  let answered = answered_cuts(valid.fixed, |name: Bytes| map_contains(filed, name));
+  let answered = answered_cuts(
+    valid.fixed,
+    |name: Bytes| map_contains(filed, name),
+    |owner: Bytes| map_contains(tests_filed, owner) && map_contains(tests_held, owner),
+  );
   let unread = fold(valid.modules, rowless, |acc: Map<Bytes, Bool>, m: CompiledModule|
     if answered(m.cuts) { acc } else { map_insert(acc, m.name, true) });
   let here = |name: Bytes| !map_contains(unread, name);
@@ -697,7 +726,11 @@ pub fn kept_held(
 pub fn answered_part(package: CompiledPackage) -> CompiledPackage / {abort.raise} = {
   let rowed = fold(package.defs, map_new(), |acc: Map<Bytes, Bool>, r: KnownDefRow|
     map_insert(acc, r.name, true));
-  let answered = answered_cuts(package.fixed, |name: Bytes| map_contains(rowed, name));
+  let answered = answered_cuts(
+    package.fixed,
+    |name: Bytes| map_contains(rowed, name),
+    |owner: Bytes| false,
+  );
   let unanswered = fold(package.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
     if answered(m.cuts) { acc } else { map_insert(acc, m.name, true) });
   let here = |name: Bytes| !map_contains(unanswered, module_of(name));
@@ -711,16 +744,19 @@ pub fn answered_part(package: CompiledPackage) -> CompiledPackage / {abort.raise
 }
 
 /// Whether each body a module's cuts blank belongs to a function `fixed` gives a hash and `rowed`
-/// holds a row for.
+/// holds a row for, or to a test `tested` holds a fixed hash and a row for.
 fn answered_cuts(
   fixed: List<Fixed>,
   rowed: (Bytes) -> Bool,
+  tested: (Bytes) -> Bool,
 ) -> (List<Cut>) -> Bool / {abort.raise} = {
   let hashed = fold(fixed, map_new(), |acc: Map<Bytes, Bool>, f: Fixed|
     if f.decl { acc } else { map_insert(acc, f.name, true) });
   |cuts: List<Cut>|
     fold(cuts, true, |all: Bool, c: Cut|
-      all && (!c.braced || (map_contains(hashed, c.name) && rowed(c.name))))
+      all
+        && (!c.braced
+        || (if c.test { tested(c.name) } else { map_contains(hashed, c.name) && rowed(c.name) })))
 }
 
 pub fn merged_interfaces(packages: List<CompiledPackage>) -> Interfaces =
@@ -1069,7 +1105,7 @@ test "a stub stands while every embed something it holds reaches reads the same"
   // function that does, and `e`, whose test does. `d` imports `a` and reaches none of it that embeds.
   assert_eq(standing(reading(b"two")), [b"c", b"d"]);
   let kept = kept_modules(originals, full);
-  let rows = rows_of(full).defs;
+  let rows = rows_of(full);
   assert_eq(standing_names(standing_modules(kept, originals, rows, reading(b"one"), map_new())), [
     b"a",
     b"b",
@@ -1125,7 +1161,7 @@ test "a program read through what its last load kept answers what its source doe
   assert_eq(map(kept.modules, |m: CompiledModule| m.stub), [b"", b""]);
   let rows = rows_of(first);
   // Nothing moved: both modules are read as stubs, their rows taken whole.
-  let unmoved = standing_modules(kept, map(sources, original), rows.defs, unread, map_new());
+  let unmoved = standing_modules(kept, map(sources, original), rows, unread, map_new());
   assert_eq(standing_names(unmoved), [b"app", b"base"]);
   let again = shipping(sources, unmoved, rows);
   assert_eq(again.stubs, [b"app", b"base"]);
@@ -1141,7 +1177,7 @@ test "a program read through what its last load kept answers what its source doe
     },
     depends(),
   ];
-  let through = standing_modules(kept, map(edited, original), rows.defs, unread, map_new());
+  let through = standing_modules(kept, map(edited, original), rows, unread, map_new());
   assert_eq(standing_names(through), [b"base"]);
   let via = shipping(edited, through, rows);
   let fresh = shipping(edited, [], no_rows());
@@ -1155,20 +1191,24 @@ test "a program read through what its last load kept answers what its source doe
   // `base` moved: `app`, which reaches it, is read from its source with it.
   let below = [dependent(), { name: b"base", src: bytes_concat(depends().src, b"\n") }];
   assert_eq(
-    standing_names(standing_modules(kept, map(below, original), rows.defs, unread, map_new())),
+    standing_names(standing_modules(kept, map(below, original), rows, unread, map_new())),
     [],
   );
   // A module a definition of which has no row, or a row filed under another key, is read from its
   // source.
   let rowless = filter(rows.defs, |row: KnownDefRow| row.name != b"base.one");
   assert_eq(
-    standing_names(standing_modules(kept, map(sources, original), rowless, unread, map_new())),
+    standing_names(
+      standing_modules(kept, map(sources, original), { ..rows, defs: rowless }, unread, map_new()),
+    ),
     [b"app"],
   );
   let another = map(rows.defs, |row: KnownDefRow|
     if row.name == b"app.four" { { ..row, hash: b"another build's" } } else { row });
   assert_eq(
-    standing_names(standing_modules(kept, map(sources, original), another, unread, map_new())),
+    standing_names(
+      standing_modules(kept, map(sources, original), { ..rows, defs: another }, unread, map_new()),
+    ),
     [b"base"],
   )
 }
@@ -1231,7 +1271,7 @@ test "a build's kept module stands where a shipped module it reaches only gained
   );
   let originals = |shipped: Source| [original(app), original(shipped)];
   let kept = kept_modules(originals(r), first);
-  let rows = rows_of(first).defs;
+  let rows = rows_of(first);
   let standing = |now: Source|
     standing_names(
       standing_modules(
@@ -1276,7 +1316,7 @@ test "a build's kept modules stand while the data file a shipped one embeds read
   );
   let originals = [original(app), original(words)];
   let kept = kept_modules(originals, first);
-  let rows = rows_of(first).defs;
+  let rows = rows_of(first);
   let standing = |bytes: Bytes| {
     let read = embeds_now(pkgs, [app], [words], [], holding(bytes));
     standing_names(
@@ -1448,4 +1488,57 @@ test "a public definition's contract moves with its signature and specification,
   assert_eq(contract_named(specified, b"lib.T"), contract_named(base, b"lib.T"));
   let widened = contracts_of(lib(b"x + 1", b"", b"| A | B | C"));
   assert(contract_named(widened, b"lib.T") != contract_named(base, b"lib.T"))
+}
+
+// A load answering for its own tests reads a standing module's test bodies as blanks, each answered
+// by its row and by the hash its run fixed.
+test "a stub of an own module blanks its tests' bodies, each answered as its run left it" {
+  let a: Source = {
+    name: b"a",
+    src: b"pub fn one() -> Int = 1\n\ntest \"one is one\" { assert_eq(one(), 1) }\n",
+  };
+  let full = whole_of(analyse(parse_all([a])));
+  let kept = kept_modules([original(a)], full, [], true);
+  assert_eq(len(kept.tests), 1);
+  assert_eq(map(kept.test_checks, |c: { name: Bytes, hash: Bytes }| c.name), [b"a.test#0"]);
+  assert_eq(map(at(kept.modules, 0).cuts, |c: Cut| c.test), [true]);
+  let rows = rows_of(full);
+  assert_eq(map(rows.tests, |r: KnownTestRow| r.owner), [b"a.test#0"]);
+  assert_eq(
+    map(rows.tests, |r: KnownTestRow| r.hash),
+    map(kept.test_checks, |c: { name: Bytes, hash: Bytes }| c.hash),
+  );
+  let through = standing_modules(
+    kept,
+    [original(a)],
+    rows,
+    |m: Bytes, k: Bytes| Err(b"none"),
+    map_new(),
+  );
+  assert_eq(len(through), 1);
+  assert_eq(len(at(through, 0).tests), 1);
+  assert_eq(bytes_index_of(at(at(through, 0).modules, 0).stub, b"assert_eq"), None);
+  let via = whole_of(
+    analyse_with(
+      parse_all([a]),
+      rows.defs,
+      rows.tests,
+      { root: b"", manifest: None, supplied: [] },
+      merged_interfaces(through),
+    ),
+  );
+  assert_eq(via.hashes.held_tests, 1);
+  assert_eq(via.hashes.tests, full.hashes.tests);
+  assert_eq(via.checked.tests, full.checked.tests);
+  // Without the test's row, the module is read from its source.
+  assert_eq(
+    standing_modules(
+      kept,
+      [original(a)],
+      { ..rows, tests: [] },
+      |m: Bytes, k: Bytes| Err(b"none"),
+      map_new(),
+    ),
+    [],
+  )
 }
