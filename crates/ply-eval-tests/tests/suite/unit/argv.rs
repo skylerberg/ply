@@ -33,8 +33,12 @@ fn a_vector_given_back_full_does_not_come_out_of_take_full() {
 
 #[test]
 fn a_secret_handed_back_is_not_held_by_the_pool() {
-    let payload = Arc::new(Value::str("hunter2"));
-    give(vec![Value::Secret(Arc::clone(&payload))]);
+    let secret = Value::secret_text("hunter2");
+    let Value::Secret(payload) = &secret else {
+        unreachable!("a secret is a `Secret`")
+    };
+    let payload = Arc::clone(payload);
+    give(vec![secret]);
     assert_eq!(
         Arc::strong_count(&payload),
         1,

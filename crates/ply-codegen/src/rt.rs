@@ -48,9 +48,10 @@ pub struct Tables {
     pub functions: Vec<usize>,
     /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.
     pub memo: Box<[AtomicI64]>,
-    /// What computing each memoized answer cost, in calls and allocations, stored before the
-    /// answer is: a later read charges it, so a cost is the same whether or not it was memoized.
-    pub memo_costs: Box<[(AtomicI64, AtomicI64)]>,
+    /// What computing each memoized answer cost, in calls, allocations and their bytes, stored
+    /// before the answer is: a later read charges it, so a cost is the same whether or not it was
+    /// memoized.
+    pub memo_costs: Box<[(AtomicI64, AtomicI64, AtomicI64)]>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: Mutex<Heap>,
     /// The 256 one-byte values, each made immortal when first asked for; `0` is not yet.
@@ -123,9 +124,10 @@ impl Tables {
 
     /// As [`Tables::memoize`], with what computing the answer cost, which every later read charges.
     pub fn memoize_costing(&self, index: usize, w: Word, cost: Cost) -> Word {
-        if let Some((steps, allocations)) = self.memo_costs.get(index) {
+        if let Some((steps, allocations, bytes)) = self.memo_costs.get(index) {
             steps.store(cost.steps, Release);
             allocations.store(cost.allocations, Release);
+            bytes.store(cost.bytes, Release);
         }
         self.memoize(index, w)
     }
@@ -133,9 +135,10 @@ impl Tables {
     /// What computing the memoized answer at `index` cost.
     pub fn memo_cost(&self, index: usize) -> Cost {
         match self.memo_costs.get(index) {
-            Some((steps, allocations)) => Cost {
+            Some((steps, allocations, bytes)) => Cost {
                 steps: steps.load(Acquire),
                 allocations: allocations.load(Acquire),
+                bytes: bytes.load(Acquire),
             },
             None => Cost::default(),
         }
@@ -3680,11 +3683,12 @@ pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
     unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize) }
 }
 
-/// What a computation cost: the calls it made and the objects it allocated.
+/// What a computation cost: the calls it made, the objects it allocated and the bytes they took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cost {
     pub steps: i64,
     pub allocations: i64,
+    pub bytes: i64,
 }
 
 impl Cost {
@@ -3692,6 +3696,7 @@ impl Cost {
         Cost {
             steps: self.steps.saturating_add(other.steps),
             allocations: self.allocations.saturating_add(other.allocations),
+            bytes: self.bytes.saturating_add(other.bytes),
         }
     }
 
@@ -3699,6 +3704,7 @@ impl Cost {
         Cost {
             steps: self.steps - other.steps,
             allocations: self.allocations - other.allocations,
+            bytes: self.bytes - other.bytes,
         }
     }
 }
@@ -3709,13 +3715,14 @@ impl Ctx {
         Cost {
             steps: self.ticks,
             allocations: i64::try_from(self.heap.allocated()).unwrap_or(i64::MAX),
+            bytes: i64::try_from(self.heap.allocated_bytes()).unwrap_or(i64::MAX),
         }
         .plus(self.charged)
     }
 }
 
-/// `metered(f)`: `f()` and what it cost, as `{allocations, performs, steps, value}` with each
-/// performed atom's count in `performs`, ordered by the atom.
+/// `metered(f)`: `f()` and what it cost, as `{allocations, bytes, performs, steps, value}` with
+/// each performed atom's count in `performs`, ordered by the atom.
 fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let before = ctx.cost();
     let performed = ctx.performed.len();
@@ -3748,16 +3755,18 @@ fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let performs = ctx.heap.list_from(&items);
     let shape = tables.layouts.shape(vec![
         Symbol::new("allocations"),
+        Symbol::new("bytes"),
         Symbol::new("performs"),
         Symbol::new("steps"),
         Symbol::new("value"),
     ]);
-    let r = ctx.heap.alloc(KIND_RECORD, 0, 4, shape);
+    let r = ctx.heap.alloc(KIND_RECORD, 0, 5, shape);
     unsafe {
         set_word(r, 0, heap::imm(spent.allocations));
-        set_word(r, 1, performs);
-        set_word(r, 2, heap::imm(spent.steps));
-        set_word(r, 3, value);
+        set_word(r, 1, heap::imm(spent.bytes));
+        set_word(r, 2, performs);
+        set_word(r, 3, heap::imm(spent.steps));
+        set_word(r, 4, value);
     }
     r as Word
 }
@@ -3915,7 +3924,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     }
                 }
                 ClosureKind::Synth { arity, rule } => {
-                    if args.len() != *arity {
+                    if args.len() != usize::from(*arity) {
                         let d = error(format!(
                             "a generated function takes {arity} arguments and was given {}",
                             args.len()
