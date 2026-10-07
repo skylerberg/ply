@@ -1,19 +1,21 @@
 //! What a check says of the statements a program runs: each call of `std.db` and `std.sqlite`
 //! whose statement a check can compute before anything runs, held by `std.sql`'s `checked` to the
-//! call that runs it, to the row type a derived codec reads its rows into, and to the program's
-//! schema where it declares one: a `const fn` whose type is `std.sql.Schema`. The statements and the
+//! call that runs it, to the row type a derived codec reads its rows into, and to the schema its
+//! module declares or imports: a `const fn` whose type is `std.sql.Schema`. The statements and the
 //! schema are computed on a machine of their own, as a literal's parser is, and what the check
 //! found is kept in the toolchain's cache under the hashes of all they reach. A codec's fields are
 //! read from the type `derive row` wrote it for, since a value that holds functions does not cross
-//! back from the machine.
+//! back from the machine. The check reads a module's bodies, so a module that runs a statement is
+//! never read as its stub.
 
 import compiler.derive (RowField, RowRead, RScalar, ROptional, RArray, RDocument, RByJson)
 import compiler.front (Analysis, ConstSite, StatementSite, Argument, AText, ACall, ARow, ATagged,
-                       AList, ACtor, AOther, statement_sites)
+                       AList, ACtor, AOther, statement_sites, consts_of_type)
 import compiler.hash (TheFn, hex, reach)
 import compiler.interface (sized)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.resolve (Diag, error_at, error_with_labels, label_at)
+import compiler.rewrite (statement_runners)
 import compiler.type_syntax (TVar)
 import machine (machine, Called, default_options, unconfigured)
 import std.bin
@@ -82,8 +84,8 @@ fn performs() -> List<Performs> =
   ]
 
 /// A statement a call runs, as the check asks after it: what the call says of it, the argument it
-/// is computed from, the constructor of each parameter the call writes as a list, and the fields
-/// of the row type a derived codec reads its rows into.
+/// is computed from, the constructor of each parameter the call writes as a list, the fields of the
+/// row type a derived codec reads its rows into, and the schema it is held to.
 pub type Asked = {
   dialect: Dialect,
   operation: Operation,
@@ -91,6 +93,7 @@ pub type Asked = {
   statement: Argument,
   given: Option<List<Option<String>>>,
   row: Option<List<sql::Field>>,
+  schema: Option<ConstSite>,
 }
 
 /// What the check found wrong with one statement: its code, the byte of the statement it stands
@@ -105,17 +108,42 @@ pub type Judgement = | Judged({ text: String, found: List<Found> }) | Unjudged
 
 derive bin for Judgement
 
-/// A call that runs a statement, and what the check asks of it.
-pub type Asking = { site: StatementSite, asked: Asked }
+/// A call that runs a statement, what the check asks of it, and every schema its module reaches.
+pub type Asking = { site: StatementSite, asked: Asked, schemas: List<ConstSite> }
 
-/// Every call in the root package's modules whose statement the check asks after.
-pub fn asking(analysis: Analysis) -> List<Asking> / {abort.raise} =
+/// Every call in the root package's modules whose statement the check asks after. A statement is
+/// held to the schema its module declares or imports, at any depth, and to none where it reaches
+/// two, which `schemas_refused` says.
+pub fn asking(analysis: Analysis) -> List<Asking> / {abort.raise} = {
+  let schemas = consts_of_type(analysis, schema_type());
   fold(
     statement_sites(analysis, map(performs(), |p: Performs| p.callee)),
     [],
     |acc: List<Asking>, site: StatementSite|
-      match asked_of(site) { Some(a) -> push(acc, { site: site, asked: a }), None -> acc },
+      match asked_of(site) {
+        None -> acc,
+        Some(a) -> {
+          let reached = reached_modules(analysis.r.imports, site.module);
+          let held = filter(schemas, |s: ConstSite| contains(reached, s.module));
+          push(acc, {
+            site: site,
+            asked: { ..a, schema: if len(held) == 1 { list_at(held, 0) } else { None } },
+            schemas: held,
+          })
+        },
+      },
   )
+}
+
+/// `module` and every module it imports, at any depth, by their places in `imports`.
+fn reached_modules(imports: List<List<Int>>, module: Int) -> List<Int> =
+  fold(range(0, len(imports)), [module], |seen: List<Int>, _: Int|
+    fold(seen, seen, |acc: List<Int>, m: Int|
+      fold(
+        match list_at(imports, m) { Some(xs) -> xs, None -> [] },
+        acc,
+        |more: List<Int>, x: Int| if contains(more, x) { more } else { push(more, x) },
+      )))
 
 fn asked_of(site: StatementSite) -> Option<Asked> =
   match find(performs(), |p: Performs| p.callee == site.callee) {
@@ -139,6 +167,7 @@ fn asked_of(site: StatementSite) -> Option<Asked> =
               _ -> None,
             }
           },
+          schema: None,
         })
       },
     },
@@ -242,7 +271,6 @@ pub fn judgement_key(
   stamp: String,
   version: String,
   budget: Int,
-  schema: Option<ConstSite>,
   a: Asked,
 ) -> Bytes / {abort.raise} =
   hex(
@@ -253,7 +281,7 @@ pub fn judgement_key(
         sized(bytes_of_string(stamp)),
         sized(bytes_of_string(version)),
         sized(ascii_of_int(budget)),
-        sized(match schema { Some(s) -> s.hash, None -> b"" }),
+        sized(match a.schema { Some(s) -> s.hash, None -> b"" }),
         sized(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
         sized(operation_text(a.operation)),
         sized(match a.label { Some(l) -> bytes_of_string(l), None -> b"\x00" }),
@@ -336,20 +364,20 @@ fn answer_of(called: Called) -> Option<Value> =
   match called.answer { Ok(v) -> Some(v), Err(_) -> None }
 
 /// Each statement of `asked` judged on a machine loaded for them alone, each definition they are
-/// computed by called under `steps`: the schema's value first, where the program declares one.
+/// computed by called under `steps`, and each schema they are held to entered once.
 pub fn judged(
   front: LoadedAnalysis,
   analysis: Analysis,
   root: String,
   steps: Int,
-  schema: Option<ConstSite>,
   asked: List<Asked>,
 ) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} = {
-  let named = fold(
-    asked,
-    match schema { Some(s) -> [s.name], None -> [] },
-    |acc: List<Bytes>, a: Asked| callees_in(a.statement, acc, 64),
-  );
+  let schemas = fold(asked, [], |acc: List<Bytes>, a: Asked|
+    match a.schema {
+      Some(s) -> if contains(acc, s.name) { acc } else { push(acc, s.name) },
+      None -> acc,
+    });
+  let named = fold(asked, schemas, |acc: List<Bytes>, a: Asked| callees_in(a.statement, acc, 64));
   if len(named) == 0 {
     Ok(map(asked, |a: Asked| judgement_of(None, a, computed_text(a.statement))))
   } else {
@@ -368,16 +396,26 @@ pub fn judged(
             ) {
             Err(refused) -> Err(refused.diags),
             Ok(_) -> {
-              let declared = match schema {
-                None -> None,
-                Some(s) -> match answer_of(
-                    machine.call[literals](string_of_bytes_lossy(s.name), []),
-                  ) {
-                  Some(v) -> schema_of(v),
-                  None -> None,
-                },
-              };
-              Ok(map(asked, |a: Asked| judgement_of(declared, a, computed_value(a.statement, 64))))
+              let declared = fold(
+                schemas,
+                map_new(),
+                |acc: Map<Bytes, sql::Schema>, name: Bytes|
+                  match answer_of(machine.call[literals](string_of_bytes_lossy(name), [])) {
+                    Some(v) -> match schema_of(v) {
+                      Some(s) -> map_insert(acc, name, s),
+                      None -> acc,
+                    },
+                    None -> acc,
+                  },
+              );
+              Ok(
+                map(asked, |a: Asked|
+                  judgement_of(
+                    match a.schema { Some(s) -> map_get(declared, s.name), None -> None },
+                    a,
+                    computed_value(a.statement, 64),
+                  )),
+              )
             },
           },
         };
@@ -552,11 +590,12 @@ fn excerpt(text: String, at: Int) -> Bytes / {abort.raise} = {
 
 /// The diagnostics a judgement makes at the call that runs the statement, naming the statement and
 /// the schema it was checked against.
-pub fn misfits(a: Asking, schema: Option<ConstSite>, j: Judgement) -> List<Diag> / {abort.raise} =
+pub fn misfits(a: Asking, j: Judgement) -> List<Diag> / {abort.raise} =
   match j {
     Unjudged -> [],
     Judged(judged) ->
       map(judged.found, |f: Found| {
+        let schema = a.asked.schema;
         let schema_name = match schema { Some(s) -> s.name, None -> b"" };
         let message = bytes_of_string(f.message);
         let headline = if f.code == b"E0433" {
@@ -612,24 +651,44 @@ pub fn misfits(a: Asking, schema: Option<ConstSite>, j: Judgement) -> List<Diag>
       }),
   }
 
-/// A program declares one schema: every `const fn` of `std.sql.Schema` past the first is refused.
-pub fn schemas_refused(schemas: List<ConstSite>) -> List<Diag> =
-  match schemas {
-    [] -> [],
-    [first, ..rest] ->
-      map(rest, |s: ConstSite|
-        error_with_labels(
-          b"E0471",
-          bytes_concat_all([b"`", s.name, b"` is a second schema: a program declares one"]),
-          [
-            label_at(s.module, s.span, true, b"a `const fn` of `std.sql.Schema`"),
-            label_at(first.module, first.span, false, b"the program's schema"),
-          ],
-          [
-            b"a check holds every statement the program runs to its one schema, so a second would leave it guessing which",
-          ],
-        )),
-  }
+/// A module whose statements reach two schemas, through what it declares and imports, is refused
+/// once, at its first statement: they are held to one.
+pub fn schemas_refused(asks: List<Asking>) -> List<Diag> =
+  fold(
+    asks,
+    { modules: [], diags: [] },
+    |acc: { modules: List<Int>, diags: List<Diag> }, a: Asking|
+      if contains(acc.modules, a.site.module) { acc } else {
+        match a.schemas {
+          [first, second, ..] ->
+            {
+              modules: push(acc.modules, a.site.module),
+              diags: push(
+                acc.diags,
+                error_with_labels(
+                  b"E0471",
+                  bytes_concat_all([
+                    b"this statement's module reaches two schemas, `",
+                    first.name,
+                    b"` and `",
+                    second.name,
+                    b"`, and its statements are held to one",
+                  ]),
+                  [
+                    label_at(a.site.module, a.site.span, true, b"this call runs a statement"),
+                    label_at(first.module, first.span, false, b"a `const fn` of `std.sql.Schema`"),
+                    label_at(second.module, second.span, false, b"another"),
+                  ],
+                  [
+                    b"a statement is held to the schema its module declares or imports; split the modules so each reaches one",
+                  ],
+                ),
+              ),
+            },
+          _ -> acc,
+        }
+      },
+  ).diags
 
 // --- Tests ------------------------------------------------------------------
 
@@ -672,6 +731,11 @@ test "a call's statement, parameters and row are read from where the call writes
   // A parameter of another type than `std.sql.Param` is no parameter the check reads.
   assert_eq(param_of(ACtor({ type_name: b"m.Param", name: b"PInt" })), None);
   assert_eq(asked_of(a_site(b"m.other", [text])), None)
+}
+
+// A module that runs one of these is read from its source by every check, never as its stub.
+test "the calls the check reads a statement at are the ones the compiler keeps a module's bodies for" {
+  assert_eq(map(performs(), |p: Performs| p.callee), statement_runners())
 }
 
 test "a derived codec's fields are held to the columns as a document where they are not scalars" {
@@ -738,7 +802,23 @@ test "a schema reads back from the value the machine answered for it" {
   )
 }
 
+test "a module's statements are held to the schema it declares or imports, at any depth" {
+  // 0 imports 1, which imports 2; 3 imports 0; 4 stands alone.
+  let imports = [[1], [2], [], [0], []];
+  assert_eq(reached_modules(imports, 0), [0, 1, 2]);
+  assert_eq(reached_modules(imports, 3), [3, 0, 1, 2]);
+  assert_eq(reached_modules(imports, 4), [4]);
+  // A cycle of imports ends.
+  assert_eq(reached_modules([[1], [0]], 1), [1, 0])
+}
+
 test "what the check found is reported at the call, naming the statement and the schema" {
+  let declared: ConstSite = {
+    module: 0,
+    span: { start: 0, end: 1 },
+    name: b"m.schema",
+    hash: b"s",
+  };
   let a = {
     site: a_site(b"std.db.db.query", []),
     asked: {
@@ -748,21 +828,16 @@ test "what the check found is reported at the call, naming the statement and the
       statement: ACall({ callee: b"m.items_all", hash: b"h", args: [] }),
       given: None,
       row: None,
+      schema: Some(declared),
     },
+    schemas: [declared],
   };
-  let declared: ConstSite = {
-    module: 0,
-    span: { start: 0, end: 1 },
-    name: b"m.schema",
-    hash: b"s",
-  };
-  let schema = Some(declared);
   let found = {
     code: b"E0433",
     at: 12,
     message: "names the column `nmae`, which `items` does not have",
   };
-  let diags = misfits(a, schema, Judged({ text: "select sku, nmae from items", found: [found] }));
+  let diags = misfits(a, Judged({ text: "select sku, nmae from items", found: [found] }));
   assert_eq(map(diags, |d: Diag| d.code), [b"E0433"]);
   assert_eq(map(diags, |d: Diag| d.message), [
     b"this statement names the column `nmae`, which `items` does not have in the schema `m.schema`",
@@ -774,8 +849,10 @@ test "what the check found is reported at the call, naming the statement and the
       b"checked against the schema `m.schema`, a `const fn` of `std.sql.Schema`",
     ],
   ]);
-  assert_eq(misfits(a, schema, Unjudged), []);
-  assert_eq(map(schemas_refused([declared, declared]), |d: Diag| d.code), [b"E0471"]);
-  assert_eq(schemas_refused([declared]), []);
+  assert_eq(misfits(a, Unjudged), []);
+  // Two statements of one module that reaches two schemas are refused once.
+  let twice = { ..a, schemas: [declared, { ..declared, name: b"n.schema" }] };
+  assert_eq(map(schemas_refused([twice, twice]), |d: Diag| d.code), [b"E0471"]);
+  assert_eq(schemas_refused([a]), []);
   assert_eq(code_of(sql::Unfollowed), b"E0470")
 }

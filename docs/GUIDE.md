@@ -617,9 +617,10 @@ kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
 (§8.4), evaluates the body in its place, once a run, as it does any definition
 that takes nothing; the value is the same either way, since the body is pure.
 
-A `const fn` whose type is `std.sql.Schema` is the program's schema: the
-statements the program runs are checked against it before anything runs (§16).
-A program declares one; a second is `E0471`.
+A `const fn` whose type is `std.sql.Schema` is a schema: the statements of the
+module that declares it, and of every module that imports that one at any
+depth, are checked against it before anything runs (§16). A module whose
+statements reach two is `E0471`.
 
 A value is kept as it is laid out, so a table that is compact is one that reads
 quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
@@ -3238,8 +3239,10 @@ each `db.query`, `db.batch`, `db.execute`, `db.returning` and `db.copy_out`,
 anything runs: text, joined by `++` or not, a call of a definition on such
 values, `sqlite::bound` of one, or a tagged literal. Each definition the
 statement is computed by is entered on a machine of its own under the literals'
-budget, and the program's schema with them where it declares one (§3.5); one
-that raises leaves the statement to the run. The statement is held to its call:
+budget, and the schema the statement's module reaches with them (§3.5); one that
+raises leaves the statement to the run. A module that runs a statement is read
+from its source by every check, never as its stub. The statement is held to its
+call:
 text the reader refuses is `E0431`, tables that do not include the table the
 label names `E0435`, a statement the operation does not perform (a write run as a
 query, a read or one with `returning` run as `execute`, one without it run as
@@ -3462,7 +3465,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0469` | a test's table or label that performs more than raises |
 | `E0470` | a statement checked against the schema written past what the check follows |
-| `E0471` | a second `const fn` of `std.sql.Schema`: a program declares one schema |
+| `E0471` | a module whose statements reach two `const fn`s of `std.sql.Schema` |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
 | `E0501` | assertion failed |
