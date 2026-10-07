@@ -5,7 +5,9 @@
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
-#                                every test exactly once, every cache key a job
+#                                every test exactly once, no corpus run the last
+#                                table measured takes over a third of its job's
+#                                deadline, every cache key a job
 #                                writes is one a job reads, every key that
 #                                names the run is one a later run reads and no
 #                                job needs, and every key over a crate's Ply
@@ -33,7 +35,9 @@
 #                                from the cut in DIR, or round robin without one
 #   ci-shards.sh desks-for-runner K [DIR]
 #                                the desk runs runner K takes, likewise
-#   ci-shards.sh corpus-line ID  the package one run tests and its filter
+#   ci-shards.sh corpus-line ID...
+#                                the package each run tests, its filter and its
+#                                part, tab-separated, a line a run
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the gates
 #                                job: the host packages, and the tree check it
 #                                runs alone
@@ -74,9 +78,12 @@ CORPUS_PROGRAM=crates/ply-corpus/ply
 # The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
-# The fixtures the standard library's tests read, as a project: `--std` over it runs the tests and
-# laws of every module the binary ships beside its own, so no file here lists the modules.
+# The fixtures the standard library's tests read, as a project: `--std` over it tests and proves every
+# module of the library beside its own. Its tests and its proofs are runs of each of the library's
+# top-level modules, a module beneath one its own (`std.hash.legacy` is `std.hash`'s), and of each of
+# the project's modules (`stdlib_entries`).
 CORPUS_STDLIB=crates/ply-corpus/stdlib
+STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
 # The checks that start desks under load and drive them over postgres: a test at a time, cut by
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
@@ -88,6 +95,9 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+# Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
+# for a lane whatever its tests are placed by, as a test over cases is one test.
+CORPUS_SHARDED=("cli-phases:3")
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
 # steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
 RUNS_MARGIN=4
@@ -205,18 +215,74 @@ filter_of() {
   done
 }
 
-# One entry id a line: `program`, `stdlib`, `fixture-<name>` per fixture, `package-<id>` per package
-# suite, every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
-# each module as `module`, or, for one placed a test at a time, `module:<id>` per test, the id a hash
-# of its label, so a duration measured for a test stays with it however the module's tests move.
+# One entry id a line: `program`, the standard library's runs, `fixture-<name>` per fixture,
+# `package-<id>` per package suite, every checks module that declares a test, then every such module of
+# the CLI's suite under `cli-`; each module as `module`, or, for one placed a test at a time,
+# `module:<id>` per test, the id a hash of its label, so a duration measured for a test stays with it
+# however the module's tests move. A run CORPUS_SHARDED cuts is its parts, `entry#1` to `entry#N`.
 corpus_entries() {
   local entry file
-  printf 'program\n'
-  printf 'stdlib\n'
-  for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
-  for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
-  module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+  {
+    printf 'program\n'
+    stdlib_entries
+    for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
+    for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
+    module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
+    module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+  } | awk -v sharded="${CORPUS_SHARDED[*]-}" '
+    BEGIN {
+      n = split(sharded, s, " ")
+      for (i = 1; i <= n; i++) if (match(s[i], /:[0-9]+$/)) parts[substr(s[i], 1, RSTART - 1)] = substr(s[i], RSTART + 1)
+    }
+    $0 in parts { for (k = 1; k <= parts[$0]; k++) print $0 "#" k; next }
+    { print }
+  '
+}
+
+# How many parts CORPUS_SHARDED cuts the run $1 into; nothing for one it does not cut.
+parts_of() {
+  local entry
+  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
+    [[ ${entry%:*} == "$1" ]] && printf '%s\n' "${entry##*:}"
+  done
+  return 0
+}
+
+# The library's runs, each named by a module: `std.<module>` per top-level module of the library, those
+# beneath it its own, and `<module>` per module of CORPUS_STDLIB. `stdlib:<module>` per one that
+# declares a test, then `proofs:<module>` per one that declares a law or states an `ensures` or `cost`
+# clause, which `ply prove` owes a proof of: apart, so the cut can give a lane the tests and another
+# the proofs, each a process with a load of its own.
+stdlib_entries() {
+  library_modules_with '^test(/[a-z]+)? "' | sed 's/^/stdlib:/'
+  library_modules_with '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' | sed 's/^/proofs:/'
+}
+
+# The library's runs a `.ply` file of which holds a line the extended regular expression matches.
+library_modules_with() {
+  { grep -rlE --include='*.ply' "$1" "$root/$STD_LIBRARY" || true; } |
+    sed "s|^$root/$STD_LIBRARY/|std.|; s|^\(std\.[^/.]*\).*|\1|" | LC_ALL=C sort -u
+  { grep -lE "$1" "$root/$CORPUS_STDLIB"/*.ply || true; } | sed 's|.*/||; s|\.ply$||' | LC_ALL=C sort
+}
+
+# `run<TAB>key` per test and law of the library's runs, the name a filter is matched against:
+# `std.<module>.<label>` under its top-level module, and a project module's `<module>.<label>` under
+# the module.
+stdlib_keys() {
+  local file rel
+  find "$root/$STD_LIBRARY" -name '*.ply' | LC_ALL=C sort | while IFS= read -r file; do
+    rel=${file#"$root/$STD_LIBRARY/"}
+    rel=${rel%.ply}
+    labels_of "$file" | awk -v run="std.${rel%%/*}" -v module="std.${rel//\//.}" -v OFS="$TAB" '{ print run, module "." $0 }'
+  done
+  for file in "$root/$CORPUS_STDLIB"/*.ply; do
+    labels_of "$file" | awk -v module="$(basename "$file" .ply)" -v OFS="$TAB" '{ print module, module "." $0 }'
+  done
+}
+
+# The labels of a module's tests and laws.
+labels_of() {
+  sed -nE 's/^(test|law)(\/[a-z]+)? "([^"]*)".*/\3/p' "$1"
 }
 
 # `PREFIX<module>` per module of the package at DIR that declares a test, or `PREFIX<module>:<id>` per
@@ -349,43 +415,64 @@ cmd_corpus_for_partition() {
   done < <(corpus_placed)
 }
 
-# `path filter`: the program's entry takes every test of its package, a module's its own, and
-# `module:<id>` the test whose label hashes to it, by the qualified name `ply test --filter` matches.
-# A module the cut places a test at a time is a run too, of every test it declares.
+# `path<TAB>filter<TAB>shard` per entry named, in order, a field empty where the run has none: the
+# program's entry takes every test of its package, a module's its own, and `module:<id>` the test whose
+# label hashes to it, by the qualified name `ply test --filter` matches; `entry#K` takes part K of
+# what `entry` would, by `ply test --shard K/N`. A module the cut places a test at a time is a run too,
+# of every test it declares, and so are a run cut into parts, of every part, and `stdlib` and
+# `proofs`, of every test and every claim of the library.
 cmd_corpus_line() {
-  local entry entries
+  local entries id
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
   entries=$(corpus_entries)
+  for id in "$@"; do corpus_line_of "$id" "$entries" || return 1; done
+}
+
+# The line of the entry $1 among the entries $2.
+corpus_line_of() {
+  local entry line
   while read -r entry; do
-    [[ $entry == "$1" || ${entry%%:*} == "$1" ]] || continue
-    if [[ $1 == program ]]; then
-      printf '%s\n' "$CORPUS_PROGRAM"
-    elif [[ $1 == stdlib ]]; then
-      printf '%s\n' "$CORPUS_STDLIB"
-    elif [[ $1 == fixture-* ]]; then
-      printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${1#fixture-}"
-    elif [[ $1 == package-* ]]; then
-      package_path "${1#package-}"
-    elif [[ $1 == cli-* ]]; then
-      module_line "$CLI_SUITE" "${1#cli-}"
+    [[ $entry == "$1" || ${entry%%[:#]*} == "$1" ]] || continue
+    line=$(entry_line "${1%#*}") || return 1
+    if [[ $1 == *#* ]]; then
+      printf '%s%s%s/%s\n' "$line" "$TAB" "${1##*#}" "$(parts_of "${1%#*}")"
     else
-      module_line "$CORPUS_CHECKS" "$1"
+      printf '%s%s\n' "$line" "$TAB"
     fi
-    return 0
-  done <<< "$entries"
+    return
+  done <<< "$2"
   echo "no corpus entry named '$1'" >&2
   return 1
 }
 
-# `path filter` of the run `module` or `module:<id>` of the package at DIR.
+# `path<TAB>filter` of the entry $1, or of the run a module is or a run cut into parts is.
+entry_line() {
+  if [[ $1 == program ]]; then
+    printf '%s%s\n' "$CORPUS_PROGRAM" "$TAB"
+  elif [[ $1 == stdlib || $1 == proofs ]]; then
+    printf '%s%s\n' "$CORPUS_STDLIB" "$TAB"
+  elif [[ $1 == stdlib:* || $1 == proofs:* ]]; then
+    printf '%s%s%s.\n' "$CORPUS_STDLIB" "$TAB" "${1#*:}"
+  elif [[ $1 == fixture-* ]]; then
+    printf '%s/%s.ply%s\n' "$CORPUS_FIXTURES" "${1#fixture-}" "$TAB"
+  elif [[ $1 == package-* ]]; then
+    printf '%s%s\n' "$(package_path "${1#package-}")" "$TAB"
+  elif [[ $1 == cli-* ]]; then
+    module_line "$CLI_SUITE" "${1#cli-}"
+  else
+    module_line "$CORPUS_CHECKS" "$1"
+  fi
+}
+
+# `path<TAB>filter` of the run `module` or `module:<id>` of the package at DIR.
 module_line() {
   local dir=$1 module=${2%%:*} name
   if [[ $2 == *:* ]]; then
     name=$(corpus_test_names "$root/$dir/$module.ply" | label_ids | awk -F"$TAB" -v id="${2##*:}" '$1 == id { print $2; exit }')
     [[ -n $name ]] || { echo "no test of $dir/$module.ply has the id '${2##*:}'" >&2; return 1; }
-    printf '%s %s.%s\n' "$dir" "$module" "$name"
+    printf '%s%s%s.%s\n' "$dir" "$TAB" "$module" "$name"
   else
-    printf '%s %s.\n' "$dir" "$module"
+    printf '%s%s%s.\n' "$dir" "$TAB" "$module"
   fi
 }
 
@@ -599,9 +686,17 @@ living_durations() {
     echo "FAIL: cargo metadata named no test binary in $root" >&2
     return 1
   }
-  # A corpus row is the entry's own, and lives while the entry does; a startup row is a package's.
+  # A corpus row is the entry's own, and lives while the entry does, or while a part of it does, which
+  # counts as its share until it is measured; a startup row is a package's.
   dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$({ corpus_placed; desk_placed; } | tr '\n' ' ')" '
-    BEGIN { n = split(placed, ids, " "); for (i = 1; i <= n; i++) corpus[ids[i]] = 1; n = 0 }
+    BEGIN {
+      n = split(placed, ids, " ")
+      for (i = 1; i <= n; i++) {
+        corpus[ids[i]] = 1
+        if (index(ids[i], "#")) corpus[substr(ids[i], 1, index(ids[i], "#") - 1)] = 1
+      }
+      n = 0
+    }
     NR == FNR { live[$0] = 1; next }
     $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
     $1 == "startup" { print > out; next }
@@ -725,26 +820,49 @@ desk_cut() {
 }
 
 # The corpus runs the partitions take, as `corpus-<k>.txt` of `lane entry` lines. The tests of a module
-# placed a test at a time go in as runs of neighbours, one run while the module fits a lane and as few
-# as it needs once it does not, so a cold start its tests share is paid once a run rather than once a
-# test. Runs and the other entries go longest first onto the lane of every partition's that would end
-# soonest with it; the lanes are taken partition by partition, so the first placed land on different
-# runners. A lane pays each package's startup once. An entry nothing measured counts as the median
-# of those that were.
+# placed a test at a time, and the standard library's runs of each kind, go in as runs of neighbours,
+# one run while they fit a lane and as few as they need once they do not, so a cold start they share is
+# paid once a run rather than once an entry. Runs and the other entries go longest first onto the lane
+# of every partition's that would end soonest with it; the lanes are taken partition by partition, so
+# the first placed land on different runners. A lane pays each package's startup once. An entry nothing
+# measured counts as its share of the run it is a part of, where that was measured whole, or else as
+# the median of its neighbours that were measured, or else of every entry that was.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
   corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" \
-    -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" '
-    function package(id) {
+    -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" -v stdlib="$CORPUS_STDLIB" '
+    # What the startup a lane pays once is kept under: a part of a run is a `ply test` of its own.
+    function package(id,   whole) {
+      if (index(id, "#")) {
+        whole = package(substr(id, 1, index(id, "#") - 1))
+        return (whole in batched) ? whole "#" id : id
+      }
       if (id ~ /^cli-/) return cli
-      if (id == "program" || id == "stdlib" || id ~ /^package-/ || id ~ /^fixture-/) return id
+      if (id ~ /^stdlib:/) return stdlib
+      if (id ~ /^proofs:/) return "prove:" stdlib
+      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
+    }
+    # About two minutes unmeasured; a program or package suite row holds its startup whole, and so
+    # do the proof runs, each a share of its prove.
+    function startup(key) {
+      if (key in start) return start[key]
+      return ((index(key, "#") ? substr(key, 1, index(key, "#") - 1) : key) in batched) ? 120000 : 0
     }
     function module_of(id) { return index(id, ":") ? substr(id, 1, index(id, ":") - 1) : "" }
     # A new unit holding nothing yet, of the package `id` is tested in.
     function unit(id) { u++; size[u] = 0; cost[u] = 0; pkg[u] = package(id) }
     function hold(id) { member[u, ++size[u]] = id; cost[u] += ms[id] }
+    # The middle of the first `count` values of `v`, which it sorts.
+    function middle(v, count,   i, j, x) {
+      for (i = 2; i <= count; i++) {
+        x = v[i]
+        for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]
+        v[j + 1] = x
+      }
+      return v[int((count + 1) / 2)]
+    }
     BEGIN {
       FS = "\t"
       while ((getline line < rows) > 0) {
@@ -753,19 +871,26 @@ corpus_cut() {
         else ms[f[2]] = f[3] + 0
       }
       FS = " "
+      batched[checks] = batched[cli] = batched[stdlib] = 1
     }
     { ids[++n] = $1 }
     END {
-      for (i = 1; i <= n; i++) if (ids[i] in ms) measured[++m] = ms[ids[i]]
-      for (i = 2; i <= m; i++) {
-        x = measured[i]
-        for (j = i - 1; j >= 1 && measured[j] > x; j--) measured[j + 1] = measured[j]
-        measured[j + 1] = x
-      }
-      median = m ? measured[int((m + 1) / 2)] : 60000
       for (i = 1; i <= n; i++) {
-        if (!(ids[i] in ms)) ms[ids[i]] = median
-        total += ms[ids[i]]
+        if (ids[i] in ms) measured[++m] = ms[ids[i]]
+        if (index(ids[i], "#")) parts[substr(ids[i], 1, index(ids[i], "#") - 1)]++
+      }
+      median = m ? middle(measured, m) : 60000
+      for (i = 1; i <= n; ) {
+        mod = module_of(ids[i])
+        c = 0
+        for (j = i; j <= n && (j == i || (mod != "" && module_of(ids[j]) == mod)); j++)
+          if (ids[j] in ms) near[++c] = ms[ids[j]]
+        guess = (mod != "" && c) ? middle(near, c) : median
+        for (; i < j; i++) {
+          whole = index(ids[i], "#") ? substr(ids[i], 1, index(ids[i], "#") - 1) : ""
+          if (!(ids[i] in ms)) ms[ids[i]] = ((whole in parts) && (whole in ms)) ? ms[whole] / parts[whole] : guess
+          total += ms[ids[i]]
+        }
       }
       lanes = p * l
       target = total / lanes
@@ -794,14 +919,11 @@ corpus_cut() {
         for (j = i - 1; j >= 1 && cost[order[j]] < cost[x]; j--) order[j + 1] = order[j]
         order[j + 1] = x
       }
-      # About two minutes unmeasured; a program or package suite row holds its startup whole.
-      start[checks] = (checks in start) ? start[checks] : 120000
-      start[cli] = (cli in start) ? start[cli] : 120000
       for (i = 1; i <= u; i++) {
         x = order[i]
         best = 0
         for (j = 1; j <= lanes; j++) {
-          end = load[j] + cost[x] + ((j SUBSEP pkg[x]) in loads ? 0 : start[pkg[x]])
+          end = load[j] + cost[x] + ((j SUBSEP pkg[x]) in loads ? 0 : startup(pkg[x]))
           if (best == 0 || end < bestend) { best = j; bestend = end }
         }
         load[best] = bestend
@@ -1605,11 +1727,34 @@ cmd_verify() {
       done <<< "$names"
     done
   done
+  # The library's runs likewise, by `std.<module>.` and by a project module's `<module>.`.
+  keys=$(stdlib_keys)
+  for module in $(stdlib_entries | sed 's/^[a-z]*://' | LC_ALL=C sort -u); do
+    outside=$(awk -F"$TAB" -v m="$module" '$1 != m && index($2, m ".") { print $2; exit }' <<< "$keys")
+    if [[ -n $outside ]]; then
+      echo "FAIL: '$module.' is part of '$outside', a test or law of another of the library's runs, so the run of $module picks it too" >&2
+      failures=$((failures + 1))
+    fi
+  done
   for entry in "${CLI_TREE_CHECKS[@]}"; do
     module=${entry%%:*}
     names=$(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
     if ! grep -qxF -- "${entry#*:}" <<< "$names"; then
       echo "FAIL: $CLI_SUITE/$module.ply declares no test '${entry#*:}', and CLI_TREE_CHECKS names it" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  # A run cut into parts is an entry's, a `ply test` a partition takes, cut into two or more.
+  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
+    id=${entry%:*}
+    if ! [[ ${entry##*:} =~ ^[0-9]+$ ]] || ((${entry##*:} < 2)); then
+      echo "FAIL: CORPUS_SHARDED cuts '$id' into '${entry##*:}' parts, and a run is cut into two or more" >&2
+      failures=$((failures + 1))
+    elif ! grep -qxF -- "$id#1" <<< "$entries"; then
+      echo "FAIL: CORPUS_SHARDED names '$id', which is no corpus entry" >&2
+      failures=$((failures + 1))
+    elif [[ $id == proofs:* ]] || corpus_alone "$id" || corpus_desk "$id"; then
+      echo "FAIL: CORPUS_SHARDED names '$id', which is no \`ply test\` a partition takes" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1661,6 +1806,17 @@ cmd_verify() {
       echo "FAIL: job '$corpus_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
       failures=$((failures + 1))
     fi
+    # A run over a third of the deadline leaves the cut too little room to balance the lanes, and
+    # cold it can outlast one.
+    if [[ -n $budget && -s $TIMINGS ]]; then
+      while read -r id seconds; do
+        echo "FAIL: corpus run $id took ${seconds}s in the last table, over a third of job '$corpus_job''s ${budget}-minute deadline: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST) or cut it into parts (CORPUS_SHARDED)" >&2
+        failures=$((failures + 1))
+      done < <(awk -F"$TAB" -v limit=$((budget * 60000 / 3)) -v taken="$(if [[ $corpus_command == *partition ]]; then corpus_placed; else desk_placed; fi | tr '\n' ' ')" '
+        BEGIN { n = split(taken, ids, " "); for (i = 1; i <= n; i++) run[ids[i]] = 1 }
+        $1 == "corpus" && ($2 in run) && $3 + 0 > limit { printf "%s %d\n", $2, $3 / 1000 }
+      ' "$TIMINGS")
+    fi
   done
 
   # --- cache keys -----------------------------------------------------------
@@ -1687,7 +1843,7 @@ case "${1:-}" in
   corpus-matrix) cmd_corpus_matrix ;;
   corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
   desks-for-runner) cmd_desks_for_runner "${2:?a desk runner}" "${3:-}" ;;
-  corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
+  corpus-line) cmd_corpus_line "${2:?a corpus entry}" "${@:3}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   rust-answered) cmd_rust_answered "${2:-}" "${3:-}" "${4:-}" ;;
@@ -1699,7 +1855,7 @@ case "${1:-}" in
   fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
