@@ -64,6 +64,9 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
 - `crates/ply-cli` is the CLI as a Ply program plus the runnable `ply bootstrap` makes of it
   (`bootstrap/ply.run`); it is not a cargo crate. The `refresh` job rebuilds both runnables on
   main by driving the released binary, so the checkout can rebuild itself without cargo.
+- A `ply.lock` records a path dependency in this checkout (prove, sim, store, suite) by name and
+  version only, so editing one moves no lock. Adding or dropping a dependency or bumping a version
+  does: run `ply resolve` on the lock's directory, as CI's lock gate does for every `ply.lock`.
 - `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit
   codes, or diagnostic codes updates it in the same PR. The builtins and the standard library are
   documented by their doc comments, which a change to them updates.
