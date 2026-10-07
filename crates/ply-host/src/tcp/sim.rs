@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// Where the ports the twin assigns start: the first of the dynamic range.
 const EPHEMERAL: u16 = 49152;
@@ -180,6 +181,7 @@ impl Net for SimNet {
             Op::PeerAddress => "ply_host::tcp::sim::peer_address",
             Op::PeerCredentials => "ply_host::tcp::sim::peer_credentials",
             Op::Options => "ply_host::tcp::sim::options",
+            Op::SendSecret => "ply_host::tcp::sim::send_secret",
         }
     }
 
@@ -398,6 +400,32 @@ impl Net for SimNet {
             .or_default()
             .extend_from_slice(payload);
         Ok(HostAnswer::Value(some(Value::Int(payload.len() as i64))))
+    }
+
+    /// What a test reads back of a credential is what the peer would: the twin keeps it with
+    /// everything else sent.
+    fn send_secret(
+        &self,
+        at: &Resource,
+        conn: i64,
+        payload: Zeroizing<Vec<u8>>,
+        _timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        self.handles.check(conn, at, span)?;
+        let mut state = lock(&self.state);
+        if !state.conns.contains_key(&conn) {
+            return Err(not_a_stream(conn, span));
+        }
+        if state.ended.contains(&conn) {
+            return Ok(HostAnswer::Value(Value::Bool(false)));
+        }
+        state
+            .sent
+            .entry(conn)
+            .or_default()
+            .extend_from_slice(&payload);
+        Ok(HostAnswer::Value(Value::Bool(true)))
     }
 
     fn close_write(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {

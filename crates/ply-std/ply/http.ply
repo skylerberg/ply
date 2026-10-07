@@ -4,19 +4,49 @@
 //! fills. An ambiguous message is refused and the connection closed, and every loop is bounded by
 //! `Limits`. Every connection the module opens or accepts is closed however serving it ends, an `app`
 //! a clause unwinds out of included. There is no compression, `Upgrade` or `Content-Encoding`.
+//!
+//! A request's `multipart/form-data` body is read by `form` through `std.multipart`; `dated` and
+//! `last_modified` write `std.date`'s HTTP dates; `negotiate` picks among the types a resource is
+//! offered in by the request's `Accept`, and `negotiated` answers with it and says the answer
+//! varies by `Accept`. `std.cookie` reads and sets cookies, `std.cors` answers cross-origin
+//! requests, and `std.static` serves files.
+//!
+//! `fetch` asks for a `std.url` `Url`, over TLS for `https`, follows redirects and keeps a
+//! `std.cookie` jar, and goes through a proxy where it is given one; `request`, `dial` and `ask`
+//! are the exchange underneath, on a host and port.
+//!
+//! `serve` answers connections one at a time. `serve_pooled` answers them with a pool of tasks
+//! over a bounded queue and sheds what it cannot hold: a connection that finds the queue full, or
+//! that waited in it past `Shedding.max_wait_ms`, is answered 503 with `Retry-After` and closed
+//! unread, and `Pooled` counts each kind. When `accept` answers that the listener is closed, as it
+//! does at a stop under `--host`, the pool drains: it accepts nothing more, serves every connection
+//! it already accepted, those still queued included, answers a request already read on a kept
+//! connection with `Connection: close`, closes a kept connection that waits idle at once, and
+//! returns when every worker is done; the run's `--drain-ms` bounds the whole.
 
 import std.bytes (int_of_ascii, is_digit)
+import std.chan (Accepted, try_send)
+import std.cookie
+import std.cookie (Jar)
+import std.date
+import std.date (OffsetDateTime)
 import std.dns
+import std.dns (dns)
 import std.ip
 import std.ip (Ip, Prefix, SocketAddress, ip)
+import std.mime
+import std.mime (MediaType)
+import std.multipart
 import std.net
 import std.net (Blocks, Hears, Leaves, MemNet, Repeats, Says, Silent, Stalls, Step, net, send_all)
-import std.list (any, contains, drop, reverse)
+import std.list (all, any, contains, drop, reverse)
 import std.option (option_unwrap_or)
+import std.task
+import std.time (as_millis, between, millis)
 import std.url
 import std.url (Url, url_fragment, url_host, url_host_port, url_parse, url_path, url_query,
                 url_reason, url_render, url_scheme, url_userinfo)
-import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case, is_ascii)
+import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case, is_ascii, join)
 
 // --- The message ------------------------------------------------------------
 
@@ -1154,30 +1184,44 @@ pub fn allow_field(ms: List<Method>) -> String =
 
 /// The standard reason for a status; `Unknown` for one this module does not name.
 pub fn reason_phrase(status: Int) -> String =
-  if status == 100 { "Continue" }
-  else if status == 200 { "OK" }
-  else if status == 201 { "Created" }
-  else if status == 204 { "No Content" }
-  else if status == 301 { "Moved Permanently" }
-  else if status == 302 { "Found" }
-  else if status == 304 { "Not Modified" }
-  else if status == 400 { "Bad Request" }
-  else if status == 401 { "Unauthorized" }
-  else if status == 403 { "Forbidden" }
-  else if status == 404 { "Not Found" }
-  else if status == 405 { "Method Not Allowed" }
-  else if status == 408 { "Request Timeout" }
-  else if status == 411 { "Length Required" }
-  else if status == 413 { "Content Too Large" }
-  else if status == 414 { "URI Too Long" }
-  else if status == 415 { "Unsupported Media Type" }
-  else if status == 417 { "Expectation Failed" }
-  else if status == 431 { "Request Header Fields Too Large" }
-  else if status == 500 { "Internal Server Error" }
-  else if status == 501 { "Not Implemented" }
-  else if status == 503 { "Service Unavailable" }
-  else if status == 505 { "HTTP Version Not Supported" }
-  else { "Unknown" }
+  match status {
+    100 -> "Continue",
+    200 -> "OK",
+    201 -> "Created",
+    202 -> "Accepted",
+    204 -> "No Content",
+    206 -> "Partial Content",
+    301 -> "Moved Permanently",
+    302 -> "Found",
+    303 -> "See Other",
+    304 -> "Not Modified",
+    307 -> "Temporary Redirect",
+    308 -> "Permanent Redirect",
+    400 -> "Bad Request",
+    401 -> "Unauthorized",
+    403 -> "Forbidden",
+    404 -> "Not Found",
+    405 -> "Method Not Allowed",
+    406 -> "Not Acceptable",
+    407 -> "Proxy Authentication Required",
+    408 -> "Request Timeout",
+    411 -> "Length Required",
+    412 -> "Precondition Failed",
+    413 -> "Content Too Large",
+    414 -> "URI Too Long",
+    415 -> "Unsupported Media Type",
+    416 -> "Range Not Satisfiable",
+    417 -> "Expectation Failed",
+    429 -> "Too Many Requests",
+    431 -> "Request Header Fields Too Large",
+    500 -> "Internal Server Error",
+    501 -> "Not Implemented",
+    502 -> "Bad Gateway",
+    503 -> "Service Unavailable",
+    504 -> "Gateway Timeout",
+    505 -> "HTTP Version Not Supported",
+    _ -> "Unknown",
+  }
 
 /// 1xx, 204 and 304 carry no body or `Content-Length`: a client would read one as the next message.
 fn bodiless(status: Int) -> Bool = (status >= 100 && status < 200) || status == 204 || status == 304
@@ -1282,6 +1326,148 @@ fn hex_digit(v: Int) -> String / {abort.raise} = string_slice("0123456789abcdef"
 
 /// The interim answer that tells a client sending `Expect: 100-continue` to send its body.
 pub fn continue_response() -> Bytes = b"HTTP/1.1 100 Continue\r\n\r\n"
+
+// --- Forms ------------------------------------------------------------------
+
+/// Why a request carries no form `form` reads.
+pub type FormError =
+  /// Its `Content-Type` is not `multipart/form-data` with a boundary: what it says, or `None`.
+  | NotAForm(Option<String>)
+  /// The body is one `std.multipart` refuses, at a byte and for a reason.
+  | Unreadable(multipart::Refusal)
+
+/// The fields and files of a `multipart/form-data` request body, read by `std.multipart` under
+/// `limits`.
+pub fn form(
+  req: Request,
+  limits: multipart::Limits,
+) -> Result<multipart::Form, FormError> / {abort.raise} =
+  match header(req.headers, "content-type") {
+    None -> Err(NotAForm(None)),
+    Some(text) -> match form_boundary(text) {
+      None -> Err(NotAForm(Some(text))),
+      Some(boundary) -> match multipart::parse_form(req.body, boundary, limits) {
+        Ok(f) -> Ok(f),
+        Err(r) -> Err(Unreadable(r)),
+      },
+    },
+  }
+
+fn form_boundary(text: String) -> Option<String> / {abort.raise} =
+  match mime::parse(text) {
+    Ok(m) -> if mime::essence(m) == "multipart/form-data" { mime::boundary(m) } else { None },
+    Err(_) -> None,
+  }
+
+/// What a request whose form does not read is answered with: 415 for a body of another type,
+/// 400 for one that does not read, saying at which byte.
+pub fn form_refusal(e: FormError) -> Response =
+  match e {
+    NotAForm(_) -> text_response(415, "the body is not multipart/form-data with a boundary\n"),
+    Unreadable(r) ->
+      text_response(400, "the form does not read at byte " ++ int_to_string(r.at) ++ "\n"),
+  }
+
+// --- Dates ------------------------------------------------------------------
+
+/// `r` with a `Date` field naming `at`, as RFC 9110 §6.6.1 asks of a server with a clock.
+pub fn dated(r: Response, at: OffsetDateTime) -> Response =
+  { ..r, headers: set_header(r.headers, "date", date::http_date(at)) }
+
+/// `r` with a `Last-Modified` field naming `at`.
+pub fn last_modified(r: Response, at: OffsetDateTime) -> Response =
+  { ..r, headers: set_header(r.headers, "last-modified", date::http_date(at)) }
+
+/// The instant the first field `name` names as an HTTP date, `now` deciding the century of a
+/// two-digit year; `None` where there is no such field or it does not read as one.
+pub fn date_field(
+  headers: Headers,
+  name: String,
+  now: Instant,
+) -> Option<OffsetDateTime> / {abort.raise} =
+  match header(headers, name) { Some(text) -> date::parse_http_date(text, now), None -> None }
+
+// --- Negotiation ------------------------------------------------------------
+
+/// The media types the `Accept` fields of `headers` list, in order; `None` where there is no
+/// such field, or one that does not read, which a server treats as accepting anything.
+pub fn accepted(headers: Headers) -> Option<List<MediaType>> / {abort.raise} =
+  match header_lines(headers, "accept") {
+    [] -> None,
+    lines -> match mime::parse_list(join(lines, ", ")) {
+      Ok(ranges) -> Some(ranges),
+      Err(_) -> None,
+    },
+  }
+
+/// The type of `offered` a request's `Accept` prefers, as RFC 9110 §12.5.1 weighs them: each
+/// offer takes the weight of the most specific range that covers it, and of equal weights the
+/// earlier offer wins. `None` where every offer weighs zero, which is 406; the first offer where
+/// the request names no `Accept`.
+pub fn negotiate(headers: Headers, offered: List<MediaType>) -> Option<MediaType> / {abort.raise} =
+  match accepted(headers) {
+    None -> list_at(offered, 0),
+    Some(ranges) -> {
+      let best = fold(
+        offered,
+        { pick: None, weight: 0 },
+        |b: { pick: Option<MediaType>, weight: Int }, m: MediaType| {
+          let w = weight_of(ranges, m);
+          if w > b.weight { { pick: Some(m), weight: w } } else { b }
+        },
+      );
+      best.pick
+    },
+  }
+
+/// The weight in thousandths the most specific range of `ranges` covering `m` gives it; zero where
+/// none does.
+fn weight_of(ranges: List<MediaType>, m: MediaType) -> Int / {abort.raise} = {
+  let covering = filter(ranges, |r: MediaType| mime::matches(r, m));
+  let chosen = fold(
+    covering,
+    { specificity: -1, weight: 0 },
+    |b: { specificity: Int, weight: Int }, r: MediaType|
+      if mime::specificity(r) > b.specificity {
+        { specificity: mime::specificity(r), weight: option_unwrap_or(mime::quality(r), 0) }
+      } else { b },
+  );
+  chosen.weight
+}
+
+/// `r` with `field` among those its `Vary` names, once, so a cache keys what it holds by it.
+pub fn vary(r: Response, field: String) -> Response / {abort.raise} = {
+  let named = fold(header_lines(r.headers, "vary"), [], |acc: List<String>, line: String|
+    fold(string_split(line, ","), acc, |inner: List<String>, part: String| {
+      let t = ascii_trim(part);
+      if string_len(t) == 0 { inner } else { push(inner, t) }
+    }));
+  if any(named, |n: String| eq_ignore_ascii_case(n, field) || n == "*") { r }
+  else { { ..r, headers: set_header(r.headers, "vary", join(push(named, field), ", ")) } }
+}
+
+/// What `produce` answers for the type `negotiate` chooses among `offered`, its `Content-Type`
+/// that type; 406 naming the types offered where none is acceptable. Either way the response
+/// says it varies by `Accept`, or a cache hands one client's type to another.
+pub fn negotiated<| e>(
+  req: Request,
+  offered: List<MediaType>,
+  produce: (MediaType) -> Response / e,
+) -> Response / {abort.raise | e} =
+  match negotiate(req.headers, offered) {
+    Some(m) -> {
+      let r = produce(m);
+      vary({ ..r, headers: set_header(r.headers, "content-type", mime::render(m)) }, "Accept")
+    },
+    None ->
+      vary(
+        text_response(
+          406,
+          "this resource is available as " ++ join(map(offered, mime::render), ", ") ++ "\n",
+        ),
+        "Accept",
+      ),
+  }
 
 // --- The read loop ----------------------------------------------------------
 
@@ -1765,6 +1951,276 @@ fn read_answer<[l]>(
     BodyClosed -> Err(Closed),
   }
 
+// --- Fetching a URL ---------------------------------------------------------
+
+/// A proxy every request goes through: a request for an `http` URL is sent to it in absolute
+/// form, and one for an `https` URL through a `CONNECT` tunnel to the URL's host, secured end to
+/// end inside it.
+pub type Proxy = { host: String, port: Int }
+
+/// How `fetch` goes about a request.
+pub type Fetching = {
+  /// The bounds of each exchange, whose deadlines are the fetch's timeouts.
+  limits: Limits,
+  /// The redirects followed before the answer is `TooManyRedirects`.
+  max_redirects: Int,
+  proxy: Option<Proxy>,
+}
+
+/// Ten redirects, no proxy, and `default_limits`, whose deadlines bound every wait.
+pub fn fetching() -> Fetching = { limits: default_limits(), max_redirects: 10, proxy: None }
+
+/// Why a fetch has no answer.
+pub type FetchError =
+  /// The URL's scheme is neither `http` nor `https`, or it names no host.
+  | NotHttp(String)
+  /// No connection was made, or it was not secured, to the URL's host or to the proxy.
+  | NoConnection(net::Refusal)
+  /// The proxy answered `CONNECT` with this status rather than a tunnel.
+  | ProxyRefused(Int)
+  /// The exchange on the connection failed.
+  | NoAnswer(ClientError)
+  /// A redirect's `Location` does not resolve against the URL it answered.
+  | BadLocation(String)
+  /// A redirect from `https` led to this URL over `http`, which is not followed.
+  | Downgraded(String)
+  /// The redirects ran past the bound.
+  | TooManyRedirects(Int)
+
+/// What a fetch answered: the last response, the URL that gave it, the jar with what every
+/// response along the way set, and how many redirects were followed.
+pub type Fetched = { response: Response, url: Url, jar: Jar, redirects: Int }
+
+/// `method` with `headers` and `body` to `to`, a connection to its host for each exchange, chosen
+/// by its scheme (`net::dial`, or `net::dial_tls` offering `http/1.1`) or through the proxy.
+/// Redirects are followed as the Fetch standard follows them, up to `max_redirects`: a 303 is
+/// fetched with `GET` (a `HEAD` stays one), a 301 or 302 that answered a `POST` with `GET`, and a
+/// 307 or 308 with the method and body it answered; a method that changes drops the body and its
+/// type. A redirect to another origin drops `Authorization`, `Proxy-Authorization` and the
+/// `Cookie` the caller wrote, and one from `https` to `http` is not followed. The jar's cookies
+/// for each URL go with its request, and what each response sets goes into the jar, at `now`,
+/// the wall clock's, from the epoch. `Host` comes from the URL and is not the caller's to set.
+pub fn fetch<[l]>(
+  method: Method,
+  to: Url,
+  headers: Headers,
+  body: Bytes,
+  jar: Jar,
+  options: Fetching,
+  now: Instant,
+) -> Result<Fetched, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+  hop[l](
+    method,
+    to,
+    map_remove(headers, "host"),
+    body,
+    jar,
+    options,
+    now,
+    max(options.max_redirects, 0),
+  )
+
+fn hop<[l]>(
+  method: Method,
+  at: Url,
+  headers: Headers,
+  body: Bytes,
+  jar: Jar,
+  options: Fetching,
+  now: Instant,
+  left: Int,
+) -> Result<Fetched, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+  match exchanged_at[l](method, at, with_cookies(headers, jar, at, now), body, options) {
+    Err(e) -> Err(e),
+    Ok(res) -> {
+      let kept = cookie::store(jar, at, header_lines(res.headers, "set-cookie"), now);
+      let redirects = max(options.max_redirects, 0) - left;
+      match redirect_of(res) {
+        None -> Ok({ response: res, url: at, jar: kept, redirects: redirects }),
+        Some(location) -> if left <= 0 { Err(TooManyRedirects(redirects)) } else {
+          match url::url_join(at, location) {
+            Err(_) -> Err(BadLocation(location)),
+            Ok(next) -> if url_scheme(at) == "https" && url_scheme(next) != "https" {
+              Err(Downgraded(url::url_redacted(next)))
+            } else {
+              let m = redirected_method(res.status, method);
+              hop(
+                m,
+                next,
+                followed_headers(
+                  headers,
+                  m != method,
+                  url::url_origin(at) == url::url_origin(next),
+                ),
+                if m == method { body } else { b"" },
+                kept,
+                options,
+                now,
+                left - 1,
+              )
+            },
+          }
+        },
+      }
+    },
+  }
+
+/// The `Location` of a redirect, where the response is one and names it.
+fn redirect_of(res: Response) -> Option<String> =
+  if res.status == 301 || res.status == 302 || res.status == 303 || res.status == 307
+      || res.status == 308 { header(res.headers, "location") }
+  else { None }
+
+fn redirected_method(status: Int, m: Method) -> Method =
+  if status == 303 { if m == Head { Head } else { Get } }
+  else if (status == 301 || status == 302) && m == Post { Get }
+  else { m }
+
+fn followed_headers(headers: Headers, method_changed: Bool, same_origin: Bool) -> Headers = {
+  let kept = if same_origin { headers } else {
+    map_remove(map_remove(map_remove(headers, "authorization"), "proxy-authorization"), "cookie")
+  };
+  if method_changed { map_remove(map_remove(kept, "content-type"), "content-encoding") }
+  else { kept }
+}
+
+/// `headers` with the jar's cookies for `at` after any the caller wrote.
+fn with_cookies(headers: Headers, jar: Jar, at: Url, now: Instant) -> Headers / {abort.raise} =
+  match cookie::header_for(jar, at, now) {
+    None -> headers,
+    Some(jarred) -> match header(headers, "cookie") {
+      Some(own) -> set_header(headers, "cookie", own ++ "; " ++ jarred),
+      None -> set_header(headers, "cookie", jarred),
+    },
+  }
+
+/// The host a URL names, as a connection dials it: a name, or an address without brackets.
+fn host_text(u: Url) -> Option<String> =
+  match url_host(u) {
+    Some(url::Name(name)) -> Some(name),
+    Some(url::V4(four)) -> Some(ip::render(ip::V4(four))),
+    Some(url::V6(six)) -> Some(ip::render(ip::V6(six))),
+    None -> None,
+  }
+
+/// What a request to `u` names as its target: its path, `/` for none, and its query.
+fn target_of(u: Url) -> String =
+  (if url_path(u) == "" { "/" } else { url_path(u) })
+    ++ (match url_query(u) { Some(q) -> "?" ++ q, None -> "" })
+
+/// The host and port a `CONNECT` names, an IPv6 address in brackets.
+fn tunnel_authority(u: Url, host: String, port: Int) -> String =
+  (match url_host(u) { Some(url::V6(_)) -> "[" ++ host ++ "]", _ -> host }) ++ ":"
+    ++ int_to_string(port)
+
+fn exchanged_at<[l]>(
+  method: Method,
+  at: Url,
+  headers: Headers,
+  body: Bytes,
+  options: Fetching,
+) -> Result<Response, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+  let scheme = url_scheme(at);
+  match ((host_text(at), url::url_port_or_default(at), url_host_port(at))) {
+    (Some(host), Some(port), Some(authority)) -> if scheme != "http" && scheme != "https" {
+      Err(NotHttp(url::url_redacted(at)))
+    } else {
+      let bare = request_to(method, authority, target_of(at), body);
+      let req = { ..bare, headers: headers };
+      match options.proxy {
+        None -> direct[l](scheme == "https", host, port, req, options.limits),
+        Some(p) -> proxied[l](at, host, port, p, req, options.limits),
+      }
+    },
+    _ -> Err(NotHttp(url::url_redacted(at))),
+  }
+}
+
+fn direct<[l]>(
+  secure: Bool,
+  host: String,
+  port: Int,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+  let opened: Result<Int, net::Refusal> = if secure {
+    try { net::dial_tls[l](host, port, ["http/1.1"], [], limits.connect_timeout_ms) }
+  } else { try { net::dial[l](host, port, [], limits.connect_timeout_ms) } };
+  match opened {
+    Err(why) -> Err(NoConnection(why)),
+    Ok(c) -> bracket(|| c, |h: Int| net.close[l](h), |h: Int| answer_on[l](h, req, limits)),
+  }
+}
+
+fn answer_on<[l]>(
+  c: Int,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {net.send[l], net.recv[l], abort.raise} =
+  match exchange_over[l](c, req, limits, true) { Ok(r) -> Ok(r), Err(e) -> Err(NoAnswer(e)) }
+
+fn proxied<[l]>(
+  at: Url,
+  host: String,
+  port: Int,
+  p: Proxy,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+  let opened: Result<Int, net::Refusal> = try {
+    net::dial[l](p.host, p.port, [], limits.connect_timeout_ms)
+  };
+  match opened {
+    Err(why) -> Err(NoConnection(why)),
+    Ok(c) ->
+      bracket(|| c, |h: Int| net.close[l](h), |h: Int|
+        if url_scheme(at) == "https" {
+          tunnelled[l](h, tunnel_authority(at, host, port), host, req, limits)
+        } else {
+          answer_on[l](h, { ..req, target: "http://" ++ req.authority ++ target_of(at) }, limits)
+        }),
+  }
+}
+
+/// A `CONNECT` to `authority` on the proxy's connection, then TLS to `host` inside the tunnel and
+/// the request over it.
+fn tunnelled<[l]>(
+  c: Int,
+  authority: String,
+  host: String,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {net.send[l], net.recv[l], net.start_tls[l], abort.raise} = {
+  let asked = bytes_of_string(
+    "CONNECT " ++ authority ++ " HTTP/1.1\r\nHost: " ++ authority ++ "\r\n\r\n",
+  );
+  if !send_all[l](c, asked, limits.write_timeout_ms) { Err(NoAnswer(NotSent)) } else {
+    match read_head[l](c, b"", limits, false) {
+      HeadTimedOut -> Err(NoAnswer(TimedOut)),
+      HeadIdle -> Err(NoAnswer(TimedOut)),
+      HeadClosed(_) -> Err(NoAnswer(Closed)),
+      HeadBytes(got) -> match parse_response_head(got.buf, Other("CONNECT"), limits) {
+        ResponseRefused(r) -> Err(NoAnswer(Malformed(r))),
+        ResponseIncomplete ->
+          Err(
+            NoAnswer(
+              Malformed({ status: 502, reason: "the proxy's answer to CONNECT did not end" }),
+            ),
+          ),
+        ResponseParsed(head) -> if head.status < 200 || head.status > 299 {
+          Err(ProxyRefused(head.status))
+        } else {
+          let unread = bytes_slice(got.buf, head.consumed, bytes_len(got.buf));
+          match net.start_tls[l](c, host, ["http/1.1"], unread, limits.connect_timeout_ms) {
+            Err(why) -> Err(NoConnection(why)),
+            Ok(_) -> answer_on[l](c, req, limits),
+          }
+        },
+      },
+    }
+  }
+}
+
 // --- Serving ----------------------------------------------------------------
 
 /// One connection: read a head, answer it, then close or go round again with the leftover bytes.
@@ -1776,20 +2232,64 @@ pub fn serve_connection<[l] | e>(
   app: (Request) -> Response / e,
 ) -> Unit / {abort.raise, net.peer_address[l], net.recv[l], net.send[l], net.close[l] | e} =
   bracket(|| c, |h: Int| net.close[l](h), |h: Int|
-    connection_loop[l](h, limits, app, net.peer_address[l](h), b"", limits.max_keep_alive, false))
+    connection_loop[l](
+      h,
+      limits,
+      app,
+      false,
+      || false,
+      net.peer_address[l](h),
+      b"",
+      limits.max_keep_alive,
+      false,
+    ))
 
+/// `serve_connection`, until `stop` is closed, and drained from then on: the request being read or
+/// answered is answered, and so is one already read behind it, but the connection is kept no
+/// longer, so the last answer says `Connection: close`; a connection waiting idle for its next
+/// request is closed at once, its wait cut into slices of at most 250 milliseconds between which
+/// it looks at `stop`.
+pub fn serve_draining<[l] | e>(
+  c: Int,
+  limits: Limits,
+  stop: Chan<Unit>,
+  app: (Request) -> Response / {task.select | e},
+) -> Unit / {abort.raise, net.peer_address[l], net.recv[l], net.send[l], net.close[l], task.select | e} =
+  bracket(|| c, |h: Int| net.close[l](h), |h: Int|
+    connection_loop[l](
+      h,
+      limits,
+      app,
+      true,
+      || stopped_by(stop),
+      net.peer_address[l](h),
+      b"",
+      limits.max_keep_alive,
+      false,
+    ))
+
+/// Whether `stop` is closed: what a serving loop that drains looks at between requests.
+pub fn stopped_by(stop: Chan<Unit>) -> Bool / {task.select} =
+  match task.select([(stop, None)], false) { Some(_) -> true, None -> false }
+
+/// The longest one wait of an idle connection that drains takes, between its looks at the stop.
+fn idle_slice_ms() -> Int = 250
+
+/// `watched` says the loop drains, `stopping` whether the stop has come; a loop that does not
+/// drain reads an idle connection in one wait.
 fn connection_loop<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  watched: Bool,
+  stopping: () -> Bool / e,
   peer: Option<SocketAddress>,
   carried: Bytes,
   left: Int,
   reused: Bool,
 ) -> Unit / {abort.raise, net.recv[l], net.send[l] | e} =
   if left <= 0 { () } else {
-    // The idle timeout runs until the next request's first byte; the header timeout from then.
-    match read_head[l](c, carried, limits, reused) {
+    match next_head[l](c, limits, watched, stopping, carried, reused) {
       // The peer went away, or went quiet between messages.
       HeadClosed(_) -> (),
       HeadIdle -> (),
@@ -1802,15 +2302,57 @@ fn connection_loop<[l] | e>(
           false,
           text_response(408, "the request head did not arrive\n"),
         ),
-      HeadBytes(read) -> after_head(c, limits, app, peer, read, left - 1),
+      HeadBytes(got) -> after_head(c, limits, app, watched, stopping, peer, got, left - 1),
     }
   }
+
+/// The next request's head. The idle timeout runs until its first byte and the header timeout
+/// from then; a loop that drains waits idle in slices, and is idle once it sees the stop.
+fn next_head<[l] | e>(
+  c: Int,
+  limits: Limits,
+  watched: Bool,
+  stopping: () -> Bool / e,
+  carried: Bytes,
+  reused: Bool,
+) -> HeadRead / {net.recv[l], abort.raise | e} =
+  if watched && reused && bytes_len(carried) == 0 {
+    match idle_wait[l](c, limits, stopping) {
+      None -> HeadIdle,
+      Some(chunk) -> if bytes_len(chunk) == 0 { HeadClosed(b"") }
+      else { read_head[l](c, chunk, limits, false) },
+    }
+  } else { read_head[l](c, carried, limits, reused) }
+
+/// The first bytes of the next request on an idle connection, read in slices until the idle
+/// timeout; `None` where it times out or a stop is seen first.
+fn idle_wait<[l] | e>(
+  c: Int,
+  limits: Limits,
+  stopping: () -> Bool / e,
+) -> Option<Bytes> / {net.recv[l], abort.raise | e} = {
+  let slice = min_int(limits.idle_timeout_ms, idle_slice_ms());
+  let rounds = max(limits.idle_timeout_ms / slice, 1);
+  iterate(rounds, rounds + 1, |left: Int|
+    if left <= 0 || stopping() { Stop(None) } else {
+      match net.recv[l](
+          c,
+          min_int(read_size(), limits.max_request_line + limits.max_header_bytes),
+          slice,
+        ) {
+        None -> Continue(left - 1),
+        Some(chunk) -> Stop(Some(chunk)),
+      }
+    })
+}
 
 /// From here on `left` is how many requests the connection may serve after this one.
 fn after_head<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  watched: Bool,
+  stopping: () -> Bool / e,
   peer: Option<SocketAddress>,
   read: { buf: Bytes, complete: Bool },
   left: Int,
@@ -1842,6 +2384,8 @@ fn after_head<[l] | e>(
         c,
         limits,
         app,
+        watched,
+        stopping,
         peer,
         head,
         bytes_slice(read.buf, head.consumed, bytes_len(read.buf)),
@@ -1853,6 +2397,8 @@ fn after_parse<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  watched: Bool,
+  stopping: () -> Bool / e,
   peer: Option<SocketAddress>,
   head: Head,
   rest: Bytes,
@@ -1883,7 +2429,7 @@ fn after_parse<[l] | e>(
           false,
           refusal_response(r),
         ),
-      Body(got) -> after_body(c, limits, app, peer, head, got, left),
+      Body(got) -> after_body(c, limits, app, watched, stopping, peer, head, got, left),
     }
   }
 
@@ -1891,6 +2437,8 @@ fn after_body<[l] | e>(
   c: Int,
   limits: Limits,
   app: (Request) -> Response / e,
+  watched: Bool,
+  stopping: () -> Bool / e,
   peer: Option<SocketAddress>,
   head: Head,
   got: { bytes: Bytes, rest: Bytes, trailers: Headers },
@@ -1908,9 +2456,12 @@ fn after_body<[l] | e>(
     body: got.bytes,
     peer: peer,
   };
-  let keep = head.keep_alive && left > 0;
-  write_response[l](c, limits, req.method, req.version, keep, app(req));
-  if keep { connection_loop(c, limits, app, peer, got.rest, left, true) } else { () }
+  let answer = app(req);
+  // A stop seen now ends the connection after this answer, unless a request is read behind it.
+  let keep = head.keep_alive && left > 0 && !(watched && bytes_len(got.rest) == 0 && stopping());
+  write_response[l](c, limits, req.method, req.version, keep, answer);
+  if keep { connection_loop(c, limits, app, watched, stopping, peer, got.rest, left, true) }
+  else { () }
 }
 
 fn write_response<[l]>(
@@ -2020,6 +2571,161 @@ pub fn listen_and_serve<[l], [k] | e>(
   check_limits(limits);
   bracket(|| net.listen[l](port), |s: Int| net.close[l](s), |s: Int|
     serve[l, k](s, count, limits, app))
+}
+
+// --- Shedding and draining --------------------------------------------------
+
+/// How a pool of workers holds load. A connection accepted while every worker is busy waits in a
+/// queue; one accepted while the queue is full, and one that waited past `max_wait_ms` by the time
+/// a worker takes it, is shed: answered 503 with `Retry-After`, without its request being read,
+/// and closed.
+pub type Shedding = {
+  /// Connections served at once.
+  workers: Int,
+  /// Connections accepted and waiting for a worker, at most; zero sheds whatever finds every
+  /// worker busy.
+  queue: Int,
+  /// The longest a connection waits for a worker and is still served.
+  max_wait_ms: Int,
+  /// The seconds a shed connection is told to wait before it asks again.
+  retry_after_s: Int,
+}
+
+/// Eight workers, a queue of sixty-four, a second's wait at most, and a second's `Retry-After`.
+pub fn default_shedding() -> Shedding =
+  { workers: 8, queue: 64, max_wait_ms: 1000, retry_after_s: 1 }
+
+/// What a pool did with the connections it accepted: served them, or shed them because the queue
+/// was full or because they had waited too long.
+pub type Pooled = { served: Int, shed_full: Int, shed_late: Int }
+
+type Queued = { conn: Int, at: Instant }
+
+type Worked = { served: Int, late: Int }
+
+/// Accepts up to `count` connections on `listener` and serves each with `app`, `shedding.workers`
+/// at once, holding and shedding load as `Shedding` says. When `accept` answers that the listener
+/// is closed, as it does at a stop, the pool drains: it accepts no more, every connection already
+/// accepted is served, those in the queue included, with `serve_draining`'s rules, and it
+/// answers once every worker is done. `l` is the listener's label and `k` each connection's.
+pub fn serve_pooled<[l], [k] | e>(
+  listener: Int,
+  count: Int,
+  limits: Limits,
+  shedding: Shedding,
+  app: (Request) -> Response / {task.select | e},
+) -> Pooled / {abort.raise, net.accept[l], net.peer_address[k], net.recv[k], net.send[k], net.close[k], task.write, clock.read | e} =
+  pooled[l, k](listener, count, limits, shedding, |c: Int, stop: Chan<Unit>|
+    serve_draining[k](c, limits, stop, app))
+
+/// `serve_pooled` with each connection served by `conn`, handed the connection and the channel the
+/// pool closes when it stops accepting, for a program with a connection loop of its own; a
+/// connection `conn` is handed is its to close.
+pub fn pooled<[l], [k] | e>(
+  listener: Int,
+  count: Int,
+  limits: Limits,
+  shedding: Shedding,
+  conn: (Int, Chan<Unit>) -> Unit / e,
+) -> Pooled / {abort.raise, net.accept[l], net.send[k], net.close[k], task.write, clock.read | e} = {
+  check_limits(limits);
+  check_shedding(shedding);
+  let line: Chan<Queued> = task.channel(shedding.queue);
+  let stop: Chan<Unit> = task.channel(0);
+  let workers = map(range(0, shedding.workers), |_i: Int|
+    task.spawn(|| worker[k](line, stop, limits, shedding, conn, { served: 0, late: 0 }, count)));
+  let accepted = accepting[l, k](listener, line, limits, shedding, count, 0);
+  task.close(stop);
+  task.close(line);
+  fold(workers, { served: 0, shed_full: accepted, shed_late: 0 }, |p: Pooled, w: Task<Worked>| {
+    let done = task.join(w);
+    { served: p.served + done.served, shed_full: p.shed_full, shed_late: p.shed_late + done.late }
+  })
+}
+
+/// A shedding of no worker, or of a negative queue, wait or `Retry-After`, is a mistake in the
+/// configuration, so it panics naming the field.
+pub fn check_shedding(s: Shedding) -> Unit / {abort.raise} =
+  if s.workers <= 0 {
+    panic("`Shedding.workers` is " ++ int_to_string(s.workers) ++ ", and a pool needs one")
+  } else if s.queue < 0 || s.max_wait_ms < 0 || s.retry_after_s < 0 {
+    panic("`Shedding`'s queue, wait and `Retry-After` may not be negative")
+  } else { () }
+
+/// The accept loop: each connection into the queue, or shed where it is full; answers how many it
+/// shed.
+fn accepting<[l], [k]>(
+  listener: Int,
+  line: Chan<Queued>,
+  limits: Limits,
+  shedding: Shedding,
+  left: Int,
+  shed: Int,
+) -> Int / {abort.raise, net.accept[l], net.send[k], net.close[k], task.select, clock.read} =
+  if left <= 0 { shed } else {
+    let c = net.accept[l](listener);
+    if c == 0 { shed } else {
+      match try_send(line, { conn: c, at: clock.now() }) {
+        Accepted -> accepting(listener, line, limits, shedding, left - 1, shed),
+        _ -> {
+          busy[k](c, limits, shedding);
+          accepting(listener, line, limits, shedding, left - 1, shed + 1)
+        },
+      }
+    }
+  }
+
+fn worker<[k] | e>(
+  line: Chan<Queued>,
+  stop: Chan<Unit>,
+  limits: Limits,
+  shedding: Shedding,
+  conn: (Int, Chan<Unit>) -> Unit / e,
+  done: Worked,
+  left: Int,
+) -> Worked / {abort.raise, net.send[k], net.close[k], task.recv, clock.read | e} =
+  if left <= 0 { done } else {
+    match task.recv(line) {
+      None -> done,
+      Some(q) -> if as_millis(between(q.at, clock.now())) > shedding.max_wait_ms {
+        busy[k](q.conn, limits, shedding);
+        worker(
+          line,
+          stop,
+          limits,
+          shedding,
+          conn,
+          { served: done.served, late: done.late + 1 },
+          left - 1,
+        )
+      } else {
+        conn(q.conn, stop);
+        worker(
+          line,
+          stop,
+          limits,
+          shedding,
+          conn,
+          { served: done.served + 1, late: done.late },
+          left - 1,
+        )
+      },
+    }
+  }
+
+/// What a shed connection is answered with, before it is closed.
+pub fn busy_response(shedding: Shedding) -> Response = {
+  let r = text_response(503, "the server is busy; ask again shortly\n");
+  { ..r, headers: set_header(r.headers, "retry-after", int_to_string(shedding.retry_after_s)) }
+}
+
+fn busy<[k]>(
+  c: Int,
+  limits: Limits,
+  shedding: Shedding,
+) -> Unit / {net.send[k], net.close[k], abort.raise} = {
+  send_all[k](c, encode(Get, Http11, false, busy_response(shedding)), limits.write_timeout_ms);
+  net.close[k](c)
 }
 
 // --- Tests: helpers ---------------------------------------------------------
@@ -3548,4 +4254,515 @@ test "a request no connection carried has no client" {
   let bare = request_to(Get, "example.org", "/", b"");
   let req = { ..bare, headers: add_header(empty_headers(), "Forwarded", "for=192.0.2.1") };
   assert_eq(client_ip(req, [ip::read_prefix("0.0.0.0/0")]), None)
+}
+
+// --- Tests: forms, dates and negotiation ------------------------------------
+
+/// What a connection whose client says `request` is answered by `app`.
+fn exchanged_with(
+  request: Bytes,
+  app: (Request) -> Response / {abort.raise},
+) -> Bytes / {ip.refused, abort.raise} = {
+  let ran = net::on_mem(net::mem_calling(net::mem_empty(), caller(), [Says(request)]), || {
+    let listener = net.listen[listener](0);
+    serve_connection[conn](net.accept[listener](listener), default_limits(), app)
+  });
+  net::mem_sent(ran.net, served_conn())
+}
+
+fn upload() -> Bytes =
+  b"--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nBolts\r\n--XyZ\r\nContent-Disposition: form-data; name=\"sheet\"; filename=\"parts.csv\"\r\nContent-Type: text/csv\r\n\r\nsku,qty\n\r\n--XyZ--\r\n"
+
+fn posted(content_type: String, body: Bytes) -> Request / {abort.raise} = {
+  let bare = request_to(Post, "example.org", "/upload", body);
+  { ..bare, headers: set_header(empty_headers(), "content-type", content_type) }
+}
+
+/// Answers what a form held, or the response its refusal is.
+fn form_app(req: Request) -> Response / {abort.raise} =
+  match form(req, multipart::default_limits()) {
+    Ok(f) ->
+      text_response(
+        200,
+        fold(f.fields, "", |acc: String, field: multipart::Field|
+            acc ++ field.name ++ "=" ++ field.value ++ ";")
+          ++ fold(f.files, "", |acc: String, file: multipart::File|
+            acc ++ file.name ++ ":" ++ file.filename ++ ":" ++ string_of_bytes_lossy(file.data)),
+      ),
+    Err(e) -> form_refusal(e),
+  }
+
+test "a multipart form's fields and files are read from the request that carried them" {
+  let body = upload();
+  let out = exchanged_with(
+    bytes_concat_all([
+      b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=XyZ\r\nContent-Length: ",
+      bytes_of_string(int_to_string(bytes_len(body))),
+      b"\r\nConnection: close\r\n\r\n",
+      body,
+    ]),
+    form_app,
+  );
+  assert_eq(
+    out,
+    encode(Post, Http11, false, text_response(200, "title=Bolts;sheet:parts.csv:sku,qty\n")),
+  )
+}
+
+test "a body that is no form is refused for what it is" {
+  assert_eq(
+    form(posted("application/json", b"{}"), multipart::default_limits()),
+    Err(NotAForm(Some("application/json"))),
+  );
+  assert_eq(
+    form(request_to(Post, "example.org", "/", b""), multipart::default_limits()),
+    Err(NotAForm(None)),
+  );
+  assert_eq(form_app(posted("multipart/form-data", upload())).status, 415);
+  let cut = posted("multipart/form-data; boundary=XyZ", bytes_slice(upload(), 0, 40));
+  match form(cut, multipart::default_limits()) {
+    Err(Unreadable(_)) -> (),
+    _ -> panic("a body cut short is unreadable"),
+  };
+  assert_eq(form_app(cut).status, 400)
+}
+
+test "a response names its date and when its resource last changed" {
+  match date::of_unix_seconds(1700000000) {
+    None -> panic("a date"),
+    Some(at) -> {
+      let r = last_modified(dated(response(200, b""), at), at);
+      assert_eq(header(r.headers, "date"), Some("Tue, 14 Nov 2023 22:13:20 GMT"));
+      assert_eq(header(r.headers, "last-modified"), Some("Tue, 14 Nov 2023 22:13:20 GMT"));
+      assert_eq(date_field(r.headers, "last-modified", Instant(1700000000000000000)), Some(at));
+      assert_eq(date_field(r.headers, "if-modified-since", Instant(0)), None)
+    },
+  }
+}
+
+test "the type a request accepts is chosen by weight, then by the order offered: {c.accept}" for c: { accept: String, offered: List<MediaType>, chosen: Option<MediaType> } in [
+    {
+      accept: "",
+      offered: [mime"text/html", mime"application/json"],
+      chosen: Some(mime"text/html"),
+    },
+    {
+      accept: "application/json",
+      offered: [mime"text/html", mime"application/json"],
+      chosen: Some(mime"application/json"),
+    },
+    {
+      accept: "text/html;q=0.5, application/json",
+      offered: [mime"text/html", mime"application/json"],
+      chosen: Some(mime"application/json"),
+    },
+    {
+      accept: "text/*;q=0.3, text/html;q=0.9",
+      offered: [mime"text/plain", mime"text/html"],
+      chosen: Some(mime"text/html"),
+    },
+    {
+      accept: "*/*;q=0.1, text/plain;q=0",
+      offered: [mime"text/plain", mime"application/json"],
+      chosen: Some(mime"application/json"),
+    },
+    { accept: "image/png", offered: [mime"application/json"], chosen: None },
+    { accept: "a;;b", offered: [mime"text/plain"], chosen: Some(mime"text/plain") },
+  ] {
+  let headers = if string_len(c.accept) == 0 { empty_headers() }
+  else { set_header(empty_headers(), "accept", c.accept) };
+  assert_eq(negotiate(headers, c.offered), c.chosen)
+}
+
+fn parts_app(req: Request) -> Response / {abort.raise} =
+  negotiated(req, [mime"text/html", mime"application/json"], |m: MediaType|
+    if mime::subtype(m) == "json" { response(200, b"[]") } else { response(200, b"<ul></ul>") })
+
+test "a negotiated answer says what it is and that it varies by Accept, a refused one too" {
+  let json = exchanged_with(
+    b"GET /parts HTTP/1.1\r\nHost: x\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+    parts_app,
+  );
+  assert_eq(
+    json,
+    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nvary: Accept\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+  );
+  let none = exchanged_with(
+    b"GET /parts HTTP/1.1\r\nHost: x\r\nAccept: image/png\r\nConnection: close\r\n\r\n",
+    parts_app,
+  );
+  assert(bytes_index_of(none, b"HTTP/1.1 406 Not Acceptable\r\n") == Some(0));
+  assert(bytes_index_of(none, b"vary: Accept\r\n") != None)
+}
+
+test "a field a response varies by is named once" {
+  let r = vary(vary(vary(response(200, b""), "Accept"), "accept"), "Origin");
+  assert_eq(header_lines(r.headers, "vary"), ["Accept, Origin"]);
+  let any_at_all = { ..response(200, b""), headers: set_header(empty_headers(), "vary", "*") };
+  assert_eq(header_lines(vary(any_at_all, "Accept").headers, "vary"), ["*"])
+}
+
+// --- Tests: fetching a URL --------------------------------------------------
+
+fn wall() -> Instant = Instant(1700000000000000000)
+
+type Site = { name: String, at: String, port: Int, scripts: List<List<Step>> }
+
+/// A network where each site's name resolves to its address, and each connection to it is answered
+/// with the next of its scripts.
+fn world_of(sites: List<Site>) -> MemNet / {ip.refused, abort.raise} = {
+  let names = fold(sites, dns::table(), |t: dns::Table, s: Site|
+    dns::with_name(t, s.name, [ip::read(s.at)]));
+  fold(sites, net::mem_resolving(net::mem_empty(), names), |n: MemNet, s: Site|
+    net::mem_serving(n, ip::socket_at(ip::read(s.at), s.port), s.scripts))
+}
+
+fn said(r: Response) -> Step / {abort.raise} = Says(encode(Get, Http11, false, r))
+
+fn redirect(status: Int, location: String) -> Response =
+  { ..response(status, b""), headers: set_header(empty_headers(), "location", location) }
+
+fn shop(scripts: List<List<Step>>) -> Site =
+  { name: "shop.example", at: "192.0.2.10", port: 80, scripts: scripts }
+
+fn sent_text(n: MemNet, conn: Int) -> String = string_of_bytes_lossy(net::mem_sent(n, conn))
+
+type Fetch = { method: Method, url: Url, headers: Headers, body: Bytes, options: Fetching }
+
+fn plain(method: Method, to: Url, body: Bytes) -> Fetch =
+  { method: method, url: to, headers: empty_headers(), body: body, options: fetching() }
+
+/// `f` fetched over `world` with a jar of its own, and the network it left.
+fn fetched_over(
+  world: MemNet,
+  f: Fetch,
+) -> { value: Result<Fetched, FetchError>, net: MemNet } / {sim.read, abort.raise} = {
+  let ran = net::on_mem(world, ||
+    simulate {
+      task::unbounded(||
+        fetch[site](f.method, f.url, f.headers, f.body, cookie::jar(50), f.options, wall()))
+    });
+  { value: ran.value, net: ran.net }
+}
+
+fn status_of(r: Result<Fetched, FetchError>) -> Int =
+  match r { Ok(f) -> f.response.status, Err(_) -> 0 }
+
+test "a POST that is redirected is fetched again with GET, and carries what the first answer set" {
+  let ran = fetched_over(
+    world_of([
+      shop([
+        [
+          said({
+            ..redirect(302, "/next"),
+            headers: add_header(redirect(302, "/next").headers, "set-cookie", "s=1; Path=/"),
+          }),
+        ],
+        [said(text_response(200, "done"))],
+      ]),
+    ]),
+    plain(Post, url"http://shop.example/start", b"x"),
+  );
+  match ran.value {
+    Ok(f) -> {
+      assert_eq((f.response.status, f.response.body, f.redirects), (200, b"done", 1));
+      assert_eq(url_render(f.url), "http://shop.example/next");
+      assert_eq(cookie::header_for(f.jar, url"http://shop.example/", wall()), Some("s=1"))
+    },
+    Err(_) -> panic("the redirect is followed"),
+  };
+  assert(
+    string_starts_with(
+      sent_text(ran.net, 1),
+      "POST /start HTTP/1.1\r\nHost: shop.example\r\nContent-Length: 1\r\n",
+    ),
+  );
+  assert_eq(
+    sent_text(ran.net, 2),
+    "GET /next HTTP/1.1\r\nHost: shop.example\r\ncookie: s=1\r\nConnection: close\r\n\r\n",
+  )
+}
+
+test "a 307 is fetched again with the method and the body it answered" {
+  let ran = fetched_over(
+    world_of([
+      shop([
+        [said(redirect(307, "http://shop.example/again"))],
+        [said(text_response(201, "made"))],
+      ]),
+    ]),
+    plain(Post, url"http://shop.example/orders", b"x"),
+  );
+  assert_eq(status_of(ran.value), 201);
+  assert_eq(
+    sent_text(ran.net, 2),
+    "POST /again HTTP/1.1\r\nHost: shop.example\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+  )
+}
+
+test "credentials go no further than the origin they were written for" {
+  let asked = {
+    ..plain(Get, url"http://shop.example/", b""),
+    headers: set_header(
+      set_header(empty_headers(), "authorization", "Bearer t"),
+      "cookie",
+      "own=1",
+    ),
+  };
+  let ran = fetched_over(
+    world_of([
+      shop([[said(redirect(302, "/same"))], [said(redirect(301, "http://other.example/x"))]]),
+      {
+        name: "other.example",
+        at: "192.0.2.20",
+        port: 80,
+        scripts: [[said(text_response(200, "there"))]],
+      },
+    ]),
+    asked,
+  );
+  assert_eq(status_of(ran.value), 200);
+  assert(string_contains(sent_text(ran.net, 2), "authorization: Bearer t\r\n"));
+  assert(string_contains(sent_text(ran.net, 2), "cookie: own=1\r\n"));
+  assert(!string_contains(sent_text(ran.net, 3), "authorization"));
+  assert(!string_contains(sent_text(ran.net, 3), "cookie"))
+}
+
+test "a redirect from https to http is not followed, and nor is one past the bound" {
+  let secure = {
+    name: "secure.example",
+    at: "192.0.2.30",
+    port: 443,
+    scripts: [[net::Upgrades, said(redirect(301, "http://secure.example/"))]],
+  };
+  assert_eq(
+    fetched_over(world_of([secure]), plain(Get, url"https://secure.example/", b"")).value,
+    Err(Downgraded("http://secure.example/")),
+  );
+  let looping = world_of([
+    shop([[said(redirect(302, "/a"))], [said(redirect(302, "/b"))], [said(redirect(302, "/c"))]]),
+  ]);
+  let bounded = {
+    ..plain(Get, url"http://shop.example/", b""),
+    options: { ..fetching(), max_redirects: 2 },
+  };
+  assert_eq(fetched_over(looping, bounded).value, Err(TooManyRedirects(2)))
+}
+
+test "an https URL is fetched over TLS to its host, and what cannot be reached says why" {
+  let ran = fetched_over(
+    world_of([
+      {
+        name: "secure.example",
+        at: "192.0.2.30",
+        port: 443,
+        scripts: [[net::Upgrades, said(text_response(200, "secret"))]],
+      },
+    ]),
+    plain(Get, url"https://secure.example/parts", b""),
+  );
+  assert_eq(status_of(ran.value), 200);
+  assert_eq(net::mem_secured(ran.net, 1), Some("secure.example"));
+  assert_eq(
+    fetched_over(world_of([]), plain(Get, url"http://nowhere.example/", b"")).value,
+    Err(NoConnection(net::NameNotFound)),
+  );
+  assert_eq(
+    fetched_over(world_of([]), plain(Get, url"ftp://files.example/", b"")).value,
+    Err(NotHttp("ftp://files.example/")),
+  )
+}
+
+fn proxy_site(scripts: List<List<Step>>) -> Site =
+  { name: "proxy.example", at: "192.0.2.99", port: 3128, scripts: scripts }
+
+fn via_proxy(f: Fetch) -> Fetch =
+  { ..f, options: { ..fetching(), proxy: Some({ host: "proxy.example", port: 3128 }) } }
+
+test "through a proxy an http URL is asked for in absolute form" {
+  let ran = fetched_over(
+    world_of([proxy_site([[said(text_response(200, "proxied"))]])]),
+    via_proxy(plain(Get, url"http://shop.example/parts?x=1", b"")),
+  );
+  assert_eq(status_of(ran.value), 200);
+  assert(
+    string_starts_with(
+      sent_text(ran.net, 1),
+      "GET http://shop.example/parts?x=1 HTTP/1.1\r\nHost: shop.example\r\n",
+    ),
+  )
+}
+
+test "through a proxy an https URL is tunnelled and secured to its host, or refused by the proxy" {
+  let ran = fetched_over(
+    world_of([
+      proxy_site([
+        [
+          Says(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+          net::Upgrades,
+          said(text_response(200, "inside")),
+        ],
+      ]),
+    ]),
+    via_proxy(plain(Get, url"https://secure.example/parts", b"")),
+  );
+  match ran.value {
+    Ok(f) -> assert_eq(f.response.body, b"inside"),
+    Err(_) -> panic("the tunnel carries the request"),
+  };
+  assert(
+    string_starts_with(
+      sent_text(ran.net, 1),
+      "CONNECT secure.example:443 HTTP/1.1\r\nHost: secure.example:443\r\n\r\nGET /parts HTTP/1.1\r\nHost: secure.example\r\n",
+    ),
+  );
+  assert_eq(net::mem_secured(ran.net, 1), Some("secure.example"));
+  let refused = fetched_over(
+    world_of([
+      proxy_site([
+        [Says(b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n")],
+      ]),
+    ]),
+    via_proxy(plain(Get, url"https://secure.example/parts", b"")),
+  );
+  assert_eq(refused.value, Err(ProxyRefused(407)))
+}
+
+// --- Tests: shedding and draining -------------------------------------------
+
+/// `n` clients, each saying `script` from a port of its own.
+fn clients(n: Int, script: List<Step>) -> MemNet / {ip.refused, abort.raise} =
+  fold(range(0, n), net::mem_empty(), |m: MemNet, i: Int|
+    net::mem_calling(m, ip::socket_at(ip::read("203.0.113.9"), 4000 + i), script))
+
+fn get_closing() -> Bytes = b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+
+/// Fifty milliseconds of virtual time for every request.
+fn slow_app(req: Request) -> Response / {clock.write} = {
+  clock.sleep(millis(50));
+  text_response(200, "ok")
+}
+
+fn answers(n: MemNet, count: Int) -> List<String> =
+  map(range(2, count + 2), |c: Int| string_of_bytes_lossy(net::mem_sent(n, c)))
+
+fn one_answer(a: String) -> Bool =
+  string_starts_with(a, "HTTP/1.1 200 OK\r\n")
+    || string_starts_with(a, "HTTP/1.1 503 Service Unavailable\r\n")
+
+test "past a full queue a connection is shed with 503 and Retry-After, and no more are held than the bound" {
+  let ran = net::on_mem(clients(5, [Says(get_closing())]), ||
+    simulate {
+      let listener = net.listen[listener](0);
+      serve_pooled[listener, conn](
+        listener,
+        10,
+        default_limits(),
+        { ..default_shedding(), workers: 1, queue: 1 },
+        slow_app,
+      )
+    });
+  let p = ran.value;
+  assert_eq((p.served + p.shed_full, p.shed_late), (5, 0));
+  // One worker busy and one connection queued is all the pool holds while it accepts.
+  assert(p.served >= 1 && p.served <= 2);
+  let said = answers(ran.net, 5);
+  assert(all(said, one_answer));
+  assert_eq(len(filter(said, |a: String| string_contains(a, "retry-after: 1\r\n"))), p.shed_full);
+  assert_eq(len(ran.net.closed), 5)
+}
+
+test "a connection that waited past its bound for a worker is shed rather than served" {
+  let ran = net::on_mem(clients(3, [Says(get_closing())]), ||
+    simulate {
+      let listener = net.listen[listener](0);
+      serve_pooled[listener, conn](
+        listener,
+        10,
+        default_limits(),
+        { ..default_shedding(), workers: 1, queue: 2, max_wait_ms: 10 },
+        slow_app,
+      )
+    });
+  let p = ran.value;
+  assert_eq(p.served, 1);
+  assert_eq(p.shed_full + p.shed_late, 2);
+  assert(p.shed_late >= 1);
+  assert(all(answers(ran.net, 3), one_answer))
+}
+
+fn quick_idle() -> Limits = { ..default_limits(), idle_timeout_ms: 250 }
+
+test "a pool that stops accepting answers every connection it accepted, and leaves none open" {
+  let ran = net::on_mem(
+    clients(2, [Says(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")]),
+    ||
+      simulate {
+        let listener = net.listen[listener](0);
+        serve_pooled[listener, conn](
+          listener,
+          10,
+          quick_idle(),
+          { ..default_shedding(), workers: 1, queue: 1 },
+          echo_app,
+        )
+      },
+  );
+  assert_eq(ran.value.served + ran.value.shed_full, 2);
+  assert(
+    all(answers(ran.net, 2), |a: String|
+      string_starts_with(a, "HTTP/1.1 503 ")
+        || (string_starts_with(a, "HTTP/1.1 200 OK\r\n")
+        && string_find(a, "GET /a|") == string_len(a) - 7)),
+  );
+  assert_eq(len(ran.net.closed), 2)
+}
+
+test "a kept-alive connection a pool is serving as it stops is answered, then closed" {
+  let ran = net::on_mem(clients(1, [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Silent]), ||
+    simulate {
+      let listener = net.listen[listener](0);
+      serve_pooled[listener, conn](
+        listener,
+        10,
+        quick_idle(),
+        { ..default_shedding(), workers: 1, queue: 1 },
+        echo_app,
+      )
+    });
+  assert_eq(ran.value, { served: 1, shed_full: 0, shed_late: 0 });
+  // Answered as kept alive where the stop came after it, and closing where before.
+  let out = net::mem_sent(ran.net, 2);
+  assert(out == answer_of(200, "GET /a|", true) || out == answer_of(200, "GET /a|", false));
+  assert_eq(ran.net.closed, [2])
+}
+
+/// `script` served by `serve_draining` under a stop that has already come.
+fn drained(script: List<Step>) -> MemNet / {ip.refused, sim.read, abort.raise} =
+  net::on_mem(net::mem_calling(net::mem_empty(), caller(), script), ||
+    simulate {
+      let stop: Chan<Unit> = task.channel(0);
+      task.close(stop);
+      let listener = net.listen[listener](0);
+      serve_draining[conn](net.accept[listener](listener), default_limits(), stop, echo_app)
+    }).net
+
+test "once stopped a connection answers what it has read, the last answer closing it, and waits for no more" {
+  let one = drained([Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), Silent]);
+  assert_eq(net::mem_sent(one, served_conn()), answer_of(200, "GET /a|", false));
+  assert_eq(len(net::mem_deadlines(one, served_conn())), 1);
+  assert_eq(one.closed, [served_conn()]);
+  let two = drained([
+    Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n"),
+    Silent,
+  ]);
+  assert_eq(
+    net::mem_sent(two, served_conn()),
+    bytes_concat(answer_of(200, "GET /a|", true), answer_of(200, "GET /b|", false)),
+  )
+}
+
+test "a shed connection is told when to ask again" {
+  let r = busy_response({ ..default_shedding(), retry_after_s: 7 });
+  assert_eq((r.status, header(r.headers, "retry-after")), (503, Some("7")))
 }
