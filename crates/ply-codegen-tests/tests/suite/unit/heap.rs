@@ -101,6 +101,26 @@ fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
 }
 
 #[test]
+fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
+    let mut h = Heap::new();
+    let child = h.alloc(KIND_RECORD, 0, 1, 0);
+    unsafe { set_word(child, 0, imm(1)) };
+    let o = h.alloc(KIND_CTOR, 0, 1, 0);
+    unsafe { set_word(o, 0, child as Word) };
+    inc(child as Word);
+    assert_eq!(reset(o as Word), o as Word);
+    unsafe {
+        assert_eq!((*o).len, 0);
+        assert_eq!((*o).rc, 1);
+        assert_eq!((*child).rc, 1, "the argument was let go once");
+    }
+    dec(o as Word);
+    let boxed = h.boxed_int(i64::MAX);
+    assert_eq!(reset(boxed), 0, "only a record or a constructor is a token");
+    dec(child as Word);
+}
+
+#[test]
 fn an_int_that_fits_is_an_immediate_and_one_that_does_not_is_boxed() {
     let mut h = Heap::new();
     let l = layouts();

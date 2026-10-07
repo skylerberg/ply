@@ -1,0 +1,481 @@
+//! Ply programs checked as values: what `ply check` says of sources held in memory, and for a
+//! program that checks, each definition's type, row, hash and references.
+//!
+//! `check` takes a program as its sources, each under the path a project would hold it at, so
+//! `store/orders.ply` is the module `store.orders`, and answers what the compiler's own front end
+//! answers: its diagnostics as `std.syntax`'s values, and where there is no error the definitions
+//! `ply defs`, `ply hash` and `ply callers` print. A hash covers a definition's structure and all
+//! it reaches and no name, comment or layout, so two checks say what an edit moved: `moved` names
+//! the definitions whose hashes differ, and a rename, a move or a reformat that is only that moves
+//! none.
+//!
+//! The check runs the compiler in the program that calls it, so it takes limits: how many sources
+//! and how many bytes of them it reads. Its steps grow with those and with what the sources import,
+//! and a run bounds them as it bounds any (`ply test --steps`). A program that reaches `check`
+//! pulls the compiler's front end into its own load, which a first check of it pays for once.
+//!
+//! The standard library resolves as it does for any program: `check` asks the binary it runs in
+//! for the shipped modules its sources import, through the effect `shipped`, which a run lends
+//! with `--host --allow shipped`. That effect is a function of the binary, so a test that performs
+//! it is cached like any other. `check_alone` answers it with no module, for sources that import
+//! none: it performs nothing.
+
+import compiler.front (Analysis, Analysed, Refused, module_of)
+import compiler.hash (hex)
+import compiler.infer (DefInfo)
+import compiler.items (Item, IEffect, IType)
+import compiler.load
+import compiler.load (SourceFile)
+import compiler.resolve
+import compiler.resolve (Diag, ParsedModule, qualify)
+import compiler.types (row_text, scheme_text)
+import compiler.unit (shipped)
+import std.bytes
+import std.list (at_or, sort)
+import std.place (place_at)
+import std.syntax
+import std.syntax (Diagnostic, Edit, Error, Sample, Span, Warning, sample_source)
+
+/// One source of a program: the path a project would hold it at, which names its module, and its
+/// text.
+pub type Source = new { path: String, text: Bytes }
+
+/// The most a check reads: how many sources, and how many bytes of them together.
+pub type Limits = new { files: Int, bytes: Int }
+
+/// Why sources were not checked.
+pub type Refusal =
+  /// More sources than the limit: how many.
+  | TooManyFiles(Int)
+  /// More bytes than the limit: how many.
+  | TooManyBytes(Int)
+  /// A path that names no module, and why: every directory and file stem is an identifier.
+  | NotAModule(String, String)
+
+/// What this module raises where it refuses.
+pub effect checker {
+  /// The sources are past a limit, or one's path names no module.
+  raise refused(why: Refusal)
+}
+
+/// What a check asks of the binary it runs in: the shipped modules its sources import.
+pub effect set Shipped = {shipped.names, shipped.module, shipped.reached}
+
+/// What a definition is.
+pub type DefinitionKind = | Function | Type | Effect
+
+/// One definition of a checked program.
+///
+/// `name` is its name program-wide, `store.orders.place`, and `path` the source it is written in,
+/// `<std>/list.ply` for a shipped module's. `signature` is a function's type as `ply check --types`
+/// writes it and `row` what a call of it may perform, as a row is written; both are empty for a
+/// type or an effect. `hash` is sixty-four hex digits over the definition and all it reaches.
+/// `references` are the definitions, types and effects it names directly.
+pub type Definition = new {
+  name: String,
+  module: String,
+  simple_name: String,
+  kind: DefinitionKind,
+  path: String,
+  span: Span,
+  signature: String,
+  row: String,
+  hash: String,
+  references: List<String>,
+}
+
+/// What the front end answered for a program.
+///
+/// `diagnostics` holds its errors where it has any, and then `definitions` is empty; where it has
+/// none, `ok` is true, the diagnostics are its warnings, and `definitions` holds every function,
+/// type and effect of its own modules and each one of a shipped module it reaches.
+pub type Checked = new { ok: Bool, diagnostics: List<Diagnostic>, definitions: List<Definition> }
+
+fn admitted(
+  sources: List<Source>,
+  limits: Limits,
+) -> List<SourceFile> / {checker.refused, abort.raise} = {
+  let bytes = fold(sources, 0, |total: Int, source: Source| total + bytes_len(source.text));
+  if len(sources) > limits.files { checker.refused(TooManyFiles(len(sources))) }
+  else if bytes > limits.bytes { checker.refused(TooManyBytes(bytes)) } else {
+    map(sources, |source: Source|
+      match module_of(source.path) {
+        Ok(module) -> { path: source.path, name: module, text: source.text },
+        Err(why) -> checker.refused(NotAModule(source.path, why)),
+      })
+  }
+}
+
+fn file_at(files: List<SourceFile>, module: Int) -> SourceFile =
+  at_or(files, module, { path: "", name: "", text: b"" })
+
+fn said(files: List<SourceFile>, diag: Diag) -> Diagnostic =
+  {
+    code: string_of_bytes_lossy(diag.code),
+    severity: if diag.severity == b"warning" { Warning } else { Error },
+    message: string_of_bytes_lossy(diag.message),
+    labels: map(diag.labels, |label: resolve::Label| {
+      let file = file_at(files, label.module);
+      {
+        path: file.path,
+        span: { start: label.start, end: label.end },
+        place: place_at(file.text, label.start),
+        primary: label.primary,
+        text: string_of_bytes_lossy(label.text),
+      }
+    }),
+    notes: map(diag.notes_text, |note: Bytes| string_of_bytes_lossy(note)),
+    fixes: map(diag.fixes, |fix: resolve::Fix|
+      {
+        title: string_of_bytes_lossy(fix.title),
+        edits: map(fix.edits, |edit: resolve::Edit|
+          {
+            path: file_at(files, edit.module).path,
+            span: { start: edit.start, end: edit.end },
+            text: edit.text,
+          }),
+      }),
+  }
+
+type Tables = { hashes: Map<Bytes, Bytes>, references: Map<Bytes, List<Bytes>> }
+
+fn tables_of(analysis: Analysis) -> Tables =
+  {
+    hashes: fold(
+      analysis.hashes.decls,
+      fold(
+        analysis.hashes.defs,
+        map_new(),
+        |held: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| map_insert(held, d.name, d.hash),
+      ),
+      |held: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| map_insert(held, d.name, d.hash),
+    ),
+    references: fold(
+      analysis.hashes.deps,
+      map_new(),
+      |held: Map<Bytes, List<Bytes>>, d: { name: Bytes, names: List<Bytes> }|
+        map_insert(held, d.name, d.names),
+    ),
+  }
+
+fn hash_in(tables: Tables, name: Bytes) -> String / {abort.raise} =
+  match map_get(tables.hashes, name) { Some(h) -> string_of_bytes_lossy(hex(h)), None -> "" }
+
+fn references_in(tables: Tables, name: Bytes) -> List<String> =
+  match map_get(tables.references, name) {
+    Some(names) -> map(names, |n: Bytes| string_of_bytes_lossy(n)),
+    None -> [],
+  }
+
+fn function(files: List<SourceFile>, tables: Tables, def: DefInfo) -> Definition / {abort.raise} =
+  {
+    name: string_of_bytes_lossy(def.name),
+    module: string_of_bytes_lossy(def.module),
+    simple_name: string_of_bytes_lossy(def.simple_name),
+    kind: Function,
+    path: file_at(files, def.at.module).path,
+    span: def.at.span,
+    signature: string_of_bytes_lossy(scheme_text(def.scheme)),
+    row: string_of_bytes_lossy(row_text({ atoms: def.footprint, tail: None })),
+    hash: hash_in(tables, def.name),
+    references: references_in(tables, def.name),
+  }
+
+fn declaration(
+  tables: Tables,
+  path: String,
+  module: Bytes,
+  kind: DefinitionKind,
+  simple: Bytes,
+  span: Span,
+) -> Definition / {abort.raise} = {
+  let name = qualify(module, simple);
+  {
+    name: string_of_bytes_lossy(name),
+    module: string_of_bytes_lossy(module),
+    simple_name: string_of_bytes_lossy(simple),
+    kind: kind,
+    path: path,
+    span: span,
+    signature: "",
+    row: "",
+    hash: hash_in(tables, name),
+    references: references_in(tables, name),
+  }
+}
+
+fn declared(
+  tables: Tables,
+  path: String,
+  parsed: ParsedModule,
+  found: List<Definition>,
+) -> List<Definition> / {abort.raise} =
+  fold(parsed.module.items, found, |acc: List<Definition>, item: Item|
+    match item {
+      IType(d) -> push(acc, declaration(tables, path, parsed.name, Type, d.name.name, d.name.span)),
+      IEffect(d) ->
+        push(acc, declaration(tables, path, parsed.name, Effect, d.name.name, d.name.span)),
+      _ -> acc,
+    })
+
+fn definitions_of(files: List<SourceFile>, analysis: Analysis) -> List<Definition> / {abort.raise} = {
+  let tables = tables_of(analysis);
+  fold(
+    range(0, len(analysis.mods)),
+    map(analysis.checked.defs, |def: DefInfo| function(files, tables, def)),
+    |found: List<Definition>, i: Int|
+      match list_at(analysis.mods, i) {
+        Some(parsed) -> declared(tables, file_at(files, i).path, parsed, found),
+        None -> found,
+      },
+  )
+}
+
+/// `sources` checked as one program with no manifest, or a refusal raised: more of them than
+/// `limits` reads, or a path that names no module.
+pub fn checked(
+  sources: List<Source>,
+  limits: Limits,
+) -> Checked / {checker.refused, Shipped, abort.raise} = {
+  let answered = load::analysed(admitted(sources, limits));
+  match answered.out {
+    Refused(diags) ->
+      {
+        ok: false,
+        diagnostics: map(diags, |diag: Diag| said(answered.files, diag)),
+        definitions: [],
+      },
+    Analysed(analysis) ->
+      {
+        ok: true,
+        diagnostics: map(analysis.warnings, |diag: Diag| said(answered.files, diag)),
+        definitions: definitions_of(answered.files, analysis),
+      },
+  }
+}
+
+/// `sources` checked as one program with no manifest: what `ply check` answers for a directory
+/// holding them.
+pub fn check(
+  sources: List<Source>,
+  limits: Limits,
+) -> Result<Checked, Refusal> / {Shipped, abort.raise} = try { checked(sources, limits) }
+
+/// `check` with no shipped module to import: for sources that import none, which then performs
+/// nothing. An import of one is the error it is where the module does not ship.
+pub fn check_alone(
+  sources: List<Source>,
+  limits: Limits,
+) -> Result<Checked, Refusal> / {abort.raise} =
+  handle {
+    check(sources, limits)
+  } with {
+    shipped.names() -> [],
+    shipped.module(name) -> None,
+    shipped.reached(view, pulled) -> (),
+  }
+
+/// The definition named `name` program-wide.
+pub fn definition(program: Checked, name: String) -> Option<Definition> =
+  fold(program.definitions, None, |held: Option<Definition>, d: Definition|
+    match held { Some(_) -> held, None -> if d.name == name { Some(d) } else { None } })
+
+/// Each definition's hash by its name: what two checks are compared by.
+pub fn hashes(program: Checked) -> Map<String, String> =
+  fold(program.definitions, map_new(), |held: Map<String, String>, d: Definition|
+    map_insert(held, d.name, d.hash))
+
+/// The names of the definitions that mention `name` directly, in order.
+pub fn callers(program: Checked, name: String) -> List<String> =
+  sort(
+    fold(program.definitions, [], |held: List<String>, d: Definition|
+      if fold(d.references, false, |any: Bool, r: String| any || r == name) { push(held, d.name) }
+      else { held }),
+  )
+
+/// The names whose definitions differ between two checks, in order: one that hashes otherwise,
+/// and one only either holds. Empty exactly when the two programs are the same definitions under
+/// the same names.
+pub fn moved(before: Checked, after: Checked) -> List<String> = {
+  let was = hashes(before);
+  let now = hashes(after);
+  sort(
+    map_fold(
+      now,
+      map_fold(was, [], |held: List<String>, name: String, hash: String|
+        if map_get(now, name) == Some(hash) { held } else { push(held, name) }),
+      |held: List<String>, name: String, _: String|
+        if map_contains(was, name) { held } else { push(held, name) },
+    ),
+  )
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn roomy() -> Limits = { files: 16, bytes: 65536 }
+
+fn alone(sources: List<Source>) -> Checked / {abort.raise} =
+  match check_alone(sources, roomy()) {
+    Ok(program) -> program,
+    Err(_) -> panic("the sources are within the limits and their paths name modules"),
+  }
+
+fn shop() -> List<Source> =
+  [
+    {
+      path: "shop/prices.ply",
+      text: b"pub type Price = | Cents(Int)\n\npub fn cents(p: Price) -> Int = match p { Cents(n) -> n }\n\npub fn total(ps: List<Price>) -> Int = fold(ps, 0, |sum: Int, p: Price| sum + cents(p))\n",
+    },
+    {
+      path: "main.ply",
+      text: b"import shop.prices (Price, Cents, total)\n\nfn basket() -> List<Price> = [Cents(250), Cents(199)]\n\nfn main() -> Int = total(basket())\n",
+    },
+  ]
+
+fn names_of(program: Checked) -> List<String> = map(program.definitions, |d: Definition| d.name)
+
+fn found(program: Checked, name: String) -> Definition / {abort.raise} =
+  match definition(program, name) { Some(d) -> d, None -> panic("no definition is named " ++ name) }
+
+test "a program that checks answers each definition's kind, place, type, row, hash and references" {
+  let answered = alone(shop());
+  assert(answered.ok);
+  assert_eq(answered.diagnostics, []);
+  assert_eq(sort(names_of(answered)), [
+    "main.basket",
+    "main.main",
+    "shop.prices.Price",
+    "shop.prices.cents",
+    "shop.prices.total",
+  ]);
+  let total = found(answered, "shop.prices.total");
+  assert_eq(total.kind, Function);
+  assert_eq(total.module, "shop.prices");
+  assert_eq(total.simple_name, "total");
+  assert_eq(total.path, "shop/prices.ply");
+  assert_eq(total.signature, "(List<shop.prices.Price>) -> Int");
+  assert_eq(total.row, "{}");
+  assert_eq(string_len(total.hash), 64);
+  assert_eq(sort(total.references), ["shop.prices.Price", "shop.prices.cents"]);
+  assert_eq(found(answered, "shop.prices.Price").kind, Type);
+  assert_eq(callers(answered, "shop.prices.total"), ["main.main"]);
+  assert_eq(callers(answered, "shop.prices.cents"), ["shop.prices.total"])
+}
+
+test "a program that does not check answers its diagnostics as values, placed in the source they are about" {
+  let answered = alone([
+    { path: "m.ply", text: b"fn one() -> Int = 1\n\nfn two() -> Int = \"two\"\n" },
+  ]);
+  assert(!answered.ok);
+  assert_eq(answered.definitions, []);
+  match list_at(answered.diagnostics, 0) {
+    None -> panic("a type error is reported"),
+    Some(d) -> {
+      assert_eq(d.code, "E0201");
+      assert_eq(d.severity, Error);
+      match syntax::primary(d) {
+        None -> panic("a diagnostic is placed"),
+        Some(label) -> {
+          assert_eq(label.path, "m.ply");
+          assert_eq(label.place, { line: 3, column: 19 });
+          assert_eq(label.span, { start: 39, end: 44 })
+        },
+      }
+    },
+  }
+}
+
+test "a syntax error is the parser's diagnostic, and a warning leaves the program checked" {
+  let broken = alone([{ path: "m.ply", text: b"fn f( = 1\n" }]);
+  assert_eq(map(broken.diagnostics, |d: Diagnostic| d.code), ["E0001"]);
+  let unused = alone([{ path: "m.ply", text: b"type Shape = | Dot\n\nfn main() -> Int = 1\n" }]);
+  assert(unused.ok);
+  assert_eq(map(unused.diagnostics, |d: Diagnostic| d.severity), [Warning])
+}
+
+test "sources past a limit, and a path that names no module, are refused before anything is read" {
+  let two: List<Source> = [
+    { path: "a.ply", text: b"fn a() -> Int = 1\n" },
+    { path: "b.ply", text: b"fn b() -> Int = 2\n" },
+  ];
+  assert_eq(check_alone(two, { files: 1, bytes: 1000 }), Err(TooManyFiles(2)));
+  assert_eq(check_alone(two, { files: 2, bytes: 20 }), Err(TooManyBytes(36)));
+  assert(match check_alone([{ path: "a-b.ply", text: b"" }], roomy()) {
+    Err(NotAModule(path, _)) -> path == "a-b.ply",
+    _ -> false,
+  })
+}
+
+test "an import of a shipped module is an error where none ships, as `check_alone` answers" {
+  let answered = alone([
+    { path: "m.ply", text: b"import std.list (at_or)\n\nfn main() -> Int = at_or([1], 0, 2)\n" },
+  ]);
+  assert_eq(map(answered.diagnostics, |d: Diagnostic| d.code), ["E0106"])
+}
+
+test "a rename, a reformat and a comment move no hash, and an edit moves what reaches it" {
+  let before = alone(shop());
+  let renamed = alone(
+    map(shop(), |source: Source|
+      {
+        path: source.path,
+        text: bytes::replace(bytes::replace(source.text, b"sum", b"so_far"), b"ps", b"prices"),
+      }),
+  );
+  assert_eq(moved(before, renamed), []);
+  let reformatted = alone(
+    map(shop(), |source: Source|
+      { path: source.path, text: bytes_concat(b"// a note\n", syntax::formatted(source.text)) }),
+  );
+  assert_eq(moved(before, reformatted), []);
+  let edited = alone(
+    map(shop(), |source: Source|
+      {
+        path: source.path,
+        text: bytes::replace(source.text, b"Cents(n) -> n", b"Cents(n) -> n + 0"),
+      }),
+  );
+  assert_eq(moved(before, edited), ["main.main", "shop.prices.cents", "shop.prices.total"])
+}
+
+fn sampled(source: Bytes) -> Checked / {abort.raise} = alone([{ path: "m.ply", text: source }])
+
+/// `source` with every binding and use of `from` written `to`.
+fn rebound(source: Bytes, from: String, to: Bytes) -> Bytes / {abort.raise} =
+  match syntax::edited(
+      source,
+      fold(syntax::walk(syntax::parse(source).tree), [], |edits: List<Edit>, node: syntax::Node|
+        match ((syntax::kind(node), syntax::name(node))) {
+          (syntax::Binding, Some(ident)) -> if ident.text == from {
+            push(edits, { path: "", span: ident.span, text: to })
+          } else { edits },
+          (syntax::Name, Some(ident)) -> if ident.text == from {
+            push(edits, { path: "", span: ident.span, text: to })
+          } else { edits },
+          _ -> edits,
+        }),
+    ) {
+    Some(out) -> out,
+    None -> source,
+  }
+
+law "a sample checks" forall (s: Sample) { sampled(sample_source(s)).ok }
+
+law "formatting a sample moves no definition's hash"
+  forall (s: Sample) {
+    moved(sampled(sample_source(s)), sampled(syntax::formatted(sample_source(s)))) == []
+  }
+
+law "renaming a local binder moves no definition's hash"
+  forall (s: Sample) {
+    moved(sampled(sample_source(s)), sampled(rebound(sample_source(s), "y", b"held"))) == []
+  }
+
+law "a formatted sample checks as its source does"
+  forall (s: Sample) {
+    let before = sampled(sample_source(s));
+    let after = sampled(syntax::formatted(sample_source(s)));
+    before.ok == after.ok && hashes(before) == hashes(after)
+      && map(before.definitions, |d: Definition| d.signature)
+      == map(after.definitions, |d: Definition| d.signature)
+  }
