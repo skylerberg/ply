@@ -24,21 +24,25 @@
 //! `2^38 - 64` under either ChaCha20; a longer one raises.
 //!
 //! **Signing.** Ed25519 (RFC 8032), strict: an `S` at or past the group order is refused. ECDSA
-//! over P-256 with SHA-256, its nonce RFC 6979's, in the encoding the key was made for: `Der`, an
-//! ASN.1 `SEQUENCE` of two `INTEGER`s as X.509 and TLS carry it, or `Raw`, `r` then `s` in 32
-//! bytes each as JOSE does. Neither reads the other. RSA of 2048 bits or more over SHA-256, -384
-//! or -512: PKCS #1 v1.5 signs and verifies, and PSS, with a salt as long as its digest, verifies.
-//! There is no PKCS #1 v1.5 decryption, and no RSA key is made here.
+//! on P-256, P-384, P-521 and secp256k1, each over the hash JOSE pairs it with, its nonce RFC
+//! 6979's, in the encoding the key was made for: `Der`, an ASN.1 `SEQUENCE` of two `INTEGER`s as
+//! X.509 and TLS carry it, or `Raw`, `r` then `s` as JOSE does. Neither reads the other. RSA of
+//! 2048 bits or more over SHA-256, -384 or -512, PKCS #1 v1.5 and PSS. A PSS salt is as long as
+//! its digest and made of the key and the message, so every signature here is a function of the
+//! two. There is no PKCS #1 v1.5 decryption, and no RSA key is made here.
 //!
 //! **Agreeing.** X25519 (RFC 7748) and ECDH over P-256. A peer's P-256 key is checked to be a
 //! point of the curve where it is made, and an X25519 result of all zeros, which a peer of small
 //! order forces, is refused. What `agree` answers is not uniform and is no key: `derive`, HKDF over
 //! SHA-256, makes keys of it, each under its own `info`, and `seal_key_of` makes a `SealKey`.
 //!
-//! **Keys in and out.** Each maker takes raw bytes. `spki_decode` and `spki_encode` read and
-//! write a public key's `SubjectPublicKeyInfo`, `private_key_of_der` reads a private key from
-//! PKCS #8, SEC 1 or PKCS #1 without opening it, as `std.pem` hands one over, and `Jwk` is a
-//! public key as a JSON Web Key holds its numbers.
+//! **Keys in and out.** Each maker takes raw bytes, and each `new_` maker draws them with
+//! `entropy.secret`, so a key is never a plain value. `spki_decode` and `spki_encode` read and
+//! write a public key's `SubjectPublicKeyInfo`. `private_key_of_der` reads a private key from
+//! PKCS #8, SEC 1 or PKCS #1 without opening it, as `std.pem` hands one over, and
+//! `private_key_document` writes a signing key's, sealed, for `std.fs`'s `write_secret`. `Jwk`
+//! is a public key as a JSON Web Key holds its numbers, and `rsa_private_of_jwk` reads an RSA
+//! private key from one without its numbers being plain values.
 //!
 //! `same` compares two byte strings in time that follows their lengths alone.
 
@@ -74,9 +78,12 @@ pub opaque type SealKey = | SealKey(Secret<Bytes>)
 pub fn seal_key(material: Secret<Bytes>) -> Option<SealKey> =
   if whole(material) { Some(SealKey(material)) } else { None }
 
-/// A key of the operating system's entropy.
-pub fn new_seal_key() -> SealKey / {entropy.next, abort.raise} =
-  SealKey(secret_of_bytes(token_bytes(32)))
+/// A key of the operating system's entropy, drawn sealed.
+pub fn new_seal_key() -> SealKey / {entropy.secret, abort.raise} =
+  match seal_key(entropy.secret(32)) {
+    Some(key) -> key,
+    None -> panic("thirty-two bytes are a key"),
+  }
 
 /// The bytes of a nonce `seal` draws.
 pub fn nonce_size() -> Int = 24
@@ -163,9 +170,9 @@ pub fn counted_key(cipher: Cipher, material: Secret<Bytes>) -> Option<CountedKey
     )
   }
 
-/// A key of the operating system's entropy.
-pub fn new_counted_key(cipher: Cipher) -> CountedKey / {entropy.next, abort.raise} =
-  match counted_key(cipher, secret_of_bytes(token_bytes(32))) {
+/// A key of the operating system's entropy, drawn sealed.
+pub fn new_counted_key(cipher: Cipher) -> CountedKey / {entropy.secret, abort.raise} =
+  match counted_key(cipher, entropy.secret(32)) {
     Some(key) -> key,
     None -> panic("thirty-two bytes are a key"),
   }
@@ -236,23 +243,47 @@ pub fn watched<a | e>(body: () -> a / {nonces.spend | e}) -> Result<a, Reuse> / 
 pub type Encoding =
   /// An ASN.1 `SEQUENCE` of the `INTEGER`s `r` and `s`, in DER: X.509, TLS and PKCS #7.
   | Der
-  /// `r` then `s`, each in 32 bytes: JOSE's `ES256`, WebAuthn and IEEE P1363.
+  /// `r` then `s`, each as long as the curve's scalar: JOSE's `ES256`, WebAuthn and IEEE P1363.
   | Raw
 
-/// The hash an RSA signature is over.
+/// The hash a signature is over.
 pub type Digest = | Sha256 | Sha384 | Sha512
+
+/// A curve ECDSA signs over: NIST's P-256, P-384 and P-521 (FIPS 186-5), and secp256k1 (SEC 2).
+pub type EcdsaCurve = | NistP256 | NistP384 | NistP521 | Secp256k1
+
+/// The hash a key on `curve` signs over here, as JOSE pairs them: SHA-256 on P-256 and secp256k1
+/// (`ES256`, `ES256K`), SHA-384 on P-384 (`ES384`) and SHA-512 on P-521 (`ES512`).
+pub fn curve_digest(curve: EcdsaCurve) -> Digest =
+  match curve { NistP256 -> Sha256, NistP384 -> Sha384, NistP521 -> Sha512, Secp256k1 -> Sha256 }
+
+/// The bytes of a scalar on `curve`, and of each of a raw signature's halves.
+pub fn scalar_size(curve: EcdsaCurve) -> Int =
+  match curve { NistP256 -> 32, NistP384 -> 48, NistP521 -> 66, Secp256k1 -> 32 }
+
+/// The curve's name in the PKCS #8 and X.509 documents that carry a key on it.
+pub fn curve_oid(curve: EcdsaCurve) -> Oid =
+  match curve {
+    NistP256 -> oid::prime256v1(),
+    NistP384 -> oid::secp384r1(),
+    NistP521 -> oid::secp521r1(),
+    Secp256k1 -> oid::secp256k1(),
+  }
+
+fn curve_scheme(curve: EcdsaCurve) -> String =
+  match curve { NistP256 -> "p256", NistP384 -> "p384", NistP521 -> "p521", Secp256k1 -> "k256" }
 
 /// A key that signs, with the key that verifies it.
 pub opaque type SigningKey =
   | Ed25519Signing(Secret<Bytes>, Bytes)
-  | EcdsaP256Signing(Secret<Bytes>, Bytes, Encoding)
+  | EcdsaSigning(EcdsaCurve, Secret<Bytes>, Bytes, Encoding)
   | RsaPkcs1Signing(Secret<Bytes>, Bytes, Digest)
+  | RsaPssSigning(Secret<Bytes>, Bytes, Digest)
 
 /// A key that verifies: the public key, and how a signature under it is made and written.
 pub opaque type VerifyingKey =
   | Ed25519Verifying(Bytes)
-  | EcdsaP256Verifying(Bytes, Encoding)
-  | EcdsaVerifying(Bytes, Digest, Encoding)
+  | EcdsaVerifying(EcdsaCurve, Digest, Bytes, Encoding)
   | RsaPkcs1Verifying(Bytes, Digest)
   | RsaPssVerifying(Bytes, Digest)
 
@@ -261,19 +292,16 @@ show for VerifyingKey by verifying_text
 fn digest_name(d: Digest) -> String =
   match d { Sha256 -> "sha256", Sha384 -> "sha384", Sha512 -> "sha512" }
 
-/// The scheme a point's curve and a digest name: P-256 for a 65-byte point, P-384 for any other.
-fn ecdsa_scheme(point: Bytes, digest: Digest) -> String =
-  (if bytes_len(point) == 65 { "ecdsa-p256-" } else { "ecdsa-p384-" }) ++ digest_name(digest)
+fn ecdsa_scheme(curve: EcdsaCurve, digest: Digest) -> String =
+  "ecdsa-" ++ curve_scheme(curve) ++ "-" ++ digest_name(digest)
 
 fn encoding_name(encoding: Encoding) -> String = match encoding { Der -> "der", Raw -> "raw" }
 
 fn verifying_text(key: VerifyingKey) -> String =
   match key {
     Ed25519Verifying(public) -> "ed25519:" ++ hex(public),
-    EcdsaP256Verifying(point, Der) -> "ecdsa-p256-der:" ++ hex(point),
-    EcdsaP256Verifying(point, Raw) -> "ecdsa-p256-raw:" ++ hex(point),
-    EcdsaVerifying(point, digest, encoding) ->
-      ecdsa_scheme(point, digest) ++ "-" ++ encoding_name(encoding) ++ ":" ++ hex(point),
+    EcdsaVerifying(curve, digest, point, encoding) ->
+      ecdsa_scheme(curve, digest) ++ "-" ++ encoding_name(encoding) ++ ":" ++ hex(point),
     RsaPkcs1Verifying(public, d) -> "rsa-pkcs1-" ++ digest_name(d) ++ ":" ++ hex(public),
     RsaPssVerifying(public, d) -> "rsa-pss-" ++ digest_name(d) ++ ":" ++ hex(public),
   }
@@ -288,34 +316,49 @@ pub fn ed25519_signing(seed: Secret<Bytes>) -> Option<SigningKey> =
     None -> None,
   }
 
-/// An Ed25519 key of the operating system's entropy.
-pub fn new_ed25519_signing() -> SigningKey / {entropy.next, abort.raise} =
-  match ed25519_signing(secret_of_bytes(token_bytes(32))) {
+/// An Ed25519 key of the operating system's entropy, drawn sealed.
+pub fn new_ed25519_signing() -> SigningKey / {entropy.secret, abort.raise} =
+  match ed25519_signing(entropy.secret(32)) {
     Some(key) -> key,
     None -> panic("thirty-two bytes are a seed"),
   }
 
-/// The ECDSA P-256 key a scalar is, signing in `encoding`: 32 bytes, most significant first, of a
-/// number from one to the curve's order less one. `None` for anything else.
-pub fn ecdsa_p256_signing(scalar: Secret<Bytes>, encoding: Encoding) -> Option<SigningKey> =
-  match public_of("p256", scalar) {
-    Some(point) -> Some(EcdsaP256Signing(scalar, point, encoding)),
+/// The ECDSA key a scalar on `curve` is, signing over `curve_digest(curve)` in `encoding`, its
+/// nonce RFC 6979's: `scalar_size(curve)` bytes, most significant first, of a number from one to
+/// the curve's order less one. `None` for anything else.
+pub fn ecdsa_signing(
+  curve: EcdsaCurve,
+  scalar: Secret<Bytes>,
+  encoding: Encoding,
+) -> Option<SigningKey> =
+  match public_of(curve_scheme(curve), scalar) {
+    Some(point) -> Some(EcdsaSigning(curve, scalar, point, encoding)),
     None -> None,
   }
 
-/// How many draws a fresh P-256 scalar is given: one is out of range once in `2^32`.
+/// How many draws a fresh scalar is given: one is out of range at most once in `2^32`.
 fn draws() -> Int = 8
 
-fn drawn_scalar(left: Int) -> Secret<Bytes> / {entropy.next, abort.raise} = {
-  let scalar = secret_of_bytes(token_bytes(32));
-  if public_of("p256", scalar) != None { scalar }
-  else if left <= 1 { panic("the entropy source answers no P-256 scalar") }
-  else { drawn_scalar(left - 1) }
+/// A scalar of `curve` drawn sealed. A P-521 scalar is a zero byte and 65 drawn, below `2^520`,
+/// since a draw cannot be read to be held below the order: a key half a bit short of the curve's
+/// strength of 260 bits.
+fn drawn_scalar(curve: EcdsaCurve, left: Int) -> Secret<Bytes> / {entropy.secret, abort.raise} = {
+  let scalar = match curve {
+    NistP521 -> secret_concat(secret_of_bytes(b"\x00"), entropy.secret(65)),
+    _ -> entropy.secret(scalar_size(curve)),
+  };
+  if public_of(curve_scheme(curve), scalar) != None { scalar }
+  else if left <= 1 { panic("the entropy source answers no scalar of the curve") }
+  else { drawn_scalar(curve, left - 1) }
 }
 
-/// An ECDSA P-256 key of the operating system's entropy, signing in `encoding`.
-pub fn new_ecdsa_p256_signing(encoding: Encoding) -> SigningKey / {entropy.next, abort.raise} =
-  match ecdsa_p256_signing(drawn_scalar(draws()), encoding) {
+/// An ECDSA key on `curve` of the operating system's entropy, drawn sealed, signing in
+/// `encoding`.
+pub fn new_ecdsa_signing(
+  curve: EcdsaCurve,
+  encoding: Encoding,
+) -> SigningKey / {entropy.secret, abort.raise} =
+  match ecdsa_signing(curve, drawn_scalar(curve, draws()), encoding) {
     Some(key) -> key,
     None -> panic("a drawn scalar is a key"),
   }
@@ -329,12 +372,71 @@ pub fn rsa_pkcs1_signing(document: Secret<Bytes>, digest: Digest) -> Option<Sign
     None -> None,
   }
 
+/// The RSA key a private-key document is, signing PSS over `digest`, its mask MGF1 over the same
+/// hash and its salt as long as the digest: HMAC, under the document, of the message's digest, so
+/// a signature is a function of the key and the message as an Ed25519 or RFC 6979 one is, and
+/// nobody without the key foresees a salt. `None` as `rsa_pkcs1_signing` answers it.
+pub fn rsa_pss_signing(document: Secret<Bytes>, digest: Digest) -> Option<SigningKey> =
+  match public_of("rsa", document) {
+    Some(public) -> Some(RsaPssSigning(document, public, digest)),
+    None -> None,
+  }
+
 /// The key that verifies what `key` signs.
 pub fn verifying_key(key: SigningKey) -> VerifyingKey =
   match key {
     Ed25519Signing(_, public) -> Ed25519Verifying(public),
-    EcdsaP256Signing(_, point, encoding) -> EcdsaP256Verifying(point, encoding),
+    EcdsaSigning(curve, _, point, encoding) ->
+      EcdsaVerifying(curve, curve_digest(curve), point, encoding),
     RsaPkcs1Signing(_, public, digest) -> RsaPkcs1Verifying(public, digest),
+    RsaPssSigning(_, public, digest) -> RsaPssVerifying(public, digest),
+  }
+
+fn der_length(size: Int) -> Bytes / {abort.raise} =
+  if size < 0x80 { byte_of_int(size) }
+  else if size < 0x100 { bytes_concat(b"\x81", byte_of_int(size)) }
+  else { bytes_concat_all([b"\x82", byte_of_int(size >>> 8), byte_of_int(size & 0xFF)]) }
+
+/// A DER tag and the length of what follows it: how a document's public frame is written around
+/// a secret it cannot hold as a plain value.
+fn der_head(tag: Int, size: Int) -> Bytes / {abort.raise} =
+  bytes_concat(byte_of_int(tag), der_length(size))
+
+/// The private key's document, sealed: PKCS #8 (RFC 5208, RFC 5958) for an Ed25519 key (RFC 8410)
+/// and an ECDSA one (an RFC 5915 `ECPrivateKey` holding the public point beside the scalar), and
+/// for an RSA key the document it was made of. What `private_key_of_der` reads back, and what
+/// `std.fs`'s `write_secret` writes down.
+pub fn private_key_document(key: SigningKey) -> Secret<Bytes> / {abort.raise} =
+  match key {
+    Ed25519Signing(seed, _) ->
+      secret_concat(secret_of_bytes(hex"302e020100300506032b657004220420"), seed),
+    EcdsaSigning(curve, scalar, point, _) -> {
+      let size = scalar_size(curve);
+      let bits = bytes_concat(der_head(3, bytes_len(point) + 1), bytes_concat(b"\x00", point));
+      let public = bytes_concat(der_head(0xA1, bytes_len(bits)), bits);
+      // The `ECPrivateKey`: its version, the scalar as an `OCTET STRING`, then the public point.
+      let inner = 5 + size + bytes_len(public);
+      let head = der_head(0x30, inner);
+      let held = der_head(4, bytes_len(head) + inner);
+      let named = handle {
+        algorithm(oid::ec_public_key(), Some(curve_oid(curve)))
+      } with {
+        asn1.unwritable(_) -> panic("a curve's name is written"),
+      };
+      let outer = 3 + bytes_len(named) + bytes_len(held) + bytes_len(head) + inner;
+      let before = bytes_concat_all([
+        der_head(0x30, outer),
+        b"\x02\x01\x00",
+        named,
+        held,
+        head,
+        b"\x02\x01\x01",
+        der_head(4, size),
+      ]);
+      secret_concat(secret_concat(secret_of_bytes(before), scalar), secret_of_bytes(public))
+    },
+    RsaPkcs1Signing(document, _, _) -> document,
+    RsaPssSigning(document, _, _) -> document,
   }
 
 /// The Ed25519 key 32 bytes name; `None` for any other length. Bytes that are no point of the
@@ -349,24 +451,35 @@ fn one() -> Secret<Bytes> = secret_of_bytes(bytes_concat(repeat(b"\x00", 31), b"
 fn on_p256(point: Bytes) -> Bool =
   bytes_len(point) == 65 && or_else(false, || crypto_agree("p256", one(), point) != None)
 
-/// The ECDSA P-256 key a point is, verifying signatures written in `encoding`: the 65-byte
-/// uncompressed form, `04`, `x`, `y`. `None` for any other form and for a point off the curve.
-pub fn ecdsa_p256_verifying(point: Bytes, encoding: Encoding) -> Option<VerifyingKey> =
-  if on_p256(point) { Some(EcdsaP256Verifying(point, encoding)) } else { None }
+/// How the runtime checks ECDSA on a curve over a digest, and whether the signature it reads is
+/// raw; `None` for a pairing it does not check.
+fn checked_as(curve: EcdsaCurve, digest: Digest) -> Option<{ scheme: String, raw: Bool }> =
+  match ((curve, digest)) {
+    (NistP256, Sha256) -> Some({ scheme: "ecdsa-p256-sha256", raw: true }),
+    (NistP256, Sha384) -> Some({ scheme: "ecdsa-p256-sha384", raw: false }),
+    (NistP384, Sha256) -> Some({ scheme: "ecdsa-p384-sha256", raw: false }),
+    (NistP384, Sha384) -> Some({ scheme: "ecdsa-p384-sha384", raw: false }),
+    (NistP521, Sha512) -> Some({ scheme: "ecdsa-p521-sha512", raw: true }),
+    (Secp256k1, Sha256) -> Some({ scheme: "ecdsa-k256-sha256", raw: true }),
+    _ -> None,
+  }
 
-/// The ECDSA key a point is, verifying signatures over `digest` written in `encoding`, as a
-/// certificate pairs a curve with a hash: P-256 for a 65-byte uncompressed point and P-384 for a
-/// 97-byte one, over SHA-256 or SHA-384. P-256 over SHA-256 is `ecdsa_p256_verifying`'s key.
-/// `None` for any other length or form and for SHA-512. A P-384 point off its curve is a key that
-/// verifies nothing.
-pub fn ecdsa_verifying(point: Bytes, digest: Digest, encoding: Encoding) -> Option<VerifyingKey> = {
-  let size = bytes_len(point);
-  if digest == Sha512 || (size != 65 && size != 97) || or_else(0, || bytes_at(point, 0)) != 4 {
-    None
-  } else if size == 65 && digest == Sha256 { ecdsa_p256_verifying(point, encoding) }
-  else if size == 65 && !on_p256(point) { None }
-  else { Some(EcdsaVerifying(point, digest, encoding)) }
-}
+/// The ECDSA key a point of `curve` is, verifying signatures over `digest` written in `encoding`:
+/// the uncompressed form, `04`, `x`, `y`. The pairings are each curve's own digest, as
+/// `curve_digest` names it, and those certificates use beside them: P-256 over SHA-384 and P-384
+/// over SHA-256. `None` for any other pairing, form or length, and for a P-256 point off the
+/// curve; a point off any other curve is a key that verifies nothing. A secp256k1 signature whose
+/// `s` is in the high half is taken as its low twin.
+pub fn ecdsa_verifying(
+  curve: EcdsaCurve,
+  digest: Digest,
+  point: Bytes,
+  encoding: Encoding,
+) -> Option<VerifyingKey> =
+  if checked_as(curve, digest) == None || bytes_len(point) != 2 * scalar_size(curve) + 1
+      || or_else(0, || bytes_at(point, 0)) != 4
+      || (curve == NistP256 && !on_p256(point)) { None }
+  else { Some(EcdsaVerifying(curve, digest, point, encoding)) }
 
 /// The bits of the modulus a PKCS #1 `RSAPublicKey` holds, or `None` for bytes that are not one
 /// in DER: what a caller reads to say why a key is refused.
@@ -401,19 +514,16 @@ pub fn rsa_pkcs1_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey
   match rsa_public(public) { Some(key) -> Some(RsaPkcs1Verifying(key, digest)), None -> None }
 
 /// The RSA key a PKCS #1 `RSAPublicKey` is, verifying PSS over `digest`, its mask MGF1 over the
-/// same hash and its salt as long as the digest. `None` as `rsa_pkcs1_verifying` answers it.
-///
-/// No key here signs PSS. A PSS signature takes a fresh salt, and the library that signs under an
-/// RSA key draws that salt from a generator of its own, so the signature would be no function of
-/// the key and the message: `rsa_pkcs1_signing` is the RSA key that signs.
+/// same hash and its salt as long as the digest, whatever the salt is. `None` as
+/// `rsa_pkcs1_verifying` answers it.
 pub fn rsa_pss_verifying(public: Bytes, digest: Digest) -> Option<VerifyingKey> =
   match rsa_public(public) { Some(key) -> Some(RsaPssVerifying(key, digest)), None -> None }
 
 /// How a key's signatures are made, which a document that carries one names beside it.
 pub type Signature =
   | Ed25519Signature
-  /// ECDSA over this hash, written this way, on the curve the key's point is of.
-  | EcdsaSignature(Digest, Encoding)
+  /// ECDSA on this curve over this hash, written this way.
+  | EcdsaSignature(EcdsaCurve, Digest, Encoding)
   /// RSA PKCS #1 v1.5 over this hash.
   | RsaPkcs1Signature(Digest)
   /// RSA PSS over this hash, its salt as long as the digest.
@@ -423,8 +533,7 @@ pub type Signature =
 pub fn signature_of(key: VerifyingKey) -> Signature =
   match key {
     Ed25519Verifying(_) -> Ed25519Signature,
-    EcdsaP256Verifying(_, encoding) -> EcdsaSignature(Sha256, encoding),
-    EcdsaVerifying(_, digest, encoding) -> EcdsaSignature(digest, encoding),
+    EcdsaVerifying(curve, digest, _, encoding) -> EcdsaSignature(curve, digest, encoding),
     RsaPkcs1Verifying(_, digest) -> RsaPkcs1Signature(digest),
     RsaPssVerifying(_, digest) -> RsaPssSignature(digest),
   }
@@ -434,8 +543,7 @@ pub fn signature_of(key: VerifyingKey) -> Signature =
 pub fn verifying_bytes(key: VerifyingKey) -> Bytes =
   match key {
     Ed25519Verifying(public) -> public,
-    EcdsaP256Verifying(point, _) -> point,
-    EcdsaVerifying(point, _, _) -> point,
+    EcdsaVerifying(_, _, point, _) -> point,
     RsaPkcs1Verifying(public, _) -> public,
     RsaPssVerifying(public, _) -> public,
   }
@@ -443,17 +551,17 @@ pub fn verifying_bytes(key: VerifyingKey) -> Bytes =
 fn left_padded(magnitude: Bytes, size: Int) -> Bytes =
   bytes_concat(repeat(b"\x00", size - bytes_len(magnitude)), magnitude)
 
-/// `r` then `s` in 32 bytes each, as the DER signature `der` holds them; `None` for bytes that are
-/// not DER's one writing of a `SEQUENCE` of two `INTEGER`s that are not negative and fit.
-fn raw_of_der(der: Bytes) -> Option<Bytes> / {abort.raise} =
+/// `r` then `s` in `size` bytes each, as the DER signature `der` holds them; `None` for bytes that
+/// are not DER's one writing of a `SEQUENCE` of two `INTEGER`s that are not negative and fit.
+fn raw_of_der(der: Bytes, size: Int) -> Option<Bytes> / {abort.raise} =
   match asn1::decode_with(der, 2, |reader: Reader|
       asn1::within(asn1::read_sequence(reader), |fields: Reader| {
         let r = asn1::read_unsigned(fields);
         let s = asn1::read_unsigned(r.rest);
         { value: { r: r.value, s: s.value }, rest: s.rest }
       })) {
-    Ok(halves) -> if bytes_len(halves.r) > 32 || bytes_len(halves.s) > 32 { None }
-    else { Some(bytes_concat(left_padded(halves.r, 32), left_padded(halves.s, 32))) },
+    Ok(halves) -> if bytes_len(halves.r) > size || bytes_len(halves.s) > size { None }
+    else { Some(bytes_concat(left_padded(halves.r, size), left_padded(halves.s, size))) },
     Err(_) -> None,
   }
 
@@ -469,16 +577,20 @@ fn der_of_raw(raw: Bytes) -> Bytes / {abort.raise} = {
 fn made(signature: Option<Bytes>) -> Bytes / {abort.raise} =
   match signature { Some(bytes) -> bytes, None -> panic("a key its maker checked signs") }
 
-/// `key`'s signature over `message`: 64 bytes under Ed25519 and ECDSA `Raw`, at most 72 under
-/// ECDSA `Der`, the modulus's length under RSA. A function of the key and the message alone.
+/// `key`'s signature over `message`: 64 bytes under Ed25519, twice the scalar's under ECDSA `Raw`
+/// and a few more at most under `Der`, the modulus's length under RSA. A function of the key and
+/// the message alone.
 pub fn sign(key: SigningKey, message: Bytes) -> Bytes / {abort.raise} =
   match key {
     Ed25519Signing(seed, _) -> made(crypto_sign("ed25519", seed, message)),
-    EcdsaP256Signing(scalar, _, Raw) -> made(crypto_sign("ecdsa-p256-sha256", scalar, message)),
-    EcdsaP256Signing(scalar, _, Der) ->
-      der_of_raw(made(crypto_sign("ecdsa-p256-sha256", scalar, message))),
+    EcdsaSigning(curve, scalar, _, encoding) -> {
+      let raw = made(crypto_sign(ecdsa_scheme(curve, curve_digest(curve)), scalar, message));
+      match encoding { Raw -> raw, Der -> der_of_raw(raw) }
+    },
     RsaPkcs1Signing(document, _, digest) ->
       made(crypto_sign("rsa-pkcs1-" ++ digest_name(digest), document, message)),
+    RsaPssSigning(document, _, digest) ->
+      made(crypto_sign("rsa-pss-" ++ digest_name(digest), document, message)),
   }
 
 /// Whether `signature` is `message` signed by the key `key` verifies. `false` for a signature of
@@ -487,17 +599,19 @@ pub fn verify(key: VerifyingKey, message: Bytes, signature: Bytes) -> Bool =
   or_else(false, ||
     match key {
       Ed25519Verifying(public) -> crypto_verify("ed25519", public, message, signature),
-      EcdsaP256Verifying(point, Raw) ->
-        crypto_verify("ecdsa-p256-sha256", point, message, signature),
-      EcdsaP256Verifying(point, Der) -> match raw_of_der(signature) {
-        Some(raw) -> crypto_verify("ecdsa-p256-sha256", point, message, raw),
+      EcdsaVerifying(curve, digest, point, encoding) -> match checked_as(curve, digest) {
         None -> false,
+        Some(native) -> {
+          let size = scalar_size(curve);
+          let read = match encoding {
+            Raw -> if bytes_len(signature) != 2 * size { None }
+            else if native.raw { Some(signature) }
+            else { Some(der_of_raw(signature)) },
+            Der -> if native.raw { raw_of_der(signature, size) } else { Some(signature) },
+          };
+          match read { Some(s) -> crypto_verify(native.scheme, point, message, s), None -> false }
+        },
       },
-      EcdsaVerifying(point, digest, Der) ->
-        crypto_verify(ecdsa_scheme(point, digest), point, message, signature),
-      EcdsaVerifying(point, digest, Raw) ->
-        bytes_len(signature) == bytes_len(point) - 1
-          && crypto_verify(ecdsa_scheme(point, digest), point, message, der_of_raw(signature)),
       RsaPkcs1Verifying(public, digest) ->
         crypto_verify("rsa-pkcs1-" ++ digest_name(digest), public, message, signature),
       RsaPssVerifying(public, digest) ->
@@ -545,14 +659,14 @@ fn agreement_key(curve: Curve, private: Secret<Bytes>) -> Option<AgreementKey> =
 /// The X25519 key 32 bytes are; `None` for any other length. Every 32 bytes are a key.
 pub fn x25519_key(private: Secret<Bytes>) -> Option<AgreementKey> = agreement_key(X25519, private)
 
-/// The P-256 key a scalar is, as `ecdsa_p256_signing` reads one. `None` for anything else.
+/// The P-256 key a scalar is, as `ecdsa_signing` reads one on `NistP256`. `None` for anything else.
 pub fn p256_key(scalar: Secret<Bytes>) -> Option<AgreementKey> = agreement_key(P256, scalar)
 
-/// A key of the operating system's entropy on `curve`.
-pub fn new_agreement_key(curve: Curve) -> AgreementKey / {entropy.next, abort.raise} = {
+/// A key of the operating system's entropy on `curve`, drawn sealed.
+pub fn new_agreement_key(curve: Curve) -> AgreementKey / {entropy.secret, abort.raise} = {
   let private = match curve {
-    X25519 -> secret_of_bytes(token_bytes(32)),
-    P256 -> drawn_scalar(draws()),
+    X25519 -> entropy.secret(32),
+    P256 -> drawn_scalar(NistP256, draws()),
   };
   match agreement_key(curve, private) { Some(key) -> key, None -> panic("a drawn key is a key") }
 }
@@ -628,25 +742,51 @@ pub type PrivateKey =
   | Ed25519Private(Secret<Bytes>)
   /// X25519: 32 bytes.
   | X25519Private(Secret<Bytes>)
-  /// P-256: the 32-byte scalar.
-  | P256Private(Secret<Bytes>)
-  /// RSA: the document itself, which is what `rsa_pkcs1_signing` takes.
+  /// An elliptic curve's: the scalar, `scalar_size(curve)` bytes.
+  | EcPrivate(EcdsaCurve, Secret<Bytes>)
+  /// RSA: the document itself, which is what `rsa_pkcs1_signing` and `rsa_pss_signing` take.
   | RsaPrivate(Secret<Bytes>)
 
 /// The private key a DER document holds, read by the runtime without opening it: PKCS #8
-/// (`PRIVATE KEY`) for any of the four, SEC 1 (`EC PRIVATE KEY`) on P-256, or PKCS #1
+/// (`PRIVATE KEY`) for any of them, SEC 1 (`EC PRIVATE KEY`) on any of the curves, or PKCS #1
 /// (`RSA PRIVATE KEY`). `None` for anything else. A `std.pem` `Key`'s `material` is such a
-/// document.
+/// document, and so is what `private_key_document` answers.
 pub fn private_key_of_der(document: Secret<Bytes>) -> Option<PrivateKey> =
   match secret_private_key(document) {
     None -> None,
     Some(found) -> match found.scheme {
       "ed25519" -> Some(Ed25519Private(found.key)),
       "x25519" -> Some(X25519Private(found.key)),
-      "p256" -> Some(P256Private(found.key)),
+      "p256" -> Some(EcPrivate(NistP256, found.key)),
+      "p384" -> Some(EcPrivate(NistP384, found.key)),
+      "p521" -> Some(EcPrivate(NistP521, found.key)),
+      "k256" -> Some(EcPrivate(Secp256k1, found.key)),
       "rsa" -> Some(RsaPrivate(found.key)),
       _ -> None,
     },
+  }
+
+/// The members of a private RSA JSON Web Key past `n` and `e` (RFC 7518 §6.3.2), each its
+/// base64url text, sealed: `d`, then the primes and the numbers the Chinese remainder theorem
+/// signs with. A key that leaves the last five out is no key here.
+pub type RsaJwkPrivate = {
+  d: Secret<String>,
+  p: Secret<String>,
+  q: Secret<String>,
+  dp: Secret<String>,
+  dq: Secret<String>,
+  qi: Secret<String>,
+}
+
+/// The RSA key a JSON Web Key's numbers are, as its document: `n` and `e` most significant byte
+/// first, and the private members. The runtime decodes and assembles them without one of them
+/// ever being a plain value, and answers `None` where they are no key of 2048 to 4096 bits
+/// together.
+pub fn rsa_private_of_jwk(n: Bytes, e: Bytes, private: RsaJwkPrivate) -> Option<PrivateKey> =
+  match or_else(None, ||
+      secret_rsa_jwk(n, e, [private.d, private.p, private.q, private.dp, private.dq, private.qi])) {
+    Some(document) -> Some(RsaPrivate(document)),
+    None -> None,
   }
 
 fn algorithm(id: Oid, parameters: Option<Oid>) -> Bytes / {asn1.unwritable, abort.raise} =
@@ -869,19 +1009,88 @@ test "a key is thirty-two bytes, and a nonce is its cipher's length" {
   assert(key_name(key) != key_name(counted_at(Aes256Gcm, repeat(b"j", 32))))
 }
 
-test "a fresh key and a sealed message take what the entropy they are handed gives" {
+test "a fresh key is drawn sealed, and a sealed message's nonce is the entropy it is handed" {
   let drawn = handle {
     let key = new_seal_key();
     { key: key, sealed: seal(key, b"message", b"header") }
   } with {
     entropy.next() -> 0x06_0504_0302_0100,
+    entropy.secret(n) -> secret_of_bytes(repeat(b"k", n)),
   };
   let seven = hex"00010203040506";
   let stream = bytes_concat_all([seven, seven, seven, seven, seven]);
-  assert(Some(drawn.key) == seal_key(secret_of_bytes(bytes_slice(stream, 0, 32))));
+  assert(Some(drawn.key) == seal_key(secret_of_bytes(repeat(b"k", 32))));
   assert_eq(bytes_slice(drawn.sealed, 0, 24), bytes_slice(stream, 0, 24));
   assert_eq(drawn.sealed, seal_under(drawn.key, bytes_slice(stream, 0, 24), b"message", b"header"));
   assert_eq(open(drawn.key, drawn.sealed, b"header"), Some(b"message"))
+}
+
+/// What `new_ecdsa_signing` and the others draw under a handler that answers `entropy.secret(n)`
+/// with `n` bytes counting up from `start`.
+fn counting_secret(start: Int, n: Int) -> Secret<Bytes> / {abort.raise} =
+  secret_of_bytes(bytes_concat_all(map(range(0, n), |i: Int| byte_of_int(start + i & 0xFF))))
+
+test "every key std.crypto makes is drawn sealed, and its document reads back as the key" {
+  let made = handle {
+    {
+      edwards: new_ed25519_signing(),
+      nist: map([NistP256, NistP384, NistP521, Secp256k1], |c: EcdsaCurve|
+        new_ecdsa_signing(c, Raw)),
+      counted: new_counted_key(Aes256Gcm),
+      agreeing: new_agreement_key(X25519),
+    }
+  } with {
+    entropy.secret(n) -> counting_secret(1, n),
+  };
+  assert_eq(Some(made.edwards), ed25519_signing(counting_secret(1, 32)));
+  assert_eq(
+    private_key_of_der(private_key_document(made.edwards)),
+    Some(Ed25519Private(counting_secret(1, 32))),
+  );
+  let p521 = secret_concat(secret_of_bytes(b"\x00"), counting_secret(1, 65));
+  assert_eq(map(made.nist, |k: SigningKey| private_key_of_der(private_key_document(k))), [
+    Some(EcPrivate(NistP256, counting_secret(1, 32))),
+    Some(EcPrivate(NistP384, counting_secret(1, 48))),
+    Some(EcPrivate(NistP521, p521)),
+    Some(EcPrivate(Secp256k1, counting_secret(1, 32))),
+  ]);
+  assert(Some(made.counted) == counted_key(Aes256Gcm, counting_secret(1, 32)));
+  assert(Some(made.agreeing) == x25519_key(counting_secret(1, 32)))
+}
+
+type Written = { curve: EcdsaCurve, document: Bytes }
+
+/// What OpenSSL writes of the key of scalar one on each curve, as PKCS #8 DER: an `ECPrivateKey`
+/// holding the curve's generator as its public point.
+fn written_by_openssl() -> List<Written> =
+  [
+    {
+      curve: NistP256,
+      document: hex"308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104200000000000000000000000000000000000000000000000000000000000000001a144034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    },
+    {
+      curve: NistP384,
+      document: hex"3081b6020100301006072a8648ce3d020106052b8104002204819e30819b0201010430000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a16403620004aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab73617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f",
+    },
+    {
+      curve: NistP521,
+      document: hex"3081ee020100301006072a8648ce3d020106052b810400230481d63081d30201010442000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001a18189038186000400c6858e06b70404e9cd9e3ecb662395b4429c648139053fb521f828af606b4d3dbaa14b5e77efe75928fe1dc127a2ffa8de3348b3c1856a429bf97e7e31c2e5bd66011839296a789a3bc0045c8a5fb42c7d1bd998f54449579b446817afbd17273e662c97ee72995ef42640c550b9013fad0761353c7086a272c24088be94769fd16650",
+    },
+    {
+      curve: Secp256k1,
+      document: hex"308184020100301006072a8648ce3d020106052b8104000a046d306b02010104200000000000000000000000000000000000000000000000000000000000000001a1440342000479be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+    },
+  ]
+
+test "the {w.curve} key of scalar one's document is the one OpenSSL writes" for w: Written in written_by_openssl(
+  ) {
+  let one = bytes_concat(repeat(b"\x00", scalar_size(w.curve) - 1), b"\x01");
+  let key = signer(ecdsa_signing(w.curve, secret_of_bytes(one), Der));
+  assert(private_key_document(key) == secret_of_bytes(w.document));
+  assert_eq(
+    private_key_of_der(secret_of_bytes(w.document)),
+    Some(EcPrivate(w.curve, secret_of_bytes(one))),
+  )
 }
 
 law "what is sealed opens, under its key and what it was bound to"
@@ -988,8 +1197,8 @@ fn rfc_6979_point() -> Bytes =
   hex"0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"
 
 test "ECDSA over P-256, RFC 6979's example, in both encodings" {
-  let raw = signer(ecdsa_p256_signing(secret_of_bytes(rfc_6979_scalar()), Raw));
-  let der = signer(ecdsa_p256_signing(secret_of_bytes(rfc_6979_scalar()), Der));
+  let raw = signer(ecdsa_signing(NistP256, secret_of_bytes(rfc_6979_scalar()), Raw));
+  let der = signer(ecdsa_signing(NistP256, secret_of_bytes(rfc_6979_scalar()), Der));
   let r = hex"efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716";
   let s = hex"f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8";
   assert_eq(verifying_bytes(verifying_key(raw)), rfc_6979_point());
@@ -1000,24 +1209,30 @@ test "ECDSA over P-256, RFC 6979's example, in both encodings" {
   assert(!verify(verifying_key(raw), b"sample", sign(der, b"sample")));
   assert(!verify(verifying_key(der), b"sample", sign(raw, b"sample")));
   assert(!verify(verifying_key(raw), b"simple", sign(raw, b"sample")));
-  assert_eq(Some(verifying_key(raw)), ecdsa_p256_verifying(rfc_6979_point(), Raw));
+  assert_eq(Some(verifying_key(raw)), ecdsa_verifying(NistP256, Sha256, rfc_6979_point(), Raw));
   assert(verifying_key(raw) != verifying_key(der));
-  assert_eq(f"{verifying_key(der)}", "ecdsa-p256-der:" ++ hex_of(rfc_6979_point()))
+  assert_eq(f"{verifying_key(der)}", "ecdsa-p256-sha256-der:" ++ hex_of(rfc_6979_point()))
 }
 
 test "a P-256 key is a scalar in range and a point on the curve" {
   let order = hex"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
-  assert(ecdsa_p256_signing(secret_of_bytes(repeat(b"\x00", 32)), Raw) == None);
-  assert(ecdsa_p256_signing(secret_of_bytes(order), Raw) == None);
-  assert(ecdsa_p256_signing(secret_of_bytes(repeat(b"\xff", 32)), Raw) == None);
-  assert(ecdsa_p256_signing(secret_of_bytes(repeat(b"\x01", 31)), Raw) == None);
+  assert(ecdsa_signing(NistP256, secret_of_bytes(repeat(b"\x00", 32)), Raw) == None);
+  assert(ecdsa_signing(NistP256, secret_of_bytes(order), Raw) == None);
+  assert(ecdsa_signing(NistP256, secret_of_bytes(repeat(b"\xff", 32)), Raw) == None);
+  assert(ecdsa_signing(NistP256, secret_of_bytes(repeat(b"\x01", 31)), Raw) == None);
   assert(
-    ecdsa_p256_signing(secret_of_bytes(bytes_concat(repeat(b"\x00", 31), b"\x01")), Raw) != None,
+    ecdsa_signing(NistP256, secret_of_bytes(bytes_concat(repeat(b"\x00", 31), b"\x01")), Raw)
+      != None,
   );
-  assert_eq(ecdsa_p256_verifying(turned(rfc_6979_point(), 8 * 64), Raw), None);
-  assert_eq(ecdsa_p256_verifying(bytes_slice(rfc_6979_point(), 0, 64), Raw), None);
+  assert_eq(ecdsa_verifying(NistP256, Sha256, turned(rfc_6979_point(), 8 * 64), Raw), None);
+  assert_eq(ecdsa_verifying(NistP256, Sha256, bytes_slice(rfc_6979_point(), 0, 64), Raw), None);
   assert_eq(
-    ecdsa_p256_verifying(bytes_concat(b"\x03", bytes_slice(rfc_6979_point(), 1, 33)), Raw),
+    ecdsa_verifying(
+      NistP256,
+      Sha256,
+      bytes_concat(b"\x03", bytes_slice(rfc_6979_point(), 1, 33)),
+      Raw,
+    ),
     None,
   );
   assert_eq(p256_peer(bytes_concat(b"\x04", repeat(b"\x00", 64))), None)
@@ -1027,13 +1242,13 @@ law "a signature verifies under its key, and under no other message or key"
   forall (material: Bytes, message: Bytes, which: Int) {
     let made_key = match (which & 0xFF) % 3 {
       0 -> ed25519_signing(keyed(material)),
-      1 -> ecdsa_p256_signing(keyed(material), Raw),
-      _ -> ecdsa_p256_signing(keyed(material), Der),
+      1 -> ecdsa_signing(NistP256, keyed(material), Raw),
+      _ -> ecdsa_signing(NistP256, keyed(material), Der),
     };
     let other = match (which & 0xFF) % 3 {
       0 -> ed25519_signing(keyed(bytes_concat(material, b"."))),
-      1 -> ecdsa_p256_signing(keyed(bytes_concat(material, b".")), Raw),
-      _ -> ecdsa_p256_signing(keyed(bytes_concat(material, b".")), Der),
+      1 -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Raw),
+      _ -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Der),
     };
     match made_key {
       None -> true,
@@ -1060,13 +1275,13 @@ law "a seed decides its key and every signature under it"
 
 law "a signature in one encoding is the other's, written again, and reads back"
   forall (material: Bytes, message: Bytes) {
-    match ecdsa_p256_signing(keyed(material), Raw) {
+    match ecdsa_signing(NistP256, keyed(material), Raw) {
       None -> true,
       Some(key) -> {
         let raw = sign(key, message);
-        raw_of_der(der_of_raw(raw)) == Some(raw)
+        raw_of_der(der_of_raw(raw), 32) == Some(raw)
           && Some(der_of_raw(raw))
-          == (match ecdsa_p256_signing(keyed(material), Der) {
+          == (match ecdsa_signing(NistP256, keyed(material), Der) {
             Some(der) -> Some(sign(der, message)),
             None -> None,
           })
@@ -1079,15 +1294,18 @@ test "a DER signature is read in its one writing" {
   let s = bytes_concat(repeat(b"\x00", 31), b"\x7f");
   let der = der_of_raw(bytes_concat(r, s));
   assert_eq(der, bytes_concat_all([hex"3026022100", r, hex"02017f"]));
-  assert_eq(raw_of_der(der), Some(bytes_concat(r, s)));
+  let read = |d: Bytes| raw_of_der(d, 32);
+  assert_eq(read(der), Some(bytes_concat(r, s)));
   // A missing sign byte, a padded number, a long-form length, trailing bytes, and a third number.
-  assert_eq(raw_of_der(bytes_concat_all([hex"30250220", r, hex"02017f"])), None);
-  assert_eq(raw_of_der(bytes_concat_all([hex"3027022100", r, hex"0202007f"])), None);
-  assert_eq(raw_of_der(bytes_concat_all([hex"308126022100", r, hex"02017f"])), None);
-  assert_eq(raw_of_der(bytes_concat(der, b"\x00")), None);
-  assert_eq(raw_of_der(bytes_concat_all([hex"3029022100", r, hex"02017f", hex"020101"])), None);
-  assert_eq(raw_of_der(hex"3000"), None);
-  assert_eq(raw_of_der(b""), None)
+  assert_eq(read(bytes_concat_all([hex"30250220", r, hex"02017f"])), None);
+  assert_eq(read(bytes_concat_all([hex"3027022100", r, hex"0202007f"])), None);
+  assert_eq(read(bytes_concat_all([hex"308126022100", r, hex"02017f"])), None);
+  assert_eq(read(bytes_concat(der, b"\x00")), None);
+  assert_eq(read(bytes_concat_all([hex"3029022100", r, hex"02017f", hex"020101"])), None);
+  assert_eq(read(hex"3000"), None);
+  assert_eq(read(b""), None);
+  // A half that fits one curve's scalar is too long for a smaller one's.
+  assert_eq(raw_of_der(der, 31), None)
 }
 
 // --- Agreement --------------------------------------------------------------

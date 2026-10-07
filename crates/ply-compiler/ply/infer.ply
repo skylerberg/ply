@@ -441,8 +441,9 @@ pub fn listing_ty() -> Type / {abort.raise} =
       ]),
     ),
   )
-/// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own,
-/// whose promises are checked here; a dependency's were checked when its package was.
+/// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own;
+/// a definition of any other is counted by what its row writes, whatever its body does, so its
+/// `bounded` promises were checked when its package was.
 pub type Known = {
   defs: Map<Bytes, KnownDef>,
   tests: Map<Bytes, List<Option<KnownTest>>>,
@@ -9065,22 +9066,22 @@ fn check_component(
   );
   let required: Checker = fold(range(0, len(comp)), settled, |c: Checker, slot: Int|
     require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
-  let kept: Checker = if required.module >= required.known.root { required } else {
-    fold(range(0, len(comp)), required, |c: Checker, slot: Int|
-      unwritten_divergence(
-        bounded_row(
-          kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)),
-          at(fns, at(comp, slot)),
-          at(sigs.sigs, slot),
-        ),
+  // Only the run's own definitions are counted off their bodies, so only they are held to `bounded`.
+  let kept: Checker = fold(range(0, len(comp)), required, |c: Checker, slot: Int|
+    unwritten_divergence(
+      bounded_row(
+        if c.module >= c.known.root { c }
+        else { kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)) },
         at(fns, at(comp, slot)),
         at(sigs.sigs, slot),
-        ending_of(slot),
-        |caller: Bytes|
-          fold(range(0, len(comp)), 0, |start: Int, k: Int|
-            if at(qualified, k) == caller { at(fns, at(comp, k)).span.start } else { start }),
-      ))
-  };
+      ),
+      at(fns, at(comp, slot)),
+      at(sigs.sigs, slot),
+      ending_of(slot),
+      |caller: Bytes|
+        fold(range(0, len(comp)), 0, |start: Int, k: Int|
+          if at(qualified, k) == caller { at(fns, at(comp, k)).span.start } else { start }),
+    ));
   let closed: Checker = fold(sigs.sigs, kept, |c: Checker, s: Signature|
     close_unreachable_row(c, s));
   let removed: Checker = fold(qualified, closed, |c: Checker, name: Bytes|
@@ -18231,6 +18232,28 @@ test "a group terminates when every loop through it descends, through a builtin'
     diverges(
       b"fn ping(n: Int) -> Int = pong(n)\nfn pong(n: Int) -> Int = if n <= 0 { 0 } else { ping(n) }\n",
       b"ping",
+    ),
+  )
+}
+
+test "a callback a recursion hands on in its own place is called as that recursion calls it" {
+  let tree = b"type T = | Node(Int, List<T>)\n";
+  let trav = b"fn trav(xs: List<T>, f: (T) -> Option<Int>, done: List<Int>) -> Option<List<Int>> = match xs { [] -> Some(done), [x, ..rest] -> match f(x) { None -> None, Some(y) -> trav(rest, f, push(done, y)) } }\n";
+  let total = b"fn total(t: T) -> Option<Int> = match t { Node(v, kids) -> match trav(kids, |k: T| total(k), []) { None -> None, Some(ys) -> Some(fold(ys, v, |a: Int, y: Int| a + y)) } }\n";
+  let src = bytes_concat_all([tree, trav, total]);
+  assert(!diverges(src, b"trav"));
+  assert(!diverges(src, b"total"));
+  // Handed on beside what is not a part of what this call was handed, it is called with that.
+  let grown = b"fn grown(xs: List<T>, ys: List<T>, f: (T) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { match ys { [] -> 0, [y, ..] -> f(y) + grown(xs, fold(xs, ys, |acc: List<T>, x: T| push(acc, x)), f, n - 1) } }\nfn through(t: T) -> Int = match t { Node(v, kids) -> v + grown(kids, kids, |k: T| through(k), 2) }\n";
+  assert(diverges(bytes_concat(tree, grown), b"through"));
+  // Handed on in another callback's place, it goes where the check does not follow.
+  let swapped = b"fn swapped(xs: List<T>, f: (T) -> Int, g: (T) -> Int) -> Int = match xs { [] -> 0, [x, ..rest] -> f(x) + swapped(rest, g, f) }\nfn through(t: T) -> Int = match t { Node(v, kids) -> v + swapped(kids, |k: T| through(k), |k: T| 0) }\n";
+  assert(diverges(bytes_concat(tree, swapped), b"through"));
+  // Called with a count that grows at every call, it is called with nothing known.
+  assert(
+    diverges(
+      b"fn counted(i: Int, n: Int, f: (Int) -> Int) -> Int = if i >= n { 0 } else { f(i) + counted(i + 1, n, f) }\nfn down(n: Int) -> Int = if n <= 0 { 0 } else { counted(0, n, |i: Int| down(i)) }\n",
+      b"down",
     ),
   )
 }

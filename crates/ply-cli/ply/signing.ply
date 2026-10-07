@@ -1,16 +1,18 @@
 //! Keys, and what a build's signature vouches for. A key is an Ed25519 seed in a file and its
-//! public half in another. A seed is plain where `ply keygen` draws it and writes its file, and a
-//! `Secret` from the moment one is read back. A signature is `std.signed`'s, detached in a file beside what it vouches
-//! for, so an artifact's digest is the same whoever signs it and however many do; a registry's
-//! attestation is signed the same way.
+//! public half in another. A seed is a `Secret` from the moment `ply keygen` draws it: its file is
+//! written through `fs.write_secret` and read back through `fs.read_secret`. A signature is
+//! `std.signed`'s, detached in a file beside what it vouches for, so an artifact's digest is the
+//! same whoever signs it and however many do; a registry's attestation is signed the same way.
 
 import std.bin
 import std.bytes (bytes_of_hex, hex_of)
 import std.ed25519
-import std.fs (fs, Dir, File, MemFs, mem_kind, mem_of, mem_read)
+import std.fs (fs, Dir, File, MemFs, mem_kind, mem_of, mem_read, mem_read_secret, mem_sealed,
+               on_mem)
 import std.path (resolve)
 import std.random (entropy)
 import compiler.resolve (Diag, error_at)
+import paths
 import sources (under_abs)
 import compiler.parsing (no_module)
 
@@ -22,8 +24,14 @@ fn secret_word() -> String = "ply-ed25519-secret"
 
 fn public_word() -> String = "ply-ed25519-public"
 
-pub fn secret_text(seed: Bytes) -> String / {abort.raise} =
-  secret_word() ++ " " ++ hex_of(seed) ++ "\n"
+fn secret_head() -> Bytes = bytes_of_string(secret_word() ++ " ")
+
+/// Writes `seed` as a secret key file's one line, the seed never a plain value.
+pub fn write_seed(
+  p: paths::Rooted,
+  seed: Secret<Bytes>,
+) -> Bool / {fs.write_secret[cwd], fs.write_secret[abs]} =
+  paths::write_secret(p, secret_head(), seed, "hex", b"\n")
 
 pub fn public_text(public: Bytes) -> String / {abort.raise} =
   public_word() ++ " " ++ hex_of(public) ++ "\n"
@@ -40,25 +48,30 @@ fn key_of(text: String, word: String) -> Result<Bytes, String> / {abort.raise} =
     _ -> Err("it is not one `" ++ word ++ " <hex>` line"),
   }
 
-/// The seed a secret key file holds, sealed.
-pub fn seed_of(text: String) -> Result<Secret<Bytes>, String> / {abort.raise} =
-  match key_of(text, secret_word()) { Ok(seed) -> Ok(secret_of_bytes(seed)), Err(why) -> Err(why) }
+/// The seed of the secret key file at `path`, read sealed, or why there is none: the file is one
+/// line, its newline optional, and nothing of it is a plain value of this program.
+pub fn read_seed(
+  path: String,
+) -> Result<Secret<Bytes>, Diag> / {fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
+  let at = paths::spelled(path);
+  let line = match paths::read_secret(at, secret_head(), "hex", b"\n") {
+    Some(seed) -> Some(seed),
+    None -> paths::read_secret(at, secret_head(), "hex", b""),
+  };
+  match line {
+    Some(seed) -> if secret_len(seed) == 32 { Ok(seed) }
+    else { Err(unkeyed(path, "does not hold a secret key: its key is not 64 hex digits")) },
+    None -> if paths::read_secret(at, bytes_of_string(public_word() ++ " "), "raw", b"") != None {
+      Err(unkeyed(path, "does not hold a secret key: it is a `" ++ public_word() ++ "` key"))
+    } else { Err(unkeyed(path, "is not there, or not one `" ++ secret_word() ++ " <hex>` line")) },
+  }
+}
 
 pub fn public_of(text: String) -> Result<Bytes, String> / {abort.raise} =
   key_of(text, public_word())
 
-/// Thirty-two bytes the operating system drew: seven of each 63-bit draw.
-pub fn fresh_seed() -> Bytes / {entropy.next, abort.raise} =
-  bytes_slice(
-    bytes_concat_all(
-      map(range(0, 5), |_i: Int| {
-        let n = entropy.next();
-        bytes_concat_all(map(range(0, 7), |k: Int| byte_of_int(n >>> 8 * k & 255)))
-      }),
-    ),
-    0,
-    32,
-  )
+/// Thirty-two bytes the operating system drew, sealed as they are drawn.
+pub fn fresh_seed() -> Secret<Bytes> / {entropy.secret} = entropy.secret(32)
 
 /// A key file that cannot be read, decoded or written.
 pub fn unkeyed(path: String, why: String) -> Diag =
@@ -180,32 +193,76 @@ pub fn a_seed(n: Int) -> Bytes / {abort.raise} =
 
 test "a key file names what it holds, and the other kind is refused" {
   let seed = a_seed(7);
-  assert_eq(seed_of(secret_text(seed)), Ok(secret_of_bytes(seed)));
+  let line = "ply-ed25519-secret " ++ hex_of(seed);
   let public = ed25519::public_key(secret_of_bytes(seed));
+  let disk = mem_of([
+    { path: "keys/line", body: bytes_of_string(line ++ "\n") },
+    { path: "keys/bare", body: bytes_of_string(line) },
+    { path: "keys/public", body: bytes_of_string(public_text(public)) },
+    { path: "keys/short", body: b"ply-ed25519-secret 00\n" },
+    {
+      path: "keys/upper",
+      body: bytes_of_string(secret_word() ++ " " ++ string_upper(hex_of(seed))),
+    },
+    { path: "keys/other", body: b"a seed\n" },
+  ]);
+  let read = |path: String|
+    handle {
+      match read_seed(path) {
+        Ok(seed) -> Ok(seed),
+        Err(d) -> Err(string_of_bytes_lossy(d.message)),
+      }
+    } with {
+      fs.read_secret[cwd](p, before, encoding, after) ->
+        mem_read_secret(disk, p, before, encoding, after),
+      fs.read_secret[abs](p, before, encoding, after) -> None,
+    };
+  assert(read("keys/line") == Ok(secret_of_bytes(seed)));
+  assert(read("keys/bare") == Ok(secret_of_bytes(seed)));
   assert_eq(public_of(public_text(public)), Ok(public));
-  assert(match public_of(secret_text(seed)) { Err(_) -> true, Ok(_) -> false });
-  assert(match seed_of(public_text(public)) { Err(_) -> true, Ok(_) -> false });
-  assert(match seed_of("ply-ed25519-secret 00") {
-    Err(why) -> string_contains(why, "64"),
-    Ok(_) -> false,
-  })
+  assert(match public_of(line) { Err(_) -> true, Ok(_) -> false });
+  let refused = |path: String, why: String|
+    read(path) == Err("the key file `" ++ path ++ "` " ++ why);
+  assert(refused("keys/public", "does not hold a secret key: it is a `ply-ed25519-public` key"));
+  assert(refused("keys/short", "does not hold a secret key: its key is not 64 hex digits"));
+  let unread = "is not there, or not one `ply-ed25519-secret <hex>` line";
+  assert(refused("keys/upper", unread) && refused("keys/other", unread));
+  assert(refused("keys/none", unread))
 }
 
-test "a fresh seed is thirty-two bytes of seven-byte draws" {
-  let drawn = with_cell[n](0) { c ->
+test "a key written is one sealed line its owner alone reads, and reads back as the seed" {
+  let seed = secret_of_bytes(a_seed(9));
+  let written = handle {
+    on_mem[cwd](mem_of([]), || {
+      let wrote = write_seed(paths::spelled("release.key"), seed);
+      let back = match read_seed("release.key") { Ok(s) -> Some(s), Err(_) -> None };
+      { wrote: wrote, back: back }
+    })
+  } with {
+    fs.read_secret[abs](p, before, encoding, after) -> None,
+    fs.write_secret[abs](p, before, secret, encoding, after) -> false,
+  };
+  assert(written.value.wrote && written.value.back == Some(seed));
+  assert(
+    mem_sealed(written.tree, "release.key")
+      == Some({ before: b"ply-ed25519-secret ", secret: seed, encoding: "hex", after: b"\n" }),
+  );
+  assert_eq(mem_read(written.tree, "release.key"), None)
+}
+
+test "a fresh seed is thirty-two bytes drawn sealed" {
+  let drawn = with_cell[asked](0) { c ->
     handle {
-      fresh_seed()
+      { seed: fresh_seed(), asked: cell_get(c) }
     } with {
-      entropy.next() -> {
-        cell_set(c, cell_get(c) + 1);
-        cell_get(c)
+      entropy.secret(n) -> {
+        cell_set(c, n);
+        secret_of_bytes(a_seed(n))
       },
     }
   };
-  assert_eq(bytes_len(drawn), 32);
-  assert_eq(bytes_at(drawn, 0), 1);
-  assert_eq(bytes_at(drawn, 7), 2);
-  assert_eq(bytes_at(drawn, 14), 3)
+  assert(drawn.seed == secret_of_bytes(a_seed(32)));
+  assert_eq(drawn.asked, 32)
 }
 
 fn commit_on(disk: MemFs, dir: String) -> String / {abort.raise} =

@@ -16,6 +16,7 @@ pub fn world_independent(value: &Value) -> bool {
             | Value::Decimal(_)
             | Value::Str(_)
             | Value::Bytes(_)
+            | Value::Secret(_)
             | Value::Unit => {}
             Value::Cell(_) | Value::Task(_) | Value::Chan(_) => return false,
             Value::List(items) => pending.extend(items.iter()),
@@ -28,7 +29,6 @@ pub fn world_independent(value: &Value) -> bool {
             }
             Value::Record(fields) => pending.extend(fields.values()),
             Value::Ctor { args, .. } => pending.extend(args.iter()),
-            Value::Secret(inner) => pending.push(inner),
             Value::Closure(closure) => match &closure.kind {
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
                 ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),

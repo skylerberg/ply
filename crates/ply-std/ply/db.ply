@@ -24,13 +24,30 @@
 //! its own statements, and an operation performed while two transactions are between statements is
 //! raised.
 //!
-//! A connection that fails is class `08`: `08001` it could not be opened, `08006` it broke, `08P01` a
-//! reply could not be read, `08003` the transaction's connection is gone and the transaction with it,
-//! and `08007` a `commit` whose outcome is unknown. A server that asks for a password when none was
-//! given is `28000`.
+//! A connection that fails is class `08`: `08001` it could not be opened, TLS included, `08006` it
+//! broke, `08P01` a reply could not be read, `08003` the transaction's connection is gone and the
+//! transaction with it, and `08007` a `commit` whose outcome is unknown. A server that asks for a
+//! password when none was given is `28000`. A connection string's `sslmode` decides whether every
+//! connection is secured, and a secured one is always verified (`Ssl`).
+//!
+//! `db.notify` is a statement like any other, on its transaction's connection, so the server delivers
+//! it when that commits. Listening is not: `db.listen` opens a connection of the driver's own, outside
+//! the pool and never inside a transaction, and `db.notified` waits on it, one task at a time. That
+//! connection can be lost, and what is notified while it is lost is lost with it, so the wait that
+//! opens a new one and listens again answers `Reconnected` before anything heard after: a program
+//! that keeps state from notifications reads it afresh there. The wait is an operation rather than
+//! a `std.seq` sequence because each wait needs a deadline of its own and changes the listener (its
+//! buffer, its connection) in a way a sequence pulled again from its start would repeat.
+//!
+//! `copy_into` and `copy_from` move rows with `COPY` in its text format, the values as text as every
+//! statement's are: in, a sequence of rows sent a chunk at a time and kept whole or not at all; out,
+//! a sequence of the rows a statement answers, read a page at a time. Each holds its connection, a
+//! transaction's or one of the pool's, until it ends; `db.copy_in`, `db.copy_rows`, `db.copy_end`,
+//! `db.copy_out` and `db.copy_take` are the operations under them.
 //!
 //! `MemDb` is the in-memory twin: `open` a schema, then `step`, `begin_step`, `commit_step` and
-//! `abort_step` answer what a server would.
+//! `abort_step` answer what a server would, and `notify_step`, `listen_step`, `unlisten_step`,
+//! `notified_step` and `cut_step` what its notifications would. It holds no copy.
 
 import std.bytes (u32_be, u32_be_at, is_digit, cstring, peek)
 import std.json
@@ -38,7 +55,9 @@ import std.net (net)
 import std.random (entropy, nonce)
 import std.pg
 import std.string
-import std.list (concat, contains, drop_last)
+import std.list (concat, contains, drop_last, find)
+import std.seq
+import std.seq (Seq, Done, Skip, Yield, seq)
 import std.bytes
 import std.option (option_unwrap_or)
 import std.result (result_map, result_map_err)
@@ -61,7 +80,51 @@ pub nondet effect db {
   write abort() -> Answer
   /// Handled by `transaction`, never by the host: a host binding for it is a defect.
   write rollback(reason: String) -> Unit
+  /// Notifies the channel `c` with `payload`: every session listening on `c` hears it once the
+  /// transaction this is performed in commits, at once outside one, and never if the transaction
+  /// rolls back. Two with one payload in one transaction are heard once. A payload of 8000 bytes or
+  /// more is `22023`.
+  write notify[c](payload: String) -> Answer
+  /// Listens on the channel `c`, on a connection of its own outside the pool that `notified`
+  /// reads.
+  write listen[c]() -> Answer
+  /// Stops listening on the channel `c`.
+  write unlisten[c]() -> Answer
+  /// The next notification on a channel the program listens on, waiting at most `timeout_ms` for
+  /// one, or what became of the connection it is heard on. One task waits at a time.
+  write notified(timeout_ms: Int) -> Notice
+  /// Begins copying rows into the `columns` of table `t` with `COPY`, answering the copy's number.
+  /// Inside a transaction it runs on the transaction's connection, which runs nothing else until
+  /// the copy ends; outside one it holds a connection of the pool's until then.
+  write copy_in[t](columns: List<String>) -> Result<Int, DbError>
+  /// Sends rows to a copy `copy_in` began, each its columns' values in order.
+  write copy_rows[t](copy: Int, rows: List<List<Param>>) -> Result<Unit, DbError>
+  /// Ends a copy. A copy in with `None` keeps every row it was sent and answers how many; with
+  /// `Some(why)` the server keeps none of them and the answer is its refusal, `57014`, which is also
+  /// how a row the server could not take refuses it. A copy out reads and drops what was not taken,
+  /// and answers how many rows were, or what failed it.
+  write copy_end[t](copy: Int, failure: Option<String>) -> Result<Int, DbError>
+  /// Begins copying the rows the statement `s` answers out of the server with `COPY`, answering the
+  /// copy's number. It holds a connection as `copy_in` does.
+  read copy_out[t](s: Stmt) -> Result<Int, DbError>
+  /// At most `rows` more rows of a copy out, as `query` would have answered them; none once the
+  /// server has sent every row or the copy failed, which `copy_end` then says.
+  read copy_take[t](copy: Int, rows: Int) -> Result<List<Row>, DbError>
 }
+
+/// What a wait for a notification answers.
+pub type Notice =
+  /// A notification on a channel the program listens on.
+  | Notified(pg::Notification)
+  /// The listening connection was lost and a new one listens again on every channel. A
+  /// notification sent in between was lost, so a program that keeps state from them reads it
+  /// afresh.
+  | Reconnected
+  /// The listening connection is lost and a new one could not be opened, for this reason; the next
+  /// wait tries again, and answers `Reconnected` once one is.
+  | Unheard(DbError)
+  /// Nothing arrived before the deadline.
+  | Quiet
 
 /// A transaction's isolation level, as postgres names them.
 pub type Isolation = | ReadCommitted | RepeatableRead | Serializable
@@ -164,6 +227,106 @@ fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
 
 /// A serialization failure or a deadlock: the server is asking the program to retry.
 pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
+
+// --- Copying ------------------------------------------------------------------------
+
+/// Copies `rows` into the `columns` of table `t` with `COPY`, sending them a chunk of at most `chunk`
+/// rows at a time, so no more than one chunk is held, and answers how many rows the server took.
+/// The rows are pulled as they are sent, within `budget` elements and skips. The copy keeps every
+/// row or none: a chunk refused, the budget spent (`seq.spent`) or a raise out of a pull fails it
+/// with `CopyFail` before the raise goes on.
+pub fn copy_into<[t] | e>(
+  columns: List<String>,
+  rows: Seq<List<Param> | e>,
+  chunk: Int,
+  budget: Int,
+) -> Result<Int, DbError> / {db.copy_in[t], db.copy_rows[t], db.copy_end[t], seq.spent | e} =
+  match db.copy_in[t](columns) {
+    Err(e) -> Err(e),
+    Ok(id) -> with_cell[sending](false) { closed ->
+      bracket(
+        || (),
+        |u: Unit|
+          if !cell_get(closed) {
+            db.copy_end[t](id, Some("the rows stopped short of their end"));
+            ()
+          },
+        |u: Unit|
+          match sent_chunks[t](id, rows, max(chunk, 1), budget, budget, []) {
+            Err(e) -> Err(e),
+            Ok(_) -> {
+              cell_set(closed, true);
+              db.copy_end[t](id, None)
+            },
+          },
+      )
+    },
+  }
+
+/// What is left of `s` pulled and sent, `held` the rows of the chunk not yet sent.
+fn sent_chunks<[t] | e>(
+  id: Int,
+  s: Seq<List<Param> | e>,
+  chunk: Int,
+  budget: Int,
+  left: Int,
+  held: List<List<Param>>,
+) -> Result<Unit, DbError> / {db.copy_rows[t], seq.spent | e} =
+  match s() {
+    Done -> if len(held) == 0 { Ok(()) } else { db.copy_rows[t](id, held) },
+    Skip(rest) -> if left <= 0 { seq.spent(budget) }
+    else { sent_chunks[t](id, rest, chunk, budget, left - 1, held) },
+    Yield(row, rest) -> if left <= 0 { seq.spent(budget) } else {
+      let more = push(held, row);
+      if len(more) < chunk { sent_chunks[t](id, rest, chunk, budget, left - 1, more) } else {
+        match db.copy_rows[t](id, more) {
+          Err(e) -> Err(e),
+          Ok(_) -> sent_chunks[t](id, rest, chunk, budget, left - 1, []),
+        }
+      }
+    },
+  }
+
+/// The rows the statement `s` answers, copied out of the server with `COPY` and handed to `body` as
+/// a sequence whose pulls read them `page` at a time, so no more than a page is held. Each row is
+/// what `query` would have answered. The copy ends when `body` returns, what it did not pull read
+/// and dropped; the answer is `body`'s, or what failed the copy, which ends the sequence early.
+pub fn copy_from<a, [t] | e>(
+  s: Stmt,
+  page: Int,
+  body: (Seq<Row | {db.copy_take[t]}>) -> a / e,
+) -> Result<a, DbError> / {db.copy_out[t], db.copy_take[t], db.copy_end[t] | e} =
+  match db.copy_out[t](s) {
+    Err(e) -> Err(e),
+    Ok(id) -> with_cell[receiving](false) { closed ->
+      bracket(
+        || (),
+        |u: Unit|
+          if !cell_get(closed) {
+            db.copy_end[t](id, None);
+            ()
+          },
+        |u: Unit| {
+          let answer = body(paged[t](id, max(page, 1), [], 4611686018427387903));
+          cell_set(closed, true);
+          match db.copy_end[t](id, None) { Err(e) -> Err(e), Ok(_) -> Ok(answer) }
+        },
+      )
+    },
+  }
+
+/// A copy out's rows, `held` the ones a page brought that are not yet pulled.
+fn paged<[t]>(id: Int, page: Int, held: List<Row>, fuel: Int) -> Seq<Row | {db.copy_take[t]}> =
+  ||
+    match held {
+      [row, ..rest] -> Yield(row, paged[t](id, page, rest, fuel)),
+      [] -> if fuel <= 0 { Done } else {
+        match db.copy_take[t](id, page) {
+          Ok(rows) -> if len(rows) == 0 { Done } else { Skip(paged[t](id, page, rows, fuel - 1)) },
+          Err(_) -> Done,
+        }
+      },
+    }
 
 // --- Batching ----------------------------------------------------------------------
 
@@ -771,21 +934,34 @@ fn last<a>(xs: List<a>) -> Option<a> = match xs { [] -> None, [h] -> Some(h), [_
 /// A table of the twin and the rows it holds.
 pub type MemTable = { def: Table, rows: List<Row> }
 
-/// One entry per open scope.
-pub type Frame = { tables: List<MemTable>, failed: Bool, level: Isolation, access: Access }
+/// One entry per open scope: what the scope began with, which a rollback to it restores.
+pub type Frame = {
+  tables: List<MemTable>,
+  failed: Bool,
+  level: Isolation,
+  access: Access,
+  pending: List<pg::Notification>,
+}
 
-/// The in-memory twin of a database: its tables, sequences, and the transaction scopes open on it.
+/// The program's listener in the twin: the channels it listens on, what was delivered to it and not
+/// yet taken, and whether its connection was cut, which the next wait answers `Reconnected` for.
+pub type MemListener = { channels: List<String>, inbox: List<pg::Notification>, cut: Bool }
+
+/// The in-memory twin of a database: its tables, sequences, the transaction scopes open on it, the
+/// notifications the open transaction will deliver when it commits, and the program's listener.
 pub type MemDb = {
   tables: List<MemTable>,
   sequences: Map<String, Int>,
   stack: List<Frame>,
   failed: Bool,
+  pending: List<pg::Notification>,
+  listener: MemListener,
 }
 
 /// The twin after an operation, and what the operation answered.
 pub type Outcome = { db: MemDb, out: Answer }
 
-/// An empty twin of a schema, every sequence at zero.
+/// An empty twin of a schema, every sequence at zero, nothing listened to.
 pub fn open(s: Schema) -> MemDb =
   {
     tables: map(s.tables, |t: Table| { def: t, rows: [] }),
@@ -793,17 +969,20 @@ pub fn open(s: Schema) -> MemDb =
       map_insert(acc, n, 0)),
     stack: [],
     failed: false,
+    pending: [],
+    listener: { channels: [], inbox: [], cut: false },
   }
 
 fn memdb(
+  db: MemDb,
   tables: List<MemTable>,
   sequences: Map<String, Int>,
   stack: List<Frame>,
   failed: Bool,
-) -> MemDb = { tables: tables, sequences: sequences, stack: stack, failed: failed }
+) -> MemDb = { ..db, tables: tables, sequences: sequences, stack: stack, failed: failed }
 
 fn mark_failed(db: MemDb) -> MemDb =
-  if len(db.stack) == 0 { db } else { memdb(db.tables, db.sequences, db.stack, true) }
+  if len(db.stack) == 0 { db } else { memdb(db, db.tables, db.sequences, db.stack, true) }
 
 fn fail(db: MemDb, e: DbError) -> Outcome = { db: mark_failed(db), out: Failed(e) }
 
@@ -2646,7 +2825,7 @@ fn insert_build(
     { seqs: db.sequences, rows: [], err: None },
     |acc: Build, exprs: List<Expr>| build_tuple(mt.def, cols, exprs, ps, acc),
   );
-  let advanced = memdb(db.tables, b.seqs, db.stack, db.failed);
+  let advanced = memdb(db, db.tables, b.seqs, db.stack, db.failed);
   match b.err { Some(e) -> fail(advanced, e), None -> insert_rows(advanced, mt, b.rows, q) }
 }
 
@@ -2763,7 +2942,7 @@ fn insert_rows(db: MemDb, mt: MemTable, rows: List<Row>, q: InsertQ) -> Outcome 
         Some(e) -> fail(db, e),
         None ->
           finish_write(
-            memdb(tables, db.sequences, db.stack, db.failed),
+            memdb(db, tables, db.sequences, db.stack, db.failed),
             rows,
             q.returning,
             len(rows),
@@ -2954,7 +3133,7 @@ fn finish_update(db: MemDb, mt: MemTable, acc: UpAcc, q: UpdateQ) -> Outcome / {
         Some(e) -> fail(db, e),
         None ->
           finish_write(
-            memdb(tables, db.sequences, db.stack, db.failed),
+            memdb(db, tables, db.sequences, db.stack, db.failed),
             map(acc.changed, |c: Changed| c.row),
             q.returning,
             len(acc.changed),
@@ -2995,7 +3174,7 @@ fn exec_delete(db: MemDb, q: DeleteQ, ps: List<Param>) -> Outcome / {abort.raise
               Some(e) -> fail(db, e),
               None ->
                 finish_write(
-                  memdb(tables, db.sequences, db.stack, db.failed),
+                  memdb(db, tables, db.sequences, db.stack, db.failed),
                   acc.gone,
                   q.returning,
                   len(acc.gone),
@@ -3039,9 +3218,15 @@ fn delete_walk(
 
 /// A refused `begin` does not abort the transaction it is nested inside.
 pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
-  let frame = { tables: db.tables, failed: false, level: level, access: access };
+  let frame = {
+    tables: db.tables,
+    failed: false,
+    level: level,
+    access: access,
+    pending: db.pending,
+  };
   match list_at(db.stack, 0) {
-    None -> done(memdb(db.tables, db.sequences, [frame], false), Count(0)),
+    None -> done(memdb(db, db.tables, db.sequences, [frame], false), Count(0)),
     Some(outer) -> match nested_refusal(
         db.failed,
         len(db.stack),
@@ -3051,7 +3236,7 @@ pub fn begin_step(db: MemDb, level: Isolation, access: Access) -> Outcome = {
         access,
       ) {
       Some(e) -> fail_open(db, e),
-      None -> done(memdb(db.tables, db.sequences, push(db.stack, frame), db.failed), Count(0)),
+      None -> done(memdb(db, db.tables, db.sequences, push(db.stack, frame), db.failed), Count(0)),
     },
   }
 }
@@ -3116,30 +3301,130 @@ pub fn isolation_name(a: Isolation) -> String =
     Serializable -> "serializable",
   }
 
-/// Committing an aborted transaction is `25P02`, stricter on purpose than the bare server.
+/// Committing an aborted transaction is `25P02`, stricter on purpose than the bare server. A
+/// transaction that commits delivers what it notified; one that does not, nothing of it.
 pub fn commit_step(db: MemDb) -> Outcome =
   match last(db.stack) {
     None -> fail_open(db, no_transaction("`db.commit`")),
     Some(frame) -> if len(db.stack) == 1 {
       if db.failed {
-        { db: memdb(frame.tables, db.sequences, [], false), out: Failed(in_failed_txn()) }
-      } else { done(memdb(db.tables, db.sequences, [], false), Count(0)) }
+        {
+          db: { ..memdb(db, frame.tables, db.sequences, [], false), pending: frame.pending },
+          out: Failed(in_failed_txn()),
+        }
+      } else {
+        done(
+          delivered({ ..memdb(db, db.tables, db.sequences, [], false), pending: [] }, db.pending),
+          Count(0),
+        )
+      }
     } else if db.failed {
       // A failed `commit` closes and rolls back its scope, as the driver does.
       {
-        db: memdb(frame.tables, db.sequences, drop_last(db.stack, 1), true),
+        db: {
+          ..memdb(db, frame.tables, db.sequences, drop_last(db.stack, 1), true),
+          pending: frame.pending,
+        },
         out: Failed(in_failed_txn()),
       }
-    } else { done(memdb(db.tables, db.sequences, drop_last(db.stack, 1), db.failed), Count(0)) },
+    } else {
+      done(memdb(db, db.tables, db.sequences, drop_last(db.stack, 1), db.failed), Count(0))
+    },
   }
 
-/// `db.abort` on the twin: the innermost scope's changes undone.
+/// `db.abort` on the twin: the innermost scope's changes undone, and what it notified with them.
 pub fn abort_step(db: MemDb) -> Outcome =
   match last(db.stack) {
     None -> fail_open(db, no_transaction("`db.abort`")),
     Some(frame) ->
-      done(memdb(frame.tables, db.sequences, drop_last(db.stack, 1), frame.failed), Count(0)),
+      done(
+        {
+          ..memdb(db, frame.tables, db.sequences, drop_last(db.stack, 1), frame.failed),
+          pending: frame.pending,
+        },
+        Count(0),
+      ),
   }
+
+// --- Notifications, on the twin --------------------------------------------------
+
+/// The twin with `notes` heard by its listener: each on a channel it listens on goes to its inbox,
+/// and the rest are dropped, as is every one while its connection is cut.
+fn delivered(db: MemDb, notes: List<pg::Notification>) -> MemDb =
+  if db.listener.cut { db } else {
+    {
+      ..db,
+      listener: {
+        ..db.listener,
+        inbox: fold(
+          notes,
+          db.listener.inbox,
+          |inbox: List<pg::Notification>, n: pg::Notification|
+            if contains(db.listener.channels, n.channel) { push(inbox, n) } else { inbox },
+        ),
+      },
+    }
+  }
+
+/// The most bytes a notification's payload may hold, short of the 8000 postgres refuses.
+pub fn max_payload() -> Int = 7999
+
+/// `db.notify[channel]` on the twin: queued until the transaction commits, delivered at once outside
+/// one, and once however often one transaction sends it. A notification's sender is `0`: the twin is
+/// no server process.
+pub fn notify_step(db: MemDb, channel: String, payload: String) -> Outcome / {abort.raise} =
+  if db.failed { fail(db, in_failed_txn()) }
+  else if bytes_len(bytes_of_string(payload)) > max_payload() {
+    fail(db, db_error("22023", "", "payload string too long"))
+  } else {
+    let n = { sender: 0, channel: channel, payload: payload };
+    if len(db.stack) == 0 { done(delivered(db, [n]), Count(1)) }
+    else if contains(db.pending, n) { done(db, Count(1)) }
+    else { done({ ..db, pending: push(db.pending, n) }, Count(1)) }
+  }
+
+/// `db.listen[channel]` on the twin: from now on, what is notified on it is heard.
+pub fn listen_step(db: MemDb, channel: String) -> Outcome =
+  if contains(db.listener.channels, channel) { done(db, Count(0)) } else {
+    done(
+      { ..db, listener: { ..db.listener, channels: push(db.listener.channels, channel) } },
+      Count(0),
+    )
+  }
+
+/// `db.unlisten[channel]` on the twin; what was already heard on it stays to be taken.
+pub fn unlisten_step(db: MemDb, channel: String) -> Outcome =
+  done(
+    {
+      ..db,
+      listener: { ..db.listener, channels: filter(db.listener.channels, |c: String| c != channel) },
+    },
+    Count(0),
+  )
+
+/// The twin after a wait for a notification, and what the wait answered.
+pub type Waited = { db: MemDb, notice: Notice }
+
+/// `db.notified` on the twin: `Reconnected` after a cut, which listens again; otherwise the oldest
+/// notification heard, or `Quiet` at once, since nothing in the twin waits. A wait with nothing
+/// listened to panics, as the driver does.
+pub fn notified_step(db: MemDb) -> Waited / {abort.raise} =
+  if len(db.listener.channels) == 0 { panic(nothing_listened()) } else if db.listener.cut {
+    { db: { ..db, listener: { ..db.listener, cut: false } }, notice: Reconnected }
+  } else {
+    match db.listener.inbox {
+      [oldest, ..later] ->
+        { db: { ..db, listener: { ..db.listener, inbox: later } }, notice: Notified(oldest) },
+      [] -> { db: db, notice: Quiet },
+    }
+  }
+
+/// The twin with its listener's connection cut: what was heard and not taken is lost, and so is
+/// everything notified until the next wait listens again.
+pub fn cut_step(db: MemDb) -> MemDb = { ..db, listener: { ..db.listener, inbox: [], cut: true } }
+
+fn nothing_listened() -> String =
+  "`db.notified` waits on the channels `db.listen` named, and there are none"
 
 fn no_transaction(what: String) -> DbError =
   db_error("25P01", "", what ++ " with no transaction open")
@@ -3526,6 +3811,152 @@ test "a parameter numbered past the ones given, or below one, is refused" {
   assert_eq(t_code(t_out(d, "insert into part (sku, price) values ($0, 1)", [PText("a")])), "42P02")
 }
 
+fn t_heard(channel: String, payload: String) -> Notice =
+  Notified({ sender: 0, channel: channel, payload: payload })
+
+fn t_listening() -> MemDb = listen_step(open({ tables: [] }), "jobs").db
+
+fn t_notified(db: MemDb, payload: String) -> MemDb / {abort.raise} =
+  notify_step(db, "jobs", payload).db
+
+fn t_begun(db: MemDb) -> MemDb = begin_step(db, ReadCommitted, ReadWrite).db
+
+test "the twin delivers a notification when its transaction commits, and never when it rolls back" {
+  let queued = t_notified(t_notified(t_begun(t_listening()), "a"), "a");
+  assert_eq(notified_step(queued).notice, Quiet);
+  let others = notify_step(queued, "audit", "x").db;
+  let committed = notified_step(commit_step(others).db);
+  // Two with one payload in one transaction are heard once, and a channel nobody hears is dropped.
+  assert_eq(committed.notice, t_heard("jobs", "a"));
+  assert_eq(notified_step(committed.db).notice, Quiet);
+  let rolled = abort_step(t_notified(t_begun(committed.db), "b")).db;
+  assert_eq(notified_step(rolled).notice, Quiet);
+  let now = t_notified(rolled, "c");
+  assert_eq(notified_step(now).notice, t_heard("jobs", "c"))
+}
+
+test "a savepoint rolled back takes back what it notified, and leaves what the transaction did" {
+  let outer = t_notified(t_begun(t_listening()), "kept");
+  let inner = abort_step(t_notified(t_begun(outer), "undone")).db;
+  let first = notified_step(commit_step(inner).db);
+  assert_eq(first.notice, t_heard("jobs", "kept"));
+  assert_eq(notified_step(first.db).notice, Quiet)
+}
+
+test "a notification the twin refuses is refused as the server refuses it" {
+  let long = string_of_bytes(bytes_concat_all(map(range(0, 8000), |i: Int| b"x")));
+  assert_eq(t_code(notify_step(t_listening(), "jobs", long).out), "22023");
+  let failed = t_run(t_begun(t_listening()), "select * from missing", []).db;
+  assert_eq(t_code(notify_step(failed, "jobs", "x").out), "25P02")
+}
+
+test "a cut listener loses what it held and what is sent until its next wait, which says so" {
+  let held = t_notified(t_listening(), "before");
+  let cut = cut_step(held);
+  let lost = t_notified(cut, "during");
+  let back = notified_step(lost);
+  assert_eq(back.notice, Reconnected);
+  assert_eq(notified_step(back.db).notice, Quiet);
+  let after = notified_step(t_notified(back.db, "after"));
+  assert_eq(after.notice, t_heard("jobs", "after"));
+  let unheard = unlisten_step(after.db, "jobs").db;
+  assert_eq(unheard.listener.channels, []);
+  assert_eq(t_notified(unheard, "gone").listener.inbox, [])
+}
+
+/// What cuts the listener's connection in a law's run.
+effect outage {
+  write cut() -> Unit
+}
+
+/// `body` over a twin of no tables, its transactions, notifications on `jobs` and outages answered
+/// from the twin.
+fn on_twin<a | e>(
+  body: () -> a / {db.begin, db.commit, db.abort, db.notify[jobs], db.listen[jobs], db.notified, outage.cut | e},
+) -> a / {abort.raise | e} =
+  with_cell[twin](open({ tables: [] })) { t -> {
+    let stepped = |o: Outcome| {
+      cell_set(t, o.db);
+      o.out
+    };
+    handle {
+      body()
+    } with {
+      db.begin(level, access) -> stepped(begin_step(cell_get(t), level, access)),
+      db.commit() -> stepped(commit_step(cell_get(t))),
+      db.abort() -> stepped(abort_step(cell_get(t))),
+      db.notify[jobs](payload) -> stepped(notify_step(cell_get(t), "jobs", payload)),
+      db.listen[jobs]() -> stepped(listen_step(cell_get(t), "jobs")),
+      db.notified(timeout_ms) -> {
+        let w = notified_step(cell_get(t));
+        cell_set(t, w.db);
+        w.notice
+      },
+      outage.cut() -> cell_set(t, cut_step(cell_get(t))),
+    }
+  } }
+
+/// How often something happens in a law's run: a domain small enough to search whole.
+type Times = | Never | Once | Twice
+
+fn times(t: Times) -> Int = match t { Never -> 0, Once -> 1, Twice -> 2 }
+
+/// `waits` waits, each followed by a yield, and what each answered.
+fn t_waits(waits: Int) -> List<Notice> / {db.notified, task.yield} =
+  fold(range(0, waits), [], |heard: List<Notice>, i: Int| {
+    let n = db.notified(100);
+    task.yield();
+    push(heard, n)
+  })
+
+/// Whether the notifications `0` to `sent - 1` were heard in order, each one missing told by a
+/// `Reconnected` between the last one heard before it and the next one heard after it, or at the end.
+fn announced(heard: List<Notice>, sent: Int) -> Bool / {abort.raise} = {
+  let walked = fold(
+    heard,
+    { next: 0, warned: false, ok: true },
+    |at: { next: Int, warned: Bool, ok: Bool }, n: Notice|
+      match n {
+        Reconnected -> { ..at, warned: true },
+        Notified(note) -> match string::int_of_string(note.payload) {
+          Some(i) -> if i == at.next { { next: i + 1, warned: false, ok: at.ok } }
+          else if i > at.next && at.warned { { next: i + 1, warned: false, ok: at.ok } }
+          else { { ..at, ok: false } },
+          None -> { ..at, ok: false },
+        },
+        _ -> at,
+      },
+  );
+  walked.ok && (walked.next == sent || walked.warned)
+}
+
+law "a listener over the twin hears what is committed while it listens, in order, and is told of every loss, in every interleaving"
+  forall (sent: Times, cut: Times) {
+    simulate {
+      let n = times(sent) + 1;
+      let heard = on_twin(|| {
+        db.listen[jobs]();
+        let notifier = task.spawn(||
+          fold(range(0, n), (), |u: Unit, i: Int| {
+            transaction(ReadCommitted, ReadWrite, || db.notify[jobs](int_to_string(i)));
+            task.yield()
+          }));
+        let cutter = task.spawn(||
+          fold(range(0, times(cut)), (), |u: Unit, i: Int| {
+            task.yield();
+            outage.cut()
+          }));
+        let early = t_waits(n + 1);
+        task.join(notifier);
+        task.join(cutter);
+        concat(early, t_waits(n + 2))
+      });
+      let delivered = filter(heard, |h: Notice| match h { Notified(_) -> true, _ -> false });
+      announced(heard, n)
+        && (cut != Never || (len(delivered) == n && !contains(heard, Reconnected)))
+    }
+  }
+
 // --- A live server ---------------------------------------------------------------
 //
 // The effect's own handler, over `std.pg`. A perform names its label — the table — and a clause
@@ -3533,11 +3964,20 @@ test "a parameter numbered past the ones given, or below one, is refused" {
 // pool, the transaction scope, the text of every value and the tables a statement names. What is
 // left to the host is `net`.
 
+/// Whether the driver's connections are secured: not at all; with TLS after asking the server, as
+/// `sslmode=require`, `verify-ca` and `verify-full` ask; or with TLS at once, as
+/// `sslnegotiation=direct` asks of a server from Postgres 17 on. Whenever TLS is asked for, the
+/// server's certificate is verified for the host as `verify-full` verifies it, against the built-in
+/// roots and `--trust`: `std.net` has no handshake that skips verification, so `require` and
+/// `verify-ca` here are `verify-full`, never libpq's weaker readings of them.
+pub type Ssl = | Disabled | Negotiated | Immediate
+
 /// Where the driver connects, and what each connection starts with; `server` makes one with no
 /// settings, and `server_of` reads one from a connection string.
 pub type Server = {
   host: String,
   port: Int,
+  ssl: Ssl,
   user: String,
   database: String,
   password: Option<String>,
@@ -3551,7 +3991,7 @@ pub type Server = {
   client: pg::Client,
 }
 
-/// A server with none of the start-up settings.
+/// A server reached in plaintext, with none of the start-up settings.
 pub fn server(
   host: String,
   port: Int,
@@ -3562,6 +4002,7 @@ pub fn server(
   {
     host: host,
     port: port,
+    ssl: Disabled,
     user: user,
     database: database,
     password: password,
@@ -3592,7 +4033,8 @@ type Link = { n: Int, session: pg::Session }
 
 /// A transaction on connection `n`: `session` is `None` once the connection is lost, which ended the
 /// transaction on the server; `depth` counts the transaction and its savepoints; `level` and
-/// `access` are its outermost `begin`'s; `busy` while one of its operations is on the wire.
+/// `access` are its outermost `begin`'s; `busy` while one of its operations is on the wire;
+/// `copying` while a copy holds its connection, which then runs nothing else.
 type Scope = {
   n: Int,
   session: Option<pg::Session>,
@@ -3600,10 +4042,49 @@ type Scope = {
   level: Isolation,
   access: Access,
   busy: Bool,
+  copying: Bool,
 }
 
-/// `opened` counts the connections open, which `size` bounds, and `made` every one ever opened.
-type Pool = { idle: List<Link>, opened: Int, made: Int, open: List<Scope> }
+/// A copy under way, numbered `id`, on connection `n`: its session, `None` while one of its
+/// operations is on the wire or once the server has sent all of a copy out; whether the connection
+/// is a transaction's; and for a copy out, the columns its rows are read as, what has arrived of
+/// rows not yet taken, whether the server has sent every one, how many were taken, and what failed
+/// it, if anything did.
+type Copy = {
+  id: Int,
+  n: Int,
+  session: Option<pg::Session>,
+  within: Bool,
+  out: Bool,
+  columns: List<pg::Column>,
+  pending: Bytes,
+  done: Bool,
+  taken: Int,
+  failed: Option<DbError>,
+}
+
+/// The listening connection: its session, `None` until one is opened and once it is lost; the
+/// channels it listens on; whether a wait is on the wire; and whether it was lost, which the wait
+/// that opens a new one answers `Reconnected` for.
+type Listener = {
+  session: Option<pg::Session>,
+  channels: List<String>,
+  waiting: Bool,
+  lost: Bool,
+  made: Int,
+}
+
+/// `opened` counts the connections open, which `size` bounds, and `made` every one ever opened;
+/// `copied` numbers the copies begun. The listener's connection is not the pool's.
+type Pool = {
+  idle: List<Link>,
+  opened: Int,
+  made: Int,
+  open: List<Scope>,
+  copies: List<Copy>,
+  copied: Int,
+  listener: Listener,
+}
 
 // --- The text of a value ---------------------------------------------------------
 
@@ -3830,10 +4311,19 @@ fn pool_busy(size: Int) -> DbError =
   db_error("53300", "", "the pool of " ++ int_to_string(size) ++ " connection(s) is busy")
 
 fn within(p: Pool, scope: Scope) -> Decided =
-  match scope.session {
-    None -> { pool: p, plan: Answered(Failed(connection_lost())) },
-    Some(session) -> { pool: busy(p, scope.n), plan: Within(scope, session) },
+  if scope.copying { { pool: p, plan: Answered(Failed(copy_holds())) } } else {
+    match scope.session {
+      None -> { pool: p, plan: Answered(Failed(connection_lost())) },
+      Some(session) -> { pool: busy(p, scope.n), plan: Within(scope, session) },
+    }
   }
+
+fn copy_holds() -> DbError =
+  db_error(
+    "55000",
+    "",
+    "a copy holds this transaction's connection, which runs nothing else until the copy ends",
+  )
 
 fn busy(p: Pool, n: Int) -> Pool =
   { ..p, open: map(p.open, |s: Scope| if s.n == n { { ..s, busy: true } } else { s }) }
@@ -3877,9 +4367,11 @@ fn for_close(p: Pool, what: String, lost: Answer) -> ToClose / {abort.raise} =
   match route(p.open) {
     Ambiguous -> panic(ambiguous(what)),
     NoTransaction -> { pool: p, closing: Settled(Failed(no_transaction(what))) },
-    Own(scope) -> match scope.session {
-      None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Settled(lost) },
-      Some(session) -> { pool: busy(p, scope.n), closing: Closes(scope, session) },
+    Own(scope) -> if scope.copying { { pool: p, closing: Settled(Failed(copy_holds())) } } else {
+      match scope.session {
+        None -> { pool: { ..p, open: without_scope(p.open, scope) }, closing: Settled(lost) },
+        Some(session) -> { pool: busy(p, scope.n), closing: Closes(scope, session) },
+      }
     },
   }
 
@@ -3914,6 +4406,8 @@ fn client_error(e: pg::ClientError) -> DbError =
     pg::Rejected(_, s) -> server_error(s),
     pg::Refused(s) -> server_error(s),
     pg::Unreachable -> db_error("08001", "", pg::client_error_text(e)),
+    pg::Declined -> db_error("08001", "", pg::client_error_text(e)),
+    pg::Unsecured(_) -> db_error("08001", "", pg::client_error_text(e)),
     pg::Unexpected(what) -> db_error("08P01", "", what),
     _ -> db_error("08006", "", pg::client_error_text(e)),
   }
@@ -5843,16 +6337,25 @@ fn control(
 ) -> Result<pg::Reply, pg::ClientError> / {net.send[link], net.recv[link], abort.raise, diverges} =
   pg::simple_query[link](session, sql, cfg.client)
 
+/// How a connection to `cfg` is secured: verified as the host it was told to reach.
+fn tls_of(cfg: Server) -> pg::Tls =
+  match cfg.ssl {
+    Disabled -> pg::NoTls,
+    Negotiated -> pg::Requested(cfg.host),
+    Immediate -> pg::Direct(cfg.host),
+  }
+
 fn linked(
   cfg: Server,
   nonce: String,
   c: Claim,
-) -> Result<Link, DbError> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+) -> Result<Link, DbError> / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match c {
     Idle(l) -> Ok(l),
     Fresh(n) -> match pg::connect[link](
         cfg.host,
         cfg.port,
+        tls_of(cfg),
         cfg.user,
         cfg.database,
         startup_parameters(cfg),
@@ -5925,7 +6428,7 @@ fn statement_outside(
   s: Stmt,
   ps: List<Param>,
   rows: Bool,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+) -> Left / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match run_checked(l.session, s, ps, rows, cfg) {
@@ -5960,7 +6463,7 @@ fn opening(
   c: Claim,
   level: Isolation,
   access: Access,
-) -> Left / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+) -> Left / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match linked(cfg, nonce, c) {
     Err(e) -> { answer: Failed(e), n: claim_n(c), scope: None, freed: Some(Lost) },
     Ok(l) -> match control(
@@ -5979,6 +6482,7 @@ fn opening(
             level: level,
             access: access,
             busy: false,
+            copying: false,
           }),
           freed: None,
         },
@@ -6053,6 +6557,470 @@ fn aborting(
     }
   }
 
+// --- Copies on a live server -------------------------------------------------------
+
+/// Where a copy is to run: refused, on a connection outside any transaction, or on the performer's
+/// transaction's.
+type CopyClaim = | CopyRefused(DbError) | CopyOutside(Claim) | CopyWithin(Scope, pg::Session)
+
+type ClaimedCopy = { pool: Pool, claim: CopyClaim }
+
+fn for_copy(p: Pool, size: Int, what: String) -> ClaimedCopy / {abort.raise} =
+  match route(p.open) {
+    Ambiguous -> panic(ambiguous(what)),
+    NoTransaction -> {
+      let d = outside(p, size);
+      match d.plan {
+        Outside(c) -> { pool: d.pool, claim: CopyOutside(c) },
+        Answered(Failed(e)) -> { pool: d.pool, claim: CopyRefused(e) },
+        _ -> { pool: d.pool, claim: CopyRefused(pool_busy(size)) },
+      }
+    },
+    Own(scope) -> if scope.copying { { pool: p, claim: CopyRefused(copy_holds()) } } else {
+      match scope.session {
+        None -> { pool: p, claim: CopyRefused(connection_lost()) },
+        Some(session) ->
+          {
+            pool: {
+              ..p,
+              open: map(p.open, |s: Scope| if s.n == scope.n { { ..s, copying: true } } else { s }),
+            },
+            claim: CopyWithin(scope, session),
+          },
+      }
+    },
+  }
+
+/// A copy as it began: the connection it holds and the columns of a copy out, or why it did not
+/// begin, with the connection still talking or `None` once it is lost.
+type Begun = {
+  n: Int,
+  within: Bool,
+  session: Option<pg::Session>,
+  columns: List<pg::Column>,
+  failed: Option<DbError>,
+}
+
+/// `sql` sent on the connection `claim` names; `out` is the statement a copy out reads, whose
+/// columns are described first.
+fn copy_begun(
+  cfg: Server,
+  nonce: String,
+  claim: CopyClaim,
+  sql: String,
+  out: Option<String>,
+) -> Begun / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match claim {
+    CopyRefused(e) -> { n: 0 - 1, within: false, session: None, columns: [], failed: Some(e) },
+    CopyOutside(c) -> match linked(cfg, nonce, c) {
+      Err(e) -> { n: claim_n(c), within: false, session: None, columns: [], failed: Some(e) },
+      Ok(l) -> copy_on(cfg, l.n, false, l.session, sql, out),
+    },
+    CopyWithin(scope, session) -> copy_on(cfg, scope.n, true, session, sql, out),
+  }
+
+fn copy_on(
+  cfg: Server,
+  n: Int,
+  within: Bool,
+  session: pg::Session,
+  sql: String,
+  out: Option<String>,
+) -> Begun / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match out {
+    None -> match pg::copy_in_begin[link](session, sql, cfg.client) {
+      Ok(c) -> { n: n, within: within, session: Some(c.session), columns: [], failed: None },
+      Err(e) -> copy_refused(cfg, n, within, session, e),
+    },
+    Some(query) -> match pg::described[link](session, query, cfg.client) {
+      Err(e) -> copy_refused(cfg, n, within, session, e),
+      Ok(r) -> match pg::copy_out_begin[link](r.session, sql, cfg.client) {
+        Ok(c) ->
+          {
+            n: n,
+            within: within,
+            session: Some(c.session),
+            columns: r.answer.columns,
+            failed: None,
+          },
+        Err(e) -> copy_refused(cfg, n, within, r.session, e),
+      },
+    },
+  }
+
+/// A copy that did not begin: a refusal leaves the server talking on the connection, and anything
+/// else ends it.
+fn copy_refused(
+  cfg: Server,
+  n: Int,
+  within: Bool,
+  session: pg::Session,
+  e: pg::ClientError,
+) -> Begun / {net.send[link], net.close[link], abort.raise} =
+  match e {
+    pg::Rejected(after, server) ->
+      {
+        n: n,
+        within: within,
+        session: Some(after),
+        columns: [],
+        failed: Some(server_error(server)),
+      },
+    _ -> {
+      pg::finish[link](session, cfg.client);
+      { n: n, within: within, session: None, columns: [], failed: Some(client_error(e)) }
+    },
+  }
+
+/// The pool once a copy has let its connection go: back to its transaction, or to the idle ones,
+/// while the server still talks on it; lost, and its transaction with it, otherwise.
+fn let_copy_go(p: Pool, n: Int, within: Bool, session: Option<pg::Session>) -> Pool = {
+  let counted = match session { Some(_) -> p, None -> { ..p, opened: p.opened - 1 } };
+  if within {
+    {
+      ..counted,
+      open: map(counted.open, |s: Scope|
+        if s.n == n { { ..s, copying: false, session: session } } else { s }),
+    }
+  } else {
+    match session {
+      Some(talking) -> { ..counted, idle: push(counted.idle, { n: n, session: talking }) },
+      None -> counted,
+    }
+  }
+}
+
+fn copy_of(p: Pool, id: Int) -> Option<Copy> = find(p.copies, |c: Copy| c.id == id)
+
+fn with_copy(p: Pool, c: Copy) -> Pool =
+  { ..p, copies: map(p.copies, |held: Copy| if held.id == c.id { c } else { held }) }
+
+fn without_copy(p: Pool, id: Int) -> Pool =
+  { ..p, copies: filter(p.copies, |held: Copy| held.id != id) }
+
+fn no_copy(id: Int) -> DbError =
+  db_error("55000", "", "no copy is open under the number " ++ int_to_string(id))
+
+fn copy_busy(id: Int) -> DbError =
+  db_error(
+    "55000",
+    "",
+    "copy " ++ int_to_string(id) ++ " is already on the wire for another operation",
+  )
+
+fn copy_direction(id: Int, out: Bool) -> DbError =
+  db_error(
+    "55000",
+    "",
+    "copy " ++ int_to_string(id) ++ " is a copy " ++ (if out { "out" } else { "in" })
+      ++ ", and this operation is the other way",
+  )
+
+/// A copy's connection taken for one operation on the wire.
+type Took = { pool: Pool, copy: Copy, session: pg::Session }
+
+fn took(p: Pool, id: Int, out: Bool) -> Result<Took, DbError> =
+  match copy_of(p, id) {
+    None -> Err(no_copy(id)),
+    Some(c) -> if c.out != out { Err(copy_direction(id, c.out)) } else {
+      match c.session {
+        None -> Err(copy_busy(id)),
+        Some(session) ->
+          Ok({ pool: with_copy(p, { ..c, session: None }), copy: c, session: session }),
+      }
+    },
+  }
+
+/// Rows in `COPY`'s text format, each parameter as its text.
+fn copy_text(rows: List<List<Param>>) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(rows, |row: List<Param>| pg::copy_row(map(row, param_text))))
+
+/// The first `most` whole lines of `data`, and what follows them.
+type Lines = { lines: List<Bytes>, rest: Bytes }
+
+fn first_lines(data: Bytes, most: Int) -> Lines / {abort.raise} = {
+  let split = fold(
+    range(0, max(most, 0)),
+    { lines: [], rest: data, open: true },
+    |acc: { lines: List<Bytes>, rest: Bytes, open: Bool }, i: Int|
+      if !acc.open { acc } else {
+        match bytes_index_of_byte(acc.rest, 10) {
+          None -> { ..acc, open: false },
+          Some(at) ->
+            {
+              lines: push(acc.lines, bytes_slice(acc.rest, 0, at)),
+              rest: bytes_slice(acc.rest, at + 1, bytes_len(acc.rest)),
+              open: true,
+            },
+        }
+      },
+  );
+  { lines: split.lines, rest: split.rest }
+}
+
+/// Lines of a copy out as rows, read as `columns` say.
+fn copied_rows(
+  columns: List<pg::Column>,
+  lines: List<Bytes>,
+) -> Result<List<Row>, DbError> / {abort.raise} =
+  fold(lines, Ok([]), |acc: Result<List<Row>, DbError>, line: Bytes|
+    match acc {
+      Err(e) -> Err(e),
+      Ok(rows) -> match pg::copy_fields(line) {
+        None ->
+          Err(db_error("08P01", "", "a row of the copy does not read: it ends in a backslash")),
+        Some(values) -> Ok(push(rows, row_of(columns, values, 0, map_new()))),
+      },
+    })
+
+/// What a take of a copy out came to: the copy as it now stands, the connection it lets go of
+/// once the server has sent everything (`Some` of `None` when that connection was lost), and the
+/// rows.
+type Taking = {
+  copy: Copy,
+  release: Option<Option<pg::Session>>,
+  answer: Result<List<Row>, DbError>,
+}
+
+/// At most `rows` rows, read from what has arrived and then from the server, a piece at a time.
+fn taking_rows(
+  cfg: Server,
+  c: Copy,
+  session: Option<pg::Session>,
+  rows: Int,
+) -> Taking / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} = {
+  let ready = first_lines(c.pending, rows);
+  let answered = |copy: Copy, release: Option<Option<pg::Session>>, lines: Lines|
+    match copied_rows(copy.columns, lines.lines) {
+      Ok(found) ->
+        {
+          copy: { ..copy, pending: lines.rest, taken: copy.taken + len(found) },
+          release: release,
+          answer: Ok(found),
+        },
+      Err(e) -> { copy: { ..copy, failed: Some(e) }, release: release, answer: Err(e) },
+    };
+  match session {
+    None -> answered(c, None, ready),
+    Some(s) -> if len(ready.lines) >= rows { answered({ ..c, session: Some(s) }, None, ready) }
+    else {
+      match pg::copy_out_take[link](s, cfg.client) {
+        Ok(piece) -> match piece.data {
+          Some(data) ->
+            taking_rows(
+              cfg,
+              { ..c, pending: bytes_concat(c.pending, data) },
+              Some(piece.session),
+              rows,
+            ),
+          None ->
+            answered(
+              { ..c, session: None, done: true },
+              Some(Some(piece.session)),
+              first_lines(c.pending, rows),
+            ),
+        },
+        Err(pg::Rejected(after, server)) -> {
+          let failed = server_error(server);
+          {
+            copy: { ..c, session: None, done: true, failed: Some(failed) },
+            release: Some(Some(after)),
+            answer: Err(failed),
+          }
+        },
+        Err(e) -> {
+          pg::finish[link](s, cfg.client);
+          let failed = client_error(e);
+          {
+            copy: { ..c, session: None, done: true, failed: Some(failed) },
+            release: Some(None),
+            answer: Err(failed),
+          }
+        },
+      }
+    },
+  }
+}
+
+/// What remains of a copy out read and dropped, so its connection is ready for the next statement.
+fn drained(
+  cfg: Server,
+  s: pg::Session,
+) -> Result<pg::Session, pg::ClientError> / {net.recv[link], abort.raise, diverges} =
+  match pg::copy_out_take[link](s, cfg.client) {
+    Err(e) -> Err(e),
+    Ok(piece) -> match piece.data {
+      None -> Ok(piece.session),
+      Some(_) -> drained(cfg, piece.session),
+    },
+  }
+
+/// What ending a copy came to: the connection it lets go of, `None` when it is lost, and the answer.
+type Ended = { session: Option<pg::Session>, answer: Result<Int, DbError> }
+
+fn ended_in(
+  cfg: Server,
+  session: pg::Session,
+  failure: Option<String>,
+) -> Ended / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match pg::copy_in_end[link]({ session: session, columns: 0 }, failure, cfg.client) {
+    Ok(r) -> { session: Some(r.session), answer: Ok(count_of(r.answer.tag)) },
+    Err(pg::Rejected(after, server)) -> { session: Some(after), answer: Err(server_error(server)) },
+    Err(e) -> {
+      pg::finish[link](session, cfg.client);
+      { session: None, answer: Err(client_error(e)) }
+    },
+  }
+
+fn ended_out(
+  cfg: Server,
+  c: Copy,
+  session: pg::Session,
+) -> Ended / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match drained(cfg, session) {
+    Ok(s) -> { session: Some(s), answer: Ok(c.taken) },
+    Err(pg::Rejected(after, server)) -> { session: Some(after), answer: Err(server_error(server)) },
+    Err(e) -> {
+      pg::finish[link](session, cfg.client);
+      { session: None, answer: Err(client_error(e)) }
+    },
+  }
+
+/// `COPY` of the `columns` of table `t` from the client, every name quoted.
+fn copy_in_sql(t: String, columns: List<String>) -> String =
+  "copy " ++ quote_ident(t) ++ " (" ++ comma(map(columns, quote_ident)) ++ ") from stdin"
+
+// --- The listening connection --------------------------------------------------------
+
+/// A connection of its own that listens on every one of `channels`.
+fn listening(
+  cfg: Server,
+  nonce: String,
+  made: Int,
+  channels: List<String>,
+) -> Result<pg::Session, DbError> / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match pg::connect[link](
+      cfg.host,
+      cfg.port,
+      tls_of(cfg),
+      cfg.user,
+      cfg.database,
+      startup_parameters(cfg),
+      cfg.password,
+      nonce ++ "-listener-" ++ int_to_string(made),
+      cfg.client,
+    ) {
+    Err(e) -> Err(client_error(e)),
+    Ok(s) ->
+      fold(channels, Ok(s), |acc: Result<pg::Session, DbError>, channel: String|
+        match acc {
+          Err(e) -> Err(e),
+          Ok(talking) -> match control(talking, "listen " ++ quote_ident(channel), cfg) {
+            Ok(r) -> Ok(r.session),
+            Err(e) -> {
+              pg::finish[link](talking, cfg.client);
+              Err(client_error(e))
+            },
+          },
+        }),
+  }
+
+/// What a wait on the listener left: the listener, and what it answered.
+type Listened = { listener: Listener, notice: Notice }
+
+type Subscribed = { listener: Listener, answer: Answer }
+
+fn listened_to(
+  cfg: Server,
+  nonce: String,
+  l: Listener,
+  channel: String,
+) -> Subscribed / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match l.session {
+    None -> match listening(cfg, nonce, l.made, push(l.channels, channel)) {
+      Err(e) -> { listener: { ..l, made: l.made + 1 }, answer: Failed(e) },
+      Ok(s) ->
+        {
+          listener: {
+            ..l,
+            session: Some(s),
+            channels: push(l.channels, channel),
+            made: l.made + 1,
+          },
+          answer: Count(0),
+        },
+    },
+    Some(s) -> match control(s, "listen " ++ quote_ident(channel), cfg) {
+      Ok(r) ->
+        {
+          listener: { ..l, session: Some(r.session), channels: push(l.channels, channel) },
+          answer: Count(0),
+        },
+      Err(pg::Rejected(after, server)) ->
+        { listener: { ..l, session: Some(after) }, answer: Failed(server_error(server)) },
+      Err(e) -> {
+        pg::finish[link](s, cfg.client);
+        { listener: { ..l, session: None, lost: true }, answer: Failed(client_error(e)) }
+      },
+    },
+  }
+
+fn unlistened(
+  cfg: Server,
+  l: Listener,
+  channel: String,
+) -> Subscribed / {net.send[link], net.recv[link], net.close[link], abort.raise, diverges} = {
+  let rest = filter(l.channels, |c: String| c != channel);
+  match l.session {
+    None -> { listener: { ..l, channels: rest }, answer: Count(0) },
+    Some(s) -> match control(s, "unlisten " ++ quote_ident(channel), cfg) {
+      Ok(r) -> { listener: { ..l, session: Some(r.session), channels: rest }, answer: Count(0) },
+      Err(pg::Rejected(after, server)) ->
+        { listener: { ..l, session: Some(after) }, answer: Failed(server_error(server)) },
+      Err(e) -> {
+        pg::finish[link](s, cfg.client);
+        { listener: { ..l, session: None, channels: rest, lost: true }, answer: Count(0) }
+      },
+    },
+  }
+}
+
+/// A wait on the listener, which opens a new connection first when the last one was lost.
+fn waited(
+  cfg: Server,
+  nonce: String,
+  l: Listener,
+  timeout_ms: Int,
+) -> Listened / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match l.session {
+    None -> reopened(cfg, nonce, l),
+    Some(s) -> match pg::await_notification[link](s, timeout_ms) {
+      Ok(w) ->
+        {
+          listener: { ..l, session: Some(w.session) },
+          notice: match w.notice { Some(n) -> Notified(n), None -> Quiet },
+        },
+      Err(_) -> {
+        pg::finish[link](s, cfg.client);
+        reopened(cfg, nonce, { ..l, session: None, lost: true })
+      },
+    },
+  }
+
+fn reopened(
+  cfg: Server,
+  nonce: String,
+  l: Listener,
+) -> Listened / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match listening(cfg, nonce, l.made, l.channels) {
+    Ok(s) ->
+      { listener: { ..l, session: Some(s), lost: false, made: l.made + 1 }, notice: Reconnected },
+    Err(e) -> { listener: { ..l, lost: true, made: l.made + 1 }, notice: Unheard(e) },
+  }
+
+fn listener_busy() -> String =
+  "the listener was used while a wait or a subscription on it was on the wire: one task listens at a time"
+
 /// The `db` effect served from a live server. `nonce` is the caller's, so a run's seed decides it
 /// and a test can fix it; each connection's nonce is that text and its own number.
 pub fn serve<a | e>(
@@ -6060,8 +7028,16 @@ pub fn serve<a | e>(
   size: Int,
   nonce: String,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> a / {diverges, abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link] | e} =
-  with_cell[dbpool]({ idle: [], opened: 0, made: 0, open: [] }) { pool -> {
+) -> a / {diverges, abort.raise, net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link] | e} =
+  with_cell[dbpool]({
+      idle: [],
+      opened: 0,
+      made: 0,
+      open: [],
+      copies: [],
+      copied: 0,
+      listener: { session: None, channels: [], waiting: false, lost: false, made: 0 },
+    }) { pool -> {
     let taken = |d: Decided| {
       cell_set(pool, d.pool);
       d.plan
@@ -6125,6 +7101,100 @@ pub fn serve<a | e>(
           _ -> match shared(s, each) { Some(answers) -> answers, None -> alone(s, each) },
         }
       };
+    // A copy begun on the connection it claims, numbered once the server has begun it.
+    let copy_begin = |sql: String, out: Option<String>, what: String| {
+      let claimed = for_copy(cell_get(pool), size, what);
+      cell_set(pool, claimed.pool);
+      match claimed.claim {
+        CopyRefused(e) -> Err(e),
+        claim -> {
+          let b = copy_begun(cfg, nonce, claim, sql, out);
+          match b.failed {
+            Some(e) -> {
+              cell_set(pool, let_copy_go(cell_get(pool), b.n, b.within, b.session));
+              Err(e)
+            },
+            None -> {
+              let p = cell_get(pool);
+              cell_set(pool, {
+                ..p,
+                copies: push(p.copies, {
+                  id: p.copied,
+                  n: b.n,
+                  session: b.session,
+                  within: b.within,
+                  out: out != None,
+                  columns: b.columns,
+                  pending: b"",
+                  done: false,
+                  taken: 0,
+                  failed: None,
+                }),
+                copied: p.copied + 1,
+              });
+              Ok(p.copied)
+            },
+          }
+        },
+      }
+    };
+    // A copy ended: its connection let go of and its number forgotten.
+    let copy_closed = |c: Copy, e: Ended| {
+      cell_set(pool, let_copy_go(without_copy(cell_get(pool), c.id), c.n, c.within, e.session));
+      e.answer
+    };
+    let copy_end = |id: Int, failure: Option<String>|
+      match copy_of(cell_get(pool), id) {
+        None -> Err(no_copy(id)),
+        Some(c) -> if c.out && c.done {
+          cell_set(pool, without_copy(cell_get(pool), id));
+          match c.failed { Some(e) -> Err(e), None -> Ok(c.taken) }
+        } else {
+          match took(cell_get(pool), id, c.out) {
+            Err(e) -> Err(e),
+            Ok(t) -> {
+              cell_set(pool, t.pool);
+              copy_closed(c, if c.out { ended_out(cfg, c, t.session) }
+              else { ended_in(cfg, t.session, failure) })
+            },
+          }
+        },
+      };
+    let taken_from = |c: Copy, session: Option<pg::Session>, rows: Int| {
+      let t = taking_rows(cfg, c, session, rows);
+      let kept = with_copy(cell_get(pool), t.copy);
+      cell_set(pool, match t.release {
+        None -> kept,
+        Some(left) -> let_copy_go(kept, c.n, c.within, left),
+      });
+      t.answer
+    };
+    let copy_take = |id: Int, rows: Int|
+      match copy_of(cell_get(pool), id) {
+        None -> Err(no_copy(id)),
+        Some(c) -> if !c.out { Err(copy_direction(id, false)) }
+        else if c.done { taken_from(c, None, rows) } else {
+          match took(cell_get(pool), id, true) {
+            Err(e) -> Err(e),
+            Ok(t) -> {
+              cell_set(pool, t.pool);
+              taken_from(c, Some(t.session), rows)
+            },
+          }
+        },
+      };
+    // The listener taken for one operation on the wire, and given back with what it came to.
+    let listener_taken = || {
+      let p = cell_get(pool);
+      if p.listener.waiting { panic(listener_busy()) } else {
+        cell_set(pool, { ..p, listener: { ..p.listener, waiting: true } });
+        p.listener
+      }
+    };
+    let listener_back = |l: Listener| {
+      cell_set(pool, { ..cell_get(pool), listener: { ..l, waiting: false } });
+      ()
+    };
     let answer = handle {
       body()
     } with {
@@ -6159,10 +7229,77 @@ pub fn serve<a | e>(
         Settled(a) -> a,
         Closes(scope, session) -> settled(aborting(cfg, scope, session)),
       },
+      db.notify[*c](payload) ->
+        statement(notify_statement(), [PText(c), PText(payload)], false, "`db.notify`"),
+      db.listen[*c]() -> {
+        let l = listener_taken();
+        if contains(l.channels, c) {
+          listener_back(l);
+          Count(0)
+        } else {
+          let s = listened_to(cfg, nonce, l, c);
+          listener_back(s.listener);
+          s.answer
+        }
+      },
+      db.unlisten[*c]() -> {
+        let s = unlistened(cfg, listener_taken(), c);
+        listener_back(s.listener);
+        s.answer
+      },
+      db.notified(timeout_ms) -> {
+        if len(cell_get(pool).listener.channels) == 0 { panic(nothing_listened()) } else { () };
+        let w = waited(cfg, nonce, listener_taken(), timeout_ms);
+        listener_back(w.listener);
+        w.notice
+      },
+      db.copy_in[*t](columns) -> copy_begin(copy_in_sql(t, columns), None, "`db.copy_in`"),
+      db.copy_rows[*t](id, rows) -> match took(cell_get(pool), id, false) {
+        Err(e) -> Err(e),
+        Ok(took_rows) -> {
+          cell_set(pool, took_rows.pool);
+          match pg::copy_send[link](
+              { session: took_rows.session, columns: 0 },
+              copy_text(rows),
+              cfg.client,
+            ) {
+            Ok(c) -> {
+              cell_set(
+                pool,
+                with_copy(cell_get(pool), { ..took_rows.copy, session: Some(c.session) }),
+              );
+              Ok(())
+            },
+            Err(e) -> {
+              pg::finish[link](took_rows.session, cfg.client);
+              copy_closed(took_rows.copy, { session: None, answer: Err(client_error(e)) });
+              Err(client_error(e))
+            },
+          }
+        },
+      },
+      db.copy_end[*t](id, failure) -> copy_end(id, failure),
+      db.copy_out[*t](s) -> {
+        check_statement(s, true, t);
+        let body = statement_text(s.sql);
+        copy_begin("copy (" ++ body ++ ") to stdout", Some(body), "`db.copy_out`")
+      },
+      db.copy_take[*t](id, rows) -> copy_take(id, rows),
     };
     finished(cell_get(pool), cfg);
     answer
   } }
+
+/// What `db.notify` sends: the channel and the payload as parameters, so neither is ever read as
+/// SQL.
+fn notify_statement() -> Stmt = stmt("select pg_notify($1, $2)")
+
+/// A statement's text short of a closing `;`, which a statement inside a `COPY` may not have.
+fn statement_text(sql: String) -> String / {abort.raise} =
+  match tokenize(Postgres, sql) {
+    Err(_) -> sql,
+    Ok(ts) -> match statement_body(sql, ts) { Some(body) -> body, None -> sql },
+  }
 
 // --- One statement for a batch -----------------------------------------------------
 
@@ -6256,11 +7393,15 @@ fn split_asks(rows: List<Row>, asks: Int) -> List<Answer> = {
 }
 
 /// Every connection the pool still holds once its body has returned, told it is done and closed:
-/// the idle ones, and one a body returned from inside its transaction, which the server rolls back.
+/// the idle ones; one a body returned from inside its transaction, which the server rolls back; one
+/// a copy left open, which the server keeps none of; and the listener's.
 fn finished(p: Pool, cfg: Server) -> Unit / {net.send[link], net.close[link], abort.raise} = {
+  let close = |s: Option<pg::Session>|
+    match s { Some(session) -> pg::finish[link](session, cfg.client), None -> () };
   fold(p.idle, (), |done: Unit, l: Link| pg::finish[link](l.session, cfg.client));
-  fold(p.open, (), |done: Unit, scope: Scope|
-    match scope.session { Some(session) -> pg::finish[link](session, cfg.client), None -> () })
+  fold(p.open, (), |done: Unit, scope: Scope| close(scope.session));
+  fold(filter(p.copies, |c: Copy| !c.within), (), |done: Unit, c: Copy| close(c.session));
+  close(p.listener.session)
 }
 
 // --- Where the server is ---------------------------------------------------------
@@ -6335,8 +7476,15 @@ fn url_refusal(url: String) -> String =
 
 /// A `Server` from `postgres://user[:password]@host[:port]/database`, whose query may set
 /// `statement_timeout`, `idle_in_transaction_session_timeout` (whole milliseconds, `0` for none, at
-/// most 2147483647), `application_name` and `sslmode=disable|prefer` (read and nothing more: TLS to
-/// postgres is not wired up). Any other key, or a key given twice, is refused.
+/// most 2147483647), `application_name`, `sslmode` and `sslnegotiation`. Any other key, or a key
+/// given twice, is refused.
+///
+/// Without `sslmode` a connection is plaintext, as `sslmode=disable` asks. `require`, `verify-ca`
+/// and `verify-full` secure every connection and verify the server as `verify-full` does (`Ssl`
+/// says why all three). `allow` and `prefer` are refused: each goes on in plaintext when the server
+/// says it does not speak TLS, and anyone between the two can say that for it.
+/// `sslnegotiation=direct` begins TLS without asking first, which a server before Postgres 17 does
+/// not understand, and asks for an `sslmode` that secures; `postgres`, asking first, is the default.
 pub fn server_of(url: String) -> Result<Server, String> / {abort.raise} =
   match split_at(url, "://") {
     None -> Err(url_refusal(url)),
@@ -6427,32 +7575,100 @@ fn server_parts(rest: String) -> Result<Server, String> / {abort.raise} = {
   }
 }
 
-/// `sslmode` is read and nothing more: TLS to postgres is not wired up. Every other parameter is a
-/// setting the server is told at start-up, under the name postgres gives it.
+/// A connection string's query read: the server as far as it goes, and the two TLS settings, which
+/// are read together once every parameter is.
+type Reading = { server: Server, mode: Option<String>, negotiation: Option<String> }
+
+/// `sslmode` and `sslnegotiation` decide `ssl` between them. Every other parameter is a setting the
+/// server is told at start-up, under the name postgres gives it.
 fn with_query(query: String, s: Server) -> Result<Server, String> / {abort.raise} =
   if string_len(query) == 0 { Ok(s) } else {
-    fold(string_split(query, "&"), Ok(s), |acc: Result<Server, String>, pair: String|
-      match acc {
-        Err(why) -> Err(why),
-        Ok(so_far) -> match split_at(pair, "=") {
-          None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
-          Some(kv) -> match unpercent(kv.tail) {
-            Err(why) -> Err(why),
-            Ok(value) -> with_setting(so_far, kv.head, value),
+    let read = fold(
+      string_split(query, "&"),
+      Ok({ server: s, mode: None, negotiation: None }),
+      |acc: Result<Reading, String>, pair: String|
+        match acc {
+          Err(why) -> Err(why),
+          Ok(so_far) -> match split_at(pair, "=") {
+            None -> Err("`" ++ pair ++ "` is not a `key=value` parameter"),
+            Some(kv) -> match unpercent(kv.tail) {
+              Err(why) -> Err(why),
+              Ok(value) -> with_parameter(so_far, kv.head, value),
+            },
           },
         },
-      })
+    );
+    match read {
+      Err(why) -> Err(why),
+      Ok(r) -> match ssl_of(r.mode, r.negotiation) {
+        Err(why) -> Err(why),
+        Ok(ssl) -> Ok({ ..r.server, ssl: ssl }),
+      },
+    }
+  }
+
+fn with_parameter(
+  r: Reading,
+  key: String,
+  value: String,
+) -> Result<Reading, String> / {abort.raise} =
+  if key == "sslmode" {
+    match r.mode {
+      Some(_) -> Err("`sslmode` is given twice"),
+      None -> Ok({ ..r, mode: Some(value) }),
+    }
+  } else if key == "sslnegotiation" {
+    match r.negotiation {
+      Some(_) -> Err("`sslnegotiation` is given twice"),
+      None -> Ok({ ..r, negotiation: Some(value) }),
+    }
+  } else {
+    match with_setting(r.server, key, value) {
+      Err(why) -> Err(why),
+      Ok(server) -> Ok({ ..r, server: server }),
+    }
+  }
+
+/// What the two TLS settings ask for together.
+fn ssl_of(mode: Option<String>, negotiation: Option<String>) -> Result<Ssl, String> =
+  match secures(mode) {
+    Err(why) -> Err(why),
+    Ok(secured) -> match negotiation {
+      None -> Ok(if secured { Negotiated } else { Disabled }),
+      Some(way) -> if way == "postgres" { Ok(if secured { Negotiated } else { Disabled }) }
+      else if way == "direct" {
+        if secured { Ok(Immediate) } else {
+          Err(
+            "`sslnegotiation=direct` begins TLS at once, and this `sslmode` does not secure the connection: add `sslmode=verify-full`",
+          )
+        }
+      } else {
+        Err("`sslnegotiation=" ++ way ++ "` is not a negotiation; `postgres` and `direct` are")
+      },
+    },
+  }
+
+/// Whether an `sslmode` secures the connection, or why it is refused.
+fn secures(mode: Option<String>) -> Result<Bool, String> =
+  match mode {
+    None -> Ok(false),
+    Some(m) -> if m == "disable" { Ok(false) }
+    else if m == "require" || m == "verify-ca" || m == "verify-full" { Ok(true) }
+    else if m == "allow" || m == "prefer" {
+      Err(
+        "`sslmode=" ++ m
+          ++ "` goes on in plaintext when the server says it does not speak TLS, which anyone between the two can say: write `sslmode=verify-full`, or `sslmode=disable` for a server that is reached in plaintext",
+      )
+    } else {
+      Err(
+        "`sslmode=" ++ m
+          ++ "` is not a mode; `disable`, `require`, `verify-ca` and `verify-full` are read",
+      )
+    },
   }
 
 fn with_setting(s: Server, key: String, value: String) -> Result<Server, String> / {abort.raise} =
-  if key == "sslmode" {
-    if value == "disable" || value == "prefer" { Ok(s) } else {
-      Err(
-        "`sslmode=" ++ value
-          ++ "` is not configurable: TLS to postgres is not wired up, so only `disable` and `prefer` are read",
-      )
-    }
-  } else if key == "application_name" {
+  if key == "application_name" {
     // A zero byte ends a start-up parameter, so the rest of the name would be read as another.
     if string_contains(value, "\0") { Err("an `application_name` may not hold a zero byte") }
     else { once(s.application_name, key, { ..s, application_name: Some(value) }) }
@@ -6496,7 +7712,7 @@ pub fn with_server<a | e>(
   url: String,
   size: Int,
   body: () -> a / {db.read[*], db.write[*] | e},
-) -> Result<a, String> / {diverges, abort.raise, net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
+) -> Result<a, String> / {diverges, abort.raise, net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next | e} =
   match server_of(url) { Err(why) -> Err(why), Ok(cfg) -> Ok(serve(cfg, size, nonce(), body)) }
 
 // --- Tests ------------------------------------------------------------------
@@ -7116,9 +8332,30 @@ test "what a connection string cannot mean is refused rather than guessed" {
   assert_err("postgres://ply@db:0/app", "port 0");
   assert_err("postgres://ply@db:nine/app", "is not a port");
   assert_err("postgres://ply@db/", "no database name");
-  assert_err("postgres://ply@db/app?sslmode=require", "sslmode=require");
   assert_err("postgres://ply@db/app?timeout=3", "not a parameter");
   assert_err("postgres://ply@db/app?sslmode", "key=value")
+}
+
+fn ssl_in(url: String) -> Ssl / {abort.raise} =
+  match server_of(url) { Ok(s) -> s.ssl, Err(why) -> panic(why) }
+
+test "every sslmode that secures verifies the server, and one that can be talked out of TLS is refused" {
+  assert_eq(ssl_in("postgres://ply@db/app"), Disabled);
+  assert_eq(ssl_in("postgres://ply@db/app?sslmode=disable"), Disabled);
+  assert_eq(ssl_in("postgres://ply@db/app?sslmode=require"), Negotiated);
+  assert_eq(ssl_in("postgres://ply@db/app?sslmode=verify-ca"), Negotiated);
+  assert_eq(
+    ssl_in("postgres://ply@db/app?sslmode=verify-full&sslnegotiation=postgres"),
+    Negotiated,
+  );
+  assert_eq(ssl_in("postgres://ply@db/app?sslnegotiation=direct&sslmode=verify-full"), Immediate);
+  assert_err("postgres://ply@db/app?sslmode=prefer", "plaintext");
+  assert_err("postgres://ply@db/app?sslmode=allow", "plaintext");
+  assert_err("postgres://ply@db/app?sslmode=on", "not a mode");
+  assert_err("postgres://ply@db/app?sslnegotiation=direct", "does not secure");
+  assert_err("postgres://ply@db/app?sslmode=disable&sslnegotiation=direct", "does not secure");
+  assert_err("postgres://ply@db/app?sslnegotiation=fast&sslmode=require", "not a negotiation");
+  assert_err("postgres://ply@db/app?sslmode=require&sslmode=disable", "given twice")
 }
 
 fn assert_err(url: String, wanted: String) -> Unit / {abort.raise} =
@@ -7422,6 +8659,8 @@ fn over_script<a | e>(
         Some(heard.bytes)
       },
       net.close[link](c) -> cell_set(fake, t_closed(cell_get(fake), c)),
+      net.start_tls[link](c, name, alpn, unread, timeout_ms) ->
+        panic("the scripted server speaks no TLS"),
     };
     { value: value, wires: cell_get(fake).wires }
   } }
@@ -7556,7 +8795,15 @@ test "two tasks' transactions each hold a connection of their own, whichever ord
 }
 
 test "an operation belongs to the one transaction not waiting on the server, and to none when all are" {
-  let s = { n: 0, session: None, depth: 1, level: ReadCommitted, access: ReadWrite, busy: false };
+  let s = {
+    n: 0,
+    session: None,
+    depth: 1,
+    level: ReadCommitted,
+    access: ReadWrite,
+    busy: false,
+    copying: false,
+  };
   let waiting = { ..s, n: 1, busy: true };
   assert_eq(route([]), NoTransaction);
   assert_eq(route([waiting]), NoTransaction);
@@ -7577,6 +8824,20 @@ test "a pool lends a connection to one statement at a time, and says so when it 
     );
     assert(fold(r.value, false, |acc: Bool, a: Answer| acc || a == Count(1)));
     assert_eq(len(r.wires), 1)
+  }
+}
+
+test "a notification goes on its transaction's connection, its channel and payload as parameters" {
+  simulate {
+    let r = over_script(1, [], || {
+      let inside = transaction(ReadCommitted, ReadWrite, || db.notify[jobs]("in"));
+      { inside: inside, outside: db.notify[jobs]("out") }
+    });
+    assert_eq(r.value.inside, Ok(Count(1)));
+    assert_eq(r.value.outside, Count(1));
+    assert_eq(t_said(r.wires), [
+      [t_begin("read committed"), notify_statement().sql, "commit", notify_statement().sql],
+    ])
   }
 }
 

@@ -186,10 +186,12 @@ fn the_digest_moves_when_a_flag_alone_moves() {
     assert!(secrets.rows[0].secrets);
 }
 
-/// A credential crosses the boundary to these and to nothing else: each hashes the password it is
-/// handed and answers the hash, which is one-way in it.
+/// A credential crosses the boundary to these and to nothing else: the password hashes, each
+/// answering a hash that is one-way in it, and the two writes that put one where it is meant to
+/// go, a file a key is written down in and a connection a login is sent on, each answering only
+/// whether it wrote.
 #[test]
-fn only_the_password_hashes_declare_that_they_may_receive_a_credential() {
+fn only_the_password_hashes_and_the_two_secret_writes_declare_that_they_may_receive_a_credential() {
     let mut claiming: Vec<&str> = ply_machine::hosts::registry()
         .ops()
         .filter(|op| op.secrets)
@@ -200,10 +202,12 @@ fn only_the_password_hashes_declare_that_they_may_receive_a_credential() {
     assert_eq!(
         claiming,
         [
+            "ply_host::fs::write_secret",
             "ply_host::password::argon2",
             "ply_host::password::bcrypt",
             "ply_host::password::pbkdf2",
             "ply_host::password::scrypt",
+            "ply_host::tcp::send_secret",
         ]
     );
 }

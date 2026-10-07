@@ -1101,14 +1101,19 @@ fn key_fault(key: Key, policy: Policy) -> Option<Fault> =
       None -> Some(Unverifiable),
     },
     EcKey(curve, point) ->
-      when(
-        Unverifiable,
-        !((curve == oid::prime256v1() && bytes_len(point) == 65)
-          || (curve == oid::secp384r1() && bytes_len(point) == 97)),
-      ),
+      when(Unverifiable, match signing_curve(curve) {
+        Some(c) -> bytes_len(point) != 2 * crypto::scalar_size(c) + 1,
+        None -> true,
+      }),
     Ed25519Key(_) -> None,
     OtherKey(_, _) -> Some(Unverifiable),
   }
+
+/// The curve of a certificate's key this module verifies under: the two the web signs on.
+fn signing_curve(curve: Oid) -> Option<crypto::EcdsaCurve> =
+  if curve == oid::prime256v1() { Some(crypto::NistP256) }
+  else if curve == oid::secp384r1() { Some(crypto::NistP384) }
+  else { None }
 
 /// The key that verifies a signature made by `algorithm` under `key`.
 fn verifier(key: Key, algorithm: Algorithm, policy: Policy) -> Result<VerifyingKey, Fault> =
@@ -1118,7 +1123,10 @@ fn verifier(key: Key, algorithm: Algorithm, policy: Policy) -> Result<VerifyingK
       let made = match ((key, algorithm)) {
         (RsaKey(public), RsaPkcs1(d)) -> crypto::rsa_pkcs1_verifying(public, d),
         (RsaKey(public), RsaPss(d)) -> crypto::rsa_pss_verifying(public, d),
-        (EcKey(_, point), Ecdsa(d)) -> crypto::ecdsa_verifying(point, d, crypto::Der),
+        (EcKey(curve, point), Ecdsa(d)) -> match signing_curve(curve) {
+          Some(c) -> crypto::ecdsa_verifying(c, d, point, crypto::Der),
+          None -> None,
+        },
         (Ed25519Key(public), Ed25519) -> crypto::ed25519_verifying(public),
         _ -> None,
       };
@@ -1615,11 +1623,8 @@ fn spki_der(key: VerifyingKey) -> Bytes / {Written} = {
   let public = crypto::verifying_bytes(key);
   let algorithm = match crypto::signature_of(key) {
     crypto::Ed25519Signature -> [asn1::oid(oid::ed25519())],
-    crypto::EcdsaSignature(_, _) ->
-      [
-        asn1::oid(oid::ec_public_key()),
-        asn1::oid(if bytes_len(public) == 65 { oid::prime256v1() } else { oid::secp384r1() }),
-      ],
+    crypto::EcdsaSignature(curve, _, _) ->
+      [asn1::oid(oid::ec_public_key()), asn1::oid(crypto::curve_oid(curve))],
     _ -> [asn1::oid(oid::rsa_encryption()), asn1::null()],
   };
   asn1::sequence([asn1::sequence(algorithm), asn1::bit_string({ unused: 0, bytes: public })])
@@ -1628,24 +1633,45 @@ fn spki_der(key: VerifyingKey) -> Bytes / {Written} = {
 fn signing_der(key: VerifyingKey) -> Bytes / {Written} =
   asn1::sequence(match crypto::signature_of(key) {
     crypto::Ed25519Signature -> [asn1::oid(oid::ed25519())],
-    crypto::EcdsaSignature(Sha256, _) -> [asn1::oid(oid::ecdsa_with_sha256())],
-    crypto::EcdsaSignature(Sha384, _) -> [asn1::oid(oid::ecdsa_with_sha384())],
-    crypto::EcdsaSignature(Sha512, _) -> [asn1::oid(oid::Oid([1, 2, 840, 10045, 4, 3, 4]))],
+    crypto::EcdsaSignature(_, Sha256, _) -> [asn1::oid(oid::ecdsa_with_sha256())],
+    crypto::EcdsaSignature(_, Sha384, _) -> [asn1::oid(oid::ecdsa_with_sha384())],
+    crypto::EcdsaSignature(_, Sha512, _) -> [asn1::oid(oid::Oid([1, 2, 840, 10045, 4, 3, 4]))],
     crypto::RsaPkcs1Signature(Sha256) ->
       [asn1::oid(oid::sha256_with_rsa_encryption()), asn1::null()],
     crypto::RsaPkcs1Signature(Sha384) ->
       [asn1::oid(oid::sha384_with_rsa_encryption()), asn1::null()],
     crypto::RsaPkcs1Signature(Sha512) ->
       [asn1::oid(oid::sha512_with_rsa_encryption()), asn1::null()],
-    crypto::RsaPssSignature(_) -> panic("no key signs RSA PSS"),
+    crypto::RsaPssSignature(d) -> [asn1::oid(oid::rsassa_pss()), pss_parameters(d)],
   })
+
+/// RSASSA-PSS parameters as RFC 4055 writes them: the hash, MGF1 over it, and a salt as long as
+/// its digest, each hash with a `NULL`, as `pss_digest` reads them back.
+fn pss_parameters(d: Digest) -> Bytes / {Written} = {
+  let hash = asn1::sequence([
+    asn1::oid(match d {
+      Sha256 -> oid::sha256(),
+      Sha384 -> oid::sha384(),
+      Sha512 -> oid::sha512(),
+    }),
+    asn1::null(),
+  ]);
+  asn1::sequence([
+    asn1::explicit(asn1::context(0), hash),
+    asn1::explicit(
+      asn1::context(1),
+      asn1::sequence([asn1::oid(oid::Oid([1, 2, 840, 113549, 1, 1, 8])), hash]),
+    ),
+    asn1::explicit(asn1::context(2), asn1::int(digest_bytes(d))),
+  ])
+}
 
 /// `signer`'s signature over `message`, as a certificate carries one: an ECDSA signature in DER
 /// whichever way the key writes its own.
 fn signed(signer: crypto::SigningKey, message: Bytes) -> Bytes / {abort.raise} = {
   let made = crypto::sign(signer, message);
   match crypto::signature_of(crypto::verifying_key(signer)) {
-    crypto::EcdsaSignature(_, crypto::Raw) -> {
+    crypto::EcdsaSignature(_, _, crypto::Raw) -> {
       let half = bytes_len(made) / 2;
       asn1::sequence([
         asn1::unsigned(bytes_slice(made, 0, half)),
