@@ -31,14 +31,12 @@ fn fails(source: &str) -> Diagnostic {
 
 #[test]
 fn a_secret_is_copied_out_with_no_payload_whatever_it_holds() {
-    for payload in [
-        Value::str("hunter2"),
-        Value::str(""),
-        Value::bytes(b"\x00\xff"),
-        Value::Int(1),
-        Value::list(vec![Value::str("a"), Value::str("b")]),
+    for secret in [
+        Value::secret_text("hunter2"),
+        Value::secret_text(""),
+        Value::secret_bytes(b"\x00\xff"),
+        Value::secret_bytes(b"hunter2"),
     ] {
-        let secret = Value::secret(payload);
         assert_eq!(Plain::of(&secret), Plain::Secret);
         assert_eq!(Plain::shown(&secret), Plain::Secret);
         assert!(!format!("{secret:?}").contains("hunter2"));
@@ -47,7 +45,7 @@ fn a_secret_is_copied_out_with_no_payload_whatever_it_holds() {
 
 #[test]
 fn a_nested_secret_is_copied_out_with_no_payload() {
-    let inner = Value::secret(Value::str("hunter2"));
+    let inner = Value::secret_text("hunter2");
     let outer = Value::list(vec![
         Value::ctor("Some", vec![inner.clone()]),
         Value::map([(Value::str("password"), inner.clone())]),
@@ -87,7 +85,7 @@ test "two logins differ" {
 #[test]
 fn a_runtime_type_error_over_a_secret_prints_no_payload() {
     let d = values_equal(
-        &Value::secret(Value::str("hunter2")),
+        &Value::secret_text("hunter2"),
         &Value::builtin(ply_eval::Builtin::Len),
         ply_eval::Span::DUMMY,
     )
@@ -115,7 +113,7 @@ test "equality works and prints nothing" {
 #[test]
 fn a_secret_is_never_equal_to_its_payload() {
     let span = ply_eval::Span::DUMMY;
-    let secret = Value::secret(Value::str("hunter2"));
+    let secret = Value::secret_text("hunter2");
     let plain = Value::str("hunter2");
     assert!(!values_equal(&secret, &plain, span).unwrap());
     assert!(!values_equal(&plain, &secret, span).unwrap());
@@ -139,10 +137,7 @@ fn the_comparison_is_over_the_whole_of_both_operands() {
 fn compare_values_refuses_a_secret_at_run_time() {
     let d = ply_eval::builtins::call(
         ply_eval::Builtin::CompareValues,
-        vec![
-            Value::secret(Value::str("a")),
-            Value::secret(Value::str("b")),
-        ],
+        vec![Value::secret_text("a"), Value::secret_text("b")],
         ply_eval::Span::DUMMY,
     )
     .expect_err("a credential has no order");
@@ -156,7 +151,7 @@ fn compare_values_refuses_a_secret_at_run_time() {
 
 #[test]
 fn a_secret_key_is_refused_by_every_map_operation_that_takes_one() {
-    let key = Value::secret(Value::str("a"));
+    let key = Value::secret_text("a");
     for (builtin, args) in [
         (
             ply_eval::Builtin::MapInsert,
@@ -466,8 +461,8 @@ fn map_of_entries_refuses_a_secret_key() {
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapOfEntries,
         vec![Value::list(vec![
-            entry(Value::secret(Value::str("hunter2")), Value::Int(1)),
-            entry(Value::secret(Value::str("hunter1")), Value::Int(0)),
+            entry(Value::secret_text("hunter2"), Value::Int(1)),
+            entry(Value::secret_text("hunter1"), Value::Int(0)),
         ])],
         ply_eval::Span::DUMMY,
     );
@@ -483,7 +478,7 @@ fn map_of_entries_refuses_a_secret_key() {
 #[test]
 fn map_merge_refuses_a_secret_key() {
     // No map builtin builds this right-hand side, so it is assembled directly.
-    let right = Value::map([(Value::secret(Value::str("hunter2")), Value::Int(1))]);
+    let right = Value::map([(Value::secret_text("hunter2"), Value::Int(1))]);
     let refused = ply_eval::builtins::call(
         ply_eval::Builtin::MapMerge,
         vec![Value::empty_map(), right],
@@ -496,7 +491,7 @@ fn map_merge_refuses_a_secret_key() {
 
 #[test]
 fn every_map_operation_that_orders_a_key_refuses_a_secret() {
-    let secret = Value::secret(Value::str("hunter2"));
+    let secret = Value::secret_text("hunter2");
     let cases: Vec<(ply_eval::Builtin, Vec<Value>)> = vec![
         (
             ply_eval::Builtin::MapInsert,

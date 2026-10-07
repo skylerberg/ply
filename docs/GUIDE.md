@@ -1013,11 +1013,15 @@ already holds, and `config.secret` (`std.config`) answers one it never held.
 These make a secret of a secret without opening it: `secret_bytes` (a string's
 UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
 hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
-give it), `secret_private_key` (the key a DER document holds) and the
-derivations `std.hash` names, `hkdf` and `pbkdf2`. None answers a part of a
-secret: a slice of one, compared with `==` against each of 256 guesses, would
-read it a byte at a time, so two keys out of one derivation are two `hkdf`
-calls under two `info`s.
+give it) and `secret_encode` (the text of a secret's bytes in those),
+`secret_private_key` (the key a DER document holds), `secret_rsa_jwk` (the
+document an RSA JSON Web Key's numbers make) and the derivations `std.hash`
+names, `hkdf` and `pbkdf2`. None answers a part of a secret: a slice of one,
+compared with `==` against each of 256 guesses, would read it a byte at a time,
+so two keys out of one derivation are two `hkdf` calls under two `info`s.
+`std.random`'s `entropy.secret(n)` draws `n` bytes straight into a secret. A
+secret holds its bytes in memory no other value shares, and they are
+overwritten with zeros when the last value holding the secret is dropped.
 
 A secret is observed four ways: `==` and `!=` between two of them,
 `secret_verify` against a string, `secret_is_empty` and `secret_len`. A
@@ -1032,9 +1036,17 @@ secret: each is one-way in the key.
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
 allows it (`E0439`). The operations `ply` ships that take one are
-`std.password`'s, which hash a password and answer the hash, one-way in it; so
-a secret has no way out of a program: key material that is to be written down,
-as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
+`std.password`'s, which hash a password and answer the hash, one-way in it, and
+the two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
+alone may read, and `std.net`'s `send_secret`, to a connection. Both write the
+same frame, all of it or nothing: plain bytes before the secret, the secret
+`raw` or in `hex`, `base64`, `base64url` or `base32`, and plain bytes after it,
+as a key file's line is a word, the key in hex and a newline, and SASL's PLAIN
+is `AUTH PLAIN `, a credential in base64 and a line end. That frame is a
+secret's one way out of a program. `std.fs`'s `read_secret` reads one back in:
+given the frame, it answers the secret a file holds inside it, never a plain
+value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
+`ply build --sign` reads it, without the key ever being a plain value.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -2901,8 +2913,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`,
 readable by its owner alone, and the public key at `PATH.pub`, each one line
 naming what it holds and 64 hex digits. It never writes over a file, and a key
-file that cannot be read, decoded or written is `E0462`. A secret key read back
-from its file is a `Secret` (§4.6) from then on.
+file that cannot be read, decoded or written is `E0462`. A secret key is a
+`Secret` (§4.6) from the moment `ply keygen` draws it, and is read back as one.
 
 `ply build --sign KEY` signs what it writes, a program or a library, in
 `<artifact>.sig` beside it. A signature is detached, so the artifact's digest

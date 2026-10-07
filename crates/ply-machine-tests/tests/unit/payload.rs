@@ -118,7 +118,7 @@ fn a_value_only_its_own_run_can_hold_is_refused_by_what_it_is() {
         .into_value()
         .expect_err("a program's own function does not cross");
     assert!(why.contains("only its own run"), "{why}");
-    let secret = Plain::of(&Value::secret(Value::str("hunter2")));
+    let secret = Plain::of(&Value::secret_text("hunter2"));
     assert_eq!(secret, Plain::Secret);
     assert!(secret.into_value().is_err());
 }
