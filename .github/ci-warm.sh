@@ -11,25 +11,34 @@
 # ci-warm.sh used MARK    the C cache and the stages cut to what the `ply`s since MARK used: a load
 #                         marks what it reads, so the rest is what earlier runs left that this one
 #                         did not read, and every job after would restore it for nothing.
-# ci-warm.sh pack TAR     the C cache and the stages as one file, for `shared` on another branch
+# ci-warm.sh pack TAR     the C cache and the stages as one file, for `handed` in this run's other
+#                         jobs and `shared` on another branch
 # ci-warm.sh shared NAME  the artifact NAME, which a run of these sources packed, laid over the C
 #                         cache and the stages as files this run wrote. A cache reaches only its own
 #                         branch and main; an artifact reaches every run. Sets the step's `found`.
 #                         Nothing found, or a download that failed, leaves the run to build.
+# ci-warm.sh handed NAME  likewise the artifact NAME of this run, which `build-ply` packed for the
+#                         run's other jobs
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
 
-# Unpacked aside and copied in only when whole, so a download cut short leaves no half of an object.
 shared() {
-  local name=$1 run dir
+  local name=$1 run
   # A fork's run names its artifacts as it likes, so only this repository's own are taken.
   run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=10" \
     -q '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)]
         | sort_by(.created_at) | last | .workflow_run.id // empty') || return 1
   [ -n "$run" ] || { echo "no run has packed a stage for these sources"; return 1; }
+  laid "$run" "$name"
+}
+
+# The artifact NAME of run RUN, unpacked aside and copied in only when whole, so a download cut short
+# leaves no half of an object.
+laid() {
+  local run=$1 name=$2 dir
   dir=$(mktemp -d)
   gh run download "$run" -n "$name" -D "$dir" || return 1
   mkdir "$dir/unpacked"
@@ -88,8 +97,16 @@ case "${1:-}" in
       echo "no stage came back: this run builds its own"
     fi
     ;;
+  handed)
+    name=${2:?usage: ci-warm.sh handed NAME}
+    if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name"; then
+      echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+    else
+      echo "the stage $name did not come back: this job starts from the cache"
+    fi
+    ;;
   *)
-    ply=${1:?usage: ci-warm.sh PLY | program PLY | used MARK | pack TAR | shared NAME}
+    ply=${1:?usage: ci-warm.sh PLY | program PLY | used MARK | pack TAR | shared NAME | handed NAME}
     dir=$(mktemp -d)
     trap 'rm -rf "$dir"' EXIT
     printf 'test "a unit is compiled" {\n  assert(1 + 1 == 2)\n}\n' > "$dir/m.ply"
