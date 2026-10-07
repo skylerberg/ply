@@ -14,6 +14,7 @@ use crate::process;
 use crate::random;
 use crate::sched;
 use crate::signal::{self, Accepting, Shutdown};
+use crate::sqlite;
 use crate::tcp;
 use crate::term;
 use crate::time;
@@ -38,6 +39,8 @@ pub struct Host {
     process: Option<Arc<process::ProcessHost>>,
     /// The stop flag and the phase machine, when this run listens for a signal.
     shutdown: Option<Arc<Shutdown>>,
+    /// The database connections open under `fs`'s roots.
+    sqlite: Arc<sqlite::SqliteHost>,
     /// The run's clocks: what `std.time` and the language's `clock` read, and what a production
     /// region's sleeps are deadlines on.
     time: Arc<time::TimeHost>,
@@ -64,6 +67,7 @@ impl Host {
             password: Arc::new(password::PasswordHost::new()),
             process: None,
             shutdown: None,
+            sqlite: Arc::new(sqlite::SqliteHost::new()),
             time: Arc::new(time::TimeHost::new()),
             trace: Arc::new(trace::Trace::default()),
         }
@@ -148,6 +152,12 @@ impl Host {
         random::register(&mut registry);
         sched::register(&mut registry);
         signal::register(&mut registry, self.shutdown.as_ref());
+        // Its operations wait on the pool of the roots it is handed.
+        sqlite::register(
+            &mut registry,
+            Arc::clone(&self.fs),
+            Arc::clone(&self.sqlite),
+        );
         tcp::register(&mut registry, Arc::clone(&self.net) as Arc<dyn tcp::Net>);
         term::register(&mut registry, self.process.as_ref());
         time::register(&mut registry, Arc::clone(&self.time));
@@ -174,6 +184,7 @@ impl Host {
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
             shutdown: self.shutdown.clone(),
+            sqlite: Arc::clone(&self.sqlite),
             time: Arc::clone(&self.time),
             bell: Arc::clone(&self.bell),
         })
@@ -231,6 +242,8 @@ struct Facilities {
     process: Option<Arc<process::ProcessHost>>,
     trace: Arc<trace::Trace>,
     shutdown: Option<Arc<Shutdown>>,
+    /// The database connections, for those an entry point left open.
+    sqlite: Arc<sqlite::SqliteHost>,
     time: Arc<time::TimeHost>,
     bell: Arc<Bell>,
 }
@@ -394,8 +407,10 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Closes the spans this entry point left open, and warns of them.
+    /// Closes the spans this entry point left open, and warns of them, and the database
+    /// connections it left open.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
+        self.sqlite.end_machine(machine);
         self.trace.end_entry_point(machine).into_iter().collect()
     }
 

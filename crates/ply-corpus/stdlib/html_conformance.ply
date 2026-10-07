@@ -1,0 +1,296 @@
+//! `std.html`'s tokenizer against the tokenizer tests of html5lib-tests: every test of every file
+//! in `html5lib/tokenizer`, once for each initial state it names, its tokens compared whole and its
+//! parse errors by their codes. The suite gives each error a line and a column by a convention of
+//! its own; the tokenizer gives a byte, which is not compared.
+//!
+//! Eight runs are not made, and the tally test counts them. The four of
+//! `unicodeCharsProblematic.test` whose input is a lone surrogate: a byte stream holds no
+//! surrogate, since UTF-8 has none, so no input this tokenizer reads is one, and the decoder that
+//! made its bytes would have written U+FFFD where the suite expects `surrogate-in-input-stream`.
+//! And the four of `xmlViolation.test`, which expect what the standard's coercion of a DOM into an
+//! XML infoset makes of the tokens, which is no tokenizer's. Three runs of `domjs.test` expect
+//! `unexpected-question-mark-instead-of-tag-name`, an error the standard removed when it read
+//! `<?` as a processing instruction; for the same input `test3.test` expects the one it reads now,
+//! `invalid-first-character-of-processing-instruction-target`, and so these are compared.
+
+import std.html
+import std.html (Attribute, Lexeme, Start, Token)
+import std.json
+import std.json (Json)
+import std.list (at_or, chunks, concat, sort)
+import std.utf16
+
+type File = { name: String, bytes: Bytes }
+
+fn files() -> List<File> = embed_dir("html5lib/tokenizer")
+
+/// One test in one of its initial states: where it is, its input, the state and the last start
+/// tag it is read from, and the tokens and the codes of the errors the suite expects.
+type Run = {
+  file: String,
+  description: String,
+  input: String,
+  state: String,
+  last: Option<String>,
+  output: Json,
+  errors: List<String>,
+}
+
+/// A test the suite holds and this module does not run, and why.
+type Unrun = { file: String, description: String, why: String }
+
+/// The runs of a file, and the tests of it not run.
+type Read = { runs: List<Run>, unrun: List<Unrun> }
+
+fn text_of(j: Json, name: String) -> Option<String> =
+  match json::get(j, name) { Some(json::Str(s)) -> Some(s), _ -> None }
+
+fn hex_digit(c: Char) -> Int = {
+  let n = int_of_char(c);
+  if n >= 48 && n <= 57 { n - 48 }
+  else if n >= 97 && n <= 102 { n - 87 }
+  else if n >= 65 && n <= 70 { n - 55 }
+  else { -1 }
+}
+
+type Units = { units: List<Int>, skip: Int }
+
+/// `s` with each `\uXXXX` read as the UTF-16 unit it names, as a doubled escape asks; `None`
+/// where the units are no text, as a lone surrogate is not.
+fn double_unescaped(s: String) -> Option<String> / {abort.raise} = {
+  let chars = array_of_list(string_chars(s));
+  let read = fold(range(0, array_len(chars)), { units: [], skip: 0 }, |u: Units, i: Int|
+    if u.skip > 0 { { ..u, skip: u.skip - 1 } }
+    else if array_at(chars, i) == Some('\\') && array_at(chars, i + 1) == Some('u')
+        && i + 5 < array_len(chars) {
+      let digits = map(range(i + 2, i + 6), |k: Int|
+        match array_at(chars, k) { Some(c) -> hex_digit(c), None -> -1 });
+      if fold(digits, true, |ok: Bool, d: Int| ok && d >= 0) {
+        { units: push(u.units, fold(digits, 0, |n: Int, d: Int| n * 16 + d)), skip: 5 }
+      } else { { ..u, units: concat_units(u.units, chars, i) } }
+    } else { { ..u, units: concat_units(u.units, chars, i) } });
+  match try { utf16::of_units(read.units) } { Ok(text) -> Some(text), Err(_) -> None }
+}
+
+fn concat_units(units: List<Int>, chars: Array<Char>, i: Int) -> List<Int> / {abort.raise} =
+  match array_at(chars, i) {
+    Some(c) ->
+      fold(utf16::units(string_of_chars([c])), units, |all: List<Int>, unit: Int| push(all, unit)),
+    None -> units,
+  }
+
+/// `j` with each string in it unescaped once more; `None` where one holds a lone surrogate.
+fn unescaped_json(j: Json) -> Option<Json> / {abort.raise} =
+  match j {
+    json::Str(s) -> match double_unescaped(s) { Some(t) -> Some(json::Str(t)), None -> None },
+    json::Array(items) -> {
+      let each = map(items, unescaped_json);
+      if fold(each, true, |ok: Bool, x: Option<Json>| ok && x != None) {
+        Some(json::Array(map(each, |x: Option<Json>| match x { Some(v) -> v, None -> json::Null })))
+      } else { None }
+    },
+    json::Object(members) -> {
+      let pairs = map(map_entries(members), |m: { key: String, value: Json }|
+        match ((double_unescaped(m.key), unescaped_json(m.value))) {
+          (Some(k), Some(v)) -> Some({ key: k, value: v }),
+          _ -> None,
+        });
+      if fold(pairs, true, |ok: Bool, x: Option<{ key: String, value: Json }>| ok && x != None) {
+        Some(
+          json::Object(
+            map_of_entries(
+              map(pairs, |x: Option<{ key: String, value: Json }>|
+                match x { Some(p) -> p, None -> { key: "", value: json::Null } }),
+            ),
+          ),
+        )
+      } else { None }
+    },
+    _ -> Some(j),
+  }
+
+/// The error a run of the suite names as the standard names it now.
+fn current_code(code: String) -> String =
+  if code == "unexpected-question-mark-instead-of-tag-name" {
+    "invalid-first-character-of-processing-instruction-target"
+  } else { code }
+
+fn codes(listed: Json) -> List<String> =
+  match json::get(listed, "errors") {
+    Some(json::Array(errors)) ->
+      sort(
+        map(errors, |e: Json| match text_of(e, "code") { Some(c) -> current_code(c), None -> "" }),
+      ),
+    _ -> [],
+  }
+
+fn states(listed: Json) -> List<String> =
+  match json::get(listed, "initialStates") {
+    Some(json::Array(names)) -> map(names, |n: Json| match n { json::Str(s) -> s, _ -> "" }),
+    _ -> ["Data state"],
+  }
+
+/// The runs a test of `file` makes, or why it makes none.
+fn test_runs(file: String, listed: Json) -> Read / {abort.raise} = {
+  let description = match text_of(listed, "description") { Some(d) -> d, None -> "" };
+  let doubled = json::get(listed, "doubleEscaped") == Some(json::Bool(true));
+  let input = match text_of(listed, "input") {
+    Some(s) -> if doubled { double_unescaped(s) } else { Some(s) },
+    None -> None,
+  };
+  let output = match json::get(listed, "output") {
+    Some(o) -> if doubled { unescaped_json(o) } else { Some(o) },
+    None -> None,
+  };
+  match ((input, output)) {
+    (Some(text), Some(expected)) ->
+      {
+        runs: map(states(listed), |state: String|
+          {
+            file: file,
+            description: description,
+            input: text,
+            state: state,
+            last: text_of(listed, "lastStartTag"),
+            output: expected,
+            errors: codes(listed),
+          }),
+        unrun: [],
+      },
+    _ -> { runs: [], unrun: [{ file: file, description: description, why: "a lone surrogate" }] },
+  }
+}
+
+fn read_file(f: File) -> Read / {abort.raise} =
+  match json::parse(f.bytes) {
+    Ok(json::Object(top)) -> match map_get(top, "tests") {
+      Some(json::Array(tests)) ->
+        fold(tests, { runs: [], unrun: [] }, |r: Read, t: Json| {
+          let more = test_runs(f.name, t);
+          { runs: concat(r.runs, more.runs), unrun: concat(r.unrun, more.unrun) }
+        }),
+      _ -> match map_get(top, "xmlViolationTests") {
+        Some(json::Array(tests)) ->
+          {
+            runs: [],
+            unrun: map(tests, |t: Json|
+              {
+                file: f.name,
+                description: match text_of(t, "description") { Some(d) -> d, None -> "" },
+                why: "the infoset coercion",
+              }),
+          },
+        _ -> panic(f.name ++ " holds no tests"),
+      },
+    },
+    _ -> panic(f.name ++ " is no JSON object"),
+  }
+
+fn suite() -> Read / {abort.raise} =
+  fold(files(), { runs: [], unrun: [] }, |r: Read, f: File| {
+    let more = read_file(f);
+    { runs: concat(r.runs, more.runs), unrun: concat(r.unrun, more.unrun) }
+  })
+
+/// The runs of one file, fifty at most, from the `from`th.
+type Block = { file: String, from: Int, runs: List<Run> }
+
+fn blocks() -> List<Block> / {abort.raise} =
+  fold(files(), [], |found: List<Block>, f: File| {
+    let pieces = chunks(read_file(f).runs, 50);
+    fold(range(0, len(pieces)), found, |b: List<Block>, i: Int|
+      push(b, { file: f.name, from: i * 50, runs: at_or(pieces, i, []) }))
+  })
+
+fn state_of(name: String) -> html::State =
+  if name == "PLAINTEXT state" { html::Plaintext }
+  else if name == "RCDATA state" { html::Rcdata }
+  else if name == "RAWTEXT state" { html::Rawtext }
+  else if name == "Script data state" { html::ScriptData }
+  else if name == "CDATA section state" { html::CdataSection }
+  else { html::Data }
+
+fn opt(s: Option<String>) -> Json = match s { Some(t) -> json::Str(t), None -> json::Null }
+
+/// A token as the suite writes one, or `None` for the end of the input, which it writes none of.
+fn written(t: Token) -> Option<Json> =
+  match t {
+    html::Doctype(d) ->
+      Some(
+        json::Array([
+          json::Str("DOCTYPE"),
+          opt(d.name),
+          opt(d.public_id),
+          opt(d.system_id),
+          json::Bool(!d.force_quirks),
+        ]),
+      ),
+    html::StartTag(tag) -> {
+      let attributes = json::Object(
+        map_of_entries(
+          map(tag.attributes, |a: Attribute| { key: a.name, value: json::Str(a.value) }),
+        ),
+      );
+      let head = [json::Str("StartTag"), json::Str(tag.name), attributes];
+      Some(json::Array(if tag.self_closing { push(head, json::Bool(true)) } else { head }))
+    },
+    html::EndTag(tag) -> Some(json::Array([json::Str("EndTag"), json::Str(tag.name)])),
+    html::Comment(data) -> Some(json::Array([json::Str("Comment"), json::Str(data)])),
+    html::Text(data) -> Some(json::Array([json::Str("Character"), json::Str(data)])),
+    html::Instruction(target, data) ->
+      Some(json::Array([json::Str("ProcessingInstruction"), json::Str(target), json::Str(data)])),
+    html::EndOfFile -> None,
+  }
+
+/// What the tokenizer reads of a run: its tokens as the suite writes them, and its errors' codes.
+type Got = { output: Json, errors: List<String> }
+
+fn got(r: Run) -> Got / {abort.raise} = {
+  let start: Start = { state: state_of(r.state), last_start_tag: r.last, foreign: false };
+  match html::tokenize(html::cursor(bytes_of_string(r.input), start, html::default_limits())) {
+    Ok(lexemes) ->
+      {
+        output: json::Array(
+          fold(lexemes, [], |all: List<Json>, l: Lexeme|
+            match written(l.token) { Some(j) -> push(all, j), None -> all }),
+        ),
+        errors: sort(
+          fold(lexemes, [], |all: List<String>, l: Lexeme|
+            fold(l.problems, all, |codes: List<String>, p: html::Problem|
+              push(codes, html::code(p.error)))),
+        ),
+      },
+    Err(_) -> { output: json::Str("refused"), errors: [] },
+  }
+}
+
+fn shown(r: Run, g: Got) -> String / {abort.raise} =
+  r.file ++ " `" ++ r.description ++ "` (" ++ r.state ++ "): " ++ json::to_string(g.output) ++ " "
+    ++ json::to_string(json::strings(g.errors))
+    ++ ", not "
+    ++ json::to_string(r.output)
+    ++ " "
+    ++ json::to_string(json::strings(r.errors))
+
+test "{b.file} from its run {b.from} reads as the suite says" for b: Block in blocks() {
+  let wrong = fold(b.runs, [], |found: List<String>, r: Run| {
+    let g = got(r);
+    if g.output == r.output && g.errors == r.errors { found } else { push(found, shown(r, g)) }
+  });
+  assert_eq(wrong, [])
+}
+
+test "the suite is the runs counted here" {
+  let s = suite();
+  assert_eq(len(s.runs), 7045);
+  assert_eq(map(s.unrun, |u: Unrun| u.file ++ ": " ++ u.why), [
+    "unicodeCharsProblematic.test: a lone surrogate",
+    "unicodeCharsProblematic.test: a lone surrogate",
+    "unicodeCharsProblematic.test: a lone surrogate",
+    "unicodeCharsProblematic.test: a lone surrogate",
+    "xmlViolation.test: the infoset coercion",
+    "xmlViolation.test: the infoset coercion",
+    "xmlViolation.test: the infoset coercion",
+    "xmlViolation.test: the infoset coercion",
+  ])
+}
