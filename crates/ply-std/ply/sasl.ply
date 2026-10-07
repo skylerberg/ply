@@ -17,6 +17,10 @@
 //! whether a mechanism sends the credential itself, which a protocol lets it do only where no one
 //! else reads the connection. A name and a password are taken as their UTF-8 bytes: RFC 4013's
 //! preparation is not applied, so only ASCII ones are sure to be what a server stored.
+//!
+//! `begin` and `answer` bind nothing. A protocol that knows its channel builds the SCRAM messages
+//! itself with `scram_first` and `scram_final` under a `Binding`, as postgres binds a TLS
+//! connection by the server's certificate under SCRAM-SHA-256-PLUS.
 
 import std.base64 (base64_decode, base64_encode)
 import std.bytes (int_of_ascii, xor)
@@ -206,7 +210,7 @@ fn scram_begun(
     let bare = scram_first_bare(user, s.nonce);
     {
       exchange: ScramFirst(secret, bare, s.most_iterations),
-      first: Some(spoken(bytes_of_string("n,," ++ bare))),
+      first: Some(spoken(bytes_of_string(gs2_header(Unbound) ++ bare))),
     }
   }
 
@@ -230,7 +234,7 @@ pub fn answer(x: Exchange, challenge: Bytes) -> Answered / {sasl.refused, abort.
         None -> sasl.refused(BadChallenge),
         Some(asked) -> if asked.iterations > most { sasl.refused(TooMuchWork(asked.iterations)) }
         else {
-          match scram_final(secret, bare, said, asked) {
+          match scram_final(Unbound, secret, bare, said, asked) {
             None -> sasl.refused(BadChallenge),
             Some(proof) ->
               {
@@ -288,9 +292,29 @@ fn bearer_message(
 // RFC 5802's exchange with RFC 7677's SHA-256: the client proves it knows the password without
 // sending it, and then the server proves it knows the verifier. Four messages.
 
-/// SCRAM's first message: a GS2 header saying no channel binding is in use, then the bare
-/// message.
-pub fn scram_first(user: String, nonce: String) -> String = "n,," ++ scram_first_bare(user, nonce)
+/// What a SCRAM exchange is bound to, RFC 5802 §6: nothing, on a channel with no binding to
+/// offer (`n`); nothing, by a client that would bind a channel the server offered no binding of
+/// (`y`), which lets a server that did offer one see it was stripped on the way; or the channel,
+/// by RFC 5929's `tls-server-end-point` data, the hash of the server's certificate (`p`), under the
+/// mechanism's `-PLUS` name.
+pub type Binding = | Unbound | Unoffered | ServerEndPoint(Bytes)
+
+/// The GS2 header a SCRAM exchange under `b` opens its first message with.
+pub fn gs2_header(b: Binding) -> String =
+  match b { Unbound -> "n,,", Unoffered -> "y,,", ServerEndPoint(_) -> "p=tls-server-end-point,," }
+
+/// What the final message's `c=` says: the GS2 header and the binding's data, in base64.
+fn channel_text(b: Binding) -> String / {abort.raise} =
+  base64_encode(
+    bytes_concat(bytes_of_string(gs2_header(b)), match b {
+      ServerEndPoint(data) -> data,
+      _ -> b"",
+    }),
+  )
+
+/// SCRAM's first message: the GS2 header `b` says, then the bare message.
+pub fn scram_first(b: Binding, user: String, nonce: String) -> String =
+  gs2_header(b) ++ scram_first_bare(user, nonce)
 
 /// The client's first message without its GS2 header, which the signatures cover: the user and
 /// the client's nonce. `=` and `,` in the name are escaped, because they separate the fields.
@@ -351,11 +375,13 @@ pub type Proof = { reply: String, expected: Bytes }
 /// The client's last message and the signature to hold the server to, out of the password's
 /// UTF-8 bytes, which the runtime stretches and keys without opening; `None` where the
 /// challenge's nonce does not open with the client's own, which a server that saw the first
-/// message always sends back.
+/// message always sends back. `b` is the binding the first message's header named.
 ///
 /// Both sides sign the client's bare message, the server's first message, and the final message
-/// without its proof, joined by commas.
+/// without its proof, joined by commas; the final message carries the binding, so a proof made
+/// over one channel does not prove anything over another.
 pub fn scram_final(
+  b: Binding,
   password: Secret<Bytes>,
   first_bare: String,
   server_first: String,
@@ -364,7 +390,7 @@ pub fn scram_final(
   match scram_attribute(first_bare, "r") {
     None -> None,
     Some(own) -> if own == "" || !string_starts_with(challenge.nonce, own) { None } else {
-      let without_proof = "c=biws,r=" ++ challenge.nonce;
+      let without_proof = "c=" ++ channel_text(b) ++ ",r=" ++ challenge.nonce;
       let signed = bytes_of_string(first_bare ++ "," ++ server_first ++ "," ++ without_proof);
       let salted = pbkdf2_sha256(password, challenge.salt, challenge.iterations);
       let client_key = hmac_sha256(salted, b"Client Key");
@@ -522,7 +548,7 @@ test "scram, against the example RFC 7677 works out" {
     Some(challenge) -> {
       assert_eq(challenge.iterations, 4096);
       assert_eq(bytes_len(challenge.salt), 16);
-      match scram_final(secret_of_bytes(b"pencil"), first_bare, server_first, challenge) {
+      match scram_final(Unbound, secret_of_bytes(b"pencil"), first_bare, server_first, challenge) {
         None -> panic("the example's nonce is not the client's"),
         Some(proof) -> {
           assert_eq(
@@ -531,7 +557,21 @@ test "scram, against the example RFC 7677 works out" {
           );
           assert(scram_verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=", proof.expected));
           assert(!scram_verify("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", proof.expected));
-          assert(!scram_verify("e=other", proof.expected))
+          assert(!scram_verify("e=other", proof.expected));
+          // A channel the exchange is bound to is in what both sides sign, so the proof moves.
+          match scram_final(
+              ServerEndPoint(b"\x01\x02"),
+              secret_of_bytes(b"pencil"),
+              first_bare,
+              server_first,
+              challenge,
+            ) {
+            None -> panic("a bound exchange has no proof"),
+            Some(bound) -> {
+              assert(string_starts_with(bound.reply, "c=cD10bHMtc2VydmVyLWVuZC1wb2ludCwsAQI=,r="));
+              assert(bound.expected != proof.expected)
+            },
+          }
         },
       }
     },
@@ -628,7 +668,9 @@ fn result_map_response(a: Result<Answered, Why>) -> Result<Bool, Why> =
 
 test "a scram user name escapes what separates fields" {
   assert_eq(scram_first_bare("a=b,c", "n"), "n=a=3Db=2Cc,r=n");
-  assert_eq(scram_first("user", "n1"), "n,,n=user,r=n1")
+  assert_eq(scram_first(Unbound, "user", "n1"), "n,,n=user,r=n1");
+  assert_eq(scram_first(Unoffered, "user", "n1"), "y,,n=user,r=n1");
+  assert_eq(scram_first(ServerEndPoint(b"h"), "user", "n1"), "p=tls-server-end-point,,n=user,r=n1")
 }
 
 test "a challenge that is not one is refused rather than defaulted" {
@@ -816,6 +858,7 @@ law "a server that holds a password's verifier takes the client's proof, and the
     match scram_challenge(server_first) {
       None -> false,
       Some(challenge) -> match scram_final(
+          Unbound,
           secret_bytes(secret_of_string(secret)),
           first_bare,
           server_first,
