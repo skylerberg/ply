@@ -46,13 +46,13 @@ import std.hash (sha256)
 import std.idna
 import std.ip
 import std.ip (Ip, Prefix)
-import std.list (all, any, concat, contains, count, find, flat_map)
+import std.list (all, any, concat, contains, count, find, flat_map, reverse)
 import std.oid
 import std.oid (Oid)
 import std.pem
 import std.result (result_err, result_ok)
 import std.show (show)
-import std.string (ascii_lower, is_ascii)
+import std.string (ascii_lower, is_ascii, join)
 import std.time (nanos_at)
 
 // --- What a certificate holds ----------------------------------------------------
@@ -267,6 +267,70 @@ pub fn is_ca(c: Certificate) -> Bool =
 /// Whether the subject and the issuer are one name.
 pub fn is_self_issued(c: Certificate) -> Bool = c.info.subject.der == c.info.issuer.der
 
+/// `commonName`, the attribute a client certificate's subject names its holder by.
+pub fn common_name() -> Oid = oid::Oid([2, 5, 4, 3])
+
+/// The values the attributes of type `id` in `n` hold, outermost first.
+pub fn values_of(n: Name, id: Oid) -> List<String> =
+  flat_map(n.rdns, |rdn: List<Attribute>|
+    map(filter(rdn, |a: Attribute| a.id == id), |a: Attribute| a.value))
+
+/// `n` as RFC 4514 writes a distinguished name: its relative names innermost first, separated by
+/// `,`, the attributes of one by `+`, each `TYPE=value`. `TYPE` is the short name RFC 4514 gives
+/// its type (`CN`, `L`, `ST`, `O`, `OU`, `C`, `STREET`, `DC`, `UID`), or its dotted identifier;
+/// `value` has escaped what §2.4 escapes, and one that is no string (`#` and its DER in hex) is
+/// written as it is.
+pub fn name_text(n: Name) -> String =
+  join(
+    map(reverse(n.rdns), |rdn: List<Attribute>|
+      join(map(rdn, |a: Attribute| type_text(a.id) ++ "=" ++ escaped_value(a.value)), "+")),
+    ",",
+  )
+
+fn type_text(id: Oid) -> String =
+  match oid::arcs(id) {
+    [2, 5, 4, 3] -> "CN",
+    [2, 5, 4, 7] -> "L",
+    [2, 5, 4, 8] -> "ST",
+    [2, 5, 4, 10] -> "O",
+    [2, 5, 4, 11] -> "OU",
+    [2, 5, 4, 6] -> "C",
+    [2, 5, 4, 9] -> "STREET",
+    [0, 9, 2342, 19200300, 100, 1, 25] -> "DC",
+    [0, 9, 2342, 19200300, 100, 1, 1] -> "UID",
+    _ -> oid::to_string(id),
+  }
+
+/// A value as RFC 4514 §2.4 writes it: `"`, `+`, `,`, `;`, `<`, `>` and `\` after a `\`, a space or
+/// a `#` that leads it and a space that ends it the same, and NUL as `\00`. A value that is no
+/// string, `#` and its DER in hex, is written as it is.
+fn escaped_value(v: String) -> String =
+  if string_starts_with(v, "#") && string_len(v) > 1 && all_hex(string_slice(v, 1, string_len(v))) {
+    v
+  } else {
+    let chars = string_chars(v);
+    let last = len(chars) - 1;
+    join(
+      fold(chars, { at: 0, out: [] }, |s: { at: Int, out: List<String> }, c: Char| {
+        let n = int_of_char(c);
+        let one = string_of_chars([c]);
+        let written = if n == 0 { "\\00" }
+        else if n == 34 || n == 43 || n == 44 || n == 59 || n == 60 || n == 62 || n == 92 {
+          "\\" ++ one
+        } else if (s.at == 0 && (n == 32 || n == 35)) || (s.at == last && n == 32) { "\\" ++ one }
+        else { one };
+        { at: s.at + 1, out: push(s.out, written) }
+      }).out,
+      "",
+    )
+  }
+
+fn all_hex(s: String) -> Bool =
+  all(string_chars(s), |c: Char| {
+    let n = int_of_char(c);
+    (n >= 48 && n <= 57) || (n >= 97 && n <= 102) || (n >= 65 && n <= 70)
+  })
+
 // --- Identifiers -----------------------------------------------------------------
 
 fn ext(last: Int) -> Oid = oid::Oid([2, 5, 29, last])
@@ -445,7 +509,9 @@ fn unrepeated(extensions: List<Extension>) -> Unit / {x509.refused} = {
 }
 
 /// An `AlgorithmIdentifier`'s type and parameters.
-fn identified(r: Reader) -> Read<{ id: Oid, parameters: Option<Value> }> / {Row} =
+fn identified(
+  r: Reader,
+) -> Read<{ id: Oid, parameters: Option<Value> }> / {asn1.refused, abort.raise} =
   asn1::within(asn1::read_sequence(r), |a: Reader| {
     let id = asn1::read_oid(a);
     if asn1::is_empty(id.rest) { { value: { id: id.value, parameters: None }, rest: id.rest } }
@@ -472,7 +538,7 @@ fn hash_named(v: Value) -> Option<Digest> =
   }
 
 /// The hash of RSASSA-PSS parameters that are one hash, MGF1 over it and a salt of its length.
-fn pss_digest(parameters: Value) -> Option<Digest> / {abort.raise} =
+fn pss_digest(parameters: Value) -> Option<Digest> =
   match parameters {
     asn1::Sequence([asn1::Constructed(_, [hash]), asn1::Constructed(_, [asn1::Sequence([asn1::ObjectId(mgf), masked])]), asn1::Constructed(_, [asn1::Integer(salt)])]) -> match hash_named(
         hash,
@@ -485,7 +551,7 @@ fn pss_digest(parameters: Value) -> Option<Digest> / {abort.raise} =
     _ -> None,
   }
 
-fn algorithm_at(r: Reader) -> Read<Algorithm> / {Row} = {
+fn algorithm_at(r: Reader) -> Read<Algorithm> / {asn1.refused, abort.raise} = {
   let found = identified(r);
   let id = found.value.id;
   let bare = found.value.parameters == None;
@@ -510,7 +576,7 @@ fn algorithm_at(r: Reader) -> Read<Algorithm> / {Row} = {
   { value: algorithm, rest: found.rest }
 }
 
-fn key_at(r: Reader) -> Read<Key> / {Row} =
+fn key_at(r: Reader) -> Read<Key> / {asn1.refused, abort.raise} =
   asn1::within(asn1::read_sequence(r), |s: Reader| {
     let found = identified(s);
     let bits = asn1::read_bit_string(found.rest);
@@ -535,7 +601,7 @@ fn latin1(bytes: Bytes) -> String / {abort.raise} =
       match char_of_int(bytes_at(bytes, i)) { Some(c) -> [c], None -> [] }),
   )
 
-fn attribute_at(r: Reader) -> Read<Attribute> / {Row} =
+fn attribute_at(r: Reader) -> Read<Attribute> / {asn1.refused, abort.raise} =
   asn1::within(asn1::read_sequence(r), |a: Reader| {
     let id = asn1::read_oid(a);
     let raw = asn1::read_raw(id.rest);
@@ -558,7 +624,7 @@ fn name_at(r: Reader, limits: Limits) -> Read<Name> / {Row} = {
   else { { value: { rdns: rdns.value, der: raw.value }, rest: rdns.rest } }
 }
 
-fn ia5(r: Reader, number: Int) -> Read<String> / {Row} =
+fn ia5(r: Reader, number: Int) -> Read<String> / {asn1.refused, abort.raise} =
   asn1::read_implicit(r, asn1::context(number), |x: Reader| asn1::read_string(x, Ia5String))
 
 fn general_name_at(r: Reader, limits: Limits) -> Read<GeneralName> / {Row} = {
@@ -811,7 +877,7 @@ fn extension_at(r: Reader, limits: Limits, mode: Reading) -> Read<Extension> / {
 
 // --- Names -----------------------------------------------------------------------
 
-fn label_held(label: String) -> Bool / {abort.raise} = {
+fn label_held(label: String) -> Bool = {
   let b = bytes_of_string(label);
   let n = bytes_len(b);
   n >= 1 && n <= 63 && bytes_scan(b, 0, b"abcdefghijklmnopqrstuvwxyz0123456789-", n) == n
@@ -819,7 +885,7 @@ fn label_held(label: String) -> Bool / {abort.raise} = {
     && bytes_at(b, n - 1) != b'-'
 }
 
-fn all_digits(label: String) -> Bool / {abort.raise} = {
+fn all_digits(label: String) -> Bool = {
   let b = bytes_of_string(label);
   bytes_scan(b, 0, b"0123456789", bytes_len(b)) == bytes_len(b)
 }
@@ -827,7 +893,7 @@ fn all_digits(label: String) -> Bool / {abort.raise} = {
 /// The labels of a host's name in lower case, or `None` for a text that is none: a label that is
 /// empty, over 63 octets, not letters, digits and inner hyphens, or a last label of digits alone,
 /// which is how an IP address ends.
-fn labels_of(name: String) -> Option<List<String>> / {abort.raise} =
+fn labels_of(name: String) -> Option<List<String>> =
   if !is_ascii(name) || string_len(name) == 0 || string_len(name) > 253 { None } else {
     let labels = string_split(ascii_lower(name), ".");
     let numeric = match list_at(labels, len(labels) - 1) { Some(l) -> all_digits(l), None -> true };
@@ -904,7 +970,7 @@ type Held = | Inside | Elsewhere | Garbled
 fn held_if(inside: Bool) -> Held = if inside { Inside } else { Elsewhere }
 
 /// The host of a mailbox or of a URI's authority, as labels.
-fn mailbox_of(mailbox: String) -> Option<{ local: String, host: List<String> }> / {abort.raise} =
+fn mailbox_of(mailbox: String) -> Option<{ local: String, host: List<String> }> =
   match string_split(mailbox, "@") {
     [local, host] -> match labels_of(host) {
       Some(labels) -> if local == "" { None } else { Some({ local: local, host: labels }) },
@@ -913,7 +979,7 @@ fn mailbox_of(mailbox: String) -> Option<{ local: String, host: List<String> }> 
     _ -> None,
   }
 
-fn uri_host(uri: String) -> Option<List<String>> / {abort.raise} =
+fn uri_host(uri: String) -> Option<List<String>> =
   match string_split(uri, "://") {
     [_, rest, ..] -> {
       let authority = match string_split(rest, "/") { [a, ..] -> a, [] -> rest };
@@ -1584,7 +1650,7 @@ fn drafted(draft: Draft) -> List<Bytes> / {Written} =
     ),
   )
 
-fn mask_bytes(bits: Int, octets: Int) -> Bytes / {abort.raise} =
+fn mask_bytes(bits: Int, octets: Int) -> Bytes =
   bytes_concat_all(
     map(range(0, octets), |i: Int| {
       let ones = min(max(bits - 8 * i, 0), 8);
@@ -1934,6 +2000,26 @@ fn checked(
 
 fn made<a>(body: () -> a / {x509.refused, abort.raise}) -> a / {abort.raise} =
   match try { body() } { Ok(x) -> x, Err(refusal) -> panic("the fixture is refused") }
+
+fn attribute(arcs: List<Int>, value: String) -> Attribute = { id: oid::Oid(arcs), value: value }
+
+test "a name is written as RFC 4514 writes it, innermost first, what it escapes escaped" {
+  let n: Name = {
+    rdns: [
+      [attribute([2, 5, 4, 6], "US")],
+      [attribute([2, 5, 4, 10], "Example, Inc.")],
+      [attribute([2, 5, 4, 11], "Sales"), attribute([2, 5, 4, 3], " Jo+Ann ")],
+      [attribute([1, 2, 3, 4], "#04024869")],
+      [attribute([0, 9, 2342, 19200300, 100, 1, 25], "#example;<x>")],
+    ],
+    der: b"",
+  };
+  assert_eq(
+    name_text(n),
+    "DC=\\#example\\;\\<x\\>,1.2.3.4=#04024869,OU=Sales+CN=\\ Jo\\+Ann\\ ,O=Example\\, Inc.,C=US",
+  );
+  assert_eq(values_of(n, common_name()), [" Jo+Ann "])
+}
 
 test "a built chain verifies to its root, and the path is the leaf, the CA and the root" {
   let p = made(pki);

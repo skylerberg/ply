@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The Ply runs (`ci-shards.sh`'s corpus entries), each a `ply test`: over the corpus with the grants
 # `benches/corpus.sh` gives the program, or over the CLI's suite with the grants its harness drives
-# `ply` with, from a scratch directory of the run's own. A run fails when a test fails, when the run
-# refuses, and when its filter selects no test, so a renamed test never stops being run quietly.
+# `ply` with, from a scratch directory of the run's own; the standard library's proof runs are a
+# `ply prove`. A run fails when a test fails or a claim does not hold, when the run refuses, and when
+# its filter selects no test or claim, so a renamed test never stops being run quietly.
 #
 #   ci-corpus.sh partition K TIMINGS [CUT]
 #       every run partition K takes (`ci-shards.sh corpus-for-partition K [CUT]`), each lane one
@@ -10,18 +11,26 @@
 #       `--filter` each, so the package's closure is loaded once a lane rather than once a run. Each
 #       run's milliseconds are appended to TIMINGS as `corpus <run> <ms>`: a module's are its tests'
 #       own, out of the report. Each `ply test` adds `cached <what> <n>`, the tests it took from the
-#       cache, which tells `ci-shards.sh timings` whether the run's costs are a cold run's.
+#       cache, which tells `ci-shards.sh timings` whether the run's costs are a cold run's. A lane
+#       prints each run whole as it ends, so the log of a job stopped short shows every run it
+#       finished.
+#
+#   Every `ply` the partition, desk and lone runs start is stopped at PLY_CI_DEADLINE, the epoch
+#   second the job set its runs to end by, and none starts after it: the job then fails naming the
+#   runs it stopped and the ones it never started, and the steps after it still keep what the runs
+#   wrote, so a re-run starts from there rather than cold.
 #   ci-corpus.sh desks K TIMINGS CUT [ARG...]
 #       the desk runs runner K takes (`ci-shards.sh desks-for-runner K CUT`, round robin when CUT is
 #       empty) in one `ply test` with the desk's grants and ARGs added, their milliseconds onto
 #       TIMINGS as a partition's
-#   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test`
+#   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test` or `ply prove`
 #   ci-corpus.sh select [CUT]
 #       the jobs a run has to start, as `KEY=VALUE` lines for the workflow's outputs: `partitions`
 #       and `corpus`, the matrices of the partitions, desk runners and runs alone holding a run no
 #       kept answer stands for, and `lanes` and `solo`, whether either holds one. Every `ply test`
 #       is the one `partition`, `desks` or `run` starts, asked only what an earlier run kept
-#       (`--kept`), so a job none of whose runs has work is never started.
+#       (`--kept`), so a job none of whose runs has work is never started. No kept answer stands for
+#       a proof run.
 #   ci-corpus.sh mark                  the moment `keep` gathers from
 #   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
 #                                      since `mark`, into DIR for a later run: a body is keyed by its
@@ -47,6 +56,8 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
 cli_suite=crates/ply-cli-tests/ply
+stdlib=crates/ply-corpus/stdlib
+TAB=$'\t'
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
 mark=$caches/ply-c-corpus.mark
@@ -80,18 +91,65 @@ desk_grants=(--exec "http_floor=$root/target/http-floor" --exec "pg_floor=$root/
 asked=()
 selecting=0
 
+# The epoch second every `ply` this job starts must end by; empty for no end.
+deadline=${PLY_CI_DEADLINE:-}
+# A run's status when the deadline stopped it, or came before it could start.
+STOPPED=124
+# Where the runs the deadline stopped or left unstarted are listed, one a line, when a job lists them.
+stopped=
+# The lock the lanes of a partition print through, when they print beside each other.
+lock=
+
+past_deadline() { [[ -n $deadline ]] && (($(date +%s) >= deadline)); }
+
+# The command, ended when the deadline comes along with everything it started: STOPPED then, and
+# when the deadline had already come.
+bounded() {
+  local status=0
+  [[ -n $deadline ]] || { "$@"; return; }
+  past_deadline && return "$STOPPED"
+  timeout --kill-after=30 "$((deadline - $(date +%s)))" "$@" || status=$?
+  if ((status == 124 || status == 137)) && past_deadline; then return "$STOPPED"; fi
+  return "$status"
+}
+
+# `stopped_run SECONDS ID...`: what the runs the deadline ended after SECONDS say, and their entries
+# in the list.
+stopped_run() {
+  local seconds=$1
+  shift
+  echo "::error::corpus $* stopped at the job's deadline after ${seconds}s"
+  [[ -z $stopped ]] || printf 'stopped %s\n' "$@" >> "$stopped"
+}
+
+# `not_started ID...`, likewise for runs the deadline came before.
+not_started() {
+  echo "corpus $* not started: the job's deadline had come"
+  [[ -z $stopped ]] || printf 'not-started %s\n' "$@" >> "$stopped"
+}
+
+# FILE's lines, all at once, then FILE gone: a run's lines are written whole once it ends, so the
+# lane beside it never cuts into them.
+said() {
+  if [[ -n $lock ]]; then flock "$lock" cat "$1"; else cat "$1"; fi
+  rm -f "$1"
+}
+
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
-# directory of its own, which its harness empties before each test and refuses without the marker.
+# directory of its own, which its harness empties before each test and refuses without the marker,
+# and the standard library's fixtures with every shipped module's tests, granted nothing.
 tested() {
   local path=$1 status=0 dir
   shift
   if [[ $path == "$cli_suite" ]]; then
     dir=$(mktemp -d)
     touch "$dir/.ply-scratch"
-    (cd "$dir" && "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
+    (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
     rm -rf "$dir"
+  elif [[ $path == "$stdlib" ]]; then
+    bounded "$ply" test --std "$path" --json "$@" || status=$?
   else
-    "$ply" test "$path" "$@" "${grants[@]}" || status=$?
+    bounded "$ply" test "$path" "$@" "${grants[@]}" || status=$?
   fi
   return "$status"
 }
@@ -136,32 +194,34 @@ spent() {
   ' "$1" 2>/dev/null
 }
 
-# The run ID with ARGs added, its `cached` row onto TIMINGS when that is not empty.
+# The run ID with ARGs added, its `cached` row onto TIMINGS when that is not empty. STOPPED when the
+# deadline ended it.
 run_one() {
-  local timings=$1 id=$2 line path filter status=0 selected out started
+  local timings=$1 id=$2 line path filter shard status=0 selected out started
   shift 2
+  if [[ $id == proofs || $id == proofs:* ]]; then
+    run_proofs "$timings" "$id" -- "$@"
+    return
+  fi
   line=$("$shards" corpus-line "$id") || return 2
-  read -r path filter <<< "$line"
+  fields "$line"
   out=$(mktemp)
   started=$(date +%s%3N)
   if [[ $id == package-* || $id == fixture-* ]]; then
     # A package's own suite and a fixture run as `ply test` runs them: the corpus's grants are for
     # the corpus.
-    "$ply" test "$path" --json "$@" > "$out" || status=$?
-  elif [[ $id == stdlib ]]; then
-    "$ply" test --std "$path" --json "$@" > "$out" || status=$?
-    # A kept answer of the tests stands only while the library and the `ply` its proofs ran on do.
-    local proved
-    if ((!selecting)) && ! proved=$("$ply" prove --std "$path" 2>&1); then
-      printf '%s\n' "$proved" >&2
-      status=1
-    fi
+    bounded "$ply" test "$path" --json ${shard:+--shard "$shard"} "$@" > "$out" || status=$?
   else
-    tested "$path" ${filter:+--filter "$filter"} "$@" > "$out" || status=$?
+    tested "$path" ${filter:+--filter "$filter"} ${shard:+--shard "$shard"} "$@" > "$out" || status=$?
   fi
   if ((selecting)); then
     rm -f "$out"
     return "$status"
+  fi
+  if ((status == STOPPED)); then
+    stopped_run "$((($(date +%s%3N) - started) / 1000))" "$id"
+    rm -f "$out"
+    return "$STOPPED"
   fi
   listed "$out"
   timed "$out" "$path" >> "$durations"
@@ -177,35 +237,64 @@ run_one() {
   rm -f "$out"
 }
 
-# The runs IDs, all of one package, in one `ply test` with the ARGs after `--` added: each run's
-# milliseconds are the summed durations of the tests whose `<module>.<label>` key its filter holds,
-# and a run whose filter selected none fails.
-run_modules() {
-  local timings=$1 id line path filter status=0 out bad=0 n ms i
-  local -a filters=() ids=() args=() extra=()
-  shift
+# A corpus line, `path<TAB>filter<TAB>shard`, into the caller's `path`, `filter` and `shard`, either
+# of the last two empty.
+fields() {
+  local rest=${1#*"$TAB"}
+  path=${1%%"$TAB"*}
+  filter=${rest%%"$TAB"*}
+  shard=${rest#*"$TAB"}
+}
+
+# `ID... [-- ARG...]` into the caller's `ids`, `filters`, `cuts`, `extra` and `path`: the runs, the
+# filter and part of each, the ARGs, and the package the runs are all of.
+parsed_runs() {
+  local lines line filter shard
   while [ $# -gt 0 ]; do
     if [ "$1" = -- ]; then
       shift
       extra=("$@")
       break
     fi
-    id=$1
+    ids+=("$1")
     shift
-    line=$("$shards" corpus-line "$id") || return 2
-    read -r path filter <<< "$line"
-    ids+=("$id")
-    filters+=("$filter")
-    args+=(--filter "$filter")
   done
+  lines=$("$shards" corpus-line "${ids[@]}") || return 2
+  while IFS= read -r line; do
+    fields "$line"
+    filters+=("$filter")
+    cuts+=("$shard")
+  done <<< "$lines"
+}
+
+# The runs IDs, all of one package, in one `ply test` with the ARGs after `--` added: each run's
+# milliseconds are the summed durations of the tests whose `<module>.<label>` key its filter holds,
+# and a run whose filter selected none fails. STOPPED when the deadline ended them.
+run_modules() {
+  local timings=$1 path status=0 out bad=0 n ms i started key
+  local -a filters=() cuts=() ids=() args=() extra=()
+  shift
+  parsed_runs "$@" || return 2
+  for i in "${!filters[@]}"; do
+    args+=(--filter "${filters[$i]}")
+    [[ -z ${cuts[$i]} ]] || args+=(--shard "${cuts[$i]}")
+  done
+  # A part of a run is a `ply test` of its own, and the cut charges its startup apart.
+  key=$path
+  [[ -z ${cuts[0]} ]] || key=$path#${ids[0]}
   # What an earlier run kept answers each run of several apart, whichever runs it was batched with:
   # only the ones it does not answer are run.
+  started=$(date +%s%3N)
   if ((!selecting)) && [ "${#ids[@]}" -gt 1 ]; then
     local asking=0 left kept_ids=() kept_filters=() answered=()
     out=$(mktemp)
     tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} --kept > "$out" || asking=$?
     left=$(jq -r '.unanswered[]?' "$out" 2>/dev/null)
     rm -f "$out"
+    if [ "$asking" -eq "$STOPPED" ]; then
+      stopped_run "$((($(date +%s%3N) - started) / 1000))" "${ids[@]}"
+      return "$STOPPED"
+    fi
     if [ "$asking" -eq 0 ]; then
       echo "answered by what earlier runs kept: ${ids[*]}"
       return 0
@@ -217,6 +306,7 @@ run_modules() {
           kept_ids+=("${ids[$i]}")
           kept_filters+=("${filters[$i]}")
           args+=(--filter "${filters[$i]}")
+          [[ -z ${cuts[$i]} ]] || args+=(--shard "${cuts[$i]}")
         else
           answered+=("${ids[$i]}")
         fi
@@ -233,6 +323,11 @@ run_modules() {
     rm -f "$out"
     return "$status"
   fi
+  if ((status == STOPPED)); then
+    stopped_run "$((($(date +%s%3N) - started) / 1000))" "${ids[@]}"
+    rm -f "$out"
+    return "$STOPPED"
+  fi
   wall=$(($(date +%s%3N) - started))
   listed "$out"
   timed "$out" "$path" >> "$durations"
@@ -240,11 +335,20 @@ run_modules() {
   cached_row "$out" "$path" "$timings"
   # The startup the cut charges a lane once per package.
   ran=$(jq '(.summary.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
-  printf 'startup\t%s\t%s\n' "$path" "$((wall > ran ? wall - ran : 0))" >> "$timings"
+  printf 'startup\t%s\t%s\n' "$key" "$((wall > ran ? wall - ran : 0))" >> "$timings"
+  # Per filter, every test it names, run or cached (a module whose tests all passed before selects
+  # them), and the milliseconds of those that ran: one read of a report that can hold thousands.
+  local -a counted=()
+  read -ra counted <<< "$(jq -r '
+    [.selection.tests[]? | .key // ""] as $selected | [.results[]? | [.key // "", .duration_ms // 0]] as $ran
+    | [$ARGS.positional[] as $f
+        | ([$selected[] | select(contains($f))] | length),
+          ([$ran[] | select(.[0] | contains($f)) | .[1]] | add // 0 | floor)]
+    | map(tostring) | join(" ")
+  ' "$out" --args "${filters[@]}" 2>/dev/null)"
   for i in "${!ids[@]}"; do
-    # Every test the filter names, run or cached: a module whose tests all passed before selects them.
-    n=$(jq --arg f "${filters[$i]}" '[.selection.tests[]? | select(.key | contains($f))] | length' "$out" 2>/dev/null || echo 0)
-    ms=$(jq --arg f "${filters[$i]}" '[.results[]? | select(.key | contains($f)) | .duration_ms] | add // 0 | floor' "$out" 2>/dev/null || echo 0)
+    n=${counted[$((2 * i))]:-0}
+    ms=${counted[$((2 * i + 1))]:-0}
     if [ "$n" -eq 0 ]; then
       echo "corpus run ${ids[$i]} selected no test (filter: ${filters[$i]})" >&2
       bad=1
@@ -259,37 +363,146 @@ run_modules() {
   rm -f "$out"
 }
 
-# One lane's runs, one after another: the program's own, each fixture's and each package's suite in a
-# `ply test` of their own, every checks run in one, and every run of the CLI's suite in one.
-lane() {
-  local timings=$1 id started failed=0
-  local durations=${1%.tsv}.durations
-  local -a checks=() cli=()
+# The proof runs IDs of the library, in one `ply prove` with the ARGs after `--` added: each run's
+# milliseconds are its share of the prove's wall clock, by the claims its filter names, since what a
+# prove spends grows with the claims it is asked for, its load as well. A run whose filter names no
+# claim fails. Nothing an earlier run kept answers a proof, so a selecting run always has one to run.
+# STOPPED when the deadline ended them.
+run_proofs() {
+  local timings=$1 path status=0 out bad=0 i n all cached spent started wall
+  local -a filters=() cuts=() ids=() args=() extra=()
   shift
+  parsed_runs "$@" || return 2
+  for i in "${!filters[@]}"; do [[ -z ${filters[$i]} ]] || args+=(--filter "${filters[$i]}"); done
+  ((!selecting)) || return 1
+  out=$(mktemp)
+  started=$(date +%s%3N)
+  bounded "$ply" prove --std "$path" ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"} --json > "$out" || status=$?
+  if ((status == STOPPED)); then
+    stopped_run "$((($(date +%s%3N) - started) / 1000))" "${ids[@]}"
+    rm -f "$out"
+    return "$STOPPED"
+  fi
+  wall=$(($(date +%s%3N) - started))
+  spent=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
+  all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
+  cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
+  echo "proved: $all claims, $cached from the cache, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
+  [[ -z $timings ]] || printf 'cached\tprove:%s\t%s\n' "$path" "$cached" >> "$timings"
+  local -a counted=()
+  read -ra counted <<< "$(jq -r '
+    [.obligations[]? | .owner // ""] as $owners
+    | [$ARGS.positional[] as $f | [$owners[] | select(contains($f))] | length | tostring] | join(" ")
+  ' "$out" --args "${filters[@]}" 2>/dev/null)"
+  for i in "${!ids[@]}"; do
+    n=${counted[$i]:-0}
+    if [ "$n" -eq 0 ]; then
+      echo "corpus run ${ids[$i]} selected no claim (filter: ${filters[$i]:-none})" >&2
+      bad=1
+    fi
+    [[ -z $timings ]] || printf 'corpus\t%s\t%s\n' "${ids[$i]}" "$((all > 0 ? wall * n / all : 0))" >> "$timings"
+  done
+  if [ "$status" -ne 0 ] || [ "$bad" -ne 0 ]; then
+    disproved "$out"
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
+}
+
+# What a red proof run said: each claim that does not hold, how and where, and a refused run's
+# diagnostics.
+disproved() {
+  jq -r '
+    (.obligations[]? | select(.outcome | IN("refuted", "outgrown", "vacuous", "defect"))
+      | "FAILED \(.owner) \(.label): \(.outcome)\(if .location then " at \(.location)" else "" end)",
+        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome, .tier) | tojson)"),
+    (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
+  ' "$1" 2>/dev/null || cat "$1"
+}
+
+# A line, out whole beside the lanes printing next to it.
+say() {
+  if [[ -n $lock ]]; then flock "$lock" printf '%s\n' "$*"; else printf '%s\n' "$*"; fi
+}
+
+# Whether the deadline has come before the runs IDs of the lane NAME titled WHAT could start, which
+# then says so in a block of its own.
+too_late() {
+  local name=$1 what=$2 block
+  shift 2
+  past_deadline || return 1
+  block=$(mktemp)
+  { echo "::group::$name: $what $*"; not_started "$@"; echo "::endgroup::"; } > "$block" 2>&1
+  said "$block"
+}
+
+# The run ID as `run_one` runs it, in a block of the lane NAME, its wall clock onto TIMINGS.
+single() {
+  local name=$1 timings=$2 id=$3 status=0 started block
+  too_late "$name" corpus "$id" && return 1
+  say "$name: started corpus $id"
+  block=$(mktemp)
+  started=$(date +%s%3N)
+  {
+    echo "::group::$name: corpus $id"
+    run_one "$timings" "$id" ${asked[@]+"${asked[@]}"} || status=$?
+    echo "::endgroup::"
+  } > "$block" 2>&1
+  ((status == STOPPED)) || printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
+  said "$block"
+  return "$((status != 0))"
+}
+
+# The runs IDs of one package as RUNNER (`run_modules` or `run_proofs`) runs them, in a block of the
+# lane NAME titled WHAT.
+batch() {
+  local name=$1 what=$2 runner=$3 timings=$4 status=0 block
+  shift 4
+  too_late "$name" "$what" "$@" && return 1
+  say "$name: started $what $*"
+  block=$(mktemp)
+  {
+    echo "::group::$name: $what $*"
+    "$runner" "$timings" "$@" -- ${asked[@]+"${asked[@]}"} || status=1
+    echo "::endgroup::"
+  } > "$block" 2>&1
+  said "$block"
+  return "$status"
+}
+
+# One lane's runs, one after another: the program's own, each fixture's and each package's suite in a
+# `ply test` of their own, every checks run in one, every run of the CLI's suite in one, the library's
+# tests in one and its proofs in a `ply prove`, and each part of a run cut into parts in one of its own.
+# Each prints as it ends, a block under the lane's NAME, and once the deadline has come none starts.
+lane() {
+  local name=$1 timings=$2 id failed=0
+  local durations=${2%.tsv}.durations
+  local -a checks=() cli=() library=() proofs=()
+  shift 2
   : > "$timings"
   : > "$durations"
   for id in "$@"; do
     case "$id" in
-      program | stdlib | package-* | fixture-*)
-        echo "::group::corpus $id"
-        started=$(date +%s%3N)
-        run_one "$timings" "$id" ${asked[@]+"${asked[@]}"} || failed=1
-        printf 'corpus\t%s\t%s\n' "$id" "$(($(date +%s%3N) - started))" >> "$timings"
-        echo "::endgroup::"
-        ;;
+      program | program#* | package-* | fixture-*) single "$name" "$timings" "$id" || failed=1 ;;
+      *#*) batch "$name" "part ${id##*#} of ${id%#*}" run_modules "$timings" "$id" || failed=1 ;;
       cli-*) cli+=("$id") ;;
+      stdlib:*) library+=("$id") ;;
+      proofs:*) proofs+=("$id") ;;
       *) checks+=("$id") ;;
     esac
   done
   if [ "${#checks[@]}" -gt 0 ]; then
-    echo "::group::corpus checks ${checks[*]}"
-    run_modules "$timings" "${checks[@]}" -- ${asked[@]+"${asked[@]}"} || failed=1
-    echo "::endgroup::"
+    batch "$name" "corpus checks" run_modules "$timings" "${checks[@]}" || failed=1
   fi
   if [ "${#cli[@]}" -gt 0 ]; then
-    echo "::group::the CLI's suite ${cli[*]}"
-    run_modules "$timings" "${cli[@]}" -- ${asked[@]+"${asked[@]}"} || failed=1
-    echo "::endgroup::"
+    batch "$name" "the CLI's suite" run_modules "$timings" "${cli[@]}" || failed=1
+  fi
+  if [ "${#library[@]}" -gt 0 ]; then
+    batch "$name" "the library's tests" run_modules "$timings" "${library[@]}" || failed=1
+  fi
+  if [ "${#proofs[@]}" -gt 0 ]; then
+    batch "$name" "the library's proofs" run_proofs "$timings" "${proofs[@]}" || failed=1
   fi
   return "$failed"
 }
@@ -316,21 +529,26 @@ case "${1:-}" in
     : > "$timings"
     : > "$durations"
     work=$(mktemp -d)
+    lock=$work/lock
+    stopped=$work/stopped
+    : > "$lock"
+    : > "$stopped"
     lanes=$(cut -d' ' -f1 <<< "$runs" | sort -un)
     pids=()
     for l in $lanes; do
       read -ra ids <<< "$(awk -v l="$l" '$1 == l { printf "%s ", $2 }' <<< "$runs")"
-      lane "$work/lane-$l.tsv" "${ids[@]}" > "$work/lane-$l.log" 2>&1 &
+      lane "lane $l" "$work/lane-$l.tsv" "${ids[@]}" &
       pids+=("$!")
     done
     failed=0
     for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
     for l in $lanes; do
-      echo "=== corpus lane $l"
-      cat "$work/lane-$l.log"
       cat "$work/lane-$l.tsv" >> "$timings"
       cat "$work/lane-$l.durations" >> "$durations"
     done
+    if [ -s "$stopped" ]; then
+      echo "::error::partition $shard reached its deadline with $(grep -c '^stopped ' "$stopped") runs stopped and $(grep -c '^not-started ' "$stopped") not started: what the runs finished is kept, and a re-run of this job starts from it"
+    fi
     rm -rf "$work"
     exit "$failed"
     ;;
@@ -368,7 +586,7 @@ case "${1:-}" in
         placed=$("$shards" corpus-for-partition "$k" "$cut") || exit 2
         for l in $(cut -d' ' -f1 <<< "$placed" | sort -un); do
           read -ra ids <<< "$(awk -v l="$l" '$1 == l { printf "%s ", $2 }' <<< "$placed")"
-          lane "$work/lane-$k-$l.tsv" "${ids[@]}" > /dev/null 2>&1 || exit 1
+          lane "lane $l" "$work/lane-$k-$l.tsv" "${ids[@]}" > /dev/null 2>&1 || exit 1
         done
       ) &
       pids+=("$!")

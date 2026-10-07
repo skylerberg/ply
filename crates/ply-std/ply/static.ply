@@ -18,16 +18,17 @@
 //! index file where `Options` names one, and 404 where not. The host refuses a path that leaves
 //! the root besides. Each answer names its type with `nosniff`, its strong entity tag (the size
 //! and the modification time), `Last-Modified`, `Date` and `Accept-Ranges: bytes`; several ranges
-//! are one `multipart/byteranges` body under a boundary drawn from `entropy`. A file is read
-//! through a handle, or by `read_at` for a range, a chunk at a time, so no read passes `std.fs`'s
-//! bound, and the answer holds the bytes whole: `std.http`'s responses carry no stream.
+//! are one `multipart/byteranges` body under a boundary drawn from `entropy`. A file's body is a
+//! stream of its length, read through a handle, or by `read_at` for a range, a chunk at a time as
+//! it is sent, so a file of any size is answered in the memory of a chunk; an answer to `HEAD`
+//! opens nothing.
 
 import std.date
 import std.date (OffsetDateTime)
 import std.fs
 import std.fs (fs)
 import std.http
-import std.http (Headers, Method, Request, Response)
+import std.http (Body, Headers, Method, Request, Response, Stream, Streamed)
 import std.ip
 import std.ip (ip)
 import std.list (all, any, sort_by)
@@ -37,6 +38,8 @@ import std.multipart
 import std.net
 import std.net (Says, net)
 import std.random (entropy, rand, with_rand)
+import std.seq
+import std.seq (Seq)
 import std.string (ascii_trim, int_of_string)
 import std.time (nanos_at)
 import std.url (url_decode)
@@ -150,7 +153,7 @@ fn if_match_holds(headers: Headers, v: Validators) -> Bool / {abort.raise} =
   }
 
 /// `If-Unmodified-Since`, read only where there is no `If-Match` and the resource has a date.
-fn unmodified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool / {abort.raise} =
+fn unmodified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool =
   if http::has_header(headers, "if-match") { true } else {
     match ((http::date_field(headers, "if-unmodified-since", now), v.modified)) {
       (Some(at), Some(modified)) -> seconds_of(modified) <= seconds_of(at),
@@ -174,7 +177,7 @@ fn none_match_holds(headers: Headers, v: Validators) -> Option<Bool> / {abort.ra
   }
 
 /// `If-Modified-Since`: whether the resource changed after the date the client holds.
-fn modified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool / {abort.raise} =
+fn modified_since_holds(headers: Headers, v: Validators, now: Instant) -> Bool =
   match ((http::date_field(headers, "if-modified-since", now), v.modified)) {
     (Some(at), Some(modified)) -> seconds_of(modified) > seconds_of(at),
     _ -> true,
@@ -362,13 +365,16 @@ pub fn file_etag(size: Int, modified: Instant) -> ETag / {abort.raise} =
 
 /// The answer to `req` from the file `path` names under the root `r`, `path` being what the
 /// request names below where the files are served, as the request wrote it. `now` is the wall
-/// clock's, for `Date` and for reading the client's dates.
-pub fn serve<[r]>(
+/// clock's, for `Date` and for reading the client's dates. The body is a stream of the file's
+/// length, read through a handle `Options.chunk` bytes at a time as it is sent, and a range of it
+/// by `read_at`; a file that ends short of the length it had when it was looked at, or changes,
+/// leaves the stream short and its connection closed. An answer to `HEAD` opens nothing.
+pub fn serve<[r] | s>(
   req: Request,
   path: String,
   options: Options,
   now: OffsetDateTime,
-) -> Response / {fs.kind[r], fs.stat[r], fs.open[r], fs.read_chunk[r], fs.close[r], fs.read_at[r], entropy.next, abort.raise} =
+) -> Response<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> / {fs.kind[r], fs.stat[r], fs.open[r], fs.read_at[r], entropy.next, abort.raise} =
   if req.method != http::Get && req.method != http::Head {
     http::dated(http::method_not_allowed([http::Get, http::Head]), now)
   } else {
@@ -381,17 +387,14 @@ pub fn serve<[r]>(
     }
   }
 
-fn not_found(now: OffsetDateTime) -> Response =
+fn not_found<| e>(now: OffsetDateTime) -> Response<| e> =
   http::dated(http::text_response(404, "there is no such file\n"), now)
 
 type Found = { path: String, stat: fs::Stat }
 
 /// The file `under` names, its index where it is a directory, where every step to it is a file or
 /// a directory and none a link.
-fn found<[r]>(
-  under: String,
-  options: Options,
-) -> Option<Found> / {fs.kind[r], fs.stat[r], abort.raise} =
+fn found<[r]>(under: String, options: Options) -> Option<Found> / {fs.kind[r], fs.stat[r]} =
   if !unlinked[r](under) { None } else {
     match fs.stat[r](under) {
       Some(s) -> if s.kind == fs::File { Some({ path: under, stat: s }) }
@@ -412,7 +415,7 @@ fn found<[r]>(
   }
 
 /// Whether no step of `under` is a link.
-fn unlinked<[r]>(under: String) -> Bool / {fs.kind[r], abort.raise} =
+fn unlinked<[r]>(under: String) -> Bool / {fs.kind[r]} =
   if under == "." { true } else {
     fold(
       string_split(under, "/"),
@@ -424,12 +427,12 @@ fn unlinked<[r]>(under: String) -> Bool / {fs.kind[r], abort.raise} =
     ).ok
   }
 
-fn answered<[r]>(
+fn answered<[r] | s>(
   req: Request,
   file: Found,
   options: Options,
   now: OffsetDateTime,
-) -> Response / {fs.open[r], fs.read_chunk[r], fs.close[r], fs.read_at[r], entropy.next, abort.raise} = {
+) -> Response<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> / {fs.open[r], fs.read_at[r], entropy.next, abort.raise} = {
   let tag = file_etag(file.stat.size, file.stat.modified);
   let modified = date::of_instant(file.stat.modified);
   let v = { etag: Some(tag), modified: Some(modified) };
@@ -452,40 +455,123 @@ fn answered<[r]>(
           "bytes */" ++ int_to_string(file.stat.size),
         ),
       },
-    Whole -> match whole[r](file.path, file.stat.size, options.chunk) {
-      Some(body) ->
-        {
-          ..described,
-          headers: http::set_header(described.headers, "content-type", kind),
-          body: body,
-        },
-      None -> changed(now),
+    Whole -> {
+      let typed = http::set_header(described.headers, "content-type", kind);
+      if req.method == http::Head {
+        { ..described, headers: typed, body: unread[r](file.stat.size) }
+      } else {
+        match fs.open[r](file.path, fs::ToRead) {
+          Err(_) -> changed(now),
+          Ok(opened) ->
+            {
+              ..described,
+              headers: typed,
+              body: file_body[r](opened, file.stat.size, options.chunk),
+            },
+        }
+      }
     },
-    Partial([one]) -> match range_bytes[r](file.path, one, options.chunk) {
-      Some(body) ->
-        {
-          status: 206,
-          headers: http::set_header(
-            http::set_header(described.headers, "content-type", kind),
-            "content-range",
-            content_range(one, file.stat.size),
-          ),
-          body: body,
-        },
-      None -> changed(now),
-    },
+    Partial([one]) ->
+      {
+        status: 206,
+        headers: http::set_header(
+          http::set_header(described.headers, "content-type", kind),
+          "content-range",
+          content_range(one, file.stat.size),
+        ),
+        body: range_body[r](file.path, one, options.chunk),
+      },
     Partial(ranges) ->
       byteranges[r](file.path, ranges, file.stat.size, kind, described, options.chunk, now),
   }
 }
 
+/// A body of `size` bytes that is never read, as the answer to `HEAD` is.
+fn unread<[r] | s>(
+  size: Int,
+) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+    length: Some(size),
+    chunks: seq::empty(),
+    close: || (),
+  };
+  Streamed(held)
+}
+
+/// The `size` bytes of the file `f` is open on, as they are pulled, the file closed with the stream.
+fn file_body<[r] | s>(
+  f: Int,
+  size: Int,
+  chunk: Int,
+) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+    length: Some(size),
+    chunks: through[r](f, size, chunk),
+    close: || {
+      fs.close[r](f);
+      ()
+    },
+  };
+  Streamed(held)
+}
+
+/// The bytes of `range` in the file at `path`, as they are pulled.
+fn range_body<[r] | s>(
+  path: String,
+  range: ByteRange,
+  chunk: Int,
+) -> Body<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+  let held: Stream<| {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | s}> = {
+    length: Some(range.last - range.first + 1),
+    chunks: ranged_chunks[r](path, range, chunk),
+    close: || (),
+  };
+  Streamed(held)
+}
+
+/// The `size` bytes of the file `f` is open on, a chunk of at most `chunk` bytes each pull; it ends
+/// short where the file does.
+fn through<[r] | e>(
+  f: Int,
+  size: Int,
+  chunk: Int,
+) -> Seq<Bytes | {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | e}> = {
+  let step: (Int) -> Option<{ value: Bytes, next: Int }> / {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | e} = |sent: Int|
+    if sent >= size { None } else {
+      match fs.read_chunk[r](f, min(chunk, size - sent)) {
+        Some(b) -> if bytes_len(b) == 0 { None }
+        else { Some({ value: b, next: sent + bytes_len(b) }) },
+        None -> None,
+      }
+    };
+  seq::unfold(0, step)
+}
+
+/// The bytes of `range` in the file at `path`, read `chunk` at a time as they are pulled.
+fn ranged_chunks<[r] | e>(
+  path: String,
+  range: ByteRange,
+  chunk: Int,
+) -> Seq<Bytes | {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | e}> = {
+  let want = range.last - range.first + 1;
+  let step: (Int) -> Option<{ value: Bytes, next: Int }> / {fs.read_chunk[r], fs.read_at[r], fs.close[r], abort.raise | e} = |sent: Int|
+    if sent >= want { None } else {
+      match fs.read_at[r](path, range.first + sent, min(chunk, want - sent)) {
+        Some(b) -> if bytes_len(b) == 0 { None }
+        else { Some({ value: b, next: sent + bytes_len(b) }) },
+        None -> None,
+      }
+    };
+  seq::unfold(0, step)
+}
+
 /// The fields every answer about a file carries, and no body.
-fn described(
+fn described<| e>(
   tag: ETag,
   modified: OffsetDateTime,
   options: Options,
   now: OffsetDateTime,
-) -> Response = {
+) -> Response<| e> = {
   let base = http::last_modified(http::dated(http::response(200, b""), now), modified);
   let fields = http::set_header(
     http::set_header(
@@ -506,18 +592,19 @@ fn content_range(r: ByteRange, size: Int) -> String =
   "bytes " ++ int_to_string(r.first) ++ "-" ++ int_to_string(r.last) ++ "/" ++ int_to_string(size)
 
 /// The file changed between its look and its read, which a retry answers.
-fn changed(now: OffsetDateTime) -> Response =
+fn changed<| e>(now: OffsetDateTime) -> Response<| e> =
   http::dated(http::text_response(503, "the file changed while it was read\n"), now)
 
-fn byteranges<[r]>(
+/// Several ranges, as one `multipart/byteranges` body read whole: at most `max_ranges` of them.
+fn byteranges<[r] | e>(
   path: String,
   ranges: List<ByteRange>,
   size: Int,
   kind: String,
-  described: Response,
+  described: Response<| e>,
   chunk: Int,
   now: OffsetDateTime,
-) -> Response / {fs.read_at[r], entropy.next, abort.raise} = {
+) -> Response<| e> / {fs.read_at[r], entropy.next, abort.raise} = {
   let parts = fold(ranges, Some([]), |acc: Option<List<multipart::Part>>, r: ByteRange|
     match acc {
       None -> None,
@@ -550,51 +637,12 @@ fn byteranges<[r]>(
             "content-type",
             "multipart/byteranges; boundary=" ++ boundary,
           ),
-          body: body,
+          body: http::Whole(body),
         },
       Err(_) -> changed(now),
     },
   }
 }
-
-/// A file's `size` bytes, read through a handle `chunk` bytes at a time; `None` where it is not
-/// there or is no longer that size.
-fn whole<[r]>(
-  path: String,
-  size: Int,
-  chunk: Int,
-) -> Option<Bytes> / {fs.open[r], fs.read_chunk[r], fs.close[r], abort.raise} =
-  match fs.open[r](path, fs::ToRead) {
-    Err(_) -> None,
-    Ok(file) ->
-      bracket(
-        || file,
-        |f: Int| {
-          fs.close[r](f);
-          ()
-        },
-        |f: Int| read_through[r](f, size, chunk),
-      ),
-  }
-
-fn read_through<[r]>(
-  f: Int,
-  size: Int,
-  chunk: Int,
-) -> Option<Bytes> / {fs.read_chunk[r], abort.raise} =
-  iterate({ got: [], total: 0 }, size + 2, |s: { got: List<Bytes>, total: Int }|
-    if s.total >= size {
-      match fs.read_chunk[r](f, 1) {
-        Some(b) -> Stop(if bytes_len(b) == 0 { Some(bytes_concat_all(s.got)) } else { None }),
-        None -> Stop(None),
-      }
-    } else {
-      match fs.read_chunk[r](f, min(chunk, size - s.total)) {
-        None -> Stop(None),
-        Some(b) -> if bytes_len(b) == 0 { Stop(None) }
-        else { Continue({ got: push(s.got, b), total: s.total + bytes_len(b) }) },
-      }
-    })
 
 /// The bytes of `r` in the file, read `chunk` at a time; `None` where the file no longer holds
 /// them all.
@@ -894,17 +942,32 @@ fn site() -> fs::MemFs / {abort.raise} = {
 
 fn noon() -> OffsetDateTime / {abort.raise} = at_second(1700000100)
 
-/// The answer to a request for `path` with `pairs` over the site, under `options`.
+/// An answer with its body read whole, and the length it said it had.
+type Read = { status: Int, headers: Headers, body: Bytes, length: Option<Int> }
+
+/// The answer to a request for `path` with `pairs` over the site, under `options`, its body read
+/// while the site is there to read.
 fn fetched(
   method: Method,
   path: String,
   pairs: List<{ name: String, value: String }>,
   options: Options,
-) -> Response / {abort.raise} = {
+) -> Read / {abort.raise} = {
   let bare = http::request_to(method, "example.org", path, b"");
   let req = { ..bare, headers: fields(pairs) };
   with_rand(rand(7), ||
-    fs::on_mem[site](site(), || serve[site](req, req.path, options, noon())).value).value
+    fs::on_mem[site](site(), || {
+      let r = serve[site](req, req.path, options, noon());
+      {
+        status: r.status,
+        headers: r.headers,
+        length: http::body_length(r.body),
+        body: match http::gathered(r.body, 1048576) {
+          Some(b) -> b,
+          None -> panic("a site file is under a MiB"),
+        },
+      }
+    }).value).value
 }
 
 test "a file is served with what it is, when it changed, and how to ask for less of it" {
@@ -1053,13 +1116,71 @@ test "a file is answered over a connection as its client asked for it, a range a
   assert(string_ends_with(wire, "Connection: close\r\n\r\n"))
 }
 
-test "a file is read a chunk at a time, and a HEAD carries the length a GET would" {
+test "a file is read a chunk at a time, and a HEAD carries the length a GET would and reads nothing" {
   let small = fetched(http::Get, "/data/parts.csv", [], { ..default_options(), chunk: 3 });
-  assert_eq(small.body, b"0123456789abcdefghij");
+  assert_eq((small.body, small.length), (b"0123456789abcdefghij", Some(20)));
   let head = fetched(http::Head, "/data/parts.csv", [], default_options());
-  let wire = http::encode(http::Head, http::Http11, true, head);
-  assert(bytes_index_of(wire, b"Content-Length: 20\r\n") != None);
-  assert(string_ends_with(string_of_bytes_lossy(wire), "\r\n\r\n"));
+  assert_eq((head.status, head.body, head.length), (200, b"", Some(20)));
+  let looked = metered(|| fetched(http::Head, "/data/parts.csv", [], default_options()));
+  assert(
+    !any(looked.performs, |p: { atom: String, count: Int }|
+      string_contains(p.atom, "fs.open") || string_contains(p.atom, "fs.read")),
+    Some("a HEAD opened or read the file"),
+  );
   assert_eq(fetched(http::Post, "/data/parts.csv", [], default_options()).status, 405);
   assert_eq(fetched(http::Get, "/empty/readme.txt", [], default_options()).body, b"")
+}
+
+/// What serving `/big.bin`, a file of `size` bytes each read of which is answered with `block`, to a
+/// client over a connection whose sends are counted and let go cost, and the bytes it sent.
+fn served_large(size: Int, block: Bytes) -> { sent: Int, bytes: Int } / {abort.raise} = {
+  let looked = fs::on_mem[big](fs::mem_of([{ path: "big.bin", body: b"" }]), ||
+    fs.stat[big]("big.bin"));
+  let stat = match looked.value {
+    Some(st) -> { ..st, size: size },
+    None -> panic("the file is there"),
+  };
+  let asked = b"GET /big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+  let options = { ..default_options(), chunk: bytes_len(block) };
+  with_cell[wire]({ sent: 0, reads: 0 }) { wire -> {
+    let cost = metered(||
+      handle {
+        with_rand(rand(7), ||
+          http::serve_connection[conn](7, http::default_limits(), |req: Request|
+            serve[big](req, req.path, options, noon())))
+      } with {
+        fs.kind[big](path) -> fs::File,
+        fs.stat[big](path) -> Some(stat),
+        fs.open[big](path, how) -> Ok(3),
+        fs.read_chunk[big](file, most) ->
+          Some(if most == bytes_len(block) { block } else { bytes_slice(block, 0, most) }),
+        fs.close[big](file) -> true,
+        fs.read_at[big](path, at, most) -> None,
+        net.recv[conn](c, most, wait) -> {
+          let w = cell_get(wire);
+          cell_set(wire, { ..w, reads: w.reads + 1 });
+          Some(if w.reads == 0 { asked } else { b"" })
+        },
+        net.send[conn](c, payload, wait) -> {
+          let w = cell_get(wire);
+          cell_set(wire, { ..w, sent: w.sent + bytes_len(payload) });
+          Some(bytes_len(payload))
+        },
+        net.close[conn](c) -> (),
+        net.peer_address[conn](c) -> None,
+        net.peer_certificate[conn](c) -> None,
+      });
+    { sent: cell_get(wire).sent, bytes: cost.bytes }
+  } }
+}
+
+test "a 100 MB file is served a chunk at a time, holding a few chunks however large it is" {
+  let kilo = bytes_of_string(fold(range(0, 256), "", |acc: String, _i: Int| acc ++ "data"));
+  let block = bytes_concat_all(map(range(0, 1024), |_i: Int| kilo));
+  let size = 100 * 1048576;
+  let ran = served_large(size, block);
+  // Every byte of the file went out, after a head of fewer than 400 bytes.
+  assert(ran.sent > size && ran.sent < size + 400);
+  // A body held whole, or copied once on its way, would be a hundred times the block.
+  assert(ran.bytes < 4 * bytes_len(block), Some(int_to_string(ran.bytes) ++ " bytes allocated"))
 }

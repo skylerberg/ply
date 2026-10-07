@@ -2,7 +2,7 @@
 //! its place relative to the root, and the shipped modules the run binds as the root `shipped`.
 
 import std.fs
-import std.fs (fs)
+import std.fs (fs, MemFs, mem_empty, mem_list, mem_write, on_mem)
 import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.hash (hex)
@@ -10,19 +10,22 @@ import std.path (join, is_absolute, normalize, parent)
 import compiler.front (module_of, Embedded, Pulls, Shipping, ShippedData, embeds_wanted, pulls_bin,
                        pulls_of, shipped_data_wanted, shipped_pulled)
 import compiler.unit (identity_of, read_kept, write_kept)
+import compiler.interface (blanked, imported)
+import compiler.items (parse, unimported)
 import std.bin
 import std.random (entropy)
 import std.time (time)
 import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
+import env (env)
 import walk (walk_room)
 import compiler.pkg (PackageSources, Supplied, wants)
 import paths
 import paths (Rooted, displayed, read_file)
 import walk (Failure, Found, named, nothing, is_ply)
-import std.list (concat)
-import compiler.parsing (no_module)
+import std.list (at_or, concat)
+import compiler.parsing (no_module, Span)
 
 /// One module of the program: its place below the root, which names it, and its bytes.
 pub type File = {
@@ -291,7 +294,7 @@ fn listed(
 
 fn read_dep_modules(
   root: String,
-) -> List<File> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+) -> List<File> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let swept = at_abs(root);
   let found = named(nothing(), swept);
   fold(map_values(found.files), [], |acc: List<File>, rooted: Rooted|
@@ -318,7 +321,7 @@ fn at_abs(path: String) -> Rooted / {abort.raise} = { label: "abs", path: under_
 fn read_dep(
   root: Bytes,
   dir: String,
-) -> DepPackage / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+) -> DepPackage / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let here = string_of_bytes_lossy(root);
   match read_file(at_abs(join(dir, "ply.pkg"))) {
     None -> { root: here, dir: dir, manifest: None, files: [] },
@@ -336,7 +339,7 @@ pub fn index_path(project: String) -> String = join(project, "vendor/index")
 /// The index a project holds, or none: a project that was not vendored reads nothing extra.
 pub fn vendored(
   project: String,
-) -> List<Vendored> / {builder.git[vcs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+) -> List<Vendored> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match read_file(at_abs(index_path(project))) { None -> [], Some(text) -> index_of(text) }
 
 /// One line per package: `<want>\t<dir>`, in the order `ply vendor` wrote them.
@@ -501,8 +504,9 @@ pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
 pub fn no_shipping() -> Shipping = { read: [], unread: [], data: [], asked: [], pulls: [] }
 
 /// The shipped modules a load of `user` and `pkgs` pulls and the data files those embed, each read
-/// off the directory bound as `shipped` when it is pulled. `every` pulls each module of the standard
-/// library there is, whatever `user` and `pkgs` import.
+/// off the directory bound as `shipped` when it is pulled, a module as a module importing it reads
+/// it (`compiler.interface.imported`). `every` pulls each module of the standard library there is,
+/// whole, whatever `user` and `pkgs` import.
 pub fn shipping_for(
   user: List<Source>,
   pkgs: PackageSources,
@@ -513,7 +517,11 @@ pub fn shipping_for(
     user,
     pkgs,
     listed,
-    |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"),
+    |name: Bytes|
+      match fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply") {
+        Some(text) -> Some(if every { text } else { imported(text) }),
+        None -> None,
+      },
     |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name)),
     pulls_of,
     if every { filter(listed, |name: Bytes| is_std(string_of_bytes_lossy(name))) } else { [] },
@@ -527,14 +535,16 @@ pub type PullReads = { lexed: Int, kept: Int }
 pub type KeptShipping = { shipping: Shipping, reads: PullReads }
 
 /// [`shipping_for`] with what each module's text says it pulls kept in the store of `paths`, under
-/// the text's digest: a load lexes only the texts it has not read before.
+/// the text's digest, and each shipped module as an importer reads it kept in the toolchain's
+/// ([`imported_reader`]): a load lexes only the texts it has not read before.
 pub fn shipping_kept(
   paths: List<paths::Resolved>,
   user: List<Source>,
   pkgs: PackageSources,
   every: Bool = false,
-) -> KeptShipping / {fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+) -> KeptShipping / {env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let listed = shipped_names();
+  let importing = imported_reader();
   let at = match list_at(paths, 0) {
     Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/pulls").path },
     None -> { label: "cwd", dir: ".ply-cache/pulls" },
@@ -551,12 +561,17 @@ pub fn shipping_kept(
       ]),
     None -> b"",
   };
+  let read = |name: Bytes|
+    match fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply") {
+      None -> None,
+      Some(text) -> Some(if every { text } else { read_imported(importing, text) }),
+    };
   with_cell[pulls]({ lexed: 0, kept: 0 }) { c -> {
     let shipping = shipped_pulled(
       user,
       pkgs,
       listed,
-      |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"),
+      read,
       |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name)),
       |source: Source| {
         let found = if bytes_len(reader) == 0 { { pulls: pulls_of(source), kept: false } }
@@ -571,6 +586,90 @@ pub fn shipping_kept(
     { shipping: shipping, reads: cell_get(c) }
   } }
 }
+
+/// How a load reads a shipped module for a module importing it: what that reading is a function of
+/// beside the text, empty where the binary says nothing of it and nothing is kept, and the
+/// toolchain's directory of what `ply` reuses (`env.reused`), where the spans it blanks are kept for
+/// every project on the machine, each under the text's digest and that reading's.
+pub type ImportedReader = { dir: String, importer: Bytes }
+
+pub fn imported_reader() -> ImportedReader / {env.reused[sys], fs.read_file[shipped], abort.raise} =
+  {
+    dir: under_abs(env.reused[sys]()),
+    importer: match fs.read_file[shipped]("definitions") {
+      Some(definitions) ->
+        bytes_concat_all([
+          b"ply.imported.1\x00",
+          hex(bin::shape_digest(blanked_bin())),
+          b"\x00",
+          identity_of(definitions, [b"interface.imported"]),
+          b"\x00",
+        ]),
+      None -> b"",
+    },
+  }
+
+/// A shipped module's `text` as a module importing it reads it (`compiler.interface.imported`).
+pub fn read_imported(
+  r: ImportedReader,
+  text: Bytes,
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  if bytes_len(r.importer) == 0 { imported(text) } else { kept_imported(r.dir, r.importer, text) }
+
+/// The shipped module `name` as a module importing it reads it, or `None` where this binary ships no
+/// such module.
+pub fn shipped_imported(
+  r: ImportedReader,
+  name: Bytes,
+) -> Option<Bytes> / {fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  match fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply") {
+    Some(text) -> Some(read_imported(r, text)),
+    None -> None,
+  }
+
+/// What an importer reads of a shipped module's text, the spans it blanks kept under the text's
+/// digest, so the machine finds them once for each text and each binary's reading of it.
+fn kept_imported(
+  dir: String,
+  importer: Bytes,
+  text: Bytes,
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let key = hex(blake3(bytes_concat(importer, blake3(text))));
+  let kept = match read_kept[abs](dir, key) {
+    Some(bytes) -> match bin::decode(bytes, blanked_bin()) {
+      Ok(b) -> if !fits(b.bounds, bytes_len(text)) { None } else {
+        Some(
+          map(range(0, len(b.bounds) / 2), |i: Int|
+            { start: at_or(b.bounds, 2 * i, 0), end: at_or(b.bounds, 2 * i + 1, 0) }),
+        )
+      },
+      Err(_) -> None,
+    },
+    None -> None,
+  };
+  let spans = match kept {
+    Some(spans) -> spans,
+    None -> {
+      let spans = unimported(text);
+      let bounds = fold(spans, [], |acc: List<Int>, s: Span| push(push(acc, s.start), s.end));
+      write_kept[abs](dir, key, bin::encode({ bounds: bounds }, blanked_bin()));
+      spans
+    },
+  };
+  blanked(text, spans)
+}
+
+/// Where each span of a shipped module's text an importer reads nothing of starts and ends.
+type Blanked = { bounds: List<Int> }
+
+derive bin for Blanked
+
+/// Whether `bounds` pair into spans in order, apart, within a text of `size` bytes: a kept entry
+/// that does not is read as none.
+fn fits(bounds: List<Int>, size: Int) -> Bool =
+  len(bounds) % 2 == 0
+    && fold(bounds, { ok: true, at: 0 }, |s: { ok: Bool, at: Int }, b: Int|
+      { ok: s.ok && s.at <= b && b <= size, at: b }).ok
 
 fn kept_pulls<[r]>(
   dir: String,
@@ -609,7 +708,7 @@ pub fn shipped_data(
 pub fn shipped_listed(s: Shipping) -> List<Bytes> =
   concat(map(s.read, |source: Source| source.name), s.unread)
 
-pub fn shipped_modules() -> List<Source> / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+pub fn shipped_modules() -> List<Source> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   match fs.list_dir[shipped](".") {
     None -> [],
     Some(names) ->
@@ -754,7 +853,7 @@ test "a load reads the shipped modules it pulls and what they embed, and only th
         Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
       fs.read_file[shipped](p) -> {
         cell_update(c, |xs: List<String>| push(xs, p));
-        if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = 1\n") }
+        if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = bytes::b()\n") }
         else if p == "std.bytes.ply" { Some(b"pub fn b() -> Int = 2\n") }
         else { Some(b"pub fn x() -> Int = 3\n") }
       },
@@ -788,6 +887,95 @@ test "a load of every standard library module reads each, imported or not, and n
     cell_get(c)
   } };
   assert_eq(read, ["std.bytes.ply", "std.json.ply", "std.list.ply"])
+}
+
+fn exercised() -> Bytes =
+  b"//! Counting.\n\nimport std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = x * 2\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)), 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n"
+
+/// What a load of a module importing `std.count`, a shipped module with a test and a law, reads of
+/// the shipped modules: the modules, the text of `std.count` and the files asked for.
+fn counted_load(
+  every: Bool,
+) -> { read: List<Bytes>, text: Bytes, files: List<String> } / {abort.raise} =
+  with_cell[reads]([]) { c -> {
+    let shipping = handle {
+      shipping_for(
+        [{ name: b"main", src: b"import std.count\nfn main() -> Unit = ()\n" }],
+        { root: b"", manifest: None, supplied: [] },
+        every,
+      )
+    } with {
+      fs.list_dir[shipped](p) -> Some(["std.count.ply", "std.laws.ply"]),
+      fs.read_file[shipped](p) -> {
+        cell_update(c, |xs: List<String>| push(xs, p));
+        if p == "std.count.ply" { Some(exercised()) }
+        else { Some(b"pub fn agrees<a>(f: (Int) -> a, g: (Int) -> a) -> Bool = true\n") }
+      },
+    };
+    {
+      read: map(shipping.read, |source: Source| source.name),
+      text: fold(shipping.read, b"", |acc: Bytes, source: Source|
+        if source.name == b"std.count" { source.src } else { acc }),
+      files: cell_get(c),
+    }
+  } }
+
+/// What a load of a module importing `std.count` read of `std.count`, with a fresh project store and
+/// the toolchain's store in `toolchain`, and the toolchain's store it left.
+fn kept_count(toolchain: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.raise} = {
+  let over = on_mem[cwd](mem_empty(), ||
+    on_mem[abs](toolchain, ||
+      handle {
+        shipping_kept(
+          [],
+          [{ name: b"main", src: b"import std.count\nfn main() -> Unit = ()\n" }],
+          { root: b"", manifest: None, supplied: [] },
+        )
+      } with {
+        env.reused[sys]() -> "/reused",
+        fs.list_dir[shipped](p) -> Some(["std.count.ply"]),
+        fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(exercised()) }
+        else if p == "definitions" { Some(b"front.pulls_of aa\ninterface.imported bb\n") }
+        else { None },
+        entropy.next() -> 7,
+        time.now_ms() -> 0,
+      })).value;
+  {
+    text: fold(over.value.shipping.read, b"", |acc: Bytes, source: Source|
+      if source.name == b"std.count" { source.src } else { acc }),
+    toolchain: over.tree,
+  }
+}
+
+test "what an importer reads of a shipped module is kept for every project, and a kept entry that does not fit is none" {
+  let viewed = imported(exercised());
+  let cold = kept_count(mem_empty());
+  assert_eq(cold.text, viewed);
+  let kept = match mem_list(cold.toolchain, "reused") { Some(names) -> names, None -> [] };
+  assert_eq(len(kept), 1);
+  let entry = "reused/" ++ at_or(kept, 0, "");
+  // Another project's first load reads what the toolchain kept, and finds nothing itself.
+  let planted = mem_write(cold.toolchain, entry, bin::encode({ bounds: [] }, blanked_bin())).fs;
+  assert_eq(kept_count(planted).text, exercised());
+  let spoiled = mem_write(cold.toolchain, entry, bin::encode({ bounds: [5, 2] }, blanked_bin())).fs;
+  assert_eq(kept_count(spoiled).text, viewed)
+}
+
+test "a project's load reads no shipped test or law, nor what only they reach, and `--std`'s reads all" {
+  let load = counted_load(false);
+  assert_eq(load.read, [b"std.count"]);
+  assert_eq(load.files, ["std.count.ply"]);
+  assert_eq(bytes_len(load.text), bytes_len(exercised()));
+  let says = |word: Bytes| bytes_index_of(load.text, word) != None;
+  assert(says(b"/// One more.\npub fn more(x: Int) -> Int = bump(x)"));
+  assert(says(b"fn bump(x: Int) -> Int = x + 1"));
+  assert(!says(b"std.laws") && !says(b"twice") && !says(b"test") && !says(b"law"));
+  let parsed = parse(load.text);
+  assert_eq(len(parsed.parser.diags), 0);
+  assert_eq(len(parsed.node.items), 2);
+  let whole = counted_load(true);
+  assert_eq(whole.read, [b"std.count", b"std.laws"]);
+  assert_eq(whole.text, exercised())
 }
 
 fn embedding_words() -> Bytes = b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n"

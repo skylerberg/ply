@@ -4,7 +4,7 @@
 import compiler.costs (Report, Costed, Site, Unkept, Priced, Costing, costs, cost_keys, priced_of,
                        report_bin)
 import compiler.embed (EmbedAt, EmbedFile)
-import compiler.front (Analysis)
+import compiler.front (Analysis, analyse_pulling_std_with, no_rows, written_form, Analysed, Refused)
 import compiler.hash (hex)
 import compiler.items (Item, IFn)
 import compiler.resolve (Source, ParsedModule, Diag, PackageDeps, error_at, error_at_and)
@@ -12,7 +12,7 @@ import compiler.parsing (Span, no_module)
 import compiler.unit (identity_of, read_kept, shipped, write_kept)
 import diagnostic (Place, spot_of)
 import env (env)
-import program (Program, sourced)
+import program (Program, sourced, is_shipped)
 import report (indent)
 import sources (under_abs)
 import std.term (Style, bold, dim, red, green, yellow, plain)
@@ -22,6 +22,7 @@ import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import std.string (repeat)
+import std.list (at, concat)
 import proof.obligation (plural)
 
 /// Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
@@ -124,6 +125,45 @@ fn costs_key(
   )
 }
 
+/// What a report is a function of in each module's text. A shipped module's bodies are never
+/// walked, so of it only what the program holds counts: the hashes of its definitions and
+/// declarations the load kept, which a function the program does not reach is not among, and its
+/// form. Any other module's text counts whole.
+fn keyed_sources(a: Analysis, srcs: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let owner = |name: Bytes| {
+    let dot = fold(range(0, bytes_len(name)), 0 - 1, |acc: Int, i: Int|
+      if bytes_at(name, i) == 46 { i } else { acc });
+    if dot < 0 { b"" } else { bytes_slice(name, 0, dot) }
+  };
+  let held = fold(
+    concat(a.hashes.defs, a.hashes.decls),
+    map_new(),
+    |acc: Map<Bytes, List<Bytes>>, d: { name: Bytes, hash: Bytes }| {
+      let m = owner(d.name);
+      map_insert(
+        acc,
+        m,
+        push(
+          match map_get(acc, m) { Some(xs) -> xs, None -> [] },
+          bytes_concat_all([d.name, b" ", d.hash, b"\n"]),
+        ),
+      )
+    },
+  );
+  map(range(0, len(a.mods)), |i: Int| {
+    let m = at(a.mods, i);
+    let src = match list_at(srcs, i) { Some(x) -> x, None -> b"" };
+    if !is_shipped(string_of_bytes_lossy(m.name)) { src } else {
+      bytes_concat_all(
+        concat(
+          [b"shipped\x00", written_form(m.module, src), b"\x00"],
+          match map_get(held, m.name) { Some(xs) -> xs, None -> [] },
+        ),
+      )
+    }
+  })
+}
+
 /// `body` with every cost report it asks for kept under the toolchain's cache, as the emitter's
 /// answers are: a program whose every text stands takes its report whole, and any other has each of
 /// its modules' walks taken back as `costs` finds them still answering.
@@ -140,7 +180,7 @@ pub fn pricing<a | e>(
       let key = costs_key(
         identity,
         map(a.mods, |m: ParsedModule| m.name),
-        p.srcs,
+        keyed_sources(a, p.srcs),
         a.packages,
         a.module_packages,
         len(a.packages),
@@ -213,7 +253,7 @@ fn unkept_returns(u: Unkept) -> Diag =
 
 // --- The listing ------------------------------------------------------------------
 
-fn basename(path: String) -> String / {abort.raise} = {
+fn basename(path: String) -> String = {
   let parts = string_split(path, "/");
   match list_at(parts, len(parts) - 1) { Some(last) -> last, None -> path }
 }
@@ -245,7 +285,7 @@ fn tally(d: Costed) -> String =
 fn kind_of(d: Costed) -> String =
   if d.kind == b"test" { " (test)" } else if d.kind == b"law" { " (law)" } else { "" }
 
-fn painted(style: Style, verdict: Bytes) -> String / {abort.raise} =
+fn painted(style: Style, verdict: Bytes) -> String =
   if verdict == b"reuses" { green(style, "reuses ") }
   else if verdict == b"copies" { red(style, "COPIES ") }
   else { yellow(style, "unknown") }
@@ -387,6 +427,22 @@ test "a cost report's key moves with the checker, a module's text, the packages 
   assert(key(b"c", [b"fn f() -> Int = 1", b"fn g() -> Int = 3"], [0, 0], []) != base, None);
   assert(key(b"c", srcs, [0, 1], []) != base, None);
   assert(key(b"c", srcs, [0, 0], embedded(b"1")) != key(b"c", srcs, [0, 0], embedded(b"2")), None)
+}
+
+test "a cost report stands over a shipped module that gained what the program does not reach" {
+  let user: Source = { name: b"m", src: b"import std.x (f)\npub fn use() -> Int = f()\n" };
+  let keyed = |x: Bytes|
+    match analyse_pulling_std_with([user], [{ name: b"std.x", src: x }], [], []).out {
+      Analysed(a) ->
+        keyed_sources(
+          a,
+          map(a.mods, |m: ParsedModule| if m.name == b"std.x" { x } else { user.src }),
+        ),
+      Refused(_) -> panic("the program checks"),
+    };
+  let base = keyed(b"pub fn f() -> Int = 1\n");
+  assert_eq(keyed(b"pub fn f() -> Int = 1\n\npub fn g() -> Int = 2\n"), base);
+  assert(keyed(b"pub fn f() -> Int = 2\n") != base, Some("what the program reaches moved"))
 }
 
 fn place() -> List<Place> = [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]

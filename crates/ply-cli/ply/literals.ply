@@ -1,27 +1,33 @@
-//! What a load enters before anything runs: its tagged literals' parsers and its `const`
-//! definitions. `tag"text"` is the call `tag::literal("text")`, and one with holes the call of
-//! `tag::compile` on the texts around them, and a load that checked has not yet run either: here
+//! What a load enters before anything runs: its tagged literals' parsers, its `const` definitions
+//! and its statements. `tag"text"` is the call `tag::literal("text")`, and one with holes the call
+//! of `tag::compile` on the texts around them, and a load that checked has not yet run either: here
 //! each one the run's own modules hold is entered on a machine of its own, under a step budget, and
 //! what its parser answers is the literal's verdict. A verdict is a function of the parser and the
 //! texts, so it is kept under the hash of all the parser reaches and the texts, in the toolchain's
 //! cache. A `const` definition is entered the same way, handed nothing: what it answers is kept
 //! there too, as the text a unit holds a value by, under the hash of all the definition reaches,
-//! and every unit emitted after holds the value in place of the body.
+//! and every unit emitted after holds the value in place of the body. A statement a call runs is
+//! computed the same way and judged by `statements`.
 
 import compiler.exprs (TaggedPart)
-import compiler.front (Analysis, TaggedSite, tagged_sites, ConstSite, const_sites)
+import compiler.front (Analysis, TaggedSite, Within, tagged_sites, ConstSite, const_sites)
 import compiler.hash (TheFn, hex, reach)
 import compiler.interface (sized)
 import compiler.lexer (utf8_len)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.parsing (Span, no_module)
 import compiler.resolve (Diag, Label, error_at, error_with_labels, label_at)
-import compiler.unit (read_kept, write_kept, shipped, emitter_identity, stored_root)
+import compiler.unit (read_kept, write_kept, shipped, compiler_roots, emitter_identity, identity_of,
+                      stored_root)
 import diagnostic (Place, shown)
 import env (env)
 import machine (machine, Called, default_options, unconfigured)
 import program (Timed, front_of)
+import semantics
 import sources (under_abs)
+import statements
+import statements (Asking, Judgement, Unjudged, asking, judged, judgement_key, judgement_bin,
+                   misfits, schemas_refused)
 import std.bin
 import std.fs (fs)
 import std.hash (blake3)
@@ -60,12 +66,16 @@ derive bin for Verdict
 /// the same way and handed nothing, so it has no parts.
 pub type Asked = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
-/// What a command asks of its tagged literals' parsers and its `const` definitions. What answers is
-/// `settling`, which `main` runs every command under, or a handler of the asker's own. A verdict is
-/// a function of what is asked, so the effect is a deterministic one, whatever the answering keeps.
+/// What a command asks of its tagged literals' parsers, its `const` definitions and its statements.
+/// What answers is `settling`, which `main` runs every command under, or a handler of the asker's
+/// own. A verdict is a function of what is asked, so the effect is a deterministic one, whatever
+/// the answering keeps.
 pub effect literal {
   /// In `asked`'s order; or what kept the definitions from being entered at all.
   read verdicts(timed: Timed, analysis: Analysis, root: String, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
+  /// Each statement of `asked` judged against the schema it is held to, in `asked`'s order; or what
+  /// kept the definitions from being entered at all.
+  read statements(timed: Timed, analysis: Analysis, root: String, asked: List<statements::Asked>) -> Result<List<Judgement>, List<Diag>>
 }
 
 // --- Asking -----------------------------------------------------------------------
@@ -254,7 +264,7 @@ fn const_raised(site: ConstSite, message: String, also: List<Label>) -> Diag =
     ],
   )
 
-fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> / {abort.raise} =
+fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> =
   match verdict {
     Accepted -> None,
     Rejected(_) -> None,
@@ -300,10 +310,38 @@ fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> / {abort.rai
   }
 
 /// What refuses a load before anything of it runs: each tagged literal of the run's own modules its
-/// parser does not accept, at the place in its text the parser names, and each `const` definition
-/// the program holds that a build could not evaluate and keep. Nothing at all, and nothing asked,
-/// where the program writes neither.
+/// parser does not accept, at the place in its text the parser names; each `const` definition the
+/// program holds that a build could not evaluate and keep; and what the check finds wrong with each
+/// statement the run's own modules run. Nothing at all, and nothing asked, where the program writes
+/// none of them.
 pub fn unsettled(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+) -> List<Diag> / {literal.verdicts, literal.statements, abort.raise} =
+  concat(literal_refusals(timed, analysis, root), statement_refusals(timed, analysis, root))
+
+fn statement_refusals(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+) -> List<Diag> / {literal.statements, abort.raise} = {
+  let asks = filter(asking(analysis), |a: Asking| a.site.module < len(timed.program.files));
+  let refused = schemas_refused(asks);
+  if len(asks) == 0 { refused } else {
+    match literal.statements(timed, analysis, root, map(asks, |a: Asking| a.asked)) {
+      Err(diags) -> concat(refused, diags),
+      Ok(judgements) ->
+        fold(range(0, len(asks)), refused, |acc: List<Diag>, i: Int|
+          match list_at(judgements, i) {
+            Some(j) -> concat(acc, misfits(at(asks, i), j)),
+            None -> acc,
+          }),
+    }
+  }
+}
+
+fn literal_refusals(
   timed: Timed,
   analysis: Analysis,
   root: String,
@@ -397,6 +435,10 @@ fn handed(a: Asked) -> Value = {
   match texts { [text] -> text, _ -> VList(texts) }
 }
 
+/// What entering the definitions `names` enters of the program: all they reach.
+fn entering(analysis: Analysis, names: List<Bytes>) -> Within / {abort.raise} =
+  { owners: reach(analysis.hashes, map(names, |n: Bytes| TheFn(n))).fns, tests: map_new() }
+
 fn callees(asked: List<Asked>) -> List<Bytes> =
   fold(asked, [], |acc: List<Bytes>, a: Asked|
     if contains(acc, a.callee) { acc } else { push(acc, a.callee) })
@@ -459,14 +501,13 @@ fn entered(
 
 /// What a verdict is a function of: the toolchain that entered the definition, the budget, the
 /// definition by the hash of all it reaches, and the texts.
-fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise} =
+fn verdict_key(toolchain: Bytes, a: Asked) -> Bytes / {abort.raise} =
   hex(
     blake3(
       bytes_concat_all([
-        sized(b"ply literal verdict 1"),
+        sized(b"ply literal verdict 2"),
         sized(hex(bin::shape_digest(verdict_bin()))),
-        sized(bytes_of_string(stamp)),
-        sized(bytes_of_string(version)),
+        sized(toolchain),
         sized(bytes_of_string(int_to_string(budget_of(a)))),
         sized(a.hash),
         sized(bytes_of_string(int_to_string(len(a.parts)))),
@@ -475,6 +516,25 @@ fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise
     ),
   )
 
+/// What a verdict or a judgement is a function of on the toolchain's side: the runtime, the binary,
+/// what the program's hashes mean, and the code that analyses, emits and judges, by the hash of all
+/// it reaches. No shipped module is part of it: what a definition reaches of one is in its hash.
+fn judging(definitions: Bytes, runtime: Bytes, version: String) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([
+        sized(b"ply literal toolchain 1"),
+        sized(runtime),
+        sized(bytes_of_string(version)),
+        sized(bytes_of_string(semantics::version())),
+        sized(identity_of(definitions, judging_roots())),
+      ]),
+    ),
+  )
+
+/// The definitions a verdict or a judgement is a function of besides what it is asked over.
+fn judging_roots() -> List<Bytes> = push(compiler_roots(), b"literals.settling")
+
 /// `value` is the key a `const` definition's value is kept under, which a unit finds it by.
 type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 
@@ -482,19 +542,27 @@ type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 /// rest entered once and their verdicts kept there, a `const` definition's value beside its own:
 /// the parsers on one machine and the `const` definitions on another, each under its budget.
 pub fn settling<a | e>(
-  body: () -> a / {literal.verdicts | e},
-) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+  body: () -> a / {literal.verdicts, literal.statements | e},
+) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
   handle {
     body()
   } with {
+    literal.statements(timed, analysis, root, asked) ->
+      judgements(
+        under_abs(env.bodies[sys]()),
+        judging(shipped.definitions(), shipped.runtime().identity, env.binary_version[sys]()),
+        root,
+        timed,
+        analysis,
+        asked,
+      ),
     literal.verdicts(timed, analysis, root, asked) -> {
       let dir = under_abs(env.bodies[sys]());
-      let stamp = env.shipped_digest[sys]();
-      let version = env.binary_version[sys]();
       let runtime = shipped.runtime().identity;
+      let toolchain = judging(shipped.definitions(), runtime, env.binary_version[sys]());
       let emitter = emitter_identity(shipped.definitions());
       let sought = map(asked, |a: Asked| {
-        let key = verdict_key(stamp, version, a);
+        let key = verdict_key(toolchain, a);
         let value = if is_const(a) { baked_key(runtime, emitter, a.hash) } else { b"" };
         let verdict = match read_kept[abs](dir, key) {
           None -> None,
@@ -515,7 +583,11 @@ pub fn settling<a | e>(
       });
       let open = filter(sought, |s: Sought| s.kept == None);
       if len(open) == 0 { Ok(settled(sought, [])) } else {
-        let front = front_of(timed, analysis);
+        let front = front_of(
+          timed,
+          analysis,
+          Some(entering(analysis, callees(map(open, |s: Sought| s.asked)))),
+        );
         let parsers = filter(open, |s: Sought| !is_const(s.asked));
         let consts = filter(open, |s: Sought| is_const(s.asked));
         let over = |some: List<Sought>, steps: Int|
@@ -556,6 +628,73 @@ pub fn settling<a | e>(
       }
     },
   }
+
+/// A statement asked after, the key its judgement is kept under, and the judgement kept there.
+type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
+
+/// Each statement's judgement: the one kept for it, or the one the statements not kept were judged
+/// to, in their order.
+fn judgements(
+  dir: String,
+  toolchain: Bytes,
+  root: String,
+  timed: Timed,
+  analysis: Analysis,
+  asked: List<statements::Asked>,
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let keyed = map(asked, |a: statements::Asked| {
+    let key = judgement_key(toolchain, step_budget(), a);
+    {
+      asked: a,
+      key: key,
+      kept: match read_kept[abs](dir, key) {
+        None -> None,
+        Some(bytes) -> match bin::decode(bytes, judgement_bin()) {
+          Ok(j) -> Some(j),
+          Err(_) -> None,
+        },
+      },
+    }
+  });
+  let open = filter(keyed, |k: Keyed| k.kept == None);
+  if len(open) == 0 { Ok(map(keyed, |k: Keyed| match k.kept { Some(j) -> j, None -> Unjudged })) }
+  else {
+    match judged(
+        |within: Within| front_of(timed, analysis, Some(within)),
+        analysis,
+        root,
+        step_budget(),
+        map(open, |k: Keyed| k.asked),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(found) -> {
+        fold(range(0, len(open)), (), |_: Unit, i: Int|
+          match list_at(found, i) {
+            Some(j) -> write_kept[abs](dir, at(open, i).key, bin::encode(j, judgement_bin())),
+            None -> (),
+          });
+        Ok(
+          fold(
+            keyed,
+            { out: [], next: 0 },
+            |acc: { out: List<Judgement>, next: Int }, k: Keyed|
+              match k.kept {
+                Some(j) -> { out: push(acc.out, j), next: acc.next },
+                None ->
+                  {
+                    out: push(acc.out, match list_at(found, acc.next) {
+                      Some(j) -> j,
+                      None -> Unjudged,
+                    }),
+                    next: acc.next + 1,
+                  },
+              },
+          ).out,
+        )
+      },
+    }
+  }
+}
 
 /// Each verdict sought, in order: the one kept, or the next of `found`, which holds the rest's.
 fn settled(sought: List<Sought>, found: List<Verdict>) -> List<Verdict> =
@@ -720,24 +859,42 @@ test "a `const` definition is asked with no text, under its own budget" {
   assert(is_const(a));
   assert_eq(budget_of(a), const_budget());
   assert_eq(budget_of({ ..a, parts: [b"x"] }), step_budget());
-  assert(verdict_key("b3:a", "0.1.0", a) != verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }))
+  assert(verdict_key(b"t", a) != verdict_key(b"t", { ..a, hash: b"g" }))
 }
 
 test "a verdict is kept under the toolchain, the parser's hash and the text" {
   let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
-  let key = verdict_key("b3:a", "0.1.0", a);
-  assert_eq(verdict_key("b3:a", "0.1.0", { ..a, callee: b"n.literal" }), key);
-  assert(verdict_key("b3:b", "0.1.0", a) != key);
-  assert(verdict_key("b3:a", "0.2.0", a) != key);
-  assert(verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }) != key);
-  assert(verdict_key("b3:a", "0.1.0", { ..a, parts: [b"b"] }) != key);
+  let key = verdict_key(b"t", a);
+  assert_eq(verdict_key(b"t", { ..a, callee: b"n.literal" }), key);
+  assert(verdict_key(b"u", a) != key);
+  assert(verdict_key(b"t", { ..a, hash: b"g" }) != key);
+  assert(verdict_key(b"t", { ..a, parts: [b"b"] }) != key);
   // The texts around a hole are not the one text they would join to.
   assert(
-    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
-      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab"] }),
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] }) != verdict_key(b"t", { ..a, parts: [b"ab"] }),
   );
   assert(
-    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
-      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab", b""] }),
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] })
+      != verdict_key(b"t", { ..a, parts: [b"ab", b""] }),
   )
+}
+
+test "the toolchain a verdict is kept under moves with the code that judges it, and with no shipped module" {
+  let held = |settling: Bytes, other: Bytes|
+    bytes_concat_all(
+      map(push(judging_roots(), b"std.result.unreached"), |name: Bytes|
+        bytes_concat_all([
+          name,
+          b" ",
+          if name == b"literals.settling" { settling }
+          else if name == b"std.result.unreached" { other }
+          else { b"aa" },
+          b"\n",
+        ])),
+    );
+  let toolchain = judging(held(b"s1", b"o1"), b"runtime", "0.1.0");
+  assert_eq(judging(held(b"s1", b"o2"), b"runtime", "0.1.0"), toolchain);
+  assert(judging(held(b"s2", b"o1"), b"runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"other runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"runtime", "0.2.0") != toolchain)
 }

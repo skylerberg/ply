@@ -11,11 +11,12 @@ use std::sync::Arc;
 const CLIENT: &str = r#"
 import std.net (net)
 import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected, NoTls)
-import std.db (db, serve, server_of, stmt, transaction, is_retryable, Rows, Count, Failed, Serializable, ReadWrite)
+import std.db (db, serve, server_of, transaction, is_retryable, Serializable, ReadWrite)
+import std.sql (stmt, Rows, Count, Failed)
 
 // The driver over the same script: what a connection string asks of every connection it opens.
 pub fn told(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) ->
@@ -28,7 +29,7 @@ pub fn told(url: String) -> Result<String, String>
   }
 
 pub fn ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
@@ -41,7 +42,7 @@ pub fn ask(host: String, port: Int) -> Result<String, String>
   }
 
 pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
@@ -55,7 +56,7 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
 
 // A transaction the server refuses to commit, run again while the refusal says to.
 pub fn retried(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) -> Ok(serve(cfg, 1, "test-nonce", || attempts(3, ""))),
@@ -75,7 +76,7 @@ fn attempts(left: Int, seen: String) -> String / {db.execute[items], db.abort, d
 // A refusal is not the end of the connection: the second query runs on the session the first
 // one came back with.
 pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
@@ -92,15 +93,16 @@ pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
     },
   }
 
-// SCRAM: the nonce is the one RFC 7677 works out, so the scripted server can be that example.
-pub fn ask_scram(
+// Authenticated as the server asks, by SCRAM or a clear-text password; the nonce is the one RFC
+// 7677 works out, so the scripted server can be that example. The password is sealed at once.
+pub fn ask_with_password(
   host: String,
   port: Int,
   user: String,
   password: String,
   nonce: String,
-) -> Result<String, String> / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match connect[link](host, port, NoTls, user, "ply", [], Some(password), nonce, default_client()) {
+) -> Result<String, String> / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match connect[link](host, port, NoTls, user, "ply", [], Some(secret_bytes(secret_of_string(password))), nonce, default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -499,7 +501,7 @@ fn a_connection_strings_settings_are_in_the_start_up_message() {
 #[test]
 fn the_client_answers_scram_and_checks_the_servers_proof() {
     let outcome = run(
-        "m.ask_scram",
+        "m.ask_with_password",
         vec![
             Value::str("127.0.0.1"),
             Value::Int(5432),
@@ -532,7 +534,7 @@ fn the_client_speaks_scram_to_a_real_server() {
     }
     let cluster = crate::support::cluster::Cluster::start_with_password("ply", "pencil");
     let ran = run_over_tcp(
-        "m.ask_scram",
+        "m.ask_with_password",
         vec![
             Value::str("127.0.0.1"),
             Value::Int(i64::from(cluster.port())),
@@ -544,5 +546,39 @@ fn the_client_speaks_scram_to_a_real_server() {
     match ran {
         Ok(outcome) => assert_eq!(outcome.text, "1"),
         Err(why) => panic!("the client could not talk to a real server: {why}"),
+    }
+}
+
+/// A real cluster that asks for the password in the clear, which the client sends sealed, by
+/// `net.send_secret`; a wrong one is the server's refusal, not a connection.
+#[test]
+fn the_client_sends_a_clear_text_password_to_a_real_server() {
+    if !crate::support::cluster::available() {
+        eprintln!("skipping: postgres is not installed here");
+        return;
+    }
+    let cluster = crate::support::cluster::Cluster::start_with_clear_text_password("ply", "pencil");
+    let ask = |password: &str| {
+        run_over_tcp(
+            "m.ask_with_password",
+            vec![
+                Value::str("127.0.0.1"),
+                Value::Int(i64::from(cluster.port())),
+                Value::str("ply"),
+                Value::str(password),
+                Value::str("a-cluster-test-nonce"),
+            ],
+        )
+    };
+    match ask("pencil") {
+        Ok(outcome) => assert_eq!(outcome.text, "1"),
+        Err(why) => panic!("the client could not authenticate in the clear: {why}"),
+    }
+    match ask("crayon") {
+        Ok(outcome) => panic!("a wrong password connected: {}", outcome.text),
+        Err(why) => assert!(
+            why.contains("28P01"),
+            "the refusal is not the server's: {why}"
+        ),
     }
 }

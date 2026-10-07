@@ -1054,6 +1054,7 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
                 .into_iter()
                 .map(std::path::PathBuf::from)
                 .collect(),
+            mtls: str_list("mtls")?,
         },
         fs: named_list("fs")?
             .into_iter()

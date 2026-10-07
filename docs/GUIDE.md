@@ -618,6 +618,11 @@ kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
 (§8.4), evaluates the body in its place, once a run, as it does any definition
 that takes nothing; the value is the same either way, since the body is pure.
 
+A `const fn` whose type is `std.sql.Schema` is a schema: the statements of the
+module that declares it, and of every module that imports that one at any
+depth, are checked against it before anything runs (§16). A module whose
+statements reach two is `E0471`.
+
 A value is kept as it is laid out, so a table that is compact is one that reads
 quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
 width below 64 is held in that word: an `Array` of those is one object, kept as
@@ -2065,8 +2070,10 @@ is the clock, the network, a program other than `ply`, or what a run keeps for t
 `filed_under` in `--json`, and the code it ran), and where the run's time went, phase by phase
 from the process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
-any of them matches; `--no-cache` bypasses both the result and the front-end
-cache.
+any of them matches; `--shard K/N` runs part K of N of what the rest selects,
+parted by a hash of each key, so a test is in the same part every run and the
+runs `1/N` to `N/N` run each test once; `--no-cache` bypasses both the result
+and the front-end cache.
 
 A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
 its test's, which covers the body and the case's type and neither the table nor
@@ -2074,9 +2081,9 @@ the label, taken with the case's value as built. A case added to the table runs
 alone, wherever it is added; a reordered table or a reworded label runs
 nothing; an edit to the body runs every case, and an edit to what the table is
 built from runs the cases whose values it changed. Its label is the one its
-holes make, which is what `--filter` reads. Listing the cases runs the table,
-so a run that reports on a test over cases builds the program even when every
-case stands on a pass.
+holes make, which is what `--filter` and `--shard` read. Listing the cases runs
+the table, so a run that reports on a test over cases builds the program even
+when every case stands on a pass.
 
 ### 8.3 Determinism
 
@@ -2461,7 +2468,8 @@ clauses unless it is `transparent` too. `std.laws` ships the schemas the
 standard library states its laws with (`ply doc std.laws`).
 
 A definition of another package
-— a dependency's, or outside `--std` a shipped module's — is claimed by its
+— a dependency's, a compiler module's the library ships, or outside `--std` a
+standard library module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
 unfolds its body, which that package's own run proves. A `transparent fn` is
 claimed by its body too: a proof anywhere may unfold it, so its body, and all
@@ -2480,8 +2488,9 @@ and a `summary` — and `summary` counts defects as `defect`. A claim's type
 variables are lettered by where they first appear among
 its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
 (`a := Int`), and a proof leaves each an uninterpreted sort
-(`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),
-`--prove-roots N`, `--prove-budget N` (spent reports `property`),
+(`uninterpreted a, b`). Flags: `--filter SUBSTRING` (the obligations whose
+owner's name holds it; repeated, those any of them matches),
+`--prove-cases N` (below 25 kept cases only `example`), `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
 number keys the cached result, so more budget is a stronger claim). A `proved`
@@ -2605,6 +2614,7 @@ derive json for Line
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
+| `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
 
 There are no other derivers (`E0207`). `snake_case` is `std.text`'s, so a
 name collision (`HTTPRequest` and `HttpRequest` both give `http_request`) is
@@ -2646,6 +2656,29 @@ A type that states a `key` (§4.4) derives `eq`, `ord` and `hash` from what the
 key answers, and one that states a `show` derives `show` from that function: the
 dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
 and `bin` encode the fields as they are.
+
+`row` is a record's row in a SQL table, a column per field under the field's
+name, read and written in the order the fields are declared:
+
+```ply
+import std.sql
+import std.json
+
+pub type Line = { sku: String, qty: Int }
+pub type Order = { id: Int, customer: String, note: Option<String>, lines: List<Line> }
+derive json for Line
+derive row for Order
+// order_row : () -> sql::RowCodec<Order>
+```
+
+A `String`, `Int`, `Bool`, `Float`, `Decimal` or `Bytes` field is the column of
+that type, an `Option` one that may be null, a `List` of those an array, a
+`json::Json` the document it holds, and any other field a `jsonb` document read
+and written through its type's own `json` codec, which the module must import
+`std.json` for and derive. The derivation needs `import std.sql`; a sum, a type
+with parameters and an empty record have no row (`E0206`), and `row` is no
+constraint a `where` can name (`E0207`). The codec's `fields` are what a check
+holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
 
 ## 12. Builtins
 
@@ -2697,9 +2730,12 @@ std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
 ships beside it, each named by its place below the library (`std/oid/names.txt`):
 `ply std` lists them with the module that embeds each, `ply std --show
 std/oid/names.txt` prints one, and the digest `ply std` prints covers them. A
-load reads only the shipped modules its modules
-import, what those import in turn, and what they embed, so a change to any other
-leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
+load reads of a shipped module what a module importing it can reach: none of
+its tests or laws, nor a private function or type or an `import` that only they
+reach, which it neither parses nor checks. It reads only the shipped modules its
+modules import, what the parts it reads import in turn, and what they embed, so
+a change to any other leaves it alone; a change to one it reads warns `W0605`.
+Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
@@ -2747,7 +2783,8 @@ checked against that declaration, so it performs none of it.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, as `std.http`'s `serve_pooled_tls` uses it to offer `h2` and `http/1.1`; a name given several times holds several certificates, and a handshake gets the one whose names cover the name the client asks for (SNI), or the first; a certificate whose files change is read again within a second and served without a restart, the one before kept where the new one does not load; sessions resume from tickets whose key rotates; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, still serves a client that presents none, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding); `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, serves a client that presents none unless `--mtls` names its credential, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding), which `std.http` carries on each request as `client_certificate` and `std.x509` reads; a client presents one where its connection was opened or set with `net::Presenting("NAME")`, the `--tls` credential named, as `std.http`'s `fetch` does for `Fetching.credential`; `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
@@ -2997,7 +3034,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
@@ -3110,7 +3147,10 @@ package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
 dependents' rows standing. What each module imports, and what it embeds, is kept
 in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
-has not read. A load reads its dependencies and the shipped modules it
+has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
+`reused/` under the stage root, under the text's digest and the `ply` that read it, so a
+project's first load lexes no shipped module's tests or laws to find it. A load reads its
+dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
@@ -3198,7 +3238,8 @@ way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
 program reached hashes as it did; its `--json` document then carries
 `front_end` with `reused` and `key`, and otherwise `reused` false beside the own
-modules the load read as their stubs (`stubbed`).
+modules the load read as their stubs (`stubbed`) and those it read whole again
+because what one references in a module read from its source moved (`restored`).
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
@@ -3226,6 +3267,35 @@ load until it is mended, so its diagnostic names the place as the sources stand.
 A module that declares one is read as its stub like any other: the value is the
 definition's, wherever its body is read from. `compiler.load` evaluates none, and
 there a `const fn` is a definition that takes nothing, evaluated once a run.
+
+The same commands then check the statements the root package's modules run:
+each `db.query`, `db.batch`, `db.execute`, `db.returning` and `db.copy_out`,
+`std.db`'s `fetch` and `fetch_returning`, and `std.sqlite`'s `query`, `execute`,
+`returning`, `run` and `fold_rows`, whose statement a check can compute before
+anything runs: text, joined by `++` or not, a call of a definition on such
+values, `sqlite::bound` of one, or a tagged literal. Each definition the
+statement is computed by is entered on a machine of its own under the literals'
+budget, and the schema the statement's module reaches with them (§3.5); one that
+raises leaves the statement to the run. A module that runs a statement is read
+from its source by every check, never as its stub. The statement is held to its
+call:
+text the reader refuses is `E0431`, tables that do not include the table the
+label names `E0435`, a statement the operation does not perform (a write run as a
+query, a read or one with `returning` run as `execute`, one without it run as
+`returning`) `E0436`, and parameters the call writes as a list, more or fewer
+than the placeholders, `E0438`. Against the schema it is also read for every
+table and column it names (`E0433`); a `*` is `E0447`; a construct the check does
+not follow (a `with`, a set operation, a subquery in `from`, a window, `on
+conflict`) is `E0470` where the check stops; a parameter written as a `Param`
+constructor that is not the type of the column it is compared with, stored in or
+bounds is `E0438`; and the columns a `fetch` answers are held to the fields of
+the row its codec reads, when `derive row` wrote it (§11), by name, by type and
+by null, a `left join` making the joined table's columns ones that may be null
+(`E0437`). Each is reported at the call, with the statement's text, where it
+comes from and the schema. What the check found is kept in the toolchain's cache
+under the hashes of all the statement and the schema reach, and is asked again
+only after an edit to one of them; `std.db` holds a statement the check could not
+compute to the same rules when it runs it, and raises.
 
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements, and keeps a doc comment directly above what it
@@ -3391,8 +3461,14 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0426` | continuation resumed twice across an at-most-once host operation |
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |
-| `E0429` | `net.listen_tls` named a credential the run lacks |
-| `E0430` | `--tls` credential, or certificate to trust, that does not load |
+| `E0429` | `net.listen_tls`, `net::Presenting` or `--mtls` named a credential the run lacks |
+| `E0430` | `--tls` credential, or certificate to trust, that does not load, or `--mtls` with no `--trust` |
+| `E0431` | a statement the reader refuses, found before it runs |
+| `E0433` | a statement that names a table or column the schema does not declare |
+| `E0435` | a statement whose tables do not include the table its call's label names |
+| `E0436` | a statement the call does not perform: a write run as a query, or the like |
+| `E0437` | columns a statement answers that disagree with the row type it is read into |
+| `E0438` | parameters or values that disagree in number or type with the placeholders and columns they fill |
 | `E0439` | `Secret` passed to a host operation not allowed one |
 | `E0440` | configuration source unreadable |
 | `E0441` | required configuration key missing |
@@ -3401,6 +3477,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
+| `E0447` | a statement checked against the schema that answers `*` |
 | `E0448` | definition the C backend cannot compile |
 | `E0449` | region handle or continuation reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
@@ -3423,6 +3500,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0469` | a test's table or label that performs more than raises |
+| `E0470` | a statement checked against the schema written past what the check follows |
+| `E0471` | a module whose statements reach two `const fn`s of `std.sql.Schema` |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
 | `E0501` | assertion failed |

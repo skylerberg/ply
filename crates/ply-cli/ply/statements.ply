@@ -1,0 +1,851 @@
+//! What a check says of the statements a program runs: each call of `std.db` and `std.sqlite`
+//! whose statement a check can compute before anything runs, held by `std.sql`'s `checked` to the
+//! call that runs it, to the row type a derived codec reads its rows into, and to the schema its
+//! module declares or imports: a `const fn` whose type is `std.sql.Schema`. The statements and the
+//! schema are computed on a machine of their own, as a literal's parser is, and what the check
+//! found is kept in the toolchain's cache under the hashes of all they reach. A codec's fields are
+//! read from the type `derive row` wrote it for, since a value that holds functions does not cross
+//! back from the machine. The check reads a module's bodies, so a module that runs a statement is
+//! never read as its stub.
+
+import compiler.derive (RowField, RowRead, RScalar, ROptional, RArray, RDocument, RByJson)
+import compiler.front (Analysis, ConstSite, StatementSite, Argument, AText, ACall, ARow, ATagged,
+                       AList, ACtor, AOther, Within, statement_sites, consts_of_type)
+import compiler.hash (TheFn, hex, reach)
+import compiler.interface (sized)
+import compiler.load (every_root, LoadedAnalysis)
+import compiler.resolve (Diag, error_at, error_with_labels, label_at)
+import compiler.rewrite (statement_runners)
+import compiler.type_syntax (TVar)
+import machine (machine, Called, default_options, unconfigured)
+import std.bin
+import std.bytes (ascii_of_int)
+import std.hash (blake3)
+import std.list (at, concat, contains, find)
+import std.sql
+import std.sql (Dialect, Postgres, Sqlite, Operation, Reads, Writes, WritesRows, Either, Finding,
+                Misfit, Unreadable, Undeclared, Unlabelled, Misperformed, Starred, Unfollowed,
+                Misshapen, Misbound)
+import std.value (Value, VBool, VCtor, VInt, VList, VRecord, VStr, field_named, ctor_name)
+import units (emit, text_of)
+
+/// The program-wide name of the type a schema is declared as.
+pub fn schema_type() -> Bytes = b"std.sql.Schema"
+
+/// How a call runs a statement: the operation or the definition, by program-wide name, the dialect,
+/// how it performs the statement, which argument holds it, which its parameters and which the codec
+/// its rows are read by (`-1` for none), and whether its label names a table.
+type Performs = {
+  callee: Bytes,
+  dialect: Dialect,
+  operation: Operation,
+  statement: Int,
+  params: Int,
+  codec: Int,
+  table: Bool,
+}
+
+fn db_call(callee: Bytes, operation: Operation, params: Int, codec: Int) -> Performs =
+  {
+    callee: callee,
+    dialect: Postgres,
+    operation: operation,
+    statement: 0,
+    params: params,
+    codec: codec,
+    table: true,
+  }
+
+fn sqlite_call(callee: Bytes, operation: Operation) -> Performs =
+  {
+    callee: callee,
+    dialect: Sqlite,
+    operation: operation,
+    statement: 1,
+    params: 0 - 1,
+    codec: 0 - 1,
+    table: false,
+  }
+
+fn performs() -> List<Performs> =
+  [
+    db_call(b"std.db.db.query", Reads, 1, 0 - 1),
+    db_call(b"std.db.db.batch", Reads, 0 - 1, 0 - 1),
+    db_call(b"std.db.db.execute", Writes, 1, 0 - 1),
+    db_call(b"std.db.db.returning", WritesRows, 1, 0 - 1),
+    db_call(b"std.db.db.copy_out", Reads, 0 - 1, 0 - 1),
+    db_call(b"std.db.fetch", Reads, 2, 1),
+    db_call(b"std.db.fetch_returning", WritesRows, 2, 1),
+    sqlite_call(b"std.sqlite.query", Reads),
+    sqlite_call(b"std.sqlite.execute", Writes),
+    sqlite_call(b"std.sqlite.returning", WritesRows),
+    sqlite_call(b"std.sqlite.run", Either),
+    sqlite_call(b"std.sqlite.fold_rows", Reads),
+  ]
+
+/// A statement a call runs, as the check asks after it: what the call says of it, the argument it
+/// is computed from, the constructor of each parameter the call writes as a list, the fields of the
+/// row type a derived codec reads its rows into, and the schema it is held to.
+pub type Asked = {
+  dialect: Dialect,
+  operation: Operation,
+  label: Option<String>,
+  statement: Argument,
+  given: Option<List<Option<String>>>,
+  row: Option<List<sql::Field>>,
+  schema: Option<ConstSite>,
+}
+
+/// What the check found wrong with one statement: its code, the byte of the statement it stands
+/// at, and why.
+pub type Found = { code: Bytes, at: Int, message: String }
+
+derive bin for Found
+
+/// A statement's text and what the check found wrong with it, or `Unjudged` where it could not be
+/// computed before anything runs, which the run's own check then judges.
+pub type Judgement = | Judged({ text: String, found: List<Found> }) | Unjudged
+
+derive bin for Judgement
+
+/// A call that runs a statement, what the check asks of it, and every schema its module reaches.
+pub type Asking = { site: StatementSite, asked: Asked, schemas: List<ConstSite> }
+
+/// Every call in the root package's modules whose statement the check asks after. A statement is
+/// held to the schema its module declares or imports, at any depth, and to none where it reaches
+/// two, which `schemas_refused` says.
+pub fn asking(analysis: Analysis) -> List<Asking> / {abort.raise} = {
+  let schemas = consts_of_type(analysis, schema_type());
+  fold(
+    statement_sites(analysis, map(performs(), |p: Performs| p.callee)),
+    [],
+    |acc: List<Asking>, site: StatementSite|
+      match asked_of(site) {
+        None -> acc,
+        Some(a) -> {
+          let reached = reached_modules(analysis.r.imports, site.module);
+          let held = filter(schemas, |s: ConstSite| contains(reached, s.module));
+          push(acc, {
+            site: site,
+            asked: { ..a, schema: if len(held) == 1 { list_at(held, 0) } else { None } },
+            schemas: held,
+          })
+        },
+      },
+  )
+}
+
+/// `module` and every module it imports, at any depth, by their places in `imports`.
+fn reached_modules(imports: List<List<Int>>, module: Int) -> List<Int> =
+  fold(range(0, len(imports)), [module], |seen: List<Int>, _: Int|
+    fold(seen, seen, |acc: List<Int>, m: Int|
+      fold(
+        match list_at(imports, m) { Some(xs) -> xs, None -> [] },
+        acc,
+        |more: List<Int>, x: Int| if contains(more, x) { more } else { push(more, x) },
+      )))
+
+fn asked_of(site: StatementSite) -> Option<Asked> =
+  match find(performs(), |p: Performs| p.callee == site.callee) {
+    None -> None,
+    Some(p) -> match list_at(site.args, p.statement) {
+      None -> None,
+      Some(argument) -> {
+        let unwrapped = unbound(argument);
+        Some({
+          dialect: p.dialect,
+          operation: p.operation,
+          label: if p.table { Some(string_of_bytes_lossy(site.label)) } else { None },
+          statement: unwrapped.statement,
+          given: match unwrapped.given {
+            Some(given) -> Some(given),
+            None -> if p.params < 0 { None } else { given_by(list_at(site.args, p.params)) },
+          },
+          row: if p.codec < 0 { None } else {
+            match list_at(site.args, p.codec) {
+              Some(ARow(fields)) -> Some(map(fields, |f: RowField| field_of(f))),
+              _ -> None,
+            }
+          },
+          schema: None,
+        })
+      },
+    },
+  }
+
+/// A SQLite statement and its parameters, where they are written together: `bound(stmt, ps)`, or
+/// a tagged literal, whose holes are its parameters.
+fn unbound(a: Argument) -> { statement: Argument, given: Option<List<Option<String>>> } =
+  match a {
+    ACall(c) -> if c.callee != b"std.sqlite.bound" { { statement: a, given: None } } else {
+      match c.args {
+        [statement, params] -> { statement: statement, given: given_by(Some(params)) },
+        _ -> { statement: a, given: None },
+      }
+    },
+    ATagged(t) -> { statement: a, given: Some(map(t.holes, param_of)) },
+    _ -> { statement: a, given: None },
+  }
+
+fn given_by(a: Option<Argument>) -> Option<List<Option<String>>> =
+  match a { Some(AList(items)) -> Some(map(items, param_of)), _ -> None }
+
+/// The constructor a parameter is written with, where it is one of `std.sql`'s `Param`.
+fn param_of(a: Argument) -> Option<String> =
+  match a {
+    ACtor(c) -> if c.type_name == b"std.sql.Param" { Some(string_of_bytes_lossy(c.name)) }
+    else { None },
+    _ -> None,
+  }
+
+/// A derived codec's field as `std.sql` holds a statement's columns to it.
+fn field_of(f: RowField) -> sql::Field =
+  { name: string_of_bytes_lossy(f.name), kind: kind_of(f.read) }
+
+fn kind_of(r: RowRead) -> sql::FieldKind =
+  match r {
+    RScalar(reader) -> scalar_kind(reader),
+    ROptional(inner) -> sql::FOptional(kind_of(inner)),
+    RArray(reader) -> sql::FArray(scalar_kind(reader)),
+    RDocument -> sql::FJson,
+    RByJson(_) -> sql::FJson,
+  }
+
+fn scalar_kind(reader: Bytes) -> sql::FieldKind =
+  if reader == b"text_field" { sql::FText }
+  else if reader == b"int_field" { sql::FInt }
+  else if reader == b"bool_field" { sql::FBool }
+  else if reader == b"float_field" { sql::FFloat }
+  else if reader == b"numeric_field" { sql::FNumeric }
+  else if reader == b"bytes_field" { sql::FBytes }
+  else { sql::FJson }
+
+// --- Asking ------------------------------------------------------------------------------
+
+fn argument_key(a: Argument, left: Int) -> Bytes / {abort.raise} =
+  if left <= 0 { b"?" } else {
+    match a {
+      AText(b) -> bytes_concat(b"t", sized(b)),
+      ACall(c) ->
+        bytes_concat_all([
+          b"c",
+          sized(c.callee),
+          sized(c.hash),
+          sized(ascii_of_int(len(c.args))),
+          bytes_concat_all(map(c.args, |x: Argument| argument_key(x, left - 1))),
+        ]),
+      ARow(_) -> b"r",
+      ATagged(t) ->
+        bytes_concat_all([
+          b"g",
+          sized(t.callee),
+          sized(t.hash),
+          sized(ascii_of_int(len(t.parts))),
+          bytes_concat_all(map(t.parts, sized)),
+        ]),
+      AList(items) ->
+        bytes_concat_all([
+          b"l",
+          sized(ascii_of_int(len(items))),
+          bytes_concat_all(map(items, |x: Argument| argument_key(x, left - 1))),
+        ]),
+      ACtor(c) -> bytes_concat_all([b"k", sized(c.type_name), sized(c.name)]),
+      AOther -> b"o",
+    }
+  }
+
+fn operation_text(o: Operation) -> Bytes =
+  match o {
+    Reads -> b"reads",
+    Writes -> b"writes",
+    WritesRows -> b"writes rows",
+    Either -> b"either",
+  }
+
+fn kind_key(k: sql::FieldKind) -> Bytes = bytes_of_string(sql::field_text(k))
+
+/// What a judgement is a function of: the toolchain that judged it, the budget, the schema by the
+/// hash of all it reaches, and the statement asked after, each definition it is computed by under
+/// the hash of all that reaches.
+pub fn judgement_key(toolchain: Bytes, budget: Int, a: Asked) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([
+        sized(b"ply statement judgement 2"),
+        sized(hex(bin::shape_digest(judgement_bin()))),
+        sized(toolchain),
+        sized(ascii_of_int(budget)),
+        sized(match a.schema { Some(s) -> s.hash, None -> b"" }),
+        sized(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
+        sized(operation_text(a.operation)),
+        sized(match a.label { Some(l) -> bytes_of_string(l), None -> b"\x00" }),
+        match a.given {
+          None -> sized(b"\x00"),
+          Some(given) ->
+            bytes_concat_all(
+              map(given, |g: Option<String>|
+                sized(match g { Some(c) -> bytes_of_string(c), None -> b"\x00" })),
+            ),
+        },
+        match a.row {
+          None -> sized(b"\x00"),
+          Some(fields) ->
+            bytes_concat_all(
+              map(fields, |f: sql::Field|
+                bytes_concat(sized(bytes_of_string(f.name)), sized(kind_key(f.kind)))),
+            ),
+        },
+        sized(argument_key(a.statement, 64)),
+      ]),
+    ),
+  )
+
+// --- Answering ---------------------------------------------------------------------------
+
+fn callees_in(a: Argument, acc: List<Bytes>, left: Int) -> List<Bytes> =
+  if left <= 0 { acc } else {
+    match a {
+      ACall(c) ->
+        fold(
+          c.args,
+          if contains(acc, c.callee) { acc } else { push(acc, c.callee) },
+          |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1),
+        ),
+      ATagged(t) -> if contains(acc, t.callee) { acc } else { push(acc, t.callee) },
+      AList(items) ->
+        fold(items, acc, |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1)),
+      _ -> acc,
+    }
+  }
+
+/// The value of `a`, computed on the loaded machine; `None` where it is not one a check can
+/// compute, or its computing raised.
+fn computed_value(a: Argument, left: Int) -> Option<Value> / {machine.call[literals]} =
+  if left <= 0 { None } else {
+    match a {
+      AText(b) -> Some(VStr(string_of_bytes_lossy(b))),
+      AList(items) -> match all_computed(items, left - 1) {
+        Some(vs) -> Some(VList(vs)),
+        None -> None,
+      },
+      ACall(c) -> match all_computed(c.args, left - 1) {
+        None -> None,
+        Some(args) -> answer_of(machine.call[literals](string_of_bytes_lossy(c.callee), args)),
+      },
+      ATagged(t) -> {
+        let texts = map(t.parts, |p: Bytes| VStr(string_of_bytes_lossy(p)));
+        let handed = match texts { [one] -> one, _ -> VList(texts) };
+        match answer_of(machine.call[literals](string_of_bytes_lossy(t.callee), [handed])) {
+          Some(VCtor(name, [v])) -> if ctor_name(name) == "Ok" { Some(v) } else { None },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    }
+  }
+
+fn all_computed(xs: List<Argument>, left: Int) -> Option<List<Value>> / {machine.call[literals]} =
+  fold(xs, Some([]), |acc: Option<List<Value>>, x: Argument|
+    match acc {
+      None -> None,
+      Some(vs) -> match computed_value(x, left) { Some(v) -> Some(push(vs, v)), None -> None },
+    })
+
+fn answer_of(called: Called) -> Option<Value> =
+  match called.answer { Ok(v) -> Some(v), Err(_) -> None }
+
+/// Each statement of `asked` judged on a machine loaded for them alone, each definition they are
+/// computed by called under `steps`, and each schema they are held to entered once. `hand` answers
+/// the dump their unit is emitted over, given what it enters.
+pub fn judged(
+  hand: (Within) -> LoadedAnalysis / {abort.raise},
+  analysis: Analysis,
+  root: String,
+  steps: Int,
+  asked: List<Asked>,
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} = {
+  let schemas = fold(asked, [], |acc: List<Bytes>, a: Asked|
+    match a.schema {
+      Some(s) -> if contains(acc, s.name) { acc } else { push(acc, s.name) },
+      None -> acc,
+    });
+  let named = fold(asked, schemas, |acc: List<Bytes>, a: Asked| callees_in(a.statement, acc, 64));
+  if len(named) == 0 {
+    Ok(map(asked, |a: Asked| judgement_of(None, a, computed_text(a.statement))))
+  } else {
+    let reached = reach(analysis.hashes, map(named, |n: Bytes| TheFn(n))).fns;
+    let front = hand({ owners: reached, tests: map_new() });
+    match text_of(
+        emit.unit(front, filter(every_root(front), |n: Bytes| map_contains(reached, n))),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(unit) -> {
+        machine.configure[literals]({ ..default_options(), steps: steps });
+        let answered = match machine.load[literals](root, front, unit) {
+          Err(refused) -> Err(refused.diags),
+          Ok(_) -> match machine.bound[literals](
+              string_of_bytes_lossy(at(named, 0)),
+              unconfigured(),
+            ) {
+            Err(refused) -> Err(refused.diags),
+            Ok(_) -> {
+              let declared = fold(
+                schemas,
+                map_new(),
+                |acc: Map<Bytes, sql::Schema>, name: Bytes|
+                  match answer_of(machine.call[literals](string_of_bytes_lossy(name), [])) {
+                    Some(v) -> match schema_of(v) {
+                      Some(s) -> map_insert(acc, name, s),
+                      None -> acc,
+                    },
+                    None -> acc,
+                  },
+              );
+              Ok(
+                map(asked, |a: Asked|
+                  judgement_of(
+                    match a.schema { Some(s) -> map_get(declared, s.name), None -> None },
+                    a,
+                    computed_value(a.statement, 64),
+                  )),
+              )
+            },
+          },
+        };
+        machine.drop[literals]();
+        answered
+      },
+    }
+  }
+}
+
+/// A statement written as text alone, which needs no machine to compute.
+fn computed_text(a: Argument) -> Option<Value> =
+  match a { AText(b) -> Some(VStr(string_of_bytes_lossy(b))), _ -> None }
+
+fn judgement_of(
+  schema: Option<sql::Schema>,
+  a: Asked,
+  value: Option<Value>,
+) -> Judgement / {abort.raise} =
+  match value {
+    None -> Unjudged,
+    Some(v) -> match statement_of(v) {
+      None -> Unjudged,
+      Some(text) ->
+        Judged({
+          text: text,
+          found: map(
+            sql::checked(
+              schema,
+              {
+                dialect: a.dialect,
+                operation: a.operation,
+                label: a.label,
+                given: a.given,
+                row: a.row,
+              },
+              text,
+            ),
+            |f: Finding| { code: code_of(f.misfit), at: f.at, message: f.message },
+          ),
+        }),
+    },
+  }
+
+/// The code a check reports each misfit under.
+pub fn code_of(m: Misfit) -> Bytes =
+  match m {
+    Unreadable -> b"E0431",
+    Undeclared -> b"E0433",
+    Unlabelled -> b"E0435",
+    Misperformed -> b"E0436",
+    Misshapen -> b"E0437",
+    Misbound -> b"E0438",
+    Starred -> b"E0447",
+    Unfollowed -> b"E0470",
+  }
+
+// --- Values, read back -------------------------------------------------------------------
+
+fn text_in(v: Option<Value>) -> Option<String> = match v { Some(VStr(s)) -> Some(s), _ -> None }
+
+fn every<a>(v: Option<Value>, f: (Value) -> Option<a>) -> Option<List<a>> =
+  match v {
+    Some(VList(items)) ->
+      fold(items, Some([]), |acc: Option<List<a>>, item: Value|
+        match acc {
+          None -> None,
+          Some(xs) -> match f(item) { Some(x) -> Some(push(xs, x)), None -> None },
+        }),
+    _ -> None,
+  }
+
+/// A schema's value as the machine answered it. What a table declares beyond its columns and its
+/// key is not what the check reads, so it is left out.
+pub fn schema_of(v: Value) -> Option<sql::Schema> =
+  match v {
+    VRecord(fields) -> match every(field_named(fields, "tables"), table_of) {
+      Some(tables) -> Some({ tables: tables }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn table_of(v: Value) -> Option<sql::Table> =
+  match v {
+    VRecord(fields) -> match ((
+        text_in(field_named(fields, "name")),
+        every(field_named(fields, "columns"), column_of),
+        every(field_named(fields, "primary_key"), |k: Value| text_in(Some(k))),
+      )) {
+      (Some(name), Some(columns), Some(key)) ->
+        Some({
+          name: name,
+          columns: columns,
+          primary_key: key,
+          unique: [],
+          foreign_keys: [],
+          checks: [],
+        }),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn column_of(v: Value) -> Option<sql::Column> =
+  match v {
+    VRecord(fields) -> match ((
+        text_in(field_named(fields, "name")),
+        field_named(fields, "ty"),
+        field_named(fields, "nullable"),
+      )) {
+      (Some(name), Some(ty), Some(VBool(nullable))) -> match column_type_of(ty, 8) {
+        Some(t) -> Some({ name: name, ty: t, nullable: nullable, default: sql::DNone }),
+        None -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn column_type_of(v: Value, left: Int) -> Option<sql::ColumnType> =
+  match v {
+    VCtor(name, args) -> {
+      let n = ctor_name(name);
+      if n == "TInt" { Some(sql::TInt) }
+      else if n == "TBool" { Some(sql::TBool) }
+      else if n == "TText" { Some(sql::TText) }
+      else if n == "TBytes" { Some(sql::TBytes) }
+      else if n == "TFloat" { Some(sql::TFloat) }
+      else if n == "TJson" { Some(sql::TJson) } else if n == "TNumeric" {
+        match args { [VInt(p), VInt(s)] -> Some(sql::TNumeric(p, s)), _ -> None }
+      } else if n == "TArray" && left > 0 {
+        match args {
+          [inner] -> match column_type_of(inner, left - 1) {
+            Some(t) -> Some(sql::TArray(t)),
+            None -> None,
+          },
+          _ -> None,
+        }
+      } else { None }
+    },
+    _ -> None,
+  }
+
+/// A statement's text: a `Stmt`'s, or a `std.sqlite` `Bound`'s.
+fn statement_of(v: Value) -> Option<String> =
+  match v {
+    VStr(s) -> Some(s),
+    VCtor(name, args) -> if ctor_name(name) != "Bound" { None }
+    else { match args { [VStr(s), ..] -> Some(s), _ -> None } },
+    VRecord(fields) -> text_in(field_named(fields, "sql")),
+    _ -> None,
+  }
+
+// --- What a check reports ----------------------------------------------------------------
+
+/// Where a statement a call runs comes from, as a diagnostic names it.
+fn source_of(a: Argument) -> Bytes =
+  match a {
+    ACall(c) -> if c.callee == b"std.sql.stmt" { b"the text written here" }
+    else { bytes_concat_all([b"`", c.callee, b"()`"]) },
+    ATagged(t) -> bytes_concat_all([b"a tagged literal, read by `", t.callee, b"`"]),
+    _ -> b"the text written here",
+  }
+
+/// Up to 24 bytes of `text` from byte `at`.
+fn excerpt(text: String, at: Int) -> Bytes / {abort.raise} = {
+  let b = bytes_of_string(text);
+  let from = min(max(at, 0), bytes_len(b));
+  bytes_slice(b, from, min(bytes_len(b), from + 24))
+}
+
+/// The diagnostics a judgement makes at the call that runs the statement, naming the statement and
+/// the schema it was checked against.
+pub fn misfits(a: Asking, j: Judgement) -> List<Diag> / {abort.raise} =
+  match j {
+    Unjudged -> [],
+    Judged(judged) ->
+      map(judged.found, |f: Found| {
+        let schema = a.asked.schema;
+        let schema_name = match schema { Some(s) -> s.name, None -> b"" };
+        let message = bytes_of_string(f.message);
+        let headline = if f.code == b"E0433" {
+          bytes_concat_all([b"this statement ", message, b" in the schema `", schema_name, b"`"])
+        } else if f.code == b"E0470" {
+          bytes_concat_all([
+            b"the check does not follow ",
+            message,
+            b" in a statement it holds to the schema",
+          ])
+        } else { message };
+        let placed = if f.at <= 0 { [] } else {
+          [
+            bytes_concat_all([
+              b"at byte ",
+              ascii_of_int(f.at),
+              b" of the statement: `",
+              excerpt(judged.text, f.at),
+              b"`",
+            ]),
+          ]
+        };
+        let against = if schema == None { [] } else {
+          [
+            bytes_concat_all([
+              b"checked against the schema `",
+              schema_name,
+              b"`, a `const fn` of `std.sql.Schema`",
+            ]),
+          ]
+        };
+        error_at(
+          f.code,
+          a.site.module,
+          a.site.span,
+          headline,
+          b"this call runs the statement",
+          concat(
+            concat(
+              [
+                bytes_concat_all([
+                  b"the statement, from ",
+                  source_of(a.asked.statement),
+                  b": ",
+                  bytes_of_string(judged.text),
+                ]),
+              ],
+              placed,
+            ),
+            against,
+          ),
+        )
+      }),
+  }
+
+/// A module whose statements reach two schemas, through what it declares and imports, is refused
+/// once, at its first statement: they are held to one.
+pub fn schemas_refused(asks: List<Asking>) -> List<Diag> =
+  fold(
+    asks,
+    { modules: [], diags: [] },
+    |acc: { modules: List<Int>, diags: List<Diag> }, a: Asking|
+      if contains(acc.modules, a.site.module) { acc } else {
+        match a.schemas {
+          [first, second, ..] ->
+            {
+              modules: push(acc.modules, a.site.module),
+              diags: push(
+                acc.diags,
+                error_with_labels(
+                  b"E0471",
+                  bytes_concat_all([
+                    b"this statement's module reaches two schemas, `",
+                    first.name,
+                    b"` and `",
+                    second.name,
+                    b"`, and its statements are held to one",
+                  ]),
+                  [
+                    label_at(a.site.module, a.site.span, true, b"this call runs a statement"),
+                    label_at(first.module, first.span, false, b"a `const fn` of `std.sql.Schema`"),
+                    label_at(second.module, second.span, false, b"another"),
+                  ],
+                  [
+                    b"a statement is held to the schema its module declares or imports; split the modules so each reaches one",
+                  ],
+                ),
+              ),
+            },
+          _ -> acc,
+        }
+      },
+  ).diags
+
+// --- Tests ------------------------------------------------------------------
+
+fn a_site(callee: Bytes, args: List<Argument>) -> StatementSite =
+  { module: 0, span: { start: 3, end: 9 }, callee: callee, label: b"items", args: args }
+
+fn a_param(name: Bytes) -> Argument = ACtor({ type_name: b"std.sql.Param", name: name })
+
+test "a call's statement, parameters and row are read from where the call writes them" {
+  let text = ACall({ callee: b"m.items_all", hash: b"h", args: [] });
+  let query = asked_of(a_site(b"std.db.db.query", [text, AList([a_param(b"PInt"), AOther])]));
+  assert_eq(
+    match query { Some(a) -> Some((a.label, a.given, a.row, a.statement == text)), None -> None },
+    Some((Some("items"), Some([Some("PInt"), None]), None, true)),
+  );
+  let row = ARow([
+    { name: b"sku", read: RScalar(b"text_field") },
+    { name: b"note", read: ROptional(RScalar(b"text_field")) },
+  ]);
+  assert_eq(
+    match asked_of(a_site(b"std.db.fetch", [text, row, AList([])])) {
+      Some(a) -> a.row,
+      None -> None,
+    },
+    Some([{ name: "sku", kind: sql::FText }, { name: "note", kind: sql::FOptional(sql::FText) }]),
+  );
+  // A SQLite statement is the first argument of the `bound` that pairs it with its parameters.
+  let bound = ACall({
+    callee: b"std.sqlite.bound",
+    hash: b"b",
+    args: [text, AList([a_param(b"PText")])],
+  });
+  assert_eq(
+    match asked_of(a_site(b"std.sqlite.query", [AOther, bound, AOther])) {
+      Some(a) -> Some((a.label, a.given, a.statement == text)),
+      None -> None,
+    },
+    Some((None, Some([Some("PText")]), true)),
+  );
+  // A parameter of another type than `std.sql.Param` is no parameter the check reads.
+  assert_eq(param_of(ACtor({ type_name: b"m.Param", name: b"PInt" })), None);
+  assert_eq(asked_of(a_site(b"m.other", [text])), None)
+}
+
+// A module that runs one of these is read from its source by every check, never as its stub.
+test "the calls the check reads a statement at are the ones the compiler keeps a module's bodies for" {
+  assert_eq(map(performs(), |p: Performs| p.callee), statement_runners())
+}
+
+test "a derived codec's fields are held to the columns as a document where they are not scalars" {
+  assert_eq(kind_of(RByJson(TVar({ name: b"a", span: { start: 0, end: 0 } }))), sql::FJson);
+  assert_eq(kind_of(RArray(b"int_field")), sql::FArray(sql::FInt));
+  assert_eq(kind_of(ROptional(RDocument)), sql::FOptional(sql::FJson));
+  assert_eq(scalar_kind(b"numeric_field"), sql::FNumeric)
+}
+
+test "a schema reads back from the value the machine answered for it" {
+  let column = |name: String, ty: Value, nullable: Bool|
+    VRecord([
+      { name: "default", value: VCtor("std.sql.DNone", []) },
+      { name: "name", value: VStr(name) },
+      { name: "nullable", value: VBool(nullable) },
+      { name: "ty", value: ty },
+    ]);
+  let schema = VRecord([
+    {
+      name: "tables",
+      value: VList([
+        VRecord([
+          { name: "checks", value: VList([]) },
+          {
+            name: "columns",
+            value: VList([
+              column("sku", VCtor("std.sql.TText", []), false),
+              column("price", VCtor("std.sql.TNumeric", [VInt(12), VInt(2)]), true),
+              column("tags", VCtor("std.sql.TArray", [VCtor("std.sql.TText", [])]), false),
+            ]),
+          },
+          { name: "foreign_keys", value: VList([]) },
+          { name: "name", value: VStr("items") },
+          { name: "primary_key", value: VList([VStr("sku")]) },
+          { name: "unique", value: VList([]) },
+        ]),
+      ]),
+    },
+  ]);
+  assert_eq(
+    schema_of(schema),
+    Some({
+      tables: [
+        {
+          name: "items",
+          columns: [
+            sql::column("sku", sql::TText, false),
+            sql::column("price", sql::TNumeric(12, 2), true),
+            sql::column("tags", sql::TArray(sql::TText), false),
+          ],
+          primary_key: ["sku"],
+          unique: [],
+          foreign_keys: [],
+          checks: [],
+        },
+      ],
+    }),
+  );
+  assert_eq(schema_of(VRecord([{ name: "tables", value: VList([VInt(1)]) }])), None);
+  assert_eq(statement_of(VRecord([{ name: "sql", value: VStr("select 1") }])), Some("select 1"));
+  assert_eq(
+    statement_of(VCtor("std.sqlite.Bound", [VStr("select 2"), VList([])])),
+    Some("select 2"),
+  )
+}
+
+test "a module's statements are held to the schema it declares or imports, at any depth" {
+  // 0 imports 1, which imports 2; 3 imports 0; 4 stands alone.
+  let imports = [[1], [2], [], [0], []];
+  assert_eq(reached_modules(imports, 0), [0, 1, 2]);
+  assert_eq(reached_modules(imports, 3), [3, 0, 1, 2]);
+  assert_eq(reached_modules(imports, 4), [4]);
+  // A cycle of imports ends.
+  assert_eq(reached_modules([[1], [0]], 1), [1, 0])
+}
+
+test "what the check found is reported at the call, naming the statement and the schema" {
+  let declared: ConstSite = {
+    module: 0,
+    span: { start: 0, end: 1 },
+    name: b"m.schema",
+    hash: b"s",
+  };
+  let a = {
+    site: a_site(b"std.db.db.query", []),
+    asked: {
+      dialect: Postgres,
+      operation: Reads,
+      label: Some("items"),
+      statement: ACall({ callee: b"m.items_all", hash: b"h", args: [] }),
+      given: None,
+      row: None,
+      schema: Some(declared),
+    },
+    schemas: [declared],
+  };
+  let found = {
+    code: b"E0433",
+    at: 12,
+    message: "names the column `nmae`, which `items` does not have",
+  };
+  let diags = misfits(a, Judged({ text: "select sku, nmae from items", found: [found] }));
+  assert_eq(map(diags, |d: Diag| d.code), [b"E0433"]);
+  assert_eq(map(diags, |d: Diag| d.message), [
+    b"this statement names the column `nmae`, which `items` does not have in the schema `m.schema`",
+  ]);
+  assert_eq(map(diags, |d: Diag| d.notes_text), [
+    [
+      b"the statement, from `m.items_all()`: select sku, nmae from items",
+      b"at byte 12 of the statement: `nmae from items`",
+      b"checked against the schema `m.schema`, a `const fn` of `std.sql.Schema`",
+    ],
+  ]);
+  assert_eq(misfits(a, Unjudged), []);
+  // Two statements of one module that reaches two schemas are refused once.
+  let twice = { ..a, schemas: [declared, { ..declared, name: b"n.schema" }] };
+  assert_eq(map(schemas_refused([twice, twice]), |d: Diag| d.code), [b"E0471"]);
+  assert_eq(schemas_refused([a]), []);
+  assert_eq(code_of(sql::Unfollowed), b"E0470")
+}

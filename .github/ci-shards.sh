@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 # The tables CI's test jobs are cut from, the check that the cut is total, and the caches a run
-# parks for its own jobs, handed back when it is green.
+# leaves the runs after it.
 #
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
-#                                every test exactly once, every cache key a job
+#                                every test exactly once, no corpus run the last
+#                                table measured takes over a third of its job's
+#                                deadline, every cache key a job
 #                                writes is one a job reads, every key that
-#                                names the run is one the run gives back or a
-#                                later run reads, and every key over a crate's
-#                                Ply sources names every crate's
+#                                names the run is one a later run reads and no
+#                                job needs, and every key over a crate's Ply
+#                                sources names every crate's
 #   ci-shards.sh cache-keys      just that last check
+#   ci-shards.sh fetch-timings   the table the last run measured, from this
+#                                pull request's branch or else from main, into
+#                                the place the cut reads it from
 #   ci-shards.sh partitions      the JSON matrix of the corpus partitions
 #   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
 #   ci-shards.sh shard-configs D the nextest config each shard runs under and
@@ -30,7 +35,9 @@
 #                                from the cut in DIR, or round robin without one
 #   ci-shards.sh desks-for-runner K [DIR]
 #                                the desk runs runner K takes, likewise
-#   ci-shards.sh corpus-line ID  the package one run tests and its filter
+#   ci-shards.sh corpus-line ID...
+#                                the package each run tests, its filter and its
+#                                part, tab-separated, a line a run
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the gates
 #                                job: the host packages, and the tree check it
 #                                runs alone
@@ -44,8 +51,6 @@
 #   ci-shards.sh rust-kept NEW JUNIT OUT
 #                                the traces in NEW of the tests JUNIT says passed,
 #                                copied into OUT
-#   ci-shards.sh give-back RUN   delete the entries this run parked for its own
-#                                jobs, once every job that reads them is done
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -58,7 +63,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PARTITIONS=8
 NEXTEST_SHARDS=2
 
-# What the last run whose test jobs all passed measured, restored from the cache by the `plan` job.
+# What the last run whose test jobs all passed measured, which its `passes` job uploaded in the
+# `test-durations` artifact (`fetch-timings`).
 TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
@@ -72,9 +78,12 @@ CORPUS_PROGRAM=crates/ply-corpus/ply
 # The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
-# The fixtures the standard library's tests read, as a project: `--std` over it runs the tests and
-# laws of every module the binary ships beside its own, so no file here lists the modules.
+# The fixtures the standard library's tests read, as a project: `--std` over it tests and proves every
+# module of the library beside its own. Its tests and its proofs are runs of each of the library's
+# top-level modules, a module beneath one its own (`std.hash.legacy` is `std.hash`'s), and of each of
+# the project's modules (`stdlib_entries`).
 CORPUS_STDLIB=crates/ply-corpus/stdlib
+STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
 # The checks that start desks under load and drive them over postgres: a test at a time, cut by
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
@@ -86,6 +95,12 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+# Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
+# for a lane whatever its tests are placed by, as a test over cases is one test.
+CORPUS_SHARDED=("cli-phases:3")
+# Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
+# steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
+RUNS_MARGIN=4
 # Corpus processes a partition runs side by side, each a lane of the cut: a lane's runs of one package
 # go in one `ply test`, which loads the package's closure once. Two, so the program's and the packages'
 # own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
@@ -147,14 +162,10 @@ declare -a PROBE_JOBS=(
   "ucontext:plan"
 )
 
-# What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
-# the emitter's stage and the shard cut. No later run can name one, so a green run gives them back,
-# and the repository's 10 GB cache stays for what does outlive a run: the archive and the runtime
-# under the Rust key, the stage under `ply-c-stage-sources-`, the kept C, the stores and the passes.
-GIVE_BACK=(ply-c-stage-emitter- test-shards-)
-
-# `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings- rust-traces-)
+# `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
+# of its own run is never a cache, which the repository's other runs evict while those jobs wait for
+# runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- rust-traces-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
@@ -204,18 +215,74 @@ filter_of() {
   done
 }
 
-# One entry id a line: `program`, `stdlib`, `fixture-<name>` per fixture, `package-<id>` per package
-# suite, every checks module that declares a test, then every such module of the CLI's suite under `cli-`;
-# each module as `module`, or, for one placed a test at a time, `module:<id>` per test, the id a hash
-# of its label, so a duration measured for a test stays with it however the module's tests move.
+# One entry id a line: `program`, the standard library's runs, `fixture-<name>` per fixture,
+# `package-<id>` per package suite, every checks module that declares a test, then every such module of
+# the CLI's suite under `cli-`; each module as `module`, or, for one placed a test at a time,
+# `module:<id>` per test, the id a hash of its label, so a duration measured for a test stays with it
+# however the module's tests move. A run CORPUS_SHARDED cuts is its parts, `entry#1` to `entry#N`.
 corpus_entries() {
   local entry file
-  printf 'program\n'
-  printf 'stdlib\n'
-  for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
-  for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
-  module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+  {
+    printf 'program\n'
+    stdlib_entries
+    for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
+    for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
+    module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
+    module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+  } | awk -v sharded="${CORPUS_SHARDED[*]-}" '
+    BEGIN {
+      n = split(sharded, s, " ")
+      for (i = 1; i <= n; i++) if (match(s[i], /:[0-9]+$/)) parts[substr(s[i], 1, RSTART - 1)] = substr(s[i], RSTART + 1)
+    }
+    $0 in parts { for (k = 1; k <= parts[$0]; k++) print $0 "#" k; next }
+    { print }
+  '
+}
+
+# How many parts CORPUS_SHARDED cuts the run $1 into; nothing for one it does not cut.
+parts_of() {
+  local entry
+  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
+    [[ ${entry%:*} == "$1" ]] && printf '%s\n' "${entry##*:}"
+  done
+  return 0
+}
+
+# The library's runs, each named by a module: `std.<module>` per top-level module of the library, those
+# beneath it its own, and `<module>` per module of CORPUS_STDLIB. `stdlib:<module>` per one that
+# declares a test, then `proofs:<module>` per one that declares a law or states an `ensures` or `cost`
+# clause, which `ply prove` owes a proof of: apart, so the cut can give a lane the tests and another
+# the proofs, each a process with a load of its own.
+stdlib_entries() {
+  library_modules_with '^test(/[a-z]+)? "' | sed 's/^/stdlib:/'
+  library_modules_with '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' | sed 's/^/proofs:/'
+}
+
+# The library's runs a `.ply` file of which holds a line the extended regular expression matches.
+library_modules_with() {
+  { grep -rlE --include='*.ply' "$1" "$root/$STD_LIBRARY" || true; } |
+    sed "s|^$root/$STD_LIBRARY/|std.|; s|^\(std\.[^/.]*\).*|\1|" | LC_ALL=C sort -u
+  { grep -lE "$1" "$root/$CORPUS_STDLIB"/*.ply || true; } | sed 's|.*/||; s|\.ply$||' | LC_ALL=C sort
+}
+
+# `run<TAB>key` per test and law of the library's runs, the name a filter is matched against:
+# `std.<module>.<label>` under its top-level module, and a project module's `<module>.<label>` under
+# the module.
+stdlib_keys() {
+  local file rel
+  find "$root/$STD_LIBRARY" -name '*.ply' | LC_ALL=C sort | while IFS= read -r file; do
+    rel=${file#"$root/$STD_LIBRARY/"}
+    rel=${rel%.ply}
+    labels_of "$file" | awk -v run="std.${rel%%/*}" -v module="std.${rel//\//.}" -v OFS="$TAB" '{ print run, module "." $0 }'
+  done
+  for file in "$root/$CORPUS_STDLIB"/*.ply; do
+    labels_of "$file" | awk -v module="$(basename "$file" .ply)" -v OFS="$TAB" '{ print module, module "." $0 }'
+  done
+}
+
+# The labels of a module's tests and laws.
+labels_of() {
+  sed -nE 's/^(test|law)(\/[a-z]+)? "([^"]*)".*/\3/p' "$1"
 }
 
 # `PREFIX<module>` per module of the package at DIR that declares a test, or `PREFIX<module>:<id>` per
@@ -348,43 +415,64 @@ cmd_corpus_for_partition() {
   done < <(corpus_placed)
 }
 
-# `path filter`: the program's entry takes every test of its package, a module's its own, and
-# `module:<id>` the test whose label hashes to it, by the qualified name `ply test --filter` matches.
-# A module the cut places a test at a time is a run too, of every test it declares.
+# `path<TAB>filter<TAB>shard` per entry named, in order, a field empty where the run has none: the
+# program's entry takes every test of its package, a module's its own, and `module:<id>` the test whose
+# label hashes to it, by the qualified name `ply test --filter` matches; `entry#K` takes part K of
+# what `entry` would, by `ply test --shard K/N`. A module the cut places a test at a time is a run too,
+# of every test it declares, and so are a run cut into parts, of every part, and `stdlib` and
+# `proofs`, of every test and every claim of the library.
 cmd_corpus_line() {
-  local entry entries
+  local entries id
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
   entries=$(corpus_entries)
+  for id in "$@"; do corpus_line_of "$id" "$entries" || return 1; done
+}
+
+# The line of the entry $1 among the entries $2.
+corpus_line_of() {
+  local entry line
   while read -r entry; do
-    [[ $entry == "$1" || ${entry%%:*} == "$1" ]] || continue
-    if [[ $1 == program ]]; then
-      printf '%s\n' "$CORPUS_PROGRAM"
-    elif [[ $1 == stdlib ]]; then
-      printf '%s\n' "$CORPUS_STDLIB"
-    elif [[ $1 == fixture-* ]]; then
-      printf '%s/%s.ply\n' "$CORPUS_FIXTURES" "${1#fixture-}"
-    elif [[ $1 == package-* ]]; then
-      package_path "${1#package-}"
-    elif [[ $1 == cli-* ]]; then
-      module_line "$CLI_SUITE" "${1#cli-}"
+    [[ $entry == "$1" || ${entry%%[:#]*} == "$1" ]] || continue
+    line=$(entry_line "${1%#*}") || return 1
+    if [[ $1 == *#* ]]; then
+      printf '%s%s%s/%s\n' "$line" "$TAB" "${1##*#}" "$(parts_of "${1%#*}")"
     else
-      module_line "$CORPUS_CHECKS" "$1"
+      printf '%s%s\n' "$line" "$TAB"
     fi
-    return 0
-  done <<< "$entries"
+    return
+  done <<< "$2"
   echo "no corpus entry named '$1'" >&2
   return 1
 }
 
-# `path filter` of the run `module` or `module:<id>` of the package at DIR.
+# `path<TAB>filter` of the entry $1, or of the run a module is or a run cut into parts is.
+entry_line() {
+  if [[ $1 == program ]]; then
+    printf '%s%s\n' "$CORPUS_PROGRAM" "$TAB"
+  elif [[ $1 == stdlib || $1 == proofs ]]; then
+    printf '%s%s\n' "$CORPUS_STDLIB" "$TAB"
+  elif [[ $1 == stdlib:* || $1 == proofs:* ]]; then
+    printf '%s%s%s.\n' "$CORPUS_STDLIB" "$TAB" "${1#*:}"
+  elif [[ $1 == fixture-* ]]; then
+    printf '%s/%s.ply%s\n' "$CORPUS_FIXTURES" "${1#fixture-}" "$TAB"
+  elif [[ $1 == package-* ]]; then
+    printf '%s%s\n' "$(package_path "${1#package-}")" "$TAB"
+  elif [[ $1 == cli-* ]]; then
+    module_line "$CLI_SUITE" "${1#cli-}"
+  else
+    module_line "$CORPUS_CHECKS" "$1"
+  fi
+}
+
+# `path<TAB>filter` of the run `module` or `module:<id>` of the package at DIR.
 module_line() {
   local dir=$1 module=${2%%:*} name
   if [[ $2 == *:* ]]; then
     name=$(corpus_test_names "$root/$dir/$module.ply" | label_ids | awk -F"$TAB" -v id="${2##*:}" '$1 == id { print $2; exit }')
     [[ -n $name ]] || { echo "no test of $dir/$module.ply has the id '${2##*:}'" >&2; return 1; }
-    printf '%s %s.%s\n' "$dir" "$module" "$name"
+    printf '%s%s%s.%s\n' "$dir" "$TAB" "$module" "$name"
   else
-    printf '%s %s.\n' "$dir" "$module"
+    printf '%s%s%s.\n' "$dir" "$TAB" "$module"
   fi
 }
 
@@ -598,9 +686,17 @@ living_durations() {
     echo "FAIL: cargo metadata named no test binary in $root" >&2
     return 1
   }
-  # A corpus row is the entry's own, and lives while the entry does; a startup row is a package's.
+  # A corpus row is the entry's own, and lives while the entry does, or while a part of it does, which
+  # counts as its share until it is measured; a startup row is a package's.
   dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$({ corpus_placed; desk_placed; } | tr '\n' ' ')" '
-    BEGIN { n = split(placed, ids, " "); for (i = 1; i <= n; i++) corpus[ids[i]] = 1; n = 0 }
+    BEGIN {
+      n = split(placed, ids, " ")
+      for (i = 1; i <= n; i++) {
+        corpus[ids[i]] = 1
+        if (index(ids[i], "#")) corpus[substr(ids[i], 1, index(ids[i], "#") - 1)] = 1
+      }
+      n = 0
+    }
     NR == FNR { live[$0] = 1; next }
     $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
     $1 == "startup" { print > out; next }
@@ -724,26 +820,49 @@ desk_cut() {
 }
 
 # The corpus runs the partitions take, as `corpus-<k>.txt` of `lane entry` lines. The tests of a module
-# placed a test at a time go in as runs of neighbours, one run while the module fits a lane and as few
-# as it needs once it does not, so a cold start its tests share is paid once a run rather than once a
-# test. Runs and the other entries go longest first onto the lane of every partition's that would end
-# soonest with it; the lanes are taken partition by partition, so the first placed land on different
-# runners. A lane pays each package's startup once. An entry nothing measured counts as the median
-# of those that were.
+# placed a test at a time, and the standard library's runs of each kind, go in as runs of neighbours,
+# one run while they fit a lane and as few as they need once they do not, so a cold start they share is
+# paid once a run rather than once an entry. Runs and the other entries go longest first onto the lane
+# of every partition's that would end soonest with it; the lanes are taken partition by partition, so
+# the first placed land on different runners. A lane pays each package's startup once. An entry nothing
+# measured counts as its share of the run it is a part of, where that was measured whole, or else as
+# the median of its neighbours that were measured, or else of every entry that was.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
   corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" \
-    -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" '
-    function package(id) {
+    -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" -v stdlib="$CORPUS_STDLIB" '
+    # What the startup a lane pays once is kept under: a part of a run is a `ply test` of its own.
+    function package(id,   whole) {
+      if (index(id, "#")) {
+        whole = package(substr(id, 1, index(id, "#") - 1))
+        return (whole in batched) ? whole "#" id : id
+      }
       if (id ~ /^cli-/) return cli
-      if (id == "program" || id == "stdlib" || id ~ /^package-/ || id ~ /^fixture-/) return id
+      if (id ~ /^stdlib:/) return stdlib
+      if (id ~ /^proofs:/) return "prove:" stdlib
+      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
+    }
+    # About two minutes unmeasured; a program or package suite row holds its startup whole, and so
+    # do the proof runs, each a share of its prove.
+    function startup(key) {
+      if (key in start) return start[key]
+      return ((index(key, "#") ? substr(key, 1, index(key, "#") - 1) : key) in batched) ? 120000 : 0
     }
     function module_of(id) { return index(id, ":") ? substr(id, 1, index(id, ":") - 1) : "" }
     # A new unit holding nothing yet, of the package `id` is tested in.
     function unit(id) { u++; size[u] = 0; cost[u] = 0; pkg[u] = package(id) }
     function hold(id) { member[u, ++size[u]] = id; cost[u] += ms[id] }
+    # The middle of the first `count` values of `v`, which it sorts.
+    function middle(v, count,   i, j, x) {
+      for (i = 2; i <= count; i++) {
+        x = v[i]
+        for (j = i - 1; j >= 1 && v[j] > x; j--) v[j + 1] = v[j]
+        v[j + 1] = x
+      }
+      return v[int((count + 1) / 2)]
+    }
     BEGIN {
       FS = "\t"
       while ((getline line < rows) > 0) {
@@ -752,19 +871,26 @@ corpus_cut() {
         else ms[f[2]] = f[3] + 0
       }
       FS = " "
+      batched[checks] = batched[cli] = batched[stdlib] = 1
     }
     { ids[++n] = $1 }
     END {
-      for (i = 1; i <= n; i++) if (ids[i] in ms) measured[++m] = ms[ids[i]]
-      for (i = 2; i <= m; i++) {
-        x = measured[i]
-        for (j = i - 1; j >= 1 && measured[j] > x; j--) measured[j + 1] = measured[j]
-        measured[j + 1] = x
-      }
-      median = m ? measured[int((m + 1) / 2)] : 60000
       for (i = 1; i <= n; i++) {
-        if (!(ids[i] in ms)) ms[ids[i]] = median
-        total += ms[ids[i]]
+        if (ids[i] in ms) measured[++m] = ms[ids[i]]
+        if (index(ids[i], "#")) parts[substr(ids[i], 1, index(ids[i], "#") - 1)]++
+      }
+      median = m ? middle(measured, m) : 60000
+      for (i = 1; i <= n; ) {
+        mod = module_of(ids[i])
+        c = 0
+        for (j = i; j <= n && (j == i || (mod != "" && module_of(ids[j]) == mod)); j++)
+          if (ids[j] in ms) near[++c] = ms[ids[j]]
+        guess = (mod != "" && c) ? middle(near, c) : median
+        for (; i < j; i++) {
+          whole = index(ids[i], "#") ? substr(ids[i], 1, index(ids[i], "#") - 1) : ""
+          if (!(ids[i] in ms)) ms[ids[i]] = ((whole in parts) && (whole in ms)) ? ms[whole] / parts[whole] : guess
+          total += ms[ids[i]]
+        }
       }
       lanes = p * l
       target = total / lanes
@@ -793,14 +919,11 @@ corpus_cut() {
         for (j = i - 1; j >= 1 && cost[order[j]] < cost[x]; j--) order[j + 1] = order[j]
         order[j + 1] = x
       }
-      # About two minutes unmeasured; a program or package suite row holds its startup whole.
-      start[checks] = (checks in start) ? start[checks] : 120000
-      start[cli] = (cli in start) ? start[cli] : 120000
       for (i = 1; i <= u; i++) {
         x = order[i]
         best = 0
         for (j = 1; j <= lanes; j++) {
-          end = load[j] + cost[x] + ((j SUBSEP pkg[x]) in loads ? 0 : start[pkg[x]])
+          end = load[j] + cost[x] + ((j SUBSEP pkg[x]) in loads ? 0 : startup(pkg[x]))
           if (best == 0 || end < bestend) { best = j; bestend = end }
         }
         load[best] = bestend
@@ -828,11 +951,14 @@ ci_files() {
 # One job writes each cache key and another reads it. A rename that misses a side leaves a cache
 # nothing restores -- a run that is quietly slow rather than red -- and a restore naming a key
 # nothing writes always misses the same way. Only the literal before the first `${{ ... }}` is
-# compared: it is the part a restore can match on, and the part both sides spell out.
+# compared: it is the part a restore can match on, and the part both sides spell out. A cache is
+# for what a miss only slows: the repository's other runs evict any entry while a run's jobs wait
+# for runners, so a key that names the run is one a later run reads, and none is restored with
+# `fail-on-cache-miss`.
 cmd_cache_keys() {
   local files=() file
   while IFS= read -r file; do files+=("$file"); done < <(ci_files)
-  awk -v give_back="${GIVE_BACK[*]}" -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
+  awk -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
       gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
@@ -866,7 +992,8 @@ cmd_cache_keys() {
         if (mode == "save") savepath[steplit[i]] = steppath
         else if (mode == "restore") { rlit[++nr] = steplit[i]; rpath[nr] = steppath; rwhere[nr] = stepwhere }
       }
-      nlit = 0; steppath = ""; inpath = 0
+      if (mode == "restore" && stepfail && steprun) needed[++nneeded] = stepwhere
+      nlit = 0; steppath = ""; inpath = 0; stepfail = 0; steprun = 0
     }
     FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
     # A new list item is a new step; the rules below read the one they are in.
@@ -874,6 +1001,7 @@ cmd_cache_keys() {
     /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     mode == "" { next }
+    /^[[:space:]]*fail-on-cache-miss:[[:space:]]*true/ { stepfail = 1; next }
     inpath {
       line = $0
       sub(/^[[:space:]]*/, "", line)
@@ -906,6 +1034,7 @@ cmd_cache_keys() {
     /^[[:space:]]*key:/ {
       rest = $0
       sub(/.*key:[[:space:]]*/, "", rest)
+      if (mode == "restore" && index(rest, "github.run_id") > 0) steprun = 1
       note(mode, rest)
     }
     END {
@@ -938,28 +1067,22 @@ cmd_cache_keys() {
           bad = 1
         }
       }
-      # A key that names the run carries the work of this run to the jobs of this run, and no later
-      # run can name it: the run has to give it back, unless a `restore-keys` entry matches it.
-      ng = split(give_back, gk, " ")
+      # A key that names the run is one only a `restore-keys` entry of a later run can match: one
+      # nothing later reads carries this run'"'"'s work to this run'"'"'s jobs, which an artifact does.
       for (i = 1; i <= n; i++) {
         if (!(order[i] in run_scoped)) continue
         ok = 0
-        for (j = 1; j <= ng; j++) if (gk[j] != "" && index(order[i], gk[j]) == 1) { ok = 1; break }
-        if (!ok) for (r in late) if (index(order[i], r) == 1) { ok = 1; break }
+        for (r in late) if (index(order[i], r) == 1) { ok = 1; break }
         if (!ok) {
-          printf "FAIL: %s writes run-scoped cache key \"%s\", which no later run reads and GIVE_BACK does not name\n", where[order[i]], order[i] > "/dev/stderr"
+          printf "FAIL: %s writes run-scoped cache key \"%s\", which no later run reads: what a job hands the jobs of its own run goes as an artifact\n", where[order[i]], order[i] > "/dev/stderr"
           bad = 1
         }
       }
-      # And the other way: an entry that names no key is a delete that quietly stops matching.
-      for (j = 1; j <= ng; j++) {
-        if (gk[j] == "") continue
-        ok = 0
-        for (k in saved) if (index(k, gk[j]) == 1) { ok = 1; break }
-        if (!ok) {
-          printf "FAIL: GIVE_BACK names \"%s\", which no save writes\n", gk[j] > "/dev/stderr"
-          bad = 1
-        }
+      # And a job that cannot go on without an entry of its own run fails whenever the entry was
+      # evicted, and a re-run of it fails the same way.
+      for (i = 1; i <= nneeded; i++) {
+        printf "FAIL: %s restores a key that names the run with fail-on-cache-miss: what a job needs from another job of its run goes as an artifact\n", needed[i] > "/dev/stderr"
+        bad = 1
       }
       nf = split(families, fk, " ")
       for (j = 1; j <= nf; j++) {
@@ -972,7 +1095,7 @@ cmd_cache_keys() {
         }
       }
       if (bad) exit 1
-      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read later or given back\n", n, length(read), length(run_scoped)
+      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read by a later run and needed by no job\n", n, length(read), length(run_scoped)
     }
   ' "${files[@]}"
 }
@@ -1062,25 +1185,38 @@ cmd_rust_inputs() {
   return $((missing > 0))
 }
 
-# Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
-# run reads holds the repository's cache budget against the caches that do outlive a run.
-cmd_give_back() {
-  local run=${1:?usage: ci-shards.sh give-back RUN_ID} key listing size id
-  for key in ${GIVE_BACK[@]+"${GIVE_BACK[@]}"}; do
-    listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$key$run" \
-      -q '.actions_caches[] | "\(.size_in_bytes) \(.id)"')
-    while read -r size id; do
-      [[ -n $id ]] || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id"
-      echo "gave back $key$run, $((size / 1000000)) MB"
-    done <<< "$listing"
+# The table at TIMINGS: the `timings.tsv` of the newest `test-durations` artifact that holds one, which
+# a run's `passes` job writes when its test jobs all passed, of the runs on this pull request's
+# branch and else on main's. A branch cuts by what its own tree measured, and main never by a
+# branch's. A fork's run names its artifacts as it likes, so only this repository's own are taken.
+# The newest few of a branch are looked in; none with a table leaves none, and the cut falls back to
+# slicing by count.
+cmd_fetch_timings() {
+  local branch run runs dir=${TIMINGS%/*} tmp
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  for branch in ${GITHUB_HEAD_REF:-} main; do
+    runs=$(BRANCH=$branch gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?name=test-durations&per_page=100" \
+      -q '.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id
+            and .workflow_run.head_branch == env.BRANCH) | "\(.created_at) \(.workflow_run.id)"' |
+      LC_ALL=C sort -r | head -n 5 | cut -d' ' -f2) || runs=
+    for run in $runs; do
+      tmp=$(mktemp -d)
+      if gh run download "$run" -n test-durations -D "$tmp" > /dev/null 2>&1 && [[ -s $tmp/timings.tsv ]]; then
+        mv "$tmp/timings.tsv" "$TIMINGS"
+        rm -rf "$tmp"
+        echo "the table run $run measured on $branch: $(grep -c . "$TIMINGS") durations"
+        return 0
+      fi
+      rm -rf "$tmp"
+    done
   done
+  echo "no run on ${GITHUB_HEAD_REF:+$GITHUB_HEAD_REF or }main left a table: the cut falls back to slicing by count"
 }
 
-# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; of a family
-# keyed by content, the newest entry on the ref; and what an earlier run on the ref parked for its own
-# jobs, which a cancelled run never gave back. A ref runs one run at a time. On main, every entry of
-# a pull request that is closed, which no run reads again.
+# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; and of a
+# family keyed by content, the newest entry on the ref. A ref runs one run at a time. On main, every
+# entry of a pull request that is closed, which no run reads again.
 cmd_supersede() {
   local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
   for prefix in "${SUPERSEDED[@]}"; do
@@ -1091,14 +1227,6 @@ cmd_supersede() {
       [[ -n $id && $key != *-"$run" ]] || continue
       grep -qxF "${key%-*}" <<< "$current" || continue
       gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
-    done <<< "$listing"
-  done
-  for prefix in "${GIVE_BACK[@]}"; do
-    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&per_page=100" \
-      -q '.actions_caches[] | "\(.key) \(.id)"')
-    while read -r key id; do
-      [[ -n $id && $key != *-"$run" ]] || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "gave back $key"
     done <<< "$listing"
   done
   for prefix in "${NEWEST[@]}"; do
@@ -1599,11 +1727,34 @@ cmd_verify() {
       done <<< "$names"
     done
   done
+  # The library's runs likewise, by `std.<module>.` and by a project module's `<module>.`.
+  keys=$(stdlib_keys)
+  for module in $(stdlib_entries | sed 's/^[a-z]*://' | LC_ALL=C sort -u); do
+    outside=$(awk -F"$TAB" -v m="$module" '$1 != m && index($2, m ".") { print $2; exit }' <<< "$keys")
+    if [[ -n $outside ]]; then
+      echo "FAIL: '$module.' is part of '$outside', a test or law of another of the library's runs, so the run of $module picks it too" >&2
+      failures=$((failures + 1))
+    fi
+  done
   for entry in "${CLI_TREE_CHECKS[@]}"; do
     module=${entry%%:*}
     names=$(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
     if ! grep -qxF -- "${entry#*:}" <<< "$names"; then
       echo "FAIL: $CLI_SUITE/$module.ply declares no test '${entry#*:}', and CLI_TREE_CHECKS names it" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  # A run cut into parts is an entry's, a `ply test` a partition takes, cut into two or more.
+  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
+    id=${entry%:*}
+    if ! [[ ${entry##*:} =~ ^[0-9]+$ ]] || ((${entry##*:} < 2)); then
+      echo "FAIL: CORPUS_SHARDED cuts '$id' into '${entry##*:}' parts, and a run is cut into two or more" >&2
+      failures=$((failures + 1))
+    elif ! grep -qxF -- "$id#1" <<< "$entries"; then
+      echo "FAIL: CORPUS_SHARDED names '$id', which is no corpus entry" >&2
+      failures=$((failures + 1))
+    elif [[ $id == proofs:* ]] || corpus_alone "$id" || corpus_desk "$id"; then
+      echo "FAIL: CORPUS_SHARDED names '$id', which is no \`ply test\` a partition takes" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1636,24 +1787,41 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # A job that starts corpus runs ends them at a deadline that leaves its steps after them
+  # RUNS_MARGIN minutes of its limit: a job the limit cancels keeps nothing its runs wrote.
+  local block limit budget
+  for corpus_command in "ci-corpus.sh partition" "ci-corpus.sh desks"; do
+    corpus_job=$(awk -v c="${corpus_command//./\\.}" '
+      /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+      $0 ~ c { print job; exit }
+    ' "$workflow")
+    [[ -n $corpus_job ]] || continue
+    block=$(awk -v j="  $corpus_job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
+    limit=$(sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p' <<< "$block")
+    budget=$(sed -n 's/.*PLY_CI_DEADLINE=\$((\$(date +%s) + \([0-9][0-9]*\) \* 60)).*/\1/p' <<< "$block")
+    if [[ -z $budget ]]; then
+      echo "FAIL: job '$corpus_job' runs \`$corpus_command\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
+      failures=$((failures + 1))
+    elif [[ -z $limit ]] || ((budget > limit - RUNS_MARGIN)); then
+      echo "FAIL: job '$corpus_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
+      failures=$((failures + 1))
+    fi
+    # A run over a third of the deadline leaves the cut too little room to balance the lanes, and
+    # cold it can outlast one.
+    if [[ -n $budget && -s $TIMINGS ]]; then
+      while read -r id seconds; do
+        echo "FAIL: corpus run $id took ${seconds}s in the last table, over a third of job '$corpus_job''s ${budget}-minute deadline: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST) or cut it into parts (CORPUS_SHARDED)" >&2
+        failures=$((failures + 1))
+      done < <(awk -F"$TAB" -v limit=$((budget * 60000 / 3)) -v taken="$(if [[ $corpus_command == *partition ]]; then corpus_placed; else desk_placed; fi | tr '\n' ' ')" '
+        BEGIN { n = split(taken, ids, " "); for (i = 1; i <= n; i++) run[ids[i]] = 1 }
+        $1 == "corpus" && ($2 in run) && $3 + 0 > limit { printf "%s %d\n", $2, $3 / 1000 }
+      ' "$TIMINGS")
+    fi
+  done
 
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
-  # GIVE_BACK is a table until a job runs it, and a job that is not required can stop running with
-  # nothing red about it.
-  local give_back_job
-  give_back_job=$(awk '
-    /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
-    /ci-shards\.sh give-back/ { print job; exit }
-  ' "$workflow")
-  if [[ -z $give_back_job ]]; then
-    echo "FAIL: GIVE_BACK names the caches a run gives back, and no job in $workflow runs \`ci-shards.sh give-back\`" >&2
-    failures=$((failures + 1))
-  elif [[ $give_back_job != ci && " ${needs//[][,]/ } " != *" $give_back_job "* ]]; then
-    echo "FAIL: job '$give_back_job' gives this run's own caches back, and is neither \`ci\` nor in its needs list" >&2
-    failures=$((failures + 1))
-  fi
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -1675,7 +1843,7 @@ case "${1:-}" in
   corpus-matrix) cmd_corpus_matrix ;;
   corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
   desks-for-runner) cmd_desks_for_runner "${2:?a desk runner}" "${3:-}" ;;
-  corpus-line) cmd_corpus_line "${2:?a corpus entry}" ;;
+  corpus-line) cmd_corpus_line "${2:?a corpus entry}" "${@:3}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   rust-answered) cmd_rust_answered "${2:-}" "${3:-}" "${4:-}" ;;
@@ -1684,10 +1852,10 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
-  give-back) cmd_give_back "${2:?a run id}" ;;
+  fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
