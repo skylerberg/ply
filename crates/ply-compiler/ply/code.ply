@@ -742,7 +742,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
             node: NSimulate({
               size: len(inner.names),
               captures: inner.captures,
-              body: mark(b.code, []).code,
+              body: mark(b.code, nothing_live()).code,
             }),
           },
           stack: st_pop(b.stack),
@@ -810,7 +810,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
                       resume: match c.resume { Some(_) -> true, None -> false },
                       size: len(f.names),
                       captures: f.captures,
-                      body: mark(cb.code, []).code,
+                      body: mark(cb.code, nothing_live()).code,
                     }),
                     stack: st_pop(cb.stack),
                     ok: true,
@@ -846,7 +846,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
                         ret: Some({
                           size: len(f.names),
                           captures: f.captures,
-                          body: mark(rb.code, []).code,
+                          body: mark(rb.code, nothing_live()).code,
                         }),
                       }),
                     },
@@ -1094,7 +1094,7 @@ fn lam_of(params: List<Bytes>, b: Lowered) -> Lowered = {
         params: len(params),
         size: len(inner.names),
         captures: inner.captures,
-        body: mark(b.code, []).code,
+        body: mark(b.code, nothing_live()).code,
       }),
     },
     stack: st_pop(b.stack),
@@ -1373,18 +1373,59 @@ fn binder_of(pattern: Pattern) -> Option<Bytes> =
 // --- ownership --------------------------------------------------------------
 // Backwards: a read is `Owned` when its slot is not read again after it, else `Borrowed`.
 // Liveness is by slot, not name: a shadowed name is two slots that die at different points.
+// A field read whose record is read after it only through other fields is marked `Owned` itself:
+// the record gives the field up when it is the only holder of it, so the reader holds it alone.
 
-type Marked = { code: Code, live: List<Int> }
+/// What the code after a point reads: each slot it reads, the slots of those it reads whole, and
+/// each field it reads of a slot read only through its fields. An update's base is read through the
+/// fields it copies.
+type Live = { slots: List<Int>, whole: List<Int>, fields: List<FieldUse> }
+
+type FieldUse = { slot: Int, field: Bytes }
+
+fn nothing_live() -> Live = { slots: [], whole: [], fields: [] }
 
 fn live_union(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push_unique(acc, x))
 
-fn live_drop(live: List<Int>, s: Int) -> List<Int> = filter(live, |x: Int| x != s)
+fn unite(a: Live, b: Live) -> Live =
+  {
+    slots: live_union(a.slots, b.slots),
+    whole: live_union(a.whole, b.whole),
+    fields: fold(b.fields, a.fields, |acc: List<FieldUse>, u: FieldUse| push_unique(acc, u)),
+  }
+
+fn dying(live: Live, s: Int) -> Live =
+  {
+    slots: filter(live.slots, |x: Int| x != s),
+    whole: filter(live.whole, |x: Int| x != s),
+    fields: filter(live.fields, |u: FieldUse| u.slot != s),
+  }
+
+fn lives(live: Live, s: Int) -> Bool = contains(live.slots, s)
+
+fn read_whole(live: Live, s: Int) -> Live =
+  { ..live, slots: push_unique(live.slots, s), whole: push_unique(live.whole, s) }
+
+fn read_fields(live: Live, s: Int, names: List<Bytes>) -> Live =
+  {
+    ..live,
+    slots: push_unique(live.slots, s),
+    fields: fold(names, live.fields, |acc: List<FieldUse>, n: Bytes|
+      push_unique(acc, { slot: s, field: n })),
+  }
+
+/// Whether nothing after reads slot `s` whole or reads its field `name`: the record may give that
+/// field up to a read of it here.
+fn gives_up(live: Live, s: Int, name: Bytes) -> Bool =
+  !contains(live.whole, s) && !contains(live.fields, { slot: s, field: name })
+
+type Marked = { code: Code, live: Live }
 
 /// The slot a projection reads through, when its base is a bare variable.
 fn base_slot(code: Code) -> Option<Int> = match code.node { NVar(v) -> v.slot, _ -> None }
 
-pub fn mark(c: Code, live: List<Int>) -> Marked =
+pub fn mark(c: Code, live: Live) -> Marked =
   match c.node {
     NLit(_) -> { code: c, live: live },
     NLabel(_) -> { code: c, live: live },
@@ -1392,24 +1433,20 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
       None -> { code: c, live: live },
       Some(s) ->
         {
-          code: {
-            own: if contains(live, s) { Borrowed } else { Owned },
-            node: c.node,
-            span: c.span,
-          },
-          live: push_unique(live, s),
+          code: { own: if lives(live, s) { Borrowed } else { Owned }, node: c.node, span: c.span },
+          live: read_whole(live, s),
         },
     },
     // The base is read after every written field, so backwards it is marked first.
     NUpdate(u) -> {
       let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
-      let owned = s >= 0 && !contains(live, s);
+      let owned = s >= 0 && !lives(live, s);
       let base = {
         own: if owned { Owned } else { Borrowed },
         node: u.base.node,
         span: u.base.span,
       };
-      let after = if s < 0 { live } else { push_unique(live, s) };
+      let after = if s < 0 { live } else { read_fields(live, s, u.copies) };
       let r = mark_seq(map(u.sets, |f: CodeField| f.value), after);
       {
         code: {
@@ -1447,7 +1484,8 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         live: l.live,
       }
     },
-    // The base is marked here so the node stays `Borrowed`: a last read may move the record out, never a field.
+    // A last read of the base moves the record out. A read before others of the record's fields,
+    // and of no other read of this one or of the whole record, is the field's `Owned` read.
     NField(fd) -> match base_slot(fd.base) {
       None -> {
         let b = mark(fd.base, live);
@@ -1457,14 +1495,19 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
         }
       },
       Some(s) -> {
+        let later = lives(live, s);
         let base = {
-          own: if contains(live, s) { Borrowed } else { Owned },
+          own: if later { Borrowed } else { Owned },
           node: fd.base.node,
           span: fd.base.span,
         };
         {
-          code: { own: Borrowed, span: c.span, node: NField({ base: base, field: fd.field }) },
-          live: push_unique(live, s),
+          code: {
+            own: if later && gives_up(live, s, fd.field) { Owned } else { Borrowed },
+            span: c.span,
+            node: NField({ base: base, field: fd.field }),
+          },
+          live: read_fields(live, s, [fd.field]),
         }
       },
     },
@@ -1472,9 +1515,9 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     // Walked last arm first: a failing guard goes on to the later arms, whose tests read the subject again,
     // so they and whatever the subject was read from are its future too.
     NMatch(m) -> {
-      let subject = mark(m.scrutinee, []).live;
+      let subject = mark(m.scrutinee, nothing_live()).live;
       let n = len(m.arms);
-      let marked = fold(range(0, n), { arms: [], live: [] }, |acc: ArmMark, k: Int|
+      let marked = fold(range(0, n), { arms: [], live: nothing_live() }, |acc: ArmMark, k: Int|
         match list_at(m.arms, n - 1 - k) {
           None -> acc,
           Some(a) -> {
@@ -1482,16 +1525,15 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
             let g: GuardMark = match a.guard {
               None -> { guard: None, live: b.live },
               Some(gc) -> {
-                let later = if len(acc.arms) == 0 { acc.live }
-                else { live_union(acc.live, subject) };
-                let gm = mark(gc, live_union(b.live, later));
+                let later = if len(acc.arms) == 0 { acc.live } else { unite(acc.live, subject) };
+                let gm = mark(gc, unite(b.live, later));
                 { guard: Some(gm.code), live: gm.live }
               },
             };
-            let after = fold(pat_slots(a.pat), g.live, |x: List<Int>, s: Int| live_drop(x, s));
+            let after = fold(pat_slots(a.pat), g.live, |x: Live, s: Int| dying(x, s));
             {
               arms: push(acc.arms, { pat: a.pat, guard: g.guard, body: b.code }),
-              live: live_union(acc.live, after),
+              live: unite(acc.live, after),
             }
           },
         });
@@ -1576,7 +1618,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
     NCell(cl) -> {
       let b = mark(cl.body, live);
-      let after = match cl.slot { None -> b.live, Some(s) -> live_drop(b.live, s) };
+      let after = match cl.slot { None -> b.live, Some(s) -> dying(b.live, s) };
       let i = mark(cl.init, after);
       {
         code: {
@@ -1596,7 +1638,7 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     NIf(i) -> {
       let t = mark(i.then_branch, live);
       let e = mark(i.else_branch, live);
-      let cnd = mark(i.cond, live_union(t.live, e.live));
+      let cnd = mark(i.cond, unite(t.live, e.live));
       {
         code: {
           own: Borrowed,
@@ -1648,15 +1690,14 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
           },
           // The binder dies at its `let`: nothing before it can read the slot.
           Some(CLet(l)) -> {
-            let m = mark(l.value, live_drop(acc.live, l.slot));
+            let m = mark(l.value, dying(acc.live, l.slot));
             {
               codes: push(acc.codes, CLet({ name: l.name, slot: l.slot, value: m.code })),
               live: m.live,
             }
           },
           Some(CLetPat(l)) -> {
-            let dropped = fold(pat_slots(l.pat), acc.live, |x: List<Int>, sl: Int|
-              live_drop(x, sl));
+            let dropped = fold(pat_slots(l.pat), acc.live, |x: Live, sl: Int| dying(x, sl));
             let m = mark(l.value, dropped);
             {
               codes: push(acc.codes, CLetPat({ span: l.span, pat: l.pat, value: m.code })),
@@ -1678,10 +1719,10 @@ pub fn mark(c: Code, live: List<Int>) -> Marked =
     },
   }
 
-type CapMark = { captures: List<Capture>, live: List<Int> }
+type CapMark = { captures: List<Capture>, live: Live }
 
 /// A capture reads the enclosing barrier's slot, `Owned` when nothing after it wants that slot.
-fn mark_caps(caps: List<Capture>, live: List<Int>) -> CapMark = {
+fn mark_caps(caps: List<Capture>, live: Live) -> CapMark = {
   let walked = fold(
     rev_caps(caps),
     { captures: [], live: live },
@@ -1690,25 +1731,25 @@ fn mark_caps(caps: List<Capture>, live: List<Int>) -> CapMark = {
         captures: push(acc.captures, {
           src: capture.src,
           dst: capture.dst,
-          own: if contains(acc.live, capture.src) { Borrowed } else { Owned },
+          own: if lives(acc.live, capture.src) { Borrowed } else { Owned },
         }),
-        live: push_unique(acc.live, capture.src),
+        live: read_whole(acc.live, capture.src),
       },
   );
   { captures: rev_caps(walked.captures), live: walked.live }
 }
 
-type ArmMark = { arms: List<CodeArm>, live: List<Int> }
+type ArmMark = { arms: List<CodeArm>, live: Live }
 
-type GuardMark = { guard: Option<Code>, live: List<Int> }
+type GuardMark = { guard: Option<Code>, live: Live }
 
-type StmtSeq = { codes: List<CodeStmt>, live: List<Int> }
+type StmtSeq = { codes: List<CodeStmt>, live: Live }
 
 fn cfield_name(fs: List<CodeField>, i: Int) -> Bytes =
   match list_at(fs, i) { Some(fd) -> fd.name, None -> b"" }
 
 /// Last code first.
-fn mark_seq(codes: List<Code>, live: List<Int>) -> MarkedSeq = {
+fn mark_seq(codes: List<Code>, live: Live) -> MarkedSeq = {
   let n = len(codes);
   let walked = fold(range(0, n), { codes: [], live: live }, |acc: MarkedSeq, k: Int|
     match list_at(codes, n - 1 - k) {
@@ -1721,7 +1762,7 @@ fn mark_seq(codes: List<Code>, live: List<Int>) -> MarkedSeq = {
   { codes: rev_codes(walked.codes), live: walked.live }
 }
 
-type MarkedSeq = { codes: List<Code>, live: List<Int> }
+type MarkedSeq = { codes: List<Code>, live: Live }
 
 fn rev_codes(codes: List<Code>) -> List<Code> =
   map(range(0, len(codes)), |i: Int| nth(codes, len(codes) - 1 - i))
@@ -1774,7 +1815,7 @@ pub fn lower_fn(
   );
   match lower_in(body, { frames: [start], labels: labels, sites: sites }) {
     None -> None,
-    Some(o) -> Some({ code: mark(o.code, []).code, size: len(st_top(o.stack).names) }),
+    Some(o) -> Some({ code: mark(o.code, nothing_live()).code, size: len(st_top(o.stack).names) }),
   }
 }
 
@@ -1882,6 +1923,32 @@ test "an or-pattern arm lowers to an arm per alternative, each binding its own s
   assert_eq(
     lower_dump(b"fn f(p: (Int, Int)) -> Int = match p { (x, 0) | (0, x) -> x, _ -> 1 }\n"),
     "L;1;f:m.f:1:3;bmatch(ovar(p,0),arm(r:(_0=v:x:1,_1=l:i0,),-,ovar(x,1)),arm(r:(_0=l:i0,_1=v:x:2,),-,ovar(x,2)),arm(_,-,blit(i1)));",
+  )
+}
+
+test "a field read before the record's other fields takes it, and one read again or before the whole record borrows it" {
+  assert_eq(
+    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = bytes_len(s.a) + s.b\n"),
+    "L;1;f:m.f:1:1;bbin(add,bapp(bvar(bytes_len,-),ofld(bvar(s,0),a)),bfld(ovar(s,0),b));",
+  );
+  assert_eq(
+    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = bytes_len(s.a) + bytes_len(s.a)\n"),
+    "L;1;f:m.f:1:1;bbin(add,bapp(bvar(bytes_len,-),bfld(bvar(s,0),a)),bapp(bvar(bytes_len,-),bfld(ovar(s,0),a)));",
+  );
+  assert_eq(
+    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> Int = bytes_len(s.a) + g(s)\n"),
+    "L;1;f:m.f:1:1;bbin(add,bapp(bvar(bytes_len,-),bfld(bvar(s,0),a)),bapp(bvar(g,-),ovar(s,0)));",
+  )
+}
+
+test "an update's base is read through the fields it copies, so a field it sets is taken" {
+  assert_eq(
+    lower_dump(b"fn f(s: { a: Bytes, b: Int }) -> { a: Bytes, b: Int } = { a: g(s.a), b: s.b }\n"),
+    "L;1;f:m.f:1:1;bupd(ovar(s,0),c:b,s:a=bapp(bvar(g,-),ofld(bvar(s,0),a)));",
+  );
+  assert_eq(
+    lower_dump(b"fn f(s: { a: Bytes, b: Bytes }) -> { a: Bytes, b: Bytes } = { a: s.b, b: s.b }\n"),
+    "L;1;f:m.f:1:1;bupd(ovar(s,0),c:b,s:a=bfld(bvar(s,0),b));",
   )
 }
 

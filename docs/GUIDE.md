@@ -1216,7 +1216,13 @@ otherwise copies one path of the list's trie; `list_set` is the same, and
 `array_set` copies the whole array. A copy is caused by a second owner: a
 binding read again after the update, a closure capture, a value read out with
 `cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
-a caller that keeps using what it passed. `ply check --costs` reports every
+a caller that keeps using what it passed. A record is not one of them once it
+is done with the value: a field read that nothing after it reads again, as the
+field or as the whole record, takes the field out of a record no one else
+holds, and a `let` or `match` pattern lets its subject go once its binders hold
+their fields (an arm with a guard keeps it for the arms after), so
+`{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
+The same holds for `Bytes` and `++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
@@ -1928,8 +1934,10 @@ values and their first difference. Any other failure is `E0502`.
 
 `metered(f)` answers `f()` with what it cost, in resources the runtime counts
 rather than time: `steps`, the calls it made, each counted as `--steps`
-counts them; `allocations`, the objects it built; and `performs`, each atom it
-performed with how many times, ordered by the atom's qualified name. A
+counts them; `allocations`, the objects it built; `bytes`, the memory those
+took, which an update in place does not spend and a copy does; and
+`performs`, each atom it performed with how many times, ordered by the atom's
+qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
@@ -2952,7 +2960,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -3064,7 +3072,9 @@ moved and what reaches it, and a definition generic over an effect row or a
 label every time. The hash it is filed under reads a definition of another
 package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
-dependents' rows standing. A load reads its dependencies and the shipped modules it
+dependents' rows standing. What each module imports, and what it embeds, is kept
+in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
+has not read. A load reads its dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
