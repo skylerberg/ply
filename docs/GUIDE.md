@@ -1216,7 +1216,13 @@ otherwise copies one path of the list's trie; `list_set` is the same, and
 `array_set` copies the whole array. A copy is caused by a second owner: a
 binding read again after the update, a closure capture, a value read out with
 `cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
-a caller that keeps using what it passed. `ply check --costs` reports every
+a caller that keeps using what it passed. A record is not one of them once it
+is done with the value: a field read that nothing after it reads again, as the
+field or as the whole record, takes the field out of a record no one else
+holds, and a `let` or `match` pattern lets its subject go once its binders hold
+their fields (an arm with a guard keeps it for the arms after), so
+`{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
+The same holds for `Bytes` and `++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
@@ -1926,8 +1932,10 @@ values and their first difference. Any other failure is `E0502`.
 
 `metered(f)` answers `f()` with what it cost, in resources the runtime counts
 rather than time: `steps`, the calls it made, each counted as `--steps`
-counts them; `allocations`, the objects it built; and `performs`, each atom it
-performed with how many times, ordered by the atom's qualified name. A
+counts them; `allocations`, the objects it built; `bytes`, the memory those
+took, which an update in place does not spend and a copy does; and
+`performs`, each atom it performed with how many times, ordered by the atom's
+qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
