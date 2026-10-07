@@ -476,6 +476,34 @@ pub fn tagged_target(index: Index, module: Int, t: Tagged) -> Option<Bytes> / {a
     _ -> None,
   }
 
+/// What a name `module` writes as a value denotes: a definition, by its program-wide name, or a
+/// constructor, by its own name and its type's program-wide one.
+pub type Denoted =
+  | DenotesFn(Bytes)
+  | DenotesCtor({ type_name: Bytes, name: Bytes })
+  | DenotesNothing
+
+pub fn denoted(index: Index, module: Int, qname: QName) -> Denoted / {abort.raise} =
+  match value_target(index, module, qname) {
+    Some(FnTarget(node)) -> DenotesFn(at(index.nodes, node).name),
+    Some(CtorTarget(c)) -> DenotesCtor({ type_name: at(index.nodes, c.owner).name, name: c.name }),
+    None -> DenotesNothing,
+  }
+
+/// The program-wide name of the effect `module` names `qname`.
+pub fn effect_called(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+  match effect_target(index, module, qname) {
+    Some(v) -> Some(at(index.nodes, v).name),
+    None -> None,
+  }
+
+/// The program-wide name of the type `module` names `qname`.
+pub fn type_named(index: Index, module: Int, qname: QName) -> Option<Bytes> / {abort.raise} =
+  match type_target(index, module, qualifier(qname), qname.name.name) {
+    Some(v) -> Some(at(index.nodes, v).name),
+    None -> None,
+  }
+
 fn ctor_target(index: Index, module: Int, qname: QName) -> Option<ValueTarget> / {abort.raise} =
   match target(index, module, 0, qualifier(qname), qname.name.name) {
     None -> None,
@@ -3221,22 +3249,29 @@ pub fn fixed_nodes(
   hashes: HashOutput,
   keep: Map<Bytes, Bool>,
   applied: List<Fixed> = [],
+  // Only the nodes of these names, where it is given.
+  named: Option<Map<Bytes, Bool>> = None,
 ) -> List<Fixed> / {abort.raise} = {
   let prior = fold(applied, map_new(), |acc: Map<Bytes, Fixed>, f: Fixed|
     map_insert(acc, pin_key(f.name, f.decl), f));
+  let node_refs = |refs: List<Int>|
+    map(refs, |r: Int| { name: at(index.nodes, r).name, decl: is_decl(at(index.nodes, r)) });
+  // What hashing read of each node is what it references, held or not.
   let edges_of = |v: Int, node: Node, decl: Bool|
     match map_get(prior, pin_key(node.name, decl)) {
       Some(f) -> f.edges,
-      None ->
-        map(
-          finish(
-            normalize_node(
-              new_encoder(index, node.module, map_new(), map_new(), map_new()),
-              node.body,
-            ),
-          ).refs,
-          |r: Int| { name: at(index.nodes, r).name, decl: is_decl(at(index.nodes, r)) },
-        ),
+      None -> match list_at(hashes.refs.edges, v) {
+        Some(refs) -> node_refs(refs),
+        None ->
+          node_refs(
+            finish(
+              normalize_node(
+                new_encoder(index, node.module, map_new(), map_new(), map_new()),
+                node.body,
+              ),
+            ).refs,
+          ),
+      },
     };
   let own = fold(
     hashes.own,
@@ -3280,7 +3315,8 @@ pub fn fixed_nodes(
             def: if decl { acc.def } else { acc.def + 1 },
             decl: if decl { acc.decl + 1 } else { acc.decl },
           };
-          if !map_contains(keep, at(index.mods, node.module).name) { next } else {
+          let wanted = match named { None -> true, Some(m) -> map_contains(m, node.name) };
+          if !wanted || !map_contains(keep, at(index.mods, node.module).name) { next } else {
             {
               ..next,
               out: push(next.out, {
