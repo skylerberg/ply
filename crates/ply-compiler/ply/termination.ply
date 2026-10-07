@@ -1605,7 +1605,7 @@ fn summary(context: MemberContext, x: Seen) -> Summary / {abort.raise} = {
     names: map(def.params, |p: Param| p.name.name),
     params: map(range(0, len(def.params)), |i: Int|
       if !function_param(context.group, context.me, i) { NotCalled } else {
-        fold(x.uses, CalledWith([]), |acc: Passing, u: Use|
+        let own = fold(x.uses, CalledWith([]), |acc: Passing, u: Use|
           if u.param != i { acc } else {
             match acc {
               CalledWith(cs) -> match u.args {
@@ -1614,11 +1614,57 @@ fn summary(context: MemberContext, x: Seen) -> Summary / {abort.raise} = {
               },
               other -> other,
             }
-          })
+          });
+        match own {
+          CalledWith(cs) ->
+            recursed(
+              context,
+              cs,
+              filter(x.calls, |c: Call| c.callee == context.me && hands_on(c, i)),
+            ),
+          other -> other,
+        }
       }),
     result: match list_at(context.results, context.me) { Some(Some(t)) -> t, _ -> UnknownTerm },
   }
 }
+
+/// Whether a call hands on the parameter at `i` as it is, in the same place.
+fn hands_on(c: Call, i: Int) -> Bool =
+  match list_at(c.args, i) {
+    Some(Exactly(l)) -> l.k == 0 && l.base == Some(PlaceBase({ param: i, path: [] })),
+    _ -> false,
+  }
+
+/// A parameter called with `calls` here, and handed on in its place by each of `selves`, the
+/// definition's calls of itself: each of those invocations calls it as this one does, in the terms
+/// of what it was handed, so those calls are this one's too, read back through each call until no
+/// new one appears. Past a number of rounds, a call of which nothing is known stands for the rest.
+fn recursed(
+  context: MemberContext,
+  calls: List<List<Term>>,
+  selves: List<Call>,
+) -> Passing / {abort.raise} =
+  if len(selves) == 0 || len(calls) == 0 { CalledWith(calls) } else {
+    let unknown = map(at(calls, 0), |_: Term| UnknownTerm);
+    iterate(
+      { known: calls, k: 0 },
+      recursion_rounds() + 2,
+      |st: { known: List<List<Term>>, k: Int }| {
+        let next = fold(selves, st.known, |acc: List<List<Term>>, c: Call|
+          fold(st.known, acc, |grown: List<List<Term>>, call: List<Term>|
+            with_call(grown, map(call, |t: Term| translated(context, t, c.args)))));
+        if len(next) == len(st.known) { Stop(CalledWith(st.known)) }
+        else if st.k >= recursion_rounds() { Stop(CalledWith(with_call(next, unknown))) }
+        else { Continue({ known: next, k: st.k + 1 }) }
+      },
+    )
+  }
+
+fn recursion_rounds() -> Int = 6
+
+fn with_call(xs: List<List<Term>>, call: List<Term>) -> List<List<Term>> =
+  if fold(xs, false, |found: Bool, x: List<Term>| found || x == call) { xs } else { push(xs, call) }
 
 fn called(acc: Seen, x: Call) -> Seen = { ..acc, calls: push(acc.calls, x) }
 
@@ -1858,6 +1904,26 @@ fn applied(
       fold(args, a, |x: Seen, y: Expr| walk(context, scope, x, y)),
       |x: Seen, n: NamedArg| walk(context, scope, x, n.value),
     );
+  // A function parameter handed on in its own place to the definition's own recursion does not
+  // escape: that invocation calls it as this one does, which its summary reads back.
+  let own_place = |i: Int, x: Expr|
+    match x {
+      EVar(w) -> match local_of(scope, w.name) { Some(FunctionParam(j)) -> j == i, _ -> false },
+      _ -> false,
+    };
+  let walk_recursion = |a: Seen| {
+    let names = map(at(context.group.defs, context.me).params, |p: Param| p.name.name);
+    fold(
+      named,
+      fold(range(0, len(args)), a, |x: Seen, i: Int|
+        if own_place(i, at(args, i)) { x } else { walk(context, scope, x, at(args, i)) }),
+      |x: Seen, n: NamedArg|
+        match index_of(names, n.name.name) {
+          Some(i) -> if own_place(i, n.value) { x } else { walk(context, scope, x, n.value) },
+          None -> walk(context, scope, x, n.value),
+        },
+    )
+  };
   match func {
     EVar(v) -> match local_of(scope, v.name) {
       Some(LetLambda(f)) ->
@@ -1870,7 +1936,7 @@ fn applied(
       Some(KnownTerm(_)) -> walk_args(acc),
       None -> match callee_of(context, scope, v.name) {
         GroupMember(t) ->
-          called(walk_args(acc), {
+          called(if t == context.me { walk_recursion(acc) } else { walk_args(acc) }, {
             callee: t,
             args: arguments(context, scope, t, args, named),
             facts: scope.facts,
