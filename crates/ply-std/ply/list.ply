@@ -186,49 +186,56 @@ pub fn transpose<a>(xss: List<List<a>>) -> List<List<a>> =
 /// `x`, `n` times over; none where `n` is not positive.
 pub fn replicate<a>(x: a, n: Int) -> List<a> = map(range(0, n), |_: Int| x)
 
-/// Whether `ok` answers true for an element. An empty list is `false`.
+/// Whether `ok` answers true for an element. An empty list is `false`. `ok` is asked of no element
+/// after the first it answers true for.
 pub fn any<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Bool / e
   cost len(xs) * k
-= fold(xs, false, |acc: Bool, x: a| acc || ok(x))
+= match xs { [] -> false, [x, ..rest] -> if ok(x) { true } else { any(rest, ok) } }
 
-/// Whether `ok` answers true for every element. An empty list is `true`.
+/// Whether `ok` answers true for every element. An empty list is `true`. `ok` is asked of no
+/// element after the first it answers false for.
 pub fn all<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Bool / e
   cost len(xs) * k
-= fold(xs, true, |acc: Bool, x: a| acc && ok(x))
+= match xs { [] -> true, [x, ..rest] -> if ok(x) { all(rest, ok) } else { false } }
 
 /// How many elements `ok` answers true for.
 pub fn count<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Int / e
   cost len(xs) * k
 = fold(xs, 0, |acc: Int, x: a| if ok(x) { acc + 1 } else { acc })
 
-/// The first element `ok` answers true for, or `None`. The first answer is kept, so the walk is a
-/// scan rather than a race.
+/// The first element `ok` answers true for, or `None`. `ok` is asked of no element after that one.
 pub fn find<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<a> / e
   cost len(xs) * k
-=
-  fold(xs, None, |found: Option<a>, x: a|
-    match found { Some(_) -> found, None -> if ok(x) { Some(x) } else { None } })
+= match xs { [] -> None, [x, ..rest] -> if ok(x) { Some(x) } else { find(rest, ok) } }
 
 /// What `f` answers for the first element it answers `Some` for, or `None`. `f` is asked of no
 /// element after that one.
 pub fn find_map<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e cost k) -> Option<b> / e
   cost len(xs) * k
-= fold(xs, None, |found: Option<b>, x: a| match found { Some(_) -> found, None -> f(x) })
+=
+  match xs {
+    [] -> None,
+    [x, ..rest] -> match f(x) { Some(y) -> Some(y), None -> find_map(rest, f) },
+  }
 
 /// The last element `ok` answers true for, or `None`. `ok` is asked of every element.
 pub fn find_last<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<a> / e
   cost len(xs) * k
 = fold(xs, None, |found: Option<a>, x: a| if ok(x) { Some(x) } else { found })
 
-/// The position of the first element `ok` answers true for, or `None`.
+/// The position of the first element `ok` answers true for, or `None`. `ok` is asked of no element
+/// after that one.
 pub fn find_index<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k) -> Option<Int> / e
   cost len(xs) * k
+= index_from(xs, ok, 0)
+
+fn index_from<a | e>(xs: List<a>, ok: (a) -> Bool / e cost k, at: Int) -> Option<Int> / e
+  cost len(xs) * k
 =
-  fold(xs, { at: 0, found: None }, |s: { at: Int, found: Option<Int> }, x: a|
-    match s.found {
-      Some(_) -> s,
-      None -> if ok(x) { { ..s, found: Some(s.at) } } else { { ..s, at: s.at + 1 } },
-    }).found
+  match xs {
+    [] -> None,
+    [x, ..rest] -> if ok(x) { Some(at) } else { index_from(rest, ok, at + 1) },
+  }
 
 /// Whether `x` is one of the elements.
 pub fn contains<a>(xs: List<a>, x: a) -> Bool
@@ -859,13 +866,73 @@ test "a callback may perform effects, and stops being called once the answer is 
       x
     };
     assert(any([1, 2, 3, 4], |x: Int| tick(x) == 2));
+    let by_any = cell_get(c);
     assert(!all([1, 2, 3, 4], |x: Int| tick(x) < 2));
+    let by_all = cell_get(c);
     assert_eq(find([1, 2, 3, 4], |x: Int| tick(x) > 2), Some(3));
+    let by_find = cell_get(c);
+    assert_eq(find_index([1, 2, 3, 4], |x: Int| tick(x) > 2), Some(2));
+    let by_index = cell_get(c);
+    assert_eq(find_map([1, 2, 3, 4], |x: Int| if tick(x) > 1 { Some(x) } else { None }), Some(2));
+    let by_map = cell_get(c);
     assert_eq(count([1, 2, 3, 4], |x: Int| tick(x) > 2), 2);
-    assert_eq(sort_by([3, 1, 2], |x: Int, y: Int| tick(x) <= y), [1, 2, 3]);
-    cell_get(c)
+    [
+      by_any,
+      by_all - by_any,
+      by_find - by_all,
+      by_index - by_find,
+      by_map - by_index,
+      cell_get(c) - by_map,
+    ]
   } };
-  assert(calls > 2 + 2 + 3 + 4)
+  assert_eq(calls, [2, 2, 3, 3, 2, 4])
+}
+
+/// A list of `n` whose first element is `1` and every other `0`: a search for a `1`, or a check
+/// that all are `0`, is decided at its front.
+fn decided_first(n: Int) -> List<Int> = map(range(0, n), |i: Int| if i == 0 { 1 } else { 0 })
+
+test "any decided at the front takes the same steps however long the rest" {
+  let short = decided_first(4);
+  let long = decided_first(4000);
+  assert_eq(
+    metered(|| any(long, |x: Int| x == 1)).steps,
+    metered(|| any(short, |x: Int| x == 1)).steps,
+  )
+}
+
+test "all decided at the front takes the same steps however long the rest" {
+  let short = decided_first(4);
+  let long = decided_first(4000);
+  assert_eq(
+    metered(|| all(long, |x: Int| x == 0)).steps,
+    metered(|| all(short, |x: Int| x == 0)).steps,
+  )
+}
+
+test "find decided at the front takes the same steps however long the rest" {
+  let short = decided_first(4);
+  let long = decided_first(4000);
+  assert_eq(
+    metered(|| find(long, |x: Int| x == 1)).steps,
+    metered(|| find(short, |x: Int| x == 1)).steps,
+  )
+}
+
+test "find_map decided at the front takes the same steps however long the rest" {
+  let short = decided_first(4);
+  let long = decided_first(4000);
+  let ones = |x: Int| if x == 1 { Some(x) } else { None };
+  assert_eq(metered(|| find_map(long, ones)).steps, metered(|| find_map(short, ones)).steps)
+}
+
+test "find_index decided at the front takes the same steps however long the rest" {
+  let short = decided_first(4);
+  let long = decided_first(4000);
+  assert_eq(
+    metered(|| find_index(long, |x: Int| x == 1)).steps,
+    metered(|| find_index(short, |x: Int| x == 1)).steps,
+  )
 }
 
 test "contains, index_of and remove_first are the equality question" {

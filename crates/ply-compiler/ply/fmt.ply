@@ -17,7 +17,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt,
               SLet, SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged, Hole, written_operator, call_operator)
+              ETagged, Tagged, Hole, written_operator, call_operator, set_binder)
 import rewrite (map_expr, map_item)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
@@ -91,7 +91,7 @@ fn render_diag(src: Bytes, diag: ParseDiag) -> Bytes / {abort.raise} = {
 }
 
 /// The dump with every `start:end:` prefix removed, so two parses compare as trees.
-fn erase_spans(dump: Bytes) -> Bytes / {abort.raise} =
+pub fn erase_spans(dump: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all(
     map(bytes_split(dump, b";"), |u: Bytes|
       if bytes_len(u) > 0 && is_digit(bytes_at(u, 0)) {
@@ -439,7 +439,8 @@ fn row_suffix(input: PrintInput, r: Option<RowExpr>) -> Bytes / {abort.raise} =
 
 fn positional_name(i: Int) -> Bytes = bytes_concat(b"_", ascii_of_int(i))
 
-fn is_ty_tuple(fields: List<{ name: Ident, ty: TypeExpr }>) -> Bool / {abort.raise} =
+/// Whether a record type's fields are a tuple's, `(A, B)`, which the parser reads as a record.
+pub fn is_ty_tuple(fields: List<{ name: Ident, ty: TypeExpr }>) -> Bool / {abort.raise} =
   len(fields) >= 2
     && fold(range(0, len(fields)), true, |ok: Bool, i: Int| {
       let f = at(fields, i);
@@ -589,7 +590,8 @@ fn lit_text(input: PrintInput, span: Span, literal: Lit) -> Bytes / {abort.raise
 fn pat_punned(f: { name: Ident, pat: Pattern }) -> Bool =
   match f.pat { PVar(v) -> v.name.name == f.name.name && v.span == f.name.span, _ -> false }
 
-fn is_pat_tuple(fields: List<{ name: Ident, pat: Pattern }>) -> Bool / {abort.raise} =
+/// Whether a record pattern's fields are a tuple's, `(a, b)`, which the parser reads as a record.
+pub fn is_pat_tuple(fields: List<{ name: Ident, pat: Pattern }>) -> Bool / {abort.raise} =
   len(fields) >= 2
     && fold(range(0, len(fields)), true, |ok: Bool, i: Int| {
       let f = at(fields, i);
@@ -660,7 +662,8 @@ fn bp(op: Bytes) -> Int =
   else if op == b"add" || op == b"sub" { 9 }
   else { match call_operator(op) { Some(o) -> o.bp, None -> 10 } }
 
-fn op_text(op: Bytes) -> Bytes = {
+/// A binary operator as it is written, by the name the tree holds it under.
+pub fn op_text(op: Bytes) -> Bytes = {
   let table = [
     { n: b"or", t: b"||" },
     { n: b"and", t: b"&&" },
@@ -690,7 +693,8 @@ fn op_text(op: Bytes) -> Bytes = {
   }
 }
 
-fn unary_text(op: Bytes) -> Bytes =
+/// A unary operator as it is written, by the name the tree holds it under.
+pub fn unary_text(op: Bytes) -> Bytes =
   if op == b"neg" { b"-" } else if op == b"not" { b"!" } else { b"~" }
 
 /// A form with no closer of its own to read: where it ends is worked out rather than seen.
@@ -760,6 +764,37 @@ fn starts_with_brace(expr: Expr) -> Bool =
     _ -> false,
   }
 
+/// Whether an operand past an expression's first opens with a `{` of its own, which a scrutinee
+/// would read as the block after it.
+fn holds_brace(expr: Expr) -> Bool / {abort.raise} =
+  match expr {
+    EBinary(v) -> holds_brace(v.lhs) || opens_brace(v.rhs) || holds_brace(v.rhs),
+    EUnary(v) -> opens_brace(v.operand) || holds_brace(v.operand),
+    EApp(v) -> holds_brace(v.func),
+    EField(v) -> holds_brace(v.base),
+    ETry(v) -> holds_brace(v.operand),
+    _ -> false,
+  }
+
+/// Whether `expr` prints a `{` first: a tuple, though a record in the tree, prints `(`.
+fn opens_brace(expr: Expr) -> Bool / {abort.raise} =
+  match expr {
+    ERecord(v) -> !is_tuple(v.fields),
+    ERecordUpdate(_) -> true,
+    EBlock(_) -> true,
+    ESimulate(_) -> true,
+    EParallel(_) -> true,
+    EBinary(v) -> opens_brace(v.lhs),
+    EApp(v) -> opens_brace(v.func),
+    EField(v) -> opens_brace(v.base),
+    ETry(v) -> opens_brace(v.operand),
+    _ -> false,
+  }
+
+/// A scrutinee is bracketed where a `{` in it would be read as the block that follows it.
+fn parens_scrutinee(expr: Expr) -> Bool / {abort.raise} =
+  starts_with_brace(expr) || holds_brace(expr)
+
 fn wrap(o: Option<Bytes>, parens: Bool) -> Option<Bytes> =
   if parens { cat([Some(b"("), o, Some(b")")]) } else { o }
 
@@ -774,7 +809,8 @@ fn punned(field: RecField) -> Bool =
     _ -> false,
   }
 
-fn is_tuple(fields: List<RecField>) -> Bool / {abort.raise} =
+/// Whether a record's fields are a tuple's, `(a, b)`, which the parser reads as a record.
+pub fn is_tuple(fields: List<RecField>) -> Bool / {abort.raise} =
   len(fields) >= 2
     && fold(range(0, len(fields)), true, |ok: Bool, i: Int| {
       let f = at(fields, i);
@@ -842,7 +878,7 @@ fn flat_field(input: PrintInput, field: RecField, pun_ok: Bool) -> Option<Bytes>
   else { cat([Some(bytes_concat(field.name.name, b": ")), flat_expr(input, field.value)]) }
 
 fn flat_scrutinee(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
-  wrap(flat_expr(input, expr), starts_with_brace(expr))
+  wrap(flat_expr(input, expr), parens_scrutinee(expr))
 
 fn flat_args(
   input: PrintInput,
@@ -900,10 +936,22 @@ fn interpolated(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
     else { cat([Some(b"f\""), pieces(input, e), Some(b"\"")]) },
   }
 
+/// A span without the parentheses a grouping widened it by, a pair a round.
+fn ungrouped(input: PrintInput, span: Span) -> Span / {abort.raise} =
+  iterate(span, (span.end - span.start) / 2 + 1, |cur: Span|
+    if cur.end - cur.start >= 2 && bytes_at(input.source, cur.start) == 40
+        && bytes_at(input.source, cur.end - 1) == 41 {
+      let inner = { start: skip_ws(input, cur.start + 1), end: back_ws(input, cur.end - 1) };
+      if inner.start >= inner.end { Stop(cur) } else { Continue(inner) }
+    } else { Stop(cur) })
+
 /// A concatenation the program wrote may open with an interpolated string too, so the span must be
 /// exactly one: the `"` closing its first `f"` is the span's last token.
-fn one_interpolation(input: PrintInput, span: Span) -> Bool / {abort.raise} =
-  if bytes_slice(input.source, span.start, span.start + 2) != b"f\"" { false } else {
+fn one_interpolation(input: PrintInput, grouped: Span) -> Bool / {abort.raise} = {
+  let span = ungrouped(input, grouped);
+  if span.end - span.start < 2 || bytes_slice(input.source, span.start, span.start + 2) != b"f\"" {
+    false
+  } else {
     let toks = lex(bytes_slice(input.source, span.start, span.end)).tokens;
     let walked = fold(
       toks,
@@ -923,6 +971,7 @@ fn one_interpolation(input: PrintInput, span: Span) -> Bool / {abort.raise} =
     );
     walked.closed == len(toks) - 2
   }
+}
 
 /// Each piece of the concatenation printed, left to right.
 fn pieces(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
@@ -1141,7 +1190,7 @@ fn scrutinee(
   expr: Expr,
   indent: Int,
   after: Int,
-) -> Printer / {abort.raise} = operand(input, printer, expr, starts_with_brace(expr), indent, after)
+) -> Printer / {abort.raise} = operand(input, printer, expr, parens_scrutinee(expr), indent, after)
 
 /// The operator opens every line of a broken chain after the first, and each of them sits at `cont`,
 /// whether what nests there is a tighter operator or a bracketed group.
@@ -1484,21 +1533,20 @@ fn elements(
   close(input, s2, span.end, indent, closer)
 }
 
-/// A map or set literal the parser built a `map_of_entries` call of: the source still opens it with
-/// `#{` or `#[`, which a call spelled out never does.
+/// A map literal the parser built a `map_of_entries` call of, which the source still opens with
+/// `#{` where a call spelled out never does, or a set literal, whose call no source can spell.
 type Literal = { set: Bool, items: List<Expr>, span: Span }
 
 fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
   match e {
-    EApp(a) -> match a.func {
-      EVar(f) -> if f.name.module != None || f.name.name.name != b"map_of_entries" { None } else {
-        let opener = bytes_slice(input.source, a.span.start, a.span.start + 2);
-        match a.args {
-          [EList(l)] -> if opener == b"#{" || opener == b"#[" {
-            Some({ set: opener == b"#[", items: l.items, span: a.span })
-          } else { None },
-          _ -> None,
-        }
+    EApp(a) -> match ((a.func, a.args)) {
+      (EVar(f), [EList(l)]) -> match f.name.module {
+        Some(m) -> if m.name == set_binder() { Some({ set: true, items: l.items, span: a.span }) }
+        else { None },
+        None -> if f.name.name.name == b"map_of_entries"
+            && bytes_slice(input.source, a.span.start, a.span.start + 2) == b"#{" {
+          Some({ set: false, items: l.items, span: a.span })
+        } else { None },
       },
       _ -> None,
     },
@@ -1523,20 +1571,48 @@ fn field_of(fields: List<RecField>, name: Bytes) -> Option<Expr> =
   fold(fields, None, |acc: Option<Expr>, field: RecField|
     if field.name.name == name { Some(field.value) } else { acc })
 
+/// How an expression the parser built of other nodes was written, which only its source says.
+pub type Spelling =
+  | AsParsed
+  /// `f"a {x} b"`: the values in its holes, in order.
+  | Interpolated(List<Expr>)
+  /// `#{k: v, ..}`: its entries, in order.
+  | MapLiteral(List<{ key: Expr, value: Expr }>)
+  /// `#[a, ..]`: its items, in order.
+  | SetLiteral(List<Expr>)
+
+/// How `e` is written in `source`, the text it was parsed from.
+pub fn spelling(source: Bytes, e: Expr) -> Spelling / {abort.raise} = {
+  let input: PrintInput = { source: source, comments: [] };
+  match literal_of(input, e) {
+    Some(m) -> {
+      let entries = map(m.items, |x: Expr|
+        match entry_parts(x) { Some(parts) -> parts, None -> { key: x, value: x } });
+      if m.set { SetLiteral(map(entries, |entry: { key: Expr, value: Expr }| entry.key)) }
+      else { MapLiteral(entries) }
+    },
+    None -> match e {
+      ELit(_) -> AsParsed,
+      _ -> if one_interpolation(input, expr_span(e)) { Interpolated(holes_of(e)) }
+      else { AsParsed },
+    },
+  }
+}
+
+/// The values in the holes of an interpolated string, as the parser's concatenation holds them.
+pub fn holes_of(e: Expr) -> List<Expr> = holes_onto(e, [])
+
+fn holes_onto(e: Expr, found: List<Expr>) -> List<Expr> =
+  match e {
+    EBinary(v) -> if v.op == b"concat" { holes_onto(v.rhs, holes_onto(v.lhs, found)) }
+    else { found },
+    EApp(v) -> match v.args { [x] -> push(found, x), _ -> found },
+    _ -> found,
+  }
+
 fn flat_literal(input: PrintInput, m: Literal) -> Option<Bytes> / {abort.raise} =
   if m.set {
-    cat([
-      Some(b"#["),
-      sep(
-        map(m.items, |x: Expr|
-          match entry_parts(x) {
-            Some(en) -> flat_expr(input, en.key),
-            None -> flat_expr(input, x),
-          }),
-        b", ",
-      ),
-      Some(b"]"),
-    ])
+    cat([Some(b"#["), sep(map(m.items, |x: Expr| flat_expr(input, x)), b", "), Some(b"]")])
   } else {
     let entry = |key: Expr, value: Expr|
       cat([flat_expr(input, key), Some(b": "), flat_expr(input, value)]);
@@ -1577,7 +1653,8 @@ fn literal(p: PrintInput, printer: Printer, m: Literal, indent: Int) -> Printer 
     };
     match list_at(m.items, i) {
       None -> s,
-      Some(x) -> match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) },
+      Some(x) -> if m.set { entry(x, x) }
+      else { match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) } },
     }
   });
   close(p, s2, m.span.end, indent, if m.set { b"]" } else { b"}" })
@@ -2573,7 +2650,11 @@ test "a map or a set literal prints as the literal it was, and a spelled-out cal
     b"fn f() -> Map<String, Int> = #{ \"a\" : 1,\"b\":2 }\n",
     b"fn f() -> Map<String, Int> = #{\"a\": 1, \"b\": 2}\n",
   );
-  lays_out(b"fn f() -> Map<Int, Unit> = #[ 3,1 ]\n", b"fn f() -> Map<Int, Unit> = #[3, 1]\n");
+  lays_out(b"fn f() -> Set<Int> = #[ 3,1 ]\n", b"fn f() -> Set<Int> = #[3, 1]\n");
+  lays_out(
+    b"fn f() -> Set<{ key: Int, value: Int }> = #[{key: 1, value: 2}]\n",
+    b"fn f() -> Set<{ key: Int, value: Int }> = #[{ key: 1, value: 2 }]\n",
+  );
   lays_out(b"fn f() -> Map<Int, Int> = #{}\n", b"fn f() -> Map<Int, Int> = #{}\n");
   lays_out(
     b"fn f() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}])\n",
@@ -3180,6 +3261,36 @@ test "an interpolated string keeps its text as written and prints each hole flat
     b"fn h(x: Int) -> String = f\"x = {x + 1} {{y}} \\n {f\"in {x}\"}\"\nfn k(a: Int, b: Int) -> String = f\"{a}\" ++ f\"{b}\"\n",
   );
   assert(stable(src))
+}
+
+test "an interpolated string inside parentheses is still one, and loses only the parentheses" {
+  lays_out(
+    b"fn h(x: Int) -> String = (f\"a {x + 1}\")\n",
+    b"fn h(x: Int) -> String = f\"a {x + 1}\"\n",
+  );
+  lays_out(
+    b"fn h(x: Int) -> String = (f\"b {x}\") ++ ( ( f\"{x}\" ) )\n",
+    b"fn h(x: Int) -> String = f\"b {x}\" ++ f\"{x}\"\n",
+  )
+}
+
+test "a scrutinee that holds a record past its first operand is bracketed, as one that opens with it is" {
+  lays_out(
+    b"fn f(x: Int) -> Int = if (x + { a: x }.a) > 0 { 1 } else { 2 }\n",
+    b"fn f(x: Int) -> Int = if (x + { a: x }.a > 0) { 1 } else { 2 }\n",
+  );
+  lays_out(
+    b"fn f(x: Int) -> Int = match -({ a: x }.a) { 0 -> 1, _ -> 2 }\n",
+    b"fn f(x: Int) -> Int = match (-{ a: x }.a) { 0 -> 1, _ -> 2 }\n",
+  );
+  lays_out(
+    b"fn f(x: Int) -> Bool = if x == (1, 2)._0 { true } else { false }\n",
+    b"fn f(x: Int) -> Bool = if x == (1, 2)._0 { true } else { false }\n",
+  )
+}
+
+test "a source that ends at a one-byte body with no line break is printed" {
+  lays_out(b"fn f(x: Int) -> Int = x", b"fn f(x: Int) -> Int = x\n")
 }
 
 test "a tagged literal is kept as written, its tag touching its string" {

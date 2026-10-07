@@ -86,8 +86,9 @@ re-checking-out a dependency keeps what was cached for it.
 
 ### 2.1 Source and identifiers
 
-Source is UTF-8; whitespace only separates tokens and there is no layout rule.
-A comment is `//` to end of line.
+Source is UTF-8, and one that is not is read up to its first byte that is no
+part of a character, which is `X0001`; whitespace only separates tokens and
+there is no layout rule. A comment is `//` to end of line.
 
 A *doc comment* documents a declaration for whoever calls or names it. `///`
 lines document the `fn`, `extern fn`, `type`, `effect`, effect operation, `effect
@@ -174,7 +175,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `uuid"6ba7b810-.."`, `html"<b>{x}</b>"` | what its tag answers | A tagged literal: a text its tag's parser read when the program was checked, and holes its tag is handed apart from the text, below. |
 | `'a'`, `'\n'`, `'\u{1F600}'` | `Char` | Exactly one character, or one escape. |
 | `#{"a": 1, k: v}` | `Map<k, v>` | Keys are expressions; a later entry for a key replaces an earlier one. |
-| `#[1, 2]` | `Map<a, Unit>` | A set: each element a key whose value is `()`. |
+| `#[1, 2]` | `Set<a>` | `std.set`'s set: each element once, in order (§4.3). |
 | `true`, `false` / `()` | `Bool` / `Unit` | |
 
 `1`, `1.0`, `1m` and `1u32` have four types and never convert implicitly
@@ -678,10 +679,11 @@ types, values and patterns, accessed as `t._0`. `(A)` only groups; `()` is
 `Unit`.
 
 An alias may take parameters and name a type that constrains them, as
-`std.set`'s `type Set<a> = Map<a, Unit>` names a map keyed by `a`. The alias carries no
+`type Index<a> = Map<a, Int>` names a map keyed by `a`. The alias carries no
 constraint: each signature that uses it promises what its expansion needs,
 `where derivable(ord, a)` here, and one that does not is `E0206` where it names
-the alias. It may take label and row parameters too (§4.5):
+the alias; a `new` record or a sum carries it (below). It may take label and row
+parameters too (§4.5):
 `type Step<a | e> = () -> Option<a> / e` is the function type it expands to, with
 the row a use gives it in place of `e`.
 
@@ -727,7 +729,12 @@ the declaration's own type, label and row parameters (§4.5), holds no `Cell`,
 `Task` or `Chan` (`E0446`, §4.6), and does not reach the record itself except
 through a sum (`E0214`), since whatever reads a record's shape reads its fields
 whole. A `Map` key it leaves to a parameter is promised where a value is built,
-as a constructor's is, not by each signature that names the type.
+as a constructor's is. The type carries that promise: a signature that names
+the record or a sum at a parameter of its own, where the type keys a `Map` by
+it through anything it holds, is held to `where derivable(ord, a)` without
+writing it, so its callers meet it and its body assumes it; `std.set`'s
+`Set<a>` is one. A `key`, a `show` or a `gen` (§4.4) may name such a function,
+since what its types carry is no `where` of its own.
 
 At run time a `new` record is the record it is written as. `==`, `compare`,
 `digest`, `show`, `reflect` and every derived codec (§11) read its fields as
@@ -744,10 +751,14 @@ replacing one by its index is a load or a store; it is a value like a list,
 compared, ordered and derived element by element, and has no literal: build it
 with `array_new` or `array_of_list` (§12). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
-`map_insert` or `map_of_entries`; a set is a `Map` whose values are `()`,
-written `#[a, b]`, and `std.set` names its type `Set<a>`. It iterates in `compare` order. Its key type
+`map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
 `Task` and `Chan` are refused (`E0206`).
+
+`#[a, b]` is a set, `std.set`'s `Set<a>`, each element once in `compare`
+order, which `show` writes back as the literal (`ply doc std.set`). It is no
+`Map`, and is built by `std.set`'s `of_list`: a module that writes one imports
+`std.set` itself, under a name no source can write, so `std.set` writes none.
 
 ### 4.4 Sum types
 
@@ -1234,6 +1245,9 @@ field or as the whole record, takes the field out of a record no one else
 holds, and a `let` or `match` pattern lets its subject go once its binders hold
 their fields (an arm with a guard keeps it for the arms after), so
 `{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
+A subject let go so is the memory of the next record or constructor of its
+width the body builds, so `match s { Set(m) -> Set(map_insert(m, x, ())) }`
+updates a set no one else holds without allocating its wrapper again.
 The same holds for `Bytes` and `++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
@@ -2639,7 +2653,7 @@ The functions every module calls without importing them. Each is declared in the
 compiler's prelude as an `extern fn`: a signature the runtime implements, with a
 row and a `where` like any other and no body, and a doc. Only the prelude
 declares one; an `extern fn` in a module is `E0151`. A module may shadow any
-except `compare_values` and `map_of_entries`, which the map and set literals are
+except `compare_values` and `map_of_entries`, which the map literal is
 written in, and the six the wrapping and saturating operators are written in
 (§2.4), which no binding around such an operator may hide either (`E0105`).
 `to_int` reads a value of any integer type as an `Int`, answering `None` past
