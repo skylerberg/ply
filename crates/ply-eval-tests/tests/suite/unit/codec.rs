@@ -85,7 +85,7 @@ fn a_name_repeated_in_every_row_is_written_once() {
 
 #[test]
 fn what_is_not_plain_data_is_refused() {
-    let secret = Value::Secret(Arc::new(Value::str("hunter2")));
+    let secret = Value::secret_text("hunter2");
     let err = encode(&record(vec![("key", secret)])).unwrap_err();
     assert!(err.contains("not plain data"), "{err}");
 }

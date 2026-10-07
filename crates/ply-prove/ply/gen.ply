@@ -27,6 +27,8 @@ pub type Ungeneratable =
   | UUninhabited(String)
   | UUnknown(String)
   | UTooDeep
+  /// A function of more parameters than a generated one's `U8` arity counts.
+  | UWide
 
 /// The declared types, each with how many nested constructor applications a value of it needs, and
 /// each variant with the same: `None` when nothing finite inhabits it. A type that states a
@@ -172,7 +174,8 @@ pub fn generatable(ty: Ty, types: Types) -> Result<Unit, Ungeneratable> =
   match ty {
     Var(_) -> Ok(()),
     Record(fields) -> all_ok(map(fields, |f: { name: String, ty: Ty }| f.ty), types),
-    Fn(params, ret, pure) -> if !pure { Err(UEffectful) } else { all_ok(push(params, ret), types) },
+    Fn(params, ret, pure) -> if !pure { Err(UEffectful) }
+    else { match arity_of(params) { Err(e) -> Err(e), Ok(_) -> all_ok(push(params, ret), types) } },
     Con(name, args) -> if is_scalar(name) { Ok(()) }
     else if is_sequence(name) || name == "Map" { all_ok(args, types) }
     else if name == "Cell" { Err(UCell) }
@@ -188,6 +191,10 @@ pub fn generatable(ty: Ty, types: Types) -> Result<Unit, Ungeneratable> =
       }
     },
   }
+
+/// How many parameters a generated function of `params` takes, as its arity counts them.
+pub fn arity_of(params: List<Ty>) -> Result<U8, Ungeneratable> =
+  handle { Ok(u8_of_int(len(params))) } with { abort.raise(_) -> Err(UWide) }
 
 fn all_ok(xs: List<Ty>, types: Types) -> Result<Unit, Ungeneratable> =
   fold(xs, Ok(()), |acc: Result<Unit, Ungeneratable>, x: Ty|
@@ -249,8 +256,12 @@ fn value(
     match ty {
       Var(_) -> Ok(int(gen, rand)),
       Record(fields) -> record(gen, by_name(fields), rand, depth),
-      Fn(params, ret, pure) -> if !pure { Err(UEffectful) }
-      else { function(gen, params, ret, rand, depth) },
+      Fn(params, ret, pure) -> if !pure { Err(UEffectful) } else {
+        match arity_of(params) {
+          Err(e) -> Err(e),
+          Ok(arity) -> function(gen, arity, params, ret, rand, depth),
+        }
+      },
       Con(name, args) -> if name == "Int" { Ok(int(gen, rand)) }
       else if is_width(name) { Ok(fixed(gen, name, rand)) }
       else if name == "Float" { Ok(float(gen, rand)) }
@@ -701,14 +712,17 @@ pub fn comparable(t: Ty) -> Bool =
 /// From a fixed family of pure, total, printable functions, so a counterexample reads.
 fn function(
   gen: Gen,
+  arity: U8,
   params: List<Ty>,
   ret: Ty,
   rand: Rand,
   depth: Int,
 ) -> Result<Generated, Ungeneratable> / {abort.raise} = {
-  let arity = len(params);
-  let projection = fold(range(0, arity), None, |found: Option<Int>, i: Int|
-    match found { Some(_) -> found, None -> if at(params, i) == ret { Some(i) } else { None } });
+  let projection = fold(range(0, len(params)), None, |found: Option<U8>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if at(params, i) == ret { Some(u8_of_int(i)) } else { None },
+    });
   let tabulatable = match list_at(params, 0) { Some(p) -> comparable(p), None -> false };
   let chosen = match gen.edge {
     Some(_) -> { choice: 0, rand: rand },
@@ -852,7 +866,11 @@ test "a recursive type terminates, and one nothing finite inhabits is not genera
   assert_eq(generatable(Con("Cell", [int_t()]), types), Err(UCell));
   assert_eq(generatable(Con("Chan", [int_t()]), types), Err(UChan));
   assert_eq(generatable(Fn([int_t()], int_t(), false), types), Err(UEffectful));
-  assert_eq(generatable(Con("m.Nowhere", []), types), Err(UUnknown("m.Nowhere")))
+  assert_eq(generatable(Con("m.Nowhere", []), types), Err(UUnknown("m.Nowhere")));
+  let taking = |n: Int| Fn(map(range(0, n), |_: Int| int_t()), int_t(), true);
+  assert_eq(generatable(taking(255), types), Ok(()));
+  assert_eq(generatable(taking(256), types), Err(UWide));
+  assert_eq(match drawn_at(taking(256), 5, 0) { Ok(_) -> None, Err(e) -> Some(e) }, Some(UWide))
 }
 
 test "a draw is a function of its root, its key and its case" {
