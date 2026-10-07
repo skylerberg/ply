@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # The tables CI's test jobs are cut from, the check that the cut is total, and the caches a run
-# parks for its own jobs, handed back when it is green.
+# leaves the runs after it.
 #
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
 #                                every test exactly once, every cache key a job
 #                                writes is one a job reads, every key that
-#                                names the run is one the run gives back or a
-#                                later run reads, and every key over a crate's
-#                                Ply sources names every crate's
+#                                names the run is one a later run reads and no
+#                                job needs, and every key over a crate's Ply
+#                                sources names every crate's
 #   ci-shards.sh cache-keys      just that last check
+#   ci-shards.sh fetch-timings   the table the last run measured, from this
+#                                pull request's branch or else from main, into
+#                                the place the cut reads it from
 #   ci-shards.sh partitions      the JSON matrix of the corpus partitions
 #   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
 #   ci-shards.sh shard-configs D the nextest config each shard runs under and
@@ -44,8 +47,6 @@
 #   ci-shards.sh rust-kept NEW JUNIT OUT
 #                                the traces in NEW of the tests JUNIT says passed,
 #                                copied into OUT
-#   ci-shards.sh give-back RUN   delete the entries this run parked for its own
-#                                jobs, once every job that reads them is done
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -58,7 +59,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PARTITIONS=8
 NEXTEST_SHARDS=2
 
-# What the last run whose test jobs all passed measured, restored from the cache by the `plan` job.
+# What the last run whose test jobs all passed measured, which its `passes` job uploaded in the
+# `test-durations` artifact (`fetch-timings`).
 TIMINGS=/tmp/ply-test-timings/timings.tsv
 
 TAB=$'\t'
@@ -86,6 +88,9 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+# Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
+# steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
+RUNS_MARGIN=4
 # Corpus processes a partition runs side by side, each a lane of the cut: a lane's runs of one package
 # go in one `ply test`, which loads the package's closure once. Two, so the program's and the packages'
 # own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
@@ -147,14 +152,10 @@ declare -a PROBE_JOBS=(
   "ucontext:plan"
 )
 
-# What a run parks for its own jobs, as the literal ci.yml writes before `${{ github.run_id }}`:
-# the emitter's stage and the shard cut. No later run can name one, so a green run gives them back,
-# and the repository's 10 GB cache stays for what does outlive a run: the archive and the runtime
-# under the Rust key, the stage under `ply-c-stage-sources-`, the kept C, the stores and the passes.
-GIVE_BACK=(ply-c-stage-emitter- test-shards-)
-
-# `<family>-<run id>` entries only the newest of which is ever restored.
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- test-timings- rust-traces-)
+# `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
+# of its own run is never a cache, which the repository's other runs evict while those jobs wait for
+# runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- rust-traces-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
@@ -828,11 +829,14 @@ ci_files() {
 # One job writes each cache key and another reads it. A rename that misses a side leaves a cache
 # nothing restores -- a run that is quietly slow rather than red -- and a restore naming a key
 # nothing writes always misses the same way. Only the literal before the first `${{ ... }}` is
-# compared: it is the part a restore can match on, and the part both sides spell out.
+# compared: it is the part a restore can match on, and the part both sides spell out. A cache is
+# for what a miss only slows: the repository's other runs evict any entry while a run's jobs wait
+# for runners, so a key that names the run is one a later run reads, and none is restored with
+# `fail-on-cache-miss`.
 cmd_cache_keys() {
   local files=() file
   while IFS= read -r file; do files+=("$file"); done < <(ci_files)
-  awk -v give_back="${GIVE_BACK[*]}" -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
+  awk -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
       gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
@@ -866,7 +870,8 @@ cmd_cache_keys() {
         if (mode == "save") savepath[steplit[i]] = steppath
         else if (mode == "restore") { rlit[++nr] = steplit[i]; rpath[nr] = steppath; rwhere[nr] = stepwhere }
       }
-      nlit = 0; steppath = ""; inpath = 0
+      if (mode == "restore" && stepfail && steprun) needed[++nneeded] = stepwhere
+      nlit = 0; steppath = ""; inpath = 0; stepfail = 0; steprun = 0
     }
     FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
     # A new list item is a new step; the rules below read the one they are in.
@@ -874,6 +879,7 @@ cmd_cache_keys() {
     /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     /uses:[[:space:]]*actions\/cache\/restore@/ { mode = "restore"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
     mode == "" { next }
+    /^[[:space:]]*fail-on-cache-miss:[[:space:]]*true/ { stepfail = 1; next }
     inpath {
       line = $0
       sub(/^[[:space:]]*/, "", line)
@@ -906,6 +912,7 @@ cmd_cache_keys() {
     /^[[:space:]]*key:/ {
       rest = $0
       sub(/.*key:[[:space:]]*/, "", rest)
+      if (mode == "restore" && index(rest, "github.run_id") > 0) steprun = 1
       note(mode, rest)
     }
     END {
@@ -938,28 +945,22 @@ cmd_cache_keys() {
           bad = 1
         }
       }
-      # A key that names the run carries the work of this run to the jobs of this run, and no later
-      # run can name it: the run has to give it back, unless a `restore-keys` entry matches it.
-      ng = split(give_back, gk, " ")
+      # A key that names the run is one only a `restore-keys` entry of a later run can match: one
+      # nothing later reads carries this run'"'"'s work to this run'"'"'s jobs, which an artifact does.
       for (i = 1; i <= n; i++) {
         if (!(order[i] in run_scoped)) continue
         ok = 0
-        for (j = 1; j <= ng; j++) if (gk[j] != "" && index(order[i], gk[j]) == 1) { ok = 1; break }
-        if (!ok) for (r in late) if (index(order[i], r) == 1) { ok = 1; break }
+        for (r in late) if (index(order[i], r) == 1) { ok = 1; break }
         if (!ok) {
-          printf "FAIL: %s writes run-scoped cache key \"%s\", which no later run reads and GIVE_BACK does not name\n", where[order[i]], order[i] > "/dev/stderr"
+          printf "FAIL: %s writes run-scoped cache key \"%s\", which no later run reads: what a job hands the jobs of its own run goes as an artifact\n", where[order[i]], order[i] > "/dev/stderr"
           bad = 1
         }
       }
-      # And the other way: an entry that names no key is a delete that quietly stops matching.
-      for (j = 1; j <= ng; j++) {
-        if (gk[j] == "") continue
-        ok = 0
-        for (k in saved) if (index(k, gk[j]) == 1) { ok = 1; break }
-        if (!ok) {
-          printf "FAIL: GIVE_BACK names \"%s\", which no save writes\n", gk[j] > "/dev/stderr"
-          bad = 1
-        }
+      # And a job that cannot go on without an entry of its own run fails whenever the entry was
+      # evicted, and a re-run of it fails the same way.
+      for (i = 1; i <= nneeded; i++) {
+        printf "FAIL: %s restores a key that names the run with fail-on-cache-miss: what a job needs from another job of its run goes as an artifact\n", needed[i] > "/dev/stderr"
+        bad = 1
       }
       nf = split(families, fk, " ")
       for (j = 1; j <= nf; j++) {
@@ -972,7 +973,7 @@ cmd_cache_keys() {
         }
       }
       if (bad) exit 1
-      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read later or given back\n", n, length(read), length(run_scoped)
+      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read by a later run and needed by no job\n", n, length(read), length(run_scoped)
     }
   ' "${files[@]}"
 }
@@ -1062,25 +1063,38 @@ cmd_rust_inputs() {
   return $((missing > 0))
 }
 
-# Deletes this run's entries under the keys above. A GitHub key is immutable, so an entry no later
-# run reads holds the repository's cache budget against the caches that do outlive a run.
-cmd_give_back() {
-  local run=${1:?usage: ci-shards.sh give-back RUN_ID} key listing size id
-  for key in ${GIVE_BACK[@]+"${GIVE_BACK[@]}"}; do
-    listing=$(gh api "repos/$GITHUB_REPOSITORY/actions/caches?key=$key$run" \
-      -q '.actions_caches[] | "\(.size_in_bytes) \(.id)"')
-    while read -r size id; do
-      [[ -n $id ]] || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id"
-      echo "gave back $key$run, $((size / 1000000)) MB"
-    done <<< "$listing"
+# The table at TIMINGS: the `timings.tsv` of the newest `test-durations` artifact that holds one, which
+# a run's `passes` job writes when its test jobs all passed, of the runs on this pull request's
+# branch and else on main's. A branch cuts by what its own tree measured, and main never by a
+# branch's. A fork's run names its artifacts as it likes, so only this repository's own are taken.
+# The newest few of a branch are looked in; none with a table leaves none, and the cut falls back to
+# slicing by count.
+cmd_fetch_timings() {
+  local branch run runs dir=${TIMINGS%/*} tmp
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  for branch in ${GITHUB_HEAD_REF:-} main; do
+    runs=$(BRANCH=$branch gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?name=test-durations&per_page=100" \
+      -q '.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id
+            and .workflow_run.head_branch == env.BRANCH) | "\(.created_at) \(.workflow_run.id)"' |
+      LC_ALL=C sort -r | head -n 5 | cut -d' ' -f2) || runs=
+    for run in $runs; do
+      tmp=$(mktemp -d)
+      if gh run download "$run" -n test-durations -D "$tmp" > /dev/null 2>&1 && [[ -s $tmp/timings.tsv ]]; then
+        mv "$tmp/timings.tsv" "$TIMINGS"
+        rm -rf "$tmp"
+        echo "the table run $run measured on $branch: $(grep -c . "$TIMINGS") durations"
+        return 0
+      fi
+      rm -rf "$tmp"
+    done
   done
+  echo "no run on ${GITHUB_HEAD_REF:+$GITHUB_HEAD_REF or }main left a table: the cut falls back to slicing by count"
 }
 
-# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; of a family
-# keyed by content, the newest entry on the ref; and what an earlier run on the ref parked for its own
-# jobs, which a cancelled run never gave back. A ref runs one run at a time. On main, every entry of
-# a pull request that is closed, which no run reads again.
+# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; and of a
+# family keyed by content, the newest entry on the ref. A ref runs one run at a time. On main, every
+# entry of a pull request that is closed, which no run reads again.
 cmd_supersede() {
   local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
   for prefix in "${SUPERSEDED[@]}"; do
@@ -1091,14 +1105,6 @@ cmd_supersede() {
       [[ -n $id && $key != *-"$run" ]] || continue
       grep -qxF "${key%-*}" <<< "$current" || continue
       gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
-    done <<< "$listing"
-  done
-  for prefix in "${GIVE_BACK[@]}"; do
-    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&per_page=100" \
-      -q '.actions_caches[] | "\(.key) \(.id)"')
-    while read -r key id; do
-      [[ -n $id && $key != *-"$run" ]] || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "gave back $key"
     done <<< "$listing"
   done
   for prefix in "${NEWEST[@]}"; do
@@ -1636,24 +1642,30 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # A job that starts corpus runs ends them at a deadline that leaves its steps after them
+  # RUNS_MARGIN minutes of its limit: a job the limit cancels keeps nothing its runs wrote.
+  local block limit budget
+  for corpus_command in "ci-corpus.sh partition" "ci-corpus.sh desks"; do
+    corpus_job=$(awk -v c="${corpus_command//./\\.}" '
+      /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+      $0 ~ c { print job; exit }
+    ' "$workflow")
+    [[ -n $corpus_job ]] || continue
+    block=$(awk -v j="  $corpus_job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
+    limit=$(sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p' <<< "$block")
+    budget=$(sed -n 's/.*PLY_CI_DEADLINE=\$((\$(date +%s) + \([0-9][0-9]*\) \* 60)).*/\1/p' <<< "$block")
+    if [[ -z $budget ]]; then
+      echo "FAIL: job '$corpus_job' runs \`$corpus_command\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
+      failures=$((failures + 1))
+    elif [[ -z $limit ]] || ((budget > limit - RUNS_MARGIN)); then
+      echo "FAIL: job '$corpus_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
+      failures=$((failures + 1))
+    fi
+  done
 
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
-  # GIVE_BACK is a table until a job runs it, and a job that is not required can stop running with
-  # nothing red about it.
-  local give_back_job
-  give_back_job=$(awk '
-    /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
-    /ci-shards\.sh give-back/ { print job; exit }
-  ' "$workflow")
-  if [[ -z $give_back_job ]]; then
-    echo "FAIL: GIVE_BACK names the caches a run gives back, and no job in $workflow runs \`ci-shards.sh give-back\`" >&2
-    failures=$((failures + 1))
-  elif [[ $give_back_job != ci && " ${needs//[][,]/ } " != *" $give_back_job "* ]]; then
-    echo "FAIL: job '$give_back_job' gives this run's own caches back, and is neither \`ci\` nor in its needs list" >&2
-    failures=$((failures + 1))
-  fi
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -1684,10 +1696,10 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
-  give-back) cmd_give_back "${2:?a run id}" ;;
+  fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|give-back RUN|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
