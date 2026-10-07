@@ -33,20 +33,23 @@
 //! - `{{! a comment }}` writes nothing. `{{-` and `-}}` open and close any action and also drop
 //!   the blanks and line ends that touch it on that side.
 //!
-//! `read_html` reads the same language where the text is HTML, with `std.html`'s reader, and
+//! `read_html` reads the same language where the text is HTML, with `std.html`'s tokenizer, and
 //! writes each value by where it stands. In an element's content and in a quoted attribute value
 //! it is characters, escaped; as the whole of an unquoted value it is written quoted. In an
-//! attribute that holds a URL (`href`, `src`, `action`, `formaction` and the like) it is
-//! percent-encoded as that part of a URL, and one that would give the URL a scheme other than
-//! `http`, `https`, `mailto` or `tel` fails the filling unless it is a `TrustedUrl`. A value
-//! that is an `Html` is markup already and is written as it is, which is the one way a value is
-//! not escaped; an HTML template's own filling is one (`fill_html`), and an `include` writes
-//! another HTML template's so. A template that would write a value where no escaping makes it
-//! text is refused when it is read: in a tag outside an attribute's value, in an unquoted value
-//! it is only part of, in a comment, a `script` or a `style`, in an event handler, a `style` or
-//! a `srcdoc` attribute, and in a URL whose scheme its text wrote otherwise. So is one whose
-//! branches leave the markup at different places, as an `if` that opens a tag its `else` does
-//! not, and one that ends an action on the `html` pipe, or on `url` in a URL, where the value
+//! attribute that holds a URL (`href`, `src`, `action`, `formaction` and the like, each URL of a
+//! `srcset` or a `ping`, and a refresh's in a `<meta http-equiv=refresh>`'s `content`) it is
+//! percent-encoded as that part of the URL, and one that would give the URL a scheme other than
+//! `http`, `https`, `mailto` or `tel` fails the filling unless it is a `std.html` `trusted_url`.
+//! A value that is an `Html` is markup already and is written as it is, which is the one way a
+//! value is not escaped; an HTML template's own filling is one (`fill_html`), and an `include`
+//! writes another HTML template's so. A template's markup is refused when it is read where the
+//! standard's tokenizer reads a parse error in it, and where it would write a value where no
+//! escaping makes it text: in a tag outside an attribute's value, in an unquoted value it is only
+//! part of, in a comment, a `script` or a `style`, in an event handler, a `style`, a `srcdoc` or an
+//! `http-equiv` attribute, in a `srcset` candidate's descriptors or a refresh's delay, and in a URL
+//! whose scheme its text wrote otherwise. So is one whose branches leave the markup at different
+//! places, as an `if` that opens a tag its `else` does not, or that write one attribute twice in
+//! a tag; and one that ends an action on the `html` pipe, or on `url` in a URL, where the value
 //! would be escaped twice.
 
 import std.bytes (int_of_ascii, is_digit, is_letter, peek, scan, scan_until)
@@ -657,14 +660,6 @@ pub fn parse_html(source: String) -> Result<Template, Refusal> = try { read_html
 
 // --- Data -----------------------------------------------------------------------
 
-/// A URL the program vouches for: written into an HTML template's URL, it may give the URL any
-/// scheme. It is still percent-encoded, and anywhere else it is its text.
-pub opaque type TrustedUrl = | TrustedUrl(String)
-
-/// `url` as one the program vouches for: one it wrote or has checked, never text that reached it
-/// from outside as it came.
-pub fn trusted_url(url: String) -> TrustedUrl = TrustedUrl(url)
-
 /// The data a JSON document is: an object as a map of its members, an array as a list, a whole
 /// number as an `Int` and any other as a `Decimal`, and `null` as `None`.
 pub fn of_json(j: Json) -> Value =
@@ -749,7 +744,6 @@ fn text(v: Value) -> Option<String> =
     VDecimal(d) -> Some(decimal_to_string(d)),
     VFloat(f) -> Some(float_to_string(f)),
     VChar(c) -> Some(string_of_chars([c])),
-    VCtor("std.template.TrustedUrl", [VStr(url)]) -> Some(url),
     _ -> None,
   }
 
@@ -804,7 +798,6 @@ fn json_of(v: Value, env: Env, at: Int) -> Json / {template.failed} =
       ),
     VCtor("Some", [held]) -> json_of(held, env, at),
     VCtor("None", []) -> json::Null,
-    VCtor("std.template.TrustedUrl", [VStr(url)]) -> json::Str(url),
     _ -> fail(env, at, WrongKind("data JSON writes", kind(v))),
   }
 
@@ -896,7 +889,7 @@ fn finished(out: Sink, env: Env, at: Int) -> Wrote / {template.failed, abort.rai
     Page(d) -> match html::finish(d) { Some(page) -> Fragment(page), None -> crossed(env, at) },
   }
 
-fn literal(lit: Lit, f: Filling, env: Env) -> Filling / {template.failed} = {
+fn literal(lit: Lit, f: Filling, env: Env) -> Filling / {template.failed, abort.raise} = {
   let room = counted(f, lit.size, env, lit.at);
   match ((lit.chunk, room.out)) {
     (Plain(written), Words(parts)) -> { ..room, out: Words(push(parts, bytes_of_string(written))) },
@@ -908,11 +901,20 @@ fn literal(lit: Lit, f: Filling, env: Env) -> Filling / {template.failed} = {
   }
 }
 
+/// What `w` is where `h` is a URL: its text, which is no markup's, and whether it is trusted.
+fn url_of(w: Wrote, env: Env, at: Int) -> html::UrlText / {template.failed} =
+  match w {
+    Characters(s) -> { text: s, trusted: false },
+    Fragment(page) -> match html::url_text(page) {
+      Some(u) -> u,
+      None -> fail(env, at, WrongKind("the text of a URL", "markup")),
+    },
+  }
+
 /// `w` written at `spot`: into a text as it is, and into a page as its hole reads it, a URL's
 /// part percent-encoded and refused where it would name a scheme no value may.
 fn put(
   w: Wrote,
-  trusted: Bool,
   spot: Spot,
   f: Filling,
   env: Env,
@@ -935,8 +937,7 @@ fn put(
         let value = match ((h.url, w)) {
           (None, Characters(s)) -> html::text(s),
           (None, Fragment(page)) -> page,
-          (Some(_), Fragment(_)) -> fail(env, at, WrongKind("the text of a URL", "markup")),
-          (Some(part), Characters(s)) -> match html::url_value(part, s, trusted) {
+          _ -> match html::written_url(h, url_of(w, env, at)) {
             Ok(url) -> html::text(url),
             Err(scheme) -> fail(env, at, UnsafeUrl(scheme)),
           },
@@ -958,13 +959,11 @@ fn shown(
   at: Int,
 ) -> Filling / {template.failed, abort.raise} =
   match html::reflected(v) {
-    Some(page) -> put(Fragment(page), false, spot, counted(f, html::size(page), env, at), env, at),
+    Some(page) -> put(Fragment(page), spot, counted(f, html::size(page), env, at), env, at),
     None -> {
       let written = text_of(v, env, at);
-      let trusted = match v { VCtor("std.template.TrustedUrl", _) -> true, _ -> false };
       put(
         Characters(written),
-        trusted,
         spot,
         counted(f, bytes_len(bytes_of_string(written)), env, at),
         env,
@@ -1018,14 +1017,7 @@ fn filled(
             { ..stepped(f, env, inc.at), out: sink(t.markup) },
             |a: Filling, m: Node| filled(m, { data: data, bound: [] }, within, depth - 1, a),
           );
-          put(
-            finished(inner.out, env, inc.at),
-            false,
-            inc.spot,
-            { ..inner, out: f.out },
-            env,
-            inc.at,
-          )
+          put(finished(inner.out, env, inc.at), inc.spot, { ..inner, out: f.out }, env, inc.at)
         },
       }
     },
@@ -1433,7 +1425,7 @@ type Page = {
   url: String,
   q: String,
   js: String,
-  vouched: TrustedUrl,
+  vouched: Html,
   safe: Html,
   n: Int,
   on: Bool,
@@ -1447,7 +1439,7 @@ fn page() -> Value = {
     url: "/a b?c=d&e",
     q: "a b&c=/",
     js: "JavaScript:alert(1)",
-    vouched: trusted_url("javascript:void(0)"),
+    vouched: html::trusted_url("javascript:void(0)"),
     safe: html::fragment([html::text("1 < 2")]),
     n: 3,
     on: true,
@@ -1552,8 +1544,8 @@ fn placings() -> List<Filled> =
       text: "<a href=\"/a%20b?c=d&amp;e\" id=\"a\">x</a>",
     },
     {
-      source: "<p{{ for l in links }} data-{{! none }}k=\"{{ l.label }}\"{{ end }}>x</p>",
-      text: "<p data-k=\"A&amp;B\" data-k=\"&lt;C&gt;\">x</p>",
+      source: "<p{{ if on }} data-{{! none }}k=\"{{ name }}\"{{ end }}>x</p>",
+      text: "<p data-k=\"&lt;b&gt;O&#39;Neil &amp; &quot;Co&quot;&lt;/b&gt;\">x</p>",
     },
     {
       source: "{{ if on }}<b>{{ else }}<i>{{ end }}{{ n }}{{ if on }}</b>{{ else }}</i>{{ end }}",
@@ -1641,11 +1633,21 @@ fn unplaceable() -> List<Refused> =
     },
     {
       source: "a < b",
-      offset: 2,
-      why: Markup("a `<` opens a tag: write `&lt;` for the character"),
+      offset: 3,
+      why: Markup(html::explain(html::InvalidFirstCharacterOfTagName)),
     },
-    { source: "<p>{{ n }}</p", offset: 13, why: Markup("a tag is not closed") },
-    { source: "<p title=\"{{ n }}", offset: 17, why: Markup("an attribute's value is not closed") },
+    { source: "<p>{{ n }}</p", offset: 13, why: Markup(html::explain(html::EofInTag)) },
+    { source: "<p title=\"{{ n }}", offset: 17, why: Markup(html::explain(html::EofInTag)) },
+    {
+      source: "<p{{ for l in links }} data-{{! none }}k=\"{{ l.label }}\"{{ end }}>x</p>",
+      offset: 40,
+      why: Markup(html::explain(html::DuplicateAttribute)),
+    },
+    {
+      source: "<img srcset=\"/a.png {{ n }}x\">",
+      offset: 20,
+      why: Misplaced("a hole in a `srcset` stands in a candidate's URL, not in its descriptors"),
+    },
     { source: "{{ if on }}<p{{ end }}>x</p>", offset: 0, why: Uneven },
     { source: "<p{{ if on }} title=\"{{ else }}>{{ end }}", offset: 2, why: Uneven },
     { source: "<p title=\"{{ for l in links }}\"{{ end }}>", offset: 10, why: Uneven },
@@ -1687,8 +1689,26 @@ test "a value that would name a URL's scheme fails the filling, unless it is vou
     Ok("<a href=\"?u=JavaScript%3Aalert%281%29\">x</a>"),
   );
   assert_eq(why("<a href=\"x{{ vouched }}\">x</a>"), Ok("<a href=\"xjavascript:void(0)\">x</a>"));
-  assert_eq(why("<a href=\"{{ vouched | lower }}\">x</a>"), Err(UnsafeUrl("javascript")));
-  assert_eq(why("<a href=\"{{ safe }}\">x</a>"), Err(WrongKind("the text of a URL", "markup")));
+  assert_eq(why("<a href=\"{{ vouched | lower }}\">x</a>"), Err(WrongKind("a text", "markup")));
+  assert_eq(why("<a href=\"{{ safe }}\">x</a>"), Ok("<a href=\"1%20%3C%202\">x</a>"));
+  let bold = match html::literal("<b>x</b>") { Ok(h) -> h, Err(_) -> html::text("") };
+  assert_eq(
+    match page_over("<a href=\"{{ m }}\">x</a>", reflect({ m: bold })) {
+      Ok(text) -> Ok(text),
+      Err(f) -> Err(f.why),
+    },
+    Err(WrongKind("the text of a URL", "markup")),
+  );
+  assert_eq(why("<img srcset=\"{{ url }} 2x\">"), Ok("<img srcset=\"/a%20b?c=d&amp;e 2x\">"));
+  assert_eq(why("<a ping=\"/p {{ js }}\">x</a>"), Err(UnsafeUrl("JavaScript")));
+  assert_eq(
+    why("<meta http-equiv=\"refresh\" content=\"0;url={{ js }}\">"),
+    Err(UnsafeUrl("JavaScript")),
+  );
+  assert_eq(
+    why("<meta http-equiv=\"refresh\" content=\"0; {{ url }}\">"),
+    Ok("<meta http-equiv=\"refresh\" content=\"0; /a%20b?c=d&amp;e\">"),
+  );
   assert_eq(why("<a href=\"{{ links }}\">x</a>"), Err(WrongKind("a text", "a list")))
 }
 
