@@ -15,5 +15,6 @@ mod password_host;
 mod pg_client;
 mod random_host;
 mod shared_state;
+mod sqlite_host;
 mod support;
 mod unit;

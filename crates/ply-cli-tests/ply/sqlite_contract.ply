@@ -1,0 +1,391 @@
+//! `std.sqlite`'s twin runs the engine a file does, so each must answer one script alike: a program
+//! tested over the twin is then tested for the file it will be run on.
+
+import fs_contract (first_difference)
+import harness (fresh, in_memory, tree, json_of, at, nth, str, codes, diagnostic, stdout, said,
+                assert_ok, Source)
+import std.db (stmt, PInt, PText, Row, Rows, Count, Failed)
+import std.fs (fs)
+import std.list (contains)
+import std.sqlite
+import std.sqlite (sqlite, sql, Create, ReadOnly, ReadWrite, Limits, Options, Connection)
+
+fn roomy() -> Limits = { sql_bytes: 10000, params: 100, rows: 10000, bytes: 1000000, steps: 100000 }
+
+fn plain() -> Options = { strict: true, busy_ms: 20, statements: 8 }
+
+/// What `go` answered, or why it was refused.
+fn told<| e>(go: () -> String / {sql.refused | e}) -> String / e =
+  match try[sql.refused] { go() } { Ok(line) -> line, Err(why) -> f"{why}" }
+
+fn names<[d]>(
+  conn: Hold<Connection<[d]>>,
+) -> String / {hold.read, sqlite.query[d], sql.refused, abort.raise} = {
+  let rows = sqlite::query(conn, sqlite"select name from person order by id", roomy());
+  f"{map(rows, |row: Row| sqlite::text(row, "name"))}"
+}
+
+fn added<[d]>(
+  conn: Hold<Connection<[d]>>,
+  name: String,
+) -> String / {hold.read, sqlite.execute[d], sql.refused} = {
+  let made = sqlite::execute(
+    conn,
+    sqlite"insert into person (name) values ({PText(name)})",
+    roomy(),
+  );
+  f"{made.rows} row, id {made.last_row_id}"
+}
+
+fn counted<[d]>(
+  conn: Hold<Connection<[d]>>,
+  q: sqlite::Bound,
+  limits: Limits,
+) -> String / {hold.read, sqlite.query[d], sql.refused, abort.raise} =
+  int_to_string(len(sqlite::query(conn, q, limits))) ++ " rows"
+
+/// Every operation of a database, each answered as a line.
+fn script<[d]>() -> List<String> / {sqlite.read[d], sqlite.write[d], sql.refused, abort.raise} = {
+  let missing = told(||
+    with_hold[missing](sqlite::opening[d]("none.db", ReadWrite, plain()), |c|
+      sqlite::close(c)) { conn -> "opened" });
+  let first = with_hold[first](sqlite::opening[d]("app.db", Create, plain()), |c|
+    sqlite::close(c)) { conn ->
+    [
+      "create -> "
+        ++ told(|| {
+          let made = sqlite::execute(
+            conn,
+            sqlite"create table person (id integer primary key, name text not null unique, age integer check (age >= 0)) strict",
+            roomy(),
+          );
+          f"{made.rows} rows, id {made.last_row_id}"
+        }),
+      "insert Ada -> " ++ told(|| added(conn, "Ada")),
+      "insert Grace -> " ++ told(|| added(conn, "Grace")),
+      "insert Ada again -> " ++ told(|| added(conn, "Ada")),
+      "insert a negative age -> "
+        ++ told(|| {
+          sqlite::execute(
+            conn,
+            sqlite"insert into person (name, age) values ('Alan', {PInt(-1)})",
+            roomy(),
+          );
+          "inserted"
+        }),
+      "insert text for an age -> "
+        ++ told(|| {
+          sqlite::execute(
+            conn,
+            sqlite"insert into person (name, age) values ('Alan', 'old')",
+            roomy(),
+          );
+          "inserted"
+        }),
+      "names -> " ++ told(|| names(conn)),
+      "returning -> "
+        ++ told(|| {
+          let rows = sqlite::returning(
+            conn,
+            sqlite"update person set age = 36 where name = 'Ada' returning id, age",
+            roomy(),
+          );
+          f"{map(rows, |row: Row| sqlite::int(row, "id") * 100 + sqlite::int(row, "age"))}"
+        }),
+      "an age and a null -> "
+        ++ told(|| {
+          let rows = sqlite::query(conn, sqlite"select age from person order by id", roomy());
+          f"{map(rows, |row: Row| sqlite::optional(row, "age", sqlite::int))}"
+        }),
+      "a null read as an integer -> "
+        ++ told(|| {
+          let rows = sqlite::query(conn, sqlite"select age from person order by id", roomy());
+          f"{map(rows, |row: Row| sqlite::int(row, "age"))}"
+        }),
+      "run a query -> "
+        ++ (match sqlite::run(conn, sqlite"select count(*) as n from person", roomy()) {
+          Rows(rows) -> f"{len(rows)} row",
+          Count(n) -> f"count {n}",
+          Failed(e) -> e.code,
+        }),
+      "run a write -> "
+        ++ (match sqlite::run(
+            conn,
+            sqlite"update person set age = 85 where name = 'Grace'",
+            roomy(),
+          ) {
+          Rows(rows) -> f"{len(rows)} row",
+          Count(n) -> f"count {n}",
+          Failed(e) -> e.code,
+        }),
+      "run a failure -> "
+        ++ (match sqlite::run(conn, sqlite"insert into person (name) values ('Ada')", roomy()) {
+          Rows(rows) -> f"{len(rows)} row",
+          Count(n) -> f"count {n}",
+          Failed(e) -> e.code ++ " " ++ e.constraint,
+        }),
+      "a transaction that commits -> "
+        ++ told(|| sqlite::transaction(conn, || added(conn, "Edsger")) ++ ", then " ++ names(conn)),
+      "a transaction that raises -> "
+        ++ told(|| sqlite::transaction(conn, || added(conn, "Barbara") ++ added(conn, "Ada")))
+        ++ ", then "
+        ++ told(|| names(conn)),
+      "a savepoint that raises -> "
+        ++ told(||
+          sqlite::transaction(conn, ||
+            added(conn, "Barbara") ++ ", inner "
+              ++ told(|| sqlite::transaction(conn, || added(conn, "Tony") ++ added(conn, "Ada")))))
+        ++ ", then "
+        ++ told(|| names(conn)),
+      "a commit with none open -> "
+        ++ told(|| {
+          sqlite::execute(conn, sqlite::bound(stmt("commit"), []), roomy());
+          "committed"
+        }),
+      "over the rows -> "
+        ++ told(|| counted(conn, sqlite"select name from person", { ..roomy(), rows: 2 })),
+      "over the bytes -> "
+        ++ told(|| counted(conn, sqlite"select name from person", { ..roomy(), bytes: 4 })),
+      "over the steps -> "
+        ++ told(||
+          counted(
+            conn,
+            sqlite"with recursive c(i) as (select 1 union all select i + 1 from c where i < 500000) select count(*) as n from c",
+            { ..roomy(), steps: 5 },
+          )),
+      "a fold -> "
+        ++ told(||
+          sqlite::fold_rows(
+            conn,
+            sqlite"select name from person order by id",
+            roomy(),
+            2,
+            "",
+            |acc: String, row: Row| acc ++ string_slice(sqlite::text(row, "name"), 0, 1),
+          )),
+      "a statement inside a fold -> "
+        ++ told(||
+          sqlite::fold_rows(
+            conn,
+            sqlite"select name from person order by id",
+            roomy(),
+            2,
+            "",
+            |_: String, _: Row| told(|| names(conn)),
+          )),
+      "a fold past its rows -> "
+        ++ told(||
+          sqlite::fold_rows(
+            conn,
+            sqlite"select name from person",
+            { ..roomy(), rows: 3 },
+            2,
+            "",
+            |acc: String, _: Row| acc ++ ".",
+          )),
+      "a function the engine refuses -> "
+        ++ told(|| counted(conn, sqlite::bound(stmt("select changes() as n"), []), roomy())),
+      "a clock read through a parameter -> "
+        ++ told(|| counted(conn, sqlite"select datetime({PText("now")}) as at", roomy())),
+      "a date that reads no clock -> "
+        ++ told(|| {
+          let rows = sqlite::query(
+            conn,
+            sqlite"select date('2024-02-28', '+2 days') as d",
+            roomy(),
+          );
+          f"{map(rows, |row: Row| sqlite::text(row, "d"))}"
+        }),
+      "a pragma that is set -> "
+        ++ told(|| {
+          sqlite::execute(conn, sqlite"pragma user_version = 3", roomy());
+          let rows = sqlite::query(conn, sqlite"pragma user_version", roomy());
+          f"{map(rows, |row: Row| sqlite::int(row, "user_version"))}"
+        }),
+      "a pragma that is refused -> "
+        ++ told(|| {
+          sqlite::execute(conn, sqlite"pragma journal_mode = delete", roomy());
+          "set"
+        }),
+      "a table that is not strict -> "
+        ++ told(|| {
+          sqlite::execute(conn, sqlite"create table loose (a)", roomy());
+          "made"
+        }),
+      "a backup -> "
+        ++ told(|| {
+          sqlite::backup(conn, "copy.db");
+          "copied"
+        }),
+      "a backup over one -> "
+        ++ told(|| {
+          sqlite::backup(conn, "copy.db");
+          "copied"
+        }),
+      "a backup inside a transaction -> "
+        ++ told(||
+          sqlite::transaction(conn, || {
+            sqlite::backup(conn, "other.db");
+            "copied"
+          })),
+    ]
+  };
+  let together = with_hold[one](sqlite::opening[d]("app.db", ReadWrite, plain()), |c|
+    sqlite::close(c)) { one ->
+    with_hold[two](sqlite::opening[d]("app.db", ReadWrite, plain()), |c| sqlite::close(c)) { two ->
+      [
+        "a writer's transaction, read from beside it -> "
+          ++ told(||
+            sqlite::transaction(one, ||
+              added(one, "Margaret") ++ ", beside it " ++ names(two) ++ ", a second writer "
+                ++ told(|| added(two, "Frances"))
+                ++ ", a second transaction "
+                ++ told(|| sqlite::transaction(two, || "begun")))),
+        "after its commit -> " ++ told(|| names(two)),
+        "a snapshot, written beside -> "
+          ++ told(||
+            sqlite::snapshot(one, ||
+              names(one) ++ ", beside it " ++ told(|| added(two, "Frances")) ++ ", still "
+                ++ names(one)
+                ++ ", its own write "
+                ++ told(|| added(one, "Jean")))),
+      ]
+    }
+  };
+  let reading = with_hold[reading](
+    sqlite::opening[d]("app.db", ReadOnly, plain()),
+    |c| sqlite::close(c),
+  ) { conn ->
+    [
+      "read back -> " ++ told(|| names(conn)),
+      "a write where only reads were asked for -> " ++ told(|| added(conn, "Kathleen")),
+      "a transaction where only reads were asked for -> "
+        ++ told(|| sqlite::transaction(conn, || "begun")),
+      "a snapshot where only reads were asked for -> "
+        ++ told(|| sqlite::snapshot(conn, || names(conn))),
+    ]
+  };
+  let copied = told(||
+    with_hold[copied](sqlite::opening[d]("copy.db", ReadOnly, plain()), |c|
+      sqlite::close(c)) { conn -> names(conn) });
+  let closed = told(|| {
+    let kept = with_hold[leaving](sqlite::opening[d]("app.db", ReadOnly, plain()), |c|
+      sqlite::close(c)) { conn -> hold_get(conn) };
+    with_hold[left](kept, |_: Connection<[d]>| ()) { conn -> names(conn) }
+  });
+  fold(
+    [first, together, reading, ["the copy -> " ++ copied, "a closed connection -> " ++ closed]],
+    ["open what is not there -> " ++ missing],
+    |all: List<String>, lines: List<String>|
+      fold(lines, all, |acc: List<String>, line: String| push(acc, line)),
+  )
+}
+
+test/nondet "the database's twin answers every operation as a file does" {
+  fresh();
+  let disk = script[cwd]();
+  let twin = sqlite::in_memory[cwd](|| script[cwd]());
+  match first_difference(disk, twin) { Some(why) -> panic(why), None -> () };
+  let everyone = "[\"Ada\", \"Grace\", \"Edsger\", \"Barbara\", \"Margaret\"]";
+  map(
+    [
+      "open what is not there -> Unopened(\"unable to open database file\")",
+      "insert Grace -> 1 row, id 2",
+      "insert Ada again -> Constraint(Unique, \"person.name\")",
+      "insert a negative age -> Constraint(Check, \"age >= 0\")",
+      "insert text for an age -> Constraint(Datatype, \"person.age\")",
+      "an age and a null -> [Some(36), None]",
+      "a null read as an integer -> Mistyped(\"age\", \"an integer\")",
+      "run a failure -> unique person.name",
+      "a transaction that raises -> Constraint(Unique, \"person.name\"), then [\"Ada\", \"Grace\", \"Edsger\"]",
+      "over the steps -> Over(\"steps\")",
+      "a fold -> AGEB",
+      "a fold past its rows -> Over(\"rows\")",
+      "a date that reads no clock -> [\"2024-03-01\"]",
+      "a pragma that is set -> [3]",
+      "a backup inside a transaction -> Malformed(\"cannot VACUUM from within a transaction\")",
+      "a writer's transaction, read from beside it -> 1 row, id 5, beside it [\"Ada\", \"Grace\", \"Edsger\", \"Barbara\"], a second writer Busy, a second transaction Busy",
+      "after its commit -> " ++ everyone,
+      "a snapshot, written beside -> " ++ everyone ++ ", beside it 1 row, id 6, still " ++ everyone
+        ++ ", its own write Busy",
+      "a transaction where only reads were asked for -> begun",
+      "the copy -> [\"Ada\", \"Grace\", \"Edsger\", \"Barbara\"]",
+    ],
+    |line: String| assert(contains(twin, line), Some("neither answered: " ++ line)),
+  );
+  ()
+}
+
+test/nondet "a database written and closed is a file under its root, read back when it is opened again" {
+  fresh();
+  let wrote = told(|| {
+    with_hold[writing](sqlite::opening[cwd]("kept.db", Create, plain()), |c|
+      sqlite::close(c)) { conn -> {
+      sqlite::execute(
+        conn,
+        sqlite"create table person (id integer primary key, name text not null) strict",
+        roomy(),
+      );
+      added(conn, "Ada") ++ ", " ++ added(conn, "Grace")
+    } }
+  });
+  assert_eq(wrote, "1 row, id 1, 1 row, id 2");
+  assert_eq(fs.read_at[cwd]("kept.db", 0, 16), Some(b"SQLite format 3\x00"));
+  let read = told(||
+    with_hold[reading](sqlite::opening[cwd]("kept.db", ReadOnly, plain()), |c|
+      sqlite::close(c)) { conn -> names(conn) });
+  assert_eq(read, "[\"Ada\", \"Grace\"]")
+}
+
+// A `test`, not a `test/nondet`: over the twin the script's row holds nothing of the world.
+test "over the twin the script answers the same lines every time" {
+  let twice = map([0, 1], |_: Int| sqlite::in_memory[cwd](|| script[cwd]()));
+  assert_eq(list_at(twice, 0), list_at(twice, 1))
+}
+
+/// A program that sums a table over the twin, `inserting` what its one write is.
+fn summing(inserting: String) -> List<Source> =
+  [
+    {
+      path: "m.ply",
+      text:
+        \\import std.db (PInt, Row)
+        \\import std.sqlite
+        \\import std.sqlite (sql, Create)
+        \\
+        \\fn main() -> Int / {sql.refused, abort.raise} =
+        \\  sqlite::in_memory[app](||
+        \\    with_hold[db](sqlite::opening[app]("a.db", Create, { strict: true, busy_ms: 0, statements: 4 }), |c| sqlite::close(c)) { conn -> {
+        \\      let limits = { sql_bytes: 1000, params: 10, rows: 10, bytes: 1000, steps: 1000 };
+        \\      sqlite::execute(conn, sqlite"create table t (n integer) strict", limits);
+        ++ "\n      sqlite::execute(conn, "
+        ++ inserting
+        ++ ", limits);\n"
+        ++
+        \\      fold(sqlite::query(conn, sqlite"select n from t", limits), 0, |acc: Int, row: Row|
+        \\        acc + sqlite::int(row, "n"))
+        \\    } })
+        \\
+        ,
+    },
+  ]
+
+test "a program runs over the twin with no host, and a refused statement is a check error in its text" {
+  let ran = in_memory(tree(summing("sqlite\"insert into t values ({PInt(41)}), ({PInt(1)})\"")), [
+    "run",
+  ]);
+  assert_ok(ran);
+  assert(string_contains(stdout(ran), "42"), Some(said(ran)));
+  let v = json_of(
+    in_memory(tree(summing("sqlite\"insert into t values ({PInt(41)}), (random())\"")), [
+      "check",
+      "--json",
+    ]),
+  );
+  assert_eq(codes(v), ["E0153"]);
+  let label = nth(at(diagnostic(v), "labels"), 0);
+  assert(
+    string_contains(str(at(label, "message")), "`random` is not a function of the program's state"),
+  );
+  assert_eq(str(at(label, "snippet")), "r")
+}
