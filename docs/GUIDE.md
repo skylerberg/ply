@@ -2070,8 +2070,10 @@ is the clock, the network, a program other than `ply`, or what a run keeps for t
 `filed_under` in `--json`, and the code it ran), and where the run's time went, phase by phase
 from the process's start (`phases` in the `--json` report);
 `--filter SUBSTRING` matches `<module>.<label>`, and repeated it runs every test
-any of them matches; `--no-cache` bypasses both the result and the front-end
-cache.
+any of them matches; `--shard K/N` runs part K of N of what the rest selects,
+parted by a hash of each key, so a test is in the same part every run and the
+runs `1/N` to `N/N` run each test once; `--no-cache` bypasses both the result
+and the front-end cache.
 
 A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
 its test's, which covers the body and the case's type and neither the table nor
@@ -2079,9 +2081,9 @@ the label, taken with the case's value as built. A case added to the table runs
 alone, wherever it is added; a reordered table or a reworded label runs
 nothing; an edit to the body runs every case, and an edit to what the table is
 built from runs the cases whose values it changed. Its label is the one its
-holes make, which is what `--filter` reads. Listing the cases runs the table,
-so a run that reports on a test over cases builds the program even when every
-case stands on a pass.
+holes make, which is what `--filter` and `--shard` read. Listing the cases runs
+the table, so a run that reports on a test over cases builds the program even
+when every case stands on a pass.
 
 ### 8.3 Determinism
 
@@ -2466,7 +2468,8 @@ clauses unless it is `transparent` too. `std.laws` ships the schemas the
 standard library states its laws with (`ply doc std.laws`).
 
 A definition of another package
-— a dependency's, or outside `--std` a shipped module's — is claimed by its
+— a dependency's, a compiler module's the library ships, or outside `--std` a
+standard library module's — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
 unfolds its body, which that package's own run proves. A `transparent fn` is
 claimed by its body too: a proof anywhere may unfold it, so its body, and all
@@ -2485,8 +2488,9 @@ and a `summary` — and `summary` counts defects as `defect`. A claim's type
 variables are lettered by where they first appear among
 its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
 (`a := Int`), and a proof leaves each an uninterpreted sort
-(`uninterpreted a, b`). Flags: `--prove-cases N` (below 25 kept cases only `example`),
-`--prove-roots N`, `--prove-budget N` (spent reports `property`),
+(`uninterpreted a, b`). Flags: `--filter SUBSTRING` (the obligations whose
+owner's name holds it; repeated, those any of them matches),
+`--prove-cases N` (below 25 kept cases only `example`), `--prove-roots N`, `--prove-budget N` (spent reports `property`),
 `--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
 1000000000; an evaluation past it leaves the obligation `unattempted`, and the
 number keys the cached result, so more budget is a stronger claim). A `proved`
@@ -3026,7 +3030,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
