@@ -1990,13 +1990,15 @@ sweep_filter() {
   local path=$1 module
   case $path in
     examples/*/*) ;;
-    examples/*.ply) printf 'edit_sweep.editing %s with \n' "$path" ;;
+    examples/*.ply) printf 'edit_sweep.editing %s with \n' "${path%.ply}" ;;
     crates/ply-compiler/ply/*/*) ;;
-    crates/ply-compiler/ply/*.ply) printf 'edit_sweep.editing compiler/%s with \n' "${path#crates/ply-compiler/ply/}" ;;
+    crates/ply-compiler/ply/*.ply)
+      module=${path#crates/ply-compiler/ply/}
+      printf 'edit_sweep.editing compiler/%s with \n' "${module%.ply}"
+      ;;
     crates/ply-std/ply/*.ply)
       module=${path#crates/ply-std/ply/}
-      module=${module%.ply}
-      printf 'edit_sweep.editing std.%s with \n' "${module//\//.}"
+      printf 'edit_sweep.editing std/%s with \n' "${module%.ply}"
       ;;
   esac
 }
