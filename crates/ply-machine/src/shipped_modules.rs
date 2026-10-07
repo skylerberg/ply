@@ -31,18 +31,21 @@ pub fn is_shipped_name(name: &str) -> bool {
     ply_eval::host::is_std(name) || is_compiler(name)
 }
 
-/// Every shipped module's name: the standard library's, the compiler's, then what the compiler
+/// Every shipped module's name: the standard library's, each file at or below its tree named by its
+/// place there (`hash/legacy.ply` is `std.hash.legacy`), the compiler's, then what the compiler
 /// embeds from beside its package. No text is read.
 pub fn names() -> Vec<String> {
     let pack = ply_pack::installed();
-    let named = |root: &'static str, dir: &'static str| {
-        pack.files_in(dir).filter_map(move |path| {
-            let stem = path[dir.len() + 1..].strip_suffix(".ply")?;
-            Some(format!("{root}.{stem}"))
-        })
+    let named = |root: &'static str, dir: &'static str, path: &str| {
+        let stem = path[dir.len() + 1..].strip_suffix(".ply")?;
+        Some(format!("{root}.{}", stem.replace('/', ".")))
     };
-    named(STD_ROOT, ply_pack::STD)
-        .chain(named(COMPILER_ROOT, ply_pack::COMPILER))
+    pack.modules_below(ply_pack::STD)
+        .filter_map(|path| named(STD_ROOT, ply_pack::STD, path))
+        .chain(
+            pack.files_in(ply_pack::COMPILER)
+                .filter_map(|path| named(COMPILER_ROOT, ply_pack::COMPILER, path)),
+        )
         .chain([format!("{COMPILER_ROOT}.{PRELUDE_NAME}")])
         .collect()
 }
@@ -74,7 +77,7 @@ fn path_of(module: &str) -> Option<String> {
         (COMPILER_ROOT, stem) => (ply_pack::COMPILER, stem),
         _ => return None,
     };
-    Some(format!("{dir}/{stem}.ply"))
+    Some(format!("{dir}/{}.ply", stem.replace('.', "/")))
 }
 
 pub fn source(module: &ModuleName) -> Option<&'static str> {

@@ -618,6 +618,11 @@ kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
 (§8.4), evaluates the body in its place, once a run, as it does any definition
 that takes nothing; the value is the same either way, since the body is pure.
 
+A `const fn` whose type is `std.sql.Schema` is a schema: the statements of the
+module that declares it, and of every module that imports that one at any
+depth, are checked against it before anything runs (§16). A module whose
+statements reach two is `E0471`.
+
 A value is kept as it is laid out, so a table that is compact is one that reads
 quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
 width below 64 is held in that word: an `Array` of those is one object, kept as
@@ -2605,6 +2610,7 @@ derive json for Line
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 | `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
+| `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
 
 There are no other derivers (`E0207`). `snake_case` is `std.text`'s, so a
 name collision (`HTTPRequest` and `HttpRequest` both give `http_request`) is
@@ -2647,6 +2653,29 @@ key answers, and one that states a `show` derives `show` from that function: the
 dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
 and `bin` encode the fields as they are.
 
+`row` is a record's row in a SQL table, a column per field under the field's
+name, read and written in the order the fields are declared:
+
+```ply
+import std.sql
+import std.json
+
+pub type Line = { sku: String, qty: Int }
+pub type Order = { id: Int, customer: String, note: Option<String>, lines: List<Line> }
+derive json for Line
+derive row for Order
+// order_row : () -> sql::RowCodec<Order>
+```
+
+A `String`, `Int`, `Bool`, `Float`, `Decimal` or `Bytes` field is the column of
+that type, an `Option` one that may be null, a `List` of those an array, a
+`json::Json` the document it holds, and any other field a `jsonb` document read
+and written through its type's own `json` codec, which the module must import
+`std.json` for and derive. The derivation needs `import std.sql`; a sum, a type
+with parameters and an empty record have no row (`E0206`), and `row` is no
+constraint a `where` can name (`E0207`). The codec's `fields` are what a check
+holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
+
 ## 12. Builtins
 
 The functions every module calls without importing them. Each is declared in the
@@ -2684,8 +2713,10 @@ needle, an `iterate` past its budget, `int_of_u64` of a value past an `Int`.
 
 The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
-std.<name>`. Its tests and obligations are no project's: `ply test`, `ply prove`
-and `ply review` skip them unless you pass `--std`, which adds those of every
+std.<name>`, a name having more segments where a module sits beneath another
+(`std.hash.legacy` beside `std.hash`). Its tests and obligations are no
+project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
+`--std`, which adds those of every
 module `ply std` lists, whichever of them the project imports.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
@@ -3225,6 +3256,35 @@ A module that declares one is read as its stub like any other: the value is the
 definition's, wherever its body is read from. `compiler.load` evaluates none, and
 there a `const fn` is a definition that takes nothing, evaluated once a run.
 
+The same commands then check the statements the root package's modules run:
+each `db.query`, `db.batch`, `db.execute`, `db.returning` and `db.copy_out`,
+`std.db`'s `fetch` and `fetch_returning`, and `std.sqlite`'s `query`, `execute`,
+`returning`, `run` and `fold_rows`, whose statement a check can compute before
+anything runs: text, joined by `++` or not, a call of a definition on such
+values, `sqlite::bound` of one, or a tagged literal. Each definition the
+statement is computed by is entered on a machine of its own under the literals'
+budget, and the schema the statement's module reaches with them (§3.5); one that
+raises leaves the statement to the run. A module that runs a statement is read
+from its source by every check, never as its stub. The statement is held to its
+call:
+text the reader refuses is `E0431`, tables that do not include the table the
+label names `E0435`, a statement the operation does not perform (a write run as a
+query, a read or one with `returning` run as `execute`, one without it run as
+`returning`) `E0436`, and parameters the call writes as a list, more or fewer
+than the placeholders, `E0438`. Against the schema it is also read for every
+table and column it names (`E0433`); a `*` is `E0447`; a construct the check does
+not follow (a `with`, a set operation, a subquery in `from`, a window, `on
+conflict`) is `E0470` where the check stops; a parameter written as a `Param`
+constructor that is not the type of the column it is compared with, stored in or
+bounds is `E0438`; and the columns a `fetch` answers are held to the fields of
+the row its codec reads, when `derive row` wrote it (§11), by name, by type and
+by null, a `left join` making the joined table's columns ones that may be null
+(`E0437`). Each is reported at the call, with the statement's text, where it
+comes from and the schema. What the check found is kept in the toolchain's cache
+under the hashes of all the statement and the schema reach, and is asked again
+only after an edit to one of them; `std.db` holds a statement the check could not
+compute to the same rules when it runs it, and raises.
+
 `ply fmt` keeps comments, the spelling of every literal, and the order of
 imports, items and statements, and keeps a doc comment directly above what it
 documents; it prints `formatted PATH` per file it changed
@@ -3391,6 +3451,12 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0428` | `blocking` host handler answered inline |
 | `E0429` | `net.listen_tls` named a credential the run lacks |
 | `E0430` | `--tls` credential, or certificate to trust, that does not load |
+| `E0431` | a statement the reader refuses, found before it runs |
+| `E0433` | a statement that names a table or column the schema does not declare |
+| `E0435` | a statement whose tables do not include the table its call's label names |
+| `E0436` | a statement the call does not perform: a write run as a query, or the like |
+| `E0437` | columns a statement answers that disagree with the row type it is read into |
+| `E0438` | parameters or values that disagree in number or type with the placeholders and columns they fill |
 | `E0439` | `Secret` passed to a host operation not allowed one |
 | `E0440` | configuration source unreadable |
 | `E0441` | required configuration key missing |
@@ -3399,6 +3465,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
 | `E0446` | value outlives its region |
+| `E0447` | a statement checked against the schema that answers `*` |
 | `E0448` | definition the C backend cannot compile |
 | `E0449` | region handle or continuation reaching a runtime boundary |
 | `E0450` | compiled backend cannot be attached |
@@ -3421,6 +3488,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
 | `E0468` | `cost` bound on a definition whose row says it may not return |
 | `E0469` | a test's table or label that performs more than raises |
+| `E0470` | a statement checked against the schema written past what the check follows |
+| `E0471` | a module whose statements reach two `const fn`s of `std.sql.Schema` |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
 | `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
 | `E0501` | assertion failed |
