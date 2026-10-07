@@ -359,6 +359,42 @@ fn a_text_that_enters_what_a_built_program_does_is_not_built_again() {
     );
 }
 
+/// A program this tree's builder makes holds each `const fn` as the value it answered when the
+/// program was built, as a bootstrapped one does, so a run computes none: entered with fewer calls
+/// than the table takes to make, the program still answers from it. One that raises is left to its
+/// body, which raises where the program reaches it.
+#[test]
+fn a_program_this_trees_builder_makes_holds_its_constants() {
+    let stage = ply_codegen::c::stage::stage_dir(&format!("held-constants-{}", std::process::id()));
+    let runnable = built_by_own(
+        &stage,
+        "held",
+        "const fn table() -> List<Int> = map(range(0, 20000), |i: Int| i * 2)\n\nconst fn wrong() -> Int = 7 / (bytes_len(b\"\") - 0)\n\npub fn main() -> Int = len(table())\n",
+    );
+    let _ = std::fs::remove_dir_all(&stage);
+    let program = ply_machine::runnable::decode(&runnable)
+        .unwrap_or_else(|why| panic!("the runnable reads: {why}"));
+    assert_eq!(
+        program.unit.matches("rt_baked_p(").count(),
+        1,
+        "the unit holds the table's value and leaves the definition that raises to its body"
+    );
+    let front = program.front.answer;
+    let unit =
+        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
+    let mut machine =
+        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+    let answer =
+        ply_codegen::rt::with_step_budget(1000, || machine.call("m.main", Vec::new(), Span::DUMMY))
+            .into_parts()
+            .0
+            .unwrap_or_else(|d| panic!("the program answers from the table it holds: {d}"));
+    assert!(
+        matches!(answer, ply_eval::Value::Int(20000)),
+        "the table holds what its body makes"
+    );
+}
+
 /// The value a runnable's `m.main` answers.
 fn answer_of(runnable: &[u8]) -> ply_eval::Value {
     let program = ply_machine::runnable::decode(runnable)
