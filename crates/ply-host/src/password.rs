@@ -492,10 +492,7 @@ fn narrow(n: i64) -> Result<u32, String> {
 /// A credential's bytes, which only this side of the boundary reads.
 fn opened(v: &Value, op: Op, span: Span) -> Result<&[u8], Diagnostic> {
     match v {
-        Value::Secret(held) => match &**held {
-            Value::Bytes(b) => Ok(b),
-            _ => Err(unsealed(op, span)),
-        },
+        Value::Secret(held) if !held.is_text() => Ok(held.bytes()),
         _ => Err(unsealed(op, span)),
     }
 }

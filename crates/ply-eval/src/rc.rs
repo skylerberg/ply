@@ -165,7 +165,6 @@ fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
         }),
         Value::Record(fields) => fields.values().any(|x| reaches_cell(x, slot, next, budget)),
         Value::Ctor { args, .. } => args.iter().any(|x| reaches_cell(x, slot, next, budget)),
-        Value::Secret(inner) => reaches_cell(inner, slot, next, budget),
         _ => false,
     }
 }
