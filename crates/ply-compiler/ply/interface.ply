@@ -14,7 +14,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_inter
               analyse_with, dump_of, test_owners, test_check_key, known_def_row_bin, Cut, cut_bin,
               cuts_of, body_cuts_of, Dump, ModuleRow, Rows, checked_staged, no_rows, rows_of,
               staged_pulling_std_with, embed_slot, shipped_hashes, analyse_pulling_std_with,
-              ShippedData, embeds_now)
+              ShippedData, embeds_now, in_order)
 
 import infer (DefInfo, test_owner)
 import rewrite (has_tagged)
@@ -349,6 +349,16 @@ pub fn with_embeds(
         }
       }))
 
+/// The cuts a package's stub of the module at `i` is made with: the bodies the analysis read, and
+/// every test and law the module's text holds, which the load may have left out of what it read.
+fn package_cuts(analysis: Analysis, i: Int) -> List<Cut> / {abort.raise} = {
+  let read = cuts_of(at(analysis.mods, i));
+  match map_get(analysis.left_out, at(analysis.mods, i).name) {
+    None -> read,
+    Some(items) -> in_order(filter(read, |c: Cut| c.braced), items),
+  }
+}
+
 /// A module `analysis` read through `through`, or never reached, is carried over whole: what a
 /// package fixes of a module is its own, and a load that reads a shipped module for what it reaches
 /// has rows for only that, which are not the ones its stub was cut for.
@@ -391,7 +401,7 @@ pub fn compile_package(
     modules: map(fresh, |name: Bytes|
       match ((map_get(originals, name), map_get(index, name))) {
         (Some(o), Some(i)) -> {
-          let cuts = cuts_of(at(analysis.mods, i));
+          let cuts = package_cuts(analysis, i);
           {
             name: name,
             stub: stubbed(o.src, cuts),
@@ -524,7 +534,7 @@ pub fn kept_modules(
             cuts: match map_get(analysis.stub_cuts, name) {
               Some(cuts) -> cuts,
               None -> if own { body_cuts_of(at(analysis.mods, i)) }
-              else { cuts_of(at(analysis.mods, i)) },
+              else { package_cuts(analysis, i) },
             },
           },
       }
@@ -1249,6 +1259,44 @@ test "a stub that reaches a shipped module still stands where that module only g
     b"std.r",
     b"std.s",
   ])
+}
+
+test "a package's stub of a shipped module leaves out its tests and laws though the load left them out of what it read" {
+  let r: Source = {
+    name: b"std.r",
+    src: b"pub fn used() -> Int = 1 + 0\n\ntest \"used is one\" {\n  assert_eq(used(), 1)\n}\n\nlaw \"used is positive\"\n  forall (n: Int) {\n    used() > 0\n  }\n",
+  };
+  let app: Source = { name: b"app", src: b"import std.r (used)\npub fn f() -> Int = used()\n" };
+  let checked = whole_of(analyse_pulling_std_with([app], [r], [], []).out);
+  let built = whole_of(
+    checked_staged(
+      staged_pulling_std_with(
+        [app],
+        [r],
+        { root: b"", manifest: None, supplied: [] },
+        no_interfaces(),
+        [],
+        [],
+        false,
+      ),
+      [],
+      [],
+    ).out,
+  );
+  let items = |cuts: List<Cut>| len(filter(cuts, |c: Cut| !c.braced));
+  let stubs = map([checked, built], |w: Analysis|
+    at(compile_package([original(r)], w, [b"std.r"]).modules, 0));
+  assert_eq(map(stubs, |m: CompiledModule| items(m.cuts)), [2, 2]);
+  assert_eq(map(stubs, |m: CompiledModule| bytes_index_of(m.stub, b"used is")), [None, None]);
+  assert_eq(
+    map([checked, built], |w: Analysis|
+      map(
+        filter(kept_modules([original(app), original(r)], w).modules, |m: CompiledModule|
+          m.name == b"std.r"),
+        |m: CompiledModule| items(m.cuts),
+      )),
+    [[2], [2]],
+  )
 }
 
 test "a build's kept module stands where a shipped module it reaches only gained a function" {
