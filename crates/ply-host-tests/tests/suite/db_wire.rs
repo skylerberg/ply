@@ -16,7 +16,7 @@ import std.db (db, with_server, transaction, copy_into, copy_from, ReadCommitted
 import std.sql (stmt, PInt, PText, PNull, PBytes, PArray, PNumeric, CInt, Rows, Count, Failed, Row, DbError)
 import std.seq (Seq, seq)
 
-effect set Wire = {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next}
+effect set Wire = {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next}
 
 fn served(answered: Result<Result<String, String>, String>) -> Result<String, String> =
   match answered { Err(why) -> Err(why), Ok(inner) -> inner }
