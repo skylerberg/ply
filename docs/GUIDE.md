@@ -86,8 +86,9 @@ re-checking-out a dependency keeps what was cached for it.
 
 ### 2.1 Source and identifiers
 
-Source is UTF-8; whitespace only separates tokens and there is no layout rule.
-A comment is `//` to end of line.
+Source is UTF-8, and one that is not is read up to its first byte that is no
+part of a character, which is `X0001`; whitespace only separates tokens and
+there is no layout rule. A comment is `//` to end of line.
 
 A *doc comment* documents a declaration for whoever calls or names it. `///`
 lines document the `fn`, `extern fn`, `type`, `effect`, effect operation, `effect

@@ -2455,40 +2455,32 @@ pub fn std_pkg() -> PackageDeps = { prefix: b"std", deps: [] }
 pub fn compiler_pkg() -> PackageDeps = { prefix: b"compiler", deps: [b"std"] }
 
 /// The packages of a load as the front end's tables take them: the root package first, then
-/// the closure's, then the built-in std, with the shipped modules past the end, and every module
-/// mapped to the package it was parsed from. The order is the root's modules, then the closure's
-/// dependency modules, then the pulled toolchain modules.
+/// the closure's, then the built-in std and the compiler, with the shipped modules past the end,
+/// and every module mapped to the package it was parsed from. The order is the root's modules, then
+/// the closure's dependency modules, then the pulled toolchain modules. The toolchain's own tree is
+/// the built-in std itself, so its table holds no second one: the compiler's modules it pulls
+/// import it as they import the built-in.
 fn pkg_tables(
   parsed: List<ParsedSource>,
   root_count: Int,
   clo: Closure,
   toolchain: Bool,
 ) -> { pkgs: List<PackageDeps>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int } / {abort.raise} = {
-  let std = if toolchain { 0 - 1 } else { len(clo.packages) };
-  let compiler = if toolchain { 0 - 1 } else { std + 1 };
+  let own = map(clo.packages, |package: Package| { prefix: package.prefix, deps: package.deps });
+  let std = if toolchain { len(own) - 1 } else { len(own) };
+  let compiler = std + 1;
   {
-    pkgs: if toolchain {
-      map(clo.packages, |package: Package| { prefix: package.prefix, deps: package.deps })
-    } else {
-      push(
-        push(
-          map(clo.packages, |package: Package| { prefix: package.prefix, deps: package.deps }),
-          std_pkg(),
-        ),
-        compiler_pkg(),
-      )
-    },
+    pkgs: push(if toolchain { own } else { push(own, std_pkg()) }, compiler_pkg()),
     // Pulled std publishes as the shipped modules (its internal imports are qualified), and pulled
     // compiler as its own package, which its bare sibling imports resolve against.
     module_packages: map(range(0, len(parsed)), |i: Int|
       if i < root_count { 0 }
       else if i < root_count + len(clo.modules) { at(clo.modules, i - root_count).pkg }
-      else if toolchain { len(clo.packages) }
-      else if is_compiler(at(parsed, i).name) { std + 1 }
-      else { std + 2 }),
+      else if is_compiler(at(parsed, i).name) { compiler }
+      else { compiler + 1 }),
     std: std,
     compiler: compiler,
-    shipped: if toolchain { len(clo.packages) } else { std + 2 },
+    shipped: compiler + 1,
   }
 }
 
@@ -3974,6 +3966,29 @@ pub fn parse_shipped(
 /// that renders one needs both lists.
 pub type Pulled = { pulled: List<Bytes>, out: AnalysisOutcome, viewed: List<ShippedView> }
 
+/// Modules of the standard library analysed apart from any program, as the toolchain's own tree is:
+/// each of `modules` whole, what it embeds read from what the shipped modules hold, and the
+/// compiler's modules they import pulled, with what those import in turn, each read for what is
+/// reached of it. `modules` holds every standard-library module one of them imports; `shipped`
+/// every shipped module and `data` each data file `modules` embed.
+pub fn analyse_shipped(
+  modules: List<Source>,
+  shipped: List<Source>,
+  data: List<ShippedData>,
+) -> Pulled / {abort.raise} = {
+  let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let held = data_held(data);
+  let embeds = fold(modules, [], |acc: List<Embedded>, module: Source|
+    fold(embeds_wanted(b"", [module]), acc, |a: List<Embedded>, asked: Embedded|
+      push(a, { ..asked, read: shipped_read(whole, held, module.name, asked.want) })));
+  checked_staged(
+    staged_pulling_std_with(modules, shipped, embeds: embeds, data: data, apart: true),
+    [],
+    [],
+  )
+}
+
 pub fn analyse_pulling_std(user: List<Source>, shipped: List<Source>) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(user, shipped, [], [])
 
@@ -4040,13 +4055,17 @@ pub fn staged_pulling_std_with(
   // (`shipped_pulled`).
   unread: List<Bytes> = [],
   // Whether a shipped module is read only for what the program reaches. `ply test --std` reads
-  // every one whole, its tests and laws among them, and the toolchain's own tree always does.
+  // every one whole, its tests and laws among them; the toolchain's own tree is whole as any root
+  // is, and what it pulls of the compiler is read for what it reaches.
   reached: Bool = true,
   // The data files the modules of `shipped` embed (`shipped_pulled`).
   data: List<ShippedData> = [],
   // Shipped modules pulled whatever the program imports: `ply test --std` asks for every module of
   // the standard library.
   asked: List<Bytes> = [],
+  // Whether `user` is modules of the standard library read apart from any program: they load as
+  // the toolchain's own tree does, though they are not the whole of it.
+  apart: Bool = false,
   // What each module's text says it pulls, which a stub of it no longer says (`shipped_pulled`).
   pulls: List<ModulePulls> = [],
 ) -> Staged / {abort.raise} = {
@@ -4083,8 +4102,9 @@ pub fn staged_pulling_std_with(
   // with the whole shipped set among them is the built-in package's sources.
   let listed = concat(map(shipped, |s: Source| s.name), unread);
   let toolchain = fold(user, true, |acc: Bool, s: Source| acc && is_std(s.name))
-    && fold(listed, true, |acc: Bool, name: Bytes|
-      acc && (!is_std(name) || list::contains(map(user, |u: Source| u.name), name)));
+    && (apart
+    || fold(listed, true, |acc: Bool, name: Bytes|
+      acc && (!is_std(name) || list::contains(map(user, |u: Source| u.name), name))));
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let x = pulling(
@@ -4115,7 +4135,8 @@ pub fn staged_pulling_std_with(
   let whole_load = if len(x.diags) > 0 { Err(x.diags) } else { hashed(x.parsed) };
   match whole_load {
     Err(diags) -> { pulled: x.pulled, hashed: Err(diags), viewed: [] },
-    Ok(h) -> if !reached || toolchain { { pulled: x.pulled, hashed: Ok(h), viewed: [] } } else {
+    Ok(h) -> if !reached || len(x.pulled) == 0 { { pulled: x.pulled, hashed: Ok(h), viewed: [] } }
+    else {
       let reach = reach_of(h);
       {
         pulled: x.pulled,
@@ -6060,6 +6081,41 @@ test "a shipped compiler module is pulled in under the compiler's root" {
   assert_eq(a.pulled, [b"compiler.a", b"compiler.b"]);
   assert_eq(a.dump.diags, []);
   assert_eq(len(filter(a.dump.defs, |row: DefRow| row.name == b"compiler.a.first")), 1)
+}
+
+/// A library module that calls into the compiler, whose modules name one another bare and import
+/// the library back.
+fn library_over_compiler() -> List<Source> =
+  [
+    { name: b"std.base", src: b"pub fn one() -> Int = 1" },
+    {
+      name: b"std.reader",
+      src: b"import compiler.a (first)\nimport std.base (one)\npub fn read() -> Int = first() + one()",
+    },
+    {
+      name: b"compiler.a",
+      src: b"import b (second)\nimport std.base (one)\npub fn first() -> Int = second() + one()\npub fn unreached() -> Int = 0",
+    },
+    { name: b"compiler.b", src: b"import std.deep (two)\npub fn second() -> Int = two()" },
+    { name: b"std.deep", src: b"pub fn two() -> Int = 2\npub fn idle() -> Int = 0" },
+  ]
+
+test "library modules read apart pull the compiler's modules they import, and what those import, each for what is reached" {
+  let all = library_over_compiler();
+  let own = filter(all, |s: Source| s.name == b"std.base" || s.name == b"std.reader");
+  let pulled = analyse_shipped(own, all, []);
+  assert_eq(pulled.pulled, [b"compiler.a", b"compiler.b", b"std.deep"]);
+  let d = dump_of(pulled.out);
+  assert_eq(d.diags, []);
+  assert_eq(map(d.defs, |row: DefRow| row.name), [
+    b"std.base.one",
+    b"std.reader.read",
+    b"compiler.a.first",
+    b"compiler.b.second",
+    b"std.deep.two",
+  ]);
+  assert_eq(d.packages, [{ prefix: b"", deps: [] }, { prefix: b"compiler", deps: [b"std"] }]);
+  assert_eq(d.module_packages, [0, 0, 1, 1, 2])
 }
 
 fn messages(d: Dump) -> List<Bytes> = map(d.diags, |diag: Diag| diag.message)
