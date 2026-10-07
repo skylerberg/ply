@@ -8,8 +8,8 @@
 //!
 //! Over a list, `option_all` answers every value or nothing and reads nothing past the first `None`.
 //! `option_traverse` maps and gathers in one pass and `option_try_fold` threads a state: neither
-//! calls its callback past the first `None`, and each is a `fold` underneath, so a definition that
-//! recurses through the callback is seen to end as it is through `fold`.
+//! reads past the first `None`, and a definition that recurses through the callback of either is
+//! seen to end as it is through `fold`.
 
 import std.laws (agrees, inverse)
 
@@ -75,6 +75,11 @@ pub fn option_zip<a, b>(o: Option<a>, p: Option<b>) -> Option<(a, b)> =
 pub fn option_flatten<a>(o: Option<Option<a>>) -> Option<a> =
   match o { None -> None, Some(inner) -> inner }
 
+/// The value as a list of one, or the empty list: what a list of options is gathered through.
+pub fn option_to_list<a>(o: Option<a>) -> List<a>
+  returns fresh
+= match o { None -> [], Some(x) -> [x] }
+
 /// The layers the other way round: a missing value is a success that holds none, and a failure
 /// stays the failure. `std.result`'s `result_transpose` goes back.
 pub fn option_transpose<a, e>(o: Option<Result<a, e>>) -> Result<Option<a>, e> =
@@ -89,16 +94,31 @@ pub fn option_try_fold<a, s | e>(
 ) -> Option<s> / e
   cost len(xs) * k
 =
-  fold(xs, Some(init), |acc: Option<s>, x: a|
-    match acc { None -> None, Some(state) -> f(state, x) })
+  match xs {
+    [] -> Some(init),
+    [x, ..rest] -> match f(init, x) {
+      None -> None,
+      Some(state) -> option_try_fold(rest, state, f),
+    },
+  }
 
-/// `f` of each element in order, or `None` where `f` answers none. `f` is not called past its
-/// first `None`.
+/// `f` of each element in order, or `None` where `f` answers none. Nothing past the first `None`
+/// is read.
 pub fn option_traverse<a, b | e>(xs: List<a>, f: (a) -> Option<b> / e cost k) -> Option<List<b>> / e
   cost len(xs) * k
+= traversed(xs, f, [])
+
+fn traversed<a, b | e>(
+  xs: List<a>,
+  f: (a) -> Option<b> / e cost k,
+  done: List<b>,
+) -> Option<List<b>> / e
+  cost len(xs) * k
 =
-  option_try_fold(xs, [], |done: List<b>, x: a|
-    match f(x) { None -> None, Some(y) -> Some(push(done, y)) })
+  match xs {
+    [] -> Some(done),
+    [x, ..rest] -> match f(x) { None -> None, Some(y) -> traversed(rest, f, push(done, y)) },
+  }
 
 /// Every value in order, or `None` where one is missing. What follows the first `None` is not
 /// read.
@@ -169,6 +189,14 @@ test "a callback may perform effects, and runs only where the value calls for it
   assert_eq(calls, 2)
 }
 
+test "an option is a list of at most one, and a list of options gathers into the values there" {
+  assert_eq(option_to_list(Some(3)), [3]);
+  assert_eq(option_to_list(None), []);
+  let gathered = fold([Some(1), None, Some(2)], [], |acc: List<Int>, o: Option<Int>|
+    fold(option_to_list(o), acc, |xs: List<Int>, x: Int| push(xs, x)));
+  assert_eq(gathered, [1, 2])
+}
+
 test "a nested option flattens to its inner one, and the layers of a result swap" {
   assert_eq(option_flatten(Some(Some(1))), Some(1));
   let inner_missing: Option<Option<Int>> = Some(None);
@@ -210,6 +238,21 @@ test "a walk calls nothing past the first element that answers none" {
     cell_get(c)
   } };
   assert_eq(calls, 2)
+}
+
+test "a traverse and a fold that answer none first take the same steps whatever follows" {
+  let short = [0 - 1, 2, 4, 6];
+  let long = fold(range(0, 4000), [0 - 1], |acc: List<Int>, i: Int| push(acc, i));
+  let kept = |x: Int| if x < 0 { None } else { Some(x) };
+  let stepped = |sum: Int, x: Int| if x < 0 { None } else { Some(sum + x) };
+  assert_eq(
+    metered(|| option_traverse(long, kept)).steps,
+    metered(|| option_traverse(short, kept)).steps,
+  );
+  assert_eq(
+    metered(|| option_try_fold(long, 0, stepped)).steps,
+    metered(|| option_try_fold(short, 0, stepped)).steps,
+  )
 }
 
 type Nested = | Leaf(Int) | Branch(List<Nested>)

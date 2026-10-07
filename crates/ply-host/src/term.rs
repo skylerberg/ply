@@ -148,7 +148,9 @@ impl HostHandler for Operation {
                     Box::new(|| match stdio::read_line() {
                         // A line nothing but `Secret`'s own readers may read; `None` at the end.
                         Ok(line) => JobOutput::built(move || {
-                            option(line.map(|line| Value::secret(Value::str(line))))
+                            option(
+                                line.map(|line| Value::secret_text(&zeroize::Zeroizing::new(line))),
+                            )
                         }),
                         Err(e) => {
                             JobOutput::Failed(format!("standard input could not be read: {e}"))

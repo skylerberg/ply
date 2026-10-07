@@ -195,6 +195,8 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.recv[listener] ply_host::tcp::recv",
             "std.net.net.send[conn] ply_host::tcp::send",
             "std.net.net.send[listener] ply_host::tcp::send",
+            "std.net.net.send_secret[conn] ply_host::tcp::send_secret",
+            "std.net.net.send_secret[listener] ply_host::tcp::send_secret",
             "std.net.net.serve_tls[conn] ply_host::tls::serve",
             "std.net.net.serve_tls[listener] ply_host::tls::serve",
             "std.net.net.set_option[conn] ply_host::tcp::set_option",
@@ -445,6 +447,50 @@ fn a_port_outside_the_range_is_refused() {
     )
     .expect_err("70000 is not a TCP port");
     assert_eq!(refused.code, codes::RUNTIME_ERROR);
+}
+
+#[test]
+fn a_credential_goes_out_whole_between_its_frame_and_only_in_an_encoding_it_names() {
+    let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
+    let binding = bind(net.clone());
+    let (_, conn) = open(&binding, net.as_ref());
+    let send = |encoding: &str| {
+        perform(
+            &binding,
+            net.as_ref(),
+            Op::SendSecret,
+            "conn",
+            vec![
+                Value::Int(conn),
+                Value::bytes(b"AUTH PLAIN "),
+                Value::secret_bytes(b"\0ada\0hunter2"),
+                Value::str(encoding),
+                Value::bytes(b"\r\n"),
+                Value::Int(5000),
+            ],
+        )
+    };
+    assert_eq!(
+        send("base64").expect("a credential is sent"),
+        Value::Bool(true)
+    );
+    assert_eq!(net.sent(conn), b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n");
+    assert_eq!(send("raw").expect("as it is"), Value::Bool(true));
+    assert!(net.sent(conn).ends_with(b"AUTH PLAIN \0ada\0hunter2\r\n"));
+    let refused = send("rot13").expect_err("no such encoding");
+    assert_eq!(refused.code, codes::RUNTIME_ERROR);
+    assert!(!format!("{refused:#?}").contains("hunter2"), "{refused:#?}");
+    let sent = net.sent(conn);
+    perform(
+        &binding,
+        net.as_ref(),
+        Op::CloseWrite,
+        "conn",
+        vec![Value::Int(conn)],
+    )
+    .expect("this end stops sending");
+    assert_eq!(send("base64").expect("answered"), Value::Bool(false));
+    assert_eq!(net.sent(conn), sent);
 }
 
 #[test]

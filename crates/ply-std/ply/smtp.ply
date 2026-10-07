@@ -19,8 +19,9 @@
 //! before it. Bytes that arrive between the server's leave and the handshake are refused
 //! (`Injected`), never read as if TLS had carried them. A mechanism that sends the credential
 //! itself is used only over TLS unless the caller says `PasswordInClear`. No credential is in
-//! a refusal, in what a turn or an engine shows, or in the lines a session keeps: the bytes
-//! of an `AUTH` exchange leave a `Turn` through `wire_bytes` alone.
+//! a refusal, in what a turn or an engine shows, or in the lines a session keeps, and none is
+//! ever a plain value: what the client says in an `AUTH` exchange is a `Veiled` wire, sealed,
+//! which a session writes with `net.send_secret`.
 //!
 //! A message is bytes and an `Envelope`, both `std.email`'s: `send` writes a `Draft`, `relay`
 //! sends a `Message` on as the bytes it was read from, and `submit` takes the two as they are.
@@ -1010,16 +1011,26 @@ type State = {
 /// `feed` is given what the server sent and answers what to send back.
 pub opaque type Engine = | Engine(State)
 
-/// Bytes for the server. They show as they are, but for the lines of an `AUTH` exchange, which
-/// show as stars; `wire_bytes` is the one way to those.
-pub opaque type Wire = | Open(Bytes) | Veiled(Bytes)
+/// What to write to the server. It shows as it is, but for a line of an `AUTH` exchange, which
+/// shows as stars.
+pub type Wire =
+  /// These bytes, written with `net.send`.
+  | Open(Bytes)
+  /// A line of an `AUTH` exchange: the bytes before what the client says, what it says, sealed,
+  /// and the line's end, written with `net.send_secret` as the first, the second in base64, and
+  /// the third.
+  | Veiled(Bytes, Secret<Bytes>, Bytes)
 
 show for Wire by wire_text
 
-fn wire_text(w: Wire) -> String = match w { Open(said) -> show(said), Veiled(_) -> "****" }
+fn wire_text(w: Wire) -> String = match w { Open(said) -> show(said), Veiled(_, _, _) -> "****" }
 
-/// What to write to the connection.
-pub fn wire_bytes(w: Wire) -> Bytes = match w { Open(said) -> said, Veiled(said) -> said }
+/// How many bytes a wire puts on the connection.
+fn wire_size(w: Wire) -> Int =
+  match w {
+    Open(said) -> bytes_len(said),
+    Veiled(lead, said, end) -> bytes_len(lead) + (secret_len(said) + 2) / 3 * 4 + bytes_len(end),
+  }
 
 /// One line of an exchange, as a session keeps it. No line of it holds a credential: what the
 /// client says in an `AUTH` exchange is kept as stars.
@@ -1291,12 +1302,11 @@ fn settle(s: State, said: List<Line>, answered: Int) -> Turn / {smtp.refused, ab
   }
 
 /// A line of an `AUTH` exchange: `lead`, and what the client says in base64, or `=` where it
-/// says nothing after a command. The one place a response's bytes are read here.
-fn auth_line(lead: String, response: sasl::Response) -> Wire / {abort.raise} = {
-  let encoded = base64_encode(sasl::wire(response));
-  Veiled(
-    bytes_of_string(lead ++ (if lead != "" && encoded == "" { "=" } else { encoded }) ++ "\r\n"),
-  )
+/// says nothing after a command.
+fn auth_line(lead: String, response: sasl::Response) -> Wire = {
+  let said = sasl::said(response);
+  let marked = if lead != "" && secret_is_empty(said) { lead ++ "=" } else { lead };
+  Veiled(bytes_of_string(marked), said, b"\r\n")
 }
 
 /// The turn that writes one command and waits for its reply.
@@ -1344,7 +1354,7 @@ fn authenticate(s: State, said: List<Line>, answered: Int) -> Turn / {smtp.refus
             };
             // RFC 4954 §4: a response that takes the command past 512 octets waits to be asked.
             match inline {
-              Some(line) if bytes_len(wire_bytes(line)) <= 512 ->
+              Some(line) if wire_size(line) <= 512 ->
                 turn(
                   {
                     ..s,
@@ -1625,13 +1635,21 @@ fn ending(ms: Int) -> Instant / {clock.read, task::deadline.at} = {
 fn read_by<[l]>(h: Int, most: Int, end: Instant) -> Option<Bytes> / {net.recv[l], clock.read} =
   match net::ms_left(end) { None -> None, Some(ms) -> net.recv[l](h, most, ms) }
 
-/// Every byte of `payload` written by `end`; `false` where the connection stopped taking them.
+/// Every byte of `out` written by `end`; `false` where the connection stopped taking them. A line
+/// of an `AUTH` exchange goes by `net.send_secret`, so what the client says there is never a
+/// plain value.
 fn sent_by<[l]>(
   h: Int,
-  payload: Bytes,
+  out: Wire,
   end: Instant,
-) -> Bool / {net.send[l], clock.read, abort.raise} =
-  match net::ms_left(end) { None -> false, Some(ms) -> send_all[l](h, payload, ms) }
+) -> Bool / {net.send[l], net.send_secret[l], clock.read, abort.raise} =
+  match net::ms_left(end) {
+    None -> false,
+    Some(ms) -> match out {
+      Open(payload) -> send_all[l](h, payload, ms),
+      Veiled(lead, said, line_end) -> net.send_secret[l](h, lead, said, "base64", line_end, ms),
+    },
+  }
 
 /// The connection `h` secured as its client by `net.start_tls`, verifying the server as `host`,
 /// within `ms`: `None` where it is, and why where it is not. Plaintext that waited at the
@@ -1664,12 +1682,11 @@ fn drive<[l] | e>(
   end: Option<Instant>,
   secure: (Int, Bytes) -> Option<Refusal> / e,
   left: Int,
-) -> Driven / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} = {
+) -> Driven / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} = {
   let waits = config_of(t.engine).timeouts;
-  let payload = wire_bytes(t.out);
   let all_said = concat(said, t.said);
-  let wrote = bytes_len(payload) > 0;
-  if wrote && !sent_by[l](h, payload, ending(waits.block_ms)) {
+  let wrote = wire_size(t.out) > 0;
+  if wrote && !sent_by[l](h, t.out, ending(waits.block_ms)) {
     smtp.refused(NotSent(match t.next { Await(p) -> p, _ -> Quit }))
   } else {
     match t.next {
@@ -1716,7 +1733,7 @@ fn established<[l] | e>(
   c: Config,
   link: Link,
   secure: (Int, Bytes) -> Option<Refusal> / e,
-) -> Session / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} =
+) -> Session / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} =
   match try[smtp.refused] { drive[l](h, start(c, link), [], None, secure, 16 * max_reads()) } {
     Ok(d) -> { handle: h, engine: d.engine, kept: kept_of(c.limits, [], d.said) },
     Err(why) -> {
@@ -1750,7 +1767,7 @@ pub fn open_tls<[l]>(
   host: String,
   port: Int,
   c: Config,
-) -> Session / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+) -> Session / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
   let h = connected[l](host, port, c);
   match upgrade[l](h, host, b"", c.timeouts.connect_ms) {
     Some(why) -> {
@@ -1778,7 +1795,7 @@ pub fn open<[l]>(
   host: String,
   port: Int,
   c: Config,
-) -> Session / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+) -> Session / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
   let h = connected[l](host, port, c);
   established[l](
     h,
@@ -1800,7 +1817,7 @@ pub fn submit<[l]>(
   envelope: Envelope,
   data: Bytes,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} = {
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} = {
   let d = drive[l](
     s.handle,
     mail(s.engine, envelope, data, asked),
@@ -1827,7 +1844,7 @@ pub fn send<[l]>(
   s: Session,
   d: Draft,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} =
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} =
   match try[email.unwritable] { email::write_fresh(d, email::repertoire_for(d)) } {
     Ok(data) -> submit[l](s, email::envelope(d), data, asked),
     Err(why) -> smtp.refused(Unwritable(why)),
@@ -1840,7 +1857,7 @@ pub fn relay<[l]>(
   s: Session,
   m: Message,
   asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
-) -> Sent / {net.send[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
   match try[email.refused] { email::message_envelope(m) } {
     Ok(envelope) ->
       submit[l](
@@ -1856,7 +1873,7 @@ pub fn relay<[l]>(
 /// server that does not answer, or a session that is over, is left as it is.
 fn farewell<[l]>(
   s: Session,
-) -> Unit / {net.send[l], net.recv[l], clock.read, task::deadline.at, abort.raise} =
+) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, abort.raise} =
   match try[smtp.refused] {
       drive[l](s.handle, leave(s.engine), [], None, |_: Int, _: Bytes| Some(NotReady), max_reads())
     } {
@@ -1868,7 +1885,7 @@ fn farewell<[l]>(
 /// closed.
 pub fn quit<[l]>(
   s: Session,
-) -> Unit / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, abort.raise} = {
+) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, abort.raise} = {
   farewell[l](s);
   net.close[l](s.handle)
 }
@@ -1885,7 +1902,7 @@ pub fn with_session_tls<a, [l] | e>(
   port: Int,
   c: Config,
   body: (Session) -> a / e,
-) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
   with_hold[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { held -> {
     let s = hold_get(held);
     let answer_of = body(s);
@@ -1899,7 +1916,7 @@ pub fn with_session<a, [l] | e>(
   port: Int,
   c: Config,
   body: (Session) -> a / e,
-) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
   with_hold[session](open[l](host, port, c), |s: Session| close[l](s)) { held -> {
     let s = hold_get(held);
     let answer_of = body(s);
@@ -2348,7 +2365,7 @@ fn marked(mark: String, sent: Bytes) -> List<String> / {abort.raise} =
 /// the lines of an `AUTH` exchange, which are as a session keeps them.
 fn written(t: Turn) -> List<String> / {abort.raise} =
   concat(if contains(t.said, Upgraded) { ["*: TLS"] } else { [] }, match t.out {
-    Veiled(_) ->
+    Veiled(_, _, _) ->
       map(filter(t.said, |l: Line| match l { Client(_) -> true, _ -> false }), |l: Line|
         transcript_text([l])),
     Open(sent) -> marked("C:", sent),
@@ -2365,11 +2382,21 @@ fn told(d: Delivery) -> String =
       Permanent(stage, r) -> "permanent " ++ stage_word(stage) ++ " " ++ code_text(r.code),
     })
 
-/// A replay so far: the lines exchanged, the bytes the client wrote, every turn as it shows,
-/// what became of each message, and whether one is on its way.
+/// The bytes a wire writes as `net.send` would, none for a line of an `AUTH` exchange.
+fn open_bytes(w: Wire) -> Bytes = match w { Open(said) -> said, Veiled(_, _, _) -> b"" }
+
+/// A wire as a reader of what was written sees it: a line of an `AUTH` exchange with stars where
+/// the client's words go.
+fn starred_bytes(w: Wire) -> Bytes =
+  match w { Open(said) -> said, Veiled(lead, _, end) -> bytes_concat_all([lead, b"****", end]) }
+
+/// A replay so far: the lines exchanged, the bytes the client wrote with `net.send`, each line
+/// of an `AUTH` exchange as `net.send_secret` wrote it, every turn as it shows, what became of
+/// each message, and whether one is on its way.
 type Tale = {
   lines: List<String>,
   wire: Bytes,
+  sealed: List<Secret<Bytes>>,
   shown: String,
   outcomes: List<String>,
   delivering: Bool,
@@ -2379,13 +2406,21 @@ type Tale = {
 type Replayed = {
   exchange: String,
   wire: Bytes,
+  sealed: List<Secret<Bytes>>,
   shown: String,
   engine: Engine,
   ended: Result<List<String>, Refusal>,
 }
 
 fn ended(t: Tale, how: Result<List<String>, Refusal>) -> Replayed =
-  { exchange: join(t.lines, "\n"), wire: t.wire, shown: t.shown, engine: t.engine, ended: how }
+  {
+    exchange: join(t.lines, "\n"),
+    wire: t.wire,
+    sealed: t.sealed,
+    shown: t.shown,
+    engine: t.engine,
+    ended: how,
+  }
 
 type Moved =
   | Halt(Result<List<String>, Refusal>)
@@ -2444,7 +2479,11 @@ fn replay(
   let rests = t.next == Ready || t.next == Over;
   let here: Tale = {
     lines: concat(tale.lines, written(t)),
-    wire: bytes_concat(tale.wire, wire_bytes(t.out)),
+    wire: bytes_concat(tale.wire, open_bytes(t.out)),
+    sealed: match t.out {
+      Veiled(lead, said, end) -> push(tale.sealed, net::sent_secret(lead, said, "base64", end)),
+      Open(_) -> tale.sealed,
+    },
     shown: tale.shown ++ show(t),
     outcomes: if tale.delivering && rests { concat(tale.outcomes, map(deliveries(t.engine), told)) }
     else { tale.outcomes },
@@ -2475,7 +2514,15 @@ fn played(
     first_turn,
     beats,
     acts,
-    { lines: [], wire: b"", shown: "", outcomes: [], delivering: false, engine: first_turn.engine },
+    {
+      lines: [],
+      wire: b"",
+      sealed: [],
+      shown: "",
+      outcomes: [],
+      delivering: false,
+      engine: first_turn.engine,
+    },
     2000,
   )
 }
@@ -2499,9 +2546,10 @@ fn deliver(names: List<String>) -> Act / {email.refused, abort.raise} =
 
 fn client() -> Config / {smtp.refused, abort.raise} = config("client.example", default_limits())
 
-fn tim() -> Credential / {sasl.refused} = sasl::password("tim", "tanstaaftanstaaf")
+fn tim() -> Credential / {sasl.refused} =
+  sasl::password("tim", secret_of_bytes(b"tanstaaftanstaaf"))
 
-fn pencil() -> Credential / {sasl.refused} = sasl::password("user", "pencil")
+fn pencil() -> Credential / {sasl.refused} = sasl::password("user", secret_of_bytes(b"pencil"))
 
 /// The credential a case gives a client, by name: a credential cannot be a case, since a case is
 /// hashed and a hash of one is something to test guesses against.
@@ -2544,7 +2592,9 @@ fn configured(s: Setup) -> Config / {abort.raise} = {
     Nobody -> Ok(None),
     Tim -> try[sasl.refused] { Some(tim()) },
     Pencil -> try[sasl.refused] { Some(pencil()) },
-    Bearer(token) -> try[sasl.refused] { Some(sasl::bearer("tim", token)) },
+    Bearer(token) -> try[sasl.refused] {
+      Some(sasl::bearer("tim", secret_bytes(secret_of_string(token))))
+    },
   };
   match ((try[smtp.refused] { config(s.name, default_limits()) }, held)) {
     (Ok(bare), Ok(credential)) -> {
@@ -3393,7 +3443,7 @@ test "however the server's bytes are cut into reads, the client says the same an
     map(
       filter([1, 2, 3, 5, 7, 64], |size: Int| {
         let cut = played(configured(r.client), r.secure, r.acts, recut(beats_of(r.exchange), size));
-        cut.wire != whole.wire || cut.ended != whole.ended
+        cut.wire != whole.wire || cut.sealed != whole.sealed || cut.ended != whole.ended
       }),
       |size: Int| r.what ++ ", in reads of " ++ int_to_string(size),
     )
@@ -3403,8 +3453,9 @@ test "however the server's bytes are cut into reads, the client says the same an
 
 // --- Tests: credentials -------------------------------------------------------
 
-/// An exchange that proves a credential: what must never show, and what the server must be
-/// sent all the same.
+/// An exchange that proves a credential: what must never show or be sent as plain bytes, what is
+/// sent as plain bytes all the same, and each line of the `AUTH` exchange, in order, as the server
+/// must be sent it sealed.
 type Proven = {
   what: String,
   client: Setup,
@@ -3412,7 +3463,19 @@ type Proven = {
   exchange: String,
   hidden: List<String>,
   sent: List<String>,
+  veiled: List<Bytes>,
 }
+
+/// XOAUTH2's message for `tim` and a token of 600 `x`s after `ya29.`, as a line.
+fn long_bearer_line() -> Bytes / {abort.raise} =
+  bytes_of_string(
+    base64_encode(
+        bytes_of_string(
+          "user=tim\u{1}auth=Bearer ya29." ++ string::repeat("x", 600) ++ "\u{1}\u{1}",
+        ),
+      )
+      ++ "\r\n",
+  )
 
 fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
   [
@@ -3429,7 +3492,8 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
         \\S: 535 5.7.8 Authentication credentials invalid
       ,
       hidden: ["tanstaaf", "AHRpbQB0YW5zdGFhZnRhbnN0YWFm", "dGFuc3RhYWZ0YW5zdGFhZg"],
-      sent: ["AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n"],
+      sent: ["EHLO client.example\r\n"],
+      veiled: [b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n"],
     },
     {
       what: "LOGIN: the name and then the password",
@@ -3448,7 +3512,8 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
         \\S: 235 2.7.0 Accepted
       ,
       hidden: ["tanstaaf", "dGFuc3RhYWZ0YW5zdGFhZg"],
-      sent: ["AUTH LOGIN\r\ndGlt\r\ndGFuc3RhYWZ0YW5zdGFhZg==\r\n"],
+      sent: ["EHLO client.example\r\nAUTH LOGIN\r\n"],
+      veiled: [b"dGlt\r\n", b"dGFuc3RhYWZ0YW5zdGFhZg==\r\n"],
     },
     {
       what: "SCRAM-SHA-256: RFC 7677's messages, and an empty line once the server has proved itself",
@@ -3467,8 +3532,11 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
         \\S: 235 2.7.0 Accepted
       ,
       hidden: ["pencil", "dHzbZapWIk4jUhN", "Yz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEy"],
-      sent: [
-        "AUTH SCRAM-SHA-256 biwsbj11c2VyLHI9ck9wck5HZndFYmVSV2diTkVrcU8=\r\nYz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEyUmFUQ0FmdXhGSWxqKWhObEYkazAscD1kSHpiWmFwV0lrNGpVaE4rVXRlOXl0YWc5empmTUhnc3FtbWl6N0FuZFZRPQ==\r\n\r\n",
+      sent: ["EHLO client.example\r\n"],
+      veiled: [
+        b"AUTH SCRAM-SHA-256 biwsbj11c2VyLHI9ck9wck5HZndFYmVSV2diTkVrcU8=\r\n",
+        b"Yz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEyUmFUQ0FmdXhGSWxqKWhObEYkazAscD1kSHpiWmFwV0lrNGpVaE4rVXRlOXl0YWc5empmTUhnc3FtbWl6N0FuZFZRPQ==\r\n",
+        b"\r\n",
       ],
     },
     {
@@ -3489,8 +3557,10 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
         "ya29",
         "bixhPXRpbSwBaG9zdD1teC5leGFtcGxlAXBvcnQ9NTg3AWF1dGg9QmVhcmVyIHlhMjkudG9rZW4BAQ",
       ],
-      sent: [
-        "AUTH OAUTHBEARER bixhPXRpbSwBaG9zdD1teC5leGFtcGxlAXBvcnQ9NTg3AWF1dGg9QmVhcmVyIHlhMjkudG9rZW4BAQ==\r\nAQ==\r\n",
+      sent: ["EHLO client.example\r\n"],
+      veiled: [
+        b"AUTH OAUTHBEARER bixhPXRpbSwBaG9zdD1teC5leGFtcGxlAXBvcnQ9NTg3AWF1dGg9QmVhcmVyIHlhMjkudG9rZW4BAQ==\r\n",
+        b"AQ==\r\n",
       ],
     },
     {
@@ -3508,19 +3578,22 @@ fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
         \\S: 235 2.7.0 Accepted
       ,
       hidden: ["ya29", "xxxxxxxx", "dXNlcj10aW0BYXV0aD1CZWFyZXIgeWEyOS54"],
-      sent: ["AUTH XOAUTH2\r\ndXNlcj10aW0BYXV0aD1CZWFyZXIgeWEyOS54"],
+      sent: ["EHLO client.example\r\nAUTH XOAUTH2\r\n"],
+      veiled: [long_bearer_line()],
     },
   ]
 
-test "a credential goes to the server and nowhere else: not into a refusal, a turn as it shows, or the lines a session keeps" for p: Proven in provings(
+test "a credential goes to the server sealed and nowhere else: not into a refusal, a turn as it shows, the lines a session keeps, or the plain bytes it writes" for p: Proven in provings(
   ) {
   let got = replayed(configured(p.client), p.secure, [], p.exchange);
   let wire = string_of_bytes_lossy(got.wire);
   assert_eq(got.exchange, p.exchange);
   assert(all(p.sent, |part: String| string_contains(wire, part)));
+  assert(got.sealed == map(p.veiled, secret_of_bytes));
   assert(
     all(p.hidden, |part: String|
-      !string_contains(got.exchange, part) && !string_contains(got.shown, part)
+      !string_contains(wire, part) && !string_contains(got.exchange, part)
+        && !string_contains(got.shown, part)
         && !string_contains(show(got.ended), part)
         && !string_contains(show(got.engine), part)
         && !string_contains(show(configured(p.client)), part)),
@@ -3657,8 +3730,8 @@ fn driven(
   left: Int,
 ) -> Option<Bytes> / {abort.raise} = {
   let fine = holding(t.engine) <= config_of(t.engine).limits.reply && room(t.engine) >= 1
-    && whole_lines(wire_bytes(t.out));
-  let so_far = bytes_concat(wrote, wire_bytes(t.out));
+    && whole_lines(starred_bytes(t.out));
+  let so_far = bytes_concat(wrote, starred_bytes(t.out));
   let fed = match t.next { Await(_) -> true, _ -> false };
   let next_turn = match t.next {
     Over -> None,
@@ -3692,7 +3765,7 @@ fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) 
   match try[abort.raise] {
       match try[smtp.refused] { config("client.example", limits) } {
         Err(_) -> None,
-        Ok(bare) -> match try[sasl.refused] { sasl::password("user", "pencil") } {
+        Ok(bare) -> match try[sasl.refused] { sasl::password("user", secret_of_bytes(b"pencil")) } {
           Err(_) -> None,
           Ok(held) -> {
             let c = with_exposure(
@@ -3866,14 +3939,45 @@ test "a session over TLS from its first byte is verified as its host, writes wha
     map(sent.deliveries, told)
   });
   assert_eq(ran.value, Ok(["Jones@foo.com accepted 250", "Green@foo.com permanent RCPT 550"]));
-  assert_eq(
-    net::mem_sent(ran.net, 1),
-    replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission()).wire,
-  );
+  let engine = replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission());
+  assert_eq(net::mem_sent(ran.net, 1), engine.wire);
+  assert(net::mem_sent_secrets(ran.net, 1) == engine.sealed);
   assert_eq(net::mem_secured(ran.net, 1), Some("mx.example"));
   assert_eq(net::mem_deadlines(ran.net, 1), [300000, 300000, 300000, 300000, 600000, 30000]);
   assert_eq(net::mem_unmet(ran.net, 1), []);
   assert_eq(ran.net.closed, [1])
+}
+
+test "a session's credential reaches a server that hears it whole in its line, and no plain byte holds it" {
+  let script = [
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Hears(b"EHLO client.example\r\n"),
+    net::Says(b"250-mx.example\r\n250 AUTH PLAIN\r\n"),
+    net::HearsSecret(b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n"),
+    net::Says(b"235 2.7.0 Accepted\r\n"),
+    net::Hears(b"QUIT\r\n"),
+    net::Says(b"221 2.0.0 Bye\r\n"),
+  ];
+  let c = with_credential(config("client.example", { ..default_limits(), transcript: 40 }), tim());
+  let ran = on_mx(serving(465, [script]), || {
+    let s = open_tls[mail]("mx.example", 465, c);
+    let proved = authenticated(s.engine);
+    let text = transcript_text(transcript(s));
+    quit[mail](s);
+    { proved: proved, text: text }
+  });
+  match ran.value {
+    Ok(v) -> {
+      assert(v.proved);
+      assert(string_contains(v.text, "C: AUTH PLAIN ****"));
+      assert(!string_contains(v.text, "AHRp"))
+    },
+    Err(why) -> panic("the session was refused: " ++ show(why)),
+  };
+  let plain = string_of_bytes_lossy(net::mem_sent(ran.net, 1));
+  assert_eq(plain, "EHLO client.example\r\nQUIT\r\n");
+  assert_eq(net::mem_unmet(ran.net, 1), [])
 }
 
 test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, and the credential after the upgrade" {
@@ -3911,7 +4015,7 @@ test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, 
 fn acted<[l]>(
   s: Session,
   acts: List<Act>,
-) -> List<String> / {net.send[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
+) -> List<String> / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
   fold(
     acts,
     { session: s, outcomes: [] },
@@ -4294,8 +4398,8 @@ law "no address and no parameter writes a line of its own: a message's commands 
           } {
           Err(why) -> usable(why),
           Ok(t) -> {
-            let lines = marked("", wire_bytes(t.out));
-            whole_lines(wire_bytes(t.out)) && len(lines) == len(envelope.recipients) + 2
+            let lines = marked("", open_bytes(t.out));
+            whole_lines(open_bytes(t.out)) && len(lines) == len(envelope.recipients) + 2
               && all(list::enumerate(lines), |l: { index: Int, value: String }|
                 string_starts_with(l.value, if l.index == 0 { " MAIL FROM:<" }
                 else if l.index <= len(envelope.recipients) { " RCPT TO:<" }

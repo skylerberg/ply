@@ -10,6 +10,7 @@ pub use socket::TcpHost;
 pub(crate) use socket::apply;
 pub use wire::{Credentials, Endpoint, Probing, Refusal, SocketOption};
 
+use ply_eval::crypto::Framing;
 use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Resource, Span, Symbol, codes,
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 pub const MODULE: &str = "std.net";
 
@@ -52,6 +54,7 @@ operations! {
     PeerCertificate = "peer_certificate" / 1,
     Protocol = "protocol" / 1,
     Options = "options" / 1,
+    SendSecret = "send_secret" / 6,
 }
 
 impl Op {
@@ -68,6 +71,7 @@ impl Op {
                 | Op::Accept
                 | Op::Recv
                 | Op::Send
+                | Op::SendSecret
         )
     }
 
@@ -97,8 +101,10 @@ impl Op {
                 Linearity::AtMostOnce
             },
             blocking: self.waits() && net.waits(),
-            // No expression turns a `Secret` into the `Bytes` a socket write takes.
-            secrets: false,
+            // `send_secret`'s credential is encoded into one buffer that is wiped once written, and
+            // what it answers says only whether every byte went. No other operation takes one: no
+            // expression turns a `Secret` into the `Bytes` a socket write takes.
+            secrets: matches!(self, Op::SendSecret),
             path: net.path(self),
         }
     }
@@ -216,6 +222,17 @@ pub trait Net: Send + Sync {
         at: &Resource,
         conn: i64,
         payload: &[u8],
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic>;
+    /// Every byte of `payload` or none answered as written: `true` once the peer took them all,
+    /// `false` for a deadline or a peer gone before it did. The payload holds a credential, and is
+    /// wiped when it is dropped.
+    fn send_secret(
+        &self,
+        at: &Resource,
+        conn: i64,
+        payload: Zeroizing<Vec<u8>>,
         timeout: Duration,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic>;
@@ -421,9 +438,24 @@ impl HostHandler for Operation {
             Op::Send => {
                 let payload = Arc::clone(req.args[1].as_bytes(span, "a payload")?);
                 if payload.is_empty() {
-                    return Err(empty_payload(span));
+                    return Err(empty_payload(self.op, span));
                 }
                 self.net.send(at, handle(0)?, &payload, timeout(2)?, span)
+            }
+            Op::SendSecret => {
+                let before = req.args[1].as_bytes(span, "the bytes before the secret")?;
+                let ply_eval::Value::Secret(held) = &req.args[2] else {
+                    return Err(not_sealed(&req.args[2], span));
+                };
+                let encoding = req.args[3].as_str(span, "an encoding")?;
+                let framing = Framing::named(encoding, self.op.what(), span)?;
+                let after = req.args[4].as_bytes(span, "the bytes after the secret")?;
+                let payload = framing.framed(before, held.bytes(), after);
+                if payload.is_empty() {
+                    return Err(empty_payload(self.op, span));
+                }
+                self.net
+                    .send_secret(at, handle(0)?, payload, timeout(5)?, span)
             }
             Op::CloseWrite => self.net.close_write(at, handle(0)?, span),
             Op::Close => self.net.close(at, handle(0)?, span),
@@ -464,15 +496,29 @@ fn deadline(op: Op, ms: i64, span: Span) -> Result<Duration, Diagnostic> {
     Ok(Duration::from_millis(ms as u64))
 }
 
-/// Keeps `send`'s `Some(0)` unambiguous as the peer being gone.
+/// Keeps `send`'s `Some(0)` unambiguous as the peer being gone, and `send_secret`'s `true` a
+/// credential that went.
 #[cold]
-fn empty_payload(span: Span) -> Diagnostic {
+fn empty_payload(op: Op, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        "`net.send` was given an empty payload",
+        format!("{} was given an empty payload", op.what()),
     )
     .primary(span, "there is nothing to write")
     .note("`send` answers `Some(0)` when the peer is gone, so an empty payload would be indistinguishable from one")
+}
+
+#[cold]
+fn not_sealed(got: &ply_eval::Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "`net.send_secret` was handed a {} where its credential is a `Secret`",
+            got.type_name()
+        ),
+    )
+    .primary(span, "performed here")
+    .note("inference checks a perform's arguments, so reaching this means the evaluator was handed a module that was never checked")
 }
 
 fn port(op: Op, port: i64, span: Span) -> Result<u16, Diagnostic> {
