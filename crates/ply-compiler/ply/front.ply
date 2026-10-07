@@ -3397,13 +3397,18 @@ fn unread_shipped(name: Bytes) -> Diag =
 pub type ShippedData = { name: Bytes, bytes: Bytes }
 
 /// The shipped modules a load reads, the names of the rest, of which it reads none, the data files
-/// the read ones embed, and the ones it pulls whatever its modules import.
+/// the read ones embed, the ones it pulls whatever its modules import, and what each read one's
+/// text says it embeds, which a stub of it no longer says.
 pub type Shipping = {
   read: List<Source>,
   unread: List<Bytes>,
   data: List<ShippedData>,
   asked: List<Bytes>,
+  wants: List<Wanting>,
 }
+
+/// What a module's text says it embeds.
+pub type Wanting = { name: Bytes, wants: List<EmbedWant> }
 
 /// What a load reads of a module to find what it pulls: what it imports, the hidden imports among
 /// them, and what it embeds.
@@ -3446,6 +3451,7 @@ pub fn shipped_pulled<| e>(
       found: [],
       data: [],
       tried: map_new(),
+      wants: [],
     },
     len(listed) + 1,
     asked,
@@ -3457,6 +3463,7 @@ pub fn shipped_pulled<| e>(
     unread: filter(listed, |name: Bytes| !map_contains(held, name)),
     data: needed.data,
     asked: asked,
+    wants: needed.wants,
   }
 }
 
@@ -3465,6 +3472,7 @@ type Needed = {
   found: List<Source>,
   data: List<ShippedData>,
   tried: Map<Bytes, Bool>,
+  wants: List<Wanting>,
 }
 
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
@@ -3504,6 +3512,7 @@ fn needing<| e>(
                 importers: push(acc.importers, { name: name, imports: pulls.imports }),
                 found: push(acc.found, source),
                 tried: tried,
+                wants: push(acc.wants, { name: name, wants: pulls.wants }),
               },
               name,
               pulls.wants,
@@ -3672,6 +3681,7 @@ fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
+  wanting: Map<Bytes, List<EmbedWant>>,
   data: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   stubs: Map<Bytes, Bytes>,
@@ -3690,12 +3700,13 @@ fn pulling(
         users,
         shipped,
         whole,
+        wanting,
         data,
         listed,
         stubs,
         tested,
         map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes| {
-          let o = shipped_embedded(whole, data, len(acc.parsed), { name: name, src: src });
+          let o = shipped_embedded(whole, wanting, data, len(acc.parsed), { name: name, src: src });
           {
             ..acc,
             parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
@@ -3745,6 +3756,7 @@ fn data_held(data: List<ShippedData>) -> Map<Bytes, Bytes> =
 /// it: read as a stub it has no body left to ask, and the emitter may still lower the whole of it.
 fn shipped_embedded(
   whole: Map<Bytes, Bytes>,
+  wanting: Map<Bytes, List<EmbedWant>>,
   data: Map<Bytes, Bytes>,
   index: Int,
   source: Source,
@@ -3752,8 +3764,9 @@ fn shipped_embedded(
   let text = match map_get(whole, source.name) { Some(t) -> t, None -> source.src };
   let p = { ..parse_at(index, source), src: text };
   if !names_embed(text) { { parsed: p, embeds: [] } } else {
-    let wants = if text == source.src { wants_of(p.module.module) }
-    else { wants_of(parse(text).node) };
+    let wants = if text == source.src { wants_of(p.module.module) } else {
+      match map_get(wanting, source.name) { Some(w) -> w, None -> wants_of(parse(text).node) }
+    };
     let table = fold(wants, map_new(), |acc: Map<Bytes, EmbedRead>, want: EmbedWant|
       map_insert(acc, embed_key(want), shipped_read(whole, data, source.name, want)));
     let r = embedded(p.module.module, table, []);
@@ -3780,7 +3793,8 @@ pub fn parse_shipped(
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let held = data_held(data);
-  map(range(0, len(modules)), |i: Int| shipped_embedded(whole, held, i, at(modules, i)).parsed)
+  map(range(0, len(modules)), |i: Int|
+    shipped_embedded(whole, map_new(), held, i, at(modules, i)).parsed)
 }
 
 /// `analyse` over `user` and the modules of `shipped` it imports, with those named in the order they
@@ -3888,6 +3902,9 @@ pub fn staged_pulling_std_with(
   // Whether `user` is modules of the standard library read apart from any program: they load as
   // the toolchain's own tree does, though they are not the whole of it.
   apart: Bool = false,
+  // What a shipped module's text says it embeds, which a stub of it no longer says
+  // (`shipped_pulled`).
+  wants: List<Wanting> = [],
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -3924,6 +3941,8 @@ pub fn staged_pulling_std_with(
     len(assembled),
     texts,
     whole,
+    fold(wants, map_new(), |acc: Map<Bytes, List<EmbedWant>>, w: Wanting|
+      map_insert(acc, w.name, w.wants)),
     data_held(data),
     listed,
     stubs,
@@ -4249,6 +4268,7 @@ pub fn analyse_pulling_std_with(
   reached: Bool = true,
   data: List<ShippedData> = [],
   asked: List<Bytes> = [],
+  wants: List<Wanting> = [],
 ) -> Pulled / {abort.raise} =
   checked_staged(
     staged_pulling_std_with(
@@ -4262,6 +4282,7 @@ pub fn analyse_pulling_std_with(
       reached: reached,
       data: data,
       asked: asked,
+      wants: wants,
     ),
     defs,
     tests,
@@ -7554,7 +7575,7 @@ test "a shipped module read as its stub still answers what the shipped modules' 
     map_new(),
     |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src),
   );
-  let stub = shipped_embedded(whole, map_new(), 0, {
+  let stub = shipped_embedded(whole, map_new(), map_new(), 0, {
     name: b"std.a",
     src: b"pub fn text() -> Bytes = b\"\"",
   });
@@ -7709,7 +7730,7 @@ test "a data file the shipped modules do not hold, or a path that leaves them, i
 
 test "a shipped module read as its stub still answers the data file its text embeds" {
   let whole = map_insert(map_new(), b"std.words", words_module(b"words/list.txt").src);
-  let stub = shipped_embedded(whole, data_held(words_data(b"one\n")), 0, {
+  let stub = shipped_embedded(whole, map_new(), data_held(words_data(b"one\n")), 0, {
     name: b"std.words",
     src: b"pub fn list() -> Bytes = b\"\"",
   });
@@ -7720,6 +7741,20 @@ test "a shipped module read as its stub still answers the data file its text emb
       read: Ok([{ name: b"", bytes: b"one\n" }]),
     },
   ])
+}
+
+test "a shipped module read as its stub answers what its text's read kept that it embeds, never parsing the text again" {
+  let whole = map_insert(map_new(), b"std.words", b"embed( names nothing a parse would find");
+  let wanting = map_insert(
+    map_new(),
+    b"std.words",
+    wants_of(parse(words_module(b"words/list.txt").src).node),
+  );
+  let stub = shipped_embedded(whole, wanting, data_held(words_data(b"one\n")), 0, {
+    name: b"std.words",
+    src: b"pub fn list() -> Bytes = b\"\"",
+  });
+  assert_eq(map(stub.embeds, |e: EmbedAt| e.key), [b"file:words/list.txt"])
 }
 
 test "the shipped modules parse for a listing with their data written out, as a load that pulls them does" {
