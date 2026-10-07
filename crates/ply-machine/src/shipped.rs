@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 9] = [
+const OPERATIONS: [(&str, &str); 10] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("reached", "ply_machine::shipped::reached"),
@@ -14,6 +14,7 @@ const OPERATIONS: [(&str, &str); 9] = [
     ("stamps", "ply_machine::shipped::stamps"),
     ("runtime", "ply_machine::shipped::runtime"),
     ("runnable", "ply_machine::shipped::runnable"),
+    ("values", "ply_machine::shipped::values"),
     ("builtins", "ply_machine::shipped::builtins"),
     ("definitions", "ply_machine::shipped::definitions"),
 ];
@@ -186,10 +187,53 @@ impl HostHandler for Shipped {
                 })?;
                 PlyValue::bytes(bytes)
             }
+            ("values", [files, dump, unit, roots, steps]) => {
+                values(files, dump, unit, roots, steps, span)?
+            }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
         Ok(HostAnswer::Value(value))
     }
+}
+
+/// What each stored root answers on the unit emitted over `files` and `dump`, as
+/// [`crate::enter::stored_values`] enters them.
+fn values(
+    files: &PlyValue,
+    dump: &PlyValue,
+    unit: &PlyValue,
+    roots: &PlyValue,
+    steps: &PlyValue,
+    span: ply_eval::Span,
+) -> Result<PlyValue, Diagnostic> {
+    let front = crate::driver::loaded_analysis_of(
+        &crate::payload::record(vec![
+            ("dump", dump.clone()),
+            ("files", files.clone()),
+            ("read_ms", PlyValue::Int(0)),
+            ("front_ms", PlyValue::Int(0)),
+            ("file_ms", PlyValue::Int(0)),
+            ("cached", PlyValue::Bool(false)),
+        ]),
+        span,
+    )?;
+    let unit = String::from_utf8(unit.as_bytes(span, "the unit's C")?.to_vec()).map_err(|_| {
+        Diagnostic::error(codes::RUNTIME_ERROR, "the unit's C is not UTF-8")
+            .primary(span, "handed here")
+    })?;
+    let roots = roots
+        .as_list(span, "the stored roots")?
+        .iter()
+        .map(|root| root.as_str(span, "a stored root").map(str::to_string))
+        .collect::<Result<Vec<_>, _>>()?;
+    let steps = steps.as_int(span, "the calls each may make")?;
+    let answered = crate::enter::stored_values(front, unit, roots, steps)?;
+    Ok(PlyValue::list(
+        answered
+            .into_iter()
+            .map(|value| crate::payload::option(value.map(PlyValue::bytes)))
+            .collect(),
+    ))
 }
 
 /// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens

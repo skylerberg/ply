@@ -7,15 +7,18 @@
 //! enters. Asked for the answer rather than a program to ship, it writes whatever the front end
 //! answered, a refusal included, and whatever unit the emitter made of it.
 
-import load (SourceFile, Unloaded, checked_of, every_root, hash_in, prepared, read_prepared)
-import front (Refused, Rows, dump_of, no_rows, rows_bin, shipped_dump)
-import hash (Prior, prior_bin)
+import load (Checked, SourceFile, Unloaded, checked_of, every_root, hash_in, prepared,
+             read_prepared)
+import front (BakedRow, Refused, Rows, dump_of, no_rows, rows_bin, shipped_dump)
+import hash (Prior, TheFn, prior_bin, reach)
 import interface (KeptModules, kept_modules_bin, standing_hash)
 import resolve (Diag, Label)
-import unit (shipped, emitted, emitter_identity, held, identity_of, program_key, programs_kept,
-             read_kept, write_kept)
+import unit (Baked, Runtime, shipped, baked_key, const_budget, const_room, emitted,
+             emitter_identity, held, identity_of, keep_value, kept_value, program_key,
+             programs_kept, read_kept, stored_root, write_kept)
 import std.bin
 import std.fs (fs)
+import std.list (at, concat)
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
@@ -96,8 +99,12 @@ fn place(diag: Diag, files: List<SourceFile>) -> String / {abort.raise} =
 fn told(diags: List<Diag>, files: List<SourceFile>) -> Unit / {process.err[proc], abort.raise} =
   fold(diags, (), |_: Unit, diag: Diag|
     process.err[proc](
-      place(diag, files) ++ string_of_bytes_lossy(diag.code) ++ ": "
-        ++ string_of_bytes_lossy(diag.message),
+      fold(
+        diag.notes_text,
+        place(diag, files) ++ string_of_bytes_lossy(diag.code) ++ ": "
+          ++ string_of_bytes_lossy(diag.message),
+        |told: String, note: Bytes| told ++ "\n  = " ++ string_of_bytes_lossy(note),
+      ),
     ))
 
 fn texts(files: List<SourceFile>) -> List<Bytes> = map(files, |f: SourceFile| f.text)
@@ -129,7 +136,7 @@ pub fn built(
   kept: Bool,
   phases: Bool,
   answering: Bool,
-) -> Int / {fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+) -> Int / {fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let started = time.elapsed_ms();
   let definitions = shipped.definitions();
   let rows = rows_at(rows, definitions);
@@ -207,27 +214,19 @@ pub fn built(
               };
               let keeping = time.elapsed_ms();
               let offered = every_root(c.front);
-              let emission = if kept {
-                emitted(
-                  shipped.runtime(),
-                  c.front.dump,
-                  texts(c.front.files),
-                  offered,
-                  emitter_identity(definitions),
-                  |key: Bytes| read_kept[bodies](".", key),
-                  |key: Bytes, bytes: Bytes| write_kept[bodies](".", key, bytes),
-                )
-              } else {
-                emitted(
-                  shipped.runtime(),
-                  c.front.dump,
-                  texts(c.front.files),
-                  offered,
-                  b"",
-                  |_: Bytes| None,
-                  |_: Bytes, _: Bytes| (),
-                )
-              };
+              let emitter = if kept { emitter_identity(definitions) } else { b"" };
+              let values = if answering { [] } else { constants(c, offered, kept, emitter) };
+              let valuing = time.elapsed_ms();
+              let emission = emitted(
+                shipped.runtime(),
+                c.front.dump,
+                texts(c.front.files),
+                offered,
+                emitter,
+                |key: Bytes| answer_kept(kept, key),
+                |key: Bytes, bytes: Bytes| keep_answer(kept, key, bytes),
+                values,
+              );
               let emitting = time.elapsed_ms();
               let unit = match emission {
                 Ok(e) -> if answering { Ok(e.produced.text) }
@@ -254,8 +253,10 @@ pub fn built(
                         ++ ms(reading, checking)
                         ++ ", rows kept "
                         ++ ms(checking, keeping)
+                        ++ ", constants held "
+                        ++ ms(keeping, valuing)
                         ++ ", emitted "
-                        ++ ms(keeping, emitting)
+                        ++ ms(valuing, emitting)
                         ++ ", encoded "
                         ++ ms(emitting, encoding)
                         ++ ", written "
@@ -273,13 +274,96 @@ pub fn built(
   }
 }
 
+/// An emitter's answer kept below `bodies` between builds, when a build keeps them.
+fn answer_kept(
+  kept: Bool,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[bodies], fs.write[bodies], time.now_ms, abort.raise} =
+  if kept { read_kept[bodies](".", key) } else { None }
+
+fn keep_answer(
+  kept: Bool,
+  key: Bytes,
+  bytes: Bytes,
+) -> Unit / {fs.write[bodies], entropy.next, time.now_ms, abort.raise} =
+  if kept { write_kept[bodies](".", key, bytes) } else { () }
+
+/// The value of each `const` definition among `offered`, which the unit holds in place of its body
+/// as a bootstrapped program's does: read back where a build or a check kept it, under the runtime,
+/// the emitter and the hash of all the definition reaches, and else entered here and kept beside
+/// the emitter's answers. One that raises, runs past `const_budget` or answers past `const_room` is
+/// left to its body, which answers the same in every process that reaches it.
+fn constants(
+  c: Checked,
+  offered: List<Bytes>,
+  kept: Bool,
+  emitter: Bytes,
+) -> List<Baked> / {fs.read[bodies], fs.write[bodies], shipped.runtime, shipped.values, entropy.next, time.now_ms, abort.raise} = {
+  let runtime = shipped.runtime();
+  let wanted = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  let rows = filter(c.front.dump.baked, |row: BakedRow| map_contains(wanted, row.name));
+  let key = |row: BakedRow| baked_key(runtime.identity, emitter, row.hash);
+  let had = map(rows, |row: BakedRow| if kept { kept_value[bodies](".", key(row)) } else { None });
+  let open = filter(range(0, len(rows)), |i: Int| at(had, i) == None);
+  let names = map(open, |i: Int| at(rows, i).name);
+  let found = if len(names) == 0 { [] } else { entered(c, runtime, names, offered, kept, emitter) };
+  let fresh = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Bytes>, k: Int|
+    match list_at(found, k) {
+      Some(Some(text)) -> if bytes_len(text) > const_room() { acc } else {
+        if kept { keep_value[bodies](".", key(at(rows, at(open, k))), text) };
+        map_insert(acc, at(names, k), text)
+      },
+      _ -> acc,
+    });
+  fold(range(0, len(rows)), [], |acc: List<Baked>, i: Int| {
+    let name = at(rows, i).name;
+    match match at(had, i) { Some(text) -> Some(text), None -> map_get(fresh, name) } {
+      Some(text) -> push(acc, { name: name, text: text }),
+      None -> acc,
+    }
+  })
+}
+
+/// What each of `names`, `const` definitions, answers through its stored root on a unit of all they
+/// reach, which the launcher compiles and enters: none for one it could not answer.
+fn entered(
+  c: Checked,
+  runtime: Runtime,
+  names: List<Bytes>,
+  offered: List<Bytes>,
+  kept: Bool,
+  emitter: Bytes,
+) -> List<Option<Bytes>> / {fs.read[bodies], fs.write[bodies], shipped.values, entropy.next, time.now_ms, abort.raise} = {
+  let reached = reach(c.hashes, map(names, |n: Bytes| TheFn(n))).fns;
+  let roots = concat(filter(offered, |n: Bytes| map_contains(reached, n)), map(names, stored_root));
+  match emitted(
+      runtime,
+      c.front.dump,
+      texts(c.front.files),
+      roots,
+      emitter,
+      |key: Bytes| answer_kept(kept, key),
+      |key: Bytes, bytes: Bytes| keep_answer(kept, key, bytes),
+    ) {
+    Err(_) -> map(names, |_: Bytes| None),
+    Ok(e) ->
+      shipped.values(
+        c.front.files,
+        c.front.dump,
+        e.produced.text,
+        map(names, |n: Bytes| string_of_bytes(stored_root(n))),
+        const_budget(),
+      ),
+  }
+}
+
 fn written(out: String, bytes: Bytes) -> Int / {fs.write[out], process.err[proc]} =
   if fs.write_file[out](out, bytes) { 0 } else {
     process.err[proc]("the runnable could not be written to `" ++ out ++ "`");
     2
   }
 
-pub fn main() -> Unit / {process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, entropy.next, time.now_ms, time.elapsed_ms, abort.raise} =
+pub fn main() -> Unit / {process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, abort.raise} =
   match process.args[proc]() {
     [root, entry, out, rows, kept, phases] ->
       process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases", false)),

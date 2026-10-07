@@ -3833,10 +3833,12 @@ pub unsafe extern "C" fn rt_stored(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
-/// A call through a value. Takes the callee and the arguments.
+/// A call through a value. Takes the callee and the arguments. A closure this call holds the only
+/// count of is never called again, so it gives the call its captures rather than sharing them.
 pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n: i64) -> i64 {
     let args = args_of(args, n);
-    let r = call_value(ctx, callee, args);
+    let give = heap::kind(callee) == KIND_CLOSURE && is_unique(callee);
+    let r = applied(ctx, callee, args, give);
     heap::dec(callee);
     r
 }
@@ -3844,6 +3846,12 @@ pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n
 /// Applies `callee` to `args`, or answers 0 with the context failed. Reads the callee, takes the
 /// arguments.
 pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
+    applied(ctx, callee, args, false)
+}
+
+/// `call_value`, a closure's captures taken out of it where `give` is set: the caller holds the
+/// closure alone and lets it go after.
+fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
     let c = unsafe { &mut *ctx };
     match heap::kind(callee) {
         KIND_CLOSURE => {
@@ -3856,7 +3864,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                 ));
                 return c.fail(d);
             }
-            // Captures are held once more; the arguments are already taken.
+            // Captures are held once more, or given; the arguments are already taken.
             // Uninitialised on purpose, as zeroing costs every call;
             // exactly `total` words are written and read.
             let mut handles = [const { std::mem::MaybeUninit::<i64>::uninit() }; 64];
@@ -3873,7 +3881,11 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
             };
             for i in 0..captures {
                 let w = unsafe { word_at(o, CLOSURE_CAPTURES + i) };
-                heap::inc(w);
+                if give {
+                    unsafe { set_word(o, CLOSURE_CAPTURES + i, heap::unit()) };
+                } else {
+                    heap::inc(w);
+                }
                 push(w, i);
             }
             for (i, w) in args.iter().enumerate() {

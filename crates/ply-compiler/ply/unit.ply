@@ -17,6 +17,7 @@ import std.bin
 import std.list (sort_by, take, at, concat)
 import std.graph
 import std.bytes (hex_of, u32_at, u64_le, hex_digit, ascii_of_int)
+import std.fs
 import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
@@ -63,6 +64,11 @@ pub effect shipped {
   /// A program as this binary's launcher enters it: the entry it runs, its front end's answer over
   /// every source that answer's indices run over, in their order, and the C of its unit.
   read runnable(entry: String, files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes) -> Bytes
+  /// What each of `roots`, each a `stored_root` of a `const` definition, answers on `unit` compiled
+  /// here over that front end's answer, each called alone with nothing lent and under `steps`
+  /// calls: the text its value is kept as, or none where it raised, ran past its calls, or the unit
+  /// holds no such root.
+  read values(files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes, roots: List<String>, steps: Int) -> List<Option<Bytes>>
 }
 
 /// The hash `definitions` holds for a definition of the compiler's, `name` as the compiler's own
@@ -1328,6 +1334,44 @@ fn answers_at_once(
 /// A `const` definition and the text a build kept its value as, which the runtime wrote and reads.
 pub type Baked = { name: Bytes, text: Bytes }
 
+/// The calls a `const` definition may make before a build gives up on it.
+pub fn const_budget() -> Int = 100000000
+
+/// The bytes of text a `const` definition's value may be kept as.
+pub fn const_room() -> Int = 16777216
+
+/// What a `const` definition's value is a function of, and so kept under: the runtime that
+/// evaluated and wrote it, the compiler whose code it ran as, and what the front end keeps it
+/// under, which is the hash of all it reaches, the files it embeds among them, and the names of it.
+pub fn baked_key(runtime: Bytes, emitter: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([sized(b"ply baked value 1"), sized(runtime), sized(emitter), sized(hash)]),
+    ),
+  )
+
+/// A value kept under `dir`, whole. It is kept behind its own digest, so one a full disk cut short
+/// reads as none and is evaluated again.
+pub fn kept_value<[r]>(
+  dir: String,
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], fs.write[r], time.now_ms, abort.raise} =
+  match read_kept[r](dir, key) {
+    None -> None,
+    Some(bytes) -> if bytes_len(bytes) < 32 { None } else {
+      let text = bytes_slice(bytes, 32, bytes_len(bytes));
+      if blake3(text) == bytes_slice(bytes, 0, 32) { Some(text) } else { None }
+    },
+  }
+
+/// `text` kept under `dir` as `kept_value` reads it back.
+pub fn keep_value<[r]>(
+  dir: String,
+  key: Bytes,
+  text: Bytes,
+) -> Unit / {fs.write[r], entropy.next, time.now_ms, abort.raise} =
+  write_kept[r](dir, key, bytes_concat(blake3(text), text))
+
 /// The root that answers a `const` definition's value as that text: what a build enters to keep it.
 pub fn stored_root(name: Bytes) -> Bytes = bytes_concat(name, b"#stored")
 
@@ -2137,6 +2181,41 @@ test "a value's text is cut into literals no longer than a compiler takes" {
   assert_eq(quoted(b""), b"\"\"\n");
   let long = bytes_concat_all(map(range(0, piece_len() + 1), |_: Int| b"0"));
   assert_eq(len(bytes_split(quoted(long), b"\n")), 3)
+}
+
+/// What reading `key` back answers over a directory `kept` whose file for it holds `bytes`.
+fn read_back(tree: fs::MemFs, key: Bytes, bytes: Bytes) -> Option<Bytes> / {abort.raise} =
+  fs::on_mem[abs](fs::mem_write(tree, "kept/" ++ string_of_bytes(key), bytes).fs, ||
+    handle { kept_value[abs]("kept", key) } with { time.now_ms() -> 0 }).value
+
+test "a kept value reads back whole, and one cut short or altered reads as none" {
+  let key = baked_key(b"runtime", b"emitter", b"hash");
+  let kept = fs::on_mem[abs](fs::mem_empty(), ||
+    handle {
+      keep_value[abs]("kept", key, b"78da01");
+      kept_value[abs]("kept", key)
+    } with {
+      entropy.next() -> 7,
+      time.now_ms() -> 0,
+    });
+  assert_eq(kept.value, Some(b"78da01"));
+  let whole = match fs::mem_read(kept.tree, "kept/" ++ string_of_bytes(key)) {
+    Some(bytes) -> bytes,
+    None -> panic("the value is kept under its key"),
+  };
+  assert_eq(read_back(kept.tree, key, whole), Some(b"78da01"));
+  assert_eq(read_back(kept.tree, key, bytes_slice(whole, 0, bytes_len(whole) - 1)), None);
+  assert_eq(read_back(kept.tree, key, bytes_concat(whole, b"0")), None);
+  assert_eq(read_back(kept.tree, key, b""), None)
+}
+
+test "a value is kept under the runtime, the compiler and the hash of all its definition reaches" {
+  let key = baked_key(b"runtime", b"emitter", b"hash");
+  assert_eq(bytes_len(key), 64);
+  assert(baked_key(b"another", b"emitter", b"hash") != key);
+  assert(baked_key(b"runtime", b"another", b"hash") != key);
+  assert(baked_key(b"runtime", b"emitter", b"another") != key);
+  assert(baked_key(b"runtim", b"eemitter", b"hash") != key)
 }
 
 test "a unit takes what its callees let it, resolves its bodies and says what it holds" {
