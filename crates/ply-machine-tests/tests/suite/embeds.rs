@@ -56,6 +56,48 @@ fn a_program_runs_what_a_shipped_module_it_imports_embedded() {
     assert!(ran.failure.is_none(), "the test passes: {:?}", ran.failure);
 }
 
+/// `std.hash.legacy` is `hash/legacy.ply` below the library, beside `std.hash`'s `hash.ply`.
+#[test]
+fn a_shipped_module_below_the_library_is_named_by_its_place_and_imported_beside_its_parent() {
+    use ply_machine::shipped_modules;
+    let names = shipped_modules::names();
+    assert!(names.iter().any(|n| n == "std.hash"), "{names:?}");
+    assert!(names.iter().any(|n| n == "std.hash.legacy"), "{names:?}");
+    let on_disk = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ply-std/ply/hash/legacy.ply"),
+    )
+    .expect("the checkout holds the module");
+    let module = ply_eval::ModuleName::from_dotted("std.hash.legacy");
+    assert_eq!(shipped_modules::source(&module), Some(on_disk.as_str()));
+    assert_eq!(
+        shipped_modules::pseudo_path(&module),
+        std::path::PathBuf::from("<std>/hash/legacy.ply")
+    );
+    assert!(
+        !shipped_modules::data_names()
+            .iter()
+            .any(|n| n.ends_with(".ply")),
+        "a module was listed as data"
+    );
+    let dir = scratch();
+    write(
+        dir.path(),
+        "m.ply",
+        "import std.hash (sha256)\nimport std.hash.legacy (sha1)\nimport std.bytes (hex_of)\n\n\
+         test \"both\" {\n  \
+         assert_eq(hex_of(sha1(b\"abc\")), \"a9993e364706816aba3e25717850c26c9cd0d89d\");\n  \
+         assert_eq(bytes_len(sha256(b\"abc\")), 32)\n}\n",
+    );
+    let loaded = loaded(dir.path());
+    let executor = Executor {
+        front: &loaded.front,
+        hosting: Hosting::default(),
+        provider: backend(&loaded),
+    };
+    let ran = testrun::executed(&executor, 0, None);
+    assert!(ran.failure.is_none(), "the test passes: {:?}", ran.failure);
+}
+
 #[test]
 fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
     use ply_machine::shipped_modules;
