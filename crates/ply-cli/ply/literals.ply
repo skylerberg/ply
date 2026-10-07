@@ -17,11 +17,13 @@ import compiler.lexer (utf8_len)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.parsing (Span, no_module)
 import compiler.resolve (Diag, Label, error_at, error_with_labels, label_at)
-import compiler.unit (read_kept, write_kept, shipped, emitter_identity, stored_root)
+import compiler.unit (read_kept, write_kept, shipped, compiler_roots, emitter_identity, identity_of,
+                      stored_root)
 import diagnostic (Place, shown)
 import env (env)
 import machine (machine, Called, default_options, unconfigured)
 import program (Timed, front_of)
+import semantics
 import sources (under_abs)
 import statements
 import statements (Asking, Judgement, Unjudged, asking, judged, judgement_key, judgement_bin,
@@ -499,14 +501,13 @@ fn entered(
 
 /// What a verdict is a function of: the toolchain that entered the definition, the budget, the
 /// definition by the hash of all it reaches, and the texts.
-fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise} =
+fn verdict_key(toolchain: Bytes, a: Asked) -> Bytes / {abort.raise} =
   hex(
     blake3(
       bytes_concat_all([
-        sized(b"ply literal verdict 1"),
+        sized(b"ply literal verdict 2"),
         sized(hex(bin::shape_digest(verdict_bin()))),
-        sized(bytes_of_string(stamp)),
-        sized(bytes_of_string(version)),
+        sized(toolchain),
         sized(bytes_of_string(int_to_string(budget_of(a)))),
         sized(a.hash),
         sized(bytes_of_string(int_to_string(len(a.parts)))),
@@ -514,6 +515,25 @@ fn verdict_key(stamp: String, version: String, a: Asked) -> Bytes / {abort.raise
       ]),
     ),
   )
+
+/// What a verdict or a judgement is a function of on the toolchain's side: the runtime, the binary,
+/// what the program's hashes mean, and the code that analyses, emits and judges, by the hash of all
+/// it reaches. No shipped module is part of it: what a definition reaches of one is in its hash.
+fn judging(definitions: Bytes, runtime: Bytes, version: String) -> Bytes / {abort.raise} =
+  hex(
+    blake3(
+      bytes_concat_all([
+        sized(b"ply literal toolchain 1"),
+        sized(runtime),
+        sized(bytes_of_string(version)),
+        sized(bytes_of_string(semantics::version())),
+        sized(identity_of(definitions, judging_roots())),
+      ]),
+    ),
+  )
+
+/// The definitions a verdict or a judgement is a function of besides what it is asked over.
+fn judging_roots() -> List<Bytes> = push(compiler_roots(), b"literals.settling")
 
 /// `value` is the key a `const` definition's value is kept under, which a unit finds it by.
 type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
@@ -523,20 +543,26 @@ type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 /// the parsers on one machine and the `const` definitions on another, each under its budget.
 pub fn settling<a | e>(
   body: () -> a / {literal.verdicts, literal.statements | e},
-) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
   handle {
     body()
   } with {
     literal.statements(timed, analysis, root, asked) ->
-      judgements(under_abs(env.bodies[sys]()), root, timed, analysis, asked),
+      judgements(
+        under_abs(env.bodies[sys]()),
+        judging(shipped.definitions(), shipped.runtime().identity, env.binary_version[sys]()),
+        root,
+        timed,
+        analysis,
+        asked,
+      ),
     literal.verdicts(timed, analysis, root, asked) -> {
       let dir = under_abs(env.bodies[sys]());
-      let stamp = env.shipped_digest[sys]();
-      let version = env.binary_version[sys]();
       let runtime = shipped.runtime().identity;
+      let toolchain = judging(shipped.definitions(), runtime, env.binary_version[sys]());
       let emitter = emitter_identity(shipped.definitions());
       let sought = map(asked, |a: Asked| {
-        let key = verdict_key(stamp, version, a);
+        let key = verdict_key(toolchain, a);
         let value = if is_const(a) { baked_key(runtime, emitter, a.hash) } else { b"" };
         let verdict = match read_kept[abs](dir, key) {
           None -> None,
@@ -610,15 +636,14 @@ type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
 /// to, in their order.
 fn judgements(
   dir: String,
+  toolchain: Bytes,
   root: String,
   timed: Timed,
   analysis: Analysis,
   asked: List<statements::Asked>,
-) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
-  let stamp = env.shipped_digest[sys]();
-  let version = env.binary_version[sys]();
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let keyed = map(asked, |a: statements::Asked| {
-    let key = judgement_key(stamp, version, step_budget(), a);
+    let key = judgement_key(toolchain, step_budget(), a);
     {
       asked: a,
       key: key,
@@ -834,24 +859,42 @@ test "a `const` definition is asked with no text, under its own budget" {
   assert(is_const(a));
   assert_eq(budget_of(a), const_budget());
   assert_eq(budget_of({ ..a, parts: [b"x"] }), step_budget());
-  assert(verdict_key("b3:a", "0.1.0", a) != verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }))
+  assert(verdict_key(b"t", a) != verdict_key(b"t", { ..a, hash: b"g" }))
 }
 
 test "a verdict is kept under the toolchain, the parser's hash and the text" {
   let a: Asked = { callee: b"m.literal", hash: b"h", parts: [b"a"] };
-  let key = verdict_key("b3:a", "0.1.0", a);
-  assert_eq(verdict_key("b3:a", "0.1.0", { ..a, callee: b"n.literal" }), key);
-  assert(verdict_key("b3:b", "0.1.0", a) != key);
-  assert(verdict_key("b3:a", "0.2.0", a) != key);
-  assert(verdict_key("b3:a", "0.1.0", { ..a, hash: b"g" }) != key);
-  assert(verdict_key("b3:a", "0.1.0", { ..a, parts: [b"b"] }) != key);
+  let key = verdict_key(b"t", a);
+  assert_eq(verdict_key(b"t", { ..a, callee: b"n.literal" }), key);
+  assert(verdict_key(b"u", a) != key);
+  assert(verdict_key(b"t", { ..a, hash: b"g" }) != key);
+  assert(verdict_key(b"t", { ..a, parts: [b"b"] }) != key);
   // The texts around a hole are not the one text they would join to.
   assert(
-    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
-      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab"] }),
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] }) != verdict_key(b"t", { ..a, parts: [b"ab"] }),
   );
   assert(
-    verdict_key("b3:a", "0.1.0", { ..a, parts: [b"a", b"b"] })
-      != verdict_key("b3:a", "0.1.0", { ..a, parts: [b"ab", b""] }),
+    verdict_key(b"t", { ..a, parts: [b"a", b"b"] })
+      != verdict_key(b"t", { ..a, parts: [b"ab", b""] }),
   )
+}
+
+test "the toolchain a verdict is kept under moves with the code that judges it, and with no shipped module" {
+  let held = |settling: Bytes, other: Bytes|
+    bytes_concat_all(
+      map(push(judging_roots(), b"std.result.unreached"), |name: Bytes|
+        bytes_concat_all([
+          name,
+          b" ",
+          if name == b"literals.settling" { settling }
+          else if name == b"std.result.unreached" { other }
+          else { b"aa" },
+          b"\n",
+        ])),
+    );
+  let toolchain = judging(held(b"s1", b"o1"), b"runtime", "0.1.0");
+  assert_eq(judging(held(b"s1", b"o2"), b"runtime", "0.1.0"), toolchain);
+  assert(judging(held(b"s2", b"o1"), b"runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"other runtime", "0.1.0") != toolchain);
+  assert(judging(held(b"s1", b"o1"), b"runtime", "0.2.0") != toolchain)
 }
