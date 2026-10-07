@@ -15,8 +15,9 @@ import env (env)
 import loads (shipped_stamps)
 import results
 import std.random (entropy)
+import std.hash (blake3)
 import std.fs (fs, File, mem_kind, mem_list, mem_modified, mem_of, mem_size)
-import std.list (sort_by, at_or, concat, contains, dedup, flat_map)
+import std.list (sort_by, at, at_or, concat, contains, dedup, flat_map)
 import std.path (parent)
 import std.time (time)
 import std.cli (Parsed, Run, has, parse, parse_nat, value, values_of)
@@ -55,6 +56,7 @@ import trials (Bench, Evident, Tried, diagnosed, trial, by_name)
 import trials
 import walk
 import views
+import listings
 import answers
 import program
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
@@ -2456,19 +2458,38 @@ fn selected(
     let handing = time.elapsed_us();
     let handed = front_of(timed, analysis);
     let listing = time.elapsed_us();
-    // Which tests there are is the tables' to say, so each test over cases lists its own first.
-    match listed(handed, over_cases(analysis, options)) {
+    // Which tests there are is the tables' to say, so each test over cases lists its own first,
+    // unless a run kept what it listed while all its table reaches stands.
+    let hashed = hashed_by_kind(analysis);
+    let asked = map(over_cases(analysis, options), |i: Int|
+      { test: i, hash: listing_hash(analysis, timed.program.places, hashed, i) });
+    let place = listings_at(flags.paths);
+    let stamp = bytes_of_string(shipped_stamps().runtime);
+    let kept = if options.no_cache { map_new() }
+    else if place.label == "cwd" { listings::kept[cwd](place.dir, stamp, asked) }
+    else { listings::kept[abs](place.dir, stamp, asked) };
+    let unkept = filter(asked, |a: listings::Asked| !map_contains(kept, a.test));
+    match listed(handed, map(unkept, |a: listings::Asked| a.test)) {
       Err(diags) -> {
         tester.ended[corpus]();
         unbound(style, { diags: diags, places: timed.program.places })
       },
-      Ok(found) ->
+      Ok(found) -> {
+        if options.no_cache { () }
+        else if place.label == "cwd" { listings::keep[cwd](place.dir, stamp, unkept, found.cases) }
+        else { listings::keep[abs](place.dir, stamp, unkept, found.cases) };
+        let cases = map_fold(
+          kept,
+          found.cases,
+          |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: List<Listed>|
+            map_insert(acc, i, Ok(listed)),
+        );
         decided_run(
           flags,
           style,
           options,
           timed,
-          ranged(analysis, found.cases),
+          ranged(analysis, cases),
           handed,
           found.unit,
           opened,
@@ -2476,10 +2497,64 @@ fn selected(
           { ..spent, store_us: handing - configuring, handoff_us: listing - handing },
           listing,
           keeping,
-        ),
+        )
+      },
     }
   })
 }
+
+/// Each definition's hash and each declaration's, by kind and name: a function and a type may share
+/// a name.
+fn hashed_by_kind(analysis: Analysis) -> Map<Bytes, Bytes> =
+  fold(
+    analysis.hashes.decls,
+    fold(
+      analysis.hashes.defs,
+      map_new(),
+      |acc: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
+        map_insert(acc, bytes_concat(b"fn ", d.name), d.hash),
+    ),
+    |acc: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
+      map_insert(acc, bytes_concat(b"decl ", d.name), d.hash),
+  )
+
+/// What a test over cases lists is a function of: its text, its table and its label among it, and
+/// each definition it references, by its hash. The test's own hash leaves its table and its label
+/// out, so that a case added moves no other case's key.
+fn listing_hash(
+  analysis: Analysis,
+  places: List<Place>,
+  hashed: Map<Bytes, Bytes>,
+  i: Int,
+) -> Bytes / {abort.raise} =
+  match test_at(analysis, i) {
+    None -> b"",
+    Some(t) -> {
+      let text = match list_at(places, t.at.module) {
+        Some(place) -> if t.at.span.end <= bytes_len(place.text)
+            && t.at.span.start <= t.at.span.end {
+          bytes_slice(place.text, t.at.span.start, t.at.span.end)
+        } else { b"" },
+        None -> b"",
+      };
+      let r = analysis.hashes.refs;
+      blake3(
+        bytes_concat_all(
+          fold(at_or(analysis.hashes.test_refs, i, []), [text], |acc: List<Bytes>, v: Int| {
+            let key = bytes_concat(if at(r.decls, v) { b"decl " } else { b"fn " }, at(r.names, v));
+            push(push(acc, key), match map_get(hashed, key) { Some(h) -> h, None -> b"" })
+          }),
+        ),
+      )
+    },
+  }
+
+/// Where a project keeps what its tests over cases listed.
+fn listings_at(paths: List<paths::Resolved>) -> { label: String, dir: String } =
+  match list_at(paths, 0) {
+    Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/listings").path },
+    None -> { label: "cwd", dir: ".ply-cache/listings" },
+  }
 
 /// The run over the tests as listing left them. `built` is the unit listing built and bound as
 /// the first, when anything was listed: the run's tests then run in it. `listing` is when listing
