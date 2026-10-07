@@ -36,7 +36,7 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               test_owner, cases_root, listing_ty, witness_order_bin, elaborated, ended, stated,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
               builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts,
-              InstanceInfo, NumericInfo, Raise, raise_bin)
+              InstanceInfo, NumericInfo, Raise, raise_bin, Elaboration)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -3477,10 +3477,10 @@ pub fn claims(
 }
 
 /// The claims of the modules at `wanted`, ascending and closed under imports, lowered as `claims`
-/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and the checker
-/// walks again only the definitions there that write a record update — the one thing lowering reads
-/// from it — seeded with every other definition's and test's rows as the next analysis would be.
-/// A module the run does not own is claimed by its specs, so its source and its stub answer alike.
+/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and what
+/// lowering reads of the checker — the shape of each record update — is what the check filed, as
+/// the emitter reads it. A module the run does not own is claimed by its specs, so its source and
+/// its stub answer alike.
 pub fn claims_in(
   analysis: Analysis,
   wanted: List<Int>,
@@ -3488,6 +3488,23 @@ pub fn claims_in(
 ) -> List<Claim> / {abort.raise} = {
   let stubs = fold(analysis.stubs, map_new(), |acc: Map<Bytes, Bool>, s: Bytes|
     map_insert(acc, s, true));
+  let shapes = match facts_read(rows_of(analysis), walked_facts(analysis), None, analysis.mods) {
+    Ok(facts) -> facts.elaboration,
+    Err(_) -> rechecked(analysis, wanted),
+  };
+  claims_of_modules(
+    updated_mods(analysis.mods, shapes),
+    analysis.r,
+    wanted,
+    |m: Bytes| map_contains(stubs, m) || !owned(m),
+    ended(analysis.checked.defs),
+    stated(analysis.checked.defs),
+  )
+}
+
+/// What the checker makes of each record update at `wanted`, walked again where the check filed no
+/// facts to read: every other definition and test is seeded with its rows.
+fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.raise} = {
   let walked = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, i: Int| {
     let m = at(analysis.mods, i);
     fold(m.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
@@ -3509,15 +3526,7 @@ pub fn claims_in(
   );
   match elaboration_with(analysis.r, analysis.mods, known) {
     None -> panic("a program the front end checked does not check"),
-    Some(shapes) ->
-      claims_of_modules(
-        updated_mods(analysis.mods, shapes),
-        analysis.r,
-        wanted,
-        |m: Bytes| map_contains(stubs, m) || !owned(m),
-        ended(analysis.checked.defs),
-        stated(analysis.checked.defs),
-      ),
+    Some(shapes) -> shapes,
   }
 }
 
@@ -6469,6 +6478,22 @@ test "a refused program's answer is its diagnostics, placed where it went wrong,
   assert_eq(a.dump.defs, []);
   assert_eq(a.dump.tests, []);
   assert_eq(a.dump.hashes, [])
+}
+
+test "claims read each record update's shape from what the check filed, as a walk again finds it" {
+  let a = analysis_of([
+    {
+      name: b"m",
+      src: b"pub type P = { x: Int, y: Int }\n\npub fn moved(p: P) -> P\n  ensures result.x == p.x + 1\n= { ..p, x: p.x + 1 }\n",
+    },
+  ]);
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(string_of_bytes_lossy(why)),
+    Ok(f) -> {
+      assert(len(f.elaboration.updates) > 0, Some("the check filed no update"));
+      assert_eq(f.elaboration.updates, rechecked(a, [0]).updates)
+    },
+  }
 }
 
 fn analysis_of(sources: List<Source>) -> Analysis / {abort.raise} =
