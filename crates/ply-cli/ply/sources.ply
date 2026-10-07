@@ -7,8 +7,12 @@ import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.hash (hex)
 import std.path (join, is_absolute, normalize, parent)
-import compiler.front (module_of, Embedded, Shipping, ShippedData, embeds_wanted,
-                       shipped_data_wanted, shipped_pulled)
+import compiler.front (module_of, Embedded, Pulls, Shipping, ShippedData, embeds_wanted, pulls_bin,
+                       pulls_of, shipped_data_wanted, shipped_pulled)
+import compiler.unit (identity_of, read_kept, write_kept)
+import std.bin
+import std.random (entropy)
+import std.time (time)
 import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
@@ -511,8 +515,81 @@ pub fn shipping_for(
     listed,
     |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"),
     |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name)),
+    pulls_of,
     if every { filter(listed, |name: Bytes| is_std(string_of_bytes_lossy(name))) } else { [] },
   )
+}
+
+/// How a load found what its modules pull: the texts it lexed for it, and those whose answer an
+/// earlier load kept.
+pub type PullReads = { lexed: Int, kept: Int }
+
+pub type KeptShipping = { shipping: Shipping, reads: PullReads }
+
+/// [`shipping_for`] with what each module's text says it pulls kept in the store of `paths`, under
+/// the text's digest: a load lexes only the texts it has not read before.
+pub fn shipping_kept(
+  paths: List<paths::Resolved>,
+  user: List<Source>,
+  pkgs: PackageSources,
+  every: Bool = false,
+) -> KeptShipping / {fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let listed = shipped_names();
+  let at = match list_at(paths, 0) {
+    Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/pulls").path },
+    None -> { label: "cwd", dir: ".ply-cache/pulls" },
+  };
+  // What a module pulls is a function of its text and of the code that reads it.
+  let reader = match fs.read_file[shipped]("definitions") {
+    Some(definitions) ->
+      bytes_concat_all([
+        b"ply.pulls.1\x00",
+        hex(bin::shape_digest(pulls_bin())),
+        b"\x00",
+        identity_of(definitions, [b"front.pulls_of"]),
+        b"\x00",
+      ]),
+    None -> b"",
+  };
+  with_cell[pulls]({ lexed: 0, kept: 0 }) { c -> {
+    let shipping = shipped_pulled(
+      user,
+      pkgs,
+      listed,
+      |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply"),
+      |name: Bytes| fs.read_file[shipped](string_of_bytes_lossy(name)),
+      |source: Source| {
+        let found = if bytes_len(reader) == 0 { { pulls: pulls_of(source), kept: false } }
+        else if at.label == "cwd" { kept_pulls[cwd](at.dir, reader, source) }
+        else { kept_pulls[abs](at.dir, reader, source) };
+        cell_update(c, |n: PullReads|
+          if found.kept { { ..n, kept: n.kept + 1 } } else { { ..n, lexed: n.lexed + 1 } });
+        found.pulls
+      },
+      if every { filter(listed, |name: Bytes| is_std(string_of_bytes_lossy(name))) } else { [] },
+    );
+    { shipping: shipping, reads: cell_get(c) }
+  } }
+}
+
+fn kept_pulls<[r]>(
+  dir: String,
+  reader: Bytes,
+  source: Source,
+) -> { pulls: Pulls, kept: Bool } / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
+  let key = hex(blake3(bytes_concat(reader, blake3(source.src))));
+  let kept = match read_kept[r](dir, key) {
+    Some(bytes) -> match bin::decode(bytes, pulls_bin()) { Ok(p) -> Some(p), Err(_) -> None },
+    None -> None,
+  };
+  match kept {
+    Some(p) -> { pulls: p, kept: true },
+    None -> {
+      let p = pulls_of(source);
+      write_kept[r](dir, key, bin::encode(p, pulls_bin()));
+      { pulls: p, kept: false }
+    },
+  }
 }
 
 /// The data files `modules` embed, each read once off the directory bound as `shipped`.

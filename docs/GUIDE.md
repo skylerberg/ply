@@ -2943,7 +2943,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -3055,7 +3055,9 @@ moved and what reaches it, and a definition generic over an effect row or a
 label every time. The hash it is filed under reads a definition of another
 package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
-dependents' rows standing. A load reads its dependencies and the shipped modules it
+dependents' rows standing. What each module imports, and what it embeds, is kept
+in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
+has not read. A load reads its dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
