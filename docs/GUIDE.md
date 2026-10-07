@@ -1938,7 +1938,9 @@ its type call it a `Cell`.
 ### 8.1 Writing tests
 
 `test "label" { ... }` is an item with a block body (§6.5 shows one); it cannot
-be `pub`, referenced or given arguments. The body is `Unit`: a test passes when
+be `pub`, referenced or given arguments. It is keyed `<module>.<label>`, a test
+over cases by its label as written, holes and all, so two tests of one module
+may not share a label, as two laws may not (`E0105`). The body is `Unit`: a test passes when
 it finishes, so one that ends on a value, such as a comparison missing its
 `assert`, is `E0201`. `assert(cond)` / `assert(cond, Some("why"))` and
 `assert_eq(actual, expected)` fail with `E0501`, the latter reporting both
@@ -1982,12 +1984,15 @@ usually a call of the definition that builds it, often from `embed_dir` (§3.4);
 a nullary definition is computed once however many cases read it, and a record
 literal in it is a `new` record where the case's type is one (§4.2). The name is
 bound in the body and in the label, and a label before `for` is read as an
-interpolated string is (§2.3): each `{expr}` is a hole, `{{` and `}}` are
-braces, and a label with no hole names every case alike. A case is told from
+interpolated string is (§2.3): each `{expr}` is a hole, and `{{` and `}}` are
+braces. A case is keyed by the label its holes make, so a test's cases must
+render to distinct labels: a table two of whose cases render alike fails as one
+test, naming the label and the places in the table that hold it, and no case
+runs for another. Two cases built alike render alike, and a label with no hole
+fits a table of one case. A case is told from
 another by its value as it was built, which is finer than `==`: `1.5m` and
 `1.50m` are two cases, as are two values of a type whose `key` (§4.4) answers
-the same, so no case's pass stands for a case its body can tell from it. Two
-cases built alike are one. A case's type is `derivable(hash, ·)` read through
+the same, so no case's pass stands for a case its body can tell from it. A case's type is `derivable(hash, ·)` read through
 no `key` (`E0206`): it holds no `Float`, function, `Cell`, `Task`, `Chan` or
 `Secret`, and neither does a keyed type in it. The cases
 are listed before any test runs, so
