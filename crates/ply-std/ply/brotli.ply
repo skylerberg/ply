@@ -896,37 +896,16 @@ fn command_head(src: Bytes, bit: Int, state: Int, m: Meta) -> Head / {abort.rais
 fn command(
   src: Bytes,
   end: Int,
-  bit: Int,
-  out: Bytes,
-  literal_state: Int,
-  command_state: Int,
-  distance_state: Int,
-  near: Int,
-  far: Int,
-  left: Int,
-  insert: Int,
-  copy: Int,
+  s: Step,
   m: Meta,
   lim: Array<Int>,
   most: Int,
 ) -> Step / {brotli.refused, abort.raise} = {
-  let head = if copy == 0 { command_head(src, bit, command_state, m) }
-  else { { bit: bit, commands: command_state, insert: insert, copy: copy } };
-  if head.bit > end {
-    {
-      out: out,
-      bit: bit,
-      literals: literal_state,
-      commands: command_state,
-      distances: distance_state,
-      near: near,
-      far: far,
-      left: left,
-      insert: 0,
-      copy: 0,
-      starved: true,
-    }
-  } else if head.insert > left { bad(array_get(lim, 2), head.bit, end, Length) } else {
+  let head = if s.copy == 0 { command_head(src, s.bit, s.commands, m) }
+  else { { bit: s.bit, commands: s.commands, insert: s.insert, copy: s.copy } };
+  if head.bit > end { { ..s, insert: 0, copy: 0, starved: true } }
+  else if head.insert > s.left { bad(array_get(lim, 2), head.bit, end, Length) } else {
+    let out = s.out;
     let n = bytes_len(out);
     let ask = min(head.insert, most);
     let last = if n > 0 { bytes_at(out, n - 1) } else { 0 };
@@ -937,53 +916,35 @@ fn command(
       head.bit,
       out,
       ask,
-      literal_state,
+      s.literals,
       last,
       before,
       context_lookup(),
-      array_get(m.modes, literal_state & 255),
+      array_get(m.modes, s.literals & 255),
       singles(),
       m.literal_trees,
       m.literal_map,
       m,
       2 * ask + 2,
     );
-    let at = wrote.bit;
-    let state = wrote.state;
-    let grown = wrote.out;
-    let done = bytes_len(grown) - n;
-    if done < head.insert || left <= done || most <= done {
+    let done = bytes_len(wrote.out) - n;
+    let left = s.left - done;
+    let moved = {
+      ..s,
+      out: wrote.out,
+      bit: wrote.bit,
+      literals: wrote.state,
+      commands: head.commands,
+      left: left,
+    };
+    if done < head.insert || left <= 0 || most <= done {
       {
-        out: grown,
-        bit: at,
-        literals: state,
-        commands: head.commands,
-        distances: distance_state,
-        near: near,
-        far: far,
-        left: left - done,
+        ..moved,
         insert: head.insert - done,
-        copy: if done == head.insert && left <= done { 0 } else { head.copy },
+        copy: if done == head.insert && left <= 0 { 0 } else { head.copy },
         starved: done < ask,
       }
-    } else {
-      copied(
-        src,
-        end,
-        at,
-        grown,
-        state,
-        head.commands,
-        distance_state,
-        near,
-        far,
-        left - done,
-        m,
-        lim,
-        head.copy,
-        most - done,
-      )
-    }
+    } else { copied(src, end, moved, m, lim, head.copy, most - done) }
   }
 }
 
@@ -993,14 +954,7 @@ fn command(
 fn copied(
   src: Bytes,
   end: Int,
-  bit: Int,
-  out: Bytes,
-  literal_state: Int,
-  command_state: Int,
-  distance_state: Int,
-  near: Int,
-  far: Int,
-  left: Int,
+  s: Step,
   m: Meta,
   lim: Array<Int>,
   copy: Int,
@@ -1008,25 +962,11 @@ fn copied(
 ) -> Step / {brotli.refused, abort.raise} = {
   let length = copy >>> 1;
   if copy & 1 == 1 {
-    placed_copy(
-      end,
-      bit,
-      out,
-      literal_state,
-      command_state,
-      distance_state,
-      near,
-      far,
-      left,
-      lim,
-      length,
-      near & 0x1FF_FFFF,
-      0,
-      most,
-    )
+    let last = s.near & 0x1FF_FFFF;
+    placed_copy(end, s, lim, length, last, 0, most)
   } else {
-    let turned = if distance_state >>> 16 == 0 { switched(src, bit, distance_state, m.distances) }
-    else { { state: distance_state, bit: bit } };
+    let turned = if s.distances >>> 16 == 0 { switched(src, s.bit, s.distances, m.distances) }
+    else { { state: s.distances, bit: s.bit } };
     let context = if length > 4 { 3 } else { length - 2 };
     let tree = array_get(
       m.distance_trees,
@@ -1037,28 +977,14 @@ fn copied(
     let at = turned.bit + (e & 15);
     let rest = code - m.direct - 16;
     let width = if rest < 0 { 0 } else { 1 + (rest >>> m.postfix + 1) };
-    if at + width > end {
-      {
-        out: out,
-        bit: bit,
-        literals: literal_state,
-        commands: command_state,
-        distances: distance_state,
-        near: near,
-        far: far,
-        left: left,
-        insert: 0,
-        copy: copy,
-        starved: true,
-      }
-    } else {
-      let d0 = near & 0x1FF_FFFF;
-      let d1 = near >>> 25;
+    if at + width > end { { ..s, insert: 0, copy: copy, starved: true } } else {
+      let d0 = s.near & 0x1FF_FFFF;
+      let d1 = s.near >>> 25;
       let dist = if code < 16 {
         let from = if code == 0 { d0 }
         else if code == 1 { d1 }
-        else if code == 2 { far & 0x1FF_FFFF }
-        else if code == 3 { far >>> 25 }
+        else if code == 2 { s.far & 0x1FF_FFFF }
+        else if code == 3 { s.far >>> 25 }
         else if code < 10 { d0 }
         else { d1 };
         let off = if code < 4 { 0 } else { (code - 4 >>> 1) % 3 + 1 };
@@ -1070,14 +996,7 @@ fn copied(
       };
       placed_copy(
         end,
-        at + width,
-        out,
-        literal_state,
-        command_state,
-        turned.state - 65536,
-        near,
-        far,
-        left,
+        { ..s, bit: at + width, distances: turned.state - 65536 },
         lim,
         length,
         dist,
@@ -1094,57 +1013,43 @@ fn copied(
 /// for the last used becomes the last used, unless it named a word.
 fn placed_copy(
   end: Int,
-  bit: Int,
-  out: Bytes,
-  literal_state: Int,
-  command_state: Int,
-  distance_state: Int,
-  near: Int,
-  far: Int,
-  left: Int,
+  s: Step,
   lim: Array<Int>,
   length: Int,
   dist: Int,
   code: Int,
   most: Int,
 ) -> Step / {brotli.refused, abort.raise} = {
+  let out = s.out;
   let n = bytes_len(out);
   let base = array_get(lim, 2);
   let reach = min(array_get(lim, 0) + n, array_get(lim, 1));
-  if dist <= 0 { bad(base, bit, end, Distance) } else if dist <= reach {
-    if length > left { bad(base, bit, end, Length) } else {
+  if dist <= 0 { bad(base, s.bit, end, Distance) } else if dist <= reach {
+    if length > s.left { bad(base, s.bit, end, Length) } else {
       let now = min(length, most);
       {
+        ..s,
         out: if dist >= now { out ++ bytes_slice(out, n - dist, n - dist + now) }
         else { out ++ cycle(bytes_slice(out, n - dist, n), now) },
-        bit: bit,
-        literals: literal_state,
-        commands: command_state,
-        distances: distance_state,
-        near: if code == 0 { near } else { dist | (near & 0x1FF_FFFF) << 25 },
-        far: if code == 0 { far } else { near >>> 25 | (far & 0x1FF_FFFF) << 25 },
-        left: left - now,
+        near: if code == 0 { s.near } else { dist | (s.near & 0x1FF_FFFF) << 25 },
+        far: if code == 0 { s.far } else { s.near >>> 25 | (s.far & 0x1FF_FFFF) << 25 },
+        left: s.left - now,
         insert: 0,
         copy: if now < length { length - now << 1 | 1 } else { 0 },
         starved: false,
       }
     }
-  } else if length < 4 || length > 24 { bad(base, bit, end, Word) } else {
+  } else if length < 4 || length > 24 { bad(base, s.bit, end, Word) } else {
     let width = bytes_at(word_bits(), length);
     let id = dist - reach - 1;
     let from = array_get(word_starts(), length) + (id & (1 << width) - 1) * length;
-    if id >>> width > 120 { bad(base, bit, end, Word) } else {
+    if id >>> width > 120 { bad(base, s.bit, end, Word) } else {
       let word = transformed(bytes_slice(words(), from, from + length), id >>> width);
-      if bytes_len(word) > left { bad(base, bit, end, Length) } else {
+      if bytes_len(word) > s.left { bad(base, s.bit, end, Length) } else {
         {
+          ..s,
           out: out ++ word,
-          bit: bit,
-          literals: literal_state,
-          commands: command_state,
-          distances: distance_state,
-          near: near,
-          far: far,
-          left: left - bytes_len(word),
+          left: s.left - bytes_len(word),
           insert: 0,
           copy: 0,
           starved: false,
@@ -1167,34 +1072,7 @@ fn commands(
 ) -> Step / {brotli.refused, abort.raise} =
   if fuel <= 0 || s.starved || (s.left <= 0 && s.copy == 0) || bytes_len(s.out) >= stop { s } else {
     let most = stop - bytes_len(s.out);
-    let bit = s.bit;
-    let literal_state = s.literals;
-    let command_state = s.commands;
-    let distance_state = s.distances;
-    let near = s.near;
-    let far = s.far;
-    let left = s.left;
-    let insert = s.insert;
-    let copy = s.copy;
-    let out = s.out;
-    let next = command(
-      src,
-      end,
-      bit,
-      out,
-      literal_state,
-      command_state,
-      distance_state,
-      near,
-      far,
-      left,
-      insert,
-      copy,
-      m,
-      lim,
-      most,
-    );
-    commands(src, end, next, m, lim, stop, fuel - 1)
+    commands(src, end, command(src, end, s, m, lim, most), m, lim, stop, fuel - 1)
   }
 
 // --- Streams ------------------------------------------------------------------
@@ -1407,16 +1285,14 @@ fn block_start(d: Decoder) -> Decoder / {brotli.refused, abort.raise} = {
 fn plain_bytes(d: Decoder) -> Decoder / {brotli.refused, abort.raise} = {
   let core = d.core;
   let from = core.bit >>> 3;
-  let input = d.input;
-  let hist = d.hist;
-  let end = 8 * bytes_len(input) - 256;
+  let end = 8 * bytes_len(d.input) - 256;
   let count = min(core.left, (end >>> 3) - from);
   let left = core.left - count;
   let next = if left > 0 { { phase: core.phase, bit: 8 * (from + count) } }
-  else { after_block(input, 8 * (from + count), end, core.last, core.base) };
+  else { after_block(d.input, 8 * (from + count), end, core.last, core.base) };
   {
-    input: input,
-    hist: if core.phase == 3 { hist ++ bytes_slice(input, from, from + count) } else { hist },
+    ..d,
+    hist: if core.phase == 3 { d.hist ++ bytes_slice(d.input, from, from + count) } else { d.hist },
     core: {
       ..core,
       bit: next.bit,
@@ -1431,14 +1307,12 @@ fn plain_bytes(d: Decoder) -> Decoder / {brotli.refused, abort.raise} = {
 /// ends inside one.
 fn coded(d: Decoder, goal: Int) -> Decoder / {brotli.refused, abort.raise} = {
   let core = d.core;
-  let input = d.input;
-  let hist = d.hist;
-  let end = 8 * bytes_len(input) - 256;
+  let end = 8 * bytes_len(d.input) - 256;
   let s = commands(
-    input,
+    d.input,
     end,
     {
-      out: hist,
+      out: d.hist,
       bit: core.bit,
       literals: core.literals,
       commands: core.commands,
@@ -1456,22 +1330,25 @@ fn coded(d: Decoder, goal: Int) -> Decoder / {brotli.refused, abort.raise} = {
     core.left + end - core.bit + 8,
   );
   let next = if s.left > 0 || s.copy != 0 { { phase: 2, bit: s.bit } }
-  else { after_block(input, s.bit, end, core.last, core.base) };
-  let moved = {
-    ..core,
-    bit: next.bit,
-    phase: next.phase,
-    need: if s.starved { 1 } else { 0 },
-    left: s.left,
-    literals: s.literals,
-    commands: s.commands,
-    distances: s.distances,
-    near: s.near,
-    far: s.far,
-    insert: s.insert,
-    copy: s.copy,
-  };
-  { input: input, hist: s.out, core: moved }
+  else { after_block(d.input, s.bit, end, core.last, core.base) };
+  {
+    ..d,
+    hist: s.out,
+    core: {
+      ..core,
+      bit: next.bit,
+      phase: next.phase,
+      need: if s.starved { 1 } else { 0 },
+      left: s.left,
+      literals: s.literals,
+      commands: s.commands,
+      distances: s.distances,
+      near: s.near,
+      far: s.far,
+      insert: s.insert,
+      copy: s.copy,
+    },
+  }
 }
 
 /// One step of a reader. A reader that needs more input than it has says so in `need`.
@@ -1770,11 +1647,9 @@ fn commands_written(
   at: Int,
   last: Int,
   k: Coding,
-  out: Bytes,
-  acc: Int,
-  n: Int,
+  w: Bits,
 ) -> Bits / {abort.raise} =
-  if i >= array_len(seqs) { { out: out, acc: acc, n: n } } else {
+  if i >= array_len(seqs) { w } else {
     let seq = array_get(seqs, i);
     let insert = seq & 0xF_FFFF;
     let copy = max(seq >>> 20 & 0xF_FFFF, 2);
@@ -1791,9 +1666,8 @@ fn commands_written(
       copy_codes(),
       bytes_at(b"\x00\x08\x00\x08\x00\x08\x10\x00\x10\x08\x10", cell) + (symbol & 7),
     );
-    let head = acc | code >>> 4 << n | insert - (ic >>> 5) << n + (code & 15);
-    let held = n + (code & 15) + (ic & 31);
-    let out1 = drained(out, head, held);
+    let head = w.acc | code >>> 4 << w.n | insert - (ic >>> 5) << w.n + (code & 15);
+    let held = w.n + (code & 15) + (ic & 31);
     let lengths = head >>> (held & 0x78) | copy - (cc >>> 5) << (held & 7);
     let held2 = (held & 7) + (cc & 31);
     let wrote = literals_written(
@@ -1801,14 +1675,12 @@ fn commands_written(
       at,
       at + insert,
       k.literals,
-      drained(out1, lengths, held2),
+      drained(drained(w.out, head, held), lengths, held2),
       lengths >>> (held2 & 0x78),
       held2 & 7,
     );
     let far = both >>> 10;
     if far == 64 {
-      let n3 = wrote.n;
-      let acc3 = wrote.acc;
       commands_written(
         seqs,
         i + 1,
@@ -1816,9 +1688,7 @@ fn commands_written(
         at + insert + (if dist == 0 { 0 } else { copy }),
         if dist == 0 { last } else { dist },
         k,
-        wrote.out,
-        acc3,
-        n3,
+        wrote,
       )
     } else {
       let dcode = array_get(k.distances, far);
@@ -1826,17 +1696,11 @@ fn commands_written(
       let tail = wrote.acc | dcode >>> 4 << wrote.n
         | (dist + 3 & (1 << width) - 1) << wrote.n + (dcode & 15);
       let held3 = wrote.n + (dcode & 15) + width;
-      commands_written(
-        seqs,
-        i + 1,
-        buf,
-        at + insert + copy,
-        dist,
-        k,
-        drained(wrote.out, tail, held3),
-        tail >>> (held3 & 0x78),
-        held3 & 7,
-      )
+      commands_written(seqs, i + 1, buf, at + insert + copy, dist, k, {
+        out: drained(wrote.out, tail, held3),
+        acc: tail >>> (held3 & 0x78),
+        n: held3 & 7,
+      })
     }
   }
 
@@ -1914,8 +1778,6 @@ fn block_written(
         code_written(code_written(headed, literal_lengths), command_lengths),
         distance_lengths,
       );
-      let n = spelled.n;
-      let acc = spelled.acc;
       let wrote = commands_written(
         seqs,
         0,
@@ -1927,9 +1789,7 @@ fn block_written(
           commands: codes_of(command_lengths),
           distances: codes_of(distance_lengths),
         },
-        spelled.out,
-        acc,
-        n,
+        spelled,
       );
       if bytes_len(wrote.out) >= bytes_len(stored) {
         { bytes: stored, packer: { table: table, last: last, acc: 0, n: 0 } }
@@ -1989,23 +1849,18 @@ type Pressed = { out: Bytes, next: Encoder }
 /// written. It keeps the 2 MiB before the bytes not yet written, and lets go of what is older
 /// once that is as much again.
 fn pressed(w: Encoder, chunk: Bytes, level: Level) -> Pressed / {abort.raise} = {
-  let from = w.from;
-  let shift = w.shift;
-  let packer = w.packer;
   let buf = bytes_concat(w.buf, chunk);
-  let whole = (bytes_len(buf) - from) / 131072 * 131072;
-  if whole == 0 { { out: b"", next: { buf: buf, from: from, shift: shift, packer: packer } } }
-  else {
-    let done = blocks_written(buf, from, from + whole, shift, level, packer, []);
-    let out = bytes_concat_all(done.out);
-    let at = from + whole;
+  let whole = (bytes_len(buf) - w.from) / 131072 * 131072;
+  if whole == 0 { { out: b"", next: { ..w, buf: buf } } } else {
+    let done = blocks_written(buf, w.from, w.from + whole, w.shift, level, w.packer, []);
+    let at = w.from + whole;
     let cut = if at > 4194304 { at - 2097152 } else { 0 };
     {
-      out: out,
+      out: bytes_concat_all(done.out),
       next: {
         buf: if cut == 0 { buf } else { bytes_slice(buf, cut, bytes_len(buf)) },
         from: at - cut,
-        shift: shift + cut,
+        shift: w.shift + cut,
         packer: done.packer,
       },
     }
@@ -2347,7 +2202,20 @@ test "the reasons only a command can give are given where it stands" {
   let lim = array_of_list([0, 1008, 100]);
   let placed = |length: Int, dist: Int, left: Int| -> Result<Bytes, Refusal> {
     try {
-      placed_copy(800, 80, b"abcdef", 0, 0, 0, ring, ring, left, lim, length, dist, 5, 1000).out
+      let s = {
+        out: b"abcdef",
+        bit: 80,
+        literals: 0,
+        commands: 0,
+        distances: 0,
+        near: ring,
+        far: ring,
+        left: left,
+        insert: 0,
+        copy: 0,
+        starved: false,
+      };
+      placed_copy(800, s, lim, length, dist, 5, 1000).out
     }
   };
   assert_eq(placed(3, 2, 10), Ok(b"abcdefefe"));
@@ -2490,4 +2358,21 @@ test "64 KiB of text takes under three steps a byte to unpack, and under five to
   assert(packed.steps < 5 * 65536, Some(int_to_string(packed.steps)));
   let read = metered(|| decompress(packed.value, roomy()));
   assert(read.steps < 3 * 65536, Some(int_to_string(read.steps)))
+}
+
+test "64 KiB of short matches unpacks without a copy of the output for each" {
+  let picks = noise(13200);
+  let text = bytes_slice(
+    bytes_concat_all(
+      map(range(0, 13200), |i: Int| {
+        let k = (bytes_at(picks, i) & 31) * 2;
+        bytes_slice(sentence(), k, k + 5)
+      }),
+    ),
+    0,
+    65536,
+  );
+  let packed = compress(text, Fast);
+  let read = metered(|| decompress(packed, roomy()));
+  assert(read.bytes < 128 * 65536, Some(int_to_string(read.bytes)))
 }

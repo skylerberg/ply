@@ -213,20 +213,34 @@ pub fn read_all<| e>(
     fold_chunks(source, chunk, limit, [], |parts: List<Bytes>, bytes: Bytes| push(parts, bytes)),
   )
 
-/// The lines `chunk` completes after `rest`, each without its `\n`, and what follows the last
-/// `\n`: one step of a reader of lines, which carries `rest` to the next chunk.
+/// The lines `chunk` completes after the pieces of an unfinished line `pending` holds, each
+/// without its `\n`, and the pieces of the line it leaves unfinished: one step of a reader of
+/// lines, which carries `pending` to the next chunk. Only `chunk` is searched, and a line is
+/// joined once, when its `\n` arrives, so a line read in many chunks costs its length.
 pub fn split_lines(
-  rest: Bytes,
+  pending: List<Bytes>,
   chunk: Bytes,
-) -> { lines: List<Bytes>, rest: Bytes } / {abort.raise} = {
-  let parts = bytes_split(bytes_concat(rest, chunk), b"\n");
-  let whole = len(parts) - 1;
-  { lines: take(parts, whole), rest: at(parts, whole) }
-}
+) -> { lines: List<Bytes>, pending: List<Bytes> } / {abort.raise} =
+  match bytes_index_of_byte(chunk, 10) {
+    None ->
+      { lines: [], pending: if bytes_len(chunk) == 0 { pending } else { push(pending, chunk) } },
+    Some(cut) -> {
+      let parts = bytes_split(bytes_slice(chunk, cut + 1, bytes_len(chunk)), b"\n");
+      let whole = len(parts) - 1;
+      let last = at(parts, whole);
+      {
+        lines: concat(
+          [bytes_concat_all(push(pending, bytes_slice(chunk, 0, cut)))],
+          take(parts, whole),
+        ),
+        pending: if bytes_len(last) == 0 { [] } else { [last] },
+      }
+    },
+  }
 
 /// `f` over each line of the source, without its `\n`; a last line needs none, and a source that
 /// ends in `\n` has no empty line after it. It reads `chunk` bytes at a time and at most `limit`
-/// in all.
+/// in all, and a line costs its length however many chunks it spans.
 pub fn fold_lines<a | e>(
   source: Hold<Source<| e>>,
   chunk: Int,
@@ -235,21 +249,21 @@ pub fn fold_lines<a | e>(
   f: (a, Bytes) -> a / e,
 ) -> a / {hold.read, io.too_long, abort.raise | e} = {
   let ended = iterate(
-    { acc: init, rest: b"", read: 0 },
+    { acc: init, pending: [], read: 0 },
     steps(chunk, limit),
-    |s: { acc: a, rest: Bytes, read: Int }| {
+    |s: { acc: a, pending: List<Bytes>, read: Int }| {
       let bytes = next(source, chunk, limit, s.read);
       if bytes_len(bytes) == 0 { Stop(s) } else {
-        let split = split_lines(s.rest, bytes);
+        let split = split_lines(s.pending, bytes);
         Continue({
           acc: fold(split.lines, s.acc, f),
-          rest: split.rest,
+          pending: split.pending,
           read: s.read + bytes_len(bytes),
         })
       }
     },
   );
-  if bytes_len(ended.rest) == 0 { ended.acc } else { f(ended.acc, ended.rest) }
+  match ended.pending { [] -> ended.acc, pieces -> f(ended.acc, bytes_concat_all(pieces)) }
 }
 
 /// Copies what the source holds into the sink, `chunk` bytes at a time and in the memory of one
@@ -298,16 +312,19 @@ pub fn lines<| e>(
   chunk: Int,
 ) -> Seq<Bytes | {hold.read, abort.raise | e}> =
   seq::flat_map(
-    seq::unfold(Some(b""), |left: Option<Bytes>|
+    seq::unfold(Some([]), |left: Option<List<Bytes>>|
       match left {
         None -> None,
-        Some(rest) -> {
+        Some(pending) -> {
           let bytes = read(source, chunk);
           if bytes_len(bytes) == 0 {
-            Some({ value: if bytes_len(rest) == 0 { [] } else { [rest] }, next: None })
+            Some({
+              value: match pending { [] -> [], pieces -> [bytes_concat_all(pieces)] },
+              next: None,
+            })
           } else {
-            let split = split_lines(rest, bytes);
-            Some({ value: split.lines, next: Some(split.rest) })
+            let split = split_lines(pending, bytes);
+            Some({ value: split.lines, next: Some(split.pending) })
           }
         },
       }),
@@ -321,13 +338,15 @@ fn drawn(picks: List<Int>) -> Bytes =
   bytes_concat_all(map(picks, |p: Int| if p % 2 == 0 { b"\n" } else { b"a" }))
 
 fn split_in_two(h: Halves) -> { lines: List<Bytes>, rest: Bytes } / {abort.raise} = {
-  let first = split_lines(b"", drawn(h.head));
-  let second = split_lines(first.rest, drawn(h.tail));
-  { lines: concat(first.lines, second.lines), rest: second.rest }
+  let first = split_lines([], drawn(h.head));
+  let second = split_lines(first.pending, drawn(h.tail));
+  { lines: concat(first.lines, second.lines), rest: bytes_concat_all(second.pending) }
 }
 
-fn split_whole(h: Halves) -> { lines: List<Bytes>, rest: Bytes } / {abort.raise} =
-  split_lines(b"", bytes_concat(drawn(h.head), drawn(h.tail)))
+fn split_whole(h: Halves) -> { lines: List<Bytes>, rest: Bytes } / {abort.raise} = {
+  let one = split_lines([], bytes_concat(drawn(h.head), drawn(h.tail)));
+  { lines: one.lines, rest: bytes_concat_all(one.pending) }
+}
 
 law "the lines of a text are the same wherever a chunk ends" = agrees(split_in_two, split_whole)
 
@@ -502,6 +521,48 @@ test "the lines of a source are one sequence whatever the chunk and whatever sho
       shut,
     ) { source -> seq::to_list(lines(source, c.chunk), 64) });
   assert_eq(read.value, [b"one", b"two", b"three"])
+}
+
+/// A file of one line of `n` bytes, which ends in a newline, then a short line.
+fn one_long_line(n: Int) -> fs::MemFs / {abort.raise} =
+  fs::mem_of([
+    {
+      path: "long",
+      body: bytes_concat(
+        bytes_concat_all(
+          map(range(0, n / 64), |_: Int|
+            b"abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl"),
+        ),
+        b"\nend",
+      ),
+    },
+  ])
+
+/// The lengths of the lines of the file `long`, read 1 KiB at a time by `fold_lines` or by `lines`.
+fn line_lengths(
+  by_sequence: Bool,
+  n: Int,
+) -> List<Int> / {io.refused, io.too_long, io.closed, seq.spent, abort.raise} =
+  fs::on_mem[data](one_long_line(n), ||
+    with_hold[file](
+      reading[data]("long"),
+      shut,
+    ) { source ->
+      if by_sequence { seq::to_list(seq::map(lines(source, 1024), bytes_len), n) } else {
+        fold_lines(source, 1024, n + 8, [], |out: List<Int>, line: Bytes|
+          push(out, bytes_len(line)))
+      }
+    }).value
+
+test "a line read in many chunks costs its length: four times as long, it allocates about four times the bytes" for by_sequence: Bool in [
+    false,
+    true,
+  ] {
+  let short = metered(|| line_lengths(by_sequence, 65536));
+  let long = metered(|| line_lengths(by_sequence, 262144));
+  assert_eq(short.value, [65536, 3]);
+  assert_eq(long.value, [262144, 3]);
+  assert(long.bytes < 6 * short.bytes, Some(f"{short.bytes} bytes, then {long.bytes}"))
 }
 
 test "a sequence over a source reads as it is pulled, and a budget of one pull reads two chunks" {
