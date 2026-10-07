@@ -1426,12 +1426,20 @@ pub type Analysis = {
   /// what each one's source was cut by, and what a module read without its tests and laws is.
   stubs: List<Bytes>,
   stub_cuts: Map<Bytes, List<Cut>>,
-  /// Each module read whole, the cuts that leave out its tests and laws, taken before the load left
-  /// any of them out: what a stub of it leaves out whatever the load kept.
-  left_out: Map<Bytes, List<Cut>>,
+  /// Each module read whole, the cuts its stub is made with: every body, test and law its text
+  /// holds, noted before the load left any of them out.
+  whole_cuts: Map<Bytes, List<Cut>>,
+  /// What the load hashed of the shipped functions the program does not reach, which a stub blanks.
+  unreached: Option<Unreached>,
+  /// The stubs the load read whole again, since the program reaches a function each blanked with
+  /// no row to answer for it.
+  restored: List<Bytes>,
   /// What each module embeds, for every pass that parses its text again.
   embeds: List<EmbedAt>,
 }
+
+/// The whole program's hashing, before a load left out the shipped functions in `names`.
+pub type Unreached = { index: Index, hashes: HashOutput, names: Map<Bytes, Bool> }
 
 /// A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type AnalysisOutcome = | Refused(List<Diag>) | Analysed(Analysis)
@@ -2544,7 +2552,9 @@ pub type Hashed = {
   texts: List<Bytes>,
   /// What a stub's source was cut by, and a module's read with its tests and laws left out.
   cuts: Map<Bytes, List<Cut>>,
-  left_out: Map<Bytes, List<Cut>>,
+  whole_cuts: Map<Bytes, List<Cut>>,
+  unreached: Option<Unreached>,
+  restored: List<Bytes>,
 }
 
 fn hashed_closure(
@@ -2556,7 +2566,7 @@ fn hashed_closure(
   embeds: List<EmbedAt> = [],
   priors: List<Prior> = [],
   cuts: List<StubCuts> = [],
-  left: List<StubCuts> = [],
+  whole: List<StubCuts> = [],
 ) -> Result<Hashed, List<Diag>> / {abort.raise} = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -2635,8 +2645,10 @@ fn hashed_closure(
                   map_new(),
                   |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
                 ),
-                left_out: fold(left, map_new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
+                whole_cuts: fold(whole, map_new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
                   map_insert(acc, c.name, c.cuts)),
+                unreached: None,
+                restored: [],
               })
             }
           }
@@ -2693,7 +2705,9 @@ fn checked_closure(
       module_packages: h.module_packages,
       stubs: map(h.ifaces.stubs, |source: Source| source.name),
       stub_cuts: h.cuts,
-      left_out: h.left_out,
+      whole_cuts: h.whole_cuts,
+      unreached: h.unreached,
+      restored: h.restored,
       embeds: h.embeds,
     })
   }
@@ -3785,16 +3799,13 @@ type Pull = {
   diags: List<Diag>,
   /// What each module read whole is cut by, where its tests and laws were left out.
   cuts: List<StubCuts>,
-  left: List<StubCuts>,
+  whole: List<StubCuts>,
 }
 
-/// The cuts that leave out the tests and laws of a module read whole, noted before the load leaves
-/// any of them out.
-fn left_out(left: List<StubCuts>, stubs: Map<Bytes, Bytes>, p: ParsedSource) -> List<StubCuts> =
-  if map_contains(stubs, p.name) { left } else {
-    let items = filter(cuts_of(p.module), |c: Cut| !c.braced);
-    if len(items) == 0 { left } else { push(left, { name: p.name, cuts: items }) }
-  }
+/// The cuts of a module read whole, noted before the load leaves any of its items out.
+fn whole_cut(whole: List<StubCuts>, stubs: Map<Bytes, Bytes>, p: ParsedSource) -> List<StubCuts> =
+  if map_contains(stubs, p.name) { whole }
+  else { push(whole, { name: p.name, cuts: cuts_of(p.module) }) }
 
 /// What a module read whole is cut by, noted before its tests and laws are left out: a stub of it
 /// blanks them too, and its own cuts are what the stub was made with.
@@ -3879,7 +3890,7 @@ fn pulling(
             ..acc,
             parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
             cuts: if tested { acc.cuts } else { uncut(acc.cuts, stubs, o.parsed) },
-            left: left_out(acc.left, stubs, o.parsed),
+            whole: whole_cut(acc.whole, stubs, o.parsed),
             pulled: push(acc.pulled, name),
             embeds: concat(acc.embeds, o.embeds),
           }
@@ -4059,16 +4070,16 @@ pub fn staged_pulling_std_with(
   let sources = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
   let read = fold(
     range(0, len(sources)),
-    { parsed: [], cuts: [], left: [] },
-    |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts>, left: List<StubCuts> }, i: Int| {
+    { parsed: [], cuts: [], whole: [] },
+    |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts>, whole: List<StubCuts> }, i: Int| {
       let s = at(sources, i);
       let read = if map_contains(stubs, s.name) {
         with_hidden(parse_at(i, read_as(stubs, s)), map_get(told, s.name))
       } else { parse_at(i, s) };
       let p = { ..read, src: s.src };
-      let left = left_out(acc.left, stubs, p);
-      if tested { { ..acc, parsed: push(acc.parsed, p), left: left } } else {
-        { parsed: push(acc.parsed, untested(p)), cuts: uncut(acc.cuts, stubs, p), left: left }
+      let whole = whole_cut(acc.whole, stubs, p);
+      if tested { { ..acc, parsed: push(acc.parsed, p), whole: whole } } else {
+        { parsed: push(acc.parsed, untested(p)), cuts: uncut(acc.cuts, stubs, p), whole: whole }
       }
     },
   );
@@ -4096,35 +4107,120 @@ pub fn staged_pulling_std_with(
     listed,
     stubs,
     tested,
-    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, left: read.left, diags: [] },
+    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, whole: read.whole, diags: [] },
     map_len(texts),
     asked,
   );
-  let hashed = |parsed: List<ParsedSource>|
-    hashed_closure(
-      parsed,
-      clo,
-      len(user),
-      toolchain,
-      ifaces,
-      concat(written.at, x.embeds),
-      priors,
-      x.cuts,
-      x.left,
-    );
-  let whole_load = if len(x.diags) > 0 { Err(x.diags) } else { hashed(x.parsed) };
-  match whole_load {
-    Err(diags) -> { pulled: x.pulled, hashed: Err(diags), viewed: [] },
-    Ok(h) -> if !reached || toolchain { { pulled: x.pulled, hashed: Ok(h), viewed: [] } } else {
-      let reach = reach_of(h);
-      {
-        pulled: x.pulled,
-        hashed: match cut_to(x.parsed, h, reach) { None -> Ok(h), Some(cut) -> hashed(cut) },
-        viewed: views_of(h, |name: Bytes| map_contains(reach, name)),
-      }
-    },
+  let hashed = |parsed: List<ParsedSource>, back: Restored|
+    match hashed_closure(
+        parsed,
+        clo,
+        len(user),
+        toolchain,
+        ifaces,
+        concat(written.at, x.embeds),
+        priors,
+        x.cuts,
+        concat(x.whole, back.whole),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(h) -> Ok({ ..h, restored: back.names }),
+    };
+  let rowless = rowless_of(ifaces);
+  let restore = |parsed: List<ParsedSource>, needed: (Bytes) -> Bool|
+    restored(parsed, rowless, needed, whole, told, data_held(data), tested);
+  if len(x.diags) > 0 { { pulled: x.pulled, hashed: Err(x.diags), viewed: [] } }
+  else if !reached || toolchain {
+    let back = restore(x.parsed, |_: Bytes| true);
+    { pulled: x.pulled, hashed: hashed(back.parsed, back), viewed: [] }
+  } else {
+    match hashed(x.parsed, no_restored()) {
+      Err(diags) -> { pulled: x.pulled, hashed: Err(diags), viewed: [] },
+      Ok(h) -> {
+        let reach = reach_of(h);
+        let back = restore(x.parsed, |name: Bytes| map_contains(reach, name));
+        let left = fold(
+          map_keys(shipped_functions(h)),
+          map_new(),
+          |acc: Map<Bytes, Bool>, n: Bytes|
+            if map_contains(reach, n) { acc } else { map_insert(acc, n, true) },
+        );
+        let out = match cut_to(back.parsed, h, reach) {
+          None -> if len(back.names) == 0 { Ok(h) } else { hashed(back.parsed, back) },
+          Some(cut) -> hashed(cut, back),
+        };
+        {
+          pulled: x.pulled,
+          hashed: match out {
+            Err(diags) -> Err(diags),
+            Ok(cut) -> if map_len(left) == 0 { Ok(cut) } else {
+              Ok({ ..cut, unreached: Some({ index: h.index, hashes: h.hashes, names: left }) })
+            },
+          },
+          viewed: views_of(h, |name: Bytes| map_contains(reach, name)),
+        }
+      },
+    }
   }
 }
+
+/// Each stub's functions it blanked with no row to answer for them, by module: a shipped module's
+/// function the program it was kept for did not reach.
+fn rowless_of(ifaces: Interfaces) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
+  let rowed = fold(ifaces.defs, map_new(), |acc: Map<Bytes, Bool>, row: KnownDefRow|
+    map_insert(acc, row.name, true));
+  fold(ifaces.cuts, map_new(), |acc: Map<Bytes, List<Bytes>>, s: StubCuts| {
+    let names = fold(s.cuts, [], |ns: List<Bytes>, c: Cut|
+      if c.braced && !c.test && bytes_len(c.name) > 0 && !map_contains(rowed, c.name) {
+        push(ns, c.name)
+      } else { ns });
+    if len(names) == 0 { acc } else { map_insert(acc, s.name, names) }
+  })
+}
+
+/// The stubs read whole again, and their cuts as a module read whole notes them.
+type Restored = { parsed: List<ParsedSource>, names: List<Bytes>, whole: List<StubCuts> }
+
+fn no_restored() -> Restored = { parsed: [], names: [], whole: [] }
+
+/// `parsed` with each stub read from its shipped module's text whose rowless blanks hold a function
+/// `needed` names: only its body can answer for it.
+fn restored(
+  parsed: List<ParsedSource>,
+  rowless: Map<Bytes, List<Bytes>>,
+  needed: (Bytes) -> Bool,
+  whole: Map<Bytes, Bytes>,
+  told: Map<Bytes, Pulls>,
+  data: Map<Bytes, Bytes>,
+  tested: Bool,
+) -> Restored / {abort.raise} =
+  if map_len(rowless) == 0 { { ..no_restored(), parsed: parsed } } else {
+    fold(range(0, len(parsed)), no_restored(), |acc: Restored, i: Int| {
+      let p = at(parsed, i);
+      let back = match map_get(rowless, p.name) {
+        None -> None,
+        Some(fns) -> if len(filter(fns, needed)) == 0 { None } else {
+          match map_get(whole, p.name) {
+            Some(text) ->
+              Some(shipped_embedded(whole, told, data, i, { name: p.name, src: text }).parsed),
+            None ->
+              panic(
+                "a stub blanks a function the program reaches with no row, and its text is not in hand",
+              ),
+          }
+        },
+      };
+      match back {
+        None -> { ..acc, parsed: push(acc.parsed, p) },
+        Some(w) ->
+          {
+            parsed: push(acc.parsed, if tested { w } else { untested(w) }),
+            names: push(acc.names, p.name),
+            whole: push(acc.whole, { name: p.name, cuts: cuts_of(w.module) }),
+          },
+      }
+    })
+  }
 
 /// The first shipped module's slot.
 fn first_shipped(h: Hashed) -> Int = h.root_count + len(h.clo.modules)
