@@ -18,13 +18,16 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_inter
 import infer (DefInfo)
 import rewrite (has_tagged)
 import types (Scheme, canonical_scheme)
-import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile, EmbedWant, embed_key, wants_by_item)
+import items (parse)
+import resolve (qualify)
 
 /// A module another one's analysis read, with the key it had then.
 pub type Reached = { name: Bytes, key: Bytes }
 
 /// `key` is what the stub stands for (`module_key`); `reaches` is every module it imports, directly
-/// or not, so the stub stands wherever each of them still has its key, in whatever package.
+/// or not, so the stub stands wherever each of them still has its key, in whatever package, and
+/// every embed something it holds reaches through what it references.
 pub type CompiledModule = {
   name: Bytes,
   stub: Bytes,
@@ -168,36 +171,165 @@ pub fn read_key(read: EmbedRead) -> Bytes =
     }),
   )
 
-fn embeds_reached(embeds: List<EmbedAt>) -> Map<Bytes, List<Reached>> =
-  fold(embeds, map_new(), |acc: Map<Bytes, List<Reached>>, e: EmbedAt|
-    map_insert(
-      acc,
-      e.module,
-      push(match map_get(acc, e.module) { Some(rs) -> rs, None -> [] }, {
-        name: embed_slot(e.module, e.key),
-        key: read_key(e.read),
-      }),
-    ))
+fn listed_at<a>(m: Map<Bytes, List<a>>, k: Bytes) -> List<a> =
+  match map_get(m, k) { Some(xs) -> xs, None -> [] }
+
+fn noted<a>(m: Map<Bytes, List<a>>, k: Bytes, xs: List<a>) -> Map<Bytes, List<a>> =
+  if len(xs) == 0 { m } else { map_insert(m, k, concat(listed_at(m, k), xs)) }
+
+/// Each embed a load read, by the module that asks for it: `functions` by the node of the function
+/// whose body asks, `items` by the module whose test or law does, which nothing else references,
+/// and `modules` by a module whose text the load was not handed, so no item of it can be named.
+type Embedders = {
+  functions: Map<Int, List<Reached>>,
+  items: Map<Bytes, List<Reached>>,
+  modules: Map<Bytes, List<Reached>>,
+}
+
+fn embedders(analysis: Analysis, sources: List<Original>) -> Embedders / {abort.raise} = {
+  let read = fold(analysis.embeds, map_new(), |acc: Map<Bytes, Reached>, e: EmbedAt| {
+    let slot = embed_slot(e.module, e.key);
+    map_insert(acc, slot, { name: slot, key: read_key(e.read) })
+  });
+  let by_module = fold(analysis.embeds, map_new(), |acc: Map<Bytes, List<Reached>>, e: EmbedAt|
+    noted(acc, e.module, [{ name: embed_slot(e.module, e.key), key: read_key(e.read) }]));
+  let texts = fold(sources, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
+    map_insert(acc, o.name, o.src));
+  let none: Embedders = { functions: map_new(), items: map_new(), modules: map_new() };
+  map_fold(by_module, none, |acc: Embedders, module: Bytes, every: List<Reached>|
+    match map_get(texts, module) {
+      None -> { ..acc, modules: noted(acc.modules, module, every) },
+      Some(src) -> {
+        let asked = wants_by_item(parse(src).node);
+        let named = fold(
+          asked,
+          { into: acc, seen: map_new() },
+          |a: { into: Embedders, seen: Map<Bytes, Bool> }, item: { name: Option<Bytes>, wants: List<EmbedWant> }| {
+            let held = fold(item.wants, [], |xs: List<Reached>, want: EmbedWant|
+              match map_get(read, embed_slot(module, embed_key(want))) {
+                Some(r) -> push(xs, r),
+                None -> xs,
+              });
+            let seen = fold(held, a.seen, |m: Map<Bytes, Bool>, r: Reached|
+              map_insert(m, r.name, true));
+            let node = match item.name {
+              Some(n) -> map_get(analysis.hashes.refs.fns, qualify(module, n)),
+              None -> None,
+            };
+            {
+              into: match node {
+                Some(v) ->
+                  {
+                    ..a.into,
+                    functions: map_insert(
+                      a.into.functions,
+                      v,
+                      concat(
+                        match map_get(a.into.functions, v) { Some(rs) -> rs, None -> [] },
+                        held,
+                      ),
+                    ),
+                  },
+                None -> { ..a.into, items: noted(a.into.items, module, held) },
+              },
+              seen: seen,
+            }
+          },
+        );
+        // An embed no item answers for, which a parse of the text does not show, stays the module's.
+        {
+          ..named.into,
+          modules: noted(
+            named.into.modules,
+            module,
+            filter(every, |r: Reached| !map_contains(named.seen, r.name)),
+          ),
+        }
+      },
+    })
+}
+
+/// Each module whose functions, tests or laws reach each embedding function through what they
+/// reference, by that function's node.
+fn embed_reachers(analysis: Analysis, e: Embedders) -> Map<Int, Map<Int, Bool>> / {abort.raise} =
+  if map_len(e.functions) == 0 { map_new() } else {
+    let refs = analysis.hashes.refs;
+    let n = len(refs.edges);
+    let into = fold(range(0, n), map_new(), |acc: Map<Int, List<Int>>, v: Int|
+      fold(at(refs.edges, v), acc, |m: Map<Int, List<Int>>, w: Int|
+        map_insert(m, w, push(match map_get(m, w) { Some(xs) -> xs, None -> [] }, v))));
+    let reaching = |h: Int|
+      iterate(
+        { seen: map_insert(map_new(), h, true), stack: [h] },
+        n + 1,
+        |x: { seen: Map<Int, Bool>, stack: List<Int> }|
+          match x.stack {
+            [] -> Stop(x.seen),
+            [v, ..rest] ->
+              Continue(
+                fold(
+                  match map_get(into, v) { Some(xs) -> xs, None -> [] },
+                  { seen: x.seen, stack: rest },
+                  |y: { seen: Map<Int, Bool>, stack: List<Int> }, u: Int|
+                    if map_contains(y.seen, u) { y }
+                    else { { seen: map_insert(y.seen, u, true), stack: push(y.stack, u) } },
+                ),
+              ),
+          },
+      );
+    let items = concat(
+      map(range(0, len(analysis.index.tests)), |k: Int|
+        {
+          module: at(analysis.index.tests, k).module,
+          refs: concat(
+            match list_at(analysis.hashes.test_refs, k) { Some(rs) -> rs, None -> [] },
+            match list_at(analysis.hashes.test_runs, k) { Some(rs) -> rs, None -> [] },
+          ),
+        }),
+      map(range(0, len(analysis.index.laws)), |k: Int|
+        {
+          module: at(analysis.index.laws, k).module,
+          refs: match list_at(analysis.hashes.law_refs, k) { Some(rs) -> rs, None -> [] },
+        }),
+    );
+    map_fold(e.functions, map_new(), |acc: Map<Int, Map<Int, Bool>>, h: Int, _: List<Reached>| {
+      let seen = reaching(h);
+      let by_nodes = map_fold(seen, map_new(), |m: Map<Int, Bool>, v: Int, _: Bool|
+        map_insert(m, at(analysis.index.nodes, v).module, true));
+      map_insert(
+        acc,
+        h,
+        fold(items, by_nodes, |m: Map<Int, Bool>, item: { module: Int, refs: List<Int> }|
+          if fold(item.refs, false, |any: Bool, r: Int| any || map_contains(seen, r)) {
+            map_insert(m, item.module, true)
+          } else { m }),
+      )
+    })
+  }
 
 /// Every module `from` imports, directly or not, each under `keyed`'s key for it, then every embed
-/// of those and of `from` itself.
+/// what `from` holds reaches: one a function asks for that something of `from` references, directly
+/// or not, one of its own tests and laws, and every one of a module whose items cannot be named.
 fn reached_from(
   analysis: Analysis,
   keyed: (Bytes) -> Bytes,
-  embedded: Map<Bytes, List<Reached>>,
+  e: Embedders,
+  reachers: Map<Int, Map<Int, Bool>>,
   from: Int,
 ) -> List<Reached> / {abort.raise} = {
   let modules = reach(analysis.r.imports, from);
-  fold(
+  let imported = fold(
     concat([from], modules),
     map(modules, |j: Int|
       { name: at(analysis.mods, j).name, key: keyed(at(analysis.mods, j).name) }),
-    |acc: List<Reached>, j: Int|
-      match map_get(embedded, at(analysis.mods, j).name) {
-        Some(rs) -> concat(acc, rs),
-        None -> acc,
-      },
-  )
+    |acc: List<Reached>, j: Int| concat(acc, listed_at(e.modules, at(analysis.mods, j).name)),
+  );
+  let held = concat(imported, listed_at(e.items, at(analysis.mods, from).name));
+  map_fold(e.functions, held, |acc: List<Reached>, h: Int, rs: List<Reached>|
+    match map_get(reachers, h) {
+      Some(ms) -> if map_contains(ms, from) { concat(acc, rs) } else { acc },
+      None -> acc,
+    })
 }
 
 /// `keys` with what each embed a module of `modules` reaches reads now, under the name it is
@@ -239,12 +371,14 @@ pub fn compile_package(
     map_insert(acc, o.name, o));
   let index = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
     map_insert(acc, at(analysis.mods, i).name, i));
-  let embedded = embeds_reached(analysis.embeds);
+  let e = embedders(analysis, sources);
+  let reachers = embed_reachers(analysis, e);
   let reached = |i: Int|
     reached_from(
       analysis,
       |name: Bytes| match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" },
-      embedded,
+      e,
+      reachers,
       i,
     );
   let implemented = fold(
@@ -362,7 +496,8 @@ pub fn kept_modules(
     map_insert(acc, o.name, o));
   let keyed = |name: Bytes|
     match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" };
-  let embedded = embeds_reached(analysis.embeds);
+  let e = embedders(analysis, sources);
+  let reachers = embed_reachers(analysis, e);
   let fresh = map_fold(members, map_new(), |acc: Map<Bytes, Bool>, name: Bytes, b: Bool|
     if map_contains(read, name) { acc } else { map_insert(acc, name, true) });
   let applied = fold(through, [], |acc: List<Fixed>, package: CompiledPackage|
@@ -374,13 +509,13 @@ pub fn kept_modules(
     modules: map(filter(range(0, len(names)), kept), |i: Int| {
       let name = at(names, i);
       match map_get(read, name) {
-        Some(m) -> { ..m, stub: b"", reaches: reached_from(analysis, keyed, embedded, i) },
+        Some(m) -> { ..m, stub: b"", reaches: reached_from(analysis, keyed, e, reachers, i) },
         None ->
           {
             name: name,
             stub: b"",
             key: keyed(name),
-            reaches: reached_from(analysis, keyed, embedded, i),
+            reaches: reached_from(analysis, keyed, e, reachers, i),
             cuts: match map_get(analysis.stub_cuts, name) {
               Some(cuts) -> cuts,
               None -> if own { body_cuts_of(at(analysis.mods, i)) }
@@ -885,18 +1020,26 @@ fn reading(bytes: Bytes) -> EmbedReader =
     if module == b"a" && key == b"file:x.txt" { Ok([{ name: b"", bytes: bytes }]) }
     else { Err(b"nothing is embedded") }
 
-test "a stub stands while what its module, and each module it reaches, embeds reads the same" {
-  let a: Source = { name: b"a", src: b"pub fn text() -> Bytes = embed(\"x.txt\")\n" };
+test "a stub stands while every embed something it holds reaches reads the same" {
+  let a: Source = {
+    name: b"a",
+    src: b"pub fn text() -> Bytes = embed(\"x.txt\")\npub fn other() -> Int = 2\n",
+  };
   let b: Source = {
     name: b"b",
     src: b"import a (text)\npub fn size() -> Int = bytes_len(text())\n",
   };
   let c: Source = { name: b"c", src: b"pub fn three() -> Int = 3\n" };
-  let originals = [original(a), original(b), original(c)];
+  let d: Source = { name: b"d", src: b"import a (other)\npub fn plus() -> Int = other() + 1\n" };
+  let e: Source = {
+    name: b"e",
+    src: b"import a (text)\npub fn four() -> Int = 4\ntest \"e reads it\" { assert(bytes_len(text()) > 0) }\n",
+  };
+  let originals = [original(a), original(b), original(c), original(d), original(e)];
   let full = whole_of(
     checked_staged(
       staged_pulling_std_with(
-        [a, b, c],
+        [a, b, c, d, e],
         [],
         { root: b"", manifest: None, supplied: [] },
         no_interfaces(),
@@ -913,7 +1056,7 @@ test "a stub stands while what its module, and each module it reaches, embeds re
       [],
     ).out,
   );
-  let p = compile_package(originals, full, [b"a", b"b", b"c"]);
+  let p = compile_package(originals, full, [b"a", b"b", b"c", b"d", b"e"]);
   let keys = fold(originals, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
     map_insert(acc, o.name, module_key(o)));
   let standing = |read: EmbedReader|
@@ -921,18 +1064,22 @@ test "a stub stands while what its module, and each module it reaches, embeds re
       valid_part(p, with_embeds(keys, p.modules, read), map_new()).modules,
       |m: CompiledModule| m.name,
     );
-  assert_eq(standing(reading(b"one")), [b"a", b"b", b"c"]);
-  // The file moved and no module's text did: `a`, which embeds it, and `b`, which reaches `a`.
-  assert_eq(standing(reading(b"two")), [b"c"]);
+  assert_eq(standing(reading(b"one")), [b"a", b"b", b"c", b"d", b"e"]);
+  // The file moved and no module's text did: `a`, which embeds it, `b`, whose function reaches the
+  // function that does, and `e`, whose test does. `d` imports `a` and reaches none of it that embeds.
+  assert_eq(standing(reading(b"two")), [b"c", b"d"]);
   let kept = kept_modules(originals, full);
   let rows = rows_of(full).defs;
   assert_eq(standing_names(standing_modules(kept, originals, rows, reading(b"one"), map_new())), [
     b"a",
     b"b",
     b"c",
+    b"d",
+    b"e",
   ]);
   assert_eq(standing_names(standing_modules(kept, originals, rows, reading(b"two"), map_new())), [
     b"c",
+    b"d",
   ])
 }
 
