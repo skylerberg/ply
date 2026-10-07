@@ -531,14 +531,23 @@ read in changes none of it. A yanked version is passed over by a new resolution
 and kept by a lock that already pins it.
 
 `ply build` records what it resolved in `ply.lock`, beside the package's own
-`ply.pkg`: every dependency's name, its version, and the BLAKE3 digest of the
-modules it contributed, sorted by name, with what they embed (§3.4), and for a
-registry dependency the `archive` digest it was fetched as. A package is pinned
-by *what* it is and
-never by where it was found, so a moved checkout keeps its pin. A build verifies
-the lock before it writes an artifact — a dependency whose sources moved since it
-was pinned is `E0138`, and a lock this `ply` cannot read is `E0139` — and writes
-one when the closure it resolved is not the one on file. `ply resolve` pins what is on
+`ply.pkg`: every dependency's name and version, sorted by name, with the BLAKE3
+digest of the modules it contributed and what they embed (§3.4), and for a
+registry dependency the `archive` digest it was fetched as. A path dependency
+inside the checkout the project is in is recorded without a digest, as Cargo's
+lock records one: the commit that holds the project holds its sources, so an
+edit to it leaves the dependent's lock as it was. The checkout is the nearest
+directory at or above the project's root that holds a `.git` (a clone's
+directory, or the file a worktree or a submodule keeps), and a path dependency
+is inside it when its directory is at or below that one with no directory on
+the way up a symlink or holding a `.git` of its own. A git or registry
+dependency, a path one outside the checkout, and every dependency of a project
+in no checkout keep their digest. A package is pinned by *what* it is and never
+by where it was found, so a moved checkout keeps its pin. A build verifies
+the lock before it writes an artifact — a dependency whose digest no longer
+matches its sources is `E0138`, and a lock this `ply` cannot read, or one of
+another format than this `ply`'s (2), is `E0139` — and writes one when the
+closure it resolved is not the one on file. `ply resolve` pins what is on
 disk now, and is how a change to a dependency is accepted, deliberately —
 deleting the lockfile, or one package's entry in it, does the same. `ply vendor`
 copies the closure into `vendor/`, one directory per package named by the prefix
@@ -546,8 +555,8 @@ the closure granted it, whole — its `ply.pkg`, its modules and the data it shi
 but not the repository a fetch came from — plus `vendor/index`, one line per
 package saying which want that directory answers. A walk that finds the index
 reads those trees and asks for nothing else, so a vendored checkout builds with
-no cache, no network and no git; the lockfile's digest still says the sources are
-the ones that were pinned. A registry dependency is vendored like any other, and
+no cache, no network and no git; the lockfile still holds the sources to what
+was pinned. A registry dependency is vendored like any other, and
 `ply resolve` in a vendored project writes the version it selects into the
 vendored copy as well as the cache, so the next walk reads what the lock pins. `ply why
 NAME` says how a package got here: the path from the root package to it through
@@ -1242,18 +1251,26 @@ keeps its declared type (`E0201`), and it builds one: outside the module of an
 `push(xs, x)` appends in place when the caller holds the last reference, and
 otherwise copies one path of the list's trie; `list_set` is the same, and
 `array_set` copies the whole array. A copy is caused by a second owner: a
-binding read again after the update, a closure capture, a value read out with
-`cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
-a caller that keeps using what it passed. A record is not one of them once it
-is done with the value: a field read that nothing after it reads again, as the
-field or as the whole record, takes the field out of a record no one else
-holds, and a `let` or `match` pattern lets its subject go once its binders hold
-their fields (an arm with a guard keeps it for the arms after), so
-`{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
-A subject let go so is the memory of the next record or constructor of its
-width the body builds, so `match s { Set(m) -> Set(map_insert(m, x, ())) }`
-updates a set no one else holds without allocating its wrapper again.
-The same holds for `Bytes` and `++`. `ply check --costs` reports every
+binding read again after the update, a capture of a closure that is called
+again, a value read out with `cell_get`/`map_get`/`list_at`/`array_get` (use
+`cell_update`/`map_update`), or a caller that keeps using what it passed.
+"Again" is along the path taken: an `if` or `match` branch lets go, as it
+opens, of a binding only another branch reads, and a closure called by the
+only holder of it, as a sequence's step is pulled, gives its call what it
+captured. A variable passed to a call is read after the call's other
+arguments, so `array_set(c, i, array_get(c, i) + 1)` and
+`f(buf, bytes_len(buf))` hand it on, as does the left side of `++`. A record
+is not a second owner once it is done with the value: a field read that
+nothing after it reads again, as the field or as the whole record, takes the
+field out of a record no one else holds; a branch beside one that reads the
+record whole lets go of the fields it does not read; and a `let` or `match`
+pattern lets its subject go once its binders hold their fields (an arm with a
+guard keeps it for the arms after), so `{ ..s, out: push(s.out, x) }` and
+`let { out, n } = s` grow `out` in place. A subject let go so is the memory of
+the next record or constructor of its width the body builds, so
+`match s { Set(m) -> Set(map_insert(m, x, ())) }` updates a set no one else
+holds without allocating its wrapper again. The same holds for `Bytes` and
+`++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
@@ -3048,7 +3065,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
-| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name, version and source digest, with no module parsed or checked; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
+| `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name and version and the source digest of each the checkout does not hold (`in the checkout` for the rest, `"digest": null` in `--json`), with no module parsed or checked; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
 | `ply vendor [path]` | copy the closure into `vendor/`, one directory per package plus an index, so the project builds with no cache and no network |
 | `ply why NAME [path]` | why a package is in the closure: the path from the root package to it, then the version and digest the closure pins |
 | `ply publish [path]` | build this library's `.plyz` and upload it, then its interface, to `PLY_REGISTRY` under `PLY_REGISTRY_TOKEN`, once its version is the bump its changes need (§15.1) |
@@ -3095,7 +3112,11 @@ this compiler, that runnable is the program: a hash covers all its definition
 reaches and no comment, layout, test or definition nothing reaches. Otherwise it
 checks the sources, seeded with the rows its last build of that program
 kept, emits its unit with the emitter's answers kept, and writes the runnable,
-keeping it under that key in `programs/` below the stage root. A program it
+keeping it under that key in `programs/` below the stage root. The unit holds the
+value of each `const fn` the program holds, as `ply build`'s does (§3.5): one a
+build or a check kept is read back, and the rest are entered on a unit of what
+they reach and kept, so the program evaluates none of them; one that raises or
+spends its budget is left to its body. A program it
 ships holds no test and no law, which nothing it enters reaches, and a module
 whose text has not moved since its last build of the program, and that imports
 none whose text has, it reads as that build cut it: its signatures and

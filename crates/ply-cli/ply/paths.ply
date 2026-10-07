@@ -7,7 +7,7 @@
 import std.cli
 import env (env)
 import std.fs (fs, Kind, File, Dir, Symlink, Missing, MemFs, Written, mem_create_dir, mem_empty,
-               mem_kind, mem_list, mem_of, mem_read, mem_resolved, mem_write)
+               mem_kind, mem_list, mem_of, mem_read, mem_resolved, mem_symlink, mem_write)
 import std.path (file_name, is_absolute, join, normalize, parent, strip_dot)
 import std.list (at_or)
 
@@ -245,6 +245,32 @@ pub fn at_abs(spelling: String) -> Resolved =
     machine: "/" ++ spelling,
   }
 
+// --- Checkouts -----------------------------------------------------------------
+
+/// What an absolute path names under `abs`, a symlink reported as one.
+fn kind_at_root(path: String) -> Kind / {fs.kind[abs], abort.raise} =
+  fs.kind[abs](string_slice(path, 1, string_len(path)))
+
+/// The checkout an absolute directory is part of: the nearest directory at or above it that holds a
+/// `.git`, the directory a clone keeps or the file a worktree or a submodule keeps in its place.
+/// `None` outside every checkout and for a relative path; the filesystem's root is never one.
+pub fn checkout_of(dir: String) -> Option<String> / {fs.kind[abs], abort.raise} =
+  iterate(normalize(dir), string_len(dir) + 2, |at: String|
+    if !is_absolute(at) || at == "/" { Stop(None) }
+    else if kind_at_root(join(at, ".git")) != Missing { Stop(Some(at)) }
+    else { Continue(parent(at)) })
+
+/// Whether the absolute directory `dir` is part of the checkout at `tree`, so that a commit of the
+/// checkout holds what is in it: at or below `tree`, and with no directory from it up to `tree` a
+/// symlink, whose target a commit does not hold, or a checkout of its own (a nested repository or a
+/// submodule), whose files the outer commit does not hold either.
+pub fn in_checkout(tree: String, dir: String) -> Bool / {fs.kind[abs], abort.raise} =
+  iterate(normalize(dir), string_len(dir) + 2, |at: String|
+    if at == tree { Stop(true) }
+    else if !string_starts_with(at, tree ++ "/") { Stop(false) }
+    else if kind_at_root(at) != Dir || kind_at_root(join(at, ".git")) != Missing { Stop(false) }
+    else { Continue(parent(at)) })
+
 // --- Tests ------------------------------------------------------------------
 
 test "a rooted path prints as spelled under the working directory, and absolute outside it" {
@@ -364,6 +390,60 @@ test "a file's root is its directory, so a package's own files are beside the fi
   assert_eq(in_root(outside, "ply.lock"), { label: "abs", path: "srv/lib/ply.lock" });
   assert_eq(displayed(in_root(outside, "ply.lock")), "/srv/lib/ply.lock");
   assert_eq(outside.absolute, "/srv/lib")
+}
+
+/// A repository with a nested one, a submodule, a link out of it and a registry slot in a project's
+/// cache; a linked worktree; and directories in none.
+pub fn checkouts() -> MemFs / {abort.raise} =
+  mem_symlink(
+    mem_of([
+      { path: "repo/.git/HEAD", body: b"ref: refs/heads/main\n" },
+      { path: "repo/app/ply.pkg", body: b"" },
+      { path: "repo/app/.ply-cache/registry/r/ply.pkg", body: b"" },
+      { path: "repo/libs/a/ply.pkg", body: b"" },
+      { path: "repo/nested/.git/HEAD", body: b"ref: refs/heads/main\n" },
+      { path: "repo/nested/b/ply.pkg", body: b"" },
+      { path: "repo/sub/.git", body: b"gitdir: ../.git/modules/sub\n" },
+      { path: "repo/sub/c/ply.pkg", body: b"" },
+      { path: "repo-b/d/ply.pkg", body: b"" },
+      { path: "other/e/ply.pkg", body: b"" },
+      { path: "wt/.git", body: b"gitdir: /repo/.git/worktrees/wt\n" },
+      { path: "wt/lib/ply.pkg", body: b"" },
+    ]),
+    "repo/link",
+    "../other/e",
+  ).fs
+
+test "a checkout is the nearest directory up with a `.git`, a directory or a worktree's file" {
+  let found = |dir: String|
+    handle { checkout_of(dir) } with { fs.kind[abs](p) -> mem_kind(checkouts(), p) };
+  assert_eq(found("/repo/app"), Some("/repo"));
+  assert_eq(found("/repo"), Some("/repo"));
+  assert_eq(found("/repo/nested/b"), Some("/repo/nested"));
+  assert_eq(found("/repo/sub/c"), Some("/repo/sub"));
+  assert_eq(found("/wt/lib"), Some("/wt"));
+  assert_eq(found("/other/e"), None);
+  assert_eq(found("repo/app"), None)
+}
+
+test "a directory is part of a checkout below it, and not through a link or another checkout" {
+  let part = |tree: String, dir: String|
+    handle { in_checkout(tree, dir) } with { fs.kind[abs](p) -> mem_kind(checkouts(), p) };
+  assert(part("/repo", "/repo/libs/a"));
+  assert(part("/repo", "/repo/libs/a/../../app"));
+  // The checkout's own root is part of it.
+  assert(part("/repo", "/repo"));
+  assert(part("/wt", "/wt/lib"));
+  // A sibling whose name only begins like the checkout's.
+  assert(!part("/repo", "/repo-b/d"));
+  assert(!part("/repo", "/other/e"));
+  // Another repository, and a submodule: the outer commit holds neither one's files.
+  assert(!part("/repo", "/repo/nested/b"));
+  assert(!part("/repo", "/repo/sub/c"));
+  // A link: the commit holds the link, and not the tree it points at.
+  assert(!part("/repo", "/repo/link"));
+  // A name that names nothing.
+  assert(!part("/repo", "/repo/gone"))
 }
 
 test "a path that names nothing yet is rooted at the nearest directory above it" {
