@@ -3081,8 +3081,10 @@ so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
 publisher sent. `ply check` of a whole project reads the project's own modules
 the same way, from what its last check kept beside the package: a module that
-still stands enters with its bodies cut out and its tests and laws as written,
-its rows answer for the bodies, and what the check warned of it is said again.
+still stands enters with its function and test bodies cut out, the rest of its
+tests and its laws as written, its rows answer for the bodies, and what the check
+warned of it is said again; a test's body is cut only where its row and the hash its
+run fixed were kept, and otherwise the module is read from source.
 Its answer is the one a check of every source gives. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
