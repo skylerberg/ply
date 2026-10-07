@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 const PROGRAM: &str = r#"
-import std.db (stmt, PInt, PText, Row)
+import std.sql (stmt, PInt, PText, Row)
 import std.sqlite
 import std.sqlite (sqlite, sql, Busy, Refused, Unopened, Create, ReadOnly, ReadWrite, Limits, Options)
 

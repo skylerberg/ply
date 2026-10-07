@@ -4,10 +4,10 @@ import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_lab
                 is_bare, no_module)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
               VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
-              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub,
+              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub, DRow,
               spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, NGen,
               stated_type, sampler_of, item_span, IAlias)
-import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text)
+import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Param, Stmt, SLet, SLetElse, SExpr, MatchArm,
@@ -27,7 +27,8 @@ import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, R
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, FixedTest, FixedLaw, Prior,
              Rehash, Rehashed, rehash_index, by_name, tagged_target, closure_of, reached_functions,
-             LawNode, Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem)
+             LawNode, Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted,
+             DenotesFn, DenotesCtor, DenotesNothing, effect_called, type_named)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, LabelSite, OperandSite, TrySite, UpdateShape, WitnessOp, WitnessRef,
@@ -35,7 +36,7 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               test_owner, cases_root, listing_ty, witness_order_bin, elaborated, ended, stated,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
               builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts,
-              InstanceInfo, NumericInfo, Raise, raise_bin)
+              InstanceInfo, NumericInfo, Raise, raise_bin, Elaboration)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -46,7 +47,8 @@ import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
-import rewrite (fn_has_update, tagged_in)
+import rewrite (fn_has_update, tagged_in, picked_in)
+import derive (RowField, row_shape, generated_name, same_deriver)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_want_bin, embed_key, embed_tables,
               embedded, rewritten, wants_of, want_of_key)
 import items (parse, import_decl_bin)
@@ -1426,12 +1428,20 @@ pub type Analysis = {
   /// what each one's source was cut by, and what a module read without its tests and laws is.
   stubs: List<Bytes>,
   stub_cuts: Map<Bytes, List<Cut>>,
-  /// Each module read whole, the cuts that leave out its tests and laws, taken before the load left
-  /// any of them out: what a stub of it leaves out whatever the load kept.
-  left_out: Map<Bytes, List<Cut>>,
+  /// Each module read whole, the cuts its stub is made with: every body, test and law its text
+  /// holds, noted before the load left any of them out.
+  whole_cuts: Map<Bytes, List<Cut>>,
+  /// What the load hashed of the shipped functions the program does not reach, which a stub blanks.
+  unreached: Option<Unreached>,
+  /// The stubs the load read whole again, since the program reaches a function each blanked with
+  /// no row to answer for it.
+  restored: List<Bytes>,
   /// What each module embeds, for every pass that parses its text again.
   embeds: List<EmbedAt>,
 }
+
+/// The whole program's hashing, before a load left out the shipped functions in `names`.
+pub type Unreached = { index: Index, hashes: HashOutput, names: Map<Bytes, Bool> }
 
 /// A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type AnalysisOutcome = | Refused(List<Diag>) | Analysed(Analysis)
@@ -1515,6 +1525,167 @@ fn kept_under(hashes: HashOutput, name: Bytes, hash: Bytes) -> Bytes / {abort.ra
       ),
     ),
   )
+
+/// Every `const` definition the root package's modules hold whose declared type is the type named
+/// `type_name` program-wide.
+pub fn consts_of_type(analysis: Analysis, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
+  let named = fold(range(0, len(analysis.mods)), [], |acc: List<Bytes>, i: Int|
+    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
+      fold(at(analysis.mods, i).module.items, acc, |names: List<Bytes>, item: Item|
+        match item {
+          IFn(d) -> match ((d.baked, d.ret)) {
+            (Some(_), Some(TCon(c))) -> if type_named(analysis.index, i, c.name)
+                == Some(type_name) { push(names, qualify(at(analysis.mods, i).name, d.name.name)) }
+            else { names },
+            _ -> names,
+          },
+          _ -> names,
+        })
+    });
+  filter(const_sites(analysis.mods, analysis.hashes), |site: ConstSite| contains(named, site.name))
+}
+
+/// An argument as a check reads it before anything runs: text as written, literals joined by `++`
+/// included; the call of a definition, by its program-wide name and the hash of all it reaches, on
+/// arguments read the same way; the call of a row codec `derive row` wrote, by the fields it reads;
+/// a tagged literal, by its parser and its texts; a list; a constructor applied, by its type's
+/// program-wide name and its own; or anything else.
+pub type Argument =
+  | AText(Bytes)
+  | ACall({ callee: Bytes, hash: Bytes, args: List<Argument> })
+  | ARow(List<RowField>)
+  | ATagged({ callee: Bytes, hash: Bytes, parts: List<Bytes>, holes: List<Argument> })
+  | AList(List<Argument>)
+  | ACtor({ type_name: Bytes, name: Bytes })
+  | AOther
+
+/// A call that runs a statement, as `statement_sites` finds it: where it is, the operation or the
+/// definition it calls by program-wide name, the label written at it, and its arguments.
+pub type StatementSite = {
+  module: Int,
+  span: Span,
+  callee: Bytes,
+  label: Bytes,
+  args: List<Argument>,
+}
+
+/// What reading an argument looks names up in: the scopes, each definition's hash, and each row
+/// codec a module derives, by the program-wide name of the function that answers it.
+type Reading = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
+
+fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
+  fold(mods, map_new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
+    fold(parsed.derived, acc, |rows: Map<Bytes, List<RowField>>, d: Derived|
+      if !same_deriver(d.deriver, DRow) { rows } else {
+        match row_shape(parsed.module, d.target) {
+          Some(fields) ->
+            map_insert(rows, qualify(parsed.name, generated_name(DRow, d.target)), fields),
+          None -> rows,
+        }
+      }))
+
+/// Every perform of an operation, and every call of a definition with a label written at it, whose
+/// program-wide name is one of `callees`, in the root package's modules. An operation is named by
+/// its effect's name and its own: `std.db.db.query`.
+pub fn statement_sites(
+  analysis: Analysis,
+  callees: List<Bytes>,
+) -> List<StatementSite> / {abort.raise} = {
+  let reading = {
+    index: analysis.index,
+    hashes: by_name(analysis.hashes.defs),
+    rows: derived_rows(analysis.mods),
+  };
+  fold(range(0, len(analysis.mods)), [], |acc: List<StatementSite>, i: Int|
+    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
+      let calls = picked_in(at(analysis.mods, i).module, |e: Expr|
+        match e { EPerform(_) -> true, EApp(a) -> len(a.labels) > 0, _ -> false });
+      fold(calls, acc, |sites: List<StatementSite>, e: Expr|
+        match statement_site(reading, i, e) {
+          Some(site) -> if contains(callees, site.callee) { push(sites, site) } else { sites },
+          None -> sites,
+        })
+    })
+}
+
+fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSite> / {abort.raise} = {
+  let args = |xs: List<Expr>| map(xs, |x: Expr| argument(reading, module, x));
+  match e {
+    EPerform(p) -> match ((effect_called(reading.index, module, p.eff), p.resource)) {
+      (Some(named), Some(label)) ->
+        Some({
+          module: module,
+          span: p.span,
+          callee: bytes_concat_all([named, b".", p.op.name]),
+          label: label.name,
+          args: args(p.args),
+        }),
+      _ -> None,
+    },
+    EApp(a) -> match ((a.func, list_at(a.labels, 0))) {
+      (EVar(v), Some(label)) -> match denoted(reading.index, module, v.name) {
+        DenotesFn(callee) ->
+          Some({
+            module: module,
+            span: a.span,
+            callee: callee,
+            label: label.name,
+            args: args(a.args),
+          }),
+        _ -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+}
+
+fn argument(reading: Reading, module: Int, e: Expr) -> Argument / {abort.raise} = {
+  let hash_of = |name: Bytes| match map_get(reading.hashes, name) { Some(h) -> h, None -> b"" };
+  match e {
+    ELit(l) -> match l.lit { LStr(s) -> AText(s), _ -> AOther },
+    EBinary(b) -> if b.op != b"++" { AOther } else {
+      match ((argument(reading, module, b.lhs), argument(reading, module, b.rhs))) {
+        (AText(x), AText(y)) -> AText(bytes_concat(x, y)),
+        _ -> AOther,
+      }
+    },
+    EVar(v) -> match denoted(reading.index, module, v.name) {
+      DenotesCtor(c) -> ACtor(c),
+      _ -> AOther,
+    },
+    EApp(a) -> if len(a.labels) > 0 || len(a.named) > 0 { AOther } else {
+      match a.func {
+        EVar(v) -> match denoted(reading.index, module, v.name) {
+          DenotesFn(callee) -> match map_get(reading.rows, callee) {
+            Some(fields) -> if len(a.args) == 0 { ARow(fields) } else { AOther },
+            None ->
+              ACall({
+                callee: callee,
+                hash: hash_of(callee),
+                args: map(a.args, |x: Expr| argument(reading, module, x)),
+              }),
+          },
+          DenotesCtor(c) -> ACtor(c),
+          DenotesNothing -> AOther,
+        },
+        _ -> AOther,
+      }
+    },
+    EList(l) -> AList(map(l.items, |x: Expr| argument(reading, module, x))),
+    ETagged(t) -> match tagged_target(reading.index, module, t) {
+      Some(callee) ->
+        ATagged({
+          callee: callee,
+          hash: hash_of(callee),
+          parts: map(tagged_parts(t), |part: TaggedPart| part.text),
+          holes: map(t.holes, |h: Hole| argument(reading, module, h.value)),
+        }),
+      None -> AOther,
+    },
+    _ -> AOther,
+  }
+}
 
 /// A definition's or a test's published rows as the last answer wrote them, under the check key it
 /// had then: the checker takes them wherever the item's own form and what it reads of the rest of
@@ -2536,7 +2707,9 @@ pub type Hashed = {
   texts: List<Bytes>,
   /// What a stub's source was cut by, and a module's read with its tests and laws left out.
   cuts: Map<Bytes, List<Cut>>,
-  left_out: Map<Bytes, List<Cut>>,
+  whole_cuts: Map<Bytes, List<Cut>>,
+  unreached: Option<Unreached>,
+  restored: List<Bytes>,
 }
 
 fn hashed_closure(
@@ -2548,7 +2721,7 @@ fn hashed_closure(
   embeds: List<EmbedAt> = [],
   priors: List<Prior> = [],
   cuts: List<StubCuts> = [],
-  left: List<StubCuts> = [],
+  whole: List<StubCuts> = [],
 ) -> Result<Hashed, List<Diag>> / {abort.raise} = {
   // The packages' identity reports ahead of anything the program text has to say: manifest
   // and graph diags point one slot past every module, in manifest order.
@@ -2627,8 +2800,10 @@ fn hashed_closure(
                   map_new(),
                   |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
                 ),
-                left_out: fold(left, map_new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
+                whole_cuts: fold(whole, map_new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
                   map_insert(acc, c.name, c.cuts)),
+                unreached: None,
+                restored: [],
               })
             }
           }
@@ -2685,7 +2860,9 @@ fn checked_closure(
       module_packages: h.module_packages,
       stubs: map(h.ifaces.stubs, |source: Source| source.name),
       stub_cuts: h.cuts,
-      left_out: h.left_out,
+      whole_cuts: h.whole_cuts,
+      unreached: h.unreached,
+      restored: h.restored,
       embeds: h.embeds,
     })
   }
@@ -3300,10 +3477,10 @@ pub fn claims(
 }
 
 /// The claims of the modules at `wanted`, ascending and closed under imports, lowered as `claims`
-/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and the checker
-/// walks again only the definitions there that write a record update — the one thing lowering reads
-/// from it — seeded with every other definition's and test's rows as the next analysis would be.
-/// A module the run does not own is claimed by its specs, so its source and its stub answer alike.
+/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and what
+/// lowering reads of the checker — the shape of each record update — is what the check filed, as
+/// the emitter reads it. A module the run does not own is claimed by its specs, so its source and
+/// its stub answer alike.
 pub fn claims_in(
   analysis: Analysis,
   wanted: List<Int>,
@@ -3311,6 +3488,23 @@ pub fn claims_in(
 ) -> List<Claim> / {abort.raise} = {
   let stubs = fold(analysis.stubs, map_new(), |acc: Map<Bytes, Bool>, s: Bytes|
     map_insert(acc, s, true));
+  let shapes = match facts_read(rows_of(analysis), walked_facts(analysis), None, analysis.mods) {
+    Ok(facts) -> facts.elaboration,
+    Err(_) -> rechecked(analysis, wanted),
+  };
+  claims_of_modules(
+    updated_mods(analysis.mods, shapes),
+    analysis.r,
+    wanted,
+    |m: Bytes| map_contains(stubs, m) || !owned(m),
+    ended(analysis.checked.defs),
+    stated(analysis.checked.defs),
+  )
+}
+
+/// What the checker makes of each record update at `wanted`, walked again where the check filed no
+/// facts to read: every other definition and test is seeded with its rows.
+fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.raise} = {
   let walked = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, i: Int| {
     let m = at(analysis.mods, i);
     fold(m.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
@@ -3332,15 +3526,7 @@ pub fn claims_in(
   );
   match elaboration_with(analysis.r, analysis.mods, known) {
     None -> panic("a program the front end checked does not check"),
-    Some(shapes) ->
-      claims_of_modules(
-        updated_mods(analysis.mods, shapes),
-        analysis.r,
-        wanted,
-        |m: Bytes| map_contains(stubs, m) || !owned(m),
-        ended(analysis.checked.defs),
-        stated(analysis.checked.defs),
-      ),
+    Some(shapes) -> shapes,
   }
 }
 
@@ -3777,16 +3963,13 @@ type Pull = {
   diags: List<Diag>,
   /// What each module read whole is cut by, where its tests and laws were left out.
   cuts: List<StubCuts>,
-  left: List<StubCuts>,
+  whole: List<StubCuts>,
 }
 
-/// The cuts that leave out the tests and laws of a module read whole, noted before the load leaves
-/// any of them out.
-fn left_out(left: List<StubCuts>, stubs: Map<Bytes, Bytes>, p: ParsedSource) -> List<StubCuts> =
-  if map_contains(stubs, p.name) { left } else {
-    let items = filter(cuts_of(p.module), |c: Cut| !c.braced);
-    if len(items) == 0 { left } else { push(left, { name: p.name, cuts: items }) }
-  }
+/// The cuts of a module read whole, noted before the load leaves any of its items out.
+fn whole_cut(whole: List<StubCuts>, stubs: Map<Bytes, Bytes>, p: ParsedSource) -> List<StubCuts> =
+  if map_contains(stubs, p.name) { whole }
+  else { push(whole, { name: p.name, cuts: cuts_of(p.module) }) }
 
 /// What a module read whole is cut by, noted before its tests and laws are left out: a stub of it
 /// blanks them too, and its own cuts are what the stub was made with.
@@ -3871,7 +4054,7 @@ fn pulling(
             ..acc,
             parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
             cuts: if tested { acc.cuts } else { uncut(acc.cuts, stubs, o.parsed) },
-            left: left_out(acc.left, stubs, o.parsed),
+            whole: whole_cut(acc.whole, stubs, o.parsed),
             pulled: push(acc.pulled, name),
             embeds: concat(acc.embeds, o.embeds),
           }
@@ -4078,16 +4261,16 @@ pub fn staged_pulling_std_with(
   let sources = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
   let read = fold(
     range(0, len(sources)),
-    { parsed: [], cuts: [], left: [] },
-    |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts>, left: List<StubCuts> }, i: Int| {
+    { parsed: [], cuts: [], whole: [] },
+    |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts>, whole: List<StubCuts> }, i: Int| {
       let s = at(sources, i);
       let read = if map_contains(stubs, s.name) {
         with_hidden(parse_at(i, read_as(stubs, s)), map_get(told, s.name))
       } else { parse_at(i, s) };
       let p = { ..read, src: s.src };
-      let left = left_out(acc.left, stubs, p);
-      if tested { { ..acc, parsed: push(acc.parsed, p), left: left } } else {
-        { parsed: push(acc.parsed, untested(p)), cuts: uncut(acc.cuts, stubs, p), left: left }
+      let whole = whole_cut(acc.whole, stubs, p);
+      if tested { { ..acc, parsed: push(acc.parsed, p), whole: whole } } else {
+        { parsed: push(acc.parsed, untested(p)), cuts: uncut(acc.cuts, stubs, p), whole: whole }
       }
     },
   );
@@ -4116,36 +4299,120 @@ pub fn staged_pulling_std_with(
     listed,
     stubs,
     tested,
-    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, left: read.left, diags: [] },
+    { parsed: assembled, pulled: [], embeds: [], cuts: read.cuts, whole: read.whole, diags: [] },
     map_len(texts),
     asked,
   );
-  let hashed = |parsed: List<ParsedSource>|
-    hashed_closure(
-      parsed,
-      clo,
-      len(user),
-      toolchain,
-      ifaces,
-      concat(written.at, x.embeds),
-      priors,
-      x.cuts,
-      x.left,
-    );
-  let whole_load = if len(x.diags) > 0 { Err(x.diags) } else { hashed(x.parsed) };
-  match whole_load {
-    Err(diags) -> { pulled: x.pulled, hashed: Err(diags), viewed: [] },
-    Ok(h) -> if !reached || len(x.pulled) == 0 { { pulled: x.pulled, hashed: Ok(h), viewed: [] } }
-    else {
-      let reach = reach_of(h);
-      {
-        pulled: x.pulled,
-        hashed: match cut_to(x.parsed, h, reach) { None -> Ok(h), Some(cut) -> hashed(cut) },
-        viewed: views_of(h, |name: Bytes| map_contains(reach, name)),
-      }
-    },
+  let hashed = |parsed: List<ParsedSource>, back: Restored|
+    match hashed_closure(
+        parsed,
+        clo,
+        len(user),
+        toolchain,
+        ifaces,
+        concat(written.at, x.embeds),
+        priors,
+        x.cuts,
+        concat(x.whole, back.whole),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(h) -> Ok({ ..h, restored: back.names }),
+    };
+  let rowless = rowless_of(ifaces);
+  let restore = |parsed: List<ParsedSource>, needed: (Bytes) -> Bool|
+    restored(parsed, rowless, needed, whole, told, data_held(data), tested);
+  if len(x.diags) > 0 { { pulled: x.pulled, hashed: Err(x.diags), viewed: [] } }
+  else if !reached || len(x.pulled) == 0 {
+    let back = restore(x.parsed, |_: Bytes| true);
+    { pulled: x.pulled, hashed: hashed(back.parsed, back), viewed: [] }
+  } else {
+    match hashed(x.parsed, no_restored()) {
+      Err(diags) -> { pulled: x.pulled, hashed: Err(diags), viewed: [] },
+      Ok(h) -> {
+        let reach = reach_of(h);
+        let back = restore(x.parsed, |name: Bytes| map_contains(reach, name));
+        let left = fold(
+          map_keys(shipped_functions(h)),
+          map_new(),
+          |acc: Map<Bytes, Bool>, n: Bytes|
+            if map_contains(reach, n) { acc } else { map_insert(acc, n, true) },
+        );
+        let out = match cut_to(back.parsed, h, reach) {
+          None -> if len(back.names) == 0 { Ok(h) } else { hashed(back.parsed, back) },
+          Some(cut) -> hashed(cut, back),
+        };
+        {
+          pulled: x.pulled,
+          hashed: match out {
+            Err(diags) -> Err(diags),
+            Ok(cut) -> if map_len(left) == 0 { Ok(cut) } else {
+              Ok({ ..cut, unreached: Some({ index: h.index, hashes: h.hashes, names: left }) })
+            },
+          },
+          viewed: views_of(h, |name: Bytes| map_contains(reach, name)),
+        }
+      },
+    }
   }
 }
+
+/// Each stub's functions it blanked with no row to answer for them, by module: a shipped module's
+/// function the program it was kept for did not reach.
+fn rowless_of(ifaces: Interfaces) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
+  let rowed = fold(ifaces.defs, map_new(), |acc: Map<Bytes, Bool>, row: KnownDefRow|
+    map_insert(acc, row.name, true));
+  fold(ifaces.cuts, map_new(), |acc: Map<Bytes, List<Bytes>>, s: StubCuts| {
+    let names = fold(s.cuts, [], |ns: List<Bytes>, c: Cut|
+      if c.braced && !c.test && bytes_len(c.name) > 0 && !map_contains(rowed, c.name) {
+        push(ns, c.name)
+      } else { ns });
+    if len(names) == 0 { acc } else { map_insert(acc, s.name, names) }
+  })
+}
+
+/// The stubs read whole again, and their cuts as a module read whole notes them.
+type Restored = { parsed: List<ParsedSource>, names: List<Bytes>, whole: List<StubCuts> }
+
+fn no_restored() -> Restored = { parsed: [], names: [], whole: [] }
+
+/// `parsed` with each stub read from its shipped module's text whose rowless blanks hold a function
+/// `needed` names: only its body can answer for it.
+fn restored(
+  parsed: List<ParsedSource>,
+  rowless: Map<Bytes, List<Bytes>>,
+  needed: (Bytes) -> Bool,
+  whole: Map<Bytes, Bytes>,
+  told: Map<Bytes, Pulls>,
+  data: Map<Bytes, Bytes>,
+  tested: Bool,
+) -> Restored / {abort.raise} =
+  if map_len(rowless) == 0 { { ..no_restored(), parsed: parsed } } else {
+    fold(range(0, len(parsed)), no_restored(), |acc: Restored, i: Int| {
+      let p = at(parsed, i);
+      let back = match map_get(rowless, p.name) {
+        None -> None,
+        Some(fns) -> if len(filter(fns, needed)) == 0 { None } else {
+          match map_get(whole, p.name) {
+            Some(text) ->
+              Some(shipped_embedded(whole, told, data, i, { name: p.name, src: text }).parsed),
+            None ->
+              panic(
+                "a stub blanks a function the program reaches with no row, and its text is not in hand",
+              ),
+          }
+        },
+      };
+      match back {
+        None -> { ..acc, parsed: push(acc.parsed, p) },
+        Some(w) ->
+          {
+            parsed: push(acc.parsed, if tested { w } else { untested(w) }),
+            names: push(acc.names, p.name),
+            whole: push(acc.whole, { name: p.name, cuts: cuts_of(w.module) }),
+          },
+      }
+    })
+  }
 
 /// The first shipped module's slot.
 fn first_shipped(h: Hashed) -> Int = h.root_count + len(h.clo.modules)
@@ -6213,8 +6480,58 @@ test "a refused program's answer is its diagnostics, placed where it went wrong,
   assert_eq(a.dump.hashes, [])
 }
 
+test "claims read each record update's shape from what the check filed, as a walk again finds it" {
+  let a = analysis_of([
+    {
+      name: b"m",
+      src: b"pub type P = { x: Int, y: Int }\n\npub fn moved(p: P) -> P\n  ensures result.x == p.x + 1\n= { ..p, x: p.x + 1 }\n",
+    },
+  ]);
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(string_of_bytes_lossy(why)),
+    Ok(f) -> {
+      assert(len(f.elaboration.updates) > 0, Some("the check filed no update"));
+      assert_eq(f.elaboration.updates, rechecked(a, [0]).updates)
+    },
+  }
+}
+
 fn analysis_of(sources: List<Source>) -> Analysis / {abort.raise} =
   match analyse(parse_all(sources)) { Refused(_) -> panic("the program checks"), Analysed(w) -> w }
+
+test "a statement site is a perform or a labelled call, its arguments read as a check computes them" {
+  let w = analysis_of([
+    {
+      name: b"store",
+      src: b"pub type Param = | PInt(Int) | PNull\npub type Stmt = { sql: String }\npub fn stmt(sql: String) -> Stmt = { sql: sql }\npub effect db { read query[t](s: Stmt, ps: List<Param>) -> Int }\npub fn run<[t]>(s: Stmt) -> Int / {db.query[t]} = db.query[t](s, [])\n",
+    },
+    {
+      name: b"app",
+      src: b"import store\nimport store (db)\nfn q() -> store::Stmt = store::stmt(\"select \" ++ \"sku from items\")\npub fn f(n: Int, p: store::Param) -> Int / {db.query[items]} = db.query[items](q(), [store::PInt(n), store::PNull, p])\npub fn g() -> Int / {db.query[items]} = store::run[items](store::stmt(\"select 1\"))\n",
+    },
+  ]);
+  let hash_of = |name: Bytes|
+    match map_get(by_name(w.hashes.defs), name) { Some(h) -> h, None -> b"" };
+  let sites = statement_sites(w, [b"store.db.query", b"store.run"]);
+  assert_eq(map(sites, |s: StatementSite| (s.callee, s.label)), [
+    (b"store.db.query", b"t"),
+    (b"store.db.query", b"items"),
+    (b"store.run", b"items"),
+  ]);
+  assert_eq(map(sites, |s: StatementSite| s.args), [
+    [AOther, AList([])],
+    [
+      ACall({ callee: b"app.q", hash: hash_of(b"app.q"), args: [] }),
+      AList([
+        ACtor({ type_name: b"store.Param", name: b"PInt" }),
+        ACtor({ type_name: b"store.Param", name: b"PNull" }),
+        AOther,
+      ]),
+    ],
+    [ACall({ callee: b"store.stmt", hash: hash_of(b"store.stmt"), args: [AText(b"select 1")] })],
+  ]);
+  assert_eq(len(statement_sites(w, [b"store.other"])), 0)
+}
 
 fn seeded_of(outcome: AnalysisOutcome) -> List<Bytes> / {abort.raise} =
   match outcome { Refused(_) -> panic("the program checks"), Analysed(w) -> w.checked.seeded }
@@ -7374,16 +7691,22 @@ fn hash_of(sources: List<Source>, name: Bytes) -> Bytes / {abort.raise} =
   }
 
 test "a map or a set literal and the call it builds are one definition" {
+  let set = {
+    name: b"std.set",
+    src: b"pub type Set<a> = | Set(Map<a, Unit>)\npub fn of_list<a>(xs: List<a>) -> Set<a> = Set(map_new())\n",
+  };
   let lit = [
+    set,
     {
       name: b"m",
-      src: b"pub fn two() -> Map<Int, Int> = #{1: 2, 3: 4}\npub fn s() -> Map<Int, Unit> = #[5]",
+      src: b"import std.set\npub fn two() -> Map<Int, Int> = #{1: 2, 3: 4}\npub fn s() -> set::Set<Int> = #[5]",
     },
   ];
   let call = [
+    set,
     {
       name: b"m",
-      src: b"pub fn two() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}, {key: 3, value: 4}])\npub fn s() -> Map<Int, Unit> = map_of_entries([{key: 5, value: ()}])",
+      src: b"import std.set\npub fn two() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}, {key: 3, value: 4}])\npub fn s() -> set::Set<Int> = set::of_list([5])",
     },
   ];
   assert(hash_of(lit, b"m.two") != b"");

@@ -182,7 +182,8 @@ impl Hosts {
                 shutdown: None,
             });
         }
-        let material = tls::Credentials::load(&credentials.tls, &credentials.trust)?;
+        let material =
+            tls::Credentials::load(&credentials.tls, &credentials.trust, &credentials.mtls)?;
         // Loaded up front so a bad root is `E0454` before anything runs.
         let roots = ply_host::fs::Roots::load(roots, Span::DUMMY).map_err(|d| vec![d])?;
         // Opened only when a `db` operation can reach it, and probed now so an unreachable database
@@ -943,7 +944,7 @@ fn bind(
         HostBinding::hermetic_with(registry)
     };
     // Loaded even without `--host`: this command answers what a run trusts, and whether it starts.
-    let credentials = tls::Credentials::load(&args.tls.tls, &args.tls.trust)
+    let credentials = tls::Credentials::load(&args.tls.tls, &args.tls.trust, &args.tls.mtls)
         .map_err(|diagnostics| ("NotBound", diagnostics))?;
     // Likewise, so an unresolvable root is `E0454` before the listing overstates what is reached.
     let roots = ply_host::fs::Roots::load(&args.fs, Span::DUMMY)

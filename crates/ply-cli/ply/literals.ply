@@ -1,12 +1,13 @@
-//! What a load enters before anything runs: its tagged literals' parsers and its `const`
-//! definitions. `tag"text"` is the call `tag::literal("text")`, and one with holes the call of
-//! `tag::compile` on the texts around them, and a load that checked has not yet run either: here
+//! What a load enters before anything runs: its tagged literals' parsers, its `const` definitions
+//! and its statements. `tag"text"` is the call `tag::literal("text")`, and one with holes the call
+//! of `tag::compile` on the texts around them, and a load that checked has not yet run either: here
 //! each one the run's own modules hold is entered on a machine of its own, under a step budget, and
 //! what its parser answers is the literal's verdict. A verdict is a function of the parser and the
 //! texts, so it is kept under the hash of all the parser reaches and the texts, in the toolchain's
 //! cache. A `const` definition is entered the same way, handed nothing: what it answers is kept
 //! there too, as the text a unit holds a value by, under the hash of all the definition reaches,
-//! and every unit emitted after holds the value in place of the body.
+//! and every unit emitted after holds the value in place of the body. A statement a call runs is
+//! computed the same way and judged by `statements`.
 
 import compiler.exprs (TaggedPart)
 import compiler.front (Analysis, TaggedSite, tagged_sites, ConstSite, const_sites)
@@ -22,6 +23,9 @@ import env (env)
 import machine (machine, Called, default_options, unconfigured)
 import program (Timed, front_of)
 import sources (under_abs)
+import statements
+import statements (Asking, Judgement, Unjudged, asking, judged, judgement_key, judgement_bin,
+                   misfits, schemas_refused)
 import std.bin
 import std.fs (fs)
 import std.hash (blake3)
@@ -60,12 +64,16 @@ derive bin for Verdict
 /// the same way and handed nothing, so it has no parts.
 pub type Asked = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
-/// What a command asks of its tagged literals' parsers and its `const` definitions. What answers is
-/// `settling`, which `main` runs every command under, or a handler of the asker's own. A verdict is
-/// a function of what is asked, so the effect is a deterministic one, whatever the answering keeps.
+/// What a command asks of its tagged literals' parsers, its `const` definitions and its statements.
+/// What answers is `settling`, which `main` runs every command under, or a handler of the asker's
+/// own. A verdict is a function of what is asked, so the effect is a deterministic one, whatever
+/// the answering keeps.
 pub effect literal {
   /// In `asked`'s order; or what kept the definitions from being entered at all.
   read verdicts(timed: Timed, analysis: Analysis, root: String, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
+  /// Each statement of `asked` judged against the schema it is held to, in `asked`'s order; or what
+  /// kept the definitions from being entered at all.
+  read statements(timed: Timed, analysis: Analysis, root: String, asked: List<statements::Asked>) -> Result<List<Judgement>, List<Diag>>
 }
 
 // --- Asking -----------------------------------------------------------------------
@@ -300,10 +308,38 @@ fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> =
   }
 
 /// What refuses a load before anything of it runs: each tagged literal of the run's own modules its
-/// parser does not accept, at the place in its text the parser names, and each `const` definition
-/// the program holds that a build could not evaluate and keep. Nothing at all, and nothing asked,
-/// where the program writes neither.
+/// parser does not accept, at the place in its text the parser names; each `const` definition the
+/// program holds that a build could not evaluate and keep; and what the check finds wrong with each
+/// statement the run's own modules run. Nothing at all, and nothing asked, where the program writes
+/// none of them.
 pub fn unsettled(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+) -> List<Diag> / {literal.verdicts, literal.statements, abort.raise} =
+  concat(literal_refusals(timed, analysis, root), statement_refusals(timed, analysis, root))
+
+fn statement_refusals(
+  timed: Timed,
+  analysis: Analysis,
+  root: String,
+) -> List<Diag> / {literal.statements, abort.raise} = {
+  let asks = filter(asking(analysis), |a: Asking| a.site.module < len(timed.program.files));
+  let refused = schemas_refused(asks);
+  if len(asks) == 0 { refused } else {
+    match literal.statements(timed, analysis, root, map(asks, |a: Asking| a.asked)) {
+      Err(diags) -> concat(refused, diags),
+      Ok(judgements) ->
+        fold(range(0, len(asks)), refused, |acc: List<Diag>, i: Int|
+          match list_at(judgements, i) {
+            Some(j) -> concat(acc, misfits(at(asks, i), j)),
+            None -> acc,
+          }),
+    }
+  }
+}
+
+fn literal_refusals(
   timed: Timed,
   analysis: Analysis,
   root: String,
@@ -482,11 +518,13 @@ type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 /// rest entered once and their verdicts kept there, a `const` definition's value beside its own:
 /// the parsers on one machine and the `const` definitions on another, each under its budget.
 pub fn settling<a | e>(
-  body: () -> a / {literal.verdicts | e},
+  body: () -> a / {literal.verdicts, literal.statements | e},
 ) -> a / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
   handle {
     body()
   } with {
+    literal.statements(timed, analysis, root, asked) ->
+      judgements(under_abs(env.bodies[sys]()), root, timed, analysis, asked),
     literal.verdicts(timed, analysis, root, asked) -> {
       let dir = under_abs(env.bodies[sys]());
       let stamp = env.shipped_digest[sys]();
@@ -556,6 +594,74 @@ pub fn settling<a | e>(
       }
     },
   }
+
+/// A statement asked after, the key its judgement is kept under, and the judgement kept there.
+type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
+
+/// Each statement's judgement: the one kept for it, or the one the statements not kept were judged
+/// to, in their order.
+fn judgements(
+  dir: String,
+  root: String,
+  timed: Timed,
+  analysis: Analysis,
+  asked: List<statements::Asked>,
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], env.shipped_digest[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  let stamp = env.shipped_digest[sys]();
+  let version = env.binary_version[sys]();
+  let keyed = map(asked, |a: statements::Asked| {
+    let key = judgement_key(stamp, version, step_budget(), a);
+    {
+      asked: a,
+      key: key,
+      kept: match read_kept[abs](dir, key) {
+        None -> None,
+        Some(bytes) -> match bin::decode(bytes, judgement_bin()) {
+          Ok(j) -> Some(j),
+          Err(_) -> None,
+        },
+      },
+    }
+  });
+  let open = filter(keyed, |k: Keyed| k.kept == None);
+  if len(open) == 0 { Ok(map(keyed, |k: Keyed| match k.kept { Some(j) -> j, None -> Unjudged })) }
+  else {
+    match judged(
+        front_of(timed, analysis),
+        analysis,
+        root,
+        step_budget(),
+        map(open, |k: Keyed| k.asked),
+      ) {
+      Err(diags) -> Err(diags),
+      Ok(found) -> {
+        fold(range(0, len(open)), (), |_: Unit, i: Int|
+          match list_at(found, i) {
+            Some(j) -> write_kept[abs](dir, at(open, i).key, bin::encode(j, judgement_bin())),
+            None -> (),
+          });
+        Ok(
+          fold(
+            keyed,
+            { out: [], next: 0 },
+            |acc: { out: List<Judgement>, next: Int }, k: Keyed|
+              match k.kept {
+                Some(j) -> { out: push(acc.out, j), next: acc.next },
+                None ->
+                  {
+                    out: push(acc.out, match list_at(found, acc.next) {
+                      Some(j) -> j,
+                      None -> Unjudged,
+                    }),
+                    next: acc.next + 1,
+                  },
+              },
+          ).out,
+        )
+      },
+    }
+  }
+}
 
 /// Each verdict sought, in order: the one kept, or the next of `found`, which holds the rest's.
 fn settled(sought: List<Sought>, found: List<Verdict>) -> List<Verdict> =

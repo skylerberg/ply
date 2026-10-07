@@ -601,6 +601,8 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
           name,
           b")->rc = 1; ply_obj(",
           name,
+          b")->kind = 3; ply_obj(",
+          name,
           b")->flags = ",
           ascii_of_int(d.flags),
           b"; ply_obj(",
@@ -977,6 +979,8 @@ fn built_now(
       rec.value.expr,
       b")->rc = 1; ply_obj(",
       rec.value.expr,
+      b")->kind = 3; ply_obj(",
+      rec.value.expr,
       b")->flags = ",
       ascii_of_int(flags),
       b"; ply_obj(",
@@ -1026,6 +1030,80 @@ fn built_now(
   {
     emitter: note_made(kept, rec.value.expr),
     value: { kind: KBoxed, expr: rec.value.expr, ty: ty },
+  }
+}
+
+/// A constructor with arguments, built in this body's reuse token for its width when it holds one;
+/// a token may be a record's cells or another constructor's, so the header is written whole.
+fn ctor_built(emitter: Emitter, tag: Int, words: List<Bytes>) -> WithValue / {abort.raise} = {
+  let n = len(words);
+  let tok = bytes_concat(b"tok", ascii_of_int(n));
+  let made = bind(note_tok(emitter, n), KBoxed, b"0");
+  let r = made.value.expr;
+  let flat = bytes_join(
+    map(words, |w: Bytes| bytes_concat_all([b"ply_is_imm(", w, b")"])),
+    b" && ",
+  );
+  let took = line(
+    line(
+      indent(line(made.emitter, bytes_concat_all([b"if (", tok, b") {"]))),
+      bytes_concat_all([r, b" = ", tok, b"; ", tok, b" = 0;"]),
+    ),
+    bytes_concat_all([
+      b"ply_obj(",
+      r,
+      b")->rc = 1; ply_obj(",
+      r,
+      b")->kind = 4; ply_obj(",
+      r,
+      b")->flags = (",
+      flat,
+      b") ? 1 : 0; ply_obj(",
+      r,
+      b")->len = ",
+      ascii_of_int(n),
+      b"; ply_obj(",
+      r,
+      b")->layout = ",
+      tag_text(emitter, tag),
+      b";",
+    ]),
+  );
+  let stored = fold(range(0, n), took, |acc: Emitter, at: Int|
+    line(
+      acc,
+      bytes_concat_all([
+        b"ply_words(",
+        r,
+        b")[",
+        ascii_of_int(at),
+        b"] = ",
+        match list_at(words, at) { Some(w) -> w, None -> b"0" },
+        b";",
+      ]),
+    ));
+  let arr = fresh(indent(line(outdent(stored), b"} else {")));
+  let called = check(
+    line(
+      line(
+        arr.emitter,
+        bytes_concat_all([b"Word ", arr.name, b"[] = {", bytes_join(words, b", "), b"};"]),
+      ),
+      bytes_concat_all([
+        r,
+        b" = rt_ctor_p(ctx, ",
+        tag_text(emitter, tag),
+        b", (Word)(intptr_t)",
+        arr.name,
+        b", ",
+        ascii_of_int(n),
+        b");",
+      ]),
+    ),
+  );
+  {
+    emitter: note_made(line(outdent(called), b"}"), r),
+    value: { kind: KBoxed, expr: r, ty: TyOpen },
   }
 }
 
@@ -1657,10 +1735,15 @@ fn takes_field(emitter: Emitter, read: Code, base: Code, holder: Bytes) -> Bool 
 
 /// A subject whose fields a pattern bound, each binder holding a count of its own, is let go at
 /// once where this body holds it alone, so a field the subject alone held is its binder's alone;
-/// its cells are the token the next record of its shape takes.
-fn let_go(emitter: Emitter, subj: CValue) -> Emitter =
+/// its cells are the token the next record or constructor of its width takes.
+fn let_go(emitter: Emitter, subj: CValue, pattern: CodePattern) -> Emitter =
   if emitter.release && subj.kind == KBoxed && spendable(emitter, subj.expr) {
-    release_holder(spend_made(emitter, subj.expr), subj)
+    let spent = spend_made(emitter, subj.expr);
+    match pattern {
+      PxCtor(c) -> if len(c.args) == 0 { release_holder(spent, subj) }
+      else { into_token(spent, subj.expr, len(c.args)) },
+      _ -> release_holder(spent, subj),
+    }
   } else { emitter }
 
 /// Releases a holder's count, keeping its cells as a reuse token when the shape is known, and nulls the local.
@@ -1697,31 +1780,35 @@ fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
           emitter,
           bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]),
         ),
-      Some(n) ->
-        line(
-          note_tok(emitter, n),
-          bytes_concat_all([
-            b"if (tok",
-            ascii_of_int(n),
-            b" == 0) { tok",
-            ascii_of_int(n),
-            b" = ply_reset_flat(",
-            value.expr,
-            b"); if (!tok",
-            ascii_of_int(n),
-            b") tok",
-            ascii_of_int(n),
-            b" = rt_reset_p(ctx, ",
-            value.expr,
-            b"); } else { ply_dec(ctx, ",
-            value.expr,
-            b"); } ",
-            value.expr,
-            b" = 0;",
-          ]),
-        ),
+      Some(n) -> into_token(emitter, value.expr, n),
     },
   }
+
+/// Releases the local `name`, a record or a constructor of `n` words, into the token of that width
+/// where it is unique and the token is empty, and nulls it.
+fn into_token(emitter: Emitter, name: Bytes, n: Int) -> Emitter =
+  line(
+    note_tok(emitter, n),
+    bytes_concat_all([
+      b"if (tok",
+      ascii_of_int(n),
+      b" == 0) { tok",
+      ascii_of_int(n),
+      b" = ply_reset_flat(",
+      name,
+      b"); if (!tok",
+      ascii_of_int(n),
+      b") tok",
+      ascii_of_int(n),
+      b" = rt_reset_p(ctx, ",
+      name,
+      b"); } else { ply_dec(ctx, ",
+      name,
+      b"); } ",
+      name,
+      b" = 0;",
+    ]),
+  )
 
 /// A forwarded field of a record about to be released is duplicated first, as `rt_field` does.
 fn secure_field(emitter: Emitter, base: Code, b: CValue, v: CValue) -> WithValue =
@@ -3861,6 +3948,7 @@ fn emit_lambda(
           fold(o.emitter.deferred_locals, b"", |acc: Bytes, r: Bytes|
             bytes_concat_all([acc, b"  Word ", r, b" = 0;\n"])),
           bytes_join(o.emitter.out, b""),
+          toks_freed(o.emitter.reuse_widths),
           b"  ctx->fuel += 1;\n  return ",
           w.expr,
           b";\n}\n",
@@ -3877,6 +3965,26 @@ fn emit_lambda(
     },
   }
 }
+
+/// The line before a return that frees each token the body filled and nothing took.
+fn toks_freed(widths: List<Int>) -> Bytes =
+  if len(widths) == 0 { b"" } else { bytes_concat_all([b"  ", toks_freeing(widths), b"\n"]) }
+
+fn toks_freeing(widths: List<Int>) -> Bytes =
+  bytes_join(
+    map(sorted_widths(widths), |w: Int|
+      bytes_concat_all([
+        b"if (tok",
+        ascii_of_int(w),
+        b") ply_dec(ctx, tok",
+        ascii_of_int(w),
+        b");",
+      ])),
+    b" ",
+  )
+
+/// Where a group member returns: what frees the group's tokens, known once every member is emitted.
+fn toks_mark() -> Bytes = b"/*toks*/"
 
 /// A compiled call's arguments: each duplicated as soon as it is evaluated, unlike a builtin's.
 fn args_one_pass(
@@ -4900,18 +5008,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", fv.name))),
             Some(tag) -> match items(emitter, a.args, params, 0, []) {
               None -> None,
-              Some(w) -> {
+              Some(w) -> if len(w.names) > 0 { Some(ctor_built(w.emitter, tag, w.names)) } else {
                 let arr = fresh(w.emitter);
-                let e = line(
-                  arr.emitter,
-                  bytes_concat_all([
-                    b"Word ",
-                    arr.name,
-                    b"[] = {",
-                    if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
-                    b"};",
-                  ]),
-                );
+                let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
                 let o = bind(
                   e,
                   KBoxed,
@@ -4920,9 +5019,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                     tag_text(emitter, tag),
                     b", (Word)(intptr_t)",
                     arr.name,
-                    b", ",
-                    ascii_of_int(len(a.args)),
-                    b")",
+                    b", 0)",
                   ]),
                 );
                 Some({ emitter: check(o.emitter), value: o.value })
@@ -5976,7 +6073,7 @@ fn stmts(
               None -> None,
               Some(gem) ->
                 stmts(
-                  let_go(pat_bind(gem, l.pat, held.value), { ..held.value, ty: o.value.ty }),
+                  let_go(pat_bind(gem, l.pat, held.value), { ..held.value, ty: o.value.ty }, l.pat),
                   xs,
                   params,
                   i + 1,
@@ -6034,7 +6131,7 @@ fn arms(
               Some(_) -> with_pinned(inner, push(inner.pinned, subj.expr)),
             };
             let bound = if lookup { lookup_bind(binding, a.pat, subj) }
-            else { let_go(pat_bind(binding, a.pat, subj), subj) };
+            else { let_go(pat_bind(binding, a.pat, subj), subj, a.pat) };
             match guarded_body(
                 bound,
                 inner.pinned,
@@ -7654,7 +7751,12 @@ pub fn emit_fn_full(
       let head = fuel_head(bytes_concat(name, b"_entry"), param_names(b"p", len(params)));
       let w = returned(o.emitter, o.value);
       let o = { emitter: w.emitter, value: o.value };
-      let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", w.expr, b";\n}\n"]);
+      let epilogue = bytes_concat_all([
+        toks_freed(o.emitter.reuse_widths),
+        b"  ctx->fuel += 1;\n  return ",
+        w.expr,
+        b";\n}\n",
+      ]);
       let entry = bytes_concat_all([
         b"Word ",
         name,
@@ -7854,7 +7956,10 @@ pub fn emit_group_full(
           tick_line(),
           b"\n",
           b"  switch (which) {\n",
-          bytes_join(emitter.out, b""),
+          bytes_join(
+            bytes_split(bytes_join(emitter.out, b""), toks_mark()),
+            toks_freeing(emitter.reuse_widths),
+          ),
           b"  }\n  return 0;\n}\n",
           entered,
           wrappers,
@@ -7898,7 +8003,7 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
             let w = returned(o.emitter, o.value);
             let closed = line(
               w.emitter,
-              bytes_concat_all([b"ctx->fuel += 1; return ", w.expr, b";"]),
+              bytes_concat_all([toks_mark(), b" ctx->fuel += 1; return ", w.expr, b";"]),
             );
             group_cases(line(outdent(closed), b"}"), members, i + 1)
           },
@@ -8686,9 +8791,13 @@ test "a buffer read out of a record this body holds alone reaches its append uns
       Some(a) -> match bytes_index_of(text(name), then) { None -> false, Some(b) -> a < b },
     };
   let takes = |name: Bytes| bytes_index_of(text(name), b"] = ply_unit; } else { ply_inc(") != None;
-  // A pattern's subject is let go once its fields are bound, before the buffer is appended to.
+  // A pattern's subject is let go once its fields are bound, before the buffer is appended to, and
+  // its cells are the token the record or constructor built after takes; one nothing took is
+  // freed on the way out.
   assert(before(b"m.pattern", b"tok2 = rt_reset_p(ctx, t3); }", b"rt_concat_p("), None);
-  assert(before(b"m.ctor", b"ply_dec(ctx, t3); t3 = 0;", b"rt_concat_p("), None);
+  assert(before(b"m.ctor", b"tok2 = rt_reset_p(ctx, t3); }", b"rt_concat_p("), None);
+  assert(before(b"m.ctor", b"rt_concat_p(", b" = tok2; tok2 = 0;"), None);
+  assert(before(b"m.ctor", b" = tok2; tok2 = 0;", b"if (tok2) ply_dec(ctx, tok2);"), None);
   // A field read before the record's last is taken from it where the record holds it alone.
   assert_eq(map([b"m.update", b"m.iterated", b"m.fields"], takes), [true, true, false]);
   assert(bytes_index_of(text(b"m.folded"), b"@@f0@@, 2)") != None, None);

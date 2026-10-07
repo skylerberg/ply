@@ -16,6 +16,7 @@ import cli.builder (builder)
 import cli.claims (prover, hermetic_prover)
 import cli.env (env)
 import compiler.unit (shipped)
+import compiler.front (module_of)
 import compiler.load
 import cli.hosts (tcb, hermetic_tcb)
 import cli.machine (machine, hermetic_machine)
@@ -38,7 +39,7 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
                     Discard, Said, Signal, Kill, Terminate)
 import std.time (time)
 import std.path (segments)
-import std.string (unlines)
+import std.string (join, unlines)
 import std.text (shell_join)
 
 // --- What a run said ---------------------------------------------------------
@@ -398,8 +399,30 @@ fn shipped_file(name: String) -> Option<Bytes> / {Shipped, abort.raise} =
   } else if string_contains(name, "/") { shipped.module(name) }
   else { None }
 
+/// The module a `.ply` file of a tree is under `prefix`, named by its place there: `hash/legacy.ply`
+/// of the standard library's tree is `std.hash.legacy`.
+pub fn module_in(prefix: String, file: String) -> String / {abort.raise} =
+  match module_of(file) {
+    Ok(name) -> prefix ++ name,
+    Err(why) -> panic("`" ++ file ++ "` cannot be a module: " ++ why),
+  }
+
+/// The file of a tree that holds the module `name` below `prefix`, the inverse of `module_in`.
+fn file_in(prefix: String, name: String) -> String / {abort.raise} =
+  join(string_split(string_slice(name, string_len(prefix), string_len(name)), "."), "/") ++ ".ply"
+
 /// The trees the shipped modules are built from, which `shipped_drift` holds the binary to.
 pub fn std_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../ply-std/ply")
+
+/// A standard library module under its name in a program.
+pub type StdModule = { module: String, src: Bytes }
+
+/// Each module of the standard library's tree: a table whose cases each read one module, so an
+/// edit of one moves no other's.
+pub fn std_modules() -> List<StdModule> / {abort.raise} =
+  fold(std_tree(), [], |acc: List<StdModule>, f: { name: String, bytes: Bytes }|
+    if !string_ends_with(f.name, ".ply") { acc }
+    else { push(acc, { module: module_in("std.", f.name), src: f.bytes }) })
 
 pub fn compiler_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../ply-compiler/ply")
 
@@ -409,10 +432,9 @@ pub fn phase_files() -> List<{ name: String, bytes: Bytes }> = embed_dir("../pha
 fn tree_of(
   name: String,
 ) -> Option<{ file: String, files: List<{ name: String, bytes: Bytes }> }> / {abort.raise} =
-  if string_starts_with(name, "std.") {
-    Some({ file: string_slice(name, 4, string_len(name)) ++ ".ply", files: std_tree() })
-  } else if string_starts_with(name, "compiler.") {
-    Some({ file: string_slice(name, 9, string_len(name)) ++ ".ply", files: compiler_tree() })
+  if string_starts_with(name, "std.") { Some({ file: file_in("std.", name), files: std_tree() }) }
+  else if string_starts_with(name, "compiler.") {
+    Some({ file: file_in("compiler.", name), files: compiler_tree() })
   } else { None }
 
 /// What the compiler embeds from beside its tree, and the name the shipped modules hold it under.
@@ -446,7 +468,7 @@ pub fn shipped_drift() -> List<String> / {Shipped, abort.raise} = {
   let modules = |prefix: String, files: List<{ name: String, bytes: Bytes }>|
     map(
       filter(files, |f: { name: String, bytes: Bytes }| string_ends_with(f.name, ".ply")),
-      |f: { name: String, bytes: Bytes }| prefix ++ f.name,
+      |f: { name: String, bytes: Bytes }| module_in(prefix, f.name) ++ ".ply",
     );
   let held = push(
     concat(modules("std.", std_tree()), modules("compiler.", compiler_tree())),
@@ -1070,14 +1092,17 @@ pub fn at_terminal(argv: List<String>) -> Option<Int> / {Shell, abort.raise} =
     }
   }
 
-/// A connection to the server's port that `ready` accepts, or why none came within `ms`: the
-/// server exited, or nothing it answered was accepted.
+/// How long a server may take to listen. A server builds its program before it listens, cold where
+/// the compiler changed, so this bounds a server that never listens, not how fast one starts.
+fn listening_ms() -> Int = 300000
+
+/// A connection to the server's port that `ready` accepts, or why none came: the server exited, or
+/// nothing it answered was accepted within `listening_ms`.
 pub fn connected<| e>(
   server: Server,
-  ms: Int,
   ready: (Int) -> Bool / e,
 ) -> Result<Int, String> / {diverges, abort.raise, Spawned, Wire, Clock | e} =
-  connected_by(server, time.elapsed_ms() + ms, ms, ready)
+  connected_by(server, time.elapsed_ms() + listening_ms(), listening_ms(), ready)
 
 fn connected_by<| e>(
   server: Server,
@@ -1112,8 +1137,8 @@ fn connected_by<| e>(
   }
 
 /// The first connection the server takes, or the test fails saying why there was none.
-pub fn connection(server: Server, ms: Int) -> Int / {Spawned, Wire, Clock, abort.raise, diverges} =
-  match connected(server, ms, |_c: Int| true) {
+pub fn connection(server: Server) -> Int / {Spawned, Wire, Clock, abort.raise, diverges} =
+  match connected(server, |_c: Int| true) {
     Ok(c) -> c,
     Err(why) -> {
       stop(server);
