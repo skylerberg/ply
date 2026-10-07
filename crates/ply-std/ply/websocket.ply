@@ -1,0 +1,1340 @@
+//! WebSockets (RFC 6455) over an HTTP/1.1 `Upgrade`, with permessage-deflate (RFC 7692).
+//!
+//! The protocol is a core with no I/O, bytes in and events out, and sessions over `std.net` on
+//! top of it. `decode_frame` reads one frame from the front of a buffer under `Limits`, and
+//! `encode_frame` writes one, masked under a key where one is given. `received` is the state
+//! machine: it takes the frames a peer sent, in order, and answers the messages they complete,
+//! the pongs and the close it must send back, and the failure that ends the connection. Every
+//! ambiguity is a failure, closed with the code RFC 6455 §7.4 gives it: a frame from a client that
+//! is not masked or one from a server that is (1002), a reserved bit or opcode (1002), a control
+//! frame fragmented or over 125 bytes (1002), a continuation with nothing to continue or a new
+//! message inside a fragmented one (1002), a close code no endpoint may send (1002), text that is
+//! not UTF-8 (1007), and a frame, a message or a count of fragments past `Limits` (1009). A close
+//! from the peer is echoed, and nothing is read after it.
+//!
+//! `upgrade` answers a request as a server does: the `101` that switches it, with the
+//! subprotocol of the client's offers this server speaks first, or the response that refuses it
+//! (`426` naming version 13 for another version, `400` for a request that is no handshake).
+//! `handshake` writes a client's request and `confirmed` checks the server's `101` against it.
+//!
+//! permessage-deflate is taken without context on either side: a server that accepts the
+//! extension answers `server_no_context_takeover` and `client_no_context_takeover`, and a client
+//! offers both, so each message is compressed on its own by `std.gzip`'s DEFLATE and decompressed
+//! under `Limits.max_message`, which makes a decompression bomb a 1009 rather than an allocation.
+//! A message is sent compressed, its final block marked as the last (RFC 7692 §7.2.3.4), and one
+//! that was compressed by a flush is read with the empty block that ends it put back.
+//!
+//! `serve_connection` reads one request on a connection, upgrades it and answers each message
+//! with what `respond` makes of it; `connect` opens a client session to a `ws` or `wss` URL;
+//! `receive`, `send` and `close` work a session either way. A client masks each frame under a key
+//! drawn from `entropy`.
+
+import std.base64 (base64_decode, base64_encode)
+import std.bytes (cycle, u16_be, u16_be_at, u64_be, u64_be_at, xor)
+import std.dns
+import std.dns (dns)
+import std.gzip
+import std.hash_legacy (sha1)
+import std.http
+import std.http (Request, Response)
+import std.ip
+import std.ip (ip)
+import std.list (any, contains)
+import std.net
+import std.net (Says, net, send_all)
+import std.random (entropy, rand, token_bytes, with_rand)
+import std.string (ascii_lower, ascii_trim, eq_ignore_ascii_case, join)
+import std.task
+import std.url
+import std.url (Url)
+
+// --- Frames -----------------------------------------------------------------
+
+/// What a frame is.
+pub type Opcode = | Continuation | Text | Binary | Close | Ping | Pong
+
+/// A frame as the protocol reads it, unmasked: whether it ends its message, whether its message
+/// is compressed (RSV1), what it is, and its payload.
+pub type Frame = { fin: Bool, compressed: Bool, opcode: Opcode, payload: Bytes }
+
+/// What one connection may cost.
+pub type Limits = {
+  /// Payload bytes in one frame.
+  max_frame: Int,
+  /// Bytes in one message, its fragments together and decompressed.
+  max_message: Int,
+  /// Frames one message is sent in.
+  max_fragments: Int,
+}
+
+/// Frames of 1 MiB, messages of 4 MiB, and 128 fragments.
+pub fn default_limits() -> Limits = { max_frame: 1048576, max_message: 4194304, max_fragments: 128 }
+
+/// Why a connection is failed: the close code it is closed with, and why.
+pub type Failure = { code: Int, reason: String }
+
+/// What the front of a buffer holds.
+pub type Decoded =
+  /// Not a whole frame yet.
+  | More
+  /// A frame, whether it was masked, and the bytes it took.
+  | Got({ frame: Frame, masked: Bool, used: Int })
+  /// What the connection is failed with.
+  | Broken(Failure)
+
+fn protocol_error(reason: String) -> Failure = { code: 1002, reason: reason }
+
+fn too_big(reason: String) -> Failure = { code: 1009, reason: reason }
+
+fn opcode_of(n: Int) -> Option<Opcode> =
+  match n {
+    0 -> Some(Continuation),
+    1 -> Some(Text),
+    2 -> Some(Binary),
+    8 -> Some(Close),
+    9 -> Some(Ping),
+    10 -> Some(Pong),
+    _ -> None,
+  }
+
+fn code_of(o: Opcode) -> Int =
+  match o { Continuation -> 0, Text -> 1, Binary -> 2, Close -> 8, Ping -> 9, Pong -> 10 }
+
+/// Whether a frame of this kind is a control frame.
+pub fn is_control(o: Opcode) -> Bool = o == Close || o == Ping || o == Pong
+
+/// The frame at the front of `buf`, read under `limits`; a compressed frame is refused unless
+/// `compression` was agreed.
+pub fn decode_frame(buf: Bytes, limits: Limits, compression: Bool) -> Decoded / {abort.raise} =
+  if bytes_len(buf) < 2 { More } else {
+    let b0 = bytes_at(buf, 0);
+    let b1 = bytes_at(buf, 1);
+    match opcode_of(b0 & 15) {
+      None -> Broken(protocol_error("a reserved opcode")),
+      Some(op) -> if b0 & 0x30 != 0 { Broken(protocol_error("a reserved bit is set")) }
+      else if b0 & 0x40 != 0 && (!compression || is_control(op)) {
+        Broken(protocol_error("a frame is marked compressed with nothing agreed to compress it"))
+      } else if is_control(op) && (b0 & 0x80 == 0 || b1 & 0x7f > 125) {
+        Broken(protocol_error("a control frame is fragmented or longer than 125 bytes"))
+      } else { sized(buf, b0, b1, op, limits) },
+    }
+  }
+
+fn sized(buf: Bytes, b0: Int, b1: Int, op: Opcode, limits: Limits) -> Decoded / {abort.raise} = {
+  let short = b1 & 0x7f;
+  let length = if short == 126 { u16_be_at(buf, 2) }
+  else if short == 127 { u64_be_at(buf, 2) }
+  else { Some(short) };
+  let header = if short == 126 { 4 } else if short == 127 { 10 } else { 2 };
+  let masked = b1 & 0x80 != 0;
+  let top = short == 127 && bytes_len(buf) > 2 && bytes_at(buf, 2) & 0x80 != 0;
+  match length {
+    None -> if top { Broken(protocol_error("a length with its top bit set")) } else { More },
+    Some(n) -> if n < 0 || top { Broken(protocol_error("a length with its top bit set")) }
+    else if (short == 126 && n < 126) || (short == 127 && n < 65536) {
+      Broken(protocol_error("a length not written in its shortest form"))
+    } else if n > limits.max_frame { Broken(too_big("a frame is longer than the limit")) } else {
+      let start = header + (if masked { 4 } else { 0 });
+      if bytes_len(buf) < start + n { More } else {
+        let raw = bytes_slice(buf, start, start + n);
+        let payload = if masked { unmasked(raw, bytes_slice(buf, header, header + 4)) }
+        else { raw };
+        Got({
+          frame: { fin: b0 & 0x80 != 0, compressed: b0 & 0x40 != 0, opcode: op, payload: payload },
+          masked: masked,
+          used: start + n,
+        })
+      }
+    },
+  }
+}
+
+/// `payload` under the four-byte masking key `key`, which is also how a masked payload is read.
+pub fn unmasked(payload: Bytes, key: Bytes) -> Bytes / {abort.raise} =
+  xor(payload, cycle(key, bytes_len(payload)))
+
+/// `f` on the wire, masked under `key` where one is given (a client's frames must be).
+pub fn encode_frame(f: Frame, key: Option<Bytes>) -> Bytes / {abort.raise} = {
+  let n = bytes_len(f.payload);
+  let first = (if f.fin { 0x80 } else { 0 }) | (if f.compressed { 0x40 } else { 0 })
+    | code_of(f.opcode);
+  let mask_bit = match key { Some(_) -> 0x80, None -> 0 };
+  let length = if n < 126 { byte_of_int(mask_bit | n) }
+  else if n < 65536 { bytes_concat(byte_of_int(mask_bit | 126), u16_be(n)) }
+  else { bytes_concat(byte_of_int(mask_bit | 127), u64_be(n)) };
+  match key {
+    Some(k) -> bytes_concat_all([byte_of_int(first), length, k, unmasked(f.payload, k)]),
+    None -> bytes_concat_all([byte_of_int(first), length, f.payload]),
+  }
+}
+
+// --- Messages and the state machine -----------------------------------------
+
+/// Which end of a connection this is.
+pub type Role = | Server | Client
+
+/// A whole message.
+pub type Message = | TextMessage(String) | BinaryMessage(Bytes)
+
+/// A message being reassembled from its fragments.
+type Partial = { opcode: Opcode, parts: List<Bytes>, size: Int, count: Int, compressed: Bool }
+
+/// One end of a connection, as `received` leaves it.
+pub type State = {
+  role: Role,
+  limits: Limits,
+  /// Whether permessage-deflate was agreed.
+  compression: Bool,
+  partial: Option<Partial>,
+  /// This end has sent its close.
+  closing: Bool,
+  /// The close handshake is over, or the connection failed: nothing more is read.
+  closed: Bool,
+}
+
+/// A connection's state as it opens.
+pub fn opened(role: Role, limits: Limits, compression: Bool) -> State =
+  {
+    role: role,
+    limits: limits,
+    compression: compression,
+    partial: None,
+    closing: false,
+    closed: false,
+  }
+
+/// What a frame meant.
+pub type Event =
+  /// A message, whole.
+  | Received(Message)
+  /// A ping, which a pong among the replies answers.
+  | Pinged(Bytes)
+  /// A pong.
+  | Ponged(Bytes)
+  /// The peer closed with this code and reason (1005 for a close with no code); a close among the
+  /// replies answers it unless this end had closed first.
+  | ClosedBy({ code: Int, reason: String })
+  /// The connection failed: a close with the failure's code is among the replies.
+  | Failed(Failure)
+
+/// What `received` answers: the state after the frame, what it meant, and the frames to send back.
+pub type Step = { state: State, events: List<Event>, replies: List<Frame> }
+
+/// The frame that closes with `code` and `reason`; no code at all for 1005.
+pub fn close_frame(code: Int, reason: String) -> Frame / {abort.raise} =
+  {
+    fin: true,
+    compressed: false,
+    opcode: Close,
+    payload: if code == 1005 { b"" } else { bytes_concat(u16_be(code), bytes_of_string(reason)) },
+  }
+
+fn failed(s: State, f: Failure) -> Step / {abort.raise} =
+  {
+    state: { ..s, closing: true, closed: true, partial: None },
+    events: [Failed(f)],
+    replies: [close_frame(f.code, f.reason)],
+  }
+
+/// What `f`, the next frame the peer sent, means to `s`.
+pub fn received(s: State, f: Frame, masked: Bool) -> Step / {abort.raise} =
+  if s.closed { { state: s, events: [], replies: [] } } else if masked != (s.role == Server) {
+    failed(
+      s,
+      protocol_error(if masked { "a server's frame is masked" }
+      else { "a client's frame is not masked" }),
+    )
+  } else {
+    match f.opcode {
+      Ping ->
+        {
+          state: s,
+          events: [Pinged(f.payload)],
+          replies: [{ fin: true, compressed: false, opcode: Pong, payload: f.payload }],
+        },
+      Pong -> { state: s, events: [Ponged(f.payload)], replies: [] },
+      Close -> closed_by(s, f.payload),
+      Continuation -> match s.partial {
+        None -> failed(s, protocol_error("a continuation with no message to continue")),
+        Some(p) -> if f.compressed { failed(s, protocol_error("a continuation marked compressed")) }
+        else {
+          gathered(
+            s,
+            {
+              ..p,
+              parts: push(p.parts, f.payload),
+              size: p.size + bytes_len(f.payload),
+              count: p.count + 1,
+            },
+            f.fin,
+          )
+        },
+      },
+      _ -> match s.partial {
+        Some(_) -> failed(s, protocol_error("a new message inside a fragmented one")),
+        None ->
+          gathered(
+            s,
+            {
+              opcode: f.opcode,
+              parts: [f.payload],
+              size: bytes_len(f.payload),
+              count: 1,
+              compressed: f.compressed,
+            },
+            f.fin,
+          ),
+      },
+    }
+  }
+
+fn gathered(s: State, p: Partial, fin: Bool) -> Step / {abort.raise} =
+  if p.size > s.limits.max_message { failed(s, too_big("a message is longer than the limit")) }
+  else if p.count > s.limits.max_fragments {
+    failed(s, too_big("a message is in more fragments than the limit"))
+  } else if !fin { { state: { ..s, partial: Some(p) }, events: [], replies: [] } } else {
+    let whole = bytes_concat_all(p.parts);
+    match if p.compressed { inflated(whole, s.limits.max_message) } else { Ok(whole) } {
+      Err(why) -> failed({ ..s, partial: None }, why),
+      Ok(payload) -> match p.opcode {
+        Text -> match utf8(payload) {
+          Some(text) ->
+            { state: { ..s, partial: None }, events: [Received(TextMessage(text))], replies: [] },
+          None -> failed(s, { code: 1007, reason: "a text message is not UTF-8" }),
+        },
+        _ ->
+          {
+            state: { ..s, partial: None },
+            events: [Received(BinaryMessage(payload))],
+            replies: [],
+          },
+      },
+    }
+  }
+
+/// `b` as text where it is UTF-8.
+fn utf8(b: Bytes) -> Option<String> =
+  match try[abort.raise] { string_of_bytes(b) } { Ok(t) -> Some(t), Err(_) -> None }
+
+/// The close codes an endpoint may send: those RFC 6455 §7.4.1 defines for the wire, and the ones
+/// registered or private (3000 to 4999).
+pub fn sendable_code(code: Int) -> Bool =
+  (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014) || (code >= 3000 && code <= 4999)
+
+fn closed_by(s: State, payload: Bytes) -> Step / {abort.raise} =
+  if bytes_len(payload) == 1 { failed(s, protocol_error("a close of one byte")) } else {
+    let code = if bytes_len(payload) == 0 { 1005 }
+    else { match u16_be_at(payload, 0) { Some(n) -> n, None -> 1005 } };
+    let reason = utf8(
+      bytes_slice(payload, if bytes_len(payload) == 0 { 0 } else { 2 }, bytes_len(payload)),
+    );
+    if code != 1005 && !sendable_code(code) {
+      failed(s, protocol_error("a close code no endpoint may send"))
+    } else {
+      match reason {
+        None -> failed(s, { code: 1007, reason: "a close reason is not UTF-8" }),
+        Some(text) ->
+          {
+            state: { ..s, closing: true, closed: true, partial: None },
+            events: [ClosedBy({ code: code, reason: text })],
+            replies: if s.closing { [] }
+            else { [close_frame(if code == 1005 { 1005 } else { code }, "")] },
+          },
+      }
+    }
+  }
+
+/// The tail RFC 7692 §7.2.2 has a receiver put back on a message compressed by a flush, and the
+/// final empty block that ends the stream it then is.
+fn flushed_tail() -> Bytes = b"\x00\x00\xff\xff\x03\x00"
+
+/// A compressed message's payload decompressed, at most `limit` bytes of it: the stream it is
+/// with the flush's tail put back, which a message whose last block is final ends before.
+fn inflated(data: Bytes, limit: Int) -> Result<Bytes, Failure> / {abort.raise} = {
+  let stream = bytes_concat(data, flushed_tail());
+  let first = gzip::try_inflate(stream, limit);
+  let read = match first {
+    Err(r) -> if r.why == gzip::Trailing { gzip::try_inflate(bytes_slice(stream, 0, r.at), limit) }
+    else { first },
+    Ok(_) -> first,
+  };
+  match read {
+    Ok(b) -> Ok(b),
+    Err(r) ->
+      Err(if r.why == gzip::OverLimit { too_big("a message decompresses past the limit") }
+      else { { code: 1007, reason: "a compressed message does not decompress" } }),
+  }
+}
+
+/// The frame `m` is sent in, compressed where `compression` was agreed.
+pub fn message_frame(m: Message, compression: Bool) -> Frame / {abort.raise} = {
+  let plain = match m { TextMessage(t) -> bytes_of_string(t), BinaryMessage(b) -> b };
+  let op = match m { TextMessage(_) -> Text, BinaryMessage(_) -> Binary };
+  if compression { { fin: true, compressed: true, opcode: op, payload: gzip::deflate(plain) } }
+  else { { fin: true, compressed: false, opcode: op, payload: plain } }
+}
+
+// --- The handshake ----------------------------------------------------------
+
+/// The GUID RFC 6455 §1.3 has both ends append to the key.
+fn guid() -> String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/// The `Sec-WebSocket-Accept` a server answers the key `key` with.
+pub fn accept_key(key: String) -> String / {abort.raise} =
+  base64_encode(sha1(bytes_of_string(key ++ guid())))
+
+/// The extension a server answers an offer of permessage-deflate with.
+fn deflate_answer() -> String =
+  "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+
+/// What a server says it speaks.
+pub type Options = {
+  /// Subprotocols in the order this end prefers them.
+  protocols: List<String>,
+  /// Whether permessage-deflate is offered or accepted.
+  compression: Bool,
+  limits: Limits,
+  /// The longest wait for the next frame.
+  idle_timeout_ms: Int,
+  /// Messages one connection is answered before it is closed.
+  max_messages: Int,
+}
+
+/// No subprotocol, compression on, `default_limits`, a minute's idle wait and ten thousand
+/// messages.
+pub fn default_options() -> Options =
+  {
+    protocols: [],
+    compression: true,
+    limits: default_limits(),
+    idle_timeout_ms: 60000,
+    max_messages: 10000,
+  }
+
+/// What a server agreed in its `101`.
+pub type Agreed = { protocol: Option<String>, compression: Bool }
+
+/// What a request is answered with.
+pub type Upgrade =
+  /// The `101` that switches the connection, written, and what it agreed.
+  | Upgrading({ head: Bytes, agreed: Agreed })
+  /// The response that refuses it.
+  | Refused(Response)
+
+fn tokens(headers: http::Headers, name: String) -> List<String> / {abort.raise} =
+  fold(http::header_lines(headers, name), [], |acc: List<String>, line: String|
+    fold(string_split(line, ","), acc, |inner: List<String>, part: String| {
+      let t = ascii_trim(part);
+      if string_len(t) == 0 { inner } else { push(inner, t) }
+    }))
+
+fn names(headers: http::Headers, name: String, token: String) -> Bool / {abort.raise} =
+  any(tokens(headers, name), |t: String| eq_ignore_ascii_case(t, token))
+
+/// Whether the client offers permessage-deflate in a form this end can take: its window is ours to
+/// keep under 32 KiB, which every offer allows, unless it asks the server for fewer bits.
+fn deflate_offered(headers: http::Headers) -> Bool / {abort.raise} =
+  any(tokens(headers, "sec-websocket-extensions"), |offer: String| {
+    let parts = map(string_split(offer, ";"), ascii_trim);
+    match parts {
+      [first, ..params] ->
+        eq_ignore_ascii_case(first, "permessage-deflate")
+          && !any(params, |p: String|
+            string_starts_with(ascii_lower(p), "server_max_window_bits")
+              && p != "server_max_window_bits=15"),
+      [] -> false,
+    }
+  })
+
+/// The answer to `req` as a server that speaks what `options` say.
+pub fn upgrade(req: Request, options: Options) -> Upgrade / {abort.raise} = {
+  let h = req.headers;
+  let key = match http::header(h, "sec-websocket-key") { Some(k) -> ascii_trim(k), None -> "" };
+  let key_reads = match base64_decode(key) { Some(b) -> bytes_len(b) == 16, None -> false };
+  if req.method != http::Get || req.version != http::Http11 || !names(h, "upgrade", "websocket")
+      || !names(h, "connection", "upgrade")
+      || !key_reads { Refused(http::text_response(400, "this is not a WebSocket handshake\n")) }
+  else if http::header(h, "sec-websocket-version") != Some("13") {
+    let r = http::text_response(426, "this server speaks WebSocket version 13\n");
+    Refused({ ..r, headers: http::set_header(r.headers, "sec-websocket-version", "13") })
+  } else {
+    let offered = tokens(h, "sec-websocket-protocol");
+    let protocol = fold(offered, None, |chosen: Option<String>, p: String|
+      match chosen {
+        Some(_) -> chosen,
+        None -> if contains(options.protocols, p) { Some(p) } else { None },
+      });
+    let compression = options.compression && deflate_offered(h);
+    let lines = [
+      "HTTP/1.1 101 Switching Protocols\r\n",
+      "Upgrade: websocket\r\n",
+      "Connection: Upgrade\r\n",
+      "Sec-WebSocket-Accept: " ++ accept_key(key) ++ "\r\n",
+      match protocol { Some(p) -> "Sec-WebSocket-Protocol: " ++ p ++ "\r\n", None -> "" },
+      if compression { "Sec-WebSocket-Extensions: " ++ deflate_answer() ++ "\r\n" } else { "" },
+      "\r\n",
+    ];
+    Upgrading({
+      head: bytes_of_string(join(lines, "")),
+      agreed: { protocol: protocol, compression: compression },
+    })
+  }
+}
+
+/// A client's opening request to `target` at `authority` under `key` (sixteen bytes in base64).
+pub fn handshake(
+  authority: String,
+  target: String,
+  key: String,
+  options: Options,
+) -> Bytes / {abort.raise} = {
+  let lines = [
+    "GET " ++ target ++ " HTTP/1.1\r\n",
+    "Host: " ++ authority ++ "\r\n",
+    "Upgrade: websocket\r\n",
+    "Connection: Upgrade\r\n",
+    "Sec-WebSocket-Key: " ++ key ++ "\r\n",
+    "Sec-WebSocket-Version: 13\r\n",
+    match options.protocols {
+      [] -> "",
+      ps -> "Sec-WebSocket-Protocol: " ++ join(ps, ", ") ++ "\r\n",
+    },
+    if options.compression { "Sec-WebSocket-Extensions: " ++ deflate_answer() ++ "\r\n" }
+    else { "" },
+    "\r\n",
+  ];
+  bytes_of_string(join(lines, ""))
+}
+
+/// What a server's answer to `handshake` agreed, or why it is no `101` for that request: another
+/// status, the wrong accept key, a subprotocol or extension the client did not offer, or
+/// compression that keeps context.
+pub fn confirmed(
+  head: http::ResponseHead,
+  key: String,
+  options: Options,
+) -> Result<Agreed, String> / {abort.raise} = {
+  let h = head.headers;
+  let protocol = http::header(h, "sec-websocket-protocol");
+  let extensions = tokens(h, "sec-websocket-extensions");
+  let compression = any(extensions, |e: String|
+    string_starts_with(ascii_lower(e), "permessage-deflate"));
+  if head.status != 101 { Err("the server answered " ++ int_to_string(head.status)) }
+  else if !names(h, "upgrade", "websocket") || !names(h, "connection", "upgrade") {
+    Err("the answer does not switch to WebSocket")
+  } else if http::header(h, "sec-websocket-accept") != Some(accept_key(key)) {
+    Err("the accept key is not this request's")
+  } else if match protocol { Some(p) -> !contains(options.protocols, p), None -> false } {
+    Err("a subprotocol that was not offered")
+  } else if compression
+      && (!options.compression
+      || !any(extensions, |e: String| string_contains(e, "server_no_context_takeover"))) {
+    Err("compression that was not offered, or that keeps context")
+  } else if len(extensions) > (if compression { 1 } else { 0 }) {
+    Err("an extension that was not offered")
+  } else { Ok({ protocol: protocol, compression: compression }) }
+}
+
+// --- Sessions over std.net --------------------------------------------------
+
+/// One end of an open connection: its handle, its state, and the bytes read past the last frame.
+pub type Session = { conn: Int, state: State, buffer: Bytes, agreed: Agreed }
+
+/// What `receive` found.
+pub type Got =
+  /// A message.
+  | Message(Message)
+  /// The close handshake ended, with the peer's code and reason.
+  | Closed({ code: Int, reason: String })
+  /// The connection failed, and a close saying why was sent.
+  | Failure(Failure)
+  /// Nothing came within the wait.
+  | TimedOut
+  /// The peer went away without closing.
+  | Gone
+
+/// The most frames `receive` reads before a message, past which it fails the connection: pings
+/// and pongs between messages, and fragments.
+fn frame_budget(limits: Limits) -> Int = limits.max_fragments + 256
+
+/// The next message on `s`, answering pings and a close on the way, each read within
+/// `timeout_ms`.
+pub fn receive<[l]>(
+  s: Session,
+  timeout_ms: Int,
+) -> { session: Session, got: Got } / {net.recv[l], net.send[l], entropy.next, abort.raise} = {
+  let budget = frame_budget(s.state.limits) * 2;
+  iterate(
+    { session: s, got: None, left: budget },
+    budget + 2,
+    |r: { session: Session, got: Option<Got>, left: Int }|
+      match r.got {
+        Some(g) -> Stop({ session: r.session, got: g }),
+        None -> if r.left <= 0 {
+          let f = { code: 1008, reason: "too many frames without a message" };
+          sent[l](r.session, [close_frame(f.code, f.reason)], timeout_ms);
+          Stop({
+            session: { ..r.session, state: { ..r.session.state, closed: true, closing: true } },
+            got: Failure(f),
+          })
+        } else {
+          let next = stepped[l](r.session, timeout_ms);
+          Continue({ session: next.session, got: next.got, left: r.left - 1 })
+        },
+      },
+  )
+}
+
+fn stepped<[l]>(
+  s: Session,
+  timeout_ms: Int,
+) -> { session: Session, got: Option<Got> } / {net.recv[l], net.send[l], entropy.next, abort.raise} =
+  if s.state.closed { { session: s, got: Some(Closed({ code: 1006, reason: "" })) } } else {
+    match decode_frame(s.buffer, s.state.limits, s.state.compression) {
+      Broken(f) -> {
+        sent[l](s, [close_frame(f.code, f.reason)], timeout_ms);
+        {
+          session: { ..s, state: { ..s.state, closed: true, closing: true } },
+          got: Some(Failure(f)),
+        }
+      },
+      More -> match net.recv[l](s.conn, http::read_size(), timeout_ms) {
+        None -> { session: s, got: Some(TimedOut) },
+        Some(chunk) -> if bytes_len(chunk) == 0 { { session: s, got: Some(Gone) } }
+        else { { session: { ..s, buffer: bytes_concat(s.buffer, chunk) }, got: None } },
+      },
+      Got(g) -> {
+        let step = received(s.state, g.frame, g.masked);
+        sent[l](s, step.replies, timeout_ms);
+        let next = {
+          ..s,
+          state: step.state,
+          buffer: bytes_slice(s.buffer, g.used, bytes_len(s.buffer)),
+        };
+        { session: next, got: got_of(step.events) }
+      },
+    }
+  }
+
+fn got_of(events: List<Event>) -> Option<Got> =
+  fold(events, None, |g: Option<Got>, e: Event|
+    match g {
+      Some(_) -> g,
+      None -> match e {
+        Received(m) -> Some(Message(m)),
+        ClosedBy(c) -> Some(Closed(c)),
+        Failed(f) -> Some(Failure(f)),
+        _ -> None,
+      },
+    })
+
+/// The frames, masked where this end is a client.
+fn sent<[l]>(
+  s: Session,
+  frames: List<Frame>,
+  timeout_ms: Int,
+) -> Bool / {net.send[l], entropy.next, abort.raise} =
+  fold(frames, true, |ok: Bool, f: Frame|
+    ok
+      && send_all[l](
+        s.conn,
+        encode_frame(f, match s.state.role { Client -> Some(token_bytes(4)), Server -> None }),
+        timeout_ms,
+      ))
+
+/// Sends `m` on `s`; `false` where the peer took it no longer.
+pub fn send<[l]>(
+  s: Session,
+  m: Message,
+  timeout_ms: Int,
+) -> Bool / {net.send[l], entropy.next, abort.raise} =
+  !s.state.closing && sent[l](s, [message_frame(m, s.state.compression)], timeout_ms)
+
+/// Sends a close with `code` and `reason`; the peer's close is read with `receive`.
+pub fn close<[l]>(
+  s: Session,
+  code: Int,
+  reason: String,
+  timeout_ms: Int,
+) -> Session / {net.send[l], entropy.next, abort.raise} =
+  if s.state.closing { s } else {
+    sent[l](s, [close_frame(code, reason)], timeout_ms);
+    { ..s, state: { ..s.state, closing: true } }
+  }
+
+/// Reads one request on `c`, upgrades it as `options` say or answers why not, and then answers each
+/// message with the messages `respond` makes of it, up to `options.max_messages`; the connection is
+/// closed however that ends.
+pub fn serve_connection<[l] | e>(
+  c: Int,
+  limits: http::Limits,
+  options: Options,
+  respond: (Message) -> List<Message> / e,
+) -> Unit / {net.recv[l], net.send[l], net.close[l], entropy.next, abort.raise | e} =
+  bracket(|| c, |h: Int| net.close[l](h), |h: Int|
+    match http::read_head[l](h, b"", limits, false) {
+      http::HeadBytes(got) -> match http::parse_head(got.buf, limits) {
+        http::Parsed(head) -> match upgrade(head.request, options) {
+          Refused(r) -> {
+            send_all[l](
+              h,
+              http::encode(head.request.method, head.request.version, false, r),
+              limits.write_timeout_ms,
+            );
+            ()
+          },
+          Upgrading(u) -> if send_all[l](h, u.head, limits.write_timeout_ms) {
+            answering[l](
+              {
+                conn: h,
+                state: opened(Server, options.limits, u.agreed.compression),
+                buffer: bytes_slice(got.buf, head.consumed, bytes_len(got.buf)),
+                agreed: u.agreed,
+              },
+              options,
+              respond,
+              options.max_messages,
+            )
+          } else { () },
+        },
+        http::Refused(r) -> {
+          send_all[l](
+            h,
+            http::encode(http::Get, http::Http11, false, http::refusal_response(r)),
+            limits.write_timeout_ms,
+          );
+          ()
+        },
+        http::Incomplete -> (),
+      },
+      _ -> (),
+    })
+
+fn answering<[l] | e>(
+  s: Session,
+  options: Options,
+  respond: (Message) -> List<Message> / e,
+  left: Int,
+) -> Unit / {net.recv[l], net.send[l], entropy.next, abort.raise | e} =
+  if left <= 0 {
+    close[l](s, 1008, "this connection has had its messages", options.idle_timeout_ms);
+    ()
+  } else {
+    let r = receive[l](s, options.idle_timeout_ms);
+    match r.got {
+      Message(m) -> {
+        fold(respond(m), true, |ok: Bool, out: Message|
+          ok && send[l](r.session, out, options.idle_timeout_ms));
+        answering(r.session, options, respond, left - 1)
+      },
+      TimedOut -> {
+        close[l](r.session, 1001, "idle", options.idle_timeout_ms);
+        ()
+      },
+      _ -> (),
+    }
+  }
+
+/// Why `connect` has no session.
+pub type ConnectError =
+  /// The URL is not `ws` or `wss` with a host.
+  | NotWebSocket(String)
+  /// No connection was made, or it was not secured.
+  | NoConnection(net::Refusal)
+  /// The server's answer was no `101` for this request, and why.
+  | Declined(String)
+
+/// A client session to `to`, a `ws` URL over TCP or a `wss` one over TLS, under `options`.
+pub fn connect<[l]>(
+  to: Url,
+  options: Options,
+  limits: http::Limits,
+) -> Result<Session, ConnectError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, entropy.next, abort.raise} = {
+  let scheme = url::url_scheme(to);
+  let host = match url::url_host(to) {
+    Some(url::Name(n)) -> Some(n),
+    Some(url::V4(a)) -> Some(ip::render(ip::V4(a))),
+    Some(url::V6(a)) -> Some(ip::render(ip::V6(a))),
+    None -> None,
+  };
+  let port = match url::url_port(to) {
+    Some(p) -> Some(p),
+    None -> if scheme == "wss" { Some(443) } else { Some(80) },
+  };
+  match ((host, port, url::url_host_port(to))) {
+    (Some(h), Some(p), Some(authority)) -> if scheme != "ws" && scheme != "wss" {
+      Err(NotWebSocket(url::url_redacted(to)))
+    } else {
+      let opened: Result<Int, net::Refusal> = if scheme == "wss" {
+        try { net::dial_tls[l](h, p, ["http/1.1"], [], limits.connect_timeout_ms) }
+      } else { try { net::dial[l](h, p, [], limits.connect_timeout_ms) } };
+      match opened {
+        Err(why) -> Err(NoConnection(why)),
+        Ok(c) -> {
+          let target = (if url::url_path(to) == "" { "/" } else { url::url_path(to) })
+            ++ (match url::url_query(to) { Some(q) -> "?" ++ q, None -> "" });
+          let key = base64_encode(token_bytes(16));
+          let answered = shaken[l](c, authority, target, key, options, limits);
+          match answered { Err(_) -> net.close[l](c), Ok(_) -> () };
+          answered
+        },
+      }
+    },
+    _ -> Err(NotWebSocket(url::url_redacted(to))),
+  }
+}
+
+fn shaken<[l]>(
+  c: Int,
+  authority: String,
+  target: String,
+  key: String,
+  options: Options,
+  limits: http::Limits,
+) -> Result<Session, ConnectError> / {net.send[l], net.recv[l], abort.raise} =
+  if !send_all[l](c, handshake(authority, target, key, options), limits.write_timeout_ms) {
+    Err(Declined("the request was not sent"))
+  } else {
+    match http::read_head[l](c, b"", limits, false) {
+      http::HeadBytes(got) -> match http::parse_response_head(got.buf, http::Get, limits) {
+        http::ResponseParsed(head) -> match confirmed(head, key, options) {
+          Ok(agreed) ->
+            Ok({
+              conn: c,
+              state: opened(Client, options.limits, agreed.compression),
+              buffer: bytes_slice(got.buf, head.consumed, bytes_len(got.buf)),
+              agreed: agreed,
+            }),
+          Err(why) -> Err(Declined(why)),
+        },
+        _ -> Err(Declined("the answer is not HTTP")),
+      },
+      _ -> Err(Declined("no answer came")),
+    }
+  }
+
+// --- Tests: frames ----------------------------------------------------------
+
+fn frame(fin: Bool, op: Opcode, payload: Bytes) -> Frame =
+  { fin: fin, compressed: false, opcode: op, payload: payload }
+
+fn text(t: String) -> Frame = frame(true, Text, bytes_of_string(t))
+
+/// The masking key RFC 6455 §5.7's examples use.
+fn key() -> Bytes = b"\x37\xfa\x21\x3d"
+
+fn hello() -> Bytes = b"Hello"
+
+fn bytes_of(n: Int) -> Bytes =
+  bytes_of_string(fold(range(0, n), "", |acc: String, _i: Int| acc ++ "x"))
+
+test "RFC 6455's example frames are read and written as it writes them: {c.what}" for c: { what: String, wire: Bytes, frame: Frame, key: Option<Bytes> } in [
+    { what: "a text frame", wire: b"\x81\x05Hello", frame: text("Hello"), key: None },
+    {
+      what: "a masked text frame",
+      wire: b"\x81\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58",
+      frame: text("Hello"),
+      key: Some(key()),
+    },
+    {
+      what: "a first fragment",
+      wire: b"\x01\x03Hel",
+      frame: frame(false, Text, b"Hel"),
+      key: None,
+    },
+    {
+      what: "a last fragment",
+      wire: b"\x80\x02lo",
+      frame: frame(true, Continuation, b"lo"),
+      key: None,
+    },
+    { what: "a ping", wire: b"\x89\x05Hello", frame: frame(true, Ping, hello()), key: None },
+    {
+      what: "a masked pong",
+      wire: b"\x8a\x85\x37\xfa\x21\x3d\x7f\x9f\x4d\x51\x58",
+      frame: frame(true, Pong, hello()),
+      key: Some(key()),
+    },
+    {
+      what: "256 bytes in a 16-bit length",
+      wire: bytes_concat(b"\x82\x7e\x01\x00", bytes_of(256)),
+      frame: frame(true, Binary, bytes_of(256)),
+      key: None,
+    },
+    {
+      what: "64 KiB in a 64-bit length",
+      wire: bytes_concat(b"\x82\x7f\x00\x00\x00\x00\x00\x01\x00\x00", bytes_of(65536)),
+      frame: frame(true, Binary, bytes_of(65536)),
+      key: None,
+    },
+  ] {
+  assert_eq(encode_frame(c.frame, c.key), c.wire);
+  assert_eq(
+    decode_frame(c.wire, default_limits(), false),
+    Got({ frame: c.frame, masked: c.key != None, used: bytes_len(c.wire) }),
+  );
+  assert_eq(
+    decode_frame(bytes_slice(c.wire, 0, bytes_len(c.wire) - 1), default_limits(), false),
+    More,
+  )
+}
+
+test "a length not in its shortest form, or with its top bit set, is a protocol error" {
+  assert_eq(
+    decode_frame(b"\x82\x7e\x00\x05Hello", default_limits(), false),
+    Broken({ code: 1002, reason: "a length not written in its shortest form" }),
+  );
+  assert_eq(
+    decode_frame(b"\x82\x7f\x80\x00\x00\x00\x00\x00\x00\x05Hello", default_limits(), false),
+    Broken({ code: 1002, reason: "a length with its top bit set" }),
+  )
+}
+
+law "a frame reads back as it was written, masked or not"
+  forall (payload: Bytes, masked: Bool, fin: Bool) {
+    let f = frame(fin, Binary, payload);
+    let wire = encode_frame(f, if masked { Some(key()) } else { None });
+    decode_frame(wire, default_limits(), false)
+      == Got({ frame: f, masked: masked, used: bytes_len(wire) })
+  }
+
+// --- Tests: the handshake ---------------------------------------------------
+
+fn opening(extra: String) -> Bytes =
+  bytes_of_string(
+    "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
+      ++ extra
+      ++ "\r\n",
+  )
+
+fn request_of(raw: Bytes) -> Request / {abort.raise} =
+  match http::parse_head(raw, http::default_limits()) {
+    http::Parsed(h) -> h.request,
+    _ -> panic("a request head"),
+  }
+
+test "the server's key is the one RFC 6455 derives from the client's" {
+  assert_eq(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+}
+
+test "a handshake is answered 101 with what both ends speak" {
+  let options = { ..default_options(), protocols: ["chat", "superchat"] };
+  match upgrade(
+      request_of(
+        opening(
+          "Sec-WebSocket-Protocol: superchat, chat\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n",
+        ),
+      ),
+      options,
+    ) {
+    Upgrading(u) -> {
+      assert_eq(u.agreed, { protocol: Some("superchat"), compression: true });
+      assert_eq(
+        u.head,
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+      )
+    },
+    Refused(_) -> panic("the handshake is one"),
+  }
+}
+
+test "what is no handshake is refused, and another version is told this one: {c.what}" for c: { what: String, raw: Bytes, status: Int } in [
+    {
+      what: "no Upgrade",
+      raw: b"GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+      status: 400,
+    },
+    {
+      what: "a key of the wrong length",
+      raw: b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: AAAA\r\nSec-WebSocket-Version: 13\r\n\r\n",
+      status: 400,
+    },
+    {
+      what: "a POST",
+      raw: b"POST / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n",
+      status: 400,
+    },
+    {
+      what: "version 8",
+      raw: b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n",
+      status: 426,
+    },
+  ] {
+  match upgrade(request_of(c.raw), default_options()) {
+    Refused(r) -> {
+      assert_eq(r.status, c.status);
+      assert_eq(http::header(r.headers, "sec-websocket-version"), if c.status == 426 { Some("13") }
+      else { None })
+    },
+    Upgrading(_) -> panic("no switch"),
+  }
+}
+
+fn answer_head(extra: String) -> http::ResponseHead / {abort.raise} =
+  match http::parse_response_head(
+      bytes_of_string(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+          ++ extra
+          ++ "\r\n",
+      ),
+      http::Get,
+      http::default_limits(),
+    ) {
+    http::ResponseParsed(h) -> h,
+    _ -> panic("a response head"),
+  }
+
+test "a client takes a 101 that answers its request, and nothing else: {c.what}" for c: { what: String, extra: String, agreed: Result<Agreed, String> } in [
+    { what: "a plain switch", extra: "", agreed: Ok({ protocol: None, compression: false }) },
+    {
+      what: "a subprotocol offered",
+      extra: "Sec-WebSocket-Protocol: chat\r\n",
+      agreed: Ok({ protocol: Some("chat"), compression: false }),
+    },
+    {
+      what: "a subprotocol not offered",
+      extra: "Sec-WebSocket-Protocol: other\r\n",
+      agreed: Err("a subprotocol that was not offered"),
+    },
+    {
+      what: "compression without context",
+      extra: "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n",
+      agreed: Ok({ protocol: None, compression: true }),
+    },
+    {
+      what: "compression that keeps context",
+      extra: "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+      agreed: Err("compression that was not offered, or that keeps context"),
+    },
+    {
+      what: "an extension not offered",
+      extra: "Sec-WebSocket-Extensions: x-webkit-deflate-frame\r\n",
+      agreed: Err("an extension that was not offered"),
+    },
+  ] {
+  let options = { ..default_options(), protocols: ["chat"] };
+  assert_eq(confirmed(answer_head(c.extra), "dGhlIHNhbXBsZSBub25jZQ==", options), c.agreed)
+}
+
+test "a key of another request is refused" {
+  assert_eq(
+    confirmed(answer_head(""), "AQIDBAUGBwgJCgsMDQ4PEA==", default_options()),
+    Err("the accept key is not this request's"),
+  )
+}
+
+// --- Tests: Autobahn's cases, as an echo server answers them ----------------
+
+/// The limits the cases of sizes run under.
+fn small() -> Options =
+  { ..default_options(), limits: { max_frame: 64, max_message: 128, max_fragments: 4 } }
+
+/// What an echo server under `options` wrote after its `101`, to a client that said `frames`
+/// after a handshake with `extra` in it.
+fn echoed(extra: String, frames: Bytes, options: Options) -> Bytes / {ip.refused, abort.raise} = {
+  let left = with_rand(rand(7), ||
+    net::on_mem(
+      net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [
+        Says(bytes_concat(opening(extra), frames)),
+      ]),
+      || {
+        let listener = net.listen[listener](0);
+        serve_connection[conn](
+          net.accept[listener](listener),
+          http::default_limits(),
+          options,
+          |m: Message| [m],
+        )
+      },
+    ).net).value;
+  let wrote = net::mem_sent(left, 2);
+  match bytes_index_of(wrote, b"\r\n\r\n") {
+    Some(at) -> bytes_slice(wrote, at + 4, bytes_len(wrote)),
+    None -> wrote,
+  }
+}
+
+fn client_says(frames: List<Frame>) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(frames, |f: Frame| encode_frame(f, Some(key()))))
+
+fn server_says(frames: List<Frame>) -> Bytes / {abort.raise} =
+  bytes_concat_all(map(frames, |f: Frame| encode_frame(f, None)))
+
+fn closing(code: Int) -> Frame / {abort.raise} = close_frame(code, "")
+
+fn closed_on(code: Int, reason: String) -> Frame / {abort.raise} = close_frame(code, reason)
+
+fn invalid_utf8() -> Bytes = b"\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5\xed\xa0\x80"
+
+type Case = { case: String, said: Bytes, answered: List<Frame> }
+
+fn autobahn() -> List<Case> / {abort.raise} =
+  [
+    {
+      case: "1.1.1 an empty text message",
+      said: client_says([text(""), closing(1000)]),
+      answered: [text(""), closing(1000)],
+    },
+    {
+      case: "1.2.1 a binary message",
+      said: client_says([frame(true, Binary, b"\x00\xff"), closing(1000)]),
+      answered: [frame(true, Binary, b"\x00\xff"), closing(1000)],
+    },
+    {
+      case: "2.1 a ping with no payload",
+      said: client_says([frame(true, Ping, b""), closing(1000)]),
+      answered: [frame(true, Pong, b""), closing(1000)],
+    },
+    {
+      case: "2.3 a ping with a binary payload",
+      said: client_says([frame(true, Ping, b"\x00\xff\xfe\xfd"), closing(1000)]),
+      answered: [frame(true, Pong, b"\x00\xff\xfe\xfd"), closing(1000)],
+    },
+    {
+      case: "2.5 a ping of 126 bytes",
+      said: client_says([frame(true, Ping, bytes_of(126))]),
+      answered: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
+    },
+    {
+      case: "2.6 a pong nobody asked for",
+      said: client_says([frame(true, Pong, b"x"), closing(1000)]),
+      answered: [closing(1000)],
+    },
+    {
+      case: "3.1 a frame with RSV2 set",
+      said: bytes_concat(b"\xa1\x80", key()),
+      answered: [closed_on(1002, "a reserved bit is set")],
+    },
+    {
+      case: "4.1.1 a reserved opcode for data",
+      said: bytes_concat(b"\x83\x80", key()),
+      answered: [closed_on(1002, "a reserved opcode")],
+    },
+    {
+      case: "4.2.1 a reserved opcode for control",
+      said: bytes_concat(b"\x8b\x80", key()),
+      answered: [closed_on(1002, "a reserved opcode")],
+    },
+    {
+      case: "5.1 a fragmented ping",
+      said: client_says([frame(false, Ping, b"x")]),
+      answered: [closed_on(1002, "a control frame is fragmented or longer than 125 bytes")],
+    },
+    {
+      case: "5.3 a text message in two fragments",
+      said: client_says([
+        frame(false, Text, b"frag"),
+        frame(true, Continuation, b"ment"),
+        closing(1000),
+      ]),
+      answered: [text("fragment"), closing(1000)],
+    },
+    {
+      case: "5.6 a ping between fragments",
+      said: client_says([
+        frame(false, Text, b"a"),
+        frame(true, Ping, b"p"),
+        frame(true, Continuation, b"b"),
+        closing(1000),
+      ]),
+      answered: [frame(true, Pong, b"p"), text("ab"), closing(1000)],
+    },
+    {
+      case: "5.9 a continuation with nothing to continue",
+      said: client_says([frame(true, Continuation, b"x")]),
+      answered: [closed_on(1002, "a continuation with no message to continue")],
+    },
+    {
+      case: "5.18 a new message inside a fragmented one",
+      said: client_says([frame(false, Text, b"a"), text("b")]),
+      answered: [closed_on(1002, "a new message inside a fragmented one")],
+    },
+    {
+      case: "6.3.1 text that is not UTF-8",
+      said: client_says([frame(true, Text, invalid_utf8())]),
+      answered: [closed_on(1007, "a text message is not UTF-8")],
+    },
+    {
+      case: "7.1.1 a message, a close, and nothing after it",
+      said: client_says([text("Hello"), closing(1000), text("late")]),
+      answered: [text("Hello"), closing(1000)],
+    },
+    {
+      case: "7.3.1 a close with no code",
+      said: client_says([frame(true, Close, b"")]),
+      answered: [frame(true, Close, b"")],
+    },
+    {
+      case: "7.3.2 a close of one byte",
+      said: client_says([frame(true, Close, b"\x03")]),
+      answered: [closed_on(1002, "a close of one byte")],
+    },
+    {
+      case: "7.5.1 a close whose reason is not UTF-8",
+      said: client_says([frame(true, Close, bytes_concat(b"\x03\xe8", invalid_utf8()))]),
+      answered: [closed_on(1007, "a close reason is not UTF-8")],
+    },
+    {
+      case: "7.7.4 a close of code 3000",
+      said: client_says([closing(3000)]),
+      answered: [closing(3000)],
+    },
+    {
+      case: "7.7.13 a close of code 4999",
+      said: client_says([closing(4999)]),
+      answered: [closing(4999)],
+    },
+    {
+      case: "7.9.1 a close of code 0",
+      said: client_says([frame(true, Close, b"\x00\x00")]),
+      answered: [closed_on(1002, "a close code no endpoint may send")],
+    },
+    {
+      case: "7.9.3 a close of code 1004",
+      said: client_says([frame(true, Close, b"\x03\xec")]),
+      answered: [closed_on(1002, "a close code no endpoint may send")],
+    },
+    {
+      case: "7.13.2 a close of code 5000",
+      said: client_says([frame(true, Close, b"\x13\x88")]),
+      answered: [closed_on(1002, "a close code no endpoint may send")],
+    },
+    {
+      case: "9.1 a frame past the limit",
+      said: client_says([frame(true, Binary, bytes_of(65))]),
+      answered: [closed_on(1009, "a frame is longer than the limit")],
+    },
+    {
+      case: "9.2 a message past the limit",
+      said: client_says([
+        frame(false, Binary, bytes_of(64)),
+        frame(false, Continuation, bytes_of(64)),
+        frame(true, Continuation, b"x"),
+      ]),
+      answered: [closed_on(1009, "a message is longer than the limit")],
+    },
+    {
+      case: "9.3 a message in too many fragments",
+      said: client_says([
+        frame(false, Text, b"a"),
+        frame(false, Continuation, b"b"),
+        frame(false, Continuation, b"c"),
+        frame(false, Continuation, b"d"),
+        frame(true, Continuation, b"e"),
+      ]),
+      answered: [closed_on(1009, "a message is in more fragments than the limit")],
+    },
+    {
+      case: "an unmasked frame from a client",
+      said: encode_frame(text("x"), None),
+      answered: [closed_on(1002, "a client's frame is not masked")],
+    },
+  ]
+
+test "Autobahn {c.case}: an echo server answers as the suite has it" for c: Case in autobahn() {
+  assert_eq(echoed("", c.said, small()), server_says(c.answered))
+}
+
+// --- Tests: permessage-deflate ----------------------------------------------
+
+test "Autobahn 12.1.1: a compressed message is echoed compressed" {
+  let m = TextMessage("Hello, compressed world, hello again, compressed world");
+  let said = client_says([message_frame(m, true), closing(1000)]);
+  assert_eq(
+    echoed(
+      "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n",
+      said,
+      default_options(),
+    ),
+    server_says([message_frame(m, true), closing(1000)]),
+  )
+}
+
+test "RFC 7692's compressed examples read as Hello: {c.what}" for c: { what: String, wire: Bytes } in [
+    { what: "a compressed block flushed", wire: b"\xc1\x07\xf2\x48\xcd\xc9\xc9\x07\x00" },
+    {
+      what: "a stored block flushed",
+      wire: b"\xc1\x0b\x00\x05\x00\xfa\xff\x48\x65\x6c\x6c\x6f\x00",
+    },
+    { what: "a final block", wire: b"\xc1\x08\xf3\x48\xcd\xc9\xc9\x07\x00\x00" },
+  ] {
+  match decode_frame(c.wire, default_limits(), true) {
+    Got(g) ->
+      assert_eq(received(opened(Client, default_limits(), true), g.frame, g.masked).events, [
+        Received(TextMessage("Hello")),
+      ]),
+    _ -> panic("a whole frame"),
+  }
+}
+
+test "a compressed message that would decompress past the limit fails the connection, not the memory" {
+  let bomb = {
+    fin: true,
+    compressed: true,
+    opcode: Binary,
+    payload: gzip::deflate(bytes_of(4096)),
+  };
+  let step = received(
+    opened(Server, { max_frame: 1024, max_message: 1024, max_fragments: 4 }, true),
+    bomb,
+    true,
+  );
+  assert_eq(step.events, [Failed({ code: 1009, reason: "a message decompresses past the limit" })])
+}
+
+// --- Tests: a client session ------------------------------------------------
+
+test "a client opens a session, sends masked, and reads its server's answer and close" {
+  let wanted = with_rand(rand(7), || base64_encode(token_bytes(16))).value;
+  let answer = bytes_concat_all([
+    bytes_of_string(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
+        ++ accept_key(wanted)
+        ++ "\r\n\r\n",
+    ),
+    server_says([text("hi back"), closing(1000)]),
+  ]);
+  let world = net::mem_serving(
+    net::mem_resolving(
+      net::mem_empty(),
+      dns::with_name(dns::table(), "chat.example", [ip::read("192.0.2.40")]),
+    ),
+    ip::read_socket("192.0.2.40:80"),
+    [[Says(answer)]],
+  );
+  let options = { ..default_options(), compression: false };
+  let ran = net::on_mem(world, ||
+    simulate {
+      task::unbounded(||
+        with_rand(rand(7), ||
+          match connect[chat](url"ws://chat.example/room?x=1", options, http::default_limits()) {
+            Err(_) -> [],
+            Ok(s) -> {
+              let wrote = send[chat](s, TextMessage("hi"), 1000);
+              let first = receive[chat](s, 1000);
+              let second = receive[chat](first.session, 1000);
+              [
+                Some(wrote),
+                Some(first.got == Message(TextMessage("hi back"))),
+                Some(second.got == Closed({ code: 1000, reason: "" })),
+              ]
+            },
+          }).value)
+    });
+  assert_eq(ran.value, [Some(true), Some(true), Some(true)]);
+  let sent = net::mem_sent(ran.net, 1);
+  let text_sent = string_of_bytes_lossy(sent);
+  assert(
+    string_starts_with(
+      text_sent,
+      "GET /room?x=1 HTTP/1.1\r\nHost: chat.example\r\nUpgrade: websocket\r\n",
+    ),
+  );
+  let frames = match bytes_index_of(sent, b"\r\n\r\n") {
+    Some(at) -> bytes_slice(sent, at + 4, bytes_len(sent)),
+    None -> b"",
+  };
+  // The text frame, masked, then the close the client sends back.
+  assert_eq(bytes_slice(frames, 0, 2), b"\x81\x82");
+  assert_eq(bytes_at(frames, 8) & 0x8f, 0x88)
+}

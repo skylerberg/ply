@@ -180,6 +180,8 @@ impl Net for SimNet {
             Op::LocalAddress => "ply_host::tcp::sim::local_address",
             Op::PeerAddress => "ply_host::tcp::sim::peer_address",
             Op::PeerCredentials => "ply_host::tcp::sim::peer_credentials",
+            Op::PeerCertificate => "ply_host::tcp::sim::peer_certificate",
+            Op::Protocol => "ply_host::tcp::sim::protocol",
             Op::Options => "ply_host::tcp::sim::options",
             Op::SendSecret => "ply_host::tcp::sim::send_secret",
         }
@@ -514,6 +516,23 @@ impl Net for SimNet {
         conn: i64,
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
+        self.handles.check(conn, at, span)?;
+        Ok(HostAnswer::Value(wire::none()))
+    }
+
+    /// The twin's connections are never secured, so none has a certificate to report.
+    fn peer_certificate(
+        &self,
+        at: &Resource,
+        conn: i64,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        self.handles.check(conn, at, span)?;
+        Ok(HostAnswer::Value(wire::none()))
+    }
+
+    /// Nor a protocol one agreed.
+    fn protocol(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
         self.handles.check(conn, at, span)?;
         Ok(HostAnswer::Value(wire::none()))
     }
