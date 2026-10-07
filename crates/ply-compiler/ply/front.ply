@@ -27,7 +27,7 @@ import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, R
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
              hash_index, hashed_and_unused, hex, digest, Pin, Fixed, FixedTest, FixedLaw, Prior,
              Rehash, Rehashed, rehash_index, by_name, tagged_target, closure_of, reached_functions,
-             LawNode, Node, NodeFn, NodeType, NodeEffect)
+             LawNode, Node, NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem)
 import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder,
               EffectInfo, OpInfo, CtorInfo, Known, KnownDef, KnownTest, KeptFacts, RootFacts,
               WitnessOrder, LabelSite, OperandSite, TrySite, UpdateShape, WitnessOp, WitnessRef,
@@ -3918,32 +3918,39 @@ fn shipped_functions(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} =
   })
 
 /// The functions a program reaches of the shipped modules it pulls: those every other definition
-/// reaches, those the tests and laws outside them do, and those behind each name a module outside
-/// them imports. A reached definition's specifications are read with it, so what they name is
-/// reached too. A function is reached as itself: an effect or a type of its name reached without
-/// it leaves it, and what it calls, unread.
+/// and declaration reaches, those the tests and laws outside them do, and the one behind each name
+/// a module outside them imports that names nothing else, since such an import has to resolve. A
+/// reached definition's specifications are read with it, so what they name is reached too. A
+/// function is reached as itself: an effect or a type of its name reached or imported without it
+/// leaves it, and what it calls, unread.
 fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
   let first = first_shipped(h);
   let candidates = shipped_functions(h);
-  let imported = fold(range(0, first), [], |acc: List<Bytes>, i: Int|
-    fold(at(h.mods, i).module.imports, acc, |a: List<Bytes>, d: ImportDecl|
+  let imported = fold(range(0, first), [], |acc: List<Which>, i: Int|
+    fold(at(h.mods, i).module.imports, acc, |a: List<Which>, d: ImportDecl|
       match d.kind {
         INames(names) -> {
           let module = join(map(d.path, |part: Ident| part.name), b".");
-          fold(names, a, |b: List<Bytes>, n: Ident| push(b, qualify(module, n.name)))
+          fold(names, a, |b: List<Which>, n: Ident| {
+            let name = qualify(module, n.name);
+            if map_contains(h.hashes.refs.declared, name) { b } else { push(b, TheFn(name)) }
+          })
         },
         _ -> a,
       }));
   // Every type a shipped module declares is read, reached or not, and so is what the module states
   // of it: the type's node holds those functions, and a `gen`'s sampler is what a prover enters.
-  let stated = fold(range(first, len(h.mods)), [], |acc: List<Bytes>, i: Int| {
+  let stated = fold(range(first, len(h.mods)), [], |acc: List<Which>, i: Int| {
     let m = at(h.mods, i);
-    fold(m.module.items, acc, |a: List<Bytes>, item: Item| {
+    fold(m.module.items, acc, |a: List<Which>, item: Item| {
       let typed = match stated_type(item) {
-        Some(target) -> push(a, qualify(m.name, target.name)),
+        Some(target) -> push(a, TheDecl(qualify(m.name, target.name))),
         None -> a,
       };
-      match sampler_of(item) { Some(name) -> push(typed, qualify(m.name, name)), None -> typed }
+      match sampler_of(item) {
+        Some(name) -> push(typed, TheFn(qualify(m.name, name))),
+        None -> typed,
+      }
     })
   });
   reached_functions(
@@ -3951,11 +3958,19 @@ fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
     h.hashes,
     concat(
       concat(
-        fold(h.hashes.defs, [], |acc: List<Bytes>, d: { name: Bytes, hash: Bytes }|
-          if map_contains(candidates, d.name) { acc } else { push(acc, d.name) }),
+        fold(
+          h.index.nodes,
+          fold(h.hashes.defs, [], |acc: List<Which>, d: { name: Bytes, hash: Bytes }|
+            if map_contains(candidates, d.name) { acc } else { push(acc, TheFn(d.name)) }),
+          |acc: List<Which>, n: Node|
+            match n.body {
+              NodeFn(_) -> acc,
+              _ -> if n.module < first { push(acc, TheDecl(n.name)) } else { acc },
+            },
+        ),
         concat(
-          map(filter(h.index.tests, |t: TestNode| t.module < first), |t: TestNode| t.key),
-          map(filter(h.index.laws, |l: LawNode| l.module < first), |l: LawNode| l.key),
+          map(filter(h.index.tests, |t: TestNode| t.module < first), |t: TestNode| TheItem(t.key)),
+          map(filter(h.index.laws, |l: LawNode| l.module < first), |l: LawNode| TheItem(l.key)),
         ),
       ),
       concat(imported, stated),
@@ -5376,10 +5391,12 @@ test "a shipped function is read for itself, not for an effect or a type that sh
   assert_eq(loaded_twice(b"import std.z"), both([b"m.f"]));
   // `try_unpack` raises through the effect `pack` and matches the constructor `Pack`.
   assert_eq(loaded_twice(b"import std.z (try_unpack)"), both([b"m.f", b"std.z.try_unpack"]));
-  // An imported name is every definition behind it, so the function comes with what it calls.
+  // An imported name that names an effect resolves to it once the function is left out, so only a
+  // reference reaches the function; one that names a function alone has to resolve to it.
+  assert_eq(loaded_twice(b"import std.z (pack)"), both([b"m.f"]));
   assert_eq(
-    loaded_twice(b"import std.z (pack)"),
-    both([b"m.f", b"std.z.deeper", b"std.z.pack", b"std.z.squeezed"]),
+    loaded_twice(b"import std.z (pack, Pack)\npub fn g() -> Pack = pack(2)"),
+    both([b"m.f", b"m.g", b"std.z.deeper", b"std.z.pack", b"std.z.squeezed"]),
   );
   assert_eq(loaded_twice(b"import std.z (Pack)"), both([b"m.f"]));
   assert_eq(loaded_twice(b"import std.z (Loose)"), both([b"m.f"]));
@@ -5391,7 +5408,7 @@ test "a shipped function is read for itself, not for an effect or a type that sh
   // `try_row` raises through the effect `table`; the function of that name embeds a data file.
   assert_eq(loaded_twice(b"import std.w (try_row)"), both([b"m.f", b"std.w.try_row"]));
   assert_eq(loaded_twice(b"import std.w (rows)"), both([b"m.f", b"std.w.rows", b"std.w.table"]));
-  assert_eq(loaded_twice(b"import std.w (table)"), both([b"m.f", b"std.w.table"]))
+  assert_eq(loaded_twice(b"import std.w (table)"), both([b"m.f"]))
 }
 
 test "a data file a shipped function embeds moves what reaches the function, and nothing that reaches an effect of its name" {
@@ -5406,7 +5423,7 @@ test "a data file a shipped function embeds moves what reaches the function, and
   let reader = b"import std.w (try_row)";
   assert_eq(def_names(over(reader, b"one\n")), [b"m.f", b"std.w.try_row"]);
   assert_eq(pulled_hashes(over(reader, b"one\n")), pulled_hashes(over(reader, b"one\ntwo\n")));
-  let named = b"import std.w (table)";
+  let named = b"import std.w (table)\npub fn g() -> Bytes = table()";
   let one = over(named, b"one\n");
   assert(pulled_hash(one, b"std.w.table") != None);
   assert(
