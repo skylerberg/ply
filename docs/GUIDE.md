@@ -2498,7 +2498,8 @@ obligation is cached under its claim's hash, which reads another package's
 definitions by their contracts, so it stands across an edit to a dependency's
 body; a sampled one is cached under the hash of every implementation its cases
 run and of each generator its points are drawn through, and is drawn again when
-any of them moves. `--reach`
+any of them moves. Only a claim that held is cached: one that ended any other
+way, `unattempted` among them, is discharged again by every run. `--reach`
 asks the static tier alone about every obligation the run reports on, cached or
 not, and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
