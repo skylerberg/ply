@@ -11,9 +11,9 @@ import std.random (entropy)
 import std.seq
 import std.string
 import std.db
-import std.db (db, with_server, stmt, transaction, copy_into, copy_from, PInt, PText, PNull, PBytes,
-               PArray, PNumeric, CInt, Rows, Count, Failed, ReadCommitted, ReadWrite, Row, Notice,
-               Notified, Reconnected, Unheard, Quiet, DbError)
+import std.sql
+import std.db (db, with_server, transaction, copy_into, copy_from, ReadCommitted, ReadWrite, Notice, Notified, Reconnected, Unheard, Quiet)
+import std.sql (stmt, PInt, PText, PNull, PBytes, PArray, PNumeric, CInt, Rows, Count, Failed, Row, DbError)
 import std.seq (Seq, seq)
 
 effect set Wire = {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next}
@@ -94,16 +94,16 @@ pub fn reconnects(url: String) -> Result<String, String> / {Wire, abort.raise, d
     heard_until(3, 120, [])
   })
 
-fn sample() -> List<List<db::Param>> =
+fn sample() -> List<List<sql::Param>> =
   [
     [PInt(1), PText("plain"), PBytes(b"\x00\x01\xff"), PArray([PText("a"), PText("b,c")]), PNumeric(1.5m)],
     [PInt(2), PText("tab\there\nnew line\\back"), PNull, PNull, PNull],
     [PInt(3), PText("\\N"), PBytes(b""), PArray([]), PNumeric(0m)],
   ]
 
-fn named(id: Int, name: String) -> List<db::Param> = [PInt(id), PText(name), PNull, PNull, PNull]
+fn named(id: Int, name: String) -> List<sql::Param> = [PInt(id), PText(name), PNull, PNull, PNull]
 
-fn all() -> db::Stmt = stmt("select id, name, data, tags, price from items order by id")
+fn all() -> sql::Stmt = stmt("select id, name, data, tags, price from items order by id")
 
 fn counted() -> String / {db.query[items]} =
   match db.query[items](stmt("select count(*) as n from items"), []) {
@@ -114,7 +114,7 @@ fn counted() -> String / {db.query[items]} =
 
 // What a copy of `rows` into `items` answered: how many rows the server took, the SQLSTATE that
 // refused it, or the budget its rows ran past.
-fn copied_in<| e>(rows: Seq<List<db::Param> | e>, chunk: Int, budget: Int) -> String / {db.copy_in[items], db.copy_rows[items], db.copy_end[items] | e} =
+fn copied_in<| e>(rows: Seq<List<sql::Param> | e>, chunk: Int, budget: Int) -> String / {db.copy_in[items], db.copy_rows[items], db.copy_end[items] | e} =
   match try[seq.spent] { copy_into[items](["id", "name", "data", "tags", "price"], rows, chunk, budget) } {
     Ok(Ok(n)) -> int_to_string(n),
     Ok(Err(e)) -> e.code,
