@@ -5,7 +5,7 @@
 //! happened, the mutants and mixtures tried, and everything said about all of it are decided here,
 //! in both forms, along with the code the run exits with.
 
-import compiler.load (LoadedAnalysis)
+import compiler.load (LoadedAnalysis, every_root)
 import args (Flags, from_argv, kept, style_of)
 import units (emit, Emitted, whole_emitted)
 import appends (broken_promises, priced)
@@ -30,8 +30,8 @@ import compiler.front (Analysed, Refused, Analysis, Embedded, analyse, analyse_p
                        ModuleSpan, test_roots, viewed_text)
 import compiler.embed (EmbedWant, wants_by_item)
 import compiler.unit (codes, shipped)
-import compiler.hash (TheItem, reach)
-import compiler.infer (DefInfo, TestInfo)
+import compiler.hash (TheItem, Which, reach, reached_functions)
+import compiler.infer (DefInfo, TestInfo, cases_root)
 import compiler.resolve (Diag, Label, Source, error_with_labels, qualify)
 import compiler.types
 import compiler.types (RAny, RNamed, RSingleton, RVar)
@@ -343,6 +343,8 @@ pub type Program = {
   options: Json,
   /// The runtime stamp a pass is filed under beside its test's hash; `None` when the run files none.
   filed_under: Option<String>,
+  /// The unit the run's tests execute in.
+  unit: Int,
 }
 
 pub type Backend = {
@@ -2382,6 +2384,7 @@ fn program_of(
   {
     root: root,
     filed_under: filed_under,
+    unit: 0,
     files: map(timed.program.places, |place: Place| place.path),
     places: timed.program.places,
     modules: map(modules_of(timed.program, analysis), |m: { name: String, path: String }|
@@ -2469,18 +2472,18 @@ fn selected(
     else if place.label == "cwd" { listings::kept[cwd](place.dir, stamp, asked) }
     else { listings::kept[abs](place.dir, stamp, asked) };
     let unkept = filter(asked, |a: listings::Asked| !map_contains(kept, a.test));
-    match listed(handed, map(unkept, |a: listings::Asked| a.test)) {
+    match listed(handed, analysis, map(unkept, |a: listings::Asked| a.test)) {
       Err(diags) -> {
         tester.ended[corpus]();
         unbound(style, { diags: diags, places: timed.program.places })
       },
       Ok(found) -> {
         if options.no_cache { () }
-        else if place.label == "cwd" { listings::keep[cwd](place.dir, stamp, unkept, found.cases) }
-        else { listings::keep[abs](place.dir, stamp, unkept, found.cases) };
+        else if place.label == "cwd" { listings::keep[cwd](place.dir, stamp, unkept, found) }
+        else { listings::keep[abs](place.dir, stamp, unkept, found) };
         let cases = map_fold(
           kept,
-          found.cases,
+          found,
           |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: List<Listed>|
             map_insert(acc, i, Ok(listed)),
         );
@@ -2491,7 +2494,6 @@ fn selected(
           timed,
           ranged(analysis, cases),
           handed,
-          found.unit,
           opened,
           targeted,
           { ..spent, store_us: handing - configuring, handoff_us: listing - handing },
@@ -2566,7 +2568,6 @@ fn decided_run(
   timed: Timed,
   over: Ranged,
   handed: LoadedAnalysis,
-  built: Option<Emitted>,
   opened: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
@@ -2596,10 +2597,14 @@ fn decided_run(
   let building = time.elapsed_us();
   // What a test runs is the unit's to say, so a run that would execute anything emits it before
   // deciding: a test nothing answered by its own key may be answered by its code.
-  let emitted = match built {
-    Some(e) -> Ok(Some(e)),
-    None -> unit_for(handed, len(to_run(first)) > 0 || options.config.schema != None),
-  };
+  // Only what the run's scope holds runs, so only that is compiled.
+  let visible = set_of(scope.visible);
+  let emitted = run_unit(
+    handed,
+    over,
+    filter(to_run(first), |i: Int| map_contains(visible, i)),
+    options.config.schema != None,
+  );
   match emitted {
     Err(diags) -> {
       tester.ended[corpus]();
@@ -2614,7 +2619,6 @@ fn decided_run(
       let answered = by_code(first, passed_by_code(first, keyed), search);
       let decisions = answered.decisions;
       // Which tests may share a worker is the program's to say, from the atoms each row carries.
-      let visible = set_of(scope.visible);
       let classes = classes_of(p, filter(to_run(decisions), |i: Int| map_contains(visible, i)));
       let decided = decided_of(
         p,
@@ -2628,16 +2632,12 @@ fn decided_run(
       // table had cases to list.
       let build = len(decided.runs) > 0 || options.config.schema != None;
       let text = match unit { Some(e) -> if build { Some(e.text) } else { None }, None -> None };
-      let bound_unit = match built {
-        Some(_) -> Ok(0),
-        None -> tester.unit[corpus](handed, text, true),
-      };
-      match bound_unit {
+      match tester.unit[corpus](handed, text, true) {
         Err(diags) -> {
           tester.ended[corpus]();
           unbound(style, { diags: diags, places: p.places })
         },
-        Ok(_) -> {
+        Ok(bound_unit) -> {
           let binding = time.elapsed_us();
           match configuration::opened_by(options.host, options.config, |name: String|
               tester.schema[corpus](name)) {
@@ -2656,7 +2656,7 @@ fn decided_run(
                   flags,
                   style,
                   options,
-                  p,
+                  { ..p, unit: bound_unit },
                   timed,
                   analysis,
                   over.judged,
@@ -2761,30 +2761,73 @@ fn over_cases(analysis: Analysis, options: Options) -> List<Int> =
   filter(scope_of(analysis, { ..options, filters: [] }).visible, |i: Int|
     match test_at(analysis, i) { Some(t) -> t.cases, None -> false })
 
-/// What listing found: the unit it built and bound to list in, which the run's tests then run in,
-/// and each asked test's cases or why they could not be listed.
-type Listing = { unit: Option<Emitted>, cases: Map<Int, Result<List<Listed>, Unlisted>> }
-
+/// Each asked test's cases, or why they could not be listed, from a unit of their tables alone.
 fn listed(
   handed: LoadedAnalysis,
+  analysis: Analysis,
   asked: List<Int>,
-) -> Result<Listing, List<Diag>> / {tester.unit[corpus], tester.cases[corpus], emit.unit} =
-  if len(asked) == 0 { Ok({ unit: None, cases: map_new() }) } else {
-    match whole_emitted(handed) {
+) -> Result<Map<Int, Result<List<Listed>, Unlisted>>, List<Diag>> / {tester.unit[corpus], tester.cases[corpus], emit.unit, abort.raise} =
+  if len(asked) == 0 { Ok(map_new()) } else {
+    let roots = test_roots(handed.dump);
+    let tables = fold(asked, map_new(), |acc: Map<Bytes, Bool>, i: Int|
+      match list_at(roots, i) { Some(r) -> map_insert(acc, cases_root(r), true), None -> acc });
+    match emit.unit(handed, offered_over(handed, tables, reached_by(analysis, asked))) {
       Err(diags) -> Err(diags),
       Ok(e) -> match tester.unit[corpus](handed, Some(e.text), true) {
         Err(diags) -> Err(diags),
         Ok(unit) ->
-          Ok({
-            unit: Some(e),
-            cases: fold(
-              asked,
-              map_new(),
-              |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int|
-                map_insert(acc, i, tester.cases[corpus](unit, i)),
-            ),
-          }),
+          Ok(
+            fold(asked, map_new(), |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int|
+              map_insert(acc, i, tester.cases[corpus](unit, i))),
+          ),
       },
+    }
+  }
+
+/// The functions the tests at `tests` reach, and what a reached definition's clauses reach.
+fn reached_by(analysis: Analysis, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
+  reached_functions(
+    analysis.index,
+    analysis.hashes,
+    fold(tests, [], |acc: List<Which>, i: Int|
+      match test_at(analysis, i) { Some(t) -> push(acc, TheItem(t.key)), None -> acc }),
+  )
+
+/// The roots a unit offers: those of `own`, and each root of a definition `reached` names, so a root
+/// runs here as in the whole program's unit and its code digests alike.
+fn offered_over(
+  front: LoadedAnalysis,
+  own: Map<Bytes, Bool>,
+  reached: Map<Bytes, Bool>,
+) -> List<Bytes> / {abort.raise} =
+  filter(every_root(front), |r: Bytes| map_contains(own, r) || map_contains(reached, root_owner(r)))
+
+/// The definition a root answers for: a clause's is its function's.
+fn root_owner(root: Bytes) -> Bytes / {abort.raise} =
+  match bytes_index_of(root, b"#") { Some(i) -> bytes_slice(root, 0, i), None -> root }
+
+/// The unit the run's tests at `tests` execute in: their roots, a test over cases with the root that
+/// lists its table, and all they reach; or the whole program's where a schema has constants to enter.
+fn run_unit(
+  front: LoadedAnalysis,
+  over: Ranged,
+  tests: List<Int>,
+  schema: Bool,
+) -> Result<Option<Emitted>, List<Diag>> / {emit.unit, abort.raise} =
+  if schema { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
+  else if len(tests) == 0 { Ok(None) } else {
+    let roots = test_roots(front.dump);
+    let own = fold(tests, map_new(), |acc: Map<Bytes, Bool>, k: Int|
+      match list_at(over.entries, k) {
+        Some(entry) -> match list_at(roots, entry.test) {
+          Some(r) -> map_insert(map_insert(acc, r, true), cases_root(r), true),
+          None -> acc,
+        },
+        None -> acc,
+      });
+    match emit.unit(front, offered_over(front, own, reached_by(over.analysis, tests))) {
+      Ok(e) -> Ok(Some(e)),
+      Err(diags) -> Err(diags),
     }
   }
 
@@ -2897,14 +2940,6 @@ fn ranged(
   }
 }
 
-/// The unit a run would execute in, or none for a run that would execute nothing.
-fn unit_for(
-  front: LoadedAnalysis,
-  wanted: Bool,
-) -> Result<Option<Emitted>, List<Diag>> / {emit.unit} =
-  if !wanted { Ok(None) }
-  else { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
-
 /// Each test's code by index: the digest of what its root runs in the unit, and for a case its
 /// identity with it.
 fn codes_of(
@@ -3010,7 +3045,7 @@ fn concluded_run(
   let started = time.elapsed_us();
   let done = flat_map(decided.classes, |group: Group| {
     let ran = ran_class(
-      map(group.tests, |i: Int| job_of(program, 0, i, narrowing, searching)),
+      map(group.tests, |i: Int| job_of(program, program.unit, i, narrowing, searching)),
       asked,
     );
     if shown {
@@ -4167,6 +4202,7 @@ fn a_program(cases: List<Case>) -> Program =
     warnings: [],
     options: Null,
     filed_under: Some("aabbccddeeff00112233"),
+    unit: 0,
   }
 
 fn an_outcome(index: Int, name: String, status: String) -> Outcome =
