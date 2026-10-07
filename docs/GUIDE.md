@@ -240,10 +240,11 @@ it stands and nothing a hole holds is read as text:
 
 ```ply
 import std.html
-import std.html (Html, text)
+import std.html (Html, html, text)
 import std.sh
 
-fn row(name: String, kind: String) -> Html = html"<li class={text(kind)}>{text(name)}</li>"
+fn row(name: String, kind: String) -> Html / {html.unsafe_url, abort.raise} =
+  html"<li class={text(kind)}>{text(name)}</li>"
 
 fn search(pattern: String, file: String) -> List<String> = sh"-n --color=never {pattern} {file}"
 ```
@@ -2705,7 +2706,7 @@ checked against that declaration, so it performs none of it.
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
-| `--fs NAME=PATH` | repeatable filesystem root, which is also where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
+| `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
@@ -2745,6 +2746,9 @@ definitions printed back to source without tests, laws, comments or anything
 unreached, and the runnable `ply run` loads — that source checked again, its
 front end's answer and its compiled unit, which holds the value of each
 `const fn` (§3.5) — so a run of it runs no front end and evaluates none of them.
+What is reached is what each definition refers to: an effect or a type that
+shares a function's name is another definition, so a program that names the
+effect holds nothing the function calls.
 The BLAKE3 digest covers those and the entry point, so an edit nothing reaches
 leaves it unchanged; a failure raised by a run of it carries no line number. A
 part that does not agree with the rest — a body under a hash that does not name
