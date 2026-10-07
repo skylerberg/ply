@@ -1550,7 +1550,8 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
-/// Perceus's `reset`: a unique record drops its fields and keeps its memory with `len` zeroed;
+/// Perceus's `reset`: a unique record or constructor drops its fields and keeps its memory with
+/// `len` zeroed, for the next record or constructor of its width, which writes the whole header;
 /// answers `w`, or `0` after releasing anything else.
 pub fn reset(w: Word) -> Word {
     if is_imm(w) || w == 0 {
@@ -1558,7 +1559,7 @@ pub fn reset(w: Word) -> Word {
     }
     let o = obj(w);
     unsafe {
-        if (*o).kind != KIND_RECORD || count(o).load(Relaxed) != 1 {
+        if ((*o).kind != KIND_RECORD && (*o).kind != KIND_CTOR) || count(o).load(Relaxed) != 1 {
             dec(w);
             return 0;
         }

@@ -8550,7 +8550,7 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
               b"`map_of_entries` is a builtin",
               b"cannot be redefined",
               [
-                b"a map literal `#{k: v}` and a set literal `#[a]` are written in its name, so a module that redefined it would change what they mean",
+                b"a map literal `#{k: v}` is written in its name, so a module that redefined it would change what it means",
               ],
             ),
           }
@@ -8560,7 +8560,7 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
         _ -> acc,
       },
   );
-  let fns = collected.fns;
+  let fns = map(collected.fns, |d: FnDef| carried(collected.checker, d));
   let names = collected.names;
   let index = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
     let n = at(names, i);
@@ -11549,7 +11549,8 @@ fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
 }
 
 /// A clause's scope: the parameters, and what the body assumes, its definition's constraints.
-fn spec_scope(checker: Checker, def: FnDef, env: SpecEnv) -> Checker / {abort.raise} = {
+fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abort.raise} = {
+  let def = carried(checker, written);
   let c0: Checker = {
     ..checker,
     ty_params: env.ty_params,
@@ -11902,6 +11903,168 @@ fn assumed_for(checker: Checker, deriver: Deriver) -> List<Int> / {abort.raise} 
         || (same_deriver(deriver, DNumeric) && same_deriver(a.deriver, DInteger)) {
       fold(a.vars, acc, |b: List<Int>, v: Int| ints_insert(b, v))
     } else { acc })
+
+/// `def` with `where derivable(ord, a)` for each type parameter `a` its signature writes inside an
+/// argument a declared type keys a `Map` by: the type carries the constraint, so callers meet it
+/// and the body assumes it as though the signature wrote it.
+fn carried(checker: Checker, def: FnDef) -> FnDef / {abort.raise} = {
+  let names = map(def.generics.types, |g: Ident| g.name);
+  if len(names) == 0 { def } else {
+    let written = fold(
+      def.params,
+      match def.ret { Some(t) -> [t], None -> [] },
+      |acc: List<TypeExpr>, p: Param| match p.ty { Some(t) -> push(acc, t), None -> acc },
+    );
+    let found = fold(written, [], |acc: List<KeyedMention>, t: TypeExpr|
+      keyed_mentions(checker, t, names, acc));
+    fold(found, def, |d: FnDef, k: KeyedMention|
+      if fold(d.constraints, false, |has: Bool, c: Constraint|
+          has || (c.param.name == k.param.name && same_deriver(c.deriver, DOrd))) { d } else {
+        {
+          ..d,
+          constraints: push(d.constraints, {
+            deriver: DOrd,
+            deriver_span: k.at,
+            param: k.param,
+            span: k.at,
+          }),
+        }
+      })
+  }
+}
+
+/// A type parameter written inside an argument a declared type keys a `Map` by, and the type's use.
+type KeyedMention = { at: Span, param: Ident }
+
+fn keyed_mentions(
+  checker: Checker,
+  t: TypeExpr,
+  names: List<Bytes>,
+  out: List<KeyedMention>,
+) -> List<KeyedMention> / {abort.raise} =
+  match t {
+    TCon(c) -> {
+      let inner = fold(c.args, out, |acc: List<KeyedMention>, a: TypeExpr|
+        keyed_mentions(checker, a, names, acc));
+      if is_bare(c.name)
+          && (builtin_type_arity(c.name.name.name) != None || contains(names, c.name.name.name)) {
+        inner
+      } else {
+        match global(checker, TypeSpace, c.name).name {
+          None -> inner,
+          Some(q) ->
+            fold(
+              keyed_positions(checker, q, [], keyed_room(checker)),
+              inner,
+              |acc: List<KeyedMention>, j: Int|
+                match list_at(c.args, j) {
+                  Some(a) ->
+                    fold(params_written(a, names), acc, |b: List<KeyedMention>, p: Ident|
+                      push(b, { at: c.span, param: p })),
+                  None -> acc,
+                },
+            ),
+        }
+      }
+    },
+    TFn(f) ->
+      fold(
+        f.params,
+        keyed_mentions(checker, f.ret, names, out),
+        |acc: List<KeyedMention>, p: TypeExpr| keyed_mentions(checker, p, names, acc),
+      ),
+    TRecord(r) ->
+      fold(r.fields, out, |acc: List<KeyedMention>, f: { name: Ident, ty: TypeExpr }|
+        keyed_mentions(checker, f.ty, names, acc)),
+    _ -> out,
+  }
+
+/// The type parameters among `names` that `t` writes anywhere in it.
+fn params_written(t: TypeExpr, names: List<Bytes>) -> List<Ident> =
+  match t {
+    TVar(id) -> if contains(names, id.name) { [id] } else { [] },
+    TCon(c) ->
+      fold(
+        c.args,
+        if is_bare(c.name) && len(c.args) == 0 && contains(names, c.name.name.name) {
+          [c.name.name]
+        } else { [] },
+        |acc: List<Ident>, a: TypeExpr| concat(acc, params_written(a, names)),
+      ),
+    TFn(f) ->
+      fold(f.params, params_written(f.ret, names), |acc: List<Ident>, p: TypeExpr|
+        concat(acc, params_written(p, names))),
+    TRecord(r) ->
+      fold(r.fields, [], |acc: List<Ident>, f: { name: Ident, ty: TypeExpr }|
+        concat(acc, params_written(f.ty, names))),
+    _ -> [],
+  }
+
+/// The positions of the declared type `name`'s parameters a value of it keys a `Map` by, through
+/// anything it holds; `seen` are the types being walked, so a recursive one ends, and `room` is
+/// how many more declarations a walk may enter.
+fn keyed_positions(
+  checker: Checker,
+  name: Bytes,
+  seen: List<Bytes>,
+  room: Int,
+) -> List<Int> / {abort.raise} =
+  if room <= 0 || contains(seen, name) { [] } else {
+    let within = push(seen, name);
+    match map_get(checker.nominals, name) {
+      Some(r) -> positions_among(r.ty_vars, keyed_vars(checker, r.ty, within, room - 1)),
+      None -> match filter(checker.ctors, |c: CtorInfo| c.type_name == name) {
+        [] -> [],
+        [first, ..rest] ->
+          positions_among(
+            first.scheme.ty_vars,
+            fold(push(rest, first), [], |acc: List<Int>, c: CtorInfo|
+              fold(c.fields, acc, |held: List<Int>, f: Type|
+                ints_union(held, keyed_vars(checker, f, within, room - 1)))),
+          ),
+      },
+    }
+  }
+
+/// Enough room for a walk to enter every declaration there is.
+fn keyed_room(checker: Checker) -> Int = len(checker.ctors) + map_len(checker.nominals) + 1
+
+fn positions_among(vars: List<Int>, keyed: List<Int>) -> List<Int> =
+  filter(range(0, len(vars)), |i: Int|
+    match list_at(vars, i) { Some(v) -> contains(keyed, v), None -> false })
+
+/// The variables a value of `t` needs ordered: a `Map` key's, and those of an argument a declared
+/// type it holds keys a `Map` by.
+fn keyed_vars(
+  checker: Checker,
+  t: Type,
+  seen: List<Bytes>,
+  room: Int,
+) -> List<Int> / {abort.raise} =
+  match t {
+    TyCon(c) -> {
+      let inner = fold(c.args, [], |acc: List<Int>, a: Type|
+        ints_union(acc, keyed_vars(checker, a, seen, room)));
+      if c.name == b"Map" && len(c.args) == 2 { ints_union(inner, vars_of_type(at(c.args, 0))) }
+      else if builtin_type_arity(c.name) != None { inner } else {
+        fold(keyed_positions(checker, c.name, seen, room), inner, |acc: List<Int>, j: Int|
+          match list_at(c.args, j) { Some(a) -> ints_union(acc, vars_of_type(a)), None -> acc })
+      }
+    },
+    TyNominal(n) ->
+      fold(n.fields, [], |acc: List<Int>, f: Field|
+        ints_union(acc, keyed_vars(checker, f.ty, seen, room))),
+    TyRecord(fs) ->
+      fold(fs, [], |acc: List<Int>, f: Field|
+        ints_union(acc, keyed_vars(checker, f.ty, seen, room))),
+    TyFn(f) ->
+      fold(f.params, keyed_vars(checker, f.ret, seen, room), |acc: List<Int>, p: Type|
+        ints_union(acc, keyed_vars(checker, p, seen, room))),
+    TyVar(_) -> [],
+  }
+
+fn vars_of_type(t: Type) -> List<Int> / {abort.raise} =
+  free_vars(subst_new(), t, { tys: [], rows: [] }).tys
 
 fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
   match t {
@@ -12724,13 +12887,18 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
                 bytes_concat_all([b"a `", what, b"` names a function of its type's own module"]),
                 [],
               ),
-            Some(f) -> fitted(checker, def, type_name, f),
+            Some(f) -> fitted(checker, def, type_name, f, writes_where(m, def.by.name)),
           },
         },
       }
     },
   }
 }
+
+/// Whether the function `name` of `m` writes a `where`; what its signature's types carry is none.
+fn writes_where(m: ParsedModule, name: Bytes) -> Bool =
+  fold(m.module.items, false, |found: Bool, item: Item|
+    found || (match item { IFn(d) -> d.name.name == name && len(d.constraints) > 0, _ -> false }))
 
 fn not_a_sum(
   checker: Checker,
@@ -12764,9 +12932,10 @@ fn fitted(
   def: InstanceDef,
   type_name: Bytes,
   f: DefInfo,
+  where_written: Bool,
 ) -> Checker / {abort.raise} =
   match resolve(checker, f.scheme.ty) {
-    TyFn(sig) -> if len(f.constraints) > 0 {
+    TyFn(sig) -> if where_written {
       unfit(
         checker,
         def,
@@ -18900,6 +19069,48 @@ test "a key's function is at the type's own rows, and a type that binds a label 
   let sink = b"effect log {\n  write note[l](line: String) -> Unit\n}\ntype T<[l]> = | T((String) -> Unit / {log.note[l]}) | Quiet";
   assert_eq(keyed(sink, b"fn k<[l]>(t: T<[l]>) -> Int = 0"), [b"E0218"]);
   assert_eq(keyed(sink, b"fn k(t: T<[app]>) -> Int = 0"), [b"E0218"])
+}
+
+test "a declared type that keys a `Map` by its parameter carries the parameter's order into each signature naming it" {
+  let bag = b"type Bag<a> = | Bag(Map<a, Int>)\n";
+  // Taken, the order is assumed in the body; answered, a caller is held to it.
+  assert_eq(
+    check_codes(
+      bytes_concat(bag, b"fn size<a>(b: Bag<a>) -> Int = match b { Bag(m) -> map_len(m) }\n"),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        bag,
+        b"fn none<a>() -> Bag<a> = Bag(map_new())\nfn floats() -> Bag<Float> = none()\n",
+      ),
+    ),
+    [b"E0206"],
+  );
+  // Through a `new` record, and through a declaration holding one in a list.
+  assert_eq(
+    check_codes(
+      b"type Ranked<a> = new { by: Map<a, Int> }\ntype Held<a> = | Held(List<Ranked<a>>)\nfn first<a>(h: Held<a>) -> Int = match h { Held(rs) -> match list_at(rs, 0) { Some(r) -> map_len(r.by), None -> 0 } }\n",
+    ),
+    [],
+  );
+  // A parameter a declaration holds without keying a `Map` by it carries nothing.
+  assert_eq(
+    check_codes(b"type Box<a> = | Box(a)\nfn keyed<a>(b: Box<a>) -> Map<a, Int> = map_new()\n"),
+    [b"E0206"],
+  );
+  // A `key` and a `show` name functions the type's order is carried into, with no `where`.
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        bag,
+        b"key for Bag by items\nshow for Bag by shown\nfn items<a>(b: Bag<a>) -> Map<a, Int> = match b { Bag(m) -> m }\nfn shown<a>(b: Bag<a>) -> String = int_to_string(map_len(items(b)))\n",
+      ),
+    ),
+    [],
+  )
 }
 
 test "a key answers a type that is ordered and hashed, and that does not hold its own" {

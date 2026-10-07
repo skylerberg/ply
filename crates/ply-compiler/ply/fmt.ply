@@ -17,7 +17,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt,
               SLet, SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, expr_span, is_block_like,
-              ETagged, Tagged, Hole, written_operator, call_operator)
+              ETagged, Tagged, Hole, written_operator, call_operator, set_binder)
 import rewrite (map_expr, map_item)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad, pat_span)
@@ -1484,21 +1484,20 @@ fn elements(
   close(input, s2, span.end, indent, closer)
 }
 
-/// A map or set literal the parser built a `map_of_entries` call of: the source still opens it with
-/// `#{` or `#[`, which a call spelled out never does.
+/// A map literal the parser built a `map_of_entries` call of, which the source still opens with
+/// `#{` where a call spelled out never does, or a set literal, whose call no source can spell.
 type Literal = { set: Bool, items: List<Expr>, span: Span }
 
 fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
   match e {
-    EApp(a) -> match a.func {
-      EVar(f) -> if f.name.module != None || f.name.name.name != b"map_of_entries" { None } else {
-        let opener = bytes_slice(input.source, a.span.start, a.span.start + 2);
-        match a.args {
-          [EList(l)] -> if opener == b"#{" || opener == b"#[" {
-            Some({ set: opener == b"#[", items: l.items, span: a.span })
-          } else { None },
-          _ -> None,
-        }
+    EApp(a) -> match ((a.func, a.args)) {
+      (EVar(f), [EList(l)]) -> match f.name.module {
+        Some(m) -> if m.name == set_binder() { Some({ set: true, items: l.items, span: a.span }) }
+        else { None },
+        None -> if f.name.name.name == b"map_of_entries"
+            && bytes_slice(input.source, a.span.start, a.span.start + 2) == b"#{" {
+          Some({ set: false, items: l.items, span: a.span })
+        } else { None },
       },
       _ -> None,
     },
@@ -1525,18 +1524,7 @@ fn field_of(fields: List<RecField>, name: Bytes) -> Option<Expr> =
 
 fn flat_literal(input: PrintInput, m: Literal) -> Option<Bytes> / {abort.raise} =
   if m.set {
-    cat([
-      Some(b"#["),
-      sep(
-        map(m.items, |x: Expr|
-          match entry_parts(x) {
-            Some(en) -> flat_expr(input, en.key),
-            None -> flat_expr(input, x),
-          }),
-        b", ",
-      ),
-      Some(b"]"),
-    ])
+    cat([Some(b"#["), sep(map(m.items, |x: Expr| flat_expr(input, x)), b", "), Some(b"]")])
   } else {
     let entry = |key: Expr, value: Expr|
       cat([flat_expr(input, key), Some(b": "), flat_expr(input, value)]);
@@ -1577,7 +1565,8 @@ fn literal(p: PrintInput, printer: Printer, m: Literal, indent: Int) -> Printer 
     };
     match list_at(m.items, i) {
       None -> s,
-      Some(x) -> match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) },
+      Some(x) -> if m.set { entry(x, x) }
+      else { match entry_parts(x) { Some(en) -> entry(en.key, en.value), None -> entry(x, x) } },
     }
   });
   close(p, s2, m.span.end, indent, if m.set { b"]" } else { b"}" })
@@ -2573,7 +2562,11 @@ test "a map or a set literal prints as the literal it was, and a spelled-out cal
     b"fn f() -> Map<String, Int> = #{ \"a\" : 1,\"b\":2 }\n",
     b"fn f() -> Map<String, Int> = #{\"a\": 1, \"b\": 2}\n",
   );
-  lays_out(b"fn f() -> Map<Int, Unit> = #[ 3,1 ]\n", b"fn f() -> Map<Int, Unit> = #[3, 1]\n");
+  lays_out(b"fn f() -> Set<Int> = #[ 3,1 ]\n", b"fn f() -> Set<Int> = #[3, 1]\n");
+  lays_out(
+    b"fn f() -> Set<{ key: Int, value: Int }> = #[{key: 1, value: 2}]\n",
+    b"fn f() -> Set<{ key: Int, value: Int }> = #[{ key: 1, value: 2 }]\n",
+  );
   lays_out(b"fn f() -> Map<Int, Int> = #{}\n", b"fn f() -> Map<Int, Int> = #{}\n");
   lays_out(
     b"fn f() -> Map<Int, Int> = map_of_entries([{key: 1, value: 2}])\n",
