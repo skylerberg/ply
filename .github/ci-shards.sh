@@ -52,10 +52,11 @@
 #                                the traces in NEW of the tests JUNIT says passed,
 #                                copied into OUT
 #   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
-#                                `workflow_dispatch`, SWEEP_SHARDS shards of the seventh of the cases
-#                                the day of the week names, so a week sweeps every case; on a pull
+#                                `workflow_dispatch`, SWEEP_SHARDS shards of the part of the cases
+#                                the day names, so SWEEP_DAYS days sweep every case; on a pull
 #                                request, a job for each module the paths on stdin change, up to
-#                                SWEEP_MOST of them; none otherwise
+#                                SWEEP_MOST of them, taking one of SWEEP_PARTS parts of its edits;
+#                                none otherwise
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -101,10 +102,12 @@ CORPUS_ALONE=(cli-compiler_compiled)
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
 # Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
-# of the tree a dozen ways and checks it warm and cold after each, a day of runners over the tree.
+# of the tree one way and checks it warm and cold, days of runners over the tree.
 CLI_NIGHTLY=(edit_sweep)
 SWEEP_SHARDS=16
+SWEEP_DAYS=14
 SWEEP_MOST=6
+SWEEP_PARTS=4
 # Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
 # for a lane whatever its tests are placed by, as a test over cases is one test.
 CORPUS_SHARDED=("cli-phases:3" "cli-http_audit:2")
@@ -1842,19 +1845,19 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; $((${#TREE_CHECKS[@]} + ${#GATES_ALONE[@]})) tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
-# The sweep's case for a changed path, as a `--filter`: an example, a module of the compiler's
+# The sweep's cases for a changed path, as a `--filter`: an example, a module of the compiler's
 # package, or one of the standard library; nothing for any other path.
 sweep_filter() {
   local path=$1 module
   case $path in
     examples/*/*) ;;
-    examples/*.ply) printf 'edit_sweep.editing %s agrees\n' "$path" ;;
+    examples/*.ply) printf 'edit_sweep.editing %s with \n' "$path" ;;
     crates/ply-compiler/ply/*/*) ;;
-    crates/ply-compiler/ply/*.ply) printf 'edit_sweep.editing compiler/%s agrees\n' "${path#crates/ply-compiler/ply/}" ;;
+    crates/ply-compiler/ply/*.ply) printf 'edit_sweep.editing compiler/%s with \n' "${path#crates/ply-compiler/ply/}" ;;
     crates/ply-std/ply/*.ply)
       module=${path#crates/ply-std/ply/}
       module=${module%.ply}
-      printf 'edit_sweep.editing std.%s agrees\n' "${module//\//.}"
+      printf 'edit_sweep.editing std.%s with \n' "${module//\//.}"
       ;;
   esac
 }
@@ -1862,13 +1865,16 @@ sweep_filter() {
 cmd_sweep_matrix() {
   local event=$1 path
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
-    jq -cn --argjson n "$SWEEP_SHARDS" --argjson day "$(date -u +%u)" \
-      '($n * 7) as $of | {include: [range(1; $n + 1) | (($day - 1) * $n + .) as $k
+    jq -cn --argjson n "$SWEEP_SHARDS" --argjson days "$SWEEP_DAYS" --argjson day "$(($(date -u +%s) / 86400))" \
+      '($n * $days) as $of | {include: [range(1; $n + 1) | (($day % $days) * $n + .) as $k
         | {name: "\($k)/\($of)", shard: "\($k)/\($of)", filter: ""}]}'
     return
   fi
+  # A run takes a quarter of each changed module's edits, the next run of the pull request the next.
+  local part=$((${GITHUB_RUN_NUMBER:-0} % SWEEP_PARTS + 1))
   while read -r path; do sweep_filter "$path"; done | sort -u | head -n "$SWEEP_MOST" |
-    jq -Rcn '{include: [inputs | {name: (. | sub("^edit_sweep.editing "; "") | sub(" agrees$"; "")), shard: "", filter: .}]}'
+    jq -Rcn --arg shard "$part/$SWEEP_PARTS" \
+      '{include: [inputs | {name: (. | sub("^edit_sweep.editing "; "") | sub(" with $"; "")), shard: $shard, filter: .}]}'
 }
 
 case "${1:-}" in
