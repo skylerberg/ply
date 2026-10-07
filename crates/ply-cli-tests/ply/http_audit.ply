@@ -47,13 +47,16 @@ fn body() -> String =
   \\
 
 /// The first `recv` answers `first` and every later one `more`; the bytes the server wrote come
-/// back.
+/// back. The handler reads the request's body before it answers.
 fn serve() -> String =
   \\import std.net (net)
-  \\import std.http (default_limits, text_response, serve_connection, Request, Response,
-  \\                 method_name)
+  \\import std.http (default_limits, text_response, serve_connection, request_body, Reading,
+  \\                 Request, Response, method_name)
   \\
-  \\fn echo(req: Request) -> Response = text_response(200, method_name(req.method) ++ " " ++ req.path)
+  \\fn echo<| e>(req: Request) -> Response<| e> / {Reading} = {
+  \\  let body = request_body(req, 1048576);
+  \\  text_response(200, method_name(req.method) ++ " " ++ req.path ++ " " ++ int_to_string(bytes_len(body)))
+  \\}
   \\
   \\fn drive(first: Bytes, more: Bytes) -> { out: Bytes, reads: Int } / {abort.raise} =
   \\  with_cell[outbox](b"") { outbox -> {
@@ -72,6 +75,7 @@ fn serve() -> String =
   \\      },
   \\      net.close[conn](c) -> (),
   \\      net.peer_address[conn](c) -> None,
+  \\      net.peer_certificate[conn](c) -> None,
   \\    };
   \\    {out: cell_get(outbox), reads: cell_get(reads)}
   \\  } }
@@ -270,7 +274,7 @@ test "the head and body deadlines bound the whole message" {
         \\import std.http (default_limits, serve_connection, text_response, Request, Response,
         \\                 method_name)
         \\
-        \\fn echo(req: Request) -> Response = text_response(200, method_name(req.method) ++ " " ++ req.path)
+        \\fn echo<| e>(req: Request) -> Response<| e> = text_response(200, method_name(req.method) ++ " " ++ req.path)
         \\
         \\// The total of every deadline the server asked a `recv` for, driving a peer that
         \\// answers one byte at a time and never finishes.
@@ -293,6 +297,7 @@ test "the head and body deadlines bound the whole message" {
         \\      net.send[conn](c, payload, t) -> Some(bytes_len(payload)),
         \\      net.close[conn](c) -> (),
         \\      net.peer_address[conn](c) -> None,
+        \\      net.peer_certificate[conn](c) -> None,
         \\    };
         \\    cell_get(total)
         \\  } }
@@ -317,12 +322,12 @@ test "a program-supplied header value with CR or LF refuses the encode" {
   scratch(|| {
     red_saying(
       ply_test(
-        \\import std.http (encode, Get, Http11, response, set_header, empty_headers)
+        \\import std.http (encode, Get, Http11, Response, Whole, set_header, empty_headers)
         \\
         \\test "a CR in a value splits nothing" {
-        \\  assert_eq(bytes_len(encode(Get, Http11, true,
-        \\    {status: 200, headers: set_header(empty_headers(), "x-echo", "a\r\nSet-Cookie: evil=1"),
-        \\     body: b"ok"})), 0)
+        \\  let r: Response<| {}> = {status: 200, headers: set_header(empty_headers(), "x-echo", "a\r\nSet-Cookie: evil=1"),
+        \\     body: Whole(b"ok")};
+        \\  assert_eq(bytes_len(encode(Get, Http11, true, r)), 0)
         \\}
         \\
       ),
@@ -338,11 +343,11 @@ test "a program may not set a framing field on a response" {
   scratch(|| {
     red_saying(
       ply_test(
-        \\import std.http (encode, Get, Http11, response, set_header, empty_headers)
+        \\import std.http (encode, Get, Http11, Response, Whole, set_header, empty_headers)
         \\
         \\test "a second Content-Length" {
-        \\  assert_eq(bytes_len(encode(Get, Http11, true,
-        \\    {status: 200, headers: set_header(empty_headers(), "content-length", "0"), body: b"ok"})), 0)
+        \\  let r: Response<| {}> = {status: 200, headers: set_header(empty_headers(), "content-length", "0"), body: Whole(b"ok")};
+        \\  assert_eq(bytes_len(encode(Get, Http11, true, r)), 0)
         \\}
         \\
       ),
@@ -359,7 +364,7 @@ test "a handler that fails ends the run rather than the connection" {
         \\import std.net (net)
         \\import std.http (default_limits, serve_connection, Request, Response)
         \\
-        \\fn boom(req: Request) -> Response / {abort.raise} = panic("the handler had a bug")
+        \\fn boom<| e>(req: Request) -> Response<| e> / {abort.raise} = panic("the handler had a bug")
         \\
         \\test "a failing handler" {
         \\  with_cell[outbox](b"") { outbox -> {
@@ -373,6 +378,7 @@ test "a handler that fails ends the run rather than the connection" {
         \\      },
         \\      net.close[conn](c) -> (),
         \\      net.peer_address[conn](c) -> None,
+        \\      net.peer_certificate[conn](c) -> None,
         \\    };
         \\    assert_eq(bytes_len(cell_get(outbox)), 0)
         \\  } }
@@ -483,15 +489,17 @@ test "a streamed response always ends with its terminating chunk" {
     green(
       ply_test(
         \\import std.net (net)
-        \\import std.http (default_limits, respond_chunked, response, last_chunk, Http11)
+        \\import std.http (default_limits, respond, chunked, empty_headers, last_chunk, Get, Http11, Response)
+        \\import std.seq
         \\
-        \\fn counted(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
-        \\  if seed >= 3000 { None } else { Some({chunk: b"x", next: seed + 1}) }
+        \\fn counted(seed: Int) -> Option<{ value: Bytes, next: Int }> =
+        \\  if seed >= 3000 { None } else { Some({value: b"x", next: seed + 1}) }
         \\
         \\test "a producer with more chunks than the stream bound" {
+        \\  let r: Response<| {}> = {status: 200, headers: empty_headers(), body: chunked(seq::unfold(0, counted))};
         \\  with_cell[outbox](b"") { outbox -> {
         \\    handle {
-        \\      respond_chunked[conn](7, Http11, response(200, b""), true, default_limits(), 0, counted)
+        \\      respond[conn](7, default_limits(), Get, Http11, true, r)
         \\    } with {
         \\      net.send[conn](c, payload, t) -> {
         \\        cell_set(outbox, bytes_concat(cell_get(outbox), payload));
@@ -503,7 +511,7 @@ test "a streamed response always ends with its terminating chunk" {
         \\}
         \\
       ),
-      "`std.http.stream_chunks` must terminate the message before it gives up: leaving a framed but unterminated chunked response on a connection the caller may reuse is response smuggling",
+      "`std.http.sent_out` must terminate the message before it gives up: leaving a framed but unterminated chunked response on a connection the caller may reuse is response smuggling",
     )
   })
 }
@@ -513,7 +521,8 @@ test "a streamed response may exceed the evaluator's call budget" {
     green(
       ply_test(
         \\import std.net (net)
-        \\import std.http (respond_chunked, response, last_chunk, Http11, Limits)
+        \\import std.http (respond, chunked, empty_headers, last_chunk, Get, Http11, Limits, Response)
+        \\import std.seq
         \\
         \\fn wide(n: Int) -> Limits =
         \\  {max_request_line: 8192, max_header_bytes: 65536, max_header_count: 100,
@@ -522,14 +531,14 @@ test "a streamed response may exceed the evaluator's call budget" {
         \\   header_timeout_ms: 5000, body_timeout_ms: 30000, idle_timeout_ms: 5000,
         \\   write_timeout_ms: 30000, connect_timeout_ms: 5000}
         \\
-        \\fn twenty_thousand(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
-        \\  if seed >= 20000 { None } else { Some({chunk: b"x", next: seed + 1}) }
+        \\fn twenty_thousand(seed: Int) -> Option<{ value: Bytes, next: Int }> =
+        \\  if seed >= 20000 { None } else { Some({value: b"x", next: seed + 1}) }
         \\
         \\test "a producer of twenty thousand chunks under a bound of fifty thousand" {
+        \\  let r: Response<| {}> = {status: 200, headers: empty_headers(), body: chunked(seq::unfold(0, twenty_thousand))};
         \\  with_cell[outbox](b"") { outbox -> {
         \\    handle {
-        \\      assert(respond_chunked[conn](7, Http11, response(200, b""), true, wide(50000), 0,
-        \\                                   twenty_thousand))
+        \\      assert(respond[conn](7, wide(50000), Get, Http11, true, r))
         \\    } with {
         \\      net.send[conn](c, payload, t) -> {
         \\        cell_set(outbox, bytes_concat(cell_get(outbox), payload));

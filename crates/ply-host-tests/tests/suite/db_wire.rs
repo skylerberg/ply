@@ -197,7 +197,7 @@ fn call(host: Arc<ply_host::Host>, entry: &str, url: &str) -> Result<String, Str
 
 /// A host that trusts the certificate at `trusted`, as `--trust` would have it.
 fn trusting(trusted: &std::path::Path) -> Arc<ply_host::Host> {
-    let credentials = ply_host::Credentials::load(&[], &[trusted.to_path_buf()])
+    let credentials = ply_host::Credentials::load(&[], &[trusted.to_path_buf()], &[])
         .unwrap_or_else(|why| panic!("the certificate is trusted: {why:?}"));
     Arc::new(ply_host::Host::with_credentials(credentials))
 }

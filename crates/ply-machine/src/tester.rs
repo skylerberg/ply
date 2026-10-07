@@ -781,6 +781,7 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
                 .into_iter()
                 .map(PathBuf::from)
                 .collect(),
+            mtls: str_list_at(v, "mtls", span)?,
         },
         fs: named_list("fs")?
             .into_iter()
