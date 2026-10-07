@@ -3076,11 +3076,13 @@ analysis, so a package
 costs no analysis of its own; a project keeps one per semantics version (§15.1),
 so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
-publisher sent. `ply check` of a whole project reads the project's own modules
-the same way, from what its last check kept beside the package: a module that
-still stands enters with its bodies cut out and its tests and laws as written,
-its rows answer for the bodies, and what the check warned of it is said again.
-Its answer is the one a check of every source gives. A run about the
+publisher sent. `ply check`, `ply defs` and `ply run` of a whole project read the
+project's own modules the same way, from what the last of them kept beside the
+package: a module that still stands enters with its bodies cut out and its tests and
+laws as written, its rows answer for the bodies, and what the check warned of it is
+said again. Each answers as it does over every source; a run compiles what it runs
+from source. `ply test` reads them from source, since a mutant and a bisection
+rewrite bodies. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and neither does `compiler.load`. A cache that will not read
@@ -3144,7 +3146,8 @@ which runs have work before starting them. `ply defs` keeps its listing the same
 way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
 program reached hashes as it did; its `--json` document then carries
-`front_end` with `reused` and `key`.
+`front_end` with `reused` and `key`, and otherwise `reused` false beside the own
+modules the load read as their stubs (`stubbed`).
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
