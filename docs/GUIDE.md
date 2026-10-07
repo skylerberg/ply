@@ -3234,7 +3234,8 @@ way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
 program reached hashes as it did; its `--json` document then carries
 `front_end` with `reused` and `key`, and otherwise `reused` false beside the own
-modules the load read as their stubs (`stubbed`).
+modules the load read as their stubs (`stubbed`) and those it read whole again
+because what one references in a module read from its source moved (`restored`).
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
