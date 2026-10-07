@@ -24,12 +24,14 @@ import cli.tester (tester, hermetic_tester)
 import std.bytes (hex_of)
 import std.config (config)
 import std.fs
-import std.fs (fs, MemFs, Entry, File)
+import std.fs (fs, MemFs, Entry, File, Seen)
 import std.json
 import std.json (Json, Null, Number, Str, Array, Object)
 import std.list (sort_by, concat, contains)
 import std.net
 import std.net (net)
+import std.os
+import std.os (os)
 import std.random (entropy)
 import std.process (process, Var, Finished, Exited, Signalled, Captured, captured, args_step,
                     out_step, err_step, exit_step, with_input, line_step, Line, Keep, Lines,
@@ -37,6 +39,7 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
 import std.time (time)
 import std.path (segments)
 import std.string (unlines)
+import std.text (shell_join)
 
 // --- What a run said ---------------------------------------------------------
 
@@ -299,7 +302,9 @@ pub fn warm_agrees(what: String) -> Json / {Reached, Hermetic, Shipped, abort.ra
 }
 
 /// How many definitions a check took from the cache, and how many it checked.
-pub type Seeding = { seeded: Int, checked: Int }
+/// Definitions taken from their filed rows or checked, and tests taken as their hashing fixed them
+/// or hashed.
+pub type Seeding = { seeded: Int, checked: Int, held: Int, hashed: Int }
 
 pub fn seeding() -> Seeding / {Reached, Shipped, abort.raise, diverges} = seeding_at(".")
 
@@ -309,7 +314,12 @@ pub fn seeding_at(dir: String) -> Seeding / {Reached, Shipped, abort.raise, dive
     "front_end",
     "definitions",
   ]);
-  { seeded: int(at(d, "seeded")), checked: int(at(d, "checked")) }
+  {
+    seeded: int(at(d, "seeded")),
+    checked: int(at(d, "checked")),
+    held: int(at(d, "tests_held")),
+    hashed: int(at(d, "tests_hashed")),
+  }
 }
 
 /// A package as its manifest declares it: its prefix and the prefixes it depends on.
@@ -570,6 +580,10 @@ pub fn over_tree<a | e>(
         cell_set(disk, c.fs);
         c.bytes
       };
+      let linked = |l: fs::Linked| {
+        cell_set(disk, l.fs);
+        l.done
+      };
       handle {
         let value = body();
         { value: value, tree: cell_get(disk) }
@@ -611,8 +625,8 @@ pub fn over_tree<a | e>(
         fs.walk[abs](p) -> fs::mem_walk(cell_get(disk), p),
         fs.append[cwd](p, body) -> appended(fs::mem_append(cell_get(disk), in_w(p), body)),
         fs.append[abs](p, body) -> appended(fs::mem_append(cell_get(disk), p, body)),
-        fs.sync[cwd](p) -> fs::mem_sync(cell_get(disk), in_w(p)),
-        fs.sync[abs](p) -> fs::mem_sync(cell_get(disk), p),
+        fs.sync[cwd](p) -> kept(fs::mem_sync(cell_get(disk), in_w(p))),
+        fs.sync[abs](p) -> kept(fs::mem_sync(cell_get(disk), p)),
         fs.lock[cwd](p) -> kept(fs::mem_lock(cell_get(disk), in_w(p))),
         fs.lock[abs](p) -> kept(fs::mem_lock(cell_get(disk), p)),
         fs.unlock[cwd](p) -> kept(fs::mem_unlock(cell_get(disk), in_w(p))),
@@ -638,6 +652,17 @@ pub fn over_tree<a | e>(
         fs.write_chunk[abs](file, body) -> kept(fs::mem_write_chunk(cell_get(disk), file, body)),
         fs.close[cwd](file) -> kept(fs::mem_close(cell_get(disk), file)),
         fs.close[abs](file) -> kept(fs::mem_close(cell_get(disk), file)),
+        fs.stat[cwd](p) -> fs::mem_stat(cell_get(disk), in_w(p)),
+        fs.stat[abs](p) -> fs::mem_stat(cell_get(disk), p),
+        fs.scan[cwd](p, deep) -> match fs::mem_scan(cell_get(disk), in_w(p), deep) {
+          Some(seen) -> Some(map(seen, |s: Seen| { ..s, path: out_of_w(s.path) })),
+          None -> None,
+        },
+        fs.scan[abs](p, deep) -> fs::mem_scan(cell_get(disk), p, deep),
+        fs.space[cwd](p) -> fs::mem_space(cell_get(disk), in_w(p)),
+        fs.space[abs](p) -> fs::mem_space(cell_get(disk), p),
+        fs.link[cwd](p, to) -> linked(fs::mem_link(cell_get(disk), in_w(p), in_w(to))),
+        fs.link[abs](p, to) -> linked(fs::mem_link(cell_get(disk), p, to)),
         entropy.next() -> {
           let n = cell_get(drawn);
           cell_set(drawn, n + 1);
@@ -894,8 +919,16 @@ pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server / {Spaw
 /// The binary started as `spawned` starts it and left running, its output handed over a line at a
 /// time through `next_line` and its error stream dropped.
 pub fn speaking(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abort.raise} =
+  talking(argv, vars, false)
+
+/// As `speaking`, with the binary's input left open: written with `process.input[ply]` and ended
+/// with `process.end_input[ply]`.
+pub fn listening(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abort.raise} =
+  talking(argv, vars, true)
+
+fn talking(argv: List<String>, vars: List<Var>, input: Bool) -> Server / {Spawned, abort.raise} =
   match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
-      input: false,
+      input: input,
       out: Lines,
       err: Discard,
     }) {
@@ -912,7 +945,15 @@ pub fn spawned_reading(
   argv: List<String>,
   vars: List<Var>,
   input: String,
-) -> Ran / {Spawned, abort.raise} =
+) -> Ran / {Spawned, abort.raise} = finished(spawned_fed(argv, vars, bytes_of_string(input)))
+
+/// As `spawned_reading`, for input and output that are not text: how the run ended, and each
+/// stream byte for byte.
+pub fn spawned_fed(
+  argv: List<String>,
+  vars: List<Var>,
+  input: Bytes,
+) -> Finished / {Spawned, abort.raise} =
   match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
       input: true,
       out: Keep,
@@ -920,13 +961,72 @@ pub fn spawned_reading(
     }) {
     Err(why) -> panic("`ply` did not start: " ++ why),
     Ok(child) -> {
-      let _ = process.input[ply](child, bytes_of_string(input));
+      let _ = process.input[ply](child, input);
       process.end_input[ply](child);
       match process.wait[ply](child, -1) {
-        Some(f) -> finished(f),
+        Some(f) -> f,
         None -> panic("a wait with no timeout came back with nothing"),
       }
     },
+  }
+
+// --- Through a shell ---------------------------------------------------------
+
+/// What a run of `ply` needs that only a shell gives it: a pipe whose reader leaves, and a
+/// terminal. The shell is the one `--exec sh` names, and the `ply` it starts is the one this run
+/// is, which a run of the suite also names `--exec ply`.
+pub effect set Shell = {config.get[env], process.read[sh], process.write[sh], os.read}
+
+/// The path of the `ply` this run is.
+pub fn this_ply() -> String / {os.executable, abort.raise} =
+  match os.executable() { Some(path) -> path, None -> panic("this `ply` has no path") }
+
+/// The words a shell starts `ply` with, as `spawned` starts it: `--color never` ahead of `argv`.
+/// `$PLY` is the binary, which `shell_environment` sets.
+fn shell_ply(argv: List<String>) -> String / {abort.raise} =
+  match shell_join(concat(["--color", "never"], argv)) {
+    Some(words) -> "\"$PLY\" " ++ words,
+    None -> panic("an argument no shell word spells"),
+  }
+
+fn shell_environment() -> List<Var> / {config.get[env], os.executable, abort.raise} =
+  push(environment([]), { name: "PLY", value: this_ply() })
+
+/// `ply` run with its output piped into `reader`, a shell command: what the reader wrote, and on
+/// stderr what the run wrote there and then `status` and the code it exited with.
+pub fn spawned_into(argv: List<String>, reader: String) -> Finished / {Shell, abort.raise} =
+  process.spawn[sh](
+    ["-c", "{ " ++ shell_ply(argv) ++ "; echo \"status $?\" >&2; } | " ++ reader],
+    "",
+    shell_environment(),
+  )
+
+/// `ply` started at a terminal of its own, 80 columns by 24 rows, echoing and a line at a time:
+/// the pseudo-terminal `script` makes. What is written to the terminal comes a line at a time
+/// from the child this answers, what the test writes to the child's input is typed at it, and
+/// once `ply` has ended a line that starts `after:` holds what `stty -a` says of the terminal as
+/// it was left, its line ends, tabs and semicolons made blanks. `None` where the system has no
+/// `script` to make a terminal with, when a test has nothing to assert.
+pub fn at_terminal(argv: List<String>) -> Option<Int> / {Shell, abort.raise} =
+  if process.spawn[sh](["-c", "command -v script >/dev/null 2>&1"], "", environment([])).ended
+      != Exited(0) { None } else {
+    let inside = "stty rows 24 columns 80 echo icanon; " ++ shell_ply(argv)
+      ++ "; echo \"after: $(stty -a | tr '\\n\\t;' '   ') \"";
+    // util-linux's `script` takes the command as one word after `-c`, and the BSDs' as the
+    // words after the file it writes its record to.
+    let made = match os.family() {
+      os::Linux -> "script -qec \"$INSIDE\" /dev/null",
+      _ -> "script -q /dev/null sh -c \"$INSIDE\"",
+    };
+    match process.start[sh](
+        ["-c", made],
+        "",
+        push(shell_environment(), { name: "INSIDE", value: inside }),
+        { input: true, out: Lines, err: Discard },
+      ) {
+      Ok(child) -> Some(child),
+      Err(why) -> panic("`script` did not start: " ++ why),
+    }
   }
 
 /// A connection to the server's port that `ready` accepts, or why none came within `ms`: the

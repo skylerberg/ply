@@ -4,7 +4,9 @@ use ply_eval::{
     Value, codes,
 };
 use ply_host::fs::*;
+use ply_host::pool::Pooled;
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,7 +23,10 @@ fn a_path_under_the_root_resolves() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     std::fs::write(real.join("a.ply"), b"x").unwrap();
-    assert_eq!(confine(&real, "a.ply", span()).unwrap(), real.join("a.ply"));
+    assert_eq!(
+        confine(&real, "a.ply", span()).unwrap(),
+        Some(real.join("a.ply"))
+    );
 }
 
 #[test]
@@ -67,6 +72,29 @@ fn a_write_through_a_symlinked_directory_is_refused() {
 
     let refusal = confine(&real, "out/artifact.plyx", span()).expect_err("it should be refused");
     assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
+}
+
+/// A link to where nothing is resolves to nothing, so it is held by where it leads.
+#[test]
+fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_refused() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let outside = root();
+    let made = outside.path().canonicalize().unwrap().join("made");
+    std::os::unix::fs::symlink(&made, real.join("link")).unwrap();
+    let fs = rooted(&real);
+
+    let refused = perform(
+        &fs,
+        Op::WriteFile,
+        "cache",
+        &[Value::str("link"), Value::bytes(b"x")],
+    );
+    assert!(!made.exists(), "the write landed outside the root");
+    assert_eq!(
+        refused.expect_err("the link leads out").code,
+        codes::FS_PATH_ESCAPES_ROOT
+    );
 }
 
 #[test]
@@ -232,7 +260,7 @@ fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Valu
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => fs.block_on(pending),
+        HostAnswer::Pending(pending) => fs.pool().block_on(pending),
         HostAnswer::Value(v) => Ok(v),
     }
 }
@@ -686,10 +714,17 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
         !boolean(&done(link("l", "a.txt"))),
         "a path that is there is not made a link"
     );
+    // A target is read from the directory the link is made in, wherever a link above it leads.
+    std::fs::create_dir_all(real.join("d/e/f")).unwrap();
+    std::os::unix::fs::symlink("..", real.join("d/back")).unwrap();
+    std::os::unix::fs::symlink("e/f", real.join("d/deep")).unwrap();
+    assert!(boolean(&done(link("d/deep/up", "../../../a.txt"))));
+    assert_eq!(std::fs::read(real.join("d/e/f/up")).unwrap(), b"x");
     for (path, target) in [
         ("out", "../elsewhere"),
         ("d/out", "../../x"),
         ("abs", "/etc"),
+        ("d/back/esc", "../x"),
     ] {
         let refused = link(path, target).expect_err("the target leaves the root");
         assert_eq!(
@@ -934,4 +969,628 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
     assert_eq!(negative.code, codes::RUNTIME_ERROR);
     // Neither refusal moved the descriptor.
     assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
+}
+
+// --- Exclusive creates, looks, scans, names and room ---
+
+#[test]
+fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink("nowhere", real.join("d/l")).unwrap();
+
+    let made = opened(&fs, "cache", "d/new", "ToCreate").expect("nothing is there");
+    assert!(boolean(&on(
+        &fs,
+        Op::WriteChunk,
+        &[Value::Int(made), Value::bytes(b"mine")]
+    )));
+    assert!(closed(&fs, "cache", made));
+    assert_eq!(std::fs::read(real.join("d/new")).unwrap(), b"mine");
+    assert_eq!(file_mode(&real.join("d/new")), 0o600);
+
+    for there in ["d/new", "d/a.txt", "d", "d/l"] {
+        assert_eq!(
+            opened(&fs, "cache", there, "ToCreate"),
+            Err("std.fs.Exists".into()),
+            "{there}"
+        );
+    }
+    // The link was refused as itself: nothing was made where it points.
+    assert!(!real.join("d/nowhere").exists());
+    assert_eq!(
+        opened(&fs, "cache", "no/new", "ToCreate"),
+        Err("std.fs.NotFound".into())
+    );
+    assert_eq!(
+        opened(&fs, "cache", "d/a.txt/new", "ToCreate"),
+        Err("std.fs.NotADirectory".into())
+    );
+}
+
+/// A `std.fs.Stat`, as a test reads one.
+#[derive(Debug, PartialEq)]
+struct Looked {
+    kind: String,
+    size: i64,
+    modified: i64,
+    mode: u32,
+    links: i64,
+    device: i64,
+    id: i64,
+}
+
+fn looked(v: &Value) -> Looked {
+    let Value::Record(fields) = v else {
+        panic!("not a stat: {}", v.type_name())
+    };
+    let int = |name: &str| match fields.named(name) {
+        Some(Value::Int(n)) => *n,
+        _ => panic!("no `{name}`"),
+    };
+    let modified = match fields.named("modified") {
+        Some(Value::Ctor { name, args }) if name.as_str() == "Instant" => match args.as_slice() {
+            [Value::Int(nanos)] => *nanos,
+            _ => panic!("an `Instant` holds one `Int`"),
+        },
+        _ => panic!("no `modified`"),
+    };
+    Looked {
+        kind: ctor_name(fields.named("kind").expect("a kind")),
+        size: int("size"),
+        modified,
+        mode: mode_bits_of(fields.named("mode").expect("a mode")),
+        links: int("links"),
+        device: int("device"),
+        id: int("id"),
+    }
+}
+
+fn stat(fs: &Arc<FsHost>, path: &str) -> Option<Looked> {
+    option(&on(fs, Op::Stat, &[Value::str(path)])).map(looked)
+}
+
+fn linked(fs: &Arc<FsHost>, path: &str, to: &str) -> Result<(), String> {
+    match &on(fs, Op::Link, &[Value::str(path), Value::str(to)]) {
+        Value::Ctor { name, args } if name.as_str() == "Ok" => {
+            assert!(matches!(args.as_slice(), [Value::Unit]));
+            Ok(())
+        }
+        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
+        other => panic!("not a `Result`: {}", other.type_name()),
+    }
+}
+
+#[test]
+fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"abc").unwrap();
+    std::fs::set_permissions(real.join("d/a.txt"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    std::os::unix::fs::symlink("a.txt", real.join("d/l")).unwrap();
+
+    let meta = std::fs::metadata(real.join("d/a.txt")).unwrap();
+    let file = stat(&fs, "d/a.txt").expect("a file is there");
+    assert_eq!(
+        file,
+        Looked {
+            kind: "std.fs.File".into(),
+            size: 3,
+            modified: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            mode: 0o640,
+            links: 1,
+            device: meta.dev() as i64,
+            id: meta.ino() as i64,
+        }
+    );
+
+    let folder = stat(&fs, "d").expect("a directory is there");
+    assert_eq!(
+        (folder.kind.as_str(), folder.size, folder.links),
+        ("std.fs.Dir", 0, 1)
+    );
+    assert_eq!(folder.mode, file_mode(&real.join("d")));
+
+    // The link is read, not followed: it is no file, and it is not the file it points at.
+    let link = stat(&fs, "d/l").expect("a link is there");
+    assert_eq!(
+        (link.kind.as_str(), link.size, link.mode, link.links),
+        ("std.fs.Symlink", 0, 0o777, 1)
+    );
+    assert_ne!(link.id, file.id);
+
+    assert_eq!(stat(&fs, "d/absent"), None);
+    let refused =
+        perform(&fs, Op::Stat, "cache", &[Value::str("../d")]).expect_err("it leaves the root");
+    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
+}
+
+#[test]
+fn a_scan_is_a_walk_with_a_look_at_each_entry_and_goes_below_only_when_asked() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir_all(real.join("a/z")).unwrap();
+    std::fs::write(real.join("a/b.txt"), b"b").unwrap();
+    std::fs::write(real.join("a/z/y.txt"), b"yy").unwrap();
+    std::fs::write(real.join("a-c.txt"), b"").unwrap();
+    std::os::unix::fs::symlink("a", real.join("link")).unwrap();
+
+    let scan = |path: &str, deep: bool| -> Option<Vec<(String, String, i64)>> {
+        option(&on(&fs, Op::Scan, &[Value::str(path), Value::Bool(deep)])).map(|entries| {
+            let Value::List(entries) = entries else {
+                panic!("not a list")
+            };
+            entries
+                .iter()
+                .map(|e| {
+                    let Value::Record(fields) = e else {
+                        panic!("not a record")
+                    };
+                    let path = match fields.named("path") {
+                        Some(Value::Str(s)) => s.to_string(),
+                        _ => panic!("no path"),
+                    };
+                    let found = looked(fields.named("stat").expect("a stat"));
+                    (path, found.kind, found.size)
+                })
+                .collect()
+        })
+    };
+    let entry = |p: &str, k: &str, size: i64| (p.to_string(), format!("std.fs.{k}"), size);
+    assert_eq!(
+        scan("", true),
+        Some(vec![
+            entry("a", "Dir", 0),
+            entry("a/b.txt", "File", 1),
+            entry("a/z", "Dir", 0),
+            entry("a/z/y.txt", "File", 2),
+            entry("a-c.txt", "File", 0),
+            entry("link", "Symlink", 0),
+        ])
+    );
+    assert_eq!(
+        scan("", false),
+        Some(vec![
+            entry("a", "Dir", 0),
+            entry("a-c.txt", "File", 0),
+            entry("link", "Symlink", 0),
+        ])
+    );
+    assert_eq!(
+        scan("./a/", false),
+        Some(vec![entry("a/b.txt", "File", 1), entry("a/z", "Dir", 0)])
+    );
+    assert_eq!(scan("a/b.txt", true), None);
+    assert_eq!(scan("absent", true), None);
+}
+
+#[test]
+fn a_file_takes_a_second_name_and_nothing_else_does() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"one").unwrap();
+    std::os::unix::fs::symlink("d/a.txt", real.join("l")).unwrap();
+
+    assert_eq!(linked(&fs, "twin.txt", "d/a.txt"), Ok(()));
+    std::fs::write(real.join("twin.txt"), b"both").unwrap();
+    assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
+    let (first, second) = (
+        stat(&fs, "d/a.txt").expect("the file"),
+        stat(&fs, "twin.txt").expect("its second name"),
+    );
+    assert_eq!((first.links, second.links), (2, 2));
+    assert_eq!((first.device, first.id), (second.device, second.id));
+
+    // A copy onto the file itself, by either name, would empty it before reading it.
+    for (from, to) in [("twin.txt", "d/a.txt"), ("d/a.txt", "d/a.txt")] {
+        assert!(
+            boolean(&on(&fs, Op::Copy, &[Value::str(from), Value::str(to)])),
+            "{from} -> {to}"
+        );
+        assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
+    }
+
+    let refused = |path: &str, to: &str, why: &str| {
+        assert_eq!(
+            linked(&fs, path, to),
+            Err(format!("std.fs.{why}")),
+            "{path} -> {to}"
+        );
+    };
+    refused("n", "absent", "NotFound");
+    refused("n", "d", "NotAFile");
+    refused("n", "l", "NotAFile");
+    refused("l", "d/a.txt", "Exists");
+    refused("twin.txt", "d/a.txt", "Exists");
+    refused("no/n", "d/a.txt", "NotFound");
+    refused("d/a.txt/n", "d/a.txt", "NotADirectory");
+    assert!(!real.join("n").exists());
+
+    for (path, to) in [("../n", "d/a.txt"), ("n", "/d/a.txt")] {
+        let refused = perform(&fs, Op::Link, "cache", &[Value::str(path), Value::str(to)])
+            .expect_err("it leaves the root");
+        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{path} -> {to}");
+    }
+}
+
+#[test]
+fn the_room_of_a_file_system_is_answered_for_a_path_that_names_something() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::write(real.join("a.txt"), b"x").unwrap();
+
+    let room = |path: &str| -> Option<[i64; 5]> {
+        option(&on(&fs, Op::Space, &[Value::str(path)])).map(|space| {
+            let Value::Record(fields) = space else {
+                panic!("not a record")
+            };
+            ["total", "free", "available", "inodes", "inodes_free"].map(|name| {
+                match fields.named(name) {
+                    Some(Value::Int(n)) => *n,
+                    _ => panic!("no `{name}`"),
+                }
+            })
+        })
+    };
+    let [total, free, available, inodes, inodes_free] = room("").expect("the root is there");
+    assert!(total > 0 && free <= total && available <= free);
+    assert!(inodes_free <= inodes);
+    // One file system holds the root and the file in it.
+    assert_eq!(room("a.txt").map(|r| r[0]), Some(total));
+    assert_eq!(room("absent"), None);
+}
+
+#[test]
+fn a_look_a_scan_the_room_and_a_second_name_are_registered_and_wait_in_the_pool() {
+    let dir = root();
+    let fs = rooted(dir.path());
+    let handlers = registrations(&fs);
+    for (op, name, arity) in [
+        (Op::Stat, "stat", 1),
+        (Op::Scan, "scan", 2),
+        (Op::Space, "space", 1),
+        (Op::Link, "link", 2),
+    ] {
+        assert_eq!((op.name(), op.arity()), (name, arity));
+        let (declaration, _) = handlers
+            .iter()
+            .find(|(d, _)| d.op.as_str() == name)
+            .unwrap_or_else(|| panic!("`{name}` is not registered"));
+        assert!(declaration.blocking, "{name}");
+        assert_eq!(declaration.path, format!("ply_host::fs::{name}"));
+        let refused = perform(&fs, op, "elsewhere", &vec![Value::str("a"); arity])
+            .expect_err("`elsewhere` has no root");
+        assert_eq!(refused.code, codes::FS_ROOT_UNBOUND, "{name}");
+    }
+}
+
+// --- Links that lead out of the root ---
+
+/// Where a link that leads out of the root stands in the path an operation is given.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Way {
+    /// The last name is a link to a path outside the root where nothing is.
+    Dangling,
+    /// The last name is a link to a file outside the root.
+    ToFile,
+    /// A name below a link to a path outside the root where nothing is.
+    BelowDangling,
+    /// A file outside the root, named through a link to its directory.
+    Through,
+    /// A name that is not there, through a link to a directory outside the root.
+    ThroughToNew,
+    /// `..` after a link to a directory inside the root.
+    Climbing,
+}
+
+impl Way {
+    const ALL: [Way; 6] = [
+        Way::Dangling,
+        Way::ToFile,
+        Way::BelowDangling,
+        Way::Through,
+        Way::ThroughToNew,
+        Way::Climbing,
+    ];
+
+    fn path(self) -> &'static str {
+        match self {
+            Way::Dangling => "gone",
+            Way::ToFile => "file",
+            Way::BelowDangling => "gone/new",
+            Way::Through => "out/secret.txt",
+            Way::ThroughToNew => "out/new",
+            Way::Climbing => "in/../plain.txt",
+        }
+    }
+
+    /// Whether the path names the link, which an operation that follows no link acts on as itself.
+    fn names_the_link(self) -> bool {
+        matches!(self, Way::Dangling | Way::ToFile)
+    }
+}
+
+/// A root holding a file, a directory and the links each `Way` names, and the directory outside it
+/// that they lead to.
+fn linked_out() -> (tempfile::TempDir, tempfile::TempDir) {
+    let (inside, outside) = (root(), root());
+    let (here, there) = (inside.path(), outside.path().canonicalize().unwrap());
+    std::fs::write(there.join("secret.txt"), b"secret").unwrap();
+    std::fs::create_dir(there.join("kept")).unwrap();
+    std::fs::write(there.join("kept/more.txt"), b"more").unwrap();
+    std::fs::write(here.join("plain.txt"), b"plain").unwrap();
+    std::fs::create_dir(here.join("dir")).unwrap();
+    std::fs::write(here.join("dir/inner.txt"), b"inner").unwrap();
+    let link = |to: PathBuf, name: &str| std::os::unix::fs::symlink(to, here.join(name)).unwrap();
+    link(there.join("gone"), "gone");
+    link(there.join("secret.txt"), "file");
+    link(there.clone(), "out");
+    link(PathBuf::from("dir"), "in");
+    (inside, outside)
+}
+
+/// Everything at and under `dir`: each path with its mode, how many names it has, when it was
+/// modified and a file's bytes.
+fn held(dir: &Path) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut ahead = vec![dir.to_path_buf()];
+    while let Some(at) = ahead.pop() {
+        let meta = std::fs::symlink_metadata(&at).unwrap();
+        let body = if meta.is_file() {
+            std::fs::read(&at).unwrap()
+        } else {
+            Vec::new()
+        };
+        out.push(format!(
+            "{} {:o} {} {}.{} {body:?}",
+            at.display(),
+            meta.mode(),
+            meta.nlink(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        ));
+        if meta.is_dir() {
+            ahead.extend(std::fs::read_dir(&at).unwrap().map(|e| e.unwrap().path()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Every way `op` is given `path`, each with whether it then acts on a link that is the path's
+/// last name rather than on what the link leads to. No arm is a wildcard, so an operation added to
+/// the family does not compile until it says how it takes a path.
+fn given(op: Op, path: &str) -> Vec<(Vec<Value>, bool)> {
+    let p = || Value::str(path);
+    let how = |name: &str| Value::ctor(format!("std.fs.{name}"), Vec::new());
+    match op {
+        Op::ReadFile
+        | Op::ListDir
+        | Op::Resolved
+        | Op::FileSize
+        | Op::ModifiedMs
+        | Op::CreateDir
+        | Op::Sync
+        | Op::Canonical
+        | Op::Mode
+        | Op::Walk
+        | Op::Space => vec![(vec![p()], false)],
+        Op::Kind
+        | Op::Exists
+        | Op::Remove
+        | Op::Lock
+        | Op::Unlock
+        | Op::RemoveTree
+        | Op::ReadLink
+        | Op::Stat => vec![(vec![p()], true)],
+        Op::ReadAt => vec![(vec![p(), Value::Int(0), Value::Int(4)], false)],
+        Op::WriteFile | Op::Append => vec![(vec![p(), Value::bytes(b"x")], false)],
+        Op::TempDir => vec![(vec![p(), Value::str("t-")], false)],
+        Op::SetMode => vec![(vec![p(), mode_value(0o600)], false)],
+        Op::SetModified => vec![(vec![p(), Value::Int(1000)], false)],
+        Op::Scan => vec![(vec![p(), Value::Bool(true)], false)],
+        Op::Symlink => vec![(vec![p(), Value::str("plain.txt")], true)],
+        Op::Open => vec![
+            (vec![p(), how("ToRead")], false),
+            (vec![p(), how("ToWrite")], false),
+            (vec![p(), how("ToAppend")], false),
+            (vec![p(), how("ToCreate")], true),
+        ],
+        Op::Rename => vec![
+            (vec![p(), Value::str("moved")], true),
+            (vec![Value::str("plain.txt"), p()], true),
+        ],
+        Op::Copy => vec![
+            (vec![p(), Value::str("copied")], false),
+            (vec![Value::str("plain.txt"), p()], false),
+        ],
+        Op::Link => vec![
+            (vec![p(), Value::str("plain.txt")], true),
+            (vec![Value::str("named"), p()], true),
+        ],
+        // An open file is named by the descriptor `open` answered, and takes no path.
+        Op::ReadChunk | Op::WriteChunk | Op::Close => Vec::new(),
+    }
+}
+
+#[test]
+fn no_operation_reaches_through_a_link_out_of_the_root() {
+    let registered: Vec<String> = {
+        let dir = root();
+        registrations(&rooted(dir.path()))
+            .iter()
+            .map(|(declaration, _)| declaration.op.as_str().to_string())
+            .collect()
+    };
+    for name in &registered {
+        let op = *Op::ALL
+            .iter()
+            .find(|op| op.name() == name)
+            .unwrap_or_else(|| panic!("`{name}` is registered and is no `Op`"));
+        for way in Way::ALL {
+            for (args, itself) in given(op, way.path()) {
+                let (inside, outside) = linked_out();
+                let fs = rooted(inside.path());
+                let before = held(outside.path());
+                let answer = perform(&fs, op, "cache", &args);
+                let said = format!("`{name}` given `{}` ({way:?})", way.path());
+                if itself && way.names_the_link() {
+                    assert!(answer.is_ok(), "{said} acts on the link itself");
+                } else {
+                    let refused = answer
+                        .err()
+                        .unwrap_or_else(|| panic!("{said} was not refused"));
+                    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{said}");
+                }
+                assert_eq!(
+                    held(outside.path()),
+                    before,
+                    "{said} changed what is outside the root"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
+    for name in ["gone", "file", "out"] {
+        let (inside, outside) = linked_out();
+        let here = inside.path().canonicalize().unwrap();
+        let fs = rooted(&here);
+        let before = held(outside.path());
+        let target = std::fs::read_link(here.join(name)).unwrap();
+        let path = || Value::str(name);
+
+        assert_eq!(ctor_name(&on(&fs, Op::Kind, &[path()])), "std.fs.Symlink");
+        assert!(boolean(&on(&fs, Op::Exists, &[path()])));
+        assert_eq!(
+            stat(&fs, name).map(|found| found.kind),
+            Some("std.fs.Symlink".to_string())
+        );
+        assert_eq!(
+            maybe_str(&on(&fs, Op::ReadLink, &[path()])),
+            target.to_str().map(str::to_string)
+        );
+        assert_eq!(
+            opened(&fs, "cache", name, "ToCreate"),
+            Err("std.fs.Exists".into())
+        );
+        assert_eq!(linked(&fs, "named", name), Err("std.fs.NotAFile".into()));
+        assert_eq!(linked(&fs, name, "plain.txt"), Err("std.fs.Exists".into()));
+        assert!(!boolean(&on(
+            &fs,
+            Op::Symlink,
+            &[path(), Value::str("plain.txt")]
+        )));
+
+        assert!(boolean(&on(
+            &fs,
+            Op::Rename,
+            &[path(), Value::str("moved")]
+        )));
+        assert_eq!(std::fs::read_link(here.join("moved")).unwrap(), target);
+        std::fs::write(here.join("new.txt"), b"new").unwrap();
+        assert!(boolean(&on(
+            &fs,
+            Op::Rename,
+            &[Value::str("new.txt"), Value::str("moved")]
+        )));
+        assert_eq!(std::fs::read(here.join("moved")).unwrap(), b"new");
+
+        std::os::unix::fs::symlink(&target, here.join("again")).unwrap();
+        let remove = if name == "out" {
+            Op::RemoveTree
+        } else {
+            Op::Remove
+        };
+        assert!(boolean(&on(&fs, remove, &[Value::str("again")])));
+        assert!(std::fs::symlink_metadata(here.join("again")).is_err());
+        assert_eq!(held(outside.path()), before, "through `{name}`");
+    }
+}
+
+/// A chain of `links` links under `at`, the first named `first`, the last leading to `to`.
+fn chain(at: &Path, first: &str, links: usize, to: &str) {
+    for i in 0..links {
+        let name = if i == 0 {
+            first.to_string()
+        } else {
+            format!("{first}-{i}")
+        };
+        let next = if i + 1 == links {
+            to.to_string()
+        } else {
+            format!("{first}-{}", i + 1)
+        };
+        std::os::unix::fs::symlink(next, at.join(name)).unwrap();
+    }
+}
+
+#[test]
+fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    std::fs::create_dir(real.join("d")).unwrap();
+    std::fs::write(real.join("d/a.txt"), b"a").unwrap();
+    let read = |path: &str| maybe_bytes(&on(&fs, Op::ReadFile, &[Value::str(path)]));
+    let write = |path: &str| {
+        boolean(&on(
+            &fs,
+            Op::WriteFile,
+            &[Value::str(path), Value::bytes(b"w")],
+        ))
+    };
+
+    // A link to what is not there yet is written through, and one that names the root's own
+    // absolute path stays inside it.
+    std::os::unix::fs::symlink("d/new.txt", real.join("fresh")).unwrap();
+    assert!(write("fresh"));
+    assert_eq!(std::fs::read(real.join("d/new.txt")).unwrap(), b"w");
+    std::os::unix::fs::symlink(real.join("d"), real.join("whole")).unwrap();
+    assert_eq!(read("whole/a.txt"), Some(b"a".to_vec()));
+    std::os::unix::fs::symlink("..", real.join("d/up")).unwrap();
+    assert_eq!(read("d/up/d/a.txt"), Some(b"a".to_vec()));
+
+    chain(&real, "forty", 40, "d/a.txt");
+    assert_eq!(read("forty"), Some(b"a".to_vec()));
+    chain(&real, "more", 41, "d/a.txt");
+    chain(&real, "round", 2, "round");
+    for nowhere in ["more", "round", "round/below"] {
+        assert_eq!(read(nowhere), None, "{nowhere}");
+        assert!(!write(nowhere), "{nowhere}");
+        assert_eq!(
+            opened(&fs, "cache", nowhere, "ToWrite"),
+            Err("std.fs.NotFound".into()),
+            "{nowhere}"
+        );
+        assert_eq!(
+            ctor_name(&on(&fs, Op::Resolved, &[Value::str(nowhere)])),
+            "std.fs.Missing",
+            "{nowhere}"
+        );
+    }
+    assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"a");
+    assert_eq!(
+        ctor_name(&on(&fs, Op::Kind, &[Value::str("round")])),
+        "std.fs.Symlink"
+    );
+
+    // A link's target that steps back out of a name that is not there names nothing, as the
+    // system answers it.
+    std::os::unix::fs::symlink("absent/../d/a.txt", real.join("back")).unwrap();
+    assert_eq!(read("back"), None);
+    assert!(!write("back"));
 }
