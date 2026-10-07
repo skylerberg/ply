@@ -11,7 +11,8 @@ use std::sync::Arc;
 const CLIENT: &str = r#"
 import std.net (net)
 import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected, NoTls)
-import std.db (db, serve, server_of, stmt, transaction, is_retryable, Rows, Count, Failed, Serializable, ReadWrite)
+import std.db (db, serve, server_of, transaction, is_retryable, Serializable, ReadWrite)
+import std.sql (stmt, Rows, Count, Failed)
 
 // The driver over the same script: what a connection string asks of every connection it opens.
 pub fn told(url: String) -> Result<String, String>

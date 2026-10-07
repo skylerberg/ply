@@ -1,20 +1,21 @@
 //! An adversarial audit of the database design's central claim: that `std.db`'s in-memory twin and postgres
 //! agree.
 import std.db
+import std.sql
 import std.db (db)
 
 // --- The fixture ------------------------------------------------------------
 
-pub fn fixture() -> db::Schema = { tables: [part(), bin()] }
+pub fn fixture() -> sql::Schema = { tables: [part(), bin()] }
 
-fn part() -> db::Table =
+fn part() -> sql::Table =
   {
     name: "part",
     columns: [
-      db::column("sku", db::TText, false),
-      db::column("price", db::TNumeric(10, 4), false),
-      db::column("tag", db::TText, true),
-      db::column("n", db::TInt, true),
+      sql::column("sku", sql::TText, false),
+      sql::column("price", sql::TNumeric(10, 4), false),
+      sql::column("tag", sql::TText, true),
+      sql::column("n", sql::TInt, true),
     ],
     primary_key: ["sku"],
     unique: [{ name: "part_tag_key", columns: ["tag"] }],
@@ -22,13 +23,13 @@ fn part() -> db::Table =
     checks: [{ name: "part_price_check", expr: "price >= 0" }],
   }
 
-fn bin() -> db::Table =
+fn bin() -> sql::Table =
   {
     name: "bin",
     columns: [
-      db::column_default("id", db::TInt, false, db::DSequence("bin_id_seq")),
-      db::column("sku", db::TText, true),
-      db::column("qty", db::TInt, true),
+      sql::column_default("id", sql::TInt, false, sql::DSequence("bin_id_seq")),
+      sql::column("sku", sql::TText, true),
+      sql::column("qty", sql::TInt, true),
     ],
     primary_key: ["id"],
     unique: [],
@@ -40,54 +41,54 @@ fn bin() -> db::Table =
 
 // --- Driving the twin -------------------------------------------------------
 
-type Step = { sql: String, ps: List<db::Param> }
+type Step = { sql: String, ps: List<sql::Param> }
 
-type Run = { db: db::MemDb, out: List<db::Answer> }
+type Run = { db: db::MemDb, out: List<sql::Answer> }
 
 /// Every answer, in order, for a sequence of statements against a fresh twin.
-fn replay(steps: List<Step>) -> List<db::Answer> / {abort.raise} =
+fn replay(steps: List<Step>) -> List<sql::Answer> / {abort.raise} =
   fold(steps, { db: db::open(fixture()), out: [] }, |acc: Run, s: Step| {
-    let r = db::step(acc.db, db::stmt(s.sql), s.ps);
+    let r = db::step(acc.db, sql::stmt(s.sql), s.ps);
     { db: r.db, out: push(acc.out, r.out) }
   }).out
 
 /// The answer to the last statement of a sequence, which is what most tests below assert on.
-fn last_answer(steps: List<Step>) -> db::Answer / {abort.raise} = last_of(replay(steps))
+fn last_answer(steps: List<Step>) -> sql::Answer / {abort.raise} = last_of(replay(steps))
 
-fn last_of(xs: List<db::Answer>) -> db::Answer =
+fn last_of(xs: List<sql::Answer>) -> sql::Answer =
   match xs {
-    [] -> db::Failed(db::db_error("", "", "nothing ran")),
+    [] -> sql::Failed(sql::db_error("", "", "nothing ran")),
     [x] -> x,
     [_, ..t] -> last_of(t),
   }
 
 fn q(sql: String) -> Step = { sql: sql, ps: [] }
 
-fn insert_part(sku: String, n: db::Param) -> Step =
+fn insert_part(sku: String, n: sql::Param) -> Step =
   {
     sql: "insert into part (sku, price, tag, n) values ($1, $2, $3, $4)",
-    ps: [db::PText(sku), db::PNumeric(1m), db::PNull, n],
+    ps: [sql::PText(sku), sql::PNumeric(1m), sql::PNull, n],
   }
 
 /// The SQLSTATE, or the shape when there was no failure.
-fn shape(a: db::Answer) -> String =
+fn shape(a: sql::Answer) -> String =
   match a {
-    db::Failed(e) -> "Failed " ++ e.code,
-    db::Count(n) -> "Count " ++ int_to_string(n),
-    db::Rows(rs) -> "Rows " ++ int_to_string(len(rs)),
+    sql::Failed(e) -> "Failed " ++ e.code,
+    sql::Count(n) -> "Count " ++ int_to_string(n),
+    sql::Rows(rs) -> "Rows " ++ int_to_string(len(rs)),
   }
 
-fn skus(a: db::Answer) -> List<String> =
+fn skus(a: sql::Answer) -> List<String> =
   match a {
-    db::Rows(rs) ->
-      map(rs, |r: db::Row| match map_get(r, "sku") { Some(db::CText(s)) -> s, _ -> "?" }),
+    sql::Rows(rs) ->
+      map(rs, |r: sql::Row| match map_get(r, "sku") { Some(sql::CText(s)) -> s, _ -> "?" }),
     _ -> [],
   }
 
 // --- 1.
 test "an ORDER BY over a column with ties returns an order SQL does not promise" {
   let twelve = fold(range(0, 12), [], |acc: List<Step>, i: Int|
-    push(acc, insert_part(letter(i), db::PInt(1))));
+    push(acc, insert_part(letter(i), sql::PInt(1))));
   let answer = last_answer(push(twelve, q("select sku from part order by n limit 3")));
   assert_eq(skus(answer), ["a", "b", "c"]);
   // PostgreSQL 18.3, the same twelve inserts and the same statement.
@@ -105,10 +106,10 @@ fn letter(i: Int) -> String / {abort.raise} = string_slice("abcdefghijkl", i, i 
 // The same disagreement without a bounded sort, which rules out "it is only the top-N heapsort".
 test "an UPDATE moves a row in postgres and leaves it in place in the twin" {
   let ops = [
-    insert_part("a", db::PInt(5)),
-    insert_part("b", db::PInt(5)),
-    insert_part("c", db::PInt(5)),
-    { sql: "update part set n = $1 where sku = $2", ps: [db::PInt(5), db::PText("a")] },
+    insert_part("a", sql::PInt(5)),
+    insert_part("b", sql::PInt(5)),
+    insert_part("c", sql::PInt(5)),
+    { sql: "update part set n = $1 where sku = $2", ps: [sql::PInt(5), sql::PText("a")] },
   ];
   let loose = last_answer(push(ops, q("select sku from part order by n limit 10")));
   assert_eq(skus(loose), ["a", "b", "c"]);
@@ -122,13 +123,13 @@ test "an UPDATE moves a row in postgres and leaves it in place in the twin" {
 test "a WHERE naming a column that does not exist is refused on an empty table" {
   assert_eq(shape(last_answer([q("select sku from part where nosuch = 1")])), "Failed 42703");
   assert_eq(
-    shape(last_answer([{ sql: "delete from part where nosuch = $1", ps: [db::PInt(1)] }])),
+    shape(last_answer([{ sql: "delete from part where nosuch = $1", ps: [sql::PInt(1)] }])),
     "Failed 42703",
   );
   assert_eq(
     shape(
       last_answer([
-        { sql: "update part set n = $1 where nosuch = $2", ps: [db::PInt(1), db::PInt(1)] },
+        { sql: "update part set n = $1 where nosuch = $2", ps: [sql::PInt(1), sql::PInt(1)] },
       ]),
     ),
     "Failed 42703",
@@ -142,11 +143,11 @@ test "a WHERE naming a column that does not exist is refused on an empty table" 
 // one above will assume a row is enough to close it.
 test "a literal that will not parse at the column's type is refused when the statement is planned" {
   let with_null = last_answer([
-    insert_part("a", db::PNull),
+    insert_part("a", sql::PNull),
     q("select sku from part where n = 'abc'"),
   ]);
   let with_value = last_answer([
-    insert_part("a", db::PInt(3)),
+    insert_part("a", sql::PInt(3)),
     q("select sku from part where n = 'abc'"),
   ]);
   let empty = last_answer([q("select sku from part where n = 'abc'")]);
@@ -157,7 +158,7 @@ test "a literal that will not parse at the column's type is refused when the sta
   // The literal that *does* parse is coerced rather than refused, which is the other half of the
   // same resolution.
   assert_eq(
-    shape(last_answer([insert_part("a", db::PInt(3)), q("select sku from part where n = '3'")])),
+    shape(last_answer([insert_part("a", sql::PInt(3)), q("select sku from part where n = '3'")])),
     "Rows 1",
   )
 }
@@ -181,16 +182,16 @@ test "a numeric is assignment-cast into a bigint column, rounding half away from
   );
   assert_eq(
     shape(
-      last_answer([insert_part("z", db::PInt(2)), q("update part set n = 3.4 where sku = 'z'")]),
+      last_answer([insert_part("z", sql::PInt(2)), q("update part set n = 3.4 where sku = 'z'")]),
     ),
     "Count 1",
   )
 }
 
-fn ns(a: db::Answer) -> List<Int> =
+fn ns(a: sql::Answer) -> List<Int> =
   match a {
-    db::Rows(rs) ->
-      map(rs, |r: db::Row| match map_get(r, "n") { Some(db::CInt(n)) -> n, _ -> -999 }),
+    sql::Rows(rs) ->
+      map(rs, |r: sql::Row| match map_get(r, "n") { Some(sql::CInt(n)) -> n, _ -> -999 }),
     _ -> [],
   }
 
@@ -203,7 +204,7 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
   );
   assert_eq(
     shape(
-      last_answer([insert_part("z", db::PInt(2)), q("update part set n = '9' where sku = 'z'")]),
+      last_answer([insert_part("z", sql::PInt(2)), q("update part set n = '9' where sku = 'z'")]),
     ),
     "Count 1",
   );
@@ -224,7 +225,7 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
       last_answer([
         {
           sql: "insert into part (sku, price, n) values ($1, 1, $2)",
-          ps: [db::PText("y"), db::PText("2")],
+          ps: [sql::PText("y"), sql::PText("2")],
         },
       ]),
     ),
@@ -235,11 +236,11 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
 // The column-to-column form, which a real `UPDATE` writes constantly.
 test "an UPDATE assigns one column to another of a different type in both directions" {
   assert_eq(
-    shape(last_answer([insert_part("a", db::PInt(2)), q("update part set n = price")])),
+    shape(last_answer([insert_part("a", sql::PInt(2)), q("update part set n = price")])),
     "Count 1",
   );
   assert_eq(
-    shape(last_answer([insert_part("a", db::PInt(2)), q("update part set price = n")])),
+    shape(last_answer([insert_part("a", sql::PInt(2)), q("update part set price = n")])),
     "Count 1",
   )
 }
@@ -257,7 +258,7 @@ test "a comment and an alias are ordinary SQL; an ordinal ORDER BY is a named re
 test "a duplicate result column is refused before a row, as a value in the twin and a diagnostic in the driver" {
   assert_eq(shape(last_answer([q("select sku, sku from part")])), "Failed 0A000");
   assert_eq(
-    shape(last_answer([insert_part("a", db::PNull), q("select sku, sku from part")])),
+    shape(last_answer([insert_part("a", sql::PNull), q("select sku, sku from part")])),
     "Failed 0A000",
   );
   // Two targets aliased to one name are the same refusal.
@@ -275,8 +276,8 @@ test "a commit with no transaction open is 25P01 in both halves" {
     shape(
       db::step(
         db::commit_step(d).db,
-        db::stmt("insert into part (sku, price) values ($1, $2)"),
-        [db::PText("a"), db::PNumeric(1m)],
+        sql::stmt("insert into part (sku, price) values ($1, $2)"),
+        [sql::PText("a"), sql::PNumeric(1m)],
       ).out,
     ),
     "Count 1",
@@ -310,9 +311,9 @@ test "a nested begin that widens the access mode is 25001 in both halves" {
 test "the areas the audit could not break agree with postgres exactly" {
   // three-valued logic in `WHERE`, including `IN` and `NOT IN` over a NULL
   let ops = [
-    insert_part("a", db::PInt(1)),
-    insert_part("b", db::PNull),
-    insert_part("c", db::PInt(3)),
+    insert_part("a", sql::PInt(1)),
+    insert_part("b", sql::PNull),
+    insert_part("c", sql::PInt(3)),
     q("select sku from part where n in (1, null) order by sku"),
     q("select sku from part where n not in (1, null) order by sku"),
     q("select sku from part where n not in (3) order by sku"),
@@ -320,7 +321,7 @@ test "the areas the audit could not break agree with postgres exactly" {
     q("select sku from part where n between 1 and 3 order by sku"),
   ];
   let out = replay(ops);
-  assert_eq(map(drop_first(out, 3), |a: db::Answer| skus(a)), [
+  assert_eq(map(drop_first(out, 3), |a: sql::Answer| skus(a)), [
     ["a"],
     [],
     ["a"],
@@ -330,15 +331,15 @@ test "the areas the audit could not break agree with postgres exactly" {
 
   // `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`, and both overrides
   let nulls = replay([
-    insert_part("a", db::PInt(1)),
-    insert_part("b", db::PNull),
-    insert_part("c", db::PInt(3)),
+    insert_part("a", sql::PInt(1)),
+    insert_part("b", sql::PNull),
+    insert_part("c", sql::PInt(3)),
     q("select sku from part order by n"),
     q("select sku from part order by n desc"),
     q("select sku from part order by n asc nulls first"),
     q("select sku from part order by n desc nulls last"),
   ]);
-  assert_eq(map(drop_first(nulls, 3), |a: db::Answer| skus(a)), [
+  assert_eq(map(drop_first(nulls, 3), |a: sql::Answer| skus(a)), [
     ["a", "c", "b"],
     ["b", "c", "a"],
     ["b", "a", "c"],
@@ -353,11 +354,16 @@ test "the areas the audit could not break agree with postgres exactly" {
     q("insert into part (sku, price) values ('c', 999999.99995)"),
     q("select sku, price from part order by sku"),
   ]);
-  assert_eq(map(money, |a: db::Answer| shape(a)), ["Count 1", "Count 1", "Failed 22003", "Rows 2"]);
+  assert_eq(map(money, |a: sql::Answer| shape(a)), [
+    "Count 1",
+    "Count 1",
+    "Failed 22003",
+    "Rows 2",
+  ]);
 
   // a unique key with a NULL in it never collides, and a `CHECK` passes on unknown.
   assert_eq(
-    shape(last_answer([insert_part("a", db::PNull), insert_part("b", db::PNull)])),
+    shape(last_answer([insert_part("a", sql::PNull), insert_part("b", sql::PNull)])),
     "Count 1",
   );
 
@@ -368,7 +374,12 @@ test "the areas the audit could not break agree with postgres exactly" {
     { sql: "insert into bin (sku, qty) values ('zz', 1)", ps: [] },
     { sql: "insert into bin (sku, qty) values ('a', 2) returning id", ps: [] },
   ]);
-  assert_eq(map(aborted, |a: db::Answer| shape(a)), ["Count 1", "Rows 1", "Failed 23503", "Rows 1"])
+  assert_eq(map(aborted, |a: sql::Answer| shape(a)), [
+    "Count 1",
+    "Rows 1",
+    "Failed 23503",
+    "Rows 1",
+  ])
 }
 
 fn drop_first<a>(xs: List<a>, n: Int) -> List<a> =
