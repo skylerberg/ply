@@ -63,8 +63,20 @@ const REPEATABLE: &Rows = &[
     // A wait changes nothing outside the program: crossed twice, it waits twice.
     ("clock", &["now", "sleep"]),
     ("std.config.config", &["get", "secret"]),
-    // A socket's port is fixed while it is open, so reading it again reads the same one.
-    ("std.net.net", &["local_port"]),
+    // A question to a resolver changes nothing it asks about.
+    ("std.dns.dns", &["lookup", "reverse", "servers"]),
+    // A socket's port and its two addresses are fixed while it is open, and so is who holds its
+    // far end; its options are read as they stand, and reading them sets none.
+    (
+        "std.net.net",
+        &[
+            "local_address",
+            "local_port",
+            "options",
+            "peer_address",
+            "peer_credentials",
+        ],
+    ),
     // What the machine says of itself is read, never taken.
     (
         "std.os.os",
@@ -94,6 +106,7 @@ const REPEATABLE: &Rows = &[
     // Asking what a stream is, or how large the terminal is, changes neither.
     ("std.term.term", &["is_terminal", "size"]),
     ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
+    ("std.udp.udp", &["local_address", "options"]),
     (
         "task",
         &[

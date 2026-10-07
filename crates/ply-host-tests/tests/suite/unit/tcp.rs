@@ -169,16 +169,26 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.accept[listener] ply_host::tcp::accept",
             "std.net.net.close[conn] ply_host::tcp::close",
             "std.net.net.close[listener] ply_host::tcp::close",
+            "std.net.net.close_write[conn] ply_host::tcp::close_write",
+            "std.net.net.close_write[listener] ply_host::tcp::close_write",
             "std.net.net.connect[conn] ply_host::tcp::connect",
             "std.net.net.connect[listener] ply_host::tcp::connect",
             "std.net.net.connect_tls[conn] ply_host::tls::connect",
             "std.net.net.connect_tls[listener] ply_host::tls::connect",
+            "std.net.net.connect_to[conn] ply_host::tcp::connect_to",
+            "std.net.net.connect_to[listener] ply_host::tcp::connect_to",
+            "std.net.net.connect_unix[conn] ply_host::tcp::connect_unix",
+            "std.net.net.connect_unix[listener] ply_host::tcp::connect_unix",
             "std.net.net.handshake[conn] ply_host::tls::handshake",
             "std.net.net.handshake[listener] ply_host::tls::handshake",
             "std.net.net.listen[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] ply_host::tcp::listen",
+            "std.net.net.listen_on[conn] ply_host::tcp::listen_on",
+            "std.net.net.listen_on[listener] ply_host::tcp::listen_on",
             "std.net.net.listen_tls[conn] ply_host::tls::listen",
             "std.net.net.listen_tls[listener] ply_host::tls::listen",
+            "std.net.net.listen_unix[conn] ply_host::tcp::listen_unix",
+            "std.net.net.listen_unix[listener] ply_host::tcp::listen_unix",
             "std.net.net.local_port[conn] ply_host::tcp::local_port",
             "std.net.net.local_port[listener] ply_host::tcp::local_port",
             "std.net.net.recv[conn] ply_host::tcp::recv",
@@ -187,6 +197,12 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.send[listener] ply_host::tcp::send",
             "std.net.net.send_secret[conn] ply_host::tcp::send_secret",
             "std.net.net.send_secret[listener] ply_host::tcp::send_secret",
+            "std.net.net.serve_tls[conn] ply_host::tls::serve",
+            "std.net.net.serve_tls[listener] ply_host::tls::serve",
+            "std.net.net.set_option[conn] ply_host::tcp::set_option",
+            "std.net.net.set_option[listener] ply_host::tcp::set_option",
+            "std.net.net.start_tls[conn] ply_host::tls::start",
+            "std.net.net.start_tls[listener] ply_host::tls::start",
         ]
     );
 }
@@ -217,15 +233,22 @@ fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     assert!(script.listing().rows.iter().all(|r| !r.blocking));
 }
 
-/// Reading a socket's port changes nothing; every other operation opens, moves or closes bytes.
+/// Reading what a socket is changes nothing; every other operation opens, moves, tunes or closes.
 #[test]
-fn only_reading_a_port_is_repeatable() {
+fn only_reading_what_a_socket_is_is_repeatable() {
+    let reads = [
+        Op::LocalPort,
+        Op::LocalAddress,
+        Op::PeerAddress,
+        Op::PeerCredentials,
+        Op::Options,
+    ];
     for net in [
         Arc::new(TcpHost::new()) as Arc<dyn Net>,
         Arc::new(SimNet::new(Vec::new())),
     ] {
         for op in Op::ALL {
-            let expected = if op == Op::LocalPort {
+            let expected = if reads.contains(&op) {
                 Linearity::Repeatable
             } else {
                 Linearity::AtMostOnce
@@ -455,6 +478,17 @@ fn a_credential_goes_out_whole_between_its_frame_and_only_in_an_encoding_it_name
     let refused = send("rot13").expect_err("no such encoding");
     assert_eq!(refused.code, codes::RUNTIME_ERROR);
     assert!(!format!("{refused:#?}").contains("hunter2"), "{refused:#?}");
+    let sent = net.sent(conn);
+    perform(
+        &binding,
+        net.as_ref(),
+        Op::CloseWrite,
+        "conn",
+        vec![Value::Int(conn)],
+    )
+    .expect("this end stops sending");
+    assert_eq!(send("base64").expect("answered"), Value::Bool(false));
+    assert_eq!(net.sent(conn), sent);
 }
 
 #[test]

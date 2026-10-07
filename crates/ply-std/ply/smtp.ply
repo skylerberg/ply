@@ -1,0 +1,4411 @@
+//! Sending mail: an SMTP client (RFC 5321), as an engine over bytes and as sessions over
+//! `std.net`.
+//!
+//! The protocol is an `Engine`, which is a value. `start` makes one for a connection just
+//! opened, and `feed` gives it what the server sent and answers a `Turn`: what to write back,
+//! and whether to wait for more, start TLS, take a command or close. It reads no socket and no
+//! clock, so an exchange is data, and a test is a server's lines and the lines the client must
+//! answer them with. The engine greets with `EHLO`, and with `HELO` only where a caller asked
+//! for that fallback; reads what the server offers into `Capabilities`; upgrades by `STARTTLS`
+//! (RFC 3207); proves a credential by `AUTH` (RFC 4954) under `std.sasl`'s mechanisms; and
+//! sends a message as `MAIL FROM`, a `RCPT TO` for each recipient and `DATA`, all at once where
+//! the server offers `PIPELINING`, after a `RSET` for every message but a session's first. A
+//! `Reply` is a `Code`, its lines, and the enhanced `Status` (RFC 3463) its text opens with.
+//! What a server may make a client hold is a `Limits`, which `config` takes.
+//!
+//! A `Config` is what a caller requires. TLS is required unless it says otherwise: over a
+//! connection that starts in the clear the engine asks for `STARTTLS`, refuses a server that
+//! does not offer or grant it, and after the handshake forgets everything the server said
+//! before it. Bytes that arrive between the server's leave and the handshake are refused
+//! (`Injected`), never read as if TLS had carried them. A mechanism that sends the credential
+//! itself is used only over TLS unless the caller says `PasswordInClear`. No credential is in
+//! a refusal, in what a turn or an engine shows, or in the lines a session keeps, and none is
+//! ever a plain value: what the client says in an `AUTH` exchange is a `Veiled` wire, sealed,
+//! which a session writes with `net.send_secret`.
+//!
+//! A message is bytes and an `Envelope`, both `std.email`'s: `send` writes a `Draft`, `relay`
+//! sends a `Message` on as the bytes it was read from, and `submit` takes the two as they are.
+//! Nothing is repaired. Bytes that are not CRLF lines of at most 998 octets are refused, and so
+//! are a message past the server's `SIZE`, one with a byte past 127 for a server without
+//! `8BITMIME`, and one whose addresses or header need `SMTPUTF8` for a server without it. The
+//! answer is a `Delivery` for each recipient, `Accepted`, `Temporary` or `Permanent` with the
+//! command refused and the server's reply, so a message one recipient did not get is never a
+//! bare success.
+//!
+//! A `Session` is an engine on a `std.net` connection, under the caller's label: `open_tls`
+//! over TLS from the first byte (port 465), `open` over a connection that starts in the clear
+//! (ports 587 and 25) and is upgraded by `net.start_tls`, which verifies the server as the host
+//! named; `with_session_tls` and `with_session` hold theirs for the body alone and close it
+//! however the body ends. A wait for a reply lasts what `Timeouts` gives its phase, by default
+//! RFC 5321 §4.5.3.2's, as one deadline on the clock that each read is given what is left of,
+//! held to `std.task`'s deadline around the call where that is earlier: a `task::timeout`
+//! around a session bounds it whole, and a caller with none says so with `task::unbounded`.
+//!
+//! A queue with its retries, a domain's mail servers, DKIM signatures and `BDAT` are not here.
+
+import std.base64 (base64_decode, base64_encode)
+import std.bytes
+import std.bytes (int_of_ascii, peek)
+import std.dns
+import std.email
+import std.email (Address, Draft, Envelope, Message, NullPath, ReturnTo, email)
+import std.gen
+import std.gen (Gen)
+import std.http (max_reads, read_size)
+import std.ip
+import std.laws (inverse, round_trip)
+import std.list
+import std.list (all, any, concat, contains, find, first)
+import std.net
+import std.net (net, send_all)
+import std.random (entropy, nonce)
+import std.result (result_is_ok, result_map, result_ok)
+import std.sasl
+import std.sasl (Credential, Exchange, Mechanism, sasl)
+import std.show (show)
+import std.string
+import std.string (ascii_trim, ascii_upper, join)
+import std.task
+import std.time (after, millis, time)
+
+// --- Reply codes --------------------------------------------------------------
+
+/// The three digits a reply opens with (RFC 5321 §4.2), `250` or `550`. The first says what
+/// became of the command, and is all a client may decide by: the other two tell a person more.
+pub opaque type Code = | Code(Int)
+
+show for Code by code_text
+
+gen for Code by codes
+
+fn code_text(c: Code) -> String = match c { Code(n) -> int_to_string(n) }
+
+/// The code `n` is; `None` unless it is three digits of which the first is 2, 3, 4 or 5.
+pub fn code(n: Int) -> Option<Code> = if n >= 200 && n <= 599 { Some(Code(n)) } else { None }
+
+/// A code as a number, `250`.
+pub fn number(c: Code) -> Int = match c { Code(n) -> n }
+
+/// What a code's first digit says.
+pub type Class =
+  /// 2: the command was done.
+  | Completed
+  /// 3: the server waits for the rest of the command.
+  | Intermediate
+  /// 4: not this time. The same command may be taken later.
+  | Transient
+  /// 5: no, and not later either.
+  | Rejected
+
+/// What a code's first digit says.
+pub fn class_of(c: Code) -> Class =
+  match c {
+    Code(n) -> if n < 300 { Completed }
+    else if n < 400 { Intermediate }
+    else if n < 500 { Transient }
+    else { Rejected },
+  }
+
+/// The codes RFC 5321 and its extensions name, and any other of the right shape.
+pub fn codes() -> Gen<Code> =
+  gen::one_of([
+    gen::map(
+      gen::elements([
+        220,
+        221,
+        235,
+        250,
+        251,
+        334,
+        354,
+        421,
+        450,
+        451,
+        452,
+        454,
+        500,
+        502,
+        503,
+        530,
+        535,
+        550,
+        552,
+        554,
+      ]),
+      |n: Int| Code(n),
+    ),
+    gen::map(gen::int_between(200, 599), |n: Int| Code(n)),
+  ])
+
+/// An enhanced status code (RFC 3463), `5.1.1`: a class that is 2, 4 or 5 as a reply code's
+/// first digit is, a subject and a detail. Where a reply code says how the command fared, this
+/// says why, in terms a program can act on: `x.1.1` is a mailbox that does not exist, `x.2.2`
+/// one that is full, `x.7.1` a delivery not authorized.
+pub opaque type Status = | Status(Int, Int, Int)
+
+show for Status by status_text
+
+gen for Status by statuses
+
+fn status_text(s: Status) -> String =
+  match s {
+    Status(kind, subject, detail) ->
+      int_to_string(kind) ++ "." ++ int_to_string(subject) ++ "." ++ int_to_string(detail),
+  }
+
+/// The status of these three numbers; `None` unless the class is 2, 4 or 5 and the subject and
+/// the detail are each from 0 to 999.
+pub fn status(kind: Int, subject: Int, detail: Int) -> Option<Status> =
+  if (kind == 2 || kind == 4 || kind == 5) && subject >= 0 && subject <= 999 && detail >= 0
+      && detail <= 999 { Some(Status(kind, subject, detail)) }
+  else { None }
+
+/// A status's class, subject and detail: `[5, 1, 1]` of `5.1.1`.
+pub fn status_parts(s: Status) -> List<Int> =
+  match s { Status(kind, subject, detail) -> [kind, subject, detail] }
+
+/// The status `text` is, three numbers between dots with no sign and no blank; `None` for
+/// anything else.
+pub fn read_status(text: String) -> Option<Status> / {abort.raise} =
+  match map(string_split(text, "."), |part: String|
+      if string_len(part) < 1 || string_len(part) > 3 { None }
+      else { int_of_ascii(bytes_of_string(part)) }) {
+    [Some(kind), Some(subject), Some(detail)] -> status(kind, subject, detail),
+    _ -> None,
+  }
+
+/// Statuses of every class.
+pub fn statuses() -> Gen<Status> =
+  gen::map2(
+    gen::elements([2, 4, 5]),
+    gen::map2(gen::int_between(0, 999), gen::int_between(0, 999), |subject: Int, detail: Int|
+      [subject, detail]),
+    |kind: Int, rest: List<Int>| Status(kind, list::at_or(rest, 0, 0), list::at_or(rest, 1, 0)),
+  )
+
+// --- Replies ------------------------------------------------------------------
+
+/// What a server says to a command: a code, and one or more lines of text for a person.
+///
+/// A line holds no line break and no control character but a tab. Text a server sent that is
+/// no UTF-8, or that holds a control character, is read with U+FFFD in its place, so that what
+/// a reply says can be logged as it is.
+pub opaque type Reply = new {
+  code: Code,
+  /// The text of each line, without its code. A reply has at least one, which may be empty.
+  lines: List<String>,
+}
+
+gen for Reply by replies
+
+/// The reply of this code and these lines; `None` for no lines, and for a line that holds a
+/// control character other than a tab.
+pub fn reply(c: Code, texts: List<String>) -> Option<Reply> =
+  if len(texts) == 0 || !all(texts, is_text) { None } else { Some({ code: c, lines: texts }) }
+
+fn is_text(line: String) -> Bool = all(string_chars(line), |c: Char| !is_control(c))
+
+fn is_control(c: Char) -> Bool = (int_of_char(c) < 32 && c != '\t') || int_of_char(c) == 127
+
+/// A reply's lines as one text, a line feed between them.
+pub fn reply_text(r: Reply) -> String = join(r.lines, "\n")
+
+/// The enhanced status a reply's text opens with, where it opens with one of the code's own
+/// class; `None` otherwise. A server that offers `ENHANCEDSTATUSCODES` opens every reply to a
+/// command after `EHLO` with one.
+pub fn enhanced(r: Reply) -> Option<Status> / {abort.raise} =
+  match first(string_split(list::at_or(r.lines, 0, ""), " ")) {
+    None -> None,
+    Some(word) -> match read_status(word) {
+      Some(Status(kind, subject, detail)) -> if kind == number(r.code) / 100 {
+        Some(Status(kind, subject, detail))
+      } else { None },
+      None -> None,
+    },
+  }
+
+/// A reply as a server writes it: each line after its code, a hyphen between them on every line
+/// but the last, where a space stands, or nothing before an empty text.
+pub fn render_reply(r: Reply) -> Bytes = {
+  let digits = code_text(r.code);
+  let end = len(r.lines) - 1;
+  bytes_of_string(
+    join(
+        map(list::enumerate(r.lines), |l: { index: Int, value: String }|
+          if l.index < end { digits ++ "-" ++ l.value }
+          else if l.value == "" { digits }
+          else { digits ++ " " ++ l.value }),
+        "\r\n",
+      )
+      ++ "\r\n",
+  )
+}
+
+/// Replies of one line and of several, some of them empty, and some opening with a status.
+pub fn replies() -> Gen<Reply> =
+  gen::map2(
+    codes(),
+    gen::and_then(gen::int_between(1, 4), |n: Int|
+      gen::list_of_length(
+        gen::map2(
+          gen::option_of(statuses()),
+          gen::list_of(
+            gen::elements([
+              "OK",
+              "mx.example",
+              "PIPELINING",
+              "8BITMIME",
+              "SIZE",
+              "10240000",
+              "AUTH",
+              "PLAIN",
+              "caf\u{e9}",
+              "<a@b.example>",
+              "-",
+              "\t",
+              "Queued",
+              "as",
+              "4F2A",
+            ]),
+            4,
+          ),
+          |opening: Option<Status>, words: List<String>|
+            join(concat(match opening { Some(s) -> [status_text(s)], None -> [] }, words), " "),
+        ),
+        n,
+      )),
+    |c: Code, texts: List<String>| { code: c, lines: texts },
+  )
+
+// --- Limits and deadlines -----------------------------------------------------
+
+/// What a server may make a client hold and do.
+pub type Limits = new {
+  /// Bytes in one line of a reply, its line break among them.
+  line: Int,
+  /// Bytes in one whole reply, over however many lines.
+  reply: Int,
+  /// The most iterations of its hash a SCRAM server may ask for.
+  scram_iterations: Int,
+  /// Lines of its exchange a session keeps for `transcript`, the newest; at `0`, none.
+  transcript: Int,
+}
+
+/// 4 KiB a line, where RFC 5321 has a server send 512 bytes at most, 64 KiB a reply, a million
+/// iterations, and no transcript.
+pub fn default_limits() -> Limits =
+  { line: 4096, reply: 65536, scram_iterations: 1000000, transcript: 0 }
+
+/// What a session waits for, which a deadline and a refusal are named by.
+pub type Phase =
+  /// The server's first word, before the client says anything.
+  | Greeting
+  /// The answer to `EHLO` or `HELO`.
+  | Hello
+  /// The answer to `STARTTLS`.
+  | StartTls
+  /// The TLS handshake.
+  | Handshake
+  /// An answer in an `AUTH` exchange.
+  | Auth
+  /// The answer to `RSET`.
+  | Reset
+  /// The answer to `MAIL FROM`.
+  | Mail
+  /// The answer to a `RCPT TO`.
+  | Rcpt
+  /// The answer to `DATA`: leave to send the message.
+  | Data
+  /// The answer to the message, after the dot that ends it.
+  | Body
+  /// The answer to `QUIT`.
+  | Quit
+
+/// How long, in milliseconds, each wait may last.
+pub type Timeouts = new {
+  /// Reaching the server, and a TLS handshake with it.
+  connect_ms: Int,
+  /// The server's first word.
+  greeting_ms: Int,
+  /// The answer to `MAIL FROM`.
+  mail_ms: Int,
+  /// The answer to one `RCPT TO`.
+  rcpt_ms: Int,
+  /// The answer to `DATA`.
+  data_ms: Int,
+  /// One write of a command or of a stretch of the message.
+  block_ms: Int,
+  /// The answer to the message, which a server gives only once it has taken responsibility for
+  /// it.
+  end_ms: Int,
+  /// The answer to `EHLO`, `STARTTLS`, `RSET` and each step of `AUTH`.
+  other_ms: Int,
+  /// The answer to `QUIT`.
+  quit_ms: Int,
+}
+
+/// The waits RFC 5321 §4.5.3.2 has a client allow at least: five minutes for the greeting, for
+/// `MAIL` and for each `RCPT`, two for `DATA`, three for each write, ten for the answer to the
+/// message. It names none for the rest: five minutes here, a minute to connect, and thirty
+/// seconds for the answer to `QUIT`, which nothing depends on.
+pub fn default_timeouts() -> Timeouts =
+  {
+    connect_ms: 60000,
+    greeting_ms: 300000,
+    mail_ms: 300000,
+    rcpt_ms: 300000,
+    data_ms: 120000,
+    block_ms: 180000,
+    end_ms: 600000,
+    other_ms: 300000,
+    quit_ms: 30000,
+  }
+
+/// How long the wait for a phase's answer may last.
+pub fn timeout(t: Timeouts, p: Phase) -> Int =
+  match p {
+    Greeting -> t.greeting_ms,
+    Handshake -> t.connect_ms,
+    Mail -> t.mail_ms,
+    Rcpt -> t.rcpt_ms,
+    Data -> t.data_ms,
+    Body -> t.end_ms,
+    Quit -> t.quit_ms,
+    _ -> t.other_ms,
+  }
+
+// --- Refusals -----------------------------------------------------------------
+
+/// An extension a message cannot travel without.
+pub type Need =
+  /// `8BITMIME` (RFC 6152): the message holds a byte past 127.
+  | EightBitMime
+  /// `SMTPUTF8` (RFC 6531): an address of the envelope, or the message's header, is outside
+  /// ASCII.
+  | SmtpUtf8
+  /// `DSN` (RFC 3461): delivery reports were asked for.
+  | Notices
+
+/// Why a session does not go on, or a message is not sent.
+pub type Refusal =
+  /// The name to greet the server by is neither a domain nor an address literal.
+  | BadClientName
+  /// The server was not reached.
+  | Unreachable
+  /// The connection stopped taking bytes.
+  | NotSent(Phase)
+  /// No answer came within the phase's wait.
+  | TimedOut(Phase)
+  /// The server closed the connection before it answered. In `Body` the message was sent
+  /// whole and may or may not have been taken.
+  | Closed(Phase)
+  /// A reply's line is longer than `Limits.line`.
+  | LineTooLong
+  /// A reply is longer than `Limits.reply`.
+  | ReplyTooLarge
+  /// A line that is not three digits of a reply code and then a space, a hyphen or its end; or
+  /// one that ends with a line feed alone, or holds a carriage return.
+  | BadLine
+  /// A reply whose lines do not all open with one code.
+  | MixedCodes
+  /// The server said more than the commands sent to it asked for.
+  | Unsolicited
+  /// Bytes arrived between the server's leave to start TLS and the handshake. What is read
+  /// before the handshake was not sent by the server the handshake proves, so nothing of it is
+  /// kept (RFC 3207 §4.2).
+  | Injected
+  /// An answer the phase has no place for: a greeting that is not 220, `EHLO` refused, `STARTTLS`
+  /// refused where TLS is required.
+  | Unexpected(Phase, Reply)
+  /// TLS is required and the server does not offer `STARTTLS`.
+  | NoTls
+  /// The TLS handshake failed, for the reason `std.net` gives: the server is not the one named,
+  /// the two agree on nothing, or it went away.
+  | HandshakeFailed(net::Refusal)
+  /// The server offers no mechanism the credential and the configuration both take, or no
+  /// `AUTH` at all.
+  | NoMechanism
+  /// The only mechanisms both sides take send the credential itself, the connection is not TLS,
+  /// and `PasswordInClear` was not asked for.
+  | InClear(Mechanism)
+  /// The server refused the credential.
+  | Denied(Reply)
+  /// The exchange went wrong on the server's side of it, as `std.sasl` says how.
+  | BadAuth(sasl::Why)
+  /// A command for a session that is waiting for an answer, or is over.
+  | NotReady
+  /// An envelope to no one.
+  | NoRecipients
+  /// The message is this many bytes, and the server takes at most that many.
+  | TooLarge(Int, Int)
+  /// The message needs an extension the server does not offer.
+  | Unoffered(Need)
+  /// The message is not lines that each end with CRLF and hold at most 998 octets, at the byte
+  /// and for the reason `std.email` gives.
+  | Unsendable(email::Refusal)
+  /// The message holds a NUL, at this byte.
+  | NulByte(Int)
+  /// The message's last line has no line break.
+  | Unterminated
+  /// An envelope identifier that is empty, longer than 100 characters, or not printable ASCII.
+  | BadEnvelopeId
+  /// The draft has no bytes, as `std.email` says why.
+  | Unwritable(email::Unwritable)
+  /// The message names no envelope, as `std.email` says why.
+  | Unreadable(email::Refusal)
+
+/// What this module raises where it refuses.
+pub effect smtp {
+  /// The session does not go on, or the message is not sent.
+  raise refused(why: Refusal)
+}
+
+/// Whether the session a refusal came from can still send: `true` for a message refused before
+/// anything of it was sent, `false` once the exchange itself went wrong.
+pub fn usable(why: Refusal) -> Bool =
+  match why {
+    NoRecipients -> true,
+    TooLarge(_, _) -> true,
+    Unoffered(_) -> true,
+    Unsendable(_) -> true,
+    NulByte(_) -> true,
+    Unterminated -> true,
+    BadEnvelopeId -> true,
+    Unwritable(_) -> true,
+    Unreadable(_) -> true,
+    _ -> false,
+  }
+
+// --- Reading replies ----------------------------------------------------------
+
+/// What has been read of a reply that is not whole yet: its code, below zero before the first
+/// line, its lines, and their bytes.
+type Partial = { digits: Int, lines: List<String>, size: Int }
+
+fn nothing_read() -> Partial = { digits: -1, lines: [], size: 0 }
+
+/// What reading at a buffer found: a whole reply or none, what was read of the next one, and
+/// where the unread bytes start.
+type Taken = { whole: Option<Reply>, partial: Partial, at: Int }
+
+fn printable(raw: Bytes) -> String =
+  string_of_chars(
+    map(string_chars(string_of_bytes_lossy(raw)), |c: Char|
+      if is_control(c) { '\u{fffd}' } else { c }),
+  )
+
+/// The reply that ends in `held` at or after `at`, if one does. `left` bounds the rounds: each
+/// takes a line.
+fn take(
+  held: Bytes,
+  at: Int,
+  p: Partial,
+  limits: Limits,
+  left: Int,
+) -> Taken / {smtp.refused, abort.raise} =
+  match bytes_index_of_from(held, b"\n", at) {
+    None -> if bytes_len(held) - at > limits.line { smtp.refused(LineTooLong) }
+    else if p.size + bytes_len(held) - at > limits.reply { smtp.refused(ReplyTooLarge) }
+    else { { whole: None, partial: p, at: at } },
+    Some(end) -> {
+      let size = p.size + end + 1 - at;
+      if end + 1 - at > limits.line { smtp.refused(LineTooLong) }
+      else if size > limits.reply { smtp.refused(ReplyTooLarge) }
+      else if end == at || peek(held, end - 1) != b'\r' { smtp.refused(BadLine) } else {
+        let line = bytes_slice(held, at, end - 1);
+        let n = bytes_len(line);
+        let digits = match int_of_ascii(bytes_slice(line, 0, min(n, 3))) {
+          Some(d) -> if n >= 3 && d >= 200 && d <= 599 { d } else { -1 },
+          None -> -1,
+        };
+        let mark = peek(line, 3);
+        if digits < 0 || (n > 3 && mark != b' ' && mark != b'-') { smtp.refused(BadLine) }
+        else if bytes_index_of_byte(line, b'\r') != None { smtp.refused(BadLine) }
+        else if p.digits >= 0 && p.digits != digits { smtp.refused(MixedCodes) } else {
+          let texts = push(p.lines, printable(bytes_slice(line, min(n, 4), n)));
+          if mark != b'-' {
+            {
+              whole: Some({ code: Code(digits), lines: texts }),
+              partial: nothing_read(),
+              at: end + 1,
+            }
+          } else if left <= 0 { smtp.refused(ReplyTooLarge) } else {
+            take(held, end + 1, { digits: digits, lines: texts, size: size }, limits, left - 1)
+          }
+        }
+      }
+    },
+  }
+
+/// The reply `data` is, raising `smtp.refused` where `parse_reply` answers `Err`: one whole
+/// reply as RFC 5321 §4.2 has a server write it, each line ending with CRLF, and nothing after
+/// it.
+pub fn read_reply(data: Bytes, limits: Limits) -> Reply / {smtp.refused, abort.raise} = {
+  let t = take(data, 0, nothing_read(), limits, bytes_len(data));
+  match t.whole {
+    Some(r) -> if t.at == bytes_len(data) { r } else { smtp.refused(Unsolicited) },
+    None -> smtp.refused(BadLine),
+  }
+}
+
+/// The reply `data` is, or why it is none: a line or a reply past its limit, a line that is no
+/// reply's, lines of two codes, or bytes after the reply's end.
+pub fn parse_reply(data: Bytes, limits: Limits) -> Result<Reply, Refusal> / {abort.raise} =
+  try { read_reply(data, limits) }
+
+// --- What a server offers -----------------------------------------------------
+
+/// What a server says of the size of message it takes (RFC 1870).
+pub type Size =
+  /// Nothing: it does not offer `SIZE`.
+  | Unsaid
+  /// That it reads the size a client declares, and names no bound.
+  | Unbounded
+  /// That it takes this many bytes at most.
+  | AtMost(Int)
+
+/// An extension this module has no use for: its keyword in upper case, and its parameters as
+/// written.
+pub type Extension = { keyword: String, params: List<String> }
+
+/// What a server offered in answer to `EHLO`.
+pub type Capabilities = new {
+  /// The first line of its answer: the name it goes by, and whatever it says after it.
+  greeting: String,
+  /// `STARTTLS` (RFC 3207): it will upgrade the connection to TLS.
+  starttls: Bool,
+  /// `AUTH` (RFC 4954): the mechanisms it takes that `std.sasl` answers, in its order.
+  auth: List<Mechanism>,
+  /// The mechanisms it takes that `std.sasl` does not answer, by name in upper case.
+  unanswered: List<String>,
+  /// `PIPELINING` (RFC 2920): it reads commands sent before their answers.
+  pipelining: Bool,
+  /// `8BITMIME` (RFC 6152): it takes a message with bytes past 127.
+  eight_bit: Bool,
+  /// `SMTPUTF8` (RFC 6531): it takes addresses and headers outside ASCII.
+  utf8: Bool,
+  /// `SIZE` (RFC 1870).
+  size: Size,
+  /// `CHUNKING` (RFC 3030): it takes a message by `BDAT`. Not used here.
+  chunking: Bool,
+  /// `DSN` (RFC 3461): it takes requests for delivery reports.
+  dsn: Bool,
+  /// `ENHANCEDSTATUSCODES` (RFC 2034): its replies open with a status `enhanced` reads.
+  enhanced: Bool,
+  /// Everything else it offered, in its order.
+  others: List<Extension>,
+}
+
+/// A server that offers nothing: what `HELO` leaves a client knowing.
+pub fn nothing_offered(greeting: String) -> Capabilities =
+  {
+    greeting: greeting,
+    starttls: false,
+    auth: [],
+    unanswered: [],
+    pipelining: false,
+    eight_bit: false,
+    utf8: false,
+    size: Unsaid,
+    chunking: false,
+    dsn: false,
+    enhanced: false,
+    others: [],
+  }
+
+/// What the answer to `EHLO` offers: a keyword a line after the first, in any case, and its
+/// parameters after spaces. `AUTH=` before the mechanisms, which old servers wrote for old
+/// clients, is read as `AUTH` is. A `SIZE` whose parameter is no number names no bound.
+pub fn capabilities(r: Reply) -> Capabilities / {abort.raise} =
+  fold(
+    list::drop(r.lines, 1),
+    nothing_offered(list::at_or(r.lines, 0, "")),
+    |c: Capabilities, line: String| {
+      let words = filter(string_split(line, " "), |w: String| w != "");
+      let keyword = ascii_upper(list::at_or(words, 0, ""));
+      let params = list::drop(words, 1);
+      if string_starts_with(keyword, "AUTH=") {
+        mechanisms_in(c, list::prepend(string_slice(keyword, 5, string_len(keyword)), params))
+      } else {
+        match keyword {
+          "" -> c,
+          "STARTTLS" -> { ..c, starttls: true },
+          "AUTH" -> mechanisms_in(c, params),
+          "PIPELINING" -> { ..c, pipelining: true },
+          "8BITMIME" -> { ..c, eight_bit: true },
+          "SMTPUTF8" -> { ..c, utf8: true },
+          "SIZE" -> { ..c, size: bound_of(params) },
+          "CHUNKING" -> { ..c, chunking: true },
+          "DSN" -> { ..c, dsn: true },
+          "ENHANCEDSTATUSCODES" -> { ..c, enhanced: true },
+          _ -> { ..c, others: push(c.others, { keyword: keyword, params: params }) },
+        }
+      }
+    },
+  )
+
+/// `c` with the mechanisms `offered` names.
+fn mechanisms_in(c: Capabilities, offered: List<String>) -> Capabilities =
+  fold(filter(offered, |named: String| named != ""), c, |held: Capabilities, named: String|
+    match sasl::mechanism_named(named) {
+      Some(m) -> { ..held, auth: list::push_unique(held.auth, m) },
+      None -> { ..held, unanswered: list::push_unique(held.unanswered, ascii_upper(named)) },
+    })
+
+/// The bound `SIZE`'s parameters name.
+fn bound_of(params: List<String>) -> Size / {abort.raise} =
+  match first(params) {
+    None -> Unbounded,
+    Some(digits) -> match int_of_ascii(bytes_of_string(digits)) {
+      Some(most) -> if most > 0 { AtMost(most) } else { Unbounded },
+      None -> Unbounded,
+    },
+  }
+
+// --- The message as it travels ------------------------------------------------
+
+/// `body` with a dot before every line that opens with one, as RFC 5321 §4.5.2 has a client
+/// send it, so that no line of a message is the lone dot that ends one.
+pub fn stuff(body: Bytes) -> Bytes / {abort.raise} = {
+  let inner = bytes::replace(body, b"\r\n.", b"\r\n..");
+  if peek(inner, 0) == b'.' { bytes_concat(b".", inner) } else { inner }
+}
+
+/// `data` without the dot `stuff` put before each line that opens with one: what a server
+/// keeps of what it read up to the lone dot.
+pub fn unstuff(data: Bytes) -> Bytes / {abort.raise} = {
+  let inner = bytes::replace(data, b"\r\n.", b"\r\n");
+  if peek(data, 0) == b'.' { bytes_slice(inner, 1, bytes_len(inner)) } else { inner }
+}
+
+/// What keeps `data` from travelling as a message: a line feed or a carriage return that is not
+/// half of a CRLF, a line past 998 octets, a NUL, or a last line with no line break. None is
+/// repaired, since a repair changes what a signature was taken over, and a line break one
+/// server reads and another does not is how a second message is smuggled inside a first.
+pub fn flaw(data: Bytes) -> Option<Refusal> / {abort.raise} = {
+  let n = bytes_len(data);
+  match first(email::line_flaws(data)) {
+    Some(found) -> Some(Unsendable(found)),
+    None -> match bytes_index_of_byte(data, 0) {
+      Some(at) -> Some(NulByte(at)),
+      None -> if n > 0 && peek(data, n - 1) != b'\n' { Some(Unterminated) } else { None },
+    },
+  }
+}
+
+/// A message as it follows `DATA`: stuffed, and then the lone dot.
+fn payload_of(data: Bytes) -> Bytes / {abort.raise} = bytes_concat(stuff(data), b".\r\n")
+
+// --- Delivery reports ---------------------------------------------------------
+
+/// How much of a message a report of its failure returns (RFC 3461 §4.3).
+pub type Return =
+  /// The whole message.
+  | Full
+  /// Its header alone.
+  | Headers
+
+/// An event a sender is told of (RFC 3461 §4.1).
+pub type Event =
+  /// The message reached the recipient's mailbox, or left for where no reports are made.
+  | Delivered
+  /// It could not be delivered.
+  | Failed
+  /// It is late, and still being tried.
+  | Delayed
+
+/// What a message asks of the servers that carry it, by RFC 3461's `DSN` extension. A server
+/// that does not offer the extension is not sent a message that asks anything.
+pub type Dsn = new {
+  /// How much of the message a report returns; the server's choice where `None`.
+  ret: Option<Return>,
+  /// An identifier of the sender's own, returned in each report: printable ASCII, 100
+  /// characters at most.
+  envelope_id: Option<String>,
+  /// The events to report: `Some([])` for none at all, and the server's choice, which is
+  /// failure and often delay, where `None`.
+  notify: Option<List<Event>>,
+  /// Whether to name each recipient to the servers as it was first addressed, so that a report
+  /// names it so after it was rewritten on the way.
+  original: Bool,
+}
+
+/// Nothing asked: reports are made as the servers choose.
+pub fn no_dsn() -> Dsn = { ret: None, envelope_id: None, notify: None, original: false }
+
+fn asks(d: Dsn) -> Bool = d != no_dsn()
+
+/// `text` as RFC 3461 §4 carries it in a parameter: printable ASCII as it is, but for `+` and
+/// `=`, and every other byte as `+` and two hex digits.
+pub fn xtext(text: String) -> String / {abort.raise} = {
+  let raw = bytes_of_string(text);
+  join(
+    map(range(0, bytes_len(raw)), |i: Int| {
+      let b = peek(raw, i);
+      if b > 32 && b < 127 && b != b'+' && b != b'=' { string_of_bytes(byte_of_int(b)) }
+      else { "+" ++ upper_hex(b) }
+    }),
+    "",
+  )
+}
+
+/// The two upper-case hex digits of a byte.
+fn upper_hex(b: Int) -> String / {abort.raise} = ascii_upper(bytes::hex_of(byte_of_int(b)))
+
+/// An address as the envelope carries it: in ASCII, its domain's A-labels, wherever its local
+/// part is ASCII, so that only a local part outside ASCII needs `SMTPUTF8`.
+fn path_text(a: Address) -> String =
+  match email::ascii_text(a) { Some(text) -> text, None -> show(a) }
+
+/// An address as `ORCPT` names it: `rfc822;` and its text in `xtext`, or under RFC 6533
+/// `utf-8;` and its text with `\x{..}` for what a parameter cannot hold, where it is outside
+/// ASCII.
+fn original_of(a: Address) -> String / {abort.raise} =
+  if email::is_ascii(a) { "rfc822;" ++ xtext(path_text(a)) } else {
+    "utf-8;"
+      ++ join(
+        map(string_chars(show(a)), |c: Char|
+          if int_of_char(c) <= 32 || c == '\\' || c == '+' || c == '=' || int_of_char(c) == 127 {
+            "\\x{" ++ upper_hex(int_of_char(c)) ++ "}"
+          } else { string_of_chars([c]) }),
+        "",
+      )
+  }
+
+fn event_word(e: Event) -> String =
+  match e { Delivered -> "SUCCESS", Failed -> "FAILURE", Delayed -> "DELAY" }
+
+/// The parameters `asked` adds to `MAIL FROM`.
+fn mail_asks(asked: Dsn) -> String / {abort.raise} =
+  (match asked.ret { Some(Full) -> " RET=FULL", Some(Headers) -> " RET=HDRS", None -> "" })
+    ++ (match asked.envelope_id { Some(id) -> " ENVID=" ++ xtext(id), None -> "" })
+
+/// The parameters `asked` adds to the `RCPT TO` of `a`.
+fn rcpt_asks(asked: Dsn, a: Address) -> String / {abort.raise} =
+  (match asked.notify {
+      None -> "",
+      Some(events) ->
+        " NOTIFY="
+          ++ (if len(events) == 0 { "NEVER" } else {
+            join(
+              map(filter([Delivered, Failed, Delayed], |e: Event| contains(events, e)), event_word),
+              ",",
+            )
+          }),
+    })
+    ++ (if asked.original { " ORCPT=" ++ original_of(a) } else { "" })
+
+fn is_envelope_id(id: String) -> Bool / {abort.raise} =
+  id != "" && string_len(xtext(id)) <= 100
+    && all(string_chars(id), |c: Char| int_of_char(c) >= 32 && int_of_char(c) < 127)
+
+// --- What a caller requires ---------------------------------------------------
+
+/// How much a caller requires of the connection before a credential or a message crosses it.
+pub type Tls =
+  /// TLS, or nothing is sent: on a connection that is not TLS the client asks for `STARTTLS`
+  /// and refuses a server that does not offer it or does not grant it.
+  | RequireTls
+  /// TLS where the server offers it, and the connection as it is where it does not. Whoever
+  /// stands between the two ends can take the offer out, so this protects against a listener
+  /// and not against a forger.
+  | Opportunistic
+  /// No TLS: the client never asks for it. For a server on the same host, and for a test.
+  | Plain
+
+/// Whether a credential may be sent where anyone on the path reads it.
+pub type Exposure =
+  /// A mechanism that sends the credential itself is used only over TLS.
+  | Protected
+  /// Such a mechanism is used on a connection that is not TLS too: the password or the token
+  /// crosses the network as it is.
+  | PasswordInClear
+
+/// What a client is configured as: the name it greets a server by, what it requires of the
+/// connection, the credential it proves itself with, and its limits and waits.
+pub opaque type Config = new {
+  client: String,
+  tls: Tls,
+  credential: Option<Credential>,
+  mechanisms: List<Mechanism>,
+  exposure: Exposure,
+  helo: Bool,
+  limits: Limits,
+  timeouts: Timeouts,
+}
+
+/// A client that greets a server as `client`, its own domain or its address in brackets
+/// (`[192.0.2.1]`), requires TLS, has no credential, and waits as `default_timeouts` says.
+/// Raises `smtp.refused(BadClientName)` for a name that is neither.
+pub fn config(client: String, limits: Limits) -> Config / {smtp.refused, abort.raise} =
+  match email::parse_address("postmaster@" ++ client) {
+    Err(_) -> smtp.refused(BadClientName),
+    Ok(_) ->
+      {
+        client: client,
+        tls: RequireTls,
+        credential: None,
+        mechanisms: sasl::mechanisms(),
+        exposure: Protected,
+        helo: false,
+        limits: limits,
+        timeouts: default_timeouts(),
+      },
+  }
+
+/// `c` requiring this much of the connection.
+pub fn with_tls(c: Config, policy: Tls) -> Config = { ..c, tls: policy }
+
+/// `c` proving itself with `held` to a server that offers `AUTH`, and refusing one that does
+/// not.
+pub fn with_credential(c: Config, held: Credential) -> Config = { ..c, credential: Some(held) }
+
+/// `c` taking only these mechanisms, the first that the server offers and the credential
+/// serves. Without this it takes `std.sasl`'s, in their order.
+pub fn with_mechanisms(c: Config, order: List<Mechanism>) -> Config = { ..c, mechanisms: order }
+
+/// `c` sending a credential under this much protection.
+pub fn with_exposure(c: Config, e: Exposure) -> Config = { ..c, exposure: e }
+
+/// `c` saying `HELO` to a server that refuses `EHLO`, which then offers no extension at all.
+pub fn with_helo_fallback(c: Config) -> Config = { ..c, helo: true }
+
+/// `c` waiting as `t` says.
+pub fn with_timeouts(c: Config, t: Timeouts) -> Config = { ..c, timeouts: t }
+
+// --- Outcomes -----------------------------------------------------------------
+
+/// The command a server refused a message at.
+pub type Stage =
+  /// `MAIL FROM`: the sender, or the message's size or kind.
+  | AtMail
+  /// `RCPT TO`: this recipient.
+  | AtRcpt
+  /// `DATA`: every recipient it had taken.
+  | AtData
+  /// The message itself, once it had read it.
+  | AtEnd
+
+/// What became of a message for one recipient.
+pub type Outcome =
+  /// The server took responsibility for delivering it, with what it said, which often names the
+  /// message in its queue.
+  | Accepted(Reply)
+  /// Not this time: the same message may be taken later.
+  | Temporary(Stage, Reply)
+  /// No, and not later either.
+  | Permanent(Stage, Reply)
+
+/// One recipient of a message, and what became of it there.
+pub type Delivery = { recipient: Address, outcome: Outcome }
+
+/// Whether sending again later may succeed where this did not.
+pub fn retryable(o: Outcome) -> Bool = match o { Temporary(_, _) -> true, _ -> false }
+
+/// Whether the server took the message for this recipient.
+pub fn accepted(o: Outcome) -> Bool = match o { Accepted(_) -> true, _ -> false }
+
+/// A failure at `stage`. RFC 5321 §4.5.3.1.10 has a client read 552 in answer to `RCPT` as too
+/// many recipients for one message, which is 452's meaning: the rest are sent again.
+fn failure(stage: Stage, r: Reply) -> Outcome =
+  if class_of(r.code) == Transient || (stage == AtRcpt && number(r.code) == 552) {
+    Temporary(stage, r)
+  } else { Permanent(stage, r) }
+
+// --- The engine ---------------------------------------------------------------
+
+/// What an engine is told of the connection it speaks over.
+pub type Link = new {
+  /// The host connected to, which a token mechanism names to the server.
+  host: String,
+  port: Int,
+  /// Whether the connection is TLS already.
+  secure: Bool,
+  /// A nonce no earlier connection used, for SCRAM: printable ASCII with no comma.
+  nonce: String,
+}
+
+/// What a reply to come answers.
+type Expect =
+  | ForGreeting
+  | ForEhlo
+  | ForHelo
+  | ForStartTls
+  | ForAuth
+  | ForReset
+  | ForMail
+  | ForRcpt(Address)
+  | ForData
+  | ForEnd
+  | ForQuit
+
+fn phase_of(x: Expect) -> Phase =
+  match x {
+    ForGreeting -> Greeting,
+    ForEhlo -> Hello,
+    ForHelo -> Hello,
+    ForStartTls -> StartTls,
+    ForAuth -> Auth,
+    ForReset -> Reset,
+    ForMail -> Mail,
+    ForRcpt(_) -> Rcpt,
+    ForData -> Data,
+    ForEnd -> Body,
+    ForQuit -> Quit,
+  }
+
+/// What an engine does once every reply it waits for has come.
+type Todo =
+  | SayHello
+  | SayHelo
+  | Negotiate
+  | Authenticate
+  | Shake
+  | Respond(sasl::Response)
+  | Advance
+  | Rest
+  | Finish
+
+/// A command of a transaction, and what its reply answers.
+type Step = { words: String, expect: Expect }
+
+/// What the server has said to `DATA` and to the message after it.
+type Permit = | Unasked | Go | Stopped(Reply) | Ended(Reply)
+
+/// The reply that ended a transaction early, and the command it answered.
+type Cut = { stage: Stage, by: Reply }
+
+/// A message on its way: the commands not yet sent, the bytes that follow `DATA`, and what the
+/// server has said of the sender and of each recipient.
+type Job = {
+  queue: List<Step>,
+  payload: Bytes,
+  to_all: List<Address>,
+  mail: Option<Reply>,
+  refused: List<Delivery>,
+  taken: List<Address>,
+  data: Permit,
+  cut: Option<Cut>,
+}
+
+type Proving = { exchange: Exchange, unsent: Option<sasl::Response> }
+
+type State = {
+  config: Config,
+  link: Link,
+  offered: Option<Capabilities>,
+  held: Bytes,
+  partial: Partial,
+  pending: List<Expect>,
+  todo: Todo,
+  proving: Option<Proving>,
+  authenticated: Bool,
+  job: Option<Job>,
+  done: List<Delivery>,
+  sent: Int,
+  over: Bool,
+}
+
+/// One end of an SMTP session as a value: what the client knows of the server, what it waits
+/// for, and the bytes it holds of a reply not yet whole. It reads nothing and writes nothing:
+/// `feed` is given what the server sent and answers what to send back.
+pub opaque type Engine = | Engine(State)
+
+/// What to write to the server. It shows as it is, but for a line of an `AUTH` exchange, which
+/// shows as stars.
+pub type Wire =
+  /// These bytes, written with `net.send`.
+  | Open(Bytes)
+  /// A line of an `AUTH` exchange: the bytes before what the client says, what it says, sealed,
+  /// and the line's end, written with `net.send_secret` as the first, the second in base64, and
+  /// the third.
+  | Veiled(Bytes, Secret<Bytes>, Bytes)
+
+show for Wire by wire_text
+
+fn wire_text(w: Wire) -> String = match w { Open(said) -> show(said), Veiled(_, _, _) -> "****" }
+
+/// How many bytes a wire puts on the connection.
+fn wire_size(w: Wire) -> Int =
+  match w {
+    Open(said) -> bytes_len(said),
+    Veiled(lead, said, end) -> bytes_len(lead) + (secret_len(said) + 2) / 3 * 4 + bytes_len(end),
+  }
+
+/// One line of an exchange, as a session keeps it. No line of it holds a credential: what the
+/// client says in an `AUTH` exchange is kept as stars.
+pub type Line =
+  /// A line the client sent, without its line break.
+  | Client(String)
+  /// A line the server sent.
+  | Server(String)
+  /// The message, in this many bytes as they were sent, the dot that ends them among them.
+  | Payload(Int)
+  /// The connection became TLS.
+  | Upgraded
+
+/// What a transport does next for an engine.
+pub type Next =
+  /// Read from the server, within the wait the phase is allowed, and `feed` what arrives.
+  | Await(Phase)
+  /// Start TLS on the connection, with `unread` handed to whatever starts it, and then call
+  /// `upgraded`.
+  | Secure
+  /// Nothing: the session takes a command.
+  | Ready
+  /// Close the connection: the session is over.
+  | Over
+
+/// One step of an engine: where it stands now, what to write to the server before anything
+/// else, what to do after that, the lines of the exchange this step read and wrote, and how
+/// many whole replies it read.
+pub type Turn = { engine: Engine, out: Wire, next: Next, said: List<Line>, answered: Int }
+
+fn state(e: Engine) -> State = match e { Engine(s) -> s }
+
+fn turn(s: State, out: Wire, next: Next, said: List<Line>, answered: Int) -> Turn =
+  { engine: Engine(s), out: out, next: next, said: said, answered: answered }
+
+/// An engine for a connection just made, which waits for the server's greeting.
+pub fn start(c: Config, link: Link) -> Turn =
+  turn(
+    {
+      config: c,
+      link: link,
+      offered: None,
+      held: b"",
+      partial: nothing_read(),
+      pending: [ForGreeting],
+      todo: Rest,
+      proving: None,
+      authenticated: false,
+      job: None,
+      done: [],
+      sent: 0,
+      over: false,
+    },
+    Open(b""),
+    Await(Greeting),
+    [],
+    0,
+  )
+
+/// What the server offered in answer to the last `EHLO`; `None` before one is answered, and
+/// again from the moment TLS starts until the `EHLO` after it is.
+pub fn offered(e: Engine) -> Option<Capabilities> = state(e).offered
+
+/// Whether the connection is TLS.
+pub fn secured(e: Engine) -> Bool = state(e).link.secure
+
+/// Whether the server accepted the credential.
+pub fn authenticated(e: Engine) -> Bool = state(e).authenticated
+
+/// What became of the last message for each of its recipients, in the envelope's order.
+pub fn deliveries(e: Engine) -> List<Delivery> = state(e).done
+
+/// The bytes the engine was fed and has not read as a line yet: what whoever starts TLS on the
+/// connection is handed, and refuses the upgrade over.
+pub fn unread(e: Engine) -> Bytes = state(e).held
+
+/// How many bytes the engine holds of the reply it is reading: at most `Limits.reply`, since
+/// it refuses the byte past that.
+pub fn holding(e: Engine) -> Int = state(e).partial.size + bytes_len(state(e).held)
+
+/// How many bytes a transport may read for the engine now: what is left of `Limits.reply` for
+/// the reply being read, and never less than the one byte that shows a reply to be too large.
+pub fn room(e: Engine) -> Int = max(1, state(e).config.limits.reply - holding(e))
+
+/// The limits and waits an engine was configured with.
+pub fn config_of(e: Engine) -> Config = state(e).config
+
+fn ready(s: State) -> Bool = len(s.pending) == 0 && s.todo == Rest && !s.over
+
+/// The engine after the server sent `data`: every whole reply in it is taken as the answer to
+/// the oldest command still unanswered, and once none is unanswered the next command is
+/// written.
+///
+/// Raises `smtp.refused` for a reply that does not read, one the command it answers has no
+/// place for, bytes past the last reply asked for (`Unsolicited`, or `Injected` where they
+/// follow the leave to start TLS), and whatever keeps the session from going on: no TLS where
+/// it is required, no mechanism, a credential refused.
+pub fn feed(e: Engine, data: Bytes) -> Turn / {smtp.refused, abort.raise} = {
+  let s = state(e);
+  let held = bytes_concat(s.held, data);
+  if s.todo == Shake && len(s.pending) == 0 { smtp.refused(Injected) }
+  else { absorb({ ..s, held: b"" }, held, 0, [], 0, bytes_len(held) + 1) }
+}
+
+/// `left` bounds the rounds: each takes a reply.
+fn absorb(
+  s: State,
+  held: Bytes,
+  at: Int,
+  said: List<Line>,
+  answered: Int,
+  left: Int,
+) -> Turn / {smtp.refused, abort.raise} =
+  match first(s.pending) {
+    None -> if at < bytes_len(held) && !s.over {
+      smtp.refused(if s.todo == Shake { Injected } else { Unsolicited })
+    } else { settle(s, said, answered) },
+    Some(awaited) -> if left <= 0 { smtp.refused(Unsolicited) } else {
+      let t = take(held, at, s.partial, s.config.limits, bytes_len(held));
+      match t.whole {
+        None ->
+          turn(
+            { ..s, held: bytes_slice(held, t.at, bytes_len(held)), partial: t.partial },
+            Open(b""),
+            Await(phase_of(awaited)),
+            said,
+            answered,
+          ),
+        Some(r) ->
+          absorb(
+            answer({ ..s, pending: list::drop(s.pending, 1), partial: nothing_read() }, awaited, r),
+            held,
+            t.at,
+            concat(said, heard(r)),
+            answered + 1,
+            left - 1,
+          ),
+      }
+    },
+  }
+
+/// A reply as the lines a session keeps of it.
+fn heard(r: Reply) -> List<Line> = {
+  let end = len(r.lines) - 1;
+  map(list::enumerate(r.lines), |l: { index: Int, value: String }|
+    Server(
+      code_text(r.code) ++ (if l.index < end { "-" } else if l.value == "" { "" } else { " " })
+        ++ l.value,
+    ))
+}
+
+/// The state after `r` answered `awaited`.
+fn answer(s: State, awaited: Expect, r: Reply) -> State / {smtp.refused, abort.raise} = {
+  let kind = class_of(r.code);
+  match awaited {
+    ForGreeting -> if number(r.code) == 220 { { ..s, todo: SayHello } }
+    else { smtp.refused(Unexpected(Greeting, r)) },
+    ForEhlo -> if kind == Completed { { ..s, offered: Some(capabilities(r)), todo: Negotiate } }
+    else if kind == Rejected && s.config.helo { { ..s, todo: SayHelo } }
+    else { smtp.refused(Unexpected(Hello, r)) },
+    ForHelo -> if kind == Completed {
+      { ..s, offered: Some(nothing_offered(list::at_or(r.lines, 0, ""))), todo: Negotiate }
+    } else { smtp.refused(Unexpected(Hello, r)) },
+    ForStartTls -> if number(r.code) == 220 { { ..s, todo: Shake } }
+    else if s.config.tls == RequireTls { smtp.refused(Unexpected(StartTls, r)) }
+    else { { ..s, todo: Authenticate } },
+    ForAuth -> proved(s, r),
+    ForReset -> if kind == Completed { { ..s, todo: Advance } }
+    else { smtp.refused(Unexpected(Reset, r)) },
+    ForQuit -> { ..s, todo: Finish, over: true },
+    _ -> match s.job { None -> smtp.refused(Unsolicited), Some(j) -> moved(s, j, awaited, r) },
+  }
+}
+
+/// The state after `r` answered a step of an `AUTH` exchange: 334 carries what the server says
+/// next, 235 is its word that the client is who it says, and anything else is a refusal. A 235
+/// before the mechanism has the server proved is refused, not believed.
+fn proved(s: State, r: Reply) -> State / {smtp.refused, abort.raise} =
+  match s.proving {
+    None -> smtp.refused(Unsolicited),
+    Some(p) -> if number(r.code) == 334 {
+      match p.unsent {
+        Some(kept) ->
+          { ..s, proving: Some({ exchange: p.exchange, unsent: None }), todo: Respond(kept) },
+        None -> {
+          let said = ascii_trim(list::at_or(r.lines, 0, ""));
+          match base64_decode(if said == "=" { "" } else { said }) {
+            None -> smtp.refused(BadAuth(sasl::BadChallenge)),
+            Some(challenge) -> match try[sasl.refused] { sasl::answer(p.exchange, challenge) } {
+              Err(why) -> smtp.refused(BadAuth(why)),
+              Ok(a) ->
+                {
+                  ..s,
+                  proving: Some({ exchange: a.exchange, unsent: None }),
+                  todo: Respond(a.response),
+                },
+            },
+          }
+        },
+      }
+    } else if number(r.code) == 235 {
+      if sasl::proven(p.exchange) && p.unsent == None {
+        { ..s, proving: None, authenticated: true, todo: Rest }
+      } else { smtp.refused(BadAuth(sasl::Unproven)) }
+    } else if class_of(r.code) == Transient || class_of(r.code) == Rejected {
+      smtp.refused(Denied(r))
+    } else { smtp.refused(Unexpected(Auth, r)) },
+  }
+
+/// The state after `r` answered a command of the transaction `j`. A 421 says the server is
+/// closing the connection: it ends the transaction and the session, and every recipient not
+/// yet answered for is told to try again.
+fn moved(s: State, j: Job, awaited: Expect, r: Reply) -> State / {smtp.refused} = {
+  let kind = class_of(r.code);
+  let stage = match awaited {
+    ForMail -> AtMail,
+    ForRcpt(_) -> AtRcpt,
+    ForData -> AtData,
+    _ -> AtEnd,
+  };
+  if number(r.code) == 421 {
+    {
+      ..s,
+      pending: [],
+      job: Some({ ..j, queue: [], cut: Some({ stage: stage, by: r }) }),
+      todo: Advance,
+      over: true,
+    }
+  } else if kind == Intermediate && awaited != ForData {
+    smtp.refused(Unexpected(phase_of(awaited), r))
+  } else {
+    let after = match awaited {
+      ForMail -> if kind == Completed { j } else { { ..j, mail: Some(r) } },
+      ForRcpt(a) -> if kind == Completed { { ..j, taken: push(j.taken, a) } }
+      else { { ..j, refused: push(j.refused, { recipient: a, outcome: failure(AtRcpt, r) }) } },
+      ForData -> { ..j, data: if kind == Intermediate { Go } else { Stopped(r) } },
+      _ -> { ..j, data: Ended(r) },
+    };
+    if awaited == ForData && kind == Completed { smtp.refused(Unexpected(Data, r)) }
+    else { { ..s, job: Some(after), todo: Advance } }
+  }
+}
+
+/// What the engine does now that no reply is awaited.
+fn settle(s: State, said: List<Line>, answered: Int) -> Turn / {smtp.refused, abort.raise} =
+  match s.todo {
+    SayHello -> says(s, "EHLO " ++ s.config.client, ForEhlo, said, answered),
+    SayHelo -> says(s, "HELO " ++ s.config.client, ForHelo, said, answered),
+    Negotiate -> {
+      let starttls = match s.offered { Some(c) -> c.starttls, None -> false };
+      if s.link.secure || s.config.tls == Plain { authenticate(s, said, answered) }
+      else if starttls { says(s, "STARTTLS", ForStartTls, said, answered) }
+      else if s.config.tls == RequireTls { smtp.refused(NoTls) }
+      else { authenticate(s, said, answered) }
+    },
+    Authenticate -> authenticate(s, said, answered),
+    Shake -> turn(s, Open(b""), Secure, said, answered),
+    Respond(response) ->
+      turn(
+        { ..s, pending: [ForAuth], todo: Rest },
+        auth_line("", response),
+        Await(Auth),
+        push(said, Client("****")),
+        answered,
+      ),
+    Advance -> advance(s, said, answered),
+    Rest -> turn(s, Open(b""), Ready, said, answered),
+    Finish -> turn(s, Open(b""), Over, said, answered),
+  }
+
+/// A line of an `AUTH` exchange: `lead`, and what the client says in base64, or `=` where it
+/// says nothing after a command.
+fn auth_line(lead: String, response: sasl::Response) -> Wire = {
+  let said = sasl::said(response);
+  let marked = if lead != "" && secret_is_empty(said) { lead ++ "=" } else { lead };
+  Veiled(bytes_of_string(marked), said, b"\r\n")
+}
+
+/// The turn that writes one command and waits for its reply.
+fn says(s: State, words: String, expect: Expect, said: List<Line>, answered: Int) -> Turn =
+  turn(
+    { ..s, pending: [expect], todo: Rest },
+    Open(bytes_of_string(words ++ "\r\n")),
+    Await(phase_of(expect)),
+    push(said, Client(words)),
+    answered,
+  )
+
+/// The turn that proves the configured credential, or the one that is ready where there is
+/// none. The mechanism is the first the configuration takes that the server offers and the
+/// credential serves; one that sends the credential itself is passed over on a connection that
+/// is not TLS unless `PasswordInClear` is asked for.
+fn authenticate(s: State, said: List<Line>, answered: Int) -> Turn / {smtp.refused, abort.raise} =
+  match s.config.credential {
+    None -> turn({ ..s, todo: Rest }, Open(b""), Ready, said, answered),
+    Some(held) -> {
+      let server_takes = match s.offered { Some(c) -> c.auth, None -> [] };
+      let fit = filter(s.config.mechanisms, |m: Mechanism|
+        contains(server_takes, m) && sasl::serves(held, m));
+      let safe = filter(fit, |m: Mechanism|
+        s.link.secure || !sasl::reveals(m) || s.config.exposure == PasswordInClear);
+      match first(safe) {
+        None -> match first(fit) {
+          Some(m) -> smtp.refused(InClear(m)),
+          None -> smtp.refused(NoMechanism),
+        },
+        Some(m) -> match try[sasl.refused] {
+            sasl::begin(m, held, {
+              nonce: s.link.nonce,
+              most_iterations: s.config.limits.scram_iterations,
+              host: s.link.host,
+              port: s.link.port,
+            })
+          } {
+          Err(why) -> smtp.refused(BadAuth(why)),
+          Ok(b) -> {
+            let words = "AUTH " ++ sasl::mechanism_name(m);
+            let inline = match b.first {
+              Some(said_first) -> Some(auth_line(words ++ " ", said_first)),
+              None -> None,
+            };
+            // RFC 4954 §4: a response that takes the command past 512 octets waits to be asked.
+            match inline {
+              Some(line) if wire_size(line) <= 512 ->
+                turn(
+                  {
+                    ..s,
+                    proving: Some({ exchange: b.exchange, unsent: None }),
+                    pending: [ForAuth],
+                    todo: Rest,
+                  },
+                  line,
+                  Await(Auth),
+                  push(said, Client(words ++ " ****")),
+                  answered,
+                ),
+              _ ->
+                turn(
+                  {
+                    ..s,
+                    proving: Some({ exchange: b.exchange, unsent: b.first }),
+                    pending: [ForAuth],
+                    todo: Rest,
+                  },
+                  Open(bytes_of_string(words ++ "\r\n")),
+                  Await(Auth),
+                  push(said, Client(words)),
+                  answered,
+                ),
+            }
+          },
+        },
+      }
+    },
+  }
+
+/// The next step of a transaction: its next command, the message after the leave to send it,
+/// or its end.
+fn advance(s: State, said: List<Line>, answered: Int) -> Turn / {abort.raise} =
+  match s.job {
+    None -> turn({ ..s, todo: Rest }, Open(b""), Ready, said, answered),
+    Some(j) -> match j.queue {
+      [next_step, ..later] -> if s.over || j.mail != None
+          || (next_step.expect == ForData && len(j.taken) == 0) { finished(s, j, said, answered) }
+      else {
+        turn(
+          { ..s, job: Some({ ..j, queue: later }), pending: [next_step.expect], todo: Advance },
+          Open(bytes_of_string(next_step.words ++ "\r\n")),
+          Await(phase_of(next_step.expect)),
+          push(said, Client(next_step.words)),
+          answered,
+        )
+      },
+      _ -> if j.data != Go || s.over { finished(s, j, said, answered) } else {
+        // A server that gives leave to send a message it took no recipient for is sent none.
+        let body = if j.mail == None && len(j.taken) > 0 { j.payload } else { b".\r\n" };
+        turn(
+          { ..s, job: Some({ ..j, data: Unasked }), pending: [ForEnd], todo: Advance },
+          Open(body),
+          Await(Body),
+          push(said, Payload(bytes_len(body))),
+          answered,
+        )
+      },
+    },
+  }
+
+fn finished(s: State, j: Job, said: List<Line>, answered: Int) -> Turn / {abort.raise} =
+  turn(
+    {
+      ..s,
+      job: None,
+      pending: [],
+      done: map(j.to_all, |a: Address| { recipient: a, outcome: fate(j, a) }),
+      sent: s.sent + 1,
+      todo: if s.over { Finish } else { Rest },
+    },
+    Open(b""),
+    if s.over { Over } else { Ready },
+    said,
+    answered,
+  )
+
+/// What became of the message `j` carried for `a`.
+fn fate(j: Job, a: Address) -> Outcome / {abort.raise} =
+  match j.mail {
+    Some(r) -> failure(AtMail, r),
+    None -> match find(j.refused, |d: Delivery| d.recipient == a) {
+      Some(d) -> d.outcome,
+      None -> match j.data {
+        Ended(r) if contains(j.taken, a) -> if class_of(r.code) == Completed { Accepted(r) }
+        else { failure(AtEnd, r) },
+        Stopped(r) if contains(j.taken, a) -> failure(AtData, r),
+        _ -> match j.cut {
+          Some(c) -> Temporary(c.stage, c.by),
+          None -> panic("a recipient the server never answered for"),
+        },
+      },
+    },
+  }
+
+/// The engine after TLS started on its connection: it forgets what the server offered before,
+/// which anyone could have written, and says `EHLO` again. Raises `smtp.refused(NotReady)` for
+/// an engine that did not ask for it.
+pub fn upgraded(e: Engine) -> Turn / {smtp.refused, abort.raise} = {
+  let s = state(e);
+  if s.todo != Shake || len(s.pending) > 0 || bytes_len(s.held) > 0 { smtp.refused(NotReady) }
+  else {
+    settle({ ..s, link: { ..s.link, secure: true }, offered: None, todo: SayHello }, [Upgraded], 0)
+  }
+}
+
+/// The engine after the server closed the connection: over, where that answers `QUIT` or
+/// nothing was awaited, and `smtp.refused(Closed(..))` naming the phase otherwise.
+pub fn closed(e: Engine) -> Turn / {smtp.refused} = {
+  let s = state(e);
+  match first(s.pending) {
+    Some(awaited) if awaited != ForQuit -> smtp.refused(Closed(phase_of(awaited))),
+    _ -> turn({ ..s, pending: [], todo: Finish, over: true }, Open(b""), Over, [], 0),
+  }
+}
+
+/// The turn that sends `data` under `envelope`: `MAIL FROM`, a `RCPT TO` for each recipient
+/// and `DATA`, all at once to a server that offers `PIPELINING` and one at a time to any other,
+/// after a `RSET` where the session has sent a message before. The message follows the
+/// server's leave to send it, dot-stuffed, and is not sent at all where no recipient was
+/// taken. `deliveries` answers what became of it once the engine is `Ready` again.
+///
+/// Raises `smtp.refused` before anything is written, and leaves the session as it was, for an
+/// envelope to no one (`NoRecipients`), a message that is not CRLF lines (`Unsendable`,
+/// `NulByte`, `Unterminated`), one past the size the server takes (`TooLarge`), one that needs
+/// `8BITMIME`, `SMTPUTF8` or `DSN` from a server that does not offer it (`Unoffered`), and an
+/// envelope identifier that is none (`BadEnvelopeId`); and `NotReady` for an engine that is
+/// waiting or over.
+pub fn mail(
+  e: Engine,
+  envelope: Envelope,
+  data: Bytes,
+  asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+) -> Turn / {smtp.refused, abort.raise} = {
+  let s = state(e);
+  let shape = shape_of(envelope, data);
+  match s.offered {
+    None -> smtp.refused(NotReady),
+    Some(c) -> if s.over { smtp.refused(Closed(Mail)) }
+    else if !ready(s) { smtp.refused(NotReady) } else {
+      match objection(c, envelope, data, asked, shape) {
+        Some(why) -> smtp.refused(why),
+        None -> {
+          let steps = steps_of(c, envelope, asked, shape, s.sent > 0);
+          let now = if c.pipelining { steps } else { list::take(steps, 1) };
+          turn(
+            {
+              ..s,
+              job: Some({
+                queue: list::drop(steps, len(now)),
+                payload: payload_of(data),
+                to_all: envelope.recipients,
+                mail: None,
+                refused: [],
+                taken: [],
+                data: Unasked,
+                cut: None,
+              }),
+              pending: map(now, |step: Step| step.expect),
+              todo: Advance,
+              done: [],
+            },
+            Open(bytes_of_string(join(map(now, |step: Step| step.words ++ "\r\n"), ""))),
+            Await(phase_of(list::at_or(now, 0, { words: "", expect: ForMail }).expect)),
+            map(now, |step: Step| Client(step.words)),
+            0,
+          )
+        },
+      }
+    },
+  }
+}
+
+/// What of a message decides how it is declared: its size, whether it holds a byte past 127,
+/// and whether an address of its envelope or a byte of its header is outside ASCII.
+type Shape = { size: Int, eight_bit: Bool, utf8: Bool }
+
+fn shape_of(envelope: Envelope, data: Bytes) -> Shape / {abort.raise} = {
+  let n = bytes_len(data);
+  let high = match bytes_position(data, 0, |b: Int| b > 127) { Some(at) -> at, None -> n };
+  let head_end = match bytes_index_of(data, b"\r\n\r\n") { Some(at) -> at, None -> n };
+  { size: n, eight_bit: high < n, utf8: envelope.utf8 || high < head_end }
+}
+
+/// Why a server that offers `c` is not sent `data` under `envelope`; `None` where it is.
+fn objection(
+  c: Capabilities,
+  envelope: Envelope,
+  data: Bytes,
+  asked: Dsn,
+  shape: Shape,
+) -> Option<Refusal> / {abort.raise} =
+  if len(envelope.recipients) == 0 { Some(NoRecipients) } else {
+    match flaw(data) {
+      Some(why) -> Some(why),
+      None -> if shape.eight_bit && !c.eight_bit { Some(Unoffered(EightBitMime)) }
+      else if shape.utf8 && !c.utf8 { Some(Unoffered(SmtpUtf8)) }
+      else if asks(asked) && !c.dsn { Some(Unoffered(Notices)) }
+      else if !(match asked.envelope_id { Some(id) -> is_envelope_id(id), None -> true }) {
+        Some(BadEnvelopeId)
+      } else {
+        match c.size {
+          AtMost(most) if shape.size > most -> Some(TooLarge(shape.size, most)),
+          _ -> None,
+        }
+      },
+    }
+  }
+
+/// The commands that send a message of this shape under `envelope`: `RSET` where `again` says
+/// the session sent one before, `MAIL FROM` with what the server is told of the message,
+/// a `RCPT TO` for each recipient, and `DATA`.
+fn steps_of(
+  c: Capabilities,
+  envelope: Envelope,
+  asked: Dsn,
+  shape: Shape,
+  again: Bool,
+) -> List<Step> / {abort.raise} = {
+  let from_words = "MAIL FROM:<"
+    ++ (match envelope.sender { ReturnTo(a) -> path_text(a), NullPath -> "" })
+    ++ ">"
+    ++ (if c.size == Unsaid { "" } else { " SIZE=" ++ int_to_string(shape.size) })
+    ++ (if shape.eight_bit { " BODY=8BITMIME" } else { "" })
+    ++ (if shape.utf8 { " SMTPUTF8" } else { "" })
+    ++ mail_asks(asked);
+  concat(
+    concat(if again { [{ words: "RSET", expect: ForReset }] } else { [] }, [
+      { words: from_words, expect: ForMail },
+    ]),
+    push(
+      map(envelope.recipients, |a: Address|
+        { words: "RCPT TO:<" ++ path_text(a) ++ ">" ++ rcpt_asks(asked, a), expect: ForRcpt(a) }),
+      { words: "DATA", expect: ForData },
+    ),
+  )
+}
+
+/// The turn that says `QUIT`; for an engine that is over already, the turn that is over.
+/// Raises `smtp.refused(NotReady)` for an engine that is waiting for an answer.
+pub fn leave(e: Engine) -> Turn / {smtp.refused} = {
+  let s = state(e);
+  if s.over { turn(s, Open(b""), Over, [], 0) }
+  else if !ready(s) { smtp.refused(NotReady) }
+  else { turn({ ..s, pending: [ForQuit] }, Open(b"QUIT\r\n"), Await(Quit), [Client("QUIT")], 0) }
+}
+
+// --- Sessions over a connection -----------------------------------------------
+
+/// An SMTP session on an open connection: the handle `std.net` gave, and the engine that
+/// speaks over it. The label it was opened under is the one every function here takes it
+/// under.
+pub opaque type Session = new {
+  handle: Int,
+  engine: Engine,
+  /// The newest lines of the exchange, `Limits.transcript` of them at most.
+  kept: List<Line>,
+}
+
+/// A message sent: the session to send the next one over, and what became of this one for each
+/// of its recipients, in the envelope's order. A message is sent only so far as every outcome
+/// here is `Accepted`.
+pub type Sent = { session: Session, deliveries: List<Delivery> }
+
+/// What a session was driven to: its engine, and the lines exchanged on the way.
+type Driven = { engine: Engine, said: List<Line> }
+
+/// The instant a wait of `ms` from now ends, or the deadline around the call where that is
+/// earlier, as `std.net`'s `dial` holds its own: an outer `task::timeout` bounds a session whole.
+fn ending(ms: Int) -> Instant / {clock.read, task::deadline.at} = {
+  let own = after(clock.now(), millis(ms));
+  match task::earliest(Some(own), task::deadline.at()) { Some(earlier) -> earlier, None -> own }
+}
+
+/// One read of what the server sends, waiting until `end` and no longer: `None` once it passed.
+fn read_by<[l]>(h: Int, most: Int, end: Instant) -> Option<Bytes> / {net.recv[l], clock.read} =
+  match net::ms_left(end) { None -> None, Some(ms) -> net.recv[l](h, most, ms) }
+
+/// Every byte of `out` written by `end`; `false` where the connection stopped taking them. A line
+/// of an `AUTH` exchange goes by `net.send_secret`, so what the client says there is never a
+/// plain value.
+fn sent_by<[l]>(
+  h: Int,
+  out: Wire,
+  end: Instant,
+) -> Bool / {net.send[l], net.send_secret[l], clock.read, abort.raise} =
+  match net::ms_left(end) {
+    None -> false,
+    Some(ms) -> match out {
+      Open(payload) -> send_all[l](h, payload, ms),
+      Veiled(lead, said, line_end) -> net.send_secret[l](h, lead, said, "base64", line_end, ms),
+    },
+  }
+
+/// The connection `h` secured as its client by `net.start_tls`, verifying the server as `host`,
+/// within `ms`: `None` where it is, and why where it is not. Plaintext that waited at the
+/// upgrade, in `unread` or on the socket, is `Injected`, as the engine's own check calls it.
+fn upgrade<[l]>(
+  h: Int,
+  host: String,
+  unread: Bytes,
+  ms: Int,
+) -> Option<Refusal> / {net.start_tls[l], clock.read, task::deadline.at} =
+  match net::ms_left(ending(ms)) {
+    None -> Some(TimedOut(Handshake)),
+    Some(left) -> match net.start_tls[l](h, host, [], unread, left) {
+      Ok(_) -> None,
+      Err(net::Injected) -> Some(Injected),
+      Err(net::TimedOut) -> Some(TimedOut(Handshake)),
+      Err(why) -> Some(HandshakeFailed(why)),
+    },
+  }
+
+/// Writes what `t` says and does what it says next, until the engine is ready or over. A wait
+/// for a reply ends at an instant: `ending` the phase's time from when the command was written
+/// or the reply before it ended, and `end` while a reply is half read, so a reply that trickles
+/// in is held to one wait. `secure` starts TLS and answers why it could not, or nothing. `left`
+/// bounds the rounds: each takes what one read brought, or starts TLS.
+fn drive<[l] | e>(
+  h: Int,
+  t: Turn,
+  said: List<Line>,
+  end: Option<Instant>,
+  secure: (Int, Bytes) -> Option<Refusal> / e,
+  left: Int,
+) -> Driven / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} = {
+  let waits = config_of(t.engine).timeouts;
+  let all_said = concat(said, t.said);
+  let wrote = wire_size(t.out) > 0;
+  if wrote && !sent_by[l](h, t.out, ending(waits.block_ms)) {
+    smtp.refused(NotSent(match t.next { Await(p) -> p, _ -> Quit }))
+  } else {
+    match t.next {
+      Ready -> { engine: t.engine, said: all_said },
+      Over -> { engine: t.engine, said: all_said },
+      Secure -> if left <= 0 { smtp.refused(TimedOut(Handshake)) } else {
+        match secure(h, unread(t.engine)) {
+          Some(why) -> smtp.refused(why),
+          None -> drive[l](h, upgraded(t.engine), all_said, None, secure, left - 1),
+        }
+      },
+      Await(p) -> {
+        let until = match end {
+          Some(kept) if !wrote && t.answered == 0 -> kept,
+          _ -> ending(timeout(waits, p)),
+        };
+        match read_by[l](h, min(read_size(), room(t.engine)), until) {
+          Some(chunk) if left > 0 ->
+            drive[l](
+              h,
+              if bytes_len(chunk) == 0 { closed(t.engine) } else { feed(t.engine, chunk) },
+              all_said,
+              Some(until),
+              secure,
+              left - 1,
+            ),
+          _ -> smtp.refused(TimedOut(p)),
+        }
+      },
+    }
+  }
+}
+
+/// The newest `limits.transcript` lines of `kept` and then `said`.
+fn kept_of(limits: Limits, kept: List<Line>, said: List<Line>) -> List<Line> = {
+  let lines = concat(kept, said);
+  list::drop(lines, len(lines) - max(limits.transcript, 0))
+}
+
+/// The session on the connection `h`, greeted, secured as `c` requires and authenticated; the
+/// connection closed, and `smtp.refused` raised, where it does not get that far.
+fn established<[l] | e>(
+  h: Int,
+  c: Config,
+  link: Link,
+  secure: (Int, Bytes) -> Option<Refusal> / e,
+) -> Session / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise | e} =
+  match try[smtp.refused] { drive[l](h, start(c, link), [], None, secure, 16 * max_reads()) } {
+    Ok(d) -> { handle: h, engine: d.engine, kept: kept_of(c.limits, [], d.said) },
+    Err(why) -> {
+      net.close[l](h);
+      smtp.refused(why)
+    },
+  }
+
+/// A connection to `host` at `port` within `Timeouts.connect_ms`; raises `Unreachable`.
+fn connected<[l]>(
+  host: String,
+  port: Int,
+  c: Config,
+) -> Int / {net.connect[l], clock.read, task::deadline.at, smtp.refused} =
+  match net::ms_left(ending(c.timeouts.connect_ms)) {
+    None -> smtp.refused(Unreachable),
+    Some(ms) -> match net.connect[l](host, port, ms) {
+      Some(h) -> h,
+      None -> smtp.refused(Unreachable),
+    },
+  }
+
+/// A session with the server at `host` and `port` over TLS from its first byte, as port 465
+/// serves it (RFC 8314): the handshake completed and the server verified as `host` before it
+/// is greeted, and then `c`'s credential given where it has one.
+///
+/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `HandshakeFailed` with
+/// `std.net`'s reason for a server that is not `host` or agrees on no TLS, and whatever `feed`
+/// raises of the greeting, of what the server offers and of the credential.
+pub fn open_tls<[l]>(
+  host: String,
+  port: Int,
+  c: Config,
+) -> Session / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+  let h = connected[l](host, port, c);
+  match upgrade[l](h, host, b"", c.timeouts.connect_ms) {
+    Some(why) -> {
+      net.close[l](h);
+      smtp.refused(why)
+    },
+    None ->
+      established[l](
+        h,
+        c,
+        { host: host, port: port, secure: true, nonce: nonce() },
+        |_: Int, _: Bytes| Some(NotReady),
+      ),
+  }
+}
+
+/// A session with the server at `host` and `port` over a connection that starts in the clear,
+/// as ports 587 and 25 serve it: greeted, upgraded by `STARTTLS` as `c` requires, the server
+/// verified as `host`, and given `c`'s credential where it has one.
+///
+/// Raises `smtp.refused`, with the connection closed: `Unreachable`, `NoTls` where TLS is
+/// required and not offered, `Injected` for bytes the server sent between its leave to start
+/// TLS and the handshake, `HandshakeFailed` with `std.net`'s reason, and whatever `feed` raises.
+pub fn open<[l]>(
+  host: String,
+  port: Int,
+  c: Config,
+) -> Session / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} = {
+  let h = connected[l](host, port, c);
+  established[l](
+    h,
+    c,
+    { host: host, port: port, secure: false, nonce: nonce() },
+    |at: Int, unread: Bytes| upgrade[l](at, host, unread, c.timeouts.connect_ms),
+  )
+}
+
+/// Sends `data` under `envelope` and answers what became of it for each recipient, never a
+/// bare success: a recipient the server refused, or told to try later, is in the answer with
+/// what the server said. `asked` is what to ask of the servers about delivery reports.
+///
+/// Raises `smtp.refused`. Where `usable` says so the message was refused before any of it was
+/// written and the session is as it was; otherwise the exchange went wrong and the session is
+/// good only for `close`.
+pub fn submit<[l]>(
+  s: Session,
+  envelope: Envelope,
+  data: Bytes,
+  asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} = {
+  let d = drive[l](
+    s.handle,
+    mail(s.engine, envelope, data, asked),
+    [],
+    None,
+    |_: Int, _: Bytes| Some(NotReady),
+    max_reads() * (len(envelope.recipients) + 8),
+  );
+  {
+    session: {
+      handle: s.handle,
+      engine: d.engine,
+      kept: kept_of(config_of(d.engine).limits, s.kept, d.said),
+    },
+    deliveries: deliveries(d.engine),
+  }
+}
+
+/// Sends a draft to everyone `std.email`'s `envelope` names, its `Bcc` recipients among them
+/// and their field left out: written in ASCII wherever the draft can be, under a boundary drawn
+/// from the host's entropy. Answers and raises as `submit` does, and `Unwritable` for a draft
+/// with no bytes.
+pub fn send<[l]>(
+  s: Session,
+  d: Draft,
+  asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise} =
+  match try[email.unwritable] { email::write_fresh(d, email::repertoire_for(d)) } {
+    Ok(data) -> submit[l](s, email::envelope(d), data, asked),
+    Err(why) -> smtp.refused(Unwritable(why)),
+  }
+
+/// Sends a message read on to everyone its fields name, as `std.email`'s `message_envelope`
+/// reads them: the bytes it was read from, without its `Bcc` and `Resent-Bcc` lines. Answers
+/// and raises as `submit` does, and `Unreadable` for a message that names no envelope.
+pub fn relay<[l]>(
+  s: Session,
+  m: Message,
+  asked: Dsn = { ret: None, envelope_id: None, notify: None, original: false },
+) -> Sent / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
+  match try[email.refused] { email::message_envelope(m) } {
+    Ok(envelope) ->
+      submit[l](
+        s,
+        envelope,
+        email::render(email::without(email::without(m, "Bcc"), "Resent-Bcc")),
+        asked,
+      ),
+    Err(why) -> smtp.refused(Unreadable(why)),
+  }
+
+/// Says `QUIT` and waits for the server's answer, for as long as `Timeouts.quit_ms` allows. A
+/// server that does not answer, or a session that is over, is left as it is.
+fn farewell<[l]>(
+  s: Session,
+) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], clock.read, task::deadline.at, abort.raise} =
+  match try[smtp.refused] {
+      drive[l](s.handle, leave(s.engine), [], None, |_: Int, _: Bytes| Some(NotReady), max_reads())
+    } {
+    Ok(_) -> (),
+    Err(_) -> (),
+  }
+
+/// Ends a session: `QUIT`, the server's answer where it gives one in time, and the connection
+/// closed.
+pub fn quit<[l]>(
+  s: Session,
+) -> Unit / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, abort.raise} = {
+  farewell[l](s);
+  net.close[l](s.handle)
+}
+
+/// Closes a session's connection and says nothing: what is left to do with a session after a
+/// refusal `usable` answers `false` for.
+pub fn close<[l]>(s: Session) -> Unit / {net.close[l]} = net.close[l](s.handle)
+
+/// What `body` answers over a TLS session with the server at `host` and `port`, opened as
+/// `open_tls` opens one and held for `body` alone: told `QUIT` when `body` answers, and closed
+/// however `body` ends. `body` neither quits nor closes the session it is given.
+pub fn with_session_tls<a, [l] | e>(
+  host: String,
+  port: Int,
+  c: Config,
+  body: (Session) -> a / e,
+) -> a / {net.connect[l] bounded, net.start_tls[l] bounded, net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+  with_hold[session](open_tls[l](host, port, c), |s: Session| close[l](s)) { held -> {
+    let s = hold_get(held);
+    let answer_of = body(s);
+    farewell[l](s);
+    answer_of
+  } }
+
+/// `with_session_tls` over a connection that starts in the clear, opened as `open` opens one.
+pub fn with_session<a, [l] | e>(
+  host: String,
+  port: Int,
+  c: Config,
+  body: (Session) -> a / e,
+) -> a / {net.connect[l] bounded, net.start_tls[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, entropy.next bounded, smtp.refused, abort.raise | e} =
+  with_hold[session](open[l](host, port, c), |s: Session| close[l](s)) { held -> {
+    let s = hold_get(held);
+    let answer_of = body(s);
+    farewell[l](s);
+    answer_of
+  } }
+
+/// What the server offered when the session was opened.
+pub fn offered_to(s: Session) -> Option<Capabilities> = offered(s.engine)
+
+/// The newest lines of a session's exchange, `Limits.transcript` of them at most, oldest
+/// first. No credential is among them.
+pub fn transcript(s: Session) -> List<Line> = s.kept
+
+/// Lines of an exchange as text, one to a line: `C:` before what the client said, `S:` before
+/// what the server said, and `*:` before what is neither.
+pub fn transcript_text(lines: List<Line>) -> String =
+  join(
+    map(lines, |l: Line|
+      match l {
+        Client(said) -> if said == "" { "C:" } else { "C: " ++ said },
+        Server(said) -> "S: " ++ said,
+        Payload(n) -> "*: " ++ int_to_string(n) ++ " octets of message",
+        Upgraded -> "*: TLS",
+      }),
+    "\n",
+  )
+
+// --- Tests: replies -----------------------------------------------------------
+
+fn said(n: Int, texts: List<String>) -> Reply / {abort.raise} =
+  match code(n) {
+    None -> panic("no code"),
+    Some(c) -> match reply(c, texts) { Some(r) -> r, None -> panic("no reply") },
+  }
+
+fn told_of(r: Reply) -> String = code_text(r.code) ++ "|" ++ join(r.lines, "|")
+
+type Read = { data: Bytes, expect: Result<String, Refusal> }
+
+fn reads() -> List<Read> =
+  [
+    { data: b"250 OK\r\n", expect: Ok("250|OK") },
+    { data: b"250\r\n", expect: Ok("250|") },
+    { data: b"250 \r\n", expect: Ok("250|") },
+    {
+      data: b"220 foo.com Simple Mail Transfer Service Ready\r\n",
+      expect: Ok("220|foo.com Simple Mail Transfer Service Ready"),
+    },
+    {
+      data: b"250-foo.com greets bar.com\r\n250-8BITMIME\r\n250-SIZE\r\n250-DSN\r\n250 HELP\r\n",
+      expect: Ok("250|foo.com greets bar.com|8BITMIME|SIZE|DSN|HELP"),
+    },
+    { data: b"250-\r\n250\r\n", expect: Ok("250||") },
+    {
+      data: b"354 Start mail input; end with <CRLF>.<CRLF>\r\n",
+      expect: Ok("354|Start mail input; end with <CRLF>.<CRLF>"),
+    },
+    { data: b"550 5.1.1 caf\xc3\xa9\tclosed\r\n", expect: Ok("550|5.1.1 caf\u{e9}\tclosed") },
+    {
+      data: b"571 not in RFC 5321's grammar, and sent all the same\r\n",
+      expect: Ok("571|not in RFC 5321's grammar, and sent all the same"),
+    },
+    {
+      data: b"550 bad \xff byte \x1b[31m and \x00\r\n",
+      expect: Ok("550|bad \u{fffd} byte \u{fffd}[31m and \u{fffd}"),
+    },
+    { data: b"250 OK\n", expect: Err(BadLine) },
+    { data: b"\n", expect: Err(BadLine) },
+    { data: b"\r\n", expect: Err(BadLine) },
+    { data: b"250 O\rK\r\n", expect: Err(BadLine) },
+    { data: b"25 OK\r\n", expect: Err(BadLine) },
+    { data: b"2500 OK\r\n", expect: Err(BadLine) },
+    { data: b"250_OK\r\n", expect: Err(BadLine) },
+    { data: b"199 too low\r\n", expect: Err(BadLine) },
+    { data: b"600 too high\r\n", expect: Err(BadLine) },
+    { data: b"-25 signed\r\n", expect: Err(BadLine) },
+    { data: b"2 5 spaced\r\n", expect: Err(BadLine) },
+    { data: b"OK\r\n", expect: Err(BadLine) },
+    { data: b"250-first\r\n251 second\r\n", expect: Err(MixedCodes) },
+    { data: b"250 OK\r\n250 again\r\n", expect: Err(Unsolicited) },
+    { data: b"250 OK\r\nmore", expect: Err(Unsolicited) },
+    { data: b"250 OK", expect: Err(BadLine) },
+    { data: b"250-first\r\n", expect: Err(BadLine) },
+    { data: b"", expect: Err(BadLine) },
+  ]
+
+test "a reply is its code and the text of each of its lines, or refused" for r: Read in reads() {
+  assert_eq(result_map(parse_reply(r.data, default_limits()), told_of), r.expect)
+}
+
+test "a reply past a limit is refused, whether or not its line has ended" {
+  let tight: Limits = { line: 16, reply: 40, scram_iterations: 1, transcript: 0 };
+  assert_eq(result_map(parse_reply(b"250 0123456789\r\n", tight), told_of), Ok("250|0123456789"));
+  assert_eq(parse_reply(b"250 01234567890\r\n", tight), Err(LineTooLong));
+  assert_eq(parse_reply(b"250 0123456789012", tight), Err(LineTooLong));
+  assert_eq(
+    result_map(parse_reply(b"250-0123456789\r\n250-0123456789\r\n250 01\r\n", tight), told_of),
+    Ok("250|0123456789|0123456789|01"),
+  );
+  assert_eq(
+    parse_reply(b"250-0123456789\r\n250-0123456789\r\n250 012\r\n", tight),
+    Err(ReplyTooLarge),
+  );
+  assert_eq(
+    parse_reply(b"250-0123456789\r\n250-0123456789\r\n250-01234", tight),
+    Err(ReplyTooLarge),
+  )
+}
+
+test "a reply is written as a server writes it" {
+  assert_eq(render_reply(said(250, ["OK"])), b"250 OK\r\n");
+  assert_eq(render_reply(said(250, [""])), b"250\r\n");
+  assert_eq(
+    render_reply(said(250, ["foo.com greets bar.com", "", "HELP"])),
+    b"250-foo.com greets bar.com\r\n250-\r\n250 HELP\r\n",
+  );
+  assert_eq(reply_text(said(250, ["foo.com", "HELP"])), "foo.com\nHELP");
+  assert_eq(reply(Code(250), []), None);
+  assert_eq(reply(Code(250), ["a\r\nb"]), None);
+  assert_eq(reply(Code(250), ["a\u{7f}"]), None);
+  assert_eq(result_is_ok_some(reply(Code(250), ["tab\there"])), true)
+}
+
+fn result_is_ok_some(r: Option<Reply>) -> Bool = r != None
+
+law "a reply is read back from what it is written as" =
+  round_trip(render_reply, |data: Bytes| result_ok(parse_reply(data, default_limits())))
+
+/// Whether `given` is refused, or is a reply within `limits` that is written as bytes which
+/// read as it; `false` where reading it fails any other way. What is written may be longer than
+/// what was read, by the U+FFFD that stands for each byte no text holds.
+fn reads_or_refuses(given: Bytes, limits: Limits) -> Bool =
+  match try[abort.raise] {
+      match parse_reply(given, limits) {
+        Err(_) -> true,
+        Ok(r) ->
+          bytes_len(given) <= limits.reply
+            && parse_reply(render_reply(r), default_limits()) == Ok(r),
+      }
+    } {
+    Ok(held) -> held,
+    Err(_) -> false,
+  }
+
+law "any bytes are a reply within the limits or are refused, and a reply read is written as bytes that read as it"
+  forall (data: Bytes, cut: Int) {
+    let tight: Limits = { line: 24, reply: 60, scram_iterations: 1, transcript: 0 };
+    let lined = bytes_concat_all([b"250-", data, b"\r\n250 ", data, b"\r\n"]);
+    let n = bytes_len(lined) + 1;
+    reads_or_refuses(data, tight) && reads_or_refuses(lined, tight)
+      && reads_or_refuses(bytes_slice(lined, 0, (cut % n + n) % n), tight)
+  }
+
+test "a code is three digits of which the first says what became of the command" {
+  assert_eq(
+    map([199, 200, 250, 354, 421, 550, 599, 600, -250], |n: Int|
+      match code(n) { Some(c) -> number(c), None -> 0 }),
+    [0, 200, 250, 354, 421, 550, 599, 0, 0],
+  );
+  assert_eq(
+    map([220, 354, 451, 554], |n: Int|
+      match code(n) { Some(c) -> Some(class_of(c)), None -> None }),
+    [Some(Completed), Some(Intermediate), Some(Transient), Some(Rejected)],
+  );
+  assert_eq(show(code(250)), "Some(250)")
+}
+
+type Stated = { text: String, expect: Option<List<Int>> }
+
+fn stated() -> List<Stated> =
+  [
+    { text: "2.0.0", expect: Some([2, 0, 0]) },
+    { text: "4.2.2", expect: Some([4, 2, 2]) },
+    { text: "5.1.1", expect: Some([5, 1, 1]) },
+    { text: "5.7.999", expect: Some([5, 7, 999]) },
+    { text: "5.07.1", expect: Some([5, 7, 1]) },
+    { text: "3.1.1", expect: None },
+    { text: "1.0.0", expect: None },
+    { text: "5.1", expect: None },
+    { text: "5.1.1.1", expect: None },
+    { text: "5.1000.1", expect: None },
+    { text: "5.-1.1", expect: None },
+    { text: "5..1", expect: None },
+    { text: "5.1.x", expect: None },
+    { text: " 5.1.1", expect: None },
+    { text: "", expect: None },
+  ]
+
+test "an enhanced status is a class, a subject and a detail" for s: Stated in stated() {
+  assert_eq(option_parts(read_status(s.text)), s.expect)
+}
+
+fn option_parts(s: Option<Status>) -> Option<List<Int>> =
+  match s { Some(held) -> Some(status_parts(held)), None -> None }
+
+test "a reply's status is the one its text opens with, where that is of the code's class" {
+  assert_eq(show(enhanced(said(550, ["5.1.1 No such user"]))), "Some(5.1.1)");
+  assert_eq(show(enhanced(said(250, ["2.1.5 Ok", "2.1.5 more"]))), "Some(2.1.5)");
+  assert_eq(
+    show(enhanced(said(451, ["4.7.1 Greylisted, try again in 300 seconds"]))),
+    "Some(4.7.1)",
+  );
+  assert_eq(enhanced(said(250, ["2.0.0"])), status(2, 0, 0));
+  assert_eq(enhanced(said(550, ["No such user"])), None);
+  assert_eq(enhanced(said(550, ["2.1.5 a status of another class"])), None);
+  assert_eq(enhanced(said(354, ["3.0.0 no such class"])), None);
+  assert_eq(enhanced(said(250, [""])), None);
+  assert_eq(status(3, 0, 0), None);
+  assert_eq(status(5, 1000, 0), None);
+  assert_eq(status(5, 0, -1), None)
+}
+
+law "a status is read back from what it shows as" = round_trip(status_text, read_status)
+
+// --- Tests: what a server offers ----------------------------------------------
+
+test "what a server offers is read from the lines after its name" {
+  let c = capabilities(
+    said(250, [
+      "mx.example at your service, [192.0.2.7]",
+      "SIZE 35651584",
+      "8bitmime",
+      "AUTH LOGIN PLAIN XOAUTH2 PLAIN-CLIENTTOKEN OAUTHBEARER scram-sha-256 CRAM-MD5",
+      "ENHANCEDSTATUSCODES",
+      "PIPELINING",
+      "CHUNKING",
+      "SMTPUTF8",
+      "STARTTLS",
+      "DSN",
+      "X-EXPS GSSAPI NTLM",
+      "HELP",
+      "",
+    ]),
+  );
+  assert_eq(c.greeting, "mx.example at your service, [192.0.2.7]");
+  assert_eq(c.size, AtMost(35651584));
+  assert_eq(c.auth, [
+    sasl::Login,
+    sasl::Plain,
+    sasl::XOAuth2,
+    sasl::OAuthBearer,
+    sasl::ScramSha256,
+  ]);
+  assert_eq(c.unanswered, ["PLAIN-CLIENTTOKEN", "CRAM-MD5"]);
+  assert_eq([c.starttls, c.pipelining, c.eight_bit, c.utf8, c.chunking, c.dsn, c.enhanced], [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+  ]);
+  assert_eq(c.others, [
+    { keyword: "X-EXPS", params: ["GSSAPI", "NTLM"] },
+    { keyword: "HELP", params: [] },
+  ])
+}
+
+test "a server that names itself and nothing else offers nothing" {
+  assert_eq(capabilities(said(250, ["mx.example"])), nothing_offered("mx.example"));
+  assert_eq(capabilities(said(250, ["STARTTLS"])), nothing_offered("STARTTLS"));
+  assert_eq(capabilities(said(250, [""])), nothing_offered(""))
+}
+
+test "SIZE names a bound, or none, and AUTH is read in the form old servers wrote it too" {
+  let size_of = |line: String| capabilities(said(250, ["mx.example", line])).size;
+  assert_eq(size_of("SIZE"), Unbounded);
+  assert_eq(size_of("SIZE 0"), Unbounded);
+  assert_eq(size_of("SIZE 1000"), AtMost(1000));
+  assert_eq(size_of("size 1000"), AtMost(1000));
+  assert_eq(size_of("SIZE lots"), Unbounded);
+  assert_eq(size_of("SIZE -5"), Unbounded);
+  assert_eq(size_of("SIZES 1000"), Unsaid);
+  assert_eq(capabilities(said(250, ["mx", "AUTH=PLAIN LOGIN", "AUTH PLAIN"])).auth, [
+    sasl::Plain,
+    sasl::Login,
+  ]);
+  assert_eq(capabilities(said(250, ["mx", "AUTH"])).auth, [])
+}
+
+// --- Tests: the message as it travels -----------------------------------------
+
+type Stuffed = { body: Bytes, expect: Bytes }
+
+fn stuffings() -> List<Stuffed> =
+  [
+    { body: b"", expect: b"" },
+    {
+      body: b"Blah blah blah...\r\n...etc. etc. etc.\r\n",
+      expect: b"Blah blah blah...\r\n....etc. etc. etc.\r\n",
+    },
+    { body: b".\r\n", expect: b"..\r\n" },
+    { body: b"a\r\n.\r\nb\r\n", expect: b"a\r\n..\r\nb\r\n" },
+    { body: b".\r\n.\r\n..\r\n", expect: b"..\r\n..\r\n...\r\n" },
+    { body: b"a.b\r\nc.\r\n", expect: b"a.b\r\nc.\r\n" },
+    { body: b"\r\n.", expect: b"\r\n.." },
+  ]
+
+test "a line that opens with a dot is sent with one more" for s: Stuffed in stuffings() {
+  assert_eq(stuff(s.body), s.expect);
+  assert_eq(unstuff(s.expect), s.body)
+}
+
+/// Bytes made of the pieces a stuffing can go wrong on.
+type Lines = | Lines(Bytes)
+
+gen for Lines by lined
+
+fn lined() -> Gen<Lines> =
+  gen::map(
+    gen::list_of(
+      gen::elements([b".", b"..", b"\r\n", b"\r\n", b"a", b"\r", b"\n", b" .", b"\r\n.\r\n"]),
+      12,
+    ),
+    |pieces: List<Bytes>| Lines(bytes_concat_all(pieces)),
+  )
+
+fn unlined(l: Lines) -> Bytes = match l { Lines(body) -> body }
+
+law "a stuffed body is unstuffed to what it was" = inverse(stuff, unstuff)
+
+law "a body of dots and line breaks, stuffed, is unstuffed to what it was" =
+  inverse(|l: Lines| stuff(unlined(l)), |sent: Bytes| Lines(unstuff(sent)))
+
+law "no line of a stuffed body is a lone dot"
+  forall (l: Lines, raw: Bytes) {
+    all([unlined(l), raw], |body: Bytes|
+      !bytes::contains(bytes_concat(b"\r\n", stuff(body)), b"\r\n.\r\n"))
+  }
+
+law "a message that is sent ends at its last dot, and holds no line break but CRLF"
+  forall (l: Lines) {
+    let body = match l { Lines(given) -> given };
+    let sent = payload_of(body);
+    let n = bytes_len(sent);
+    flaw(body) != None
+      || (len(email::line_flaws(sent)) == 0
+      && bytes_index_of(bytes_concat(b"\r\n", sent), b"\r\n.\r\n") == Some(n - 3)
+      && unstuff(bytes_slice(sent, 0, n - 3)) == body)
+  }
+
+law "whatever std.email writes of a draft is a message a session takes"
+  forall (d: Draft) {
+    match email::build(d, "boundary", email::repertoire_for(d)) {
+      Err(_) -> false,
+      Ok(data) -> flaw(data) == None,
+    }
+  }
+
+type Flawed = { data: Bytes, expect: Option<Refusal> }
+
+fn flawed() -> List<Flawed> / {abort.raise} =
+  [
+    { data: b"", expect: None },
+    { data: b"Subject: hi\r\n\r\nbody\r\n", expect: None },
+    { data: b"\r\n", expect: None },
+    { data: bytes_concat(bytes::repeat(b"x", 998), b"\r\n"), expect: None },
+    { data: b"a\nb\r\n", expect: Some(Unsendable({ at: 1, why: email::BareLineFeed })) },
+    { data: b"a\r\n.\n", expect: Some(Unsendable({ at: 4, why: email::BareLineFeed })) },
+    { data: b"a\rb\r\n", expect: Some(Unsendable({ at: 1, why: email::BareCarriageReturn })) },
+    { data: b"a\r\n.\r", expect: Some(Unsendable({ at: 4, why: email::BareCarriageReturn })) },
+    {
+      data: bytes_concat(bytes::repeat(b"x", 999), b"\r\n"),
+      expect: Some(Unsendable({ at: 998, why: email::LongLine })),
+    },
+    { data: b"a\x00b\r\n", expect: Some(NulByte(1)) },
+    { data: b"a\r\nb", expect: Some(Unterminated) },
+    { data: b"a", expect: Some(Unterminated) },
+  ]
+
+test "a message that is not CRLF lines is refused where it is not, never repaired" for f: Flawed in flawed(
+  ) { assert_eq(flaw(f.data), f.expect) }
+
+test "a parameter's text is carried as printable ASCII" {
+  assert_eq(xtext("QQ314159"), "QQ314159");
+  assert_eq(xtext("Bob@Example.COM"), "Bob@Example.COM");
+  assert_eq(xtext("a+b=c d"), "a+2Bb+3Dc+20d");
+  assert_eq(xtext("caf\u{e9}\r\n"), "caf+C3+A9+0D+0A");
+  assert_eq(xtext(""), "");
+  assert_eq(original_of(email::address("Bob", "Example.COM")), "rfc822;Bob@Example.COM");
+  assert_eq(original_of(email::address("a+b", "example.org")), "rfc822;a+2Bb@example.org");
+  assert_eq(
+    original_of(email::address("j\u{fc}rgen m=1", "example.org", email::Utf8)),
+    "utf-8;\"j\u{fc}rgen\\x{20}m\\x{3D}1\"@example.org",
+  )
+}
+
+test "a client greets by a domain or an address in brackets, and by nothing else" {
+  let named = |client: String| result_is_ok(try[smtp.refused] { config(client, default_limits()) });
+  assert(named("client.example"));
+  assert(named("localhost"));
+  assert(named("[192.0.2.1]"));
+  assert(named("[IPv6:2001:db8::1]"));
+  assert(!named(""));
+  assert(!named("client.example\r\nMAIL FROM:<eve@example.org>"));
+  assert(!named("two words"));
+  assert(!named("a@b"));
+  assert(!named("b\u{fc}cher.example"));
+  assert(!named("client.example>"))
+}
+
+// --- Tests: recorded exchanges ------------------------------------------------
+
+// A recording is the lines of one exchange: `S:` before what the server said, `C:` before what
+// the client said, with `****` where it said a credential, `*: TLS` where the connection became
+// TLS and `*: closed` where the server closed it. Replaying one feeds the engine the server's
+// lines, a run of them as one read, and writes down what the engine sends: the two are the same
+// text only if the client says each of its lines, byte for byte, where the recording has it.
+
+/// What a recording has happen while the client waits.
+type Beat = | Says(Bytes) | Starts | Hangs
+
+/// What the client is asked to do when it is ready.
+type Act = | Deliver(Envelope, Bytes, Dsn) | Bye
+
+type Tape = { beats: List<Beat>, run: List<String> }
+
+fn wound(t: Tape) -> List<Beat> =
+  if len(t.run) == 0 { t.beats }
+  else { push(t.beats, Says(bytes_of_string(join(t.run, "\r\n") ++ "\r\n"))) }
+
+fn beats_of(recording: String) -> List<Beat> / {abort.raise} =
+  wound(
+    fold(string_split(recording, "\n"), { beats: [], run: [] }, |t: Tape, line: String|
+      if string_starts_with(line, "S:") {
+        {
+          beats: t.beats,
+          run: push(t.run, string_slice(line, min(3, string_len(line)), string_len(line))),
+        }
+      } else if line == "*: TLS" { { beats: push(wound(t), Starts), run: [] } }
+      else if line == "*: closed" { { beats: push(wound(t), Hangs), run: [] } }
+      else { { beats: wound(t), run: [] } }),
+  )
+
+fn marked(mark: String, sent: Bytes) -> List<String> / {abort.raise} =
+  if bytes_len(sent) < 2 { [] } else {
+    map(
+      string_split(string_of_bytes_lossy(bytes_slice(sent, 0, bytes_len(sent) - 2)), "\r\n"),
+      |line: String| if line == "" { mark } else { mark ++ " " ++ line },
+    )
+  }
+
+/// The lines a turn wrote, as a recording has them: what it sent as the bytes it sent, but for
+/// the lines of an `AUTH` exchange, which are as a session keeps them.
+fn written(t: Turn) -> List<String> / {abort.raise} =
+  concat(if contains(t.said, Upgraded) { ["*: TLS"] } else { [] }, match t.out {
+    Veiled(_, _, _) ->
+      map(filter(t.said, |l: Line| match l { Client(_) -> true, _ -> false }), |l: Line|
+        transcript_text([l])),
+    Open(sent) -> marked("C:", sent),
+  })
+
+fn stage_word(s: Stage) -> String =
+  match s { AtMail -> "MAIL", AtRcpt -> "RCPT", AtData -> "DATA", AtEnd -> "end" }
+
+fn told(d: Delivery) -> String =
+  show(d.recipient) ++ " "
+    ++ (match d.outcome {
+      Accepted(r) -> "accepted " ++ code_text(r.code),
+      Temporary(stage, r) -> "temporary " ++ stage_word(stage) ++ " " ++ code_text(r.code),
+      Permanent(stage, r) -> "permanent " ++ stage_word(stage) ++ " " ++ code_text(r.code),
+    })
+
+/// The bytes a wire writes as `net.send` would, none for a line of an `AUTH` exchange.
+fn open_bytes(w: Wire) -> Bytes = match w { Open(said) -> said, Veiled(_, _, _) -> b"" }
+
+/// A wire as a reader of what was written sees it: a line of an `AUTH` exchange with stars where
+/// the client's words go.
+fn starred_bytes(w: Wire) -> Bytes =
+  match w { Open(said) -> said, Veiled(lead, _, end) -> bytes_concat_all([lead, b"****", end]) }
+
+/// A replay so far: the lines exchanged, the bytes the client wrote with `net.send`, each line
+/// of an `AUTH` exchange as `net.send_secret` wrote it, every turn as it shows, what became of
+/// each message, and whether one is on its way.
+type Tale = {
+  lines: List<String>,
+  wire: Bytes,
+  sealed: List<Secret<Bytes>>,
+  shown: String,
+  outcomes: List<String>,
+  delivering: Bool,
+  engine: Engine,
+}
+
+type Replayed = {
+  exchange: String,
+  wire: Bytes,
+  sealed: List<Secret<Bytes>>,
+  shown: String,
+  engine: Engine,
+  ended: Result<List<String>, Refusal>,
+}
+
+fn ended(t: Tale, how: Result<List<String>, Refusal>) -> Replayed =
+  {
+    exchange: join(t.lines, "\n"),
+    wire: t.wire,
+    sealed: t.sealed,
+    shown: t.shown,
+    engine: t.engine,
+    ended: how,
+  }
+
+type Moved =
+  | Halt(Result<List<String>, Refusal>)
+  | Onward(Result<Turn, Refusal>, List<Beat>, List<Act>, Tale)
+
+fn onward(t: Turn, beats: List<Beat>, acts: List<Act>, here: Tale) -> Moved / {abort.raise} =
+  match t.next {
+    Over -> Halt(Ok(here.outcomes)),
+    Secure -> match beats {
+      [Starts, ..later] -> Onward(try[smtp.refused] { upgraded(t.engine) }, later, acts, here),
+      [Says(chunk), ..later] ->
+        Onward(try[smtp.refused] { feed(t.engine, chunk) }, later, acts, {
+          ..here,
+          lines: concat(here.lines, marked("S:", chunk)),
+        }),
+      _ -> Halt(Err(HandshakeFailed(net::Reset))),
+    },
+    Await(p) -> match beats {
+      [Says(chunk), ..later] ->
+        Onward(try[smtp.refused] { feed(t.engine, chunk) }, later, acts, {
+          ..here,
+          lines: concat(here.lines, marked("S:", chunk)),
+        }),
+      [Hangs, ..later] ->
+        Onward(try[smtp.refused] { closed(t.engine) }, later, acts, {
+          ..here,
+          lines: push(here.lines, "*: closed"),
+        }),
+      _ -> Halt(Err(TimedOut(p))),
+    },
+    Ready -> match acts {
+      [] -> Halt(Ok(here.outcomes)),
+      [Bye, ..rest] -> Onward(try[smtp.refused] { leave(t.engine) }, beats, rest, here),
+      [Deliver(envelope, data, asked), ..rest] -> match try[smtp.refused] {
+          mail(t.engine, envelope, data, asked)
+        } {
+        Ok(next_turn) -> Onward(Ok(next_turn), beats, rest, { ..here, delivering: true }),
+        Err(why) -> if !usable(why) { Halt(Err(why)) } else {
+          Onward(Ok({ ..t, out: Open(b""), said: [] }), beats, rest, {
+            ..here,
+            outcomes: push(here.outcomes, "refused: " ++ show(why)),
+          })
+        },
+      },
+    },
+  }
+
+/// `left` bounds the rounds: each takes a beat or an act.
+fn replay(
+  t: Turn,
+  beats: List<Beat>,
+  acts: List<Act>,
+  tale: Tale,
+  left: Int,
+) -> Replayed / {abort.raise} = {
+  let rests = t.next == Ready || t.next == Over;
+  let here: Tale = {
+    lines: concat(tale.lines, written(t)),
+    wire: bytes_concat(tale.wire, open_bytes(t.out)),
+    sealed: match t.out {
+      Veiled(lead, said, end) -> push(tale.sealed, net::sent_secret(lead, said, "base64", end)),
+      Open(_) -> tale.sealed,
+    },
+    shown: tale.shown ++ show(t),
+    outcomes: if tale.delivering && rests { concat(tale.outcomes, map(deliveries(t.engine), told)) }
+    else { tale.outcomes },
+    delivering: tale.delivering && !rests,
+    engine: t.engine,
+  };
+  match onward(t, beats, acts, here) {
+    Halt(how) -> ended(here, how),
+    Onward(next_turn, beats_left, acts_left, now) -> match next_turn {
+      Err(why) -> ended(now, Err(why)),
+      Ok(turned) -> if left <= 0 { ended(now, Err(NotReady)) }
+      else { replay(turned, beats_left, acts_left, now, left - 1) },
+    },
+  }
+}
+
+fn link(secure: Bool) -> Link =
+  { host: "mx.example", port: 587, secure: secure, nonce: "rOprNGfwEbeRWgbNEkqO" }
+
+fn played(
+  client: Config,
+  secure: Bool,
+  acts: List<Act>,
+  beats: List<Beat>,
+) -> Replayed / {abort.raise} = {
+  let first_turn = start(client, link(secure));
+  replay(
+    first_turn,
+    beats,
+    acts,
+    {
+      lines: [],
+      wire: b"",
+      sealed: [],
+      shown: "",
+      outcomes: [],
+      delivering: false,
+      engine: first_turn.engine,
+    },
+    2000,
+  )
+}
+
+fn replayed(
+  client: Config,
+  secure: Bool,
+  acts: List<Act>,
+  exchange: String,
+) -> Replayed / {abort.raise} = played(client, secure, acts, beats_of(exchange))
+
+fn smith() -> Address / {email.refused, abort.raise} = email::address("Smith", "bar.com")
+
+fn at_foo(names: List<String>) -> List<Address> / {email.refused, abort.raise} =
+  map(names, |who: String| email::address(who, "foo.com"))
+
+fn blah() -> Bytes = b"Blah blah blah...\r\n...etc. etc. etc.\r\n"
+
+fn deliver(names: List<String>) -> Act / {email.refused, abort.raise} =
+  Deliver(email::enveloped(ReturnTo(smith()), at_foo(names)), blah(), no_dsn())
+
+fn client() -> Config / {smtp.refused, abort.raise} = config("client.example", default_limits())
+
+fn tim() -> Credential / {sasl.refused} =
+  sasl::password("tim", secret_of_bytes(b"tanstaaftanstaaf"))
+
+fn pencil() -> Credential / {sasl.refused} = sasl::password("user", secret_of_bytes(b"pencil"))
+
+/// The credential a case gives a client, by name: a credential cannot be a case, since a case is
+/// hashed and a hash of one is something to test guesses against.
+type Held = | Nobody | Tim | Pencil | Bearer(String)
+
+/// A client's configuration as a case holds it.
+type Setup = {
+  name: String,
+  tls: Tls,
+  held: Held,
+  mechanisms: Option<List<Mechanism>>,
+  exposure: Exposure,
+  helo: Bool,
+}
+
+fn setup() -> Setup =
+  {
+    name: "client.example",
+    tls: RequireTls,
+    held: Nobody,
+    mechanisms: None,
+    exposure: Protected,
+    helo: false,
+  }
+
+fn named_as(name: String) -> Setup = { ..setup(), name: name }
+
+fn tls_as(s: Setup, policy: Tls) -> Setup = { ..s, tls: policy }
+
+fn given(s: Setup, h: Held) -> Setup = { ..s, held: h }
+
+fn mechs(s: Setup, order: List<Mechanism>) -> Setup = { ..s, mechanisms: Some(order) }
+
+fn exposed(s: Setup) -> Setup = { ..s, exposure: PasswordInClear }
+
+fn helo(s: Setup) -> Setup = { ..s, helo: true }
+
+fn configured(s: Setup) -> Config / {abort.raise} = {
+  let held = match s.held {
+    Nobody -> Ok(None),
+    Tim -> try[sasl.refused] { Some(tim()) },
+    Pencil -> try[sasl.refused] { Some(pencil()) },
+    Bearer(token) -> try[sasl.refused] {
+      Some(sasl::bearer("tim", secret_bytes(secret_of_string(token))))
+    },
+  };
+  match ((try[smtp.refused] { config(s.name, default_limits()) }, held)) {
+    (Ok(bare), Ok(credential)) -> {
+      let c = with_exposure(with_tls(bare, s.tls), s.exposure);
+      let given = match credential { Some(k) -> with_credential(c, k), None -> c };
+      let ordered = match s.mechanisms {
+        Some(order) -> with_mechanisms(given, order),
+        None -> given,
+      };
+      if s.helo { with_helo_fallback(ordered) } else { ordered }
+    },
+    _ -> panic("a case's client does not configure"),
+  }
+}
+
+type Recorded = {
+  what: String,
+  client: Setup,
+  secure: Bool,
+  acts: List<Act>,
+  exchange: String,
+  ended: Result<List<String>, Refusal>,
+}
+
+fn sendings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, abort.raise} =
+  [
+    {
+      what: "RFC 5321 D.1: three recipients, of whom one has no mailbox",
+      client: tls_as(named_as("bar.com"), Plain),
+      secure: false,
+      acts: [deliver(["Jones", "Green", "Brown"]), Bye],
+      exchange:
+        \\S: 220 foo.com Simple Mail Transfer Service Ready
+        \\C: EHLO bar.com
+        \\S: 250-foo.com greets bar.com
+        \\S: 250-8BITMIME
+        \\S: 250-SIZE
+        \\S: 250-DSN
+        \\S: 250 HELP
+        \\C: MAIL FROM:<Smith@bar.com> SIZE=38
+        \\S: 250 OK
+        \\C: RCPT TO:<Jones@foo.com>
+        \\S: 250 OK
+        \\C: RCPT TO:<Green@foo.com>
+        \\S: 550 No such user here
+        \\C: RCPT TO:<Brown@foo.com>
+        \\S: 250 OK
+        \\C: DATA
+        \\S: 354 Start mail input; end with <CRLF>.<CRLF>
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 OK
+        \\C: QUIT
+        \\S: 221 foo.com Service closing transmission channel
+      ,
+      ended: Ok([
+        "Jones@foo.com accepted 250",
+        "Green@foo.com permanent RCPT 550",
+        "Brown@foo.com accepted 250",
+      ]),
+    },
+    {
+      what: "STARTTLS, a second EHLO, AUTH PLAIN, and two messages in pipelined commands with a RSET between",
+      client: given(setup(), Tim),
+      secure: false,
+      acts: [deliver(["Jones", "Green"]), deliver(["Brown"]), Bye],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250-PIPELINING
+        \\S: 250-AUTH PLAIN LOGIN
+        \\S: 250 STARTTLS
+        \\C: STARTTLS
+        \\S: 220 2.0.0 Ready to start TLS
+        \\*: TLS
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250-PIPELINING
+        \\S: 250-SIZE 10240000
+        \\S: 250-ENHANCEDSTATUSCODES
+        \\S: 250-8BITMIME
+        \\S: 250 AUTH PLAIN LOGIN
+        \\C: AUTH PLAIN ****
+        \\S: 235 2.7.0 Authentication successful
+        \\C: MAIL FROM:<Smith@bar.com> SIZE=38
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: RCPT TO:<Green@foo.com>
+        \\C: DATA
+        \\S: 250 2.1.0 Ok
+        \\S: 250 2.1.5 Ok
+        \\S: 450 4.2.2 Mailbox full
+        \\S: 354 End data with <CR><LF>.<CR><LF>
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 2.0.0 Ok: queued as 4F2A91
+        \\C: RSET
+        \\C: MAIL FROM:<Smith@bar.com> SIZE=38
+        \\C: RCPT TO:<Brown@foo.com>
+        \\C: DATA
+        \\S: 250 2.0.0 Ok
+        \\S: 250 2.1.0 Ok
+        \\S: 250 2.1.5 Ok
+        \\S: 354 End data with <CR><LF>.<CR><LF>
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 2.0.0 Ok: queued as 4F2A92
+        \\C: QUIT
+        \\S: 221 2.0.0 Bye
+      ,
+      ended: Ok([
+        "Jones@foo.com accepted 250",
+        "Green@foo.com temporary RCPT 450",
+        "Brown@foo.com accepted 250",
+      ]),
+    },
+    {
+      what: "a sender told to come back later: every recipient may be tried again",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones", "Brown"]), Bye],
+      exchange:
+        \\S: 220-mx.example ESMTP
+        \\S: 220 Unsolicited commercial mail is not welcome here
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 ENHANCEDSTATUSCODES
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\S: 451 4.7.1 Greylisted, try again in 300 seconds
+        \\C: QUIT
+        \\S: 221 2.0.0 Bye
+      ,
+      ended: Ok(["Jones@foo.com temporary MAIL 451", "Brown@foo.com temporary MAIL 451"]),
+    },
+    {
+      what: "a server that says HELO only, to a client asked to fall back, and a recipient forwarded",
+      client: helo(tls_as(setup(), Plain)),
+      secure: false,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 old.example Sendmail 5.61 ready
+        \\C: EHLO client.example
+        \\S: 500 Command unrecognized
+        \\C: HELO client.example
+        \\S: 250 old.example Hello client.example
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\S: 250 Sender ok
+        \\C: RCPT TO:<Jones@foo.com>
+        \\S: 251 User not local; will forward to <Jones@elsewhere.example>
+        \\C: DATA
+        \\S: 354 Enter mail
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 Ok
+      ,
+      ended: Ok(["Jones@foo.com accepted 250"]),
+    },
+    {
+      what: "too many recipients for one message is a reason to send the rest again, and no DATA follows none taken",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones", "Green"]), Bye],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\S: 250 OK
+        \\C: RCPT TO:<Jones@foo.com>
+        \\S: 552 Too many recipients
+        \\C: RCPT TO:<Green@foo.com>
+        \\S: 550 No such user here
+        \\C: QUIT
+        \\S: 221 Bye
+      ,
+      ended: Ok(["Jones@foo.com temporary RCPT 552", "Green@foo.com permanent RCPT 550"]),
+    },
+    {
+      what: "a pipelined DATA given leave with no recipient taken is answered with no message",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Green"]), deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 PIPELINING
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Green@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 550 No such user here
+        \\S: 354 Go ahead
+        \\C: .
+        \\S: 554 No valid recipients
+        \\C: RSET
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: DATA
+        \\S: 250 Reset
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 554 5.5.1 Not today
+      ,
+      ended: Ok(["Green@foo.com permanent RCPT 550", "Jones@foo.com permanent DATA 554"]),
+    },
+    {
+      what: "a message refused once it was read, for good and then for now",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones", "Brown"]), deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 PIPELINING
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: RCPT TO:<Brown@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 550 5.7.1 Message content rejected
+        \\C: RSET
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 452 4.3.1 Insufficient system storage
+      ,
+      ended: Ok([
+        "Jones@foo.com permanent end 550",
+        "Brown@foo.com permanent end 550",
+        "Jones@foo.com temporary end 452",
+      ]),
+    },
+    {
+      what: "a server closing down in the middle of a message: everyone is tried again, and the session is over",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones", "Brown"]), deliver(["Green"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 PIPELINING
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: RCPT TO:<Brown@foo.com>
+        \\C: DATA
+        \\S: 250 2.1.0 Ok
+        \\S: 250 2.1.5 Ok
+        \\S: 421 4.3.2 System shutting down
+      ,
+      ended: Ok(["Jones@foo.com temporary RCPT 421", "Brown@foo.com temporary RCPT 421"]),
+    },
+    {
+      what: "a message past the size the server takes is refused before a byte of it is sent, and the session goes on",
+      client: setup(),
+      secure: true,
+      acts: [
+        deliver(["Jones"]),
+        Deliver(email::enveloped(ReturnTo(smith()), at_foo(["Jones"])), b"Hi\r\n", no_dsn()),
+      ],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 SIZE 30
+        \\C: MAIL FROM:<Smith@bar.com> SIZE=4
+        \\S: 250 OK
+        \\C: RCPT TO:<Jones@foo.com>
+        \\S: 250 OK
+        \\C: DATA
+        \\S: 354 Go ahead
+        \\C: Hi
+        \\C: .
+        \\S: 250 OK
+      ,
+      ended: Ok(["refused: TooLarge(38, 30)", "Jones@foo.com accepted 250"]),
+    },
+    {
+      what: "addresses and bytes outside ASCII go only to a server that takes them, and are declared",
+      client: setup(),
+      secure: true,
+      acts: [
+        Deliver(
+          email::enveloped(ReturnTo(smith()), [
+            email::address("\u{7528}\u{6237}", "\u{4f8b}\u{3048}.jp", email::Utf8),
+          ]),
+          bytes_of_string("Subject: hi\r\n\r\nGr\u{fc}\u{df}e\r\n"),
+          no_dsn(),
+        ),
+        Deliver(
+          email::enveloped(ReturnTo(smith()), at_foo(["Jones"])),
+          bytes_of_string("Subject: Gr\u{fc}\u{df}e\r\n\r\nHi.\r\n"),
+          no_dsn(),
+        ),
+        Deliver(
+          email::enveloped(ReturnTo(smith()), at_foo(["Jones"])),
+          bytes_of_string("Subject: hi\r\n\r\nGr\u{fc}\u{df}e\r\n"),
+          no_dsn(),
+        ),
+      ],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250-PIPELINING
+        \\S: 250-8BITMIME
+        \\S: 250 SMTPUTF8
+        \\C: MAIL FROM:<Smith@bar.com> BODY=8BITMIME SMTPUTF8
+        \\C: RCPT TO:<用户@例え.jp>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Subject: hi
+        \\C:
+        \\C: Grüße
+        \\C: .
+        \\S: 250 OK
+        \\C: RSET
+        \\C: MAIL FROM:<Smith@bar.com> BODY=8BITMIME SMTPUTF8
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Subject: Grüße
+        \\C:
+        \\C: Hi.
+        \\C: .
+        \\S: 250 OK
+        \\C: RSET
+        \\C: MAIL FROM:<Smith@bar.com> BODY=8BITMIME
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Subject: hi
+        \\C:
+        \\C: Grüße
+        \\C: .
+        \\S: 250 OK
+      ,
+      ended: Ok([
+        "\u{7528}\u{6237}@\u{4f8b}\u{3048}.jp accepted 250",
+        "Jones@foo.com accepted 250",
+        "Jones@foo.com accepted 250",
+      ]),
+    },
+    {
+      what: "a server that takes neither is sent neither, and the session goes on",
+      client: setup(),
+      secure: true,
+      acts: [
+        Deliver(
+          email::enveloped(ReturnTo(smith()), [
+            email::address("\u{7528}\u{6237}", "example.org", email::Utf8),
+          ]),
+          blah(),
+          no_dsn(),
+        ),
+        Deliver(
+          email::enveloped(ReturnTo(smith()), at_foo(["Jones"])),
+          bytes_of_string("Subject: Gr\u{fc}\u{df}e\r\n\r\nHi.\r\n"),
+          no_dsn(),
+        ),
+        Deliver(email::enveloped(ReturnTo(smith()), at_foo(["Jones"])), blah(), {
+          ret: None,
+          envelope_id: None,
+          notify: Some([]),
+          original: false,
+        }),
+        Deliver(email::enveloped(ReturnTo(smith()), []), blah(), no_dsn()),
+        Deliver(email::enveloped(ReturnTo(smith()), at_foo(["Jones"])), b"a\nb\r\n", no_dsn()),
+        Bye,
+      ],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+        \\C: QUIT
+        \\S: 221 Bye
+      ,
+      ended: Ok([
+        "refused: Unoffered(SmtpUtf8)",
+        "refused: Unoffered(EightBitMime)",
+        "refused: Unoffered(Notices)",
+        "refused: NoRecipients",
+        "refused: Unsendable({at: 1, why: BareLineFeed})",
+      ]),
+    },
+    {
+      what: "RFC 3461's requests for reports, a bounce's null reverse path, and a local part that needs its quotes",
+      client: setup(),
+      secure: true,
+      acts: [
+        Deliver(
+          email::enveloped(ReturnTo(email::address("Alice", "Example.ORG")), [
+            email::address("Bob", "Example.COM"),
+            email::address("john doe", "example.org"),
+          ]),
+          blah(),
+          {
+            ret: Some(Headers),
+            envelope_id: Some("QQ314159"),
+            notify: Some([Failed, Delivered]),
+            original: true,
+          },
+        ),
+        Deliver(email::enveloped(NullPath, [email::address("Alice", "Example.ORG")]), blah(), {
+          ret: Some(Full),
+          envelope_id: None,
+          notify: Some([]),
+          original: false,
+        }),
+        Deliver(email::enveloped(NullPath, [email::address("Alice", "Example.ORG")]), blah(), {
+          ret: None,
+          envelope_id: Some("caf\u{e9}"),
+          notify: None,
+          original: false,
+        }),
+      ],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250-PIPELINING
+        \\S: 250 DSN
+        \\C: MAIL FROM:<Alice@Example.ORG> RET=HDRS ENVID=QQ314159
+        \\C: RCPT TO:<Bob@Example.COM> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;Bob@Example.COM
+        \\C: RCPT TO:<"john doe"@example.org> NOTIFY=SUCCESS,FAILURE ORCPT=rfc822;"john+20doe"@example.org
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 OK
+        \\C: RSET
+        \\C: MAIL FROM:<> RET=FULL
+        \\C: RCPT TO:<Alice@Example.ORG> NOTIFY=NEVER
+        \\C: DATA
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 250 OK
+        \\S: 354 Go ahead
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\S: 250 OK
+      ,
+      ended: Ok([
+        "Bob@Example.COM accepted 250",
+        "\"john doe\"@example.org accepted 250",
+        "Alice@Example.ORG accepted 250",
+        "refused: BadEnvelopeId",
+      ]),
+    },
+  ]
+
+test "a message is sent as recorded, and what became of it is answered for each recipient" for r: Recorded in sendings(
+  ) {
+  let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
+  assert_eq(got.exchange, r.exchange);
+  assert_eq(got.ended, r.ended)
+}
+
+fn failings() -> List<Recorded> / {smtp.refused, sasl.refused, email.refused, abort.raise} =
+  [
+    {
+      what: "CVE-2011-0411: what is read with the leave to start TLS is not kept for after it",
+      client: setup(),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 STARTTLS
+        \\C: STARTTLS
+        \\S: 220 2.0.0 Ready to start TLS
+        \\S: 250-mx.example
+        \\S: 250 AUTH PLAIN
+      ,
+      ended: Err(Injected),
+    },
+    {
+      what: "a server that drops the connection after the message was sent",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\S: 250 OK
+        \\C: RCPT TO:<Jones@foo.com>
+        \\S: 250 OK
+        \\C: DATA
+        \\S: 354 Go ahead
+        \\C: Blah blah blah...
+        \\C: ....etc. etc. etc.
+        \\C: .
+        \\*: closed
+      ,
+      ended: Err(Closed(Body)),
+    },
+    {
+      what: "a server that drops the connection before it gave leave to send",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 PIPELINING
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\C: RCPT TO:<Jones@foo.com>
+        \\C: DATA
+        \\S: 250 OK
+        \\*: closed
+      ,
+      ended: Err(Closed(Rcpt)),
+    },
+    {
+      what: "a server that offers nothing, where TLS is required",
+      client: setup(),
+      secure: false,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+      ,
+      ended: Err(NoTls),
+    },
+    {
+      what: "a server that offers nothing, to a client with a credential to prove",
+      client: given(setup(), Tim),
+      secure: true,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+      ,
+      ended: Err(NoMechanism),
+    },
+    {
+      what: "a server that refuses EHLO, to a client not asked to fall back",
+      client: tls_as(setup(), Plain),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 old.example Sendmail 5.61 ready
+        \\C: EHLO client.example
+        \\S: 500 Command unrecognized
+      ,
+      ended: Err(Unexpected(Hello, said(500, ["Command unrecognized"]))),
+    },
+    {
+      what: "a server that does not take mail",
+      client: setup(),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 554 No SMTP service here
+      ,
+      ended: Err(Unexpected(Greeting, said(554, ["No SMTP service here"]))),
+    },
+    {
+      what: "a server that says more than it was asked",
+      client: setup(),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\S: 250 and something no one asked for
+      ,
+      ended: Err(Unsolicited),
+    },
+    {
+      what: "a server that offers STARTTLS and then refuses it, where TLS is required",
+      client: setup(),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 STARTTLS
+        \\C: STARTTLS
+        \\S: 454 4.7.0 TLS not available due to temporary reason
+      ,
+      ended: Err(
+        Unexpected(StartTls, said(454, ["4.7.0 TLS not available due to temporary reason"])),
+      ),
+    },
+    {
+      what: "the same server, to a client that takes TLS where it is to be had",
+      client: tls_as(setup(), Opportunistic),
+      secure: false,
+      acts: [Bye],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 STARTTLS
+        \\C: STARTTLS
+        \\S: 454 4.7.0 TLS not available due to temporary reason
+        \\C: QUIT
+        \\*: closed
+      ,
+      ended: Ok([]),
+    },
+    {
+      what: "a client asked for no TLS does not ask the server for it",
+      client: tls_as(setup(), Plain),
+      secure: false,
+      acts: [Bye],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 STARTTLS
+        \\C: QUIT
+        \\S: 221 Bye
+      ,
+      ended: Ok([]),
+    },
+    {
+      what: "a password is not sent in the clear",
+      client: given(tls_as(setup(), Opportunistic), Tim),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH LOGIN PLAIN
+      ,
+      ended: Err(InClear(sasl::Plain)),
+    },
+    {
+      what: "unless the caller says so by name",
+      client: exposed(given(tls_as(setup(), Plain), Tim)),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH LOGIN PLAIN
+        \\C: AUTH PLAIN ****
+        \\S: 235 2.7.0 Authentication successful
+      ,
+      ended: Ok([]),
+    },
+    {
+      what: "RFC 7677's exchange: SCRAM proves a password in the clear without sending it, and holds the server to its proof",
+      client: given(tls_as(setup(), Opportunistic), Pencil),
+      secure: false,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH PLAIN SCRAM-SHA-256
+        \\C: AUTH SCRAM-SHA-256 ****
+        \\S: 334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxTyVodllEcFdVYTJSYVRDQWZ1eEZJbGopaE5sRiRrMCxzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTQwOTY=
+        \\C: ****
+        \\S: 334 dj02cnJpVFJCaTIzV3BSUi93dHVwK21NaFVaVW4vZEI1bkxUSlJzamw5NUc0PQ==
+        \\C: ****
+        \\S: 235 2.7.0 Authentication successful
+      ,
+      ended: Ok([]),
+    },
+    {
+      what: "a SCRAM server that says welcome before it has proved it knows the password",
+      client: given(setup(), Pencil),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH SCRAM-SHA-256
+        \\C: AUTH SCRAM-SHA-256 ****
+        \\S: 334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxTyVodllEcFdVYTJSYVRDQWZ1eEZJbGopaE5sRiRrMCxzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTQwOTY=
+        \\C: ****
+        \\S: 235 2.7.0 Authentication successful
+      ,
+      ended: Err(BadAuth(sasl::Unproven)),
+    },
+    {
+      what: "a SCRAM server whose proof is not the password's",
+      client: given(setup(), Pencil),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH SCRAM-SHA-256
+        \\C: AUTH SCRAM-SHA-256 ****
+        \\S: 334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxTyVodllEcFdVYTJSYVRDQWZ1eEZJbGopaE5sRiRrMCxzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTQwOTY=
+        \\C: ****
+        \\S: 334 dj1BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBPQ==
+      ,
+      ended: Err(BadAuth(sasl::Unproven)),
+    },
+    {
+      what: "LOGIN, asked for alone, and a credential the server does not take",
+      client: mechs(given(setup(), Tim), [sasl::Login]),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH PLAIN LOGIN
+        \\C: AUTH LOGIN
+        \\S: 334 VXNlcm5hbWU6
+        \\C: ****
+        \\S: 334 UGFzc3dvcmQ6
+        \\C: ****
+        \\S: 535 5.7.8 Authentication credentials invalid
+      ,
+      ended: Err(Denied(said(535, ["5.7.8 Authentication credentials invalid"]))),
+    },
+    {
+      what: "RFC 7628: a token refused is explained, answered with one byte, and then refused",
+      client: given(setup(), Bearer("ya29.token")),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH XOAUTH2 OAUTHBEARER
+        \\C: AUTH OAUTHBEARER ****
+        \\S: 334 eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIiwic2NvcGUiOiJtYWlsIn0=
+        \\C: ****
+        \\S: 535 5.7.8 Authentication failed
+      ,
+      ended: Err(Denied(said(535, ["5.7.8 Authentication failed"]))),
+    },
+    {
+      what: "a token too long for the command's line is sent on a line of its own, once the server asks",
+      client: given(setup(), Bearer("ya29." ++ string::repeat("x", 600))),
+      secure: true,
+      acts: [Bye],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH XOAUTH2
+        \\C: AUTH XOAUTH2
+        \\S: 334
+        \\C: ****
+        \\S: 235 2.7.0 Accepted
+        \\C: QUIT
+        \\S: 221 2.0.0 closing connection
+      ,
+      ended: Ok([]),
+    },
+    {
+      what: "a challenge that is no base64",
+      client: mechs(given(setup(), Tim), [sasl::Login]),
+      secure: true,
+      acts: [],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH LOGIN
+        \\C: AUTH LOGIN
+        \\S: 334 Username:
+      ,
+      ended: Err(BadAuth(sasl::BadChallenge)),
+    },
+    {
+      what: "a server that answers a command with a code no command of the kind has",
+      client: setup(),
+      secure: true,
+      acts: [deliver(["Jones"])],
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250 mx.example
+        \\C: MAIL FROM:<Smith@bar.com>
+        \\S: 354 Go ahead
+      ,
+      ended: Err(Unexpected(Mail, said(354, ["Go ahead"]))),
+    },
+  ]
+
+test "an exchange that goes wrong is refused where it does, and for the reason it does" for r: Recorded in failings(
+  ) {
+  let got = replayed(configured(r.client), r.secure, r.acts, r.exchange);
+  assert_eq(got.exchange, r.exchange);
+  assert_eq(got.ended, r.ended)
+}
+
+/// `beats` with what the server says cut into reads of `size` bytes.
+fn recut(beats: List<Beat>, size: Int) -> List<Beat> / {abort.raise} =
+  list::flat_map(beats, |b: Beat|
+    match b {
+      Says(chunk) ->
+        map(range(0, (bytes_len(chunk) + size - 1) / size), |i: Int|
+          Says(bytes_slice(chunk, i * size, min(bytes_len(chunk), (i + 1) * size)))),
+      other -> [other],
+    })
+
+// A reply no command asked for is told from an answer only by arriving before the command was
+// written, so that one recording is left out.
+test "however the server's bytes are cut into reads, the client says the same and ends the same" {
+  let cases = filter(concat(sendings(), failings()), |r: Recorded| r.ended != Err(Unsolicited));
+  let differing = list::flat_map(cases, |r: Recorded| {
+    let whole = replayed(configured(r.client), r.secure, r.acts, r.exchange);
+    map(
+      filter([1, 2, 3, 5, 7, 64], |size: Int| {
+        let cut = played(configured(r.client), r.secure, r.acts, recut(beats_of(r.exchange), size));
+        cut.wire != whole.wire || cut.sealed != whole.sealed || cut.ended != whole.ended
+      }),
+      |size: Int| r.what ++ ", in reads of " ++ int_to_string(size),
+    )
+  });
+  assert_eq(differing, [])
+}
+
+// --- Tests: credentials -------------------------------------------------------
+
+/// An exchange that proves a credential: what must never show or be sent as plain bytes, what is
+/// sent as plain bytes all the same, and each line of the `AUTH` exchange, in order, as the server
+/// must be sent it sealed.
+type Proven = {
+  what: String,
+  client: Setup,
+  secure: Bool,
+  exchange: String,
+  hidden: List<String>,
+  sent: List<String>,
+  veiled: List<Bytes>,
+}
+
+/// XOAUTH2's message for `tim` and a token of 600 `x`s after `ya29.`, as a line.
+fn long_bearer_line() -> Bytes / {abort.raise} =
+  bytes_of_string(
+    base64_encode(
+        bytes_of_string(
+          "user=tim\u{1}auth=Bearer ya29." ++ string::repeat("x", 600) ++ "\u{1}\u{1}",
+        ),
+      )
+      ++ "\r\n",
+  )
+
+fn provings() -> List<Proven> / {smtp.refused, sasl.refused, abort.raise} =
+  [
+    {
+      what: "PLAIN: RFC 4616's message, in base64",
+      client: given(setup(), Tim),
+      secure: true,
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH LOGIN PLAIN
+        \\C: AUTH PLAIN ****
+        \\S: 535 5.7.8 Authentication credentials invalid
+      ,
+      hidden: ["tanstaaf", "AHRpbQB0YW5zdGFhZnRhbnN0YWFm", "dGFuc3RhYWZ0YW5zdGFhZg"],
+      sent: ["EHLO client.example\r\n"],
+      veiled: [b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n"],
+    },
+    {
+      what: "LOGIN: the name and then the password",
+      client: mechs(given(setup(), Tim), [sasl::Login]),
+      secure: true,
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH LOGIN PLAIN
+        \\C: AUTH LOGIN
+        \\S: 334 VXNlcm5hbWU6
+        \\C: ****
+        \\S: 334 UGFzc3dvcmQ6
+        \\C: ****
+        \\S: 235 2.7.0 Accepted
+      ,
+      hidden: ["tanstaaf", "dGFuc3RhYWZ0YW5zdGFhZg"],
+      sent: ["EHLO client.example\r\nAUTH LOGIN\r\n"],
+      veiled: [b"dGlt\r\n", b"dGFuc3RhYWZ0YW5zdGFhZg==\r\n"],
+    },
+    {
+      what: "SCRAM-SHA-256: RFC 7677's messages, and an empty line once the server has proved itself",
+      client: given(setup(), Pencil),
+      secure: true,
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH PLAIN SCRAM-SHA-256
+        \\C: AUTH SCRAM-SHA-256 ****
+        \\S: 334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxTyVodllEcFdVYTJSYVRDQWZ1eEZJbGopaE5sRiRrMCxzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTQwOTY=
+        \\C: ****
+        \\S: 334 dj02cnJpVFJCaTIzV3BSUi93dHVwK21NaFVaVW4vZEI1bkxUSlJzamw5NUc0PQ==
+        \\C: ****
+        \\S: 235 2.7.0 Accepted
+      ,
+      hidden: ["pencil", "dHzbZapWIk4jUhN", "Yz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEy"],
+      sent: ["EHLO client.example\r\n"],
+      veiled: [
+        b"AUTH SCRAM-SHA-256 biwsbj11c2VyLHI9ck9wck5HZndFYmVSV2diTkVrcU8=\r\n",
+        b"Yz1iaXdzLHI9ck9wck5HZndFYmVSV2diTkVrcU8laHZZRHBXVWEyUmFUQ0FmdXhGSWxqKWhObEYkazAscD1kSHpiWmFwV0lrNGpVaE4rVXRlOXl0YWc5empmTUhnc3FtbWl6N0FuZFZRPQ==\r\n",
+        b"\r\n",
+      ],
+    },
+    {
+      what: "OAUTHBEARER: RFC 7628's message, and its one byte to a refusal",
+      client: given(setup(), Bearer("ya29.token")),
+      secure: true,
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH XOAUTH2 OAUTHBEARER
+        \\C: AUTH OAUTHBEARER ****
+        \\S: 334 eyJzdGF0dXMiOiJpbnZhbGlkX3Rva2VuIiwic2NvcGUiOiJtYWlsIn0=
+        \\C: ****
+        \\S: 535 5.7.8 Authentication failed
+      ,
+      hidden: [
+        "ya29",
+        "bixhPXRpbSwBaG9zdD1teC5leGFtcGxlAXBvcnQ9NTg3AWF1dGg9QmVhcmVyIHlhMjkudG9rZW4BAQ",
+      ],
+      sent: ["EHLO client.example\r\n"],
+      veiled: [
+        b"AUTH OAUTHBEARER bixhPXRpbSwBaG9zdD1teC5leGFtcGxlAXBvcnQ9NTg3AWF1dGg9QmVhcmVyIHlhMjkudG9rZW4BAQ==\r\n",
+        b"AQ==\r\n",
+      ],
+    },
+    {
+      what: "XOAUTH2, on a line of its own where it is too long for the command's",
+      client: given(setup(), Bearer("ya29." ++ string::repeat("x", 600))),
+      secure: true,
+      exchange:
+        \\S: 220 mx.example ESMTP
+        \\C: EHLO client.example
+        \\S: 250-mx.example
+        \\S: 250 AUTH XOAUTH2
+        \\C: AUTH XOAUTH2
+        \\S: 334
+        \\C: ****
+        \\S: 235 2.7.0 Accepted
+      ,
+      hidden: ["ya29", "xxxxxxxx", "dXNlcj10aW0BYXV0aD1CZWFyZXIgeWEyOS54"],
+      sent: ["EHLO client.example\r\nAUTH XOAUTH2\r\n"],
+      veiled: [long_bearer_line()],
+    },
+  ]
+
+test "a credential goes to the server sealed and nowhere else: not into a refusal, a turn as it shows, the lines a session keeps, or the plain bytes it writes" for p: Proven in provings(
+  ) {
+  let got = replayed(configured(p.client), p.secure, [], p.exchange);
+  let wire = string_of_bytes_lossy(got.wire);
+  assert_eq(got.exchange, p.exchange);
+  assert(all(p.sent, |part: String| string_contains(wire, part)));
+  assert(got.sealed == map(p.veiled, secret_of_bytes));
+  assert(
+    all(p.hidden, |part: String|
+      !string_contains(wire, part) && !string_contains(got.exchange, part)
+        && !string_contains(got.shown, part)
+        && !string_contains(show(got.ended), part)
+        && !string_contains(show(got.engine), part)
+        && !string_contains(show(configured(p.client)), part)),
+  )
+}
+
+test "a turn that carries a credential shows stars where it carries it" {
+  let got = replayed(
+    with_credential(client(), tim()),
+    true,
+    [],
+    \\S: 220 mx.example ESMTP
+    \\C: EHLO client.example
+    \\S: 250-mx.example
+    \\S: 250 AUTH PLAIN
+  );
+  assert(string_contains(got.shown, "out: ****"));
+  assert(string_contains(got.shown, "Client(\"AUTH PLAIN ****\")"));
+  assert(string_contains(got.shown, "credential: Some(password(\"tim\", ****))"));
+  assert(string_contains(got.shown, "out: b\"EHLO client.example\\r\\n\""))
+}
+
+// --- Tests: the engine's laws -------------------------------------------------
+
+fn offering(lines: List<String>) -> Bytes = render_reply({ code: Code(250), lines: lines })
+
+law "what a server offered before TLS is forgotten: after it the client knows the second EHLO's answer alone"
+  forall (before: Reply, after: Reply) {
+    match try[smtp.refused] { config("client.example", default_limits()) } {
+      Err(_) -> false,
+      Ok(plain_client) -> {
+        let asked = played(plain_client, false, [], [
+          Says(b"220 mx.example ESMTP\r\n"),
+          Says(offering(push(before.lines, "STARTTLS"))),
+          Says(b"220 Go ahead\r\n"),
+        ]);
+        let got = played(plain_client, false, [], [
+          Says(b"220 mx.example ESMTP\r\n"),
+          Says(offering(push(before.lines, "STARTTLS"))),
+          Says(b"220 Go ahead\r\n"),
+          Starts,
+          Says(offering(after.lines)),
+        ]);
+        asked.ended == Err(HandshakeFailed(net::Reset)) && !secured(asked.engine)
+          && offered(asked.engine)
+          == Some(capabilities({ code: Code(250), lines: push(before.lines, "STARTTLS") }))
+          && got.ended == Ok([])
+          && secured(got.engine)
+          && offered(got.engine) == Some(capabilities({ code: Code(250), lines: after.lines }))
+      },
+    }
+  }
+
+/// What a server might say: whole replies of every kind, the ones that move an exchange on,
+/// and bytes that are no reply at all.
+type Script = | Script(List<Bytes>)
+
+gen for Script by scripts
+
+/// How far a script takes an exchange before anything may follow: a greeting, an answer to
+/// `EHLO`, and then what the client of one configuration or another waits for next.
+fn openings() -> List<List<Bytes>> = {
+  let greeting = b"220 mx.example ESMTP\r\n";
+  let offer = b"250-mx.example\r\n250-PIPELINING\r\n250-STARTTLS\r\n250 AUTH PLAIN LOGIN SCRAM-SHA-256\r\n";
+  let bare_offer = b"250-mx.example\r\n250-SIZE 100\r\n250 AUTH LOGIN\r\n";
+  let challenge = b"334 cj1yT3ByTkdmd0ViZVJXZ2JORWtxT3NlcnZlcixzPVcyMlphSjBTTlk3c29Fc1VFamI2Z1E9PSxpPTI=\r\n";
+  [
+    [],
+    [greeting],
+    [greeting, offer],
+    [greeting, offer, b"220 Go ahead\r\n", offer],
+    [greeting, offer, b"220 Go ahead\r\n", offer, b"235 Accepted\r\n"],
+    [
+      greeting,
+      offer,
+      b"220 Go ahead\r\n",
+      bare_offer,
+      b"334 VXNlcm5hbWU6\r\n",
+      b"334 UGFzc3dvcmQ6\r\n",
+    ],
+    [greeting, offer, b"235 Accepted\r\n"],
+    [greeting, offer, challenge],
+    [greeting, offer, challenge, b"334 dj1BQUFB\r\n"],
+    [greeting, bare_offer],
+    [greeting, bare_offer, b"250 OK\r\n", b"250 OK\r\n", b"354 Go ahead\r\n"],
+    [greeting, bare_offer, b"334 VXNlcm5hbWU6\r\n", b"334 UGFzc3dvcmQ6\r\n", b"235 Accepted\r\n"],
+    [greeting, b"250-mx.example\r\n250 AUTH PLAIN\r\n", b"235 Accepted\r\n"],
+    [greeting, b"500 What?\r\n", b"250 mx.example\r\n"],
+  ]
+}
+
+fn scripts() -> Gen<Script> =
+  gen::map2(
+    gen::elements(openings()),
+    gen::list_of(
+      gen::one_of([
+        gen::map(replies(), render_reply),
+        gen::elements([
+          b"250 OK\r\n",
+          b"250 OK\r\n",
+          b"250 OK\r\n250 OK\r\n",
+          b"250 OK\r\n250 OK\r\n354 Go ahead\r\n",
+          b"354 Go ahead\r\n",
+          b"235 Accepted\r\n",
+          b"334\r\n",
+          b"220 Go ahead\r\n",
+          b"421 Closing\r\n",
+          b"550 No\r\n",
+          b"451 Later\r\n",
+          b"221 Bye\r\n",
+          b"250-half a reply\r\n",
+          b"250 no line end",
+        ]),
+        gen::and_then(gen::int_between(0, 12), |n: Int| gen::bytes_of(n)),
+      ]),
+      14,
+    ),
+    |opened: List<Bytes>, chunks: List<Bytes>| Script(concat(opened, chunks)),
+  )
+
+fn whole_lines(sent: Bytes) -> Bool / {abort.raise} =
+  bytes_len(sent) == 0
+    || (peek(sent, bytes_len(sent) - 1) == b'\n'
+    && all(email::line_flaws(sent), |f: email::Refusal| f.why == email::LongLine))
+
+/// What an engine writes when it is fed `chunks`, asked to send to `envelope` whenever it is
+/// ready, and upgraded whenever it asks; `None` where at some turn it holds more than its
+/// limit or writes what is not whole lines. `left` bounds the turns.
+fn driven(
+  t: Turn,
+  chunks: List<Bytes>,
+  envelope: Envelope,
+  wrote: Bytes,
+  left: Int,
+) -> Option<Bytes> / {abort.raise} = {
+  let fine = holding(t.engine) <= config_of(t.engine).limits.reply && room(t.engine) >= 1
+    && whole_lines(starred_bytes(t.out));
+  let so_far = bytes_concat(wrote, starred_bytes(t.out));
+  let fed = match t.next { Await(_) -> true, _ -> false };
+  let next_turn = match t.next {
+    Over -> None,
+    Secure -> Some(try[smtp.refused] { upgraded(t.engine) }),
+    Ready ->
+      Some(if left % 5 == 0 { try[smtp.refused] { leave(t.engine) } }
+      else { try[smtp.refused] { mail(t.engine, envelope, blah()) } }),
+    Await(_) -> match first(chunks) {
+      Some(chunk) -> Some(try[smtp.refused] { feed(t.engine, chunk) }),
+      None -> None,
+    },
+  };
+  if !fine { None } else {
+    match next_turn {
+      Some(Ok(turned)) -> if left <= 0 { Some(so_far) } else {
+        driven(turned, if fed { list::drop(chunks, 1) } else { chunks }, envelope, so_far, left - 1)
+      },
+      _ -> Some(so_far),
+    }
+  }
+}
+
+/// `driven` for a client of one of twenty-four configurations, over a connection that is TLS or
+/// not; `None` too where a turn fails in any way but a refusal.
+fn driven_as(chunks: List<Bytes>, envelope: Envelope, secure: Bool, shape: Int) -> Option<Bytes> = {
+  let limits: Limits = { line: 80, reply: 120, scram_iterations: 4, transcript: 0 };
+  let kind = (shape % 24 + 24) % 24;
+  let policy = if kind % 3 == 0 { RequireTls }
+  else if kind % 3 == 1 { Opportunistic }
+  else { Plain };
+  match try[abort.raise] {
+      match try[smtp.refused] { config("client.example", limits) } {
+        Err(_) -> None,
+        Ok(bare) -> match try[sasl.refused] { sasl::password("user", secret_of_bytes(b"pencil")) } {
+          Err(_) -> None,
+          Ok(held) -> {
+            let c = with_exposure(
+              with_tls(if kind % 2 == 0 { bare } else { with_credential(bare, held) }, policy),
+              if kind % 4 < 2 { Protected } else { PasswordInClear },
+            );
+            driven(start(c, link(secure)), chunks, envelope, b"", 40)
+          },
+        },
+      }
+    } {
+    Ok(wrote) -> wrote,
+    Err(_) -> None,
+  }
+}
+
+/// The answers of a server that takes everything, whatever the client's address.
+fn open_handed() -> List<Bytes> =
+  [b"220 mx.example ESMTP\r\n", b"250-mx.example\r\n250-PIPELINING\r\n250 SMTPUTF8\r\n"]
+
+law "whatever a server sends, the client answers or refuses: it fails no other way, holds no more than its limit, and writes whole lines"
+  forall (s: Script, envelope: Envelope, shape: Int) {
+    match s {
+      Script(chunks) ->
+        driven_as(chunks, envelope, true, shape) != None
+          && driven_as(chunks, envelope, false, shape) != None
+          && driven_as(concat(open_handed(), chunks), envelope, true, shape) != None,
+    }
+  }
+
+test "the scripts a law draws take a client through every part of a session" {
+  let wrote = list::flat_map(range(0, 400), |root: Int|
+    match gen::sample(scripts(), root, b"scripts", root % 30, None).value {
+      None -> [],
+      Some(Script(chunks)) -> match gen::sample(
+          email::envelopes(),
+          root,
+          b"envelopes",
+          root % 30,
+          None,
+        ).value {
+        None -> [],
+        Some(envelope) ->
+          map(
+            list::somes([
+              driven_as(chunks, envelope, true, root),
+              driven_as(chunks, envelope, false, root),
+              driven_as(concat(open_handed(), chunks), envelope, true, root),
+            ]),
+            string_of_bytes_lossy,
+          ),
+      },
+    });
+  let some = |part: String| any(wrote, |sent: String| string_contains(sent, part));
+  assert_eq(len(wrote), 1200);
+  assert(some("EHLO client.example\r\nSTARTTLS\r\nEHLO client.example\r\n"));
+  assert(some("AUTH PLAIN "));
+  assert(some("AUTH LOGIN\r\n"));
+  assert(some("AUTH SCRAM-SHA-256 "));
+  assert(some("MAIL FROM:<"));
+  assert(some("RSET\r\n"));
+  assert(some("DATA\r\nBlah blah blah...\r\n....etc. etc. etc.\r\n.\r\n"));
+  assert(some("SMTPUTF8\r\n"));
+  assert(some("QUIT\r\n"))
+}
+
+// --- Tests: sessions over the in-memory network --------------------------------
+
+/// A network where `mx.example` is a server at `port` that answers each connection with the
+/// next of `scripts`.
+fn serving(port: Int, scripts: List<List<net::Step>>) -> net::MemNet / {abort.raise} =
+  net::mem_serving(
+    net::mem_resolving(
+      net::mem_empty(),
+      dns::with_name(dns::table(), "mx.example", [ip::loopback_v4()]),
+    ),
+    ip::socket_at(ip::loopback_v4(), port),
+    scripts,
+  )
+
+/// A recording's server side as a scripted peer: what it says, an upgrade where the connection
+/// became TLS, and its going away where it closed.
+fn script_of(beats: List<Beat>) -> List<net::Step> =
+  map(beats, |b: Beat|
+    match b { Says(chunk) -> net::Says(chunk), Starts -> net::Upgrades, Hangs -> net::Leaves })
+
+/// A recording of a session over TLS from its first byte, as a scripted peer.
+fn implicit(exchange: String) -> List<net::Step> / {abort.raise} =
+  list::prepend(net::Upgrades, script_of(beats_of(exchange)))
+
+/// A recording with no credential in it as a peer that also hears each line the client said
+/// there before it goes on, so that a client that says anything else fails where it says it.
+fn scripted(exchange: String) -> List<net::Step> / {abort.raise} = {
+  let grouped = fold(
+    string_split(exchange, "\n"),
+    { steps: [], mark: "", run: [] },
+    |g: Grouped, line: String| {
+      let mark = string_slice(line, 0, min(2, string_len(line)));
+      if line == "*: TLS" { { steps: push(flushed(g), net::Upgrades), mark: "", run: [] } }
+      else if line == "*: closed" { { steps: push(flushed(g), net::Leaves), mark: "", run: [] } }
+      else if mark == g.mark { { ..g, run: push(g.run, line) } }
+      else { { steps: flushed(g), mark: mark, run: [line] } }
+    },
+  );
+  flushed(grouped)
+}
+
+/// A run of a recording's lines, all the server's or all the client's, and the steps before it.
+type Grouped = { steps: List<net::Step>, mark: String, run: List<String> }
+
+fn flushed(g: Grouped) -> List<net::Step> / {abort.raise} =
+  if g.run == [] { g.steps } else {
+    let said = bytes_of_string(
+      join(
+          map(g.run, |line: String| string_slice(line, min(3, string_len(line)), string_len(line))),
+          "\r\n",
+        )
+        ++ "\r\n",
+    );
+    push(g.steps, if g.mark == "S:" { net::Says(said) } else { net::Hears(said) })
+  }
+
+/// What `go` answered over `world`, in a simulated run with no deadline above it, its nonces
+/// and its clock's date fixed.
+fn on_mx<a>(
+  world: net::MemNet,
+  go: () -> a / {net.write[mail], clock.read, clock.write, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise},
+) -> net::Over<Result<a, Refusal>> / {sim.read, abort.raise} =
+  net::on_mem(world, ||
+    simulate {
+      task::unbounded(||
+        handle {
+          try[smtp.refused] { go() }
+        } with {
+          entropy.next() -> 7,
+          time.now_ms() -> 880127706123,
+        })
+    })
+
+fn submission() -> String =
+  \\S: 220 mx.example ESMTP
+  \\C: EHLO client.example
+  \\S: 250-mx.example
+  \\S: 250-PIPELINING
+  \\S: 250-SIZE 10240000
+  \\S: 250 AUTH PLAIN LOGIN
+  \\C: AUTH PLAIN ****
+  \\S: 235 2.7.0 Authentication successful
+  \\C: MAIL FROM:<Smith@bar.com> SIZE=38
+  \\C: RCPT TO:<Jones@foo.com>
+  \\C: RCPT TO:<Green@foo.com>
+  \\C: DATA
+  \\S: 250 2.1.0 Ok
+  \\S: 250 2.1.5 Ok
+  \\S: 550 5.1.1 No such user
+  \\S: 354 End data with <CR><LF>.<CR><LF>
+  \\C: Blah blah blah...
+  \\C: ....etc. etc. etc.
+  \\C: .
+  \\S: 250 2.0.0 Ok: queued as 4F2A91
+  \\C: QUIT
+  \\S: 221 2.0.0 Bye
+
+test "a session over TLS from its first byte is verified as its host, writes what the engine says, waits each phase's time, and is closed once" {
+  let c = with_credential(client(), tim());
+  let envelope = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
+  let ran = on_mx(serving(465, [implicit(submission())]), || {
+    let s = open_tls[mail]("mx.example", 465, c);
+    let sent = submit[mail](s, envelope, blah());
+    quit[mail](sent.session);
+    map(sent.deliveries, told)
+  });
+  assert_eq(ran.value, Ok(["Jones@foo.com accepted 250", "Green@foo.com permanent RCPT 550"]));
+  let engine = replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission());
+  assert_eq(net::mem_sent(ran.net, 1), engine.wire);
+  assert(net::mem_sent_secrets(ran.net, 1) == engine.sealed);
+  assert_eq(net::mem_secured(ran.net, 1), Some("mx.example"));
+  assert_eq(net::mem_deadlines(ran.net, 1), [300000, 300000, 300000, 300000, 600000, 30000]);
+  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(ran.net.closed, [1])
+}
+
+test "a session's credential reaches a server that hears it whole in its line, and no plain byte holds it" {
+  let script = [
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Hears(b"EHLO client.example\r\n"),
+    net::Says(b"250-mx.example\r\n250 AUTH PLAIN\r\n"),
+    net::HearsSecret(b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n"),
+    net::Says(b"235 2.7.0 Accepted\r\n"),
+    net::Hears(b"QUIT\r\n"),
+    net::Says(b"221 2.0.0 Bye\r\n"),
+  ];
+  let c = with_credential(config("client.example", { ..default_limits(), transcript: 40 }), tim());
+  let ran = on_mx(serving(465, [script]), || {
+    let s = open_tls[mail]("mx.example", 465, c);
+    let proved = authenticated(s.engine);
+    let text = transcript_text(transcript(s));
+    quit[mail](s);
+    { proved: proved, text: text }
+  });
+  match ran.value {
+    Ok(v) -> {
+      assert(v.proved);
+      assert(string_contains(v.text, "C: AUTH PLAIN ****"));
+      assert(!string_contains(v.text, "AHRp"))
+    },
+    Err(why) -> panic("the session was refused: " ++ show(why)),
+  };
+  let plain = string_of_bytes_lossy(net::mem_sent(ran.net, 1));
+  assert_eq(plain, "EHLO client.example\r\nQUIT\r\n");
+  assert_eq(net::mem_unmet(ran.net, 1), [])
+}
+
+test "STARTTLS over a connection: only EHLO and STARTTLS cross it in the clear, and the credential after the upgrade" {
+  let r = list::at(sendings(), 1);
+  let jones = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
+  let brown = email::enveloped(ReturnTo(smith()), at_foo(["Brown"]));
+  let in_clear = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Hears(b"EHLO client.example\r\n"),
+    net::Says(b"250-mx.example\r\n250-PIPELINING\r\n250-AUTH PLAIN LOGIN\r\n250 STARTTLS\r\n"),
+    net::Hears(b"STARTTLS\r\n"),
+    net::Says(b"220 2.0.0 Ready to start TLS\r\n"),
+    net::Upgrades,
+  ];
+  let script = concat(in_clear, list::drop(script_of(beats_of(r.exchange)), 4));
+  let ran = on_mx(serving(587, [script]), || {
+    let s = open[mail]("mx.example", 587, configured(r.client));
+    let first_sent = submit[mail](s, jones, blah());
+    let second_sent = submit[mail](first_sent.session, brown, blah());
+    quit[mail](second_sent.session);
+    map(concat(first_sent.deliveries, second_sent.deliveries), told)
+  });
+  assert_eq(ran.value, r.ended);
+  assert_eq(
+    net::mem_sent(ran.net, 1),
+    replayed(configured(r.client), false, r.acts, r.exchange).wire,
+  );
+  assert_eq(net::mem_secured(ran.net, 1), Some("mx.example"));
+  assert_eq(net::mem_unmet(ran.net, 1), []);
+  assert_eq(ran.net.closed, [1])
+}
+
+/// What a session does with `acts` until it is over: each message submitted, a refusal of one
+/// before any of it was sent kept as what became of it, and `QUIT` said where asked.
+fn acted<[l]>(
+  s: Session,
+  acts: List<Act>,
+) -> List<String> / {net.send[l], net.send_secret[l], net.recv[l], net.close[l], clock.read, task::deadline.at, smtp.refused, abort.raise} =
+  fold(
+    acts,
+    { session: s, outcomes: [] },
+    |done: { session: Session, outcomes: List<String> }, act: Act|
+      if state(done.session.engine).over { done } else {
+        match act {
+          Bye -> {
+            quit[l](done.session);
+            done
+          },
+          Deliver(envelope, data, asked) -> match try[smtp.refused] {
+              submit[l](done.session, envelope, data, asked)
+            } {
+            Ok(sent) ->
+              {
+                session: sent.session,
+                outcomes: concat(done.outcomes, map(sent.deliveries, told)),
+              },
+            Err(why) -> if usable(why) {
+              { ..done, outcomes: push(done.outcomes, "refused: " ++ show(why)) }
+            } else { smtp.refused(why) },
+          },
+        }
+      },
+  ).outcomes
+
+test "every recording with no credential in it, played by a server that hears each line the client says, ends over a connection as it does in the engine" {
+  let cases = filter(concat(sendings(), failings()), |r: Recorded|
+    !string_contains(r.exchange, "****"));
+  let differing = filter(cases, |r: Recorded| {
+    let port = if r.secure { 465 } else { 587 };
+    let script = if r.secure { list::prepend(net::Upgrades, scripted(r.exchange)) }
+    else { scripted(r.exchange) };
+    let c = configured(r.client);
+    let ran = on_mx(serving(port, [script]), ||
+      acted[mail](
+        if r.secure { open_tls[mail]("mx.example", port, c) }
+        else { open[mail]("mx.example", port, c) },
+        r.acts,
+      ));
+    ran.value != r.ended
+      || net::mem_sent(ran.net, 1) != replayed(c, r.secure, r.acts, r.exchange).wire
+  });
+  assert_eq(map(differing, |r: Recorded| r.what), [])
+}
+
+test "plaintext waiting at the upgrade is refused before TLS, whether the client read it or the socket holds it" {
+  let offered = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+  ];
+  // CVE-2011-0411: the injected reply arrives with the leave to start TLS, in one read.
+  let read_with = on_mx(
+    serving(587, [
+      concat(offered, [
+        net::Says(b"220 2.0.0 Go ahead\r\n250-mx.example\r\n250 AUTH PLAIN\r\n"),
+        net::Upgrades,
+      ]),
+    ]),
+    || secured(open[mail]("mx.example", 587, client()).engine),
+  );
+  // It arrives after it, so that it is on the socket when the handshake is to begin.
+  let held_back = on_mx(
+    serving(587, [
+      concat(offered, [
+        net::Says(b"220 2.0.0 Go ahead\r\n"),
+        net::Says(b"250-mx.example\r\n250 AUTH PLAIN\r\n"),
+        net::Upgrades,
+      ]),
+    ]),
+    || secured(open[mail]("mx.example", 587, client()).engine),
+  );
+  assert_eq([read_with.value, held_back.value], [Err(Injected), Err(Injected)]);
+  assert(
+    all([read_with.net, held_back.net], |n: net::MemNet|
+      net::mem_sent(n, 1) == b"EHLO client.example\r\nSTARTTLS\r\n"
+        && net::mem_secured(n, 1) == None
+        && n.closed == [1]),
+  )
+}
+
+test "a connection that starts in the clear is refused where its server is not verified, and used as it is where no TLS is asked for" {
+  let offer = [
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+    net::Says(b"220 2.0.0 Ready to start TLS\r\n"),
+  ];
+  let untrusted = on_mx(serving(587, [push(offer, net::Refuses(net::Untrusted))]), ||
+    secured(open[mail]("mx.example", 587, client()).engine));
+  assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
+  assert_eq(untrusted.net.closed, [1]);
+  let plain = on_mx(
+    serving(25, [
+      [
+        net::Says(b"220 mx.example ESMTP\r\n"),
+        net::Says(b"250-mx.example\r\n250 STARTTLS\r\n"),
+        net::Says(b"221 Bye\r\n"),
+      ],
+    ]),
+    || {
+      let s = open[mail]("mx.example", 25, with_tls(client(), Plain));
+      quit[mail](s);
+      secured(s.engine)
+    },
+  );
+  assert_eq(plain.value, Ok(false));
+  assert_eq(net::mem_sent(plain.net, 1), b"EHLO client.example\r\nQUIT\r\n");
+  assert_eq(net::mem_secured(plain.net, 1), None);
+  assert_eq(plain.net.closed, [1])
+}
+
+test "a server that cannot be reached, is not the one named, or hangs up at once" {
+  let open_one = || secured(open_tls[mail]("mx.example", 465, client()).engine);
+  let gone = on_mx(serving(25, []), open_one);
+  assert_eq(gone.value, Err(Unreachable));
+  assert_eq(gone.net.closed, []);
+  let untrusted = on_mx(serving(465, [[net::Refuses(net::Untrusted)]]), open_one);
+  assert_eq(untrusted.value, Err(HandshakeFailed(net::Untrusted)));
+  assert_eq(untrusted.net.closed, [1]);
+  let hung = on_mx(serving(465, [[net::Upgrades, net::Leaves]]), open_one);
+  assert_eq(hung.value, Err(Closed(Greeting)));
+  assert_eq(hung.net.closed, [1])
+}
+
+/// `go` with each read of what `mail`'s servers send coming `ms` milliseconds after it was
+/// asked for.
+fn slowly<a>(
+  ms: Int,
+  go: () -> a / {net.write[mail], clock.read, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise},
+) -> a / {net.write[mail], clock.read, clock.write, task::deadline.at, entropy.next, time.now_ms, smtp.refused, abort.raise} =
+  handle {
+    go()
+  } with {
+    net.recv[mail](c, most, t) -> {
+      clock.sleep(millis(ms));
+      net.recv[mail](c, most, t)
+    },
+  }
+
+test "a wait is one deadline that each read is given what is left of, however the answer trickles in" {
+  let silent = on_mx(serving(465, [[net::Upgrades, net::Silent]]), ||
+    secured(open_tls[mail]("mx.example", 465, client()).engine));
+  assert_eq(silent.value, Err(TimedOut(Greeting)));
+  assert_eq(net::mem_deadlines(silent.net, 1), [300000]);
+  assert_eq(silent.net.closed, [1]);
+  let trickling = [
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250-mx.exa"),
+    net::Says(b"mple\r\n"),
+    net::Says(b"250-PIPE"),
+    net::Says(b"LINING\r\n250 HELP\r\n"),
+  ];
+  let within = |ms: Int| {
+    let waits: Timeouts = { ..default_timeouts(), other_ms: ms };
+    on_mx(serving(465, [trickling]), ||
+      slowly(20, ||
+        secured(open_tls[mail]("mx.example", 465, with_timeouts(client(), waits)).engine)))
+  };
+  let short = within(60);
+  assert_eq(short.value, Err(TimedOut(Hello)));
+  assert_eq(net::mem_deadlines(short.net, 1), [300000, 60, 40, 20]);
+  assert_eq(net::mem_unmet(short.net, 1), [net::Says(b"LINING\r\n250 HELP\r\n")]);
+  assert_eq(short.net.closed, [1]);
+  let long = within(80);
+  assert_eq(long.value, Ok(true));
+  assert_eq(net::mem_deadlines(long.net, 1), [300000, 80, 60, 40, 20]);
+  assert_eq(long.net.closed, [])
+}
+
+test "a session is held to the deadline around it, which bounds its every wait" {
+  let ran = net::on_mem(serving(465, [[net::Upgrades, net::Silent]]), ||
+    simulate {
+      task::unbounded(||
+        task::timeout(millis(250), ||
+          handle {
+            try[smtp.refused] { secured(open_tls[mail]("mx.example", 465, client()).engine) }
+          } with {
+            entropy.next() -> 7,
+          }))
+    });
+  assert_eq(ran.value, task::Done(Err(TimedOut(Greeting))));
+  assert_eq(net::mem_deadlines(ran.net, 1), [250])
+}
+
+test "a server that stops taking bytes is told nothing more" {
+  let ran = on_mx(
+    serving(465, [[net::Upgrades, net::Says(b"220 mx.example ESMTP\r\n"), net::Leaves]]),
+    || secured(open_tls[mail]("mx.example", 465, client()).engine),
+  );
+  assert_eq(ran.value, Err(NotSent(Hello)));
+  assert_eq(net::mem_sent(ran.net, 1), b"");
+  assert_eq(ran.net.closed, [1])
+}
+
+test "a session is told goodbye when its user is done, and closed however its user ends" {
+  let envelope = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
+  let c = with_credential(client(), tim());
+  let done = on_mx(serving(465, [implicit(submission())]), ||
+    with_session_tls[mail]("mx.example", 465, c, |s: Session|
+      len(submit[mail](s, envelope, blah()).deliveries)));
+  assert_eq(done.value, Ok(2));
+  assert_eq(
+    net::mem_sent(done.net, 1),
+    replayed(c, true, [deliver(["Jones", "Green"]), Bye], submission()).wire,
+  );
+  assert_eq(done.net.closed, [1]);
+  let dropped = list::at(failings(), 1);
+  let jones = email::enveloped(ReturnTo(smith()), at_foo(["Jones"]));
+  let cut = on_mx(serving(465, [list::prepend(net::Upgrades, scripted(dropped.exchange))]), ||
+    with_session_tls[mail]("mx.example", 465, configured(dropped.client), |s: Session|
+      len(submit[mail](s, jones, blah()).deliveries)));
+  assert_eq(cut.value, Err(Closed(Body)));
+  assert_eq(
+    net::mem_sent(cut.net, 1),
+    replayed(configured(dropped.client), true, dropped.acts, dropped.exchange).wire,
+  );
+  assert_eq(cut.net.closed, [1])
+}
+
+/// What the server was sent between `DATA` and the lone dot, as it would keep it.
+fn delivered(sent: Bytes) -> Bytes / {abort.raise} =
+  match bytes_index_of(sent, b"DATA\r\n") {
+    None -> b"",
+    Some(from) -> match bytes_index_of_from(sent, b"\r\n.\r\n", from) {
+      None -> b"",
+      Some(to) -> unstuff(bytes_slice(sent, from + 6, to + 2)),
+    },
+  }
+
+/// A server's answers to a message for two recipients, each a read of its own: it takes the
+/// sender, both recipients and the message.
+fn taking() -> List<net::Step> =
+  [
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"250 OK\r\n"),
+    net::Says(b"354 Go ahead\r\n"),
+    net::Says(b"250 OK\r\n"),
+  ]
+
+fn hello_draft() -> Draft / {time.now_ms, entropy.next, email.refused, abort.raise} =
+  email::with_bcc(
+    email::with_text(
+      email::compose(
+        email::named("John Doe", email::address("jdoe", "machine.example")),
+        [email::mailbox(email::address("mary", "example.net"))],
+        "Gr\u{fc}\u{df}e",
+      ),
+      "Hello.\n.A line that opens with a dot.\n..\n",
+    ),
+    [email::one(email::mailbox(email::address("eve", "example.org")))],
+  )
+
+test "a draft is sent to everyone it goes to, its blind copies among them, as the bytes std.email writes without them" {
+  let d = match handle {
+      try[email.refused] { hello_draft() }
+    } with {
+      entropy.next() -> 7,
+      time.now_ms() -> 880127706123,
+    } {
+    Ok(made) -> made,
+    Err(_) -> panic("the draft was refused"),
+  };
+  let ran = on_mx(
+    serving(465, [
+      concat(
+        [
+          net::Upgrades,
+          net::Says(b"220 mx.example ESMTP\r\n"),
+          net::Says(b"250-mx.example\r\n250 SMTPUTF8\r\n"),
+        ],
+        taking(),
+      ),
+    ]),
+    || map(send[mail](open_tls[mail]("mx.example", 465, client()), d).deliveries, told),
+  );
+  let written = match email::build(d, "boundary-7-7") { Ok(data) -> data, Err(_) -> b"" };
+  let wire = string_of_bytes_lossy(net::mem_sent(ran.net, 1));
+  assert_eq(ran.value, Ok(["mary@example.net accepted 250", "eve@example.org accepted 250"]));
+  assert_eq(email::repertoire_for(d), email::Ascii);
+  assert(bytes_len(written) > 0);
+  assert_eq(delivered(net::mem_sent(ran.net, 1)), written);
+  assert(
+    string_contains(
+      wire,
+      "MAIL FROM:<jdoe@machine.example>\r\nRCPT TO:<mary@example.net>\r\nRCPT TO:<eve@example.org>\r\nDATA\r\n",
+    ),
+  );
+  assert(string_contains(wire, "\r\n..A line that opens with a dot.\r\n...\r\n.\r\n"));
+  assert(!string_contains(wire, "Bcc"));
+  assert(!string_contains(string_of_bytes_lossy(written), "eve@example.org"))
+}
+
+test "a message read is sent on as the bytes it was read from, to everyone it names, without its blind copies' lines" {
+  let data = b"From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nBcc: eve@example.org\r\nSubject: Saying Hello\r\nX-Odd:   kept \t as it was\r\n\r\n.Hello.\r\n";
+  let m = email::read_tolerant(data, email::default_limits()).message;
+  let greeted = [
+    net::Upgrades,
+    net::Says(b"220 mx.example ESMTP\r\n"),
+    net::Says(b"250 mx.example\r\n"),
+  ];
+  let ran = on_mx(serving(465, [concat(greeted, taking())]), ||
+    map(relay[mail](open_tls[mail]("mx.example", 465, client()), m).deliveries, told));
+  assert_eq(ran.value, Ok(["mary@example.net accepted 250", "eve@example.org accepted 250"]));
+  assert_eq(
+    delivered(net::mem_sent(ran.net, 1)),
+    b"From: John Doe <jdoe@machine.example>\r\nTo: Mary Smith <mary@example.net>\r\nSubject: Saying Hello\r\nX-Odd:   kept \t as it was\r\n\r\n.Hello.\r\n",
+  );
+  let nameless = email::read_tolerant(
+    b"Subject: no one\r\n\r\nHi.\r\n",
+    email::default_limits(),
+  ).message;
+  let refused = on_mx(serving(465, [greeted]), ||
+    len(relay[mail](open_tls[mail]("mx.example", 465, client()), nameless).deliveries));
+  assert_eq(refused.value, Err(Unreadable({ at: 0, why: email::Missing("from") })));
+  assert_eq(net::mem_sent(refused.net, 1), b"EHLO client.example\r\n")
+}
+
+test "a session keeps the newest lines of its exchange, and no credential among them" {
+  let envelope = email::enveloped(ReturnTo(smith()), at_foo(["Jones", "Green"]));
+  let kept = |most: Int| {
+    let limits: Limits = { ..default_limits(), transcript: most };
+    let c = with_credential(config("client.example", limits), tim());
+    on_mx(serving(465, [implicit(submission())]), || {
+      let s = open_tls[mail]("mx.example", 465, c);
+      transcript_text(transcript(submit[mail](s, envelope, blah()).session))
+    }).value
+  };
+  assert_eq(
+    kept(100),
+    Ok(
+      \\S: 220 mx.example ESMTP
+      \\C: EHLO client.example
+      \\S: 250-mx.example
+      \\S: 250-PIPELINING
+      \\S: 250-SIZE 10240000
+      \\S: 250 AUTH PLAIN LOGIN
+      \\C: AUTH PLAIN ****
+      \\S: 235 2.7.0 Authentication successful
+      \\C: MAIL FROM:<Smith@bar.com> SIZE=38
+      \\C: RCPT TO:<Jones@foo.com>
+      \\C: RCPT TO:<Green@foo.com>
+      \\C: DATA
+      \\S: 250 2.1.0 Ok
+      \\S: 250 2.1.5 Ok
+      \\S: 550 5.1.1 No such user
+      \\S: 354 End data with <CR><LF>.<CR><LF>
+      \\*: 42 octets of message
+      \\S: 250 2.0.0 Ok: queued as 4F2A91
+    ),
+  );
+  assert_eq(
+    kept(3),
+    Ok(
+      \\S: 354 End data with <CR><LF>.<CR><LF>
+      \\*: 42 octets of message
+      \\S: 250 2.0.0 Ok: queued as 4F2A91
+    ),
+  );
+  assert_eq(kept(0), Ok(""))
+}
+
+law "no address and no parameter writes a line of its own: a message's commands are one line each"
+  forall (envelope: Envelope, id: String, original: Bool) {
+    match try[smtp.refused] { config("client.example", default_limits()) } {
+      Err(_) -> false,
+      Ok(c) -> {
+        let opened = played(c, true, [], [
+          Says(b"220 mx.example ESMTP\r\n"),
+          Says(b"250-mx.example\r\n250-PIPELINING\r\n250-SMTPUTF8\r\n250-8BITMIME\r\n250 DSN\r\n"),
+        ]);
+        match try[smtp.refused] {
+            mail(opened.engine, envelope, blah(), {
+              ret: Some(Headers),
+              envelope_id: Some(id),
+              notify: Some([Failed, Delayed]),
+              original: original,
+            })
+          } {
+          Err(why) -> usable(why),
+          Ok(t) -> {
+            let lines = marked("", open_bytes(t.out));
+            whole_lines(open_bytes(t.out)) && len(lines) == len(envelope.recipients) + 2
+              && all(list::enumerate(lines), |l: { index: Int, value: String }|
+                string_starts_with(l.value, if l.index == 0 { " MAIL FROM:<" }
+                else if l.index <= len(envelope.recipients) { " RCPT TO:<" }
+                else { " DATA" }))
+          },
+        }
+      },
+    }
+  }

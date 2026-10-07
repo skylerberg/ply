@@ -382,12 +382,12 @@ pub struct RootView {
 }
 
 impl Filesystem {
-    /// `Some` when the program can perform an `fs` operation or the run bound a root.
+    /// `Some` when the program can perform an operation under a root, a file's or a database's,
+    /// or the run bound one.
     pub fn of(listing: &HostListing, roots: Option<&ply_host::fs::Roots>) -> Option<Filesystem> {
-        let reachable = listing
-            .rows
-            .iter()
-            .any(|row| row.path.starts_with("ply_host::fs::"));
+        let reachable = listing.rows.iter().any(|row| {
+            row.path.starts_with("ply_host::fs::") || row.path.starts_with("ply_host::sqlite::")
+        });
         let configured = roots.is_some_and(|r| !r.is_empty());
         if !reachable && !configured {
             return None;
@@ -447,10 +447,15 @@ pub struct CredentialView {
 impl Transport {
     /// `Some` when the program can create a TLS listener or the run was given credentials.
     pub fn of(listing: &HostListing, credentials: Option<&tls::Credentials>) -> Option<Transport> {
-        let reachable = listing
-            .rows
-            .iter()
-            .any(|row| row.path == tls::HANDLER || row.path == tls::CONNECT_HANDLER);
+        let reachable = listing.rows.iter().any(|row| {
+            [
+                tls::HANDLER,
+                tls::CONNECT_HANDLER,
+                tls::START_HANDLER,
+                tls::SERVE_HANDLER,
+            ]
+            .contains(&row.path)
+        });
         let configured = credentials.is_some_and(|c| !c.is_empty() || c.trusted() > 0);
         if !reachable && !configured {
             return None;
