@@ -266,7 +266,7 @@ pub enum ClosureKind {
     },
     /// A function the prover generated: data rather than a body, so the C backend applies it.
     Synth {
-        arity: usize,
+        arity: u8,
         rule: Synth,
     },
 }
@@ -274,7 +274,7 @@ pub enum ClosureKind {
 pub enum Synth {
     Const(Value),
     /// The argument at this position.
-    Project(usize),
+    Project(u8),
     /// The first entry whose key equals the first argument, else `default`.
     Table {
         entries: Vec<(Value, Value)>,
@@ -287,7 +287,7 @@ impl Synth {
     pub fn apply(&self, args: &[Value]) -> Result<Value, Diagnostic> {
         match self {
             Synth::Const(value) => Ok(value.clone()),
-            Synth::Project(index) => Ok(args[*index].clone()),
+            Synth::Project(index) => Ok(args[usize::from(*index)].clone()),
             Synth::Table { entries, default } => {
                 for (key, value) in entries {
                     if values_equal(&args[0], key, Span::DUMMY)? {
@@ -318,8 +318,8 @@ impl Closure {
             ClosureKind::Builtin(b) => b.arity(),
             ClosureKind::Ctor { arity, .. }
             | ClosureKind::Native { arity, .. }
-            | ClosureKind::Continuation { arity, .. }
-            | ClosureKind::Synth { arity, .. } => *arity,
+            | ClosureKind::Continuation { arity, .. } => *arity,
+            ClosureKind::Synth { arity, .. } => usize::from(*arity),
         }
     }
 }
