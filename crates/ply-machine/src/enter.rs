@@ -108,6 +108,7 @@ fn entered_with(
         &crate::options::TlsOptions {
             tls: Vec::new(),
             trust,
+            mtls: Vec::new(),
         },
         &roots,
         process,

@@ -221,7 +221,7 @@ impl Net for SimNet {
             return Ok(HostAnswer::Value(wire::err(&Refusal::PermissionDenied)));
         }
         let handle = self.bind(at, to.port);
-        lock(&self.state).options.insert(handle, options);
+        lock(&self.state).options.insert(handle, settings(options));
         Ok(HostAnswer::Value(wire::ok(Value::Int(handle))))
     }
 
@@ -263,7 +263,7 @@ impl Net for SimNet {
     ) -> Result<HostAnswer, Diagnostic> {
         Ok(HostAnswer::Value(match self.opened(at, to) {
             Some(handle) => {
-                lock(&self.state).options.insert(handle, options);
+                lock(&self.state).options.insert(handle, settings(options));
                 wire::ok(Value::Int(handle))
             }
             None => wire::err(&Refusal::Refused),
@@ -472,8 +472,10 @@ impl Net for SimNet {
         self.handles.check(socket, at, span)?;
         let mut state = lock(&self.state);
         let set = state.options.entry(socket).or_default();
-        set.retain(|held| std::mem::discriminant(held) != std::mem::discriminant(&option));
-        set.push(option);
+        if option.is_setting() {
+            set.retain(|held| std::mem::discriminant(held) != std::mem::discriminant(&option));
+            set.push(option);
+        }
         Ok(HostAnswer::Value(wire::ok(Value::Unit)))
     }
 
@@ -547,6 +549,14 @@ impl Net for SimNet {
                 .unwrap_or_default(),
         )))
     }
+}
+
+/// What the twin reads back of the options a socket opened with.
+fn settings(options: Vec<SocketOption>) -> Vec<SocketOption> {
+    options
+        .into_iter()
+        .filter(SocketOption::is_setting)
+        .collect()
 }
 
 /// Where the twin puts a far end it was not told of.
