@@ -8,7 +8,7 @@ import compiler.load (LoadedAnalysis, tell_viewed)
 import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
-import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
+import compiler.front (Refused, Analysed, Analysis, Moved, Pulled, Rows, DefInterface, Shipping,
                        ShippedView, analyse_pulling_std_with, dump_of, embeds_now, filing,
                        module_items, module_imports, no_rows, pins_pulling, rows_of)
 import compiler.pkg (PackageSources, Pinned, Supplied)
@@ -35,7 +35,7 @@ import builder (builder)
 import loads
 import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, ShippedEntry)
 import std.random (entropy)
-import std.list (concat, push_unique)
+import std.list (concat, contains, push_unique)
 import std.string (join)
 import compiler.parsing (no_module)
 
@@ -183,6 +183,7 @@ fn front_end(
   embeds: List<Embed>,
   priors: List<Prior>,
   reached: Bool,
+  moved: List<Moved>,
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
@@ -198,6 +199,7 @@ fn front_end(
     data: shipping.data,
     asked: shipping.asked,
     pulls: shipping.pulls,
+    moved: moved,
   )
 
 /// Seeded with what the load published, so only what the splice moved is walked again.
@@ -216,6 +218,7 @@ pub fn reanalysed(
     program.embeds,
     analysis.hashes.priors,
     program.reached,
+    [],
   )
 
 fn analysed(
@@ -270,6 +273,7 @@ fn analysed_through(
     project.embeds,
     priors,
     reached,
+    mine.moved,
   );
   let shipped_places = map(pulled.pulled, |n: Bytes|
     shipped_place(texts, string_of_bytes_lossy(n)));
@@ -279,32 +283,40 @@ fn analysed_through(
     map_insert(acc, source.name, true));
   let stubbed = fold(mine.through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
     fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
-  // The check that kept a module's stub showed its measures, and its text and all it reaches stand.
-  let fresh = |m: Bytes| map_contains(own, m) && !map_contains(stubbed, m);
   let refused = |ds: List<Diag>| { ..broken(project, shipping, places, ds), viewed: pulled.viewed };
   match pulled.out {
     Refused(ds) -> loaded(refused(ds)),
-    Analysed(w) -> if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
-      { program: broken(project, shipping, places, []), starved: true }
-    } else {
-      match unshown(w, fresh) {
-        [] -> {
-          let warnings = interfaces::warned_with(w.mods, w.warnings, mine);
-          loaded({
-            files: project.files,
-            places: places,
-            diags: warnings,
-            cache_warnings: [],
-            whole: Some({ ..w, warnings: warnings }),
-            pkgs: pkgs,
-            through: read,
-            embeds: project.embeds,
-            shipping: shipping,
-            reached: reached,
-            viewed: pulled.viewed,
-          })
-        },
-        missing -> loaded(refused(map(missing, undescended))),
+    Analysed(w) -> {
+      // The check that kept a module's stub showed its measures, and its text and all it reaches
+      // stand; a stub the load read whole again is fresh.
+      let fresh = |m: Bytes|
+        map_contains(own, m) && (!map_contains(stubbed, m) || contains(w.restored, m));
+      if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
+        { program: broken(project, shipping, places, []), starved: true }
+      } else {
+        match unshown(w, fresh) {
+          [] -> {
+            let warnings = interfaces::warned_with(
+              w.mods,
+              w.warnings,
+              interfaces::standing_own(mine, w.restored),
+            );
+            loaded({
+              files: project.files,
+              places: places,
+              diags: warnings,
+              cache_warnings: [],
+              whole: Some({ ..w, warnings: warnings }),
+              pkgs: pkgs,
+              through: interfaces::through_standing(read, w.restored),
+              embeds: project.embeds,
+              shipping: shipping,
+              reached: reached,
+              viewed: pulled.viewed,
+            })
+          },
+          missing -> loaded(refused(map(missing, undescended))),
+        }
       }
     },
   }
@@ -338,7 +350,7 @@ fn assembled(
   rows: Rows,
   through: List<CompiledPackage> = [],
   priors: List<Prior> = [],
-  own: interfaces::Own = { through: [], names: [], warned: [] },
+  own: interfaces::Own = { through: [], names: [], warned: [], moved: [] },
   reached: Bool = true,
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
