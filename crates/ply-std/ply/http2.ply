@@ -7,11 +7,12 @@
 //!
 //! A `Connection` is one end of a connection, a server's or a client's. `receive` gives it bytes
 //! read from the peer and answers the `Event`s they make, `respond` and `request` give it messages
-//! to send, and `take_output` answers what to write. Requests and responses are `std.http`'s, so an
-//! application does not know which wire carried one. Time is what the caller passes as `now`;
-//! `tick` acts on what a clock alone decides, and `deadline` says when it next needs to run. The
-//! machine reads no socket and no clock, so an exchange is data, and two machines handed each
-//! other's bytes are a test of both.
+//! to send, and `take_output` answers what to write. A `Response` has the shape `std.http`'s has, so
+//! either is the other, and `std.http` reads a `Request` as its own; it serves and fetches over this
+//! machine, so an application does not know which wire carried a message. Time is what the caller
+//! passes as `now`; `tick` acts on what a clock alone decides, and `deadline` says when it next
+//! needs to run. The machine reads no socket and no clock, so an exchange is data, and two machines
+//! handed each other's bytes are a test of both.
 //!
 //! What a peer may make one connection cost is `Limits`, and each known attack on HTTP/2 is one of
 //! its fields: rapid reset (CVE-2023-44487) is `max_resets`, the CONTINUATION flood
@@ -28,11 +29,8 @@
 import std.bytes (bytes_of_hex, hex_of, int_of_ascii, is_blank, repeat, u32_be, u32_be_at)
 import std.gen
 import std.gen (Gen)
-import std.http
-import std.http (Method, Request, Response)
-import std.ip (SocketAddress)
 import std.laws (round_trip)
-import std.list (at_or, concat, contains, sort)
+import std.list (at_or, concat, contains, drop, sort)
 import std.string (ascii_lower, ascii_trim, join)
 import std.time (at_millis)
 
@@ -1525,6 +1523,27 @@ pub fn check_limits(l: Limits) -> Unit / {abort.raise} = {
 
 // --- The connection: its state ------------------------------------------------------
 
+/// A message's fields after its pseudo-header fields: each name lowercase, with its values in the
+/// order they came. It is the shape `std.http`'s `Headers` has.
+pub type Headers = Map<String, List<String>>
+
+/// A request as HTTP/2 carries it: its method, scheme and authority, its target (the path with its
+/// query, or `*`), its fields, the trailers after its body, and its body. A request read has every
+/// `cookie` field joined into one, as one HTTP/1.1 carried would.
+pub type Request = {
+  method: String,
+  scheme: String,
+  authority: String,
+  target: String,
+  headers: Headers,
+  trailers: Headers,
+  body: Bytes,
+}
+
+/// A response: its status, fields and body, the shape `std.http`'s `Response` has, so either is the
+/// other.
+pub type Response = { status: Int, headers: Headers, body: Bytes }
+
 /// What a call on a connection reports, in the order it happened.
 pub type Event =
   /// A whole request arrived on a stream: `respond` answers it.
@@ -1558,12 +1577,12 @@ type Stream = {
   request: Request,
   /// A client's response head: its status, 0 until it arrives, and its fields.
   status: Int,
-  headers: http::Headers,
+  headers: Headers,
   /// The `content-length` the message's head gave.
   expected: Option<Int>,
   body: List<Bytes>,
   received: Int,
-  trailers: http::Headers,
+  trailers: Headers,
   /// The body this end sends, how much of it has gone, the trailers that follow it, and whether
   /// the stream has anything left to send.
   out: Bytes,
@@ -1592,8 +1611,6 @@ type Block = {
 type Conn = {
   role: Role,
   limits: Limits,
-  peer: Option<SocketAddress>,
-  scheme: String,
   /// A server has read the client's preface.
   started: Bool,
   /// The peer's first `SETTINGS` has been read.
@@ -1667,27 +1684,18 @@ fn our_settings(l: Limits) -> List<Setting> =
     MaxHeaderListSize(l.max_header_list_size),
   ]
 
-fn blank_request(peer: Option<SocketAddress>) -> Request =
+fn blank_request() -> Request =
   {
-    method: http::Get,
-    target: "",
-    path: "",
-    query: "",
+    method: "",
+    scheme: "",
     authority: "",
-    version: http::Http11,
+    target: "",
     headers: map_new(),
     trailers: map_new(),
     body: b"",
-    peer: peer,
   }
 
-fn opened(
-  role: Role,
-  limits: Limits,
-  peer: Option<SocketAddress>,
-  scheme: String,
-  now: Instant,
-) -> Connection / {abort.raise} = {
+fn opened(role: Role, limits: Limits, now: Instant) -> Connection / {abort.raise} = {
   check_limits(limits);
   let t = ms(now);
   let raise_by = limits.connection_window - default_window();
@@ -1698,8 +1706,6 @@ fn opened(
   Connection({
     role: role,
     limits: limits,
-    peer: peer,
-    scheme: scheme,
     started: role == Client,
     greeted: false,
     over: false,
@@ -1744,21 +1750,17 @@ fn opened(
   })
 }
 
-/// A server's end of a connection a client just opened; `peer` is where the socket says it comes
-/// from, which each request carries. Its `SETTINGS` are the first output, and the client's preface
-/// is the first input it reads: a connection that opens with anything else, an HTTP/1.1 request
-/// among them, is closed at its first byte that differs. Panics on limits `check_limits` refuses.
-pub fn server(
-  limits: Limits,
-  peer: Option<SocketAddress>,
-  now: Instant,
-) -> Connection / {abort.raise} = opened(Server, limits, peer, "", now)
+/// A server's end of a connection a client just opened. Its `SETTINGS` are the first output, and
+/// the client's preface is the first input it reads: a connection that opens with anything else,
+/// an HTTP/1.1 request among them, is closed at its first byte that differs. Panics on limits
+/// `check_limits` refuses.
+pub fn server(limits: Limits, now: Instant) -> Connection / {abort.raise} =
+  opened(Server, limits, now)
 
-/// A client's end of a connection it just opened, whose requests name `scheme` (`"https"` over
-/// TLS). The preface and its `SETTINGS` are the first output. Panics on limits `check_limits`
-/// refuses.
-pub fn client(limits: Limits, scheme: String, now: Instant) -> Connection / {abort.raise} =
-  opened(Client, limits, None, scheme, now)
+/// A client's end of a connection it just opened. The preface and its `SETTINGS` are the first
+/// output. Panics on limits `check_limits` refuses.
+pub fn client(limits: Limits, now: Instant) -> Connection / {abort.raise} =
+  opened(Client, limits, now)
 
 /// The bytes to write to the peer, in order, and the connection without them.
 pub fn take_output(c: Connection) -> { connection: Connection, bytes: Bytes } = {
@@ -2072,8 +2074,7 @@ fn took_data(
   }
 }
 
-fn silent(st: Stream) -> Bool =
-  st.status == 204 || st.status == 304 || http::method_name(st.request.method) == "HEAD"
+fn silent(st: Stream) -> Bool = st.status == 204 || st.status == 304 || st.request.method == "HEAD"
 
 /// The peer ended its side of a stream: the message is whole.
 fn remote_ended(k: Conn, st: Stream, t: Int) -> Conn / {abort.raise} =
@@ -2235,7 +2236,7 @@ fn new_stream(
       taken,
       s,
       if end_stream { RemoteClosed } else { Open },
-      blank_request(k.peer),
+      blank_request(),
       t,
     );
     if d.size > taken.limits.max_header_list_size {
@@ -2248,15 +2249,15 @@ fn new_stream(
         t,
       )
     } else {
-      match request_of(d.fields, k.peer) {
+      match request_of(d.fields) {
         Malformed(_) -> reset_stream(taken, s, ProtocolError, t),
         Unserved(status, reason) -> refused(stored(taken, st), st, status, reason, t),
         Asked(req, expected) -> {
           let read = { ..st, request: req, expected: expected, phase: Open };
           if end_stream { remote_ended(stored(taken, read), read, t) }
-          else if match http::header(req.headers, "expect") {
-              Some(v) -> ascii_lower(v) == "100-continue",
-              None -> false,
+          else if match map_get(req.headers, "expect") {
+              Some([v]) -> ascii_lower(v) == "100-continue",
+              _ -> false,
             } {
             // The client waits for the 100 before it sends its body.
             stored(headers_emitted(taken, s, [status_field(100)], false), read)
@@ -2364,8 +2365,16 @@ fn discarded(k: Conn, st: Stream, end: Bool, flow: Int, t: Int) -> Conn / {abort
 fn refused(k: Conn, st: Stream, status: Int, reason: String, t: Int) -> Conn / {abort.raise} =
   match map_get(k.streams, st.id) {
     Some(current) -> if current.answered { reset_stream(k, st.id, Cancel, t) }
-    else { answered(k, current, http::text_response(status, reason ++ "\n"), t) },
+    else { answered(k, current, plain_text(status, reason ++ "\n"), t) },
     None -> k,
+  }
+
+/// A `text/plain` response, as a server answers what it refuses.
+fn plain_text(status: Int, text: String) -> Response =
+  {
+    status: status,
+    headers: map_insert(map_new(), "content-type", ["text/plain; charset=utf-8"]),
+    body: bytes_of_string(text),
   }
 
 fn on_reset(k: Conn, s: Int, code: ErrorCode, t: Int) -> Conn / {http2.violated, abort.raise} =
@@ -2486,7 +2495,7 @@ type Head = | Asked(Request, Option<Int>) | Malformed(String) | Unserved(Int, St
 type Gathering = {
   pseudo: Map<Bytes, Bytes>,
   regular: Bool,
-  headers: http::Headers,
+  headers: Headers,
   cookies: List<String>,
   length: Option<Int>,
   wrong: Option<String>,
@@ -2571,29 +2580,19 @@ fn regular_gathered(g: Gathering, name: String, value: String) -> Gathering / {a
       None -> wrong(g, "a `content-length` that is not a number"),
       Some(n) -> if g.length != None && g.length != Some(n) {
         wrong(g, "two `content-length` fields that differ")
-      } else { { ..g, length: Some(n), headers: http::add_header(g.headers, name, value) } },
+      } else { { ..g, length: Some(n), headers: field_added(g.headers, name, value) } },
     }
-  } else { { ..g, headers: http::add_header(g.headers, name, value) } }
+  } else { { ..g, headers: field_added(g.headers, name, value) } }
+
+fn field_added(h: Headers, name: String, value: String) -> Headers =
+  map_insert(h, name, push(match map_get(h, name) { Some(earlier) -> earlier, None -> [] }, value))
 
 /// The fields with the cookie's pieces joined into one, as a message HTTP/1.1 carried has it
 /// (§8.2.3).
-fn with_cookies(g: Gathering) -> http::Headers / {abort.raise} =
-  if g.cookies == [] { g.headers }
-  else { http::set_header(g.headers, "cookie", join(g.cookies, "; ")) }
+fn with_cookies(g: Gathering) -> Headers / {abort.raise} =
+  if g.cookies == [] { g.headers } else { map_insert(g.headers, "cookie", [join(g.cookies, "; ")]) }
 
-fn method_named(m: String) -> Method =
-  match m {
-    "GET" -> http::Get,
-    "HEAD" -> http::Head,
-    "POST" -> http::Post,
-    "PUT" -> http::Put,
-    "PATCH" -> http::Patch,
-    "DELETE" -> http::Delete,
-    "OPTIONS" -> http::Options,
-    _ -> http::Other(m),
-  }
-
-fn request_of(fields: List<Field>, peer: Option<SocketAddress>) -> Head / {abort.raise} = {
+fn request_of(fields: List<Field>) -> Head / {abort.raise} = {
   let g = gathered(fields, [b":method", b":scheme", b":authority", b":path"], false);
   match g.wrong {
     Some(why) -> Malformed(why),
@@ -2608,7 +2607,8 @@ fn request_of(fields: List<Field>, peer: Option<SocketAddress>) -> Head / {abort
           )
           < bytes_len(m) { Malformed("a `:method` that is not a token") } else {
         match ((map_get(g.pseudo, b":scheme"), map_get(g.pseudo, b":path"))) {
-          (Some(_), Some(p)) -> targeted(g, string_of_bytes(m), string_of_bytes(p), peer),
+          (Some(scheme), Some(p)) ->
+            targeted(g, string_of_bytes(m), string_of_bytes(scheme), string_of_bytes(p)),
           _ -> Malformed("no `:scheme` or no `:path`"),
         }
       },
@@ -2616,48 +2616,36 @@ fn request_of(fields: List<Field>, peer: Option<SocketAddress>) -> Head / {abort
   }
 }
 
-fn targeted(
-  g: Gathering,
-  method: String,
-  path: String,
-  peer: Option<SocketAddress>,
-) -> Head / {abort.raise} = {
+fn targeted(g: Gathering, method: String, scheme: String, path: String) -> Head / {abort.raise} = {
+  let hosts = match map_get(g.headers, "host") { Some(named) -> named, None -> [] };
   let authority = match map_get(g.pseudo, b":authority") {
     Some(a) -> string_of_bytes(a),
-    None -> match http::header(g.headers, "host") { Some(h) -> h, None -> "" },
+    None -> match hosts { [h] -> h, _ -> "" },
   };
-  let host = http::header(g.headers, "host");
   if path == "" { Malformed("an empty `:path`") } else if path == "*" && method != "OPTIONS" {
     Malformed("a `:path` of `*` with other than OPTIONS")
   } else if path != "*" && !string_starts_with(path, "/") {
     Malformed("a `:path` that is not a path")
   } else if string_contains(path, "#") { Malformed("a `:path` with a fragment") }
   else if string_contains(authority, "@") { Malformed("an `:authority` with userinfo") }
-  else if host != None && host != Some(authority) {
-    Malformed("a `host` other than the `:authority`")
-  } else {
-    let raw = bytes_of_string(path);
-    let q = match bytes_index_of(raw, b"?") { Some(i) -> i, None -> bytes_len(raw) };
+  else if hosts != [] && hosts != [authority] { Malformed("a `host` other than the `:authority`") }
+  else {
     Asked(
       {
-        method: method_named(method),
-        target: path,
-        path: string_of_bytes(bytes_slice(raw, 0, q)),
-        query: if q >= bytes_len(raw) { "" }
-        else { string_of_bytes(bytes_slice(raw, q + 1, bytes_len(raw))) },
+        method: method,
+        scheme: scheme,
         authority: authority,
-        version: http::Http11,
+        target: path,
         headers: with_cookies(g),
         trailers: map_new(),
         body: b"",
-        peer: peer,
       },
       g.length,
     )
   }
 }
 
-type Answer = { status: Int, headers: http::Headers, expected: Option<Int> }
+type Answer = { status: Int, headers: Headers, expected: Option<Int> }
 
 fn response_of(fields: List<Field>) -> Result<Answer, String> / {abort.raise} = {
   let g = gathered(fields, [b":status"], false);
@@ -2675,7 +2663,7 @@ fn response_of(fields: List<Field>) -> Result<Answer, String> / {abort.raise} = 
   }
 }
 
-fn trailers_of(fields: List<Field>) -> Result<http::Headers, String> / {abort.raise} = {
+fn trailers_of(fields: List<Field>) -> Result<Headers, String> / {abort.raise} = {
   let g = gathered(fields, [], true);
   match g.wrong { Some(why) -> Err(why), None -> Ok(with_cookies(g)) }
 }
@@ -2683,7 +2671,7 @@ fn trailers_of(fields: List<Field>) -> Result<http::Headers, String> / {abort.ra
 /// The fields a message's header map is sent as. A field the protocol computes or the connection
 /// carries itself panics, as `std.http`'s `encode` does; one that only means something to an
 /// HTTP/1.1 connection is left out; and each value loses the whitespace at its ends.
-fn sent_fields(headers: http::Headers, request: Bool) -> List<Field> / {abort.raise} =
+fn sent_fields(headers: Headers, request: Bool) -> List<Field> / {abort.raise} =
   fold(map_entries(headers), [], |acc: List<Field>, e: { key: String, value: List<String> }| {
     let name = ascii_lower(e.key);
     let raw = bytes_of_string(name);
@@ -2708,20 +2696,19 @@ fn status_field(status: Int) -> Field =
 fn length_field(n: Int) -> Field =
   { name: b"content-length", value: bytes_of_string(int_to_string(n)) }
 
-fn request_fields(r: Request, scheme: String) -> List<Field> / {abort.raise} = {
-  let method = http::method_name(r.method);
-  let path = if string_len(r.target) > 0 { r.target }
-  else if string_len(r.query) > 0 { r.path ++ "?" ++ r.query }
-  else if string_len(r.path) > 0 { r.path }
-  else { "/" };
+fn request_fields(r: Request) -> List<Field> / {abort.raise} = {
+  let method = r.method;
   let authority = if r.authority == "" { [] }
   else { [{ name: b":authority", value: bytes_of_string(r.authority) }] };
   let pseudo = concat(
     [
       { name: b":method", value: bytes_of_string(method) },
-      { name: b":scheme", value: bytes_of_string(scheme) },
+      { name: b":scheme", value: bytes_of_string(r.scheme) },
     ],
-    push(authority, { name: b":path", value: bytes_of_string(path) }),
+    push(authority, {
+      name: b":path",
+      value: bytes_of_string(if r.target == "" { "/" } else { r.target }),
+    }),
   );
   let framed = bytes_len(r.body) > 0 || method == "POST" || method == "PUT" || method == "PATCH";
   concat(concat(pseudo, sent_fields(r.headers, true)), if framed {
@@ -2777,7 +2764,7 @@ fn answered(k: Conn, st: Stream, r: Response, t: Int) -> Conn / {abort.raise} =
     panic("a response's status is 200 to 999, not " ++ int_to_string(r.status))
   } else {
     let empty = r.status == 204 || r.status == 304;
-    let body = if empty || http::method_name(st.request.method) == "HEAD" { b"" } else { r.body };
+    let body = if empty || st.request.method == "HEAD" { b"" } else { r.body };
     let fields = concat(
       concat([status_field(r.status)], sent_fields(r.headers, false)),
       if empty { [] } else { [length_field(bytes_len(r.body))] },
@@ -2902,12 +2889,7 @@ pub fn request(c: Connection, req: Request, now: Instant) -> Option<Sent> / {abo
     let s = k.next_stream;
     let trailers = sent_fields(req.trailers, false);
     let ends = bytes_len(req.body) == 0 && trailers == [];
-    let headed = headers_emitted(
-      { ..k, next_stream: s + 2 },
-      s,
-      request_fields(req, k.scheme),
-      ends,
-    );
+    let headed = headers_emitted({ ..k, next_stream: s + 2 }, s, request_fields(req), ends);
     let st = {
       ..fresh_stream(headed, s, Open, req, t),
       out: req.body,
@@ -3726,10 +3708,22 @@ fn data(s: Int, b: Bytes, end: Bool) -> Bytes / {abort.raise} =
   encode_frame(DataFrame({ stream: s, data: b, end_stream: end, padding: None }))
 
 fn echo(r: Request) -> Response / {abort.raise} =
-  http::text_response(
-    200,
-    http::method_name(r.method) ++ " " ++ r.target ++ " " ++ string_of_bytes_lossy(r.body),
-  )
+  plain_text(200, r.method ++ " " ++ r.target ++ " " ++ string_of_bytes_lossy(r.body))
+
+/// A request to example.com over `https`, with no field of its own.
+fn asking(method: String, target: String, body: Bytes) -> Request =
+  {
+    method: method,
+    scheme: "https",
+    authority: "example.com",
+    target: target,
+    headers: map_new(),
+    trailers: map_new(),
+    body: body,
+  }
+
+fn first_value(h: Headers, name: String) -> Option<String> =
+  match map_get(h, name) { Some(values) -> list_at(values, 0), None -> None }
 
 type Served = { connection: Connection, frames: List<String>, events: List<Event> }
 
@@ -3749,7 +3743,7 @@ fn served(
   chunks: List<Bytes>,
   app: (Request) -> Response / {abort.raise},
 ) -> Served / {abort.raise} = {
-  let start = take_output(server(limits, None, at(0)));
+  let start = take_output(server(limits, at(0)));
   fold(
     chunks,
     { connection: start.connection, frames: [], events: [] },
@@ -3780,11 +3774,10 @@ test "a GET is a request the application answers with HEADERS and then DATA" {
   match s.events {
     [Requested(q)] -> {
       assert_eq(q.stream, 1);
-      assert_eq(q.request.path, "/a");
-      assert_eq(q.request.query, "b=1");
+      assert_eq(q.request.scheme, "https");
       assert_eq(q.request.target, "/a?b=1");
       assert_eq(q.request.authority, "example.com");
-      assert_eq(q.request.method, http::Get)
+      assert_eq(q.request.method, "GET")
     },
     _ -> panic("one request, not " ++ int_to_string(len(s.events)) ++ " events"),
   };
@@ -3792,7 +3785,7 @@ test "a GET is a request the application answers with HEADERS and then DATA" {
 }
 
 test "the server's first output is its SETTINGS and the window it adds to the connection's" {
-  let start = take_output(server(default_limits(), None, at(0)));
+  let start = take_output(server(default_limits(), at(0)));
   assert_eq(map(frames_in(start.bytes), shown), ["SETTINGS", "WINDOW_UPDATE 0 983041"])
 }
 
@@ -4123,10 +4116,8 @@ fn drop_method(fields: List<(String, String)>) -> List<(String, String)> =
 
 test "after h2spec: {e.name}" for e: Exchange in exchanges() {
   let s = served(default_limits(), concat([opening([])], e.input), echo);
-  assert_eq(drop_first(s.frames), e.output)
+  assert_eq(drop(s.frames, 1), e.output)
 }
-
-fn drop_first(xs: List<String>) -> List<String> = match xs { [_, ..rest] -> rest, [] -> [] }
 
 type Bad = { name: String, fields: List<(String, String)> }
 
@@ -4198,8 +4189,8 @@ test "cookies sent as several fields are one field to the application" {
   );
   match s.events {
     [Requested(q)] -> {
-      assert_eq(http::header_lines(q.request.headers, "cookie"), ["a=1; b=2"]);
-      assert_eq(http::header(q.request.headers, "accept"), Some("*/*"))
+      assert_eq(map_get(q.request.headers, "cookie"), Some(["a=1; b=2"]));
+      assert_eq(first_value(q.request.headers, "accept"), Some("*/*"))
     },
     _ -> panic("one request"),
   }
@@ -4241,7 +4232,7 @@ test "a response to HEAD, and a 204, carry no body" {
   );
   assert_eq(head.frames, ["SETTINGS ACK", "HEADERS 1 END_STREAM"]);
   let none = served(default_limits(), [opening([]), get(1, "/")], |_: Request|
-    http::response(204, b"ignored"));
+    { status: 204, headers: map_new(), body: b"ignored" });
   assert_eq(none.frames, ["SETTINGS ACK", "HEADERS 1 END_STREAM"])
 }
 
@@ -4284,7 +4275,7 @@ test "rapid reset: streams opened and reset past max_resets close the connection
 
 test "streams reset within the window count, and the count begins again after it" {
   let l = { ..default_limits(), max_resets: 2, window_ms: 100 };
-  let start = take_output(server(l, None, at(0)));
+  let start = take_output(server(l, at(0)));
   let one = receive(
     start.connection,
     bytes_concat(
@@ -4559,7 +4550,7 @@ test "an idle connection closes after idle_timeout_ms" {
   let s = served(l, [opening([]), get(1, "/")], echo);
   assert_eq(deadline(s.connection), Some(at(2001)));
   let idle = ticked(s, 2001);
-  assert_eq(drop_first(drop_first(drop_first(idle.frames))), ["GOAWAY 1 NO_ERROR"]);
+  assert_eq(drop(idle.frames, 3), ["GOAWAY 1 NO_ERROR"]);
   assert(finished(idle.connection), None)
 }
 
@@ -4631,14 +4622,7 @@ type Ends = {
 }
 
 fn joined(l: Limits) -> Ends / {abort.raise} =
-  {
-    client: client(l, "https", at(0)),
-    server: server(l, None, at(0)),
-    up: b"",
-    down: b"",
-    events: [],
-    step: 0,
-  }
+  { client: client(l, at(0)), server: server(l, at(0)), up: b"", down: b"", events: [], step: 0 }
 
 /// How many octets the delivery at step `i` carries of the `n` waiting: what `cuts` says in turn,
 /// 1 to 200, or all of them where it says nothing.
@@ -4694,23 +4678,16 @@ fn answers(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
     })
 
 test "a client's requests reach a server, and its answers come back on their streams" {
-  let posted = {
-    ..http::request_to(http::Post, "example.com", "/b", b"xyz"),
-    trailers: http::set_header(map_new(), "x-sum", "3"),
-  };
+  let posted = { ..asking("POST", "/b", b"xyz"), trailers: map_insert(map_new(), "x-sum", ["3"]) };
   let e = carried(
-    asked(joined(default_limits()), [
-      http::request_to(http::Get, "example.com", "/a", b""),
-      posted,
-      http::request_to(http::Head, "example.com", "/c", b""),
-    ]),
+    asked(joined(default_limits()), [asking("GET", "/a", b""), posted, asking("HEAD", "/c", b"")]),
     echo,
     [],
     50,
   );
   assert_eq(answers(e.events), [(1, 200, "GET /a "), (3, 200, "POST /b xyz"), (5, 200, "")]);
   match filter(e.events, |x: Event| match x { Answered(a) -> a.stream == 5, _ -> false }) {
-    [Answered(a)] -> assert_eq(http::header(a.response.headers, "content-length"), Some("8")),
+    [Answered(a)] -> assert_eq(first_value(a.response.headers, "content-length"), Some("8")),
     _ -> panic("an answer on stream 5"),
   };
   assert_eq(open_streams(e.client), 0);
@@ -4718,17 +4695,11 @@ test "a client's requests reach a server, and its answers come back on their str
 }
 
 test "a request's trailers reach the server's application" {
-  let posted = {
-    ..http::request_to(http::Post, "example.com", "/b", b"xyz"),
-    trailers: http::set_header(map_new(), "x-sum", "3"),
-  };
+  let posted = { ..asking("POST", "/b", b"xyz"), trailers: map_insert(map_new(), "x-sum", ["3"]) };
   let e = carried(
     asked(joined(default_limits()), [posted]),
     |r: Request|
-      http::text_response(200, match http::header(r.trailers, "x-sum") {
-        Some(v) -> v,
-        None -> "none",
-      }),
+      plain_text(200, match first_value(r.trailers, "x-sum") { Some(v) -> v, None -> "none" }),
     [],
     50,
   );
@@ -4736,12 +4707,8 @@ test "a request's trailers reach the server's application" {
 }
 
 test "a client refuses a response whose head is malformed, and a server's PUSH_PROMISE" {
-  let start = take_output(client(default_limits(), "https", at(0)));
-  let sent = match request(
-      start.connection,
-      http::request_to(http::Get, "example.com", "/", b""),
-      at(0),
-    ) {
+  let start = take_output(client(default_limits(), at(0)));
+  let sent = match request(start.connection, asking("GET", "/", b""), at(0)) {
     Some(s) -> s.connection,
     None -> panic("a stream"),
   };
@@ -4766,8 +4733,8 @@ test "a client refuses a response whose head is malformed, and a server's PUSH_P
 
 test "a client is told which of its streams a GOAWAY left untaken, and opens no more" {
   let opened_two = asked(joined(default_limits()), [
-    http::request_to(http::Get, "example.com", "/a", b""),
-    http::request_to(http::Get, "example.com", "/b", b""),
+    asking("GET", "/a", b""),
+    asking("GET", "/b", b""),
   ]);
   let c = take_output(opened_two.client);
   let told = receive(
@@ -4779,23 +4746,22 @@ test "a client is told which of its streams a GOAWAY left untaken, and opens no 
     at(1),
   );
   assert_eq(answers(told.events), [(3, 0 - 1, "REFUSED_STREAM")]);
-  assert_eq(
-    request(told.connection, http::request_to(http::Get, "example.com", "/c", b""), at(2)) == None,
-    true,
-  )
+  assert_eq(request(told.connection, asking("GET", "/c", b""), at(2)) == None, true)
 }
 
+/// An answer of as many octets as the target, `/50`, says.
 fn sized(r: Request) -> Response / {abort.raise} =
-  http::response(
-    200,
-    repeat(
+  {
+    status: 200,
+    headers: map_new(),
+    body: repeat(
       b"x",
-      match int_of_ascii(bytes_of_string(string_slice(r.path, 1, string_len(r.path)))) {
+      match int_of_ascii(bytes_of_string(string_slice(r.target, 1, string_len(r.target)))) {
         Some(n) -> n,
         None -> 0,
       },
     ),
-  )
+  }
 
 /// `n` folded into `0` to `below`, for a sampled number to pick with.
 fn non_negative(n: Int, below: Int) -> Int / {abort.raise} =
@@ -4832,7 +4798,7 @@ law "a server sends no more DATA than its client's windows allow, however they o
       map(range(0, 3), |i: Int|
         get(2 * i + 1, "/" ++ int_to_string(non_negative(at_or(sizes, i, 0), 70000)))),
     );
-    let start = take_output(server(default_limits(), None, at(0)));
+    let start = take_output(server(default_limits(), at(0)));
     let first = receive(
       start.connection,
       bytes_concat(opening([InitialWindowSize(w)]), gets),
@@ -4863,8 +4829,7 @@ law "a server sends no more DATA than its client's windows allow, however they o
   }
 
 fn posts(n: Int, size: Int) -> List<Request> / {abort.raise} =
-  map(range(0, n), |i: Int|
-    http::request_to(http::Post, "example.com", "/" ++ int_to_string(i), repeat(b"p", size)))
+  map(range(0, n), |i: Int| asking("POST", "/" ++ int_to_string(i), repeat(b"p", size)))
 
 law "two exchanges larger than every stream window finish however the bytes between the ends are cut"
   forall (cuts: List<Int>) {
@@ -4927,10 +4892,7 @@ test "two answers larger than their windows finish under every interleaving of t
     let inbox = task.channel(4);
     let l = { ..default_limits(), initial_window: 40 };
     let e = multiplexed(
-      asked(joined(l), [
-        http::request_to(http::Get, "example.com", "/50", b""),
-        http::request_to(http::Get, "example.com", "/45", b""),
-      ]),
+      asked(joined(l), [asking("GET", "/50", b""), asking("GET", "/45", b"")]),
       inbox,
       40,
     );

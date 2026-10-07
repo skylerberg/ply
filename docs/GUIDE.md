@@ -2740,8 +2740,11 @@ At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
 is what `std.http`'s `serve_pooled` drains on: it accepts nothing more, and it
 answers every connection it had accepted, queued ones included, the last answer
 on each saying `Connection: close`, and closes the ones waiting idle at once.
-Before the stop it sheds load, answering `503` with `Retry-After` to a
-connection that finds its queue full or that waited in it too long.
+A connection that opened with the HTTP/2 preface is drained with `GOAWAY`: the
+streams the client opened before it saw it are answered, and then the
+connection closes. Before the stop it sheds load, answering `503` with
+`Retry-After` to a connection that finds its queue full or that waited in it
+too long.
 
 An unreadable configuration source is `E0440`. A statement the server rejects
 and one that touches a table outside what the call site labelled are refusals
@@ -3422,7 +3425,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
   between calls; no backpressure; no migrations or live schema
-  check; HTTP/1.1 only; no authentication framework.
+  check; HTTP/2 only by prior knowledge, never negotiated over TLS, and with no
+  server push; no authentication framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
 `handle` names is found only when it reaches the host boundary at run time
