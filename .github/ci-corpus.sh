@@ -25,6 +25,9 @@
 #       empty) in one `ply test` with the desk's grants and ARGs added, their milliseconds onto
 #       TIMINGS as a partition's
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test` or `ply prove`
+#   ci-corpus.sh sweep [ARG...]        the edit sweep (`edit_sweep` of the CLI's suite) with the suite's
+#                                      grants: the cases its `--filter`s name, or else, with ARGs such as
+#                                      `--shard K/N` added, every case
 #   ci-corpus.sh select [CUT]
 #       the jobs a run has to start, as `KEY=VALUE` lines for the workflow's outputs: `partitions`
 #       and `corpus`, the matrices of the partitions, desk runners and runs alone holding a run no
@@ -644,6 +647,33 @@ case "${1:-}" in
   run)
     : > "$durations"
     run_one "" "${2:?a corpus entry}" "${@:3}"
+    ;;
+  sweep)
+    : > "$durations"
+    out=$(mktemp)
+    status=0
+    # Filters are alternatives, so one naming the whole module beside a case's would run every case.
+    # A part of a module's cases may hold none of them.
+    named=0
+    parted=0
+    for arg in "${@:2}"; do
+      [[ $arg == --filter* ]] && named=1
+      [[ $arg == --shard* ]] && parted=1
+    done
+    if ((named)); then
+      tested "$cli_suite" "${@:2}" > "$out" || status=$?
+    else
+      tested "$cli_suite" --filter "edit_sweep." "${@:2}" > "$out" || status=$?
+    fi
+    listed "$out"
+    selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
+    if [ "$status" -ne 0 ] || { [ "$selected" -eq 0 ] && ! ((named && parted)); }; then
+      [ "$selected" -gt 0 ] || echo "the sweep selected no case" >&2
+      red "$out"
+      rm -f "$out"
+      exit 1
+    fi
+    rm -f "$out"
     ;;
   mark)
     touch "$mark"

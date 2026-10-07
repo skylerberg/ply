@@ -2069,7 +2069,8 @@ imports, `pub`, specs and test labels are erased, and references are replaced by
 their referent's hash. A test runs exactly when neither its hash nor the code it compiles to has a
 recorded pass that still stands, so renames and comment edits run nothing, and neither does an edit
 or a new `ply` that compiles a test to the same code; the selection line counts those `by code`
-(`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes.
+(`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json`
+gives each definition's and test's as `hash`.
 
 A pass is filed with what its run read of the world: each file and directory a handler read under a
 root (by the root's name, so a pass reads the same from another checkout), each shipped module it

@@ -1,0 +1,96 @@
+//! `edit_gate`'s edits made to every module of the tree, a case per module and kind of edit: each
+//! example within the examples, each of the compiler's modules within its package, and each module
+//! of the standard library as the examples read it, standing in for the one the binary ships. Too
+//! long for a pull request's lanes, a fourteenth of it runs each night, and a pull request runs a
+//! quarter of the edits of each module it changes (`ci-shards.sh sweep-matrix`).
+
+import edit_gate (Edit, every_edit, edit_name, disagreements, shipped_disagreements, held_through)
+import std.string (join)
+import cli.sources (stem)
+import harness (Source, scratch, project, example_files, compiler_tree, prelude_file, std_modules,
+                StdModule)
+
+fn ply_files(files: List<{ name: String, bytes: Bytes }>) -> List<{ name: String, bytes: Bytes }> =
+  filter(files, |f: { name: String, bytes: Bytes }| string_ends_with(f.name, ".ply"))
+
+fn examples() -> List<Source> / {abort.raise} =
+  map(example_files(), |f: { name: String, bytes: Bytes }|
+    { path: f.name, text: string_of_bytes(f.bytes) })
+
+/// A file's name without its `.ply`: no case names a module with a `.` after a word, which would
+/// put it under another module's `--filter`.
+fn example_names() -> List<String> / {abort.raise} =
+  map(ply_files(example_files()), |f: { name: String, bytes: Bytes }| stem(f.name))
+
+/// The compiler's package under `ply`, with the prelude it embeds from beside it.
+fn compiler() -> List<Source> / {abort.raise} =
+  push(
+    map(compiler_tree(), |f: { name: String, bytes: Bytes }|
+      { path: "ply/" ++ f.name, text: string_of_bytes(f.bytes) }),
+    { path: "prelude.ply", text: string_of_bytes(prelude_file()) },
+  )
+
+fn compiler_names() -> List<String> / {abort.raise} =
+  map(ply_files(compiler_tree()), |f: { name: String, bytes: Bytes }| stem(f.name))
+
+/// Each module of the standard library, its name's dots as slashes.
+fn stds() -> List<String> / {abort.raise} =
+  map(std_modules(), |m: StdModule| join(string_split(m.module, "."), "/"))
+
+fn std_module(slashed: String) -> StdModule / {abort.raise} = {
+  let name = join(string_split(slashed, "/"), ".");
+  match filter(std_modules(), |m: StdModule| m.module == name) {
+    [m, ..] -> m,
+    [] -> panic("no module of the standard library is named `" ++ name ++ "`"),
+  }
+}
+
+/// Each of `modules` with each kind of edit, as a case names it.
+fn with_every_edit(modules: List<String>) -> List<String> =
+  fold(modules, [], |acc: List<String>, m: String|
+    fold(every_edit(), acc, |a: List<String>, e: Edit| push(a, m ++ " with " ++ edit_name(e))))
+
+/// The module and the edit a case names.
+fn case_of(case: String) -> { module: String, edit: Edit } / {abort.raise} = {
+  let b = bytes_of_string(case);
+  match bytes_index_of(b, b" with ") {
+    None -> panic("a case names a module and an edit: `" ++ case ++ "`"),
+    Some(at) -> {
+      let named = string_of_bytes_lossy(bytes_slice(b, at + 6, bytes_len(b)));
+      match filter(every_edit(), |e: Edit| edit_name(e) == named) {
+        [e, ..] -> { module: string_of_bytes_lossy(bytes_slice(b, 0, at)), edit: e },
+        [] -> panic("no edit is named `" ++ named ++ "`"),
+      }
+    },
+  }
+}
+
+test "editing examples/{case} agrees warm and cold" for case: String in with_every_edit(
+    example_names(),
+  ) {
+  let c = case_of(case);
+  scratch(|| {
+    project(examples());
+    held_through(disagreements(".", [c.module ++ ".ply"], [c.edit]), 0)
+  })
+}
+
+test "editing compiler/{case} agrees warm and cold" for case: String in with_every_edit(
+    compiler_names(),
+  ) {
+  let c = case_of(case);
+  scratch(|| {
+    project(compiler());
+    held_through(disagreements("ply", ["ply/" ++ c.module ++ ".ply"], [c.edit]), 0)
+  })
+}
+
+test "editing {case} agrees warm and cold where the examples read it" for case: String in with_every_edit(
+    stds(),
+  ) {
+  let c = case_of(case);
+  scratch(|| {
+    project(examples());
+    held_through(shipped_disagreements(".", std_module(c.module), [c.edit]), 0)
+  })
+}
