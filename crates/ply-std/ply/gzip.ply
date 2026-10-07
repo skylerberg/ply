@@ -376,14 +376,9 @@ fn blocks_written(
   s: Scanned,
   c: Coder,
 ) -> Scanned / {abort.raise} =
-  if from >= to && !last { s } else if from >= to - 65535 {
-    let w = s.w;
-    let table = s.table;
-    block_written(data, from, to, shift, last, table, w, c)
-  } else {
-    let w = s.w;
-    let table = s.table;
-    let one = block_written(data, from, from + 65535, shift, false, table, w, c);
+  if from >= to && !last { s }
+  else if from >= to - 65535 { block_written(data, from, to, shift, last, s.table, s.w, c) } else {
+    let one = block_written(data, from, from + 65535, shift, false, s.table, s.w, c);
     blocks_written(data, from + 65535, to, shift, last, one, c)
   }
 
@@ -466,40 +461,23 @@ type Pressed = { out: Bytes, next: Encoder }
 /// The writer with `chunk` taken in, and every whole block it then holds written. It keeps the
 /// 32 KiB before the bytes not yet written.
 fn pressed(e: Encoder, chunk: Bytes, format: Format) -> Pressed / {abort.raise} = {
-  let from = e.from;
-  let shift = e.shift;
-  let tables = e.coder;
   let sum = match format { Deflate -> e.sum, _ -> checksum::update(e.sum, chunk) };
   let total = e.total + bytes_len(chunk);
-  let state = e.state;
   let buf = bytes_concat(e.buf, chunk);
-  let whole = (bytes_len(buf) - from) / 65535 * 65535;
-  if whole == 0 {
-    {
-      out: b"",
-      next: {
-        buf: buf,
-        from: from,
-        shift: shift,
-        state: state,
-        coder: tables,
-        sum: sum,
-        total: total,
-      },
-    }
-  } else {
-    let done = blocks_written(buf, from, from + whole, shift, false, state, tables);
+  let whole = (bytes_len(buf) - e.from) / 65535 * 65535;
+  if whole == 0 { { out: b"", next: { ..e, buf: buf, sum: sum, total: total } } } else {
+    let done = blocks_written(buf, e.from, e.from + whole, e.shift, false, e.state, e.coder);
     let w = done.w;
-    let at = from + whole;
+    let at = e.from + whole;
     let cut = if at > 65536 { at - 32768 } else { 0 };
     {
       out: bytes_concat_all(w.pieces),
       next: {
+        ..e,
         buf: if cut == 0 { buf } else { bytes_slice(buf, cut, bytes_len(buf)) },
         from: at - cut,
-        shift: shift + cut,
+        shift: e.shift + cut,
         state: { w: { pieces: [], buf: w.buf, bits: w.bits }, table: done.table },
-        coder: tables,
         sum: sum,
         total: total,
       },
@@ -511,17 +489,13 @@ fn pressed(e: Encoder, chunk: Bytes, format: Format) -> Pressed / {abort.raise} 
 /// the CRC-32 of what was written and its length for gzip and the Adler-32 for zlib.
 fn closed(e: Encoder, format: Format) -> Bytes / {abort.raise} = {
   let sum = int_of_u64(checksum::finish(e.sum) & 0xFFFF_FFFFu64);
-  let total = e.total;
-  let tables = e.coder;
-  let from = e.from;
-  let shift = e.shift;
-  let buf = e.buf;
-  let state = e.state;
-  let done = flushed(blocks_written(buf, from, bytes_len(buf), shift, true, state, tables).w);
+  let done = flushed(
+    blocks_written(e.buf, e.from, bytes_len(e.buf), e.shift, true, e.state, e.coder).w,
+  );
   match format {
     Deflate -> done,
     Zlib -> bytes_concat(done, u32_be(sum)),
-    Gzip -> bytes_concat_all([done, u32_le(sum), u32_le(total & 0xFFFF_FFFF)]),
+    Gzip -> bytes_concat_all([done, u32_le(sum), u32_le(e.total & 0xFFFF_FFFF)]),
   }
 }
 
@@ -1048,14 +1022,12 @@ fn headed(d: Decoder) -> Core / {gzip.refused, abort.raise} = {
 /// ends inside one.
 fn coded_block(d: Decoder, goal: Int) -> Decoder / {gzip.refused, abort.raise} = {
   let core = d.core;
-  let input = d.input;
-  let hist = d.hist;
-  let end = 8 * bytes_len(input) - 128;
+  let end = 8 * bytes_len(d.input) - 128;
   let ran = symbols(
-    input,
+    d.input,
     end,
     core.bit,
-    hist,
+    d.hist,
     array_of_list([core.cut, core.limit, core.opened, core.base]),
     core.lit,
     core.dist,
@@ -1063,27 +1035,27 @@ fn coded_block(d: Decoder, goal: Int) -> Decoder / {gzip.refused, abort.raise} =
     core.sent + goal,
     end - core.bit + 1,
   );
-  let state = ran.state;
-  let moved = {
-    ..core,
-    bit: ran.bit,
-    phase: if state != 0 { 2 } else if core.last { 4 } else { 1 },
-    need: if state == 1 { 1 } else { 0 },
-  };
-  { input: input, hist: ran.out, core: moved }
+  {
+    ..d,
+    hist: ran.out,
+    core: {
+      ..core,
+      bit: ran.bit,
+      phase: if ran.state != 0 { 2 } else if core.last { 4 } else { 1 },
+      need: if ran.state == 1 { 1 } else { 0 },
+    },
+  }
 }
 
 /// A stored block's bytes, as many as the input holds.
 fn stored_bytes(d: Decoder) -> Decoder / {abort.raise} = {
   let core = d.core;
   let from = core.bit >>> 3;
-  let input = d.input;
-  let hist = d.hist;
-  let count = min(core.left, bytes_len(input) - 16 - from);
+  let count = min(core.left, bytes_len(d.input) - 16 - from);
   let left = core.left - count;
   {
-    input: input,
-    hist: if count > 0 { hist ++ bytes_slice(input, from, from + count) } else { hist },
+    ..d,
+    hist: if count > 0 { d.hist ++ bytes_slice(d.input, from, from + count) } else { d.hist },
     core: {
       ..core,
       bit: 8 * (from + count),
