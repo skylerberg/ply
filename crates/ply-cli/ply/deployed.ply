@@ -8,7 +8,8 @@ import units
 import units (emit)
 import compiler.front (Dump, HashFrame, HDef, HashRow, BodyRow, DefRow, TypeRow, EffectRow,
                        shipped_dump)
-import compiler.hash (Printed, Unprintable, body_key, hex, print_bodies)
+import compiler.hash (Closed, HashOutput, Printed, Unprintable, body_key, by_name, held_by, hex,
+                      print_bodies, walk)
 import compiler.load (SourceFile, held, LoadedAnalysis)
 import compiler.plyx (Header, Placed, Section, decode, digest_of, digest_text, domain, word)
 import compiler.resolve (Diag, error_at)
@@ -53,8 +54,9 @@ pub type Opened = {
 
 /// What a build asks of its artifacts: one made from the program, an earlier one read back, and a
 /// library's unit. `deploying` answers it with this module; a test answers it with what it reports.
+/// `hashes` is the hashing `front` was answered from: a closure is walked over its references.
 pub effect artifacts {
-  read made(front: LoadedAnalysis, entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
+  read made(front: LoadedAnalysis, hashes: HashOutput, entry: String, startup: List<String>, reaches: Bool) -> Result<Made, Refusal>
   /// `None` when nothing could be read at `path`.
   read previous(path: String, bytes: Option<Bytes>) -> Result<Previous, Refusal>
   read unit(front: LoadedAnalysis, names: List<String>) -> Result<Compiled, Refusal>
@@ -68,7 +70,8 @@ pub fn deploying<a | e>(
   handle {
     body()
   } with {
-    artifacts.made(front, entry, startup, reaches) -> made(front, entry, startup, reaches),
+    artifacts.made(front, hashes, entry, startup, reaches) ->
+      made(front, hashes, entry, startup, reaches),
     artifacts.previous(path, bytes) -> previous(path, bytes),
     artifacts.unit(front, names) -> library_unit(front, names),
   }
@@ -142,34 +145,6 @@ fn hash_rows(d: Dump) -> Map<Bytes, HashRow> =
   fold(d.hashes, map_new(), |acc: Map<Bytes, HashRow>, f: HashFrame|
     match f { HDef(r) -> map_insert(acc, r.name, r), _ -> acc })
 
-/// Breadth first: each round reaches one dependency further, and only a row's key has any, so the
-/// rows bound the rounds.
-fn reached(rows: Map<Bytes, HashRow>, n: Bytes, seen: Map<Bytes, Bool>) -> Map<Bytes, Bool> =
-  fold(
-    range(0, map_len(rows) + 2),
-    { seen: seen, frontier: [n] },
-    |acc: { seen: Map<Bytes, Bool>, frontier: List<Bytes> }, _round: Int|
-      fold(
-        acc.frontier,
-        { seen: acc.seen, frontier: [] },
-        |o: { seen: Map<Bytes, Bool>, frontier: List<Bytes> }, m: Bytes|
-          if map_contains(o.seen, m) { o } else {
-            {
-              seen: map_insert(o.seen, m, true),
-              frontier: fold(
-                match map_get(rows, m) { Some(r) -> r.deps, None -> [] },
-                o.frontier,
-                |f: List<Bytes>, d: Bytes| push(f, d),
-              ),
-            }
-          },
-      ),
-  ).seen
-
-/// Every name `roots` reach through what each refers to, themselves included, in name order.
-fn closure_of(rows: Map<Bytes, HashRow>, roots: List<Bytes>) -> List<Bytes> =
-  map_keys(fold(roots, map_new(), |acc: Map<Bytes, Bool>, r: Bytes| reached(rows, r, acc)))
-
 /// A hash as the answer spells it, in hex, as the bytes a body is keyed by.
 fn raw(h: Bytes) -> Bytes / {abort.raise} = bytes_of_hex(string_of_bytes(h))
 
@@ -195,28 +170,27 @@ fn filed(stored: List<Bytes>, hash: Bytes) -> Option<Bytes> / {abort.raise} =
     },
   }
 
-/// Every body the answer holds, keyed by the hash it is filed under.
-fn bodies_of(d: Dump, rows: Map<Bytes, HashRow>) -> Map<Bytes, Bytes> / {abort.raise} =
-  map_fold(grouped(d), map_new(), |acc: Map<Bytes, Bytes>, name: Bytes, stored: List<Bytes>|
-    match map_get(rows, name) {
-      None -> acc,
-      Some(r) ->
-        fold(hashes_of(r), acc, |into: Map<Bytes, Bytes>, h: Bytes|
-          match filed(stored, h) { Some(b) -> map_insert(into, h, b), None -> into }),
-    })
-
 type Pair = { name: Bytes, hash: Bytes }
 
-/// Each name of the closure with each hash it is filed under, by name and then by hash.
-fn pairs_of(rows: Map<Bytes, HashRow>, names: List<Bytes>) -> List<Pair> / {abort.raise} =
-  map_values(
-    fold(names, map_new(), |acc: Map<Bytes, Pair>, n: Bytes|
-      match map_get(rows, n) {
+/// The body the answer holds for each of `pairs`, keyed by the hash it is filed under.
+fn bodies_of(d: Dump, pairs: List<Pair>) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let stored = grouped(d);
+  fold(pairs, map_new(), |acc: Map<Bytes, Bytes>, pair: Pair|
+    match map_get(stored, pair.name) {
+      None -> acc,
+      Some(bodies) -> match filed(bodies, pair.hash) {
+        Some(b) -> map_insert(acc, pair.hash, b),
         None -> acc,
-        Some(r) ->
-          fold(hashes_of(r), acc, |into: Map<Bytes, Pair>, h: Bytes|
-            map_insert(into, bytes_concat_all([n, b"\x00", h]), { name: n, hash: h })),
-      }),
+      },
+    })
+}
+
+/// Each definition and declaration a closure holds with the hash it is filed under, by name and
+/// then by hash.
+fn pairs_of(held: List<Closed>) -> List<Pair> =
+  map_values(
+    fold(held, map_new(), |acc: Map<Bytes, Pair>, x: Closed|
+      map_insert(acc, bytes_concat_all([x.name, b"\x00", x.hash]), { name: x.name, hash: x.hash })),
   )
 
 fn listed(names: List<Bytes>) -> Bytes =
@@ -248,17 +222,26 @@ fn unhashed(name: Bytes) -> Diag =
     [],
   )
 
-/// Whether the module that holds `name` exports it; a prelude effect is public.
-fn exported(d: Dump, name: Bytes) -> Bool =
-  match filter(d.defs, |r: DefRow| r.name == name) {
-    [r, ..] -> r.public,
-    [] -> match filter(d.types, |r: TypeRow| r.name == name) {
-      [r, ..] -> r.public,
-      [] -> match filter(d.effects, |r: EffectRow| r.name == name) {
-        [r, ..] -> r.public,
-        [] -> true,
-      },
-    },
+/// Each function's and each declaration's `pub`, by name: a function and an effect of one name each
+/// say their own.
+type Exports = { fns: Map<Bytes, Bool>, decls: Map<Bytes, Bool> }
+
+fn exports_of(d: Dump) -> Exports = {
+  let typed = fold(d.types, map_new(), |acc: Map<Bytes, Bool>, r: TypeRow|
+    map_insert(acc, r.name, r.public));
+  {
+    fns: fold(d.defs, map_new(), |acc: Map<Bytes, Bool>, r: DefRow|
+      map_insert(acc, r.name, r.public)),
+    decls: fold(d.effects, typed, |acc: Map<Bytes, Bool>, r: EffectRow|
+      map_insert(acc, r.name, r.public)),
+  }
+}
+
+/// Whether the module that holds `x` exports it; a prelude effect is public.
+fn exported(e: Exports, x: Closed) -> Bool =
+  match map_get(if x.decl { e.decls } else { e.fns }, x.name) {
+    Some(public) -> public,
+    None -> true,
   }
 
 fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
@@ -270,25 +253,47 @@ fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
 fn path_of(module: Bytes) -> String / {abort.raise} =
   join(string_split(string_of_bytes(module), "."), "/") ++ ".ply"
 
+/// The closure printed back, each reference under the name its definition names: two modules that
+/// declare one thing alike file one body, and only what a definition references says which it means.
 fn printed_files(
   d: Dump,
-  pairs: List<Pair>,
+  held: List<Closed>,
   bodies: Map<Bytes, Bytes>,
 ) -> Result<List<SourceFile>, Diag> / {shipped.names, abort.raise} = {
   let shipped_names = fold(shipped.names(), map_new(), |acc: Map<Bytes, Bool>, n: String|
     map_insert(acc, bytes_of_string(n), true));
   let shipped_modules = map_keys(
-    fold(pairs, map_new(), |acc: Map<Bytes, Bool>, pair: Pair| {
-      let m = module_of(pair.name);
+    fold(held, map_new(), |acc: Map<Bytes, Bool>, x: Closed| {
+      let m = module_of(x.name);
       if map_contains(shipped_names, m) { map_insert(acc, m, true) } else { acc }
     }),
   );
+  let exports = exports_of(d);
   match print_bodies(
       map_values(bodies),
-      map(pairs, |pair: Pair| { name: pair.name, hash: pair.hash, public: exported(d, pair.name) }),
+      map_values(
+        fold(
+          held,
+          map_new(),
+          |acc: Map<Bytes, { name: Bytes, hash: Bytes, public: Bool }>, x: Closed|
+            map_insert(acc, bytes_concat_all([x.name, b"\x00", x.hash]), {
+              name: x.name,
+              hash: x.hash,
+              public: exported(exports, x),
+            }),
+        ),
+      ),
       [],
       [],
       shipped_modules,
+      false,
+      map(held, |x: Closed|
+        {
+          name: x.name,
+          hash: x.hash,
+          names: fold(x.refs, [], |acc: List<Bytes>, i: Int|
+            match list_at(held, i) { Some(to) -> push(acc, to.name), None -> acc }),
+        }),
     ) {
     Unprintable(r) ->
       Err(
@@ -319,7 +324,7 @@ fn unfaithful(
   again: Dump,
 ) -> Option<Bytes> / {abort.raise} = {
   let now = hash_rows(again);
-  let rebuilt = bodies_of(again, now);
+  let rebuilt = bodies_of(again, pairs);
   match filter(pairs, |pair: Pair|
       !files(now, pair) || map_get(rebuilt, pair.hash) != map_get(bodies, pair.hash)) {
     [pair, ..] -> Some(pair.name),
@@ -332,16 +337,28 @@ fn names_of_pairs(pairs: List<Pair>) -> List<Bytes> =
     fold(pairs, map_new(), |acc: Map<Bytes, Bool>, pair: Pair| map_insert(acc, pair.name, true)),
   )
 
-fn reaches_of(rows: Map<Bytes, HashRow>, names: List<Bytes>) -> List<Reach> / {abort.raise} = {
-  let among = fold(names, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
-  map(names, |n: Bytes|
-    {
-      name: string_of_bytes(n),
-      reaches: map(
-        filter(map_keys(reached(rows, n, map_new())), |m: Bytes| map_contains(among, m)),
-        string_of_bytes,
-      ),
-    })
+/// Each definition and declaration a closure holds with the names it reaches of it, its own
+/// included, in name order, a declaration before the function of its name.
+fn reaches_of(held: List<Closed>) -> List<Reach> / {abort.raise} = {
+  let edges = map(held, |x: Closed| x.refs);
+  let name_at = |i: Int| match list_at(held, i) { Some(x) -> x.name, None -> b"" };
+  map_values(
+    fold(range(0, len(held)), map_new(), |acc: Map<Bytes, Reach>, i: Int|
+      match list_at(held, i) {
+        None -> acc,
+        Some(x) ->
+          map_insert(acc, bytes_concat_all([x.name, b"\x00", if x.decl { b"0" } else { b"1" }]), {
+            name: string_of_bytes(x.name),
+            reaches: map(
+              map_keys(
+                fold(walk(edges, [i]), map_new(), |seen: Map<Bytes, Bool>, j: Int|
+                  map_insert(seen, name_at(j), true)),
+              ),
+              string_of_bytes,
+            ),
+          }),
+      }),
+  )
 }
 
 // --- The sections -----------------------------------------------------------------
@@ -399,36 +416,37 @@ fn closure_section(files: List<SourceFile>) -> Section / {abort.raise} =
 // --- Making one -------------------------------------------------------------------
 
 /// The artifact of `entry`, with `startup` run before it: its closure, printed back to source and
-/// checked again, the unit emitted from that check, and the runnable made of both.
+/// checked again, the unit emitted from that check, and the runnable made of both. The closure is
+/// what the functions `entry` and `startup` reach over `hashes`, a function apart from an effect or
+/// a type of its name: holding one holds nothing the other reaches.
 pub fn made(
   front: LoadedAnalysis,
+  hashes: HashOutput,
   entry: String,
   startup: List<String>,
   reaches: Bool,
 ) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, abort.raise} = {
-  let rows = hash_rows(front.dump);
+  let defs = by_name(hashes.defs);
   let roots = map(push(startup, entry), bytes_of_string);
-  match filter(roots, |r: Bytes|
-      match map_get(rows, r) { Some(x) -> x.def == None, None -> true }) {
+  match filter(roots, |r: Bytes| !map_contains(defs, r)) {
     [missing, ..] -> Err(refusal([unhashed(missing)])),
     [] -> {
-      let names = closure_of(rows, roots);
-      let pairs = pairs_of(rows, names);
-      let all = bodies_of(front.dump, rows);
-      match filter(pairs, |pair: Pair| !map_contains(all, pair.hash)) {
+      let closure = held_by(hashes, roots);
+      let pairs = pairs_of(closure);
+      let bodies = bodies_of(front.dump, pairs);
+      match filter(pairs, |pair: Pair| !map_contains(bodies, pair.hash)) {
         [_, ..] ->
           Err(
             refusal([
-              no_body(names_of_pairs(filter(pairs, |pair: Pair| !map_contains(all, pair.hash)))),
+              no_body(names_of_pairs(filter(pairs, |pair: Pair| !map_contains(bodies, pair.hash)))),
             ]),
           ),
         [] -> {
-          let bodies = fold(pairs, map_new(), |acc: Map<Bytes, Bytes>, pair: Pair|
-            match map_get(all, pair.hash) {
-              Some(b) -> map_insert(acc, pair.hash, b),
-              None -> acc,
-            });
-          match printed_files(front.dump, pairs, bodies) {
+          let names = map_keys(
+            fold(closure, map_new(), |acc: Map<Bytes, Bool>, x: Closed|
+              if x.decl { acc } else { map_insert(acc, x.name, true) }),
+          );
+          match printed_files(front.dump, closure, bodies) {
             Err(d) -> Err(refusal([d])),
             Ok(files) -> match held(files) {
               Err(u) ->
@@ -462,8 +480,8 @@ pub fn made(
                     ) {
                     Err(diags) -> Err(refusal(diags)),
                     Ok(unit) -> {
-                      let entry_hash = match map_get(rows, bytes_of_string(entry)) {
-                        Some(r) -> match r.def { Some(h) -> raw(h), None -> b"" },
+                      let entry_hash = match map_get(defs, bytes_of_string(entry)) {
+                        Some(h) -> h,
                         None -> b"",
                       };
                       let runnable = shipped.runnable(
@@ -488,7 +506,7 @@ pub fn made(
                         definitions: len(map_keys(bodies)),
                         names: map(pairs, |pair: Pair|
                           { name: string_of_bytes(pair.name), hash: hex_of(pair.hash) }),
-                        reaches: if reaches { reaches_of(rows, names) } else { [] },
+                        reaches: if reaches { reaches_of(closure) } else { [] },
                       })
                     },
                   }
@@ -809,33 +827,45 @@ pub fn previous(
 
 // --- Tests ------------------------------------------------------------------------
 
-fn row(name: Bytes, def: Option<Bytes>, deps: List<Bytes>) -> HashRow =
-  { name: name, def: def, own: None, decl: None, specs: [], spec_texts: [], deps: deps }
+fn held_as(name: Bytes, decl: Bool, hash: Bytes, refs: List<Int>) -> Closed =
+  { name: name, decl: decl, hash: hash, refs: refs }
 
-fn rows_of(rs: List<HashRow>) -> Map<Bytes, HashRow> =
-  fold(rs, map_new(), |acc: Map<Bytes, HashRow>, r: HashRow| map_insert(acc, r.name, r))
-
-test "a closure is every name its roots reach, once, and nothing they do not" {
-  let rows = rows_of([
-    row(b"m.main", Some(b"1"), [b"m.a", b"m.b"]),
-    row(b"m.a", Some(b"2"), [b"m.b", b"m.a"]),
-    row(b"m.b", Some(b"3"), []),
-    row(b"m.unreached", Some(b"4"), [b"m.a"]),
-  ]);
-  assert_eq(closure_of(rows, [b"m.main"]), [b"m.a", b"m.b", b"m.main"]);
-  assert_eq(closure_of(rows, [b"m.b"]), [b"m.b"])
+test "a name held as a function and as a declaration is filed under both hashes, by name and then by hash" {
+  let held = [
+    held_as(b"m.f", false, b"\x05", [1, 2]),
+    held_as(b"m.T", false, b"\x09", []),
+    held_as(b"m.T", true, b"\x02", []),
+  ];
+  assert_eq(pairs_of(held), [
+    { name: b"m.T", hash: b"\x02" },
+    { name: b"m.T", hash: b"\x09" },
+    { name: b"m.f", hash: b"\x05" },
+  ])
 }
 
-test "a name filed as a definition and as a declaration is held under both hashes, in order" {
-  let rows = rows_of([
-    { ..row(b"m.T", Some(b"09"), []), decl: Some(b"02") },
-    row(b"m.f", Some(b"05"), [b"m.T"]),
-  ]);
-  assert_eq(map(pairs_of(rows, [b"m.T", b"m.f"]), |pair: Pair| pair.hash), [
-    b"\x02",
-    b"\x09",
-    b"\x05",
+test "what a held definition reaches of its closure is read through what each references, a declaration apart from the function of its name" {
+  let held = [
+    held_as(b"m.main", false, b"\x01", [1]),
+    held_as(b"m.gz", true, b"\x02", []),
+    held_as(b"m.gz", false, b"\x03", [3]),
+    held_as(b"m.written", false, b"\x04", []),
+  ];
+  assert_eq(reaches_of(held), [
+    { name: "m.gz", reaches: ["m.gz"] },
+    { name: "m.gz", reaches: ["m.gz", "m.written"] },
+    { name: "m.main", reaches: ["m.gz", "m.main"] },
+    { name: "m.written", reaches: ["m.written"] },
   ])
+}
+
+test "a function and an effect of one name each say whether their module exports them" {
+  let exports = {
+    fns: map_insert(map_new(), b"m.gz", false),
+    decls: map_insert(map_new(), b"m.gz", true),
+  };
+  assert(exported(exports, held_as(b"m.gz", true, b"\x02", [])));
+  assert(!exported(exports, held_as(b"m.gz", false, b"\x03", [])));
+  assert(exported(exports, held_as(b"abort", true, b"\x07", [])))
 }
 
 test "the namespace writes each name's text once, where every record that names it points" {
