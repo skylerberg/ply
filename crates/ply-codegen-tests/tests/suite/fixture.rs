@@ -27,12 +27,13 @@ pub fn standard_library() -> ply_machine::runnable::Runnable {
         .iter()
         .map(|(n, text)| (n.as_str(), *text))
         .collect();
-    let mut files = ply_machine::builds::module_files(&named);
+    let mut files: Vec<(String, Vec<u8>)> = ply_machine::builds::module_files(&named)
+        .into_iter()
+        .map(|(path, text)| (path, text.into_bytes()))
+        .collect();
     for name in shipped_modules::data_names() {
         let bytes = shipped_modules::data(&name).expect("a listed data file is carried");
-        let text = std::str::from_utf8(bytes)
-            .unwrap_or_else(|e| panic!("`{name}` is not the text a tree held in memory is: {e}"));
-        files.push((name, text.to_string()));
+        files.push((name, bytes.to_vec()));
     }
     ply_machine::builds::checked_program(&files)
         .unwrap_or_else(|d| panic!("the standard library checks: {d}"))

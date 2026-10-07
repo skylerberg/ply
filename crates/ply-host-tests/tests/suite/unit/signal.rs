@@ -2,6 +2,7 @@ use ply_eval::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity,
     Resource, Span, Symbol, Value, codes,
 };
+use ply_host::pool::Pooled;
 use ply_host::signal::*;
 use ply_host::tcp::{Net, TcpHost};
 use std::io::Read;
@@ -38,11 +39,15 @@ fn settle(host: &TcpHost, answered: Result<HostAnswer, Diagnostic>) -> Value {
         HostAnswer::Pending(pending) => {
             let until = Instant::now() + Duration::from_secs(10);
             loop {
-                if let Some(value) = host.poll(&pending).expect("the token is this host's") {
+                if let Some(value) = host
+                    .pool()
+                    .poll(&pending)
+                    .expect("the token is this host's")
+                {
                     return value;
                 }
                 assert!(Instant::now() < until, "`{pending}` never resolved");
-                let _ = host.park_until(Duration::from_millis(20));
+                let _ = host.pool().park_until(Duration::from_millis(20));
             }
         }
     }
@@ -189,7 +194,7 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     }
     assert_eq!(host.accepts_in_flight(), 1, "the accept never parked");
     assert_eq!(
-        host.poll(&pending).expect("this host's token"),
+        host.pool().poll(&pending).expect("this host's token"),
         None,
         "nothing is connecting, so it is still waiting"
     );
@@ -201,14 +206,14 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let answered = loop {
-        if let Some(value) = host.poll(&pending).expect("this host's token") {
+        if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
             break int(&value);
         }
         assert!(
             Instant::now() < deadline,
             "the parked accept never returned, so an idle service would never observe a stop"
         );
-        let _ = host.park_until(Duration::from_millis(20));
+        let _ = host.pool().park_until(Duration::from_millis(20));
     };
     assert_eq!(
         answered, 0,
@@ -242,12 +247,12 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
         .or_else(|_| TcpStream::connect(address));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Some(value) = host.poll(&pending).expect("this host's token") {
+        if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
             assert_eq!(int(&value), 0);
             break;
         }
         assert!(Instant::now() < deadline, "the accept never returned");
-        let _ = host.park_until(Duration::from_millis(20));
+        let _ = host.pool().park_until(Duration::from_millis(20));
     }
     if let Ok(stream) = &mut client {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -303,18 +308,127 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     );
 }
 
-/// Both are flag reads: replaying changes nothing outside the program and neither waits on a peer.
+/// The stop's two are flag reads: replaying changes nothing outside the program. An ask takes the
+/// arrival it answers, so a second one answers otherwise. None waits on a peer.
 #[test]
 fn the_registrations_declare_what_a_reviewer_relies_on() {
     let shutdown = Shutdown::new(Bounds::default());
+    let declaration =
+        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.signal"))
+            .expect("std.signal ships");
     for (op, _) in registrations(Some(&shutdown)) {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
-        assert_eq!(op.linearity, Linearity::Repeatable);
+        let reads = matches!(op.op.as_str(), "stopping" | "deadline_ms");
+        let expected = if reads {
+            Linearity::Repeatable
+        } else {
+            Linearity::AtMostOnce
+        };
+        assert_eq!(op.linearity, expected, "{op}");
         assert!(!op.blocking);
         assert!(!op.secrets, "a stop flag is handed no value at all");
         assert!(op.path.starts_with("ply_host::signal::"));
+        let mode = if reads { "read" } else { "write" };
+        assert!(
+            declaration.contains(&format!("  {mode} {}() ->", op.op)),
+            "`{}` is not declared a `{mode}` in std.signal",
+            op.op
+        );
     }
+}
+
+/// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler. The
+/// shell's own `kill` sends it, which every system has.
+fn send_user2() {
+    let sent = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -USR2 {}", std::process::id())])
+        .status()
+        .expect("a shell runs");
+    assert!(sent.success());
+}
+
+fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
+    let until = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < until {
+        if shutdown.arrived(which).expect("the handler is installed") {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+#[test]
+fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
+    let shutdown = Shutdown::new(Bounds::default());
+    assert!(
+        !shutdown
+            .arrived(Asked::User2)
+            .expect("the first ask installs the handler"),
+        "nothing arrived before anybody asked"
+    );
+    send_user2();
+    assert!(arrives(&shutdown, Asked::User2), "one arrival is seen");
+    send_user2();
+    send_user2();
+    assert!(arrives(&shutdown, Asked::User2), "two arrivals are seen");
+    std::thread::sleep(Duration::from_millis(200));
+    // The second of the two may have landed after the ask that saw the first.
+    let _ = shutdown.arrived(Asked::User2);
+    assert!(
+        !shutdown.arrived(Asked::User2).expect("installed"),
+        "arrivals are not counted: nothing is owed once they were answered"
+    );
+    assert!(
+        !shutdown.stopping(),
+        "a signal asked about is no request to stop"
+    );
+}
+
+#[test]
+fn an_ask_is_answered_through_its_handler() {
+    let shutdown = Shutdown::new(Bounds::default());
+    let handlers = registrations(Some(&shutdown));
+    let (declaration, handler) = handlers
+        .iter()
+        .find(|(op, _)| op.op.as_str() == "resized")
+        .expect("`resized` is registered");
+    let atom = ply_eval::EffectAtom::new(
+        Symbol::new(EFFECT),
+        Resource::Singleton,
+        ply_eval::Mode::Write,
+    );
+    struct Nothing;
+    impl HostRuntime for Nothing {
+        fn watch(&self, _: &ply_eval::Pending) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            Vec::new()
+        }
+        fn park(&self) -> Result<(), Diagnostic> {
+            Ok(())
+        }
+        fn block_on(&self, _: ply_eval::Pending) -> Result<Value, Diagnostic> {
+            Ok(Value::Unit)
+        }
+    }
+    let answered = handler
+        .call(
+            &Nothing,
+            &HostRequest {
+                atom,
+                op: declaration,
+                args: &[],
+                span: Span::DUMMY,
+                machine: ply_eval::host::MachineId(0),
+                task: None,
+                declared: None,
+            },
+        )
+        .expect("an ask is answered");
+    assert!(matches!(answered, HostAnswer::Value(Value::Bool(false))));
 }
 
 #[test]
