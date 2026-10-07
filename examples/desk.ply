@@ -12,8 +12,9 @@ import std.net
 import std.ip
 // Twice, and both are needed: the selective import binds the effect name, so that a row and a
 // perform can both say `db.query[items]`, and the plain import binds the module, so that a type
-// can say `db::Answer` and a call can say `db::transaction`.
+// can say `sql::Answer` and a call can say `db::transaction`.
 import std.db
+import std.sql
 import std.db (db, with_server)
 import std.random (entropy)
 import std.json
@@ -83,87 +84,26 @@ derive json for Problem
 derive json for Health
 derive json for Readiness
 
-/// The storage format.
-pub type RowError = { column: String, expected: String, found: String }
-
-pub type RowCodec<a> = {
-  columns: List<String>,
-  decode: (db::Row) -> Result<a, RowError> / {abort.raise},
-  params: (a) -> List<db::Param> / {abort.raise},
-}
-
-fn row_and_then<a, b | e>(
-  r: Result<a, RowError>,
-  f: (a) -> Result<b, RowError> / e,
-) -> Result<b, RowError> / e = match r { Ok(x) -> f(x), Err(e) -> Err(e) }
-
-fn wrong(k: String, want: String) -> RowError = { column: k, expected: want, found: "another type" }
-
-fn text_at(r: db::Row, k: String) -> Result<String, RowError> =
-  match map_get(r, k) { Some(db::CText(s)) -> Ok(s), _ -> Err(wrong(k, "text")) }
-
-fn int_at(r: db::Row, k: String) -> Result<Int, RowError> =
-  match map_get(r, k) { Some(db::CInt(n)) -> Ok(n), _ -> Err(wrong(k, "bigint")) }
-
-fn numeric_at(r: db::Row, k: String) -> Result<Decimal, RowError> =
-  match map_get(r, k) { Some(db::CNumeric(d)) -> Ok(d), _ -> Err(wrong(k, "numeric")) }
-
-/// A `jsonb` column read back through the type's own json codec, which is what makes the wire format
-/// and the storage format one text rather than two.
-fn json_at<a>(r: db::Row, k: String, c: json::JsonCodec<a>) -> Result<a, RowError> / {abort.raise} =
-  match map_get(r, k) {
-    Some(db::CJson(j)) -> match (c.decode)(j) {
-      Ok(x) -> Ok(x),
-      Err(_) -> Err(wrong(k, "a well-formed " ++ k ++ " document")),
-    },
-    _ -> Err(wrong(k, "jsonb")),
-  }
-
-fn item_row() -> RowCodec<Item> =
-  {
-    columns: ["sku", "name", "price", "on_hand"],
-    decode: |r: db::Row|
-      row_and_then(text_at(r, "sku"), |sku: String|
-        row_and_then(text_at(r, "name"), |name: String|
-          row_and_then(numeric_at(r, "price"), |price: Decimal|
-            row_and_then(int_at(r, "on_hand"), |on_hand: Int|
-              Ok({ sku: sku, name: name, price: price, on_hand: on_hand }))))),
-    params: |i: Item|
-      [db::PText(i.sku), db::PText(i.name), db::PNumeric(i.price), db::PInt(i.on_hand)],
-  }
-
-fn order_row() -> RowCodec<Order> =
-  {
-    columns: ["id", "customer", "lines", "total", "state"],
-    decode: |r: db::Row|
-      row_and_then(int_at(r, "id"), |id: Int|
-        row_and_then(text_at(r, "customer"), |customer: String|
-          row_and_then(json_at(r, "lines", json::list_json(line_json())), |lines: List<Line>|
-            row_and_then(numeric_at(r, "total"), |total: Decimal|
-              row_and_then(json_at(r, "state", state_json()), |state: State|
-                Ok({ id: id, customer: customer, lines: lines, total: total, state: state })))))),
-    params: |o: Order|
-      [
-        db::PInt(o.id),
-        db::PText(o.customer),
-        lines_param(o.lines),
-        db::PNumeric(o.total),
-        state_param(o.state),
-      ],
-  }
+// The storage format, which nobody wrote either: a column per field, and a field that is not a
+// scalar is a `jsonb` document read through its own JSON codec, so what the desk stores and what
+// it sends are one text.
+derive row for Item
+derive row for Order
 
 // --- The schema, which is a value ------------------------------------------------
 
-pub fn schema() -> db::Schema =
+/// A `const fn` of `std.sql.Schema`, so the check holds every statement the desk runs to it: a
+/// column misspelled in one is an error before anything runs.
+pub const fn schema() -> sql::Schema =
   {
     tables: [
       {
         name: "items",
         columns: [
-          { name: "sku", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "name", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "price", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone },
-          { name: "on_hand", ty: db::TInt, nullable: false, default: db::DNone },
+          { name: "sku", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "name", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "price", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
+          { name: "on_hand", ty: sql::TInt, nullable: false, default: sql::DNone },
         ],
         primary_key: ["sku"],
         unique: [],
@@ -173,11 +113,11 @@ pub fn schema() -> db::Schema =
       {
         name: "orders",
         columns: [
-          { name: "id", ty: db::TInt, nullable: false, default: db::DSequence("orders_id_seq") },
-          { name: "customer", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "lines", ty: db::TJson, nullable: false, default: db::DNone },
-          { name: "total", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone },
-          { name: "state", ty: db::TJson, nullable: false, default: db::DNone },
+          { name: "id", ty: sql::TInt, nullable: false, default: sql::DSequence("orders_id_seq") },
+          { name: "customer", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "lines", ty: sql::TJson, nullable: false, default: sql::DNone },
+          { name: "total", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
+          { name: "state", ty: sql::TJson, nullable: false, default: sql::DNone },
         ],
         primary_key: ["id"],
         unique: [],
@@ -312,103 +252,91 @@ fn accept_of(configured: Option<String>) -> Result<Accept, String> =
 
 // --- The statements ---------------------------------------------------------------
 
-fn items_all() -> db::Stmt = db::stmt("select sku, name, price, on_hand from items order by sku")
+fn items_all() -> sql::Stmt = sql::stmt("select sku, name, price, on_hand from items order by sku")
 
 /// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
 /// rows on the wire, no parameters to bind.
-fn store_reachable() -> db::Stmt = db::stmt("select count(*) from items")
+fn store_reachable() -> sql::Stmt = sql::stmt("select count(*) from items")
 
-fn items_in_stock() -> db::Stmt =
-  db::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
+fn items_in_stock() -> sql::Stmt =
+  sql::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
 
-fn item_by_sku() -> db::Stmt =
-  db::stmt("select sku, name, price, on_hand from items where sku = $1")
+fn item_by_sku() -> sql::Stmt =
+  sql::stmt("select sku, name, price, on_hand from items where sku = $1")
 
-fn item_insert() -> db::Stmt =
-  db::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
+fn item_insert() -> sql::Stmt =
+  sql::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
 
 /// The reservation, and the only interesting statement in the file.
-fn item_reserve() -> db::Stmt =
-  db::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
+fn item_reserve() -> sql::Stmt =
+  sql::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
 
-fn orders_all() -> db::Stmt =
-  db::stmt("select id, customer, lines, total, state from orders order by id")
+fn orders_all() -> sql::Stmt =
+  sql::stmt("select id, customer, lines, total, state from orders order by id")
 
-fn order_by_id() -> db::Stmt =
-  db::stmt("select id, customer, lines, total, state from orders where id = $1")
+fn order_by_id() -> sql::Stmt =
+  sql::stmt("select id, customer, lines, total, state from orders where id = $1")
 
 /// The id is the database's.
-fn order_insert() -> db::Stmt =
-  db::stmt(
+fn order_insert() -> sql::Stmt =
+  sql::stmt(
     "insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
       ++ " returning id, customer, lines, total, state",
   )
 
 /// No compare-and-set on `state`, and the reason is worth writing down because it is a design
 /// decision the twin forced rather than a shortcut.
-fn order_cancel() -> db::Stmt = db::stmt("update orders set state = $1 where id = $2")
+fn order_cancel() -> sql::Stmt = sql::stmt("update orders set state = $1 where id = $2")
 
 // --- Reading a result set ----------------------------------------------------------
 
-fn rows_of<a>(
-  ans: db::Answer,
-  c: RowCodec<a>,
+/// The rows a fetch read, or the problem a client is told of in their place.
+fn listed<a>(
+  read: Result<List<a>, sql::Unread>,
 ) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
-  match ans {
-    db::Rows(rows) -> decoded(rows, c),
-    db::Count(_) -> Err(problem(500, "unreadable answer", "a query answered a count")),
-    db::Failed(e) -> Err(unavailable(e)),
+  match read {
+    Ok(xs) -> Ok(xs),
+    Err(sql::Refused(e)) -> Err(unavailable(e)),
+    Err(sql::Counted(_)) -> Err(problem(500, "unreadable answer", "a query answered a count")),
+    Err(sql::Misread(e)) ->
+      Err(
+        problem(
+          500,
+          "unreadable row",
+          e.column ++ ": expected " ++ e.expected ++ ", found " ++ e.found,
+        ),
+      ),
   }
-
-fn decoded<a>(
-  rows: List<db::Row>,
-  c: RowCodec<a>,
-) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
-  fold(rows, Ok([]), |acc: Result<List<a>, http::Response<| {}>>, r: db::Row|
-    match acc {
-      Err(p) -> Err(p),
-      Ok(xs) -> match (c.decode)(r) {
-        Ok(x) -> Ok(push(xs, x)),
-        Err(e) ->
-          Err(
-            problem(
-              500,
-              "unreadable row",
-              e.column ++ ": expected " ++ e.expected ++ ", found " ++ e.found,
-            ),
-          ),
-      },
-    })
 
 fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 
 /// A SQLSTATE the desk has no answer for.
-fn unavailable(e: db::DbError) -> http::Response<| {}> / {abort.raise} =
+fn unavailable(e: sql::DbError) -> http::Response<| {}> / {abort.raise} =
   problem(503, "the store is unavailable", e.code)
 
 fn shelf() -> Result<List<Item>, http::Response<| {}>> / {db.query[items], abort.raise} =
-  rows_of(db.query[items](items_all(), []), item_row())
+  listed(db::fetch[items](items_all(), item_row(), []))
 
 fn book() -> Result<List<Order>, http::Response<| {}>> / {db.query[orders], abort.raise} =
-  rows_of(db.query[orders](orders_all(), []), order_row())
+  listed(db::fetch[orders](orders_all(), order_row(), []))
 
 fn order_row_of(
   id: Int,
 ) -> Result<Option<Order>, http::Response<| {}>> / {db.query[orders], abort.raise} = {
-  let os = rows_of(db.query[orders](order_by_id(), [db::PInt(id)]), order_row())?;
+  let os = listed(db::fetch[orders](order_by_id(), order_row(), [sql::PInt(id)]))?;
   Ok(head_of(os))
 }
 
 /// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value built by the codec
 /// this file already derived.
-fn lines_param(lines: List<Line>) -> db::Param / {abort.raise} = {
+fn lines_param(lines: List<Line>) -> sql::Param / {abort.raise} = {
   let c = json::list_json(line_json());
-  db::PJson((c.encode)(lines))
+  sql::PJson((c.encode)(lines))
 }
 
-fn state_param(s: State) -> db::Param / {abort.raise} = {
+fn state_param(s: State) -> sql::Param / {abort.raise} = {
   let c = state_json();
-  db::PJson((c.encode)(s))
+  sql::PJson((c.encode)(s))
 }
 
 // --- The business, which touches nothing ----------------------------------------
@@ -545,7 +473,7 @@ pub fn health() -> http::Response<| {}> / {abort.raise} =
 pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
     match db.query[items](store_reachable(), []) {
-      db::Rows(_) ->
+      sql::Rows(_) ->
         json_body(
           200,
           { service: "parts desk", store: "reachable", stopping: false },
@@ -553,8 +481,8 @@ pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abor
         ),
       // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
       // client's action is the same whichever code the server sent, and an operator's is not.
-      db::Failed(e) -> unready(e.code, false),
-      db::Count(_) -> unready("unreadable answer", false),
+      sql::Failed(e) -> unready(e.code, false),
+      sql::Count(_) -> unready("unreadable answer", false),
     }
   }
 
@@ -583,7 +511,7 @@ pub fn list_items() -> http::Response<| {}> / {db.query[items], abort.raise} =
 
 /// Everything the shelf is short of.
 pub fn featured() -> http::Response<| {}> / {db.query[items], abort.raise} =
-  match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
+  match listed(db::fetch[items](items_in_stock(), item_row(), [sql::PInt(0)])) {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
@@ -593,7 +521,7 @@ pub fn get_item(
 ) -> http::Response<| {}> / {db.query[items], abort.raise} =
   match map_get(params, "sku") {
     None -> problem(400, "bad request", "no sku was captured"),
-    Some(sku) -> match rows_of(db.query[items](item_by_sku(), [db::PText(sku)]), item_row()) {
+    Some(sku) -> match listed(db::fetch[items](item_by_sku(), item_row(), [sql::PText(sku)])) {
       Err(r) -> r,
       Ok(rows) -> match head_of(rows) {
         Some(i) -> json_body(200, i, item_json()),
@@ -667,14 +595,13 @@ fn recorded(
   stock: List<Item>,
   total: Decimal,
 ) -> http::Response<| {}> / {Desk, abort.raise} =
-  match rows_of(
-      db.returning[orders](order_insert(), [
-        db::PText(p.customer),
+  match listed(
+      db::fetch_returning[orders](order_insert(), order_row(), [
+        sql::PText(p.customer),
         lines_param(p.lines),
-        db::PNumeric(total),
+        sql::PNumeric(total),
         state_param(Open),
       ]),
-      order_row(),
     ) {
     Err(r) -> r,
     Ok(rows) -> match head_of(rows) {
@@ -733,9 +660,13 @@ fn moving(
 
 /// Three answers, and each one is a different thing to have happened.
 fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
-  match db.execute[items](item_reserve(), [db::PInt(to), db::PText(i.sku), db::PInt(i.on_hand)]) {
-    db::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
-    db::Failed(_) -> db.rollback(i.sku),
+  match db.execute[items](item_reserve(), [
+      sql::PInt(to),
+      sql::PText(i.sku),
+      sql::PInt(i.on_hand),
+    ]) {
+    sql::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
+    sql::Failed(_) -> db.rollback(i.sku),
     _ -> db.rollback(i.sku),
   }
 
@@ -776,10 +707,10 @@ fn cancelling(id: Int) -> http::Response<| {}> / {Desk, abort.raise} =
 /// from under it; that answers 409 without a rollback — nothing had been written, so there is
 /// nothing to discard and committing an empty transaction is the honest end of it.
 fn cancelled_now(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
-  match db.execute[orders](order_cancel(), [state_param(Cancelled), db::PInt(o.id)]) {
-    db::Count(n) -> if n == 1 { restocked(o) }
+  match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::PInt(o.id)]) {
+    sql::Count(n) -> if n == 1 { restocked(o) }
     else { problem(409, "already cancelled", int_to_string(o.id)) },
-    db::Failed(e) -> unavailable(e),
+    sql::Failed(e) -> unavailable(e),
     _ -> problem(500, "unreadable answer", "an update returned rows"),
   }
 
@@ -1421,7 +1352,7 @@ pub fn twin<a | e>(
   with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
     with_cell[sink](trace::sink()) { t -> {
       with_cell[stop](signal::running()) { s -> {
-        let step = |q: db::Stmt, ps: List<db::Param>| {
+        let step = |q: sql::Stmt, ps: List<sql::Param>| {
           let o = db::step(cell_get(c), q, ps);
           cell_set(c, o.db);
           o.out
@@ -1565,18 +1496,18 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.rai
       stepped(d, item_insert(), item_row().params(i))),
     |d: db::MemDb, o: Order|
       stepped(d, order_insert(), [
-        db::PText(o.customer),
+        sql::PText(o.customer),
         lines_param(o.lines),
-        db::PNumeric(o.total),
+        sql::PNumeric(o.total),
         state_param(o.state),
       ]),
   )
 
 /// A step whose answer must be a success.
-fn stepped(d: db::MemDb, s: db::Stmt, ps: List<db::Param>) -> db::MemDb / {abort.raise} = {
+fn stepped(d: db::MemDb, s: sql::Stmt, ps: List<sql::Param>) -> db::MemDb / {abort.raise} = {
   let out = db::step(d, s, ps);
   match out.out {
-    db::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
+    sql::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
     _ -> out.db,
   }
 }
@@ -1588,19 +1519,13 @@ pub fn shelf_of(d: db::MemDb) -> List<Item> / {abort.raise} = read_out(d, items_
 
 pub fn book_of(d: db::MemDb) -> List<Order> / {abort.raise} = read_out(d, orders_all(), order_row())
 
-fn read_out<a>(d: db::MemDb, s: db::Stmt, c: RowCodec<a>) -> List<a> / {abort.raise} = {
-  let out = db::step(d, s, []);
-  match out.out {
-    db::Rows(rows) ->
-      fold(rows, [], |acc: List<a>, r: db::Row|
-        match (c.decode)(r) {
-          Ok(x) -> push(acc, x),
-          Err(e) -> panic("a row would not decode: " ++ e.column),
-        }),
-    db::Failed(e) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
-    _ -> panic("a query answered a count"),
+fn read_out<a>(d: db::MemDb, s: sql::Stmt, c: sql::RowCodec<a>) -> List<a> / {abort.raise} =
+  match sql::decoded(db::step(d, s, []).out, c) {
+    Ok(xs) -> xs,
+    Err(sql::Misread(e)) -> panic("a row would not decode: " ++ e.column),
+    Err(sql::Refused(e)) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
+    Err(sql::Counted(_)) -> panic("a query answered a count"),
   }
-}
 
 // --- Tests: the business, which needs no handler at all ----------------------------
 
@@ -1736,7 +1661,7 @@ fn against<a | e>(
 ) -> Ran<a> / {abort.raise, signal.stopping | e} =
   with_cell[store](d) { c -> {
     with_cell[sink](trace::sink()) { t -> {
-      let step = |q: db::Stmt, ps: List<db::Param>| {
+      let step = |q: sql::Stmt, ps: List<sql::Param>| {
         let o = db::step(cell_get(c), q, ps);
         cell_set(c, o.db);
         o.out
@@ -2157,7 +2082,7 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
   } with {
     // Two clauses, because `ready`'s row is two atoms.
     db.query[items](q, ps) ->
-      db::Failed({ code: "57P01", constraint: "", detail: "terminating connection" }),
+      sql::Failed({ code: "57P01", constraint: "", detail: "terminating connection" }),
     signal.stopping() -> false,
   }
 }
