@@ -11,8 +11,8 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               MatchArm, HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole)
 import items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric,
-              DInteger, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias, INames,
-              Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written,
+              DInteger, DRow, deriver_text, deriver_tag, ImportDecl, ImportKind, IModule, IAlias,
+              INames, Vis, VPub, VPriv, Derived, Constraint, SpecClause, parse, constraint_written,
               TDNominal, IInstance, InstanceDef, NKey, NShow, NGen)
 import rewrite (expand, find_type)
 import resolve (Diag, Source, error_at, error_at_and, dump_diags, path_span)
@@ -70,6 +70,7 @@ fn runtime_module(deriver: Deriver) -> Option<Bytes> =
     DJson -> Some(b"std.json"),
     DBin -> Some(b"std.bin"),
     DShow -> Some(b"std.show"),
+    DRow -> Some(b"std.sql"),
     _ -> None,
   }
 
@@ -78,6 +79,7 @@ fn runtime_path(deriver: Deriver) -> List<Bytes> =
     DJson -> [b"std", b"json"],
     DBin -> [b"std", b"bin"],
     DShow -> [b"std", b"show"],
+    DRow -> [b"std", b"sql"],
     _ -> [],
   }
 
@@ -94,24 +96,49 @@ pub fn generated_name(deriver: Deriver, type_name: Bytes) -> Bytes / {abort.rais
 type Blocker = { span: Span, reason: Bytes, note: Option<Bytes>, variant: Option<Bytes> }
 
 fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise} =
+  if same_deriver(deriver, DRow) { check_row(def) } else {
+    match def.body {
+      TDAlias(body) -> check_type_expr(deriver, body),
+      TDNominal(body) -> check_type_expr(deriver, body),
+      TDSum(variants) ->
+        fold(variants, None, |acc: Option<Blocker>, variant: VariantDef|
+          match acc {
+            Some(_) -> acc,
+            None -> match first_blocked_type_expr(deriver, variant.fields) {
+              Some(b) ->
+                Some({
+                  span: b.span,
+                  reason: b.reason,
+                  note: b.note,
+                  variant: Some(variant.name.name),
+                }),
+              None -> None,
+            },
+          }),
+    }
+  }
+
+fn row_refusal(def: TypeDef, reason: Bytes) -> Option<Blocker> =
+  Some({ span: def.name.span, reason: reason, note: None, variant: None })
+
+/// A row is a record's fields, a column each, of one type each.
+fn check_row(def: TypeDef) -> Option<Blocker> / {abort.raise} =
+  if is_generic(def.generics) {
+    row_refusal(def, b"a column holds one type, so a type with parameters has no row")
+  } else {
+    match row_fields(def) {
+      None -> row_refusal(def, b"a row is a record's fields, a column each"),
+      Some(fields) -> if len(fields) == 0 { row_refusal(def, b"a row has a column at least") }
+      else { check_type_expr(DRow, TRecord({ span: def.name.span, fields: fields })) },
+    }
+  }
+
+/// The fields of a record type, as written.
+fn row_fields(def: TypeDef) -> Option<List<{ name: Ident, ty: TypeExpr }>> =
   match def.body {
-    TDAlias(body) -> check_type_expr(deriver, body),
-    TDNominal(body) -> check_type_expr(deriver, body),
-    TDSum(variants) ->
-      fold(variants, None, |acc: Option<Blocker>, variant: VariantDef|
-        match acc {
-          Some(_) -> acc,
-          None -> match first_blocked_type_expr(deriver, variant.fields) {
-            Some(b) ->
-              Some({
-                span: b.span,
-                reason: b.reason,
-                note: b.note,
-                variant: Some(variant.name.name),
-              }),
-            None -> None,
-          },
-        }),
+    TDAlias(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
+    TDNominal(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
+    TDSum(_) -> None,
   }
 
 /// Whether the module states what `deriver` reads of `target`: its `key` for `eq`, `ord` and `hash`,
@@ -146,6 +173,7 @@ fn function_refusal(deriver: Deriver) -> Bytes =
     DHash -> b"a function has no content to hash",
     DNumeric -> b"a function is not a number",
     DInteger -> b"a function is not an integer",
+    DRow -> b"a function has no column to be stored in",
   }
 
 pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Bytes =
@@ -173,6 +201,7 @@ pub fn secret_reason(deriver: Deriver) -> Bytes =
     DHash -> b"a hash of a credential is something to test guesses against",
     DNumeric -> b"a credential is not a number",
     DInteger -> b"a credential is not an integer",
+    DRow -> b"a derived row would write the credential into the database",
   }
 
 pub fn refusal_note(w: DeriveRefusal, deriver: Deriver) -> Option<Bytes> =
@@ -286,7 +315,8 @@ fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.r
 type Alias = { name: Bytes, body: TypeExpr }
 
 /// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
-/// module's; `cycle` holds the types whose codecs call the target's and are called back by it.
+/// module's; `cycle` holds the types whose codecs call the target's and are called back by it; `json`
+/// is how a row's fields stored as documents name `std.json`.
 type DeriveEmitter = {
   d: Deriver,
   rt: Bytes,
@@ -294,6 +324,7 @@ type DeriveEmitter = {
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  json: Bytes,
 }
 
 fn emitter(
@@ -303,12 +334,13 @@ fn emitter(
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  json: Bytes,
 ) -> DeriveEmitter / {abort.raise} = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
     if fold(params, false, |acc: Bool, ident: Ident| acc || bytes_starts_with(ident.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle }
+  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle, json: json }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
@@ -370,6 +402,7 @@ fn dict_type(emitter: DeriveEmitter, arg: Bytes) -> Bytes =
   match emitter.d {
     DJson -> bytes_concat_all([emitter.rt, b"JsonCodec<", arg, b">"]),
     DBin -> bytes_concat_all([emitter.rt, b"BinCodec<", arg, b">"]),
+    DRow -> bytes_concat_all([emitter.rt, b"RowCodec<", arg, b">"]),
     DShow -> bytes_concat_all([b"{show: (", arg, b") -> String}"]),
     DHash -> bytes_concat_all([b"{hash: (", arg, b") -> Bytes}"]),
     DEq -> bytes_concat_all([b"{eq: (", arg, b", ", arg, b") -> Bool}"]),
@@ -436,8 +469,200 @@ fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {a
       TDNominal(body) -> codec(emitter, body, target),
       TDSum(variants) -> bin_sum(emitter, def, variants, target),
     },
+    DRow -> match row_fields(def) {
+      Some(fields) -> row_record(emitter, fields, target),
+      None -> b"()",
+    },
     _ -> b"()",
   }
+
+// --- A record's row --------------------------------------------------------------------------
+// Each field is a column of its own name, read and written by one of `std.sql`'s readers: a scalar
+// by its own, `Option` by `optional_field`, a `List` of scalars as an array, a `Json` as the
+// document it is, and anything else as a document through the type's own JSON codec.
+
+/// A field type as the module writes it, through its own parameterless aliases.
+fn row_resolved(emitter: DeriveEmitter, ty: TypeExpr) -> TypeExpr / {abort.raise} =
+  iterate({ cur: ty, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
+    if s.n >= 64 { Stop(s.cur) } else {
+      match s.cur {
+        TCon(c) -> if !is_bare(c.name) || len(c.args) > 0 { Stop(s.cur) } else {
+          match find_alias(emitter.aliases, c.name.name.name) {
+            Some(body) -> Continue({ cur: body, n: s.n + 1 }),
+            None -> Stop(s.cur),
+          }
+        },
+        _ -> Stop(s.cur),
+      }
+    })
+
+/// The `std.sql` reader of a scalar field type.
+fn row_scalar(ty: TypeExpr) -> Option<Bytes> =
+  match ty {
+    TCon(c) -> if !is_bare(c.name) || len(c.args) > 0 { None } else {
+      let name = c.name.name.name;
+      if name == b"String" { Some(b"text_field") }
+      else if name == b"Int" { Some(b"int_field") }
+      else if name == b"Bool" { Some(b"bool_field") }
+      else if name == b"Float" { Some(b"float_field") }
+      else if name == b"Decimal" { Some(b"numeric_field") }
+      else if name == b"Bytes" { Some(b"bytes_field") }
+      else { None }
+    },
+    _ -> None,
+  }
+
+/// How a field of a row is read: by the reader of `std.sql`'s that it names, as an `Option` of
+/// what it holds, as an array of what the reader it names reads, as the document it holds, or
+/// through the type's own JSON codec.
+pub type RowRead =
+  | RScalar(Bytes)
+  | ROptional(RowRead)
+  | RArray(Bytes)
+  | RDocument
+  | RByJson(TypeExpr)
+
+/// A field of a record's row: its column and how it is read.
+pub type RowField = { name: Bytes, read: RowRead }
+
+/// The fields `derive row for target` reads, in order, as the module that declares the type writes
+/// them; `None` for a type the module does not declare as a record.
+pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abort.raise} = {
+  let ex = new_expander(0, b"", module);
+  match find_type(ex.types, target) {
+    None -> None,
+    Some(def) -> match row_fields(def) {
+      None -> None,
+      Some(fields) -> {
+        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], b"");
+        Some(
+          map(fields, |f: { name: Ident, ty: TypeExpr }|
+            { name: f.name.name, read: row_read(e, f.ty, 8) }),
+        )
+      },
+    },
+  }
+}
+
+fn row_read(emitter: DeriveEmitter, ty: TypeExpr, left: Int) -> RowRead / {abort.raise} = {
+  let t = row_resolved(emitter, ty);
+  match row_scalar(t) {
+    Some(reader) -> RScalar(reader),
+    None -> match t {
+      TCon(c) -> if left > 0 && c.name.name.name == b"Option" && len(c.args) == 1 {
+        ROptional(row_read(emitter, at(c.args, 0), left - 1))
+      } else if c.name.name.name == b"List" && len(c.args) == 1 {
+        match row_scalar(row_resolved(emitter, at(c.args, 0))) {
+          Some(reader) -> RArray(reader),
+          None -> RByJson(t),
+        }
+      } else if c.name.name.name == b"Json" && !is_bare(c.name) { RDocument }
+      else { RByJson(t) },
+      _ -> RByJson(t),
+    },
+  }
+}
+
+/// Whether a field of this type is stored as a document through its JSON codec.
+fn row_by_json(read: RowRead) -> Bool =
+  match read { RByJson(_) -> true, ROptional(inner) -> row_by_json(inner), _ -> false }
+
+/// The reader of a field read this way, as an expression the module can write.
+fn row_reader(emitter: DeriveEmitter, read: RowRead) -> Bytes / {abort.raise} =
+  match read {
+    RScalar(reader) -> bytes_concat_all([emitter.rt, reader, b"()"]),
+    ROptional(inner) ->
+      bytes_concat_all([emitter.rt, b"optional_field(", row_reader(emitter, inner), b")"]),
+    RArray(reader) -> bytes_concat_all([emitter.rt, b"array_field(", emitter.rt, reader, b"())"]),
+    RDocument -> bytes_concat(emitter.rt, b"document_field()"),
+    RByJson(t) -> row_document(emitter, t),
+  }
+
+/// Whether any field of a record this module derives a row for is stored through its JSON codec.
+fn row_wants_json(emitter: DeriveEmitter, def: TypeDef) -> Bool / {abort.raise} =
+  match row_fields(def) {
+    None -> false,
+    Some(fields) ->
+      fold(fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
+        acc || row_by_json(row_read(emitter, f.ty, 8))),
+  }
+
+fn row_document(emitter: DeriveEmitter, ty: TypeExpr) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    emitter.rt,
+    b"json_field(",
+    codec({ ..emitter, d: DJson, rt: emitter.json, cycle: [] }, ty, render_type(ty)),
+    b")",
+  ])
+
+fn row_record(
+  emitter: DeriveEmitter,
+  fields: List<{ name: Ident, ty: TypeExpr }>,
+  annotation: Bytes,
+) -> Bytes / {abort.raise} = {
+  let readers = map(fields, |f: { name: Ident, ty: TypeExpr }|
+    row_reader(emitter, row_read(emitter, f.ty, 8)));
+  let name = |i: Int| at(fields, i).name.name;
+  let listed = map(range(0, len(fields)), |i: Int|
+    bytes_concat_all([emitter.rt, b"field(\"", name(i), b"\", ", at(readers, i), b")"]));
+  let built = map(range(0, len(fields)), |i: Int|
+    bytes_concat_all([name(i), b": ", emitter.b, ascii_of_int(i)]));
+  let decode = fold(
+    range(0, len(fields)),
+    bytes_concat_all([b"Ok({", join(built, b", "), b"})"]),
+    |acc: Bytes, k: Int| {
+      let i = len(fields) - 1 - k;
+      bytes_concat_all([
+        b"match ",
+        emitter.rt,
+        b"read(",
+        emitter.b,
+        b"r, \"",
+        name(i),
+        b"\", ",
+        at(readers, i),
+        b") {Err(",
+        emitter.b,
+        b"e) -> Err(",
+        emitter.b,
+        b"e), Ok(",
+        emitter.b,
+        ascii_of_int(i),
+        b") -> ",
+        acc,
+        b"}",
+      ])
+    },
+  );
+  let params = map(range(0, len(fields)), |i: Int|
+    bytes_concat_all([
+      emitter.rt,
+      b"written(",
+      at(readers, i),
+      b", ",
+      emitter.b,
+      b"v.",
+      name(i),
+      b")",
+    ]));
+  bytes_concat_all([
+    b"{fields: [",
+    join(listed, b", "),
+    b"], decode: |",
+    emitter.b,
+    b"r: ",
+    emitter.rt,
+    b"Row| ",
+    decode,
+    b", params: |",
+    emitter.b,
+    b"v: ",
+    annotation,
+    b"| [",
+    join(params, b", "),
+    b"]}",
+  ])
+}
 
 /// An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
 fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {abort.raise} =
@@ -1420,13 +1645,24 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
           Some(blocker) -> not_derivable(expander, def, blocker),
           None -> {
             let rt: WithPrefix = runtime_prefix(expander, def);
-            let ex1: Expander = rt.ex;
-            match rt.prefix {
-              None -> ex1,
-              Some(prefix) -> {
+            let json: WithPrefix = match rt.prefix {
+              None -> rt,
+              Some(_) -> documents_prefix(rt.ex, def, target),
+            };
+            let ex1: Expander = json.ex;
+            match ((rt.prefix, json.prefix)) {
+              (Some(prefix), Some(documents)) -> {
                 let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
                 let source = emit_item(
-                  emitter(def.deriver, prefix, target.generics.types, ex1.aliases, ex1.path, cycle),
+                  emitter(
+                    def.deriver,
+                    prefix,
+                    target.generics.types,
+                    ex1.aliases,
+                    ex1.path,
+                    cycle,
+                    documents,
+                  ),
                   target,
                 );
                 match parse_generated(source, def.span, if len(cycle) == 0 { 1 } else { 2 }) {
@@ -1443,12 +1679,25 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
                     },
                 }
               },
+              _ -> ex1,
             }
           },
         },
       }
     },
   }
+
+/// How a row's fields stored as documents name `std.json`, which the module must import as a
+/// `derive json` would; nothing to name for any other derivation.
+fn documents_prefix(
+  expander: Expander,
+  def: DeriveDef,
+  target: TypeDef,
+) -> WithPrefix / {abort.raise} =
+  if !same_deriver(def.deriver, DRow)
+      || !row_wants_json(emitter(DRow, b"", [], expander.aliases, expander.path, [], b""), target) {
+    { ex: expander, prefix: Some(b"") }
+  } else { runtime_prefix(expander, { ..def, deriver: DJson }) }
 
 /// Parsing what was just printed is the deriver's own round-trip check.
 fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
@@ -1826,6 +2075,32 @@ test "the bin form writes scalars straight, composes the rest, and keys a sum by
     at(out, 1),
     b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = tree_bin_at(a, bin::max_depth())\nfn tree_bin_at<a>(a: bin::BinCodec<a>, ddepth: Int) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = if ddepth <= 0 {bin::too_deep()} else {{put: |dw: Bytes, dv: Tree<a>| match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)((tree_bin_at(a, ddepth - 1).put)(bin::put_tag(dw, 1), d0), d1)}, take: |dd: Bytes, dn: Int| match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match (tree_bin_at(a, ddepth - 1).take)(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}, shape: |ds: bin::Shapes| bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin_at(a, ddepth - 1).shape, a.shape]}])}}",
   )
+}
+
+test "a row reads a column per field, and a field that is no scalar as a document through its codec" {
+  let src = b"import std.sql\nimport std.json\ntype Money = Decimal\ntype Line = {sku: String}\ntype Part = {sku: String, price: Money, note: Option<String>, tags: List<Int>, lines: List<Line>}\nderive json for Line\nderive row for Part";
+  let out = preview(b"shop", parse(src).node);
+  assert_eq(len(out), 2);
+  assert_eq(
+    at(out, 1),
+    b"fn part_row() -> sql::RowCodec<Part> = {fields: [sql::field(\"sku\", sql::text_field()), sql::field(\"price\", sql::numeric_field()), sql::field(\"note\", sql::optional_field(sql::text_field())), sql::field(\"tags\", sql::array_field(sql::int_field())), sql::field(\"lines\", sql::json_field(json::list_json(line_json())))], decode: |dr: sql::Row| match sql::read(dr, \"sku\", sql::text_field()) {Err(de) -> Err(de), Ok(d0) -> match sql::read(dr, \"price\", sql::numeric_field()) {Err(de) -> Err(de), Ok(d1) -> match sql::read(dr, \"note\", sql::optional_field(sql::text_field())) {Err(de) -> Err(de), Ok(d2) -> match sql::read(dr, \"tags\", sql::array_field(sql::int_field())) {Err(de) -> Err(de), Ok(d3) -> match sql::read(dr, \"lines\", sql::json_field(json::list_json(line_json()))) {Err(de) -> Err(de), Ok(d4) -> Ok({sku: d0, price: d1, note: d2, tags: d3, lines: d4})}}}}}, params: |dv: Part| [sql::written(sql::text_field(), dv.sku), sql::written(sql::numeric_field(), dv.price), sql::written(sql::optional_field(sql::text_field()), dv.note), sql::written(sql::array_field(sql::int_field()), dv.tags), sql::written(sql::json_field(json::list_json(line_json())), dv.lines)]}",
+  );
+  match row_shape(parse(src).node, b"Part") {
+    None -> panic("a record declared in the module has a row"),
+    Some(fields) ->
+      assert_eq(map(fields, |f: RowField| f.name), [b"sku", b"price", b"note", b"tags", b"lines"]),
+  };
+  let refused = |text: Bytes|
+    map(expand_derives(0, b"t", parse(text).node).diags, |d: Diag| d.code);
+  // A row is a record's fields; a sum, a type with parameters and a missing `std.json` have none.
+  assert_eq(refused(b"import std.sql\ntype S = | A | B\nderive row for S"), [b"E0206"]);
+  assert_eq(refused(b"import std.sql\ntype P<a> = {x: a}\nderive row for P"), [b"E0206"]);
+  assert_eq(refused(b"import std.sql\ntype L = {x: Int}\ntype P = {l: L}\nderive row for P"), [
+    b"E0206",
+  ]);
+  assert_eq(refused(b"type P = {x: Int}\nderive row for P"), [b"E0206"]);
+  // A row is no constraint a type parameter can be held to.
+  assert(len(parse(b"fn f<a>(x: a) -> a where derivable(row, a) = x").parser.diags) > 0)
 }
 
 test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
