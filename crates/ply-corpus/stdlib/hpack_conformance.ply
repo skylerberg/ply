@@ -1,0 +1,117 @@
+//! `std.http2`'s HPACK against hpack-test-case (github.com/http2jp/hpack-test-case at 8a1406e7,
+//! its `LICENSE` beside the files): the stories two encoders wrote, `python-hpack`, and
+//! `nghttp2-change-table-size`, whose encoder also resized its table between blocks. A story is
+//! the header blocks of one connection, so one decoder reads its blocks in order, and each must
+//! decode to the fields the story lists. Then `std.http2`'s encoder writes the same field lists,
+//! resizing its table where the story's did, and a decoder must read each block back.
+
+import std.bytes (bytes_of_hex)
+import std.http2
+import std.http2 (Decoder, Encoder, Field)
+import std.json
+import std.json (Json)
+
+type File = { name: String, bytes: Bytes }
+
+fn files() -> List<File> = embed_dir("hpack")
+
+/// One block of a story: the table size its encoder changed to before it, the block, and its
+/// fields.
+type Case = { size: Option<Int>, wire: Bytes, fields: List<Field> }
+
+type Story = { name: String, cases: List<Case> }
+
+fn number(j: Option<Json>) -> Option<Int> =
+  match j { Some(json::Number(n)) -> int_of_decimal(n, Down), _ -> None }
+
+fn field_of(j: Json) -> Field / {abort.raise} =
+  match j {
+    json::Object(one) -> match map_first(one) {
+      Some(e) -> match e.value {
+        json::Str(v) -> { name: bytes_of_string(e.key), value: bytes_of_string(v) },
+        _ -> panic("a field whose value is not a string"),
+      },
+      None -> panic("a field with no name"),
+    },
+    _ -> panic("a field that is not an object"),
+  }
+
+fn case_of(j: Json) -> Case / {abort.raise} =
+  {
+    size: number(json::get(j, "header_table_size")),
+    wire: match json::get(j, "wire") { Some(json::Str(w)) -> bytes_of_hex(w), _ -> b"" },
+    fields: match json::get(j, "headers") { Some(json::Array(fs)) -> map(fs, field_of), _ -> [] },
+  }
+
+fn story_of(f: File) -> Story / {abort.raise} =
+  match json::parse(f.bytes) {
+    Ok(j) -> match json::get(j, "cases") {
+      Some(json::Array(cases)) -> { name: f.name, cases: map(cases, case_of) },
+      _ -> panic(f.name ++ " holds no cases"),
+    },
+    Err(_) -> panic(f.name ++ " is not JSON"),
+  }
+
+fn stories() -> List<Story> / {abort.raise} =
+  map(filter(files(), |f: File| string_ends_with(f.name, ".json")), story_of)
+
+fn ceiling(c: Case) -> Int = match c.size { Some(n) -> max(n, 4096), None -> 4096 }
+
+type Reading = { decoder: Decoder, wrong: List<String> }
+
+fn read_in(r: Reading, c: Case, i: Int, block: Bytes) -> Reading / {abort.raise} = {
+  let d = http2::with_ceiling(r.decoder, ceiling(c));
+  match try { http2::decode(d, block) } {
+    Ok(got) -> if got.fields == c.fields { { ..r, decoder: got.decoder } } else {
+      {
+        ..r,
+        decoder: got.decoder,
+        wrong: push(r.wrong, "block " ++ int_to_string(i) ++ " decodes to other fields"),
+      }
+    },
+    Err(v) -> { ..r, wrong: push(r.wrong, "block " ++ int_to_string(i) ++ ": " ++ v.reason) },
+  }
+}
+
+test "{s.name} decodes block by block to the fields it lists" for s: Story in stories() {
+  let read = fold(
+    range(0, len(s.cases)),
+    { decoder: http2::decoder(4096, 2), wrong: [] },
+    |r: Reading, i: Int|
+      match list_at(s.cases, i) { Some(c) -> read_in(r, c, i, c.wire), None -> r },
+  );
+  assert_eq(read.wrong, [])
+}
+
+type Writing = { encoder: Encoder, reading: Reading }
+
+test "{s.name}'s field lists read back from the blocks std.http2 writes for them" for s: Story in stories(
+  ) {
+  let done = fold(
+    range(0, len(s.cases)),
+    { encoder: http2::encoder(4096), reading: { decoder: http2::decoder(4096, 2), wrong: [] } },
+    |w: Writing, i: Int|
+      match list_at(s.cases, i) {
+        Some(c) -> {
+          let e = match c.size { Some(n) -> http2::with_capacity(w.encoder, n), None -> w.encoder };
+          let written = http2::encode(e, c.fields);
+          { encoder: written.encoder, reading: read_in(w.reading, c, i, written.block) }
+        },
+        None -> w,
+      },
+  );
+  assert_eq(done.reading.wrong, [])
+}
+
+test "the suite is the stories and blocks counted here" {
+  let s = stories();
+  assert_eq(len(s), 63);
+  assert_eq(fold(s, 0, |n: Int, story: Story| n + len(story.cases)), 6651);
+  assert_eq(
+    len(
+      filter(s, |story: Story|
+        fold(story.cases, false, |any: Bool, c: Case| any || c.size != None)),
+    ),
+    31,
+  )
+}
