@@ -2684,8 +2684,10 @@ needle, an `iterate` past its budget, `int_of_u64` of a value past an `Int`.
 
 The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
-std.<name>`. Its tests and obligations are no project's: `ply test`, `ply prove`
-and `ply review` skip them unless you pass `--std`, which adds those of every
+std.<name>`, a name having more segments where a module sits beneath another
+(`std.hash.legacy` beside `std.hash`). Its tests and obligations are no
+project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
+`--std`, which adds those of every
 module `ply std` lists, whichever of them the project imports.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
