@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 /// How many connections a listener bound here queues before the kernel refuses more.
 const BACKLOG: i32 = 128;
@@ -51,6 +52,14 @@ impl Plain {
             Plain::Tcp(s) => (&**s).write(payload),
             #[cfg(unix)]
             Plain::Unix(s) => (&**s).write(payload),
+        }
+    }
+
+    fn write_all(&self, payload: &[u8]) -> io::Result<()> {
+        match self {
+            Plain::Tcp(s) => (&**s).write_all(payload),
+            #[cfg(unix)]
+            Plain::Unix(s) => (&**s).write_all(payload),
         }
     }
 
@@ -414,6 +423,7 @@ impl Net for TcpHost {
             Op::PeerAddress => "ply_host::tcp::peer_address",
             Op::PeerCredentials => "ply_host::tcp::peer_credentials",
             Op::Options => "ply_host::tcp::options",
+            Op::SendSecret => "ply_host::tcp::send_secret",
         }
     }
 
@@ -766,6 +776,29 @@ impl Net for TcpHost {
                 session.deadline(timeout);
                 JobOutput::MaybeInt(Some(session.write(&payload) as i64))
             }
+        })
+    }
+
+    fn send_secret(
+        &self,
+        at: &Resource,
+        conn: i64,
+        payload: Zeroizing<Vec<u8>>,
+        timeout: Duration,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let conn = self.sockets.stream(conn, at, span)?;
+        self.waiting(span, "send_secret", Op::SendSecret.what(), move || {
+            JobOutput::Bool(match conn {
+                Connection::Plain(stream) => {
+                    stream.write_within(timeout);
+                    stream.write_all(&payload).is_ok()
+                }
+                Connection::Tls(session) => {
+                    session.deadline(timeout);
+                    session.write(&payload) == payload.len()
+                }
+            })
         })
     }
 

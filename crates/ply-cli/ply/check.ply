@@ -16,7 +16,7 @@ import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
 import paths (Resolved)
-import sources (Project, DepPackage, load_resolved)
+import sources (Project, DepPackage, PullReads, load_resolved)
 import interfaces
 import compiler.hash (hex)
 import std.bin
@@ -25,7 +25,7 @@ import report (Answer, ok_code, count_of, indent, refused, warning_lines)
 import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines,
                   atom_texts, raise_text, raise_kind)
 import std.term (Style, bold, dim, green, plain)
-import compiler.costs (Report)
+import compiler.costs (Report, Costing)
 import compiler.termination (Ends, Stated, Diverges, Site)
 import compiler.front (Analysis, effect_sets_of)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
@@ -156,21 +156,55 @@ fn count_line(label: String, n: Int, noun: String = "definition") -> String / {a
   under() ++ pad_right(label, 11, " ") ++ " " ++ pad_left(int_to_string(n), 8, " ") ++ " "
     ++ plural(n, noun)
 
-fn seeding_lines(style: Style, analysis: Analysis) -> List<String> / {abort.raise} = {
+// A module whose text an earlier load read is taken as that load found what it imports, and every
+// other one is lexed for it.
+
+fn seeding_lines(
+  style: Style,
+  analysis: Analysis,
+  pulls: Option<PullReads>,
+) -> List<String> / {abort.raise} = {
   let x = seeding_of(analysis);
-  [
-    "",
-    indent() ++ bold(style, "front-end cache"),
-    count_line("seeded", x.seeded),
-    count_line("checked", x.checked),
-    count_line("held", x.held, "test"),
-    count_line("hashed", x.hashed, "test"),
-    under() ++ pad_right("stubbed", 11, " ") ++ " "
-      ++ pad_left(int_to_string(len(analysis.stubs)), 8, " ")
-      ++ " "
-      ++ plural(len(analysis.stubs), "module"),
-  ]
+  concat(
+    [
+      "",
+      indent() ++ bold(style, "front-end cache"),
+      count_line("seeded", x.seeded),
+      count_line("checked", x.checked),
+      count_line("held", x.held, "test"),
+      count_line("hashed", x.hashed, "test"),
+      count_line("stubbed", len(analysis.stubs), "module"),
+    ],
+    match pulls { Some(p) -> [count_line("lexed", p.lexed, "module")], None -> [] },
+  )
 }
+
+fn pulls_json(pulls: Option<PullReads>) -> Json =
+  match pulls {
+    None -> Null,
+    Some(p) -> object([{ key: "lexed", value: int(p.lexed) }, { key: "kept", value: int(p.kept) }]),
+  }
+
+/// What the cost pass walked, where it ran: the bodies it walked rather than took as an earlier run
+/// kept them, and the modules it lowered to walk them.
+fn cost_lines(style: Style, pass: Option<Costing>) -> List<String> / {abort.raise} =
+  match pass {
+    None -> [],
+    Some(c) ->
+      [
+        "",
+        indent() ++ bold(style, "cost pass"),
+        count_line("walked", c.walked, "body"),
+        count_line("lowered", c.lowered, "module"),
+      ],
+  }
+
+fn cost_json(pass: Option<Costing>) -> Json =
+  match pass {
+    None -> Null,
+    Some(c) ->
+      object([{ key: "walked", value: int(c.walked) }, { key: "lowered", value: int(c.lowered) }]),
+  }
 
 fn seeding_json(analysis: Analysis) -> Json = {
   let x = seeding_of(analysis);
@@ -521,6 +555,7 @@ fn document(
   views: List<ModuleFacts>,
   defs: List<DefInfo>,
   warnings: List<Diag>,
+  pass: Option<Costing>,
 ) -> Json / {abort.raise} = {
   let p: Program = timed.program;
   let located = locations(defs);
@@ -547,9 +582,11 @@ fn document(
       value: object([
         { key: "phases", value: phases_json(timed) },
         { key: "definitions", value: seeding_json(analysis) },
+        { key: "pulls", value: pulls_json(timed.pulls) },
         { key: "stubbed", value: Array(json_strings(map(analysis.stubs, string_of_bytes_lossy))) },
       ]),
     },
+    { key: "cost_pass", value: cost_json(pass) },
     { key: "diagnostics", value: all_to_json(warnings, p.places) },
   ])
 }
@@ -581,7 +618,7 @@ fn answered(
   flags: Flags,
   timed: Timed,
   analysis: Analysis,
-  report: Report,
+  pass: Option<Costing>,
   warnings: List<Diag>,
 ) -> Answer / {abort.raise} = {
   let views = module_facts(timed.program, analysis);
@@ -589,15 +626,21 @@ fn answered(
   let tests = own_tests(timed.program, analysis);
   let head = concat([summary(style, analysis, defs, tests)], warning_lines(style, warnings));
   let explained = if flags.explain {
-    concat(concat(head, phase_lines(style, timed)), seeding_lines(style, analysis))
+    concat(
+      concat(concat(head, phase_lines(style, timed)), seeding_lines(style, analysis, timed.pulls)),
+      cost_lines(style, pass),
+    )
   } else { head };
   let typed = if flags.types {
     concat(explained, type_lines(style, flags.explain, timed.program, analysis, views, defs, tests))
   } else { explained };
   {
-    json: if flags.json { document(flags, timed, analysis, views, defs, warnings) }
+    json: if flags.json { document(flags, timed, analysis, views, defs, warnings, pass) }
     else { object([]) },
-    lines: costed(style, flags, timed.program.places, report, typed),
+    lines: match pass {
+      Some(c) -> costed(style, flags, timed.program.places, c.report, typed),
+      None -> typed,
+    },
     errs: [],
     code: ok_code(),
   }
@@ -612,9 +655,11 @@ fn checked(
 ) -> Answer / {priced.report, literal.verdicts, abort.raise} = {
   let kept = promised(timed.program, analysis);
   let asked = kept || flags.costs;
-  let nothing: Report = { ok: true, rounds: 0, defs: [], unkept: [] };
-  let r: Report = if asked { costs_of(timed.program, analysis) } else { nothing };
-  let unkept = if !r.ok { [unresolved()] } else if kept { promises(r) } else { [] };
+  let pass = if asked { Some(costs_of(timed.program, analysis)) } else { None };
+  let unkept = match pass {
+    None -> [],
+    Some(c) -> if !c.report.ok { [unresolved()] } else if kept { promises(c.report) } else { [] },
+  };
   let broken = if len(unkept) > 0 { unkept }
   else { unsettled(timed, analysis, root_of(flags).machine) };
   if len(broken) > 0 { refused(style, "check", broken, timed.program.places) } else {
@@ -623,7 +668,7 @@ fn checked(
       flags,
       timed,
       analysis,
-      r,
+      pass,
       filter(load_diagnostics(timed.program), |diag: Diag| !in_shipped_module(timed.program, diag)),
     )
   }
@@ -863,6 +908,7 @@ test "the longest phase is printed first, and the total accounts for all three" 
     front_ms: 90,
     file_ms: 8,
     cached: true,
+    pulls: None,
   });
   assert_eq(lines, [
     "",

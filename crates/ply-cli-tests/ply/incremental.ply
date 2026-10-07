@@ -131,6 +131,76 @@ test "an edit hashes only the tests of the module it moved" {
   })
 }
 
+/// What the cost pass walked of the project here: the bodies it walked, and the modules it lowered.
+fn cost_pass() -> { walked: Int, lowered: Int } / {Reached, Shipped, abort.raise, diverges} = {
+  let c = path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]);
+  { walked: int(at(c, "walked")), lowered: int(at(c, "lowered")) }
+}
+
+// The cost pass keeps each module's walks under its text and what its check read, so an edit walks
+// the bodies of the module it moved and those that read what a moved body answers.
+test "an edit walks only the bodies whose walk it moved" {
+  scratch(|| {
+    project([
+      { path: "a.ply", text: "pub fn mk(n: Int) -> List<Int> = range(0, n)\n" },
+      { path: "b.ply", text: "import a (mk)\n\nfn grow(n: Int) -> List<Int> = push(mk(n), n)\n" },
+      { path: "c.ply", text: "fn solo(xs: List<Int>) -> List<Int> = push(xs, 1)\n" },
+    ]);
+    let cold = cost_pass();
+    assert(cold.walked == 3 && cold.lowered == 3, Some("a cold pass walks every body"));
+    let warm = cost_pass();
+    assert(warm.walked == 0 && warm.lowered == 0, Some("an unchanged program walks nothing"));
+    edit(
+      "a.ply",
+      "= range(0, n)",
+      "= match map_get(map_new(), n) { Some(xs) -> xs, None -> range(0, n) }",
+    );
+    let shared = cost_pass();
+    assert(
+      shared.walked == 2 && shared.lowered == 2,
+      Some("`mk` is walked, and `grow`, which reads what it answers"),
+    );
+    edit("c.ply", "push(xs, 1)", "push(xs, 2)");
+    let apart = cost_pass();
+    assert(apart.walked == 1 && apart.lowered == 1, Some("`solo` is walked, and nothing reads it"));
+    ()
+  })
+}
+
+/// How the check of the project here found what its modules pull.
+fn pull_reads() -> { lexed: Int, kept: Int } / {Reached, Shipped, abort.raise, diverges} = {
+  let p = path(json_of(on_disk(["check", "--json", "--explain"])), ["front_end", "pulls"]);
+  { lexed: int(at(p, "lexed")), kept: int(at(p, "kept")) }
+}
+
+// What a module's text says it pulls is kept under the text's digest, so a load lexes for it only
+// the texts it has not read.
+test "a load lexes for what its modules pull only the texts it has not read" {
+  scratch(|| {
+    project([
+      { path: "a.ply", text: "pub fn one() -> Int = 1\n" },
+      { path: "b.ply", text: "import a\n\npub fn two() -> Int = a::one() + 1\n" },
+    ]);
+    let cold = pull_reads();
+    assert(cold.lexed == 2 && cold.kept == 0, Some("a cold load lexes every module"));
+    let warm = pull_reads();
+    assert(warm.lexed == 0 && warm.kept == 2, Some("a warm load lexes none"));
+    edit(
+      "b.ply",
+      "import a\n\npub fn two() -> Int = a::one() + 1\n",
+      "import a\nimport std.list (first)\n\npub fn two() -> Int = match first([a::one()]) { Some(n) -> n + 1, None -> 0 }\n",
+    );
+    let moved = pull_reads();
+    assert(
+      moved.lexed > 1 && moved.kept == 1,
+      Some("the edited module is lexed and pulls `std.list`, which is lexed too"),
+    );
+    let again = pull_reads();
+    assert(again.lexed == 0, Some("what the edit pulled is kept too"));
+    ()
+  })
+}
+
 /// `spin` and `hop` call each other without descending, and `wait` calls into them.
 fn looping(above: String, between: String) -> String =
   above ++ "fn spin(n: Int) -> Int / {diverges} = hop(n + 1)\n" ++ between

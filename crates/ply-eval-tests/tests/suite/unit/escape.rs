@@ -91,19 +91,9 @@ fn the_route_reads_outermost_first() {
 }
 
 #[test]
-fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
-    let value = Value::Secret(Arc::new(Value::Ctor {
-        name: Symbol::new("m.Just"),
-        args: Arc::new(vec![cell()]),
-    }));
-    let found = carries(&value).expect("the payload carries it");
-    assert_eq!(found.handle, Handle::Cell);
-    assert_eq!(found.route, vec!["a `Secret`'s payload"]);
-    assert!(
-        !found.reached().contains("Just"),
-        "the payload's shape stays redacted: {}",
-        found.reached()
-    );
+fn a_secret_holds_bytes_alone_and_so_no_handle() {
+    assert!(carries(&Value::secret_bytes(b"key")).is_none());
+    assert!(carries(&Value::secret_text("key")).is_none());
 }
 
 #[test]

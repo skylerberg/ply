@@ -186,7 +186,7 @@ fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.memo_costs = functions
         .iter()
-        .map(|_| (AtomicI64::new(0), AtomicI64::new(0)))
+        .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
         .collect();
     tables.functions = functions;
     tables.roots = roots;
