@@ -1954,22 +1954,31 @@ fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} =
   let keyed = check_keys(checked, hashes);
   let decls = by_name(hashes.decls);
   let read = bodies_read(checked);
-  let owners = test_owners(checked.tests);
   {
     defs: fold(checked.defs, [], |acc: List<KnownDefRow>, def_info: DefInfo|
       match map_get(keyed, def_info.name) {
         Some(x) -> push(acc, def_known_row(decls, def_info, x, read)),
         None -> acc,
       }),
-    tests: map(range(0, len(checked.tests)), |i: Int|
-      test_known_row(
-        decls,
-        at(checked.tests, i),
-        test_check_key(checked, hashes, i),
-        at(owners, i),
-        read,
-      )),
+    tests: test_rows(checked, hashes, decls, read),
   }
+}
+
+fn test_rows(
+  checked: CheckOutput,
+  hashes: HashOutput,
+  decls: Map<Bytes, Bytes>,
+  read: BodiesRead,
+) -> List<KnownTestRow> / {abort.raise} = {
+  let owners = test_owners(checked.tests);
+  map(range(0, len(checked.tests)), |i: Int|
+    test_known_row(
+      decls,
+      at(checked.tests, i),
+      test_check_key(checked, hashes, i),
+      at(owners, i),
+      read,
+    ))
 }
 
 /// The rows a compiled package carries: each definition's counts as its row writes them, which is
@@ -2055,13 +2064,26 @@ pub type Filing = {
 
 pub fn filed_span(span: Span) -> FiledSpan = { start: span.start, end: span.end }
 
-/// A type's constructors in declaration order, which is each one's index.
-fn ctors_of_type(ctors: List<CtorInfo>, name: Bytes) -> List<CtorInfo> = {
-  let mine = filter(ctors, |ctor_info: CtorInfo| ctor_info.type_name == name);
-  fold(range(0, len(mine)), [], |acc: List<CtorInfo>, i: Int|
-    fold(mine, acc, |a: List<CtorInfo>, ctor_info: CtorInfo|
-      if ctor_info.index == i { push(a, ctor_info) } else { a }))
+/// Each type's constructors in declaration order, which is each one's index.
+fn ctors_by_type(ctors: List<CtorInfo>) -> Map<Bytes, List<CtorInfo>> = {
+  let grouped = fold(ctors, map_new(), |acc: Map<Bytes, List<CtorInfo>>, ctor_info: CtorInfo|
+    map_insert(
+      acc,
+      ctor_info.type_name,
+      push(match map_get(acc, ctor_info.type_name) { Some(cs) -> cs, None -> [] }, ctor_info),
+    ));
+  map_fold(grouped, grouped, |acc: Map<Bytes, List<CtorInfo>>, name: Bytes, mine: List<CtorInfo>|
+    map_insert(
+      acc,
+      name,
+      fold(range(0, len(mine)), [], |ordered: List<CtorInfo>, i: Int|
+        fold(mine, ordered, |a: List<CtorInfo>, ctor_info: CtorInfo|
+          if ctor_info.index == i { push(a, ctor_info) } else { a })),
+    ))
 }
+
+fn ctors_of_type(by_type: Map<Bytes, List<CtorInfo>>, name: Bytes) -> List<CtorInfo> =
+  match map_get(by_type, name) { Some(cs) -> cs, None -> [] }
 
 fn filed_op(op_info: OpInfo) -> FiledOp / {abort.raise} =
   {
@@ -2076,7 +2098,7 @@ type Filers = {
   defs: Map<Bytes, DefInfo>,
   types: Map<Bytes, TypeRow>,
   effects: Map<Bytes, EffectInfo>,
-  ctors: List<CtorInfo>,
+  ctors: Map<Bytes, List<CtorInfo>>,
   hashed: Map<Bytes, Bytes>,
   checked: Map<Bytes, Bytes>,
   decls: Map<Bytes, Bytes>,
@@ -2193,7 +2215,7 @@ fn listed(h: Option<Bytes>) -> List<Bytes> = match h { Some(x) -> [x], None -> [
 
 /// A name's one body answers for each hash the name has; a `fn` and a declaration sharing a name
 /// have a body each, and each is filed under the hash it verifies as.
-fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
+fn filed_bodies(hashes: HashOutput, standing: Map<Bytes, Bool>) -> List<FiledBody> / {abort.raise} = {
   let defs = by_name(hashes.defs);
   let decls = by_name(hashes.decls);
   let counted = fold(
@@ -2207,7 +2229,10 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
     if bytes_len(b.body) == 0 { acc } else {
       let alone = match map_get(counted, b.name) { Some(n) -> n == 1, None -> false };
       fold(
-        concat(listed(map_get(defs, b.name)), listed(map_get(decls, b.name))),
+        concat(
+          if map_contains(standing, b.name) { [] } else { listed(map_get(defs, b.name)) },
+          listed(map_get(decls, b.name)),
+        ),
         acc,
         |a: List<FiledBody>, hash: Bytes|
           if alone || body_key(b.body) == Some(hash) { push(a, { hash: hash, body: b.body }) }
@@ -2216,12 +2241,24 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
     })
 }
 
-/// Everything the front-end cache files after an analysis, as plain data.
-pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
+/// Everything the front-end cache files after an analysis, as plain data. `stored` is what the
+/// store gave the load, each interface under the check key its row names: a definition the checker
+/// took from its rows under the key it has now is in the store as this filing would write it, so
+/// only the modules that list it name it.
+pub fn filing(analysis: Analysis, stored: List<DefInterface> = []) -> Filing / {abort.raise} = {
   let hashed = by_name(analysis.hashes.defs);
   let checked = check_keys(analysis.checked, analysis.hashes);
   let decls = by_name(analysis.hashes.decls);
   let types = type_rows(analysis.mods);
+  let ctors = ctors_by_type(analysis.checked.ctors);
+  let filed = fold(stored, map_new(), |acc: Map<Bytes, Bytes>, d: DefInterface|
+    map_insert(acc, d.row.name, d.row.hash));
+  let standing = fold(analysis.checked.seeded, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    match map_get(filed, name) {
+      Some(k) -> if map_get(checked, name) == Some(k) { map_insert(acc, name, true) } else { acc },
+      None -> acc,
+    });
+  let read = bodies_read(analysis.checked);
   let f: Filers = {
     defs: map_of_entries(
       map(analysis.checked.defs, |def_info: DefInfo| { key: def_info.name, value: def_info }),
@@ -2231,15 +2268,16 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
       map(analysis.checked.effects, |effect_info: EffectInfo|
         { key: effect_info.name, value: effect_info }),
     ),
-    ctors: analysis.checked.ctors,
+    ctors: ctors,
     hashed: hashed,
     checked: checked,
     decls: decls,
   };
-  let rows = rows_of(analysis);
-  let row_of = fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
-    map_insert(acc, row.name, row));
-  let tests = tests_by_module(analysis.checked, analysis.hashes, rows.tests);
+  let tests = tests_by_module(
+    analysis.checked,
+    analysis.hashes,
+    test_rows(analysis.checked, analysis.hashes, decls, read),
+  );
   let typed = fold(types, [], |acc: List<FiledDecl>, t: TypeRow|
     match map_get(decls, t.name) {
       None -> acc,
@@ -2251,7 +2289,7 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
             effect: false,
             arity: t.arity,
             nondet: false,
-            variants: map(ctors_of_type(analysis.checked.ctors, t.name), |ctor_info: CtorInfo|
+            variants: map(ctors_of_type(ctors, t.name), |ctor_info: CtorInfo|
               { name: ctor_info.simple_name, fields: map(ctor_info.fields, type_text) }),
             ops: [],
           },
@@ -2270,19 +2308,20 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
     // A definition's interface holds while its check key does, which a body edit leaves alone
     // wherever what the edited definition publishes does not move.
     defs: fold(analysis.checked.defs, [], |acc: List<FiledDef>, def_info: DefInfo|
-      match ((
-          map_get(hashed, def_info.name),
-          map_get(checked, def_info.name),
-          map_get(row_of, def_info.name),
-        )) {
-        (Some(h), Some(k), Some(row)) ->
-          push(acc, {
-            name: def_info.name,
-            hash: h,
-            check: k,
-            interface: { row: row, scheme: scheme_text(def_info.scheme) },
-          }),
-        _ -> acc,
+      if map_contains(standing, def_info.name) { acc } else {
+        match ((map_get(hashed, def_info.name), map_get(checked, def_info.name))) {
+          (Some(h), Some(k)) ->
+            push(acc, {
+              name: def_info.name,
+              hash: h,
+              check: k,
+              interface: {
+                row: def_known_row(decls, def_info, k, read),
+                scheme: scheme_text(def_info.scheme),
+              },
+            }),
+          _ -> acc,
+        }
       }),
     decls: fold(analysis.checked.effects, typed, |acc: List<FiledDecl>, effect_info: EffectInfo|
       match map_get(decls, effect_info.name) {
@@ -2300,7 +2339,7 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
             },
           }),
       }),
-    bodies: filed_bodies(analysis.hashes),
+    bodies: filed_bodies(analysis.hashes, standing),
   }
 }
 
@@ -6554,6 +6593,40 @@ type Session = { rows: Rows, off: List<Bytes> }
 
 fn filed_rows(filing: Filing) -> Rows =
   { defs: map(filing.defs, |d: FiledDef| d.interface.row), tests: filed_tests(filing) }
+
+test "a filing writes again only what the store does not hold under the key it has now" {
+  let first = filing(
+    analysis_of([
+      {
+        name: b"m",
+        src: b"pub fn kept(n: Int) -> Int = n + 1\npub fn edited(n: Int) -> Int = n * 2\n",
+      },
+    ]),
+  );
+  let stored = map(first.defs, |d: FiledDef| d.interface);
+  let w = match analyse_with(
+      parse_all([
+        {
+          name: b"m",
+          src: b"pub fn kept(n: Int) -> Int = n + 1\npub fn edited(n: Int) -> Int = n * 3\n",
+        },
+      ]),
+      filed_rows(first).defs,
+      [],
+    ) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> w,
+  };
+  assert_eq(w.checked.seeded, [b"m.kept"]);
+  let names = |f: Filing| map(f.defs, |d: FiledDef| d.name);
+  assert_eq(names(filing(w)), [b"m.kept", b"m.edited"]);
+  let again = filing(w, stored);
+  assert_eq(names(again), [b"m.edited"]);
+  assert_eq(len(again.bodies), 1);
+  assert_eq(map(at(again.modules, 0).entries, |e: FiledEntry| e.name), [b"m.kept", b"m.edited"]);
+  let elsewhere = map(stored, |d: DefInterface| { ..d, row: { ..d.row, hash: b"another key" } });
+  assert_eq(names(filing(w, elsewhere)), [b"m.kept", b"m.edited"])
+}
 
 /// The steps whose seeded answer is not the fresh one.
 fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} = {
