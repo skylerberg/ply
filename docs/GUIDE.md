@@ -2715,6 +2715,13 @@ checked against that declaration, so it performs none of it.
 | `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0) |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
+At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
+is what `std.http`'s `serve_pooled` drains on: it accepts nothing more, and it
+answers every connection it had accepted, queued ones included, the last answer
+on each saying `Connection: close`, and closes the ones waiting idle at once.
+Before the stop it sheds load, answering `503` with `Retry-After` to a
+connection that finds its queue full or that waited in it too long.
+
 An unreadable configuration source is `E0440`. A statement the server rejects
 and one that touches a table outside what the call site labelled are refusals
 from `std.db`, which reads and runs its own statements.
