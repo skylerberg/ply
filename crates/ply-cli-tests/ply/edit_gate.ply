@@ -8,13 +8,15 @@ import compiler.items (parse, Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                        IEffectSet, IExtern, IInstance, INumeric, FnDef, TDSum, TDAlias, TDNominal,
                        VPub, NKey, NShow, NGen)
 import compiler.exprs (expr_span)
+import compiler.fmt (line_end)
 import compiler.embed (EmbedWant, wants_of)
 import harness (Source, Ran, Here, Reached, Shipped, Hermetic, scratch, project, comparable,
                 json_of, on_disk_shipping, over_tree, tree, sources_here, example_files,
                 std_modules, StdModule, shown, at, items, truth)
 import std.fs (fs)
+import std.place (spliced)
 import std.json (Json, Object, Array)
-import std.list (concat, contains)
+import std.list (concat, contains, first, last)
 import std.string
 
 /// A kind of edit the gate makes to a module.
@@ -79,9 +81,6 @@ pub fn edit_name(e: Edit) -> String =
 /// A file an edit writes, whole.
 pub type Change = { path: String, bytes: Bytes }
 
-fn splice(text: Bytes, start: Int, end: Int, put: Bytes) -> Bytes / {abort.raise} =
-  bytes_concat_all([bytes_slice(text, 0, start), put, bytes_slice(text, end, bytes_len(text))])
-
 fn module_of(src: Bytes) -> Option<Module> / {abort.raise} = {
   let p = parse(src);
   if len(p.parser.diags) > 0 { None } else { Some(p.node) }
@@ -90,25 +89,17 @@ fn module_of(src: Bytes) -> Option<Module> / {abort.raise} = {
 fn fns_of(m: Module) -> List<FnDef> =
   fold(m.items, [], |acc: List<FnDef>, item: Item| match item { IFn(d) -> push(acc, d), _ -> acc })
 
-fn first<a>(xs: List<a>) -> Option<a> = list_at(xs, 0)
-
-fn last<a>(xs: List<a>) -> Option<a> = list_at(xs, len(xs) - 1)
-
-/// The byte past the line holding `at`, or the text's end.
-fn line_after(text: Bytes, at: Int) -> Int / {abort.raise} =
-  match bytes_index_of_from(text, b"\n", at) { Some(i) -> i + 1, None -> bytes_len(text) }
-
 /// Where a line goes above every item: past the last import, else past the module's `//!` lines.
 fn above_items(text: Bytes, m: Module) -> Int / {abort.raise} =
   match last(m.imports) {
-    Some(i) -> line_after(text, i.span.end),
+    Some(i) -> line_end(text, i.span.end),
     None -> heading_end(text, 0, bytes_len(text) + 1),
   }
 
 fn heading_end(text: Bytes, at: Int, left: Int) -> Int / {abort.raise} =
   if left <= 0 || at >= bytes_len(text) { at }
   else if bytes_starts_with(bytes_slice(text, at, bytes_len(text)), b"//!")
-      || bytes_at(text, at) == 10 { heading_end(text, line_after(text, at), left - 1) }
+      || bytes_at(text, at) == 10 { heading_end(text, line_end(text, at), left - 1) }
   else { at }
 
 /// Where `needle` last starts in `text` before `end`.
@@ -176,14 +167,14 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
           one(bytes_concat(src, b"\n/// What the gate added.\npub fn gate_added() -> Int = 7\n")),
         Comment -> {
           let at = above_items(src, m);
-          one(splice(src, at, at, b"// the gate's note\n"))
+          one(spliced(src, at, at, b"// the gate's note\n"))
         },
         WrapBody -> match first(fns_of(m)) {
           None -> None,
           Some(d) -> {
             let s = expr_span(d.body);
             one(
-              splice(
+              spliced(
                 src,
                 s.start,
                 s.end,
@@ -196,13 +187,13 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
           None -> None,
           Some(d) -> {
             let s = expr_span(d.body);
-            one(splice(src, s.start, s.end, b"panic(\"the gate\")"))
+            one(spliced(src, s.start, s.end, b"panic(\"the gate\")"))
           },
         },
         Unexport -> match first(filter(fns_of(m), |d: FnDef| d.vis == VPub)) {
           None -> None,
           Some(d) -> match last_before(src, b"pub ", d.name.span.start) {
-            Some(i) -> one(splice(src, i, i + 4, b"")),
+            Some(i) -> one(spliced(src, i, i + 4, b"")),
             None -> None,
           },
         },
@@ -210,20 +201,25 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
           None -> None,
           Some(d) ->
             one(
-              splice(src, d.name.span.start, d.name.span.end, bytes_concat(d.name.name, b"_moved")),
+              spliced(
+                src,
+                d.name.span.start,
+                d.name.span.end,
+                bytes_concat(d.name.name, b"_moved"),
+              ),
             ),
         },
         RemoveFn -> match last(fns_of(m)) {
           None -> None,
-          Some(d) -> one(splice(src, d.span.start, d.span.end, b"")),
+          Some(d) -> one(spliced(src, d.span.start, d.span.end, b"")),
         },
         AddImport -> {
           let at = above_items(src, m);
-          one(splice(src, at, at, b"import std.option\n"))
+          one(spliced(src, at, at, b"import std.option\n"))
         },
         RemoveImport -> match first(m.imports) {
           None -> None,
-          Some(i) -> one(splice(src, i.span.start, line_after(src, i.span.end), b"")),
+          Some(i) -> one(spliced(src, i.span.start, line_end(src, i.span.end), b"")),
         },
         AddTest -> one(bytes_concat(src, b"\ntest \"the gate's test\" {\n  assert(true)\n}\n")),
         AddVariant -> {
@@ -234,7 +230,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
             });
           match first(sums) {
             None -> None,
-            Some(end) -> one(splice(src, end, end, b" | GateVariant")),
+            Some(end) -> one(spliced(src, end, end, b" | GateVariant")),
           }
         },
         AddField -> {
@@ -254,7 +250,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
             Some(i) -> {
               let before = written_before(src, i);
               one(
-                splice(src, i, i, if before == 44 || before == 123 { b" gate_field: Int " }
+                spliced(src, i, i, if before == 44 || before == 123 { b" gate_field: Int " }
                 else { b", gate_field: Int " }),
               )
             },
@@ -268,7 +264,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
               INumeric(d) -> push(acc, { start: d.span.start, end: d.span.end }),
               _ -> acc,
             });
-          match first(spans) { None -> None, Some(s) -> one(splice(src, s.start, s.end, b"")) }
+          match first(spans) { None -> None, Some(s) -> one(spliced(src, s.start, s.end, b"")) }
         },
         NarrowSet -> {
           let cuts = fold(m.items, [], |acc: List<{ start: Int, end: Int }>, item: Item|
@@ -284,7 +280,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
               },
               _ -> acc,
             });
-          match first(cuts) { None -> None, Some(s) -> one(splice(src, s.start, s.end, b"")) }
+          match first(cuts) { None -> None, Some(s) -> one(spliced(src, s.start, s.end, b"")) }
         },
         AddOp -> {
           let ends = fold(m.items, [], |acc: List<Int>, item: Item|
@@ -297,7 +293,7 @@ fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
             });
           match first(ends) {
             None -> None,
-            Some(i) -> one(splice(src, i, i, b"\n  read gate_peek() -> Int\n")),
+            Some(i) -> one(spliced(src, i, i, b"\n  read gate_peek() -> Int\n")),
           }
         },
         TouchEmbed -> None,
