@@ -847,14 +847,38 @@ fn root_keys(
   mods: List<ParsedModule>,
   checked: CheckOutput,
   hashes: HashOutput,
+  within: Option<Within> = None,
 ) -> List<KeyRow> / {abort.raise} = {
   let own = by_name(hashes.own);
   let sentences = by_name_many(hashes.spec_texts);
   let deps = by_name_names(hashes.deps);
   let decls = by_name(hashes.decls);
+  let owned = |name: Bytes| match within { Some(w) -> map_contains(w.owners, name), None -> true };
+  let tested = |key: Bytes| match within { Some(w) -> map_contains(w.tests, key), None -> true };
+  // A kept root's key reads each definition it references, owned or not.
+  let read = match within {
+    None -> None,
+    Some(w) ->
+      Some(
+        fold(
+          concat(map_keys(w.owners), map_keys(w.tests)),
+          map_new(),
+          |acc: Map<Bytes, Bool>, name: Bytes|
+            fold(
+              match map_get(deps, name) { Some(ns) -> ns, None -> [] },
+              map_insert(acc, name, true),
+              |m: Map<Bytes, Bool>, n: Bytes| map_insert(m, n, true),
+            ),
+        ),
+      ),
+  };
   // Each signature printed once: a root reads many definitions, and many roots read one.
   let published = map_of_entries(
-    map(checked.defs, |d: DefInfo| { key: d.name, value: key_published(d) }),
+    map(
+      filter(checked.defs, |d: DefInfo|
+        match read { Some(r) -> map_contains(r, d.name), None -> true }),
+      |d: DefInfo| { key: d.name, value: key_published(d) },
+    ),
   );
   let laws = checked.laws;
   let law_texts = hashes.law_texts;
@@ -867,7 +891,7 @@ fn root_keys(
         { out: acc.out, ordinal: 0, law_ordinal: 0, law_at: acc.law_at },
         |a: Keying, item: Item|
           match item {
-            IFn(d) ->
+            IFn(d) -> if !owned(qualify(parsed.name, d.name.name)) { a } else {
               key_fn(
                 published,
                 own,
@@ -877,43 +901,51 @@ fn root_keys(
                 a,
                 qualify(parsed.name, d.name.name),
                 d.spec,
-              ),
+              )
+            },
             ITest(d) -> {
               let name = qualify(parsed.name, d.name);
-              let read = key_reads(published, deps, decls, name, None);
-              let root = qualify(parsed.name, key_test_root(a.ordinal));
-              let run = push(a.out, { root: root, key: bytes_concat(b"test+", read) });
-              {
-                ..a,
-                ordinal: a.ordinal + 1,
-                out: if d.cases == None { run }
-                else { push(run, { root: cases_root(root), key: bytes_concat(b"cases+", read) }) },
+              if !tested(name) { { ..a, ordinal: a.ordinal + 1 } } else {
+                let read = key_reads(published, deps, decls, name, None);
+                let root = qualify(parsed.name, key_test_root(a.ordinal));
+                let run = push(a.out, { root: root, key: bytes_concat(b"test+", read) });
+                {
+                  ..a,
+                  ordinal: a.ordinal + 1,
+                  out: if d.cases == None { run } else {
+                    push(run, { root: cases_root(root), key: bytes_concat(b"cases+", read) })
+                  },
+                }
               }
             },
-            ILaw(d) -> {
-              let name = qualify(parsed.name, d.name);
-              let keyed = match list_at(law_texts, a.law_at) {
-                None -> a,
-                Some(text) -> {
-                  let read = key_reads(published, deps, decls, name, None);
-                  let guarded = match list_at(laws, a.law_at) {
-                    Some(l) -> l.has_guard,
-                    None -> false,
-                  };
-                  fold(
-                    if guarded { [b"guard", b"body"] } else { [b"body"] },
-                    a,
-                    |b: Keying, part: Bytes| {
-                      let row = {
-                        root: qualify(parsed.name, key_law_root(a.law_ordinal, part)),
-                        key: bytes_concat_all([hex(text), b"#", part, b"+", read]),
-                      };
-                      { ..b, out: push(b.out, row) }
-                    },
-                  )
-                },
-              };
-              { ..keyed, law_ordinal: a.law_ordinal + 1, law_at: a.law_at + 1 }
+            ILaw(d) -> match within {
+              // A run's tests enter no law.
+              Some(_) -> { ..a, law_ordinal: a.law_ordinal + 1, law_at: a.law_at + 1 },
+              None -> {
+                let name = qualify(parsed.name, d.name);
+                let keyed = match list_at(law_texts, a.law_at) {
+                  None -> a,
+                  Some(text) -> {
+                    let read = key_reads(published, deps, decls, name, None);
+                    let guarded = match list_at(laws, a.law_at) {
+                      Some(l) -> l.has_guard,
+                      None -> false,
+                    };
+                    fold(
+                      if guarded { [b"guard", b"body"] } else { [b"body"] },
+                      a,
+                      |b: Keying, part: Bytes| {
+                        let row = {
+                          root: qualify(parsed.name, key_law_root(a.law_ordinal, part)),
+                          key: bytes_concat_all([hex(text), b"#", part, b"+", read]),
+                        };
+                        { ..b, out: push(b.out, row) }
+                      },
+                    )
+                  },
+                };
+                { ..keyed, law_ordinal: a.law_ordinal + 1, law_at: a.law_at + 1 }
+              },
             },
             _ -> a,
           },
@@ -1209,7 +1241,9 @@ fn emitter_roots(
   mods: List<ParsedModule>,
   checked: CheckOutput,
   cr: Carrier,
+  within: Option<Within> = None,
 ) -> List<EmitterRoot> / {abort.raise} = {
+  let owned = |name: Bytes| match within { Some(w) -> map_contains(w.owners, name), None -> true };
   let defs = map_of_entries(map(checked.defs, |d: DefInfo| { key: d.name, value: d }));
   let laws = map_of_entries(map(checked.laws, |l: LawInfo| { key: l.key, value: l }));
   let tests = map_of_entries(map(checked.tests, |t: TestInfo| { key: t.key, value: t }));
@@ -1224,7 +1258,7 @@ fn emitter_roots(
           match item {
             IFn(d) -> {
               let name = qualify(parsed.name, d.name.name);
-              match map_get(defs, name) {
+              match if owned(name) { map_get(defs, name) } else { None } {
                 None -> a,
                 Some(def) -> {
                   let sig = emit_signature(def.scheme.ty);
@@ -1290,30 +1324,33 @@ fn emitter_roots(
               };
               { ..a, tests: push(a.tests, row), specs: listed, ordinal: a.ordinal + 1 }
             },
-            ILaw(d) -> {
-              let name = qualify(parsed.name, d.name);
-              let law = map_get(laws, name);
-              let guarded = match law { Some(l) -> l.has_guard, None -> false };
-              let measured = match law { Some(l) -> l.cost, None -> false };
-              let binders = match law {
-                Some(l) -> map(l.binders, |b: LawBinder| b.ty),
-                None -> [],
-              };
-              let vars = vars_in(binders);
-              let place = match law {
-                Some(l) -> span_at(l.at.module, l.at.span),
-                None -> no_module_span(),
-              };
-              let rows = map(
-                if guarded { [b"guard", b"body"] } else { [b"body"] },
-                |part: Bytes| {
-                  let root = qualify(parsed.name, key_law_root(a.law_ordinal, part));
-                  if measured && part == b"body" {
-                    emit_root(cr, vars, [], root, binders, measure_ty(), 0, false, place)
-                  } else { emit_proposition(cr, vars, [], root, binders, place) }
-                },
-              );
-              { ..a, specs: concat(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
+            ILaw(d) -> match within {
+              Some(_) -> { ..a, law_ordinal: a.law_ordinal + 1 },
+              None -> {
+                let name = qualify(parsed.name, d.name);
+                let law = map_get(laws, name);
+                let guarded = match law { Some(l) -> l.has_guard, None -> false };
+                let measured = match law { Some(l) -> l.cost, None -> false };
+                let binders = match law {
+                  Some(l) -> map(l.binders, |b: LawBinder| b.ty),
+                  None -> [],
+                };
+                let vars = vars_in(binders);
+                let place = match law {
+                  Some(l) -> span_at(l.at.module, l.at.span),
+                  None -> no_module_span(),
+                };
+                let rows = map(
+                  if guarded { [b"guard", b"body"] } else { [b"body"] },
+                  |part: Bytes| {
+                    let root = qualify(parsed.name, key_law_root(a.law_ordinal, part));
+                    if measured && part == b"body" {
+                      emit_root(cr, vars, [], root, binders, measure_ty(), 0, false, place)
+                    } else { emit_proposition(cr, vars, [], root, binders, place) }
+                  },
+                );
+                { ..a, specs: concat(a.specs, rows), law_ordinal: a.law_ordinal + 1 }
+              },
             },
             _ -> a,
           },
@@ -1370,6 +1407,7 @@ fn tables(
   module_packages: List<Int>,
   embeds: List<EmbedAt>,
   stub_cuts: Map<Bytes, List<Cut>>,
+  within: Option<Within> = None,
 ) -> Dump / {abort.raise} = {
   let fns = fn_written(mods);
   let effs = effect_written(mods);
@@ -1395,8 +1433,8 @@ fn tables(
     ctors: map(checked.ctors, ctor_row),
     hashes: hash_rows(index, hashes),
     hashes_digest: digest(hashes),
-    keys: root_keys(mods, checked, hashes),
-    emitter_roots: emitter_roots(mods, checked, cr),
+    keys: root_keys(mods, checked, hashes, within),
+    emitter_roots: emitter_roots(mods, checked, cr, within),
     baked: map(const_sites(mods, hashes), |site: ConstSite| { name: site.name, hash: site.hash }),
     emitter_ctors: emitter_ctors_of(mods, checked, cr),
     ordinals: map(mods, ordinal_row),
@@ -2947,6 +2985,29 @@ pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
         w.stub_cuts,
       ),
   }
+
+/// What a run of tests enters of a program: the definitions `owners` names, which every root of a
+/// test it runs or lists reaches, and the tests and listings `tests` keys.
+pub type Within = { owners: Map<Bytes, Bool>, tests: Map<Bytes, Bool> }
+
+/// `dump_of` for a run that enters only what `within` holds: every other definition's root and key,
+/// every other test's key and every law's are left out. Each test keeps its root, by which a run
+/// finds it.
+pub fn dump_within(w: Analysis, within: Within) -> Dump / {abort.raise} =
+  tables(
+    w.warnings,
+    w.mods,
+    w.r,
+    w.checked,
+    w.index,
+    w.hashes,
+    w.packages,
+    w.pins,
+    w.module_packages,
+    w.embeds,
+    w.stub_cuts,
+    Some(within),
+  )
 
 /// A builtin as the checker binds it, the names its parameters are documented under, and the
 /// witnesses a `numeric` or `integer` constraint has the elaboration pass ahead of them.
@@ -5556,6 +5617,33 @@ test "a test's root is the one at its place among the program's tests" {
     b"a.second",
     b"b.third",
   ])
+}
+
+test "a dump within a run keeps every test's root, and keys what it keeps as the whole dump does" {
+  let src = b"fn base(x: Int) -> Int = x + 1\nfn used(x: Int) -> Int requires x > 0 = base(x)\nfn other(x: Int) -> Int = x * 2\ntest \"uses\" { assert_eq(used(1), 2) }\ntest \"others\" { assert_eq(other(1), 2) }\nlaw \"l\" forall (x: Int) { other(x) == x * 2 }";
+  match analyse(parse_all([{ name: b"m", src: src }])) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> {
+      let whole = dump_of(Analysed(w));
+      // `base` is outside it, yet `used`'s key reads its signature.
+      let within = dump_within(w, {
+        owners: map_insert(map_new(), b"m.used", true),
+        tests: map_insert(map_new(), b"m.uses", true),
+      });
+      assert_eq(map(within.emitter_roots, |root: EmitterRoot| root.root), [
+        b"m.used",
+        b"m.test#0",
+        b"m.test#1",
+        b"m.used#requires#0",
+      ]);
+      assert_eq(
+        within.keys,
+        filter(whole.keys, |k: KeyRow|
+          contains([b"m.used#requires#0", b"m.used", b"m.test#0"], k.root)),
+      );
+      assert_eq(len(within.keys), 3);
+    },
+  }
 }
 
 test "a root carries a width exactly where a value it is entered with or answers is one" {
