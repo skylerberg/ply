@@ -51,6 +51,11 @@
 #   ci-shards.sh rust-kept NEW JUNIT OUT
 #                                the traces in NEW of the tests JUNIT says passed,
 #                                copied into OUT
+#   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
+#                                `workflow_dispatch`, SWEEP_SHARDS shards of the seventh of the cases
+#                                the day of the week names, so a week sweeps every case; on a pull
+#                                request, a job for each module the paths on stdin change, up to
+#                                SWEEP_MOST of them; none otherwise
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -95,6 +100,11 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+# Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
+# of the tree a dozen ways and checks it warm and cold after each, a day of runners over the tree.
+CLI_NIGHTLY=(edit_sweep)
+SWEEP_SHARDS=16
+SWEEP_MOST=6
 # Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
 # for a lane whatever its tests are placed by, as a test over cases is one test.
 CORPUS_SHARDED=("cli-phases:3" "cli-http_audit:2")
@@ -228,7 +238,7 @@ corpus_entries() {
     for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
     for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
     module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
-    module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
+    module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
   } | awk -v sharded="${CORPUS_SHARDED[*]-}" '
     BEGIN {
       n = split(sharded, s, " ")
@@ -1832,6 +1842,35 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; $((${#TREE_CHECKS[@]} + ${#GATES_ALONE[@]})) tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
+# The sweep's case for a changed path, as a `--filter`: an example, a module of the compiler's
+# package, or one of the standard library; nothing for any other path.
+sweep_filter() {
+  local path=$1 module
+  case $path in
+    examples/*/*) ;;
+    examples/*.ply) printf 'edit_sweep.editing %s agrees\n' "$path" ;;
+    crates/ply-compiler/ply/*/*) ;;
+    crates/ply-compiler/ply/*.ply) printf 'edit_sweep.editing compiler/%s agrees\n' "${path#crates/ply-compiler/ply/}" ;;
+    crates/ply-std/ply/*.ply)
+      module=${path#crates/ply-std/ply/}
+      module=${module%.ply}
+      printf 'edit_sweep.editing std.%s agrees\n' "${module//\//.}"
+      ;;
+  esac
+}
+
+cmd_sweep_matrix() {
+  local event=$1 path
+  if [[ $event == schedule || $event == workflow_dispatch ]]; then
+    jq -cn --argjson n "$SWEEP_SHARDS" --argjson day "$(date -u +%u)" \
+      '($n * 7) as $of | {include: [range(1; $n + 1) | (($day - 1) * $n + .) as $k
+        | {name: "\($k)/\($of)", shard: "\($k)/\($of)", filter: ""}]}'
+    return
+  fi
+  while read -r path; do sweep_filter "$path"; done | sort -u | head -n "$SWEEP_MOST" |
+    jq -Rcn '{include: [inputs | {name: (. | sub("^edit_sweep.editing "; "") | sub(" agrees$"; "")), shard: "", filter: .}]}'
+}
+
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys) cmd_cache_keys ;;
@@ -1854,6 +1893,7 @@ case "${1:-}" in
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
+  sweep-matrix) cmd_sweep_matrix "${2:?an event}" ;;
   *)
     echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2

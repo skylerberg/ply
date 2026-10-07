@@ -15,17 +15,24 @@ on:
     paths-ignore: ["**.md", "docs/**"]
   pull_request:
     paths-ignore: ["**.md", "docs/**"]
+  # Nightly, and on demand: every job starts from nothing an earlier run kept (`PLY_CI_COLD`), so no
+  # kept answer goes unchecked, and a seventh of the edit sweep runs, the whole of it in a week.
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
 
 # A newer push to a pull request supersedes its run; a merge to main never cancels the run before
 # it, whose `refresh` job is the one that commits the builder and the `ply` program back.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   # `gh run download` of another run's artifact.
   actions: read
+  # The files a pull request changes, whose modules the edit sweep edits.
+  pull-requests: read
 
 env:
   # The Rust key folds both in, so raising either builds afresh.
@@ -38,12 +45,18 @@ env:
   # `ply --count-alloc-sites` naming inlined frames (Cargo.toml), which nothing in CI asks of it.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
   RUST_BACKTRACE: "1"
+  # A cold run restores nothing a Ply run kept: no stage, store, pass, C or Rust test trace. Rust's
+  # own build caches are kept, since they decide nothing a test answers.
+  PLY_CI_COLD: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
 
 jobs:
   plan:
     name: CI tables and cache keys are total, and the ucontext probe
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      sweep: ${{ steps.sweep.outputs.sweep }}
+      swept: ${{ steps.sweep.outputs.swept }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -65,6 +78,26 @@ jobs:
 
       - name: ./probes/ucontext/run.sh
         run: ./probes/ucontext/run.sh
+
+      # Nightly, every case of the edit sweep in shards; on a pull request, the case of each module it
+      # changes.
+      - name: The edit sweep's jobs
+        id: sweep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate --jq '.[].filename' > /tmp/changed
+          else
+            : > /tmp/changed
+          fi
+          sweep=$(.github/ci-shards.sh sweep-matrix "$EVENT" < /tmp/changed)
+          echo "sweep=$sweep" >> "$GITHUB_OUTPUT"
+          echo "swept=$(jq -r '.include | length > 0' <<< "$sweep")" >> "$GITHUB_OUTPUT"
+          jq -r '.include[].name' <<< "$sweep"
 
   clippy:
     name: cargo fmt --all --check and cargo clippy --workspace --all-targets
@@ -342,6 +375,7 @@ jobs:
       # moved has both from an earlier run; against any other tree the buckets of emitted C that
       # did not move are already built, which is most of them.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         id: stage-cache
         with:
           path: |
@@ -359,7 +393,7 @@ jobs:
       # After the mark, so the cut below keeps it.
       - name: The stage a run on another branch built from these sources
         id: shared
-        if: steps.stage-cache.outputs.cache-hit != 'true'
+        if: steps.stage-cache.outputs.cache-hit != 'true' && env.PLY_CI_COLD != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/ci-warm.sh shared "${{ steps.stage-name.outputs.name }}"
@@ -375,6 +409,7 @@ jobs:
         run: .github/ci-warm.sh target/release/ply
       # What earlier runs kept of each Ply run: the passes its tests took and the answer it kept.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
@@ -463,6 +498,7 @@ jobs:
       # What this shard's tests compiled and asked of the compiler on its last run: bodies and
       # answers are each kept under what decides them, so one still current is read back.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-c-nextest
           key: ply-c-nextest-${{ matrix.shard }}-${{ github.run_id }}
@@ -600,6 +636,7 @@ jobs:
       # The C every partition compiled and read last run, which `passes` made one: without it a
       # lane's first `ply test` emits its package's whole unit before its first test.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         id: lanes-c
         with:
           path: /tmp/ply-c-lanes
@@ -607,7 +644,7 @@ jobs:
           restore-keys: ply-c-lanes-
       # A partition no run has kept C for starts from what main's corpus jobs kept.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.lanes-c.outputs.cache-matched-key == ''
+        if: ${{ (steps.lanes-c.outputs.cache-matched-key == '') && env.PLY_CI_COLD != 'true' }}
         with:
           path: /tmp/ply-c-corpus
           key: ply-c-corpus-
@@ -619,6 +656,7 @@ jobs:
           .github/ci-corpus.sh mark
       # Passes earlier runs published, each filed under the runtime stamp that earned it.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
@@ -627,6 +665,7 @@ jobs:
         run: .github/ci-corpus.sh upstream-mark
       # Each package's front-end store as the last partition to load it left it.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: |
             crates/ply-cli/ply/.ply-cache
@@ -710,6 +749,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
@@ -753,6 +793,7 @@ jobs:
       # partition holding only its own last run's would load and emit a package it was just given
       # from nothing. A store no partition wrote this run stays as the last run left it.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: |
             crates/ply-cli/ply/.ply-cache
@@ -1099,6 +1140,7 @@ jobs:
       # The C main's corpus runs compiled (`ci-corpus.sh keep`): without it a lane's first `ply test`
       # emits the checks package's whole closure, the compiler's included, before its first check.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-c-corpus
           key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
@@ -1108,6 +1150,7 @@ jobs:
       - name: The corpus's compiled C, merged under the stage
         run: .github/ci-corpus.sh restore /tmp/ply-c-corpus
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
@@ -1115,6 +1158,7 @@ jobs:
       - name: The passes this job starts from
         run: .github/ci-corpus.sh upstream-mark
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.PLY_CI_COLD != 'true'
         with:
           path: |
             crates/ply-cli/ply/.ply-cache
@@ -1221,10 +1265,41 @@ jobs:
           key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
 
   # The one check that says a run is green.
+  # Every module of the tree edited the ways `edit_gate` edits its fixtures, and checked warm and cold
+  # after each (`edit_sweep`): nightly a seventh of the cases in shards, and on a pull request the
+  # modules it changes.
+  edit-sweep:
+    name: edit sweep ${{ matrix.name }}
+    needs: [plan, build, build-ply]
+    if: needs.plan.outputs.swept == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.sweep) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+        with:
+          stage: ${{ needs.build-ply.outputs.stage }}
+      - name: The sweep's cases this job takes
+        env:
+          SHARD: ${{ matrix.shard }}
+          FILTER: ${{ matrix.filter }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FILTER" ]; then
+            .github/ci-corpus.sh sweep --filter "$FILTER"
+          else
+            .github/ci-corpus.sh sweep --shard "$SHARD"
+          fi
+
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, corpus, refresh]
+    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, corpus, refresh, edit-sweep]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -1235,14 +1310,15 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # `refresh` runs on main only, and `build-ply` starts no partition or corpus job whose runs
-          # what earlier runs kept answers.
+          # `refresh` runs on a push to main only, `build-ply` starts no partition or corpus job whose
+          # runs what earlier runs kept answers, and the edit sweep runs only where it has cases.
           not_ok=$(jq -r --arg event "$EVENT" '
             to_entries[]
             | select(.value.result != "success")
-            | select(($event == "pull_request" and .value.result == "skipped"
+            | select(($event != "push" and .value.result == "skipped"
                 and .key == "refresh") | not)
-            | select((.value.result == "skipped" and (.key == "lanes" or .key == "corpus")) | not)
+            | select((.value.result == "skipped"
+                and (.key == "lanes" or .key == "corpus" or .key == "edit-sweep")) | not)
             | "\(.key) = \(.value.result)"
           ' /tmp/needs.json)
           if [ -n "$not_ok" ]; then
