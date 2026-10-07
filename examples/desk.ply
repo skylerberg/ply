@@ -8,6 +8,8 @@
 //! and over TLS it is given a credential and told its name: `--tls desk=CERT,KEY --set DESK_TLS=desk`.
 
 import std.net (net, send_all)
+import std.net
+import std.ip
 // Twice, and both are needed: the selective import binds the effect name, so that a row and a
 // perform can both say `db.query[items]`, and the plain import binds the module, so that a type
 // can say `db::Answer` and a call can say `db::transaction`.
@@ -44,7 +46,7 @@ effect set Serving = {Desk, trace.enter[http], trace.exit[http], trace.event[htt
 /// What the *entry point* performs, which is `Serving` without the database: a run reads where to
 /// reach its database and serves every `db` operation from there, so no row names `db` and a host
 /// needs no database of its own.
-effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
+effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
 // A task per connection, when the settings ask for one.
 // The line that says which port the desk landed on.
 
@@ -249,8 +251,9 @@ pub fn connections_of(configured: Option<String>) -> Result<Int, String> / {abor
 
 pub type Storage = | Postgres | Memory
 
-/// One connection answered at a time, or a task for each.
-pub type Accept = | Sequential | TaskPerConnection
+/// One connection answered at a time, a task for each, or a pool of workers that sheds load past a
+/// bounded queue and drains at a stop.
+pub type Accept = | Sequential | TaskPerConnection | Pooled(http::Shedding)
 
 /// How a run serves the desk, read once at start-up.
 pub type Settings = {
@@ -297,10 +300,11 @@ fn accept_of(configured: Option<String>) -> Result<Accept, String> =
     None -> Ok(Sequential),
     Some("sequential") -> Ok(Sequential),
     Some("task-per-connection") -> Ok(TaskPerConnection),
+    Some("pooled") -> Ok(Pooled(http::default_shedding())),
     Some(other) ->
       Err(
-        accept_key() ++ " is `" ++ other ++ "`; the loops are `sequential` and "
-          ++ "`task-per-connection`",
+        accept_key() ++ " is `" ++ other ++ "`; the loops are `sequential`, "
+          ++ "`task-per-connection` and `pooled`",
       ),
   }
 
@@ -1069,18 +1073,33 @@ pub fn serve_connection(
   // A limit that is zero or negative is a configuration nobody meant, and it is refused here rather
   // than turning into a service that answers 413 to everything.
   http::check_limits(l);
-  turn(c, l, b"", l.max_keep_alive, false);
+  turn(c, l, b"", l.max_keep_alive, false, || false);
   net.close[conn](c)
 }
 
-fn turn(
+/// `serve_connection` until `stop` is closed, and drained after: the request in hand is answered
+/// with `Connection: close` unless one is already read behind it, and a connection between requests
+/// is closed rather than waited on.
+pub fn serve_connection_until(
+  c: Int,
+  l: http::Limits,
+  stop: Chan<Unit>,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], net.close[conn], task.select, abort.raise} = {
+  http::check_limits(l);
+  turn(c, l, b"", l.max_keep_alive, false, || http::stopped_by(stop));
+  net.close[conn](c)
+}
+
+fn turn<| e>(
   c: Int,
   l: http::Limits,
   carried: Bytes,
   left: Int,
   reused: Bool,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
-  if left <= 0 { () } else {
+  stopping: () -> Bool / e,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} =
+  if left <= 0 { () }
+  else if reused && bytes_len(carried) == 0 && stopping() { () } else {
     match http::read_head[conn](c, carried, l, reused) {
       // The peer went away. There is nothing to answer and nothing to say.
       http::HeadClosed(_) -> (),
@@ -1096,18 +1115,19 @@ fn turn(
           false,
           http::text_response(408, "the request head did not arrive\n"),
         ),
-      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left - 1),
+      http::HeadBytes(read) -> heard(c, l, read.buf, read.complete, left - 1, stopping),
     }
   }
 
 /// From here on `left` is how many requests the connection may serve after this one.
-fn heard(
+fn heard<| e>(
   c: Int,
   l: http::Limits,
   buf: Bytes,
   complete: Bool,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
+  stopping: () -> Bool / e,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} =
   match http::parse_head(buf, l) {
     // The head stopped mid-way with nothing more coming, or it ran past the bound without a
     // terminator.
@@ -1134,16 +1154,17 @@ fn heard(
     // where the next message begins, so there is nothing to resynchronise to.
     http::Refused(why) ->
       write_out(c, l, http::Get, http::Http11, false, http::refusal_response(why)),
-    http::Parsed(h) -> continued(c, l, h, buf, left),
+    http::Parsed(h) -> continued(c, l, h, buf, left, stopping),
   }
 
-fn continued(
+fn continued<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
   buf: Bytes,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} = {
+  stopping: () -> Bool / e,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
   // A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
   // nothing to read.
   let told = if h.expects_continue {
@@ -1157,17 +1178,19 @@ fn continued(
       h,
       http::read_body[conn](c, h.framing, bytes_slice(buf, h.consumed, bytes_len(buf)), l),
       left,
+      stopping,
     )
   }
 }
 
-fn with_body(
+fn with_body<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
   body: http::BodyResult,
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} =
+  stopping: () -> Bool / e,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} =
   match body {
     http::BodyTimedOut ->
       write_out(
@@ -1181,18 +1204,21 @@ fn with_body(
     http::BodyClosed -> (),
     http::BodyRefused(why) ->
       write_out(c, l, h.request.method, h.request.version, false, http::refusal_response(why)),
-    http::Body(got) -> answered(c, l, h, got, left),
+    http::Body(got) -> answered(c, l, h, got, left, stopping),
   }
 
-fn answered(
+fn answered<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
   got: { bytes: Bytes, rest: Bytes, trailers: http::Headers },
   left: Int,
-) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise} = {
-  let keep = h.keep_alive && left > 0;
+  stopping: () -> Bool / e,
+) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
   let reply = answer(whole(h, got.bytes, got.trailers));
+  // A stop seen once the answer is ready makes it the connection's last, unless a request is
+  // already read behind it.
+  let keep = h.keep_alive && left > 0 && !(bytes_len(got.rest) == 0 && stopping());
   let wrote = match streamable(h.request.method, reply) {
     Buffered(r) ->
       send_all[conn](
@@ -1207,7 +1233,7 @@ fn answered(
   if wrote && keep {
     // Pipelined requests are answered in order by construction: one connection, one task, and the
     // leftover buffer carried into the next turn.
-    turn(c, l, got.rest, left, true)
+    turn(c, l, got.rest, left, true, stopping)
   } else { () }
 }
 
@@ -1289,6 +1315,18 @@ fn spawned(
     else { spawned(listener, l, left - 1, push(running, task.spawn(|| serve_connection(c, l)))) }
   }
 
+/// The same budget answered by `shedding.workers` tasks over a bounded queue: a connection that
+/// finds it full, or that waited in it too long, is answered 503 with `Retry-After`, and when the
+/// listener is closed under the loop every connection already taken is answered before it returns.
+pub fn serve_pooled(
+  listener: Int,
+  l: http::Limits,
+  count: Int,
+  shedding: http::Shedding,
+) -> http::Pooled / {task.write, clock.read, Serving, net.accept[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
+  http::pooled[listener, conn](listener, count, l, shedding, |c: Int, stop: Chan<Unit>|
+    serve_connection_until(c, l, stop))
+
 fn joined(tasks: List<Task<Unit>>) -> Int / {task.write, abort.raise} =
   fold(tasks, 0, |n: Int, t: Task<Unit>| {
     task.join(t);
@@ -1310,7 +1348,7 @@ pub fn listen_and_serve(
 /// port 0 is found.
 pub fn listening(
   s: Settings,
-) -> Int / {task.write, Serving, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], process.out[proc], abort.raise} = {
+) -> Int / {task.write, clock.read, Serving, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], process.out[proc], abort.raise} = {
   let listener = match s.tls {
     None -> net.listen[listener](s.port),
     Some(credential) -> net.listen_tls[listener](s.port, credential),
@@ -1322,6 +1360,7 @@ pub fn listening(
   let served = match s.accept {
     Sequential -> serve(listener, limits(), s.connections),
     TaskPerConnection -> serve_each(listener, limits(), s.connections),
+    Pooled(shedding) -> serve_pooled(listener, limits(), s.connections, shedding).served,
   };
   net.close[listener](listener);
   served
@@ -2266,6 +2305,16 @@ test "each way of running the desk is a setting, and a value it does not know re
     ),
     Ok({ port: 0, connections: 9, store: Memory, tls: Some("desk"), accept: TaskPerConnection }),
   );
+  assert_eq(
+    settings_of(port: Some("0"), accept: Some("pooled")),
+    Ok({
+      port: 0,
+      connections: 64,
+      store: Postgres,
+      tls: None,
+      accept: Pooled(http::default_shedding()),
+    }),
+  );
   match settings_of(port: Some("8137"), store: Some("sqlite")) {
     Ok(_) -> panic("`sqlite` is not a store the desk has"),
     Err(why) -> assert(mentions(why, b"DESK_STORE")),
@@ -2335,6 +2384,63 @@ test "a signal drains the accept loop with no source change" {
       } }
     } }
   } }
+}
+
+/// What `count` clients each asking for `path` once were answered by a pooled desk of one worker
+/// and a queue of one, and how the pool counted them.
+fn pooled_run(count: Int, path: String) -> net::Over<http::Pooled> / {sim.read, abort.raise} = {
+  let asked = bytes_of_string(
+    "GET " ++ path ++ " HTTP/1.1\r\nHost: desk.example\r\nConnection: close\r\n\r\n",
+  );
+  let callers = fold(range(0, count), net::mem_empty(), |m: net::MemNet, i: Int|
+    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Says(asked)]));
+  twin(Some(secret_of_string(twin_key())), ||
+    net::on_mem(callers, ||
+      simulate {
+        let listener = net.listen[listener](0);
+        serve_pooled(listener, limits(), 10, { ..http::default_shedding(), workers: 1, queue: 1 })
+      }))
+}
+
+test "a pooled desk sheds what its queue cannot hold, and answers every connection it took" {
+  let ran = pooled_run(2, "/health");
+  let p = ran.value;
+  // Whether the one worker was free as each arrived is the schedule's to say, in every one of them.
+  assert_eq(p.served + p.shed_full + p.shed_late, 2);
+  assert(p.served >= 1);
+  let wrote = map(range(2, 4), |c: Int| net::mem_sent(ran.net, c));
+  assert_eq(len(filter(wrote, |w: Bytes| status_of(w) == 200)), p.served);
+  assert_eq(
+    len(
+      filter(wrote, |w: Bytes|
+        status_of(w) == 503 && bytes_index_of(w, b"retry-after: 1\r\n") != None),
+    ),
+    p.shed_full,
+  );
+  // Each connection taken was answered once and closed: the stop drained it.
+  assert_eq(len(ran.net.closed), 2)
+}
+
+test "a kept-alive desk connection under a stop is answered as its last, and not waited on" {
+  let ran = twin(Some(secret_of_string(twin_key())), ||
+    net::on_mem(
+      net::mem_calling(net::mem_empty(), ip::socket_at(ip::loopback_v4(), 4000), [
+        net::Says(get_line("/health")),
+        net::Silent,
+      ]),
+      ||
+        simulate {
+          let stop: Chan<Unit> = task.channel(0);
+          task.close(stop);
+          let listener = net.listen[listener](0);
+          serve_connection_until(net.accept[listener](listener), limits(), stop)
+        },
+    ));
+  let wrote = net::mem_sent(ran.net, 2);
+  assert_eq(status_of(wrote), 200);
+  assert(bytes_index_of(wrote, b"Connection: close\r\n") != None);
+  assert_eq(len(net::mem_deadlines(ran.net, 2)), 1);
+  assert_eq(ran.net.closed, [2])
 }
 
 // The other half of the drain, from the client's side: while a stop is pending but the listener is
