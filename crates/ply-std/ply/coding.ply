@@ -1,0 +1,505 @@
+//! Content codings (RFC 9110 §8.4): `gzip`, `deflate`, `br` and `zstd`, written and read through
+//! `std.gzip`, `std.brotli` and `std.zstd`, chosen by `Accept-Encoding`.
+//!
+//! `negotiate` weighs a request's `Accept-Encoding` by RFC 9110 §12.5.3: the coding of the most
+//! weight among those offered, the earlier offer of two that weigh alike, `identity` unless the
+//! field refuses it, and `None` where nothing offered is acceptable. `encoded` codes a response
+//! for the request it answers: a 200 whose type is text, or another type that compresses, and
+//! whose body is at least `min_size` bytes, with no coding or range of its own. Media that are
+//! compressed already (images, audio, video, archives) are left as they are. Whatever it decides,
+//! a response that could have been coded says it varies by `Accept-Encoding`, and a strong entity
+//! tag of one that is coded becomes weak, since the coded bytes are another representation of
+//! the same resource.
+//!
+//! `decoded_body` undoes the codings a request body names, the last applied first, and every
+//! step under one bound on the bytes it may answer: a body that would decode past it is refused
+//! (`TooLarge`, 413) before it is allocated, so a decompression bomb is a refusal. A coding this
+//! module does not read is `Unsupported` (415), and a body that does not decode `Damaged` (400).
+//!
+//! `fetch` is `std.http`'s, offering every coding here and decoding the answer under
+//! `Limits.max_body`. A coded body is held whole in each direction: `std.http`'s messages carry
+//! their body as `Bytes`, and a body coded or decoded as it streams is `std.gzip`'s, `std.brotli`'s
+//! and `std.zstd`'s `encoded` and `decoded` over a `std.seq` of chunks, which a streamed message
+//! would hand them.
+
+import std.brotli
+import std.cookie
+import std.cookie (Jar)
+import std.dns
+import std.dns (dns)
+import std.gzip
+import std.http
+import std.http (Headers, Method, Request, Response)
+import std.ip
+import std.ip (ip)
+import std.list (drop, reverse)
+import std.mime
+import std.net
+import std.net (net)
+import std.string (ascii_lower, ascii_trim, join)
+import std.task
+import std.url
+import std.url (Url)
+import std.zstd
+
+/// A content coding.
+pub type Coding = | Identity | Gzip | Deflate | Br | Zstd
+
+/// How a field names the coding.
+pub fn name(c: Coding) -> String =
+  match c {
+    Identity -> "identity",
+    Gzip -> "gzip",
+    Deflate -> "deflate",
+    Br -> "br",
+    Zstd -> "zstd",
+  }
+
+/// The coding a field's token names, `x-gzip` as `gzip`, without regard to case.
+pub fn of_name(text: String) -> Option<Coding> = {
+  let t = ascii_lower(ascii_trim(text));
+  if t == "identity" { Some(Identity) }
+  else if t == "gzip" || t == "x-gzip" { Some(Gzip) }
+  else if t == "deflate" { Some(Deflate) }
+  else if t == "br" { Some(Br) }
+  else if t == "zstd" { Some(Zstd) }
+  else { None }
+}
+
+/// The codings a server offers, in the order it prefers them where a client weighs them alike.
+pub fn preferred() -> List<Coding> = [Zstd, Br, Gzip, Deflate]
+
+// --- Negotiation ------------------------------------------------------------
+
+/// One entry of `Accept-Encoding`: a coding's token in lower case, or `*`, and its weight in
+/// thousandths.
+pub type Weighted = { token: String, weight: Int }
+
+/// The entries of the `Accept-Encoding` fields `fields` holds, in order; `None` where one does not
+/// read, which a server treats as a field it did not get.
+pub fn read_accept(fields: List<String>) -> Option<List<Weighted>> / {abort.raise} =
+  fold(fields, Some([]), |acc: Option<List<Weighted>>, field: String|
+    fold(string_split(field, ","), acc, |inner: Option<List<Weighted>>, piece: String|
+      match inner {
+        None -> None,
+        Some(found) -> if string_len(ascii_trim(piece)) == 0 { inner }
+        else { match entry_of(piece) { Some(w) -> Some(push(found, w)), None -> None } },
+      }))
+
+fn entry_of(piece: String) -> Option<Weighted> / {abort.raise} = {
+  let parts = string_split(piece, ";");
+  let token = ascii_lower(ascii_trim(match list_at(parts, 0) { Some(t) -> t, None -> "" }));
+  if string_len(token) == 0 || !(token == "*" || mime::is_token(token)) { None } else {
+    let weight = fold(drop(parts, 1), Some(1000), |w: Option<Int>, param: String| {
+      let p = ascii_trim(param);
+      if string_starts_with(ascii_lower(p), "q=") { thousandths(string_slice(p, 2, string_len(p))) }
+      else { w }
+    });
+    match weight { Some(n) -> Some({ token: token, weight: n }), None -> None }
+  }
+}
+
+/// A weight of RFC 9110 §12.4.2, `0` to `1` with at most three decimals, in thousandths.
+fn thousandths(q: String) -> Option<Int> / {abort.raise} = {
+  let b = bytes_of_string(q);
+  let n = bytes_len(b);
+  let digits = fold(range(2, n), true, |ok: Bool, i: Int|
+    ok && bytes_at(b, i) >= 0x30 && bytes_at(b, i) <= 0x39);
+  if n == 0 || n > 5 || (n > 1 && (bytes_at(b, 1) != 0x2e || !digits)) { None } else {
+    let whole = bytes_at(b, 0) - 0x30;
+    let fraction = fold(range(2, 5), 0, |acc: Int, i: Int|
+      acc * 10 + (if i < n { bytes_at(b, i) - 0x30 } else { 0 }));
+    if (whole == 0 || whole == 1) && whole * 1000 + fraction <= 1000 {
+      Some(whole * 1000 + fraction)
+    } else { None }
+  }
+}
+
+/// The weight `entries` give a coding: its own entry's, or `*`'s where it has none. `identity`
+/// takes 1000 where nothing names it or `*`.
+fn weight_for(entries: List<Weighted>, c: Coding) -> Int = {
+  let own = fold(entries, None, |w: Option<Int>, e: Weighted|
+    if e.token == name(c) || (c == Gzip && e.token == "x-gzip") { Some(e.weight) } else { w });
+  let star = fold(entries, None, |w: Option<Int>, e: Weighted|
+    if e.token == "*" { Some(e.weight) } else { w });
+  match own {
+    Some(n) -> n,
+    None -> match star { Some(n) -> n, None -> if c == Identity { 1000 } else { 0 } },
+  }
+}
+
+/// The coding to answer a request whose `Accept-Encoding` fields are `fields` with, of `offered`;
+/// `identity` where no field was sent, and where the field weighs none of the offers above it
+/// and does not refuse it; `None` where it refuses every offer and `identity` too.
+pub fn negotiate(fields: List<String>, offered: List<Coding>) -> Option<Coding> / {abort.raise} =
+  match fields {
+    [] -> Some(Identity),
+    _ -> match read_accept(fields) {
+      None -> Some(Identity),
+      Some(entries) -> {
+        let best = fold(
+          offered,
+          { pick: Identity, weight: weight_for(entries, Identity) },
+          |b: { pick: Coding, weight: Int }, c: Coding| {
+            let w = weight_for(entries, c);
+            if w > b.weight || (w == b.weight && w > 0 && b.pick == Identity) {
+              { pick: c, weight: w }
+            } else { b }
+          },
+        );
+        if best.weight > 0 { Some(best.pick) } else { None }
+      },
+    },
+  }
+
+// --- Coding and decoding ----------------------------------------------------
+
+/// `body` written in `c`.
+pub fn encode(body: Bytes, c: Coding) -> Bytes / {abort.raise} =
+  match c {
+    Identity -> body,
+    Gzip -> gzip::gzip(body),
+    Deflate -> gzip::zlib(body),
+    Br -> brotli::compress(body, brotli::Fast),
+    Zstd -> zstd::compress(body, zstd::Fast),
+  }
+
+/// Why a coded body is not decoded.
+pub type Refused =
+  /// It names a coding this module does not read.
+  | Unsupported(String)
+  /// It decodes to more than the bound, which is this many bytes.
+  | TooLarge(Int)
+  /// It does not decode in the coding it names.
+  | Damaged(String)
+
+/// The status a request is refused with for `r`.
+pub fn refusal_status(r: Refused) -> Int =
+  match r { Unsupported(_) -> 415, TooLarge(_) -> 413, Damaged(_) -> 400 }
+
+/// What `body`, written in `c`, decodes to, at most `limit` bytes of it.
+pub fn decode(body: Bytes, c: Coding, limit: Int) -> Result<Bytes, Refused> / {abort.raise} =
+  match c {
+    Identity -> if bytes_len(body) > limit { Err(TooLarge(limit)) } else { Ok(body) },
+    Gzip -> match gzip::try_gunzip(body, limit) {
+      Ok(b) -> Ok(b),
+      Err(r) -> Err(if r.why == gzip::OverLimit { TooLarge(limit) } else { Damaged("gzip") }),
+    },
+    Deflate -> match gzip::try_unzlib(body, limit) {
+      Ok(b) -> Ok(b),
+      Err(r) -> Err(if r.why == gzip::OverLimit { TooLarge(limit) } else { Damaged("deflate") }),
+    },
+    Br -> match brotli::try_decompress(body, { output: limit, window: 16777216 }) {
+      Ok(b) -> Ok(b),
+      Err(r) -> Err(if r.why == brotli::OverLimit { TooLarge(limit) } else { Damaged("br") }),
+    },
+    Zstd -> match zstd::try_decompress(body, { output: limit, window: 8388608 }) {
+      Ok(b) -> Ok(b),
+      Err(r) -> Err(if r.why == zstd::OverLimit { TooLarge(limit) } else { Damaged("zstd") }),
+    },
+  }
+
+/// The codings a `Content-Encoding` field lists, in the order they were applied; `Err` names the
+/// first this module does not read.
+pub fn codings_of(fields: List<String>) -> Result<List<Coding>, String> / {abort.raise} =
+  fold(fields, Ok([]), |acc: Result<List<Coding>, String>, field: String|
+    fold(string_split(field, ","), acc, |inner: Result<List<Coding>, String>, piece: String|
+      match inner {
+        Err(_) -> inner,
+        Ok(found) -> if string_len(ascii_trim(piece)) == 0 { inner } else {
+          match of_name(piece) {
+            Some(Identity) -> inner,
+            Some(c) -> Ok(push(found, c)),
+            None -> Err(ascii_trim(piece)),
+          }
+        },
+      }))
+
+/// A message body whose `Content-Encoding` is `headers`', decoded, the last coding applied first,
+/// at most `limit` bytes at every step.
+pub fn decoded_body(
+  headers: Headers,
+  body: Bytes,
+  limit: Int,
+) -> Result<Bytes, Refused> / {abort.raise} =
+  match codings_of(http::header_lines(headers, "content-encoding")) {
+    Err(token) -> Err(Unsupported(token)),
+    Ok(codings) ->
+      fold(reverse(codings), Ok(body), |acc: Result<Bytes, Refused>, c: Coding|
+        match acc { Ok(b) -> decode(b, c, limit), Err(_) -> acc }),
+  }
+
+/// `req` with its body decoded and its `Content-Encoding` gone, or the response that refuses it.
+pub fn decoded_request(req: Request, limit: Int) -> Result<Request, Response> / {abort.raise} =
+  match decoded_body(req.headers, req.body, limit) {
+    Ok(body) -> Ok({ ..req, body: body, headers: map_remove(req.headers, "content-encoding") }),
+    Err(r) -> Err(http::text_response(refusal_status(r), refusal_text(r))),
+  }
+
+fn refusal_text(r: Refused) -> String / {abort.raise} =
+  match r {
+    Unsupported(token) -> "the body is coded as `" ++ token ++ "`, which is not read here\n",
+    TooLarge(n) -> "the body decodes to more than " ++ int_to_string(n) ++ " bytes\n",
+    Damaged(c) -> "the body does not decode as " ++ c ++ "\n",
+  }
+
+// --- Responses --------------------------------------------------------------
+
+/// Whether a type is worth coding: text, and the types of structured text, scripts, fonts and
+/// images that are text; nothing compressed already.
+pub fn compressible(content_type: String) -> Bool / {abort.raise} =
+  match mime::parse(content_type) {
+    Err(_) -> false,
+    Ok(m) -> {
+      let top = mime::top_level(m);
+      let sub = mime::subtype(m);
+      top == "text" || string_ends_with(sub, "+json") || string_ends_with(sub, "+xml")
+        || (top == "application"
+        && (sub == "json" || sub == "javascript" || sub == "xml" || sub == "wasm"
+        || sub == "x-www-form-urlencoded"
+        || sub == "graphql"))
+        || (top == "image" && (sub == "svg+xml" || sub == "bmp" || sub == "x-icon"))
+        || (top == "font" && (sub == "ttf" || sub == "otf"))
+    },
+  }
+
+/// `res`, the answer to a request whose fields are `request`, coded as the request prefers among
+/// `offered`, where it is a 200 of a compressible type of at least `min_size` bytes with no
+/// coding or range of its own. A response that could have been coded says it varies by
+/// `Accept-Encoding`, coded or not.
+pub fn encoded(
+  request: Headers,
+  res: Response,
+  offered: List<Coding>,
+  min_size: Int,
+) -> Response / {abort.raise} = {
+  let kind = http::header(res.headers, "content-type");
+  let eligible = res.status == 200 && !http::has_header(res.headers, "content-encoding")
+    && !http::has_header(res.headers, "content-range")
+    && (match kind { Some(k) -> compressible(k), None -> false });
+  if !eligible { res } else {
+    let varied = http::vary(res, "Accept-Encoding");
+    if bytes_len(res.body) < min_size { varied } else {
+      match negotiate(http::header_lines(request, "accept-encoding"), offered) {
+        Some(Identity) -> varied,
+        None -> varied,
+        Some(c) -> {
+          let fields = http::set_header(varied.headers, "content-encoding", name(c));
+          {
+            status: varied.status,
+            headers: match http::header(fields, "etag") {
+              Some(tag) -> if string_starts_with(tag, "W/") { fields }
+              else { http::set_header(fields, "etag", "W/" ++ tag) },
+              None -> fields,
+            },
+            body: encode(varied.body, c),
+          }
+        },
+      }
+    }
+  }
+}
+
+/// `app` with its request's body decoded under `limit` and its answer coded as `encoded` codes
+/// one, offering every coding here and coding nothing under 256 bytes.
+pub fn serving<| e>(
+  req: Request,
+  limit: Int,
+  app: (Request) -> Response / e,
+) -> Response / {abort.raise | e} =
+  match decoded_request(req, limit) {
+    Err(refused) -> refused,
+    Ok(plain) -> encoded(req.headers, app(plain), preferred(), 256),
+  }
+
+// --- The client -------------------------------------------------------------
+
+/// `http::fetch`, saying in `Accept-Encoding` that it reads every coding here and decoding the
+/// answer's body, at most `Limits.max_body` bytes of it; an answer that does not decode is
+/// `Malformed` with 502.
+pub fn fetch<[l]>(
+  method: Method,
+  to: Url,
+  headers: Headers,
+  body: Bytes,
+  jar: Jar,
+  options: http::Fetching,
+  now: Instant,
+) -> Result<http::Fetched, http::FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
+  let offered = http::set_header(headers, "accept-encoding", join(map(preferred(), name), ", "));
+  match http::fetch[l](method, to, offered, body, jar, options, now) {
+    Err(e) -> Err(e),
+    Ok(f) -> match decoded_body(f.response.headers, f.response.body, options.limits.max_body) {
+      Ok(plain) ->
+        Ok({
+          ..f,
+          response: {
+            ..f.response,
+            body: plain,
+            headers: map_remove(f.response.headers, "content-encoding"),
+          },
+        }),
+      Err(r) -> Err(http::NoAnswer(http::Malformed({ status: 502, reason: refusal_text(r) }))),
+    },
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn accept(field: String) -> List<String> = if string_len(field) == 0 { [] } else { [field] }
+
+test "a coding is chosen by its weight, then by the server's order: {c.field}" for c: { field: String, chosen: Option<Coding> } in [
+    { field: "", chosen: Some(Identity) },
+    { field: "gzip", chosen: Some(Gzip) },
+    { field: "gzip, br", chosen: Some(Br) },
+    { field: "gzip;q=1.0, br;q=0.5", chosen: Some(Gzip) },
+    { field: "*", chosen: Some(Zstd) },
+    { field: "*;q=0.2, br;q=0", chosen: Some(Zstd) },
+    { field: "br;q=0, zstd;q=0, gzip;q=0, deflate;q=0", chosen: Some(Identity) },
+    { field: "identity;q=0, br;q=0, zstd;q=0, gzip;q=0, deflate;q=0", chosen: None },
+    { field: "*;q=0", chosen: None },
+    { field: "x-gzip", chosen: Some(Gzip) },
+    { field: "compress", chosen: Some(Identity) },
+    { field: "gzip;q=2", chosen: Some(Identity) },
+    { field: "gzip;q=0.0001", chosen: Some(Identity) },
+  ] { assert_eq(negotiate(accept(c.field), preferred()), c.chosen) }
+
+fn page() -> Bytes =
+  bytes_of_string(
+    fold(range(0, 40), "", |acc: String, i: Int|
+      acc ++ "<li>part " ++ int_to_string(i) ++ " in stock</li>\n"),
+  )
+
+fn served(kind: String, status: Int, body: Bytes) -> Response =
+  {
+    status: status,
+    headers: http::set_header(
+      http::set_header(http::empty_headers(), "content-type", kind),
+      "etag",
+      "\"v1\"",
+    ),
+    body: body,
+  }
+
+test "every coding reads back what it wrote" {
+  assert(all_read_back([Identity, Gzip, Deflate, Br, Zstd]))
+}
+
+fn all_read_back(cs: List<Coding>) -> Bool / {abort.raise} =
+  fold(cs, true, |ok: Bool, c: Coding| ok && decode(encode(page(), c), c, 1000000) == Ok(page()))
+
+test "a text answer is coded as the request prefers, says it varies, and weakens its tag" {
+  let request = http::set_header(http::empty_headers(), "accept-encoding", "gzip, br;q=0.5");
+  let r = encoded(request, served("text/html; charset=utf-8", 200, page()), preferred(), 256);
+  assert_eq(http::header(r.headers, "content-encoding"), Some("gzip"));
+  assert_eq(http::header(r.headers, "vary"), Some("Accept-Encoding"));
+  assert_eq(http::header(r.headers, "etag"), Some("W/\"v1\""));
+  assert(bytes_len(r.body) < bytes_len(page()));
+  assert_eq(decoded_body(r.headers, r.body, 1000000), Ok(page()))
+}
+
+test "what is not worth coding is left as it is: {c.what}" for c: { what: String, kind: String, status: Int, size: Int, varied: Bool } in [
+    { what: "an image", kind: "image/png", status: 200, size: 2000, varied: false },
+    { what: "an archive", kind: "application/zip", status: 200, size: 2000, varied: false },
+    { what: "a small page", kind: "text/html", status: 200, size: 100, varied: true },
+    { what: "a partial answer", kind: "text/plain", status: 206, size: 2000, varied: false },
+  ] {
+  let request = http::set_header(http::empty_headers(), "accept-encoding", "gzip");
+  let body = bytes_slice(bytes_concat(page(), page()), 0, c.size);
+  let r = encoded(request, served(c.kind, c.status, body), preferred(), 256);
+  assert_eq(http::header(r.headers, "content-encoding"), None);
+  assert_eq(r.body, body);
+  assert_eq(http::header(r.headers, "vary") != None, c.varied)
+}
+
+test "a coded request body is decoded, and one that would decode past the bound is refused" {
+  let zeros = bytes_of_string(
+    fold(range(0, 64), "", |acc: String, _i: Int| acc ++ "0000000000000000"),
+  );
+  let coded = |c: Coding| {
+    let bare = http::request_to(http::Post, "x", "/", encode(zeros, c));
+    { ..bare, headers: http::set_header(http::empty_headers(), "content-encoding", name(c)) }
+  };
+  assert(
+    fold([Gzip, Deflate, Br, Zstd], true, |ok: Bool, c: Coding|
+      ok
+        && decoded_request(coded(c), 1024)
+        == Ok({ ..coded(c), body: zeros, headers: http::empty_headers() })),
+  );
+  assert(
+    fold([Gzip, Deflate, Br, Zstd], true, |ok: Bool, c: Coding|
+      ok && (match decoded_request(coded(c), 100) { Err(r) -> r.status == 413, Ok(_) -> false })),
+  );
+  let stacked = {
+    ..http::request_to(http::Post, "x", "/", encode(encode(zeros, Gzip), Br)),
+    headers: http::set_header(http::empty_headers(), "content-encoding", "gzip, br"),
+  };
+  assert_eq(decoded_body(stacked.headers, stacked.body, 4096), Ok(zeros));
+  let unknown = {
+    ..stacked,
+    headers: http::set_header(http::empty_headers(), "content-encoding", "compress"),
+  };
+  assert_eq(decoded_body(unknown.headers, unknown.body, 4096), Err(Unsupported("compress")));
+  let broken = {
+    ..stacked,
+    headers: http::set_header(http::empty_headers(), "content-encoding", "gzip"),
+  };
+  assert_eq(decoded_body(broken.headers, b"not gzip", 4096), Err(Damaged("gzip")))
+}
+
+test "a server's answer over a connection is coded as its client asked, and its client reads it" {
+  let asked = b"GET /parts HTTP/1.1\r\nHost: shop.example\r\nAccept-Encoding: br\r\nConnection: close\r\n\r\n";
+  let served_over = net::on_mem(
+    net::mem_calling(net::mem_empty(), ip::read_socket("198.51.100.4:5000"), [net::Says(asked)]),
+    || {
+      let listener = net.listen[listener](0);
+      http::serve_connection[conn](
+        net.accept[listener](listener),
+        http::default_limits(),
+        |req: Request| serving(req, 1048576, |_r: Request| served("text/html", 200, page())),
+      )
+    },
+  );
+  let answer = net::mem_sent(served_over.net, 2);
+  assert(string_contains(string_of_bytes_lossy(answer), "content-encoding: br\r\n"));
+  let world = net::mem_serving(
+    net::mem_resolving(
+      net::mem_empty(),
+      dns::with_name(dns::table(), "shop.example", [ip::read("192.0.2.10")]),
+    ),
+    ip::read_socket("192.0.2.10:80"),
+    [[net::Says(answer)]],
+  );
+  let ran = net::on_mem(world, ||
+    simulate {
+      task::unbounded(||
+        fetch[site](
+          http::Get,
+          url"http://shop.example/parts",
+          http::empty_headers(),
+          b"",
+          cookie::jar(0),
+          http::fetching(),
+          Instant(0),
+        ))
+    });
+  match ran.value {
+    Ok(f) -> {
+      assert_eq(f.response.body, page());
+      assert_eq(http::header(f.response.headers, "content-encoding"), None)
+    },
+    Err(_) -> panic("the coded answer reads"),
+  };
+  assert(
+    string_contains(
+      string_of_bytes_lossy(net::mem_sent(ran.net, 1)),
+      "accept-encoding: zstd, br, gzip, deflate\r\n",
+    ),
+  )
+}
+
+law "a body coded in any coding decodes to itself under a bound that holds it"
+  forall (b: Bytes, which: Int) {
+    let c = match list_at(preferred(), (which % 4 + 4) % 4) { Some(x) -> x, None -> Gzip };
+    decode(encode(b, c), c, bytes_len(b)) == Ok(b)
+  }

@@ -2726,8 +2726,8 @@ checked against that declaration, so it performs none of it.
 
 | flag | meaning |
 | --- | --- |
-| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; a name given several times holds several certificates, and a handshake gets the one whose names cover the name the client asks for (SNI), or the first; a certificate whose files change is read again within a second and served without a restart, the one before kept where the new one does not load; sessions resume from tickets whose key rotates; `E0430` if it does not load, `E0429` if unnamed |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, still serves a client that presents none, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding); `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
@@ -3104,9 +3104,11 @@ so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
 publisher sent. `ply check`, `ply defs` and `ply run` of a whole project read the
 project's own modules the same way, from what the last of them kept beside the
-package: a module that still stands enters with its bodies cut out and its tests and
-laws as written, its rows answer for the bodies, and what the check warned of it is
-said again. Each answers as it does over every source; a run compiles what it runs
+package: a module that still stands enters with its function and test bodies cut
+out, the rest of its tests and its laws as written, its rows answer for the bodies,
+and what the check warned of it is said again; a test's body is cut only where its
+row and the hash its run fixed were kept, and otherwise the module is read from
+source. Each answers as it does over every source; a run compiles what it runs
 from source. `ply test` reads them from source, since a mutant and a bisection
 rewrite bodies. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
