@@ -642,8 +642,13 @@ case "${1:-}" in
     out=$(mktemp)
     status=0
     # Filters are alternatives, so one naming the whole module beside a case's would run every case.
+    # A part of a module's cases may hold none of them.
     named=0
-    for arg in "${@:2}"; do [[ $arg == --filter* ]] && named=1; done
+    parted=0
+    for arg in "${@:2}"; do
+      [[ $arg == --filter* ]] && named=1
+      [[ $arg == --shard* ]] && parted=1
+    done
     if ((named)); then
       tested "$cli_suite" "${@:2}" > "$out" || status=$?
     else
@@ -651,7 +656,7 @@ case "${1:-}" in
     fi
     listed "$out"
     selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
-    if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
+    if [ "$status" -ne 0 ] || { [ "$selected" -eq 0 ] && ! ((named && parted)); }; then
       [ "$selected" -gt 0 ] || echo "the sweep selected no case" >&2
       red "$out"
       rm -f "$out"
