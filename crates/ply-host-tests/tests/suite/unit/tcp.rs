@@ -1250,8 +1250,9 @@ fn issued() -> (
 #[test]
 fn an_outbound_tls_connection_is_verified_and_served_end_to_end() {
     let (_dir, spec, certificate) = issued();
-    let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[certificate])
-        .expect("the material loads");
+    let credentials =
+        ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[certificate], &[])
+            .expect("the material loads");
     let net = Arc::new(TcpHost::with_credentials(credentials));
     let binding = bind_tls(net.clone());
     let listener = int(perform(
@@ -1337,7 +1338,7 @@ fn an_outbound_tls_connection_is_verified_and_served_end_to_end() {
 #[test]
 fn an_untrusted_server_ends_the_connection_at_the_handshake() {
     let (_dir, spec, _certificate) = issued();
-    let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[])
+    let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[], &[])
         .expect("the material loads");
     let net = Arc::new(TcpHost::with_credentials(credentials));
     let binding = bind_tls(net.clone());
