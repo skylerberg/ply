@@ -2636,7 +2636,7 @@ fn after_head<[l] | e>(
         peer: from.peer,
         client_certificate: from.certificate,
       };
-      let out = exchanged[l](c, limits, app, req, head, rest, keep);
+      let out = exchanged[l](c, limits, app, req, head, rest, keep, || watched && stopping());
       if out.keep { connection_loop(c, limits, app, watched, stopping, from, out.rest, left, true) }
       else { () }
     },
@@ -2682,8 +2682,9 @@ type Inbound = {
 type Exchanged = { keep: Bool, rest: Bytes }
 
 /// One request answered: `app` called, its answer written, and its body read past where `app` did
-/// not read it all. The body's reads are answered from the connection, its refusal with its
-/// status where no answer has begun, after which the connection closes.
+/// not read it all, unless `closing` says by then that the connection ends after this answer. The
+/// body's reads are answered from the connection, its refusal with its status where no answer has
+/// begun, after which the connection closes.
 fn exchanged<[l] | e>(
   c: Int,
   limits: Limits,
@@ -2692,6 +2693,7 @@ fn exchanged<[l] | e>(
   head: Head,
   rest: Bytes,
   keep: Bool,
+  closing: () -> Bool / e,
 ) -> Exchanged / {abort.raise, net.recv[l], net.send[l] | e} = {
   let start: Inbound = {
     state: body_start(head.framing, limits),
@@ -2710,8 +2712,10 @@ fn exchanged<[l] | e>(
         let held = cell_get(cell);
         cell_set(cell, { ..held, started: true });
         // A client still holding its body back for a `100` is answered without it, and the
-        // connection ends there.
-        respond[l](c, limits, req.method, req.version, keep && held.continued, res)
+        // connection ends there, as it does where a stop came before the answer with the body
+        // left unread: nothing waits on a body for a request the connection will not carry.
+        let kept = keep && held.continued && (held.ended || !closing());
+        respond[l](c, limits, req.method, req.version, kept, res)
       } with {
         incoming.pull() -> {
           let p = pulled[l](c, limits, cell_get(cell));
@@ -5720,6 +5724,29 @@ test "once stopped a connection answers what it has read, the last answer closin
     net::mem_sent(two, served_conn()),
     bytes_concat(answer_of(200, "GET /a|", true), answer_of(200, "GET /b|", false)),
   )
+}
+
+test "a stop that comes while a handler answers without reading its body closes the connection unread" {
+  let n = net::on_mem(
+    net::mem_calling(net::mem_empty(), caller(), [
+      Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n"),
+      Silent,
+    ]),
+    ||
+      simulate {
+        let stop: Chan<Unit> = task.channel(0);
+        let listener = net.listen[listener](0);
+        let early = |req: Request| {
+          task.close(stop);
+          ignore_body_app(req)
+        };
+        serve_draining[conn](net.accept[listener](listener), default_limits(), stop, early)
+      },
+  ).net;
+  assert_eq(net::mem_sent(n, served_conn()), answer_of(200, "/a", false));
+  // The head's read alone waited: nothing waited on the body.
+  assert_eq(len(net::mem_deadlines(n, served_conn())), 1);
+  assert_eq(n.closed, [served_conn()])
 }
 
 test "a shed connection is told when to ask again" {
