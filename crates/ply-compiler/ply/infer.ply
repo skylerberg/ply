@@ -423,7 +423,7 @@ pub type Keying = {
 pub type KeptFacts = { name: Bytes, facts: Bytes }
 
 /// The name a test's sites are filed under: its module and its place among the module's tests,
-/// since two tests may share a label and a test may share a definition's name.
+/// since a test may share a definition's name.
 pub fn test_owner(module: Bytes, position: Int) -> Bytes =
   bytes_concat_all([module, b".test#", ascii_of_int(position)])
 
@@ -10585,14 +10585,35 @@ fn close_unreachable_row(checker: Checker, signature: Signature) -> Checker / {a
 // --- Tests and laws --------------------------------------------------------------------------------
 
 /// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
+/// The first of `labels` named `name`, where one is.
+fn labelled(labels: List<{ name: Bytes, span: Span }>, name: Bytes) -> Option<Span> =
+  fold(labels, None, |span: Option<Span>, l: { name: Bytes, span: Span }|
+    match span { Some(_) -> span, None -> if l.name == name { Some(l.span) } else { None } })
+
 fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let walked = fold(
     parsed.module.items,
-    { checker: checker, position: 0 },
-    |acc: { checker: Checker, position: Int }, item: Item|
+    { checker: checker, position: 0, labels: [] },
+    |acc: { checker: Checker, position: Int, labels: List<{ name: Bytes, span: Span }> }, item: Item|
       match item {
         ITest(def) -> {
-          let c: Checker = { ..acc.checker, scope: acc.checker.scope + 1 };
+          let seen: Checker = match labelled(acc.labels, def.name) {
+            None -> acc.checker,
+            Some(first) ->
+              report_error_at_and(
+                acc.checker,
+                b"E0105",
+                def.name_span,
+                bytes_concat_all([b"two tests are labelled ", debug_quoted(def.name)]),
+                b"relabelled here",
+                { module: acc.checker.module, span: first },
+                b"first labelled here",
+                [
+                  b"a test is keyed `<module>.<label>`, so one label names one test; a test over cases that shares another's body and case type can range over both tables at once",
+                ],
+              ),
+          };
+          let c: Checker = { ..seen, scope: seen.scope + 1 };
           let check = test_check(c, qualify(parsed.name, def.name));
           let owner = test_owner(parsed.name, acc.position);
           let footprint: WithAtoms = match known_test(c, parsed.name, acc.position, check) {
@@ -10685,6 +10706,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               walking: b"",
             },
             position: acc.position + 1,
+            labels: push(acc.labels, { name: def.name, span: def.name_span }),
           }
         },
         _ -> acc,
@@ -10859,11 +10881,7 @@ fn check_laws(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise}
       match item {
         ILaw(def) -> {
           let c: Checker = { ..acc.checker, scope: acc.checker.scope + 1 };
-          match fold(acc.labels, None, |span: Option<Span>, l: { name: Bytes, span: Span }|
-              match span {
-                Some(_) -> span,
-                None -> if l.name == def.name { Some(l.span) } else { None },
-              }) {
+          match labelled(acc.labels, def.name) {
             Some(first) ->
               {
                 ..acc,
@@ -17228,6 +17246,39 @@ fn refusals(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
       fold(diag.labels, b"", |acc: Bytes, label: Label|
         if label.primary { bytes_slice(src, label.start, label.end) } else { acc }),
     ])
+
+// A test is keyed `<module>.<label>` wherever a run names it: what it reaches, its check, its pass
+// and the body its cases are listed by. Two of one label would be one name for two tests.
+test "a test, as a law, is keyed by its label, so a module's second test of one label is refused by name" {
+  let prefix = b"fn one() -> Int = 1\n";
+  assert_eq(
+    refusals(
+      bytes_concat(
+        prefix,
+        b"test \"one is one\" { assert_eq(one(), 1) }\ntest \"one is one\" { assert(one() > 0) }",
+      ),
+    ),
+    [[b"E0105", b"two tests are labelled \"one is one\"", b"\"one is one\""]],
+  );
+  assert_eq(
+    refusals(
+      bytes_concat(
+        prefix,
+        b"law \"alike\" forall (n: Int) { one() + n == n + 1 }\nlaw \"alike\" forall (b: Bool) { b || !b }",
+      ),
+    ),
+    [[b"E0105", b"two laws are labelled \"alike\"", b"\"alike\""]],
+  );
+  assert_eq(
+    refusals(
+      bytes_concat(
+        prefix,
+        b"test \"one is one\" { assert_eq(one(), 1) }\ntest \"one is positive\" { assert(one() > 0) }\nlaw \"one is one\" forall (n: Int) { one() + n == n + 1 }",
+      ),
+    ),
+    [],
+  )
+}
 
 test "a declaration that mentions a `Cell` or a `Task` is refused at the type that mentions it" {
   assert_eq(refusals(b"type Held = Held(Task<Int>)"), [
