@@ -1,0 +1,89 @@
+//! A buffer grown through the record that holds it is appended to in place, whether the record is
+//! taken apart by a `let` pattern or a `match`, rebuilt by an update that reads the field it sets,
+//! or carried by `iterate` or `fold`: the bytes allocated grow with the buffer, where a copy at each
+//! step would make them grow with its square. A record something else still holds gives up
+//! nothing, and every holder reads what it was given.
+
+type S = { out: Bytes, n: Int }
+
+type T = | T(Bytes, Int)
+
+fn pattern(s: S, fuel: Int) -> Bytes = {
+  let { out, n } = s;
+  if n <= 0 || fuel <= 0 { out } else { pattern({ out: out ++ b"x", n: n - 1 }, fuel - 1) }
+}
+
+fn constructor(t: T, fuel: Int) -> Bytes =
+  match t {
+    T(out, n) -> if n <= 0 || fuel <= 0 { out }
+    else { constructor(T(out ++ b"x", n - 1), fuel - 1) },
+  }
+
+fn update(s: S, fuel: Int) -> Bytes =
+  if s.n <= 0 || fuel <= 0 { s.out }
+  else { update({ ..s, out: s.out ++ b"x", n: s.n - 1 }, fuel - 1) }
+
+fn iterated(n: Int) -> Bytes / {abort.raise} =
+  iterate({ out: b"", n: n }, n + 1, |s: S|
+    if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b"x", n: s.n - 1 }) })
+
+fn folded(n: Int) -> Bytes =
+  fold(range(0, n), { out: b"", n: 0 }, |s: S, _: Int| { out: s.out ++ b"x", n: s.n + 1 }).out
+
+fn shapes() -> List<String> =
+  [
+    "a `let` record pattern",
+    "a `match` on a constructor",
+    "an update that reads the field it sets",
+    "an `iterate` state",
+    "a `fold` accumulator",
+  ]
+
+/// `n` bytes appended one at a time through the shape named `name`.
+fn grown(name: String, n: Int) -> Bytes / {abort.raise} =
+  if name == "a `let` record pattern" { pattern({ out: b"", n: n }, n + 1) }
+  else if name == "a `match` on a constructor" { constructor(T(b"", n), n + 1) }
+  else if name == "an update that reads the field it sets" { update({ out: b"", n: n }, n + 1) }
+  else if name == "an `iterate` state" { iterated(n) }
+  else { folded(n) }
+
+test "through {s}, four times the appends allocate about four times the bytes" for s: String in shapes(
+  ) {
+  let small = metered(|| bytes_len(grown(s, 2000)));
+  let large = metered(|| bytes_len(grown(s, 8000)));
+  assert_eq(small.value, 2000);
+  assert_eq(large.value, 8000);
+  assert(
+    large.bytes < 6 * small.bytes,
+    Some(f"{small.bytes} bytes for 2000 appends, {large.bytes} for 8000"),
+  )
+}
+
+test "a record another binding holds gives up nothing, and each holder reads what it was given" {
+  let s: S = { out: b"abc", n: 1 };
+  let kept = s;
+  let grown = { ..s, out: s.out ++ b"d" };
+  assert_eq(grown.out, b"abcd");
+  assert_eq(kept.out, b"abc");
+  let t = T(b"xy", 2);
+  let other = t;
+  let pieces = match t { T(out, n) -> out ++ bytes_of_string(int_to_string(n)) };
+  assert_eq(pieces, b"xy2");
+  assert_eq(other, T(b"xy", 2))
+}
+
+test "a field read twice is read whole both times, and a record read whole after its field keeps it" {
+  let s: S = { out: b"ab", n: 2 };
+  let twice = { out: s.out ++ s.out, n: s.n };
+  assert_eq(twice.out, b"abab");
+  let r: S = { out: b"cd", n: 3 };
+  let first = r.out ++ b"!";
+  assert_eq(first, b"cd!");
+  assert_eq(r, { out: b"cd", n: 3 })
+}
+
+test "a closure called again reads the record it captured whole each time" {
+  let s: S = { out: b"abc", n: 1 };
+  let total = fold(range(0, 3), 0, |acc: Int, _: Int| acc + bytes_len(s.out ++ b"z") + s.n);
+  assert_eq(total, 15)
+}

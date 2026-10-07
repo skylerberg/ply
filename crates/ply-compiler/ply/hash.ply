@@ -2177,6 +2177,50 @@ fn first_pass(index: Index) -> List<Finished> / {abort.raise} =
 
 fn graph_of(index: Index) -> Graph / {abort.raise} = graph_with(index, first_pass(index), map_new())
 
+/// What each fixed node references, by index, as its run fixed it: a stub's blank body references
+/// nothing.
+fn fixed_edges(index: Index, fixed: List<Fixed>) -> Map<Int, List<Int>> / {abort.raise} = {
+  let keys = node_keys(index);
+  fold(fixed, map_new(), |acc: Map<Int, List<Int>>, f: Fixed|
+    match map_get(keys, pin_key(f.name, f.decl)) {
+      None -> acc,
+      Some(v) ->
+        map_insert(
+          acc,
+          v,
+          fold(f.edges, [], |es: List<Int>, r: NodeRef|
+            match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es }),
+        ),
+    })
+}
+
+/// [`first_pass`] with each node in `fixed` read as its edges there, normalized only where it shares
+/// a cycle: its sketch orders that cycle's members, and nothing else of it is read.
+fn first_pass_held(index: Index, fixed: Map<Int, List<Int>>) -> List<Finished> / {abort.raise} = {
+  let plain = |v: Int| {
+    let node = at(index.nodes, v);
+    finish(
+      normalize_node(new_encoder(index, node.module, map_new(), map_new(), map_new()), node.body),
+    )
+  };
+  let read = map(range(0, len(index.nodes)), |v: Int|
+    match map_get(fixed, v) { Some(es) -> { bytes: b"", refs: es }, None -> plain(v) });
+  if map_len(fixed) == 0 { read } else {
+    let cyclic = fold(
+      graph::components({ out: map(read, |f: Finished| f.refs) }),
+      map_new(),
+      |acc: Map<Int, Bool>, c: List<Int>|
+        if len(c) < 2 { acc }
+        else { fold(c, acc, |a: Map<Int, Bool>, v: Int| map_insert(a, v, true)) },
+    );
+    map(range(0, len(index.nodes)), |v: Int| {
+      let f: Finished = at(read, v);
+      if map_contains(fixed, v) && map_contains(cyclic, v) { { ..f, bytes: plain(v).bytes } }
+      else { f }
+    })
+  }
+}
+
 /// `extra` gives a node the references its compiled body has, where the body here is a blank.
 fn graph_with(
   index: Index,
@@ -2297,7 +2341,8 @@ pub fn hash_index(index: Index) -> HashOutput / {abort.raise} = hash_index_pinne
 
 pub type NodeRef = { name: Bytes, decl: Bool }
 
-/// What hashing derives from a node's body, which a stub lacks; `own` and specs are a function's.
+/// What hashing derives from a node's body, which a stub lacks; `own`, specs and `contract` are a
+/// function's, `contract` empty for a declaration.
 pub type Fixed = {
   name: Bytes,
   decl: Bool,
@@ -2305,6 +2350,7 @@ pub type Fixed = {
   own: Option<Bytes>,
   specs: List<Bytes>,
   spec_texts: List<Bytes>,
+  contract: Bytes,
   body: Bytes,
   edges: List<NodeRef>,
 }
@@ -2517,7 +2563,8 @@ pub fn hash_index_pinned(
 ) -> HashOutput / {abort.raise} =
   hashed_over(index, first_pass(index), fixed, packages, priors, nothing_held())
 
-/// The hashes and the definitions nothing uses, over one normalization of every node.
+/// The hashes and the definitions nothing uses, over one normalization of every node but the fixed
+/// ones, which are read as their earlier run fixed them.
 pub fn hashed_and_unused(
   index: Index,
   fixed: List<Fixed>,
@@ -2526,7 +2573,7 @@ pub fn hashed_and_unused(
   tests: List<FixedTest> = [],
   laws: List<FixedLaw> = [],
 ) -> { hashes: HashOutput, unused: List<Diag> } / {abort.raise} = {
-  let first = first_pass(index);
+  let first = first_pass_held(index, fixed_edges(index, fixed));
   let held = held_items(index, node_keys(index), tests, laws);
   let test_roots = map(range(0, len(index.tests)), |i: Int|
     match map_get(held.tests, i) {
@@ -2786,12 +2833,15 @@ fn hashed_over(
   let check_keys = check_key_components(index, g, held, kept, packages, hashes);
   let contracts = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int|
     if is_decl(at(index.nodes, v)) { acc } else {
-      map_insert(acc, v, match map_get(kept, v) {
-        Some(p) -> p.contract,
-        None -> match map_get(check_keys.contracts, v) {
-          Some(c) -> c,
-          None -> contract_of(index, g, hashes, v),
-        },
+      let fixed_contract = match map_get(held, v) { Some(f) -> f.contract, None -> b"" };
+      map_insert(acc, v, if bytes_len(fixed_contract) > 0 { fixed_contract } else {
+        match map_get(kept, v) {
+          Some(p) -> p.contract,
+          None -> match map_get(check_keys.contracts, v) {
+            Some(c) -> c,
+            None -> contract_of(index, g, hashes, v),
+          },
+        }
       })
     });
   let tests = fold(
@@ -3192,6 +3242,11 @@ pub fn fixed_nodes(
     |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
       map_insert(acc, x.name, x.hashes),
   );
+  let contracts = fold(
+    hashes.contracts,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash),
+  );
   let listed = |m: Map<Bytes, List<Bytes>>, name: Bytes|
     match map_get(m, name) { Some(xs) -> xs, None -> [] };
   let walked = fold(
@@ -3223,6 +3278,8 @@ pub fn fixed_nodes(
                 own: if decl { None } else { map_get(own, node.name) },
                 specs: if decl { [] } else { listed(specs, node.name) },
                 spec_texts: if decl { [] } else { listed(texts, node.name) },
+                contract: if decl { b"" }
+                else { match map_get(contracts, node.name) { Some(c) -> c, None -> b"" } },
                 body: body.body,
                 edges: edges_of(v, node, decl),
               }),
@@ -6082,6 +6139,39 @@ test "hashing takes a standing module's tests and laws as an earlier run fixed t
   assert_eq(
     hashed_and_unused(index, [], [], [], items.tests, dangling).hashes.laws,
     fresh.hashes.laws,
+  )
+}
+
+test "hashing reads a fixed definition's contract and references as its run fixed them, and answers as reading them again" {
+  let index = indexed(itemized());
+  let fresh = hashed_and_unused(index, [], []);
+  let fixed = fixed_nodes(index, fresh.hashes, map_insert(map_new(), b"base", true));
+  assert(len(filter(fixed, |f: Fixed| !f.decl)) > 0, Some("the fixture's base defines functions"));
+  let held = hashed_and_unused(index, fixed, []);
+  assert_eq([held.hashes.defs, held.hashes.decls, held.hashes.own, held.hashes.contracts], [
+    fresh.hashes.defs,
+    fresh.hashes.decls,
+    fresh.hashes.own,
+    fresh.hashes.contracts,
+  ]);
+  assert_eq(
+    held.unused,
+    unused_over(
+      index,
+      first_pass(index),
+      fixed,
+      concat(held.hashes.test_roots, held.hashes.law_roots),
+    ),
+  );
+  // What is fixed is what is answered: a contract fixed as another answers that one, unencoded.
+  let marked = map(fixed, |f: Fixed|
+    if f.decl { f } else { { ..f, contract: bytes_concat(b"fixed:", f.contract) } });
+  let taken = hashed_and_unused(index, marked, []).hashes.contracts;
+  let base = |c: { name: Bytes, hash: Bytes }| bytes_starts_with(c.name, b"base.");
+  assert_eq(
+    filter(taken, base),
+    map(filter(fresh.hashes.contracts, base), |c: { name: Bytes, hash: Bytes }|
+      { ..c, hash: bytes_concat(b"fixed:", c.hash) }),
   )
 }
 
