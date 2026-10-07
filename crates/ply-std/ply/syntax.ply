@@ -1,0 +1,1840 @@
+//! Ply source as values: a module parsed into a tree, read through accessors, and printed as
+//! `ply fmt` prints it.
+//!
+//! `parse` reads one module's source and answers its tree with the diagnostics the parser made,
+//! each a value: a code, a message, labels with a line, a column and byte offsets, and notes. The
+//! parser is the compiler's own, so it reads what `ply check` reads and recovers as it does: an
+//! item that does not parse is reported once and left out, and the items around it are read, so a
+//! tree answered beside diagnostics holds the rest of the module. Nothing inside a broken item is
+//! kept, and a source that is not UTF-8 is read up to where it stops being.
+//!
+//! A tree is made of nodes, and a `Node` is opaque: what it holds is the compiler's, which changes
+//! with the language. A node is read by `kind`, `span`, `text`, `name`, `children` and the few
+//! accessors beside them, which keep their meaning. `Kind` is the vocabulary, and it grows: a
+//! release that adds syntax adds a kind and moves `version`, so a `match` over kinds ends in a
+//! wildcard arm. A kind is never renamed or given another meaning without `version` moving.
+//!
+//! The tree is what was written. An interpolated string, a map or set literal, a tuple and an
+//! operator are each one node of their own kind though the compiler reads them as calls, and the
+//! names the parser writes for itself are no node. Comments are not nodes: `comments` answers the
+//! ones inside a node's span, a doc comment is its item's `doc`, and `format` and `edited` keep
+//! every one.
+//!
+//! `format` is the formatter `ply fmt` runs. It keeps every comment, the spelling of every literal
+//! and the order of everything, and its answer parses to the same tree (`shape`) and formats to
+//! itself.
+//!
+//! Code is made as text and checked as syntax. `expression`, `pattern`, `type_expression`, `item`
+//! and `identifier` each read one fragment whole or refuse it, and a `syntax"…"` literal is a
+//! module's items checked where it is written, each hole a node: an expression, a pattern, a type
+//! or a name, by where the hole stands. A node in a hole is written as one node, in parentheses
+//! unless it is a name, so nothing it holds is read as part of the text around it. `edited` makes
+//! replacements in a source by span and keeps every other byte.
+//!
+//! `std.checker` answers what these sources mean: diagnostics from the whole front end, and each
+//! definition's type, row, hash and references.
+
+import compiler.exprs
+import compiler.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
+                       ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell,
+                       EWithHold, ESimulate, EParallel, ETagged, EBad, ETryBlock, Param, Stmt, SLet,
+                       SLetElse, SExpr, MatchArm, HandleClause, ReturnClause, NamedArg, RecField,
+                       Hole, expr_span, written_operator)
+import compiler.fmt
+import compiler.items
+import compiler.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet,
+                       IExtern, IInstance, INumeric, ImportDecl, IModule, IAlias, INames, Binder,
+                       SpecClause, SRequires, SEnsures, SCost, VariantDef, OpDef, TDAlias, TDSum,
+                       TDNominal, item_span, item_doc, is_pub, is_written)
+import compiler.lexer
+import compiler.parsing
+import compiler.parsing (ParseDiag, Parser, Input)
+import compiler.patterns
+import compiler.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad,
+                          LInt, LStr, LBad, pat_span)
+import compiler.type_syntax
+import compiler.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, ty_span,
+                             is_raise)
+import std.bytes
+import std.gen
+import std.gen (Gen)
+import std.laws (idempotent)
+import std.list (at_or, concat, flat_map, sort_by)
+import std.place (Place, place_at)
+
+// --- Diagnostics ------------------------------------------------------------
+
+/// A stretch of a source, in bytes: from `start` up to `end`.
+pub type Span = { start: Int, end: Int }
+
+/// One place a diagnostic points at, and what it says of it.
+///
+/// `path` names the source: `""` for the one source `parse` was given, and for a diagnostic of
+/// `std.checker` the path its source was given under, or nothing where it is about no source.
+/// `place` is where `span` starts.
+pub type Label = new { path: String, span: Span, place: Place, primary: Bool, text: String }
+
+/// One replacement in the source at `path`: `text` in place of `span`. An empty span inserts and
+/// an empty text deletes.
+pub type Edit = new { path: String, span: Span, text: Bytes }
+
+/// A change that applies as it is and leaves a program the diagnostic no longer holds for.
+pub type Fix = new { title: String, edits: List<Edit> }
+
+/// Whether a diagnostic refuses the program or only remarks on it.
+pub type Severity = | Error | Warning
+
+/// What the front end says of a source: a code `ply explain` reads (`E0001`), a sentence, the
+/// places it is about with the primary one among them, the notes under it, and the fixes it
+/// offers.
+pub type Diagnostic = new {
+  code: String,
+  severity: Severity,
+  message: String,
+  labels: List<Label>,
+  notes: List<String>,
+  fixes: List<Fix>,
+}
+
+/// The label a diagnostic is placed at: its first primary one, else its first.
+pub fn primary(diagnostic: Diagnostic) -> Option<Label> =
+  match fold(diagnostic.labels, None, |found: Option<Label>, label: Label|
+      match found { Some(_) -> found, None -> if label.primary { Some(label) } else { None } }) {
+    Some(label) -> Some(label),
+    None -> list_at(diagnostic.labels, 0),
+  }
+
+/// What this module raises where it refuses.
+pub effect syntax {
+  /// A node does not go where a `syntax"…"` literal's hole stands, or the text it makes does not
+  /// parse.
+  raise refused(why: Diagnostic)
+}
+
+fn said(source: Bytes, diag: ParseDiag) -> Diagnostic =
+  {
+    code: string_of_bytes_lossy(diag.code),
+    severity: if diag.severity == b"warning" { Warning } else { Error },
+    message: string_of_bytes_lossy(diag.message),
+    labels: map(diag.labels, |label: parsing::Label|
+      {
+        path: "",
+        span: { start: label.start, end: label.end },
+        place: place_at(source, label.start),
+        primary: label.primary,
+        text: string_of_bytes_lossy(label.text),
+      }),
+    notes: map(diag.notes_text, |note: Bytes| string_of_bytes_lossy(note)),
+    fixes: [],
+  }
+
+/// A refusal of this module's own, placed like the parser's.
+fn unexpected(source: Bytes, span: Span, message: String, label: String) -> Diagnostic =
+  said(
+    source,
+    parsing::error_at(
+      parsing::unexpected(),
+      span,
+      bytes_of_string(message),
+      bytes_of_string(label),
+      [],
+    ),
+  )
+
+// --- Nodes ------------------------------------------------------------------
+
+/// The source a node was parsed from, and that source's comments.
+type Origin = { source: Bytes, comments: List<lexer::Comment> }
+
+/// What a node is, as the compiler holds it.
+type At =
+  | AModule(Module)
+  | AImport(ImportDecl)
+  | AImported(parsing::Ident)
+  | AAlias(parsing::Ident)
+  | AItem(Item)
+  | AVariant(VariantDef)
+  | AOperation(OpDef)
+  | AParam(Param)
+  | AClause(SpecClause)
+  | ADecreases(Expr)
+  | ARow(RowExpr)
+  | AExpr(Expr)
+  | ALet(Stmt)
+  | AArm(MatchArm)
+  | AHandler(HandleClause)
+  | AReturn(ReturnClause)
+  | AField({ name: parsing::Ident, value: Expr })
+  | APatField({ name: parsing::Ident, pat: Pattern })
+  | ATypeField({ name: parsing::Ident, ty: TypeExpr })
+  | APattern(Pattern)
+  | AType(TypeExpr)
+
+/// One node of a tree: a module, an item, an expression, a pattern, a type, or a part of one.
+///
+/// Two nodes are `==` when they are the same node of the same source; `shape` compares trees
+/// whatever their layout.
+pub opaque type Node = | Node(Origin, At)
+
+/// What a node is. The list grows with the language: end a `match` over it with a wildcard arm.
+///
+/// Each kind says what `children` answers for it, in the order the source writes them, and what
+/// `name` answers where it names anything.
+pub type Kind =
+  /// A whole source: its imports, then its items.
+  | Module
+  /// `import a.b`: named by the module's path; an `ImportedName` for each name in a list, or an
+  /// `ImportAlias`.
+  | Import
+  /// One name of `import a.b (f, g)`.
+  | ImportedName
+  /// The binder of `import a.b as c`.
+  | ImportAlias
+  /// `fn`: its parameters, its result type and its `Row` where written, its `Requires`, `Ensures`
+  /// and `Cost` clauses, its `Decreases`, then its body.
+  | Function
+  /// `type`: the type it names, or each `Variant` of a sum.
+  | TypeDeclaration
+  /// `effect`: each `Operation`.
+  | EffectDeclaration
+  /// `test`, named by its label: over cases, the values in its label's holes, the case's
+  /// `Parameter` and the table; then its body.
+  | Test
+  /// `law`, named by its label: its binders as `Parameter`s, its guard and its cost bound where
+  /// written, then its body, which for an instantiation is the `Call` of the schema.
+  | Law
+  /// `law schema`: its parameters, its binders, its guard where written, then its body.
+  | LawSchema
+  /// `derive json for T`, named by the type.
+  | Derive
+  /// `effect set`, named by the set.
+  | EffectSet
+  /// `extern fn`: its parameters, its result type, its `Row` and its clauses.
+  | ExternFunction
+  /// `key for T by f`, `show for T by f` or `gen for T by f`, named by the type.
+  | Instance
+  /// `numeric for T by { .. }`, named by the type.
+  | Numeric
+  /// A constructor of a sum type: the types of its fields.
+  | Variant
+  /// An operation of an effect: the types of its parameters, then of its result unless it is a
+  /// `raise`.
+  | Operation
+  /// A parameter of a function, a lambda, a law or a handler, or the binder of a `with_cell`, a
+  /// `with_hold` or a test over cases: its type and its default where written.
+  | Parameter
+  /// `requires e`: the condition.
+  | Requires
+  /// `ensures e`: the condition.
+  | Ensures
+  /// `cost e`: the bound.
+  | Cost
+  /// `decreases e`: the measure.
+  | Decreases
+  /// An effect row, `{fs.read[r], abort.raise | e}`: read it with `text`.
+  | Row
+  /// A literal: a number, a string, a line string, bytes, a character, `true`, `false` or `()`.
+  | Literal
+  /// A name used as a value, `f` or `m::f`: `name` is `f` and `qualifier` is `m`.
+  | Name
+  /// A binary operator: its two operands. `operator` is its spelling.
+  | Binary
+  /// `-x`, `!x` or `~x`: the operand. `operator` is its spelling.
+  | Unary
+  /// `|x: T| body`: its parameters, its result type where written, then its body.
+  | Lambda
+  /// A call: the callee, then each argument, a named one as a `Field`.
+  | Call
+  /// `if`: the condition, the block, and the `else` branch where one is written.
+  | If
+  /// `match`: the scrutinee, then each `Arm`.
+  | Match
+  /// `{ .. }`: each statement, a `Let`, a `LetElse` or an expression, then the tail.
+  | Block
+  /// `{ a: 1, b }`: each `Field`.
+  | RecordLiteral
+  /// `(a, b)`: each element.
+  | Tuple
+  /// `{ ..base, a: 1 }`: the base, then each `Field`.
+  | RecordUpdate
+  /// `x?`: the operand.
+  | Propagate
+  /// `a.b`: the value; `name` is the field.
+  | Access
+  /// `[a, b]`: each element.
+  | ListLiteral
+  /// `#{k: v}`: each key and its value, in turn.
+  | MapLiteral
+  /// `#[a, b]`: each element.
+  | SetLiteral
+  /// `f"a {x} b"`: the value in each hole.
+  | Interpolation
+  /// `tag"text {x}"`: the value in each hole; `name` is the tag.
+  | TaggedLiteral
+  /// `eff.op[r](args)`: each argument; `name` is the operation and `qualifier` the effect.
+  | Perform
+  /// `handle { .. } with { .. }`: the body, then each `Handler` and the `ReturnHandler`.
+  | Handle
+  /// `with_cell[r](init) { c -> body }`: the initial value, the binder, the body.
+  | WithCell
+  /// `with_hold[r](acquire, release) { h -> body }`: the two, the binder, the body.
+  | WithHold
+  /// `simulate { .. }`: the body.
+  | Simulate
+  /// `parallel { a, b }`: each branch.
+  | Parallel
+  /// `try { .. }`: the body.
+  | TryBlock
+  /// `let p: T = v;`: the pattern, the type where written, the value.
+  | Let
+  /// `let p = v else { .. };`: as a `Let`, then the block.
+  | LetElse
+  /// An arm of a `match`: the pattern, the guard where written, the body.
+  | Arm
+  /// A clause of a `handle`: its parameters, then its body; `name` is the operation and
+  /// `qualifier` the effect.
+  | Handler
+  /// `return x -> ..` in a `handle`: the binder, then the body.
+  | ReturnHandler
+  /// A named part: a record's field, a named argument, a record pattern's field or a record
+  /// type's: the value, pattern or type. A field written by its name alone holds the node of that
+  /// name, at the same span.
+  | Field
+  /// `_`.
+  | Wildcard
+  /// A pattern that binds a name.
+  | Binding
+  /// A literal as a pattern.
+  | LiteralPattern
+  /// `lo..=hi`.
+  | RangePattern
+  /// `Some(p)`: each argument; `name` is the constructor and `qualifier` its module.
+  | ConstructorPattern
+  /// `{ a, b: p, .. }`: each `Field`.
+  | RecordPattern
+  /// `(p, q)`: each element.
+  | TuplePattern
+  /// `[p, q, ..rest]`: each element, then the rest.
+  | ListPattern
+  /// `p | q`: each alternative.
+  | Alternatives
+  /// A type variable, `a`.
+  | TypeVariable
+  /// `List<Int>` or `m::T`: each type argument; `name` is the type and `qualifier` its module.
+  | TypeName
+  /// `(A, B) -> C / {..}`: each parameter type, the result type, and the `Row` where written.
+  | FunctionType
+  /// `{ a: Int }`: each `Field`.
+  | RecordType
+  /// `(A, B)`: each element.
+  | TupleType
+  /// `()` as a type.
+  | UnitType
+  /// What stands where the parser could read nothing.
+  | Unparsed
+
+/// A name as the source writes it, and where.
+pub type Ident = new { text: String, span: Span }
+
+/// A comment as written, its `//`, `///` or `//!` included, without the blanks that end its line.
+pub type Comment = new { span: Span, text: String }
+
+/// The version of this module's vocabulary: it moves when a `Kind` is added, and with what is said
+/// of the release when an accessor comes to answer otherwise for a tree it already read.
+pub fn version() -> Int = 1
+
+fn spelled(ident: parsing::Ident) -> Ident =
+  { text: string_of_bytes_lossy(ident.name), span: ident.span }
+
+fn bound(binder: Binder) -> Param =
+  { name: binder.name, ty: Some(binder.ty), cost: None, default: None, span: binder.span }
+
+fn untyped(name: parsing::Ident) -> Param =
+  { name: name, ty: None, cost: None, default: None, span: name.span }
+
+fn optional<a>(value: Option<a>, made: (a) -> At) -> List<At> =
+  match value { Some(x) -> [made(x)], None -> [] }
+
+fn as_types(ts: List<TypeExpr>) -> List<At> = map(ts, |t: TypeExpr| AType(t))
+
+fn as_values(es: List<Expr>) -> List<At> = map(es, |e: Expr| AExpr(e))
+
+fn as_params(ps: List<Param>) -> List<At> = map(ps, |p: Param| AParam(p))
+
+fn as_binders(bs: List<Binder>) -> List<At> = map(bs, |b: Binder| AParam(bound(b)))
+
+fn as_clauses(cs: List<SpecClause>) -> List<At> = map(cs, |c: SpecClause| AClause(c))
+
+fn as_fields(fs: List<RecField>) -> List<At> =
+  map(fs, |f: RecField| AField({ name: f.name, value: f.value }))
+
+fn all_of(parts: List<List<At>>) -> List<At> = flat_map(parts, |part: List<At>| part)
+
+fn span_of(source: Bytes, at: At) -> Span =
+  match at {
+    AModule(_) -> { start: 0, end: bytes_len(source) },
+    AImport(d) -> d.span,
+    AImported(i) -> i.span,
+    AAlias(i) -> i.span,
+    AItem(item) -> item_span(item),
+    AVariant(v) -> v.span,
+    AOperation(o) -> o.span,
+    AParam(p) -> p.span,
+    AClause(c) -> c.span,
+    ADecreases(e) -> expr_span(e),
+    ARow(r) -> r.span,
+    AExpr(e) -> expr_span(e),
+    ALet(stmt) -> match stmt { SLet(v) -> v.span, SLetElse(v) -> v.span, SExpr(e) -> expr_span(e) },
+    AArm(arm) -> arm.span,
+    AHandler(c) -> c.span,
+    AReturn(r) -> r.span,
+    AField(f) -> parsing::span_to(f.name.span, expr_span(f.value)),
+    APatField(f) -> parsing::span_to(f.name.span, pat_span(f.pat)),
+    ATypeField(f) -> parsing::span_to(f.name.span, ty_span(f.ty)),
+    APattern(p) -> pat_span(p),
+    AType(t) -> ty_span(t),
+  }
+
+fn in_order(source: Bytes, parts: List<At>) -> List<At> =
+  sort_by(parts, |a: At, b: At| span_of(source, a).start < span_of(source, b).start)
+
+fn item_parts(item: Item) -> List<At> =
+  match item {
+    IFn(d) ->
+      all_of([
+        as_params(d.params),
+        optional(d.ret, |t: TypeExpr| AType(t)),
+        optional(d.effects, |r: RowExpr| ARow(r)),
+        as_clauses(d.spec),
+        optional(d.decreases, |e: Expr| ADecreases(e)),
+        [AExpr(d.body)],
+      ]),
+    IType(d) -> match d.body {
+      TDAlias(t) -> [AType(t)],
+      TDSum(vs) -> map(vs, |v: VariantDef| AVariant(v)),
+      TDNominal(t) -> [AType(t)],
+    },
+    IEffect(d) -> map(d.ops, |o: OpDef| AOperation(o)),
+    ITest(d) ->
+      all_of([
+        match d.cases {
+          Some(c) ->
+            all_of([
+              as_values(fmt::holes_of(c.label)),
+              [
+                AParam({
+                  name: c.binder,
+                  ty: Some(c.ty),
+                  cost: None,
+                  default: None,
+                  span: parsing::span_to(c.binder.span, ty_span(c.ty)),
+                }),
+                AExpr(c.table),
+              ],
+            ]),
+          None -> [],
+        },
+        [AExpr(d.body)],
+      ]),
+    ILaw(d) ->
+      all_of([
+        as_binders(d.binders),
+        optional(d.guard, |e: Expr| AExpr(e)),
+        optional(d.cost, |e: Expr| AExpr(e)),
+        [AExpr(d.body)],
+      ]),
+    ISchema(d) ->
+      all_of([
+        as_binders(d.params),
+        as_binders(d.binders),
+        optional(d.guard, |e: Expr| AExpr(e)),
+        [AExpr(d.body)],
+      ]),
+    IExtern(d) ->
+      all_of([
+        as_params(d.params),
+        [AType(d.ret)],
+        optional(d.effects, |r: RowExpr| ARow(r)),
+        as_clauses(d.spec),
+      ]),
+    IDerive(_) -> [],
+    IEffectSet(_) -> [],
+    IInstance(_) -> [],
+    INumeric(_) -> [],
+  }
+
+fn statement(stmt: Stmt) -> At = match stmt { SExpr(e) -> AExpr(e), _ -> ALet(stmt) }
+
+/// A call the parser wrote for an operator, `a +% b`.
+fn is_operator(e: Expr) -> Bool =
+  match e {
+    EApp(v) -> match written_operator(v.func, v.args) { Some(_) -> true, None -> false },
+    _ -> false,
+  }
+
+/// A call the parser wrote around the value in an interpolated string's hole: its callee is
+/// reached through a binder no source can spell.
+fn is_display(e: Expr) -> Bool =
+  match e {
+    EApp(v) -> match v.func {
+      EVar(f) -> match f.name.module {
+        Some(binder) -> exprs::hidden_binder(binder.name),
+        None -> false,
+      },
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+fn expr_parts(source: Bytes, e: Expr) -> List<At> / {abort.raise} =
+  match fmt::spelling(source, e) {
+    fmt::Interpolated(holes) -> as_values(holes),
+    fmt::MapLiteral(entries) ->
+      flat_map(entries, |entry: { key: Expr, value: Expr }| [AExpr(entry.key), AExpr(entry.value)]),
+    fmt::SetLiteral(xs) -> as_values(xs),
+    fmt::AsParsed -> match e {
+      ELit(_) -> [],
+      EVar(_) -> [],
+      EBinary(v) -> [AExpr(v.lhs), AExpr(v.rhs)],
+      EUnary(v) -> [AExpr(v.operand)],
+      ELambda(v) ->
+        all_of([as_params(v.params), optional(v.ret, |t: TypeExpr| AType(t)), [AExpr(v.body)]]),
+      EApp(v) -> if is_operator(e) || is_display(e) { as_values(v.args) } else {
+        in_order(
+          source,
+          all_of([
+            [AExpr(v.func)],
+            as_values(v.args),
+            map(v.named, |arg: NamedArg| AField({ name: arg.name, value: arg.value })),
+          ]),
+        )
+      },
+      EIf(v) ->
+        all_of([
+          [AExpr(v.cond), AExpr(v.then_branch)],
+          match v.else_branch { ELit(_) -> [], other -> [AExpr(other)] },
+        ]),
+      EMatch(v) -> all_of([[AExpr(v.scrutinee)], map(v.arms, |arm: MatchArm| AArm(arm))]),
+      EBlock(v) -> all_of([map(v.stmts, statement), optional(v.tail, |x: Expr| AExpr(x))]),
+      ERecord(v) -> if fmt::is_tuple(v.fields) { map(v.fields, |f: RecField| AExpr(f.value)) }
+      else { as_fields(v.fields) },
+      ERecordUpdate(v) -> all_of([[AExpr(v.base)], as_fields(v.fields)]),
+      ETry(v) -> [AExpr(v.operand)],
+      EField(v) -> [AExpr(v.base)],
+      EList(v) -> as_values(v.items),
+      EPerform(v) -> as_values(v.args),
+      EHandle(v) ->
+        in_order(
+          source,
+          all_of([
+            [AExpr(v.body)],
+            map(v.clauses, |c: HandleClause| AHandler(c)),
+            optional(v.ret, |r: ReturnClause| AReturn(r)),
+          ]),
+        ),
+      EWithCell(v) -> [AExpr(v.init), AParam(untyped(v.binder)), AExpr(v.body)],
+      EWithHold(v) ->
+        [AExpr(v.acquire), AExpr(v.release), AParam(untyped(v.binder)), AExpr(v.body)],
+      ESimulate(v) -> [AExpr(v.body)],
+      EParallel(v) -> as_values(v.branches),
+      ETagged(t) -> map(t.holes, |h: Hole| AExpr(h.value)),
+      EBad(_) -> [],
+      ETryBlock(v) -> [AExpr(v.body)],
+    },
+  }
+
+fn pattern_parts(p: Pattern) -> List<At> / {abort.raise} =
+  match p {
+    PWild(_) -> [],
+    PVar(_) -> [],
+    PLit(_) -> [],
+    PRange(_) -> [],
+    PCtor(v) -> map(v.args, |x: Pattern| APattern(x)),
+    PRecord(v) -> if fmt::is_pat_tuple(v.fields) {
+      map(v.fields, |f: { name: parsing::Ident, pat: Pattern }| APattern(f.pat))
+    } else { map(v.fields, |f: { name: parsing::Ident, pat: Pattern }| APatField(f)) },
+    PList(v) ->
+      all_of([map(v.items, |x: Pattern| APattern(x)), optional(v.rest, |x: Pattern| APattern(x))]),
+    POr(v) -> map(v.alts, |x: Pattern| APattern(x)),
+    PBad(_) -> [],
+  }
+
+fn type_parts(t: TypeExpr) -> List<At> / {abort.raise} =
+  match t {
+    TVar(_) -> [],
+    TCon(x) -> as_types(x.args),
+    TFn(x) ->
+      all_of([as_types(x.params), [AType(x.ret)], optional(x.effects, |r: RowExpr| ARow(r))]),
+    TRecord(x) -> if fmt::is_ty_tuple(x.fields) {
+      map(x.fields, |f: { name: parsing::Ident, ty: TypeExpr }| AType(f.ty))
+    } else { map(x.fields, |f: { name: parsing::Ident, ty: TypeExpr }| ATypeField(f)) },
+    TUnit(_) -> [],
+    TBad(_) -> [],
+  }
+
+fn parts_of(source: Bytes, at: At) -> List<At> / {abort.raise} =
+  match at {
+    AModule(m) ->
+      all_of([
+        map(filter(m.imports, is_written), |d: ImportDecl| AImport(d)),
+        map(m.items, |item: Item| AItem(item)),
+      ]),
+    AImport(d) -> match d.kind {
+      IModule -> [],
+      IAlias(binder) -> [AAlias(binder)],
+      INames(names) -> map(names, |n: parsing::Ident| AImported(n)),
+    },
+    AImported(_) -> [],
+    AAlias(_) -> [],
+    AItem(item) -> item_parts(item),
+    AVariant(v) -> as_types(v.fields),
+    AOperation(o) -> if is_raise(o.mode) { as_types(o.params) }
+    else { push(as_types(o.params), AType(o.ret)) },
+    AParam(p) ->
+      all_of([optional(p.ty, |t: TypeExpr| AType(t)), optional(p.default, |e: Expr| AExpr(e))]),
+    AClause(c) -> [AExpr(c.expr)],
+    ADecreases(e) -> [AExpr(e)],
+    ARow(_) -> [],
+    AExpr(e) -> expr_parts(source, e),
+    ALet(stmt) -> match stmt {
+      SLet(v) ->
+        all_of([[APattern(v.pat)], optional(v.ty, |t: TypeExpr| AType(t)), [AExpr(v.value)]]),
+      SLetElse(v) ->
+        all_of([
+          [APattern(v.pat)],
+          optional(v.ty, |t: TypeExpr| AType(t)),
+          [AExpr(v.value), AExpr(v.fallback)],
+        ]),
+      SExpr(e) -> [AExpr(e)],
+    },
+    AArm(arm) ->
+      all_of([[APattern(arm.pat)], optional(arm.guard, |e: Expr| AExpr(e)), [AExpr(arm.body)]]),
+    AHandler(c) ->
+      in_order(
+        source,
+        all_of([
+          map(c.params, |p: parsing::Ident| AParam(untyped(p))),
+          optional(c.resume, |k: parsing::Ident| AParam(untyped(k))),
+          [AExpr(c.body)],
+        ]),
+      ),
+    AReturn(r) -> [AParam(untyped(r.binder)), AExpr(r.body)],
+    AField(f) -> [AExpr(f.value)],
+    APatField(f) -> [APattern(f.pat)],
+    ATypeField(f) -> [AType(f.ty)],
+    APattern(p) -> pattern_parts(p),
+    AType(t) -> type_parts(t),
+  }
+
+fn item_kind(item: Item) -> Kind =
+  match item {
+    IFn(_) -> Function,
+    IType(_) -> TypeDeclaration,
+    IEffect(_) -> EffectDeclaration,
+    ITest(_) -> Test,
+    ILaw(_) -> Law,
+    ISchema(_) -> LawSchema,
+    IDerive(_) -> Derive,
+    IEffectSet(_) -> EffectSet,
+    IExtern(_) -> ExternFunction,
+    IInstance(_) -> Instance,
+    INumeric(_) -> Numeric,
+  }
+
+fn expr_kind(source: Bytes, e: Expr) -> Kind / {abort.raise} =
+  match fmt::spelling(source, e) {
+    fmt::Interpolated(_) -> Interpolation,
+    fmt::MapLiteral(_) -> MapLiteral,
+    fmt::SetLiteral(_) -> SetLiteral,
+    fmt::AsParsed -> match e {
+      ELit(v) -> match v.lit { LBad -> Unparsed, _ -> Literal },
+      EVar(_) -> Name,
+      EBinary(_) -> Binary,
+      EUnary(_) -> Unary,
+      ELambda(_) -> Lambda,
+      EApp(_) -> if is_operator(e) { Binary } else if is_display(e) { Interpolation } else { Call },
+      EIf(_) -> If,
+      EMatch(_) -> Match,
+      EBlock(_) -> Block,
+      ERecord(v) -> if fmt::is_tuple(v.fields) { Tuple } else { RecordLiteral },
+      ERecordUpdate(_) -> RecordUpdate,
+      ETry(_) -> Propagate,
+      EField(_) -> Access,
+      EList(_) -> ListLiteral,
+      EPerform(_) -> Perform,
+      EHandle(_) -> Handle,
+      EWithCell(_) -> WithCell,
+      EWithHold(_) -> WithHold,
+      ESimulate(_) -> Simulate,
+      EParallel(_) -> Parallel,
+      ETagged(_) -> TaggedLiteral,
+      EBad(_) -> Unparsed,
+      ETryBlock(_) -> TryBlock,
+    },
+  }
+
+fn kind_of(source: Bytes, at: At) -> Kind / {abort.raise} =
+  match at {
+    AModule(_) -> Module,
+    AImport(_) -> Import,
+    AImported(_) -> ImportedName,
+    AAlias(_) -> ImportAlias,
+    AItem(item) -> item_kind(item),
+    AVariant(_) -> Variant,
+    AOperation(_) -> Operation,
+    AParam(_) -> Parameter,
+    AClause(c) -> match c.kind { SRequires -> Requires, SEnsures -> Ensures, SCost -> Cost },
+    ADecreases(_) -> Decreases,
+    ARow(_) -> Row,
+    AExpr(e) -> expr_kind(source, e),
+    ALet(stmt) -> match stmt { SLetElse(_) -> LetElse, _ -> Let },
+    AArm(_) -> Arm,
+    AHandler(_) -> Handler,
+    AReturn(_) -> ReturnHandler,
+    AField(_) -> Field,
+    APatField(_) -> Field,
+    ATypeField(_) -> Field,
+    APattern(p) -> match p {
+      PWild(_) -> Wildcard,
+      PVar(_) -> Binding,
+      PLit(_) -> LiteralPattern,
+      PRange(_) -> RangePattern,
+      PCtor(_) -> ConstructorPattern,
+      PRecord(v) -> if fmt::is_pat_tuple(v.fields) { TuplePattern } else { RecordPattern },
+      PList(_) -> ListPattern,
+      POr(_) -> Alternatives,
+      PBad(_) -> Unparsed,
+    },
+    AType(t) -> match t {
+      TVar(_) -> TypeVariable,
+      TCon(_) -> TypeName,
+      TFn(_) -> FunctionType,
+      TRecord(x) -> if fmt::is_ty_tuple(x.fields) { TupleType } else { RecordType },
+      TUnit(_) -> UnitType,
+      TBad(_) -> Unparsed,
+    },
+  }
+
+fn import_path(d: ImportDecl) -> parsing::Ident =
+  {
+    name: bytes::join(map(d.path, |part: parsing::Ident| part.name), b"."),
+    span: match ((list_at(d.path, 0), list_at(d.path, len(d.path) - 1))) {
+      (Some(first), Some(last)) -> parsing::span_to(first.span, last.span),
+      _ -> d.span,
+    },
+  }
+
+fn item_name(item: Item) -> parsing::Ident =
+  match item {
+    IFn(d) -> d.name,
+    IType(d) -> d.name,
+    IEffect(d) -> d.name,
+    ITest(d) -> { name: d.name, span: d.name_span },
+    ILaw(d) -> { name: d.name, span: d.name_span },
+    ISchema(d) -> d.name,
+    IDerive(d) -> d.target,
+    IEffectSet(d) -> d.name,
+    IExtern(d) -> d.name,
+    IInstance(d) -> d.target,
+    INumeric(d) -> d.target,
+  }
+
+fn name_of(at: At) -> Option<parsing::Ident> =
+  match at {
+    AImport(d) -> Some(import_path(d)),
+    AImported(i) -> Some(i),
+    AAlias(i) -> Some(i),
+    AItem(item) -> Some(item_name(item)),
+    AVariant(v) -> Some(v.name),
+    AOperation(o) -> Some(o.name),
+    AParam(p) -> Some(p.name),
+    AExpr(e) -> match e {
+      EVar(v) -> Some(v.name.name),
+      EField(v) -> Some(v.field),
+      EPerform(v) -> Some(v.op),
+      ETagged(t) -> Some(t.tag),
+      _ -> None,
+    },
+    AHandler(c) -> Some(c.op),
+    AField(f) -> Some(f.name),
+    APatField(f) -> Some(f.name),
+    ATypeField(f) -> Some(f.name),
+    APattern(p) -> match p { PVar(v) -> Some(v.name), PCtor(v) -> Some(v.name.name), _ -> None },
+    AType(t) -> match t { TVar(i) -> Some(i), TCon(x) -> Some(x.name.name), _ -> None },
+    _ -> None,
+  }
+
+fn qualifier_of(at: At) -> Option<parsing::Ident> =
+  match at {
+    AExpr(e) -> match e { EVar(v) -> v.name.module, EPerform(v) -> Some(v.eff.name), _ -> None },
+    AHandler(c) -> Some(c.eff.name),
+    APattern(p) -> match p { PCtor(v) -> v.name.module, _ -> None },
+    AType(t) -> match t { TCon(x) -> x.name.module, _ -> None },
+    _ -> None,
+  }
+
+fn named(found: Option<parsing::Ident>) -> Option<Ident> =
+  match found { Some(ident) -> Some(spelled(ident)), None -> None }
+
+/// What a node is.
+pub fn kind(node: Node) -> Kind / {abort.raise} =
+  match node { Node(origin, at) -> kind_of(origin.source, at) }
+
+/// Where a node is written in its source. An item's span starts at its keyword: a `pub` before
+/// it and the doc above it lie outside, and a parenthesised expression's or pattern's takes in its
+/// parentheses.
+pub fn span(node: Node) -> Span = match node { Node(origin, at) -> span_of(origin.source, at) }
+
+/// The whole source a node was parsed from.
+pub fn source(node: Node) -> Bytes = match node { Node(origin, _) -> origin.source }
+
+/// A node as written: the bytes of its span.
+pub fn text(node: Node) -> Bytes / {abort.raise} =
+  match node {
+    Node(origin, at) -> {
+      let s = span_of(origin.source, at);
+      bytes_slice(origin.source, s.start, s.end)
+    },
+  }
+
+/// The line and column a node starts at in its source.
+pub fn place(node: Node) -> Place =
+  match node { Node(origin, at) -> place_at(origin.source, span_of(origin.source, at).start) }
+
+/// The nodes directly inside a node, in the order the source writes them: what its `Kind` says.
+pub fn children(node: Node) -> List<Node> / {abort.raise} =
+  match node { Node(origin, at) -> map(parts_of(origin.source, at), |part: At| Node(origin, part)) }
+
+/// The name a node declares, binds or refers to, and where it is written: what its `Kind` says.
+/// A test's and a law's is its label.
+pub fn name(node: Node) -> Option<Ident> = match node { Node(_, at) -> named(name_of(at)) }
+
+/// What a name is reached through: the module binder of `m::f`, of a qualified constructor
+/// pattern or type, and the effect of a `Perform` or a `Handler`.
+pub fn qualifier(node: Node) -> Option<Ident> =
+  match node { Node(_, at) -> named(qualifier_of(at)) }
+
+/// A `Binary` or a `Unary` node's operator as it is written: `+`, `&&`, `+%`, `!`.
+pub fn operator(node: Node) -> Option<String> =
+  match node {
+    Node(_, AExpr(e)) -> match e {
+      EBinary(v) -> Some(string_of_bytes_lossy(fmt::op_text(v.op))),
+      EUnary(v) -> Some(string_of_bytes_lossy(fmt::unary_text(v.op))),
+      EApp(v) -> match written_operator(v.func, v.args) {
+        Some(o) -> Some(string_of_bytes_lossy(o.text)),
+        None -> None,
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+/// What a string literal reads as, its escapes read; `None` for any other node.
+pub fn string_value(node: Node) -> Option<String> =
+  match node {
+    Node(_, AExpr(ELit(v))) -> match v.lit { LStr(s) -> Some(string_of_bytes_lossy(s)), _ -> None },
+    _ -> None,
+  }
+
+/// What an `Int` literal reads as; `None` for any other node.
+pub fn int_value(node: Node) -> Option<Int> =
+  match node { Node(_, AExpr(ELit(v))) -> match v.lit { LInt(n) -> Some(n), _ -> None }, _ -> None }
+
+/// Whether an item is written `pub`.
+pub fn is_public(node: Node) -> Bool =
+  match node {
+    Node(_, AItem(item)) -> match item {
+      IFn(d) -> is_pub(d.vis),
+      IType(d) -> is_pub(d.vis),
+      IEffect(d) -> is_pub(d.vis),
+      ISchema(d) -> is_pub(d.vis),
+      IEffectSet(d) -> is_pub(d.vis),
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// The doc comment of a module, an item, a variant or an operation, a line each without its
+/// marker; empty where it has none.
+pub fn doc(node: Node) -> List<String> = {
+  let held = match node {
+    Node(_, AModule(m)) -> m.doc,
+    Node(_, AItem(item)) -> item_doc(item),
+    Node(_, AVariant(v)) -> v.doc,
+    Node(_, AOperation(o)) -> o.doc,
+    _ -> None,
+  };
+  match held { Some(d) -> map(d.lines, |line: Bytes| string_of_bytes_lossy(line)), None -> [] }
+}
+
+/// The comments written inside a node's span, in order: every comment of the source for its
+/// `Module`. A doc comment above an item lies outside the item's span and inside the module's.
+pub fn comments(node: Node) -> List<Comment> / {abort.raise} =
+  match node {
+    Node(origin, at) -> {
+      let within = span_of(origin.source, at);
+      fold(origin.comments, [], |found: List<Comment>, c: lexer::Comment|
+        if c.start < within.start || c.end > within.end { found } else {
+          push(found, {
+            span: { start: c.start, end: c.end },
+            text: string_of_bytes_lossy(bytes_slice(origin.source, c.start, c.end)),
+          })
+        })
+    },
+  }
+
+fn walked(node: Node, room: Int, found: List<Node>) -> List<Node> / {abort.raise} =
+  if room <= 0 { panic("a tree nests deeper than its source is long") } else {
+    fold(children(node), push(found, node), |so_far: List<Node>, child: Node|
+      walked(child, room - 1, so_far))
+  }
+
+/// A node and every node inside it, each before what it holds, in the order the source writes
+/// them.
+pub fn walk(node: Node) -> List<Node> / {abort.raise} =
+  walked(node, 4 * bytes_len(source(node)) + 64, [])
+
+fn holds(node: Node, offset: Int) -> Bool = span(node).start <= offset && offset < span(node).end
+
+/// The nodes whose spans hold the byte at `offset`, outermost first, from `node` down: empty
+/// where `node` does not hold it.
+pub fn enclosing(node: Node, offset: Int) -> List<Node> / {abort.raise} =
+  if !holds(node, offset) { [] } else {
+    iterate(
+      { at: node, path: [node] },
+      4 * bytes_len(source(node)) + 64,
+      |s: { at: Node, path: List<Node> }|
+        match filter(children(s.at), |child: Node| holds(child, offset)) {
+          [] -> Stop(s.path),
+          [inner, ..] -> Continue({ at: inner, path: push(s.path, inner) }),
+        },
+    )
+  }
+
+/// A node's tree with every position, comment and layout left out: two nodes have one shape
+/// exactly when they are the same tree, however each is written. A literal counts by its value,
+/// so `1_000` and `1000` are one shape.
+pub fn shape(node: Node) -> Bytes / {abort.raise} =
+  match node { Node(origin, at) -> shaped(origin.source, at, 8) }
+
+/// A part the compiler dumps is its dump; any other is its kind, its name and its parts' shapes,
+/// each led by its length. Such a part holds dumped ones within two levels, which `room` covers.
+fn shaped(source: Bytes, at: At, room: Int) -> Bytes / {abort.raise} =
+  match at {
+    AModule(m) -> fmt::erase_spans(items::dump_module(m)),
+    AItem(item) -> fmt::erase_spans(items::dump_item(item)),
+    AExpr(e) -> fmt::erase_spans(exprs::dump_expr(e)),
+    APattern(p) -> fmt::erase_spans(patterns::dump_pattern(p)),
+    AType(t) -> fmt::erase_spans(type_syntax::dump_ty(t)),
+    AParam(p) -> fmt::erase_spans(exprs::dump_param(p)),
+    ARow(r) -> fmt::erase_spans(type_syntax::dump_row(r)),
+    _ -> if room <= 0 { b"" } else {
+      bytes_concat_all(
+        fold(
+          parts_of(source, at),
+          [part_tag(at), b"(", match name_of(at) { Some(ident) -> ident.name, None -> b"" }, b")"],
+          |acc: List<Bytes>, part: At| {
+            let inner = shaped(source, part, room - 1);
+            push(push(push(acc, bytes_of_string(int_to_string(bytes_len(inner)))), b":"), inner)
+          },
+        ),
+      )
+    },
+  }
+
+fn part_tag(at: At) -> Bytes =
+  match at {
+    AImport(_) -> b"import",
+    AImported(_) -> b"imported",
+    AAlias(_) -> b"alias",
+    AVariant(_) -> b"variant",
+    AOperation(_) -> b"operation",
+    AClause(c) -> items::spec_kind_text(c.kind),
+    ADecreases(_) -> b"decreases",
+    ALet(stmt) -> match stmt { SLetElse(_) -> b"let-else", _ -> b"let" },
+    AArm(_) -> b"arm",
+    AHandler(_) -> b"handler",
+    AReturn(_) -> b"return",
+    AField(_) -> b"field",
+    APatField(_) -> b"field",
+    ATypeField(_) -> b"field",
+    _ -> b"",
+  }
+
+// --- Parsing ----------------------------------------------------------------
+
+/// A source's tree, and what the parser said of it: no diagnostic for a source that parses.
+pub type Parsed = new { tree: Node, diagnostics: List<Diagnostic> }
+
+fn origin_of(source: Bytes) -> Origin / {abort.raise} =
+  { source: source, comments: lexer::lex(source).comments }
+
+/// One module's source as a tree, a `Module` node, with the parser's diagnostics.
+///
+/// The parse takes time in proportion to the source and nests at most 128 deep, refusing what
+/// nests deeper. An item that does not parse is a diagnostic and no node, and the items around it
+/// are read.
+pub fn parse(source: Bytes) -> Parsed / {abort.raise} = {
+  let read = items::parse(source);
+  {
+    tree: Node(origin_of(source), AModule(read.node)),
+    diagnostics: map(read.parser.diags, |diag: ParseDiag| said(source, diag)),
+  }
+}
+
+/// What `ply fmt` writes for a module's source: the same function, so the same bytes. A source
+/// that does not parse is refused with the parser's first diagnostic, as the command refuses it.
+/// The formatter holds its own answer to parsing as its source does, and refuses a source it
+/// would print otherwise: that is a defect of `ply`, answered as `E0505`.
+pub fn format(source: Bytes) -> Result<Bytes, Diagnostic> / {abort.raise} =
+  match fmt::fmt_source(source) {
+    Ok(out) -> Ok(out),
+    Err(why) -> match list_at(items::parse(source).parser.diags, 0) {
+      Some(diag) -> Err(said(source, diag)),
+      None ->
+        Err(
+          said(source, parsing::error_at(b"E0505", { start: 0, end: 0 }, why, b"not printed", [])),
+        ),
+    },
+  }
+
+/// A source as `format` writes it, or as it is where `format` refuses it.
+pub fn formatted(source: Bytes) -> Bytes / {abort.raise} =
+  match format(source) { Ok(out) -> out, Err(_) -> source }
+
+fn starts_before(a: Edit, b: Edit) -> Bool = a.span.start < b.span.start
+
+/// `source` with every one of `edits` made, each by its span in `source` as it stands, and every
+/// byte outside them kept. `None` where two edits overlap or one reaches outside the source.
+pub fn edited(source: Bytes, edits: List<Edit>) -> Option<Bytes> = {
+  let ordered = sort_by(edits, starts_before);
+  let made = fold(
+    ordered,
+    Some({ out: [], from: 0 }),
+    |acc: Option<{ out: List<Bytes>, from: Int }>, edit: Edit|
+      match acc {
+        None -> None,
+        Some(so_far) -> if edit.span.start < so_far.from || edit.span.end < edit.span.start
+            || edit.span.end > bytes_len(source) { None } else {
+          match try[abort.raise] { bytes_slice(source, so_far.from, edit.span.start) } {
+            Err(_) -> None,
+            Ok(kept) -> Some({ out: push(push(so_far.out, kept), edit.text), from: edit.span.end }),
+          }
+        },
+      },
+  );
+  match made {
+    None -> None,
+    Some(done) -> match try[abort.raise] { bytes_slice(source, done.from, bytes_len(source)) } {
+      Err(_) -> None,
+      Ok(rest) -> Some(bytes_concat_all(push(done.out, rest))),
+    },
+  }
+}
+
+// --- Fragments --------------------------------------------------------------
+
+/// The first diagnostic of a parse that made any, or one for what follows the fragment.
+fn refusal(
+  source: Bytes,
+  input: Input,
+  parser: Parser,
+  what: String,
+) -> Option<Diagnostic> / {abort.raise} =
+  match list_at(parser.diags, 0) {
+    Some(diag) -> Some(said(source, diag)),
+    None -> if parsing::at_eof(input, parser) { None } else {
+      Some(
+        unexpected(
+          source,
+          parsing::current_span(input, parser),
+          "expected the end of " ++ what,
+          "the " ++ what ++ " ends before this",
+        ),
+      )
+    },
+  }
+
+fn failed(parser: Parser, source: Bytes) -> Diagnostic =
+  match list_at(parser.diags, 0) {
+    Some(diag) -> said(source, diag),
+    None -> unexpected(source, { start: 0, end: 0 }, "this does not parse", "here"),
+  }
+
+/// One expression, whole: an `Err` where `text` is none, or holds more than one.
+pub fn expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
+  let s = parsing::start(text);
+  match exprs::expr(s.input, s.parser) {
+    Err(parser) -> Err(failed(parser, text)),
+    Ok(read) -> match refusal(text, s.input, read.parser, "expression") {
+      Some(why) -> Err(why),
+      None -> Ok(Node(origin_of(text), AExpr(read.node))),
+    },
+  }
+}
+
+/// One pattern, whole.
+pub fn pattern(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
+  let s = parsing::start(text);
+  match patterns::pattern(s.input, s.parser) {
+    Err(parser) -> Err(failed(parser, text)),
+    Ok(read) -> match refusal(text, s.input, read.parser, "pattern") {
+      Some(why) -> Err(why),
+      None -> Ok(Node(origin_of(text), APattern(read.node))),
+    },
+  }
+}
+
+/// One type, whole.
+pub fn type_expression(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
+  let s = parsing::start(text);
+  match type_syntax::ty(s.input, s.parser) {
+    Err(parser) -> Err(failed(parser, text)),
+    Ok(read) -> match refusal(text, s.input, read.parser, "type") {
+      Some(why) -> Err(why),
+      None -> Ok(Node(origin_of(text), AType(read.node))),
+    },
+  }
+}
+
+/// One item, whole, with its doc: an `Err` where `text` does not parse, imports, or holds none or
+/// more than one.
+pub fn item(text: Bytes) -> Result<Node, Diagnostic> / {abort.raise} = {
+  let read = items::parse(text);
+  match list_at(read.parser.diags, 0) {
+    Some(diag) -> Err(said(text, diag)),
+    None -> match ((filter(read.node.imports, is_written), read.node.items)) {
+      ([], [one]) -> Ok(Node(origin_of(text), AItem(one))),
+      _ ->
+        Err(
+          unexpected(
+            text,
+            { start: 0, end: bytes_len(text) },
+            "expected one item and no import",
+            "not one item",
+          ),
+        ),
+    },
+  }
+}
+
+/// A name as an expression, a `Name` node: an `Err` where `text` is not one identifier, a keyword
+/// among them.
+pub fn identifier(text: String) -> Result<Node, Diagnostic> / {abort.raise} = {
+  let given = bytes_of_string(text);
+  let lexed = lexer::lex(given);
+  match ((lexed.diags, lexed.tokens)) {
+    ([], [first, _]) -> match first.kind {
+      lexer::Identifier(n) -> {
+        let at = { start: first.start, end: first.end };
+        Ok(
+          Node(
+            { source: given, comments: [] },
+            AExpr(EVar({ span: at, name: parsing::bare({ name: n, span: at }) })),
+          ),
+        )
+      },
+      _ -> Err(not_a_name(given)),
+    },
+    _ -> Err(not_a_name(given)),
+  }
+}
+
+fn not_a_name(given: Bytes) -> Diagnostic =
+  unexpected(given, { start: 0, end: bytes_len(given) }, "expected one name", "not a name")
+
+// --- The `syntax"…"` literal ------------------------------------------------
+
+/// What may stand in a hole, by what the text around it makes of a name written there.
+type Stand = | AsName | AsExpression | AsPattern | AsType
+
+/// The texts of a `syntax"…"` literal with holes, and what each hole stands as.
+pub opaque type Template = | Template(List<Bytes>, List<Stand>)
+
+/// Why a literal's text is refused, as a tagged literal's parser answers it.
+pub type Malformed = { message: String, offset: Int }
+
+/// Why a literal's texts are refused: `part` is the text, counted from 0.
+pub type MalformedPart = { message: String, offset: Int, part: Int }
+
+fn hole_name(i: Int) -> Bytes = bytes_concat(b"hole__", bytes_of_string(int_to_string(i)))
+
+/// How many characters `text` holds before the byte at `upto`.
+fn characters(text: Bytes, upto: Int) -> Int =
+  string_len(
+    string_of_bytes_lossy(match try[abort.raise] { bytes_slice(text, 0, upto) } {
+      Ok(before) -> before,
+      Err(_) -> text,
+    }),
+  )
+
+/// The texts with a name where each hole stands, and where each text starts in the whole.
+fn assembled(texts: List<Bytes>) -> { whole: Bytes, starts: List<Int> } =
+  fold(
+    range(0, len(texts)),
+    { whole: b"", starts: [] },
+    |acc: { whole: Bytes, starts: List<Int> }, i: Int| {
+      let led = if i == 0 { acc.whole } else { bytes_concat(acc.whole, hole_name(i - 1)) };
+      { whole: bytes_concat(led, at_or(texts, i, b"")), starts: push(acc.starts, bytes_len(led)) }
+    },
+  )
+
+/// The text an offset of the whole falls in, and how far into it: a hole's name counts as the end
+/// of the text before it.
+fn located(texts: List<Bytes>, starts: List<Int>, offset: Int) -> { part: Int, offset: Int } =
+  fold(range(0, len(texts)), { part: 0, offset: 0 }, |found: { part: Int, offset: Int }, i: Int| {
+    let from = at_or(starts, i, 0);
+    let text = at_or(texts, i, b"");
+    if offset < from { found } else if offset <= from + bytes_len(text) {
+      { part: i, offset: characters(text, offset - from) }
+    } else { { part: i, offset: characters(text, bytes_len(text)) } }
+  })
+
+fn stand_of(node: Node) -> Stand / {abort.raise} =
+  match kind(node) {
+    Name -> AsExpression,
+    Binding -> AsPattern,
+    TypeVariable -> AsType,
+    _ -> AsName,
+  }
+
+/// What the hole named `hole` stands as in `tree`, where a node is named by it.
+fn standing(tree: Node, hole: Bytes) -> Option<Stand> / {abort.raise} = {
+  let spelled = string_of_bytes_lossy(hole);
+  fold(walk(tree), None, |found: Option<Stand>, node: Node|
+    match found {
+      Some(_) -> found,
+      None -> match name(node) {
+        Some(ident) -> if ident.text == spelled && qualifier(node) == None { Some(stand_of(node)) }
+        else { None },
+        None -> None,
+      },
+    })
+}
+
+/// What a `syntax"…"` literal with holes is checked by: the texts as one module, a name where
+/// each hole stands. A hole stands where the name would be an expression, a pattern, a type, or
+/// the name of a definition, a parameter or a field.
+pub fn compile(parts: List<String>) -> Result<Template, MalformedPart> / {abort.raise} = {
+  let texts = map(parts, bytes_of_string);
+  let made = assembled(texts);
+  let read = parse(made.whole);
+  match primary_of(read.diagnostics) {
+    Some(refused) -> {
+      let at = located(texts, made.starts, refused.span.start);
+      Err({ message: refused.text, offset: at.offset, part: at.part })
+    },
+    None ->
+      fold(
+        range(0, len(texts) - 1),
+        Ok(Template(texts, [])),
+        |acc: Result<Template, MalformedPart>, i: Int|
+          match acc {
+            Err(_) -> acc,
+            Ok(Template(held, stands)) -> match standing(read.tree, hole_name(i)) {
+              Some(stand) -> Ok(Template(held, push(stands, stand))),
+              None ->
+                Err({
+                  message: "a hole stands here for an expression, a pattern, a type or a name, and this is none of them",
+                  offset: characters(at_or(texts, i, b""), bytes_len(at_or(texts, i, b""))),
+                  part: i,
+                }),
+            },
+          },
+      ),
+  }
+}
+
+/// The message and place of the first diagnostic, as a literal's refusal carries them.
+fn primary_of(diagnostics: List<Diagnostic>) -> Option<{ text: String, span: Span }> =
+  match list_at(diagnostics, 0) {
+    None -> None,
+    Some(diagnostic) -> match primary(diagnostic) {
+      Some(label) -> Some({ text: diagnostic.message, span: label.span }),
+      None -> Some({ text: diagnostic.message, span: { start: 0, end: 0 } }),
+    },
+  }
+
+/// What a `syntax"…"` literal with no hole is checked by, and is: the text as one module.
+pub fn literal(text: String) -> Result<Node, Malformed> / {abort.raise} = {
+  let given = bytes_of_string(text);
+  let read = parse(given);
+  match primary_of(read.diagnostics) {
+    Some(refused) -> Err({ message: refused.text, offset: characters(given, refused.span.start) }),
+    None -> Ok(read.tree),
+  }
+}
+
+fn misplaced<a>(node: Node, wanted: String) -> a / {syntax.refused, abort.raise} =
+  syntax.refused(
+    unexpected(
+      text(node),
+      { start: 0, end: bytes_len(text(node)) },
+      "a hole here takes " ++ wanted,
+      "not " ++ wanted,
+    ),
+  )
+
+fn is_bare_name(node: Node) -> Bool / {abort.raise} =
+  qualifier(node) == None
+    && (match kind(node) { Name -> true, Binding -> true, TypeVariable -> true, _ -> false })
+
+/// A node's text in parentheses. A line string runs to the end of its line, so one that ends the
+/// text has the closing parenthesis on the next.
+fn bracketed(node: Node) -> Bytes / {abort.raise} = {
+  let written = text(node);
+  let ends_lines = match bytes_index_of(written, b"\\\\") { Some(_) -> b"\n", None -> b"" };
+  bytes_concat_all([b"(", written, ends_lines, b")"])
+}
+
+/// A node as the text a hole of its stand takes.
+fn placed(stand: Stand, node: Node) -> Bytes / {syntax.refused, abort.raise} =
+  match ((stand, node)) {
+    (AsName, _) -> if is_bare_name(node) { text(node) } else { misplaced(node, "a name") },
+    (AsExpression, Node(_, AExpr(e))) -> match e { EVar(_) -> text(node), _ -> bracketed(node) },
+    (AsExpression, _) -> misplaced(node, "an expression"),
+    (AsPattern, Node(_, APattern(_))) -> bracketed(node),
+    (AsPattern, _) -> if is_bare_name(node) { text(node) } else { misplaced(node, "a pattern") },
+    (AsType, Node(_, AType(_))) -> bracketed(node),
+    (AsType, _) -> if is_bare_name(node) { text(node) } else { misplaced(node, "a type") },
+  }
+
+/// The module a `syntax"…"` literal is with `holes` where its holes stand: each node written
+/// whole where it stands, in parentheses unless it is a name. Refused where a node is not what its
+/// hole takes, or the text made does not parse.
+pub fn fill(template: Template, holes: List<Node>) -> Node / {syntax.refused, abort.raise} =
+  match template {
+    Template(texts, stands) -> {
+      let whole = bytes_concat_all(
+        fold(range(0, len(texts)), [], |acc: List<Bytes>, i: Int| {
+          let with_text = push(acc, at_or(texts, i, b""));
+          match ((list_at(stands, i), list_at(holes, i))) {
+            (Some(stand), Some(node)) -> push(with_text, placed(stand, node)),
+            _ -> with_text,
+          }
+        }),
+      );
+      let read = parse(whole);
+      match list_at(read.diagnostics, 0) { Some(why) -> syntax.refused(why), None -> read.tree }
+    },
+  }
+
+// --- Sampling ---------------------------------------------------------------
+
+/// A small module that parses and checks, written with uneven layout and comments, for a claim
+/// about source to be sampled over: `forall (s: Sample)` draws programs where a `Bytes` draws
+/// noise no parser reads. Its definitions are `f0`, `f1` and so on, each of one `Int` named `x` to
+/// an `Int`, and a `let` in one binds `y`.
+pub type Sample = | Sample(Bytes)
+
+gen for Sample by samples
+
+/// The source a `Sample` holds.
+pub fn sample_source(s: Sample) -> Bytes = match s { Sample(source) -> source }
+
+/// The smallest bodies of a sample: each an `Int` over `x`, with no import behind it.
+fn sample_atoms() -> List<Bytes> =
+  [b"x", b"1", b"2_000", b"0xFF", b"( x )", b"len([x,x])", b"map_len(#{ 1:x })"]
+
+/// What a body is also written with where only its spelling is read: the forms the parser makes
+/// calls of, and the literals whose spelling the formatter keeps.
+fn spelled_atoms() -> List<Bytes> =
+  concat(sample_atoms(), [
+    b"f\"n {x}\"",
+    b"(f\"{x+1} of {x}\")",
+    b"( ( f\"{x}\" ) )",
+    b"tag\"t {x}\"",
+    b"#[x, 1 ]",
+    b"(x,1)",
+    b"x +% 1",
+    b"{ a:x, b }",
+    b"{ ..r, a:x }",
+    b"g(x, to:1)",
+    b"r.a",
+    b"x?",
+    b"'c'",
+    b"1.50m",
+    b"b\"\\x00\"",
+    b"-  x",
+    b"|n: Int| n",
+    b"eff.op[r](x)",
+  ])
+
+fn sample_bodies(depth: Int, atoms: List<Bytes>) -> Gen<Bytes> =
+  if depth <= 0 { gen::elements(atoms) } else {
+    let inner = sample_bodies(depth - 1, atoms);
+    gen::one_of([
+      gen::elements(atoms),
+      gen::map2(inner, inner, |a: Bytes, b: Bytes| bytes_concat_all([a, b"+   ", b])),
+      gen::map2(inner, inner, |a: Bytes, b: Bytes| bytes_concat_all([a, b"  *  (", b, b")"])),
+      gen::map2(inner, inner, |a: Bytes, b: Bytes|
+        bytes_concat_all([b"if (", a, b")>0{", b, b"}else{ x }"])),
+      gen::map2(inner, inner, |a: Bytes, b: Bytes|
+        bytes_concat_all([b"{ let y=", a, b";\n      y - ", b, b" }"])),
+      gen::map2(inner, inner, |a: Bytes, b: Bytes|
+        bytes_concat_all([b"match (", a, b") { 0->", b, b",  // none\n _ -> x }"])),
+      gen::map(inner, |a: Bytes|
+        bytes_concat_all([b"fold([1,2 , 3],", a, b",|acc:Int,n:Int| acc+n)"])),
+    ])
+  }
+
+/// A module of up to three definitions, each body made of `atoms`.
+fn sample_modules(atoms: List<Bytes>) -> Gen<Bytes> =
+  gen::map(
+    gen::list_of(
+      gen::map2(
+        gen::elements([b"", b"// a note\n", b"/// A doc.\n", b"\n\n"]),
+        sample_bodies(2, atoms),
+        |lead: Bytes, body: Bytes| { lead: lead, body: body },
+      ),
+      3,
+    ),
+    |defs: List<{ lead: Bytes, body: Bytes }>|
+      bytes_concat_all(
+        map(range(0, len(defs)), |i: Int| {
+          let def = at_or(defs, i, { lead: b"", body: b"x" });
+          bytes_concat_all([
+            def.lead,
+            b"fn f",
+            bytes_of_string(int_to_string(i)),
+            b"( x:Int )->Int=",
+            def.body,
+            b"\n",
+          ])
+        }),
+      ),
+  )
+
+fn samples() -> Gen<Sample> =
+  gen::map(sample_modules(sample_atoms()), |source: Bytes| Sample(source))
+
+/// A module that parses and need not check: a sample's layouts over every form the formatter reads
+/// back from the source.
+type Spelled = | Spelled(Bytes)
+
+gen for Spelled by spellings
+
+fn spelled_text(s: Spelled) -> Bytes = match s { Spelled(source) -> source }
+
+fn spellings() -> Gen<Spelled> =
+  gen::map(sample_modules(spelled_atoms()), |source: Bytes| Spelled(source))
+
+/// A text made of what Ply source is written in, most of it no module: openers of every literal,
+/// escapes, brackets, operators and characters cut short, which a `Bytes` rarely draws side by side.
+type Noise = | Noise(Bytes)
+
+gen for Noise by noises
+
+fn noise_text(n: Noise) -> Bytes = match n { Noise(text) -> text }
+
+fn noises() -> Gen<Noise> =
+  gen::map(gen::list_of(gen::elements(noise_parts()), 12), |parts: List<Bytes>|
+    Noise(bytes_concat_all(parts)))
+
+fn noise_parts() -> List<Bytes> =
+  [
+    b"fn f() -> Int = ",
+    b"type T = ",
+    b"test \"",
+    b"law \"",
+    b"import a.b ",
+    b"\"",
+    b"'",
+    b"b\"",
+    b"b'",
+    b"f\"",
+    b"tag\"",
+    b"\\\\",
+    b"\\",
+    b"\\u{",
+    b"\\x",
+    b"\\n",
+    b"{",
+    b"}",
+    b"(",
+    b")",
+    b"[",
+    b"]",
+    b"#{",
+    b"#[",
+    b"<",
+    b">",
+    b"|",
+    b"->",
+    b"=",
+    b",",
+    b";",
+    b":",
+    b"::",
+    b".",
+    b"..=",
+    b"?",
+    b"+%",
+    b"-",
+    b"/",
+    b"//",
+    b"///",
+    b"//!",
+    b"\n",
+    b" ",
+    b"x",
+    b"_",
+    b"1",
+    b"0x",
+    b"1e",
+    b"1.",
+    b"u8",
+    b"m",
+    b"if ",
+    b"else ",
+    b"match ",
+    b"let ",
+    b"handle ",
+    b"with ",
+    b"\xc3",
+    b"\xc3\xa9",
+    b"\xe2\x82",
+    b"\xf0\x9f",
+    b"\xff",
+    b"\x00",
+  ]
+
+// --- Tests ------------------------------------------------------------------
+
+fn tree_of(source: Bytes) -> Node / {abort.raise} = parse(source).tree
+
+fn kinds(nodes: List<Node>) -> List<Kind> / {abort.raise} = map(nodes, kind)
+
+fn texts_of(nodes: List<Node>) -> List<Bytes> / {abort.raise} = map(nodes, text)
+
+fn names_in(tree: Node) -> List<String> / {abort.raise} =
+  fold(walk(tree), [], |found: List<String>, node: Node|
+    match ((kind(node), name(node))) { (Name, Some(ident)) -> push(found, ident.text), _ -> found })
+
+fn first_item(source: Bytes) -> Node / {abort.raise} =
+  match children(tree_of(source)) { [first, ..] -> first, [] -> panic("the source holds no item") }
+
+fn body_of(source: Bytes) -> Node / {abort.raise} = {
+  let parts = children(first_item(source));
+  match list_at(parts, len(parts) - 1) {
+    Some(body) -> body,
+    None -> panic("the item holds nothing"),
+  }
+}
+
+test "a module is its imports and its items, each read by what it is and what it names" {
+  let tree = tree_of(
+    b"//! A module.\n\nimport std.list (at, concat)\nimport std.json as j\n\n/// Adds.\npub fn add(a: Int, b: Int) -> Int = a + b\n\ntype Shape = | Dot | Line(Int)\n\ntest \"adds\" { assert_eq(add(1, 2), 3) }\n",
+  );
+  assert_eq(kind(tree), Module);
+  assert_eq(doc(tree), ["A module."]);
+  let parts = children(tree);
+  assert_eq(kinds(parts), [Import, Import, Function, TypeDeclaration, Test]);
+  assert_eq(map(parts, |n: Node| match name(n) { Some(i) -> i.text, None -> "" }), [
+    "std.list",
+    "std.json",
+    "add",
+    "Shape",
+    "adds",
+  ]);
+  assert_eq(texts_of(children(at_or(parts, 0, tree))), [b"at", b"concat"]);
+  assert_eq(kinds(children(at_or(parts, 1, tree))), [ImportAlias]);
+  let add = at_or(parts, 2, tree);
+  assert(is_public(add));
+  assert_eq(doc(add), ["Adds."]);
+  assert_eq(kinds(children(add)), [Parameter, Parameter, TypeName, Binary]);
+  assert_eq(text(add), b"fn add(a: Int, b: Int) -> Int = a + b");
+  assert_eq(kinds(children(at_or(parts, 3, tree))), [Variant, Variant])
+}
+
+test "an expression is read as it is written, whatever the compiler makes of it" {
+  let body = |source: Bytes|
+    body_of(bytes_concat(b"fn f(x: Int, m: Map<Int, Int>) -> Int = ", source));
+  assert_eq(kind(body(b"f\"a {x} b {x + 1}\"\n")), Interpolation);
+  assert_eq(texts_of(children(body(b"f\"a {x} b {x + 1}\"\n"))), [b"x", b"x + 1"]);
+  assert_eq(kind(body(b"#{1: x, 2: 3}\n")), MapLiteral);
+  assert_eq(texts_of(children(body(b"#{1: x, 2: 3}\n"))), [b"1", b"x", b"2", b"3"]);
+  assert_eq(kind(body(b"#[x, 2]\n")), SetLiteral);
+  assert_eq(texts_of(children(body(b"#[x, 2]\n"))), [b"x", b"2"]);
+  assert_eq(kind(body(b"(x, 2)\n")), Tuple);
+  assert_eq(texts_of(children(body(b"(x, 2)\n"))), [b"x", b"2"]);
+  let wrapping = body(b"x +% 2\n");
+  assert_eq(kind(wrapping), Binary);
+  assert_eq(operator(wrapping), Some("+%"));
+  assert_eq(texts_of(children(wrapping)), [b"x", b"2"]);
+  assert_eq(operator(body(b"x * 2\n")), Some("*"));
+  assert_eq(kinds(children(body(b"if x > 0 { x }\n"))), [Binary, Block]);
+  assert_eq(kinds(children(body(b"if x > 0 { x } else { 0 }\n"))), [Binary, Block, Block]);
+  assert_eq(names_in(body(b"f(x, m: m)\n")), ["f", "x", "m"]);
+  assert_eq(names_in(body(b"f\"{x}\"\n")), ["x"])
+}
+
+test "every name a body refers to is a node, and no name the parser wrote for itself is" {
+  let tree = tree_of(
+    b"fn f(xs: List<Int>, m: Map<Int, Int>) -> String = {\n  let total = fold(xs, 0, |acc: Int, x: Int| acc + x);\n  match list_at(xs, total) {\n    Some(first) -> f\"{first} of {len(xs)}\",\n    None -> show(#{1: total}),\n  }\n}\n",
+  );
+  assert_eq(names_in(tree), [
+    "fold",
+    "xs",
+    "acc",
+    "x",
+    "list_at",
+    "xs",
+    "total",
+    "first",
+    "len",
+    "xs",
+    "show",
+    "total",
+  ])
+}
+
+test "a node is found by a byte of its source, and read by its place" {
+  let source = b"fn f(x: Int) -> Int =\n  x + 10\n";
+  let tree = tree_of(source);
+  let path = enclosing(tree, 28);
+  assert_eq(kinds(path), [Module, Function, Binary, Literal]);
+  let ten = at_or(path, 3, tree);
+  assert_eq(text(ten), b"10");
+  assert_eq(int_value(ten), Some(10));
+  assert_eq(place(ten), { line: 2, column: 7 });
+  assert_eq(span(ten), { start: 28, end: 30 });
+  assert_eq(enclosing(tree, 400), [])
+}
+
+test "comments are reached from the node whose span holds them, and docs from what they document" {
+  let source = b"// leads\n/// Doubles.\nfn double(x: Int) -> Int = {\n  // twice\n  x * 2  // done\n}\n";
+  let tree = tree_of(source);
+  assert_eq(map(comments(tree), |c: Comment| c.text), [
+    "// leads",
+    "/// Doubles.",
+    "// twice",
+    "// done",
+  ]);
+  let item = first_item(source);
+  assert_eq(doc(item), ["Doubles."]);
+  assert_eq(map(comments(item), |c: Comment| c.text), ["// twice", "// done"])
+}
+
+test "a source that does not parse answers its diagnostics as values and the items around the break" {
+  let read = parse(b"fn one() -> Int = 1\n\nfn two( = 2\n\nfn three() -> Int = 3\n");
+  assert_eq(map(read.diagnostics, |d: Diagnostic| d.code), ["E0001"]);
+  match list_at(read.diagnostics, 0) {
+    None -> panic("the parser reports the break"),
+    Some(d) -> {
+      assert_eq(d.severity, Error);
+      assert(string_starts_with(d.message, "expected "));
+      match primary(d) {
+        None -> panic("a diagnostic is placed"),
+        Some(label) -> {
+          assert_eq(label.place, { line: 3, column: 9 });
+          assert_eq(label.span.start, 29)
+        },
+      }
+    },
+  };
+  assert_eq(map(children(read.tree), |n: Node| match name(n) { Some(i) -> i.text, None -> "" }), [
+    "one",
+    "three",
+  ])
+}
+
+test "format is the formatter: it lays a module out, keeps its comments and refuses what does not parse" {
+  assert_eq(
+    format(b"// top\nfn   f(a: Int,b: Int)->Int = a+b // add\n"),
+    Ok(b"// top\nfn f(a: Int, b: Int) -> Int = a + b  // add\n"),
+  );
+  match format(b"fn f( = 1\n") {
+    Ok(_) -> panic("a source that does not parse is not printed"),
+    Err(d) -> assert_eq(d.code, "E0001"),
+  };
+  assert_eq(formatted(b"fn f( = 1\n"), b"fn f( = 1\n")
+}
+
+test "two sources that differ in layout, comments and a literal's spelling have one shape" {
+  let a = tree_of(b"fn f(x: Int) -> Int = x + 1_000\n");
+  let b = tree_of(b"// the same\nfn f( x : Int ) -> Int =\n  x + 1000\n");
+  assert_eq(shape(a), shape(b));
+  assert(a != b);
+  assert(shape(a) != shape(tree_of(b"fn f(x: Int) -> Int = x + 1001\n")));
+  assert_eq(
+    shape(body_of(b"fn f(x: Int) -> Int = x + 1\n")),
+    shape(body_of(b"fn g(x: Int) -> Int =\n  x  +  1\n")),
+  )
+}
+
+test "edits are made by span and keep every other byte, and edits that collide are refused" {
+  let source = b"fn f(x: Int) -> Int = x + x  // twice\n";
+  let renamed = edited(source, [
+    { path: "", span: { start: 26, end: 27 }, text: b"y" },
+    { path: "", span: { start: 5, end: 6 }, text: b"y" },
+    { path: "", span: { start: 22, end: 23 }, text: b"y" },
+  ]);
+  assert_eq(renamed, Some(b"fn f(y: Int) -> Int = y + y  // twice\n"));
+  assert_eq(
+    edited(source, [{ path: "", span: { start: 0, end: 0 }, text: b"pub " }]),
+    Some(bytes_concat(b"pub ", source)),
+  );
+  assert_eq(
+    edited(source, [
+      { path: "", span: { start: 5, end: 7 }, text: b"a" },
+      { path: "", span: { start: 6, end: 8 }, text: b"b" },
+    ]),
+    None,
+  );
+  assert_eq(edited(source, [{ path: "", span: { start: 30, end: 90 }, text: b"" }]), None)
+}
+
+test "a fragment is one expression, pattern, type, item or name, whole, or it is refused" {
+  match expression(b"f(x) + 1") {
+    Ok(node) -> {
+      assert_eq(kind(node), Binary);
+      assert_eq(names_in(node), ["f", "x"])
+    },
+    Err(d) -> panic(d.message),
+  };
+  assert(match expression(b"f(x) g") { Ok(_) -> false, Err(d) -> d.code == "E0001" });
+  assert(match expression(b"") { Ok(_) -> false, Err(_) -> true });
+  assert(match pattern(b"Some([first, ..rest])") {
+    Ok(n) -> kind(n) == ConstructorPattern,
+    Err(_) -> false,
+  });
+  assert(match type_expression(b"Map<String, List<Int>>") {
+    Ok(n) -> kind(n) == TypeName,
+    Err(_) -> false,
+  });
+  assert(match type_expression(b"Map<String") { Ok(_) -> false, Err(_) -> true });
+  assert(match item(b"/// One.\nfn one() -> Int = 1\n") {
+    Ok(n) -> doc(n) == ["One."],
+    Err(_) -> false,
+  });
+  assert(match item(b"fn one() -> Int = 1\nfn two() -> Int = 2\n") {
+    Ok(_) -> false,
+    Err(_) -> true,
+  });
+  assert(match identifier("total") { Ok(n) -> kind(n) == Name, Err(_) -> false });
+  assert(match identifier("fn") { Ok(_) -> false, Err(_) -> true });
+  assert(match identifier("a b") { Ok(_) -> false, Err(_) -> true })
+}
+
+fn made_of(parts: List<String>, holes: List<Node>) -> Result<Bytes, String> / {abort.raise} =
+  match compile(parts) {
+    Err(why) -> Err(why.message),
+    Ok(template) -> match try { fill(template, holes) } {
+      Ok(tree) -> Ok(formatted(source(tree))),
+      Err(why) -> Err(why.message),
+    },
+  }
+
+fn fragment(read: Result<Node, Diagnostic>) -> Node / {abort.raise} =
+  match read { Ok(node) -> node, Err(d) -> panic(d.message) }
+
+test "a literal's holes take nodes: a name, an expression bracketed where it stands, a pattern, a type" {
+  assert_eq(
+    made_of(["pub fn ", "(x: ", ") -> ", " = match x { ", " -> ", " * 2, _ -> 0 }\n"], [
+      fragment(identifier("twice")),
+      fragment(type_expression(b"Option<Int>")),
+      fragment(type_expression(b"Int")),
+      fragment(pattern(b"Some(n)")),
+      fragment(expression(b"n + 1")),
+    ]),
+    Ok(b"pub fn twice(x: Option<Int>) -> Int = match x { Some(n) -> (n + 1) * 2, _ -> 0 }\n"),
+  );
+  assert(match expression(b"1 } fn g() -> Int = { 2") { Ok(_) -> false, Err(_) -> true })
+}
+
+test "a function type and a line string in a hole stay the one node each was" {
+  assert_eq(
+    made_of(["fn f(g: ", ") -> Int / {abort.raise} = g(1)\n"], [
+      fragment(type_expression(b"(Int) -> Int / {abort.raise}")),
+    ]),
+    Ok(b"fn f(g: (Int) -> Int / {abort.raise}) -> Int / {abort.raise} = g(1)\n"),
+  );
+  match made_of(["fn f() -> String = ", " ++ \"!\"\n"], [fragment(expression(b"\\\\one\n"))]) {
+    Err(why) -> panic(why),
+    Ok(made) -> {
+      let body = body_of(made);
+      assert_eq(kind(body), Binary);
+      assert_eq(map(children(body), string_value), [Some("one"), Some("!")])
+    },
+  }
+}
+
+test "a hole that takes a name refuses anything else, and a text that is no module is refused where it breaks" {
+  assert_eq(
+    made_of(["fn ", "() -> Int = 1\n"], [fragment(expression(b"a + b"))]),
+    Err("a hole here takes a name"),
+  );
+  assert_eq(
+    compile(["fn f( = ", "\n"]),
+    Err({ message: "expected a parameter name, found `=`", offset: 6, part: 0 }),
+  );
+  assert(match literal("fn f() -> Int = 1\n") {
+    Ok(tree) -> kind(tree) == Module,
+    Err(_) -> false,
+  });
+  assert_eq(
+    match literal("fn f() -> Int = \n") { Ok(_) -> None, Err(why) -> Some(why.offset) },
+    Some(17),
+  )
+}
+
+/// Whether each node under `node`, `room` levels down, lies inside its parent and starts no earlier
+/// than the one before it.
+fn nested(node: Node, room: Int) -> Bool / {abort.raise} =
+  if room <= 0 { true } else {
+    let within = span(node);
+    fold(
+      children(node),
+      { ok: true, from: within.start },
+      |acc: { ok: Bool, from: Int }, child: Node| {
+        let at = span(child);
+        {
+          ok: acc.ok && acc.from <= at.start && at.end <= within.end && nested(child, room - 1),
+          from: at.start,
+        }
+      },
+    ).ok
+  }
+
+test "a sample is a module that parses" {
+  let drawn = gen::sample(samples(), 7, b"sample", 16, None);
+  match drawn.value {
+    None -> panic("a sample is drawn"),
+    Some(s) -> assert_eq(parse(sample_source(s)).diagnostics, []),
+  }
+}
+
+law "any text formats to itself once it is formatted" = idempotent(formatted)
+
+law "any text is read as a module, with diagnostics where it is none, and walked"
+  forall (n: Noise) {
+    let read = parse(noise_text(n));
+    kind(read.tree) == Module && len(walk(read.tree)) > 0
+      && formatted(formatted(noise_text(n))) == formatted(noise_text(n))
+  }
+
+law "a sample parses" forall (s: Sample) { parse(sample_source(s)).diagnostics == [] }
+
+law "a module that parses is formatted, whatever it is written with"
+  forall (s: Spelled) {
+    parse(spelled_text(s)).diagnostics == []
+      && (match format(spelled_text(s)) { Ok(_) -> true, Err(_) -> false })
+  }
+
+law "formatting a module a second time changes nothing"
+  forall (s: Spelled) {
+    formatted(formatted(spelled_text(s))) == formatted(spelled_text(s))
+  }
+
+law "a formatted module parses to the tree its source does"
+  forall (s: Spelled) {
+    shape(parse(formatted(spelled_text(s))).tree) == shape(parse(spelled_text(s)).tree)
+  }
+
+law "a walk of a module meets each node inside its parent, after the one before it"
+  forall (s: Spelled) {
+    nested(parse(spelled_text(s)).tree, 64)
+  }
+
+law "an edit of nothing is the source" forall (source: Bytes) { edited(source, []) == Some(source) }
