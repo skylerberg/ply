@@ -1,0 +1,249 @@
+//! A rename that proves itself: every place a function is named is rewritten, the program is
+//! checked before and after, and the rename stands only where no definition's hash moved.
+//!
+//! A hash covers a definition's structure and all it reaches and no name, so a rename that only
+//! renames moves none: the function answers to its new name under its old hash, and so does every
+//! definition that calls it. A rename that captures, where the new name is already bound at a
+//! call or already defined, changes what some body means, and then the program no longer checks
+//! or that body's hash says so. The rewrite here is by syntax alone and knows nothing of scopes;
+//! the hashes are what make it safe to use.
+
+import std.checker
+import std.checker (Checked, Source)
+import std.string (replace)
+import std.syntax
+import std.syntax (Edit, Function, Import, ImportedName, Name, Node)
+
+/// Why a rename was not made.
+type Refused =
+  /// The program does not check as it stands, or its sources are past the limits: what was said.
+  | Unchecked(List<String>)
+  /// No function of that name is defined in that module.
+  | NotDefined(String)
+  /// The renamed program does not check: what was said of it.
+  | Breaks(List<String>)
+  /// The renamed program checks and is another program: the definitions that differ.
+  | Moves(List<String>)
+
+fn limits() -> checker::Limits = { files: 64, bytes: 1048576 }
+
+fn messages(program: Checked) -> List<String> =
+  map(program.diagnostics, |d: syntax::Diagnostic| d.code ++ ": " ++ d.message)
+
+fn checked(sources: List<Source>) -> Result<Checked, List<String>> / {abort.raise} =
+  match checker::check_alone(sources, limits()) {
+    Err(_) -> Err(["the sources are past what a rename reads"]),
+    Ok(program) -> if program.ok { Ok(program) } else { Err(messages(program)) },
+  }
+
+/// The name a module's file is imported under: its path, as a module name.
+fn module_of(path: String) -> String / {abort.raise} =
+  replace(string_slice(path, 0, string_len(path) - 4), "/", ".")
+
+fn last_segment(module: String) -> String / {abort.raise} = {
+  let parts = string_split(module, ".");
+  match list_at(parts, len(parts) - 1) { Some(last) -> last, None -> module }
+}
+
+fn renamed_at(node: Node, to: String) -> List<Edit> =
+  match syntax::name(node) {
+    Some(ident) -> [{ path: "", span: ident.span, text: bytes_of_string(to) }],
+    None -> [],
+  }
+
+fn is_named(node: Node, text: String) -> Bool =
+  match syntax::name(node) { Some(ident) -> ident.text == text, None -> false }
+
+fn is_qualified_by(node: Node, binder: String) -> Bool =
+  match syntax::qualifier(node) { Some(ident) -> ident.text == binder, None -> false }
+
+/// How one source names the module that defines the function: whether its uses are bare, and the
+/// binder a qualified use goes through.
+type Reach = { bare: Bool, binder: Option<String> }
+
+/// What `tree`, the source of the module `own`, reaches the function `from` of `module` by.
+fn reach_of(tree: Node, own: String, module: String, from: String) -> Reach / {abort.raise} =
+  if own == module { { bare: true, binder: None } } else {
+    fold(syntax::children(tree), { bare: false, binder: None }, |reach: Reach, node: Node|
+      if syntax::kind(node) != Import || !is_named(node, module) { reach } else {
+        match syntax::children(node) {
+          [] -> { ..reach, binder: Some(last_segment(module)) },
+          parts ->
+            fold(parts, reach, |r: Reach, part: Node|
+              match syntax::kind(part) {
+                ImportedName -> if is_named(part, from) { { ..r, bare: true } } else { r },
+                _ -> match syntax::name(part) {
+                  Some(alias) -> { ..r, binder: Some(alias.text) },
+                  None -> r,
+                },
+              }),
+        }
+      })
+  }
+
+/// Every place `tree` names the function: where it is defined, where it is imported, and each use
+/// its source reaches it by.
+fn edits_in(
+  tree: Node,
+  own: String,
+  module: String,
+  from: String,
+  to: String,
+) -> List<Edit> / {abort.raise} = {
+  let reach = reach_of(tree, own, module, from);
+  fold(syntax::walk(tree), [], |edits: List<Edit>, node: Node|
+    match syntax::kind(node) {
+      Function -> if own == module && is_named(node, from) {
+        fold(renamed_at(node, to), edits, push_edit)
+      } else { edits },
+      ImportedName -> if reach.bare && own != module && is_named(node, from) {
+        fold(renamed_at(node, to), edits, push_edit)
+      } else { edits },
+      Name -> if !is_named(node, from) { edits } else {
+        match ((syntax::qualifier(node), reach.binder)) {
+          (None, _) -> if reach.bare { fold(renamed_at(node, to), edits, push_edit) }
+          else { edits },
+          (Some(_), Some(binder)) -> if is_qualified_by(node, binder) {
+            fold(renamed_at(node, to), edits, push_edit)
+          } else { edits },
+          (Some(_), None) -> edits,
+        }
+      },
+      _ -> edits,
+    })
+}
+
+fn push_edit(edits: List<Edit>, edit: Edit) -> List<Edit> = push(edits, edit)
+
+fn rewritten(
+  sources: List<Source>,
+  module: String,
+  from: String,
+  to: String,
+) -> List<Source> / {abort.raise} =
+  map(sources, |source: Source| {
+    let edits = edits_in(syntax::parse(source.text).tree, module_of(source.path), module, from, to);
+    match syntax::edited(source.text, edits) {
+      Some(text) -> { path: source.path, text: text },
+      None -> source,
+    }
+  })
+
+/// `sources` with the function `from` of `module` named `to` wherever it is named, or why not: the
+/// answer is a program in which every definition hashes as it did, the renamed one under its new
+/// name.
+fn rename(
+  sources: List<Source>,
+  module: String,
+  from: String,
+  to: String,
+) -> Result<List<Source>, Refused> / {abort.raise} =
+  match checked(sources) {
+    Err(said) -> Err(Unchecked(said)),
+    Ok(before) -> {
+      let old = module ++ "." ++ from;
+      match map_get(checker::hashes(before), old) {
+        None -> Err(NotDefined(old)),
+        Some(hash) -> {
+          let after_sources = rewritten(sources, module, from, to);
+          match checked(after_sources) {
+            Err(said) -> Err(Breaks(said)),
+            Ok(after) -> {
+              let expected = map_insert(
+                map_remove(checker::hashes(before), old),
+                module ++ "." ++ to,
+                hash,
+              );
+              if checker::hashes(after) == expected { Ok(after_sources) } else {
+                Err(
+                  Moves(
+                    filter(checker::moved(before, after), |name: String|
+                      name != old && name != module ++ "." ++ to),
+                  ),
+                )
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn shop() -> List<Source> =
+  [
+    {
+      path: "shop/prices.ply",
+      text: b"/// What a basket costs.\npub fn total(prices: List<Int>) -> Int = fold(prices, 0, |sum: Int, p: Int| sum + p)\n\npub fn discounted(prices: List<Int>) -> Int = total(prices) * 9 / 10  // ten off\n",
+    },
+    {
+      path: "main.ply",
+      text: b"import shop.prices\nimport shop.prices (total)\n\n// The basket, whole and discounted.\nfn main() -> Int = total([250, 199])   +   prices::total([1]) + prices::discounted([2])\n",
+    },
+  ]
+
+fn text_of(sources: List<Source>, path: String) -> Bytes =
+  fold(sources, b"", |found: Bytes, s: Source| if s.path == path { s.text } else { found })
+
+test "a rename rewrites the definition, its import and every call, and keeps every other byte" {
+  match rename(shop(), "shop.prices", "total", "sum_of") {
+    Err(_) -> panic("the rename moves no hash"),
+    Ok(renamed) -> {
+      assert_eq(
+        text_of(renamed, "shop/prices.ply"),
+        b"/// What a basket costs.\npub fn sum_of(prices: List<Int>) -> Int = fold(prices, 0, |sum: Int, p: Int| sum + p)\n\npub fn discounted(prices: List<Int>) -> Int = sum_of(prices) * 9 / 10  // ten off\n",
+      );
+      assert_eq(
+        text_of(renamed, "main.ply"),
+        b"import shop.prices\nimport shop.prices (sum_of)\n\n// The basket, whole and discounted.\nfn main() -> Int = sum_of([250, 199])   +   prices::sum_of([1]) + prices::discounted([2])\n",
+      )
+    },
+  }
+}
+
+test "a renamed program holds the same definitions: each hash stands, the renamed one under its new name" {
+  let before = checked(shop());
+  let after = match rename(shop(), "shop.prices", "total", "sum_of") {
+    Ok(renamed) -> checked(renamed),
+    Err(_) -> Err(["the rename moves no hash"]),
+  };
+  match ((before, after)) {
+    (Ok(was), Ok(now)) -> {
+      assert_eq(checker::moved(was, now), ["shop.prices.sum_of", "shop.prices.total"]);
+      assert_eq(
+        map_get(checker::hashes(now), "shop.prices.sum_of"),
+        map_get(checker::hashes(was), "shop.prices.total"),
+      );
+      assert_eq(
+        map_get(checker::hashes(now), "main.main"),
+        map_get(checker::hashes(was), "main.main"),
+      )
+    },
+    _ -> panic("both programs check"),
+  }
+}
+
+fn capturing() -> List<Source> =
+  [
+    {
+      path: "m.ply",
+      text: b"fn pick(a: Int, b: Int) -> Int = a\n\nfn main() -> Int = {\n  let chosen = |a: Int, b: Int| b;\n  pick(1, 2) + chosen(3, 4)\n}\n",
+    },
+  ]
+
+test "a rename onto a name a caller binds is refused, naming the definition it would change" {
+  assert_eq(rename(capturing(), "m", "pick", "chosen"), Err(Moves(["m.main"])))
+}
+
+test "a rename onto a name that is taken, of a function that is not there, or in a program that does not check is refused" {
+  assert(match rename(shop(), "shop.prices", "total", "discounted") {
+    Err(Breaks(_)) -> true,
+    _ -> false,
+  });
+  assert_eq(rename(shop(), "shop.prices", "sum", "s"), Err(NotDefined("shop.prices.sum")));
+  assert(match rename([{ path: "m.ply", text: b"fn f() -> Int = \"one\"\n" }], "m", "f", "g") {
+    Err(Unchecked(_)) -> true,
+    _ -> false,
+  })
+}
