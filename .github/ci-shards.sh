@@ -5,9 +5,9 @@
 #   ci-shards.sh verify          every crate is a member, every test named here
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the shards run
-#                                every test exactly once, no corpus run the last
-#                                table measured takes over a third of its job's
-#                                deadline, every cache key a job
+#                                every test exactly once, no corpus run the cut
+#                                places took over a third of its job's deadline
+#                                in the last table, every cache key a job
 #                                writes is one a job reads, every key that
 #                                names the run is one a later run reads and no
 #                                job needs, and every key over a crate's Ply
@@ -95,9 +95,6 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
-# Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
-# for a lane whatever its tests are placed by, as a test over cases is one test.
-CORPUS_SHARDED=("cli-phases:3" "cli-http_audit:2" "cli-grants:2")
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
 # steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
 RUNS_MARGIN=4
@@ -219,33 +216,15 @@ filter_of() {
 # `package-<id>` per package suite, every checks module that declares a test, then every such module of
 # the CLI's suite under `cli-`; each module as `module`, or, for one placed a test at a time,
 # `module:<id>` per test, the id a hash of its label, so a duration measured for a test stays with it
-# however the module's tests move. A run CORPUS_SHARDED cuts is its parts, `entry#1` to `entry#N`.
+# however the module's tests move.
 corpus_entries() {
   local entry file
-  {
-    printf 'program\n'
-    stdlib_entries
-    for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
-    for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-    module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
-    module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
-  } | awk -v sharded="${CORPUS_SHARDED[*]-}" '
-    BEGIN {
-      n = split(sharded, s, " ")
-      for (i = 1; i <= n; i++) if (match(s[i], /:[0-9]+$/)) parts[substr(s[i], 1, RSTART - 1)] = substr(s[i], RSTART + 1)
-    }
-    $0 in parts { for (k = 1; k <= parts[$0]; k++) print $0 "#" k; next }
-    { print }
-  '
-}
-
-# How many parts CORPUS_SHARDED cuts the run $1 into; nothing for one it does not cut.
-parts_of() {
-  local entry
-  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
-    [[ ${entry%:*} == "$1" ]] && printf '%s\n' "${entry##*:}"
-  done
-  return 0
+  printf 'program\n'
+  stdlib_entries
+  for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
+  for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
+  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
+  module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}"
 }
 
 # The library's runs, each named by a module: `std.<module>` per top-level module of the library, those
@@ -386,6 +365,84 @@ desk_placed() {
   done < <(corpus_entries)
 }
 
+# The runs the partitions take, a `ply test` the rows in $1 measured over $2 milliseconds as its parts:
+# `run#K/N` for K from 1 to N, N the fewest parts whose shares of the run are no longer than that, each
+# the run's `ply test --shard K/N`. A proof run is a `ply prove`, which has no parts, and a single
+# test's run is no shorter in any, so those stay whole, and so does every run when $2 is empty.
+corpus_parted() {
+  corpus_placed | awk -v rows="$1" -v limit="${2:-0}" '
+    BEGIN {
+      while ((getline line < rows) > 0) {
+        split(line, f, "\t")
+        if (f[1] == "corpus") ms[f[2]] = f[3] + 0
+      }
+    }
+    # Of the runs named with a colon, only the library'"'"'s test runs are neither proofs nor a test.
+    limit > 0 && ms[$1] > limit && ($1 !~ /:/ || $1 ~ /^stdlib:/) {
+      n = int(ms[$1] / limit)
+      if (n * limit < ms[$1]) n++
+      for (k = 1; k <= n; k++) print $1 "#" k "/" n
+      next
+    }
+    { print }
+  '
+}
+
+# The job of the workflow whose steps run COMMAND.
+job_running() {
+  awk -v c="${1//./\\.}" '
+    /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
+    $0 ~ c { print job; exit }
+  ' "$root/.github/workflows/ci.yml"
+}
+
+# The lines of the workflow's job JOB.
+job_block() {
+  awk -v j="  $1:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$root/.github/workflows/ci.yml"
+}
+
+# The minutes after its start by which the job JOB ends its runs (`PLY_CI_DEADLINE`); nothing for a
+# job that sets no deadline.
+deadline_of() {
+  job_block "$1" | sed -n 's/.*PLY_CI_DEADLINE=\$((\$(date +%s) + \([0-9][0-9]*\) \* 60)).*/\1/p'
+}
+
+# The milliseconds a run of the job running COMMAND may take, measured: a third of the job's deadline,
+# which leaves the cut room to balance the lanes and a cold run room to take longer. Nothing for a job
+# with no deadline.
+run_limit() {
+  local minutes
+  minutes=$(deadline_of "$(job_running "$1")")
+  [[ -z $minutes ]] || printf '%d\n' $((minutes * 60000 / 3))
+}
+
+# `run seconds` per run the job running COMMAND takes, the partitions' as the rows in TABLE part them,
+# that TABLE measured over the job's limit.
+overlong() {
+  local table=$1 command=$2 limit
+  limit=$(run_limit "$command")
+  [[ -n $limit ]] || return 0
+  if [[ $command == *partition ]]; then corpus_parted "$table" "$limit"; else desk_placed; fi |
+    awk -v rows="$table" -v limit="$limit" '
+      BEGIN {
+        while ((getline line < rows) > 0) {
+          split(line, f, "\t")
+          if (f[1] == "corpus") ms[f[2]] = f[3] + 0
+        }
+      }
+      ms[$1] > limit { printf "%s %d\n", $1, ms[$1] / 1000 }
+    '
+}
+
+# Why the cut leaves the run $1 longer than its limit, and what would make it shorter.
+unparted() {
+  case $1 in
+    proofs:*) printf 'a proof run is one `ply prove`, which has no parts: give some of its claims a module of their own, or make them cheaper\n' ;;
+    *#*) printf 'a part takes the tests whose keys hash to it, and one of these, or the few it took, outlast the limit: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST), or split the longest test\n' ;;
+    *) printf 'a single test has no parts: split it into tests\n' ;;
+  esac
+}
+
 # The desk runs runner K takes, one a line: the plan's cut when DIR holds one, else round robin.
 cmd_desks_for_runner() {
   local k=$1 dir=${2:-} id n=0
@@ -417,10 +474,10 @@ cmd_corpus_for_partition() {
 
 # `path<TAB>filter<TAB>shard` per entry named, in order, a field empty where the run has none: the
 # program's entry takes every test of its package, a module's its own, and `module:<id>` the test whose
-# label hashes to it, by the qualified name `ply test --filter` matches; `entry#K` takes part K of
-# what `entry` would, by `ply test --shard K/N`. A module the cut places a test at a time is a run too,
-# of every test it declares, and so are a run cut into parts, of every part, and `stdlib` and
-# `proofs`, of every test and every claim of the library.
+# label hashes to it, by the qualified name `ply test --filter` matches; `run#K/N` takes part K of N
+# of what `run` would, by `ply test --shard K/N`. A module the cut places a test at a time is a run too,
+# of every test it declares, and so are `stdlib` and `proofs`, of every test and every claim of the
+# library.
 cmd_corpus_line() {
   local entries id
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
@@ -430,15 +487,18 @@ cmd_corpus_line() {
 
 # The line of the entry $1 among the entries $2.
 corpus_line_of() {
-  local entry line
-  while read -r entry; do
-    [[ $entry == "$1" || ${entry%%[:#]*} == "$1" ]] || continue
-    line=$(entry_line "${1%#*}") || return 1
-    if [[ $1 == *#* ]]; then
-      printf '%s%s%s/%s\n' "$line" "$TAB" "${1##*#}" "$(parts_of "${1%#*}")"
-    else
-      printf '%s%s\n' "$line" "$TAB"
+  local entry line run=${1%%#*} part=
+  if [[ $1 == *#* ]]; then
+    part=${1#*#}
+    if ! [[ $part =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] || ((BASH_REMATCH[1] > BASH_REMATCH[2])); then
+      echo "corpus entry '$1' names no part K/N of '$run', K from 1 to N" >&2
+      return 1
     fi
+  fi
+  while read -r entry; do
+    [[ $entry == "$run" || ${entry%%:*} == "$run" ]] || continue
+    line=$(entry_line "$run") || return 1
+    printf '%s%s%s\n' "$line" "$TAB" "$part"
     return
   done <<< "$2"
   echo "no corpus entry named '$1'" >&2
@@ -585,11 +645,15 @@ cmd_durations() {
 # cut by: one duration a test, the longest any job measured. A corpus or startup row is what it cost
 # when no corpus test came from the cache, so a run that took some keeps BEFORE's: cut by a warm
 # run's costs, a cold run piles what the cache had saved onto one partition. A corpus or startup row
-# no job reported, its job left unstarted by the selection, keeps BEFORE's. `cached` rows only say
-# which run this was.
+# no job reported, its job left unstarted by the selection, keeps BEFORE's. A run whose every part
+# `run#K/N` reported is reported too, the sum of its parts, which the cut parts it by; a reported run
+# takes along BEFORE's rows of its parts in another shape, and a warm run leaves out a part's first
+# row, its tests mostly the cache's. `cached` rows only say which run this was.
 cmd_timings() {
   local before=$1
   awk -F"$TAB" -v OFS="$TAB" -v before="$before" '
+    function run_of(id) { sub(/#.*/, "", id); return id }
+    function shape_of(id) { return match(id, /\/[0-9]+$/) ? substr(id, RSTART + 1) : "" }
     BEGIN {
       while ((getline line < before) > 0) {
         split(line, f, "\t")
@@ -601,9 +665,25 @@ cmd_timings() {
     END {
       for (k in ms) {
         split(k, f, OFS)
-        print k, ((warm && (f[1] == "corpus" || f[1] == "startup") && (k in kept)) ? kept[k] : ms[k])
+        if (f[1] != "corpus" || !index(f[2], "#")) continue
+        run = run_of(f[2])
+        shape[run] = shape_of(f[2])
+        parts[run]++
+        sum[run] += ms[k]
       }
-      for (k in kept) if (!(k in ms)) print k, kept[k]
+      for (run in shape) if (!(("corpus" OFS run) in ms) && parts[run] == shape[run] + 0) ms["corpus" OFS run] = sum[run]
+      for (k in ms) {
+        split(k, f, OFS)
+        if (warm && (f[1] == "corpus" || f[1] == "startup") && (k in kept)) print k, kept[k]
+        else if (!warm || f[1] != "corpus" || !index(f[2], "#")) print k, ms[k]
+      }
+      for (k in kept) {
+        if (k in ms) continue
+        split(k, f, OFS)
+        run = run_of(f[2])
+        if (f[1] == "corpus" && index(f[2], "#") && ((run in shape) ? shape_of(f[2]) != shape[run] : (("corpus" OFS run) in ms))) continue
+        print k, kept[k]
+      }
     }
   ' | LC_ALL=C sort -t"$TAB" -k1,1 -k2,2
 }
@@ -686,19 +766,16 @@ living_durations() {
     echo "FAIL: cargo metadata named no test binary in $root" >&2
     return 1
   }
-  # A corpus row is the entry's own, and lives while the entry does, or while a part of it does, which
-  # counts as its share until it is measured; a startup row is a package's.
+  # A corpus row is an entry's own or a part's of it, and lives while the entry does; a startup row is
+  # a package's.
   dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$({ corpus_placed; desk_placed; } | tr '\n' ' ')" '
     BEGIN {
       n = split(placed, ids, " ")
-      for (i = 1; i <= n; i++) {
-        corpus[ids[i]] = 1
-        if (index(ids[i], "#")) corpus[substr(ids[i], 1, index(ids[i], "#") - 1)] = 1
-      }
+      for (i = 1; i <= n; i++) corpus[ids[i]] = 1
       n = 0
     }
     NR == FNR { live[$0] = 1; next }
-    $1 == "corpus" { if ($2 in corpus) print > out; else n++; next }
+    $1 == "corpus" { run = $2; sub(/#.*/, "", run); if (run in corpus) print > out; else n++; next }
     $1 == "startup" { print > out; next }
     $1 in live { print > out; next }
     { n++ }
@@ -824,13 +901,15 @@ desk_cut() {
 # one run while they fit a lane and as few as they need once they do not, so a cold start they share is
 # paid once a run rather than once an entry. Runs and the other entries go longest first onto the lane
 # of every partition's that would end soonest with it; the lanes are taken partition by partition, so
-# the first placed land on different runners. A lane pays each package's startup once. An entry nothing
-# measured counts as its share of the run it is a part of, where that was measured whole, or else as
-# the median of its neighbours that were measured, or else of every entry that was.
+# the first placed land on different runners. A lane pays each package's startup once. A run measured
+# over a third of the partitions' deadline goes in as its parts (`corpus_parted`). A part nothing
+# measured counts as its share of its run; any other entry nothing measured as the median of its
+# neighbours that were measured, or else of every entry that was.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
-  corpus_placed | awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" \
+  corpus_parted "$rows" "$(run_limit "ci-corpus.sh partition")" |
+    awk -v rows="$rows" -v dir="$dir" -v p="$PARTITIONS" -v l="$CORPUS_LANES" \
     -v checks="$CORPUS_CHECKS" -v cli="$CLI_SUITE" -v stdlib="$CORPUS_STDLIB" '
     # What the startup a lane pays once is kept under: a part of a run is a `ply test` of its own.
     function package(id,   whole) {
@@ -844,13 +923,24 @@ corpus_cut() {
       if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
     }
-    # About two minutes unmeasured; a program or package suite row holds its startup whole, and so
-    # do the proof runs, each a share of its prove.
-    function startup(key) {
-      if (key in start) return start[key]
-      return ((index(key, "#") ? substr(key, 1, index(key, "#") - 1) : key) in batched) ? 120000 : 0
+    # About two minutes unmeasured, a part'"'"'s measured under its run, whose every part loads the same
+    # closure; a program or package suite row holds its startup whole, and so do the proof runs, each
+    # a share of its prove.
+    function startup(key,   run) {
+      run = key
+      sub(/#[0-9]+\/[0-9]+$/, "", run)
+      if (run in start) return start[run]
+      sub(/#.*/, "", run)
+      return (run in batched) ? 120000 : 0
     }
-    function module_of(id) { return index(id, ":") ? substr(id, 1, index(id, ":") - 1) : "" }
+    # A part is a run of its own, whatever its run is a neighbour of.
+    function module_of(id) { return (index(id, ":") && !index(id, "#")) ? substr(id, 1, index(id, ":") - 1) : "" }
+    # The share of its run a part `run#K/N` is.
+    function share_of(id,   run) {
+      run = substr(id, 1, index(id, "#") - 1)
+      match(id, /[0-9]+$/)
+      return (run in ms) ? ms[run] / substr(id, RSTART) : median
+    }
     # A new unit holding nothing yet, of the package `id` is tested in.
     function unit(id) { u++; size[u] = 0; cost[u] = 0; pkg[u] = package(id) }
     function hold(id) { member[u, ++size[u]] = id; cost[u] += ms[id] }
@@ -875,10 +965,7 @@ corpus_cut() {
     }
     { ids[++n] = $1 }
     END {
-      for (i = 1; i <= n; i++) {
-        if (ids[i] in ms) measured[++m] = ms[ids[i]]
-        if (index(ids[i], "#")) parts[substr(ids[i], 1, index(ids[i], "#") - 1)]++
-      }
+      for (i = 1; i <= n; i++) if (ids[i] in ms) measured[++m] = ms[ids[i]]
       median = m ? middle(measured, m) : 60000
       for (i = 1; i <= n; ) {
         mod = module_of(ids[i])
@@ -887,8 +974,7 @@ corpus_cut() {
           if (ids[j] in ms) near[++c] = ms[ids[j]]
         guess = (mod != "" && c) ? middle(near, c) : median
         for (; i < j; i++) {
-          whole = index(ids[i], "#") ? substr(ids[i], 1, index(ids[i], "#") - 1) : ""
-          if (!(ids[i] in ms)) ms[ids[i]] = ((whole in parts) && (whole in ms)) ? ms[whole] / parts[whole] : guess
+          if (!(ids[i] in ms)) ms[ids[i]] = index(ids[i], "#") ? share_of(ids[i]) : guess
           total += ms[ids[i]]
         }
       }
@@ -1348,8 +1434,8 @@ check_shards() {
   for ((i = 1; i <= PARTITIONS; i++)); do
     cmd_corpus_for_partition "$i" "$dir"
   done | cut -d' ' -f2 | LC_ALL=C sort > "$tmp/corpus-cut"
-  if ! cmp -s "$tmp/corpus-cut" <(corpus_placed | LC_ALL=C sort); then
-    echo "FAIL: the $what cut's corpus runs are not every run a partition takes, each once" >&2
+  if ! cmp -s "$tmp/corpus-cut" <(corpus_parted "$timings" "$(run_limit "ci-corpus.sh partition")" | LC_ALL=C sort); then
+    echo "FAIL: the $what cut's corpus runs are not every run a partition takes, each once or as its parts" >&2
     bad=1
   fi
   for ((i = 1; i <= DESK_RUNNERS; i++)); do
@@ -1413,6 +1499,67 @@ check_runs() {
   fi
   if [[ $(cut -d' ' -f1 "$tmp/$outgrows.lanes" | uniq | grep -c .) -ne $(cut -d' ' -f1 "$tmp/$outgrows.lanes" | sort -u | grep -c .) ]]; then
     echo "FAIL: the corpus cut gave a lane tests of $outgrows that are not neighbours" >&2
+    bad=1
+  fi
+  rm -rf "$tmp"
+  return "$bad"
+}
+
+# Whether the corpus cut over the nextest rows in $1 and invented corpus costs parts each `ply test`
+# measured over the partitions' limit into the fewest parts no longer than it, each a `--shard` of the
+# run, and leaves whole every other run, measured or not; and whether what it leaves over the limit
+# is a proof run, a single test and a part measured so, which it cannot part.
+check_parts() {
+  local nextest=$1 tmp limit long edge library proof single over want k bad=0
+  limit=$(run_limit "ci-corpus.sh partition")
+  if [[ -z $limit ]]; then
+    echo "FAIL: the partitions' job sets no deadline, so the corpus cut parts no run" >&2
+    return 1
+  fi
+  tmp=$(mktemp -d)
+  corpus_placed > "$tmp/placed"
+  long=$(grep -m1 -E '^cli-[^:]+$' "$tmp/placed" || true)
+  edge=$(grep -E '^cli-[^:]+$' "$tmp/placed" | sed -n 2p || true)
+  library=$(grep -m1 '^stdlib:' "$tmp/placed" || true)
+  proof=$(grep -m1 '^proofs:' "$tmp/placed" || true)
+  single=$(grep -m1 -E '^cli-[^:]+:' "$tmp/placed" || true)
+  if [[ -z $long || -z $edge || -z $library || -z $proof || -z $single ]]; then
+    echo "FAIL: the partitions take no two runs of the CLI's modules, library tests, proofs and single tests the corpus cut's check of parts needs" >&2
+    rm -rf "$tmp"
+    return 1
+  fi
+  {
+    cat "$nextest"
+    printf 'corpus\t%s\t%d\n' "$long" $((limit * 5 / 2)) "$long#1/3" $((limit + 1000)) "$edge" "$limit" \
+      "$library" $((limit + 1)) "$proof" $((limit * 2)) "$single" $((limit * 2))
+  } > "$tmp/timings.tsv"
+  awk -v long="$long" -v library="$library" '
+    $0 == long { print $0 "#1/3"; print $0 "#2/3"; print $0 "#3/3"; next }
+    $0 == library { print $0 "#1/2"; print $0 "#2/2"; next }
+    { print }
+  ' "$tmp/placed" | LC_ALL=C sort > "$tmp/expected"
+  shard_configs "$tmp/cut" "$tmp/timings.tsv" > /dev/null || {
+    echo "FAIL: the corpus cut's check of parts cut nothing" >&2
+    rm -rf "$tmp"
+    return 1
+  }
+  for ((k = 1; k <= PARTITIONS; k++)); do cut -d' ' -f2 "$tmp/cut/corpus-$k.txt"; done | LC_ALL=C sort > "$tmp/parted"
+  if ! cmp -s "$tmp/expected" "$tmp/parted"; then
+    echo "FAIL: the corpus cut did not take $long, measured at two and a half times the partitions' limit, as three parts, and $library, just over it, as two, each part once, and every other run whole" >&2
+    bad=1
+  fi
+  over=$(overlong "$tmp/timings.tsv" "ci-corpus.sh partition" | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' ')
+  want=$(printf '%s\n' "$long#1/3" "$proof" "$single" | LC_ALL=C sort | tr '\n' ' ')
+  if [[ $over != "$want" ]]; then
+    echo "FAIL: the runs the corpus cut leaves over the partitions' limit are '$over', not the proof run, the single test and the part measured over it: '$want'" >&2
+    bad=1
+  fi
+  if [[ $(cmd_corpus_line "$long#2/3") != "$(cmd_corpus_line "$long")2/3" ]]; then
+    echo "FAIL: corpus-line names another run than part 2 of 3 of $long, by \`ply test --shard 2/3\`" >&2
+    bad=1
+  fi
+  if cmd_corpus_line "$long#4/3" > /dev/null 2>&1 || cmd_corpus_line "$long#0/3" > /dev/null 2>&1; then
+    echo "FAIL: corpus-line takes a part of $long that no \`ply test --shard\` names" >&2
     bad=1
   fi
   rm -rf "$tmp"
@@ -1562,6 +1709,7 @@ cmd_verify() {
     done
     check_shards made-up "$made_up/timings.tsv" || failures=$((failures + 1))
     check_runs "$made_up/timings.tsv" || failures=$((failures + 1))
+    check_parts "$made_up/timings.tsv" || failures=$((failures + 1))
     rm -rf "$made_up"
     if [[ -s $TIMINGS ]]; then
       check_shards measured "$TIMINGS" || failures=$((failures + 1))
@@ -1588,6 +1736,21 @@ cmd_verify() {
   table=$(cmd_timings "$made_up/none.tsv" < "$made_up/measured.tsv" | tr '\t\n' ' ;')
   if [[ $table != "$cold" ]]; then
     echo "FAIL: a run with no table before it wrote '$table', not the longest it measured: '$cold'" >&2
+    failures=$((failures + 1))
+  fi
+  # `r` parted anew and reported whole, `s` reported in part, `w` reported whole again.
+  printf 'corpus\t%s\t%s\n' r 900 'r#1/3' 100 'r#2/3' 200 'r#3/3' 300 s 850 's#1/2' 400 's#2/2' 450 'w#1/2' 10 > "$made_up/before.tsv"
+  printf 'corpus\t%s\t%s\n' 'r#1/2' 300 'r#2/2' 500 's#1/2' 420 w 70 > "$made_up/measured.tsv"
+  warm="corpus r 900;corpus s 850;corpus s#1/2 400;corpus s#2/2 450;corpus w 70;"
+  cold="corpus r 800;corpus r#1/2 300;corpus r#2/2 500;corpus s 850;corpus s#1/2 420;corpus s#2/2 450;corpus w 70;"
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t12\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$warm" ]]; then
+    echo "FAIL: a run that took tests from the cache and ran parts wrote '$table', not the rows it was cut by, less its parts of another shape: '$warm'" >&2
+    failures=$((failures + 1))
+  fi
+  table=$({ cat "$made_up/measured.tsv"; printf 'cached\tp\t0\n'; } | cmd_timings "$made_up/before.tsv" | tr '\t\n' ' ;')
+  if [[ $table != "$cold" ]]; then
+    echo "FAIL: a run that took nothing from the cache and ran parts wrote '$table', not each run whose every part reported as their sum: '$cold'" >&2
     failures=$((failures + 1))
   fi
   rm -rf "$made_up"
@@ -1625,7 +1788,7 @@ cmd_verify() {
       failures=$((failures + 1))
     # `[[ == * ]]`, not `grep -q`: under pipefail an early-exiting grep fails the pipe.
     else
-      block=$(awk -v j="  $job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
+      block=$(job_block "$job")
       if [[ $block != *"probes/$probe/run.sh"* ]]; then
         echo "FAIL: job '$job' exists but its steps never run probes/$probe/run.sh, so it is required in name only" >&2
         failures=$((failures + 1))
@@ -1744,20 +1907,6 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  # A run cut into parts is an entry's, a `ply test` a partition takes, cut into two or more.
-  for entry in ${CORPUS_SHARDED[@]+"${CORPUS_SHARDED[@]}"}; do
-    id=${entry%:*}
-    if ! [[ ${entry##*:} =~ ^[0-9]+$ ]] || ((${entry##*:} < 2)); then
-      echo "FAIL: CORPUS_SHARDED cuts '$id' into '${entry##*:}' parts, and a run is cut into two or more" >&2
-      failures=$((failures + 1))
-    elif ! grep -qxF -- "$id#1" <<< "$entries"; then
-      echo "FAIL: CORPUS_SHARDED names '$id', which is no corpus entry" >&2
-      failures=$((failures + 1))
-    elif [[ $id == proofs:* ]] || corpus_alone "$id" || corpus_desk "$id"; then
-      echo "FAIL: CORPUS_SHARDED names '$id', which is no \`ply test\` a partition takes" >&2
-      failures=$((failures + 1))
-    fi
-  done
   # Every entry is a partition's, a desk runner's or alone, once, so the round robins stay total.
   local placed k
   placed=$(
@@ -1775,10 +1924,7 @@ cmd_verify() {
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
   for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh desks"; do
-    corpus_job=$(awk -v c="${corpus_command//./\\.}" '
-      /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
-      $0 ~ c { print job; exit }
-    ' "$workflow")
+    corpus_job=$(job_running "$corpus_command")
     if [[ -z $corpus_job ]]; then
       echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its corpus runs run nowhere" >&2
       failures=$((failures + 1))
@@ -1789,16 +1935,12 @@ cmd_verify() {
   done
   # A job that starts corpus runs ends them at a deadline that leaves its steps after them
   # RUNS_MARGIN minutes of its limit: a job the limit cancels keeps nothing its runs wrote.
-  local block limit budget
+  local limit budget
   for corpus_command in "ci-corpus.sh partition" "ci-corpus.sh desks"; do
-    corpus_job=$(awk -v c="${corpus_command//./\\.}" '
-      /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
-      $0 ~ c { print job; exit }
-    ' "$workflow")
+    corpus_job=$(job_running "$corpus_command")
     [[ -n $corpus_job ]] || continue
-    block=$(awk -v j="  $corpus_job:" '$0 == j {f = 1; next} f && /^  [a-z]/ {exit} f' "$workflow")
-    limit=$(sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p' <<< "$block")
-    budget=$(sed -n 's/.*PLY_CI_DEADLINE=\$((\$(date +%s) + \([0-9][0-9]*\) \* 60)).*/\1/p' <<< "$block")
+    limit=$(job_block "$corpus_job" | sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p')
+    budget=$(deadline_of "$corpus_job")
     if [[ -z $budget ]]; then
       echo "FAIL: job '$corpus_job' runs \`$corpus_command\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
       failures=$((failures + 1))
@@ -1806,16 +1948,13 @@ cmd_verify() {
       echo "FAIL: job '$corpus_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
       failures=$((failures + 1))
     fi
-    # A run over a third of the deadline leaves the cut too little room to balance the lanes, and
-    # cold it can outlast one.
-    if [[ -n $budget && -s $TIMINGS ]]; then
+    # The cut parts a `ply test` the partitions take that outlasts the job's limit (`run_limit`); a run
+    # it cannot part is too long for the cut to balance the lanes, and cold it can outlast one.
+    if [[ -s $TIMINGS ]]; then
       while read -r id seconds; do
-        echo "FAIL: corpus run $id took ${seconds}s in the last table, over a third of job '$corpus_job''s ${budget}-minute deadline: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST) or cut it into parts (CORPUS_SHARDED)" >&2
+        echo "FAIL: corpus run $id took ${seconds}s in the last table, over a third of job '$corpus_job''s ${budget}-minute deadline, and the cut cannot part it: $(unparted "$id")" >&2
         failures=$((failures + 1))
-      done < <(awk -F"$TAB" -v limit=$((budget * 60000 / 3)) -v taken="$(if [[ $corpus_command == *partition ]]; then corpus_placed; else desk_placed; fi | tr '\n' ' ')" '
-        BEGIN { n = split(taken, ids, " "); for (i = 1; i <= n; i++) run[ids[i]] = 1 }
-        $1 == "corpus" && ($2 in run) && $3 + 0 > limit { printf "%s %d\n", $2, $3 / 1000 }
-      ' "$TIMINGS")
+      done < <(overlong "$TIMINGS" "$corpus_command")
     fi
   done
 
