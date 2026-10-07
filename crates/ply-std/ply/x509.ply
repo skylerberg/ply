@@ -46,13 +46,13 @@ import std.hash (sha256)
 import std.idna
 import std.ip
 import std.ip (Ip, Prefix)
-import std.list (all, any, concat, contains, count, find, flat_map)
+import std.list (all, any, concat, contains, count, find, flat_map, reverse)
 import std.oid
 import std.oid (Oid)
 import std.pem
 import std.result (result_err, result_ok)
 import std.show (show)
-import std.string (ascii_lower, is_ascii)
+import std.string (ascii_lower, is_ascii, join)
 import std.time (nanos_at)
 
 // --- What a certificate holds ----------------------------------------------------
@@ -266,6 +266,70 @@ pub fn is_ca(c: Certificate) -> Bool =
 
 /// Whether the subject and the issuer are one name.
 pub fn is_self_issued(c: Certificate) -> Bool = c.info.subject.der == c.info.issuer.der
+
+/// `commonName`, the attribute a client certificate's subject names its holder by.
+pub fn common_name() -> Oid = oid::Oid([2, 5, 4, 3])
+
+/// The values the attributes of type `id` in `n` hold, outermost first.
+pub fn values_of(n: Name, id: Oid) -> List<String> =
+  flat_map(n.rdns, |rdn: List<Attribute>|
+    map(filter(rdn, |a: Attribute| a.id == id), |a: Attribute| a.value))
+
+/// `n` as RFC 4514 writes a distinguished name: its relative names innermost first, separated by
+/// `,`, the attributes of one by `+`, each `TYPE=value`. `TYPE` is the short name RFC 4514 gives
+/// its type (`CN`, `L`, `ST`, `O`, `OU`, `C`, `STREET`, `DC`, `UID`), or its dotted identifier;
+/// `value` has escaped what §2.4 escapes, and one that is no string (`#` and its DER in hex) is
+/// written as it is.
+pub fn name_text(n: Name) -> String / {abort.raise} =
+  join(
+    map(reverse(n.rdns), |rdn: List<Attribute>|
+      join(map(rdn, |a: Attribute| type_text(a.id) ++ "=" ++ escaped_value(a.value)), "+")),
+    ",",
+  )
+
+fn type_text(id: Oid) -> String =
+  match oid::arcs(id) {
+    [2, 5, 4, 3] -> "CN",
+    [2, 5, 4, 7] -> "L",
+    [2, 5, 4, 8] -> "ST",
+    [2, 5, 4, 10] -> "O",
+    [2, 5, 4, 11] -> "OU",
+    [2, 5, 4, 6] -> "C",
+    [2, 5, 4, 9] -> "STREET",
+    [0, 9, 2342, 19200300, 100, 1, 25] -> "DC",
+    [0, 9, 2342, 19200300, 100, 1, 1] -> "UID",
+    _ -> oid::to_string(id),
+  }
+
+/// A value as RFC 4514 §2.4 writes it: `"`, `+`, `,`, `;`, `<`, `>` and `\` after a `\`, a space or
+/// a `#` that leads it and a space that ends it the same, and NUL as `\00`. A value that is no
+/// string, `#` and its DER in hex, is written as it is.
+fn escaped_value(v: String) -> String / {abort.raise} =
+  if string_starts_with(v, "#") && string_len(v) > 1 && all_hex(string_slice(v, 1, string_len(v))) {
+    v
+  } else {
+    let chars = string_chars(v);
+    let last = len(chars) - 1;
+    join(
+      fold(chars, { at: 0, out: [] }, |s: { at: Int, out: List<String> }, c: Char| {
+        let n = int_of_char(c);
+        let one = string_of_chars([c]);
+        let written = if n == 0 { "\\00" }
+        else if n == 34 || n == 43 || n == 44 || n == 59 || n == 60 || n == 62 || n == 92 {
+          "\\" ++ one
+        } else if (s.at == 0 && (n == 32 || n == 35)) || (s.at == last && n == 32) { "\\" ++ one }
+        else { one };
+        { at: s.at + 1, out: push(s.out, written) }
+      }).out,
+      "",
+    )
+  }
+
+fn all_hex(s: String) -> Bool =
+  all(string_chars(s), |c: Char| {
+    let n = int_of_char(c);
+    (n >= 48 && n <= 57) || (n >= 97 && n <= 102) || (n >= 65 && n <= 70)
+  })
 
 // --- Identifiers -----------------------------------------------------------------
 
@@ -1934,6 +1998,26 @@ fn checked(
 
 fn made<a>(body: () -> a / {x509.refused, abort.raise}) -> a / {abort.raise} =
   match try { body() } { Ok(x) -> x, Err(refusal) -> panic("the fixture is refused") }
+
+fn attribute(arcs: List<Int>, value: String) -> Attribute = { id: oid::Oid(arcs), value: value }
+
+test "a name is written as RFC 4514 writes it, innermost first, what it escapes escaped" {
+  let n: Name = {
+    rdns: [
+      [attribute([2, 5, 4, 6], "US")],
+      [attribute([2, 5, 4, 10], "Example, Inc.")],
+      [attribute([2, 5, 4, 11], "Sales"), attribute([2, 5, 4, 3], " Jo+Ann ")],
+      [attribute([1, 2, 3, 4], "#04024869")],
+      [attribute([0, 9, 2342, 19200300, 100, 1, 25], "#example;<x>")],
+    ],
+    der: b"",
+  };
+  assert_eq(
+    name_text(n),
+    "DC=\\#example\\;\\<x\\>,1.2.3.4=#04024869,OU=Sales+CN=\\ Jo\\+Ann\\ ,O=Example\\, Inc.,C=US",
+  );
+  assert_eq(values_of(n, common_name()), [" Jo+Ann "])
+}
 
 test "a built chain verifies to its root, and the path is the leaf, the CA and the root" {
   let p = made(pki);

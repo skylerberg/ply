@@ -48,7 +48,7 @@ impl Material {
     }
 
     fn credentials(&self, name: &str) -> Credentials {
-        Credentials::load(&[self.spec(name)], &[]).expect("the generated material loads")
+        Credentials::load(&[self.spec(name)], &[], &[]).expect("the generated material loads")
     }
 
     fn write(&self, rel: &str, text: &str) -> PathBuf {
@@ -59,7 +59,9 @@ impl Material {
 }
 
 fn load(spec: CredentialSpec) -> Vec<Diagnostic> {
-    Credentials::load(&[spec], &[]).err().unwrap_or_default()
+    Credentials::load(&[spec], &[], &[])
+        .err()
+        .unwrap_or_default()
 }
 
 fn one(diagnostics: Vec<Diagnostic>) -> Diagnostic {
@@ -184,7 +186,7 @@ fn every_credential_that_fails_is_reported_rather_than_the_first() {
         certificate: material.dir.path().join("absent.pem"),
         key: material.key.clone(),
     };
-    let diagnostics = Credentials::load(&[absent("a"), absent("b"), material.spec("c")], &[])
+    let diagnostics = Credentials::load(&[absent("a"), absent("b"), material.spec("c")], &[], &[])
         .expect_err("two of the three cannot load");
     assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
     assert!(
@@ -254,15 +256,7 @@ fn shaken(
     client: &Arc<ClientConfig>,
     name: &str,
 ) -> (rustls::Connection, rustls::Connection) {
-    let mut s: rustls::Connection = rustls::ServerConnection::new(Arc::clone(server))
-        .expect("a server connection")
-        .into();
-    let mut c: rustls::Connection = ClientConnection::new(
-        Arc::clone(client),
-        rustls::pki_types::ServerName::try_from(name.to_string()).expect("a server name"),
-    )
-    .expect("a client connection")
-    .into();
+    let (mut s, mut c) = ends(server, client, name);
     // Enough rounds for the handshake and the tickets a TLS 1.3 server sends after it.
     for _ in 0..8 {
         pump(&mut c, &mut s);
@@ -275,7 +269,38 @@ fn shaken(
     (s, c)
 }
 
+/// The error a handshake between the two ends with, whichever end refused.
+fn refusal(server: &Arc<ServerConfig>, client: &Arc<ClientConfig>, name: &str) -> TlsError {
+    let (mut s, mut c) = ends(server, client, name);
+    for _ in 0..8 {
+        if let Err(e) = passed(&mut c, &mut s).and_then(|()| passed(&mut s, &mut c)) {
+            return e;
+        }
+    }
+    panic!("the handshake completed")
+}
+
+/// A server's connection and a client's, before either has written.
+fn ends(
+    server: &Arc<ServerConfig>,
+    client: &Arc<ClientConfig>,
+    name: &str,
+) -> (rustls::Connection, rustls::Connection) {
+    let s = rustls::ServerConnection::new(Arc::clone(server)).expect("a server connection");
+    let c = ClientConnection::new(
+        Arc::clone(client),
+        rustls::pki_types::ServerName::try_from(name.to_string()).expect("a server name"),
+    )
+    .expect("a client connection");
+    (s.into(), c.into())
+}
+
 fn pump(from: &mut rustls::Connection, to: &mut rustls::Connection) {
+    passed(from, to).expect("the peer's records are good");
+}
+
+/// What `from` has to write, read by `to`, or the error `to` refused it with.
+fn passed(from: &mut rustls::Connection, to: &mut rustls::Connection) -> Result<(), TlsError> {
     let mut wire = Vec::new();
     while from.wants_write() {
         from.write_tls(&mut wire).expect("written to a buffer");
@@ -283,9 +308,9 @@ fn pump(from: &mut rustls::Connection, to: &mut rustls::Connection) {
     let mut reader: &[u8] = &wire;
     while !reader.is_empty() {
         to.read_tls(&mut reader).expect("read from a buffer");
-        to.process_new_packets()
-            .expect("the peer's records are good");
+        to.process_new_packets()?;
     }
+    Ok(())
 }
 
 #[test]
@@ -293,7 +318,7 @@ fn one_name_holds_several_certificates_and_a_client_is_answered_with_the_one_for
     let dir = tempfile::tempdir().expect("a temp dir");
     let (first, a) = issued_into(dir.path(), "a", &["a.example"]);
     let (second, b) = issued_into(dir.path(), "b", &["b.example"]);
-    let credentials = Credentials::load(&[first, second], &[]).expect("both load");
+    let credentials = Credentials::load(&[first, second], &[], &[]).expect("both load");
     let (_, credential) = credentials.iter().next().expect("one name");
     assert_eq!(credentials.names().collect::<Vec<_>>(), ["api"]);
     let client = client_trusting(&[&a, &b], None);
@@ -312,7 +337,7 @@ fn one_name_holds_several_certificates_and_a_client_is_answered_with_the_one_for
 fn a_certificate_whose_files_change_is_served_anew_without_a_restart() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let (spec, before) = issued_into(dir.path(), "api", &["localhost"]);
-    let credentials = Credentials::load(std::slice::from_ref(&spec), &[]).expect("it loads");
+    let credentials = Credentials::load(std::slice::from_ref(&spec), &[], &[]).expect("it loads");
     let (_, credential) = credentials.iter().next().expect("one name");
     assert_eq!(
         credential.chooser().leaves(),
@@ -362,7 +387,7 @@ fn a_client_certificate_the_run_trusts_is_who_the_client_is_and_none_is_still_se
     let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
     let (_, caller) = issued_into(dir.path(), "caller", &["caller.example"]);
     let trusted = dir.path().join("caller.pem");
-    let credentials = Credentials::load(&[server], &[trusted]).expect("it loads");
+    let credentials = Credentials::load(&[server], &[trusted], &[]).expect("it loads");
     let (_, credential) = credentials.iter().next().expect("one name");
     let (s, _) = shaken(
         credential.config(),
@@ -380,6 +405,98 @@ fn a_client_certificate_the_run_trusts_is_who_the_client_is_and_none_is_still_se
         "localhost",
     );
     assert!(anonymous.peer_certificates().is_none());
+}
+
+#[test]
+fn a_listener_that_requires_a_client_certificate_refuses_a_client_without_one() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
+    let (_, caller) = issued_into(dir.path(), "caller", &["caller.example"]);
+    let trusted = dir.path().join("caller.pem");
+    let credentials =
+        Credentials::load(&[server], &[trusted], &["api".to_string()]).expect("it loads");
+    assert!(credentials.requires_client("api"));
+    let (_, credential) = credentials.iter().next().expect("one name");
+    let (s, _) = shaken(
+        credential.config(),
+        &client_trusting(&[&served], Some(&caller)),
+        "localhost",
+    );
+    assert_eq!(
+        s.peer_certificates()
+            .and_then(|chain| chain.first().cloned()),
+        Some(der_of(&caller))
+    );
+    let refused = refusal(
+        credential.config(),
+        &client_trusting(&[&served], None),
+        "localhost",
+    );
+    assert_eq!(refused, TlsError::NoCertificatesPresented);
+}
+
+#[test]
+fn requiring_a_client_certificate_wants_the_credential_and_something_to_verify_it() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (server, _) = issued_into(dir.path(), "server", &["localhost"]);
+    let trusted = dir.path().join("server.pem");
+    let unknown = one(Credentials::load(
+        std::slice::from_ref(&server),
+        std::slice::from_ref(&trusted),
+        &["web".to_string()],
+    )
+    .err()
+    .unwrap_or_default());
+    assert_eq!(unknown.code, codes::TLS_CREDENTIAL_UNKNOWN);
+    assert!(
+        unknown.message.contains("`--mtls web`"),
+        "{}",
+        unknown.message
+    );
+    let unverified = one(Credentials::load(&[server], &[], &["api".to_string()])
+        .err()
+        .unwrap_or_default());
+    assert_eq!(unverified.code, codes::TLS_CREDENTIAL_INVALID);
+    assert!(
+        unverified.message.contains("nothing verifies one"),
+        "{}",
+        unverified.message
+    );
+}
+
+#[test]
+fn a_client_presenting_a_credential_is_who_the_server_sees() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
+    let (caller, called) = issued_into(dir.path(), "caller", &["caller.example"]);
+    let caller = CredentialSpec {
+        name: "caller".to_string(),
+        ..caller
+    };
+    let trusted = [dir.path().join("server.pem"), dir.path().join("caller.pem")];
+    let credentials =
+        Credentials::load(&[server, caller], &trusted, &["api".to_string()]).expect("it loads");
+    let presenting = credentials
+        .presenting("caller", Span::DUMMY)
+        .expect("the run holds the credential");
+    let listener = credentials
+        .resolve("api", Span::DUMMY)
+        .expect("the run holds the listener's");
+    let (s, c) = shaken(&listener, &presenting, "localhost");
+    assert_eq!(
+        s.peer_certificates()
+            .and_then(|chain| chain.first().cloned()),
+        Some(der_of(&called))
+    );
+    assert_eq!(
+        c.peer_certificates()
+            .and_then(|chain| chain.first().cloned()),
+        Some(der_of(&served))
+    );
+    let missing = credentials
+        .presenting("absent", Span::DUMMY)
+        .expect_err("no credential of that name");
+    assert_eq!(missing.code, codes::TLS_CREDENTIAL_UNKNOWN);
 }
 
 #[test]
