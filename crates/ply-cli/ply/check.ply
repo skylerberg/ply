@@ -22,12 +22,12 @@ import compiler.hash (hex)
 import std.bin
 import std.hash (blake3)
 import report (Answer, ok_code, count_of, indent, refused, warning_lines)
-import signature (SetLine, counted_lines, effect_sets, provenance, provenance_lines, set_lines,
-                  atom_texts, raise_text, raise_kind)
+import signature (SetLine, Provenance, counted_lines, effect_sets, provenance, provenance_lines,
+                  set_lines, atom_texts, raise_text, raise_kind)
 import std.term (Style, bold, dim, green, plain)
 import compiler.costs (Report, Costing)
 import compiler.termination (Ends, Stated, Diverges, Site)
-import compiler.front (Analysis, effect_sets_of)
+import compiler.front (Analysis, effect_sets_of, schema_definitions)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
                        Unguarded, Calls)
 import compiler.resolve (Diag)
@@ -52,7 +52,7 @@ fn under() -> String = indent() ++ "  "
 fn json_strings(ss: List<String>) -> List<Json> = map(ss, |s: String| Str(s))
 
 /// As the reference prints a test's name: the bytes, with the ones that would close the quotes escaped.
-pub fn quoted(s: String) -> String / {abort.raise} = {
+pub fn quoted(s: String) -> String = {
   let b = bytes_of_string(s);
   string_of_bytes_lossy(
     bytes_concat_all([
@@ -87,13 +87,13 @@ fn mine(name: String, defs: List<DefInfo>) -> List<DefInfo> =
 
 type Phase = { label: String, ms: Int }
 
-fn share(ms: Int, total: Int) -> String / {abort.raise} = {
+fn share(ms: Int, total: Int) -> String = {
   // Per mille is tenths of a percent, so one division answers both digits.
   let tenths = if total == 0 { 0 } else { ms * 1000 / total };
   pad_left(int_to_string(tenths / 10) ++ "." ++ int_to_string(tenths % 10), 5, " ") ++ "%"
 }
 
-fn phase_line(style: Style, phase: Phase, total: Int) -> String / {abort.raise} =
+fn phase_line(style: Style, phase: Phase, total: Int) -> String =
   under() ++ pad_right(phase.label, 11, " ") ++ " " ++ pad_left(int_to_string(phase.ms), 8, " ")
     ++ "ms "
     ++ dim(style, share(phase.ms, total))
@@ -105,7 +105,7 @@ fn ordered(phases: List<Phase>) -> List<Phase> =
     concat(push(before, p), filter(acc, |q: Phase| q.ms < p.ms))
   })
 
-fn phase_lines(style: Style, timed: Timed) -> List<String> / {abort.raise} = {
+fn phase_lines(style: Style, timed: Timed) -> List<String> = {
   let total = timed.read_ms + timed.front_ms + timed.file_ms;
   let rows = ordered([
     { label: "read", ms: timed.read_ms },
@@ -258,10 +258,18 @@ fn widest(defs: List<DefInfo>) -> Int =
     if n > acc { n } else { acc }
   })
 
+/// What a definition's row declares and its body does not perform. A definition a law schema is
+/// carries the row the compiler gives every schema so that any law body fits it, and is held to none.
+fn provenance_in(schemas: Map<Bytes, Bool>, def_info: DefInfo) -> Provenance / {abort.raise} =
+  if map_contains(schemas, def_info.name) {
+    { ..provenance(def_info), performed: None, unperformed: [] }
+  } else { provenance(def_info) }
+
 fn def_block(
   style: Style,
   explain: Bool,
   program: Program,
+  schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   width: Int,
   lines: List<String>,
@@ -281,7 +289,7 @@ fn def_block(
   if !explain { said } else {
     fold(
       concat(
-        provenance_lines(provenance(def_info), types_indent()),
+        provenance_lines(provenance_in(schemas, def_info), types_indent()),
         map(def_info.raises, |r: Raise|
           "  raises"
             ++ (match raise_at(program, def_info, r) { Some(p) -> " at " ++ p, None -> "" })
@@ -363,6 +371,7 @@ fn module_block(
   explain: Bool,
   program: Program,
   analysis: Analysis,
+  schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
@@ -384,7 +393,7 @@ fn module_block(
   let setted = if !explain { effected } else { set_blocks(effected, sets_of(analysis, mo, ours)) };
   let width = widest(ours);
   let defined = fold(ours, setted, |acc: List<String>, def_info: DefInfo|
-    def_block(style, explain, program, located, width, acc, def_info));
+    def_block(style, explain, program, schemas, located, width, acc, def_info));
   fold(
     filter(tests, |test_info: TestInfo| string_of_bytes_lossy(test_info.module) == mo.name),
     defined,
@@ -412,8 +421,9 @@ fn type_lines(
   tests: List<TestInfo>,
 ) -> List<String> / {abort.raise} = {
   let located = locations(defs);
+  let schemas = schema_definitions(analysis.mods);
   fold(views, [], |acc: List<String>, mo: ModuleFacts|
-    module_block(style, explain, program, analysis, located, defs, tests, acc, mo))
+    module_block(style, explain, program, analysis, schemas, located, defs, tests, acc, mo))
 }
 
 // --- The JSON document ---------------------------------------------------------------
@@ -446,7 +456,11 @@ fn module_json(
   object(fields)
 }
 
-fn provenance_fields(program: Program, def_info: DefInfo) -> List<Member> / {abort.raise} =
+fn provenance_fields(
+  program: Program,
+  schemas: Map<Bytes, Bool>,
+  def_info: DefInfo,
+) -> List<Member> / {abort.raise} =
   [
     {
       key: "written_as",
@@ -458,7 +472,10 @@ fn provenance_fields(program: Program, def_info: DefInfo) -> List<Member> / {abo
         json_strings(map(def_info.performed, |a: Atom| string_of_bytes_lossy(atom_text(a)))),
       ),
     },
-    { key: "declared_not_performed", value: Array(json_strings(provenance(def_info).unperformed)) },
+    {
+      key: "declared_not_performed",
+      value: Array(json_strings(provenance_in(schemas, def_info).unperformed)),
+    },
     {
       key: "raises",
       value: Array(map(def_info.raises, |r: Raise| raise_json(program, def_info, r))),
@@ -468,6 +485,7 @@ fn provenance_fields(program: Program, def_info: DefInfo) -> List<Member> / {abo
 fn definition_json(
   program: Program,
   explain: Bool,
+  schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   def_info: DefInfo,
 ) -> Json / {abort.raise} = {
@@ -483,7 +501,8 @@ fn definition_json(
     { key: "ending", value: ending_json(program, located, def_info) },
   ];
   let fields: List<Member> = if !explain { named } else {
-    fold(provenance_fields(program, def_info), named, |acc: List<Member>, f: Member| push(acc, f))
+    fold(provenance_fields(program, schemas, def_info), named, |acc: List<Member>, f: Member|
+      push(acc, f))
   };
   object(fields)
 }
@@ -560,6 +579,7 @@ fn document(
 ) -> Json / {abort.raise} = {
   let p: Program = timed.program;
   let located = locations(defs);
+  let schemas = schema_definitions(analysis.mods);
   object([
     { key: "command", value: Str("check") },
     { key: "ok", value: Bool(true) },
@@ -573,7 +593,8 @@ fn document(
     {
       key: "definitions",
       value: Array(
-        map(defs, |def_info: DefInfo| definition_json(p, flags.explain, located, def_info)),
+        map(defs, |def_info: DefInfo|
+          definition_json(p, flags.explain, schemas, located, def_info)),
       ),
     },
     { key: "tests", value: Array(map(own_tests(p, analysis), test_json)) },
@@ -797,7 +818,7 @@ fn checked_now(
   flags: Flags,
   project: Project,
   started: Int,
-) -> { answer: Answer, filed: Option<Answer> } / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
+) -> { answer: Answer, filed: Option<Answer> } / {fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps, true);
   match t.program.whole {
     None ->
@@ -817,7 +838,7 @@ fn checked_now(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise, diverges, shipped.reached} = {
+) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   // `--explain` says what this run's own phases took, which no filed answer knows.
