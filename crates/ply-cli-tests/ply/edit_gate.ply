@@ -1,0 +1,715 @@
+//! Warm answers what cold does through every kind of edit to every kind of item. Each edit is made
+//! to a module of a project whose cache the last check filed: the check that reads that cache must
+//! answer what a check from nothing answers, every hash, type and row included, and once the edit is
+//! undone, what it answered before the edit. `edit_sweep` makes the same edits to every module of
+//! the tree.
+
+import compiler.items (parse, Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive,
+                       IEffectSet, IExtern, IInstance, INumeric, FnDef, TDSum, TDAlias, TDNominal,
+                       VPub, NKey, NShow, NGen)
+import compiler.exprs (expr_span)
+import compiler.fmt (line_end)
+import compiler.embed (EmbedWant, wants_of)
+import harness (Source, Ran, Here, Reached, Shipped, Hermetic, scratch, project, comparable,
+                json_of, on_disk_shipping, over_tree, tree, sources_here, example_files,
+                std_modules, StdModule, shown, at, items, truth)
+import std.fs (fs)
+import std.place (spliced)
+import std.json (Json, Object, Array)
+import std.list (concat, contains, first, last)
+import std.string
+
+/// A kind of edit the gate makes to a module.
+pub type Edit =
+  | AddFn
+  | Comment
+  | WrapBody
+  | RaiseBody
+  | Unexport
+  | RenameFn
+  | RemoveFn
+  | AddImport
+  | RemoveImport
+  | AddTest
+  | AddVariant
+  | AddField
+  | DropStatement
+  | NarrowSet
+  | AddOp
+  | TouchEmbed
+
+pub fn every_edit() -> List<Edit> =
+  [
+    AddFn,
+    Comment,
+    WrapBody,
+    RaiseBody,
+    Unexport,
+    RenameFn,
+    RemoveFn,
+    AddImport,
+    RemoveImport,
+    AddTest,
+    AddVariant,
+    AddField,
+    DropStatement,
+    NarrowSet,
+    AddOp,
+    TouchEmbed,
+  ]
+
+pub fn edit_name(e: Edit) -> String =
+  match e {
+    AddFn -> "a function added",
+    Comment -> "a comment above the items",
+    WrapBody -> "a body rewritten to mean the same",
+    RaiseBody -> "a body that now raises",
+    Unexport -> "a function made private",
+    RenameFn -> "a public function renamed",
+    RemoveFn -> "a function removed",
+    AddImport -> "an import added",
+    RemoveImport -> "an import removed",
+    AddTest -> "a test added",
+    AddVariant -> "a variant added",
+    AddField -> "a field added",
+    DropStatement -> "a derive, key, show, gen or numeric removed",
+    NarrowSet -> "an effect set narrowed",
+    AddOp -> "an operation added to an effect",
+    TouchEmbed -> "a file an embed reads changed",
+  }
+
+/// A file an edit writes, whole.
+pub type Change = { path: String, bytes: Bytes }
+
+fn module_of(src: Bytes) -> Option<Module> / {abort.raise} = {
+  let p = parse(src);
+  if len(p.parser.diags) > 0 { None } else { Some(p.node) }
+}
+
+fn fns_of(m: Module) -> List<FnDef> =
+  fold(m.items, [], |acc: List<FnDef>, item: Item| match item { IFn(d) -> push(acc, d), _ -> acc })
+
+/// Where a line goes above every item: past the last import, else past the module's `//!` lines.
+fn above_items(text: Bytes, m: Module) -> Int / {abort.raise} =
+  match last(m.imports) {
+    Some(i) -> line_end(text, i.span.end),
+    None -> heading_end(text, 0, bytes_len(text) + 1),
+  }
+
+fn heading_end(text: Bytes, at: Int, left: Int) -> Int / {abort.raise} =
+  if left <= 0 || at >= bytes_len(text) { at }
+  else if bytes_starts_with(bytes_slice(text, at, bytes_len(text)), b"//!")
+      || bytes_at(text, at) == 10 { heading_end(text, line_end(text, at), left - 1) }
+  else { at }
+
+/// Where `needle` last starts in `text` before `end`.
+fn last_before(text: Bytes, needle: Bytes, end: Int) -> Option<Int> / {abort.raise} =
+  fold(range(0, max(0, end - bytes_len(needle) + 1)), None, |found: Option<Int>, i: Int|
+    if bytes_slice(text, i, i + bytes_len(needle)) == needle { Some(i) } else { found })
+
+/// The last `}` in `text` between `start` and `end`.
+fn last_brace(text: Bytes, start: Int, end: Int) -> Option<Int> / {abort.raise} =
+  fold(range(start, end), None, |found: Option<Int>, i: Int|
+    if bytes_at(text, i) == 125 { Some(i) } else { found })
+
+/// The byte before `at` that is no space, tab or newline.
+fn written_before(text: Bytes, at: Int) -> Int / {abort.raise} =
+  fold(range(0, at), 0 - 1, |found: Int, i: Int| {
+    let b = bytes_at(text, i);
+    if b == 32 || b == 9 || b == 10 { found } else { b }
+  })
+
+fn in_dir(path: String, file: String) -> String / {abort.raise} = {
+  let b = bytes_of_string(path);
+  let slash = fold(range(0, bytes_len(b)), 0 - 1, |found: Int, i: Int|
+    if bytes_at(b, i) == 47 { i } else { found });
+  if slash < 0 { file } else { string_of_bytes(bytes_slice(b, 0, slash)) ++ "/" ++ file }
+}
+
+/// `xs` each once, in the order each first appears.
+fn once(xs: List<String>) -> List<String> =
+  fold(
+    xs,
+    { seen: map_new(), out: [] },
+    |acc: { seen: Map<String, Bool>, out: List<String> }, x: String|
+      if map_contains(acc.seen, x) { acc }
+      else { { seen: map_insert(acc.seen, x, true), out: push(acc.out, x) } },
+  ).out
+
+/// What `e` makes of the module at `path`, whose text is `src`, as the files it writes; none where
+/// the module holds nothing it edits.
+pub fn edited(e: Edit, path: String, src: Bytes) -> Option<List<Change>> / {Here, abort.raise} =
+  match e {
+    TouchEmbed -> match module_of(src) {
+      None -> None,
+      Some(m) -> match first(filter(wants_of(m), |w: EmbedWant| !w.dir)) {
+        None -> None,
+        Some(w) -> {
+          let file = in_dir(path, string_of_bytes(w.path));
+          match fs.read_file[cwd](file) {
+            None -> None,
+            Some(bytes) -> Some([{ path: file, bytes: bytes_concat(bytes, b"\n") }]),
+          }
+        },
+      },
+    },
+    _ -> match edited_text(e, src) { Some(b) -> Some([{ path: path, bytes: b }]), None -> None },
+  }
+
+/// What `e` makes of a module's text, for every edit but one to a file it embeds.
+fn edited_text(e: Edit, src: Bytes) -> Option<Bytes> / {abort.raise} =
+  match module_of(src) {
+    None -> None,
+    Some(m) -> {
+      let one = |bytes: Bytes| Some(bytes);
+      match e {
+        AddFn ->
+          one(bytes_concat(src, b"\n/// What the gate added.\npub fn gate_added() -> Int = 7\n")),
+        Comment -> {
+          let at = above_items(src, m);
+          one(spliced(src, at, at, b"// the gate's note\n"))
+        },
+        WrapBody -> match first(fns_of(m)) {
+          None -> None,
+          Some(d) -> {
+            let s = expr_span(d.body);
+            one(
+              spliced(
+                src,
+                s.start,
+                s.end,
+                bytes_concat_all([b"{ ", bytes_slice(src, s.start, s.end), b" }"]),
+              ),
+            )
+          },
+        },
+        RaiseBody -> match first(fns_of(m)) {
+          None -> None,
+          Some(d) -> {
+            let s = expr_span(d.body);
+            one(spliced(src, s.start, s.end, b"panic(\"the gate\")"))
+          },
+        },
+        Unexport -> match first(filter(fns_of(m), |d: FnDef| d.vis == VPub)) {
+          None -> None,
+          Some(d) -> match last_before(src, b"pub ", d.name.span.start) {
+            Some(i) -> one(spliced(src, i, i + 4, b"")),
+            None -> None,
+          },
+        },
+        RenameFn -> match first(filter(fns_of(m), |d: FnDef| d.vis == VPub)) {
+          None -> None,
+          Some(d) ->
+            one(
+              spliced(
+                src,
+                d.name.span.start,
+                d.name.span.end,
+                bytes_concat(d.name.name, b"_moved"),
+              ),
+            ),
+        },
+        RemoveFn -> match last(fns_of(m)) {
+          None -> None,
+          Some(d) -> one(spliced(src, d.span.start, d.span.end, b"")),
+        },
+        AddImport -> {
+          let at = above_items(src, m);
+          one(spliced(src, at, at, b"import std.option\n"))
+        },
+        RemoveImport -> match first(m.imports) {
+          None -> None,
+          Some(i) -> one(spliced(src, i.span.start, line_end(src, i.span.end), b"")),
+        },
+        AddTest -> one(bytes_concat(src, b"\ntest \"the gate's test\" {\n  assert(true)\n}\n")),
+        AddVariant -> {
+          let sums = fold(m.items, [], |acc: List<Int>, item: Item|
+            match item {
+              IType(d) -> match d.body { TDSum(_) -> push(acc, d.span.end), _ -> acc },
+              _ -> acc,
+            });
+          match first(sums) {
+            None -> None,
+            Some(end) -> one(spliced(src, end, end, b" | GateVariant")),
+          }
+        },
+        AddField -> {
+          let records = fold(m.items, [], |acc: List<Int>, item: Item|
+            match item {
+              IType(d) -> match d.body {
+                TDSum(_) -> acc,
+                _ -> match last_brace(src, d.span.start, d.span.end) {
+                  Some(i) -> push(acc, i),
+                  None -> acc,
+                },
+              },
+              _ -> acc,
+            });
+          match first(records) {
+            None -> None,
+            Some(i) -> {
+              let before = written_before(src, i);
+              one(
+                spliced(src, i, i, if before == 44 || before == 123 { b" gate_field: Int " }
+                else { b", gate_field: Int " }),
+              )
+            },
+          }
+        },
+        DropStatement -> {
+          let spans = fold(m.items, [], |acc: List<{ start: Int, end: Int }>, item: Item|
+            match item {
+              IDerive(d) -> push(acc, { start: d.span.start, end: d.span.end }),
+              IInstance(d) -> push(acc, { start: d.span.start, end: d.span.end }),
+              INumeric(d) -> push(acc, { start: d.span.start, end: d.span.end }),
+              _ -> acc,
+            });
+          match first(spans) { None -> None, Some(s) -> one(spliced(src, s.start, s.end, b"")) }
+        },
+        NarrowSet -> {
+          let cuts = fold(m.items, [], |acc: List<{ start: Int, end: Int }>, item: Item|
+            match item {
+              IEffectSet(d) -> {
+                let n = len(d.atoms);
+                if n < 2 { acc } else {
+                  match ((list_at(d.atoms, n - 2), list_at(d.atoms, n - 1))) {
+                    (Some(a), Some(b)) -> push(acc, { start: a.span.end, end: b.span.end }),
+                    _ -> acc,
+                  }
+                }
+              },
+              _ -> acc,
+            });
+          match first(cuts) { None -> None, Some(s) -> one(spliced(src, s.start, s.end, b"")) }
+        },
+        AddOp -> {
+          let ends = fold(m.items, [], |acc: List<Int>, item: Item|
+            match item {
+              IEffect(d) -> match last_brace(src, d.span.start, d.span.end) {
+                Some(i) -> push(acc, i),
+                None -> acc,
+              },
+              _ -> acc,
+            });
+          match first(ends) {
+            None -> None,
+            Some(i) -> one(spliced(src, i, i, b"\n  read gate_peek() -> Int\n")),
+          }
+        },
+        TouchEmbed -> None,
+      }
+    },
+  }
+
+// --- Sessions ---------------------------------------------------------------------------------
+
+fn put(c: Change) -> Unit / {Here, abort.raise} =
+  assert(fs.write_file[cwd](c.path, c.bytes), Some("`" ++ c.path ++ "` is written"))
+
+fn held(path: String) -> Bytes / {Here, abort.raise} =
+  match fs.read_file[cwd](path) { Some(b) -> b, None -> panic("`" ++ path ++ "` reads") }
+
+/// Where `a` and `b` first differ, as a path into them and what each holds there.
+pub fn difference(a: Json, b: Json, at: String) -> String / {abort.raise} =
+  match ((a, b)) {
+    (Object(x), Object(y)) -> {
+      let keys = once(concat(map_keys(x), map_keys(y)));
+      match first(filter(keys, |k: String| map_get(x, k) != map_get(y, k))) {
+        None -> at ++ ": alike",
+        Some(k) -> match ((map_get(x, k), map_get(y, k))) {
+          (Some(u), Some(v)) -> difference(u, v, at ++ "." ++ k),
+          (Some(_), None) -> at ++ "." ++ k ++ " is only in the first",
+          _ -> at ++ "." ++ k ++ " is only in the second",
+        },
+      }
+    },
+    (Array(xs), Array(ys)) -> if len(xs) != len(ys) {
+      at ++ " holds " ++ int_to_string(len(xs)) ++ " against " ++ int_to_string(len(ys))
+        ++ "; first apart at "
+        ++ apart_at(xs, ys, at)
+    } else { apart_at(xs, ys, at) },
+    _ -> at ++ ": " ++ clipped(shown(a)) ++ " against " ++ clipped(shown(b)),
+  }
+
+fn apart_at(xs: List<Json>, ys: List<Json>, at: String) -> String / {abort.raise} =
+  match first(filter(range(0, max(len(xs), len(ys))), |i: Int| list_at(xs, i) != list_at(ys, i))) {
+    None -> at ++ ": alike",
+    Some(i) -> match ((list_at(xs, i), list_at(ys, i))) {
+      (Some(u), Some(v)) -> difference(u, v, at ++ "[" ++ int_to_string(i) ++ "]"),
+      (Some(u), None) ->
+        at ++ "[" ++ int_to_string(i) ++ "] is only in the first: " ++ clipped(shown(u)),
+      (None, Some(v)) ->
+        at ++ "[" ++ int_to_string(i) ++ "] is only in the second: " ++ clipped(shown(v)),
+      _ -> at ++ ": alike",
+    },
+  }
+
+fn clipped(s: String) -> String / {abort.raise} =
+  if string_len(s) <= 300 { s } else { string_slice(s, 0, 300) ++ "…" }
+
+/// What a session of edits found: the steps where the warm answer was not the cold one, or where an
+/// undone edit did not land on the answer it began from, and how many edits it made.
+pub type Session = { off: List<String>, made: Int }
+
+/// What a session compares after each step: the project at `dir` checked, and with `runs` how its
+/// tests ended too, which the kept emitter answers and passes decide, as the check does not.
+type Asked = { dir: String, runs: Bool }
+
+fn checked(dir: String) -> List<String> = ["check", dir, "--explain", "--json"]
+
+/// What a run of the tests answered that a cache could decide: how it exited, and each test that
+/// failed with the code it failed with.
+fn outcome(report: Json) -> Json =
+  Object(
+    map_insert(
+      map_insert(map_new(), "exit_code", at(report, "exit_code")),
+      "failures",
+      Array(
+        map(items(at(report, "failures")), |f: Json|
+          Array([at(f, "key"), at(at(f, "diagnostic"), "code")])),
+      ),
+    ),
+  )
+
+fn answer_of<| e>(
+  asked: Asked,
+  ran: (List<String>) -> Ran / {abort.raise | e},
+) -> Json / {abort.raise | e} = {
+  let check = comparable(json_of(ran(checked(asked.dir))));
+  if !asked.runs { check }
+  else { Array([check, outcome(json_of(ran(["test", asked.dir, "--json"])))]) }
+}
+
+/// The project as it stands, seeded from its cache and filing into it, with each of `shipped`
+/// standing in for the shipped module it is filed as.
+fn warm_of(
+  asked: Asked,
+  shipped: List<Source>,
+) -> Json / {Reached, Shipped, abort.raise, diverges} =
+  answer_of(asked, |argv: List<String>| on_disk_shipping(argv, shipped))
+
+/// The same from nothing: in memory, beside no cache.
+fn cold_of(
+  asked: Asked,
+  shipped: List<Source>,
+) -> Json / {Hermetic, Shipped, Here, abort.raise, diverges} = {
+  let t = tree(sources_here());
+  answer_of(asked, |argv: List<String>| over_tree(t, || on_disk_shipping(argv, shipped)).value)
+}
+
+/// One step of a session, its edit made: what the warm answer and the cold one say with `shipped`
+/// standing in, and, once `undo` undid it, what the warm one says against `start`.
+fn stepped(
+  asked: Asked,
+  start: Json,
+  out: Session,
+  step: String,
+  shipped: List<Source>,
+  undo: () -> Unit / {Here, abort.raise},
+) -> Session / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  let warm = warm_of(asked, shipped);
+  let fresh = cold_of(asked, shipped);
+  let seen = if warm == fresh { out.off }
+  else { push(out.off, step ++ ": " ++ difference(warm, fresh, "answer")) };
+  undo();
+  let back = warm_of(asked, []);
+  {
+    off: if back == start { seen }
+    else { push(seen, step ++ ", undone: " ++ difference(back, start, "answer")) },
+    made: out.made + 1,
+  }
+}
+
+fn opened(
+  asked: Asked,
+) -> { start: Json, off: List<String> } / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  let start = warm_of(asked, []);
+  let cold = cold_of(asked, []);
+  {
+    start: start,
+    off: if start == cold { [] }
+    else { ["before any edit: " ++ difference(start, cold, "answer")] },
+  }
+}
+
+/// Each edit of `edits` made to each module at `paths` under the working directory, one at a time
+/// and undone after, the project at `dir` checked after each.
+pub fn disagreements(
+  dir: String,
+  paths: List<String>,
+  edits: List<Edit>,
+  runs: Bool = false,
+) -> Session / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  let asked = { dir: dir, runs: runs };
+  let o = opened(asked);
+  fold(paths, { off: o.off, made: 0 }, |acc: Session, path: String|
+    fold(edits, acc, |out: Session, e: Edit|
+      match edited(e, path, held(path)) {
+        None -> out,
+        Some(changes) -> {
+          let before = map(changes, |c: Change| { path: c.path, bytes: held(c.path) });
+          fold(changes, (), |_: Unit, c: Change| put(c));
+          stepped(asked, o.start, out, path ++ ", " ++ edit_name(e), [], ||
+            fold(before, (), |_: Unit, c: Change| put(c)))
+        },
+      }))
+}
+
+/// Each edit of `edits` made to the shipped module `module` as the project at `dir` reads it, one at
+/// a time and undone after: the module stands in for the one the binary ships.
+pub fn shipped_disagreements(
+  dir: String,
+  module: StdModule,
+  edits: List<Edit>,
+) -> Session / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  let asked = { dir: dir, runs: false };
+  let o = opened(asked);
+  fold(edits, { off: o.off, made: 0 }, |out: Session, e: Edit|
+    match edited_text(e, module.src) {
+      None -> out,
+      Some(text) ->
+        stepped(
+          asked,
+          o.start,
+          out,
+          module.module ++ ", " ++ edit_name(e),
+          [{ path: module.module ++ ".ply", text: string_of_bytes(text) }],
+          || (),
+        ),
+    })
+}
+
+/// That a session found nothing, and made an edit to every module it was given.
+pub fn held_through(s: Session, modules: Int) -> Unit / {abort.raise} = {
+  assert(s.made >= modules, Some("each module is edited at least once"));
+  assert(
+    len(s.off) == 0,
+    Some(
+      "an answer seeded from the cache was not the one from nothing:\n"
+        ++ string::join(s.off, "\n"),
+    ),
+  )
+}
+
+fn agrees(paths: List<String>) -> Unit / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
+  let opening = cold_of({ dir: ".", runs: false }, []);
+  assert(
+    truth(at(opening, "ok")) && len(items(at(opening, "diagnostics"))) == 0,
+    Some(
+      "the project checks cold with nothing to warn of: "
+        ++ clipped(shown(at(opening, "diagnostics"))),
+    ),
+  );
+  held_through(disagreements(".", paths, every_edit(), runs: true), len(paths))
+}
+
+// --- Every kind of item ----------------------------------------------------------------------
+
+/// What kind of item `item` is, as the catalogue names it. Every kind of item is named, so one the
+/// language gains fails to compile here until it is.
+pub fn kind_of(item: Item) -> String =
+  match item {
+    IFn(d) -> if d.baked != None { "const fn" }
+    else if d.transparent != None { "transparent fn" }
+    else { "fn" },
+    IType(d) -> if d.opaque != None { "opaque type" } else {
+      match d.body {
+        TDSum(_) -> "sum type",
+        TDAlias(_) -> "type alias",
+        TDNominal(_) -> "new type",
+      }
+    },
+    IEffect(_) -> "effect",
+    ITest(d) -> if d.cases == None { "test" } else { "test over cases" },
+    ILaw(_) -> "law",
+    ISchema(_) -> "law schema",
+    IDerive(_) -> "derive",
+    IEffectSet(_) -> "effect set",
+    // Only the prelude declares one, and a module that writes one is refused.
+    IExtern(_) -> "extern fn",
+    IInstance(d) -> match d.kind { NKey -> "key", NShow -> "show", NGen -> "gen" },
+    INumeric(_) -> "numeric",
+  }
+
+/// The kinds no project's module can hold.
+fn unwritable() -> List<String> = ["extern fn"]
+
+fn kinds_in(sources: List<Bytes>) -> List<String> / {abort.raise} =
+  once(
+    fold(sources, [], |acc: List<String>, src: Bytes|
+      match module_of(src) { None -> acc, Some(m) -> concat(acc, map(m.items, kind_of)) }),
+  )
+
+/// A project of two modules: `lib`, which holds the kind of item the fixture is named for, and
+/// `app`, which reads it the way an importer does.
+type Fixture = { name: String, files: List<Source> }
+
+fn lib_app(name: String, lib: String, app: String) -> Fixture =
+  { name: name, files: [{ path: "lib.ply", text: lib }, { path: "app.ply", text: app }] }
+
+fn catalogue() -> List<Fixture> =
+  [
+    lib_app(
+      "fn",
+      "/// Twice its argument.\npub fn twice(x: Int) -> Int = x * 2\n\npub fn thrice(x: Int) -> Int = {\n  let doubled = twice(x);\n  doubled + x\n}\n",
+      "import lib\n\npub fn four() -> Int = lib::twice(2)\n\ntest \"four and three\" {\n  assert_eq(four() + lib::thrice(1), 7)\n}\n",
+    ),
+    lib_app(
+      "sum type",
+      "pub type Shape =\n  | Dot\n  | Line(Int)\n\npub fn length(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> n,\n  }\n",
+      "import lib\nimport lib (Dot, Line)\n\npub fn kind(s: lib::Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(_) -> 1,\n  }\n\npub fn total(shapes: List<lib::Shape>) -> Int =\n  fold(shapes, 0, |acc: Int, s: lib::Shape| acc + lib::length(s))\n\ntest \"a line is longer than a dot\" {\n  assert_eq(total([Line(2), Dot]), 2)\n}\n",
+    ),
+    lib_app(
+      "type alias",
+      "pub type Point = { x: Int, y: Int }\n\npub type Money = Int\n\npub fn origin() -> Point = { x: 0, y: 0 }\n",
+      "import lib\n\npub fn moved(p: lib::Point) -> lib::Point = { x: p.x + 1, y: p.y }\n\npub fn cost() -> lib::Money = 3\n\ntest \"one step right\" {\n  assert_eq(moved(lib::origin()).x, 1)\n}\n",
+    ),
+    lib_app(
+      "new type",
+      "pub type Celsius = new { degrees: Int }\n\npub fn freezing() -> Celsius = { degrees: 0 }\n\npub fn degrees(c: Celsius) -> Int = c.degrees\n",
+      "import lib\n\npub fn warmer() -> Int = lib::degrees(lib::freezing()) + 1\n\ntest \"warmer than freezing\" {\n  assert_eq(warmer(), 1)\n}\n",
+    ),
+    lib_app(
+      "opaque type",
+      "pub opaque type Count = new { n: Int }\n\npub fn zero() -> Count = { n: 0 }\n\npub fn next(c: Count) -> Count = { n: c.n + 1 }\n\npub fn value(c: Count) -> Int = c.n\n",
+      "import lib\n\npub fn two() -> Int = lib::value(lib::next(lib::next(lib::zero())))\n\ntest \"two steps\" {\n  assert_eq(two(), 2)\n}\n",
+    ),
+    lib_app(
+      "effect",
+      "pub effect log {\n  write emit(Bytes) -> Unit\n  read peek() -> Int\n}\n\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
+      "import lib\n\npub fn said() -> Int =\n  handle {\n    lib::say(b\"a\");\n    2\n  } with {\n    lib::log.emit(_) -> (),\n  }\n\ntest \"said\" {\n  assert_eq(said(), 2)\n}\n",
+    ),
+    lib_app(
+      "effect set",
+      "pub effect log {\n  write emit(Bytes) -> Unit\n  read peek() -> Int\n}\n\npub effect set Logging = {log.write, log.read}\n\npub fn noted() -> Int / {Logging} = {\n  log.emit(b\"x\");\n  log.peek()\n}\n",
+      "import lib\n\npub fn twice_noted() -> Int / {lib::Logging} = lib::noted() + lib::noted()\n",
+    ),
+    lib_app(
+      "derive",
+      "pub type Box =\n  | Box(Int)\n\nderive eq for Box\n\npub fn boxed(n: Int) -> Box = Box(n)\n",
+      "import lib\n\npub fn same(a: lib::Box, b: lib::Box) -> Bool = a == b\n\ntest \"a box is itself\" {\n  assert(same(lib::boxed(1), lib::boxed(1)))\n}\n",
+    ),
+    lib_app(
+      "key",
+      "pub type Tag =\n  | Tag(Int)\n\npub fn tag_key(t: Tag) -> Int =\n  match t {\n    Tag(n) -> n,\n  }\n\nkey for Tag by tag_key\n\npub fn tagged(n: Int) -> Tag = Tag(n)\n",
+      "import lib\n\npub fn same(a: lib::Tag, b: lib::Tag) -> Bool = a == b\n\ntest \"a tag is itself\" {\n  assert(same(lib::tagged(1), lib::tagged(1)))\n}\n",
+    ),
+    lib_app(
+      "show",
+      "pub type Mark =\n  | Mark(Int)\n\npub fn shown(m: Mark) -> String = \"mark\"\n\nshow for Mark by shown\n\npub fn marked() -> Mark = Mark(1)\n",
+      "import lib\n\npub fn label() -> String = \"{lib::marked()}\"\n",
+    ),
+    lib_app(
+      "gen",
+      "import std.gen\n\npub type Coin =\n  | Coin(Int)\n\npub fn arbitrary() -> gen::Gen<Coin> = gen::map(gen::int(), |n: Int| Coin(n))\n\ngen for Coin by arbitrary\n\npub fn value(c: Coin) -> Int =\n  match c {\n    Coin(n) -> n,\n  }\n",
+      "import lib\n\npub fn kept(c: lib::Coin) -> lib::Coin = c\n\nlaw \"a coin is kept\" forall (c: lib::Coin) {\n  lib::value(kept(c)) == lib::value(c)\n}\n",
+    ),
+    lib_app(
+      "numeric",
+      "pub type Small =\n  | Small(Int)\n\npub fn of(s: Small) -> Int =\n  match s {\n    Small(n) -> n,\n  }\n\npub fn add(a: Small, b: Small) -> Small = Small(of(a) + of(b))\npub fn sub(a: Small, b: Small) -> Small = Small(of(a) - of(b))\npub fn mul(a: Small, b: Small) -> Small = Small(of(a) * of(b))\npub fn neg(a: Small) -> Small = Small(0 - of(a))\npub fn of_int(n: Int) -> Small = Small(n)\n\nderive eq for Small\n\nnumeric for Small by { add: add, sub: sub, mul: mul, neg: neg, of_int: of_int }\n",
+      "import lib\n\npub fn summed(a: lib::Small, b: lib::Small) -> lib::Small = a + b\n\ntest \"one and two\" {\n  assert(summed(lib::of_int(1), lib::of_int(2)) == lib::of_int(3))\n}\n",
+    ),
+    lib_app(
+      "law",
+      "pub fn twice(x: Int) -> Int = x + x\n\nlaw \"twice doubles\" forall (x: Int) {\n  twice(x) == 2 * x\n}\n",
+      "import lib\n\npub fn four() -> Int = lib::twice(2)\n",
+    ),
+    lib_app(
+      "law schema",
+      "pub law schema round_trip<a, b | e>(encode: (a) -> b / e, decode: (b) -> Option<a> / e)\n  forall (x: a) { decode(encode(x)) == Some(x) }\n\npub fn wrap(n: Int) -> List<Int> = [n]\n\npub fn unwrap(xs: List<Int>) -> Option<Int> = list_at(xs, 0)\n",
+      "import lib\n\nlaw \"a wrap unwraps\" = lib::round_trip(lib::wrap, lib::unwrap)\n",
+    ),
+    lib_app(
+      "test",
+      "pub fn one() -> Int = 1\n\ntest \"one is one\" {\n  assert_eq(one(), 1)\n}\n",
+      "import lib\n\ntest \"one and one\" {\n  assert_eq(lib::one() + lib::one(), 2)\n}\n",
+    ),
+    lib_app(
+      "test over cases",
+      "pub fn table() -> List<Int> = [1, 2]\n\npub fn held(n: Int) -> Bool = n > 0\n\ntest \"{n} holds\" for n: Int in table() {\n  assert(held(n))\n}\n",
+      "import lib\n\ntest \"{n} holds here too\" for n: Int in lib::table() {\n  assert(lib::held(n))\n}\n",
+    ),
+    lib_app(
+      "const fn",
+      "pub const fn table() -> List<Int> = [1, 2, 3]\n\npub fn summed() -> Int = fold(table(), 0, |acc: Int, n: Int| acc + n)\n",
+      "import lib\n\npub fn six() -> Int = lib::summed()\n\ntest \"six\" {\n  assert_eq(six(), 6)\n}\n",
+    ),
+    lib_app(
+      "transparent fn",
+      "pub transparent fn same(x: Int) -> Int = x\n",
+      "import lib\n\npub fn kept(x: Int) -> Int ensures result == x = lib::same(x)\n",
+    ),
+    {
+      name: "embed",
+      files: [
+        {
+          path: "lib.ply",
+          text: "pub fn data() -> Bytes = embed(\"data.txt\")\n\npub fn size() -> Int = bytes_len(data())\n",
+        },
+        { path: "data.txt", text: "four" },
+        {
+          path: "app.ply",
+          text: "import lib\n\npub fn twice() -> Int = lib::size() * 2\n\ntest \"eight\" {\n  assert(twice() >= 8)\n}\n",
+        },
+      ],
+    },
+    lib_app(
+      "tagged literal",
+      "pub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> =\n  if string_len(text) > 0 { Ok(string_len(text)) }\n  else { Err({ message: \"empty\", offset: 0 }) }\n",
+      "import lib\n\npub fn three() -> Int = lib\"abc\"\n\ntest \"three\" {\n  assert_eq(three(), 3)\n}\n",
+    ),
+  ]
+
+fn fixture(name: String) -> Fixture / {abort.raise} =
+  match first(filter(catalogue(), |f: Fixture| f.name == name)) {
+    Some(f) -> f,
+    None -> panic("no fixture is named `" ++ name ++ "`"),
+  }
+
+fn fixture_names() -> List<String> = map(catalogue(), |f: Fixture| f.name)
+
+test "{name} agrees warm and cold through every edit to its modules" for name: String in fixture_names(
+  ) {
+  scratch(|| {
+    let f = fixture(name);
+    project(f.files);
+    agrees(map(filter(f.files, |s: Source| string_ends_with(s.path, ".ply")), |s: Source| s.path))
+  })
+}
+
+test "every kind of item a module of the tree holds has a fixture its edits run over" {
+  let held = concat(
+    map(
+      filter(example_files(), |f: { name: String, bytes: Bytes }| string_ends_with(f.name, ".ply")),
+      |f: { name: String, bytes: Bytes }| f.bytes,
+    ),
+    map(std_modules(), |m: StdModule| m.src),
+  );
+  let fixtures = kinds_in(
+    fold(catalogue(), [], |acc: List<Bytes>, f: Fixture|
+      concat(acc, map(f.files, |s: Source| bytes_of_string(s.text)))),
+  );
+  let missing = filter(kinds_in(held), |k: String|
+    !contains(fixtures, k) && !contains(unwritable(), k));
+  assert(
+    len(missing) == 0,
+    Some("the tree holds kinds of item no fixture edits: " ++ string::join(missing, ", ")),
+  )
+}
+
+test "an edit is made where its kind of item is, and nowhere it is not" {
+  let src = b"import std.option\n\npub type Shape =\n  | Dot\n\npub fn one() -> Int = 1\n";
+  let made = map(
+    [AddVariant, Unexport, RenameFn, WrapBody, RemoveImport, NarrowSet, AddOp],
+    |e: Edit| match edited_text(e, src) { Some(b) -> b, None -> b"-" },
+  );
+  assert_eq(made, [
+    b"import std.option\n\npub type Shape =\n  | Dot | GateVariant\n\npub fn one() -> Int = 1\n",
+    b"import std.option\n\npub type Shape =\n  | Dot\n\nfn one() -> Int = 1\n",
+    b"import std.option\n\npub type Shape =\n  | Dot\n\npub fn one_moved() -> Int = 1\n",
+    b"import std.option\n\npub type Shape =\n  | Dot\n\npub fn one() -> Int = { 1 }\n",
+    b"\npub type Shape =\n  | Dot\n\npub fn one() -> Int = 1\n",
+    b"-",
+    b"-",
+  ])
+}

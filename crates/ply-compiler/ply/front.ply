@@ -2756,6 +2756,8 @@ pub type Hashed = {
   restored: List<Bytes>,
   embed_items: Map<Bytes, List<ItemWants>>,
   forms: Map<Bytes, Bytes>,
+  /// The tests a stub blanked that nothing its run fixed holds: their modules are read whole again.
+  unheld: List<Bytes>,
 }
 
 fn hashed_closure(
@@ -2810,24 +2812,7 @@ fn hashed_closure(
               ifaces.laws,
               blanked_tests(concat(ifaces.cuts, cuts)),
             );
-            if len(hashed.unheld) > 0 {
-              Err([
-                outside_every_module(
-                  error_at(
-                    b"E0505",
-                    0,
-                    dummy_span(),
-                    bytes_concat_all([
-                      b"the test `",
-                      at(hashed.unheld, 0),
-                      b"`, of a module read as its stub, has no hash its run fixed",
-                    ]),
-                    b"its body is blank",
-                    [b"this is Ply's fault: a stub stands only where each of its tests was fixed"],
-                  ),
-                ),
-              ])
-            } else {
+            {
               Ok({
                 mods: x.mods,
                 r: x.r,
@@ -2852,6 +2837,7 @@ fn hashed_closure(
                 restored: [],
                 embed_items: map_new(),
                 forms: map_new(),
+                unheld: hashed.unheld,
               })
             }
           }
@@ -2929,10 +2915,45 @@ fn analyse_closure(
   embeds: List<EmbedAt> = [],
   priors: List<Prior> = [],
 ) -> AnalysisOutcome / {abort.raise} =
-  match hashed_closure(parsed, clo, root_count, toolchain, ifaces, embeds, priors) {
+  match held_whole(hashed_closure(parsed, clo, root_count, toolchain, ifaces, embeds, priors)) {
     Err(diags) -> Refused(diags),
     Ok(h) -> checked_closure(h, defs, tests),
   }
+
+/// `r`, refused where a test a stub blanked is still held by nothing its run fixed once every stub
+/// such a test was in was read whole: that is Ply's fault.
+fn held_whole(r: Result<Hashed, List<Diag>>) -> Result<Hashed, List<Diag>> =
+  match r {
+    Err(diags) -> Err(diags),
+    Ok(h) -> match list_at(h.unheld, 0) {
+      None -> Ok(h),
+      Some(key) ->
+        Err([
+          outside_every_module(
+            error_at(
+              b"E0505",
+              0,
+              dummy_span(),
+              bytes_concat_all([
+                b"the test `",
+                key,
+                b"`, of a module read as its stub, has no hash its run fixed",
+              ]),
+              b"its body is blank",
+              [b"this is Ply's fault: a stub stands only where each of its tests was fixed"],
+            ),
+          ),
+        ]),
+    },
+  }
+
+/// The modules of the tests `h` could not hold.
+fn unheld_modules(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
+  let keys = fold(h.unheld, map_new(), |acc: Map<Bytes, Bool>, k: Bytes| map_insert(acc, k, true));
+  fold(h.index.tests, map_new(), |acc: Map<Bytes, Bool>, t: TestNode|
+    if map_contains(keys, t.key) { map_insert(acc, at(h.index.mods, t.module).name, true) }
+    else { acc })
+}
 
 /// Every table the answer holds, as rows.
 /// The answer as a program ships it: what a load walked and what it warned of are functions of the
@@ -4466,15 +4487,20 @@ pub fn staged_pulling_std_with(
   // source and what the stub references there moved, it is read whole again.
   let first = if len(moved) == 0 || len(x.diags) > 0 { None }
   else { Some(hashed(ifaces, x.parsed, no_restored())) };
+  // A stub whose test nothing its run fixed holds now stands on something that moved too.
   let again = match first {
     Some(Ok(h)) ->
-      moved_through(
-        h,
-        moved,
-        forms,
-        ifaces,
-        x.parsed,
-        fold(sources, map_new(), |acc: Map<Bytes, Bool>, s: Source| map_insert(acc, s.name, true)),
+      map_merge(
+        moved_through(
+          h,
+          moved,
+          forms,
+          ifaces,
+          x.parsed,
+          fold(sources, map_new(), |acc: Map<Bytes, Bool>, s: Source|
+            map_insert(acc, s.name, true)),
+        ),
+        unheld_modules(h),
       ),
     _ -> map_new(),
   };
@@ -4493,7 +4519,7 @@ pub fn staged_pulling_std_with(
   let rowless = rowless_of(ifs);
   let restore = |parsed: List<ParsedSource>, needed: (Bytes) -> Bool|
     restored(parsed, rowless, needed, whole, told, data_held(data), tested);
-  if len(x.diags) > 0 { { pulled: x.pulled, hashed: Err(x.diags), viewed: [] } }
+  let staged = if len(x.diags) > 0 { { pulled: x.pulled, hashed: Err(x.diags), viewed: [] } }
   else if !reached || len(x.pulled) == 0 {
     let back = restore(own.parsed, |_: Bytes| true);
     {
@@ -4533,7 +4559,8 @@ pub fn staged_pulling_std_with(
         }
       },
     }
-  }
+  };
+  { ..staged, hashed: held_whole(staged.hashed) }
 }
 
 /// Each stub's functions it blanked with no row to answer for them, by module: a shipped module's
