@@ -15,7 +15,7 @@ import compiler.type_syntax (TypeExpr, TRecord)
 import std.fs (MemFs)
 import std.json (Json, Null)
 import std.json
-import std.list (sort, sort_by)
+import std.list (concat, contains, sort, sort_by)
 import std.process (process, Exited)
 import std.string
 import std.text (shell_join)
@@ -496,6 +496,118 @@ test "a program over shipped modules that name one record alike, and an effect b
     assert_ok(on_disk_shipping_only(["build", ".", "-o", "app.plyx"], alike_shipped()));
     let ran = json_of(on_disk_shipping_only(["run", "app.plyx", "--json"], alike_shipped()));
     assert(str(at(ran, "value")) == "209", Some(shown(ran)))
+  })
+}
+
+/// A shipped module of three tables of attacks, refused by `tests`.
+fn attacks(tests: String) -> List<Source> =
+  [
+    {
+      path: "std.attacks.ply",
+      text: string::join(
+        [
+          "//! Three tables of attacks, each refused alike.",
+          "",
+          "import std.list (concat)",
+          "",
+          "/// One attack: what it is called and how it is made.",
+          "pub type Attack = { name: String, n: Int }",
+          "",
+          "/// Whether an attack is refused.",
+          "pub fn refused(c: Attack) -> Bool = c.n > 0",
+          "",
+          "fn forged() -> List<Attack> = [{ name: \"forged one\", n: 1 }, { name: \"forged two\", n: 2 }]",
+          "",
+          "fn replayed() -> List<Attack> =",
+          "  [{ name: \"replayed one\", n: 3 }, { name: \"replayed two\", n: 4 }, { name: \"replayed three\", n: 5 }]",
+          "",
+          "fn stripped() -> List<Attack> = [{ name: \"stripped one\", n: 6 }]",
+          "",
+          tests,
+        ],
+        "\n",
+      ),
+    },
+  ]
+
+/// Three tests over cases of one label and one body, each over a table of its own.
+fn apart() -> String =
+  \\test "{c.name} is refused" for c: Attack in forged() { assert(refused(c)) }
+  \\
+  \\test "{c.name} is refused" for c: Attack in replayed() { assert(refused(c)) }
+  \\
+  \\test "{c.name} is refused" for c: Attack in stripped() { assert(refused(c)) }
+  \\
+
+/// The same test over the three tables at once.
+fn together() -> String =
+  \\test "{c.name} is refused" for c: Attack in concat(concat(forged(), replayed()), stripped()) {
+  \\  assert(refused(c))
+  \\}
+  \\
+
+/// The shipped modules `names` import, themselves included, as this binary ships them.
+fn shipped_closure(names: List<String>) -> List<Source> / {Shipped, abort.raise} = {
+  let all = shipped_sources();
+  let imports = |text: String|
+    fold(string_split(text, "\n"), [], |acc: List<String>, line: String|
+      if !string_starts_with(line, "import std.") { acc } else {
+        let rest = string_slice(line, 7, string_len(line));
+        push(acc, match string::index_of(rest, " ") {
+          Some(end) -> string_slice(rest, 0, end),
+          None -> rest,
+        })
+      });
+  let wanted = iterate(names, len(all) + 1, |held: List<String>| {
+    let grown = fold(all, held, |acc: List<String>, s: Source| {
+      let name = string_slice(s.path, 0, string_len(s.path) - 4);
+      if !contains(held, name) { acc } else {
+        fold(imports(s.text), acc, |a: List<String>, n: String|
+          if contains(a, n) { a } else { push(a, n) })
+      }
+    });
+    if len(grown) == len(held) { Stop(held) } else { Continue(grown) }
+  });
+  filter(all, |s: Source| contains(wanted, string_slice(s.path, 0, string_len(s.path) - 4)))
+}
+
+// A test is keyed by its label, so three of one label were one name for three tables, and a run
+// could list one table's cases for another's.
+test "a shipped module's second test of one label is refused by name, and one test over every table runs each case" {
+  scratch(|| {
+    program("pub fn mine() -> Int = 1\n");
+    let needed = shipped_closure(["std.cases", "std.list", "std.show"]);
+    let ran = |tests: String, argv: List<String>|
+      json_of(
+        on_disk_shipping_only(
+          concat(argv, ["--json", "--filter", "std.attacks."]),
+          concat(attacks(tests), needed),
+        ),
+      );
+    let refused = ran(apart(), ["test", "--std"]);
+    assert(int(at(refused, "exit_code")) != 0, Some(shown(refused)));
+    let said = map(items(at(refused, "diagnostics")), |d: Json|
+      str(at(d, "code")) ++ " " ++ str(at(d, "message")));
+    assert_eq(said, [
+      "E0105 two tests are labelled \"{c.name} is refused\"",
+      "E0105 two tests are labelled \"{c.name} is refused\"",
+    ]);
+    let keys = |argv: List<String>| {
+      let v = ran(together(), argv);
+      assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
+      sort(map(items(path(v, ["selection", "tests"])), |t: Json| str(at(t, "key"))))
+    };
+    let every = [
+      "std.attacks.forged one is refused",
+      "std.attacks.forged two is refused",
+      "std.attacks.replayed one is refused",
+      "std.attacks.replayed three is refused",
+      "std.attacks.replayed two is refused",
+      "std.attacks.stripped one is refused",
+    ];
+    assert_eq(keys(["test", "--std"]), every);
+    assert_eq(keys(["test", "--std"]), every);
+    assert_eq(keys(["test", "--std", "--no-cache"]), every)
   })
 }
 
@@ -1027,6 +1139,11 @@ fn named_module(listing: Json, name: String) -> Option<Json> =
 test "ply doc documents a name of a shipped module that embeds a data file" {
   let r = in_memory(app("fn f() -> Int = 1\n"), ["doc", "std.oid.name"]);
   assert(r.code == 0 && string_contains(said(r), "well-known identifier"), Some(said(r)))
+}
+
+test "ply doc documents a name of a shipped module that imports the compiler's" {
+  let r = in_memory(app("fn f() -> Int = 1\n"), ["doc", "std.syntax.format"]);
+  assert(r.code == 0 && string_contains(said(r), "What `ply fmt` writes"), Some(said(r)))
 }
 
 // A file the tree holds and no module embeds would ship in every binary and be read by nothing.
