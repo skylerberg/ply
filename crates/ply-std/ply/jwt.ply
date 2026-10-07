@@ -13,17 +13,17 @@
 //! signature is computed. So the token never chooses how it is judged: `none` is no algorithm a
 //! key can name, and a public key is never read as an HMAC secret. The algorithms are HMAC with
 //! SHA-256, SHA-384 and SHA-512 (`HS256`, `HS384`, `HS512`), EdDSA over Ed25519, ECDSA over P-256
-//! with SHA-256 (`ES256`), RSA PKCS #1 v1.5 (`RS256`, `RS384`, `RS512`) and, to verify only,
-//! RSA-PSS (`PS256`, `PS384`, `PS512`): `std.crypto` signs no PSS, and a PSS key asked to sign
-//! is refused as `NoSigner`. `ES384`, `ES512` and `ES256K` are refused as `Unsupported`, there
-//! being no P-384, P-521 or secp256k1 here.
+//! with SHA-256 (`ES256`), P-384 with SHA-384 (`ES384`), P-521 with SHA-512 (`ES512`) and
+//! secp256k1 with SHA-256 (`ES256K`, RFC 8812), RSA PKCS #1 v1.5 (`RS256`, `RS384`, `RS512`) and
+//! RSA-PSS (`PS256`, `PS384`, `PS512`). Every signature here is a function of the key and the
+//! input: an ECDSA nonce is RFC 6979's and a PSS salt is made of the key and the message.
 //!
 //! A key that signs holds its material as a `Secret`, which the runtime alone reads; a key that
 //! only verifies is public bytes. An HMAC secret shorter than its hash's digest is refused by
 //! `sign` and by `verify` alike (RFC 7518 §3.2), since a verifier under a guessable secret admits
 //! whoever guesses it, and an RSA key under 2048 bits is refused as `SmallKey`. An `ES256`
-//! signature is `r` then `s` in 32 bytes each and nothing else: the DER form X.509 writes is no
-//! signature here.
+//! signature is `r` then `s`, each as long as the curve's scalar, and nothing else: the DER form
+//! X.509 writes is no signature here.
 //!
 //! Reading is strict. A token longer than the limit its reader names is refused unread. Its
 //! parts are unpadded base64url with no stray character and no loose bits; its header and its
@@ -40,15 +40,14 @@
 //! bounds a token's age, or refuses one used twice, keeps that state itself.
 //!
 //! `jwk` and `jwks` read the keys of RFC 7517 this module can use: `oct`, `OKP` over Ed25519,
-//! `EC` over P-256 and `RSA`, and `key_for` picks the one a peeked header names. A JWK is JSON its
-//! caller parsed, so the text of a `k` or a `d` has been a plain `String` on the way here; the
-//! bytes it encodes are decoded inside a `Secret` and are never a plain value. An RSA private key
-//! does not come as a JWK: `RsaPkcs1Document` takes the PKCS #8 or PKCS #1 document, as `std.pem`
-//! hands one over.
+//! `EC` over the four curves and `RSA`, and `key_for` picks the one a peeked header names. A JWK
+//! is JSON its caller parsed, so the text of a `k` or a `d` has been a plain `String` on the way
+//! here; the bytes it encodes are decoded inside a `Secret` and are never a plain value, and an
+//! RSA private key's numbers are made a document by the runtime alone.
 
 import std.base64 (base64url_decode, base64url_decode_secret, base64url_encode)
 import std.crypto
-import std.crypto (Digest, Raw, Sha256, Sha384, Sha512)
+import std.crypto (Digest, EcdsaCurve, Raw, Sha256, Sha384, Sha512)
 import std.decimal
 import std.ed25519
 import std.gen
@@ -79,21 +78,33 @@ pub type Key =
   | Ed25519(Bytes)
   /// `EdDSA` over Ed25519, to sign with: the thirty-two bytes of a seed, which is the private key.
   | Ed25519Seed(Secret<Bytes>)
-  /// `ES256`, to verify with: a point of P-256 in its 65-byte uncompressed form.
-  | EcdsaP256(Bytes)
-  /// `ES256`, to sign with: the thirty-two bytes of a P-256 scalar.
-  | EcdsaP256Scalar(Secret<Bytes>)
+  /// `ES256`, `ES384`, `ES512` or `ES256K` by its curve (P-256, P-384, P-521 or secp256k1), to
+  /// verify with: a point of the curve in its uncompressed form.
+  | Ecdsa(EcdsaCurve, Bytes)
+  /// The same, to sign with: the curve's scalar, most significant byte first.
+  | EcdsaScalar(EcdsaCurve, Secret<Bytes>)
   /// `RS256`, `RS384` or `RS512` by its digest, to verify with: a PKCS #1 `RSAPublicKey` of 2048
   /// bits or more.
   | RsaPkcs1(Digest, Bytes)
   /// The same, to sign with: a private key document, PKCS #8 or PKCS #1 in DER.
   | RsaPkcs1Document(Digest, Secret<Bytes>)
   /// `PS256`, `PS384` or `PS512` by its digest, to verify with: a PKCS #1 `RSAPublicKey` of 2048
-  /// bits or more. No key signs PSS here.
+  /// bits or more.
   | RsaPss(Digest, Bytes)
+  /// The same, to sign with: a private key document, PKCS #8 or PKCS #1 in DER.
+  | RsaPssDocument(Digest, Secret<Bytes>)
 
 fn digest_bits(digest: Digest) -> String =
   match digest { Sha256 -> "256", Sha384 -> "384", Sha512 -> "512" }
+
+/// The `alg` of ECDSA on `curve` (RFC 7518 §3.4, RFC 8812 §3.2).
+fn curve_algorithm(curve: EcdsaCurve) -> String =
+  match curve {
+    crypto::NistP256 -> "ES256",
+    crypto::NistP384 -> "ES384",
+    crypto::NistP521 -> "ES512",
+    crypto::Secp256k1 -> "ES256K",
+  }
 
 /// The `alg` a token signed with `key` names.
 pub fn algorithm(key: Key) -> String =
@@ -103,24 +114,32 @@ pub fn algorithm(key: Key) -> String =
     HmacSha512(_) -> "HS512",
     Ed25519(_) -> "EdDSA",
     Ed25519Seed(_) -> "EdDSA",
-    EcdsaP256(_) -> "ES256",
-    EcdsaP256Scalar(_) -> "ES256",
+    Ecdsa(curve, _) -> curve_algorithm(curve),
+    EcdsaScalar(curve, _) -> curve_algorithm(curve),
     RsaPkcs1(digest, _) -> "RS" ++ digest_bits(digest),
     RsaPkcs1Document(digest, _) -> "RS" ++ digest_bits(digest),
     RsaPss(digest, _) -> "PS" ++ digest_bits(digest),
+    RsaPssDocument(digest, _) -> "PS" ++ digest_bits(digest),
   }
 
-/// The key a verifier holds for what `key` signs: the public key of an Ed25519 seed, a P-256
+/// The key a verifier holds for what `key` signs: the public key of an Ed25519 seed, an ECDSA
 /// scalar or an RSA document, and an HMAC secret itself, which both sides share. Raises for a key
 /// `sign` would refuse.
 pub fn verifying(key: Key) -> Key / {jwt.refused, abort.raise} =
   match usable(key) {
     Ed25519Seed(seed) -> Ed25519(ed25519::public_key(seed)),
-    EcdsaP256Scalar(scalar) -> EcdsaP256(public_of(crypto::ecdsa_p256_signing(scalar, Raw), key)),
+    EcdsaScalar(curve, scalar) ->
+      Ecdsa(curve, public_of(crypto::ecdsa_signing(curve, scalar, Raw), key)),
     RsaPkcs1Document(digest, document) ->
       RsaPkcs1(digest, public_of(crypto::rsa_pkcs1_signing(document, digest), key)),
+    RsaPssDocument(digest, document) ->
+      RsaPss(digest, public_of(crypto::rsa_pss_signing(document, digest), key)),
     other -> other,
   }
+
+/// What verifies ECDSA under `point` on `curve`, over the curve's own hash, `r` then `s`.
+fn point_key(curve: EcdsaCurve, point: Bytes) -> Option<crypto::VerifyingKey> =
+  crypto::ecdsa_verifying(curve, crypto::curve_digest(curve), point, Raw)
 
 fn public_of(signer: Option<crypto::SigningKey>, key: Key) -> Bytes / {jwt.refused} =
   match signer {
@@ -136,13 +155,16 @@ fn usable(key: Key) -> Key / {jwt.refused} =
     HmacSha512(secret) -> if secret_len(secret) < 64 { short(secret) } else { key },
     Ed25519(public) -> if bytes_len(public) != 32 { odd(bytes_len(public)) } else { key },
     Ed25519Seed(seed) -> if secret_len(seed) != 32 { odd(secret_len(seed)) } else { key },
-    EcdsaP256(point) -> if crypto::ecdsa_p256_verifying(point, Raw) == None { no_key(key) }
-    else { key },
-    EcdsaP256Scalar(scalar) -> if crypto::ecdsa_p256_signing(scalar, Raw) == None { no_key(key) }
-    else { key },
+    Ecdsa(curve, point) -> if point_key(curve, point) == None { no_key(key) } else { key },
+    EcdsaScalar(curve, scalar) -> if crypto::ecdsa_signing(curve, scalar, Raw) == None {
+      no_key(key)
+    } else { key },
     RsaPkcs1(_, public) -> rsa_usable(key, public),
     RsaPss(_, public) -> rsa_usable(key, public),
     RsaPkcs1Document(digest, document) -> if crypto::rsa_pkcs1_signing(document, digest) == None {
+      no_key(key)
+    } else { key },
+    RsaPssDocument(digest, document) -> if crypto::rsa_pss_signing(document, digest) == None {
       no_key(key)
     } else { key },
   }
@@ -167,13 +189,16 @@ fn signature(key: Key, input: Bytes) -> Bytes / {jwt.refused, abort.raise} =
     HmacSha384(secret) -> hmac_sha384(secret, input),
     HmacSha512(secret) -> hmac_sha512(secret, input),
     Ed25519Seed(seed) -> ed25519::sign(seed, input),
-    EcdsaP256Scalar(scalar) -> signed_with(crypto::ecdsa_p256_signing(scalar, Raw), key, input),
+    EcdsaScalar(curve, scalar) ->
+      signed_with(crypto::ecdsa_signing(curve, scalar, Raw), key, input),
     RsaPkcs1Document(digest, document) ->
       signed_with(crypto::rsa_pkcs1_signing(document, digest), key, input),
-    RsaPss(_, _) -> jwt.refused(NoSigner(algorithm(key))),
+    RsaPssDocument(digest, document) ->
+      signed_with(crypto::rsa_pss_signing(document, digest), key, input),
     Ed25519(_) -> jwt.refused(CannotSign),
-    EcdsaP256(_) -> jwt.refused(CannotSign),
+    Ecdsa(_, _) -> jwt.refused(CannotSign),
     RsaPkcs1(_, _) -> jwt.refused(CannotSign),
+    RsaPss(_, _) -> jwt.refused(CannotSign),
   }
 
 fn signed_with(
@@ -190,14 +215,16 @@ fn signed_by(key: Key, input: Bytes, signature: Bytes) -> Bool / {abort.raise} =
     HmacSha512(secret) -> tags_match(hmac_sha512(secret, input), signature),
     Ed25519(public) -> ed25519::verify(public, input, signature),
     Ed25519Seed(seed) -> ed25519::verify(ed25519::public_key(seed), input, signature),
-    EcdsaP256(point) -> held_by(crypto::ecdsa_p256_verifying(point, Raw), input, signature),
-    EcdsaP256Scalar(scalar) ->
-      held_by(verifier_of(crypto::ecdsa_p256_signing(scalar, Raw)), input, signature),
+    Ecdsa(curve, point) -> held_by(point_key(curve, point), input, signature),
+    EcdsaScalar(curve, scalar) ->
+      held_by(verifier_of(crypto::ecdsa_signing(curve, scalar, Raw)), input, signature),
     RsaPkcs1(digest, public) ->
       held_by(crypto::rsa_pkcs1_verifying(public, digest), input, signature),
     RsaPkcs1Document(digest, document) ->
       held_by(verifier_of(crypto::rsa_pkcs1_signing(document, digest)), input, signature),
     RsaPss(digest, public) -> held_by(crypto::rsa_pss_verifying(public, digest), input, signature),
+    RsaPssDocument(digest, document) ->
+      held_by(verifier_of(crypto::rsa_pss_signing(document, digest)), input, signature),
   }
 
 fn verifier_of(signer: Option<crypto::SigningKey>) -> Option<crypto::VerifyingKey> =
@@ -348,8 +375,6 @@ pub type Refusal =
   | NoKey(String)
   /// A public key was asked to sign.
   | CannotSign
-  /// A key of this algorithm was asked to sign, and the algorithm is only verified here.
-  | NoSigner(String)
   /// This member is not of the type its definition gives it.
   | Mistyped(String)
   /// `other` holds this name, which is a registered claim's and has a field of its own.
@@ -384,7 +409,7 @@ pub fn refusal_to_string(r: Refusal) -> String =
     Unsecured(alg) -> "the header's `alg` is `" ++ alg ++ "`: nobody signed this token",
     Unsupported(name) ->
       "`" ++ name
-        ++ "` is not implemented: this module has HS256, HS384, HS512, EdDSA over Ed25519, ES256, RS256, RS384, RS512 and, to verify, PS256, PS384 and PS512",
+        ++ "` is not implemented: this module has HS256, HS384, HS512, EdDSA over Ed25519, ES256, ES384, ES512, ES256K, RS256, RS384, RS512, PS256, PS384 and PS512",
     WrongAlgorithm(found, wanted) ->
       "the header's `alg` is `" ++ found ++ "` and the key is for `" ++ wanted ++ "`",
     Critical(names) ->
@@ -398,9 +423,6 @@ pub fn refusal_to_string(r: Refusal) -> String =
       "an RSA key of " ++ int_to_string(bits) ++ " bits is under the 2048 a signature needs",
     NoKey(alg) -> "the key's bytes are no `" ++ alg ++ "` key",
     CannotSign -> "a public key signs nothing",
-    NoSigner(alg) ->
-      "`" ++ alg
-        ++ "` is verified here and never signed: a PSS signature takes a fresh salt, which the library that signs under an RSA key draws for itself, so it would be no function of the key and the message",
     Mistyped(name) -> "`" ++ name ++ "` is not of the type its definition gives it",
     Reserved(name) -> "`" ++ name ++ "` is a registered claim, which has a field of its own",
     Expired(at) -> "the token expired at " ++ seconds_text(at),
@@ -551,10 +573,8 @@ fn header_of(text: String) -> Header / {jwt.refused, abort.raise} = {
 /// token that names another.
 fn accepted(header: Header, key: Key) -> Unit / {jwt.refused} =
   if spells_none(header.alg) { jwt.refused(Unsecured(header.alg)) }
-  else if header.alg != algorithm(key) {
-    if contains(unimplemented(), header.alg) { jwt.refused(Unsupported(header.alg)) }
-    else { jwt.refused(WrongAlgorithm(header.alg, algorithm(key))) }
-  } else if map_get(header.members, "b64") == Some(json::Bool(false)) { jwt.refused(Unencoded) }
+  else if header.alg != algorithm(key) { jwt.refused(WrongAlgorithm(header.alg, algorithm(key))) }
+  else if map_get(header.members, "b64") == Some(json::Bool(false)) { jwt.refused(Unencoded) }
   else {
     match map_get(header.members, "crit") {
       Some(listed) -> jwt.refused(Critical(strings_in(listed))),
@@ -565,9 +585,6 @@ fn accepted(header: Header, key: Key) -> Unit / {jwt.refused} =
 /// Whether `alg` is `none` in any capitals: an ASCII letter is its lower case with bit five set.
 fn spells_none(alg: String) -> Bool =
   map(string_chars(alg), |c: Char| int_of_char(c) | 0x20) == [110, 111, 110, 101]
-
-/// The signature algorithms the JOSE registry names over a curve this module has none of.
-fn unimplemented() -> List<String> = ["ES384", "ES512", "ES256K"]
 
 fn strings_in(j: Json) -> List<String> =
   match j {
@@ -730,15 +747,17 @@ fn listed(text: Option<String>) -> List<String> = match text { Some(t) -> [t], N
 pub type Jwk = new { kid: Option<String>, key: Key }
 
 /// The key a JWK states: an `oct` key whose `alg` is `HS256`, `HS384` or `HS512`; an `OKP` key
-/// on `Ed25519`, a public one or, with `d`, a seed; an `EC` key on `P-256`, a public one or, with
-/// `d`, a scalar; or a public `RSA` key whose `alg` is one of the six this module verifies.
+/// on `Ed25519`, a public one or, with `d`, a seed; an `EC` key on `P-256`, `P-384`, `P-521` or
+/// `secp256k1`, a public one or, with `d`, a scalar; or an `RSA` key whose `alg` is one of the
+/// six RSA algorithms, a public one or, with `d`, a private one.
 ///
 /// An `oct` or an `RSA` key with no `alg` is refused as `Missing`, since a `Key` names its
-/// algorithm and the bytes alone do not: build it with the constructor meant. Raises
-/// `Unsupported` for any other `kty`, curve or `alg` and for an `RSA` key with a `d`, whose
-/// numbers are not read here; `Unexpected` for a `use` other than `sig` and for a `d` that is not
-/// the private key of `x`; `SmallKey` for an RSA modulus under 2048 bits, `NoKey` for a point off
-/// its curve, and `Mistyped` for a member of the wrong type or not base64url.
+/// algorithm and the bytes alone do not: build it with the constructor meant, and so is a private
+/// `RSA` key that leaves its primes out. Raises `Unsupported` for any other `kty`, curve or `alg`;
+/// `Unexpected` for a `use` other than `sig` and for a `d` that is not the private key of `x`;
+/// `SmallKey` for an RSA modulus under 2048 bits, `NoKey` for a point off its curve or private
+/// numbers that are no key with `n` and `e`, and `Mistyped` for a member of the wrong type or not
+/// base64url.
 pub fn jwk(j: Json) -> Jwk / {jwt.refused, abort.raise} =
   match j {
     Object(members) -> {
@@ -826,42 +845,79 @@ fn edwards_key(
   }
 }
 
+/// The curve a JWK's `crv` names (RFC 7518 §6.2.1.1, RFC 8812 §3.1).
+fn jwk_curve(name: String) -> Option<EcdsaCurve> =
+  match name {
+    "P-256" -> Some(crypto::NistP256),
+    "P-384" -> Some(crypto::NistP384),
+    "P-521" -> Some(crypto::NistP521),
+    "secp256k1" -> Some(crypto::Secp256k1),
+    _ -> None,
+  }
+
 fn curve_key(members: Map<String, Json>, alg: Option<String>) -> Key / {jwt.refused, abort.raise} = {
-  where_stated("alg", alg, "ES256");
-  let curve = needed(members, "crv");
-  if curve != "P-256" { jwt.refused(Unsupported(curve)) } else {
-    let stated = crypto::Ec(curve, octets(members, "x"), octets(members, "y"));
-    let public = match crypto::public_of_jwk(stated) {
-      Some(crypto::P256Public(point)) -> usable(EcdsaP256(point)),
-      _ -> jwt.refused(NoKey("ES256")),
-    };
-    if !map_contains(members, "d") { public } else {
-      let scalar = usable(EcdsaP256Scalar(sealed_octets(members, "d")));
-      if verifying(scalar) == public { scalar }
-      else { jwt.refused(Unexpected("x", [needed(members, "x")])) }
-    }
+  let named = needed(members, "crv");
+  match jwk_curve(named) {
+    None -> jwt.refused(Unsupported(named)),
+    Some(curve) -> {
+      where_stated("alg", alg, curve_algorithm(curve));
+      let size = crypto::scalar_size(curve);
+      let x = octets(members, "x");
+      let y = octets(members, "y");
+      let public = if bytes_len(x) != size || bytes_len(y) != size {
+        jwt.refused(NoKey(curve_algorithm(curve)))
+      } else { usable(Ecdsa(curve, bytes_concat_all([b"\x04", x, y]))) };
+      if !map_contains(members, "d") { public } else {
+        let scalar = usable(EcdsaScalar(curve, sealed_octets(members, "d")));
+        if verifying(scalar) == public { scalar }
+        else { jwt.refused(Unexpected("x", [needed(members, "x")])) }
+      }
+    },
   }
 }
 
-fn rsa_key(members: Map<String, Json>, alg: Option<String>) -> Key / {jwt.refused, abort.raise} =
-  if map_contains(members, "d") { jwt.refused(Unsupported("an RSA private key as a JWK")) } else {
-    let public = match crypto::public_of_jwk(
-        crypto::Rsa(octets(members, "n"), octets(members, "e")),
-      ) {
-      Some(crypto::RsaPublic(document)) -> document,
-      _ -> jwt.refused(NoKey("RSA")),
+/// A member's text, sealed as it is read out of the JSON its caller parsed.
+fn sealed_text(members: Map<String, Json>, name: String) -> Secret<String> / {jwt.refused} =
+  secret_of_string(needed(members, name))
+
+fn rsa_key(members: Map<String, Json>, alg: Option<String>) -> Key / {jwt.refused, abort.raise} = {
+  let n = octets(members, "n");
+  let e = octets(members, "e");
+  let public = match crypto::public_of_jwk(crypto::Rsa(n, e)) {
+    Some(crypto::RsaPublic(document)) -> document,
+    _ -> jwt.refused(NoKey("RSA")),
+  };
+  let private = if !map_contains(members, "d") { None } else {
+    let numbers = {
+      d: sealed_text(members, "d"),
+      p: sealed_text(members, "p"),
+      q: sealed_text(members, "q"),
+      dp: sealed_text(members, "dp"),
+      dq: sealed_text(members, "dq"),
+      qi: sealed_text(members, "qi"),
     };
-    match alg {
-      Some("RS256") -> RsaPkcs1(Sha256, public),
-      Some("RS384") -> RsaPkcs1(Sha384, public),
-      Some("RS512") -> RsaPkcs1(Sha512, public),
-      Some("PS256") -> RsaPss(Sha256, public),
-      Some("PS384") -> RsaPss(Sha384, public),
-      Some("PS512") -> RsaPss(Sha512, public),
-      Some(other) -> jwt.refused(Unsupported(other)),
-      None -> jwt.refused(Missing("alg")),
+    match crypto::rsa_private_of_jwk(n, e, numbers) {
+      Some(crypto::RsaPrivate(document)) -> Some(document),
+      _ -> jwt.refused(NoKey(match alg { Some(named) -> named, None -> "RSA" })),
     }
+  };
+  match ((alg, private)) {
+    (Some("RS256"), None) -> RsaPkcs1(Sha256, public),
+    (Some("RS384"), None) -> RsaPkcs1(Sha384, public),
+    (Some("RS512"), None) -> RsaPkcs1(Sha512, public),
+    (Some("PS256"), None) -> RsaPss(Sha256, public),
+    (Some("PS384"), None) -> RsaPss(Sha384, public),
+    (Some("PS512"), None) -> RsaPss(Sha512, public),
+    (Some("RS256"), Some(document)) -> RsaPkcs1Document(Sha256, document),
+    (Some("RS384"), Some(document)) -> RsaPkcs1Document(Sha384, document),
+    (Some("RS512"), Some(document)) -> RsaPkcs1Document(Sha512, document),
+    (Some("PS256"), Some(document)) -> RsaPssDocument(Sha256, document),
+    (Some("PS384"), Some(document)) -> RsaPssDocument(Sha384, document),
+    (Some("PS512"), Some(document)) -> RsaPssDocument(Sha512, document),
+    (Some(other), _) -> jwt.refused(Unsupported(other)),
+    (None, _) -> jwt.refused(Missing("alg")),
   }
+}
 
 /// A member that may be left out, and must be `wanted` where it is not.
 fn where_stated(name: String, stated: Option<String>, wanted: String) -> Unit / {jwt.refused} =
@@ -881,11 +937,12 @@ type Stated =
   | Shared(Int, Bytes)
   | Seed(Bytes)
   | Edwards(Bytes)
-  | Scalar(Bytes)
-  | Point(Bytes)
+  | Scalar(EcdsaCurve, Bytes)
+  | Point(EcdsaCurve, Bytes)
   | Document(Digest, Bytes)
   | Pkcs1(Digest, Bytes)
   | Pss(Digest, Bytes)
+  | PssDocument(Digest, Bytes)
 
 gen for Stated by stated_keys
 
@@ -901,9 +958,9 @@ fn stated_keys() -> Gen<Stated> =
     } else {
       gen::map(gen::bytes_of(32), |material: Bytes|
         if kind == 3 { Seed(material) }
-        else if crypto::ecdsa_p256_signing(secret_of_bytes(material), Raw) != None {
-          Scalar(material)
-        } else { Scalar(scalar_one()) })
+        else if crypto::ecdsa_signing(crypto::NistP256, secret_of_bytes(material), Raw) != None {
+          Scalar(crypto::NistP256, material)
+        } else { Scalar(crypto::NistP256, scalar_one()) })
     })
 
 /// The scalar one, for a draw that is no scalar: zero, or a number at or past the curve's order.
@@ -917,11 +974,12 @@ fn key_of(stated: Stated) -> Key =
     Shared(_, secret) -> HmacSha512(secret_of_bytes(secret)),
     Seed(seed) -> Ed25519Seed(secret_of_bytes(seed)),
     Edwards(public) -> Ed25519(public),
-    Scalar(scalar) -> EcdsaP256Scalar(secret_of_bytes(scalar)),
-    Point(point) -> EcdsaP256(point),
+    Scalar(curve, scalar) -> EcdsaScalar(curve, secret_of_bytes(scalar)),
+    Point(curve, point) -> Ecdsa(curve, point),
     Document(digest, document) -> RsaPkcs1Document(digest, secret_of_bytes(document)),
     Pkcs1(digest, public) -> RsaPkcs1(digest, public),
     Pss(digest, public) -> RsaPss(digest, public),
+    PssDocument(digest, document) -> RsaPssDocument(digest, secret_of_bytes(document)),
   }
 
 fn b64(text: String) -> String / {abort.raise} = base64url_encode(bytes_of_string(text))
@@ -1042,7 +1100,7 @@ fn curve_token() -> String =
   "eyJhbGciOiJFUzI1NiJ9." ++ rfc_claims_part()
     ++ ".DtEhU3ljbEg8L38VWAfUAqOyKAM6-Xx-F4GawxaepmXFCgfTjDxw5djxLa8ISlSApmWQxfKTUJqPP3-Kg6NU1Q"
 
-/// The token of RFC 7515 appendix A.4, signed over P-521, which is no curve here.
+/// The token of RFC 7515 appendix A.4, signed over P-521.
 fn p521_token() -> String =
   "eyJhbGciOiJFUzUxMiJ9.UGF5bG9hZA.AdwMgeerwtHoh-l192l60hp9wAHZFVJbLfD_UxMi70cwnZOYaRI1bKPWROc-mZZqwqT2SI-KGDKB34XO0aw_7XdtAG8GaSwFKdCAPZgoXD2YBJZCPEX3xKpRwcdOO8KpEHwJjyqOgzDO7iKvU8vcnwNrmxYbSW9ERBXukOXolLzeO_Jn"
 
@@ -1072,7 +1130,7 @@ fn published() -> List<Published> / {abort.raise} =
     {
       name: "RFC 7515 appendix A.3",
       token: curve_token(),
-      key: Point(curve_point()),
+      key: Point(crypto::NistP256, curve_point()),
       alg: "ES256",
       payload: rfc_payload(),
     },
@@ -1084,6 +1142,94 @@ fn published() -> List<Published> / {abort.raise} =
       payload: b"Example of Ed25519 signing",
     },
   ]
+
+/// A key on a curve as a JWK states it, and a token over `Payload` another implementation signed
+/// under it: RFC 7515 appendix A.4's on P-521, and OpenSSL's on P-384 and secp256k1.
+type Curved = {
+  alg: String,
+  curve: EcdsaCurve,
+  crv: String,
+  x: String,
+  y: String,
+  d: String,
+  token: String,
+}
+
+fn curved() -> List<Curved> =
+  [
+    {
+      alg: "ES512",
+      curve: crypto::NistP521,
+      crv: "P-521",
+      x: "AekpBQ8ST8a8VcfVOTNl353vSrDCLLJXmPk06wTjxrrjcBpXp5EOnYG_NjFZ6OvLFV1jSfS9tsz4qUxcWceqwQGk",
+      y: "ADSmRA43Z1DSNx_RvcLI87cdL07l6jQyyBXMoxVg_l2Th-x3S1WDhjDly79ajL4Kkd0AZMaZmh9ubmf63e3kyMj2",
+      d: "AY5pb7A0UFiB3RELSD64fTLOSV_jazdF7fLYyuTw8lOfRhWg6Y6rUrPAxerEzgdRhajnu0ferB0d53vM9mE15j2C",
+      token: p521_token(),
+    },
+    {
+      alg: "ES384",
+      curve: crypto::NistP384,
+      crv: "P-384",
+      x: "QhZc-4gfd3Z8qRgFiJDhjVLqVUD3mj6u8YNM5-cHCdefbv08-Vzs_QmKvoFuiNOh",
+      y: "vcaP9WReSce1y6bpVMpxTZAR8DuLMzQ_W5P81mpeVPMJ0110aYszrrt5eeUg06Qz",
+      d: "AAAAAAAAAAAAAAAAAAAAEjRWeJCrze8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH",
+      token: "eyJhbGciOiJFUzM4NCJ9.UGF5bG9hZA.oaz9_irmTOXXK0MQ5E8-cO6Hl5dCNoUYidoIqS48VbYszTILb2ya5L0x3B118p7n1zk68rUx5dh9vc4HzwKddcECxICEmExMNsvqVffAsayRB3bYBr2nhUMgCPlKy9tR",
+    },
+    {
+      alg: "ES256K",
+      curve: crypto::Secp256k1,
+      crv: "secp256k1",
+      x: "ibaPEM95vmILZmAy6VE-50OtbnnlxyWAbUB0NsMtK_8",
+      y: "mzcQ1Apyn49D2GcuUrs43lgcKfzgge8O4phFP-trgVc",
+      d: "AAAAAAAAAAAAwP_uAAAAAAAAAAAAAAAAAAAAAAAAAAs",
+      token: "eyJhbGciOiJFUzI1NksifQ.UGF5bG9hZA._fNpjb3g9ve-d0BEOqYkmzYFYc0qDvoNcmj7cwRA6tTarn3w79z88vRFh0cznda6lFcE3kO-Anxl3JNNo6Jc7g",
+    },
+  ]
+
+test "{c.alg}: another's token verifies, the JWK's scalar signs what its point verifies, and a turned bit is refused" for c: Curved in curved(
+  ) {
+  let point = bytes_concat_all([b"\x04", the_bytes(c.x), the_bytes(c.y)]);
+  let public = key_of(Point(c.curve, point));
+  assert_eq(algorithm(public), c.alg);
+  assert_eq(verify_bytes(c.token, public, 4096).payload, b"Payload");
+  let read = jwk(
+    document(
+      "{\"kty\":\"EC\",\"alg\":\"" ++ c.alg ++ "\",\"crv\":\"" ++ c.crv ++ "\",\"x\":\"" ++ c.x
+        ++ "\",\"y\":\""
+        ++ c.y
+        ++ "\",\"d\":\""
+        ++ c.d
+        ++ "\"}",
+    ),
+  );
+  assert_eq(verifying(read.key), public);
+  let ours = sign_bytes(b"Payload", read.key, unmarked());
+  assert_eq(ours, sign_bytes(b"Payload", read.key, unmarked()));
+  assert_eq(verify_bytes(ours, public, 4096).payload, b"Payload");
+  assert_eq(
+    option_map(list_at(string_split(ours, "."), 2), |part: String| bytes_len(the_bytes(part))),
+    Some(2 * crypto::scalar_size(c.curve)),
+  );
+  let parts = string_split(ours, ".");
+  let turned = option_expect(list_at(parts, 0), "a header") ++ "." ++ base64url_encode(b"Payloae")
+    ++ "."
+    ++ option_expect(list_at(parts, 2), "a signature");
+  assert_eq(try { verify_bytes(turned, public, 4096) }, Err(BadSignature))
+}
+
+/// RFC 7515 appendix A.2's RSA key as its JWK states it, private numbers and all, under `alg`.
+fn rsa_private_jwk(alg: String) -> String =
+  "{\"kty\":\"RSA\",\"alg\":\"" ++ alg
+    ++ "\",\"n\":\"ofgWCuLjybRlzo0tZWJjNiuSfb4p4fAkd_wWJcyQoTbji9k0l8W26mPddxHmfHQp-Vaw-4qPCJrcS2mJPMEzP1Pt0Bm4d4QlL-yRT-SFd2lZS-pCgNMsD1W_YpRPEwOWvG6b32690r2jZ47soMZo9wGzjb_7OMg0LOL-bSf63kpaSHSXndS5z5rexMdbBYUsLA9e-KXBdQOS-UTo7WTBEMa2R2CapHg665xsmtdVMTBQY4uDZlxvb3qCo5ZwKh9kG4LT6_I5IhlJH7aGhyxXFvUK-DWNmoudF8NAco9_h9iaGNj8q2ethFkMLs91kzk2PAcDTW9gb54h4FRWyuXpoQ\",\"e\":\"AQAB\",\"d\":\"Eq5xpGnNCivDflJsRQBXHx1hdR1k6Ulwe2JZD50LpXyWPEAeP88vLNO97IjlA7_GQ5sLKMgvfTeXZx9SE-7YwVol2NXOoAJe46sui395IW_GO-pWJ1O0BkTGoVEn2bKVRUCgu-GjBVaYLU6f3l9kJfFNS3E0QbVdxzubSu3Mkqzjkn439X0M_V51gfpRLI9JYanrC4D4qAdGcopV_0ZHHzQlBjudU2QvXt4ehNYTCBr6XCLQUShb1juUO1ZdiYoFaFQT5Tw8bGUl_x_jTj3ccPDVZFD9pIuhLhBOneufuBiB4cS98l2SR_RQyGWSeWjnczT0QU91p1DhOVRuOopznQ\",\"p\":\"4BzEEOtIpmVdVEZNCqS7baC4crd0pqnRH_5IB3jw3bcxGn6QLvnEtfdUdiYrqBdss1l58BQ3KhooKeQTa9AB0Hw_Py5PJdTJNPY8cQn7ouZ2KKDcmnPGBY5t7yLc1QlQ5xHdwW1VhvKn-nXqhJTBgIPgtldC-KDV5z-y2XDwGUc\",\"q\":\"uQPEfgmVtjL0Uyyx88GZFF1fOunH3-7cepKmtH4pxhtCoHqpWmT8YAmZxaewHgHAjLYsp1ZSe7zFYHj7C6ul7TjeLQeZD_YwD66t62wDmpe_HlB-TnBA-njbglfIsRLtXlnDzQkv5dTltRJ11BKBBypeeF6689rjcJIDEz9RWdc\",\"dp\":\"BwKfV3Akq5_MFZDFZCnW-wzl-CCo83WoZvnLQwCTeDv8uzluRSnm71I3QCLdhrqE2e9YkxvuxdBfpT_PI7Yz-FOKnu1R6HsJeDCjn12Sk3vmAktV2zb34MCdy7cpdTh_YVr7tss2u6vneTwrA86rZtu5Mbr1C1XsmvkxHQAdYo0\",\"dq\":\"h_96-mK1R_7glhsum81dZxjTnYynPbZpHziZjeeHcXYsXaaMwkOlODsWa7I9xXDoRwbKgB719rrmI2oKr6N3Do9U0ajaHF-NKJnwgjMd2w9cjz3_-kyNlxAr2v4IKhGNpmM5iIgOS1VZnOZ68m6_pbLBSp3nssTdlqvd0tIiTHU\",\"qi\":\"IYd7DHOhrWvxkwPQsRM2tOgrjbcrfvtQJipd-DlcxyVuuM9sQLdgjVk2oy26F0EmpScGLq2MowX7fhd_QJQ3ydy5cY7YIBi87w93IKLEdfnbJtoOPLUW0ITrJReOgo1cq9SbsxYawBgfp_gh6A5603k2-ZQwVK0JKSHuLFkuQ3U\"}"
+
+test "RFC 7515's RSA key read from its JWK signs the RFC's token, and is the document it states" {
+  let read = jwk(document(rsa_private_jwk("RS256")));
+  assert_eq(read.key, RsaPkcs1Document(Sha256, secret_of_bytes(rsa_document())));
+  assert_eq(sign_bytes(rfc_payload(), read.key, unmarked()), rsa_token());
+  assert_eq(verifying(read.key), RsaPkcs1(Sha256, rsa_public()));
+  let pss = jwk(document(rsa_private_jwk("PS384")));
+  assert_eq(pss.key, RsaPssDocument(Sha384, secret_of_bytes(rsa_document())))
+}
 
 test "the token of {c.name} is its key's over its payload" for c: Published in published() {
   let signed = verify_bytes(c.token, key_of(c.key), 4096);
@@ -1152,40 +1298,58 @@ test "{c.alg} verifies the token openssl signs under RFC 7515's RSA key" for c: 
   })
 }
 
-test "PKCS #1 v1.5 over each digest is what openssl signs, and PSS is never signed" {
+test "PKCS #1 v1.5 over each digest is what openssl signs, and PSS signs what its key verifies" {
   let token = |digest: Digest|
     sign_bytes(rfc_payload(), key_of(Document(digest, rsa_document())), unmarked());
   assert_eq(Some(token(Sha384)), option_map(list_at(rsa_crossed(), 0), |c: Crossed256| c.token));
   assert_eq(Some(token(Sha512)), option_map(list_at(rsa_crossed(), 1), |c: Crossed256| c.token));
-  assert_eq(
-    try { sign_bytes(rfc_payload(), RsaPss(Sha256, rsa_public()), unmarked()) },
-    Err(NoSigner("PS256")),
-  );
-  assert_eq(try { sign(claims(), RsaPss(Sha512, rsa_public()), as_jwt()) }, Err(NoSigner("PS512")))
+  let holds = |digest: Digest| {
+    let signer = key_of(PssDocument(digest, rsa_document()));
+    let signed = sign_bytes(rfc_payload(), signer, unmarked());
+    signed == sign_bytes(rfc_payload(), signer, unmarked())
+      && verifying(signer) == RsaPss(digest, rsa_public())
+      && verify_bytes(signed, RsaPss(digest, rsa_public()), 4096).payload == rfc_payload()
+      && verify_bytes(signed, signer, 4096).header.alg == "PS" ++ digest_bits(digest)
+  };
+  assert(holds(Sha256) && holds(Sha384) && holds(Sha512));
+  assert_eq(try { sign(claims(), RsaPss(Sha512, rsa_public()), as_jwt()) }, Err(CannotSign))
 }
 
 test "RFC 7515's ES256 example verifies, and its key signs r and s and never DER" {
-  let signer = key_of(Scalar(curve_scalar()));
-  assert_eq(verifying(signer), EcdsaP256(curve_point()));
+  let signer = key_of(Scalar(crypto::NistP256, curve_scalar()));
+  assert_eq(verifying(signer), Ecdsa(crypto::NistP256, curve_point()));
   assert_eq(verify_bytes(curve_token(), signer, 4096).payload, rfc_payload());
   // The RFC drew its nonce; this signature's is RFC 6979's, so it is another, and is one.
   let ours = sign_bytes(rfc_payload(), signer, unmarked());
   assert(ours != curve_token());
   assert_eq(ours, sign_bytes(rfc_payload(), signer, unmarked()));
-  assert_eq(verify_bytes(ours, EcdsaP256(curve_point()), 4096).payload, rfc_payload());
+  assert_eq(
+    verify_bytes(ours, Ecdsa(crypto::NistP256, curve_point()), 4096).payload,
+    rfc_payload(),
+  );
   assert_eq(
     option_map(list_at(string_split(ours, "."), 2), |part: String| bytes_len(the_bytes(part))),
     Some(64),
   );
   // The same signature as X.509 writes it, a DER SEQUENCE of two INTEGERs, is refused.
   let input = "eyJhbGciOiJFUzI1NiJ9." ++ rfc_claims_part();
-  let der = match crypto::ecdsa_p256_signing(secret_of_bytes(curve_scalar()), crypto::Der) {
+  let der = match crypto::ecdsa_signing(
+      crypto::NistP256,
+      secret_of_bytes(curve_scalar()),
+      crypto::Der,
+    ) {
     Some(key) -> crypto::sign(key, bytes_of_string(input)),
     None -> panic("the RFC's scalar is a key"),
   };
   assert(bytes_at(der, 0) == 0x30 && bytes_len(der) > 64);
   assert_eq(
-    try { verify_bytes(input ++ "." ++ base64url_encode(der), EcdsaP256(curve_point()), 4096) },
+    try {
+      verify_bytes(
+        input ++ "." ++ base64url_encode(der),
+        Ecdsa(crypto::NistP256, curve_point()),
+        4096,
+      )
+    },
     Err(BadSignature),
   );
   // A signature of zeros, which a verifier that skips the range check accepts for any message.
@@ -1193,7 +1357,7 @@ test "RFC 7515's ES256 example verifies, and its key signs r and s and never DER
     try {
       verify_bytes(
         input ++ "." ++ base64url_encode(bytes_concat_all(map(range(0, 64), |_i: Int| b"\x00"))),
-        EcdsaP256(curve_point()),
+        Ecdsa(crypto::NistP256, curve_point()),
         4096,
       )
     },
@@ -1211,14 +1375,17 @@ test "RFC 8037's keys read as the seed and the public key they are" {
 
 test "RFC 7515's P-256 and RSA keys read as the keys they are" {
   let point = "\"kty\":\"EC\",\"crv\":\"P-256\",\"x\":\"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU\",\"y\":\"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0\"";
-  assert_eq(jwk(document("{" ++ point ++ "}")), { kid: None, key: EcdsaP256(curve_point()) });
+  assert_eq(jwk(document("{" ++ point ++ "}")), {
+    kid: None,
+    key: Ecdsa(crypto::NistP256, curve_point()),
+  });
   assert_eq(
     jwk(
       document(
         "{" ++ point ++ ",\"d\":\"jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI\",\"kid\":\"ec-1\"}",
       ),
     ),
-    { kid: Some("ec-1"), key: key_of(Scalar(curve_scalar())) },
+    { kid: Some("ec-1"), key: key_of(Scalar(crypto::NistP256, curve_scalar())) },
   );
   let rsa = |alg: String|
     jwk(
@@ -1491,9 +1658,26 @@ fn malformed() -> List<Attack> / {jwt.refused, abort.raise} =
       forged("{\"alg\":\"HS256\",\"typ\":7}", "{}", good_key()),
       Mistyped("typ"),
     ),
-    attack("RFC 7515's ES512 example, over P-521", p521_token(), Unsupported("ES512")),
-    attack("an ES384 token", b64("{\"alg\":\"ES384\"}") ++ ".e30.AAAA", Unsupported("ES384")),
-    attack("an ES256K token", b64("{\"alg\":\"ES256K\"}") ++ ".e30.AAAA", Unsupported("ES256K")),
+    attack(
+      "RFC 7515's ES512 example under an HMAC key",
+      p521_token(),
+      WrongAlgorithm("ES512", "HS256"),
+    ),
+    attack(
+      "an ES384 token under an HMAC key",
+      b64("{\"alg\":\"ES384\"}") ++ ".e30.AAAA",
+      WrongAlgorithm("ES384", "HS256"),
+    ),
+    attack(
+      "an ES256K token under an HMAC key",
+      b64("{\"alg\":\"ES256K\"}") ++ ".e30.AAAA",
+      WrongAlgorithm("ES256K", "HS256"),
+    ),
+    attack(
+      "an unregistered algorithm under an HMAC key",
+      b64("{\"alg\":\"ES224\"}") ++ ".e30.AAAA",
+      WrongAlgorithm("ES224", "HS256"),
+    ),
     attack(
       "RFC 7515's ES256 example under an HMAC key",
       curve_token(),
@@ -1565,7 +1749,7 @@ fn judged() -> List<Attack> / {jwt.refused, abort.raise} =
     },
     {
       ..attack("an HS256 token made with a P-256 point as its secret", forged(hs256_header(), "{\"sub\":\"admin\"}", HmacSha256(secret_of_bytes(curve_point()))), WrongAlgorithm("HS256", "ES256")),
-      key: Point(curve_point()),
+      key: Point(crypto::NistP256, curve_point()),
     },
     // RFC 8725 section 3.1: the algorithm is the verifier's to name, per key.
     {
@@ -1586,7 +1770,11 @@ fn judged() -> List<Attack> / {jwt.refused, abort.raise} =
     },
     {
       ..attack("a P-256 point that is not on the curve", curve_token(), NoKey("ES256")),
-      key: Point(bytes_concat(b"\x04", counting(64))),
+      key: Point(crypto::NistP256, bytes_concat(b"\x04", counting(64))),
+    },
+    {
+      ..attack("a P-521 point of the wrong length", p521_token(), NoKey("ES512")),
+      key: Point(crypto::NistP521, bytes_concat(b"\x04", counting(64))),
     },
     {
       ..attack("an HS256 token made with a public key's bytes as its secret", forged(hs256_header(), "{\"sub\":\"admin\"}", HmacSha256(secret_of_bytes(rfc_public()))), WrongAlgorithm("HS256", "EdDSA")),
@@ -1678,12 +1866,8 @@ test "{c.name} is refused" for c: Attack in attacks() {
 
 test "a refusal says what it refused" {
   assert_eq(
-    refusal_to_string(Unsupported("ES512")),
-    "`ES512` is not implemented: this module has HS256, HS384, HS512, EdDSA over Ed25519, ES256, RS256, RS384, RS512 and, to verify, PS256, PS384 and PS512",
-  );
-  assert_eq(
-    refusal_to_string(NoSigner("PS256")),
-    "`PS256` is verified here and never signed: a PSS signature takes a fresh salt, which the library that signs under an RSA key draws for itself, so it would be no function of the key and the message",
+    refusal_to_string(Unsupported("RSA-OAEP")),
+    "`RSA-OAEP` is not implemented: this module has HS256, HS384, HS512, EdDSA over Ed25519, ES256, ES384, ES512, ES256K, RS256, RS384, RS512, PS256, PS384 and PS512",
   );
   assert_eq(
     refusal_to_string(SmallKey(1024)),
@@ -1815,13 +1999,22 @@ test "signing refuses a key its algorithm cannot use" {
   );
   assert_eq(try { verifying(Ed25519Seed(secret_of_bytes(counting(31)))) }, Err(KeyLength(31)));
   let zero = secret_of_bytes(bytes_concat_all(map(range(0, 32), |_i: Int| b"\x00")));
-  assert_eq(try { sign(sample(), EcdsaP256Scalar(zero), as_jwt()) }, Err(NoKey("ES256")));
-  assert_eq(try { verifying(EcdsaP256Scalar(secret_of_bytes(counting(31)))) }, Err(NoKey("ES256")));
+  assert_eq(
+    try { sign(sample(), EcdsaScalar(crypto::NistP256, zero), as_jwt()) },
+    Err(NoKey("ES256")),
+  );
+  assert_eq(
+    try { verifying(EcdsaScalar(crypto::NistP256, secret_of_bytes(counting(31)))) },
+    Err(NoKey("ES256")),
+  );
   assert_eq(
     try { sign(sample(), RsaPkcs1Document(Sha256, secret_of_bytes(b"no document")), as_jwt()) },
     Err(NoKey("RS256")),
   );
-  assert_eq(try { sign(sample(), EcdsaP256(curve_point()), as_jwt()) }, Err(CannotSign));
+  assert_eq(
+    try { sign(sample(), Ecdsa(crypto::NistP256, curve_point()), as_jwt()) },
+    Err(CannotSign),
+  );
   assert_eq(try { sign(sample(), RsaPkcs1(Sha512, rsa_public()), as_jwt()) }, Err(CannotSign))
 }
 
@@ -1869,7 +2062,7 @@ test "a key set reads as the keys this module can use, and a header picks its ow
   assert_eq(keys, [
     { kid: Some("rsa-1"), key: RsaPkcs1(Sha256, rsa_public()) },
     { kid: Some("rsa-1"), key: RsaPss(Sha256, rsa_public()) },
-    { kid: Some("ec-1"), key: EcdsaP256(curve_point()) },
+    { kid: Some("ec-1"), key: Ecdsa(crypto::NistP256, curve_point()) },
     { kid: Some("ed-1"), key: Ed25519(rfc_public()) },
     { kid: Some("ed-2"), key: other_public() },
     { kid: Some("mac-1"), key: rfc_key() },
@@ -1900,7 +2093,10 @@ test "a key set reads as the keys this module can use, and a header picks its ow
   assert_eq(named("PS256", "rsa-1"), Some(RsaPss(Sha256, rsa_public())));
   assert_eq(named("RS384", "rsa-1"), None);
   assert_eq(named("HS256", "rsa-1"), None);
-  assert_eq(key_for(keys, peek(curve_token(), 4096).header), Some(EcdsaP256(curve_point())));
+  assert_eq(
+    key_for(keys, peek(curve_token(), 4096).header),
+    Some(Ecdsa(crypto::NistP256, curve_point())),
+  );
   assert_eq(
     option_map(key_for(keys, peek(rsa_token(), 4096).header), |key: Key|
       verify_bytes(rsa_token(), key, 4096).payload),
@@ -1934,9 +2130,14 @@ fn unread() -> List<Unread> =
       refusal: Unsupported("RSA-OAEP"),
     },
     {
-      name: "an RSA private key",
+      name: "an RSA private key that leaves its primes out",
       key: "{\"kty\":\"RSA\",\"alg\":\"RS256\",\"n\":\"AQAB\",\"e\":\"AQAB\",\"d\":\"AQAB\"}",
-      refusal: Unsupported("an RSA private key as a JWK"),
+      refusal: Missing("p"),
+    },
+    {
+      name: "an RSA private key whose numbers are no key",
+      key: "{\"kty\":\"RSA\",\"alg\":\"PS256\",\"n\":\"AQAB\",\"e\":\"AQAB\",\"d\":\"AQAB\",\"p\":\"Aw\",\"q\":\"BQ\",\"dp\":\"AQ\",\"dq\":\"AQ\",\"qi\":\"AQ\"}",
+      refusal: NoKey("PS256"),
     },
     {
       name: "an RSA key with no modulus",
@@ -1944,9 +2145,14 @@ fn unread() -> List<Unread> =
       refusal: NoKey("RSA"),
     },
     {
-      name: "a P-384 key",
+      name: "a P-384 key whose numbers are short",
       key: "{\"kty\":\"EC\",\"crv\":\"P-384\",\"x\":\"AA\",\"y\":\"AA\"}",
-      refusal: Unsupported("P-384"),
+      refusal: NoKey("ES384"),
+    },
+    {
+      name: "a key on a curve JOSE names and this module has none of",
+      key: "{\"kty\":\"EC\",\"crv\":\"brainpoolP256r1\",\"x\":\"AA\",\"y\":\"AA\"}",
+      refusal: Unsupported("brainpoolP256r1"),
     },
     {
       name: "a P-256 key whose numbers are short",
@@ -2106,7 +2312,7 @@ fn places() -> List<Place> / {abort.raise} =
     [
       { token: good(), key: good_stated() },
       { token: rfc_edwards_token(), key: Edwards(rfc_public()) },
-      { token: curve_token(), key: Point(curve_point()) },
+      { token: curve_token(), key: Point(crypto::NistP256, curve_point()) },
       { token: rsa_token(), key: Pkcs1(Sha256, rsa_public()) },
     ],
     |each: { token: String, key: Stated }| {

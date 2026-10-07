@@ -3,15 +3,14 @@
 //! `Result`'s constructors are the prelude's (`Ok`, `Err`) and `?` propagates one. The combinators are
 //! `result_`-prefixed for the same reason `option`'s are: `map` is a name a program already has.
 //!
-//! Over a list there are two policies. One ends at the first failure: `result_all` reads nothing
-//! past it, and `result_traverse` and `result_try_fold` call their callback for nothing past it;
-//! those two are a `fold` underneath, so a definition that recurses through the callback is seen to
-//! end as it is through `fold`. The other reads every element and answers every failure, which is
-//! what validating a form or a configuration file wants: `result_partition` and
-//! `result_accumulate`.
+//! Over a list there are two policies. One ends at the first failure: `result_all`,
+//! `result_traverse` and `result_try_fold` read nothing past it, and a definition that recurses
+//! through the callback of either of the last two is seen to end as it is through `fold`. The
+//! other reads every element and answers every failure, which is what validating a form or a
+//! configuration file wants: `result_partition` and `result_accumulate`.
 
 import std.laws (agrees, inverse)
-import std.list (first, somes)
+import std.list (concat, first, somes)
 
 /// The success through `f`; a failure passes through.
 pub fn result_map<a, b, e | row>(r: Result<a, e>, f: (a) -> b / row) -> Result<b, e> / row bounded =
@@ -90,7 +89,7 @@ pub fn result_transpose<a, e>(r: Result<Option<a>, e>) -> Option<Result<a, e>> =
   match r { Ok(None) -> None, Ok(Some(x)) -> Some(Ok(x)), Err(e) -> Some(Err(e)) }
 
 /// A fold whose step may fail: `f` of the state and each element in order, or the first failure.
-/// `f` is not called for what follows.
+/// Nothing past the first failure is read.
 pub fn result_try_fold<a, s, e | row>(
   xs: List<a>,
   init: s,
@@ -98,18 +97,33 @@ pub fn result_try_fold<a, s, e | row>(
 ) -> Result<s, e> / row
   cost len(xs) * k
 =
-  fold(xs, Ok(init), |acc: Result<s, e>, x: a|
-    match acc { Err(e) -> Err(e), Ok(state) -> f(state, x) })
+  match xs {
+    [] -> Ok(init),
+    [x, ..rest] -> match f(init, x) {
+      Err(e) -> Err(e),
+      Ok(state) -> result_try_fold(rest, state, f),
+    },
+  }
 
-/// `f` of each element in order, or the first failure. `f` is not called past its first failure.
+/// `f` of each element in order, or the first failure. Nothing past the first failure is read.
 pub fn result_traverse<a, b, e | row>(
   xs: List<a>,
   f: (a) -> Result<b, e> / row cost k,
 ) -> Result<List<b>, e> / row
   cost len(xs) * k
+= traversed(xs, f, [])
+
+fn traversed<a, b, e | row>(
+  xs: List<a>,
+  f: (a) -> Result<b, e> / row cost k,
+  done: List<b>,
+) -> Result<List<b>, e> / row
+  cost len(xs) * k
 =
-  result_try_fold(xs, [], |done: List<b>, x: a|
-    match f(x) { Err(e) -> Err(e), Ok(y) -> Ok(push(done, y)) })
+  match xs {
+    [] -> Ok(done),
+    [x, ..rest] -> match f(x) { Err(e) -> Err(e), Ok(y) -> traversed(rest, f, push(done, y)) },
+  }
 
 /// Every success in order, or the first failure. What follows the first failure is not read.
 pub fn result_all<a, e>(rs: List<Result<a, e>>) -> Result<List<a>, e>
@@ -259,6 +273,20 @@ test "a failure at the front ends the walk in the same steps whatever follows it
   let short = failed_first(4);
   let long = failed_first(4000);
   assert_eq(metered(|| result_all(long)).steps, metered(|| result_all(short)).steps)
+}
+
+test "a traverse and a fold whose step fails first take the same steps whatever follows" {
+  let short = [1, 2, 4, 6];
+  let long = concat([1], range(0, 4000));
+  let stepped = |sum: Int, x: Int| if x % 2 == 1 { Err(x) } else { Ok(sum + x) };
+  assert_eq(
+    metered(|| result_traverse(long, halved)).steps,
+    metered(|| result_traverse(short, halved)).steps,
+  );
+  assert_eq(
+    metered(|| result_try_fold(long, 0, stepped)).steps,
+    metered(|| result_try_fold(short, 0, stepped)).steps,
+  )
 }
 
 test "a partition keeps both sides in order, and accumulating answers every failure" {
