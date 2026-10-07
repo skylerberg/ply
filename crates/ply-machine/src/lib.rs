@@ -316,22 +316,26 @@ impl HostHandler for MachineHandler {
 }
 
 /// The entry a later run's `reuse` takes `front` and `unit` back from: the places and modules of its
-/// files, the front end's answer, and the unit's C. Only a load that held is worth filing, and none
-/// is answered for a load whose entry would not read back whole.
+/// files, the shipped modules' texts as placed, the front end's answer, and the unit's C. Only a load
+/// that held is worth filing, and none is answered for a load whose entry would not read back whole.
 fn filed(front: &Value, unit: &Value, span: Span) -> Result<Value, Diagnostic> {
     use crate::payload::field_of;
-    let placed: Vec<(String, String)> = field_of(front, "files", span)?
+    let placed: Vec<driver::LoadedFile> = field_of(front, "files", span)?
         .as_list(span, "a front's files")?
         .iter()
         .map(|file| {
-            Ok((
-                field_of(file, "path", span)?
+            Ok(driver::LoadedFile {
+                path: field_of(file, "path", span)?
                     .as_str(span, "a path")?
                     .to_string(),
-                field_of(file, "name", span)?
+                name: field_of(file, "name", span)?
                     .as_str(span, "a module")?
                     .to_string(),
-            ))
+                text: String::from_utf8_lossy(
+                    field_of(file, "text", span)?.as_bytes(span, "a text")?,
+                )
+                .into_owned(),
+            })
         })
         .collect::<Result<_, Diagnostic>>()?;
     let unit = unit.as_bytes(span, "the program's unit")?;
