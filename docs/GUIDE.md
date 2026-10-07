@@ -1242,18 +1242,26 @@ keeps its declared type (`E0201`), and it builds one: outside the module of an
 `push(xs, x)` appends in place when the caller holds the last reference, and
 otherwise copies one path of the list's trie; `list_set` is the same, and
 `array_set` copies the whole array. A copy is caused by a second owner: a
-binding read again after the update, a closure capture, a value read out with
-`cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
-a caller that keeps using what it passed. A record is not one of them once it
-is done with the value: a field read that nothing after it reads again, as the
-field or as the whole record, takes the field out of a record no one else
-holds, and a `let` or `match` pattern lets its subject go once its binders hold
-their fields (an arm with a guard keeps it for the arms after), so
-`{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
-A subject let go so is the memory of the next record or constructor of its
-width the body builds, so `match s { Set(m) -> Set(map_insert(m, x, ())) }`
-updates a set no one else holds without allocating its wrapper again.
-The same holds for `Bytes` and `++`. `ply check --costs` reports every
+binding read again after the update, a capture of a closure that is called
+again, a value read out with `cell_get`/`map_get`/`list_at`/`array_get` (use
+`cell_update`/`map_update`), or a caller that keeps using what it passed.
+"Again" is along the path taken: an `if` or `match` branch lets go, as it
+opens, of a binding only another branch reads, and a closure called by the
+only holder of it, as a sequence's step is pulled, gives its call what it
+captured. A variable passed to a call is read after the call's other
+arguments, so `array_set(c, i, array_get(c, i) + 1)` and
+`f(buf, bytes_len(buf))` hand it on, as does the left side of `++`. A record
+is not a second owner once it is done with the value: a field read that
+nothing after it reads again, as the field or as the whole record, takes the
+field out of a record no one else holds; a branch beside one that reads the
+record whole lets go of the fields it does not read; and a `let` or `match`
+pattern lets its subject go once its binders hold their fields (an arm with a
+guard keeps it for the arms after), so `{ ..s, out: push(s.out, x) }` and
+`let { out, n } = s` grow `out` in place. A subject let go so is the memory of
+the next record or constructor of its width the body builds, so
+`match s { Set(m) -> Set(map_insert(m, x, ())) }` updates a set no one else
+holds without allocating its wrapper again. The same holds for `Bytes` and
+`++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
