@@ -100,7 +100,7 @@ CORPUS_ALONE=(cli-compiler_compiled)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations grants incremental)
 # Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
 # of the tree one way and checks it warm and cold, days of runners over the tree.
 CLI_NIGHTLY=(edit_sweep)
