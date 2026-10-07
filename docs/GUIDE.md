@@ -2681,9 +2681,12 @@ std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
 ships beside it, each named by its place below the library (`std/oid/names.txt`):
 `ply std` lists them with the module that embeds each, `ply std --show
 std/oid/names.txt` prints one, and the digest `ply std` prints covers them. A
-load reads only the shipped modules its modules
-import, what those import in turn, and what they embed, so a change to any other
-leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
+load reads of a shipped module what a module importing it can reach: none of
+its tests or laws, nor a private function or type or an `import` that only they
+reach, which it neither parses nor checks. It reads only the shipped modules its
+modules import, what the parts it reads import in turn, and what they embed, so
+a change to any other leaves it alone; a change to one it reads warns `W0605`.
+Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
