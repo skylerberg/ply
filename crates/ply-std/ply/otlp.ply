@@ -2384,12 +2384,14 @@ fn retry_after(headers: http::Headers) -> Option<Int> =
     None -> None,
   }
 
-fn judged(cfg: Config, signal: Signal, res: http::Response) -> Shipped / {abort.raise} =
+fn judged(cfg: Config, signal: Signal, res: http::Response<| {}>) -> Shipped / {abort.raise} =
   if res.status >= 200 && res.status < 300 {
-    Taken(match decode_receipt(cfg.encoding, signal, res.body, default_limits()) {
-      Ok(receipt) -> receipt,
-      Err(_) -> { rejected: 0, message: "" },
-    })
+    Taken(
+      match decode_receipt(cfg.encoding, signal, http::whole_bytes(res.body), default_limits()) {
+        Ok(receipt) -> receipt,
+        Err(_) -> { rejected: 0, message: "" },
+      },
+    )
   } else if res.status == 429 || res.status == 502 || res.status == 503 || res.status == 504 {
     Later(retry_after(res.headers))
   } else { Spurned }
@@ -2414,7 +2416,7 @@ fn request_of(cfg: Config, out: Outbound) -> http::Request / {abort.raise} = {
 fn exchanged<[l]>(
   cfg: Config,
   out: Outbound,
-) -> Result<http::Response, http::ClientError> / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l], abort.raise} =
+) -> Result<http::Response<| {}>, http::ClientError> / {net.connect[l], net.connect_tls[l], net.send[l], net.recv[l], net.close[l], abort.raise} =
   if cfg.tls {
     match http::dial_tls[l](cfg.host, cfg.port, cfg.limits) {
       Err(e) -> Err(e),
@@ -3165,7 +3167,11 @@ effect collector {
   write took_metrics(m: Metrics) -> Unit
 }
 
-fn receipt_response(e: Encoding, signal: Signal, rejected: Int) -> http::Response / {abort.raise} = {
+fn receipt_response<| r>(
+  e: Encoding,
+  signal: Signal,
+  rejected: Int,
+) -> http::Response<| r> / {abort.raise} = {
   let receipt: Receipt = {
     rejected: rejected,
     message: if rejected == 0 { "" } else { "turned away" },
@@ -3173,16 +3179,16 @@ fn receipt_response(e: Encoding, signal: Signal, rejected: Int) -> http::Respons
   {
     status: 200,
     headers: http::set_header(http::empty_headers(), "content-type", content_type(e)),
-    body: encode_receipt(e, signal, receipt),
+    body: http::Whole(encode_receipt(e, signal, receipt)),
   }
 }
 
-fn took(
+fn took<| r>(
   e: Encoding,
   path: String,
   raw: Bytes,
   rejected: Int,
-) -> http::Response / {collector.took_traces, collector.took_metrics, abort.raise} =
+) -> http::Response<| r> / {collector.took_traces, collector.took_metrics, abort.raise} =
   if path == traces_path() {
     match decode_traces(e, raw, default_limits()) {
       Ok(t) -> {
@@ -3202,12 +3208,13 @@ fn took(
   } else { http::text_response(404, "no such signal") }
 
 /// An OTLP receiver over `std.http`: both paths, both encodings, gzipped or not.
-fn receive(
+fn receive<| r>(
   req: http::Request,
-) -> http::Response / {collector.next, collector.took_traces, collector.took_metrics, abort.raise} = {
+) -> http::Response<| r> / {collector.next, collector.took_traces, collector.took_metrics, http::Reading} = {
   let kind = match http::header(req.headers, "content-type") { Some(k) -> k, None -> "" };
   let packed = http::header(req.headers, "content-encoding") == Some("gzip");
-  let raw = if packed { gzip::try_gunzip(req.body, 4194304) } else { Ok(req.body) };
+  let sent = http::request_body(req, 4194304);
+  let raw = if packed { gzip::try_gunzip(sent, 4194304) } else { Ok(sent) };
   let encoding = if kind == content_type(Json) { Some(Json) }
   else if kind == content_type(Protobuf) { Some(Protobuf) }
   else { None };

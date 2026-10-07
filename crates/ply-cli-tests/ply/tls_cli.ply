@@ -1,6 +1,6 @@
 //! `--tls NAME=CERT,KEY`: what `ply hosts` discloses of the TLS stack and the credentials a run is
-//! given, what moves the binding's digest, how a credential that does not load is refused, and
-//! the protocol two ends agree over it.
+//! given, what moves the binding's digest, how a credential that does not load is refused, the
+//! protocol two ends agree over it, and the certificate a client presents and `--mtls` requires.
 
 import harness (scratch, Ran, program, write, working, on_disk, in_memory, one, said, stdout,
                 stderr, json_of, at, path, nth, items, str, int, shown, Here, Reached, Shipped)
@@ -174,7 +174,7 @@ fn alpn_serving() -> String =
   \\import std.task
   \\import std.url
   \\
-  \\fn answer(req: Request) -> Response =
+  \\fn answer<| e>(req: Request) -> Response<| e> =
   \\  http::text_response(200, (if req.version == http::Http2 { "h2 " } else { "h1 " }) ++ req.path)
   \\
   \\fn read_all(c: Int, got: Bytes, fuel: Int) -> Bytes / {net.write[plain]} =
@@ -219,13 +219,75 @@ fn alpn_serving() -> String =
   \\  let pooled = task.join(serving);
   \\  net.close[listener](l);
   \\  match fetched {
-  \\    Ok(f) -> if f.response.body != b"h2 /parts" { panic("the fetch was not HTTP/2: " ++ show(f.response)) }
+  \\    Ok(f) -> if http::whole_bytes(f.response.body) != b"h2 /parts" {
+  \\      panic("the fetch was not HTTP/2: " ++ show(f.response.status))
+  \\    }
   \\    else if !string_starts_with(plainly, "Some(\"http/1.1\") HTTP/1.1 200 OK")
   \\        || !string_ends_with(plainly, "h1 /plain") {
   \\      panic("a client offering http/1.1 alone was not served it: " ++ plainly)
   \\    } else if pooled.served != 2 { panic("the pool served " ++ show(pooled)) } else { 0 },
   \\    Err(why) -> panic("the fetch failed: " ++ show(why)),
   \\  }
+  \\}
+  \\
+
+/// Serves two `fetch`es of its own with `std.http`'s TLS pool, the first presenting the `--tls`
+/// credential `caller` and the second none, and answers what each request carried: the
+/// certificate's subject, DNS names and fingerprint as `std.x509` reads them, `none`, or `refused`
+/// where the fetch failed.
+fn client_certified() -> String =
+  \\import std.bytes
+  \\import std.cookie
+  \\import std.dns (dns)
+  \\import std.http
+  \\import std.http (Request, Response)
+  \\import std.ip
+  \\import std.net
+  \\import std.net (net)
+  \\import std.task
+  \\import std.url
+  \\import std.x509
+  \\
+  \\fn answer<| e>(req: Request) -> Response<| {abort.raise | e}> / {abort.raise | e} =
+  \\  http::text_response(200, match req.client_certificate {
+  \\    None -> "none",
+  \\    Some(der) -> match x509::parse(der, x509::limits(), x509::Tolerant) {
+  \\      Err(_) -> "unreadable",
+  \\      Ok(c) -> x509::name_text(x509::info(c).subject) ++ " / " ++ dns_names(c) ++ " / sha256:"
+  \\        ++ bytes::hex_of(x509::fingerprint(c)),
+  \\    },
+  \\  })
+  \\
+  \\fn dns_names(c: x509::Certificate) -> String =
+  \\  fold(x509::alt_names(c), "", |names: String, n: x509::GeneralName|
+  \\    match n { x509::Dns(name) -> names ++ name, _ -> names })
+  \\
+  \\fn fetched(port: Int, credential: Option<String>) -> String / {dns.lookup, net.write[client], task.write, clock.read, clock.write, abort.raise} = {
+  \\  let to = match url::url_parse("https://localhost:" ++ int_to_string(port) ++ "/") {
+  \\    Ok(u) -> u,
+  \\    Err(_) -> panic("no URL"),
+  \\  };
+  \\  let options = { ..http::fetching(), credential: credential };
+  \\  match task::unbounded(||
+  \\      http::fetch[client](http::Get, to, http::empty_headers(), b"", cookie::jar(0), options, Instant(0))) {
+  \\    Ok(f) -> string_of_bytes_lossy(http::whole_bytes(f.response.body)),
+  \\    Err(_) -> "refused",
+  \\  }
+  \\}
+  \\
+  \\fn main() -> String / {dns.lookup, net.read[listener], net.write[listener], net.read[conn], net.write[conn], net.write[client], task.write, clock.read, clock.write, abort.raise} = {
+  \\  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+  \\    Ok(l) -> l,
+  \\    Err(why) -> panic("no listener: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
+  \\  let serving = task.spawn(||
+  \\    http::serve_pooled_tls[listener, conn](l, 2, http::default_limits(), http::default_shedding(), "api", answer));
+  \\  let presenting = fetched(port, Some("caller"));
+  \\  let anonymous = fetched(port, None);
+  \\  let _pooled = task.join(serving);
+  \\  net.close[listener](l);
+  \\  "presenting: " ++ presenting ++ " | anonymous: " ++ anonymous
   \\}
   \\
 
@@ -315,6 +377,43 @@ test/nondet "a std.http server and client agree h2 over TLS, and a client offeri
   let api = credential("api");
   let r = on_disk(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
   assert(r.code == 0, Some(said(r)))
+}
+
+test/nondet "a request over a --tls listener carries the certificate its client presented, one presenting none carries none, and --mtls refuses that one" {
+  program(client_certified());
+  let api = credential("api");
+  let caller = credential("caller");
+  let tls = ["--tls", spec("api", api), "--tls", spec("caller", caller)];
+  let trust = ["--trust", api.cert, "--trust", caller.cert];
+  let listed = json_of(on_disk(fold(trust, fold(tls, ["hosts", "--host", "--json"], push), push)));
+  let presented = nth(path(listed, ["transport", "credentials"]), 1);
+  assert(str(at(presented, "name")) == "caller", Some(shown(listed)));
+  let carried = " / localhost / " ++ str(at(presented, "fingerprint"));
+  let r = on_disk(fold(trust, fold(tls, ["run", "--host"], push), push));
+  assert(r.code == 0, Some(said(r)));
+  assert(
+    string_contains(stdout(r), "presenting: CN=") && string_contains(stdout(r), carried ++ " | "),
+    Some(said(r)),
+  );
+  assert(string_contains(stdout(r), "anonymous: none"), Some(said(r)));
+  let required = on_disk(
+    fold(["--mtls", "api"], fold(trust, fold(tls, ["run", "--host"], push), push), push),
+  );
+  assert(required.code == 0, Some(said(required)));
+  assert(string_contains(stdout(required), carried ++ " | "), Some(said(required)));
+  assert(string_contains(stdout(required), "anonymous: refused"), Some(said(required)))
+}
+
+test "--mtls names a credential the run was given" {
+  scratch(|| {
+    program(secure());
+    let r = on_disk(["hosts", "--host", "--mtls", "api"]);
+    assert(r.code != 0, Some(said(r)));
+    assert(
+      string_contains(said(r), "E0429") && string_contains(said(r), "`--mtls api`"),
+      Some(said(r)),
+    )
+  })
 }
 
 test "a program that touches no socket reports no transport" {

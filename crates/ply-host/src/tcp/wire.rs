@@ -306,6 +306,9 @@ pub enum SocketOption {
     /// A multicast group, and the interface it is joined on where one is named.
     JoinGroup(IpAddr, Option<String>),
     LeaveGroup(IpAddr, Option<String>),
+    /// The `--tls` credential a later `start_tls` presents where its server asks for a client
+    /// certificate.
+    Presenting(String),
 }
 
 /// A `std.net.Probing`: when an idle connection is probed, how often, and how many unanswered
@@ -373,8 +376,22 @@ impl SocketOption {
             }),
             "std.net.Broadcast" => SocketOption::Broadcast(arg.as_bool(span, "a flag")?),
             "std.net.MulticastLoop" => SocketOption::MulticastLoop(arg.as_bool(span, "a flag")?),
+            "std.net.Presenting" => {
+                SocketOption::Presenting(arg.as_str(span, "a credential")?.to_string())
+            }
             _ => return Err(wrong()),
         })
+    }
+
+    /// Whether `options` reads the option back: a group joined or left, and a credential to
+    /// present, are acts rather than settings of the socket.
+    pub fn is_setting(&self) -> bool {
+        !matches!(
+            self,
+            SocketOption::JoinGroup(..)
+                | SocketOption::LeaveGroup(..)
+                | SocketOption::Presenting(_)
+        )
     }
 
     pub fn list(value: &Value, span: Span) -> Result<Vec<SocketOption>, Diagnostic> {
@@ -404,6 +421,7 @@ impl SocketOption {
             SocketOption::LeaveGroup(group, interface) => {
                 membership("LeaveGroup", group, interface)
             }
+            SocketOption::Presenting(name) => named("Presenting", Value::str(name)),
         }
     }
 }
