@@ -239,6 +239,8 @@ fn only_reading_what_a_socket_is_is_repeatable() {
         Op::LocalAddress,
         Op::PeerAddress,
         Op::PeerCredentials,
+        Op::PeerCertificate,
+        Op::Protocol,
         Op::Options,
     ];
     for net in [

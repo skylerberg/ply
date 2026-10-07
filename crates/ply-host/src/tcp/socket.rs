@@ -413,6 +413,8 @@ impl Net for TcpHost {
             Op::LocalAddress => "ply_host::tcp::local_address",
             Op::PeerAddress => "ply_host::tcp::peer_address",
             Op::PeerCredentials => "ply_host::tcp::peer_credentials",
+            Op::PeerCertificate => "ply_host::tls::peer_certificate",
+            Op::Protocol => "ply_host::tls::protocol",
             Op::Options => "ply_host::tcp::options",
         }
     }
@@ -854,6 +856,27 @@ impl Net for TcpHost {
             _ => None,
         })?;
         answered(wire::option(credentials.map(|c| c.value())))
+    }
+
+    fn peer_certificate(
+        &self,
+        at: &Resource,
+        conn: i64,
+        span: Span,
+    ) -> Result<HostAnswer, Diagnostic> {
+        let leaf = self.described(conn, at, span, |sock| match sock {
+            Socket::Tls(s) => s.peer_certificate(),
+            _ => None,
+        })?;
+        answered(wire::option(leaf.map(Value::bytes)))
+    }
+
+    fn protocol(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+        let agreed = self.described(conn, at, span, |sock| match sock {
+            Socket::Tls(s) => s.protocol(),
+            _ => None,
+        })?;
+        answered(wire::option(agreed.map(Value::str)))
     }
 
     fn options(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
