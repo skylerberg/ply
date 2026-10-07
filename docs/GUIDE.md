@@ -56,8 +56,10 @@ and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
 the store and the compiled package); add it to `.gitignore`. A run that files
-into the store compacts it, as `ply cache compact` does, once more than half of
-`store.dat` holds entries a later filing replaced or dropped.
+into the store drops what no file or pass still reaches once half the files it
+holds were filed again since it last did, and compacts it, as `ply cache compact`
+does, once more than half of `store.dat` holds entries a later filing replaced or
+dropped.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this

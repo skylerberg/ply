@@ -688,6 +688,21 @@ pub fn put_filed_load<[r]>(cache: Cache, digest: Bytes) -> Cache / {fs.read[r], 
 
 fn priors_key() -> Bytes = named_key("priors")
 
+fn unswept_key() -> Bytes = named_key("unswept")
+
+/// How many fingerprints were filed again or dropped since the last sweep.
+fn unswept<[r]>(cache: Cache) -> Read<Int> / {fs.read[r], abort.raise} =
+  read[r](
+    cache,
+    t_loads(),
+    unswept_key(),
+    bin::int_bin(),
+    "fingerprints filed since the last sweep",
+  )
+
+fn put_unswept<[r]>(cache: Cache, n: Int) -> Cache / {fs.read[r], abort.raise} =
+  renew[r](cache, t_loads(), unswept_key(), bin::int_bin(), n)
+
 /// What the last filing's hashing answered for each node it hashed, as the front end encodes it,
 /// with the bodies left to the bodies table: a later load hashes a node again only where it moved.
 pub fn filed_priors<[r]>(cache: Cache) -> Read<Bytes> / {fs.read[r], abort.raise} =
@@ -821,6 +836,41 @@ pub fn prune<[r]>(
     {
       pruned: { sources: walked.dropped, defs: gone(0), decls: gone(1), bodies: gone(2) },
       cache: swept.cache,
+    }
+  }
+}
+
+/// `prune`, once the fingerprints filed again or dropped since the last sweep come to half of those
+/// the store holds: a sweep reads every fingerprint and pass record, too much to do after each edit,
+/// and what it would drop meanwhile is only space. A fingerprint of a file outside `keep` is dropped
+/// at once.
+pub fn prune_due<[r]>(
+  cache: Cache,
+  keep: List<String>,
+) -> { pruned: Pruned, cache: Cache } / {fs.read[r], abort.raise} = {
+  let kept_keys = fold(keep, map_new(), |m: Map<Bytes, Bool>, k: String|
+    map_insert(m, named_key(k), true));
+  let held = keys(cache.store, t_sources());
+  let stray = filter(held, |k: Bytes| !map_contains(kept_keys, k));
+  let refiled = map_fold(cache.store.puts, 0, |n: Int, sl: Bytes, p: Bytes|
+    if bytes_at(sl, 0) == t_sources() { n + 1 } else { n });
+  if len(stray) == 0 && refiled == 0 {
+    { pruned: { sources: 0, defs: 0, decls: 0, bodies: 0 }, cache: cache }
+  } else {
+    let before = unswept[r](cache);
+    let count = (match before.value { Some(n) -> n, None -> 0 }) + refiled + len(stray);
+    if count * 2 > len(held) {
+      let swept = prune[r](before.cache, keep);
+      { ..swept, cache: put_unswept[r](swept.cache, 0) }
+    } else {
+      {
+        pruned: { sources: len(stray), defs: 0, decls: 0, bodies: 0 },
+        cache: put_unswept[r](
+          fold(stray, before.cache, |c: Cache, k: Bytes|
+            { ..c, store: drop(c.store, t_sources(), k) }),
+          count,
+        ),
+      }
     }
   }
 }
@@ -1008,6 +1058,37 @@ test "prune keeps what the kept files and the pass records reach, and drops the 
   assert_eq(run.value.pruned, { sources: 1, defs: 2, decls: 0, bodies: 1 });
   assert_eq(run.value.sources, Some(["a.ply"]));
   assert_eq(run.value.defs, [true, false, true, false])
+}
+
+test "a filing sweeps once half the fingerprints the store holds were filed again since the last" {
+  let run = on_twin(mem_empty(), || {
+    let files = ["a.ply", "b.ply", "c.ply", "d.ply", "e.ply", "f.ply"];
+    let c0 = fold(files, open_cache[mem]("cache", "", [], built()), |c: Cache, f: String|
+      put_fingerprint[mem](c, print(f, ["m." ++ f])));
+    flush_cache[mem](put_def[mem](c0, name_key("m.orphan"), "m.orphan", b"v"));
+    // Each step files one fingerprint again, as a load that read that file anew does.
+    let step = |f: String, keep: List<String>| {
+      let c = put_fingerprint[mem](
+        open_cache[mem]("cache", "", [], built()),
+        print(f, ["m." ++ f, "m.more"]),
+      );
+      let p = prune_due[mem](c, keep);
+      flush_cache[mem](p.cache);
+      let r = open_cache[mem]("cache", "", [], built());
+      {
+        pruned: p.pruned,
+        orphan: def_of[mem](r, name_key("m.orphan"), "m.orphan").value != None,
+        sources: len(match source_keys[mem](r).value { Some(ks) -> ks, None -> [] }),
+      }
+    };
+    let fewer = filter(files, |f: String| f != "f.ply");
+    [step("a.ply", files), step("b.ply", fewer), step("c.ply", fewer)]
+  });
+  assert_eq(run.value, [
+    { pruned: { sources: 0, defs: 0, decls: 0, bodies: 0 }, orphan: true, sources: 6 },
+    { pruned: { sources: 1, defs: 0, decls: 0, bodies: 0 }, orphan: true, sources: 5 },
+    { pruned: { sources: 0, defs: 1, decls: 0, bodies: 0 }, orphan: false, sources: 5 },
+  ])
 }
 
 test "lookup finds a definition by its name, its simple name and a prefix of its hash" {
