@@ -10,6 +10,7 @@ fn pack() {
 }
 
 mod db_in_ply;
+mod db_wire;
 mod password_host;
 mod pg_client;
 mod random_host;
