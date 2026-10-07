@@ -9,12 +9,13 @@ import parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Lab
                 comma_list, parsed_or, failed, token_lparen, token_rparen, token_lbrace,
                 token_rbrace, token_lbracket, token_rbracket, token_comma, token_colon, token_dot,
                 token_eq, token_lt, token_gt, token_underscore, token_ge, token_pipe, token_slash,
-                token_arrow, token_hashbracket, keyword_pub, keyword_fn, keyword_type,
+                token_arrow, token_hashbracket, at_pos, keyword_pub, keyword_fn, keyword_type,
                 keyword_effect, keyword_nondet, keyword_test, keyword_import, dump_node, dump_count,
                 dump_presence, dump_payload, dump_word, dump_bool, dump_list, dump_opt, dump_ident,
                 dump_qname, dump_diags, Doc, doc_at, module_doc, token_between, dump_doc,
                 primary_span_of, span_bin, ident_bin)
 import std.bin
+import std.list (any, at_or, concat)
 import lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead, InterpolatedTail,
               Keyword, Punctuation, EndOfInput, Comment, DocMark, ItemDoc, ModuleDoc, doc_mark,
               follows_name)
@@ -2512,6 +2513,222 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
   }
 }
 
+// --- What a module that imports this one reads ---------------------------------
+
+/// One walk over a module's tokens: each item's first token, found at bracket depth zero, and each
+/// identifier with the index of the item it stands in.
+type Scan = { at: Int, depth: Int, prev: TokenKind, starts: List<Int>, spelt: List<Spelt> }
+
+type Spelt = { piece: Int, name: Bytes }
+
+/// `Exercised` is a `test` or a `law`; `Private` a function or a type no `pub` opens, with the names
+/// it declares; `Imported` an `import`, with the names it binds; `Held` anything else, which an
+/// importer reads, a `derive` among them, since what it makes is called by names no source spells.
+type PieceKind = | Exercised | Private(List<Bytes>) | Imported(List<Bytes>) | Held
+
+/// The spans of `src` that a module importing it reads nothing of: each `test` and `law`; each
+/// private function and type that nothing an importer reads spells, directly or through others; and
+/// each `import` whose names nothing left spells. A span runs from the end of the token before its
+/// item, so the item's own comments go with it, to the end of the item's last token. The items are
+/// found from the tokens alone, without a parse, and any identifier left that spells a name keeps
+/// what declares it.
+pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
+  let s = start(src);
+  let input = s.input;
+  let scan = scanned(input, s.parser);
+  let count = len(scan.starts);
+  let firsts = array_of_list(scan.starts);
+  let end = ending(input);
+  let lasts = array_of_list(map(range(0, count), |j: Int| at_or(scan.starts, j + 1, end) - 1));
+  let kinds = array_of_list(
+    map(range(0, count), |j: Int|
+      piece_kind(input, at_pos(s.parser, array_get(firsts, j)), array_get(lasts, j))),
+  );
+  let kept = reached(kinds, reaches(kinds, scan.spelt));
+  let bound = fold(range(0, count), map_new(), |acc: Map<Bytes, Bool>, j: Int|
+    match array_get(kinds, j) {
+      Imported(names) -> fold(names, acc, |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true)),
+      _ -> acc,
+    });
+  let used = fold(scan.spelt, map_new(), |acc: Map<Bytes, Bool>, sp: Spelt|
+    if array_get(kept, sp.piece) && map_contains(bound, sp.name) { map_insert(acc, sp.name, true) }
+    else { acc });
+  fold(range(0, count), [], |acc: List<Span>, j: Int| {
+    let cut = match array_get(kinds, j) {
+      Exercised -> true,
+      Private(_) -> !array_get(kept, j),
+      Imported(names) -> len(names) > 0 && !any(names, |n: Bytes| map_contains(used, n)),
+      Held -> false,
+    };
+    if cut {
+      push(acc, {
+        start: before_piece(input, array_get(firsts, j)),
+        end: token_at(input, array_get(lasts, j)).end,
+      })
+    } else { acc }
+  })
+}
+
+fn scanned(input: Input, parser: Parser) -> Scan / {abort.raise} =
+  fold(
+    input.tokens,
+    { at: 0, depth: 0, prev: EndOfInput, starts: [], spelt: [] },
+    |s: Scan, t: Token| {
+      let k = t.kind;
+      let starts = if s.depth == 0 && may_start(k) && !modifies(s.prev)
+          && at_item_start(input, at_pos(parser, s.at)) { push(s.starts, s.at) }
+      else { s.starts };
+      let spelt = match k {
+        Identifier(n) -> if len(starts) == 0 { s.spelt }
+        else { push(s.spelt, { piece: len(starts) - 1, name: n }) },
+        _ -> s.spelt,
+      };
+      { at: s.at + 1, depth: depth_after(s.depth, k), prev: k, starts: starts, spelt: spelt }
+    },
+  )
+
+/// Whether a token may open an item: a keyword, or an identifier some item opens with.
+fn may_start(k: TokenKind) -> Bool =
+  match k {
+    Keyword(_) -> true,
+    Identifier(n) ->
+      n == b"law" || n == b"derive" || n == b"reuse" || n == b"transparent" || n == b"const"
+        || n == b"opaque"
+        || n == b"extern"
+        || n == b"key"
+        || n == b"show"
+        || n == b"gen"
+        || n == b"numeric",
+    _ -> false,
+  }
+
+/// Whether a token makes the next part of an item already begun (`pub fn`, `reuse fn`, `opaque type`,
+/// `nondet effect`, `test/nondet`).
+fn modifies(k: TokenKind) -> Bool =
+  match k {
+    Identifier(n) ->
+      n == b"reuse" || n == b"transparent" || n == b"const" || n == b"opaque" || n == b"extern",
+    _ -> k == keyword_pub() || k == keyword_nondet() || k == token_slash(),
+  }
+
+/// For each item, the private items it spells a name of.
+fn reaches(kinds: Array<PieceKind>, spelt: List<Spelt>) -> Array<List<Int>> / {abort.raise} = {
+  let count = array_len(kinds);
+  let declares = fold(range(0, count), map_new(), |acc: Map<Bytes, List<Int>>, j: Int|
+    match array_get(kinds, j) {
+      Private(names) ->
+        fold(names, acc, |a: Map<Bytes, List<Int>>, n: Bytes|
+          map_insert(a, n, push(match map_get(a, n) { Some(js) -> js, None -> [] }, j))),
+      _ -> acc,
+    });
+  fold(spelt, array_new(count, []), |acc: Array<List<Int>>, sp: Spelt|
+    match map_get(declares, sp.name) {
+      Some(js) -> array_set(acc, sp.piece, concat(array_get(acc, sp.piece), js)),
+      None -> acc,
+    })
+}
+
+/// Which items an importer reads: every `Held` one, and each private one an item it reads spells.
+fn reached(kinds: Array<PieceKind>, edges: Array<List<Int>>) -> Array<Bool> / {abort.raise} = {
+  let count = array_len(kinds);
+  let roots = filter(range(0, count), |j: Int|
+    match array_get(kinds, j) { Held -> true, _ -> false });
+  iterate(
+    {
+      kept: fold(roots, array_new(count, false), |k: Array<Bool>, j: Int| array_set(k, j, true)),
+      frontier: roots,
+    },
+    count + 2,
+    |st: Reach|
+      if len(st.frontier) == 0 { Stop(st.kept) } else {
+        Continue(
+          fold(st.frontier, { kept: st.kept, frontier: [] }, |acc: Reach, j: Int|
+            fold(array_get(edges, j), acc, |a: Reach, q: Int|
+              if array_get(a.kept, q) { a }
+              else { { kept: array_set(a.kept, q, true), frontier: push(a.frontier, q) } })),
+        )
+      },
+  )
+}
+
+/// The items found to be read so far, and those just found, whose names are yet to be followed.
+type Reach = { kept: Array<Bool>, frontier: List<Int> }
+
+fn token_at(input: Input, i: Int) -> Token =
+  match list_at(input.tokens, i) { Some(t) -> t, None -> { start: 0, end: 0, kind: EndOfInput } }
+
+/// Where a cut item's span starts: the end of the token before it, or for the first item the end of
+/// the module's own doc, which stays.
+fn before_piece(input: Input, first: Int) -> Int / {abort.raise} =
+  if first > 0 { token_at(input, first - 1).end } else {
+    fold(input.comments, 0, |at: Int, c: Comment|
+      if c.end <= token_at(input, 0).start && doc_mark(input.source, c) == Some(ModuleDoc) { c.end }
+      else { at })
+  }
+
+/// The token that ends the module.
+fn ending(input: Input) -> Int =
+  if token_at(input, input.token_count - 1).kind == EndOfInput { input.token_count - 1 }
+  else { input.token_count }
+
+fn depth_after(depth: Int, k: TokenKind) -> Int =
+  match k {
+    Punctuation(p) -> if p == b"lparen" || p == b"lbrace" || p == b"lbracket" || p == b"hashbrace"
+        || p == b"hashbracket" { depth + 1 }
+    else if p == b"rparen" || p == b"rbrace" || p == b"rbracket" { max(depth - 1, 0) }
+    else { depth },
+    InterpolatedHead(_) -> depth + 1,
+    InterpolatedTail(_) -> max(depth - 1, 0),
+    _ -> depth,
+  }
+
+fn piece_kind(input: Input, here: Parser, last: Int) -> PieceKind / {abort.raise} = {
+  let k = token_kind(input, here);
+  if k == keyword_test() || at_law_start(input, here) { Exercised } else if k == keyword_import() {
+    match import_decl(input, here) { Ok(d) -> Imported(bound_by(d.node)), Err(_) -> Held }
+  } else if k == keyword_type() || at_opaque_start(input, here) {
+    Private(type_names(input, here.pos, last))
+  } else if k == keyword_fn() || at_reuse_start(input, here) || at_transparent_start(input, here)
+      || at_const_start(input, here) {
+    match ident_after(input, here.pos, last, keyword_fn()) { Some(n) -> Private([n]), None -> Held }
+  } else { Held }
+}
+
+/// The names an `import` binds: the module's last segment, the name it binds it as, or each name
+/// it selects.
+fn bound_by(d: ImportDecl) -> List<Bytes> =
+  match d.kind {
+    IModule -> match list_at(d.path, len(d.path) - 1) { Some(seg) -> [seg.name], None -> [] },
+    IAlias(a) -> [a.name],
+    INames(ns) -> map(ns, |n: Ident| n.name),
+  }
+
+/// The identifier right after the first token of kind `k` among `first` to `last`.
+fn ident_after(input: Input, first: Int, last: Int, k: TokenKind) -> Option<Bytes> =
+  fold(range(first, last), None, |found: Option<Bytes>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if token_at(input, i).kind != k { None }
+      else { match token_at(input, i + 1).kind { Identifier(n) -> Some(n), _ -> None } },
+    })
+
+/// What a type declares: its name, and each identifier right after an `=` or a `|` at its own
+/// depth, which takes in every constructor it has.
+fn type_names(input: Input, first: Int, last: Int) -> List<Bytes> / {abort.raise} = {
+  let named = match ident_after(input, first, last, keyword_type()) { Some(n) -> [n], None -> [] };
+  fold(
+    range(first, last),
+    { depth: 0, names: named },
+    |s: { depth: Int, names: List<Bytes> }, i: Int| {
+      let k = token_at(input, i).kind;
+      let names = if s.depth == 0 && (k == token_eq() || k == token_pipe()) {
+        match token_at(input, i + 1).kind { Identifier(n) -> push(s.names, n), _ -> s.names }
+      } else { s.names };
+      { depth: depth_after(s.depth, k), names: names }
+    },
+  ).names
+}
+
 pub fn parse(src: Bytes) -> Parsed<Module> / {abort.raise} = {
   let s = start(src);
   let r = run(s.input, s.parser);
@@ -3430,6 +3647,22 @@ test "a header holds the imports a whole parse finds, the hidden ones among them
   assert(same(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n"), None);
   assert(same(b"import std.bin\ntype T = { a: Int }\nderive bin for T\n"), None);
   assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None)
+}
+
+test "an importer reads no test or law, nor a private item or an import only they reach" {
+  let src = b"//! A module.\n\nimport std.laws (agrees)\nimport std.bytes\n\n/// More.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + bytes::one()\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)\n\nfn thrice(x: Int) -> Int = x * 3\n\ntype Pair = { a: Int, b: Int }\n\n// --- Tests\n\ntest \"more\" {\n  assert_eq(more(twice(1)), 4)\n}\n\ntest/nondet \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)\n";
+  assert_eq(map(unimported(src), |s: Span| bytes_slice(src, s.start, s.end)), [
+    b"\n\nimport std.laws (agrees)",
+    b"\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = thrice(x)",
+    b"\n\nfn thrice(x: Int) -> Int = x * 3",
+    b"\n\ntype Pair = { a: Int, b: Int }",
+    b"\n\n// --- Tests\n\ntest \"more\" {\n  assert_eq(more(twice(1)), 4)\n}",
+    b"\n\ntest/nondet \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }",
+    b"\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)",
+  ]);
+  // Whatever a `pub` item or a `derive` spells stays, and so does what that spells in turn.
+  let held = b"import std.bin\n\ntype Kept = { a: Int }\n\nderive bin for Kept\n\nfn helper() -> Int = 1\n\npub fn shown() -> Int = helper()\n";
+  assert_eq(unimported(held), [])
 }
 
 test "`gen for T by f` is an item that brings `std.gen` under a name no source writes" {
