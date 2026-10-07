@@ -8,7 +8,10 @@
 //!
 //! `connect` gets a session to where the server answers a query, authenticating with a clear-text
 //! password or SCRAM-SHA-256 (md5 is refused with a message naming it); the client's SCRAM nonce is
-//! the caller's to draw, so a run's `random` seed decides it and a test can fix it. `simple_query` and
+//! the caller's to draw, so a run's `random` seed decides it and a test can fix it. The password is
+//! a `Secret<Bytes>` throughout: SCRAM derives its proof from it under `std.sasl`, and a clear-text
+//! password goes out by `net.send_secret`, its message's kind and length in the clear before it and
+//! its NUL after, so no plain value in the program ever holds it. `simple_query` and
 //! `extended_query` answer the columns, the rows and the command tag. The SCRAM steps are
 //! `std.sasl`'s. A connection is `std.net`'s; which statements to send, what a transaction is and
 //! when to retry are `std.db`'s.
@@ -16,8 +19,12 @@
 //! `connect` secures a connection before its start-up when `Tls` asks: after an `SSLRequest` the
 //! server says yes or no, and a no is `Declined` rather than a plaintext session; with direct
 //! negotiation the handshake begins at once. The server is verified as `net.start_tls` verifies one,
-//! and plaintext the server sent behind its yes is `Injected`. SCRAM is never bound to the channel
-//! (`SCRAM-SHA-256-PLUS`): `std.net` does not say which certificate the server presented.
+//! and plaintext the server sent behind its yes is `Injected`. Over TLS, SCRAM is bound to the
+//! channel where the server offers it (SCRAM-SHA-256-PLUS), by the `tls-server-end-point` hash of
+//! the certificate the server presented (`end_point`), so a proof made for one connection proves
+//! nothing on another; where it does not, the client says it would have bound one, so a server
+//! whose offer was stripped on the way refuses. An offer the client cannot bind, for a certificate
+//! whose signature names no hash, is refused rather than answered unbound.
 //!
 //! A session that has sent `LISTEN` takes notifications with `await_notification`; one that arrives
 //! while a statement is answered is kept in the session for the next wait. A copy moves rows in
@@ -30,9 +37,11 @@ import std.bytes (u16_be, u32_be, i32_be, u16_be_at, u32_be_at, i32_be_at, slice
 import std.ip
 import std.net
 import std.net (Says, net, send_all)
-import std.list (concat)
+import std.list (concat, contains)
 import std.option (option_all)
-import std.sasl (scram_challenge, scram_final, scram_first, scram_first_bare, scram_verify)
+import std.hash (sha256, sha384, sha512)
+import std.sasl (scram_challenge, scram_final, scram_first, scram_first_bare, scram_verify, Binding,
+                 Unbound, Unoffered, ServerEndPoint)
 
 // --- Kinds --------------------------------------------------------------------
 
@@ -676,10 +685,10 @@ pub fn connect<[l]>(
   user: String,
   database: String,
   parameters: List<Set>,
-  password: Option<String>,
+  password: Option<Secret<Bytes>>,
   nonce: String,
   client: Client,
-) -> Result<Session, ClientError> / {net.connect[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], abort.raise, diverges} =
+) -> Result<Session, ClientError> / {net.connect[l], net.start_tls[l], net.peer_certificate[l], net.send[l], net.send_secret[l], net.recv[l], net.close[l], abort.raise, diverges} =
   match net.connect[l](host, port, client.connect_ms) {
     None -> Err(Unreachable),
     Some(conn) -> {
@@ -694,9 +703,9 @@ pub fn connect<[l]>(
       };
       let started = match secured[l](conn, tls, client) {
         Err(e) -> Err(e),
-        Ok(_) -> if !send_all[l](conn, startup(user, database, parameters), client.write_ms) {
+        Ok(channel) -> if !send_all[l](conn, startup(user, database, parameters), client.write_ms) {
           Err(NotSent)
-        } else { greet[l](opening, password, nonce, client, nothing_said()) },
+        } else { greet[l](opening, password, nonce, client, nothing_said(channel)) },
       };
       match started {
         Ok(s) -> Ok(s),
@@ -712,6 +721,10 @@ pub fn connect<[l]>(
 /// direct one.
 pub fn alpn() -> String = "postgresql"
 
+/// What a connection was secured as: not at all, or by TLS with the certificate the server
+/// presented, which SCRAM binds the exchange to.
+type Channel = | Plaintext | Secured(Option<Bytes>)
+
 /// `conn` secured as `tls` asks, before anything else is sent on it. The answer to an
 /// `SSLRequest` is read a byte at a time, so a byte the server sent after it is still on the socket
 /// when the handshake begins, where `net.start_tls` refuses it as `Injected`.
@@ -719,9 +732,9 @@ fn secured<[l]>(
   conn: Int,
   tls: Tls,
   client: Client,
-) -> Result<Unit, ClientError> / {net.send[l], net.recv[l], net.start_tls[l], abort.raise} =
+) -> Result<Channel, ClientError> / {net.send[l], net.recv[l], net.start_tls[l], net.peer_certificate[l], abort.raise} =
   match tls {
-    NoTls -> Ok(()),
+    NoTls -> Ok(Plaintext),
     Direct(name) -> upgraded[l](conn, name, client),
     Requested(name) -> if !send_all[l](conn, ssl_request(), client.write_ms) { Err(NotSent) } else {
       match net.recv[l](conn, 1, client.read_ms) {
@@ -738,19 +751,19 @@ fn upgraded<[l]>(
   conn: Int,
   name: String,
   client: Client,
-) -> Result<Unit, ClientError> / {net.start_tls[l]} =
+) -> Result<Channel, ClientError> / {net.start_tls[l], net.peer_certificate[l]} =
   match net.start_tls[l](conn, name, [alpn()], b"", client.connect_ms) {
-    Ok(_) -> Ok(()),
+    Ok(_) -> Ok(Secured(net.peer_certificate[l](conn))),
     Err(why) -> Err(Unsecured(why)),
   }
 
 fn greet<[l]>(
   s: Session,
-  password: Option<String>,
+  password: Option<Secret<Bytes>>,
   nonce: String,
   client: Client,
   acc: Greeting,
-) -> Result<Session, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
+) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match read_message[l](s.conn, s.buffer, client.read_ms) {
     Err(e) -> Err(e),
     Ok(got) -> {
@@ -762,9 +775,15 @@ fn greet<[l]>(
           Some(0) -> greet[l](rest, password, nonce, client, acc),
           Some(3) -> match password {
             None -> Err(Refused(no_password(s.user, "a clear-text password"))),
-            Some(text) -> if !send_all[l](rest.conn, password_message(text), client.write_ms) {
-              Err(NotSent)
-            } else { greet[l](rest, password, nonce, client, acc) },
+            Some(secret) -> if !net.send_secret[l](
+                rest.conn,
+                password_head(secret_len(secret)),
+                secret,
+                "raw",
+                b"\x00",
+                client.write_ms,
+              ) { Err(NotSent) }
+            else { greet[l](rest, password, nonce, client, acc) },
           },
           Some(10) -> scram_begin[l](rest, password, nonce, client, acc, m),
           Some(11) -> scram_continue[l](rest, password, nonce, client, acc, m),
@@ -808,18 +827,24 @@ fn no_password(user: String, what: String) -> Server =
     constraint: "",
   }
 
-/// `PasswordMessage`, which is also the frame a SASL step travels in.
-pub fn password_message(text: String) -> Bytes / {abort.raise} =
-  bytes_concat(byte_of_int(112), counted(cstring(text)))
+/// What a `PasswordMessage` holding a password of `length` bytes begins with: its kind and its
+/// length, which counts itself, the password and the NUL after it. It is all of the message a
+/// server is told in the clear; a SASL step travels in the same frame.
+pub fn password_head(length: Int) -> Bytes / {abort.raise} =
+  bytes_concat(byte_of_int(112), u32_be(length + 5))
 
 // --- SASL -----------------------------------------------------------------------
 
-/// What the greeting has collected: the parameters the server set, and where SASL has got to.
-type Greeting = { settings: List<Set>, sasl: Sasl }
+/// What the greeting has collected: the parameters the server set, where SASL has got to, and
+/// the channel it runs over.
+type Greeting = { settings: List<Set>, sasl: Sasl, channel: Channel }
 
-type Sasl = { first_bare: String, expected: Option<Bytes> }
+/// SCRAM's first message without its header, the binding the header named, and the signature the
+/// server is to prove itself with.
+type Sasl = { first_bare: String, binding: Binding, expected: Option<Bytes> }
 
-fn nothing_said() -> Greeting = { settings: [], sasl: { first_bare: "", expected: None } }
+fn nothing_said(channel: Channel) -> Greeting =
+  { settings: [], sasl: { first_bare: "", binding: Unbound, expected: None }, channel: channel }
 
 /// The bytes after an authentication code, as the text a SASL step carries.
 fn auth_text(message: Message) -> Option<String> / {abort.raise} =
@@ -840,46 +865,203 @@ fn names_from(b: Bytes, at: Int, acc: List<String>, left: Int) -> List<String> /
     }
   }
 
-fn offers_scram(message: Message) -> Bool / {abort.raise} =
-  fold(mechanisms(message), false, |acc: Bool, name: String| acc || name == "SCRAM-SHA-256")
+/// The binding SCRAM runs under over `channel`, given the mechanisms the server offers: none over
+/// plaintext; the channel where the server offers SCRAM-SHA-256-PLUS over TLS, and never less; and
+/// otherwise none, saying the client would have bound one.
+fn bound_as(
+  channel: Channel,
+  offered: List<String>,
+) -> Result<Binding, ClientError> / {abort.raise} = {
+  let plain = contains(offered, "SCRAM-SHA-256");
+  match channel {
+    Plaintext -> if plain { Ok(Unbound) } else { Err(no_scram()) },
+    Secured(certificate) -> if !contains(offered, "SCRAM-SHA-256-PLUS") {
+      if plain { Ok(Unoffered) } else { Err(no_scram()) }
+    } else {
+      match certificate {
+        None ->
+          Err(
+            Unexpected(
+              "the server offers SCRAM-SHA-256-PLUS and presented no certificate to bind it to",
+            ),
+          ),
+        Some(der) -> match end_point(der) {
+          Some(hash) -> Ok(ServerEndPoint(hash)),
+          None ->
+            Err(
+              Unexpected(
+                "the server offers SCRAM-SHA-256-PLUS, and its certificate is signed under an algorithm that names no hash to bind it by; this client does not answer the offer unbound",
+              ),
+            ),
+        },
+      }
+    },
+  }
+}
+
+fn no_scram() -> ClientError = Unexpected("the server offers no SCRAM-SHA-256 mechanism")
+
+/// The mechanism SCRAM is named under for a binding.
+fn scram_mechanism(b: Binding) -> String =
+  match b { ServerEndPoint(_) -> "SCRAM-SHA-256-PLUS", _ -> "SCRAM-SHA-256" }
 
 /// The client's first message: the mechanism, then the length-prefixed first message.
 fn scram_begin<[l]>(
   s: Session,
-  password: Option<String>,
+  password: Option<Secret<Bytes>>,
   nonce: String,
   client: Client,
   acc: Greeting,
   message: Message,
-) -> Result<Session, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
+) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
     None -> Err(Refused(no_password(s.user, "a password"))),
-    Some(_) -> if !offers_scram(message) {
-      Err(Unexpected("the server offers no SCRAM-SHA-256 mechanism"))
-    } else {
-      let first_bare = scram_first_bare(s.user, nonce);
-      let raw = bytes_of_string(scram_first(s.user, nonce));
-      let payload = bytes_concat_all([cstring("SCRAM-SHA-256"), i32_be(bytes_len(raw)), raw]);
-      if !send_all[l](s.conn, bytes_concat(byte_of_int(112), counted(payload)), client.write_ms) {
-        Err(NotSent)
-      } else {
-        greet[l](s, password, nonce, client, {
-          ..acc,
-          sasl: { first_bare: first_bare, expected: None },
-        })
-      }
+    Some(_) -> match bound_as(acc.channel, mechanisms(message)) {
+      Err(e) -> Err(e),
+      Ok(binding) -> {
+        let first_bare = scram_first_bare(s.user, nonce);
+        let raw = bytes_of_string(scram_first(binding, s.user, nonce));
+        let payload = bytes_concat_all([
+          cstring(scram_mechanism(binding)),
+          i32_be(bytes_len(raw)),
+          raw,
+        ]);
+        if !send_all[l](s.conn, bytes_concat(byte_of_int(112), counted(payload)), client.write_ms) {
+          Err(NotSent)
+        } else {
+          greet[l](s, password, nonce, client, {
+            ..acc,
+            sasl: { first_bare: first_bare, binding: binding, expected: None },
+          })
+        }
+      },
+    },
+  }
+
+// --- The channel's binding --------------------------------------------------------
+
+/// A DER element: its tag, and where its content starts and ends.
+type Element = { tag: Int, start: Int, end: Int }
+
+/// The DER element at `at` of `b`; `None` for one that is not whole within `b`. A length takes at
+/// most four bytes, past which no certificate runs.
+fn der_at(b: Bytes, at: Int) -> Option<Element> / {abort.raise} =
+  if at < 0 || at + 2 > bytes_len(b) { None } else {
+    let first = bytes_at(b, at + 1);
+    let n = if first < 128 { 0 } else { first - 128 };
+    if n > 4 || at + 2 + n > bytes_len(b) || first == 128 { None } else {
+      let length = if n == 0 { first }
+      else { fold(range(0, n), 0, |acc: Int, i: Int| acc * 256 + bytes_at(b, at + 2 + i)) };
+      let start = at + 2 + n;
+      if start + length > bytes_len(b) { None }
+      else { Some({ tag: bytes_at(b, at), start: start, end: start + length }) }
+    }
+  }
+
+/// The object identifier the DER element at `at` holds, where it holds one.
+fn der_oid(b: Bytes, at: Int) -> Option<Bytes> / {abort.raise} =
+  match der_at(b, at) {
+    Some(e) -> if e.tag == 6 { Some(bytes_slice(b, e.start, e.end)) } else { None },
+    None -> None,
+  }
+
+/// The hash a signature algorithm's identifier names, SHA-256 where it is MD5 or SHA-1, as RFC
+/// 5929 §4.1 has `tls-server-end-point` take it; `params` is where its parameters are, which
+/// name RSASSA-PSS's.
+fn signing_hash(
+  b: Bytes,
+  algorithm: Bytes,
+  params: Int,
+  end: Int,
+) -> Option<String> / {abort.raise} = {
+  let rsa = b"\x2a\x86\x48\x86\xf7\x0d\x01\x01";
+  let ecdsa = b"\x2a\x86\x48\xce\x3d\x04";
+  if contains(
+      [
+        bytes_concat(rsa, b"\x04"),
+        bytes_concat(rsa, b"\x05"),
+        bytes_concat(rsa, b"\x0b"),
+        bytes_concat(ecdsa, b"\x01"),
+        bytes_concat(ecdsa, b"\x03\x02"),
+      ],
+      algorithm,
+    ) { Some("SHA-256") }
+  else if algorithm == bytes_concat(rsa, b"\x0c") || algorithm == bytes_concat(ecdsa, b"\x03\x03") {
+    Some("SHA-384")
+  } else if algorithm == bytes_concat(rsa, b"\x0d")
+      || algorithm == bytes_concat(ecdsa, b"\x03\x04") { Some("SHA-512") }
+  else if algorithm == bytes_concat(rsa, b"\x0a") { pss_hash(b, params, end) }
+  else { None }
+}
+
+/// The hash RSASSA-PSS's parameters name in their first, explicitly tagged field; SHA-1, and so
+/// SHA-256 here, where they name none.
+fn pss_hash(b: Bytes, params: Int, end: Int) -> Option<String> / {abort.raise} =
+  if params >= end { Some("SHA-256") } else {
+    match der_at(b, params) {
+      None -> None,
+      Some(sequence) -> match der_at(b, sequence.start) {
+        None -> Some("SHA-256"),
+        Some(first) -> if first.tag != 160 || sequence.start >= sequence.end { Some("SHA-256") }
+        else {
+          match der_at(b, first.start) {
+            None -> None,
+            Some(identifier) -> match der_oid(b, identifier.start) {
+              None -> None,
+              Some(hash) -> {
+                let nist = b"\x60\x86\x48\x01\x65\x03\x04\x02";
+                if hash == bytes_concat(nist, b"\x01") || hash == b"\x2b\x0e\x03\x02\x1a" {
+                  Some("SHA-256")
+                } else if hash == bytes_concat(nist, b"\x02") { Some("SHA-384") }
+                else if hash == bytes_concat(nist, b"\x03") { Some("SHA-512") }
+                else { None }
+              },
+            },
+          }
+        },
+      },
+    }
+  }
+
+/// The `tls-server-end-point` data of a DER certificate, RFC 5929 §4.1: the certificate's hash under
+/// the hash its signature algorithm names. `None` for a certificate that does not read, and for an
+/// algorithm that names no hash, as Ed25519's does not.
+pub fn end_point(der: Bytes) -> Option<Bytes> / {abort.raise} =
+  match der_at(der, 0) {
+    None -> None,
+    Some(certificate) -> match der_at(der, certificate.start) {
+      None -> None,
+      Some(signed) -> match der_at(der, signed.end) {
+        None -> None,
+        Some(algorithm) -> match der_at(der, algorithm.start) {
+          None -> None,
+          Some(identifier) -> if identifier.tag != 6 { None } else {
+            match signing_hash(
+                der,
+                bytes_slice(der, identifier.start, identifier.end),
+                identifier.end,
+                algorithm.end,
+              ) {
+              Some("SHA-256") -> Some(sha256(der)),
+              Some("SHA-384") -> Some(sha384(der)),
+              Some("SHA-512") -> Some(sha512(der)),
+              _ -> None,
+            }
+          },
+        },
+      },
     },
   }
 
 /// The client's last message: the proof, and nothing else in the frame.
 fn scram_continue<[l]>(
   s: Session,
-  password: Option<String>,
+  password: Option<Secret<Bytes>>,
   nonce: String,
   client: Client,
   acc: Greeting,
   message: Message,
-) -> Result<Session, ClientError> / {net.send[l], net.recv[l], abort.raise, diverges} =
+) -> Result<Session, ClientError> / {net.send[l], net.send_secret[l], net.recv[l], abort.raise, diverges} =
   match password {
     None -> Err(Refused(no_password(s.user, "a password"))),
     Some(secret) -> match auth_text(message) {
@@ -887,7 +1069,8 @@ fn scram_continue<[l]>(
       Some(server_first) -> match scram_challenge(server_first) {
         None -> Err(Unexpected("a SASL continue this client cannot read: " ++ server_first)),
         Some(challenge) -> match scram_final(
-            secret_bytes(secret_of_string(secret)),
+            acc.sasl.binding,
+            secret,
             acc.sasl.first_bare,
             server_first,
             challenge,
@@ -900,7 +1083,7 @@ fn scram_continue<[l]>(
             } else {
               greet[l](s, password, nonce, client, {
                 ..acc,
-                sasl: { first_bare: acc.sasl.first_bare, expected: Some(proof.expected) },
+                sasl: { ..acc.sasl, expected: Some(proof.expected) },
               })
             }
           },
@@ -1475,9 +1658,145 @@ test "a back end key is the two words a cancel needs" {
 
 test "the mechanisms an authentication message offers" {
   let offered = bytes_concat_all([b"SCRAM-SHA-256\x00", b"PLAIN\x00", b"\x00"]);
-  assert(offers_scram({ kind: Authentication, body: bytes_concat(u32_be(10), offered) }));
+  assert_eq(mechanisms({ kind: Authentication, body: bytes_concat(u32_be(10), offered) }), [
+    "SCRAM-SHA-256",
+    "PLAIN",
+  ]);
   let plain = bytes_concat_all([b"PLAIN\x00", b"\x00"]);
-  assert(!offers_scram({ kind: Authentication, body: bytes_concat(u32_be(10), plain) }))
+  assert_eq(mechanisms({ kind: Authentication, body: bytes_concat(u32_be(10), plain) }), ["PLAIN"]);
+  assert_eq(bound_as(Plaintext, ["PLAIN"]), Err(no_scram()))
+}
+
+/// A certificate whose signature algorithm is the object identifier `algorithm`, with `params`
+/// after it: what `end_point` reads of one, and no more. Its signed part is long enough that it and
+/// the whole take a length in two bytes, as a real certificate's do.
+fn t_certificate(algorithm: Bytes, params: Bytes) -> Bytes / {abort.raise} = {
+  let length = |n: Int|
+    if n < 128 { byte_of_int(n) }
+    else { bytes_concat_all([byte_of_int(130), byte_of_int(n / 256), byte_of_int(n % 256)]) };
+  let element = |tag: Int, content: Bytes|
+    bytes_concat_all([byte_of_int(tag), length(bytes_len(content)), content]);
+  let subject = fold(range(0, 300), b"", |acc: Bytes, i: Int| bytes_concat(acc, b"s"));
+  element(
+    48,
+    bytes_concat_all([
+      element(48, bytes_concat(element(2, b"\x01"), element(4, subject))),
+      element(48, bytes_concat(element(6, algorithm), params)),
+      element(3, b"\x00\x01"),
+    ]),
+  )
+}
+
+test "a certificate is bound by its hash under the hash its signature names, SHA-256 for MD5 and SHA-1" {
+  let rsa = |last: Bytes| bytes_concat(b"\x2a\x86\x48\x86\xf7\x0d\x01\x01", last);
+  let ecdsa = |rest: Bytes| bytes_concat(b"\x2a\x86\x48\xce\x3d\x04", rest);
+  let bound = |algorithm: Bytes, params: Bytes| {
+    let der = t_certificate(algorithm, params);
+    (end_point(der), der)
+  };
+  let sha256_of = |p: (Option<Bytes>, Bytes)| p._0 == Some(sha256(p._1));
+  assert(sha256_of(bound(rsa(b"\x0b"), b"\x05\x00")));
+  assert(sha256_of(bound(rsa(b"\x05"), b"\x05\x00")));
+  assert(sha256_of(bound(rsa(b"\x04"), b"\x05\x00")));
+  assert(sha256_of(bound(ecdsa(b"\x03\x02"), b"")));
+  assert(sha256_of(bound(ecdsa(b"\x01"), b"")));
+  let sha384_rsa = bound(rsa(b"\x0c"), b"\x05\x00");
+  assert_eq(sha384_rsa._0, Some(sha384(sha384_rsa._1)));
+  let sha512_ecdsa = bound(ecdsa(b"\x03\x04"), b"");
+  assert_eq(sha512_ecdsa._0, Some(sha512(sha512_ecdsa._1)));
+  // RSASSA-PSS names its hash in its parameters, and SHA-1 by saying nothing.
+  let pss_sha384 = bound(
+    rsa(b"\x0a"),
+    b"\x30\x0f\xa0\x0d\x30\x0b\x06\x09\x60\x86\x48\x01\x65\x03\x04\x02\x02",
+  );
+  assert_eq(pss_sha384._0, Some(sha384(pss_sha384._1)));
+  assert(sha256_of(bound(rsa(b"\x0a"), b"\x30\x00")));
+  // Ed25519 names no hash, and a certificate cut short is none.
+  assert_eq(bound(b"\x2b\x65\x70", b"")._0, None);
+  assert_eq(end_point(b"\x30\x05\x30"), None);
+  let whole = t_certificate(rsa(b"\x0b"), b"\x05\x00");
+  assert_eq(end_point(bytes_slice(whole, 0, bytes_len(whole) - 1)), None)
+}
+
+/// The SCRAM step a client takes over a connection its far end does `script` on, secured as `tls`
+/// says, the far end presenting `certificate`.
+fn t_scram(
+  script: List<net::Step>,
+  tls: Tls,
+  certificate: Bytes,
+) -> String / {net::socket.refused, abort.raise, diverges} = {
+  let server = ip::socket_at(ip::loopback_v4(), 5432);
+  let world = net::mem_presenting(
+    net::mem_serving(net::mem_empty(), server, [script]),
+    "db.example",
+    certificate,
+  );
+  let over = net::on_mem(world, ||
+    connect[conn](
+      "127.0.0.1",
+      5432,
+      tls,
+      "ply",
+      "ply",
+      [],
+      Some(secret_of_bytes(b"pencil")),
+      "n",
+      default_client(),
+    ));
+  match over.value { Ok(_) -> "connected", Err(e) -> client_error_text(e) }
+}
+
+fn t_offered(names: List<String>) -> Bytes / {abort.raise} =
+  t_frame(82, bytes_concat_all([u32_be(10), bytes_concat_all(map(names, cstring)), b"\x00"]))
+
+fn t_first(mechanism: String, header: String) -> Bytes / {abort.raise} = {
+  let raw = bytes_of_string(header ++ "n=ply,r=n");
+  t_frame(112, bytes_concat_all([cstring(mechanism), i32_be(bytes_len(raw)), raw]))
+}
+
+test "over TLS, SCRAM is bound to the server's certificate where it offers the binding, and says so where not" {
+  let begun = startup("ply", "ply", []);
+  let refused = t_frame(69, b"SFATAL\x00C28P01\x00Mno\x00\x00");
+  let der = t_certificate(b"\x2a\x86\x48\xce\x3d\x04\x03\x02", b"");
+  let both = t_offered(["SCRAM-SHA-256-PLUS", "SCRAM-SHA-256"]);
+  // The script hears exactly the first message it names, or the run fails there.
+  let plus = t_scram(
+    [
+      net::Upgrades,
+      net::Hears(begun),
+      Says(both),
+      net::Hears(t_first("SCRAM-SHA-256-PLUS", "p=tls-server-end-point,,")),
+      Says(refused),
+    ],
+    Direct("db.example"),
+    der,
+  );
+  assert(string_contains(plus, "28P01"));
+  let stripped = t_scram(
+    [
+      net::Upgrades,
+      net::Hears(begun),
+      Says(t_offered(["SCRAM-SHA-256"])),
+      net::Hears(t_first("SCRAM-SHA-256", "y,,")),
+      Says(refused),
+    ],
+    Direct("db.example"),
+    der,
+  );
+  assert(string_contains(stripped, "28P01"));
+  let plain = t_scram(
+    [net::Hears(begun), Says(both), net::Hears(t_first("SCRAM-SHA-256", "n,,")), Says(refused)],
+    NoTls,
+    der,
+  );
+  assert(string_contains(plain, "28P01"));
+  // An offer the client cannot bind is refused, and nothing is said under it.
+  let unbindable = t_scram(
+    [net::Upgrades, net::Hears(begun), Says(both)],
+    Direct("db.example"),
+    t_certificate(b"\x2b\x65\x70", b""),
+  );
+  assert(string_contains(unbindable, "names no hash"))
 }
 
 fn t_frame(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
@@ -1637,6 +1956,45 @@ test "direct negotiation begins the handshake first, with no ssl request" {
   let plain = t_connect([net::Hears(begun), Says(t_welcome())], NoTls);
   assert_eq(plain.outcome, "connected");
   assert_eq(plain.secured, None)
+}
+
+/// What `connect` with `password` came to over a server that does `script`, the bytes the program
+/// sent in the clear, and how many it sent sealed.
+fn t_authenticated(
+  script: List<net::Step>,
+  password: Option<Secret<Bytes>>,
+) -> { outcome: String, sent: Bytes, sealed: Int } / {net::socket.refused, abort.raise, diverges} = {
+  let server = ip::socket_at(ip::loopback_v4(), 5432);
+  let over = net::on_mem(net::mem_serving(net::mem_empty(), server, [script]), ||
+    connect[conn]("127.0.0.1", 5432, NoTls, "ply", "ply", [], password, "n", default_client()));
+  {
+    outcome: match over.value { Ok(_) -> "connected", Err(e) -> client_error_text(e) },
+    sent: net::mem_sent(over.net, 1),
+    sealed: len(net::mem_sent_secrets(over.net, 1)),
+  }
+}
+
+test "a clear-text password goes out sealed: its kind and length, the password raw, then its NUL" {
+  let begun = startup("ply", "ply", []);
+  let asked = t_frame(82, u32_be(3));
+  let c = t_authenticated(
+    [
+      net::Hears(begun),
+      Says(asked),
+      net::HearsSecret(bytes_concat_all([b"p", u32_be(11), b"pencil\x00"])),
+      Says(t_welcome()),
+    ],
+    Some(secret_of_bytes(b"pencil")),
+  );
+  assert_eq(c.outcome, "connected");
+  // No byte the program sent in the clear holds the password.
+  assert_eq(c.sent, begun);
+  assert_eq(c.sealed, 1);
+  // A server that asks for one where none was given is refused, and nothing more is sent.
+  let none = t_authenticated([net::Hears(begun), Says(asked)], None);
+  assert_eq(none.outcome, client_error_text(Refused(no_password("ply", "a clear-text password"))));
+  assert_eq(none.sent, begun);
+  assert_eq(none.sealed, 0)
 }
 
 fn t_notify(sender: Int, channel: String, payload: String) -> Bytes / {abort.raise} =
