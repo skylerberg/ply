@@ -194,19 +194,242 @@ fn every_credential_that_fails_is_reported_rather_than_the_first() {
     );
 }
 
-#[test]
-fn two_credentials_with_one_name_are_refused_rather_than_one_winning() {
-    let material = material();
-    let diagnostic = one(
-        Credentials::load(&[material.spec("api"), material.spec("api")], &[])
-            .expect_err("`api` twice is two answers to one question"),
-    );
-    assert_eq!(diagnostic.code, codes::TLS_CREDENTIAL_INVALID);
+/// A certificate for `names` written beside the others in `dir`, under `stem`.
+fn issued_into(
+    dir: &std::path::Path,
+    stem: &str,
+    names: &[&str],
+) -> (CredentialSpec, ply_host::certgen::Issued) {
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let issued = ply_host::certgen::issue(&names).expect("a certificate is issued");
+    let certificate = dir.join(format!("{stem}.pem"));
+    let key = dir.join(format!("{stem}.key"));
+    std::fs::write(&certificate, &issued.certificate).expect("the certificate is written");
+    std::fs::write(&key, &issued.key).expect("the key is written");
+    (
+        CredentialSpec {
+            name: "api".to_string(),
+            certificate,
+            key,
+        },
+        issued,
+    )
+}
+
+fn der_of(issued: &ply_host::certgen::Issued) -> rustls::pki_types::CertificateDer<'static> {
+    rustls::pki_types::CertificateDer::from(issued.der.clone())
+}
+
+/// A client that trusts `trusted`, and presents `own` where it is given one.
+fn client_trusting(
+    trusted: &[&ply_host::certgen::Issued],
+    own: Option<&ply_host::certgen::Issued>,
+) -> Arc<ClientConfig> {
+    use rustls::pki_types::pem::PemObject;
+    let mut roots = RootCertStore::empty();
+    for issued in trusted {
+        roots.add(der_of(issued)).expect("a generated certificate");
+    }
+    let builder = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("the provider supports both versions")
+        .with_root_certificates(roots);
+    let config = match own {
+        Some(issued) => builder
+            .with_client_auth_cert(
+                vec![der_of(issued)],
+                rustls::pki_types::PrivateKeyDer::from_pem_slice(issued.key.as_bytes())
+                    .expect("a generated key"),
+            )
+            .expect("the key goes with the certificate"),
+        None => builder.with_no_client_auth(),
+    };
+    Arc::new(config)
+}
+
+/// A handshake between the two over buffers, and what each end ended with: the server's
+/// connection and the client's.
+fn shaken(
+    server: &Arc<ServerConfig>,
+    client: &Arc<ClientConfig>,
+    name: &str,
+) -> (rustls::Connection, rustls::Connection) {
+    let mut s: rustls::Connection = rustls::ServerConnection::new(Arc::clone(server))
+        .expect("a server connection")
+        .into();
+    let mut c: rustls::Connection = ClientConnection::new(
+        Arc::clone(client),
+        rustls::pki_types::ServerName::try_from(name.to_string()).expect("a server name"),
+    )
+    .expect("a client connection")
+    .into();
+    // Enough rounds for the handshake and the tickets a TLS 1.3 server sends after it.
+    for _ in 0..8 {
+        pump(&mut c, &mut s);
+        pump(&mut s, &mut c);
+    }
     assert!(
-        diagnostic.message.contains("`api`"),
-        "{}",
-        diagnostic.message
+        !s.is_handshaking() && !c.is_handshaking(),
+        "the handshake completes"
     );
+    (s, c)
+}
+
+fn pump(from: &mut rustls::Connection, to: &mut rustls::Connection) {
+    let mut wire = Vec::new();
+    while from.wants_write() {
+        from.write_tls(&mut wire).expect("written to a buffer");
+    }
+    let mut reader: &[u8] = &wire;
+    while !reader.is_empty() {
+        to.read_tls(&mut reader).expect("read from a buffer");
+        to.process_new_packets()
+            .expect("the peer's records are good");
+    }
+}
+
+#[test]
+fn one_name_holds_several_certificates_and_a_client_is_answered_with_the_one_for_its_name() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (first, a) = issued_into(dir.path(), "a", &["a.example"]);
+    let (second, b) = issued_into(dir.path(), "b", &["b.example"]);
+    let credentials = Credentials::load(&[first, second], &[]).expect("both load");
+    let (_, credential) = credentials.iter().next().expect("one name");
+    assert_eq!(credentials.names().collect::<Vec<_>>(), ["api"]);
+    let client = client_trusting(&[&a, &b], None);
+    for (name, wanted) in [("a.example", &a), ("b.example", &b)] {
+        let (_, c) = shaken(credential.config(), &client, name);
+        assert_eq!(
+            c.peer_certificates()
+                .and_then(|chain| chain.first().cloned()),
+            Some(der_of(wanted)),
+            "the certificate for {name}"
+        );
+    }
+}
+
+#[test]
+fn a_certificate_whose_files_change_is_served_anew_without_a_restart() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (spec, before) = issued_into(dir.path(), "api", &["localhost"]);
+    let credentials = Credentials::load(std::slice::from_ref(&spec), &[]).expect("it loads");
+    let (_, credential) = credentials.iter().next().expect("one name");
+    assert_eq!(
+        credential.chooser().leaves(),
+        std::slice::from_ref(&before.der)
+    );
+    let (_, after) = issued_into(dir.path(), "api", &["localhost"]);
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    for path in [&spec.certificate, &spec.key] {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(later))
+            .expect("the files' times move");
+    }
+    credential.chooser().reload_now();
+    assert_eq!(
+        credential.chooser().leaves(),
+        std::slice::from_ref(&after.der)
+    );
+    let (_, c) = shaken(
+        credential.config(),
+        &client_trusting(&[&after], None),
+        "localhost",
+    );
+    assert_eq!(
+        c.peer_certificates()
+            .and_then(|chain| chain.first().cloned()),
+        Some(der_of(&after))
+    );
+    // A file that no longer loads leaves the certificate before it in place.
+    std::fs::write(&spec.key, "not a key").expect("the key is spoiled");
+    std::fs::File::options()
+        .write(true)
+        .open(&spec.key)
+        .and_then(|f| f.set_modified(later + std::time::Duration::from_secs(10)))
+        .expect("the key's time moves");
+    credential.chooser().reload_now();
+    assert_eq!(
+        credential.chooser().leaves(),
+        std::slice::from_ref(&after.der)
+    );
+}
+
+#[test]
+fn a_client_certificate_the_run_trusts_is_who_the_client_is_and_none_is_still_served() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (server, served) = issued_into(dir.path(), "server", &["localhost"]);
+    let (_, caller) = issued_into(dir.path(), "caller", &["caller.example"]);
+    let trusted = dir.path().join("caller.pem");
+    let credentials = Credentials::load(&[server], &[trusted]).expect("it loads");
+    let (_, credential) = credentials.iter().next().expect("one name");
+    let (s, _) = shaken(
+        credential.config(),
+        &client_trusting(&[&served], Some(&caller)),
+        "localhost",
+    );
+    assert_eq!(
+        s.peer_certificates()
+            .and_then(|chain| chain.first().cloned()),
+        Some(der_of(&caller))
+    );
+    let (anonymous, _) = shaken(
+        credential.config(),
+        &client_trusting(&[&served], None),
+        "localhost",
+    );
+    assert!(anonymous.peer_certificates().is_none());
+}
+
+#[test]
+fn a_client_that_comes_back_resumes_its_session_from_a_ticket() {
+    let material = material();
+    let credentials = material.credentials("api");
+    let (_, credential) = credentials.iter().next().expect("one name");
+    let client = Arc::new(client(&material.der, &["http/1.1"]));
+    let (_, first) = shaken(credential.config(), &client, "localhost");
+    assert_eq!(first.handshake_kind(), Some(rustls::HandshakeKind::Full));
+    let (_, second) = shaken(credential.config(), &client, "localhost");
+    assert_eq!(
+        second.handshake_kind(),
+        Some(rustls::HandshakeKind::Resumed)
+    );
+}
+
+#[test]
+fn a_secured_session_keeps_the_certificate_its_peer_presented() {
+    let material = material();
+    let peer = peer(&material);
+    let client = speak(
+        peer.port(),
+        material.der.clone(),
+        vec!["http/1.1".to_string()],
+        RESPONSE.len(),
+    );
+    let session = peer.accept();
+    assert_eq!(
+        session.peer_certificate(),
+        None,
+        "nothing before the handshake"
+    );
+    assert_eq!(session.protocol(), None);
+    assert!(session.handshake().is_some());
+    // The client presented none, and this run trusts none to ask for.
+    assert_eq!(session.peer_certificate(), None);
+    assert_eq!(session.protocol(), Some("http/1.1".to_string()));
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let chunk = session.read(4096).expect("no deadline is set");
+        assert!(!chunk.is_empty());
+        request.extend_from_slice(&chunk);
+    }
+    session.write(RESPONSE);
+    client
+        .join()
+        .expect("the client finished")
+        .expect("a response");
+    session.close();
 }
 
 #[test]
