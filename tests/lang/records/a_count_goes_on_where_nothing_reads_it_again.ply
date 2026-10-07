@@ -1,0 +1,105 @@
+//! A buffer appended to where nothing on the path reads it again grows in place: one a step holds
+//! and the caller holding the step alone calls once, one a branch reads out of a record its sibling
+//! reads whole, one held by a variable only a sibling branch reads, and one passed to a call before
+//! an argument that reads it. The bytes allocated grow with the buffer, where a copy at each step
+//! would make them grow with its square. A step called again, and a variable or field another path
+//! still reads, give up nothing.
+
+type S = { out: Bytes, n: Int }
+
+type Step = | More(Bytes, () -> Step) | Over
+
+/// A step that appends a byte to the buffer it holds, `n` times.
+fn stepping(s: S) -> () -> Step =
+  ||
+    if s.n <= 0 { Over } else {
+      let next = { out: s.out ++ b"x", n: s.n - 1 };
+      More(next.out, stepping(next))
+    }
+
+/// The buffer the last of `fuel` steps answers.
+fn pulled(k: () -> Step, fuel: Int) -> Bytes =
+  match k() { Over -> b"", More(b, rest) -> if fuel <= 1 { b } else { pulled(rest, fuel - 1) } }
+
+fn whole(s: S) -> Int = s.n
+
+/// One branch reads `s` whole; the other appends to its buffer, read out before the branch.
+fn beside_whole(s: S, fuel: Int) -> Bytes =
+  if fuel <= 0 { s.out } else {
+    let out = s.out;
+    if s.n < 0 { beside_whole({ ..s, n: whole(s) }, fuel - 1) }
+    else { beside_whole({ ..s, out: out ++ b"y" }, fuel - 1) }
+  }
+
+/// One branch reads `s`; the other, which does not, appends to its buffer, read out before.
+fn beside_read(s: S, fuel: Int) -> Bytes =
+  if fuel <= 0 { s.out } else {
+    let out = s.out;
+    if s.n < 0 { beside_read(s, fuel - 1) }
+    else { beside_read({ out: out ++ b"v", n: 0 }, fuel - 1) }
+  }
+
+fn with_length(buf: Bytes, length: Int) -> Bytes = if length < 0 { b"" } else { buf ++ b"z" }
+
+/// The buffer passed before an argument that reads it.
+fn passed(buf: Bytes, fuel: Int) -> Bytes =
+  if fuel <= 0 { buf } else { passed(with_length(buf, bytes_len(buf)), fuel - 1) }
+
+/// Each count bumped where it stands, the array passed before the argument that reads it.
+fn counted(c: Array<Int>, i: Int, n: Int) -> Array<Int> / {abort.raise} =
+  if i >= n { c } else { counted(array_set(c, i % 64, array_get(c, i % 64) + 1), i + 1, n) }
+
+fn shapes() -> List<String> =
+  [
+    "a step its caller holds alone",
+    "a branch beside one that reads the record whole",
+    "a branch beside one that reads the variable",
+    "a call with an argument after it that reads it",
+  ]
+
+/// `n` bytes appended one at a time through the shape named `name`.
+fn grown(name: String, n: Int) -> Bytes =
+  if name == "a step its caller holds alone" { pulled(stepping({ out: b"", n: n }), n) }
+  else if name == "a branch beside one that reads the record whole" {
+    beside_whole({ out: b"", n: 0 }, n)
+  } else if name == "a branch beside one that reads the variable" {
+    beside_read({ out: b"", n: 0 }, n)
+  } else { passed(b"", n) }
+
+test "through {s}, four times the appends allocate about four times the bytes" for s: String in shapes(
+  ) {
+  let small = metered(|| bytes_len(grown(s, 2000)));
+  let large = metered(|| bytes_len(grown(s, 8000)));
+  assert_eq(small.value, 2000);
+  assert_eq(large.value, 8000);
+  assert(
+    large.bytes < 6 * small.bytes,
+    Some(f"{small.bytes} bytes for 2000 appends, {large.bytes} for 8000"),
+  )
+}
+
+test "an array passed before the argument that reads it is set where it stands" {
+  let small = metered(|| array_get(counted(array_new(64, 0), 0, 2000), 0));
+  let large = metered(|| array_get(counted(array_new(64, 0), 0, 8000), 0));
+  assert_eq(small.value, 32);
+  assert_eq(large.value, 125);
+  assert(large.bytes < 2 * small.bytes, Some(f"{small.bytes} bytes, then {large.bytes}"))
+}
+
+test "a step called twice answers the same both times" {
+  let k = stepping({ out: b"ab", n: 3 });
+  assert_eq(pulled(k, 3), b"abxxx");
+  assert_eq(pulled(k, 3), b"abxxx");
+  assert_eq(pulled(k, 1), b"abx")
+}
+
+test "a variable or a field another path reads is there for it" {
+  let s: S = { out: b"cd", n: -1 };
+  assert_eq(beside_whole(s, 2), b"cd");
+  assert_eq(beside_read(s, 2), b"cd");
+  assert_eq(beside_whole({ out: b"cd", n: 1 }, 2), b"cdyy");
+  assert_eq(s.out, b"cd");
+  let buf = b"pq";
+  assert_eq(passed(buf, 2), b"pqzz");
+  assert_eq(buf, b"pq")
+}

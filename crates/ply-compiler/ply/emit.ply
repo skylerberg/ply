@@ -6,7 +6,8 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
              NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange, PxCtor, PxRecord,
              PxList, CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel,
              NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture,
-             CodeClause, CodeReturn, Own, Borrowed, Owned, lower_fn, irrefutable)
+             CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit, irrefutable, slots_read,
+             all_read)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
               parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
               SEnsures, SCost, FnDef, TDNominal, test_run, test_listing, IInstance, NGen,
@@ -1737,74 +1738,6 @@ fn secure_field(emitter: Emitter, base: Code, b: CValue, v: CValue) -> WithValue
       value: { kind: KBoxed, expr: t.value.expr, ty: v.ty },
     }
   }
-
-fn through_caps(reads: List<Int>, caps: List<Capture>) -> List<Int> =
-  fold(reads, [], |acc: List<Int>, s: Int|
-    match fold(caps, None, |found: Option<Int>, capture: Capture|
-        if capture.dst == s { Some(capture.src) } else { found }) {
-      Some(src) -> push(acc, src),
-      None -> acc,
-    })
-
-/// Every slot read, lambdas and clause bodies included: a name a barrier copies in is still a read.
-fn slots_read(code: Code) -> List<Int> =
-  match code.node {
-    NVar(v) -> match v.slot { Some(s) -> [s], None -> [] },
-    NLit(_) -> [],
-    NUnary(u) -> slots_read(u.operand),
-    NBinary(b) -> concat(slots_read(b.lhs), slots_read(b.rhs)),
-    NField(f) -> slots_read(f.base),
-    NApp(a) -> concat(slots_read(a.func), all_read(a.args)),
-    NIf(i) ->
-      concat(slots_read(i.cond), concat(slots_read(i.then_branch), slots_read(i.else_branch))),
-    NBlock(b) ->
-      concat(
-        fold(b.stmts, [], |acc: List<Int>, stmt: CodeStmt|
-          concat(acc, match stmt {
-            CLet(l) -> slots_read(l.value),
-            CLetPat(l) -> slots_read(l.value),
-            CDo(d) -> slots_read(d.code),
-          })),
-        match b.tail { Some(t) -> slots_read(t), None -> [] },
-      ),
-    NList(l) -> all_read(l.items),
-    NRecord(r) -> fields_read(r.fields, []),
-    NMatch(m) ->
-      concat(
-        slots_read(m.scrutinee),
-        fold(m.arms, [], |acc: List<Int>, a: CodeArm|
-          concat(
-            acc,
-            concat(match a.guard { Some(g) -> slots_read(g), None -> [] }, slots_read(a.body)),
-          )),
-      ),
-    NUpdate(u) -> fields_read(u.sets, slots_read(u.base)),
-    NLabel(_) -> [],
-    NPerform(p) -> concat(match p.label { Some(x) -> slots_read(x), None -> [] }, all_read(p.args)),
-    NCell(c2) -> concat(slots_read(c2.init), slots_read(c2.body)),
-    // A capture read inside a lambda is a read of the object it copies; the lambda's own parameter is not a read here.
-    NLambda(l) -> through_caps(slots_read(l.body), l.captures),
-    NSimulate(x) -> concat(map(x.captures, |c2: Capture| c2.src), slots_read(x.body)),
-    NParallel(pr) -> all_read(pr.branches),
-    NHandle(h) ->
-      concat(
-        slots_read(h.body),
-        concat(
-          fold(h.clauses, [], |acc: List<Int>, clause: CodeClause|
-            concat(
-              concat(acc, match clause.label { Some(x) -> slots_read(x), None -> [] }),
-              through_caps(slots_read(clause.body), clause.captures),
-            )),
-          match h.ret { Some(r) -> through_caps(slots_read(r.body), r.captures), None -> [] },
-        ),
-      ),
-  }
-
-fn all_read(codes: List<Code>) -> List<Int> =
-  fold(codes, [], |acc: List<Int>, code: Code| concat(acc, slots_read(code)))
-
-fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
-  fold(fs, before, |acc: List<Int>, field: CodeField| concat(acc, slots_read(field.value)))
 
 fn from_table(emitter: Emitter, literal: Lit) -> WithValue / {abort.raise} = {
   let c = const_of(emitter, literal);
@@ -5938,6 +5871,104 @@ fn local_of(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<Bytes> 
     },
   }
 
+/// What a slot reads as, with the type the prologue knows a parameter it did not open by.
+fn slot_value(emitter: Emitter, params: List<EmitParam>, s: Int) -> Option<CValue> =
+  match conv_of(emitter, s) {
+    Some(cv) -> Some(cv),
+    None -> match list_at(params, s) {
+      Some(p) -> if p.kind == KBoxed {
+        Some({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(s)), ty: p.ty })
+      } else { None },
+      None -> None,
+    },
+  }
+
+/// A statement that is a last read and nothing else: a slot's, or a field's through a record read
+/// after it.
+fn last_read(code: Code) -> Option<{ slot: Int, field: Option<Bytes> }> =
+  if code.own != Owned { None } else {
+    match code.node {
+      NVar(v) -> match v.slot { Some(s) -> Some({ slot: s, field: None }), None -> None },
+      NField(f) -> if f.base.own != Borrowed { None } else {
+        match f.base.node {
+          NVar(v) -> match v.slot {
+            Some(s) -> Some({ slot: s, field: Some(f.field) }),
+            None -> None,
+          },
+          _ -> None,
+        }
+      },
+      _ -> None,
+    }
+  }
+
+/// The count a slot's local holds let go, where this body holds it and no loop reads it again.
+fn released_slot(emitter: Emitter, s: Int, params: List<EmitParam>) -> Emitter =
+  match slot_value(emitter, params, s) {
+    Some(v) -> if emitter.release && v.kind == KBoxed && is_made(emitter, v.expr)
+        && !is_pinned(emitter, v.expr) { release_holder(spend_made(emitter, v.expr), v) }
+    else { emitter },
+    None -> emitter,
+  }
+
+/// A record's field let go where the record is its only holder, as a field's last read takes it:
+/// a count read out of the field before is then the only one. A record built here, or held back,
+/// keeps its fields.
+fn released_field(emitter: Emitter, s: Int, name: Bytes, params: List<EmitParam>) -> Emitter =
+  match slot_value(emitter, params, s) {
+    None -> emitter,
+    Some(v) -> if !emitter.release || v.kind != KBoxed || !is_made(emitter, v.expr)
+        || is_pinned(emitter, v.expr)
+        || deferred_of(emitter, v.expr) != None
+        || built_of(emitter, v.expr) != None { emitter } else {
+      match field_at(v.ty, name) {
+        Some(i) -> if i.kind != KBoxed { emitter } else {
+          let t = fresh(emitter);
+          line(
+            t.emitter,
+            bytes_concat_all([
+              b"if (ply_obj(",
+              v.expr,
+              b")->rc == 1) { Word ",
+              t.name,
+              b" = ply_words(",
+              v.expr,
+              b")[",
+              ascii_of_int(i.at),
+              b"]; ply_words(",
+              v.expr,
+              b")[",
+              ascii_of_int(i.at),
+              b"] = ply_unit; ply_dec(ctx, ",
+              t.name,
+              b"); }",
+            ]),
+          )
+        },
+        None -> {
+          let idx = field_of(emitter, name);
+          let t = fresh(idx.emitter);
+          check(
+            line(
+              t.emitter,
+              bytes_concat_all([
+                b"{ Word ",
+                t.name,
+                b" = rt_field_p(ctx, ",
+                v.expr,
+                b", @@f",
+                ascii_of_int(idx.i),
+                b"@@, 2); ply_dec(ctx, ",
+                t.name,
+                b"); }",
+              ]),
+            ),
+          )
+        },
+      }
+    },
+  }
+
 fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
     bytes_concat_all([
@@ -6000,18 +6031,31 @@ fn stmts(
             }
           },
         },
-        CDo(d) -> match expr(notail(emitter), d.code, params) {
-          None -> None,
-          Some(o) ->
+        // A last read standing alone, as a branch opens with, lets the count go without reading it.
+        CDo(d) -> match last_read(d.code) {
+          Some(r) ->
             stmts(
-              drop_value(
-                line(o.emitter, bytes_concat_all([b"(void)(", as_word(o.value), b");"])),
-                o.value,
-              ),
+              match r.field {
+                None -> released_slot(emitter, r.slot, params),
+                Some(name) -> released_field(emitter, r.slot, name, params),
+              },
               xs,
               params,
               i + 1,
             ),
+          None -> match expr(notail(emitter), d.code, params) {
+            None -> None,
+            Some(o) ->
+              stmts(
+                drop_value(
+                  line(o.emitter, bytes_concat_all([b"(void)(", as_word(o.value), b");"])),
+                  o.value,
+                ),
+                xs,
+                params,
+                i + 1,
+              ),
+          },
         },
       },
     }
@@ -8753,6 +8797,28 @@ test "a buffer read out of a record this body holds alone reaches its append uns
   assert(bytes_index_of(text(b"m.guarded"), b"t2 = 0;") == None, None)
 }
 
+test "a branch lets go as it opens of a parameter only another branch reads, and of a field read out before it" {
+  let src = bytes_concat_all([
+    b"type S = { out: Bytes, n: Int }\n",
+    b"fn whole(s: S) -> Int = s.n\n",
+    b"fn slot(x: Bytes, c: Bool) -> Int = if c { bytes_len(x) } else { 0 }\n",
+    b"fn field(s: S) -> Int = { let out = s.out; if s.n < 0 { whole(s) } else { bytes_len(out ++ b\"x\") + s.n } }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"bytes_len"], true);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  let text = |name: Bytes|
+    match filter(out, |e: Emitted| e.name == name) { [e, ..] -> e.text, [] -> b"" };
+  assert(bytes_index_of(text(b"m.slot"), b"} else {\n    ply_dec(ctx, p0); p0 = 0;") != None, None);
+  let field = text(b"m.field");
+  match bytes_index_of(field, b"if (ply_obj(p0)->rc == 1) { Word ") {
+    None -> assert(false, Some(string_of_bytes(field))),
+    Some(at) -> match bytes_index_of(field, b"rt_concat_p(") {
+      None -> assert(false, None),
+      Some(joined) -> assert(at < joined, None),
+    },
+  }
+}
+
 fn emit_all_program(
   sources: List<Source>,
   ctors: List<Bytes>,
@@ -9361,7 +9427,7 @@ fn prepare(
     known: known,
     body: def.body,
     code: if known && wants(wanted, full) {
-      match lower_fn(names, labels, sites, def.body) { Some(l) -> Some(l.code), None -> None }
+      match lower_to_emit(names, labels, sites, def.body) { Some(l) -> Some(l.code), None -> None }
     } else { None },
   }
 }
@@ -9536,8 +9602,9 @@ fn root_emitted(
     ps,
     known,
     body,
-    if known { match lower_fn(names, [], sites, body) { Some(l) -> Some(l.code), None -> None } }
-    else { None },
+    if known {
+      match lower_to_emit(names, [], sites, body) { Some(l) -> Some(l.code), None -> None }
+    } else { None },
   )
 
 fn emitted_from(
