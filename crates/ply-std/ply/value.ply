@@ -49,14 +49,15 @@ pub type Field = { name: String, value: Value }
 /// One key and value of a map value.
 pub type Entry = { key: Value, value: Value }
 
-/// A function as data. Only a generated one (constant, projection, table) can be called.
+/// A function as data. Only a generated one (constant, projection, table) can be called, and it
+/// takes at most 255 arguments.
 pub type Fun =
   | FNamed(String)
   | FAnonymous
-  | FConst({ arity: Int, value: Value })
-  | FProject({ arity: Int, index: Int })
+  | FConst({ arity: U8, value: Value })
+  | FProject({ arity: U8, index: U8 })
   /// The first entry whose key equals the first argument, else `default`.
-  | FTable({ arity: Int, entries: List<Entry>, default: Value })
+  | FTable({ arity: U8, entries: List<Entry>, default: Value })
 
 /// A list or a map shows this many items before the rest is counted.
 pub fn shown_items() -> Int = 32
@@ -90,7 +91,7 @@ fn rendered(v: Value, depth: Int, bounded: Bool) -> String =
       else { ctor_name(name) ++ "(" ++ join(map(args, inner), ", ") ++ ")" },
       VMap(entries) ->
         "{" ++ items_text(map(entries, |e: Entry| entry_text(e, depth, bounded)), bounded) ++ "}",
-      VFn(f) -> "<fn" ++ fun_text(f) ++ ">",
+      VFn(f) -> "<fn" ++ fun_text(f, inner) ++ ">",
       VCell(c) -> "<cell @" ++ int_to_string(c.index) ++ "." ++ int_to_string(c.generation) ++ ">",
       VTask(id) -> "<task @" ++ int_to_string(id) ++ ">",
       VChan(id) -> "<channel #" ++ int_to_string(id) ++ ">",
@@ -152,24 +153,25 @@ fn tuple_item(fields: List<Field>, i: Int, depth: Int, bounded: Bool) -> String 
     None -> "",
   }
 
-/// A generated function shows as the lambda it behaves as.
-fn fun_text(f: Fun) -> String =
+/// A generated function shows as the lambda it behaves as, each value in it as `inner` writes it.
+fn fun_text(f: Fun, inner: (Value) -> String) -> String =
   match f {
     FNamed(name) -> " " ++ name,
     FAnonymous -> "",
     FConst(c) ->
-      " |" ++ join(map(range(0, c.arity), |_: Int| "_"), ", ") ++ "| " ++ render(c.value),
-    FProject(p) -> " |" ++ params(p.arity) ++ "| x" ++ int_to_string(p.index),
-    FTable(t) -> " |" ++ params(t.arity) ++ "| " ++ table_text(t.entries, t.default),
+      " |" ++ join(map(range(0, int_of_u8(c.arity)), |_: Int| "_"), ", ") ++ "| " ++ inner(c.value),
+    FProject(p) -> " |" ++ params(p.arity) ++ "| x" ++ int_to_string(int_of_u8(p.index)),
+    FTable(t) -> " |" ++ params(t.arity) ++ "| " ++ table_text(t.entries, t.default, inner),
   }
 
-fn params(arity: Int) -> String = join(map(range(0, arity), |i: Int| "x" ++ int_to_string(i)), ", ")
+fn params(arity: U8) -> String =
+  join(map(range(0, int_of_u8(arity)), |i: Int| "x" ++ int_to_string(i)), ", ")
 
-fn table_text(entries: List<Entry>, default: Value) -> String =
-  fold(range(0, len(entries)), render(default), |acc: String, j: Int|
+fn table_text(entries: List<Entry>, default: Value, inner: (Value) -> String) -> String =
+  fold(range(0, len(entries)), inner(default), |acc: String, j: Int|
     match list_at(entries, len(entries) - 1 - j) {
       Some(e) ->
-        "if x0 == " ++ render(e.key) ++ " { " ++ render(e.value) ++ " } else { " ++ acc ++ " }",
+        "if x0 == " ++ inner(e.key) ++ " { " ++ inner(e.value) ++ " } else { " ++ acc ++ " }",
       None -> acc,
     })
 
@@ -470,8 +472,19 @@ test "render_all writes what render does, every item at every depth" {
     "[" ++ join(map(range(0, 40), |i: Int| int_to_string(i)), ", ") ++ "]",
   );
   assert(render(long) != render_all(long));
-  assert_eq(render_all(VCtor("m.Shipped", [VInt(2)])), "Shipped(2)")
+  assert_eq(render_all(VCtor("m.Shipped", [VInt(2)])), "Shipped(2)");
+  let made = VFn(FTable({ arity: 1u8, entries: [{ key: VInt(0), value: long }], default: long }));
+  assert_eq(
+    render_all(made),
+    "<fn |x0| if x0 == 0 { " ++ render_all(long) ++ " } else { " ++ render_all(long) ++ " }>",
+  )
 }
+
+law "render_all writes a value inside a list or a constructor as it writes the value alone"
+  forall (v: Value) {
+    render_all(VList([v])) == "[" ++ render_all(v) ++ "]"
+      && render_all(VCtor("m.Held", [v])) == "Held(" ++ render_all(v) ++ ")"
+  }
 
 test "a snapshot cut short shows where it was cut" {
   assert_eq(render(VList([VInt(1), VElided(5)])), "[1, … 5 more]");
@@ -501,13 +514,13 @@ test "a slot is filled with its value, and a slot naming none is kept" {
 test "a function shows as what it is" {
   assert_eq(render(VFn(FNamed("m.double"))), "<fn m.double>");
   assert_eq(render(VFn(FAnonymous)), "<fn>");
-  assert_eq(render(VFn(FConst({ arity: 2, value: VInt(3) }))), "<fn |_, _| 3>");
-  assert_eq(render(VFn(FProject({ arity: 2, index: 1 }))), "<fn |x0, x1| x1>");
+  assert_eq(render(VFn(FConst({ arity: 2u8, value: VInt(3) }))), "<fn |_, _| 3>");
+  assert_eq(render(VFn(FProject({ arity: 2u8, index: 1u8 }))), "<fn |x0, x1| x1>");
   assert_eq(
     render(
       VFn(
         FTable({
-          arity: 1,
+          arity: 1u8,
           entries: [{ key: VInt(1), value: VBool(true) }],
           default: VBool(false),
         }),

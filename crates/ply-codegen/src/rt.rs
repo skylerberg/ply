@@ -3915,7 +3915,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     }
                 }
                 ClosureKind::Synth { arity, rule } => {
-                    if args.len() != *arity {
+                    if args.len() != usize::from(*arity) {
                         let d = error(format!(
                             "a generated function takes {arity} arguments and was given {}",
                             args.len()
