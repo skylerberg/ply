@@ -18,6 +18,7 @@ import std.time (time)
 import compiler.embed (EmbedRead, EmbedWant)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
+import env (env)
 import walk (walk_room)
 import compiler.pkg (PackageSources, Supplied, wants)
 import paths
@@ -534,16 +535,20 @@ pub type PullReads = { lexed: Int, kept: Int }
 pub type KeptShipping = { shipping: Shipping, reads: PullReads }
 
 /// [`shipping_for`] with what each module's text says it pulls kept in the store of `paths`, under
-/// the text's digest: a load lexes only the texts it has not read before.
+/// the text's digest, and each shipped module as an importer reads it kept in the toolchain's
+/// ([`imported_reader`]): a load lexes only the texts it has not read before.
 pub fn shipping_kept(
   paths: List<paths::Resolved>,
   user: List<Source>,
   pkgs: PackageSources,
   every: Bool = false,
-) -> KeptShipping / {fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+) -> KeptShipping / {env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let listed = shipped_names();
-  let importing = imported_reader(paths);
-  let at = { label: importing.label, dir: importing.dir };
+  let importing = imported_reader();
+  let at = match list_at(paths, 0) {
+    Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/pulls").path },
+    None -> { label: "cwd", dir: ".ply-cache/pulls" },
+  };
   // What a module pulls is a function of its text and of the code that reads it.
   let reader = match fs.read_file[shipped]("definitions") {
     Some(definitions) ->
@@ -582,22 +587,15 @@ pub fn shipping_kept(
   } }
 }
 
-/// How the loads of a project read a shipped module for a module importing it: the store of the
-/// project, as the label it is reached by and the directory, and what that reading is a function of
-/// beside the text, empty where the binary says nothing of it and nothing is kept.
-pub type ImportedReader = { label: String, dir: String, importer: Bytes }
+/// How a load reads a shipped module for a module importing it: what that reading is a function of
+/// beside the text, empty where the binary says nothing of it and nothing is kept, and the
+/// toolchain's directory of what `ply` reuses (`env.reused`), where the spans it blanks are kept for
+/// every project on the machine, each under the text's digest and that reading's.
+pub type ImportedReader = { dir: String, importer: Bytes }
 
-/// The reader of the project at the first of `paths`.
-pub fn imported_reader(
-  paths: List<paths::Resolved>,
-) -> ImportedReader / {fs.read_file[shipped], abort.raise} = {
-  let at = match list_at(paths, 0) {
-    Some(r) -> { label: r.label, dir: paths::in_root(r, ".ply-cache/pulls").path },
-    None -> { label: "cwd", dir: ".ply-cache/pulls" },
-  };
+pub fn imported_reader() -> ImportedReader / {env.reused[sys], fs.read_file[shipped], abort.raise} =
   {
-    label: at.label,
-    dir: at.dir,
+    dir: under_abs(env.reused[sys]()),
     importer: match fs.read_file[shipped]("definitions") {
       Some(definitions) ->
         bytes_concat_all([
@@ -610,37 +608,34 @@ pub fn imported_reader(
       None -> b"",
     },
   }
-}
 
 /// A shipped module's `text` as a module importing it reads it (`compiler.interface.imported`).
 pub fn read_imported(
   r: ImportedReader,
   text: Bytes,
-) -> Bytes / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  if bytes_len(r.importer) == 0 { imported(text) }
-  else if r.label == "cwd" { kept_imported[cwd](r.dir, r.importer, text) }
-  else { kept_imported[abs](r.dir, r.importer, text) }
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+  if bytes_len(r.importer) == 0 { imported(text) } else { kept_imported(r.dir, r.importer, text) }
 
 /// The shipped module `name` as a module importing it reads it, or `None` where this binary ships no
 /// such module.
 pub fn shipped_imported(
   r: ImportedReader,
   name: Bytes,
-) -> Option<Bytes> / {fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
+) -> Option<Bytes> / {fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
   match fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply") {
     Some(text) -> Some(read_imported(r, text)),
     None -> None,
   }
 
 /// What an importer reads of a shipped module's text, the spans it blanks kept under the text's
-/// digest, so a load lexes only a text it has not read before.
-fn kept_imported<[r]>(
+/// digest, so the machine finds them once for each text and each binary's reading of it.
+fn kept_imported(
   dir: String,
   importer: Bytes,
   text: Bytes,
-) -> Bytes / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
+) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let key = hex(blake3(bytes_concat(importer, blake3(text))));
-  let kept = match read_kept[r](dir, key) {
+  let kept = match read_kept[abs](dir, key) {
     Some(bytes) -> match bin::decode(bytes, blanked_bin()) {
       Ok(b) -> if !fits(b.bounds, bytes_len(text)) { None } else {
         Some(
@@ -657,7 +652,7 @@ fn kept_imported<[r]>(
     None -> {
       let spans = unimported(text);
       let bounds = fold(spans, [], |acc: List<Int>, s: Span| push(push(acc, s.start), s.end));
-      write_kept[r](dir, key, bin::encode({ bounds: bounds }, blanked_bin()));
+      write_kept[abs](dir, key, bin::encode({ bounds: bounds }, blanked_bin()));
       spans
     },
   };
@@ -925,11 +920,11 @@ fn counted_load(
     }
   } }
 
-/// What a load of a module importing `std.count` through the store in `tree` read of `std.count`,
-/// and the store it left.
-fn kept_count(tree: MemFs) -> { text: Bytes, tree: MemFs } / {abort.raise} = {
-  let over = on_mem[cwd](tree, ||
-    on_mem[abs](mem_empty(), ||
+/// What a load of a module importing `std.count` read of `std.count`, with a fresh project store and
+/// the toolchain's store in `toolchain`, and the toolchain's store it left.
+fn kept_count(toolchain: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.raise} = {
+  let over = on_mem[cwd](mem_empty(), ||
+    on_mem[abs](toolchain, ||
       handle {
         shipping_kept(
           [],
@@ -937,29 +932,32 @@ fn kept_count(tree: MemFs) -> { text: Bytes, tree: MemFs } / {abort.raise} = {
           { root: b"", manifest: None, supplied: [] },
         )
       } with {
+        env.reused[sys]() -> "/reused",
         fs.list_dir[shipped](p) -> Some(["std.count.ply"]),
         fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(exercised()) }
         else if p == "definitions" { Some(b"front.pulls_of aa\ninterface.imported bb\n") }
         else { None },
         entropy.next() -> 7,
         time.now_ms() -> 0,
-      }).value);
+      })).value;
   {
     text: fold(over.value.shipping.read, b"", |acc: Bytes, source: Source|
       if source.name == b"std.count" { source.src } else { acc }),
-    tree: over.tree,
+    toolchain: over.tree,
   }
 }
 
-test "what an importer reads of a shipped module is kept, and a kept entry that does not fit is none" {
+test "what an importer reads of a shipped module is kept for every project, and a kept entry that does not fit is none" {
   let viewed = imported(exercised());
   let cold = kept_count(mem_empty());
   assert_eq(cold.text, viewed);
-  let kept = match mem_list(cold.tree, ".ply-cache/pulls") { Some(names) -> names, None -> [] };
-  assert(len(kept) > 0, Some("the load kept nothing"));
-  assert_eq(kept_count(cold.tree).text, viewed);
-  let spoiled = fold(kept, cold.tree, |t: MemFs, name: String|
-    mem_write(t, ".ply-cache/pulls/" ++ name, bin::encode({ bounds: [5, 2] }, blanked_bin())).fs);
+  let kept = match mem_list(cold.toolchain, "reused") { Some(names) -> names, None -> [] };
+  assert_eq(len(kept), 1);
+  let entry = "reused/" ++ at_or(kept, 0, "");
+  // Another project's first load reads what the toolchain kept, and finds nothing itself.
+  let planted = mem_write(cold.toolchain, entry, bin::encode({ bounds: [] }, blanked_bin())).fs;
+  assert_eq(kept_count(planted).text, exercised());
+  let spoiled = mem_write(cold.toolchain, entry, bin::encode({ bounds: [5, 2] }, blanked_bin())).fs;
   assert_eq(kept_count(spoiled).text, viewed)
 }
 
