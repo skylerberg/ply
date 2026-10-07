@@ -417,8 +417,9 @@ fn module_row(
 // holds: what a compiled package ships, and what the emitter reads of a module it does not lower.
 
 /// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span. It
-/// names the function whose body it blanks, which a stub is read only with a row and a hash for.
-pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes }
+/// names the function whose body it blanks, or with `test` the test (by its owner), which a stub is
+/// read only with a row and a hash for.
+pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes, test: Bool }
 
 derive bin for Cut
 
@@ -447,19 +448,68 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
             end: b.end,
             braced: true,
             name: qualify(parsed.name, d.name.name),
+            test: false,
           })
         }
       },
-      ITest(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
-      ILaw(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
+      ITest(d) ->
+        push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
+      ILaw(d) ->
+        push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
       _ -> acc,
     })
 }
 
-/// The cuts that blank a module's bodies and leave its tests and laws: a stub of a module whose own
-/// tests a load still answers for.
-pub fn body_cuts_of(parsed: ParsedModule) -> List<Cut> =
-  filter(cuts_of(parsed), |cut: Cut| cut.braced)
+/// Each test a stub blanks the body of, by its owner.
+pub fn blanked_tests(cuts: List<StubCuts>) -> List<Bytes> =
+  fold(cuts, [], |acc: List<Bytes>, s: StubCuts|
+    fold(s.cuts, acc, |a: List<Bytes>, c: Cut| if c.test { push(a, c.name) } else { a }))
+
+/// The cuts that blank a module's function and test bodies and leave the rest of each test, and its
+/// laws: a stub of a module whose own tests a load still answers for, each by its row and the hash
+/// its run fixed.
+pub fn body_cuts_of(parsed: ParsedModule) -> List<Cut> / {abort.raise} = {
+  let tested = fold(
+    parsed.module.items,
+    { cuts: [], position: 0 },
+    |acc: { cuts: List<Cut>, position: Int }, item: Item|
+      match item {
+        ITest(d) -> {
+          let b = expr_span(d.body);
+          {
+            cuts: if b.end - b.start < 2 { acc.cuts } else {
+              push(acc.cuts, {
+                start: b.start,
+                end: b.end,
+                braced: true,
+                name: test_owner(parsed.name, acc.position),
+                test: true,
+              })
+            },
+            position: acc.position + 1,
+          }
+        },
+        _ -> acc,
+      },
+  );
+  in_order(filter(cuts_of(parsed), |cut: Cut| cut.braced), tested.cuts)
+}
+
+/// Two runs of cuts, each in source order, as one.
+fn in_order(a: List<Cut>, b: List<Cut>) -> List<Cut> / {abort.raise} =
+  iterate(
+    { out: [], i: 0, j: 0 },
+    len(a) + len(b) + 1,
+    |x: { out: List<Cut>, i: Int, j: Int }|
+      match ((list_at(a, x.i), list_at(b, x.j))) {
+        (None, None) -> Stop(x),
+        (Some(c), None) -> Continue({ ..x, out: push(x.out, c), i: x.i + 1 }),
+        (None, Some(c)) -> Continue({ ..x, out: push(x.out, c), j: x.j + 1 }),
+        (Some(c), Some(d)) -> if c.start <= d.start {
+          Continue({ ..x, out: push(x.out, c), i: x.i + 1 })
+        } else { Continue({ ..x, out: push(x.out, d), j: x.j + 1 }) },
+      },
+  ).out
 
 fn def_row(def_info: DefInfo, w: Written) -> DefRow / {abort.raise} =
   {
@@ -1593,6 +1643,7 @@ fn known_from_rows(
   fixed: List<Fixed>,
   texts: List<Bytes>,
   blank: Map<Bytes, Bool>,
+  cut_tests: Map<Bytes, Bool>,
 ) -> Known / {abort.raise} = {
   let decls = by_name(hashes.decls);
   let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
@@ -1620,6 +1671,7 @@ fn known_from_rows(
       reads: by_name_names(hashes.deps),
       said: said_of(hashes),
       blank: blank,
+      cut_tests: cut_tests,
     }),
   }
 }
@@ -1737,7 +1789,7 @@ fn facts_filed(read: BodiesRead, owner: Bytes, at: Span) -> Bytes / {abort.raise
   }
 
 /// Each test's owner, in the order the tests were checked.
-fn test_owners(tests: List<TestInfo>) -> List<Bytes> =
+pub fn test_owners(tests: List<TestInfo>) -> List<Bytes> =
   fold(
     tests,
     { seen: map_new(), out: [] },
@@ -1944,7 +1996,7 @@ fn check_keys(checked: CheckOutput, hashes: HashOutput) -> Map<Bytes, Bytes> =
   )
 
 /// A test's, which is its hash where the checker keyed nothing.
-fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {abort.raise} =
+pub fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {abort.raise} =
   match list_at(checked.test_checks, i) {
     Some(k) -> if bytes_len(k) > 0 { k } else { at(hashes.tests, i) },
     None -> at(hashes.tests, i),
@@ -2531,6 +2583,8 @@ fn hashed_closure(
           let built = build_index(x.mods, x.r);
           if len(built.diags) > 0 { Err(map(built.diags, outside_every_module)) } else {
             // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
+            // A stub blanks the body of each test it cuts: each is hashed as its run fixed it, or not
+            // at all.
             let hashed = hashed_and_unused(
               built.index,
               ifaces.fixed,
@@ -2538,26 +2592,46 @@ fn hashed_closure(
               priors,
               ifaces.tests,
               ifaces.laws,
+              blanked_tests(concat(ifaces.cuts, cuts)),
             );
-            Ok({
-              mods: x.mods,
-              r: x.r,
-              index: built.index,
-              hashes: hashed.hashes,
-              unused: hashed.unused,
-              clo: clo,
-              packages: tables.pkgs,
-              module_packages: tables.module_packages,
-              root_count: root_count,
-              ifaces: ifaces,
-              embeds: embeds,
-              texts: map(parsed, |p: ParsedSource| p.src),
-              cuts: fold(
-                concat(ifaces.cuts, cuts),
-                map_new(),
-                |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
-              ),
-            })
+            if len(hashed.unheld) > 0 {
+              Err([
+                outside_every_module(
+                  error_at(
+                    b"E0505",
+                    0,
+                    dummy_span(),
+                    bytes_concat_all([
+                      b"the test `",
+                      at(hashed.unheld, 0),
+                      b"`, of a module read as its stub, has no hash its run fixed",
+                    ]),
+                    b"its body is blank",
+                    [b"this is Ply's fault: a stub stands only where each of its tests was fixed"],
+                  ),
+                ),
+              ])
+            } else {
+              Ok({
+                mods: x.mods,
+                r: x.r,
+                index: built.index,
+                hashes: hashed.hashes,
+                unused: hashed.unused,
+                clo: clo,
+                packages: tables.pkgs,
+                module_packages: tables.module_packages,
+                root_count: root_count,
+                ifaces: ifaces,
+                embeds: embeds,
+                texts: map(parsed, |p: ParsedSource| p.src),
+                cuts: fold(
+                  concat(ifaces.cuts, cuts),
+                  map_new(),
+                  |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
+                ),
+              })
+            }
           }
         },
       }
@@ -2583,6 +2657,9 @@ fn checked_closure(
       h.texts,
       fold(h.ifaces.stubs, map_new(), |acc: Map<Bytes, Bool>, stub: Source|
         map_insert(acc, stub.name, true)),
+      map_fold(h.cuts, map_new(), |acc: Map<Bytes, Bool>, _: Bytes, cuts: List<Cut>|
+        fold(cuts, acc, |a: Map<Bytes, Bool>, c: Cut|
+          if c.test { map_insert(a, c.name, true) } else { a })),
     ),
   );
   if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
@@ -4901,8 +4978,8 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
       cuts: [
-        { start: 115, end: 126, braced: true, name: b"m.say" },
-        { start: 127, end: 152, braced: false, name: b"" },
+        { start: 115, end: 126, braced: true, name: b"m.say", test: false },
+        { start: 127, end: 152, braced: false, name: b"", test: false },
       ],
     },
   ])
