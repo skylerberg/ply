@@ -42,6 +42,7 @@ pub mod sched;
 pub mod semantics;
 pub mod sim;
 mod span;
+pub mod sqlite;
 pub mod task_regions;
 pub mod trace;
 mod value;
