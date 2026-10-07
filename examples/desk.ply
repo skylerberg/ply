@@ -12,12 +12,15 @@ import std.net
 import std.ip
 // Twice, and both are needed: the selective import binds the effect name, so that a row and a
 // perform can both say `db.query[items]`, and the plain import binds the module, so that a type
-// can say `db::Answer` and a call can say `db::transaction`.
+// can say `sql::Answer` and a call can say `db::transaction`.
 import std.db
+import std.sql
 import std.db (db, with_server)
 import std.random (entropy)
 import std.json
 import std.http
+import std.seq
+import std.seq (Seq)
 import std.router
 // Tracing, configuration and the stop signal, each twice for the reason above.
 import std.trace
@@ -46,7 +49,7 @@ effect set Serving = {Desk, trace.enter[http], trace.exit[http], trace.event[htt
 /// What the *entry point* performs, which is `Serving` without the database: a run reads where to
 /// reach its database and serves every `db` operation from there, so no row names `db` and a host
 /// needs no database of its own.
-effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
+effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
 // A task per connection, when the settings ask for one.
 // The line that says which port the desk landed on.
 
@@ -81,87 +84,26 @@ derive json for Problem
 derive json for Health
 derive json for Readiness
 
-/// The storage format.
-pub type RowError = { column: String, expected: String, found: String }
-
-pub type RowCodec<a> = {
-  columns: List<String>,
-  decode: (db::Row) -> Result<a, RowError> / {abort.raise},
-  params: (a) -> List<db::Param> / {abort.raise},
-}
-
-fn row_and_then<a, b | e>(
-  r: Result<a, RowError>,
-  f: (a) -> Result<b, RowError> / e,
-) -> Result<b, RowError> / e = match r { Ok(x) -> f(x), Err(e) -> Err(e) }
-
-fn wrong(k: String, want: String) -> RowError = { column: k, expected: want, found: "another type" }
-
-fn text_at(r: db::Row, k: String) -> Result<String, RowError> =
-  match map_get(r, k) { Some(db::CText(s)) -> Ok(s), _ -> Err(wrong(k, "text")) }
-
-fn int_at(r: db::Row, k: String) -> Result<Int, RowError> =
-  match map_get(r, k) { Some(db::CInt(n)) -> Ok(n), _ -> Err(wrong(k, "bigint")) }
-
-fn numeric_at(r: db::Row, k: String) -> Result<Decimal, RowError> =
-  match map_get(r, k) { Some(db::CNumeric(d)) -> Ok(d), _ -> Err(wrong(k, "numeric")) }
-
-/// A `jsonb` column read back through the type's own json codec, which is what makes the wire format
-/// and the storage format one text rather than two.
-fn json_at<a>(r: db::Row, k: String, c: json::JsonCodec<a>) -> Result<a, RowError> / {abort.raise} =
-  match map_get(r, k) {
-    Some(db::CJson(j)) -> match (c.decode)(j) {
-      Ok(x) -> Ok(x),
-      Err(_) -> Err(wrong(k, "a well-formed " ++ k ++ " document")),
-    },
-    _ -> Err(wrong(k, "jsonb")),
-  }
-
-fn item_row() -> RowCodec<Item> =
-  {
-    columns: ["sku", "name", "price", "on_hand"],
-    decode: |r: db::Row|
-      row_and_then(text_at(r, "sku"), |sku: String|
-        row_and_then(text_at(r, "name"), |name: String|
-          row_and_then(numeric_at(r, "price"), |price: Decimal|
-            row_and_then(int_at(r, "on_hand"), |on_hand: Int|
-              Ok({ sku: sku, name: name, price: price, on_hand: on_hand }))))),
-    params: |i: Item|
-      [db::PText(i.sku), db::PText(i.name), db::PNumeric(i.price), db::PInt(i.on_hand)],
-  }
-
-fn order_row() -> RowCodec<Order> =
-  {
-    columns: ["id", "customer", "lines", "total", "state"],
-    decode: |r: db::Row|
-      row_and_then(int_at(r, "id"), |id: Int|
-        row_and_then(text_at(r, "customer"), |customer: String|
-          row_and_then(json_at(r, "lines", json::list_json(line_json())), |lines: List<Line>|
-            row_and_then(numeric_at(r, "total"), |total: Decimal|
-              row_and_then(json_at(r, "state", state_json()), |state: State|
-                Ok({ id: id, customer: customer, lines: lines, total: total, state: state })))))),
-    params: |o: Order|
-      [
-        db::PInt(o.id),
-        db::PText(o.customer),
-        lines_param(o.lines),
-        db::PNumeric(o.total),
-        state_param(o.state),
-      ],
-  }
+// The storage format, which nobody wrote either: a column per field, and a field that is not a
+// scalar is a `jsonb` document read through its own JSON codec, so what the desk stores and what
+// it sends are one text.
+derive row for Item
+derive row for Order
 
 // --- The schema, which is a value ------------------------------------------------
 
-pub fn schema() -> db::Schema =
+/// A `const fn` of `std.sql.Schema`, so the check holds every statement the desk runs to it: a
+/// column misspelled in one is an error before anything runs.
+pub const fn schema() -> sql::Schema =
   {
     tables: [
       {
         name: "items",
         columns: [
-          { name: "sku", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "name", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "price", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone },
-          { name: "on_hand", ty: db::TInt, nullable: false, default: db::DNone },
+          { name: "sku", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "name", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "price", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
+          { name: "on_hand", ty: sql::TInt, nullable: false, default: sql::DNone },
         ],
         primary_key: ["sku"],
         unique: [],
@@ -171,11 +113,11 @@ pub fn schema() -> db::Schema =
       {
         name: "orders",
         columns: [
-          { name: "id", ty: db::TInt, nullable: false, default: db::DSequence("orders_id_seq") },
-          { name: "customer", ty: db::TText, nullable: false, default: db::DNone },
-          { name: "lines", ty: db::TJson, nullable: false, default: db::DNone },
-          { name: "total", ty: db::TNumeric(12, 2), nullable: false, default: db::DNone },
-          { name: "state", ty: db::TJson, nullable: false, default: db::DNone },
+          { name: "id", ty: sql::TInt, nullable: false, default: sql::DSequence("orders_id_seq") },
+          { name: "customer", ty: sql::TText, nullable: false, default: sql::DNone },
+          { name: "lines", ty: sql::TJson, nullable: false, default: sql::DNone },
+          { name: "total", ty: sql::TNumeric(12, 2), nullable: false, default: sql::DNone },
+          { name: "state", ty: sql::TJson, nullable: false, default: sql::DNone },
         ],
         primary_key: ["id"],
         unique: [],
@@ -310,100 +252,91 @@ fn accept_of(configured: Option<String>) -> Result<Accept, String> =
 
 // --- The statements ---------------------------------------------------------------
 
-fn items_all() -> db::Stmt = db::stmt("select sku, name, price, on_hand from items order by sku")
+fn items_all() -> sql::Stmt = sql::stmt("select sku, name, price, on_hand from items order by sku")
 
 /// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
 /// rows on the wire, no parameters to bind.
-fn store_reachable() -> db::Stmt = db::stmt("select count(*) from items")
+fn store_reachable() -> sql::Stmt = sql::stmt("select count(*) from items")
 
-fn items_in_stock() -> db::Stmt =
-  db::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
+fn items_in_stock() -> sql::Stmt =
+  sql::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
 
-fn item_by_sku() -> db::Stmt =
-  db::stmt("select sku, name, price, on_hand from items where sku = $1")
+fn item_by_sku() -> sql::Stmt =
+  sql::stmt("select sku, name, price, on_hand from items where sku = $1")
 
-fn item_insert() -> db::Stmt =
-  db::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
+fn item_insert() -> sql::Stmt =
+  sql::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
 
 /// The reservation, and the only interesting statement in the file.
-fn item_reserve() -> db::Stmt =
-  db::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
+fn item_reserve() -> sql::Stmt =
+  sql::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
 
-fn orders_all() -> db::Stmt =
-  db::stmt("select id, customer, lines, total, state from orders order by id")
+fn orders_all() -> sql::Stmt =
+  sql::stmt("select id, customer, lines, total, state from orders order by id")
 
-fn order_by_id() -> db::Stmt =
-  db::stmt("select id, customer, lines, total, state from orders where id = $1")
+fn order_by_id() -> sql::Stmt =
+  sql::stmt("select id, customer, lines, total, state from orders where id = $1")
 
 /// The id is the database's.
-fn order_insert() -> db::Stmt =
-  db::stmt(
+fn order_insert() -> sql::Stmt =
+  sql::stmt(
     "insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
       ++ " returning id, customer, lines, total, state",
   )
 
 /// No compare-and-set on `state`, and the reason is worth writing down because it is a design
 /// decision the twin forced rather than a shortcut.
-fn order_cancel() -> db::Stmt = db::stmt("update orders set state = $1 where id = $2")
+fn order_cancel() -> sql::Stmt = sql::stmt("update orders set state = $1 where id = $2")
 
 // --- Reading a result set ----------------------------------------------------------
 
-fn rows_of<a>(ans: db::Answer, c: RowCodec<a>) -> Result<List<a>, http::Response> / {abort.raise} =
-  match ans {
-    db::Rows(rows) -> decoded(rows, c),
-    db::Count(_) -> Err(problem(500, "unreadable answer", "a query answered a count")),
-    db::Failed(e) -> Err(unavailable(e)),
+/// The rows a fetch read, or the problem a client is told of in their place.
+fn listed<a>(
+  read: Result<List<a>, sql::Unread>,
+) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
+  match read {
+    Ok(xs) -> Ok(xs),
+    Err(sql::Refused(e)) -> Err(unavailable(e)),
+    Err(sql::Counted(_)) -> Err(problem(500, "unreadable answer", "a query answered a count")),
+    Err(sql::Misread(e)) ->
+      Err(
+        problem(
+          500,
+          "unreadable row",
+          e.column ++ ": expected " ++ e.expected ++ ", found " ++ e.found,
+        ),
+      ),
   }
-
-fn decoded<a>(
-  rows: List<db::Row>,
-  c: RowCodec<a>,
-) -> Result<List<a>, http::Response> / {abort.raise} =
-  fold(rows, Ok([]), |acc: Result<List<a>, http::Response>, r: db::Row|
-    match acc {
-      Err(p) -> Err(p),
-      Ok(xs) -> match (c.decode)(r) {
-        Ok(x) -> Ok(push(xs, x)),
-        Err(e) ->
-          Err(
-            problem(
-              500,
-              "unreadable row",
-              e.column ++ ": expected " ++ e.expected ++ ", found " ++ e.found,
-            ),
-          ),
-      },
-    })
 
 fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 
 /// A SQLSTATE the desk has no answer for.
-fn unavailable(e: db::DbError) -> http::Response / {abort.raise} =
+fn unavailable(e: sql::DbError) -> http::Response<| {}> / {abort.raise} =
   problem(503, "the store is unavailable", e.code)
 
-fn shelf() -> Result<List<Item>, http::Response> / {db.query[items], abort.raise} =
-  rows_of(db.query[items](items_all(), []), item_row())
+fn shelf() -> Result<List<Item>, http::Response<| {}>> / {db.query[items], abort.raise} =
+  listed(db::fetch[items](items_all(), item_row(), []))
 
-fn book() -> Result<List<Order>, http::Response> / {db.query[orders], abort.raise} =
-  rows_of(db.query[orders](orders_all(), []), order_row())
+fn book() -> Result<List<Order>, http::Response<| {}>> / {db.query[orders], abort.raise} =
+  listed(db::fetch[orders](orders_all(), order_row(), []))
 
 fn order_row_of(
   id: Int,
-) -> Result<Option<Order>, http::Response> / {db.query[orders], abort.raise} = {
-  let os = rows_of(db.query[orders](order_by_id(), [db::PInt(id)]), order_row())?;
+) -> Result<Option<Order>, http::Response<| {}>> / {db.query[orders], abort.raise} = {
+  let os = listed(db::fetch[orders](order_by_id(), order_row(), [sql::PInt(id)]))?;
   Ok(head_of(os))
 }
 
 /// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value built by the codec
 /// this file already derived.
-fn lines_param(lines: List<Line>) -> db::Param / {abort.raise} = {
+fn lines_param(lines: List<Line>) -> sql::Param / {abort.raise} = {
   let c = json::list_json(line_json());
-  db::PJson((c.encode)(lines))
+  sql::PJson((c.encode)(lines))
 }
 
-fn state_param(s: State) -> db::Param / {abort.raise} = {
+fn state_param(s: State) -> sql::Param / {abort.raise} = {
   let c = state_json();
-  db::PJson((c.encode)(s))
+  sql::PJson((c.encode)(s))
 }
 
 // --- The business, which touches nothing ----------------------------------------
@@ -509,17 +442,21 @@ fn int_field(name: String, value: Int) -> { key: String, value: trace::Field } =
 fn json_headers() -> http::Headers = map_of_entries([field("content-type", "application/json")])
 
 /// The dictionary is an argument.
-fn json_body<a>(status: Int, x: a, codec: json::JsonCodec<a>) -> http::Response / {abort.raise} =
-  { status: status, headers: json_headers(), body: json::encode_bytes(x, codec) }
+fn json_body<a>(
+  status: Int,
+  x: a,
+  codec: json::JsonCodec<a>,
+) -> http::Response<| {}> / {abort.raise} =
+  { status: status, headers: json_headers(), body: http::Whole(json::encode_bytes(x, codec)) }
 
-fn problem(status: Int, error: String, detail: String) -> http::Response / {abort.raise} =
+fn problem(status: Int, error: String, detail: String) -> http::Response<| {}> / {abort.raise} =
   json_body(status, { error: error, detail: detail }, problem_json())
 
-fn text(status: Int, body: Bytes) -> http::Response =
+fn text(status: Int, body: Bytes) -> http::Response<| {}> =
   {
     status: status,
     headers: map_of_entries([field("content-type", "text/plain; charset=utf-8")]),
-    body: body,
+    body: http::Whole(body),
   }
 
 fn join(xs: List<String>) -> String =
@@ -529,14 +466,14 @@ fn join(xs: List<String>) -> String =
 
 // --- Liveness and readiness, which are two different questions --------------------
 
-pub fn health() -> http::Response / {abort.raise} =
+pub fn health() -> http::Response<| {}> / {abort.raise} =
   json_body(200, { service: "parts desk", routes: len(table()) }, health_json())
 
 /// 503 while draining, 503 while the store is unreachable, 200 otherwise.
-pub fn ready() -> http::Response / {db.query[items], signal.stopping, abort.raise} =
+pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
     match db.query[items](store_reachable(), []) {
-      db::Rows(_) ->
+      sql::Rows(_) ->
         json_body(
           200,
           { service: "parts desk", store: "reachable", stopping: false },
@@ -544,12 +481,12 @@ pub fn ready() -> http::Response / {db.query[items], signal.stopping, abort.rais
         ),
       // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
       // client's action is the same whichever code the server sent, and an operator's is not.
-      db::Failed(e) -> unready(e.code, false),
-      db::Count(_) -> unready("unreadable answer", false),
+      sql::Failed(e) -> unready(e.code, false),
+      sql::Count(_) -> unready("unreadable answer", false),
     }
   }
 
-fn unready(store: String, stopping: Bool) -> http::Response / {abort.raise} =
+fn unready(store: String, stopping: Bool) -> http::Response<| {}> / {abort.raise} =
   json_body(503, { service: "parts desk", store: store, stopping: stopping }, readiness_json())
 
 /// Also pure: the pages are definitions, not rows, so serving one touches nothing.
@@ -560,7 +497,7 @@ fn pages() -> Map<String, String> =
     { key: "orders/cancelling", value: "DELETE /orders/{id} puts the lines back on the shelf" },
   ])
 
-pub fn docs(params: Map<String, String>) -> http::Response / {abort.raise} =
+pub fn docs(params: Map<String, String>) -> http::Response<| {}> / {abort.raise} =
   match map_get(params, "page") {
     None -> problem(404, "no such page", "the pages are: " ++ join(map_keys(pages()))),
     Some(p) -> match map_get(pages(), p) {
@@ -569,20 +506,22 @@ pub fn docs(params: Map<String, String>) -> http::Response / {abort.raise} =
     },
   }
 
-pub fn list_items() -> http::Response / {db.query[items], abort.raise} =
+pub fn list_items() -> http::Response<| {}> / {db.query[items], abort.raise} =
   match shelf() { Err(r) -> r, Ok(rows) -> json_body(200, rows, json::list_json(item_json())) }
 
 /// Everything the shelf is short of.
-pub fn featured() -> http::Response / {db.query[items], abort.raise} =
-  match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
+pub fn featured() -> http::Response<| {}> / {db.query[items], abort.raise} =
+  match listed(db::fetch[items](items_in_stock(), item_row(), [sql::PInt(0)])) {
     Err(r) -> r,
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
 
-pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items], abort.raise} =
+pub fn get_item(
+  params: Map<String, String>,
+) -> http::Response<| {}> / {db.query[items], abort.raise} =
   match map_get(params, "sku") {
     None -> problem(400, "bad request", "no sku was captured"),
-    Some(sku) -> match rows_of(db.query[items](item_by_sku(), [db::PText(sku)]), item_row()) {
+    Some(sku) -> match listed(db::fetch[items](item_by_sku(), item_row(), [sql::PText(sku)])) {
       Err(r) -> r,
       Ok(rows) -> match head_of(rows) {
         Some(i) -> json_body(200, i, item_json()),
@@ -591,10 +530,12 @@ pub fn get_item(params: Map<String, String>) -> http::Response / {db.query[items
     },
   }
 
-pub fn list_orders() -> http::Response / {db.query[orders], abort.raise} =
+pub fn list_orders() -> http::Response<| {}> / {db.query[orders], abort.raise} =
   match book() { Err(r) -> r, Ok(rows) -> json_body(200, rows, json::list_json(order_json())) }
 
-pub fn get_order(params: Map<String, String>) -> http::Response / {db.query[orders], abort.raise} =
+pub fn get_order(
+  params: Map<String, String>,
+) -> http::Response<| {}> / {db.query[orders], abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) -> match order_row_of(id) {
@@ -608,7 +549,7 @@ pub fn get_order(params: Map<String, String>) -> http::Response / {db.query[orde
 
 /// `Some` for every route whose pattern declared `{id:Int}`, because nothing else could have
 /// matched.
-fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> / {abort.raise} =
+fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response<| {}>> / {abort.raise} =
   match router::int_param(params, "id") {
     Some(id) -> Ok(id),
     None -> Err(problem(400, "bad order id", "an order id is one or more digits")),
@@ -616,7 +557,7 @@ fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> / {a
 
 // --- The two that are transactions --------------------------------------------------
 
-pub fn place_order(body: Bytes) -> http::Response / {Desk, abort.raise} =
+pub fn place_order(body: Bytes) -> http::Response<| {}> / {Desk, abort.raise} =
   match json::decode_bytes(body, placement_json()) {
     Err(e) -> problem(400, "malformed body", json::error_to_string(e)),
     Ok(p) -> placed(p),
@@ -624,7 +565,7 @@ pub fn place_order(body: Bytes) -> http::Response / {Desk, abort.raise} =
 
 /// The two refusals that need no database are answered before one is opened, so a malformed order
 /// costs no connection and no `BEGIN`.
-fn placed(p: Placement) -> http::Response / {Desk, abort.raise} =
+fn placed(p: Placement) -> http::Response<| {}> / {Desk, abort.raise} =
   if len(p.lines) == 0 { problem(422, "empty order", "an order needs at least one line") }
   else if bad_qty(p.lines) {
     problem(422, "bad quantity", "every line needs a quantity above zero")
@@ -634,7 +575,7 @@ fn placed(p: Placement) -> http::Response / {Desk, abort.raise} =
 
 /// The span that shows where a placement's time went, and the one place in this file where a span is
 /// *not* closed by the program.
-fn placing(p: Placement) -> http::Response / {Desk, abort.raise} = {
+fn placing(p: Placement) -> http::Response<| {}> / {Desk, abort.raise} = {
   let span = trace.enter[orders](
     "reserving",
     map_of_entries([text_field("customer", p.customer), int_field("lines", len(p.lines))]),
@@ -653,15 +594,14 @@ fn recorded(
   p: Placement,
   stock: List<Item>,
   total: Decimal,
-) -> http::Response / {Desk, abort.raise} =
-  match rows_of(
-      db.returning[orders](order_insert(), [
-        db::PText(p.customer),
+) -> http::Response<| {}> / {Desk, abort.raise} =
+  match listed(
+      db::fetch_returning[orders](order_insert(), order_row(), [
+        sql::PText(p.customer),
         lines_param(p.lines),
-        db::PNumeric(total),
+        sql::PNumeric(total),
         state_param(Open),
       ]),
-      order_row(),
     ) {
     Err(r) -> r,
     Ok(rows) -> match head_of(rows) {
@@ -720,24 +660,28 @@ fn moving(
 
 /// Three answers, and each one is a different thing to have happened.
 fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
-  match db.execute[items](item_reserve(), [db::PInt(to), db::PText(i.sku), db::PInt(i.on_hand)]) {
-    db::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
-    db::Failed(_) -> db.rollback(i.sku),
+  match db.execute[items](item_reserve(), [
+      sql::PInt(to),
+      sql::PText(i.sku),
+      sql::PInt(i.on_hand),
+    ]) {
+    sql::Count(n) -> if n == 1 { () } else { db.rollback(i.sku) },
+    sql::Failed(_) -> db.rollback(i.sku),
     _ -> db.rollback(i.sku),
   }
 
 /// What `db::transaction` hands back, turned into a response.
 fn settled(
-  out: Result<http::Response, db::Rollback>,
+  out: Result<http::Response<| {}>, db::Rollback>,
   error: String,
-) -> http::Response / {abort.raise} =
+) -> http::Response<| {}> / {abort.raise} =
   match out {
     Ok(r) -> r,
     Err(rb) -> match rb.error { Some(e) -> unavailable(e), None -> problem(409, error, rb.reason) },
   }
 
 /// `Serializable`, and it is the only endpoint that asks for it.
-pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk, abort.raise} =
+pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Desk, abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
@@ -747,7 +691,7 @@ pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk, abor
       ),
   }
 
-fn cancelling(id: Int) -> http::Response / {Desk, abort.raise} =
+fn cancelling(id: Int) -> http::Response<| {}> / {Desk, abort.raise} =
   match order_row_of(id) {
     Err(r) -> r,
     Ok(found) -> match found {
@@ -762,15 +706,15 @@ fn cancelling(id: Int) -> http::Response / {Desk, abort.raise} =
 /// A `DELETE` that raced another one and lost affects no row here, because the order it read is gone
 /// from under it; that answers 409 without a rollback — nothing had been written, so there is
 /// nothing to discard and committing an empty transaction is the honest end of it.
-fn cancelled_now(o: Order) -> http::Response / {Desk, abort.raise} =
-  match db.execute[orders](order_cancel(), [state_param(Cancelled), db::PInt(o.id)]) {
-    db::Count(n) -> if n == 1 { restocked(o) }
+fn cancelled_now(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
+  match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::PInt(o.id)]) {
+    sql::Count(n) -> if n == 1 { restocked(o) }
     else { problem(409, "already cancelled", int_to_string(o.id)) },
-    db::Failed(e) -> unavailable(e),
+    sql::Failed(e) -> unavailable(e),
     _ -> problem(500, "unreadable answer", "an update returned rows"),
   }
 
-fn restocked(o: Order) -> http::Response / {Desk, abort.raise} =
+fn restocked(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
   match shelf() {
     Err(r) -> r,
     Ok(stock) -> {
@@ -858,7 +802,9 @@ fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
 // --- Dispatch ---------------------------------------------------------------------
 
 /// A buffered answer, or a head and a cursor the connection pulls.
-pub type Reply = | Buffered(http::Response) | Stream({ head: http::Response, cursor: Cursor })
+pub type Reply =
+  | Buffered(http::Response<| {}>)
+  | Stream({ head: http::Response<| {}>, cursor: Cursor })
 
 pub fn receipt(
   params: Map<String, String>,
@@ -977,7 +923,7 @@ fn dispatched(
     Featured -> Buffered(featured()),
     GetItem -> Buffered(get_item(params)),
     ListOrders -> Buffered(list_orders()),
-    PlaceOrder -> Buffered(place_order(req.body)),
+    PlaceOrder -> Buffered(place_order(http::whole_bytes(req.body))),
     GetOrder -> Buffered(get_order(params)),
     CancelOrder -> Buffered(cancel_order(params)),
     Receipt -> receipt(params),
@@ -999,7 +945,7 @@ pub fn answer(req: http::Request) -> Reply / {Serving, abort.raise} =
 /// computing the `Content-Length` the same request would have produced under `GET`.
 fn routed_method(m: http::Method) -> http::Method = match m { http::Head -> http::Get, _ -> m }
 
-fn server_options() -> http::Response / {abort.raise} =
+fn server_options() -> http::Response<| {}> / {abort.raise} =
   {
     status: 204,
     headers: map_of_entries([
@@ -1008,36 +954,41 @@ fn server_options() -> http::Response / {abort.raise} =
         join(map(router::declared_methods(table()), |m: http::Method| http::method_name(m))),
       ),
     ]),
-    body: b"",
+    body: http::Whole(b""),
   }
 
 /// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and the methods come from the matcher rather than
 /// from a list written here — sorted and deduplicated by `route`, so the field cannot disagree with
 /// the table it was derived from.
-fn method_not_allowed(ms: List<http::Method>) -> http::Response / {abort.raise} =
+fn method_not_allowed(ms: List<http::Method>) -> http::Response<| {}> / {abort.raise} =
   {
     status: 405,
     headers: map_of_entries([
       field("content-type", "application/json"),
       field("allow", join(map(ms, |m: http::Method| http::method_name(m)))),
     ]),
-    body: json::encode_bytes(
-      {
-        error: "method not allowed",
-        detail: "this path is served by " ++ join(map(ms, |m: http::Method| http::method_name(m))),
-      },
-      problem_json(),
+    body: http::Whole(
+      json::encode_bytes(
+        {
+          error: "method not allowed",
+          detail: "this path is served by "
+            ++ join(map(ms, |m: http::Method| http::method_name(m))),
+        },
+        problem_json(),
+      ),
     ),
   }
 
 /// Every route, buffered — the shape a test drives and the shape `http::serve` would take as its
 /// `app`.
-pub fn app(req: http::Request) -> http::Response / {Serving, abort.raise} = collapse(answer(req))
+pub fn app(req: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
+  collapse(answer(req))
 
-pub fn collapse(r: Reply) -> http::Response =
+pub fn collapse(r: Reply) -> http::Response<| {}> =
   match r {
     Buffered(response) -> response,
-    Stream(s) -> { status: s.head.status, headers: s.head.headers, body: drained(s.cursor) },
+    Stream(s) ->
+      { status: s.head.status, headers: s.head.headers, body: http::Whole(drained(s.cursor)) },
   }
 
 // --- The connection ------------------------------------------------------------------
@@ -1228,7 +1179,11 @@ fn answered<| e>(
       ),
     // The one route that writes as it produces.
     Stream(s) ->
-      http::respond_chunked[conn](c, h.request.version, s.head, keep, l, s.cursor, next_chunk),
+      http::respond[conn](c, l, h.request.method, h.request.version, keep, {
+        status: s.head.status,
+        headers: s.head.headers,
+        body: http::chunked(cursor_chunks(s.cursor)),
+      }),
   };
   if wrote && keep {
     // Pipelined requests are answered in order by construction: one connection, one task, and the
@@ -1243,6 +1198,14 @@ fn answered<| e>(
 fn streamable(m: http::Method, r: Reply) -> Reply =
   match m { http::Head -> Buffered(collapse(r)), _ -> r }
 
+/// A cursor's chunks as a stream, each made as it is pulled.
+fn cursor_chunks(c: Cursor) -> Seq<Bytes | {}> =
+  seq::unfold(c, |at: Cursor|
+    match next_chunk(at) {
+      None -> None,
+      Some(step) -> Some({ value: step.chunk, next: step.next }),
+    })
+
 /// The head's request with the body and the trailers it was framed with.
 fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request =
   {
@@ -1254,8 +1217,9 @@ fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request =
     version: h.request.version,
     headers: h.request.headers,
     trailers: trailers,
-    body: body,
+    body: http::Whole(body),
     peer: h.request.peer,
+    client_certificate: h.request.client_certificate,
   }
 
 fn write_out(
@@ -1264,7 +1228,7 @@ fn write_out(
   m: http::Method,
   v: http::Version,
   keep: Bool,
-  r: http::Response,
+  r: http::Response<| {}>,
 ) -> Unit / {net.send[conn], abort.raise} = {
   send_all[conn](c, http::encode(m, v, keep, r), l.write_timeout_ms);
   ()
@@ -1388,7 +1352,7 @@ pub fn twin<a | e>(
   with_cell[store](stocked(seed_shelf(), seed_orders())) { c -> {
     with_cell[sink](trace::sink()) { t -> {
       with_cell[stop](signal::running()) { s -> {
-        let step = |q: db::Stmt, ps: List<db::Param>| {
+        let step = |q: sql::Stmt, ps: List<sql::Param>| {
           let o = db::step(cell_get(c), q, ps);
           cell_set(c, o.db);
           o.out
@@ -1532,18 +1496,18 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.rai
       stepped(d, item_insert(), item_row().params(i))),
     |d: db::MemDb, o: Order|
       stepped(d, order_insert(), [
-        db::PText(o.customer),
+        sql::PText(o.customer),
         lines_param(o.lines),
-        db::PNumeric(o.total),
+        sql::PNumeric(o.total),
         state_param(o.state),
       ]),
   )
 
 /// A step whose answer must be a success.
-fn stepped(d: db::MemDb, s: db::Stmt, ps: List<db::Param>) -> db::MemDb / {abort.raise} = {
+fn stepped(d: db::MemDb, s: sql::Stmt, ps: List<sql::Param>) -> db::MemDb / {abort.raise} = {
   let out = db::step(d, s, ps);
   match out.out {
-    db::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
+    sql::Failed(e) -> panic("the fixture would not load: " ++ e.code ++ " " ++ e.detail),
     _ -> out.db,
   }
 }
@@ -1555,19 +1519,13 @@ pub fn shelf_of(d: db::MemDb) -> List<Item> / {abort.raise} = read_out(d, items_
 
 pub fn book_of(d: db::MemDb) -> List<Order> / {abort.raise} = read_out(d, orders_all(), order_row())
 
-fn read_out<a>(d: db::MemDb, s: db::Stmt, c: RowCodec<a>) -> List<a> / {abort.raise} = {
-  let out = db::step(d, s, []);
-  match out.out {
-    db::Rows(rows) ->
-      fold(rows, [], |acc: List<a>, r: db::Row|
-        match (c.decode)(r) {
-          Ok(x) -> push(acc, x),
-          Err(e) -> panic("a row would not decode: " ++ e.column),
-        }),
-    db::Failed(e) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
-    _ -> panic("a query answered a count"),
+fn read_out<a>(d: db::MemDb, s: sql::Stmt, c: sql::RowCodec<a>) -> List<a> / {abort.raise} =
+  match sql::decoded(db::step(d, s, []).out, c) {
+    Ok(xs) -> xs,
+    Err(sql::Misread(e)) -> panic("a row would not decode: " ++ e.column),
+    Err(sql::Refused(e)) -> panic("a read of the twin failed: " ++ e.code ++ " " ++ e.detail),
+    Err(sql::Counted(_)) -> panic("a query answered a count"),
   }
-}
 
 // --- Tests: the business, which needs no handler at all ----------------------------
 
@@ -1703,7 +1661,7 @@ fn against<a | e>(
 ) -> Ran<a> / {abort.raise, signal.stopping | e} =
   with_cell[store](d) { c -> {
     with_cell[sink](trace::sink()) { t -> {
-      let step = |q: db::Stmt, ps: List<db::Param>| {
+      let step = |q: sql::Stmt, ps: List<sql::Param>| {
         let o = db::step(cell_get(c), q, ps);
         cell_set(c, o.db);
         o.out
@@ -1783,11 +1741,14 @@ fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.
 /// The desk as `examples/desk.sql` seeds it.
 fn stock() -> db::MemDb / {abort.raise} = stocked(seed_shelf(), seed_orders())
 
-fn served_by(m: http::Method, path: String, body: Bytes) -> Ran<http::Response> / {abort.raise} =
-  under(stock(), || app(request(m, path, body)))
+fn served_by(
+  m: http::Method,
+  path: String,
+  body: Bytes,
+) -> Ran<http::Response<| {}>> / {abort.raise} = under(stock(), || app(request(m, path, body)))
 
 /// A placement, with the key.
-fn posted(body: String) -> Ran<http::Response> / {abort.raise} =
+fn posted(body: String) -> Ran<http::Response<| {}>> / {abort.raise} =
   under(stock(), || app(authorized_request(http::Post, "/orders", bytes_of_string(body))))
 
 fn request(m: http::Method, path: String, body: Bytes) -> http::Request =
@@ -1800,8 +1761,9 @@ fn request(m: http::Method, path: String, body: Bytes) -> http::Request =
     version: http::Http11,
     headers: map_new(),
     trailers: map_new(),
-    body: body,
+    body: http::Whole(body),
     peer: None,
+    client_certificate: None,
   }
 
 /// A request carrying the key the twin is configured with.
@@ -1815,8 +1777,9 @@ fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Reque
     version: http::Http11,
     headers: map_of_entries([field("x-api-key", twin_key())]),
     trailers: map_new(),
-    body: body,
+    body: http::Whole(body),
     peer: None,
+    client_certificate: None,
   }
 
 /// The names of the records a run produced, in order.
@@ -1825,13 +1788,14 @@ fn recorded_names(rs: List<trace::Record>) -> List<String> = map(rs, |r: trace::
 fn outcomes_of(rs: List<trace::Record>) -> List<trace::Outcome> =
   map(filter(rs, |r: trace::Record| r.kind == trace::KExit), |r: trace::Record| r.outcome)
 
-fn body_string(r: http::Response) -> String / {abort.raise} = string_of_bytes(r.body)
+fn body_string(r: http::Response<| {}>) -> String / {abort.raise} =
+  string_of_bytes(http::whole_bytes(r.body))
 
 test "GET /health is pure and counts the table it is served from" {
   let r = served_by(http::Get, "/health", b"");
   assert_eq(r.out.status, 200);
   assert_eq(
-    json::decode_bytes(r.out.body, health_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), health_json()),
     Ok({ service: "parts desk", routes: 11 }),
   );
   // Pure means pure: the store this request was handed is the store it left.
@@ -1853,7 +1817,10 @@ test "list_items reaches one table, and the type is what says so" {
     handle {
       let r = list_items();
       assert_eq(r.status, 200);
-      assert_eq(json::decode_bytes(r.body, json::list_json(item_json())), Ok(seed_shelf()))
+      assert_eq(
+        json::decode_bytes(http::whole_bytes(r.body), json::list_json(item_json())),
+        Ok(seed_shelf()),
+      )
     } with {
       db.query[items](s, ps) -> {
         let o = db::step(cell_get(c), s, ps);
@@ -1867,7 +1834,10 @@ test "list_items reaches one table, and the type is what says so" {
 test "GET /items reads the shelf and answers it in sku order" {
   let r = served_by(http::Get, "/items", b"");
   assert_eq(r.out.status, 200);
-  assert_eq(json::decode_bytes(r.out.body, json::list_json(item_json())), Ok(seed_shelf()))
+  assert_eq(
+    json::decode_bytes(http::whole_bytes(r.out.body), json::list_json(item_json())),
+    Ok(seed_shelf()),
+  )
 }
 
 // The literal route, which shares a resource with `/items/{sku}` and a footprint with it too: two
@@ -1878,7 +1848,10 @@ test "GET /items/featured is the shelf minus what is out of stock" {
   let r = under(stocked(push(seed_shelf(), flange), []), ||
     app(request(http::Get, "/items/featured", b"")));
   assert_eq(r.out.status, 200);
-  assert_eq(json::decode_bytes(r.out.body, json::list_json(item_json())), Ok(seed_shelf()))
+  assert_eq(
+    json::decode_bytes(http::whole_bytes(r.out.body), json::list_json(item_json())),
+    Ok(seed_shelf()),
+  )
 }
 
 test "GET /items/{sku} answers the item, and 404s the one nobody stocks" {
@@ -1886,7 +1859,7 @@ test "GET /items/{sku} answers the item, and 404s the one nobody stocks" {
   let missing = served_by(http::Get, "/items/sprocket", b"");
   assert_eq(missing.out.status, 404);
   assert_eq(
-    json::decode_bytes(missing.out.body, problem_json()),
+    json::decode_bytes(http::whole_bytes(missing.out.body), problem_json()),
     Ok({ error: "no such item", detail: "sprocket" }),
   )
 }
@@ -1901,7 +1874,10 @@ test "a sku that looks like an injection is a value and nothing else" {
 test "GET /orders reads the order book and answers it in id order" {
   let r = served_by(http::Get, "/orders", b"");
   assert_eq(r.out.status, 200);
-  assert_eq(json::decode_bytes(r.out.body, json::list_json(order_json())), Ok(seed_orders()))
+  assert_eq(
+    json::decode_bytes(http::whole_bytes(r.out.body), json::list_json(order_json())),
+    Ok(seed_orders()),
+  )
 }
 
 test "GET /orders/{id:Int} answers one order, and an unparseable id routes nowhere" {
@@ -1912,7 +1888,7 @@ test "GET /orders/{id:Int} answers one order, and an unparseable id routes nowhe
   let unrouted = served_by(http::Get, "/orders/seven", b"");
   assert_eq(unrouted.out.status, 404);
   assert_eq(
-    json::decode_bytes(unrouted.out.body, problem_json()),
+    json::decode_bytes(http::whole_bytes(unrouted.out.body), problem_json()),
     Ok({ error: "no such route", detail: "/orders/seven" }),
   )
 }
@@ -1924,7 +1900,7 @@ test "POST /orders prices the lines, draws the shelf down and records a line" {
   let r = posted("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}");
   assert_eq(r.out.status, 201);
   assert_eq(
-    json::decode_bytes(r.out.body, order_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), order_json()),
     Ok({ id: 3, customer: "hedy", lines: [{ sku: "widget", qty: 2 }], total: 25.00m, state: Open }),
   );
   assert_eq(
@@ -1956,7 +1932,7 @@ test "an order the shelf cannot cover writes nothing and says which sku" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}");
   assert_eq(r.out.status, 409);
   assert_eq(
-    json::decode_bytes(r.out.body, problem_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), problem_json()),
     Ok({ error: "out of stock", detail: "widget" }),
   );
   assert_eq(r.shelf, seed_shelf());
@@ -1993,7 +1969,7 @@ test "a rolled-back placement consumes the order number it was given" {
   });
   assert_eq(r.out.status, 201);
   assert_eq(
-    json::decode_bytes(r.out.body, order_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), order_json()),
     Ok({ id: 4, customer: "hedy", lines: [{ sku: "widget", qty: 2 }], total: 25.00m, state: Open }),
   );
   assert_eq(len(r.book), 3)
@@ -2015,7 +1991,7 @@ test "an order naming nothing on the shelf is refused before anything is written
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"sprocket\",\"qty\":1}]}");
   assert_eq(r.out.status, 404);
   assert_eq(
-    json::decode_bytes(r.out.body, problem_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), problem_json()),
     Ok({ error: "no such item", detail: "sprocket" }),
   );
   assert_eq(r.book, seed_orders())
@@ -2025,7 +2001,7 @@ test "a body that does not fit the type is refused by field and reason" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":\"two\"}]}");
   assert_eq(r.out.status, 400);
   assert_eq(
-    json::decode_bytes(r.out.body, problem_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), problem_json()),
     Ok({ error: "malformed body", detail: "$.lines[0].qty: expected a number, found a string" }),
   );
   // A body that never parsed opened no transaction, so there is nothing to roll back and nothing
@@ -2073,14 +2049,17 @@ test "GET /health is 200 with no store, no clock and no stop flag in reach" {
   // `health`'s row is empty.
   let r = health();
   assert_eq(r.status, 200);
-  assert_eq(json::decode_bytes(r.body, health_json()), Ok({ service: "parts desk", routes: 11 }))
+  assert_eq(
+    json::decode_bytes(http::whole_bytes(r.body), health_json()),
+    Ok({ service: "parts desk", routes: 11 }),
+  )
 }
 
 test "GET /ready is 200 when the store answers and nobody has asked it to stop" {
   let r = served_by(http::Get, "/ready", b"");
   assert_eq(r.out.status, 200);
   assert_eq(
-    json::decode_bytes(r.out.body, readiness_json()),
+    json::decode_bytes(http::whole_bytes(r.out.body), readiness_json()),
     Ok({ service: "parts desk", store: "reachable", stopping: false }),
   );
   // A readiness poll is one aggregate and leaves nothing behind.
@@ -2095,7 +2074,7 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
     let r = ready();
     assert_eq(r.status, 503);
     assert_eq(
-      json::decode_bytes(r.body, readiness_json()),
+      json::decode_bytes(http::whole_bytes(r.body), readiness_json()),
       Ok({ service: "parts desk", store: "57P01", stopping: false }),
     );
     // The same process, the same moment, the same outage.
@@ -2103,7 +2082,7 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
   } with {
     // Two clauses, because `ready`'s row is two atoms.
     db.query[items](q, ps) ->
-      db::Failed({ code: "57P01", constraint: "", detail: "terminating connection" }),
+      sql::Failed({ code: "57P01", constraint: "", detail: "terminating connection" }),
     signal.stopping() -> false,
   }
 }
@@ -2113,7 +2092,7 @@ test "a draining desk answers 503 before it stops accepting, and asks no databas
     let r = ready();
     assert_eq(r.status, 503);
     assert_eq(
-      json::decode_bytes(r.body, readiness_json()),
+      json::decode_bytes(http::whole_bytes(r.body), readiness_json()),
       Ok({ service: "parts desk", store: "draining", stopping: true }),
     );
     assert_eq(health().status, 200)
@@ -2152,8 +2131,9 @@ test "POST /orders takes the configured key and refuses every other request" {
       version: http::Http11,
       headers: map_of_entries([field("x-api-key", "guess")]),
       trailers: map_new(),
-      body: bytes_of_string(body),
+      body: http::Whole(bytes_of_string(body)),
       peer: None,
+      client_certificate: None,
     }));
   assert_eq(guessed.out.status, 401);
   assert_eq(guessed.book, seed_orders());
@@ -2191,7 +2171,7 @@ test "the configured credential appears in no response, no field and no record" 
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":1}]}");
   assert_eq(r.out.status, 201);
   let key = bytes_of_string(twin_key());
-  assert_eq(bytes_index_of(r.out.body, key), None);
+  assert_eq(bytes_index_of(http::whole_bytes(r.out.body), key), None);
   assert_eq(bytes_index_of(bytes_of_string(join(recorded_names(r.records))), key), None);
   assert_eq(bytes_index_of(bytes_of_string(rendered_fields(r.records)), key), None)
 }
@@ -2483,7 +2463,7 @@ test "GET /orders/{id}/receipt streams, and a missing order does not" {
       match receipt(map_of_entries([{ key: "id", value: "1" }])) {
         Stream(s) -> {
           assert_eq(s.head.status, 200);
-          assert_eq(s.head.body, b"")
+          assert_eq(http::whole_bytes(s.head.body), b"")
         },
         Buffered(_) -> panic("an order that exists is streamed"),
       };
@@ -2537,8 +2517,8 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
         {
           wrote: bytes_concat_all(cell_get(sent)),
           // How many *responses* were written, counted as the writes that begin with a status line:
-          // `send_all` writes a buffered response in one, and `respond_chunked` writes a head and then
-          // chunks that begin with a hex size.
+          // `send_all` writes a buffered response in one, and `http::respond` writes a stream's head
+          // and then chunks that begin with a hex size.
           sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
           closes: cell_get(closes),
           shelf: ran.shelf,
@@ -3067,7 +3047,7 @@ pub fn lines_of(ws: List<Want>) -> List<Line> =
 
 /// Through the whole route — the key check, the decode and the span — so the law covers what a
 /// client actually reaches rather than starting after it.
-pub fn placed_over(ws: List<Want>) -> Ran<http::Response> / {abort.raise} =
+pub fn placed_over(ws: List<Want>) -> Ran<http::Response<| {}>> / {abort.raise} =
   under(stocked(seed_shelf(), []), ||
     app(
       authorized_request(
@@ -3107,7 +3087,9 @@ law "a placement the shelf can cover moves the shelf by exactly the drawdown"
 pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
   let r = under(stock(), || app(request(http::Get, "/orders/" ++ int_to_string(id), b"")));
   match order_by(seed_orders(), id) {
-    Some(o) -> r.out.status == 200 && json::decode_bytes(r.out.body, order_json()) == Ok(o),
+    Some(o) ->
+      r.out.status == 200
+        && json::decode_bytes(http::whole_bytes(r.out.body), order_json()) == Ok(o),
     None -> r.out.status == 404,
   }
 }

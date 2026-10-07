@@ -3,13 +3,15 @@
 //! load reads the front-end cache before it analyses and files the answer after, so a run checks
 //! what moved since the last one and takes the rest from its rows.
 
+import env (env)
 import compiler.load (LoadedAnalysis, tell_viewed)
 import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
-import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
-                       ShippedView, analyse_pulling_std_with, dump_of, embeds_now, filing,
-                       module_items, module_imports, no_rows, pins_pulling, rows_of)
+import compiler.front (Refused, Analysed, Analysis, Moved, Pulled, Rows, DefInterface, Shipping,
+                       ShippedView, Within, analyse_pulling_std_with, dump_of, dump_within,
+                       embeds_now, filing, module_items, module_imports, no_rows, pins_pulling,
+                       rows_of)
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import compiler.interface (CompiledPackage, CompiledModule, Original, merged_interfaces)
 import interfaces
@@ -34,7 +36,7 @@ import builder (builder)
 import loads
 import loads (Sources, SourceFile, SourcePackage, Recorded, StdlibMoved, ShippedEntry)
 import std.random (entropy)
-import std.list (concat, push_unique)
+import std.list (concat, contains, push_unique)
 import std.string (join)
 import compiler.parsing (no_module)
 
@@ -182,6 +184,7 @@ fn front_end(
   embeds: List<Embed>,
   priors: List<Prior>,
   reached: Bool,
+  moved: List<Moved>,
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
@@ -197,6 +200,7 @@ fn front_end(
     data: shipping.data,
     asked: shipping.asked,
     pulls: shipping.pulls,
+    moved: moved,
   )
 
 /// Seeded with what the load published, so only what the splice moved is walked again.
@@ -215,6 +219,7 @@ pub fn reanalysed(
     program.embeds,
     analysis.hashes.priors,
     program.reached,
+    [],
   )
 
 fn analysed(
@@ -269,6 +274,7 @@ fn analysed_through(
     project.embeds,
     priors,
     reached,
+    mine.moved,
   );
   let shipped_places = map(pulled.pulled, |n: Bytes|
     shipped_place(texts, string_of_bytes_lossy(n)));
@@ -278,32 +284,40 @@ fn analysed_through(
     map_insert(acc, source.name, true));
   let stubbed = fold(mine.through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
     fold(p.modules, acc, |a: Map<Bytes, Bool>, m: CompiledModule| map_insert(a, m.name, true)));
-  // The check that kept a module's stub showed its measures, and its text and all it reaches stand.
-  let fresh = |m: Bytes| map_contains(own, m) && !map_contains(stubbed, m);
   let refused = |ds: List<Diag>| { ..broken(project, shipping, places, ds), viewed: pulled.viewed };
   match pulled.out {
     Refused(ds) -> loaded(refused(ds)),
-    Analysed(w) -> if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
-      { program: broken(project, shipping, places, []), starved: true }
-    } else {
-      match unshown(w, fresh) {
-        [] -> {
-          let warnings = interfaces::warned_with(w.mods, w.warnings, mine);
-          loaded({
-            files: project.files,
-            places: places,
-            diags: warnings,
-            cache_warnings: [],
-            whole: Some({ ..w, warnings: warnings }),
-            pkgs: pkgs,
-            through: read,
-            embeds: project.embeds,
-            shipping: shipping,
-            reached: reached,
-            viewed: pulled.viewed,
-          })
-        },
-        missing -> loaded(refused(map(missing, undescended))),
+    Analysed(w) -> {
+      // The check that kept a module's stub showed its measures, and its text and all it reaches
+      // stand; a stub the load read whole again is fresh.
+      let fresh = |m: Bytes|
+        map_contains(own, m) && (!map_contains(stubbed, m) || contains(w.restored, m));
+      if len(mine.through) > 0 && len(measures_in(w, fresh)) > 0 {
+        { program: broken(project, shipping, places, []), starved: true }
+      } else {
+        match unshown(w, fresh) {
+          [] -> {
+            let warnings = interfaces::warned_with(
+              w.mods,
+              w.warnings,
+              interfaces::standing_own(mine, w.restored),
+            );
+            loaded({
+              files: project.files,
+              places: places,
+              diags: warnings,
+              cache_warnings: [],
+              whole: Some({ ..w, warnings: warnings }),
+              pkgs: pkgs,
+              through: interfaces::through_standing(read, w.restored),
+              embeds: project.embeds,
+              shipping: shipping,
+              reached: reached,
+              viewed: pulled.viewed,
+            })
+          },
+          missing -> loaded(refused(map(missing, undescended))),
+        }
       }
     },
   }
@@ -337,7 +351,7 @@ fn assembled(
   rows: Rows,
   through: List<CompiledPackage> = [],
   priors: List<Prior> = [],
-  own: interfaces::Own = { through: [], names: [], warned: [] },
+  own: interfaces::Own = { through: [], names: [], warned: [], moved: [] },
   reached: Bool = true,
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
@@ -721,7 +735,7 @@ pub fn load_program(
   paths: List<paths::Resolved>,
   interfaced: Bool = true,
   verify: Bool = false,
-) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+) -> Program / {env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
   let shipping: Shipping = if usable(project) {
     shipping_kept(paths, project.sources, pkgs_of(project)).shipping
@@ -785,15 +799,22 @@ pub fn load_uncached(
 
 /// What the load answered, for the machine to read rather than load again. The dump carries the
 /// load's warnings, the cache's among them, so a command the machine reports for says them too.
-pub fn front_of(timed: Timed, analysis: Analysis) -> LoadedAnalysis / {abort.raise} =
+/// `within` scopes it to what a run of tests enters (`dump_within`).
+pub fn front_of(
+  timed: Timed,
+  analysis: Analysis,
+  within: Option<Within> = None,
+) -> LoadedAnalysis / {abort.raise} = {
+  let told = { ..analysis, warnings: load_diagnostics(timed.program) };
   {
-    dump: dump_of(Analysed({ ..analysis, warnings: load_diagnostics(timed.program) })),
+    dump: match within { Some(w) -> dump_within(told, w), None -> dump_of(Analysed(told)) },
     files: placed_sources(timed.program, analysis),
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
     file_ms: timed.file_ms,
     cached: timed.cached,
   }
+}
 
 /// The front end a command's test hands an effect that takes one: these tests read what a report
 /// says about what they were given, so nothing loads, and the record exists only because the
@@ -808,7 +829,7 @@ pub fn timed_load(
   interfaced: Bool = true,
   verify: Bool = false,
   every: Bool = false,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+) -> Timed / {env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   timed_over(paths, load_resolved(paths), started, interfaced, verify, every: every)
 }
@@ -825,7 +846,7 @@ pub fn timed_over(
   verify: Bool = false,
   own: Bool = false,
   every: Bool = false,
-) -> Timed / {builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
+) -> Timed / {env.reused[sys], builder.git[vcs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
   let interfaced = interfaced && !every;
   let found: KeptShipping = if usable(project) {
     shipping_kept(paths, project.sources, pkgs_of(project), every)
@@ -952,15 +973,16 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
   fold(labels, None, |acc: Option<Label>, label: Label|
     match acc { Some(_) -> acc, None -> if label.primary { Some(label) } else { None } })
 
-/// What a run answers for: its root package's modules, and the shipped ones when it asks for them.
-/// Another package's definitions are claimed by their specs: that package's own run proves them.
+/// What a run answers for: its root package's modules, and the standard library's when it asks for
+/// them. Another package's definitions are claimed by their specs: that package's own run proves
+/// them, as the compiler's own run proves the compiler's.
 pub fn owned_of(analysis: Analysis, std: Bool) -> (Bytes) -> Bool = {
   let roots = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
     match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
       (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, m.name, true) } else { acc },
       _ -> acc,
     });
-  |m: Bytes| map_contains(roots, m) || (std && is_shipped(string_of_bytes_lossy(m)))
+  |m: Bytes| map_contains(roots, m) || (std && is_std(string_of_bytes_lossy(m)))
 }
 
 /// A diagnostic raised inside a module the project did not write, which is the shipped modules'
@@ -1141,6 +1163,30 @@ test "a shipped module's text is said to live under its root, outside the identi
   assert_eq(pseudo_path("std.json"), "<std>/json.ply");
   assert_eq(pseudo_path("std.http.server"), "<std>/http/server.ply");
   assert_eq(pseudo_path("compiler.fmt"), "<compiler>/fmt.ply")
+}
+
+test "under `--std` a proof answers for the standard library's claims and never the compiler's" {
+  let w = match analyse_pulling_std_with(
+      [
+        {
+          name: b"m",
+          src: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
+        },
+      ],
+      [
+        { name: b"std.y", src: b"pub fn one() -> Int = 1\n" },
+        { name: b"compiler.x", src: b"pub fn one() -> Int = 1\n" },
+      ],
+      [],
+      [],
+      reached: false,
+    ).out {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  };
+  let owned = owned_of(w, true);
+  assert(owned(b"m") && owned(b"std.y") && !owned(b"compiler.x"));
+  assert(!owned_of(w, false)(b"std.y"))
 }
 
 test "a shipped module is one under a reserved root and nothing else" {

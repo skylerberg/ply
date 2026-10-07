@@ -10,7 +10,7 @@ import std.random (entropy)
 import std.time (time)
 import std.bytes (hex_of)
 import compiler.diagnostics (parse_all)
-import compiler.front (Analysed, Refused, Analysis, KnownDefRow, Rows, Shipping, analyse)
+import compiler.front (Analysed, Refused, Analysis, KnownDefRow, Moved, Rows, Shipping, analyse)
 import compiler.hash (Fixed, FixedTest, FixedLaw)
 import compiler.interface (CompiledPackage, CompiledModule, Envelope, Original, compile_package,
                            valid_part, answered_part, held_moved, module_key, module_of,
@@ -19,7 +19,7 @@ import compiler.interface (CompiledPackage, CompiledModule, Envelope, Original, 
 import compiler.embed (EmbedRead, EmbedReader)
 import compiler.pkg (PackageSources, closure, registry_dir)
 import compiler.resolve (Diag, Label, Edit, Fix, ParsedModule, Source, error_at, diag_bin)
-import std.list (at, concat, sort_by)
+import std.list (at, concat, contains, sort_by)
 import store.engine (fresh_nonce)
 import store.twin (on_twin)
 import loads (Place)
@@ -73,7 +73,10 @@ pub fn read_through<[r]>(
       Ok(p) -> {
         let keys = with_embeds(keys_of(found), p.modules, read);
         let held = held_moved(p, keys, shipped.read, shipped.unread, shipped.data);
-        let standing = answered_part(valid_part(p, keys, held));
+        let standing = answered_part(
+          valid_part(p, keys, held),
+          map(shipped.read, |s: Source| s.name),
+        );
         { packages: if len(standing.modules) == 0 { [] } else { [standing] }, held: held }
       },
     },
@@ -97,7 +100,8 @@ pub fn refreshed<[r]>(
   let covered = fold(through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
     fold(p.modules, acc, |a: Map<Bytes, Bool>, compiled: CompiledModule|
       map_insert(a, compiled.name, true)));
-  if fold(held, true, |all: Bool, n: Bytes| all && map_contains(covered, n)) { () } else {
+  let stands = |n: Bytes| map_contains(covered, n) && !contains(analysis.restored, n);
+  if fold(held, true, |all: Bool, n: Bytes| all && stands(n)) { () } else {
     kept[r](
       place,
       package_name(),
@@ -114,15 +118,27 @@ pub fn refreshed<[r]>(
 /// Beside the package, under the same semantics.
 fn own_name() -> String = package_name() ++ ".own"
 
-/// `names` is each module a warning's labels and fixes count, by the index they count it under.
-type OwnKept = { kept: KeptModules, names: List<Bytes>, warned: List<Diag> }
+/// `names` is each module a warning's labels and fixes count, by the index they count it under, and
+/// `forms` each module's `written_form` as it was kept.
+type OwnKept = {
+  kept: KeptModules,
+  names: List<Bytes>,
+  warned: List<Diag>,
+  forms: List<{ name: Bytes, form: Bytes }>,
+}
 
 derive bin for OwnKept
 
-/// The root package's modules a load reads as stubs, and what the check that kept them warned of them.
-pub type Own = { through: List<CompiledPackage>, names: List<Bytes>, warned: List<Diag> }
+/// The root package's modules a load reads as stubs, what the check that kept them warned of them,
+/// and what it kept of each module it kept that the load reads from source.
+pub type Own = {
+  through: List<CompiledPackage>,
+  names: List<Bytes>,
+  warned: List<Diag>,
+  moved: List<Moved>,
+}
 
-pub fn no_own() -> Own = { through: [], names: [], warned: [] }
+pub fn no_own() -> Own = { through: [], names: [], warned: [], moved: [] }
 
 /// The root package's modules as they stand now, named as a load names them.
 pub fn own_originals(pkgs: PackageSources, roots: List<Source>) -> List<Original> =
@@ -134,7 +150,8 @@ fn warned_in(diag: Diag) -> Int =
 
 /// The root package's modules that still stand as the last check kept them, each read as its stub:
 /// its bodies blanks that `rows` answer for, its tests and laws as written. `found` is every module
-/// the load may read.
+/// the load may read. A stub stands whatever moved of the root package it imports: the load reads it
+/// whole again where what it references there moved (`moved`).
 pub fn own_through<[r]>(
   place: Place,
   found: List<Original>,
@@ -147,10 +164,30 @@ pub fn own_through<[r]>(
     Some(bytes) -> match bin::decode(bytes, own_kept_bin()) {
       Err(_) -> no_own(),
       Ok(k) -> {
-        let through = standing_modules(k.kept, found, rows, read, held);
+        let through = standing_modules(
+          k.kept,
+          found,
+          rows,
+          read,
+          held,
+          deferred: map(k.kept.modules, |m: CompiledModule| m.name),
+        );
         let standing = fold(through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
           fold(p.modules, acc, |a: Map<Bytes, Bool>, compiled: CompiledModule|
             map_insert(a, compiled.name, true)));
+        let forms = fold(
+          k.forms,
+          map_new(),
+          |acc: Map<Bytes, Bytes>, f: { name: Bytes, form: Bytes }| map_insert(acc, f.name, f.form),
+        );
+        let fixed = fold(k.kept.fixed, map_new(), |acc: Map<Bytes, List<Fixed>>, f: Fixed| {
+          let module = module_of(f.name);
+          map_insert(
+            acc,
+            module,
+            push(match map_get(acc, module) { Some(fs) -> fs, None -> [] }, f),
+          )
+        });
         {
           through: through,
           names: k.names,
@@ -159,9 +196,48 @@ pub fn own_through<[r]>(
               Some(name) -> map_contains(standing, name),
               None -> false,
             }),
+          // A module kept with no form is one no form of it now matches.
+          moved: fold(k.kept.modules, [], |acc: List<Moved>, m: CompiledModule|
+            if map_contains(standing, m.name) { acc } else {
+              push(acc, {
+                module: m.name,
+                form: match map_get(forms, m.name) { Some(f) -> f, None -> b"" },
+                fixed: match map_get(fixed, m.name) { Some(fs) -> fs, None -> [] },
+              })
+            }),
         }
       },
     },
+  }
+
+/// `own` without what it kept of the stubs a load read whole again, `restored`: their warnings are
+/// the load's own.
+pub fn standing_own(own: Own, restored: List<Bytes>) -> Own / {abort.raise} =
+  if len(restored) == 0 { own } else {
+    {
+      ..own,
+      warned: filter(own.warned, |diag: Diag|
+        match list_at(own.names, warned_in(diag)) {
+          Some(name) -> !contains(restored, name),
+          None -> true,
+        }),
+    }
+  }
+
+/// `through` without the stubs a load read whole again, `restored`.
+pub fn through_standing(
+  through: List<CompiledPackage>,
+  restored: List<Bytes>,
+) -> List<CompiledPackage> / {abort.raise} =
+  if len(restored) == 0 { through } else {
+    map(through, |p: CompiledPackage|
+      {
+        modules: filter(p.modules, |m: CompiledModule| !contains(restored, m.name)),
+        defs: filter(p.defs, |r: KnownDefRow| !contains(restored, module_of(r.name))),
+        fixed: filter(p.fixed, |f: Fixed| !contains(restored, module_of(f.name))),
+        tests: filter(p.tests, |t: FixedTest| !contains(restored, t.module)),
+        laws: filter(p.laws, |l: FixedLaw| !contains(restored, l.module)),
+      })
   }
 
 /// `fresh`, what a load warned of the modules it read from source, with what `own` holds of the ones
@@ -220,6 +296,18 @@ pub fn own_kept<[r]>(
           names: map(analysis.mods, |m: ParsedModule| m.name),
           warned: filter(warnings, |diag: Diag|
             list_at(analysis.module_packages, warned_in(diag)) == Some(0)),
+          forms: fold(
+            range(0, len(analysis.mods)),
+            [],
+            |acc: List<{ name: Bytes, form: Bytes }>, i: Int|
+              match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
+                (Some(m), Some(0)) -> match map_get(analysis.forms, m.name) {
+                  Some(form) -> push(acc, { name: m.name, form: form }),
+                  None -> acc,
+                },
+                _ -> acc,
+              },
+          ),
         },
         own_kept_bin(),
       ),

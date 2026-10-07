@@ -4,8 +4,8 @@
 import harness (scratch, Ran, Source, project, program, write, read, shipped_sources, in_memory,
                 one, tree, on_disk, warm_agrees, seeding, said, stdout, stderr, json_of, at, path,
                 nth, items, first, str, int, truth, shown, Hermetic, Reached, Shipped, inspected,
-                reader_source, std_tree, std_data, on_disk_shipping, on_disk_shipping_only,
-                over_tree, spawned, assert_ok, codes)
+                reader_source, std_tree, std_data, module_in, StdModule, std_modules,
+                on_disk_shipping, on_disk_shipping_only, over_tree, spawned, assert_ok, codes)
 import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, TDAlias,
                        is_pub)
@@ -666,6 +666,85 @@ test "ply std's listing names each module it ships and ends on the digest --dige
   })
 }
 
+/// A standard library whose `std.kept.deep` is `kept/deep.ply` beneath `std.kept`'s `kept.ply`, each
+/// embedding a file of the directory they share, in the order a flat directory lists their files.
+fn nested_shipped() -> List<Source> =
+  [
+    {
+      path: "std.kept.deep.ply",
+      text:
+        \\//! A module beneath another.
+        \\
+        \\import std.kept (one)
+        \\
+        \\/// One more than the module above's one.
+        \\pub fn two() -> Int = one() + 1
+        \\
+        \\/// What the file beneath this module holds.
+        \\pub fn words() -> Bytes = embed("deep/words.txt")
+        \\
+        \\test "two is two" { assert_eq(two(), 2) }
+        \\
+    },
+    { path: "std/kept/deep/words.txt", text: "deep\n" },
+    {
+      path: "std.kept.ply",
+      text:
+        \\//! A module with another beneath it.
+        \\
+        \\/// One.
+        \\pub fn one() -> Int = 1
+        \\
+        \\/// What the file beside the module beneath this one holds.
+        \\pub fn list() -> Bytes = embed("kept/list.txt")
+        \\
+    },
+    { path: "std/kept/list.txt", text: "one\n" },
+  ]
+
+test "a module beneath another ships under its place: listed in name order, documented and run" {
+  scratch(|| {
+    program(
+      \\import std.kept (list)
+      \\import std.kept.deep (two, words)
+      \\
+      \\test "both" {
+      \\  assert_eq(two(), 2);
+      \\  assert_eq(list(), b"one\n");
+      \\  assert_eq(words(), b"deep\n")
+      \\}
+      \\
+    );
+    let listed = items(
+      at(json_of(on_disk_shipping_only(["std", "--json"], nested_shipped())), "modules"),
+    );
+    assert_eq(map(listed, |m: Json| str(at(m, "module"))), ["std.kept", "std.kept.deep"]);
+    assert_eq(map(listed, |m: Json| map(items(at(m, "data")), |d: Json| str(at(d, "name")))), [
+      ["std/kept/list.txt"],
+      ["std/kept/deep/words.txt"],
+    ]);
+    let doc = on_disk_shipping_only(["doc", "std.kept.deep.two"], nested_shipped());
+    assert(doc.code == 0 && string_contains(said(doc), "One more than"), Some(said(doc)));
+    let ran = json_of(on_disk_shipping_only(["test", "--std", "--json"], nested_shipped()));
+    assert(int(at(ran, "exit_code")) == 0, Some(shown(ran)));
+    assert_eq(sort(map(items(path(ran, ["selection", "tests"])), |t: Json| str(at(t, "key")))), [
+      "m.both",
+      "std.kept.deep.two is two",
+    ])
+  })
+}
+
+test "ply doc documents a module of the standard library beneath another, and a name it publishes" {
+  let t = app("fn f() -> Int = 1\n");
+  let module = in_memory(t, ["doc", "std.hash.legacy"]);
+  assert(
+    module.code == 0 && string_contains(said(module), "MD5 and SHA-1, which are broken"),
+    Some(said(module)),
+  );
+  let one = in_memory(t, ["doc", "std.hash.legacy.sha1"]);
+  assert(one.code == 0 && string_contains(said(one), "at <std>/hash/legacy.ply:"), Some(said(one)))
+}
+
 test "ply std show written bare prints every shipped source" {
   let t = app("fn f() -> Int = 1\n");
   let r = in_memory(t, ["std", "--show"]);
@@ -1141,15 +1220,17 @@ test "ply doc documents a name of a shipped module that embeds a data file" {
   assert(r.code == 0 && string_contains(said(r), "well-known identifier"), Some(said(r)))
 }
 
+test "ply doc documents a name of a shipped module that imports the compiler's" {
+  let r = in_memory(app("fn f() -> Int = 1\n"), ["doc", "std.syntax.format"]);
+  assert(r.code == 0 && string_contains(said(r), "What `ply fmt` writes"), Some(said(r)))
+}
+
 // A file the tree holds and no module embeds would ship in every binary and be read by nothing.
 test "each data file the standard library's tree holds is one a module of it embeds" {
   let embedded = fold(std_tree(), [], |acc: List<String>, f: { name: String, bytes: Bytes }|
-    if !string_ends_with(f.name, ".ply") || string_contains(f.name, "/") { acc } else {
+    if !string_ends_with(f.name, ".ply") { acc } else {
       fold(
-        shipped_data_wanted({
-          name: bytes_of_string("std." ++ string_slice(f.name, 0, string_len(f.name) - 4)),
-          src: f.bytes,
-        }),
+        shipped_data_wanted({ name: bytes_of_string(module_in("std.", f.name)), src: f.bytes }),
         acc,
         |a: List<String>, name: Bytes| push(a, string_of_bytes(name)),
       )
@@ -1357,16 +1438,7 @@ fn undocumented(module: String, src: Bytes) -> List<String> / {abort.raise} =
 
 fn bare(doc: Option<Doc>) -> Bool = match doc { None -> true, Some(_) -> false }
 
-/// A standard library module under its name in a program.
-type Published = { module: String, src: Bytes }
-
-fn std_modules() -> List<Published> / {abort.raise} =
-  fold(std_tree(), [], |acc: List<Published>, f: { name: String, bytes: Bytes }|
-    if !string_ends_with(f.name, ".ply") { acc } else {
-      push(acc, { module: "std." ++ string_slice(f.name, 0, string_len(f.name) - 4), src: f.bytes })
-    })
-
-test "every name {m.module} publishes is documented" for m: Published in std_modules() {
+test "every name {m.module} publishes is documented" for m: StdModule in std_modules() {
   let missing = undocumented(m.module, m.src);
   assert(
     len(missing) == 0,
@@ -1404,7 +1476,7 @@ test "a shipped module folds case and trims by ASCII, unless it is listed as rea
   let found = sort(
     fold(std_tree(), [], |acc: List<String>, f: { name: String, bytes: Bytes }|
       if string_ends_with(f.name, ".ply") && reads_unicode(f.bytes) {
-        push(acc, string_slice(f.name, 0, string_len(f.name) - 4))
+        push(acc, module_in("", f.name))
       } else { acc }),
   );
   let listed = map(unicode_readers(), |r: { module: String, why: String }| r.module);

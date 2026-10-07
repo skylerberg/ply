@@ -9,25 +9,23 @@ import compiler.derive (Expansion)
 import compiler.embed (EmbedAt, want_of_key)
 import compiler.front (Dump, Embedded, KnownDefRow, ShippedData, Analysed, Refused, checked_staged,
                        dump_of, embeds_wanted, pulls_bin, pulls_of, rows_of, shipped_data_embeds,
-                       shipped_pulled, staged_pulling_std_with)
+                       staged_pulling_std_with)
 import compiler.hash
 import compiler.hash (HashOutput, Node, TestNode, Printed, Unprintable)
 import compiler.infer
 import compiler.items
 import compiler.lexer
-import compiler.load (tell_viewed)
+import compiler.load (shipped_for, tell_viewed)
 import compiler.resolve
 import compiler.resolve (Source, Diag, ResolveSucceeded, ResolveFailed)
 import compiler.rewrite
-import compiler.unit (shipped)
-import harness (compiler_tree, example_files, lang_corpus, phase_files, prelude_file, std_data,
-                std_tree)
+import harness (compiler_tree, example_files, lang_corpus, module_in, phase_files, prelude_file,
+                std_data, std_tree)
 import std.bin
 import std.bytes
 import std.list (any, at, concat, find, flatten, last, somes, take)
 import std.show (show)
 import std.string
-import cli.sources (stem)
 
 type File = { name: String, bytes: Bytes }
 
@@ -44,10 +42,11 @@ fn is_ply(file: File) -> Bool / {abort.raise} = string_ends_with(file.name, ".pl
 fn top_level(files: List<File>) -> List<File> / {abort.raise} =
   filter(files, |file: File| is_ply(file) && !string_contains(file.name, "/"))
 
-/// Each `.ply` file directly in a tree as the module `prefix` and its stem name.
+/// Each `.ply` file of a tree as the module its place names below `prefix`: `a/b.ply` is
+/// `<prefix>a.b`.
 fn modules_of(files: List<File>, prefix: String) -> List<Source> / {abort.raise} =
-  map(top_level(files), |file: File|
-    { name: bytes_of_string(prefix ++ stem(file.name)), src: file.bytes })
+  map(filter(files, is_ply), |file: File|
+    { name: bytes_of_string(module_in(prefix, file.name)), src: file.bytes })
 
 fn phases_file(name: String) -> Bytes / {abort.raise} =
   match filter(phase_files(), |file: File| file.name == name) {
@@ -419,15 +418,7 @@ fn partings(walked: Dump, seeded: Dump) -> List<String> / {abort.raise} =
 test "{p.name} checked from the rows its walk published answers as the walk did" for p: Part in parts(
   ) {
   let pkgs = { root: b"", manifest: None, supplied: [] };
-  let held = |name: Bytes| shipped.module(string_of_bytes_lossy(name));
-  let shipping = shipped_pulled(
-    p.modules,
-    pkgs,
-    map(shipped.names(), bytes_of_string),
-    held,
-    held,
-    pulls_of,
-  );
+  let shipping = shipped_for(p.modules, pkgs);
   let staged = staged_pulling_std_with(
     p.modules,
     shipping.read,
@@ -563,25 +554,40 @@ fn unfaithful(s: Stored, of: (Bytes) -> Bool) -> List<String> / {abort.raise} = 
   }
 }
 
-/// Each `.ply` file of a tree as the module its path names: `a/b.ply` is `a.b`.
-fn modules_under(files: List<File>) -> List<Source> / {abort.raise} =
-  map(filter(files, is_ply), |file: File|
-    {
-      name: bytes_of_string(string::join(string_split(stem(file.name), "/"), ".")),
-      src: file.bytes,
-    })
-
-/// Whether a module needs no package but the library: one that imports the compiler does.
-fn alone(s: Source) -> Bool = bytes_index_of(s.src, b"\nimport compiler.") == None
+/// The modules of `sources` that need no package but the library: none that imports the
+/// compiler, and none that imports such a module, however far.
+fn alone(sources: List<Source>) -> List<Source> / {abort.raise} = {
+  let imports = map(sources, |s: Source|
+    { name: s.name, of: map(items::parse(s.src).node.imports, resolve::import_module_name) });
+  let direct = fold(
+    imports,
+    map_new(),
+    |acc: Map<Bytes, Bool>, m: { name: Bytes, of: List<Bytes> }|
+      if any(m.of, |n: Bytes| bytes_starts_with(n, b"compiler.")) { map_insert(acc, m.name, true) }
+      else { acc },
+  );
+  let needing = iterate(direct, len(sources) + 1, |held: Map<Bytes, Bool>| {
+    let grown = fold(imports, held, |acc: Map<Bytes, Bool>, m: { name: Bytes, of: List<Bytes> }|
+      if !map_contains(acc, m.name) && any(m.of, |n: Bytes| map_contains(acc, n)) {
+        map_insert(acc, m.name, true)
+      } else { acc });
+    if map_len(grown) == map_len(held) { Stop(grown) } else { Continue(grown) }
+  });
+  filter(sources, |s: Source| !map_contains(needing, s.name))
+}
 
 // A program prints with what it reaches, as a bisection prints it: two of them may declare one
 // effect alike, which no print of both can name.
 test "every body and test of the library, the examples and the language corpus prints back to what it was stored under" {
-  let programs = flatten([
-    modules_of(example_files(), ""),
-    filter(modules_under(lang_corpus()), alone),
-  ]);
-  let s = stored(flatten([modules_of(std_tree(), "std."), programs]));
+  let held = alone(
+    flatten([
+      modules_of(std_tree(), "std."),
+      modules_of(example_files(), ""),
+      modules_of(lang_corpus(), ""),
+    ]),
+  );
+  let programs = filter(held, |p: Source| !bytes_starts_with(p.name, b"std."));
+  let s = stored(held);
   let wrong = flatten([
     unfaithful(s, |m: Bytes| bytes_starts_with(m, b"std.")),
     flatten(

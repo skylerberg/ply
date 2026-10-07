@@ -5,21 +5,21 @@
 //! the directory its manifest names; what a module embeds is read beside it; the shipped modules
 //! they import are the binary's own shipped modules.
 
-import front (Dump, EmitterRoot, Embedded, Analysed, Refused, Rows, KnownDefRow, Shipping, Staged,
-              ShippedView, analyse_pulling_std_with, checked_staged, dump_of, embeds_wanted,
-              embeds_now, module_of, no_interfaces, pulls_of, rows_of, shipped_pulled, staged_hash,
-              staged_pulling_std_with, viewed_text)
+import front (Dump, EmitterRoot, Embedded, AnalysisOutcome, Analysed, Refused, Rows, KnownDefRow,
+              Shipping, Staged, ShippedView, analyse_pulling_std_with, checked_staged, dump_of,
+              no_rows, embeds_wanted, embeds_now, module_of, no_interfaces, pulls_of, rows_of,
+              shipped_pulled, staged_hash, staged_pulling_std_with, viewed_text)
 import embed (EmbedAt, EmbedRead, EmbedFile)
 import hash (Prior)
 import interface (CompiledPackage, KeptModules, Original, kept_held, kept_modules,
-                  merged_interfaces, standing_modules)
+                  merged_interfaces, standing_modules, imported)
 import pkg (PackageSources, Supplied, closure, git_spec, wants)
 import resolve (Source, Diag, error_at)
 import unit (Runtime, shipped, compiled)
 import std.fs
 import std.fs (fs, File, Dir, Missing, Symlink)
 import std.path (is_absolute, join, normalize, parent)
-import std.list (at, concat)
+import std.list (at, concat, contains)
 import parsing (no_module)
 
 /// One source a front end's answer names: where it was read, the module it is, and its text.
@@ -96,7 +96,7 @@ fn below<[r]>(
 
 /// One package as it lies below its root: its manifest when it holds one, and its modules, each
 /// named by its path below the root.
-type Package = { root: String, manifest: Option<Bytes>, files: List<SourceFile> }
+pub type Package = { root: String, manifest: Option<Bytes>, files: List<SourceFile> }
 
 fn package_at<[r]>(
   root: String,
@@ -332,18 +332,27 @@ fn originals(
     push(acc, { name: s.name, src: s.src, manifest: None }))
 }
 
-/// The program below `root` read and hashed, taking from `priors` what an earlier load of it hashed
-/// wherever that stands. A module whose text stands as `kept` knew it, and that reaches none whose
-/// text moved, is read as its stub, with `rows` for its bodies. `tested` reads its tests and laws,
-/// which a program to ship has none of. A file that cannot be a module and a dependency `ply` would
-/// have to fetch are each a refusal.
-pub fn read<[r]>(
+/// What a read takes in before it loads anything: the program's packages, the shipped modules they
+/// pull, every module as it stands now, what each embeds, and the modules that stand as the last
+/// read kept them.
+pub type Prepared = {
+  own: Package,
+  deps: List<Package>,
+  pkgs: PackageSources,
+  shipping: Shipping,
+  found: List<Original>,
+  embeds: List<Embedded>,
+  through: List<CompiledPackage>,
+}
+
+/// The program below `root` as `read` takes it in. A module whose text stands as `kept` knew it,
+/// and that reaches none whose text moved, stands, with `rows` for its bodies. A file that cannot
+/// be a module and a dependency `ply` would have to fetch are each a refusal.
+pub fn prepared<[r]>(
   root: String,
-  priors: List<Prior>,
   kept: Option<KeptModules> = None,
   rows: List<KnownDefRow> = [],
-  tested: Bool = true,
-) -> Result<Read, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.reached, abort.raise} =
+) -> Result<Prepared, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, abort.raise} =
   match package_at[r](root) {
     Err(diags) -> Err(unloaded(diags)),
     Ok(own) -> if len(own.files) == 0 {
@@ -358,8 +367,7 @@ pub fn read<[r]>(
             supplied: map(deps, supplied_of),
           };
           let shipping = shipped_for(sources_of(own.files), pkgs);
-          let shipped_sources = shipping.read;
-          let found = originals(pkgs, sources_of(own.files), shipped_sources);
+          let found = originals(pkgs, sources_of(own.files), shipping.read);
           let embeds = fold(deps, embeds_of[r](own), |acc: List<Embedded>, package: Package|
             concat(acc, embeds_of[r](package)));
           let through = match kept {
@@ -367,7 +375,7 @@ pub fn read<[r]>(
               let read = embeds_now(
                 pkgs,
                 sources_of(own.files),
-                shipped_sources,
+                shipping.read,
                 embeds,
                 shipping.data,
               );
@@ -376,38 +384,72 @@ pub fn read<[r]>(
                 found,
                 { defs: rows, tests: [] },
                 read,
-                kept_held(k, found, read, shipped_sources, shipping.unread, shipping.data),
+                kept_held(k, found, read, shipping.read, shipping.unread, shipping.data),
+                map(shipping.read, |s: Source| s.name),
               )
             },
             None -> [],
           };
-          let staged = staged_pulling_std_with(
-            sources_of(own.files),
-            shipped_sources,
-            pkgs,
-            merged_interfaces(through),
-            embeds,
-            priors,
-            tested,
-            unread: shipping.unread,
-            data: shipping.data,
-          );
-          tell_viewed(staged.viewed, true);
-          let files = placed(own, deps, staged.pulled, texts_of(shipped_sources));
-          match staged.hashed {
-            Err(diags) -> Err({ diags: diags, files: files }),
-            Ok(h) ->
-              Ok({
-                staged: staged,
-                files: files,
-                priors: h.hashes.priors,
-                originals: found,
-                through: through,
-              }),
-          }
+          Ok({
+            own: own,
+            deps: deps,
+            pkgs: pkgs,
+            shipping: shipping,
+            found: found,
+            embeds: embeds,
+            through: through,
+          })
         },
       }
     },
+  }
+
+/// The program `p` takes in read and hashed, taking from `priors` what an earlier load of it hashed
+/// wherever that stands, and each module that stands read as its stub. `tested` reads its tests and
+/// laws, which a program to ship has none of.
+pub fn read_prepared(
+  p: Prepared,
+  priors: List<Prior>,
+  tested: Bool = true,
+) -> Result<Read, Unloaded> / {shipped.reached, abort.raise} = {
+  let staged = staged_pulling_std_with(
+    sources_of(p.own.files),
+    p.shipping.read,
+    p.pkgs,
+    merged_interfaces(p.through),
+    p.embeds,
+    priors,
+    tested,
+    unread: p.shipping.unread,
+    data: p.shipping.data,
+    pulls: p.shipping.pulls,
+  );
+  tell_viewed(staged.viewed, true);
+  let files = placed(p.own, p.deps, staged.pulled, texts_of(p.shipping.read));
+  match staged.hashed {
+    Err(diags) -> Err({ diags: diags, files: files }),
+    Ok(h) ->
+      Ok({
+        staged: staged,
+        files: files,
+        priors: h.hashes.priors,
+        originals: p.found,
+        through: p.through,
+      }),
+  }
+}
+
+/// The program below `root` read and hashed, as `prepared` takes it in and `read_prepared` reads it.
+pub fn read<[r]>(
+  root: String,
+  priors: List<Prior>,
+  kept: Option<KeptModules> = None,
+  rows: List<KnownDefRow> = [],
+  tested: Bool = true,
+) -> Result<Read, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.reached, abort.raise} =
+  match prepared[r](root, kept, rows) {
+    Err(u) -> Err(u),
+    Ok(p) -> read_prepared(p, priors, tested),
   }
 
 /// A program that was read, checked, seeded with the rows a last load of it published. A program
@@ -439,14 +481,15 @@ pub fn checked<[r]>(
 ) -> Result<Checked, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, shipped.reached, abort.raise} =
   match read[r](root, priors) { Err(u) -> Err(u), Ok(r) -> checked_of(r, rows) }
 
-/// The shipped modules a load of `user` and `pkgs` pulls and the data files those embed, each
-/// asked of the binary when it is pulled.
-fn shipped_for(
+/// The shipped modules a load of `user` and `pkgs` pulls, each as an importer reads it, and the data
+/// files those embed, each asked of the binary when it is pulled.
+pub fn shipped_for(
   user: List<Source>,
   pkgs: PackageSources,
 ) -> Shipping / {shipped.names, shipped.module, abort.raise} = {
   let held = |name: Bytes| shipped.module(string_of_bytes_lossy(name));
-  shipped_pulled(user, pkgs, map(shipped.names(), bytes_of_string), held, held, pulls_of)
+  let read = |name: Bytes| match held(name) { Some(text) -> Some(imported(text)), None -> None };
+  shipped_pulled(user, pkgs, map(shipped.names(), bytes_of_string), read, held, pulls_of)
 }
 
 /// What a load read of the shipped modules it pulled, told to whatever observes the run. `pulled` is
@@ -461,10 +504,14 @@ fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
   fold(shipped_sources, map_new(), |acc: Map<Bytes, Bytes>, source: Source|
     map_insert(acc, source.name, source.src))
 
-/// A program held in memory, one package with no manifest, checked against the shipped modules.
-pub fn held(
+/// What the front end answered for a program held in memory, with every source its module indices
+/// run over, in their order.
+pub type Held = { out: AnalysisOutcome, files: List<SourceFile> }
+
+/// A program held in memory, one package with no manifest, analysed against the shipped modules.
+pub fn analysed(
   files: List<SourceFile>,
-) -> Result<LoadedAnalysis, Unloaded> / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
+) -> Held / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
   let pkgs = { root: b"", manifest: None, supplied: [] };
   let shipping = shipped_for(sources_of(files), pkgs);
   let own = { root: "", manifest: None, files: files };
@@ -480,13 +527,20 @@ pub fn held(
     data: shipping.data,
   );
   tell_viewed(pulled.viewed, true);
-  let placing = placed(own, [], pulled.pulled, texts_of(shipping.read));
-  match pulled.out {
-    Refused(diags) -> Err({ diags: diags, files: placing }),
+  { out: pulled.out, files: placed(own, [], pulled.pulled, texts_of(shipping.read)) }
+}
+
+/// A program held in memory, one package with no manifest, checked against the shipped modules.
+pub fn held(
+  files: List<SourceFile>,
+) -> Result<LoadedAnalysis, Unloaded> / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
+  let answered = analysed(files);
+  match answered.out {
+    Refused(diags) -> Err({ diags: diags, files: answered.files }),
     Analysed(w) ->
       Ok({
         dump: dump_of(Analysed(w)),
-        files: placing,
+        files: answered.files,
         read_ms: 0,
         front_ms: 0,
         file_ms: 0,
@@ -562,6 +616,44 @@ test "a program is the `.ply` files below its root, in path order, each the modu
       assert_eq(map(l.front.files, |f: SourceFile| f.name), ["a.c", "b"]);
       assert(bytes_len(l.unit) > 0)
     },
+  }
+}
+
+test "a module read through what the last read kept pulls what its text's hidden imports name" {
+  let tree = fs::mem_of([
+    {
+      path: "p/a.ply",
+      body: b"pub fn used() -> Int = 1\n\ntest \"used at {n}\" for n: Int in [1, 2] {\n  assert_eq(used(), 1)\n}\n",
+    },
+    { path: "p/m.ply", body: b"import a (used)\n\npub fn main() -> Int = used()\n" },
+  ]);
+  let module = |name: String|
+    if name == "std.cases" { Some(b"pub fn listed() -> Int = 1\n") }
+    else if name == "std.show" { Some(b"pub fn shown() -> Int = 1\n") }
+    else { None };
+  handle {
+    match read[t]("p", [], None, [], false) {
+      Err(u) -> panic(said(u.diags)),
+      Ok(first) -> match checked_of(first, no_rows()) {
+        Err(u) -> panic(said(u.diags)),
+        Ok(c) -> match read[t]("p", [], Some(c.kept), c.rows.defs, false) {
+          Err(u) -> panic(said(u.diags)),
+          Ok(again) -> {
+            assert(contains(first.staged.pulled, b"std.cases"), None);
+            assert(len(again.through) > 0, Some("`a` is read as its stub"));
+            // A program to ship holds no test, but the emitter reads the text whole.
+            assert_eq(again.staged.pulled, first.staged.pulled)
+          },
+        },
+      },
+    }
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> ["std.cases", "std.show"],
+    shipped.module(name) -> module(name),
+    shipped.reached(view, pulled) -> (),
   }
 }
 
@@ -648,6 +740,33 @@ test "a shipped module a program imports embeds a data file the binary holds" {
     },
   };
   assert_eq(codes(over(None)), [b"E0146"])
+}
+
+// The emitter parses a shipped module's placed text, so the place is the text the front end read.
+test "a shipped module is placed as the load read it, what a module importing it reads in place" {
+  let whole = b"/// Two.\npub fn count() -> Int = 2\n\ntest \"two\" {\n  assert_eq(count(), 2)\n}\n";
+  let tree = fs::mem_of([
+    { path: "p/m.ply", body: b"import std.words (count)\n\nfn main() -> Int = count()\n" },
+  ]);
+  let loaded = handle {
+    load[t]("p")
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> ["std.words"],
+    shipped.module(name) -> if name == "std.words" { Some(whole) } else { None },
+    shipped.reached(view, pulled) -> (),
+    shipped.runtime() -> no_runtime(),
+  };
+  match loaded {
+    Err(diags) -> panic(said(diags)),
+    Ok(l) ->
+      assert_eq(
+        map(filter(l.front.files, |f: SourceFile| f.name == "std.words"), |f: SourceFile| f.text),
+        [imported(whole)],
+      ),
+  }
 }
 
 test "a root with nothing to load, and a file that cannot be a module, are refused" {

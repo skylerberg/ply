@@ -1109,7 +1109,7 @@ fn kept_key(parts: List<Bytes>) -> Bytes / {abort.raise} =
 fn standing(looked: Map<Bytes, Answer>, offered: Map<Bytes, Bool>) -> Map<Bytes, Answer> =
   map_fold(looked, map_new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
     match a {
-      Refused(_) -> map_insert(acc, n, a),
+      Refused(_) -> acc,
       Body(b) -> if fold(b.tables.members, true, |ok: Bool, m: Bytes|
           ok && map_contains(offered, m)
             && (match map_get(looked, m) {
@@ -1179,25 +1179,20 @@ fn bucketed(names: List<Bytes>) -> Map<Int, List<Bytes>> / {abort.raise} =
     map_insert(acc, b, push(match map_get(acc, b) { Some(xs) -> xs, None -> [] }, n))
   })
 
-/// Each root's answer as an earlier run kept it, `materials` naming what each is a function of. A
-/// body answers for its material whatever else is offered, so it is taken before a refusal filed
-/// under this offered set, and a bucket's pack, the bodies its roots had when it was written, before
-/// a root's own body.
+/// Each root's body as an earlier run kept it, `materials` naming what each is a function of: a
+/// bucket's pack, the bodies its roots had when it was written, before a root's own body. A refusal
+/// is never kept: what the emitter refuses may be the program's doing, which no material names.
 fn looked_up<| e>(
   materials: Map<Bytes, Bytes>,
   packs: Map<Int, Map<Bytes, Answer>>,
   body: (Bytes) -> Option<Answer> / e,
-  refusal: (Bytes) -> Option<Answer> / e,
 ) -> Map<Bytes, Answer> / {abort.raise | e} =
   map_fold(materials, map_new(), |acc: Map<Bytes, Answer>, n: Bytes, m: Bytes| {
     let found = match map_get(packs, bucket_of(n)) {
       Some(packed) -> map_get(packed, n),
       None -> body(m),
     };
-    match found {
-      Some(a) -> map_insert(acc, n, a),
-      None -> match refusal(m) { Some(a) -> map_insert(acc, n, a), None -> acc },
-    }
+    match found { Some(a) -> map_insert(acc, n, a), None -> acc }
   })
 
 type Repack = { names: List<Bytes>, pack: Pack }
@@ -1448,9 +1443,7 @@ pub fn emitted<| e>(
     runtime.identity,
     emitter,
   ];
-  let fragment = kept_key(ordered(offered));
   let body_key = |m: Bytes| kept_key(concat(common, [b"body", m]));
-  let refusal_key = |m: Bytes| kept_key(concat(common, [b"refusal", fragment, m]));
   let materials = fold(offered, map_new(), |acc: Map<Bytes, Bytes>, n: Bytes|
     match root_material(p, n) { Some(m) -> map_insert(acc, n, m), None -> acc });
   let buckets = bucketed(map_keys(materials));
@@ -1470,12 +1463,7 @@ pub fn emitted<| e>(
         None -> acc,
       },
   );
-  let looked = looked_up(
-    materials,
-    packs,
-    |m: Bytes| decoded(p.keys, read(body_key(m))),
-    |m: Bytes| decoded(p.keys, read(refusal_key(m))),
-  );
+  let looked = looked_up(materials, packs, |m: Bytes| decoded(p.keys, read(body_key(m))));
   let kept = standing(looked, asked);
   let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
   let fresh = if len(missed) == 0 { [] } else {
@@ -1498,7 +1486,7 @@ pub fn emitted<| e>(
         None -> (),
         Some(m) -> match a {
           Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
-          Refused(_) -> write(refusal_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
+          Refused(_) -> (),
         },
       });
     fold(repacked(p.keys, buckets, packs, looked, answered), (), |_: Unit, r: Repack|
@@ -1921,11 +1909,10 @@ fn answered_by(answers: List<{ key: Bytes, value: Answer }>) -> (Bytes) -> Optio
   |k: Bytes| map_get(m, k)
 }
 
-test "a bucket's pack answers before a root's own body, and a body before a refusal" {
+test "a bucket's pack answers before a root's own body, and a root kept with neither is asked again" {
   let mate = bucket_mate(b"m.a");
   assert(bucket_of(b"m.b") != bucket_of(b"m.a") && bucket_of(b"m.c") != bucket_of(b"m.a"), None);
   let packed = one_body(b"m.a", []);
-  let refusal = Refused({ why: b"a body the lowering does not reach", handles: [] });
   let looked = looked_up(
     map_of_entries([
       { key: b"m.a", value: b"ma" },
@@ -1939,17 +1926,12 @@ test "a bucket's pack answers before a root's own body, and a body before a refu
       { key: b"mb", value: one_body(b"m.b", []) },
       { key: b"md", value: one_body(mate, []) },
     ]),
-    answered_by([
-      { key: b"mb", value: refusal },
-      { key: b"mc", value: refusal },
-      { key: b"md", value: refusal },
-    ]),
   );
   assert_eq(map_get(looked, b"m.a"), Some(packed));
   assert_eq(map_get(looked, b"m.b"), Some(one_body(b"m.b", [])));
-  assert_eq(map_get(looked, b"m.c"), Some(refusal));
+  assert_eq(map_get(looked, b"m.c"), None);
   // A pack holds every body its bucket had, so a root it does not hold had none.
-  assert_eq(map_get(looked, mate), Some(refusal))
+  assert_eq(map_get(looked, mate), None)
 }
 
 test "a kept body stands only where each callee it names still has the key it was filed with" {
@@ -2121,6 +2103,34 @@ test "a unit holds a `const` definition as the value a build kept, and makes its
   assert(bytes_index_of(storing.produced.text, b"rt_stored_p(ctx, held)") != None, None);
   let alone = unit([stored_root(b"m.table")], []);
   assert_eq(map(alone.produced.dropped, |d: Dropped| d.function), [b"m.table#stored"])
+}
+
+test "a root the emitter refuses is asked again, and nothing of the refusal is kept" {
+  let dump = dump_of(analyse(parse_all([{ name: b"m", src: b"pub fn f() -> Int = 1\n" }])));
+  // The text the emitter reads names a module the program does not hold: the refusal is the
+  // program's doing, which nothing the root is filed under says.
+  let source = b"import gone (x)\n\npub fn f() -> Int = 1\n";
+  let runtime = { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" };
+  with_cell[kept](map_new()) { store -> {
+    let run = ||
+      match emitted(
+          runtime,
+          dump,
+          [source],
+          [b"m.f"],
+          b"",
+          |k: Bytes| map_get(cell_get(store), k),
+          |k: Bytes, v: Bytes| cell_set(store, map_insert(cell_get(store), k, v)),
+        ) {
+        Ok(e) -> e,
+        Err(why) -> panic(string_of_bytes_lossy(why)),
+      };
+    let first = run();
+    assert_eq(map(first.produced.dropped, |d: Dropped| d.function), [b"m.f"]);
+    let again = run();
+    assert_eq(again.asked, 1);
+    assert_eq(map(again.produced.dropped, |d: Dropped| d.function), [b"m.f"])
+  } }
 }
 
 test "a value's text is cut into literals no longer than a compiler takes" {

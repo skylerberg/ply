@@ -4,9 +4,11 @@
 
 import harness (scratch, Ran, Source, project, write, in_memory, tree, on_disk, on_disk_shipping,
                 warm_agrees, shipped_sources, said, json_of, at, items, first, str, int, shown,
-                Hermetic, Reached, Shipped, assert_ok, reader_source)
-import cli.sources (is_std)
+                Hermetic, Reached, Shipped, assert_ok, reader_source, StdModule, std_modules)
+import cli.program (is_shipped)
+import cli.sources (is_compiler, is_std)
 import std.json (Json)
+import std.list (any)
 import std.string
 
 fn codes_of(ran: Ran) -> List<String> / {abort.raise} =
@@ -43,13 +45,16 @@ fn importer() -> String =
   \\
 
 test "nothing a project can name lands under the reserved root" {
-  // Every one of these derives a module name at or under `std`.
+  // Every one of these derives a module name at or under `std` or `compiler`.
   fold(
     [
       { rel: "std.ply", expected: "std" },
       { rel: "std/json.ply", expected: "std.json" },
       { rel: "std/net.ply", expected: "std.net" },
       { rel: "std/http/server.ply", expected: "std.http.server" },
+      { rel: "compiler/front.ply", expected: "compiler.front" },
+      { rel: "compiler/items.ply", expected: "compiler.items" },
+      { rel: "compiler/fmt.ply", expected: "compiler.fmt" },
     ],
     (),
     |u: Unit, c: { rel: String, expected: String }| {
@@ -64,10 +69,14 @@ test "nothing a project can name lands under the reserved root" {
     },
   );
   // Near misses keep working: reserving a prefix reserves no name that merely starts with it.
-  fold(["stdlib.ply", "mine/std_helpers.ply", "a/std_thing.ply"], (), |u: Unit, rel: String| {
-    let r = checked([{ path: rel, text: "pub fn f() -> Int = 1\n" }]);
-    assert(r.code == 0, Some("`" ++ rel ++ "` was refused: " ++ said(r)))
-  })
+  fold(
+    ["stdlib.ply", "mine/std_helpers.ply", "a/std_thing.ply", "compilers.ply"],
+    (),
+    |u: Unit, rel: String| {
+      let r = checked([{ path: rel, text: "pub fn f() -> Int = 1\n" }]);
+      assert(r.code == 0, Some("`" ++ rel ++ "` was refused: " ++ said(r)))
+    },
+  )
 }
 
 test "naming a file under std directly cannot smuggle it in as a std module" {
@@ -122,33 +131,139 @@ test "a project module named net beside std.net is a loud collision" {
   )
 }
 
-test "no cycle can be built between a project and the stdlib" {
-  // A project module named after one `std.json` imports, in case the shipped import could be
-  // captured.
-  let answer = json_of(
-    checked([{ path: "app.ply", text: "import std.json\npub fn f() -> Int = 1\n" }]),
-  );
-  fold(items(at(answer, "modules")), (), |u: Unit, m: Json|
-    if !is_std(str(at(m, "name"))) { u } else {
-      fold(items(at(m, "imports")), u, |v: Unit, i: Json|
-        assert(
-          is_std(str(i)),
-          Some("the shipped module `" ++ str(at(m, "name")) ++ "` imports `" ++ str(i) ++ "`"),
-        ))
-    });
-  fold(
-    filter(shipped_sources(), |source: Source| string_starts_with(source.path, "std.")),
-    (),
-    |u: Unit, source: Source|
-      fold(
+/// A project of modules named as the compiler's modules name their siblings, each declaring what
+/// the compiler's module of that name declares at another type, beside one that imports the
+/// library modules the compiler serves and calls all of them.
+fn namesakes() -> List<Source> =
+  [
+    { path: "fmt.ply", text: "pub fn fmt_source(src: Int) -> Int = src\n" },
+    { path: "items.ply", text: "pub fn parse(src: Int) -> Int = src\n" },
+    { path: "lexer.ply", text: "pub fn lex(src: Int) -> Int = src\n" },
+    { path: "parsing.ply", text: "pub type Span = | Nowhere\npub fn span_to(a: Int) -> Int = a\n" },
+    {
+      path: "app.ply",
+      text:
+        \\import std.checker
+        \\import std.json
+        \\import std.syntax
+        \\import fmt (fmt_source)
+        \\import items (parse)
+        \\import lexer (lex)
+        \\import parsing (span_to)
+        \\
+        \\pub fn mine() -> Int = fmt_source(1) + parse(2) + lex(3) + span_to(4)
+        \\
+        \\pub fn formatted() -> Bytes / {abort.raise} = syntax::formatted(b"fn  f()->Int = 1\n")
+        \\
+        \\pub fn checked_names() -> List<String> / {abort.raise} =
+        \\  match checker::check_alone([{ path: "m.ply", text: b"fn f() -> Int = 1\n" }], { files: 1, bytes: 100 }) {
+        \\    Ok(c) -> map(c.definitions, |d: checker::Definition| d.name),
+        \\    Err(_) -> [],
+        \\  }
+        \\
+        \\test "the shipped modules answer as they do anywhere, and the project's are its own" {
+        \\  assert_eq(mine(), 10);
+        \\  assert_eq(formatted(), b"fn f() -> Int = 1\n");
+        \\  assert_eq(checked_names(), ["m.f"])
+        \\}
+        \\
+    },
+  ]
+
+/// The module an `import` line names: `import std.list (at)` names `std.list`.
+fn imported(line: String) -> String / {abort.raise} = {
+  let rest = string_slice(line, 7, string_len(line));
+  match string::split_once(rest, " ") { Some(x) -> x.head, None -> rest }
+}
+
+/// Each shipped module by its name, with the modules its `import` lines name as written.
+fn shipped_imports() -> List<{ name: String, imports: List<String> }> / {Shipped, abort.raise} =
+  map(shipped_sources(), |source: Source|
+    {
+      name: string_slice(source.path, 0, string_len(source.path) - 4),
+      imports: map(
         filter(string_split(source.text, "\n"), |l: String| string_starts_with(l, "import ")),
-        u,
-        |v: Unit, l: String|
-          assert(
-            string_starts_with(string_slice(l, 7, string_len(l)), "std."),
-            Some("`" ++ source.path ++ "` imports something outside `std`: " ++ l),
-          ),
+        imported,
       ),
+    })
+
+// A shipped module's import resolves among the shipped modules alone: a project can name no module
+// under `std` or `compiler` (above), and a bare import of the compiler's names its own sibling.
+test "no cycle can be built between a project and the stdlib" {
+  let files = namesakes();
+  assert_ok(in_memory(tree(files), ["test"]));
+  // What each shipped definition references, as the load resolved it: none of the project's.
+  let own = map(files, |f: Source| string_slice(f.path, 0, string_len(f.path) - 4) ++ ".");
+  let answer = json_of(in_memory(tree(files), ["hash", "--json", "--deps"]));
+  let shipped = filter(items(at(answer, "definitions")), |d: Json|
+    is_shipped(str(at(d, "module"))));
+  assert(len(shipped) > 0, Some("the load reached no shipped definition: " ++ shown(answer)));
+  fold(shipped, (), |u: Unit, d: Json|
+    fold(items(at(d, "deps")), u, |v: Unit, dep: Json|
+      assert(
+        !any(own, |prefix: String| string_starts_with(str(dep), prefix)),
+        Some(
+          "the shipped `" ++ str(at(d, "name")) ++ "` references the project's `" ++ str(dep)
+            ++ "`",
+        ),
+      )));
+  assert(
+    len(filter(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) == "parsing.span_to"))
+      == 1,
+    Some("the project's own `parsing` is not its own: " ++ shown(answer)),
+  )
+}
+
+test "{m.module} imports only shipped modules" for m: StdModule in std_modules() {
+  fold(
+    filter(string_split(string_of_bytes(m.src), "\n"), |l: String|
+      string_starts_with(l, "import ")),
+    (),
+    |u: Unit, l: String|
+      assert(
+        is_shipped(imported(l)),
+        Some(
+          "`" ++ m.module ++ "` imports `" ++ imported(l)
+            ++ "`, which neither the library nor the compiler holds",
+        ),
+      ),
+  )
+}
+
+/// The library modules that import the compiler's, directly or through another library module.
+fn over_compiler(
+  modules: List<{ name: String, imports: List<String> }>,
+) -> Map<String, Bool> / {abort.raise} =
+  iterate(map_new(), len(modules) + 1, |held: Map<String, Bool>| {
+    let grown = fold(
+      modules,
+      held,
+      |acc: Map<String, Bool>, m: { name: String, imports: List<String> }|
+        if !is_std(m.name) || map_contains(acc, m.name) { acc }
+        else if any(m.imports, |i: String| is_compiler(i) || map_contains(acc, i)) {
+          map_insert(acc, m.name, true)
+        } else { acc },
+    );
+    if map_len(grown) == map_len(held) { Stop(grown) } else { Continue(grown) }
+  })
+
+// The other half: the compiler, which the builder builds, imports no library module that reaches
+// back into it, so the library may import the compiler without a cycle.
+test "no module of the compiler imports a library module that imports the compiler" {
+  let modules = shipped_imports();
+  let over = over_compiler(modules);
+  assert(
+    map_contains(over, "std.syntax") && map_contains(over, "std.checker"),
+    Some("the library modules over the compiler are not found, so this test holds of nothing"),
+  );
+  let wrong = fold(modules, [], |acc: List<String>, m: { name: String, imports: List<String> }|
+    if !is_compiler(m.name) { acc } else {
+      fold(m.imports, acc, |a: List<String>, i: String|
+        if map_contains(over, i) { push(a, m.name ++ " imports " ++ i) } else { a })
+    });
+  assert(
+    wrong == [],
+    Some("a cycle between the compiler and the library:\n" ++ string::join(wrong, "\n")),
   )
 }
 
@@ -173,6 +288,28 @@ test "a definition that does not import std is unmoved by one that does" {
 }
 
 /// `std.net` as the compiler before this one shipped it: `edit` of what this one ships.
+/// A shipped module a project's load would refuse were it to read its test, which does not parse,
+/// or its helper only the test calls, which does not check; its law imports `std.laws`.
+fn counted() -> Source =
+  {
+    path: "std.counted.ply",
+    text: "//! Counting.\n\nimport std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\nfn twice(x: Int) -> Int = \"two\"\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)) 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n",
+  }
+
+test "a project's load reads no test or law of a shipped module, nor what only they reach" {
+  scratch(|| {
+    project([
+      {
+        path: "m.ply",
+        text: "import std.counted\n\n/// Two more.\npub fn two_more(x: Int) -> Int = counted::more(counted::more(x))\n",
+      },
+    ]);
+    let ran = on_disk_shipping(["check", "--json"], [counted()]);
+    assert_ok(ran);
+    assert_eq(map(items(at(json_of(ran), "files")), str), ["m.ply", "<std>/counted.ply"])
+  })
+}
+
 fn an_older_net<| e>(edit: (String) -> String / e) -> List<Source> / {abort.raise | e} = {
   let now = string_of_bytes(embed("../../ply-std/ply/net.ply"));
   let was = edit(now);

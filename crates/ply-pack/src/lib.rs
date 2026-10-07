@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-/// The shipped modules: `std.<stem>` for each `.ply` file here. Every other file at or below it is
-/// data those modules embed.
+/// The shipped modules: each `.ply` file at or below it is one, `hash/legacy.ply` being
+/// `std.hash.legacy`. Every other file at or below it is data those modules embed.
 pub const STD: &str = "crates/ply-std/ply";
 
 const MODULE: &str = ".ply";
@@ -33,6 +33,9 @@ pub const MANIFEST: &str = "ply.pkg";
 
 /// What a trace names a directory's data by, after the directory.
 const DATA_BELOW: &str = "/**";
+
+/// What a trace names the modules at or below a directory by, after the directory.
+const MODULES_BELOW: &str = "/**.ply";
 
 const MAGIC: &[u8; 8] = b"PLYPACK1";
 const TRAILER: usize = 8 + 8 + MAGIC.len();
@@ -67,8 +70,7 @@ impl Pack {
     /// use, so a process that asks for one module reads one file.
     pub fn of_checkout(repo: &Path) -> Result<Pack, String> {
         let mut paths: Vec<String> = Vec::new();
-        paths.extend(files_in(repo, STD, |name| name.ends_with(MODULE))?);
-        paths.extend(data_below(repo, STD)?);
+        paths.extend(below(repo, STD)?);
         paths.extend(files_in(repo, COMPILER, |name| name.ends_with(MODULE))?);
         paths.push(PRELUDE.to_string());
         paths.extend(bootstrap(repo, BUILDER_BUILT, &BUILDER_FILES)?);
@@ -158,18 +160,27 @@ impl Pack {
         asked(|a| {
             a.dirs.insert(format!("{dir}{DATA_BELOW}"));
         });
-        self.data_in(dir)
+        self.below_in(dir, false)
     }
 
-    fn data_in<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
+    /// The paths of the modules at or below `dir`, ascending.
+    pub fn modules_below<'a>(&'a self, dir: &str) -> impl Iterator<Item = &'a str> + 'a {
+        asked(|a| {
+            a.dirs.insert(format!("{dir}{MODULES_BELOW}"));
+        });
+        self.below_in(dir, true)
+    }
+
+    fn below_in<'a>(&'a self, dir: &str, modules: bool) -> impl Iterator<Item = &'a str> + 'a {
         let prefix = format!("{dir}/");
-        self.listed()
-            .filter(move |path| path.starts_with(prefix.as_str()) && !path.ends_with(MODULE))
+        self.listed().filter(move |path| {
+            path.starts_with(prefix.as_str()) && path.ends_with(MODULE) == modules
+        })
     }
 
     /// What this process asked of the pack since [`record`], as trace lines: `pack\t<path>\t<digest>`
-    /// a file read, `packed\t<dir>\t<digest>` a directory listed, `<dir>/**` for the data below one
-    /// and `*` for every path.
+    /// a file read, `packed\t<dir>\t<digest>` a directory listed, `<dir>/**` for the data below one,
+    /// `<dir>/**.ply` for the modules below one and `*` for every path.
     pub fn asked_lines(&self) -> Vec<String> {
         let Some(asked) = ASKED.get() else {
             return Vec::new();
@@ -211,8 +222,10 @@ impl Pack {
         let mut hasher = blake3::Hasher::new();
         let names: Vec<&str> = if dir == "*" {
             self.listed().collect()
+        } else if let Some(dir) = dir.strip_suffix(MODULES_BELOW) {
+            self.below_in(dir, true).collect()
         } else if let Some(dir) = dir.strip_suffix(DATA_BELOW) {
-            self.data_in(dir).collect()
+            self.below_in(dir, false).collect()
         } else {
             self.directly_in(dir).collect()
         };
@@ -503,9 +516,9 @@ fn files_in(repo: &Path, dir: &str, keep: impl Fn(&str) -> bool) -> Result<Vec<S
     Ok(out)
 }
 
-/// The paths of the files at or below `dir` that are no module, ascending. Nothing under a name
-/// starting with `.` is one, as no walk of a project reads there.
-fn data_below(repo: &Path, dir: &str) -> Result<Vec<String>, String> {
+/// The paths of the files at or below `dir`, ascending: its modules and the data they embed.
+/// Nothing under a name starting with `.` is either, as no walk of a project reads there.
+fn below(repo: &Path, dir: &str) -> Result<Vec<String>, String> {
     let unlisted = |e: std::io::Error| format!("`{dir}` could not be listed: {e}");
     let mut out = Vec::new();
     for entry in std::fs::read_dir(repo.join(dir)).map_err(unlisted)? {
@@ -516,8 +529,8 @@ fn data_below(repo: &Path, dir: &str) -> Result<Vec<String>, String> {
         }
         let path = format!("{dir}/{name}");
         if entry.path().is_dir() {
-            out.extend(data_below(repo, &path)?);
-        } else if entry.path().is_file() && !name.ends_with(MODULE) {
+            out.extend(below(repo, &path)?);
+        } else if entry.path().is_file() {
             out.push(path);
         }
     }
