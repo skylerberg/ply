@@ -97,7 +97,7 @@ CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
 # Runs cut into parts by `ply test --shard K/N`, as `entry:N`, each part the run `entry#K`: one too long
 # for a lane whatever its tests are placed by, as a test over cases is one test.
-CORPUS_SHARDED=("cli-phases:3")
+CORPUS_SHARDED=("cli-phases:3" "cli-http_audit:2")
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
 # steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
 RUNS_MARGIN=4
