@@ -1,0 +1,2613 @@
+//! Zstandard (RFC 8878): frames read and written.
+//!
+//! `decompress` reads what any writer of the format wrote: blocks as they are, of one byte
+//! repeated, and of literals and sequences in every mode the format has for either; a stream of
+//! several frames as the one stream they are, skippable frames among them passed; a frame's
+//! length checked where it declares one and its checksum where it ends with one; and, by
+//! `decompress_with`, frames written with a dictionary. `first` reads one frame and says where it
+//! ended.
+//!
+//! Every reader takes `Limits`, and there is none without them. `output` is the most bytes it
+//! answers, and a frame that declares more is refused at its header. `window` is the most bytes
+//! of history a frame may ask the reader to keep: a frame of a few bytes can ask for gigabytes,
+//! and one that asks for more than `window` is refused at its header, before a block is read. A
+//! refusal says why and at which byte of the input; `decompress` raises it, as `zstd.refused`, and
+//! `try_decompress` answers it. Bytes after the last frame that open no other are refused.
+//!
+//! `compress` writes one frame. `Fast` looks one place back for each position, codes literals
+//! under a Huffman code and sequences under tables of each block's own, and writes about a
+//! quarter more than `zstd -1` on prose and source and about what it writes on a binary;
+//! `Stored` writes the bytes as they are. What either writes is a function of the bytes alone.
+//!
+//! `decoded` and `encoded` are the two directions over a `std.seq` sequence of chunks, as
+//! `std.io`'s `chunks` gives a file: a stream is read or written in the memory of its window and
+//! a block, whatever its length, and `decoded` answers the same bytes as `decompress` however
+//! the input is cut.
+
+import std.bytes (bits_at, bytes_of_hex, cycle, pieces, repeat, u32_le, with_byte, word_at)
+import std.checksum
+import std.checksum (Xxh64)
+import std.laws (inverse)
+import std.list (at_or, take)
+import std.lz (code_lengths, codes_below, drained, found, spans, tally)
+import std.math (bit_length)
+import std.seq
+import std.seq (seq, Seq, Done, Skip, Yield)
+
+// --- Refusals ---------------------------------------------------------------
+
+/// Why a reader refused.
+pub type Why =
+  /// The bytes do not open with a frame's magic number.
+  | NotThisFormat
+  /// The stream holds, or a frame declares, more bytes than `Limits.output`.
+  | OverLimit
+  /// A frame asks its reader to keep more bytes of history than `Limits.window`.
+  | Window
+  /// The input ends before the stream does.
+  | Truncated
+  /// A frame header with a reserved bit set.
+  | Header
+  /// A block of the type the format reserves.
+  | BlockType
+  /// A block longer than a frame's blocks may be, written or unpacked.
+  | BlockSize
+  /// A literals section whose sizes disagree, whose streams do not end where they say, or that
+  /// reuses a code no block before it set.
+  | Literals
+  /// Weights that are no prefix code of at most eleven bits.
+  | Weights
+  /// A table of sequence codes that is no distribution, names a code the format has none for, or
+  /// repeats a table no block before it set.
+  | Table
+  /// A sequences section with a reserved bit set, or whose bits do not end where its sequences do.
+  | Sequences
+  /// A match that reaches back before the first byte it may, or an offset of zero.
+  | Offset
+  /// A frame that names a dictionary other than the one given, or bytes that are no dictionary.
+  | Dictionary
+  /// A frame whose checksum is not its content's.
+  | Checksum
+  /// A frame that holds another number of bytes than its header declares.
+  | Length
+  /// Bytes after a frame that open no other.
+  | Trailing
+
+/// A refusal, and the offset of the input byte the reader stood at.
+pub type Refusal = new { at: Int, why: Why }
+
+/// What a reader of this module raises where it refuses.
+pub effect zstd {
+  /// The input is not whole frames, or asks for more than the limits.
+  raise refused(e: Refusal)
+}
+
+fn refuse<a>(at: Int, why: Why) -> a / {zstd.refused} = zstd.refused({ at: at, why: why })
+
+/// What a reader may spend: the most bytes it answers, and the most bytes of history a frame may
+/// ask it to keep.
+pub type Limits = new { output: Int, window: Int }
+
+// --- Bits -------------------------------------------------------------------
+
+/// Each byte value as the one byte it is.
+const fn singles() -> Array<Bytes> = array_of_list(map(range(0, 256), byte_of_int))
+
+// A block is read through sixteen zero bytes before it and eight after, so eight bytes can be
+// read at any bit of it and a little before, and a stream read downward reads zeros below it.
+
+fn padded(input: Bytes, from: Int, to: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    bytes_slice(input, from, to),
+    b"\x00\x00\x00\x00\x00\x00\x00\x00",
+  ])
+
+// --- Finite state tables ------------------------------------------------------
+
+/// A distribution as a table description spells it: each symbol's count, -1 for one of less than
+/// a cell, the bits a state is, and the byte after the description.
+type Norm = { counts: List<Int>, log: Int, next: Int }
+
+type Counted = { counts: List<Int>, bit: Int, left: Int }
+
+/// The counts from bit `bit` until they fill the `left` cells still unclaimed. A count is read in
+/// as few bits as tell it from the ones still possible.
+fn counted(
+  blk: Bytes,
+  bit: Int,
+  stop: Int,
+  left: Int,
+  counts: List<Int>,
+  fuel: Int,
+) -> Counted / {abort.raise} =
+  if left <= 0 || fuel <= 0 || bit > stop { { counts: counts, bit: bit, left: left } } else {
+    let width = bit_length(left + 1);
+    let raw = bits_at(blk, bit, width);
+    let low = (1 << width - 1) - 1;
+    let threshold = (1 << width) - 2 - left;
+    let short = raw & low < threshold;
+    let value = if short { raw & low } else if raw > low { raw - threshold } else { raw };
+    let used = if short { width - 1 } else { width };
+    let after = left - (if value == 0 { 1 } else { value - 1 });
+    if value == 1 { zero_run(blk, bit + used, stop, after, push(counts, 0), fuel - 1) }
+    else { counted(blk, bit + used, stop, after, push(counts, value - 1), fuel - 1) }
+  }
+
+/// After a count of zero, two bits say how many more follow it, and three that two more bits do.
+fn zero_run(
+  blk: Bytes,
+  bit: Int,
+  stop: Int,
+  left: Int,
+  counts: List<Int>,
+  fuel: Int,
+) -> Counted / {abort.raise} =
+  if fuel <= 0 || bit > stop { { counts: counts, bit: bit, left: left } } else {
+    let more = bits_at(blk, bit, 2);
+    let filled = fold(range(0, more), counts, |c: List<Int>, _: Int| push(c, 0));
+    if more == 3 { zero_run(blk, bit + 2, stop, left, filled, fuel - 1) }
+    else { counted(blk, bit + 2, stop, left, filled, fuel - 1) }
+  }
+
+/// The table description at byte `at` of a block that ends at `end`, of at most `most_log` bits a
+/// state and symbols up to `most`.
+fn norm(
+  blk: Bytes,
+  at: Int,
+  end: Int,
+  most_log: Int,
+  most: Int,
+  where: Int,
+) -> Norm / {zstd.refused, abort.raise} =
+  if at >= end { refuse(where, Table) } else {
+    let log = 5 + (bytes_at(blk, at) & 15);
+    if log > most_log { refuse(where, Table) } else {
+      let read = counted(blk, at * 8 + 4, end * 8, 1 << log, [], 2 * most + 8);
+      if read.left != 0 || read.bit > end * 8 || len(read.counts) > most + 1 {
+        refuse(where, Table)
+      } else { { counts: read.counts, log: log, next: read.bit + 7 >>> 3 } }
+    }
+  }
+
+type Placed = { cells: Array<Int>, high: Int }
+
+/// A symbol of less than a cell takes one, from the table's end down.
+fn lows(c: Array<Int>, s: Int, high: Int, cells: Array<Int>) -> Placed / {abort.raise} =
+  if s >= array_len(c) { { cells: cells, high: high } }
+  else if array_get(c, s) == -1 { lows(c, s + 1, high - 1, array_set(cells, high - 1, s)) }
+  else { lows(c, s + 1, high, cells) }
+
+/// The next cell a step around the table that no low symbol holds.
+fn onward(pos: Int, size: Int, high: Int, fuel: Int) -> Int = {
+  let next = pos + (size >>> 1) + (size >>> 3) + 3 & size - 1;
+  if next >= high && fuel > 0 { onward(next, size, high, fuel - 1) } else { next }
+}
+
+/// Each symbol from `s` takes as many cells as its count, a step apart.
+fn spread(
+  c: Array<Int>,
+  s: Int,
+  left: Int,
+  pos: Int,
+  high: Int,
+  cells: Array<Int>,
+  fuel: Int,
+) -> Array<Int> / {abort.raise} =
+  if fuel <= 0 || s >= array_len(c) { cells } else if left <= 0 {
+    let more = if s + 1 < array_len(c) { max(array_get(c, s + 1), 0) } else { 0 };
+    spread(c, s + 1, more, pos, high, cells, fuel - 1)
+  } else {
+    let size = array_len(cells);
+    spread(c, s, left - 1, onward(pos, size, high, size), high, array_set(cells, pos, s), fuel - 1)
+  }
+
+/// Each cell from `i` made the state it is: its symbol's states, in the order of their cells,
+/// count upward from the symbol's count, and one reads the bits that bring it back under the
+/// table's size. A state is what `carried` holds for its symbol above bit 14, the bits it reads
+/// at bit 10, and the state those bits are added to below.
+fn states(
+  cells: Array<Int>,
+  i: Int,
+  next: Array<Int>,
+  log: Int,
+  carried: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if i >= array_len(cells) { cells } else {
+    let s = array_get(cells, i);
+    let n = array_get(next, s);
+    let width = log + 1 - bit_length(n);
+    states(
+      array_set(cells, i, array_get(carried, s) << 14 | width << 10 | (n << width) - (1 << log)),
+      i + 1,
+      array_set(next, s, n + 1),
+      log,
+      carried,
+    )
+  }
+
+/// The decoding table of a distribution whose every symbol `carried` has an entry for.
+fn fse(counts: List<Int>, log: Int, carried: Array<Int>) -> Array<Int> / {abort.raise} = {
+  let c = array_of_list(counts);
+  let size = 1 << log;
+  let low = lows(c, 0, size, array_new(size, 0));
+  let high = low.high;
+  let first = if array_len(c) > 0 { max(array_get(c, 0), 0) } else { 0 };
+  let cells = spread(c, 0, first, 0, high, low.cells, size + array_len(c) + 2);
+  states(cells, 0, array_of_list(map(counts, |p: Int| if p == -1 { 1 } else { p })), log, carried)
+}
+
+/// What a literal length code carries, 0 to 35.
+const fn length_codes() -> Array<Int> =
+  spans(
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      2,
+      2,
+      3,
+      3,
+      4,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+    ],
+    0,
+  )
+
+/// What a match length code carries, 0 to 52.
+const fn match_codes() -> Array<Int> =
+  spans(
+    [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1,
+      1,
+      1,
+      2,
+      2,
+      3,
+      3,
+      4,
+      4,
+      5,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+    ],
+    3,
+  )
+
+/// What an offset code carries, 0 to 31: the code is the count of its extra bits.
+const fn offset_codes() -> Array<Int> =
+  array_of_list(map(range(0, 32), |code: Int| 1 << code << 5 | code))
+
+/// A symbol as itself, for a table of weights.
+const fn plain_codes() -> Array<Int> = array_of_list(range(0, 256))
+
+// The three tables of sequence codes stand in one array: literal lengths from 0, match lengths
+// from 512 and offsets from 1024, so a state is its index there.
+
+/// Where the table of a kind starts: 0 is literal lengths, 1 offsets, 2 match lengths, the order
+/// a block describes them in.
+fn region(kind: Int) -> Int = if kind == 0 { 0 } else if kind == 1 { 1024 } else { 512 }
+
+fn carried(kind: Int) -> Array<Int> =
+  if kind == 0 { length_codes() } else if kind == 1 { offset_codes() } else { match_codes() }
+
+fn most_symbol(kind: Int) -> Int = if kind == 0 { 35 } else if kind == 1 { 31 } else { 52 }
+
+fn most_log(kind: Int) -> Int = if kind == 1 { 8 } else { 9 }
+
+fn default_log(kind: Int) -> Int = if kind == 1 { 5 } else { 6 }
+
+/// `table` laid into `all` from `base`.
+fn laid(all: Array<Int>, base: Int, table: Array<Int>, i: Int) -> Array<Int> / {abort.raise} =
+  if i >= array_len(table) { all }
+  else { laid(array_set(all, base + i, array_get(table, i)), base, table, i + 1) }
+
+/// The `n` cells of `from` at `base` laid into `all` at the same place.
+fn relaid(
+  all: Array<Int>,
+  from: Array<Int>,
+  base: Int,
+  n: Int,
+  i: Int,
+) -> Array<Int> / {abort.raise} =
+  if i >= n { all }
+  else { relaid(array_set(all, base + i, array_get(from, base + i)), from, base, n, i + 1) }
+
+/// The tables a block uses where it describes none.
+const fn predefined() -> Array<Int> = {
+  let lengths = fse(
+    [
+      4,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      3,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      -1,
+      -1,
+      -1,
+      -1,
+    ],
+    6,
+    length_codes(),
+  );
+  let matches = fse(
+    [
+      1,
+      4,
+      3,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+      -1,
+    ],
+    6,
+    match_codes(),
+  );
+  let offsets = fse(
+    [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1],
+    5,
+    offset_codes(),
+  );
+  laid(laid(laid(array_new(1280, 0), 0, lengths, 0), 512, matches, 0), 1024, offsets, 0)
+}
+
+type Tabled = { tables: Array<Int>, log: Int, next: Int }
+
+/// One of a block's three tables, set as its mode says: the predefined one, one symbol alone, one
+/// described at byte `at`, or the table the block before left.
+fn tabled(
+  blk: Bytes,
+  at: Int,
+  end: Int,
+  mode: Int,
+  kind: Int,
+  tables: Array<Int>,
+  before: Int,
+  where: Int,
+) -> Tabled / {zstd.refused, abort.raise} =
+  if mode == 0 {
+    {
+      tables: relaid(tables, predefined(), region(kind), 1 << default_log(kind), 0),
+      log: default_log(kind),
+      next: at,
+    }
+  } else if mode == 1 {
+    if at >= end || bytes_at(blk, at) > most_symbol(kind) { refuse(where, Table) } else {
+      {
+        tables: array_set(tables, region(kind), array_get(carried(kind), bytes_at(blk, at)) << 14),
+        log: 0,
+        next: at + 1,
+      }
+    }
+  } else if mode == 2 {
+    let n = norm(blk, at, end, most_log(kind), most_symbol(kind), where);
+    {
+      tables: laid(tables, region(kind), fse(n.counts, n.log, carried(kind)), 0),
+      log: n.log,
+      next: n.next,
+    }
+  } else if before < 0 { refuse(where, Table) }
+  else { { tables: tables, log: before, next: at } }
+
+// --- Literals ---------------------------------------------------------------
+
+/// A prefix code as a reader looks one up: indexed by the next `bits` bits, most significant
+/// first, each entry a symbol over the bits its code takes, `symbol << 4 | length`.
+type Code = { table: Array<Int>, bits: Int }
+
+/// `n` cells of `table` from `at` set to `entry`.
+fn run(table: Array<Int>, at: Int, entry: Int, n: Int) -> Array<Int> / {abort.raise} =
+  if n <= 0 { table } else { run(array_set(table, at, entry), at + 1, entry, n - 1) }
+
+/// The symbols of each weight in turn from the least, which are the longest codes and take the
+/// lowest cells: a symbol of weight `w` takes `2^(w - 1)` of them.
+fn ranked(
+  weights: Array<Int>,
+  w: Int,
+  s: Int,
+  pos: Int,
+  bits: Int,
+  table: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if w > bits { table }
+  else if s >= array_len(weights) { ranked(weights, w + 1, 0, pos, bits, table) }
+  else if array_get(weights, s) != w { ranked(weights, w, s + 1, pos, bits, table) } else {
+    let span = 1 << w - 1;
+    ranked(weights, w, s + 1, pos + span, bits, run(table, pos, s << 4 | bits + 1 - w, span))
+  }
+
+/// The code of a list of weights, one a symbol from symbol 0, and the last symbol's, which is
+/// what makes the cells a power of two.
+fn code_of(weights: List<Int>, where: Int) -> Code / {zstd.refused, abort.raise} = {
+  let sum = fold(weights, 0, |total: Int, w: Int|
+    if w > 0 && w <= 12 { total + (1 << w - 1) } else if w == 0 { total } else { total + 8192 });
+  let bits = bit_length(sum);
+  let left = (1 << bits) - sum;
+  if sum == 0 || bits > 11 || len(weights) > 255 || left & left - 1 != 0 { refuse(where, Weights) }
+  else {
+    let all = array_of_list(push(weights, bit_length(left)));
+    let ones = fold(push(weights, bit_length(left)), 0, |n: Int, w: Int|
+      if w == 1 { n + 1 } else { n });
+    if ones < 2 { refuse(where, Weights) }
+    else { { table: ranked(all, 1, 0, 0, bits, array_new(1 << bits, 0)), bits: bits } }
+  }
+}
+
+/// The `n` bits below bit `top` of a stream that starts at bit `floor`, zeros below it.
+fn below(blk: Bytes, floor: Int, top: Int, n: Int) -> Int / {abort.raise} =
+  if top - n >= floor { bits_at(blk, top - n, n) }
+  else if top <= floor { 0 }
+  else { bits_at(blk, floor, top - floor) << n - (top - floor) }
+
+/// Weights coded by two states that take turns down one stream: each gives its symbol and reads
+/// its bits, and when one reads past the stream's start the other gives its last.
+fn weighed(
+  blk: Bytes,
+  floor: Int,
+  bit: Int,
+  table: Array<Int>,
+  a: Int,
+  b: Int,
+  out: List<Int>,
+  fuel: Int,
+) -> List<Int> / {abort.raise} =
+  if fuel <= 0 { out } else {
+    let cell = array_get(table, a);
+    let width = cell >>> 10 & 15;
+    let next = (cell & 1023) + below(blk, floor, bit, width);
+    let given = push(out, cell >>> 14);
+    if bit - width < floor { push(given, array_get(table, b) >>> 14) }
+    else { weighed(blk, floor, bit - width, table, b, next, given, fuel - 1) }
+  }
+
+type Tree = { code: Code, next: Int }
+
+/// The code a literals section describes at byte `at`: weights four bits each, or coded.
+fn tree(blk: Bytes, at: Int, end: Int, where: Int) -> Tree / {zstd.refused, abort.raise} =
+  if at >= end { refuse(where, Weights) } else {
+    let head = bytes_at(blk, at);
+    if head >= 128 {
+      let n = head - 127;
+      let size = n + 1 >>> 1;
+      if at + 1 + size > end { refuse(where, Weights) } else {
+        let weights = map(range(0, n), |i: Int|
+          bytes_at(blk, at + 1 + (i >>> 1)) >>> (if i & 1 == 0 { 4 } else { 0 }) & 15);
+        { code: code_of(weights, where), next: at + 1 + size }
+      }
+    } else {
+      let last = at + head;
+      if head == 0 || last >= end || bytes_at(blk, last) == 0 { refuse(where, Weights) } else {
+        let n = norm(blk, at + 1, last + 1, 6, 12, where);
+        let floor = n.next * 8;
+        let top = last * 8 + bit_length(bytes_at(blk, last)) - 1;
+        if n.next > last { refuse(where, Weights) } else {
+          let table = fse(n.counts, n.log, plain_codes());
+          let a = below(blk, floor, top, n.log);
+          let b = below(blk, floor, top - n.log, n.log);
+          let weights = weighed(blk, floor, top - 2 * n.log, table, a, b, [], 256);
+          { code: code_of(weights, where), next: last + 1 }
+        }
+      }
+    }
+  }
+
+/// `left` symbols of a stream read downward from bit `bit` to bit `floor`, four a step while four
+/// remain. The stream ends exactly where its symbols do.
+fn symbols(
+  blk: Bytes,
+  floor: Int,
+  bit: Int,
+  table: Array<Int>,
+  width: Int,
+  one: Array<Bytes>,
+  out: Bytes,
+  left: Int,
+  where: Int,
+) -> Bytes / {zstd.refused, abort.raise} =
+  if bit < floor { refuse(where, Literals) }
+  else if left <= 0 { if bit == floor { out } else { refuse(where, Literals) } } else if left >= 4 {
+    let w = word_at(blk, bit - 48 >>> 3) >>> (bit - 48 & 7);
+    let mask = (1 << width) - 1;
+    let a = array_get(table, w >>> 48 - width & mask);
+    let used = a & 15;
+    let b = array_get(table, w >>> 48 - used - width & mask);
+    let two = used + (b & 15);
+    let c = array_get(table, w >>> 48 - two - width & mask);
+    let three = two + (c & 15);
+    let d = array_get(table, w >>> 48 - three - width & mask);
+    symbols(
+      blk,
+      floor,
+      bit - three - (d & 15),
+      table,
+      width,
+      one,
+      out ++ array_get(one, a >>> 4) ++ array_get(one, b >>> 4) ++ array_get(one, c >>> 4)
+        ++ array_get(one, d >>> 4),
+      left - 4,
+      where,
+    )
+  } else {
+    let a = array_get(table, bits_at(blk, bit - width, width));
+    symbols(
+      blk,
+      floor,
+      bit - (a & 15),
+      table,
+      width,
+      one,
+      out ++ array_get(one, a >>> 4),
+      left - 1,
+      where,
+    )
+  }
+
+/// The `count` symbols of the stream in bytes `from` to `to`, after `out`. A stream's last byte
+/// holds a set bit above its last bit.
+fn stream(
+  blk: Bytes,
+  from: Int,
+  to: Int,
+  code: Code,
+  out: Bytes,
+  count: Int,
+  where: Int,
+) -> Bytes / {zstd.refused, abort.raise} =
+  if to <= from || bytes_at(blk, to - 1) == 0 { refuse(where, Literals) } else {
+    symbols(
+      blk,
+      from * 8,
+      (to - 1) * 8 + bit_length(bytes_at(blk, to - 1)) - 1,
+      code.table,
+      code.bits,
+      singles(),
+      out,
+      count,
+      where,
+    )
+  }
+
+/// Four streams one after another, their sizes in six bytes before them: the first three hold a
+/// quarter of the symbols each, rounded up, and the last the rest.
+fn four_streams(
+  blk: Bytes,
+  from: Int,
+  to: Int,
+  code: Code,
+  count: Int,
+  where: Int,
+) -> Bytes / {zstd.refused, abort.raise} = {
+  let sizes = word_at(blk, from);
+  let a = from + 6 + (sizes & 0xFFFF);
+  let b = a + (sizes >>> 16 & 0xFFFF);
+  let c = b + (sizes >>> 32 & 0xFFFF);
+  let each = count + 3 >>> 2;
+  if from + 6 > to || c >= to || count < 6 { refuse(where, Literals) } else {
+    let first = stream(blk, from + 6, a, code, b"", each, where);
+    let second = stream(blk, a, b, code, first, each, where);
+    let third = stream(blk, b, c, code, second, each, where);
+    stream(blk, c, to, code, third, count - 3 * each, where)
+  }
+}
+
+/// A block's literals, the byte after their section, and the code the next block may reuse.
+type Lits = { bytes: Bytes, next: Int, code: Code }
+
+/// The literals section at byte `at` of a block that ends at `end`: the bytes as they are, one
+/// byte repeated, or coded, by a code described there or by `before`. None is longer than `most`.
+fn literals(
+  blk: Bytes,
+  at: Int,
+  end: Int,
+  before: Code,
+  most: Int,
+  where: Int,
+) -> Lits / {zstd.refused, abort.raise} = {
+  let head = word_at(blk, at);
+  let kind = head & 3;
+  let format = head >>> 2 & 3;
+  if at >= end { refuse(where, Literals) } else if kind < 2 {
+    let size = if format & 1 == 0 { 1 } else if format == 1 { 2 } else { 3 };
+    let count = if size == 1 { head >>> 3 & 31 }
+    else if size == 2 { head >>> 4 & 0xFFF }
+    else { head >>> 4 & 0xF_FFFF };
+    let from = at + size;
+    if count > most || from + (if kind == 0 { count } else { 1 }) > end { refuse(where, Literals) }
+    else if kind == 0 {
+      { bytes: bytes_slice(blk, from, from + count), next: from + count, code: before }
+    } else {
+      { bytes: cycle(bytes_slice(blk, from, from + 1), count), next: from + 1, code: before }
+    }
+  } else {
+    let size = if format < 2 { 3 } else { format + 2 };
+    let width = if format < 2 { 10 } else if format == 2 { 14 } else { 18 };
+    let count = head >>> 4 & (1 << width) - 1;
+    let packed = head >>> 4 + width & (1 << width) - 1;
+    let from = at + size;
+    let to = from + packed;
+    if count > most || count == 0 || to > end { refuse(where, Literals) } else {
+      let told = if kind == 2 { tree(blk, from, to, where) }
+      else if before.bits == 0 { refuse(where, Literals) }
+      else { { code: before, next: from } };
+      let bytes = if format == 0 { stream(blk, told.next, to, told.code, b"", count, where) }
+      else { four_streams(blk, told.next, to, told.code, count, where) };
+      { bytes: bytes, next: to, code: told.code }
+    }
+  }
+}
+
+// --- Sequences --------------------------------------------------------------
+
+/// What a block's sequences leave: the bytes written and the three offsets last used.
+type Run = { out: Bytes, r1: Int, r2: Int, r3: Int }
+
+// What a block may not pass, in an array a sequence reads: 0 the length its output may reach, 1
+// the first byte of history a match may copy, 2 the frame's window, 3 where the frame's own
+// bytes start, 4 the input offset a refusal names, and 5 whether passing 0 is the limit's doing.
+
+fn over(lim: Array<Int>) -> Why / {abort.raise} =
+  if array_get(lim, 5) == 1 { OverLimit } else { BlockSize }
+
+/// One sequence read from below bit `bit`: the extra bits of its offset, match length and literal
+/// length, and then, but for the block's last, the bits that move each state on. All of them are
+/// read at once where they fit a word.
+fn sequence(
+  blk: Bytes,
+  floor: Int,
+  bit: Int,
+  ls: Int,
+  ms: Int,
+  os: Int,
+  tables: Array<Int>,
+  lits: Bytes,
+  lp: Int,
+  out: Bytes,
+  r1: Int,
+  r2: Int,
+  r3: Int,
+  left: Int,
+  lim: Array<Int>,
+) -> Run / {zstd.refused, abort.raise} =
+  if left <= 0 { ended(blk, floor, bit, lits, lp, out, r1, r2, r3, lim) } else {
+    let le = array_get(tables, ls);
+    let me = array_get(tables, ms);
+    let oe = array_get(tables, os);
+    let lb = le >>> 14 & 31;
+    let mb = me >>> 14 & 31;
+    let ob = oe >>> 14 & 31;
+    let ln = if left > 1 { le >>> 10 & 15 } else { 0 };
+    let mn = if left > 1 { me >>> 10 & 15 } else { 0 };
+    let on = if left > 1 { oe >>> 10 & 15 } else { 0 };
+    let moves = ln + mn + on;
+    let p = bit - moves - lb - mb - ob;
+    if p < floor { refuse(array_get(lim, 4), Sequences) } else if bit - p <= 56 {
+      let w = word_at(blk, p >>> 3) >>> (p & 7);
+      placed(
+        blk,
+        floor,
+        p,
+        (le & 1023) + (w >>> mn + on & (1 << ln) - 1)
+          | 512 + (me & 1023) + (w >>> on & (1 << mn) - 1) << 16
+          | 1024 + (oe & 1023) + (w & (1 << on) - 1) << 32,
+        tables,
+        lits,
+        lp,
+        out,
+        r1,
+        r2,
+        r3,
+        left - 1,
+        lim,
+        (oe >>> 19) + (w >>> moves + lb + mb & (1 << ob) - 1),
+        (me >>> 19) + (w >>> moves + lb & (1 << mb) - 1) << 20
+          | (le >>> 19) + (w >>> moves & (1 << lb) - 1),
+      )
+    } else {
+      placed(
+        blk,
+        floor,
+        p,
+        (le & 1023) + bits_at(blk, p + mn + on, ln)
+          | 512 + (me & 1023) + bits_at(blk, p + on, mn) << 16
+          | 1024 + (oe & 1023) + bits_at(blk, p, on) << 32,
+        tables,
+        lits,
+        lp,
+        out,
+        r1,
+        r2,
+        r3,
+        left - 1,
+        lim,
+        (oe >>> 19) + bits_at(blk, p + moves + lb + mb, ob),
+        (me >>> 19) + bits_at(blk, p + moves + lb, mb) << 20
+          | (le >>> 19) + bits_at(blk, p + moves, lb),
+      )
+    }
+  }
+
+/// A sequence written: its literals, then its match. `states` is the three states to go on from,
+/// sixteen bits each; `offset` the offset's value, where 1 to 3 name an offset used before; and
+/// `lengths` the match length over the literal length, twenty bits below it.
+fn placed(
+  blk: Bytes,
+  floor: Int,
+  bit: Int,
+  states: Int,
+  tables: Array<Int>,
+  lits: Bytes,
+  lp: Int,
+  out: Bytes,
+  r1: Int,
+  r2: Int,
+  r3: Int,
+  left: Int,
+  lim: Array<Int>,
+  offset: Int,
+  lengths: Int,
+) -> Run / {zstd.refused, abort.raise} = {
+  let count = lengths & 0xF_FFFF;
+  let length = lengths >>> 20;
+  // Which earlier offset: none, the first, second or third, or the first less one.
+  let labelled = if offset > 3 { 0 } else if count == 0 { offset + 1 } else { offset };
+  let dist = if labelled == 0 { offset - 3 }
+  else if labelled == 1 { r1 }
+  else if labelled == 2 { r2 }
+  else if labelled == 3 { r3 }
+  else { r1 - 1 };
+  if lp + count > bytes_len(lits) { refuse(array_get(lim, 4), Sequences) } else {
+    let lit = if count == 0 { out } else { out ++ bytes_slice(lits, lp, lp + count) };
+    let n = bytes_len(lit);
+    if n + length > array_get(lim, 0) { refuse(array_get(lim, 4), over(lim)) }
+    else if dist <= 0 || dist > n - array_get(lim, 1)
+        || (dist > array_get(lim, 2) && n - array_get(lim, 3) > array_get(lim, 2)) {
+      refuse(array_get(lim, 4), Offset)
+    } else {
+      sequence(
+        blk,
+        floor,
+        bit,
+        states & 0xFFFF,
+        states >>> 16 & 0xFFFF,
+        states >>> 32,
+        tables,
+        lits,
+        lp + count,
+        if dist >= length { lit ++ bytes_slice(lit, n - dist, n - dist + length) }
+        else { lit ++ cycle(bytes_slice(lit, n - dist, n), length) },
+        dist,
+        if labelled == 1 { r2 } else { r1 },
+        if labelled == 1 || labelled == 2 { r3 } else { r2 },
+        left,
+        lim,
+      )
+    }
+  }
+}
+
+/// After a block's last sequence its bits are spent, and the literals no sequence took follow.
+fn ended(
+  blk: Bytes,
+  floor: Int,
+  bit: Int,
+  lits: Bytes,
+  lp: Int,
+  out: Bytes,
+  r1: Int,
+  r2: Int,
+  r3: Int,
+  lim: Array<Int>,
+) -> Run / {zstd.refused, abort.raise} =
+  if bit != floor { refuse(array_get(lim, 4), Sequences) }
+  else if bytes_len(out) + bytes_len(lits) - lp > array_get(lim, 0) {
+    refuse(array_get(lim, 4), over(lim))
+  } else { { out: out ++ bytes_slice(lits, lp, bytes_len(lits)), r1: r1, r2: r2, r3: r3 } }
+
+// --- Blocks -----------------------------------------------------------------
+
+/// What one block leaves the next of its frame: the three tables of sequence codes and the bits a
+/// state of each is, below zero for a table no block has set; the literals' code; and the three
+/// offsets last used.
+type Entropy = {
+  tables: Array<Int>,
+  ll: Int,
+  of: Int,
+  ml: Int,
+  code: Code,
+  r1: Int,
+  r2: Int,
+  r3: Int,
+}
+
+const fn fresh() -> Entropy =
+  {
+    tables: predefined(),
+    ll: -1,
+    of: -1,
+    ml: -1,
+    code: { table: array_new(1, 0), bits: 0 },
+    r1: 1,
+    r2: 4,
+    r3: 8,
+  }
+
+type Blocked = { hist: Bytes, entropy: Entropy }
+
+/// A compressed block of `size` bytes: its literals, and the sequences that place them among
+/// matches after `hist`.
+fn compressed(
+  blk: Bytes,
+  size: Int,
+  e: Entropy,
+  hist: Bytes,
+  lim: Array<Int>,
+) -> Blocked / {zstd.refused, abort.raise} = {
+  let where = array_get(lim, 4);
+  let end = 16 + size;
+  let lits = literals(blk, 16, end, e.code, array_get(lim, 0) - bytes_len(hist), where);
+  let at = lits.next;
+  let first = bytes_at(blk, at);
+  let head = if first < 128 { 1 } else if first < 255 { 2 } else { 3 };
+  let count = if first < 128 { first }
+  else if first < 255 { (first - 128 << 8) + bytes_at(blk, at + 1) }
+  else { bytes_at(blk, at + 1) + (bytes_at(blk, at + 2) << 8) + 0x7F00 };
+  if at >= end || at + head > end { refuse(where, Sequences) } else if count == 0 {
+    if at + 1 != end { refuse(where, Sequences) }
+    else if bytes_len(hist) + bytes_len(lits.bytes) > array_get(lim, 0) { refuse(where, over(lim)) }
+    else { { hist: hist ++ lits.bytes, entropy: { ..e, code: lits.code } } }
+  } else {
+    let modes = bytes_at(blk, at + head);
+    if at + head >= end || modes & 3 != 0 { refuse(where, Sequences) } else {
+      let lengths = tabled(blk, at + head + 1, end, modes >>> 6, 0, e.tables, e.ll, where);
+      let ll = lengths.log;
+      let offsets = tabled(blk, lengths.next, end, modes >>> 4 & 3, 1, lengths.tables, e.of, where);
+      let of = offsets.log;
+      let matches = tabled(blk, offsets.next, end, modes >>> 2 & 3, 2, offsets.tables, e.ml, where);
+      let ml = matches.log;
+      let from = matches.next;
+      if from >= end || bytes_at(blk, end - 1) == 0 { refuse(where, Sequences) } else {
+        let floor = from * 8;
+        let top = (end - 1) * 8 + bit_length(bytes_at(blk, end - 1)) - 1;
+        let bit = top - ll - of - ml;
+        if bit < floor { refuse(where, Sequences) } else {
+          let tables = matches.tables;
+          let done = sequence(
+            blk,
+            floor,
+            bit,
+            bits_at(blk, top - ll, ll),
+            512 + bits_at(blk, bit, ml),
+            1024 + bits_at(blk, bit + ml, of),
+            tables,
+            lits.bytes,
+            0,
+            hist,
+            e.r1,
+            e.r2,
+            e.r3,
+            count,
+            lim,
+          );
+          {
+            hist: done.out,
+            entropy: {
+              tables: tables,
+              ll: ll,
+              of: of,
+              ml: ml,
+              code: lits.code,
+              r1: done.r1,
+              r2: done.r2,
+              r3: done.r3,
+            },
+          }
+        }
+      }
+    }
+  }
+}
+
+// --- Dictionaries -----------------------------------------------------------
+
+/// A dictionary: bytes a frame's matches may reach before its own, and where it is more than
+/// those bytes, the number a frame names it by and the tables its first block may reuse.
+pub opaque type Dictionary = new { id: Int, content: Bytes, entropy: Entropy }
+
+/// No dictionary.
+const fn no_dictionary() -> Dictionary = { id: 0, content: b"", entropy: fresh() }
+
+/// The dictionary `bytes` are: one `zstd --train` made, which opens with its own magic number, or
+/// any other bytes, which are content alone.
+pub fn dictionary(bytes: Bytes) -> Dictionary / {zstd.refused, abort.raise} = {
+  let n = bytes_len(bytes);
+  if n < 8 || bytes_slice(bytes, 0, 4) != b"\x37\xA4\x30\xEC" {
+    { id: 0, content: bytes, entropy: fresh() }
+  } else {
+    let blk = padded(bytes, 0, n);
+    let end = 16 + n;
+    let literal = tree(blk, 24, end, 8);
+    let offsets = tabled(blk, literal.next, end, 2, 1, predefined(), -1, literal.next - 16);
+    let of = offsets.log;
+    let matches = tabled(blk, offsets.next, end, 2, 2, offsets.tables, -1, offsets.next - 16);
+    let ml = matches.log;
+    let lengths = tabled(blk, matches.next, end, 2, 0, matches.tables, -1, matches.next - 16);
+    let at = lengths.next;
+    if at + 12 > end { refuse(at - 16, Dictionary) } else {
+      let r1 = word_at(blk, at) & 0xFFFF_FFFF;
+      let r2 = word_at(blk, at + 4) & 0xFFFF_FFFF;
+      let r3 = word_at(blk, at + 8) & 0xFFFF_FFFF;
+      let room = end - at - 12;
+      if r1 == 0 || r2 == 0 || r3 == 0 || r1 > room || r2 > room || r3 > room {
+        refuse(at - 16, Dictionary)
+      } else {
+        {
+          id: word_at(blk, 20) & 0xFFFF_FFFF,
+          content: bytes_slice(bytes, at - 16 + 12, n),
+          entropy: {
+            tables: lengths.tables,
+            ll: lengths.log,
+            of: of,
+            ml: ml,
+            code: literal.code,
+            r1: r1,
+            r2: r2,
+            r3: r3,
+          },
+        }
+      }
+    }
+  }
+}
+
+// --- Frames -----------------------------------------------------------------
+
+/// A frame being read: the history it may ask for, where in the history its own bytes start, how
+/// many bytes before them a match may still reach, the sum of its bytes where it ends with one,
+/// and the length it declares, or -1.
+type Frame = { window: Int, origin: Int, reach: Int, sum: Option<checksum::State>, content: Int }
+
+/// Everything of a reader but its two buffers.
+type Core = {
+  limits: Limits,
+  dictionary: Dictionary,
+  /// The next byte of `input` to read, and the stream offset of its first.
+  at: Int,
+  base: Int,
+  /// The history up to here has been answered.
+  sent: Int,
+  /// Bytes answered before a frame that starts its history over.
+  ready: List<Bytes>,
+  /// The bytes the frames before this one held, and how many frames there were.
+  made: Int,
+  frames: Int,
+  /// 0 between frames, 1 among a frame's blocks, 2 before its checksum, 3 in a skippable frame.
+  phase: Int,
+  /// The bytes of a skippable frame still to pass.
+  skip: Int,
+  /// How many bytes from `at` the reader needs before it can go on, or 0.
+  need: Int,
+  /// Whether a frame has ended since this was last cleared.
+  closed: Bool,
+  frame: Frame,
+  entropy: Entropy,
+}
+
+/// A reader part of the way through a stream: the input not yet read, the bytes written that a
+/// match may still copy or that are not yet answered, and the rest.
+type Decoder = { input: Bytes, hist: Bytes, core: Core }
+
+fn decoder(limits: Limits, d: Dictionary, input: Bytes) -> Decoder =
+  {
+    input: input,
+    hist: b"",
+    core: {
+      limits: limits,
+      dictionary: d,
+      at: 0,
+      base: 0,
+      sent: 0,
+      ready: [],
+      made: 0,
+      frames: 0,
+      phase: 0,
+      skip: 0,
+      need: 0,
+      closed: false,
+      frame: { window: 0, origin: 0, reach: 0, sum: None, content: -1 },
+      entropy: fresh(),
+    },
+  }
+
+fn starved(d: Decoder, need: Int) -> Decoder = { ..d, core: { ..d.core, need: need } }
+
+/// A frame's header at `at`: its magic, a byte of flags, and as the flags say a window, the
+/// number of a dictionary and the length of the content.
+fn opened(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} = {
+  let core = d.core;
+  let at = core.at;
+  let where = core.base + at;
+  let flags = bytes_at(d.input, at + 4);
+  let single = flags >>> 5 & 1;
+  let id_size = if flags & 3 == 3 { 4 } else { flags & 3 };
+  let sized = flags >>> 6;
+  let size_size = if sized == 0 { single } else { 1 << sized };
+  let need = 5 + (1 - single) + id_size + size_size;
+  if have < need { starved(d, need) }
+  else if flags & 8 != 0 { refuse(where + 4, Header) } else {
+    let told = bytes_at(d.input, at + 5);
+    let id_at = at + 5 + (1 - single);
+    let id = fold(range(0, id_size), 0, |n: Int, i: Int| n | bytes_at(d.input, id_at + i) << 8 * i);
+    let size_at = id_at + id_size;
+    let high = if size_size == 8 { int_of_u32(bytes_u32_le(d.input, size_at + 4)) } else { 0 };
+    let low = fold(range(0, min(size_size, 4)), 0, |n: Int, i: Int|
+      n | bytes_at(d.input, size_at + i) << 8 * i);
+    let content = if size_size == 0 { -1 }
+    else if size_size == 2 { low + 256 }
+    else if high > 0x3FFF_FFFF { 0x3FFF_FFFF_FFFF_FFFF }
+    else { low | high << 32 };
+    let power = 10 + (told >>> 3);
+    let window = if single == 1 { content } else { (1 << power) + (1 << power - 3) * (told & 7) };
+    let room = core.limits.output - core.made;
+    if content > room { refuse(where, OverLimit) }
+    else if window > core.limits.window { refuse(where, Window) }
+    else if id != 0 && id != core.dictionary.id { refuse(id_at + core.base, Dictionary) } else {
+      let prior = bytes_len(core.dictionary.content);
+      let frame = {
+        window: window,
+        origin: if prior > 0 { prior } else { bytes_len(d.hist) },
+        reach: prior,
+        sum: if flags & 4 != 0 { Some(checksum::init(Xxh64(0u64))) } else { None },
+        content: content,
+      };
+      let next = {
+        ..core,
+        at: at + need,
+        phase: 1,
+        need: 0,
+        frame: frame,
+        entropy: core.dictionary.entropy,
+      };
+      if prior == 0 { { input: d.input, hist: d.hist, core: next } } else {
+        {
+          input: d.input,
+          hist: core.dictionary.content,
+          core: {
+            ..next,
+            sent: prior,
+            ready: push(core.ready, bytes_slice(d.hist, core.sent, bytes_len(d.hist))),
+          },
+        }
+      }
+    }
+  }
+}
+
+/// What stands between frames: the magic of a frame, or of a skippable one and its length.
+fn between(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} =
+  if have < 4 { starved(d, 4) } else {
+    let core = d.core;
+    let magic = int_of_u32(bytes_u32_le(d.input, core.at));
+    if magic == 0xFD2F_B528 { if have < 6 { starved(d, 6) } else { opened(d, have) } }
+    else if magic & 0xFFFF_FFF0 == 0x184D_2A50 {
+      if have < 8 { starved(d, 8) } else {
+        {
+          ..d,
+          core: {
+            ..core,
+            at: core.at + 8,
+            phase: 3,
+            need: 0,
+            skip: int_of_u32(bytes_u32_le(d.input, core.at + 4)),
+          },
+        }
+      }
+    } else { refuse(core.base + core.at, if core.frames == 0 { NotThisFormat } else { Trailing }) }
+  }
+
+/// A skippable frame's bytes are passed as they come.
+fn skipped(d: Decoder, have: Int) -> Decoder = {
+  let core = d.core;
+  let pass = min(have, core.skip);
+  if pass == core.skip {
+    {
+      ..d,
+      core: { ..core, at: core.at + pass, skip: 0, phase: 0, need: 0, frames: core.frames + 1 },
+    }
+  } else { { ..d, core: { ..core, at: core.at + pass, skip: core.skip - pass, need: 1 } } }
+}
+
+/// A frame ended: it held what it declared, and the bytes after it are another's.
+fn closed(d: Decoder) -> Decoder / {zstd.refused} = {
+  let core = d.core;
+  let held = bytes_len(d.hist) - core.frame.origin;
+  if core.frame.content >= 0 && core.frame.content != held { refuse(core.base + core.at, Length) }
+  else {
+    {
+      ..d,
+      core: {
+        ..core,
+        phase: 0,
+        need: 0,
+        closed: true,
+        made: core.made + held,
+        frames: core.frames + 1,
+        frame: { ..core.frame, sum: None },
+      },
+    }
+  }
+}
+
+/// The four bytes after a frame's last block: the low half of the XXH64 of its content.
+fn checked(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} =
+  if have < 4 { starved(d, 4) } else {
+    let core = d.core;
+    let sum = match core.frame.sum {
+      Some(state) -> int_of_u64(checksum::finish(state) & 0xFFFF_FFFFu64),
+      None -> 0,
+    };
+    if int_of_u32(bytes_u32_le(d.input, core.at)) != sum { refuse(core.base + core.at, Checksum) }
+    else { closed({ ..d, core: { ..core, at: core.at + 4 } }) }
+  }
+
+/// One block: three bytes that say whether it is the frame's last, its type and its size, then
+/// the bytes as they are, one byte to repeat, or literals and sequences.
+fn block(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} =
+  if have < 3 { starved(d, 3) } else {
+    let core = d.core;
+    let at = core.at;
+    let where = core.base + at;
+    let head = word_at(bytes_concat(bytes_slice(d.input, at, at + 3), b"\x00\x00\x00\x00\x00"), 0);
+    let kind = head >>> 1 & 3;
+    let size = head >>> 3;
+    let frame = core.frame;
+    let most = min(frame.window, 131072);
+    let need = 3 + (if kind == 1 { 1 } else { size });
+    if kind == 3 { refuse(where, BlockType) }
+    else if size > most { refuse(where, BlockSize) }
+    else if have < need { starved(d, need) } else {
+      let input = d.input;
+      let hist = d.hist;
+      let before = bytes_len(hist);
+      let room = core.limits.output - core.made - (before - frame.origin);
+      let blocked: Blocked = if kind == 0 {
+        if size > room { refuse(where, OverLimit) }
+        else { { hist: hist ++ bytes_slice(input, at + 3, at + 3 + size), entropy: core.entropy } }
+      } else if kind == 1 {
+        if size > room { refuse(where, OverLimit) } else {
+          { hist: hist ++ cycle(bytes_slice(input, at + 3, at + 4), size), entropy: core.entropy }
+        }
+      } else {
+        compressed(
+          padded(input, at + 3, at + 3 + size),
+          size,
+          core.entropy,
+          hist,
+          array_of_list([
+            before + min(most, room),
+            frame.origin - frame.reach,
+            frame.window,
+            frame.origin,
+            where,
+            if room < most { 1 } else { 0 },
+          ]),
+        )
+      };
+      let entropy = blocked.entropy;
+      let grown = blocked.hist;
+      let sum = match frame.sum {
+        Some(state) -> Some(checksum::update(state, bytes_slice(grown, before, bytes_len(grown)))),
+        None -> None,
+      };
+      let moved = {
+        input: input,
+        hist: grown,
+        core: {
+          ..core,
+          at: at + need,
+          need: 0,
+          entropy: entropy,
+          frame: { ..frame, sum: sum },
+          phase: if head & 1 == 0 { 1 } else { 2 },
+        },
+      };
+      if head & 1 == 0 { moved }
+      else { match frame.sum { Some(_) -> moved, None -> closed(moved) } }
+    }
+  }
+
+/// One step of a reader: a header, a block, a checksum, or what of a skippable frame the input
+/// holds. A reader that needs more input than it has says how much in `need`.
+fn step(d: Decoder) -> Decoder / {zstd.refused, abort.raise} = {
+  let phase = d.core.phase;
+  let have = bytes_len(d.input) - d.core.at;
+  if phase == 0 { between(d, have) }
+  else if phase == 1 { block(d, have) }
+  else if phase == 2 { checked(d, have) }
+  else { skipped(d, have) }
+}
+
+/// Steps until the reader needs input, or `stop` says to.
+fn pumped(d: Decoder, goal: Int, one: Bool, fuel: Int) -> Decoder / {zstd.refused, abort.raise} =
+  if fuel <= 0 || d.core.need > 0 || (one && d.core.closed)
+      || bytes_len(d.hist) - d.core.sent >= goal { d }
+  else { pumped(step(d), goal, one, fuel - 1) }
+
+/// The reader as it must stand where its input ends: between frames, with one read.
+fn finished(d: Decoder) -> Decoder / {zstd.refused, abort.raise} = {
+  let at = d.core.at;
+  let left = bytes_slice(d.input, at, bytes_len(d.input));
+  // What is left opens a frame as far as it goes: a magic number, or the start of one.
+  let start = bytes_slice(left, 0, min(4, bytes_len(left)));
+  let opens = bytes_starts_with(b"\x28\xB5\x2F\xFD", start)
+    || (bytes_len(start) > 0 && bytes_at(start, 0) & 0xF0 == 0x50
+    && bytes_starts_with(b"\x2A\x4D\x18", bytes_slice(start, 1, bytes_len(start))));
+  if d.core.phase == 0 && !opens {
+    refuse(d.core.base + at, if d.core.frames == 0 { NotThisFormat } else { Trailing })
+  } else if d.core.phase != 0 || d.core.frames == 0 || bytes_len(left) != 0 {
+    refuse(d.core.base + bytes_len(d.input), Truncated)
+  } else { d }
+}
+
+/// The bytes written and not yet answered.
+fn pending(d: Decoder) -> Bytes / {abort.raise} =
+  bytes_concat_all(push(d.core.ready, bytes_slice(d.hist, d.core.sent, bytes_len(d.hist))))
+
+/// The bytes a stream of frames holds, which are `limits.output` at most.
+pub fn decompress(data: Bytes, limits: Limits) -> Bytes / {zstd.refused, abort.raise} =
+  decompress_with(data, no_dictionary(), limits)
+
+/// `decompress`, for frames written with the dictionary `d`.
+pub fn decompress_with(
+  data: Bytes,
+  d: Dictionary,
+  limits: Limits,
+) -> Bytes / {zstd.refused, abort.raise} = {
+  let end = finished(
+    pumped(decoder(limits, d, data), 0x3FFF_FFFF_FFFF_FFFF, false, 2 * bytes_len(data) + 8),
+  );
+  pending(end)
+}
+
+/// `decompress`, with a refusal answered rather than raised.
+pub fn try_decompress(data: Bytes, limits: Limits) -> Result<Bytes, Refusal> / {abort.raise} =
+  try { decompress(data, limits) }
+
+/// A stream's first frame, and how many bytes of the input it and the skippable frames before it
+/// took.
+pub type First = new { plain: Bytes, used: Int }
+
+/// The first frame of `data`, whatever follows it.
+pub fn first(data: Bytes, limits: Limits) -> First / {zstd.refused, abort.raise} = {
+  let end = pumped(
+    decoder(limits, no_dictionary(), data),
+    0x3FFF_FFFF_FFFF_FFFF,
+    true,
+    2 * bytes_len(data) + 8,
+  );
+  if !end.core.closed { refuse(bytes_len(data), Truncated) }
+  else { { plain: pending(end), used: end.core.at } }
+}
+
+// --- A stream a chunk at a time -----------------------------------------------
+
+/// The reader with `chunk` after the input it has not read.
+fn fed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
+  let core = d.core;
+  {
+    input: bytes_concat(bytes_slice(d.input, core.at, bytes_len(d.input)), chunk),
+    hist: d.hist,
+    core: { ..core, at: 0, base: core.base + core.at, need: 0 },
+  }
+}
+
+type Taken = { out: Bytes, next: Decoder }
+
+/// What the reader has written and not yet answered, and the reader without the history no match
+/// can reach: among a frame's blocks a match reaches the frame's window, or the frame's first
+/// byte and the dictionary before it while the frame is shorter than its window, and between
+/// frames nothing.
+fn taken(d: Decoder) -> Taken / {abort.raise} = {
+  let core = d.core;
+  let frame = core.frame;
+  let n = bytes_len(d.hist);
+  let out = bytes_concat_all(push(core.ready, bytes_slice(d.hist, core.sent, n)));
+  let live = if core.phase != 1 { n }
+  else if n - frame.origin <= frame.window { frame.origin - frame.reach }
+  else { n - frame.window };
+  let dead = max(0, min(live, n));
+  if dead >= 65536 && dead * 4 >= n - dead {
+    {
+      out: out,
+      next: {
+        input: d.input,
+        hist: bytes_slice(d.hist, dead, n),
+        core: {
+          ..core,
+          sent: n - dead,
+          ready: [],
+          frame: { ..frame, origin: frame.origin - dead },
+        },
+      },
+    }
+  } else { { out: out, next: { ..d, core: { ..core, sent: n, ready: [] } } } }
+}
+
+/// How many bytes a reader writes before it answers them: a sixteenth of a megabyte, or an
+/// eighth of the frame's window where that is more.
+fn stride(d: Decoder) -> Int = max(65536, d.core.frame.window >>> 3)
+
+fn flowing<| e>(
+  packed: Seq<Bytes | e>,
+  d: Decoder,
+  fuel: Int,
+) -> Seq<Bytes | {zstd.refused, abort.raise | e}> =
+  ||
+    if fuel <= 0 { Done } else {
+      let moved = pumped(d, stride(d), false, 2 * bytes_len(d.input) + 8);
+      if bytes_len(moved.hist) > moved.core.sent || len(moved.core.ready) > 0 {
+        let answered = taken(moved);
+        Yield(answered.out, flowing(packed, answered.next, fuel - 1))
+      } else if moved.core.need == 0 { Skip(flowing(packed, moved, fuel - 1)) } else {
+        match packed() {
+          Done -> {
+            finished(moved);
+            Done
+          },
+          Skip(rest) -> Skip(flowing(rest, moved, fuel - 1)),
+          Yield(chunk, rest) -> Skip(flowing(rest, fed(moved, chunk), fuel - 1)),
+        }
+      }
+    }
+
+/// What the chunks of a stream of frames unpack to, a chunk for each pull that has bytes to
+/// answer. A pull reads at most one chunk of `packed` and unpacks until it has a stride of bytes,
+/// a sixteenth of a megabyte or an eighth of the frame's window, or needs the next chunk, so the
+/// reader holds one chunk of input, one block, and of what it has written no more than a frame's
+/// window and a quarter again, a stride and a block. The sequence refuses where `decompress`
+/// would, at the same offset, and where `packed` ends before the stream does.
+pub fn decoded<| e>(
+  packed: Seq<Bytes | e>,
+  limits: Limits,
+) -> Seq<Bytes | {zstd.refused, abort.raise | e}> =
+  flowing(packed, decoder(limits, no_dictionary(), b""), 0x3FFF_FFFF_FFFF_FFFF)
+
+/// `decoded`, for frames written with the dictionary `d`.
+pub fn decoded_with<| e>(
+  packed: Seq<Bytes | e>,
+  d: Dictionary,
+  limits: Limits,
+) -> Seq<Bytes | {zstd.refused, abort.raise | e}> =
+  flowing(packed, decoder(limits, d, b""), 0x3FFF_FFFF_FFFF_FFFF)
+
+// --- Writing: bits ------------------------------------------------------------
+
+// A stream that is read downward is written upward: bits wait in an `Int`, the next to write
+// above the `n` already there, and leave it a byte at a time from the lowest.
+
+/// A stream ended: a set bit above its last, and the bytes that hold what is left.
+fn capped(out: Bytes, acc: Int, n: Int) -> Bytes / {abort.raise} = {
+  let all = acc | 1 << n;
+  let whole = drained(out, all, n + 1);
+  if n + 1 & 7 == 0 { whole } else { whole ++ array_get(singles(), all >>> (n + 1 & 0x78) & 255) }
+}
+
+// --- Writing: finite state tables -----------------------------------------------
+
+/// A distribution as a writer codes by it: the bits a state is; the state each cell leads to, the
+/// cells in the order of their symbols; and for each symbol what a state adds to learn how many
+/// bits it writes, above bit 16, and what the rest of it adds to find its cell.
+type Coder = { log: Int, states: Array<Int>, widths: Array<Int>, finds: Array<Int> }
+
+/// Each cell from `u` on files its state under its symbol's next place.
+fn filed(
+  cells: Array<Int>,
+  u: Int,
+  next: Array<Int>,
+  states: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if u >= array_len(cells) { states } else {
+    let s = array_get(cells, u);
+    let at = array_get(next, s);
+    filed(cells, u + 1, array_set(next, s, at + 1), array_set(states, at, array_len(cells) + u))
+  }
+
+type Places = { starts: List<Int>, widths: List<Int>, finds: List<Int>, total: Int }
+
+/// The writer's tables of a distribution, laid over the same cells a reader's are.
+fn coder(counts: List<Int>, log: Int) -> Coder / {abort.raise} = {
+  let c = array_of_list(counts);
+  let size = 1 << log;
+  let low = lows(c, 0, size, array_new(size, 0));
+  let high = low.high;
+  let lead = if array_len(c) > 0 { max(array_get(c, 0), 0) } else { 0 };
+  let cells = spread(c, 0, lead, 0, high, low.cells, size + array_len(c) + 2);
+  let places = fold(counts, { starts: [], widths: [], finds: [], total: 0 }, |t: Places, p: Int| {
+    let n = if p == -1 { 1 } else { p };
+    let most = if n < 2 { log } else { log + 1 - bit_length(n - 1) };
+    {
+      starts: push(t.starts, t.total),
+      widths: push(t.widths, if n == 0 { (log + 1 << 16) - size }
+      else { (most << 16) - (n << most) }),
+      finds: push(t.finds, t.total - n),
+      total: t.total + n,
+    }
+  });
+  {
+    log: log,
+    states: filed(cells, 0, array_of_list(places.starts), array_new(size, 0)),
+    widths: array_of_list(places.widths),
+    finds: array_of_list(places.finds),
+  }
+}
+
+/// The state a writer starts a symbol's run in.
+fn started(c: Coder, symbol: Int) -> Int / {abort.raise} = {
+  let width = array_get(c.widths, symbol);
+  let n = width + 32768 >>> 16;
+  array_get(c.states, ((n << 16) - width >>> n) + array_get(c.finds, symbol))
+}
+
+/// A distribution's description, as `norm` reads one: four bits for the bits a state is past
+/// five, then each count in as few bits as tell it from the ones still possible, and after a
+/// zero how many more follow, two bits at a time.
+fn described(
+  counts: Array<Int>,
+  s: Int,
+  left: Int,
+  out: Bytes,
+  acc: Int,
+  n: Int,
+  fuel: Int,
+) -> Bytes / {abort.raise} =
+  if fuel <= 0 || left <= 0 || s >= array_len(counts) { drained(out, acc, n + 7) } else {
+    let count = array_get(counts, s);
+    let width = bit_length(left + 1);
+    let low = (1 << width - 1) - 1;
+    let threshold = (1 << width) - 2 - left;
+    let value = count + 1;
+    let written = if value < threshold { value }
+    else if value <= low { value }
+    else { value + threshold };
+    let used = if value < threshold { width - 1 } else { width };
+    let acc1 = acc | written << n;
+    let n1 = n + used;
+    if count != 0 {
+      described(
+        counts,
+        s + 1,
+        left - (if count < 0 { 1 } else { count }),
+        drained(out, acc1, n1),
+        acc1 >>> (n1 & 0x78),
+        n1 & 7,
+        fuel - 1,
+      )
+    } else {
+      let gap = zeros_from(counts, s + 1, 0);
+      let flags = gap / 3;
+      let acc2 = acc1 | (1 << 2 * flags) - 1 << n1 | gap % 3 << n1 + 2 * flags;
+      let n2 = n1 + 2 * flags + 2;
+      described(
+        counts,
+        s + 1 + gap,
+        left,
+        drained(out, acc2, n2),
+        acc2 >>> (n2 & 0x78),
+        n2 & 7,
+        fuel - 1,
+      )
+    }
+  }
+
+/// How many counts from `s` are zero, sixteen at most at a time.
+fn zeros_from(counts: Array<Int>, s: Int, n: Int) -> Int / {abort.raise} =
+  if n >= 15 || s >= array_len(counts) || array_get(counts, s) != 0 { n }
+  else { zeros_from(counts, s + 1, n + 1) }
+
+// --- Writing: literals --------------------------------------------------------
+
+/// Each symbol's code over its length, `code << 4 | length`, as a reader's table has them: the
+/// symbols of each weight in turn from the least take the lowest codes.
+fn encoded_by(
+  weights: Array<Int>,
+  w: Int,
+  s: Int,
+  pos: Int,
+  bits: Int,
+  codes: Array<Int>,
+) -> Array<Int> / {abort.raise} =
+  if w > bits { codes }
+  else if s >= array_len(weights) { encoded_by(weights, w + 1, 0, pos, bits, codes) }
+  else if array_get(weights, s) != w { encoded_by(weights, w, s + 1, pos, bits, codes) } else {
+    encoded_by(
+      weights,
+      w,
+      s + 1,
+      pos + (1 << w - 1),
+      bits,
+      array_set(codes, s, pos >>> w - 1 << 4 | bits + 1 - w),
+    )
+  }
+
+/// The symbols of `lits` from `i` down to `from`, four a step, after the bits already waiting:
+/// the last symbol is written first, so it is read last.
+fn symbols_written(
+  lits: Bytes,
+  from: Int,
+  i: Int,
+  codes: Array<Int>,
+  out: Bytes,
+  acc: Int,
+  n: Int,
+) -> Bytes / {abort.raise} =
+  if i >= from + 4 {
+    let w = int_of_u32(bytes_u32_le(lits, i - 4));
+    let a = array_get(codes, w >>> 24);
+    let b = array_get(codes, w >>> 16 & 255);
+    let c = array_get(codes, w >>> 8 & 255);
+    let d = array_get(codes, w & 255);
+    let two = n + (a & 15);
+    let three = two + (b & 15);
+    let four = three + (c & 15);
+    let all = acc | a >>> 4 << n | b >>> 4 << two | c >>> 4 << three | d >>> 4 << four;
+    let held = four + (d & 15);
+    symbols_written(
+      lits,
+      from,
+      i - 4,
+      codes,
+      drained(out, all, held),
+      all >>> (held & 0x78),
+      held & 7,
+    )
+  } else if i > from {
+    let a = array_get(codes, bytes_at(lits, i - 1));
+    let all = acc | a >>> 4 << n;
+    let held = n + (a & 15);
+    symbols_written(
+      lits,
+      from,
+      i - 1,
+      codes,
+      drained(out, all, held),
+      all >>> (held & 0x78),
+      held & 7,
+    )
+  } else { capped(out, acc, n) }
+
+/// Weights coded as `weighed` reads them: two states take turns up the list, the last weight of
+/// each turn starting its state, and both are written out at the end.
+fn weights_coded(
+  weights: Array<Int>,
+  i: Int,
+  c: Coder,
+  mine: Int,
+  other: Int,
+  out: Bytes,
+  acc: Int,
+  n: Int,
+) -> Bytes / {abort.raise} =
+  if i < 0 {
+    // The state that coded the first weight is read first, so it is written last.
+    let all = acc | (mine & (1 << c.log) - 1) << n | (other & (1 << c.log) - 1) << n + c.log;
+    capped(drained(out, all, n + 2 * c.log), all >>> (n + 2 * c.log & 0x78), n + 2 * c.log & 7)
+  } else {
+    let symbol = array_get(weights, i);
+    let width = mine + array_get(c.widths, symbol) >>> 16;
+    let all = acc | (mine & (1 << width) - 1) << n;
+    let held = n + width;
+    weights_coded(
+      weights,
+      i - 1,
+      c,
+      other,
+      array_get(c.states, (mine >>> width) + array_get(c.finds, symbol)),
+      drained(out, all, held),
+      all >>> (held & 0x78),
+      held & 7,
+    )
+  }
+
+/// How many of a table's `1 << log` cells each symbol takes, by how often it occurs among
+/// `total`: its share and one at least, the commonest taking or giving up what that leaves
+/// over. Empty where it would be left no cell, or every one.
+fn shares(counts: Array<Int>, total: Int, log: Int) -> List<Int> / {abort.raise} = {
+  let size = 1 << log;
+  let rough = map(array_to_list(counts), |count: Int|
+    if count == 0 { 0 } else { max(1, count * size / total) });
+  let most = fold(rough, 0, |a: Int, b: Int| max(a, b));
+  let spare = size - fold(rough, 0, |sum: Int, p: Int| sum + p);
+  if most + spare < 1 || most + spare >= size { [] } else {
+    fold(rough, { out: [], done: false }, |t: { out: List<Int>, done: Bool }, p: Int|
+      if p == most && !t.done { { out: push(t.out, p + spare), done: true } }
+      else { { out: push(t.out, p), done: t.done } }).out
+  }
+}
+
+/// A code's description: a byte and the weights four bits each where they are 128 at most, or
+/// their own distribution and they coded by it. Empty where neither can say them.
+fn tree_written(weights: List<Int>) -> Bytes / {abort.raise} = {
+  let n = len(weights);
+  if n <= 128 {
+    bytes_concat_all(
+      fold(range(0, n + 1 >>> 1), [byte_of_int(127 + n)], |out: List<Bytes>, i: Int|
+        push(out, byte_of_int(at_or(weights, 2 * i, 0) << 4 | at_or(weights, 2 * i + 1, 0)))),
+    )
+  } else {
+    let tally = fold(weights, array_new(13, 0), |counts: Array<Int>, w: Int|
+      array_set(counts, w, array_get(counts, w) + 1));
+    match shares(tally, n, 6) {
+      [] -> b"",
+      settled -> {
+        let c = coder(settled, 6);
+        let all = array_of_list(weights);
+        let head = described(array_of_list(settled), 0, 64, b"", 1, 4, 64);
+        // The last weight starts the state its place falls to, and the one before it the other.
+        let a = started(c, array_get(all, n - 1));
+        let b = started(c, array_get(all, n - 2));
+        let body = weights_coded(all, n - 3, c, a, b, head, 0, 0);
+        if bytes_len(body) > 127 { b"" } else { bytes_concat(byte_of_int(bytes_len(body)), body) }
+      },
+    }
+  }
+}
+
+/// The first bytes of a literals section: its type, and its sizes in the fewest bytes they fit.
+fn literals_head(kind: Int, count: Int, packed: Int, streams: Int) -> Bytes / {abort.raise} =
+  if kind < 2 {
+    if count < 32 { byte_of_int(count << 3 | kind) }
+    else if count < 4096 { bytes_slice(u32_le(count << 4 | 4 | kind), 0, 2) }
+    else { bytes_slice(u32_le(count << 4 | 12 | kind), 0, 3) }
+  } else if streams == 1 { bytes_slice(u32_le(packed << 14 | count << 4 | kind), 0, 3) }
+  else if count < 1024 && packed < 1024 {
+    bytes_slice(u32_le(packed << 14 | count << 4 | 4 | kind), 0, 3)
+  } else if count < 16384 && packed < 16384 { u32_le(packed << 18 | count << 4 | 8 | kind) } else {
+    bytes_concat(u32_le(packed << 22 | count << 4 | 12 | kind), byte_of_int(packed >>> 10 & 255))
+  }
+
+/// A block's literals as a section: under a Huffman code where that is shorter, one byte where
+/// they are all the same, and otherwise as they are.
+fn literals_written(lits: Bytes) -> Bytes / {abort.raise} = {
+  let n = bytes_len(lits);
+  let plain = bytes_concat(literals_head(0, n, 0, 1), lits);
+  if n < 64 { plain } else {
+    let counts = tally(lits);
+    let present = filter(range(0, 256), |s: Int| array_get(counts, s) > 0);
+    if len(present) == 1 { bytes_concat(literals_head(1, n, 0, 1), bytes_slice(lits, 0, 1)) } else {
+      let lengths = code_lengths(counts, 11);
+      let bits = fold(array_to_list(lengths), 0, |a: Int, b: Int| max(a, b));
+      let last = fold(present, 0, |top: Int, s: Int| max(top, s));
+      let weights = map(range(0, 256), |s: Int|
+        if array_get(lengths, s) == 0 { 0 } else { bits + 1 - array_get(lengths, s) });
+      let codes = encoded_by(array_of_list(weights), 1, 0, 0, bits, array_new(256, 0));
+      let spelled = tree_written(take(weights, last));
+      let each = n + 3 >>> 2;
+      let body = if n < 256 { symbols_written(lits, 0, n, codes, b"", 0, 0) } else {
+        let a = symbols_written(lits, 0, each, codes, b"", 0, 0);
+        let b = symbols_written(lits, each, 2 * each, codes, b"", 0, 0);
+        let c = symbols_written(lits, 2 * each, 3 * each, codes, b"", 0, 0);
+        bytes_concat_all([
+          bytes_slice(u32_le(bytes_len(a) | bytes_len(b) << 16), 0, 4),
+          bytes_slice(u32_le(bytes_len(c)), 0, 2),
+          a,
+          b,
+          c,
+          symbols_written(lits, 3 * each, n, codes, b"", 0, 0),
+        ])
+      };
+      let packed = bytes_len(spelled) + bytes_len(body);
+      if bytes_len(spelled) == 0 || packed >= n || (n < 256 && packed > 1023) { plain } else {
+        bytes_concat_all([literals_head(2, n, packed, if n < 256 { 1 } else { 4 }), spelled, body])
+      }
+    }
+  }
+}
+
+// --- Writing: sequences -------------------------------------------------------
+
+/// The code of each literal length below 64.
+const fn short_lengths() -> Bytes = codes_below(length_codes(), 0, 64)
+
+/// The code of each match length below 131.
+const fn short_matches() -> Bytes = codes_below(match_codes(), 3, 128)
+
+/// The three distributions a block's sequences are written by.
+type Coders = { lengths: Coder, matches: Coder, offsets: Coder }
+
+/// The predefined three.
+const fn default_coders() -> Coders =
+  {
+    lengths: coder(
+      [
+        4,
+        3,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        3,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        -1,
+        -1,
+        -1,
+        -1,
+      ],
+      6,
+    ),
+    matches: coder(
+      [
+        1,
+        4,
+        3,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+      ],
+      6,
+    ),
+    offsets: coder(
+      [1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1],
+      5,
+    ),
+  }
+
+// A sequence is one `Int`: its literal length, its match length less three above bit 20, and its
+// offset's value above bit 40.
+
+/// A sequence's three codes: its literal length's, its match length's above bit 8, and its
+/// offset's above bit 16.
+fn codes_of(seq: Int) -> Int / {abort.raise} = {
+  let count = seq & 0xF_FFFF;
+  let length = seq >>> 20 & 0xF_FFFF;
+  let lc = if count < 64 { bytes_at(short_lengths(), count) } else { bit_length(count) + 18 };
+  let mc = if length < 128 { bytes_at(short_matches(), length) } else { bit_length(length) + 35 };
+  lc | mc << 8 | bit_length(seq >>> 40) - 1 << 16
+}
+
+/// How often each code of each of the three kinds occurs in a block's sequences.
+type Tallies = { lengths: Array<Int>, matches: Array<Int>, offsets: Array<Int> }
+
+fn tallied(
+  seqs: Array<Int>,
+  i: Int,
+  lengths: Array<Int>,
+  matches: Array<Int>,
+  offsets: Array<Int>,
+) -> Tallies / {abort.raise} =
+  if i >= array_len(seqs) { { lengths: lengths, matches: matches, offsets: offsets } } else {
+    let codes = codes_of(array_get(seqs, i));
+    let lc = codes & 255;
+    let mc = codes >>> 8 & 255;
+    let oc = codes >>> 16;
+    tallied(
+      seqs,
+      i + 1,
+      array_set(lengths, lc, array_get(lengths, lc) + 1),
+      array_set(matches, mc, array_get(matches, mc) + 1),
+      array_set(offsets, oc, array_get(offsets, oc) + 1),
+    )
+  }
+
+/// The most bits `c` takes to write the symbols `counts` count.
+fn bits_under(counts: Array<Int>, c: Coder) -> Int / {abort.raise} =
+  fold(range(0, array_len(counts)), 0, |bits: Int, s: Int|
+    bits + array_get(counts, s) * ((array_get(c.widths, s) >>> 16) + 1))
+
+/// The table one kind of code is written by in a block: what a section's second byte calls it,
+/// 0 for the predefined distribution and 2 for one of the block's own; that one's description;
+/// and the writer's tables.
+type Chosen = { mode: Int, head: Bytes, coder: Coder }
+
+/// The block's own distribution of the codes `counts` count, `total` in all, in a table of
+/// `most` bits at most, where describing it and writing by it takes fewer bits than writing by
+/// the predefined one, `usual`.
+fn chosen(counts: Array<Int>, total: Int, most: Int, usual: Coder) -> Chosen / {abort.raise} = {
+  let log = min(most, max(5, bit_length(total) - 2));
+  match if total < 32 { [] } else { shares(counts, total, log) } {
+    [] -> { mode: 0, head: b"", coder: usual },
+    cells -> {
+      let own = coder(cells, log);
+      let head = described(array_of_list(cells), 0, 1 << log, b"", log - 5, 4, len(cells) + 2);
+      if 8 * bytes_len(head) + bits_under(counts, own) < bits_under(counts, usual) {
+        { mode: 2, head: head, coder: own }
+      } else { { mode: 0, head: b"", coder: usual } }
+    },
+  }
+}
+
+/// The sequences from `i` down to the first, each moving the three states and then writing its
+/// extra bits, so that the first sequence's are read first.
+fn sequences_written(
+  seqs: Array<Int>,
+  i: Int,
+  k: Coders,
+  ls: Int,
+  ms: Int,
+  os: Int,
+  out: Bytes,
+  acc: Int,
+  n: Int,
+) -> Bytes / {abort.raise} =
+  if i < 0 {
+    // The states are read lengths first, so they are written last, each in its table's bits.
+    let wide = k.matches.log + k.offsets.log + k.lengths.log;
+    let all = acc | (ms & (1 << k.matches.log) - 1) << n
+      | (os & (1 << k.offsets.log) - 1) << n + k.matches.log
+      | (ls & (1 << k.lengths.log) - 1) << n + k.matches.log + k.offsets.log;
+    capped(drained(out, all, n + wide), all >>> (n + wide & 0x78), n + wide & 7)
+  } else {
+    let seq = array_get(seqs, i);
+    let count = seq & 0xF_FFFF;
+    let length = seq >>> 20 & 0xF_FFFF;
+    let offset = seq >>> 40;
+    let codes = codes_of(seq);
+    let lc = codes & 255;
+    let mc = codes >>> 8 & 255;
+    let oc = codes >>> 16;
+    let ow = os + array_get(k.offsets.widths, oc) >>> 16;
+    let mw = ms + array_get(k.matches.widths, mc) >>> 16;
+    let lw = ls + array_get(k.lengths.widths, lc) >>> 16;
+    let moved = acc | (os & (1 << ow) - 1) << n | (ms & (1 << mw) - 1) << n + ow
+      | (ls & (1 << lw) - 1) << n + ow + mw;
+    let held = n + ow + mw + lw;
+    let out1 = drained(out, moved, held);
+    let n1 = held & 7;
+    let le = array_get(length_codes(), lc);
+    let me = array_get(match_codes(), mc);
+    let extra = moved >>> (held & 0x78) | count - (le >>> 5) << n1
+      | length + 3 - (me >>> 5) << n1 + (le & 31);
+    let held2 = n1 + (le & 31) + (me & 31);
+    let out2 = drained(out1, extra, held2);
+    let n2 = held2 & 7;
+    let far = extra >>> (held2 & 0x78) | offset - (1 << oc) << n2;
+    sequences_written(
+      seqs,
+      i - 1,
+      k,
+      array_get(k.lengths.states, (ls >>> lw) + array_get(k.lengths.finds, lc)),
+      array_get(k.matches.states, (ms >>> mw) + array_get(k.matches.finds, mc)),
+      array_get(k.offsets.states, (os >>> ow) + array_get(k.offsets.finds, oc)),
+      drained(out2, far, n2 + oc),
+      far >>> (n2 + oc & 0x78),
+      n2 + oc & 7,
+    )
+  }
+
+/// A sequences section: how many there are, a byte that says which table each kind of code is
+/// written by, the description of each that is the block's own, and the sequences. The last
+/// sequence starts the states and writes its extra bits first.
+fn sequences_section(seqs: Array<Int>) -> Bytes / {abort.raise} = {
+  let count = array_len(seqs);
+  if count == 0 { b"\x00" } else {
+    let usual = default_coders();
+    let seen = tallied(seqs, 0, array_new(36, 0), array_new(53, 0), array_new(29, 0));
+    let lengths = chosen(seen.lengths, count, 9, usual.lengths);
+    let offsets = chosen(seen.offsets, count, 8, usual.offsets);
+    let matches = chosen(seen.matches, count, 9, usual.matches);
+    let k: Coders = { lengths: lengths.coder, matches: matches.coder, offsets: offsets.coder };
+    let seq = array_get(seqs, count - 1);
+    let lits = seq & 0xF_FFFF;
+    let length = seq >>> 20 & 0xF_FFFF;
+    let offset = seq >>> 40;
+    let codes = codes_of(seq);
+    let lc = codes & 255;
+    let mc = codes >>> 8 & 255;
+    let oc = codes >>> 16;
+    let le = array_get(length_codes(), lc);
+    let me = array_get(match_codes(), mc);
+    let opening = lits - (le >>> 5) | length + 3 - (me >>> 5) << (le & 31);
+    let held = (le & 31) + (me & 31);
+    let out = drained(b"", opening, held);
+    let far = opening >>> (held & 0x78) | offset - (1 << oc) << (held & 7);
+    let held2 = (held & 7) + oc;
+    let head = if count < 128 { byte_of_int(count) } else if count < 0x7F00 {
+      bytes_concat(byte_of_int((count >>> 8) + 128), byte_of_int(count & 255))
+    } else { bytes_concat(b"\xFF", bytes_slice(u32_le(count - 0x7F00), 0, 2)) };
+    bytes_concat_all([
+      head,
+      byte_of_int(lengths.mode << 6 | offsets.mode << 4 | matches.mode << 2),
+      lengths.head,
+      offsets.head,
+      matches.head,
+      sequences_written(
+        seqs,
+        count - 2,
+        k,
+        started(k.lengths, lc),
+        started(k.matches, mc),
+        started(k.offsets, oc),
+        drained(out, far, held2),
+        far >>> (held2 & 0x78),
+        held2 & 7,
+      ),
+    ])
+  }
+}
+
+// --- Writing: matches ---------------------------------------------------------
+
+/// The three offsets a reader will hold, and the sequences as it reads them.
+type Named = { out: List<Int>, lits: List<Bytes>, at: Int, r1: Int, r2: Int, r3: Int }
+
+/// A match's distance as the value a sequence carries: 1 to 3 for one of the last three used,
+/// counted from the second where no literal stands before the match, and three more than itself
+/// for any other.
+fn named(buf: Bytes, t: Named, seq: Int) -> Named / {abort.raise} = {
+  let count = seq & 0xF_FFFF;
+  let length = seq >>> 20 & 0xF_FFFF;
+  let dist = seq >>> 40;
+  let value = if count > 0 {
+    if dist == t.r1 { 1 } else if dist == t.r2 { 2 } else if dist == t.r3 { 3 } else { dist + 3 }
+  } else if dist == t.r2 { 1 }
+  else if dist == t.r3 { 2 }
+  else if dist == t.r1 - 1 { 3 }
+  else { dist + 3 };
+  let which = if value > 3 { 0 } else if count == 0 { value + 1 } else { value };
+  {
+    out: push(t.out, count | length - 3 << 20 | value << 40),
+    lits: push(t.lits, bytes_slice(buf, t.at, t.at + count)),
+    at: t.at + count + length,
+    r1: dist,
+    r2: if which == 1 { t.r2 } else { t.r1 },
+    r3: if which == 1 || which == 2 { t.r3 } else { t.r2 },
+  }
+}
+
+/// How hard a writer looks for what repeats.
+pub type Level =
+  /// Not at all: the bytes as they are, in blocks. A frame is its input and a few bytes more.
+  | Stored
+  /// One place a position: where the next four bytes last stood, within 2 MiB, and the distance
+  /// of the match before. Literals go under a Huffman code, and each kind of a block's sequence
+  /// codes under a table of the block's own where that is shorter than the predefined one.
+  | Fast
+
+/// What a writer carries from block to block: where bytes of four last stood, and the three
+/// offsets a reader holds.
+type Packer = { table: Array<Int>, r1: Int, r2: Int, r3: Int }
+
+type Packed = { bytes: Bytes, packer: Packer }
+
+fn packer() -> Packer / {abort.raise} = { table: array_new(131072, 0), r1: 1, r2: 4, r3: 8 }
+
+fn block_head(last: Bool, kind: Int, size: Int) -> Bytes / {abort.raise} =
+  bytes_slice(u32_le(size << 3 | kind << 1 | (if last { 1 } else { 0 })), 0, 3)
+
+/// The block of `buf` from `from` to `to`, which are 128 KiB apart at most: literals and
+/// sequences where those are shorter than the bytes, and the bytes otherwise.
+fn block_written(
+  buf: Bytes,
+  from: Int,
+  to: Int,
+  shift: Int,
+  last: Bool,
+  level: Level,
+  p: Packer,
+) -> Packed / {abort.raise} = {
+  let stored = bytes_concat(block_head(last, 0, to - from), bytes_slice(buf, from, to));
+  match level {
+    Stored -> { bytes: stored, packer: p },
+    Fast -> {
+      let r1 = p.r1;
+      let r2 = p.r2;
+      let r3 = p.r3;
+      let seen = found(buf, from, from, to, p.table, [], r1, shift, to - from + 1);
+      let seqs = seen.seqs;
+      let table = seen.table;
+      let start: Named = { out: [], lits: [], at: from, r1: r1, r2: r2, r3: r3 };
+      let told = fold(seqs, start, |t: Named, seq: Int| named(buf, t, seq));
+      let body = bytes_concat(
+        literals_written(bytes_concat_all(push(told.lits, bytes_slice(buf, told.at, to)))),
+        sequences_section(array_of_list(told.out)),
+      );
+      if bytes_len(body) >= to - from {
+        { bytes: stored, packer: { table: table, r1: r1, r2: r2, r3: r3 } }
+      } else {
+        {
+          bytes: bytes_concat(block_head(last, 2, bytes_len(body)), body),
+          packer: { table: table, r1: told.r1, r2: told.r2, r3: told.r3 },
+        }
+      }
+    },
+  }
+}
+
+/// The blocks of `buf` from `from` to `to`, the last marked so where `last` is set.
+fn blocks_written(
+  buf: Bytes,
+  from: Int,
+  to: Int,
+  shift: Int,
+  last: Bool,
+  level: Level,
+  p: Packer,
+  out: List<Bytes>,
+) -> { out: List<Bytes>, packer: Packer } / {abort.raise} =
+  if from >= to - 131072 {
+    let one = block_written(buf, from, to, shift, last, level, p);
+    { out: push(out, one.bytes), packer: one.packer }
+  } else {
+    let one = block_written(buf, from, from + 131072, shift, false, level, p);
+    let grown = push(out, one.bytes);
+    blocks_written(buf, from + 131072, to, shift, last, level, one.packer, grown)
+  }
+
+/// `data` as one frame, which says how long it is and ends with a checksum. The frame's window is
+/// the data where that is 2 MiB at most, and 2 MiB otherwise.
+pub fn compress(data: Bytes, level: Level) -> Bytes / {abort.raise} = {
+  let n = bytes_len(data);
+  let head = if n < 256 { bytes_concat(b"\x28\xB5\x2F\xFD\x24", byte_of_int(n)) }
+  else if n < 65792 { bytes_concat(b"\x28\xB5\x2F\xFD\x64", bytes_slice(u32_le(n - 256), 0, 2)) }
+  else if n <= 2097152 { bytes_concat(b"\x28\xB5\x2F\xFD\xA4", u32_le(n)) }
+  else { bytes_concat_all([b"\x28\xB5\x2F\xFD\xC4\x58", u32_le(n), u32_le(n >>> 32)]) };
+  let blocks = blocks_written(data, 0, n, 0, true, level, packer(), [head]);
+  bytes_concat_all(
+    push(blocks.out, u32_le(int_of_u64(checksum::xxh64(data, 0u64) & 0xFFFF_FFFFu64))),
+  )
+}
+
+// --- Writing a chunk at a time ------------------------------------------------
+
+/// A writer part of the way through a frame: the bytes a match may reach and after them, from
+/// `from`, the ones no block holds yet; the stream offset of the first of them; the sum of every
+/// byte so far; and what one block leaves the next.
+type Encoder = { buf: Bytes, from: Int, shift: Int, sum: checksum::State, packer: Packer }
+
+type Pressed = { out: Bytes, next: Encoder }
+
+/// The writer with `chunk` taken in, and every whole block it then holds written. It keeps the
+/// 2 MiB before the bytes not yet written, and lets go of what is older once that is as much
+/// again.
+fn pressed(w: Encoder, chunk: Bytes, level: Level) -> Pressed / {abort.raise} = {
+  let sum = checksum::update(w.sum, chunk);
+  let from = w.from;
+  let shift = w.shift;
+  let packer = w.packer;
+  let buf = bytes_concat(w.buf, chunk);
+  let whole = (bytes_len(buf) - from) / 131072 * 131072;
+  if whole == 0 {
+    { out: b"", next: { buf: buf, from: from, shift: shift, sum: sum, packer: packer } }
+  } else {
+    let done = blocks_written(buf, from, from + whole, shift, false, level, packer, []);
+    let out = bytes_concat_all(done.out);
+    let at = from + whole;
+    let cut = if at > 4194304 { at - 2097152 } else { 0 };
+    {
+      out: out,
+      next: {
+        buf: if cut == 0 { buf } else { bytes_slice(buf, cut, bytes_len(buf)) },
+        from: at - cut,
+        shift: shift + cut,
+        sum: sum,
+        packer: done.packer,
+      },
+    }
+  }
+}
+
+/// What ends a frame: the bytes no block holds yet, in blocks of which the last says so, and the
+/// low half of the sum.
+fn sealed(w: Encoder, level: Level) -> Bytes / {abort.raise} = {
+  let done = blocks_written(w.buf, w.from, bytes_len(w.buf), w.shift, true, level, w.packer, []);
+  bytes_concat_all(push(done.out, u32_le(int_of_u64(checksum::finish(w.sum) & 0xFFFF_FFFFu64))))
+}
+
+fn encoding<| e>(
+  plain: Seq<Bytes | e>,
+  level: Level,
+  state: Option<Encoder>,
+  fuel: Int,
+) -> Seq<Bytes | {abort.raise | e}> =
+  ||
+    if fuel <= 0 { Done } else {
+      // A frame opens with its magic number, a byte that says a checksum ends it, and its window.
+      let head = match state { Some(_) -> b"", None -> b"\x28\xB5\x2F\xFD\x04\x58" };
+      let w = match state {
+        Some(held) -> held,
+        None -> { buf: b"", from: 0, shift: 0, sum: checksum::init(Xxh64(0u64)), packer: packer() },
+      };
+      match plain() {
+        Done -> Yield(bytes_concat(head, sealed(w, level)), seq::empty()),
+        Skip(rest) -> Skip(encoding(rest, level, state, fuel - 1)),
+        Yield(chunk, rest) -> {
+          let took = pressed(w, chunk, level);
+          let out = bytes_concat(head, took.out);
+          if bytes_len(out) == 0 { Skip(encoding(rest, level, Some(took.next), fuel - 1)) }
+          else { Yield(out, encoding(rest, level, Some(took.next), fuel - 1)) }
+        },
+      }
+    }
+
+/// One frame of the chunks of `plain`, a chunk for each pull that completes a block of 128 KiB or
+/// ends the frame. The frame's window is 2 MiB and it ends with a checksum; it does not say how
+/// long it is, which a writer that has not seen its last chunk does not know. The writer holds
+/// the 2 MiB a match may reach and up to as much again, the block it is filling, and the chunk
+/// it was handed.
+pub fn encoded<| e>(plain: Seq<Bytes | e>, level: Level) -> Seq<Bytes | {abort.raise | e}> =
+  encoding(plain, level, None, 0x3FFF_FFFF_FFFF_FFFF)
+
+// --- Tests ------------------------------------------------------------------
+
+fn sentence() -> Bytes =
+  b"Ply checks every effect a program performs, and a test that reads no host is cached. "
+
+fn thrice() -> Bytes = repeat(sentence(), 3)
+
+fn roomy() -> Limits = { output: 1048576, window: 2097152 }
+
+/// `n` bytes no match shortens.
+fn noise(n: Int) -> Bytes / {abort.raise} =
+  bytes_slice(
+    bytes_concat_all(
+      map(range(0, n / 4 + 1), |i: Int|
+        u32_le((i + 1) * 2654435761 >>> 13 ^ (i + 1) * 40503 >>> 5 ^ i)),
+    ),
+    0,
+    n,
+  )
+
+type Sample = { name: String, bytes: Bytes }
+
+fn samples() -> List<Sample> / {abort.raise} =
+  [
+    { name: "nothing", bytes: b"" },
+    { name: "one byte", bytes: b"a" },
+    { name: "text with no repeat", bytes: b"abcdefghijklmnop" },
+    { name: "a sentence three times", bytes: thrice() },
+    { name: "a sentence past two blocks", bytes: repeat(sentence(), 3200) },
+    { name: "a match that copies what it is writing", bytes: repeat(b"abc", 2000) },
+    { name: "one byte past a block", bytes: repeat(b"x", 140000) },
+    {
+      name: "every byte value, so weights that are themselves coded",
+      bytes: repeat(
+        bytes_concat_all(map(range(0, 256), |b: Int| repeat(byte_of_int(b), b % 7 + 1))),
+        4,
+      ),
+    },
+    { name: "noise, which is stored", bytes: noise(300) },
+    { name: "noise past a block", bytes: noise(140000) },
+    { name: "noise and then a sentence", bytes: bytes_concat(noise(5000), repeat(sentence(), 60)) },
+  ]
+
+/// What the chunks of a frame unpack to, joined.
+fn gathered(
+  chunks: Seq<Bytes | {zstd.refused, abort.raise}>,
+) -> Bytes / {zstd.refused, seq.spent, abort.raise} =
+  bytes_concat_all(seq::to_list(chunks, 1000000))
+
+test "{s.name} survives each level, whole and a chunk at a time" for s: Sample in samples() {
+  let fast = compress(s.bytes, Fast);
+  assert(decompress(fast, roomy()) == s.bytes);
+  assert(decompress(compress(s.bytes, Stored), roomy()) == s.bytes);
+  assert(gathered(decoded(seq::slices(fast, 1000), roomy())) == s.bytes);
+  let chunked = gathered(encoded(seq::slices(s.bytes, 30000), Fast));
+  assert(decompress(chunked, roomy()) == s.bytes);
+  assert(gathered(decoded(encoded(seq::slices(s.bytes, 7001), Stored), roomy())) == s.bytes);
+  assert(bytes_len(fast) <= bytes_len(s.bytes) + 16)
+}
+
+test "a frame says how long it is and ends with a checksum, and text packs to under half" {
+  assert_eq(compress(b"", Fast), bytes_of_hex("28b52ffd2400010000" ++ "99e9d851"));
+  assert_eq(bytes_slice(compress(thrice(), Fast), 0, 6), bytes_of_hex("28b52ffd24ff"));
+  assert_eq(
+    bytes_slice(compress(repeat(sentence(), 4), Stored), 0, 7),
+    bytes_of_hex("28b52ffd645400"),
+  );
+  assert_eq(bytes_len(compress(noise(300), Fast)), 300 + 4 + 3 + 3 + 4);
+  let page = repeat(sentence(), 3200);
+  assert(bytes_len(compress(page, Fast)) < bytes_len(page) / 100);
+  assert_eq(
+    gathered(encoded(seq::once(b""), Fast)),
+    bytes_of_hex("28b52ffd0458010000" ++ "99e9d851"),
+  )
+}
+
+test "many sequences are written by tables of the block's own, and a few, or all of one code, by the predefined ones" {
+  // Literal lengths of three codes, match lengths of five, and one offset code.
+  let alike = |n: Int|
+    array_of_list(map(range(0, n), |i: Int| i % 3 | i % 5 << 20 | 4 + i % 2 << 40));
+  assert_eq(bytes_at(sequences_section(alike(8)), 1), 0);
+  assert_eq(bytes_at(sequences_section(alike(100)), 1), 2 << 6 | 2 << 2);
+  // A count of 128 or more takes two bytes.
+  assert_eq(bytes_at(sequences_section(alike(1000)), 2), 2 << 6 | 2 << 2)
+}
+
+type Fixture = { name: String, packed: String, plain: Bytes }
+
+/// Frames `zstd` 1.5.7 wrote of the sentence three times.
+fn frames() -> List<Fixture> =
+  [
+    {
+      name: "level 3",
+      packed: "28b52ffd24ff750200520511179027cd01804b04ec36fbfae437594d6966f2134cee900307488b8646c289565b3192e99d537962f39914330089b3723526e60676c673524be9c7f5d0b1402dfa3008020100d509a34214a70caf06",
+      plain: thrice(),
+    },
+    {
+      name: "level 19, with no checksum",
+      packed: "28b52ffd20ff55020062051012a0bb012014c379e649a26cecfac3befaef35e261a849ccf379333367eb3c50f78da6dfac7dfc5878c06a19596d57b8856d3bbe5309d1bf55a767946af22f8901009609a34214",
+      plain: thrice(),
+    },
+    {
+      name: "level 3 from a pipe, which gives a window and no length",
+      packed: "28b52ffd0458750200520511179027cd01804b04ec36fbfae437594d6966f2134cee900307488b8646c289565b3192e99d537962f39914330089b3723526e60676c673524be9c7f5d0b1402dfa3008020100d509a34214a70caf06",
+      plain: thrice(),
+    },
+  ]
+
+test "decompress reads {f.name}" for f: Fixture in frames() {
+  assert_eq(decompress(bytes_of_hex(f.packed), roomy()), f.plain);
+  assert_eq(gathered(decoded(seq::slices(bytes_of_hex(f.packed), 1), roomy())), f.plain)
+}
+
+fn unpacked(packed: Bytes) -> Bytes / {zstd.refused, abort.raise} = decompress(packed, roomy())
+
+law "a frame written fast reads back" = inverse(|x: Bytes| compress(x, Fast), unpacked)
+
+law "a frame written stored reads back" = inverse(|x: Bytes| compress(x, Stored), unpacked)
+
+law "a frame reads the same however its bytes are cut, and so does what is written of them"
+  forall (x: Bytes, cuts: List<Int>) {
+    let sizes = map(cuts, |c: Int| c & 7);
+    gathered(decoded(seq::of_list(pieces(compress(x, Fast), sizes)), roomy())) == x
+      && unpacked(gathered(encoded(seq::of_list(pieces(x, sizes)), Fast))) == x
+  }
+
+law "a frame cut short anywhere is refused as cut short"
+  forall (x: Bytes, n: Int) {
+    let whole = compress(x, Fast);
+    match try_decompress(bytes_slice(whole, 0, (n & 0x7FFF_FFFF) % bytes_len(whole)), roomy()) {
+      Err(refusal) -> refusal.why == Truncated,
+      Ok(_) -> false,
+    }
+  }
+
+/// Whether a reader held to 4096 bytes answers no more than that or refuses, and raises nothing
+/// else.
+fn harmless(packed: Bytes) -> Bool = {
+  let got: Result<Result<Bytes, Refusal>, String> = try[abort.raise] {
+    try_decompress(packed, { output: 4096, window: 65536 })
+  };
+  match got { Ok(Ok(plain)) -> bytes_len(plain) <= 4096, Ok(Err(_)) -> true, Err(_) -> false }
+}
+
+/// `body` as the one block of a frame, of the type `kind`.
+fn framed(kind: Int, body: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    b"\x28\xB5\x2F\xFD\x00\x30",
+    bytes_slice(u32_le(bytes_len(body) << 3 | kind << 1 | 1), 0, 3),
+    body,
+  ])
+
+law "whatever bytes a reader is handed, as a stream, as a frame's blocks or as one block, it answers within its limits or refuses"
+  forall (x: Bytes) {
+    harmless(x) && harmless(bytes_concat(b"\x28\xB5\x2F\xFD\x00\x30", x)) && harmless(framed(2, x))
+      && harmless(framed(1, x))
+  }
+
+law "a frame with a byte changed is answered within the limits or refused"
+  forall (x: Bytes, at: Int, to: Int) {
+    let whole = compress(bytes_concat(x, thrice()), Fast);
+    harmless(with_byte(whole, (at & 0x7FFF_FFFF) % bytes_len(whole), to & 255))
+  }
+
+fn refused(got: Result<Bytes, Refusal>, at: Int, why: Why) -> Unit / {abort.raise} =
+  assert_eq(got, Err({ at: at, why: why }))
+
+test "a reader says why bytes are no stream of frames, and where" {
+  let good = compress(b"check me", Fast);
+  let n = bytes_len(good);
+  let read = |packed: Bytes| try_decompress(packed, roomy());
+  refused(read(b""), 0, Truncated);
+  refused(read(b"\x28\xB5"), 2, Truncated);
+  refused(read(bytes_slice(good, 0, 5)), 5, Truncated);
+  refused(read(bytes_slice(good, 0, n - 1)), n - 1, Truncated);
+  refused(read(b"PK\x03\x04 an archive of another kind"), 0, NotThisFormat);
+  refused(read(b"\x28\xB5\x2F\xFD\x08\x00"), 4, Header);
+  refused(read(b"\x28\xB5\x2F\xFD\x20\x05\x07\x00\x00"), 6, BlockType);
+  refused(read(b"\x28\xB5\x2F\xFD\x00\x00\x81\x3E\x00"), 6, BlockSize);
+  refused(read(b"\x28\xB5\x2F\xFD\x20\x05\x21\x00\x00abcd"), 13, Length);
+  refused(read(b"\x28\xB5\x2F\xFD\x21\x07\x04\x21\x00\x00abcd"), 5, Dictionary);
+  refused(read(with_byte(good, n - 1, bytes_at(good, n - 1) ^ 1)), n - 4, Checksum);
+  refused(read(bytes_concat(good, b"junk")), n, Trailing);
+  refused(read(bytes_concat(good, b"\x00")), n, Trailing);
+  refused(read(bytes_concat(good, bytes_slice(good, 0, n - 2))), 2 * n - 2, Truncated);
+  refused(try_decompress(good, { output: 7, window: 2097152 }), 0, OverLimit);
+  assert_eq(try_decompress(good, { output: 8, window: 8 }), Ok(b"check me"));
+  refused(try_decompress(good, { output: 8, window: 7 }), 0, Window)
+}
+
+test "frames one after another are one stream, a skippable frame among them is passed, and the first can be had alone" {
+  let a = compress(b"one, ", Fast);
+  let b = compress(b"two", Stored);
+  let skip = b"\x5A\x2A\x4D\x18\x03\x00\x00\x00...";
+  let all = bytes_concat_all([skip, a, skip, b, skip]);
+  assert_eq(decompress(all, roomy()), b"one, two");
+  assert_eq(gathered(decoded(seq::slices(all, 3), roomy())), b"one, two");
+  assert_eq(decompress(skip, roomy()), b"");
+  refused(
+    try_decompress(all, { output: 7, window: 2097152 }),
+    bytes_len(skip) * 2 + bytes_len(a),
+    OverLimit,
+  );
+  let head = first(all, roomy());
+  assert_eq(head.plain, b"one, ");
+  assert_eq(head.used, bytes_len(skip) + bytes_len(a));
+  assert_eq(first(bytes_concat(a, b"junk"), roomy()).used, bytes_len(a));
+  refused(try { first(bytes_slice(a, 0, 7), roomy()).plain }, 7, Truncated)
+}
+
+test "bytes that are no trained dictionary are one of content alone, and a trained one cut short is refused" {
+  assert_eq(dictionary(b"any bytes at all").id, 0);
+  assert_eq(dictionary(b"any bytes at all").content, b"any bytes at all");
+  let cut: Result<Dictionary, Refusal> = try {
+    dictionary(b"\x37\xA4\x30\xEC\x01\x00\x00\x00\x00")
+  };
+  assert(match cut { Err(_) -> true, Ok(_) -> false })
+}
+
+test "a frame that asks for a window past the limit is refused in a few steps, whatever it asks for" {
+  let asks = |window: Bytes|
+    metered(|| try_decompress(bytes_concat(b"\x28\xB5\x2F\xFD\x00", window), roomy()));
+  let huge = asks(b"\xF8");
+  let large = asks(b"\x60");
+  refused(huge.value, 0, Window);
+  refused(large.value, 0, Window);
+  assert_eq(huge.steps, large.steps);
+  assert(huge.steps < 40, Some(int_to_string(huge.steps)));
+  assert(huge.allocations < 40, Some(int_to_string(huge.allocations)))
+}
+
+/// The widest the history stands after an answer, reading `d` to where it needs input.
+fn widest(
+  d: Decoder,
+  most: Int,
+  fuel: Int,
+) -> { d: Decoder, most: Int } / {zstd.refused, abort.raise} =
+  if fuel <= 0 || d.core.need > 0 { { d: d, most: most } } else {
+    let answered = taken(pumped(d, stride(d), false, 1000000));
+    widest(answered.next, max(most, bytes_len(answered.next.hist)), fuel - 1)
+  }
+
+test "a stream is read in a history its window bounds, however long it is" {
+  let plain = repeat(sentence(), 4000);
+  // A frame of a 1 KiB window, in blocks of 1000 bytes as they are.
+  let frame = bytes_concat_all(
+    fold(range(0, 340), [b"\x28\xB5\x2F\xFD\x00\x00"], |out: List<Bytes>, i: Int|
+      push(
+        push(out, bytes_slice(u32_le(1000 << 3 | (if i == 339 { 1 } else { 0 })), 0, 3)),
+        bytes_slice(plain, 1000 * i, 1000 * i + 1000),
+      )),
+  );
+  assert(decompress(frame, roomy()) == plain);
+  let read = fold(
+    seq::to_list(seq::slices(frame, 5000), 1000),
+    { d: decoder(roomy(), no_dictionary(), b""), most: 0 },
+    |at: { d: Decoder, most: Int }, chunk: Bytes| widest(fed(at.d, chunk), at.most, 1000),
+  );
+  assert_eq(read.d.core.made, 340000);
+  assert(read.most < 140000, Some(int_to_string(read.most)))
+}
+
+law "a round trip takes steps in proportion to the input"
+  forall (n: Int) cost n {
+    decompress(compress(bytes_slice(repeat(sentence(), n / 85 + 1), 0, n), Fast), roomy())
+  }
+
+test "64 KiB of text takes under two steps a byte to unpack and check, and under four to pack" {
+  let text = bytes_slice(repeat(bytes_concat(sentence(), noise(40)), 600), 0, 65536);
+  let packed = metered(|| compress(text, Fast));
+  assert(packed.steps < 4 * 65536, Some(int_to_string(packed.steps)));
+  let read = metered(|| decompress(packed.value, roomy()));
+  assert(read.steps < 2 * 65536, Some(int_to_string(read.steps)))
+}

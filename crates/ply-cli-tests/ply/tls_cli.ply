@@ -29,6 +29,135 @@ fn plain() -> String =
   \\}
   \\
 
+/// Opens a connection to its own listener and secures it at both ends, as a `STARTTLS` does, the
+/// server's half in a task of its own since each half waits on the other. It ends by a panic
+/// that says which half refused, and why: the client's where both did, since a client that
+/// refuses its server is what the server then fails on.
+fn upgrading() -> String =
+  \\import std.ip
+  \\import std.net
+  \\import std.net (net)
+  \\
+  \\fn served(s: Int) -> Result<Bytes, String> / {net.write[conn]} =
+  \\  match net.serve_tls[conn](s, "api", [], b"", 5000) {
+  \\    Err(why) -> Err("the server's half: " ++ net::refusal_message(why)),
+  \\    Ok(_) -> match net.recv[conn](s, 64, 5000) {
+  \\      Some(heard) -> Ok(heard),
+  \\      None -> Err("nothing came over the secured connection"),
+  \\    },
+  \\  }
+  \\
+  \\fn main() -> Int / {net.read[listener], net.write[listener], net.write[conn], net.write[client], task.write, abort.raise} = {
+  \\  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+  \\    Ok(l) -> l,
+  \\    Err(why) -> panic("no listener: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let here = match net.local_address[listener](l) {
+  \\    Some(here) -> here,
+  \\    None -> panic("a listener has an address"),
+  \\  };
+  \\  let c = match net.connect_to[client](here, [], 5000) {
+  \\    Ok(c) -> c,
+  \\    Err(why) -> panic("no connection: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let s = net.accept[listener](l);
+  \\  let serving = task.spawn(|| served(s));
+  \\  let secured = net.start_tls[client](c, "localhost", [], b"", 5000);
+  \\  let sent = match secured { Ok(_) -> net.send[client](c, b"secured", 5000), Err(_) -> None };
+  \\  net.close[client](c);
+  \\  let heard = task.join(serving);
+  \\  net.close[conn](s);
+  \\  net.close[listener](l);
+  \\  match ((secured, heard)) {
+  \\    (Err(why), _) -> panic("the client's half: " ++ net::refusal_message(why)),
+  \\    (Ok(_), Err(why)) -> panic(why),
+  \\    (Ok(_), Ok(bytes)) -> if sent == Some(7) && bytes == b"secured" { 0 }
+  \\    else { panic("the secured connection carried something else") },
+  \\  }
+  \\}
+  \\
+
+/// Sends no mail: opens an SMTP session over a connection that starts in the clear to a server
+/// of its own, whose leave to start TLS is `go_ahead` (the source of a byte string's contents),
+/// proves a sealed password to it by `AUTH PLAIN` over TLS, and answers what the session kept of
+/// its exchange, or panics with why the client refused. The server takes the password only as
+/// the line it must be.
+fn smtp_upgrading(go_ahead: String) -> String =
+  smtp_upgrade() ++ "\nfn go_ahead() -> Bytes = b\"" ++ go_ahead ++ "\"\n"
+
+fn smtp_upgrade() -> String =
+  \\import std.ip
+  \\import std.net
+  \\import std.net (net)
+  \\import std.random (entropy)
+  \\import std.sasl
+  \\import std.sasl (sasl)
+  \\import std.show (show)
+  \\import std.smtp
+  \\import std.smtp (smtp)
+  \\import std.task
+  \\
+  \\fn served(l: Int) -> Result<Unit, String> / {net.write[listener], net.write[conn]} = {
+  \\  let s = net.accept[listener](l);
+  \\  let say = |said: Bytes| net.send[conn](s, said, 5000);
+  \\  let _greeted = say(b"220 localhost ESMTP\r\n");
+  \\  let _hello = net.recv[conn](s, 512, 5000);
+  \\  let _offered = say(b"250-localhost\r\n250 STARTTLS\r\n");
+  \\  let _asked = net.recv[conn](s, 512, 5000);
+  \\  let _left = say(go_ahead());
+  \\  let secured = net.serve_tls[conn](s, "api", [], b"", 5000);
+  \\  let answer = match secured {
+  \\    Err(why) -> Err(net::refusal_message(why)),
+  \\    Ok(_) -> {
+  \\      let _again = net.recv[conn](s, 512, 5000);
+  \\      let _offered_again = say(b"250-localhost\r\n250 AUTH PLAIN\r\n");
+  \\      let auth = net.recv[conn](s, 512, 5000);
+  \\      let proved = auth == Some(b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n");
+  \\      let _verdict = say(if proved { b"235 2.7.0 Accepted\r\n" } else { b"535 5.7.8 No\r\n" });
+  \\      let _quit = net.recv[conn](s, 512, 5000);
+  \\      let _bye = say(b"221 bye\r\n");
+  \\      if proved { Ok(()) } else { Err("the credential was not the line it must be") }
+  \\    },
+  \\  };
+  \\  net.close[conn](s);
+  \\  answer
+  \\}
+  \\
+  \\fn main() -> Int / {net.read[listener], net.write[listener], net.write[conn], net.write[client], task.write, clock.read, entropy.next, abort.raise} = {
+  \\  let l = match net.listen_on[listener](ip::socket_at(ip::loopback_v4(), 0), []) {
+  \\    Ok(l) -> l,
+  \\    Err(why) -> panic("no listener: " ++ net::refusal_message(why)),
+  \\  };
+  \\  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
+  \\  let held = match try[sasl.refused] {
+  \\    sasl::password("tim", secret_of_bytes(b"tanstaaftanstaaf"))
+  \\  } {
+  \\    Ok(k) -> k,
+  \\    Err(_) -> panic("the credential was refused"),
+  \\  };
+  \\  let serving = task.spawn(|| served(l));
+  \\  let kept = try[smtp.refused] {
+  \\    let c = smtp::with_credential(
+  \\      smtp::config("client.example", { ..smtp::default_limits(), transcript: 40 }),
+  \\      held,
+  \\    );
+  \\    task::unbounded(||
+  \\      smtp::with_session[client]("localhost", port, c, |s: smtp::Session|
+  \\        smtp::transcript_text(smtp::transcript(s))))
+  \\  };
+  \\  let served_as = task.join(serving);
+  \\  net.close[listener](l);
+  \\  match kept {
+  \\    Ok(text) -> if served_as == Ok(())
+  \\        && string_contains(
+  \\          text,
+  \\          "*: TLS\nC: EHLO client.example\nS: 250-localhost\nS: 250 AUTH PLAIN\nC: AUTH PLAIN ****\nS: 235 2.7.0 Accepted",
+  \\        ) { 0 }
+  \\    else { panic("the session was not secured and proved:\n" ++ text ++ "\n" ++ show(served_as)) },
+  \\    Err(why) -> panic("the client refused: " ++ show(why)),
+  \\  }
+  \\}
+
 /// Reaches the boundary without touching a socket.
 fn no_socket() -> String = "fn main() -> Int = simulate { spawn { 1 }; 2 }\n"
 
@@ -67,6 +196,47 @@ test/nondet "the listing discloses the TLS stack and the credential it was given
     Some("the credential must be named with its fingerprint:\n" ++ text),
   );
   assert(string_contains(text, "digest: b3:"), Some(text))
+}
+
+test/nondet "an open connection is secured at both ends by a run that holds and trusts the credential" {
+  program(upgrading());
+  let api = credential("api");
+  let r = on_disk(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
+  assert(r.code == 0, Some(said(r)));
+  // The same run without the certificate trusted: the client's half refuses it, typed.
+  let untrusted = on_disk(["run", "--host", "--tls", spec("api", api)]);
+  assert(untrusted.code != 0, Some(said(untrusted)));
+  assert(
+    string_contains(
+      said(untrusted),
+      "the client's half: the peer's certificate is not trusted for that name",
+    ),
+    Some(said(untrusted)),
+  )
+}
+
+test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, proves a sealed password over it, and refuses plaintext sent after the server's leave" {
+  program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n"));
+  let api = credential("api");
+  let trusted = ["run", "--host", "--tls", spec("api", api), "--trust", api.cert];
+  let r = on_disk(trusted);
+  assert(r.code == 0, Some(said(r)));
+  // The same server without its certificate trusted: the handshake is refused, typed.
+  let untrusted = on_disk(["run", "--host", "--tls", spec("api", api)]);
+  assert(
+    untrusted.code != 0
+      && string_contains(said(untrusted), "the client refused: HandshakeFailed(Untrusted)"),
+    Some(said(untrusted)),
+  );
+  // CVE-2011-0411: a reply injected after the leave, which a client that kept it would read as
+  // the server's answer over TLS.
+  program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n250 AUTH PLAIN\\r\\n"));
+  let again = credential("api");
+  let injected = on_disk(["run", "--host", "--tls", spec("api", again), "--trust", again.cert]);
+  assert(
+    injected.code != 0 && string_contains(said(injected), "the client refused: Injected"),
+    Some(said(injected)),
+  )
 }
 
 test "a program that touches no socket reports no transport" {
