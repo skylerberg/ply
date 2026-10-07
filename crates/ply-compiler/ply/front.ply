@@ -36,7 +36,7 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               test_owner, cases_root, listing_ty, witness_order_bin, elaborated, ended, stated,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
               builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts,
-              InstanceInfo, NumericInfo, Raise, raise_bin)
+              InstanceInfo, NumericInfo, Raise, raise_bin, Elaboration)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, closure, empty, pins_of,
@@ -49,8 +49,9 @@ import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update, tagged_in, picked_in)
 import derive (RowField, row_shape, generated_name, same_deriver)
-import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_want_bin, embed_key, embed_tables,
-              embedded, rewritten, wants_of, want_of_key)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, ItemWants, embed_want_bin, item_wants_bin,
+              embed_key, embed_tables, embedded, rewritten, wants_of, wants_by_item, wants_in,
+              want_of_key)
 import items (parse, import_decl_bin)
 import std.bytes (join, ascii_of_int)
 import std.list
@@ -1438,6 +1439,9 @@ pub type Analysis = {
   restored: List<Bytes>,
   /// What each module embeds, for every pass that parses its text again.
   embeds: List<EmbedAt>,
+  /// What each item of a module that embeds asks for, where the load knew it without a parse of its
+  /// own: from what the module's text was kept as pulling, or from the module read whole.
+  embed_items: Map<Bytes, List<ItemWants>>,
 }
 
 /// The whole program's hashing, before a load left out the shipped functions in `names`.
@@ -2710,6 +2714,7 @@ pub type Hashed = {
   whole_cuts: Map<Bytes, List<Cut>>,
   unreached: Option<Unreached>,
   restored: List<Bytes>,
+  embed_items: Map<Bytes, List<ItemWants>>,
 }
 
 fn hashed_closure(
@@ -2804,6 +2809,7 @@ fn hashed_closure(
                   map_insert(acc, c.name, c.cuts)),
                 unreached: None,
                 restored: [],
+                embed_items: map_new(),
               })
             }
           }
@@ -2864,6 +2870,7 @@ fn checked_closure(
       unreached: h.unreached,
       restored: h.restored,
       embeds: h.embeds,
+      embed_items: h.embed_items,
     })
   }
 }
@@ -3477,10 +3484,10 @@ pub fn claims(
 }
 
 /// The claims of the modules at `wanted`, ascending and closed under imports, lowered as `claims`
-/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and the checker
-/// walks again only the definitions there that write a record update — the one thing lowering reads
-/// from it — seeded with every other definition's and test's rows as the next analysis would be.
-/// A module the run does not own is claimed by its specs, so its source and its stub answer alike.
+/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and what
+/// lowering reads of the checker — the shape of each record update — is what the check filed, as
+/// the emitter reads it. A module the run does not own is claimed by its specs, so its source and
+/// its stub answer alike.
 pub fn claims_in(
   analysis: Analysis,
   wanted: List<Int>,
@@ -3488,6 +3495,23 @@ pub fn claims_in(
 ) -> List<Claim> / {abort.raise} = {
   let stubs = fold(analysis.stubs, map_new(), |acc: Map<Bytes, Bool>, s: Bytes|
     map_insert(acc, s, true));
+  let shapes = match facts_read(rows_of(analysis), walked_facts(analysis), None, analysis.mods) {
+    Ok(facts) -> facts.elaboration,
+    Err(_) -> rechecked(analysis, wanted),
+  };
+  claims_of_modules(
+    updated_mods(analysis.mods, shapes),
+    analysis.r,
+    wanted,
+    |m: Bytes| map_contains(stubs, m) || !owned(m),
+    ended(analysis.checked.defs),
+    stated(analysis.checked.defs),
+  )
+}
+
+/// What the checker makes of each record update at `wanted`, walked again where the check filed no
+/// facts to read: every other definition and test is seeded with its rows.
+fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.raise} = {
   let walked = fold(wanted, map_new(), |acc: Map<Bytes, Bool>, i: Int| {
     let m = at(analysis.mods, i);
     fold(m.module.items, acc, |a: Map<Bytes, Bool>, item: Item|
@@ -3509,15 +3533,7 @@ pub fn claims_in(
   );
   match elaboration_with(analysis.r, analysis.mods, known) {
     None -> panic("a program the front end checked does not check"),
-    Some(shapes) ->
-      claims_of_modules(
-        updated_mods(analysis.mods, shapes),
-        analysis.r,
-        wanted,
-        |m: Bytes| map_contains(stubs, m) || !owned(m),
-        ended(analysis.checked.defs),
-        stated(analysis.checked.defs),
-      ),
+    Some(shapes) -> shapes,
   }
 }
 
@@ -3712,7 +3728,7 @@ pub type ModulePulls = { name: Bytes, pulls: Pulls }
 
 /// What a load reads of a module to find what it pulls: what it imports, the hidden imports among
 /// them, and what it embeds.
-pub type Pulls = { imports: List<ImportDecl>, wants: List<EmbedWant> }
+pub type Pulls = { imports: List<ImportDecl>, wants: List<ItemWants> }
 
 derive bin for Pulls
 
@@ -3721,7 +3737,7 @@ derive bin for Pulls
 pub fn pulls_of(source: Source) -> Pulls / {abort.raise} =
   {
     imports: headed_at(0, source).module.module.imports,
-    wants: if names_embed(source.src) { wants_of(parse(source.src).node) } else { [] },
+    wants: if names_embed(source.src) { wants_by_item(parse(source.src).node) } else { [] },
   }
 
 /// What a load of `user` and its package closure pulls, each module read once through `read`: what
@@ -3818,7 +3834,7 @@ fn needing<| e>(
                 pulls: push(acc.pulls, { name: name, pulls: pulls }),
               },
               name,
-              pulls.wants,
+              wants_in(pulls.wants),
             )
           },
         }
@@ -4103,7 +4119,10 @@ fn shipped_embedded(
   let p = { ..read, src: text };
   if !names_embed(text) { { parsed: p, embeds: [] } } else {
     let wants = if text == source.src { wants_of(p.module.module) } else {
-      match map_get(told, source.name) { Some(t) -> t.wants, None -> wants_of(parse(text).node) }
+      match map_get(told, source.name) {
+        Some(t) -> wants_in(t.wants),
+        None -> wants_of(parse(text).node),
+      }
     };
     let table = fold(wants, map_new(), |acc: Map<Bytes, EmbedRead>, want: EmbedWant|
       map_insert(acc, embed_key(want), shipped_read(whole, data, source.name, want)));
@@ -4266,6 +4285,17 @@ pub fn staged_pulling_std_with(
     },
   );
   let parsed = read.parsed;
+  let items = fold(
+    range(0, len(sources)),
+    fold(pulls, map_new(), |acc: Map<Bytes, List<ItemWants>>, m: ModulePulls|
+      if len(m.pulls.wants) == 0 { acc } else { map_insert(acc, m.name, m.pulls.wants) }),
+    |acc: Map<Bytes, List<ItemWants>>, i: Int| {
+      let s = at(sources, i);
+      if !tested || map_contains(acc, s.name) || map_contains(stubs, s.name)
+          || !names_embed(s.src) { acc }
+      else { map_insert(acc, s.name, wants_by_item(at(parsed, i).module.module)) }
+    },
+  );
   let mentions = concat(
     map(user, |s: Source| names_embed(s.src)),
     map(clo.modules, |m: { pkg: Int, src: Source }| names_embed(m.src.src)),
@@ -4307,7 +4337,7 @@ pub fn staged_pulling_std_with(
         concat(x.whole, back.whole),
       ) {
       Err(diags) -> Err(diags),
-      Ok(h) -> Ok({ ..h, restored: back.names }),
+      Ok(h) -> Ok({ ..h, restored: back.names, embed_items: items }),
     };
   let rowless = rowless_of(ifaces);
   let restore = |parsed: List<ParsedSource>, needed: (Bytes) -> Bool|
@@ -6471,6 +6501,22 @@ test "a refused program's answer is its diagnostics, placed where it went wrong,
   assert_eq(a.dump.hashes, [])
 }
 
+test "claims read each record update's shape from what the check filed, as a walk again finds it" {
+  let a = analysis_of([
+    {
+      name: b"m",
+      src: b"pub type P = { x: Int, y: Int }\n\npub fn moved(p: P) -> P\n  ensures result.x == p.x + 1\n= { ..p, x: p.x + 1 }\n",
+    },
+  ]);
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(string_of_bytes_lossy(why)),
+    Ok(f) -> {
+      assert(len(f.elaboration.updates) > 0, Some("the check filed no update"));
+      assert_eq(f.elaboration.updates, rechecked(a, [0]).updates)
+    },
+  }
+}
+
 fn analysis_of(sources: List<Source>) -> Analysis / {abort.raise} =
   match analyse(parse_all(sources)) { Refused(_) -> panic("the program checks"), Analysed(w) -> w }
 
@@ -7916,6 +7962,40 @@ test "only a module that may call `embed` is parsed for what it embeds" {
   assert(!names_embed(b"x embed"))
 }
 
+test "what a module's items ask to embed is what the module asks, each once" {
+  let m = parse(
+    b"fn a() -> Bytes = embed(\"x\")\nfn b() -> Bytes = embed(\"x\")\nfn c() -> List<Int> = map(embed_dir(\"d\"), |f: { name: String, bytes: Bytes }| 1)\ntest \"t\" { assert(bytes_len(embed(\"y\")) > 0) }\n",
+  ).node;
+  assert_eq(wants_in(wants_by_item(m)), wants_of(m));
+  assert_eq(map(wants_by_item(m), |i: ItemWants| i.name), [
+    Some(b"a"),
+    Some(b"b"),
+    Some(b"c"),
+    Some(b"t"),
+  ])
+}
+
+test "a load hands on what each item asks to embed, from what the text was kept as pulling where it was" {
+  let a: Source = { name: b"a", src: b"pub fn text() -> Bytes = embed(\"x.txt\")\n" };
+  let read = [
+    {
+      root: b"",
+      module: b"a",
+      want: { path: b"x.txt", dir: false },
+      read: Ok([{ name: b"", bytes: b"one" }]),
+    },
+  ];
+  let items = |pulls: List<ModulePulls>|
+    match staged_pulling_std_with([a], [], embeds: read, pulls: pulls).hashed {
+      Ok(h) -> map_get(h.embed_items, b"a"),
+      Err(_) -> panic("the module loads"),
+    };
+  assert_eq(items([]), Some([{ name: Some(b"text"), wants: [{ path: b"x.txt", dir: false }] }]));
+  // What was kept is taken as it stands: the text is not parsed for it again.
+  let kept = [{ name: Some(b"kept"), wants: [{ path: b"x.txt", dir: false }] }];
+  assert_eq(items([{ name: b"a", pulls: { imports: [], wants: kept } }]), Some(kept))
+}
+
 test "an embed is the bytes read for it, and other bytes are another definition" {
   let src = b"fn data() -> Bytes = embed(\"d.txt\")\nfn other() -> Int = 1\n";
   let one = embedding(src, [a_file(b"one")]);
@@ -8249,7 +8329,7 @@ test "a shipped module read as its stub answers what its text's read kept that i
   let whole = map_insert(map_new(), b"std.words", b"embed( names nothing a parse would find");
   let told = map_insert(map_new(), b"std.words", {
     imports: [],
-    wants: wants_of(parse(words_module(b"words/list.txt").src).node),
+    wants: wants_by_item(parse(words_module(b"words/list.txt").src).node),
   });
   let stub = shipped_embedded(whole, told, data_held(words_data(b"one\n")), 0, {
     name: b"std.words",

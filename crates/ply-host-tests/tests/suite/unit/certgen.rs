@@ -41,6 +41,7 @@ fn an_issued_certificate_is_a_localhost_certificate_a_client_can_trust() {
             key,
         }],
         &[],
+        &[],
     )
     .expect("the issued material loads as a credential");
     let (name, credential) = loaded.iter().next().expect("the credential is there");
@@ -75,6 +76,7 @@ fn a_named_certificate_is_a_certificate_for_that_name() {
             certificate,
             key,
         }],
+        &[],
         &[],
     )
     .expect("the issued material loads as a credential");
