@@ -1013,11 +1013,15 @@ already holds, and `config.secret` (`std.config`) answers one it never held.
 These make a secret of a secret without opening it: `secret_bytes` (a string's
 UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
 hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
-give it), `secret_private_key` (the key a DER document holds) and the
-derivations `std.hash` names, `hkdf` and `pbkdf2`. None answers a part of a
-secret: a slice of one, compared with `==` against each of 256 guesses, would
-read it a byte at a time, so two keys out of one derivation are two `hkdf`
-calls under two `info`s.
+give it) and `secret_encode` (the text of a secret's bytes in those),
+`secret_private_key` (the key a DER document holds), `secret_rsa_jwk` (the
+document an RSA JSON Web Key's numbers make) and the derivations `std.hash`
+names, `hkdf` and `pbkdf2`. None answers a part of a secret: a slice of one,
+compared with `==` against each of 256 guesses, would read it a byte at a time,
+so two keys out of one derivation are two `hkdf` calls under two `info`s.
+`std.random`'s `entropy.secret(n)` draws `n` bytes straight into a secret. A
+secret holds its bytes in memory no other value shares, and they are
+overwritten with zeros when the last value holding the secret is dropped.
 
 A secret is observed four ways: `==` and `!=` between two of them,
 `secret_verify` against a string, `secret_is_empty` and `secret_len`. A
@@ -1032,9 +1036,17 @@ secret: each is one-way in the key.
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
 allows it (`E0439`). The operations `ply` ships that take one are
-`std.password`'s, which hash a password and answer the hash, one-way in it; so
-a secret has no way out of a program: key material that is to be written down,
-as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
+`std.password`'s, which hash a password and answer the hash, one-way in it, and
+the two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
+alone may read, and `std.net`'s `send_secret`, to a connection. Both write the
+same frame, all of it or nothing: plain bytes before the secret, the secret
+`raw` or in `hex`, `base64`, `base64url` or `base32`, and plain bytes after it,
+as a key file's line is a word, the key in hex and a newline, and SASL's PLAIN
+is `AUTH PLAIN `, a credential in base64 and a line end. That frame is a
+secret's one way out of a program. `std.fs`'s `read_secret` reads one back in:
+given the frame, it answers the secret a file holds inside it, never a plain
+value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
+`ply build --sign` reads it, without the key ever being a plain value.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -1216,7 +1228,13 @@ otherwise copies one path of the list's trie; `list_set` is the same, and
 `array_set` copies the whole array. A copy is caused by a second owner: a
 binding read again after the update, a closure capture, a value read out with
 `cell_get`/`map_get`/`list_at`/`array_get` (use `cell_update`/`map_update`), or
-a caller that keeps using what it passed. `ply check --costs` reports every
+a caller that keeps using what it passed. A record is not one of them once it
+is done with the value: a field read that nothing after it reads again, as the
+field or as the whole record, takes the field out of a record no one else
+holds, and a `let` or `match` pattern lets its subject go once its binders hold
+their fields (an arm with a guard keeps it for the arms after), so
+`{ ..s, out: push(s.out, x) }` and `let { out, n } = s` grow `out` in place.
+The same holds for `Bytes` and `++`. `ply check --costs` reports every
 copying `push`, `list_set` and `array_set` in the run's own modules with its
 cause and fix. A `reuse fn` there turns that into an error, `E0127`; a
 dependency's, the shipped modules' included, is checked when that package is
@@ -1926,8 +1944,10 @@ values and their first difference. Any other failure is `E0502`.
 
 `metered(f)` answers `f()` with what it cost, in resources the runtime counts
 rather than time: `steps`, the calls it made, each counted as `--steps`
-counts them; `allocations`, the objects it built; and `performs`, each atom it
-performed with how many times, ordered by the atom's qualified name. A
+counts them; `allocations`, the objects it built; `bytes`, the memory those
+took, which an update in place does not spend and a copy does; and
+`performs`, each atom it performed with how many times, ordered by the atom's
+qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
@@ -2120,7 +2140,7 @@ rather than raised.
 | --- | --- |
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
-| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default under the temp directory) |
+| `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each module's walks, kept under its text, its bodies' own forms and what its check read, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default under the temp directory) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
@@ -2716,6 +2736,13 @@ checked against that declaration, so it performs none of it.
 | `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0) |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
+At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
+is what `std.http`'s `serve_pooled` drains on: it accepts nothing more, and it
+answers every connection it had accepted, queued ones included, the last answer
+on each saying `Connection: close`, and closes the ones waiting idle at once.
+Before the stop it sheds load, answering `503` with `Retry-After` to a
+connection that finds its queue full or that waited in it too long.
+
 An unreadable configuration source is `E0440`. A statement the server rejects
 and one that touches a table outside what the call site labelled are refusals
 from `std.db`, which reads and runs its own statements.
@@ -2886,8 +2913,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`,
 readable by its owner alone, and the public key at `PATH.pub`, each one line
 naming what it holds and 64 hex digits. It never writes over a file, and a key
-file that cannot be read, decoded or written is `E0462`. A secret key read back
-from its file is a `Secret` (§4.6) from then on.
+file that cannot be read, decoded or written is `E0462`. A secret key is a
+`Secret` (§4.6) from the moment `ply keygen` draws it, and is read back as one.
 
 `ply build --sign KEY` signs what it writes, a program or a library, in
 `<artifact>.sig` beside it. A signature is detached, so the artifact's digest
@@ -2943,7 +2970,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, and the modules a compiled package stood for; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -3055,7 +3082,9 @@ moved and what reaches it, and a definition generic over an effect row or a
 label every time. The hash it is filed under reads a definition of another
 package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
-dependents' rows standing. A load reads its dependencies and the shipped modules it
+dependents' rows standing. What each module imports, and what it embeds, is kept
+in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
+has not read. A load reads its dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the

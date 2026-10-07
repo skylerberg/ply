@@ -309,6 +309,11 @@ builtins! { $
     /// database an image holds, answering the image it leaves.
     SqliteRun = "sqlite_run", 6, ends;
     SqliteFunctions = "sqlite_functions", 0, ends;
+    /// `secret_encode(encoding, bytes)`: the text a credential's bytes are in an encoding, sealed.
+    SecretEncode = "secret_encode", 2, raises;
+    /// `secret_rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
+    /// numbers make, each private one its base64url text sealed; `None` for numbers that are no key.
+    SecretRsaJwk = "secret_rsa_jwk", 3, raises;
 }
 
 impl Builtin {
@@ -1338,10 +1343,9 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             )
         }
 
-        Builtin::SecretOfString => {
-            args[0].as_str(span, "`secret_of_string`")?;
-            Ok(Value::secret(args[0].clone()))
-        }
+        Builtin::SecretOfString => Ok(Value::secret_text(
+            args[0].as_str(span, "`secret_of_string`")?,
+        )),
 
         // Constant time but not rate limited: preventing a guessing loop is the program's job.
         Builtin::SecretVerify => {
@@ -1349,26 +1353,24 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
             };
             let candidate = args[1].as_str(span, "`secret_verify`")?;
-            let held = held.as_str(span, "`secret_verify`")?;
-            Ok(Value::Bool(crate::value::constant_time_eq(
-                held.as_bytes(),
-                candidate.as_bytes(),
-            )))
+            Ok(Value::Bool(
+                held.is_text()
+                    && crate::value::constant_time_eq(held.bytes(), candidate.as_bytes()),
+            ))
         }
 
         Builtin::SecretIsEmpty => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
             };
-            Ok(Value::Bool(match &**held {
-                Value::Str(s) => s.is_empty(),
-                Value::Bytes(b) => b.is_empty(),
-                // Only strings and bytes are constructible; `false` reports a credential as present.
-                _ => false,
-            }))
+            Ok(Value::Bool(held.bytes().is_empty()))
         }
 
-        Builtin::SecretOfBytes => crate::crypto::of_bytes(&args[0], span),
+        Builtin::SecretOfBytes => Ok(Value::secret_bytes(
+            args[0].as_bytes(span, "`secret_of_bytes`")?,
+        )),
+        Builtin::SecretEncode => crate::crypto::encode(&args[0], &args[1], span),
+        Builtin::SecretRsaJwk => crate::crypto::rsa_jwk(args, span),
         Builtin::SecretBytes => crate::crypto::utf8(&args[0], span),
         Builtin::SecretLen => crate::crypto::len(&args[0], span),
         Builtin::SecretConcat => crate::crypto::concat(&args[0], &args[1], span),

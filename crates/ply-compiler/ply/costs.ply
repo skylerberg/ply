@@ -7,16 +7,22 @@ import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecor
 import items (Module, Derived, Item, IFn, ITest, ILaw, Binder, FnDef, ReturnsFresh, ReturnsParam,
               parse)
 import exprs (Param, Expr)
-import rewrite (expand)
-import embed (EmbedAt, embed_tables, rewritten)
+import rewrite (expand, witness_param)
+import embed (EmbedAt, EmbedFile, embed_tables, rewritten)
 import derive (expand_derives)
-import resolve (ParsedModule, Resolved, ResolveSucceeded, ResolveFailed, ValueSpace, PackageDeps,
-                resolve_packaged, no_packages, qualify, find)
-import infer (Builtin, builtins, expanded_mods, test_owner)
-import front (Rows, WalkedFacts, Analysed, Refused, analyse, facts_read, rows_of, walked_facts)
-import diagnostics (parse_all)
+import resolve (ParsedModule, Resolved, ResolveOutcome, ResolveSucceeded, ResolveFailed, ValueSpace,
+                Source, resolve_packaged, no_packages, qualify, find)
+import infer (Builtin, builtins, expanded_mods, test_owner, RootFacts, LabelSite, UpdateShape,
+              WitnessOp, WitnessRef, WitnessOrder, OperandSite, TrySite, no_root_facts,
+              root_facts_bin)
+import front (Analysis, Rows, WalkedFacts, KnownDefRow, KnownTestRow, Analysed, Refused, Cut,
+              analyse, analyse_pulling_std, cuts_of, facts_read, rows_of, walked_facts)
+import hash (hex)
+import interface (stubbed)
+import diagnostics (ParsedSource, parse_all)
 import std.bin
-import std.list (at)
+import std.hash (blake3)
+import std.list (at, concat, contains)
 import std.bytes (ascii_of_int)
 
 type Cause =
@@ -53,12 +59,65 @@ type Demand = { callee: Int, param: Int, owner: Owner }
 /// `op` is the updating builtin: `push`, `list_set` or `array_set`.
 type RawSite = { span: Span, op: Bytes, owner: Owner }
 
+/// What a walk read of a callee's return: a later run takes the walk while each read answers alike.
+type Read = { callee: Int, ret: ReturnOwnership }
+
+/// A name a walk looked up at the top level: what it is bound to, and the definition that is.
+type Look = { name: Bytes, bound: Option<Bytes>, def: Option<Int> }
+
 type CostState = {
   chain: List<Bind>,
   sites: List<RawSite>,
   demands: List<Demand>,
   escaped: List<Int>,
+  reads: List<Read>,
+  looked: List<Look>,
 }
+
+// What a run keeps of a module, for a later run to take each body's walk from while every name it
+// looked up is what it was and every callee it read answers as it did. Definitions are named: an
+// index is one run's.
+
+/// What a name is bound to is the module's own text and resolved bodies, which its key holds;
+/// whether that is a definition is the text of the module it is in, which the key does not.
+type Looked = { name: Bytes, bound: Option<Bytes>, def: Bool }
+
+type KeptRead = { callee: Bytes, ret: ReturnOwnership }
+
+type KeptDemand = { callee: Bytes, param: Int, owner: Owner }
+
+type KeptWalk = {
+  reads: List<KeptRead>,
+  sites: List<RawSite>,
+  demands: List<KeptDemand>,
+  escaped: List<Bytes>,
+  ret: Owner,
+}
+
+type KeptBody = {
+  kind: Bytes,
+  name: Bytes,
+  label: Bytes,
+  def: Option<Bytes>,
+  arity: Int,
+  reuse: Option<Span>,
+  looked: List<Looked>,
+  walks: List<KeptWalk>,
+}
+
+type KeptModule = { bodies: List<KeptBody> }
+
+derive bin for Cause
+derive bin for Reason
+derive bin for Owner
+derive bin for ReturnOwnership
+derive bin for RawSite
+derive bin for Looked
+derive bin for KeptRead
+derive bin for KeptDemand
+derive bin for KeptWalk
+derive bin for KeptBody
+derive bin for KeptModule
 
 type WithOwner = { state: CostState, owner: Owner }
 
@@ -78,7 +137,10 @@ type Def = {
   says: Option<{ ret: ReturnOwnership, span: Span }>,
 }
 
-/// `def` is the index in `Program.defs`, or -1 for a test or a law, which has no caller.
+/// `def` is the index in `Program.defs`, or -1 for a test or a law, which has no caller. A body an
+/// earlier run walked is lowered only once a round finds none of its `kept` walks answering, and
+/// `lowered` says it has been: `code` and `span` (its item's) are the lowering's. `looked` is what
+/// its kept walks looked up.
 type Body = {
   kind: Bytes,
   module: Int,
@@ -87,11 +149,22 @@ type Body = {
   label: Bytes,
   def: Int,
   arity: Int,
+  span: Span,
   code: Option<Code>,
+  lowered: Bool,
   reuse: Option<Span>,
+  looked: List<Looked>,
+  kept: List<Found>,
 }
 
-type Found = { sites: List<RawSite>, demands: List<Demand>, escaped: List<Int>, ret: Owner }
+type Found = {
+  sites: List<RawSite>,
+  demands: List<Demand>,
+  escaped: List<Int>,
+  ret: Owner,
+  reads: List<Read>,
+  looked: List<Look>,
+}
 
 type Program = {
   r: Resolved,
@@ -102,8 +175,6 @@ type Program = {
 }
 
 type Env = { prog: Program, module: Int, tables: Tables }
-
-type Settled = { tables: Tables, rounds: Int }
 
 type Parsed = { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }
 
@@ -141,6 +212,9 @@ fn add_demand(state: CostState, d: Demand) -> CostState =
   { ..state, demands: push(state.demands, d) }
 
 fn add_escaped(state: CostState, d: Int) -> CostState = { ..state, escaped: push(state.escaped, d) }
+
+fn look(state: CostState, name: Bytes, found: Bound) -> CostState =
+  { ..state, looked: push(state.looked, { name: name, bound: found.bound, def: found.def }) }
 
 fn with_chain(state: CostState, chain: List<Bind>) -> CostState = { ..state, chain: chain }
 
@@ -199,8 +273,9 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
           fold(u.sets, state, |acc: CostState, f: CodeField| walk(env, f.value, acc).state),
         ).state,
       ),
+    // A field read marked `Owned` takes the field from a record nothing after it reads it of.
     NField(f) -> {
-      let b = walk(env, f.base, state);
+      let b = walk(env, if c.own == Owned { { ..f.base, own: Owned } } else { f.base }, state);
       match b.owner {
         BlockedOwner(reason) ->
           {
@@ -401,19 +476,23 @@ fn var_owner(
         },
       None -> { state: state, owner: free(name) },
     },
-    None -> match def_of(env, name) {
-      Some(d) ->
-        {
-          state: add_escaped(state, d),
-          owner: blocked(CProgram, b"a top-level definition, which the program holds"),
-        },
-      None ->
-        {
-          state: state,
-          owner: if sep_at(name) >= 0 {
-            blocked(CProgram, b"a module-qualified name denotes something the program holds")
-          } else { free(name) },
-        },
+    None -> {
+      let found = bound_in(env.prog, env.module, name);
+      let looked = look(state, name, found);
+      match found.def {
+        Some(d) ->
+          {
+            state: add_escaped(looked, d),
+            owner: blocked(CProgram, b"a top-level definition, which the program holds"),
+          },
+        None ->
+          {
+            state: looked,
+            owner: if sep_at(name) >= 0 {
+              blocked(CProgram, b"a module-qualified name denotes something the program holds")
+            } else { free(name) },
+          },
+      }
     },
   }
 
@@ -433,22 +512,13 @@ fn qname_of(text: Bytes) -> QName / {abort.raise} = {
   }
 }
 
-fn def_of(env: Env, name: Bytes) -> Option<Int> / {abort.raise} =
-  match find(env.prog.r, env.module, ValueSpace, qname_of(name)) {
-    None -> None,
-    Some(b) -> map_get(env.prog.index, b.qualified),
-  }
+type Bound = { bound: Option<Bytes>, def: Option<Int> }
 
-fn builtin_of(env: Env, func: Code) -> Option<Bytes> / {abort.raise} =
-  match func.node {
-    NVar(v) -> if v.slot != None || sep_at(v.name) >= 0 || def_of(env, v.name) != None { None }
-    else if map_contains(env.prog.builtins, v.name) { Some(v.name) }
-    else { None },
-    _ -> None,
+fn bound_in(prog: Program, module: Int, name: Bytes) -> Bound / {abort.raise} =
+  match find(prog.r, module, ValueSpace, qname_of(name)) {
+    None -> { bound: None, def: None },
+    Some(b) -> { bound: Some(b.qualified), def: map_get(prog.index, b.qualified) },
   }
-
-fn callee_of(env: Env, func: Code) -> Option<Int> / {abort.raise} =
-  match func.node { NVar(v) -> if v.slot != None { None } else { def_of(env, v.name) }, _ -> None }
 
 fn app(
   env: Env,
@@ -457,11 +527,25 @@ fn app(
   args: List<Code>,
   state: CostState,
 ) -> WithOwner / {abort.raise} = {
-  let builtin = builtin_of(env, func);
-  let callee = callee_of(env, func);
+  let named = match func.node {
+    NVar(v) -> if v.slot != None { None }
+    else { Some({ name: v.name, found: bound_in(env.prog, env.module, v.name) }) },
+    _ -> None,
+  };
+  let callee = match named { Some(x) -> x.found.def, None -> None };
+  // A builtin is called by its bare name, where no definition takes the name.
+  let builtin = match named {
+    Some(x) -> if x.found.def != None || sep_at(x.name) >= 0
+        || !map_contains(env.prog.builtins, x.name) { None }
+    else { Some(x.name) },
+    None -> None,
+  };
   let n = len(args);
   // A callee written as a name is a call, not the definition escaping.
-  let before = match func.node { NVar(_) -> state, _ -> walk(env, func, state).state };
+  let before = match func.node {
+    NVar(_) -> match named { Some(x) -> look(state, x.name, x.found), None -> state },
+    _ -> walk(env, func, state).state,
+  };
   let walked: Args = fold(args, { state: before, owners: [] }, |acc: Args, arg: Code| {
     let w = match callback_owners(builtin, len(acc.owners), n, acc.owners) {
       Some(owners) -> callback(env, owners, arg, acc.state),
@@ -482,7 +566,14 @@ fn app(
           o -> add_demand(acc, { callee: d, param: j, owner: o }),
         }),
   };
-  { state: demanded, owner: result_owner(env, builtin, callee, walked.owners) }
+  let read = match ((builtin, callee)) {
+    (None, Some(d)) -> match list_at(env.tables.rets, d) {
+      Some(r) -> { ..demanded, reads: push(demanded.reads, { callee: d, ret: r }) },
+      None -> demanded,
+    },
+    _ -> demanded,
+  };
+  { state: read, owner: result_owner(env, builtin, callee, walked.owners) }
 }
 
 /// The builtins that answer their first argument updated: in place when it reaches them at one owner.
@@ -684,17 +775,30 @@ fn walk_body(env: Env, b: Body) -> Found / {abort.raise} =
         demands: [],
         escaped: [],
         ret: unknown(CCall, b"the value a call answered, which the callee may also hold"),
+        reads: [],
+        looked: [],
       },
     Some(c) -> {
       let chain = map(range(0, b.arity), |k: Int|
         { slot: k, owner: if b.def < 0 { FreshOwner } else { ParamOwner(k) } });
-      let w = walk(env, c, { chain: chain, sites: [], demands: [], escaped: [] });
-      { sites: w.state.sites, demands: w.state.demands, escaped: w.state.escaped, ret: w.owner }
+      let w = walk(env, c, {
+        chain: chain,
+        sites: [],
+        demands: [],
+        escaped: [],
+        reads: [],
+        looked: [],
+      });
+      {
+        sites: w.state.sites,
+        demands: w.state.demands,
+        escaped: w.state.escaped,
+        ret: w.owner,
+        reads: w.state.reads,
+        looked: w.state.looked,
+      }
     },
   }
-
-fn round(program: Program, tables: Tables) -> List<Found> / {abort.raise} =
-  map(program.bodies, |b: Body| walk_body({ prog: program, module: b.module, tables: tables }, b))
 
 fn settle(program: Program, found: List<Found>, tables: Tables) -> Tables / {abort.raise} =
   fold(range(0, len(program.bodies)), start_tables(program.defs), |acc: Tables, i: Int| {
@@ -720,10 +824,178 @@ fn settle(program: Program, found: List<Found>, tables: Tables) -> Tables / {abo
     if b.def < 0 { demanded } else { with_ret(demanded, b.def, ret_of(f.ret)) }
   })
 
-fn fixpoint(program: Program, tables: Tables, rounds: Int) -> Settled / {abort.raise} = {
-  let next = settle(program, round(program, tables), tables);
-  if next == tables || rounds + 1 >= 24 { { tables: next, rounds: rounds + 1 } }
-  else { fixpoint(program, next, rounds + 1) }
+fn no_found() -> Found =
+  { sites: [], demands: [], escaped: [], ret: FreshOwner, reads: [], looked: [] }
+
+/// What answers a body this round: the walk it had, one this run made or an earlier run kept, by
+/// place, or a walk to make.
+type Try = | Stays | Made(Int) | Kept(Int) | Walks
+
+/// A run so far: `found` is each body's walk under the tables last walked, `took` the kept walks
+/// that answered, by place, and `made` the walks made, each in the order it first answered.
+/// `fresh` are the modules lowered with nothing kept.
+type Run = {
+  prog: Program,
+  found: List<Found>,
+  took: List<List<Int>>,
+  made: List<List<Found>>,
+  whole: Option<Whole>,
+  fresh: Map<Int, Bool>,
+  lowered: Int,
+  failed: Bool,
+}
+
+type Settled = { run: Run, tables: Tables, rounds: Int }
+
+/// A walk reads nothing that moves between runs but the names it looks up and the callees' answers
+/// it reads, so one whose reads all answer alike answers as walking again would.
+fn answers(f: Found, rets: List<ReturnOwnership>) -> Bool =
+  fold(f.reads, true, |acc: Bool, r: Read| acc && list_at(rets, r.callee) == Some(r.ret))
+
+fn first_answering(walks: List<Found>, rets: List<ReturnOwnership>) -> Option<Int> / {abort.raise} =
+  fold(range(0, len(walks)), None, |acc: Option<Int>, j: Int|
+    match acc { Some(_) -> acc, None -> if answers(at(walks, j), rets) { Some(j) } else { None } })
+
+fn keys_of(m: Map<Int, Bool>) -> List<Int> =
+  map_fold(m, [], |acc: List<Int>, k: Int, _: Bool| push(acc, k))
+
+/// Each body `which` holds answered under `tables`, by a walk that reads alike or by walking it,
+/// lowering first each module a body to walk has no code in.
+fn evaluate(p: Priced, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / {abort.raise} =
+  if run.failed { run } else {
+    let n = len(run.prog.bodies);
+    let tried = map(range(0, n), |i: Int|
+      if !which(i) { Stays } else {
+        match first_answering(at(run.made, i), tables.rets) {
+          Some(j) -> Made(j),
+          None -> match first_answering(at(run.prog.bodies, i).kept, tables.rets) {
+            Some(j) -> Kept(j),
+            None -> Walks,
+          },
+        }
+      });
+    let unlowered = fold(range(0, n), map_new(), |acc: Map<Int, Bool>, i: Int|
+      match at(tried, i) {
+        Walks -> {
+          let b: Body = at(run.prog.bodies, i);
+          if b.lowered { acc } else { map_insert(acc, b.module, true) }
+        },
+        _ -> acc,
+      });
+    let ready = if map_len(unlowered) == 0 { run } else { relowered(p, run, keys_of(unlowered)) };
+    if ready.failed { ready } else {
+      let walks = fold(range(0, n), map_new(), |acc: Map<Int, Found>, i: Int|
+        match at(tried, i) {
+          Walks -> {
+            let b: Body = at(ready.prog.bodies, i);
+            map_insert(acc, i, walk_body({ prog: ready.prog, module: b.module, tables: tables }, b))
+          },
+          _ -> acc,
+        });
+      let walked = |i: Int| match map_get(walks, i) { Some(f) -> f, None -> no_found() };
+      {
+        ..ready,
+        found: map(range(0, n), |i: Int|
+          match at(tried, i) {
+            Stays -> at(ready.found, i),
+            Made(j) -> at(at(ready.made, i), j),
+            Kept(j) -> at(at(ready.prog.bodies, i).kept, j),
+            Walks -> walked(i),
+          }),
+        took: map(range(0, n), |i: Int| {
+          let took: List<Int> = at(ready.took, i);
+          match at(tried, i) {
+            Kept(j) -> if contains(took, j) { took } else { push(took, j) },
+            _ -> took,
+          }
+        }),
+        made: map(range(0, n), |i: Int|
+          match at(tried, i) {
+            Walks -> push(at(ready.made, i), walked(i)),
+            _ -> at(ready.made, i),
+          }),
+      }
+    }
+  }
+
+/// The bodies of `modules`, kept from an earlier run, given the code their lowering makes now. The
+/// module's key holds its text, so the lowering makes the bodies that were kept.
+fn relowered(p: Priced, run: Run, modules: List<Int>) -> Run / {abort.raise} =
+  match lower(p, run.whole, modules, run.prog.index) {
+    None -> { ..run, failed: true },
+    Some(l) -> {
+      let made = fold(range(0, len(modules)), map_new(), |acc: Map<Int, List<Body>>, k: Int|
+        map_insert(acc, at(modules, k), at(l.bodies, k)));
+      let placed = fold(
+        run.prog.bodies,
+        { bodies: [], seen: map_new() },
+        |acc: { bodies: List<Body>, seen: Map<Int, Int> }, b: Body|
+          match map_get(made, b.module) {
+            None -> { ..acc, bodies: push(acc.bodies, b) },
+            Some(lowered) -> {
+              let k = match map_get(acc.seen, b.module) { Some(x) -> x, None -> 0 };
+              match list_at(lowered, k) {
+                Some(m) -> if m.label != b.label || m.kind != b.kind {
+                  panic("a module whose key stands lowered to other bodies than it kept")
+                } else {
+                  {
+                    bodies: push(acc.bodies, { ..b, code: m.code, span: m.span, lowered: true }),
+                    seen: map_insert(acc.seen, b.module, k + 1),
+                  }
+                },
+                None -> panic("a module whose key stands lowered to fewer bodies than it kept"),
+              }
+            },
+          },
+      );
+      {
+        ..run,
+        prog: { ..run.prog, r: resolution(l.whole, run.prog.r), bodies: placed.bodies },
+        whole: l.whole,
+        lowered: run.lowered + len(modules),
+      }
+    },
+  }
+
+/// Each definition's readers: the bodies whose walk reads what it answers. Which callees a walk
+/// reads is the body's, whatever the tables say, so any walk of it says.
+fn readers_of(found: List<Found>) -> Map<Int, List<Int>> / {abort.raise} =
+  fold(range(0, len(found)), map_new(), |acc: Map<Int, List<Int>>, i: Int|
+    fold(at(found, i).reads, acc, |m: Map<Int, List<Int>>, r: Read| {
+      let was = match map_get(m, r.callee) { Some(xs) -> xs, None -> [] };
+      if len(was) > 0 && at(was, len(was) - 1) == i { m }
+      else { map_insert(m, r.callee, push(was, i)) }
+    }))
+
+/// The bodies that read a definition `before` and `after` answer apart.
+fn moved_readers(
+  readers: Map<Int, List<Int>>,
+  before: Tables,
+  after: Tables,
+) -> Map<Int, Bool> / {abort.raise} =
+  fold(range(0, len(after.rets)), map_new(), |acc: Map<Int, Bool>, d: Int|
+    if list_at(before.rets, d) == list_at(after.rets, d) { acc } else {
+      match map_get(readers, d) {
+        None -> acc,
+        Some(xs) -> fold(xs, acc, |m: Map<Int, Bool>, i: Int| map_insert(m, i, true)),
+      }
+    })
+
+/// Rounds until the tables settle, or 24 of them; a body is walked again only where a callee it
+/// reads answers otherwise than the round before.
+fn iterate(
+  p: Priced,
+  run: Run,
+  readers: Map<Int, List<Int>>,
+  tables: Tables,
+  rounds: Int,
+) -> Settled / {abort.raise} = {
+  let next = settle(run.prog, run.found, tables);
+  let moved = moved_readers(readers, tables, next);
+  let walked = evaluate(p, run, |i: Int| map_contains(moved, i), next);
+  if walked.failed || next == tables || rounds + 1 >= 24 {
+    { run: walked, tables: next, rounds: rounds + 1 }
+  } else { iterate(p, walked, readers, next, rounds + 1) }
 }
 
 fn fix(cause: Option<Cause>) -> Bytes =
@@ -855,74 +1127,87 @@ fn quoted(s: Bytes) -> Bytes / {abort.raise} =
     b"\"",
   ])
 
-fn lowered(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> / {abort.raise} =
+fn code_of(names: List<Bytes>, labels: List<Bytes>, body: Expr) -> Option<Code> / {abort.raise} =
   match lower_fn(names, labels, map_new(), body) { Some(l) -> Some(l.code), None -> None }
 
-fn bodies_of(
-  mods: List<ParsedModule>,
-  index: Map<Bytes, Int>,
-  own: (Int) -> Bool,
-) -> List<Body> / {abort.raise} =
-  fold(range(0, len(mods)), [], |acc: List<Body>, i: Int| {
-    let m: ParsedModule = at(mods, i);
-    fold(if own(i) { m.module.items } else { [] }, acc, |a: List<Body>, item: Item|
-      match item {
-        IFn(d) -> {
-          let labels = map(d.generics.labels, |ident: Ident| ident.name);
-          let names = map(d.params, |param: Param| param.name.name);
-          push(a, {
-            kind: b"fn",
-            module: i,
-            module_name: m.name,
-            name: d.name.name,
-            label: bytes_concat_all([m.name, b".", d.name.name]),
-            def: match map_get(index, qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
-            arity: len(names) + len(labels),
-            code: lowered(names, labels, d.body),
-            reuse: d.reuse,
-          })
-        },
-        // Over cases, the body is read as a function of its case.
-        ITest(t) -> {
-          let names = match t.cases { Some(c) -> [c.binder.name], None -> [] };
-          push(a, {
-            kind: b"test",
-            module: i,
-            module_name: m.name,
-            name: t.name,
-            label: bytes_concat_all([m.name, b": test ", quoted(t.name)]),
-            def: 0 - 1,
-            arity: len(names),
-            code: lowered(names, [], t.body),
-            reuse: None,
-          })
-        },
-        ILaw(l) -> {
-          let names = map(l.binders, |binder: Binder| binder.name.name);
-          push(a, {
-            kind: b"law",
-            module: i,
-            module_name: m.name,
-            name: l.name,
-            label: bytes_concat_all([m.name, b": law ", quoted(l.name)]),
-            def: 0 - 1,
-            arity: len(names),
-            code: lowered(names, [], l.body),
-            reuse: None,
-          })
-        },
-        _ -> a,
-      })
-  })
+/// Module `i`'s bodies, lowered, in item order.
+fn module_bodies(i: Int, m: ParsedModule, index: Map<Bytes, Int>) -> List<Body> / {abort.raise} =
+  fold(m.module.items, [], |a: List<Body>, item: Item|
+    match item {
+      IFn(d) -> {
+        let labels = map(d.generics.labels, |ident: Ident| ident.name);
+        let names = map(d.params, |param: Param| param.name.name);
+        push(a, {
+          kind: b"fn",
+          module: i,
+          module_name: m.name,
+          name: d.name.name,
+          label: bytes_concat_all([m.name, b".", d.name.name]),
+          def: match map_get(index, qualify(m.name, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
+          arity: len(names) + len(labels),
+          span: d.span,
+          code: code_of(names, labels, d.body),
+          lowered: true,
+          reuse: d.reuse,
+          looked: [],
+          kept: [],
+        })
+      },
+      // Over cases, the body is read as a function of its case.
+      ITest(t) -> {
+        let names = match t.cases { Some(c) -> [c.binder.name], None -> [] };
+        push(a, {
+          kind: b"test",
+          module: i,
+          module_name: m.name,
+          name: t.name,
+          label: bytes_concat_all([m.name, b": test ", quoted(t.name)]),
+          def: 0 - 1,
+          arity: len(names),
+          span: t.span,
+          code: code_of(names, [], t.body),
+          lowered: true,
+          reuse: None,
+          looked: [],
+          kept: [],
+        })
+      },
+      ILaw(l) -> {
+        let names = map(l.binders, |binder: Binder| binder.name.name);
+        push(a, {
+          kind: b"law",
+          module: i,
+          module_name: m.name,
+          name: l.name,
+          label: bytes_concat_all([m.name, b": law ", quoted(l.name)]),
+          def: 0 - 1,
+          arity: len(names),
+          span: l.span,
+          code: code_of(names, [], l.body),
+          lowered: true,
+          reuse: None,
+          looked: [],
+          kept: [],
+        })
+      },
+      _ -> a,
+    })
 
-fn def_of_fn(module: Bytes, i: Int, own: Bool, def: FnDef) -> Def / {abort.raise} = {
-  let params = map(def.params, |param: Param| param.name.name);
+/// `witnesses` are the parameters the lowering passes ahead of the written ones.
+fn def_of_fn(
+  module: Bytes,
+  i: Int,
+  own: Bool,
+  def: FnDef,
+  witnesses: List<Bytes>,
+) -> Def / {abort.raise} = {
+  let params = concat(witnesses, map(def.params, |param: Param| param.name.name));
   {
     name: qualify(module, def.name.name),
     module: i,
     module_name: module,
     params: params,
-    arity: len(def.params),
+    arity: len(params),
     own: own,
     says: match def.returns {
       None -> None,
@@ -989,164 +1274,617 @@ fn unkept_of(program: Program, tables: Tables) -> List<Unkept> / {abort.raise} =
 /// a definition.
 fn builtin_names() -> List<Bytes> / {abort.raise} = map(builtins(), |b: Builtin| b.name)
 
-fn program_of(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  pkgs: List<PackageDeps>,
-  module_packages: List<Int>,
-  shipped: Int,
-  rows: Rows,
-  walked: WalkedFacts,
-  embeds: List<EmbedAt>,
-) -> Option<Program> / {abort.raise} = {
-  let tables = embed_tables(embeds);
-  let parsed = map(range(0, len(names)), |i: Int| {
-    let r = parse(at(srcs, i));
+/// A checked program as the cost checker reads it: the front end's analysis, each module's text as
+/// its source holds it (a stub's too), and what the analysis's check read of each body.
+pub type Priced = { analysis: Analysis, srcs: List<Bytes>, rows: Rows, walked: WalkedFacts }
+
+pub fn priced_of(analysis: Analysis, srcs: List<Bytes>) -> Priced / {abort.raise} =
+  { analysis: analysis, srcs: srcs, rows: rows_of(analysis), walked: walked_facts(analysis) }
+
+/// The root package's modules: the ones whose bodies a run costs.
+fn own_module(a: Analysis, i: Int) -> Bool =
+  match list_at(a.module_packages, i) { Some(k) -> k == 0, None -> true }
+
+fn places(mods: List<ParsedModule>) -> Map<Bytes, Int> / {abort.raise} =
+  fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(mods, i).name, i))
+
+/// Where module `k` of the front end's answer stands among the program's modules.
+fn placed(here: Map<Bytes, Int>, names: List<Bytes>, k: Int) -> Option<Int> =
+  match list_at(names, k) { Some(n) -> map_get(here, n), None -> None }
+
+/// Each module's witness orders by definition name, by its index among `mods`.
+fn orders_by_module(
+  w: WalkedFacts,
+  mods: List<ParsedModule>,
+) -> Map<Int, Map<Bytes, List<Bytes>>> / {abort.raise} = {
+  let here = places(mods);
+  fold(w.orders, map_new(), |acc: Map<Int, Map<Bytes, List<Bytes>>>, o: WitnessOrder|
+    match placed(here, w.modules, o.module) {
+      None -> acc,
+      Some(i) -> {
+        let was = match map_get(acc, i) { Some(m) -> m, None -> map_new() };
+        map_insert(acc, i, map_insert(was, o.name, o.params))
+      },
+    })
+}
+
+/// Every definition of the program as the front end read it, which for a stub is its source's
+/// signature. A witnessed definition takes its witnesses first, as its lowering does.
+fn defs_of(a: Analysis, walked: WalkedFacts) -> List<Def> / {abort.raise} = {
+  let orders = orders_by_module(walked, a.mods);
+  fold(range(0, len(a.mods)), [], |acc: List<Def>, i: Int| {
+    let m: ParsedModule = at(a.mods, i);
+    let ws = match map_get(orders, i) { Some(o) -> o, None -> map_new() };
+    fold(m.module.items, acc, |xs: List<Def>, item: Item|
+      match item {
+        IFn(d) ->
+          push(
+            xs,
+            def_of_fn(m.name, i, own_module(a, i), d, match map_get(ws, d.name.name) {
+              Some(w) -> map(w, witness_param),
+              None -> [],
+            }),
+          ),
+        _ -> xs,
+      })
+  })
+}
+
+/// Every module parsed from its source and resolved together: what a module the front end read as
+/// its stub, or cut, is lowered from, and the resolution its walk looks names up in, which holds the
+/// bindings its bodies' expansions make.
+type Whole = { mods: List<ParsedModule>, r: Resolved }
+
+fn whole_of(p: Priced) -> Option<Whole> / {abort.raise} = {
+  let a = p.analysis;
+  let tables = embed_tables(a.embeds);
+  let parsed = map(range(0, len(a.mods)), |i: Int| {
+    let name = at(a.mods, i).name;
+    let r = parse(match list_at(p.srcs, i) { Some(src) -> src, None -> b"" });
     let x = expand(r.node, r.parser.diags);
-    let d = expand_derives(i, at(names, i), x.module);
-    let e = rewritten(tables, at(names, i), d.module);
-    {
-      name: at(names, i),
-      module: e.module,
-      derived: d.derived,
-      bad: len(d.diags) > 0 || len(e.diags) > 0,
-    }
+    let d = expand_derives(i, name, x.module);
+    let e = rewritten(tables, name, d.module);
+    { name: name, module: e.module, derived: d.derived, bad: len(d.diags) > 0 || len(e.diags) > 0 }
   });
-  if fold(parsed, false, |acc: Bool, p: Parsed| acc || p.bad) { None } else {
-    let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
-    let packaged = if len(pkgs) == 0 { no_packages(mods) } else {
-      {
-        pkgs: pkgs,
-        module_packages: module_packages,
-        std: shipped - 2,
-        compiler: shipped - 1,
-        shipped: shipped,
-      }
-    };
-    match resolve_packaged(
-        mods,
-        packaged.pkgs,
-        packaged.module_packages,
-        packaged.std,
-        packaged.compiler,
-        packaged.shipped,
+  if fold(parsed, false, |acc: Bool, x: Parsed| acc || x.bad) { None } else {
+    match resolved_as(
+        a,
+        map(parsed, |x: Parsed| { name: x.name, module: x.module, derived: x.derived }),
       ) {
       ResolveFailed(_) -> None,
-      // A record update stands for a literal only once the checker has the base's shape, which is
-      // what the front end's check read of each body costed here; a body that does not lower has no
-      // cost to read.
-      ResolveSucceeded(x) -> {
-        // The root package's: the one the program's own appends and promises are in.
-        let own = |i: Int|
-          match list_at(packaged.module_packages, i) { Some(k) -> k == 0, None -> true };
-        match facts_read(rows, walked, Some(owned_roots(x.mods, own)), x.mods) {
-          Err(_) -> None,
-          Ok(facts) -> {
-            let mods = expanded_mods(x.mods, facts.elaboration);
-            let defs = fold(range(0, len(mods)), [], |acc: List<Def>, i: Int| {
-              let m: ParsedModule = at(mods, i);
-              fold(m.module.items, acc, |a: List<Def>, item: Item|
-                match item { IFn(d) -> push(a, def_of_fn(m.name, i, own(i), d)), _ -> a })
-            });
-            let index = fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int|
-              map_insert(acc, at(defs, i).name, i));
-            Some({
-              r: x.r,
-              index: index,
-              defs: defs,
-              bodies: bodies_of(mods, index, own),
-              builtins: fold(builtin_names(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes|
-                map_insert(acc, b, true)),
-            })
-          },
-        }
-      },
+      ResolveSucceeded(x) -> Some({ mods: x.mods, r: x.r }),
     }
   }
 }
 
-/// Every body costed: each definition and test of the modules `own` holds, by the root the front
-/// end's answer files its facts under.
-fn owned_roots(mods: List<ParsedModule>, own: (Int) -> Bool) -> Map<Bytes, Bool> / {abort.raise} =
-  fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
-    if !own(i) { acc } else {
-      let m: ParsedModule = at(mods, i);
-      fold(
-        m.module.items,
-        { roots: acc, position: 0 },
-        |a: { roots: Map<Bytes, Bool>, position: Int }, item: Item|
-          match item {
-            IFn(d) -> { ..a, roots: map_insert(a.roots, qualify(m.name, d.name.name), true) },
-            ITest(_) ->
-              {
-                roots: map_insert(a.roots, test_owner(m.name, a.position), true),
-                position: a.position + 1,
-              },
-            _ -> a,
-          },
-      ).roots
-    })
+/// `mods` resolved in the packages the front end resolved `a` in.
+fn resolved_as(a: Analysis, mods: List<ParsedModule>) -> ResolveOutcome / {abort.raise} = {
+  let shipped = len(a.packages);
+  let packaged = if shipped == 0 { no_packages(mods) } else {
+    {
+      pkgs: a.packages,
+      module_packages: a.module_packages,
+      std: shipped - 2,
+      compiler: shipped - 1,
+      shipped: shipped,
+    }
+  };
+  resolve_packaged(
+    mods,
+    packaged.pkgs,
+    packaged.module_packages,
+    packaged.std,
+    packaged.compiler,
+    packaged.shipped,
+  )
+}
 
-/// Every update of the program with its verdict. `rows` and `walked` are what the front end's check
-/// of the program read, which holds the facts of every body of the root package, and `embeds` what
-/// its answer says it embedded. A body of the root package they hold no facts for leaves the
-/// report not `ok`.
-pub fn costs(
-  names: List<Bytes>,
-  srcs: List<Bytes>,
-  pkgs: List<PackageDeps>,
-  module_packages: List<Int>,
-  shipped: Int,
-  rows: Rows,
-  walked: WalkedFacts,
-  embeds: List<EmbedAt> = [],
-) -> Report / {abort.raise} =
-  match program_of(names, srcs, pkgs, module_packages, shipped, rows, walked, embeds) {
-    None -> { ok: false, rounds: 0, defs: [], unkept: [] },
-    Some(p) -> {
-      let settled = fixpoint(p, start_tables(p.defs), 0);
-      // Verdicts come from a walk under the settled tables, not the round that produced them.
-      let found = round(p, settled.tables);
-      {
-        ok: true,
-        rounds: settled.rounds,
-        defs: fold(range(0, len(p.bodies)), [], |acc: List<Costed>, i: Int| {
-          let b: Body = at(p.bodies, i);
-          let f: Found = at(found, i);
-          if len(f.sites) == 0 { acc } else {
-            push(acc, {
-              kind: b.kind,
-              module: b.module,
-              module_name: b.module_name,
-              name: b.name,
-              label: b.label,
-              reuse: b.reuse,
-              sites: map(f.sites, |raw: RawSite| finish(raw, b.def, settled.tables)),
+type Lowered = { bodies: List<List<Body>>, whole: Option<Whole> }
+
+/// Modules `wanted`, each one's bodies lowered in item order with what the front end's check read
+/// of each written out. A module the front end read whole is lowered as it read it; one it read as
+/// its stub, or cut, from `whole`, which this resolves on first need. `None` is a module that does
+/// not lower: one the front end holds no facts of a body of.
+fn lower(
+  p: Priced,
+  whole: Option<Whole>,
+  wanted: List<Int>,
+  index: Map<Bytes, Int>,
+) -> Option<Lowered> / {abort.raise} =
+  if len(wanted) == 0 { Some({ bodies: [], whole: whole }) } else {
+    let a = p.analysis;
+    let cut = |i: Int| {
+      let name = at(a.mods, i).name;
+      map_contains(a.stub_cuts, name) || contains(a.stubs, name)
+    };
+    let needs = fold(wanted, false, |acc: Bool, i: Int| acc || cut(i));
+    let taken = match whole { Some(_) -> whole, None -> if needs { whole_of(p) } else { None } };
+    let missing = match taken { Some(_) -> false, None -> needs };
+    if missing { None } else {
+      let tables = embed_tables(a.embeds);
+      let read = fold(
+        wanted,
+        { mods: [], bad: false },
+        |acc: { mods: List<ParsedModule>, bad: Bool }, i: Int|
+          if cut(i) {
+            {
+              ..acc,
+              mods: push(acc.mods, match taken { Some(w) -> at(w.mods, i), None -> at(a.mods, i) }),
+            }
+          } else {
+            let m: ParsedModule = at(a.mods, i);
+            let e = rewritten(tables, m.name, m.module);
+            { mods: push(acc.mods, { ..m, module: e.module }), bad: acc.bad || len(e.diags) > 0 }
+          },
+      );
+      if read.bad { None } else {
+        match facts_read(p.rows, p.walked, None, read.mods) {
+          Err(_) -> None,
+          Ok(facts) -> {
+            let expanded = expanded_mods(read.mods, facts.elaboration);
+            Some({
+              bodies: map(range(0, len(wanted)), |k: Int|
+                module_bodies(at(wanted, k), at(expanded, k), index)),
+              whole: taken,
             })
-          }
+          },
+        }
+      }
+    }
+  }
+
+fn found_of(index: Map<Bytes, Int>, w: KeptWalk) -> Option<Found> / {abort.raise} = {
+  let reads = fold(w.reads, Some([]), |acc: Option<List<Read>>, r: KeptRead|
+    match ((acc, map_get(index, r.callee))) {
+      (Some(xs), Some(d)) -> Some(push(xs, { callee: d, ret: r.ret })),
+      _ -> None,
+    });
+  let demands = fold(w.demands, Some([]), |acc: Option<List<Demand>>, x: KeptDemand|
+    match ((acc, map_get(index, x.callee))) {
+      (Some(xs), Some(d)) -> Some(push(xs, { callee: d, param: x.param, owner: x.owner })),
+      _ -> None,
+    });
+  let escaped = fold(w.escaped, Some([]), |acc: Option<List<Int>>, name: Bytes|
+    match ((acc, map_get(index, name))) { (Some(xs), Some(d)) -> Some(push(xs, d)), _ -> None });
+  match ((reads, demands, escaped)) {
+    (Some(r), Some(d), Some(e)) ->
+      Some({ sites: w.sites, demands: d, escaped: e, ret: w.ret, reads: r, looked: [] }),
+    _ -> None,
+  }
+}
+
+/// A body as an earlier run kept it. Its walks are taken only while every name it looks up is bound
+/// to a definition exactly where it was then.
+fn held_body(
+  prog: Program,
+  i: Int,
+  module_name: Bytes,
+  k: KeptBody,
+) -> Option<Body> / {abort.raise} = {
+  let def = match k.def { None -> Some(0 - 1), Some(name) -> map_get(prog.index, name) };
+  match def {
+    None -> None,
+    Some(d) -> {
+      let stands = fold(k.looked, true, |acc: Bool, l: Looked|
+        acc && (match l.bound { None -> true, Some(q) -> map_contains(prog.index, q) == l.def }));
+      Some({
+        kind: k.kind,
+        module: i,
+        module_name: module_name,
+        name: k.name,
+        label: k.label,
+        def: d,
+        arity: k.arity,
+        span: dummy_span(),
+        code: None,
+        lowered: false,
+        reuse: k.reuse,
+        looked: k.looked,
+        kept: if !stands { [] } else {
+          fold(k.walks, [], |acc: List<Found>, w: KeptWalk|
+            match found_of(prog.index, w) { Some(f) -> push(acc, f), None -> acc })
+        },
+      })
+    },
+  }
+}
+
+/// Module `i`'s bodies as an earlier run kept them, or `None` for bytes that do not decode or that
+/// name a definition the program does not hold.
+fn held_bodies(
+  prog: Program,
+  i: Int,
+  module_name: Bytes,
+  bytes: Bytes,
+) -> Option<List<Body>> / {abort.raise} =
+  match bin::decode(bytes, kept_module_bin()) {
+    Err(_) -> None,
+    Ok(m) ->
+      fold(m.bodies, Some([]), |acc: Option<List<Body>>, k: KeptBody|
+        match acc {
+          None -> None,
+          Some(bs) -> match held_body(prog, i, module_name, k) {
+            Some(b) -> Some(push(bs, b)),
+            None -> None,
+          },
         }),
-        unkept: unkept_of(p, settled.tables),
+  }
+
+/// The whole program's, once a stub has been lowered: a stub's bodies are blank, and so is what their
+/// expansions bind.
+fn resolution(whole: Option<Whole>, r: Resolved) -> Resolved =
+  match whole { Some(w) -> w.r, None -> r }
+
+fn failed_run(prog: Program) -> Run =
+  {
+    prog: prog,
+    found: [],
+    took: [],
+    made: [],
+    whole: None,
+    fresh: map_new(),
+    lowered: 0,
+    failed: true,
+  }
+
+/// The program, each own module's bodies taken as an earlier run kept them where `kept` holds them,
+/// and lowered otherwise.
+fn started(p: Priced, kept: List<Option<Bytes>>) -> Run / {abort.raise} = {
+  let a = p.analysis;
+  let defs = defs_of(a, p.walked);
+  let base = {
+    r: a.r,
+    index: fold(range(0, len(defs)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+      map_insert(acc, at(defs, i).name, i)),
+    builtins: fold(builtin_names(), map_new(), |acc: Map<Bytes, Bool>, b: Bytes|
+      map_insert(acc, b, true)),
+    defs: defs,
+    bodies: [],
+  };
+  let held = map(range(0, len(a.mods)), |i: Int|
+    if !own_module(a, i) { None } else {
+      match list_at(kept, i) {
+        Some(Some(bytes)) -> held_bodies(base, i, at(a.mods, i).name, bytes),
+        _ -> None,
+      }
+    });
+  let missed = filter(range(0, len(a.mods)), |i: Int|
+    own_module(a, i) && (match at(held, i) { Some(_) -> false, None -> true }));
+  match lower(p, None, missed, base.index) {
+    None -> failed_run(base),
+    Some(l) -> {
+      let fresh = fold(range(0, len(missed)), map_new(), |acc: Map<Int, List<Body>>, k: Int|
+        map_insert(acc, at(missed, k), at(l.bodies, k)));
+      let bodies = fold(range(0, len(a.mods)), [], |acc: List<Body>, i: Int|
+        match at(held, i) {
+          Some(bs) -> concat(acc, bs),
+          None -> match map_get(fresh, i) { Some(bs) -> concat(acc, bs), None -> acc },
+        });
+      let none: List<Int> = [];
+      let unmade: List<Found> = [];
+      {
+        prog: { ..base, r: resolution(l.whole, base.r), bodies: bodies },
+        found: map(bodies, |_: Body| no_found()),
+        took: map(bodies, |_: Body| none),
+        made: map(bodies, |_: Body| unmade),
+        whole: l.whole,
+        fresh: fold(missed, map_new(), |acc: Map<Int, Bool>, i: Int| map_insert(acc, i, true)),
+        lowered: len(missed),
+        failed: false,
       }
     },
   }
+}
+
+fn kept_walk(prog: Program, f: Found) -> KeptWalk / {abort.raise} = {
+  let name = |d: Int| at(prog.defs, d).name;
+  {
+    reads: map(f.reads, |r: Read| { callee: name(r.callee), ret: r.ret }),
+    sites: f.sites,
+    demands: map(f.demands, |x: Demand| { callee: name(x.callee), param: x.param, owner: x.owner }),
+    escaped: map(f.escaped, |d: Int| name(d)),
+    ret: f.ret,
+  }
+}
+
+/// What a walk looked up, each name once.
+fn looked_of(f: Found) -> List<Looked> =
+  map_fold(
+    fold(f.looked, map_new(), |acc: Map<Bytes, Looked>, l: Look|
+      map_insert(acc, l.name, { name: l.name, bound: l.bound, def: l.def != None })),
+    [],
+    |acc: List<Looked>, _: Bytes, l: Looked| push(acc, l),
+  )
+
+fn kept_body(run: Run, i: Int) -> KeptBody / {abort.raise} = {
+  let b: Body = at(run.prog.bodies, i);
+  let made: List<Found> = at(run.made, i);
+  {
+    kind: b.kind,
+    name: b.name,
+    label: b.label,
+    def: if b.def < 0 { None } else { Some(at(run.prog.defs, b.def).name) },
+    arity: b.arity,
+    reuse: b.reuse,
+    looked: match list_at(made, 0) { Some(f) -> looked_of(f), None -> b.looked },
+    walks: concat(
+      map(at(run.took, i), |j: Int| kept_walk(run.prog, at(b.kept, j))),
+      map(made, |f: Found| kept_walk(run.prog, f)),
+    ),
+  }
+}
+
+/// A default argument is written at its callee's place, in a text another module's key holds; a
+/// walk that found a site there is not kept.
+fn own_sites(f: Found, span: Span) -> Bool =
+  fold(f.sites, true, |acc: Bool, s: RawSite|
+    acc && s.span.start >= span.start && s.span.end <= span.end)
+
+/// Of each module, the entry to keep under its key where it moved: lowered with nothing kept, or
+/// with a body that made a walk or left one it kept untaken.
+fn kept_of(run: Run, n: Int) -> List<Option<Bytes>> / {abort.raise} = {
+  let prog = run.prog;
+  let by_module = fold(range(0, len(prog.bodies)), map_new(), |acc: Map<Int, List<Int>>, i: Int| {
+    let m = at(prog.bodies, i).module;
+    map_insert(acc, m, push(match map_get(acc, m) { Some(xs) -> xs, None -> [] }, i))
+  });
+  map(range(0, n), |m: Int| {
+    let xs = match map_get(by_module, m) { Some(xs) -> xs, None -> [] };
+    let moved = map_contains(run.fresh, m)
+      || fold(xs, false, |acc: Bool, i: Int|
+        acc || len(at(run.made, i)) > 0 || len(at(run.took, i)) < len(at(prog.bodies, i).kept));
+    let own = fold(xs, true, |acc: Bool, i: Int|
+      acc
+        && fold(at(run.made, i), true, |ok: Bool, f: Found|
+          ok && own_sites(f, at(prog.bodies, i).span)));
+    if !moved || !own { None }
+    else { Some(bin::encode({ bodies: map(xs, |i: Int| kept_body(run, i)) }, kept_module_bin())) }
+  })
+}
+
+fn report_of(run: Run, tables: Tables, rounds: Int) -> Report / {abort.raise} = {
+  let prog = run.prog;
+  {
+    ok: true,
+    rounds: rounds,
+    defs: fold(range(0, len(prog.bodies)), [], |acc: List<Costed>, i: Int| {
+      let b: Body = at(prog.bodies, i);
+      let f: Found = at(run.found, i);
+      if len(f.sites) == 0 { acc } else {
+        push(acc, {
+          kind: b.kind,
+          module: b.module,
+          module_name: b.module_name,
+          name: b.name,
+          label: b.label,
+          reuse: b.reuse,
+          sites: map(f.sites, |raw: RawSite| finish(raw, b.def, tables)),
+        })
+      }
+    }),
+    unkept: unkept_of(prog, tables),
+  }
+}
+
+/// What `costs` answers: the report, and of each module the entry to keep under its `cost_keys`
+/// key where it moved. `walked` counts the bodies walked rather than taken as a run kept them, and
+/// `lowered` the modules lowered to walk them.
+pub type Costing = { report: Report, kept: List<Option<Bytes>>, walked: Int, lowered: Int }
+
+/// Every update of the program with its verdict. `kept` holds, by module, what an earlier run kept
+/// under the module's `cost_keys` key: a body is walked only where none of the walks kept of it read
+/// alike, and its module lowered only then. A body of the root package the front end holds no facts
+/// for leaves the report not `ok`.
+pub fn costs(p: Priced, kept: List<Option<Bytes>> = []) -> Costing / {abort.raise} = {
+  let n = len(p.analysis.mods);
+  let refused = {
+    report: { ok: false, rounds: 0, defs: [], unkept: [] },
+    kept: map(range(0, n), |_: Int| None),
+    walked: 0,
+    lowered: 0,
+  };
+  let start = started(p, kept);
+  let tables = start_tables(start.prog.defs);
+  let first = evaluate(p, start, |_: Int| true, tables);
+  if first.failed { refused } else {
+    // Verdicts come from a walk under the settled tables, not the round that produced them.
+    let settled = iterate(p, first, readers_of(first.found), tables, 0);
+    if settled.run.failed { refused } else {
+      {
+        report: report_of(settled.run, settled.tables, settled.rounds),
+        kept: kept_of(settled.run, n),
+        walked: fold(settled.run.made, 0, |acc: Int, xs: List<Found>|
+          if len(xs) > 0 { acc + 1 } else { acc }),
+        lowered: settled.run.lowered,
+      }
+    }
+  }
+}
+
+/// What each module's kept entry is filed under, by module: its text, what it embeds, each body's own
+/// form (what its references resolve to, and what other modules' text its expansions wrote in) and
+/// the facts the front end's check read of it, what that check walked afresh, and its witness orders,
+/// under the checker's `identity`. A module of another package has none, and nor does one a body of
+/// which has no own form.
+pub fn cost_keys(p: Priced, identity: Bytes) -> List<Bytes> / {abort.raise} = {
+  let a = p.analysis;
+  let owns = fold(
+    a.hashes.own,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, o: { name: Bytes, hash: Bytes }| map_insert(acc, o.name, o.hash),
+  );
+  let defs = fold(p.rows.defs, map_new(), |acc: Map<Bytes, Bytes>, r: KnownDefRow|
+    map_insert(acc, r.name, blake3(r.facts)));
+  let tests = fold(p.rows.tests, map_new(), |acc: Map<Bytes, Bytes>, r: KnownTestRow|
+    map_insert(acc, r.owner, blake3(r.facts)));
+  let embeds = embeds_by_module(a.embeds);
+  let loose = loose_by_module(p.walked, a.mods);
+  let orders = orders_by_module(p.walked, a.mods);
+  let head = bytes_concat_all([
+    b"ply.costs.module.1\x00",
+    hex(bin::shape_digest(kept_module_bin())),
+    b"\x00",
+    identity,
+    b"\x00",
+  ]);
+  let entry = |m: Map<Bytes, Bytes>, k: Bytes| match map_get(m, k) { Some(x) -> x, None -> b"!" };
+  fold(
+    range(0, len(a.mods)),
+    { keys: [], test: 0, law: 0 },
+    |acc: { keys: List<Bytes>, test: Int, law: Int }, i: Int| {
+      let m: ParsedModule = at(a.mods, i);
+      let items = fold(
+        m.module.items,
+        { parts: [], position: 0, test: acc.test, law: acc.law, formless: false },
+        |x: { parts: List<Bytes>, position: Int, test: Int, law: Int, formless: Bool }, item: Item|
+          match item {
+            IFn(d) -> {
+              let name = qualify(m.name, d.name.name);
+              match map_get(owns, name) {
+                None -> { ..x, formless: true },
+                Some(own) ->
+                  {
+                    ..x,
+                    parts: push(
+                      x.parts,
+                      bytes_concat_all([b"f", name, b"\x00", own, b"\x00", entry(defs, name)]),
+                    ),
+                  },
+              }
+            },
+            ITest(_) -> {
+              let owner = test_owner(m.name, x.position);
+              let moved = { ..x, position: x.position + 1, test: x.test + 1 };
+              match list_at(a.hashes.test_texts, x.test) {
+                None -> { ..moved, formless: true },
+                Some(own) ->
+                  {
+                    ..moved,
+                    parts: push(
+                      x.parts,
+                      bytes_concat_all([b"t", owner, b"\x00", own, b"\x00", entry(tests, owner)]),
+                    ),
+                  },
+              }
+            },
+            ILaw(_) -> match list_at(a.hashes.law_texts, x.law) {
+              None -> { ..x, law: x.law + 1, formless: true },
+              Some(own) -> { ..x, parts: push(x.parts, bytes_concat(b"l", own)), law: x.law + 1 },
+            },
+            _ -> x,
+          },
+      );
+      let key = if !own_module(a, i) || items.formless { b"" } else {
+        hex(
+          blake3(
+            bytes_concat_all([
+              head,
+              m.name,
+              b"\x00",
+              blake3(match list_at(p.srcs, i) { Some(src) -> src, None -> b"" }),
+              b"\x00",
+              match map_get(embeds, m.name) { Some(e) -> e, None -> b"" },
+              b"\x00",
+              bytes_concat_all(map(items.parts, |part: Bytes| bytes_concat(part, b"\x00"))),
+              b"\x00",
+              match map_get(loose, i) { Some(l) -> l, None -> b"" },
+              b"\x00",
+              match map_get(orders, i) {
+                Some(o) ->
+                  map_fold(o, b"", |acc2: Bytes, name: Bytes, params: List<Bytes>|
+                    bytes_concat_all([
+                      acc2,
+                      name,
+                      b"(",
+                      bytes_concat_all(map(params, |q: Bytes| bytes_concat(q, b","))),
+                      b")",
+                    ])),
+                None -> b"",
+              },
+            ]),
+          ),
+        )
+      };
+      { keys: push(acc.keys, key), test: items.test, law: items.law }
+    },
+  ).keys
+}
+
+fn embeds_by_module(embeds: List<EmbedAt>) -> Map<Bytes, Bytes> / {abort.raise} =
+  fold(embeds, map_new(), |acc: Map<Bytes, Bytes>, e: EmbedAt|
+    map_insert(
+      acc,
+      e.module,
+      bytes_concat_all([
+        match map_get(acc, e.module) { Some(was) -> was, None -> b"" },
+        e.key,
+        b"\x00",
+        match e.read {
+          Ok(files) ->
+            bytes_concat_all(
+              map(files, |f: EmbedFile|
+                bytes_concat_all([f.name, b"\x00", blake3(f.bytes), b"\x00"])),
+            ),
+          Err(why) -> bytes_concat(b"!", why),
+        },
+        b"\x00",
+      ]),
+    ))
+
+/// What the front end's check walked afresh of each module (its clauses and laws), by its index among
+/// `mods`, in bytes that do not say where the module stands among them.
+fn loose_by_module(w: WalkedFacts, mods: List<ParsedModule>) -> Map<Int, Bytes> / {abort.raise} = {
+  let here = places(mods);
+  let into = |acc: Map<Int, RootFacts>, k: Int, add: (RootFacts) -> RootFacts|
+    match placed(here, w.modules, k) {
+      None -> acc,
+      Some(i) ->
+        map_insert(acc, i, add(match map_get(acc, i) { Some(f) -> f, None -> no_root_facts() })),
+    };
+  let l = w.loose;
+  let labelled = fold(l.label_sites, map_new(), |acc: Map<Int, RootFacts>, x: LabelSite|
+    into(acc, x.module, |f: RootFacts|
+      { ..f, label_sites: push(f.label_sites, { ..x, module: 0 }) }));
+  let updated = fold(l.updates, labelled, |acc: Map<Int, RootFacts>, x: UpdateShape|
+    into(acc, x.module, |f: RootFacts| { ..f, updates: push(f.updates, { ..x, module: 0 }) }));
+  let witnessed = fold(l.ops, updated, |acc: Map<Int, RootFacts>, x: WitnessOp|
+    into(acc, x.module, |f: RootFacts| { ..f, ops: push(f.ops, { ..x, module: 0 }) }));
+  let referenced = fold(l.refs, witnessed, |acc: Map<Int, RootFacts>, x: WitnessRef|
+    into(acc, x.module, |f: RootFacts| { ..f, refs: push(f.refs, { ..x, module: 0 }) }));
+  let operated = fold(l.operands, referenced, |acc: Map<Int, RootFacts>, x: OperandSite|
+    into(acc, x.module, |f: RootFacts| { ..f, operands: push(f.operands, { ..x, module: 0 }) }));
+  let tried = fold(l.tries, operated, |acc: Map<Int, RootFacts>, x: TrySite|
+    into(acc, x.module, |f: RootFacts| { ..f, tries: push(f.tries, { ..x, module: 0 }) }));
+  map_fold(tried, map_new(), |acc: Map<Int, Bytes>, i: Int, f: RootFacts|
+    map_insert(acc, i, bin::encode(f, root_facts_bin())))
+}
 
 // --- Tests ------------------------------------------------------------------
 
-/// The report on a program the front end checked as one package, as a driver hands it what that
-/// check read.
-fn reported(
+/// A program the front end checked, as a driver hands it to the cost checker; `module_packages`
+/// puts a module in another package.
+fn checked(
   names: List<Bytes>,
   srcs: List<Bytes>,
-  pkgs: List<PackageDeps> = [],
   module_packages: List<Int> = [],
-  shipped: Int = 0,
-) -> Report / {abort.raise} =
+) -> Priced / {abort.raise} =
   match analyse(
       parse_all(map(range(0, len(names)), |i: Int| { name: at(names, i), src: at(srcs, i) })),
     ) {
     Refused(_) -> panic("the program checks"),
-    Analysed(w) -> costs(names, srcs, pkgs, module_packages, shipped, rows_of(w), walked_facts(w)),
+    Analysed(w) ->
+      priced_of(
+        if len(module_packages) == 0 { w } else { { ..w, module_packages: module_packages } },
+        srcs,
+      ),
   }
+
+fn reported(
+  names: List<Bytes>,
+  srcs: List<Bytes>,
+  module_packages: List<Int> = [],
+) -> Report / {abort.raise} = costs(checked(names, srcs, module_packages)).report
 
 test "an update comes back with its place, its verdict, why, and the edit that would remove a copy" {
   let src = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match map_get(m, 0) { Some(xs) -> push(xs, n), None -> [] }\n";
@@ -1261,15 +1999,153 @@ test "another package's definition answers what its `returns` clause says, its b
     b"pub fn plain(n: Int) -> List<Int> = range(0, n)\n",
   ]);
   let app = b"import lib.more\nreuse fn grow(n: Int) -> List<Int> = push(more::made(n), n)\nreuse fn other(n: Int) -> List<Int> = push(more::plain(n), n)\n";
-  let pkgs = [
-    { prefix: b"", deps: [b"lib"] },
-    { prefix: b"lib", deps: [] },
-    { prefix: b"std", deps: [] },
-    { prefix: b"compiler", deps: [] },
-  ];
-  let r = reported([b"app", b"lib.more"], [app, lib], pkgs, [0, 1], 4);
+  let r = reported([b"app", b"lib.more"], [app, lib], [0, 1]);
   assert(r.ok);
   assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
   // The dependency's clause is its own run's to show.
   assert_eq(r.unkept, [])
+}
+
+/// The cost checker run as a driver that keeps what it is handed does, over `store`.
+fn costed_over(
+  store: Map<Bytes, Bytes>,
+  p: Priced,
+) -> { costing: Costing, store: Map<Bytes, Bytes> } / {abort.raise} = {
+  let keys = cost_keys(p, b"checker");
+  let c = costs(p, map(keys, |k: Bytes| if bytes_len(k) == 0 { None } else { map_get(store, k) }));
+  {
+    costing: c,
+    store: fold(range(0, len(keys)), store, |acc: Map<Bytes, Bytes>, i: Int|
+      match list_at(c.kept, i) {
+        Some(Some(bytes)) -> map_insert(acc, at(keys, i), bytes),
+        _ -> acc,
+      }),
+  }
+}
+
+/// Three modules: `b` reads what `a.mk` and `a.keep` answer, and `c` reads nothing of either.
+fn layered(mk: Bytes) -> Priced / {abort.raise} =
+  checked([b"a", b"b", b"c"], [
+    bytes_concat(
+      b"pub fn table() -> Map<Int, List<Int>> = map_new()\npub fn keep(xs: List<Int>) -> List<Int> = xs\n",
+      mk,
+    ),
+    b"import a (mk, keep)\nfn grow(n: Int) -> List<Int> = push(mk(n), n)\nfn hold(xs: List<Int>, n: Int) -> List<Int> = push(keep(xs), n)\ntest \"grows\" { assert_eq(grow(1), [0, 1]) }\n",
+    b"fn solo(xs: List<Int>) -> List<Int> = push(xs, 1)\n",
+  ])
+
+fn made_fresh() -> Bytes = b"pub fn mk(n: Int) -> List<Int> = range(0, n)\n"
+
+fn made_shared() -> Bytes =
+  b"pub fn mk(n: Int) -> List<Int> = match map_get(table(), 0) { Some(xs) -> xs, None -> range(0, n) }\n"
+
+test "a run that takes what earlier runs walked answers as a run from nothing, and walks only what moved" {
+  let first = costed_over(map_new(), layered(made_fresh()));
+  assert_eq([first.costing.walked, first.costing.lowered], [7, 3]);
+  let again = costed_over(first.store, layered(made_fresh()));
+  assert_eq(again.costing.report, first.costing.report);
+  assert_eq([again.costing.walked, again.costing.lowered], [0, 0]);
+  // `mk` answers a clone now: its module is walked again, and of the rest only `grow`, which reads it.
+  let shared = layered(made_shared());
+  let moved = costed_over(again.store, shared);
+  assert_eq(moved.costing.report, costs(shared).report);
+  assert_eq(verdicts(moved.costing.report), [b"grow copies", b"hold reuses", b"solo reuses"]);
+  assert_eq([moved.costing.walked, moved.costing.lowered], [4, 2]);
+  // Each text's walks are kept under its own key, so going back walks nothing.
+  let back = costed_over(moved.store, layered(made_fresh()));
+  assert_eq(back.costing.report, first.costing.report);
+  assert_eq([back.costing.walked, back.costing.lowered], [0, 0])
+}
+
+/// `user` checked with what it pulls of `shipped`, as a driver hands it to the cost checker.
+fn checked_pulling(user: List<Source>, shipped: List<Source>) -> Priced / {abort.raise} = {
+  let texts = fold(concat(user, shipped), map_new(), |acc: Map<Bytes, Bytes>, x: Source|
+    map_insert(acc, x.name, x.src));
+  match analyse_pulling_std(user, shipped).out {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) ->
+      priced_of(
+        w,
+        map(w.mods, |m: ParsedModule|
+          match map_get(texts, m.name) { Some(src) -> src, None -> b"" }),
+      ),
+  }
+}
+
+/// The program as a load reads it once nothing module `name` reaches moved since the build that
+/// kept it: that module's functions' bodies blank, its tests standing, and resolved so, without
+/// what its bodies bind.
+fn as_stub(whole: Priced, name: Bytes) -> Priced / {abort.raise} = {
+  let a = whole.analysis;
+  let i = fold(range(0, len(a.mods)), 0, |acc: Int, k: Int|
+    if at(a.mods, k).name == name { k } else { acc });
+  let cuts = filter(cuts_of(at(a.mods, i)), |c: Cut| bytes_len(c.name) > 0);
+  let read = map(range(0, len(a.mods)), |k: Int|
+    {
+      name: at(a.mods, k).name,
+      src: if k == i { stubbed(at(whole.srcs, k), cuts) } else { at(whole.srcs, k) },
+    });
+  match resolved_as(a, map(parse_all(read), |x: ParsedSource| x.module)) {
+    ResolveFailed(_) -> panic("the stubbed program resolves"),
+    ResolveSucceeded(x) ->
+      {
+        ..whole,
+        analysis: {
+          ..a,
+          mods: x.mods,
+          r: x.r,
+          stubs: [name],
+          stub_cuts: map_insert(map_new(), name, cuts),
+        },
+      },
+  }
+}
+
+/// `b` interpolates, which binds `std.show` in it where its bodies are read.
+fn interpolating(mk: Bytes) -> Priced / {abort.raise} =
+  checked_pulling(
+    [
+      { name: b"a", src: bytes_concat(b"pub fn table() -> Map<Int, List<Int>> = map_new()\n", mk) },
+      {
+        name: b"b",
+        src: b"import a (mk)\nfn grow(n: Int) -> List<Int> = push(mk(string_len(f\"{n}\")), n)\nfn told(xs: List<Int>, n: Int) -> List<Int> = push(xs, string_len(f\"{n}\"))\n",
+      },
+    ],
+    [{ name: b"std.show", src: b"pub fn display(n: Int) -> String = int_to_string(n)\n" }],
+  )
+
+test "a module read as its stub is lowered from its source, and walked as a whole read walks it" {
+  let first = costed_over(map_new(), interpolating(made_fresh()));
+  let shared = interpolating(made_shared());
+  let stubbed_b = as_stub(shared, b"b");
+  assert_eq(costs(stubbed_b).report, costs(shared).report);
+  let moved = costed_over(first.store, stubbed_b);
+  assert_eq(moved.costing.report, costs(shared).report);
+  // `a` again, and of `b` only `grow`, which reads `mk`: `told` looked up what the stub does not bind.
+  assert_eq([moved.costing.walked, moved.costing.lowered], [3, 2]);
+  let key = at(cost_keys(shared, b"checker"), 1);
+  assert_eq(map_get(moved.store, key), map_get(costed_over(first.store, shared).store, key))
+}
+
+test "a kept walk is not taken once what a name its body looks up is bound to stops being a definition" {
+  let p = layered(made_fresh());
+  let first = costed_over(map_new(), p);
+  let key = at(cost_keys(p, b"checker"), 1);
+  let kept = match map_get(first.store, key) {
+    Some(bytes) -> match bin::decode(bytes, kept_module_bin()) {
+      Ok(m) -> m,
+      Err(_) -> panic("a kept entry decodes"),
+    },
+    None -> panic("the module's entry is kept"),
+  };
+  let renamed = {
+    bodies: map(kept.bodies, |k: KeptBody|
+      {
+        ..k,
+        looked: map(k.looked, |l: Looked| if l.name == b"mk" { { ..l, def: false } } else { l }),
+      }),
+  };
+  let again = costed_over(map_insert(first.store, key, bin::encode(renamed, kept_module_bin())), p);
+  assert_eq(again.costing.report, first.costing.report);
+  assert_eq([again.costing.walked, again.costing.lowered], [1, 1])
 }

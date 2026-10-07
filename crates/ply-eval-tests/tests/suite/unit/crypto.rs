@@ -6,11 +6,11 @@ fn done(b: Builtin, args: Vec<Value>) -> Value {
 }
 
 fn secret(b: &[u8]) -> Value {
-    Value::secret(Value::bytes(b))
+    Value::secret_bytes(b)
 }
 
 fn text(s: &str) -> Value {
-    Value::secret(Value::str(s))
+    Value::secret_text(s)
 }
 
 fn hex(digits: &str) -> Vec<u8> {
@@ -31,10 +31,15 @@ fn held(v: &Value) -> Option<&Value> {
 /// A credential's bytes, read where only a test may.
 fn opened(v: &Value) -> Vec<u8> {
     match v {
-        Value::Secret(inner) => match &**inner {
-            Value::Bytes(b) => b.to_vec(),
-            other => panic!("a secret of {other:?}"),
-        },
+        Value::Secret(inner) if !inner.is_text() => inner.bytes().to_vec(),
+        other => panic!("no secret of bytes: {other:?}"),
+    }
+}
+
+/// The text a `Secret<String>` holds, read where only a test may.
+fn opened_text(v: &Value) -> String {
+    match v {
+        Value::Secret(inner) => inner.text().expect("a secret of text").to_string(),
         other => panic!("no secret: {other:?}"),
     }
 }
@@ -242,7 +247,7 @@ fn a_misuse_raises_and_names_no_key() {
         (
             Builtin::CryptoSign,
             vec![
-                Value::str("rsa-pss-sha256"),
+                Value::str("ecdsa-p224-sha224"),
                 short.clone(),
                 Value::bytes(b""),
             ],
@@ -364,4 +369,306 @@ fn what_is_sealed_opens_and_a_turned_bit_does_not() {
             assert!(held(&read).is_none(), "{cipher} at {at}");
         }
     }
+}
+
+fn encoded(encoding: &str, bytes: &[u8]) -> String {
+    opened_text(&done(
+        Builtin::SecretEncode,
+        vec![Value::str(encoding), secret(bytes)],
+    ))
+}
+
+#[test]
+fn a_secret_encodes_as_rfc_4648_writes_and_decodes_back() {
+    // RFC 4648, section 10.
+    let words = ["", "f", "fo", "foo", "foob", "fooba", "foobar"];
+    let base64 = [
+        "", "Zg==", "Zm8=", "Zm9v", "Zm9vYg==", "Zm9vYmE=", "Zm9vYmFy",
+    ];
+    let base32 = [
+        "",
+        "MY======",
+        "MZXQ====",
+        "MZXW6===",
+        "MZXW6YQ=",
+        "MZXW6YTB",
+        "MZXW6YTBOI======",
+    ];
+    let hex_text = [
+        "",
+        "66",
+        "666f",
+        "666f6f",
+        "666f6f62",
+        "666f6f6261",
+        "666f6f626172",
+    ];
+    for (i, word) in words.iter().enumerate() {
+        assert_eq!(encoded("base64", word.as_bytes()), base64[i]);
+        assert_eq!(encoded("base32", word.as_bytes()), base32[i]);
+        assert_eq!(encoded("hex", word.as_bytes()), hex_text[i]);
+        assert_eq!(
+            encoded("base64url", word.as_bytes()),
+            base64[i].trim_end_matches('=')
+        );
+    }
+    let every: Vec<u8> = (0..=255).collect();
+    for encoding in ["hex", "base64", "base64url", "base32"] {
+        for n in 0..40 {
+            let bytes = &every[255 - n..];
+            let sealed = done(
+                Builtin::SecretEncode,
+                vec![Value::str(encoding), secret(bytes)],
+            );
+            assert_eq!(Plain::of(&sealed), Plain::Secret);
+            let back = done(Builtin::SecretDecode, vec![Value::str(encoding), sealed]);
+            assert_eq!(opened(held(&back).unwrap()), bytes, "{encoding} of {n}");
+        }
+    }
+    let d = call(
+        Builtin::SecretEncode,
+        vec![Value::str("rot13"), secret(b"key")],
+        Span::DUMMY,
+    )
+    .unwrap_err();
+    assert!(!format!("{d:#?}").contains("key\""), "{d:#?}");
+}
+
+#[test]
+fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
+    use ply_eval::crypto::Framing;
+    let named = |name: &str| Framing::named(name, "`fs.write_secret`", Span::DUMMY);
+    let every: Vec<u8> = (0..=255).collect();
+    for encoding in ["raw", "hex", "base64", "base64url", "base32"] {
+        let framing = named(encoding).unwrap_or_else(|_| panic!("{encoding}"));
+        for n in [0, 1, 2, 3, 5, 32, 256] {
+            let secret = &every[256 - n..];
+            let line = framing.framed(b"key ", secret, b"\n");
+            assert!(line.starts_with(b"key ") && line.ends_with(b"\n"));
+            let back = framing.unframed(&line, b"key ", b"\n");
+            assert_eq!(
+                back.as_deref().map(|b| &b[..]),
+                Some(secret),
+                "{encoding} of {n}"
+            );
+            assert!(framing.unframed(&line, b"kez ", b"\n").is_none());
+            assert!(framing.unframed(&line, b"key ", b"\r\n").is_none());
+            assert!(framing.unframed(&line[..3], b"key ", b"\n").is_none());
+        }
+    }
+    let hex = named("hex").unwrap();
+    assert_eq!(&hex.framed(b"", b"\xab", b"")[..], b"ab");
+    assert!(hex.unframed(b"AB", b"", b"").is_none());
+    assert!(hex.unframed(b"abc", b"", b"").is_none());
+    for refused in ["rot13", "base32-typed", "RAW", ""] {
+        let d = named(refused).err().unwrap_or_else(|| panic!("{refused}"));
+        assert_eq!(d.code, codes::RUNTIME_ERROR);
+        assert!(d.message.contains("`fs.write_secret`"), "{}", d.message);
+    }
+}
+
+fn rsa_document() -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ply-corpus/stdlib/asn1/rsa_key.der"),
+    )
+    .expect("the corpus's RSA key")
+}
+
+#[test]
+fn a_pss_signature_is_a_function_of_the_key_and_the_message_and_verifies() {
+    let document = rsa_document();
+    let public = plain(
+        held(&done(
+            Builtin::CryptoPublic,
+            vec![Value::str("rsa"), secret(&document)],
+        ))
+        .unwrap(),
+    );
+    for digest in ["sha256", "sha384", "sha512"] {
+        let scheme = format!("rsa-pss-{digest}");
+        let signed = |message: &[u8]| {
+            plain(
+                held(&done(
+                    Builtin::CryptoSign,
+                    vec![
+                        Value::str(&scheme),
+                        secret(&document),
+                        Value::bytes(message),
+                    ],
+                ))
+                .unwrap(),
+            )
+        };
+        let once = signed(b"what was built");
+        assert_eq!(once, signed(b"what was built"), "{scheme}");
+        assert_ne!(once, signed(b"what was not"), "{scheme}");
+        let holds = |scheme: &str, message: &[u8]| {
+            done(
+                Builtin::CryptoVerify,
+                vec![
+                    Value::str(scheme),
+                    Value::bytes(&public),
+                    Value::bytes(message),
+                    Value::bytes(&once),
+                ],
+            ) == Value::Bool(true)
+        };
+        assert!(holds(&scheme, b"what was built"), "{scheme}");
+        assert!(!holds(&scheme, b"what was not"), "{scheme}");
+        assert!(!holds(&format!("rsa-pkcs1-{digest}"), b"what was built"));
+    }
+}
+
+#[test]
+fn every_curve_signs_as_its_verifier_reads_and_a_high_s_secp256k1_signature_is_its_twin() {
+    for (curve, scheme, size) in [
+        ("p256", "ecdsa-p256-sha256", 32),
+        ("p384", "ecdsa-p384-sha384", 48),
+        ("p521", "ecdsa-p521-sha512", 66),
+        ("k256", "ecdsa-k256-sha256", 32),
+    ] {
+        let mut scalar = vec![0u8; size];
+        scalar[size - 1] = 7;
+        scalar[size - 2] = 1;
+        let public = plain(
+            held(&done(
+                Builtin::CryptoPublic,
+                vec![Value::str(curve), secret(&scalar)],
+            ))
+            .unwrap(),
+        );
+        assert_eq!(public.len(), 2 * size + 1, "{curve}");
+        let raw = plain(
+            held(&done(
+                Builtin::CryptoSign,
+                vec![Value::str(scheme), secret(&scalar), Value::bytes(b"m")],
+            ))
+            .unwrap(),
+        );
+        assert_eq!(raw.len(), 2 * size, "{curve}");
+        if curve == "p384" {
+            continue;
+        }
+        let verified = |signature: &[u8], message: &[u8]| {
+            done(
+                Builtin::CryptoVerify,
+                vec![
+                    Value::str(scheme),
+                    Value::bytes(&public),
+                    Value::bytes(message),
+                    Value::bytes(signature),
+                ],
+            ) == Value::Bool(true)
+        };
+        assert!(verified(&raw, b"m"), "{curve}");
+        assert!(!verified(&raw, b"n"), "{curve}");
+    }
+    // secp256k1's order; `s` and `n - s` are one signature.
+    let order = hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141");
+    let scalar = secret(&[3u8; 32]);
+    let public = plain(
+        held(&done(
+            Builtin::CryptoPublic,
+            vec![Value::str("k256"), scalar.clone()],
+        ))
+        .unwrap(),
+    );
+    let raw = plain(
+        held(&done(
+            Builtin::CryptoSign,
+            vec![Value::str("ecdsa-k256-sha256"), scalar, Value::bytes(b"m")],
+        ))
+        .unwrap(),
+    );
+    let mut high = raw[..32].to_vec();
+    let mut borrow = 0i16;
+    let mut s = [0u8; 32];
+    for i in (0..32).rev() {
+        let d = i16::from(order[i]) - i16::from(raw[32 + i]) - borrow;
+        borrow = i16::from(d < 0);
+        s[i] = (d + 256 * borrow) as u8;
+    }
+    high.extend(s);
+    for signature in [&raw, &high] {
+        assert_eq!(
+            done(
+                Builtin::CryptoVerify,
+                vec![
+                    Value::str("ecdsa-k256-sha256"),
+                    Value::bytes(&public),
+                    Value::bytes(b"m"),
+                    Value::bytes(signature),
+                ],
+            ),
+            Value::Bool(true)
+        );
+    }
+}
+
+/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds.
+fn integers(der: &[u8]) -> Vec<Vec<u8>> {
+    fn length(der: &[u8], at: &mut usize) -> usize {
+        let first = der[*at];
+        *at += 1;
+        if first < 0x80 {
+            return usize::from(first);
+        }
+        let mut n = 0;
+        for _ in 0..first & 0x7f {
+            n = n << 8 | usize::from(der[*at]);
+            *at += 1;
+        }
+        n
+    }
+    let mut at = 1;
+    let end = length(der, &mut at) + at;
+    let mut out = Vec::new();
+    while at < end {
+        assert_eq!(der[at], 0x02);
+        at += 1;
+        let n = length(der, &mut at);
+        out.push(der[at..at + n].to_vec());
+        at += n;
+    }
+    out
+}
+
+#[test]
+fn an_rsa_jwk_makes_the_document_its_numbers_came_from_and_numbers_that_disagree_make_none() {
+    let document = rsa_document();
+    let numbers = integers(&document);
+    assert_eq!(numbers.len(), 9);
+    let unsigned = |n: &[u8]| {
+        n.iter()
+            .skip_while(|b| **b == 0)
+            .copied()
+            .collect::<Vec<u8>>()
+    };
+    let sealed_text = |n: &[u8]| {
+        done(
+            Builtin::SecretEncode,
+            vec![Value::str("base64url"), secret(&unsigned(n))],
+        )
+    };
+    let args = |private: Vec<Value>| {
+        vec![
+            Value::bytes(unsigned(&numbers[1])),
+            Value::bytes(unsigned(&numbers[2])),
+            Value::list(private),
+        ]
+    };
+    let texts = |private: &[Vec<u8>]| private.iter().map(|n| sealed_text(n)).collect::<Vec<_>>();
+    let made = done(Builtin::SecretRsaJwk, args(texts(&numbers[3..])));
+    assert_eq!(Plain::of(held(&made).unwrap()), Plain::Secret);
+    assert_eq!(opened(held(&made).unwrap()), document);
+    let mut wrong = numbers[3..].to_vec();
+    wrong.swap(1, 2);
+    wrong[4][0] ^= 1;
+    assert!(held(&done(Builtin::SecretRsaJwk, args(texts(&wrong)))).is_none());
+    let mut unread = texts(&numbers[3..]);
+    unread[0] = text("not base64url!");
+    assert!(held(&done(Builtin::SecretRsaJwk, args(unread))).is_none());
+    let short = texts(&numbers[3..8]);
+    assert!(call(Builtin::SecretRsaJwk, args(short), Span::DUMMY).is_err());
 }

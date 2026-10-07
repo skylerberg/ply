@@ -79,7 +79,9 @@ fn upgrading() -> String =
 
 /// Sends no mail: opens an SMTP session over a connection that starts in the clear to a server
 /// of its own, whose leave to start TLS is `go_ahead` (the source of a byte string's contents),
-/// and answers what the session kept of its exchange, or panics with why the client refused.
+/// proves a sealed password to it by `AUTH PLAIN` over TLS, and answers what the session kept of
+/// its exchange, or panics with why the client refused. The server takes the password only as
+/// the line it must be.
 fn smtp_upgrading(go_ahead: String) -> String =
   smtp_upgrade() ++ "\nfn go_ahead() -> Bytes = b\"" ++ go_ahead ++ "\"\n"
 
@@ -88,6 +90,8 @@ fn smtp_upgrade() -> String =
   \\import std.net
   \\import std.net (net)
   \\import std.random (entropy)
+  \\import std.sasl
+  \\import std.sasl (sasl)
   \\import std.show (show)
   \\import std.smtp
   \\import std.smtp (smtp)
@@ -106,10 +110,13 @@ fn smtp_upgrade() -> String =
   \\    Err(why) -> Err(net::refusal_message(why)),
   \\    Ok(_) -> {
   \\      let _again = net.recv[conn](s, 512, 5000);
-  \\      let _offered_again = say(b"250 localhost\r\n");
+  \\      let _offered_again = say(b"250-localhost\r\n250 AUTH PLAIN\r\n");
+  \\      let auth = net.recv[conn](s, 512, 5000);
+  \\      let proved = auth == Some(b"AUTH PLAIN AHRpbQB0YW5zdGFhZnRhbnN0YWFm\r\n");
+  \\      let _verdict = say(if proved { b"235 2.7.0 Accepted\r\n" } else { b"535 5.7.8 No\r\n" });
   \\      let _quit = net.recv[conn](s, 512, 5000);
   \\      let _bye = say(b"221 bye\r\n");
-  \\      Ok(())
+  \\      if proved { Ok(()) } else { Err("the credential was not the line it must be") }
   \\    },
   \\  };
   \\  net.close[conn](s);
@@ -122,18 +129,31 @@ fn smtp_upgrade() -> String =
   \\    Err(why) -> panic("no listener: " ++ net::refusal_message(why)),
   \\  };
   \\  let port = match net.local_port[listener](l) { Some(p) -> p, None -> panic("no port") };
+  \\  let held = match try[sasl.refused] {
+  \\    sasl::password("tim", secret_of_bytes(b"tanstaaftanstaaf"))
+  \\  } {
+  \\    Ok(k) -> k,
+  \\    Err(_) -> panic("the credential was refused"),
+  \\  };
   \\  let serving = task.spawn(|| served(l));
   \\  let kept = try[smtp.refused] {
-  \\    let c = smtp::config("client.example", { ..smtp::default_limits(), transcript: 40 });
+  \\    let c = smtp::with_credential(
+  \\      smtp::config("client.example", { ..smtp::default_limits(), transcript: 40 }),
+  \\      held,
+  \\    );
   \\    task::unbounded(||
   \\      smtp::with_session[client]("localhost", port, c, |s: smtp::Session|
   \\        smtp::transcript_text(smtp::transcript(s))))
   \\  };
-  \\  let _served = task.join(serving);
+  \\  let served_as = task.join(serving);
   \\  net.close[listener](l);
   \\  match kept {
-  \\    Ok(text) -> if string_contains(text, "*: TLS\nC: EHLO client.example\nS: 250 localhost") { 0 }
-  \\    else { panic("the session was not secured:\n" ++ text) },
+  \\    Ok(text) -> if served_as == Ok(())
+  \\        && string_contains(
+  \\          text,
+  \\          "*: TLS\nC: EHLO client.example\nS: 250-localhost\nS: 250 AUTH PLAIN\nC: AUTH PLAIN ****\nS: 235 2.7.0 Accepted",
+  \\        ) { 0 }
+  \\    else { panic("the session was not secured and proved:\n" ++ text ++ "\n" ++ show(served_as)) },
   \\    Err(why) -> panic("the client refused: " ++ show(why)),
   \\  }
   \\}
@@ -195,7 +215,7 @@ test/nondet "an open connection is secured at both ends by a run that holds and 
   )
 }
 
-test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, and refuses plaintext sent after the server's leave" {
+test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, proves a sealed password over it, and refuses plaintext sent after the server's leave" {
   program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n"));
   let api = credential("api");
   let trusted = ["run", "--host", "--tls", spec("api", api), "--trust", api.cert];
