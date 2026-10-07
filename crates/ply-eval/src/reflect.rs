@@ -19,8 +19,8 @@ fn record(fields: Vec<(&str, PlyValue)>) -> PlyValue {
     ))
 }
 
-fn count(n: usize) -> PlyValue {
-    PlyValue::Int(n as i64)
+fn byte(n: u8) -> PlyValue {
+    PlyValue::Fixed(crate::Fixed::new(IntTy::U8, u128::from(n)))
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
@@ -83,15 +83,15 @@ pub fn value_of(p: &Plain) -> PlyValue {
                 Fun::Const { arity, value } => value_ctor(
                     "FConst",
                     vec![record(vec![
-                        ("arity", count(*arity)),
+                        ("arity", byte(*arity)),
                         ("value", grow(|| value_of(value))),
                     ])],
                 ),
                 Fun::Project { arity, index } => value_ctor(
                     "FProject",
                     vec![record(vec![
-                        ("arity", count(*arity)),
-                        ("index", count(*index)),
+                        ("arity", byte(*arity)),
+                        ("index", byte(*index)),
                     ])],
                 ),
                 Fun::Table {
@@ -101,7 +101,7 @@ pub fn value_of(p: &Plain) -> PlyValue {
                 } => value_ctor(
                     "FTable",
                     vec![record(vec![
-                        ("arity", count(*arity)),
+                        ("arity", byte(*arity)),
                         ("entries", grow(|| entries(es))),
                         ("default", grow(|| value_of(default))),
                     ])],
@@ -283,24 +283,27 @@ pub fn plain_of(v: &PlyValue, span: Span) -> Result<Plain, Diagnostic> {
                 return Err(bad("holds no `Fun`"));
             };
             let at = |i: usize| fargs.get(i).ok_or_else(|| bad("is missing an argument"));
-            let size = |x: &PlyValue, name: &str| -> Result<usize, Diagnostic> {
-                usize::try_from(int(&field(x, name)?)?)
-                    .map_err(|_| bad(&format!("has a negative `{name}`")))
+            let byte = |x: &PlyValue, name: &str| -> Result<u8, Diagnostic> {
+                match field(x, name)? {
+                    PlyValue::Fixed(n) if n.ty == IntTy::U8 => u8::try_from(n.raw())
+                        .map_err(|_| bad(&format!("has a `{name}` past a `U8`"))),
+                    _ => Err(bad(&format!("has a `{name}` that is no `U8`"))),
+                }
             };
             Plain::Fn(
                 match f.as_str().rsplit_once('.').map_or(f.as_str(), |(_, s)| s) {
                     "FNamed" => Fun::Named(text(at(0)?)?),
                     "FAnonymous" => Fun::Anonymous,
                     "FConst" => Fun::Const {
-                        arity: size(at(0)?, "arity")?,
+                        arity: byte(at(0)?, "arity")?,
                         value: Box::new(grow(|| plain_of(&field(at(0)?, "value")?, span))?),
                     },
                     "FProject" => Fun::Project {
-                        arity: size(at(0)?, "arity")?,
-                        index: size(at(0)?, "index")?,
+                        arity: byte(at(0)?, "arity")?,
+                        index: byte(at(0)?, "index")?,
                     },
                     "FTable" => Fun::Table {
-                        arity: size(at(0)?, "arity")?,
+                        arity: byte(at(0)?, "arity")?,
                         entries: grow(|| entries(&field(at(0)?, "entries")?))?,
                         default: Box::new(grow(|| plain_of(&field(at(0)?, "default")?, span))?),
                     },

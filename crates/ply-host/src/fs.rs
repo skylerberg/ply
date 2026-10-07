@@ -1,6 +1,7 @@
 //! The filesystem, as operations confined to roots the run names.
 
 use crate::pool::{JobOutput, Pool, Pooled, option, record};
+use ply_eval::crypto::Framing;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
@@ -14,6 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// Must match the effect `std.fs` declares.
 pub const EFFECT: &str = "fs";
@@ -68,6 +70,8 @@ operations! {
     Scan = "scan" / 2,
     Space = "space" / 1,
     Link = "link" / 2,
+    WriteSecret = "write_secret" / 5,
+    ReadSecret = "read_secret" / 4,
 }
 
 impl Op {
@@ -108,6 +112,8 @@ impl Op {
             Op::Scan => "fs-scan",
             Op::Space => "fs-space",
             Op::Link => "fs-link",
+            Op::WriteSecret => "fs-write-secret",
+            Op::ReadSecret => "fs-read-secret",
         }
     }
 
@@ -148,7 +154,9 @@ impl Op {
             | Op::WriteChunk
             | Op::Close
             | Op::Scan
-            | Op::Space => Last::Followed,
+            | Op::Space
+            | Op::WriteSecret
+            | Op::ReadSecret => Last::Followed,
         }
     }
 
@@ -160,8 +168,10 @@ impl Op {
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: true,
-            // No expression turns a `Secret` into a path `String` or a body `Bytes`.
-            secrets: false,
+            // `write_secret`'s credential is framed once into memory that is wiped when the file is
+            // written, and nothing it answers or refuses carries any of it. No other operation
+            // takes one: no expression turns a `Secret` into a path or a body `Bytes`.
+            secrets: matches!(self, Op::WriteSecret),
             path: self.path(),
         }
     }
@@ -370,6 +380,27 @@ impl HostHandler for Operation {
             Op::WriteFile | Op::Append => {
                 Second::Body(Arc::clone(req.args[1].as_bytes(span, "a body")?))
             }
+            Op::WriteSecret => {
+                let before = req.args[1].as_bytes(span, "the bytes before the secret")?;
+                let Value::Secret(held) = &req.args[2] else {
+                    return Err(not_sealed(&req.args[2], span));
+                };
+                let encoding = req.args[3].as_str(span, "an encoding")?;
+                let framing = Framing::named(encoding, self.op.what(), span)?;
+                let after = req.args[4].as_bytes(span, "the bytes after the secret")?;
+                Second::Sealed(framing.framed(before, held.bytes(), after))
+            }
+            Op::ReadSecret => {
+                let before = Arc::clone(req.args[1].as_bytes(span, "the bytes before the secret")?);
+                let encoding = req.args[2].as_str(span, "an encoding")?;
+                let framing = Framing::named(encoding, self.op.what(), span)?;
+                let after = Arc::clone(req.args[3].as_bytes(span, "the bytes after the secret")?);
+                Second::Frame {
+                    before,
+                    framing,
+                    after,
+                }
+            }
             Op::Rename | Op::Copy | Op::Link => {
                 Second::Path(req.args[1].as_str(span, "a path")?.to_string())
             }
@@ -533,12 +564,23 @@ enum Second {
     None,
     Opening(Opening),
     Body(Arc<[u8]>),
+    /// A credential in its frame, this job's own copy, wiped when the job is done with it.
+    Sealed(Zeroizing<Vec<u8>>),
+    /// What a credential is read back from between.
+    Frame {
+        before: Arc<[u8]>,
+        framing: Framing,
+        after: Arc<[u8]>,
+    },
     Path(String),
     Target(String),
     Name(String),
     Mode(u32),
     Millis(i64),
-    Range { offset: i64, len: i64 },
+    Range {
+        offset: i64,
+        len: i64,
+    },
     Deep(bool),
 }
 
@@ -632,6 +674,29 @@ fn run(
                 .is_ok(),
             ),
             _ => JobOutput::Failed("a write with no body reached the pool".into()),
+        },
+        Op::WriteSecret => match second {
+            Second::Sealed(body) => JobOutput::Bool(write_private(&target, &body)),
+            _ => JobOutput::Failed("a secret write with no secret reached the pool".into()),
+        },
+        Op::ReadSecret => match (second, std::fs::symlink_metadata(&target)) {
+            (_, Ok(meta)) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
+                JobOutput::Refused(too_large(meta.len(), path, span))
+            }
+            (
+                Second::Frame {
+                    before,
+                    framing,
+                    after,
+                },
+                Ok(meta),
+            ) if meta.is_file() => {
+                let read = read_private(&target, meta.len())
+                    .and_then(|held| framing.unframed(&held, &before, &after));
+                JobOutput::built(move || option(read.map(|bytes| Value::secret_bytes(&bytes))))
+            }
+            (Second::Frame { .. }, _) => JobOutput::built(|| option(None)),
+            _ => JobOutput::Failed("a secret read with no frame reached the pool".into()),
         },
         // Idempotent, so a cache writer need not check first and race with itself.
         Op::CreateDir => JobOutput::Bool(std::fs::create_dir_all(&target).is_ok()),
@@ -885,7 +950,7 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, to_write: bool, m
     // The path as the program named it: where a link in it leads is read again when the record is.
     let target = root.join(path);
     match op {
-        Op::ReadFile | Op::ReadAt | Op::FileSize | Op::Mode | Op::ReadLink => {
+        Op::ReadFile | Op::ReadSecret | Op::ReadAt | Op::FileSize | Op::Mode | Op::ReadLink => {
             read(machine, Read::File, &target)
         }
         Op::ListDir => read(machine, Read::Dir, &target),
@@ -903,6 +968,7 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, to_write: bool, m
         Op::Open => read(machine, Read::File, &target),
         Op::ReadChunk | Op::WriteChunk | Op::Close => {}
         Op::WriteFile
+        | Op::WriteSecret
         | Op::Append
         | Op::CreateDir
         | Op::Remove
@@ -1309,6 +1375,39 @@ fn append_to(target: &Path, body: &[u8]) -> Option<i64> {
     i64::try_from(end.checked_sub(body.len() as u64)?).ok()
 }
 
+/// Writes `body` as the whole of a file its owner alone may read or write (`rw-------`): a new file
+/// is made so, and one already there is made so before it is emptied and written, so no byte of
+/// the body is ever readable by anyone else.
+fn write_private(target: &Path, body: &[u8]) -> bool {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let Ok(mut file) = unfollowed(
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600),
+        target,
+    ) else {
+        return false;
+    };
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .is_ok()
+        && file.set_len(0).is_ok()
+        && file.write_all(body).is_ok()
+}
+
+/// A file's bytes read into memory that is wiped when they are dropped, in one buffer of the size
+/// the file had, so no copy is left behind as a buffer grows; `None` for a file that changed size
+/// under the read or could not be read.
+fn read_private(target: &Path, size: u64) -> Option<Zeroizing<Vec<u8>>> {
+    let size = usize::try_from(size).ok()?;
+    let mut bytes = Zeroizing::new(vec![0u8; size]);
+    let mut file = unfollowed(OpenOptions::new().read(true), target).ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    let mut past = [0u8; 1];
+    (file.read(&mut past).ok()? == 0).then_some(bytes)
+}
+
 /// What is there, which may be less than was asked for: a file can end before the range does, and
 /// a reader that recorded an offset cannot be told its cache is short by a diagnostic it cannot
 /// catch. `None` keeps the meaning it has for `read_file`: this path names nothing to read.
@@ -1519,10 +1618,13 @@ fn nothing(op: Op) -> JobOutput {
         | Op::RemoveTree
         | Op::SetMode
         | Op::Symlink
-        | Op::SetModified => JobOutput::Bool(false),
+        | Op::SetModified
+        | Op::WriteSecret => JobOutput::Bool(false),
         Op::FileSize | Op::ModifiedMs | Op::Append => JobOutput::MaybeInt(None),
         Op::TempDir | Op::Canonical | Op::ReadLink => JobOutput::MaybeString(None),
-        Op::Mode | Op::Walk | Op::Stat | Op::Scan | Op::Space => JobOutput::built(|| option(None)),
+        Op::Mode | Op::Walk | Op::Stat | Op::Scan | Op::Space | Op::ReadSecret => {
+            JobOutput::built(|| option(None))
+        }
         Op::Open | Op::Link => JobOutput::built(|| tried(Err(Refusal::NotFound))),
         Op::ReadChunk | Op::WriteChunk | Op::Close => JobOutput::Failed(
             "an operation on an open file reached the pool as one on a path".into(),
@@ -1616,6 +1718,19 @@ fn chunk_too_large(max: u64, span: Span) -> Diagnostic {
         "a read answers with one whole value, and the bound is {MAX_READ_BYTES} bytes"
     ))
     .note("ask for a smaller chunk: a read costs at most the chunk it asks for, whatever the file holds")
+}
+
+#[cold]
+fn not_sealed(got: &Value, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "`fs.write_secret` was handed a {} where its body is a `Secret`",
+            got.type_name()
+        ),
+    )
+    .primary(span, "performed here")
+    .note("inference checks a perform's arguments, so reaching this means the evaluator was handed a module that was never checked")
 }
 
 #[cold]

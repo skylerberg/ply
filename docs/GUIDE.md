@@ -1017,11 +1017,15 @@ already holds, and `config.secret` (`std.config`) answers one it never held.
 These make a secret of a secret without opening it: `secret_bytes` (a string's
 UTF-8), `secret_concat`, `secret_decode` (the bytes a secret text encodes in
 hex, base64 or base32, under the names `std.hex`, `std.base64` and `std.base32`
-give it), `secret_private_key` (the key a DER document holds) and the
-derivations `std.hash` names, `hkdf` and `pbkdf2`. None answers a part of a
-secret: a slice of one, compared with `==` against each of 256 guesses, would
-read it a byte at a time, so two keys out of one derivation are two `hkdf`
-calls under two `info`s.
+give it) and `secret_encode` (the text of a secret's bytes in those),
+`secret_private_key` (the key a DER document holds), `secret_rsa_jwk` (the
+document an RSA JSON Web Key's numbers make) and the derivations `std.hash`
+names, `hkdf` and `pbkdf2`. None answers a part of a secret: a slice of one,
+compared with `==` against each of 256 guesses, would read it a byte at a time,
+so two keys out of one derivation are two `hkdf` calls under two `info`s.
+`std.random`'s `entropy.secret(n)` draws `n` bytes straight into a secret. A
+secret holds its bytes in memory no other value shares, and they are
+overwritten with zeros when the last value holding the secret is dropped.
 
 A secret is observed four ways: `==` and `!=` between two of them,
 `secret_verify` against a string, `secret_is_empty` and `secret_len`. A
@@ -1036,9 +1040,17 @@ secret: each is one-way in the key.
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
 allows it (`E0439`). The operations `ply` ships that take one are
-`std.password`'s, which hash a password and answer the hash, one-way in it; so
-a secret has no way out of a program: key material that is to be written down,
-as `ply keygen`'s is, is written by whoever drew it, before it is sealed.
+`std.password`'s, which hash a password and answer the hash, one-way in it, and
+the two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
+alone may read, and `std.net`'s `send_secret`, to a connection. Both write the
+same frame, all of it or nothing: plain bytes before the secret, the secret
+`raw` or in `hex`, `base64`, `base64url` or `base32`, and plain bytes after it,
+as a key file's line is a word, the key in hex and a newline, and SASL's PLAIN
+is `AUTH PLAIN `, a credential in base64 and a line end. That frame is a
+secret's one way out of a program. `std.fs`'s `read_secret` reads one back in:
+given the frame, it answers the secret a file holds inside it, never a plain
+value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
+`ply build --sign` reads it, without the key ever being a plain value.
 
 **`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
 branded by their region and cannot outlive it; the brand prints as
@@ -1392,10 +1404,12 @@ part of its argument hands its caller a part.
 A function handed to `map`, `filter` or `fold` is called with each element, and
 one handed to `map_fold` with each key and value; one handed to a definition
 outside the group is called as that definition calls it, with the parts of its
-arguments it hands on; a function an `if` chooses is handed on as each branch
-is; and a lambda bound by `let` is read where it is called, eight lambdas deep
-at most. A member of the group handed anywhere else, or one called from a
-lambda whose calls the checker cannot see, is called with nothing known.
+arguments it hands on, where a function that definition hands on as it took it,
+in the same place, to its own recursion is called as each call down that
+recursion calls it; a function an `if` chooses is handed on as each branch is;
+and a lambda bound by `let` is read where it is called, eight lambdas deep at
+most. A member of the group handed anywhere else, or one called from a lambda
+whose calls the checker cannot see, is called with nothing known.
 
 A definition whose group descends ends, and so does one calling only
 definitions that end. Any other may not return, and its row says so with the
@@ -2929,8 +2943,8 @@ $ ply build . -o app.plyx --verify             # compare, write nothing
 `ply keygen PATH` writes an Ed25519 key pair (`std.ed25519`): the secret key at `PATH`,
 readable by its owner alone, and the public key at `PATH.pub`, each one line
 naming what it holds and 64 hex digits. It never writes over a file, and a key
-file that cannot be read, decoded or written is `E0462`. A secret key read back
-from its file is a `Secret` (§4.6) from then on.
+file that cannot be read, decoded or written is `E0462`. A secret key is a
+`Secret` (§4.6) from the moment `ply keygen` draws it, and is read back as one.
 
 `ply build --sign KEY` signs what it writes, a program or a library, in
 `<artifact>.sig` beside it. A signature is detached, so the artifact's digest
@@ -3105,8 +3119,9 @@ pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
 front end takes as they are. A module whose source or package manifest moved
-since, or that embeds a file that reads otherwise, or that imports a module
-either is true of, is read from source, as is one the package
+since, or that imports a module whose source or manifest moved, or one of whose
+definitions, tests or laws reaches, through what it references, a function that
+embeds a file that reads otherwise, is read from source, as is one the package
 lacks; a shipped module that moved only by gaining definitions, every one the
 package fixed of it hashing as it did, is read from source alone, and what
 imports it still reads its stub. The package is cut again from the load's own
@@ -3114,11 +3129,13 @@ analysis, so a package
 costs no analysis of its own; a project keeps one per semantics version (§15.1),
 so a `ply` that changes nothing a hash or a row means reads the one another
 kept. A registry dependency's first load reads it through the interface its
-publisher sent. `ply check` of a whole project reads the project's own modules
-the same way, from what its last check kept beside the package: a module that
-still stands enters with its bodies cut out and its tests and laws as written,
-its rows answer for the bodies, and what the check warned of it is said again.
-Its answer is the one a check of every source gives. A run about the
+publisher sent. `ply check`, `ply defs` and `ply run` of a whole project read the
+project's own modules the same way, from what the last of them kept beside the
+package: a module that still stands enters with its bodies cut out and its tests and
+laws as written, its rows answer for the bodies, and what the check warned of it is
+said again. Each answers as it does over every source; a run compiles what it runs
+from source. `ply test` reads them from source, since a mutant and a bisection
+rewrite bodies. A run about the
 shipped modules — `--std`, or a project whose own modules ship — reads them from
 source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
 read and file neither, and neither does `compiler.load`. A cache that will not read
@@ -3182,7 +3199,8 @@ which runs have work before starting them. `ply defs` keeps its listing the same
 way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
 program reached hashes as it did; its `--json` document then carries
-`front_end` with `reused` and `key`.
+`front_end` with `reused` and `key`, and otherwise `reused` false beside the own
+modules the load read as their stubs (`stubbed`).
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,

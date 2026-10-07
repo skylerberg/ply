@@ -175,7 +175,7 @@ fn a_function_has_no_text_and_a_text_cut_short_reads_as_none() {
     unsafe { set_word(closure, CLOSURE_CODE, 0) };
     let holder = h.list_from(&[imm(1), closure as Word]);
     assert_eq!(text(&l, holder), Err("a function".to_string()));
-    let secret = h.bridge(Value::Secret(Arc::new(Value::str("key"))));
+    let secret = h.bridge(Value::secret_text("key"));
     assert_eq!(text(&l, secret), Err("a Secret".to_string()));
 
     let whole = text(&l, h.to_word(&l, &table())).unwrap();
