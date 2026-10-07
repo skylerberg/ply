@@ -17,7 +17,7 @@ import results
 import std.random (entropy)
 import std.hash (blake3)
 import std.fs (fs, File, mem_kind, mem_list, mem_modified, mem_of, mem_size)
-import std.list (sort_by, at, at_or, concat, contains, dedup, flat_map)
+import std.list (sort_by, all, at, at_or, concat, contains, dedup, flat_map)
 import std.path (parent)
 import std.time (time)
 import std.cli (Parsed, Run, has, parse, parse_nat, value, values_of)
@@ -45,7 +45,7 @@ import paths
 import program (Timed, load_diagnostics, front_of, in_shipped_module, is_shipped, modules_of,
                 timed_over, timed_uncached_over, unmoved)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
-import sources (Embed, File, Project, imported_reader, load_resolved, shipped_imported)
+import sources (Embed, File, Project, imported_reader, is_std, load_resolved, shipped_imported)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null, parse_string)
@@ -81,7 +81,7 @@ import suite.select (Cached, Changed, Decision, Held, Moved, New, Pass, Previous
                      Row, SameCode, Search, Stands, Unhashed, answers_per_root, asked_by_code,
                      by_code, code_keys, decide, digest_of, filed, key_of, narrowed, owed_roots,
                      seed_keys, to_run, word)
-import std.bytes (bytes_of_hex, hex_of)
+import std.bytes (bytes_of_hex, hex_of, u32_at)
 import sim.plan
 import sim.plan (Seed)
 import sim.recording (Interleaving)
@@ -110,6 +110,7 @@ pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} = {
     explain: has(p, "explain"),
     no_cache: has(p, "no-cache"),
     filters: values_of(p, "filter"),
+    shard: match value(p, "shard") { Some(v) -> surface::shard_of(v), None -> None },
     jobs: match value(p, "jobs") { Some(v) -> parse_nat(v), None -> None },
     steps: match value(p, "steps") {
       Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
@@ -2316,8 +2317,8 @@ fn case_view(analysis: Analysis, i: Int, test_info: TestInfo) -> Case / {abort.r
 }
 
 /// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
-/// and a shipped module's are in scope only under `--std` — narrowed by `--filter` to the keys that
-/// contain one of its substrings.
+/// and a standard library module's are in scope only under `--std`, the compiler's never — narrowed
+/// by `--filter` to the keys that contain one of its substrings, and by `--shard` to its part.
 type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
 fn root_modules(analysis: Analysis) -> Map<String, Bool> =
@@ -2328,14 +2329,15 @@ fn root_modules(analysis: Analysis) -> Map<String, Bool> =
       _ -> acc,
     })
 
-fn scope_of(analysis: Analysis, options: Options) -> Scope = {
+fn scope_of(analysis: Analysis, options: Options) -> Scope / {abort.raise} = {
   let packaged = len(analysis.packages) > 0;
   let root = root_modules(analysis);
   let in_scope = |t: TestInfo|
     (if packaged { map_contains(root, string_of_bytes_lossy(t.module)) }
       else { !is_shipped(string_of_bytes_lossy(t.module)) })
-      || (options.std && is_shipped(string_of_bytes_lossy(t.module)));
-  let matches = |t: TestInfo| kept(options.filters, string_of_bytes_lossy(t.key));
+      || (options.std && is_std(string_of_bytes_lossy(t.module)));
+  let matches = |t: TestInfo|
+    kept(options.filters, string_of_bytes_lossy(t.key)) && in_shard(options.shard, t.key);
   fold(
     range(0, len(analysis.checked.tests)),
     { visible: [], out: [], filtered_out: 0 },
@@ -2348,6 +2350,17 @@ fn scope_of(analysis: Analysis, options: Options) -> Scope = {
       },
   )
 }
+
+/// Whether the test keyed `key` is in the part `--shard` asks for: its key's hash decides, so it is in
+/// the same part every run, whatever else the run selects.
+fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
+  match shard {
+    None -> true,
+    Some(s) -> match u32_at(blake3(key), 0) {
+      Some(n) -> n % s.count == s.index - 1,
+      None -> s.index == 1,
+    },
+  }
 
 /// A diagnostic raised inside a module that ships with `ply` is its maintainers', not this
 /// program's.
@@ -2754,10 +2767,10 @@ fn decided_run(
 
 // --- A test over cases --------------------------------------------------------
 
-/// The tests over cases this run reports on, whatever `--filter` says: a filter reads a case's
-/// label, which only its listing knows.
-fn over_cases(analysis: Analysis, options: Options) -> List<Int> =
-  filter(scope_of(analysis, { ..options, filters: [] }).visible, |i: Int|
+/// The tests over cases this run reports on, whatever `--filter` and `--shard` say: each reads a
+/// case's label, which only its listing knows.
+fn over_cases(analysis: Analysis, options: Options) -> List<Int> / {abort.raise} =
+  filter(scope_of(analysis, { ..options, filters: [], shard: None }).visible, |i: Int|
     match test_at(analysis, i) { Some(t) -> t.cases, None -> false })
 
 /// Each asked test's cases, or why they could not be listed, from a unit of their tables alone.
@@ -5150,6 +5163,76 @@ test "a run reports on the tests `--filter` keeps, and counts the ones it hid" {
   let either = options_from(parsed(["test", "--filter", "m.gam", "--filter", "alpha"]), "/p");
   assert_eq(scope_of(w, either).visible, [0, 2]);
   assert_eq(scope_of(w, options_from(parsed(["test"]), "/p")).visible, [0, 1, 2])
+}
+
+test "`--std` adds the standard library's tests and never the compiler's, whose own suite runs them" {
+  let w = match analyse_pulling_std_with(
+      [
+        {
+          name: b"m",
+          src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
+        },
+      ],
+      [
+        {
+          name: b"std.y",
+          src: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
+        },
+        {
+          name: b"compiler.x",
+          src: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
+        },
+      ],
+      [],
+      [],
+      reached: false,
+    ).out {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  };
+  let keys = |args: List<String>|
+    map(scope_of(w, options_from(parsed(concat(["test"], args)), "/p")).visible, |i: Int|
+      match test_at(w, i) { Some(t) -> t.key, None -> b"" });
+  assert_eq(len(w.checked.tests), 3);
+  assert_eq(keys([]), [b"m.own"]);
+  let std = keys(["--std"]);
+  assert(len(std) == 2 && contains(std, b"m.own") && contains(std, b"std.y.library"))
+}
+
+test "the parts of a run hold each of its tests once, a case as a test, each key in one part whatever else runs" {
+  let whole = ranging();
+  let over = ranged(
+    whole,
+    map_insert(
+      map_new(),
+      1,
+      Ok(
+        map(range(0, 12), |n: Int|
+          { label: "holds " ++ int_to_string(n), identity: bytes_of_string(int_to_string(n)) }),
+      ),
+    ),
+  );
+  let part = |k: Int, more: List<String>|
+    scope_of(
+      over.analysis,
+      options_from(parsed(concat(["test", "--shard", int_to_string(k) ++ "/3"], more)), "/p"),
+    );
+  let parts = map([1, 2, 3], |k: Int| part(k, []).visible);
+  assert(all(parts, |held: List<Int>| len(held) > 0));
+  assert(all(range(0, 13), |i: Int| len(filter(parts, |held: List<Int>| contains(held, i))) == 1));
+  assert_eq(part(2, []).filtered_out, 13 - len(at_or(parts, 1, [])));
+  // Narrowed by `--filter` to `holds 1`, `holds 10` and `holds 11`, each part keeps those it held.
+  assert(
+    all([1, 2, 3], |k: Int|
+      part(k, ["--filter", "holds 1"]).visible
+        == filter(at_or(parts, k - 1, []), |i: Int| i == 2 || i >= 11)),
+  );
+  // A part of one is the run, and listing asks for every test over cases whatever the part.
+  assert_eq(
+    scope_of(over.analysis, options_from(parsed(["test", "--shard", "1/1"]), "/p")).visible,
+    range(0, 13),
+  );
+  assert_eq(over_cases(whole, options_from(parsed(["test", "--shard", "3/3"]), "/p")), [1])
 }
 
 // --- What a search's cost reads as --------------------------------------------
