@@ -163,10 +163,10 @@ fn fixed_lengths() -> List<Int> =
 // --- Writing ----------------------------------------------------------------
 
 /// Bits not yet in `pieces`: `bits` of them, fewer than 32, the next to write lowest in `buf`.
-type Writer = { pieces: List<Bytes>, buf: Int, bits: Int }
+type Bits = { pieces: List<Bytes>, buf: Int, bits: Int }
 
 /// `packed` is up to 31 bits to write over how many they are, `bits << 6 | count`.
-fn put(w: Writer, packed: Int) -> Writer / {abort.raise} = {
+fn put(w: Bits, packed: Int) -> Bits / {abort.raise} = {
   let { pieces, buf, bits } = w;
   let wide = buf | packed >>> 6 << bits;
   let count = bits + (packed & 63);
@@ -263,7 +263,7 @@ reuse fn entered(
   }
 
 /// What a block leaves the next: the bits written, and where bytes of three last stood.
-type Scanned = { w: Writer, table: Array<Int> }
+type Scanned = { w: Bits, table: Array<Int> }
 
 /// One symbol a round: a literal, or the match the table holds for the three bytes at `i` when
 /// the position after it holds none longer. The table keeps a position in the stream plus one,
@@ -274,7 +274,7 @@ reuse fn scanned(
   n: Int,
   i: Int,
   table: Array<Int>,
-  w: Writer,
+  w: Bits,
   c: Coder,
   shift: Int,
   left: Int,
@@ -332,7 +332,7 @@ fn block_written(
   shift: Int,
   last: Bool,
   table: Array<Int>,
-  w: Writer,
+  w: Bits,
   c: Coder,
 ) -> Scanned / {abort.raise} = {
   let held = w.buf;
@@ -387,7 +387,7 @@ fn unwritten() -> Scanned / {abort.raise} =
   { w: { pieces: [], buf: 0, bits: 0 }, table: array_new(32768, 0) }
 
 /// Everything written, the bits that fill no byte in a last byte of their own.
-fn flushed(w: Writer) -> Bytes / {abort.raise} =
+fn flushed(w: Bits) -> Bytes / {abort.raise} =
   bytes_concat_all(push(w.pieces, bytes_slice(u32_le(w.buf), 0, (w.bits + 7) / 8)))
 
 /// `data` as a raw DEFLATE stream.
@@ -525,6 +525,61 @@ fn encoding<| e>(
 /// block it is filling, and the chunk it was handed.
 pub fn encoded<| e>(plain: Seq<Bytes | e>, format: Format) -> Seq<Bytes | {abort.raise | e}> =
   encoding(plain, format, None, 0x3FFF_FFFF_FFFF_FFFF)
+
+/// A writer part of the way through a stream: `write` feeds it, `flush` empties it, `finish` ends
+/// it. It holds the 32 KiB a match may reach and the block it is filling.
+pub opaque type Writer = | Writer(Encoder)
+
+/// What a writer answers: the bytes it wrote, and the writer after them.
+pub type Written = { out: Bytes, next: Writer }
+
+/// A writer of a stream in the framing `format`, its header (gzip's ten bytes, zlib's two) its
+/// first bytes out.
+pub fn writer(format: Format) -> Writer / {abort.raise} = Writer(encoder(format))
+
+/// `chunk` taken in: every whole block of 64 KiB the writer then holds written out.
+pub fn write(w: Writer, chunk: Bytes, format: Format) -> Written / {abort.raise} =
+  match w {
+    Writer(e) -> {
+      let took = pressed(e, chunk, format);
+      { out: took.out, next: Writer(took.next) }
+    },
+  }
+
+/// Everything taken in written out, in blocks none of which ends the stream, and then the empty
+/// stored block of a sync flush, which ends on a whole byte as `00 00 ff ff`: a reader handed these
+/// bytes answers every byte written so far. The writer goes on matching against what it wrote, as
+/// permessage-deflate's context takeover (RFC 7692 §7.2.1) asks.
+pub fn flush(w: Writer, format: Format) -> Written / {abort.raise} =
+  match w {
+    Writer(e) -> {
+      let n = bytes_len(e.buf);
+      let done = blocks_written(e.buf, e.from, n, e.shift, false, e.state, e.coder);
+      let pad = 0 - (done.w.bits + 3) & 7;
+      let marked = put(done.w, 3 + pad);
+      let cut = if n > 32768 { n - 32768 } else { 0 };
+      {
+        out: bytes_concat_all(
+          push(
+            push(marked.pieces, bytes_slice(u32_le(marked.buf), 0, marked.bits / 8)),
+            b"\x00\x00\xff\xff",
+          ),
+        ),
+        next: Writer({
+          ..e,
+          buf: if cut == 0 { e.buf } else { bytes_slice(e.buf, cut, n) },
+          from: n - cut,
+          shift: e.shift + cut,
+          state: { w: { pieces: [], buf: 0, bits: 0 }, table: done.table },
+        }),
+      }
+    },
+  }
+
+/// The stream's last bytes: what the writer holds, in the block that ends the stream, and what
+/// the framing ends with.
+pub fn finish(w: Writer, format: Format) -> Bytes / {abort.raise} =
+  match w { Writer(e) -> closed(e, format) }
 
 // --- Reading: prefix codes --------------------------------------------------
 
@@ -1202,6 +1257,54 @@ pub fn decoded<| e>(
 ) -> Seq<Bytes | {gzip.refused, abort.raise | e}> =
   || flowing(packed, decoder(format, limit, b""), 0x3FFF_FFFF_FFFF_FFFF)()
 
+/// A reader part of the way through a stream: `read` feeds it and `ended` says whether the stream
+/// has. It holds of its input what a symbol or a header left unread, and of what it wrote the
+/// 32 KiB a match may reach.
+pub opaque type Reader = | Reader(Decoder)
+
+/// What a reader answers: the bytes it wrote, and the reader after them.
+pub type Read = { out: Bytes, next: Reader }
+
+/// A reader of a stream in the framing `format` that answers `limit` bytes at most in all.
+pub fn reader(format: Format, limit: Int) -> Reader / {abort.raise} =
+  Reader(decoder(format, limit, b""))
+
+/// `chunk` read after what the reader holds: every byte it then completes. Refused (`gzip.refused`)
+/// where the format's whole reader would refuse the stream, but for its ending early: a stream
+/// ends where `ended` says it has. A raw or zlib stream that ends inside `chunk` leaves what follows
+/// it unread, as permessage-deflate's flush after a final block leaves a byte; a later `read`
+/// refuses it.
+pub fn read(r: Reader, chunk: Bytes) -> Read / {gzip.refused, abort.raise} =
+  match r {
+    Reader(d) -> if d.core.phase == 5 && d.core.format != Gzip && bytes_len(chunk) > 0 {
+      refuse(d.core.base + (d.core.bit >>> 3), Trailing)
+    } else {
+      let moved = read_to_end(fed(d, chunk), 8 * (bytes_len(chunk) + bytes_len(d.input)) + 64);
+      let answered = taken(moved);
+      { out: answered.out, next: Reader(answered.next) }
+    },
+  }
+
+/// Steps until the reader needs input, or a raw or zlib stream has ended.
+fn read_to_end(d: Decoder, fuel: Int) -> Decoder / {gzip.refused, abort.raise} =
+  if fuel <= 0 || d.core.need > 0 || (d.core.phase == 5 && d.core.format != Gzip) { d }
+  else { read_to_end(step(d, 0x3FFF_FFFF_FFFF_FFFF), fuel - 1) }
+
+/// Whether the stream has ended: its last block read, and for gzip and zlib the trailer after it.
+pub fn ended(r: Reader) -> Bool =
+  match r {
+    Reader(d) -> match d.core.format {
+      Gzip -> d.core.phase == 0 && d.core.members > 0,
+      _ -> d.core.phase == 5,
+    },
+  }
+
+/// The reader allowed `more` bytes beyond those it has answered, whatever it was allowed before.
+pub fn allowing(r: Reader, more: Int) -> Reader =
+  match r {
+    Reader(d) -> Reader({ ..d, core: { ..d.core, limit: d.core.cut + bytes_len(d.hist) + more } }),
+  }
+
 // --- Tests ------------------------------------------------------------------
 
 fn checked() -> Bytes =
@@ -1609,7 +1712,7 @@ fn bomb(runs: Int) -> Bytes / {abort.raise} = {
   let run = match_bits(c.lengths, c.codes, c.spans, 258, 1);
   let opened = put({ pieces: [], buf: 3, bits: 3 }, array_get(c.literals, 0));
   let ended = put(
-    fold(range(0, runs), opened, |w: Writer, _: Int| put(w, run)),
+    fold(range(0, runs), opened, |w: Bits, _: Int| put(w, run)),
     array_get(c.literals, 256),
   );
   flushed(ended)
@@ -1792,4 +1895,70 @@ test "a stream is read in a history of a few times a match's reach, however long
   assert(gathered(decoded(seq::slices(gzip(long), 3000), Gzip, 400000)) == long);
   assert(gathered(decoded(seq::slices(zlib(long), 3000), Zlib, 400000)) == long);
   assert(gathered(encoded(seq::slices(long, 50000), Gzip)) == gzip(long))
+}
+
+/// `pieces` written one `write` at a time, then finished: the bytes and the writer's last.
+fn written_in(pieces: List<Bytes>, format: Format) -> Bytes / {abort.raise} = {
+  let ran = fold(
+    pieces,
+    { out: [], w: writer(format) },
+    |s: { out: List<Bytes>, w: Writer }, p: Bytes| {
+      let took = write(s.w, p, format);
+      { out: push(s.out, took.out), w: took.next }
+    },
+  );
+  bytes_concat_all(push(ran.out, finish(ran.w, format)))
+}
+
+/// `pieces` read one `read` at a time: what they answered, and whether the stream had ended.
+fn read_in(
+  pieces: List<Bytes>,
+  format: Format,
+  limit: Int,
+) -> { out: Bytes, ended: Bool } / {gzip.refused, abort.raise} = {
+  let ran = fold(
+    pieces,
+    { out: [], r: reader(format, limit) },
+    |s: { out: List<Bytes>, r: Reader }, p: Bytes| {
+      let got = read(s.r, p);
+      { out: push(s.out, got.out), r: got.next }
+    },
+  );
+  { out: bytes_concat_all(ran.out), ended: ended(ran.r) }
+}
+
+test "a stream written a piece at a time is the stream written whole, and reads back a piece at a time: {f}" for f: Format in [
+    Deflate,
+    Zlib,
+    Gzip,
+  ] {
+  let long = text(200000);
+  let pieces = seq::to_list(seq::slices(long, 7000), 100);
+  let packed = written_in(pieces, f);
+  assert_eq(packed, packed_as(f, long));
+  let back = read_in(seq::to_list(seq::slices(packed, 999), 1000), f, 200000);
+  assert_eq(back, { out: long, ended: true });
+  let cut = read_in([bytes_slice(packed, 0, bytes_len(packed) - 3)], f, 200000);
+  assert(!cut.ended);
+  let over: Result<{ out: Bytes, ended: Bool }, Refusal> = try { read_in([packed], f, 199999) };
+  assert_eq(match over { Err(r) -> Some(r.why), Ok(_) -> None }, Some(OverLimit))
+}
+
+test "a flush ends on a whole byte with an empty stored block, and a reader answers all before it" {
+  let first = text(100000);
+  let second = bytes_slice(first, 500, 3000);
+  let one = flush(write(writer(Deflate), first, Deflate).next, Deflate);
+  let wrote = bytes_concat(write(writer(Deflate), first, Deflate).out, one.out);
+  assert(bytes_ends_with(wrote, b"\x00\x00\xff\xff"));
+  let reading = read(reader(Deflate, 1000000), wrote);
+  assert_eq(reading.out, first);
+  assert(!ended(reading.next));
+  // The next flush matches against what the first wrote, so what was said before costs little.
+  let two = flush(write(one.next, second, Deflate).next, Deflate);
+  let again = bytes_concat(write(one.next, second, Deflate).out, two.out);
+  assert(bytes_len(again) < 40, Some(int_to_string(bytes_len(again)) ++ " bytes"));
+  assert_eq(read(reading.next, again).out, second);
+  // A reader allowed no more than the second message refuses one past it.
+  let tight: Result<Read, Refusal> = try { read(allowing(reading.next, 100), again) };
+  assert_eq(match tight { Err(r) -> Some(r.why), Ok(_) -> None }, Some(OverLimit))
 }

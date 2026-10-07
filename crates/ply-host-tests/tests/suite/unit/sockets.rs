@@ -601,7 +601,7 @@ impl Material {
             Vec::new()
         };
         bound(Host::with_credentials(
-            Credentials::load(&[spec], &trusted).expect("the generated material loads"),
+            Credentials::load(&[spec], &trusted, &[]).expect("the generated material loads"),
         ))
     }
 }
@@ -702,6 +702,80 @@ fn an_open_connection_is_secured_at_both_ends_and_carries_bytes_after() {
     b.close("conn", server);
     b.close("listener", listener);
     assert_eq!(b.host.handshakes().completed, 2);
+}
+
+#[test]
+fn a_connection_presenting_a_credential_is_who_its_server_sees_and_one_presenting_none_is_no_one() {
+    let material = material();
+    let b = material.host(true);
+    let (listener, here) = b.listening(loopback());
+    let peer_certificate = |label: &str, conn: i64| {
+        maybe(b.net("peer_certificate", label, vec![Value::Int(conn)])).map(bytes)
+    };
+
+    let (client, server) = b.joined(listener, &here);
+    ok(b.net(
+        "set_option",
+        "client",
+        vec![
+            Value::Int(client),
+            SocketOption::Presenting("mail".to_string()).value(),
+        ],
+    ));
+    assert!(
+        !b.options("client", client)
+            .iter()
+            .any(|o| matches!(o, SocketOption::Presenting(_))),
+        "a credential to present is not read back"
+    );
+    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
+    started.expect("the client secured");
+    served.expect("the server secured");
+    let seen = peer_certificate("conn", server);
+    assert!(seen.is_some(), "the server sees the certificate presented");
+    assert_eq!(
+        seen,
+        peer_certificate("client", client),
+        "the credential presented is the one the server holds"
+    );
+    b.close("client", client);
+    b.close("conn", server);
+
+    let (client, server) = b.joined(listener, &here);
+    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
+    started.expect("the client secured");
+    served.expect("the server secured");
+    assert_eq!(peer_certificate("conn", server), None);
+    b.close("client", client);
+    b.close("conn", server);
+
+    let (client, server) = b.joined(listener, &here);
+    ok(b.net(
+        "set_option",
+        "client",
+        vec![
+            Value::Int(client),
+            SocketOption::Presenting("absent".to_string()).value(),
+        ],
+    ));
+    let unknown = b
+        .perform(
+            NET,
+            "start_tls",
+            Some("client"),
+            vec![
+                Value::Int(client),
+                text("localhost"),
+                strings(&[]),
+                Value::bytes(b""),
+                Value::Int(5000),
+            ],
+        )
+        .expect_err("the run holds no credential of that name");
+    assert_eq!(unknown.code, codes::TLS_CREDENTIAL_UNKNOWN);
+    b.close("client", client);
+    b.close("conn", server);
+    b.close("listener", listener);
 }
 
 #[test]
@@ -1366,7 +1440,10 @@ fn the_script_keeps_the_sockets_rules_without_a_socket() {
     let dialled = int(ok(value(net.connect_to(
         &label("client"),
         to.clone(),
-        vec![SocketOption::NoDelay(false)],
+        vec![
+            SocketOption::NoDelay(false),
+            SocketOption::Presenting("caller".to_string()),
+        ],
         Duration::from_secs(1),
         Span::DUMMY,
     ))));
@@ -1385,7 +1462,11 @@ fn the_script_keeps_the_sockets_rules_without_a_socket() {
         Span::DUMMY,
     )
     .expect("a list of options");
-    assert_eq!(options, [SocketOption::NoDelay(false)]);
+    assert_eq!(
+        options,
+        [SocketOption::NoDelay(false)],
+        "a credential to present is no setting"
+    );
     let secured = ok(value(net.start_tls(
         &label("client"),
         dialled,

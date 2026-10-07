@@ -74,6 +74,17 @@ impl Cluster {
         )
     }
 
+    /// A cluster whose TCP connections send their password in the clear, which `password`
+    /// authentication asks for.
+    pub fn start_with_clear_text_password(database: &str, password: &str) -> Cluster {
+        Cluster::launch(
+            database,
+            &["--auth-local=trust", "--auth-host=password"],
+            Some(password),
+            None,
+        )
+    }
+
     /// `start_with_password`'s cluster, speaking TLS with a certificate and its key (PEM) as well
     /// as plaintext, so a client's `sslmode` decides which.
     pub fn start_with_tls(database: &str, password: &str, certificate: &str, key: &str) -> Cluster {

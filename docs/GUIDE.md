@@ -2730,9 +2730,12 @@ std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
 ships beside it, each named by its place below the library (`std/oid/names.txt`):
 `ply std` lists them with the module that embeds each, `ply std --show
 std/oid/names.txt` prints one, and the digest `ply std` prints covers them. A
-load reads only the shipped modules its modules
-import, what those import in turn, and what they embed, so a change to any other
-leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
+load reads of a shipped module what a module importing it can reach: none of
+its tests or laws, nor a private function or type or an `import` that only they
+reach, which it neither parses nor checks. It reads only the shipped modules its
+modules import, what the parts it reads import in turn, and what they embed, so
+a change to any other leaves it alone; a change to one it reads warns `W0605`.
+Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
@@ -2780,7 +2783,8 @@ checked against that declaration, so it performs none of it.
 | flag | meaning |
 | --- | --- |
 | `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, as `std.http`'s `serve_pooled_tls` uses it to offer `h2` and `http/1.1`; a name given several times holds several certificates, and a handshake gets the one whose names cover the name the client asks for (SNI), or the first; a certificate whose files change is read again within a second and served without a restart, the one before kept where the new one does not load; sessions resume from tickets whose key rotates; `E0430` if it does not load, `E0429` if unnamed |
-| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, still serves a client that presents none, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding); `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, serves a client that presents none unless `--mtls` names its credential, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding), which `std.http` carries on each request as `client_certificate` and `std.x509` reads; a client presents one where its connection was opened or set with `net::Presenting("NAME")`, the `--tls` credential named, as `std.http`'s `fetch` does for `Fetching.credential`; `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
+| `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
@@ -3143,7 +3147,10 @@ package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
 dependents' rows standing. What each module imports, and what it embeds, is kept
 in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
-has not read. A load reads its dependencies and the shipped modules it
+has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
+`reused/` under the stage root, under the text's digest and the `ply` that read it, so a
+project's first load lexes no shipped module's tests or laws to find it. A load reads its
+dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the
@@ -3453,8 +3460,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0426` | continuation resumed twice across an at-most-once host operation |
 | `E0427` | host handler answered an atom outside the entry point's footprint |
 | `E0428` | `blocking` host handler answered inline |
-| `E0429` | `net.listen_tls` named a credential the run lacks |
-| `E0430` | `--tls` credential, or certificate to trust, that does not load |
+| `E0429` | `net.listen_tls`, `net::Presenting` or `--mtls` named a credential the run lacks |
+| `E0430` | `--tls` credential, or certificate to trust, that does not load, or `--mtls` with no `--trust` |
 | `E0431` | a statement the reader refuses, found before it runs |
 | `E0433` | a statement that names a table or column the schema does not declare |
 | `E0435` | a statement whose tables do not include the table its call's label names |

@@ -267,6 +267,8 @@ pub struct TcpHost {
     closed_at: Mutex<Vec<SocketAddr>>,
     /// The tokens a machine parks on when this host is itself its runtime.
     inbox: Arc<Inbox>,
+    /// The credential each connection's `start_tls` presents, where `Presenting` named one.
+    presenting: Arc<Mutex<BTreeMap<i64, String>>>,
 }
 
 impl Default for TcpHost {
@@ -294,6 +296,7 @@ impl TcpHost {
             accepts: Arc::new(AtomicUsize::new(0)),
             closed_at: Mutex::new(Vec::new()),
             inbox: Arc::new(Inbox::default()),
+            presenting: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -554,10 +557,16 @@ impl Net for TcpHost {
         span: Span,
     ) -> Result<HostAnswer, Diagnostic> {
         let sockets = Arc::clone(&self.sockets);
+        let presenting = Arc::clone(&self.presenting);
         let at = at.clone();
         self.waiting(span, "connect_to", Op::ConnectTo.what(), move || {
             let reached = reach_to(&to, &options, timeout).map(|stream| {
-                sockets.insert(Some(&at), Socket::Stream(Plain::Tcp(Arc::new(stream))))
+                let handle =
+                    sockets.insert(Some(&at), Socket::Stream(Plain::Tcp(Arc::new(stream))));
+                if let Some(name) = presented(&options) {
+                    lock(&presenting).insert(handle, name);
+                }
+                handle
             });
             JobOutput::built(move || match reached {
                 Ok(handle) => wire::ok(Value::Int(handle)),
@@ -641,7 +650,12 @@ impl Net for TcpHost {
             None
         };
         let reason = early.as_ref().map(|(reason, _)| *reason);
-        let config = tls::client_offering(&self.credentials.client(), &upgrade.alpn);
+        let named = lock(&self.presenting).get(&conn).cloned();
+        let client = match named {
+            Some(name) => self.credentials.presenting(&name, span)?,
+            None => self.credentials.client(),
+        };
+        let config = tls::client_offering(&client, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let (stream, session) =
             self.sockets
@@ -816,6 +830,7 @@ impl Net for TcpHost {
         self.sockets.handles.check(socket, at, span)?;
         let sock = lock(&self.sockets.open).remove(&socket);
         self.sockets.handles.close(socket);
+        lock(&self.presenting).remove(&socket);
         match sock {
             // Shut down, not just dropped: a `recv` parked on another `Arc` returns only then.
             Some(Socket::Stream(s)) => s.shutdown(Shutdown::Both),
@@ -845,6 +860,9 @@ impl Net for TcpHost {
             Some(raw) => apply(&raw, &option).map_err(|e| Refusal::of(&e)),
             None => Err(Refusal::Reset),
         })?;
+        if let (Ok(()), SocketOption::Presenting(name)) = (&set, &option) {
+            lock(&self.presenting).insert(socket, name.clone());
+        }
         answered(match set {
             Ok(()) => wire::ok(Value::Unit),
             Err(refusal) => wire::err(&refusal),
@@ -920,6 +938,14 @@ impl Net for TcpHost {
             options.iter().map(SocketOption::value).collect(),
         ))
     }
+}
+
+/// The credential `options` name for a later `start_tls` to present, the last where several do.
+fn presented(options: &[SocketOption]) -> Option<String> {
+    options.iter().rev().find_map(|o| match o {
+        SocketOption::Presenting(name) => Some(name.clone()),
+        _ => None,
+    })
 }
 
 /// The handshake of an upgrade, completed within its deadline or refused with why.
@@ -1194,6 +1220,8 @@ pub(crate) fn apply(socket: &RawSocket, option: &SocketOption) -> io::Result<()>
         }
         SocketOption::JoinGroup(group, interface) => membership(socket, group, interface, true),
         SocketOption::LeaveGroup(group, interface) => membership(socket, group, interface, false),
+        // A credential to present is the TLS session's, set at `start_tls`.
+        SocketOption::Presenting(_) => Ok(()),
     }
 }
 

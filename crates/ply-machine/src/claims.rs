@@ -974,6 +974,7 @@ fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
                     .into_iter()
                     .map(PathBuf::from)
                     .collect(),
+                mtls: str_list_at(v, "mtls", span)?,
             },
             fs,
             trace: crate::trace::TraceOptions {

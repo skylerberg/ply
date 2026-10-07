@@ -17,13 +17,8 @@ const UNIT: &[u8] = b"/* the unit */\n";
 fn filed(dir: &Path) -> (LoadedAnalysis, Vec<u8>) {
     let value = handed(dir);
     let front = loaded_analysis_of(&value, Span::DUMMY).expect("the handed front reads");
-    let placed: Vec<(String, String)> = front
-        .files
-        .iter()
-        .map(|f| (f.path.clone(), f.name.clone()))
-        .collect();
     let dump = ply_machine::payload::field_of(&value, "dump", Span::DUMMY).expect("a dump");
-    let entry = reused::entry(&placed, dump, UNIT).expect("the answer encodes");
+    let entry = reused::entry(&front.files, dump, UNIT).expect("the answer encodes");
     (front, entry)
 }
 
