@@ -186,6 +186,13 @@ pub nondet effect net {
   read peer_credentials[s](conn: Int) -> Option<PeerCredentials>
   /// Each option the socket has, as it stands now.
   read options[s](socket: Int) -> List<SocketOption>
+  /// Writes `before`, then `secret` in `encoding`, then `after`, every byte or `false`, framed as
+  /// `std.fs`'s `write_secret` frames a file: what puts a credential on a connection, as SASL's
+  /// PLAIN puts `\0user\0password` in base64 between `AUTH PLAIN ` and a line end, without it ever
+  /// being a plain value. An encoding `write_secret` does not name is a runtime error, and so is a
+  /// write of nothing at all. `false` is a deadline, a peer gone or this end's sending ended before
+  /// every byte went, and nothing says how many did.
+  write send_secret[s](conn: Int, before: Bytes, secret: Secret<Bytes>, encoding: String, after: Bytes, timeout_ms: Int) -> Bool
 }
 
 /// What a socket refuses.
@@ -432,6 +439,11 @@ pub type Step =
   | Hears(Bytes)
   /// It waits until this end has ended its sending.
   | HearsEnd
+  /// It waits until it has heard exactly these bytes, written whole by one `send_secret`: a
+  /// credential in its frame, as `sent_secret` makes it, which the far end knows as a server
+  /// knows a password. A program that sends anything else here, or these bytes any other way,
+  /// fails where it sends it, and nothing says how what it sent differs.
+  | HearsSecret(Bytes)
   /// It does its half of a TLS handshake here, and what follows is read only once secured.
   | Upgrades
   /// It fails a TLS handshake here with this refusal.
@@ -472,8 +484,9 @@ pub type MemListener = {
 
 /// A connection a twin holds. `script` is what the far end does next; `fed` says the far end may
 /// send more than the script holds, which is so while it is the program's own and open; `gone`
-/// says it will take nothing more. `sent` is everything this end sent, `unheard` what no
-/// `Hears` has matched yet, and `deadlines` the deadline each read was given, in order.
+/// says it will take nothing more. `sent` is everything this end sent but credentials, which
+/// `sealed` holds as `send_secret` framed them; `unheard` is what no `Hears` has matched yet,
+/// and `deadlines` the deadline each read was given, in order.
 pub type MemConn = {
   label: Option<String>,
   local: Option<SocketAddress>,
@@ -484,6 +497,7 @@ pub type MemConn = {
   gone: Bool,
   ended: Bool,
   sent: Bytes,
+  sealed: List<Secret<Bytes>>,
   unheard: Bytes,
   deadlines: List<Int>,
   secured: Option<String>,
@@ -562,9 +576,14 @@ pub fn mem_credential(n: MemNet, name: String) -> MemNet =
 /// as it is asked when `most` is zero: the short reads and partial writes a socket gives.
 pub fn mem_short(n: MemNet, most: Int) -> MemNet = { ..n, short: most }
 
-/// Everything the program sent on `conn`, whether or not it is still open.
+/// Everything the program sent on `conn` but credentials, whether or not it is still open.
 pub fn mem_sent(n: MemNet, conn: Int) -> Bytes =
   match map_get(n.conns, conn) { Some(c) -> c.sent, None -> b"" }
+
+/// Each credential the program sent on `conn` by `send_secret`, in its frame and in order, sealed:
+/// what a test compares whole with the one it expects.
+pub fn mem_sent_secrets(n: MemNet, conn: Int) -> List<Secret<Bytes>> =
+  match map_get(n.conns, conn) { Some(c) -> c.sealed, None -> [] }
 
 /// What `conn`'s far end has yet to do: empty when the program played its script out.
 pub fn mem_unmet(n: MemNet, conn: Int) -> List<Step> =
@@ -633,12 +652,19 @@ fn with_conn(n: MemNet, id: Int, c: MemConn) -> MemNet = { ..n, conns: map_inser
 /// The connection with every step at the head of its script that has been met taken off: a
 /// `Hears` the program has sent all of, a `HearsEnd` after it ended its sending, a `Says` of
 /// nothing, and a `Leaves`, which ends the script. A `Hears` the program has sent something else
-/// for fails here.
+/// for fails here, and so does a `HearsSecret` it has sent plain bytes for.
 fn listened(c: MemConn) -> MemConn / {abort.raise} =
   match c.script {
     [Says(bytes), ..rest] -> if bytes_len(bytes) == 0 { listened({ ..c, script: rest }) }
     else { c },
     [HearsEnd, ..rest] -> if c.ended { listened({ ..c, script: rest }) } else { c },
+    [HearsSecret(_), ..] -> if bytes_len(c.unheard) == 0 { c } else {
+      panic(
+        "the peer was to hear a credential and the program sent \""
+          ++ string_of_bytes_lossy(c.unheard)
+          ++ "\"",
+      )
+    },
     [Leaves, ..] -> { ..c, script: [], fed: false, gone: true },
     [Hears(expected), ..rest] -> {
       let wanted = bytes_len(expected);
@@ -675,6 +701,7 @@ fn new_conn(
     gone: false,
     ended: false,
     sent: b"",
+    sealed: [],
     unheard: b"",
     deadlines: [],
     secured: None,
@@ -1018,6 +1045,68 @@ pub fn mem_send(
   }
 }
 
+/// The bytes `send_secret` puts on a connection, sealed: what a peer reads, and what the twin and
+/// any other handler of `send_secret` keeps in their place, since nothing in Ply opens them.
+/// Raises, in the host's words, for an encoding `send_secret` does not write.
+pub fn sent_secret(
+  before: Bytes,
+  secret: Secret<Bytes>,
+  encoding: String,
+  after: Bytes,
+) -> Secret<Bytes> / {abort.raise} = {
+  let written = if encoding == "raw" { secret } else {
+    match try[abort.raise] { secret_encode(encoding, secret) } {
+      Ok(text) -> secret_bytes(text),
+      Err(_) -> panic("`net.send_secret` knows no encoding `" ++ encoding ++ "`"),
+    }
+  };
+  secret_concat(secret_concat(secret_of_bytes(before), written), secret_of_bytes(after))
+}
+
+/// What `net.send_secret` answers over the network: every byte or none, all of it sealed. The far
+/// end hears the credential in its frame, whole, as a `HearsSecret` waits for it, and
+/// `mem_sent_secrets` keeps it; nothing of it is in `mem_sent`. A credential is not handed to
+/// the program's own end, which would read it as plain bytes: a joined connection fails here,
+/// where a socket would deliver it.
+pub fn mem_send_secret(
+  n: MemNet,
+  label: String,
+  conn: Int,
+  before: Bytes,
+  secret: Secret<Bytes>,
+  encoding: String,
+  after: Bytes,
+  timeout_ms: Int,
+) -> Stepped<Bool> / {abort.raise} = {
+  deadline("send_secret", timeout_ms);
+  let framed = sent_secret(before, secret, encoding, after);
+  if secret_is_empty(framed) { panic("`net.send_secret` was given an empty payload") } else {
+    let c = listened(conn_of(n, label, conn));
+    if c.ended || c.gone { { net: with_conn(n, conn, c), answer: false } }
+    else if c.joined != None {
+      panic(
+        "the twin cannot hand a credential to the program's own end of socket "
+          ++ int_to_string(conn)
+          ++ ": nothing in Ply opens it",
+      )
+    } else {
+      let kept = { ..c, sealed: push(c.sealed, framed) };
+      match c.script {
+        [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: false },
+        [Hears(expected), ..] ->
+          panic(
+            "the peer was to hear \"" ++ string_of_bytes_lossy(expected)
+              ++ "\" and the program sent a credential",
+          ),
+        [HearsSecret(expected), ..rest] -> if secret_of_bytes(expected) == framed {
+          { net: with_conn(n, conn, listened({ ..kept, script: rest })), answer: true }
+        } else { panic("the peer was to hear one credential and the program sent another") },
+        _ -> { net: with_conn(n, conn, kept), answer: true },
+      }
+    }
+  }
+}
+
 /// The network with `bytes` waiting to be read at the other end of a joined connection.
 fn passed_on(n: MemNet, other: Option<Int>, bytes: Bytes) -> MemNet =
   match other {
@@ -1342,6 +1431,20 @@ pub fn on_mem<a | e>(
         cell_set(t, s.net);
         s.answer
       },
+      net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
+        let s = mem_send_secret(
+          cell_get(t),
+          label,
+          conn,
+          before,
+          secret,
+          encoding,
+          after,
+          timeout_ms,
+        );
+        cell_set(t, s.net);
+        s.answer
+      },
       net.close_write[*label](conn) -> cell_set(t, mem_close_write(cell_get(t), label, conn).net),
       net.close[*label](socket) -> cell_set(t, mem_close(cell_get(t), label, socket).net),
       net.set_option[*label](socket, option) -> {
@@ -1422,6 +1525,28 @@ test "send_all loops over a partial write and stops at a dead peer" {
   }
 }
 
+test "a credential goes on a connection whole and sealed, framed by what is said before and after it" {
+  let password = secret_of_bytes(b"\x00ada\x00hunter2");
+  let sent = with_cell[wire]([]) { wire -> {
+    let went = handle {
+      net.send_secret[smtp](1, b"AUTH PLAIN ", password, "base64", b"\r\n", 1000)
+    } with {
+      net.send_secret[smtp](c, before, secret, encoding, after, timeout_ms) -> {
+        cell_set(wire, push(cell_get(wire), sent_secret(before, secret, encoding, after)));
+        true
+      },
+    };
+    { went: went, wire: cell_get(wire) }
+  } };
+  assert(sent.went);
+  assert(sent.wire == [secret_of_bytes(b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n")]);
+  assert(sent_secret(b"", password, "raw", b"") == password);
+  assert(
+    sent_secret(b"user=", secret_of_bytes(b"\xff\x01"), "hex", b";")
+      == secret_of_bytes(b"user=ff01;"),
+  )
+}
+
 /// A network with one peer at `192.0.2.25:25` that answers one connection with `script`.
 fn relayed(script: List<Step>) -> MemNet / {ip.refused, abort.raise} =
   mem_serving(mem_empty(), ip::read_socket("192.0.2.25:25"), [script])
@@ -1461,6 +1586,77 @@ test "a program that sends what its peer was not to hear fails where it sends it
       net.send[relay](to_relay(), b"HELO x\r\n", 1000)).value
   };
   assert_eq(failed, Err("the peer was to hear \"EHLO x\r\n\" and the program sent \"HELO x\r\n\""))
+}
+
+fn plain_auth() -> Bytes = b"AUTH PLAIN AGFkYQBodW50ZXIy\r\n"
+
+test "a credential reaches the far end whole in its frame, and nothing that shows the connection holds it" {
+  let password = secret_of_bytes(b"\x00ada\x00hunter2");
+  let script = [
+    Says(b"220 ready\r\n"),
+    Hears(b"EHLO x\r\n"),
+    Says(b"250 AUTH PLAIN\r\n"),
+    HearsSecret(plain_auth()),
+    Says(b"235 ok\r\n"),
+  ];
+  let ran = on_mem(relayed(script), || {
+    let c = to_relay();
+    let greeting = net.recv[relay](c, 512, 1000);
+    let hello = send_all[relay](c, b"EHLO x\r\n", 1000);
+    let offer = net.recv[relay](c, 512, 1000);
+    let went = net.send_secret[relay](c, b"AUTH PLAIN ", password, "base64", b"\r\n", 1000);
+    let reply = net.recv[relay](c, 512, 1000);
+    net.close_write[relay](c);
+    let late = net.send_secret[relay](c, b"", password, "raw", b"", 1000);
+    net.close[relay](c);
+    { c: c, read: [greeting, offer, reply], hello: hello, went: went, late: late }
+  });
+  assert(ran.value.hello && ran.value.went && !ran.value.late);
+  assert_eq(ran.value.read, [
+    Some(b"220 ready\r\n"),
+    Some(b"250 AUTH PLAIN\r\n"),
+    Some(b"235 ok\r\n"),
+  ]);
+  assert_eq(mem_sent(ran.net, ran.value.c), b"EHLO x\r\n");
+  assert(mem_sent_secrets(ran.net, ran.value.c) == [secret_of_bytes(plain_auth())]);
+  assert_eq(mem_unmet(ran.net, ran.value.c), [])
+}
+
+test "a credential the peer was not to hear fails where it is sent, and says nothing of either" {
+  let sent = |script: List<Step>, encoding: String| {
+    let failed: Result<Bool, String> = try[abort.raise] {
+      on_mem(relayed(script), ||
+        net.send_secret[relay](
+          to_relay(),
+          b"AUTH PLAIN ",
+          secret_of_bytes(b"\x00ada\x00hunter2"),
+          encoding,
+          b"\r\n",
+          1000,
+        )).value
+    };
+    failed
+  };
+  assert_eq(sent([HearsSecret(plain_auth())], "base64"), Ok(true));
+  assert_eq(
+    sent([HearsSecret(plain_auth())], "raw"),
+    Err("the peer was to hear one credential and the program sent another"),
+  );
+  assert_eq(
+    sent([Hears(b"AUTH PLAIN\r\n")], "base64"),
+    Err("the peer was to hear \"AUTH PLAIN\r\n\" and the program sent a credential"),
+  );
+  assert_eq(sent([Says(b"220 ready\r\n")], "base64"), Ok(true));
+  assert_eq(sent([Blocks], "base64"), Ok(false));
+  assert_eq(sent([], "rot13"), Err("`net.send_secret` knows no encoding `rot13`"));
+  let pending: Result<Bool, String> = try[abort.raise] {
+    on_mem(relayed([HearsSecret(plain_auth())]), || {
+      let c = to_relay();
+      let _half = net.send[relay](c, b"AUTH", 1000);
+      net.send_secret[relay](c, b"", secret_of_bytes(plain_auth()), "raw", b"", 1000)
+    }).value
+  };
+  assert_eq(pending, Err("the peer was to hear a credential and the program sent \"AUTH\""))
 }
 
 test "a read and a write move no more than a short network lets them" {
@@ -1944,6 +2140,16 @@ test "the twin refuses {c.what} in the host's words" for c: { misuse: String, wh
       says: "`net.recv` was given a timeout of 0 milliseconds",
     },
     { misuse: "nothing", what: "an empty payload", says: "`net.send` was given an empty payload" },
+    {
+      misuse: "no secret",
+      what: "an empty credential in an empty frame",
+      says: "`net.send_secret` was given an empty payload",
+    },
+    {
+      misuse: "encoding",
+      what: "a credential in an encoding it does not write",
+      says: "`net.send_secret` knows no encoding `rot13`",
+    },
     { misuse: "none", what: "a read of no bytes", says: "`net.recv` was asked for 0 bytes" },
     {
       misuse: "listener",
@@ -1977,6 +2183,12 @@ test "the twin refuses {c.what} in the host's words" for c: { misuse: String, wh
         ()
       } else if c.misuse == "nothing" {
         let _sent = net.send[relay](conn, b"", 1000);
+        ()
+      } else if c.misuse == "no secret" {
+        let _sent = net.send_secret[relay](conn, b"", secret_of_bytes(b""), "raw", b"", 1000);
+        ()
+      } else if c.misuse == "encoding" {
+        let _sent = net.send_secret[relay](conn, b"", secret_of_bytes(b"k"), "rot13", b"", 1000);
         ()
       } else if c.misuse == "none" {
         let _read = net.recv[relay](conn, 0, 1000);

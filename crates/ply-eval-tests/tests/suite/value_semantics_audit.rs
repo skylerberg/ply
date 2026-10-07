@@ -47,12 +47,21 @@ pub fn deep(s: Secret<String>) -> Int = descend(2000, s)
 pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 10 + d
 "#;
 
+/// A credential, and its payload held apart, to count who else holds it.
+fn credential(text: &str) -> (Value, Arc<ply_eval::Sealed>) {
+    let secret = Value::secret_text(text);
+    let Value::Secret(payload) = &secret else {
+        unreachable!("a secret is a `Secret`")
+    };
+    let payload = Arc::clone(payload);
+    (secret, payload)
+}
+
 #[test]
 fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
     for arity in 1..=ARGUMENT_VECTOR_CLASSES + 1 {
-        let payload = Arc::new(Value::str("hunter2"));
-        let secret = Value::Secret(Arc::clone(&payload));
+        let (secret, payload) = credential("hunter2");
         let answered = compiled
             .answer_of(&format!("m.carry{arity}"), vec![secret])
             .unwrap_or_else(|d| panic!("`carry{arity}` raised: {d:#?}"));
@@ -69,8 +78,7 @@ fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
 #[test]
 fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
-    let payload = Arc::new(Value::str("hunter2"));
-    let secret = Value::Secret(Arc::clone(&payload));
+    let (secret, payload) = credential("hunter2");
     let answered = compiled
         .answer_of("m.deep", vec![secret])
         .unwrap_or_else(|d| panic!("`deep` raised: {d:#?}"));
@@ -86,7 +94,7 @@ fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
 fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments() {
     let compiled = Compiled::new(SECRET_ARGUMENTS);
     for _ in 0..64 {
-        let secret = Value::secret(Value::str("hunter2"));
+        let secret = Value::secret_text("hunter2");
         let _ = compiled
             .answer_of("m.carry4", vec![secret])
             .expect("`carry4` runs");
@@ -110,7 +118,7 @@ fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments()
 fn the_assertion_differ_never_descends_into_a_credential() {
     let hidden = "hunter2";
     let other = "correct-horse-battery-staple";
-    let secret = |s: &str| Value::secret(Value::str(s));
+    let secret = Value::secret_text;
     let record = |s: Value| {
         Value::Record(Arc::new(
             [(ply_eval::Symbol::new("password"), s)]
@@ -136,11 +144,6 @@ fn the_assertion_differ_never_descends_into_a_credential() {
             "as a map value",
             Value::map([(Value::str("ada"), secret(hidden))]),
             Value::map([(Value::str("ada"), secret(other))]),
-        ),
-        (
-            "wrapping a compound",
-            Value::secret(Value::list(vec![Value::str(hidden)])),
-            Value::secret(Value::list(vec![Value::str(other)])),
         ),
         (
             "a list against a shorter one",
@@ -388,8 +391,7 @@ test "one line, either way" {
 
 #[test]
 fn canonicalizing_a_key_clones_a_credential_rather_than_rebuilding_it() {
-    let payload = Arc::new(Value::str("hunter2"));
-    let secret = Value::Secret(Arc::clone(&payload));
+    let (secret, payload) = credential("hunter2");
     let key = Value::Record(Arc::new(
         [
             (ply_eval::Symbol::new("d"), {

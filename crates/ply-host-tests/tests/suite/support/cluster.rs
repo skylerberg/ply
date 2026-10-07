@@ -31,6 +31,18 @@ fn binary(name: &str) -> PathBuf {
     bin_dir().expect("postgres is installed").join(name)
 }
 
+/// The major version of the postgres a cluster runs.
+pub fn major() -> u32 {
+    let out = Command::new(binary("postgres"))
+        .arg("--version")
+        .output()
+        .expect("postgres runs");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    text.split_whitespace()
+        .find_map(|word| word.split('.').next()?.parse().ok())
+        .unwrap_or_else(|| panic!("`postgres --version` names no version: {text}"))
+}
+
 /// Whether this machine can run a cluster. CI promises one, so there a missing one fails the test
 /// that asked rather than skipping it.
 pub fn available() -> bool {
@@ -58,10 +70,27 @@ impl Cluster {
             database,
             &["--auth-local=trust", "--auth-host=scram-sha-256"],
             Some(password),
+            None,
         )
     }
 
-    fn launch(database: &str, auth: &[&str], password: Option<&str>) -> Cluster {
+    /// `start_with_password`'s cluster, speaking TLS with a certificate and its key (PEM) as well
+    /// as plaintext, so a client's `sslmode` decides which.
+    pub fn start_with_tls(database: &str, password: &str, certificate: &str, key: &str) -> Cluster {
+        Cluster::launch(
+            database,
+            &["--auth-local=trust", "--auth-host=scram-sha-256"],
+            Some(password),
+            Some((certificate, key)),
+        )
+    }
+
+    fn launch(
+        database: &str,
+        auth: &[&str],
+        password: Option<&str>,
+        tls: Option<(&str, &str)>,
+    ) -> Cluster {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let data = directory.path().join("data");
         let initdb = binary("initdb");
@@ -88,6 +117,26 @@ impl Cluster {
             String::from_utf8_lossy(&status.stderr)
         );
 
+        let mut secured = Vec::new();
+        if let Some((certificate, key)) = tls {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(data.join("server.crt"), certificate)
+                .expect("the certificate is written");
+            let key_file = data.join("server.key");
+            std::fs::write(&key_file, key).expect("the key is written");
+            // Postgres refuses a key that anyone but its owner can read.
+            std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o600))
+                .expect("the key is its owner's alone");
+            secured = vec![
+                "-c",
+                "ssl=on",
+                "-c",
+                "ssl_cert_file=server.crt",
+                "-c",
+                "ssl_key_file=server.key",
+            ];
+        }
+
         let port = free_port();
         let postgres = binary("postgres");
         // Run directly, not via `pg_ctl`, so the server is our child and dies with the harness.
@@ -108,6 +157,7 @@ impl Cluster {
                 "-c",
                 "synchronous_commit=off",
             ])
+            .args(secured)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

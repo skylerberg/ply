@@ -10,12 +10,12 @@ use std::sync::Arc;
 /// The client, entered once. Trust authentication, because the script decides the handshake.
 const CLIENT: &str = r#"
 import std.net (net)
-import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected)
+import std.pg (connect, simple_query, extended_query, finish, default_client, Answer, ClientError, client_error_text, server_text, Rejected, NoTls)
 import std.db (db, serve, server_of, stmt, transaction, is_retryable, Rows, Count, Failed, Serializable, ReadWrite)
 
 // The driver over the same script: what a connection string asks of every connection it opens.
 pub fn told(url: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) ->
@@ -28,8 +28,8 @@ pub fn told(url: String) -> Result<String, String>
   }
 
 pub fn ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
+  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -41,8 +41,8 @@ pub fn ask(host: String, port: Int) -> Result<String, String>
   }
 
 pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
+  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match extended_query[link](session, "select $1", [Some(value)], default_client()) {
       Err(e) -> Err(client_error_text(e)),
@@ -55,7 +55,7 @@ pub fn ask_with(host: String, port: Int, value: String) -> Result<String, String
 
 // A transaction the server refuses to commit, run again while the refusal says to.
 pub fn retried(url: String) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
   match server_of(url) {
     Err(why) -> Err(why),
     Ok(cfg) -> Ok(serve(cfg, 1, "test-nonce", || attempts(3, ""))),
@@ -75,8 +75,8 @@ fn attempts(left: Int, seen: String) -> String / {db.execute[items], db.abort, d
 // A refusal is not the end of the connection: the second query runs on the session the first
 // one came back with.
 pub fn refuse_then_ask(host: String, port: Int) -> Result<String, String>
-  / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match connect[link](host, port, "ply", "ply", [], None, "test-nonce", default_client()) {
+  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match connect[link](host, port, NoTls, "ply", "ply", [], None, "test-nonce", default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select nope", default_client()) {
       Ok(_) -> Err("the server accepted what it should have refused"),
@@ -99,8 +99,8 @@ pub fn ask_scram(
   user: String,
   password: String,
   nonce: String,
-) -> Result<String, String> / {net.connect[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
-  match connect[link](host, port, user, "ply", [], Some(password), nonce, default_client()) {
+) -> Result<String, String> / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], abort.raise, diverges} =
+  match connect[link](host, port, NoTls, user, "ply", [], Some(password), nonce, default_client()) {
     Err(e) -> Err(client_error_text(e)),
     Ok(session) -> match simple_query[link](session, "select 1", default_client()) {
       Err(e) -> Err(client_error_text(e)),

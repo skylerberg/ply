@@ -802,14 +802,11 @@ fn sequence(
   tables: Array<Int>,
   lits: Bytes,
   lp: Int,
-  out: Bytes,
-  r1: Int,
-  r2: Int,
-  r3: Int,
+  run: Run,
   left: Int,
   lim: Array<Int>,
 ) -> Run / {zstd.refused, abort.raise} =
-  if left <= 0 { ended(blk, floor, bit, lits, lp, out, r1, r2, r3, lim) } else {
+  if left <= 0 { ended(floor, bit, lits, lp, run, lim) } else {
     let le = array_get(tables, ls);
     let me = array_get(tables, ms);
     let oe = array_get(tables, os);
@@ -833,10 +830,7 @@ fn sequence(
         tables,
         lits,
         lp,
-        out,
-        r1,
-        r2,
-        r3,
+        run,
         left - 1,
         lim,
         (oe >>> 19) + (w >>> moves + lb + mb & (1 << ob) - 1),
@@ -854,10 +848,7 @@ fn sequence(
         tables,
         lits,
         lp,
-        out,
-        r1,
-        r2,
-        r3,
+        run,
         left - 1,
         lim,
         (oe >>> 19) + bits_at(blk, p + moves + lb + mb, ob),
@@ -878,10 +869,7 @@ fn placed(
   tables: Array<Int>,
   lits: Bytes,
   lp: Int,
-  out: Bytes,
-  r1: Int,
-  r2: Int,
-  r3: Int,
+  run: Run,
   left: Int,
   lim: Array<Int>,
   offset: Int,
@@ -892,12 +880,12 @@ fn placed(
   // Which earlier offset: none, the first, second or third, or the first less one.
   let labelled = if offset > 3 { 0 } else if count == 0 { offset + 1 } else { offset };
   let dist = if labelled == 0 { offset - 3 }
-  else if labelled == 1 { r1 }
-  else if labelled == 2 { r2 }
-  else if labelled == 3 { r3 }
-  else { r1 - 1 };
+  else if labelled == 1 { run.r1 }
+  else if labelled == 2 { run.r2 }
+  else if labelled == 3 { run.r3 }
+  else { run.r1 - 1 };
   if lp + count > bytes_len(lits) { refuse(array_get(lim, 4), Sequences) } else {
-    let lit = if count == 0 { out } else { out ++ bytes_slice(lits, lp, lp + count) };
+    let lit = if count == 0 { run.out } else { run.out ++ bytes_slice(lits, lp, lp + count) };
     let n = bytes_len(lit);
     if n + length > array_get(lim, 0) { refuse(array_get(lim, 4), over(lim)) }
     else if dist <= 0 || dist > n - array_get(lim, 1)
@@ -914,11 +902,13 @@ fn placed(
         tables,
         lits,
         lp + count,
-        if dist >= length { lit ++ bytes_slice(lit, n - dist, n - dist + length) }
-        else { lit ++ cycle(bytes_slice(lit, n - dist, n), length) },
-        dist,
-        if labelled == 1 { r2 } else { r1 },
-        if labelled == 1 || labelled == 2 { r3 } else { r2 },
+        {
+          out: if dist >= length { lit ++ bytes_slice(lit, n - dist, n - dist + length) }
+          else { lit ++ cycle(bytes_slice(lit, n - dist, n), length) },
+          r1: dist,
+          r2: if labelled == 1 { run.r2 } else { run.r1 },
+          r3: if labelled == 1 || labelled == 2 { run.r3 } else { run.r2 },
+        },
         left,
         lim,
       )
@@ -928,21 +918,17 @@ fn placed(
 
 /// After a block's last sequence its bits are spent, and the literals no sequence took follow.
 fn ended(
-  blk: Bytes,
   floor: Int,
   bit: Int,
   lits: Bytes,
   lp: Int,
-  out: Bytes,
-  r1: Int,
-  r2: Int,
-  r3: Int,
+  run: Run,
   lim: Array<Int>,
 ) -> Run / {zstd.refused, abort.raise} =
   if bit != floor { refuse(array_get(lim, 4), Sequences) }
-  else if bytes_len(out) + bytes_len(lits) - lp > array_get(lim, 0) {
+  else if bytes_len(run.out) + bytes_len(lits) - lp > array_get(lim, 0) {
     refuse(array_get(lim, 4), over(lim))
-  } else { { out: out ++ bytes_slice(lits, lp, bytes_len(lits)), r1: r1, r2: r2, r3: r3 } }
+  } else { { ..run, out: run.out ++ bytes_slice(lits, lp, bytes_len(lits)) } }
 
 // --- Blocks -----------------------------------------------------------------
 
@@ -1022,10 +1008,7 @@ fn compressed(
             tables,
             lits.bytes,
             0,
-            hist,
-            e.r1,
-            e.r2,
-            e.r3,
+            { out: hist, r1: e.r1, r2: e.r2, r3: e.r3 },
             count,
             lim,
           );
@@ -1305,24 +1288,27 @@ fn block(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} =
     let need = 3 + (if kind == 1 { 1 } else { size });
     if kind == 3 { refuse(where, BlockType) }
     else if size > most { refuse(where, BlockSize) }
-    else if have < need { starved(d, need) } else {
-      let input = d.input;
-      let hist = d.hist;
-      let before = bytes_len(hist);
+    // Not `starved`: a whole read of `d` would leave `core` shared and copy the tables each block.
+    else if have < need { { ..d, core: { ..core, need: need } } } else {
+      let before = bytes_len(d.hist);
       let room = core.limits.output - core.made - (before - frame.origin);
       let blocked: Blocked = if kind == 0 {
-        if size > room { refuse(where, OverLimit) }
-        else { { hist: hist ++ bytes_slice(input, at + 3, at + 3 + size), entropy: core.entropy } }
+        if size > room { refuse(where, OverLimit) } else {
+          { hist: d.hist ++ bytes_slice(d.input, at + 3, at + 3 + size), entropy: core.entropy }
+        }
       } else if kind == 1 {
         if size > room { refuse(where, OverLimit) } else {
-          { hist: hist ++ cycle(bytes_slice(input, at + 3, at + 4), size), entropy: core.entropy }
+          {
+            hist: d.hist ++ cycle(bytes_slice(d.input, at + 3, at + 4), size),
+            entropy: core.entropy,
+          }
         }
       } else {
         compressed(
-          padded(input, at + 3, at + 3 + size),
+          padded(d.input, at + 3, at + 3 + size),
           size,
           core.entropy,
-          hist,
+          d.hist,
           array_of_list([
             before + min(most, room),
             frame.origin - frame.reach,
@@ -1333,20 +1319,19 @@ fn block(d: Decoder, have: Int) -> Decoder / {zstd.refused, abort.raise} =
           ]),
         )
       };
-      let entropy = blocked.entropy;
-      let grown = blocked.hist;
       let sum = match frame.sum {
-        Some(state) -> Some(checksum::update(state, bytes_slice(grown, before, bytes_len(grown)))),
+        Some(state) ->
+          Some(checksum::update(state, bytes_slice(blocked.hist, before, bytes_len(blocked.hist)))),
         None -> None,
       };
       let moved = {
-        input: input,
-        hist: grown,
+        ..d,
+        hist: blocked.hist,
         core: {
           ..core,
           at: at + need,
           need: 0,
-          entropy: entropy,
+          entropy: blocked.entropy,
           frame: { ..frame, sum: sum },
           phase: if head & 1 == 0 { 1 } else { 2 },
         },
@@ -2271,24 +2256,18 @@ type Pressed = { out: Bytes, next: Encoder }
 /// again.
 fn pressed(w: Encoder, chunk: Bytes, level: Level) -> Pressed / {abort.raise} = {
   let sum = checksum::update(w.sum, chunk);
-  let from = w.from;
-  let shift = w.shift;
-  let packer = w.packer;
   let buf = bytes_concat(w.buf, chunk);
-  let whole = (bytes_len(buf) - from) / 131072 * 131072;
-  if whole == 0 {
-    { out: b"", next: { buf: buf, from: from, shift: shift, sum: sum, packer: packer } }
-  } else {
-    let done = blocks_written(buf, from, from + whole, shift, false, level, packer, []);
-    let out = bytes_concat_all(done.out);
-    let at = from + whole;
+  let whole = (bytes_len(buf) - w.from) / 131072 * 131072;
+  if whole == 0 { { out: b"", next: { ..w, buf: buf, sum: sum } } } else {
+    let done = blocks_written(buf, w.from, w.from + whole, w.shift, false, level, w.packer, []);
+    let at = w.from + whole;
     let cut = if at > 4194304 { at - 2097152 } else { 0 };
     {
-      out: out,
+      out: bytes_concat_all(done.out),
       next: {
         buf: if cut == 0 { buf } else { bytes_slice(buf, cut, bytes_len(buf)) },
         from: at - cut,
-        shift: shift + cut,
+        shift: w.shift + cut,
         sum: sum,
         packer: done.packer,
       },
@@ -2610,4 +2589,21 @@ test "64 KiB of text takes under two steps a byte to unpack and check, and under
   assert(packed.steps < 4 * 65536, Some(int_to_string(packed.steps)));
   let read = metered(|| decompress(packed.value, roomy()));
   assert(read.steps < 2 * 65536, Some(int_to_string(read.steps)))
+}
+
+test "64 KiB of short matches unpacks without a copy of the output for each" {
+  let picks = noise(11000);
+  let text = bytes_slice(
+    bytes_concat_all(
+      map(range(0, 11000), |i: Int| {
+        let k = (bytes_at(picks, i) & 15) * 4;
+        bytes_slice(sentence(), k, k + 6)
+      }),
+    ),
+    0,
+    65536,
+  );
+  let packed = compress(text, Fast);
+  let read = metered(|| decompress(packed, roomy()));
+  assert(read.bytes < 128 * 65536, Some(int_to_string(read.bytes)))
 }
