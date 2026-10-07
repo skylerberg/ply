@@ -55,16 +55,16 @@ pub enum Fun {
     Named(String),
     Anonymous,
     Const {
-        arity: usize,
+        arity: u8,
         value: Box<Plain>,
     },
     Project {
-        arity: usize,
-        index: usize,
+        arity: u8,
+        index: u8,
     },
     /// The first entry whose key equals the first argument, else `default`.
     Table {
-        arity: usize,
+        arity: u8,
         entries: Vec<(Plain, Plain)>,
         default: Box<Plain>,
     },
@@ -172,7 +172,7 @@ fn pairs(entries: Vec<(Plain, Plain)>) -> Result<Vec<(Value, Value)>, &'static s
         .collect()
 }
 
-fn synth(arity: usize, rule: Synth) -> Value {
+fn synth(arity: u8, rule: Synth) -> Value {
     Value::Closure(Arc::new(Closure {
         name: None,
         kind: ClosureKind::Synth { arity, rule },

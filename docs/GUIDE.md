@@ -1400,10 +1400,12 @@ part of its argument hands its caller a part.
 A function handed to `map`, `filter` or `fold` is called with each element, and
 one handed to `map_fold` with each key and value; one handed to a definition
 outside the group is called as that definition calls it, with the parts of its
-arguments it hands on; a function an `if` chooses is handed on as each branch
-is; and a lambda bound by `let` is read where it is called, eight lambdas deep
-at most. A member of the group handed anywhere else, or one called from a
-lambda whose calls the checker cannot see, is called with nothing known.
+arguments it hands on, where a function that definition hands on as it took it,
+in the same place, to its own recursion is called as each call down that
+recursion calls it; a function an `if` chooses is handed on as each branch is;
+and a lambda bound by `let` is read where it is called, eight lambdas deep at
+most. A member of the group handed anywhere else, or one called from a lambda
+whose calls the checker cannot see, is called with nothing known.
 
 A definition whose group descends ends, and so does one calling only
 definitions that end. Any other may not return, and its row says so with the
