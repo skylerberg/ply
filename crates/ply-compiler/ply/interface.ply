@@ -19,7 +19,8 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_inter
 import infer (DefInfo, test_owner)
 import rewrite (has_tagged, has_statements)
 import types (Scheme, canonical_scheme)
-import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile, EmbedWant, embed_key, wants_by_item)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile, EmbedWant, ItemWants, embed_key,
+              wants_by_item)
 import items (parse)
 import resolve (qualify)
 
@@ -201,11 +202,14 @@ fn embedders(analysis: Analysis, sources: List<Original>) -> Embedders / {abort.
     match map_get(texts, module) {
       None -> { ..acc, modules: noted(acc.modules, module, every) },
       Some(src) -> {
-        let asked = wants_by_item(parse(src).node);
+        let asked = match map_get(analysis.embed_items, module) {
+          Some(items) -> items,
+          None -> wants_by_item(parse(src).node),
+        };
         let named = fold(
           asked,
           { into: acc, seen: map_new() },
-          |a: { into: Embedders, seen: Map<Bytes, Bool> }, item: { name: Option<Bytes>, wants: List<EmbedWant> }| {
+          |a: { into: Embedders, seen: Map<Bytes, Bool> }, item: ItemWants| {
             let held = fold(item.wants, [], |xs: List<Reached>, want: EmbedWant|
               match map_get(read, embed_slot(module, embed_key(want))) {
                 Some(r) -> push(xs, r),
@@ -532,6 +536,12 @@ pub fn kept_modules(
     match map_get(originals, name) { Some(o) -> module_key(o), None -> b"" };
   let e = embedders(analysis, sources);
   let reachers = embed_reachers(analysis, e);
+  let now = fold(analysis.embeds, map_new(), |acc: Map<Bytes, Bytes>, x: EmbedAt|
+    map_insert(acc, embed_slot(x.module, x.key), read_key(x.read)));
+  // A module read through `through` whose every reach has its key yet reaches what it did.
+  let stands = |m: CompiledModule|
+    fold(m.reaches, true, |all: Bool, r: Reached|
+      all && (match map_get(now, r.name) { Some(k) -> k, None -> keyed(r.name) }) == r.key);
   let fresh = map_fold(members, map_new(), |acc: Map<Bytes, Bool>, name: Bytes, b: Bool|
     if map_contains(read, name) { acc } else { map_insert(acc, name, true) });
   let applied = fold(through, [], |acc: List<Fixed>, package: CompiledPackage|
@@ -543,7 +553,8 @@ pub fn kept_modules(
     modules: map(filter(range(0, len(names)), kept), |i: Int| {
       let name = at(names, i);
       match map_get(read, name) {
-        Some(m) -> { ..m, stub: b"", reaches: reached_from(analysis, keyed, e, reachers, i) },
+        Some(m) -> if stands(m) { { ..m, stub: b"" } }
+        else { { ..m, stub: b"", reaches: reached_from(analysis, keyed, e, reachers, i) } },
         None ->
           {
             name: name,
@@ -699,6 +710,20 @@ pub fn valid_part(
     tests: filter(package.tests, |t: FixedTest| map_contains(standing, t.module)),
     laws: filter(package.laws, |l: FixedLaw| map_contains(standing, l.module)),
   }
+}
+
+/// What `name` hashes to where its module stands in `through`: everything the module reaches
+/// stands, or is a shipped module that only gained definitions, so it hashes as it was kept.
+pub fn standing_hash(through: List<CompiledPackage>, name: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let module = module_of(name);
+  fold(through, None, |acc: Option<Bytes>, p: CompiledPackage|
+    match acc {
+      Some(_) -> acc,
+      None -> if !contains(map(p.modules, |m: CompiledModule| m.name), module) { None } else {
+        fold(p.fixed, None, |found: Option<Bytes>, f: Fixed|
+          if f.name == name { Some(f.hash) } else { found })
+      },
+    })
 }
 
 /// Each shipped module of `package` whose text moved but whose every definition and declaration the

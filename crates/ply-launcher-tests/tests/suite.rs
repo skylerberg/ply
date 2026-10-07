@@ -410,3 +410,51 @@ fn a_program_built_through_what_its_last_build_kept_is_the_program() {
     assert_eq!(answer_of(&second), ply_eval::Value::Int(10));
     assert_eq!(answer_of(&third), ply_eval::Value::Int(12));
 }
+
+/// A build whose entry's module stands as the last build kept it, with all that module reaches,
+/// takes the program that build made without reading the rest: a module beside it that no longer
+/// parses is not read. One the entry reaches that moved is read and built.
+#[test]
+fn a_build_whose_entry_stands_takes_its_program_without_reading_the_rest() {
+    let id = std::process::id();
+    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-entry-{id}"));
+    let src = stage.join("src");
+    std::fs::create_dir_all(&src).expect("the sources' directory");
+    let lib = |n: i64| {
+        std::fs::write(
+            src.join("lib.ply"),
+            format!("pub fn n() -> Int = {n} + {id} - {id}\n"),
+        )
+        .expect("the library is written")
+    };
+    lib(1);
+    std::fs::write(
+        src.join("m.ply"),
+        "import lib\n\npub fn main() -> Int = lib::n() + 1\n",
+    )
+    .expect("the entry's module is written");
+    std::fs::write(src.join("aside.ply"), "pub fn aside() -> Int = 3\n")
+        .expect("the module beside it is written");
+    let rows = format!("kept-entry-test-{id}");
+    let build = |name: &str| {
+        let out = stage.join(name);
+        ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
+            .map(|()| std::fs::read(&out).expect("the runnable is read"))
+    };
+    let first = build("first.run").unwrap_or_else(|d| panic!("the first build builds: {d}"));
+    std::fs::write(src.join("aside.ply"), "pub fn aside( -> \n")
+        .expect("the module beside it is broken");
+    let standing = build("standing.run");
+    lib(2);
+    let moved = build("moved.run");
+    let _ = std::fs::remove_dir_all(&stage);
+    assert_eq!(answer_of(&first), ply_eval::Value::Int(2));
+    assert!(
+        standing.as_ref().is_ok_and(|bytes| *bytes == first),
+        "a build whose entry stands takes the program it made, reading nothing else"
+    );
+    assert!(
+        moved.is_err(),
+        "a build whose entry reaches a moved module reads the program, the broken module with it"
+    );
+}
