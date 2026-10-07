@@ -93,10 +93,11 @@ fn table() -> List<Route<Endpoint>> =
     { method: Post, path: [Param("name"), Param("version"), Literal("yank")], endpoint: Yank },
   ]
 
-/// One request, answered from the store and the run's configuration and from nothing else.
-pub fn answer(
+/// One request, answered from the store and the run's configuration and from nothing else. A
+/// write's body is read whole, and refused past the bound `limits` sets.
+pub fn answer<| e>(
   req: Request,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
+) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], http::Reading} =
   match router::route(table(), req.method, req.path) {
     NotFound -> text_response(404, "no such resource\n"),
     MethodNotAllowed(ms) -> method_not_allowed(ms),
@@ -155,22 +156,27 @@ pub fn answer(
     },
   }
 
-fn not_a_version() -> Response = text_response(404, "that is not a version such as `0.1.0`\n")
+fn not_a_version<| e>() -> Response<| e> =
+  text_response(404, "that is not a version such as `0.1.0`\n")
 
-fn file(body: Option<Bytes>, kind: String) -> Response =
+fn file<| e>(body: Option<Bytes>, kind: String) -> Response<| e> =
   match body {
     None -> text_response(404, "no such resource\n"),
     Some(b) ->
-      { status: 200, headers: set_header(http::empty_headers(), "content-type", kind), body: b },
+      {
+        status: 200,
+        headers: set_header(http::empty_headers(), "content-type", kind),
+        body: http::Whole(b),
+      },
   }
 
-fn refusal(r: Refusal) -> Response = {
+fn refusal<| e>(r: Refusal) -> Response<| e> = {
   let base = text_response(r.status, r.reason ++ "\n");
   if r.status == 401 { { ..base, headers: set_header(base.headers, "www-authenticate", "Bearer") } }
   else { base }
 }
 
-fn trouble(t: Trouble, name: String, version: Version) -> Response =
+fn trouble<| e>(t: Trouble, name: String, version: Version) -> Response<| e> =
   match t {
     Busy -> text_response(503, "another write to `" ++ name ++ "` holds its lock; try again\n"),
     Unreadable(why) -> text_response(500, why ++ "\n"),
@@ -185,42 +191,46 @@ fn trouble(t: Trouble, name: String, version: Version) -> Response =
       text_response(404, "`" ++ name ++ "` " ++ render_version(version) ++ " is not published\n"),
   }
 
-fn publish(
+fn publish<| e>(
   req: Request,
   name: String,
   version: Version,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
+) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], http::Reading} =
   match allowed(name, req.headers) {
     Err(r) -> refusal(r),
-    Ok(_) -> match judged(name, version, http::header(req.headers, "x-ply-digest"), req.body) {
-      Err(r) -> refusal(r),
-      Ok(release) -> match published(name, release, req.body) {
-        Err(t) -> trouble(t, name, version),
-        Ok(kept) -> if kept.fresh {
-          let _ = config.get[server]("attest.key") != None && marked(name, render_version(version));
-          text_response(
-            201,
-            "published `" ++ name ++ "` " ++ render_version(version) ++ " as " ++ release.digest
-              ++ "\n",
-          )
-        } else {
-          text_response(
-            200,
-            "`" ++ name ++ "` " ++ render_version(version) ++ " is already published as "
-              ++ release.digest
-              ++ "\n",
-          )
+    Ok(_) -> {
+      let body = http::request_body(req, limits().max_body);
+      match judged(name, version, http::header(req.headers, "x-ply-digest"), body) {
+        Err(r) -> refusal(r),
+        Ok(release) -> match published(name, release, body) {
+          Err(t) -> trouble(t, name, version),
+          Ok(kept) -> if kept.fresh {
+            let _ = config.get[server]("attest.key") != None
+              && marked(name, render_version(version));
+            text_response(
+              201,
+              "published `" ++ name ++ "` " ++ render_version(version) ++ " as " ++ release.digest
+                ++ "\n",
+            )
+          } else {
+            text_response(
+              200,
+              "`" ++ name ++ "` " ++ render_version(version) ++ " is already published as "
+                ++ release.digest
+                ++ "\n",
+            )
+          },
         },
-      },
+      }
     },
   }
 
-fn interface(
+fn interface<| e>(
   req: Request,
   name: String,
   version: Version,
   semantics: String,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
+) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], http::Reading} =
   match allowed(name, req.headers) {
     Err(r) -> refusal(r),
     Ok(_) -> match index_of(name) {
@@ -228,38 +238,41 @@ fn interface(
       Ok(None) -> trouble(Absent, name, version),
       Ok(Some(x)) -> match release_at(x, version) {
         None -> trouble(Absent, name, version),
-        Some(r) -> match judged_interface(semantics, r.digest, req.body) {
-          Err(refused) -> refusal(refused),
-          Ok(_) -> match interfaced(name, version, semantics, req.body) {
-            Err(Exists) ->
-              text_response(
-                409,
-                "`" ++ name ++ "` " ++ render_version(version)
-                  ++ " already has another interface under "
-                  ++ semantics
-                  ++ ", and an interface is what its archive and semantics make\n",
-              ),
-            Err(t) -> trouble(t, name, version),
-            Ok(fresh) ->
-              text_response(
-                if fresh { 201 } else { 200 },
-                "the interface of `" ++ name ++ "` " ++ render_version(version) ++ " under "
-                  ++ semantics
-                  ++ (if fresh { " is kept" } else { " is already kept" })
-                  ++ "\n",
-              ),
-          },
+        Some(r) -> {
+          let body = http::request_body(req, limits().max_body);
+          match judged_interface(semantics, r.digest, body) {
+            Err(refused) -> refusal(refused),
+            Ok(_) -> match interfaced(name, version, semantics, body) {
+              Err(Exists) ->
+                text_response(
+                  409,
+                  "`" ++ name ++ "` " ++ render_version(version)
+                    ++ " already has another interface under "
+                    ++ semantics
+                    ++ ", and an interface is what its archive and semantics make\n",
+                ),
+              Err(t) -> trouble(t, name, version),
+              Ok(fresh) ->
+                text_response(
+                  if fresh { 201 } else { 200 },
+                  "the interface of `" ++ name ++ "` " ++ render_version(version) ++ " under "
+                    ++ semantics
+                    ++ (if fresh { " is kept" } else { " is already kept" })
+                    ++ "\n",
+                ),
+            },
+          }
         },
       },
     },
   }
 
-fn attestation(
+fn attestation<| e>(
   req: Request,
   name: String,
   version: Version,
   semantics: String,
-) -> Response / {config.get[server], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], abort.raise} =
+) -> Response<| e> / {config.get[server], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], http::Reading} =
   match config.get[server]("attester") {
     None -> text_response(403, "this registry keeps no attestations: it names no `attester`\n"),
     Some(hex) -> match index_of(name) {
@@ -267,35 +280,31 @@ fn attestation(
       Ok(None) -> trouble(Absent, name, version),
       Ok(Some(x)) -> match release_at(x, version) {
         None -> trouble(Absent, name, version),
-        Some(r) -> match judged_attestation(
-            name,
-            version,
-            semantics,
-            r.digest,
-            bytes_of_hex(hex),
-            req.body,
-          ) {
-          Err(refused) -> refusal(refused),
-          Ok(_) -> match attestation_kept(name, version, semantics, req.body) {
-            Err(t) -> trouble(t, name, version),
-            Ok(_) ->
-              text_response(
-                201,
-                "the attestation of `" ++ name ++ "` " ++ render_version(version) ++ " under "
-                  ++ semantics
-                  ++ " is kept\n",
-              ),
-          },
+        Some(r) -> {
+          let body = http::request_body(req, limits().max_body);
+          match judged_attestation(name, version, semantics, r.digest, bytes_of_hex(hex), body) {
+            Err(refused) -> refusal(refused),
+            Ok(_) -> match attestation_kept(name, version, semantics, body) {
+              Err(t) -> trouble(t, name, version),
+              Ok(_) ->
+                text_response(
+                  201,
+                  "the attestation of `" ++ name ++ "` " ++ render_version(version) ++ " under "
+                    ++ semantics
+                    ++ " is kept\n",
+                ),
+            },
+          }
         },
       },
     },
   }
 
-fn yanked(
+fn yanked<| e>(
   req: Request,
   name: String,
   version: Version,
-) -> Response / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
+) -> Response<| e> / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], abort.raise} =
   match allowed(name, req.headers) {
     Err(r) -> refusal(r),
     Ok(_) -> match yank(name, version) {
@@ -326,7 +335,7 @@ fn port() -> Int / {config.get[server], abort.raise} =
 fn accepting(
   listener: Int,
   running: Option<Int>,
-) -> Unit / {config.get[server], config.secret[tokens], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], net.close[conn], net.peer_address[conn], net.recv[conn], net.send[conn], net.accept[listener], process.wait[attest], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], config.get[env], abort.raise, diverges} = {
+) -> Unit / {config.get[server], config.secret[tokens], fs.read_file[store], fs.create_dir[store], fs.lock[store], fs.rename[store], fs.unlock[store], fs.write_file[store], net.close[conn], net.peer_address[conn], net.peer_certificate[conn], net.recv[conn], net.send[conn], net.accept[listener], process.wait[attest], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], config.get[env], abort.raise, diverges} = {
   let c = net.accept[listener](listener);
   if c == 0 { () } else {
     http::serve_connection[conn](c, limits(), answer);
@@ -372,7 +381,7 @@ fn started() -> Option<Int> / {config.get[server], fs.list_dir[store], fs.remove
     _ -> None,
   }
 
-fn main() -> Unit / {config.get[server], config.secret[tokens], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener], net.peer_address[conn], net.recv[conn], net.send[conn], net.close[conn], fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.get[env], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], process.wait[attest], abort.raise, diverges} = {
+fn main() -> Unit / {config.get[server], config.secret[tokens], net.listen[listener], net.listen_tls[listener], net.accept[listener], net.close[listener], net.peer_address[conn], net.peer_certificate[conn], net.recv[conn], net.send[conn], net.close[conn], fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.get[env], fs.list_dir[store], fs.remove[store], process.bound[attest], process.start[attest], process.wait[attest], abort.raise, diverges} = {
   let listener = match config.get[server]("tls") {
     None -> net.listen[listener](port()),
     Some(credential) -> net.listen_tls[listener](port(), credential),
@@ -398,9 +407,26 @@ fn written(
   { ..req, headers: if digest == "" { authed } else { set_header(authed, "x-ply-digest", digest) } }
 }
 
-fn statuses(rs: List<Response>) -> List<Int> = map(rs, |r: Response| r.status)
+/// An answer with its body read whole.
+type Answered = { status: Int, headers: http::Headers, body: Bytes }
 
-fn index_in(r: Response) -> Index / {abort.raise} =
+/// What `answer` answers `req` with, called as a server calls it on a request whose body is whole.
+fn asked(
+  req: Request,
+) -> Answered / {fs.read_file[store], fs.write_file[store], fs.create_dir[store], fs.rename[store], fs.lock[store], fs.unlock[store], config.secret[tokens], config.get[server], abort.raise} =
+  match http::read_whole(http::empty_headers(), || answer(req)) {
+    Ok(r) -> { status: r.status, headers: r.headers, body: http::whole_bytes(r.body) },
+    Err(refused) ->
+      {
+        status: refused.status,
+        headers: http::empty_headers(),
+        body: bytes_of_string(refused.reason),
+      },
+  }
+
+fn statuses(rs: List<Answered>) -> List<Int> = map(rs, |r: Answered| r.status)
+
+fn index_in(r: Answered) -> Index / {abort.raise} =
   match decode_bytes(r.body, index_json()) {
     Ok(x) -> x,
     Err(_) -> panic("the index does not read"),
@@ -412,11 +438,11 @@ test "a publish is served back as the static layout a resolve reads" {
   let ran = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
-        answer(get("/orders/index.json")),
-        answer(get("/orders/0.2.0/package.plyz")),
-        answer(get("/orders/0.2.0/package.plyz.b3")),
-        answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
+        asked(written(Put, "/orders/0.2.0", "t0k", d, body)),
+        asked(get("/orders/index.json")),
+        asked(get("/orders/0.2.0/package.plyz")),
+        asked(get("/orders/0.2.0/package.plyz.b3")),
+        asked(written(Put, "/orders/0.2.0", "t0k", d, body)),
       ]));
   assert_eq(statuses(ran.value), [201, 200, 200, 200, 200]);
   let listed = index_in(at(ran.value, 1));
@@ -435,16 +461,16 @@ test "an interface is kept beside its version under its semantics, and served ba
   let ran = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
-        answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
-        answer(written(Put, "/orders/0.2.0/interface/ab12", "", d, framed(b"one"))),
-        answer(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
-        answer(get("/orders/0.2.0/interface/ab12")),
-        answer(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
-        answer(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"two"))),
-        answer(written(Put, "/orders/0.2.0/interface/cd34", "t0k", d, framed(b"one"))),
-        answer(get("/orders/0.2.0/interface/..")),
-        answer(get("/orders/0.2.0/interface/cd34")),
+        asked(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
+        asked(written(Put, "/orders/0.2.0", "t0k", d, body)),
+        asked(written(Put, "/orders/0.2.0/interface/ab12", "", d, framed(b"one"))),
+        asked(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
+        asked(get("/orders/0.2.0/interface/ab12")),
+        asked(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"one"))),
+        asked(written(Put, "/orders/0.2.0/interface/ab12", "t0k", d, framed(b"two"))),
+        asked(written(Put, "/orders/0.2.0/interface/cd34", "t0k", d, framed(b"one"))),
+        asked(get("/orders/0.2.0/interface/..")),
+        asked(get("/orders/0.2.0/interface/cd34")),
       ]));
   assert_eq(statuses(ran.value), [404, 201, 401, 201, 200, 200, 409, 422, 404, 404]);
   assert_eq(at(ran.value, 4).body, framed(b"one"))
@@ -483,8 +509,8 @@ test "an attestation is kept when the registry's attester signed it, and a publi
       [{ key: "attester", value: attester }, { key: "attest.key", value: "attester.key" }],
       ||
         [
-          answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
-          answer(
+          asked(written(Put, "/orders/0.2.0", "t0k", d, body)),
+          asked(
             written(
               Put,
               "/orders/0.2.0/attestation/ab12",
@@ -493,7 +519,7 @@ test "an attestation is kept when the registry's attester signed it, and a publi
               signed_by(a_seed(2), an_attestation(d)),
             ),
           ),
-          answer(
+          asked(
             written(
               Put,
               "/orders/0.2.0/attestation/ab12",
@@ -502,7 +528,7 @@ test "an attestation is kept when the registry's attester signed it, and a publi
               signed_by(a_seed(1), an_attestation("b3:other")),
             ),
           ),
-          answer(
+          asked(
             written(
               Put,
               "/orders/0.2.0/attestation/ab12",
@@ -511,7 +537,7 @@ test "an attestation is kept when the registry's attester signed it, and a publi
               signed_by(a_seed(1), an_attestation(d)),
             ),
           ),
-          answer(get("/orders/0.2.0/attestation/ab12")),
+          asked(get("/orders/0.2.0/attestation/ab12")),
         ],
     ));
   assert_eq(statuses(ran.value), [201, 403, 422, 201, 200]);
@@ -520,8 +546,8 @@ test "an attestation is kept when the registry's attester signed it, and a publi
   let bare = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(written(Put, "/orders/0.2.0", "t0k", d, body)),
-        answer(
+        asked(written(Put, "/orders/0.2.0", "t0k", d, body)),
+        asked(
           written(
             Put,
             "/orders/0.2.0/attestation/ab12",
@@ -541,11 +567,11 @@ test "a write without a token, under another's, or with a digest its body does n
   let ran = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(written(Put, "/orders/0.2.0", "", d, body)),
-        answer(written(Put, "/orders/0.2.0", "m0n", d, body)),
-        answer(written(Put, "/orders/0.2.0", "t0k", "b3:00", body)),
-        answer(written(Put, "/orders/0.2.0", "t0k", "", body)),
-        answer(written(Put, "/orders/0.3.0", "t0k", d, body)),
+        asked(written(Put, "/orders/0.2.0", "", d, body)),
+        asked(written(Put, "/orders/0.2.0", "m0n", d, body)),
+        asked(written(Put, "/orders/0.2.0", "t0k", "b3:00", body)),
+        asked(written(Put, "/orders/0.2.0", "t0k", "", body)),
+        asked(written(Put, "/orders/0.3.0", "t0k", d, body)),
       ]));
   assert_eq(statuses(ran.value), [401, 403, 422, 400, 422]);
   assert_eq(http::header(at(ran.value, 0).headers, "www-authenticate"), Some("Bearer"));
@@ -557,12 +583,12 @@ test "a yank is one field of the index, made under the package's token" {
   let ran = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(written(Put, "/orders/0.2.0", "t0k", archive_digest(body), body)),
-        answer(written(Post, "/orders/0.2.0/yank", "m0n", "", b"")),
-        answer(written(Post, "/orders/0.2.0/yank", "t0k", "", b"")),
-        answer(written(Post, "/orders/0.9.0/yank", "t0k", "", b"")),
-        answer(get("/orders/index.json")),
-        answer(get("/orders/0.2.0/package.plyz")),
+        asked(written(Put, "/orders/0.2.0", "t0k", archive_digest(body), body)),
+        asked(written(Post, "/orders/0.2.0/yank", "m0n", "", b"")),
+        asked(written(Post, "/orders/0.2.0/yank", "t0k", "", b"")),
+        asked(written(Post, "/orders/0.9.0/yank", "t0k", "", b"")),
+        asked(get("/orders/index.json")),
+        asked(get("/orders/0.2.0/package.plyz")),
       ]));
   assert_eq(statuses(ran.value), [201, 403, 200, 404, 200, 200]);
   assert_eq(map(index_in(at(ran.value, 4)).versions, |release: Release| release.yanked), [true]);
@@ -573,11 +599,11 @@ test "a path the layout does not hold is 404, and a method it does not take is 4
   let ran = twin::over(fs::mem_empty(), ||
     twin::configured(||
       [
-        answer(get("/orders/index.json")),
-        answer(get("/orders")),
-        answer(get("/Orders/index.json")),
-        answer(get("/orders/latest/package.plyz")),
-        answer(written(Delete, "/orders/0.2.0", "t0k", "", b"")),
+        asked(get("/orders/index.json")),
+        asked(get("/orders")),
+        asked(get("/Orders/index.json")),
+        asked(get("/orders/latest/package.plyz")),
+        asked(written(Delete, "/orders/0.2.0", "t0k", "", b"")),
       ]));
   assert_eq(statuses(ran.value), [404, 404, 404, 404, 405])
 }

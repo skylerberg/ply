@@ -17,12 +17,15 @@
 //! (`426` naming version 13 for another version, `400` for a request that is no handshake).
 //! `handshake` writes a client's request and `confirmed` checks the server's `101` against it.
 //!
-//! permessage-deflate is taken without context on either side: a server that accepts the
-//! extension answers `server_no_context_takeover` and `client_no_context_takeover`, and a client
-//! offers both, so each message is compressed on its own by `std.gzip`'s DEFLATE and decompressed
+//! permessage-deflate keeps each end's compression context from one message to the next (RFC 7692
+//! §7.2.1) unless the negotiation says that end does not: a server takes a client's offer as it
+//! is, answering `server_no_context_takeover` where the offer asks it or `Options.takeover` is
+//! off and `client_no_context_takeover` where the offer says so or that option is off, and a
+//! client offers both where it is off. A message is compressed by `std.gzip`'s writer and ended
+//! with a sync flush whose `00 00 ff ff` is taken off, and decompressed with those bytes put back
 //! under `Limits.max_message`, which makes a decompression bomb a 1009 rather than an allocation.
-//! A message is sent compressed, its final block marked as the last (RFC 7692 §7.2.3.4), and one
-//! that was compressed by a flush is read with the empty block that ends it put back.
+//! A context costs 32 KiB a direction for as long as the connection is open; one whose stream a
+//! final block ended is started again.
 //!
 //! `serve_connection` reads one request on a connection, upgrades it and answers each message
 //! with what `respond` makes of it; `connect` opens a client session to a `ws` or `wss` URL;
@@ -34,12 +37,12 @@ import std.bytes (cycle, u16_be, u16_be_at, u64_be, u64_be_at, xor)
 import std.dns
 import std.dns (dns)
 import std.gzip
-import std.hash_legacy (sha1)
+import std.hash.legacy (sha1)
 import std.http
 import std.http (Request, Response)
 import std.ip
 import std.ip (ip)
-import std.list (any, contains)
+import std.list (all, any, at_or, concat, contains, drop)
 import std.net
 import std.net (Says, net, send_all)
 import std.random (entropy, rand, token_bytes, with_rand)
@@ -179,12 +182,20 @@ pub type Message = | TextMessage(String) | BinaryMessage(Bytes)
 /// A message being reassembled from its fragments.
 type Partial = { opcode: Opcode, parts: List<Bytes>, size: Int, count: Int, compressed: Bool }
 
+/// Whether each end keeps its compression context from one message to the next, as
+/// permessage-deflate agreed it (RFC 7692 §7.1.1).
+pub type Contexts = { server: Bool, client: Bool }
+
 /// One end of a connection, as `received` leaves it.
 pub type State = {
   role: Role,
   limits: Limits,
-  /// Whether permessage-deflate was agreed.
-  compression: Bool,
+  /// What permessage-deflate agreed, where it was.
+  compression: Option<Contexts>,
+  /// The context this end compresses its messages in, where it keeps one.
+  deflater: Option<gzip::Writer>,
+  /// The context the peer's messages are decompressed in, where the peer keeps one.
+  inflater: Option<gzip::Reader>,
   partial: Option<Partial>,
   /// This end has sent its close.
   closing: Bool,
@@ -193,11 +204,13 @@ pub type State = {
 }
 
 /// A connection's state as it opens.
-pub fn opened(role: Role, limits: Limits, compression: Bool) -> State =
+pub fn opened(role: Role, limits: Limits, compression: Option<Contexts>) -> State =
   {
     role: role,
     limits: limits,
     compression: compression,
+    deflater: None,
+    inflater: None,
     partial: None,
     closing: false,
     closed: false,
@@ -294,20 +307,18 @@ fn gathered(s: State, p: Partial, fin: Bool) -> Step / {abort.raise} =
     failed(s, too_big("a message is in more fragments than the limit"))
   } else if !fin { { state: { ..s, partial: Some(p) }, events: [], replies: [] } } else {
     let whole = bytes_concat_all(p.parts);
-    match if p.compressed { inflated(whole, s.limits.max_message) } else { Ok(whole) } {
+    match if p.compressed { inflated(s, whole) }
+      else { Ok({ bytes: whole, inflater: s.inflater }) } {
       Err(why) -> failed({ ..s, partial: None }, why),
-      Ok(payload) -> match p.opcode {
-        Text -> match utf8(payload) {
-          Some(text) ->
-            { state: { ..s, partial: None }, events: [Received(TextMessage(text))], replies: [] },
-          None -> failed(s, { code: 1007, reason: "a text message is not UTF-8" }),
-        },
-        _ ->
-          {
-            state: { ..s, partial: None },
-            events: [Received(BinaryMessage(payload))],
-            replies: [],
+      Ok(read) -> {
+        let next = { ..s, partial: None, inflater: read.inflater };
+        match p.opcode {
+          Text -> match utf8(read.bytes) {
+            Some(text) -> { state: next, events: [Received(TextMessage(text))], replies: [] },
+            None -> failed(next, { code: 1007, reason: "a text message is not UTF-8" }),
           },
+          _ -> { state: next, events: [Received(BinaryMessage(read.bytes))], replies: [] },
+        }
       },
     }
   }
@@ -344,34 +355,74 @@ fn closed_by(s: State, payload: Bytes) -> Step / {abort.raise} =
     }
   }
 
-/// The tail RFC 7692 §7.2.2 has a receiver put back on a message compressed by a flush, and the
-/// final empty block that ends the stream it then is.
-fn flushed_tail() -> Bytes = b"\x00\x00\xff\xff\x03\x00"
+/// The tail of the sync flush RFC 7692 §7.2.1 has a sender take off a compressed message, and a
+/// receiver put back.
+fn flush_tail() -> Bytes = b"\x00\x00\xff\xff"
 
-/// A compressed message's payload decompressed, at most `limit` bytes of it: the stream it is
-/// with the flush's tail put back, which a message whose last block is final ends before.
-fn inflated(data: Bytes, limit: Int) -> Result<Bytes, Failure> / {abort.raise} = {
-  let stream = bytes_concat(data, flushed_tail());
-  let first = gzip::try_inflate(stream, limit);
-  let read = match first {
-    Err(r) -> if r.why == gzip::Trailing { gzip::try_inflate(bytes_slice(stream, 0, r.at), limit) }
-    else { first },
-    Ok(_) -> first,
+/// Whether this end keeps its compression context, and whether its peer does.
+fn keeps(s: State, c: Contexts) -> Bool = match s.role { Server -> c.server, Client -> c.client }
+
+fn peer_keeps(s: State, c: Contexts) -> Bool =
+  match s.role { Server -> c.client, Client -> c.server }
+
+/// A compressed message's payload decompressed in the peer's context, or a fresh one, at most
+/// `max_message` bytes of it, and the context the next message is read in: none where the peer
+/// keeps none, or where a final block ended its stream.
+fn inflated(
+  s: State,
+  data: Bytes,
+) -> Result<{ bytes: Bytes, inflater: Option<gzip::Reader> }, Failure> / {abort.raise} = {
+  let limit = s.limits.max_message;
+  let start = match s.inflater {
+    Some(r) -> gzip::allowing(r, limit),
+    None -> gzip::reader(gzip::Deflate, limit),
+  };
+  let read: Result<{ bytes: Bytes, after: gzip::Reader }, gzip::Refusal> = try {
+    let body = gzip::read(start, data);
+    if gzip::ended(body.next) { { bytes: body.out, after: body.next } } else {
+      let tail = gzip::read(body.next, flush_tail());
+      { bytes: bytes_concat(body.out, tail.out), after: tail.next }
+    }
   };
   match read {
-    Ok(b) -> Ok(b),
+    Ok(got) ->
+      Ok({
+        bytes: got.bytes,
+        inflater: match s.compression {
+          Some(c) -> if peer_keeps(s, c) && !gzip::ended(got.after) { Some(got.after) }
+          else { None },
+          None -> None,
+        },
+      }),
     Err(r) ->
       Err(if r.why == gzip::OverLimit { too_big("a message decompresses past the limit") }
       else { { code: 1007, reason: "a compressed message does not decompress" } }),
   }
 }
 
-/// The frame `m` is sent in, compressed where `compression` was agreed.
-pub fn message_frame(m: Message, compression: Bool) -> Frame / {abort.raise} = {
+/// The frame `m` is sent in, compressed where permessage-deflate was agreed, and the state with
+/// this end's context after it.
+pub fn message_frame(s: State, m: Message) -> { state: State, frame: Frame } / {abort.raise} = {
   let plain = match m { TextMessage(t) -> bytes_of_string(t), BinaryMessage(b) -> b };
   let op = match m { TextMessage(_) -> Text, BinaryMessage(_) -> Binary };
-  if compression { { fin: true, compressed: true, opcode: op, payload: gzip::deflate(plain) } }
-  else { { fin: true, compressed: false, opcode: op, payload: plain } }
+  match s.compression {
+    None -> { state: s, frame: { fin: true, compressed: false, opcode: op, payload: plain } },
+    Some(c) -> {
+      let start = match s.deflater { Some(w) -> w, None -> gzip::writer(gzip::Deflate) };
+      let took = gzip::write(start, plain, gzip::Deflate);
+      let flushed = gzip::flush(took.next, gzip::Deflate);
+      let all = bytes_concat(took.out, flushed.out);
+      {
+        state: { ..s, deflater: if keeps(s, c) { Some(flushed.next) } else { None } },
+        frame: {
+          fin: true,
+          compressed: true,
+          opcode: op,
+          payload: bytes_slice(all, 0, bytes_len(all) - bytes_len(flush_tail())),
+        },
+      }
+    },
+  }
 }
 
 // --- The handshake ----------------------------------------------------------
@@ -383,9 +434,10 @@ fn guid() -> String = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 pub fn accept_key(key: String) -> String / {abort.raise} =
   base64_encode(sha1(bytes_of_string(key ++ guid())))
 
-/// The extension a server answers an offer of permessage-deflate with.
-fn deflate_answer() -> String =
-  "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+/// permessage-deflate, with what it says neither end keeps.
+fn deflate_field(c: Contexts) -> String =
+  "permessage-deflate" ++ (if c.server { "" } else { "; server_no_context_takeover" })
+    ++ (if c.client { "" } else { "; client_no_context_takeover" })
 
 /// What a server says it speaks.
 pub type Options = {
@@ -393,6 +445,9 @@ pub type Options = {
   protocols: List<String>,
   /// Whether permessage-deflate is offered or accepted.
   compression: Bool,
+  /// Whether either end may keep its compression context from one message to the next: 32 KiB a
+  /// direction a connection, for messages that compress against the ones before them.
+  takeover: Bool,
   limits: Limits,
   /// The longest wait for the next frame.
   idle_timeout_ms: Int,
@@ -400,26 +455,28 @@ pub type Options = {
   max_messages: Int,
 }
 
-/// No subprotocol, compression on, `default_limits`, a minute's idle wait and ten thousand
-/// messages.
+/// No subprotocol, compression on with context kept, `default_limits`, a minute's idle wait and
+/// ten thousand messages.
 pub fn default_options() -> Options =
   {
     protocols: [],
     compression: true,
+    takeover: true,
     limits: default_limits(),
     idle_timeout_ms: 60000,
     max_messages: 10000,
   }
 
-/// What a server agreed in its `101`.
-pub type Agreed = { protocol: Option<String>, compression: Bool }
+/// What a server agreed in its `101`: a subprotocol, and permessage-deflate's contexts where it
+/// agreed that.
+pub type Agreed = { protocol: Option<String>, compression: Option<Contexts> }
 
 /// What a request is answered with.
 pub type Upgrade =
   /// The `101` that switches the connection, written, and what it agreed.
   | Upgrading({ head: Bytes, agreed: Agreed })
   /// The response that refuses it.
-  | Refused(Response)
+  | Refused(Response<| {}>)
 
 fn tokens(headers: http::Headers, name: String) -> List<String> / {abort.raise} =
   fold(http::header_lines(headers, name), [], |acc: List<String>, line: String|
@@ -431,20 +488,29 @@ fn tokens(headers: http::Headers, name: String) -> List<String> / {abort.raise} 
 fn names(headers: http::Headers, name: String, token: String) -> Bool / {abort.raise} =
   any(tokens(headers, name), |t: String| eq_ignore_ascii_case(t, token))
 
-/// Whether the client offers permessage-deflate in a form this end can take: its window is ours to
-/// keep under 32 KiB, which every offer allows, unless it asks the server for fewer bits.
-fn deflate_offered(headers: http::Headers) -> Bool / {abort.raise} =
-  any(tokens(headers, "sec-websocket-extensions"), |offer: String| {
-    let parts = map(string_split(offer, ";"), ascii_trim);
-    match parts {
-      [first, ..params] ->
-        eq_ignore_ascii_case(first, "permessage-deflate")
-          && !any(params, |p: String|
-            string_starts_with(ascii_lower(p), "server_max_window_bits")
-              && p != "server_max_window_bits=15"),
-      [] -> false,
-    }
-  })
+/// The parameters of the client's first offer of permessage-deflate this end can take, each in
+/// lower case: one that names a parameter RFC 7692 does not, or asks the server for a window under
+/// the 32 KiB its writer keeps, is passed over.
+fn deflate_offer(headers: http::Headers) -> Option<List<String>> / {abort.raise} =
+  fold(
+    tokens(headers, "sec-websocket-extensions"),
+    None,
+    |found: Option<List<String>>, offer: String|
+      match found {
+        Some(_) -> found,
+        None -> match map(string_split(offer, ";"), |p: String| ascii_lower(ascii_trim(p))) {
+          [first, ..params] -> if first == "permessage-deflate" && all(params, takeable) {
+            Some(params)
+          } else { None },
+          [] -> None,
+        },
+      },
+  )
+
+fn takeable(param: String) -> Bool / {abort.raise} =
+  param == "server_no_context_takeover" || param == "client_no_context_takeover"
+    || param == "server_max_window_bits=15"
+    || string_starts_with(param, "client_max_window_bits")
 
 /// The answer to `req` as a server that speaks what `options` say.
 pub fn upgrade(req: Request, options: Options) -> Upgrade / {abort.raise} = {
@@ -464,14 +530,26 @@ pub fn upgrade(req: Request, options: Options) -> Upgrade / {abort.raise} = {
         Some(_) -> chosen,
         None -> if contains(options.protocols, p) { Some(p) } else { None },
       });
-    let compression = options.compression && deflate_offered(h);
+    let compression = if !options.compression { None } else {
+      match deflate_offer(h) {
+        None -> None,
+        Some(params) ->
+          Some({
+            server: options.takeover && !contains(params, "server_no_context_takeover"),
+            client: options.takeover && !contains(params, "client_no_context_takeover"),
+          }),
+      }
+    };
     let lines = [
       "HTTP/1.1 101 Switching Protocols\r\n",
       "Upgrade: websocket\r\n",
       "Connection: Upgrade\r\n",
       "Sec-WebSocket-Accept: " ++ accept_key(key) ++ "\r\n",
       match protocol { Some(p) -> "Sec-WebSocket-Protocol: " ++ p ++ "\r\n", None -> "" },
-      if compression { "Sec-WebSocket-Extensions: " ++ deflate_answer() ++ "\r\n" } else { "" },
+      match compression {
+        Some(c) -> "Sec-WebSocket-Extensions: " ++ deflate_field(c) ++ "\r\n",
+        None -> "",
+      },
       "\r\n",
     ];
     Upgrading({
@@ -499,8 +577,11 @@ pub fn handshake(
       [] -> "",
       ps -> "Sec-WebSocket-Protocol: " ++ join(ps, ", ") ++ "\r\n",
     },
-    if options.compression { "Sec-WebSocket-Extensions: " ++ deflate_answer() ++ "\r\n" }
-    else { "" },
+    if options.compression {
+      "Sec-WebSocket-Extensions: "
+        ++ deflate_field({ server: options.takeover, client: options.takeover })
+        ++ "\r\n"
+    } else { "" },
     "\r\n",
   ];
   bytes_of_string(join(lines, ""))
@@ -508,7 +589,8 @@ pub fn handshake(
 
 /// What a server's answer to `handshake` agreed, or why it is no `101` for that request: another
 /// status, the wrong accept key, a subprotocol or extension the client did not offer, or
-/// compression that keeps context.
+/// permessage-deflate with a parameter the client cannot honour, or that keeps a context the
+/// client asked it not to.
 pub fn confirmed(
   head: http::ResponseHead,
   key: String,
@@ -517,8 +599,14 @@ pub fn confirmed(
   let h = head.headers;
   let protocol = http::header(h, "sec-websocket-protocol");
   let extensions = tokens(h, "sec-websocket-extensions");
-  let compression = any(extensions, |e: String|
+  let deflates = filter(extensions, |e: String|
     string_starts_with(ascii_lower(e), "permessage-deflate"));
+  let params = match deflates {
+    [one] -> drop(map(string_split(one, ";"), |p: String| ascii_lower(ascii_trim(p))), 1),
+    _ -> [],
+  };
+  let server_none = contains(params, "server_no_context_takeover");
+  let client_none = contains(params, "client_no_context_takeover");
   if head.status != 101 { Err("the server answered " ++ int_to_string(head.status)) }
   else if !names(h, "upgrade", "websocket") || !names(h, "connection", "upgrade") {
     Err("the answer does not switch to WebSocket")
@@ -526,13 +614,22 @@ pub fn confirmed(
     Err("the accept key is not this request's")
   } else if match protocol { Some(p) -> !contains(options.protocols, p), None -> false } {
     Err("a subprotocol that was not offered")
-  } else if compression
-      && (!options.compression
-      || !any(extensions, |e: String| string_contains(e, "server_no_context_takeover"))) {
-    Err("compression that was not offered, or that keeps context")
-  } else if len(extensions) > (if compression { 1 } else { 0 }) {
+  } else if len(deflates) > 1 || len(extensions) > len(deflates) {
     Err("an extension that was not offered")
-  } else { Ok({ protocol: protocol, compression: compression }) }
+  } else if deflates != [] && !options.compression { Err("compression that was not offered") }
+  else if any(params, |p: String|
+      p != "server_no_context_takeover" && p != "client_no_context_takeover"
+        && !string_starts_with(p, "server_max_window_bits")) {
+    Err("compression with a parameter this client cannot honour")
+  } else if deflates != [] && !options.takeover && (!server_none || !client_none) {
+    Err("compression that keeps a context this client asked it not to")
+  } else {
+    Ok({
+      protocol: protocol,
+      compression: if deflates == [] { None }
+      else { Some({ server: !server_none, client: !client_none }) },
+    })
+  }
 }
 
 // --- Sessions over std.net --------------------------------------------------
@@ -590,7 +687,7 @@ fn stepped<[l]>(
   timeout_ms: Int,
 ) -> { session: Session, got: Option<Got> } / {net.recv[l], net.send[l], entropy.next, abort.raise} =
   if s.state.closed { { session: s, got: Some(Closed({ code: 1006, reason: "" })) } } else {
-    match decode_frame(s.buffer, s.state.limits, s.state.compression) {
+    match decode_frame(s.buffer, s.state.limits, s.state.compression != None) {
       Broken(f) -> {
         sent[l](s, [close_frame(f.code, f.reason)], timeout_ms);
         {
@@ -642,13 +739,18 @@ fn sent<[l]>(
         timeout_ms,
       ))
 
-/// Sends `m` on `s`; `false` where the peer took it no longer.
+/// Sends `m` on `s`: the session after it, its compression context moved on, and whether the
+/// peer took it.
 pub fn send<[l]>(
   s: Session,
   m: Message,
   timeout_ms: Int,
-) -> Bool / {net.send[l], entropy.next, abort.raise} =
-  !s.state.closing && sent[l](s, [message_frame(m, s.state.compression)], timeout_ms)
+) -> { session: Session, sent: Bool } / {net.send[l], entropy.next, abort.raise} =
+  if s.state.closing { { session: s, sent: false } } else {
+    let made = message_frame(s.state, m);
+    let next = { ..s, state: made.state };
+    { session: next, sent: sent[l](next, [made.frame], timeout_ms) }
+  }
 
 /// Sends a close with `code` and `reason`; the peer's close is read with `receive`.
 pub fn close<[l]>(
@@ -723,9 +825,13 @@ fn answering<[l] | e>(
     let r = receive[l](s, options.idle_timeout_ms);
     match r.got {
       Message(m) -> {
-        fold(respond(m), true, |ok: Bool, out: Message|
-          ok && send[l](r.session, out, options.idle_timeout_ms));
-        answering(r.session, options, respond, left - 1)
+        let answered = fold(
+          respond(m),
+          { session: r.session, sent: true },
+          |at: { session: Session, sent: Bool }, out: Message|
+            if at.sent { send[l](at.session, out, options.idle_timeout_ms) } else { at },
+        );
+        answering(answered.session, options, respond, left - 1)
       },
       TimedOut -> {
         close[l](r.session, 1001, "idle", options.idle_timeout_ms);
@@ -928,10 +1034,13 @@ test "a handshake is answered 101 with what both ends speak" {
       options,
     ) {
     Upgrading(u) -> {
-      assert_eq(u.agreed, { protocol: Some("superchat"), compression: true });
+      assert_eq(u.agreed, {
+        protocol: Some("superchat"),
+        compression: Some({ server: true, client: true }),
+      });
       assert_eq(
         u.head,
-        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
       )
     },
     Refused(_) -> panic("the handshake is one"),
@@ -985,11 +1094,11 @@ fn answer_head(extra: String) -> http::ResponseHead / {abort.raise} =
   }
 
 test "a client takes a 101 that answers its request, and nothing else: {c.what}" for c: { what: String, extra: String, agreed: Result<Agreed, String> } in [
-    { what: "a plain switch", extra: "", agreed: Ok({ protocol: None, compression: false }) },
+    { what: "a plain switch", extra: "", agreed: Ok({ protocol: None, compression: None }) },
     {
       what: "a subprotocol offered",
       extra: "Sec-WebSocket-Protocol: chat\r\n",
-      agreed: Ok({ protocol: Some("chat"), compression: false }),
+      agreed: Ok({ protocol: Some("chat"), compression: None }),
     },
     {
       what: "a subprotocol not offered",
@@ -997,14 +1106,24 @@ test "a client takes a 101 that answers its request, and nothing else: {c.what}"
       agreed: Err("a subprotocol that was not offered"),
     },
     {
-      what: "compression without context",
+      what: "compression whose server keeps no context",
       extra: "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n",
-      agreed: Ok({ protocol: None, compression: true }),
+      agreed: Ok({ protocol: None, compression: Some({ server: false, client: true }) }),
     },
     {
-      what: "compression that keeps context",
+      what: "compression that keeps context both ways",
       extra: "Sec-WebSocket-Extensions: permessage-deflate\r\n",
-      agreed: Err("compression that was not offered, or that keeps context"),
+      agreed: Ok({ protocol: None, compression: Some({ server: true, client: true }) }),
+    },
+    {
+      what: "compression with a server window of its own",
+      extra: "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10\r\n",
+      agreed: Ok({ protocol: None, compression: Some({ server: true, client: true }) }),
+    },
+    {
+      what: "compression that bounds the client's window, which this client did not offer",
+      extra: "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits=10\r\n",
+      agreed: Err("compression with a parameter this client cannot honour"),
     },
     {
       what: "an extension not offered",
@@ -1014,6 +1133,25 @@ test "a client takes a 101 that answers its request, and nothing else: {c.what}"
   ] {
   let options = { ..default_options(), protocols: ["chat"] };
   assert_eq(confirmed(answer_head(c.extra), "dGhlIHNhbXBsZSBub25jZQ==", options), c.agreed)
+}
+
+test "a client that keeps no context asks both ends to keep none, and holds its server to it" {
+  let options = { ..default_options(), takeover: false };
+  assert(
+    bytes_index_of(
+        handshake("x", "/", "dGhlIHNhbXBsZSBub25jZQ==", options),
+        b"Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n",
+      )
+      != None,
+  );
+  assert_eq(
+    confirmed(
+      answer_head("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover\r\n"),
+      "dGhlIHNhbXBsZSBub25jZQ==",
+      options,
+    ),
+    Err("compression that keeps a context this client asked it not to"),
+  )
 }
 
 test "a key of another request is refused" {
@@ -1237,17 +1375,167 @@ test "Autobahn {c.case}: an echo server answers as the suite has it" for c: Case
 
 // --- Tests: permessage-deflate ----------------------------------------------
 
-test "Autobahn 12.1.1: a compressed message is echoed compressed" {
-  let m = TextMessage("Hello, compressed world, hello again, compressed world");
-  let said = client_says([message_frame(m, true), closing(1000)]);
-  assert_eq(
-    echoed(
-      "Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n",
-      said,
-      default_options(),
+/// The frames `messages` are sent in, one after another, by an end of `role` under `contexts`.
+fn compressed(
+  role: Role,
+  contexts: Contexts,
+  messages: List<Message>,
+) -> List<Frame> / {abort.raise} =
+  fold(
+    messages,
+    { state: opened(role, default_limits(), Some(contexts)), frames: [] },
+    |at: { state: State, frames: List<Frame> }, m: Message| {
+      let made = message_frame(at.state, m);
+      { state: made.state, frames: push(at.frames, made.frame) }
+    },
+  ).frames
+
+/// The messages `frames` read as, one after another, by an end of `role` under `contexts`.
+fn decompressed(
+  role: Role,
+  contexts: Contexts,
+  frames: List<Frame>,
+) -> List<Event> / {abort.raise} =
+  fold(
+    frames,
+    { state: opened(role, default_limits(), Some(contexts)), events: [] },
+    |at: { state: State, events: List<Event> }, f: Frame| {
+      let step = received(at.state, f, role == Server);
+      { state: step.state, events: concat(at.events, step.events) }
+    },
+  ).events
+
+/// A text of `n` bytes that repeats itself, as the cases of sizes send.
+fn of_size(n: Int) -> Message / {abort.raise} =
+  TextMessage(
+    string_of_bytes_lossy(
+      bytes_slice(bytes_concat_all(map(range(0, n / 16 + 1), |_i: Int| b"compress me now ")), 0, n),
     ),
-    server_says([message_frame(m, true), closing(1000)]),
   )
+
+type Deflating = {
+  case: String,
+  offer: String,
+  answer: String,
+  contexts: Contexts,
+  sizes: List<Int>,
+}
+
+fn deflating() -> List<Deflating> =
+  [
+    {
+      case: "12.1.1 small messages, each end keeping its context",
+      offer: "permessage-deflate",
+      answer: "permessage-deflate",
+      contexts: { server: true, client: true },
+      sizes: [16, 16, 16, 16],
+    },
+    {
+      case: "12.2.1 messages of 64 bytes",
+      offer: "permessage-deflate; client_max_window_bits",
+      answer: "permessage-deflate",
+      contexts: { server: true, client: true },
+      sizes: [64, 64, 64],
+    },
+    {
+      case: "12.4.1 messages of 1 KiB",
+      offer: "permessage-deflate",
+      answer: "permessage-deflate",
+      contexts: { server: true, client: true },
+      sizes: [1024, 1024],
+    },
+    {
+      case: "12.5.1 messages of 64 KiB",
+      offer: "permessage-deflate",
+      answer: "permessage-deflate",
+      contexts: { server: true, client: true },
+      sizes: [65536, 65536],
+    },
+    {
+      case: "13.2.1 a client that keeps no context",
+      offer: "permessage-deflate; client_no_context_takeover",
+      answer: "permessage-deflate; client_no_context_takeover",
+      contexts: { server: true, client: false },
+      sizes: [16, 64, 16],
+    },
+    {
+      case: "13.3.1 a server asked to keep none",
+      offer: "permessage-deflate; server_no_context_takeover",
+      answer: "permessage-deflate; server_no_context_takeover",
+      contexts: { server: false, client: true },
+      sizes: [16, 64, 16],
+    },
+    {
+      case: "13.4.1 neither end keeping one",
+      offer: "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+      answer: "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+      contexts: { server: false, client: false },
+      sizes: [16, 1024],
+    },
+  ]
+
+test "Autobahn {c.case}: an echo server agrees what was offered, and echoes each message in its context" for c: Deflating in deflating(
+  ) {
+  let limits = { max_frame: 1048576, max_message: 1048576, max_fragments: 4 };
+  let options = { ..default_options(), limits: limits };
+  match upgrade(request_of(opening("Sec-WebSocket-Extensions: " ++ c.offer ++ "\r\n")), options) {
+    Upgrading(u) -> {
+      assert_eq(u.agreed.compression, Some(c.contexts));
+      assert(
+        bytes_index_of(u.head, bytes_of_string("Sec-WebSocket-Extensions: " ++ c.answer ++ "\r\n"))
+          != None,
+      )
+    },
+    Refused(_) -> panic("the offer is taken"),
+  };
+  let messages = map(c.sizes, of_size);
+  let said = client_says(push(compressed(Client, c.contexts, messages), closing(1000)));
+  let echo = echoed("Sec-WebSocket-Extensions: " ++ c.offer ++ "\r\n", said, options);
+  assert_eq(echo, server_says(push(compressed(Server, c.contexts, messages), closing(1000))));
+  let frames = compressed(Server, c.contexts, messages);
+  assert_eq(decompressed(Client, c.contexts, frames), map(messages, |m: Message| Received(m)))
+}
+
+test "Autobahn 13.5.1: an offer that bounds the server's window under 32 KiB is declined, and messages go plain" {
+  match upgrade(
+      request_of(
+        opening("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=9\r\n"),
+      ),
+      default_options(),
+    ) {
+    Upgrading(u) -> {
+      assert_eq(u.agreed.compression, None);
+      assert_eq(bytes_index_of(u.head, b"Sec-WebSocket-Extensions"), None)
+    },
+    Refused(_) -> panic("the handshake is one"),
+  }
+}
+
+test "a context kept from one message to the next compresses a repeat to a back-reference" {
+  let both = { server: true, client: true };
+  let again = TextMessage("Hello, compressed world, hello again, compressed world");
+  let kept = compressed(Server, both, [again, again]);
+  let fresh = compressed(Server, { server: false, client: true }, [again, again]);
+  let size = |f: Frame| bytes_len(f.payload);
+  assert(size(at_or(kept, 1, close_frame(1000, ""))) < 8);
+  assert_eq(
+    size(at_or(fresh, 1, close_frame(1000, ""))),
+    size(at_or(fresh, 0, close_frame(1000, ""))),
+  )
+}
+
+test "RFC 7692 §7.2.3.2: a second Hello in the first one's window reads as Hello" {
+  let first = {
+    fin: true,
+    compressed: true,
+    opcode: Text,
+    payload: b"\xf2\x48\xcd\xc9\xc9\x07\x00",
+  };
+  let second = { fin: true, compressed: true, opcode: Text, payload: b"\xf2\x00\x11\x00\x00" };
+  assert_eq(decompressed(Client, { server: true, client: true }, [first, second]), [
+    Received(TextMessage("Hello")),
+    Received(TextMessage("Hello")),
+  ])
 }
 
 test "RFC 7692's compressed examples read as Hello: {c.what}" for c: { what: String, wire: Bytes } in [
@@ -1260,9 +1548,14 @@ test "RFC 7692's compressed examples read as Hello: {c.what}" for c: { what: Str
   ] {
   match decode_frame(c.wire, default_limits(), true) {
     Got(g) ->
-      assert_eq(received(opened(Client, default_limits(), true), g.frame, g.masked).events, [
-        Received(TextMessage("Hello")),
-      ]),
+      assert_eq(
+        received(
+          opened(Client, default_limits(), Some({ server: false, client: false })),
+          g.frame,
+          g.masked,
+        ).events,
+        [Received(TextMessage("Hello"))],
+      ),
     _ -> panic("a whole frame"),
   }
 }
@@ -1275,7 +1568,11 @@ test "a compressed message that would decompress past the limit fails the connec
     payload: gzip::deflate(bytes_of(4096)),
   };
   let step = received(
-    opened(Server, { max_frame: 1024, max_message: 1024, max_fragments: 4 }, true),
+    opened(
+      Server,
+      { max_frame: 1024, max_message: 1024, max_fragments: 4 },
+      Some({ server: true, client: true }),
+    ),
     bomb,
     true,
   );
@@ -1311,10 +1608,10 @@ test "a client opens a session, sends masked, and reads its server's answer and 
             Err(_) -> [],
             Ok(s) -> {
               let wrote = send[chat](s, TextMessage("hi"), 1000);
-              let first = receive[chat](s, 1000);
+              let first = receive[chat](wrote.session, 1000);
               let second = receive[chat](first.session, 1000);
               [
-                Some(wrote),
+                Some(wrote.sent),
                 Some(first.got == Message(TextMessage("hi back"))),
                 Some(second.got == Closed({ code: 1000, reason: "" })),
               ]

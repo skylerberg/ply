@@ -1,7 +1,7 @@
 //! TLS credentials and sessions, terminated through rustls.
 
 use ply_eval::{Diagnostic, Span, codes};
-use rustls::client::ClientConnection;
+use rustls::client::{ClientConnection, ResolvesClientCert};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::hash::HashAlgorithm;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -11,7 +11,9 @@ use rustls::server::{
     ServerSessionMemoryCache, WebPkiClientVerifier,
 };
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig, Error as TlsError, PeerIncompatible, RootCertStore, StreamOwned};
+use rustls::{
+    ClientConfig, Error as TlsError, PeerIncompatible, RootCertStore, SignatureScheme, StreamOwned,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
@@ -151,6 +153,22 @@ impl Chooser {
     }
 }
 
+/// A client presents the first certificate a credential holds, as a server asks for one.
+impl ResolvesClientCert for Chooser {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        self.refresh(false);
+        lock(&self.loaded).first().map(|l| Arc::clone(&l.key))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 impl ResolvesServerCert for Chooser {
     fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         self.refresh(false);
@@ -228,6 +246,10 @@ pub struct Credentials {
     entries: BTreeMap<String, Credential>,
     /// What `net.connect_tls` verifies a server against.
     client: Option<Arc<ClientConfig>>,
+    /// The same, presenting each credential to a server that asks a client for a certificate.
+    presenting: BTreeMap<String, Arc<ClientConfig>>,
+    /// The credentials whose listeners refuse a client that presents no certificate.
+    required: Vec<String>,
     trusted: usize,
 }
 
@@ -238,11 +260,13 @@ impl Credentials {
 
     /// `trusted` names PEM files whose certificates `net.connect_tls` accepts beside the roots,
     /// and which a listener verifies a client's certificate against: where there are any, every
-    /// listener asks a client for one and serves a client that presents none. A name given
-    /// several times holds several certificates, chosen among by the name a client asks for.
+    /// listener asks a client for one, and serves a client that presents none unless `required`
+    /// names its credential (`--mtls`). A name given several times holds several certificates,
+    /// chosen among by the name a client asks for.
     pub fn load(
         specs: &[CredentialSpec],
         trusted: &[PathBuf],
+        required: &[String],
     ) -> Result<Credentials, Vec<Diagnostic>> {
         let mut grouped: BTreeMap<String, Vec<Loaded>> = BTreeMap::new();
         let mut firsts: BTreeMap<String, (String, usize)> = BTreeMap::new();
@@ -269,11 +293,19 @@ impl Credentials {
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
+        for name in required {
+            if !grouped.contains_key(name) {
+                diagnostics.push(err_required_unknown(name));
+            } else if anchors.is_empty() {
+                diagnostics.push(err_required_untrusted(name));
+            }
+        }
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
         let shared = Shared::new(&anchors).map_err(|d| vec![d])?;
         let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
+        let mut presenting: BTreeMap<String, Arc<ClientConfig>> = BTreeMap::new();
         for (name, loaded) in grouped {
             let chooser = Arc::new(Chooser {
                 loaded: Mutex::new(loaded),
@@ -281,8 +313,12 @@ impl Credentials {
             });
             let (fingerprint, certificates) = firsts.remove(&name).unwrap_or_default();
             let config = shared
-                .server(&chooser)
+                .server(&chooser, required.contains(&name))
                 .map_err(|e| vec![err_configured(&name, &e)])?;
+            presenting.insert(
+                name.clone(),
+                client_config(anchors.clone(), Some(Arc::clone(&chooser))).map_err(|d| vec![d])?,
+            );
             entries.insert(
                 name,
                 Credential {
@@ -294,12 +330,29 @@ impl Credentials {
             );
         }
         let trusted = anchors.len();
-        let client = client_config(anchors).map_err(|d| vec![d])?;
+        let client = client_config(anchors, None).map_err(|d| vec![d])?;
         Ok(Credentials {
             entries,
             client: Some(client),
+            presenting,
+            required: required.to_vec(),
             trusted,
         })
+    }
+
+    /// Whether the listener of the credential `name` refuses a client that presents no certificate.
+    pub fn requires_client(&self, name: &str) -> bool {
+        self.required.iter().any(|r| r == name)
+    }
+
+    /// The configuration `net.start_tls` verifies a server with, presenting the credential `name`
+    /// where the server asks for a client certificate; `E0429` naming the configured credentials
+    /// where the run holds none of that name.
+    pub fn presenting(&self, name: &str, span: Span) -> Result<Arc<ClientConfig>, Diagnostic> {
+        match self.presenting.get(name) {
+            Some(config) => Ok(Arc::clone(config)),
+            None => Err(unknown_credential(name, self.names(), span)),
+        }
     }
 
     /// How many trusted certificates join the roots.
@@ -311,7 +364,8 @@ impl Credentials {
     pub fn client(&self) -> Arc<ClientConfig> {
         match &self.client {
             Some(config) => Arc::clone(config),
-            None => client_config(Vec::new()).expect("the provider supports the versions it names"),
+            None => client_config(Vec::new(), None)
+                .expect("the provider supports the versions it names"),
         }
     }
 
@@ -343,10 +397,12 @@ impl fmt::Debug for Credentials {
     }
 }
 
-/// What every listener of a run shares: the client verifier the trusted certificates make, and
-/// one ticket key, which rotates, so a session one listener began resumes at another.
+/// What every listener of a run shares: the client verifiers the trusted certificates make, one
+/// that serves a client presenting no certificate and one that refuses it, and one ticket key,
+/// which rotates, so a session one listener began resumes at another.
 struct Shared {
     verifier: Option<Arc<dyn ClientCertVerifier>>,
+    requiring: Option<Arc<dyn ClientCertVerifier>>,
     tickets: Arc<dyn ProducesTickets>,
 }
 
@@ -358,29 +414,28 @@ impl Shared {
                 format!("TLS session tickets could not be set up: {e}"),
             )
         })?;
-        let verifier = if anchors.is_empty() {
-            None
-        } else {
-            let mut roots = RootCertStore::empty();
-            roots.add_parsable_certificates(anchors.to_vec());
-            let built = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
-                .allow_unauthenticated()
-                .build()
-                .map_err(|e| {
-                    Diagnostic::error(
-                        codes::TLS_CREDENTIAL_INVALID,
-                        format!("the trusted certificates cannot verify a client: {e}"),
-                    )
-                })?;
-            Some(built)
-        };
-        Ok(Shared { verifier, tickets })
+        let verifier = client_verifier(anchors, false)?;
+        let requiring = client_verifier(anchors, true)?;
+        Ok(Shared {
+            verifier,
+            requiring,
+            tickets,
+        })
     }
 
-    fn server(&self, chooser: &Arc<Chooser>) -> Result<Arc<ServerConfig>, TlsError> {
+    fn server(
+        &self,
+        chooser: &Arc<Chooser>,
+        required: bool,
+    ) -> Result<Arc<ServerConfig>, TlsError> {
         let versions = ServerConfig::builder_with_provider(provider())
             .with_safe_default_protocol_versions()?;
-        let verified = match &self.verifier {
+        let verifier = if required {
+            &self.requiring
+        } else {
+            &self.verifier
+        };
+        let verified = match verifier {
             Some(verifier) => versions.with_client_cert_verifier(Arc::clone(verifier)),
             None => versions.with_no_client_auth(),
         };
@@ -393,6 +448,32 @@ impl Shared {
     }
 }
 
+/// What verifies a client's certificate against `anchors`, none where there are none: one that
+/// serves a client presenting no certificate, or where `required` one that refuses it.
+fn client_verifier(
+    anchors: &[CertificateDer<'static>],
+    required: bool,
+) -> Result<Option<Arc<dyn ClientCertVerifier>>, Diagnostic> {
+    if anchors.is_empty() {
+        return Ok(None);
+    }
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(anchors.to_vec());
+    let builder = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider());
+    let builder = if required {
+        builder
+    } else {
+        builder.allow_unauthenticated()
+    };
+    let built = builder.build().map_err(|e| {
+        Diagnostic::error(
+            codes::TLS_CREDENTIAL_INVALID,
+            format!("the trusted certificates cannot verify a client: {e}"),
+        )
+    })?;
+    Ok(Some(built))
+}
+
 /// Sessions a listener keeps for resumption by id, besides those its tickets carry.
 const SESSIONS: usize = 1024;
 
@@ -401,14 +482,19 @@ pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
-fn client_config(trusted: Vec<CertificateDer<'static>>) -> Result<Arc<ClientConfig>, Diagnostic> {
+/// A client's configuration: the roots and `trusted` to verify a server against, and where
+/// `presenting` names a credential, its certificate for a server that asks for one.
+fn client_config(
+    trusted: Vec<CertificateDer<'static>>,
+    presenting: Option<Arc<Chooser>>,
+) -> Result<Arc<ClientConfig>, Diagnostic> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let (_, ignored) = roots.add_parsable_certificates(trusted);
     if ignored > 0 {
         return Err(err_trust(ignored));
     }
-    let mut config = ClientConfig::builder_with_provider(provider())
+    let rooted = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| {
             Diagnostic::error(
@@ -416,8 +502,11 @@ fn client_config(trusted: Vec<CertificateDer<'static>>) -> Result<Arc<ClientConf
                 format!("the TLS client could not be configured: {e}"),
             )
         })?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .with_root_certificates(roots);
+    let mut config = match presenting {
+        Some(chooser) => rooted.with_client_cert_resolver(chooser as Arc<dyn ResolvesClientCert>),
+        None => rooted.with_no_client_auth(),
+    };
     config.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
     Ok(Arc::new(config))
 }
@@ -1103,6 +1192,26 @@ fn err_untrusted(path: &Path, why: String) -> Diagnostic {
     )
     .note(TRUSTED)
     .note("roots are loaded before anything runs, so this is refused rather than discovered on the first handshake")
+}
+
+#[cold]
+fn err_required_unknown(name: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::TLS_CREDENTIAL_UNKNOWN,
+        format!("`--mtls {name}` names a credential this run was not given"),
+    )
+    .note(format!(
+        "pass `--tls {name}=CERT.pem,KEY.pem` beside it: `--mtls` makes that credential's listener require a client certificate"
+    ))
+}
+
+#[cold]
+fn err_required_untrusted(name: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::TLS_CREDENTIAL_INVALID,
+        format!("`--mtls {name}` requires a client certificate, and nothing verifies one"),
+    )
+    .note("pass `--trust CERT.pem` naming the certificates a client's must be issued by")
 }
 
 const TRUSTED: &str = "`--trust CERT.pem` and `PLY_TRUST` name PEM files of certificates, each a root `net.connect_tls` may accept";

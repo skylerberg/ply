@@ -82,6 +82,7 @@ type Options = {
   host: Bool,
   tls: List<Tls>,
   trust: List<String>,
+  mtls: List<String>,
   fs: List<Named>,
   db: Db,
   config: Config,
@@ -147,6 +148,7 @@ fn main(root: String, index: Int, front: LoadedAnalysis, unit: Bytes, world: Wor
     host: false,
     tls: [],
     trust: [],
+    mtls: [],
     fs: [],
     db: {
       url: None,

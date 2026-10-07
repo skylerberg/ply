@@ -3,7 +3,7 @@
 
 import std.bin
 import std.hash (blake3)
-import std.list (at, concat, take)
+import std.list (at, concat, contains, take)
 import resolve (Source, ParsedModule)
 import diagnostics (parse_all)
 import pkg (PackageSources)
@@ -14,13 +14,14 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Interfaces, no_inter
               analyse_with, dump_of, test_owners, test_check_key, known_def_row_bin, Cut, cut_bin,
               cuts_of, body_cuts_of, Dump, ModuleRow, Rows, checked_staged, no_rows, rows_of,
               staged_pulling_std_with, embed_slot, shipped_hashes, analyse_pulling_std_with,
-              ShippedData, embeds_now, in_order)
+              ShippedData, embeds_now)
 
 import infer (DefInfo, test_owner)
-import rewrite (has_tagged)
+import rewrite (has_tagged, has_statements)
 import types (Scheme, canonical_scheme)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedFile, EmbedWant, embed_key, wants_by_item)
-import items (parse)
+import items (parse, unimported)
+import parsing (Span)
 import resolve (qualify)
 
 /// A module another one's analysis read, with the key it had then.
@@ -103,6 +104,18 @@ fn cut(src: Bytes, c: Cut) -> List<Bytes> / {abort.raise} =
 
 pub fn stub_module(src: Bytes, parsed: ParsedModule) -> Bytes / {abort.raise} =
   stubbed(src, cuts_of(parsed))
+
+/// A shipped module as a module that imports it reads it: what `items.unimported` finds of it
+/// blanked, at the offsets it had. Its tests and laws stay for a run over the shipped modules
+/// themselves.
+pub fn imported(src: Bytes) -> Bytes / {abort.raise} = blanked(src, unimported(src))
+
+/// `src` with each of `spans`, in order and apart, blanked at the offsets it had.
+pub fn blanked(src: Bytes, spans: List<Span>) -> Bytes / {abort.raise} =
+  stubbed(
+    src,
+    map(spans, |s: Span| { start: s.start, end: s.end, braced: false, name: b"", test: false }),
+  )
 
 /// `src` with each cut blanked, at the offsets it had: what a module's published cuts make of it.
 pub fn stubbed(src: Bytes, cuts: List<Cut>) -> Bytes / {abort.raise} = {
@@ -351,13 +364,40 @@ pub fn with_embeds(
 
 /// The cuts a package's stub of the module at `i` is made with: the bodies the analysis read, and
 /// every test and law the module's text holds, which the load may have left out of what it read.
-fn package_cuts(analysis: Analysis, i: Int) -> List<Cut> / {abort.raise} = {
-  let read = cuts_of(at(analysis.mods, i));
-  match map_get(analysis.left_out, at(analysis.mods, i).name) {
-    None -> read,
-    Some(items) -> in_order(filter(read, |c: Cut| c.braced), items),
+fn package_cuts(analysis: Analysis, i: Int) -> List<Cut> / {abort.raise} =
+  match map_get(analysis.whole_cuts, at(analysis.mods, i).name) {
+    None -> cuts_of(at(analysis.mods, i)),
+    Some(cuts) -> cuts,
   }
+
+/// The shipped functions of `members` the load's program does not reach, fixed as the whole
+/// program's hashing fixed them and with no body: nothing a build makes reads one, and a load that
+/// comes to reach one reads its module whole.
+fn unreached_fixed(
+  analysis: Analysis,
+  members: Map<Bytes, Bool>,
+  applied: List<Fixed>,
+) -> List<Fixed> / {abort.raise} =
+  match analysis.unreached {
+    None -> [],
+    Some(u) ->
+      map(fixed_nodes(u.index, u.hashes, members, applied, Some(u.names)), |f: Fixed|
+        { ..f, body: b"" }),
+  }
+
+/// Whether a function's blank needs no row: a function of a shipped module the load pulls is read
+/// only where its program reaches it, and a load that reaches one its stub blanked with no row reads
+/// the module from its text.
+fn rowless_in(pulled: List<Bytes>) -> (Bytes) -> Bool / {abort.raise} = {
+  let held = fold(pulled, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+  |name: Bytes| map_contains(held, module_of(name))
 }
+
+/// What `through` holds of each module, but for those the load read whole again.
+fn read_through(analysis: Analysis, through: List<CompiledPackage>) -> Map<Bytes, CompiledModule> =
+  fold(through, map_new(), |acc: Map<Bytes, CompiledModule>, package: CompiledPackage|
+    fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
+      if contains(analysis.restored, m.name) { a } else { map_insert(a, m.name, m) }))
 
 /// A module `analysis` read through `through`, or never reached, is carried over whole: what a
 /// package fixes of a module is its own, and a load that reads a shipped module for what it reaches
@@ -368,13 +408,7 @@ pub fn compile_package(
   modules: List<Bytes>,
   through: List<CompiledPackage> = [],
 ) -> CompiledPackage / {abort.raise} = {
-  let read = fold(
-    through,
-    map_new(),
-    |acc: Map<Bytes, CompiledModule>, package: CompiledPackage|
-      fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
-        map_insert(a, m.name, m)),
-  );
+  let read = read_through(analysis, through);
   let fresh = filter(modules, |m: Bytes| !map_contains(read, m));
   let members = fold(fresh, map_new(), |acc: Map<Bytes, Bool>, m: Bytes| map_insert(acc, m, true));
   let mine = |name: Bytes| map_contains(members, module_of(name));
@@ -418,12 +452,14 @@ pub fn compile_package(
       |row: KnownDefRow|
         match map_get(implemented, row.name) { Some(h) -> { ..row, hash: h }, None -> row },
     ),
-    fixed: fixed_nodes(
-      analysis.index,
-      analysis.hashes,
-      members,
-      fold(through, [], |acc: List<Fixed>, package: CompiledPackage| concat(acc, package.fixed)),
-    ),
+    fixed: {
+      let applied = fold(through, [], |acc: List<Fixed>, package: CompiledPackage|
+        concat(acc, package.fixed));
+      concat(
+        fixed_nodes(analysis.index, analysis.hashes, members, applied),
+        unreached_fixed(analysis, members, applied),
+      )
+    },
     tests: [],
     laws: [],
   };
@@ -493,20 +529,16 @@ pub fn kept_modules(
   own: Bool = false,
 ) -> KeptModules / {abort.raise} = {
   let names = map(analysis.mods, |m: ParsedModule| m.name);
-  // A tagged literal is checked off its module's bodies, so a module that writes one keeps them.
+  // A tagged literal and a statement are checked off their module's bodies, so a module that writes
+  // either keeps them.
   let kept = |i: Int|
     !own
       || (list_at(analysis.module_packages, i) == Some(0)
-      && !has_tagged(at(analysis.mods, i).module));
+      && !has_tagged(at(analysis.mods, i).module)
+      && !has_statements(at(analysis.mods, i).module));
   let members = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
     if kept(i) { map_insert(acc, at(names, i), true) } else { acc });
-  let read = fold(
-    through,
-    map_new(),
-    |acc: Map<Bytes, CompiledModule>, package: CompiledPackage|
-      fold(package.modules, acc, |a: Map<Bytes, CompiledModule>, m: CompiledModule|
-        map_insert(a, m.name, m)),
-  );
+  let read = read_through(analysis, through);
   let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
     map_insert(acc, o.name, o));
   let keyed = |name: Bytes|
@@ -541,7 +573,10 @@ pub fn kept_modules(
     }),
     fixed: map(
       concat(
-        fixed_nodes(analysis.index, analysis.hashes, fresh, applied),
+        concat(
+          fixed_nodes(analysis.index, analysis.hashes, fresh, applied),
+          unreached_fixed(analysis, fresh, applied),
+        ),
         filter(applied, |f: Fixed| {
           let module = module_of(f.name);
           map_contains(members, module) && !map_contains(fresh, module)
@@ -580,7 +615,10 @@ pub fn standing_modules(
   rows: Rows,
   read: EmbedReader,
   held: Map<Bytes, Bool>,
+  // The shipped modules the load pulls, whose functions a stub may blank with no row.
+  pulled: List<Bytes> = [],
 ) -> List<CompiledPackage> / {abort.raise} = {
+  let rowless_ok = rowless_in(pulled);
   let originals = fold(sources, map_new(), |acc: Map<Bytes, Original>, o: Original|
     map_insert(acc, o.name, o));
   let valid = valid_part(
@@ -611,11 +649,11 @@ pub fn standing_modules(
   let tests_held = fold(valid.tests, map_new(), |acc: Map<Bytes, Bool>, t: FixedTest|
     map_insert(acc, test_owner(t.module, t.position), true));
   let rowless = fold(valid.fixed, map_new(), |acc: Map<Bytes, Bool>, fixed: Fixed|
-    if fixed.decl || map_contains(filed, fixed.name) { acc }
+    if fixed.decl || map_contains(filed, fixed.name) || rowless_ok(fixed.name) { acc }
     else { map_insert(acc, module_of(fixed.name), true) });
   let answered = answered_cuts(
     valid.fixed,
-    |name: Bytes| map_contains(filed, name),
+    |name: Bytes| map_contains(filed, name) || rowless_ok(name),
     |owner: Bytes| map_contains(tests_filed, owner) && map_contains(tests_held, owner),
   );
   let unread = fold(valid.modules, rowless, |acc: Map<Bytes, Bool>, m: CompiledModule|
@@ -733,12 +771,17 @@ pub fn kept_held(
 
 /// The part of `package` whose stubs blank only bodies it holds a hash and a row for: a stub is read
 /// for its functions' answers and never for a blank, so a module kept otherwise is read from source.
-pub fn answered_part(package: CompiledPackage) -> CompiledPackage / {abort.raise} = {
+pub fn answered_part(
+  package: CompiledPackage,
+  // The shipped modules the load pulls, whose functions a stub may blank with no row.
+  pulled: List<Bytes> = [],
+) -> CompiledPackage / {abort.raise} = {
+  let rowless_ok = rowless_in(pulled);
   let rowed = fold(package.defs, map_new(), |acc: Map<Bytes, Bool>, r: KnownDefRow|
     map_insert(acc, r.name, true));
   let answered = answered_cuts(
     package.fixed,
-    |name: Bytes| map_contains(rowed, name),
+    |name: Bytes| map_contains(rowed, name) || rowless_ok(name),
     |owner: Bytes| false,
   );
   let unanswered = fold(package.modules, map_new(), |acc: Map<Bytes, Bool>, m: CompiledModule|
@@ -757,7 +800,7 @@ pub fn answered_part(package: CompiledPackage) -> CompiledPackage / {abort.raise
 /// holds a row for, or to a test `tested` holds a fixed hash and a row for.
 fn answered_cuts(
   fixed: List<Fixed>,
-  rowed: (Bytes) -> Bool,
+  rowed: (Bytes) -> Bool / {abort.raise},
   tested: (Bytes) -> Bool,
 ) -> (List<Cut>) -> Bool / {abort.raise} = {
   let hashed = fold(fixed, map_new(), |acc: Map<Bytes, Bool>, f: Fixed|
@@ -1297,6 +1340,40 @@ test "a package's stub of a shipped module leaves out its tests and laws though 
       )),
     [[2], [2]],
   )
+}
+
+test "a package's stub of a shipped module blanks what the program does not reach, which a load that reaches it reads whole" {
+  let r: Source = {
+    name: b"std.r",
+    src: b"pub fn used() -> Int = 1 + 0\n\npub fn spare() -> Int = 2 + 0\n",
+  };
+  let app: Source = { name: b"app", src: b"import std.r (used)\npub fn f() -> Int = used()\n" };
+  let p = compile_package(
+    [original(r)],
+    whole_of(analyse_pulling_std_with([app], [r], [], []).out),
+    [b"std.r"],
+  );
+  assert_eq(map(at(p.modules, 0).cuts, |c: Cut| c.name), [b"std.r.used", b"std.r.spare"]);
+  assert_eq(map(filter(p.fixed, |f: Fixed| f.name == b"std.r.spare"), |f: Fixed| f.body), [b""]);
+  assert_eq(len(filter(p.defs, |row: KnownDefRow| row.name == b"std.r.spare")), 0);
+  let keys = map_insert(map_new(), b"std.r", module_key(original(r)));
+  let through = answered_part(valid_part(p, keys, map_new()), [b"std.r"]);
+  assert_eq(map(through.modules, |m: CompiledModule| m.name), [b"std.r"]);
+  let via = |a: Source|
+    whole_of(analyse_pulling_std_with([a], [r], [], [], ifaces: merged_interfaces([through])).out);
+  assert_eq(via(app).restored, []);
+  let both: Source = {
+    name: b"app",
+    src: b"import std.r (used, spare)\npub fn f() -> Int = used() + spare()\n",
+  };
+  let read = via(both);
+  assert_eq(read.restored, [b"std.r"]);
+  assert_eq(
+    read.hashes.defs,
+    whole_of(analyse_pulling_std_with([both], [r], [], []).out).hashes.defs,
+  );
+  let again = compile_package([original(r)], read, [b"std.r"], [through]);
+  assert_eq(len(filter(again.defs, |row: KnownDefRow| row.name == b"std.r.spare")), 1)
 }
 
 test "a build's kept module stands where a shipped module it reaches only gained a function" {

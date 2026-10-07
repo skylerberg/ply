@@ -1,0 +1,126 @@
+//! `std.http`'s streamed bodies through `std.static` and `std.coding` together, over `std.net`'s
+//! twin: a file coded as it is sent, and a coded request body refused as it is read.
+
+import std.coding
+import std.fs
+import std.fs (fs)
+import std.gzip
+import std.http
+import std.http (Request, Response)
+import std.ip
+import std.ip (ip)
+import std.list (concat)
+import std.net
+import std.net (Says, net)
+import std.random (entropy, rand, with_rand)
+import std.date
+import std.static
+
+/// A text of `n` bytes that does not repeat itself in a short run, as a page of data does not.
+fn text(n: Int) -> Bytes / {abort.raise} =
+  bytes_slice(
+    bytes_concat_all(
+      map(range(0, n / 24 + 1), |i: Int|
+        bytes_of_string("line " ++ int_to_string(i * 7919) ++ " of the file\n")),
+    ),
+    0,
+    n,
+  )
+
+fn caller() -> ip::SocketAddress / {ip.refused, abort.raise} = ip::read_socket("198.51.100.4:5000")
+
+fn noon() -> date::OffsetDateTime / {abort.raise} =
+  match date::of_unix_seconds(1700000100) { Some(o) -> o, None -> panic("a date") }
+
+/// What the server wrote back to a client that said `asked`, serving `app`.
+fn served_back(
+  asked: List<Bytes>,
+  app: http::Handler<| {fs.read_chunk[site], fs.read_at[site], fs.close[site], fs.kind[site], fs.stat[site], fs.open[site], entropy.next}>,
+  tree: fs::MemFs,
+) -> { out: Bytes, unread: Int } / {ip.refused, abort.raise} = {
+  let ran = net::on_mem(
+    net::mem_calling(net::mem_empty(), caller(), map(asked, |b: Bytes| Says(b))),
+    ||
+      with_rand(rand(7), ||
+        fs::on_mem[site](tree, || {
+          let listener = net.listen[listener](0);
+          http::serve_connection[conn](net.accept[listener](listener), http::default_limits(), app)
+        }).value).value,
+  );
+  { out: net::mem_sent(ran.net, 2), unread: len(net::mem_unmet(ran.net, 2)) }
+}
+
+test "a file served gzip-coded is a stream of chunks that decodes to the file" {
+  let file = text(3000000);
+  let tree = fs::mem_of([{ path: "data.txt", body: file }]);
+  let back = served_back(
+    [b"GET /data.txt HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"],
+    |req: Request|
+      coding::serving(req, 1048576, |plain: Request|
+        static::serve[site](
+          plain,
+          plain.path,
+          { ..static::default_options(), chunk: 65536 },
+          noon(),
+        )),
+    tree,
+  );
+  let head = match http::parse_response_head(back.out, http::Get, http::default_limits()) {
+    http::ResponseParsed(h) -> h,
+    _ -> panic("an answer"),
+  };
+  assert_eq(head.status, 200);
+  assert_eq(head.framing, http::Chunked);
+  assert_eq(http::header(head.headers, "content-encoding"), Some("gzip"));
+  assert_eq(http::header(head.headers, "content-length"), None);
+  let body = bytes_slice(back.out, head.consumed, bytes_len(back.out));
+  let limits = { ..http::default_limits(), max_body: 4000000, max_chunk_size: 4000000 };
+  let coded = iterate(
+    { state: http::body_start(http::Chunked, limits), at: 0, out: [] },
+    100000,
+    |s: { state: http::BodyState, at: Int, out: List<Bytes> }|
+      match http::body_step(s.state, bytes_slice(body, s.at, bytes_len(body))) {
+        http::Complete(done) -> Stop(bytes_concat_all(push(s.out, done.out))),
+        http::Await(step) ->
+          Continue({ state: step.state, at: s.at + step.consumed, out: push(s.out, step.out) }),
+        http::Rejected(r) -> panic(r.reason),
+      },
+  );
+  assert(bytes_len(coded) < bytes_len(file) / 2);
+  assert(gzip::gunzip(coded, bytes_len(file)) == file)
+}
+
+test "a coded request body that would decode past its bound is refused at the bound, its coded rest unread" {
+  let four_k = bytes_of_string(fold(range(0, 1024), "", |acc: String, _i: Int| acc ++ "0000"));
+  let coded = gzip::gzip(bytes_concat_all(map(range(0, 1024), |_i: Int| four_k)));
+  let pieces = map(range(0, bytes_len(coded) / 512 + 1), |i: Int|
+    http::encode_chunk(
+      bytes_slice(coded, min(i * 512, bytes_len(coded)), min((i + 1) * 512, bytes_len(coded))),
+    ));
+  let back = served_back(
+    concat(
+      [
+        b"POST /upload HTTP/1.1\r\nHost: x\r\nContent-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n",
+      ],
+      concat(pieces, [http::last_chunk()]),
+    ),
+    |req: Request|
+      coding::serving(req, 65536, |plain: Request| {
+        let body = http::request_body(plain, 16777216);
+        http::text_response(200, int_to_string(bytes_len(body)) ++ " bytes\n")
+      }),
+    fs::mem_empty(),
+  );
+  assert(string_starts_with(string_of_bytes_lossy(back.out), "HTTP/1.1 413 Content Too Large\r\n"));
+  assert(
+    string_ends_with(
+      string_of_bytes_lossy(back.out),
+      "the body decodes to more than 65536 bytes\n",
+    ),
+  );
+  // Four MiB of zeros took a few pieces to pass the bound, and the rest were never read.
+  assert(
+    back.unread > len(pieces) / 2,
+    Some(int_to_string(back.unread) ++ " of " ++ int_to_string(len(pieces))),
+  )
+}
