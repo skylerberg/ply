@@ -47,9 +47,9 @@ import std.pkg (Manifest)
 import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update, tagged_in)
-import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_key, embed_tables, embedded,
-              rewritten, wants_of, want_of_key)
-import items (parse)
+import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, embed_want_bin, embed_key, embed_tables,
+              embedded, rewritten, wants_of, want_of_key)
+import items (parse, import_decl_bin)
 import std.bytes (join, ascii_of_int)
 import std.list
 import lexer (is_ident_start)
@@ -3315,18 +3315,23 @@ type Round = { wanted: Map<Bytes, Bytes>, diags: List<Diag> }
 
 type Wanted = { names: Map<Bytes, Bool>, diags: List<Diag> }
 
+/// A module by its name, and what it imports.
+type Importer = { name: Bytes, imports: List<ImportDecl> }
+
+fn importer(p: ParsedSource) -> Importer = { name: p.name, imports: p.module.module.imports }
+
 /// The shipped modules `parsed` imports and does not hold yet, by name, and each of `asked` it does
 /// not hold. A user module names one by its root; a shipped one names its siblings in the compiler
 /// package bare. `listed` is every shipped module there is, read or not.
 fn wanted(
   users: Int,
   listed: List<Bytes>,
-  parsed: List<ParsedSource>,
+  parsed: List<Importer>,
   asked: List<Bytes>,
 ) -> Wanted / {abort.raise} = {
   let has = fold(listed, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
     map_insert(acc, name, true));
-  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: ParsedSource|
+  let present = fold(parsed, map_new(), |acc: Map<Bytes, Bool>, p: Importer|
     map_insert(acc, p.name, true));
   let named: Wanted = {
     names: fold(asked, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
@@ -3336,7 +3341,7 @@ fn wanted(
   };
   fold(range(0, len(parsed)), named, |acc: Wanted, i: Int| {
     let p = at(parsed, i);
-    let imports = p.module.module.imports;
+    let imports = p.imports;
     let ships = i >= users;
     fold(imports, acc, |w: Wanted, decl: ImportDecl| {
       let name = import_module_name(decl);
@@ -3369,7 +3374,7 @@ fn pull_round(
   parsed: List<ParsedSource>,
   asked: List<Bytes>,
 ) -> Round / {abort.raise} = {
-  let w = wanted(users, listed, parsed, asked);
+  let w = wanted(users, listed, map(parsed, importer), asked);
   map_fold(w.names, { wanted: map_new(), diags: w.diags }, |r: Round, name: Bytes, _: Bool|
     match map_get(shipped, name) {
       Some(src) -> { ..r, wanted: map_insert(r.wanted, name, src) },
@@ -3400,27 +3405,48 @@ pub type Shipping = {
   asked: List<Bytes>,
 }
 
+/// What a load reads of a module to find what it pulls: what it imports, the hidden imports among
+/// them, and what it embeds.
+pub type Pulls = { imports: List<ImportDecl>, wants: List<EmbedWant> }
+
+derive bin for Pulls
+
+/// A module's pulls as its text says them: its header where that says what it imports, else its
+/// whole parse.
+pub fn pulls_of(source: Source) -> Pulls / {abort.raise} =
+  {
+    imports: headed_at(0, source).module.module.imports,
+    wants: if names_embed(source.src) { wants_of(parse(source.src).node) } else { [] },
+  }
+
 /// What a load of `user` and its package closure pulls, each module read once through `read`: what
 /// they import and each of `asked`, what those import in turn, and what any of them embeds beside
-/// itself, a data file read once through `read_data`. Handed the read ones, the rest as `unread`
-/// and `asked`, the front end pulls what it would have pulled from every shipped module.
+/// itself, a data file read once through `read_data`. `pulled` answers what a module's text says
+/// it pulls, as `pulls_of` does. Handed the read ones, the rest as `unread` and `asked`, the front
+/// end pulls what it would have pulled from every shipped module.
 pub fn shipped_pulled<| e>(
   user: List<Source>,
   pkgs: PackageSources,
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
   read_data: (Bytes) -> Option<Bytes> / e,
+  pulled: (Source) -> Pulls / e,
   asked: List<Bytes> = [],
 ) -> Shipping / {abort.raise | e} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let own = concat(user, map(clo.modules, |m: { pkg: Int, src: Source }| m.src));
-  let parsed = map(range(0, len(own)), |i: Int| headed_at(i, at(own, i)));
   let needed = needing(
     len(own),
     listed,
     read,
     read_data,
-    { parsed: parsed, found: [], data: [], tried: map_new() },
+    pulled,
+    {
+      importers: map(own, |source: Source| { name: source.name, imports: pulled(source).imports }),
+      found: [],
+      data: [],
+      tried: map_new(),
+    },
     len(listed) + 1,
     asked,
   );
@@ -3435,7 +3461,7 @@ pub fn shipped_pulled<| e>(
 }
 
 type Needed = {
-  parsed: List<ParsedSource>,
+  importers: List<Importer>,
   found: List<Source>,
   data: List<ShippedData>,
   tried: Map<Bytes, Bool>,
@@ -3448,11 +3474,12 @@ fn needing<| e>(
   listed: List<Bytes>,
   read: (Bytes) -> Option<Bytes> / e,
   read_data: (Bytes) -> Option<Bytes> / e,
+  pulled: (Source) -> Pulls / e,
   x: Needed,
   room: Int,
   asked: List<Bytes>,
 ) -> Needed / {abort.raise | e} = {
-  let names = filter(map_keys(wanted(users, listed, x.parsed, asked).names), |name: Bytes|
+  let names = filter(map_keys(wanted(users, listed, x.importers, asked).names), |name: Bytes|
     !map_contains(x.tried, name));
   if len(names) == 0 || room <= 0 { x } else {
     needing(
@@ -3460,19 +3487,26 @@ fn needing<| e>(
       listed,
       read,
       read_data,
+      pulled,
       fold(names, x, |acc: Needed, name: Bytes| {
         let tried = map_insert(acc.tried, name, true);
         match read(name) {
           None -> { ..acc, tried: tried },
           Some(src) -> {
             let source = { name: name, src: src };
-            let p = headed_at(len(acc.parsed), source);
+            let pulls = pulled(source);
             beside(
               listed,
               read,
               read_data,
-              { ..acc, parsed: push(acc.parsed, p), found: push(acc.found, source), tried: tried },
-              source,
+              {
+                ..acc,
+                importers: push(acc.importers, { name: name, imports: pulls.imports }),
+                found: push(acc.found, source),
+                tried: tried,
+              },
+              name,
+              pulls.wants,
             )
           },
         }
@@ -3490,35 +3524,33 @@ fn beside<| e>(
   read: (Bytes) -> Option<Bytes> / e,
   read_data: (Bytes) -> Option<Bytes> / e,
   x: Needed,
-  source: Source,
+  module: Bytes,
+  wants: List<EmbedWant>,
 ) -> Needed / {abort.raise | e} =
-  if !names_embed(source.src) { x } else {
-    fold(wants_of(parse(source.src).node), x, |acc: Needed, want: EmbedWant|
-      if want.dir { acc } else {
-        match shipped_name(source.name, want.path) {
-          Some(name) -> if map_contains(acc.tried, name) || !list::contains(listed, name) { acc }
-          else {
+  fold(wants, x, |acc: Needed, want: EmbedWant|
+    if want.dir { acc } else {
+      match shipped_name(module, want.path) {
+        Some(name) -> if map_contains(acc.tried, name) || !list::contains(listed, name) { acc }
+        else {
+          let tried = map_insert(acc.tried, name, true);
+          match read(name) {
+            None -> { ..acc, tried: tried },
+            Some(src) -> { ..acc, found: push(acc.found, { name: name, src: src }), tried: tried },
+          }
+        },
+        None -> match shipped_data_name(module, want.path) {
+          None -> acc,
+          Some(name) -> if map_contains(acc.tried, name) { acc } else {
             let tried = map_insert(acc.tried, name, true);
-            match read(name) {
+            match read_data(name) {
               None -> { ..acc, tried: tried },
-              Some(src) ->
-                { ..acc, found: push(acc.found, { name: name, src: src }), tried: tried },
+              Some(bytes) ->
+                { ..acc, data: push(acc.data, { name: name, bytes: bytes }), tried: tried },
             }
           },
-          None -> match shipped_data_name(source.name, want.path) {
-            None -> acc,
-            Some(name) -> if map_contains(acc.tried, name) { acc } else {
-              let tried = map_insert(acc.tried, name, true);
-              match read_data(name) {
-                None -> { ..acc, tried: tried },
-                Some(bytes) ->
-                  { ..acc, data: push(acc.data, { name: name, bytes: bytes }), tried: tried },
-              }
-            },
-          },
-        }
-      })
-  }
+        },
+      }
+    })
 
 /// The name the shipped modules give what sits at `path` beside the shipped module `module`. They
 /// hold a package, and what lies beside its directory, under the package's one root:
@@ -5625,6 +5657,7 @@ fn pulled_by(
         shipped_text(name)
       },
       |name: Bytes| None,
+      pulls_of,
       named,
     );
     { shipping: shipping, asked: cell_get(c) }
@@ -5710,6 +5743,7 @@ test "a load reads a compiler module's bare sibling imports and what it embeds b
       fold(texts, None, |acc: Option<Bytes>, t: Source|
         if t.name == name { Some(t.src) } else { acc }),
     |name: Bytes| None,
+    pulls_of,
   );
   assert_eq(map(s.read, |t: Source| t.name), [
     b"compiler.fmt",
@@ -5749,6 +5783,7 @@ fn data_pulled_by(
           { ..a, data: push(a.data, name) });
         if name == b"std/words/list.txt" { Some(b"one\ntwo\n") } else { None }
       },
+      pulls_of,
       named,
     );
     let asked = cell_get(c);
