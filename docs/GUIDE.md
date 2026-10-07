@@ -3111,7 +3111,11 @@ this compiler, that runnable is the program: a hash covers all its definition
 reaches and no comment, layout, test or definition nothing reaches. Otherwise it
 checks the sources, seeded with the rows its last build of that program
 kept, emits its unit with the emitter's answers kept, and writes the runnable,
-keeping it under that key in `programs/` below the stage root. A program it
+keeping it under that key in `programs/` below the stage root. The unit holds the
+value of each `const fn` the program holds, as `ply build`'s does (§3.5): one a
+build or a check kept is read back, and the rest are entered on a unit of what
+they reach and kept, so the program evaluates none of them; one that raises or
+spends its budget is left to its body. A program it
 ships holds no test and no law, which nothing it enters reaches, and a module
 whose text has not moved since its last build of the program, and that imports
 none whose text has, it reads as that build cut it: its signatures and

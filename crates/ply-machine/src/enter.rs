@@ -133,6 +133,63 @@ fn entered_with(
     })
 }
 
+/// What each of `roots` answers on `unit`, the C emitted over `front`, compiled here: each called
+/// alone with no arguments, nothing lent and under `steps` calls, on a thread of its own as every
+/// machine runs. A root's bytes are the text a build keeps a `const` definition's value as through
+/// its stored root; one that raised, ran past its calls, answered anything else or is not in the
+/// unit answers none.
+pub fn stored_values(
+    front: crate::driver::LoadedAnalysis,
+    unit: String,
+    roots: Vec<String>,
+    steps: i64,
+) -> Result<Vec<Option<Vec<u8>>>, Diagnostic> {
+    let entered = std::thread::Builder::new()
+        .name("ply constants".to_string())
+        .stack_size(crate::STACK)
+        .spawn(move || {
+            let loaded = crate::driver::load_over_analysis_taken(PathBuf::from("."), front)
+                .map_err(|err| {
+                    err.diagnostics.into_iter().next().unwrap_or_else(|| {
+                        Diagnostic::error(
+                            codes::INTERNAL_ERROR,
+                            "the front end's answer did not read, and nothing said why",
+                        )
+                    })
+                })?;
+            let unit = ply_codegen::Unit::handed(&loaded.front, unit).map_err(|e| {
+                Diagnostic::error(
+                    codes::BACKEND_UNAVAILABLE,
+                    format!("the unit could not be compiled: {e:#}"),
+                )
+            })?;
+            let mut machine =
+                ply_eval::Machine::new(&loaded.front, ply_eval::Provider::attach(unit))?;
+            Ok(roots
+                .iter()
+                .map(|root| {
+                    ply_eval::rc::reset();
+                    let (answer, _) = ply_codegen::rt::with_step_budget(steps, || {
+                        machine.call(root, Vec::new(), Span::DUMMY)
+                    })
+                    .into_parts();
+                    answer.ok().and_then(|value| match &value {
+                        ply_eval::Value::Bytes(bytes) => Some(bytes.to_vec()),
+                        _ => None,
+                    })
+                })
+                .collect())
+        })
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the constants could not be entered on a thread of their own: {e}"),
+            )
+        })?
+        .join();
+    entered.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
     diagnostics.first().cloned().unwrap_or_else(|| {
         Diagnostic::error(
