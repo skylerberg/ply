@@ -59,7 +59,22 @@ impl RandomHost {
             }
         }
     }
+
+    /// `size` bytes drawn straight into a `Secret`, so no plain value of the program ever holds
+    /// them: a key's material.
+    pub fn secret(&self, size: i64) -> Result<Value, Diagnostic> {
+        let size = usize::try_from(size)
+            .ok()
+            .filter(|n| *n <= MAX_SECRET)
+            .ok_or_else(|| bad_size(size))?;
+        let mut drawn = zeroize::Zeroizing::new(vec![0u8; size]);
+        self.rng.fill(&mut drawn).map_err(|_| no_entropy())?;
+        Ok(Value::secret_bytes(&drawn))
+    }
 }
+
+/// The most bytes one `entropy.secret` draws: far past any key, and short of a mistake in a size.
+pub const MAX_SECRET: usize = 1 << 16;
 
 /// The handler both operations share: one source of entropy for the run, not one per call.
 struct Entropy {
@@ -77,6 +92,10 @@ impl HostHandler for Entropy {
             "below" => {
                 let n = req.args[0].as_int(req.span, "`entropy.below`")?;
                 Ok(HostAnswer::Value(Value::Int(self.host.below(n)?)))
+            }
+            "secret" => {
+                let n = req.args[0].as_int(req.span, "`entropy.secret`")?;
+                Ok(HostAnswer::Value(self.host.secret(n)?))
             }
             other => Err(unknown_op(other, req.span)),
         }
@@ -110,6 +129,7 @@ operations! {
     path "random";
     Next = "next",
     Below = "below",
+    Secret = "secret",
 }
 
 impl Op {
@@ -147,6 +167,14 @@ fn bad_bound(n: i64) -> Diagnostic {
     )
     .primary(Span::DUMMY, "this bound names no range")
     .note("a bound of zero has no value below it, and a negative one has no meaning here")
+}
+
+fn bad_size(n: i64) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`entropy.secret` draws 0 to {MAX_SECRET} bytes, and was asked for {n}"),
+    )
+    .primary(Span::DUMMY, "this size is no key's")
 }
 
 fn unknown_op(op: &str, span: Span) -> Diagnostic {

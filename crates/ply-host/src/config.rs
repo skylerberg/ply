@@ -119,7 +119,7 @@ impl HostHandler for Operation {
 
 /// The one place in this crate a Ply-level `Secret` is built.
 fn secret(plain: &str) -> Value {
-    Value::secret(Value::Str(plain.into()))
+    Value::secret_text(plain)
 }
 
 fn option(value: Option<Value>) -> Value {
