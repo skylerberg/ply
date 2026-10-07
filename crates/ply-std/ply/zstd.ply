@@ -806,7 +806,7 @@ fn sequence(
   left: Int,
   lim: Array<Int>,
 ) -> Run / {zstd.refused, abort.raise} =
-  if left <= 0 { ended(floor, bit, lits, lp, run, lim) } else {
+  if left <= 0 { run_ended(floor, bit, lits, lp, run, lim) } else {
     let le = array_get(tables, ls);
     let me = array_get(tables, ms);
     let oe = array_get(tables, os);
@@ -917,7 +917,7 @@ fn placed(
 }
 
 /// After a block's last sequence its bits are spent, and the literals no sequence took follow.
-fn ended(
+fn run_ended(
   floor: Int,
   bit: Int,
   lits: Bytes,
@@ -1504,6 +1504,39 @@ pub fn decoded_with<| e>(
   limits: Limits,
 ) -> Seq<Bytes | {zstd.refused, abort.raise | e}> =
   flowing(packed, decoder(limits, d, b""), 0x3FFF_FFFF_FFFF_FFFF)
+
+/// A reader part of the way through a stream of frames: `read` feeds it and `ended` says whether
+/// the stream may end where it stands. It holds of its input what a header or a block left unread,
+/// and of what it wrote a frame's window.
+pub opaque type Reader = | Reader(Decoder)
+
+/// What a reader answers: the bytes it wrote, and the reader after them.
+pub type Read = { out: Bytes, next: Reader }
+
+/// A reader of a stream of frames under `limits`.
+pub fn reader(limits: Limits) -> Reader = Reader(decoder(limits, no_dictionary(), b""))
+
+/// `chunk` read after what the reader holds: every byte it then completes. Refused (`zstd.refused`)
+/// where `decompress` would refuse the stream, but for its ending early: a stream may end where
+/// `ended` says.
+pub fn read(r: Reader, chunk: Bytes) -> Read / {zstd.refused, abort.raise} =
+  match r {
+    Reader(d) -> {
+      let moved = pumped(
+        fed(d, chunk),
+        0x3FFF_FFFF_FFFF_FFFF,
+        false,
+        2 * (bytes_len(d.input) + bytes_len(chunk)) + 8,
+      );
+      let answered = taken(moved);
+      { out: answered.out, next: Reader(answered.next) }
+    },
+  }
+
+/// Whether the stream may end where the reader stands: between frames, one read at least, and
+/// nothing of another held.
+pub fn ended(r: Reader) -> Bool =
+  match r { Reader(d) -> d.core.phase == 0 && d.core.frames > 0 && d.core.at >= bytes_len(d.input) }
 
 // --- Writing: bits ------------------------------------------------------------
 
@@ -2164,7 +2197,7 @@ type Packer = { table: Array<Int>, r1: Int, r2: Int, r3: Int }
 
 type Packed = { bytes: Bytes, packer: Packer }
 
-fn packer() -> Packer / {abort.raise} = { table: array_new(131072, 0), r1: 1, r2: 4, r3: 8 }
+fn packer() -> Packer = { table: array_new(131072, 0), r1: 1, r2: 4, r3: 8 }
 
 fn block_head(last: Bool, kind: Int, size: Int) -> Bytes / {abort.raise} =
   bytes_slice(u32_le(size << 3 | kind << 1 | (if last { 1 } else { 0 })), 0, 3)
@@ -2282,6 +2315,13 @@ fn sealed(w: Encoder, level: Level) -> Bytes / {abort.raise} = {
   bytes_concat_all(push(done.out, u32_le(int_of_u64(checksum::finish(w.sum) & 0xFFFF_FFFFu64))))
 }
 
+/// A frame opens with its magic number, a byte that says a checksum ends it, and its window.
+fn frame_head() -> Bytes = b"\x28\xB5\x2F\xFD\x04\x58"
+
+/// A writer before its first byte.
+fn unwritten() -> Encoder =
+  { buf: b"", from: 0, shift: 0, sum: checksum::init(Xxh64(0u64)), packer: packer() }
+
 fn encoding<| e>(
   plain: Seq<Bytes | e>,
   level: Level,
@@ -2290,12 +2330,8 @@ fn encoding<| e>(
 ) -> Seq<Bytes | {abort.raise | e}> =
   ||
     if fuel <= 0 { Done } else {
-      // A frame opens with its magic number, a byte that says a checksum ends it, and its window.
-      let head = match state { Some(_) -> b"", None -> b"\x28\xB5\x2F\xFD\x04\x58" };
-      let w = match state {
-        Some(held) -> held,
-        None -> { buf: b"", from: 0, shift: 0, sum: checksum::init(Xxh64(0u64)), packer: packer() },
-      };
+      let head = match state { Some(_) -> b"", None -> frame_head() };
+      let w = match state { Some(held) -> held, None -> unwritten() };
       match plain() {
         Done -> Yield(bytes_concat(head, sealed(w, level)), seq::empty()),
         Skip(rest) -> Skip(encoding(rest, level, state, fuel - 1)),
@@ -2315,6 +2351,38 @@ fn encoding<| e>(
 /// it was handed.
 pub fn encoded<| e>(plain: Seq<Bytes | e>, level: Level) -> Seq<Bytes | {abort.raise | e}> =
   encoding(plain, level, None, 0x3FFF_FFFF_FFFF_FFFF)
+
+/// A writer part of the way through a frame: `write` feeds it and `finish` ends it. It holds the
+/// 2 MiB a match may reach and up to as much again, and the block it is filling.
+pub opaque type Writer = | Writer({ head: Bytes, encoder: Encoder })
+
+/// What a writer answers: the bytes it wrote, and the writer after them.
+pub type Written = { out: Bytes, next: Writer }
+
+/// A writer of one frame whose window is 2 MiB and which ends with a checksum. Its header goes out
+/// with its first bytes.
+pub fn writer() -> Writer = Writer({ head: frame_head(), encoder: unwritten() })
+
+/// `chunk` taken in: every whole block of 128 KiB the writer then holds written out.
+pub fn write(w: Writer, chunk: Bytes, level: Level) -> Written / {abort.raise} =
+  match w {
+    Writer(held) -> {
+      let took = pressed(held.encoder, chunk, level);
+      let out = bytes_concat(held.head, took.out);
+      {
+        out: out,
+        next: Writer({
+          head: if bytes_len(out) == 0 { held.head } else { b"" },
+          encoder: took.next,
+        }),
+      }
+    },
+  }
+
+/// The frame's last bytes: what the writer holds, in blocks of which the last says so, and the
+/// checksum.
+pub fn finish(w: Writer, level: Level) -> Bytes / {abort.raise} =
+  match w { Writer(held) -> bytes_concat(held.head, sealed(held.encoder, level)) }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -2606,4 +2674,30 @@ test "64 KiB of short matches unpacks without a copy of the output for each" {
   let packed = compress(text, Fast);
   let read = metered(|| decompress(packed, roomy()));
   assert(read.bytes < 128 * 65536, Some(int_to_string(read.bytes)))
+}
+
+test "a frame written a piece at a time reads back a piece at a time, and the stream may end after it" {
+  let text = repeat(sentence(), 6000);
+  let pieces = seq::to_list(seq::slices(text, 150000), 100);
+  let wrote = fold(
+    pieces,
+    { out: [], w: writer() },
+    |s: { out: List<Bytes>, w: Writer }, p: Bytes| {
+      let took = write(s.w, p, Fast);
+      { out: push(s.out, took.out), w: took.next }
+    },
+  );
+  let packed = bytes_concat_all(push(wrote.out, finish(wrote.w, Fast)));
+  assert_eq(decompress(packed, { output: bytes_len(text), window: 2097152 }), text);
+  let back = fold(
+    seq::to_list(seq::slices(packed, 1234), 10000),
+    { out: [], r: reader({ output: bytes_len(text), window: 2097152 }) },
+    |s: { out: List<Bytes>, r: Reader }, p: Bytes| {
+      let got = read(s.r, p);
+      { out: push(s.out, got.out), r: got.next }
+    },
+  );
+  assert_eq(bytes_concat_all(back.out), text);
+  assert(ended(back.r));
+  assert(!ended(read(reader(roomy()), bytes_slice(packed, 0, bytes_len(packed) - 1)).next))
 }

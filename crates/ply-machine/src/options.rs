@@ -4,11 +4,13 @@
 use ply_host::tls::CredentialSpec;
 use std::path::PathBuf;
 
-/// TLS credentials and extra roots of trust.
+/// TLS credentials, extra roots of trust, and the credentials whose listeners require a client
+/// certificate.
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
     pub tls: Vec<CredentialSpec>,
     pub trust: Vec<PathBuf>,
+    pub mtls: Vec<String>,
 }
 
 /// What a `SIGINT` or a `SIGTERM` does to a serving run.

@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 /// What an entry is, as its `format` field says: one of any other shape is no entry.
-const FORMAT: &str = "ply run front 3";
+const FORMAT: &str = "ply run front 4";
 
 /// What an entry says of the `reuse fn` promises the load it was filed from checked.
 const HELD: &str = "held";
@@ -24,9 +24,10 @@ pub struct Walked {
 }
 
 /// The front `entry` filed, over this run's own files: the walk's modules, the shipped modules the
-/// filed answer pulled, then the walk's manifests, in the order its ids run, and the C of the unit
-/// it was emitted as. The places are this run's, so a span renders as this run's front end would have
-/// rendered it. `None` when the entry does not read or does not fit the walk.
+/// filed answer pulled, as the load that filed it placed them, then the walk's manifests, in the
+/// order its ids run, and the C of the unit it was emitted as. The places are this run's, so a span
+/// renders as this run's front end would have rendered it. `None` when the entry does not read or does
+/// not fit the walk.
 pub fn front(
     entry: &[u8],
     modules: Vec<Walked>,
@@ -43,15 +44,21 @@ pub fn front(
     let pulled = filed.files.len().checked_sub(own + manifests.len())?;
     let mut walked = modules.into_iter().chain(manifests);
     let mut files = Vec::with_capacity(filed.files.len());
-    for (i, (path, name)) in filed.files.into_iter().enumerate() {
+    for (i, file) in filed.files.into_iter().enumerate() {
         let (path, text) = if (own..own + pulled).contains(&i) {
-            let text = crate::shipped_modules::source(&ModuleName::from_dotted(&name))?;
-            (path, text.to_string())
-        } else {
-            let file = walked.next()?;
+            if !crate::shipped_modules::ships(&ModuleName::from_dotted(&file.name)) {
+                return None;
+            }
             (file.path, file.text)
+        } else {
+            let walked = walked.next()?;
+            (walked.path, walked.text)
         };
-        files.push(LoadedFile { path, name, text });
+        files.push(LoadedFile {
+            path,
+            name: file.name,
+            text,
+        });
     }
     let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
     let answer = ply_codegen::c::dump::read(filed.dump, &ids).ok()?;
@@ -66,11 +73,11 @@ pub fn front(
     Some((front, filed.unit.to_vec()))
 }
 
-/// An entry as it reads: every file's place and module, the front end's answer and the unit's C.
-/// Only an entry that says its load's promises held is read at all, since that is the only kind
-/// ever filed.
+/// An entry as it reads: every file's place, module and the text filed for it, the front end's answer
+/// and the unit's C. Only an entry that says its load's promises held is read at all, since that is
+/// the only kind ever filed.
 struct Filed<'v> {
-    files: Vec<(String, String)>,
+    files: Vec<LoadedFile>,
     dump: &'v Value,
     unit: &'v [u8],
 }
@@ -85,10 +92,11 @@ impl<'v> Filed<'v> {
         }
         Ok(Filed {
             files: entry.field("files")?.items(|file| {
-                Ok((
-                    file.field("path")?.str()?.to_string(),
-                    file.field("name")?.str()?.to_string(),
-                ))
+                Ok(LoadedFile {
+                    path: file.field("path")?.str()?.to_string(),
+                    name: file.field("name")?.str()?.to_string(),
+                    text: file.field("text")?.str()?.to_string(),
+                })
             })?,
             dump: entry.field("dump")?.value(),
             unit: entry.field("unit")?.bytes()?,
@@ -97,9 +105,12 @@ impl<'v> Filed<'v> {
 }
 
 /// The entry for a load that held over the front and unit it was handed: every file's place and
-/// module, `dump`, the front end's answer, and the unit's C. `None` when the answer does not
-/// encode, or when the entry is more than one read of the file it is filed in would answer.
-pub fn entry(files: &[(String, String)], dump: &Value, unit: &[u8]) -> Option<Vec<u8>> {
+/// module, the text of each shipped module as the load placed it, `dump`, the front end's answer, and
+/// the unit's C. A shipped module's placed text is what an importer reads of it, which the emitter
+/// parses, so it is filed rather than read off the binary again; any other file is the walk's. `None`
+/// when the answer does not encode, or when the entry is more than one read of the file it is filed
+/// in would answer.
+pub fn entry(files: &[LoadedFile], dump: &Value, unit: &[u8]) -> Option<Vec<u8>> {
     let entry = record(vec![
         ("format", Value::str(FORMAT)),
         (
@@ -107,8 +118,17 @@ pub fn entry(files: &[(String, String)], dump: &Value, unit: &[u8]) -> Option<Ve
             Value::list(
                 files
                     .iter()
-                    .map(|(path, name)| {
-                        record(vec![("path", Value::str(path)), ("name", Value::str(name))])
+                    .map(|file| {
+                        let shipped =
+                            crate::shipped_modules::ships(&ModuleName::from_dotted(&file.name));
+                        record(vec![
+                            ("path", Value::str(&file.path)),
+                            ("name", Value::str(&file.name)),
+                            (
+                                "text",
+                                Value::str(if shipped { file.text.as_str() } else { "" }),
+                            ),
+                        ])
                     })
                     .collect(),
             ),

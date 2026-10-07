@@ -113,6 +113,10 @@ pub type SocketOption =
   | JoinGroup(Ip, Option<String>)
   /// Leave a multicast group joined on that interface.
   | LeaveGroup(Ip, Option<String>)
+  /// Present the certificate of the credential `--tls NAME=CERT,KEY` named this when a later
+  /// `start_tls` secures the connection and its server asks for a client certificate; one the run
+  /// lacks is `E0429` at that `start_tls`. It is set and not read back: `options` lists none.
+  | Presenting(String)
 
 /// Who holds the far end of a Unix socket: its user, its group, and its process where the platform
 /// says.
@@ -251,7 +255,11 @@ fn send_from<[l]>(
 ) -> Bool / {net.send[l], abort.raise} =
   if at >= bytes_len(payload) { true }
   else if left <= 0 { false } else {
-    match net.send[l](c, bytes_slice(payload, at, bytes_len(payload)), timeout_ms) {
+    match net.send[l](
+        c,
+        if at == 0 { payload } else { bytes_slice(payload, at, bytes_len(payload)) },
+        timeout_ms,
+      ) {
       None -> false,
       Some(n) -> if n <= 0 { false } else { send_from(c, payload, at + n, timeout_ms, left - 1) },
     }
@@ -308,7 +316,7 @@ fn dialled<[l]>(
   port: Int,
   options: List<SocketOption>,
   end: Instant,
-) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at, abort.raise} =
+) -> Int / {dns.lookup, net.connect_to[l], socket.refused, task.write, clock.read, clock.write, task::deadline.at} =
   match dns::resolve(name, between(clock.now(), end)) {
     Ok(found) -> reached[l](dns::interleave(dns::addresses(found)), port, options, end),
     Err(dns::TimedOut) -> socket.refused(TimedOut),
@@ -321,7 +329,7 @@ fn reached<[l]>(
   port: Int,
   options: List<SocketOption>,
   end: Instant,
-) -> Int / {net.connect_to[l], socket.refused, clock.read, abort.raise} =
+) -> Int / {net.connect_to[l], socket.refused, clock.read} =
   match addresses {
     [] -> socket.refused(NameNotFound),
     [address, ..rest] -> match ip::socket_address(address, port) {
@@ -473,12 +481,13 @@ pub type Step =
 /// connection with the next of its scripts, or a refusal.
 pub type Reach = | Serving(List<List<Step>>) | Failing(Refusal)
 
-/// A client the twin's `accept` hands out: where it calls from, what it does, and for a Unix
-/// socket who it is.
+/// A client the twin's `accept` hands out: where it calls from, what it does, for a Unix socket who
+/// it is, and the certificate (DER) it presents once its connection is secured.
 pub type Caller = {
   from: Option<SocketAddress>,
   script: List<Step>,
   credentials: Option<PeerCredentials>,
+  certificate: Option<Bytes>,
 }
 
 /// A listener a twin holds: where it is bound (an address or a Unix path), the credential it
@@ -515,6 +524,9 @@ pub type MemConn = {
   agreed: Option<String>,
   options: List<SocketOption>,
   credentials: Option<PeerCredentials>,
+  /// `accept` handed the connection out, and the certificate its client presents, where it does.
+  accepted: Bool,
+  presented: Option<Bytes>,
 }
 
 /// One network, as a value. `short` is the most bytes one `recv` or `send` moves, zero for as
@@ -553,7 +565,8 @@ pub fn mem_empty() -> MemNet =
     closed: [],
   }
 
-/// The network with a far end secured as `name` presenting the certificate `der`.
+/// The network with a far end secured as `name` presenting the certificate `der`, and with a
+/// connection `Presenting(name)` presenting it to the program's own listener.
 pub fn mem_presenting(n: MemNet, name: String, der: Bytes) -> MemNet =
   { ..n, leaves: map_insert(n.leaves, name, der) }
 
@@ -577,11 +590,45 @@ pub fn mem_serving_unix(
 /// The network with one more client for `accept` to hand out, calling from `from` and doing
 /// `script`.
 pub fn mem_calling(n: MemNet, from: SocketAddress, script: List<Step>) -> MemNet =
-  { ..n, callers: push(n.callers, { from: Some(from), script: script, credentials: None }) }
+  {
+    ..n,
+    callers: push(n.callers, {
+      from: Some(from),
+      script: script,
+      credentials: None,
+      certificate: None,
+    }),
+  }
+
+/// `mem_calling`, for a client that presents the certificate `der` once its connection is
+/// secured: what a server's `net.peer_certificate` then answers.
+pub fn mem_calling_presenting(
+  n: MemNet,
+  from: SocketAddress,
+  der: Bytes,
+  script: List<Step>,
+) -> MemNet =
+  {
+    ..n,
+    callers: push(n.callers, {
+      from: Some(from),
+      script: script,
+      credentials: None,
+      certificate: Some(der),
+    }),
+  }
 
 /// The network with one more client for `accept` to hand out over a Unix socket, held by `who`.
 pub fn mem_calling_unix(n: MemNet, who: PeerCredentials, script: List<Step>) -> MemNet =
-  { ..n, callers: push(n.callers, { from: None, script: script, credentials: Some(who) }) }
+  {
+    ..n,
+    callers: push(n.callers, {
+      from: None,
+      script: script,
+      credentials: Some(who),
+      certificate: None,
+    }),
+  }
 
 /// The network resolving names by `names`, which `connect`, `connect_tls` and, under `on_mem`,
 /// `dns` are answered from.
@@ -727,6 +774,8 @@ fn new_conn(
     agreed: None,
     options: [NoDelay(true)],
     credentials: None,
+    accepted: false,
+    presented: None,
   }
 
 /// The listener bound at `key`, if the program holds one there.
@@ -861,7 +910,14 @@ fn opened(
     Some(listener) -> {
       let l = match map_get(n.listeners, listener) { Some(l) -> l, None -> no_socket(listener) };
       let accepted = new_conn(l.at, local, []);
-      let theirs = { ..accepted, joined: Some(n.next), fed: true, secured: l.tls };
+      let theirs = {
+        ..accepted,
+        joined: Some(n.next),
+        fed: true,
+        secured: l.tls,
+        accepted: true,
+        presented: presented_by(n, options),
+      };
       {
         net: {
           ..after,
@@ -895,6 +951,11 @@ fn opened(
     },
   }
 }
+
+/// The certificate a connection opened with `options` presents to the program's own listener.
+fn presented_by(n: MemNet, options: List<SocketOption>) -> Option<Bytes> =
+  fold(options, None, |was: Option<Bytes>, o: SocketOption|
+    match o { Presenting(name) -> map_get(n.leaves, name), _ -> was })
 
 /// What `net.connect_to` answers over the network.
 pub fn mem_connect_to(
@@ -993,7 +1054,13 @@ pub fn mem_accept(n: MemNet, label: String, listener: Int) -> Stepped<Int> / {ab
       [] -> { net: n, answer: 0 },
       [caller, ..rest] -> {
         let fresh = new_conn(l.at, caller.from, caller.script);
-        let c = { ..fresh, secured: l.tls, credentials: caller.credentials };
+        let c = {
+          ..fresh,
+          secured: l.tls,
+          credentials: caller.credentials,
+          accepted: true,
+          presented: caller.certificate,
+        };
         {
           net: { ..n, next: n.next + 1, callers: rest, conns: map_insert(n.conns, n.next, c) },
           answer: n.next,
@@ -1280,10 +1347,12 @@ fn setting(option: SocketOption) -> Int =
     MulticastLoop(_) -> 8,
     JoinGroup(_, _) -> 9,
     LeaveGroup(_, _) -> 10,
+    Presenting(_) -> 11,
   }
 
 /// `options` with `option` in place of what it held for the same setting: what a twin keeps of
-/// the options set on a socket. A group joined or left is no setting, and is not kept.
+/// the options set on a socket. A group joined or left, or a credential to present, is no setting,
+/// and is not kept.
 pub fn with_option(options: List<SocketOption>, option: SocketOption) -> List<SocketOption> =
   if setting(option) >= 9 { options }
   else { push(filter(options, |held: SocketOption| setting(held) != setting(option)), option) }
@@ -1299,10 +1368,15 @@ pub fn mem_set_option(
   match map_get(n.conns, socket) {
     Some(_) -> {
       let c = conn_of(n, label, socket);
-      {
-        net: with_conn(n, socket, { ..c, options: with_option(c.options, option) }),
-        answer: Ok(()),
-      }
+      let set = with_conn(n, socket, { ..c, options: with_option(c.options, option) });
+      let presenting = match ((c.accepted, c.joined)) {
+        (false, Some(peer)) -> match map_get(set.conns, peer) {
+          Some(p) -> with_conn(set, peer, { ..p, presented: presented_by(n, [option]) }),
+          None -> set,
+        },
+        _ -> set,
+      };
+      { net: match option { Presenting(_) -> presenting, _ -> set }, answer: Ok(()) }
     },
     None -> {
       let l = listener_of(n, label, socket);
@@ -1355,13 +1429,18 @@ pub fn mem_peer_address(
     },
   }
 
-/// What `net.peer_certificate` answers over the network: the certificate `mem_presenting` gave the
-/// name a connection was secured as, where it gave one.
+/// What `net.peer_certificate` answers over the network, once a connection is secured: to a server,
+/// the certificate its client was handed out presenting (`mem_calling_presenting`), or the program's
+/// own client presents (`Presenting`); to a client, the one `mem_presenting` gave the name it
+/// secured the connection as.
 pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes> / {abort.raise} =
   match map_get(n.conns, conn) {
-    Some(_) -> match conn_of(n, label, conn).secured {
-      Some(name) -> map_get(n.leaves, name),
-      None -> None,
+    Some(_) -> {
+      let c = conn_of(n, label, conn);
+      match c.secured {
+        Some(name) -> if c.accepted { c.presented } else { map_get(n.leaves, name) },
+        None -> None,
+      }
     },
     None -> {
       let _l = listener_of(n, label, conn);
@@ -2092,6 +2171,47 @@ test "a secured connection's far end presents the certificate its name was given
     { before: before, after: net.peer_certificate[db](c) }
   });
   assert_eq(ran.value, { before: None, after: Some(b"leaf") })
+}
+
+test "a server's connection answers the certificate its client presented, and none for one that presented none" {
+  let world = mem_calling(
+    mem_calling_presenting(
+      mem_credential(mem_empty(), "api"),
+      ip::read_socket("198.51.100.4:5000"),
+      b"client leaf",
+      [],
+    ),
+    ip::read_socket("198.51.100.5:5000"),
+    [],
+  );
+  let ran = on_mem(world, || {
+    let l = net.listen_tls[web](0, "api");
+    let first = net.accept[web](l);
+    let second = net.accept[web](l);
+    [net.peer_certificate[web](first), net.peer_certificate[web](second)]
+  });
+  assert_eq(ran.value, [Some(b"client leaf"), None])
+}
+
+test "the program's own listener sees the certificate its client presents, and none from one presenting none" {
+  let world = mem_presenting(mem_credential(mem_empty(), "api"), "caller", b"caller leaf");
+  let ran = on_mem(world, || {
+    let here = ip::read_socket("127.0.0.1:8443");
+    let l = listening[listener](here, []);
+    let presenting = dial_address[client](here, [Presenting("caller")], 1000);
+    let later = dial_address[client](here, [], 1000);
+    let anonymous = dial_address[client](here, [], 1000);
+    let set = net.set_option[client](later, Presenting("caller"));
+    let served = map([presenting, later, anonymous], |_c: Int| {
+      let c = net.accept[listener](l);
+      let _secured = net.serve_tls[listener](c, "api", [], b"", 1000);
+      net.peer_certificate[listener](c)
+    });
+    { set: set, served: served, options: net.options[client](presenting) }
+  });
+  assert_eq(ran.value.set, Ok(()));
+  assert_eq(ran.value.served, [Some(b"caller leaf"), Some(b"caller leaf"), None]);
+  assert_eq(ran.value.options, [NoDelay(true)])
 }
 
 test "a secured connection says which protocol its handshake agreed, and a plaintext one none" {
