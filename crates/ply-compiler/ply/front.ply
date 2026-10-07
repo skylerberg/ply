@@ -417,8 +417,9 @@ fn module_row(
 // holds: what a compiled package ships, and what the emitter reads of a module it does not lower.
 
 /// A braced cut keeps `{` and `}` at its ends: an empty block over exactly the body's own span. It
-/// names the function whose body it blanks, which a stub is read only with a row and a hash for.
-pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes }
+/// names the function whose body it blanks, or with `test` the test (by its owner), which a stub is
+/// read only with a row and a hash for.
+pub type Cut = { start: Int, end: Int, braced: Bool, name: Bytes, test: Bool }
 
 derive bin for Cut
 
@@ -447,19 +448,68 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
             end: b.end,
             braced: true,
             name: qualify(parsed.name, d.name.name),
+            test: false,
           })
         }
       },
-      ITest(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
-      ILaw(d) -> push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"" }),
+      ITest(d) ->
+        push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
+      ILaw(d) ->
+        push(acc, { start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
       _ -> acc,
     })
 }
 
-/// The cuts that blank a module's bodies and leave its tests and laws: a stub of a module whose own
-/// tests a load still answers for.
-pub fn body_cuts_of(parsed: ParsedModule) -> List<Cut> =
-  filter(cuts_of(parsed), |cut: Cut| cut.braced)
+/// Each test a stub blanks the body of, by its owner.
+pub fn blanked_tests(cuts: List<StubCuts>) -> List<Bytes> =
+  fold(cuts, [], |acc: List<Bytes>, s: StubCuts|
+    fold(s.cuts, acc, |a: List<Bytes>, c: Cut| if c.test { push(a, c.name) } else { a }))
+
+/// The cuts that blank a module's function and test bodies and leave the rest of each test, and its
+/// laws: a stub of a module whose own tests a load still answers for, each by its row and the hash
+/// its run fixed.
+pub fn body_cuts_of(parsed: ParsedModule) -> List<Cut> / {abort.raise} = {
+  let tested = fold(
+    parsed.module.items,
+    { cuts: [], position: 0 },
+    |acc: { cuts: List<Cut>, position: Int }, item: Item|
+      match item {
+        ITest(d) -> {
+          let b = expr_span(d.body);
+          {
+            cuts: if b.end - b.start < 2 { acc.cuts } else {
+              push(acc.cuts, {
+                start: b.start,
+                end: b.end,
+                braced: true,
+                name: test_owner(parsed.name, acc.position),
+                test: true,
+              })
+            },
+            position: acc.position + 1,
+          }
+        },
+        _ -> acc,
+      },
+  );
+  in_order(filter(cuts_of(parsed), |cut: Cut| cut.braced), tested.cuts)
+}
+
+/// Two runs of cuts, each in source order, as one.
+fn in_order(a: List<Cut>, b: List<Cut>) -> List<Cut> / {abort.raise} =
+  iterate(
+    { out: [], i: 0, j: 0 },
+    len(a) + len(b) + 1,
+    |x: { out: List<Cut>, i: Int, j: Int }|
+      match ((list_at(a, x.i), list_at(b, x.j))) {
+        (None, None) -> Stop(x),
+        (Some(c), None) -> Continue({ ..x, out: push(x.out, c), i: x.i + 1 }),
+        (None, Some(c)) -> Continue({ ..x, out: push(x.out, c), j: x.j + 1 }),
+        (Some(c), Some(d)) -> if c.start <= d.start {
+          Continue({ ..x, out: push(x.out, c), i: x.i + 1 })
+        } else { Continue({ ..x, out: push(x.out, d), j: x.j + 1 }) },
+      },
+  ).out
 
 fn def_row(def_info: DefInfo, w: Written) -> DefRow / {abort.raise} =
   {
@@ -1593,6 +1643,7 @@ fn known_from_rows(
   fixed: List<Fixed>,
   texts: List<Bytes>,
   blank: Map<Bytes, Bool>,
+  cut_tests: Map<Bytes, Bool>,
 ) -> Known / {abort.raise} = {
   let decls = by_name(hashes.decls);
   let held = fold(fixed, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
@@ -1620,6 +1671,7 @@ fn known_from_rows(
       reads: by_name_names(hashes.deps),
       said: said_of(hashes),
       blank: blank,
+      cut_tests: cut_tests,
     }),
   }
 }
@@ -1737,7 +1789,7 @@ fn facts_filed(read: BodiesRead, owner: Bytes, at: Span) -> Bytes / {abort.raise
   }
 
 /// Each test's owner, in the order the tests were checked.
-fn test_owners(tests: List<TestInfo>) -> List<Bytes> =
+pub fn test_owners(tests: List<TestInfo>) -> List<Bytes> =
   fold(
     tests,
     { seen: map_new(), out: [] },
@@ -1944,7 +1996,7 @@ fn check_keys(checked: CheckOutput, hashes: HashOutput) -> Map<Bytes, Bytes> =
   )
 
 /// A test's, which is its hash where the checker keyed nothing.
-fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {abort.raise} =
+pub fn test_check_key(checked: CheckOutput, hashes: HashOutput, i: Int) -> Bytes / {abort.raise} =
   match list_at(checked.test_checks, i) {
     Some(k) -> if bytes_len(k) > 0 { k } else { at(hashes.tests, i) },
     None -> at(hashes.tests, i),
@@ -1954,22 +2006,31 @@ fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} =
   let keyed = check_keys(checked, hashes);
   let decls = by_name(hashes.decls);
   let read = bodies_read(checked);
-  let owners = test_owners(checked.tests);
   {
     defs: fold(checked.defs, [], |acc: List<KnownDefRow>, def_info: DefInfo|
       match map_get(keyed, def_info.name) {
         Some(x) -> push(acc, def_known_row(decls, def_info, x, read)),
         None -> acc,
       }),
-    tests: map(range(0, len(checked.tests)), |i: Int|
-      test_known_row(
-        decls,
-        at(checked.tests, i),
-        test_check_key(checked, hashes, i),
-        at(owners, i),
-        read,
-      )),
+    tests: test_rows(checked, hashes, decls, read),
   }
+}
+
+fn test_rows(
+  checked: CheckOutput,
+  hashes: HashOutput,
+  decls: Map<Bytes, Bytes>,
+  read: BodiesRead,
+) -> List<KnownTestRow> / {abort.raise} = {
+  let owners = test_owners(checked.tests);
+  map(range(0, len(checked.tests)), |i: Int|
+    test_known_row(
+      decls,
+      at(checked.tests, i),
+      test_check_key(checked, hashes, i),
+      at(owners, i),
+      read,
+    ))
 }
 
 /// The rows a compiled package carries: each definition's counts as its row writes them, which is
@@ -2055,13 +2116,26 @@ pub type Filing = {
 
 pub fn filed_span(span: Span) -> FiledSpan = { start: span.start, end: span.end }
 
-/// A type's constructors in declaration order, which is each one's index.
-fn ctors_of_type(ctors: List<CtorInfo>, name: Bytes) -> List<CtorInfo> = {
-  let mine = filter(ctors, |ctor_info: CtorInfo| ctor_info.type_name == name);
-  fold(range(0, len(mine)), [], |acc: List<CtorInfo>, i: Int|
-    fold(mine, acc, |a: List<CtorInfo>, ctor_info: CtorInfo|
-      if ctor_info.index == i { push(a, ctor_info) } else { a }))
+/// Each type's constructors in declaration order, which is each one's index.
+fn ctors_by_type(ctors: List<CtorInfo>) -> Map<Bytes, List<CtorInfo>> = {
+  let grouped = fold(ctors, map_new(), |acc: Map<Bytes, List<CtorInfo>>, ctor_info: CtorInfo|
+    map_insert(
+      acc,
+      ctor_info.type_name,
+      push(match map_get(acc, ctor_info.type_name) { Some(cs) -> cs, None -> [] }, ctor_info),
+    ));
+  map_fold(grouped, grouped, |acc: Map<Bytes, List<CtorInfo>>, name: Bytes, mine: List<CtorInfo>|
+    map_insert(
+      acc,
+      name,
+      fold(range(0, len(mine)), [], |ordered: List<CtorInfo>, i: Int|
+        fold(mine, ordered, |a: List<CtorInfo>, ctor_info: CtorInfo|
+          if ctor_info.index == i { push(a, ctor_info) } else { a })),
+    ))
 }
+
+fn ctors_of_type(by_type: Map<Bytes, List<CtorInfo>>, name: Bytes) -> List<CtorInfo> =
+  match map_get(by_type, name) { Some(cs) -> cs, None -> [] }
 
 fn filed_op(op_info: OpInfo) -> FiledOp / {abort.raise} =
   {
@@ -2076,7 +2150,7 @@ type Filers = {
   defs: Map<Bytes, DefInfo>,
   types: Map<Bytes, TypeRow>,
   effects: Map<Bytes, EffectInfo>,
-  ctors: List<CtorInfo>,
+  ctors: Map<Bytes, List<CtorInfo>>,
   hashed: Map<Bytes, Bytes>,
   checked: Map<Bytes, Bytes>,
   decls: Map<Bytes, Bytes>,
@@ -2193,7 +2267,7 @@ fn listed(h: Option<Bytes>) -> List<Bytes> = match h { Some(x) -> [x], None -> [
 
 /// A name's one body answers for each hash the name has; a `fn` and a declaration sharing a name
 /// have a body each, and each is filed under the hash it verifies as.
-fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
+fn filed_bodies(hashes: HashOutput, standing: Map<Bytes, Bool>) -> List<FiledBody> / {abort.raise} = {
   let defs = by_name(hashes.defs);
   let decls = by_name(hashes.decls);
   let counted = fold(
@@ -2207,7 +2281,10 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
     if bytes_len(b.body) == 0 { acc } else {
       let alone = match map_get(counted, b.name) { Some(n) -> n == 1, None -> false };
       fold(
-        concat(listed(map_get(defs, b.name)), listed(map_get(decls, b.name))),
+        concat(
+          if map_contains(standing, b.name) { [] } else { listed(map_get(defs, b.name)) },
+          listed(map_get(decls, b.name)),
+        ),
         acc,
         |a: List<FiledBody>, hash: Bytes|
           if alone || body_key(b.body) == Some(hash) { push(a, { hash: hash, body: b.body }) }
@@ -2216,12 +2293,24 @@ fn filed_bodies(hashes: HashOutput) -> List<FiledBody> / {abort.raise} = {
     })
 }
 
-/// Everything the front-end cache files after an analysis, as plain data.
-pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
+/// Everything the front-end cache files after an analysis, as plain data. `stored` is what the
+/// store gave the load, each interface under the check key its row names: a definition the checker
+/// took from its rows under the key it has now is in the store as this filing would write it, so
+/// only the modules that list it name it.
+pub fn filing(analysis: Analysis, stored: List<DefInterface> = []) -> Filing / {abort.raise} = {
   let hashed = by_name(analysis.hashes.defs);
   let checked = check_keys(analysis.checked, analysis.hashes);
   let decls = by_name(analysis.hashes.decls);
   let types = type_rows(analysis.mods);
+  let ctors = ctors_by_type(analysis.checked.ctors);
+  let filed = fold(stored, map_new(), |acc: Map<Bytes, Bytes>, d: DefInterface|
+    map_insert(acc, d.row.name, d.row.hash));
+  let standing = fold(analysis.checked.seeded, map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    match map_get(filed, name) {
+      Some(k) -> if map_get(checked, name) == Some(k) { map_insert(acc, name, true) } else { acc },
+      None -> acc,
+    });
+  let read = bodies_read(analysis.checked);
   let f: Filers = {
     defs: map_of_entries(
       map(analysis.checked.defs, |def_info: DefInfo| { key: def_info.name, value: def_info }),
@@ -2231,15 +2320,16 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
       map(analysis.checked.effects, |effect_info: EffectInfo|
         { key: effect_info.name, value: effect_info }),
     ),
-    ctors: analysis.checked.ctors,
+    ctors: ctors,
     hashed: hashed,
     checked: checked,
     decls: decls,
   };
-  let rows = rows_of(analysis);
-  let row_of = fold(rows.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, row: KnownDefRow|
-    map_insert(acc, row.name, row));
-  let tests = tests_by_module(analysis.checked, analysis.hashes, rows.tests);
+  let tests = tests_by_module(
+    analysis.checked,
+    analysis.hashes,
+    test_rows(analysis.checked, analysis.hashes, decls, read),
+  );
   let typed = fold(types, [], |acc: List<FiledDecl>, t: TypeRow|
     match map_get(decls, t.name) {
       None -> acc,
@@ -2251,7 +2341,7 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
             effect: false,
             arity: t.arity,
             nondet: false,
-            variants: map(ctors_of_type(analysis.checked.ctors, t.name), |ctor_info: CtorInfo|
+            variants: map(ctors_of_type(ctors, t.name), |ctor_info: CtorInfo|
               { name: ctor_info.simple_name, fields: map(ctor_info.fields, type_text) }),
             ops: [],
           },
@@ -2270,19 +2360,20 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
     // A definition's interface holds while its check key does, which a body edit leaves alone
     // wherever what the edited definition publishes does not move.
     defs: fold(analysis.checked.defs, [], |acc: List<FiledDef>, def_info: DefInfo|
-      match ((
-          map_get(hashed, def_info.name),
-          map_get(checked, def_info.name),
-          map_get(row_of, def_info.name),
-        )) {
-        (Some(h), Some(k), Some(row)) ->
-          push(acc, {
-            name: def_info.name,
-            hash: h,
-            check: k,
-            interface: { row: row, scheme: scheme_text(def_info.scheme) },
-          }),
-        _ -> acc,
+      if map_contains(standing, def_info.name) { acc } else {
+        match ((map_get(hashed, def_info.name), map_get(checked, def_info.name))) {
+          (Some(h), Some(k)) ->
+            push(acc, {
+              name: def_info.name,
+              hash: h,
+              check: k,
+              interface: {
+                row: def_known_row(decls, def_info, k, read),
+                scheme: scheme_text(def_info.scheme),
+              },
+            }),
+          _ -> acc,
+        }
       }),
     decls: fold(analysis.checked.effects, typed, |acc: List<FiledDecl>, effect_info: EffectInfo|
       match map_get(decls, effect_info.name) {
@@ -2300,7 +2391,7 @@ pub fn filing(analysis: Analysis) -> Filing / {abort.raise} = {
             },
           }),
       }),
-    bodies: filed_bodies(analysis.hashes),
+    bodies: filed_bodies(analysis.hashes, standing),
   }
 }
 
@@ -2492,6 +2583,8 @@ fn hashed_closure(
           let built = build_index(x.mods, x.r);
           if len(built.diags) > 0 { Err(map(built.diags, outside_every_module)) } else {
             // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
+            // A stub blanks the body of each test it cuts: each is hashed as its run fixed it, or not
+            // at all.
             let hashed = hashed_and_unused(
               built.index,
               ifaces.fixed,
@@ -2499,26 +2592,46 @@ fn hashed_closure(
               priors,
               ifaces.tests,
               ifaces.laws,
+              blanked_tests(concat(ifaces.cuts, cuts)),
             );
-            Ok({
-              mods: x.mods,
-              r: x.r,
-              index: built.index,
-              hashes: hashed.hashes,
-              unused: hashed.unused,
-              clo: clo,
-              packages: tables.pkgs,
-              module_packages: tables.module_packages,
-              root_count: root_count,
-              ifaces: ifaces,
-              embeds: embeds,
-              texts: map(parsed, |p: ParsedSource| p.src),
-              cuts: fold(
-                concat(ifaces.cuts, cuts),
-                map_new(),
-                |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
-              ),
-            })
+            if len(hashed.unheld) > 0 {
+              Err([
+                outside_every_module(
+                  error_at(
+                    b"E0505",
+                    0,
+                    dummy_span(),
+                    bytes_concat_all([
+                      b"the test `",
+                      at(hashed.unheld, 0),
+                      b"`, of a module read as its stub, has no hash its run fixed",
+                    ]),
+                    b"its body is blank",
+                    [b"this is Ply's fault: a stub stands only where each of its tests was fixed"],
+                  ),
+                ),
+              ])
+            } else {
+              Ok({
+                mods: x.mods,
+                r: x.r,
+                index: built.index,
+                hashes: hashed.hashes,
+                unused: hashed.unused,
+                clo: clo,
+                packages: tables.pkgs,
+                module_packages: tables.module_packages,
+                root_count: root_count,
+                ifaces: ifaces,
+                embeds: embeds,
+                texts: map(parsed, |p: ParsedSource| p.src),
+                cuts: fold(
+                  concat(ifaces.cuts, cuts),
+                  map_new(),
+                  |acc: Map<Bytes, List<Cut>>, c: StubCuts| map_insert(acc, c.name, c.cuts),
+                ),
+              })
+            }
           }
         },
       }
@@ -2544,6 +2657,9 @@ fn checked_closure(
       h.texts,
       fold(h.ifaces.stubs, map_new(), |acc: Map<Bytes, Bool>, stub: Source|
         map_insert(acc, stub.name, true)),
+      map_fold(h.cuts, map_new(), |acc: Map<Bytes, Bool>, _: Bytes, cuts: List<Cut>|
+        fold(cuts, acc, |a: Map<Bytes, Bool>, c: Cut|
+          if c.test { map_insert(a, c.name, true) } else { a })),
     ),
   );
   if !checked.ok { Refused(map(checked.diags, outside_every_module)) } else {
@@ -3405,13 +3521,18 @@ fn unread_shipped(name: Bytes) -> Diag =
 pub type ShippedData = { name: Bytes, bytes: Bytes }
 
 /// The shipped modules a load reads, the names of the rest, of which it reads none, the data files
-/// the read ones embed, and the ones it pulls whatever its modules import.
+/// the read ones embed, the ones it pulls whatever its modules import, and what each read one's
+/// text says it embeds, which a stub of it no longer says.
 pub type Shipping = {
   read: List<Source>,
   unread: List<Bytes>,
   data: List<ShippedData>,
   asked: List<Bytes>,
+  wants: List<Wanting>,
 }
+
+/// What a module's text says it embeds.
+pub type Wanting = { name: Bytes, wants: List<EmbedWant> }
 
 /// What a load reads of a module to find what it pulls: what it imports, the hidden imports among
 /// them, and what it embeds.
@@ -3454,6 +3575,7 @@ pub fn shipped_pulled<| e>(
       found: [],
       data: [],
       tried: map_new(),
+      wants: [],
     },
     len(listed) + 1,
     asked,
@@ -3465,6 +3587,7 @@ pub fn shipped_pulled<| e>(
     unread: filter(listed, |name: Bytes| !map_contains(held, name)),
     data: needed.data,
     asked: asked,
+    wants: needed.wants,
   }
 }
 
@@ -3473,6 +3596,7 @@ type Needed = {
   found: List<Source>,
   data: List<ShippedData>,
   tried: Map<Bytes, Bool>,
+  wants: List<Wanting>,
 }
 
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
@@ -3512,6 +3636,7 @@ fn needing<| e>(
                 importers: push(acc.importers, { name: name, imports: pulls.imports }),
                 found: push(acc.found, source),
                 tried: tried,
+                wants: push(acc.wants, { name: name, wants: pulls.wants }),
               },
               name,
               pulls.wants,
@@ -3680,6 +3805,7 @@ fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
   whole: Map<Bytes, Bytes>,
+  wanting: Map<Bytes, List<EmbedWant>>,
   data: Map<Bytes, Bytes>,
   listed: List<Bytes>,
   stubs: Map<Bytes, Bytes>,
@@ -3698,12 +3824,13 @@ fn pulling(
         users,
         shipped,
         whole,
+        wanting,
         data,
         listed,
         stubs,
         tested,
         map_fold(r.wanted, x, |acc: Pull, name: Bytes, src: Bytes| {
-          let o = shipped_embedded(whole, data, len(acc.parsed), { name: name, src: src });
+          let o = shipped_embedded(whole, wanting, data, len(acc.parsed), { name: name, src: src });
           {
             ..acc,
             parsed: push(acc.parsed, if tested { o.parsed } else { untested(o.parsed) }),
@@ -3753,6 +3880,7 @@ fn data_held(data: List<ShippedData>) -> Map<Bytes, Bytes> =
 /// it: read as a stub it has no body left to ask, and the emitter may still lower the whole of it.
 fn shipped_embedded(
   whole: Map<Bytes, Bytes>,
+  wanting: Map<Bytes, List<EmbedWant>>,
   data: Map<Bytes, Bytes>,
   index: Int,
   source: Source,
@@ -3760,8 +3888,9 @@ fn shipped_embedded(
   let text = match map_get(whole, source.name) { Some(t) -> t, None -> source.src };
   let p = { ..parse_at(index, source), src: text };
   if !names_embed(text) { { parsed: p, embeds: [] } } else {
-    let wants = if text == source.src { wants_of(p.module.module) }
-    else { wants_of(parse(text).node) };
+    let wants = if text == source.src { wants_of(p.module.module) } else {
+      match map_get(wanting, source.name) { Some(w) -> w, None -> wants_of(parse(text).node) }
+    };
     let table = fold(wants, map_new(), |acc: Map<Bytes, EmbedRead>, want: EmbedWant|
       map_insert(acc, embed_key(want), shipped_read(whole, data, source.name, want)));
     let r = embedded(p.module.module, table, []);
@@ -3788,7 +3917,8 @@ pub fn parse_shipped(
   let whole = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let held = data_held(data);
-  map(range(0, len(modules)), |i: Int| shipped_embedded(whole, held, i, at(modules, i)).parsed)
+  map(range(0, len(modules)), |i: Int|
+    shipped_embedded(whole, map_new(), held, i, at(modules, i)).parsed)
 }
 
 /// `analyse` over `user` and the modules of `shipped` it imports, with those named in the order they
@@ -3869,6 +3999,9 @@ pub fn staged_pulling_std_with(
   // Shipped modules pulled whatever the program imports: `ply test --std` asks for every module of
   // the standard library.
   asked: List<Bytes> = [],
+  // What a shipped module's text says it embeds, which a stub of it no longer says
+  // (`shipped_pulled`).
+  wants: List<Wanting> = [],
 ) -> Staged / {abort.raise} = {
   let clo = closure(pkgs, map(user, |s: Source| s.name));
   let stubs = stubbed(ifaces);
@@ -3904,6 +4037,8 @@ pub fn staged_pulling_std_with(
     len(assembled),
     texts,
     whole,
+    fold(wants, map_new(), |acc: Map<Bytes, List<EmbedWant>>, w: Wanting|
+      map_insert(acc, w.name, w.wants)),
     data_held(data),
     listed,
     stubs,
@@ -4228,6 +4363,7 @@ pub fn analyse_pulling_std_with(
   reached: Bool = true,
   data: List<ShippedData> = [],
   asked: List<Bytes> = [],
+  wants: List<Wanting> = [],
 ) -> Pulled / {abort.raise} =
   checked_staged(
     staged_pulling_std_with(
@@ -4241,6 +4377,7 @@ pub fn analyse_pulling_std_with(
       reached: reached,
       data: data,
       asked: asked,
+      wants: wants,
     ),
     defs,
     tests,
@@ -4841,8 +4978,8 @@ test "a program's answer holds its warnings, its order, its packages and its mod
       sets: [],
       // `say`'s body and the whole test, which a stub of the module blanks.
       cuts: [
-        { start: 115, end: 126, braced: true, name: b"m.say" },
-        { start: 127, end: 152, braced: false, name: b"" },
+        { start: 115, end: 126, braced: true, name: b"m.say", test: false },
+        { start: 127, end: 152, braced: false, name: b"", test: false },
       ],
     },
   ])
@@ -5690,6 +5827,52 @@ test "an asked module's tests are in a load that reads it whole, and in none tha
   assert_eq(tests_of(plain), [])
 }
 
+/// A shipped module whose `spin` is not seen to end, called by its `turn` and by its test.
+fn spinning() -> List<Source> =
+  [
+    {
+      name: b"std.spin",
+      src: b"pub fn turn(n: Int) -> Int = spin(n)\nfn spin(n: Int) -> Int = if n <= 0 { 0 } else { spin(n + 1) - 1 }\ntest \"spins\" { assert(spin(0) == 0) }\n",
+    },
+  ]
+
+test "a shipped recursion not seen to end is refused alike by every load that reads it" {
+  let refusals = |p: Pulled|
+    match p.out {
+      Analysed(_) -> [],
+      Refused(diags) -> map(diags, |d: Diag| { code: d.code, message: d.message }),
+    };
+  let spun = [{ code: b"E0302", message: b"`spin` may not return, and its row does not say so" }];
+  let importer = |body: Bytes| [{ name: b"m", src: bytes_concat(b"import std.spin\n", body) }];
+  // The standard library's own tree; then `ply test --std`, which reads the module whole.
+  assert_eq(refusals(analyse_pulling_std_with(spinning(), spinning(), [], [])), spun);
+  assert_eq(
+    refusals(
+      analyse_pulling_std_with(
+        importer(b"pub fn f() -> Int = 1\n"),
+        spinning(),
+        [],
+        [],
+        reached: false,
+        asked: [b"std.spin"],
+      ),
+    ),
+    spun,
+  );
+  assert_eq(
+    refusals(
+      analyse_pulling_std_with(importer(b"pub fn f() -> Int = spin::turn(1)\n"), spinning(), [], [
+      ]),
+    ),
+    spun,
+  );
+  // A load that reaches none of it reads none of it.
+  assert_eq(
+    refusals(analyse_pulling_std_with(importer(b"pub fn f() -> Int = 1\n"), spinning(), [], [])),
+    [],
+  )
+}
+
 test "an asked module the load never read is refused as the front end's own fault" {
   let lazy = analyse_pulling_std_with(
     [{ name: b"m", src: b"pub fn f() -> Int = 1\n" }],
@@ -6487,6 +6670,40 @@ type Session = { rows: Rows, off: List<Bytes> }
 
 fn filed_rows(filing: Filing) -> Rows =
   { defs: map(filing.defs, |d: FiledDef| d.interface.row), tests: filed_tests(filing) }
+
+test "a filing writes again only what the store does not hold under the key it has now" {
+  let first = filing(
+    analysis_of([
+      {
+        name: b"m",
+        src: b"pub fn kept(n: Int) -> Int = n + 1\npub fn edited(n: Int) -> Int = n * 2\n",
+      },
+    ]),
+  );
+  let stored = map(first.defs, |d: FiledDef| d.interface);
+  let w = match analyse_with(
+      parse_all([
+        {
+          name: b"m",
+          src: b"pub fn kept(n: Int) -> Int = n + 1\npub fn edited(n: Int) -> Int = n * 3\n",
+        },
+      ]),
+      filed_rows(first).defs,
+      [],
+    ) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> w,
+  };
+  assert_eq(w.checked.seeded, [b"m.kept"]);
+  let names = |f: Filing| map(f.defs, |d: FiledDef| d.name);
+  assert_eq(names(filing(w)), [b"m.kept", b"m.edited"]);
+  let again = filing(w, stored);
+  assert_eq(names(again), [b"m.edited"]);
+  assert_eq(len(again.bodies), 1);
+  assert_eq(map(at(again.modules, 0).entries, |e: FiledEntry| e.name), [b"m.kept", b"m.edited"]);
+  let elsewhere = map(stored, |d: DefInterface| { ..d, row: { ..d.row, hash: b"another key" } });
+  assert_eq(names(filing(w, elsewhere)), [b"m.kept", b"m.edited"])
+}
 
 /// The steps whose seeded answer is not the fresh one.
 fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} = {
@@ -7452,7 +7669,7 @@ test "a shipped module read as its stub still answers what the shipped modules' 
     map_new(),
     |acc: Map<Bytes, Bytes>, s: Source| map_insert(acc, s.name, s.src),
   );
-  let stub = shipped_embedded(whole, map_new(), 0, {
+  let stub = shipped_embedded(whole, map_new(), map_new(), 0, {
     name: b"std.a",
     src: b"pub fn text() -> Bytes = b\"\"",
   });
@@ -7607,7 +7824,7 @@ test "a data file the shipped modules do not hold, or a path that leaves them, i
 
 test "a shipped module read as its stub still answers the data file its text embeds" {
   let whole = map_insert(map_new(), b"std.words", words_module(b"words/list.txt").src);
-  let stub = shipped_embedded(whole, data_held(words_data(b"one\n")), 0, {
+  let stub = shipped_embedded(whole, map_new(), data_held(words_data(b"one\n")), 0, {
     name: b"std.words",
     src: b"pub fn list() -> Bytes = b\"\"",
   });
@@ -7618,6 +7835,20 @@ test "a shipped module read as its stub still answers the data file its text emb
       read: Ok([{ name: b"", bytes: b"one\n" }]),
     },
   ])
+}
+
+test "a shipped module read as its stub answers what its text's read kept that it embeds, never parsing the text again" {
+  let whole = map_insert(map_new(), b"std.words", b"embed( names nothing a parse would find");
+  let wanting = map_insert(
+    map_new(),
+    b"std.words",
+    wants_of(parse(words_module(b"words/list.txt").src).node),
+  );
+  let stub = shipped_embedded(whole, wanting, data_held(words_data(b"one\n")), 0, {
+    name: b"std.words",
+    src: b"pub fn list() -> Bytes = b\"\"",
+  });
+  assert_eq(map(stub.embeds, |e: EmbedAt| e.key), [b"file:words/list.txt"])
 }
 
 test "the shipped modules parse for a listing with their data written out, as a load that pulls them does" {
