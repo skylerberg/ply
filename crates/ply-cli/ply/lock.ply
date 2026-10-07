@@ -1,6 +1,12 @@
-//! `ply.lock` — the closure a build resolved, pinned by each package's own sources. A package is
-//! pinned by what it is (its name, its version, and the BLAKE3 digest of the modules it contributed)
-//! and never by where it was found, so moving a dependency keeps its pin and editing one breaks it.
+//! `ply.lock` — the closure a build resolved: each package by what it is (its name, its version and
+//! the BLAKE3 digest of the modules it contributed) and never by where it was found, so moving a
+//! dependency keeps its pin and editing one breaks it.
+//!
+//! A path dependency inside the checkout the project is in carries no digest, as Cargo's lock
+//! records one: the commit that holds the project holds its sources too, so an edit to it leaves
+//! the dependent's lock as it was, and two changes to it never meet in a lock. `committed` says
+//! which those are. A dependency fetched from git or a registry, or a path one outside the
+//! checkout, keeps its digest, which is all that pins its sources.
 //!
 //! The digest is the front end's: `pins_of` in `compiler.pkg` reads it off the package judgments
 //! that decide what a package *is*, so there is one answer to "what did this build use" and the
@@ -9,15 +15,15 @@
 import diagnostic (Place)
 import env (env)
 import paths
-import paths (Resolved, Rooted, in_root, read_file)
+import paths (Resolved, Rooted, checkout_of, checkouts, in_checkout, in_root, read_file)
 import report (Answer, ok_code, schema_version)
 import compiler.pkg
 import compiler.resolve (Diag, error_at)
-import std.fs (fs, mem_of, mem_read, mem_resolved)
+import std.fs (fs, mem_kind, mem_of, mem_read, mem_resolved)
 import std.json (Json, Member, Number, Str, JsonCodec, error_to_string, field, int_json, list_json,
                  object, optional_field, parse, string_json, to_string)
 import std.path (join)
-import std.list (at)
+import std.list (at, contains)
 import compiler.parsing (no_module)
 
 /// One package as the front end pins it, as text, because the file is JSON.
@@ -33,9 +39,10 @@ pub fn from_front(ps: List<pkg::Pinned>) -> List<Pinned> =
       digest: string_of_bytes_lossy(pin.digest),
     })
 
-/// One package as the file records it: its pin and, for a registry package, the digest of the
-/// archive it was fetched as, which the next fetch of that version must match.
-pub type Entry = { name: String, version: String, digest: String, archive: Option<String> }
+/// One package as the file records it: its name and version; the digest of its sources, `None` for
+/// a path dependency the checkout holds; and, for a registry package, the digest of the archive it
+/// was fetched as, which the next fetch of that version must match.
+pub type Entry = { name: String, version: String, digest: Option<String>, archive: Option<String> }
 
 /// A registry package's archive, as `ply resolve` fetched and checked it.
 /// `interface`: the registry published an interface for it under these semantics; `attestation`:
@@ -55,31 +62,28 @@ derive eq for Entry
 derive eq for Archived
 derive eq for Lock
 
-pub fn pin_of(entry: Entry) -> Pinned =
-  { name: entry.name, version: entry.version, digest: entry.digest }
-
-/// `archive` is written only for a registry package: a lock over path and git dependencies holds no
-/// field it does not use.
+/// A field is written only when the entry holds it: a path package the checkout holds is its name
+/// and version, and only a registry package has an archive.
 fn entry_json() -> JsonCodec<Entry> =
   {
-    encode: |e: Entry|
+    encode: |e: Entry| {
+      let optional = |key: String, value: Option<String>|
+        match value { None -> [], Some(v) -> [{ key: key, value: Str(v) }] };
       object(
         fold(
-          match e.archive { None -> [], Some(a) -> [{ key: "archive", value: Str(a) }] },
-          [
-            { key: "name", value: Str(e.name) },
-            { key: "version", value: Str(e.version) },
-            { key: "digest", value: Str(e.digest) },
-          ],
-          |acc: List<Member>, m: Member| push(acc, m),
+          [optional("digest", e.digest), optional("archive", e.archive)],
+          [{ key: "name", value: Str(e.name) }, { key: "version", value: Str(e.version) }],
+          |acc: List<Member>, ms: List<Member>|
+            fold(ms, acc, |a: List<Member>, m: Member| push(a, m)),
         ),
-      ),
+      )
+    },
     decode: |json: Json|
       match field(json, "name", string_json()) {
         Err(e) -> Err(e),
         Ok(name) -> match field(json, "version", string_json()) {
           Err(e) -> Err(e),
-          Ok(version) -> match field(json, "digest", string_json()) {
+          Ok(version) -> match optional_field(json, "digest", string_json()) {
             Err(e) -> Err(e),
             Ok(digest) -> match optional_field(json, "archive", string_json()) {
               Err(e) -> Err(e),
@@ -108,7 +112,7 @@ fn lock_json() -> JsonCodec<Lock> =
   }
 
 /// The format this file writes. A lock from another version is refused rather than half-read.
-pub fn format() -> Int = 1
+pub fn format() -> Int = 2
 
 /// Beside the package's `ply.pkg`, whichever file in its directory the path named.
 pub fn path_of(resolved: Resolved) -> Rooted = in_root(resolved, "ply.lock")
@@ -148,6 +152,35 @@ pub fn entry_of(lock: Lock, name: String) -> Option<Entry> =
   fold(lock.packages, None, |found: Option<Entry>, entry: Entry|
     match found { Some(_) -> found, None -> if entry.name == name { Some(entry) } else { None } })
 
+// --- What the checkout pins -------------------------------------------------------
+
+/// The closure's path dependencies that the checkout holding the project holds too, by name: a
+/// commit of the checkout pins their sources, so the lock records them without a digest. One is a
+/// path dependency whose directory `in_checkout` places in the checkout `checkout_of` finds at the
+/// project's root. A project in no checkout has none, and a dependency fetched from git or a
+/// registry is never one, wherever its tree is kept.
+pub fn committed(pkgs: pkg::PackageSources) -> List<String> / {fs.kind[abs], abort.raise} =
+  match checkout_of(string_of_bytes_lossy(pkgs.root)) {
+    None -> [],
+    Some(tree) ->
+      fold(pkgs.supplied, [], |names: List<String>, s: pkg::Supplied|
+        match s.manifest {
+          None -> names,
+          Some(text) -> match pkg::check_source(text).manifest {
+            None -> names,
+            Some(m) -> if fetched(pkgs.root, s.root)
+                || !in_checkout(tree, string_of_bytes_lossy(s.root)) { names }
+            else { push(names, m.name) },
+          },
+        }),
+  }
+
+/// A key the walk fetched a tree for rather than reading the directory it names: a git key, or a
+/// registry slot in the project's cache.
+fn fetched(root: Bytes, key: Bytes) -> Bool / {abort.raise} =
+  bytes_starts_with(key, b"git+")
+    || bytes_starts_with(key, bytes_concat(pkg::registry_dir(root), b"/"))
+
 // --- The judgment ----------------------------------------------------------------
 
 /// What is wrong with the lock, as a diagnostic over the project's root: a pinned package the run
@@ -162,73 +195,105 @@ pub fn refused(resolved: Resolved, why: String) -> Diag =
     [b"delete it to pin what is on disk now, or restore it from version control"],
   )
 
-pub fn mismatch(resolved: Resolved, name: String, pinned: Entry, found: Pinned) -> Diag =
+pub fn mismatch(resolved: Resolved, version: String, digest: String, found: Pinned) -> Diag =
   error_at(
     b"E0138",
     no_module(),
     { start: 0, end: 0 },
     bytes_of_string(
-      "`" ++ name ++ "` is not what `ply.lock` pins: " ++ pinned.digest
+      "`" ++ found.name ++ "` is not what `ply.lock` pins: " ++ digest
         ++ " was pinned, and the sources here are "
         ++ found.digest,
     ),
     b"a pinned dependency changed",
     [
       bytes_of_string(
-        "`ply.lock` pins " ++ name ++ " " ++ pinned.version ++ "; this tree holds "
-          ++ found.version,
+        "`ply.lock` pins " ++ found.name ++ " " ++ version ++ "; this tree holds " ++ found.version,
       ),
       b"delete its entry from `ply.lock` to pin what is on disk now, once you have checked what changed",
     ],
   )
 
-/// Verifies a build's closure against the lock: every pinned package must be the one this run
-/// found. A package the lock does not mention is not an error — a write records it.
-pub fn verified(resolved: Resolved, lock: Lock, pins: List<Pinned>) -> Result<(), Diag> =
+/// Verifies a build's closure against the lock: every package the lock pins a digest for must be
+/// the one this run found, unless the checkout holds it now (`committed`). A package the lock does
+/// not mention is not an error — a write records it.
+pub fn verified(
+  resolved: Resolved,
+  lock: Lock,
+  pins: List<Pinned>,
+  committed: List<String>,
+) -> Result<(), Diag> =
   fold(pins, Ok(()), |acc: Result<(), Diag>, found: Pinned|
     match acc {
       Err(d) -> Err(d),
-      Ok(_) -> match entry_of(lock, found.name) {
-        None -> Ok(()),
-        Some(pinned) -> if pinned.digest == found.digest { Ok(()) }
-        else { Err(mismatch(resolved, found.name, pinned, found)) },
+      Ok(_) -> if contains(committed, found.name) { Ok(()) } else {
+        match entry_of(lock, found.name) {
+          None -> Ok(()),
+          Some(pinned) -> match pinned.digest {
+            // Recorded as the checkout's and outside it now: nothing pinned these sources.
+            None -> Ok(()),
+            Some(digest) -> if digest == found.digest { Ok(()) }
+            else { Err(mismatch(resolved, pinned.version, digest, found)) },
+          },
+        }
       },
     })
 
 // --- Writing -----------------------------------------------------------------------
 
 /// The lock a run's closure pins, with every package the closure holds and no stale entries: what
-/// `ply build` writes, so a lock can only ever describe a build that happened. A package the lock
-/// already records under the same digest keeps its entry, archive and all; one `archives` names is
-/// recorded with the archive `ply resolve` fetched it as.
+/// `ply build` writes, so a lock can only ever describe a build that happened. A package
+/// `committed` names is recorded without a digest. Any other the lock already records under the
+/// same digest keeps its entry, archive and all; one `archives` names is recorded with the archive
+/// `ply resolve` fetched it as.
+pub fn written(
+  lock: Option<Lock>,
+  pins: List<Pinned>,
+  archives: List<Archived>,
+  committed: List<String>,
+) -> Lock / {abort.raise} =
+  {
+    version: format(),
+    packages: sorted(map(pins, |pin: Pinned| entry_for(lock, archives, committed, pin))),
+  }
+
+/// `written`, as the file holds it.
 pub fn text(
   lock: Option<Lock>,
   pins: List<Pinned>,
   archives: List<Archived>,
-) -> String / {abort.raise} = {
-  let entries = map(pins, |pin: Pinned| entry_for(lock, archives, pin));
-  to_string(lock_json().encode({ version: format(), packages: sorted(entries) })) ++ "\n"
-}
+  committed: List<String>,
+) -> String / {abort.raise} =
+  to_string(lock_json().encode(written(lock, pins, archives, committed))) ++ "\n"
 
-fn entry_for(lock: Option<Lock>, archives: List<Archived>, pin: Pinned) -> Entry = {
-  let fetched = fold(archives, None, |found: Option<String>, a: Archived|
-    match found {
-      Some(_) -> found,
-      None -> if a.name == pin.name && a.version == pin.version { Some(a.archive) } else { None },
-    });
-  let recorded = match lock { None -> None, Some(l) -> entry_of(l, pin.name) };
-  match fetched {
-    Some(archive) ->
-      { name: pin.name, version: pin.version, digest: pin.digest, archive: Some(archive) },
-    None -> match recorded {
-      Some(e) -> if e.digest == pin.digest && e.version == pin.version { e } else { fresh(pin) },
-      None -> fresh(pin),
-    },
+fn entry_for(
+  lock: Option<Lock>,
+  archives: List<Archived>,
+  committed: List<String>,
+  pin: Pinned,
+) -> Entry =
+  if contains(committed, pin.name) {
+    { name: pin.name, version: pin.version, digest: None, archive: None }
+  } else {
+    let fetched = fold(archives, None, |found: Option<String>, a: Archived|
+      match found {
+        Some(_) -> found,
+        None -> if a.name == pin.name && a.version == pin.version { Some(a.archive) } else { None },
+      });
+    let recorded = match lock { None -> None, Some(l) -> entry_of(l, pin.name) };
+    match fetched {
+      Some(archive) ->
+        { name: pin.name, version: pin.version, digest: Some(pin.digest), archive: Some(archive) },
+      None -> match recorded {
+        Some(e) -> if e.digest == Some(pin.digest) && e.version == pin.version { e }
+        else { fresh(pin) },
+        None -> fresh(pin),
+      },
+    }
   }
-}
 
 fn fresh(pin: Pinned) -> Entry =
-  { name: pin.name, version: pin.version, digest: pin.digest, archive: None }
+  { name: pin.name, version: pin.version, digest: Some(pin.digest), archive: None }
 
 /// By name, so two runs that pinned the same closure write the same file and a diff is a change in
 /// the closure rather than in a walk order.
@@ -255,72 +320,117 @@ pub fn a_pin(name: String, version: String, digest: String) -> Pinned =
   { name: name, version: version, digest: digest }
 
 fn an_entry(name: String, version: String, digest: String, archive: Option<String>) -> Entry =
-  { name: name, version: version, digest: digest, archive: archive }
+  { name: name, version: version, digest: Some(digest), archive: archive }
 
 test "a lock is written sorted by name, so a walk order cannot change it" {
   let pins = [a_pin("zebra", "1.0.0", "b3:z"), a_pin("alpha", "0.2.0", "b3:a")];
-  let text = text(None, pins, []);
+  let text = text(None, pins, [], []);
   assert(string_contains(text, "\"name\":\"alpha\""));
   // `string_find` raises when the needle is absent, which is itself the failure this test means.
   assert(string_find(text, "\"alpha\"") < string_find(text, "\"zebra\""))
 }
 
 test "a lock round-trips through the format it writes" {
-  let pins = [a_pin("lib", "0.1.0", "b3:1f2e")];
-  match decoded(text(None, pins, [])) {
+  let pins = [a_pin("lib", "0.1.0", "b3:1f2e"), a_pin("store", "0.1.0", "b3:5a")];
+  match decoded(text(None, pins, [], ["store"])) {
     Err(why) -> panic(why),
     Ok(lock) -> {
-      assert_eq(lock.version, 1);
-      assert_eq(lock.packages, [an_entry("lib", "0.1.0", "b3:1f2e", None)])
+      assert_eq(lock.version, 2);
+      assert_eq(lock.packages, [
+        an_entry("lib", "0.1.0", "b3:1f2e", None),
+        { name: "store", version: "0.1.0", digest: None, archive: None },
+      ])
     },
   }
 }
 
-test "only a registry package records an archive, and a path package's entry holds three fields" {
-  let text = text(None, [a_pin("lib", "0.1.0", "b3:1f"), a_pin("orders", "0.2.0", "b3:9a")], [
-    { name: "orders", version: "0.2.0", archive: "b3:77", interface: false, attestation: None },
-  ]);
+test "a path package the checkout holds is its name and version, a registry one holds its archive" {
+  let text = text(
+    None,
+    [
+      a_pin("lib", "0.1.0", "b3:1f"),
+      a_pin("orders", "0.2.0", "b3:9a"),
+      a_pin("sim", "0.1.0", "b3:5"),
+    ],
+    [{ name: "orders", version: "0.2.0", archive: "b3:77", interface: false, attestation: None }],
+    ["sim"],
+  );
   assert_eq(
     text,
-    "{\"packages\":[{\"digest\":\"b3:1f\",\"name\":\"lib\",\"version\":\"0.1.0\"},{\"archive\":\"b3:77\",\"digest\":\"b3:9a\",\"name\":\"orders\",\"version\":\"0.2.0\"}],\"version\":1}\n",
+    "{\"packages\":[{\"digest\":\"b3:1f\",\"name\":\"lib\",\"version\":\"0.1.0\"},{\"archive\":\"b3:77\",\"digest\":\"b3:9a\",\"name\":\"orders\",\"version\":\"0.2.0\"},{\"name\":\"sim\",\"version\":\"0.1.0\"}],\"version\":2}\n",
+  )
+}
+
+test "an edit to a package the checkout holds leaves the lock as it was, byte for byte" {
+  let before = text(
+    None,
+    [a_pin("prove", "0.1.0", "b3:old"), a_pin("lib", "0.1.0", "b3:l")],
+    [],
+    ["prove"],
   );
-  match decoded(text) {
+  match decoded(before) {
     Err(why) -> panic(why),
-    Ok(lock) ->
-      assert_eq(lock.packages, [
-        an_entry("lib", "0.1.0", "b3:1f", None),
-        an_entry("orders", "0.2.0", "b3:9a", Some("b3:77")),
-      ]),
+    Ok(lock) -> {
+      let edited = [a_pin("prove", "0.1.0", "b3:new"), a_pin("lib", "0.1.0", "b3:l")];
+      assert_eq(text(Some(lock), edited, [], ["prove"]), before);
+      match verified(paths::here(), lock, edited, ["prove"]) {
+        Ok(_) -> (),
+        Err(_) -> panic("an edit to a package the checkout holds was refused"),
+      };
+      // Outside the checkout the same edit is refused: only its digest pinned it there.
+      let pinned = text(None, [a_pin("prove", "0.1.0", "b3:old")], [], []);
+      match decoded(pinned) {
+        Err(why) -> panic(why),
+        Ok(outside) -> match verified(paths::here(), outside, edited, []) {
+          Ok(_) -> panic("a changed dependency outside the checkout was trusted"),
+          Err(d) -> assert_eq(d.code, b"E0138"),
+        },
+      }
+    },
   }
 }
 
 test "a pinned package whose sources moved is refused, and one the lock does not hold is not" {
-  let lock: Lock = { version: 1, packages: [an_entry("lib", "0.1.0", "b3:old", None)] };
-  let r: Resolved = {
-    label: "cwd",
-    spelling: ".",
-    display: ".",
-    inside: ".",
-    absolute: ".",
-    machine: ".",
-  };
-  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:new")]) {
+  let lock: Lock = { version: 2, packages: [an_entry("lib", "0.1.0", "b3:old", None)] };
+  let r = paths::here();
+  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:new")], []) {
     Ok(_) -> panic("a changed dependency was trusted"),
     Err(d) -> assert_eq(d.code, b"E0138"),
   };
-  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:old")]) {
+  match verified(r, lock, [a_pin("lib", "0.1.0", "b3:old")], []) {
     Ok(_) -> (),
     Err(_) -> panic("the same dependency was refused"),
   };
   // A package the lock does not mention is recorded, not refused.
-  match verified(r, lock, [a_pin("other", "0.1.0", "b3:x")]) {
+  match verified(r, lock, [a_pin("other", "0.1.0", "b3:x")], []) {
     Ok(_) -> (),
     Err(_) -> panic("an unpinned package was refused"),
   }
 }
 
+test "a lock of another format is refused, the one before this included" {
+  let disk = mem_of([
+    { path: "w/app/ply.lock", body: b"{\"packages\":[],\"version\":1}\n" },
+    { path: "w/app/main.ply", body: b"fn main() -> Int = 1" },
+  ]);
+  let r = handle {
+    paths::resolve("app")
+  } with {
+    env.pwd[sys]() -> "/w",
+    fs.resolved[cwd](p) -> mem_resolved(disk, join("w", p)),
+    fs.resolved[abs](p) -> panic("nothing here leaves the working directory"),
+  };
+  let found = handle {
+    read(r)
+  } with {
+    fs.read_file[cwd](p) -> mem_read(disk, join("w", p)),
+    fs.read_file[abs](p) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(found, Err("`ply.lock` is format 1, and this `ply` writes format 2"))
+}
+
 test "a file argument's lock is the `ply.lock` in its directory, and that is the one read" {
-  let pinned = text(None, [a_pin("lib", "0.1.0", "b3:1f")], []);
+  let pinned = text(None, [a_pin("lib", "0.1.0", "b3:1f")], [], []);
   let disk = mem_of([
     { path: "w/app/main.ply", body: b"fn main() -> Int = 1" },
     { path: "w/app/ply.lock", body: bytes_of_string(pinned) },
@@ -347,7 +457,7 @@ test "a file argument's lock is the `ply.lock` in its directory, and that is the
 
 test "writing a lock keeps what the closure still holds and drops what it left" {
   let before: Lock = {
-    version: 1,
+    version: 2,
     packages: [
       an_entry("gone", "0.1.0", "b3:g", None),
       an_entry("lib", "0.1.0", "b3:old", None),
@@ -362,6 +472,7 @@ test "writing a lock keeps what the closure still holds and drops what it left" 
       a_pin("orders", "0.2.0", "b3:o"),
     ],
     [],
+    [],
   );
   match decoded(text) {
     Err(why) -> panic(why),
@@ -375,13 +486,63 @@ test "writing a lock keeps what the closure still holds and drops what it left" 
 }
 
 test "an archive is kept only for the sources it was fetched as" {
-  let before: Lock = { version: 1, packages: [an_entry("orders", "0.2.0", "b3:o", Some("b3:77"))] };
+  let before: Lock = { version: 2, packages: [an_entry("orders", "0.2.0", "b3:o", Some("b3:77"))] };
   // The sources moved or the version did: the old archive no longer describes what is pinned.
-  let moved = text(Some(before), [a_pin("orders", "0.2.0", "b3:other")], []);
+  let moved = text(Some(before), [a_pin("orders", "0.2.0", "b3:other")], [], []);
   assert(!string_contains(moved, "b3:77"));
-  let raised = text(Some(before), [a_pin("orders", "0.3.0", "b3:o3")], [
-    { name: "orders", version: "0.3.0", archive: "b3:88", interface: false, attestation: None },
-  ]);
+  let raised = text(
+    Some(before),
+    [a_pin("orders", "0.3.0", "b3:o3")],
+    [{ name: "orders", version: "0.3.0", archive: "b3:88", interface: false, attestation: None }],
+    [],
+  );
   assert(string_contains(raised, "\"archive\":\"b3:88\""));
   assert(!string_contains(raised, "b3:77"))
+}
+
+fn a_manifest(name: String) -> Bytes =
+  bytes_of_string(
+    "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
+      ++ "\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 16, patch: 0}, dependencies: [], entry: None}",
+  )
+
+/// What `committed` makes of a project at `root` over `checkouts`, whose dependencies are at
+/// `keys`, each a package named for its key's last segment.
+fn committed_at(root: String, keys: List<String>) -> List<String> / {abort.raise} =
+  handle {
+    committed({
+      root: bytes_of_string(root),
+      manifest: None,
+      supplied: map(keys, |key: String| {
+        let segments = string_split(key, "/");
+        {
+          root: bytes_of_string(key),
+          manifest: Some(a_manifest(at(segments, len(segments) - 1))),
+          modules: [],
+        }
+      }),
+    })
+  } with {
+    fs.kind[abs](p) -> mem_kind(checkouts(), p),
+  }
+
+test "a checkout holds the path dependencies below it, not a fetched one, a link or a nested one" {
+  assert_eq(
+    committed_at("/repo/app", [
+      "/repo/libs/a",
+      "/repo",
+      "/repo-b/d",
+      "/other/e",
+      "/repo/nested/b",
+      "/repo/sub/c",
+      "/repo/link",
+      // A registry slot, inside the checkout's directory and still fetched.
+      "/repo/app/.ply-cache/registry/r",
+    ]),
+    ["a", "repo"],
+  );
+  // A project in no checkout pins every dependency by its digest.
+  assert_eq(committed_at("/other/e", ["/repo/libs/a"]), []);
+  // A linked worktree is a checkout like any other.
+  assert_eq(committed_at("/wt", ["/wt/lib", "/repo/libs/a"]), ["lib"])
 }
