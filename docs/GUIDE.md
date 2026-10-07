@@ -2726,9 +2726,12 @@ std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
 ships beside it, each named by its place below the library (`std/oid/names.txt`):
 `ply std` lists them with the module that embeds each, `ply std --show
 std/oid/names.txt` prints one, and the digest `ply std` prints covers them. A
-load reads only the shipped modules its modules
-import, what those import in turn, and what they embed, so a change to any other
-leaves it alone; a change to one it reads warns `W0605`. Of those it checks,
+load reads of a shipped module what a module importing it can reach: none of
+its tests or laws, nor a private function or type or an `import` that only they
+reach, which it neither parses nor checks. It reads only the shipped modules its
+modules import, what the parts it reads import in turn, and what they embed, so
+a change to any other leaves it alone; a change to one it reads warns `W0605`.
+Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
@@ -3139,7 +3142,10 @@ package by its contract, its signature and specifications, so an edit to a
 dependency's body checks that package's definitions again and leaves its
 dependents' rows standing. What each module imports, and what it embeds, is kept
 in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
-has not read. A load reads its dependencies and the shipped modules it
+has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
+`reused/` under the stage root, under the text's digest and the `ply` that read it, so a
+project's first load lexes no shipped module's tests or laws to find it. A load reads its
+dependencies and the shipped modules it
 pulls through the compiled package an earlier load kept in
 `.ply-cache/interfaces/`: each module with its function bodies cut out, beside
 every definition's hash, references, effects and specifications, which the

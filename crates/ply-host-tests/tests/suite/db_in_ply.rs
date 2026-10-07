@@ -17,8 +17,17 @@ import std.db (db, with_server, transaction, is_retryable, ReadCommitted, ReadWr
 import std.sql (stmt, PInt, PText, CInt, CText, Answer, Rows, Count, Failed, Row)
 
 pub fn run(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
-  match with_server(url, 4, || {
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  run_with(url, None)
+
+// `run`, its password given beside the connection string, as `config.secret` answers one.
+pub fn run_given_password(url: String) -> Result<String, String>
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  run_with(url, Some(secret_of_bytes(b"p@ss:w")))
+
+fn run_with(url: String, password: Option<Secret<Bytes>>) -> Result<String, String>
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  match with_server(url, 4, password: password, body: || {
     match db.returning[items](
       stmt("insert into items (id, name) values ($1, $2) returning id"),
       [PInt(7), PText("seven")],
@@ -57,7 +66,7 @@ fn names(rows: List<Row>) -> String =
 // A statement that writes, performed as `db.query`: the scheduler would treat two of these as
 // readers, so the driver refuses it before it reaches the server.
 pub fn sneaky(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 4, || {
     match db.query[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(1), PText("x")]) {
       _ -> Ok("the write went through as a read"),
@@ -70,7 +79,7 @@ pub fn sneaky(url: String) -> Result<String, String>
 // A call site's label is the atom the scheduler records, so a statement that reaches a table the
 // label never named would be scheduled against the wrong table.
 pub fn mislabelled(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 4, || {
     match db.query[orders](stmt("select name from items where id = $1"), [PInt(7)]) {
       _ -> Ok("the statement ran under a label it does not touch"),
@@ -82,7 +91,7 @@ pub fn mislabelled(url: String) -> Result<String, String>
 
 // A transaction commits what it did, through `begin` and `commit` on the same connection.
 pub fn commit_one(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 4, || {
     match transaction(ReadCommitted, ReadWrite, || {
       db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(8), PText("eight")])
@@ -111,7 +120,7 @@ fn shown(row: Row) -> String =
 
 // The two timeouts as the server holds them for this session, which the connection string set.
 pub fn timeouts(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 1, || {
     match db.query[pg_settings](
       stmt("select name, setting from pg_settings where name = 'statement_timeout' or name = 'idle_in_transaction_session_timeout' order by name"),
@@ -134,7 +143,7 @@ fn setting(row: Row) -> String =
 
 // A statement that runs far past the timeout the connection string set, and what ended it.
 pub fn overrun(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 1, || {
     match db.query[pg_class](
       stmt("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
@@ -157,7 +166,7 @@ fn ended(out: Result<Unit, Rollback>) -> String =
 // Two tasks in transactions at once on one pool, over one row: each holds a connection of its own,
 // so the one that rolls back undoes only its own write, whichever takes the row first.
 pub fn two_at_once(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} =
   with_server(url, 2, || {
     let kept = task.spawn(|| ended(transaction(ReadCommitted, ReadWrite, || {
       bump(1, 1);
@@ -174,10 +183,10 @@ pub fn two_at_once(url: String) -> Result<String, String>
 // and run again from its `begin` it goes through. The other runs on a pool of its own, inside the
 // first attempt.
 pub fn serialized(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
   with_server(url, 1, || contended(url, 3, ""))
 
-fn contended(url: String, left: Int, seen: String) -> String / {db.query[ledger], db.execute[ledger], db.abort, db.begin, db.commit, db.rollback, net.close[link], net.connect[link], net.start_tls[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
+fn contended(url: String, left: Int, seen: String) -> String / {db.query[ledger], db.execute[ledger], db.abort, db.begin, db.commit, db.rollback, net.close[link], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
   match transaction(Serializable, ReadWrite, || {
       db.query[ledger](stmt("select n from ledger where id = $1"), [PInt(1)]);
       if seen == "" {
@@ -198,13 +207,13 @@ fn contended(url: String, left: Int, seen: String) -> String / {db.query[ledger]
 // Two tasks, each on a pool of its own, taking two rows in opposite orders: the server breaks the
 // deadlock by refusing one with 40P01, and the other commits once that one has rolled back.
 pub fn deadlocked(url: String) -> Result<String, String>
-  / {net.connect[link], net.start_tls[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} = {
+  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} = {
   let a = task.spawn(|| crossing(url, 1, 2));
   let b = task.spawn(|| crossing(url, 2, 1));
   Ok(task.join(a) ++ " " ++ task.join(b))
 }
 
-fn crossing(url: String, first: Int, second: Int) -> String / {net.close[link], net.connect[link], net.start_tls[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
+fn crossing(url: String, first: Int, second: Int) -> String / {net.close[link], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
   match with_server(url, 1, || ended(transaction(ReadCommitted, ReadWrite, || {
       bump(first, 1);
       both_written(400);
@@ -314,6 +323,36 @@ fn the_db_effect_is_served_from_a_real_server() {
         Ok(text) => assert_eq!(text, "7 seven"),
         Err(why) => panic!("the driver could not run a statement: {why}"),
     }
+}
+
+/// The password, sealed where it is read (the connection string, or settings beside it), sent in
+/// the clear-text message a `password` cluster asks for.
+#[test]
+fn the_db_effect_sends_a_password_in_the_clear_when_asked_from_the_url_or_settings() {
+    if !crate::support::cluster::available() {
+        eprintln!("skipping: postgres is not installed here");
+        return;
+    }
+    let cluster = crate::support::cluster::Cluster::start_with_clear_text_password("ply", "p@ss:w");
+    cluster.psql(
+        "ply",
+        "create table if not exists items (id int4 primary key, name text)",
+    );
+    let port = cluster.port();
+    let in_url = format!("postgres://ply:p%40ss%3Aw@127.0.0.1:{port}/ply?sslmode=disable");
+    match call("m.run", &in_url) {
+        Ok(text) => assert_eq!(text, "7 seven"),
+        Err(why) => panic!("the driver could not authenticate in the clear: {why}"),
+    }
+    cluster.psql("ply", "delete from items");
+    let bare = format!("postgres://ply@127.0.0.1:{port}/ply?sslmode=disable");
+    match call("m.run_given_password", &bare) {
+        Ok(text) => assert_eq!(text, "7 seven"),
+        Err(why) => panic!("the driver could not authenticate with the given password: {why}"),
+    }
+    let refused = call("m.run_given_password", &in_url)
+        .expect_err("a password both in the URL and given is refused");
+    assert!(refused.contains("give it once"), "{refused}");
 }
 
 #[test]
