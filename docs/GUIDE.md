@@ -2725,7 +2725,7 @@ checked against that declaration, so it performs none of it.
 
 | flag | meaning |
 | --- | --- |
-| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`; a name given several times holds several certificates, and a handshake gets the one whose names cover the name the client asks for (SNI), or the first; a certificate whose files change is read again within a second and served without a restart, the one before kept where the new one does not load; sessions resume from tickets whose key rotates; `E0430` if it does not load, `E0429` if unnamed |
+| `--tls NAME=CERT,KEY` | repeatable TLS credential (PEM, leaf first; key PKCS#8, PKCS#1 or SEC1), used as `net.listen_tls[l](port, "NAME")` and by `net.serve_tls`, as `std.http`'s `serve_pooled_tls` uses it to offer `h2` and `http/1.1`; a name given several times holds several certificates, and a handshake gets the one whose names cover the name the client asks for (SNI), or the first; a certificate whose files change is read again within a second and served without a restart, the one before kept where the new one does not load; sessions resume from tickets whose key rotates; `E0430` if it does not load, `E0429` if unnamed |
 | `--trust CERT.pem` | repeatable certificate `net.connect_tls` and `net.start_tls` accept beside the built-in roots, and that a listener verifies a client's certificate against: with any, every TLS listener asks its client for one, still serves a client that presents none, and `net.peer_certificate` answers the one presented (on a client, the server's, for channel binding); `net.listen_tls` and `net.connect_tls` offer `http/1.1` alone, a program that offers other protocols (`h2`) secures with `net.serve_tls` or `net.start_tls`, and `net.protocol` answers what a handshake agreed; `E0430` if it does not parse; the `ply` command's own connections take `PLY_TRUST` instead (§16) |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
@@ -2742,11 +2742,11 @@ At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
 is what `std.http`'s `serve_pooled` drains on: it accepts nothing more, and it
 answers every connection it had accepted, queued ones included, the last answer
 on each saying `Connection: close`, and closes the ones waiting idle at once.
-A connection that opened with the HTTP/2 preface is drained with `GOAWAY`: the
-streams the client opened before it saw it are answered, and then the
-connection closes. Before the stop it sheds load, answering `503` with
-`Retry-After` to a connection that finds its queue full or that waited in it
-too long.
+A connection that speaks HTTP/2, by its preface or, under `serve_pooled_tls`,
+by the `h2` its TLS handshake agreed, is drained with `GOAWAY`: the streams the
+client opened before it saw it are answered, and then the connection closes.
+Before the stop it sheds load, answering `503` with `Retry-After` to a
+connection that finds its queue full or that waited in it too long.
 
 An unreadable configuration source is `E0440`. A statement the server rejects
 and one that touches a table outside what the call site labelled are refusals
@@ -3433,8 +3433,10 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
   of the runtime's own.
 * No file handles — `fs` reads a range and appends by path, with nothing open
   between calls; no backpressure; no migrations or live schema
-  check; HTTP/2 only by prior knowledge, never negotiated over TLS, and with no
-  server push; no authentication framework.
+  check; no HTTP/2 over a `listen_tls` listener, whose handshake offers
+  `http/1.1` alone (`std.http`'s `serve_pooled_tls` offers `h2` by
+  `serve_tls`), no `Upgrade: h2c`, and no server push; no authentication
+  framework.
 
 Sharp edges: `x.f(y)` with a bare variable `x` is a perform; an operation no
 `handle` names is found only when it reaches the host boundary at run time

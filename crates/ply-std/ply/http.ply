@@ -24,14 +24,16 @@
 //! connection with `Connection: close`, closes a kept connection that waits idle at once, and
 //! returns when every worker is done; the run's `--drain-ms` bounds the whole.
 //!
-//! HTTP/2 is spoken where a connection is known to speak it. Under `serve_pooled` and
-//! `serve_draining` a connection that opens with the HTTP/2 preface (prior knowledge, `h2c`) is
+//! HTTP/2 is spoken where a connection is known to speak it. Over TLS the two ends agree it by
+//! ALPN: `serve_pooled_tls` and `serve_secured` secure each connection offering `h2` and then
+//! `http/1.1`, and `fetch` offers the same for an `https` URL, directly or through a proxy's
+//! tunnel. In the clear it is spoken by prior knowledge (`h2c`): under `serve_pooled` and
+//! `serve_draining` a connection that opens with the HTTP/2 preface is HTTP/2, and `fetch` speaks it
+//! to an `http` URL where `Fetching.prior_knowledge` says its server does. An HTTP/2 connection is
 //! served by `std.http2`'s machine: each request is read as an `Http2` one and answered as it
 //! arrives, the stop drains it with `GOAWAY`, and `http2_limits` says what it may cost; `serve_h2`
-//! serves a connection already known to be HTTP/2. `serve` and `serve_connection` speak HTTP/1.1
-//! alone and refuse the preface as they refuse any other version. `fetch` speaks HTTP/2 to an `http`
-//! URL where `Fetching.prior_knowledge` says its server does. Over TLS both ends offer `http/1.1`
-//! alone.
+//! serves one already known to be HTTP/2. `serve` and `serve_connection` speak HTTP/1.1 alone and
+//! refuse the preface as they refuse any other version.
 
 import std.bytes (int_of_ascii, is_digit)
 import std.chan (Accepted, try_send)
@@ -2007,8 +2009,10 @@ pub type FetchError =
 /// response along the way set, and how many redirects were followed.
 pub type Fetched = { response: Response, url: Url, jar: Jar, redirects: Int }
 
-/// `method` with `headers` and `body` to `to`, a connection to its host for each exchange, chosen
-/// by its scheme (`net::dial`, or `net::dial_tls` offering `http/1.1`) or through the proxy.
+/// `method` with `headers` and `body` to `to`, a connection to its host for each exchange, or
+/// through the proxy. An `https` connection is secured offering `h2` and then `http/1.1`, and
+/// speaks what the server chose; an `http` one speaks HTTP/1.1, or HTTP/2 by
+/// `Fetching.prior_knowledge`.
 /// Redirects are followed as the Fetch standard follows them, up to `max_redirects`: a 303 is
 /// fetched with `GET` (a `HEAD` stays one), a 301 or 302 that answered a `POST` with `GET`, and a
 /// 307 or 308 with the method and body it answered; a method that changes drops the body and its
@@ -2153,7 +2157,8 @@ fn exchanged_at<[l]>(
   }
 }
 
-/// `h2` says a connection in the clear speaks HTTP/2 from its first byte.
+/// `h2` says a connection in the clear speaks HTTP/2 from its first byte. Over TLS the handshake
+/// offers `h2` and then `http/1.1`, and the server's choice is the protocol spoken.
 fn direct<[l]>(
   secure: Bool,
   h2: Bool,
@@ -2162,21 +2167,44 @@ fn direct<[l]>(
   req: Request,
   limits: Limits,
 ) -> Result<Response, FetchError> / {dns.lookup, net.connect_to[l], net.start_tls[l], net.send[l], net.recv[l], net.close[l], task.write, clock.read, clock.write, task::deadline.at, abort.raise} = {
-  let opened: Result<Int, net::Refusal> = if secure {
-    try { net::dial_tls[l](host, port, ["http/1.1"], [], limits.connect_timeout_ms) }
-  } else { try { net::dial[l](host, port, [], limits.connect_timeout_ms) } };
+  let opened: Result<Int, net::Refusal> = try {
+    net::dial[l](host, port, [], limits.connect_timeout_ms)
+  };
   match opened {
     Err(why) -> Err(NoConnection(why)),
     Ok(c) ->
       bracket(|| c, |h: Int| net.close[l](h), |h: Int|
-        if h2 && !secure {
-          match exchange_h2[l](h, req, "http", limits) {
-            Ok(r) -> Ok(r),
-            Err(e) -> Err(NoAnswer(e)),
-          }
-        } else { answer_on[l](h, req, limits) }),
+        if secure { secured_on[l](h, host, b"", req, limits) }
+        else { spoken[l](h, h2, "http", req, limits) }),
   }
 }
+
+/// The request on `c` once it is secured as `host`, offering `h2` and then `http/1.1`: over
+/// HTTP/2 where the server agreed `h2`, and over HTTP/1.1 otherwise. `unread` is what was read of
+/// the connection before the handshake, which must be nothing.
+fn secured_on<[l]>(
+  c: Int,
+  host: String,
+  unread: Bytes,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {net.start_tls[l], net.send[l], net.recv[l], clock.read, abort.raise} =
+  match net.start_tls[l](c, host, ["h2", "http/1.1"], unread, limits.connect_timeout_ms) {
+    Err(why) -> Err(NoConnection(why)),
+    Ok(secured) -> spoken[l](c, secured.protocol == Some("h2"), "https", req, limits),
+  }
+
+/// The request on `c`, over HTTP/2 where `h2` says so and over HTTP/1.1 otherwise.
+fn spoken<[l]>(
+  c: Int,
+  h2: Bool,
+  scheme: String,
+  req: Request,
+  limits: Limits,
+) -> Result<Response, FetchError> / {net.send[l], net.recv[l], clock.read, abort.raise} =
+  if h2 {
+    match exchange_h2[l](c, req, scheme, limits) { Ok(r) -> Ok(r), Err(e) -> Err(NoAnswer(e)) }
+  } else { answer_on[l](c, req, limits) }
 
 fn answer_on<[l]>(
   c: Int,
@@ -2216,7 +2244,7 @@ fn tunnelled<[l]>(
   host: String,
   req: Request,
   limits: Limits,
-) -> Result<Response, FetchError> / {net.send[l], net.recv[l], net.start_tls[l], abort.raise} = {
+) -> Result<Response, FetchError> / {net.send[l], net.recv[l], net.start_tls[l], clock.read, abort.raise} = {
   let asked = bytes_of_string(
     "CONNECT " ++ authority ++ " HTTP/1.1\r\nHost: " ++ authority ++ "\r\n\r\n",
   );
@@ -2236,11 +2264,13 @@ fn tunnelled<[l]>(
         ResponseParsed(head) -> if head.status < 200 || head.status > 299 {
           Err(ProxyRefused(head.status))
         } else {
-          let unread = bytes_slice(got.buf, head.consumed, bytes_len(got.buf));
-          match net.start_tls[l](c, host, ["http/1.1"], unread, limits.connect_timeout_ms) {
-            Err(why) -> Err(NoConnection(why)),
-            Ok(_) -> answer_on[l](c, req, limits),
-          }
+          secured_on[l](
+            c,
+            host,
+            bytes_slice(got.buf, head.consumed, bytes_len(got.buf)),
+            req,
+            limits,
+          )
         },
       },
     }
@@ -2711,6 +2741,40 @@ pub fn serve_h2<[l] | e>(
   bracket(|| c, |h: Int| net.close[l](h), |h: Int|
     served_h2[l](h, b"", limits, app, || stopped_by(stop), net.peer_address[l](h)))
 
+/// `serve_draining` for a connection not yet secured: it is secured with the `--tls` credential
+/// `credential` within `header_timeout_ms`, offering `h2` and then `http/1.1` (ALPN), and served
+/// as `serve_h2` serves one where the client agrees `h2`, and with HTTP/1.1 otherwise. One whose
+/// handshake fails is closed. The connection is closed however serving it ends.
+pub fn serve_secured<[l] | e>(
+  c: Int,
+  limits: Limits,
+  credential: String,
+  stop: Chan<Unit>,
+  app: (Request) -> Response / {task.select | e},
+) -> Unit / {abort.raise, net.peer_address[l], net.serve_tls[l], net.recv[l], net.send[l], net.close[l], task.select, clock.read | e} =
+  bracket(|| c, |h: Int| net.close[l](h), |h: Int|
+    match net.serve_tls[l](h, credential, ["h2", "http/1.1"], b"", limits.header_timeout_ms) {
+      Err(_) -> (),
+      Ok(secured) -> {
+        let peer = net.peer_address[l](h);
+        if secured.protocol == Some("h2") {
+          served_h2[l](h, b"", limits, app, || stopped_by(stop), peer)
+        } else {
+          connection_loop[l](
+            h,
+            limits,
+            app,
+            true,
+            || stopped_by(stop),
+            peer,
+            b"",
+            limits.max_keep_alive,
+            false,
+          )
+        }
+      },
+    })
+
 /// `first` is what was read of the connection before it was known to be HTTP/2.
 fn served_h2<[l] | e>(
   c: Int,
@@ -2974,14 +3038,49 @@ pub fn pooled<[l], [k] | e>(
   limits: Limits,
   shedding: Shedding,
   conn: (Int, Chan<Unit>) -> Unit / e,
-) -> Pooled / {abort.raise, net.accept[l], net.send[k], net.close[k], task.write, clock.read | e} = {
+) -> Pooled / {abort.raise, net.accept[l], net.send[k], net.close[k], task.write, clock.read | e} =
+  pool[l](listener, count, limits, shedding, |c: Int, turn: Turn<Chan<Unit>>|
+    match turn { Shed -> busy[k](c, limits, shedding), Serve(stop) -> conn(c, stop) })
+
+/// `serve_pooled` for a listener `net.listen` opened, each connection secured with the `--tls`
+/// credential `credential` before anything is read of it, offering `h2` and then `http/1.1`
+/// (ALPN): one whose client agrees `h2` is served as `serve_h2` serves one, and any other with
+/// HTTP/1.1 as `serve_draining` serves one. A connection the pool sheds is secured offering
+/// `http/1.1` alone and answered 503; one whose handshake fails within `header_timeout_ms` is
+/// closed.
+pub fn serve_pooled_tls<[l], [k] | e>(
+  listener: Int,
+  count: Int,
+  limits: Limits,
+  shedding: Shedding,
+  credential: String,
+  app: (Request) -> Response / {task.select | e},
+) -> Pooled / {abort.raise, net.accept[l], net.peer_address[k], net.serve_tls[k], net.recv[k], net.send[k], net.close[k], task.write, clock.read | e} =
+  pool[l](listener, count, limits, shedding, |c: Int, turn: Turn<Chan<Unit>>|
+    match turn {
+      Shed -> busy_secured[k](c, limits, shedding, credential),
+      Serve(stop) -> serve_secured[k](c, limits, credential, stop, app),
+    })
+
+/// What a pool does with a connection it accepted: sheds it, or serves it with what tells it the
+/// pool has stopped accepting, which is a channel the pool closes.
+type Turn<s> = | Shed | Serve(s)
+
+/// The pool, each connection it accepts handed to `handled` with what to do with it.
+fn pool<[l] | e>(
+  listener: Int,
+  count: Int,
+  limits: Limits,
+  shedding: Shedding,
+  handled: (Int, Turn<Chan<Unit>>) -> Unit / e,
+) -> Pooled / {abort.raise, net.accept[l], task.write, clock.read | e} = {
   check_limits(limits);
   check_shedding(shedding);
   let line: Chan<Queued> = task.channel(shedding.queue);
   let stop: Chan<Unit> = task.channel(0);
   let workers = map(range(0, shedding.workers), |_i: Int|
-    task.spawn(|| worker[k](line, stop, limits, shedding, conn, { served: 0, late: 0 }, count)));
-  let accepted = accepting[l, k](listener, line, limits, shedding, count, 0);
+    task.spawn(|| worker(line, stop, shedding, handled, { served: 0, late: 0 }, count)));
+  let accepted = accepting[l](listener, line, handled, count, 0);
   task.close(stop);
   task.close(line);
   fold(workers, { served: 0, shed_full: accepted, shed_late: 0 }, |p: Pooled, w: Task<Worked>| {
@@ -3001,58 +3100,54 @@ pub fn check_shedding(s: Shedding) -> Unit / {abort.raise} =
 
 /// The accept loop: each connection into the queue, or shed where it is full; answers how many it
 /// shed.
-fn accepting<[l], [k]>(
+fn accepting<[l] | e>(
   listener: Int,
   line: Chan<Queued>,
-  limits: Limits,
-  shedding: Shedding,
+  handled: (Int, Turn<Chan<Unit>>) -> Unit / e,
   left: Int,
   shed: Int,
-) -> Int / {abort.raise, net.accept[l], net.send[k], net.close[k], task.select, clock.read} =
+) -> Int / {abort.raise, net.accept[l], task.select, clock.read | e} =
   if left <= 0 { shed } else {
     let c = net.accept[l](listener);
     if c == 0 { shed } else {
       match try_send(line, { conn: c, at: clock.now() }) {
-        Accepted -> accepting(listener, line, limits, shedding, left - 1, shed),
+        Accepted -> accepting(listener, line, handled, left - 1, shed),
         _ -> {
-          busy[k](c, limits, shedding);
-          accepting(listener, line, limits, shedding, left - 1, shed + 1)
+          handled(c, Shed);
+          accepting(listener, line, handled, left - 1, shed + 1)
         },
       }
     }
   }
 
-fn worker<[k] | e>(
+fn worker<| e>(
   line: Chan<Queued>,
   stop: Chan<Unit>,
-  limits: Limits,
   shedding: Shedding,
-  conn: (Int, Chan<Unit>) -> Unit / e,
+  handled: (Int, Turn<Chan<Unit>>) -> Unit / e,
   done: Worked,
   left: Int,
-) -> Worked / {abort.raise, net.send[k], net.close[k], task.recv, clock.read | e} =
+) -> Worked / {abort.raise, task.recv, clock.read | e} =
   if left <= 0 { done } else {
     match task.recv(line) {
       None -> done,
       Some(q) -> if as_millis(between(q.at, clock.now())) > shedding.max_wait_ms {
-        busy[k](q.conn, limits, shedding);
+        handled(q.conn, Shed);
         worker(
           line,
           stop,
-          limits,
           shedding,
-          conn,
+          handled,
           { served: done.served, late: done.late + 1 },
           left - 1,
         )
       } else {
-        conn(q.conn, stop);
+        handled(q.conn, Serve(stop));
         worker(
           line,
           stop,
-          limits,
           shedding,
-          conn,
+          handled,
           { served: done.served + 1, late: done.late },
           left - 1,
         )
@@ -3074,6 +3169,19 @@ fn busy<[k]>(
   send_all[k](c, encode(Get, Http11, false, busy_response(shedding)), limits.write_timeout_ms);
   net.close[k](c)
 }
+
+/// `busy` for a connection not yet secured: the handshake offers `http/1.1` alone, so the 503 is
+/// one every client reads; one that does not secure is closed unanswered.
+fn busy_secured<[k]>(
+  c: Int,
+  limits: Limits,
+  shedding: Shedding,
+  credential: String,
+) -> Unit / {net.serve_tls[k], net.send[k], net.close[k], abort.raise} =
+  match net.serve_tls[k](c, credential, ["http/1.1"], b"", limits.header_timeout_ms) {
+    Ok(_) -> busy[k](c, limits, shedding),
+    Err(_) -> net.close[k](c),
+  }
 
 // --- Tests: helpers ---------------------------------------------------------
 
@@ -4880,7 +4988,7 @@ test "a redirect from https to http is not followed, and nor is one past the bou
     name: "secure.example",
     at: "192.0.2.30",
     port: 443,
-    scripts: [[net::Upgrades, said(redirect(301, "http://secure.example/"))]],
+    scripts: [[net::Upgrades, Says(h2_answering(redirect(301, "http://secure.example/"))), Silent]],
   };
   assert_eq(
     fetched_over(world_of([secure]), plain(Get, url"https://secure.example/", b"")).value,
@@ -4896,20 +5004,24 @@ test "a redirect from https to http is not followed, and nor is one past the bou
   assert_eq(fetched_over(looping, bounded).value, Err(TooManyRedirects(2)))
 }
 
-test "an https URL is fetched over TLS to its host, and what cannot be reached says why" {
+test "an https URL is fetched over TLS to its host, over HTTP/2 where it agrees h2, and what cannot be reached says why" {
   let ran = fetched_over(
     world_of([
       {
         name: "secure.example",
         at: "192.0.2.30",
         port: 443,
-        scripts: [[net::Upgrades, said(text_response(200, "secret"))]],
+        scripts: [[net::Upgrades, Says(h2_answering(text_response(200, "secret"))), Silent]],
       },
     ]),
     plain(Get, url"https://secure.example/parts", b""),
   );
-  assert_eq(status_of(ran.value), 200);
+  match ran.value {
+    Ok(f) -> assert_eq((f.response.status, f.response.body), (200, b"secret")),
+    Err(_) -> panic("the answer comes over HTTP/2"),
+  };
   assert_eq(net::mem_secured(ran.net, 1), Some("secure.example"));
+  assert(bytes_starts_with(net::mem_sent(ran.net, 1), http2::preface()));
   assert_eq(
     fetched_over(world_of([]), plain(Get, url"http://nowhere.example/", b"")).value,
     Err(NoConnection(net::NameNotFound)),
@@ -4947,7 +5059,8 @@ test "through a proxy an https URL is tunnelled and secured to its host, or refu
         [
           Says(b"HTTP/1.1 200 Connection established\r\n\r\n"),
           net::Upgrades,
-          said(text_response(200, "inside")),
+          Says(h2_answering(text_response(200, "inside"))),
+          Silent,
         ],
       ]),
     ]),
@@ -4957,12 +5070,9 @@ test "through a proxy an https URL is tunnelled and secured to its host, or refu
     Ok(f) -> assert_eq(f.response.body, b"inside"),
     Err(_) -> panic("the tunnel carries the request"),
   };
-  assert(
-    string_starts_with(
-      sent_text(ran.net, 1),
-      "CONNECT secure.example:443 HTTP/1.1\r\nHost: secure.example:443\r\n\r\nGET /parts HTTP/1.1\r\nHost: secure.example\r\n",
-    ),
-  );
+  // The host agreed `h2` inside the tunnel, so the request goes as HTTP/2 after the `CONNECT`.
+  let connect = b"CONNECT secure.example:443 HTTP/1.1\r\nHost: secure.example:443\r\n\r\n";
+  assert(bytes_starts_with(net::mem_sent(ran.net, 1), bytes_concat(connect, http2::preface())));
   assert_eq(net::mem_secured(ran.net, 1), Some("secure.example"));
   let refused = fetched_over(
     world_of([
@@ -5408,4 +5518,56 @@ test "fetch with prior knowledge reports a server that closes before it answers"
     },
   );
   assert_eq(ran.value, Err(NoAnswer(Closed)))
+}
+
+test "a TLS pool secures each connection offering h2, and serves one that agrees it over HTTP/2" {
+  let callers = net::mem_calling(net::mem_empty(), caller(), [
+    net::Upgrades,
+    Says(h2_asking(["/a"])),
+    Silent,
+  ]);
+  let ran = net::on_mem(net::mem_credential(callers, "api"), ||
+    simulate {
+      let listener = net.listen[listener](0);
+      serve_pooled_tls[listener, conn](
+        listener,
+        1,
+        quick_idle(),
+        { ..default_shedding(), workers: 1, queue: 1 },
+        "api",
+        |req: Request|
+          text_response(200, (if req.version == Http2 { "h2 " } else { "h1 " }) ++ req.path),
+      )
+    });
+  assert_eq(ran.value, { served: 1, shed_full: 0, shed_late: 0 });
+  assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
+  // The server speaks first over TLS, so its `SETTINGS` may go before the stop and its drain.
+  let frames = h2_frames(net::mem_sent(ran.net, served_conn()));
+  assert_eq(take(frames, 1), ["SETTINGS"]);
+  assert(contains(frames, "DATA 1 h2 /a END_STREAM"));
+  assert_eq(last(frames), Some("GOAWAY 1 NO_ERROR"));
+  assert_eq(ran.net.closed, [served_conn()])
+}
+
+test "a connection shed over TLS is secured offering http/1.1 alone, then told when to ask again" {
+  let ran = net::on_mem(
+    net::mem_credential(
+      net::mem_calling(net::mem_empty(), caller(), [net::Upgrades, Silent]),
+      "api",
+    ),
+    || {
+      let listener = net.listen[listener](0);
+      busy_secured[conn](
+        net.accept[listener](listener),
+        default_limits(),
+        default_shedding(),
+        "api",
+      )
+    },
+  );
+  let said = string_of_bytes_lossy(net::mem_sent(ran.net, served_conn()));
+  assert(string_starts_with(said, "HTTP/1.1 503 "));
+  assert(string_contains(said, "retry-after: 1\r\n"));
+  assert_eq(net::mem_secured(ran.net, served_conn()), Some("api"));
+  assert_eq(ran.net.closed, [served_conn()])
 }
