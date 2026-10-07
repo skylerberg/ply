@@ -184,6 +184,16 @@ pub nondet effect net {
   /// Who holds the far end of a Unix socket; `None` for any other, and where the platform does
   /// not say.
   read peer_credentials[s](conn: Int) -> Option<PeerCredentials>
+  /// The far end's end-entity certificate (DER) on a secured connection once its handshake has
+  /// completed: the server's to a client, which is what RFC 5929's `tls-server-end-point`
+  /// channel binding hashes, and the client's to a server where it presented one the run verified
+  /// against `--trust`, which is who the client is. `None` for any other connection.
+  read peer_certificate[s](conn: Int) -> Option<Bytes>
+  /// The application protocol a secured connection's handshake agreed (ALPN) once it has
+  /// completed: on a connection `listen_tls` accepted or `connect_tls` opened, which offer
+  /// `http/1.1` alone, that or none; on one `start_tls` or `serve_tls` secured, what they
+  /// answered. `None` for a plaintext connection, and where the ends agreed on none.
+  read protocol[s](conn: Int) -> Option<String>
   /// Each option the socket has, as it stands now.
   read options[s](socket: Int) -> List<SocketOption>
 }
@@ -487,6 +497,8 @@ pub type MemConn = {
   unheard: Bytes,
   deadlines: List<Int>,
   secured: Option<String>,
+  /// The application protocol the connection's handshake agreed, where it agreed one.
+  agreed: Option<String>,
   options: List<SocketOption>,
   credentials: Option<PeerCredentials>,
 }
@@ -502,6 +514,8 @@ pub type MemNet = {
   callers: List<Caller>,
   names: dns::Table,
   credentials: List<String>,
+  /// The certificate (DER) a far end secured under each name presents.
+  leaves: Map<String, Bytes>,
   short: Int,
   closed: List<Int>,
 }
@@ -520,9 +534,14 @@ pub fn mem_empty() -> MemNet =
     callers: [],
     names: dns::table(),
     credentials: [],
+    leaves: map_new(),
     short: 0,
     closed: [],
   }
+
+/// The network with a far end secured as `name` presenting the certificate `der`.
+pub fn mem_presenting(n: MemNet, name: String, der: Bytes) -> MemNet =
+  { ..n, leaves: map_insert(n.leaves, name, der) }
 
 /// The network with a peer at `at` that answers each connection with the next of `scripts`, and
 /// refuses one more than it has scripts for.
@@ -678,6 +697,7 @@ fn new_conn(
     unheard: b"",
     deadlines: [],
     secured: None,
+    agreed: None,
     options: [NoDelay(true)],
     credentials: None,
   }
@@ -921,7 +941,10 @@ pub fn mem_connect_tls(
   match reached.answer {
     Some(id) -> match map_get(reached.net.conns, id) {
       Some(c) ->
-        { net: with_conn(reached.net, id, { ..c, secured: Some(host) }), answer: Some(id) },
+        {
+          net: with_conn(reached.net, id, { ..c, secured: Some(host), agreed: Some("http/1.1") }),
+          answer: Some(id),
+        },
       None -> reached,
     },
     None -> reached,
@@ -1086,7 +1109,7 @@ fn upgraded(
   let c = listened(conn_of(n, label, conn));
   let secured = |rest: List<Step>| {
     {
-      net: with_conn(n, conn, { ..c, script: rest, secured: Some(who) }),
+      net: with_conn(n, conn, { ..c, script: rest, secured: Some(who), agreed: list_at(alpn, 0) }),
       answer: Ok({ protocol: list_at(alpn, 0) }),
     }
   };
@@ -1243,6 +1266,31 @@ pub fn mem_peer_address(
     },
   }
 
+/// What `net.peer_certificate` answers over the network: the certificate `mem_presenting` gave the
+/// name a connection was secured as, where it gave one.
+pub fn mem_peer_certificate(n: MemNet, label: String, conn: Int) -> Option<Bytes> / {abort.raise} =
+  match map_get(n.conns, conn) {
+    Some(_) -> match conn_of(n, label, conn).secured {
+      Some(name) -> map_get(n.leaves, name),
+      None -> None,
+    },
+    None -> {
+      let _l = listener_of(n, label, conn);
+      None
+    },
+  }
+
+/// What `net.protocol` answers over the network: the first protocol an upgrade offered, which is
+/// what the twin's far end agrees to, and `http/1.1` for a connection `connect_tls` opened.
+pub fn mem_protocol(n: MemNet, label: String, conn: Int) -> Option<String> / {abort.raise} =
+  match map_get(n.conns, conn) {
+    Some(_) -> conn_of(n, label, conn).agreed,
+    None -> {
+      let _l = listener_of(n, label, conn);
+      None
+    },
+  }
+
 /// What `net.peer_credentials` answers over the network.
 pub fn mem_peer_credentials(
   n: MemNet,
@@ -1353,6 +1401,8 @@ pub fn on_mem<a | e>(
       net.local_address[*label](socket) -> mem_local_address(cell_get(t), label, socket),
       net.peer_address[*label](conn) -> mem_peer_address(cell_get(t), label, conn),
       net.peer_credentials[*label](conn) -> mem_peer_credentials(cell_get(t), label, conn),
+      net.peer_certificate[*label](conn) -> mem_peer_certificate(cell_get(t), label, conn),
+      net.protocol[*label](conn) -> mem_protocol(cell_get(t), label, conn),
       net.options[*label](socket) -> mem_options(cell_get(t), label, socket),
       dns.lookup(name) -> dns::table_lookup(cell_get(t).names, name),
       dns.reverse(address) -> dns::table_reverse(cell_get(t).names, address),
@@ -1834,6 +1884,29 @@ test "a TLS connection by name is dialled, secured, and closed when it does not 
   assert_eq(mem_secured(ran.net, ran.value.c), Some("api.example"));
   assert_eq(ran.value.refused, Err(Untrusted));
   assert_eq(ran.net.closed, [2])
+}
+
+test "a secured connection's far end presents the certificate its name was given, and none before" {
+  let at = ip::read_socket("192.0.2.9:5432");
+  let world = mem_presenting(mem_serving(mem_empty(), at, [[Upgrades]]), "db.example", b"leaf");
+  let ran = on_mem(world, || {
+    let c = dial_address[db](at, [], 1000);
+    let before = net.peer_certificate[db](c);
+    secure[db](c, "db.example", [], b"", 1000);
+    { before: before, after: net.peer_certificate[db](c) }
+  });
+  assert_eq(ran.value, { before: None, after: Some(b"leaf") })
+}
+
+test "a secured connection says which protocol its handshake agreed, and a plaintext one none" {
+  let at = ip::read_socket("192.0.2.9:443");
+  let ran = on_mem(mem_serving(mem_empty(), at, [[Upgrades]]), || {
+    let c = dial_address[web](at, [], 1000);
+    let before = net.protocol[web](c);
+    let secured = secure[web](c, "web.example", ["h2", "http/1.1"], b"", 1000);
+    { before: before, secured: secured.protocol, after: net.protocol[web](c) }
+  });
+  assert_eq(ran.value, { before: None, secured: Some("h2"), after: Some("h2") })
 }
 
 test "a socket keeps the options it was opened with and the ones set on it since" {

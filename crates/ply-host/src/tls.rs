@@ -5,7 +5,12 @@ use rustls::client::ClientConnection;
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::hash::HashAlgorithm;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::server::{ServerConfig, ServerConnection};
+use rustls::server::danger::ClientCertVerifier;
+use rustls::server::{
+    ClientHello, ProducesTickets, ResolvesServerCert, ServerConfig, ServerConnection,
+    ServerSessionMemoryCache, WebPkiClientVerifier,
+};
+use rustls::sign::CertifiedKey;
 use rustls::{ClientConfig, Error as TlsError, PeerIncompatible, RootCertStore, StreamOwned};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -13,7 +18,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// The Rust path `ply hosts` prints for `net.listen_tls`; it must name [`listen`].
 pub const HANDLER: &str = "ply_host::tls::listen";
@@ -83,9 +88,119 @@ fn malformed(text: &str, why: &str) -> String {
 /// A loaded credential; nothing outside this module can take the key back out.
 pub struct Credential {
     config: Arc<ServerConfig>,
-    /// SHA-256 of the leaf certificate's DER, as `ply hosts` prints it.
+    /// SHA-256 of the first certificate's leaf, as `ply hosts` prints it.
     fingerprint: String,
     certificates: usize,
+    chooser: Arc<Chooser>,
+}
+
+/// One certificate a credential answers with, and when its two files last changed.
+#[derive(Debug)]
+struct Loaded {
+    spec: CredentialSpec,
+    key: Arc<CertifiedKey>,
+    stamp: Option<(SystemTime, SystemTime)>,
+}
+
+/// The certificates one credential name holds: a handshake gets the first whose names cover the
+/// name its client asks for (SNI), or the first of all, and a certificate whose files change is
+/// read again, a look at most a second, so a renewed one is served without a restart. One that
+/// no longer loads leaves the one before it in place.
+#[derive(Debug)]
+pub struct Chooser {
+    loaded: Mutex<Vec<Loaded>>,
+    looked: Mutex<Instant>,
+}
+
+/// How often a chooser looks at its files.
+const RELOAD_LOOK: Duration = Duration::from_secs(1);
+
+impl Chooser {
+    /// Reads changed files again, at most once a `RELOAD_LOOK` unless `now`.
+    fn refresh(&self, now: bool) {
+        {
+            let mut looked = lock(&self.looked);
+            if !now && looked.elapsed() < RELOAD_LOOK {
+                return;
+            }
+            *looked = Instant::now();
+        }
+        let mut loaded = lock(&self.loaded);
+        for entry in loaded.iter_mut() {
+            let now = stamp(&entry.spec);
+            if now != entry.stamp
+                && let Ok(fresh) = certified(&entry.spec)
+            {
+                entry.key = fresh.key;
+                entry.stamp = now;
+            }
+        }
+    }
+
+    /// Reads every file again now, whatever the clock says: what a test of reloading asks for.
+    pub fn reload_now(&self) {
+        self.refresh(true);
+    }
+
+    /// The leaf each certificate answers with now, in the order given.
+    pub fn leaves(&self) -> Vec<Vec<u8>> {
+        lock(&self.loaded)
+            .iter()
+            .filter_map(|l| l.key.end_entity_cert().ok().map(|c| c.as_ref().to_vec()))
+            .collect()
+    }
+}
+
+impl ResolvesServerCert for Chooser {
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.refresh(false);
+        let loaded = lock(&self.loaded);
+        let asked = hello
+            .server_name()
+            .and_then(|name| ServerName::try_from(name.to_string()).ok());
+        let chosen = asked.and_then(|name| loaded.iter().find(|l| covers(&l.key, &name)));
+        chosen
+            .or_else(|| loaded.first())
+            .map(|l| Arc::clone(&l.key))
+    }
+}
+
+/// Whether `key`'s leaf names `name` among its subject alternative names.
+fn covers(key: &CertifiedKey, name: &ServerName<'_>) -> bool {
+    key.end_entity_cert()
+        .ok()
+        .and_then(|der| webpki::EndEntityCert::try_from(der).ok())
+        .is_some_and(|leaf| leaf.verify_is_valid_for_subject_name(name).is_ok())
+}
+
+/// When a credential's two files last changed, where both can be looked at.
+fn stamp(spec: &CredentialSpec) -> Option<(SystemTime, SystemTime)> {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    Some((modified(&spec.certificate)?, modified(&spec.key)?))
+}
+
+/// A certificate chain and its key, read and checked to go together.
+struct Certified {
+    key: Arc<CertifiedKey>,
+    fingerprint: String,
+    certificates: usize,
+}
+
+fn certified(spec: &CredentialSpec) -> Result<Certified, Diagnostic> {
+    let chain =
+        certificates(&spec.certificate).map_err(|why| err_invalid(&spec.certificate, why))?;
+    let key = private_key(&spec.key)?;
+    let fingerprint = fingerprint(&chain[0]);
+    let certificates = chain.len();
+    let key =
+        CertifiedKey::from_der(chain, key, &provider()).map_err(|e| err_mismatch(spec, &e))?;
+    // rustls refuses a key that does not match the leaf certificate's public key.
+    key.keys_match().map_err(|e| err_mismatch(spec, &e))?;
+    Ok(Certified {
+        key: Arc::new(key),
+        fingerprint,
+        certificates,
+    })
 }
 
 impl Credential {
@@ -95,6 +210,16 @@ impl Credential {
 
     pub fn certificates(&self) -> usize {
         self.certificates
+    }
+
+    /// The certificates the name holds, as handshakes choose among them.
+    pub fn chooser(&self) -> &Arc<Chooser> {
+        &self.chooser
+    }
+
+    /// The configuration a listener under this name answers with.
+    pub fn config(&self) -> &Arc<ServerConfig> {
+        &self.config
     }
 }
 
@@ -111,12 +236,16 @@ impl Credentials {
         Credentials::default()
     }
 
-    /// `trusted` names PEM files whose certificates `net.connect_tls` accepts beside the roots.
+    /// `trusted` names PEM files whose certificates `net.connect_tls` accepts beside the roots,
+    /// and which a listener verifies a client's certificate against: where there are any, every
+    /// listener asks a client for one and serves a client that presents none. A name given
+    /// several times holds several certificates, chosen among by the name a client asks for.
     pub fn load(
         specs: &[CredentialSpec],
         trusted: &[PathBuf],
     ) -> Result<Credentials, Vec<Diagnostic>> {
-        let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
+        let mut grouped: BTreeMap<String, Vec<Loaded>> = BTreeMap::new();
+        let mut firsts: BTreeMap<String, (String, usize)> = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut anchors = Vec::new();
         for path in trusted {
@@ -126,19 +255,43 @@ impl Credentials {
             }
         }
         for spec in specs {
-            if entries.contains_key(&spec.name) {
-                diagnostics.push(err_duplicate(&spec.name));
-                continue;
-            }
-            match load_one(spec) {
-                Ok(credential) => {
-                    entries.insert(spec.name.clone(), credential);
+            match certified(spec) {
+                Ok(c) => {
+                    firsts
+                        .entry(spec.name.clone())
+                        .or_insert((c.fingerprint, c.certificates));
+                    grouped.entry(spec.name.clone()).or_default().push(Loaded {
+                        spec: spec.clone(),
+                        key: c.key,
+                        stamp: stamp(spec),
+                    });
                 }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }
         if !diagnostics.is_empty() {
             return Err(diagnostics);
+        }
+        let shared = Shared::new(&anchors).map_err(|d| vec![d])?;
+        let mut entries: BTreeMap<String, Credential> = BTreeMap::new();
+        for (name, loaded) in grouped {
+            let chooser = Arc::new(Chooser {
+                loaded: Mutex::new(loaded),
+                looked: Mutex::new(Instant::now()),
+            });
+            let (fingerprint, certificates) = firsts.remove(&name).unwrap_or_default();
+            let config = shared
+                .server(&chooser)
+                .map_err(|e| vec![err_configured(&name, &e)])?;
+            entries.insert(
+                name,
+                Credential {
+                    config,
+                    fingerprint,
+                    certificates,
+                    chooser,
+                },
+            );
         }
         let trusted = anchors.len();
         let client = client_config(anchors).map_err(|d| vec![d])?;
@@ -190,28 +343,58 @@ impl fmt::Debug for Credentials {
     }
 }
 
-fn load_one(spec: &CredentialSpec) -> Result<Credential, Diagnostic> {
-    let chain =
-        certificates(&spec.certificate).map_err(|why| err_invalid(&spec.certificate, why))?;
-    let key = private_key(&spec.key)?;
-    let fingerprint = fingerprint(&chain[0]);
-    let certificates = chain.len();
-
-    let versions = ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| err_provider(spec, &e))?;
-    // rustls refuses a key that does not match the leaf certificate's public key.
-    let mut config = versions
-        .with_no_client_auth()
-        .with_single_cert(chain, key)
-        .map_err(|e| err_mismatch(spec, &e))?;
-    config.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
-    Ok(Credential {
-        config: Arc::new(config),
-        fingerprint,
-        certificates,
-    })
+/// What every listener of a run shares: the client verifier the trusted certificates make, and
+/// one ticket key, which rotates, so a session one listener began resumes at another.
+struct Shared {
+    verifier: Option<Arc<dyn ClientCertVerifier>>,
+    tickets: Arc<dyn ProducesTickets>,
 }
+
+impl Shared {
+    fn new(anchors: &[CertificateDer<'static>]) -> Result<Shared, Diagnostic> {
+        let tickets = rustls::crypto::ring::Ticketer::new().map_err(|e| {
+            Diagnostic::error(
+                codes::TLS_CREDENTIAL_INVALID,
+                format!("TLS session tickets could not be set up: {e}"),
+            )
+        })?;
+        let verifier = if anchors.is_empty() {
+            None
+        } else {
+            let mut roots = RootCertStore::empty();
+            roots.add_parsable_certificates(anchors.to_vec());
+            let built = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| {
+                    Diagnostic::error(
+                        codes::TLS_CREDENTIAL_INVALID,
+                        format!("the trusted certificates cannot verify a client: {e}"),
+                    )
+                })?;
+            Some(built)
+        };
+        Ok(Shared { verifier, tickets })
+    }
+
+    fn server(&self, chooser: &Arc<Chooser>) -> Result<Arc<ServerConfig>, TlsError> {
+        let versions = ServerConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()?;
+        let verified = match &self.verifier {
+            Some(verifier) => versions.with_client_cert_verifier(Arc::clone(verifier)),
+            None => versions.with_no_client_auth(),
+        };
+        let mut config =
+            verified.with_cert_resolver(Arc::clone(chooser) as Arc<dyn ResolvesServerCert>);
+        config.alpn_protocols = ALPN.iter().map(|p| p.as_bytes().to_vec()).collect();
+        config.ticketer = Arc::clone(&self.tickets);
+        config.session_storage = ServerSessionMemoryCache::new(SESSIONS);
+        Ok(Arc::new(config))
+    }
+}
+
+/// Sessions a listener keeps for resumption by id, besides those its tickets carry.
+const SESSIONS: usize = 1024;
 
 /// The provider, installed explicitly on each builder.
 pub fn provider() -> Arc<CryptoProvider> {
@@ -334,6 +517,16 @@ impl Stream {
         }
     }
 
+    /// The far end's end-entity certificate as it presented it: a server's always, a client's where
+    /// it was asked for one and gave it.
+    fn peer_leaf(&self) -> Option<Vec<u8>> {
+        let chain = match self {
+            Stream::Server(s) => s.conn.peer_certificates(),
+            Stream::Client(s) => s.conn.peer_certificates(),
+        }?;
+        chain.first().map(|leaf| leaf.as_ref().to_vec())
+    }
+
     fn send_close_notify(&mut self) {
         match self {
             Stream::Server(s) => s.conn.send_close_notify(),
@@ -418,6 +611,10 @@ pub struct Session {
     /// What the handshake took, once one has completed: microseconds, measured by whichever
     /// operation got there first — `net.handshake`, or the read or write that needed the connection.
     took: Mutex<Option<u64>>,
+    /// The far end's certificate and the protocol the two agreed, kept once the handshake
+    /// completes, so reading them never waits on a read that holds the session.
+    peer: Mutex<Option<Vec<u8>>>,
+    agreed: Mutex<Option<String>>,
 }
 
 impl Session {
@@ -456,6 +653,8 @@ impl Session {
                 session: Mutex::new(Some(stream)),
                 handshakes,
                 took: Mutex::new(None),
+                peer: Mutex::new(None),
+                agreed: Mutex::new(None),
             },
             None => Session::refused(socket, handshakes, REASON_CONFIGURATION),
         }
@@ -475,7 +674,30 @@ impl Session {
             session: Mutex::new(None),
             handshakes,
             took: Mutex::new(None),
+            peer: Mutex::new(None),
+            agreed: Mutex::new(None),
         }
+    }
+
+    /// The application protocol the handshake agreed, once it has completed.
+    pub fn protocol(&self) -> Option<String> {
+        lock(&self.agreed).clone()
+    }
+
+    /// What a completed handshake leaves to be read without the session: its length, the peer's
+    /// certificate and the protocol.
+    fn settled(&self, stream: &Stream, took: u64) {
+        lock(&self.took).get_or_insert(took);
+        *lock(&self.peer) = stream.peer_leaf();
+        *lock(&self.agreed) = stream.protocol();
+        self.handshakes.completed();
+    }
+
+    /// The far end's end-entity certificate (DER) once the handshake has completed: the server's
+    /// on a client's session, and on a server's the client's where it presented one this run
+    /// verified. What RFC 5929's `tls-server-end-point` hashes.
+    pub fn peer_certificate(&self) -> Option<Vec<u8>> {
+        lock(&self.peer).clone()
     }
 
     /// This end's address, which the session shares with the socket it runs over.
@@ -503,9 +725,7 @@ impl Session {
         };
         loop {
             if !stream.is_handshaking() {
-                let took = began.elapsed().as_micros() as u64;
-                lock(&self.took).get_or_insert(took);
-                self.handshakes.completed();
+                self.settled(stream, began.elapsed().as_micros() as u64);
                 return Ok(stream.protocol());
             }
             let Some(left) = timeout
@@ -575,8 +795,7 @@ impl Session {
                 }
                 Ok(_) if !stream.is_handshaking() => {
                     let took = began.elapsed().as_micros() as u64;
-                    *lock(&self.took) = Some(took);
-                    self.handshakes.completed();
+                    self.settled(stream, took);
                     return Some(took);
                 }
                 Ok(_) => {}
@@ -660,8 +879,7 @@ impl Session {
     /// the number is the handshake's own and not the wait before it.
     fn completed(&self, began: Instant, was_handshaking: bool, stream: &Stream) {
         if was_handshaking && !stream.is_handshaking() {
-            *lock(&self.took) = Some(began.elapsed().as_micros() as u64);
-            self.handshakes.completed();
+            self.settled(stream, began.elapsed().as_micros() as u64);
         }
     }
 
@@ -827,13 +1045,10 @@ pub fn unknown_credential<'a>(
 
 /// Unreachable with `ring`, which supports both versions [`VERSIONS`] names.
 #[cold]
-fn err_provider(spec: &CredentialSpec, error: &TlsError) -> Diagnostic {
+fn err_configured(name: &str, error: &TlsError) -> Diagnostic {
     Diagnostic::error(
         codes::TLS_CREDENTIAL_INVALID,
-        format!(
-            "the credential `{}` could not be configured: {error}",
-            spec.name
-        ),
+        format!("the credential `{name}` could not be configured: {error}"),
     )
     .note(format!(
         "this build's TLS provider is {PROVIDER}, and it reported that it supports none of {}",
@@ -891,13 +1106,3 @@ fn err_untrusted(path: &Path, why: String) -> Diagnostic {
 }
 
 const TRUSTED: &str = "`--trust CERT.pem` and `PLY_TRUST` name PEM files of certificates, each a root `net.connect_tls` may accept";
-
-#[cold]
-fn err_duplicate(name: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::TLS_CREDENTIAL_INVALID,
-        format!("two `--tls` credentials are named `{name}`"),
-    )
-    .note("a credential name selects one certificate and one key, so a repeat is two answers to one question")
-    .note("give them different names, or pass only the one this run should serve")
-}
