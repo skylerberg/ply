@@ -3,7 +3,8 @@
 # `benches/corpus.sh` gives the program, or over the CLI's suite with the grants its harness drives
 # `ply` with, from a scratch directory of the run's own; the standard library's proof runs are a
 # `ply prove`. A run fails when a test fails or a claim does not hold, when the run refuses, and when
-# its filter selects no test or claim, so a renamed test never stops being run quietly.
+# its filter selects no test or claim, so a renamed test never stops being run quietly; a part of a
+# run (`run#K/N`) takes the tests whose keys hash to it, which may be none.
 #
 #   ci-corpus.sh partition K TIMINGS [CUT]
 #       every run partition K takes (`ci-shards.sh corpus-for-partition K [CUT]`), each lane one
@@ -228,8 +229,13 @@ run_one() {
   spent "$out" "$(($(date +%s%3N) - started))"
   cached_row "$out" "$id" "$timings"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
-  if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
-    [ "$selected" -gt 0 ] || echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
+  if [ "$selected" -eq 0 ] && [ -n "$shard" ]; then
+    echo "corpus run $id selected no test: every test of its run is in another part"
+  elif [ "$selected" -eq 0 ]; then
+    echo "corpus run $id selected no test (filter: ${filter:-none})" >&2
+    status=1
+  fi
+  if [ "$status" -ne 0 ]; then
     red "$out"
     rm -f "$out"
     return 1
@@ -279,14 +285,15 @@ run_modules() {
     args+=(--filter "${filters[$i]}")
     [[ -z ${cuts[$i]} ]] || args+=(--shard "${cuts[$i]}")
   done
-  # A part of a run is a `ply test` of its own, and the cut charges its startup apart.
+  # A part of a run is a `ply test` of its own, and the cut charges its startup apart, as its run's:
+  # every part loads the same closure.
   key=$path
-  [[ -z ${cuts[0]} ]] || key=$path#${ids[0]}
+  [[ -z ${cuts[0]} ]] || key=$path#${ids[0]%%#*}
   # What an earlier run kept answers each run of several apart, whichever runs it was batched with:
   # only the ones it does not answer are run.
   started=$(date +%s%3N)
   if ((!selecting)) && [ "${#ids[@]}" -gt 1 ]; then
-    local asking=0 left kept_ids=() kept_filters=() answered=()
+    local asking=0 left kept_ids=() kept_filters=() kept_cuts=() answered=()
     out=$(mktemp)
     tested "$path" "${args[@]}" ${extra[@]+"${extra[@]}"} --kept > "$out" || asking=$?
     left=$(jq -r '.unanswered[]?' "$out" 2>/dev/null)
@@ -305,6 +312,7 @@ run_modules() {
         if grep -qxF -- "${filters[$i]}" <<< "$left"; then
           kept_ids+=("${ids[$i]}")
           kept_filters+=("${filters[$i]}")
+          kept_cuts+=("${cuts[$i]}")
           args+=(--filter "${filters[$i]}")
           [[ -z ${cuts[$i]} ]] || args+=(--shard "${cuts[$i]}")
         else
@@ -314,6 +322,7 @@ run_modules() {
       [ "${#answered[@]}" -eq 0 ] || echo "answered by what earlier runs kept: ${answered[*]}"
       ids=("${kept_ids[@]}")
       filters=("${kept_filters[@]}")
+      cuts=("${kept_cuts[@]}")
     fi
   fi
   out=$(mktemp)
@@ -349,7 +358,9 @@ run_modules() {
   for i in "${!ids[@]}"; do
     n=${counted[$((2 * i))]:-0}
     ms=${counted[$((2 * i + 1))]:-0}
-    if [ "$n" -eq 0 ]; then
+    if [ "$n" -eq 0 ] && [ -n "${cuts[$i]}" ]; then
+      echo "corpus run ${ids[$i]} selected no test: every test of its run is in another part"
+    elif [ "$n" -eq 0 ]; then
       echo "corpus run ${ids[$i]} selected no test (filter: ${filters[$i]})" >&2
       bad=1
     fi
