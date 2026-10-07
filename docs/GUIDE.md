@@ -2928,7 +2928,8 @@ bytes again are the one it holds, so a publish whose interface was refused runs
 again whole. The **semantics version** names what a definition's hashes, its
 checked rows and a claim's verdict mean — `ply publish --json` reports it — and
 moves only when one of them does, so a `ply` that changes nothing they mean
-reads an interface another cut. `ply resolve` fetches the interface beside each
+reads an interface another cut. It is a digest of what they come to over a
+corpus, which the build of `ply` evaluates (§3.5). `ply resolve` fetches the interface beside each
 archive into the dependency's slot, and the first load reads the dependency
 through it rather than analysing its source. `--verify-deps` (`check`, `test`,
 `prove`) reads every dependency from source instead and refuses one whose
