@@ -1,7 +1,7 @@
-//! The front-end cache on the path every command takes: a load reads what the last one filed before
-//! it analyses, and files what it answered after. A warm check answers what a cold one does; that a
-//! seeded analysis is sound through every kind of edit is the compiler's own property, and
-//! `crates/ply-compiler/ply/front.ply` tests it over sessions of edits.
+//! The memo store on the path every command takes: a load answers each module through its queries,
+//! taking each record whose every read answers as it did. A warm check answers what a cold one
+//! does; that answers through a store kept across edits are the fresh ones is the compiler's own
+//! property, which `crates/ply-compiler/ply/checking.ply` tests over sessions of edits.
 
 import compiler.load
 import harness (scratch, Ran, Server, Source, example_files, project, write, read, working,
@@ -86,45 +86,20 @@ fn corpus() -> Unit / {Here, abort.raise} =
     { path: "leaf.ply", text: leaf() },
   ])
 
-// Nothing in the corpus imports a shipped module, so every definition is the project's own.
-test "a second check is seeded whole and an edit checks only what it moved" {
+// Nothing in the corpus imports a shipped module, so every module is the project's own.
+test "a second check takes every module as kept and an edit checks only the module it moved" {
   scratch(|| {
     corpus();
     let cold = seeding();
-    assert(cold.seeded == 0, Some("a cold cache seeds nothing"));
-    let all = cold.checked;
-    assert(all > 0, None);
+    assert(cold.taken == 0 && cold.checked == 3, Some("a cold store keeps nothing"));
     let warm = seeding();
-    assert(
-      warm.seeded == all && warm.checked == 0,
-      Some("a warm check takes every definition from its filed rows"),
-    );
-    // Nothing references `two`, so its own hash is the only one the edit moves.
+    assert(warm.taken == 3 && warm.checked == 0, Some("a warm check takes every module as kept"));
+    // Nothing imports `leaf`, so it is the only module the edit checks again.
     edit("leaf.ply", "one() + one()", "one() + one() + 0");
     let edited = seeding();
     assert(
-      edited.seeded == all - 1 && edited.checked == 1,
-      Some("the edited definition is checked and every other one is seeded"),
-    );
-    let _ = warm_agrees("after the edit");
-    ()
-  })
-}
-
-// A module whose text stands keeps its tests as hashing fixed them, so an edit hashes the tests of
-// the module it moved and no other.
-test "an edit hashes only the tests of the module it moved" {
-  scratch(|| {
-    corpus();
-    let cold = seeding();
-    assert(cold.held == 0 && cold.hashed == 2, Some("a cold cache hashes every test"));
-    let warm = seeding();
-    assert(warm.held == 2 && warm.hashed == 0, Some("a warm check holds every test"));
-    edit("shop.ply", "acc + core::price(i)", "core::price(i) + acc");
-    let edited = seeding();
-    assert(
-      edited.held == 1 && edited.hashed == 1,
-      Some("the moved module's test is hashed and the standing one's is held"),
+      edited.taken == 2 && edited.checked == 1,
+      Some("the edited module is checked and every other one is taken"),
     );
     let _ = warm_agrees("after the edit");
     ()
@@ -206,52 +181,20 @@ fn looping(above: String, between: String) -> String =
   above ++ "fn spin(n: Int) -> Int / {diverges} = hop(n + 1)\n" ++ between
     ++ "fn hop(n: Int) -> Int / {diverges} = spin(n)\n\npub fn wait(n: Int) -> Int / {diverges} = spin(n)\n"
 
-test "a seeded definition that may not return says where its call is now" {
+test "a definition that may not return says where its call is now, after its module moved" {
   scratch(|| {
     project([{ path: "m.ply", text: looping("", "") }]);
     let _ = seeding();
     write("m.ply", looping("pub fn aside() -> Int = 3\n\n", "\npub fn apart() -> Int = 4\n\n"));
     let moved = seeding();
-    assert(moved.seeded == 3 && moved.checked == 2, Some("the moved definitions are seeded"));
+    assert(moved.checked == 1, Some("the moved module is checked again"));
     let _ = warm_agrees("after the definitions moved");
     ()
   })
 }
 
-fn stubbed() -> List<String> / {Reached, Shipped, abort.raise, diverges} =
-  map(
-    items(path(json_of(on_disk(["check", "--json", "--explain"])), ["front_end", "stubbed"])),
-    str,
-  )
-
-/// What `ply defs` read of the project here as its stubs, and the hash it lists for `leaf.two`.
-fn listed_stubs() -> { stubbed: List<String>, two: String } / {Reached, Shipped, abort.raise, diverges} = {
-  let v = json_of(on_disk(["defs", "--json"]));
-  {
-    stubbed: map(items(path(v, ["front_end", "stubbed"])), str),
-    two: fold(items(at(v, "definitions")), "", |acc: String, d: Json|
-      if str(at(d, "name")) == "leaf.two" { str(at(d, "hash")) } else { acc }),
-  }
-}
-
-// A listing reads its own modules as a check does, and lists what a listing of every source does.
-test "a listing reads a module that did not move as its stub" {
-  scratch(|| {
-    corpus();
-    let cold = listed_stubs();
-    assert(cold.stubbed == [], Some("a cold listing reads every source"));
-    edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    let moved = listed_stubs();
-    assert_eq(moved.stubbed, ["core", "shop"]);
-    assert(moved.two != cold.two, Some("the edited definition's hash moves"));
-    edit("core.ply", "Note(_) -> 0", "Note(_) -> 0 + 0");
-    assert_eq(listed_stubs().stubbed, ["leaf"]);
-    ()
-  })
-}
-
-// `shop` is warned of two definitions nothing uses, which a stub of it has no body to show.
-test "a check reads a module that did not move as its stub, and warns of it what its source earned" {
+// `shop` is warned of two definitions nothing uses, which its kept answer carries.
+test "a warm check warns of a module that did not move what its source earned" {
   scratch(|| {
     corpus();
     let cold = warm_agrees("cold");
@@ -259,19 +202,15 @@ test "a check reads a module that did not move as its stub, and warns of it what
       len(filter(items(at(cold, "diagnostics")), |d: Json| str(at(d, "code")) == "W0611")) == 2,
       Some(shown(cold)),
     );
-    assert_eq(stubbed(), ["core", "leaf", "shop"]);
     edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    assert_eq(stubbed(), ["core", "shop"]);
     let _ = warm_agrees("after an edit nothing reaches");
-    // `shop` imports `core`, so it is read from its source with it.
     edit("core.ply", "Note(_) -> 0", "Note(_) -> 0 + 0");
-    assert_eq(stubbed(), ["leaf"]);
     let _ = warm_agrees("after an edit `shop` reaches");
     ()
   })
 }
 
-// No module's text says what it embeds, so a stub stands on that too.
+// No module's text says what it embeds: the embed is a read of its own.
 test "a check sees that a file a module embeds is gone, though no module moved" {
   scratch(|| {
     project([
@@ -283,16 +222,14 @@ test "a check sees that a file a module embeds is gone, though no module moved" 
       { path: "words.txt", text: "one two\n" },
     ]);
     let _ = warm_agrees("cold");
-    assert_eq(stubbed(), ["count", "words"]);
     removed("words.txt");
-    assert_eq(stubbed(), []);
     let answer = warm_agrees("the embedded file is gone");
     assert(int(at(answer, "exit_code")) != 0, Some(shown(answer)))
   })
 }
 
-// A proof that a measure descends reads the bodies of what its module imports, and a stub has none.
-test "a check that must show a measure reads the project's own modules from source" {
+// A proof that a measure descends reads the bodies of what its module imports.
+test "a check that must show a measure agrees warm and cold" {
   scratch(|| {
     project([
       { path: "step.ply", text: "pub fn down(n: Int) -> Int = n - 1\n" },
@@ -302,9 +239,7 @@ test "a check that must show a measure reads the project's own modules from sour
       },
     ]);
     let _ = warm_agrees("cold");
-    assert_eq(stubbed(), ["step", "walk"]);
     edit("walk.ply", "{ 0 }", "{ 0 + 0 }");
-    assert_eq(stubbed(), []);
     let answer = warm_agrees("after an edit to the definition that states the measure");
     assert(int(at(answer, "exit_code")) == 0, Some(shown(answer)))
   })
@@ -339,18 +274,6 @@ test "an unchanged listing takes the answer its last one kept, and an edit lists
   })
 }
 
-test "a listing over a store the cache warned of is kept, and the next takes it back" {
-  scratch(|| {
-    corpus();
-    let _ = on_disk(["check", "--explain"]);
-    write(".ply-cache/store.idx", "not an index at all");
-    let warned = json_of(on_disk(["defs", "--json"]));
-    let again = json_of(on_disk(["defs", "--json"]));
-    assert(truth(path(again, ["front_end", "reused"])), Some(shown(again)));
-    assert_eq(shown(at(again, "definitions")), shown(at(warned, "definitions")))
-  })
-}
-
 test "a check that cannot file its answer still answers, and says it filed nothing" {
   scratch(|| {
     corpus();
@@ -360,21 +283,6 @@ test "a check that cannot file its answer still answers, and says it filed nothi
     assert(!truth(path(unfiled, ["front_end", "filed"])), Some(shown(unfiled)));
     let again = json_of(on_disk(["check", "--json"]));
     assert(!truth(path(again, ["front_end", "reused"])), Some(shown(again)))
-  })
-}
-
-test "a check the cache warned in files the program's own answer, which the next takes back" {
-  scratch(|| {
-    corpus();
-    let _ = on_disk(["check", "--explain"]);
-    write(".ply-cache/store.idx", "not an index at all");
-    let about = |v: Json| filter(codes(v), |c: String| contains(about_the_cache(), c));
-    let warned = json_of(on_disk(["check", "--json"]));
-    assert(len(about(warned)) > 0, Some(shown(warned)));
-    let again = json_of(on_disk(["check", "--json"]));
-    assert(truth(path(again, ["front_end", "reused"])), Some(shown(again)));
-    assert_eq(about(again), []);
-    assert_eq(comparable(again), comparable(warned))
   })
 }
 
@@ -434,7 +342,6 @@ fn ledger() -> String =
   \\  db.query[ledger](sql::stmt("select amount from ledger"), [])
   \\
 
-// A statement is checked off its module's bodies, so a module that runs one is never its stub.
 test "a warm check holds a statement to its module's schema as a cold one does" {
   scratch(|| {
     project([
@@ -446,10 +353,6 @@ test "a warm check holds a statement to its module's schema as a cold one does" 
     assert_eq(codes(warm_agrees("cold")), ["E0433"]);
     edit("other.ply", "= 7", "= 8");
     assert_eq(codes(warm_agrees("after an edit beside the statements")), ["E0433"]);
-    assert(
-      !contains(stubbed(), "store"),
-      Some("a module that runs a statement was read as its stub"),
-    );
     edit("store.ply", "skuu", "sku");
     assert_eq(codes(warm_agrees("after the column is mended")), [])
   })
@@ -756,28 +659,14 @@ test "two definitions that share a hash each keep their own interface" {
   })
 }
 
-test "a corrupt front-end cache degrades to a cold check and is repaired" {
+test "a memo store whose index does not read degrades to a cold check and is repaired" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
-    write(".ply-cache/store.idx", "not an index at all");
-    let r = on_disk(["check", "--json", "--explain"]);
-    assert(r.code == 0, Some(said(r)));
-    let answer = json_of(r);
-    assert(
-      len(
-          filter(items(at(answer, "diagnostics")), |d: Json|
-            string_starts_with(str(at(d, "code")), "W06")),
-        )
-        > 0,
-      Some("a discarded cache is reported: " ++ shown(answer)),
-    );
-    assert(
-      int(path(answer, ["front_end", "definitions", "seeded"])) == 0,
-      Some("nothing is taken from a cache that did not read"),
-    );
-    let _ = warm_agrees("after the cache was rewritten");
-    assert(seeding().checked == 0, Some("the run that met the damage filed a whole cache"))
+    write(".ply-cache/memo/index", "not an index at all");
+    assert(seeding().taken == 0, Some("nothing is taken from an index that did not read"));
+    let _ = warm_agrees("after the index was rewritten");
+    assert(seeding().checked == 0, Some("the run that met the damage kept a whole index"))
   })
 }
 
@@ -789,46 +678,38 @@ test "a cache mangled mid-session degrades and recovers" {
     let _ = warm_agrees("cold");
     edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 2");
     let _ = warm_agrees("edited");
-    let data = ".ply-cache/store.dat";
-    let bytes = match fs.read_file[cwd](data) {
-      Some(b) -> b,
-      None -> panic("the data file reads"),
-    };
+    let data = ".ply-cache/memo/index";
+    let bytes = match fs.read_file[cwd](data) { Some(b) -> b, None -> panic("the index reads") };
     let mangled = bytes_concat_all(
       map(range(0, bytes_len(bytes)), |i: Int|
         byte_of_int(if i < 64 { bytes_at(bytes, i) } else { bytes_at(bytes, i) ^ 90 })),
     );
-    assert(fs.write_file[cwd](data, mangled), Some("the data file is written"));
+    assert(fs.write_file[cwd](data, mangled), Some("the index is written"));
     let _ = warm_agrees("the cache was mangled");
     let _ = warm_agrees("and the run after that");
     ()
   })
 }
 
-// The shape a half-finished garbage collection would leave: an index whose data file is gone.
-test "fingerprints without their interfaces are refused rather than believed" {
+// The shape a half-finished compaction would leave: records whose answers are gone.
+test "records without their answers are answered again rather than believed" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
-    removed(".ply-cache/store.dat");
-    let _ = warm_agrees("fingerprints with no interfaces behind them");
+    assert(fs.remove_tree[cwd](".ply-cache/memo/outputs"), Some("the answers are removed"));
+    let _ = warm_agrees("records with no answers behind them");
     let _ = warm_agrees("and the run after that");
     ()
   })
 }
 
-// Only a load of the whole project drops what the cache holds for files it did not read.
 test "a single-file run does not spoil the whole project run after it" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
     let r = on_disk(["check", "leaf.ply"]);
     assert(r.code == 0, Some(said(r)));
-    let stats = json_of(on_disk(["cache", "stats", "--json"]));
-    assert(
-      int(path(stats, ["frontend", "sources"])) >= 3,
-      Some("a single-file run must not have pruned the rest of the project: " ++ shown(stats)),
-    );
+    assert(seeding().checked == 0, Some("the whole project's records stand"));
     let _ = warm_agrees("whole project after a single-file run");
     ()
   })
@@ -851,8 +732,9 @@ test/nondet "two overlapping runs leave a cache that still agrees" {
 
 fn filed_nothing(what: String) -> Unit / {fs.exists[cwd], abort.raise} =
   assert(
-    !fs.exists[cwd](".ply-cache/store.idx") && !fs.exists[cwd](".ply-cache/store.dat"),
-    Some(what ++ " filed a front-end cache"),
+    !fs.exists[cwd](".ply-cache/store.idx") && !fs.exists[cwd](".ply-cache/store.dat")
+      && !fs.exists[cwd](".ply-cache/memo"),
+    Some(what ++ " filed into the cache"),
   )
 
 fn one_test() -> Unit / {Here, abort.raise} =
@@ -904,9 +786,9 @@ fn lib_dep(at_path: String) -> String =
   "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"" ++ at_path
     ++ "\")}"
 
-// A dependency's module is filed under its package's identity, so moving the package keeps what was
-// filed for it, and a changed dependency is checked again.
-test "a dependency module is filed under its package and survives the package moving" {
+// A dependency's module is read where its package stands, so moving the package checks it again and
+// nothing that imports it; a changed dependency is checked again.
+test "a dependency module moved with its package is checked again, and nothing that imports it" {
   scratch(|| {
     project([
       { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
@@ -916,12 +798,12 @@ test "a dependency module is filed under its package and survives the package mo
     ]);
     let r = on_disk(["check", "app"]);
     assert(r.code == 0, Some(stderr(r)));
-    // The package is checked out somewhere else, and its manifest is unchanged: the rows filed for it
-    // are the moved package's too.
+    // The package is checked out somewhere else, and its manifest is unchanged: what its module
+    // shows its importers is too.
     assert(fs.create_dir[cwd]("vendor"), None);
     assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
     write("app/ply.pkg", manifest("app", lib_dep("../vendor/lib")));
-    assert(seeding_at("app").checked == 0, Some("a moved package keeps the rows filed for it"));
+    assert(seeding_at("app").checked == 1, Some("the moved module is checked, and nothing else"));
     // A changed dependency is checked again where it changed; its caller reads its contract and
     // what it publishes, which the edit left alone.
     write("vendor/lib/answer.ply", "pub fn answer() -> Int = 40 + 2\n");
@@ -1010,42 +892,17 @@ fn measured() -> String =
   \\test "distance is symmetric" { assert_eq(distance(2, 5), distance(5, 2)) }
   \\
 
-type Kept = { name: String, bytes: Bytes }
-
-fn interfaces() -> String = ".ply-cache/interfaces"
-
-/// The package of the shipped modules and the dependencies: what a check keeps of the project's own
-/// modules lies beside it, named `.own`.
-fn kept_package() -> Kept / {fs.list_dir[cwd], fs.read_file[cwd], abort.raise} =
-  match fs.list_dir[cwd](interfaces()) {
-    None -> panic("the store keeps no package"),
-    Some(all) -> match filter(all, |n: String| !string_ends_with(n, ".own")) {
-      [name] -> match fs.read_file[cwd](interfaces() ++ "/" ++ name) {
-        Some(b) -> { name: name, bytes: b },
-        None -> panic("`" ++ name ++ "` does not read"),
-      },
-      names -> panic("the store keeps one package, not " ++ int_to_string(len(names))),
-    },
-  }
-
-test "a load through the compiled shipped modules answers what a load of its source does" {
+test "a load that pulls shipped modules answers what a load of their source does" {
   scratch(|| {
     project([{ path: "app.ply", text: measured() }]);
-    let _ = warm_agrees("the load that cuts the package");
-    let first = kept_package();
-    let _ = warm_agrees("a load through it");
-    assert(
-      kept_package() == first,
-      Some("a load that pulls nothing new keeps the package it read"),
-    );
+    let _ = warm_agrees("cold");
+    let _ = warm_agrees("warm");
     write(
       "more.ply",
       "import std.option (option_unwrap_or)\npub fn or_zero(o: Option<Int>) -> Int = option_unwrap_or(o, 0)\n",
     );
-    let _ = warm_agrees("a load that pulls a module the package lacks");
-    let second = kept_package();
-    assert(second.bytes != first.bytes, Some("the package is cut again to cover what was pulled"));
-    let _ = warm_agrees("a load through the package cut again");
+    let _ = warm_agrees("a load that pulls another module");
+    let _ = warm_agrees("and again");
     let hashed = ["hash", "--deps", "--json"];
     let warm_hashes = comparable(json_of(on_disk(hashed)));
     let cold_hashes = comparable(json_of(in_memory(tree(sources_here()), hashed)));
@@ -1060,11 +917,7 @@ test "a load through the compiled shipped modules answers what a load of its sou
       warm_single == cold_single,
       Some("warm: " ++ shown(warm_single) ++ "\ncold: " ++ shown(cold_single)),
     );
-    assert(
-      kept_package() == second,
-      Some("a load that reaches part of the package keeps it whole"),
-    );
-    // `replace` and a mutant re-check a spliced program through the package the load read.
+    // `replace` and a mutant re-check a spliced program as the load read it.
     write("distance.txt", "pub fn distance(a: Int, b: Int) -> Int = abs(b - a)\n");
     let replaced = on_disk(["replace", "distance", "--with", "distance.txt"]);
     assert(replaced.code == 0, Some(said(replaced)));
@@ -1073,14 +926,8 @@ test "a load through the compiled shipped modules answers what a load of its sou
     let warm = at(json_of(on_disk(mutate)), "mutants");
     let cold = at(json_of(in_memory(tree(sources_here()), mutate)), "mutants");
     assert(warm == cold, Some("warm: " ++ shown(warm) ++ "\ncold: " ++ shown(cold)));
-    write(interfaces() ++ "/" ++ second.name, "not a package");
-    let _ = warm_agrees("a load whose package does not read");
-    assert(
-      kept_package().bytes != b"not a package",
-      Some("a package that does not read is cut again"),
-    );
     assert(on_disk(["cache", "clear"]).code == 0, None);
-    assert(!fs.exists[cwd](interfaces()), Some("clearing the cache discards the package"))
+    assert(!fs.exists[cwd](".ply-cache/memo"), Some("clearing the cache discards the memo store"))
   })
 }
 
@@ -1127,7 +974,7 @@ fn packaged_project() -> Unit / {Here, abort.raise} =
 
 fn owners(v: Json) -> List<String> = map(items(at(v, "obligations")), |o: Json| str(at(o, "owner")))
 
-test "a dependency read through its compiled package answers what its source does" {
+test "a dependency's modules answer what their source does" {
   scratch(|| {
     packaged_project();
     let check = ["check", "app", "--explain", "--json"];
@@ -1136,19 +983,19 @@ test "a dependency read through its compiled package answers what its source doe
       let cold = comparable(json_of(in_memory(tree(sources_here()), check)));
       assert(warm == cold, Some(what ++ "\nwarm: " ++ shown(warm) ++ "\ncold: " ++ shown(cold)))
     };
-    agrees("the load that cuts the package");
-    agrees("a load through it");
-    assert(seeding_at("app").checked == 0, Some("the dependency is read through its stubs"));
+    agrees("cold");
+    agrees("warm");
+    assert(seeding_at("app").checked == 0, Some("every module is taken as kept"));
     // A dependency's unused definition is its own package's to report.
     assert(!contains(codes(json_of(on_disk(["check", "app", "--json"]))), "W0611"), None);
     assert(contains(codes(json_of(on_disk(["check", "lib", "--json"]))), "W0611"), None);
     assert(on_disk(["prove", "app"]).code == 0, None);
     assert(on_disk(["test", "app"]).code == 0, None);
     edit("lib/answer.ply", "= 42", "= {\n  let _ = helper();\n  42\n}");
-    // The dependency's body moved, and neither its contract nor what it publishes did: it alone is
-    // checked again. A proof stands, and what runs the body runs again: the sampled `ensures` and
-    // the test.
-    assert(seeding_at("app").checked == 1, Some("only the edited definition is walked"));
+    // The dependency's body moved, and neither its contract nor what it publishes did: its module
+    // alone is checked again. A proof stands, and what runs the body runs again: the sampled
+    // `ensures` and the test.
+    assert(seeding_at("app").checked == 1, Some("only the edited module is checked"));
     let proved = json_of(on_disk(["prove", "app", "--json"]));
     assert(int(at(proved, "cached")) == 1, Some(shown(proved)));
     assert(
@@ -1156,7 +1003,7 @@ test "a dependency read through its compiled package answers what its source doe
       None,
     );
     agrees("after the dependency moved");
-    agrees("through the package cut again");
+    agrees("and again");
     // A run answers for its own package; the dependency's obligation is its own run's.
     assert_eq(owners(json_of(on_disk(["prove", "app", "--json"]))), ["main.bump", "main.kept"]);
     assert_eq(owners(json_of(on_disk(["prove", "lib", "--json"]))), ["more.more"]);
@@ -1184,10 +1031,10 @@ test "a dependent proves through a transparent definition, and is checked and pr
       { path: "lib/same.ply", text: "pub transparent fn same(x: Int) -> Int = x\n" },
     ]);
     assert_eq(tiers(json_of(on_disk(["prove", "app", "--json"]))), ["proved"]);
-    assert(seeding_at("app").checked == 0, Some("a warm load walks nothing"));
+    assert(seeding_at("app").checked == 0, Some("a warm load checks nothing"));
     edit("lib/same.ply", "= x", "= x + 0");
     // The body is part of the contract: the dependent is checked and proved again.
-    assert(seeding_at("app").checked == 2, Some("the edit and its dependent are walked"));
+    assert(seeding_at("app").checked == 2, Some("the edit and its dependent are checked"));
     let again = json_of(on_disk(["prove", "app", "--json"]));
     assert(int(at(again, "cached")) == 0, Some(shown(again)));
     assert_eq(tiers(again), ["proved"])

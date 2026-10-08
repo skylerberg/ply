@@ -109,39 +109,39 @@ test "a damaged store is reported and the run goes on" {
   })
 }
 
-test "cache stats reports open time and the front-end files" {
+test "cache stats reports open time, the store's files and the memo store" {
   scratch(|| {
     tested_once();
     let text = stdout(on_disk(["cache", "stats"]));
     assert(string_contains(text, "opened in"), Some("the open cost is the claim:\n" ++ text));
-    assert(string_contains(text, "index"), Some("the front-end files must be sized:\n" ++ text));
+    assert(string_contains(text, "index"), Some("the store's files must be sized:\n" ++ text));
+    assert(string_contains(text, "memo"), Some(text));
     assert(string_contains(text, "reclaimable"), Some(text));
     let v = stats();
     assert(is_number(at(v, "open_ms")), Some(shown(v)));
-    assert(int(path(v, ["frontend", "index_bytes"])) > 0, Some(shown(v)));
-    assert(is_number(path(v, ["frontend", "data_bytes"])), Some(shown(v)));
-    assert(int(path(v, ["frontend", "sources"])) >= 1, Some(shown(v)));
-    assert(is_number(path(v, ["frontend", "bodies"])), Some(shown(v)));
-    assert(path(v, ["frontend", "compact_suggested"]) == json::Bool(false), Some(shown(v)))
+    assert(int(path(v, ["store", "index_bytes"])) > 0, Some(shown(v)));
+    assert(is_number(path(v, ["store", "data_bytes"])), Some(shown(v)));
+    assert(int(path(v, ["memo", "records"])) >= 1, Some(shown(v)));
+    assert(int(path(v, ["memo", "answers"])) >= 1, Some(shown(v)));
+    assert(is_number(path(v, ["history", "bodies"])), Some(shown(v)));
+    assert(path(v, ["store", "compact_suggested"]) == json::Bool(false), Some(shown(v)))
   })
 }
 
-test "cache compact drops a deleted file and keeps the rest" {
+test "cache compact keeps every result and every record the queries of this `ply` read" {
   scratch(|| {
     project([
       { path: "m.ply", text: green() },
       { path: "gone.ply", text: "fn gone() -> Int = 9\n" },
     ]);
     assert(on_disk(["test"]).code == 0, None);
-    assert(int(path(stats(), ["frontend", "sources"])) == 2, None);
+    let records = int(path(stats(), ["memo", "records"]));
     assert(fs.remove[cwd]("gone.ply"), None);
     let r = on_disk(["cache", "compact"]);
     assert(r.code == 0, Some(said(r)));
     assert(string_contains(stdout(r), "compacted"), Some(stdout(r)));
-    assert(string_contains(stdout(r), "dropped 1 file"), Some(stdout(r)));
     let v = stats();
-    assert(int(path(v, ["frontend", "sources"])) == 1, Some(shown(v)));
-    // Compaction is a front-end garbage collection.
+    assert(int(path(v, ["memo", "records"])) == records, Some(shown(v)));
     assert(int(at(v, "entries")) >= 2, Some(shown(v)));
     let text = stdout(on_disk(["test"]));
     assert(
@@ -159,8 +159,8 @@ test "cache compact --json is one object" {
     assert(str(at(v, "action")) == "compact", Some(shown(v)));
     assert(truth(at(v, "ok")), Some(shown(v)));
     assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
-    assert(int(at(v, "files_kept")) == 1, Some(shown(v)));
     assert(is_number(path(v, ["dropped", "definitions"])), Some(shown(v)));
+    assert(is_number(path(v, ["dropped", "records"])), Some(shown(v)));
     assert(is_number(at(v, "bytes_before")), Some(shown(v)));
     assert(is_number(at(v, "reclaimed_bytes")), Some(shown(v)))
   })
@@ -203,15 +203,14 @@ test "cache inspect accepts a hash prefix and emits json" {
     assert(str(at(found, "name")) == "m.double", Some(shown(found)));
     assert(str(at(found, "kind")) == "fn", Some(shown(found)));
     assert(str(at(found, "file")) == "m.ply", Some(shown(found)));
-    assert(at(found, "stale") == json::Bool(false), Some(shown(found)));
     assert(str(path(found, ["interface", "type"])) == "(Int) -> Int", Some(shown(found)));
     let by_prefix = inspected(string_slice(str(at(found, "hash")), 0, 6));
     assert(str(at(nth(at(by_prefix, "matches"), 0), "name")) == "m.double", Some(shown(by_prefix)));
-    // A stored span is a range into the bytes as cached, so a same-length edit still invalidates it.
+    // What a load answers is of the text as it stands: an edit's hash, at its place.
     write("m.ply", string::replace(green(), "x * 2", "x + 2"));
     let edited = nth(at(inspected("double"), "matches"), 0);
-    assert(at(edited, "stale") == json::Bool(true), Some(shown(edited)));
-    assert(at(edited, "location") == Null, Some(shown(edited)))
+    assert(str(at(edited, "hash")) != str(at(found, "hash")), Some(shown(edited)));
+    assert(string_starts_with(str(at(edited, "location")), "m.ply:1:"), Some(shown(edited)))
   })
 }
 
@@ -241,32 +240,6 @@ test "cache inspect reports a test and whether it is proven" {
     let after = nth(at(inspected("double doubles"), "matches"), 0);
     assert(string_contains(str(at(after, "result")), "passed"), Some(shown(after)));
     assert(path(after, ["interface", "nondet"]) == json::Bool(false), Some(shown(after)))
-  })
-}
-
-/// What a cache of the format before the store kept: each is removed once, and said once.
-fn earlier_format() -> List<String> =
-  ["frontend.idx", "frontend.dat", "results.json", "passes.json"]
-
-test "a cache left by the earlier format is explained once and removed" {
-  scratch(|| {
-    program(green());
-    fold(earlier_format(), (), |u: Unit, old: String| write(".ply-cache/" ++ old, "{}"));
-    let r = on_disk(["test"]);
-    assert(r.code == 0, Some(said(r)));
-    assert(string_contains(stdout(r), "format changed"), Some(stdout(r)));
-    assert(string_contains(stdout(r), "selected 2 of 2 (0 cached)"), Some(stdout(r)));
-    fold(earlier_format(), (), |u: Unit, old: String|
-      assert(
-        !fs.exists[cwd](".ply-cache/" ++ old),
-        Some("`" ++ old ++ "` must not be left behind forever"),
-      ));
-    let again = stdout(on_disk(["test"]));
-    assert(
-      !string_contains(again, "format changed"),
-      Some("the migration is reported once, not every run:\n" ++ again),
-    );
-    assert(string_contains(again, "selected 0 of 2 (2 cached)"), Some(again))
   })
 }
 
