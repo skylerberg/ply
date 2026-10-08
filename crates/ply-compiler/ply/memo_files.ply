@@ -1,122 +1,147 @@
-//! The memo store as files in a directory: `index`, each record by its key, and `outputs/`, each
-//! answer under its digest. A run reads the index whole, so a record it takes is validated against
-//! the world as the run finds it with no file read, and keeps what it answered: each answer as a file
-//! of its own, and its records merged into the index under a lock, beside what other runs kept.
+//! The memo store as files in a directory: `records/`, each record under its key, and `outputs/`,
+//! each answer under its digest. A run reads the records it asks for and no other, and keeps what it
+//! answered as files of their own, each landed whole by a rename, so runs that keep the same answer
+//! at once leave one.
 
 import std.bin
 import std.fs (fs)
 import std.bytes (hex_of)
-import memo (Record, Run, memo_keep, record_bin, new_run)
+import memo (Record, Run, memo_keep, record_bin, new_run, digest_of)
 
-/// Every record the store holds, by its key.
-type Index = { records: Map<Bytes, Record> }
+/// `sub` of the store in `dir`; of the store's own root for an empty `dir`.
+fn within(dir: String, sub: String) -> String = if dir == "" { sub } else { dir ++ "/" ++ sub }
 
-derive bin for Index
+fn records_dir(dir: String) -> String = within(dir, "records")
 
-fn index_path(dir: String) -> String = dir ++ "/index"
+fn outputs_dir(dir: String) -> String = within(dir, "outputs")
 
-fn outputs_dir(dir: String) -> String = dir ++ "/outputs"
+fn record_path(dir: String, key: Bytes) -> String / {abort.raise} =
+  records_dir(dir) ++ "/" ++ hex_of(key)
 
 fn output_path(dir: String, digest: Bytes) -> String / {abort.raise} =
   outputs_dir(dir) ++ "/" ++ hex_of(digest)
 
-fn read_index<[r]>(dir: String) -> Map<Bytes, Record> / {fs.read[r], abort.raise} =
-  match fs.read_file[r](index_path(dir)) {
-    None -> map_new(),
-    Some(b) -> match bin::decode(b, index_bin()) { Ok(i) -> i.records, Err(_) -> map_new() },
+/// The record `bytes` holds, or nothing where they do not read as one.
+fn record_of(bytes: Option<Bytes>) -> Option<Record> / {abort.raise} =
+  match bytes {
+    None -> None,
+    Some(b) -> match bin::decode(b, record_bin()) { Ok(rec) -> Some(rec), Err(_) -> None },
   }
 
-/// `kept` merged into the index on disk, under the store's lock: what another run kept since this
-/// one read the index stands beside it.
-fn merged<[r]>(
-  dir: String,
-  kept: Map<Bytes, Record>,
-) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
-  if map_len(kept) == 0 { () } else {
-    let lock = dir ++ "/lock";
-    if fs.lock[r](lock) {
-      let all = map_fold(
-        kept,
-        read_index[r](dir),
-        |acc: Map<Bytes, Record>, k: Bytes, rec: Record| map_insert(acc, k, rec),
-      );
-      let tmp = index_path(dir) ++ ".tmp";
-      if fs.write_file[r](tmp, bin::encode({ records: all }, index_bin())) {
-        fs.rename[r](tmp, index_path(dir));
-        ()
-      };
-      fs.unlock[r](lock);
-      ()
-    } else { () }
+/// The record the store in `dir` holds under `key`.
+pub fn record_at<[r]>(dir: String, key: Bytes) -> Option<Record> / {fs.read[r], abort.raise} =
+  record_of(fs.read_file[r](record_path(dir, key)))
+
+/// `bytes`, where they are the answer kept under `digest`: two runs that land one answer at once may
+/// leave it torn.
+fn whole(digest: Bytes, bytes: Option<Bytes>) -> Option<Bytes> =
+  match bytes { Some(b) -> if digest_of(Some(b)) == digest { Some(b) } else { None }, None -> None }
+
+/// `bytes` at `path`, landed whole: written beside it and renamed over it.
+fn landed<[r]>(path: String, bytes: Bytes) -> Unit / {fs.write[r]} = {
+  let tmp = path ++ ".tmp";
+  if fs.write_file[r](tmp, bytes) {
+    fs.rename[r](tmp, path);
+    ()
   }
+}
 
 /// `work` run over the memo store in `dir`, with `look` answering what the world holds now: each
 /// record it takes is one whose every read answers as it did, and each answer it keeps is written
-/// back before it returns. Where `dir` holds no record under a key, the store in `beside` is asked
-/// too, and nothing is written there.
-pub fn kept<a, [r], [b] | e>(
+/// back as it is answered. Where `dir` holds no record under a key, a read-only store laid out as
+/// this one is asked through `beside`, which reads a file of it by its path within it.
+pub fn kept<a, [r] | e>(
   dir: String,
-  beside: Option<String>,
+  beside: (String) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: (Run) -> { run: Run, value: a } / {memo_keep.read, memo_keep.write, abort.raise},
-) -> { run: Run, value: a } / {fs.read[r], fs.write[r], fs.read[b], abort.raise | e} = {
-  let index = read_index[r](dir);
-  let other = match beside { Some(d) -> read_index[b](d), None -> map_new() };
-  fs.create_dir[r](dir);
+) -> { run: Run, value: a } / {fs.read[r], fs.write[r], abort.raise | e} = {
+  fs.create_dir[r](records_dir(dir));
   fs.create_dir[r](outputs_dir(dir));
-  with_cell[keeping]({ fresh: map_new() }) { cell -> {
-    let done = handle {
-      work(new_run())
-    } with {
-      memo_keep.record(key) -> match map_get(cell_get(cell).fresh, key) {
-        Some(rec) -> Some(rec),
-        None -> match map_get(index, key) { Some(rec) -> Some(rec), None -> map_get(other, key) },
+  handle {
+    work(new_run())
+  } with {
+    memo_keep.record(key) -> match record_of(fs.read_file[r](record_path(dir, key))) {
+      Some(rec) -> Some(rec),
+      None -> record_of(beside(record_path("", key))),
+    },
+    memo_keep.output(digest) -> match whole(digest, fs.read_file[r](output_path(dir, digest))) {
+      Some(o) -> Some(o),
+      None -> whole(digest, beside(output_path("", digest))),
+    },
+    memo_keep.keep(key, rec, output) -> {
+      let at = output_path(dir, rec.output);
+      if !fs.exists[r](at) { landed[r](at, output) };
+      landed[r](record_path(dir, key), bin::encode(rec, record_bin()))
+    },
+    memo_keep.now(kind, at) -> look(kind, at),
+  }
+}
+
+/// The records under each of `keys` in the store `from`, and the answers they name, written into the
+/// store `to`. How many it wrote.
+pub fn copied<[r], [w]>(
+  from: String,
+  to: String,
+  keys: List<Bytes>,
+) -> Int / {fs.read[r], fs.write[w], abort.raise} = {
+  fs.create_dir[w](records_dir(to));
+  fs.create_dir[w](outputs_dir(to));
+  fold(keys, 0, |n: Int, key: Bytes| {
+    let bytes = fs.read_file[r](record_path(from, key));
+    match ((bytes, record_of(bytes))) {
+      (Some(b), Some(rec)) -> match fs.read_file[r](output_path(from, rec.output)) {
+        None -> n,
+        Some(output) -> {
+          landed[w](output_path(to, rec.output), output);
+          landed[w](record_path(to, key), b);
+          n + 1
+        },
       },
-      memo_keep.output(digest) -> match fs.read_file[r](output_path(dir, digest)) {
-        Some(b) -> Some(b),
-        None -> match beside { Some(d) -> fs.read_file[b](output_path(d, digest)), None -> None },
-      },
-      memo_keep.keep(key, rec, output) -> {
-        let path = output_path(dir, rec.output);
-        if !fs.exists[r](path) {
-          let tmp = path ++ ".tmp";
-          if fs.write_file[r](tmp, output) {
-            fs.rename[r](tmp, path);
-            ()
-          }
-        };
-        let k = cell_get(cell);
-        cell_set(cell, { fresh: map_insert(k.fresh, key, rec) })
-      },
-      memo_keep.now(kind, at) -> look(kind, at),
-    };
-    merged[r](dir, cell_get(cell).fresh);
-    done
-  } }
+      _ -> n,
+    }
+  })
 }
 
 /// What the store in `dir` holds: its records, the answers kept beside them and their bytes, and the
 /// bytes of the answers no record names, which compaction reclaims.
 pub type Usage = { records: Int, answers: Int, answer_bytes: Int, unread_bytes: Int }
 
-fn answer_files<[r]>(dir: String) -> List<String> / {fs.read[r]} =
-  match fs.list_dir[r](outputs_dir(dir)) {
+/// The names of the files in `sub` of `dir` that landed whole.
+fn landed_in<[r]>(sub: String) -> List<String> / {fs.read[r]} =
+  match fs.list_dir[r](sub) {
     Some(names) -> filter(names, |n: String| !string_ends_with(n, ".tmp")),
     None -> [],
   }
 
-fn named_digests(records: Map<Bytes, Record>) -> Map<String, Bool> / {abort.raise} =
-  map_fold(records, map_new(), |acc: Map<String, Bool>, _: Bytes, rec: Record|
-    map_insert(acc, hex_of(rec.output), true))
+/// Each record of the store in `dir` that reads back, by the name of its file.
+fn records_in<[r]>(
+  dir: String,
+) -> List<{ name: String, record: Record }> / {fs.read[r], abort.raise} =
+  fold(
+    landed_in[r](records_dir(dir)),
+    [],
+    |acc: List<{ name: String, record: Record }>, n: String|
+      match record_of(fs.read_file[r](records_dir(dir) ++ "/" ++ n)) {
+        Some(rec) -> push(acc, { name: n, record: rec }),
+        None -> acc,
+      },
+  )
+
+fn named_digests(
+  records: List<{ name: String, record: Record }>,
+) -> Map<String, Bool> / {abort.raise} =
+  fold(records, map_new(), |acc: Map<String, Bool>, r: { name: String, record: Record }|
+    map_insert(acc, hex_of(r.record.output), true))
 
 pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} = {
-  let records = read_index[r](dir);
+  let records = records_in[r](dir);
   let named = named_digests(records);
   let sized = |name: String|
     match fs.file_size[r](outputs_dir(dir) ++ "/" ++ name) { Some(n) -> n, None -> 0 };
   fold(
-    answer_files[r](dir),
-    { records: map_len(records), answers: 0, answer_bytes: 0, unread_bytes: 0 },
+    landed_in[r](outputs_dir(dir)),
+    { records: len(records), answers: 0, answer_bytes: 0, unread_bytes: 0 },
     |u: Usage, name: String| {
       let n = sized(name);
       {
@@ -129,41 +154,32 @@ pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} = {
   )
 }
 
-/// What a compaction dropped: records of queries no longer current, and answers no record names.
+/// What a compaction dropped: records it did not keep, and answers no record names.
 pub type Compacted = { records: Int, answers: Int, bytes: Int }
 
-/// Drops every record whose query is not among `current`, the hashes the queries have now, and then
-/// every answer no record left names.
+/// Drops every record `keeps` does not keep, asked with the hex of its key, and then every answer no
+/// record left names.
 pub fn compacted<[r]>(
   dir: String,
-  current: Map<Bytes, Bool>,
+  keeps: (String, Record) -> Bool,
 ) -> Compacted / {fs.read[r], fs.write[r], abort.raise} = {
-  let lock = dir ++ "/lock";
-  if !fs.exists[r](index_path(dir)) || !fs.lock[r](lock) { { records: 0, answers: 0, bytes: 0 } }
-  else {
-    let all = read_index[r](dir);
-    let kept = map_fold(all, map_new(), |acc: Map<Bytes, Record>, k: Bytes, rec: Record|
-      if map_contains(current, rec.query) { map_insert(acc, k, rec) } else { acc });
-    let tmp = index_path(dir) ++ ".tmp";
-    if map_len(kept) != map_len(all)
-        && fs.write_file[r](tmp, bin::encode({ records: kept }, index_bin())) {
-      fs.rename[r](tmp, index_path(dir));
-      ()
-    };
-    let named = named_digests(kept);
-    let dropped = fold(
-      answer_files[r](dir),
-      { answers: 0, bytes: 0 },
-      |acc: { answers: Int, bytes: Int }, name: String|
-        if map_contains(named, name) { acc } else {
-          let path = outputs_dir(dir) ++ "/" ++ name;
-          let n = match fs.file_size[r](path) { Some(x) -> x, None -> 0 };
-          if fs.remove[r](path) { { answers: acc.answers + 1, bytes: acc.bytes + n } } else { acc }
-        },
-    );
-    fs.unlock[r](lock);
-    { records: map_len(all) - map_len(kept), answers: dropped.answers, bytes: dropped.bytes }
-  }
+  let all = records_in[r](dir);
+  let kept = filter(all, |x: { name: String, record: Record }| keeps(x.name, x.record));
+  let gone = fold(all, 0, |n: Int, x: { name: String, record: Record }|
+    if keeps(x.name, x.record) || !fs.remove[r](records_dir(dir) ++ "/" ++ x.name) { n }
+    else { n + 1 });
+  let named = named_digests(kept);
+  let dropped = fold(
+    landed_in[r](outputs_dir(dir)),
+    { answers: 0, bytes: 0 },
+    |acc: { answers: Int, bytes: Int }, name: String|
+      if map_contains(named, name) { acc } else {
+        let path = outputs_dir(dir) ++ "/" ++ name;
+        let n = match fs.file_size[r](path) { Some(x) -> x, None -> 0 };
+        if fs.remove[r](path) { { answers: acc.answers + 1, bytes: acc.bytes + n } } else { acc }
+      },
+  );
+  { records: gone, answers: dropped.answers, bytes: dropped.bytes }
 }
 
 /// A store held in memory: each record by its key, and each answer by its digest.

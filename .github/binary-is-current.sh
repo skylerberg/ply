@@ -182,7 +182,7 @@ run_self_test() {
   mkdir -p "$tmp/packed"
   cp "$bin" "$tmp/packed/ply"
   cp "$(dirname "$bin")/ply-pack" "$tmp/packed/ply-pack"
-  (cd "$tmp/checkout" && "$tmp/packed/ply-pack" "$tmp/packed/ply")
+  (cd "$tmp/checkout" && "$tmp/packed/ply-pack" --sources "$tmp/packed/ply")
   if out=$(check_pack "$tmp/packed/ply" "$root"); then
     echo "   FAILED -- it did not notice a pack of other sources"; rc=1
   else

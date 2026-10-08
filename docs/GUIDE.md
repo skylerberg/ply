@@ -10,8 +10,8 @@ This guide is the reference for writing Ply and using the `ply` command.
 ## 1. Getting started
 
 Build with `cargo build --release -p ply-launcher --bins`, then `cargo pack
-target/release/ply` to append the shipped modules and the `ply` program to it, and
-put `target/release/ply` on your path. After editing Ply sources in the checkout,
+target/release/ply` to append the shipped modules and the `ply` program to it, with
+what the shipped modules answer checked (§1), and put `target/release/ply` on your path. After editing Ply sources in the checkout,
 `cargo pack` again is the whole rebuild. A Ply file is a module:
 
 ```ply
@@ -82,8 +82,9 @@ of a definition, the form of a type or an effect — never that module's text, s
 a body edit that leaves those as they were checks no importer again. A record is
 filed under the hash of the query's definition and the evaluator that ran it, so
 a `ply` that answers otherwise answers afresh. A shipped module (§13) answers
-alike in every project, so what it answers is kept once for the machine, in a
-`memo-shipped-*` stage under the stage root (`PLY_C_STAGE`, §8.6).
+alike in every project, so the binary carries what each answers, which `cargo
+pack` writes with `ply std --answers` and every load reads beside its own
+store.
 
 ## 2. Lexical structure
 
@@ -3062,7 +3063,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
-| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`; no path |
+| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into the memo store at `DIR`, through one kept under the stage root for the next answering: what `cargo pack` packs into the binary, which every load reads beside its own store); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |

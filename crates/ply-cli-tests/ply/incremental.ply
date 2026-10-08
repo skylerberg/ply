@@ -659,32 +659,44 @@ test "two definitions that share a hash each keep their own interface" {
   })
 }
 
-test "a memo store whose index does not read degrades to a cold check and is repaired" {
+/// Each record the memo store here keeps, rewritten as `f` makes it of what it held.
+fn records_rewritten(f: (Bytes) -> Bytes / {abort.raise}) -> Unit / {Here, abort.raise} = {
+  let dir = ".ply-cache/memo/records";
+  match fs.list_dir[cwd](dir) {
+    None -> panic("the run kept no records"),
+    Some(names) ->
+      fold(names, (), |u: Unit, name: String| {
+        let path = dir ++ "/" ++ name;
+        let bytes = match fs.read_file[cwd](path) { Some(b) -> b, None -> b"" };
+        assert(fs.write_file[cwd](path, f(bytes)), Some("a record is written"))
+      }),
+  }
+}
+
+test "a memo store whose records do not read degrades to a cold check and is repaired" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
-    write(".ply-cache/memo/index", "not an index at all");
-    assert(seeding().taken == 0, Some("nothing is taken from an index that did not read"));
-    let _ = warm_agrees("after the index was rewritten");
-    assert(seeding().checked == 0, Some("the run that met the damage kept a whole index"))
+    records_rewritten(|_: Bytes| b"not a record at all");
+    assert(seeding().taken == 0, Some("nothing is taken from a record that did not read"));
+    let _ = warm_agrees("after the records were rewritten");
+    assert(seeding().checked == 0, Some("the run that met the damage kept its records again"))
   })
 }
 
-// Mangled in the payload rather than replaced: a valid header over undecodable entries is what a
-// half-written append leaves.
+// Mangled in the payload rather than replaced: a record that still decodes is held to the reads it
+// names, and one that does not is no record.
 test "a cache mangled mid-session degrades and recovers" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
     edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 2");
     let _ = warm_agrees("edited");
-    let data = ".ply-cache/memo/index";
-    let bytes = match fs.read_file[cwd](data) { Some(b) -> b, None -> panic("the index reads") };
-    let mangled = bytes_concat_all(
-      map(range(0, bytes_len(bytes)), |i: Int|
-        byte_of_int(if i < 64 { bytes_at(bytes, i) } else { bytes_at(bytes, i) ^ 90 })),
-    );
-    assert(fs.write_file[cwd](data, mangled), Some("the index is written"));
+    records_rewritten(|bytes: Bytes|
+      bytes_concat_all(
+        map(range(0, bytes_len(bytes)), |i: Int|
+          byte_of_int(if i < 8 { bytes_at(bytes, i) } else { bytes_at(bytes, i) ^ 90 })),
+      ));
     let _ = warm_agrees("the cache was mangled");
     let _ = warm_agrees("and the run after that");
     ()
@@ -788,7 +800,7 @@ fn lib_dep(at_path: String) -> String =
 
 // A dependency's module is read where its package stands, so moving the package checks it again and
 // nothing that imports it; a changed dependency is checked again.
-test "a dependency module moved with its package is checked again, and nothing that imports it" {
+test "a dependency moved with its package checks nothing again, and an edit to it only what it moved" {
   scratch(|| {
     project([
       { path: "app/ply.pkg", text: manifest("app", lib_dep("../lib")) },
@@ -798,12 +810,12 @@ test "a dependency module moved with its package is checked again, and nothing t
     ]);
     let r = on_disk(["check", "app"]);
     assert(r.code == 0, Some(stderr(r)));
-    // The package is checked out somewhere else, and its manifest is unchanged: what its module
-    // shows its importers is too.
+    // The package is checked out somewhere else, and its manifest is unchanged: a load's packages
+    // are what their manifests say, never where they are.
     assert(fs.create_dir[cwd]("vendor"), None);
     assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
     write("app/ply.pkg", manifest("app", lib_dep("../vendor/lib")));
-    assert(seeding_at("app").checked == 1, Some("the moved module is checked, and nothing else"));
+    assert(seeding_at("app").checked == 0, Some("a moved package checks nothing again"));
     // A changed dependency is checked again where it changed; its caller reads its contract and
     // what it publishes, which the edit left alone.
     write("vendor/lib/answer.ply", "pub fn answer() -> Int = 40 + 2\n");

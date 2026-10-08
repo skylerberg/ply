@@ -6,9 +6,10 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 10] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
+    ("answer", "ply_machine::shipped::answer"),
     ("reached", "ply_machine::shipped::reached"),
     ("version", "ply_machine::shipped::version"),
     ("stamps", "ply_machine::shipped::stamps"),
@@ -150,6 +151,14 @@ impl HostHandler for Shipped {
                 crate::payload::option(
                     module
                         .or_else(|| crate::shipped_modules::data(name))
+                        .map(PlyValue::bytes),
+                )
+            }
+            ("answer", [path]) => {
+                let path = path.as_str(span, "a path into what the shipped modules answer")?;
+                let pack = ply_pack::installed();
+                crate::payload::option(
+                    pack.bytes(&format!("{}/{path}", ply_pack::ANSWERS))
                         .map(PlyValue::bytes),
                 )
             }
