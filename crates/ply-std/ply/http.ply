@@ -4789,6 +4789,192 @@ fn limits_streaming(n: Int) -> Limits = {
   { ..base, max_stream_chunks: n }
 }
 
+// --- Tests: what two implementations would read differently ------------------
+
+/// The status one step of the chunk decoder earns over `buf` at the start of a body: `-1` while it
+/// awaits more, `0` once it completes.
+fn chunk_status(buf: Bytes) -> Int / {abort.raise} =
+  match body_step(body_start(Chunked, default_limits()), buf) {
+    Rejected(r) -> r.status,
+    Await(_) -> -1,
+    Complete(_) -> 0,
+  }
+
+/// What `go` raised, or `None` where it returned.
+fn raised<| e>(go: () -> Unit / {abort.raise | e}) -> Option<String> / e =
+  handle {
+    go();
+    None
+  } with {
+    abort.raise(why) -> Some(why),
+  }
+
+test "no message with two available framings is accepted" {
+  assert_eq(head_status(post(b"Content-Length: 5\r\nContent-length: 5\r\n", b"hello")), 400);
+  assert_eq(head_status(post(b"CONTENT-LENGTH: 5\r\nContent-Length: 6\r\n", b"hello")), 400);
+  assert_eq(
+    head_status(
+      post(b"Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n", b"0\r\n\r\n"),
+    ),
+    400,
+  );
+  assert_eq(head_status(post(b"Transfer-Encoding: ChUnKeD, gzip\r\n", b"")), 400);
+  assert_eq(head_status(post(b"Transfer-Encoding: chunked\x0c\r\n", b"")), 400)
+}
+
+test "a request line is refused wherever it is ambiguous" {
+  assert_eq(head_status(b"\r\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
+  assert_eq(head_status(b"\nGET / HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
+  assert_eq(head_status(b"GET /a\x00b HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
+  assert_eq(head_status(b"GET  / HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
+  assert_eq(head_status(b"GET / HTTP/1.1\r\r\nHost: x\r\n\r\n"), 400);
+  assert_eq(head_status(b"GET / HTTP/1.1\r\nHost: x\r\n\n"), 400);
+  assert_eq(head_status(b"GET example.com:443 HTTP/1.1\r\nHost: x\r\n\r\n"), 400)
+}
+
+test "every malformed chunk-size line is refused" {
+  assert_eq(chunk_status(b"5 \r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b" 5\r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b"+5\r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b"-5\r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b"\r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b"0\n\r\n"), 400);
+  assert_eq(chunk_status(b"5;a=\"b\r\nc\"\r\nhello\r\n0\r\n\r\n"), 400);
+  assert_eq(chunk_status(b"0000000000000005\r\nhello\r\n0\r\n\r\n"), 0);
+  assert_eq(chunk_status(b"5;\r\nhello\r\n0\r\n\r\n"), 0)
+}
+
+test "a chunked body missing its terminator is never completed" {
+  assert_eq(chunk_status(b"5\r\nhello\r\n0\r\n"), -1);
+  assert_eq(chunk_status(b"5\r\nhello\r\n0"), -1);
+  assert_eq(chunk_status(b"5\r\nhello\r\n"), -1);
+  assert_eq(chunk_status(b"5\r\nhello\r\n0\r\n\r\n"), 0)
+}
+
+test "a head a peer sized is refused at the bound" {
+  assert_eq(head_status(get(bytes_concat_all(map(range(0, 10000), |i: Int| b"A: b\r\n")))), 431);
+  assert_eq(head_status(get(bytes_concat_all([b"A: ", filler(70000), b"\r\n"]))), 431);
+  assert_eq(
+    head_status(bytes_concat_all([b"GET /", filler(9000), b" HTTP/1.1\r\nHost: x\r\n\r\n"])),
+    414,
+  )
+}
+
+// `Host: x` and its CRLF is 9 bytes, `A: ` and n bytes and a CRLF n + 5, and the terminator 2: the
+// block is n + 16 bytes.
+test "the header block bound does not charge the terminator" {
+  let block = |n: Int| get(bytes_concat_all([b"A: ", filler(n), b"\r\n"]));
+  let bound = limits_with(8192, 64, 100, 1048576, 1048576, 4096, 8192);
+  // 64 bytes: the bound exactly, and accepted.
+  assert_eq(head_status_with(block(48), bound), 0);
+  // 65 and 66 bytes are over the bound, and only 66 is refused.
+  assert_eq(head_status_with(block(49), bound), 0);
+  assert_eq(head_status_with(block(50), bound), 431)
+}
+
+test "a peer that never finishes is answered rather than waited on" {
+  let status = |out: Bytes| bytes_slice(out, 9, 12);
+  assert_eq(status(served([Repeats(b"a")], default_limits(), echo_app).out), b"408");
+  assert_eq(
+    status(
+      served(
+        [
+          Says(b"POST /a HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"),
+          Repeats(b"1\r\na\r\n"),
+        ],
+        default_limits(),
+        echo_app,
+      ).out,
+    ),
+    b"408",
+  );
+  assert_eq(
+    status(
+      served(
+        [Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n"), Repeats(b"a")],
+        default_limits(),
+        echo_app,
+      ).out,
+    ),
+    b"408",
+  )
+}
+
+// The slow-loris window: a peer sending one byte a read holds a connection no longer than
+// `header_timeout_ms` and `body_timeout_ms` allow, and is granted most of that.
+test "the head and body deadlines bound the whole message" {
+  let l = default_limits();
+  let slow = served([Repeats(b"a")], l, echo_app);
+  assert(granted(slow.net, 0) <= l.header_timeout_ms);
+  assert(granted(slow.net, 0) > l.header_timeout_ms / 2);
+  let body = served(
+    [Says(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 1048576\r\n\r\n"), Repeats(b"a")],
+    l,
+    echo_app,
+  );
+  assert(granted(body.net, 1) <= l.body_timeout_ms)
+}
+
+test "a program-supplied header value with CR or LF refuses the encode" {
+  let r: Response<| {}> = {
+    status: 200,
+    headers: set_header(empty_headers(), "x-echo", "a\r\nSet-Cookie: evil=1"),
+    body: Whole(b"ok"),
+  };
+  match raised(|| {
+      encode(Get, Http11, true, r);
+      ()
+    }) {
+    Some(why) -> assert(string_contains(why, "contains CR or LF, which would split the response")),
+    None -> panic("a header value carrying CRLF was encoded into the response"),
+  }
+}
+
+// The framing fields belong to `encode`; a program setting one writes a second answer to the
+// message's length.
+test "a program may not set a framing field on a response" {
+  let r: Response<| {}> = {
+    status: 200,
+    headers: set_header(empty_headers(), "content-length", "0"),
+    body: Whole(b"ok"),
+  };
+  match raised(|| {
+      encode(Get, Http11, true, r);
+      ()
+    }) {
+    Some(why) -> assert(string_contains(why, "may not be set by the program")),
+    None -> panic("a program set its own Content-Length beside the computed one"),
+  }
+}
+
+fn failing_app<| e>(req: Request) -> Response<| e> / {abort.raise} = panic("the handler had a bug")
+
+test "a handler that fails ends the run rather than the connection" {
+  let script = [Says(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n")];
+  match raised(|| {
+      net::on_mem(net::mem_calling(net::mem_empty(), caller(), script), || {
+        let listener = net.listen[listener](0);
+        serve_connection[conn](net.accept[listener](listener), default_limits(), failing_app)
+      });
+      ()
+    }) {
+    Some(why) -> assert(string_contains(why, "the handler had a bug")),
+    None -> panic("a failing handler produced a response"),
+  }
+}
+
+/// Twenty thousand chunks.
+fn many_chunks(seed: Int) -> Option<{ value: Bytes, next: Int }> =
+  if seed >= 20000 { None } else { Some({ value: b"x", next: seed + 1 }) }
+
+// `max_stream_chunks` is answered from how many chunks a response may have and from nothing else:
+// a bound a user cannot raise past the evaluator's call budget would be the evaluator's ceiling.
+test "a streamed response may exceed the evaluator's call budget" {
+  let ran = streamed([], Http11, limits_streaming(50000), many_chunks);
+  assert(ran.reusable);
+  assert(bytes_ends_with(ran.out, last_chunk()))
+}
+
 // --- Tests: the client ------------------------------------------------------
 
 fn client_limits() -> Limits = {

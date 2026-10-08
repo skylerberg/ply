@@ -44,6 +44,9 @@
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
+#   ci-shards.sh formatted-sources
+#                                the maintained Ply sources, one a line, which the
+#                                gates job holds to `ply fmt --check`
 #   ci-shards.sh rust-answered DIR OUT [SHARD]
 #                                a tool config at OUT leaving out the tests whose
 #                                traces in DIR still stand against this checkout,
@@ -83,9 +86,10 @@ CORPUS_PROGRAM=crates/ply-corpus/ply
 CORPUS_FIXTURES=crates/ply-corpus/fixtures
 CORPUS_CHECKS=crates/ply-corpus/checks
 # The fixtures the standard library's tests read, as a project: `--std` over it tests and proves every
-# module of the library beside its own. Its tests and its proofs are runs of each of the library's
-# top-level modules, a module beneath one its own (`std.hash.legacy` is `std.hash`'s), and of each of
-# the project's modules (`stdlib_entries`).
+# module of the library beside its own. Its tests are runs of each of the library's top-level modules,
+# a module beneath one its own (`std.hash.legacy` is `std.hash`'s), and of each of the project's
+# modules (`stdlib_entries`); its proofs are one run, `proofs`, since a prove's load is most of what
+# it costs.
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
@@ -93,9 +97,10 @@ CLI_SUITE=crates/ply-cli-tests/ply
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
 CORPUS_DESKS=(serving database)
 DESK_RUNNERS=3
-# Runs that take a runner each: the compiler's own tests, compiled, take every core, and the reach
-# audit checks three whole packages cold.
-CORPUS_ALONE=(cli-compiler_compiled cli-reached)
+# Runs that take a runner each: the compiler's own tests, compiled, take every core, the reach audit
+# checks three whole packages cold and the copies audit lists ten, and every proof run is one load of
+# what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
+CORPUS_ALONE=(cli-compiler_compiled cli-reached cli-copies proofs)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
@@ -113,16 +118,19 @@ RUNS_MARGIN=4
 # own `ply test`s, each with a front end and C of its own, are not all one lane's to take in turn.
 CORPUS_LANES=2
 # Packages whose own suites run as corpus entries too, as `id:path`: each failing test is named in
-# the log, where a Rust test wrapping the run would report one failure for all of them.
+# the log, where a test wrapping the run would report one failure for all of them, and a pass is kept
+# until the code its test runs moves, where a test wrapping the run reruns whenever the CLI moves.
 PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
+  "lang:tests/lang"
+  "registry:crates/ply-registry/ply"
   "prove:crates/ply-prove/ply"
   "sim:crates/ply-sim/ply"
   "store:crates/ply-store/ply"
   "suite:crates/ply-test/ply"
 )
 # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
-# `laws-<id>`: the library's are its `proofs:` runs, and a law in any other package fails `verify`.
+# `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
 PACKAGE_PROOFS=(
   "compiler:crates/ply-compiler/ply"
 )
@@ -157,16 +165,37 @@ GATES_ALONE=(
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
 # table asserts it is still declared there: a check that stops being declared reports nothing.
 CLI_TREE_CHECKS=(
-  "reached:no two modules define the same function"
+  "copies:no two modules define the same function"
   "fixture_list:every fixture is listed"
-  "fmt:{path} is committed formatted"
-  "fmt:the compiler is committed formatted"
-  "fmt:the CLI is committed formatted"
-  "fmt:the CLI's suite is committed formatted"
-  "fmt:the corpus is committed formatted"
-  "fmt:the packages beside the CLI are committed formatted"
-  "fmt:the benches, the language tests and the examples are committed formatted"
   "tree:the harness is the only module that starts the \`ply\` binary"
+)
+
+# The Ply sources the repository maintains, which the gates job holds to `ply fmt --check`: a source
+# committed unformatted puts its reformatting into the next change that touches it. Every committed
+# `.ply` is under one of these or of the fixtures, whose spelling is their point (`verify`).
+FORMATTED_SOURCES=(
+  benches
+  crates/ply-cli-tests/ply
+  crates/ply-cli/ply
+  crates/ply-compiler/ply
+  crates/ply-compiler/prelude.ply
+  crates/ply-corpus/checks
+  crates/ply-corpus/ply
+  crates/ply-corpus/stdlib
+  crates/ply-prove/ply
+  crates/ply-registry/ply
+  crates/ply-sim/ply
+  crates/ply-std/ply
+  crates/ply-store/ply
+  crates/ply-test/ply
+  examples
+  tests/lang
+)
+FIXTURE_SOURCES=(
+  crates/ply-cli-tests/phases
+  crates/ply-codegen-tests/tests
+  crates/ply-corpus/fixtures
+  tests/fixtures
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
@@ -227,15 +256,16 @@ filter_of() {
   done
 }
 
-# One entry id a line: `program`, the standard library's runs, `fixture-<name>` per fixture,
-# `package-<id>` per package suite, `laws-<id>` per package's proofs, every checks module that declares a test, then every such module of
-# the CLI's suite under `cli-`; each module as `module`, or, for one placed a test at a time,
-# `module:<id>` per test, the id a hash of its label, so a duration measured for a test stays with it
-# however the module's tests move.
+# One entry id a line: `program`, the standard library's test runs and its `proofs`, `fixture-<name>`
+# per fixture, `package-<id>` per package suite, `laws-<id>` per package's proofs, every checks module
+# that declares a test, then every such module of the CLI's suite under `cli-`; each module as
+# `module`, or, for one placed a test at a time, `module:<id>` per test, the id a hash of its label, so
+# a duration measured for a test stays with it however the module's tests move.
 corpus_entries() {
   local entry file
   printf 'program\n'
   stdlib_entries
+  printf 'proofs\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
@@ -243,14 +273,11 @@ corpus_entries() {
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
 }
 
-# The library's runs, each named by a module: `std.<module>` per top-level module of the library, those
-# beneath it its own, and `<module>` per module of CORPUS_STDLIB. `stdlib:<module>` per one that
-# declares a test, then `proofs:<module>` per one that declares a law or states an `ensures` or `cost`
-# clause, which `ply prove` owes a proof of: apart, so the cut can give a lane the tests and another
-# the proofs, each a process with a load of its own.
+# The library's test runs, each named by a module: `stdlib:std.<module>` per top-level module of the
+# library that declares a test, those beneath it its own, and `stdlib:<module>` per module of
+# CORPUS_STDLIB that declares one.
 stdlib_entries() {
   library_modules_with '^test(/[a-z]+)? "' | sed 's/^/stdlib:/'
-  library_modules_with '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' | sed 's/^/proofs:/'
 }
 
 # The library's runs a `.ply` file of which holds a line the extended regular expression matches.
@@ -353,10 +380,17 @@ corpus_test_names() {
   sed -nE 's/^test(\/[a-z]+)? "([^"]*)".*/\2/p' "$1"
 }
 
+# The runs that take a runner each: CORPUS_ALONE's, and each package's proofs.
+alone_entries() {
+  local entry
+  printf '%s\n' "${CORPUS_ALONE[@]}"
+  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+}
+
 corpus_alone() {
   local id
   for id in "${CORPUS_ALONE[@]}"; do [[ $id == "$1" ]] && return 0; done
-  return 1
+  [[ $1 == laws-* ]] && proofs_path "${1#laws-}" > /dev/null
 }
 
 # Whether the entry is a test of a module whose checks start desks.
@@ -372,11 +406,11 @@ cmd_corpus_matrix() {
     first=0
     printf '{"id":"desks-%d"}' "$k"
   done
-  for id in "${CORPUS_ALONE[@]}"; do
+  while read -r id; do
     ((first)) || printf ','
     first=0
     printf '{"id":"%s"}' "$id"
-  done
+  done < <(alone_entries)
   printf ']}\n'
 }
 
@@ -408,7 +442,7 @@ corpus_parted() {
         if (f[1] == "corpus") ms[f[2]] = f[3] + 0
       }
     }
-    # Of the runs named with a colon, only the library'"'"'s test runs are neither proofs nor a test.
+    # Of the runs named with a colon, only the library'"'"'s test runs are not a single test.
     limit > 0 && ms[$1] > limit && ($1 !~ /:/ || $1 ~ /^stdlib:/) {
       n = int(ms[$1] / limit)
       if (n * limit < ms[$1]) n++
@@ -468,7 +502,6 @@ overlong() {
 # Why the cut leaves the run $1 longer than its limit, and what would make it shorter.
 unparted() {
   case $1 in
-    proofs:*) printf 'a proof run is one `ply prove`, which has no parts: give some of its claims a module of their own, or make them cheaper\n' ;;
     *#*) printf 'a part takes the tests whose keys hash to it, and one of these, or the few it took, outlast the limit: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST), or split the longest test\n' ;;
     *) printf 'a single test has no parts: split it into tests\n' ;;
   esac
@@ -508,7 +541,7 @@ cmd_corpus_for_partition() {
 # label hashes to it, by the qualified name `ply test --filter` matches; `run#K/N` takes part K of N
 # of what `run` would, by `ply test --shard K/N`. A module the cut places a test at a time is a run too,
 # of every test it declares, and so are `stdlib` and `proofs`, of every test and every claim of the
-# library.
+# library; `stdlib:<module>` takes the library's tests of that module.
 cmd_corpus_line() {
   local entries id
   # Read whole before the loop can return, so the lister never writes into a closed pipe.
@@ -542,7 +575,7 @@ entry_line() {
     printf '%s%s\n' "$CORPUS_PROGRAM" "$TAB"
   elif [[ $1 == stdlib || $1 == proofs ]]; then
     printf '%s%s\n' "$CORPUS_STDLIB" "$TAB"
-  elif [[ $1 == stdlib:* || $1 == proofs:* ]]; then
+  elif [[ $1 == stdlib:* ]]; then
     printf '%s%s%s.\n' "$CORPUS_STDLIB" "$TAB" "${1#*:}"
   elif [[ $1 == fixture-* ]]; then
     printf '%s/%s.ply%s\n' "$CORPUS_FIXTURES" "${1#fixture-}" "$TAB"
@@ -953,13 +986,11 @@ corpus_cut() {
       }
       if (id ~ /^cli-/) return cli
       if (id ~ /^stdlib:/) return stdlib
-      if (id ~ /^proofs:/) return "prove:" stdlib
-      if (id == "program" || id ~ /^package-/ || id ~ /^laws-/ || id ~ /^fixture-/) return id
+      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
       return checks
     }
     # About two minutes unmeasured, a part'"'"'s measured under its run, whose every part loads the same
-    # closure; a program or package suite row holds its startup whole, and so do the proof runs, each
-    # a share of its prove.
+    # closure; a program or package suite row holds its startup whole.
     function startup(key,   run) {
       run = key
       sub(/#[0-9]+\/[0-9]+$/, "", run)
@@ -1547,9 +1578,9 @@ check_runs() {
 # Whether the corpus cut over the nextest rows in $1 and invented corpus costs parts each `ply test`
 # measured over the partitions' limit into the fewest parts no longer than it, each a `--shard` of the
 # run, and leaves whole every other run, measured or not; and whether what it leaves over the limit
-# is a proof run, a single test and a part measured so, which it cannot part.
+# is a single test and a part measured so, which it cannot part.
 check_parts() {
-  local nextest=$1 tmp limit long edge library proof single over want k bad=0
+  local nextest=$1 tmp limit long edge library single over want k bad=0
   limit=$(run_limit "ci-corpus.sh partition")
   if [[ -z $limit ]]; then
     echo "FAIL: the partitions' job sets no deadline, so the corpus cut parts no run" >&2
@@ -1560,17 +1591,16 @@ check_parts() {
   long=$(grep -m1 -E '^cli-[^:]+$' "$tmp/placed" || true)
   edge=$(grep -E '^cli-[^:]+$' "$tmp/placed" | sed -n 2p || true)
   library=$(grep -m1 '^stdlib:' "$tmp/placed" || true)
-  proof=$(grep -m1 '^proofs:' "$tmp/placed" || true)
   single=$(grep -m1 -E '^cli-[^:]+:' "$tmp/placed" || true)
-  if [[ -z $long || -z $edge || -z $library || -z $proof || -z $single ]]; then
-    echo "FAIL: the partitions take no two runs of the CLI's modules, library tests, proofs and single tests the corpus cut's check of parts needs" >&2
+  if [[ -z $long || -z $edge || -z $library || -z $single ]]; then
+    echo "FAIL: the partitions take no two runs of the CLI's modules, library tests and single tests the corpus cut's check of parts needs" >&2
     rm -rf "$tmp"
     return 1
   fi
   {
     cat "$nextest"
     printf 'corpus\t%s\t%d\n' "$long" $((limit * 5 / 2)) "$long#1/3" $((limit + 1000)) "$edge" "$limit" \
-      "$library" $((limit + 1)) "$proof" $((limit * 2)) "$single" $((limit * 2))
+      "$library" $((limit + 1)) "$single" $((limit * 2))
   } > "$tmp/timings.tsv"
   awk -v long="$long" -v library="$library" '
     $0 == long { print $0 "#1/3"; print $0 "#2/3"; print $0 "#3/3"; next }
@@ -1588,9 +1618,9 @@ check_parts() {
     bad=1
   fi
   over=$(overlong "$tmp/timings.tsv" "ci-corpus.sh partition" | cut -d' ' -f1 | LC_ALL=C sort | tr '\n' ' ')
-  want=$(printf '%s\n' "$long#1/3" "$proof" "$single" | LC_ALL=C sort | tr '\n' ' ')
+  want=$(printf '%s\n' "$long#1/3" "$single" | LC_ALL=C sort | tr '\n' ' ')
   if [[ $over != "$want" ]]; then
-    echo "FAIL: the runs the corpus cut leaves over the partitions' limit are '$over', not the proof run, the single test and the part measured over it: '$want'" >&2
+    echo "FAIL: the runs the corpus cut leaves over the partitions' limit are '$over', not the single test and the part measured over it: '$want'" >&2
     bad=1
   fi
   if [[ $(cmd_corpus_line "$long#2/3") != "$(cmd_corpus_line "$long")2/3" ]]; then
@@ -1876,7 +1906,7 @@ cmd_verify() {
   entries=$(corpus_entries)
   for id in "${CORPUS_ALONE[@]}"; do
     if ! grep -qx "$id" <<< "$entries"; then
-      echo "FAIL: '$id' runs alone and no module of $CORPUS_CHECKS by that name declares a test" >&2
+      echo "FAIL: '$id' runs alone and is no corpus entry" >&2
       failures=$((failures + 1))
     fi
   done
@@ -1954,6 +1984,25 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # Every committed `.ply` is a maintained source or a fixture, so none is left out of the format
+  # check by being forgotten.
+  local tracked under where
+  while IFS= read -r tracked; do
+    under=0
+    for where in "${FORMATTED_SOURCES[@]}" "${FIXTURE_SOURCES[@]}"; do
+      [[ $tracked == "$where" || $tracked == "$where"/* ]] && under=$((under + 1))
+    done
+    if ((under != 1)); then
+      echo "FAIL: $tracked is under $under of FORMATTED_SOURCES and FIXTURE_SOURCES, and must be under one" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(git -C "$root" ls-files '*.ply')
+  for where in "${FORMATTED_SOURCES[@]}" "${FIXTURE_SOURCES[@]}"; do
+    if [[ ! -e $root/$where ]]; then
+      echo "FAIL: FORMATTED_SOURCES or FIXTURE_SOURCES names $where, which is not in the tree" >&2
+      failures=$((failures + 1))
+    fi
+  done
   for entry in "${CLI_TREE_CHECKS[@]}"; do
     module=${entry%%:*}
     names=$(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
@@ -1967,7 +2016,7 @@ cmd_verify() {
   placed=$(
     for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k" | cut -d' ' -f2; done
     for ((k = 1; k <= DESK_RUNNERS; k++)); do cmd_desks_for_runner "$k"; done
-    printf '%s\n' "${CORPUS_ALONE[@]}"
+    alone_entries
   )
   if [[ $(sort <<< "$placed") != "$(sort <<< "$entries")" ]]; then
     echo "FAIL: the partitions', desk runners' and lone corpus runs are not every entry, each once" >&2
@@ -2013,6 +2062,19 @@ cmd_verify() {
     fi
   done
 
+  # --- the stage a job hands the others ---------------------------------------
+  # The entries the sweep takes file by file are the ones `ci-warm.sh used` cuts file by file: one it
+  # cuts whole carries every file an earlier run left to every job of this one.
+  local sweep_rs="$root/crates/ply-codegen/src/c/sweep.rs" swept cut
+  swept=$(sed -n 's/^const BY_FILE: \[&str; [0-9]*\] = \[\(.*\)\];$/\1/p' "$sweep_rs" | tr -d ' ' | tr ',' '\n' |
+    while read -r name; do sed -n "s/^pub const $name: &str = \"\\(.*\\)\";$/\\1/p" "$sweep_rs"; done | LC_ALL=C sort)
+  cut=$(sed -n 's/^ *\([a-z| ]*\)) find "\$dir" -type f ! -newer "\$mark" -delete ;;$/\1/p' "$root/.github/ci-warm.sh" |
+    tr -d ' ' | tr '|' '\n' | LC_ALL=C sort)
+  if [[ -z $swept || $swept != "$cut" ]]; then
+    echo "FAIL: the sweep takes '$(echo $swept)' file by file and ci-warm.sh cuts '$(echo $cut)' file by file" >&2
+    failures=$((failures + 1))
+  fi
+
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
@@ -2057,6 +2119,7 @@ case "${1:-}" in
   rust-kept) cmd_rust_kept "${2:-}" "${3:-}" "${4:-}" ;;
   host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
+  formatted-sources) printf '%s\n' "${FORMATTED_SOURCES[@]}" ;;
   tree-check-filter) cmd_tree_check_filter ;;
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   fetch-timings) cmd_fetch_timings ;;

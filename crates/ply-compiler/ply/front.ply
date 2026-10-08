@@ -54,7 +54,7 @@ import std.pkg (Manifest)
 import std.list (at, concat, contains, drop, push_unique, sort_by, take)
 import fmt (item_range, replace_item)
 import rewrite (fn_has_update, tagged_in, picked_in)
-import derive (RowField, row_shape, generated_name, same_deriver)
+import derive (RowField, row_shape, generated_name, same_deriver, row_field_bin)
 import embed (EmbedAt, EmbedRead, EmbedReader, EmbedWant, ItemWants, embed_want_bin, item_wants_bin,
               embed_key, embed_tables, embedded, rewritten, wants_of, wants_by_item, wants_in,
               want_of_key, embed_at_bin)
@@ -595,8 +595,9 @@ pub fn of_module(module: Bytes, name: Bytes) -> Bool / {abort.raise} =
 /// What a module's check says of its shape: its outline, the module each import declaration
 /// resolved to (a hidden one among them), each name they name by its program-wide name, the module
 /// each names as written, what each of its embeds read and what each of its items asks to embed,
-/// and each tagged literal it holds whose parser resolves, under no hash, since a module's check
-/// fixes none. Each place is module 0's.
+/// each tagged literal it holds whose parser resolves, and each call of what a statement module
+/// declares, under no hash, since a module's check fixes none; and each `const` definition it
+/// declares with the type it is declared as. Each place is module 0's.
 pub type ModuleShape = {
   outline: Outline,
   imports: List<Bytes>,
@@ -605,6 +606,8 @@ pub type ModuleShape = {
   embeds: List<EmbedAt>,
   embed_items: List<ItemWants>,
   tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  consts: List<TypedConst>,
 }
 
 /// What the checker said of a module's own definitions, tests, laws, effects, constructors and what
@@ -649,6 +652,8 @@ pub fn no_shape(module: Bytes) -> ModuleShape =
     embeds: [],
     embed_items: [],
     tagged: [],
+    statements: [],
+    consts: [],
   }
 
 /// The tables of a module that answers nothing.
@@ -674,7 +679,13 @@ fn moved_location(l: Location, from: Int, to: Int) -> Location =
   if l.module == from { { ..l, module: to } } else { l }
 
 fn moved_shape(s: ModuleShape, from: Int, to: Int) -> ModuleShape =
-  { ..s, tagged: map(s.tagged, |x: TaggedSite| { ..x, module: moved_module(x.module, from, to) }) }
+  {
+    ..s,
+    tagged: map(s.tagged, |x: TaggedSite| { ..x, module: moved_module(x.module, from, to) }),
+    statements: map(s.statements, |x: StatementSite|
+      { ..x, module: moved_module(x.module, from, to) }),
+    consts: map(s.consts, |x: TypedConst| { ..x, module: moved_module(x.module, from, to) }),
+  }
 
 fn moved_module(module: Int, from: Int, to: Int) -> Int = if module == from { to } else { module }
 
@@ -738,6 +749,8 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
           if fold(items, false, |b: Bool, x: ItemWants| b || len(x.wants) > 0) { items } else { [] }
         },
         tagged: tagged_of(w, i),
+        statements: statements_of(w, i),
+        consts: typed_consts_of(w, i),
       },
       i,
       0,
@@ -940,6 +953,7 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
         match item { OTest(_) -> false, OLaw(_) -> false, _ -> true }),
     },
     tagged: filter(s.tagged, |x: TaggedSite| within_any(spans, x.span)),
+    statements: filter(s.statements, |x: StatementSite| within_any(spans, x.span)),
   }
 }
 
@@ -1027,7 +1041,9 @@ fn views_read(
 
 /// A program as its modules' shapes say it: every table a load holds of it but its check's.
 /// `order` names the modules in the order they are checked in, `imports` what each imports as
-/// resolved, each once, and `tagged` every tagged literal of the root package's modules.
+/// resolved, each once; `tagged` every tagged literal of the root package's modules, `statements`
+/// every call of what a statement module declares there, and `consts` every `const` definition
+/// there with its type.
 pub type Frame = {
   outlines: List<Outline>,
   order: List<Bytes>,
@@ -1042,6 +1058,8 @@ pub type Frame = {
   embeds: List<EmbedAt>,
   embed_items: Map<Bytes, List<ItemWants>>,
   tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  consts: List<TypedConst>,
 }
 
 /// A checked program's tables apart from its syntax: what a load assembled from its modules'
@@ -1119,6 +1137,8 @@ pub fn framed_program(
       embed_items: fold(read, map_new(), |acc: Map<Bytes, List<ItemWants>>, s: ModuleShape|
         if len(s.embed_items) == 0 { acc } else { map_insert(acc, s.outline.name, s.embed_items) }),
       tagged: root_tagged(module_packages, hashes, merged.tagged),
+      statements: root_statements(module_packages, hashes, merged.statements),
+      consts: root_consts(module_packages, merged.consts),
     },
     reads: {
       reads: map(shapes, |s: ModuleShape|
@@ -1271,11 +1291,11 @@ fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {ab
 }
 
 /// A program's modules as their shapes say them, each at its place in the list: their outlines, the
-/// order the modules are checked in, the modules each imports, each once, and every tagged literal
-/// they hold.
+/// order the modules are checked in, the modules each imports, each once, and every tagged literal,
+/// statement call and typed `const` definition they hold.
 fn merged_shapes(
   shapes: List<ModuleShape>,
-) -> { outlines: List<Outline>, order: List<Bytes>, imports: List<List<Bytes>>, tagged: List<TaggedSite> } / {abort.raise} = {
+) -> { outlines: List<Outline>, order: List<Bytes>, imports: List<List<Bytes>>, tagged: List<TaggedSite>, statements: List<StatementSite>, consts: List<TypedConst> } / {abort.raise} = {
   let placed = map(range(0, len(shapes)), |k: Int| moved_shape(at(shapes, k), 0, k));
   let imports = map(placed, |s: ModuleShape| s.imports);
   {
@@ -1284,6 +1304,9 @@ fn merged_shapes(
     imports: map(imports, |xs: List<Bytes>|
       fold(xs, [], |acc: List<Bytes>, x: Bytes| if contains(acc, x) { acc } else { push(acc, x) })),
     tagged: fold(placed, [], |acc: List<TaggedSite>, s: ModuleShape| concat(acc, s.tagged)),
+    statements: fold(placed, [], |acc: List<StatementSite>, s: ModuleShape|
+      concat(acc, s.statements)),
+    consts: fold(placed, [], |acc: List<TypedConst>, s: ModuleShape| concat(acc, s.consts)),
   }
 }
 
@@ -2371,6 +2394,17 @@ pub fn view_of(w: Analysis) -> View / {abort.raise} =
         fold(range(0, len(w.mods)), [], |acc: List<TaggedSite>, i: Int|
           concat(acc, tagged_of(w, i))),
       ),
+      statements: root_statements(
+        w.module_packages,
+        w.hashes,
+        fold(range(0, len(w.mods)), [], |acc: List<StatementSite>, i: Int|
+          concat(acc, statements_of(w, i))),
+      ),
+      consts: root_consts(
+        w.module_packages,
+        fold(range(0, len(w.mods)), [], |acc: List<TypedConst>, i: Int|
+          concat(acc, typed_consts_of(w, i))),
+      ),
     },
     checked: w.checked,
   }
@@ -2510,24 +2544,43 @@ fn kept_under(hashes: HashOutput, name: Bytes, hash: Bytes) -> Bytes / {abort.ra
     ),
   )
 
-/// Every `const` definition the root package's modules hold whose declared type is the type named
-/// `type_name` program-wide.
-pub fn consts_of_type(analysis: Analysis, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
-  let named = fold(range(0, len(analysis.mods)), [], |acc: List<Bytes>, i: Int|
-    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
-      fold(at(analysis.mods, i).module.items, acc, |names: List<Bytes>, item: Item|
-        match item {
-          IFn(d) -> match ((d.baked, d.ret)) {
-            (Some(_), Some(TCon(c))) -> if type_named(analysis.index, i, c.name)
-                == Some(type_name) { push(names, qualify(at(analysis.mods, i).name, d.name.name)) }
-            else { names },
-            _ -> names,
-          },
-          _ -> names,
-        })
-    });
-  filter(const_sites(outlines_of(analysis), analysis.hashes), |site: ConstSite|
-    contains(named, site.name))
+/// A `const` definition, by program-wide name, and the program-wide name of the type it is declared
+/// as.
+pub type TypedConst = { module: Int, name: Bytes, type_name: Bytes }
+
+derive bin for TypedConst
+
+/// Every `const` definition module `i` of `w` declares as a named type.
+fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} =
+  fold(at(w.mods, i).module.items, [], |acc: List<TypedConst>, item: Item|
+    match item {
+      IFn(d) -> match ((d.baked, d.ret)) {
+        (Some(_), Some(TCon(c))) -> match type_named(w.index, i, c.name) {
+          Some(type_name) ->
+            push(acc, {
+              module: i,
+              name: qualify(at(w.mods, i).name, d.name.name),
+              type_name: type_name,
+            }),
+          None -> acc,
+        },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+/// Those of `consts` the root package's modules declare.
+fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List<TypedConst> =
+  filter(consts, |c: TypedConst| list_at(module_packages, c.module) == Some(0))
+
+/// Every `const` definition of `frame`'s root package declared as the type named `type_name`
+/// program-wide.
+pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
+  let named = map(
+    filter(frame.consts, |c: TypedConst| c.type_name == type_name),
+    |c: TypedConst| c.name,
+  );
+  filter(const_sites(frame.outlines, frame.hashes), |site: ConstSite| contains(named, site.name))
 }
 
 /// An argument as a check reads it before anything runs: text as written, literals joined by `++`
@@ -2544,7 +2597,9 @@ pub type Argument =
   | ACtor({ type_name: Bytes, name: Bytes })
   | AOther
 
-/// A call that runs a statement, as `statement_sites` finds it: where it is, the operation or the
+derive bin for Argument
+
+/// A call that may run a statement, as `statements_of` finds it: where it is, the operation or the
 /// definition it calls by program-wide name, the label written at it, and its arguments.
 pub type StatementSite = {
   module: Int,
@@ -2553,6 +2608,17 @@ pub type StatementSite = {
   label: Bytes,
   args: List<Argument>,
 }
+
+derive bin for StatementSite
+
+/// The modules that declare each operation and definition a statement is run by: a module that is
+/// none of them and imports none runs no statement.
+pub fn statement_modules() -> List<Bytes> = [b"std.db", b"std.sqlite"]
+
+/// Whether `callee`, a program-wide name, is declared in a statement module.
+fn of_statement_module(callee: Bytes) -> Bool =
+  fold(statement_modules(), false, |b: Bool, m: Bytes|
+    b || bytes_starts_with(callee, bytes_concat(m, b".")))
 
 /// What reading an argument looks names up in: the scopes, each definition's hash, and each row
 /// codec a module derives, by the program-wide name of the function that answers it.
@@ -2569,28 +2635,67 @@ fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort
         }
       }))
 
-/// Every perform of an operation, and every call of a definition with a label written at it, whose
-/// program-wide name is one of `callees`, in the root package's modules. An operation is named by
-/// its effect's name and its own: `std.db.db.query`.
-pub fn statement_sites(
-  analysis: Analysis,
-  callees: List<Bytes>,
+/// Every call of what a statement module declares that module `i` of `w` holds, where it is or
+/// imports one, under no hash: a module's check fixes none.
+fn statements_of(w: Analysis, i: Int) -> List<StatementSite> / {abort.raise} = {
+  let name = at(w.mods, i).name;
+  let imported = map(at(w.r.imports, i), |t: Int| at(w.mods, t).name);
+  if !fold(statement_modules(), false, |b: Bool, m: Bytes|
+      b || m == name || contains(imported, m)) { [] }
+  else { sites_in(w, i, of_statement_module, map_new()) }
+}
+
+/// Every perform of an operation, and every call of a definition with a label written at it, in
+/// module `i` of `w` whose program-wide name `picked` takes, each argument's definitions under the
+/// hash `hashes` holds of it. An operation is named by its effect's name and its own:
+/// `std.db.db.query`.
+fn sites_in(
+  w: Analysis,
+  i: Int,
+  picked: (Bytes) -> Bool,
+  hashes: Map<Bytes, Bytes>,
 ) -> List<StatementSite> / {abort.raise} = {
-  let reading = {
-    index: analysis.index,
-    hashes: by_name(analysis.hashes.defs),
-    rows: derived_rows(analysis.mods),
-  };
-  fold(range(0, len(analysis.mods)), [], |acc: List<StatementSite>, i: Int|
-    if list_at(analysis.module_packages, i) != Some(0) { acc } else {
-      let calls = picked_in(at(analysis.mods, i).module, |e: Expr|
-        match e { EPerform(_) -> true, EApp(a) -> len(a.labels) > 0, _ -> false });
-      fold(calls, acc, |sites: List<StatementSite>, e: Expr|
-        match statement_site(reading, i, e) {
-          Some(site) -> if contains(callees, site.callee) { push(sites, site) } else { sites },
-          None -> sites,
-        })
+  let reading = { index: w.index, hashes: hashes, rows: derived_rows(w.mods) };
+  let calls = picked_in(at(w.mods, i).module, |e: Expr|
+    match e { EPerform(_) -> true, EApp(a) -> len(a.labels) > 0, _ -> false });
+  fold(calls, [], |sites: List<StatementSite>, e: Expr|
+    match statement_site(reading, i, e) {
+      Some(site) -> if picked(site.callee) { push(sites, site) } else { sites },
+      None -> sites,
     })
+}
+
+/// Those of `sites` the root package's modules hold, each definition an argument calls under the
+/// hash of all it reaches.
+fn root_statements(
+  module_packages: List<Int>,
+  hashes: HashOutput,
+  sites: List<StatementSite>,
+) -> List<StatementSite> / {abort.raise} = {
+  let hashed = by_name(hashes.defs);
+  fold(sites, [], |acc: List<StatementSite>, x: StatementSite|
+    if list_at(module_packages, x.module) != Some(0) { acc }
+    else { push(acc, { ..x, args: map(x.args, |a: Argument| hashed_argument(hashed, a)) }) })
+}
+
+fn hashed_argument(hashed: Map<Bytes, Bytes>, a: Argument) -> Argument / {abort.raise} = {
+  let hash_of = |name: Bytes| match map_get(hashed, name) { Some(h) -> h, None -> b"" };
+  match a {
+    ACall(c) ->
+      ACall({
+        ..c,
+        hash: hash_of(c.callee),
+        args: map(c.args, |x: Argument| hashed_argument(hashed, x)),
+      }),
+    ATagged(t) ->
+      ATagged({
+        ..t,
+        hash: hash_of(t.callee),
+        holes: map(t.holes, |x: Argument| hashed_argument(hashed, x)),
+      }),
+    AList(xs) -> AList(map(xs, |x: Argument| hashed_argument(hashed, x))),
+    other -> other,
+  }
 }
 
 fn statement_site(reading: Reading, module: Int, e: Expr) -> Option<StatementSite> / {abort.raise} = {
@@ -7099,7 +7204,10 @@ test "a statement site is a perform or a labelled call, its arguments read as a 
   ]);
   let hash_of = |name: Bytes|
     match map_get(by_name(w.hashes.defs), name) { Some(h) -> h, None -> b"" };
-  let sites = statement_sites(w, [b"store.db.query", b"store.run"]);
+  let statement_sites = |callees: List<Bytes>|
+    fold(range(0, len(w.mods)), [], |acc: List<StatementSite>, i: Int|
+      concat(acc, sites_in(w, i, |c: Bytes| contains(callees, c), by_name(w.hashes.defs))));
+  let sites = statement_sites([b"store.db.query", b"store.run"]);
   assert_eq(map(sites, |s: StatementSite| (s.callee, s.label)), [
     (b"store.db.query", b"t"),
     (b"store.db.query", b"items"),
@@ -7117,7 +7225,7 @@ test "a statement site is a perform or a labelled call, its arguments read as a 
     ],
     [ACall({ callee: b"store.stmt", hash: hash_of(b"store.stmt"), args: [AText(b"select 1")] })],
   ]);
-  assert_eq(len(statement_sites(w, [b"store.other"])), 0)
+  assert_eq(len(statement_sites([b"store.other"])), 0)
 }
 
 fn seeded_of(outcome: AnalysisOutcome) -> List<Bytes> / {abort.raise} =

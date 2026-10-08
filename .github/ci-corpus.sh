@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # The Ply runs (`ci-shards.sh`'s corpus entries), each a `ply test`: over the corpus with the grants
 # `benches/corpus.sh` gives the program, or over the CLI's suite with the grants its harness drives
-# `ply` with, from a scratch directory of the run's own; the proof runs, the standard library's and
-# each package's (`laws-<id>`), are a `ply prove`. A run fails when a test fails or a claim does not hold, when the run refuses, and when
-# its filter selects no test or claim, so a renamed test never stops being run quietly; a part of a
-# run (`run#K/N`) takes the tests whose keys hash to it, which may be none.
+# `ply` with, from a scratch directory of the run's own; the proof runs, the standard library's
+# (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each, on a runner of its own. A run
+# fails when a test fails or a claim does not hold, when the run refuses, and when it selects no test
+# or proves no claim, so a renamed test never stops being run quietly; a part of a run (`run#K/N`)
+# takes the tests whose keys hash to it, which may be none.
 #
 #   ci-corpus.sh partition K TIMINGS [CUT]
 #       every run partition K takes (`ci-shards.sh corpus-for-partition K [CUT]`), each lane one
@@ -203,8 +204,8 @@ spent() {
 run_one() {
   local timings=$1 id=$2 line path filter shard status=0 selected out started
   shift 2
-  if [[ $id == proofs || $id == proofs:* ]]; then
-    run_proofs "$timings" "$id" -- "$@"
+  if [[ $id == proofs ]]; then
+    run_proofs "$timings" "$@"
     return
   fi
   if [[ $id == laws-* ]]; then
@@ -381,23 +382,19 @@ run_modules() {
   rm -f "$out"
 }
 
-# The proof runs IDs of the library, in one `ply prove` with the ARGs after `--` added: each run's
-# milliseconds are its share of the prove's wall clock, by the claims its filter names, since what a
-# prove spends grows with the claims it is asked for, its load as well. A run whose filter names no
-# claim fails. Nothing an earlier run kept answers a proof, so a selecting run always has one to run.
-# STOPPED when the deadline ended them.
+# The run `proofs`, every claim of the library and of the fixtures beside it in one `ply prove` with
+# ARGs added, its `cached` row onto TIMINGS when that is not empty; it fails when it proves no claim.
+# Nothing an earlier run kept answers a proof, so a selecting run always has one to run. STOPPED when
+# the deadline ended it.
 run_proofs() {
-  local timings=$1 path status=0 out bad=0 i n all cached unattempted spent started wall
-  local -a filters=() cuts=() ids=() args=() extra=()
+  local timings=$1 status=0 out all cached unattempted spent started wall
   shift
-  parsed_runs "$@" || return 2
-  for i in "${!filters[@]}"; do [[ -z ${filters[$i]} ]] || args+=(--filter "${filters[$i]}"); done
   ((!selecting)) || return 1
   out=$(mktemp)
   started=$(date +%s%3N)
-  bounded "$ply" prove --std "$path" ${args[@]+"${args[@]}"} ${extra[@]+"${extra[@]}"} --json > "$out" || status=$?
+  bounded "$ply" prove --std "$stdlib" "$@" --json > "$out" || status=$?
   if ((status == STOPPED)); then
-    stopped_run "$((($(date +%s%3N) - started) / 1000))" "${ids[@]}"
+    stopped_run "$((($(date +%s%3N) - started) / 1000))" proofs
     rm -f "$out"
     return "$STOPPED"
   fi
@@ -408,21 +405,12 @@ run_proofs() {
   # Only a claim that held is filed, so an unattempted one is discharged again by every later run.
   unattempted=$(jq '.summary.unattempted // 0' "$out" 2>/dev/null || echo 0)
   echo "proved: $all claims, $cached from the cache, $unattempted unattempted, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
-  [[ -z $timings ]] || printf 'cached\tprove:%s\t%s\n' "$path" "$cached" >> "$timings"
-  local -a counted=()
-  read -ra counted <<< "$(jq -r '
-    [.obligations[]? | .owner // ""] as $owners
-    | [$ARGS.positional[] as $f | [$owners[] | select(contains($f))] | length | tostring] | join(" ")
-  ' "$out" --args "${filters[@]}" 2>/dev/null)"
-  for i in "${!ids[@]}"; do
-    n=${counted[$i]:-0}
-    if [ "$n" -eq 0 ]; then
-      echo "corpus run ${ids[$i]} selected no claim (filter: ${filters[$i]:-none})" >&2
-      bad=1
-    fi
-    [[ -z $timings ]] || printf 'corpus\t%s\t%s\n' "${ids[$i]}" "$((all > 0 ? wall * n / all : 0))" >> "$timings"
-  done
-  if [ "$status" -ne 0 ] || [ "$bad" -ne 0 ]; then
+  [[ -z $timings ]] || printf 'cached\tproofs\t%s\n' "$cached" >> "$timings"
+  if [ "$all" -eq 0 ]; then
+    echo "corpus run proofs proved no claim" >&2
+    status=1
+  fi
+  if [ "$status" -ne 0 ]; then
     disproved "$out"
     rm -f "$out"
     return 1
@@ -507,7 +495,7 @@ single() {
   return "$((status != 0))"
 }
 
-# The runs IDs of one package as RUNNER (`run_modules` or `run_proofs`) runs them, in a block of the
+# The runs IDs of one package as RUNNER (`run_modules`) runs them, in a block of the
 # lane NAME titled WHAT.
 batch() {
   local name=$1 what=$2 runner=$3 timings=$4 status=0 block
@@ -526,22 +514,21 @@ batch() {
 
 # One lane's runs, one after another: the program's own, each fixture's and each package's suite in a
 # `ply test` of their own, every checks run in one, every run of the CLI's suite in one, the library's
-# tests in one and its proofs in a `ply prove`, and each part of a run cut into parts in one of its own.
-# Each prints as it ends, a block under the lane's NAME, and once the deadline has come none starts.
+# tests in one, and each part of a run cut into parts in one of its own. Each prints as it ends, a
+# block under the lane's NAME, and once the deadline has come none starts.
 lane() {
   local name=$1 timings=$2 id failed=0
   local durations=${2%.tsv}.durations
-  local -a checks=() cli=() library=() proofs=()
+  local -a checks=() cli=() library=()
   shift 2
   : > "$timings"
   : > "$durations"
   for id in "$@"; do
     case "$id" in
-      program | program#* | package-* | laws-* | fixture-*) single "$name" "$timings" "$id" || failed=1 ;;
+      program | program#* | package-* | fixture-*) single "$name" "$timings" "$id" || failed=1 ;;
       *#*) batch "$name" "part ${id##*#} of ${id%#*}" run_modules "$timings" "$id" || failed=1 ;;
       cli-*) cli+=("$id") ;;
       stdlib:*) library+=("$id") ;;
-      proofs:*) proofs+=("$id") ;;
       *) checks+=("$id") ;;
     esac
   done
@@ -553,9 +540,6 @@ lane() {
   fi
   if [ "${#library[@]}" -gt 0 ]; then
     batch "$name" "the library's tests" run_modules "$timings" "${library[@]}" || failed=1
-  fi
-  if [ "${#proofs[@]}" -gt 0 ]; then
-    batch "$name" "the library's proofs" run_proofs "$timings" "${proofs[@]}" || failed=1
   fi
   return "$failed"
 }
@@ -727,7 +711,7 @@ case "${1:-}" in
     work=$(mktemp -d)
     kept_answers "$work/c" || exit 1
     # A store is one file set: it travels whole, from the partition that wrote it.
-    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache "$root"/crates/ply-corpus/stdlib/.ply-cache; do
+    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache "$root"/crates/ply-corpus/stdlib/.ply-cache "$root"/tests/lang/.ply-cache; do
       [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue
       rel=${store#"$root"/}
       "$ply" cache compact "${store%/.ply-cache}" > /dev/null ||
@@ -766,7 +750,7 @@ case "${1:-}" in
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
     ;;
   compact)
-    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks; do
+    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/tests/lang; do
       [ -f "$dir/.ply-cache/store.idx" ] || continue
       echo "=== ${dir#"$root"/}"
       "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
