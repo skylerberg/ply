@@ -121,6 +121,11 @@ PACKAGE_SUITES=(
   "store:crates/ply-store/ply"
   "suite:crates/ply-test/ply"
 )
+# Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
+# `laws-<id>`: the library's are its `proofs:` runs, and a law in any other package fails `verify`.
+PACKAGE_PROOFS=(
+  "compiler:crates/ply-compiler/ply"
+)
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
 # gates job runs them after its own tests.
@@ -152,7 +157,7 @@ GATES_ALONE=(
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
 # table asserts it is still declared there: a check that stops being declared reports nothing.
 CLI_TREE_CHECKS=(
-  "copies:no two modules define the same function"
+  "reached:no two modules define the same function"
   "fixture_list:every fixture is listed"
   "fmt:{path} is committed formatted"
   "fmt:the compiler is committed formatted"
@@ -223,7 +228,7 @@ filter_of() {
 }
 
 # One entry id a line: `program`, the standard library's runs, `fixture-<name>` per fixture,
-# `package-<id>` per package suite, every checks module that declares a test, then every such module of
+# `package-<id>` per package suite, `laws-<id>` per package's proofs, every checks module that declares a test, then every such module of
 # the CLI's suite under `cli-`; each module as `module`, or, for one placed a test at a time,
 # `module:<id>` per test, the id a hash of its label, so a duration measured for a test stays with it
 # however the module's tests move.
@@ -233,6 +238,7 @@ corpus_entries() {
   stdlib_entries
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
+  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
   module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
 }
@@ -325,6 +331,21 @@ package_path() {
     [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
   done
   return 1
+}
+
+proofs_path() {
+  local entry
+  for entry in "${PACKAGE_PROOFS[@]}"; do
+    [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
+  done
+  return 1
+}
+
+# Each `.ply` of a package below `crates/` other than the library's that states a law or an `ensures`
+# or `cost` clause, which only a `ply prove` discharges.
+claiming_files() {
+  grep -rlE --include='*.ply' '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
+    grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
 # The labels of a module's tests, in the order it declares them.
@@ -527,6 +548,8 @@ entry_line() {
     printf '%s/%s.ply%s\n' "$CORPUS_FIXTURES" "${1#fixture-}" "$TAB"
   elif [[ $1 == package-* ]]; then
     printf '%s%s\n' "$(package_path "${1#package-}")" "$TAB"
+  elif [[ $1 == laws-* ]]; then
+    printf '%s%s\n' "$(proofs_path "${1#laws-}")" "$TAB"
   elif [[ $1 == cli-* ]]; then
     module_line "$CLI_SUITE" "${1#cli-}"
   else
@@ -931,7 +954,7 @@ corpus_cut() {
       if (id ~ /^cli-/) return cli
       if (id ~ /^stdlib:/) return stdlib
       if (id ~ /^proofs:/) return "prove:" stdlib
-      if (id == "program" || id ~ /^package-/ || id ~ /^fixture-/) return id
+      if (id == "program" || id ~ /^package-/ || id ~ /^laws-/ || id ~ /^fixture-/) return id
       return checks
     }
     # About two minutes unmeasured, a part'"'"'s measured under its run, whose every part loads the same
@@ -1912,6 +1935,22 @@ cmd_verify() {
     outside=$(awk -F"$TAB" -v m="$module" '$1 != m && index($2, m ".") { print $2; exit }' <<< "$keys")
     if [[ -n $outside ]]; then
       echo "FAIL: '$module.' is part of '$outside', a test or law of another of the library's runs, so the run of $module picks it too" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  local file claimed
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    claimed=0
+    for entry in "${PACKAGE_PROOFS[@]}"; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
+    if ((!claimed)); then
+      echo "FAIL: $file states a law or contract, and no PACKAGE_PROOFS entry proves its package, so CI never discharges it" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(claiming_files)
+  for entry in "${PACKAGE_PROOFS[@]}"; do
+    if ! grep -q "^${entry#*:}/" < <(claiming_files); then
+      echo "FAIL: PACKAGE_PROOFS names ${entry#*:}, which states no law or contract — delete the entry" >&2
       failures=$((failures + 1))
     fi
   done
