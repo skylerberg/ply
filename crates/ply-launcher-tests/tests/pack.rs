@@ -52,6 +52,45 @@ fn a_checkout_packs_the_shipped_modules_the_builder_and_the_program() {
     );
 }
 
+/// What the shipped modules answer rides beside the checkout's files: a binary reads each answer
+/// back by its path in the store, and `check` holds the binary to the checkout's files alone.
+#[test]
+fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let store = dir.path().join("answers");
+    for (sub, name, bytes) in [
+        ("records", "aa", b"a record".as_slice()),
+        ("outputs", "bb", b"an answer".as_slice()),
+        ("outputs", "cc.tmp", b"half written".as_slice()),
+    ] {
+        std::fs::create_dir_all(store.join(sub)).expect("the store's directory");
+        std::fs::write(store.join(sub).join(name), bytes).expect("written");
+    }
+    let binary = runtime(dir.path());
+    let checkout = Pack::of_checkout(&repo()).expect("the checkout packs");
+    let pack = Pack::of_checkout(&repo())
+        .expect("the checkout packs")
+        .with_answers(&store)
+        .expect("the store is read");
+    ply_pack::append(&binary, &pack).expect("the binary is packed");
+    let read = Pack::of_binary(&binary)
+        .expect("the binary reads")
+        .expect("the binary carries a pack");
+    assert_eq!(
+        read.bytes("answers/records/aa"),
+        Some(b"a record".as_slice())
+    );
+    assert_eq!(
+        read.bytes("answers/outputs/bb"),
+        Some(b"an answer".as_slice())
+    );
+    assert_eq!(read.bytes("answers/outputs/cc.tmp"), None);
+    assert!(matches!(
+        ply_pack::check(&binary, &checkout).expect("the binary reads"),
+        ply_pack::Checked::Same
+    ));
+}
+
 #[test]
 fn a_binary_reads_back_the_pack_appended_to_it() {
     let dir = tempfile::tempdir().expect("a scratch directory");

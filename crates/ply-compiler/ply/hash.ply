@@ -1873,18 +1873,13 @@ pub type HashOutput = {
   /// What a clause's proof is filed under: its definition's body and the contracts of what that
   /// reaches in other packages. A fixed definition's is its hash.
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
-  /// What a later run of the same program takes in place of hashing a node again.
-  priors: List<Prior>,
-  /// By index, what each test references and runs and what each law references, and what each
-  /// keeps from being unused: what a later run takes for a test or law it does not encode again.
+  /// By index, what each test references and runs and what each law references.
   test_refs: List<List<Int>>,
   test_runs: List<List<Int>>,
   law_refs: List<List<Int>>,
-  test_roots: List<List<Int>>,
-  law_roots: List<List<Int>>,
-  /// How many tests and laws were taken as an earlier run fixed them rather than encoded.
-  held_tests: Int,
-  held_laws: Int,
+  /// By node, the effects its component sees, in the order that numbers them: what a reference to
+  /// one of its effects is written under, from wherever it is referenced.
+  enumerations: List<List<Int>>,
 }
 
 /// Each node's name, whether it is a type or an effect and not a function, and what it references,
@@ -1922,14 +1917,10 @@ pub fn no_hashes() -> HashOutput =
     test_texts: [],
     contracts: [],
     spec_checks: [],
-    priors: [],
     test_refs: [],
     test_runs: [],
     law_refs: [],
-    test_roots: [],
-    law_roots: [],
-    held_tests: 0,
-    held_laws: 0,
+    enumerations: [],
   }
 
 /// The reference graph of no program.
@@ -2178,7 +2169,7 @@ type Hashed = {
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
   contracts: Map<Int, Bytes>,
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
-  priors: List<Prior>,
+  enumerations: List<List<Int>>,
 }
 
 /// Each test's hash, stored body, own form and references, in the index's order.
@@ -2203,10 +2194,11 @@ fn first_pass(index: Index) -> List<Finished> / {abort.raise} =
       normalize_node(new_encoder(index, node.module, map_new(), map_new(), map_new()), node.body),
     ))
 
-fn graph_of(index: Index) -> Graph / {abort.raise} = graph_with(index, first_pass(index), map_new())
+fn graph_of(index: Index) -> Graph / {abort.raise} =
+  graph_with(index, first_pass(index), map_new(), map_new())
 
-/// What each fixed node references, by index, as its run fixed it: a stub's blank body references
-/// nothing.
+/// What each fixed node references, by index, as its run fixed it: a node whose body is not read
+/// here references nothing of its own.
 fn fixed_edges(index: Index, fixed: List<Fixed>) -> Map<Int, List<Int>> / {abort.raise} = {
   let keys = node_keys(index);
   fold(fixed, map_new(), |acc: Map<Int, List<Int>>, f: Fixed|
@@ -2250,10 +2242,12 @@ fn first_pass_held(index: Index, fixed: Map<Int, List<Int>>) -> List<Finished> /
 }
 
 /// `extra` gives a node the references its compiled body has, where the body here is a blank.
+/// `carried` gives a fixed node the enumeration its component had where its body was hashed.
 fn graph_with(
   index: Index,
   first: List<Finished>,
   extra: Map<Int, List<Int>>,
+  carried: Map<Int, List<Int>>,
 ) -> Graph / {abort.raise} = {
   let n = len(index.nodes);
   let edges = map(range(0, n), |v: Int|
@@ -2278,10 +2272,18 @@ fn graph_with(
       concat(push(take(ms, i), v), map(range(i, k), |j: Int| at(ms, j)))
     });
     let scc = { component_of: component_of, orders: acc };
-    push(
-      acc,
-      fold(members, [], |o: List<Int>, v: Int| effect_order(index, at(edges, v), scc, Some(ci), o)),
-    )
+    let kept = match members {
+      [first_member, ..] -> if fold(members, true, |all: Bool, v: Int|
+          all && map_contains(carried, v)) { map_get(carried, first_member) }
+      else { None },
+      [] -> None,
+    };
+    push(acc, match kept {
+      Some(order) -> order,
+      None ->
+        fold(members, [], |o: List<Int>, v: Int|
+          effect_order(index, at(edges, v), scc, Some(ci), o)),
+    })
   });
   { edges: edges, components: components, scc: { component_of: component_of, orders: orders } }
 }
@@ -2291,25 +2293,13 @@ fn key_components(
   graph: Graph,
   pinned: Map<Int, Bytes>,
   held: Map<Int, Fixed>,
-  kept: Map<Int, Prior>,
 ) -> Keyed / {abort.raise} =
   fold(
     range(0, len(graph.components)),
     { hashes: map_new(), bodies: map_new(), fresh: map_new() },
     |acc: Keyed, ci: Int| {
       let component = at(graph.components, ci);
-      if fold(component, true, |all: Bool, v: Int| all && map_contains(kept, v)) {
-        fold(component, acc, |a: Keyed, v: Int|
-          match map_get(kept, v) {
-            None -> a,
-            Some(p) ->
-              {
-                hashes: map_insert(a.hashes, v, p.hash),
-                bodies: map_insert(a.bodies, v, p.body),
-                fresh: map_insert(a.fresh, v, p.hash),
-              },
-          })
-      } else if fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
+      if fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
         fold(component, acc, |a: Keyed, v: Int|
           match map_get(held, v) {
             None -> a,
@@ -2369,8 +2359,8 @@ pub fn hash_index(index: Index) -> HashOutput / {abort.raise} = hash_index_pinne
 
 pub type NodeRef = { name: Bytes, decl: Bool }
 
-/// What hashing derives from a node's body, which a stub lacks; `own`, specs and `contract` are a
-/// function's, `contract` empty for a declaration.
+/// What hashing derives from a node's body, which a module checked against its imports' entries
+/// does not hold; `own`, specs and `contract` are a function's, `contract` empty for a declaration.
 pub type Fixed = {
   name: Bytes,
   decl: Bool,
@@ -2381,200 +2371,13 @@ pub type Fixed = {
   contract: Bytes,
   body: Bytes,
   edges: List<NodeRef>,
+  /// The effects its component sees, in the order that numbers them, which its body decides.
+  effects: List<NodeRef>,
 }
 
 derive bin for NodeRef
 
 derive bin for Fixed
-
-/// What hashing derives from a test of a module that stands, which a later load takes in place of
-/// encoding the test again: its hash, the body it is filed under, its own form, what it references
-/// and what a case of it runs, and what it keeps from being unused, each reference by name.
-/// `position` is its place among its module's tests.
-pub type FixedTest = {
-  module: Bytes,
-  position: Int,
-  hash: Bytes,
-  body: Bytes,
-  text: Bytes,
-  refs: List<NodeRef>,
-  runs: List<NodeRef>,
-  roots: List<NodeRef>,
-}
-
-/// The same of a law, which has no body filed and no cases.
-pub type FixedLaw = {
-  module: Bytes,
-  position: Int,
-  hash: Bytes,
-  text: Bytes,
-  refs: List<NodeRef>,
-  roots: List<NodeRef>,
-}
-
-derive bin for FixedTest
-
-derive bin for FixedLaw
-
-/// The tests and laws a load takes as they were hashed, by their place in the index.
-type Held = { tests: Map<Int, HeldTest>, laws: Map<Int, HeldLaw> }
-
-type HeldTest = {
-  hash: Bytes,
-  body: Bytes,
-  text: Bytes,
-  refs: List<Int>,
-  runs: List<Int>,
-  roots: List<Int>,
-}
-
-type HeldLaw = { hash: Bytes, text: Bytes, refs: List<Int>, roots: List<Int> }
-
-fn nothing_held() -> Held = { tests: map_new(), laws: map_new() }
-
-fn place_key(module: Bytes, position: Int) -> Bytes =
-  bytes_concat_all([module, b"#", ascii_of_int(position)])
-
-/// Each item's place among its own module's items, in the index's order.
-fn positions(modules: List<Int>) -> List<Int> =
-  fold(
-    modules,
-    { seen: map_new(), out: [] },
-    |acc: { seen: Map<Int, Int>, out: List<Int> }, m: Int| {
-      let at_m = match map_get(acc.seen, m) { Some(k) -> k, None -> 0 };
-      { seen: map_insert(acc.seen, m, at_m + 1), out: push(acc.out, at_m) }
-    },
-  ).out
-
-/// `refs` by their places in the index, or nothing where one names no node there or names two: a
-/// type and an effect of one name are both a declaration of it, and a reference by name cannot say
-/// which.
-fn placed_refs(
-  keys: Map<Bytes, Int>,
-  shared: Map<Bytes, Bool>,
-  refs: List<NodeRef>,
-) -> Option<List<Int>> =
-  fold(refs, Some([]), |acc: Option<List<Int>>, r: NodeRef|
-    match acc {
-      None -> None,
-      Some(vs) -> {
-        let key = pin_key(r.name, r.decl);
-        if map_contains(shared, key) { None }
-        else { match map_get(keys, key) { Some(v) -> Some(push(vs, v)), None -> None } }
-      },
-    })
-
-/// The keys more than one node of the index answers to.
-fn shared_keys(index: Index) -> Map<Bytes, Bool> =
-  fold(
-    index.nodes,
-    { seen: map_new(), shared: map_new() },
-    |acc: { seen: Map<Bytes, Bool>, shared: Map<Bytes, Bool> }, node: Node| {
-      let key = pin_key(node.name, is_decl(node));
-      if map_contains(acc.seen, key) { { ..acc, shared: map_insert(acc.shared, key, true) } }
-      else { { ..acc, seen: map_insert(acc.seen, key, true) } }
-    },
-  ).shared
-
-/// The fixed tests and laws that stand over this index: each at the place its module and position
-/// name, with every reference naming a node here. One that does not is encoded afresh.
-fn held_items(
-  index: Index,
-  keys: Map<Bytes, Int>,
-  tests: List<FixedTest>,
-  laws: List<FixedLaw>,
-) -> Held / {abort.raise} =
-  if len(tests) == 0 && len(laws) == 0 { nothing_held() } else {
-    let fixed_tests = fold(tests, map_new(), |acc: Map<Bytes, FixedTest>, t: FixedTest|
-      map_insert(acc, place_key(t.module, t.position), t));
-    let fixed_laws = fold(laws, map_new(), |acc: Map<Bytes, FixedLaw>, l: FixedLaw|
-      map_insert(acc, place_key(l.module, l.position), l));
-    let test_places = positions(map(index.tests, |t: TestNode| t.module));
-    let law_places = positions(map(index.laws, |l: LawNode| l.module));
-    let name_of = |m: Int| at(index.mods, m).name;
-    let shared = shared_keys(index);
-    {
-      tests: fold(range(0, len(index.tests)), map_new(), |acc: Map<Int, HeldTest>, i: Int|
-        match map_get(
-            fixed_tests,
-            place_key(name_of(at(index.tests, i).module), at(test_places, i)),
-          ) {
-          None -> acc,
-          Some(f) -> match ((
-              placed_refs(keys, shared, f.refs),
-              placed_refs(keys, shared, f.runs),
-              placed_refs(keys, shared, f.roots),
-            )) {
-            (Some(refs), Some(runs), Some(roots)) ->
-              map_insert(acc, i, {
-                hash: f.hash,
-                body: f.body,
-                text: f.text,
-                refs: refs,
-                runs: runs,
-                roots: roots,
-              }),
-            _ -> acc,
-          },
-        }),
-      laws: fold(range(0, len(index.laws)), map_new(), |acc: Map<Int, HeldLaw>, i: Int|
-        match map_get(fixed_laws, place_key(name_of(at(index.laws, i).module), at(law_places, i))) {
-          None -> acc,
-          Some(f) -> match ((
-              placed_refs(keys, shared, f.refs),
-              placed_refs(keys, shared, f.roots),
-            )) {
-            (Some(refs), Some(roots)) ->
-              map_insert(acc, i, { hash: f.hash, text: f.text, refs: refs, roots: roots }),
-            _ -> acc,
-          },
-        }),
-    }
-  }
-
-/// The tests and laws of the modules `keep` names, as a later load takes them for those modules'
-/// stubs. `hashes` is what `hashed_and_unused` answered over `index`.
-pub fn fixed_items(
-  index: Index,
-  hashes: HashOutput,
-  keep: Map<Bytes, Bool>,
-) -> { tests: List<FixedTest>, laws: List<FixedLaw> } / {abort.raise} = {
-  let named = |vs: List<Int>|
-    map(vs, |v: Int| { name: at(index.nodes, v).name, decl: is_decl(at(index.nodes, v)) });
-  let test_places = positions(map(index.tests, |t: TestNode| t.module));
-  let law_places = positions(map(index.laws, |l: LawNode| l.module));
-  let name_of = |m: Int| at(index.mods, m).name;
-  {
-    tests: fold(range(0, len(index.tests)), [], |acc: List<FixedTest>, i: Int| {
-      let module = name_of(at(index.tests, i).module);
-      if !map_contains(keep, module) { acc } else {
-        push(acc, {
-          module: module,
-          position: at(test_places, i),
-          hash: at(hashes.tests, i),
-          body: at(hashes.test_bodies, i),
-          text: at(hashes.test_texts, i),
-          refs: named(at(hashes.test_refs, i)),
-          runs: named(at(hashes.test_runs, i)),
-          roots: named(at(hashes.test_roots, i)),
-        })
-      }
-    }),
-    laws: fold(range(0, len(index.laws)), [], |acc: List<FixedLaw>, i: Int| {
-      let module = name_of(at(index.laws, i).module);
-      if !map_contains(keep, module) { acc } else {
-        push(acc, {
-          module: module,
-          position: at(law_places, i),
-          hash: at(hashes.laws, i),
-          text: at(hashes.law_texts, i),
-          refs: named(at(hashes.law_refs, i)),
-          roots: named(at(hashes.law_roots, i)),
-        })
-      }
-    }),
-  }
-}
 
 fn node_keys(index: Index) -> Map<Bytes, Int> / {abort.raise} =
   fold(range(0, len(index.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
@@ -2587,255 +2390,24 @@ pub fn hash_index_pinned(
   index: Index,
   fixed: List<Fixed>,
   packages: List<Int> = [],
-  priors: List<Prior> = [],
-) -> HashOutput / {abort.raise} =
-  hashed_over(index, first_pass(index), fixed, packages, priors, nothing_held())
+) -> HashOutput / {abort.raise} = hashed_over(index, first_pass(index), fixed, packages)
 
 /// The hashes and the definitions nothing uses, over one normalization of every node but the fixed
-/// ones, which are read as their earlier run fixed them. `blank` names, by owner, the tests a stub
-/// blanked, which have nothing to encode: `unheld` is each of them `tests` does not hold.
+/// ones, which are read as their earlier run fixed them.
 pub fn hashed_and_unused(
   index: Index,
   fixed: List<Fixed>,
   packages: List<Int>,
-  priors: List<Prior> = [],
-  tests: List<FixedTest> = [],
-  laws: List<FixedLaw> = [],
-  blank: List<Bytes> = [],
-) -> { hashes: HashOutput, unused: List<Diag>, unheld: List<Bytes> } / {abort.raise} = {
+) -> { hashes: HashOutput, unused: List<Diag> } / {abort.raise} = {
   let first = first_pass_held(index, fixed_edges(index, fixed));
-  let held = held_items(index, node_keys(index), tests, laws);
-  let blanked = fold(blank, map_new(), |acc: Map<Bytes, Bool>, owner: Bytes|
-    map_insert(acc, owner, true));
-  let places = positions(map(index.tests, |t: TestNode| t.module));
-  let unheld = fold(range(0, len(index.tests)), [], |acc: List<Bytes>, i: Int| {
-    let t = at(index.tests, i);
-    if map_contains(held.tests, i)
-        || !map_contains(blanked, test_owner(at(index.mods, t.module).name, at(places, i))) { acc }
-    else { push(acc, t.key) }
-  });
-  let test_roots = map(range(0, len(index.tests)), |i: Int|
-    match map_get(held.tests, i) {
-      Some(h) -> h.roots,
-      None -> test_roots_of(index, at(index.tests, i)),
-    });
-  let law_roots = map(range(0, len(index.laws)), |i: Int|
-    match map_get(held.laws, i) {
-      Some(h) -> h.roots,
-      None -> law_roots_of(index, at(index.laws, i)),
-    });
+  let roots = concat(
+    map(index.tests, |t: TestNode| test_roots_of(index, t)),
+    map(index.laws, |l: LawNode| law_roots_of(index, l)),
+  );
   {
-    hashes: {
-      ..hashed_over(index, first, fixed, packages, priors, held),
-      test_roots: test_roots,
-      law_roots: law_roots,
-      held_tests: map_len(held.tests),
-      held_laws: map_len(held.laws),
-    },
-    unused: unused_over(index, first, fixed, concat(test_roots, law_roots)),
-    unheld: unheld,
+    hashes: hashed_over(index, first, fixed, packages),
+    unused: unused_over(index, first, fixed, roots),
   }
-}
-
-// --- Priors -----------------------------------------------------------------------------
-
-/// What an earlier run hashed a node to, beside the sketch it had then.
-pub type Prior = {
-  name: Bytes,
-  decl: Bool,
-  sketch: Bytes,
-  hash: Bytes,
-  check: Bytes,
-  contract: Bytes,
-  own: Option<Bytes>,
-  specs: List<Bytes>,
-  spec_texts: List<Bytes>,
-  spec_checks: List<Bytes>,
-  body: Bytes,
-}
-
-derive bin for Prior
-
-/// References as a sketch names them: which node, of which kind, whether across a package
-/// boundary, and a fixed node's hash, which stands in for its body.
-fn ref_marks(
-  index: Index,
-  packages: List<Int>,
-  pinned: Map<Int, Bytes>,
-  v: Int,
-  refs: List<Int>,
-) -> Bytes / {abort.raise} = {
-  let own = package_of(index, packages, v);
-  bytes_concat(
-    u32_le(len(refs)),
-    bytes_concat_all(
-      map(refs, |r: Int| {
-        let node = at(index.nodes, r);
-        bytes_concat_all([
-          u32_le(bytes_len(node.name)),
-          node.name,
-          if is_decl(node) { b"d" } else { b"f" },
-          if package_of(index, packages, r) == own { b"=" } else { b"~" },
-          match map_get(pinned, r) { Some(h) -> bytes_concat(b"h", h), None -> b"-" },
-        ])
-      }),
-    ),
-  )
-}
-
-type Sketched = { sketch: Bytes, spec_refs: List<Int> }
-
-/// What a node's hashing reads besides the hashes of what it references: its form with nothing
-/// known, and each specification clause's, which that form leaves out.
-fn sketched(
-  index: Index,
-  first: List<Finished>,
-  packages: List<Int>,
-  pinned: Map<Int, Bytes>,
-  v: Int,
-) -> Sketched / {abort.raise} = {
-  let node = at(index.nodes, v);
-  let f = at(first, v);
-  let clauses = match node.body {
-    NodeFn(def) ->
-      map(def.spec, |c: SpecClause|
-        finish(
-          spec_clause(new_encoder(index, node.module, map_new(), map_new(), map_new()), def, c),
-        )),
-    _ -> [],
-  };
-  let form = |x: Finished|
-    bytes_concat_all([
-      u32_le(bytes_len(x.bytes)),
-      x.bytes,
-      ref_marks(index, packages, pinned, v, x.refs),
-    ]);
-  {
-    sketch: blake3(
-      bytes_concat_all([
-        b"ply.sketch.1\0",
-        form(f),
-        u32_le(len(clauses)),
-        bytes_concat_all(map(clauses, form)),
-      ]),
-    ),
-    spec_refs: fold(clauses, [], |acc: List<Int>, c: Finished| concat(acc, c.refs)),
-  }
-}
-
-/// The nodes whose priors stand, component by component and dependency-first: a component stands
-/// when every member's sketch is its prior's and everything a member references outside it stands
-/// too, a fixed node by the hash its sketch carries.
-fn standing_priors(
-  index: Index,
-  graph: Graph,
-  held: Map<Int, Fixed>,
-  sketches: List<Sketched>,
-  priors: List<Prior>,
-) -> Map<Int, Prior> / {abort.raise} =
-  if len(priors) == 0 { map_new() } else {
-    let by_key = fold(priors, map_new(), |acc: Map<Bytes, Prior>, p: Prior|
-      map_insert(acc, pin_key(p.name, p.decl), p));
-    fold(range(0, len(graph.components)), map_new(), |kept: Map<Int, Prior>, ci: Int| {
-      let component = at(graph.components, ci);
-      let stands = |r: Int|
-        at(graph.scc.component_of, r) == ci || map_contains(held, r) || map_contains(kept, r);
-      let found = fold(component, Some([]), |acc: Option<List<{ v: Int, p: Prior }>>, v: Int|
-        match acc {
-          None -> None,
-          Some(members) -> {
-            let node = at(index.nodes, v);
-            let s = at(sketches, v);
-            match map_get(by_key, pin_key(node.name, is_decl(node))) {
-              Some(p) -> if !map_contains(held, v) && p.sketch == s.sketch
-                  && fold(at(graph.edges, v), true, |all: Bool, r: Int| all && stands(r))
-                  && fold(s.spec_refs, true, |all: Bool, r: Int| all && stands(r)) {
-                Some(push(members, { v: v, p: p }))
-              } else { None },
-              None -> None,
-            }
-          },
-        });
-      match found {
-        Some(members) ->
-          fold(members, kept, |k: Map<Int, Prior>, m: { v: Int, p: Prior }|
-            map_insert(k, m.v, m.p)),
-        None -> kept,
-      }
-    })
-  }
-
-fn prior_forms(acc: Forms, name: Bytes, p: Prior) -> Forms = {
-  let owned: Forms = match p.own {
-    Some(o) -> { ..acc, own: push(acc.own, { name: name, hash: o }) },
-    None -> acc,
-  };
-  if len(p.specs) == 0 { owned } else {
-    {
-      ..owned,
-      specs: push(owned.specs, { name: name, hashes: p.specs }),
-      spec_texts: push(owned.spec_texts, { name: name, hashes: p.spec_texts }),
-      spec_checks: push(owned.spec_checks, { name: name, hashes: p.spec_checks }),
-    }
-  }
-}
-
-/// Every node this run hashed, as the next run reads it back.
-/// A fixed node is not hashed here, so the prior the last run had for it is handed on as it was: it
-/// stands again when the node's module is next read from its source, if that still says the same.
-fn priors_of(
-  index: Index,
-  held: Map<Int, Fixed>,
-  sketches: List<Sketched>,
-  keyed: Keyed,
-  check_keys: CheckKeys,
-  contracts: Map<Int, Bytes>,
-  forms: Forms,
-  last: List<Prior>,
-) -> List<Prior> / {abort.raise} = {
-  let handed = if map_len(held) == 0 { map_new() } else {
-    fold(last, map_new(), |acc: Map<Bytes, Prior>, p: Prior|
-      map_insert(acc, pin_key(p.name, p.decl), p))
-  };
-  let named = |xs: List<{ name: Bytes, hashes: List<Bytes> }>|
-    fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-      map_insert(acc, x.name, x.hashes));
-  let own = fold(forms.own, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-    map_insert(acc, x.name, x.hash));
-  let specs = named(forms.specs);
-  let spec_texts = named(forms.spec_texts);
-  let spec_checks = named(forms.spec_checks);
-  let listed = |m: Map<Bytes, List<Bytes>>, name: Bytes|
-    match map_get(m, name) { Some(xs) -> xs, None -> [] };
-  fold(range(0, len(index.nodes)), [], |acc: List<Prior>, v: Int|
-    if map_contains(held, v) {
-      let node = at(index.nodes, v);
-      match map_get(handed, pin_key(node.name, is_decl(node))) {
-        Some(p) -> push(acc, p),
-        None -> acc,
-      }
-    } else {
-      match map_get(keyed.hashes, v) {
-        None -> acc,
-        Some(h) -> {
-          let node = at(index.nodes, v);
-          let decl = is_decl(node);
-          push(acc, {
-            name: node.name,
-            decl: decl,
-            sketch: at(sketches, v).sketch,
-            hash: h,
-            check: match map_get(check_keys.checks, v) { Some(c) -> c, None -> h },
-            contract: match map_get(contracts, v) { Some(c) -> c, None -> h },
-            own: if decl { None } else { map_get(own, node.name) },
-            specs: if decl { [] } else { listed(specs, node.name) },
-            spec_texts: if decl { [] } else { listed(spec_texts, node.name) },
-            spec_checks: if decl { [] } else { listed(spec_checks, node.name) },
-            body: match map_get(keyed.bodies, v) { Some(b) -> b, None -> b"" },
-          })
-        },
-      }
-    })
 }
 
 fn hashed_over(
@@ -2843,100 +2415,71 @@ fn hashed_over(
   first: List<Finished>,
   fixed: List<Fixed>,
   packages: List<Int>,
-  priors: List<Prior>,
-  items: Held,
 ) -> HashOutput / {abort.raise} = {
   let keys = node_keys(index);
   let held = fold(fixed, map_new(), |acc: Map<Int, Fixed>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
+  let present = |refs: List<NodeRef>|
+    fold(refs, [], |es: List<Int>, r: NodeRef|
+      match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es });
   let g = graph_with(
     index,
     first,
     map_fold(held, map_new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
-      map_insert(
-        acc,
-        v,
-        fold(f.edges, [], |es: List<Int>, r: NodeRef|
-          match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es }),
-      )),
+      map_insert(acc, v, present(f.edges))),
+    map_fold(held, map_new(), |acc: Map<Int, List<Int>>, v: Int, f: Fixed|
+      map_insert(acc, v, present(f.effects))),
   );
   let edges = g.edges;
   let scc = g.scc;
   let pinned = map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
     map_insert(acc, v, f.hash));
-  let sketches = map(range(0, len(index.nodes)), |v: Int|
-    if map_contains(held, v) { { sketch: b"", spec_refs: [] } }
-    else { sketched(index, first, packages, pinned, v) });
-  let kept = standing_priors(index, g, held, sketches, priors);
-  let keyed = key_components(index, g, pinned, held, kept);
+  let keyed = key_components(index, g, pinned, held);
   let hashes = keyed.hashes;
-  let check_keys = check_key_components(index, g, held, kept, packages, hashes);
+  let check_keys = check_key_components(index, g, held, packages, hashes);
   let contracts = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int|
     if is_decl(at(index.nodes, v)) { acc } else {
       let fixed_contract = match map_get(held, v) { Some(f) -> f.contract, None -> b"" };
       map_insert(acc, v, if bytes_len(fixed_contract) > 0 { fixed_contract } else {
-        match map_get(kept, v) {
-          Some(p) -> p.contract,
-          None -> match map_get(check_keys.contracts, v) {
-            Some(c) -> c,
-            None -> contract_of(index, g, hashes, v),
-          },
+        match map_get(check_keys.contracts, v) {
+          Some(c) -> c,
+          None -> contract_of(index, g, hashes, v),
         }
       })
     });
   let tests = fold(
     range(0, len(index.tests)),
     { hashes: [], bodies: [], texts: [], refs: [], runs: [] },
-    |acc: TestForms, i: Int|
-      match map_get(items.tests, i) {
-        Some(h) ->
-          {
-            hashes: push(acc.hashes, h.hash),
-            bodies: push(acc.bodies, h.body),
-            texts: push(acc.texts, h.text),
-            refs: push(acc.refs, h.refs),
-            runs: push(acc.runs, h.runs),
-          },
-        None -> {
-          let t = at(index.tests, i);
-          let body = |encoder: Encoder| test_def(encoder, t.def);
-          let effects = slots_of(index, t.module, scc, body);
-          let f: Finished = encode_slotted(index, t.module, hashes, effects, false, body);
-          let text: Finished = encode_slotted(index, t.module, hashes, effects, true, body);
-          {
-            hashes: push(acc.hashes, blake3(f.bytes)),
-            bodies: push(acc.bodies, solo_body(f.bytes)),
-            texts: push(acc.texts, own_hash(text.bytes)),
-            refs: push(acc.refs, test_refs(index, t, f.refs)),
-            runs: push(acc.runs, f.refs),
-          }
-        },
-      },
+    |acc: TestForms, i: Int| {
+      let t = at(index.tests, i);
+      let body = |encoder: Encoder| test_def(encoder, t.def);
+      let effects = slots_of(index, t.module, scc, body);
+      let f: Finished = encode_slotted(index, t.module, hashes, effects, false, body);
+      let text: Finished = encode_slotted(index, t.module, hashes, effects, true, body);
+      {
+        hashes: push(acc.hashes, blake3(f.bytes)),
+        bodies: push(acc.bodies, solo_body(f.bytes)),
+        texts: push(acc.texts, own_hash(text.bytes)),
+        refs: push(acc.refs, test_refs(index, t, f.refs)),
+        runs: push(acc.runs, f.refs),
+      }
+    },
   );
   let laws = fold(
     range(0, len(index.laws)),
     { hashes: [], refs: [], texts: [] },
-    |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, i: Int|
-      match map_get(items.laws, i) {
-        Some(h) ->
-          {
-            hashes: push(acc.hashes, h.hash),
-            refs: push(acc.refs, h.refs),
-            texts: push(acc.texts, h.text),
-          },
-        None -> {
-          let l = at(index.laws, i);
-          let law = |encoder: Encoder| law_def(encoder, l.def);
-          let effects = slots_of(index, l.module, scc, law);
-          let f: Finished = encode_slotted(index, l.module, hashes, effects, false, law);
-          let text: Finished = encode_slotted(index, l.module, hashes, effects, true, law);
-          {
-            hashes: push(acc.hashes, blake3(f.bytes)),
-            refs: push(acc.refs, f.refs),
-            texts: push(acc.texts, spec_text_hash(0, 0, text.bytes)),
-          }
-        },
-      },
+    |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, i: Int| {
+      let l = at(index.laws, i);
+      let law = |encoder: Encoder| law_def(encoder, l.def);
+      let effects = slots_of(index, l.module, scc, law);
+      let f: Finished = encode_slotted(index, l.module, hashes, effects, false, law);
+      let text: Finished = encode_slotted(index, l.module, hashes, effects, true, law);
+      {
+        hashes: push(acc.hashes, blake3(f.bytes)),
+        refs: push(acc.refs, f.refs),
+        texts: push(acc.texts, spec_text_hash(0, 0, text.bytes)),
+      }
+    },
   );
   let forms = fold(
     index.order,
@@ -2947,22 +2490,19 @@ fn hashed_over(
           let node = at(index.nodes, v);
           match map_get(held, v) {
             Some(f) -> fixed_forms(acc, node.name, f),
-            None -> match map_get(kept, v) {
-              Some(p) -> prior_forms(acc, node.name, p),
-              None -> {
-                let view = viewed_refs(index, g, held, packages, hashes, check_keys, v).view;
-                unfixed_forms(
-                  index,
-                  scc,
-                  hashes,
-                  view,
-                  check_keys.checks,
-                  acc,
-                  v,
-                  node,
-                  at(first, v).refs,
-                )
-              },
+            None -> {
+              let view = viewed_refs(index, g, held, packages, hashes, check_keys, v).view;
+              unfixed_forms(
+                index,
+                scc,
+                hashes,
+                view,
+                check_keys.checks,
+                acc,
+                v,
+                node,
+                at(first, v).refs,
+              )
             },
           }
         },
@@ -2985,7 +2525,10 @@ fn hashed_over(
     spec_texts: forms.spec_texts,
     contracts: contracts,
     spec_checks: forms.spec_checks,
-    priors: priors_of(index, held, sketches, keyed, check_keys, contracts, forms, priors),
+    enumerations: map(range(0, len(index.nodes)), |v: Int| {
+      let ci = at(scc.component_of, v);
+      if ci < 0 { [] } else { at(scc.orders, ci) }
+    }),
   })
 }
 
@@ -3108,7 +2651,6 @@ fn check_key_components(
   index: Index,
   graph: Graph,
   held: Map<Int, Fixed>,
-  kept: Map<Int, Prior>,
   packages: List<Int>,
   hashes: Map<Int, Bytes>,
 ) -> CheckKeys / {abort.raise} =
@@ -3117,52 +2659,44 @@ fn check_key_components(
     { checks: map_new(), contracts: map_new() },
     |acc: CheckKeys, ci: Int| {
       let component = at(graph.components, ci);
-      if fold(component, true, |all: Bool, v: Int| all && map_contains(kept, v)) {
-        fold(component, acc, |keys: CheckKeys, v: Int|
-          match map_get(kept, v) {
-            Some(p) -> { ..keys, checks: map_insert(keys.checks, v, p.check) },
+      let gathered = fold(component, { check_keys: acc, view: map_new() }, |a: Viewed, v: Int| {
+        let x = viewed_refs(index, graph, held, packages, hashes, a.check_keys, v);
+        {
+          check_keys: x.check_keys,
+          view: map_fold(x.view, a.view, |m: Map<Int, Bytes>, r: Int, k: Bytes|
+            if at(graph.scc.component_of, r) == ci { m } else { map_insert(m, r, k) }),
+        }
+      });
+      let unmoved = map_fold(gathered.view, true, |all: Bool, r: Int, k: Bytes|
+        all && map_get(hashes, r) == Some(k));
+      if unmoved || fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
+        fold(component, gathered.check_keys, |keys: CheckKeys, v: Int|
+          match map_get(hashes, v) {
+            Some(h) -> { ..keys, checks: map_insert(keys.checks, v, h) },
             None -> keys,
           })
       } else {
-        let gathered = fold(component, { check_keys: acc, view: map_new() }, |a: Viewed, v: Int| {
-          let x = viewed_refs(index, graph, held, packages, hashes, a.check_keys, v);
-          {
-            check_keys: x.check_keys,
-            view: map_fold(x.view, a.view, |m: Map<Int, Bytes>, r: Int, k: Bytes|
-              if at(graph.scc.component_of, r) == ci { m } else { map_insert(m, r, k) }),
-          }
-        });
-        let unmoved = map_fold(gathered.view, true, |all: Bool, r: Int, k: Bytes|
-          all && map_get(hashes, r) == Some(k));
-        if unmoved || fold(component, true, |all: Bool, v: Int| all && map_contains(held, v)) {
-          fold(component, gathered.check_keys, |keys: CheckKeys, v: Int|
-            match map_get(hashes, v) {
-              Some(h) -> { ..keys, checks: map_insert(keys.checks, v, h) },
-              None -> keys,
-            })
+        let effects = slots(at(graph.scc.orders, ci));
+        if is_cyclic(component, graph.edges) {
+          let refined: Refined = hash_component(index, component, gathered.view, effects);
+          fold(
+            refined.members,
+            gathered.check_keys,
+            |keys: CheckKeys, m: { node: Int, hash: Bytes }|
+              { ..keys, checks: map_insert(keys.checks, m.node, m.hash) },
+          )
         } else {
-          let effects = slots(at(graph.scc.orders, ci));
-          if is_cyclic(component, graph.edges) {
-            let refined: Refined = hash_component(index, component, gathered.view, effects);
-            fold(
-              refined.members,
-              gathered.check_keys,
-              |keys: CheckKeys, m: { node: Int, hash: Bytes }|
-                { ..keys, checks: map_insert(keys.checks, m.node, m.hash) },
-            )
-          } else {
-            let v = at(component, 0);
-            let node = at(index.nodes, v);
-            let encoding = finish(
-              normalize_node(
-                new_encoder(index, node.module, gathered.view, map_new(), effects),
-                node.body,
-              ),
-            ).bytes;
-            {
-              ..gathered.check_keys,
-              checks: map_insert(gathered.check_keys.checks, v, blake3(encoding)),
-            }
+          let v = at(component, 0);
+          let node = at(index.nodes, v);
+          let encoding = finish(
+            normalize_node(
+              new_encoder(index, node.module, gathered.view, map_new(), effects),
+              node.body,
+            ),
+          ).bytes;
+          {
+            ..gathered.check_keys,
+            checks: map_insert(gathered.check_keys.checks, v, blake3(encoding)),
           }
         }
       }
@@ -3242,35 +2776,26 @@ fn unfixed_forms(
     _ -> acc,
   }
 
-/// Pairs nodes by `index.order`, as `assemble` pushed them; a node `applied` fixed keeps its edges.
+/// The nodes of the modules `keep` names, paired by `index.order` as `assemble` pushed them.
 pub fn fixed_nodes(
   index: Index,
   hashes: HashOutput,
   keep: Map<Bytes, Bool>,
-  applied: List<Fixed> = [],
-  // Only the nodes of these names, where it is given.
-  named: Option<Map<Bytes, Bool>> = None,
 ) -> List<Fixed> / {abort.raise} = {
-  let prior = fold(applied, map_new(), |acc: Map<Bytes, Fixed>, f: Fixed|
-    map_insert(acc, pin_key(f.name, f.decl), f));
   let node_refs = |refs: List<Int>|
     map(refs, |r: Int| { name: at(index.nodes, r).name, decl: is_decl(at(index.nodes, r)) });
-  // What hashing read of each node is what it references, held or not.
-  let edges_of = |v: Int, node: Node, decl: Bool|
-    match map_get(prior, pin_key(node.name, decl)) {
-      Some(f) -> f.edges,
-      None -> match list_at(hashes.refs.edges, v) {
-        Some(refs) -> node_refs(refs),
-        None ->
-          node_refs(
-            finish(
-              normalize_node(
-                new_encoder(index, node.module, map_new(), map_new(), map_new()),
-                node.body,
-              ),
-            ).refs,
-          ),
-      },
+  let edges_of = |v: Int, node: Node|
+    match list_at(hashes.refs.edges, v) {
+      Some(refs) -> node_refs(refs),
+      None ->
+        node_refs(
+          finish(
+            normalize_node(
+              new_encoder(index, node.module, map_new(), map_new(), map_new()),
+              node.body,
+            ),
+          ).refs,
+        ),
     };
   let own = fold(
     hashes.own,
@@ -3314,8 +2839,7 @@ pub fn fixed_nodes(
             def: if decl { acc.def } else { acc.def + 1 },
             decl: if decl { acc.decl + 1 } else { acc.decl },
           };
-          let wanted = match named { None -> true, Some(m) -> map_contains(m, node.name) };
-          if !wanted || !map_contains(keep, at(index.mods, node.module).name) { next } else {
+          if !map_contains(keep, at(index.mods, node.module).name) { next } else {
             {
               ..next,
               out: push(next.out, {
@@ -3329,7 +2853,11 @@ pub fn fixed_nodes(
                 contract: if decl { b"" }
                 else { match map_get(contracts, node.name) { Some(c) -> c, None -> b"" } },
                 body: body.body,
-                edges: edges_of(v, node, decl),
+                edges: edges_of(v, node),
+                effects: node_refs(match list_at(hashes.enumerations, v) {
+                  Some(es) -> es,
+                  None -> [],
+                }),
               }),
             }
           }
@@ -3363,7 +2891,7 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed / {abort.raise} =
     }
   });
   let g = graph_of(index);
-  let keyed = key_components(index, g, pinned, map_new(), map_new());
+  let keyed = key_components(index, g, pinned, map_new());
   let grouped = fold(range(0, len(g.components)), map_new(), |acc: Map<Int, Int>, ci: Int| {
     let c = at(g.components, ci);
     if len(c) < 2 { acc } else { fold(c, acc, |a: Map<Int, Int>, v: Int| map_insert(a, v, ci)) }
@@ -3439,14 +2967,10 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     test_texts: h.test_texts,
     contracts: [],
     spec_checks: h.spec_checks,
-    priors: h.priors,
     test_refs: h.test_refs,
     test_runs: h.test_runs,
     law_refs: h.law_refs,
-    test_roots: [],
-    law_roots: [],
-    held_tests: 0,
-    held_laws: 0,
+    enumerations: h.enumerations,
   };
   fold(index.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: IndexEntry|
     match e {
@@ -6070,111 +5594,6 @@ fn dumped_hash(dump: String, name: Bytes) -> Bytes / {abort.raise} = {
   bytes_slice(d, start, start + 64)
 }
 
-fn primed_m(changed: Bytes) -> Source =
-  {
-    name: b"m",
-    src: bytes_concat(
-      b"pub effect log { write emit(Bytes) -> Unit }\npub type Pair = { a: Int, b: Int }\nderive eq for Pair\nfn helper(x: Int) -> Int = x * 2\npub fn one() -> Int = 1\npub fn two(x: Int) -> Int requires x >= 0 ensures result > x = helper(x) + one()\npub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"two adds\" { assert_eq(two(1), 3) }\nlaw \"doubling\" forall (x: Int) { helper(x) == x + x }\n",
-      changed,
-    ),
-  }
-
-fn primed_n(changed: Bytes) -> Source =
-  {
-    name: b"n",
-    src: bytes_concat(
-      b"import m (one, two, even, say, log, Pair)\npub fn four() -> Int = two(two(one()))\npub fn pair() -> Pair = { a: one(), b: four() }\nfn hi() -> Unit / { log.write } = say(b\"hi\")\ntest \"four\" { assert_eq(four(), 7) }\n",
-      changed,
-    ),
-  }
-
-fn primed_base() -> List<Source> =
-  [
-    primed_m(b"pub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\n"),
-    primed_n(b"pub fn parity() -> Bool = even(4)\n"),
-  ]
-
-/// Each a program that differs from the base where a run of it would.
-fn primed_variants() -> List<List<Source>> / {abort.raise} =
-  [
-    primed_base(),
-    [
-      primed_m(b"pub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) && true }\n"),
-      primed_n(b"pub fn parity() -> Bool = even(4)\n"),
-    ],
-    [
-      { name: b"m", src: replace(at(primed_base(), 0).src, b"x * 2", b"x * 3") },
-      at(primed_base(), 1),
-    ],
-    [
-      { name: b"m", src: replace(at(primed_base(), 0).src, b"requires x >= 0", b"requires x > 0") },
-      at(primed_base(), 1),
-    ],
-    [
-      primed_m(
-        b"pub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn three() -> Int = 3\n",
-      ),
-      {
-        name: b"n",
-        src: replace(at(primed_base(), 1).src, b"two(two(one()))", b"two(two(three()))"),
-      },
-    ],
-    [at(primed_base(), 0), primed_n(b"")],
-    [
-      { name: b"m", src: replace(at(primed_base(), 0).src, b"helper", b"assist") },
-      at(primed_base(), 1),
-    ],
-    [
-      { name: b"m", src: replace(at(primed_base(), 0).src, b"b: Int }", b"b: Int, c: Int }") },
-      { name: b"n", src: replace(at(primed_base(), 1).src, b"b: four() }", b"b: four(), c: 0 }") },
-    ],
-    [
-      {
-        name: b"m",
-        src: replace(
-          at(primed_base(), 0).src,
-          b"emit(Bytes) -> Unit }",
-          b"emit(Bytes) -> Unit\n  write flush() -> Unit }",
-        ),
-      },
-      at(primed_base(), 1),
-    ],
-  ]
-
-fn primed_as_fresh(
-  before: List<Source>,
-  after: List<Source>,
-  packages: List<Int>,
-) -> Bool / {abort.raise} = {
-  let priors = hash_index_pinned(indexed(before), [], packages).priors;
-  let fresh = hash_index_pinned(indexed(after), [], packages);
-  hash_index_pinned(indexed(after), [], packages, priors) == fresh
-}
-
-test "a run over an earlier run's priors hashes what a run from nothing does" {
-  let variants = primed_variants();
-  fold(variants, (), |_: Unit, before: List<Source>|
-    fold(variants, (), |_: Unit, after: List<Source>| {
-      assert(primed_as_fresh(before, after, []));
-      // Across a package line, where a reference reads as the other package's contract.
-      assert(primed_as_fresh(before, after, [1, 0]))
-    }));
-  // Priors of a program whose names all moved stand for nothing in this one.
-  let renamed = map(primed_base(), |s: Source|
-    { name: s.name, src: replace(s.src, b"one", b"uno") });
-  assert(primed_as_fresh(renamed, primed_base(), []))
-}
-
-test "a run of an unchanged program takes every node from its priors" {
-  let index = indexed(primed_base());
-  let priors = hash_index_pinned(index, []).priors;
-  let first = first_pass(index);
-  let g = graph_with(index, first, map_new());
-  let sketches = map(range(0, len(index.nodes)), |v: Int| sketched(index, first, [], map_new(), v));
-  assert_eq(map_len(standing_priors(index, g, map_new(), sketches, priors)), len(index.nodes));
-  assert_eq(len(priors), len(index.nodes))
-}
-
 /// Two modules with tests and laws, one reading the other.
 fn itemized() -> List<Source> =
   [
@@ -6187,31 +5606,6 @@ fn itemized() -> List<Source> =
       src: b"import base\npub fn two() -> Int = base::one() + 1\ntest \"two\" { assert(two() == 2) }\nlaw \"two is two\" forall x: Int { two() + x == x + 2 }\n",
     },
   ]
-
-test "hashing takes a standing module's tests and laws as an earlier run fixed them, and answers as a run from nothing" {
-  let index = indexed(itemized());
-  let fresh = hashed_and_unused(index, [], []);
-  let keep = map_insert(map_insert(map_new(), b"base", true), b"app", true);
-  let items = fixed_items(index, fresh.hashes, keep);
-  assert_eq(len(items.tests), len(index.tests));
-  assert_eq(len(items.laws), len(index.laws));
-  let held = hashed_and_unused(index, [], [], [], items.tests, items.laws);
-  assert_eq([held.hashes.held_tests, held.hashes.held_laws], [len(items.tests), len(items.laws)]);
-  assert_eq({ ..held.hashes, held_tests: 0, held_laws: 0 }, fresh.hashes);
-  assert_eq(held.unused, fresh.unused);
-  assert(len(fresh.unused) > 0, Some("the fixture holds a definition nothing uses"));
-  // What is held is what is answered: a test held under another hash answers that one, unencoded.
-  let marked = map(items.tests, |t: FixedTest| { ..t, hash: bytes_concat(b"held:", t.hash) });
-  let taken = hashed_and_unused(index, [], [], [], marked, items.laws);
-  assert_eq(taken.hashes.tests, map(fresh.hashes.tests, |h: Bytes| bytes_concat(b"held:", h)));
-  // A held item one of whose references names no node here is encoded afresh.
-  let dangling = map(items.laws, |l: FixedLaw|
-    { ..l, hash: b"stale", refs: push(l.refs, { name: b"gone.away", decl: false }) });
-  assert_eq(
-    hashed_and_unused(index, [], [], [], items.tests, dangling).hashes.laws,
-    fresh.hashes.laws,
-  )
-}
 
 test "hashing reads a fixed definition's contract and references as its run fixed them, and answers as reading them again" {
   let index = indexed(itemized());
@@ -6231,7 +5625,10 @@ test "hashing reads a fixed definition's contract and references as its run fixe
       index,
       first_pass(index),
       fixed,
-      concat(held.hashes.test_roots, held.hashes.law_roots),
+      concat(
+        map(index.tests, |t: TestNode| test_roots_of(index, t)),
+        map(index.laws, |l: LawNode| law_roots_of(index, l)),
+      ),
     ),
   );
   // What is fixed is what is answered: a contract fixed as another answers that one, unencoded.
@@ -6244,63 +5641,6 @@ test "hashing reads a fixed definition's contract and references as its run fixe
     map(filter(fresh.hashes.contracts, base), |c: { name: Bytes, hash: Bytes }|
       { ..c, hash: bytes_concat(b"fixed:", c.hash) }),
   )
-}
-
-/// An effect `gz` beside a function `gz`, a test that raises through the effect, a test keyed
-/// `gz.gz` that calls the function, and a law over the reader.
-fn namesake_items() -> List<Source> =
-  [
-    {
-      name: b"gz",
-      src: b"pub effect gz { raise refused(at: Int) }\nfn written(x: Int) -> Int = x * 31 + 7\npub fn gz(x: Int) -> Int = written(x)\npub fn read(x: Int) -> Int / {gz.refused} = if x < 0 { gz.refused(x) } else { x + 1 }\nfn unused_here() -> Int = 9\ntest \"reads\" { assert(match try[gz.refused] { read(1) } { Ok(n) -> n == 2, Err(_) -> false }) }\ntest \"gz\" { assert(gz(1) == 38) }\nlaw \"read is one more\" forall (x: Int) where x >= 0 { match try[gz.refused] { read(x) } { Ok(n) -> n == x + 1, Err(_) -> false } }\n",
-    },
-  ]
-
-test "a held test or law reaches what a fresh one does: an effect it names apart from the function of that name" {
-  let index = indexed(namesake_items());
-  let fresh = hashed_and_unused(index, [], []);
-  let items = fixed_items(index, fresh.hashes, map_insert(map_new(), b"gz", true));
-  // What is filed names each reference with its kind, so the effect and the function stay apart.
-  let kinds = |refs: List<NodeRef>|
-    sort_bytes(
-      map(refs, |r: NodeRef| bytes_concat(if r.decl { b"decl " } else { b"fn " }, r.name)),
-    );
-  assert_eq(map(items.tests, |t: FixedTest| kinds(t.refs)), [
-    [b"decl gz.gz", b"fn gz.read"],
-    [b"fn gz.gz"],
-  ]);
-  let held = hashed_and_unused(index, [], [], [], items.tests, items.laws);
-  assert_eq([held.hashes.held_tests, held.hashes.held_laws], [2, 1]);
-  assert_eq({ ..held.hashes, held_tests: 0, held_laws: 0 }, fresh.hashes);
-  assert_eq(held.unused, fresh.unused);
-  assert_eq(map(held.unused, |d: Diag| d.message), [b"fn `gz.unused_here` is never used"]);
-  let names = |r: Reach| { fns: map_keys(r.fns), decls: map_keys(r.decls) };
-  fold([fresh.hashes, held.hashes], (), |_: Unit, h: HashOutput| {
-    assert_eq(names(reach(h, [TheItem(b"gz.reads")])), { fns: [b"gz.read"], decls: [b"gz.gz"] });
-    assert_eq(names(reach(h, [TheItem(b"gz.gz")])), { fns: [b"gz.gz", b"gz.written"], decls: [] });
-    assert_eq(names(reach(h, [TheItem(b"gz.read is one more")])), {
-      fns: [b"gz.read"],
-      decls: [b"gz.gz"],
-    });
-    assert_eq(naming(h, TheDecl(b"gz.gz"), false).items, [b"gz.read is one more", b"gz.reads"]);
-    assert_eq(naming(h, TheFn(b"gz.gz"), false).items, [b"gz.gz"])
-  })
-}
-
-// A reference by name says a declaration and not which: a type and an effect of one name are two.
-test "a test that names a type or an effect another declaration shares the name of is encoded afresh, and answers as a fresh one does" {
-  let index = indexed([
-    {
-      name: b"m",
-      src: b"pub type Box = | Box(Int)\npub effect Box { read held() -> Int }\nfn opened(b: Box) -> Int = match b { Box(n) -> n }\nfn read() -> Int / {Box.read} = Box.held()\npub fn one() -> Int = 1\ntest \"typed\" { assert(opened(Box(1)) == 1) }\ntest \"performed\" { assert(handle { read() } with { Box.held() -> 2 } == 2) }\ntest \"plain\" { assert(one() == 1) }\n",
-    },
-  ]);
-  let fresh = hashed_and_unused(index, [], []);
-  let items = fixed_items(index, fresh.hashes, map_insert(map_new(), b"m", true));
-  let held = hashed_and_unused(index, [], [], [], items.tests, items.laws);
-  assert_eq(held.hashes.held_tests, 1);
-  assert_eq({ ..held.hashes, held_tests: 0, held_laws: 0 }, fresh.hashes);
-  assert_eq(held.unused, fresh.unused)
 }
 
 test "renaming a definition does not move its hash, and a change to a callee does" {

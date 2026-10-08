@@ -53,8 +53,9 @@ cargo nextest run --workspace
 ```
 
 `ply` is a Rust runtime with the shipped modules, the builder and the `ply` program
-appended to it: `cargo pack BINARY` appends the checkout's, so an edit to Ply sources
-needs only that step, and a binary that carries no pack refuses to start.
+appended to it: `cargo pack BINARY` appends the checkout's, then runs BINARY to answer the
+shipped modules and appends those answers too, so an edit to Ply sources needs only that
+step, and a binary that carries no pack refuses to start.
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.

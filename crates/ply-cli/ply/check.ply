@@ -3,6 +3,7 @@
 //! `--explain` says where the time went and where each row came from, and `--costs` says where an
 //! update copies.
 
+import compiler.memo (Tally)
 import compiler.unit (shipped)
 import std.random (entropy)
 import builder (builder)
@@ -10,8 +11,8 @@ import args (Flags, style_of, no_flags, root_of)
 import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import literals (literal, unsettled)
 import diagnostic (Place, all_to_json)
-import program (Program, Timed, load_diagnostics, ModuleFacts, timed_over, module_facts, published,
-                in_shipped_module, own_tests, placed_of, location_of)
+import program (Program, Timed, ModuleFacts, timed_over, module_facts, published, in_shipped_module,
+                own_tests, placed_of, location_of)
 import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
@@ -30,7 +31,7 @@ import compiler.termination (Ends, Stated, Diverges, Site)
 import compiler.front (Analysis, effect_sets_of, schema_definitions)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
                        Unguarded, Calls)
-import compiler.resolve (Diag)
+import compiler.resolve (Diag, Label)
 import compiler.types (Atom, Type, printer_new, print_atom_list, scheme_text, row_text, type_text,
                        atom_text)
 import compiler.type_syntax (Mode, MRead, MWrite, MBad, MRaise, is_raise)
@@ -38,7 +39,7 @@ import std.fs (fs)
 import std.json (Json, Member, Str, Bool, Number, Array, Object, Null, object, parse_string,
                  to_string, int)
 import std.time (time)
-import std.list (at_or, concat)
+import std.list (at, at_or, concat)
 import std.string (join, pad_right, repeat, pad_left)
 import defs (scheme_of)
 import proof.obligation (plural)
@@ -133,24 +134,8 @@ fn phases_json(timed: Timed) -> Json =
   ])
 
 // --- Where the answer came from ---------------------------------------------------
-// A definition whose hash has not moved since the cache filed it is taken from its filed rows, and
-// every other one is checked.
-
-// A test of a module whose stub stands is taken as its hashing fixed it, and every other one is
-// hashed.
-
-type Seeding = { seeded: Int, checked: Int, held: Int, hashed: Int }
-
-fn seeding_of(analysis: Analysis) -> Seeding = {
-  let seeded = len(analysis.checked.seeded);
-  let held = analysis.hashes.held_tests;
-  {
-    seeded: seeded,
-    checked: len(analysis.checked.defs) - seeded,
-    held: held,
-    hashed: len(analysis.hashes.tests) - held,
-  }
-}
+// Each query a load asked answers from its record where every read the record made answers the
+// same, and runs again where one does not.
 
 fn count_line(label: String, n: Int, noun: String = "definition") -> String / {abort.raise} =
   under() ++ pad_right(label, 11, " ") ++ " " ++ pad_left(int_to_string(n), 8, " ") ++ " "
@@ -159,26 +144,23 @@ fn count_line(label: String, n: Int, noun: String = "definition") -> String / {a
 // A module whose text an earlier load read is taken as that load found what it imports, and every
 // other one is lexed for it.
 
-fn seeding_lines(
+fn tally_lines(
   style: Style,
-  analysis: Analysis,
+  program: Program,
   pulls: Option<PullReads>,
-) -> List<String> / {abort.raise} = {
-  let x = seeding_of(analysis);
+) -> List<String> / {abort.raise} =
   concat(
-    [
-      "",
-      indent() ++ bold(style, "front-end cache"),
-      count_line("seeded", x.seeded),
-      count_line("checked", x.checked),
-      count_line("held", x.held, "test"),
-      count_line("hashed", x.hashed, "test"),
-      count_line("stubbed", len(analysis.stubs), "module"),
-      count_line("restored", len(analysis.restored), "module"),
-    ],
+    concat(
+      ["", indent() ++ bold(style, "memo")],
+      map(program.tallies, |t: Tally|
+        under() ++ pad_right(string_of_bytes_lossy(t.query), 11, " ") ++ " "
+          ++ pad_left(int_to_string(t.took), 8, " ")
+          ++ " taken "
+          ++ pad_left(int_to_string(t.ran), 8, " ")
+          ++ " run"),
+    ),
     match pulls { Some(p) -> [count_line("lexed", p.lexed, "module")], None -> [] },
   )
-}
 
 fn pulls_json(pulls: Option<PullReads>) -> Json =
   match pulls {
@@ -207,15 +189,15 @@ fn cost_json(pass: Option<Costing>) -> Json =
       object([{ key: "walked", value: int(c.walked) }, { key: "lowered", value: int(c.lowered) }]),
   }
 
-fn seeding_json(analysis: Analysis) -> Json = {
-  let x = seeding_of(analysis);
-  object([
-    { key: "seeded", value: int(x.seeded) },
-    { key: "checked", value: int(x.checked) },
-    { key: "tests_held", value: int(x.held) },
-    { key: "tests_hashed", value: int(x.hashed) },
-  ])
-}
+fn tallies_json(program: Program) -> Json =
+  Array(
+    map(program.tallies, |t: Tally|
+      object([
+        { key: "query", value: Str(string_of_bytes_lossy(t.query)) },
+        { key: "taken", value: int(t.took) },
+        { key: "run", value: int(t.ran) },
+      ])),
+  )
 
 // --- `--types` ---------------------------------------------------------------------
 
@@ -624,13 +606,8 @@ fn document(
       key: "front_end",
       value: object([
         { key: "phases", value: phases_json(timed) },
-        { key: "definitions", value: seeding_json(analysis) },
+        { key: "queries", value: tallies_json(timed.program) },
         { key: "pulls", value: pulls_json(timed.pulls) },
-        { key: "stubbed", value: Array(json_strings(map(analysis.stubs, string_of_bytes_lossy))) },
-        {
-          key: "restored",
-          value: Array(json_strings(map(analysis.restored, string_of_bytes_lossy))),
-        },
       ]),
     },
     { key: "cost_pass", value: cost_json(pass) },
@@ -674,7 +651,10 @@ fn answered(
   let head = concat([summary(style, analysis, defs, tests)], warning_lines(style, warnings));
   let explained = if flags.explain {
     concat(
-      concat(concat(head, phase_lines(style, timed)), seeding_lines(style, analysis, timed.pulls)),
+      concat(
+        concat(head, phase_lines(style, timed)),
+        tally_lines(style, timed.program, timed.pulls),
+      ),
       cost_lines(style, pass),
     )
   } else { head };
@@ -716,7 +696,7 @@ fn checked(
       timed,
       analysis,
       pass,
-      filter(load_diagnostics(timed.program), |diag: Diag| !in_shipped_module(timed.program, diag)),
+      filter(timed.program.diags, |diag: Diag| !in_shipped_module(timed.program, diag)),
     )
   }
 }
@@ -839,27 +819,21 @@ fn checked_now(
   flags: Flags,
   project: Project,
   started: Int,
-) -> { answer: Answer, filed: Option<Answer> } / {fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
-  let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps, true);
+) -> { answer: Answer, filed: Option<Answer> } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
+  let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
   match t.program.whole {
     None ->
-      {
-        answer: refused(style_of(flags), "check", load_diagnostics(t.program), t.program.places),
-        filed: None,
-      },
+      { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
     Some(w) -> {
       let answer = checked(style_of(flags), flags, t, w);
-      let own = if len(t.program.cache_warnings) == 0 { answer } else {
-        checked(style_of(flags), flags, { ..t, program: { ..t.program, cache_warnings: [] } }, w)
-      };
-      { answer: answer, filed: Some(own) }
+      { answer: answer, filed: Some(answer) }
     },
   }
 }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, env.binary_version[sys], env.shipped_digest[sys], env.reused[sys], fs.set_modified[abs], fs.create_dir[abs], fs.write_file[abs], fs.rename[abs], fs.remove[abs], abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   // `--explain` says what this run's own phases took, which no filed answer knows.
@@ -942,14 +916,13 @@ test "the longest phase is printed first, and the total accounts for all three" 
       files: [],
       places: [],
       diags: [],
-      cache_warnings: [],
       whole: None,
       pkgs: { root: b"", manifest: None, supplied: [] },
-      through: [],
       embeds: [],
       shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
       reached: true,
       viewed: [],
+      tallies: [],
     },
     read_ms: 2,
     front_ms: 90,

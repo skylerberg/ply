@@ -76,10 +76,10 @@ fn stage() -> PathBuf {
     stage::stage_dir(&format!("builder-{}", identity()))
 }
 
-/// Where the rows builds of `program` published are kept. The builder names each file for the front
-/// end that published it, since another's rows seed nothing.
-fn rows(program: &str) -> PathBuf {
-    stage::stage_dir(sweep::ROWS).join(program)
+/// What builds of `program` name the stages they keep what its modules answered in by: the builder
+/// adds the identity of the queries that answered, so each set of them is a stage of its own.
+fn memo(program: &str) -> PathBuf {
+    stage::stage_dir(&format!("memo-{program}"))
 }
 
 /// The builder main last refreshed, and the digest of the shipped modules and runtime it was built
@@ -191,27 +191,27 @@ pub fn builder() -> Result<Runnable, Diagnostic> {
     })
 }
 
-/// `root` below `src` built by the committed builder into `out`, seeded with the rows its last
-/// build of `rows_of` kept and keeping the emitter's answers.
+/// `root` below `src` built by the committed builder into `out`, through the memo store builds of
+/// `program` keep and keeping the emitter's answers.
 fn build_by_committed(
     src: &Path,
     root: &str,
     entry: &str,
     out: &Path,
-    rows_of: &str,
+    program: &str,
 ) -> Result<(), Diagnostic> {
     let committed = committed()?;
-    // A builder that files what it keeps under its own definitions keeps and seeds as it does
-    // anywhere; one from before that would file under these shipped modules', so it keeps nothing.
+    // A builder that files what it keeps under its own definitions keeps as it does anywhere; one
+    // from before that would file under these shipped modules', so it keeps nothing.
     let own = declared(&committed.front.answer).contains("definitions");
-    let seeds = rows(rows_of);
+    let kept = memo(program);
     build_with(
         committed,
         src,
         root,
         entry,
         out,
-        own.then_some(seeds.as_path()),
+        own.then_some(kept.as_path()),
         own,
         Asked::Ship,
     )
@@ -225,11 +225,11 @@ pub fn build(
     root: &str,
     entry: &str,
     out: &Path,
-    rows_of: &str,
+    program: &str,
 ) -> Result<(), Diagnostic> {
     let started = std::time::Instant::now();
     let fresh = out.with_extension(format!("run.{}", aside()));
-    build_by_committed(src, root, entry, &fresh, rows_of)?;
+    build_by_committed(src, root, entry, &fresh, program)?;
     let built = started.elapsed();
     landed(&fresh, out)?;
     if std::env::var_os("PLY_C_PHASES").is_some() {
@@ -249,7 +249,7 @@ pub fn build_by_own(
     root: &str,
     entry: &str,
     out: &Path,
-    rows_of: &str,
+    program: &str,
 ) -> Result<(), Diagnostic> {
     let fresh = out.with_extension(format!("run.{}", aside()));
     build_with(
@@ -258,7 +258,7 @@ pub fn build_by_own(
         root,
         entry,
         &fresh,
-        Some(&rows(rows_of)),
+        Some(&memo(program)),
         true,
         Asked::Ship,
     )?;
@@ -421,7 +421,7 @@ fn build_with(
     root: &str,
     entry: &str,
     out: &Path,
-    rows: Option<&Path>,
+    memo: Option<&Path>,
     kept: bool,
     asked: Asked,
 ) -> Result<(), Diagnostic> {
@@ -441,8 +441,8 @@ fn build_with(
         root.to_string(),
         entry.to_string(),
         below(out)?,
-        match rows {
-            Some(rows) => below(rows)?,
+        match memo {
+            Some(memo) => below(memo)?,
             None => String::new(),
         },
         if kept { "kept" } else { "fresh" }.to_string(),

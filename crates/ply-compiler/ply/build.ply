@@ -7,15 +7,14 @@
 //! enters. Asked for the answer rather than a program to ship, it writes whatever the front end
 //! answered, a refusal included, and whatever unit the emitter made of it.
 
-import load (Checked, SourceFile, Unloaded, checked_of, every_root, hash_in, prepared,
-             read_prepared)
-import front (BakedRow, Refused, Rows, dump_of, no_rows, rows_bin, shipped_dump)
-import hash (Prior, TheFn, prior_bin, reach)
-import interface (KeptModules, kept_modules_bin, standing_hash)
+import load (Checked, SourceFile, Unloaded, answers_of, assembled, entry_hash_of, every_root,
+             prepared)
+import front (BakedRow, Refused, dump_of, shipped_dump)
+import hash (TheFn, reach)
 import resolve (Diag, Label)
 import unit (Baked, Runtime, shipped, baked_key, const_budget, const_room, emitted,
-             emitter_identity, held, identity_of, keep_value, kept_value, program_key,
-             programs_kept, read_kept, stored_root, write_kept)
+             emitter_identity, held, keep_value, kept_value, program_key, programs_kept, read_kept,
+             stored_root, write_kept)
 import std.bin
 import std.fs (fs)
 import std.list (at, concat)
@@ -24,56 +23,7 @@ import std.random (entropy)
 import std.time (time)
 
 fn usage() -> String =
-  "the builder takes ROOT ENTRY OUT ROWS KEPT PHASES [answer]: the program below the `src` root, the definition it enters, where its runnable and the rows that seed its next build go below `out` (no rows: an empty ROWS), `kept` to keep the emitter's answers below `bodies` (else `fresh`), `phases` to say what each step took (else `quiet`), and `answer` to write what the front end and the emitter made of a program that does not check or compile rather than refuse it"
-
-/// The definition a build's rows are a function of besides the program: the one that checks it.
-fn front_roots() -> List<Bytes> = [b"load.checked"]
-
-/// Where a build's rows go: under ROWS, by the front end that published them, since another's seed
-/// nothing.
-fn rows_at(rows: String, definitions: Bytes) -> String / {abort.raise} =
-  if rows == "" { "" } else {
-    rows ++ "-" ++ string_of_bytes(bytes_slice(identity_of(definitions, front_roots()), 0, 16))
-  }
-
-/// The rows a last build of the program kept, or none when there are none to read.
-fn kept_rows(path: String) -> Rows / {fs.read[out], abort.raise} =
-  if path == "" { no_rows() } else {
-    match fs.read_file[out](path) {
-      None -> no_rows(),
-      Some(bytes) -> match bin::decode(bytes, rows_bin()) { Ok(rows) -> rows, Err(_) -> no_rows() },
-    }
-  }
-
-/// Where a build keeps what it hashed, beside its rows: a later build of the program takes a node's
-/// hashing from it wherever the node and all it reaches stand as they were.
-fn priors_path(rows: String) -> String = rows ++ ".priors"
-
-fn kept_priors(rows: String) -> List<Prior> / {fs.read[out], abort.raise} =
-  if rows == "" { [] } else {
-    match fs.read_file[out](priors_path(rows)) {
-      None -> [],
-      Some(bytes) -> match bin::decode(bytes, bin::list_bin(prior_bin())) {
-        Ok(priors) -> priors,
-        Err(_) -> [],
-      },
-    }
-  }
-
-/// Where a build keeps how each module was cut and what its hashing fixed, beside its rows: a later
-/// build reads a module through them where its text, and the text of all it reaches, stands.
-fn modules_path(rows: String) -> String = rows ++ ".modules"
-
-fn kept_modules(rows: String) -> Option<KeptModules> / {fs.read[out], abort.raise} =
-  if rows == "" { None } else {
-    match fs.read_file[out](modules_path(rows)) {
-      None -> None,
-      Some(bytes) -> match bin::decode(bytes, kept_modules_bin()) {
-        Ok(kept) -> Some(kept),
-        Err(_) -> None,
-      },
-    }
-  }
+  "the builder takes ROOT ENTRY OUT MEMO KEPT PHASES [answer]: the program below the `src` root, the definition it enters, where its runnable and what its modules answered go below `out` (nothing kept: an empty MEMO), `kept` to keep the emitter's answers below `bodies` (else `fresh`), `phases` to say what each step took (else `quiet`), and `answer` to write what the front end and the emitter made of a program that does not check or compile rather than refuse it"
 
 /// The line and column of byte `at` of `text`, from one.
 fn line_col(text: Bytes, at: Int) -> String / {abort.raise} = {
@@ -126,150 +76,103 @@ fn refusal(
   }
 
 /// The program below `root` built into `out`: 0 when it was written, 1 when the program was refused,
-/// and 2 when what was built could not be written. `answering` writes a refusal too, with no unit,
-/// and whatever unit the emitter made, whatever it refused.
+/// and 2 when what was built could not be written. `memo` is where what its modules answered is kept
+/// between builds (none where it is empty). `answering` writes a refusal too, with no unit, and
+/// whatever unit the emitter made, whatever it refused.
 pub fn built(
   root: String,
   entry: String,
   out: String,
-  rows: String,
+  memo: String,
   kept: Bool,
   phases: Bool,
   answering: Bool,
-) -> Int / {fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+) -> Int / {shipped.answer, fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let started = time.elapsed_ms();
   let definitions = shipped.definitions();
-  let rows = rows_at(rows, definitions);
-  let priors = kept_priors(rows);
-  let seed = kept_rows(rows);
-  // An answer is of the whole text it was asked over, tests and laws among it; a program to ship
-  // holds neither, and reads what did not move through what its last build kept.
-  let taking = if answering { prepared[src](root) }
-  else { prepared[src](root, kept_modules(rows), seed.defs) };
-  // A program whose entry's module stands as the last build kept it hashes as it did then, so the
-  // runnable kept under that hash is the program, with nothing of it read.
-  let standing = match taking {
-    Err(_) -> None,
-    Ok(p) -> if answering { None } else {
-      match standing_hash(p.through, bytes_of_string(entry)) {
-        Some(h) -> read_kept[out](programs_kept(), program_key(h, shipped.runtime(), definitions)),
-        None -> None,
-      }
-    },
-  };
-  match standing {
-    Some(bytes) -> {
-      let wrote = written(out, bytes);
-      if phases {
-        process.err[proc](
-          "phases: " ++ entry ++ " stands as its last build kept it, and enters what that built: "
-            ++ ms(started, time.elapsed_ms()),
-        )
-      };
-      wrote
-    },
-    None -> match match taking { Err(u) -> Err(u), Ok(p) -> read_prepared(p, priors, answering) } {
-      Err(u) -> refusal(answering, entry, out, u),
-      Ok(r) -> {
-        let reading = time.elapsed_ms();
-        // An answer is of the text it was asked over, so only a program to ship is taken as built.
-        let key = if answering { None } else {
-          match hash_in(r, bytes_of_string(entry)) {
-            Some(h) -> Some(program_key(h, shipped.runtime(), definitions)),
-            None -> None,
-          }
-        };
-        let standing = match key { Some(k) -> read_kept[out](programs_kept(), k), None -> None };
-        match standing {
-          Some(bytes) -> {
-            if rows != "" {
-              fs.write_file[out](
-                priors_path(rows),
-                bin::encode(r.priors, bin::list_bin(prior_bin())),
-              );
-              ()
-            };
-            let wrote = written(out, bytes);
-            if phases {
-              process.err[proc](
-                "phases: " ++ entry ++ " read " ++ ms(started, reading)
-                  ++ ", and enters what a program already built does: written "
-                  ++ ms(reading, time.elapsed_ms()),
-              )
-            };
-            wrote
-          },
-          None -> match checked_of(r, seed) {
-            Err(u) -> refusal(answering, entry, out, u),
-            Ok(c) -> {
-              let checking = time.elapsed_ms();
-              if rows != "" {
-                fs.write_file[out](rows, bin::encode(c.rows, rows_bin()));
-                fs.write_file[out](modules_path(rows), bin::encode(c.kept, kept_modules_bin()));
-                fs.write_file[out](
-                  priors_path(rows),
-                  bin::encode(c.priors, bin::list_bin(prior_bin())),
-                );
-                ()
-              };
-              let keeping = time.elapsed_ms();
-              let offered = every_root(c.front);
-              let emitter = if kept { emitter_identity(definitions) } else { b"" };
-              let values = if answering { [] } else { constants(c, offered, kept, emitter) };
-              let valuing = time.elapsed_ms();
-              let emission = emitted(
-                shipped.runtime(),
-                c.front.dump,
-                texts(c.front.files),
-                offered,
-                emitter,
-                |key: Bytes| answer_kept(kept, key),
-                |key: Bytes, bytes: Bytes| keep_answer(kept, key, bytes),
-                values,
-              );
-              let emitting = time.elapsed_ms();
-              let unit = match emission {
-                Ok(e) -> if answering { Ok(e.produced.text) }
-                else { held(c.front.dump, offered, emission) },
-                Err(_) -> held(c.front.dump, offered, emission),
-              };
-              match unit {
-                Err(diags) -> {
-                  told(diags, c.front.files);
-                  1
-                },
-                Ok(unit) -> {
-                  let dump = if answering { c.front.dump } else { shipped_dump(c.front.dump) };
-                  let bytes = shipped.runnable(entry, c.front.files, dump, unit);
-                  let encoding = time.elapsed_ms();
-                  let wrote = written(out, bytes);
-                  match key {
-                    Some(k) -> if wrote == 0 { write_kept[out](programs_kept(), k, bytes) },
-                    None -> (),
-                  };
-                  if phases {
-                    process.err[proc](
-                      "phases: " ++ entry ++ " read " ++ ms(started, reading) ++ ", checked "
-                        ++ ms(reading, checking)
-                        ++ ", rows kept "
-                        ++ ms(checking, keeping)
-                        ++ ", constants held "
-                        ++ ms(keeping, valuing)
-                        ++ ", emitted "
-                        ++ ms(valuing, emitting)
-                        ++ ", encoded "
-                        ++ ms(emitting, encoding)
-                        ++ ", written "
-                        ++ ms(encoding, time.elapsed_ms()),
-                    )
-                  };
-                  wrote
-                },
-              }
-            },
-          },
+  match prepared[src](root) {
+    Err(u) -> refusal(answering, entry, out, u),
+    Ok(p) -> {
+      // A program is the definition it enters and all that reaches, so the runnable kept under its
+      // entry's hash is the program; an answer is of the whole text it was asked over.
+      let key = if answering { None } else {
+        match entry_hash_of[out](p, memo, bytes_of_string(entry)) {
+          Some(h) -> Some(program_key(h, shipped.runtime(), definitions)),
+          None -> None,
         }
-      },
+      };
+      let reading = time.elapsed_ms();
+      match match key { Some(k) -> read_kept[out](programs_kept(), k), None -> None } {
+        Some(bytes) -> {
+          let wrote = written(out, bytes);
+          if phases {
+            process.err[proc](
+              "phases: " ++ entry ++ " answered " ++ ms(started, reading)
+                ++ ", and enters what a program already built does: written "
+                ++ ms(reading, time.elapsed_ms()),
+            )
+          };
+          wrote
+        },
+        None -> match assembled(p, answers_of[out](p, memo), answering) {
+          Err(u) -> refusal(answering, entry, out, u),
+          Ok(c) -> {
+            let front = c.front;
+            let checking = time.elapsed_ms();
+            let offered = every_root(front);
+            let emitter = if kept { emitter_identity(definitions) } else { b"" };
+            let values = if answering { [] } else { constants(c, offered, kept, emitter) };
+            let valuing = time.elapsed_ms();
+            let emission = emitted(
+              shipped.runtime(),
+              front.dump,
+              texts(front.files),
+              offered,
+              emitter,
+              |key: Bytes| answer_kept(kept, key),
+              |key: Bytes, bytes: Bytes| keep_answer(kept, key, bytes),
+              values,
+            );
+            let emitting = time.elapsed_ms();
+            let unit = match emission {
+              Ok(e) -> if answering { Ok(e.produced.text) }
+              else { held(front.dump, offered, emission) },
+              Err(_) -> held(front.dump, offered, emission),
+            };
+            match unit {
+              Err(diags) -> {
+                told(diags, front.files);
+                1
+              },
+              Ok(unit) -> {
+                let dump = if answering { front.dump } else { shipped_dump(front.dump) };
+                let bytes = shipped.runnable(entry, front.files, dump, unit);
+                let encoding = time.elapsed_ms();
+                let wrote = written(out, bytes);
+                match key {
+                  Some(k) -> if wrote == 0 { write_kept[out](programs_kept(), k, bytes) },
+                  None -> (),
+                };
+                if phases {
+                  process.err[proc](
+                    "phases: " ++ entry ++ " answered " ++ ms(started, reading) ++ ", checked "
+                      ++ ms(reading, checking)
+                      ++ ", constants held "
+                      ++ ms(checking, valuing)
+                      ++ ", emitted "
+                      ++ ms(valuing, emitting)
+                      ++ ", encoded "
+                      ++ ms(emitting, encoding)
+                      ++ ", written "
+                      ++ ms(encoding, time.elapsed_ms()),
+                  )
+                };
+                wrote
+              },
+            }
+          },
+        },
+      }
     },
   }
 }
@@ -363,12 +266,12 @@ fn written(out: String, bytes: Bytes) -> Int / {fs.write[out], process.err[proc]
     2
   }
 
-pub fn main() -> Unit / {process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, abort.raise} =
+pub fn main() -> Unit / {shipped.answer, process.args[proc], process.err[proc], process.exit[proc], fs.list_dir[src], fs.kind[src], fs.read_file[src], fs.read[out], fs.write[out], fs.read[bodies], fs.write[bodies], shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.runnable, shipped.values, entropy.next, time.now_ms, time.elapsed_ms, abort.raise} =
   match process.args[proc]() {
-    [root, entry, out, rows, kept, phases] ->
-      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases", false)),
-    [root, entry, out, rows, kept, phases, "answer"] ->
-      process.exit[proc](built(root, entry, out, rows, kept == "kept", phases == "phases", true)),
+    [root, entry, out, memo, kept, phases] ->
+      process.exit[proc](built(root, entry, out, memo, kept == "kept", phases == "phases", false)),
+    [root, entry, out, memo, kept, phases, "answer"] ->
+      process.exit[proc](built(root, entry, out, memo, kept == "kept", phases == "phases", true)),
     _ -> {
       process.err[proc](usage());
       process.exit[proc](2)

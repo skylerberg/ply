@@ -7,7 +7,8 @@ import std.fs (fs, mem_empty)
 import std.random (entropy)
 import std.time (time)
 import std.bytes (bytes_of_hex, hex_of)
-import compiler.front (DefInterface, body_encoding, body_key, def_interface_bin)
+import compiler.front (DefInterface, FiledBody, FiledDef, body_encoding, body_key,
+                       def_interface_bin)
 import compiler.resolve (Diag)
 import loads
 import paths
@@ -52,8 +53,8 @@ pub fn open_store(
   stamps: tables::Stamps,
 ) -> OpenStore / {fs.read[cwd], fs.read[abs], abort.raise} = {
   let place = loads::place_of(paths, stamps);
-  let c = if place.label == "cwd" { tables::open_cache[cwd](place.dir, place.root, [], stamps) }
-  else { tables::open_cache[abs](place.dir, place.root, [], stamps) };
+  let c = if place.label == "cwd" { tables::open_cache[cwd](place.dir, stamps) }
+  else { tables::open_cache[abs](place.dir, stamps) };
   {
     place: place,
     cache: match upstream {
@@ -161,6 +162,25 @@ fn interfaces_over<[r]>(
     },
   )
 
+/// What a pass ran, put under the hash and name each was filed by.
+fn kept_over<[r]>(
+  c0: tables::Cache,
+  defs: List<FiledDef>,
+  bodies: List<FiledBody>,
+) -> tables::Cache / {fs.read[r], abort.raise} =
+  fold(
+    bodies,
+    fold(defs, c0, |c: tables::Cache, d: FiledDef|
+      tables::put_def[r](
+        c,
+        d.hash,
+        string_of_bytes_lossy(d.name),
+        bin::encode(d.interface, def_interface_bin()),
+      )),
+    |c: tables::Cache, b: FiledBody|
+      tables::put_body[r](c, b.hash, { encoding: body_encoding(), bytes: b.body }),
+  )
+
 /// What a filing puts, before anything is flushed: a pass already kept on the same trace, or a
 /// sighting already kept, is not put again.
 fn noted<[r], [u]>(
@@ -206,7 +226,7 @@ fn said(cache: tables::Cache) -> List<Diag> = loads::diags_of(tables::warnings(c
 /// `ply test`'s reads and writes, over the store a run opened, each said once.
 pub fn with_ledger<a | e>(
   kept: Option<OpenStore>,
-  go: () -> a / {ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.filed | e},
+  go: () -> a / {ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
   with_cell[books](kept) { held -> {
     let read = |k: OpenStore, c: tables::Cache| cell_set(held, Some({ ..k, cache: c }));
@@ -268,6 +288,14 @@ pub fn with_ledger<a | e>(
           else { interfaces_over[abs](k.cache, asked) };
           read(k, o.cache);
           o.value
+        },
+      },
+      ledger.history(defs, bodies) -> match cell_get(held) {
+        None -> (),
+        Some(k) -> {
+          let c = if k.place.label == "cwd" { kept_over[cwd](k.cache, defs, bodies) }
+          else { kept_over[abs](k.cache, defs, bodies) };
+          cell_set(held, Some({ ..k, cache: c }))
         },
       },
       ledger.filed(f) -> match cell_get(held) {
@@ -446,7 +474,7 @@ fn a_filing() -> Filing / {abort.raise} =
     seen: [hash_hex("f")],
   }
 
-fn built() -> tables::Stamps = { frontend: "frontend", runtime: "runtime", code: "code" }
+fn built() -> tables::Stamps = { runtime: "runtime", code: "code" }
 
 /// What a later run reads back of a filing, beside a body filed before it, and what one whose
 /// runtime stamp moved reads of its code keys.
@@ -455,13 +483,13 @@ fn read_back(
 ) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<PassRecord>>, bodies: List<Option<Bytes>> } / {abort.raise} = {
   let b = solo("old f");
   on_twin(mem_empty(), || {
-    let c0 = tables::put_body[mem](tables::open_cache[mem]("cache", "", [], built()), b.hash, {
+    let c0 = tables::put_body[mem](tables::open_cache[mem]("cache", built()), b.hash, {
       encoding: body_encoding(),
       bytes: b.body,
     });
     let c1 = tables::flush_cache[mem](noted[mem, mem](c0, f));
-    let r = tables::open_cache[mem]("cache", "", [], built());
-    let moved = tables::open_cache[mem]("cache", "", [], { ..built(), runtime: "another" });
+    let r = tables::open_cache[mem]("cache", built());
+    let moved = tables::open_cache[mem]("cache", { ..built(), runtime: "another" });
     {
       passes: passes_over[mem, mem](r, [hash_hex("t key"), hash_hex("other")]).value,
       codes: code_passes_over[mem, mem](r, [hash_hex("t code"), hash_hex("t key")]).value,
@@ -497,7 +525,7 @@ test "another build's baselines are dropped with its passes, and a body under an
   let theirs = solo("f as another stored it");
   let back = on_twin(mem_empty(), || {
     let filed = tables::put_body[mem](
-      tables::put_body[mem](tables::open_cache[mem]("cache", "", [], built()), mine.hash, {
+      tables::put_body[mem](tables::open_cache[mem]("cache", built()), mine.hash, {
         encoding: body_encoding(),
         bytes: mine.body,
       }),
@@ -505,7 +533,7 @@ test "another build's baselines are dropped with its passes, and a body under an
       { encoding: body_encoding() + 1, bytes: theirs.body },
     );
     let c1 = tables::flush_cache[mem](noted[mem, mem](filed, a_filing()));
-    let moved = tables::open_cache[mem]("cache", "", [], { ..built(), runtime: "another" });
+    let moved = tables::open_cache[mem]("cache", { ..built(), runtime: "another" });
     {
       baselines: pass_records_over[mem](moved, ["m.t"]).value,
       bodies: bodies_over[mem](moved, [hex_of(mine.hash), hex_of(theirs.hash)]).value,

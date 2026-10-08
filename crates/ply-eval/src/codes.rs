@@ -110,8 +110,6 @@ pub const INTERNAL_ERROR: &str = "E0505";
 pub const CACHE_UNREADABLE: &str = "W0601";
 pub const CACHE_CORRUPT: &str = "W0602";
 pub const CACHE_VERSION_CHANGED: &str = "W0603";
-/// The stdlib shipped with this compiler differs from the one the cache was written under.
-pub const STDLIB_CHANGED: &str = "W0605";
 /// The drain deadline expired with connections still in flight.
 pub const DRAIN_INCOMPLETE: &str = "W0608";
 /// Spans still open when their task or the entry point ended, reported when the entry point ends.

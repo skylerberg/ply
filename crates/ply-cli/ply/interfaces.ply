@@ -1,344 +1,22 @@
-//! The compiled package a project's loads read their dependencies and the shipped modules through. A
-//! load reads what still stands of the package the last one kept, and where it read a module from
-//! source it cuts the package again from its own analysis, so keeping it costs no analysis of its own.
-//! A package is kept under the semantics its hashes and rows mean, so a `ply` that means the same
-//! reads the package another kept.
+//! The interface a registry published for a dependency, which `ply resolve` leaves in the
+//! dependency's slot: where it lies, and whether it re-derives from the dependency's source.
 
-import std.fs (fs, mem_empty)
 import std.bin
-import std.random (entropy)
-import std.time (time)
-import std.bytes (hex_of)
-import compiler.diagnostics (parse_all)
-import compiler.front (Analysed, Refused, Analysis, KnownDefRow, Moved, Rows, Shipping, analyse)
-import compiler.hash (Fixed, FixedTest, FixedLaw)
-import compiler.interface (CompiledPackage, CompiledModule, Envelope, Original, compile_package,
-                           valid_part, answered_part, held_moved, module_key, module_of,
-                           compiled_package_bin, envelope_of, enveloped, KeptModules, kept_modules,
-                           kept_modules_bin, standing_modules, with_embeds, unread)
-import compiler.embed (EmbedRead, EmbedReader)
+import std.fs (fs)
+import compiler.front (Analysis)
+import compiler.interface (Interface, ModuleInterface, interface_of, interface_bin, envelope_of)
 import compiler.pkg (PackageSources, closure, registry_dir)
-import compiler.resolve (Diag, Label, Edit, Fix, ParsedModule, Source, error_at, diag_bin)
-import std.list (at, concat, contains, sort_by)
-import store.engine (fresh_nonce)
-import store.twin (on_twin)
-import loads (Place)
+import compiler.resolve (Diag, Source, error_at)
 import semantics
 import sources (under_abs)
 import compiler.parsing (no_module)
 
-fn interfaces_dir(place: Place) -> String = place.dir ++ "/interfaces"
-
-/// One per project and semantics: each module's own key says whether its stub still stands.
-fn package_name() -> String = semantics::version()
-
-/// Discards every package kept for the project; false only when one is left behind.
-pub fn cleared<[r]>(place: Place) -> Bool / {fs.read[r], fs.write[r]} =
-  !fs.exists[r](interfaces_dir(place)) || fs.remove_tree[r](interfaces_dir(place))
-
-/// Every module a load may read through the package, as it stands now: each dependency's, named as
-/// the closure names it, and each shipped one.
-pub fn originals(
+/// Each module of `pkgs`' dependencies a load of `roots` reads, named as the closure names it.
+pub fn dependency_sources(
   pkgs: PackageSources,
   roots: List<Bytes>,
-  shipped_sources: List<Source>,
-) -> List<Original> / {abort.raise} = {
-  let deps = map(closure(pkgs, roots).modules, |m: { pkg: Int, src: Source }|
-    {
-      name: m.src.name,
-      src: m.src.src,
-      manifest: match list_at(pkgs.supplied, m.pkg - 1) { Some(s) -> s.manifest, None -> None },
-    });
-  fold(shipped_sources, deps, |acc: List<Original>, s: Source|
-    push(acc, { name: s.name, src: s.src, manifest: None }))
-}
-
-/// What a load reads through the package it kept: the part that stands, and the moved shipped
-/// modules a stub may still reach (`held_moved`).
-pub type Through = { packages: List<CompiledPackage>, held: Map<Bytes, Bool> }
-
-pub fn no_through() -> Through = { packages: [], held: map_new() }
-
-/// `read` is what a module embeds, as it reads now, and `shipped` every shipped module the load pulls.
-pub fn read_through<[r]>(
-  place: Place,
-  found: List<Original>,
-  read: EmbedReader,
-  shipped: Shipping,
-) -> Through / {fs.read[r], abort.raise} =
-  match fs.read_file[r](interfaces_dir(place) ++ "/" ++ package_name()) {
-    None -> no_through(),
-    Some(bytes) -> match bin::decode(bytes, compiled_package_bin()) {
-      Err(_) -> no_through(),
-      Ok(p) -> {
-        let keys = with_embeds(keys_of(found), p.modules, read);
-        let held = held_moved(p, keys, shipped.read, shipped.unread, shipped.data);
-        let standing = answered_part(
-          valid_part(p, keys, held),
-          map(shipped.read, |s: Source| s.name),
-        );
-        { packages: if len(standing.modules) == 0 { [] } else { [standing] }, held: held }
-      },
-    },
-  }
-
-/// The modules of an analysis outside its root package: what a package of it holds.
-fn packaged(analysis: Analysis) -> List<Bytes> =
-  fold(range(0, len(analysis.mods)), [], |acc: List<Bytes>, i: Int|
-    match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
-      (Some(m), Some(pkg)) -> if pkg != 0 { push(acc, m.name) } else { acc },
-      _ -> acc,
-    })
-
-pub fn refreshed<[r]>(
-  place: Place,
-  found: List<Original>,
-  analysis: Analysis,
-  through: List<CompiledPackage>,
-) -> Unit / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let held = packaged(analysis);
-  let covered = fold(through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
-    fold(p.modules, acc, |a: Map<Bytes, Bool>, compiled: CompiledModule|
-      map_insert(a, compiled.name, true)));
-  let stands = |n: Bytes| map_contains(covered, n) && !contains(analysis.restored, n);
-  if fold(held, true, |all: Bool, n: Bytes| all && stands(n)) { () } else {
-    kept[r](
-      place,
-      package_name(),
-      bin::encode(compile_package(found, analysis, held, through), compiled_package_bin()),
-    )
-  }
-}
-
-// --- The root package's own modules ------------------------------------------------------
-// A check answers for the root package's tests and warnings, so a module of it is kept cut at its
-// bodies alone, beside what the check warned of it: a stub's bodies are not there to be walked for
-// what nothing uses.
-
-/// Beside the package, under the same semantics.
-fn own_name() -> String = package_name() ++ ".own"
-
-/// `names` is each module a warning's labels and fixes count, by the index they count it under, and
-/// `forms` each module's `written_form` as it was kept.
-type OwnKept = {
-  kept: KeptModules,
-  names: List<Bytes>,
-  warned: List<Diag>,
-  forms: List<{ name: Bytes, form: Bytes }>,
-}
-
-derive bin for OwnKept
-
-/// The root package's modules a load reads as stubs, what the check that kept them warned of them,
-/// and what it kept of each module it kept that the load reads from source.
-pub type Own = {
-  through: List<CompiledPackage>,
-  names: List<Bytes>,
-  warned: List<Diag>,
-  moved: List<Moved>,
-}
-
-pub fn no_own() -> Own = { through: [], names: [], warned: [], moved: [] }
-
-/// The root package's modules as they stand now, named as a load names them.
-pub fn own_originals(pkgs: PackageSources, roots: List<Source>) -> List<Original> =
-  map(roots, |s: Source| { name: s.name, src: s.src, manifest: pkgs.manifest })
-
-fn warned_in(diag: Diag) -> Int =
-  fold(diag.labels, no_module(), |found: Int, l: Label|
-    if found == no_module() && l.primary { l.module } else { found })
-
-/// The root package's modules that still stand as the last check kept them, each read as its stub:
-/// its bodies blanks that `rows` answer for, its tests and laws as written. `found` is every module
-/// the load may read. A stub stands whatever moved of the root package it imports: the load reads it
-/// whole again where what it references there moved (`moved`).
-pub fn own_through<[r]>(
-  place: Place,
-  found: List<Original>,
-  rows: Rows,
-  read: EmbedReader,
-  held: Map<Bytes, Bool>,
-) -> Own / {fs.read[r], abort.raise} =
-  match fs.read_file[r](interfaces_dir(place) ++ "/" ++ own_name()) {
-    None -> no_own(),
-    Some(bytes) -> match bin::decode(bytes, own_kept_bin()) {
-      Err(_) -> no_own(),
-      Ok(k) -> {
-        let through = standing_modules(
-          k.kept,
-          found,
-          rows,
-          read,
-          held,
-          deferred: map(k.kept.modules, |m: CompiledModule| m.name),
-        );
-        let standing = fold(through, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
-          fold(p.modules, acc, |a: Map<Bytes, Bool>, compiled: CompiledModule|
-            map_insert(a, compiled.name, true)));
-        let forms = fold(
-          k.forms,
-          map_new(),
-          |acc: Map<Bytes, Bytes>, f: { name: Bytes, form: Bytes }| map_insert(acc, f.name, f.form),
-        );
-        let fixed = fold(k.kept.fixed, map_new(), |acc: Map<Bytes, List<Fixed>>, f: Fixed| {
-          let module = module_of(f.name);
-          map_insert(
-            acc,
-            module,
-            push(match map_get(acc, module) { Some(fs) -> fs, None -> [] }, f),
-          )
-        });
-        {
-          through: through,
-          names: k.names,
-          warned: filter(k.warned, |diag: Diag|
-            match list_at(k.names, warned_in(diag)) {
-              Some(name) -> map_contains(standing, name),
-              None -> false,
-            }),
-          // A module kept with no form is one no form of it now matches.
-          moved: fold(k.kept.modules, [], |acc: List<Moved>, m: CompiledModule|
-            if map_contains(standing, m.name) { acc } else {
-              push(acc, {
-                module: m.name,
-                form: match map_get(forms, m.name) { Some(f) -> f, None -> b"" },
-                fixed: match map_get(fixed, m.name) { Some(fs) -> fs, None -> [] },
-              })
-            }),
-        }
-      },
-    },
-  }
-
-/// `own` without what it kept of the stubs a load read whole again, `restored`: their warnings are
-/// the load's own.
-pub fn standing_own(own: Own, restored: List<Bytes>) -> Own =
-  if len(restored) == 0 { own } else {
-    {
-      ..own,
-      warned: filter(own.warned, |diag: Diag|
-        match list_at(own.names, warned_in(diag)) {
-          Some(name) -> !contains(restored, name),
-          None -> true,
-        }),
-    }
-  }
-
-/// `through` without the stubs a load read whole again, `restored`.
-pub fn through_standing(
-  through: List<CompiledPackage>,
-  restored: List<Bytes>,
-) -> List<CompiledPackage> / {abort.raise} =
-  if len(restored) == 0 { through } else {
-    map(through, |p: CompiledPackage|
-      {
-        modules: filter(p.modules, |m: CompiledModule| !contains(restored, m.name)),
-        defs: filter(p.defs, |r: KnownDefRow| !contains(restored, module_of(r.name))),
-        fixed: filter(p.fixed, |f: Fixed| !contains(restored, module_of(f.name))),
-        tests: filter(p.tests, |t: FixedTest| !contains(restored, t.module)),
-        laws: filter(p.laws, |l: FixedLaw| !contains(restored, l.module)),
-      })
-  }
-
-/// `fresh`, what a load warned of the modules it read from source, with what `own` holds of the ones
-/// it read as stubs, each placed where its module now is: in the order a load of every module from
-/// its source warns in, which is by module.
-pub fn warned_with(
-  mods: List<ParsedModule>,
-  fresh: List<Diag>,
-  own: Own,
-) -> List<Diag> / {abort.raise} =
-  if len(own.warned) == 0 { fresh } else {
-    let now = fold(range(0, len(mods)), map_new(), |acc: Map<Bytes, Int>, i: Int|
-      map_insert(acc, at(mods, i).name, i));
-    let moved = |module: Int|
-      match list_at(own.names, module) {
-        None -> no_module(),
-        Some(name) -> match map_get(now, name) { Some(i) -> i, None -> no_module() },
-      };
-    let again = map(own.warned, |diag: Diag|
-      {
-        ..diag,
-        labels: map(diag.labels, |l: Label| { ..l, module: moved(l.module) }),
-        fixes: map(diag.fixes, |fix: Fix|
-          { ..fix, edits: map(fix.edits, |e: Edit| { ..e, module: moved(e.module) }) }),
-      });
-    sort_by(concat(fresh, again), |a: Diag, b: Diag| warned_in(a) < warned_in(b))
-  }
-
-/// What the next check reads the root package's modules through, kept where this one read one from
-/// its source. `through` is every package this one read through and `warnings` all it warned.
-pub fn own_kept<[r]>(
-  place: Place,
-  found: List<Original>,
-  analysis: Analysis,
-  through: List<CompiledPackage>,
-  warnings: List<Diag>,
-  held: Map<Bytes, Bool>,
-) -> Unit / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let stubbed = fold(analysis.stubs, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
-    map_insert(acc, n, true));
-  let whole = fold(range(0, len(analysis.mods)), true, |all: Bool, i: Int|
-    all
-      && (list_at(analysis.module_packages, i) != Some(0)
-      || (match list_at(analysis.mods, i) {
-        Some(m) -> map_contains(stubbed, m.name),
-        None -> true,
-      })));
-  // A stub read only because what it reaches was held is kept again, at that module's key now.
-  if whole && map_len(held) == 0 { () } else {
-    kept[r](
-      place,
-      own_name(),
-      bin::encode(
-        {
-          kept: kept_modules(found, analysis, through, true),
-          names: map(analysis.mods, |m: ParsedModule| m.name),
-          warned: filter(warnings, |diag: Diag|
-            list_at(analysis.module_packages, warned_in(diag)) == Some(0)),
-          forms: fold(
-            range(0, len(analysis.mods)),
-            [],
-            |acc: List<{ name: Bytes, form: Bytes }>, i: Int|
-              match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
-                (Some(m), Some(0)) -> match map_get(analysis.forms, m.name) {
-                  Some(form) -> push(acc, { name: m.name, form: form }),
-                  None -> acc,
-                },
-                _ -> acc,
-              },
-          ),
-        },
-        own_kept_bin(),
-      ),
-    )
-  }
-}
-
-/// Renamed into place, so a reader finds a whole file or none; every file kept under other
-/// semantics is swept.
-fn kept<[r]>(
-  place: Place,
-  name: String,
-  bytes: Bytes,
-) -> Unit / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let root = interfaces_dir(place);
-  match fs.list_dir[r](root) {
-    None -> (),
-    Some(names) ->
-      fold(names, (), |u: Unit, n: String|
-        if n == package_name() || n == own_name() { u } else {
-          fs.remove[r](root ++ "/" ++ n);
-          u
-        }),
-  };
-  let path = root ++ "/" ++ name;
-  let temp = path ++ "." ++ hex_of(fresh_nonce()) ++ ".tmp";
-  if fs.create_dir[r](root) && fs.write_file[r](temp, bytes) {
-    fs.rename[r](temp, path);
-    ()
-  } else { () }
-}
+) -> List<Source> / {abort.raise} =
+  map(closure(pkgs, roots).modules, |m: { pkg: Int, src: Source }| m.src)
 
 // --- Published interfaces --------------------------------------------------------------
 // `ply resolve` leaves the interface a registry published for a dependency in the dependency's slot,
@@ -355,76 +33,8 @@ pub fn slots(root_key: String, roots: List<String>) -> List<String> / {abort.rai
   filter(roots, |r: String| string_starts_with(r, dir))
 }
 
-fn keys_of(found: List<Original>) -> Map<Bytes, Bytes> =
-  fold(found, map_new(), |acc: Map<Bytes, Bytes>, o: Original|
-    map_insert(acc, o.name, module_key(o)))
-
-/// A published interface as it stands against what the walk found, when it was cut under these
-/// semantics and anything of it stands.
-fn standing_of(
-  bytes: Bytes,
-  keys: Map<Bytes, Bytes>,
-  read: EmbedReader,
-  held: Map<Bytes, Bool>,
-) -> Option<CompiledPackage> / {abort.raise} =
-  match envelope_of(bytes) {
-    None -> None,
-    Some(e) -> if e.semantics != bytes_of_string(semantics::version()) { None } else {
-      match bin::decode(e.payload, compiled_package_bin()) {
-        Err(_) -> None,
-        Ok(p) -> {
-          let standing = answered_part(valid_part(p, with_embeds(keys, p.modules, read), held));
-          if len(standing.modules) == 0 { None } else { Some(standing) }
-        },
-      }
-    },
-  }
-
 pub fn slot_read(slot: String) -> Option<Bytes> / {fs.read_file[abs], abort.raise} =
   fs.read_file[abs](under_abs(slot_interface(slot)))
-
-/// What the registry dependencies' published interfaces hold that still stands.
-pub fn published(
-  slots: List<String>,
-  found: List<Original>,
-  read: EmbedReader,
-  held: Map<Bytes, Bool>,
-) -> List<CompiledPackage> / {fs.read_file[abs], abort.raise} = {
-  let keys = keys_of(found);
-  fold(slots, [], |acc: List<CompiledPackage>, slot: String|
-    match slot_read(slot) {
-      None -> acc,
-      Some(bytes) -> match standing_of(bytes, keys, read, held) {
-        Some(p) -> push(acc, p),
-        None -> acc,
-      },
-    })
-}
-
-fn without(p: CompiledPackage, held: Map<Bytes, Bool>) -> CompiledPackage / {abort.raise} = {
-  let theirs = |name: Bytes| !map_contains(held, module_of(name));
-  {
-    modules: filter(p.modules, |compiled: CompiledModule| !map_contains(held, compiled.name)),
-    defs: filter(p.defs, |r: KnownDefRow| theirs(r.name)),
-    fixed: filter(p.fixed, |f: Fixed| theirs(f.name)),
-    tests: filter(p.tests, |t: FixedTest| !map_contains(held, t.module)),
-    laws: filter(p.laws, |l: FixedLaw| !map_contains(held, l.module)),
-  }
-}
-
-/// The project's own package first; a published one adds only the modules it lacks.
-pub fn beside(
-  own: List<CompiledPackage>,
-  more: List<CompiledPackage>,
-) -> List<CompiledPackage> / {abort.raise} = {
-  let held = fold(own, map_new(), |acc: Map<Bytes, Bool>, p: CompiledPackage|
-    fold(p.modules, acc, |a: Map<Bytes, Bool>, compiled: CompiledModule|
-      map_insert(a, compiled.name, true)));
-  fold(more, own, |acc: List<CompiledPackage>, p: CompiledPackage| {
-    let rest = without(p, held);
-    if len(rest.modules) == 0 { acc } else { push(acc, rest) }
-  })
-}
 
 // --- Re-deriving a published interface -------------------------------------------------
 
@@ -456,108 +66,50 @@ fn first_some<a>(xs: List<a>, f: (a) -> Option<String>) -> Option<String> =
   fold(xs, None, |found: Option<String>, x: a| match found { Some(_) -> found, None -> f(x) })
 
 /// What `published` holds that `own`, the same modules cut from this load's analysis, does not.
-fn difference(published: CompiledPackage, own: CompiledPackage) -> Option<String> = {
+fn difference(published: Interface, own: Interface) -> Option<String> = {
   let modules = fold(
     own.modules,
     map_new(),
-    |acc: Map<Bytes, CompiledModule>, compiled: CompiledModule|
-      map_insert(acc, compiled.name, compiled),
+    |acc: Map<Bytes, ModuleInterface>, m: ModuleInterface| map_insert(acc, m.exports.module, m),
   );
-  let defs = fold(own.defs, map_new(), |acc: Map<Bytes, KnownDefRow>, r: KnownDefRow|
-    map_insert(acc, r.name, r));
-  let fixed = fold(own.fixed, map_new(), |acc: Map<Bytes, Fixed>, f: Fixed|
-    map_insert(acc, bytes_concat(if f.decl { b"t:" } else { b"v:" }, f.name), f));
-  let named = |b: Bytes| "`" ++ string_of_bytes_lossy(b) ++ "`";
-  match first_some(published.modules, |compiled: CompiledModule|
-      if map_get(modules, compiled.name) == Some(compiled) { None }
-      else { Some(named(compiled.name) ++ "'s stub") }) {
-    Some(what) -> Some(what),
-    None -> match first_some(published.defs, |r: KnownDefRow|
-        if map_get(defs, r.name) == Some(r) { None } else { Some(named(r.name) ++ "'s row") }) {
-      Some(what) -> Some(what),
-      None ->
-        first_some(published.fixed, |f: Fixed|
-          if map_get(fixed, bytes_concat(if f.decl { b"t:" } else { b"v:" }, f.name)) == Some(f) {
-            None
-          } else { Some(named(f.name) ++ "'s hash") }),
-    },
-  }
+  first_some(published.modules, |m: ModuleInterface| {
+    let named = "`" ++ string_of_bytes_lossy(m.exports.module) ++ "`";
+    match map_get(modules, m.exports.module) {
+      None -> Some(named),
+      Some(o) -> if o.exports != m.exports { Some(named ++ "'s exports") }
+      else if o.hashes != m.hashes { Some(named ++ "'s hashes") }
+      else { None },
+    }
+  })
 }
 
+/// A published interface cut under these semantics.
+fn decoded(bytes: Bytes) -> Option<Interface> / {abort.raise} =
+  match envelope_of(bytes) {
+    None -> None,
+    Some(e) -> if e.semantics != bytes_of_string(semantics::version()) { None }
+    else { match bin::decode(e.payload, interface_bin()) { Err(_) -> None, Ok(p) -> Some(p) } },
+  }
+
 /// Each published interface that stands, against what this load's own analysis cuts of the same
-/// modules. The load read every dependency from source, so `analysis` is the interface's own derivation.
+/// modules, each read from its text among `sources`. The load read every dependency from source, so
+/// `analysis` is the interface's own derivation.
 pub fn underived(
   slots: List<String>,
-  found: List<Original>,
+  sources: List<Source>,
   analysis: Analysis,
-  read: EmbedReader,
-) -> List<Diag> / {fs.read_file[abs], abort.raise} = {
-  let keys = keys_of(found);
+) -> List<Diag> / {fs.read_file[abs], abort.raise} =
   fold(slots, [], |acc: List<Diag>, slot: String|
     match slot_read(slot) {
       None -> acc,
-      Some(bytes) -> match standing_of(bytes, keys, read, map_new()) {
+      Some(bytes) -> match decoded(bytes) {
         None -> acc,
         Some(p) -> match difference(
             p,
-            compile_package(
-              found,
-              analysis,
-              map(p.modules, |compiled: CompiledModule| compiled.name),
-            ),
+            interface_of(analysis, sources, map(p.modules, |m: ModuleInterface| m.exports.module)),
           ) {
           None -> acc,
           Some(what) -> push(acc, underived_diag(slot, what)),
         },
       },
     })
-}
-
-// --- Tests ------------------------------------------------------------------
-
-fn a_build(frontend: String) -> Place =
-  {
-    label: "mem",
-    dir: "cache",
-    root: "",
-    stamps: { frontend: frontend, runtime: "runtime", code: "code" },
-  }
-
-fn lib() -> Original = { name: b"lib", src: b"pub fn one() -> Int = 1\n", manifest: None }
-
-fn a_package() -> CompiledPackage / {abort.raise} =
-  match analyse(parse_all([{ name: lib().name, src: lib().src }])) {
-    Refused(_) -> panic("the module checks"),
-    Analysed(w) -> compile_package([lib()], w, [lib().name]),
-  }
-
-test "a build reads the package another build kept when their semantics agree" {
-  let read = on_twin(mem_empty(), || {
-    kept[mem](a_build("one"), package_name(), bin::encode(a_package(), compiled_package_bin()));
-    read_through[mem](a_build("two"), [lib()], unread, {
-      read: [],
-      unread: [],
-      data: [],
-      asked: [],
-      pulls: [],
-    })
-  }).value;
-  assert_eq(read.packages, [a_package()])
-}
-
-test "a package kept under other semantics is never read, and the next one kept sweeps it" {
-  let t = on_twin(mem_empty(), || {
-    kept[mem](a_build("one"), "elsewhere", bin::encode(a_package(), compiled_package_bin()));
-    let read = read_through[mem](a_build("one"), [lib()], unread, {
-      read: [],
-      unread: [],
-      data: [],
-      asked: [],
-      pulls: [],
-    }).packages;
-    kept[mem](a_build("one"), package_name(), bin::encode(a_package(), compiled_package_bin()));
-    { read: read, left: fs.list_dir[mem]("cache/interfaces") }
-  }).value;
-  assert_eq(t.read, []);
-  assert_eq(t.left, Some([package_name()]))
-}

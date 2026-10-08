@@ -3,7 +3,7 @@
 //! one §3.1 states for parameter defaults: a literal, a constructor applied to literals, a
 //! record or a list.
 
-import parsing (Span, ParseDiag, error_at, dummy_span, starts_upper)
+import parsing (Span, ParseDiag, error_at, dummy_span, starts_upper, parse_diag_bin)
 import items (Module, IFn, FnDef, item_span, parse)
 import exprs (Expr, ELit, EVar, EApp, ERecord, EList, RecField, expr_span)
 import patterns (LInt, LBool, LStr, LUnit)
@@ -13,7 +13,8 @@ import resolve (Source)
 import embed (EmbedAt, EmbedFile)
 import std.json (Json, Null, Bool, Number, Str, Member, object, array, variant, error_to_string)
 import std.hash (blake3)
-import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of)
+import std.bin
+import std.pkg (Manifest, Version, Dep, Path, Git, Registry, manifest_json, prefix_of, manifest_bin)
 import std.list (at, take, contains)
 import std.graph
 import std.string (join)
@@ -662,12 +663,51 @@ fn checked_manifests(
 fn manifest_diag(slot: Int, code: Bytes, message: Bytes) -> { slot: Int, diag: ParseDiag } =
   { slot: slot, diag: error_at(code, dummy_span(), message, b"in this package's manifest", []) }
 
-/// The packages of one load, judged: dependencies usable, prefixes unique, the graph acyclic,
-/// and the dependency modules named. `root_modules` are the root package's own module names,
-/// whose first segments may not squat on a dependency's prefix.
+/// The anonymous root package alone.
 pub fn empty() -> PackageSources = { root: b"", manifest: None, supplied: [] }
 
-pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure / {abort.raise} = {
+/// The packages of one load, judged, and the dependency modules named.
+pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure / {abort.raise} =
+  closed(judged(pkgs, root_modules), pkgs.supplied)
+
+/// The packages of a load as [`closure`] judges them, apart from the modules they hold.
+pub type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
+
+/// `j` over the modules `supplied` holds, each dependency's named by its package's prefix.
+pub fn closed(j: Judged, supplied: List<Supplied>) -> Closure / {abort.raise} =
+  { packages: j.packages, modules: name_modules(j.packages, supplied, 1, []), diags: j.diags }
+
+/// `j` with what spells where its packages are taken out: each package's root is its place among
+/// them, and each dependency read from a path is read from no path, so packages that move answer
+/// as they did.
+pub fn placeless(j: Judged) -> Judged / {abort.raise} =
+  {
+    ..j,
+    packages: map(range(0, len(j.packages)), |i: Int| {
+      let p = at(j.packages, i);
+      {
+        ..p,
+        root: place_token(i),
+        manifest: match p.manifest {
+          None -> None,
+          Some(m) ->
+            Some({
+              ..m,
+              dependencies: map(m.dependencies, |d: Dep|
+                match d.source { Path(_) -> { ..d, source: Path("") }, _ -> d }),
+            }),
+        },
+      }
+    }),
+  }
+
+/// The root [`placeless`] gives the package at `i` among a load's.
+pub fn place_token(i: Int) -> Bytes = bytes_of_string("package " ++ int_to_string(i))
+
+/// The packages of one load, judged: dependencies usable, prefixes unique, the graph acyclic.
+/// `root_modules` are the root package's own module names, whose first segments may not squat on
+/// a dependency's prefix.
+pub fn judged(pkgs: PackageSources, root_modules: List<Bytes>) -> Judged / {abort.raise} = {
   let texts: List<Option<Bytes>> = fold(
     pkgs.supplied,
     [pkgs.manifest],
@@ -688,13 +728,11 @@ pub fn closure(pkgs: PackageSources, root_modules: List<Bytes>) -> Closure / {ab
       manifest: m,
     }
   });
-  let judged = judge(texts, roots, checked.manifests, packages, root_modules, checked.diags);
-  {
-    packages: judged.packages,
-    modules: name_modules(judged.packages, pkgs.supplied, 1, []),
-    diags: judged.diags,
-  }
+  judge(texts, roots, checked.manifests, packages, root_modules, checked.diags)
 }
+
+derive bin for Package
+derive bin for Judged
 
 /// Dependency modules in supplied order, named by their package's prefix when it decoded;
 /// the count and order a walker supplied in is the count and order named here.
@@ -786,8 +824,6 @@ fn embed_part(embed: EmbedAt) -> Bytes / {abort.raise} =
   ])
 
 // --- The graph's judgments ------------------------------------------------------
-
-type Judged = { packages: List<Package>, diags: List<{ slot: Int, diag: ParseDiag }> }
 
 type Pending = {
   packages: List<Package>,
