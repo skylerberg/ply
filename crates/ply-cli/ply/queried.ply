@@ -3,7 +3,8 @@
 
 import std.fs (fs)
 import compiler.memo
-import compiler.memo (Query, Record, Run, Tally, memo_keep, started, tallies)
+import compiler.memo (Query, Read, Record, Run, Tally, memo_keep, asked_reads, digest_of, recorded,
+                      standing, started, tallies)
 import compiler.memo_files
 import compiler.unit (shipped)
 import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of, hashed_all,
@@ -11,6 +12,12 @@ import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evalu
                           shipped_queries, world_of, world_placing)
 import compiler.hash (Fixing, no_fixing)
 import sources (Project, File, DepPackage, Embed, embed_now, embed_of)
+import compiler.resolve (Diag, diag_bin)
+import interfaces
+import std.bin
+import std.hash (blake3)
+import std.list (concat)
+import compiler.interface (sized)
 import compiler.embed (EmbedAt, EmbedWant, want_of_key)
 import std.bytes (hex_of)
 
@@ -27,6 +34,60 @@ fn world(project: Project) -> World / {abort.raise} =
     map(project.packages, |p: DepPackage|
       { root: bytes_of_string(p.root), manifest: p.manifest, files: map(p.files, own_file) }),
   )
+
+/// The walk, as a place: the path and name of each module it found, and what it refused, which a
+/// command's answer reads beside its modules' texts.
+fn walk_kind() -> Bytes = b"walk"
+
+/// What each registry dependency's slot holds, as a place.
+fn published_kind() -> Bytes = b"published"
+
+fn walked_of(project: Project) -> Bytes / {abort.raise} =
+  bin::encode(
+    {
+      files: map(project.files, |f: File| { path: f.path, module: f.module }),
+      diags: project.diags,
+    },
+    walked_bin(),
+  )
+
+type Walked = { files: List<{ path: String, module: String }>, diags: List<Diag> }
+
+derive bin for Walked
+
+/// What each registry dependency's slot of `project` holds.
+fn published_of(project: Project) -> Bytes / {fs.read_file[abs], abort.raise} =
+  bin::encode(
+    map(
+      interfaces::slots(project.root_key, map(project.packages, |p: DepPackage| p.root)),
+      |slot: String| { slot: slot, held: interfaces::slot_read(slot) },
+    ),
+    bin::list_bin(published_bin()),
+  )
+
+type Published = { slot: String, held: Option<Bytes> }
+
+derive bin for Published
+
+/// What the world of `project`, whose queries read `w`, holds at `at` as `kind` reads it.
+fn project_look(
+  project: Project,
+  w: World,
+  kind: Bytes,
+  at: Bytes,
+) -> Option<Bytes> / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  if kind == walk_kind() { Some(walked_of(project)) }
+  else if kind == published_kind() { Some(published_of(project)) } else {
+    looked(
+      w,
+      shipped_module,
+      shipped_data,
+      shipped_names,
+      |k: Int, m: Bytes, want: EmbedWant| embed_now(project, k, m, want),
+      kind,
+      at,
+    )
+  }
 
 /// What `answers` say the load's own modules embed, each beside its module's file.
 fn embeds_answered(
@@ -76,12 +137,13 @@ pub type Queried = {
   pulled: List<Bytes>,
   fixing: Fixing,
   embeds: List<Embed>,
+  asked: List<Read>,
   tallies: List<Tally>,
 }
 
 /// What a load with no modules to answer answers.
 pub fn nothing() -> Queried =
-  { answers: [], pulled: [], fixing: no_fixing(), embeds: [], tallies: [] }
+  { answers: [], pulled: [], fixing: no_fixing(), embeds: [], asked: [], tallies: [] }
 
 type Asked = { answers: List<Answered>, pulled: List<Bytes>, fixing: Fixing }
 
@@ -120,16 +182,7 @@ pub fn answered<[r]>(
   let done = memo_files::kept[r](
     dir,
     |path: String| shipped.answer(path),
-    |kind: Bytes, at: Bytes|
-      looked(
-        w,
-        shipped_module,
-        shipped_data,
-        shipped_names,
-        |k: Int, m: Bytes, want: EmbedWant| embed_now(project, k, m, want),
-        kind,
-        at,
-      ),
+    |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
     || asked(qs, w.own, always, tested, started(qs)),
   );
   {
@@ -137,8 +190,74 @@ pub fn answered<[r]>(
     pulled: done.value.pulled,
     fixing: done.value.fixing,
     embeds: embeds_answered(project, w, done.value.answers),
+    asked: asked_reads(done.run),
     tallies: tallies(done.run),
   }
+}
+
+/// The `ply` program running and the runtime it runs on: what its definitions hash to and the
+/// runtime's stamps, which leave out every shipped definition the program does not reach.
+pub fn program() -> Bytes / {fs.read_file[shipped]} =
+  blake3(
+    bytes_concat_all([
+      sized(match fs.read_file[shipped]("definitions") { Some(b) -> b, None -> b"" }),
+      sized(match fs.read_file[shipped]("stamps") { Some(b) -> b, None -> b"" }),
+    ]),
+  )
+
+/// What a command's answer is kept under: what names the `ply` that answered, and `asked`, what names
+/// the command and its line.
+pub fn command_key(program: Bytes, asked: Bytes) -> Bytes =
+  blake3(bytes_concat_all([b"ply command answer\x00", program, b"\x00", blake3(asked)]))
+
+/// The answer kept under `key` in the memo store in `dir` for a command over `project`, where it
+/// stands, asked again where marked only when `checked`; beside the marks found on it, which keeping
+/// it again removes.
+pub fn command_kept<[r]>(
+  dir: String,
+  project: Project,
+  key: Bytes,
+  checked: Bool,
+) -> { output: Option<Bytes>, marks: List<Bytes> } / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
+  let qs = running();
+  let w = world(project);
+  let kept = memo_files::kept[r](
+    dir,
+    |path: String| shipped.answer(path),
+    |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
+    || standing(qs, started(qs), key, checked),
+  );
+  { output: kept.output, marks: kept.marks }
+}
+
+/// `output` kept under `key` in the memo store in `dir` as a command's answer over `project` made by
+/// the `ply` `program` names: a function of `asked`, what its load asked, and of the walk and what
+/// each registry slot holds. `marks` are the marks [`command_kept`] found on it. Whether the store
+/// holds it now.
+pub fn keep_command<[r]>(
+  dir: String,
+  project: Project,
+  key: Bytes,
+  program: Bytes,
+  asked: List<Read>,
+  output: Bytes,
+  marks: List<Bytes>,
+) -> Bool / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
+  let qs = running();
+  let w = world(project);
+  let reads = concat(asked, [
+    memo::World(walk_kind(), b"", digest_of(Some(walked_of(project)))),
+    memo::World(published_kind(), b"", digest_of(Some(published_of(project)))),
+  ]);
+  memo_files::kept[r](
+    dir,
+    |path: String| shipped.answer(path),
+    |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
+    || {
+      recorded(qs, key, program, reads, output, marks);
+      memo_keep.head(key) == Some(digest_of(Some(output)))
+    },
+  )
 }
 
 /// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
@@ -219,11 +338,16 @@ pub fn answered_afresh(
     pulled: done.value.pulled,
     fixing: done.value.fixing,
     embeds: embeds_answered(project, w, done.value.answers),
+    asked: asked_reads(done.run),
     tallies: tallies(done.run),
   }
 }
 
-/// The hash each query has now, which a record of any other hash will never be asked by again.
+/// The hash each query has now, and what names this `ply`, which a command's answer is kept under: a
+/// record of any other will never be asked by again.
 pub fn current() -> Map<Bytes, Bool> / {fs.read_file[shipped], abort.raise} =
-  map_fold(running(), map_new(), |acc: Map<Bytes, Bool>, _: Bytes, q: Query|
-    map_insert(acc, q.hash, true))
+  map_fold(
+    running(),
+    map_insert(map_new(), program(), true),
+    |acc: Map<Bytes, Bool>, _: Bytes, q: Query| map_insert(acc, q.hash, true),
+  )
