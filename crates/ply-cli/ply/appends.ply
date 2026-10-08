@@ -4,15 +4,15 @@
 import compiler.costs (Report, Costed, Site, Unkept, Priced, Costing, costs, cost_keys, priced_of,
                        report_bin)
 import compiler.embed (EmbedAt, EmbedFile)
-import compiler.front (Analysis, analyse_pulling_std_with, no_rows, written_form, Analysed, Refused)
+import compiler.front (Analysis, View, Outline, Outlined, OFn, analyse_pulling_std_with, no_rows,
+                       written_form, Analysed, Refused)
 import compiler.hash (hex)
-import compiler.items (Item, IFn)
 import compiler.resolve (Source, ParsedModule, Diag, PackageDeps, error_at, error_at_and)
 import compiler.parsing (Span, no_module)
 import compiler.unit (identity_of, read_kept, shipped, write_kept)
 import diagnostic (Place, spot_of)
 import env (env)
-import program (Program, sourced, is_shipped)
+import program (Program, is_shipped, whole_of)
 import report (indent)
 import sources (under_abs)
 import std.term (Style, bold, dim, red, green, yellow, plain)
@@ -22,7 +22,7 @@ import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import std.string (repeat)
-import std.list (at, concat)
+import std.list (at, concat, take)
 import proof.obligation (plural)
 
 /// Where the verdict column starts: wide enough for `stdlib.ply:1234:56`.
@@ -39,8 +39,9 @@ pub effect priced {
 
 /// Only the run's own updates: a dependency's are costed when it is the package checked.
 pub fn costs_of(program: Program, analysis: Analysis) -> Costing / {priced.report, abort.raise} = {
-  let srcs: List<Source> = sourced(program, analysis);
-  let c = priced.report(priced_of(analysis, map(srcs, |source: Source| source.src)));
+  let srcs = map(range(0, len(analysis.mods)), |i: Int|
+    match list_at(program.places, i) { Some(place) -> place.text, None -> b"" });
+  let c = priced.report(priced_of(analysis, srcs));
   {
     ..c,
     report: { ..c.report, defs: filter(c.report.defs, |d: Costed| d.module < len(program.files)) },
@@ -50,14 +51,17 @@ pub fn costs_of(program: Program, analysis: Analysis) -> Costing / {priced.repor
 /// A `reuse fn` whose promise the cost checker cannot show, and a `returns` clause it cannot show of
 /// its body, as the diagnostics a run is refused with; nothing at all when none of the run's own
 /// modules writes either.
-pub fn broken_promises(
-  program: Program,
-  analysis: Analysis,
-) -> List<Diag> / {priced.report, abort.raise} =
-  if !promised(program, analysis) { [] } else {
-    let r = costs_of(program, analysis).report;
-    if !r.ok { [unresolved()] }
-    else { fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u))) }
+pub fn broken_promises(program: Program, view: View) -> List<Diag> / {priced.report, abort.raise} =
+  if !promised(program, view) { [] } else {
+    match whole_of(program) {
+      Err(ds) -> ds,
+      Ok(w) -> {
+        let r = costs_of(program, w).report;
+        if !r.ok { [unresolved()] } else {
+          fold(r.unkept, promises(r), |acc: List<Diag>, u: Unkept| push(acc, unkept_returns(u)))
+        }
+      },
+    }
   }
 
 /// The definitions a report is a function of besides the program: the checker's entry, and the
@@ -220,17 +224,11 @@ pub fn pricing_fresh<a | e>(body: () -> a / {priced.report | e}) -> a / {abort.r
 
 /// Whether one of the run's own modules writes a `reuse fn` or a `returns` clause, so the promise
 /// check can be skipped.
-pub fn promised(program: Program, analysis: Analysis) -> Bool =
-  fold(
-    analysis.mods,
-    { i: 0, any: false },
-    |acc: { i: Int, any: Bool }, parsed: ParsedModule|
-      { i: acc.i + 1, any: acc.any || (acc.i < len(program.files) && promises_reuse(parsed)) },
-  ).any
-
-fn promises_reuse(parsed: ParsedModule) -> Bool =
-  fold(parsed.module.items, false, |a: Bool, it: Item|
-    match it { IFn(d) -> a || d.reuse != None || d.returns != None, _ -> a })
+pub fn promised(program: Program, view: View) -> Bool =
+  fold(take(view.outlines, len(program.files)), false, |any: Bool, o: Outline|
+    any
+      || fold(o.items, false, |a: Bool, it: Outlined|
+        a || (match it { OFn(f) -> f.reuse || f.returns, _ -> false })))
 
 fn unkept_returns(u: Unkept) -> Diag =
   error_at(
