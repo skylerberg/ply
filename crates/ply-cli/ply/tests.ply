@@ -44,10 +44,9 @@ import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, cov
                 queued, targets)
 import paths
 import program (Timed, front_of, in_shipped_module, is_shipped, modules_of, timed_over,
-                timed_uncached_over, unmoved, program_view)
+                timed_uncached_over, unmoved, program_view, asked_line, command_kept, keep_command)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
-import sources (Embed, Embedding, File, Project, embedding_of, embeds_stand, imported_reader,
-                is_std, load_resolved, shipped_imported)
+import sources (Embed, File, Project, imported_reader, is_std, load_resolved, shipped_imported)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null, parse_string)
@@ -59,7 +58,9 @@ import trials
 import walk
 import views
 import listings
-import answers
+import queried
+import queried (command_key)
+import std.bin
 import program
 // What a test's footprint makes it — shared, isolated or host — and the classes the tests that run
 // share are the suite's, from the atoms each row carries and the tests the binding reaches.
@@ -1892,24 +1893,30 @@ pub fn iterated(
   let project = load_resolved(flags.paths);
   let keys = match argv {
     Some(line) -> if held == None && keeps_answer(options) {
-      let program = answers::program();
+      let program = queried::program();
       Some({
-        key: answers::key_of(program, line, project),
+        key: command_key(program, asked_line(line, flags.paths)),
         alone: map(alone_lines(line, flags.filters), |a: { filter: String, line: List<String> }|
-          { filter: a.filter, key: answers::key_of(program, a.line, project) }),
+          { filter: a.filter, key: command_key(program, asked_line(a.line, flags.paths)) }),
       })
     } else { None },
     None -> None,
   };
-  match match keys { Some(k) -> replayed(flags, options, k.key, project, begun), None -> None } {
+  // `--kept` loads nothing, so it asks nothing a mark is on again.
+  let taken = match keys {
+    Some(k) -> replayed(flags, options, k.key, project, begun, !flags.kept),
+    None -> { answer: None, marks: [] },
+  };
+  match taken.answer {
     Some(answer) -> { answer: answer, held: None, embeds: [] },
     None -> if flags.kept {
       let unanswered = match keys {
         Some(k) -> if len(k.alone) == 0 { flags.filters } else {
           map(
-            filter(k.alone, |a: { filter: String, key: String }|
-              replayed({ ..flags, json: true }, options, a.key, project, begun) == None),
-            |a: { filter: String, key: String }| a.filter,
+            filter(k.alone, |a: { filter: String, key: Bytes }|
+              replayed({ ..flags, json: true }, options, a.key, project, begun, false).answer
+                == None),
+            |a: { filter: String, key: Bytes }| a.filter,
           )
         },
         None -> flags.filters,
@@ -1925,15 +1932,15 @@ pub fn iterated(
     } else {
       let t: Timed = loaded(flags, options, held, project, started);
       over_load(flags, options, s, t, begun, match keys {
-        Some(k) -> if viewed_whole(t.program) {
+        Some(k) ->
           Some({
             key: k.key,
-            views: viewed_text(t.program.viewed),
+            project: project,
+            marks: taken.marks,
             passes: [],
             after: false,
             alone: k.alone,
-          })
-        } else { None },
+          }),
         None -> None,
       })
     },
@@ -1958,7 +1965,7 @@ fn unkept(flags: Flags, unanswered: List<String>, apart: Bool) -> Answer = {
       [
         indent()
           ++ (if apart { "nothing kept answers these filters: " ++ join(unanswered, ", ") } else {
-            "nothing kept answers this run: none was kept for this command line, or a pass or shipped definition it took moved"
+            "nothing kept answers this run: none was kept for this command line, something its load read moved, or a pass it took moved"
           }),
       ]
     },
@@ -1968,17 +1975,32 @@ fn unkept(flags: Flags, unanswered: List<String>, apart: Bool) -> Answer = {
 
 fn unkept_code() -> Int = 4
 
-/// Where a run keeps its answer for the next run over the same command (`answers`): the key, its
-/// load's views of the shipped modules, and the keys of the passes it took. `after` is an answer
-/// selected again after the run filed its passes, which the store's warnings on opening are not in.
-/// `alone` is, for a run of several `--filter`s, each with the key a run of it alone keeps under.
+/// Where a run keeps its answer for the next run over the same command: the key, the walk the memo
+/// store's record of it is made over, the marks found on what the key held, and the keys of the
+/// passes it took. `after` is an answer selected again after the run filed its passes, which the
+/// store's warnings on opening are not in. `alone` is, for a run of several `--filter`s, each with
+/// the key a run of it alone keeps under.
 type Keeping = {
-  key: String,
-  views: Bytes,
+  key: Bytes,
+  project: Project,
+  marks: List<Bytes>,
   passes: List<String>,
   after: Bool,
-  alone: List<{ filter: String, key: String }>,
+  alone: List<{ filter: String, key: Bytes }>,
 }
+
+/// What a run that ran nothing answered: the lines it printed before its answer, the answer, and the
+/// keys of the passes it took.
+type Kept = {
+  opening: List<String>,
+  lines: List<String>,
+  errs: List<String>,
+  code: Int,
+  json: String,
+  passes: List<String>,
+}
+
+derive bin for Kept
 
 /// Each `--filter` of a run of several with the command line a run of it alone spells: every other
 /// `--filter` and its value left out.
@@ -2002,54 +2024,6 @@ fn alone_lines(
       })
   }
 
-/// The embeds the tests in `scope` reach, as a kept answer holds them: one asked for by a definition,
-/// test or law the tests reach, and always one a dependency asks for, one an item that declares no
-/// name asks for, and one no item of its module is found asking for.
-fn reached_embeds(
-  p: program::Program,
-  analysis: View,
-  scope: Scope,
-) -> List<Embedding> / {abort.raise} = {
-  let keys = fold(scope.visible, [], |acc: List<Bytes>, i: Int|
-    match test_at(analysis, i) { Some(t) -> push(acc, t.key), None -> acc });
-  let walked = reach(analysis.frame.hashes, map(keys, |k: Bytes| TheItem(k)));
-  let named = fold(keys, map_merge(walked.fns, walked.decls), |acc: Map<Bytes, Bool>, k: Bytes|
-    map_insert(acc, k, true));
-  let texts = fold(p.files, map_new(), |acc: Map<Bytes, Bytes>, f: File|
-    map_insert(acc, bytes_of_string(f.module), f.text));
-  let asking = fold(p.embeds, map_new(), |acc: Map<Bytes, List<ItemWants>>, e: Embed|
-    if e.embedded.root != p.pkgs.root || map_contains(acc, e.embedded.module) { acc } else {
-      match map_get(analysis.frame.embed_items, e.embedded.module) {
-        Some(items) -> map_insert(acc, e.embedded.module, items),
-        None -> match map_get(texts, e.embedded.module) {
-          None -> acc,
-          Some(text) -> match parse_all([{ name: e.embedded.module, src: text }]) {
-            [parsed, ..] -> map_insert(acc, e.embedded.module, wants_by_item(parsed.module.module)),
-            [] -> acc,
-          },
-        },
-      }
-    });
-  let reached = |e: Embedded|
-    e.root != p.pkgs.root
-      || (match map_get(asking, e.module) {
-        None -> true,
-        Some(items) -> {
-          let wanting = filter(items, |item: ItemWants|
-            fold(item.wants, false, |hit: Bool, w: EmbedWant|
-              hit || (w.path == e.want.path && w.dir == e.want.dir)));
-          len(wanting) == 0
-            || fold(wanting, false, |hit: Bool, item: ItemWants|
-              hit
-                || (match item.name {
-                  None -> true,
-                  Some(n) -> map_contains(named, qualify(e.module, n)),
-                }))
-        },
-      });
-  map(filter(p.embeds, |e: Embed| reached(e.embedded)), |e: Embed| embedding_of(e.embedded))
-}
-
 /// A run whose answer the next may take: one that consults the store, answers once and as a plain
 /// run does, and reads no configuration file the key does not cover.
 fn keeps_answer(options: Options) -> Bool =
@@ -2057,12 +2031,6 @@ fn keeps_answer(options: Options) -> Bool =
     && options.mutate == None
     && len(options.config.files) == 0
     && options.config.schema == None
-
-/// Whether the load read each shipped module it pulled for what the program reaches, so its views
-/// hold all the program takes of them: a load that cut gives a view of every module it pulled, and
-/// one it read only for an embed is in the hash of what embeds it.
-fn viewed_whole(p: program::Program) -> Bool =
-  p.reached && (len(p.viewed) > 0 || len(p.shipping.read) == 0)
 
 /// The keys of the passes that answer each test in scope.
 fn answered_by(answering: List<List<String>>, scope: Scope) -> List<String> =
@@ -2085,72 +2053,72 @@ fn unwarned(answer: Answer) -> Bool =
     _ -> false,
   }
 
-/// The answer a run kept under `key`, where it answers this one: every pass it took still stands,
-/// its load's views of the shipped modules still hold and each embed its tests reach in `project`
-/// reads as it did. A text run prints what that one printed before its answer.
+/// The answer a run kept under `key`, where it answers this one: nothing its load read moved, or,
+/// where `checked`, each read answers as it did; and every pass it took still stands. A text run
+/// prints what that one printed before its answer. Beside it, the marks found on what the key held.
 fn replayed(
   flags: Flags,
   options: Options,
-  key: String,
+  key: Bytes,
   project: Project,
   begun: Int,
-) -> Option<Answer> / {env.reused[sys], time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], tester.configure[corpus], tester.ended[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], abort.raise} = {
-  tester.configure[corpus](options);
-  let importing = imported_reader();
-  let found = results::with_ledger(results::store_for(flags.paths, false), || {
-    match list_at(ledger.passes([key]), 0) {
-      Some(Some(bytes)) -> match answers::decoded(bytes) {
-        None -> None,
-        Some(k) -> if !embeds_stand(k.embeds, project) { None } else {
-          let viewed = views::split(k.views).viewed;
-          let held = ledger.passes(k.passes);
-          let now = views::now_for(push(views::viewed_in(traces_of(held)), viewed), |m: Bytes|
-            shipped_imported(importing, m));
-          let stands = views::moved(now, viewed) == None
-            && fold(held, true, |all: Bool, h: Option<Bytes>|
-              all && h != None && standing(now, h) == Some(Stands));
-          if stands { Some(k) } else { None }
+  checked: Bool,
+) -> { answer: Option<Answer>, marks: List<Bytes> } / {shipped.answer, env.reused[sys], time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], tester.configure[corpus], tester.ended[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], abort.raise} = {
+  let kept = command_kept(flags.paths, project, key, checked);
+  match match kept.output {
+      Some(b) -> match bin::decode(b, kept_bin()) { Ok(k) -> Some(k), Err(_) -> None },
+      None -> None,
+    } {
+    None -> { answer: None, marks: kept.marks },
+    Some(k) -> {
+      tester.configure[corpus](options);
+      let importing = imported_reader();
+      let stands = results::with_ledger(results::store_for(flags.paths, false), || {
+        let held = ledger.passes(k.passes);
+        let now = views::now_for(views::viewed_in(traces_of(held)), |m: Bytes|
+          shipped_imported(importing, m));
+        fold(held, true, |all: Bool, h: Option<Bytes>|
+          all && h != None && standing(now, h) == Some(Stands))
+      });
+      tester.ended[corpus]();
+      match if stands { Some(parse_string(k.json)) } else { None } {
+        None -> { answer: None, marks: kept.marks },
+        Some(Err(_)) -> { answer: None, marks: kept.marks },
+        Some(Ok(json)) -> {
+          if !flags.json { printed(k.opening) };
+          {
+            answer: Some({
+              json: match json {
+                Object(members) ->
+                  Object(
+                    map_insert(
+                      members,
+                      "front_end",
+                      object([
+                        { key: "incremental", value: Bool(true) },
+                        {
+                          key: "phases",
+                          value: phases_json({
+                            read_us: time.elapsed_us() - begun,
+                            front_us: 0,
+                            write_back_us: 0,
+                          }),
+                        },
+                        { key: "reused", value: Bool(true) },
+                        { key: "key", value: Str(hex_of(key)) },
+                      ]),
+                    ),
+                  ),
+                other -> other,
+              },
+              lines: k.lines,
+              errs: k.errs,
+              code: k.code,
+            }),
+            marks: [],
+          }
         },
-      },
-      _ -> None,
-    }
-  });
-  tester.ended[corpus]();
-  match found {
-    None -> None,
-    Some(k) -> match parse_string(k.json) {
-      Err(_) -> None,
-      Ok(json) -> {
-        if !flags.json { printed(k.opening) };
-        Some({
-          json: match json {
-            Object(members) ->
-              Object(
-                map_insert(
-                  members,
-                  "front_end",
-                  object([
-                    { key: "incremental", value: Bool(true) },
-                    {
-                      key: "phases",
-                      value: phases_json({
-                        read_us: time.elapsed_us() - begun,
-                        front_us: 0,
-                        write_back_us: 0,
-                      }),
-                    },
-                    { key: "reused", value: Bool(true) },
-                    { key: "key", value: Str(key) },
-                  ]),
-                ),
-              ),
-            other -> other,
-          },
-          lines: k.lines,
-          errs: k.errs,
-          code: k.code,
-        })
-      },
+      }
     },
   }
 }
@@ -2162,7 +2130,7 @@ fn over_load(
   t: Timed,
   begun: Int,
   keeping: Option<Keeping>,
-) -> Iteration / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise, shipped.reached, literal.verdicts, literal.statements, tester.cases[corpus]} =
+) -> Iteration / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, shipped.answer, abort.raise, shipped.reached, literal.verdicts, literal.statements, tester.cases[corpus]} =
   match program_view(t.program) {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shipped-module
     // filter a successful load applies to warnings is not applied here.
@@ -2429,7 +2397,7 @@ fn tests_over(
   analysis: View,
   begun: Int,
   keeping: Option<Keeping>,
-) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached} = {
+) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, literal.verdicts, literal.statements, shipped.answer, abort.raise, shipped.reached} = {
   let aimed: Result<Option<List<DefInfo>>, Diag> = match options.mutate {
     Some(query) -> match targets(analysis, query) { Ok(defs) -> Ok(Some(defs)), Err(d) -> Err(d) },
     None -> Ok(None),
@@ -2458,7 +2426,7 @@ fn selected(
   targeted: Option<List<DefInfo>>,
   spent: Spent,
   keeping: Option<Keeping>,
-) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, abort.raise, shipped.reached} = {
+) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.cases[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, shipped.answer, abort.raise, shipped.reached} = {
   let configuring = time.elapsed_us();
   tester.configure[corpus](options);
   results::with_ledger(results::store_for(flags.paths, options.no_cache), || {
@@ -2586,7 +2554,7 @@ fn decided_run(
   spent: Spent,
   listing: Int,
   keeping: Option<Keeping>,
-) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.pwd[sys], env.vars[sys], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], tester.schema[corpus], ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, abort.raise, shipped.reached} = {
+) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.pwd[sys], env.vars[sys], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], tester.schema[corpus], ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, shipped.answer, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], abort.raise, shipped.reached} = {
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
   let scope = scope_of(analysis, options);
@@ -2706,7 +2674,7 @@ fn decided_run(
                     let again = cases_of(rows_of(analysis), search, false, loaded);
                     let settled = decide(again.cases);
                     if all_cached(settled, scope) {
-                      let kept_as = |f: Flags, o: Options, sc: Scope, key: String| {
+                      let kept_as = |f: Flags, o: Options, sc: Scope, key: Bytes| {
                         let next = program_of(
                           o,
                           timed,
@@ -2748,7 +2716,7 @@ fn decided_run(
                       };
                       kept_as(flags, options, scope, k.key);
                       // Each `--filter` of several kept apart too, as a run of it alone answers.
-                      fold(k.alone, (), |u: Unit, a: { filter: String, key: String }| {
+                      fold(k.alone, (), |u: Unit, a: { filter: String, key: Bytes }| {
                         let o = { ..options, filters: [a.filter] };
                         kept_as({ ..flags, filters: [a.filter] }, o, scope_of(analysis, o), a.key)
                       })
@@ -3070,7 +3038,7 @@ fn concluded_run(
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
-) -> Answer / {process.out[proc], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, abort.raise, shipped.reached} = {
+) -> Answer / {process.out[proc], time.elapsed_us, tester.unit[corpus], tester.hosted[corpus], tester.executed[corpus], tester.interleaved[corpus], ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, shipped.answer, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, shipped.reached} = {
   let refiled = keeps.refiled;
   let kept = keeps.kept;
   // What the next run answers: this run's notices of its cache and its store are not in it.
@@ -3194,26 +3162,24 @@ fn concluded_run(
   match kept {
     Some(k) -> if len(decided.runs) == 0 && answer.code == ok_code() && unwarned(answer)
         && all_cached(decisions, scope) {
-      let _ = ledger.filed({
-        passes: [
+      let _ = keep_command(
+        flags.paths,
+        k.project,
+        k.key,
+        timed.program,
+        bin::encode(
           {
-            key: k.key,
-            trace: answers::encoded({
-              opening: opening,
-              lines: answer.lines,
-              errs: answer.errs,
-              code: answer.code,
-              json: to_string(answer.json),
-              passes: k.passes,
-              views: k.views,
-              embeds: reached_embeds(timed.program, analysis, scope),
-            }),
+            opening: opening,
+            lines: answer.lines,
+            errs: answer.errs,
+            code: answer.code,
+            json: to_string(answer.json),
+            passes: k.passes,
           },
-        ],
-        codes: [],
-        records: [],
-        seen: [],
-      });
+          kept_bin(),
+        ),
+        k.marks,
+      );
       ()
     },
     None -> (),

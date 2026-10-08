@@ -42,11 +42,13 @@ derive bin for Seen
 /// A query: its name, the hash of its definition, which keys what it answered, and its body.
 pub type Query = { name: Bytes, hash: Bytes, body: (Bytes) -> Bytes / {memo.read, abort.raise} }
 
-/// What a run has settled: the digest of the answer under each key it settled, the answers it holds by their
+/// What a run has settled: the digest of the answer under each key it settled, what its driver asked,
+/// in order, the answers it holds by their
 /// digests, the keys being answered now, which a query asking one of them again would wait on
 /// forever, and, by query, how many answers it took as kept and how many it ran the body for.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
+  asked: List<Read>,
   held: Map<Bytes, Bytes>,
   open: Map<Bytes, Bool>,
   took: Map<Bytes, Int>,
@@ -54,7 +56,18 @@ pub type Run = {
 }
 
 fn new_run() -> Run =
-  { settled: map_new(), held: map_new(), open: map_new(), took: map_new(), ran: map_new() }
+  {
+    settled: map_new(),
+    asked: [],
+    held: map_new(),
+    open: map_new(),
+    took: map_new(),
+    ran: map_new(),
+  }
+
+/// What the run's driver asked, each read by the digest of what it answered: what an answer made
+/// over them is a function of.
+pub fn asked_reads(run: Run) -> List<Read> = run.asked
 
 /// What a run did of one query: answers taken as kept, and bodies run.
 pub type Tally = { query: Bytes, took: Int, ran: Int }
@@ -261,14 +274,25 @@ pub fn started(queries: Map<Bytes, Query>) -> Run / {memo_keep.read, memo_keep.w
 }
 
 /// What the query `name` answers for `input`: its record's answer where nothing it read moved, else
-/// its body's, which is kept. `left` is how much deeper the asking may go: deeper than every query a
-/// program has, which only a run asking its way around a loop reaches.
+/// its body's, which is kept. The run notes the read as one its driver asked.
 pub fn answer(
   queries: Map<Bytes, Query>,
   run: Run,
   name: Bytes,
   input: Bytes,
-  left: Int = 100000,
+) -> Answered / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let a = fetched(queries, run, name, input, 100000);
+  { ..a, run: { ..a.run, asked: push(a.run.asked, Asked(name, input, digest_of(Some(a.output)))) } }
+}
+
+/// [`answer`], for a query's body. `left` is how much deeper the asking may go: deeper than every
+/// query a program has, which only a run asking its way around a loop reaches.
+fn fetched(
+  queries: Map<Bytes, Query>,
+  run: Run,
+  name: Bytes,
+  input: Bytes,
+  left: Int,
 ) -> Answered / {memo_keep.read, memo_keep.write, abort.raise} =
   if left <= 0 { panic(string_of_bytes_lossy(too_deep())) } else {
     let s = settled(queries, run, name, input, left - 1);
@@ -484,7 +508,7 @@ fn executed(
           // An answer settled before this read was noted may have been marked since.
           let unsure = fresh && map_contains(before.settled, akey)
             && len(memo_keep.marks(akey)) > 0;
-          let a = answer(queries, before, name, asked, left - 1);
+          let a = fetched(queries, before, name, asked, left - 1);
           let s = cell_get(st);
           cell_set(st, {
             ..s,
@@ -509,6 +533,69 @@ fn executed(
       { run: { ..s.run, held: map_insert(s.run.held, d, output) }, head: d }
     } }
   }
+
+// --- Answers made over what a driver asked ---------------------------------------------------
+// A command's answer is a function of what its run asked and of the places it names, so it is kept
+// as a record of those reads, marked as any record is and taken back without the run.
+
+/// What is kept under `key`, an answer made over what a run's driver asked: its answer where no mark
+/// is on its record or, where `checked`, each of its reads answers as it did; beside the marks found
+/// on it, which keeping it again removes. Unchecked, a marked record answers nothing and nothing is
+/// asked again.
+pub fn standing(
+  queries: Map<Bytes, Query>,
+  run: Run,
+  key: Bytes,
+  checked: Bool,
+) -> { run: Run, output: Option<Bytes>, marks: List<Bytes> } / {memo_keep.read, memo_keep.write, abort.raise} =
+  match memo_keep.head(key) {
+    None -> { run: run, output: None, marks: [] },
+    Some(out) -> {
+      let marks = memo_keep.marks(key);
+      if len(marks) == 0 { { run: run, output: memo_keep.output(out), marks: [] } }
+      else if !checked { { run: run, output: None, marks: marks } } else {
+        match memo_keep.record(key) {
+          None -> { run: run, output: None, marks: marks },
+          Some(r) -> {
+            let s = stands(queries, run, r.reads, 100000);
+            if s.ok {
+              memo_keep.unmark(key, marks);
+              { run: s.run, output: memo_keep.output(out), marks: [] }
+            } else { { run: s.run, output: None, marks: marks } }
+          },
+        }
+      }
+    },
+  }
+
+/// `output` kept under `key` as an answer made over `reads` by what `hash` names, with `marks`, the
+/// marks [`standing`] found on its record, removed. Each read is noted among the readers of what it
+/// read and then asked again, so one that moved since it was made leaves the record marked.
+pub fn recorded(
+  queries: Map<Bytes, Query>,
+  key: Bytes,
+  hash: Bytes,
+  reads: List<Read>,
+  output: Bytes,
+  marks: List<Bytes>,
+) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} = {
+  map_fold(read_ids(queries, reads), (), |_: Unit, id: Bytes, _: Bool| memo_keep.link(id, key));
+  // Every read is asked again, so each place it read is noted.
+  let moved = fold(reads, false, |m: Bool, r: Read| {
+    let now = match r {
+      World(kind, at, d) -> seen_now(queries, kind, at) != d,
+      Asked(name, input, d) -> {
+        let k = key_of(query_of(queries, name), input);
+        len(memo_keep.marks(k)) > 0 || memo_keep.head(k) != Some(d)
+      },
+    };
+    m || now
+  });
+  noted_asked(queries, reads);
+  if moved { memo_keep.mark(key) };
+  memo_keep.keep(key, { query: hash, reads: reads, output: digest_of(Some(output)) }, output);
+  if len(marks) > 0 { memo_keep.unmark(key, marks) }
+}
 
 // --- A store held in memory ------------------------------------------------------------------
 
@@ -864,6 +951,46 @@ test "a record marked where a packed answer stands for what moved takes that ans
   );
   assert_eq(next.output, b"5");
   assert_eq(next.executed, 0)
+}
+
+/// A command over `w` that answers what `longer` answers for `a`, read back as `key` keeps it where it
+/// stands: whether it was taken back, and what it answered.
+fn commanded(
+  q: Map<Bytes, Query>,
+  w: World,
+  key: Bytes,
+) -> { took: Bool, output: Bytes, world: World } / {abort.raise} = {
+  let done = over_held(w.held, |_: String| None, |_: Bytes, at: Bytes| map_get(w.files, at), || {
+    let run = started(q);
+    let kept = standing(q, run, key, true);
+    match kept.output {
+      Some(o) -> { took: true, output: o },
+      None -> {
+        let a = answer(q, kept.run, b"longer", b"a");
+        let said = bytes_concat(b"said ", a.output);
+        recorded(q, key, b"c1", asked_reads(a.run), said, kept.marks);
+        { took: false, output: said }
+      },
+    }
+  });
+  { took: done.value.took, output: done.value.output, world: { ..w, held: done.held } }
+}
+
+test "an answer kept over what a run asked stands until something it asked moves" {
+  let q = test_queries(b"h1");
+  let first = commanded(q, test_world([{ at: b"a", text: b"four" }]), b"k");
+  assert_eq(first.output, b"said long 4");
+  assert(!first.took);
+  let again = commanded(q, first.world, b"k");
+  assert(again.took);
+  assert_eq(again.output, b"said long 4");
+  // Another text of the same length moves nothing it asked: it stands, checked.
+  let same = commanded(q, edited(again.world, b"a", b"FOUR"), b"k");
+  assert(same.took);
+  let moved = commanded(q, edited(same.world, b"a", b"forty"), b"k");
+  assert(!moved.took);
+  assert_eq(moved.output, b"said long 5");
+  assert(commanded(q, moved.world, b"k").took)
 }
 
 test "a record whose answer is no longer kept is answered again" {

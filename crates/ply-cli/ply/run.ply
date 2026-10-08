@@ -9,10 +9,10 @@
 //! than a source tree, so it is a second shape of the same report: the same keys wherever the two
 //! agree, the file and its digest where they do not.
 //!
-//! A run of sources walks them first and hashes what it read: when an earlier run of the same
-//! closure filed its front end's answer under that key, the machine takes it, and this run runs no
-//! front end at all. Either way the machine is handed the same answer over this run's own files,
-//! so the run reports the same whichever it was.
+//! A run of sources keeps its front end's answer in the memo store, as a function of what its load
+//! asked: while nothing that load read moved, the machine takes it back, and this run runs no front
+//! end at all. Either way the machine is handed the same answer over this run's own files, so the
+//! run reports the same whichever it was.
 
 import std.random (entropy)
 import appends (broken_promises, priced)
@@ -29,13 +29,17 @@ import entries
 import entry (Main, Module, entry_point)
 import env (env)
 import paths
-import program (Timed, front_of, timed_over, usable, program_view)
+import program (Placed, Timed, front_of, timed_over, usable, program_view, command_kept,
+                keep_command, placed_of, resolved_fields)
 import builder (builder)
-import reused (Toolchain, entry_at, file, short, touched, walked)
+import queried
+import queried (command_key)
+import std.bytes (hex_of)
+import compiler.interface (sized)
 import sources
 import units
 import units (emit)
-import sources (embeds_stand, load_resolved)
+import sources (load_resolved)
 import std.fs (fs)
 import std.time (time)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
@@ -546,7 +550,7 @@ fn configured_over(
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, abort.raise, diverges, shipped.reached} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -715,30 +719,26 @@ fn sourced(
   style: Style,
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], env.binary_version[sys], env.shipped_digest[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project: sources::Project = load_resolved(flags.paths);
-  let tools: Toolchain = { stamp: env.shipped_digest[sys](), version: env.binary_version[sys]() };
-  let walk: WalkKey = walked(tools, project, options.config.schema);
+  let key = command_key(queried::program(), asked_of(flags, options));
+  let walk: WalkKey = walked(hex_of(key), project);
   machine.configure[run](options);
   let asked = time.elapsed_ms();
-  let kept: Option<Target> = if usable(project) {
-    match entry_at(walk.key) {
+  let filed = command_kept(flags.paths, project, key);
+  let kept: Option<Target> = match filed.output {
+    None -> None,
+    Some(bytes) -> match entries::taken(bytes) {
       None -> None,
-      Some(filed) -> match entries::taken(filed) {
+      Some(k) -> match machine.reuse[run](root_of(flags).machine, walk, k.front) {
+        Some(read) -> Some(program_of(read, k.entries.mains, k.entries.modules)),
         None -> None,
-        Some(k) -> if !embeds_stand(k.embeds, project) { None } else {
-          match machine.reuse[run](root_of(flags).machine, walk, k.front) {
-            Some(read) -> Some(program_of(read, k.entries.mains, k.entries.modules)),
-            None -> None,
-          }
-        },
       },
-    }
-  } else { None };
+    },
+  };
   match kept {
     Some(t) -> {
-      touched(walk.key);
       let l = {
         reused: true,
         key: walk.key,
@@ -749,20 +749,33 @@ fn sourced(
       };
       loaded_over(style, flags, Ok(t), configured_over(Ok(t), options), l)
     },
-    None -> built(style, flags, options, project, walk.key, started),
+    None -> built(style, flags, options, project, key, filed.marks, started),
   }
 }
 
-/// This run's own front end, and the machine over its answer, filed under the walk's key once the
-/// load holds.
+/// What names a run and what shapes its front end's answer: the paths it was given and the
+/// `--config-schema` the answer is resolved against.
+fn asked_of(flags: Flags, options: Options) -> Bytes =
+  bytes_concat_all([
+    sized(b"ply run"),
+    resolved_fields(flags.paths),
+    match options.config.schema {
+      Some(s) -> bytes_concat(b"+", sized(bytes_of_string(s))),
+      None -> b"-",
+    },
+  ])
+
+/// This run's own front end, and the machine over its answer, kept under `key` once the load holds,
+/// with `marks`, the marks found on what was kept there, removed.
 fn built(
   style: Style,
   flags: Flags,
   options: Options,
   project: sources::Project,
-  key: String,
+  key: Bytes,
+  marks: List<Bytes>,
   started: Int,
-) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached} = {
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached} = {
   let t: Timed = timed_over(flags.paths, project, started);
   match program_view(t.program) {
     // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
@@ -772,7 +785,7 @@ fn built(
       Some(d) -> unbound(style, { diags: [d], places: t.program.places, artifact: None }),
       None -> match broken_promises(t.program, w.frame) {
         [] -> match unsettled(t, w.frame, root_of(flags).machine) {
-          [] -> loaded_built(style, flags, options, t, w, key),
+          [] -> loaded_built(style, flags, options, project, t, w, key, marks),
           refused -> unloaded(style, { diags: refused, places: t.program.places, artifact: None }),
         },
         broken -> unloaded(style, { diags: broken, places: t.program.places, artifact: None }),
@@ -786,10 +799,12 @@ fn loaded_built(
   style: Style,
   flags: Flags,
   options: Options,
+  project: sources::Project,
   timed: Timed,
   view: View,
-  key: String,
-) -> Answer / {time.elapsed_ms, machine.load[run], machine.schema[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, env.reused[sys], machine.filed[run], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+  key: Bytes,
+  marks: List<Bytes>,
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, machine.load[run], machine.schema[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, machine.filed[run], fs.write[abs], abort.raise} = {
   let asked = time.elapsed_ms();
   let front = front_of(timed, view);
   let emitted = units::whole(front);
@@ -803,7 +818,7 @@ fn loaded_built(
   };
   let l = {
     reused: false,
-    key: key,
+    key: hex_of(key),
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
     file_ms: timed.file_ms,
@@ -812,7 +827,14 @@ fn loaded_built(
   match ((target, emitted)) {
     (Ok(_), Ok(unit)) -> match machine.filed[run](front, unit) {
       Some(entry) -> {
-        let _ = file(key, entries::kept(offered, entry, timed.program.embeds));
+        let _ = keep_command(
+          flags.paths,
+          project,
+          key,
+          timed.program,
+          entries::kept(offered, entry),
+          marks,
+        );
         ()
       },
       None -> (),
@@ -903,6 +925,17 @@ fn explained(flags: Flags, l: Loading, answer: Answer) -> Answer =
       _ -> answer,
     }
   }
+
+// --- The walk as the machine takes it ------------------------------------------------------
+
+/// The walk as `machine.reuse` takes it: what names it, and its places as a front end places them.
+fn walked(key: String, project: sources::Project) -> WalkKey = {
+  let placed: Placed = placed_of(project);
+  { key: key, modules: placed.modules, manifests: placed.manifests }
+}
+
+/// `b3:` and the key's first twelve hex characters, as a report prints a digest.
+fn short(key: String) -> String / {abort.raise} = "b3:" ++ string_slice(key, 0, 12)
 
 // --- Tests ------------------------------------------------------------------
 
@@ -1384,4 +1417,51 @@ test "a load the machine refused says nothing about where its time went" {
   );
   assert_eq(ran.err, []);
   assert_eq(ran.answer.code, 2)
+}
+
+test "a walk hands the machine its modules, the root's first, and its manifests apart" {
+  let project = {
+    files: [
+      {
+        path: "main.ply",
+        module: "main",
+        text: b"fn main() -> Int = 1\n",
+        at: { label: "cwd", path: "main.ply" },
+      },
+      {
+        path: "util.ply",
+        module: "util",
+        text: b"pub fn one() -> Int = 1\n",
+        at: { label: "cwd", path: "util.ply" },
+      },
+    ],
+    sources: [],
+    diags: [],
+    manifest: Some({
+      path: "ply.pkg",
+      module: "",
+      text: b"fn package() -> Manifest = app()\n",
+      at: { label: "cwd", path: "ply.pkg" },
+    }),
+    packages: [
+      {
+        root: "/w/lib",
+        dir: "/w/lib",
+        manifest: Some(b"fn package() -> Manifest = lib()\n"),
+        files: [
+          {
+            path: "/w/lib/deep.ply",
+            module: "deep",
+            text: b"pub fn deep() -> Int = 7\n",
+            at: { label: "cwd", path: "/w/lib/deep.ply" },
+          },
+        ],
+      },
+    ],
+    root_key: "/w/app",
+  };
+  let w = walked("k", project);
+  assert_eq(w.key, "k");
+  assert_eq(map(w.modules, |p: Place| p.path), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
+  assert_eq(map(w.manifests, |p: Place| p.path), ["ply.pkg", "/w/lib/ply.pkg"])
 }

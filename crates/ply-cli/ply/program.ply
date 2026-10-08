@@ -36,13 +36,14 @@ import builder (builder)
 import queried
 import queried (Queried)
 import statements (statement_modules)
-import compiler.memo (Tally)
+import compiler.memo (Read, Tally)
 import compiler.checking (Answered, ModuleAnswer, packages_refused, refused_first, root_warnings,
                           rows_answered, view_answered)
 import std.random (entropy)
 import std.list (at, concat, contains, drop, push_unique, take)
 import std.string (join)
 import compiler.parsing (no_module)
+import compiler.interface (sized)
 
 /// `frame` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
 /// `pkgs` is kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
@@ -71,6 +72,9 @@ pub type Program = {
   viewed: List<ShippedView>,
   /// What the memo run that answered the load's modules did of each query it asked.
   tallies: List<Tally>,
+  /// What that run asked, each by the digest of what it answered: what a command's answer made over
+  /// the load is a function of.
+  asked: List<Read>,
 }
 
 pub type ModuleView = { name: String, path: String }
@@ -127,6 +131,7 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     reached: true,
     viewed: [],
     tallies: [],
+    asked: [],
   }
 
 /// A program nothing was loaded for: what a test hands a command that reads only what it is given.
@@ -147,6 +152,7 @@ pub fn no_program() -> Program =
     reached: true,
     viewed: [],
     tallies: [],
+    asked: [],
   }
 
 /// What a load of this project is made of: its root key and manifest text, and every dependency
@@ -307,6 +313,7 @@ fn analysed(
     reached: reached,
     viewed: loaded.views,
     tallies: [],
+    asked: [],
   };
   let owned = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
     map_insert(acc, source.name, true));
@@ -406,7 +413,7 @@ fn assembled(
   q: Queried,
   reached: Bool = true,
 ) -> Program / {abort.raise} =
-  { ..assembled_from(project, shipping, paths, q, reached), tallies: q.tallies }
+  { ..assembled_from(project, shipping, paths, q, reached), tallies: q.tallies, asked: q.asked }
 
 fn assembled_from(
   project: Project,
@@ -512,6 +519,66 @@ fn answers_of(
         else { queried::answered[abs](dir, project, asked, every) }
       },
     }
+  }
+
+/// Each path a command was given, as it resolved: what its reports' paths are relative to.
+pub fn resolved_fields(paths: List<paths::Resolved>) -> Bytes =
+  bytes_concat(
+    sized(bytes_of_string(int_to_string(len(paths)))),
+    bytes_concat_all(
+      map(paths, |r: paths::Resolved|
+        bytes_concat_all(
+          map([r.label, r.spelling, r.display, r.inside, r.absolute, r.machine], |s: String|
+            sized(bytes_of_string(s))),
+        )),
+    ),
+  )
+
+/// What names a command line and where it ran: its words, and each path it was given as resolved.
+pub fn asked_line(argv: List<String>, paths: List<paths::Resolved>) -> Bytes =
+  bytes_concat_all([
+    sized(bytes_of_string(int_to_string(len(argv)))),
+    bytes_concat_all(map(argv, |a: String| sized(bytes_of_string(a)))),
+    resolved_fields(paths),
+  ])
+
+/// The answer kept under `key` for a command over `project`, in the memo store beside it, where it
+/// stands, asked again where marked only when `checked`; beside the marks found on it, which keeping
+/// it again removes.
+pub fn command_kept(
+  paths: List<paths::Resolved>,
+  project: Project,
+  key: Bytes,
+  checked: Bool = true,
+) -> { output: Option<Bytes>, marks: List<Bytes> } / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} =
+  match ((usable(project), list_at(paths, 0))) {
+    (true, Some(r)) -> {
+      let dir = paths::in_root(r, ".ply-cache/memo").path;
+      if r.label == "cwd" { queried::command_kept[cwd](dir, project, key, checked) }
+      else { queried::command_kept[abs](dir, project, key, checked) }
+    },
+    _ -> { output: None, marks: [] },
+  }
+
+/// `output` kept under `key` as a command's answer over `project`, the load `program` made: in the
+/// memo store beside it, as a function of what the load asked. Whether the store holds it now.
+pub fn keep_command(
+  paths: List<paths::Resolved>,
+  project: Project,
+  key: Bytes,
+  program: Program,
+  output: Bytes,
+  marks: List<Bytes>,
+) -> Bool / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} =
+  match ((usable(project), list_at(paths, 0))) {
+    (true, Some(r)) -> {
+      let dir = paths::in_root(r, ".ply-cache/memo").path;
+      let made = queried::program();
+      if r.label == "cwd" {
+        queried::keep_command[cwd](dir, project, key, made, program.asked, output, marks)
+      } else { queried::keep_command[abs](dir, project, key, made, program.asked, output, marks) }
+    },
+    _ -> false,
   }
 
 /// [`answers_of`] answered afresh, with nothing kept.
