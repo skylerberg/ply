@@ -8,15 +8,16 @@
 import front (Dump, EmitterRoot, Embedded, AnalysisOutcome, Analysed, Refused, Rows, Shipping,
               ShippedView, analyse_pulling_std_with, checked_staged, dump_of, embeds_wanted,
               module_of, pulls_of, shipped_pulled, staged_pulling_std_with, viewed_text,
-              ModuleFacts, answered_load, view_dump)
+              ModuleShape, answered_load, view_dump)
 import embed (EmbedAt, EmbedRead, EmbedFile)
 import hash (HashOutput, Fixing, no_fixing, hex)
 import interface (imported)
-import memo (Query, Run, memo, memo_keep)
+import memo
+import memo (Query, Run, memo, memo_keep, started)
 import memo_files
-import checking (Answered, OwnPackage, World, asked_all, entry_hash, evaluator_of, hashed_all,
-                 identity_of, looked, packages_refused, queries, refused_first, registry,
-                 root_warnings, world_of)
+import checking (Answered, ModuleAnswer, OwnPackage, World, asked_all, entry_hash, evaluator_of,
+                 hashed_all, identity_of, looked, packages_refused, queries, refused_first,
+                 registry, root_warnings, view_answered, world_of)
 import pkg (PackageSources, Supplied, closure, git_spec, wants)
 import resolve (Source, Diag, Label, error_at)
 import unit (Runtime, shipped, compiled)
@@ -299,13 +300,12 @@ fn placed(
     })
 }
 
-/// What a read takes in before it loads anything: the program's packages, the shipped modules they
-/// pull, and what each of its modules embeds.
+/// What a read takes in before it loads anything: the program's packages and what each of its
+/// modules embeds.
 pub type Prepared = {
   own: Package,
   deps: List<Package>,
   pkgs: PackageSources,
-  shipping: Shipping,
   embeds: List<Embedded>,
 }
 
@@ -313,7 +313,7 @@ pub type Prepared = {
 /// `ply` would have to fetch are each a refusal.
 pub fn prepared<[r]>(
   root: String,
-) -> Result<Prepared, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.names, shipped.module, abort.raise} =
+) -> Result<Prepared, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], abort.raise} =
   match package_at[r](root) {
     Err(diags) -> Err(unloaded(diags)),
     Ok(own) -> if len(own.files) == 0 {
@@ -331,7 +331,6 @@ pub fn prepared<[r]>(
             own: own,
             deps: deps,
             pkgs: pkgs,
-            shipping: shipped_for(sources_of(own.files), pkgs),
             embeds: fold(deps, embeds_of[r](own), |acc: List<Embedded>, package: Package|
               concat(acc, embeds_of[r](package))),
           })
@@ -370,15 +369,15 @@ fn in_store<a, [r]>(
   let look = |kind: Bytes, at: Bytes|
     looked(w, held_module, held_module, || map(shipped.names(), bytes_of_string), kind, at);
   if dir == "" {
-    memo_files::fresh(|path: String| shipped.answer(path), look, |run: Run| work(qs, w, run)).value
+    memo::fresh(|path: String| shipped.answer(path), look, || work(qs, w, started(qs)).value)
   } else {
     let at = dir ++ "-" ++ identity_of(qs);
     if fs.create_dir[r](at) {
       fs.write_file[r](at ++ "/.used", b"");
       ()
     };
-    memo_files::kept[r](at, |path: String| shipped.answer(path), look, |run: Run|
-      work(qs, w, run)).value
+    memo_files::kept[r](at, |path: String| shipped.answer(path), look, ||
+      work(qs, w, started(qs)).value)
   }
 }
 
@@ -387,24 +386,26 @@ fn in_store<a, [r]>(
 fn running() -> Map<Bytes, Query> / {shipped.definitions, shipped.stamps, abort.raise} =
   registry(shipped.definitions(), evaluator_of(bytes_of_string(shipped.stamps())))
 
-/// What each module of a load answered checked and, where none refuses, what hashing fixed of each.
-pub type Asked = { answers: List<Answered>, fixing: Fixing }
+/// What each module of a load answered checked, the shipped modules it pulled in the order it
+/// pulled them, and, where none refuses, what hashing fixed of each.
+pub type Asked = { answers: List<Answered>, pulled: List<Bytes>, fixing: Fixing }
 
-/// What each module of `w`, a load of `p`, and each shipped module `p` pulls answers, asked of `qs`
+/// What each module of `w`, a load of `p`, and each shipped module they pull answers, asked of `qs`
 /// over a run.
 fn asked(
   qs: Map<Bytes, Query>,
   w: World,
-  p: Prepared,
   run: Run,
 ) -> { run: Run, value: Asked } / {memo_keep.read, memo_keep.write, abort.raise} = {
-  let all = asked_all(qs, w.own, shipped_of(p), false, run);
+  let all = asked_all(qs, w.own, [], false, run);
+  let answers = all.value.answers;
+  let pulled = all.value.pulled;
   // A program some module refuses has nothing to hash.
-  if len(refused_first(all.value)) > 0 {
-    { run: all.run, value: { answers: all.value, fixing: no_fixing() } }
+  if len(refused_first(answers)) > 0 {
+    { run: all.run, value: { answers: answers, pulled: pulled, fixing: no_fixing() } }
   } else {
-    let fixed = hashed_all(qs, w.own, shipped_of(p), false, all.run);
-    { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+    let fixed = hashed_all(qs, w.own, pulled, false, all.run);
+    { run: fixed.run, value: { answers: answers, pulled: pulled, fixing: fixed.value } }
   }
 }
 
@@ -414,7 +415,7 @@ pub fn answers_of<[r]>(
   p: Prepared,
   dir: String,
 ) -> Asked / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
-  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| asked(qs, w, p, run))
+  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| asked(qs, w, run))
 
 /// The hash of `entry` as hashing its module fixed it, through the memo store in the stage `dir`
 /// names: nothing where its module does not define it or does not hash. No other module is asked,
@@ -436,15 +437,18 @@ pub fn answers_afresh(
 ) -> Asked / {shipped.answer, shipped.names, shipped.module, shipped.definitions, shipped.stamps, abort.raise} = {
   let w = world_for(p);
   let qs = running();
-  memo_files::fresh(
+  memo::fresh(
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes|
       looked(w, held_module, held_module, || map(shipped.names(), bytes_of_string), kind, at),
-    |run: Run| asked(qs, w, p, run),
-  ).value
+    || asked(qs, w, started(qs)).value,
+  )
 }
 
-fn shipped_of(p: Prepared) -> List<Bytes> = map(p.shipping.read, |s: Source| s.name)
+/// Each of `pulled`, the shipped modules a load pulled, by its text as a module importing it reads it.
+fn pulled_texts(pulled: List<Bytes>) -> Map<Bytes, Bytes> / {shipped.module, abort.raise} =
+  fold(pulled, map_new(), |acc: Map<Bytes, Bytes>, n: Bytes|
+    match held_module(n) { Some(text) -> map_insert(acc, n, imported(text)), None -> acc })
 
 /// The module that defines `entry`.
 fn entry_module(entry: Bytes) -> Bytes / {abort.raise} = {
@@ -474,46 +478,51 @@ pub fn assembled(
   p: Prepared,
   asked: Asked,
   tested: Bool,
-) -> Result<Checked, Unloaded> / {shipped.reached, abort.raise} = {
-  let mine = placed(p.own, p.deps, shipped_of(p), texts_of(p.shipping.read));
+) -> Result<Checked, Unloaded> / {shipped.names, shipped.module, shipped.reached, abort.raise} = {
+  let texts = pulled_texts(asked.pulled);
+  let listed = map(shipped.names(), bytes_of_string);
+  let mine = placed(p.own, p.deps, asked.pulled, texts);
   let answers = asked.answers;
   let modules = fold(p.deps, len(p.own.files), |n: Int, d: Package| n + len(d.files))
-    + len(p.shipping.read);
+    + len(asked.pulled);
   let packaged = packages_refused(
     p.pkgs,
     map(p.own.files, |f: SourceFile| bytes_of_string(f.name)),
     modules,
-    concat(shipped_of(p), p.shipping.unread),
+    listed,
   );
   match if len(packaged) > 0 { packaged } else { refusals(answers, mine) } {
     [] -> {
       let loaded = answered_load(
         map(p.own.files, |f: SourceFile| bytes_of_string(f.name)),
         p.pkgs,
-        fold(answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
-          map_insert(acc, a.module, a.answer.facts)),
+        fold(answers, map_new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
+          map_insert(acc, a.module, a.answer.shape)),
         asked.fixing,
-        p.shipping.read,
-        p.shipping.unread,
-        [],
+        asked.pulled,
+        listed,
+        texts,
         tested,
         true,
         root_warnings(answers, len(p.own.files)),
       );
-      let program = loaded.program;
-      let pulled = loaded.pulled;
-      let texts = texts_of(p.shipping.read);
-      tell_viewed(program.views, true);
+      let view = view_answered(
+        loaded.frame,
+        loaded.reads,
+        fold(answers, map_new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
+          map_insert(acc, a.module, a.answer)),
+      );
+      tell_viewed(loaded.views, true);
       Ok({
         front: {
-          dump: view_dump(program.view, None),
-          files: placed(p.own, p.deps, pulled, texts),
+          dump: view_dump(view, None),
+          files: placed(p.own, p.deps, loaded.pulled, texts),
           read_ms: 0,
           front_ms: 0,
           file_ms: 0,
           cached: false,
         },
-        hashes: program.view.hashes,
+        hashes: view.frame.hashes,
       })
     },
     ds -> Err({ diags: ds, files: mine }),

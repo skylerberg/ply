@@ -10,9 +10,10 @@ import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
-                       ShippedView, Within, View, Outline, Outlined, OFn, FnOutline, ModuleFacts,
-                       analyse_pulling_std_with, answered_load, dump_of, view_dump, view_of,
-                       embeds_now, no_rows, pins_pulling, rows_of, KnownDefRow, KnownTestRow)
+                       ShippedView, Within, View, Frame, TableReads, Outline, Outlined, OFn,
+                       FnOutline, ModuleShape, analyse_pulling_std_with, answered_load, dump_of,
+                       view_dump, view_of, no_reads, embeds_now, no_rows, pins_pulling, rows_of,
+                       KnownDefRow, KnownTestRow)
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import interfaces
 import compiler.hash
@@ -28,33 +29,36 @@ import diagnostic (Place, spot_of)
 import paths
 import proof.statics (Unshown, unshown)
 import proof.world (measures_in)
-import sources (File, Project, DepPackage, Embed, KeptShipping, PullReads, load_resolved,
-                shipping_for, shipping_kept, no_shipping, shipped_listed, nothing_here, is_std,
-                is_compiler)
+import sources (File, Project, DepPackage, Embed, load_resolved, asked_shipped, shipping_kept_of,
+                shipping_of, shipped_listed, nothing_here, is_std, is_compiler)
 import builder (builder)
 import queried
 import queried (Queried)
 import statements (statement_modules)
 import compiler.memo (Tally)
-import compiler.checking (Answered, packages_refused, refused_first, root_warnings)
+import compiler.checking (Answered, ModuleAnswer, packages_refused, refused_first, root_warnings,
+                          rows_answered, view_answered)
 import std.random (entropy)
 import std.list (at, concat, contains, drop, push_unique, take)
 import std.string (join)
 import compiler.parsing (no_module)
 
-/// `view` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
+/// `frame` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
 /// `pkgs` is kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
 pub type Program = {
   files: List<File>,
   places: List<Place>,
   diags: List<Diag>,
-  view: Option<View>,
+  frame: Option<Frame>,
+  /// What each module answered, and how the load reads each one's tables: what [`program_view`]
+  /// makes the check's tables of, and [`whole_of`] the rows it seeds an analysis with.
+  answered: Map<Bytes, ModuleAnswer>,
+  reads: TableReads,
   /// The program analysed whole, where the load read something of its own modules from syntax.
   whole: Option<Analysis>,
-  /// The root package's modules, and what their answers published and hashing fixed of every
-  /// module: what [`whole_of`] analyses the program from.
+  /// The root package's modules, and what hashing fixed of every module: what [`whole_of`]
+  /// analyses the program from.
   sources: List<Source>,
-  rows: Rows,
   fixed: Fixing,
   pkgs: PackageSources,
   embeds: List<Embed>,
@@ -83,15 +87,7 @@ pub type ModuleReport = {
 /// A load with the clock read between its phases, for the command that reports where the time went:
 /// the walk and the shipped modules; and the front end, its modules answered through the memo store
 /// among it. `cached` and `file_ms` are what no load files any more.
-/// `pulls` is how a load that keeps what its modules pull found it; `None` for one that keeps none.
-pub type Timed = {
-  program: Program,
-  read_ms: Int,
-  front_ms: Int,
-  file_ms: Int,
-  cached: Bool,
-  pulls: Option<PullReads>,
-}
+pub type Timed = { program: Program, read_ms: Int, front_ms: Int, file_ms: Int, cached: Bool }
 
 // --- Where a shipped module's text is said to live ------------------------------
 
@@ -118,10 +114,11 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     files: project.files,
     places: places,
     diags: diags,
-    view: None,
+    frame: None,
+    answered: map_new(),
+    reads: no_reads(),
     whole: None,
     sources: project.sources,
-    rows: no_rows(),
     fixed: no_fixing(),
     pkgs: pkgs_of(project),
     embeds: project.embeds,
@@ -137,10 +134,11 @@ pub fn no_program() -> Program =
     files: [],
     places: [],
     diags: [],
-    view: None,
+    frame: None,
+    answered: map_new(),
+    reads: no_reads(),
     whole: None,
     sources: [],
-    rows: no_rows(),
     fixed: no_fixing(),
     pkgs: { root: b"", manifest: None, supplied: [] },
     embeds: [],
@@ -228,14 +226,14 @@ fn front_end(
 /// are walked again with every definition whose check reads one of them.
 pub fn reanalysed(
   program: Program,
-  view: View,
+  frame: Frame,
   sources: List<Source>,
   pkgs: PackageSources,
   moved: List<Bytes>,
 ) -> Pulled / {abort.raise} = {
-  let rows = program.rows;
+  let rows = rows_answered_all(program);
   let stale = hash::reaching(
-    view.hashes,
+    frame.hashes,
     fold(moved, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true)),
   );
   front_end(
@@ -261,6 +259,7 @@ fn analysed(
   project: Project,
   shipping: Shipping,
   answers: List<Answered>,
+  pulled: List<Bytes>,
   reached: Bool,
   fixed: Fixing,
 ) -> Program / {abort.raise} = {
@@ -271,12 +270,13 @@ fn analysed(
   let loaded = answered_load(
     map(project.sources, |s: Source| s.name),
     pkgs,
-    fold(answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
-      map_insert(acc, a.module, a.answer.facts)),
+    fold(answers, map_new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
+      map_insert(acc, a.module, a.answer.shape)),
     fixed,
-    shipping.read,
-    shipping.unread,
-    shipping.asked,
+    pulled,
+    shipped_listed(shipping),
+    fold(shipping.read, map_new(), |acc: Map<Bytes, Bytes>, source: Source|
+      map_insert(acc, source.name, source.src)),
     true,
     reached,
     warnings,
@@ -292,26 +292,23 @@ fn analysed(
       own.manifests,
     ),
     diags: warnings,
-    view: Some(loaded.program.view),
+    frame: Some(loaded.frame),
+    answered: fold(answers, map_new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
+      map_insert(acc, a.module, a.answer)),
+    reads: loaded.reads,
     whole: None,
     sources: project.sources,
-    rows: {
-      defs: fold(answers, [], |acc: List<KnownDefRow>, a: Answered|
-        concat(acc, a.answer.rows.defs)),
-      tests: fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
-        concat(acc, a.answer.rows.tests)),
-    },
     fixed: fixed,
     pkgs: pkgs,
     embeds: project.embeds,
     shipping: shipping,
     reached: reached,
-    viewed: loaded.program.views,
+    viewed: loaded.views,
     tallies: [],
   };
   let owned = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
     map_insert(acc, source.name, true));
-  let own = take(loaded.program.view.outlines, len(project.files));
+  let own = take(loaded.frame.outlines, len(project.files));
   let held = |pick: (FnOutline) -> Bool|
     fold(own, false, |b: Bool, o: Outline|
       b
@@ -319,7 +316,7 @@ fn analysed(
           m || (match item { OFn(f) -> pick(f), _ -> false })));
   let measured = held(|f: FnOutline| f.measured);
   if !measured && !stating(own) && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
-    let refused = |ds: List<Diag>| { ..program, diags: ds, view: None };
+    let refused = |ds: List<Diag>| { ..program, diags: ds, frame: None };
     match whole_of(program) {
       Err(ds) -> refused(ds),
       Ok(w) -> match if measured { unshown(w, |m: Bytes| map_contains(owned, m)) } else { [] } {
@@ -338,26 +335,41 @@ fn stating(own: List<Outline>) -> Bool =
 
 /// Whether one of the program's own modules runs a statement: is or imports a module that declares
 /// what runs one.
-pub fn runs_statements(program: Program, view: View) -> Bool =
-  stating(take(view.outlines, len(program.files)))
+pub fn runs_statements(program: Program, frame: Frame) -> Bool =
+  stating(take(frame.outlines, len(program.files)))
+
+/// What each module of the program published of its definitions and tests.
+fn rows_answered_all(program: Program) -> Rows / {abort.raise} =
+  map_fold(program.answered, no_rows(), |acc: Rows, _: Bytes, a: ModuleAnswer| {
+    let rows = rows_answered(a);
+    { defs: concat(acc.defs, rows.defs), tests: concat(acc.tests, rows.tests) }
+  })
+
+/// The program's check's tables beside its frame, read from what its modules answered: what a
+/// command that reads the check takes. `None` where the load refused.
+pub fn program_view(program: Program) -> Option<View> / {abort.raise} =
+  match program.frame {
+    None -> None,
+    Some(f) -> Some(view_answered(f, program.reads, program.answered)),
+  }
 
 /// The program analysed whole, each definition and test taken as its module's answer published it
 /// and hashing fixed it: what a command that reads syntax takes. `Err` holds what refuses it.
 pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise} =
-  match ((program.view, program.whole)) {
+  match ((program.frame, program.whole)) {
     (None, _) -> Err(program.diags),
     (Some(_), Some(w)) -> Ok(w),
-    (Some(v), None) -> match front_end(
+    (Some(f), None) -> match front_end(
         program.sources,
         program.shipping,
-        program.rows,
+        rows_answered_all(program),
         program.pkgs,
         program.embeds,
         program.reached,
         program.fixed,
       ).out {
       Refused(ds) -> Err(ds),
-      Analysed(w) -> Ok({ ..w, warnings: v.warnings }),
+      Analysed(w) -> Ok({ ..w, warnings: f.warnings }),
     },
   }
 
@@ -392,16 +404,16 @@ fn assembled(
   q: Queried,
   reached: Bool = true,
 ) -> Program / {abort.raise} =
-  { ..assembled_from(project, shipping, paths, q.answers, q.fixing, reached), tallies: q.tallies }
+  { ..assembled_from(project, shipping, paths, q, reached), tallies: q.tallies }
 
 fn assembled_from(
   project: Project,
   shipping: Shipping,
   paths: List<paths::Resolved>,
-  answers: List<Answered>,
-  fixed: Fixing,
+  q: Queried,
   reached: Bool,
-) -> Program / {abort.raise} =
+) -> Program / {abort.raise} = {
+  let answers = q.answers;
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, shipping, [], [
@@ -435,8 +447,9 @@ fn assembled_from(
         }
       });
       broken(project, shipping, concat(concat(own.modules, pulled), own.manifests), diags)
-    } else { analysed(project, shipping, answers, reached, fixed) }
+    } else { analysed(project, shipping, answers, q.pulled, reached, q.fixing) }
   }
+}
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
   interfaces::slots(project.root_key, map(project.packages, |package: DepPackage| package.root))
@@ -448,9 +461,9 @@ fn verified(
   verify: Bool,
   program: Program,
 ) -> Program / {fs.read_file[abs], abort.raise} =
-  if !verify || program.view == None { program } else {
+  if !verify || program.frame == None { program } else {
     match whole_of(program) {
-      Err(ds) -> { ..program, diags: ds, view: None },
+      Err(ds) -> { ..program, diags: ds, frame: None },
       Ok(w) -> match interfaces::underived(
           slots_of(project),
           interfaces::dependency_sources(
@@ -460,7 +473,7 @@ fn verified(
           w,
         ) {
         [] -> program,
-        refused -> { ..program, diags: concat(program.diags, refused), view: None },
+        refused -> { ..program, diags: concat(program.diags, refused), frame: None },
       },
     }
   }
@@ -469,8 +482,8 @@ fn verified(
 /// source id it answers under, so one entry per place is what keeps the ids of everything after it
 /// where the machine's reader expects them. A manifest carries no module, and the runtime files one
 /// under `pkg`.
-fn placed_sources(program: Program, view: View) -> List<SourceFile> / {abort.raise} = {
-  let named = modules_of(program, view);
+fn placed_sources(program: Program, frame: Frame) -> List<SourceFile> / {abort.raise} = {
+  let named = modules_of(program, frame);
   map(range(0, len(program.places)), |i: Int|
     {
       path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
@@ -479,23 +492,22 @@ fn placed_sources(program: Program, view: View) -> List<SourceFile> / {abort.rai
     })
 }
 
-/// Each module of `project`'s own packages and each shipped module `shipping` pulls, answered checked
-/// through the memo store beside the project; a shipped one read with its tests where `every` says,
-/// as a run over the standard library's own tests reads it.
+/// Each module of `project`'s own packages and each shipped module they pull, answered checked
+/// through the memo store beside the project; with `every`, each module of the standard library
+/// pulled whatever imports it and read with its tests, as a run over its own tests reads it.
 fn answers_of(
   paths: List<paths::Resolved>,
   project: Project,
-  shipping: Shipping,
   every: Bool,
 ) -> Queried / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], shipped.answer, abort.raise} =
   if !usable(project) { queried::nothing() } else {
-    let shipped = map(shipping.read, |s: Source| s.name);
+    let asked = asked_shipped(every);
     match list_at(paths, 0) {
-      None -> queried::answered_afresh(project, shipped, every),
+      None -> queried::answered_afresh(project, asked, every),
       Some(r) -> {
         let dir = paths::in_root(r, ".ply-cache/memo").path;
-        if r.label == "cwd" { queried::answered[cwd](dir, project, shipped, every) }
-        else { queried::answered[abs](dir, project, shipped, every) }
+        if r.label == "cwd" { queried::answered[cwd](dir, project, asked, every) }
+        else { queried::answered[abs](dir, project, asked, every) }
       },
     }
   }
@@ -503,11 +515,10 @@ fn answers_of(
 /// [`answers_of`] answered afresh, with nothing kept.
 fn answers_afresh(
   project: Project,
-  shipping: Shipping,
   every: Bool,
 ) -> Queried / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   if !usable(project) { queried::nothing() }
-  else { queried::answered_afresh(project, map(shipping.read, |s: Source| s.name), every) }
+  else { queried::answered_afresh(project, asked_shipped(every), every) }
 
 /// `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
 /// `verify` holds each published interface to what this load reads of its package's source.
@@ -517,20 +528,13 @@ pub fn load_program(
   verify: Bool = false,
 ) -> Program / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
-  let shipping: Shipping = if usable(project) {
-    shipping_kept(paths, project.sources, pkgs_of(project)).shipping
-  } else { no_shipping() };
+  let answers = answers_of(paths, project, false);
+  let shipping = shipping_kept_of(answers.pulled, false);
   let p: Program = verified(
     project,
     shipping,
     verify,
-    assembled(
-      project,
-      shipping,
-      paths,
-      answers_of(paths, project, shipping, false),
-      reached: interfaced,
-    ),
+    assembled(project, shipping, paths, answers, reached: interfaced),
   );
   tell_viewed(p.viewed, true);
   p
@@ -561,9 +565,8 @@ pub fn load_uncached(
   paths: List<paths::Resolved>,
 ) -> Program / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
-  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
-  else { no_shipping() };
-  let p = assembled(project, shipping, paths, answers_afresh(project, shipping, false));
+  let answers = answers_afresh(project, false);
+  let p = assembled(project, shipping_of(answers.pulled, false), paths, answers);
   tell_viewed(p.viewed, true);
   p
 }
@@ -577,8 +580,8 @@ pub fn front_of(
   within: Option<Within> = None,
 ) -> LoadedAnalysis / {abort.raise} = {
   {
-    dump: view_dump({ ..view, warnings: timed.program.diags }, within),
-    files: placed_sources(timed.program, view),
+    dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diags } }, within),
+    files: placed_sources(timed.program, view.frame),
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
     file_ms: timed.file_ms,
@@ -616,11 +619,8 @@ pub fn timed_over(
   every: Bool = false,
 ) -> Timed / {shipped.answer, env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
   let interfaced = interfaced && !every;
-  let found: KeptShipping = if usable(project) {
-    shipping_kept(paths, project.sources, pkgs_of(project), every)
-  } else { { shipping: no_shipping(), reads: { lexed: 0, kept: 0 } } };
-  let shipping = found.shipping;
-  let answers = answers_of(paths, project, shipping, every);
+  let answers = answers_of(paths, project, every);
+  let shipping = shipping_kept_of(answers.pulled, every);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
@@ -635,7 +635,6 @@ pub fn timed_over(
     front_ms: time.elapsed_ms() - read_done,
     file_ms: 0,
     cached: true,
-    pulls: Some(found.reads),
   }
 }
 
@@ -657,10 +656,8 @@ pub fn timed_uncached_over(
   verify: Bool = false,
   every: Bool = false,
 ) -> Timed / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise, shipped.reached} = {
-  let shipping: Shipping = if usable(project) {
-    shipping_for(project.sources, pkgs_of(project), every)
-  } else { no_shipping() };
-  let answers = answers_afresh(project, shipping, every);
+  let answers = answers_afresh(project, every);
+  let shipping = shipping_of(answers.pulled, every);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
@@ -675,7 +672,6 @@ pub fn timed_uncached_over(
     front_ms: time.elapsed_ms() - read_done,
     file_ms: 0,
     cached: false,
-    pulls: None,
   }
 }
 
@@ -687,16 +683,16 @@ pub fn unmoved(project: Project, program: Program) -> Bool =
 
 // --- Reading the tables ----------------------------------------------------------
 
-pub fn modules_of(program: Program, view: View) -> List<ModuleView> / {abort.raise} =
-  map(range(0, len(view.outlines)), |i: Int|
+pub fn modules_of(program: Program, frame: Frame) -> List<ModuleView> / {abort.raise} =
+  map(range(0, len(frame.outlines)), |i: Int|
     {
-      name: string_of_bytes_lossy(at(view.outlines, i).name),
+      name: string_of_bytes_lossy(at(frame.outlines, i).name),
       path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
     })
 
-pub fn module_reports(program: Program, view: View) -> List<ModuleReport> / {abort.raise} =
-  map(range(0, len(view.outlines)), |i: Int| {
-    let o = at(view.outlines, i);
+pub fn module_reports(program: Program, frame: Frame) -> List<ModuleReport> / {abort.raise} =
+  map(range(0, len(frame.outlines)), |i: Int| {
+    let o = at(frame.outlines, i);
     {
       index: i,
       name: string_of_bytes_lossy(o.name),
@@ -708,10 +704,10 @@ pub fn module_reports(program: Program, view: View) -> List<ModuleReport> / {abo
 
 /// The modules as the front end took them: the project's own files first, then the shipped modules
 /// it pulled, in the order the label indices count.
-pub fn sourced(program: Program, view: View) -> List<Source> / {abort.raise} =
-  map(range(0, len(view.outlines)), |i: Int|
+pub fn sourced(program: Program, frame: Frame) -> List<Source> / {abort.raise} =
+  map(range(0, len(frame.outlines)), |i: Int|
     {
-      name: at(view.outlines, i).name,
+      name: at(frame.outlines, i).name,
       src: match list_at(program.places, i) { Some(place) -> place.text, None -> b"" },
     })
 
@@ -722,14 +718,14 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
 /// What a run answers for: its root package's modules, and the standard library's when it asks for
 /// them. Another package's definitions are claimed by their specs: that package's own run proves
 /// them, as the compiler's own run proves the compiler's.
-pub fn owned_of(view: View, std: Bool) -> (Bytes) -> Bool = {
+pub fn owned_of(frame: Frame, std: Bool) -> (Bytes) -> Bool = {
   let roots = fold(
-    view.outlines,
+    frame.outlines,
     { i: 0, roots: map_new() },
     |acc: { i: Int, roots: Map<Bytes, Bool> }, o: Outline|
       {
         i: acc.i + 1,
-        roots: if list_at(view.module_packages, acc.i) == Some(0) {
+        roots: if list_at(frame.module_packages, acc.i) == Some(0) {
           map_insert(acc.roots, o.name, true)
         } else { acc.roots },
       },
@@ -781,7 +777,7 @@ fn module_fns(acc: List<Bytes>, o: Outline) -> List<Bytes> =
 pub fn published(view: View) -> List<DefInfo> = {
   let by_name = fold(view.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, def_info: DefInfo|
     map_insert(acc, def_info.name, def_info));
-  let named = fold(view.outlines, [], module_fns);
+  let named = fold(view.frame.outlines, [], module_fns);
   let first: Picking = fold(named, { seen: map_new(), out: [] }, |acc: Picking, name: Bytes|
     pick(acc, by_name, name));
   let all: Picking = fold(view.checked.defs, first, |acc: Picking, def_info: DefInfo|
@@ -932,9 +928,9 @@ test "under `--std` a proof answers for the standard library's claims and never 
     Analysed(w) -> w,
     Refused(_) -> panic("the fixture checks"),
   };
-  let owned = owned_of(view_of(w), true);
+  let owned = owned_of(view_of(w).frame, true);
   assert(owned(b"m") && owned(b"std.y") && !owned(b"compiler.x"));
-  assert(!owned_of(view_of(w), false)(b"std.y"))
+  assert(!owned_of(view_of(w).frame, false)(b"std.y"))
 }
 
 test "a shipped module is one under a reserved root and nothing else" {

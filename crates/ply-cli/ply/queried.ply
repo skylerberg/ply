@@ -2,7 +2,8 @@
 //! the walk and the toolchain's shipped modules hold it.
 
 import std.fs (fs)
-import compiler.memo (Query, Record, Run, Tally, memo_keep, tallies)
+import compiler.memo
+import compiler.memo (Query, Record, Run, Tally, memo_keep, started, tallies)
 import compiler.memo_files
 import compiler.unit (shipped)
 import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of, hashed_all,
@@ -51,40 +52,48 @@ fn running() -> Map<Bytes, Query> / {fs.read_file[shipped], abort.raise} =
     _ -> panic("the toolchain ships no `definitions` or no `stamps`"),
   }
 
-/// What each module of a load answered, what hashing fixed of each where none refuses, and what the
-/// run did of each query to answer them.
-pub type Queried = { answers: List<Answered>, fixing: Fixing, tallies: List<Tally> }
+/// What each module of a load answered, the shipped modules it pulled in the order it pulled them,
+/// what hashing fixed of each where none refuses, and what the run did of each query to answer them.
+pub type Queried = {
+  answers: List<Answered>,
+  pulled: List<Bytes>,
+  fixing: Fixing,
+  tallies: List<Tally>,
+}
 
 /// What a load with no modules to answer answers.
-pub fn nothing() -> Queried = { answers: [], fixing: no_fixing(), tallies: [] }
+pub fn nothing() -> Queried = { answers: [], pulled: [], fixing: no_fixing(), tallies: [] }
 
-type Asked = { answers: List<Answered>, fixing: Fixing }
+type Asked = { answers: List<Answered>, pulled: List<Bytes>, fixing: Fixing }
 
-/// What `own` and `shipped` answer over `run`, each shipped one read with its tests where `tested`
-/// says, and what hashing fixed of each where none refuses.
+/// What `own` and each shipped module they pull answer over `run`, `asked` pulled whatever imports
+/// them and each shipped one read with its tests where `tested` says, and what hashing fixed of each
+/// where none refuses.
 fn asked(
   qs: Map<Bytes, Query>,
   own: List<Bytes>,
-  shipped: List<Bytes>,
+  asked: List<Bytes>,
   tested: Bool,
   run: Run,
 ) -> { run: Run, value: Asked } / {memo_keep.read, memo_keep.write, abort.raise} = {
-  let all = asked_all(qs, own, shipped, tested, run);
-  if len(refused_first(all.value)) > 0 {
-    { run: all.run, value: { answers: all.value, fixing: no_fixing() } }
+  let all = asked_all(qs, own, asked, tested, run);
+  let answers = all.value.answers;
+  let pulled = all.value.pulled;
+  if len(refused_first(answers)) > 0 {
+    { run: all.run, value: { answers: answers, pulled: pulled, fixing: no_fixing() } }
   } else {
-    let fixed = hashed_all(qs, own, shipped, tested, all.run);
-    { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+    let fixed = hashed_all(qs, own, pulled, tested, all.run);
+    { run: fixed.run, value: { answers: answers, pulled: pulled, fixing: fixed.value } }
   }
 }
 
-/// What each module of `project`'s own packages answers, and each shipped module of `shipped`, read
-/// with its tests where `tested` says, through the memo store in `dir`, with what the toolchain
-/// ships answered for its shipped modules beside it.
+/// What each module of `project`'s own packages answers, and each shipped module they pull, `always`
+/// whatever imports them, read with its tests where `tested` says, through the memo store in `dir`,
+/// with what the toolchain ships answered for its shipped modules beside it.
 pub fn answered<[r]>(
   dir: String,
   project: Project,
-  shipped: List<Bytes>,
+  always: List<Bytes>,
   tested: Bool,
 ) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let qs = running();
@@ -93,9 +102,14 @@ pub fn answered<[r]>(
     dir,
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
-    |run: Run| asked(qs, w.own, shipped, tested, run),
+    || asked(qs, w.own, always, tested, started(qs)),
   );
-  { answers: done.value.answers, fixing: done.value.fixing, tallies: tallies(done.run) }
+  {
+    answers: done.value.answers,
+    pulled: done.value.pulled,
+    fixing: done.value.fixing,
+    tallies: tallies(done.run),
+  }
 }
 
 /// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
@@ -113,12 +127,11 @@ pub fn shipped_answers<[r], [w]>(
     work,
     |_: String| None,
     |kind: Bytes, at: Bytes| looked(nowhere, shipped_module, shipped_data, shipped_names, kind, at),
-    |run: Run| { run: shipped_all(qs, shipped, run), value: () },
+    || shipped_all(qs, shipped, started(qs)),
   );
   let wanted = fold(shipped_queries(), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
     match map_get(qs, name) { Some(q) -> map_insert(acc, q.hash, true), None -> acc });
-  let keys = map_fold(done.run.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes|
-    push(acc, key));
+  let keys = map_fold(done.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes| push(acc, key));
   memo_files::copied[r, w](
     work,
     out,
@@ -144,17 +157,22 @@ pub fn shipped_work(reused: String) -> String / {fs.read_file[shipped], abort.ra
 /// modules is read, the rest is answered afresh, and nothing is kept.
 pub fn answered_afresh(
   project: Project,
-  shipped: List<Bytes>,
+  always: List<Bytes>,
   tested: Bool,
 ) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
-  let done = memo_files::fresh(
+  let done = memo::fresh(
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
-    |run: Run| asked(qs, w.own, shipped, tested, run),
+    || asked(qs, w.own, always, tested, started(qs)),
   );
-  { answers: done.value.answers, fixing: done.value.fixing, tallies: tallies(done.run) }
+  {
+    answers: done.value.answers,
+    pulled: done.value.pulled,
+    fixing: done.value.fixing,
+    tallies: tallies(done.run),
+  }
 }
 
 /// The hash each query has now, which a record of any other hash will never be asked by again.

@@ -71,20 +71,24 @@ so a compiler change that leaves a test's code as it was does not run it again.
 A hash covers what its definition reaches and no comment or
 layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these.
 
-A module is checked by a query, a function of the compiler whose every read —
-of a file, the project's manifests, a shipped module, an embed, or another
-query's answer — the memo store records beside the digest of what it answered.
-A run takes a record whose every read answers as it did, and runs the query
-again where one does not, so an edit checks again the module it moved and each
-module whose check read something the edit changed: a module reads what each
-module it imports shows under the names it uses — the signature, row and counts
-of a definition, the form of a type or an effect — never that module's text, so
-a body edit that leaves those as they were checks no importer again. A record is
+A module is checked by a query, a function of the compiler whose every read — of
+a file, the project's manifests, a shipped module, an embed, or another query's
+answer — the memo store records beside the digest of what it answered. The store
+also notes what it last saw at each place a record read, and which records read
+each place and asked each record. A run first brings those notes to what the
+world holds, marking every record that read a place that moved and every record
+that asked a marked one; it takes an unmarked record without asking its reads
+again, so a run costs what moved rather than what the project holds. A marked
+record is taken where every read answers as it did, and the query runs again
+where one does not, so an edit checks again the module it moved and each module
+whose check read something the edit changed: a module reads what each module it
+imports shows under the names it uses — the signature, row and counts of a
+definition, the form of a type or an effect — never that module's text, so a
+body edit that leaves those as they were checks no importer again. A record is
 filed under the hash of the query's definition and the evaluator that ran it, so
 a `ply` that answers otherwise answers afresh. A shipped module (§13) answers
 alike in every project, so the binary carries what each answers, which `cargo
-pack` writes with `ply std --answers` and every load reads beside its own
-store.
+pack` writes with `ply std --answers` and every load reads beside its own store.
 
 ## 2. Lexical structure
 
@@ -3056,7 +3060,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -3165,14 +3169,16 @@ and takes the program's tables from what each answered, parsing no module again:
 definition's type and row, its tests, and its hashes, each of its own packages' hashed as its
 module hashed it, so a run checks and hashes again what an edit moved and takes the rest. A
 module's hashing fills its normalized forms with the hashes of what they reference, so an edit to
-a body hashes the modules that import it again without reading them. The program is analysed
+a body hashes the modules that import it again without reading them. Each module's answer keeps
+what its check said of each definition apart from its outline, and a load reads those tables only
+where its command does: `ply check` reads them for `--types` and `--json` alone. The program is analysed
 whole, each definition taken as its module answered it, only for what is read from its syntax: a
 `decreases` measure (`E0467`), a `reuse fn` or `returns` promise and `--costs`, a statement a
 call runs, `--verify-deps`, and the commands that read source (`ply doc`, `ply prove`,
 `ply review`).
-What each module imports, and what it embeds, is kept
-in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
-has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
+A load pulls each shipped module its modules' answers say they import, so a module that answers as
+it did pulls as it did, with no text read again to find what it pulls. What a load reads of a
+shipped module (§13) is kept once for the machine, in
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
 project's first load lexes no shipped module's tests or laws to find it.
 `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` answer
