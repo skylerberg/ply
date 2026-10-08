@@ -53,10 +53,8 @@
 #                                copied into OUT
 #   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
 #                                `workflow_dispatch`, SWEEP_SHARDS shards of the part of the cases
-#                                the day names, so SWEEP_DAYS days sweep every case; on a pull
-#                                request, a job for each module the paths on stdin change, up to
-#                                SWEEP_MOST of them, taking one of SWEEP_PARTS parts of its edits;
-#                                none otherwise
+#                                the day names, so SWEEP_DAYS days sweep every case; none otherwise,
+#                                since `edit_gate` holds a pull request to every kind of edit
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -106,8 +104,6 @@ CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations increment
 CLI_NIGHTLY=(edit_sweep)
 SWEEP_SHARDS=16
 SWEEP_DAYS=14
-SWEEP_MOST=6
-SWEEP_PARTS=4
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
 # steps that keep what they wrote: a cold partition packed and uploaded its stores and C in about one.
 RUNS_MARGIN=4
@@ -1986,36 +1982,15 @@ cmd_verify() {
 
 # The sweep's cases for a changed path, as a `--filter`: an example, a module of the compiler's
 # package, or one of the standard library; nothing for any other path.
-sweep_filter() {
-  local path=$1 module
-  case $path in
-    examples/*/*) ;;
-    examples/*.ply) printf 'edit_sweep.editing %s with \n' "${path%.ply}" ;;
-    crates/ply-compiler/ply/*/*) ;;
-    crates/ply-compiler/ply/*.ply)
-      module=${path#crates/ply-compiler/ply/}
-      printf 'edit_sweep.editing compiler/%s with \n' "${module%.ply}"
-      ;;
-    crates/ply-std/ply/*.ply)
-      module=${path#crates/ply-std/ply/}
-      printf 'edit_sweep.editing std/%s with \n' "${module%.ply}"
-      ;;
-  esac
-}
-
 cmd_sweep_matrix() {
-  local event=$1 path
+  local event=$1
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
     jq -cn --argjson n "$SWEEP_SHARDS" --argjson days "$SWEEP_DAYS" --argjson day "$(($(date -u +%s) / 86400))" \
       '($n * $days) as $of | {include: [range(1; $n + 1) | (($day % $days) * $n + .) as $k
         | {name: "\($k)/\($of)", shard: "\($k)/\($of)", filter: ""}]}'
-    return
+  else
+    echo '{"include":[]}'
   fi
-  # A run takes a quarter of each changed module's edits, the next run of the pull request the next.
-  local part=$((${GITHUB_RUN_NUMBER:-0} % SWEEP_PARTS + 1))
-  while read -r path; do sweep_filter "$path"; done | sort -u | head -n "$SWEEP_MOST" |
-    jq -Rcn --arg shard "$part/$SWEEP_PARTS" \
-      '{include: [inputs | {name: (. | sub("^edit_sweep.editing "; "") | sub(" with $"; "")), shard: $shard, filter: .}]}'
 }
 
 case "${1:-}" in
