@@ -8,9 +8,10 @@ import compiler.memo_files
 import compiler.unit (shipped)
 import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of, hashed_all,
                           identity_of, looked, refused_first, registry, shipped_all,
-                          shipped_queries, world_of)
+                          shipped_queries, world_of, world_placing)
 import compiler.hash (Fixing, no_fixing)
-import sources (Project, File, DepPackage, Embed)
+import sources (Project, File, DepPackage, Embed, embed_now, embed_of)
+import compiler.embed (EmbedAt, EmbedWant, want_of_key)
 import std.bytes (hex_of)
 
 fn own_file(f: File) -> OwnFile = { module: bytes_of_string(f.module), text: f.text }
@@ -25,8 +26,24 @@ fn world(project: Project) -> World / {abort.raise} =
     },
     map(project.packages, |p: DepPackage|
       { root: bytes_of_string(p.root), manifest: p.manifest, files: map(p.files, own_file) }),
-    map(project.embeds, |e: Embed| e.embedded),
   )
+
+/// What `answers` say the load's own modules embed, each beside its module's file.
+fn embeds_answered(
+  project: Project,
+  w: World,
+  answers: List<Answered>,
+) -> List<Embed> / {abort.raise} =
+  fold(answers, [], |acc: List<Embed>, a: Answered|
+    match world_placing(w, a.module) {
+      None -> acc,
+      Some(p) ->
+        fold(a.answer.shape.embeds, acc, |es: List<Embed>, e: EmbedAt|
+          match embed_of(project, p.package, p.relative, want_of_key(e.key), e.read) {
+            Some(x) -> push(es, x),
+            None -> es,
+          }),
+    })
 
 fn shipped_module(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
   fs.read_file[shipped](string_of_bytes_lossy(name) ++ ".ply")
@@ -58,11 +75,13 @@ pub type Queried = {
   answers: List<Answered>,
   pulled: List<Bytes>,
   fixing: Fixing,
+  embeds: List<Embed>,
   tallies: List<Tally>,
 }
 
 /// What a load with no modules to answer answers.
-pub fn nothing() -> Queried = { answers: [], pulled: [], fixing: no_fixing(), tallies: [] }
+pub fn nothing() -> Queried =
+  { answers: [], pulled: [], fixing: no_fixing(), embeds: [], tallies: [] }
 
 type Asked = { answers: List<Answered>, pulled: List<Bytes>, fixing: Fixing }
 
@@ -95,19 +114,29 @@ pub fn answered<[r]>(
   project: Project,
   always: List<Bytes>,
   tested: Bool,
-) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], shipped.answer, abort.raise} = {
+) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
   let done = memo_files::kept[r](
     dir,
     |path: String| shipped.answer(path),
-    |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
+    |kind: Bytes, at: Bytes|
+      looked(
+        w,
+        shipped_module,
+        shipped_data,
+        shipped_names,
+        |k: Int, m: Bytes, want: EmbedWant| embed_now(project, k, m, want),
+        kind,
+        at,
+      ),
     || asked(qs, w.own, always, tested, started(qs)),
   );
   {
     answers: done.value.answers,
     pulled: done.value.pulled,
     fixing: done.value.fixing,
+    embeds: embeds_answered(project, w, done.value.answers),
     tallies: tallies(done.run),
   }
 }
@@ -122,11 +151,20 @@ pub fn shipped_answers<[r], [w]>(
   shipped: List<Bytes>,
 ) -> Int / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.write[w], fs.read_file[shipped], abort.raise} = {
   let qs = running();
-  let nowhere = world_of({ root: b"", manifest: None, files: [] }, [], []);
+  let nowhere = world_of({ root: b"", manifest: None, files: [] }, []);
   let done = memo_files::kept[r](
     work,
     |_: String| None,
-    |kind: Bytes, at: Bytes| looked(nowhere, shipped_module, shipped_data, shipped_names, kind, at),
+    |kind: Bytes, at: Bytes|
+      looked(
+        nowhere,
+        shipped_module,
+        shipped_data,
+        shipped_names,
+        |k: Int, m: Bytes, want: EmbedWant| Err(b"no file is there"),
+        kind,
+        at,
+      ),
     || shipped_all(qs, shipped, started(qs)),
   );
   let wanted = fold(shipped_queries(), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
@@ -159,18 +197,28 @@ pub fn answered_afresh(
   project: Project,
   always: List<Bytes>,
   tested: Bool,
-) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
   let done = memo::fresh(
     |path: String| shipped.answer(path),
-    |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
+    |kind: Bytes, at: Bytes|
+      looked(
+        w,
+        shipped_module,
+        shipped_data,
+        shipped_names,
+        |k: Int, m: Bytes, want: EmbedWant| embed_now(project, k, m, want),
+        kind,
+        at,
+      ),
     || asked(qs, w.own, always, tested, started(qs)),
   );
   {
     answers: done.value.answers,
     pulled: done.value.pulled,
     fixing: done.value.fixing,
+    embeds: embeds_answered(project, w, done.value.answers),
     tallies: tallies(done.run),
   }
 }

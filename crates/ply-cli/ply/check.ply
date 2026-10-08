@@ -18,7 +18,8 @@ import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
 import paths (Resolved)
-import sources (Project, DepPackage, load_resolved)
+import sources (Project, DepPackage, Embed, Embedding, embedding_bin, embedding_of, embeds_stand,
+                load_resolved)
 import interfaces
 import compiler.hash (hex)
 import std.bin
@@ -706,8 +707,14 @@ fn checked(
 // A check's answer depends only on what its walk read, the toolchain, the places its reports name and
 // its flags; one filed under all of those is taken back, as `ply run` takes a front end.
 
-/// A check's answer as it is filed.
-type Replay = { lines: List<String>, errs: List<String>, code: Int, json: String }
+/// A check's answer as it is filed, beside the embeds its load read.
+type Replay = {
+  lines: List<String>,
+  errs: List<String>,
+  code: Int,
+  json: String,
+  embeds: List<Embedding>,
+}
 
 derive bin for Replay
 
@@ -772,16 +779,32 @@ fn replay_key(
   )
 }
 
-fn filed_answer(a: Answer) -> Bytes / {abort.raise} =
-  bin::encode({ lines: a.lines, errs: a.errs, code: a.code, json: to_string(a.json) }, replay_bin())
+fn filed_answer(a: Answer, embeds: List<Embed>) -> Bytes / {abort.raise} =
+  bin::encode(
+    {
+      lines: a.lines,
+      errs: a.errs,
+      code: a.code,
+      json: to_string(a.json),
+      embeds: map(embeds, |e: Embed| embedding_of(e.embedded)),
+    },
+    replay_bin(),
+  )
 
-fn replayed(entry: Option<Bytes>) -> Option<Answer> / {abort.raise} =
+/// The answer `entry` filed, beside the embeds its load read.
+fn replayed(
+  entry: Option<Bytes>,
+) -> Option<{ answer: Answer, embeds: List<Embedding> }> / {abort.raise} =
   match entry {
     None -> None,
     Some(bytes) -> match bin::decode(bytes, replay_bin()) {
       Err(_) -> None,
       Ok(r) -> match parse_string(r.json) {
-        Ok(json) -> Some({ json: json, lines: r.lines, errs: r.errs, code: r.code }),
+        Ok(json) ->
+          Some({
+            answer: { json: json, lines: r.lines, errs: r.errs, code: r.code },
+            embeds: r.embeds,
+          }),
         Err(_) -> None,
       },
     },
@@ -820,14 +843,18 @@ fn checked_now(
   flags: Flags,
   project: Project,
   started: Int,
-) -> { answer: Answer, filed: Option<Answer> } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
+) -> { answer: Answer, filed: Option<Answer>, embeds: List<Embed> } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
   match t.program.frame {
     None ->
-      { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
+      {
+        answer: refused(style_of(flags), "check", t.program.diags, t.program.places),
+        filed: None,
+        embeds: [],
+      },
     Some(f) -> {
       let answer = checked(style_of(flags), flags, t, f);
-      { answer: answer, filed: Some(answer) }
+      { answer: answer, filed: Some(answer), embeds: t.program.embeds }
     },
   }
 }
@@ -841,7 +868,11 @@ pub fn run(
   if flags.explain { checked_now(flags, project, started).answer } else {
     let tools: Toolchain = { stamp: env.shipped_digest[sys](), version: env.binary_version[sys]() };
     let key = replay_key(tools, project, published_field(project), flags);
-    match replayed(entry_at(key)) {
+    let taken = match replayed(entry_at(key)) {
+      Some(r) -> if embeds_stand(r.embeds, project) { Some(r.answer) } else { None },
+      None -> None,
+    };
+    match taken {
       Some(answer) -> {
         touched(key);
         if !flags.json { answer } else {
@@ -851,7 +882,10 @@ pub fn run(
       },
       None -> {
         let now = checked_now(flags, project, started);
-        let filed = match now.filed { Some(own) -> file(key, filed_answer(own)), None -> false };
+        let filed = match now.filed {
+          Some(own) -> file(key, filed_answer(own, now.embeds)),
+          None -> false,
+        };
         if !flags.json { now.answer } else {
           with_front(now.answer, |front: Json|
             reuse_said(front, [
@@ -875,7 +909,6 @@ fn a_project(path: String, main: Bytes) -> Project =
     manifest: None,
     packages: [],
     root_key: "/w/app",
-    embeds: [],
   }
 
 test "a check's answer is filed under its walk, toolchain, places and flags, and reads back whole" {
@@ -901,7 +934,21 @@ test "a check's answer is filed under its walk, toolchain, places and flags, and
     errs: ["a note"],
     code: 0,
   };
-  assert_eq(replayed(Some(filed_answer(answer))), Some(answer));
+  let embeds = [
+    {
+      embedded: {
+        root: b"/w/app",
+        module: b"main",
+        want: { path: b"data.txt", dir: false },
+        read: Ok([]),
+      },
+      file: { label: "cwd", path: "main.ply" },
+    },
+  ];
+  assert_eq(
+    replayed(Some(filed_answer(answer, embeds))),
+    Some({ answer: answer, embeds: map(embeds, |e: Embed| embedding_of(e.embedded)) }),
+  );
   assert_eq(replayed(Some(b"not an answer")), None)
 }
 
