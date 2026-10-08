@@ -3056,7 +3056,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
@@ -3172,9 +3172,9 @@ whole, each definition taken as its module answered it, only for what is read fr
 `decreases` measure (`E0467`), a `reuse fn` or `returns` promise and `--costs`, a statement a
 call runs, `--verify-deps`, and the commands that read source (`ply doc`, `ply prove`,
 `ply review`).
-What each module imports, and what it embeds, is kept
-in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
-has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
+A load pulls each shipped module its modules' answers say they import, so a module that answers as
+it did pulls as it did, with no text read again to find what it pulls. What a load reads of a
+shipped module (§13) is kept once for the machine, in
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
 project's first load lexes no shipped module's tests or laws to find it.
 `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` answer
