@@ -1,7 +1,7 @@
 //! What a `ply` binary carries besides its Rust: the shipped modules, the builder, and the `ply`
-//! program's sources and runnable, each a file keyed by its path in the repository. `ply-pack`
-//! appends them to the binary the Rust build made, so a change to them never builds Rust again;
-//! the binary maps them back at startup.
+//! program's sources and runnable, each a file keyed by its path in the repository, and what the
+//! shipped modules answer, below [`ANSWERS`]. `ply-pack` appends them to the binary the Rust build
+//! made, so a change to them never builds Rust again; the binary maps them back at startup.
 //!
 //! A pack is the files' bytes, then a table of `(path, offset, length, digest)`, then a trailer of
 //! the pack's and the table's lengths and [`MAGIC`].
@@ -30,6 +30,12 @@ const PROGRAM_FILES: [&str; 3] = ["ply.run", "ply.digest", "ply.key"];
 pub const PROGRAM: &str = "crates/ply-cli/ply";
 
 pub const MANIFEST: &str = "ply.pkg";
+
+/// The memo store of what every shipped module answers, as `ply std --answers` writes it: its
+/// `records/` and `outputs/` below this. No checkout holds it; a binary's pack carries it.
+pub const ANSWERS: &str = "answers";
+
+const ANSWER_DIRS: [&str; 2] = ["records", "outputs"];
 
 /// What a trace names a directory's data by, after the directory.
 const DATA_BELOW: &str = "/**";
@@ -132,6 +138,33 @@ impl Pack {
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         asked(|a| a.every = true);
         self.listed()
+    }
+
+    /// This pack carrying the memo store at `dir` below [`ANSWERS`], in place of any it carried.
+    pub fn with_answers(mut self, dir: &Path) -> Result<Pack, String> {
+        self.entries.retain(|entry| !is_answer(&entry.path));
+        for sub in ANSWER_DIRS {
+            let at = dir.join(sub);
+            let unlisted =
+                |e: std::io::Error| format!("`{}` could not be listed: {e}", at.display());
+            for entry in std::fs::read_dir(&at).map_err(unlisted)? {
+                let entry = entry.map_err(unlisted)?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') || name.ends_with(".tmp") || !entry.path().is_file() {
+                    continue;
+                }
+                self.entries.push(Entry {
+                    path: format!("{ANSWERS}/{sub}/{name}"),
+                    content: Content::File {
+                        at: entry.path(),
+                        read: OnceLock::new(),
+                    },
+                    digest: OnceLock::new(),
+                });
+            }
+        }
+        self.entries.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(self)
     }
 
     fn listed(&self) -> impl Iterator<Item = &str> {
@@ -254,8 +287,12 @@ impl Pack {
 
     /// The whole pack: every path and what its bytes digest to.
     pub fn digest(&self) -> Digest {
+        self.digest_where(|_| true)
+    }
+
+    fn digest_where(&self, keep: impl Fn(&str) -> bool) -> Digest {
         let mut hasher = blake3::Hasher::new();
-        for entry in &self.entries {
+        for entry in self.entries.iter().filter(|entry| keep(&entry.path)) {
             hasher.update(&(entry.path.len() as u64).to_le_bytes());
             hasher.update(entry.path.as_bytes());
             hasher.update(&self.entry_digest(entry));
@@ -405,7 +442,8 @@ pub enum Checked {
 }
 
 /// `check` reads every byte the binary carries rather than trusting its table, so a binary torn
-/// or edited after it was packed is refused.
+/// or edited after it was packed is refused. The answers it carries are made of the rest, by the
+/// binary itself, so they are no part of what it is held to.
 pub fn check(binary: &Path, wanted: &Pack) -> Result<Checked, String> {
     let Some(carried) = Pack::of_binary(binary)? else {
         return Ok(Checked::Absent);
@@ -419,10 +457,15 @@ pub fn check(binary: &Path, wanted: &Pack) -> Result<Checked, String> {
             ));
         }
     }
-    if carried.digest() == wanted.digest() {
+    let sources = |path: &str| !is_answer(path);
+    if carried.digest_where(sources) == wanted.digest_where(sources) {
         return Ok(Checked::Same);
     }
-    let mut paths: Vec<&str> = carried.paths().chain(wanted.paths()).collect();
+    let mut paths: Vec<&str> = carried
+        .paths()
+        .chain(wanted.paths())
+        .filter(|path| sources(path))
+        .collect();
     paths.sort_unstable();
     paths.dedup();
     let differs = paths
@@ -430,6 +473,11 @@ pub fn check(binary: &Path, wanted: &Pack) -> Result<Checked, String> {
         .find(|path| carried.digest_of(path) != wanted.digest_of(path))
         .expect("two packs whose digests differ differ on a path");
     Ok(Checked::Differs(differs.to_string()))
+}
+
+fn is_answer(path: &str) -> bool {
+    path.strip_prefix(ANSWERS)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// The checkout `dir` is in: the nearest directory holding the shipped modules.

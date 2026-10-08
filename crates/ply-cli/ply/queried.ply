@@ -2,16 +2,15 @@
 //! the walk and the toolchain's shipped modules hold it.
 
 import std.fs (fs)
-import compiler.memo (Query, Run, Tally, tallies)
+import compiler.memo (Query, Record, Run, Tally, tallies)
 import compiler.memo_files
+import compiler.unit (shipped)
 import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of,
-                          identity_of, looked, registry, world_of)
-import sources (Project, File, DepPackage, Embed, under_abs)
-import env (env)
-import std.list (concat)
+                          identity_of, looked, registry, shipped_all, shipped_queries, world_of)
+import sources (Project, File, DepPackage, Embed)
+import std.bytes (hex_of)
 
-fn own_file(f: File) -> OwnFile =
-  { module: bytes_of_string(f.module), path: bytes_of_string(f.path), text: f.text }
+fn own_file(f: File) -> OwnFile = { module: bytes_of_string(f.module), text: f.text }
 
 /// The world a load of `project` reads.
 fn world(project: Project) -> World / {abort.raise} =
@@ -32,6 +31,16 @@ fn shipped_module(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
 fn shipped_data(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
   fs.read_file[shipped](string_of_bytes_lossy(name))
 
+fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
+  match fs.list_dir[shipped](".") {
+    None -> [],
+    Some(names) ->
+      fold(names, [], |acc: List<Bytes>, n: String|
+        if string_ends_with(n, ".ply") {
+          push(acc, bytes_of_string(string_slice(n, 0, string_len(n) - 4)))
+        } else { acc }),
+  }
+
 /// The queries, each under the hash the program running gives its definition and the evaluator it
 /// runs on, which the toolchain ships beside its modules.
 fn running() -> Map<Bytes, Query> / {fs.read_file[shipped], abort.raise} =
@@ -46,67 +55,78 @@ pub type Queried = { answers: List<Answered>, tallies: List<Tally> }
 fn queried_of(done: { run: Run, value: List<Answered> }) -> Queried =
   { answers: done.value, tallies: tallies(done.run) }
 
-/// The memo store this machine keeps what the shipped modules answer in, for every project's loads
-/// by queries of these hashes: a stage of its own beside the `reused` one, marked used as a stage is.
-fn machine_memo(qs: Map<Bytes, Query>) -> String / {env.reused[sys], fs.write[abs], abort.raise} = {
-  let reused = under_abs(env.reused[sys]());
-  let cut = fold(range(0, string_len(reused)), 0 - 1, |acc: Int, i: Int|
-    if string_slice(reused, i, i + 1) == "/" { i } else { acc });
-  let identity = identity_of(qs);
-  let dir = if cut < 0 { "memo-shipped-" ++ identity }
-  else { string_slice(reused, 0, cut) ++ "/memo-shipped-" ++ identity };
-  if fs.create_dir[abs](dir) {
-    fs.write_file[abs](dir ++ "/.used", b"");
-    ()
-  };
-  dir
-}
-
 /// What each module of `project`'s own packages answers, and each shipped module of `shipped`,
-/// through the memo store in `dir`. A shipped module answers alike in every project, so what it
-/// answers is kept in the machine's store, which a project's run reads beside its own.
+/// through the memo store in `dir`, with what the toolchain ships answered for its shipped modules
+/// beside it.
 pub fn answered<[r]>(
   dir: String,
   project: Project,
   shipped: List<Bytes>,
-) -> Queried / {fs.read[r], fs.write[r], fs.read[abs], fs.write[abs], fs.read_file[shipped], env.reused[sys], abort.raise} = {
+) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
-  let machine = machine_memo(qs);
-  let nowhere = world_of({ root: b"", manifest: None, files: [] }, [], []);
-  let held = memo_files::kept[abs, abs](
-    machine,
-    None,
-    |kind: Bytes, at: Bytes| looked(nowhere, shipped_module, shipped_data, kind, at),
-    |run: Run| asked_all(qs, [], shipped, run),
-  );
-  let own = memo_files::kept[r, abs](
-    dir,
-    Some(machine),
-    |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, kind, at),
-    |run: Run| asked_all(qs, w.own, [], run),
-  );
-  { answers: concat(own.value, held.value), tallies: summed(tallies(own.run), tallies(held.run)) }
+  queried_of(
+    memo_files::kept[r](
+      dir,
+      |path: String| shipped.answer(path),
+      |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
+      |run: Run| asked_all(qs, w.own, shipped, run),
+    ),
+  )
 }
 
-/// What two runs did of each query, together.
-fn summed(a: List<Tally>, b: List<Tally>) -> List<Tally> =
-  fold(b, a, |acc: List<Tally>, t: Tally|
-    if fold(acc, false, |seen: Bool, u: Tally| seen || u.query == t.query) {
-      map(acc, |u: Tally|
-        if u.query == t.query { { ..u, took: u.took + t.took, ran: u.ran + t.ran } } else { u })
-    } else { push(acc, t) })
+/// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
+/// again, through the memo store in `work`, written into the store `out`, which holds those answers
+/// and nothing else: the store `cargo pack` packs beside the shipped modules. How many records it
+/// wrote.
+pub fn shipped_answers<[r], [w]>(
+  work: String,
+  out: String,
+  shipped: List<Bytes>,
+) -> Int / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.write[w], fs.read_file[shipped], abort.raise} = {
+  let qs = running();
+  let nowhere = world_of({ root: b"", manifest: None, files: [] }, [], []);
+  let done = memo_files::kept[r](
+    work,
+    |_: String| None,
+    |kind: Bytes, at: Bytes| looked(nowhere, shipped_module, shipped_data, shipped_names, kind, at),
+    |run: Run| { run: shipped_all(qs, shipped, run), value: () },
+  );
+  let wanted = fold(shipped_queries(), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    match map_get(qs, name) { Some(q) -> map_insert(acc, q.hash, true), None -> acc });
+  let keys = map_fold(done.run.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes|
+    push(acc, key));
+  memo_files::copied[r, w](
+    work,
+    out,
+    filter(keys, |key: Bytes|
+      match memo_files::record_at[r](work, key) {
+        Some(rec) -> map_contains(wanted, rec.query),
+        None -> false,
+      }),
+  )
+}
+
+/// The store `ply std --answers` answers the shipped modules through, beside the stage of reused
+/// answers `reused` names, under the identity of the queries that answer: what a later answering by
+/// a `ply` of these queries takes as kept.
+pub fn shipped_work(reused: String) -> String / {fs.read_file[shipped], abort.raise} = {
+  let cut = fold(range(0, string_len(reused)), 0 - 1, |acc: Int, i: Int|
+    if string_slice(reused, i, i + 1) == "/" { i } else { acc });
+  let name = "memo-std-" ++ identity_of(running());
+  if cut < 0 { name } else { string_slice(reused, 0, cut) ++ "/" ++ name }
+}
 
 /// [`answered`] with no store: everything is answered afresh, and nothing is kept.
 pub fn answered_afresh(
   project: Project,
   shipped: List<Bytes>,
-) -> Queried / {fs.read_file[shipped], abort.raise} = {
+) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let qs = running();
   let w = world(project);
   queried_of(
     memo_files::fresh(
-      |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, kind, at),
+      |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
       |run: Run| asked_all(qs, w.own, shipped, run),
     ),
   )

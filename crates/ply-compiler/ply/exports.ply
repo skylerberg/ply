@@ -11,7 +11,7 @@ import std.list (at, concat, contains, drop, sort_by)
 import front (Analysis, Analysed, Refused, Pulled, Staged, Hashed, ShippedData, Embedded,
               analyse_pulling_std_with, staged_pulling_std_with, checked_staged, rows_of, is_std,
               KnownDefRow, known_def_row_bin)
-import pkg (PackageSources, Supplied)
+import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef, OpDef,
               Derived, parse, is_written, item_span, import_decl_bin)
@@ -456,6 +456,25 @@ pub fn exports_of(
   let items = grouped(filter(raw.items, |item: Item| owner_of(item) != None), |item: Item|
     match owner_of(item) { Some(o) -> o, None -> b"" });
   let generated = generated_by_owner(raw, parsed, fns);
+  // What another module has of an `opaque` type is what its module publishes for it, which an
+  // importer that names the type reads as it checks a use of it.
+  let publishing = fold(
+    parsed.module.items,
+    map_new(),
+    |acc: Map<Bytes, List<Mention>>, item: Item|
+      match item {
+        IType(d) -> match d.opaque {
+          Some(op) ->
+            map_insert(
+              acc,
+              d.name.name,
+              map(concat(op.answer, op.take), |f: Bytes| { module: module, name: f }),
+            ),
+          None -> acc,
+        },
+        _ -> acc,
+      },
+  );
   {
     module: module,
     owners: owners,
@@ -465,8 +484,14 @@ pub fn exports_of(
         Some(fs) -> mentioned(sc.expanded, alone(text, fs)),
         None -> [],
       };
+      let published = match map_get(publishing, o) { Some(ms) -> ms, None -> [] };
       let mentions = filter(
-        distinct(concat(concat(mentioned(sc.written, printed), expansion), hidden_read(printed))),
+        distinct(
+          concat(
+            concat(concat(mentioned(sc.written, printed), expansion), hidden_read(printed)),
+            published,
+          ),
+        ),
         |m: Mention| !(m.module == module && m.name == o),
       );
       map_insert(acc, o, {
@@ -744,6 +769,10 @@ pub type Placed = | InRoot | InPackage(Int, Bytes) | ShippedModule
 /// embeds; and what the module checked embeds.
 pub type Reading = {
   pkgs: PackageSources,
+  /// The packages as the load judged them, which the check takes in place of judging `pkgs`.
+  judged: Option<Judged>,
+  /// The shipped modules there are, which an import that names nothing is refused with.
+  unread: List<Bytes>,
   whole: List<Source>,
   data: List<ShippedData>,
   embeds: List<Embedded>,
@@ -808,9 +837,18 @@ fn staged_against(
       tested: own,
       reached: false,
       data: reading.data,
+      unread: {
+        let staged = fold(
+          concat(shipped, reading.whole),
+          map_new(),
+          |acc: Map<Bytes, Bool>, s: Source| map_insert(acc, s.name, true),
+        );
+        filter(reading.unread, |n: Bytes| !map_contains(staged, n))
+      },
       asked: if own { [] } else { [source.name] },
       apart: placed == InRoot && is_std(source.name),
       given: reading.given,
+      judged: reading.judged,
     ),
     at: at,
   }
@@ -921,6 +959,8 @@ fn per_module(
     data: [],
     embeds: [],
     given: [],
+    judged: None,
+    unread: [],
   };
   let placing = |m: Bytes| if map_contains(texts, m) { InRoot } else { ShippedModule };
   fold(
