@@ -3162,14 +3162,18 @@ run loads the compiled object and the front end it filed beside it. A command
 that loads a program answers each of its modules — the project's own, its
 dependencies' and the shipped modules it pulls — through the memo store (§1),
 and then analyses the program whole with each definition and test taken as its
-module answered it, so a run checks again what an edit moved and takes the rest.
+module answered it, and each of its own packages' hashed as its module hashed it, so a run
+checks and hashes again what an edit moved and takes the rest. A module's hashing fills its
+normalized forms with the hashes of what they reference, so an edit to a body hashes the modules
+that import it again without reading them.
 What each module imports, and what it embeds, is kept
 in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
 has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
 project's first load lexes no shipped module's tests or laws to find it.
 `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` answer
-every module afresh and keep nothing, and neither does `compiler.load`. A memo
+the program's own modules afresh and keep nothing, and neither does `compiler.load`;
+each still takes what the binary carries answered for the shipped modules. A memo
 store that will not read is a cold check, never a failure.
 
 `ply run` over sources goes further: once a load holds, the front end's answer

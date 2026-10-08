@@ -15,7 +15,7 @@ import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, 
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import interfaces
 import compiler.hash
-import compiler.hash (HashOutput, NodeRef, TheFn, Which, hex)
+import compiler.hash (HashOutput, NodeRef, TheFn, Which, Fixing, hex, no_fixing)
 import std.hash (blake3)
 import compiler.items (Item, IFn)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Location)
@@ -34,7 +34,7 @@ import builder (builder)
 import queried
 import queried (Queried)
 import compiler.memo (Tally)
-import compiler.checking (Answered, packages_refused, refused_first)
+import compiler.checking (Answered, packages_refused, refused_first, root_warnings)
 import std.random (entropy)
 import std.list (at, concat, contains, drop, push_unique)
 import std.string (join)
@@ -175,6 +175,7 @@ fn front_end(
   pkgs: PackageSources,
   embeds: List<Embed>,
   reached: Bool,
+  fixed: Fixing,
 ) -> Pulled / {abort.raise} =
   analyse_pulling_std_with(
     sources,
@@ -188,6 +189,7 @@ fn front_end(
     data: shipping.data,
     asked: shipping.asked,
     pulls: shipping.pulls,
+    fixed: fixed,
   )
 
 /// Seeded with what the load published but for `moved`, the definitions a splice changed, which
@@ -215,19 +217,36 @@ pub fn reanalysed(
     pkgs,
     program.embeds,
     program.reached,
+    no_fixing(),
   )
 }
 
+/// The program `project` makes, each definition and test taken as `answers` published and hashed
+/// it, warned of as its root modules' answers warn.
 fn analysed(
   project: Project,
   shipping: Shipping,
-  rows: Rows,
+  answers: List<Answered>,
   reached: Bool,
+  fixed: Fixing,
 ) -> Program / {abort.raise} = {
+  let rows = {
+    defs: fold(answers, [], |acc: List<KnownDefRow>, a: Answered| concat(acc, a.answer.rows.defs)),
+    tests: fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
+      concat(acc, a.answer.rows.tests)),
+  };
   let texts = fold(shipping.read, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
-  let pulled: Pulled = front_end(project.sources, shipping, rows, pkgs, project.embeds, reached);
+  let pulled: Pulled = front_end(
+    project.sources,
+    shipping,
+    rows,
+    pkgs,
+    project.embeds,
+    reached,
+    fixed,
+  );
   let shipped_places = map(pulled.pulled, |n: Bytes|
     shipped_place(texts, string_of_bytes_lossy(n)));
   let own = placed_of(project);
@@ -235,7 +254,8 @@ fn analysed(
   let refused = |ds: List<Diag>| { ..broken(project, shipping, places, ds), viewed: pulled.viewed };
   match pulled.out {
     Refused(ds) -> refused(ds),
-    Analysed(w) -> {
+    Analysed(analysis) -> {
+      let w = { ..analysis, warnings: root_warnings(answers, len(project.sources)) };
       let owned = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
         map_insert(acc, source.name, true));
       match unshown(w, |m: Bytes| map_contains(owned, m)) {
@@ -289,13 +309,14 @@ fn assembled(
   q: Queried,
   reached: Bool = true,
 ) -> Program / {abort.raise} =
-  { ..assembled_from(project, shipping, paths, q.answers, reached), tallies: q.tallies }
+  { ..assembled_from(project, shipping, paths, q.answers, q.fixing, reached), tallies: q.tallies }
 
 fn assembled_from(
   project: Project,
   shipping: Shipping,
   paths: List<paths::Resolved>,
   answers: List<Answered>,
+  fixed: Fixing,
   reached: Bool,
 ) -> Program / {abort.raise} =
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
@@ -330,19 +351,7 @@ fn assembled_from(
         }
       });
       broken(project, shipping, concat(concat(own.modules, pulled), own.manifests), diags)
-    } else {
-      analysed(
-        project,
-        shipping,
-        {
-          defs: fold(answers, [], |acc: List<KnownDefRow>, a: Answered|
-            concat(acc, a.answer.rows.defs)),
-          tests: fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
-            concat(acc, a.answer.rows.tests)),
-        },
-        reached,
-      )
-    }
+    } else { analysed(project, shipping, answers, reached, fixed) }
   }
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
@@ -393,7 +402,7 @@ fn answers_of(
   project: Project,
   shipping: Shipping,
 ) -> Queried / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], shipped.answer, abort.raise} =
-  if !usable(project) { { answers: [], tallies: [] } } else {
+  if !usable(project) { queried::nothing() } else {
     let shipped = map(shipping.read, |s: Source| s.name);
     match list_at(paths, 0) {
       None -> queried::answered_afresh(project, shipped),
@@ -409,8 +418,8 @@ fn answers_of(
 fn answers_afresh(
   project: Project,
   shipping: Shipping,
-) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  if !usable(project) { { answers: [], tallies: [] } }
+) -> Queried / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  if !usable(project) { queried::nothing() }
   else { queried::answered_afresh(project, map(shipping.read, |s: Source| s.name)) }
 
 /// `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
@@ -457,7 +466,7 @@ pub fn pins_for(
 /// take, and what a command's switch off the cache asks for.
 pub fn load_uncached(
   paths: List<paths::Resolved>,
-) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges, shipped.reached} = {
+) -> Program / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
   let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
   else { no_shipping() };
@@ -543,7 +552,7 @@ pub fn timed_uncached(
   paths: List<paths::Resolved>,
   verify: Bool = false,
   every: Bool = false,
-) -> Timed / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, abort.raise, diverges, shipped.reached} = {
+) -> Timed / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   timed_uncached_over(paths, load_resolved(paths), started, verify, every)
 }
@@ -555,7 +564,7 @@ pub fn timed_uncached_over(
   started: Int,
   verify: Bool = false,
   every: Bool = false,
-) -> Timed / {fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise, shipped.reached} = {
+) -> Timed / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise, shipped.reached} = {
   let shipping: Shipping = if usable(project) {
     shipping_for(project.sources, pkgs_of(project), every)
   } else { no_shipping() };

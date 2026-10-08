@@ -2,11 +2,13 @@
 //! the walk and the toolchain's shipped modules hold it.
 
 import std.fs (fs)
-import compiler.memo (Query, Record, Run, Tally, tallies)
+import compiler.memo (Query, Record, Run, Tally, memo_keep, tallies)
 import compiler.memo_files
 import compiler.unit (shipped)
-import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of,
-                          identity_of, looked, registry, shipped_all, shipped_queries, world_of)
+import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of, hashed_all,
+                          identity_of, looked, refused_first, registry, shipped_all,
+                          shipped_queries, world_of)
+import compiler.hash (Fixing, no_fixing)
 import sources (Project, File, DepPackage, Embed)
 import std.bytes (hex_of)
 
@@ -49,11 +51,30 @@ fn running() -> Map<Bytes, Query> / {fs.read_file[shipped], abort.raise} =
     _ -> panic("the toolchain ships no `definitions` or no `stamps`"),
   }
 
-/// What each module of a load answered, and what the run did of each query to answer it.
-pub type Queried = { answers: List<Answered>, tallies: List<Tally> }
+/// What each module of a load answered, what hashing fixed of each where none refuses, and what the
+/// run did of each query to answer them.
+pub type Queried = { answers: List<Answered>, fixing: Fixing, tallies: List<Tally> }
 
-fn queried_of(done: { run: Run, value: List<Answered> }) -> Queried =
-  { answers: done.value, tallies: tallies(done.run) }
+/// What a load with no modules to answer answers.
+pub fn nothing() -> Queried = { answers: [], fixing: no_fixing(), tallies: [] }
+
+type Asked = { answers: List<Answered>, fixing: Fixing }
+
+/// What `own` and `shipped` answer over `run`, and what hashing fixed of each where none refuses.
+fn asked(
+  qs: Map<Bytes, Query>,
+  own: List<Bytes>,
+  shipped: List<Bytes>,
+  run: Run,
+) -> { run: Run, value: Asked } / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let all = asked_all(qs, own, shipped, run);
+  if len(refused_first(all.value)) > 0 {
+    { run: all.run, value: { answers: all.value, fixing: no_fixing() } }
+  } else {
+    let fixed = hashed_all(qs, own, all.run);
+    { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+  }
+}
 
 /// What each module of `project`'s own packages answers, and each shipped module of `shipped`,
 /// through the memo store in `dir`, with what the toolchain ships answered for its shipped modules
@@ -65,14 +86,13 @@ pub fn answered<[r]>(
 ) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
-  queried_of(
-    memo_files::kept[r](
-      dir,
-      |path: String| shipped.answer(path),
-      |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
-      |run: Run| asked_all(qs, w.own, shipped, run),
-    ),
-  )
+  let done = memo_files::kept[r](
+    dir,
+    |path: String| shipped.answer(path),
+    |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
+    |run: Run| asked(qs, w.own, shipped, run),
+  );
+  { answers: done.value.answers, fixing: done.value.fixing, tallies: tallies(done.run) }
 }
 
 /// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
@@ -117,19 +137,20 @@ pub fn shipped_work(reused: String) -> String / {fs.read_file[shipped], abort.ra
   if cut < 0 { name } else { string_slice(reused, 0, cut) ++ "/" ++ name }
 }
 
-/// [`answered`] with no store: everything is answered afresh, and nothing is kept.
+/// [`answered`] with no store of the project's: what the toolchain ships answered for the shipped
+/// modules is read, the rest is answered afresh, and nothing is kept.
 pub fn answered_afresh(
   project: Project,
   shipped: List<Bytes>,
-) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> Queried / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
-  queried_of(
-    memo_files::fresh(
-      |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
-      |run: Run| asked_all(qs, w.own, shipped, run),
-    ),
-  )
+  let done = memo_files::fresh(
+    |path: String| shipped.answer(path),
+    |kind: Bytes, at: Bytes| looked(w, shipped_module, shipped_data, shipped_names, kind, at),
+    |run: Run| asked(qs, w.own, shipped, run),
+  );
+  { answers: done.value.answers, fixing: done.value.fixing, tallies: tallies(done.run) }
 }
 
 /// The hash each query has now, which a record of any other hash will never be asked by again.

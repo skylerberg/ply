@@ -32,7 +32,8 @@ pub const PROGRAM: &str = "crates/ply-cli/ply";
 pub const MANIFEST: &str = "ply.pkg";
 
 /// The memo store of what every shipped module answers, as `ply std --answers` writes it: its
-/// `records/` and `outputs/` below this. No checkout holds it; a binary's pack carries it.
+/// `records/` and `outputs/` below this, each file deflated. No checkout holds it; a binary's pack
+/// carries it.
 pub const ANSWERS: &str = "answers";
 
 const ANSWER_DIRS: [&str; 2] = ["records", "outputs"];
@@ -69,6 +70,7 @@ enum Content {
         at: PathBuf,
         read: OnceLock<Vec<u8>>,
     },
+    Held(Vec<u8>),
 }
 
 impl Pack {
@@ -142,6 +144,7 @@ impl Pack {
 
     /// This pack carrying the memo store at `dir` below [`ANSWERS`], in place of any it carried.
     pub fn with_answers(mut self, dir: &Path) -> Result<Pack, String> {
+        use std::io::Write;
         self.entries.retain(|entry| !is_answer(&entry.path));
         for sub in ANSWER_DIRS {
             let at = dir.join(sub);
@@ -153,12 +156,16 @@ impl Pack {
                 if name.starts_with('.') || name.ends_with(".tmp") || !entry.path().is_file() {
                     continue;
                 }
+                let unread = |e: std::io::Error| {
+                    format!("`{}` could not be read: {e}", entry.path().display())
+                };
+                let bytes = std::fs::read(entry.path()).map_err(unread)?;
+                let mut deflated =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                deflated.write_all(&bytes).map_err(unread)?;
                 self.entries.push(Entry {
                     path: format!("{ANSWERS}/{sub}/{name}"),
-                    content: Content::File {
-                        at: entry.path(),
-                        read: OnceLock::new(),
-                    },
+                    content: Content::Held(deflated.finish().map_err(unread)?),
                     digest: OnceLock::new(),
                 });
             }
@@ -273,6 +280,17 @@ impl Pack {
         self.entry(path).map(|entry| self.content(entry))
     }
 
+    /// The file of the answers the pack carries at `path` within them, inflated.
+    pub fn answer(&self, path: &str) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let deflated = self.bytes(&format!("{ANSWERS}/{path}"))?;
+        let mut out = Vec::new();
+        flate2::read::DeflateDecoder::new(deflated)
+            .read_to_end(&mut out)
+            .ok()?;
+        Some(out)
+    }
+
     /// A text the pack carries. The sources are UTF-8, as the front end reads them.
     pub fn text(&self, path: &str) -> Option<&str> {
         self.bytes(path).map(|bytes| {
@@ -353,6 +371,7 @@ impl Pack {
                     panic!("`{}` was listed for the pack and reads: {e}", at.display())
                 })
             }),
+            Content::Held(bytes) => bytes,
         }
     }
 
