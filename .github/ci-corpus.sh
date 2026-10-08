@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The Ply runs (`ci-shards.sh`'s corpus entries), each a `ply test`: over the corpus with the grants
 # `benches/corpus.sh` gives the program, or over the CLI's suite with the grants its harness drives
-# `ply` with, from a scratch directory of the run's own; the standard library's proof runs are a
-# `ply prove`. A run fails when a test fails or a claim does not hold, when the run refuses, and when
+# `ply` with, from a scratch directory of the run's own; the proof runs, the standard library's and
+# each package's (`laws-<id>`), are a `ply prove`. A run fails when a test fails or a claim does not hold, when the run refuses, and when
 # its filter selects no test or claim, so a renamed test never stops being run quietly; a part of a
 # run (`run#K/N`) takes the tests whose keys hash to it, which may be none.
 #
@@ -205,6 +205,10 @@ run_one() {
   shift 2
   if [[ $id == proofs || $id == proofs:* ]]; then
     run_proofs "$timings" "$id" -- "$@"
+    return
+  fi
+  if [[ $id == laws-* ]]; then
+    package_proofs "$timings" "$id" "$@"
     return
   fi
   line=$("$shards" corpus-line "$id") || return 2
@@ -426,6 +430,39 @@ run_proofs() {
   rm -f "$out"
 }
 
+# The run `laws-<id>`, a `ply prove` of the package with ARGs added, its `cached` row onto TIMINGS when
+# that is not empty; it fails when it proves no claim. A selecting run always has it to run, as it has
+# the library's proofs. STOPPED when the deadline ended it.
+package_proofs() {
+  local timings=$1 id=$2 line path filter shard status=0 out started all cached
+  shift 2
+  ((!selecting)) || return 1
+  line=$("$shards" corpus-line "$id") || return 2
+  fields "$line"
+  out=$(mktemp)
+  started=$(date +%s%3N)
+  bounded "$ply" prove "$path" --json "$@" > "$out" || status=$?
+  if ((status == STOPPED)); then
+    stopped_run "$((($(date +%s%3N) - started) / 1000))" "$id"
+    rm -f "$out"
+    return "$STOPPED"
+  fi
+  all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
+  cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
+  echo "proved: $all claims, $cached from the cache, in $((($(date +%s%3N) - started) / 1000))s"
+  [[ -z $timings ]] || printf 'cached\t%s\t%s\n' "$id" "$cached" >> "$timings"
+  if [ "$all" -eq 0 ]; then
+    echo "corpus run $id proved no claim" >&2
+    status=1
+  fi
+  if [ "$status" -ne 0 ]; then
+    disproved "$out"
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
+}
+
 # What a red proof run said: each claim that does not hold, how and where, and a refused run's
 # diagnostics.
 disproved() {
@@ -500,7 +537,7 @@ lane() {
   : > "$durations"
   for id in "$@"; do
     case "$id" in
-      program | program#* | package-* | fixture-*) single "$name" "$timings" "$id" || failed=1 ;;
+      program | program#* | package-* | laws-* | fixture-*) single "$name" "$timings" "$id" || failed=1 ;;
       *#*) batch "$name" "part ${id##*#} of ${id%#*}" run_modules "$timings" "$id" || failed=1 ;;
       cli-*) cli+=("$id") ;;
       stdlib:*) library+=("$id") ;;
