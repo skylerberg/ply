@@ -76,15 +76,9 @@ fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
     let read = Pack::of_binary(&binary)
         .expect("the binary reads")
         .expect("the binary carries a pack");
-    assert_eq!(
-        read.bytes("answers/records/aa"),
-        Some(b"a record".as_slice())
-    );
-    assert_eq!(
-        read.bytes("answers/outputs/bb"),
-        Some(b"an answer".as_slice())
-    );
-    assert_eq!(read.bytes("answers/outputs/cc.tmp"), None);
+    assert_eq!(read.answer("records/aa"), Some(b"a record".to_vec()));
+    assert_eq!(read.answer("outputs/bb"), Some(b"an answer".to_vec()));
+    assert_eq!(read.answer("outputs/cc.tmp"), None);
     assert!(matches!(
         ply_pack::check(&binary, &checkout).expect("the binary reads"),
         ply_pack::Checked::Same

@@ -9,12 +9,13 @@ import front (Dump, EmitterRoot, Embedded, AnalysisOutcome, Analysed, Refused, R
               ShippedView, analyse_pulling_std_with, checked_staged, dump_of, embeds_wanted,
               module_of, pulls_of, shipped_pulled, staged_pulling_std_with, viewed_text)
 import embed (EmbedAt, EmbedRead, EmbedFile)
-import hash (HashOutput)
+import hash (HashOutput, Fixing, no_fixing)
 import interface (imported)
 import memo (Query, Run, memo_keep)
 import memo_files
 import checking (Answered, OwnPackage, World, asked_all, entry_hash, evaluator_of, fresh_registry,
-                 identity_of, looked, packages_refused, refused_first, registry, world_of)
+                 hashed_all, identity_of, looked, packages_refused, refused_first, registry,
+                 root_warnings, world_of)
 import pkg (PackageSources, Supplied, closure, git_spec, wants)
 import resolve (Source, Diag, Label, error_at)
 import unit (Runtime, shipped, compiled)
@@ -386,14 +387,34 @@ fn in_store<a, [r]>(
   }
 }
 
-/// What each module of `p` and each shipped module it pulls answers checked, through the memo store
-/// in the stage `dir` names (none where `dir` is empty).
+/// What each module of a load answered checked and, where none refuses, what hashing fixed of each.
+pub type Asked = { answers: List<Answered>, fixing: Fixing }
+
+/// What each module of `w`, a load of `p`, and each shipped module `p` pulls answers, asked of `qs`
+/// over a run.
+fn asked(
+  qs: Map<Bytes, Query>,
+  w: World,
+  p: Prepared,
+  run: Run,
+) -> { run: Run, value: Asked } / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let all = asked_all(qs, w.own, shipped_of(p), run);
+  // A program some module refuses has nothing to hash.
+  if len(refused_first(all.value)) > 0 {
+    { run: all.run, value: { answers: all.value, fixing: no_fixing() } }
+  } else {
+    let fixed = hashed_all(qs, w.own, shipped_of(p), all.run);
+    { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+  }
+}
+
+/// What each module of `p` and each shipped module it pulls answers, through the memo store in the
+/// stage `dir` names (none where `dir` is empty).
 pub fn answers_of<[r]>(
   p: Prepared,
   dir: String,
-) -> List<Answered> / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
-  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run|
-    asked_all(qs, w.own, shipped_of(p), run))
+) -> Asked / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
+  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| asked(qs, w, p, run))
 
 /// The hash of `entry` as hashing its module fixed it, through the memo store in the stage `dir`
 /// names: nothing where its module does not define it or does not hash. No other module is asked,
@@ -409,14 +430,12 @@ pub fn entry_hash_of<[r]>(
   })
 
 /// [`answers_of`] with nothing kept.
-pub fn answers_afresh(
-  p: Prepared,
-) -> List<Answered> / {shipped.names, shipped.module, abort.raise} = {
+pub fn answers_afresh(p: Prepared) -> Asked / {shipped.names, shipped.module, abort.raise} = {
   let w = world_for(p);
   memo_files::fresh(
     |kind: Bytes, at: Bytes|
       looked(w, held_module, held_module, || map(shipped.names(), bytes_of_string), kind, at),
-    |run: Run| asked_all(fresh_registry(), w.own, shipped_of(p), run),
+    |run: Run| asked(fresh_registry(), w, p, run),
   ).value
 }
 
@@ -444,14 +463,16 @@ fn refusals(answers: List<Answered>, files: List<SourceFile>) -> List<Diag> / {a
   })
 }
 
-/// The program `p` analysed whole, each definition and test taken as `answers` published it, or
-/// what refuses it. `tested` reads its tests and laws, which a program to ship has none of.
+/// The program `p` analysed whole, each definition and test taken as its module's answer in `asked`
+/// published and hashed it, or what refuses it. `tested` reads its tests and laws, which a program
+/// to ship has none of.
 pub fn assembled(
   p: Prepared,
-  answers: List<Answered>,
+  asked: Asked,
   tested: Bool,
 ) -> Result<Checked, Unloaded> / {shipped.reached, abort.raise} = {
   let mine = placed(p.own, p.deps, shipped_of(p), texts_of(p.shipping.read));
+  let answers = asked.answers;
   let modules = fold(p.deps, len(p.own.files), |n: Int, d: Package| n + len(d.files))
     + len(p.shipping.read);
   let packaged = packages_refused(
@@ -465,6 +486,7 @@ pub fn assembled(
         sources_of(p.own.files),
         p.shipping.read,
         p.pkgs,
+        asked.fixing,
         embeds: p.embeds,
         tested: tested,
         unread: p.shipping.unread,
@@ -483,7 +505,7 @@ pub fn assembled(
         Analysed(w) ->
           Ok({
             front: {
-              dump: dump_of(Analysed(w)),
+              dump: dump_of(Analysed({ ..w, warnings: root_warnings(answers, len(p.own.files)) })),
               files: files,
               read_ms: 0,
               front_ms: 0,
