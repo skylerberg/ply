@@ -12,7 +12,8 @@ import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import literals (literal, unsettled)
 import diagnostic (Place, all_to_json)
 import program (Program, Timed, ModuleReport, timed_over, module_reports, published,
-                in_shipped_module, own_tests, placed_of, location_of, whole_of, no_program)
+                in_shipped_module, own_tests, placed_of, location_of, whole_of, no_program,
+                program_view)
 import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
@@ -28,7 +29,7 @@ import signature (SetLine, Provenance, counted_lines, effect_sets, provenance, p
 import std.term (Style, bold, dim, green, plain)
 import compiler.costs (Report, Costing)
 import compiler.termination (Ends, Stated, Diverges, Site)
-import compiler.front (View, Outline)
+import compiler.front (View, Frame, Outline, functions_of, tests_of)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
                        Unguarded, Calls)
 import compiler.resolve (Diag, Label)
@@ -384,11 +385,11 @@ fn module_block(
 }
 
 fn sets_of(view: View, mo: ModuleReport, defs: List<DefInfo>) -> List<SetLine> / {abort.raise} =
-  match list_at(view.outlines, mo.index) { None -> [], Some(o) -> effect_sets(o.sets, defs) }
+  match list_at(view.frame.outlines, mo.index) { None -> [], Some(o) -> effect_sets(o.sets, defs) }
 
 /// Each schema the program declares, and each schema's guard, by program-wide name.
 fn schemas_of(view: View) -> Map<Bytes, Bool> =
-  fold(view.outlines, map_new(), |acc: Map<Bytes, Bool>, o: Outline|
+  fold(view.frame.outlines, map_new(), |acc: Map<Bytes, Bool>, o: Outline|
     fold(o.schemas, acc, |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true)))
 
 fn type_lines(
@@ -564,7 +565,7 @@ fn document(
   let located = locations(defs);
   let schemas = schemas_of(analysis);
   let hashes = fold(
-    analysis.hashes.defs,
+    analysis.frame.hashes.defs,
     map_new(),
     |acc: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }| map_insert(acc, d.name, d.hash),
   );
@@ -596,7 +597,7 @@ fn document(
       key: "tests",
       value: Array(
         map(own_tests(p, analysis), |t: TestInfo|
-          test_json(at_or(analysis.hashes.tests, t.index, b""), t)),
+          test_json(at_or(analysis.frame.hashes.tests, t.index, b""), t)),
       ),
     },
     { key: "effects", value: Array(map(analysis.checked.effects, effect_json)) },
@@ -615,16 +616,12 @@ fn document(
 
 // --- The answer -----------------------------------------------------------------------
 
-fn summary(
-  style: Style,
-  analysis: View,
-  defs: List<DefInfo>,
-  tests: List<TestInfo>,
-) -> String / {abort.raise} =
-  indent() ++ green(style, "checked") ++ " " ++ count_of(len(analysis.outlines), "module") ++ ", "
-    ++ count_of(len(defs), "definition")
+/// The modules, definitions and own tests `frame` holds of `program`.
+fn summary(style: Style, program: Program, frame: Frame) -> String / {abort.raise} =
+  indent() ++ green(style, "checked") ++ " " ++ count_of(len(frame.outlines), "module") ++ ", "
+    ++ count_of(functions_of(frame), "definition")
     ++ ", "
-    ++ count_of(len(tests), "test")
+    ++ count_of(tests_of(frame, len(program.files)), "test")
 
 fn costed(
   style: Style,
@@ -635,18 +632,17 @@ fn costed(
 ) -> List<String> / {abort.raise} =
   if !flags.costs { lines } else { concat(lines, report_lines(style, places, report)) }
 
+/// The answer over `frame`: the check's tables are read only for `--types` and `--json`, which list
+/// them.
 fn answered(
   style: Style,
   flags: Flags,
   timed: Timed,
-  analysis: View,
+  frame: Frame,
   pass: Option<Costing>,
   warnings: List<Diag>,
 ) -> Answer / {abort.raise} = {
-  let views = module_reports(timed.program, analysis);
-  let defs = published(analysis);
-  let tests = own_tests(timed.program, analysis);
-  let head = concat([summary(style, analysis, defs, tests)], warning_lines(style, warnings));
+  let head = concat([summary(style, timed.program, frame)], warning_lines(style, warnings));
   let explained = if flags.explain {
     concat(
       concat(
@@ -656,12 +652,31 @@ fn answered(
       cost_lines(style, pass),
     )
   } else { head };
-  let typed = if flags.types {
-    concat(explained, type_lines(style, flags.explain, timed.program, analysis, views, defs, tests))
-  } else { explained };
+  let read = if flags.types || flags.json { program_view(timed.program) } else { None };
+  let listed = |v: View|
+    {
+      views: module_reports(timed.program, frame),
+      defs: published(v),
+      tests: own_tests(timed.program, v),
+    };
+  let typed = match read {
+    Some(v) -> if !flags.types { explained } else {
+      let l = listed(v);
+      concat(
+        explained,
+        type_lines(style, flags.explain, timed.program, v, l.views, l.defs, l.tests),
+      )
+    },
+    None -> explained,
+  };
   {
-    json: if flags.json { document(flags, timed, analysis, views, defs, warnings, pass) }
-    else { object([]) },
+    json: match read {
+      Some(v) -> if !flags.json { object([]) } else {
+        let l = listed(v);
+        document(flags, timed, v, l.views, l.defs, warnings, pass)
+      },
+      None -> object([]),
+    },
     lines: match pass {
       Some(c) -> costed(style, flags, timed.program.places, c.report, typed),
       None -> typed,
@@ -677,9 +692,9 @@ fn checked(
   style: Style,
   flags: Flags,
   timed: Timed,
-  analysis: View,
+  frame: Frame,
 ) -> Answer / {priced.report, literal.verdicts, literal.statements, abort.raise} = {
-  let kept = promised(timed.program, analysis);
+  let kept = promised(timed.program, frame);
   let pass = if !kept && !flags.costs { Ok(None) } else {
     match whole_of(timed.program) {
       Ok(w) -> Ok(Some(costs_of(timed.program, w))),
@@ -694,13 +709,13 @@ fn checked(
     else { [] },
   };
   let broken = if len(unkept) > 0 { unkept }
-  else { unsettled(timed, analysis, root_of(flags).machine) };
+  else { unsettled(timed, frame, root_of(flags).machine) };
   if len(broken) > 0 { refused(style, "check", broken, timed.program.places) } else {
     answered(
       style,
       flags,
       timed,
-      analysis,
+      frame,
       match pass { Ok(p) -> p, Err(_) -> None },
       filter(timed.program.diags, |diag: Diag| !in_shipped_module(timed.program, diag)),
     )
@@ -827,11 +842,11 @@ fn checked_now(
   started: Int,
 ) -> { answer: Answer, filed: Option<Answer> } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
-  match t.program.view {
+  match t.program.frame {
     None ->
       { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
-    Some(w) -> {
-      let answer = checked(style_of(flags), flags, t, w);
+    Some(f) -> {
+      let answer = checked(style_of(flags), flags, t, f);
       { answer: answer, filed: Some(answer) }
     },
   }

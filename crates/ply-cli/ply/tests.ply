@@ -44,7 +44,7 @@ import mutants (Coverage, Judged, Mutants, Mutation, Queue, Survivor, built, cov
                 queued, targets)
 import paths
 import program (Timed, front_of, in_shipped_module, is_shipped, modules_of, timed_over,
-                timed_uncached_over, unmoved)
+                timed_uncached_over, unmoved, program_view)
 import report (Answer, indent, ok_code, compile_error, count_of, refused, warned_lines)
 import sources (Embed, File, Project, imported_reader, is_std, load_resolved, shipped_imported)
 import std.process (process)
@@ -2011,14 +2011,14 @@ fn reached_embeds(
 ) -> List<answers::Embedding> / {abort.raise} = {
   let keys = fold(scope.visible, [], |acc: List<Bytes>, i: Int|
     match test_at(analysis, i) { Some(t) -> push(acc, t.key), None -> acc });
-  let walked = reach(analysis.hashes, map(keys, |k: Bytes| TheItem(k)));
+  let walked = reach(analysis.frame.hashes, map(keys, |k: Bytes| TheItem(k)));
   let named = fold(keys, map_merge(walked.fns, walked.decls), |acc: Map<Bytes, Bool>, k: Bytes|
     map_insert(acc, k, true));
   let texts = fold(p.files, map_new(), |acc: Map<Bytes, Bytes>, f: File|
     map_insert(acc, bytes_of_string(f.module), f.text));
   let asking = fold(p.embeds, map_new(), |acc: Map<Bytes, List<ItemWants>>, e: Embed|
     if e.embedded.root != p.pkgs.root || map_contains(acc, e.embedded.module) { acc } else {
-      match map_get(analysis.embed_items, e.embedded.module) {
+      match map_get(analysis.frame.embed_items, e.embedded.module) {
         Some(items) -> map_insert(acc, e.embedded.module, items),
         None -> match map_get(texts, e.embedded.module) {
           None -> acc,
@@ -2163,7 +2163,7 @@ fn over_load(
   begun: Int,
   keeping: Option<Keeping>,
 ) -> Iteration / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, tester.configure[corpus], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.var[sys], env.pwd[sys], tester.schema[corpus], env.vars[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, priced.report, abort.raise, shipped.reached, literal.verdicts, literal.statements, tester.cases[corpus]} =
-  match t.program.view {
+  match program_view(t.program) {
     // Every diagnostic, as `check` refuses: an error is the whole answer, so the shipped-module
     // filter a successful load applies to warnings is not applied here.
     None ->
@@ -2227,7 +2227,7 @@ fn root_of(rs: List<paths::Resolved>) -> String / {fs.kind[cwd], fs.kind[abs]} =
 fn test_at(analysis: View, i: Int) -> Option<TestInfo> = list_at(analysis.checked.tests, i)
 
 fn hash_at(analysis: View, i: Int) -> Option<String> / {abort.raise} =
-  match list_at(analysis.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
+  match list_at(analysis.frame.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
 
 /// Something in its closure entered a `simulate` region, so it reads a seed and is searched.
 fn seeded_of(atoms: List<types::Atom>) -> Bool =
@@ -2318,15 +2318,15 @@ fn case_view(analysis: View, i: Int, test_info: TestInfo) -> Case / {abort.raise
 type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
 
 fn root_modules(analysis: View) -> Map<String, Bool> =
-  fold(range(0, len(analysis.outlines)), map_new(), |acc: Map<String, Bool>, i: Int|
-    match ((list_at(analysis.outlines, i), list_at(analysis.module_packages, i))) {
+  fold(range(0, len(analysis.frame.outlines)), map_new(), |acc: Map<String, Bool>, i: Int|
+    match ((list_at(analysis.frame.outlines, i), list_at(analysis.frame.module_packages, i))) {
       (Some(o), Some(pkg)) -> if pkg == 0 { map_insert(acc, string_of_bytes_lossy(o.name), true) }
       else { acc },
       _ -> acc,
     })
 
 fn scope_of(analysis: View, options: Options) -> Scope / {abort.raise} = {
-  let packaged = len(analysis.packages) > 0;
+  let packaged = len(analysis.frame.packages) > 0;
   let root = root_modules(analysis);
   let in_scope = |t: TestInfo|
     (if packaged { map_contains(root, string_of_bytes_lossy(t.module)) }
@@ -2363,7 +2363,7 @@ fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
 fn in_shipped(analysis: View, diag: Diag) -> Bool =
   match primary_of(diag) {
     None -> false,
-    Some(l) -> match list_at(analysis.outlines, l.module) {
+    Some(l) -> match list_at(analysis.frame.outlines, l.module) {
       Some(o) -> is_shipped(string_of_bytes_lossy(o.name)),
       None -> false,
     },
@@ -2394,7 +2394,7 @@ fn program_of(
     unit: 0,
     files: map(timed.program.places, |place: Place| place.path),
     places: timed.program.places,
-    modules: map(modules_of(timed.program, analysis), |m: { name: String, path: String }|
+    modules: map(modules_of(timed.program, analysis.frame), |m: { name: String, path: String }|
       { name: m.name, file: m.path }),
     incremental: timed.cached,
     phases: {
@@ -2438,8 +2438,9 @@ fn tests_over(
     Err(d) -> refused(style, "test", [d], timed.program.places),
     Ok(targeted) -> {
       let loaded_at = time.elapsed_us();
-      let unkept = broken_promises(timed.program, analysis);
-      let broken = if len(unkept) > 0 { unkept } else { unsettled(timed, analysis, options.path) };
+      let unkept = broken_promises(timed.program, analysis.frame);
+      let broken = if len(unkept) > 0 { unkept }
+      else { unsettled(timed, analysis.frame, options.path) };
       let promised_at = time.elapsed_us();
       let spent = { ..no_spent(), before_us: begun, promises_us: promised_at - loaded_at };
       if len(broken) > 0 { refused(style, "test", broken, timed.program.places) }
@@ -2522,9 +2523,9 @@ fn selected(
 /// a name.
 fn hashed_by_kind(analysis: View) -> Map<Bytes, Bytes> =
   fold(
-    analysis.hashes.decls,
+    analysis.frame.hashes.decls,
     fold(
-      analysis.hashes.defs,
+      analysis.frame.hashes.defs,
       map_new(),
       |acc: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
         map_insert(acc, bytes_concat(b"fn ", d.name), d.hash),
@@ -2552,10 +2553,10 @@ fn listing_hash(
         } else { b"" },
         None -> b"",
       };
-      let r = analysis.hashes.refs;
+      let r = analysis.frame.hashes.refs;
       blake3(
         bytes_concat_all(
-          fold(at_or(analysis.hashes.test_refs, i, []), [text], |acc: List<Bytes>, v: Int| {
+          fold(at_or(analysis.frame.hashes.test_refs, i, []), [text], |acc: List<Bytes>, v: Int| {
             let key = bytes_concat(if at(r.decls, v) { b"decl " } else { b"fn " }, at(r.names, v));
             push(push(acc, key), match map_get(hashed, key) { Some(h) -> h, None -> b"" })
           }),
@@ -2809,7 +2810,7 @@ fn listing_within(analysis: View, listing: List<Int>) -> Within / {abort.raise} 
   let keys = fold(listing, [], |acc: List<Bytes>, i: Int|
     match test_at(analysis, i) { Some(t) -> push(acc, t.key), None -> acc });
   {
-    owners: listing_reach(analysis.hashes, keys),
+    owners: listing_reach(analysis.frame.hashes, keys),
     tests: map_of_entries(map(keys, |k: Bytes| { key: k, value: true })),
   }
 }
@@ -2828,7 +2829,7 @@ fn run_within(over: Ranged, running: List<Int>) -> Within / {abort.raise} =
 /// The functions the tests at `tests` reach, and what a reached definition's clauses reach.
 fn reached_by(analysis: View, tests: List<Int>) -> Map<Bytes, Bool> / {abort.raise} =
   reached_functions(
-    analysis.hashes,
+    analysis.frame.hashes,
     fold(tests, [], |acc: List<Which>, i: Int|
       match test_at(analysis, i) { Some(t) -> push(acc, TheItem(t.key)), None -> acc }),
   )
@@ -2912,20 +2913,20 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
     entry_of(i, match list_at(tests, i) { Some(t) -> string_of_bytes_lossy(t.key), None -> "" }));
   if map_len(cases) == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {
     // Every test hashed, or none is: a hash is read by the index its test has.
-    let hashed = len(analysis.hashes.tests) == len(tests);
+    let hashed = len(analysis.frame.hashes.tests) == len(tests);
     let walked = fold(
       range(0, len(tests)),
       {
         tests: [],
         hashes: [],
         entries: [],
-        starts: analysis.hashes.refs.items,
-        runs: analysis.hashes.refs.items,
+        starts: analysis.frame.hashes.refs.items,
+        runs: analysis.frame.hashes.refs.items,
       },
       |acc: Ranging, i: Int|
         match ((list_at(tests, i), list_at(plain, i))) {
           (Some(t), Some(whole)) -> {
-            let hash = at_or(analysis.hashes.tests, i, b"");
+            let hash = at_or(analysis.frame.hashes.tests, i, b"");
             match map_get(cases, i) {
               Some(Ok(listing)) ->
                 fold(range(0, len(listing)), acc, |a: Ranging, k: Int|
@@ -2945,8 +2946,16 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
                           ..whole,
                           case: Some({ at: k, identity: c.identity }),
                         }),
-                        starts: starting(a.starts, key, map_get(analysis.hashes.refs.items, t.key)),
-                        runs: starting(a.runs, key, map_get(analysis.hashes.refs.cases, t.key)),
+                        starts: starting(
+                          a.starts,
+                          key,
+                          map_get(analysis.frame.hashes.refs.items, t.key),
+                        ),
+                        runs: starting(
+                          a.runs,
+                          key,
+                          map_get(analysis.frame.hashes.refs.cases, t.key),
+                        ),
                       }
                     },
                   }),
@@ -2967,13 +2976,15 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
     );
     let reaching = |starts: Map<Bytes, List<Int>>|
       {
-        ..analysis,
-        checked: { ..analysis.checked, tests: walked.tests },
-        hashes: {
-          ..analysis.hashes,
-          tests: if hashed { walked.hashes } else { [] },
-          refs: { ..analysis.hashes.refs, items: starts },
+        frame: {
+          ..analysis.frame,
+          hashes: {
+            ..analysis.frame.hashes,
+            tests: if hashed { walked.hashes } else { [] },
+            refs: { ..analysis.frame.hashes.refs, items: starts },
+          },
         },
+        checked: { ..analysis.checked, tests: walked.tests },
       };
     { analysis: reaching(walked.starts), judged: reaching(walked.runs), entries: walked.entries }
   }
@@ -3473,10 +3484,13 @@ fn stopped(fl: Failure<InterleavingFailure>) -> Raised / {abort.raise} =
 
 fn hashes_of(analysis: View) -> Hashes / {abort.raise} =
   {
-    defs: by_name(analysis.hashes.defs),
-    decls: by_name(analysis.hashes.decls),
+    defs: by_name(analysis.frame.hashes.defs),
+    decls: by_name(analysis.frame.hashes.decls),
     closure: |keys: List<String>| {
-      let reached = reach(analysis.hashes, map(keys, |k: String| TheItem(bytes_of_string(k))));
+      let reached = reach(
+        analysis.frame.hashes,
+        map(keys, |k: String| TheItem(bytes_of_string(k))),
+      );
       {
         fns: map(map_keys(reached.fns), string_of_bytes_lossy),
         decls: map(map_keys(reached.decls), string_of_bytes_lossy),
@@ -4192,9 +4206,9 @@ fn history_of(
         ),
     );
     {
-      defs: filter(interfaces_of(analysis.checked, analysis.hashes), |d: FiledDef|
+      defs: filter(interfaces_of(analysis.checked, analysis.frame.hashes), |d: FiledDef|
         map_contains(hashes, hex_of(d.hash))),
-      bodies: filter(filed_bodies(analysis.hashes), |b: FiledBody|
+      bodies: filter(filed_bodies(analysis.frame.hashes), |b: FiledBody|
         map_contains(hashes, hex_of(b.hash))),
     }
   }
@@ -5391,12 +5405,12 @@ test "a case is a test of its own: its label names it, its test's hash and its i
     Some({ at: 0, identity: b"one" }),
     Some({ at: 1, identity: b"two" }),
   ]);
-  let hashes = over.analysis.hashes.tests;
-  assert_eq(list_at(hashes, 0), list_at(whole.hashes.tests, 0));
-  assert_eq(list_at(hashes, 1), Some(case_hash(at_or(whole.hashes.tests, 1, b""), b"one")));
+  let hashes = over.analysis.frame.hashes.tests;
+  assert_eq(list_at(hashes, 0), list_at(whole.frame.hashes.tests, 0));
+  assert_eq(list_at(hashes, 1), Some(case_hash(at_or(whole.frame.hashes.tests, 1, b""), b"one")));
   assert(list_at(hashes, 1) != list_at(hashes, 2), None);
   // A case reaches its table where a definition is covered, and not where a failure is suspected.
-  let reached = |a: View| map_keys(reach(a.hashes, [TheItem(b"m.holds 1")]).fns);
+  let reached = |a: View| map_keys(reach(a.frame.hashes, [TheItem(b"m.holds 1")]).fns);
   assert(
     contains(reached(over.analysis), b"m.table") && contains(reached(over.analysis), b"m.held"),
   );
@@ -5434,7 +5448,7 @@ test "a test whose cases could not be listed stays one test, and ends as the lis
   };
   let over = ranged(whole, map_insert(map_new(), 1, Err(why)));
   assert_eq(map(over.analysis.checked.tests, |t: TestInfo| t.key), [b"m.plain", b"m.holds {n}"]);
-  assert_eq(over.analysis.hashes.tests, whole.hashes.tests);
+  assert_eq(over.analysis.frame.hashes.tests, whole.frame.hashes.tests);
   let p = a_program(
     map(cases_of_whole(over.analysis), |case: Case|
       { ..case, entry: at_or(over.entries, case.index, case.entry) }),
