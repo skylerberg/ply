@@ -6,7 +6,7 @@
 import std.bin
 import std.hash (blake3)
 import std.bytes (join, hex_of)
-import std.list (at, concat, contains, reverse, sort_by)
+import std.list (at, concat, contains, flatten, reverse, sort_by)
 import memo (memo, memo_keep, Held, Query, Run, Tally, answer, nothing_held, over_held, ran_total,
              started, tallies)
 import unit (definition_hash)
@@ -1172,8 +1172,9 @@ fn answered_over(
 }
 
 // --- Through a session of edits -------------------------------------------------------------
-// Each step is analysed from nothing and answered through the module queries over a store the steps
-// before it kept: the two answers must be one answer, whatever the edit was.
+// Each step is answered through the store the steps before it kept and again from nothing, which must
+// agree. A load refuses by each module's own errors, more than a whole analysis stopping at its first
+// failing phase may report, so that one decides only whether a program checks and what it publishes.
 
 type Step = { what: Bytes, sources: List<Source> }
 
@@ -1184,11 +1185,14 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
     { held: nothing_held(), off: [] },
     |s: { held: Held, off: List<Bytes> }, step: Step| {
       let warm = answered_over(s.held, step.sources);
-      {
-        held: warm.held,
-        off: if said(warm.outcome) == said(analyse(parse_all(step.sources))) { s.off }
-        else { push(s.off, step.what) },
-      }
+      let now = said(warm.outcome);
+      let whole = said(analyse(parse_all(step.sources)));
+      let agrees = now == said(answered_over(nothing_held(), step.sources).outcome)
+        && (match whole {
+          Publishing(_) -> now == whole,
+          Refusing(_) -> match now { Refusing(_) -> true, Publishing(_) -> false },
+        });
+      { held: warm.held, off: if agrees { s.off } else { push(s.off, step.what) } }
     },
   ).off
 
@@ -1212,20 +1216,146 @@ fn with_module(sources: List<Source>, name: Bytes, src: Bytes) -> List<Source> =
 fn without(sources: List<Source>, name: Bytes) -> List<Source> =
   filter(sources, |source: Source| source.name != name)
 
-fn shop_core() -> Bytes =
-  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\npub fn label(i: Item) -> String =\n  match i {\n    Book(t, _) -> t,\n    Note(t) -> t,\n  }\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
+/// A change a session makes to the shop fixture. An edit turns each change it names on, or off again,
+/// so every list of edits is a session the fixture renders, an error or a missing module among them.
+type Change =
+  | LeafBody
+  | LeafSignature
+  | LeafPrivate
+  | LeafError
+  | LeafImportsCore
+  | LeafReformatted
+  | LeafDeleted
+  | CoreRenamed
+  | CoreBody
+  | CoreResultType
+  | TypeRenamed
+  | EffectRenamed
+  | TwiceMoved
+  | DoubledRemoved
+  | ShopBody
+  | ShopImportsLeaf
+  | DefaultEdited
+  | TestAdded
+  | ExtraAdded
+  | ExtraBody
+  | TwinAdded
 
-fn shop_shop() -> Bytes =
-  b"import core\nfn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"shipped modules adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
+fn either(on: List<Change>, change: Change, yes: Bytes, no: Bytes) -> Bytes =
+  if contains(on, change) { yes } else { no }
 
-fn shop_leaf() -> Bytes = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
+fn twice_text() -> Bytes = b"pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n"
 
-fn shop() -> List<Source> =
-  [
-    { name: b"core", src: shop_core() },
-    { name: b"shop", src: shop_shop() },
-    { name: b"leaf", src: shop_leaf() },
-  ]
+fn shop_core(on: List<Change>) -> Bytes = {
+  let money = either(on, TypeRenamed, b"Cost", b"Money");
+  bytes_concat_all([
+    b"pub type ",
+    money,
+    b" = Int\npub type Item =\n  | Book(String, ",
+    money,
+    b")\n  | Note(String)\npub effect ",
+    either(on, EffectRenamed, b"ledger", b"db"),
+    b" {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\npub fn price(i: Item) -> ",
+    either(on, CoreResultType, b"Int", money),
+    b" =\n  match i {\n    Book(_, p) -> p",
+    either(on, CoreBody, b" + 0", b""),
+    b",\n    Note(_) -> 0,\n  }\n",
+    either(on, TwiceMoved, b"", twice_text()),
+    b"pub fn ",
+    either(on, CoreRenamed, b"title", b"label"),
+    b"(i: Item) -> String =\n  match i {\n    Book(t, _) -> t,\n    Note(t) -> t,\n  }\npub fn shade(n: Int = ",
+    either(on, DefaultEdited, b"2", b"1"),
+    b") -> Int = n\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n",
+    either(
+      on,
+      TestAdded,
+      b"test \"a book costs its price\" {\n  assert_eq(price(Book(\"b\", 2)), 2)\n}\n",
+      b"",
+    ),
+  ])
+}
+
+fn shop_shop(on: List<Change>) -> Bytes = {
+  let db = either(on, EffectRenamed, b"ledger", b"db");
+  bytes_concat_all([
+    b"import core\n",
+    if contains(on, ShopImportsLeaf) || contains(on, TwiceMoved) { b"import leaf\n" } else { b"" },
+    b"fn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i)",
+    either(on, ShopBody, b" + 0", b""),
+    b")\n",
+    either(
+      on,
+      DoubledRemoved,
+      b"",
+      bytes_concat_all([
+        b"fn doubled(n: Int) -> Int = ",
+        either(on, TwiceMoved, b"leaf", b"core"),
+        b"::twice(n, |x: Int| x + x)\n",
+      ]),
+    ),
+    b"fn stored(k: Int) -> Int / {core::",
+    db,
+    b".read[cart]} = core::",
+    db,
+    b".get[cart](k)\nfn shaded() -> Int = core::shade()\ntest \"shipped modules adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n",
+  ])
+}
+
+fn shop_leaf(on: List<Change>) -> Bytes =
+  bytes_concat_all([
+    either(on, LeafImportsCore, b"import core\n\n", b""),
+    either(on, LeafReformatted, b"// a comment\n", b""),
+    either(on, LeafPrivate, b"", b"pub "),
+    either(on, LeafReformatted, b"fn  one", b"fn one"),
+    b"() -> Int = ",
+    if contains(on, LeafError) { b"\"1\"" }
+    else if contains(on, LeafImportsCore) { b"core::price(core::Note(\"n\")) + 1" }
+    else { b"1" },
+    b"\npub fn two",
+    either(on, LeafSignature, b"(k: Int) -> Int = one() + k", b"() -> Int = one() + one()"),
+    either(on, LeafBody, b" + 0", b""),
+    b"\n",
+    either(on, TwiceMoved, twice_text(), b""),
+  ])
+
+fn shop_extra(on: List<Change>) -> Bytes =
+  bytes_concat_all([
+    b"import leaf\npub fn four() -> Int = leaf::two(",
+    either(on, LeafSignature, b"2", b""),
+    b") + ",
+    either(on, ExtraBody, b"3", b"2"),
+    b"\n",
+  ])
+
+/// The shop fixture with the changes `on` made: a twin is a module whose text is the leaf's.
+fn rendered(on: List<Change>) -> List<Source> = {
+  let leaf = shop_leaf(on);
+  let present = |change: Change, sources: List<Source>|
+    if contains(on, change) { sources } else { [] };
+  flatten([
+    [{ name: b"core", src: shop_core(on) }, { name: b"shop", src: shop_shop(on) }],
+    if contains(on, LeafDeleted) { [] } else { [{ name: b"leaf", src: leaf }] },
+    present(ExtraAdded, [{ name: b"extra", src: shop_extra(on) }]),
+    present(TwinAdded, [{ name: b"twin", src: leaf }]),
+  ])
+}
+
+fn shop() -> List<Source> = rendered([])
+
+/// The steps of a session from the fixture cold, each edit turning its changes on or off.
+fn session(edits: List<List<Change>>) -> List<Step> =
+  fold(
+    edits,
+    { on: [], steps: [step(b"cold", shop())] },
+    |s: { on: List<Change>, steps: List<Step> }, edit: List<Change>| {
+      let on = fold(edit, s.on, |acc: List<Change>, c: Change|
+        if contains(acc, c) { filter(acc, |d: Change| d != c) } else { push(acc, c) });
+      {
+        on: on,
+        steps: push(s.steps, step(bytes_of_string(int_to_string(len(s.steps))), rendered(on))),
+      }
+    },
+  ).steps
 
 test "an answer through the store is the fresh one through every kind of edit a session makes" {
   let s0 = shop();
@@ -1515,15 +1645,15 @@ test "edits undone, modules renamed and files emptied leave an answer through th
         with_module(
           s0,
           b"leaf",
-          bytes_concat(shop_leaf(), b"pub fn three() -> Int = two() + one()\n"),
+          bytes_concat(shop_leaf([]), b"pub fn three() -> Int = two() + one()\n"),
         ),
       ),
       step(b"and deleted", s0),
-      step(b"a module renamed", with_module(without(s0, b"leaf"), b"frond", shop_leaf())),
+      step(b"a module renamed", with_module(without(s0, b"leaf"), b"frond", shop_leaf([]))),
       step(b"and renamed back", s0),
       step(b"an imported module deleted", without(s0, b"core")),
       step(b"and restored", s0),
-      step(b"a comment", with_module(s0, b"leaf", bytes_concat(b"// a note\n", shop_leaf()))),
+      step(b"a comment", with_module(s0, b"leaf", bytes_concat(b"// a note\n", shop_leaf([])))),
       step(b"an import aliased", aliased),
       step(b"the alias removed", s0),
       step(b"an empty module", with_module(s0, b"empty", b"")),
@@ -1542,48 +1672,10 @@ test "edits undone, modules renamed and files emptied leave an answer through th
   )
 }
 
-test "a shuffle of module states leaves an answer through the store the fresh one at every step" {
-  let leaves = [
-    shop_leaf(),
-    bytes_concat(b"// reformatted\n\n", shop_leaf()),
-    b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n",
-  ];
-  let cores = [
-    shop_core(),
-    join(bytes_split(shop_core(), b"Money"), b"Cost"),
-    join(bytes_split(shop_core(), b"pub fn label("), b"pub fn title("),
-  ];
-  let shops = [
-    shop_shop(),
-    join(bytes_split(shop_shop(), b"import core\n"), b"import core\nimport leaf\n"),
-    join(bytes_split(shop_shop(), b"acc + core::price(i)"), b"acc + core::price(i) + 0"),
-  ];
-  // Each step sets one module to one of its states: which, and to what, cycles through every pair.
-  let picks = [
-    [0, 1],
-    [1, 2],
-    [2, 1],
-    [0, 2],
-    [1, 1],
-    [2, 2],
-    [0, 0],
-    [1, 0],
-    [2, 0],
-    [0, 1],
-    [1, 2],
-    [0, 2],
-  ];
-  let states = fold(picks, [shop()], |acc: List<List<Source>>, p: List<Int>| {
-    let now = at(acc, len(acc) - 1);
-    let module = at(p, 0);
-    let pick = at(p, 1);
-    push(acc, if module == 0 { with_module(now, b"leaf", at(leaves, pick)) }
-    else if module == 1 { with_module(now, b"core", at(cores, pick)) }
-    else { with_module(now, b"shop", at(shops, pick)) })
-  });
-  assert_eq(disagreements(map(states, |sources: List<Source>| step(b"a shuffle step", sources))), [
-  ])
-}
+law "an answer through the store is the fresh one at every step of any session of edits"
+  forall (edits: List<List<Change>>) {
+    disagreements(session(edits)) == []
+  }
 
 fn chain_lib(label: Bytes) -> Bytes =
   bytes_concat_all([
@@ -1747,6 +1839,40 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
   let other = [{ name: b"aaa", src: b"pub effect alpha {\n  write put(key: Int) -> Int\n}\n" }];
   assert(seeded_agrees(performing([]), performing(other)))
 }
+
+// --- What a store keeps reads back ------------------------------------------------------------
+
+law "a module's answer reads back as it was filed"
+  forall (a: ModuleAnswer) {
+    bin::round_trips(a, module_answer_bin())
+  }
+
+law "what a module shows its importers reads back as it was filed"
+  forall (s: Shown) {
+    bin::round_trips(s, shown_bin())
+  }
+
+law "a module's forms read back as they were filed"
+  forall (f: FormsAnswer) {
+    bin::round_trips(f, forms_answer_bin())
+  }
+
+law "a module's imports read back as they were filed"
+  forall (i: ImportsOf) {
+    bin::round_trips(i, imports_of_bin())
+  }
+
+law "a module's hashes read back as they were filed"
+  forall (h: HashAnswer) {
+    bin::round_trips(h, hash_answer_bin())
+  }
+
+law "what a module query is asked reads back as it was asked"
+  forall (n: Named, e: EntryNamed, m: Embedding, p: Placing) {
+    bin::round_trips(n, named_bin()) && bin::round_trips(e, entry_named_bin())
+      && bin::round_trips(m, embedding_bin())
+      && bin::round_trips(p, placing_bin())
+  }
 
 // --- What an edit runs again ------------------------------------------------------------------
 

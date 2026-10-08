@@ -1,10 +1,15 @@
-//! The standard library, the compiler and the CLI, each checked as the project it is: a definition
-//! nothing reaches is one to delete, a row naming an effect its body never performs is one to
-//! narrow, and only this run checks the measures their own definitions state.
+//! The repository's own code audited, on a runner of its own. The standard library, the compiler and
+//! the CLI, each checked as the project it is: a definition nothing reaches is one to delete, a row
+//! naming an effect its body never performs is one to narrow, and only this run checks the measures
+//! their own definitions state. And no function is written twice: two modules whose functions hash
+//! alike carry one copy too many, and the one to keep is the one every caller can reach. A copy kept
+//! on purpose says why.
 
-import harness (Reached, Repo, Shipped, at, items, json_of, on_disk, repo, str)
+import harness (Reached, Repo, Shipped, Spawned, at, items, json_of, on_disk, repo,
+                spawned_together, str)
 import std.json (Json, Array, Str, object)
-import std.list (concat)
+import std.list (at_or, concat, contains, push_unique, sort)
+import std.map (get_or)
 import std.string
 
 /// Each definition a `check --types --explain --json` answer lists whose row names an effect its
@@ -60,4 +65,107 @@ test "a definition whose row names an effect its body never performs is named wi
     { key: "definitions", value: Array([d("m.kept", []), d("m.wide", ["abort.raise", "m.e.op"])]) },
   ]);
   assert_eq(unperformed(answer), ["m.wide declares abort.raise, m.e.op"])
+}
+
+// --- Copies ----------------------------------------------------------------------------------
+
+/// Every package the repository maintains, by its directory under `crates/`.
+fn packages() -> List<String> =
+  ["std", "compiler", "cli", "prove", "sim", "test", "store", "registry", "corpus", "cli-tests"]
+
+/// Each copy kept on purpose: its members, sorted, and why it stays.
+fn kept() -> List<{ members: List<String>, why: String }> =
+  [
+    {
+      members: ["cli/signing.a_seed", "registry/service.a_seed", "std/signed.a_seed"],
+      why: "the seed three packages' key tests each need, where no test helper reaches all three",
+    },
+    {
+      members: ["std/idna.status_of", "std/list.few"],
+      why: "a three-bit mask that is a status in one module and a count its laws draw in the other",
+    },
+  ]
+
+type Member = { name: String, module: String }
+
+/// Whether a function takes anything: constants that agree are often different things.
+fn takes_parameters(ty: String) -> Bool / {abort.raise} = {
+  let params = if string_starts_with(ty, "<") { string_slice(ty, generics_end(ty), string_len(ty)) }
+  else { ty };
+  string_starts_with(params, "(") && !string_starts_with(params, "()")
+}
+
+/// Past the `<..>` that opens `ty`.
+fn generics_end(ty: String) -> Int / {abort.raise} =
+  fold(range(0, string_len(ty)), { depth: 0, end: 0 }, |s: { depth: Int, end: Int }, i: Int|
+    if s.end > 0 { s } else {
+      let c = string_slice(ty, i, i + 1);
+      let depth = if c == "<" { s.depth + 1 } else if c == ">" { s.depth - 1 } else { s.depth };
+      { depth: depth, end: if depth == 0 { i + 1 } else { 0 } }
+    }).end
+
+/// Whether a definition `ply defs` lists of a package is in the package's own files, which it places
+/// below the package; a dependency's are listed again, at the dependency's place. A module's name
+/// says neither, as `std.hash.legacy` is the library's `hash.legacy`.
+fn in_package(file: String) -> Bool =
+  !string_starts_with(file, "/") && !string_starts_with(file, "../")
+
+/// Every function with parameters each package defines, grouped by hash: every package's
+/// definitions listed at once, each by a `ply` of its own.
+fn by_hash() -> Map<String, List<Member>> / {Spawned, Repo, abort.raise} = {
+  let listed = spawned_together(
+    map(packages(), |pkg: String| ["defs", "--json", repo() ++ "/crates/ply-" ++ pkg ++ "/ply"]),
+  );
+  fold(range(0, len(packages())), map_new(), |acc: Map<String, List<Member>>, i: Int| {
+    let pkg = at_or(packages(), i, "");
+    let v = json_of(at_or(listed, i, { out: [], err: [], code: 1 }));
+    fold(items(at(v, "definitions")), acc, |m: Map<String, List<Member>>, d: Json| {
+      let module = str(at(d, "module"));
+      if !in_package(str(at(d, "file"))) || !takes_parameters(str(at(d, "type"))) { m } else {
+        let hash = str(at(d, "hash"));
+        map_insert(
+          m,
+          hash,
+          push(get_or(m, hash, []), {
+            name: pkg ++ "/" ++ str(at(d, "name")),
+            module: pkg ++ "/" ++ module,
+          }),
+        )
+      }
+    })
+  })
+}
+
+test/nondet "no two modules define the same function" {
+  let copies = fold(map_values(by_hash()), [], |acc: List<List<String>>, ms: List<Member>|
+    if len(fold(ms, [], |seen: List<String>, x: Member| push_unique(seen, x.module))) < 2 { acc }
+    else { push(acc, sort(map(ms, |x: Member| x.name))) });
+  let allowed = map(kept(), |k: { members: List<String>, why: String }| k.members);
+  let unexplained = filter(copies, |c: List<String>| !contains(allowed, c));
+  let stale = filter(allowed, |k: List<String>| !contains(copies, k));
+  let lines = |groups: List<List<String>>|
+    string::join(map(groups, |g: List<String>| string::join(g, " ")), "\n  ");
+  assert(
+    unexplained == [] && stale == [],
+    Some(
+      "functions more than one module defines; keep the copy every caller reaches:\n  "
+        ++ lines(unexplained)
+        ++ "\ncopies `kept` names that no longer hash alike:\n  "
+        ++ lines(stale),
+    ),
+  )
+}
+
+test "a function's type takes parameters past its generics, and a constant's takes none" {
+  assert(takes_parameters("(Int) -> Int"));
+  assert(takes_parameters("<a>(List<a>, Int) -> Option<a>"));
+  assert(!takes_parameters("() -> Int"));
+  assert(!takes_parameters("<a>() -> List<a>"))
+}
+
+test "a module below its package is the package's, and a dependency's file is not" {
+  assert(in_package("hash/legacy.ply"));
+  assert(in_package("hash.ply"));
+  assert(!in_package("/repo/crates/ply-prove/ply/engine.ply"));
+  assert(!in_package("../../ply-prove/ply/engine.ply"))
 }
