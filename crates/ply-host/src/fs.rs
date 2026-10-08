@@ -1,6 +1,6 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{JobOutput, Pool, Pooled, option, record};
+use crate::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Pooled, option, record};
 use ply_eval::crypto::Framing;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
@@ -309,7 +309,7 @@ impl FsHost {
     pub fn new(roots: Roots) -> FsHost {
         FsHost {
             roots,
-            pool: Pool::new(),
+            pool: Pool::queued(MAX_BLOCKING_OPERATIONS),
             held: Arc::new(Mutex::new(BTreeSet::new())),
             descriptors: Arc::new(Mutex::new(Descriptors::default())),
         }
