@@ -3172,7 +3172,8 @@ has not read. What a load reads of a shipped module (§13) is kept once for the 
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
 project's first load lexes no shipped module's tests or laws to find it.
 `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` answer
-every module afresh and keep nothing, and neither does `compiler.load`. A memo
+the program's own modules afresh and keep nothing, and neither does `compiler.load`;
+each still takes what the binary carries answered for the shipped modules. A memo
 store that will not read is a cold check, never a failure.
 
 `ply run` over sources goes further: once a load holds, the front end's answer
