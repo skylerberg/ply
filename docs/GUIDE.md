@@ -3177,7 +3177,9 @@ whole, each definition taken as its module answered it, only for what is read fr
 call runs, `--verify-deps`, and the commands that read source (`ply doc`, `ply prove`,
 `ply review`).
 A load pulls each shipped module its modules' answers say they import, so a module that answers as
-it did pulls as it did, with no text read again to find what it pulls. What a load reads of a
+it did pulls as it did, with no text read again to find what it pulls. Nor does the walk parse a
+module to find what it embeds: its check reads each embed, and the memo store notes the files as
+places that check read. What a load reads of a
 shipped module (§13) is kept once for the machine, in
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
 project's first load lexes no shipped module's tests or laws to find it.
@@ -3187,39 +3189,39 @@ each still takes what the binary carries answered for the shipped modules. A mem
 store that will not read is a cold check, never a failure.
 
 `ply run` over sources goes further: once a load holds, the front end's answer
-is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
-read — the name and bytes of every module the walk read, the root's manifest,
-each dependency's key, manifest and modules, what the modules embed, the root's
-absolute path, the `ply`
-program and the modules it ships as the launcher gates them, the binary's
-version, and `--config-schema`. A later run whose walk hashes
-the same takes that answer and runs neither the front end nor the promise check,
-which the filed load passed; it binds, grants (`--allow`, `--exec`, `--fs`) and
-picks its entry anew, and reports exactly what a run that built the answer
-reports. Any edit to a module, a dependency or a manifest, another schema or
-another `ply` is a new key, and the front end runs again; `ply.lock` is not
-read by a run and is not in the key. A single `.ply` file keys that one module.
-The answers live under the stage root (`PLY_C_STAGE`, §8.6) in `reused/`,
-one file per key, each written beside itself and renamed into place, so two runs
-of one package never read half of one; an entry that does not read is rebuilt
-and written over. They are swept with the stages, least recently used first, down to
-`PLY_C_CACHE_MAX`, never one used within the hour, and deleting them is always
-safe. `ply run --explain` says `reused` or `built`, the key, and what reading,
-the front end and the machine's load each took, on
-stderr before the entry runs, or as `front_end` in the `--json` document.
+is filed under a key of everything the walk read — the name and bytes of every
+module, the root's manifest, each dependency's key, manifest and modules, the
+root's absolute path, the `ply` program and the modules it ships as the launcher
+gates them, the binary's version, and `--config-schema` — beside each file its
+modules embedded and what was read for it. A later run whose walk hashes the
+same, and whose embeds each read as they did, takes that answer and runs neither
+the front end nor the promise check, which the filed load passed; it binds,
+grants (`--allow`, `--exec`, `--fs`) and picks its entry anew, and reports
+exactly what a run that built the answer reports. Any edit to a module, a
+dependency or a manifest, another schema or another `ply` is a new key, and the
+front end runs again; `ply.lock` is not read by a run and is not in the key. A
+single `.ply` file keys that one module. The answers live under the stage root
+(`PLY_C_STAGE`, §8.6) in `reused/`, one file per key, each written beside itself
+and renamed into place, so two runs of one package never read half of one; an
+entry that does not read is rebuilt and written over. They are swept with the
+stages, least recently used first, down to `PLY_C_CACHE_MAX`, never one used
+within the hour, and deleting them is always safe. `ply run --explain` says
+`reused` or `built`, the key, and what reading, the front end and the machine's
+load each took, on stderr before the entry runs, or as `front_end` in the
+`--json` document.
 
 `ply check` takes its own answer back the same way. A check the front end
-answered whole is filed in `reused/` under the walk's key, the interface
-each registry dependency's slot holds, the paths its reports name, and the flags
-that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
-color). A later check whose key matches prints that answer
-and exits with its code without running the front end, so a tree unchanged since
-its last check is answered in the time its walk takes. `--explain` always checks
-afresh, since what it reports is this run's. In the `--json` document,
-`front_end` carries `reused` and `key`: alone for an answer taken back, and
-beside the phases of a check that ran, with `filed`, whether the next check can
-take its answer back (false for a refused load, or when the entry could not be
-written).
+answered whole is filed in `reused/`, beside the embeds its load read, under the
+walk's key, the interface each registry dependency's slot holds, the paths its
+reports name, and the flags that shape what it prints (`--types`, `--costs`,
+`--json`, `--verify-deps`, color). A later check whose key matches prints that
+answer and exits with its code without running the front end, so a tree
+unchanged since its last check is answered in the time its walk takes.
+`--explain` always checks afresh, since what it reports is this run's. In the
+`--json` document, `front_end` carries `reused` and `key`: alone for an answer
+taken back, and beside the phases of a check that ran, with `filed`, whether the
+next check can take its answer back (false for a refused load, or when the entry
+could not be written).
 
 `ply test` keeps its answer for the next run over the same command line, files
 and `ply`, in the test store beside its passes: the answer of a run that ran no

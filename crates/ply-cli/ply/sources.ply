@@ -10,12 +10,12 @@ import std.path (join, is_absolute, normalize, parent)
 import compiler.front (module_of, Embedded, Shipping, ShippedData, embeds_wanted, pulls_of,
                        shipped_data_wanted, shipped_pulled, shipping_pulled)
 import compiler.unit (identity_of, read_kept, write_kept)
-import compiler.interface (blanked, imported)
+import compiler.interface (blanked, imported, read_key)
 import compiler.items (parse, unimported)
 import std.bin
 import std.random (entropy)
 import std.time (time)
-import compiler.embed (EmbedRead, EmbedWant)
+import compiler.embed (EmbedRead, EmbedWant, embed_key, want_of_key)
 import compiler.resolve (Source, Diag, Label, error_at)
 import builder (builder)
 import env (env)
@@ -60,7 +60,6 @@ pub type Project = {
   packages: List<DepPackage>,
   /// The key the package walk rooted at, which dependency paths resolve against.
   root_key: String,
-  embeds: List<Embed>,
 }
 
 /// One embed as the load read it, beside the file of the module that asked: a watching run reads it
@@ -143,7 +142,7 @@ fn one_file(
   }
 
 fn empty() -> Project =
-  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "", embeds: [] }
+  { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "" }
 
 /// Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused.
 fn read(
@@ -171,22 +170,102 @@ pub fn load_resolved(
     ));
   match list_at(rs, 0) {
     None -> merged,
-    Some(first) -> {
-      let walked = {
+    Some(first) ->
+      {
         ..merged,
         packages: walk_packages(first.absolute, merged.manifest),
         root_key: first.absolute,
-      };
-      { ..walked, embeds: embeds_of(walked) }
-    },
+      },
   }
 }
 
 // --- Embeds -------------------------------------------------------------------------------------
-// What the loaded packages' modules embed, each read relative to its module's own file: the front
-// end writes every one out as what was read here, so a definition's hash covers the bytes it embeds.
+// What the loaded packages' modules embed, each read relative to its module's own file when a load
+// asks for it: the front end writes every one out as what was read here, so a definition's hash
+// covers the bytes it embeds.
 
-fn embeds_of(
+/// The files of package `k` of `project`: the root's, then each dependency's in its order.
+fn package_files(project: Project, k: Int) -> List<File> =
+  if k == 0 { project.files }
+  else { match list_at(project.packages, k - 1) { Some(p) -> p.files, None -> [] } }
+
+/// The key package `k` of `project` is judged by.
+fn package_root(project: Project, k: Int) -> String =
+  if k == 0 { project.root_key }
+  else { match list_at(project.packages, k - 1) { Some(p) -> p.root, None -> "" } }
+
+/// What the module `module` of package `k` of `project` embeds as `want` asks, read beside its file.
+pub fn embed_now(
+  project: Project,
+  k: Int,
+  module: Bytes,
+  want: EmbedWant,
+) -> EmbedRead / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match filter(package_files(project, k), |f: File| bytes_of_string(f.module) == module) {
+    [f, ..] -> read_embed(f.at, want),
+    [] -> Err(b"no file is there"),
+  }
+
+/// The embed `module` of package `k` of `project` read as `read` for `want`, beside its module's file.
+pub fn embed_of(
+  project: Project,
+  k: Int,
+  module: Bytes,
+  want: EmbedWant,
+  read: EmbedRead,
+) -> Option<Embed> =
+  match filter(package_files(project, k), |f: File| bytes_of_string(f.module) == module) {
+    [f, ..] ->
+      Some({
+        embedded: {
+          root: bytes_of_string(package_root(project, k)),
+          module: module,
+          want: want,
+          read: read,
+        },
+        file: f.at,
+      }),
+    [] -> None,
+  }
+
+/// The index of the package of `project` judged by `root`: the root's 0, each dependency's after.
+fn package_of(project: Project, root: Bytes) -> Option<Int> =
+  if root == bytes_of_string(project.root_key) { Some(0) } else {
+    fold(range(0, len(project.packages)), None, |found: Option<Int>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> match list_at(project.packages, i) {
+          Some(p) -> if bytes_of_string(p.root) == root { Some(i + 1) } else { None },
+          None -> None,
+        },
+      })
+  }
+
+/// An embed an answer was made over: the package and module that asked, what it asked for, and the
+/// digest of what was read for it.
+pub type Embedding = { root: Bytes, module: Bytes, key: Bytes, digest: Bytes }
+
+derive bin for Embedding
+
+/// `e` as an answer made over it holds it.
+pub fn embedding_of(e: Embedded) -> Embedding =
+  { root: e.root, module: e.module, key: embed_key(e.want), digest: read_key(e.read) }
+
+/// Whether each embed in `held` reads now, in `project`, as it did.
+pub fn embeds_stand(
+  held: List<Embedding>,
+  project: Project,
+) -> Bool / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  fold(held, true, |all: Bool, x: Embedding|
+    all
+      && (match package_of(project, x.root) {
+        None -> false,
+        Some(k) -> read_key(embed_now(project, k, x.module, want_of_key(x.key))) == x.digest,
+      }))
+
+/// Every embed of every module of `project`, each module parsed for what it asks: what pins a load
+/// without loading it.
+pub fn embeds_parsed(
   project: Project,
 ) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   fold(
@@ -470,7 +549,6 @@ fn merge(a: Project, b: Project) -> Project = {
     packages: fold(b.packages, a.packages, |acc: List<DepPackage>, package: DepPackage|
       push(acc, package)),
     root_key: if a.root_key == "" { b.root_key } else { a.root_key },
-    embeds: concat(a.embeds, b.embeds),
   }
 }
 
