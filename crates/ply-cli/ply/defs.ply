@@ -4,13 +4,17 @@ import compiler.front (viewed_text)
 import compiler.unit (shipped)
 import std.random (entropy)
 import std.time (time)
-import answers
+import queried
 import builder (builder)
 import args (Flags, kept, no_flags, style_of)
 import env (env)
 import program (Program, Tables, Timed, published, tables_of, location_of, place_of, is_shipped,
-                hash_of, own_of, deps_of, specs_of, short_of, timed_over, no_program, program_view)
-import sources (Embed, embedding_of, load_resolved)
+                hash_of, own_of, deps_of, specs_of, short_of, timed_over, no_program, program_view,
+                asked_line, command_kept, keep_command)
+import queried (command_key)
+import sources (Project, load_resolved)
+import std.bin
+import std.bytes (hex_of)
 import report (Answer, schema_version, ok_code, count_of, indent, refused)
 import std.term (Style, bold, dim)
 import compiler.hash (TheFn, no_hashes)
@@ -106,71 +110,91 @@ fn answered(
   }
 
 /// The listing `argv` asks for, taken back where an earlier run of the same command line kept it and
-/// it still stands, else listed from a load and kept beside its views and the embeds it read.
+/// nothing it read moved, else listed from a load and kept.
 pub fn run(
   flags: Flags,
   argv: List<String>,
-) -> Answer / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], env.var[sys], env.pwd[sys], time.elapsed_ms, entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
-  let key = answers::key_of(answers::program(), argv, project);
-  match match answers::kept_standing(flags.paths, key, project) {
-      Some(k) -> match parse_string(k.json) {
+  let key = command_key(queried::program(), asked_line(argv, flags.paths));
+  let shown = hex_of(key);
+  let kept = command_kept(flags.paths, project, key);
+  match kept.output {
+    Some(bytes) -> match bin::decode(bytes, listing_bin()) {
+      Ok(l) -> match parse_string(l.json) {
         Ok(Object(members)) ->
-          Some({
+          {
             json: Object(
               map_insert(
                 members,
                 "front_end",
-                object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(key) }]),
+                object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }]),
               ),
             ),
-            lines: k.lines,
-            errs: k.errs,
-            code: k.code,
-          }),
-        _ -> None,
+            lines: l.lines,
+            errs: l.errs,
+            code: l.code,
+          },
+        _ -> listed_now(flags, project, started, key, kept.marks),
       },
-      None -> None,
-    } {
-    Some(answer) -> answer,
-    None -> {
-      let t: Timed = timed_over(flags.paths, project, started);
-      let loaded: Program = t.program;
-      match program_view(loaded) {
-        None -> refused(style_of(flags), "defs", loaded.diags, loaded.places),
-        Some(w) -> {
-          let listed = answered(
-            style_of(flags),
-            loaded,
-            tables_of(w.frame.hashes),
-            filter(published(w), |def_info: DefInfo| wanted(flags, def_info)),
-          );
-          let answer = match listed.json {
-            Object(members) ->
-              {
-                ..listed,
-                json: Object(
-                  map_insert(members, "front_end", object([{ key: "reused", value: Bool(false) }])),
-                ),
-              },
-            _ -> listed,
-          };
-          if loaded.reached {
-            answers::keep(flags.paths, key, {
-              opening: [],
-              lines: answer.lines,
-              errs: answer.errs,
-              code: answer.code,
-              json: to_string(answer.json),
-              passes: [],
-              views: viewed_text(loaded.viewed),
-              embeds: map(loaded.embeds, |e: Embed| embedding_of(e.embedded)),
-            })
-          };
-          answer
-        },
-      }
+      Err(_) -> listed_now(flags, project, started, key, kept.marks),
+    },
+    None -> listed_now(flags, project, started, key, kept.marks),
+  }
+}
+
+/// A listing as the memo store keeps it.
+type Listing = { lines: List<String>, errs: List<String>, code: Int, json: String }
+
+derive bin for Listing
+
+/// The listing listed from a load now, and kept under `key` as a function of what the load asked.
+fn listed_now(
+  flags: Flags,
+  project: Project,
+  started: Int,
+  key: Bytes,
+  marks: List<Bytes>,
+) -> Answer / {shipped.answer, env.reused[sys], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, abort.raise, shipped.reached} = {
+  let t: Timed = timed_over(flags.paths, project, started);
+  let loaded: Program = t.program;
+  match program_view(loaded) {
+    None -> refused(style_of(flags), "defs", loaded.diags, loaded.places),
+    Some(w) -> {
+      let listed = answered(
+        style_of(flags),
+        loaded,
+        tables_of(w.frame.hashes),
+        filter(published(w), |def_info: DefInfo| wanted(flags, def_info)),
+      );
+      let answer = match listed.json {
+        Object(members) ->
+          {
+            ..listed,
+            json: Object(
+              map_insert(members, "front_end", object([{ key: "reused", value: Bool(false) }])),
+            ),
+          },
+        _ -> listed,
+      };
+      let _ = keep_command(
+        flags.paths,
+        project,
+        key,
+        loaded,
+        bin::encode(
+          {
+            lines: answer.lines,
+            errs: answer.errs,
+            code: answer.code,
+            json: to_string(answer.json),
+          },
+          listing_bin(),
+        ),
+        marks,
+      );
+      answer
     },
   }
 }
