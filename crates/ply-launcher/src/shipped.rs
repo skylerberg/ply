@@ -21,8 +21,8 @@ pub const ROOT: &str = ply_pack::PROGRAM;
 
 const ENTRY: &str = "ply.main";
 
-/// The name the rows of the program's builds are kept under.
-const ROWS: &str = "cli";
+/// The name the memo store of the program's builds is kept under.
+const MEMO: &str = "cli";
 
 /// Each file of the program's packages as the pack carries it: the path it has in the repository.
 fn program_files() -> Vec<&'static str> {
@@ -147,7 +147,7 @@ pub fn program() -> Result<Runnable, Diagnostic> {
         ply_machine::builds::kept_as_built(ply_pack::installed().text(COMMITTED_KEY), || {
             committed().map(<[u8]>::to_vec)
         });
-        match ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, ROWS) {
+        match ply_machine::builds::build(&laid_out()?, ROOT, ENTRY, &staged, MEMO) {
             Ok(()) => read_back(&staged),
             Err(_) => {
                 eprintln!(
@@ -181,7 +181,7 @@ pub fn program_by_own_builder() -> Result<Runnable, Diagnostic> {
             return Ok(program);
         }
         let staged = stage.join(RUNNABLE);
-        ply_machine::builds::build_by_own(&laid_out()?, ROOT, ENTRY, &staged, ROWS)?;
+        ply_machine::builds::build_by_own(&laid_out()?, ROOT, ENTRY, &staged, MEMO)?;
         read_back(&staged)
     })
 }

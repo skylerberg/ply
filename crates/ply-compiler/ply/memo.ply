@@ -1,0 +1,332 @@
+//! Derived facts that stand while every read they made answers as it did. A query is a function a
+//! run asks by name; its record keeps each read it made, in order, and the digest of what it
+//! answered: a read of the world (a file, a shipped module, an embed) by the digest of what it
+//! answered, and a read of another query by the digest of that query's answer. A record stands while
+//! each of its reads answers the same, which for another query means that query, asked again,
+//! answers the same, so an answer that comes out equal stops what an edit moves. A query reads only
+//! through `memo`, which its row is all of, so nothing it read goes unrecorded.
+
+import std.bin
+import std.hash (blake3)
+
+pub effect memo {
+  /// What the world holds at `at`, as `kind` reads it, or nothing there.
+  read world(kind: Bytes, at: Bytes) -> Option<Bytes>
+  /// What the query named `query` answers for `input`.
+  read ask(query: Bytes, input: Bytes) -> Bytes
+}
+
+/// A read a record keeps: of the world by what it answered, or of a query by what it answered.
+pub type Read = | World(Bytes, Bytes, Bytes) | Asked(Bytes, Bytes, Bytes)
+
+/// What a query answered for an input: the hash of the query that answered, every read it made, in
+/// order, and the digest of its answer, which the answer is kept under.
+pub type Record = { query: Bytes, reads: List<Read>, output: Bytes }
+
+derive bin for Read
+derive bin for Record
+
+/// A query: its name, the hash of its definition, which keys what it answered, and its body.
+pub type Query = { name: Bytes, hash: Bytes, body: (Bytes) -> Bytes / {memo.read, abort.raise} }
+
+/// What a run has settled: each query's answer by its record's key, the keys being answered now,
+/// which a query asking one of them again would wait on forever, and, by query, how many answers it
+/// took from records that stood and how many it ran the body for.
+pub type Run = {
+  settled: Map<Bytes, Bytes>,
+  open: Map<Bytes, Bool>,
+  took: Map<Bytes, Int>,
+  ran: Map<Bytes, Int>,
+}
+
+pub fn new_run() -> Run = { settled: map_new(), open: map_new(), took: map_new(), ran: map_new() }
+
+/// What a run did of one query: answers taken from records that stood, and bodies run.
+pub type Tally = { query: Bytes, took: Int, ran: Int }
+
+derive bin for Tally
+
+fn counted(m: Map<Bytes, Int>, name: Bytes) -> Int =
+  match map_get(m, name) { Some(n) -> n, None -> 0 }
+
+fn bumped(m: Map<Bytes, Int>, name: Bytes) -> Map<Bytes, Int> =
+  map_insert(m, name, counted(m, name) + 1)
+
+/// Each query the run asked, by name.
+pub fn tallies(run: Run) -> List<Tally> =
+  map(
+    map_keys(
+      map_fold(run.ran, run.took, |acc: Map<Bytes, Int>, k: Bytes, _: Int|
+        if map_contains(acc, k) { acc } else { map_insert(acc, k, 0) }),
+    ),
+    |name: Bytes| { query: name, took: counted(run.took, name), ran: counted(run.ran, name) },
+  )
+
+/// How many bodies the run ran, over every query.
+pub fn ran_total(run: Run) -> Int = map_fold(run.ran, 0, |n: Int, _: Bytes, k: Int| n + k)
+
+/// The digest a read is kept by: nothing there is a value of its own.
+pub fn digest_of(answer: Option<Bytes>) -> Bytes =
+  match answer { Some(b) -> bytes_concat(b"=", blake3(b)), None -> b"-" }
+
+/// What a query's answer for `input` is kept under: its definition's hash and the input's digest.
+pub fn key_of(q: Query, input: Bytes) -> Bytes =
+  blake3(bytes_concat_all([b"ply.memo.1\x00", q.hash, b"\x00", blake3(input)]))
+
+/// Where a run reads records, their answers and the world, and keeps what it answers: the handler a
+/// command runs its queries under.
+pub effect memo_keep {
+  read record(key: Bytes) -> Option<Record>
+  /// The answer kept under its digest, or nothing where it was not kept.
+  read output(digest: Bytes) -> Option<Bytes>
+  write keep(key: Bytes, r: Record, output: Bytes) -> Unit
+  read now(kind: Bytes, at: Bytes) -> Option<Bytes>
+}
+
+pub type Answered = { run: Run, output: Bytes }
+
+/// What the query `name` answers for `input`: its record's answer where every read it made answers
+/// the same, else its body's, which is kept. `left` is how much deeper the asking may go: deeper
+/// than every query a program has, which only a run asking its way around a loop reaches.
+pub fn answer(
+  queries: Map<Bytes, Query>,
+  run: Run,
+  name: Bytes,
+  input: Bytes,
+  left: Int = 100000,
+) -> Answered / {memo_keep.read, memo_keep.write, abort.raise} =
+  if left <= 0 { panic("queries ask one another deeper than any program's queries go") } else {
+    let q = match map_get(queries, name) {
+      Some(q) -> q,
+      None -> panic("no query is named `" ++ string_of_bytes_lossy(name) ++ "`"),
+    };
+    let key = key_of(q, input);
+    match map_get(run.settled, key) {
+      Some(out) -> { run: run, output: out },
+      None -> {
+        if map_contains(run.open, key) {
+          panic("the query `" ++ string_of_bytes_lossy(name) ++ "` asks for its own answer")
+        };
+        let opened = { ..run, open: map_insert(run.open, key, true) };
+        // What checking a record settled stands whether or not the record does.
+        let checked = match memo_keep.record(key) {
+          None -> { run: opened, output: None },
+          Some(r) -> {
+            let s = stands(queries, opened, r.reads, left - 1);
+            { run: s.run, output: if s.ok { memo_keep.output(r.output) } else { None } }
+          },
+        };
+        let done = match checked.output {
+          Some(out) ->
+            { run: { ..checked.run, took: bumped(checked.run.took, name) }, output: out },
+          None -> executed(queries, checked.run, q, key, input, left - 1),
+        };
+        {
+          run: {
+            ..done.run,
+            settled: map_insert(done.run.settled, key, done.output),
+            open: map_remove(done.run.open, key),
+          },
+          output: done.output,
+        }
+      },
+    }
+  }
+
+/// Whether each of `reads` answers now what it answered when kept, asked in order and no further
+/// than the first that does not.
+fn stands(
+  queries: Map<Bytes, Query>,
+  run: Run,
+  reads: List<Read>,
+  left: Int,
+) -> { run: Run, ok: Bool } / {memo_keep.read, memo_keep.write, abort.raise} =
+  if left <= 0 { panic("queries ask one another deeper than any program's queries go") } else {
+    fold(reads, { run: run, ok: true }, |acc: { run: Run, ok: Bool }, r: Read|
+      if !acc.ok { acc } else {
+        match r {
+          World(kind, at, digest) ->
+            { run: acc.run, ok: digest_of(memo_keep.now(kind, at)) == digest },
+          Asked(name, input, digest) -> {
+            let a = answer(queries, acc.run, name, input, left - 1);
+            { run: a.run, ok: digest_of(Some(a.output)) == digest }
+          },
+        }
+      })
+  }
+
+/// `q`'s body run for `input`, every read it makes recorded, and its record kept under `key`.
+fn executed(
+  queries: Map<Bytes, Query>,
+  run: Run,
+  q: Query,
+  key: Bytes,
+  input: Bytes,
+  left: Int,
+) -> Answered / {memo_keep.read, memo_keep.write, abort.raise} =
+  if left <= 0 { panic("queries ask one another deeper than any program's queries go") } else {
+    with_cell[memo]({ run: { ..run, ran: bumped(run.ran, q.name) }, reads: [] }) { st -> {
+      let output = handle {
+        (q.body)(input)
+      } with {
+        memo.world(kind, at) -> {
+          let found = memo_keep.now(kind, at);
+          let read = World(kind, at, digest_of(found));
+          cell_update(st, |s: { run: Run, reads: List<Read> }| { ..s, reads: push(s.reads, read) });
+          found
+        },
+        memo.ask(name, asked) -> {
+          let a = answer(queries, cell_get(st).run, name, asked, left - 1);
+          let read = Asked(name, asked, digest_of(Some(a.output)));
+          cell_set(st, { run: a.run, reads: push(cell_get(st).reads, read) });
+          a.output
+        },
+      };
+      let s = cell_get(st);
+      memo_keep.keep(
+        key,
+        { query: q.hash, reads: s.reads, output: digest_of(Some(output)) },
+        output,
+      );
+      { run: s.run, output: output }
+    } }
+  }
+
+// --- Tests ----------------------------------------------------------------------------------
+
+type World = {
+  files: Map<Bytes, Bytes>,
+  records: Map<Bytes, Record>,
+  outputs: Map<Bytes, Bytes>,
+  read: Int,
+}
+
+fn test_world(files: List<{ at: Bytes, text: Bytes }>) -> World =
+  {
+    files: fold(files, map_new(), |acc: Map<Bytes, Bytes>, f: { at: Bytes, text: Bytes }|
+      map_insert(acc, f.at, f.text)),
+    records: map_new(),
+    outputs: map_new(),
+    read: 0,
+  }
+
+fn length_of(input: Bytes) -> Bytes / {memo.read} =
+  match memo.world(b"file", input) {
+    Some(text) -> bytes_of_string(int_to_string(bytes_len(text))),
+    None -> b"none",
+  }
+
+fn longer(input: Bytes) -> Bytes / {memo.read} = {
+  let n = memo.ask(b"length", input);
+  bytes_concat(b"long ", n)
+}
+
+fn test_queries(length_hash: Bytes) -> Map<Bytes, Query> =
+  map_insert(
+    map_insert(map_new(), b"length", { name: b"length", hash: length_hash, body: length_of }),
+    b"longer",
+    { name: b"longer", hash: b"l1", body: longer },
+  )
+
+/// `name` asked of `input` over `w` from a run of its own: what it answered, how many bodies ran,
+/// and the world it left.
+fn asked_over(
+  queries: Map<Bytes, Query>,
+  w: World,
+  name: Bytes,
+  input: Bytes,
+) -> { output: Bytes, executed: Int, world: World } / {abort.raise} =
+  with_cell[test_memo]({ ..w, read: 0 }) { cell -> {
+    let a = handle {
+      answer(queries, new_run(), name, input)
+    } with {
+      memo_keep.record(k) -> map_get(cell_get(cell).records, k),
+      memo_keep.output(d) -> map_get(cell_get(cell).outputs, d),
+      memo_keep.keep(k, r, out) ->
+        cell_update(cell, |x: World|
+          {
+            ..x,
+            records: map_insert(x.records, k, r),
+            outputs: map_insert(x.outputs, r.output, out),
+          }),
+      memo_keep.now(kind, at) -> {
+        cell_update(cell, |x: World| { ..x, read: x.read + 1 });
+        map_get(cell_get(cell).files, at)
+      },
+    };
+    { output: a.output, executed: ran_total(a.run), world: cell_get(cell) }
+  } }
+
+test "a query's record answers again while what it read answers the same" {
+  let q = test_queries(b"h1");
+  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  assert_eq(first.output, b"4");
+  assert_eq(first.executed, 1);
+  let again = asked_over(q, first.world, b"length", b"a");
+  assert_eq(again.output, b"4");
+  assert_eq(again.executed, 0);
+  let moved = asked_over(
+    q,
+    { ..again.world, files: map_insert(again.world.files, b"a", b"seven!!") },
+    b"length",
+    b"a",
+  );
+  assert_eq(moved.output, b"7");
+  assert_eq(moved.executed, 1)
+}
+
+test "an answer that comes out the same stops what an edit moves" {
+  let q = test_queries(b"h1");
+  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"longer", b"a");
+  assert_eq(first.output, b"long 4");
+  assert_eq(first.executed, 2);
+  // Another text of the same length: `length` runs again and answers the same, so `longer` stands.
+  let same = asked_over(
+    q,
+    { ..first.world, files: map_insert(first.world.files, b"a", b"FOUR") },
+    b"longer",
+    b"a",
+  );
+  assert_eq(same.output, b"long 4");
+  assert_eq(same.executed, 1);
+  let longer_now = asked_over(
+    q,
+    { ..same.world, files: map_insert(same.world.files, b"a", b"forty") },
+    b"longer",
+    b"a",
+  );
+  assert_eq(longer_now.output, b"long 5");
+  assert_eq(longer_now.executed, 2)
+}
+
+test "a query whose definition moved answers anew, and what asked it stands where it answers alike" {
+  let first = asked_over(
+    test_queries(b"h1"),
+    test_world([{ at: b"a", text: b"four" }]),
+    b"longer",
+    b"a",
+  );
+  let moved = asked_over(test_queries(b"h2"), first.world, b"longer", b"a");
+  assert_eq(moved.output, b"long 4");
+  assert_eq(moved.executed, 1)
+}
+
+test "a record whose answer is no longer kept is answered again" {
+  let q = test_queries(b"h1");
+  let first = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let lost = asked_over(q, { ..first.world, outputs: map_new() }, b"length", b"a");
+  assert_eq(lost.output, b"4");
+  assert_eq(lost.executed, 1)
+}
+
+test "a query asking for its own answer is refused" {
+  let looping = map_insert(map_new(), b"self", {
+    name: b"self",
+    hash: b"s",
+    body: |input: Bytes| memo.ask(b"self", input),
+  });
+  assert_eq(try_answer(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
+}
+
+fn try_answer(f: () -> Bytes / {abort.raise}) -> Option<Bytes> =
+  handle { Some(f()) } with { abort.raise(_) -> None }

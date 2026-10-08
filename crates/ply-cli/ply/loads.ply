@@ -1,58 +1,14 @@
-//! What a load reads from the store before the front end and files there after it: every row filed
-//! for the files it reads, then the fingerprints, interfaces and bodies the front end published.
+//! Where a project keeps its store, and the stamps that say which toolchain filed what it holds.
 
-import std.bin
-import std.fs (fs, mem_empty)
-import std.random (entropy)
-import std.time (time)
+import std.fs (fs)
 import std.hash (blake3)
-import compiler.front (DefInterface, KnownTestRow, Filing, FiledModule, FiledEntry, FiledTest,
-                       FiledDef, FiledDecl, FiledBody, FiledMember, FiledSpan, body_encoding,
-                       def_interface_bin, decl_interface_bin, known_test_row_bin, filed_span)
-import compiler.hash (Prior, hex, prior_bin)
+import compiler.hash (hex)
 import compiler.resolve (Diag)
-import compiler.termination (Ends, unknown_summary)
 import compiler.unit (identity_of, unit_roots)
 import paths
 import semantics
 import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
-import store.tables (Cache, Stamps, Fingerprint, DefEntry, TestEntry, Member, FileSpan, DefKind,
-                     KFn, KType, KEffect, Package, Body, open_cache, flush_cache, fingerprint,
-                     put_fingerprint, def_of, put_def, put_decl, put_body, prune, source_key,
-                     warnings, filed_load, put_filed_load, filed_priors, put_filed_priors, body)
-import store.twin (on_twin)
-import std.list (concat)
-
-/// One file a load read: where from, the module it is, and its bytes. The store keys it by its path,
-/// a dependency's under its package's identity, and a shipped module's by its pseudo-path.
-pub type SourceFile = { path: String, name: String, text: Bytes }
-
-/// A dependency package's root, and the identity its files are keyed under: its manifest's digest.
-pub type SourcePackage = { root: String, digest: String }
-
-pub type Sources = { files: List<SourceFile>, packages: List<SourcePackage> }
-
-/// A shipped module's entry as the store last filed it.
-pub type ShippedEntry = { name: Bytes, hash: Bytes }
-
-/// The shipped modules a load reads that the store last filed with other bytes, and what it filed for
-/// them.
-pub type StdlibMoved = { modules: List<String>, entries: List<ShippedEntry> }
-
-/// What the store holds for the files a load reads: every definition's and test's filed rows,
-/// whatever hash each was filed under, and what opening and reading the store degraded past.
-/// `intact` holds the paths whose every row is there, decodes, and was filed for the file's text;
-/// `filed_load` is the digest the last filing was filed under, and `priors` what its hashing
-/// answered, each with its body.
-pub type Recorded = {
-  defs: List<DefInterface>,
-  tests: List<KnownTestRow>,
-  stdlib: Option<StdlibMoved>,
-  warnings: List<Diag>,
-  intact: Map<String, Bool>,
-  filed_load: Option<Bytes>,
-  priors: List<Prior>,
-}
+import store.tables (Stamps)
 
 /// Where a load keeps its store: `.ply-cache` in the project root, under the root's own label, with
 /// the root as the machine spells the files it keys.
@@ -69,11 +25,6 @@ pub fn place_of(paths: List<paths::Resolved>, stamps: Stamps) -> Place =
       },
     None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
   }
-
-/// The definitions a front-end entry is a function of besides its own key: the analysis that
-/// answers it, what the front end files of one, and the load that reads and files the store.
-fn front_roots() -> List<Bytes> =
-  [b"front.analyse_pulling_std_with", b"front.filing", b"loads.known", b"loads.file"]
 
 /// The definitions a pass or a claim's evidence is a function of besides its own key: the runs that
 /// decide and file them, and what makes the unit they run in.
@@ -118,11 +69,6 @@ pub fn stamped(launched: Stamps, definitions: Bytes) -> Stamps / {abort.raise} =
       hex(blake3(bytes_concat_all(map(parts, |part: Bytes| bytes_concat(part, b"\x00"))))),
     );
   {
-    frontend: over([
-      b"ply.stamp.frontend.4",
-      bytes_of_string(launched.frontend),
-      identity_of(definitions, front_roots()),
-    ]),
     runtime: over([
       b"ply.stamp.runtime.4",
       bytes_of_string(launched.runtime),
@@ -139,22 +85,8 @@ pub fn stamped(launched: Stamps, definitions: Bytes) -> Stamps / {abort.raise} =
 }
 
 pub fn stamps_of(text: String) -> Stamps =
-  fold(
-    string_split(text, "\n"),
-    { frontend: "", runtime: "", code: "" },
-    |s: Stamps, line: String|
-      match string_split(line, " ") {
-        ["frontend", digest] -> { ..s, frontend: digest },
-        ["runtime", digest] -> { ..s, runtime: digest },
-        _ -> s,
-      },
-  )
-
-fn packages_of(ps: List<SourcePackage>) -> List<Package> =
-  map(ps, |p: SourcePackage| { root: p.root, identity: p.digest })
-
-fn opened<[r]>(place: Place, sources: Sources) -> Cache / {fs.read[r], abort.raise} =
-  open_cache[r](place.dir, place.root, packages_of(sources.packages), place.stamps)
+  fold(string_split(text, "\n"), { runtime: "", code: "" }, |s: Stamps, line: String|
+    match string_split(line, " ") { ["runtime", digest] -> { ..s, runtime: digest }, _ -> s })
 
 fn warning(code: Bytes, message: String, notes: List<String>) -> Diag =
   {
@@ -188,297 +120,12 @@ pub fn unreadable_value(why: String) -> Diag =
     "that entry is treated as absent, and what it answered for is checked again",
   ])
 
-/// The files the store kept before it was one data file and one index.
-fn retired_names() -> List<String> =
-  [
-    "frontend.json",
-    "frontend.idx",
-    "frontend.dat",
-    "results.json",
-    "passes.json",
-    "obligations.json",
-    "reviews.json",
-    "stdlib",
-    "lock",
-  ]
-
-fn retired_temp(name: String) -> Bool =
-  string_ends_with(name, ".tmp")
-    && fold(
-      ["results.", "passes.", "obligations.", "reviews.", "frontend."],
-      false,
-      |hit: Bool, stem: String| hit || string_starts_with(name, stem),
-    )
-
-/// Removes what an earlier format left, and says so the one time there was something to remove.
-pub fn retired<[r]>(place: Place) -> List<Diag> / {fs.read[r], fs.write[r]} =
-  match fs.list_dir[r](place.dir) {
-    None -> [],
-    Some(names) -> {
-      let old = filter(names, |n: String|
-        fold(retired_names(), false, |hit: Bool, r: String| hit || r == n) || retired_temp(n));
-      let removed = fold(old, 0, |n: Int, name: String|
-        if fs.remove[r](place.dir ++ "/" ++ name) { n + 1 } else { n });
-      if removed == 0 { [] } else {
-        [
-          warning(
-            b"W0603",
-            "the cache's format changed; the files the old format kept were removed",
-            [
-              "the results, proofs and front end it held are rebuilt as runs go, so tests re-run once",
-            ],
-          ),
-        ]
-      }
-    },
-  }
-
-// --- Reading ----------------------------------------------------------------
-
-type Gathered = {
-  cache: Cache,
-  defs: List<DefInterface>,
-  tests: List<KnownTestRow>,
-  intact: Map<String, Bool>,
-  unread: Option<String>,
-}
-
-fn decoded<a>(
-  g: Gathered,
-  bytes: Bytes,
-  codec: bin::BinCodec<a>,
-) -> { value: Option<a>, g: Gathered } / {abort.raise} =
-  match bin::decode(bytes, codec) {
-    Ok(v) -> { value: Some(v), g: g },
-    Err(e) ->
-      {
-        value: None,
-        g: {
-          ..g,
-          unread: match g.unread { Some(_) -> g.unread, None -> Some(bin::error_to_string(e)) },
-        },
-      },
-  }
-
-/// Every row filed for a definition or a test the files declare, whatever its hash: the front end
-/// takes a row only where the hash it was filed under is still the item's.
-fn gathered<[r]>(g0: Gathered, f: SourceFile) -> Gathered / {fs.read[r], abort.raise} =
-  match source_key(g0.cache, f.path) {
-    None -> { ..g0, intact: map_insert(g0.intact, f.path, true) },
-    Some(key) -> {
-      let got = fingerprint[r](g0.cache, key);
-      match got.value {
-        None -> { ..g0, cache: got.cache },
-        Some(fp) -> {
-          let withdefs = fold(fp.defs, { ..g0, cache: got.cache }, |g: Gathered, e: DefEntry|
-            if e.kind != KFn { g } else {
-              let slot = def_of[r](g.cache, e.check, e.name);
-              match slot.value {
-                None -> { ..g, cache: slot.cache },
-                Some(bytes) -> {
-                  let d = decoded({ ..g, cache: slot.cache }, bytes, def_interface_bin());
-                  match d.value { Some(v) -> { ..d.g, defs: push(d.g.defs, v) }, None -> d.g }
-                },
-              }
-            });
-          let g = fold(fp.tests, withdefs, |g: Gathered, t: TestEntry| {
-            let d = decoded(g, t.row, known_test_row_bin());
-            match d.value { Some(v) -> { ..d.g, tests: push(d.g.tests, v) }, None -> d.g }
-          });
-          let fns = len(filter(fp.defs, |e: DefEntry| e.kind == KFn));
-          if fp.content == blake3(f.text) && len(g.defs) == len(g0.defs) + fns
-              && len(g.tests) == len(g0.tests) + len(fp.tests) {
-            { ..g, intact: map_insert(g.intact, f.path, true) }
-          } else { g }
-        },
-      }
-    },
-  }
-
-fn is_shipped_key(key: String) -> Bool = string_starts_with(key, "<std>/")
-
-type MovedWalk = { modules: List<String>, entries: List<ShippedEntry>, cache: Cache }
-
-/// The shipped modules this load reads that the store filed with other bytes, with the entries it
-/// filed for them: the program says what the change reached.
-fn moved<[r]>(
-  cache: Cache,
-  files: List<SourceFile>,
-) -> { moved: Option<StdlibMoved>, cache: Cache } / {fs.read[r], abort.raise} = {
-  let walked = fold(
-    filter(files, |f: SourceFile| is_shipped_key(f.path)),
-    { modules: [], entries: [], cache: cache },
-    |acc: MovedWalk, f: SourceFile|
-      match source_key(acc.cache, f.path) {
-        None -> acc,
-        Some(key) -> {
-          let got = fingerprint[r](acc.cache, key);
-          match got.value {
-            None -> { ..acc, cache: got.cache },
-            Some(fp) -> if fp.content == blake3(f.text) { { ..acc, cache: got.cache } } else {
-              {
-                modules: push(acc.modules, f.name),
-                entries: fold(fp.defs, acc.entries, |es: List<ShippedEntry>, e: DefEntry|
-                  push(es, { name: bytes_of_string(e.name), hash: e.hash })),
-                cache: got.cache,
-              }
-            },
-          }
-        },
-      },
-  );
-  {
-    moved: if len(walked.modules) == 0 { None }
-    else { Some({ modules: walked.modules, entries: walked.entries }) },
-    cache: walked.cache,
-  }
-}
-
-/// What the store holds for the files a load is about to read.
-pub fn known<[r]>(place: Place, sources: Sources) -> Recorded / {fs.read[r], abort.raise} = {
-  let g = fold(
-    sources.files,
-    { cache: opened[r](place, sources), defs: [], tests: [], intact: map_new(), unread: None },
-    |acc: Gathered, f: SourceFile| gathered[r](acc, f),
-  );
-  let m = moved[r](g.cache, sources.files);
-  let last = filed_load[r](m.cache);
-  let p = priors_read[r](last.cache);
-  {
-    defs: g.defs,
-    tests: g.tests,
-    stdlib: m.moved,
-    warnings: concat(diags_of(warnings(p.cache)), match g.unread {
-      Some(why) -> [unreadable_value(why)],
-      None -> [],
-    }),
-    intact: g.intact,
-    filed_load: last.value,
-    priors: p.priors,
-  }
-}
-
-/// The last filing's priors, each with the body the bodies table holds under its hash; one whose body
-/// is not there is hashed again.
-fn priors_read<[r]>(
-  cache: Cache,
-) -> { priors: List<Prior>, cache: Cache } / {fs.read[r], abort.raise} = {
-  let filed = filed_priors[r](cache);
-  let listed = match filed.value {
-    None -> [],
-    Some(bytes) -> match bin::decode(bytes, bin::list_bin(prior_bin())) {
-      Ok(priors) -> priors,
-      Err(_) -> [],
-    },
-  };
-  fold(
-    listed,
-    { priors: [], cache: filed.cache },
-    |acc: { priors: List<Prior>, cache: Cache }, p: Prior| {
-      let got = body[r](acc.cache, p.hash);
-      match got.value {
-        Some(b) -> { priors: push(acc.priors, { ..p, body: b.bytes }), cache: got.cache },
-        None -> { ..acc, cache: got.cache },
-      }
-    },
-  )
-}
-
-// --- Filing -----------------------------------------------------------------
-
-fn kind_of(k: Bytes) -> DefKind =
-  if k == b"fn" { KFn } else if k == b"type" { KType } else { KEffect }
-
-fn entry_of(e: FiledEntry) -> DefEntry =
-  {
-    name: string_of_bytes_lossy(e.name),
-    hash: e.hash,
-    check: e.check,
-    span: filed_span(e.span),
-    kind: kind_of(e.kind),
-    members: map(e.members, |m: FiledMember|
-      { name: string_of_bytes_lossy(m.name), span: filed_span(m.span) }),
-  }
-
-fn test_of(t: FiledTest) -> TestEntry / {abort.raise} =
-  {
-    name: string_of_bytes_lossy(t.name),
-    hash: t.hash,
-    nondet: t.nondet,
-    span: filed_span(t.span),
-    row: bin::encode(t.row, known_test_row_bin()),
-  }
-
-fn print_of(cache: Cache, sources: Sources, m: FiledModule) -> Option<Fingerprint> / {abort.raise} =
-  match list_at(sources.files, m.source) {
-    None -> None,
-    Some(f) -> match source_key(cache, f.path) {
-      None -> None,
-      Some(key) ->
-        Some({
-          key: key,
-          content: blake3(f.text),
-          module: string_of_bytes_lossy(m.name),
-          defs: map(m.entries, entry_of),
-          tests: map(m.tests, test_of),
-        }),
-    },
-  }
-
-/// Files what an analysis published. A load of the whole project also drops what no file of it
-/// names. Nothing here fails the run: the store's trouble is warned about, and the next run does this
-/// work again.
-pub fn file<[r]>(
-  place: Place,
-  sources: Sources,
-  filing: Filing,
-  whole: Bool,
-  load: Bytes,
-  priors: List<Prior>,
-) -> List<Diag> / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let c0 = opened[r](place, sources);
-  let c1 = fold(filing.modules, c0, |c: Cache, m: FiledModule|
-    match print_of(c, sources, m) { Some(fp) -> put_fingerprint[r](c, fp), None -> c });
-  let c2 = fold(filing.defs, c1, |c: Cache, d: FiledDef| {
-    let name = string_of_bytes_lossy(d.name);
-    let interface = bin::encode(d.interface, def_interface_bin());
-    let keyed = put_def[r](c, d.check, name, interface);
-    if d.hash == d.check { keyed } else { put_def[r](keyed, d.hash, name, interface) }
-  });
-  let c3 = fold(filing.decls, c2, |c: Cache, d: FiledDecl|
-    put_decl[r](
-      c,
-      d.hash,
-      string_of_bytes_lossy(d.name),
-      bin::encode(d.interface, decl_interface_bin()),
-    ));
-  let c4 = fold(filing.bodies, c3, |c: Cache, b: FiledBody|
-    put_body[r](c, b.hash, { encoding: body_encoding(), bytes: b.body }));
-  let c5 = if whole {
-    prune[r](
-      c4,
-      fold(sources.files, [], |ks: List<String>, f: SourceFile|
-        match source_key(c4, f.path) { Some(k) -> push(ks, k), None -> ks }),
-    ).cache
-  } else { c4 };
-  let c7 = put_filed_priors[r](
-    put_filed_load[r](c5, load),
-    bin::encode(map(priors, |p: Prior| { ..p, body: b"" }), bin::list_bin(prior_bin())),
-  );
-  let kept = diags_of(warnings(flush_cache[r](c7)));
-  fold(retired[r](place), kept, |diags: List<Diag>, d: Diag| push(diags, d))
-}
-
 // --- Tests ------------------------------------------------------------------
 
 /// Every root a stamp names and one definition none does, each under a hash of its own, with
 /// `moved` under another.
 fn definitions_with(moved: Bytes) -> Bytes / {abort.raise} = {
-  let roots = fold(
-    code_roots(),
-    fold(verdict_roots(), front_roots(), |acc: List<Bytes>, r: Bytes| push(acc, r)),
-    |acc: List<Bytes>, r: Bytes| push(acc, r),
-  );
+  let roots = fold(code_roots(), verdict_roots(), |acc: List<Bytes>, r: Bytes| push(acc, r));
   fold(push(roots, b"other.unrelated"), b"", |acc: Bytes, root: Bytes|
     bytes_concat_all([
       acc,
@@ -490,17 +137,12 @@ fn definitions_with(moved: Bytes) -> Bytes / {abort.raise} = {
 }
 
 test "a group's stamp moves with a definition that computes what it holds, and with no other" {
-  let launched = { frontend: "evaluator", runtime: "runtime", code: "" };
+  let launched = { runtime: "runtime", code: "" };
   let now = stamped(launched, definitions_with(b""));
   assert_eq(stamped(launched, definitions_with(b"other.unrelated")), now);
-  let filing = stamped(launched, definitions_with(b"front.filing"));
-  assert(filing.frontend != now.frontend, Some("a front-end root moved and its stamp did not"));
-  assert_eq(filing.runtime, now.runtime);
   let deciding = stamped(launched, definitions_with(b"tests.selected"));
-  assert_eq(deciding.frontend, now.frontend);
   assert(deciding.runtime != now.runtime, Some("a verdict's root moved and its stamp did not"));
   let another = stamped({ ..launched, runtime: "another" }, definitions_with(b""));
-  assert_eq(another.frontend, now.frontend);
   assert(another.runtime != now.runtime, Some("the runtime moved and its stamp did not"));
   assert(another.code != now.code, Some("the runtime moved and the code passes' stamp did not"))
 }
@@ -508,7 +150,7 @@ test "a group's stamp moves with a definition that computes what it holds, and w
 // What makes a unit moves the passes keyed by test and leaves those keyed by the code a test ran;
 // what decides a test's verdict moves both.
 test "the code passes' stamp moves with what decides a verdict, and not with what makes the code" {
-  let launched = { frontend: "evaluator", runtime: "runtime", code: "" };
+  let launched = { runtime: "runtime", code: "" };
   let now = stamped(launched, definitions_with(b""));
   let emitter = stamped(launched, definitions_with(b"unit.emitted"));
   assert(emitter.runtime != now.runtime, Some("the emitter moved and the passes' stamp did not"));
@@ -523,219 +165,6 @@ test "the code passes' stamp moves with what decides a verdict, and not with wha
 }
 
 test "the shipped modules' stamps are read a name to a line, and a line naming nothing is passed over" {
-  assert_eq(stamps_of("frontend aa\nruntime bb\n"), { frontend: "aa", runtime: "bb", code: "" });
-  assert_eq(stamps_of("runtime bb\nother cc\n"), { frontend: "", runtime: "bb", code: "" })
-}
-
-fn a_place() -> Place = { label: "mem", dir: "cache", root: "", stamps: built() }
-
-fn built() -> Stamps = { frontend: "frontend", runtime: "runtime", code: "code" }
-
-fn shipped_sources() -> Sources =
-  {
-    files: [{ path: "<std>/net.ply", name: "std.net", text: b"pub fn drain() -> Int = 0\n" }],
-    packages: [],
-  }
-
-fn drain_entry() -> DefEntry =
-  {
-    name: "std.net.drain",
-    hash: blake3(b"drain"),
-    check: blake3(b"drain"),
-    span: { start: 0, end: 1 },
-    kind: KFn,
-    members: [],
-  }
-
-/// What a load that reads `std.net` is told over a store that last filed it as `filed`, before and
-/// after the load files its own reading of it.
-fn told(
-  filed: Bytes,
-) -> { before: Option<StdlibMoved>, after: Option<StdlibMoved> } / {abort.raise} =
-  on_twin(mem_empty(), || {
-    let c0 = put_fingerprint[mem](open_cache[mem]("cache", "", [], built()), {
-      key: "<std>/net.ply",
-      content: blake3(filed),
-      module: "std.net",
-      defs: [drain_entry()],
-      tests: [],
-    });
-    let c1 = flush_cache[mem](c0);
-    let before = known[mem](a_place(), shipped_sources()).stdlib;
-    let filed = file[mem](a_place(), shipped_sources(), net_filing(), false, b"load", []);
-    { before: before, after: known[mem](a_place(), shipped_sources()).stdlib }
-  }).value
-
-/// `std.net` as a load files it: its one definition, read from the first source.
-fn net_filing() -> Filing =
-  {
-    modules: [
-      {
-        name: b"std.net",
-        source: 0,
-        entries: [
-          {
-            name: b"std.net.drain",
-            hash: blake3(b"drain"),
-            check: blake3(b"drain"),
-            kind: b"fn",
-            span: { start: 0, end: 1 },
-            members: [],
-          },
-        ],
-        tests: [],
-      },
-    ],
-    defs: [],
-    decls: [],
-    bodies: [],
-  }
-
-fn one_fn() -> Filing = {
-  let check = blake3(b"f.check");
-  {
-    modules: [
-      {
-        name: b"m",
-        source: 0,
-        entries: [
-          {
-            name: b"m.f",
-            hash: blake3(b"f"),
-            check: check,
-            kind: b"fn",
-            span: { start: 0, end: 1 },
-            members: [],
-          },
-        ],
-        tests: [],
-      },
-    ],
-    defs: [
-      {
-        name: b"m.f",
-        hash: blake3(b"f"),
-        check: check,
-        interface: {
-          row: {
-            name: b"m.f",
-            hash: check,
-            effect_hashes: [],
-            footprint: b"",
-            performed: b"",
-            scaling: b"",
-            repeats: [],
-            ending: Ends,
-            summary: unknown_summary(),
-            raises: [],
-            facts: b"",
-          },
-          scheme: b"Int",
-        },
-      },
-    ],
-    decls: [],
-    bodies: [],
-  }
-}
-
-/// What a store `filing` was filed into for `m.ply` holding `was` says once it holds `now`.
-fn reread(filing: Filing, was: Bytes, now: Bytes) -> Recorded / {abort.raise} =
-  on_twin(mem_empty(), || {
-    let holding = |text: Bytes|
-      {
-        files: [
-          { path: "m.ply", name: "m", text: text },
-          { path: "../out.ply", name: "o", text: b"" },
-        ],
-        packages: [],
-      };
-    let filed = file[mem](a_place(), holding(was), filing, true, b"load", []);
-    known[mem](a_place(), holding(now))
-  }).value
-
-fn a_prior(hash: Bytes) -> Prior =
-  {
-    name: b"m.f",
-    decl: false,
-    sketch: b"sketch",
-    hash: hash,
-    check: hash,
-    contract: hash,
-    own: None,
-    specs: [],
-    spec_texts: [],
-    spec_checks: [],
-    body: b"",
-  }
-
-test "a filing's priors read back with the bodies filed under their hashes, and one without is dropped" {
-  // The body `one_fn`'s entry names, so the filing's prune keeps it.
-  let filed_body = b"\0f";
-  let hash = blake3(b"f");
-  let read = on_twin(mem_empty(), || {
-    let at = { files: [{ path: "m.ply", name: "m", text: b"f" }], packages: [] };
-    let filed = file[mem](
-      a_place(),
-      at,
-      { ..one_fn(), bodies: [{ hash: hash, body: filed_body }] },
-      true,
-      b"load",
-      [{ ..a_prior(hash), body: filed_body }, a_prior(blake3(b"a body never filed"))],
-    );
-    known[mem](a_place(), at).priors
-  }).value;
-  assert_eq(read, [{ ..a_prior(hash), body: filed_body }])
-}
-
-test "a file's rows are intact while it holds the text they were filed for and each reads back" {
-  let same = reread(one_fn(), b"f", b"f");
-  assert_eq(map_keys(same.intact), ["../out.ply", "m.ply"]);
-  assert_eq(same.filed_load, Some(b"load"));
-  assert_eq(map_keys(reread(one_fn(), b"f", b"g").intact), ["../out.ply"]);
-  assert_eq(map_keys(reread({ ..one_fn(), defs: [] }, b"f", b"f").intact), ["../out.ply"]);
-  assert_eq(map_keys(reread({ ..one_fn(), modules: [] }, b"f", b"f").intact), ["../out.ply"])
-}
-
-test "a shipped module the store filed with other bytes is named, until the load files it again" {
-  let t = told(b"what the last compiler shipped");
-  assert_eq(
-    t.before,
-    Some({ modules: ["std.net"], entries: [{ name: b"std.net.drain", hash: blake3(b"drain") }] }),
-  );
-  assert_eq(t.after, None)
-}
-
-test "a shipped module filed with the bytes this load reads has not moved" {
-  assert_eq(told(b"pub fn drain() -> Int = 0\n"), { before: None, after: None })
-}
-
-test "a cold store has no shipped modules to compare against" {
-  let run = on_twin(mem_empty(), || {
-    let r = known[mem](a_place(), shipped_sources());
-    let c = flush_cache[mem](open_cache[mem]("cache", "", [], built()));
-    r
-  });
-  assert_eq(run.value.stdlib, None);
-  assert_eq(run.value.warnings, [])
-}
-
-/// Writes `names` into the store's directory, under the row the twin handles.
-fn planted<[r]>(names: List<String>) -> Bool / {fs.write[r]} =
-  fs.create_dir[r]("cache")
-    && fold(names, true, |ok: Bool, n: String| ok && fs.write_file[r]("cache/" ++ n, b""))
-
-fn listed<[r]>() -> Option<List<String>> / {fs.read[r]} = fs.list_dir[r]("cache")
-
-test "the files an earlier format kept are removed once, and said so once" {
-  let run = on_twin(mem_empty(), || {
-    let wrote = planted[mem](["results.json", "frontend.idx.tmp", "keep.me"]);
-    let first = retired[mem](a_place());
-    let c = flush_cache[mem](open_cache[mem]("cache", "", [], built()));
-    { wrote: wrote, first: len(first), second: len(retired[mem](a_place())), left: listed[mem]() }
-  });
-  assert_eq(run.value.wrote, true);
-  assert_eq(run.value.first, 1);
-  assert_eq(run.value.second, 0);
-  assert_eq(run.value.left, Some(["keep.me"]))
+  assert_eq(stamps_of("evaluator aa\nruntime bb\n"), { runtime: "bb", code: "" });
+  assert_eq(stamps_of("other cc\n"), { runtime: "", code: "" })
 }

@@ -1,0 +1,1613 @@
+//! A program checked a module at a time, as queries the memo store keeps: `module` checks one module
+//! against the entries it names of the modules it imports, and `entry` answers what one module shows
+//! under one name. An importer reads entries, never a module's text, so an edit stops at the first
+//! module whose entries come out as they were.
+
+import std.bin
+import std.hash (blake3)
+import std.bytes (join, hex_of)
+import std.list (at, concat, contains, sort_by)
+import memo (memo, memo_keep, Query, Run, Tally, answer, tallies, ran_total)
+import memo_files (Held, nothing_held, over_held)
+import unit (definition_hash)
+import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
+                Reading, checked_against, hashed_against, hashed_needed, exports_of, of_module,
+                hashes_of, needed_by, owners_of_module, wanted_in, entry_bin, exports_bin,
+                hash_entry_bin, hashes_bin)
+import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedData, Rows,
+              KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
+              shipped_data_wanted, shipped_texts_wanted, rows_of, no_rows, rows_bin, analyse,
+              analyse_with, published)
+import items (Module, ImportDecl, header, parse)
+import derive (dotted)
+import diagnostics (parse_all, parse_at, parse_from)
+import embed (EmbedFile, EmbedRead, embed_key)
+import pkg (PackageSources, Supplied, closure)
+import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span)
+import parsing (Ident, Span, span_bin)
+import infer (DefInfo, TestInfo)
+
+/// What a load reads beside its modules' texts: its packages, the root's and each dependency's, by
+/// the key each is judged by and its manifest's text.
+pub type Layout = { root: Bytes, manifest: Option<Bytes>, supplied: List<PackageText> }
+
+pub type PackageText = { root: Bytes, manifest: Option<Bytes> }
+
+/// Where a module of the load's own packages is: its package (0 the root, then each of
+/// `Layout.supplied` in order), its name there, and its file.
+pub type Placing = { package: Int, relative: Bytes, path: Bytes }
+
+/// A module a query is asked of, by its name in the program and whether the toolchain ships it.
+pub type Named = { module: Bytes, shipped: Bool }
+
+/// An entry a query is asked for: the module's, under `name`, or under every name for none.
+pub type EntryNamed = { module: Bytes, shipped: Bool, name: Bytes }
+
+/// What an embed read: its files, or why it read none.
+pub type Embedding = { files: List<{ name: Bytes, bytes: Bytes }>, refused: Option<Bytes> }
+
+/// What a module answers checked: what it shows its importers, the errors that refuse it, the
+/// warnings it holds, how many definitions and tests it checked, and the rows they published. A label points into the module
+/// at module 0; one that pointed into a module it imports is left out.
+pub type ModuleAnswer = {
+  exports: Exports,
+  refused: List<Diag>,
+  warnings: List<Diag>,
+  defs: Int,
+  tests: Int,
+  /// What each of its definitions and tests published, which a load of the whole program takes in
+  /// place of checking them again.
+  rows: Rows,
+  /// The modules its imports name that there are: a module whose import refused it may be refused
+  /// for that alone.
+  imports: List<Bytes>,
+}
+
+derive bin for PackageText
+derive bin for Layout
+derive bin for Placing
+derive bin for Named
+derive bin for EntryNamed
+derive bin for Embedding
+derive bin for ModuleAnswer
+
+// --- What the queries read of the world ------------------------------------------------------
+
+/// The load's packages, which the root's manifest and its dependencies decide.
+pub fn layout_kind() -> Bytes = b"layout"
+
+/// Where a module of the load's own packages is, by its name; nothing for one they do not hold.
+pub fn module_kind() -> Bytes = b"module"
+
+/// A file's text, by its path.
+pub fn text_kind() -> Bytes = b"text"
+
+/// A shipped module's text, by its name; nothing for one the toolchain does not ship.
+pub fn shipped_kind() -> Bytes = b"shipped"
+
+/// A data file the shipped modules hold, by its name among them.
+pub fn data_kind() -> Bytes = b"data"
+
+/// What a module of the load's own packages embeds, by `embed_at`.
+pub fn embed_kind() -> Bytes = b"embed"
+
+/// What an embed of `module`, in the package at `root`, is read under.
+pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
+  bytes_concat_all([root, b"\x00", module, b"\x00", key])
+
+fn decoded<a>(b: Bytes, codec: bin::BinCodec<a>, what: String) -> a / {abort.raise} =
+  match bin::decode(b, codec) {
+    Ok(x) -> x,
+    Err(e) -> panic("a query read " ++ what ++ " it cannot decode: " ++ e.message),
+  }
+
+fn placing_of(module: Bytes) -> Option<Placing> / {memo.read, abort.raise} =
+  match memo.world(module_kind(), module) {
+    Some(b) -> Some(decoded(b, placing_bin(), "a module's place")),
+    None -> None,
+  }
+
+fn shipped_text(module: Bytes) -> Option<Bytes> / {memo.read} = memo.world(shipped_kind(), module)
+
+fn layout() -> Layout / {memo.read, abort.raise} =
+  match memo.world(layout_kind(), b"") {
+    Some(b) -> decoded(b, layout_bin(), "the load's packages"),
+    None -> { root: b"", manifest: None, supplied: [] },
+  }
+
+fn pkgs_of(l: Layout) -> PackageSources =
+  {
+    root: l.root,
+    manifest: l.manifest,
+    supplied: map(l.supplied, |p: PackageText| { root: p.root, manifest: p.manifest, modules: [] }),
+  }
+
+// --- Imports --------------------------------------------------------------------------------
+
+fn has_dot(name: Bytes) -> Bool = bytes_index_of(name, b".") != None
+
+/// The module an import of `module`, which stands where `placed` says and is shipped as `shipped`
+/// says, names, as the resolver finds it: a dependency's bare import names its own package's
+/// module, a shipped compiler module's its sibling's, and any other the module of its name, the
+/// load's own before a shipped one.
+fn target_of(
+  module: Bytes,
+  shipped: Bool,
+  prefix: Bytes,
+  package: Int,
+  d: ImportDecl,
+) -> Named / {memo.read, abort.raise} = {
+  let name = dotted(d);
+  if shipped {
+    let sibling = bytes_concat(b"compiler.", name);
+    if bytes_starts_with(module, b"compiler.") && !has_dot(name) && shipped_text(sibling) != None {
+      { module: sibling, shipped: true }
+    } else { { module: name, shipped: true } }
+  } else {
+    let sibling = bytes_concat_all([prefix, b".", name]);
+    if package > 0 && bytes_len(prefix) > 0 && !has_dot(name) {
+      { module: sibling, shipped: false }
+    } else if package > 0 && bytes_len(prefix) > 0 && placing_of(sibling) != None {
+      { module: sibling, shipped: false }
+    } else if placing_of(name) != None { { module: name, shipped: false } }
+    else { { module: name, shipped: true } }
+  }
+}
+
+/// Whether the module of `name` that a module of the load's own packages reads is a shipped one.
+fn shipped_for(asker_shipped: Bool, name: Bytes) -> Bool / {memo.read, abort.raise} =
+  asker_shipped || placing_of(name) == None
+
+fn entries_of(
+  asker_shipped: Bool,
+  module: Bytes,
+  name: Bytes,
+) -> List<Entry> / {memo.read, abort.raise} = {
+  let named = { module: module, shipped: shipped_for(asker_shipped, module), name: name };
+  map(
+    decoded(
+      memo.ask(entry_query(), bin::encode(named, entry_named_bin())),
+      bin::list_bin(bin::bytes_bin()),
+      "entries",
+    ),
+    |b: Bytes| decoded(b, entry_bin(), "an entry"),
+  )
+}
+
+/// What a module shows its importers, each entry kept encoded, so a reader of one name decodes that
+/// name's alone.
+type Shown = { owners: Map<Bytes, List<Bytes>>, entries: Map<Bytes, Bytes> }
+
+derive bin for Shown
+
+// --- The queries ----------------------------------------------------------------------------
+
+pub fn module_query() -> Bytes = b"module"
+
+pub fn entry_query() -> Bytes = b"entry"
+
+fn located(l: Label, at: Int) -> Option<Label> =
+  if l.module == at { Some({ ..l, module: 0 }) } else { None }
+
+/// `d` with its labels into the module at `at`, moved to module 0.
+fn own_labels(d: Diag, at: Int) -> Diag =
+  {
+    ..d,
+    labels: fold(d.labels, [], |acc: List<Label>, l: Label|
+      match located(l, at) { Some(x) -> push(acc, x), None -> acc }),
+  }
+
+fn primary_in(d: Diag, at: Int) -> Bool =
+  fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && l.module == at))
+
+fn no_exports(module: Bytes) -> Exports = { module: module, owners: map_new(), entries: map_new() }
+
+fn index_of_module(w: Analysis, name: Bytes) -> Int / {abort.raise} =
+  fold(range(0, len(w.mods)), 0 - 1, |acc: Int, i: Int|
+    if acc >= 0 { acc } else if at(w.mods, i).name == name { i } else { acc })
+
+/// A module as a query reads it: its text, parsed alone and with its statements expanded, the
+/// modules its imports name that there are, where it stands, and all else its check reads beside the
+/// entries it names.
+type ModuleRead = {
+  source: Source,
+  raw: Module,
+  parsed: ParsedModule,
+  names: List<Bytes>,
+  present: List<Bytes>,
+  placed: Placed,
+  reading: Reading,
+}
+
+fn placed_by(p: Option<Placing>) -> Placed =
+  match p {
+    None -> ShippedModule,
+    Some(x) -> if x.package == 0 { InRoot } else { InPackage(x.package, x.relative) },
+  }
+
+/// `module` as `asked` names it read, or nothing where there is no such module.
+fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, abort.raise} = {
+  let module = asked.module;
+  let shipped = asked.shipped;
+  let placing = if shipped { None } else { placing_of(module) };
+  let text = if shipped { shipped_text(module) }
+  else { match placing { Some(p) -> memo.world(text_kind(), p.path), None -> None } };
+  match text {
+    None -> None,
+    Some(src) -> {
+      let source = { name: module, src: src };
+      let read = parse(src);
+      let raw = read.node;
+      let given = parse_from(0, source, read);
+      let parsed = given.module;
+      let l = if shipped { { root: b"", manifest: None, supplied: [] } } else { layout() };
+      let pkgs = pkgs_of(l);
+      let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
+      let prefix = if package <= 0 { b"" } else {
+        match list_at(closure(pkgs, []).packages, package) { Some(p) -> p.prefix, None -> b"" }
+      };
+      let targets = map(raw.imports, |d: ImportDecl|
+        target_of(module, shipped, prefix, package, d));
+      let present = filter(targets, |t: Named|
+        if t.shipped { shipped_text(t.module) != None } else { placing_of(t.module) != None });
+      let root = if package <= 0 { l.root }
+      else { match list_at(l.supplied, package - 1) { Some(p) -> p.root, None -> b"" } };
+      let embeds = if shipped { [] } else {
+        map(module_embeds_wanted(root, source, raw), |e: Embedded| {
+          let read = match memo.world(embed_kind(), embed_at(root, module, embed_key(e.want))) {
+            None -> Err(b"no file is there"),
+            Some(b) -> {
+              let got = decoded(b, embedding_bin(), "an embed");
+              match got.refused {
+                Some(why) -> Err(why),
+                None ->
+                  Ok(
+                    map(got.files, |f: { name: Bytes, bytes: Bytes }|
+                      { name: f.name, bytes: f.bytes }),
+                  ),
+              }
+            },
+          };
+          { ..e, read: read }
+        })
+      };
+      let whole = if !shipped { [] } else {
+        fold(shipped_texts_wanted(source), [], |acc: List<Source>, n: Bytes|
+          match shipped_text(n) { Some(t) -> push(acc, { name: n, src: t }), None -> acc })
+      };
+      let data = if !shipped { [] } else {
+        fold(shipped_data_wanted(source), [], |acc: List<ShippedData>, n: Bytes|
+          match memo.world(data_kind(), n) {
+            Some(b) -> push(acc, { name: n, bytes: b }),
+            None -> acc,
+          })
+      };
+      Some({
+        source: source,
+        raw: raw,
+        parsed: parsed,
+        names: map(targets, |t: Named| t.module),
+        present: map(present, |t: Named| t.module),
+        placed: placed_by(placing),
+        reading: { pkgs: pkgs, whole: whole, data: data, embeds: embeds, given: [given] },
+      })
+    },
+  }
+}
+
+/// Where each module of `modules` stands, as a module asked as `shipped` reads it.
+fn places_of(shipped: Bool, modules: List<Bytes>) -> Map<Bytes, Placed> / {memo.read, abort.raise} =
+  fold(modules, map_new(), |acc: Map<Bytes, Placed>, m: Bytes|
+    map_insert(acc, m, if shipped { ShippedModule } else { placed_by(placing_of(m)) }))
+
+fn placing_in(places: Map<Bytes, Placed>) -> (Bytes) -> Placed / {abort.raise} =
+  |m: Bytes| match map_get(places, m) { Some(x) -> x, None -> ShippedModule }
+
+pub fn imports_query() -> Bytes = b"imports"
+
+/// One import of a module: the module it names, and where in the module's text the name stands.
+type ImportOf = { named: Named, span: Span }
+
+type ImportsOf = { imports: List<ImportOf> }
+
+derive bin for ImportOf
+derive bin for ImportsOf
+
+/// The modules a module's written imports name that there are, read as `Named` says: what the
+/// order its load checks its modules in reads, off the module's header alone.
+pub fn imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, named_bin(), "a module's name");
+  let module = asked.module;
+  let placing = if asked.shipped { None } else { placing_of(module) };
+  let text = if asked.shipped { shipped_text(module) }
+  else { match placing { Some(p) -> memo.world(text_kind(), p.path), None -> None } };
+  bin::encode(
+    {
+      imports: match text {
+        None -> [],
+        Some(src) -> {
+          let raw = match header(src) { Some(m) -> m, None -> parse(src).node };
+          let l = if asked.shipped { { root: b"", manifest: None, supplied: [] } }
+          else { layout() };
+          let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
+          let prefix = if package <= 0 { b"" } else {
+            match list_at(closure(pkgs_of(l), []).packages, package) {
+              Some(p) -> p.prefix,
+              None -> b"",
+            }
+          };
+          fold(raw.imports, [], |acc: List<ImportOf>, d: ImportDecl| {
+            let t = target_of(module, asked.shipped, prefix, package, d);
+            let there = if t.shipped { shipped_text(t.module) != None }
+            else { placing_of(t.module) != None };
+            if there { push(acc, { named: t, span: path_span(d) }) } else { acc }
+          })
+        },
+      },
+    },
+    imports_of_bin(),
+  )
+}
+
+/// What a module answers checked, read as `Named` says.
+pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, named_bin(), "a module's name");
+  bin::encode(
+    match module_read(asked) {
+      None -> absent(asked.module),
+      Some(m) -> answered(asked.shipped, m),
+    },
+    module_answer_bin(),
+  )
+}
+
+fn absent(module: Bytes) -> ModuleAnswer =
+  {
+    exports: no_exports(module),
+    refused: [],
+    warnings: [],
+    defs: 0,
+    tests: 0,
+    rows: no_rows(),
+    imports: [],
+  }
+
+fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.raise} = {
+  let module = m.source.name;
+  let deps = needed_by(
+    |d: Bytes, n: Bytes| entries_of(shipped, d, n),
+    wanted_in(m.parsed, m.raw, m.source.src, m.names),
+    m.present,
+  );
+  let places = places_of(shipped, map_keys(deps));
+  let checked = checked_against(m.source, m.placed, deps, placing_in(places), m.reading);
+  match checked.pulled.out {
+    Refused(ds) ->
+      {
+        ..absent(module),
+        refused: map(ds, |d: Diag| own_labels(d, checked.at)),
+        imports: m.present,
+      },
+    Analysed(w) -> {
+      let i = index_of_module(w, module);
+      let all = rows_of(w);
+      {
+        exports: exports_of(w, i, m.source.src, Some(m.raw)),
+        imports: m.present,
+        refused: [],
+        warnings: map(filter(w.warnings, |d: Diag| primary_in(d, i)), |d: Diag| own_labels(d, i)),
+        defs: len(filter(w.checked.defs, |d: DefInfo| d.module == module)),
+        tests: len(filter(w.checked.tests, |t: TestInfo| t.module == module)),
+        rows: {
+          defs: filter(all.defs, |r: KnownDefRow| of_module(module, r.name)),
+          tests: filter(all.tests, |r: KnownTestRow|
+            bytes_starts_with(r.owner, bytes_concat(module, b".test#"))),
+        },
+      }
+    },
+  }
+}
+
+/// What a module's hashing fixed: each owner's hash entry, and the hash of each of its definitions,
+/// declarations and tests. A module whose reading refuses it fixes nothing.
+pub type HashAnswer = {
+  hashes: Hashes,
+  owners: Map<Bytes, List<Bytes>>,
+  defs: List<{ name: Bytes, hash: Bytes }>,
+  decls: List<{ name: Bytes, hash: Bytes }>,
+  tests: List<{ key: Bytes, hash: Bytes }>,
+}
+
+derive bin for HashAnswer
+
+fn hash_entries_of(
+  asker_shipped: Bool,
+  module: Bytes,
+  name: Bytes,
+) -> List<HashEntry> / {memo.read, abort.raise} = {
+  let named = { module: module, shipped: shipped_for(asker_shipped, module), name: name };
+  map(
+    decoded(
+      memo.ask(hash_entry_query(), bin::encode(named, entry_named_bin())),
+      bin::list_bin(bin::bytes_bin()),
+      "hash entries",
+    ),
+    |b: Bytes| decoded(b, hash_entry_bin(), "a hash entry"),
+  )
+}
+
+/// What hashing a module fixed, read as `Named` says.
+pub fn hashes_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, named_bin(), "a module's name");
+  let module = asked.module;
+  let none = {
+    hashes: { module: module, entries: map_new() },
+    owners: map_new(),
+    defs: [],
+    decls: [],
+    tests: [],
+  };
+  bin::encode(
+    match module_read(asked) {
+      None -> none,
+      Some(m) -> {
+        let found = hashed_needed(
+          |d: Bytes, n: Bytes| entries_of(asked.shipped, d, n),
+          |d: Bytes, n: Bytes| hash_entries_of(asked.shipped, d, n),
+          wanted_in(m.parsed, m.raw, m.source.src, m.names),
+          m.present,
+        );
+        let places = places_of(asked.shipped, map_keys(found.deps));
+        let h = hashed_against(
+          m.source,
+          m.placed,
+          found.deps,
+          found.hashed,
+          placing_in(places),
+          m.reading,
+        );
+        match h.hashed {
+          Err(_) -> none,
+          Ok(x) -> {
+            let mine = |name: Bytes| of_module(module, name);
+            {
+              hashes: hashes_of(x.index, x.hashes, h.at, m.source.src),
+              owners: owners_of_module(x.index, h.at, m.source.src),
+              defs: filter(x.hashes.defs, |d: { name: Bytes, hash: Bytes }| mine(d.name)),
+              decls: filter(x.hashes.decls, |d: { name: Bytes, hash: Bytes }| mine(d.name)),
+              tests: fold(
+                range(0, len(x.index.tests)),
+                [],
+                |acc: List<{ key: Bytes, hash: Bytes }>, k: Int| {
+                  let t = at(x.index.tests, k);
+                  if t.module == h.at { push(acc, { key: t.key, hash: at(x.hashes.tests, k) }) }
+                  else { acc }
+                },
+              ),
+            }
+          },
+        }
+      },
+    },
+    hash_answer_bin(),
+  )
+}
+
+pub fn hash_shown_query() -> Bytes = b"hash_shown"
+
+/// What hashing a module fixed of each owner, each hash entry kept encoded, read as `Named` says.
+pub fn hash_shown_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let answer = decoded(memo.ask(hashes_query(), input), hash_answer_bin(), "a module's hashing");
+  bin::encode(
+    {
+      owners: answer.owners,
+      entries: map_fold(
+        answer.hashes.entries,
+        map_new(),
+        |acc: Map<Bytes, Bytes>, o: Bytes, e: HashEntry|
+          map_insert(acc, o, bin::encode(e, hash_entry_bin())),
+      ),
+    },
+    shown_bin(),
+  )
+}
+
+/// The hash entries a module shows under a name, each encoded, read as `EntryNamed` says: under
+/// every name for none.
+pub fn hash_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, entry_named_bin(), "an entry's name");
+  let shown = decoded(
+    memo.ask(
+      hash_shown_query(),
+      bin::encode({ module: asked.module, shipped: asked.shipped }, named_bin()),
+    ),
+    shown_bin(),
+    "what a module's hashing shows",
+  );
+  let owners = if asked.name == b"" { map_keys(shown.entries) }
+  else { match map_get(shown.owners, asked.name) { Some(os) -> os, None -> [] } };
+  bin::encode(
+    fold(owners, [], |acc: List<Bytes>, o: Bytes|
+      match map_get(shown.entries, o) { Some(e) -> push(acc, e), None -> acc }),
+    bin::list_bin(bin::bytes_bin()),
+  )
+}
+
+pub fn hashes_query() -> Bytes = b"hashes"
+
+pub fn hash_entry_query() -> Bytes = b"hash_entry"
+
+pub fn exported_query() -> Bytes = b"exported"
+
+/// What a module shows its importers, read as `Named` says.
+pub fn exported_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let answer = decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer");
+  bin::encode(
+    {
+      owners: answer.exports.owners,
+      entries: map_fold(
+        answer.exports.entries,
+        map_new(),
+        |acc: Map<Bytes, Bytes>, o: Bytes, e: Entry|
+          map_insert(acc, o, bin::encode(e, entry_bin())),
+      ),
+    },
+    shown_bin(),
+  )
+}
+
+/// The entries a module shows under a name, each encoded, read as `EntryNamed` says: under every
+/// name for none.
+pub fn entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, entry_named_bin(), "an entry's name");
+  let shown = decoded(
+    memo.ask(
+      exported_query(),
+      bin::encode({ module: asked.module, shipped: asked.shipped }, named_bin()),
+    ),
+    shown_bin(),
+    "what a module shows",
+  );
+  let owners = if asked.name == b"" { map_keys(shown.entries) }
+  else { match map_get(shown.owners, asked.name) { Some(os) -> os, None -> [] } };
+  bin::encode(
+    fold(owners, [], |acc: List<Bytes>, o: Bytes|
+      match map_get(shown.entries, o) { Some(e) -> push(acc, e), None -> acc }),
+    bin::list_bin(bin::bytes_bin()),
+  )
+}
+
+/// Each query a load asks, by its name, beside the definition that answers it, whose hash its records
+/// are kept under.
+pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {memo.read, abort.raise} }> =
+  [
+    { name: module_query(), definition: b"checking.module_answer", body: module_answer },
+    { name: imports_query(), definition: b"checking.imports_answer", body: imports_answer },
+    { name: exported_query(), definition: b"checking.exported_answer", body: exported_answer },
+    { name: entry_query(), definition: b"checking.entry_answer", body: entry_answer },
+    { name: hashes_query(), definition: b"checking.hashes_answer", body: hashes_answer },
+    {
+      name: hash_shown_query(),
+      definition: b"checking.hash_shown_answer",
+      body: hash_shown_answer,
+    },
+    {
+      name: hash_entry_query(),
+      definition: b"checking.hash_entry_answer",
+      body: hash_entry_answer,
+    },
+  ]
+
+// --- Asking a program's modules -------------------------------------------------------------
+
+/// A module of a load's own packages: its name in its package, its file, and its text.
+pub type OwnFile = { module: Bytes, path: Bytes, text: Bytes }
+
+/// A package of a load's own: the key it is judged by, its manifest's text, and its modules.
+pub type OwnPackage = { root: Bytes, manifest: Option<Bytes>, files: List<OwnFile> }
+
+/// What the world holds for the queries of a load: its packages, where each of its own modules is
+/// and its text, what each embeds, and the names of its own modules in the order a load places them.
+pub type World = {
+  layout: Bytes,
+  places: Map<Bytes, Bytes>,
+  texts: Map<Bytes, Bytes>,
+  embeds: Map<Bytes, Bytes>,
+  own: List<Bytes>,
+}
+
+fn embedding_of(read: EmbedRead) -> Embedding =
+  match read {
+    Ok(files) ->
+      { files: map(files, |f: EmbedFile| { name: f.name, bytes: f.bytes }), refused: None },
+    Err(why) -> { files: [], refused: Some(why) },
+  }
+
+/// The world of a load of `root` and `deps`, which embed what `embeds` read.
+pub fn world_of(
+  root: OwnPackage,
+  deps: List<OwnPackage>,
+  embeds: List<Embedded>,
+) -> World / {abort.raise} = {
+  let l = {
+    root: root.root,
+    manifest: root.manifest,
+    supplied: map(deps, |p: OwnPackage| { root: p.root, manifest: p.manifest }),
+  };
+  let packages = closure(pkgs_of(l), []).packages;
+  let placed = fold(
+    range(0, len(deps) + 1),
+    [],
+    |acc: List<{ name: Bytes, placing: Placing, text: Bytes }>, k: Int| {
+      let p = if k == 0 { root } else { at(deps, k - 1) };
+      let prefix = if k == 0 { b"" }
+      else { match list_at(packages, k) { Some(x) -> x.prefix, None -> b"" } };
+      fold(p.files, acc, |a: List<{ name: Bytes, placing: Placing, text: Bytes }>, f: OwnFile|
+        push(a, {
+          name: if bytes_len(prefix) == 0 { f.module }
+          else { bytes_concat_all([prefix, b".", f.module]) },
+          placing: { package: k, relative: f.module, path: f.path },
+          text: f.text,
+        }))
+    },
+  );
+  {
+    layout: bin::encode(l, layout_bin()),
+    places: fold(
+      placed,
+      map_new(),
+      |acc: Map<Bytes, Bytes>, x: { name: Bytes, placing: Placing, text: Bytes }|
+        map_insert(acc, x.name, bin::encode(x.placing, placing_bin())),
+    ),
+    texts: fold(
+      placed,
+      map_new(),
+      |acc: Map<Bytes, Bytes>, x: { name: Bytes, placing: Placing, text: Bytes }|
+        map_insert(acc, x.placing.path, x.text),
+    ),
+    embeds: fold(embeds, map_new(), |acc: Map<Bytes, Bytes>, e: Embedded|
+      map_insert(
+        acc,
+        embed_at(e.root, e.module, embed_key(e.want)),
+        bin::encode(embedding_of(e.read), embedding_bin()),
+      )),
+    own: map(placed, |x: { name: Bytes, placing: Placing, text: Bytes }| x.name),
+  }
+}
+
+/// What `w` holds as `kind` reads it at `at`, a shipped module's text and a data file's bytes as
+/// `shipped` and `data` answer them.
+pub fn looked<| e>(
+  w: World,
+  shipped: (Bytes) -> Option<Bytes> / {abort.raise | e},
+  data: (Bytes) -> Option<Bytes> / {abort.raise | e},
+  kind: Bytes,
+  at: Bytes,
+) -> Option<Bytes> / {abort.raise | e} =
+  if kind == layout_kind() { Some(w.layout) }
+  else if kind == module_kind() { map_get(w.places, at) }
+  else if kind == text_kind() { map_get(w.texts, at) }
+  else if kind == shipped_kind() { shipped(at) }
+  else if kind == data_kind() { data(at) }
+  else if kind == embed_kind() { map_get(w.embeds, at) }
+  else { None }
+
+/// The evaluator's line of the `stamps` the launcher lays beside the shipped modules: what an answer
+/// computed by running a query is a function of besides the query's own definitions.
+pub fn evaluator_of(stamps: Bytes) -> Bytes / {abort.raise} =
+  fold(bytes_split(stamps, b"\n"), b"", |acc: Bytes, line: Bytes|
+    if bytes_starts_with(line, b"evaluator ") { bytes_slice(line, 10, bytes_len(line)) }
+    else { acc })
+
+/// The queries, each under the hash its definition has in the program `definitions` lists and the
+/// stamp of the evaluator that runs it.
+pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, Query> / {abort.raise} =
+  fold(
+    queries(),
+    map_new(),
+    |acc: Map<Bytes, Query>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {memo.read, abort.raise} }|
+      map_insert(acc, q.name, {
+        name: q.name,
+        hash: match definition_hash(definitions, q.definition) {
+          Some(h) -> blake3(bytes_concat_all([h, b"\x00", evaluator])),
+          None ->
+            panic(
+              "the program holds no definition `" ++ string_of_bytes_lossy(q.definition) ++ "`",
+            ),
+        },
+        body: q.body,
+      }),
+  )
+
+/// What names the set of `qs`, each under its hash, in hex: two loads whose queries answer alike
+/// share it.
+pub fn identity_of(qs: Map<Bytes, Query>) -> String / {abort.raise} =
+  hex_of(
+    bytes_slice(
+      blake3(
+        bytes_concat_all(
+          map_fold(qs, [], |acc: List<Bytes>, _: Bytes, q: Query| push(acc, q.hash)),
+        ),
+      ),
+      0,
+      8,
+    ),
+  )
+
+/// The queries, each under its name for a hash: what a run that keeps nothing asks.
+pub fn fresh_registry() -> Map<Bytes, Query> =
+  fold(
+    queries(),
+    map_new(),
+    |acc: Map<Bytes, Query>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {memo.read, abort.raise} }|
+      map_insert(acc, q.name, { name: q.name, hash: q.name, body: q.body }),
+  )
+
+/// A module of a load, by its name in the program, and what it answered.
+pub type Answered = { module: Bytes, answer: ModuleAnswer }
+
+/// What each of `own`, the load's own modules, and of `shipped`, the shipped modules it pulls,
+/// answers checked, asked of `qs` over a run. Where the own modules import one another in a cycle,
+/// no module is checked, since none has an order to be checked in: what answers is the module whose
+/// import closes each cycle, refused for it.
+pub fn asked_all(
+  qs: Map<Bytes, Query>,
+  own: List<Bytes>,
+  shipped: List<Bytes>,
+  run: Run,
+) -> { run: Run, value: List<Answered> } / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let cycles = cycles_among(qs, run, own);
+  if len(cycles.refused) > 0 { { run: cycles.run, value: cycles.refused } } else {
+    let asks = concat(
+      map(own, |n: Bytes| { module: n, shipped: false }),
+      map(shipped, |n: Bytes| { module: n, shipped: true }),
+    );
+    fold(
+      asks,
+      { run: cycles.run, value: [] },
+      |acc: { run: Run, value: List<Answered> }, named: Named| {
+        let a = answer(qs, acc.run, module_query(), bin::encode(named, named_bin()));
+        {
+          run: a.run,
+          value: push(acc.value, {
+            module: named.module,
+            answer: decoded(a.output, module_answer_bin(), "a module's answer"),
+          }),
+        }
+      },
+    )
+  }
+}
+
+/// The cycles `own` import one another in, each refused at the import that closes it: the cycle
+/// read from its least module, and closed by the module before it.
+fn cycles_among(
+  qs: Map<Bytes, Query>,
+  run: Run,
+  own: List<Bytes>,
+) -> { run: Run, refused: List<Answered> } / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let read = fold(
+    own,
+    { run: run, edges: map_new() },
+    |acc: { run: Run, edges: Map<Bytes, List<ImportOf>> }, m: Bytes| {
+      let a = answer(
+        qs,
+        acc.run,
+        imports_query(),
+        bin::encode({ module: m, shipped: false }, named_bin()),
+      );
+      {
+        run: a.run,
+        edges: map_insert(
+          acc.edges,
+          m,
+          filter(
+            decoded(a.output, imports_of_bin(), "a module's imports").imports,
+            |i: ImportOf| !i.named.shipped,
+          ),
+        ),
+      }
+    },
+  );
+  let edges = read.edges;
+  let next = |m: Bytes|
+    map(match map_get(edges, m) { Some(es) -> es, None -> [] }, |i: ImportOf| i.named.module);
+  // Every module `from` reaches, ascending by the path that first reached it.
+  let paths = |from: Bytes|
+    iterate(
+      { seen: map_new(), frontier: map(next(from), |n: Bytes| { at: n, path: [from] }) },
+      len(own) + 2,
+      |x: { seen: Map<Bytes, List<Bytes>>, frontier: List<{ at: Bytes, path: List<Bytes> }> }|
+        if len(x.frontier) == 0 { Stop(x.seen) } else {
+          Continue(
+            fold(
+              x.frontier,
+              { seen: x.seen, frontier: [] },
+              |y: { seen: Map<Bytes, List<Bytes>>, frontier: List<{ at: Bytes, path: List<Bytes> }> }, f: { at: Bytes, path: List<Bytes> }|
+                if map_contains(y.seen, f.at) { y } else {
+                  {
+                    seen: map_insert(y.seen, f.at, f.path),
+                    frontier: concat(
+                      y.frontier,
+                      map(next(f.at), |n: Bytes| { at: n, path: push(f.path, f.at) }),
+                    ),
+                  }
+                },
+            ),
+          )
+        },
+    );
+  let refused = fold(
+    sort_by(own, |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true }),
+    { done: map_new(), out: [] },
+    |acc: { done: Map<Bytes, Bool>, out: List<Answered> }, m: Bytes|
+      if map_contains(acc.done, m) { acc } else {
+        match map_get(paths(m), m) {
+          None -> acc,
+          Some(path) -> {
+            let closing = at(path, len(path) - 1);
+            let span = fold(
+              match map_get(edges, closing) { Some(es) -> es, None -> [] },
+              { start: 0, end: 0 },
+              |s: Span, i: ImportOf| if i.named.module == m { i.span } else { s },
+            );
+            let diag = if len(path) == 1 {
+              error_at(
+                b"E0109",
+                0,
+                span,
+                bytes_concat_all([b"module `", m, b"` imports itself"]),
+                b"a module cannot import itself",
+                [b"every name a module declares is already in scope in its own file"],
+              )
+            } else {
+              error_at(
+                b"E0109",
+                0,
+                span,
+                bytes_concat_all([b"module cycle: ", backticked(path, b" -> "), b" -> `", m, b"`"]),
+                b"this import closes the cycle",
+                [
+                  b"each of these has to be checked before the next, and the last before the first, so there is no order to check them in",
+                  b"move what they share into a module that all of them import",
+                ],
+              )
+            };
+            {
+              done: fold(path, acc.done, |d: Map<Bytes, Bool>, p: Bytes| map_insert(d, p, true)),
+              out: push(acc.out, {
+                module: closing,
+                answer: { ..absent(closing), refused: [diag] },
+              }),
+            }
+          },
+        }
+      },
+  ).out;
+  { run: read.run, refused: refused }
+}
+
+/// The hash of `name`, a definition of the load's own module `module`, as hashing that module fixed
+/// it: nothing where the module does not define it.
+pub fn entry_hash(
+  qs: Map<Bytes, Query>,
+  run: Run,
+  module: Bytes,
+  name: Bytes,
+) -> { run: Run, hash: Option<Bytes> } / {memo_keep.read, memo_keep.write, abort.raise} =
+  if bytes_len(module) == 0 { { run: run, hash: None } } else {
+    let a = answer(
+      qs,
+      run,
+      hashes_query(),
+      bin::encode({ module: module, shipped: false }, named_bin()),
+    );
+    let hashed = decoded(a.output, hash_answer_bin(), "a module's hashing");
+    {
+      run: a.run,
+      hash: fold(hashed.defs, None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
+        if d.name == name { Some(d.hash) } else { acc }),
+    }
+  }
+
+/// Each of `answers` refused for what its own text says: one that imports a refused module may be
+/// refused for that alone, which the refusal of that module says.
+pub fn refused_first(answers: List<Answered>) -> List<Answered> = {
+  let refused = fold(answers, map_new(), |acc: Map<Bytes, Bool>, a: Answered|
+    if len(a.answer.refused) > 0 { map_insert(acc, a.module, true) } else { acc });
+  filter(answers, |a: Answered|
+    len(a.answer.refused) > 0
+      && !fold(a.answer.imports, false, |b: Bool, m: Bytes| b || map_contains(refused, m)))
+}
+
+// --- Tests ----------------------------------------------------------------------------------
+
+/// What an answer says, to compare one with another: a refusal by the code and message of each
+/// error, sorted, since a load refuses by each module's own; an analysis by what it publishes.
+type Said = | Refusing(List<Bytes>) | Publishing(Published)
+
+fn said(outcome: AnalysisOutcome) -> Said / {abort.raise} =
+  match outcome {
+    Refused(ds) ->
+      Refusing(
+        sort_by(
+          map(ds, |d: Diag| bytes_concat_all([d.code, b": ", d.message])),
+          |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
+        ),
+      ),
+    Analysed(_) -> Publishing(published(outcome)),
+  }
+
+/// `sources` answered through the module queries over `held`, as a load assembles them: refused by
+/// the errors of each module no refused import explains, else analysed whole, each definition and
+/// test taken as its module's answer published it.
+fn answered_over(
+  held: Held,
+  sources: List<Source>,
+) -> { held: Held, run: Run, outcome: AnalysisOutcome } / {abort.raise} = {
+  let w = world_of(
+    {
+      root: b"",
+      manifest: None,
+      files: map(sources, |s: Source|
+        { module: s.name, path: bytes_concat(s.name, b".ply"), text: s.src }),
+    },
+    [],
+    [],
+  );
+  let none = |name: Bytes| None;
+  let done = over_held(
+    held,
+    |kind: Bytes, at: Bytes| looked(w, none, none, kind, at),
+    |run: Run| asked_all(fresh_registry(), w.own, [], run),
+  );
+  let answers = done.value;
+  {
+    held: done.held,
+    run: done.run,
+    outcome: match refused_first(answers) {
+      [] ->
+        analyse_with(
+          parse_all(sources),
+          fold(answers, [], |acc: List<KnownDefRow>, a: Answered| concat(acc, a.answer.rows.defs)),
+          fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
+            concat(acc, a.answer.rows.tests)),
+        ),
+      first ->
+        Refused(fold(first, [], |acc: List<Diag>, a: Answered| concat(acc, a.answer.refused))),
+    },
+  }
+}
+
+// --- Through a session of edits -------------------------------------------------------------
+// Each step is analysed from nothing and answered through the module queries over a store the steps
+// before it kept: the two answers must be one answer, whatever the edit was.
+
+type Step = { what: Bytes, sources: List<Source> }
+
+/// The steps whose answer through the memo store, kept from step to step, is not the fresh one.
+fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
+  fold(
+    steps,
+    { held: nothing_held(), off: [] },
+    |s: { held: Held, off: List<Bytes> }, step: Step| {
+      let warm = answered_over(s.held, step.sources);
+      {
+        held: warm.held,
+        off: if said(warm.outcome) == said(analyse(parse_all(step.sources))) { s.off }
+        else { push(s.off, step.what) },
+      }
+    },
+  ).off
+
+fn step(what: Bytes, sources: List<Source>) -> Step = { what: what, sources: sources }
+
+/// Every occurrence of `from` in module `name`, as `to`.
+fn edited(
+  sources: List<Source>,
+  name: Bytes,
+  from: Bytes,
+  to: Bytes,
+) -> List<Source> / {abort.raise} =
+  map(sources, |source: Source|
+    if source.name != name { source } else if bytes_index_of(source.src, from) == None {
+      panic("the fixture drifted: the text to edit is not there")
+    } else { { name: source.name, src: join(bytes_split(source.src, from), to) } })
+
+fn with_module(sources: List<Source>, name: Bytes, src: Bytes) -> List<Source> =
+  push(filter(sources, |source: Source| source.name != name), { name: name, src: src })
+
+fn without(sources: List<Source>, name: Bytes) -> List<Source> =
+  filter(sources, |source: Source| source.name != name)
+
+fn shop_core() -> Bytes =
+  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\npub fn label(i: Item) -> String =\n  match i {\n    Book(t, _) -> t,\n    Note(t) -> t,\n  }\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
+
+fn shop_shop() -> Bytes =
+  b"import core\nfn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"shipped modules adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
+
+fn shop_leaf() -> Bytes = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + one()\n"
+
+fn shop() -> List<Source> =
+  [
+    { name: b"core", src: shop_core() },
+    { name: b"shop", src: shop_shop() },
+    { name: b"leaf", src: shop_leaf() },
+  ]
+
+test "an answer through the store is the fresh one through every kind of edit a session makes" {
+  let s0 = shop();
+  let s1 = edited(s0, b"leaf", b"one() + one()", b"one() + one() + 0");
+  let s2 = edited(
+    s1,
+    b"leaf",
+    b"pub fn two() -> Int = one() + one() + 0",
+    b"pub fn two(k: Int) -> Int = one() + k",
+  );
+  let s3 = edited(s2, b"leaf", b"pub fn one()", b"fn one()");
+  let broken = edited(s3, b"leaf", b"fn one() -> Int = 1", b"fn one() -> Int = \"1\"");
+  let s4 = edited(s3, b"core", b"pub fn label(", b"pub fn title(");
+  let s5 = edited(s4, b"core", b"Book(_, p) -> p,", b"Book(_, p) -> p + 0,");
+  let s6 = edited(s5, b"shop", b"acc + core::price(i)", b"acc + core::price(i) + 0");
+  let s7 = edited(s6, b"shop", b"import core\n", b"import core\nimport leaf\n");
+  let s8 = with_module(s6, b"extra", b"import leaf\npub fn four() -> Int = leaf::two(2) + 2\n");
+  let s9 = edited(s8, b"extra", b"+ 2\n", b"+ 3\n");
+  let s10 = edited(s9, b"leaf", b"one() + k", b"one() + k + 0");
+  let s11 = edited(
+    edited(
+      s10,
+      b"leaf",
+      b"fn one() -> Int = 1",
+      b"import core\n\nfn one() -> Int = core::price(core::Note(\"n\")) + 1",
+    ),
+    b"core",
+    b"Book(_, p) -> p + 0,",
+    b"Book(_, p) -> p + 1,",
+  );
+  let s12 = without(s11, b"extra");
+  let s13 = edited(s12, b"core", b"Money", b"Cost");
+  let s14 = edited(
+    edited(s13, b"core", b"effect db", b"effect ledger"),
+    b"shop",
+    b"core::db.",
+    b"core::ledger.",
+  );
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"unchanged", s0),
+      step(b"a body edit in a leaf", s1),
+      step(b"a signature edit in a leaf", s2),
+      step(b"`pub` removed in a leaf", s3),
+      step(b"a type error", broken),
+      step(b"the error undone", s3),
+      step(b"a rename in a module another imports", s4),
+      step(b"a body edit in a module another imports", s5),
+      step(b"a body edit in a module that imports another", s6),
+      step(b"an import added", s7),
+      step(b"an import removed", s6),
+      step(b"a file added", s8),
+      step(b"an edit to the added file", s9),
+      step(b"an edit to the leaf the added file imports", s10),
+      step(b"an import added to a module edited with the one it now imports", s11),
+      step(b"the added file deleted", s12),
+      step(b"a type renamed", s13),
+      step(b"an effect renamed", s14),
+      step(b"unchanged again", s14),
+    ]),
+    [],
+  )
+}
+
+test "moving, removing and re-signing definitions leaves an answer through the store the fresh one" {
+  let s0 = shop();
+  let twice = b"pub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\n";
+  let moved = edited(
+    edited(
+      edited(
+        edited(s0, b"core", twice, b""),
+        b"leaf",
+        b"pub fn one()",
+        bytes_concat(twice, b"pub fn one()"),
+      ),
+      b"shop",
+      b"import core",
+      b"import core\nimport leaf",
+    ),
+    b"shop",
+    b"core::twice",
+    b"leaf::twice",
+  );
+  let removed = edited(
+    edited(s0, b"shop", b"fn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\n", b""),
+    b"core",
+    twice,
+    b"",
+  );
+  let spare = with_module(s0, b"spare", b"pub fn spare() -> Int = 9\n");
+  let referenced = with_module(s0, b"extra", b"import leaf\npub fn three() -> Int = leaf::two()\n");
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a definition moved between modules", moved),
+      step(b"back", s0),
+      step(b"a definition removed outright", removed),
+      step(b"back again", s0),
+      step(
+        b"a dependency's signature changed",
+        edited(s0, b"core", b"pub fn price(i: Item) -> Money =", b"pub fn price(i: Item) -> Int ="),
+      ),
+      step(b"reformatted", edited(s0, b"leaf", b"pub fn one()", b"// a comment\npub fn  one()")),
+      step(b"an unreferenced file", spare),
+      step(b"deleted", s0),
+      step(b"a file importing the leaf", referenced),
+      step(b"the leaf deleted under it", without(referenced, b"leaf")),
+      step(b"the leaf restored", referenced),
+    ]),
+    [],
+  )
+}
+
+test "names shared, declarations alike and tests edited leave an answer through the store the fresh one" {
+  let peel = b"pub type Thing = | Wrap(Int)\npub fn peel(t: Thing) -> Int = match t { Wrap(n) -> n }\n";
+  let shared = [{ name: b"a", src: peel }, { name: b"b", src: peel }];
+  let look = b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[t]} = db.get[t](k)\n";
+  // The capability `pick` does not handle is the one its row writes.
+  let pick = |m: Bytes|
+    bytes_concat_all([
+      b"import x\nimport y\npub fn pick(k: Int) -> Int / {",
+      if m == b"x" { b"y" } else { b"x" },
+      b"::db.read[t]} =\n  handle x::look(k) + y::look(k) with { ",
+      m,
+      b"::db.get[t](j) -> j, }\n",
+    ]);
+  let alike = [
+    { name: b"x", src: look },
+    { name: b"y", src: look },
+    { name: b"z", src: b"pub fn plain() -> Int = 7\n" },
+    { name: b"w", src: pick(b"x") },
+  ];
+  let alias = [
+    { name: b"alias", src: b"pub type Cents = Int\npub fn zero() -> Cents = 0\n" },
+    { name: b"user", src: b"import alias\nfn take() -> alias::Cents = alias::zero()\n" },
+    { name: b"lone", src: b"fn lone() -> Int = 1\n" },
+  ];
+  let tested = b"fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n";
+  let palette = b"pub type Color = Red | Green\npub fn paint(what: String, shade: Color = Red) -> String =\n  match shade {\n    Red -> string_concat(what, \" red\"),\n    Green -> string_concat(what, \" green\"),\n  }\n";
+  let wall = b"import palette\npub fn wall() -> String = palette::paint(\"wall\")\npub fn given() -> String = palette::paint(\"wall\", palette::Green)\ntest \"the default crosses the module boundary\" {\n  assert_eq(wall(), \"wall red\")\n}\n";
+  let painted = [{ name: b"palette", src: palette }, { name: b"wall", src: wall }];
+  assert_eq(
+    disagreements([
+      step(b"two definitions sharing a hash", shared),
+      step(b"warm", shared),
+      step(b"identically declared effects", alike),
+      step(b"warm", alike),
+      step(b"the handler switched to the other capability", with_module(alike, b"w", pick(b"y"))),
+      step(
+        b"an unrelated edit",
+        with_module(with_module(alike, b"w", pick(b"y")), b"z", b"pub fn plain() -> Int = 8\n"),
+      ),
+      step(b"a type alias", alias),
+      step(b"warm", alias),
+      step(b"an unrelated edit", with_module(alias, b"lone", b"fn lone() -> Int = 2\n")),
+      step(b"a test", [{ name: b"m", src: tested }]),
+      step(b"a test added", [
+        { name: b"m", src: bytes_concat(tested, b"test \"twice\" { assert_eq(f() + f(), 2) }\n") },
+      ]),
+      step(b"a test with a body already present", [
+        { name: b"m", src: bytes_concat(tested, b"test \"still one\" { assert_eq(f(), 1) }\n") },
+      ]),
+      step(b"a cross-module default", painted),
+      step(
+        b"the default edited",
+        edited(painted, b"palette", b"shade: Color = Red", b"shade: Color = Green"),
+      ),
+    ]),
+    [],
+  )
+}
+
+fn performer(module: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"import ",
+    module,
+    b"\npub fn look(k: Int) -> Int / {",
+    module,
+    b"::db.read[t]} = ",
+    module,
+    b"::db.get[t](k)\ntest \"looks\" { handle { assert_eq(look(1), 0) } with { ",
+    module,
+    b"::db.get[t](k) -> 0 } }\n",
+  ])
+
+fn effect_decl() -> Bytes = b"pub effect db { read get[r](key: Int) -> Int }\n"
+
+test "a structurally identical effect appearing, renamed or deleted leaves an answer through the store the fresh one" {
+  let one = [{ name: b"x", src: effect_decl() }, { name: b"p", src: performer(b"x") }];
+  let twins = [
+    { name: b"a", src: effect_decl() },
+    { name: b"x", src: effect_decl() },
+    { name: b"p", src: performer(b"a") },
+  ];
+  let survivors = [
+    { name: b"a", src: effect_decl() },
+    { name: b"x", src: effect_decl() },
+    { name: b"p", src: performer(b"x") },
+  ];
+  assert_eq(
+    disagreements([
+      step(b"cold", one),
+      step(b"warm", one),
+      step(b"an identical effect appeared", with_module(one, b"a", effect_decl())),
+      step(b"twins", twins),
+      step(
+        b"the twin renamed to sort first",
+        with_module(twins, b"x", b"pub effect audit { read get[r](key: Int) -> Int }\n"),
+      ),
+      step(b"survivors", survivors),
+      step(b"the module that ranked first deleted", without(survivors, b"a")),
+    ]),
+    [],
+  )
+}
+
+test "reordering, relabelling and re-exporting leave an answer through the store the fresh one" {
+  let ops = |first: Bytes, second: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db {\n  ",
+          first,
+          b"\n  ",
+          second,
+          b"\n}\npub fn f() -> Int = 1\n",
+        ]),
+      },
+    ];
+  let get = b"read get[r](key: Int) -> Int";
+  let put = b"write put[r](key: Int, value: String) -> Unit";
+  let variants = |body: Bytes| [{ name: b"m", src: bytes_concat(b"pub type T =\n", body) }];
+  let labelled = |label: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"fn f() -> Int = 1\ntest \"",
+          label,
+          b"\" { assert_eq(f(), 1) }\n",
+        ]),
+      },
+    ];
+  let exported = [
+    { name: b"a", src: b"pub fn one() -> Int = 1\n" },
+    { name: b"b", src: b"import a\nfn two() -> Int = a::one() + a::one()\n" },
+  ];
+  assert_eq(
+    disagreements([
+      step(b"operations", ops(get, put)),
+      step(b"the operations reordered", ops(put, get)),
+      step(b"variants", variants(b"  | A(Int)\n  | B(String)\n")),
+      step(b"the variants reordered", variants(b"  | B(String)\n  | A(Int)\n")),
+      step(b"a test", labelled(b"f is one")),
+      step(b"its label changed", labelled(b"f is really one")),
+      step(b"and the run after that", labelled(b"f is really one")),
+      step(b"an exported name", exported),
+      step(b"its `pub` removed", with_module(exported, b"a", b"fn one() -> Int = 1\n")),
+      step(
+        b"a selective import",
+        with_module(exported, b"b", b"import a (one)\nfn two() -> Int = one() + one()\n"),
+      ),
+      step(b"back to a module import", exported),
+    ]),
+    [],
+  )
+}
+
+test "edits undone, modules renamed and files emptied leave an answer through the store the fresh one" {
+  let s0 = shop();
+  let leaf2 = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n";
+  let aliased = edited(
+    edited(s0, b"shop", b"import core", b"import core as c"),
+    b"shop",
+    b"core::",
+    b"c::",
+  );
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a body edited", with_module(s0, b"leaf", leaf2)),
+      step(b"and reverted", s0),
+      step(
+        b"a definition added",
+        with_module(
+          s0,
+          b"leaf",
+          bytes_concat(shop_leaf(), b"pub fn three() -> Int = two() + one()\n"),
+        ),
+      ),
+      step(b"and deleted", s0),
+      step(b"a module renamed", with_module(without(s0, b"leaf"), b"frond", shop_leaf())),
+      step(b"and renamed back", s0),
+      step(b"an imported module deleted", without(s0, b"core")),
+      step(b"and restored", s0),
+      step(b"a comment", with_module(s0, b"leaf", bytes_concat(b"// a note\n", shop_leaf()))),
+      step(b"an import aliased", aliased),
+      step(b"the alias removed", s0),
+      step(b"an empty module", with_module(s0, b"empty", b"")),
+      step(b"which gained a definition", with_module(s0, b"empty", b"pub fn now() -> Int = 1\n")),
+      step(b"and went away", s0),
+      step(b"a nested module beside a flat one", [
+        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", src: b"pub fn y() -> Int = 2\n" },
+      ]),
+      step(b"the nested module changed", [
+        { name: b"a", src: b"pub fn x() -> Int = 1\n" },
+        { name: b"a.b", src: b"pub fn y() -> Int = 3\n" },
+      ]),
+    ]),
+    [],
+  )
+}
+
+test "a shuffle of module states leaves an answer through the store the fresh one at every step" {
+  let leaves = [
+    shop_leaf(),
+    bytes_concat(b"// reformatted\n\n", shop_leaf()),
+    b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n",
+  ];
+  let cores = [
+    shop_core(),
+    join(bytes_split(shop_core(), b"Money"), b"Cost"),
+    join(bytes_split(shop_core(), b"pub fn label("), b"pub fn title("),
+  ];
+  let shops = [
+    shop_shop(),
+    join(bytes_split(shop_shop(), b"import core\n"), b"import core\nimport leaf\n"),
+    join(bytes_split(shop_shop(), b"acc + core::price(i)"), b"acc + core::price(i) + 0"),
+  ];
+  // Each step sets one module to one of its states: which, and to what, cycles through every pair.
+  let picks = [
+    [0, 1],
+    [1, 2],
+    [2, 1],
+    [0, 2],
+    [1, 1],
+    [2, 2],
+    [0, 0],
+    [1, 0],
+    [2, 0],
+    [0, 1],
+    [1, 2],
+    [0, 2],
+  ];
+  let states = fold(picks, [shop()], |acc: List<List<Source>>, p: List<Int>| {
+    let now = at(acc, len(acc) - 1);
+    let module = at(p, 0);
+    let pick = at(p, 1);
+    push(acc, if module == 0 { with_module(now, b"leaf", at(leaves, pick)) }
+    else if module == 1 { with_module(now, b"core", at(cores, pick)) }
+    else { with_module(now, b"shop", at(shops, pick)) })
+  });
+  assert_eq(disagreements(map(states, |sources: List<Source>| step(b"a shuffle step", sources))), [
+  ])
+}
+
+fn chain_lib(label: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"pub effect log { write note[r](msg: String) -> Int }\npub fn base(n: Int) -> Int / {log.note[",
+    label,
+    b"]} = log.note[",
+    label,
+    b"](\"n\") + n\npub fn mid(n: Int) -> Int / {log.note[",
+    label,
+    b"]} = base(n) + 1\n",
+  ])
+
+test "a row that moves under a caller leaves an answer through the store the fresh one" {
+  let before = [
+    { name: b"lib", src: chain_lib(b"a") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[a]} = lib::mid(n) + 1\n",
+    },
+  ];
+  let after = [
+    { name: b"lib", src: chain_lib(b"b") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.write[b]} = lib::mid(n) + 2\n",
+    },
+  ];
+  assert_eq(
+    disagreements([step(b"cold", before), step(b"the row moved under a checked caller", after)]),
+    [],
+  );
+  // A caller whose written row the moved one outgrows is refused through the store as it is fresh.
+  let stale = [
+    { name: b"lib", src: chain_lib(b"a") },
+    {
+      name: b"top",
+      src: b"import lib\npub fn top(n: Int) -> Int / {lib::log.note[a]} = lib::mid(n) + 1\n",
+    },
+  ];
+  let moved = with_module(stale, b"lib", chain_lib(b"b"));
+  assert_eq(disagreements([step(b"cold", stale), step(b"the callee's row moved", moved)]), []);
+  let kept = answered_over(answered_over(nothing_held(), stale).held, moved);
+  assert(match kept.outcome { Refused(_) -> true, Analysed(_) -> false })
+}
+
+test "an unused selectively imported name deleted is refused through the store as it is fresh" {
+  let s0 = [
+    { name: b"lib", src: b"pub fn used() -> Int = 1\npub fn spare() -> Int = 2\n" },
+    { name: b"app", src: b"import lib (used, spare)\nfn go() -> Int = used()\n" },
+  ];
+  let gone = with_module(s0, b"lib", b"pub fn used() -> Int = 1\n");
+  assert_eq(
+    disagreements([step(b"cold", s0), step(b"warm", s0), step(b"the name deleted", gone)]),
+    [],
+  );
+  match answered_over(answered_over(nothing_held(), s0).held, gone).outcome {
+    Analysed(_) -> panic("an import of a deleted name checked"),
+    Refused(ds) -> assert(fold(ds, false, |acc: Bool, diag: Diag| acc || diag.code == b"E0101")),
+  }
+}
+
+test "a narrowed annotation and a relabelled resource leave an answer through the store the fresh one" {
+  let narrowing = |row: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / ",
+          row,
+          b" = db.get[a](k)\n",
+        ]),
+      },
+    ];
+  let labelled = |label: Bytes|
+    [
+      {
+        name: b"m",
+        src: bytes_concat_all([
+          b"pub effect db { read get[r](key: Int) -> Int }\npub fn look(k: Int) -> Int / {db.read[",
+          label,
+          b"]} = db.get[",
+          label,
+          b"](k)\n",
+        ]),
+      },
+      {
+        name: b"u",
+        src: bytes_concat_all([
+          b"import m\nfn use_it() -> Int / {m::db.read[",
+          label,
+          b"]} = m::look(1)\n",
+        ]),
+      },
+    ];
+  let renamed = |ty: Bytes|
+    [
+      {
+        name: b"a",
+        src: bytes_concat_all([
+          b"pub type ",
+          ty,
+          b" = | Mk(Int)\npub fn mk() -> ",
+          ty,
+          b" = Mk(1)\n",
+        ]),
+      },
+      {
+        name: b"b",
+        src: bytes_concat_all([b"import a\npub fn get() -> a::", ty, b" = a::mk()\n"]),
+      },
+      { name: b"c", src: b"import b\npub fn top() -> Bool = { b::get(); true }\n" },
+    ];
+  assert_eq(
+    disagreements([
+      step(b"a wide annotation", narrowing(b"{db.read[a], db.read[b]}")),
+      step(b"the annotation narrowed", narrowing(b"{db.read[a]}")),
+      step(b"a resource", labelled(b"a")),
+      step(b"the resource relabelled", labelled(b"z")),
+      step(b"a type", renamed(b"T")),
+      step(b"the type renamed two modules away", renamed(b"Renamed")),
+    ]),
+    [],
+  )
+}
+
+test "the order an answer publishes in is the same through the store as fresh" {
+  let s0 = [
+    {
+      name: b"app",
+      src: b"import lib\npub effect audit { write note[log](m: Int) -> Unit }\npub type Wrapped = | Wrap(Int) | Empty\nfn second() -> Int = lib::base()\nfn first() -> Int = second()\n",
+    },
+    {
+      name: b"lib",
+      src: b"pub effect db { read get[t](k: Int) -> Int }\npub type Row = | Cell(Int)\npub fn base() -> Int = 1\n",
+    },
+  ];
+  assert_eq(disagreements([step(b"cold", s0), step(b"warm", s0)]), [])
+}
+
+fn performing(extra: List<Source>) -> List<Source> =
+  concat(extra, [
+    { name: b"core", src: b"pub effect db {\n  read get[r](key: Int) -> Int\n}\n" },
+    {
+      name: b"shop",
+      src: b"import core\npub fn touch(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"touch is handled\" {\n  assert_eq(handle touch(1) with { core::db.get[cart](k) -> k + 1, }, 2)\n}\n",
+    },
+  ])
+
+/// A row names its effects by name, so a new declaration that looks like one must not be taken
+/// for it: the answer through the store stays the fresh one.
+fn seeded_agrees(before: List<Source>, after: List<Source>) -> Bool / {abort.raise} =
+  disagreements([step(b"before", before), step(b"after", after)]) == []
+
+test "adding a look-alike effect keeps an answer through the store the fresh one" {
+  let alike = [{ name: b"aaa", src: b"pub effect alpha {\n  read get[r](key: Int) -> Int\n}\n" }];
+  assert(seeded_agrees(performing([]), performing([])));
+  assert(seeded_agrees(performing([]), performing(alike)))
+}
+
+test "adding an unrelated effect keeps an answer through the store the fresh one" {
+  let other = [{ name: b"aaa", src: b"pub effect alpha {\n  write put(key: Int) -> Int\n}\n" }];
+  assert(seeded_agrees(performing([]), performing(other)))
+}
+
+// --- What an edit runs again ------------------------------------------------------------------
+
+/// How many times the run ran the body of the query `name`.
+fn ran_of(run: Run, name: Bytes) -> Int =
+  fold(tallies(run), 0, |n: Int, t: Tally| if t.query == name { t.ran } else { n })
+
+fn layered(lib: Bytes) -> List<Source> =
+  [
+    { name: b"lib", src: lib },
+    { name: b"app", src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n" },
+    { name: b"aside", src: b"pub fn alone() -> Int = 7\n" },
+  ]
+
+test "a run over an unchanged program runs no query again" {
+  let sources = layered(b"pub fn step(n: Int) -> Int = n + 1\n");
+  let cold = answered_over(nothing_held(), sources);
+  assert_eq(ran_of(cold.run, module_query()), 3);
+  assert_eq(ran_total(answered_over(cold.held, sources).run), 0)
+}
+
+// A body's summary says what its answer is in terms of its arguments, which an importer's check
+// reads: an edit that leaves the summary alone leaves every importer's answer standing.
+test "a body edit checks its own module again and no module that imports it" {
+  let before = layered(b"pub fn step(n: Int) -> Int = n * 3\n");
+  let after = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
+  let warm = answered_over(answered_over(nothing_held(), before).held, after);
+  assert_eq(ran_of(warm.run, module_query()), 1);
+  assert_eq(said(warm.outcome), said(analyse(parse_all(after))))
+}
+
+test "a signature edit checks the modules that import it again, and no other" {
+  let cold = answered_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let widened = b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n";
+  let warm = answered_over(cold.held, layered(widened));
+  assert_eq(ran_of(warm.run, module_query()), 2);
+  assert_eq(said(warm.outcome), said(analyse(parse_all(layered(widened)))))
+}
+
+test "modules that import one another in a cycle are refused through the store as they are fresh" {
+  let cycle = [
+    { name: b"a", src: b"import b\npub fn a() -> Int = b::b()\n" },
+    { name: b"b", src: b"import a\npub fn b() -> Int = a::a()\n" },
+    { name: b"c", src: b"import a\npub fn c() -> Int = a::a()\n" },
+  ];
+  let itself = [{ name: b"me", src: b"import me\npub fn f() -> Int = 1\n" }];
+  assert_eq(
+    disagreements([
+      step(b"a cycle", cycle),
+      step(b"warm", cycle),
+      step(b"a module importing itself", itself),
+      step(b"the cycle broken", with_module(cycle, b"b", b"pub fn b() -> Int = 1\n")),
+    ]),
+    [],
+  )
+}
