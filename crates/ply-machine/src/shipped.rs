@@ -156,11 +156,7 @@ impl HostHandler for Shipped {
             }
             ("answer", [path]) => {
                 let path = path.as_str(span, "a path into what the shipped modules answer")?;
-                let pack = ply_pack::installed();
-                crate::payload::option(
-                    pack.bytes(&format!("{}/{path}", ply_pack::ANSWERS))
-                        .map(PlyValue::bytes),
-                )
+                crate::payload::option(ply_pack::installed().answer(path).map(PlyValue::bytes))
             }
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),
             ("stamps", []) => PlyValue::str(STAMPS.get().map_or("", String::as_str)),
