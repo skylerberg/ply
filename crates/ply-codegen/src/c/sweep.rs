@@ -155,17 +155,13 @@ pub const ANSWERED: &str = "answered";
 /// (`ply run`'s front end, `ply check`'s answer), each swept on its own.
 pub const REUSED: &str = "reused";
 
-/// The stage-directory entry holding the rows each build of a program published, a file per
-/// program and front end that published them, each swept on its own.
-pub const ROWS: &str = "rows";
-
 /// The stage-directory entry holding one runnable per program a builder built, each under what it
 /// is a function of besides its text and each swept on its own.
 pub const PROGRAMS: &str = "programs";
 
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 4] = [ANSWERED, REUSED, ROWS, PROGRAMS];
+const BY_FILE: [&str; 3] = [ANSWERED, REUSED, PROGRAMS];
 
 /// An entry used within this long is never swept: a run may still be reading it.
 const RECENT: Duration = Duration::from_secs(3600);

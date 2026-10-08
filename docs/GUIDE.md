@@ -10,8 +10,8 @@ This guide is the reference for writing Ply and using the `ply` command.
 ## 1. Getting started
 
 Build with `cargo build --release -p ply-launcher --bins`, then `cargo pack
-target/release/ply` to append the shipped modules and the `ply` program to it, and
-put `target/release/ply` on your path. After editing Ply sources in the checkout,
+target/release/ply` to append the shipped modules and the `ply` program to it, with
+what the shipped modules answer checked (§1), and put `target/release/ply` on your path. After editing Ply sources in the checkout,
 `cargo pack` again is the whole rebuild. A Ply file is a module:
 
 ```ply
@@ -46,16 +46,14 @@ directory name and file stem must be an identifier (`E0111`). `std` and
 named under either collides with its prefix (`E0133`). Naming a single file
 makes its parent the root and loads only that file.
 
-**The cache.** `.ply-cache/` at the root holds the store — what the front end
-filed for each file, the tests' passes and baselines, the discharged
-obligations and the review baselines, in one data file (`store.dat`) found
-through one index (`store.idx`) — the compiled package the project's loads
-read their dependencies and the shipped modules through, and what `ply check`
-kept of the project's own modules (`interfaces/`, §16),
-and the git dependencies that were fetched;
+**The cache.** `.ply-cache/` at the root holds the memo store (`memo/`), which
+keeps what each module of the project answered checked, the store — the tests'
+passes and baselines, the discharged obligations, the review baselines and the
+definitions a passing test ran, in one data file (`store.dat`) found through one
+index (`store.idx`) — and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
-the store and the compiled package); add it to `.gitignore`. A run that files
+the store and the memo store); add it to `.gitignore`. A run that files
 into the store compacts it, as `ply cache compact` does, once more than half of
 `store.dat` holds entries a later filing replaced or dropped.
 `PLY_CACHE_UPSTREAM=DIR` names a second
@@ -63,10 +61,8 @@ cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
 run's are published there (`PLY_CACHE_UPSTREAM_READONLY=1` reads only). Entries
 are keyed by content and by the shape of what is stored, so nothing
-machine-specific is ever shared; `--no-cache` ignores it. What the front end
-filed is believed only by a `ply` whose evaluator is the same and whose own
-definitions that analyse a program and file the answer hash as they did, and a
-pass or a discharged obligation only by one whose runtime is the same and whose
+machine-specific is ever shared; `--no-cache` ignores it. A pass or a discharged
+obligation is believed only by a `ply` whose runtime is the same and whose
 definitions that make a unit and decide a verdict hash as they did: another
 build files them again (`W0603`), and an upstream answers only builds of its
 runtime. A pass is filed as well under the code its test compiled to, believed by a build
@@ -74,13 +70,21 @@ whose runtime and definitions that run a test and file its pass hash as they did
 so a compiler change that leaves a test's code as it was does not run it again.
 A hash covers what its definition reaches and no comment or
 layout (§8.2), so the rest of `ply`, its other commands among it, is in none of these.
-What the front end filed for a definition is taken again while the definition's
-own text and what it reads of each definition and declaration it references
-stand: the signature and specifications written there, how its calls end, and
-what it performs or answers that a caller's check counts by. An edited body is
-checked again, and what references it only where one of those moved. A dependency's own
-modules are keyed by its manifest rather than by where it sits, so moving or
-re-checking-out a dependency keeps what was cached for it.
+
+A module is checked by a query, a function of the compiler whose every read —
+of a file, the project's manifests, a shipped module, an embed, or another
+query's answer — the memo store records beside the digest of what it answered.
+A run takes a record whose every read answers as it did, and runs the query
+again where one does not, so an edit checks again the module it moved and each
+module whose check read something the edit changed: a module reads what each
+module it imports shows under the names it uses — the signature, row and counts
+of a definition, the form of a type or an effect — never that module's text, so
+a body edit that leaves those as they were checks no importer again. A record is
+filed under the hash of the query's definition and the evaluator that ran it, so
+a `ply` that answers otherwise answers afresh. A shipped module (§13) answers
+alike in every project, so the binary carries what each answers, which `cargo
+pack` writes with `ply std --answers` and every load reads beside its own
+store.
 
 ## 2. Lexical structure
 
@@ -2091,7 +2095,7 @@ from the process's start (`phases` in the `--json` report);
 any of them matches; `--shard K/N` runs part K of N of what the rest selects,
 parted by a hash of each key, so a test is in the same part every run and the
 runs `1/N` to `N/N` run each test once; `--no-cache` bypasses both the result
-and the front-end cache.
+and the memo store.
 
 A case of a test over cases (§8.1) is selected as a test of its own. Its hash is
 its test's, which covers the body and the case's type and neither the table nor
@@ -2187,7 +2191,7 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each module's walks, kept under its text, its bodies' own forms and what its check read, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the rows that seed its next build, kept by the front end that published them (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the memo store its next build checks its modules through (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
@@ -2753,7 +2757,7 @@ load reads of a shipped module what a module importing it can reach: none of
 its tests or laws, nor a private function or type or an `import` that only they
 reach, which it neither parses nor checks. It reads only the shipped modules its
 modules import, what the parts it reads import in turn, and what they embed, so
-a change to any other leaves it alone; a change to one it reads warns `W0605`.
+a change to any other leaves it alone.
 Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
@@ -2920,10 +2924,10 @@ than its changes need is `E0150`, naming what moved and the least version that
 says so, before anything is sent; 0.x versions follow the same places.
 `ply contracts NAME FROM TO` lists what moved between two published versions.
 
-After the archive, `ply publish` sends the package's **interface**: what a load
-of it as a dependency cuts (§16), each module's stub keyed by the sources and
-manifests its analysis read, framed with the semantics version of the `ply` that
-cut it and the archive's digest. The registry keeps one per version and
+After the archive, `ply publish` sends the package's **interface**: what each
+of its modules shows a module that imports it — each name's signature, rows and
+counts, and what hashing fixed of it — framed with the semantics version of the
+`ply` that cut it and the archive's digest. The registry keeps one per version and
 semantics and refuses a frame that names another archive or semantics; the same
 bytes again are the one it holds, so a publish whose interface was refused runs
 again whole. The **semantics version** names what a definition's hashes, its
@@ -2931,10 +2935,9 @@ checked rows and a claim's verdict mean — `ply publish --json` reports it — 
 moves only when one of them does, so a `ply` that changes nothing they mean
 reads an interface another cut. It is a digest of what they come to over a
 corpus, which the build of `ply` evaluates (§3.5). `ply resolve` fetches the interface beside each
-archive into the dependency's slot, and the first load reads the dependency
-through it rather than analysing its source. `--verify-deps` (`check`, `test`,
-`prove`) reads every dependency from source instead and refuses one whose
-interface does not re-derive from it, `E0149`.
+archive into the dependency's slot. A load checks a dependency's modules from their source,
+through the memo store as it checks its own; `--verify-deps` (`check`, `test`, `prove`)
+refuses a dependency whose interface does not re-derive from its source, `E0149`.
 
 A registry with an **attester** vouches for what it serves. `ply attest NAME
 VERSION` lays the published version out as a project of its own, fetched and
@@ -3053,14 +3056,14 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many definitions the front-end cache seeded and how many were checked, how many tests it held as their hashing fixed them and how many were hashed, the modules a compiled package stood for, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, how many module texts the load lexed for what they import, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
-| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`; no path |
+| `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into the memo store at `DIR`, through one kept under the stage root for the next answering: what `cargo pack` packs into the binary, which every load reads beside its own store); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
 | `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
@@ -3078,8 +3081,8 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none, and the value of each `const fn` the program holds (§3.5), evaluated as `ply build` evaluates them; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
-| `ply cache clear\|stats\|compact [path]` | discard the store and the compiled package / report what it holds and its reclaimable space / reclaim it |
-| `ply cache inspect <DEF> [path]` | one definition's entries, by full name, simple name or 4+ hex hash prefix |
+| `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records of queries this `ply` no longer has and the answers no record names, and the store's definitions no pass record reaches |
+| `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
 `ply show`, `ply replace`, `ply resolve`, `ply vendor`, `ply why`, `ply publish`,
@@ -3111,19 +3114,14 @@ reads a program's sources and hashes them, and where the definition the program
 enters hashes as one of a program it already built, for this runtime and by
 this compiler, that runnable is the program: a hash covers all its definition
 reaches and no comment, layout, test or definition nothing reaches. Otherwise it
-checks the sources, seeded with the rows its last build of that program
-kept, emits its unit with the emitter's answers kept, and writes the runnable,
+checks the sources, each module through the memo store its builds of that
+program keep (§1), emits its unit with the emitter's answers kept, and writes the runnable,
 keeping it under that key in `programs/` below the stage root. The unit holds the
 value of each `const fn` the program holds, as `ply build`'s does (§3.5): one a
 build or a check kept is read back, and the rest are entered on a unit of what
 they reach and kept, so the program evaluates none of them; one that raises or
 spends its budget is left to its body. A program it
-ships holds no test and no law, which nothing it enters reaches, and a module
-whose text has not moved since its last build of the program, and that imports
-none whose text has, it reads as that build cut it: its signatures and
-declarations, with the rows and hashes kept for its bodies. What a module embeds
-counts as its text does: a file it embeds that reads otherwise has the module,
-and every module importing it, read from source. The answer is the
+ships holds no test and no law, which nothing it enters reaches. The answer is the
 one a build from every source gives. The launcher
 lays the committed runnable there under the key committed beside it.
 The committed builder builds `ply`, so each build reads back what the ones
@@ -3161,49 +3159,18 @@ fetch, and `compiler.load` refuses one.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command
-that loads a program reads the front-end cache under `.ply-cache` before it
-analyses and files what it answered after, unless the cache already holds all of
-it from the same load: a definition whose hash has not moved
-since it was filed is taken from its filed rows, so a run checks what an edit
-moved and what reaches it, and a definition generic over an effect row or a
-label every time. The hash it is filed under reads a definition of another
-package by its contract, its signature and specifications, so an edit to a
-dependency's body checks that package's definitions again and leaves its
-dependents' rows standing. What each module imports, and what it embeds, is kept
+that loads a program answers each of its modules — the project's own, its
+dependencies' and the shipped modules it pulls — through the memo store (§1),
+and then analyses the program whole with each definition and test taken as its
+module answered it, so a run checks again what an edit moved and takes the rest.
+What each module imports, and what it embeds, is kept
 in `.ply-cache/pulls/` under its text's digest, so a load lexes for them only the texts it
 has not read. What a load reads of a shipped module (§13) is kept once for the machine, in
 `reused/` under the stage root, under the text's digest and the `ply` that read it, so a
-project's first load lexes no shipped module's tests or laws to find it. A load reads its
-dependencies and the shipped modules it
-pulls through the compiled package an earlier load kept in
-`.ply-cache/interfaces/`: each module with its function bodies cut out, beside
-every definition's hash, references, effects and specifications, which the
-front end takes as they are. A module whose source or package manifest moved
-since, or that imports a module whose source or manifest moved, or one of whose
-definitions, tests or laws reaches, through what it references, a function that
-embeds a file that reads otherwise, is read from source, as is one the package
-lacks; a shipped module that moved only by gaining definitions, every one the
-package fixed of it hashing as it did, is read from source alone, and what
-imports it still reads its stub. The package is cut again from the load's own
-analysis, so a package
-costs no analysis of its own; a project keeps one per semantics version (§15.1),
-so a `ply` that changes nothing a hash or a row means reads the one another
-kept. A registry dependency's first load reads it through the interface its
-publisher sent. `ply check`, `ply defs` and `ply run` of a whole project read the
-project's own modules the same way, from what the last of them kept beside the
-package: a module that still stands enters with its function and test bodies cut
-out, the rest of its tests and its laws as written, its rows answer for the bodies,
-and what the check warned of it is said again; a test's body is cut only where its
-row and the hash its run fixed were kept, and otherwise the module is read from
-source. Each answers as it does over every source; a run compiles what it runs
-from source. `ply test` reads them from source, since a mutant and a bisection
-rewrite bodies. A run about the
-shipped modules — `--std`, or a project whose own modules ship — reads them from
-source. `ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental`
-read and file neither, and neither does `compiler.load`. A cache that will not read
-is a warning and a cold check, never a failure; the run that files over one
-that filed a shipped module this load reads with other bytes says so once, as
-`W0605`, naming the modules and how many definitions the change reached.
+project's first load lexes no shipped module's tests or laws to find it.
+`ply build`, `ply hosts`, `ply test --no-cache` and `--no-incremental` answer
+every module afresh and keep nothing, and neither does `compiler.load`. A memo
+store that will not read is a cold check, never a failure.
 
 `ply run` over sources goes further: once a load holds, the front end's answer
 is filed under a key of everything it and the `reuse fn` promise check (`E0127`)
@@ -3224,16 +3191,14 @@ of one package never read half of one; an entry that does not read is rebuilt
 and written over. They are swept with the stages, least recently used first, down to
 `PLY_C_CACHE_MAX`, never one used within the hour, and deleting them is always
 safe. `ply run --explain` says `reused` or `built`, the key, and what reading,
-the front end, filing into `.ply-cache` and the machine's load each took, on
+the front end and the machine's load each took, on
 stderr before the entry runs, or as `front_end` in the `--json` document.
 
 `ply check` takes its own answer back the same way. A check the front end
 answered whole is filed in `reused/` under the walk's key, the interface
 each registry dependency's slot holds, the paths its reports name, and the flags
 that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
-color). What the front-end cache said of itself (`W0601`, `W0602`, `W0603`,
-`W0605`) is left out of what is filed, since a check that does not read the cache
-has nothing to say about it. A later check whose key matches prints that answer
+color). A later check whose key matches prints that answer
 and exits with its code without running the front end, so a tree unchanged since
 its last check is answered in the time its walk takes. `--explain` always checks
 afresh, since what it reports is this run's. In the `--json` document,
@@ -3245,7 +3210,7 @@ written).
 `ply test` keeps its answer for the next run over the same command line, files
 and `ply`, in the test store beside its passes: the answer of a run that ran no
 test in scope or, for a green `--json` run, the one selecting again after it
-filed its passes gives, without what the front-end cache said of itself. A later run whose key matches answers with it
+filed its passes gives. A later run whose key matches answers with it
 without loading the program while every pass it took still stands and every
 shipped definition its program reached hashes as it did (§13); otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
@@ -3261,9 +3226,7 @@ which runs have work before starting them. `ply defs` keeps its listing the same
 way, beside every embed the program read, and a later listing over the same
 command line, files and `ply` takes it back while every shipped definition the
 program reached hashes as it did; its `--json` document then carries
-`front_end` with `reused` and `key`, and otherwise `reused` false beside the own
-modules the load read as their stubs (`stubbed`) and those it read whole again
-because what one references in a module read from its source moved (`restored`).
+`front_end` with `reused` and `key`, and otherwise `reused` false.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
@@ -3276,8 +3239,7 @@ A verdict is a function of the parser and the texts, so it is kept in the
 toolchain's cache (§8.6) under the hash of all the parser reaches, the texts and
 the toolchain, and a parser is entered again only for a text it has not read or
 after an edit to something it reaches; a check that touches no literal's parser
-enters nothing. A module that writes a tagged literal is read from its source
-by every check, never as its stub. A dependency's literals are its own run's
+enters nothing. A dependency's literals are its own run's
 to settle, as its tests are, and `compiler.load` settles none: there, as in any
 load nothing settled, a literal whose parser refuses it ends the run where it
 is read (`E0502`).
@@ -3288,8 +3250,7 @@ own budget: its value is kept in the toolchain's cache under the definition's
 hash and the toolchain, and a definition is entered again only after an edit to
 something it reaches or to a file it embeds. One that raises is entered by each
 load until it is mended, so its diagnostic names the place as the sources stand.
-A module that declares one is read as its stub like any other: the value is the
-definition's, wherever its body is read from. `compiler.load` evaluates none, and
+`compiler.load` evaluates none, and
 there a `const fn` is a definition that takes nothing, evaluated once a run.
 
 The same commands then check the statements the root package's modules run:
@@ -3300,8 +3261,7 @@ anything runs: text, joined by `++` or not, a call of a definition on such
 values, `sqlite::bound` of one, or a tagged literal. Each definition the
 statement is computed by is entered on a machine of its own under the literals'
 budget, and the schema the statement's module reaches with them (§3.5); one that
-raises leaves the statement to the run. A module that runs a statement is read
-from its source by every check, never as its stub. The statement is held to its
+raises leaves the statement to the run. The statement is held to its
 call:
 text the reader refuses is `E0431`, tables that do not include the table the
 label names `E0435`, a statement the operation does not perform (a write run as a
@@ -3536,7 +3496,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0602` | cache corrupt |
 | `W0603` | cache from another build |
 | `W0604` | obligation undecided at every tier |
-| `W0605` | a shipped module the load reads changed since the cache was written |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when their task or the entry point ended |

@@ -78,9 +78,9 @@ const DEFINITIONS: &str = "definitions";
 
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
-/// The runtime's side of what a store's groups are a function of beyond their own keys, as
-/// `name hex` lines: a front-end entry is the evaluator's, and a pass or a claim's evidence the
-/// whole runtime's. The program adds its own side to each, from the definitions it is told it has.
+/// The runtime's side of what kept answers are a function of beyond their own keys, as `name hex`
+/// lines: a query's answer is the evaluator's, and a pass or a claim's evidence the whole runtime's.
+/// The program adds its own side to each, from the definitions it is told it has.
 pub fn stamps() -> String {
     let stamp = |parts: &[&str]| {
         let mut h = blake3::Hasher::new();
@@ -91,8 +91,8 @@ pub fn stamps() -> String {
         h.finalize().to_hex().to_string()
     };
     format!(
-        "frontend {}\nruntime {}\n",
-        stamp(&["ply.stamp.frontend.4", ply_codegen::c::semantics_digest()]),
+        "evaluator {}\nruntime {}\n",
+        stamp(&["ply.stamp.evaluator.1", ply_codegen::c::semantics_digest()]),
         stamp(&["ply.stamp.runtime.4", RUNTIME_SOURCES])
     )
 }
