@@ -7,6 +7,7 @@
 import std.bytes
 import std.http
 import std.laws (inverse)
+import std.list (reverse)
 
 // --- The table --------------------------------------------------------------
 
@@ -614,7 +615,7 @@ fn table() -> List<Route<Endpoint>> / {abort.raise} =
     { method: http::Get, path: pattern_of_string("/files/{..rest}"), endpoint: Files },
   ]
 
-fn found(m: Matched<Endpoint>) -> Endpoint / {abort.raise} =
+fn found<a>(m: Matched<a>) -> a / {abort.raise} =
   match m {
     Found(hit) -> hit.endpoint,
     NotFound -> panic("expected a route to match"),
@@ -974,6 +975,217 @@ test "an encoded segment survives a round trip whatever it holds" {
   assert_eq(percent_decode(percent_encode("é ?#")), "é ?#");
   assert_eq(percent_encode("a/b"), "a%2Fb");
   assert_eq(len(split_path("/" ++ percent_encode("a/b/c"))), 1)
+}
+
+// --- Tests: adversarial paths -------------------------------------------------
+
+type Guarded = | Admin | Wild | Item | Slug | Posted | Deleted | Any | One
+
+fn guarded() -> List<Route<Guarded>> / {abort.raise} =
+  [
+    { method: http::Get, path: pattern_of_string("/admin"), endpoint: Admin },
+    { method: http::Get, path: pattern_of_string("/files/{..rest}"), endpoint: Wild },
+    { method: http::Get, path: pattern_of_string("/orders/{id:Int}"), endpoint: Item },
+    { method: http::Get, path: pattern_of_string("/orders/{slug}"), endpoint: Slug },
+    { method: http::Post, path: pattern_of_string("/orders/{slug}"), endpoint: Posted },
+    { method: http::Delete, path: pattern_of_string("/orders/{slug}"), endpoint: Deleted },
+  ]
+
+/// The same six routes written in the opposite order: a table is a value, so "the same table" is a
+/// claim a test can make.
+fn guarded_reversed() -> List<Route<Guarded>> / {abort.raise} = reverse(guarded())
+
+fn guarded_get(path: String) -> Matched<Guarded> / {abort.raise} = route(guarded(), http::Get, path)
+
+fn captured(m: Matched<Guarded>, name: String) -> String =
+  match m { Found(hit) -> param_or(hit.params, name, "<unbound>"), _ -> "<no match>" }
+
+test "a dot-dot segment never leaves the route it was matched against" {
+  assert_eq(path_segments("/public/../admin"), ["public", "..", "admin"]);
+  assert_eq(guarded_get("/public/../admin"), NotFound);
+  assert_eq(
+    guarded_get("/files/../admin"),
+    Found({ endpoint: Wild, params: map_of_entries([{ key: "rest", value: "../admin" }]) }),
+  );
+  assert_eq(found(guarded_get("/admin")), Admin)
+}
+
+test "an encoded dot is a dot and is still only a segment" {
+  assert_eq(path_segments("/public/%2e%2e/admin"), ["public", "..", "admin"]);
+  assert_eq(path_segments("/public/%2E%2E/admin"), ["public", "..", "admin"]);
+  assert_eq(guarded_get("/public/%2e%2e/admin"), NotFound);
+  assert_eq(captured(guarded_get("/files/%2e%2e/%2e%2e/etc/passwd"), "rest"), "../../etc/passwd")
+}
+
+test "decoding happens exactly once" {
+  assert_eq(path_segments("/a/%252e%252e/b"), ["a", "%2e%2e", "b"]);
+  assert_eq(percent_decode("%252F"), "%2F");
+  assert_eq(normalize_path("/a/%2e%2e/b"), "/b");
+  assert_eq(normalize_path("/a/%252e%252e/b"), "/a/%252e%252e/b")
+}
+
+test "an encoded separator is a byte inside one segment" {
+  assert_eq(path_segments("/files%2F..%2F..%2Fetc"), ["files/../../etc"]);
+  assert_eq(guarded_get("/files%2F..%2F..%2Fetc"), NotFound)
+}
+
+test "a null byte is a byte and matches no literal that lacks one" {
+  assert_eq(guarded_get("/admin%00"), NotFound);
+  assert_eq(len(path_segments("/admin%00")), 1);
+  assert_eq(captured(guarded_get("/orders/x%00"), "slug"), "x\0")
+}
+
+test "the reversed table answers every path the same way" {
+  assert_eq(conflicts(guarded()), []);
+  assert_eq(conflicts(guarded_reversed()), []);
+  assert_eq(well_formed(guarded()), []);
+  fold(
+    [
+      "/",
+      "/admin",
+      "/admin/",
+      "/ADMIN",
+      "/orders",
+      "/orders/",
+      "/orders/7",
+      "/orders/007",
+      "/orders/abc",
+      "/orders/7/lines",
+      "/files",
+      "/files/",
+      "/files/a/b",
+      "/files/a%2Fb",
+      "/a//b",
+      "/nowhere",
+      "",
+      "/orders/%2e%2e",
+    ],
+    (),
+    |_: Unit, p: String|
+      assert_eq(route(guarded(), http::Get, p), route(guarded_reversed(), http::Get, p)),
+  )
+}
+
+test "a method that matches beats one that only would have" {
+  let t = [
+    { method: http::Post, path: pattern_of_string("/p"), endpoint: Posted },
+    { method: http::Get, path: pattern_of_string("/p"), endpoint: Admin },
+  ];
+  assert_eq(found(route(t, http::Get, "/p")), Admin);
+  assert_eq(found(route(t, http::Post, "/p")), Posted)
+}
+
+test "a typed parameter that does not parse falls through rather than 404ing" {
+  assert_eq(found(guarded_get("/orders/7")), Item);
+  assert_eq(found(guarded_get("/orders/abc")), Slug);
+  assert_eq(found(guarded_get("/orders/007")), Slug);
+  assert_eq(found(guarded_get("/orders/")), Slug);
+  assert_eq(captured(guarded_get("/orders/"), "slug"), "")
+}
+
+test "a wildcard cannot reach outside its prefix" {
+  assert_eq(found(guarded_get("/files")), Wild);
+  assert_eq(found(guarded_get("/files/")), Wild);
+  assert_eq(captured(guarded_get("/files"), "rest"), "");
+  assert_eq(captured(guarded_get("/files/"), "rest"), "");
+  assert_eq(guarded_get("/file"), NotFound);
+  assert_eq(guarded_get("/filesx"), NotFound);
+  assert_eq(guarded_get("/x/files/a"), NotFound)
+}
+
+test "a wildcard written first shadows nothing that follows it" {
+  let t = [
+    { method: http::Get, path: pattern_of_string("/{..any}"), endpoint: Any },
+    { method: http::Get, path: pattern_of_string("/admin"), endpoint: Admin },
+    { method: http::Get, path: pattern_of_string("/{one}"), endpoint: One },
+  ];
+  assert_eq(found(route(t, http::Get, "/admin")), Admin);
+  assert_eq(found(route(t, http::Get, "/other")), One);
+  assert_eq(found(route(t, http::Get, "/a/b")), Any);
+  assert_eq(conflicts(t), [])
+}
+
+test "a route that can only ever lose is a reported conflict" {
+  let t = [
+    { method: http::Get, path: pattern_of_string("/x/{a}"), endpoint: Admin },
+    { method: http::Get, path: pattern_of_string("/x/{b}"), endpoint: Slug },
+  ];
+  assert_eq(found(route(t, http::Get, "/x/1")), Admin);
+  assert_eq(conflicts(t), [{ first: 0, second: 1 }])
+}
+
+test "a path no pattern matches is 404 and one no method matches is 405" {
+  assert_eq(route(guarded(), http::Put, "/nowhere"), NotFound);
+  assert_eq(
+    route(guarded(), http::Put, "/orders/abc"),
+    MethodNotAllowed([http::Delete, http::Get, http::Post]),
+  );
+  assert_eq(
+    route(guarded(), http::Put, "/orders/7"),
+    MethodNotAllowed([http::Delete, http::Get, http::Post]),
+  )
+}
+
+test "the Allow list does not depend on the order the table was written in" {
+  assert_eq(
+    route(guarded_reversed(), http::Put, "/orders/abc"),
+    route(guarded(), http::Put, "/orders/abc"),
+  );
+  assert_eq(allowed(guarded_reversed(), "/orders/abc"), allowed(guarded(), "/orders/abc"))
+}
+
+test "the Allow list is deduplicated across the routes that produced it" {
+  let t = [
+    { method: http::Get, path: pattern_of_string("/p/{a}"), endpoint: Slug },
+    { method: http::Get, path: pattern_of_string("/p/x"), endpoint: Admin },
+    { method: http::Get, path: pattern_of_string("/p/{..r}"), endpoint: Wild },
+    { method: http::Post, path: pattern_of_string("/p/x"), endpoint: Posted },
+  ];
+  assert_eq(route(t, http::Put, "/p/x"), MethodNotAllowed([http::Get, http::Post]))
+}
+
+test "an unrecognised method is routed and answered rather than refused" {
+  assert_eq(
+    route(guarded(), http::Other("BREW"), "/orders/abc"),
+    MethodNotAllowed([http::Delete, http::Get, http::Post]),
+  );
+  let t = [{ method: http::Other("BREW"), path: pattern_of_string("/coffee"), endpoint: Admin }];
+  assert_eq(found(route(t, http::Other("BREW"), "/coffee")), Admin);
+  assert_eq(route(t, http::Get, "/coffee"), MethodNotAllowed([http::Other("BREW")]))
+}
+
+test "a method is matched byte-exactly, so a lowercase token is another method" {
+  assert_eq(route(guarded(), http::Other("get"), "/admin"), MethodNotAllowed([http::Get]));
+  assert_eq(guarded_get("/ADMIN"), NotFound);
+  assert_eq(guarded_get("/Admin"), NotFound)
+}
+
+test "empty segments are kept and a trailing slash is another path" {
+  assert_eq(path_segments("/"), [""]);
+  assert_eq(path_segments("/a//b"), ["a", "", "b"]);
+  assert_eq(path_segments("/admin/"), ["admin", ""]);
+  assert_eq(guarded_get("/admin/"), NotFound);
+  assert_eq(guarded_get("//admin"), NotFound);
+  assert_eq(guarded_get("/"), NotFound)
+}
+
+test "a query string a caller failed to strip does not match" {
+  assert_eq(path_segments("/admin?x=1"), ["admin?x=1"]);
+  assert_eq(guarded_get("/admin?x=1"), NotFound)
+}
+
+test "an invalid escape is text rather than a refusal" {
+  assert_eq(percent_decode("%zz"), "%zz");
+  assert_eq(percent_decode("%4"), "%4");
+  assert_eq(percent_decode("%"), "%");
+  assert_eq(captured(guarded_get("/orders/%zz"), "slug"), "%zz")
+}
+
+test "a path with two thousand segments is answered" {
+  let deep = fold(range(0, 2000), "", |acc: String, _: Int| acc ++ "/a");
+  assert_eq(len(path_segments(deep)), 2000);
+  assert_eq(route(guarded(), http::Get, deep), NotFound);
+  assert_eq(string_len(captured(route(guarded(), http::Get, "/files" ++ deep), "rest")), 3999)
 }
 
 // --- Tests: the cost property -----------------------------------------------
