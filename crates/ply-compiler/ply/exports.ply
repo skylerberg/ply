@@ -17,7 +17,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               Derived, parse, is_written, item_span, import_decl_bin)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span)
-import hash (Fixed, NodeRef, Index, HashOutput, fixed_nodes, fixed_bin)
+import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
+             hashed_forms, fixed_bin)
 import resolve (Source, ParsedModule, Diag, Label)
 import diagnostics (ParsedSource, parse_at)
 import derive (dotted, runtime_module)
@@ -340,7 +341,7 @@ fn generated_by_owner(
 }
 
 /// A node's qualified name as the module that declares it and the name it declares.
-fn named_node(name: Bytes) -> Mention / {abort.raise} = {
+pub fn named_node(name: Bytes) -> Mention / {abort.raise} = {
   let k = fold(range(0, bytes_len(name)), 0 - 1, |acc: Int, i: Int|
     if bytes_at(name, i) == 46 { i } else { acc });
   if k < 0 { { module: b"", name: name } }
@@ -511,19 +512,27 @@ pub fn exports_of(
 /// What hashing `index` and `hashes` fixed of the module at `i`, written as `text`, by owner.
 pub fn hashes_of(index: Index, hashes: HashOutput, i: Int, text: Bytes) -> Hashes / {abort.raise} = {
   let parsed = at(index.mods, i);
-  let module = parsed.name;
-  let raw = parse(text).node;
-  let fns = fn_owners(raw, parsed);
+  hashes_by_owner(
+    parsed.name,
+    fixed_nodes(index, hashes, map_insert(map_new(), parsed.name, true)),
+    fn_owners(parse(text).node, parsed),
+  )
+}
+
+/// `fixed`, what hashing fixed of the nodes of `module`, by owner, a function's as `fns` names it,
+/// each without its stored body.
+pub fn hashes_by_owner(
+  module: Bytes,
+  fixed: List<Fixed>,
+  fns: Map<Bytes, Bytes>,
+) -> Hashes / {abort.raise} = {
   let fn_owner = |name: Bytes|
     match map_get(fns, simple_of(module, name)) { Some(o) -> o, None -> b"" };
-  let fixed = grouped(
-    map(fixed_nodes(index, hashes, map_insert(map_new(), module, true)), |f: Fixed|
-      { ..f, body: b"" }),
-    |f: Fixed| if f.decl { simple_of(module, f.name) } else { fn_owner(f.name) },
-  );
+  let owned = grouped(map(fixed, |f: Fixed| { ..f, body: b"" }), |f: Fixed|
+    if f.decl { simple_of(module, f.name) } else { fn_owner(f.name) });
   {
     module: module,
-    entries: map_fold(fixed, map_new(), |acc: Map<Bytes, HashEntry>, o: Bytes, fs: List<Fixed>|
+    entries: map_fold(owned, map_new(), |acc: Map<Bytes, HashEntry>, o: Bytes, fs: List<Fixed>|
       map_insert(acc, o, {
         owner: o,
         fixed: fs,
@@ -537,6 +546,14 @@ pub fn hashes_of(index: Index, hashes: HashOutput, i: Int, text: Bytes) -> Hashe
       })),
   }
 }
+
+/// Whom a module written as `raw` and read as `parsed` files what hashing fixes of it under: each
+/// function's owner by its simple name, and each owner of each name it declares.
+pub fn hash_owners(
+  raw: Module,
+  parsed: ParsedModule,
+) -> { fns: Map<Bytes, Bytes>, owners: Map<Bytes, List<Bytes>> } =
+  { fns: fn_owners(raw, parsed), owners: owners_in(raw, parsed) }
 
 /// What `parsed`, written as `text` and parsed alone as `raw`, reads of the modules it imports, each
 /// of which `targets` names: every name it says through them, in its own text and in what its
@@ -623,62 +640,6 @@ pub fn needed_by<| e>(
         },
       },
   )
-
-/// [`needed_by`] for a module's hashing: each entry `entries` answers, beside what `hashes` answers
-/// hashing fixed of it under the same name, and every entry either mentions, the effects whose
-/// numbering a fixed hash names among them.
-pub fn hashed_needed<| e>(
-  entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
-  hashes: (Bytes, Bytes) -> List<HashEntry> / {abort.raise | e},
-  wanted: List<Mention>,
-  imported: List<Bytes>,
-) -> { deps: Map<Bytes, Map<Bytes, Entry>>, hashed: Map<Bytes, Map<Bytes, HashEntry>> } / {abort.raise | e} =
-  iterate(
-    {
-      deps: fold(imported, map_new(), |acc: Map<Bytes, Map<Bytes, Entry>>, m: Bytes|
-        map_insert(acc, m, map_new())),
-      hashed: map_new(),
-      asked: map_new(),
-      work: wanted,
-    },
-    1000000,
-    |s: { deps: Map<Bytes, Map<Bytes, Entry>>, hashed: Map<Bytes, Map<Bytes, HashEntry>>, asked: Map<Bytes, Bool>, work: List<Mention> }|
-      match s.work {
-        [] -> Stop({ deps: s.deps, hashed: s.hashed }),
-        [m, ..rest] -> if map_contains(s.asked, mention_key(m)) { Continue({ ..s, work: rest }) }
-        else {
-          let have = match map_get(s.deps, m.module) { Some(h) -> h, None -> map_new() };
-          let held = match map_get(s.hashed, m.module) { Some(h) -> h, None -> map_new() };
-          let fresh = filter(entries(m.module, m.name), |e: Entry| !map_contains(have, e.owner));
-          let fixed = filter(hashes(m.module, m.name), |e: HashEntry| !map_contains(held, e.owner));
-          Continue({
-            deps: map_insert(
-              s.deps,
-              m.module,
-              fold(fresh, have, |h: Map<Bytes, Entry>, e: Entry| map_insert(h, e.owner, e)),
-            ),
-            hashed: map_insert(
-              s.hashed,
-              m.module,
-              fold(fixed, held, |h: Map<Bytes, HashEntry>, e: HashEntry| map_insert(h, e.owner, e)),
-            ),
-            asked: map_insert(s.asked, mention_key(m), true),
-            work: fold(
-              fixed,
-              fold(fresh, rest, |w: List<Mention>, e: Entry| concat(w, e.mentions)),
-              |w: List<Mention>, e: HashEntry| concat(w, e.mentions),
-            ),
-          })
-        },
-      },
-  )
-
-/// Each name the module at `i` of `index`, written as `text`, declares, under every owner of it.
-pub fn owners_of_module(
-  index: Index,
-  i: Int,
-  text: Bytes,
-) -> Map<Bytes, List<Bytes>> / {abort.raise} = owners_in(parse(text).node, at(index.mods, i))
 
 /// The entries `x` holds under `name`, or under every name for none.
 pub fn entries_under(x: Exports, name: Bytes) -> List<Entry> =
@@ -876,22 +837,6 @@ pub fn checked_against(
   { pulled: checked_staged(s.staged, rows, []), at: s.at }
 }
 
-/// `source` read and hashed as `checked_against` checks it, each node of what it imports fixed as
-/// `hashed` says hashing fixed it: what every definition of it hashes to, with nothing checked.
-pub fn hashed_against(
-  source: Source,
-  placed: Placed,
-  deps: Map<Bytes, Map<Bytes, Entry>>,
-  hashed: Map<Bytes, Map<Bytes, HashEntry>>,
-  placing: (Bytes) -> Placed / {abort.raise},
-  reading: Reading,
-) -> { hashed: Result<Hashed, List<Diag>>, at: Int } / {abort.raise} = {
-  let fixed = map_fold(hashed, [], |acc: List<Fixed>, _: Bytes, es: Map<Bytes, HashEntry>|
-    map_fold(es, acc, |a: List<Fixed>, _: Bytes, e: HashEntry| concat(a, e.fixed)));
-  let s = staged_against(source, placed, deps, fixed, placing, reading);
-  { hashed: s.staged.hashed, at: s.at }
-}
-
 // --- Tests ----------------------------------------------------------------------------------
 
 fn outcome(p: Pulled) -> Analysis / {abort.raise} =
@@ -930,31 +875,25 @@ fn agreed(w: Analysis, module: Bytes) -> Agreed / {abort.raise} = {
   }
 }
 
-/// What another hashing must agree on of a module: the hash of each definition and test.
-type HashedAs = { defs: List<{ name: Bytes, hash: Bytes }>, tests: List<Bytes> }
-
-fn hashed_as(index: Index, hashes: HashOutput, module: Bytes) -> HashedAs / {abort.raise} =
-  {
-    defs: filter(hashes.defs, |d: { name: Bytes, hash: Bytes }| of_module(module, d.name)),
-    tests: fold(range(0, len(index.tests)), [], |acc: List<Bytes>, k: Int|
-      if at(index.mods, at(index.tests, k).module).name == module {
-        push(acc, match list_at(hashes.tests, k) { Some(h) -> h, None -> b"" })
-      } else { acc }),
-  }
-
-/// Each module of `sources`, each in the root package, checked and hashed against the entries it
-/// reads, beside `whole`'s check of them all.
+/// Each module of `sources`, each in the root package, checked against the entries it reads and
+/// hashed from its forms and what hashing fixed of the modules it imports, beside `whole`'s check
+/// and hashing of them all.
 fn per_module(
   whole: Analysis,
   sources: List<Source>,
-) -> List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: HashedAs, rehashed: HashedAs }> / {abort.raise} = {
+) -> List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }> / {abort.raise} = {
   let texts = fold(sources, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let text_at = |i: Int| match map_get(texts, at(whole.mods, i).name) { Some(t) -> t, None -> b"" };
   let exports = fold(range(0, len(whole.mods)), map_new(), |acc: Map<Bytes, Exports>, i: Int|
     map_insert(acc, at(whole.mods, i).name, exports_of(whole, i, text_at(i))));
-  let hashed = fold(range(0, len(whole.mods)), map_new(), |acc: Map<Bytes, Hashes>, i: Int|
-    map_insert(acc, at(whole.mods, i).name, hashes_of(whole.index, whole.hashes, i, text_at(i))));
+  let fixed_of = |keep: (Bytes) -> Bool|
+    fixing_of(
+      whole.index,
+      whole.hashes,
+      fold(whole.mods, map_new(), |acc: Map<Bytes, Bool>, m: ParsedModule|
+        if keep(m.name) { map_insert(acc, m.name, true) } else { acc }),
+    );
   let reading = {
     pkgs: { root: b"", manifest: None, supplied: [] },
     whole: [],
@@ -968,7 +907,7 @@ fn per_module(
   fold(
     range(0, len(whole.mods)),
     [],
-    |acc: List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: HashedAs, rehashed: HashedAs }>, i: Int| {
+    |acc: List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }>, i: Int| {
       let name = at(whole.mods, i).name;
       if !map_contains(texts, name) { acc } else {
         let deps = needed_by(
@@ -976,39 +915,22 @@ fn per_module(
           wanted_of(whole, i, text_at(i)),
           import_targets(whole, i),
         );
-        let fixes = map_fold(
-          deps,
-          map_new(),
-          |out: Map<Bytes, Map<Bytes, HashEntry>>, m: Bytes, es: Map<Bytes, Entry>|
-            match map_get(hashed, m) {
-              None -> out,
-              Some(h) ->
-                map_insert(
-                  out,
-                  m,
-                  map_fold(es, map_new(), |o: Map<Bytes, HashEntry>, owner: Bytes, _: Entry|
-                    match map_get(h.entries, owner) {
-                      Some(e) -> map_insert(o, owner, e),
-                      None -> o,
-                    }),
-                ),
-            },
-        );
         let source = { name: name, src: text_at(i) };
         let apart = match checked_against(source, InRoot, deps, placing, reading).pulled.out {
           Refused(ds) -> refused_apart(name, "checks", ds),
           Analysed(w) -> w,
         };
-        let rehashed = match hashed_against(source, InRoot, deps, fixes, placing, reading).hashed {
-          Err(ds) -> refused_apart(name, "hashes", ds),
-          Ok(h) -> h,
-        };
+        let at_apart = fold(range(0, len(apart.mods)), 0, |k: Int, j: Int|
+          if at(apart.mods, j).name == name { j } else { k });
         push(acc, {
           module: name,
           whole: agreed(whole, name),
           apart: agreed(apart, name),
-          hashed: hashed_as(whole.index, whole.hashes, name),
-          rehashed: hashed_as(rehashed.index, rehashed.hashes, name),
+          hashed: fixed_of(|m: Bytes| m == name),
+          rehashed: hashed_forms(
+            module_forms(apart.index, apart.module_packages, at_apart),
+            fixed_of(|m: Bytes| m != name).nodes,
+          ),
         })
       }
     },
@@ -1035,14 +957,14 @@ test "each module checked and hashed against the entries it reads of its imports
   assert_eq(
     map(
       found,
-      |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: HashedAs, rehashed: HashedAs }|
+      |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }|
         f.module,
     ),
     [b"core", b"shop"],
   );
   for_all(
     found,
-    |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: HashedAs, rehashed: HashedAs }| {
+    |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }| {
       assert_eq(f.apart, f.whole);
       assert_eq(f.rehashed, f.hashed)
     },
