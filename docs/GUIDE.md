@@ -2195,7 +2195,7 @@ rather than raised.
 | `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
 | `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimisation flag, overriding the profile's |
 | `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each module's walks, kept under its text, its bodies' own forms and what its check read, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default under the temp directory) |
-| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; the front-end answers `ply run` files (§16); and, when the binary's `ply` program is behind its sources, the one a builder made of them and the memo store its next build checks its modules through (default under the temp directory) |
+| `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; and, when the binary's `ply` program is behind its sources, the one a builder made of them and the memo store its next build checks its modules through (default under the temp directory) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, a stage never within an hour of its last use; `0` is no cap |
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
@@ -3188,61 +3188,51 @@ the program's own modules afresh and keep nothing, and neither does `compiler.lo
 each still takes what the binary carries answered for the shipped modules. A memo
 store that will not read is a cold check, never a failure.
 
-`ply run` over sources goes further: once a load holds, the front end's answer
-is filed under a key of everything the walk read — the name and bytes of every
-module, the root's manifest, each dependency's key, manifest and modules, the
-root's absolute path, the `ply` program and the modules it ships as the launcher
-gates them, the binary's version, and `--config-schema` — beside each file its
-modules embedded and what was read for it. A later run whose walk hashes the
-same, and whose embeds each read as they did, takes that answer and runs neither
-the front end nor the promise check, which the filed load passed; it binds,
+A command's answer is kept in the memo store too, as a record whose reads are
+what its load asked — each module's answers, by the digest of what they answered
+— beside the walk (each module's path and name, and what it refused) and what
+each registry dependency's slot holds. It is filed under what names the `ply`
+program and runtime that answered and what names the command: its line, each
+path it was given as it resolved, and the flags that shape its answer. Like any
+record it is marked when something it read moves, so a later run over a tree
+where nothing moved takes the answer back after looking over the store, without
+loading the program; where something moved, a run whose reads each answer as
+they did — an edit that moved no module's answer — takes it back as well.
+
+`ply run` over sources keeps its front end's answer so, once the load holds,
+keyed by its paths and `--config-schema`: a run that takes it back runs neither
+the front end nor the promise check, which the kept load passed; it binds,
 grants (`--allow`, `--exec`, `--fs`) and picks its entry anew, and reports
-exactly what a run that built the answer reports. Any edit to a module, a
-dependency or a manifest, another schema or another `ply` is a new key, and the
-front end runs again; `ply.lock` is not read by a run and is not in the key. A
-single `.ply` file keys that one module. The answers live under the stage root
-(`PLY_C_STAGE`, §8.6) in `reused/`, one file per key, each written beside itself
-and renamed into place, so two runs of one package never read half of one; an
-entry that does not read is rebuilt and written over. They are swept with the
-stages, least recently used first, down to `PLY_C_CACHE_MAX`, never one used
-within the hour, and deleting them is always safe. `ply run --explain` says
+exactly what a run that built the answer reports. `ply run --explain` says
 `reused` or `built`, the key, and what reading, the front end and the machine's
 load each took, on stderr before the entry runs, or as `front_end` in the
 `--json` document.
 
-`ply check` takes its own answer back the same way. A check the front end
-answered whole is filed in `reused/`, beside the embeds its load read, under the
-walk's key, the interface each registry dependency's slot holds, the paths its
-reports name, and the flags that shape what it prints (`--types`, `--costs`,
-`--json`, `--verify-deps`, color). A later check whose key matches prints that
-answer and exits with its code without running the front end, so a tree
-unchanged since its last check is answered in the time its walk takes.
+`ply check` keeps its answer so, keyed by its paths, its root and the flags
+that shape what it prints (`--types`, `--costs`, `--json`, `--verify-deps`,
+color), and a check that takes it back prints it and exits with its code.
 `--explain` always checks afresh, since what it reports is this run's. In the
 `--json` document, `front_end` carries `reused` and `key`: alone for an answer
 taken back, and beside the phases of a check that ran, with `filed`, whether the
-next check can take its answer back (false for a refused load, or when the entry
-could not be written).
+next check can take its answer back (false for a refused load). `ply defs` keeps
+its listing so, keyed by its command line; its `--json` document then carries
+`front_end` with `reused` and `key`, and otherwise `reused` false.
 
-`ply test` keeps its answer for the next run over the same command line, files
-and `ply`, in the test store beside its passes: the answer of a run that ran no
-test in scope or, for a green `--json` run, the one selecting again after it
-filed its passes gives. A later run whose key matches answers with it
-without loading the program while every pass it took still stands and every
-shipped definition its program reached hashes as it did (§13); otherwise it
+`ply test` keeps its answer so too, keyed by its command line: the answer of a
+run that ran no test in scope or, for a green `--json` run, the one selecting
+again after it filed its passes gives. A later run takes it back without loading
+the program while every pass it took is still in the test store; otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read. A `--json` run of several
 `--filter`s also keeps, for each, the answer a run of it alone gives. `--kept`
-answers only from what was kept: where no kept answer of the whole command line
-stands, a run of several filters asks each what a run of it alone kept, exits 0
-where every one is answered and otherwise lists the rest under `unanswered`;
-exit 4 is a run nothing kept answers, with nothing loaded, so a caller can tell
-which runs have work before starting them. `ply defs` keeps its listing the same
-way, beside every embed the program read, and a later listing over the same
-command line, files and `ply` takes it back while every shipped definition the
-program reached hashes as it did; its `--json` document then carries
-`front_end` with `reused` and `key`, and otherwise `reused` false.
+answers only from what was kept, and only from an answer no mark is on, so it
+asks nothing again: where no kept answer of the whole command line stands, a run
+of several filters asks each what a run of it alone kept, exits 0 where every
+one is answered and otherwise lists the rest under `unanswered`; exit 4 is a run
+nothing kept answers, with nothing loaded, so a caller can tell which runs have
+work before starting them.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
