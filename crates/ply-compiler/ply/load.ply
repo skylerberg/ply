@@ -7,7 +7,8 @@
 
 import front (Dump, EmitterRoot, Embedded, AnalysisOutcome, Analysed, Refused, Rows, Shipping,
               ShippedView, analyse_pulling_std_with, checked_staged, dump_of, embeds_wanted,
-              module_of, pulls_of, shipped_pulled, staged_pulling_std_with, viewed_text)
+              module_of, pulls_of, shipped_pulled, staged_pulling_std_with, viewed_text,
+              ModuleFacts, answered_load, view_dump)
 import embed (EmbedAt, EmbedRead, EmbedFile)
 import hash (HashOutput, Fixing, no_fixing, hex)
 import interface (imported)
@@ -397,12 +398,12 @@ fn asked(
   p: Prepared,
   run: Run,
 ) -> { run: Run, value: Asked } / {memo_keep.read, memo_keep.write, abort.raise} = {
-  let all = asked_all(qs, w.own, shipped_of(p), run);
+  let all = asked_all(qs, w.own, shipped_of(p), false, run);
   // A program some module refuses has nothing to hash.
   if len(refused_first(all.value)) > 0 {
     { run: all.run, value: { answers: all.value, fixing: no_fixing() } }
   } else {
-    let fixed = hashed_all(qs, w.own, all.run);
+    let fixed = hashed_all(qs, w.own, shipped_of(p), false, all.run);
     { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
   }
 }
@@ -467,9 +468,8 @@ fn refusals(answers: List<Answered>, files: List<SourceFile>) -> List<Diag> / {a
   })
 }
 
-/// The program `p` analysed whole, each definition and test taken as its module's answer in `asked`
-/// published and hashed it, or what refuses it. `tested` reads its tests and laws, which a program
-/// to ship has none of.
+/// The program `p` as its modules' answers in `asked` say it checked and hashed, or what refuses it.
+/// `tested` reads its tests and laws, which a program to ship has none of.
 pub fn assembled(
   p: Prepared,
   asked: Asked,
@@ -483,42 +483,38 @@ pub fn assembled(
     p.pkgs,
     map(p.own.files, |f: SourceFile| bytes_of_string(f.name)),
     modules,
+    concat(shipped_of(p), p.shipping.unread),
   );
   match if len(packaged) > 0 { packaged } else { refusals(answers, mine) } {
     [] -> {
-      let staged = staged_pulling_std_with(
-        sources_of(p.own.files),
-        p.shipping.read,
+      let loaded = answered_load(
+        map(p.own.files, |f: SourceFile| bytes_of_string(f.name)),
         p.pkgs,
+        fold(answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
+          map_insert(acc, a.module, a.answer.facts)),
         asked.fixing,
-        embeds: p.embeds,
-        tested: tested,
-        unread: p.shipping.unread,
-        data: p.shipping.data,
-        pulls: p.shipping.pulls,
+        p.shipping.read,
+        p.shipping.unread,
+        [],
+        tested,
+        true,
+        root_warnings(answers, len(p.own.files)),
       );
-      tell_viewed(staged.viewed, true);
-      let files = placed(p.own, p.deps, staged.pulled, texts_of(p.shipping.read));
-      let rows = fold(answers, { defs: [], tests: [] }, |acc: Rows, a: Answered|
-        {
-          defs: concat(acc.defs, a.answer.rows.defs),
-          tests: concat(acc.tests, a.answer.rows.tests),
-        });
-      match checked_staged(staged, rows.defs, rows.tests).out {
-        Refused(diags) -> Err({ diags: diags, files: files }),
-        Analysed(w) ->
-          Ok({
-            front: {
-              dump: dump_of(Analysed({ ..w, warnings: root_warnings(answers, len(p.own.files)) })),
-              files: files,
-              read_ms: 0,
-              front_ms: 0,
-              file_ms: 0,
-              cached: false,
-            },
-            hashes: w.hashes,
-          }),
-      }
+      let program = loaded.program;
+      let pulled = loaded.pulled;
+      let texts = texts_of(p.shipping.read);
+      tell_viewed(program.views, true);
+      Ok({
+        front: {
+          dump: view_dump(program.view, None),
+          files: placed(p.own, p.deps, pulled, texts),
+          read_ms: 0,
+          front_ms: 0,
+          file_ms: 0,
+          cached: false,
+        },
+        hashes: program.view.hashes,
+      })
     },
     ds -> Err({ diags: ds, files: mine }),
   }
@@ -632,6 +628,7 @@ fn listed_queries() -> Bytes / {abort.raise} =
 /// `load` over a tree held in memory, with no shipped modules.
 fn loaded_from(
   files: List<{ path: String, body: Bytes }>,
+  names: List<String> = [],
 ) -> Result<Loaded, List<Diag>> / {abort.raise} = {
   let tree = fs::mem_of(files);
   handle {
@@ -640,7 +637,7 @@ fn loaded_from(
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
     fs.kind[t](path) -> fs::mem_kind(tree, path),
     fs.read_file[t](path) -> fs::mem_read(tree, path),
-    shipped.names() -> [],
+    shipped.names() -> names,
     shipped.module(name) -> None,
     shipped.reached(view, pulled) -> (),
     shipped.runtime() -> no_runtime(),
@@ -801,4 +798,23 @@ test "a root with nothing to load, and a file that cannot be a module, are refus
 test "a program that does not check is refused with what the checker said" {
   let said = codes(loaded_from([{ path: "p/m.ply", body: b"fn main() -> Int = \"one\"\n" }]));
   assert(len(said) > 0 && len(filter(said, |c: Bytes| c == b"E0502")) == 0)
+}
+
+test "a root module that claims a built-in package's prefix is refused, the bare root among them" {
+  fold(
+    ["p/std.ply", "p/std/json.ply", "p/compiler.ply", "p/compiler/front.ply"],
+    (),
+    |u: Unit, path: String|
+      assert(
+        contains(
+          codes(loaded_from([{ path: path, body: b"pub fn f() -> Int = 1\n" }], ["std.list"])),
+          b"E0133",
+        ),
+        Some(path),
+      ),
+  );
+  assert_eq(
+    codes(loaded_from([{ path: "p/stdx.ply", body: b"pub fn f() -> Int = 1\n" }], ["std.list"])),
+    [],
+  )
 }

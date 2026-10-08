@@ -2056,6 +2056,10 @@ pub type Refs = {
   /// By the key of each test over cases, where one of its cases starts: what its hash is taken
   /// over, which leaves out its table and its label.
   cases: Map<Bytes, List<Int>>,
+  /// By node, what its specification clauses reference, which is read with it.
+  clauses: List<List<Int>>,
+  /// By the key of each test over cases, what listing its cases references: its table and label.
+  listings: Map<Bytes, List<Int>>,
 }
 
 /// What hashing no program answers.
@@ -2093,6 +2097,8 @@ pub fn no_refs() -> Refs =
     declared: map_new(),
     items: map_new(),
     cases: map_new(),
+    clauses: [],
+    listings: map_new(),
   }
 
 /// `deps` is a list in entry order; the map indexes it, or recording is quadratic.
@@ -2182,7 +2188,7 @@ pub type ClauseForm = { kind: Int, pieces: List<Piece> }
 
 /// A test or a law normalized, and what a test over cases references besides: its table, its label
 /// and what one case runs.
-pub type ItemForm = { pieces: List<Piece>, listed: List<Int> }
+pub type ItemForm = { pieces: List<Piece>, listed: List<Int>, listing: List<Int> }
 
 pub type ItemShape = { key: Bytes, form: Option<ItemForm> }
 
@@ -2376,6 +2382,8 @@ type Hashed = {
   checks: Map<Int, Bytes>,
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
   enumerations: List<List<Int>>,
+  clauses: List<List<Int>>,
+  test_listings: List<List<Int>>,
 }
 
 /// Each test's hash, stored body, own form and references, in the index's order.
@@ -2385,6 +2393,7 @@ type TestHashes = {
   texts: List<Bytes>,
   refs: List<List<Int>>,
   runs: List<List<Int>>,
+  listings: List<List<Int>>,
 }
 
 /// `hashes` is the table references are written from; `fresh` is what each body hashed to under it.
@@ -2434,10 +2443,18 @@ fn test_form(index: Index, t: TestNode) -> ItemForm / {abort.raise} =
   {
     pieces: template_of(index, t.module, |encoder: Encoder| test_def(encoder, t.def)),
     listed: listed_refs(index, t),
+    listing: match t.def.cases {
+      Some(c) -> refs_of(index, t.module, |encoder: Encoder| expr(encoder, test_listing(c))),
+      None -> [],
+    },
   }
 
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
-  { pieces: template_of(index, l.module, |encoder: Encoder| law_def(encoder, l.def)), listed: [] }
+  {
+    pieces: template_of(index, l.module, |encoder: Encoder| law_def(encoder, l.def)),
+    listed: [],
+    listing: [],
+  }
 
 type Shaped = { shapes: Shapes, first: List<Finished> }
 
@@ -2637,7 +2654,7 @@ fn hashed_whole(
     match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
   let shaped = shapes_of(index, packages, fixed_edges(index, fixing.nodes), fixing);
   let out = hashed_over(shaped.shapes, shaped.first, held, fixing);
-  { hashes: assemble(index, out.graph.edges, out.hashed), first: shaped.first }
+  { hashes: assemble(skeleton_of(index), out.graph.edges, out.hashed), first: shaped.first }
 }
 
 pub fn hash_index(index: Index) -> HashOutput / {abort.raise} =
@@ -2663,6 +2680,8 @@ pub type Fixed = {
   edges: List<NodeRef>,
   /// The effects its component sees, in the order that numbers them, which its body decides.
   effects: List<NodeRef>,
+  /// What its specification clauses reference.
+  clauses: List<NodeRef>,
 }
 
 /// What hashing derives from a test: its hash, stored body and own form, what it references and,
@@ -2674,6 +2693,8 @@ pub type FixedTest = {
   text: Bytes,
   refs: List<NodeRef>,
   runs: List<NodeRef>,
+  /// Over cases, what listing them references.
+  listing: List<NodeRef>,
 }
 
 /// What hashing derives from a law: its hash, its sentence's and what it references.
@@ -2788,7 +2809,7 @@ fn hashed_over(
     });
   let tests = fold(
     shapes.tests,
-    { hashes: [], bodies: [], texts: [], refs: [], runs: [] },
+    { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [] },
     |acc: TestHashes, t: ItemShape|
       match t.form {
         None -> match map_get(held_tests, t.key) {
@@ -2799,6 +2820,7 @@ fn hashed_over(
               texts: push(acc.texts, x.text),
               refs: push(acc.refs, present(x.refs)),
               runs: push(acc.runs, present(x.runs)),
+              listings: push(acc.listings, present(x.listing)),
             },
           None -> panic("a test read as fixed is not fixed"),
         },
@@ -2815,6 +2837,7 @@ fn hashed_over(
               fold(form.listed, f.refs, |rs: List<Int>, r: Int| push_unique(rs, r)),
             ),
             runs: push(acc.runs, f.refs),
+            listings: push(acc.listings, form.listing),
           }
         },
       },
@@ -2886,6 +2909,14 @@ fn hashed_over(
         let ci = at(g.scc.component_of, v);
         if ci < 0 { [] } else { at(g.scc.orders, ci) }
       }),
+      clauses: map(range(0, len(shapes.nodes)), |v: Int|
+        match at(shapes.nodes, v).form {
+          Some(form) ->
+            fold(form.clauses, [], |acc: List<Int>, c: ClauseForm|
+              concat(acc, filled(c.pieces, blank()).refs)),
+          None -> match map_get(held, v) { Some(f) -> present(f.clauses), None -> [] },
+        }),
+      test_listings: tests.listings,
     },
   }
 }
@@ -3187,7 +3218,7 @@ pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / 
   let test_forms = map(tests, |t: TestNode| test_form(index, t));
   let law_forms = map(laws, |l: LawNode| law_form(index, l));
   let item_nodes = |acc: Taken, x: ItemForm|
-    fold(x.listed, piece_nodes(x.pieces, acc), |a: Taken, v: Int| taken(a, v));
+    fold(concat(x.listed, x.listing), piece_nodes(x.pieces, acc), |a: Taken, v: Int| taken(a, v));
   let table = fold(
     law_forms,
     fold(
@@ -3207,6 +3238,7 @@ pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / 
     {
       pieces: renumbered(x.pieces, ids),
       listed: map(x.listed, |v: Int| match map_get(ids, v) { Some(k) -> k, None -> v }),
+      listing: map(x.listing, |v: Int| match map_get(ids, v) { Some(k) -> k, None -> v }),
     };
   {
     nodes: map(range(0, len(table.order)), |k: Int| {
@@ -3319,6 +3351,7 @@ pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise}
         body: match map_get(h.bodies, v) { Some(b) -> b, None -> b"" },
         edges: refs(at(out.graph.edges, v)),
         effects: refs(at(h.enumerations, v)),
+        clauses: refs(at(h.clauses, v)),
       }
     }),
     tests: map(range(0, len(forms.tests)), |i: Int|
@@ -3329,6 +3362,7 @@ pub fn hashed_forms(forms: Shapes, fixed: List<Fixed>) -> Fixing / {abort.raise}
         text: at(h.test_texts, i),
         refs: refs(at(h.test_refs, i)),
         runs: refs(at(h.test_runs, i)),
+        listing: refs(at(h.test_listings, i)),
       }),
     laws: map(range(0, len(forms.laws)), |i: Int|
       {
@@ -3426,6 +3460,10 @@ pub fn fixed_nodes(
                   Some(es) -> es,
                   None -> [],
                 }),
+                clauses: node_refs(match list_at(hashes.refs.clauses, v) {
+                  Some(cs) -> cs,
+                  None -> [],
+                }),
               }),
             }
           }
@@ -3457,6 +3495,7 @@ pub fn fixing_of(
           text: at(hashes.test_texts, i),
           refs: refs(at(hashes.test_refs, i)),
           runs: refs(at(hashes.test_runs, i)),
+          listing: refs(match map_get(hashes.refs.listings, t.key) { Some(xs) -> xs, None -> [] }),
         })
       }
     }),
@@ -3529,24 +3568,38 @@ pub fn rehash_index(index: Index, pins: List<Pin>) -> Rehashed / {abort.raise} =
 fn started(m: Map<Bytes, List<Int>>, key: Bytes, vs: List<Int>) -> Map<Bytes, List<Int>> =
   map_insert(m, key, concat(match map_get(m, key) { Some(xs) -> xs, None -> [] }, vs))
 
-fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {abort.raise} = {
-  let fns = fold(range(0, len(index.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
-    let node = at(index.nodes, v);
-    if is_decl(node) { acc } else { map_insert(acc, node.name, v) }
+/// What a program's hash tables are laid out over: each node by its name and whether it is a
+/// declaration, its definitions, tests and laws in the order it lists them, each test by its key and
+/// whether it is over cases, and each law by its key.
+pub type Skeleton = {
+  nodes: List<NodeRef>,
+  order: List<IndexEntry>,
+  tests: List<{ key: Bytes, cases: Bool }>,
+  laws: List<Bytes>,
+}
+
+fn skeleton_of(index: Index) -> Skeleton =
+  {
+    nodes: map(index.nodes, |node: Node| { name: node.name, decl: is_decl(node) }),
+    order: index.order,
+    tests: map(index.tests, |t: TestNode| { key: t.key, cases: t.def.cases != None }),
+    laws: map(index.laws, |l: LawNode| l.key),
+  }
+
+fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput / {abort.raise} = {
+  let fns = fold(range(0, len(sk.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
+    let node = at(sk.nodes, v);
+    if node.decl { acc } else { map_insert(acc, node.name, v) }
   });
-  let declared = fold(
-    range(0, len(index.nodes)),
-    map_new(),
-    |acc: Map<Bytes, List<Int>>, v: Int| {
-      let node = at(index.nodes, v);
-      if is_decl(node) { started(acc, node.name, [v]) } else { acc }
-    },
-  );
-  let tested = fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int|
-    started(acc, at(index.tests, i).key, at(h.test_refs, i)));
-  let items = fold(range(0, len(index.laws)), tested, |acc: Map<Bytes, List<Int>>, i: Int|
-    started(acc, at(index.laws, i).key, at(h.law_refs, i)));
-  let names_at = |refs: List<Int>| map(refs, |r: Int| at(index.nodes, r).name);
+  let declared = fold(range(0, len(sk.nodes)), map_new(), |acc: Map<Bytes, List<Int>>, v: Int| {
+    let node = at(sk.nodes, v);
+    if node.decl { started(acc, node.name, [v]) } else { acc }
+  });
+  let tested = fold(range(0, len(sk.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int|
+    started(acc, at(sk.tests, i).key, at(h.test_refs, i)));
+  let items = fold(range(0, len(sk.laws)), tested, |acc: Map<Bytes, List<Int>>, i: Int|
+    started(acc, at(sk.laws, i), at(h.law_refs, i)));
+  let names_at = |refs: List<Int>| map(refs, |r: Int| at(sk.nodes, r).name);
   let empty: HashOutput = {
     defs: [],
     own: h.own,
@@ -3558,15 +3611,20 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     law_texts: h.law_texts,
     deps: [],
     refs: {
-      names: map(index.nodes, |node: Node| node.name),
-      decls: map(index.nodes, is_decl),
+      names: map(sk.nodes, |node: NodeRef| node.name),
+      decls: map(sk.nodes, |node: NodeRef| node.decl),
       edges: edges,
       fns: fns,
       declared: declared,
       items: items,
-      cases: fold(range(0, len(index.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int| {
-        let t = at(index.tests, i);
-        if t.def.cases == None { acc } else { started(acc, t.key, at(h.test_runs, i)) }
+      cases: fold(range(0, len(sk.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int| {
+        let t = at(sk.tests, i);
+        if !t.cases { acc } else { started(acc, t.key, at(h.test_runs, i)) }
+      }),
+      clauses: h.clauses,
+      listings: fold(range(0, len(sk.tests)), map_new(), |acc: Map<Bytes, List<Int>>, i: Int| {
+        let t = at(sk.tests, i);
+        if !t.cases { acc } else { started(acc, t.key, at(h.test_listings, i)) }
       }),
     },
     bodies: [],
@@ -3580,10 +3638,10 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
     law_refs: h.law_refs,
     enumerations: h.enumerations,
   };
-  fold(index.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: IndexEntry|
+  fold(sk.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: IndexEntry|
     match e {
       DefEntry(v) -> {
-        let node = at(index.nodes, v);
+        let node = at(sk.nodes, v);
         let bodied: HashOutput = match map_get(h.bodies, v) {
           None -> acc.out,
           Some(body) ->
@@ -3591,29 +3649,103 @@ fn assemble(index: Index, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
         };
         let keyed: HashOutput = match map_get(h.hashes, v) {
           None -> bodied,
-          Some(hash) -> match node.body {
-            NodeFn(_) ->
-              {
-                ..bodied,
-                defs: push(bodied.defs, { name: node.name, hash: hash }),
-                contracts: push(bodied.contracts, {
-                  name: node.name,
-                  hash: match map_get(h.contracts, v) { Some(c) -> c, None -> hash },
-                }),
-                checks: push(bodied.checks, {
-                  name: node.name,
-                  hash: match map_get(h.checks, v) { Some(c) -> c, None -> hash },
-                }),
-              },
-            _ -> { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) },
+          Some(hash) -> if node.decl {
+            { ..bodied, decls: push(bodied.decls, { name: node.name, hash: hash }) }
+          } else {
+            {
+              ..bodied,
+              defs: push(bodied.defs, { name: node.name, hash: hash }),
+              contracts: push(bodied.contracts, {
+                name: node.name,
+                hash: match map_get(h.contracts, v) { Some(c) -> c, None -> hash },
+              }),
+              checks: push(bodied.checks, {
+                name: node.name,
+                hash: match map_get(h.checks, v) { Some(c) -> c, None -> hash },
+              }),
+            }
           },
         };
         record({ ..acc, out: keyed }, node.name, names_at(at(edges, v)))
       },
-      TestEntry(i) -> record(acc, at(index.tests, i).key, names_at(at(h.test_refs, i))),
+      TestEntry(i) -> record(acc, at(sk.tests, i).key, names_at(at(h.test_refs, i))),
       // A law's references are what it is a claim about.
-      LawEntry(i) -> record(acc, at(index.laws, i).key, names_at(at(h.law_refs, i))),
+      LawEntry(i) -> record(acc, at(sk.laws, i), names_at(at(h.law_refs, i))),
     }).out
+}
+
+/// The hash tables of the program `sk` lays out, each node, test and law as `fixing` says hashing
+/// fixed it: what a load assembled from its modules' answers holds in place of hashing it.
+pub fn hashes_fixed(sk: Skeleton, fixing: Fixing) -> HashOutput / {abort.raise} = {
+  let keys = fold(range(0, len(sk.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
+    let node = at(sk.nodes, v);
+    map_insert(acc, pin_key(node.name, node.decl), v)
+  });
+  let ids = |refs: List<NodeRef>|
+    fold(refs, [], |es: List<Int>, r: NodeRef|
+      match map_get(keys, pin_key(r.name, r.decl)) { Some(w) -> push(es, w), None -> es });
+  let held = fold(fixing.nodes, map_new(), |acc: Map<Int, Fixed>, f: Fixed|
+    match map_get(keys, pin_key(f.name, f.decl)) { Some(v) -> map_insert(acc, v, f), None -> acc });
+  let tests = fold(fixing.tests, map_new(), |acc: Map<Bytes, FixedTest>, t: FixedTest|
+    map_insert(acc, t.key, t));
+  let laws = fold(fixing.laws, map_new(), |acc: Map<Bytes, FixedLaw>, l: FixedLaw|
+    map_insert(acc, l.key, l));
+  let test_of = |key: Bytes|
+    match map_get(tests, key) {
+      Some(t) -> t,
+      None -> panic("no test is fixed under " ++ string_of_bytes_lossy(key)),
+    };
+  let law_of = |key: Bytes|
+    match map_get(laws, key) {
+      Some(l) -> l,
+      None -> panic("no law is fixed under " ++ string_of_bytes_lossy(key)),
+    };
+  let field = |pick: (Fixed) -> Bytes|
+    map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed| map_insert(acc, v, pick(f)));
+  let stated = fold(
+    sk.order,
+    { own: [], specs: [], spec_texts: [], spec_checks: [] },
+    |acc: Stated, e: IndexEntry|
+      match e {
+        DefEntry(v) -> match map_get(held, v) {
+          Some(f) -> if f.decl { acc } else { fixed_stated(acc, f.name, f) },
+          None -> acc,
+        },
+        _ -> acc,
+      },
+  );
+  let tested = map(sk.tests, |t: { key: Bytes, cases: Bool }| test_of(t.key));
+  let lawful = map(sk.laws, law_of);
+  assemble(
+    sk,
+    map(range(0, len(sk.nodes)), |v: Int|
+      match map_get(held, v) { Some(f) -> ids(f.edges), None -> [] }),
+    {
+      hashes: field(|f: Fixed| f.hash),
+      bodies: field(|f: Fixed| f.body),
+      tests: map(tested, |t: FixedTest| t.hash),
+      test_bodies: map(tested, |t: FixedTest| t.body),
+      test_texts: map(tested, |t: FixedTest| t.text),
+      test_refs: map(tested, |t: FixedTest| ids(t.refs)),
+      test_runs: map(tested, |t: FixedTest| ids(t.runs)),
+      laws: map(lawful, |l: FixedLaw| l.hash),
+      law_refs: map(lawful, |l: FixedLaw| ids(l.refs)),
+      law_texts: map(lawful, |l: FixedLaw| l.text),
+      own: stated.own,
+      specs: stated.specs,
+      spec_texts: stated.spec_texts,
+      contracts: map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+        if f.decl || bytes_len(f.contract) == 0 { acc } else { map_insert(acc, v, f.contract) }),
+      checks: map_fold(held, map_new(), |acc: Map<Int, Bytes>, v: Int, f: Fixed|
+        if f.decl || bytes_len(f.check) == 0 { acc } else { map_insert(acc, v, f.check) }),
+      spec_checks: stated.spec_checks,
+      enumerations: map(range(0, len(sk.nodes)), |v: Int|
+        match map_get(held, v) { Some(f) -> ids(f.effects), None -> [] }),
+      clauses: map(range(0, len(sk.nodes)), |v: Int|
+        match map_get(held, v) { Some(f) -> ids(f.clauses), None -> [] }),
+      test_listings: map(tested, |t: FixedTest| ids(t.listing)),
+    },
+  )
 }
 
 /// Names collide across namespaces, so entries are merged rather than replaced.
@@ -3721,38 +3853,26 @@ pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {
 /// what a `requires`, an `ensures` or a `cost` of a reached definition names is reached, and what
 /// that reaches in turn. A function is answered only where it is reached itself: a type or an effect
 /// that shares its name is another definition, and reaching one reaches nothing the function does.
-/// `index` is the one `hashes` was made of.
 pub fn reached_functions(
-  index: Index,
   hashes: HashOutput,
   roots: List<Which>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
   let r = hashes.refs;
-  let edges = map(range(0, len(r.edges)), |v: Int|
-    with_spec_refs(index, at(index.nodes, v), at(r.edges, v)));
-  read_off(r, walked(edges, starting(r, roots)).all).fns
+  read_off(r, walked(with_clauses(r), starting(r, roots)).all).fns
 }
+
+/// Each node's references, with what its specification clauses reference.
+fn with_clauses(r: Refs) -> List<List<Int>> / {abort.raise} =
+  map(range(0, len(r.edges)), |v: Int|
+    concat(at(r.edges, v), match list_at(r.clauses, v) { Some(cs) -> cs, None -> [] }))
 
 /// The functions the listings of the tests over cases `keys` reach, with what a reached definition's
 /// clauses reach: what a unit that lists their tables holds, and none of what a case runs.
-pub fn listing_reach(
-  index: Index,
-  hashes: HashOutput,
-  keys: List<Bytes>,
-) -> Map<Bytes, Bool> / {abort.raise} = {
+pub fn listing_reach(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
   let r = hashes.refs;
-  let wanted = fold(keys, map_new(), |acc: Map<Bytes, Bool>, k: Bytes| map_insert(acc, k, true));
-  let starts = fold(index.tests, [], |acc: List<Int>, t: TestNode|
-    if !map_contains(wanted, t.key) { acc } else {
-      match t.def.cases {
-        Some(c) ->
-          concat(acc, refs_of(index, t.module, |encoder: Encoder| expr(encoder, test_listing(c)))),
-        None -> acc,
-      }
-    });
-  let edges = map(range(0, len(r.edges)), |v: Int|
-    with_spec_refs(index, at(index.nodes, v), at(r.edges, v)));
-  read_off(r, walked(edges, starts).all).fns
+  let starts = fold(keys, [], |acc: List<Int>, k: Bytes|
+    match map_get(r.listings, k) { Some(vs) -> concat(acc, vs), None -> acc });
+  read_off(r, walked(with_clauses(r), starts).all).fns
 }
 
 /// What `which` references itself, each a function or a declaration, in the order its text first
@@ -6498,13 +6618,13 @@ test "the functions reached hold what a reached definition's clauses name, and w
   ]);
   let h = hash_index(index);
   assert_eq(map_keys(closure_of(h, [b"m.f"])), [b"m.f"]);
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.f")])), [
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.f")])), [
     b"m.f",
     b"m.floor",
     b"m.model",
     b"m.under",
   ]);
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.other")])), [b"m.other"])
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.other")])), [b"m.other"])
 }
 
 test "a listing reaches what its table and label do, and nothing only a case runs" {
@@ -6520,11 +6640,11 @@ test "a listing reaches what its table and label do, and nothing only a case run
     { name: b"std.show", src: b"pub fn display(x: Int) -> Int = x\n" },
   ]);
   let h = hash_index(index);
-  let listed = map_keys(listing_reach(index, h, [b"m.case {name_of(n)}"]));
+  let listed = map_keys(listing_reach(h, [b"m.case {name_of(n)}"]));
   assert(contains(listed, b"m.table") && contains(listed, b"m.build"), Some("the table is listed"));
   assert(!contains(listed, b"m.heavy") && !contains(listed, b"m.deeper"), Some("no case runs"));
   // The test itself reaches all of it.
-  let run = map_keys(reached_functions(index, h, [TheItem(b"m.case {name_of(n)}")]));
+  let run = map_keys(reached_functions(h, [TheItem(b"m.case {name_of(n)}")]));
   assert(contains(run, b"m.heavy") && contains(run, b"m.table"), None)
 }
 
@@ -6537,17 +6657,17 @@ test "a function is reached through itself, never through a type or an effect of
   ]);
   let h = hash_index(index);
   // `user` performs the effect `log` and `boxed` names the type and the effect `Box`: no function.
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.user")])), [b"m.user"]);
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.boxed")])), [b"m.boxed"]);
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.caller")])), [
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.user")])), [b"m.user"]);
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.boxed")])), [b"m.boxed"]);
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.caller")])), [
     b"m.caller",
     b"m.helper",
     b"m.log",
   ]);
-  assert_eq(map_keys(reached_functions(index, h, [TheFn(b"m.log")])), [b"m.helper", b"m.log"]);
+  assert_eq(map_keys(reached_functions(h, [TheFn(b"m.log")])), [b"m.helper", b"m.log"]);
   // The effect `log`, and the type and the effect `Box`, are where a walk can start too.
-  assert_eq(map_keys(reached_functions(index, h, [TheDecl(b"m.log")])), []);
-  assert_eq(map_keys(reached_functions(index, h, [TheDecl(b"m.Box")])), [])
+  assert_eq(map_keys(reached_functions(h, [TheDecl(b"m.log")])), []);
+  assert_eq(map_keys(reached_functions(h, [TheDecl(b"m.Box")])), [])
 }
 
 fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput / {abort.raise} =
