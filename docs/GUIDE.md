@@ -3165,7 +3165,9 @@ and takes the program's tables from what each answered, parsing no module again:
 definition's type and row, its tests, and its hashes, each of its own packages' hashed as its
 module hashed it, so a run checks and hashes again what an edit moved and takes the rest. A
 module's hashing fills its normalized forms with the hashes of what they reference, so an edit to
-a body hashes the modules that import it again without reading them. The program is analysed
+a body hashes the modules that import it again without reading them. Each module's answer keeps
+what its check said of each definition apart from its outline, and a load reads those tables only
+where its command does: `ply check` reads them for `--types` and `--json` alone. The program is analysed
 whole, each definition taken as its module answered it, only for what is read from its syntax: a
 `decreases` measure (`E0467`), a `reuse fn` or `returns` promise and `--costs`, a statement a
 call runs, `--verify-deps`, and the commands that read source (`ply doc`, `ply prove`,
