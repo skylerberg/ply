@@ -93,12 +93,13 @@ CLI_SUITE=crates/ply-cli-tests/ply
 # duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
 CORPUS_DESKS=(serving database)
 DESK_RUNNERS=3
-# Runs that take a runner each: the compiler's own tests, compiled, take every core.
-CORPUS_ALONE=(cli-compiler_compiled)
+# Runs that take a runner each: the compiler's own tests, compiled, take every core, and the reach
+# audit checks three whole packages cold.
+CORPUS_ALONE=(cli-compiler_compiled cli-reached)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental reached)
+CLI_BY_TEST=(artifact_program bootstrap_archive corpus desk_operations incremental)
 # Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
 # of the tree one way and checks it warm and cold, days of runners over the tree.
 CLI_NIGHTLY=(edit_sweep)
@@ -913,7 +914,8 @@ desk_cut() {
 # the first placed land on different runners. A lane pays each package's startup once. A run measured
 # over a third of the partitions' deadline goes in as its parts (`corpus_parted`). A part nothing
 # measured counts as its share of its run; any other entry nothing measured as the median of its
-# neighbours that were measured, or else of every entry that was.
+# neighbours that were measured, or else, for a module newly placed a test at a time, as its share of
+# what the module measured whole, or else as the median of every entry that was.
 corpus_cut() {
   local dir=$1 rows=$2 k
   for ((k = 1; k <= PARTITIONS; k++)); do : > "$dir/corpus-$k.txt"; done
@@ -967,7 +969,12 @@ corpus_cut() {
       while ((getline line < rows) > 0) {
         split(line, f, "\t")
         if (f[1] == "startup") start[f[2]] = f[3] + 0
-        else ms[f[2]] = f[3] + 0
+        else {
+          ms[f[2]] = f[3] + 0
+          # What a module measured as one run, or as the parts of one, before it was placed a test
+          # at a time.
+          if (!index(f[2], ":")) { whole_of = f[2]; sub(/#.*/, "", whole_of); whole[whole_of] += f[3] + 0 }
+        }
       }
       FS = " "
       batched[checks] = batched[cli] = batched[stdlib] = 1
@@ -981,7 +988,7 @@ corpus_cut() {
         c = 0
         for (j = i; j <= n && (j == i || (mod != "" && module_of(ids[j]) == mod)); j++)
           if (ids[j] in ms) near[++c] = ms[ids[j]]
-        guess = (mod != "" && c) ? middle(near, c) : median
+        guess = (mod != "" && c) ? middle(near, c) : (mod != "" && (mod in whole)) ? whole[mod] / (j - i) : median
         for (; i < j; i++) {
           if (!(ids[i] in ms)) ms[ids[i]] = index(ids[i], "#") ? share_of(ids[i]) : guess
           total += ms[ids[i]]
