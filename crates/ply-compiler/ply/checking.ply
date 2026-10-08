@@ -7,8 +7,8 @@ import std.bin
 import std.hash (blake3)
 import std.bytes (join, hex_of)
 import std.list (at, concat, contains, reverse, sort_by)
-import memo (memo, memo_keep, Query, Run, Tally, answer, tallies, ran_total)
-import memo_files (Held, nothing_held, over_held)
+import memo (memo, memo_keep, Held, Query, Run, Tally, answer, nothing_held, over_held, ran_total,
+             started, tallies)
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
                 Reading, checked_against, exports_of, hashes_by_owner, hash_owners, named_node,
@@ -17,15 +17,18 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedDat
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
               shipped_data_wanted, shipped_texts_wanted, rows_of, no_rows, rows_bin, analyse,
               analyse_with, published, staged_pulling_std_with, analyse_pulling_std_with, of_module,
-              ModuleFacts, module_facts, no_facts, module_facts_bin, answered_program,
-              answered_load, view_of, view_dump, faceted, dump_of, walked_facts_bin, squats)
+              ModuleFacts, ModuleShape, ModuleTables, Frame, TableReads, View, Outline,
+              module_facts, no_shape, no_module_tables, module_shape_bin, module_tables_bin,
+              answered_program, answered_load, pulled_next, view_of, functions_of, tests_of,
+              view_over, view_dump, faceted, dump_of, walked_facts_bin, squats)
 import items (Module, ImportDecl, header, parse)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
 import interface (imported)
 import embed (EmbedFile, EmbedRead, embed_key)
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token)
-import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span)
+import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span,
+                import_module_name)
 import parsing (Ident, Span, ParseDiag, span_bin)
 import infer (DefInfo, TestInfo)
 import hash (Fixed, Fixing, Shapes, Shape, no_fixing, module_forms, hashed_forms, fixing_bin,
@@ -50,22 +53,25 @@ pub type Embedding = { files: List<{ name: Bytes, bytes: Bytes }>, refused: Opti
 /// warnings it holds, how many definitions and tests it checked, and the rows they published. A label points into the module
 /// at module 0; one that pointed into a module it imports is left out.
 pub type ModuleAnswer = {
-  exports: Exports,
+  /// What it shows its importers, encoded as the `exported` query answers it.
+  shown: Bytes,
   refused: List<Diag>,
   warnings: List<Diag>,
   defs: Int,
   tests: Int,
-  /// What each of its definitions and tests published, which a load of the whole program takes in
-  /// place of checking them again.
-  rows: Rows,
+  /// What each of its definitions and tests published, encoded by `rows_bin`: what an analysis of
+  /// the whole program takes in place of checking them again.
+  rows: Bytes,
   /// The modules its imports name that there are: a module whose import refused it may be refused
   /// for that alone.
   imports: List<Bytes>,
-  /// What hashing reads of it apart from what it imports.
-  forms: FormsAnswer,
-  /// What its check said of its own declarations, which a load assembled from its modules' answers
-  /// merges.
-  facts: ModuleFacts,
+  /// What hashing reads of it apart from what it imports, encoded as the `forms` query answers it.
+  forms: Bytes,
+  /// What its check said of its shape, which every load assembled from its modules' answers reads.
+  shape: ModuleShape,
+  /// What its check said of its own declarations, encoded by `module_tables_bin`: what a load reads
+  /// only where its command reads the check's tables.
+  tables: Bytes,
 }
 
 /// What hashing reads of a module apart from what it imports: its forms, the owner each function's
@@ -397,17 +403,18 @@ pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   )
 }
 
-fn absent(module: Bytes) -> ModuleAnswer =
+fn absent(module: Bytes) -> ModuleAnswer / {abort.raise} =
   {
-    exports: no_exports(module),
+    shown: bin::encode(shown_of(no_exports(module)), shown_bin()),
     refused: [],
     warnings: [],
     defs: 0,
     tests: 0,
-    rows: no_rows(),
+    rows: bin::encode(no_rows(), rows_bin()),
     imports: [],
-    forms: no_forms(),
-    facts: no_facts(module),
+    forms: bin::encode(no_forms(), forms_answer_bin()),
+    shape: no_shape(module),
+    tables: bin::encode(no_module_tables(), module_tables_bin()),
   }
 
 fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.raise} = {
@@ -420,34 +427,44 @@ fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.ra
   let places = places_of(shipped, map_keys(deps));
   let checked = checked_against(m.source, m.placed, deps, placing_in(places), m.reading);
   match checked.pulled.out {
+    // A module that refuses still pulls what it imports, whose refusals may be what explains its own.
     Refused(ds) ->
       {
         ..absent(module),
         refused: map(ds, |d: Diag| own_labels(d, checked.at)),
         imports: m.present,
+        shape: { ..no_shape(module), written: map(m.parsed.module.imports, import_module_name) },
       },
     Analysed(w) -> {
       let i = index_of_module(w, module);
       let all = rows_of(w);
       let owning = hash_owners(m.raw, at(w.mods, i));
+      let facts = module_facts(w, i);
       {
-        exports: exports_of(w, i, m.source.src, Some(m.raw)),
+        shown: bin::encode(shown_of(exports_of(w, i, m.source.src, Some(m.raw))), shown_bin()),
         imports: m.present,
         refused: [],
         warnings: map(filter(w.warnings, |d: Diag| primary_in(d, i)), |d: Diag| own_labels(d, i)),
         defs: len(filter(w.checked.defs, |d: DefInfo| d.module == module)),
         tests: len(filter(w.checked.tests, |t: TestInfo| t.module == module)),
-        rows: {
-          defs: filter(all.defs, |r: KnownDefRow| of_module(module, r.name)),
-          tests: filter(all.tests, |r: KnownTestRow|
-            bytes_starts_with(r.owner, bytes_concat(module, b".test#"))),
-        },
-        forms: {
-          forms: module_forms(w.index, w.module_packages, i),
-          fns: owning.fns,
-          owners: owning.owners,
-        },
-        facts: module_facts(w, i),
+        rows: bin::encode(
+          {
+            defs: filter(all.defs, |r: KnownDefRow| of_module(module, r.name)),
+            tests: filter(all.tests, |r: KnownTestRow|
+              bytes_starts_with(r.owner, bytes_concat(module, b".test#"))),
+          },
+          rows_bin(),
+        ),
+        forms: bin::encode(
+          {
+            forms: module_forms(w.index, w.module_packages, i),
+            fns: owning.fns,
+            owners: owning.owners,
+          },
+          forms_answer_bin(),
+        ),
+        shape: facts.shape,
+        tables: bin::encode(facts.tables, module_tables_bin()),
       }
     },
   }
@@ -464,10 +481,7 @@ pub fn forms_query() -> Bytes = b"forms"
 
 /// What hashing reads of a module apart from what it imports, read as `Named` says.
 pub fn forms_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} =
-  bin::encode(
-    decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer").forms,
-    forms_answer_bin(),
-  )
+  decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer").forms
 
 /// What hashing a module fixed, read as `Named` says: its forms filled from what hashing fixed of
 /// each node of another module they reference. A module that refuses has no forms, and fixes
@@ -547,21 +561,16 @@ pub fn hashes_query() -> Bytes = b"hashes"
 pub fn exported_query() -> Bytes = b"exported"
 
 /// What a module shows its importers, read as `Named` says.
-pub fn exported_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let answer = decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer");
-  bin::encode(
-    {
-      owners: answer.exports.owners,
-      entries: map_fold(
-        answer.exports.entries,
-        map_new(),
-        |acc: Map<Bytes, Bytes>, o: Bytes, e: Entry|
-          map_insert(acc, o, bin::encode(e, entry_bin())),
-      ),
-    },
-    shown_bin(),
-  )
-}
+pub fn exported_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer").shown
+
+/// What `exports` shows its importers: each entry encoded apart, which a reader decodes alone.
+fn shown_of(exports: Exports) -> Shown / {abort.raise} =
+  {
+    owners: exports.owners,
+    entries: map_fold(exports.entries, map_new(), |acc: Map<Bytes, Bytes>, o: Bytes, e: Entry|
+      map_insert(acc, o, bin::encode(e, entry_bin()))),
+  }
 
 /// The entries a module shows under a name, each encoded, read as `EntryNamed` says: under every
 /// name for none.
@@ -761,39 +770,110 @@ pub fn fresh_registry() -> Map<Bytes, Query> =
 /// A module of a load, by its name in the program, and what it answered.
 pub type Answered = { module: Bytes, answer: ModuleAnswer }
 
-/// What each of `own`, the load's own modules, and of `shipped`, the shipped modules it pulls,
-/// answers checked, asked of `qs` over a run. Where the own modules import one another in a cycle,
-/// no module is checked, since none has an order to be checked in: what answers is the module whose
-/// import closes each cycle, refused for it.
+/// What `a` says its module's definitions and tests published.
+pub fn rows_answered(a: ModuleAnswer) -> Rows / {abort.raise} =
+  decoded(a.rows, rows_bin(), "a module's rows")
+
+/// What `a` says its module's check said of its declarations.
+pub fn tables_answered(a: ModuleAnswer) -> ModuleTables / {abort.raise} =
+  decoded(a.tables, module_tables_bin(), "a module's tables")
+
+/// What `a` says its module's check said of it: its shape and its tables.
+pub fn facts_answered(a: ModuleAnswer) -> ModuleFacts / {abort.raise} =
+  { shape: a.shape, tables: tables_answered(a) }
+
+/// The program `frame` holds, its check's tables read as `reads` says from what `answers` says each
+/// of its modules answered: none for a module that answers nothing.
+pub fn view_answered(
+  frame: Frame,
+  reads: TableReads,
+  answers: Map<Bytes, ModuleAnswer>,
+) -> View / {abort.raise} =
+  view_over(
+    frame,
+    reads,
+    map(frame.outlines, |o: Outline|
+      match map_get(answers, o.name) { Some(a) -> tables_answered(a), None -> no_module_tables() }),
+  )
+
+/// What a load's modules answered: its own, then each shipped module it pulled, and those in the
+/// order it pulled them.
+pub type Asking = { answers: List<Answered>, pulled: List<Bytes> }
+
+/// What each of `own`, the load's own modules, answers checked, and each shipped module they pull,
+/// asked of `qs` over a run: each round, every shipped module a module answered so far imports as
+/// written, and each of `asked` from the first, each read with its tests where `tested` says. Where
+/// the own modules import one another in a cycle, no module is checked, since none has an order to
+/// be checked in: what answers is the module whose import closes each cycle, refused for it.
 pub fn asked_all(
   qs: Map<Bytes, Query>,
   own: List<Bytes>,
-  shipped: List<Bytes>,
+  asked: List<Bytes>,
   tested: Bool,
   run: Run,
-) -> { run: Run, value: List<Answered> } / {memo_keep.read, memo_keep.write, abort.raise} = {
+) -> { run: Run, value: Asking } / {memo_keep.read, memo_keep.write, abort.raise} = {
   let cycles = cycles_among(qs, run, own);
-  if len(cycles.refused) > 0 { { run: cycles.run, value: cycles.refused } } else {
-    let asks = concat(
-      map(own, |n: Bytes| { module: n, shipped: false, tested: false }),
-      map(shipped, |n: Bytes| { module: n, shipped: true, tested: tested }),
-    );
-    fold(
-      asks,
-      { run: cycles.run, value: [] },
-      |acc: { run: Run, value: List<Answered> }, named: Named| {
-        let a = answer(qs, acc.run, module_query(), bin::encode(named, named_bin()));
+  if len(cycles.refused) > 0 { { run: cycles.run, value: { answers: cycles.refused, pulled: [] } } }
+  else {
+    let ask = |r: Run, named: Named| {
+      let a = answer(qs, r, module_query(), bin::encode(named, named_bin()));
+      {
+        run: a.run,
+        answered: {
+          module: named.module,
+          answer: decoded(a.output, module_answer_bin(), "a module's answer"),
+        },
+      }
+    };
+    let first = fold(
+      own,
+      { run: cycles.run, answers: [], written: map_new() },
+      |acc: { run: Run, answers: List<Answered>, written: Map<Bytes, List<Bytes>> }, n: Bytes| {
+        let a = ask(acc.run, { module: n, shipped: false, tested: false });
         {
           run: a.run,
-          value: push(acc.value, {
-            module: named.module,
-            answer: decoded(a.output, module_answer_bin(), "a module's answer"),
-          }),
+          answers: push(acc.answers, a.answered),
+          written: map_insert(acc.written, n, a.answered.answer.shape.written),
         }
       },
-    )
+    );
+    let listed = fold(shipped_listed(), map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
+      map_insert(acc, n, true));
+    let users = fold(own, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
+    let pulled = iterate(
+      { run: first.run, answers: first.answers, written: first.written, read: own, pulled: [] },
+      map_len(listed) + 2,
+      |x: { run: Run, answers: List<Answered>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }| {
+        let fresh = pulled_next(users, x.read, x.written, listed, asked);
+        if len(fresh) == 0 { Stop(x) } else {
+          Continue(
+            fold(
+              fresh,
+              { ..x, read: concat(x.read, fresh), pulled: concat(x.pulled, fresh) },
+              |acc: { run: Run, answers: List<Answered>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
+                let a = ask(acc.run, { module: n, shipped: true, tested: tested });
+                {
+                  ..acc,
+                  run: a.run,
+                  answers: push(acc.answers, a.answered),
+                  written: map_insert(acc.written, n, a.answered.answer.shape.written),
+                }
+              },
+            ),
+          )
+        }
+      },
+    );
+    { run: pulled.run, value: { answers: pulled.answers, pulled: pulled.pulled } }
   }
 }
+
+/// The shipped modules there are, as the world names them.
+fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
+  match memo_keep.now(shipped_names_kind(), b"") {
+    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
+    None -> [],
+  }
 
 /// The queries a load asks of a shipped module whose answers a load cannot cheaply make again: what
 /// it answers checked and hashed, and what it shows of each. What it shows under one name is read off
@@ -1050,19 +1130,24 @@ fn answered_over(
     held,
     |path: String| None,
     |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
-    |run: Run| asked_all(fresh_registry(), w.own, [], false, run),
+    || {
+      let qs = fresh_registry();
+      let all = asked_all(qs, w.own, [], false, started(qs));
+      { run: all.run, answers: all.value.answers }
+    },
   );
-  let answers = done.value;
+  let answers = done.value.answers;
   {
     held: done.held,
-    run: done.run,
+    run: done.value.run,
     outcome: match refused_first(answers) {
       [] ->
         analyse_with(
           parse_all(sources),
-          fold(answers, [], |acc: List<KnownDefRow>, a: Answered| concat(acc, a.answer.rows.defs)),
+          fold(answers, [], |acc: List<KnownDefRow>, a: Answered|
+            concat(acc, rows_answered(a.answer).defs)),
           fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
-            concat(acc, a.answer.rows.tests)),
+            concat(acc, rows_answered(a.answer).tests)),
         ),
       first ->
         Refused(fold(first, [], |acc: List<Diag>, a: Answered| concat(acc, a.answer.refused))),
@@ -1668,16 +1753,14 @@ fn fixed_over(
     nothing_held(),
     |path: String| None,
     |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
-    |run: Run| {
-      let all = asked_all(fresh_registry(), w.own, [], false, run);
-      let fixed = hashed_all(fresh_registry(), w.own, [], false, all.run);
+    || {
+      let qs = fresh_registry();
+      let all = asked_all(qs, w.own, [], false, started(qs));
+      let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
       {
-        run: fixed.run,
-        value: {
-          answers: all.value,
-          fixing: fixed.value,
-          warnings: root_warnings(all.value, len(sources)),
-        },
+        answers: all.value.answers,
+        fixing: fixed.value,
+        warnings: root_warnings(all.value.answers, len(sources)),
       }
     },
   ).value
@@ -1727,7 +1810,7 @@ test "a program's tables made from its modules' answers are the tables of its ch
         Refused(_) -> panic("the fixture checks"),
         Analysed(w) -> {
           let answered = answered_program(
-            map(fixed.answers, |a: Answered| a.answer.facts),
+            map(fixed.answers, |a: Answered| facts_answered(a.answer)),
             fixed.fixing,
             map_new(),
             true,
@@ -1740,7 +1823,7 @@ test "a program's tables made from its modules' answers are the tables of its ch
             w.embeds,
           );
           assert_eq(answered.view.checked.defs, w.checked.defs);
-          assert_eq(answered.view.tagged, view_of(w).tagged);
+          assert_eq(answered.view.frame.tagged, view_of(w).frame.tagged);
           assert_eq(answered.view, view_of(w));
           let made = view_dump(answered.view, None);
           let whole = dump_of(Analysed(w));
@@ -1814,21 +1897,28 @@ test "a program assembled from its modules' answers, a shipped module's among th
         nothing_held(),
         |path: String| None,
         |kind: Bytes, at: Bytes| looked(w, held, held, || names, kind, at),
-        |run: Run| {
-          let all = asked_all(fresh_registry(), w.own, names, mode.tested, run);
-          let fixed = hashed_all(fresh_registry(), w.own, names, mode.tested, all.run);
-          { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+        || {
+          let qs = fresh_registry();
+          let all = asked_all(
+            qs,
+            w.own,
+            if mode.tested { names } else { [] },
+            mode.tested,
+            started(qs),
+          );
+          let fixed = hashed_all(qs, w.own, all.value.pulled, mode.tested, all.run);
+          { answers: all.value.answers, pulled: all.value.pulled, fixing: fixed.value }
         },
       ).value;
       let loaded = answered_load(
         map(f.user, |s: Source| s.name),
         { root: b"", manifest: None, supplied: [] },
-        fold(done.answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
-          map_insert(acc, a.module, a.answer.facts)),
+        fold(done.answers, map_new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
+          map_insert(acc, a.module, a.answer.shape)),
         done.fixing,
-        f.shipped,
-        [],
-        if mode.tested { names } else { [] },
+        done.pulled,
+        names,
+        texts,
         true,
         mode.reached,
         root_warnings(done.answers, len(f.user)),
@@ -1837,15 +1927,23 @@ test "a program assembled from its modules' answers, a shipped module's among th
         Refused(_) -> panic("the fixture checks"),
         Analysed(whole) -> {
           let view = view_of(whole);
+          let assembled = view_answered(
+            loaded.frame,
+            loaded.reads,
+            fold(done.answers, map_new(), |acc: Map<Bytes, ModuleAnswer>, a: Answered|
+              map_insert(acc, a.module, a.answer)),
+          );
           assert_eq(loaded.pulled, [b"std.shapes"]);
-          assert_eq(len(loaded.program.view.checked.tests), if mode.tested { 2 } else { 1 });
-          assert_eq(loaded.program.view.outlines, view.outlines);
-          assert_eq(loaded.program.view.checked.defs, view.checked.defs);
-          assert_eq(loaded.program.view.checked.facts, view.checked.facts);
-          assert_eq(loaded.program.view.checked, view.checked);
-          assert_eq(loaded.program.view.hashes, view.hashes);
-          assert_eq(loaded.program.view, view);
-          assert_eq(view_dump(loaded.program.view, None), dump_of(Analysed(whole)))
+          assert_eq(len(assembled.checked.tests), if mode.tested { 2 } else { 1 });
+          assert_eq(loaded.frame.outlines, view.frame.outlines);
+          assert_eq(assembled.checked.defs, view.checked.defs);
+          assert_eq(assembled.checked.facts, view.checked.facts);
+          assert_eq(assembled.checked, view.checked);
+          assert_eq(loaded.frame.hashes, view.frame.hashes);
+          assert_eq(assembled, view);
+          assert_eq(functions_of(loaded.frame), len(assembled.checked.defs));
+          assert_eq(tests_of(loaded.frame, 1), 1);
+          assert_eq(view_dump(assembled, None), dump_of(Analysed(whole)))
         },
       }
     },
