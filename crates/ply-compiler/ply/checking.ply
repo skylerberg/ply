@@ -11,13 +11,13 @@ import memo (memo, memo_keep, Query, Run, Tally, answer, tallies, ran_total)
 import memo_files (Held, nothing_held, over_held)
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
-                Reading, checked_against, hashed_against, hashed_needed, exports_of, of_module,
-                hashes_of, needed_by, owners_of_module, wanted_in, entry_bin, exports_bin,
-                hash_entry_bin, hashes_bin)
+                Reading, checked_against, exports_of, of_module, hashes_by_owner, hash_owners,
+                named_node, needed_by, wanted_in, entry_bin, exports_bin, hash_entry_bin,
+                hashes_bin)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedData, Rows,
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
               shipped_data_wanted, shipped_texts_wanted, rows_of, no_rows, rows_bin, analyse,
-              analyse_with, published)
+              analyse_with, published, staged_pulling_std_with)
 import items (Module, ImportDecl, header, parse)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
@@ -27,6 +27,8 @@ import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token)
 import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span)
 import parsing (Ident, Span, ParseDiag, span_bin)
 import infer (DefInfo, TestInfo)
+import hash (Fixed, Fixing, Shapes, Shape, no_fixing, module_forms, hashed_forms, fixing_bin,
+             shapes_bin)
 
 /// Where a module of the load's own packages is: its package (0 the root, then each dependency in
 /// the order the load's packages list them) and its name there. Where its file is, is no part of it.
@@ -56,8 +58,18 @@ pub type ModuleAnswer = {
   /// The modules its imports name that there are: a module whose import refused it may be refused
   /// for that alone.
   imports: List<Bytes>,
+  /// What hashing reads of it apart from what it imports.
+  forms: FormsAnswer,
 }
 
+/// What hashing reads of a module apart from what it imports: its forms, the owner each function's
+/// hash entry is filed under by its simple name, and each owner of each name it declares.
+pub type FormsAnswer = { forms: Shapes, fns: Map<Bytes, Bytes>, owners: Map<Bytes, List<Bytes>> }
+
+fn no_forms() -> FormsAnswer =
+  { forms: { nodes: [], order: [], tests: [], laws: [] }, fns: map_new(), owners: map_new() }
+
+derive bin for FormsAnswer
 derive bin for Placing
 derive bin for Named
 derive bin for EntryNamed
@@ -383,6 +395,7 @@ fn absent(module: Bytes) -> ModuleAnswer =
     tests: 0,
     rows: no_rows(),
     imports: [],
+    forms: no_forms(),
   }
 
 fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.raise} = {
@@ -404,6 +417,7 @@ fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.ra
     Analysed(w) -> {
       let i = index_of_module(w, module);
       let all = rows_of(w);
+      let owning = hash_owners(m.raw, at(w.mods, i));
       {
         exports: exports_of(w, i, m.source.src, Some(m.raw)),
         imports: m.present,
@@ -416,91 +430,78 @@ fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.ra
           tests: filter(all.tests, |r: KnownTestRow|
             bytes_starts_with(r.owner, bytes_concat(module, b".test#"))),
         },
+        forms: {
+          forms: module_forms(w.index, w.module_packages, i),
+          fns: owning.fns,
+          owners: owning.owners,
+        },
       }
     },
   }
 }
 
-/// What a module's hashing fixed: each owner's hash entry, and the hash of each of its definitions,
-/// declarations and tests. A module whose reading refuses it fixes nothing.
-pub type HashAnswer = {
-  hashes: Hashes,
-  owners: Map<Bytes, List<Bytes>>,
-  defs: List<{ name: Bytes, hash: Bytes }>,
-  decls: List<{ name: Bytes, hash: Bytes }>,
-  tests: List<{ key: Bytes, hash: Bytes }>,
-}
+/// What a module's hashing fixed: each owner's hash entry, and each of its nodes, tests and laws,
+/// which a load of the whole program takes in place of hashing them again. A module whose reading
+/// refuses it fixes nothing.
+pub type HashAnswer = { hashes: Hashes, owners: Map<Bytes, List<Bytes>>, fixing: Fixing }
 
 derive bin for HashAnswer
 
-fn hash_entries_of(
-  asker_shipped: Bool,
-  module: Bytes,
-  name: Bytes,
-) -> List<HashEntry> / {memo.read, abort.raise} = {
-  let named = { module: module, shipped: shipped_for(asker_shipped, module), name: name };
-  map(
-    decoded(
-      memo.ask(hash_entry_query(), bin::encode(named, entry_named_bin())),
-      bin::list_bin(bin::bytes_bin()),
-      "hash entries",
-    ),
-    |b: Bytes| decoded(b, hash_entry_bin(), "a hash entry"),
-  )
-}
+pub fn forms_query() -> Bytes = b"forms"
 
-/// What hashing a module fixed, read as `Named` says.
+/// What hashing reads of a module apart from what it imports, read as `Named` says.
+pub fn forms_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  bin::encode(
+    decoded(memo.ask(module_query(), input), module_answer_bin(), "a module's answer").forms,
+    forms_answer_bin(),
+  )
+
+/// What hashing a module fixed, read as `Named` says: its forms filled from what hashing fixed of
+/// each node of another module they reference. A module that refuses has no forms, and fixes
+/// nothing.
 pub fn hashes_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, named_bin(), "a module's name");
-  let module = asked.module;
-  let none = {
-    hashes: { module: module, entries: map_new() },
-    owners: map_new(),
-    defs: [],
-    decls: [],
-    tests: [],
-  };
-  bin::encode(
-    match module_read(asked) {
-      None -> none,
-      Some(m) -> {
-        let found = hashed_needed(
-          |d: Bytes, n: Bytes| entries_of(asked.shipped, d, n),
-          |d: Bytes, n: Bytes| hash_entries_of(asked.shipped, d, n),
-          wanted_in(m.parsed, m.raw, m.source.src, m.names),
-          m.present,
-        );
-        let places = places_of(asked.shipped, map_keys(found.deps));
-        let h = hashed_against(
-          m.source,
-          m.placed,
-          found.deps,
-          found.hashed,
-          placing_in(places),
-          m.reading,
-        );
-        match h.hashed {
-          Err(_) -> none,
-          Ok(x) -> {
-            let mine = |name: Bytes| of_module(module, name);
-            {
-              hashes: hashes_of(x.index, x.hashes, h.at, m.source.src),
-              owners: owners_of_module(x.index, h.at, m.source.src),
-              defs: filter(x.hashes.defs, |d: { name: Bytes, hash: Bytes }| mine(d.name)),
-              decls: filter(x.hashes.decls, |d: { name: Bytes, hash: Bytes }| mine(d.name)),
-              tests: fold(
-                range(0, len(x.index.tests)),
-                [],
-                |acc: List<{ key: Bytes, hash: Bytes }>, k: Int| {
-                  let t = at(x.index.tests, k);
-                  if t.module == h.at { push(acc, { key: t.key, hash: at(x.hashes.tests, k) }) }
-                  else { acc }
-                },
-              ),
-            }
-          },
-        }
+  let read = decoded(memo.ask(forms_query(), input), forms_answer_bin(), "a module's forms");
+  // Each node of another module the forms name, by its module.
+  let wanted = fold(read.forms.nodes, map_new(), |acc: Map<Bytes, List<Bytes>>, s: Shape|
+    match s.form {
+      Some(_) -> acc,
+      None -> {
+        let m = named_node(s.name);
+        map_insert(
+          acc,
+          m.module,
+          push(match map_get(acc, m.module) { Some(ns) -> ns, None -> [] }, m.name),
+        )
       },
+    });
+  let fixed = map_fold(wanted, [], |acc: List<Fixed>, module: Bytes, names: List<Bytes>| {
+    let shown = decoded(
+      memo.ask(
+        hash_shown_query(),
+        bin::encode({ module: module, shipped: shipped_for(asked.shipped, module) }, named_bin()),
+      ),
+      shown_bin(),
+      "what a module's hashing shows",
+    );
+    let owners = fold(names, map_new(), |os: Map<Bytes, Bool>, n: Bytes|
+      fold(
+        match map_get(shown.owners, n) { Some(xs) -> xs, None -> [] },
+        os,
+        |o: Map<Bytes, Bool>, x: Bytes| map_insert(o, x, true),
+      ));
+    map_fold(owners, acc, |a: List<Fixed>, o: Bytes, _: Bool|
+      match map_get(shown.entries, o) {
+        Some(e) -> concat(a, decoded(e, hash_entry_bin(), "a hash entry").fixed),
+        None -> a,
+      })
+  });
+  let fixing = hashed_forms(read.forms, fixed);
+  bin::encode(
+    {
+      hashes: hashes_by_owner(asked.module, fixing.nodes, read.fns),
+      owners: read.owners,
+      fixing: fixing,
     },
     hash_answer_bin(),
   )
@@ -525,30 +526,7 @@ pub fn hash_shown_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   )
 }
 
-/// The hash entries a module shows under a name, each encoded, read as `EntryNamed` says: under
-/// every name for none.
-pub fn hash_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let asked = decoded(input, entry_named_bin(), "an entry's name");
-  let shown = decoded(
-    memo.ask(
-      hash_shown_query(),
-      bin::encode({ module: asked.module, shipped: asked.shipped }, named_bin()),
-    ),
-    shown_bin(),
-    "what a module's hashing shows",
-  );
-  let owners = if asked.name == b"" { map_keys(shown.entries) }
-  else { match map_get(shown.owners, asked.name) { Some(os) -> os, None -> [] } };
-  bin::encode(
-    fold(owners, [], |acc: List<Bytes>, o: Bytes|
-      match map_get(shown.entries, o) { Some(e) -> push(acc, e), None -> acc }),
-    bin::list_bin(bin::bytes_bin()),
-  )
-}
-
 pub fn hashes_query() -> Bytes = b"hashes"
-
-pub fn hash_entry_query() -> Bytes = b"hash_entry"
 
 pub fn exported_query() -> Bytes = b"exported"
 
@@ -598,16 +576,12 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
     { name: imports_query(), definition: b"checking.imports_answer", body: imports_answer },
     { name: exported_query(), definition: b"checking.exported_answer", body: exported_answer },
     { name: entry_query(), definition: b"checking.entry_answer", body: entry_answer },
+    { name: forms_query(), definition: b"checking.forms_answer", body: forms_answer },
     { name: hashes_query(), definition: b"checking.hashes_answer", body: hashes_answer },
     {
       name: hash_shown_query(),
       definition: b"checking.hash_shown_answer",
       body: hash_shown_answer,
-    },
-    {
-      name: hash_entry_query(),
-      definition: b"checking.hash_entry_answer",
-      body: hash_entry_answer,
     },
   ]
 
@@ -808,7 +782,7 @@ pub fn asked_all(
 /// it answers checked and hashed, and what it shows of each. What it shows under one name is read off
 /// what it shows.
 pub fn shipped_queries() -> List<Bytes> =
-  [module_query(), exported_query(), hashes_query(), hash_shown_query()]
+  [module_query(), exported_query(), forms_query(), hashes_query(), hash_shown_query()]
 
 /// Each of [`shipped_queries`] asked of each of `shipped`, the shipped modules, of `qs` over a run.
 pub fn shipped_all(
@@ -831,6 +805,32 @@ pub fn packages_refused(
 ) -> List<Diag> / {abort.raise} =
   map(judged(pkgs, root_modules).diags, |sd: { slot: Int, diag: ParseDiag }|
     placed(modules + sd.slot, sd.diag))
+
+/// What hashing fixed of each of `own`, the load's own modules, asked of `qs` over a run: what a
+/// load of the whole program hashes nothing of. A shipped module is hashed there for what the
+/// program reaches of it, which costs less than reading all its module fixed.
+pub fn hashed_all(
+  qs: Map<Bytes, Query>,
+  own: List<Bytes>,
+  run: Run,
+) -> { run: Run, value: Fixing } / {memo_keep.read, memo_keep.write, abort.raise} =
+  fold(own, { run: run, value: no_fixing() }, |acc: { run: Run, value: Fixing }, module: Bytes| {
+    let a = answer(
+      qs,
+      acc.run,
+      hashes_query(),
+      bin::encode({ module: module, shipped: false }, named_bin()),
+    );
+    let f = decoded(a.output, hash_answer_bin(), "a module's hashing").fixing;
+    {
+      run: a.run,
+      value: {
+        nodes: concat(acc.value.nodes, f.nodes),
+        tests: concat(acc.value.tests, f.tests),
+        laws: concat(acc.value.laws, f.laws),
+      },
+    }
+  })
 
 /// The cycles `own` import one another in, each refused at the import that closes it: the cycle
 /// read from its least module, and closed by the module before it.
@@ -958,10 +958,24 @@ pub fn entry_hash(
     let hashed = decoded(a.output, hash_answer_bin(), "a module's hashing");
     {
       run: a.run,
-      hash: fold(hashed.defs, None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
-        if d.name == name { Some(d.hash) } else { acc }),
+      hash: fold(hashed.fixing.nodes, None, |acc: Option<Bytes>, f: Fixed|
+        if !f.decl && f.name == name { Some(f.hash) } else { acc }),
     }
   }
+
+/// The warnings of the first `root` of `answers`, the modules of the load's root package, each
+/// labelled at its module's place among them.
+pub fn root_warnings(answers: List<Answered>, root: Int) -> List<Diag> =
+  fold(range(0, root), [], |acc: List<Diag>, i: Int|
+    match list_at(answers, i) {
+      None -> acc,
+      Some(a) ->
+        concat(
+          acc,
+          map(a.answer.warnings, |d: Diag|
+            { ..d, labels: map(d.labels, |l: Label| { ..l, module: i }) }),
+        ),
+    })
 
 /// Each of `answers` refused for what its own text says: one that imports a refused module may be
 /// refused for that alone, which the refusal of that module says.
@@ -1006,6 +1020,7 @@ fn answered_over(
   let none = |name: Bytes| None;
   let done = over_held(
     held,
+    |path: String| None,
     |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
     |run: Run| asked_all(fresh_registry(), w.own, [], run),
   );
@@ -1609,6 +1624,64 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 /// How many times the run ran the body of the query `name`.
 fn ran_of(run: Run, name: Bytes) -> Int =
   fold(tallies(run), 0, |n: Int, t: Tally| if t.query == name { t.ran } else { n })
+
+/// What hashing fixed of each module of `sources` through a fresh store, and the warnings the load's
+/// root modules answered.
+fn fixed_over(sources: List<Source>) -> { fixing: Fixing, warnings: List<Diag> } / {abort.raise} = {
+  let w = world_of(
+    { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
+    [],
+    [],
+  );
+  let none = |name: Bytes| None;
+  over_held(
+    nothing_held(),
+    |path: String| None,
+    |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
+    |run: Run| {
+      let all = asked_all(fresh_registry(), w.own, [], run);
+      let fixed = hashed_all(fresh_registry(), w.own, all.run);
+      {
+        run: fixed.run,
+        value: { fixing: fixed.value, warnings: root_warnings(all.value, len(sources)) },
+      }
+    },
+  ).value
+}
+
+fn told(ds: List<Diag>) -> List<Bytes> =
+  sort_by(map(ds, |d: Diag| bytes_concat_all([d.code, b": ", d.message])), |a: Bytes, b: Bytes|
+    match compare_values(a, b) { Greater -> false, _ -> true })
+
+/// Cycles, an effect, a specification, a law, a test over cases and an `opaque` type, across modules.
+fn hashed_fixture() -> List<Source> =
+  [
+    {
+      name: b"base",
+      src: b"pub effect tick { write beat() -> Unit }\npub opaque type Coin = new { cents: Int }\npub fn coin(n: Int) -> Coin = { cents: n }\npub fn cents(c: Coin) -> Int = c.cents\npub fn even(n: Int) -> Bool / { tick.write } = if n <= 0 { true } else { tick.beat(); odd(n - 1) }\nfn odd(n: Int) -> Bool / { tick.write } = if n <= 0 { false } else { even(n - 1) }\nfn spare() -> Int = 3\npub fn half(n: Int) -> Int requires n >= 0 ensures result <= n = n / 2\nlaw \"halving shrinks\" forall (n: Int) where n >= 0 { half(n) <= n }\n",
+    },
+    {
+      name: b"app",
+      src: b"import base\npub fn worth(n: Int) -> Int = base::cents(base::coin(base::half(n)))\ntest \"worth\" { assert_eq(worth(4), 2) }\n",
+    },
+  ]
+
+test "a program hashed from its modules' answers hashes as it does hashed whole, and warns alike" {
+  fold([shop(), hashed_fixture()], (), |u: Unit, sources: List<Source>| {
+    let fixed = fixed_over(sources);
+    match ((
+        staged_pulling_std_with(sources, []).hashed,
+        staged_pulling_std_with(sources, [], fixed: fixed.fixing).hashed,
+      )) {
+      (Ok(whole), Ok(taken)) -> {
+        assert_eq(taken.hashes, whole.hashes);
+        assert_eq(taken.unused, []);
+        assert_eq(told(fixed.warnings), told(whole.unused))
+      },
+      _ -> panic("the fixture hashes"),
+    }
+  })
+}
 
 fn layered(lib: Bytes) -> List<Source> =
   [
