@@ -61,13 +61,16 @@ case "${1:-}" in
       for dir in "$stage"/*/; do
         [ -d "$dir" ] || continue
         case "$(basename "$dir")" in
-          # Files swept one by one: each an answer of its own.
-          answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
+          # Files swept one by one, as `sweep`'s `BY_FILE` takes them: each a runnable or an
+          # answer of its own.
+          answered | reused | programs) find "$dir" -type f ! -newer "$mark" -delete ;;
           # A stage, and the memo stores, go whole: its `.used` stamp is what a load writes.
           *) [ -n "$(find "$dir" -type f -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
         esac
       done
     fi
+    # A file beside the stages is what an older layout kept, which nothing this run read.
+    [ -d "$stage" ] && find "$stage" -maxdepth 1 -type f ! -name '.*' ! -newer "$mark" -delete
     find "$cache" "$stage" -mindepth 1 -type d -empty -delete 2>/dev/null || true
     echo "the C cache and stages kept $(megabytes "$cache" "$stage") MB of $before MB"
     ;;

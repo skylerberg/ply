@@ -22,10 +22,10 @@ import compiler.hash (TheFn)
 import compiler.front (Analysis, View, Analysed, Refused, analyse_shipped, view_of)
 import compiler.infer (DefInfo, TestInfo, LawInfo, Builtin, builtin_named, builtins)
 import compiler.prelude_source
-import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef, TDAlias, TDSum,
-                       VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc, SpecClause, ImportDecl,
-                       ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, TDNominal, SchemaDef,
-                       schema_of)
+import compiler.items (parse, header, Module, Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef,
+                       TDAlias, TDSum, VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc,
+                       SpecClause, ImportDecl, ReturnsFresh, ReturnsParam, Vis, VPub, VPriv,
+                       TDNominal, SchemaDef, schema_of)
 import compiler.exprs (Param)
 import compiler.parsing (Doc, Ident, Span)
 import compiler.resolve (ParsedModule, Diag, Source, qualify)
@@ -208,19 +208,38 @@ fn could_name(parsed: ParsedModule, q: Bytes) -> Bool =
     )
     > 0
 
-fn imports_of(parsed: ParsedModule) -> List<Bytes> =
-  map(parsed.module.imports, |d: ImportDecl| bytes::join(map(d.path, |i: Ident| i.name), b"."))
+fn imports_of(module: Module) -> List<Bytes> =
+  map(module.imports, |d: ImportDecl| bytes::join(map(d.path, |i: Ident| i.name), b"."))
 
-/// `names` and every module they import, transitively.
-fn imported_closure(all: List<ParsedSource>, names: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  iterate(names, len(all) + 1, |held: List<Bytes>| {
-    let grown = fold(all, held, |acc: List<Bytes>, p: ParsedSource|
-      if !contains(held, p.name) { acc } else {
-        fold(imports_of(p.module), acc, |a: List<Bytes>, n: Bytes|
-          if contains(a, n) { a } else { push(a, n) })
-      });
-    if len(grown) == len(held) { Stop(held) } else { Continue(grown) }
-  })
+/// What `src` imports, read off its header where that says all of it.
+fn header_imports(src: Bytes) -> List<Bytes> / {abort.raise} =
+  imports_of(match header(src) { Some(m) -> m, None -> parse(src).node })
+
+/// `names` and every module of `srcs` they import, transitively.
+fn imported_closure(srcs: List<Source>, names: List<Bytes>) -> List<Bytes> / {abort.raise} = {
+  let texts = fold(srcs, map_new(), |acc: Map<Bytes, Bytes>, src: Source|
+    map_insert(acc, src.name, src.src));
+  iterate(
+    { held: names, open: names },
+    len(srcs) + 1,
+    |c: { held: List<Bytes>, open: List<Bytes> }|
+      if len(c.open) == 0 { Stop(c) } else {
+        let found = fold(c.open, [], |acc: List<Bytes>, n: Bytes|
+          match map_get(texts, n) {
+            Some(src) ->
+              fold(header_imports(src), acc, |a: List<Bytes>, m: Bytes|
+                if contains(c.held, m) || contains(a, m) { a } else { push(a, m) }),
+            None -> acc,
+          });
+        Continue({ held: concat(c.held, found), open: found })
+      },
+  ).held
+}
+
+/// Whether `src`, the module `name`, could declare what `q` names, or be what `q` names or the module
+/// of it: a module whose text never spells `q` declares nothing by that name.
+fn could_spell(name: Bytes, src: Bytes, q: Bytes) -> Bool =
+  q == name || bytes_starts_with(q, bytes_concat(name, b".")) || bytes_index_of(src, q) != None
 
 /// The shipped modules a query could name something in, and what they import, analysed apart from any
 /// program: where a name no program holds is looked for. A name none of them declares analyses nothing.
@@ -229,12 +248,12 @@ fn shipped_shelf(
 ) -> Option<Shelf> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let shipped = shipped_modules();
   let srcs = filter(shipped, |src: Source| is_std(string_of_bytes_lossy(src.name)));
-  let parsed = parse_all(srcs);
   let q = bytes_of_string(query);
+  let parsed = parse_all(filter(srcs, |src: Source| could_spell(src.name, src.src, q)));
   let wanted = map(filter(parsed, |p: ParsedSource| could_name(p.module, q)), |p: ParsedSource|
     p.name);
   if len(wanted) == 0 { None } else {
-    let closure = imported_closure(parsed, wanted);
+    let closure = imported_closure(srcs, wanted);
     let chosen = filter(srcs, |src: Source| contains(closure, src.name));
     match analyse_shipped(chosen, shipped, shipped_data(chosen)).out {
       Refused(_) -> None,

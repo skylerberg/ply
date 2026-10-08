@@ -61,8 +61,9 @@ CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
 The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
 each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` jobs `desks-<k>`
-run the tests of `serving` and `database`, cut by duration, against a postgres. `.github/ci-corpus.sh run <id>`
-runs one with the grants CI passes.
+run the tests of `serving` and `database`, cut by duration, against a postgres. The proof runs, `proofs` for the
+standard library and `laws-<id>` for a package, each take a `corpus` job of their own.
+`.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 
