@@ -5,11 +5,11 @@
 //! the directory its manifest names; what a module embeds is read beside it; the shipped modules
 //! they import are the binary's own shipped modules.
 
-import front (Dump, EmitterRoot, Embedded, AnalysisOutcome, Analysed, Refused, Rows, Shipping,
-              ShippedView, analyse_pulling_std_with, checked_staged, dump_of, embeds_wanted,
-              module_of, pulls_of, shipped_pulled, staged_pulling_std_with, viewed_text,
-              ModuleShape, answered_load, view_dump)
-import embed (EmbedAt, EmbedRead, EmbedFile)
+import front (Dump, EmitterRoot, AnalysisOutcome, Analysed, Refused, Rows, Shipping, ShippedView,
+              analyse_pulling_std_with, checked_staged, dump_of, module_of, pulls_of,
+              shipped_pulled, staged_pulling_std_with, viewed_text, ModuleShape, answered_load,
+              view_dump)
+import embed (EmbedAt, EmbedRead, EmbedFile, EmbedWant)
 import hash (HashOutput, Fixing, no_fixing, hex)
 import interface (imported)
 import memo
@@ -242,22 +242,21 @@ fn read_embed<[r]>(
     }
   }
 
-/// What each module of the package asks to embed, read.
-fn embeds_of<[r]>(
-  package: Package,
-) -> List<Embedded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], abort.raise} =
-  fold(package.files, [], |acc: List<Embedded>, f: SourceFile|
-    fold(
-      embeds_wanted(bytes_of_string(package.root), [
-        { name: bytes_of_string(f.name), src: f.text },
-      ]),
-      acc,
-      |a: List<Embedded>, embed: Embedded|
-        push(a, {
-          ..embed,
-          read: read_embed[r](f.path, string_of_bytes_lossy(embed.want.path), embed.want.dir),
-        }),
-    ))
+/// What the module `name` of package `k` of `p` embeds as `want` asks: the root package first, then
+/// each dependency in its order.
+fn embed_read<[r]>(
+  p: Prepared,
+  k: Int,
+  name: Bytes,
+  want: EmbedWant,
+) -> EmbedRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} = {
+  let files = if k == 0 { p.own.files }
+  else { match list_at(p.deps, k - 1) { Some(d) -> d.files, None -> [] } };
+  match filter(files, |f: SourceFile| bytes_of_string(f.name) == name) {
+    [f, ..] -> read_embed[r](f.path, string_of_bytes_lossy(want.path), want.dir),
+    [] -> Err(b"no file is there"),
+  }
+}
 
 // --- The front end --------------------------------------------------------------
 
@@ -300,14 +299,8 @@ fn placed(
     })
 }
 
-/// What a read takes in before it loads anything: the program's packages and what each of its
-/// modules embeds.
-pub type Prepared = {
-  own: Package,
-  deps: List<Package>,
-  pkgs: PackageSources,
-  embeds: List<Embedded>,
-}
+/// What a read takes in before it loads anything: the program's packages.
+pub type Prepared = { own: Package, deps: List<Package>, pkgs: PackageSources }
 
 /// The program below `root` as a load takes it in. A file that cannot be a module and a dependency
 /// `ply` would have to fetch are each a refusal.
@@ -327,13 +320,7 @@ pub fn prepared<[r]>(
             manifest: own.manifest,
             supplied: map(deps, supplied_of),
           };
-          Ok({
-            own: own,
-            deps: deps,
-            pkgs: pkgs,
-            embeds: fold(deps, embeds_of[r](own), |acc: List<Embedded>, package: Package|
-              concat(acc, embeds_of[r](package))),
-          })
+          Ok({ own: own, deps: deps, pkgs: pkgs })
         },
       }
     },
@@ -351,23 +338,30 @@ fn world_for(p: Prepared) -> World / {abort.raise} =
   world_of(
     own_package(p.pkgs.root, p.own),
     map(range(0, len(p.deps)), |i: Int| own_package(at(p.pkgs.supplied, i).root, at(p.deps, i))),
-    p.embeds,
   )
 
 fn held_module(name: Bytes) -> Option<Bytes> / {shipped.module} =
   shipped.module(string_of_bytes_lossy(name))
 
-/// `work` over a load of `p`, through the memo store in the stage `dir` names for the queries that
-/// answer, or over none where `dir` is empty.
-fn in_store<a, [r]>(
+/// `work` over a load of `p`, whose files are read under `s`, through the memo store in the stage
+/// `dir` names under `r` for the queries that answer, or over none where `dir` is empty.
+fn in_store<a, [r], [s]>(
   p: Prepared,
   dir: String,
   work: (Map<Bytes, Query>, World, Run) -> { run: Run, value: a } / {memo_keep.read, memo_keep.write, abort.raise},
-) -> a / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} = {
+) -> a / {shipped.answer, shipped.names, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.module, shipped.definitions, shipped.stamps, abort.raise} = {
   let w = world_for(p);
   let qs = running();
   let look = |kind: Bytes, at: Bytes|
-    looked(w, held_module, held_module, || map(shipped.names(), bytes_of_string), kind, at);
+    looked(
+      w,
+      held_module,
+      held_module,
+      || map(shipped.names(), bytes_of_string),
+      |k: Int, name: Bytes, want: EmbedWant| embed_read[s](p, k, name, want),
+      kind,
+      at,
+    );
   if dir == "" {
     memo::fresh(|path: String| shipped.answer(path), look, || work(qs, w, started(qs)).value)
   } else {
@@ -411,36 +405,44 @@ fn asked(
 
 /// What each module of `p` and each shipped module it pulls answers, through the memo store in the
 /// stage `dir` names (none where `dir` is empty).
-pub fn answers_of<[r]>(
+pub fn answers_of<[r], [s]>(
   p: Prepared,
   dir: String,
-) -> Asked / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
-  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| asked(qs, w, run))
+) -> Asked / {shipped.answer, shipped.names, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
+  in_store[r, s](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| asked(qs, w, run))
 
 /// The hash of `entry` as hashing its module fixed it, through the memo store in the stage `dir`
 /// names: nothing where its module does not define it or does not hash. No other module is asked,
 /// so one beside it that no longer parses is not read.
-pub fn entry_hash_of<[r]>(
+pub fn entry_hash_of<[r], [s]>(
   p: Prepared,
   dir: String,
   entry: Bytes,
-) -> Option<Bytes> / {shipped.answer, shipped.names, fs.read[r], fs.write[r], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
-  in_store[r](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| {
+) -> Option<Bytes> / {shipped.answer, shipped.names, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.module, shipped.definitions, shipped.stamps, abort.raise} =
+  in_store[r, s](p, dir, |qs: Map<Bytes, Query>, w: World, run: Run| {
     let h = entry_hash(qs, run, entry_module(entry), entry);
     { run: h.run, value: h.hash }
   })
 
 /// [`answers_of`] with nothing kept: what the toolchain ships answered for the shipped modules is
 /// still read.
-pub fn answers_afresh(
+pub fn answers_afresh<[s]>(
   p: Prepared,
-) -> Asked / {shipped.answer, shipped.names, shipped.module, shipped.definitions, shipped.stamps, abort.raise} = {
+) -> Asked / {shipped.answer, shipped.names, fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.module, shipped.definitions, shipped.stamps, abort.raise} = {
   let w = world_for(p);
   let qs = running();
   memo::fresh(
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes|
-      looked(w, held_module, held_module, || map(shipped.names(), bytes_of_string), kind, at),
+      looked(
+        w,
+        held_module,
+        held_module,
+        || map(shipped.names(), bytes_of_string),
+        |k: Int, name: Bytes, want: EmbedWant| embed_read[s](p, k, name, want),
+        kind,
+        at,
+      ),
     || asked(qs, w, started(qs)).value,
   )
 }
@@ -603,7 +605,7 @@ pub fn load<[r]>(
 ) -> Result<Loaded, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.runtime, shipped.definitions, shipped.stamps, abort.raise} =
   match prepared[r](root) {
     Err(u) -> Err(u.diags),
-    Ok(p) -> match assembled(p, answers_afresh(p), true) {
+    Ok(p) -> match assembled(p, answers_afresh[r](p), true) {
       Err(u) -> Err(u.diags),
       Ok(c) -> match compiled(
           shipped.runtime(),

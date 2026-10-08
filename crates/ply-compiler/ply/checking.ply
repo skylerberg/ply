@@ -25,7 +25,7 @@ import items (Module, ImportDecl, header, parse)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
 import interface (imported)
-import embed (EmbedFile, EmbedRead, embed_key)
+import embed (EmbedFile, EmbedRead, EmbedWant, embed_key, want_of_key)
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token)
 import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span,
                 import_module_name)
@@ -619,12 +619,11 @@ pub type OwnFile = { module: Bytes, text: Bytes }
 pub type OwnPackage = { root: Bytes, manifest: Option<Bytes>, files: List<OwnFile> }
 
 /// What the world holds for the queries of a load: its packages, where each of its own modules is
-/// and its text, what each embeds, and the names of its own modules in the order a load places them.
+/// and its text, and the names of its own modules in the order a load places them.
 pub type World = {
   layout: Bytes,
   places: Map<Bytes, Bytes>,
   texts: Map<Bytes, Bytes>,
-  embeds: Map<Bytes, Bytes>,
   own: List<Bytes>,
 }
 
@@ -635,14 +634,9 @@ fn embedding_of(read: EmbedRead) -> Embedding =
     Err(why) -> { files: [], refused: Some(why) },
   }
 
-/// The world of a load of `root` and `deps`, which embed what `embeds` read. Its packages are what
-/// their manifests say, judged, and its modules what they are named and hold: where a package or a
-/// file is, is no part of it.
-pub fn world_of(
-  root: OwnPackage,
-  deps: List<OwnPackage>,
-  embeds: List<Embedded>,
-) -> World / {abort.raise} = {
+/// The world of a load of `root` and `deps`. Its packages are what their manifests say, judged, and
+/// its modules what they are named and hold: where a package or a file is, is no part of it.
+pub fn world_of(root: OwnPackage, deps: List<OwnPackage>) -> World / {abort.raise} = {
   let j = judged(
     {
       root: root.root,
@@ -666,11 +660,6 @@ pub fn world_of(
         }))
     },
   );
-  let place_of = fold(
-    range(0, len(deps)),
-    map_insert(map_new(), root.root, 0),
-    |acc: Map<Bytes, Int>, k: Int| map_insert(acc, at(deps, k).root, k + 1),
-  );
   {
     layout: bin::encode(placeless(j), judged_bin()),
     places: fold(
@@ -685,25 +674,50 @@ pub fn world_of(
       |acc: Map<Bytes, Bytes>, x: { name: Bytes, placing: Placing, text: Bytes }|
         map_insert(acc, x.name, x.text),
     ),
-    embeds: fold(embeds, map_new(), |acc: Map<Bytes, Bytes>, e: Embedded| {
-      let at_root = match map_get(place_of, e.root) { Some(k) -> place_token(k), None -> e.root };
-      map_insert(
-        acc,
-        embed_at(at_root, e.module, embed_key(e.want)),
-        bin::encode(embedding_of(e.read), embedding_bin()),
-      )
-    }),
     own: map(placed, |x: { name: Bytes, placing: Placing, text: Bytes }| x.name),
   }
 }
 
-/// What `w` holds as `kind` reads it at `at`, a shipped module's text, a data file's bytes and the
-/// shipped modules there are as `shipped`, `data` and `names` answer them.
+/// Where the module `module`, by its name in the program, is among `w`'s packages.
+pub fn world_placing(w: World, module: Bytes) -> Option<Placing> / {abort.raise} =
+  match map_get(w.places, module) {
+    Some(b) -> Some(decoded(b, placing_bin(), "a module's place")),
+    None -> None,
+  }
+
+/// What the module of `w` that `at` names embeds, read through `reader`, which is handed the module's
+/// package, its name there and what it asks for: nothing for a module `w` does not hold.
+fn embedded_at<| e>(
+  w: World,
+  reader: (Int, Bytes, EmbedWant) -> EmbedRead / {abort.raise | e},
+  at: Bytes,
+) -> Option<Bytes> / {abort.raise | e} = {
+  let parts = bytes_split(at, b"\x00");
+  match ((list_at(parts, 1), list_at(parts, 2))) {
+    (Some(module), Some(key)) -> match world_placing(w, module) {
+      None -> None,
+      Some(p) -> {
+        Some(
+          bin::encode(
+            embedding_of(reader(p.package, p.relative, want_of_key(key))),
+            embedding_bin(),
+          ),
+        )
+      },
+    },
+    _ -> None,
+  }
+}
+
+/// What `w` holds as `kind` reads it at `at`, a shipped module's text, a data file's bytes, the
+/// shipped modules there are and what a module embeds as `shipped`, `data`, `names` and `reader`
+/// answer them.
 pub fn looked<| e>(
   w: World,
   shipped: (Bytes) -> Option<Bytes> / {abort.raise | e},
   data: (Bytes) -> Option<Bytes> / {abort.raise | e},
   names: () -> List<Bytes> / {abort.raise | e},
+  reader: (Int, Bytes, EmbedWant) -> EmbedRead / {abort.raise | e},
   kind: Bytes,
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
@@ -713,7 +727,7 @@ pub fn looked<| e>(
   else if kind == text_kind() { map_get(w.texts, at) }
   else if kind == shipped_kind() { shipped(at) }
   else if kind == data_kind() { data(at) }
-  else if kind == embed_kind() { map_get(w.embeds, at) }
+  else if kind == embed_kind() { embedded_at(w, reader, at) }
   else { None }
 
 /// The evaluator's line of the `stamps` the launcher lays beside the shipped modules: what an answer
@@ -1113,6 +1127,9 @@ fn said(outcome: AnalysisOutcome) -> Said / {abort.raise} =
     Analysed(_) -> Publishing(published(outcome)),
   }
 
+fn nothing_embedded(package: Int, module: Bytes, want: EmbedWant) -> EmbedRead =
+  Err(b"no file is there")
+
 /// `sources` answered through the module queries over `held`, as a load assembles them: refused by
 /// the errors of each module no refused import explains, else analysed whole, each definition and
 /// test taken as its module's answer published it.
@@ -1123,13 +1140,12 @@ fn answered_over(
   let w = world_of(
     { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
     [],
-    [],
   );
   let none = |name: Bytes| None;
   let done = over_held(
     held,
     |path: String| None,
-    |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
+    |kind: Bytes, at: Bytes| looked(w, none, none, || [], nothing_embedded, kind, at),
     || {
       let qs = fresh_registry();
       let all = asked_all(qs, w.own, [], false, started(qs));
@@ -1746,13 +1762,12 @@ fn fixed_over(
   let w = world_of(
     { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
     [],
-    [],
   );
   let none = |name: Bytes| None;
   over_held(
     nothing_held(),
     |path: String| None,
-    |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
+    |kind: Bytes, at: Bytes| looked(w, none, none, || [], nothing_embedded, kind, at),
     || {
       let qs = fresh_registry();
       let all = asked_all(qs, w.own, [], false, started(qs));
@@ -1881,7 +1896,6 @@ test "a program assembled from its modules' answers, a shipped module's among th
   let w = world_of(
     { root: b"", manifest: None, files: map(f.user, |s: Source| { module: s.name, text: s.src }) },
     [],
-    [],
   );
   let texts = fold(f.shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
@@ -1896,7 +1910,7 @@ test "a program assembled from its modules' answers, a shipped module's among th
       let done = over_held(
         nothing_held(),
         |path: String| None,
-        |kind: Bytes, at: Bytes| looked(w, held, held, || names, kind, at),
+        |kind: Bytes, at: Bytes| looked(w, held, held, || names, nothing_embedded, kind, at),
         || {
           let qs = fresh_registry();
           let all = asked_all(
