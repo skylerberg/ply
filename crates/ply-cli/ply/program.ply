@@ -29,9 +29,8 @@ import diagnostic (Place, spot_of)
 import paths
 import proof.statics (Unshown, unshown)
 import proof.world (measures_in)
-import sources (File, Project, DepPackage, Embed, KeptShipping, PullReads, load_resolved,
-                shipping_for, shipping_kept, no_shipping, shipped_listed, nothing_here, is_std,
-                is_compiler)
+import sources (File, Project, DepPackage, Embed, load_resolved, asked_shipped, shipping_kept_of,
+                shipping_of, shipped_listed, nothing_here, is_std, is_compiler)
 import builder (builder)
 import queried
 import queried (Queried)
@@ -88,15 +87,7 @@ pub type ModuleReport = {
 /// A load with the clock read between its phases, for the command that reports where the time went:
 /// the walk and the shipped modules; and the front end, its modules answered through the memo store
 /// among it. `cached` and `file_ms` are what no load files any more.
-/// `pulls` is how a load that keeps what its modules pull found it; `None` for one that keeps none.
-pub type Timed = {
-  program: Program,
-  read_ms: Int,
-  front_ms: Int,
-  file_ms: Int,
-  cached: Bool,
-  pulls: Option<PullReads>,
-}
+pub type Timed = { program: Program, read_ms: Int, front_ms: Int, file_ms: Int, cached: Bool }
 
 // --- Where a shipped module's text is said to live ------------------------------
 
@@ -268,6 +259,7 @@ fn analysed(
   project: Project,
   shipping: Shipping,
   answers: List<Answered>,
+  pulled: List<Bytes>,
   reached: Bool,
   fixed: Fixing,
 ) -> Program / {abort.raise} = {
@@ -281,9 +273,10 @@ fn analysed(
     fold(answers, map_new(), |acc: Map<Bytes, ModuleShape>, a: Answered|
       map_insert(acc, a.module, a.answer.shape)),
     fixed,
-    shipping.read,
-    shipping.unread,
-    shipping.asked,
+    pulled,
+    shipped_listed(shipping),
+    fold(shipping.read, map_new(), |acc: Map<Bytes, Bytes>, source: Source|
+      map_insert(acc, source.name, source.src)),
     true,
     reached,
     warnings,
@@ -411,16 +404,16 @@ fn assembled(
   q: Queried,
   reached: Bool = true,
 ) -> Program / {abort.raise} =
-  { ..assembled_from(project, shipping, paths, q.answers, q.fixing, reached), tallies: q.tallies }
+  { ..assembled_from(project, shipping, paths, q, reached), tallies: q.tallies }
 
 fn assembled_from(
   project: Project,
   shipping: Shipping,
   paths: List<paths::Resolved>,
-  answers: List<Answered>,
-  fixed: Fixing,
+  q: Queried,
   reached: Bool,
-) -> Program / {abort.raise} =
+) -> Program / {abort.raise} = {
+  let answers = q.answers;
   if len(project.diags) > 0 { broken(project, shipping, own_places(project), project.diags) }
   else if len(project.sources) == 0 {
     broken(project, shipping, [], [
@@ -454,8 +447,9 @@ fn assembled_from(
         }
       });
       broken(project, shipping, concat(concat(own.modules, pulled), own.manifests), diags)
-    } else { analysed(project, shipping, answers, reached, fixed) }
+    } else { analysed(project, shipping, answers, q.pulled, reached, q.fixing) }
   }
+}
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
   interfaces::slots(project.root_key, map(project.packages, |package: DepPackage| package.root))
@@ -498,23 +492,22 @@ fn placed_sources(program: Program, frame: Frame) -> List<SourceFile> / {abort.r
     })
 }
 
-/// Each module of `project`'s own packages and each shipped module `shipping` pulls, answered checked
-/// through the memo store beside the project; a shipped one read with its tests where `every` says,
-/// as a run over the standard library's own tests reads it.
+/// Each module of `project`'s own packages and each shipped module they pull, answered checked
+/// through the memo store beside the project; with `every`, each module of the standard library
+/// pulled whatever imports it and read with its tests, as a run over its own tests reads it.
 fn answers_of(
   paths: List<paths::Resolved>,
   project: Project,
-  shipping: Shipping,
   every: Bool,
 ) -> Queried / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], shipped.answer, abort.raise} =
   if !usable(project) { queried::nothing() } else {
-    let shipped = map(shipping.read, |s: Source| s.name);
+    let asked = asked_shipped(every);
     match list_at(paths, 0) {
-      None -> queried::answered_afresh(project, shipped, every),
+      None -> queried::answered_afresh(project, asked, every),
       Some(r) -> {
         let dir = paths::in_root(r, ".ply-cache/memo").path;
-        if r.label == "cwd" { queried::answered[cwd](dir, project, shipped, every) }
-        else { queried::answered[abs](dir, project, shipped, every) }
+        if r.label == "cwd" { queried::answered[cwd](dir, project, asked, every) }
+        else { queried::answered[abs](dir, project, asked, every) }
       },
     }
   }
@@ -522,11 +515,10 @@ fn answers_of(
 /// [`answers_of`] answered afresh, with nothing kept.
 fn answers_afresh(
   project: Project,
-  shipping: Shipping,
   every: Bool,
 ) -> Queried / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   if !usable(project) { queried::nothing() }
-  else { queried::answered_afresh(project, map(shipping.read, |s: Source| s.name), every) }
+  else { queried::answered_afresh(project, asked_shipped(every), every) }
 
 /// `interfaced` is false for a run whose scope takes in the shipped modules: it reads their source.
 /// `verify` holds each published interface to what this load reads of its package's source.
@@ -536,20 +528,13 @@ pub fn load_program(
   verify: Bool = false,
 ) -> Program / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
-  let shipping: Shipping = if usable(project) {
-    shipping_kept(paths, project.sources, pkgs_of(project)).shipping
-  } else { no_shipping() };
+  let answers = answers_of(paths, project, false);
+  let shipping = shipping_kept_of(answers.pulled, false);
   let p: Program = verified(
     project,
     shipping,
     verify,
-    assembled(
-      project,
-      shipping,
-      paths,
-      answers_of(paths, project, shipping, false),
-      reached: interfaced,
-    ),
+    assembled(project, shipping, paths, answers, reached: interfaced),
   );
   tell_viewed(p.viewed, true);
   p
@@ -580,9 +565,8 @@ pub fn load_uncached(
   paths: List<paths::Resolved>,
 ) -> Program / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], abort.raise, diverges, shipped.reached} = {
   let project: Project = load_resolved(paths);
-  let shipping: Shipping = if usable(project) { shipping_for(project.sources, pkgs_of(project)) }
-  else { no_shipping() };
-  let p = assembled(project, shipping, paths, answers_afresh(project, shipping, false));
+  let answers = answers_afresh(project, false);
+  let p = assembled(project, shipping_of(answers.pulled, false), paths, answers);
   tell_viewed(p.viewed, true);
   p
 }
@@ -635,11 +619,8 @@ pub fn timed_over(
   every: Bool = false,
 ) -> Timed / {shipped.answer, env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, abort.raise, shipped.reached} = {
   let interfaced = interfaced && !every;
-  let found: KeptShipping = if usable(project) {
-    shipping_kept(paths, project.sources, pkgs_of(project), every)
-  } else { { shipping: no_shipping(), reads: { lexed: 0, kept: 0 } } };
-  let shipping = found.shipping;
-  let answers = answers_of(paths, project, shipping, every);
+  let answers = answers_of(paths, project, every);
+  let shipping = shipping_kept_of(answers.pulled, every);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
@@ -654,7 +635,6 @@ pub fn timed_over(
     front_ms: time.elapsed_ms() - read_done,
     file_ms: 0,
     cached: true,
-    pulls: Some(found.reads),
   }
 }
 
@@ -676,10 +656,8 @@ pub fn timed_uncached_over(
   verify: Bool = false,
   every: Bool = false,
 ) -> Timed / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read_file[abs], abort.raise, shipped.reached} = {
-  let shipping: Shipping = if usable(project) {
-    shipping_for(project.sources, pkgs_of(project), every)
-  } else { no_shipping() };
-  let answers = answers_afresh(project, shipping, every);
+  let answers = answers_afresh(project, every);
+  let shipping = shipping_of(answers.pulled, every);
   let read_done = time.elapsed_ms();
   let p: Program = verified(
     project,
@@ -694,7 +672,6 @@ pub fn timed_uncached_over(
     front_ms: time.elapsed_ms() - read_done,
     file_ms: 0,
     cached: false,
-    pulls: None,
   }
 }
 
