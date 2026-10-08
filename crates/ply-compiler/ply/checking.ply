@@ -6,18 +6,19 @@
 import std.bin
 import std.hash (blake3)
 import std.bytes (join, hex_of)
-import std.list (at, concat, contains, sort_by)
+import std.list (at, concat, contains, reverse, sort_by)
 import memo (memo, memo_keep, Query, Run, Tally, answer, tallies, ran_total)
 import memo_files (Held, nothing_held, over_held)
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
-                Reading, checked_against, exports_of, of_module, hashes_by_owner, hash_owners,
-                named_node, needed_by, wanted_in, entry_bin, exports_bin, hash_entry_bin,
-                hashes_bin)
+                Reading, checked_against, exports_of, hashes_by_owner, hash_owners, named_node,
+                needed_by, wanted_in, entry_bin, exports_bin, hash_entry_bin, hashes_bin)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedData, Rows,
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
               shipped_data_wanted, shipped_texts_wanted, rows_of, no_rows, rows_bin, analyse,
-              analyse_with, published, staged_pulling_std_with)
+              analyse_with, published, staged_pulling_std_with, analyse_pulling_std_with, of_module,
+              ModuleFacts, module_facts, no_facts, module_facts_bin, answered_program,
+              answered_load, view_of, view_dump, faceted, dump_of, walked_facts_bin)
 import items (Module, ImportDecl, header, parse)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
@@ -60,6 +61,9 @@ pub type ModuleAnswer = {
   imports: List<Bytes>,
   /// What hashing reads of it apart from what it imports.
   forms: FormsAnswer,
+  /// What its check said of its own declarations, which a load assembled from its modules' answers
+  /// merges.
+  facts: ModuleFacts,
 }
 
 /// What hashing reads of a module apart from what it imports: its forms, the owner each function's
@@ -396,6 +400,7 @@ fn absent(module: Bytes) -> ModuleAnswer =
     rows: no_rows(),
     imports: [],
     forms: no_forms(),
+    facts: no_facts(module),
   }
 
 fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.raise} = {
@@ -435,6 +440,7 @@ fn answered(shipped: Bool, m: ModuleRead) -> ModuleAnswer / {memo.read, abort.ra
           fns: owning.fns,
           owners: owning.owners,
         },
+        facts: module_facts(w, i),
       }
     },
   }
@@ -806,31 +812,34 @@ pub fn packages_refused(
   map(judged(pkgs, root_modules).diags, |sd: { slot: Int, diag: ParseDiag }|
     placed(modules + sd.slot, sd.diag))
 
-/// What hashing fixed of each of `own`, the load's own modules, asked of `qs` over a run: what a
-/// load of the whole program hashes nothing of. A shipped module is hashed there for what the
-/// program reaches of it, which costs less than reading all its module fixed.
+/// What hashing fixed of each of `own`, the load's own modules, and of `shipped`, the shipped modules
+/// it pulls, asked of `qs` over a run: what a load assembled from its modules' answers takes in place
+/// of hashing the program.
 pub fn hashed_all(
   qs: Map<Bytes, Query>,
   own: List<Bytes>,
+  shipped: List<Bytes>,
   run: Run,
 ) -> { run: Run, value: Fixing } / {memo_keep.read, memo_keep.write, abort.raise} =
-  fold(own, { run: run, value: no_fixing() }, |acc: { run: Run, value: Fixing }, module: Bytes| {
-    let a = answer(
-      qs,
-      acc.run,
-      hashes_query(),
-      bin::encode({ module: module, shipped: false }, named_bin()),
-    );
-    let f = decoded(a.output, hash_answer_bin(), "a module's hashing").fixing;
-    {
-      run: a.run,
-      value: {
-        nodes: concat(acc.value.nodes, f.nodes),
-        tests: concat(acc.value.tests, f.tests),
-        laws: concat(acc.value.laws, f.laws),
-      },
-    }
-  })
+  fold(
+    concat(
+      map(own, |n: Bytes| { module: n, shipped: false }),
+      map(shipped, |n: Bytes| { module: n, shipped: true }),
+    ),
+    { run: run, value: no_fixing() },
+    |acc: { run: Run, value: Fixing }, named: Named| {
+      let a = answer(qs, acc.run, hashes_query(), bin::encode(named, named_bin()));
+      let f = decoded(a.output, hash_answer_bin(), "a module's hashing").fixing;
+      {
+        run: a.run,
+        value: {
+          nodes: concat(acc.value.nodes, f.nodes),
+          tests: concat(acc.value.tests, f.tests),
+          laws: concat(acc.value.laws, f.laws),
+        },
+      }
+    },
+  )
 
 /// The cycles `own` import one another in, each refused at the import that closes it: the cycle
 /// read from its least module, and closed by the module before it.
@@ -1625,9 +1634,11 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 fn ran_of(run: Run, name: Bytes) -> Int =
   fold(tallies(run), 0, |n: Int, t: Tally| if t.query == name { t.ran } else { n })
 
-/// What hashing fixed of each module of `sources` through a fresh store, and the warnings the load's
-/// root modules answered.
-fn fixed_over(sources: List<Source>) -> { fixing: Fixing, warnings: List<Diag> } / {abort.raise} = {
+/// What each module of `sources` answered through a fresh store, what hashing fixed of each, and the
+/// warnings the load's root modules answered.
+fn fixed_over(
+  sources: List<Source>,
+) -> { answers: List<Answered>, fixing: Fixing, warnings: List<Diag> } / {abort.raise} = {
   let w = world_of(
     { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
     [],
@@ -1640,10 +1651,14 @@ fn fixed_over(sources: List<Source>) -> { fixing: Fixing, warnings: List<Diag> }
     |kind: Bytes, at: Bytes| looked(w, none, none, || [], kind, at),
     |run: Run| {
       let all = asked_all(fresh_registry(), w.own, [], run);
-      let fixed = hashed_all(fresh_registry(), w.own, all.run);
+      let fixed = hashed_all(fresh_registry(), w.own, [], all.run);
       {
         run: fixed.run,
-        value: { fixing: fixed.value, warnings: root_warnings(all.value, len(sources)) },
+        value: {
+          answers: all.value,
+          fixing: fixed.value,
+          warnings: root_warnings(all.value, len(sources)),
+        },
       }
     },
   ).value
@@ -1681,6 +1696,132 @@ test "a program hashed from its modules' answers hashes as it does hashed whole,
       _ -> panic("the fixture hashes"),
     }
   })
+}
+
+test "a program's tables made from its modules' answers are the tables of its check whole" {
+  fold(
+    [shop(), hashed_fixture(), faceted(), reverse(faceted())],
+    (),
+    |u: Unit, sources: List<Source>| {
+      let fixed = fixed_over(sources);
+      match analyse_pulling_std_with(sources, [], [], []).out {
+        Refused(_) -> panic("the fixture checks"),
+        Analysed(w) -> {
+          let answered = answered_program(
+            map(fixed.answers, |a: Answered| a.answer.facts),
+            fixed.fixing,
+            map_new(),
+            true,
+            true,
+            w.warnings,
+            w.manifest,
+            w.packages,
+            w.pins,
+            w.module_packages,
+            w.embeds,
+          );
+          assert_eq(answered.view.checked.defs, w.checked.defs);
+          assert_eq(answered.view.tagged, view_of(w).tagged);
+          assert_eq(answered.view, view_of(w));
+          let made = view_dump(answered.view, None);
+          let whole = dump_of(Analysed(w));
+          assert_eq(made.defs, whole.defs);
+          assert_eq(made.tests, whole.tests);
+          assert_eq(made.effects, whole.effects);
+          assert_eq(made.ctors, whole.ctors);
+          assert_eq(made.hashes, whole.hashes);
+          assert_eq(made.keys, whole.keys);
+          assert_eq(made.emitter_roots, whole.emitter_roots);
+          assert_eq(made.rows, whole.rows);
+          let walked = |b: Bytes|
+            match bin::decode(b, walked_facts_bin()) {
+              Ok(w) -> w,
+              Err(_) -> panic("walked facts decode"),
+            };
+          let a = walked(made.walked);
+          let b = walked(whole.walked);
+          assert_eq(a.pure, b.pure);
+          assert_eq(a.orders, b.orders);
+          assert_eq(a.loose.label_sites, b.loose.label_sites);
+          assert_eq(a.loose.updates, b.loose.updates);
+          assert_eq(a.loose.ops, b.loose.ops);
+          assert_eq(a.loose.refs, b.loose.refs);
+          assert_eq(a.loose.operands, b.loose.operands);
+          assert_eq(a.loose.tries, b.loose.tries);
+          assert_eq(made.walked, whole.walked);
+          assert_eq(made, whole)
+        },
+      }
+    },
+  )
+}
+
+/// A program, and a shipped module it reaches in part: a generic over a numeric type, a tagged
+/// literal's parser, what a type states, and functions nothing reaches.
+fn pulling() -> { user: List<Source>, shipped: List<Source> } =
+  {
+    user: [
+      {
+        name: b"main",
+        src: b"import std.shapes\nimport std.shapes (origin, far, Tag, size)\npub fn main() -> Int = far(origin()) + size(0 - 1) + shapes\"two\"\npub fn named(t: Tag) -> String = \"{t}\"\ntest \"sized\" { assert_eq(size(0 - 3), 3) }\n",
+      },
+    ],
+    shipped: [
+      {
+        name: b"std.shapes",
+        src: b"pub type Point = { x: Int, y: Int }\npub fn origin() -> Point = { x: 0, y: 0 }\npub fn far(p: Point) -> Int requires p.x >= 0 = p.x + helper(p)\nfn helper(p: Point) -> Int = p.y\nfn spare() -> Int = 5\npub fn unreached() -> Int requires spare() > 0 = spare()\npub type Tag = | A | B\nfn tag_text(t: Tag) -> String = match t { A -> \"a\", B -> \"b\" }\nshow for Tag by tag_text\npub fn size<a>(n: a) -> a where numeric(a) = { let zero: a = numeric_of_int(0); if n < zero { zero - n } else { n } }\npub fn spare_size<a>(n: a) -> a where numeric(a) = n\npub fn literal(text: String) -> Result<Int, { message: String, offset: Int }> = if text == \"two\" { Ok(2) } else { Err({ message: \"not two\", offset: 0 }) }\ntest \"shipped\" { assert_eq(far(origin()), 0) }\n",
+      },
+    ],
+  }
+
+test "a program assembled from its modules' answers, a shipped module's cut to its reach among them, is the program checked whole" {
+  let f = pulling();
+  let w = world_of(
+    { root: b"", manifest: None, files: map(f.user, |s: Source| { module: s.name, text: s.src }) },
+    [],
+    [],
+  );
+  let texts = fold(f.shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let held = |name: Bytes| map_get(texts, name);
+  let names = map(f.shipped, |s: Source| s.name);
+  let done = over_held(
+    nothing_held(),
+    |path: String| None,
+    |kind: Bytes, at: Bytes| looked(w, held, held, || names, kind, at),
+    |run: Run| {
+      let all = asked_all(fresh_registry(), w.own, names, run);
+      let fixed = hashed_all(fresh_registry(), w.own, names, all.run);
+      { run: fixed.run, value: { answers: all.value, fixing: fixed.value } }
+    },
+  ).value;
+  let loaded = answered_load(
+    map(f.user, |s: Source| s.name),
+    { root: b"", manifest: None, supplied: [] },
+    fold(done.answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
+      map_insert(acc, a.module, a.answer.facts)),
+    done.fixing,
+    f.shipped,
+    [],
+    [],
+    true,
+    true,
+    root_warnings(done.answers, len(f.user)),
+  );
+  match analyse_pulling_std_with(f.user, f.shipped, [], [], reached: true).out {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(whole) -> {
+      let view = view_of(whole);
+      assert_eq(loaded.pulled, [b"std.shapes"]);
+      assert_eq(loaded.program.view.outlines, view.outlines);
+      assert_eq(loaded.program.view.checked.defs, view.checked.defs);
+      assert_eq(loaded.program.view.checked.facts, view.checked.facts);
+      assert_eq(loaded.program.view.checked, view.checked);
+      assert_eq(loaded.program.view.hashes, view.hashes);
+      assert_eq(loaded.program.view, view);
+      assert_eq(view_dump(loaded.program.view, None), dump_of(Analysed(whole)))
+    },
+  }
 }
 
 fn layered(lib: Bytes) -> List<Source> =

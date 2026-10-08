@@ -1,7 +1,8 @@
 //! The program a command answers about: the files a path names, the shipped modules they pulled off
 //! the shipped modules, and every table the front end holds for them. One load per invocation. A
-//! load answers each module through the memo store and then analyses the program whole, each
-//! definition taken as its module answered it, so a run checks what moved since the last one.
+//! load answers each module through the memo store and takes the program's tables from what its
+//! modules answered, so a run checks what moved since the last one; a command that reads syntax
+//! analyses the program whole again, each definition taken as its module answered it.
 
 import env (env)
 import compiler.load (LoadedAnalysis, SourceFile, tell_viewed)
@@ -9,9 +10,9 @@ import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
 import compiler.front (Refused, Analysed, Analysis, Pulled, Rows, DefInterface, Shipping,
-                       ShippedView, Within, analyse_pulling_std_with, dump_of, dump_within,
-                       embeds_now, module_items, module_imports, no_rows, pins_pulling, rows_of,
-                       KnownDefRow, KnownTestRow)
+                       ShippedView, Within, View, Outline, Outlined, OFn, FnOutline, ModuleFacts,
+                       analyse_pulling_std_with, answered_load, dump_of, view_dump, view_of,
+                       embeds_now, no_rows, pins_pulling, rows_of, KnownDefRow, KnownTestRow)
 import compiler.pkg (PackageSources, Pinned, Supplied)
 import interfaces
 import compiler.hash
@@ -33,20 +34,28 @@ import sources (File, Project, DepPackage, Embed, KeptShipping, PullReads, load_
 import builder (builder)
 import queried
 import queried (Queried)
+import statements (statement_modules)
 import compiler.memo (Tally)
 import compiler.checking (Answered, packages_refused, refused_first, root_warnings)
 import std.random (entropy)
-import std.list (at, concat, contains, drop, push_unique)
+import std.list (at, concat, contains, drop, push_unique, take)
 import std.string (join)
 import compiler.parsing (no_module)
 
-/// `whole` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
+/// `view` is `None` exactly when `diags` holds an error: a stage that reported stopped the rest.
 /// `pkgs` is kept so a re-analysis (`ply replace`, a mutant) reads what the load did.
 pub type Program = {
   files: List<File>,
   places: List<Place>,
   diags: List<Diag>,
+  view: Option<View>,
+  /// The program analysed whole, where the load read something of its own modules from syntax.
   whole: Option<Analysis>,
+  /// The root package's modules, and what their answers published and hashing fixed of every
+  /// module: what [`whole_of`] analyses the program from.
+  sources: List<Source>,
+  rows: Rows,
+  fixed: Fixing,
   pkgs: PackageSources,
   embeds: List<Embed>,
   /// The shipped modules the load read, which a splice of it pulls again.
@@ -63,7 +72,7 @@ pub type ModuleView = { name: String, path: String }
 
 /// A module as `ply check` reports it: what it declares and what it imports, beside its place.
 /// `index` is the one a label's module points into.
-pub type ModuleFacts = {
+pub type ModuleReport = {
   index: Int,
   name: String,
   path: String,
@@ -109,10 +118,33 @@ fn broken(project: Project, shipping: Shipping, places: List<Place>, diags: List
     files: project.files,
     places: places,
     diags: diags,
+    view: None,
     whole: None,
+    sources: project.sources,
+    rows: no_rows(),
+    fixed: no_fixing(),
     pkgs: pkgs_of(project),
     embeds: project.embeds,
     shipping: shipping,
+    reached: true,
+    viewed: [],
+    tallies: [],
+  }
+
+/// A program nothing was loaded for: what a test hands a command that reads only what it is given.
+pub fn no_program() -> Program =
+  {
+    files: [],
+    places: [],
+    diags: [],
+    view: None,
+    whole: None,
+    sources: [],
+    rows: no_rows(),
+    fixed: no_fixing(),
+    pkgs: { root: b"", manifest: None, supplied: [] },
+    embeds: [],
+    shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
     reached: true,
     viewed: [],
     tallies: [],
@@ -196,14 +228,14 @@ fn front_end(
 /// are walked again with every definition whose check reads one of them.
 pub fn reanalysed(
   program: Program,
-  analysis: Analysis,
+  view: View,
   sources: List<Source>,
   pkgs: PackageSources,
   moved: List<Bytes>,
 ) -> Pulled / {abort.raise} = {
-  let rows = rows_of(analysis);
+  let rows = program.rows;
   let stale = hash::reaching(
-    analysis.hashes,
+    view.hashes,
     fold(moved, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true)),
   );
   front_end(
@@ -221,8 +253,10 @@ pub fn reanalysed(
   )
 }
 
-/// The program `project` makes, each definition and test taken as `answers` published and hashed
-/// it, warned of as its root modules' answers warn.
+/// The program `project` makes, its tables taken from what `answers` checked and hashing fixed of
+/// each module, warned of as its root modules' answers warn. It is analysed whole as well where one
+/// of its own modules holds what is read from syntax: a measure, which is held to its proof here, a
+/// cost promise, or a statement.
 fn analysed(
   project: Project,
   shipping: Shipping,
@@ -230,53 +264,102 @@ fn analysed(
   reached: Bool,
   fixed: Fixing,
 ) -> Program / {abort.raise} = {
-  let rows = {
-    defs: fold(answers, [], |acc: List<KnownDefRow>, a: Answered| concat(acc, a.answer.rows.defs)),
-    tests: fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
-      concat(acc, a.answer.rows.tests)),
-  };
   let texts = fold(shipping.read, map_new(), |acc: Map<String, Bytes>, source: Source|
     map_insert(acc, string_of_bytes_lossy(source.name), source.src));
   let pkgs: PackageSources = pkgs_of(project);
-  let pulled: Pulled = front_end(
-    project.sources,
-    shipping,
-    rows,
+  let warnings = root_warnings(answers, len(project.sources));
+  let loaded = answered_load(
+    map(project.sources, |s: Source| s.name),
     pkgs,
-    project.embeds,
-    reached,
+    fold(answers, map_new(), |acc: Map<Bytes, ModuleFacts>, a: Answered|
+      map_insert(acc, a.module, a.answer.facts)),
     fixed,
+    shipping.read,
+    shipping.unread,
+    shipping.asked,
+    true,
+    reached,
+    warnings,
   );
-  let shipped_places = map(pulled.pulled, |n: Bytes|
-    shipped_place(texts, string_of_bytes_lossy(n)));
   let own = placed_of(project);
-  let places = concat(concat(own.modules, shipped_places), own.manifests);
-  let refused = |ds: List<Diag>| { ..broken(project, shipping, places, ds), viewed: pulled.viewed };
-  match pulled.out {
-    Refused(ds) -> refused(ds),
-    Analysed(analysis) -> {
-      let w = { ..analysis, warnings: root_warnings(answers, len(project.sources)) };
-      let owned = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
-        map_insert(acc, source.name, true));
-      match unshown(w, |m: Bytes| map_contains(owned, m)) {
-        [] ->
-          {
-            files: project.files,
-            places: places,
-            diags: w.warnings,
-            whole: Some(w),
-            pkgs: pkgs,
-            embeds: project.embeds,
-            shipping: shipping,
-            reached: reached,
-            viewed: pulled.viewed,
-            tallies: [],
-          },
-        missing -> refused(map(missing, undescended)),
-      }
+  let program = {
+    files: project.files,
+    places: concat(
+      concat(
+        own.modules,
+        map(loaded.pulled, |n: Bytes| shipped_place(texts, string_of_bytes_lossy(n))),
+      ),
+      own.manifests,
+    ),
+    diags: warnings,
+    view: Some(loaded.program.view),
+    whole: None,
+    sources: project.sources,
+    rows: {
+      defs: fold(answers, [], |acc: List<KnownDefRow>, a: Answered|
+        concat(acc, a.answer.rows.defs)),
+      tests: fold(answers, [], |acc: List<KnownTestRow>, a: Answered|
+        concat(acc, a.answer.rows.tests)),
     },
+    fixed: fixed,
+    pkgs: pkgs,
+    embeds: project.embeds,
+    shipping: shipping,
+    reached: reached,
+    viewed: loaded.program.views,
+    tallies: [],
+  };
+  let owned = fold(project.sources, map_new(), |acc: Map<Bytes, Bool>, source: Source|
+    map_insert(acc, source.name, true));
+  let own = take(loaded.program.view.outlines, len(project.files));
+  let held = |pick: (FnOutline) -> Bool|
+    fold(own, false, |b: Bool, o: Outline|
+      b
+        || fold(o.items, false, |m: Bool, item: Outlined|
+          m || (match item { OFn(f) -> pick(f), _ -> false })));
+  let measured = held(|f: FnOutline| f.measured);
+  if !measured && !stating(own) && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
+    let refused = |ds: List<Diag>| { ..program, diags: ds, view: None };
+    match whole_of(program) {
+      Err(ds) -> refused(ds),
+      Ok(w) -> match if measured { unshown(w, |m: Bytes| map_contains(owned, m)) } else { [] } {
+        [] -> { ..program, whole: Some(w) },
+        missing -> refused(map(missing, undescended)),
+      },
+    }
   }
 }
+
+fn stating(own: List<Outline>) -> Bool =
+  fold(own, false, |b: Bool, o: Outline|
+    b
+      || fold(statement_modules(), false, |m: Bool, n: Bytes|
+        m || o.name == n || contains(o.imports, n)))
+
+/// Whether one of the program's own modules runs a statement: is or imports a module that declares
+/// what runs one.
+pub fn runs_statements(program: Program, view: View) -> Bool =
+  stating(take(view.outlines, len(program.files)))
+
+/// The program analysed whole, each definition and test taken as its module's answer published it
+/// and hashing fixed it: what a command that reads syntax takes. `Err` holds what refuses it.
+pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise} =
+  match ((program.view, program.whole)) {
+    (None, _) -> Err(program.diags),
+    (Some(_), Some(w)) -> Ok(w),
+    (Some(v), None) -> match front_end(
+        program.sources,
+        program.shipping,
+        program.rows,
+        program.pkgs,
+        program.embeds,
+        program.reached,
+        program.fixed,
+      ).out {
+      Refused(ds) -> Err(ds),
+      Analysed(w) -> Ok({ ..w, warnings: v.warnings }),
+    },
+  }
 
 fn undescended(u: Unshown) -> Diag =
   error_at(
@@ -364,10 +447,10 @@ fn verified(
   verify: Bool,
   program: Program,
 ) -> Program / {fs.read_file[abs], abort.raise} =
-  match program.whole {
-    None -> program,
-    Some(w) -> if !verify { program } else {
-      match interfaces::underived(
+  if !verify || program.view == None { program } else {
+    match whole_of(program) {
+      Err(ds) -> { ..program, diags: ds, view: None },
+      Ok(w) -> match interfaces::underived(
           slots_of(project),
           interfaces::dependency_sources(
             pkgs_of(project),
@@ -376,17 +459,17 @@ fn verified(
           w,
         ) {
         [] -> program,
-        refused -> { ..program, diags: concat(program.diags, refused), whole: None },
-      }
-    },
+        refused -> { ..program, diags: concat(program.diags, refused), view: None },
+      },
+    }
   }
 
 /// The files are the *places* and not the modules: a `ply.pkg` is a file the front end read and a
 /// source id it answers under, so one entry per place is what keeps the ids of everything after it
 /// where the machine's reader expects them. A manifest carries no module, and the runtime files one
 /// under `pkg`.
-fn placed_sources(program: Program, analysis: Analysis) -> List<SourceFile> = {
-  let named = modules_of(program, analysis);
+fn placed_sources(program: Program, view: View) -> List<SourceFile> / {abort.raise} = {
+  let named = modules_of(program, view);
   map(range(0, len(program.places)), |i: Int|
     {
       path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
@@ -477,16 +560,15 @@ pub fn load_uncached(
 
 /// What the load answered, for the machine to read rather than load again. The dump carries the
 /// load's warnings, the cache's among them, so a command the machine reports for says them too.
-/// `within` scopes it to what a run of tests enters (`dump_within`).
+/// `within` scopes it to what a run of tests enters.
 pub fn front_of(
   timed: Timed,
-  analysis: Analysis,
+  view: View,
   within: Option<Within> = None,
 ) -> LoadedAnalysis / {abort.raise} = {
-  let told = { ..analysis, warnings: timed.program.diags };
   {
-    dump: match within { Some(w) -> dump_within(told, w), None -> dump_of(Analysed(told)) },
-    files: placed_sources(timed.program, analysis),
+    dump: view_dump({ ..view, warnings: timed.program.diags }, within),
+    files: placed_sources(timed.program, view),
     read_ms: timed.read_ms,
     front_ms: timed.front_ms,
     file_ms: timed.file_ms,
@@ -595,36 +677,31 @@ pub fn unmoved(project: Project, program: Program) -> Bool =
 
 // --- Reading the tables ----------------------------------------------------------
 
-pub fn modules_of(program: Program, analysis: Analysis) -> List<ModuleView> =
-  map(range(0, len(analysis.mods)), |i: Int|
+pub fn modules_of(program: Program, view: View) -> List<ModuleView> / {abort.raise} =
+  map(range(0, len(view.outlines)), |i: Int|
     {
-      name: match list_at(analysis.mods, i) {
-        Some(mo) -> string_of_bytes_lossy(mo.name),
-        None -> "",
-      },
+      name: string_of_bytes_lossy(at(view.outlines, i).name),
       path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
     })
 
-pub fn module_facts(program: Program, analysis: Analysis) -> List<ModuleFacts> =
-  map(range(0, len(analysis.mods)), |i: Int|
-    match list_at(analysis.mods, i) {
-      None -> { index: i, name: "", path: "", imports: [], items: [] },
-      Some(mo) ->
-        {
-          index: i,
-          name: string_of_bytes_lossy(mo.name),
-          path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
-          imports: map(module_imports(mo), string_of_bytes_lossy),
-          items: map(module_items(mo), string_of_bytes_lossy),
-        },
-    })
+pub fn module_reports(program: Program, view: View) -> List<ModuleReport> / {abort.raise} =
+  map(range(0, len(view.outlines)), |i: Int| {
+    let o = at(view.outlines, i);
+    {
+      index: i,
+      name: string_of_bytes_lossy(o.name),
+      path: match list_at(program.places, i) { Some(place) -> place.path, None -> "" },
+      imports: map(o.imports, string_of_bytes_lossy),
+      items: map(o.declared, string_of_bytes_lossy),
+    }
+  })
 
 /// The modules as the front end took them: the project's own files first, then the shipped modules
 /// it pulled, in the order the label indices count.
-pub fn sourced(program: Program, analysis: Analysis) -> List<Source> =
-  map(range(0, len(analysis.mods)), |i: Int|
+pub fn sourced(program: Program, view: View) -> List<Source> / {abort.raise} =
+  map(range(0, len(view.outlines)), |i: Int|
     {
-      name: match list_at(analysis.mods, i) { Some(mo) -> mo.name, None -> b"" },
+      name: at(view.outlines, i).name,
       src: match list_at(program.places, i) { Some(place) -> place.text, None -> b"" },
     })
 
@@ -635,22 +712,28 @@ fn first_primary(labels: List<Label>) -> Option<Label> =
 /// What a run answers for: its root package's modules, and the standard library's when it asks for
 /// them. Another package's definitions are claimed by their specs: that package's own run proves
 /// them, as the compiler's own run proves the compiler's.
-pub fn owned_of(analysis: Analysis, std: Bool) -> (Bytes) -> Bool = {
-  let roots = fold(range(0, len(analysis.mods)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
-    match ((list_at(analysis.mods, i), list_at(analysis.module_packages, i))) {
-      (Some(m), Some(pkg)) -> if pkg == 0 { map_insert(acc, m.name, true) } else { acc },
-      _ -> acc,
-    });
+pub fn owned_of(view: View, std: Bool) -> (Bytes) -> Bool = {
+  let roots = fold(
+    view.outlines,
+    { i: 0, roots: map_new() },
+    |acc: { i: Int, roots: Map<Bytes, Bool> }, o: Outline|
+      {
+        i: acc.i + 1,
+        roots: if list_at(view.module_packages, acc.i) == Some(0) {
+          map_insert(acc.roots, o.name, true)
+        } else { acc.roots },
+      },
+  ).roots;
   |m: Bytes| map_contains(roots, m) || (std && is_std(string_of_bytes_lossy(m)))
 }
 
 /// A diagnostic raised inside a module the project did not write, which is the shipped modules'
 /// business. A run reports its own modules' tests and laws, however its dependencies were read.
-pub fn own_tests(program: Program, analysis: Analysis) -> List<TestInfo> =
-  filter(analysis.checked.tests, |test_info: TestInfo| test_info.at.module < len(program.files))
+pub fn own_tests(program: Program, view: View) -> List<TestInfo> =
+  filter(view.checked.tests, |test_info: TestInfo| test_info.at.module < len(program.files))
 
-pub fn own_laws(program: Program, analysis: Analysis) -> List<LawInfo> =
-  filter(analysis.checked.laws, |law_info: LawInfo| law_info.at.module < len(program.files))
+pub fn own_laws(program: Program, view: View) -> List<LawInfo> =
+  filter(view.checked.laws, |law_info: LawInfo| law_info.at.module < len(program.files))
 
 pub fn in_shipped_module(program: Program, diag: Diag) -> Bool =
   match first_primary(diag.labels) { Some(l) -> l.module >= len(program.files), None -> false }
@@ -679,23 +762,19 @@ fn pick(acc: Picking, by_name: Map<Bytes, DefInfo>, name: Bytes) -> Picking =
     },
   }
 
-fn module_fns(acc: List<Bytes>, parsed: ParsedModule) -> List<Bytes> =
-  fold(parsed.module.items, acc, |a: List<Bytes>, it: Item|
-    match it { IFn(d) -> push(a, qualify(parsed.name, d.name.name)), _ -> a })
+fn module_fns(acc: List<Bytes>, o: Outline) -> List<Bytes> =
+  fold(o.items, acc, |a: List<Bytes>, it: Outlined|
+    match it { OFn(f) -> push(a, qualify(o.name, f.name)), _ -> a })
 
 /// Every definition in the order its file declares it, module by module, as `ply defs` lists them
 /// and as the driver's `published_order` orders them; anything the tree does not name follows.
-pub fn published(analysis: Analysis) -> List<DefInfo> = {
-  let by_name = fold(
-    analysis.checked.defs,
-    map_new(),
-    |acc: Map<Bytes, DefInfo>, def_info: DefInfo| map_insert(acc, def_info.name, def_info),
-  );
-  let named = fold(analysis.mods, [], |acc: List<Bytes>, parsed: ParsedModule|
-    module_fns(acc, parsed));
+pub fn published(view: View) -> List<DefInfo> = {
+  let by_name = fold(view.checked.defs, map_new(), |acc: Map<Bytes, DefInfo>, def_info: DefInfo|
+    map_insert(acc, def_info.name, def_info));
+  let named = fold(view.outlines, [], module_fns);
   let first: Picking = fold(named, { seen: map_new(), out: [] }, |acc: Picking, name: Bytes|
     pick(acc, by_name, name));
-  let all: Picking = fold(analysis.checked.defs, first, |acc: Picking, def_info: DefInfo|
+  let all: Picking = fold(view.checked.defs, first, |acc: Picking, def_info: DefInfo|
     pick(acc, by_name, def_info.name));
   all.out
 }
@@ -843,9 +922,9 @@ test "under `--std` a proof answers for the standard library's claims and never 
     Analysed(w) -> w,
     Refused(_) -> panic("the fixture checks"),
   };
-  let owned = owned_of(w, true);
+  let owned = owned_of(view_of(w), true);
   assert(owned(b"m") && owned(b"std.y") && !owned(b"compiler.x"));
-  assert(!owned_of(w, false)(b"std.y"))
+  assert(!owned_of(view_of(w), false)(b"std.y"))
 }
 
 test "a shipped module is one under a reserved root and nothing else" {
@@ -907,18 +986,7 @@ test "a name nothing declares is `E0101`, and an ambiguous one says which" {
 }
 
 test "a span outside every module has no place and no location" {
-  let p: Program = {
-    files: [],
-    places: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }],
-    diags: [],
-    whole: None,
-    pkgs: { root: b"", manifest: None, supplied: [] },
-    embeds: [],
-    shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
-    reached: true,
-    viewed: [],
-    tallies: [],
-  };
+  let p: Program = { ..no_program(), places: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }] };
   assert_eq(location_of(p, { module: no_module(), span: { start: 0, end: 0 } }), None);
   assert_eq(location_of(p, { module: 0, span: { start: 3, end: 4 } }), Some("m.ply:1:4"))
 }

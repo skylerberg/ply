@@ -11,8 +11,8 @@ import args (Flags, style_of, no_flags, root_of)
 import appends (costs_of, priced, promised, promises, report_lines, unresolved)
 import literals (literal, unsettled)
 import diagnostic (Place, all_to_json)
-import program (Program, Timed, ModuleFacts, timed_over, module_facts, published, in_shipped_module,
-                own_tests, placed_of, location_of)
+import program (Program, Timed, ModuleReport, timed_over, module_reports, published,
+                in_shipped_module, own_tests, placed_of, location_of, whole_of, no_program)
 import reused (Toolchain, entry_at, file, key_of, touched)
 import env (env)
 import paths
@@ -28,7 +28,7 @@ import signature (SetLine, Provenance, counted_lines, effect_sets, provenance, p
 import std.term (Style, bold, dim, green, plain)
 import compiler.costs (Report, Costing)
 import compiler.termination (Ends, Stated, Diverges, Site)
-import compiler.front (Analysis, effect_sets_of, schema_definitions)
+import compiler.front (View, Outline)
 import compiler.infer (DefInfo, TestInfo, EffectInfo, OpInfo, Location, dump_flag, Raise, Unshown,
                        Unguarded, Calls)
 import compiler.resolve (Diag, Label)
@@ -352,13 +352,13 @@ fn module_block(
   style: Style,
   explain: Bool,
   program: Program,
-  analysis: Analysis,
+  analysis: View,
   schemas: Map<Bytes, Bool>,
   located: Map<Bytes, Location>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
   lines: List<String>,
-  mo: ModuleFacts,
+  mo: ModuleReport,
 ) -> List<String> / {abort.raise} = {
   let head = fold(
     mo.imports,
@@ -383,28 +383,26 @@ fn module_block(
   )
 }
 
-fn sets_of(
-  analysis: Analysis,
-  mo: ModuleFacts,
-  defs: List<DefInfo>,
-) -> List<SetLine> / {abort.raise} =
-  match list_at(analysis.mods, mo.index) {
-    None -> [],
-    Some(m) -> effect_sets(effect_sets_of(analysis.r, analysis.checked.effects, mo.index, m), defs),
-  }
+fn sets_of(view: View, mo: ModuleReport, defs: List<DefInfo>) -> List<SetLine> / {abort.raise} =
+  match list_at(view.outlines, mo.index) { None -> [], Some(o) -> effect_sets(o.sets, defs) }
+
+/// Each schema the program declares, and each schema's guard, by program-wide name.
+fn schemas_of(view: View) -> Map<Bytes, Bool> =
+  fold(view.outlines, map_new(), |acc: Map<Bytes, Bool>, o: Outline|
+    fold(o.schemas, acc, |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true)))
 
 fn type_lines(
   style: Style,
   explain: Bool,
   program: Program,
-  analysis: Analysis,
-  views: List<ModuleFacts>,
+  analysis: View,
+  views: List<ModuleReport>,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
 ) -> List<String> / {abort.raise} = {
   let located = locations(defs);
-  let schemas = schema_definitions(analysis.mods);
-  fold(views, [], |acc: List<String>, mo: ModuleFacts|
+  let schemas = schemas_of(analysis);
+  fold(views, [], |acc: List<String>, mo: ModuleReport|
     module_block(style, explain, program, analysis, schemas, located, defs, tests, acc, mo))
 }
 
@@ -419,9 +417,9 @@ fn set_json(v: SetLine) -> Json =
 
 fn module_json(
   explain: Bool,
-  analysis: Analysis,
+  analysis: View,
   defs: List<DefInfo>,
-  mo: ModuleFacts,
+  mo: ModuleReport,
 ) -> Json / {abort.raise} = {
   let named: List<Member> = [
     { key: "name", value: Str(mo.name) },
@@ -556,15 +554,15 @@ fn effect_json(effect_info: EffectInfo) -> Json / {abort.raise} =
 fn document(
   flags: Flags,
   timed: Timed,
-  analysis: Analysis,
-  views: List<ModuleFacts>,
+  analysis: View,
+  views: List<ModuleReport>,
   defs: List<DefInfo>,
   warnings: List<Diag>,
   pass: Option<Costing>,
 ) -> Json / {abort.raise} = {
   let p: Program = timed.program;
   let located = locations(defs);
-  let schemas = schema_definitions(analysis.mods);
+  let schemas = schemas_of(analysis);
   let hashes = fold(
     analysis.hashes.defs,
     map_new(),
@@ -578,7 +576,7 @@ fn document(
     { key: "files", value: Array(json_strings(map(p.places, |place: Place| place.path))) },
     {
       key: "modules",
-      value: Array(map(views, |mo: ModuleFacts| module_json(flags.explain, analysis, defs, mo))),
+      value: Array(map(views, |mo: ModuleReport| module_json(flags.explain, analysis, defs, mo))),
     },
     {
       key: "definitions",
@@ -619,11 +617,11 @@ fn document(
 
 fn summary(
   style: Style,
-  analysis: Analysis,
+  analysis: View,
   defs: List<DefInfo>,
   tests: List<TestInfo>,
 ) -> String / {abort.raise} =
-  indent() ++ green(style, "checked") ++ " " ++ count_of(len(analysis.mods), "module") ++ ", "
+  indent() ++ green(style, "checked") ++ " " ++ count_of(len(analysis.outlines), "module") ++ ", "
     ++ count_of(len(defs), "definition")
     ++ ", "
     ++ count_of(len(tests), "test")
@@ -641,11 +639,11 @@ fn answered(
   style: Style,
   flags: Flags,
   timed: Timed,
-  analysis: Analysis,
+  analysis: View,
   pass: Option<Costing>,
   warnings: List<Diag>,
 ) -> Answer / {abort.raise} = {
-  let views = module_facts(timed.program, analysis);
+  let views = module_reports(timed.program, analysis);
   let defs = published(analysis);
   let tests = own_tests(timed.program, analysis);
   let head = concat([summary(style, analysis, defs, tests)], warning_lines(style, warnings));
@@ -673,19 +671,27 @@ fn answered(
   }
 }
 
-/// The cost pass answers both `--costs` and the `reuse fn` promise, and runs at most once.
+/// The cost pass answers both `--costs` and the `reuse fn` promise, and runs at most once, over the
+/// program analysed whole.
 fn checked(
   style: Style,
   flags: Flags,
   timed: Timed,
-  analysis: Analysis,
+  analysis: View,
 ) -> Answer / {priced.report, literal.verdicts, literal.statements, abort.raise} = {
   let kept = promised(timed.program, analysis);
-  let asked = kept || flags.costs;
-  let pass = if asked { Some(costs_of(timed.program, analysis)) } else { None };
+  let pass = if !kept && !flags.costs { Ok(None) } else {
+    match whole_of(timed.program) {
+      Ok(w) -> Ok(Some(costs_of(timed.program, w))),
+      Err(diags) -> Err(diags),
+    }
+  };
   let unkept = match pass {
-    None -> [],
-    Some(c) -> if !c.report.ok { [unresolved()] } else if kept { promises(c.report) } else { [] },
+    Err(diags) -> diags,
+    Ok(None) -> [],
+    Ok(Some(c)) -> if !c.report.ok { [unresolved()] }
+    else if kept { promises(c.report) }
+    else { [] },
   };
   let broken = if len(unkept) > 0 { unkept }
   else { unsettled(timed, analysis, root_of(flags).machine) };
@@ -695,7 +701,7 @@ fn checked(
       flags,
       timed,
       analysis,
-      pass,
+      match pass { Ok(p) -> p, Err(_) -> None },
       filter(timed.program.diags, |diag: Diag| !in_shipped_module(timed.program, diag)),
     )
   }
@@ -821,7 +827,7 @@ fn checked_now(
   started: Int,
 ) -> { answer: Answer, filed: Option<Answer> } / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, priced.report, literal.verdicts, literal.statements, abort.raise, shipped.reached, env.reused[sys]} = {
   let t: Timed = timed_over(flags.paths, project, started, true, flags.verify_deps);
-  match t.program.whole {
+  match t.program.view {
     None ->
       { answer: refused(style_of(flags), "check", t.program.diags, t.program.places), filed: None },
     Some(w) -> {
@@ -912,18 +918,7 @@ test "a share is a tenth of a percent, and a run that took no time at all is not
 
 test "the longest phase is printed first, and the total accounts for all three" {
   let lines = phase_lines(plain(), {
-    program: {
-      files: [],
-      places: [],
-      diags: [],
-      whole: None,
-      pkgs: { root: b"", manifest: None, supplied: [] },
-      embeds: [],
-      shipping: { read: [], unread: [], data: [], asked: [], pulls: [] },
-      reached: true,
-      viewed: [],
-      tallies: [],
-    },
+    program: no_program(),
     read_ms: 2,
     front_ms: 90,
     file_ms: 8,
