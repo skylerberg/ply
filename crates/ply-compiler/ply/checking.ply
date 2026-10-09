@@ -29,7 +29,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedDat
               view_over, view_dump, faceted, dump_of, walked_facts_bin, squats, embedded_bin,
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
               shipped_wants_bin)
-import items (Module, ImportDecl, INames, header, parse, import_decl_bin, is_written)
+import items (Module, Item, IType, ImportDecl, INames, header, parse, import_decl_bin, is_written)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -450,6 +450,7 @@ pub type OwnersAnswer = {
   shape: ModuleShape,
   order: List<Bytes>,
   wanted: List<Mention>,
+  publishing: Map<Bytes, List<Mention>>,
 }
 
 /// What hashing fixed of a group of owners: each owner's hash entry, and each node, test and law.
@@ -474,6 +475,8 @@ pub fn context_query() -> Bytes = b"context"
 pub fn setting_query() -> Bytes = b"setting"
 
 pub fn group_imports_query() -> Bytes = b"group imports"
+
+pub fn published_query() -> Bytes = b"published"
 
 pub fn wants_query() -> Bytes = b"wants"
 
@@ -551,6 +554,7 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         shape: no_shape(asked.module),
         order: [],
         wanted: [],
+        publishing: map_new(),
       },
     Some(m) -> {
       let module = m.source.name;
@@ -618,6 +622,25 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         },
         order: walk_order(m.parsed),
         wanted: wanted_in(m.parsed, m.raw, m.source.src, m.names),
+        // What the module publishes for each `opaque` type is its whole text's to say: a check of
+        // the type's group alone sees only the functions that group reads.
+        publishing: fold(
+          m.parsed.module.items,
+          map_new(),
+          |acc: Map<Bytes, List<Mention>>, item: Item|
+            match item {
+              IType(d) -> match d.opaque {
+                Some(op) ->
+                  map_insert(
+                    acc,
+                    d.name.name,
+                    map(concat(op.answer, op.take), |f: Bytes| { module: module, name: f }),
+                  ),
+                None -> acc,
+              },
+              _ -> acc,
+            },
+        ),
       }
     },
   };
@@ -631,6 +654,21 @@ pub fn owner_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, owner_named_bin(), "an owner's name");
   let read = owners_asked(module_named(asked));
   match memo.offered() { Some(o) -> o, None -> owner_facts_in(owners_of(read), asked.owner) }
+}
+
+/// What a module publishes for an `opaque` type an owner of it declares, read as `OwnerNamed` says:
+/// each function that answers one and each that takes one; none for any other owner.
+pub fn published_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let asked = decoded(input, owner_named_bin(), "an owner's name");
+  let read = owners_asked(module_named(asked));
+  match memo.offered() {
+    Some(o) -> o,
+    None ->
+      bin::encode(
+        match map_get(owners_of(read).publishing, asked.owner) { Some(ms) -> ms, None -> [] },
+        bin::list_bin(mention_bin()),
+      ),
+  }
 }
 
 /// The group an owner of a module checks in, read as `OwnerNamed` says.
@@ -742,6 +780,15 @@ fn offered_projections(named: Named, read: OwnersAnswer) -> Unit / {memo.read, a
     bin::encode(named, named_bin()),
     bin::encode(read.context.setting, setting_bin()),
   );
+  map_fold(read.publishing, (), |_: Unit, owner: Bytes, ms: List<Mention>|
+    memo.offer(
+      published_query(),
+      bin::encode(
+        { module: named.module, shipped: named.shipped, tested: named.tested, owner: owner },
+        owner_named_bin(),
+      ),
+      bin::encode(ms, bin::list_bin(mention_bin())),
+    ));
   fold(read.owners, (), |_: Unit, o: { owner: Bytes, facts: Bytes, starts: List<Int> }| {
     let at = bin::encode(
       { module: named.module, shipped: named.shipped, tested: named.tested, owner: o.owner },
@@ -1002,7 +1049,20 @@ pub fn owner_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     None -> entry_in(decoded(answer, owned::group_answer_bin(), "a group's answer"), asked.owner),
   };
   if bytes_len(alone) == 0 { b"" } else {
-    let e = decoded(alone, entry_bin(), "an entry");
+    let checked = decoded(alone, entry_bin(), "an entry");
+    let e = if bytes_index_of(checked.text, b"opaque type ") == None { checked } else {
+      {
+        ..checked,
+        published: filter(
+          decoded(
+            memo.ask(published_query(), input),
+            bin::list_bin(mention_bin()),
+            "what a module publishes",
+          ),
+          |m: Mention| !contains(checked.mentions, m),
+        ),
+      }
+    };
     bin::encode({ ..e, reach: reach_of(asked, g, e, answer) }, entry_bin())
   }
 }
@@ -1214,16 +1274,40 @@ pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       let groups = groups_named(named, read);
       offered_whole(named, read, groups);
       let facts = facts_of(read);
-      let placed = map(groups, |g: GroupNamed|
+      let answers = map(groups, |g: GroupNamed| { group: g, answer: group_of(g) });
+      let refusing = fold(
+        answers,
+        map_new(),
+        |acc: Map<Bytes, Bool>, x: { group: GroupNamed, answer: owned::GroupAnswer }|
+          if len(x.answer.refused) == 0 { acc } else {
+            fold(x.group.owners, acc, |a: Map<Bytes, Bool>, o: Bytes| map_insert(a, o, true))
+          },
+      );
+      // A group that reads an owner whose group refuses is refused by that refusal, which explains
+      // its own: as a module's refusal explains those of the modules that import it.
+      let explained = |g: GroupNamed|
+        fold(g.owners, false, |b: Bool, o: Bytes|
+          b
+            || (match map_get(facts, o) {
+              Some(f) ->
+                fold(f.mentions, false, |c: Bool, m: Mention|
+                  c
+                    || (m.module == named.module
+                    && fold(declared_in(read, m.name), false, |d: Bool, x: Bytes|
+                      d || (map_contains(refusing, x) && !contains(g.owners, x))))),
+              None -> false,
+            }));
+      let placed = map(answers, |x: { group: GroupNamed, answer: owned::GroupAnswer }|
         {
           items: laid_items(
-            map(g.owners, |o: Bytes|
+            map(x.group.owners, |o: Bytes|
               match map_get(facts, o) {
                 Some(f) -> f.read,
                 None -> panic("a group's owner is the module's"),
               }),
           ),
-          answer: group_of(g),
+          answer: if len(x.answer.refused) > 0 && explained(x.group) { { ..x.answer, refused: [] } }
+          else { x.answer },
         });
       let a = owned::assembled(
         named.module,
@@ -1591,6 +1675,7 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
     { name: context_query(), definition: b"checking.context_answer", body: context_answer },
     { name: setting_query(), definition: b"checking.setting_answer", body: setting_answer },
     { name: wants_query(), definition: b"checking.wants_answer", body: wants_answer },
+    { name: published_query(), definition: b"checking.published_answer", body: published_answer },
     {
       name: group_imports_query(),
       definition: b"checking.group_imports_answer",
@@ -1646,6 +1731,7 @@ pub type World = {
   places: Map<Bytes, Bytes>,
   texts: Map<Bytes, Bytes>,
   own: List<Bytes>,
+  deps: List<Bytes>,
 }
 
 fn embedding_of(read: EmbedRead) -> Embedding =
@@ -1696,8 +1782,21 @@ pub fn world_of(root: OwnPackage, deps: List<OwnPackage>) -> World / {abort.rais
         map_insert(acc, x.name, x.text),
     ),
     own: map(placed, |x: { name: Bytes, placing: Placing, text: Bytes }| x.name),
+    deps: map(range(1, len(deps) + 1), |k: Int| prefix_in(j, k)),
   }
 }
+
+/// Whether a load that walked one file of its root package, as `w` holds it, looks at the place `at`
+/// of `kind`: any place but a module's, and a module's of one it read or of a package it read whole.
+/// Another module of the root's is not there for it, nor gone.
+pub fn walked_covers(w: World, kind: Bytes, at: Bytes) -> Bool =
+  if kind != text_kind() && kind != module_kind() && kind != embed_kind() { true } else {
+    let module = if kind != embed_kind() { at }
+    else { match list_at(bytes_split(at, b"\x00"), 1) { Some(m) -> m, None -> at } };
+    map_contains(w.places, module)
+      || fold(w.deps, false, |b: Bool, p: Bytes|
+        b || (bytes_len(p) > 0 && bytes_starts_with(module, bytes_concat(p, b"."))))
+  }
 
 /// Where the module `module`, by its name in the program, is among `w`'s packages.
 pub fn world_placing(w: World, module: Bytes) -> Option<Placing> / {abort.raise} =
@@ -3494,6 +3593,22 @@ test "a shipped module's imports are checked as an importer reads it, without wh
   ];
   let f = fixed_over(nothing_held(), user, shipped);
   assert_eq(fold(f.answers, [], |acc: List<Diag>, a: Answered| concat(acc, a.answer.refused)), [])
+}
+
+// `main` reads `pick`, whose group refuses, so its own refusal says nothing a fix to `pick` would not.
+test "a module refuses with what its refusing groups say, and nothing a group reading them says" {
+  let sources = [
+    {
+      name: b"app",
+      src: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
+    },
+  ];
+  let f = fixed_over(nothing_held(), sources, []);
+  assert_eq(
+    fold(f.answers, [], |acc: List<Bytes>, a: Answered|
+      concat(acc, map(a.answer.refused, |d: Diag| d.message))),
+    [b"unknown name `missing`"],
+  )
 }
 
 test "a name a module selects that its module does not declare refuses the module" {
