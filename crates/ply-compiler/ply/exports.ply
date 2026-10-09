@@ -8,6 +8,7 @@
 import std.bin
 import std.bytes (join, u64_le, hex_of)
 import std.list (at, concat, contains, drop, sort_by)
+import std.graph
 import front (Analysis, Analysed, Refused, Pulled, Staged, Hashed, ShippedData, Embedded,
               analyse_pulling_std_with, staged_pulling_std_with, checked_staged, rows_of, is_std,
               KnownDefRow, known_def_row_bin, of_module)
@@ -60,6 +61,10 @@ derive bin for Entry
 derive bin for Exports
 derive bin for HashEntry
 derive bin for Hashes
+derive bin for Scope
+derive bin for ModuleScope
+derive bin for OwnerRead
+derive bin for ItemAt
 
 /// The item that owns what `item` declares or states: a `derive`, an instance or a `numeric` is its
 /// type's, since only the type's own module may state one.
@@ -117,7 +122,7 @@ fn binder_of(d: ImportDecl) -> Option<Bytes> =
 
 /// How a module's text names what it reads: each import binder's module, each selected name's
 /// module, and the owner of each name it declares.
-type Scope = {
+pub type Scope = {
   module: Bytes,
   binders: Map<Bytes, Bytes>,
   selected: Map<Bytes, List<Bytes>>,
@@ -861,54 +866,178 @@ pub fn owned_text(text: Bytes, items: List<Item>) -> Bytes / {abort.raise} =
     b"\n\n",
   )
 
-/// What a check of one owner reads: the source it checks, where the owner's own text starts in it,
-/// the modules it imports as entries stand in for them, and what their checks and hashing published.
+/// How a module's text names what it reads, as written and with its statements' expansions.
+pub type ModuleScope = { written: Scope, expanded: Scope }
+
+/// One owner as a check of it reads its module: the text of each of its items and where each starts
+/// in the module, the text of the functions its statements generate, and the modules its `derive`s
+/// call into.
+pub type OwnerRead = {
+  owner: Bytes,
+  texts: List<Bytes>,
+  starts: List<Int>,
+  generated: Bytes,
+  runtimes: List<Bytes>,
+}
+
+/// How the module `parsed`, parsed alone as `raw` and its imports naming `targets`, names what it
+/// reads.
+pub fn module_scope(
+  parsed: ParsedModule,
+  raw: Module,
+  targets: List<Bytes>,
+) -> ModuleScope / {abort.raise} = {
+  let s = scopes(parsed, raw, targets);
+  { written: s.written, expanded: s.expanded }
+}
+
+/// Each owner of the module `parsed`, parsed alone as `raw` from `text`, in the order its first item
+/// stands in the module.
+pub fn owner_reads(
+  parsed: ParsedModule,
+  raw: Module,
+  text: Bytes,
+) -> List<OwnerRead> / {abort.raise} = {
+  let generated = generated_by_owner(raw, parsed, fn_owners(raw, parsed));
+  let owners = fold(raw.items, [], |os: List<Bytes>, item: Item| {
+    let o = item_owner(item);
+    if contains(os, o) { os } else { push(os, o) }
+  });
+  map(owners, |o: Bytes| {
+    let its = owner_items(raw, o);
+    {
+      owner: o,
+      texts: map(its, |item: Item| {
+        let s = item_span(item);
+        bytes_slice(text, s.start, s.end)
+      }),
+      starts: map(its, |item: Item| item_span(item).start),
+      generated: match map_get(generated, o) { Some(fs) -> alone(text, fs), None -> b"" },
+      runtimes: runtimes_of(its),
+    }
+  })
+}
+
+/// What `o`, an owner of `module`, mentions of what `scope` names: of its own module and of the
+/// modules it imports, never itself.
+pub fn owner_mentions(
+  module: Bytes,
+  scope: ModuleScope,
+  o: OwnerRead,
+) -> List<Mention> / {abort.raise} = {
+  let own = join(o.texts, b"\n\n");
+  let expansion = if bytes_len(o.generated) == 0 { [] }
+  else { mentioned(scope.expanded, o.generated) };
+  filter(
+    distinct(concat(concat(mentioned(scope.written, own), expansion), hidden_read(own))),
+    |m: Mention| !(m.module == module && m.name == o.owner),
+  )
+}
+
+/// The owners of `module` that check together, each group one whose owners mention one another round
+/// a cycle, a group after every group it mentions; `mentions` holds what each of `owners` mentions.
+pub fn owner_groups(
+  module: Bytes,
+  scope: ModuleScope,
+  owners: List<Bytes>,
+  mentions: Map<Bytes, List<Mention>>,
+) -> List<List<Bytes>> / {abort.raise} = {
+  let slot = fold(range(0, len(owners)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(owners, i), i));
+  let out = map(owners, |o: Bytes|
+    fold(
+      match map_get(mentions, o) { Some(ms) -> ms, None -> [] },
+      [],
+      |acc: List<Int>, m: Mention|
+        if m.module != module { acc } else {
+          fold(
+            match map_get(scope.written.owners, m.name) { Some(os) -> os, None -> [] },
+            acc,
+            |a: List<Int>, p: Bytes|
+              match map_get(slot, p) {
+                Some(k) -> if contains(a, k) { a } else { push(a, k) },
+                None -> a,
+              },
+          )
+        },
+    ));
+  map(graph::components({ out: out }), |comp: List<Int>|
+    sort_by(map(comp, |i: Int| at(owners, i)), |a: Bytes, b: Bytes|
+      match compare_values(a, b) { Greater -> false, _ -> true }))
+}
+
+/// Where an owner's item stands: counted from where a check's own text starts, `from`, and in its
+/// module, `to`, `len` bytes long.
+pub type ItemAt = { owner: Bytes, from: Int, to: Int, len: Int }
+
+/// What a check of a group of owners reads: the source it checks, where the group's own text starts
+/// in it and where each of its items stands there, the modules it imports as their entries stand in
+/// for them, and what their checks and hashing published.
 pub type OwnerSource = {
   source: Source,
   offset: Int,
+  items: List<ItemAt>,
   deps: Map<Bytes, Map<Bytes, Entry>>,
   rows: List<KnownDefRow>,
   fixed: List<Fixed>,
 }
 
-/// `owner`, of the module `parsed`, read alone as `raw` from `text` with `targets` the module each of
-/// its imports names: its own items as `text` writes them, beside the entries of its module that they
-/// mention, and the entries of other modules they read, as `entries` answers them by module and name.
-pub fn owner_source<| e>(
-  parsed: ParsedModule,
-  raw: Module,
-  text: Bytes,
+/// `members`, owners of `module` that check together, each beside what it mentions in `mentions`:
+/// their items as their module writes them, beside the entries of their module that they mention,
+/// and the entries of other modules they read, as `entries` answers them by module and name. Their
+/// module's imports are `imports`, each naming the module of `targets` at its place.
+pub fn group_source<| e>(
+  module: Bytes,
+  members: List<OwnerRead>,
+  mentions: List<Mention>,
+  imports: List<ImportDecl>,
   targets: List<Bytes>,
-  owner: Bytes,
   entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
 ) -> OwnerSource / {abort.raise | e} = {
-  let module = parsed.name;
-  let its = owner_items(raw, owner);
-  let own = owned_text(text, its);
-  let sc = scopes(parsed, raw, targets);
-  let generated = generated_by_owner(raw, parsed, fn_owners(raw, parsed));
-  let expansion = match map_get(generated, owner) {
-    Some(fs) -> mentioned(sc.expanded, alone(text, fs)),
-    None -> [],
-  };
-  let mentions = filter(
-    distinct(concat(concat(mentioned(sc.written, own), expansion), hidden_read(own))),
-    |m: Mention| !(m.module == module && m.name == owner),
+  let names = map(members, |o: OwnerRead| o.owner);
+  let laid = fold(
+    members,
+    { at: 0, items: [], texts: [] },
+    |acc: { at: Int, items: List<ItemAt>, texts: List<Bytes> }, o: OwnerRead|
+      fold(
+        range(0, len(o.texts)),
+        acc,
+        |a: { at: Int, items: List<ItemAt>, texts: List<Bytes> }, k: Int| {
+          let t = at(o.texts, k);
+          {
+            at: a.at + bytes_len(t) + 2,
+            items: push(a.items, {
+              owner: o.owner,
+              from: a.at,
+              to: at(o.starts, k),
+              len: bytes_len(t),
+            }),
+            texts: push(a.texts, t),
+          }
+        },
+      ),
   );
-  let needed = needed_by(entries, mentions, targets);
+  let own = join(laid.texts, b"\n\n");
+  let read = filter(mentions, |m: Mention| !(m.module == module && contains(names, m.name)));
+  let needed = needed_by(entries, read, targets);
   let siblings = match map_get(needed, module) {
-    Some(es) -> map_remove(es, owner),
+    Some(es) -> fold(names, es, |acc: Map<Bytes, Entry>, n: Bytes| map_remove(acc, n)),
     None -> map_new(),
   };
   let deps = map_remove(needed, module);
   let held = map_fold(siblings, [], |acc: List<Entry>, _: Bytes, e: Entry| push(acc, e));
-  let imports = printed_alone(
+  let written = printed_alone(
     b"",
     merged_imports(
       push(held, {
-        owner: owner,
+        owner: b"",
         text: own,
-        imports: map(imports_for(raw.imports, targets, mentions, runtimes_of(its)), unplaced),
+        imports: imports_for(
+          imports,
+          targets,
+          read,
+          fold(members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.runtimes)),
+        ),
         mentions: [],
         rows: [],
         fixed: [],
@@ -924,15 +1053,42 @@ pub fn owner_source<| e>(
   {
     source: {
       name: module,
-      src: bytes_concat_all([imports, own, b"\n\n", join(map(held, |e: Entry| e.text), b"\n")]),
+      src: bytes_concat_all([written, own, b"\n\n", join(map(held, |e: Entry| e.text), b"\n")]),
     },
-    offset: bytes_len(imports),
+    offset: bytes_len(written),
+    items: laid.items,
     deps: deps,
     rows: fold(all, [], |acc: List<KnownDefRow>, es: Map<Bytes, Entry>|
       map_fold(es, acc, |a: List<KnownDefRow>, _: Bytes, e: Entry| concat(a, e.rows))),
     fixed: fold(all, [], |acc: List<Fixed>, es: Map<Bytes, Entry>|
       map_fold(es, acc, |a: List<Fixed>, _: Bytes, e: Entry| concat(a, e.fixed))),
   }
+}
+
+/// The imports of `raw`, each placed nowhere: what a check of one of its owners reads of them.
+pub fn unplaced_imports(raw: Module) -> List<ImportDecl> = map(raw.imports, unplaced)
+
+/// `owner`, of the module `parsed`, read alone as `raw` from `text` with `targets` the module each of
+/// its imports names, as [`group_source`] reads a group of it alone.
+pub fn owner_source<| e>(
+  parsed: ParsedModule,
+  raw: Module,
+  text: Bytes,
+  targets: List<Bytes>,
+  owner: Bytes,
+  entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
+) -> OwnerSource / {abort.raise | e} = {
+  let scope = module_scope(parsed, raw, targets);
+  let members = filter(owner_reads(parsed, raw, text), |o: OwnerRead| o.owner == owner);
+  group_source(
+    parsed.name,
+    members,
+    fold(members, [], |acc: List<Mention>, o: OwnerRead|
+      concat(acc, owner_mentions(parsed.name, scope, o))),
+    unplaced_imports(raw),
+    targets,
+    entries,
+  )
 }
 
 /// `o`, an owner's source, standing where `placed` says, checked against what it reads, each module
