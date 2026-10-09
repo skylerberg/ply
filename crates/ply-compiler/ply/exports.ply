@@ -835,6 +835,109 @@ pub fn checked_against(
   { pulled: checked_staged(s.staged, rows, []), at: s.at }
 }
 
+// --- What one owner is checked against -------------------------------------------------------
+
+/// The items of the module `raw` that `owner` owns, in the order the module writes them.
+pub fn owner_items(raw: Module, owner: Bytes) -> List<Item> =
+  filter(raw.items, |item: Item| owner_of(item) == Some(owner))
+
+/// `items`, as `text` writes them, each item's own text, a blank line between them: what a check of
+/// their owner reads of its module's text.
+pub fn owned_text(text: Bytes, items: List<Item>) -> Bytes / {abort.raise} =
+  join(
+    map(items, |item: Item| {
+      let s = item_span(item);
+      bytes_slice(text, s.start, s.end)
+    }),
+    b"\n\n",
+  )
+
+/// What a check of one owner reads: the source it checks, where the owner's own text starts in it,
+/// the modules it imports as entries stand in for them, and what their checks and hashing published.
+pub type OwnerSource = {
+  source: Source,
+  offset: Int,
+  deps: Map<Bytes, Map<Bytes, Entry>>,
+  rows: List<KnownDefRow>,
+  fixed: List<Fixed>,
+}
+
+/// `owner`, of the module `parsed`, read alone as `raw` from `text` with `targets` the module each of
+/// its imports names: its own items as `text` writes them, beside the entries of its module that they
+/// mention, and the entries of other modules they read, as `entries` answers them by module and name.
+pub fn owner_source<| e>(
+  parsed: ParsedModule,
+  raw: Module,
+  text: Bytes,
+  targets: List<Bytes>,
+  owner: Bytes,
+  entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
+) -> OwnerSource / {abort.raise | e} = {
+  let module = parsed.name;
+  let its = owner_items(raw, owner);
+  let own = owned_text(text, its);
+  let sc = scopes(parsed, raw, targets);
+  let generated = generated_by_owner(raw, parsed, fn_owners(raw, parsed));
+  let expansion = match map_get(generated, owner) {
+    Some(fs) -> mentioned(sc.expanded, alone(text, fs)),
+    None -> [],
+  };
+  let mentions = filter(
+    distinct(concat(concat(mentioned(sc.written, own), expansion), hidden_read(own))),
+    |m: Mention| !(m.module == module && m.name == owner),
+  );
+  let needed = needed_by(entries, mentions, targets);
+  let siblings = match map_get(needed, module) {
+    Some(es) -> map_remove(es, owner),
+    None -> map_new(),
+  };
+  let deps = map_remove(needed, module);
+  let held = map_fold(siblings, [], |acc: List<Entry>, _: Bytes, e: Entry| push(acc, e));
+  let imports = printed_alone(
+    b"",
+    merged_imports(
+      push(held, {
+        owner: owner,
+        text: own,
+        imports: map(imports_for(raw.imports, targets, mentions, runtimes_of(its)), unplaced),
+        mentions: [],
+        rows: [],
+        fixed: [],
+      }),
+    ),
+    [],
+  );
+  let all = push(
+    map_fold(deps, [], |acc: List<Map<Bytes, Entry>>, _: Bytes, es: Map<Bytes, Entry>|
+      push(acc, es)),
+    siblings,
+  );
+  {
+    source: {
+      name: module,
+      src: bytes_concat_all([imports, own, b"\n\n", join(map(held, |e: Entry| e.text), b"\n")]),
+    },
+    offset: bytes_len(imports),
+    deps: deps,
+    rows: fold(all, [], |acc: List<KnownDefRow>, es: Map<Bytes, Entry>|
+      map_fold(es, acc, |a: List<KnownDefRow>, _: Bytes, e: Entry| concat(a, e.rows))),
+    fixed: fold(all, [], |acc: List<Fixed>, es: Map<Bytes, Entry>|
+      map_fold(es, acc, |a: List<Fixed>, _: Bytes, e: Entry| concat(a, e.fixed))),
+  }
+}
+
+/// `o`, an owner's source, standing where `placed` says, checked against what it reads, each module
+/// it imports standing where `placing` says.
+pub fn checked_owner(
+  o: OwnerSource,
+  placed: Placed,
+  placing: (Bytes) -> Placed / {abort.raise},
+  reading: Reading,
+) -> { pulled: Pulled, at: Int } / {abort.raise} = {
+  let s = staged_against(o.source, placed, o.deps, o.fixed, placing, reading);
+  { pulled: checked_staged(s.staged, o.rows, []), at: s.at }
+}
+
 // --- Tests ----------------------------------------------------------------------------------
 
 fn outcome(p: Pulled) -> Analysis / {abort.raise} =
@@ -934,6 +1037,97 @@ fn per_module(
       }
     },
   )
+}
+
+/// What a check agrees on of the functions `owner` owns of `module`.
+fn agreed_owner(
+  w: Analysis,
+  module: Bytes,
+  owned: (Bytes) -> Bool / {abort.raise},
+) -> Agreed / {abort.raise} = {
+  let a = agreed(w, module);
+  {
+    schemes: filter(a.schemes, |s: { name: Bytes, scheme: Scheme }| owned(s.name)),
+    rows: filter(a.rows, |r: KnownDefRow| owned(r.name)),
+    warnings: [],
+  }
+}
+
+/// Each owner of each module of `sources` that owns a function, checked alone against what it reads,
+/// beside `whole`'s check of it.
+fn per_owner(
+  whole: Analysis,
+  sources: List<Source>,
+) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
+  let texts = fold(sources, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let text_at = |i: Int| match map_get(texts, at(whole.mods, i).name) { Some(t) -> t, None -> b"" };
+  let exports = fold(range(0, len(whole.mods)), map_new(), |acc: Map<Bytes, Exports>, i: Int|
+    map_insert(acc, at(whole.mods, i).name, exports_of(whole, i, text_at(i))));
+  let reading = {
+    pkgs: { root: b"", manifest: None, supplied: [] },
+    tested: true,
+    whole: [],
+    data: [],
+    embeds: [],
+    given: [],
+    judged: None,
+    unread: [],
+  };
+  let placing = |m: Bytes| if map_contains(texts, m) { InRoot } else { ShippedModule };
+  fold(
+    range(0, len(whole.mods)),
+    [],
+    |acc: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, i: Int| {
+      let parsed = at(whole.mods, i);
+      let name = parsed.name;
+      if !map_contains(texts, name) { acc } else {
+        let raw = parse(text_at(i)).node;
+        let fns = fn_owners(raw, parsed);
+        let owned_by = |o: Bytes, n: Bytes| map_get(fns, simple_of(name, n)) == Some(o);
+        let owners = map_values(
+          fold(raw.items, map_new(), |m: Map<Bytes, Bytes>, item: Item|
+            match item { IFn(d) -> map_insert(m, d.name.name, d.name.name), _ -> m }),
+        );
+        fold(owners, acc, |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
+          let source = owner_source(
+            parsed,
+            raw,
+            text_at(i),
+            import_targets(whole, i),
+            o,
+            |module: Bytes, n: Bytes| entries_in(exports, module, n),
+          );
+          let apart = match checked_owner(source, InRoot, placing, reading).pulled.out {
+            Refused(ds) -> refused_apart(bytes_concat_all([name, b".", o]), "checks", ds),
+            Analysed(w) -> w,
+          };
+          push(a, {
+            owner: bytes_concat_all([name, b".", o]),
+            whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
+            apart: agreed_owner(apart, name, |n: Bytes| owned_by(o, n)),
+          })
+        })
+      }
+    },
+  )
+}
+
+test "each function checked alone against the entries it reads answers what its module's check does" {
+  let sources = [{ name: b"core", src: core_src() }, { name: b"shop", src: shop_src() }];
+  let found = per_owner(outcome(analyse_pulling_std_with(sources, [], [], [])), sources);
+  assert_eq(map(found, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
+    b"core.helper",
+    b"core.price",
+    b"core.twice",
+    b"shop.doubled",
+    b"shop.stored",
+    b"shop.total",
+  ]);
+  for_all(found, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| {
+    assert_eq(f.owner, f.owner);
+    assert_eq(f.apart, f.whole)
+  })
 }
 
 fn refused_apart<a>(name: Bytes, what: String, ds: List<Diag>) -> a / {abort.raise} =
