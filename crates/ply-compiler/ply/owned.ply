@@ -10,8 +10,8 @@ import std.bytes (int_of_ascii)
 import front (Analysis, Analysed, Refused, ModuleFacts, ModuleShape, ModuleTables, Rows,
               KnownDefRow, KnownTestRow, TaggedSite, StatementSite, TypedConst, module_facts,
               no_module_tables, rows_of, of_module, analyse_pulling_std_with, faceted)
-import exports (Exports, InRoot, ShippedModule, exports_of, entries_in, import_targets, owner_items,
-                owned_text, owner_source, checked_owner, item_owner)
+import exports (Exports, ItemAt, InRoot, ShippedModule, exports_of, entries_in, import_targets,
+                owner_source, checked_owner, item_owner)
 import items (Item, IFn, parse, item_span)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
               NumericInfo, Location, Raise, SpecInfo, LabelSite, OperandSite, UpdateShape,
@@ -21,12 +21,8 @@ import parsing (Span)
 import exprs (TaggedPart)
 import types (canonical_scheme)
 
-/// Where each of an owner's items stands: counted from where the owner's text starts, `from`, and in
-/// its module, `to`, `len` bytes long.
-pub type ItemPlace = { from: Int, to: Int, len: Int }
-
-/// What a check of one owner answered of it, every place module 0's and counted from where the
-/// owner's text starts.
+/// What a check of a group of owners answered of one of them, every place module 0's and counted from
+/// where the group's own text starts.
 pub type OwnerAnswer = {
   tables: ModuleTables,
   rows: Rows,
@@ -137,19 +133,23 @@ fn moved_rows(r: Rows, m: Mover) -> Rows =
 
 // --- One owner's answer ----------------------------------------------------------------------
 
-/// Whether `s`, in module `module`, lies in module `at` between `start` and `end`.
-fn within(module: Int, s: Span, at: Int, start: Int, end: Int) -> Bool =
-  module == at && s.start >= start && s.end <= end
+/// Whether `s`, in module `module`, lies in module `at` within one of `items`, which stand from
+/// `offset` on.
+fn within(module: Int, s: Span, at: Int, offset: Int, items: List<ItemAt>) -> Bool =
+  module == at
+    && fold(items, false, |b: Bool, x: ItemAt|
+      b || (s.start >= offset + x.from && s.end <= offset + x.from + x.len))
 
-/// What `w`, a check of one owner whose text stands in its module at `slot` from `offset` for `length`
-/// bytes, answered of that text alone: each place counted from where the text starts, module 0's.
+/// What `w`, a check of a group of owners whose own text stands in its module at `slot` from
+/// `offset`, answered of one of them, whose items are `items`: each place counted from where the
+/// group's text starts, module 0's.
 pub fn owner_answer(
   w: Analysis,
   slot: Int,
   offset: Int,
-  length: Int,
+  items: List<ItemAt>,
 ) -> OwnerAnswer / {abort.raise} = {
-  let mine = |module: Int, s: Span| within(module, s, 0, offset, offset + length);
+  let mine = |module: Int, s: Span| within(module, s, 0, offset, items);
   let here = |l: Location| mine(l.module, l.span);
   let facts = module_facts(w, slot);
   let t = facts.tables;
@@ -181,18 +181,11 @@ pub fn owner_answer(
     map_insert(acc, d.name, true));
   let back = { from: 0, to: 0, by: |p: Int| p - offset };
   let rows = rows_of(w);
+  let placed = |l: Label| within(l.module, { start: l.start, end: l.end }, slot, offset, items);
   let primary_mine = |d: Diag|
-    fold(d.labels, false, |b: Bool, l: Label|
-      b || (l.primary && l.module == slot && l.start >= offset && l.end <= offset + length));
+    fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && placed(l)));
   let own_labels = |d: Diag|
-    {
-      ..d,
-      labels: map(
-        filter(d.labels, |l: Label|
-          l.module == slot && l.start >= offset && l.end <= offset + length),
-        |l: Label| { ..l, module: 0 },
-      ),
-    };
+    { ..d, labels: map(filter(d.labels, placed), |l: Label| { ..l, module: 0 }) };
   let shape = facts.shape;
   {
     tables: moved_tables(
@@ -234,10 +227,10 @@ pub fn owner_answer(
   }
 }
 
-/// `a`, one owner's answer, its places moved to where its items stand in its module, `places`.
-pub fn placed_answer(a: OwnerAnswer, places: List<ItemPlace>) -> OwnerAnswer = {
+/// `a`, one owner's answer, its places moved to where its group's items stand in its module, `items`.
+pub fn placed_answer(a: OwnerAnswer, items: List<ItemAt>) -> OwnerAnswer = {
   let by = |p: Int|
-    fold(places, p, |acc: Int, x: ItemPlace|
+    fold(items, p, |acc: Int, x: ItemAt|
       if p >= x.from && p <= x.from + x.len { x.to + (p - x.from) } else { acc });
   let m = { from: 0, to: 0, by: by };
   {
@@ -299,16 +292,6 @@ pub fn numbered(
 
 // --- Tests ----------------------------------------------------------------------------------
 
-/// Where `items` stand in their module and in the owner's text that joins them.
-fn places_of(items: List<Item>) -> List<ItemPlace> =
-  fold(items, { at: 0, out: [] }, |acc: { at: Int, out: List<ItemPlace> }, item: Item| {
-    let s = item_span(item);
-    {
-      at: acc.at + (s.end - s.start) + 2,
-      out: push(acc.out, { from: acc.at, to: s.start, len: s.end - s.start }),
-    }
-  }).out
-
 /// What a module's own check said of it: its facts, its definitions' rows and its warnings.
 type Whole = {
   module: Bytes,
@@ -368,9 +351,7 @@ fn owned_apart(whole: Analysis, sources: List<Source>) -> List<Whole> / {abort.r
             Refused(_) -> panic("owner `" ++ string_of_bytes_lossy(o) ++ "` checks alone"),
             Analysed(w) -> w,
           };
-          let items = owner_items(raw, o);
-          let length = bytes_len(owned_text(text_at(i), items));
-          placed_answer(owner_answer(w, checked.at, source.offset, length), places_of(items))
+          placed_answer(owner_answer(w, checked.at, source.offset, source.items), source.items)
         }),
       })
     }
