@@ -7,19 +7,22 @@
 
 import std.list (at, concat, contains, flatten, sort_by)
 import std.bytes (int_of_ascii)
-import front (Analysis, Analysed, Refused, ModuleFacts, ModuleShape, ModuleTables, Rows,
-              KnownDefRow, KnownTestRow, TaggedSite, StatementSite, TypedConst, module_facts,
-              no_module_tables, rows_of, of_module, analyse_pulling_std_with, faceted)
-import exports (Exports, ItemAt, InRoot, ShippedModule, exports_of, entries_in, import_targets,
-                owner_source, checked_owner, item_owner)
+import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
+              OLaw, OFn, LawOutline, read_outline, ModuleShape, ModuleTables, Rows, KnownDefRow,
+              KnownTestRow, TaggedSite, StatementSite, TypedConst, module_facts, no_module_tables,
+              rows_of, of_module, analyse_pulling_std_with, faceted)
+import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModule, exports_of,
+                entries_in, import_targets, owner_source, checked_owner, item_owner, owner_reads,
+                module_scope, owner_mentions, owner_groups, group_source, unplaced_imports)
 import items (Item, IFn, parse, item_span)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
-              NumericInfo, Location, Raise, SpecInfo, LabelSite, OperandSite, UpdateShape,
-              WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts)
+              NumericInfo, Location, Raise, walk_order, SpecInfo, LabelSite, OperandSite,
+              UpdateShape, WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts)
 import resolve (Diag, Label, Edit, Fix, Source)
 import parsing (Span)
 import exprs (TaggedPart)
 import types (canonical_scheme)
+import hash (Shapes, kept_forms)
 
 /// What a check of a group of owners answered of one of them, every place module 0's and counted from
 /// where the group's own text starts.
@@ -31,6 +34,9 @@ pub type OwnerAnswer = {
   tagged: List<TaggedSite>,
   statements: List<StatementSite>,
   consts: List<TypedConst>,
+  /// Each effect set it declares, resolved, and each law it is with the literals its guard reads.
+  sets: List<SetView>,
+  laws: List<LawOutline>,
 }
 
 // --- Moving places ---------------------------------------------------------------------------
@@ -133,23 +139,30 @@ fn moved_rows(r: Rows, m: Mover) -> Rows =
 
 // --- One owner's answer ----------------------------------------------------------------------
 
-/// Whether `s`, in module `module`, lies in module `at` within one of `items`, which stand from
-/// `offset` on.
-fn within(module: Int, s: Span, at: Int, offset: Int, items: List<ItemAt>) -> Bool =
-  module == at
-    && fold(items, false, |b: Bool, x: ItemAt|
-      b || (s.start >= offset + x.from && s.end <= offset + x.from + x.len))
+/// Where one of an owner's items stands in the module a check read: from `at`, `len` bytes long,
+/// and counted from where its group's own text starts, `rel`.
+pub type Spot = { at: Int, len: Int, rel: Int }
 
-/// What `w`, a check of a group of owners whose own text stands in its module at `slot` from
-/// `offset`, answered of one of them, whose items are `items`: each place counted from where the
-/// group's text starts, module 0's.
+/// Whether `s`, in module `module`, lies in module `at` within one of `spots`.
+fn within(module: Int, s: Span, at: Int, spots: List<Spot>) -> Bool =
+  module == at
+    && fold(spots, false, |b: Bool, x: Spot| b || (s.start >= x.at && s.end <= x.at + x.len))
+
+/// A position of the module a check read, counted from where its group's own text starts.
+fn spotted(spots: List<Spot>, p: Int) -> Int =
+  fold(spots, p, |acc: Int, x: Spot|
+    if p >= x.at && p <= x.at + x.len { x.rel + (p - x.at) } else { acc })
+
+/// What `w`, a check that read a group of owners as its module at `slot`, answered of one of them,
+/// whose items stand where `spots` says and which declares `declared`, its own name among them: each
+/// place counted from where the group's text starts, module 0's.
 pub fn owner_answer(
   w: Analysis,
   slot: Int,
-  offset: Int,
-  items: List<ItemAt>,
+  spots: List<Spot>,
+  declared: Map<Bytes, Bool>,
 ) -> OwnerAnswer / {abort.raise} = {
-  let mine = |module: Int, s: Span| within(module, s, 0, offset, items);
+  let mine = |module: Int, s: Span| within(module, s, 0, spots);
   let here = |l: Location| mine(l.module, l.span);
   let facts = module_facts(w, slot);
   let t = facts.tables;
@@ -179,9 +192,9 @@ pub fn owner_answer(
   };
   let names = fold(kept.defs, map_new(), |acc: Map<Bytes, Bool>, d: DefInfo|
     map_insert(acc, d.name, true));
-  let back = { from: 0, to: 0, by: |p: Int| p - offset };
+  let back = { from: 0, to: 0, by: |p: Int| spotted(spots, p) };
   let rows = rows_of(w);
-  let placed = |l: Label| within(l.module, { start: l.start, end: l.end }, slot, offset, items);
+  let placed = |l: Label| within(l.module, { start: l.start, end: l.end }, slot, spots);
   let primary_mine = |d: Diag|
     fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && placed(l)));
   let own_labels = |d: Diag|
@@ -224,6 +237,13 @@ pub fn owner_answer(
       |x: StatementSite| { ..x, span: moved_at(x.span, back) },
     ),
     consts: filter(shape.consts, |x: TypedConst| map_contains(names, x.name)),
+    sets: filter(shape.outline.sets, |x: SetView| map_contains(declared, x.name)),
+    laws: fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
+      match x {
+        OLaw(l) -> if map_contains(declared, bytes_concat(b"law ", l.name)) { push(acc, l) }
+        else { acc },
+        _ -> acc,
+      }),
   }
 }
 
@@ -241,6 +261,98 @@ pub fn placed_answer(a: OwnerAnswer, items: List<ItemAt>) -> OwnerAnswer = {
     tagged: map(a.tagged, |x: TaggedSite| moved_tagged(x, m)),
     statements: map(a.statements, |x: StatementSite| { ..x, span: moved_at(x.span, m) }),
     consts: a.consts,
+    sets: a.sets,
+    laws: a.laws,
+  }
+}
+
+/// What a check of a group of owners answered of one of them, and the entry it shows what reads it:
+/// none for a test or a law.
+pub type MemberAnswer = { owner: Bytes, answer: OwnerAnswer, entry: Option<Entry> }
+
+/// What a check of a group of owners answered: each member's answer, the errors that refused the
+/// group, and the forms hashing reads of the members, each place counted from where the group's own
+/// text starts.
+pub type GroupAnswer = { members: List<MemberAnswer>, refused: List<Diag>, forms: Shapes }
+
+/// Where `owner`'s items of `items`, a group's items as [`group_source`] lays them, stand in the
+/// module a check read, each where `at` says.
+pub fn spots_of(
+  items: List<ItemAt>,
+  owner: Bytes,
+  at: (ItemAt) -> Int / {abort.raise},
+) -> List<Spot> / {abort.raise} =
+  map(filter(items, |x: ItemAt| x.owner == owner), |x: ItemAt|
+    { at: at(x), len: x.len, rel: x.from })
+
+/// What a check that read a group of owners of `module` as its module at `slot`, written as `text`,
+/// answered of them: `members` are the owners, `items` where their items stand as [`group_source`]
+/// lays them, and `at` where each item stands in the module the check read.
+pub fn group_answer(
+  out: AnalysisOutcome,
+  slot: Int,
+  text: Bytes,
+  module: Bytes,
+  members: List<OwnerRead>,
+  items: List<ItemAt>,
+  at: (ItemAt) -> Int / {abort.raise},
+) -> GroupAnswer / {abort.raise} = {
+  let spots = map(items, |x: ItemAt| { at: at(x), len: x.len, rel: x.from });
+  let back = { from: 0, to: 0, by: |p: Int| spotted(spots, p) };
+  match out {
+    Refused(ds) ->
+      {
+        members: [],
+        refused: map(ds, |d: Diag|
+          moved_diag(
+            {
+              ..d,
+              labels: map(
+                filter(d.labels, |l: Label|
+                  within(l.module, { start: l.start, end: l.end }, slot, spots)),
+                |l: Label| { ..l, module: 0 },
+              ),
+            },
+            back,
+          )),
+        forms: { nodes: [], order: [], tests: [], laws: [] },
+      },
+    Analysed(w) -> {
+      let prefix = bytes_concat(module, b".");
+      let kept = fold(members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
+        fold(
+          o.names,
+          if bytes_starts_with(o.owner, b"test ") {
+            map_insert(acc, bytes_slice(o.owner, 5, bytes_len(o.owner)), true)
+          } else if bytes_starts_with(o.owner, b"law ") {
+            map_insert(acc, bytes_slice(o.owner, 4, bytes_len(o.owner)), true)
+          } else { acc },
+          |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true),
+        ));
+      let keeps = |name: Bytes|
+        bytes_starts_with(name, prefix)
+          && map_contains(kept, bytes_slice(name, bytes_len(prefix), bytes_len(name)));
+      let shown = exports_of(w, slot, text);
+      {
+        members: map(members, |o: OwnerRead|
+          {
+            owner: o.owner,
+            answer: owner_answer(
+              w,
+              slot,
+              spots_of(items, o.owner, at),
+              fold(
+                o.names,
+                map_insert(map_new(), o.owner, true),
+                |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true),
+              ),
+            ),
+            entry: map_get(shown.entries, o.owner),
+          }),
+        refused: [],
+        forms: kept_forms(w.index, w.module_packages, slot, keeps),
+      }
+    },
   }
 }
 
@@ -287,6 +399,208 @@ pub fn numbered(
       kept: map(t.kept, |k: KeptFacts| { ..k, name: o(k.name) }),
     },
     rows: { ..a.rows, tests: map(a.rows.tests, |r: KnownTestRow| { ..r, owner: o(r.owner) }) },
+  }
+}
+
+// --- A module put together from its groups -----------------------------------------------------
+
+/// What a module answers as its groups answered: what its check says of it, what its definitions
+/// and tests published, its warnings, the errors that refuse it, how many definitions and tests it
+/// checked, and each owner's entry.
+pub type Assembled = {
+  facts: ModuleFacts,
+  rows: Rows,
+  warnings: List<Diag>,
+  refused: List<Diag>,
+  defs: Int,
+  tests: Int,
+  entries: Map<Bytes, Entry>,
+}
+
+/// One group's answer beside where its items stand as [`group_source`] lays them.
+pub type Placed = { items: List<ItemAt>, answer: GroupAnswer }
+
+/// `xs` in the order `rank` says, those of one rank in the order they came.
+fn ranked<a>(xs: List<a>, rank: (a) -> Int / {abort.raise}) -> List<a> / {abort.raise} =
+  map(
+    sort_by(
+      map(range(0, len(xs)), |i: Int| { rank: rank(at(xs, i)), at: i }),
+      |a: { rank: Int, at: Int }, b: { rank: Int, at: Int }|
+        a.rank < b.rank || (a.rank == b.rank && a.at <= b.at),
+    ),
+    |x: { rank: Int, at: Int }| at(xs, x.at),
+  )
+
+/// What `pick` holds of each of `owners`, one after another.
+fn gathered<a>(owners: List<OwnerAnswer>, pick: (OwnerAnswer) -> List<a>) -> List<a> =
+  fold(owners, [], |acc: List<a>, a: OwnerAnswer| concat(acc, pick(a)))
+
+/// Where a diagnostic's first primary label starts.
+fn diag_start(d: Diag) -> Int =
+  fold(d.labels, 0 - 1, |acc: Int, l: Label| if acc < 0 && l.primary { l.start } else { acc })
+
+/// What `module` answers as its groups answered, `groups` each placed: `shape` is what its text
+/// alone says of its shape, and `order` its functions in the order a check of it walks them.
+pub fn assembled(
+  module: Bytes,
+  shape: ModuleShape,
+  order: List<Bytes>,
+  groups: List<Placed>,
+) -> Assembled / {abort.raise} = {
+  let walk = fold(range(0, len(order)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(order, i), i));
+  let walked = |name: Bytes| match map_get(walk, name) { Some(k) -> k, None -> len(order) };
+  // Each member's answer placed where its items stand, in the order its first item does.
+  let placed = ranked(
+    fold(
+      groups,
+      [],
+      |acc: List<{ first: Int, member: MemberAnswer, answer: OwnerAnswer }>, g: Placed|
+        fold(
+          g.answer.members,
+          acc,
+          |a: List<{ first: Int, member: MemberAnswer, answer: OwnerAnswer }>, m: MemberAnswer|
+            push(a, {
+              first: fold(g.items, 0 - 1, |f: Int, x: ItemAt|
+                if x.owner == m.owner && (f < 0 || x.to < f) { x.to } else { f }),
+              member: m,
+              answer: placed_answer(m.answer, g.items),
+            }),
+        ),
+    ),
+    |x: { first: Int, member: MemberAnswer, answer: OwnerAnswer }| x.first,
+  );
+  let numbered_all = fold(
+    placed,
+    { tests: 0, laws: 0, out: [] },
+    |acc: { tests: Int, laws: Int, out: List<OwnerAnswer> }, x: { first: Int, member: MemberAnswer, answer: OwnerAnswer }| {
+      let a = numbered(x.answer, module, acc.tests, acc.laws);
+      {
+        tests: acc.tests + len(a.tables.tests),
+        laws: acc.laws + len(a.tables.laws),
+        out: push(acc.out, a),
+      }
+    },
+  );
+  let owners = numbered_all.out;
+  let prefix = bytes_concat(module, b".test#");
+  let fn_spans = fold(shape.outline.items, [], |acc: List<Span>, x: Outlined|
+    match x { OFn(f) -> push(acc, f.span), _ -> acc });
+  // A check walks the functions, then each one's clauses, then the tests, then laws and schemas:
+  // a clause's and a law's sites are filed under no owner, a clause's inside its function.
+  let site_rank = |owner: Bytes, start: Int|
+    match map_get(walk, owner) {
+      Some(k) -> k,
+      None -> if bytes_len(owner) == 0 {
+        if fold(fn_spans, false, |b: Bool, f: Span| b || (start >= f.start && start <= f.end)) {
+          1000000000 + start
+        } else { 3000000000 + start }
+      } else if bytes_starts_with(owner, prefix) {
+        2000000000
+          + (match int_of_ascii(bytes_slice(owner, bytes_len(prefix), bytes_len(owner))) {
+            Some(k) -> k,
+            None -> 0,
+          })
+      } else { 3000000000 + start },
+    };
+  let tables = {
+    defs: ranked(gathered(owners, |a: OwnerAnswer| a.tables.defs), |d: DefInfo| walked(d.name)),
+    tests: gathered(owners, |a: OwnerAnswer| a.tables.tests),
+    laws: gathered(owners, |a: OwnerAnswer| a.tables.laws),
+    effects: ranked(gathered(owners, |a: OwnerAnswer| a.tables.effects), |x: EffectInfo|
+      x.at.span.start),
+    ctors: ranked(gathered(owners, |a: OwnerAnswer| a.tables.ctors), |x: CtorInfo| x.at.span.start),
+    instances: ranked(gathered(owners, |a: OwnerAnswer| a.tables.instances), |x: InstanceInfo|
+      x.at.span.start),
+    numeric: ranked(gathered(owners, |a: OwnerAnswer| a.tables.numeric), |x: NumericInfo|
+      x.at.span.start),
+    facts: {
+      pure: ranked(gathered(owners, |a: OwnerAnswer| a.tables.facts.pure), walked),
+      label_sites: ranked(
+        gathered(owners, |a: OwnerAnswer| a.tables.facts.label_sites),
+        |x: LabelSite| site_rank(x.owner, x.span.start),
+      ),
+      operands: ranked(
+        gathered(owners, |a: OwnerAnswer| a.tables.facts.operands),
+        |x: OperandSite| site_rank(x.owner, x.span.start),
+      ),
+      elaboration: {
+        updates: ranked(
+          gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.updates),
+          |x: UpdateShape| site_rank(x.owner, x.span.start),
+        ),
+        ops: ranked(
+          gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.ops),
+          |x: WitnessOp| site_rank(x.owner, x.span.start),
+        ),
+        refs: ranked(
+          gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.refs),
+          |x: WitnessRef| site_rank(x.owner, x.span.start),
+        ),
+        orders: ranked(
+          gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.orders),
+          |x: WitnessOrder| walked(bytes_concat_all([module, b".", x.name])),
+        ),
+        tries: ranked(
+          gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.tries),
+          |x: TrySite| site_rank(x.owner, x.span.start),
+        ),
+      },
+    },
+    kept: ranked(gathered(owners, |a: OwnerAnswer| a.tables.kept), |k: KeptFacts|
+      site_rank(k.name, 0)),
+  };
+  let laws = fold(owners, map_new(), |acc: Map<Bytes, LawOutline>, a: OwnerAnswer|
+    fold(a.laws, acc, |m: Map<Bytes, LawOutline>, l: LawOutline| map_insert(m, l.name, l)));
+  let outline = shape.outline;
+  {
+    facts: {
+      shape: {
+        ..shape,
+        outline: {
+          ..outline,
+          items: map(outline.items, |x: Outlined|
+            match x {
+              OLaw(l) -> match map_get(laws, l.name) { Some(k) -> OLaw(k), None -> x },
+              _ -> x,
+            }),
+          sets: gathered(owners, |a: OwnerAnswer| a.sets),
+        },
+        tagged: ranked(gathered(owners, |a: OwnerAnswer| a.tagged), |x: TaggedSite| x.span.start),
+        statements: ranked(gathered(owners, |a: OwnerAnswer| a.statements), |x: StatementSite|
+          x.span.start),
+        consts: ranked(gathered(owners, |a: OwnerAnswer| a.consts), |x: TypedConst| walked(x.name)),
+      },
+      tables: tables,
+    },
+    rows: {
+      defs: ranked(gathered(owners, |a: OwnerAnswer| a.rows.defs), |r: KnownDefRow| walked(r.name)),
+      tests: gathered(owners, |a: OwnerAnswer| a.rows.tests),
+    },
+    warnings: ranked(gathered(owners, |a: OwnerAnswer| a.warnings), diag_start),
+    refused: ranked(
+      fold(groups, [], |acc: List<Diag>, g: Placed|
+        concat(
+          acc,
+          map(g.answer.refused, |d: Diag|
+            moved_diag(d, {
+              from: 0,
+              to: 0,
+              by: |p: Int|
+                fold(g.items, p, |q: Int, x: ItemAt|
+                  if p >= x.from && p <= x.from + x.len { x.to + (p - x.from) } else { q }),
+            })),
+        )),
+      diag_start,
+    ),
+    defs: len(tables.defs),
+    tests: len(tables.tests),
+    entries: fold(
+      placed,
+      map_new(),
+      |acc: Map<Bytes, Entry>, x: { first: Int, member: MemberAnswer, answer: OwnerAnswer }|
+        match x.member.entry { Some(e) -> map_insert(acc, x.member.owner, e), None -> acc },
+    ),
   }
 }
 
@@ -347,11 +661,19 @@ fn owned_apart(whole: Analysis, sources: List<Source>) -> List<Whole> / {abort.r
             |module: Bytes, n: Bytes| entries_in(exports, module, n),
           );
           let checked = checked_owner(source, InRoot, placing, reading);
-          let w = match checked.pulled.out {
-            Refused(_) -> panic("owner `" ++ string_of_bytes_lossy(o) ++ "` checks alone"),
-            Analysed(w) -> w,
-          };
-          placed_answer(owner_answer(w, checked.at, source.offset, source.items), source.items)
+          let g = group_answer(
+            checked.pulled.out,
+            checked.at,
+            source.source.src,
+            parsed.name,
+            filter(owner_reads(parsed, raw, text_at(i)), |r: OwnerRead| r.owner == o),
+            source.items,
+            |x: ItemAt| source.offset + x.from,
+          );
+          match g.members {
+            [m] -> placed_answer(m.answer, source.items),
+            _ -> panic("owner `" ++ string_of_bytes_lossy(o) ++ "` checks alone"),
+          }
         }),
       })
     }
@@ -476,6 +798,124 @@ fn agrees(sources: List<Source>) -> Unit / {abort.raise} = {
 test "each owner checked alone and placed where it stands answers what its module's check does" {
   agrees([{ name: b"core", src: core_fixture() }, { name: b"shop", src: shop_fixture() }]);
   agrees(faceted())
+}
+
+/// Each module of `sources` put together from its groups' answers, each group checked against the
+/// entries it reads, beside `whole`'s answer of it.
+fn assembled_apart(
+  whole: Analysis,
+  sources: List<Source>,
+) -> List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }> / {abort.raise} = {
+  let texts = fold(sources, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let text_at = |i: Int| match map_get(texts, at(whole.mods, i).name) { Some(t) -> t, None -> b"" };
+  let exports = fold(range(0, len(whole.mods)), map_new(), |acc: Map<Bytes, Exports>, i: Int|
+    map_insert(acc, at(whole.mods, i).name, exports_of(whole, i, text_at(i))));
+  let reading = {
+    pkgs: { root: b"", manifest: None, supplied: [] },
+    tested: true,
+    whole: [],
+    data: [],
+    embeds: [],
+    given: [],
+    judged: None,
+    unread: [],
+  };
+  let placing = |m: Bytes| if map_contains(texts, m) { InRoot } else { ShippedModule };
+  fold(
+    range(0, len(whole.mods)),
+    [],
+    |acc: List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }>, i: Int| {
+      let parsed = at(whole.mods, i);
+      if !map_contains(texts, parsed.name) { acc } else {
+        let text = text_at(i);
+        let raw = parse(text).node;
+        let targets = import_targets(whole, i);
+        let scope = module_scope(parsed, raw, targets);
+        let reads = owner_reads(parsed, raw, text);
+        let mentions = fold(reads, map_new(), |m: Map<Bytes, List<Mention>>, o: OwnerRead|
+          map_insert(m, o.owner, owner_mentions(parsed.name, scope, o)));
+        let groups = owner_groups(parsed.name, scope, map(reads, |o: OwnerRead| o.owner), mentions);
+        let facts = module_facts(whole, i);
+        let base = {
+          ..facts.shape,
+          outline: read_outline(parsed),
+          tagged: [],
+          statements: [],
+          consts: [],
+        };
+        let placed = map(groups, |g: List<Bytes>| {
+          let members = filter(reads, |o: OwnerRead| contains(g, o.owner));
+          let source = group_source(
+            parsed.name,
+            members,
+            fold(g, [], |ms: List<Mention>, o: Bytes|
+              concat(ms, match map_get(mentions, o) { Some(xs) -> xs, None -> [] })),
+            unplaced_imports(raw),
+            targets,
+            |module: Bytes, n: Bytes| entries_in(exports, module, n),
+          );
+          let checked = checked_owner(source, InRoot, placing, reading);
+          {
+            items: source.items,
+            answer: group_answer(
+              checked.pulled.out,
+              checked.at,
+              source.source.src,
+              parsed.name,
+              members,
+              source.items,
+              |x: ItemAt| source.offset + x.from,
+            ),
+          }
+        });
+        push(acc, {
+          module: parsed.name,
+          whole: facts,
+          rows: filter(rows_of(whole).defs, |r: KnownDefRow| of_module(parsed.name, r.name)),
+          apart: assembled(parsed.name, base, walk_order(parsed), placed),
+        })
+      }
+    },
+  )
+}
+
+fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
+  let whole = match analyse_pulling_std_with(sources, [], [], []).out {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  };
+  fold(
+    assembled_apart(whole, sources),
+    (),
+    |u: Unit, m: { module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }| {
+      let canonical = |t: ModuleTables|
+        { ..t, defs: map(t.defs, |d: DefInfo| { ..d, scheme: canonical_scheme(d.scheme) }) };
+      let a = m.apart.facts;
+      let w = m.whole;
+      assert_eq(map(a.tables.defs, |d: DefInfo| d.name), map(w.tables.defs, |d: DefInfo| d.name));
+      assert_eq(canonical(a.tables).defs, canonical(w.tables).defs);
+      assert_eq(a.tables.tests, w.tables.tests);
+      assert_eq(a.tables.laws, w.tables.laws);
+      assert_eq(a.tables.effects, w.tables.effects);
+      assert_eq(a.tables.ctors, w.tables.ctors);
+      assert_eq(a.tables.instances, w.tables.instances);
+      assert_eq(a.tables.numeric, w.tables.numeric);
+      assert_eq(a.tables.facts.pure, w.tables.facts.pure);
+      assert_eq(a.tables.facts.label_sites, w.tables.facts.label_sites);
+      assert_eq(a.tables.facts.operands, w.tables.facts.operands);
+      assert_eq(a.tables.facts.elaboration, w.tables.facts.elaboration);
+      assert_eq(a.tables.kept, w.tables.kept);
+      assert_eq(a.shape.outline, w.shape.outline);
+      assert_eq(a.shape, w.shape);
+      assert_eq(m.apart.rows.defs, map(m.rows, |r: KnownDefRow| { ..r, hash: b"" }))
+    },
+  )
+}
+
+test "a module put together from its groups' answers is what its check answers" {
+  assembles([{ name: b"core", src: core_fixture() }, { name: b"shop", src: shop_fixture() }]);
+  assembles(faceted())
 }
 
 fn core_fixture() -> Bytes =
