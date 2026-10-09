@@ -140,7 +140,7 @@ pub fn kept<a, [r] | e>(
   let value = with_cell[minted](0) { minted ->
     with_cell[marking](marks_in[r](dir)) { marking ->
       with_cell[pending](no_pending()) { pending ->
-        with_cell[heights](map_new()) { heights ->
+        with_cell[firsts](map_new()) { firsts ->
           with_cell[inlined](map_new()) { inlined -> {
             let fresh = || {
               let n = cell_get(minted);
@@ -199,39 +199,41 @@ pub fn kept<a, [r] | e>(
             // A record of the store beside, where it stands as it is.
             let trusted_at = |key: Bytes|
               if trusted { noted(beside(record_path(key))) } else { None };
+            // What the store's file of the record under `key` held when this run first read it, read
+            // once: its first bytes, which are all of it for most records, or nothing for no record.
+            let first_of = |key: Bytes|
+              match map_get(cell_get(firsts), key) {
+                Some(f) -> f,
+                None -> {
+                  let f = noted(fs.read_at[r](at(dir, record_path(key)), 0, head_bytes()));
+                  cell_set(firsts, map_insert(cell_get(firsts), key, f));
+                  f
+                },
+              };
             let record_bytes_at = |key: Bytes|
               match map_get(cell_get(pending).records, key) {
                 Some(b) -> Some(b),
-                None -> noted(fs.read_file[r](at(dir, record_path(key)))),
+                None -> match first_of(key) {
+                  Some(b) -> if bytes_len(b) < head_bytes() { Some(b) }
+                  else { noted(fs.read_file[r](at(dir, record_path(key)))) },
+                  None -> None,
+                },
               };
             let value = handle {
               work()
             } with {
               memo_keep.head(key) -> match map_get(cell_get(pending).records, key) {
                 Some(b) -> output_named(b),
-                None -> match noted(fs.read_at[r](at(dir, record_path(key)), 0, head_bytes())) {
-                  Some(b) -> {
-                    // The head holds the height too, which a read of the record asks next.
-                    cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
-                    output_named(b)
-                  },
-                  None -> match trusted_at(key) {
-                    Some(b) -> {
-                      cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
-                      output_named(b)
-                    },
-                    None -> None,
-                  },
+                None -> match first_of(key) {
+                  Some(b) -> output_named(b),
+                  None -> match trusted_at(key) { Some(b) -> output_named(b), None -> None },
                 },
               },
               memo_keep.height(key) -> match map_get(cell_get(pending).records, key) {
                 Some(b) -> height_named(b),
-                None -> match map_get(cell_get(heights), key) {
-                  Some(h) -> h,
-                  None -> match fs.read_at[r](at(dir, record_path(key)), 0, 9) {
-                    Some(b) -> height_named(b),
-                    None -> match trusted_at(key) { Some(b) -> height_named(b), None -> 0 },
-                  },
+                None -> match first_of(key) {
+                  Some(b) -> height_named(b),
+                  None -> match trusted_at(key) { Some(b) -> height_named(b), None -> 0 },
                 },
               },
               memo_keep.record(key) ->
@@ -251,7 +253,7 @@ pub fn kept<a, [r] | e>(
                 },
               },
               memo_keep.keep(key, rec, output) -> {
-                cell_set(heights, map_remove(cell_get(heights), key));
+                cell_set(firsts, map_remove(cell_get(firsts), key));
                 let p = cell_get(pending);
                 let inline = kept_inline(output);
                 let b = record_bytes(rec, inline);
@@ -272,7 +274,7 @@ pub fn kept<a, [r] | e>(
                 held(next)
               },
               memo_keep.adopt(key, rec) -> {
-                cell_set(heights, map_remove(cell_get(heights), key));
+                cell_set(firsts, map_remove(cell_get(firsts), key));
                 let p = cell_get(pending);
                 // A packed answer its record holds is held by the adopted record too.
                 let b = record_bytes(rec, map_get(cell_get(inlined), rec.output));
@@ -369,6 +371,7 @@ pub fn kept<a, [r] | e>(
               memo_keep.forget(key) -> {
                 let p = cell_get(pending);
                 cell_set(pending, { ..p, records: map_remove(p.records, key) });
+                cell_set(firsts, map_insert(cell_get(firsts), key, None));
                 fs.remove[r](at(dir, record_path(key)));
                 let held = cell_get(marking);
                 fold(
