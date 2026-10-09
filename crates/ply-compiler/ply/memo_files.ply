@@ -1,6 +1,7 @@
-//! The memo store as files in a directory: `records/`, each record under its key; `outputs/`, each
-//! answer under its digest; `places/`, what the store last saw at each place of the world a record
-//! read; `readers/`, the keys of the records that read each place or asked each record; and
+//! The memo store as files in a directory: `records/`, each record under its key, holding its answer
+//! where it is short; `outputs/`, each longer answer under its digest; `places/`, what the store last
+//! saw at each place of the world a record read; `links/`, the keys of the records that read each
+//! place or asked each record, in 4096 files by the id of what they read; and
 //! `marked/`, a file for each mark on a record, named by the record's key and the mark, so a run lists
 //! only the marks there are. A run reads the records it asks for and no other, and keeps what it
 //! answered as files of their own, each landed whole by a rename, so runs that keep the same answer
@@ -13,7 +14,8 @@ import std.fs (fs, under)
 import std.bytes (bytes_of_hex, hex_of)
 import std.list (contains)
 import memo (Record, Seen, memo_keep, digest_of, head_bytes, output_named, height_named,
-             output_path, record_bytes, record_from, record_path, seen_bin)
+             inline_named, kept_inline, output_path, record_bytes, record_from, record_path,
+             seen_bin)
 
 fn records_dir(dir: String) -> String = under(dir, "records")
 
@@ -21,7 +23,7 @@ fn outputs_dir(dir: String) -> String = under(dir, "outputs")
 
 fn places_dir(dir: String) -> String = under(dir, "places")
 
-fn readers_dir(dir: String) -> String = under(dir, "readers")
+fn links_dir(dir: String) -> String = under(dir, "links")
 
 fn marks_dir(dir: String) -> String = under(dir, "marked")
 
@@ -31,8 +33,9 @@ fn runs_dir(dir: String) -> String = under(dir, "runs")
 
 fn at(dir: String, path: String) -> String = dir ++ "/" ++ path
 
-/// What a run kept and has not written yet: records by key, answers by digest, and the keys of the
-/// records that read each place or asked each record, by its id; and about how many bytes that is.
+/// What a run kept and has not written yet: records by key, the answers no record holds by digest,
+/// and the keys of the records that read each place or asked each record, by its id; and about how
+/// many bytes that is.
 type Pending = {
   records: Map<Bytes, Bytes>,
   outputs: Map<Bytes, Bytes>,
@@ -46,6 +49,29 @@ fn no_pending() -> Pending = { records: map_new(), outputs: map_new(), links: ma
 fn pending_bound() -> Int = 67108864
 
 fn named_in(sub: String, id: Bytes) -> String / {abort.raise} = sub ++ "/" ++ hex_of(id)
+
+/// The file the readers of `id` are noted in: one of 4096, by the id's first twelve bits. Each note
+/// there is the id, then the key of a record that read it.
+fn links_path(dir: String, id: Bytes) -> String / {abort.raise} =
+  links_dir(dir) ++ "/" ++ string_slice(hex_of(bytes_slice(id, 0, 2)), 0, 3)
+
+/// The keys `bytes`, a links file, notes as readers of `id`, in the order noted.
+fn readers_in(bytes: Option<Bytes>, id: Bytes) -> List<Bytes> =
+  match bytes {
+    None -> [],
+    Some(b) ->
+      fold(range(0, bytes_len(b) / 64), [], |acc: List<Bytes>, i: Int|
+        if bytes_slice(b, i * 64, i * 64 + 32) == id {
+          push(acc, bytes_slice(b, i * 64 + 32, i * 64 + 64))
+        } else { acc }),
+  }
+
+/// The notes of `keys` as readers of `id`, as a links file holds them.
+fn notes_of(id: Bytes, keys: Bytes) -> Bytes =
+  bytes_concat_all(
+    map(range(0, bytes_len(keys) / 32), |i: Int|
+      bytes_concat(id, bytes_slice(keys, i * 32, i * 32 + 32))),
+  )
 
 /// The record `bytes` hold, or nothing where they do not read as one.
 fn record_of(bytes: Option<Bytes>) -> Option<Record> / {abort.raise} =
@@ -94,7 +120,7 @@ pub fn kept<a, [r] | e>(
   fs.create_dir[r](records_dir(dir));
   fs.create_dir[r](outputs_dir(dir));
   fs.create_dir[r](places_dir(dir));
-  fs.create_dir[r](readers_dir(dir));
+  fs.create_dir[r](links_dir(dir));
   fs.create_dir[r](marks_dir(dir));
   fs.create_dir[r](holds_dir(dir));
   fs.create_dir[r](runs_dir(dir));
@@ -111,217 +137,257 @@ pub fn kept<a, [r] | e>(
   let value = with_cell[minted](0) { minted ->
     with_cell[marking](marks_in[r](dir)) { marking ->
       with_cell[pending](no_pending()) { pending ->
-        with_cell[heights](map_new()) { heights -> {
-          let fresh = || {
-            let n = cell_get(minted);
-            cell_set(minted, n + 1);
-            token ++ "." ++ int_to_string(n)
-          };
-          // `bytes` at `path`, landed whole: written beside it under a name of this run's, and renamed.
-          let landed = |path: String, bytes: Bytes| {
-            let tmp = path ++ "." ++ fresh() ++ ".tmp";
-            if fs.write_file[r](tmp, bytes) {
-              fs.rename[r](tmp, path);
-              ()
-            }
-          };
-          // What the run kept so far, written: each answer, then each read's new readers, then each
-          // record, so a record is never there without the notes that mark it.
-          let flushed = || {
-            let p = cell_get(pending);
-            map_fold(p.outputs, (), |_: Unit, digest: Bytes, output: Bytes| {
-              let path = at(dir, output_path(digest));
-              if !fs.exists[r](path) { landed(path, output) }
-            });
-            map_fold(p.links, (), |_: Unit, id: Bytes, keys: Bytes| {
-              fs.append[r](named_in(readers_dir(dir), id), keys);
-              ()
-            });
-            map_fold(p.records, (), |_: Unit, key: Bytes, b: Bytes|
-              landed(at(dir, record_path(key)), b));
-            cell_set(pending, no_pending())
-          };
-          let held = |p: Pending| if p.size > pending_bound() { flushed() };
-          // A record of the store beside, where it stands as it is.
-          let trusted_at = |key: Bytes| if trusted { beside(record_path(key)) } else { None };
-          let record_bytes_at = |key: Bytes|
-            match map_get(cell_get(pending).records, key) {
-              Some(b) -> Some(b),
-              None -> fs.read_file[r](at(dir, record_path(key))),
+        with_cell[heights](map_new()) { heights ->
+          with_cell[inlined](map_new()) { inlined -> {
+            let fresh = || {
+              let n = cell_get(minted);
+              cell_set(minted, n + 1);
+              token ++ "." ++ int_to_string(n)
             };
-          let value = handle {
-            work()
-          } with {
-            memo_keep.head(key) -> match map_get(cell_get(pending).records, key) {
-              Some(b) -> output_named(b),
-              None -> match fs.read_at[r](at(dir, record_path(key)), 0, head_bytes()) {
-                Some(b) -> {
-                  // The head holds the height too, which a read of the record asks next.
-                  cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
-                  output_named(b)
+            // `bytes` at `path`, landed whole: written beside it under a name of this run's, and renamed.
+            let landed = |path: String, bytes: Bytes| {
+              let tmp = path ++ "." ++ fresh() ++ ".tmp";
+              if fs.write_file[r](tmp, bytes) {
+                fs.rename[r](tmp, path);
+                ()
+              }
+            };
+            // What the run kept so far, written: each answer, then each read's new readers, then each
+            // record, so a record is never there without the notes that mark it.
+            let flushed = || {
+              let p = cell_get(pending);
+              map_fold(p.outputs, (), |_: Unit, digest: Bytes, output: Bytes| {
+                let path = at(dir, output_path(digest));
+                if !fs.exists[r](path) { landed(path, output) }
+              });
+              let filed = map_fold(
+                p.links,
+                map_new(),
+                |acc: Map<String, Bytes>, id: Bytes, keys: Bytes| {
+                  let path = links_path(dir, id);
+                  let notes = notes_of(id, keys);
+                  map_insert(acc, path, match map_get(acc, path) {
+                    Some(b) -> bytes_concat(b, notes),
+                    None -> notes,
+                  })
                 },
-                None -> match trusted_at(key) {
+              );
+              map_fold(filed, (), |_: Unit, path: String, notes: Bytes| {
+                fs.append[r](path, notes);
+                ()
+              });
+              map_fold(p.records, (), |_: Unit, key: Bytes, b: Bytes|
+                landed(at(dir, record_path(key)), b));
+              cell_set(pending, no_pending())
+            };
+            let held = |p: Pending| if p.size > pending_bound() { flushed() };
+            // A record's bytes, or their first bytes, noted for the answer they hold, which the run
+            // asks for next.
+            let noted = |found: Option<Bytes>| {
+              match found {
+                Some(b) -> match ((output_named(b), inline_named(b))) {
+                  (Some(d), Some(o)) -> cell_set(inlined, map_insert(cell_get(inlined), d, o)),
+                  _ -> (),
+                },
+                None -> (),
+              };
+              found
+            };
+            // A record of the store beside, where it stands as it is.
+            let trusted_at = |key: Bytes|
+              if trusted { noted(beside(record_path(key))) } else { None };
+            let record_bytes_at = |key: Bytes|
+              match map_get(cell_get(pending).records, key) {
+                Some(b) -> Some(b),
+                None -> noted(fs.read_file[r](at(dir, record_path(key)))),
+              };
+            let value = handle {
+              work()
+            } with {
+              memo_keep.head(key) -> match map_get(cell_get(pending).records, key) {
+                Some(b) -> output_named(b),
+                None -> match noted(fs.read_at[r](at(dir, record_path(key)), 0, head_bytes())) {
                   Some(b) -> {
+                    // The head holds the height too, which a read of the record asks next.
                     cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
                     output_named(b)
                   },
-                  None -> None,
+                  None -> match trusted_at(key) {
+                    Some(b) -> {
+                      cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
+                      output_named(b)
+                    },
+                    None -> None,
+                  },
                 },
               },
-            },
-            memo_keep.height(key) -> match map_get(cell_get(pending).records, key) {
-              Some(b) -> height_named(b),
-              None -> match map_get(cell_get(heights), key) {
-                Some(h) -> h,
-                None -> match fs.read_at[r](at(dir, record_path(key)), 0, 9) {
-                  Some(b) -> height_named(b),
-                  None -> match trusted_at(key) { Some(b) -> height_named(b), None -> 0 },
+              memo_keep.height(key) -> match map_get(cell_get(pending).records, key) {
+                Some(b) -> height_named(b),
+                None -> match map_get(cell_get(heights), key) {
+                  Some(h) -> h,
+                  None -> match fs.read_at[r](at(dir, record_path(key)), 0, 9) {
+                    Some(b) -> height_named(b),
+                    None -> match trusted_at(key) { Some(b) -> height_named(b), None -> 0 },
+                  },
                 },
               },
-            },
-            memo_keep.record(key) ->
-              record_of(match record_bytes_at(key) { Some(b) -> Some(b), None -> trusted_at(key) }),
-            memo_keep.packed(key) -> record_of(beside(record_path(key))),
-            memo_keep.output(digest) -> match map_get(cell_get(pending).outputs, digest) {
-              Some(o) -> Some(o),
-              None -> match fs.read_file[r](at(dir, output_path(digest))) {
-                Some(o) -> Some(o),
-                None -> beside(output_path(digest)),
-              },
-            },
-            memo_keep.keep(key, rec, output) -> {
-              cell_set(heights, map_remove(cell_get(heights), key));
-              let p = cell_get(pending);
-              let b = record_bytes(rec);
-              let next = {
-                ..p,
-                records: map_insert(p.records, key, b),
-                outputs: map_insert(p.outputs, rec.output, output),
-                size: p.size + bytes_len(b) + bytes_len(output),
-              };
-              cell_set(pending, next);
-              held(next)
-            },
-            memo_keep.adopt(key, rec) -> {
-              cell_set(heights, map_remove(cell_get(heights), key));
-              let p = cell_get(pending);
-              let b = record_bytes(rec);
-              let next = {
-                ..p,
-                records: map_insert(p.records, key, b),
-                size: p.size + bytes_len(b),
-              };
-              cell_set(pending, next);
-              held(next)
-            },
-            memo_keep.now(kind, place) -> look(kind, place),
-            memo_keep.places() -> match fs.list_dir[r](places_dir(dir)) {
-              None -> [],
-              Some(names) ->
-                fold(names, [], |acc: List<Seen>, n: String|
-                  if string_ends_with(n, ".tmp") { acc } else {
-                    match fs.read_file[r](places_dir(dir) ++ "/" ++ n) {
-                      Some(b) -> match bin::decode(b, seen_bin()) {
-                        Ok(s) -> push(acc, s),
-                        Err(_) -> acc,
-                      },
-                      None -> acc,
-                    }
-                  }),
-            },
-            memo_keep.seen(id) -> match fs.read_file[r](named_in(places_dir(dir), id)) {
-              Some(b) -> match bin::decode(b, seen_bin()) { Ok(s) -> Some(s), Err(_) -> None },
-              None -> None,
-            },
-            memo_keep.see(id, s) ->
-              landed(named_in(places_dir(dir), id), bin::encode(s, seen_bin())),
-            memo_keep.readers(id) ->
-              keys_in(
-                match ((
-                    fs.read_file[r](named_in(readers_dir(dir), id)),
-                    map_get(cell_get(pending).links, id),
-                  )) {
-                  (Some(a), Some(b)) -> Some(bytes_concat(a, b)),
-                  (Some(a), None) -> Some(a),
-                  (None, b) -> b,
-                },
-              ),
-            memo_keep.link(id, key) -> {
-              let p = cell_get(pending);
-              let next = {
-                ..p,
-                links: map_insert(p.links, id, match map_get(p.links, id) {
-                  Some(ks) -> bytes_concat(ks, key),
-                  None -> key,
+              memo_keep.record(key) ->
+                record_of(match record_bytes_at(key) {
+                  Some(b) -> Some(b),
+                  None -> trusted_at(key),
                 }),
-                size: p.size + 64,
-              };
-              cell_set(pending, next);
-              held(next)
-            },
-            memo_keep.marks(key) -> match map_get(cell_get(marking), key) {
-              Some(ms) -> ms,
-              None -> [],
-            },
-            memo_keep.marked() -> {
-              let now = marks_in[r](dir);
-              cell_set(marking, now);
-              map_fold(now, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
-                if len(ms) == 0 { acc } else { push(acc, k) })
-            },
-            memo_keep.mark(key) -> {
-              let m = bytes_of_string(fresh());
-              fs.write_file[r](mark_path(dir, key, m), b"");
-              let held = cell_get(marking);
-              cell_set(
-                marking,
-                map_insert(
-                  held,
-                  key,
-                  push(match map_get(held, key) { Some(ms) -> ms, None -> [] }, m),
+              memo_keep.packed(key) -> record_of(noted(beside(record_path(key)))),
+              memo_keep.output(digest) -> match map_get(cell_get(pending).outputs, digest) {
+                Some(o) -> Some(o),
+                None -> match map_get(cell_get(inlined), digest) {
+                  Some(o) -> Some(o),
+                  None -> match fs.read_file[r](at(dir, output_path(digest))) {
+                    Some(o) -> Some(o),
+                    None -> beside(output_path(digest)),
+                  },
+                },
+              },
+              memo_keep.keep(key, rec, output) -> {
+                cell_set(heights, map_remove(cell_get(heights), key));
+                let p = cell_get(pending);
+                let inline = kept_inline(output);
+                let b = record_bytes(rec, inline);
+                let next = match inline {
+                  Some(o) -> {
+                    cell_set(inlined, map_insert(cell_get(inlined), rec.output, o));
+                    { ..p, records: map_insert(p.records, key, b), size: p.size + bytes_len(b) }
+                  },
+                  None ->
+                    {
+                      ..p,
+                      records: map_insert(p.records, key, b),
+                      outputs: map_insert(p.outputs, rec.output, output),
+                      size: p.size + bytes_len(b) + bytes_len(output),
+                    },
+                };
+                cell_set(pending, next);
+                held(next)
+              },
+              memo_keep.adopt(key, rec) -> {
+                cell_set(heights, map_remove(cell_get(heights), key));
+                let p = cell_get(pending);
+                // A packed answer its record holds is held by the adopted record too.
+                let b = record_bytes(rec, map_get(cell_get(inlined), rec.output));
+                let next = {
+                  ..p,
+                  records: map_insert(p.records, key, b),
+                  size: p.size + bytes_len(b),
+                };
+                cell_set(pending, next);
+                held(next)
+              },
+              memo_keep.now(kind, place) -> look(kind, place),
+              memo_keep.places() -> match fs.list_dir[r](places_dir(dir)) {
+                None -> [],
+                Some(names) ->
+                  fold(names, [], |acc: List<Seen>, n: String|
+                    if string_ends_with(n, ".tmp") { acc } else {
+                      match fs.read_file[r](places_dir(dir) ++ "/" ++ n) {
+                        Some(b) -> match bin::decode(b, seen_bin()) {
+                          Ok(s) -> push(acc, s),
+                          Err(_) -> acc,
+                        },
+                        None -> acc,
+                      }
+                    }),
+              },
+              memo_keep.seen(id) -> match fs.read_file[r](named_in(places_dir(dir), id)) {
+                Some(b) -> match bin::decode(b, seen_bin()) { Ok(s) -> Some(s), Err(_) -> None },
+                None -> None,
+              },
+              memo_keep.see(id, s) ->
+                landed(named_in(places_dir(dir), id), bin::encode(s, seen_bin())),
+              memo_keep.readers(id) ->
+                keys_in(
+                  Some(
+                    bytes_concat(
+                      bytes_concat_all(readers_in(fs.read_file[r](links_path(dir, id)), id)),
+                      match map_get(cell_get(pending).links, id) { Some(ks) -> ks, None -> b"" },
+                    ),
+                  ),
                 ),
-              )
-            },
-            memo_keep.unmark(key, gone) -> {
-              fold(gone, (), |_: Unit, m: Bytes| {
-                fs.remove[r](mark_path(dir, key, m));
-                ()
-              });
-              let held = cell_get(marking);
-              cell_set(
-                marking,
-                map_insert(
-                  held,
-                  key,
-                  filter(match map_get(held, key) { Some(ms) -> ms, None -> [] }, |m: Bytes|
-                    !contains(gone, m)),
-                ),
-              )
-            },
-            memo_keep.forget(key) -> {
-              let p = cell_get(pending);
-              cell_set(pending, { ..p, records: map_remove(p.records, key) });
-              fs.remove[r](at(dir, record_path(key)));
-              let held = cell_get(marking);
-              fold(
-                match map_get(held, key) { Some(ms) -> ms, None -> [] },
-                (),
-                |_: Unit, m: Bytes| {
+              memo_keep.link(id, key) -> {
+                let p = cell_get(pending);
+                let next = {
+                  ..p,
+                  links: map_insert(p.links, id, match map_get(p.links, id) {
+                    Some(ks) -> bytes_concat(ks, key),
+                    None -> key,
+                  }),
+                  size: p.size + 64,
+                };
+                cell_set(pending, next);
+                held(next)
+              },
+              memo_keep.marks(key) -> match map_get(cell_get(marking), key) {
+                Some(ms) -> ms,
+                None -> [],
+              },
+              memo_keep.marked() -> {
+                let now = marks_in[r](dir);
+                cell_set(marking, now);
+                map_fold(now, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
+                  if len(ms) == 0 { acc } else { push(acc, k) })
+              },
+              memo_keep.mark(key) -> {
+                let m = bytes_of_string(fresh());
+                fs.write_file[r](mark_path(dir, key, m), b"");
+                let held = cell_get(marking);
+                cell_set(
+                  marking,
+                  map_insert(
+                    held,
+                    key,
+                    push(match map_get(held, key) { Some(ms) -> ms, None -> [] }, m),
+                  ),
+                )
+              },
+              memo_keep.unmark(key, gone) -> {
+                fold(gone, (), |_: Unit, m: Bytes| {
                   fs.remove[r](mark_path(dir, key, m));
                   ()
-                },
-              );
-              cell_set(marking, map_remove(held, key))
-            },
-            memo_keep.hold(id) -> fs.lock[r](named_in(holds_dir(dir), id)),
-            memo_keep.release(id) -> {
-              fs.unlock[r](named_in(holds_dir(dir), id));
-              ()
-            },
-          };
-          flushed();
-          value
-        } }
+                });
+                let held = cell_get(marking);
+                cell_set(
+                  marking,
+                  map_insert(
+                    held,
+                    key,
+                    filter(match map_get(held, key) { Some(ms) -> ms, None -> [] }, |m: Bytes|
+                      !contains(gone, m)),
+                  ),
+                )
+              },
+              memo_keep.forget(key) -> {
+                let p = cell_get(pending);
+                cell_set(pending, { ..p, records: map_remove(p.records, key) });
+                fs.remove[r](at(dir, record_path(key)));
+                let held = cell_get(marking);
+                fold(
+                  match map_get(held, key) { Some(ms) -> ms, None -> [] },
+                  (),
+                  |_: Unit, m: Bytes| {
+                    fs.remove[r](mark_path(dir, key, m));
+                    ()
+                  },
+                );
+                cell_set(marking, map_remove(held, key))
+              },
+              memo_keep.hold(id) -> fs.lock[r](named_in(holds_dir(dir), id)),
+              memo_keep.release(id) -> {
+                fs.unlock[r](named_in(holds_dir(dir), id));
+                ()
+              },
+            };
+            flushed();
+            value
+          } }
+        }
       }
     }
   };
@@ -357,7 +423,8 @@ pub fn copied<[r], [w]>(
       match ((bytes, record_of(bytes))) {
         (Some(b), Some(rec)) -> {
           let output = output_path(rec.output);
-          let there = fs.exists[w](at(to, output))
+          let inside = inline_named(b) != None;
+          let there = inside || fs.exists[w](at(to, output))
             || (match fs.read_file[r](at(from, output)) {
               Some(o) -> landed(at(to, output), o),
               None -> false,
@@ -370,7 +437,7 @@ pub fn copied<[r], [w]>(
             };
             {
               records: map_insert(acc.records, record, true),
-              outputs: map_insert(acc.outputs, output, true),
+              outputs: if inside { acc.outputs } else { map_insert(acc.outputs, output, true) },
             }
           }
         },
@@ -389,8 +456,8 @@ pub fn copied<[r], [w]>(
   map_len(held.records)
 }
 
-/// What the store in `dir` holds: its records, the answers kept beside them and their bytes, and the
-/// bytes of the answers no record names, which compaction reclaims.
+/// What the store in `dir` holds: its records, the answers kept inside or beside them and their
+/// bytes, and the bytes of the answers no record names, which compaction reclaims.
 pub type Usage = { records: Int, answers: Int, answer_bytes: Int, unread_bytes: Int }
 
 /// The names of the files in `sub` of `dir` that landed whole.
@@ -400,34 +467,55 @@ fn landed_in<[r]>(sub: String) -> List<String> / {fs.read[r]} =
     None -> [],
   }
 
-/// Each record of the store in `dir` that reads back, by the name of its file.
+/// Each record of the store in `dir` that reads back, by the name of its file, beside the bytes of
+/// the answer it holds inside it.
 fn records_in<[r]>(
   dir: String,
-) -> List<{ name: String, record: Record }> / {fs.read[r], abort.raise} =
+) -> List<{ name: String, record: Record, inside: Option<Int> }> / {fs.read[r], abort.raise} =
   fold(
     landed_in[r](records_dir(dir)),
     [],
-    |acc: List<{ name: String, record: Record }>, n: String|
-      match record_of(fs.read_file[r](records_dir(dir) ++ "/" ++ n)) {
-        Some(rec) -> push(acc, { name: n, record: rec }),
+    |acc: List<{ name: String, record: Record, inside: Option<Int> }>, n: String| {
+      let bytes = fs.read_file[r](records_dir(dir) ++ "/" ++ n);
+      match bytes {
         None -> acc,
-      },
+        Some(b) -> match record_from(b) {
+          Some(rec) ->
+            push(acc, {
+              name: n,
+              record: rec,
+              inside: match inline_named(b) { Some(o) -> Some(bytes_len(o)), None -> None },
+            }),
+          None -> acc,
+        },
+      }
+    },
   )
 
 fn named_digests(
-  records: List<{ name: String, record: Record }>,
+  records: List<{ name: String, record: Record, inside: Option<Int> }>,
 ) -> Map<String, Bool> / {abort.raise} =
-  fold(records, map_new(), |acc: Map<String, Bool>, r: { name: String, record: Record }|
-    map_insert(acc, hex_of(r.record.output), true))
+  fold(
+    records,
+    map_new(),
+    |acc: Map<String, Bool>, r: { name: String, record: Record, inside: Option<Int> }|
+      map_insert(acc, hex_of(r.record.output), true),
+  )
 
 pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} = {
   let records = records_in[r](dir);
   let named = named_digests(records);
   let sized = |name: String|
     match fs.file_size[r](outputs_dir(dir) ++ "/" ++ name) { Some(n) -> n, None -> 0 };
+  let inside = fold(
+    records,
+    { answers: 0, bytes: 0 },
+    |acc: { answers: Int, bytes: Int }, x: { name: String, record: Record, inside: Option<Int> }|
+      match x.inside { Some(n) -> { answers: acc.answers + 1, bytes: acc.bytes + n }, None -> acc },
+  );
   fold(
     landed_in[r](outputs_dir(dir)),
-    { records: len(records), answers: 0, answer_bytes: 0, unread_bytes: 0 },
+    { records: len(records), answers: inside.answers, answer_bytes: inside.bytes, unread_bytes: 0 },
     |u: Usage, name: String| {
       let n = sized(name);
       {
@@ -450,8 +538,9 @@ pub fn compacted<[r]>(
   keeps: (String, Record) -> Bool,
 ) -> Compacted / {fs.read[r], fs.write[r], abort.raise} = {
   let all = records_in[r](dir);
-  let kept = filter(all, |x: { name: String, record: Record }| keeps(x.name, x.record));
-  let gone = fold(all, 0, |n: Int, x: { name: String, record: Record }|
+  let kept = filter(all, |x: { name: String, record: Record, inside: Option<Int> }|
+    keeps(x.name, x.record));
+  let gone = fold(all, 0, |n: Int, x: { name: String, record: Record, inside: Option<Int> }|
     if keeps(x.name, x.record) || !fs.remove[r](records_dir(dir) ++ "/" ++ x.name) { n }
     else { n + 1 });
   let named = named_digests(kept);
@@ -470,13 +559,10 @@ pub fn compacted<[r]>(
 
 test "a copy leaves its store holding the records asked for and their answers, and nothing else" {
   let record = |answer: Bytes|
-    record_bytes({
-      query: b"q",
-      input: b"",
-      reads: [],
-      output: digest_of(Some(answer)),
-      height: 1,
-    });
+    record_bytes(
+      { query: b"q", input: b"", reads: [], output: digest_of(Some(answer)), height: 1 },
+      None,
+    );
   let answer_at = |store: String, answer: Bytes|
     store ++ "/" ++ output_path(digest_of(Some(answer)));
   let tree = fs::mem_of([
@@ -496,6 +582,24 @@ test "a copy leaves its store holding the records asked for and their answers, a
   let held = fs::mem_write(first.tree, answer_at("to", b"one"), b"as held").fs;
   let again = fs::on_mem[abs](held, || copied[abs, abs]("from", "to", [b"kept"]));
   assert_eq(fs::mem_read(again.tree, answer_at("to", b"one")), Some(b"as held"))
+}
+
+test "a links file names the readers of each id it notes, and only theirs" {
+  let id = |c: Bytes| bytes_concat_all(map(range(0, 32), |_: Int| c));
+  let file = bytes_concat_all([
+    notes_of(id(b"x"), bytes_concat(id(b"a"), id(b"b"))),
+    notes_of(id(b"y"), id(b"c")),
+    notes_of(id(b"x"), id(b"a")),
+  ]);
+  assert_eq(readers_in(Some(file), id(b"x")), [id(b"a"), id(b"b"), id(b"a")]);
+  assert_eq(readers_in(Some(file), id(b"y")), [id(b"c")]);
+  assert_eq(readers_in(Some(file), id(b"z")), []);
+  // A note cut short, as a full disk leaves one, names no reader.
+  assert_eq(readers_in(Some(bytes_slice(file, 0, bytes_len(file) - 1)), id(b"x")), [
+    id(b"a"),
+    id(b"b"),
+  ]);
+  assert_eq(readers_in(None, id(b"x")), [])
 }
 
 test "a readers file's keys are each read once" {
