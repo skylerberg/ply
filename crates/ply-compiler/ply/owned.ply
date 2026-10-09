@@ -5,24 +5,27 @@
 //! from where the owner's text starts. A module's answer is its owners' answers, each placed where
 //! its items stand.
 
+import std.bin
 import std.list (at, concat, contains, flatten, sort_by)
 import std.bytes (int_of_ascii)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
-              OLaw, OFn, LawOutline, read_outline, ModuleShape, ModuleTables, Rows, KnownDefRow,
-              KnownTestRow, TaggedSite, StatementSite, TypedConst, module_facts, no_module_tables,
-              rows_of, of_module, analyse_pulling_std_with, faceted)
+              OLaw, OFn, LawOutline, read_outline, module_tables_bin, rows_bin, tagged_site_bin,
+              statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin, ModuleShape,
+              ModuleTables, Rows, KnownDefRow, KnownTestRow, TaggedSite, StatementSite, TypedConst,
+              module_facts, no_module_tables, rows_of, of_module, analyse_pulling_std_with, faceted)
 import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModule, exports_of,
-                entries_in, import_targets, owner_source, checked_owner, item_owner, owner_reads,
-                module_scope, owner_mentions, owner_groups, group_source, unplaced_imports)
-import items (Item, IFn, parse, item_span)
+                entry_bin, entries_in, import_targets, owner_source, checked_owner, item_owner,
+                owner_reads, module_scope, owner_mentions, owner_groups, group_source,
+                unplaced_imports, group_imports)
+import items (Item, IFn, parse, item_span, SCost)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
-              NumericInfo, Location, Raise, walk_order, SpecInfo, LabelSite, OperandSite,
-              UpdateShape, WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts)
-import resolve (Diag, Label, Edit, Fix, Source)
+              NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, UpdateShape,
+              WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts)
+import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
 import exprs (TaggedPart)
-import types (canonical_scheme)
-import hash (Shapes, kept_forms)
+import embed (EmbedAt, embed_at_bin)
+import hash (Shapes, UseNode, LawNode, kept_forms, shapes_bin, use_node_bin, unreached)
 
 /// What a check of a group of owners answered of one of them, every place module 0's and counted from
 /// where the group's own text starts.
@@ -37,6 +40,9 @@ pub type OwnerAnswer = {
   /// Each effect set it declares, resolved, and each law it is with the literals its guard reads.
   sets: List<SetView>,
   laws: List<LawOutline>,
+  /// What the walk for what nothing uses meets of its nodes, tests and laws, which only the walk over
+  /// its whole module can tell reached or not.
+  uses: List<UseNode>,
 }
 
 // --- Moving places ---------------------------------------------------------------------------
@@ -54,11 +60,11 @@ fn moved_index(module: Int, m: Mover) -> Int = if module == m.from { m.to } else
 fn moved_spanned(module: Int, s: Span, m: Mover) -> Span =
   if module == m.from { moved_at(s, m) } else { s }
 
+/// A definition's raises are counted from where it starts, so they move with it.
 fn moved_def(d: DefInfo, m: Mover) -> DefInfo =
   {
     ..d,
     at: moved_location(d.at, m),
-    raises: map(d.raises, |r: Raise| { ..r, span: moved_spanned(d.at.module, r.span, m) }),
     spec: map(d.spec, |x: SpecInfo| { ..x, span: moved_spanned(d.at.module, x.span, m) }),
   }
 
@@ -121,20 +127,11 @@ fn moved_diag(d: Diag, m: Mover) -> Diag =
       }),
   }
 
-fn moved_raise(r: Raise, m: Mover) -> Raise = { ..r, span: moved_at(r.span, m) }
-
 fn moved_tagged(x: TaggedSite, m: Mover) -> TaggedSite =
   {
     ..x,
     span: moved_at(x.span, m),
     parts: map(x.parts, |p: TaggedPart| { ..p, quoted: moved_at(p.quoted, m) }),
-  }
-
-fn moved_rows(r: Rows, m: Mover) -> Rows =
-  {
-    ..r,
-    defs: map(r.defs, |d: KnownDefRow|
-      { ..d, raises: map(d.raises, |x: Raise| moved_raise(x, m)) }),
   }
 
 // --- One owner's answer ----------------------------------------------------------------------
@@ -157,20 +154,20 @@ fn spotted(spots: List<Spot>, p: Int) -> Int =
 /// whose items stand where `spots` says and which declares `declared`, its own name among them: each
 /// place counted from where the group's text starts, module 0's.
 pub fn owner_answer(
-  w: Analysis,
-  slot: Int,
+  said: Said,
   spots: List<Spot>,
   declared: Map<Bytes, Bool>,
 ) -> OwnerAnswer / {abort.raise} = {
+  let w = said.w;
+  let slot = said.slot;
   let mine = |module: Int, s: Span| within(module, s, 0, spots);
   let here = |l: Location| mine(l.module, l.span);
-  let facts = module_facts(w, slot);
+  let facts = said.facts;
   let t = facts.tables;
   let e = t.facts.elaboration;
   let kept = {
     ..t,
-    defs: map(filter(t.defs, |d: DefInfo| here(d.at)), |d: DefInfo|
-      { ..d, scheme: canonical_scheme(d.scheme) }),
+    defs: filter(t.defs, |d: DefInfo| here(d.at)),
     tests: filter(t.tests, |x: TestInfo| here(x.at)),
     laws: filter(t.laws, |l: LawInfo| here(l.at)),
     effects: filter(t.effects, |x: EffectInfo| here(x.at)),
@@ -193,58 +190,75 @@ pub fn owner_answer(
   let names = fold(kept.defs, map_new(), |acc: Map<Bytes, Bool>, d: DefInfo|
     map_insert(acc, d.name, true));
   let back = { from: 0, to: 0, by: |p: Int| spotted(spots, p) };
-  let rows = rows_of(w);
+  let rows = said.rows;
   let placed = |l: Label| within(l.module, { start: l.start, end: l.end }, slot, spots);
   let primary_mine = |d: Diag|
     fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && placed(l)));
   let own_labels = |d: Diag|
     { ..d, labels: map(filter(d.labels, placed), |l: Label| { ..l, module: 0 }) };
   let shape = facts.shape;
-  {
-    tables: moved_tables(
-      {
-        ..kept,
-        facts: {
-          ..kept.facts,
-          pure: filter(kept.facts.pure, |n: Bytes| map_contains(names, n)),
-          elaboration: {
-            ..kept.facts.elaboration,
-            orders: filter(e.orders, |x: WitnessOrder|
-              map_contains(names, bytes_concat_all([at(w.mods, slot).name, b".", x.name]))),
+  let lowest = |xs: List<Int>|
+    fold(xs, 0 - 1, |acc: Int, k: Int| if acc < 0 || k < acc { k } else { acc });
+  let first_test = lowest(map(kept.tests, |x: TestInfo| x.index));
+  let first_law = lowest(map(kept.laws, |l: LawInfo| l.index));
+  // Its tests and laws numbered from its first, as a check of it alone numbers them.
+  numbered(
+    {
+      tables: moved_tables(
+        {
+          ..kept,
+          facts: {
+            ..kept.facts,
+            pure: filter(kept.facts.pure, |n: Bytes| map_contains(names, n)),
+            elaboration: {
+              ..kept.facts.elaboration,
+              orders: filter(e.orders, |x: WitnessOrder|
+                map_contains(names, bytes_concat_all([at(w.mods, slot).name, b".", x.name]))),
+            },
           },
+          kept: filter(t.kept, |k: KeptFacts| map_contains(names, k.name)),
         },
-        kept: filter(t.kept, |k: KeptFacts| map_contains(names, k.name)),
-      },
-      back,
-    ),
-    rows: moved_rows(
-      {
+        back,
+      ),
+      // A row is counted from where its definition starts, so no row moves.
+      rows: {
         defs: map(
           filter(rows.defs, |r: KnownDefRow| map_contains(names, r.name)),
           |r: KnownDefRow| { ..r, hash: b"" },
         ),
         tests: [],
       },
-      back,
-    ),
-    refused: [],
-    warnings: map(filter(w.warnings, |d: Diag| primary_mine(d) && d.code != b"W0611"), |d: Diag|
-      moved_diag(own_labels(d), back)),
-    tagged: map(filter(shape.tagged, |x: TaggedSite| mine(x.module, x.span)), |x: TaggedSite|
-      moved_tagged(x, back)),
-    statements: map(
-      filter(shape.statements, |x: StatementSite| mine(x.module, x.span)),
-      |x: StatementSite| { ..x, span: moved_at(x.span, back) },
-    ),
-    consts: filter(shape.consts, |x: TypedConst| map_contains(names, x.name)),
-    sets: filter(shape.outline.sets, |x: SetView| map_contains(declared, x.name)),
-    laws: fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
-      match x {
-        OLaw(l) -> if map_contains(declared, bytes_concat(b"law ", l.name)) { push(acc, l) }
-        else { acc },
-        _ -> acc,
-      }),
-  }
+      refused: [],
+      warnings: map(
+        filter(w.warnings, |d: Diag| primary_mine(d) && d.code != b"W0611"),
+        |d: Diag| moved_diag(own_labels(d), back),
+      ),
+      tagged: map(filter(shape.tagged, |x: TaggedSite| mine(x.module, x.span)), |x: TaggedSite|
+        moved_tagged(x, back)),
+      statements: map(
+        filter(shape.statements, |x: StatementSite| mine(x.module, x.span)),
+        |x: StatementSite| { ..x, span: moved_at(x.span, back) },
+      ),
+      consts: filter(shape.consts, |x: TypedConst| map_contains(names, x.name)),
+      sets: filter(shape.outline.sets, |x: SetView| map_contains(declared, x.name)),
+      laws: fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
+        match x {
+          OLaw(l) -> if map_contains(declared, bytes_concat(b"law ", l.name)) { push(acc, l) }
+          else { acc },
+          _ -> acc,
+        }),
+      uses: map(filter(w.uses, |r: UseNode| within(r.module, r.span, slot, spots)), |r: UseNode|
+        {
+          ..r,
+          module: 0,
+          span: moved_at(r.span, back),
+          unused: match r.unused { Some(d) -> Some(moved_diag(own_labels(d), back)), None -> None },
+        }),
+    },
+    at(w.mods, slot).name,
+    if first_test < 0 { 0 } else { 0 - first_test },
+    if first_law < 0 { 0 } else { 0 - first_law },
+  )
 }
 
 /// `a`, one owner's answer, its places moved to where its group's items stand in its module, `items`.
@@ -255,7 +269,7 @@ pub fn placed_answer(a: OwnerAnswer, items: List<ItemAt>) -> OwnerAnswer = {
   let m = { from: 0, to: 0, by: by };
   {
     tables: moved_tables(a.tables, m),
-    rows: moved_rows(a.rows, m),
+    rows: a.rows,
     refused: map(a.refused, |d: Diag| moved_diag(d, m)),
     warnings: map(a.warnings, |d: Diag| moved_diag(d, m)),
     tagged: map(a.tagged, |x: TaggedSite| moved_tagged(x, m)),
@@ -263,6 +277,12 @@ pub fn placed_answer(a: OwnerAnswer, items: List<ItemAt>) -> OwnerAnswer = {
     consts: a.consts,
     sets: a.sets,
     laws: a.laws,
+    uses: map(a.uses, |r: UseNode|
+      {
+        ..r,
+        span: moved_at(r.span, m),
+        unused: match r.unused { Some(d) -> Some(moved_diag(d, m)), None -> None },
+      }),
   }
 }
 
@@ -270,10 +290,23 @@ pub fn placed_answer(a: OwnerAnswer, items: List<ItemAt>) -> OwnerAnswer = {
 /// none for a test or a law.
 pub type MemberAnswer = { owner: Bytes, answer: OwnerAnswer, entry: Option<Entry> }
 
+derive bin for OwnerAnswer
+derive bin for MemberAnswer
+derive bin for GroupAnswer
+
 /// What a check of a group of owners answered: each member's answer, the errors that refused the
-/// group, and the forms hashing reads of the members, each place counted from where the group's own
-/// text starts.
-pub type GroupAnswer = { members: List<MemberAnswer>, refused: List<Diag>, forms: Shapes }
+/// group, the forms hashing reads of the members, each place counted from where the group's own
+/// text starts, and what their module embeds as the check read it.
+pub type GroupAnswer = {
+  members: List<MemberAnswer>,
+  refused: List<Diag>,
+  forms: Shapes,
+  embeds: List<EmbedAt>,
+}
+
+/// What a group answers that its module no longer checks together.
+pub fn no_group() -> GroupAnswer =
+  { members: [], refused: [], forms: { nodes: [], order: [], tests: [], laws: [] }, embeds: [] }
 
 /// Where `owner`'s items of `items`, a group's items as [`group_source`] lays them, stand in the
 /// module a check read, each where `at` says.
@@ -316,43 +349,90 @@ pub fn group_answer(
             back,
           )),
         forms: { nodes: [], order: [], tests: [], laws: [] },
+        embeds: [],
       },
-    Analysed(w) -> {
-      let prefix = bytes_concat(module, b".");
-      let kept = fold(members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
-        fold(
-          o.names,
-          if bytes_starts_with(o.owner, b"test ") {
-            map_insert(acc, bytes_slice(o.owner, 5, bytes_len(o.owner)), true)
-          } else if bytes_starts_with(o.owner, b"law ") {
-            map_insert(acc, bytes_slice(o.owner, 4, bytes_len(o.owner)), true)
-          } else { acc },
-          |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true),
-        ));
-      let keeps = |name: Bytes|
-        bytes_starts_with(name, prefix)
-          && map_contains(kept, bytes_slice(name, bytes_len(prefix), bytes_len(name)));
-      let shown = exports_of(w, slot, text);
-      {
-        members: map(members, |o: OwnerRead|
-          {
-            owner: o.owner,
-            answer: owner_answer(
-              w,
-              slot,
-              spots_of(items, o.owner, at),
-              fold(
-                o.names,
-                map_insert(map_new(), o.owner, true),
-                |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true),
-              ),
-            ),
-            entry: map_get(shown.entries, o.owner),
-          }),
-        refused: [],
-        forms: kept_forms(w.index, w.module_packages, slot, keeps),
+    Analysed(w) -> said_group(said_of(w, slot, text), module, members, items, at),
+  }
+}
+
+/// What a check of a module said that each owner's answer reads a part of: the check, the module's
+/// place in it, what it said of the module, every definition's row and what the module shows.
+pub type Said = { w: Analysis, slot: Int, facts: ModuleFacts, rows: Rows, shown: Exports }
+
+/// What `w` said of its module at `slot`, written as `text`, read once for every owner of it.
+pub fn said_of(w: Analysis, slot: Int, text: Bytes) -> Said / {abort.raise} =
+  {
+    w: w,
+    slot: slot,
+    facts: module_facts(w, slot),
+    rows: rows_of(w),
+    shown: exports_of(w, slot, text),
+  }
+
+/// What a check that `said` what it did of `module` answered of `members`, owners of it: `items`
+/// where their items stand as [`group_source`] lays them, and `at` where each item stands in the
+/// module the check read.
+pub fn said_group(
+  said: Said,
+  module: Bytes,
+  members: List<OwnerRead>,
+  items: List<ItemAt>,
+  at: (ItemAt) -> Int / {abort.raise},
+) -> GroupAnswer / {abort.raise} = {
+  let w = said.w;
+  let slot = said.slot;
+  let prefix = bytes_concat(module, b".");
+  // The laws a function's `cost` clauses make are the function's.
+  let costed = fold(w.index.laws, map_new(), |acc: Map<Bytes, List<Bytes>>, l: LawNode|
+    if l.module != slot { acc } else {
+      match l.def.costs {
+        Some(c) ->
+          map_insert(
+            acc,
+            c.def.name,
+            push(match map_get(acc, c.def.name) { Some(ls) -> ls, None -> [] }, l.def.name),
+          ),
+        None -> acc,
       }
-    },
+    });
+  let laws_of = |o: OwnerRead|
+    fold(o.names, [], |acc: List<Bytes>, n: Bytes|
+      concat(acc, match map_get(costed, n) { Some(ls) -> ls, None -> [] }));
+  let kept = fold(members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
+    fold(
+      concat(o.names, laws_of(o)),
+      if bytes_starts_with(o.owner, b"test ") {
+        map_insert(acc, bytes_slice(o.owner, 5, bytes_len(o.owner)), true)
+      } else if bytes_starts_with(o.owner, b"law ") {
+        map_insert(acc, bytes_slice(o.owner, 4, bytes_len(o.owner)), true)
+      } else { acc },
+      |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true),
+    ));
+  let keeps = |name: Bytes|
+    bytes_starts_with(name, prefix)
+      && map_contains(kept, bytes_slice(name, bytes_len(prefix), bytes_len(name)));
+  {
+    members: map(members, |o: OwnerRead|
+      {
+        owner: o.owner,
+        answer: owner_answer(
+          said,
+          spots_of(items, o.owner, at),
+          fold(
+            laws_of(o),
+            fold(
+              o.names,
+              map_insert(map_new(), o.owner, true),
+              |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true),
+            ),
+            |acc: Map<Bytes, Bool>, l: Bytes| map_insert(acc, bytes_concat(b"law ", l), true),
+          ),
+        ),
+        entry: map_get(said.shown.entries, o.owner),
+      }),
+    refused: [],
+    forms: kept_forms(w.index, w.module_packages, slot, keeps),
+    embeds: filter(w.embeds, |e: EmbedAt| e.module == module),
   }
 }
 
@@ -440,12 +520,14 @@ fn diag_start(d: Diag) -> Int =
   fold(d.labels, 0 - 1, |acc: Int, l: Label| if acc < 0 && l.primary { l.start } else { acc })
 
 /// What `module` answers as its groups answered, `groups` each placed: `shape` is what its text
-/// alone says of its shape, and `order` its functions in the order a check of it walks them.
+/// alone says of its shape, `order` its functions in the order a check of it walks them, and `unused`
+/// whether it warns of what nothing in it uses, as a module of the load's own root does.
 pub fn assembled(
   module: Bytes,
   shape: ModuleShape,
   order: List<Bytes>,
   groups: List<Placed>,
+  unused: Bool,
 ) -> Assembled / {abort.raise} = {
   let walk = fold(range(0, len(order)), map_new(), |acc: Map<Bytes, Int>, i: Int|
     map_insert(acc, at(order, i), i));
@@ -486,15 +568,24 @@ pub fn assembled(
   let prefix = bytes_concat(module, b".test#");
   let fn_spans = fold(shape.outline.items, [], |acc: List<Span>, x: Outlined|
     match x { OFn(f) -> push(acc, f.span), _ -> acc });
-  // A check walks the functions, then each one's clauses, then the tests, then laws and schemas:
-  // a clause's and a law's sites are filed under no owner, a clause's inside its function.
+  let costs = fold(
+    gathered(owners, |a: OwnerAnswer| a.tables.defs),
+    [],
+    |acc: List<Span>, d: DefInfo|
+      concat(acc, map(filter(d.spec, |x: SpecInfo| x.kind == SCost), |x: SpecInfo| x.span)),
+  );
+  let inside = |spans: List<Span>, start: Int|
+    fold(spans, false, |b: Bool, f: Span| b || (start >= f.start && start <= f.end));
+  // A check walks the functions, then each one's clauses, then the tests, then laws and schemas,
+  // then the laws `cost` clauses make: a clause's and a law's sites are filed under no owner, a
+  // clause's inside its function and a cost law's inside its clause.
   let site_rank = |owner: Bytes, start: Int|
     match map_get(walk, owner) {
       Some(k) -> k,
       None -> if bytes_len(owner) == 0 {
-        if fold(fn_spans, false, |b: Bool, f: Span| b || (start >= f.start && start <= f.end)) {
-          1000000000 + start
-        } else { 3000000000 + start }
+        if inside(costs, start) { 4000000000 + start }
+        else if inside(fn_spans, start) { 1000000000 + start }
+        else { 3000000000 + start }
       } else if bytes_starts_with(owner, prefix) {
         2000000000
           + (match int_of_ascii(bytes_slice(owner, bytes_len(prefix), bytes_len(owner))) {
@@ -566,6 +657,15 @@ pub fn assembled(
             }),
           sets: gathered(owners, |a: OwnerAnswer| a.sets),
         },
+        embeds: sort_by(
+          map_values(
+            fold(groups, map_new(), |acc: Map<Bytes, EmbedAt>, g: Placed|
+              fold(g.answer.embeds, acc, |m: Map<Bytes, EmbedAt>, e: EmbedAt|
+                map_insert(m, e.key, e))),
+          ),
+          |a: EmbedAt, b: EmbedAt|
+            match compare_values(a.key, b.key) { Greater -> false, _ -> true },
+        ),
         tagged: ranked(gathered(owners, |a: OwnerAnswer| a.tagged), |x: TaggedSite| x.span.start),
         statements: ranked(gathered(owners, |a: OwnerAnswer| a.statements), |x: StatementSite|
           x.span.start),
@@ -577,7 +677,12 @@ pub fn assembled(
       defs: ranked(gathered(owners, |a: OwnerAnswer| a.rows.defs), |r: KnownDefRow| walked(r.name)),
       tests: gathered(owners, |a: OwnerAnswer| a.rows.tests),
     },
-    warnings: ranked(gathered(owners, |a: OwnerAnswer| a.warnings), diag_start),
+    warnings: ranked(
+      concat(gathered(owners, |a: OwnerAnswer| a.warnings), if unused {
+        unreached(gathered(owners, |a: OwnerAnswer| a.uses))
+      } else { [] }),
+      diag_start,
+    ),
     refused: ranked(
       fold(groups, [], |acc: List<Diag>, g: Placed|
         concat(
@@ -690,15 +795,12 @@ fn span_text(s: Span) -> Bytes =
     bytes_of_string(int_to_string(s.end)),
   ])
 
-/// What a module's check said of it, each list in an order no check's order decides, schemes named
-/// alike: what a module assembled from its owners' answers is held to.
+/// What a module's check said of it, each list in an order no check's order decides: what a module
+/// assembled from its owners' answers is held to.
 fn settled_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
   let e = t.facts.elaboration;
   {
-    defs: sorted_by(
-      map(t.defs, |d: DefInfo| { ..d, scheme: canonical_scheme(d.scheme) }),
-      |d: DefInfo| d.name,
-    ),
+    defs: sorted_by(t.defs, |d: DefInfo| d.name),
     tests: sorted_by(t.tests, |x: TestInfo| x.key),
     laws: sorted_by(t.laws, |x: LawInfo| x.key),
     effects: sorted_by(t.effects, |x: EffectInfo| x.name),
@@ -805,7 +907,7 @@ test "each owner checked alone and placed where it stands answers what its modul
 fn assembled_apart(
   whole: Analysis,
   sources: List<Source>,
-) -> List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }> / {abort.raise} = {
+) -> List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, warned: List<Bytes>, apart: Assembled }> / {abort.raise} = {
   let texts = fold(sources, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
     map_insert(acc, s.name, s.src));
   let text_at = |i: Int| match map_get(texts, at(whole.mods, i).name) { Some(t) -> t, None -> b"" };
@@ -825,7 +927,7 @@ fn assembled_apart(
   fold(
     range(0, len(whole.mods)),
     [],
-    |acc: List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }>, i: Int| {
+    |acc: List<{ module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, warned: List<Bytes>, apart: Assembled }>, i: Int| {
       let parsed = at(whole.mods, i);
       if !map_contains(texts, parsed.name) { acc } else {
         let text = text_at(i);
@@ -846,13 +948,13 @@ fn assembled_apart(
         };
         let placed = map(groups, |g: List<Bytes>| {
           let members = filter(reads, |o: OwnerRead| contains(g, o.owner));
+          let named = fold(g, [], |ms: List<Mention>, o: Bytes|
+            concat(ms, match map_get(mentions, o) { Some(xs) -> xs, None -> [] }));
           let source = group_source(
             parsed.name,
             members,
-            fold(g, [], |ms: List<Mention>, o: Bytes|
-              concat(ms, match map_get(mentions, o) { Some(xs) -> xs, None -> [] })),
-            unplaced_imports(raw),
-            targets,
+            named,
+            group_imports(parsed.name, members, named, unplaced_imports(raw), targets),
             |module: Bytes, n: Bytes| entries_in(exports, module, n),
           );
           let checked = checked_owner(source, InRoot, placing, reading);
@@ -873,12 +975,21 @@ fn assembled_apart(
           module: parsed.name,
           whole: facts,
           rows: filter(rows_of(whole).defs, |r: KnownDefRow| of_module(parsed.name, r.name)),
-          apart: assembled(parsed.name, base, walk_order(parsed), placed),
+          warned: told(
+            filter(whole.warnings, |d: Diag|
+              fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && l.module == i))),
+          ),
+          apart: assembled(parsed.name, base, walk_order(parsed), placed, true),
         })
       }
     },
   )
 }
+
+/// Each of `ds` as its code and message say it, in order.
+fn told(ds: List<Diag>) -> List<Bytes> =
+  sort_by(map(ds, |d: Diag| bytes_concat_all([d.code, b": ", d.message])), |a: Bytes, b: Bytes|
+    match compare_values(a, b) { Greater -> false, _ -> true })
 
 fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
   let whole = match analyse_pulling_std_with(sources, [], [], []).out {
@@ -888,13 +999,11 @@ fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
   fold(
     assembled_apart(whole, sources),
     (),
-    |u: Unit, m: { module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, apart: Assembled }| {
-      let canonical = |t: ModuleTables|
-        { ..t, defs: map(t.defs, |d: DefInfo| { ..d, scheme: canonical_scheme(d.scheme) }) };
+    |u: Unit, m: { module: Bytes, whole: ModuleFacts, rows: List<KnownDefRow>, warned: List<Bytes>, apart: Assembled }| {
       let a = m.apart.facts;
       let w = m.whole;
       assert_eq(map(a.tables.defs, |d: DefInfo| d.name), map(w.tables.defs, |d: DefInfo| d.name));
-      assert_eq(canonical(a.tables).defs, canonical(w.tables).defs);
+      assert_eq(a.tables.defs, w.tables.defs);
       assert_eq(a.tables.tests, w.tables.tests);
       assert_eq(a.tables.laws, w.tables.laws);
       assert_eq(a.tables.effects, w.tables.effects);
@@ -908,7 +1017,8 @@ fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
       assert_eq(a.tables.kept, w.tables.kept);
       assert_eq(a.shape.outline, w.shape.outline);
       assert_eq(a.shape, w.shape);
-      assert_eq(m.apart.rows.defs, map(m.rows, |r: KnownDefRow| { ..r, hash: b"" }))
+      assert_eq(m.apart.rows.defs, map(m.rows, |r: KnownDefRow| { ..r, hash: b"" }));
+      assert_eq(told(m.apart.warnings), m.warned)
     },
   )
 }
@@ -919,7 +1029,7 @@ test "a module put together from its groups' answers is what its check answers" 
 }
 
 fn core_fixture() -> Bytes =
-  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\n/// The price.\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\nfn helper() -> Int = 7\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
+  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read get[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\n/// The price.\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\nfn helper() -> Int = 7\npub fn clipped(b: Bytes, n: Int) -> Bytes / {abort.raise} = {\n  // At most `n` bytes.\n  let k = if n > bytes_len(b) { bytes_len(b) } else { n };\n  bytes_slice(b, 0, k)\n}\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
 
 fn shop_fixture() -> Bytes =
   b"import core\nfn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"it adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
