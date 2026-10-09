@@ -70,7 +70,7 @@ fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
     let checkout = Pack::of_checkout(&repo()).expect("the checkout packs");
     let pack = Pack::of_checkout(&repo())
         .expect("the checkout packs")
-        .with_answers(&store)
+        .with_answers(&store, None)
         .expect("the store is read");
     ply_pack::append(&binary, &pack).expect("the binary is packed");
     let read = Pack::of_binary(&binary)
@@ -83,6 +83,56 @@ fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
         ply_pack::check(&binary, &checkout).expect("the binary reads"),
         ply_pack::Checked::Same
     ));
+}
+
+#[test]
+fn a_binary_is_current_once_it_carries_the_checkout_and_its_answers() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let store = dir.path().join("answers");
+    for sub in ["records", "outputs"] {
+        std::fs::create_dir_all(store.join(sub)).expect("the store's directory");
+        std::fs::write(store.join(sub).join("aa"), b"kept").expect("written");
+    }
+    let binary = runtime(dir.path());
+    let checkout = || Pack::of_checkout(&repo()).expect("the checkout packs");
+    assert!(!ply_pack::current(&binary, &checkout()).expect("the binary reads"));
+    ply_pack::append(&binary, &checkout()).expect("packed");
+    assert!(!ply_pack::current(&binary, &checkout()).expect("the binary reads"));
+    let answered = checkout()
+        .with_answers(&store, None)
+        .expect("the store is read");
+    ply_pack::append(&binary, &answered).expect("packed with its answers");
+    assert!(ply_pack::current(&binary, &checkout()).expect("the binary reads"));
+}
+
+/// An answer is named by its digest, so packing again takes the bytes the binary carries under its
+/// name rather than deflating the file again: here the file was overwritten, which no store does.
+#[test]
+fn packing_again_takes_each_answer_the_binary_carries_as_it_carries_it() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let store = dir.path().join("answers");
+    for sub in ["records", "outputs"] {
+        std::fs::create_dir_all(store.join(sub)).expect("the store's directory");
+    }
+    std::fs::write(store.join("records/aa"), b"a record").expect("written");
+    std::fs::write(store.join("outputs/bb"), b"an answer").expect("written");
+    let binary = runtime(dir.path());
+    let checkout = || Pack::of_checkout(&repo()).expect("the checkout packs");
+    let once = checkout()
+        .with_answers(&store, None)
+        .expect("the store is read");
+    ply_pack::append(&binary, &once).expect("packed");
+    std::fs::write(store.join("outputs/bb"), b"overwritten").expect("written");
+    std::fs::write(store.join("outputs/cc"), b"a new answer").expect("written");
+    let carried = Pack::of_binary(&binary)
+        .expect("the binary reads")
+        .expect("the binary carries a pack");
+    let again = checkout()
+        .with_answers(&store, Some(&carried))
+        .expect("the store is read");
+    assert_eq!(again.answer("outputs/bb"), Some(b"an answer".to_vec()));
+    assert_eq!(again.answer("outputs/cc"), Some(b"a new answer".to_vec()));
+    assert_eq!(again.answer("records/aa"), Some(b"a record".to_vec()));
 }
 
 #[test]
