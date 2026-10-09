@@ -6,11 +6,11 @@
 //! answer at once leave one.
 
 import std.bin
+import std.fs
 import std.fs (fs, under)
 import std.bytes (hex_of)
-import std.list (contains)
-import memo (Record, Seen, memo_keep, head_bytes, output_named, output_path, record_bytes,
-             record_from, record_path, seen_bin)
+import memo (Record, Seen, memo_keep, digest_of, head_bytes, output_named, output_path,
+             record_bytes, record_from, record_path, seen_bin)
 
 fn records_dir(dir: String) -> String = under(dir, "records")
 
@@ -43,10 +43,10 @@ fn keys_in(bytes: Option<Bytes>) -> List<Bytes> =
   match bytes {
     None -> [],
     Some(b) ->
-      fold(range(0, bytes_len(b) / 32), [], |acc: List<Bytes>, i: Int| {
-        let k = bytes_slice(b, i * 32, i * 32 + 32);
-        if contains(acc, k) { acc } else { push(acc, k) }
-      }),
+      map_keys(
+        fold(range(0, bytes_len(b) / 32), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+          map_insert(acc, bytes_slice(b, i * 32, i * 32 + 32), true)),
+      ),
   }
 
 /// `work` run over the memo store in `dir`, with `look` answering what the world holds now: each
@@ -171,29 +171,58 @@ pub fn kept<a, [r] | e>(
   value
 }
 
-/// The records under each of `keys` in the store `from`, and the answers they name, written into the
-/// store `to`. How many it wrote.
+/// The store `to` made to hold the records under each of `keys` in the store `from`, the answers they
+/// name, and nothing else. An answer `to` holds already is not written again, its name being its
+/// digest, so a store kept between copies is written what moved. How many records it holds.
 pub fn copied<[r], [w]>(
   from: String,
   to: String,
   keys: List<Bytes>,
-) -> Int / {fs.read[r], fs.write[w], abort.raise} = {
+) -> Int / {fs.read[r], fs.read[w], fs.write[w], abort.raise} = {
   fs.create_dir[w](records_dir(to));
   fs.create_dir[w](outputs_dir(to));
-  fold(keys, 0, |n: Int, key: Bytes| {
-    let bytes = fs.read_file[r](at(from, record_path(key)));
-    match ((bytes, record_of(bytes))) {
-      (Some(b), Some(rec)) -> match fs.read_file[r](at(from, output_path(rec.output))) {
-        None -> n,
-        Some(output) -> {
-          fs.write_file[w](at(to, output_path(rec.output)), output);
-          fs.write_file[w](at(to, record_path(key)), b);
-          n + 1
+  let landed = |path: String, bytes: Bytes| {
+    let tmp = path ++ ".tmp";
+    fs.write_file[w](tmp, bytes) && fs.rename[w](tmp, path)
+  };
+  let held = fold(
+    keys,
+    { records: map_new(), outputs: map_new() },
+    |acc: { records: Map<String, Bool>, outputs: Map<String, Bool> }, key: Bytes| {
+      let bytes = fs.read_file[r](at(from, record_path(key)));
+      match ((bytes, record_of(bytes))) {
+        (Some(b), Some(rec)) -> {
+          let output = output_path(rec.output);
+          let there = fs.exists[w](at(to, output))
+            || (match fs.read_file[r](at(from, output)) {
+              Some(o) -> landed(at(to, output), o),
+              None -> false,
+            });
+          if !there { acc } else {
+            let record = record_path(key);
+            if fs.read_file[w](at(to, record)) != Some(b) {
+              landed(at(to, record), b);
+              ()
+            };
+            {
+              records: map_insert(acc.records, record, true),
+              outputs: map_insert(acc.outputs, output, true),
+            }
+          }
         },
-      },
-      _ -> n,
-    }
-  })
+        _ -> acc,
+      }
+    },
+  );
+  let swept = |sub: String, kept: Map<String, Bool>|
+    fold(landed_in[w](at(to, sub)), (), |_: Unit, name: String|
+      if !map_contains(kept, sub ++ "/" ++ name) {
+        fs.remove[w](at(to, sub ++ "/" ++ name));
+        ()
+      });
+  swept("records", held.records);
+  swept("outputs", held.outputs);
+  map_len(held.records)
 }
 
 /// What the store in `dir` holds: its records, the answers kept beside them and their bytes, and the
@@ -273,4 +302,37 @@ pub fn compacted<[r]>(
       },
   );
   { records: gone, answers: dropped.answers, bytes: dropped.bytes }
+}
+
+test "a copy leaves its store holding the records asked for and their answers, and nothing else" {
+  let record = |answer: Bytes|
+    record_bytes({ query: b"q", reads: [], output: digest_of(Some(answer)) });
+  let answer_at = |store: String, answer: Bytes|
+    store ++ "/" ++ output_path(digest_of(Some(answer)));
+  let tree = fs::mem_of([
+    { path: "from/" ++ record_path(b"kept"), body: record(b"one") },
+    { path: answer_at("from", b"one"), body: b"one" },
+    { path: "from/" ++ record_path(b"unasked"), body: record(b"two") },
+    { path: answer_at("from", b"two"), body: b"two" },
+    { path: "to/" ++ record_path(b"stale"), body: record(b"old") },
+    { path: answer_at("to", b"old"), body: b"old" },
+  ]);
+  let first = fs::on_mem[abs](tree, || copied[abs, abs]("from", "to", [b"kept"]));
+  assert_eq(first.value, 1);
+  assert_eq(fs::mem_list(first.tree, "to/records"), Some([hex_of(b"kept")]));
+  assert_eq(fs::mem_read(first.tree, answer_at("to", b"one")), Some(b"one"));
+  assert_eq(fs::mem_read(first.tree, answer_at("to", b"old")), None);
+  // An answer the store holds is named by its digest, so a copy does not write it again.
+  let held = fs::mem_write(first.tree, answer_at("to", b"one"), b"as held").fs;
+  let again = fs::on_mem[abs](held, || copied[abs, abs]("from", "to", [b"kept"]));
+  assert_eq(fs::mem_read(again.tree, answer_at("to", b"one")), Some(b"as held"))
+}
+
+test "a readers file's keys are each read once" {
+  let key = |c: Bytes| bytes_concat_all(map(range(0, 32), |_: Int| c));
+  assert_eq(keys_in(Some(bytes_concat_all([key(b"b"), key(b"a"), key(b"b"), key(b"a")]))), [
+    key(b"a"),
+    key(b"b"),
+  ]);
+  assert_eq(keys_in(None), [])
 }
