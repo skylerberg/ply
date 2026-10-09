@@ -893,20 +893,23 @@ pub fn over_held<a | e>(
   beside: (String) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
+  // Whether the records beside stand as they are, as [`memo_files::kept`] trusts them.
+  trusted: Bool = false,
 ) -> { held: Held, value: a } / {abort.raise | e} =
   with_cell[held](held) { cell -> {
+    let held_or_beside = |key: Bytes|
+      match map_get(cell_get(cell).records, key) {
+        Some(r) -> Some(r),
+        None -> if trusted {
+          match beside(record_path(key)) { Some(b) -> record_from(b), None -> None }
+        } else { None },
+      };
     let value = handle {
       work()
     } with {
-      memo_keep.head(key) -> match map_get(cell_get(cell).records, key) {
-        Some(r) -> Some(r.output),
-        None -> None,
-      },
-      memo_keep.height(key) -> match map_get(cell_get(cell).records, key) {
-        Some(r) -> r.height,
-        None -> 0,
-      },
-      memo_keep.record(key) -> map_get(cell_get(cell).records, key),
+      memo_keep.head(key) -> match held_or_beside(key) { Some(r) -> Some(r.output), None -> None },
+      memo_keep.height(key) -> match held_or_beside(key) { Some(r) -> r.height, None -> 0 },
+      memo_keep.record(key) -> held_or_beside(key),
       memo_keep.packed(key) -> match beside(record_path(key)) {
         Some(b) -> record_from(b),
         None -> None,
@@ -989,7 +992,8 @@ pub fn fresh<a | e>(
   beside: (String) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
-) -> a / {abort.raise | e} = over_held(nothing_held(), beside, look, work).value
+  trusted: Bool = false,
+) -> a / {abort.raise | e} = over_held(nothing_held(), beside, look, work, trusted: trusted).value
 
 // --- Tests ----------------------------------------------------------------------------------
 
@@ -1230,6 +1234,26 @@ test "a packed answer is taken where what it read answers as it did, and kept as
   let moved = asked_with(q, edited(first.world, b"a", b"forty"), packed, None, b"longer", b"a");
   assert_eq(moved.output, b"long 5");
   assert_eq(moved.executed, 2)
+}
+
+test "a trusted packed answer stands as packed, and the run keeps nothing of it" {
+  let q = test_queries(b"h1");
+  let four = asked_over(q, test_world([{ at: b"a", text: b"four" }]), b"length", b"a");
+  let packed = packed_files(four.world.held);
+  let done = over_held(
+    nothing_held(),
+    |path: String| map_get(packed, path),
+    |_: Bytes, at: Bytes| None,
+    || {
+      let a = answer(q, started(q), b"longer", b"a");
+      { output: a.output, executed: ran_total(a.run) }
+    },
+    trusted: true,
+  );
+  // Only `longer` runs: `length` stands as packed, though the world this run reads holds nothing.
+  assert_eq(done.value.output, b"long 4");
+  assert_eq(done.value.executed, 1);
+  assert_eq(map_len(done.held.records), 1)
 }
 
 test "a packed answer over other shipped files than the run reads is answered again" {
