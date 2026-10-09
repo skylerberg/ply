@@ -1,7 +1,7 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, is_bare, starts_upper)
+import parsing (Span, Ident, QName, is_bare, starts_upper, span_bin)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -23,7 +23,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
-                label_at, dump_diags, qualify, default_binder, backticked)
+                label_at, dump_diags, qualify, default_binder, backticked, diag_bin)
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
@@ -2746,19 +2746,38 @@ pub fn hashed_and_unused(
   index: Index,
   fixed: Fixing,
   packages: List<Int>,
-) -> { hashes: HashOutput, unused: List<Diag> } / {abort.raise} = {
+) -> { hashes: HashOutput, unused: List<Diag>, uses: List<UseNode> } / {abort.raise} = {
   let whole = hashed_whole(index, fixed, packages);
   let named = fold(fixed.nodes, map_new(), |acc: Map<Bytes, Bool>, f: Fixed|
     map_insert(acc, pin_key(f.name, f.decl), true));
   if fold(index.nodes, true, |all: Bool, node: Node|
       all && map_contains(named, pin_key(node.name, is_decl(node)))) {
-    { hashes: whole.hashes, unused: [] }
+    let tested = fold(fixed.tests, map_new(), |acc: Map<Bytes, Bool>, t: FixedTest|
+      map_insert(acc, t.key, true));
+    let lawed = fold(fixed.laws, map_new(), |acc: Map<Bytes, Bool>, l: FixedLaw|
+      map_insert(acc, l.key, true));
+    let tests = filter(index.tests, |t: TestNode| !map_contains(tested, t.key));
+    let laws = filter(index.laws, |l: LawNode| !map_contains(lawed, l.key));
+    {
+      hashes: whole.hashes,
+      unused: [],
+      uses: item_uses(
+        index,
+        tests,
+        map(tests, |t: TestNode| test_roots_of(index, t)),
+        laws,
+        map(laws, |l: LawNode| law_roots_of(index, l)),
+      ),
+    }
   } else {
-    let roots = concat(
-      map(index.tests, |t: TestNode| test_roots_of(index, t)),
-      map(index.laws, |l: LawNode| law_roots_of(index, l)),
-    );
-    { hashes: whole.hashes, unused: unused_over(index, whole.first, fixed.nodes, roots) }
+    let tests = map(index.tests, |t: TestNode| test_roots_of(index, t));
+    let laws = map(index.laws, |l: LawNode| law_roots_of(index, l));
+    let edges = node_edges_of(index, whole.first);
+    {
+      hashes: whole.hashes,
+      unused: unused_over(index, edges, fixed.nodes, concat(tests, laws)),
+      uses: use_nodes(index, edges, held_of(index, fixed.nodes), tests, laws),
+    }
   }
 }
 
@@ -3993,7 +4012,7 @@ pub fn walk(edges: List<List<Int>>, from: List<Int>) -> List<Int> / {abort.raise
 pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.raise} =
   unused_over(
     index,
-    first_pass(index),
+    node_edges_of(index, first_pass(index)),
     fixed,
     concat(
       map(index.tests, |t: TestNode| test_roots_of(index, t)),
@@ -4001,26 +4020,137 @@ pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.rais
     ),
   )
 
-fn unused_over(
-  index: Index,
-  first: List<Finished>,
-  fixed: List<Fixed>,
-  item_roots: List<List<Int>>,
-) -> List<Diag> / {abort.raise} = {
+/// Each node of `index` `first` normalized, by what the walk for what nothing uses leads to from it.
+fn node_edges_of(index: Index, first: List<Finished>) -> List<List<Int>> / {abort.raise} =
+  map(range(0, len(index.nodes)), |v: Int| node_edges(index, at(index.nodes, v), at(first, v).refs))
+
+/// The nodes of `index` that `fixed` holds.
+fn held_of(index: Index, fixed: List<Fixed>) -> Map<Int, Bool> / {abort.raise} = {
   let keys = node_keys(index);
-  let held = fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
+  fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) {
       Some(v) -> map_insert(acc, v, true),
       None -> acc,
-    });
+    })
+}
+
+fn unused_over(
+  index: Index,
+  edges: List<List<Int>>,
+  fixed: List<Fixed>,
+  item_roots: List<List<Int>>,
+) -> List<Diag> / {abort.raise} = {
+  let held = held_of(index, fixed);
   let n = len(index.nodes);
-  let edges = map(range(0, n), |v: Int| node_edges(index, at(index.nodes, v), at(first, v).refs));
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
   let roots = fold(item_roots, own, |acc: List<Int>, rs: List<Int>| concat(acc, rs));
   let seen = walked(edges, roots).seen;
   fold(range(0, n), [], |acc: List<Diag>, v: Int|
     if at(seen, v) || map_contains(held, v) { acc }
     else { push(acc, never_used(index, at(index.nodes, v))) })
+}
+
+/// A node, a test or a law as the walk for what nothing uses meets it: where it stands, whether the
+/// walk starts at it, the nodes it leads to, each as [`pin_key`] files it, and, for a node, the
+/// warning it is given where nothing reaches it.
+pub type UseNode = {
+  key: Bytes,
+  module: Int,
+  span: Span,
+  root: Bool,
+  leads: List<Bytes>,
+  unused: Option<Diag>,
+}
+
+derive bin for UseNode
+
+fn node_span(node: Node) -> Span =
+  match node.body { NodeFn(d) -> d.span, NodeType(d) -> d.span, NodeEffect(d) -> d.span }
+
+/// Each node of `index` but those `held` holds, and each test and law, `tests` and `laws` what each
+/// test and law leads to, as the walk for what nothing uses meets them.
+fn use_nodes(
+  index: Index,
+  edges: List<List<Int>>,
+  held: Map<Int, Bool>,
+  tests: List<List<Int>>,
+  laws: List<List<Int>>,
+) -> List<UseNode> / {abort.raise} = {
+  let keys = map(index.nodes, |node: Node| pin_key(node.name, is_decl(node)));
+  concat(
+    fold(range(0, len(index.nodes)), [], |acc: List<UseNode>, v: Int|
+      if map_contains(held, v) { acc } else {
+        let node = at(index.nodes, v);
+        push(acc, {
+          key: at(keys, v),
+          module: node.module,
+          span: node_span(node),
+          root: is_root(index, node),
+          leads: map(at(edges, v), |w: Int| at(keys, w)),
+          unused: Some(never_used(index, node)),
+        })
+      }),
+    item_uses(index, index.tests, tests, index.laws, laws),
+  )
+}
+
+/// `tests` and `laws`, `test_leads` and `law_leads` what each leads to, as the walk for what nothing
+/// uses meets them: each a root.
+fn item_uses(
+  index: Index,
+  tests: List<TestNode>,
+  test_leads: List<List<Int>>,
+  laws: List<LawNode>,
+  law_leads: List<List<Int>>,
+) -> List<UseNode> / {abort.raise} = {
+  let named = |vs: List<Int>|
+    map(vs, |v: Int| {
+      let node = at(index.nodes, v);
+      pin_key(node.name, is_decl(node))
+    });
+  let item = |module: Int, span: Span, leads: List<Int>|
+    { key: b"", module: module, span: span, root: true, leads: named(leads), unused: None };
+  concat(
+    map(range(0, len(tests)), |i: Int| {
+      let t = at(tests, i);
+      item(t.module, t.def.span, at(test_leads, i))
+    }),
+    map(range(0, len(laws)), |i: Int| {
+      let l = at(laws, i);
+      item(l.module, l.def.span, at(law_leads, i))
+    }),
+  )
+}
+
+/// The warnings `uses`, the nodes, tests and laws of one module, give the nodes nothing reaches.
+pub fn unreached(uses: List<UseNode>) -> List<Diag> / {abort.raise} = {
+  let by_key = fold(uses, map_new(), |acc: Map<Bytes, UseNode>, r: UseNode|
+    if bytes_len(r.key) == 0 { acc } else { map_insert(acc, r.key, r) });
+  let seen = iterate(
+    {
+      seen: map_new(),
+      work: fold(uses, [], |acc: List<Bytes>, r: UseNode|
+        if !r.root { acc }
+        else if bytes_len(r.key) == 0 { concat(acc, r.leads) }
+        else { push(acc, r.key) }),
+    },
+    1000000000,
+    |x: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+      match x.work {
+        [] -> Stop(x.seen),
+        [k, ..rest] -> if map_contains(x.seen, k) { Continue({ ..x, work: rest }) } else {
+          Continue({
+            seen: map_insert(x.seen, k, true),
+            work: match map_get(by_key, k) { Some(r) -> concat(r.leads, rest), None -> rest },
+          })
+        },
+      },
+  );
+  fold(uses, [], |acc: List<Diag>, r: UseNode|
+    match r.unused {
+      Some(d) -> if map_contains(seen, r.key) { acc } else { push(acc, d) },
+      None -> acc,
+    })
 }
 
 /// What a test keeps from being unused: what it references, its cases' table and label among them,
@@ -6375,7 +6505,7 @@ test "hashing reads a fixed definition's contract and references as its run fixe
     held.unused,
     unused_over(
       index,
-      first_pass(index),
+      node_edges_of(index, first_pass(index)),
       fixed,
       concat(
         map(index.tests, |t: TestNode| test_roots_of(index, t)),

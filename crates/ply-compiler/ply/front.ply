@@ -28,7 +28,7 @@ import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, R
                 Namespace, ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find,
                 error_at, backticked, import_module_name, path_span, post_order)
 import hash (Index, IndexEntry, DefEntry, TestEntry, LawEntry, TestNode, HashOutput, build_index,
-             hash_index, hashed_and_unused, hex, digest, Pin, Fixing, Rehash, Rehashed,
+             UseNode, hash_index, hashed_and_unused, hex, digest, Pin, Fixing, Rehash, Rehashed,
              rehash_index, by_name, tagged_target, closure_of, reached_functions, LawNode, Node,
              NodeFn, NodeType, NodeEffect, Which, TheFn, TheDecl, TheItem, denoted, DenotesFn,
              DenotesCtor, DenotesNothing, effect_called, type_named, NodeRef, pin_key, Skeleton,
@@ -793,7 +793,7 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
 
 /// Each name `parsed`'s import declarations name, qualified by the module each resolved to, in
 /// `targets`.
-fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> / {abort.raise} =
+pub fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> / {abort.raise} =
   fold(range(0, len(parsed.module.imports)), [], |acc: List<Bytes>, k: Int|
     match at(parsed.module.imports, k).kind {
       INames(names) -> match list_at(targets, k) {
@@ -915,14 +915,24 @@ fn without_first(names: List<Bytes>, n: Bytes) -> List<Bytes> / {abort.raise} = 
 /// Whether a site in module `module` is of the walk of its definitions, which takes each module
 /// in the order they are checked in: a body's own, or a clause's, inside its definition. A test's,
 /// a schema's and a law's are walked after every definition, each module in its place.
-fn of_definitions(fn_spans: List<List<Span>>, module: Int, owner: Bytes, span: Span) -> Bool =
+fn of_definitions(
+  fn_spans: List<List<Span>>,
+  costs: List<List<Span>>,
+  module: Int,
+  owner: Bytes,
+  span: Span,
+) -> Bool =
   if bytes_len(owner) == 0 {
-    match list_at(fn_spans, module) {
-      Some(spans) ->
-        fold(spans, false, |b: Bool, at: Span| b || (span.start >= at.start && span.end <= at.end)),
-      None -> false,
-    }
+    let among = |spans: Option<List<Span>>|
+      match spans { Some(xs) -> within_any(xs, span), None -> false };
+    // A site in a `cost` clause is of the law the clause makes, which is checked with the laws.
+    among(list_at(fn_spans, module)) && !among(list_at(costs, module))
   } else { bytes_index_of(owner, b".test#") == None }
+
+/// Where each `cost` clause of the definitions `t` holds stands.
+fn cost_spans(t: ModuleTables) -> List<Span> =
+  fold(t.defs, [], |acc: List<Span>, d: DefInfo|
+    concat(acc, map(filter(d.spec, |x: SpecInfo| x.kind == SCost), |x: SpecInfo| x.span)))
 
 /// What `pick` holds of each of `checked`, the modules in the order they are checked in, that
 /// `first` says is of the walk of definitions, then the rest of each of `placed`, the modules in
@@ -964,10 +974,8 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
 
 /// `t`, the tables of the module `o` outlines, read without its tests and laws.
 fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables = {
-  let spans = fn_spans_of(o);
   let ours = |owner: Bytes, span: Span|
-    if bytes_len(owner) == 0 { within_any(spans, span) }
-    else { bytes_index_of(owner, b".test#") == None };
+    of_definitions([fn_spans_of(o)], [cost_spans(t)], 0, owner, span);
   let e = t.facts.elaboration;
   {
     ..t,
@@ -1325,13 +1333,14 @@ fn merged_tables(
   placed: List<ModuleTables>,
 ) -> CheckOutput / {abort.raise} = {
   let fn_spans = map(outlines, fn_spans_of);
+  let costs = map(placed, cost_spans);
   let at_name = fold(range(0, len(outlines)), map_new(), |acc: Map<Bytes, Int>, k: Int|
     map_insert(acc, at(outlines, k).name, k));
   // The checker takes the modules in the order they are checked in, which its tables hold.
   let checked_order = fold(order, [], |acc: List<ModuleTables>, n: Bytes|
     match map_get(at_name, n) { Some(k) -> push(acc, at(placed, k)), None -> acc });
   let of_walk = |module: Int, owner: Bytes, span: Span|
-    of_definitions(fn_spans, module, owner, span);
+    of_definitions(fn_spans, costs, module, owner, span);
   {
     ok: true,
     diags: [],
@@ -2441,6 +2450,9 @@ pub type Analysis = {
   index: Index,
   hashes: HashOutput,
   warnings: List<Diag>,
+  /// What the walk for what nothing uses met of each node hashing normalized, and of each test and
+  /// law: what a check of part of a module tells the walk over the whole of it.
+  uses: List<UseNode>,
   /// The project's `ply.pkg`, decoded; `None` is the anonymous package.
   manifest: Option<Manifest>,
   /// The closure's packages and each module's package, so the emitter and the claims lowerer
@@ -3349,6 +3361,7 @@ pub type Hashed = {
   index: Index,
   hashes: HashOutput,
   unused: List<Diag>,
+  uses: List<UseNode>,
   clo: Closure,
   packages: List<PackageDeps>,
   module_packages: List<Int>,
@@ -3408,6 +3421,7 @@ fn hashed_closure(
                 index: built.index,
                 hashes: hashed.hashes,
                 unused: hashed.unused,
+                uses: hashed.uses,
                 clo: clo,
                 packages: tables.pkgs,
                 module_packages: tables.module_packages,
@@ -3454,6 +3468,7 @@ fn checked_closure(
           )),
         outside_every_module,
       ),
+      uses: h.uses,
       manifest: at(h.clo.packages, 0).manifest,
       packages: h.packages,
       pins: pins_of(h.clo, h.embeds),
@@ -7256,17 +7271,15 @@ fn effectful() -> List<Source> =
 /// left out, and each definition's scheme in canonical form.
 pub type Published = { dump: Dump, schemes: List<{ name: Bytes, scheme: Scheme }> }
 
-/// The rows an analysis publishes, which number their variables as their texts name them: a seeded
-/// row and a walked one are then alike, however the checker numbered each. What a load answers, all
-/// but what its check walked (a seeded load walks less by design), and every definition's scheme.
+/// What a load answers, all but what its check walked (a seeded load walks less by design), and
+/// every definition's scheme.
 pub fn published(outcome: AnalysisOutcome) -> Published / {abort.raise} =
   {
     dump: { ..dump_of(outcome), walked: b"" },
     schemes: match outcome {
       Refused(_) -> [],
       Analysed(w) ->
-        map(w.checked.defs, |def_info: DefInfo|
-          { name: def_info.name, scheme: canonical_scheme(def_info.scheme) }),
+        map(w.checked.defs, |def_info: DefInfo| { name: def_info.name, scheme: def_info.scheme }),
     },
   }
 
@@ -7278,8 +7291,8 @@ fn scheme_named(p: Published, name: Bytes) -> Scheme / {abort.raise} =
   }
 
 // The same definition, with a module of generics checked ahead of it in one of the two programs:
-// the checker numbers its variables apart in the two, and the rows do not.
-test "two programs alike but for what the checker numbered first publish equal rows" {
+// the checker meets its variables in another order in the two, and publishes them numbered alike.
+test "two programs alike but for what the checker met first publish one definition" {
   let pick = b"pub fn pick<p, q>(x: p, y: q, f: (p) -> q) -> List<q> = [f(x), y]";
   let alone = [{ name: b"m", src: pick }];
   let behind = [
@@ -7289,7 +7302,7 @@ test "two programs alike but for what the checker numbered first publish equal r
   let raw = |sources: List<Source>|
     fold(analysis_of(sources).checked.defs, None, |acc: Option<Scheme>, def_info: DefInfo|
       if def_info.name == b"m.pick" { Some(def_info.scheme) } else { acc });
-  assert(raw(alone) != raw(behind));
+  assert_eq(raw(alone), raw(behind));
   let one = published(analyse(parse_all(alone)));
   let two = published(analyse(parse_all(behind)));
   assert_eq(scheme_named(one, b"m.pick"), scheme_named(two, b"m.pick"));

@@ -4,15 +4,16 @@
 //! `marked/`, a file for each mark on a record, named by the record's key and the mark, so a run lists
 //! only the marks there are. A run reads the records it asks for and no other, and keeps what it
 //! answered as files of their own, each landed whole by a rename, so runs that keep the same answer
-//! at once leave one.
+//! at once leave one. What it keeps is written in batches, as it ends or once enough waits: marks at
+//! once, and a record only after the notes of what it read.
 
 import std.bin
 import std.fs
 import std.fs (fs, under)
 import std.bytes (bytes_of_hex, hex_of)
 import std.list (contains)
-import memo (Record, Seen, memo_keep, digest_of, head_bytes, output_named, output_path,
-             record_bytes, record_from, record_path, seen_bin)
+import memo (Record, Seen, memo_keep, digest_of, head_bytes, output_named, height_named,
+             output_path, record_bytes, record_from, record_path, seen_bin)
 
 fn records_dir(dir: String) -> String = under(dir, "records")
 
@@ -29,6 +30,20 @@ fn holds_dir(dir: String) -> String = under(dir, "holds")
 fn runs_dir(dir: String) -> String = under(dir, "runs")
 
 fn at(dir: String, path: String) -> String = dir ++ "/" ++ path
+
+/// What a run kept and has not written yet: records by key, answers by digest, and the keys of the
+/// records that read each place or asked each record, by its id; and about how many bytes that is.
+type Pending = {
+  records: Map<Bytes, Bytes>,
+  outputs: Map<Bytes, Bytes>,
+  links: Map<Bytes, Bytes>,
+  size: Int,
+}
+
+fn no_pending() -> Pending = { records: map_new(), outputs: map_new(), links: map_new(), size: 0 }
+
+/// How many bytes a run holds unwritten before it writes them.
+fn pending_bound() -> Int = 67108864
 
 fn named_in(sub: String, id: Bytes) -> String / {abort.raise} = sub ++ "/" ++ hex_of(id)
 
@@ -91,106 +106,212 @@ pub fn kept<a, [r] | e>(
     None -> "unwritten",
   };
   let value = with_cell[minted](0) { minted ->
-    with_cell[marking](marks_in[r](dir)) { marking -> {
-      let fresh = || {
-        let n = cell_get(minted);
-        cell_set(minted, n + 1);
-        token ++ "." ++ int_to_string(n)
-      };
-      // `bytes` at `path`, landed whole: written beside it under a name of this run's, and renamed.
-      let landed = |path: String, bytes: Bytes| {
-        let tmp = path ++ "." ++ fresh() ++ ".tmp";
-        if fs.write_file[r](tmp, bytes) {
-          fs.rename[r](tmp, path);
-          ()
-        }
-      };
-      handle {
-        work()
-      } with {
-        memo_keep.head(key) -> match fs.read_at[r](at(dir, record_path(key)), 0, head_bytes()) {
-          Some(b) -> output_named(b),
-          None -> None,
-        },
-        memo_keep.record(key) -> record_of(fs.read_file[r](at(dir, record_path(key)))),
-        memo_keep.packed(key) -> record_of(beside(record_path(key))),
-        memo_keep.output(digest) -> match fs.read_file[r](at(dir, output_path(digest))) {
-          Some(o) -> Some(o),
-          None -> beside(output_path(digest)),
-        },
-        memo_keep.keep(key, rec, output) -> {
-          let path = at(dir, output_path(rec.output));
-          if !fs.exists[r](path) { landed(path, output) };
-          landed(at(dir, record_path(key)), record_bytes(rec))
-        },
-        memo_keep.adopt(key, rec) -> landed(at(dir, record_path(key)), record_bytes(rec)),
-        memo_keep.now(kind, place) -> look(kind, place),
-        memo_keep.places() -> match fs.list_dir[r](places_dir(dir)) {
-          None -> [],
-          Some(names) ->
-            fold(names, [], |acc: List<Seen>, n: String|
-              if string_ends_with(n, ".tmp") { acc } else {
-                match fs.read_file[r](places_dir(dir) ++ "/" ++ n) {
-                  Some(b) -> match bin::decode(b, seen_bin()) {
-                    Ok(s) -> push(acc, s),
-                    Err(_) -> acc,
-                  },
-                  None -> acc,
-                }
-              }),
-        },
-        memo_keep.seen(id) -> match fs.read_file[r](named_in(places_dir(dir), id)) {
-          Some(b) -> match bin::decode(b, seen_bin()) { Ok(s) -> Some(s), Err(_) -> None },
-          None -> None,
-        },
-        memo_keep.see(id, s) -> landed(named_in(places_dir(dir), id), bin::encode(s, seen_bin())),
-        memo_keep.readers(id) -> keys_in(fs.read_file[r](named_in(readers_dir(dir), id))),
-        memo_keep.link(id, key) -> {
-          fs.append[r](named_in(readers_dir(dir), id), key);
-          ()
-        },
-        memo_keep.marks(key) -> match map_get(cell_get(marking), key) {
-          Some(ms) -> ms,
-          None -> [],
-        },
-        memo_keep.marked() -> {
-          let now = marks_in[r](dir);
-          cell_set(marking, now);
-          map_fold(now, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
-            if len(ms) == 0 { acc } else { push(acc, k) })
-        },
-        memo_keep.mark(key) -> {
-          let m = bytes_of_string(fresh());
-          fs.write_file[r](mark_path(dir, key, m), b"");
-          let held = cell_get(marking);
-          cell_set(
-            marking,
-            map_insert(held, key, push(match map_get(held, key) { Some(ms) -> ms, None -> [] }, m)),
-          )
-        },
-        memo_keep.unmark(key, gone) -> {
-          fold(gone, (), |_: Unit, m: Bytes| {
-            fs.remove[r](mark_path(dir, key, m));
-            ()
-          });
-          let held = cell_get(marking);
-          cell_set(
-            marking,
-            map_insert(
-              held,
-              key,
-              filter(match map_get(held, key) { Some(ms) -> ms, None -> [] }, |m: Bytes|
-                !contains(gone, m)),
-            ),
-          )
-        },
-        memo_keep.hold(id) -> fs.lock[r](named_in(holds_dir(dir), id)),
-        memo_keep.release(id) -> {
-          fs.unlock[r](named_in(holds_dir(dir), id));
-          ()
-        },
+    with_cell[marking](marks_in[r](dir)) { marking ->
+      with_cell[pending](no_pending()) { pending ->
+        with_cell[heights](map_new()) { heights -> {
+          let fresh = || {
+            let n = cell_get(minted);
+            cell_set(minted, n + 1);
+            token ++ "." ++ int_to_string(n)
+          };
+          // `bytes` at `path`, landed whole: written beside it under a name of this run's, and renamed.
+          let landed = |path: String, bytes: Bytes| {
+            let tmp = path ++ "." ++ fresh() ++ ".tmp";
+            if fs.write_file[r](tmp, bytes) {
+              fs.rename[r](tmp, path);
+              ()
+            }
+          };
+          // What the run kept so far, written: each answer, then each read's new readers, then each
+          // record, so a record is never there without the notes that mark it.
+          let flushed = || {
+            let p = cell_get(pending);
+            map_fold(p.outputs, (), |_: Unit, digest: Bytes, output: Bytes| {
+              let path = at(dir, output_path(digest));
+              if !fs.exists[r](path) { landed(path, output) }
+            });
+            map_fold(p.links, (), |_: Unit, id: Bytes, keys: Bytes| {
+              fs.append[r](named_in(readers_dir(dir), id), keys);
+              ()
+            });
+            map_fold(p.records, (), |_: Unit, key: Bytes, b: Bytes|
+              landed(at(dir, record_path(key)), b));
+            cell_set(pending, no_pending())
+          };
+          let held = |p: Pending| if p.size > pending_bound() { flushed() };
+          let record_bytes_at = |key: Bytes|
+            match map_get(cell_get(pending).records, key) {
+              Some(b) -> Some(b),
+              None -> fs.read_file[r](at(dir, record_path(key))),
+            };
+          let value = handle {
+            work()
+          } with {
+            memo_keep.head(key) -> match map_get(cell_get(pending).records, key) {
+              Some(b) -> output_named(b),
+              None -> match fs.read_at[r](at(dir, record_path(key)), 0, head_bytes()) {
+                Some(b) -> {
+                  // The head holds the height too, which a read of the record asks next.
+                  cell_set(heights, map_insert(cell_get(heights), key, height_named(b)));
+                  output_named(b)
+                },
+                None -> None,
+              },
+            },
+            memo_keep.height(key) -> match map_get(cell_get(pending).records, key) {
+              Some(b) -> height_named(b),
+              None -> match map_get(cell_get(heights), key) {
+                Some(h) -> h,
+                None -> match fs.read_at[r](at(dir, record_path(key)), 0, 9) {
+                  Some(b) -> height_named(b),
+                  None -> 0,
+                },
+              },
+            },
+            memo_keep.record(key) -> record_of(record_bytes_at(key)),
+            memo_keep.packed(key) -> record_of(beside(record_path(key))),
+            memo_keep.output(digest) -> match map_get(cell_get(pending).outputs, digest) {
+              Some(o) -> Some(o),
+              None -> match fs.read_file[r](at(dir, output_path(digest))) {
+                Some(o) -> Some(o),
+                None -> beside(output_path(digest)),
+              },
+            },
+            memo_keep.keep(key, rec, output) -> {
+              cell_set(heights, map_remove(cell_get(heights), key));
+              let p = cell_get(pending);
+              let b = record_bytes(rec);
+              let next = {
+                ..p,
+                records: map_insert(p.records, key, b),
+                outputs: map_insert(p.outputs, rec.output, output),
+                size: p.size + bytes_len(b) + bytes_len(output),
+              };
+              cell_set(pending, next);
+              held(next)
+            },
+            memo_keep.adopt(key, rec) -> {
+              cell_set(heights, map_remove(cell_get(heights), key));
+              let p = cell_get(pending);
+              let b = record_bytes(rec);
+              let next = {
+                ..p,
+                records: map_insert(p.records, key, b),
+                size: p.size + bytes_len(b),
+              };
+              cell_set(pending, next);
+              held(next)
+            },
+            memo_keep.now(kind, place) -> look(kind, place),
+            memo_keep.places() -> match fs.list_dir[r](places_dir(dir)) {
+              None -> [],
+              Some(names) ->
+                fold(names, [], |acc: List<Seen>, n: String|
+                  if string_ends_with(n, ".tmp") { acc } else {
+                    match fs.read_file[r](places_dir(dir) ++ "/" ++ n) {
+                      Some(b) -> match bin::decode(b, seen_bin()) {
+                        Ok(s) -> push(acc, s),
+                        Err(_) -> acc,
+                      },
+                      None -> acc,
+                    }
+                  }),
+            },
+            memo_keep.seen(id) -> match fs.read_file[r](named_in(places_dir(dir), id)) {
+              Some(b) -> match bin::decode(b, seen_bin()) { Ok(s) -> Some(s), Err(_) -> None },
+              None -> None,
+            },
+            memo_keep.see(id, s) ->
+              landed(named_in(places_dir(dir), id), bin::encode(s, seen_bin())),
+            memo_keep.readers(id) ->
+              keys_in(
+                match ((
+                    fs.read_file[r](named_in(readers_dir(dir), id)),
+                    map_get(cell_get(pending).links, id),
+                  )) {
+                  (Some(a), Some(b)) -> Some(bytes_concat(a, b)),
+                  (Some(a), None) -> Some(a),
+                  (None, b) -> b,
+                },
+              ),
+            memo_keep.link(id, key) -> {
+              let p = cell_get(pending);
+              let next = {
+                ..p,
+                links: map_insert(p.links, id, match map_get(p.links, id) {
+                  Some(ks) -> bytes_concat(ks, key),
+                  None -> key,
+                }),
+                size: p.size + 64,
+              };
+              cell_set(pending, next);
+              held(next)
+            },
+            memo_keep.marks(key) -> match map_get(cell_get(marking), key) {
+              Some(ms) -> ms,
+              None -> [],
+            },
+            memo_keep.marked() -> {
+              let now = marks_in[r](dir);
+              cell_set(marking, now);
+              map_fold(now, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
+                if len(ms) == 0 { acc } else { push(acc, k) })
+            },
+            memo_keep.mark(key) -> {
+              let m = bytes_of_string(fresh());
+              fs.write_file[r](mark_path(dir, key, m), b"");
+              let held = cell_get(marking);
+              cell_set(
+                marking,
+                map_insert(
+                  held,
+                  key,
+                  push(match map_get(held, key) { Some(ms) -> ms, None -> [] }, m),
+                ),
+              )
+            },
+            memo_keep.unmark(key, gone) -> {
+              fold(gone, (), |_: Unit, m: Bytes| {
+                fs.remove[r](mark_path(dir, key, m));
+                ()
+              });
+              let held = cell_get(marking);
+              cell_set(
+                marking,
+                map_insert(
+                  held,
+                  key,
+                  filter(match map_get(held, key) { Some(ms) -> ms, None -> [] }, |m: Bytes|
+                    !contains(gone, m)),
+                ),
+              )
+            },
+            memo_keep.forget(key) -> {
+              let p = cell_get(pending);
+              cell_set(pending, { ..p, records: map_remove(p.records, key) });
+              fs.remove[r](at(dir, record_path(key)));
+              let held = cell_get(marking);
+              fold(
+                match map_get(held, key) { Some(ms) -> ms, None -> [] },
+                (),
+                |_: Unit, m: Bytes| {
+                  fs.remove[r](mark_path(dir, key, m));
+                  ()
+                },
+              );
+              cell_set(marking, map_remove(held, key))
+            },
+            memo_keep.hold(id) -> fs.lock[r](named_in(holds_dir(dir), id)),
+            memo_keep.release(id) -> {
+              fs.unlock[r](named_in(holds_dir(dir), id));
+              ()
+            },
+          };
+          flushed();
+          value
+        } }
       }
-    } }
+    }
   };
   match mine {
     Some(path) -> {
@@ -337,7 +458,13 @@ pub fn compacted<[r]>(
 
 test "a copy leaves its store holding the records asked for and their answers, and nothing else" {
   let record = |answer: Bytes|
-    record_bytes({ query: b"q", input: b"", reads: [], output: digest_of(Some(answer)) });
+    record_bytes({
+      query: b"q",
+      input: b"",
+      reads: [],
+      output: digest_of(Some(answer)),
+      height: 1,
+    });
   let answer_at = |store: String, answer: Bytes|
     store ++ "/" ++ output_path(digest_of(Some(answer)));
   let tree = fs::mem_of([
