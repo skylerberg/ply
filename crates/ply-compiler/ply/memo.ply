@@ -125,15 +125,19 @@ pub fn ran_total(run: Run) -> Int = map_fold(run.ran, 0, |n: Int, _: Bytes, k: I
 pub fn digest_of(answer: Option<Bytes>) -> Bytes =
   match answer { Some(b) -> bytes_concat(b"=", blake3(b)), None -> b"-" }
 
+/// The layout of the store a key, a place's note or a reader's link is named in: a store shared by
+/// `ply`s of two layouts holds two stores apart, since one marks only through its own links.
+fn layout() -> Bytes = b"ply.memo.5"
+
 /// What a query's answer for `input` is kept under: its definition's hash and the input's digest.
 pub fn key_of(q: Query, input: Bytes) -> Bytes =
-  blake3(bytes_concat_all([b"ply.memo.4\x00", q.hash, b"\x00", blake3(input)]))
+  blake3(bytes_concat_all([layout(), b"\x00", q.hash, b"\x00", blake3(input)]))
 
 fn sized(b: Bytes) -> Bytes = bytes_concat(u64_le(bytes_len(b)), b)
 
 /// What a store notes the place `at`, as `kind` reads it, under.
 pub fn place_id(kind: Bytes, at: Bytes) -> Bytes =
-  blake3(bytes_concat_all([b"ply.memo.place\x00", sized(kind), at]))
+  blake3(bytes_concat_all([layout(), b".place\x00", sized(kind), at]))
 
 /// The place that holds a query's hash, at its name: every record that asked the query reads it, so
 /// a query whose definition moved marks what asked it.
@@ -144,15 +148,23 @@ pub fn record_path(key: Bytes) -> String / {abort.raise} = "records/" ++ hex_of(
 
 pub fn output_path(digest: Bytes) -> String / {abort.raise} = "outputs/" ++ hex_of(digest)
 
-fn record_format() -> Bytes = b"\x04"
+fn record_format() -> Bytes = b"\x05"
 
-/// `r` as a store keeps it: its height and its answer's digest first, so a run that takes it as kept
-/// reads no more.
-pub fn record_bytes(r: Record) -> Bytes / {abort.raise} =
+/// The longest answer a store keeps inside the record that names it.
+pub fn inline_bound() -> Int = 2048
+
+/// `output` where a store keeps it inside its record.
+pub fn kept_inline(output: Bytes) -> Option<Bytes> =
+  if bytes_len(output) <= inline_bound() { Some(output) } else { None }
+
+/// `r` as a store keeps it: its height and its answer's digest first, then `inline`, the answer
+/// itself where the record holds it, so a run that takes it as kept reads no more.
+pub fn record_bytes(r: Record, inline: Option<Bytes>) -> Bytes / {abort.raise} =
   bytes_concat_all([
     record_format(),
     u64_le(r.height),
     sized(r.output),
+    match inline { Some(o) -> bytes_concat(b"\x01", sized(o)), None -> b"\x00" },
     sized(r.query),
     sized(r.input),
     bin::encode(r.reads, bin::list_bin(read_bin())),
@@ -175,15 +187,33 @@ pub fn height_named(b: Bytes) -> Int / {abort.raise} =
   if bytes_len(b) < 9 || bytes_slice(b, 0, 1) != record_format() { 0 }
   else { match u64_at(b, 1) { Some(h) -> h, None -> 0 } }
 
-/// How many of a record's first bytes name its answer.
-pub fn head_bytes() -> Int = 64
+/// The answer a record's bytes, or their first bytes, hold beside its digest: none for a record
+/// that keeps its answer apart.
+pub fn inline_named(b: Bytes) -> Option<Bytes> / {abort.raise} =
+  if bytes_len(b) < 9 || bytes_slice(b, 0, 1) != record_format() { None } else {
+    match sized_at(b, 9) {
+      None -> None,
+      Some(o) -> if o.next >= bytes_len(b) || bytes_at(b, o.next) != 1 { None }
+      else { match sized_at(b, o.next + 1) { Some(i) -> Some(i.value), None -> None } },
+    }
+  }
+
+/// Where in a record's bytes what follows its answer starts.
+fn past_inline(b: Bytes, at: Int) -> Option<Int> / {abort.raise} =
+  if at >= bytes_len(b) { None }
+  else if bytes_at(b, at) == 0 { Some(at + 1) }
+  else if bytes_at(b, at) != 1 { None }
+  else { match sized_at(b, at + 1) { Some(i) -> Some(i.next), None -> None } }
+
+/// How many of a record's first bytes name its answer, and hold it where the record does.
+pub fn head_bytes() -> Int = 4096
 
 /// The record `b` holds, or nothing where they do not read as one.
 pub fn record_from(b: Bytes) -> Option<Record> / {abort.raise} =
   if bytes_len(b) < 9 || bytes_slice(b, 0, 1) != record_format() { None } else {
     match sized_at(b, 9) {
       None -> None,
-      Some(o) -> match sized_at(b, o.next) {
+      Some(o) -> match match past_inline(b, o.next) { Some(at) -> sized_at(b, at), None -> None } {
         None -> None,
         Some(q) -> match sized_at(b, q.next) {
           None -> None,
@@ -594,7 +624,7 @@ fn read_ids(queries: Map<Bytes, Query>, reads: List<Read>) -> Map<Bytes, Bool> =
 /// same whatever its definition hashes to, so a record still stands on the answer of a query whose
 /// definition moved under it, and is marked where that answer moves.
 fn asked_id(name: Bytes, input: Bytes) -> Bytes =
-  blake3(bytes_concat_all([b"ply.memo.asked\x00", sized(name), input]))
+  blake3(bytes_concat_all([layout(), b".asked\x00", sized(name), input]))
 
 /// Notes the queries `reads` asked at their places, so a record that asked one is marked where its
 /// hash moves.
@@ -841,7 +871,12 @@ pub fn recorded(
   output: Bytes,
   marks: List<Bytes>,
 ) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} = {
-  map_fold(read_ids(queries, reads), (), |_: Unit, id: Bytes, _: Bool| memo_keep.link(id, key));
+  let noted = match memo_keep.record(key) {
+    Some(r) -> read_ids(queries, r.reads),
+    None -> map_new(),
+  };
+  map_fold(read_ids(queries, reads), (), |_: Unit, id: Bytes, _: Bool|
+    if !map_contains(noted, id) { memo_keep.link(id, key) });
   // Every read is asked again, so each place it read is noted.
   let moved = fold(reads, false, |m: Bool, r: Read| {
     let now = match r {
@@ -896,95 +931,121 @@ pub fn over_held<a | e>(
   // Whether the records beside stand as they are, as [`memo_files::kept`] trusts them.
   trusted: Bool = false,
 ) -> { held: Held, value: a } / {abort.raise | e} =
-  with_cell[held](held) { cell -> {
-    let held_or_beside = |key: Bytes|
-      match map_get(cell_get(cell).records, key) {
-        Some(r) -> Some(r),
-        None -> if trusted {
-          match beside(record_path(key)) { Some(b) -> record_from(b), None -> None }
-        } else { None },
+  with_cell[held](held) { cell ->
+    with_cell[inlined](map_new()) { inlined -> {
+      // A packed record, beside the answer it holds, which a later ask of the answer reads.
+      let packed_at = |key: Bytes|
+        match beside(record_path(key)) {
+          None -> None,
+          Some(b) -> match record_from(b) {
+            None -> None,
+            Some(r) -> {
+              match inline_named(b) {
+                Some(o) -> cell_set(inlined, map_insert(cell_get(inlined), r.output, o)),
+                None -> (),
+              };
+              Some(r)
+            },
+          },
+        };
+      let held_or_beside = |key: Bytes|
+        match map_get(cell_get(cell).records, key) {
+          Some(r) -> Some(r),
+          None -> if trusted { packed_at(key) } else { None },
+        };
+      let value = handle {
+        work()
+      } with {
+        memo_keep.head(key) -> match held_or_beside(key) {
+          Some(r) -> Some(r.output),
+          None -> None,
+        },
+        memo_keep.height(key) -> match held_or_beside(key) { Some(r) -> r.height, None -> 0 },
+        memo_keep.record(key) -> held_or_beside(key),
+        memo_keep.packed(key) -> packed_at(key),
+        memo_keep.output(digest) -> match map_get(cell_get(cell).outputs, digest) {
+          Some(o) -> Some(o),
+          None -> match map_get(cell_get(inlined), digest) {
+            Some(o) -> Some(o),
+            None -> beside(output_path(digest)),
+          },
+        },
+        memo_keep.keep(key, rec, output) -> {
+          let h = cell_get(cell);
+          cell_set(cell, {
+            ..h,
+            records: map_insert(h.records, key, rec),
+            outputs: map_insert(h.outputs, rec.output, output),
+          })
+        },
+        memo_keep.adopt(key, rec) -> {
+          let h = cell_get(cell);
+          // A packed answer its record holds is held beside the adopted record.
+          cell_set(cell, {
+            ..h,
+            records: map_insert(h.records, key, rec),
+            outputs: match map_get(cell_get(inlined), rec.output) {
+              Some(o) -> map_insert(h.outputs, rec.output, o),
+              None -> h.outputs,
+            },
+          })
+        },
+        memo_keep.now(kind, at) -> look(kind, at),
+        memo_keep.places() -> map_values(cell_get(cell).seen),
+        memo_keep.seen(id) -> map_get(cell_get(cell).seen, id),
+        memo_keep.see(id, s) -> {
+          let h = cell_get(cell);
+          cell_set(cell, { ..h, seen: map_insert(h.seen, id, s) })
+        },
+        memo_keep.readers(id) -> match map_get(cell_get(cell).readers, id) {
+          Some(ks) -> ks,
+          None -> [],
+        },
+        memo_keep.link(id, key) -> {
+          let h = cell_get(cell);
+          let ks = match map_get(h.readers, id) { Some(ks) -> ks, None -> [] };
+          if !contains(ks, key) {
+            cell_set(cell, { ..h, readers: map_insert(h.readers, id, push(ks, key)) })
+          }
+        },
+        memo_keep.marks(key) -> match map_get(cell_get(cell).marks, key) {
+          Some(ms) -> ms,
+          None -> [],
+        },
+        memo_keep.forget(key) -> {
+          let h = cell_get(cell);
+          cell_set(cell, {
+            ..h,
+            records: map_remove(h.records, key),
+            marks: map_remove(h.marks, key),
+          })
+        },
+        memo_keep.marked() ->
+          map_fold(cell_get(cell).marks, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
+            if len(ms) == 0 { acc } else { push(acc, k) }),
+        memo_keep.mark(key) -> {
+          let h = cell_get(cell);
+          let ms = match map_get(h.marks, key) { Some(ms) -> ms, None -> [] };
+          cell_set(cell, {
+            ..h,
+            marks: map_insert(h.marks, key, push(ms, bytes_of_string(int_to_string(h.minted)))),
+            minted: h.minted + 1,
+          })
+        },
+        memo_keep.unmark(key, gone) -> {
+          let h = cell_get(cell);
+          let ms = match map_get(h.marks, key) { Some(ms) -> ms, None -> [] };
+          cell_set(cell, {
+            ..h,
+            marks: map_insert(h.marks, key, filter(ms, |m: Bytes| !contains(gone, m))),
+          })
+        },
+        memo_keep.hold(_) -> true,
+        memo_keep.release(_) -> (),
       };
-    let value = handle {
-      work()
-    } with {
-      memo_keep.head(key) -> match held_or_beside(key) { Some(r) -> Some(r.output), None -> None },
-      memo_keep.height(key) -> match held_or_beside(key) { Some(r) -> r.height, None -> 0 },
-      memo_keep.record(key) -> held_or_beside(key),
-      memo_keep.packed(key) -> match beside(record_path(key)) {
-        Some(b) -> record_from(b),
-        None -> None,
-      },
-      memo_keep.output(digest) -> match map_get(cell_get(cell).outputs, digest) {
-        Some(o) -> Some(o),
-        None -> beside(output_path(digest)),
-      },
-      memo_keep.keep(key, rec, output) -> {
-        let h = cell_get(cell);
-        cell_set(cell, {
-          ..h,
-          records: map_insert(h.records, key, rec),
-          outputs: map_insert(h.outputs, rec.output, output),
-        })
-      },
-      memo_keep.adopt(key, rec) -> {
-        let h = cell_get(cell);
-        cell_set(cell, { ..h, records: map_insert(h.records, key, rec) })
-      },
-      memo_keep.now(kind, at) -> look(kind, at),
-      memo_keep.places() -> map_values(cell_get(cell).seen),
-      memo_keep.seen(id) -> map_get(cell_get(cell).seen, id),
-      memo_keep.see(id, s) -> {
-        let h = cell_get(cell);
-        cell_set(cell, { ..h, seen: map_insert(h.seen, id, s) })
-      },
-      memo_keep.readers(id) -> match map_get(cell_get(cell).readers, id) {
-        Some(ks) -> ks,
-        None -> [],
-      },
-      memo_keep.link(id, key) -> {
-        let h = cell_get(cell);
-        let ks = match map_get(h.readers, id) { Some(ks) -> ks, None -> [] };
-        if !contains(ks, key) {
-          cell_set(cell, { ..h, readers: map_insert(h.readers, id, push(ks, key)) })
-        }
-      },
-      memo_keep.marks(key) -> match map_get(cell_get(cell).marks, key) {
-        Some(ms) -> ms,
-        None -> [],
-      },
-      memo_keep.forget(key) -> {
-        let h = cell_get(cell);
-        cell_set(cell, {
-          ..h,
-          records: map_remove(h.records, key),
-          marks: map_remove(h.marks, key),
-        })
-      },
-      memo_keep.marked() ->
-        map_fold(cell_get(cell).marks, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
-          if len(ms) == 0 { acc } else { push(acc, k) }),
-      memo_keep.mark(key) -> {
-        let h = cell_get(cell);
-        let ms = match map_get(h.marks, key) { Some(ms) -> ms, None -> [] };
-        cell_set(cell, {
-          ..h,
-          marks: map_insert(h.marks, key, push(ms, bytes_of_string(int_to_string(h.minted)))),
-          minted: h.minted + 1,
-        })
-      },
-      memo_keep.unmark(key, gone) -> {
-        let h = cell_get(cell);
-        let ms = match map_get(h.marks, key) { Some(ms) -> ms, None -> [] };
-        cell_set(cell, {
-          ..h,
-          marks: map_insert(h.marks, key, filter(ms, |m: Bytes| !contains(gone, m))),
-        })
-      },
-      memo_keep.hold(_) -> true,
-      memo_keep.release(_) -> (),
-    };
-    { held: cell_get(cell), value: value }
-  } }
+      { held: cell_get(cell), value: value }
+    } }
+  }
 
 /// `work` run with no store of its own, asking `beside` as [`over_held`] does: each record it keeps
 /// lives only as long as the run.
@@ -1207,14 +1268,17 @@ test "a read that moved while its body ran leaves the record marked for the next
   assert_eq(next.executed, 1)
 }
 
-/// The files of a packed store that holds what `held` holds.
+/// The files of a packed store that holds what `held` holds, each answer kept as a store keeps it.
 fn packed_files(held: Held) -> Map<String, Bytes> / {abort.raise} =
-  map_fold(
-    held.outputs,
-    map_fold(held.records, map_new(), |acc: Map<String, Bytes>, k: Bytes, r: Record|
-      map_insert(acc, record_path(k), record_bytes(r))),
-    |acc: Map<String, Bytes>, d: Bytes, o: Bytes| map_insert(acc, output_path(d), o),
-  )
+  map_fold(held.records, map_new(), |acc: Map<String, Bytes>, k: Bytes, r: Record| {
+    let output = map_get(held.outputs, r.output);
+    let inline = match output { Some(o) -> kept_inline(o), None -> None };
+    let files = map_insert(acc, record_path(k), record_bytes(r, inline));
+    match ((output, inline)) {
+      (Some(o), None) -> map_insert(files, output_path(r.output), o),
+      _ -> files,
+    }
+  })
 
 test "a packed answer is taken where what it read answers as it did, and kept as the run's own" {
   let q = test_queries(b"h1");
@@ -1358,23 +1422,24 @@ test "a query asking for its own answer is refused" {
   assert_eq(try_answer(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
 }
 
-law "a record reads back as it was kept"
-  forall (r: Record) where r.height >= 0 {
-    record_from(record_bytes(r)) == Some(r)
+law "a record reads back as it was kept, with the answer it holds"
+  forall (r: Record, inline: Option<Bytes>) where r.height >= 0 {
+    let b = record_bytes(r, inline);
+    record_from(b) == Some(r) && inline_named(b) == inline
   }
 
-law "a record's first bytes name its answer"
-  forall (r: Record) where bytes_len(r.output) <= head_bytes() - 17 && r.height >= 0 {
-    let b = record_bytes(r);
-    output_named(
-        bytes_slice(b, 0, if bytes_len(b) < head_bytes() { bytes_len(b) } else { head_bytes() }),
-      )
-      == Some(r.output)
+law "a record's first bytes name its answer, and hold one it keeps inside"
+  forall (r: Record, o: Bytes) where bytes_len(r.output) <= 64 && r.height >= 0 {
+    let inline = kept_inline(o);
+    let b = record_bytes(r, inline);
+    let head = bytes_slice(b, 0, if bytes_len(b) < head_bytes() { bytes_len(b) }
+    else { head_bytes() });
+    output_named(head) == Some(r.output) && inline_named(head) == inline
   }
 
 law "bytes of another format read as no record"
-  forall (b: Bytes) where bytes_len(b) == 0 || bytes_at(b, 0) != 4 {
-    record_from(b) == None && output_named(b) == None
+  forall (b: Bytes) where bytes_len(b) == 0 || bytes_at(b, 0) != 5 {
+    record_from(b) == None && output_named(b) == None && inline_named(b) == None
   }
 
 law "a place's note reads back as it was noted"

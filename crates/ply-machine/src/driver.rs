@@ -104,10 +104,11 @@ pub fn load_over_analysis_taken(
     let mut sources = SourceMap::new();
     let mut files = Vec::with_capacity(handed.files.len());
     let mut shipped = Vec::new();
+    let ships = crate::shipped_modules::name_set();
     for file in handed.files {
         let path = PathBuf::from(&file.path);
         let source = sources.add(&path, file.text);
-        if crate::shipped_modules::ships(&ModuleName::from_dotted(&file.name)) {
+        if ships.contains(ModuleName::from_dotted(&file.name).as_str()) {
             shipped.push(source);
         }
         files.push(Found { path });
@@ -160,17 +161,24 @@ fn port_failed(why: &str) -> Diagnostic {
 /// Files in load order, then items as written; the port answers dependency-first.
 fn published_order(front: &Analysis) -> ply_eval::CheckOutput {
     let mut check = front.check.clone();
-    let mut defs = indexmap::IndexMap::with_capacity(check.defs.len());
+    let mut placed = vec![false; check.defs.len()];
+    let mut order = Vec::with_capacity(check.defs.len());
     for (_, items) in &front.ordinals {
         for item in items {
             if let ply_eval::Ordinal::Fn(name, _) = item
-                && let Some(info) = check.defs.shift_remove(name)
+                && let Some(at) = check.defs.get_index_of(name)
+                && !placed[at]
             {
-                defs.insert(name.clone(), info);
+                placed[at] = true;
+                order.push(at);
             }
         }
     }
-    defs.extend(check.defs.drain(..));
-    check.defs = defs;
+    order.extend((0..placed.len()).filter(|&at| !placed[at]));
+    let mut slots: Vec<Option<_>> = check.defs.drain(..).map(Some).collect();
+    check.defs = order
+        .into_iter()
+        .filter_map(|at| slots[at].take())
+        .collect();
     check
 }

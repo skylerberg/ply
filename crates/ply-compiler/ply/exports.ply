@@ -32,20 +32,44 @@ import types (canonical_scheme, Scheme)
 /// where `name` is empty.
 pub type Mention = { module: Bytes, name: Bytes }
 
-/// The items of one owner as an importer reads them: `text` is each printed alone, `imports` each
-/// import of the module that text needs, placed nowhere, `mentions` what that text names,
-/// `published` the functions its module publishes for an `opaque` type it declares, which only a
-/// refusal of a use of the type in another module names, and `rows` and `fixed` what its functions'
-/// checks and hashing published, which an importer takes in place of the bodies `text` leaves out.
+/// The items of one owner as an importer reads them: `reach` the digest of every entry its text
+/// reaches through what it mentions, its own among them, where the memo store answers it (empty
+/// elsewhere); `mentions` what their text names, `published` the functions its module publishes for
+/// an `opaque` type it declares, which only a refusal of a use of the type in another module names,
+/// `text` each printed alone, `imports` each import of the module that text needs, placed nowhere,
+/// and `rows` and `fixed` what its functions' checks and hashing published, which an importer takes
+/// in place of the bodies `text` leaves out. Its encoding starts with an [`EntryHead`].
 pub type Entry = {
+  reach: Bytes,
   owner: Bytes,
-  text: Bytes,
-  imports: List<ImportDecl>,
   mentions: List<Mention>,
   published: List<Mention>,
+  text: Bytes,
+  imports: List<ImportDecl>,
   rows: List<KnownDefRow>,
   fixed: List<Fixed>,
 }
+
+/// What a walk of the entries a check needs reads of one: its owner and what it names.
+pub type EntryHead = {
+  reach: Bytes,
+  owner: Bytes,
+  mentions: List<Mention>,
+  published: List<Mention>,
+}
+
+derive bin for EntryHead
+
+/// The head of the entry `b` encodes, read without the rest of it.
+pub fn entry_head(b: Bytes) -> EntryHead / {abort.raise} =
+  match entry_head_bin().take(b, 0) {
+    Ok(t) -> t.value,
+    Err(_) -> panic("an entry's bytes hold no head"),
+  }
+
+/// The head of `e`.
+pub fn head_of(e: Entry) -> EntryHead =
+  { reach: e.reach, owner: e.owner, mentions: e.mentions, published: e.published }
 
 /// Every name `module` declares, under each owner that declares it in one namespace or another, and
 /// each owner's entry.
@@ -159,7 +183,7 @@ fn scope_of(
     },
   )
 
-fn mention_key(m: Mention) -> Bytes = bytes_concat_all([m.module, b"\x00", m.name])
+pub fn mention_key(m: Mention) -> Bytes = bytes_concat_all([m.module, b"\x00", m.name])
 
 fn distinct(ms: List<Mention>) -> List<Mention> =
   map_fold(
@@ -536,6 +560,7 @@ pub fn exports_of(
         |m: Mention| !contains(mentions, m),
       );
       map_insert(acc, o, {
+        reach: b"",
         owner: o,
         text: printed,
         imports: map(imports_for(raw.imports, targets, mentions, runtimes_of(its)), unplaced),
@@ -645,21 +670,38 @@ pub fn needed_by<| e>(
   imported: List<Bytes>,
   published: Bool = false,
 ) -> Map<Bytes, Map<Bytes, Entry>> / {abort.raise | e} =
+  needed_through(entries, head_of, wanted, imported, published: published)
+
+/// [`needed_by`] over entries held as `head` reads them, each kept as `entries` answered it.
+pub fn needed_through<x | e>(
+  entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
+  head: (x) -> EntryHead,
+  wanted: List<Mention>,
+  imported: List<Bytes>,
+  published: Bool = false,
+) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} =
   iterate(
     {
-      out: fold(imported, map_new(), |acc: Map<Bytes, Map<Bytes, Entry>>, m: Bytes|
+      out: fold(imported, map_new(), |acc: Map<Bytes, Map<Bytes, x>>, m: Bytes|
         map_insert(acc, m, map_new())),
       asked: map_new(),
       work: wanted,
     },
     1000000,
-    |s: { out: Map<Bytes, Map<Bytes, Entry>>, asked: Map<Bytes, Bool>, work: List<Mention> }|
+    |s: { out: Map<Bytes, Map<Bytes, x>>, asked: Map<Bytes, Bool>, work: List<Mention> }|
       match s.work {
         [] -> Stop(s.out),
         [m, ..rest] -> if map_contains(s.asked, mention_key(m)) { Continue({ ..s, work: rest }) }
         else {
           let have = match map_get(s.out, m.module) { Some(h) -> h, None -> map_new() };
-          let fresh = filter(entries(m.module, m.name), |e: Entry| !map_contains(have, e.owner));
+          let fresh = fold(
+            entries(m.module, m.name),
+            [],
+            |acc: List<{ head: EntryHead, x: x }>, e: x| {
+              let h = head(e);
+              if map_contains(have, h.owner) { acc } else { push(acc, { head: h, x: e }) }
+            },
+          );
           let asked = map_insert(s.asked, mention_key(m), true);
           if len(fresh) == 0 {
             Continue({
@@ -673,11 +715,13 @@ pub fn needed_by<| e>(
               out: map_insert(
                 s.out,
                 m.module,
-                fold(fresh, have, |h: Map<Bytes, Entry>, e: Entry| map_insert(h, e.owner, e)),
+                fold(fresh, have, |h: Map<Bytes, x>, f: { head: EntryHead, x: x }|
+                  map_insert(h, f.head.owner, f.x)),
               ),
               asked: asked,
-              work: fold(fresh, rest, |w: List<Mention>, e: Entry|
-                concat(w, if published { concat(e.mentions, e.published) } else { e.mentions })),
+              work: fold(fresh, rest, |w: List<Mention>, f: { head: EntryHead, x: x }|
+                concat(w, if published { concat(f.head.mentions, f.head.published) }
+                else { f.head.mentions })),
             })
           }
         },
@@ -1072,16 +1116,44 @@ pub fn group_source<| e>(
   imported: List<Imported>,
   entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
   published: Bool = false,
-) -> OwnerSource / {abort.raise | e} = {
+) -> OwnerSource / {abort.raise | e} =
+  group_source_from(
+    module,
+    members,
+    imported,
+    group_needs(module, members, mentions, imported, entries, head_of, published: published),
+  )
+
+/// The entries a check of `members`, owners of `module` that check together, reads, as
+/// [`group_source`] walks them: by module, each as `entries` answered it, read through `head`.
+pub fn group_needs<x | e>(
+  module: Bytes,
+  members: List<OwnerRead>,
+  mentions: List<Mention>,
+  imported: List<Imported>,
+  entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
+  head: (x) -> EntryHead,
+  published: Bool = false,
+) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} = {
   let names = map(members, |o: OwnerRead| o.owner);
-  let own = join(fold(members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.texts)), b"\n\n");
-  let read = filter(mentions, |m: Mention| !(m.module == module && contains(names, m.name)));
-  let needed = needed_by(
+  needed_through(
     entries,
-    read,
+    head,
+    filter(mentions, |m: Mention| !(m.module == module && contains(names, m.name))),
     push(map(imported, |x: Imported| x.target), module),
     published: published,
-  );
+  )
+}
+
+/// [`group_source`] over the entries `needed` its walk found.
+pub fn group_source_from(
+  module: Bytes,
+  members: List<OwnerRead>,
+  imported: List<Imported>,
+  needed: Map<Bytes, Map<Bytes, Entry>>,
+) -> OwnerSource / {abort.raise} = {
+  let names = map(members, |o: OwnerRead| o.owner);
+  let own = join(fold(members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.texts)), b"\n\n");
   let siblings = match map_get(needed, module) {
     Some(es) -> fold(names, es, |acc: Map<Bytes, Entry>, n: Bytes| map_remove(acc, n)),
     None -> map_new(),
@@ -1092,6 +1164,7 @@ pub fn group_source<| e>(
     b"",
     merged_imports(
       push(held, {
+        reach: b"",
         owner: b"",
         text: own,
         imports: map(imported, |x: Imported| x.decl),
@@ -1385,6 +1458,19 @@ test "each module checked and hashed against the entries it reads of its imports
       assert_eq(f.rehashed, f.hashed)
     },
   )
+}
+
+test "an entry's head reads back from its bytes alone" {
+  let sources = [{ name: b"core", src: core_src() }, { name: b"shop", src: shop_src() }];
+  let whole = outcome(analyse_pulling_std_with(sources, [], [], []));
+  let entries = fold(range(0, len(whole.mods)), [], |acc: List<Entry>, i: Int|
+    fold(sources, acc, |a: List<Entry>, s: Source|
+      if at(whole.mods, i).name != s.name { a } else {
+        map_fold(exports_of(whole, i, s.src).entries, a, |b: List<Entry>, _: Bytes, e: Entry|
+          push(b, e))
+      }));
+  assert(len(entries) > 4);
+  for_all(entries, |e: Entry| assert_eq(entry_head(bin::encode(e, entry_bin())), head_of(e)))
 }
 
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =

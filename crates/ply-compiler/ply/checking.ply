@@ -12,23 +12,23 @@ import memo (memo, memo_keep, Held, Query, Run, Tally, answer, nothing_held, ove
              ran_for, started, tallies)
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
-                Reading, Mention, OwnerRead, OwnerSource, ItemAt, Imported, imported_bin,
+                Reading, Mention, OwnerRead, OwnerSource, ItemAt, Imported, EntryHead, imported_bin,
                 group_imports, checked_against, exports_of, hashes_by_owner, hash_owners,
                 named_node, needed_by, wanted_in, entry_bin, exports_bin, hash_entry_bin,
                 hashes_bin, placed_bin, mention_bin, owner_read_bin, module_scope, owner_reads,
-                owner_mentions, owner_groups, group_source, unplaced_imports, laid_items,
-                checked_owner)
+                owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
+                mention_key, unplaced_imports, laid_items, checked_owner)
 import owned
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedData, Rows,
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
-              known_def_row_bin, shipped_data_wanted, shipped_texts_wanted, rows_of, no_rows,
-              rows_bin, analyse, analyse_with, published, staged_pulling_std_with,
-              analyse_pulling_std_with, of_module, ModuleFacts, ModuleShape, ModuleTables, Frame,
-              TableReads, View, Outline, module_facts, no_shape, no_module_tables, module_shape_bin,
-              module_tables_bin, answered_program, answered_load, pulled_next, view_of,
-              functions_of, tests_of, view_over, view_dump, faceted, dump_of, walked_facts_bin,
-              squats, embedded_bin, shipped_data_bin, read_outline, named_imports, Outlined, OTest,
-              OLaw)
+              known_def_row_bin, shipped_wants_of, rows_of, no_rows, rows_bin, analyse,
+              analyse_with, published, staged_pulling_std_with, analyse_pulling_std_with, of_module,
+              ModuleFacts, ModuleShape, ModuleTables, Frame, TableReads, View, Outline,
+              module_facts, no_shape, no_module_tables, module_shape_bin, module_tables_bin,
+              answered_program, answered_load, pulled_next, view_of, functions_of, tests_of,
+              view_over, view_dump, faceted, dump_of, walked_facts_bin, squats, embedded_bin,
+              shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
+              shipped_wants_bin)
 import items (Module, ImportDecl, INames, header, parse, import_decl_bin, is_written)
 import derive (dotted)
 import diagnostics (parse_all, parse_at, parse_from, placed)
@@ -195,17 +195,30 @@ fn entries_of(
   asker_shipped: Bool,
   module: Bytes,
   name: Bytes,
-) -> List<Entry> / {memo.read, abort.raise} = {
-  let named = { module: module, shipped: shipped_for(asker_shipped, module), name: name };
-  map(
-    decoded(
-      memo.ask(entry_query(), bin::encode(named, entry_named_bin())),
-      bin::list_bin(bin::bytes_bin()),
-      "entries",
+) -> List<Entry> / {memo.read, abort.raise} =
+  map(entry_bytes_of(asker_shipped, module, name), |b: Bytes| decoded(b, entry_bin(), "an entry"))
+
+fn entry_bytes_of(
+  asker_shipped: Bool,
+  module: Bytes,
+  name: Bytes,
+) -> List<Bytes> / {memo.read, abort.raise} =
+  decoded(
+    memo.ask(
+      entry_query(),
+      bin::encode(
+        { module: module, shipped: shipped_for(asker_shipped, module), name: name },
+        entry_named_bin(),
+      ),
     ),
-    |b: Bytes| decoded(b, entry_bin(), "an entry"),
+    bin::list_bin(bin::bytes_bin()),
+    "entries",
   )
-}
+
+/// An entry as a group's walk holds it: its head, beside its bytes, which only a check decodes.
+type HeldEntry = { head: EntryHead, bytes: Bytes }
+
+fn held_entry(b: Bytes) -> HeldEntry / {abort.raise} = { head: entry_head(b), bytes: b }
 
 // --- The queries ----------------------------------------------------------------------------
 
@@ -288,17 +301,14 @@ fn module_read(asked: Named) -> Option<ModuleRead> / {memo.read, abort.raise} = 
           { ..e, read: read }
         })
       };
-      let whole = if !shipped { [] } else {
-        fold(shipped_texts_wanted(source), [], |acc: List<Source>, n: Bytes|
-          match shipped_text(n) { Some(t) -> push(acc, { name: n, src: t }), None -> acc })
-      };
-      let data = if !shipped { [] } else {
-        fold(shipped_data_wanted(source), [], |acc: List<ShippedData>, n: Bytes|
-          match memo.world(data_kind(), n) {
-            Some(b) -> push(acc, { name: n, bytes: b }),
-            None -> acc,
-          })
-      };
+      let wants = if shipped { shipped_wants_of(source, raw) } else { { texts: [], data: [] } };
+      let whole = fold(wants.texts, [], |acc: List<Source>, n: Bytes|
+        match shipped_text(n) { Some(t) -> push(acc, { name: n, src: t }), None -> acc });
+      let data = fold(wants.data, [], |acc: List<ShippedData>, n: Bytes|
+        match memo.world(data_kind(), n) {
+          Some(b) -> push(acc, { name: n, bytes: b }),
+          None -> acc,
+        });
       Some({
         source: source,
         raw: raw,
@@ -464,6 +474,8 @@ pub fn context_query() -> Bytes = b"context"
 pub fn setting_query() -> Bytes = b"setting"
 
 pub fn group_imports_query() -> Bytes = b"group imports"
+
+pub fn wants_query() -> Bytes = b"wants"
 
 pub fn declared_query() -> Bytes = b"declared"
 
@@ -649,6 +661,19 @@ pub fn setting_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   }
 }
 
+/// What a module embeds of the shipped modules, read as `Named` says: what a load ships beside the
+/// shipped modules it pulls, read off the module's setting rather than its text.
+pub fn wants_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let setting = decoded(memo.ask(setting_query(), input), setting_bin(), "a module's setting");
+  bin::encode(
+    {
+      texts: map(setting.whole, |s: Source| s.name),
+      data: map(setting.data, |d: ShippedData| d.name),
+    },
+    shipped_wants_bin(),
+  )
+}
+
 /// What a group of a module's owners reads of the module's imports, read as `GroupNamed` says.
 pub fn group_imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, group_named_bin(), "a group's names");
@@ -775,46 +800,117 @@ fn owner_facts(named: Named, owner: Bytes) -> OwnerFacts / {memo.read, abort.rai
 pub fn group_answer_of(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, group_named_bin(), "a group's names");
   if !current(asked) { bin::encode(owned::no_group(), owned::group_answer_bin()) } else {
-    let first = group_check_of(asked, false);
     match memo.offered() {
-      Some(o) -> o,
+      Some(o) -> {
+        group_reads_of(asked);
+        o
+      },
       None -> {
-        let checked_of = |c: GroupCheck|
-          checked_owner(c.source, c.setting.placed, placing_in(c.places), reading_of(c.setting));
+        let first = group_check_of(asked, false);
+        let checked_of = |c: GroupCheck| {
+          let source = group_source_of(asked, c);
+          {
+            source: source,
+            out: checked_owner(
+              source,
+              c.setting.placed,
+              placing_in(c.places),
+              reading_of(c.setting),
+            ),
+          }
+        };
         let out = checked_of(first);
         // What an `opaque` type's module publishes for it only says why a use of it is refused.
-        let c = match out.pulled.out {
-          Analysed(_) -> { check: first, out: out },
-          Refused(_) -> {
-            let wider = group_check_of(asked, true);
-            { check: wider, out: checked_of(wider) }
-          },
+        let c = match out.out.pulled.out {
+          Analysed(_) -> out,
+          Refused(_) -> checked_of(group_check_of(asked, true)),
         };
-        bin::encode(
-          owned::group_answer(
-            c.out.pulled.out,
-            c.out.at,
-            c.check.source.source.src,
-            asked.module,
-            first.reads,
-            c.check.source.items,
-            |x: ItemAt| c.check.source.offset + x.from,
-          ),
-          owned::group_answer_bin(),
-        )
+        let answer = owned::group_answer(
+          c.out.pulled.out,
+          c.out.at,
+          c.source.source.src,
+          asked.module,
+          first.reads,
+          c.source.items,
+          |x: ItemAt| c.source.offset + x.from,
+        );
+        offered_from(asked, first.reads, answer);
+        bin::encode(answer, owned::group_answer_bin())
       },
     }
   }
 }
 
-/// What a check of a group of owners reads: the source it checks, where each module it reads
-/// stands, what else it reads of its module, and its members as their module writes them.
+/// What a check of the group `asked` stands on, read without checking it: what a group whose answer
+/// a check of its whole module offered reads. Each entry it names carries the digest of all the
+/// entry reaches, so the entries those name are not read.
+fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
+  let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
+  memo.ask(setting_query(), bin::encode(named, named_bin()));
+  let imported = decoded(
+    memo.ask(group_imports_query(), bin::encode(asked, group_named_bin())),
+    bin::list_bin(imported_bin()),
+    "a group's imports",
+  );
+  let targets = push(map(imported, |x: Imported| x.target), asked.module);
+  let mentions = fold(asked.owners, [], |acc: List<Mention>, o: Bytes|
+    concat(acc, owner_facts(named, o).mentions));
+  let modules = fold(mentions, map_new(), |acc: Map<Bytes, Bool>, m: Mention|
+    if m.module == asked.module {
+      if !contains(asked.owners, m.name) {
+        fold(declared_of(m.module, asked.shipped, m.name), (), |_: Unit, o: Bytes|
+          if !contains(asked.owners, o) {
+            memo.ask(
+              owner_entry_query(),
+              bin::encode(
+                { module: m.module, shipped: asked.shipped, tested: false, owner: o },
+                owner_named_bin(),
+              ),
+            );
+            ()
+          })
+      };
+      acc
+    } else {
+      if len(entry_bytes_of(asked.shipped, m.module, m.name)) == 0 && !contains(targets, m.module) {
+        entry_bytes_of(asked.shipped, m.module, b"");
+        ()
+      };
+      map_insert(acc, m.module, true)
+    });
+  places_of(asked.shipped, map_keys(modules));
+  ()
+}
+
+/// What a check of a group of owners reads: the entries it needs, by module and owner, where each
+/// module it reads stands, what else it reads of its module, and its members as their module writes
+/// them.
 type GroupCheck = {
-  source: OwnerSource,
+  needed: Map<Bytes, Map<Bytes, HeldEntry>>,
+  imported: List<Imported>,
   places: Map<Bytes, Placed>,
   setting: Setting,
   reads: List<OwnerRead>,
 }
+
+/// The source a check of the group `asked` reads, as `c` holds what it reads.
+fn group_source_of(asked: GroupNamed, c: GroupCheck) -> OwnerSource / {abort.raise} =
+  group_source_from(
+    asked.module,
+    c.reads,
+    c.imported,
+    map_fold(
+      c.needed,
+      map_new(),
+      |acc: Map<Bytes, Map<Bytes, Entry>>, m: Bytes, es: Map<Bytes, HeldEntry>|
+        map_insert(
+          acc,
+          m,
+          map_fold(es, map_new(), |a: Map<Bytes, Entry>, o: Bytes, e: HeldEntry|
+            map_insert(a, o, decoded(e.bytes, entry_bin(), "an entry"))),
+        ),
+    ),
+  )
 
 /// What a check of the group `asked` reads, with what the modules of `opaque` types it names
 /// publish for them where `published` says.
@@ -836,30 +932,31 @@ fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {memo.read
   // it, by its own entry.
   let entries = |module: Bytes, n: Bytes|
     if module == asked.module {
-      fold(declared_of(module, asked.shipped, n), [], |acc: List<Entry>, o: Bytes|
+      fold(declared_of(module, asked.shipped, n), [], |acc: List<HeldEntry>, o: Bytes|
         if contains(asked.owners, o) { acc } else {
-          match owner_entry_of({
-              module: module,
-              shipped: asked.shipped,
-              tested: false,
-              owner: o,
-            }) {
-            Some(e) -> push(acc, e),
-            None -> acc,
-          }
+          let e = memo.ask(
+            owner_entry_query(),
+            bin::encode(
+              { module: module, shipped: asked.shipped, tested: false, owner: o },
+              owner_named_bin(),
+            ),
+          );
+          if bytes_len(e) == 0 { acc } else { push(acc, held_entry(e)) }
         })
-    } else { entries_of(asked.shipped, module, n) };
-  let source = group_source(
+    } else { map(entry_bytes_of(asked.shipped, module, n), held_entry) };
+  let needed = group_needs(
     asked.module,
     reads,
     fold(members, [], |acc: List<Mention>, f: OwnerFacts| concat(acc, f.mentions)),
     imported,
     entries,
+    |e: HeldEntry| e.head,
     published: published,
   );
   {
-    source: source,
-    places: places_of(asked.shipped, map_keys(source.deps)),
+    needed: needed,
+    imported: imported,
+    places: places_of(asked.shipped, filter(map_keys(needed), |m: Bytes| m != asked.module)),
     setting: setting,
     reads: reads,
   }
@@ -898,9 +995,121 @@ fn group_of(g: GroupNamed) -> owned::GroupAnswer / {memo.read, abort.raise} =
 /// a law, or an owner whose group refuses.
 pub fn owner_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, owner_named_bin(), "an owner's name");
-  fold(group_of(group_named_of(asked)).members, b"", |acc: Bytes, m: owned::MemberAnswer|
-    if m.owner != asked.owner { acc }
-    else { match m.entry { Some(e) -> bin::encode(e, entry_bin()), None -> acc } })
+  let g = group_named_of(asked);
+  let answer = memo.ask(group_query(), bin::encode(g, group_named_bin()));
+  let alone = match memo.offered() {
+    Some(o) -> o,
+    None -> entry_in(decoded(answer, owned::group_answer_bin(), "a group's answer"), asked.owner),
+  };
+  if bytes_len(alone) == 0 { b"" } else {
+    let e = decoded(alone, entry_bin(), "an entry");
+    bin::encode({ ..e, reach: reach_of(asked, g, e, answer) }, entry_bin())
+  }
+}
+
+/// A walk of what an entry reaches: the entries of its own group it reaches, by owner, and the digest
+/// each other entry it names reaches, or whether a module it names that declares nothing so named
+/// declares anything at all.
+type Reached = {
+  local: Map<Bytes, Entry>,
+  outside: Map<Bytes, Bytes>,
+  seen: Map<Bytes, Bool>,
+  work: List<Mention>,
+  members: Option<List<owned::MemberAnswer>>,
+}
+
+/// The digest of every entry `e`, the entry of `asked` in the group `g` that answered `answer`,
+/// reaches through what it mentions, and of where its module stands: those of its own group as the
+/// answer shows them, and each other one by its own `reach`. An edit moves it exactly where it moves
+/// one of those entries, so a check that reads an entry need not read what the entry reaches.
+fn reach_of(
+  asked: OwnerNamed,
+  g: GroupNamed,
+  e: Entry,
+  answer: Bytes,
+) -> Bytes / {memo.read, abort.raise} = {
+  let walked = iterate(
+    {
+      local: map_insert(map_new(), asked.owner, e),
+      outside: map_new(),
+      seen: map_new(),
+      work: e.mentions,
+      members: None,
+    },
+    1000000,
+    |s: Reached|
+      match s.work {
+        [] -> Stop(s),
+        [m, ..rest] -> if map_contains(s.seen, mention_key(m)) { Continue({ ..s, work: rest }) }
+        else {
+          let at = { ..s, seen: map_insert(s.seen, mention_key(m), true), work: rest };
+          Continue(if m.module == asked.module {
+            fold(declared_of(m.module, asked.shipped, m.name), at, |acc: Reached, o: Bytes|
+              if map_contains(acc.local, o) { acc } else if contains(g.owners, o) {
+                let members = match acc.members {
+                  Some(ms) -> ms,
+                  None -> decoded(answer, owned::group_answer_bin(), "a group's answer").members,
+                };
+                let found = fold(members, None, |x: Option<Entry>, mb: owned::MemberAnswer|
+                  if mb.owner == o { mb.entry } else { x });
+                match found {
+                  Some(x) ->
+                    {
+                      ..acc,
+                      members: Some(members),
+                      local: map_insert(acc.local, o, x),
+                      work: concat(acc.work, x.mentions),
+                    },
+                  None -> { ..acc, members: Some(members) },
+                }
+              } else {
+                let b = memo.ask(
+                  owner_entry_query(),
+                  bin::encode(
+                    { module: m.module, shipped: asked.shipped, tested: false, owner: o },
+                    owner_named_bin(),
+                  ),
+                );
+                if bytes_len(b) == 0 { acc }
+                else { { ..acc, outside: map_insert(acc.outside, o, entry_head(b).reach) } }
+              })
+          } else {
+            let found = entry_bytes_of(asked.shipped, m.module, m.name);
+            if len(found) == 0 {
+              let any = len(entry_bytes_of(asked.shipped, m.module, b"")) > 0;
+              {
+                ..at,
+                outside: map_insert(at.outside, bytes_concat(b"there ", m.module), if any { b"1" }
+                else { b"" }),
+              }
+            } else {
+              fold(found, at, |acc: Reached, b: Bytes| {
+                let h = entry_head(b);
+                {
+                  ..acc,
+                  outside: map_insert(
+                    acc.outside,
+                    bytes_concat_all([m.module, b".", h.owner]),
+                    h.reach,
+                  ),
+                }
+              })
+            }
+          })
+        },
+      },
+  );
+  blake3(
+    bin::encode(
+      [
+        if asked.shipped { b"" }
+        else { bin::encode(placed_by(placing_of(asked.module)), placed_bin()) },
+        bin::encode(walked.local, bin::map_bin(bin::bytes_bin(), entry_bin())),
+        bin::encode(walked.outside, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
+      ],
+      bin::list_bin(bin::bytes_bin()),
+    ),
+  )
 }
 
 /// The entry an owner shows what reads it, read as `OwnerNamed` says: none for a test, a law, or an
@@ -982,14 +1191,14 @@ fn offered_whole(
               Some(f) -> f.read,
               None -> panic("a group's owner is the module's"),
             });
+          let answer = owned::said_group(said, module, members, laid_items(members), |x: ItemAt|
+            x.to);
           memo.offer(
             group_query(),
             bin::encode(g, group_named_bin()),
-            bin::encode(
-              owned::said_group(said, module, members, laid_items(members), |x: ItemAt| x.to),
-              owned::group_answer_bin(),
-            ),
-          )
+            bin::encode(answer, owned::group_answer_bin()),
+          );
+          offered_from(g, members, answer)
         })
       },
     }
@@ -1280,17 +1489,53 @@ derive bin for GroupForms
 pub fn group_forms_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, group_named_bin(), "a group's names");
   let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
+  if !current(asked) {
+    bin::encode({ forms: owned::no_group().forms, fns: map_new() }, group_forms_bin())
+  } else {
+    let answer = memo.ask(group_query(), input);
+    let reads = map(asked.owners, |o: Bytes| owner_facts(named, o).read);
+    match memo.offered() {
+      Some(o) -> o,
+      None -> forms_of(reads, decoded(answer, owned::group_answer_bin(), "a group's answer")),
+    }
+  }
+}
+
+/// What hashing reads of `a`, the answer of a group whose members read as `reads`.
+fn forms_of(reads: List<OwnerRead>, a: owned::GroupAnswer) -> Bytes / {abort.raise} =
   bin::encode(
-    if !current(asked) { { forms: owned::no_group().forms, fns: map_new() } } else {
-      {
-        forms: group_of(asked).forms,
-        fns: fold(asked.owners, map_new(), |acc: Map<Bytes, Bytes>, o: Bytes|
-          fold(owner_facts(named, o).read.names, acc, |a: Map<Bytes, Bytes>, n: Bytes|
-            map_insert(a, n, o))),
-      }
+    {
+      forms: a.forms,
+      fns: fold(reads, map_new(), |acc: Map<Bytes, Bytes>, r: OwnerRead|
+        fold(r.names, acc, |m: Map<Bytes, Bytes>, n: Bytes| map_insert(m, n, r.owner))),
     },
     group_forms_bin(),
   )
+
+/// The entry `a`, a group's answer, shows of `owner`, encoded: empty for none.
+fn entry_in(a: owned::GroupAnswer, owner: Bytes) -> Bytes / {abort.raise} =
+  fold(a.members, b"", |acc: Bytes, m: owned::MemberAnswer|
+    if m.owner != owner { acc }
+    else { match m.entry { Some(e) -> bin::encode(e, entry_bin()), None -> acc } })
+
+/// Offers what the projections of `a`, the answer of the group `g` whose members read as `reads`,
+/// answer: each member's entry and what hashing reads of the group, which a run asking them next
+/// then takes without decoding the answer again.
+fn offered_from(
+  g: GroupNamed,
+  reads: List<OwnerRead>,
+  a: owned::GroupAnswer,
+) -> Unit / {memo.read, abort.raise} = {
+  fold(g.owners, (), |_: Unit, o: Bytes|
+    memo.offer(
+      owner_entry_query(),
+      bin::encode(
+        { module: g.module, shipped: g.shipped, tested: g.tested, owner: o },
+        owner_named_bin(),
+      ),
+      entry_in(a, o),
+    ));
+  memo.offer(group_forms_query(), bin::encode(g, group_named_bin()), forms_of(reads, a))
 }
 
 fn group_hashes_of(g: GroupNamed) -> GroupHashes / {memo.read, abort.raise} =
@@ -1345,6 +1590,7 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
     { name: group_of_query(), definition: b"checking.group_of_answer", body: group_of_answer },
     { name: context_query(), definition: b"checking.context_answer", body: context_answer },
     { name: setting_query(), definition: b"checking.setting_answer", body: setting_answer },
+    { name: wants_query(), definition: b"checking.wants_answer", body: wants_answer },
     {
       name: group_imports_query(),
       definition: b"checking.group_imports_answer",
@@ -1683,7 +1929,7 @@ fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
 /// make again: the module read for its owners, each group's check and hashing, and the module's
 /// answer and hashing put together. What one owner or one name answers is read off those.
 pub fn shipped_queries() -> List<Bytes> =
-  [owners_query(), group_query(), group_hash_query(), module_query(), hashes_query()]
+  [owners_query(), group_query(), group_hash_query(), module_query(), hashes_query(), wants_query()]
 
 /// What a load asks of each of `shipped`, the shipped modules, of `qs` over a run: its answer and its
 /// hashing, which ask all the rest.
@@ -1698,9 +1944,34 @@ pub fn shipped_all(
     map(shipped, |m: Bytes| { module: m, shipped: true, tested: false }),
   );
   fold(ordered.order, ordered.run, |r: Run, named: Named|
-    fold([module_query(), hashes_query()], r, |at: Run, query: Bytes|
+    fold([module_query(), hashes_query(), wants_query()], r, |at: Run, query: Bytes|
       answer(qs, at, query, bin::encode(named, named_bin())).run))
 }
+
+/// What each of `pulled`, shipped modules a load pulled, read with their tests where `tested` says,
+/// embeds of the shipped modules, asked of `qs` over a run, by module.
+pub fn wanted_all(
+  qs: Map<Bytes, Query>,
+  pulled: List<Bytes>,
+  tested: Bool,
+  run: Run,
+) -> { run: Run, value: Map<Bytes, ShippedWants> } / {memo_keep.read, memo_keep.write, abort.raise} =
+  fold(
+    pulled,
+    { run: run, value: map_new() },
+    |acc: { run: Run, value: Map<Bytes, ShippedWants> }, m: Bytes| {
+      let a = answer(
+        qs,
+        acc.run,
+        wants_query(),
+        bin::encode({ module: m, shipped: true, tested: tested }, named_bin()),
+      );
+      {
+        run: a.run,
+        value: map_insert(acc.value, m, decoded(a.output, shipped_wants_bin(), "a module's wants")),
+      }
+    },
+  )
 
 /// `modules` in an order that has each after those of them it imports, as each one's imports say,
 /// the rest in the order they came: a module answered before what reads it is checked whole, not a
@@ -2091,18 +2362,20 @@ fn sorted_bytes(xs: List<Bytes>) -> List<Bytes> =
 fn group_inputs_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, group_named_bin(), "a group's names");
   if !current(asked) { b"" } else {
-    let of = |c: GroupCheck|
+    let of = |c: GroupCheck| {
+      let source = group_source_of(asked, c);
       bytes_concat_all([
-        bin::encode(c.source.source.src, bin::bytes_bin()),
+        bin::encode(source.source.src, bin::bytes_bin()),
         bin::encode(
-          c.source.deps,
+          source.deps,
           bin::map_bin(bin::bytes_bin(), bin::map_bin(bin::bytes_bin(), entry_bin())),
         ),
-        bin::encode(c.source.rows, bin::list_bin(known_def_row_bin())),
-        bin::encode(c.source.fixed, bin::list_bin(fixed_bin())),
+        bin::encode(source.rows, bin::list_bin(known_def_row_bin())),
+        bin::encode(source.fixed, bin::list_bin(fixed_bin())),
         bin::encode(c.setting, setting_bin()),
         bin::encode(c.places, bin::map_bin(bin::bytes_bin(), placed_bin())),
-      ]);
+      ])
+    };
     let refused = len(group_of(asked).refused) > 0;
     blake3(
       bytes_concat(of(group_check_of(asked, false)), if refused { of(group_check_of(asked, true)) }
