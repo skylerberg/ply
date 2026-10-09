@@ -19,7 +19,7 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
                 mention_key, unplaced_imports, laid_items, checked_owner)
 import owned
-import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedData, Rows,
+import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
               known_def_row_bin, shipped_wants_of, rows_of, no_rows, rows_bin, analyse,
               analyse_with, published, staged_pulling_std_with, analyse_pulling_std_with, of_module,
@@ -31,7 +31,7 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Embedded, ShippedDat
               shipped_wants_bin)
 import items (Module, Item, IType, ImportDecl, INames, header, parse, import_decl_bin, is_written)
 import derive (dotted)
-import diagnostics (parse_all, parse_at, parse_from, placed)
+import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
 import embed (EmbedFile, EmbedRead, EmbedWant, ItemWants, embed_key, want_of_key, wants_by_item)
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token, package_sources_bin)
@@ -451,6 +451,7 @@ pub type OwnersAnswer = {
   order: List<Bytes>,
   wanted: List<Mention>,
   publishing: Map<Bytes, List<Mention>>,
+  refusing: Bool,
 }
 
 /// What hashing fixed of a group of owners: each owner's hash entry, and each node, test and law.
@@ -530,7 +531,7 @@ fn reading_of(c: Setting) -> Reading =
 
 /// The modules `m`'s imports resolve to, hidden ones among them, each once: what a load reads of
 /// what the module imports.
-fn resolved_imports(m: ModuleRead) -> List<Bytes> / {abort.raise} =
+fn resolved_imports(m: ModuleRead) -> List<Bytes> =
   fold(
     concat(m.names, map(drop(m.parsed.module.imports, len(m.raw.imports)), dotted)),
     [],
@@ -555,6 +556,7 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         order: [],
         wanted: [],
         publishing: map_new(),
+        refusing: false,
       },
     Some(m) -> {
       let module = m.source.name;
@@ -641,6 +643,8 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
               _ -> acc,
             },
         ),
+        refusing: fold(m.reading.given, false, |b: Bool, g: ParsedSource|
+          b || fold(g.diags, false, |c: Bool, d: Diag| c || d.severity == b"error")),
       }
     },
   };
@@ -1221,28 +1225,16 @@ fn offered_whole(
   named: Named,
   read: OwnersAnswer,
   groups: List<GroupNamed>,
-) -> Unit / {memo.read, abort.raise} = {
+) -> Option<List<Diag>> / {memo.read, abort.raise} = {
   let missing = filter(groups, |g: GroupNamed|
     !memo.kept(group_query(), bin::encode(g, group_named_bin())));
   // A module with any group kept is checked a group at a time: an edit costs the groups it moves.
-  if len(missing) > 1 && len(missing) == len(groups) {
+  if !(len(missing) > 1 && len(missing) == len(groups)) { None } else {
     let facts = facts_of(read);
     let module = named.module;
-    let deps = needed_by(
-      |d: Bytes, n: Bytes| entries_of(named.shipped, d, n),
-      read.wanted,
-      read.context.present,
-    );
-    let places = places_of(named.shipped, map_keys(deps));
-    let checked = checked_against(
-      { name: module, src: read.text },
-      read.context.setting.placed,
-      deps,
-      placing_in(places),
-      reading_of(read.context.setting),
-    );
+    let checked = checked_whole(named, read);
     match checked.pulled.out {
-      Refused(_) -> (),
+      Refused(ds) -> Some(map(ds, |d: Diag| own_labels(d, checked.at))),
       Analysed(w) -> {
         let said = owned::said_of(w, checked.at, read.text);
         fold(missing, (), |_: Unit, g: GroupNamed| {
@@ -1259,11 +1251,39 @@ fn offered_whole(
             bin::encode(answer, owned::group_answer_bin()),
           );
           offered_from(g, members, answer)
-        })
+        });
+        None
       },
     }
   }
 }
+
+/// `read`, a module read as `named` says, checked whole against the entries it names.
+fn checked_whole(
+  named: Named,
+  read: OwnersAnswer,
+) -> { pulled: Pulled, at: Int } / {memo.read, abort.raise} = {
+  let deps = needed_by(
+    |d: Bytes, n: Bytes| entries_of(named.shipped, d, n),
+    read.wanted,
+    read.context.present,
+  );
+  checked_against(
+    { name: named.module, src: read.text },
+    read.context.setting.placed,
+    deps,
+    placing_in(places_of(named.shipped, map_keys(deps))),
+    reading_of(read.context.setting),
+  )
+}
+
+/// `d` with only its labels into the module at `at`, each moved to module 0.
+fn own_labels(d: Diag, at: Int) -> Diag =
+  {
+    ..d,
+    labels: fold(d.labels, [], |acc: List<Label>, l: Label|
+      if l.module == at { push(acc, { ..l, module: 0 }) } else { acc }),
+  }
 
 /// What a module answers checked, read as `Named` says: its groups' answers put together.
 pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
@@ -1272,42 +1292,18 @@ pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   bin::encode(
     if !read.found { absent(named.module) } else {
       let groups = groups_named(named, read);
-      offered_whole(named, read, groups);
+      let offered = offered_whole(named, read, groups);
       let facts = facts_of(read);
-      let answers = map(groups, |g: GroupNamed| { group: g, answer: group_of(g) });
-      let refusing = fold(
-        answers,
-        map_new(),
-        |acc: Map<Bytes, Bool>, x: { group: GroupNamed, answer: owned::GroupAnswer }|
-          if len(x.answer.refused) == 0 { acc } else {
-            fold(x.group.owners, acc, |a: Map<Bytes, Bool>, o: Bytes| map_insert(a, o, true))
-          },
-      );
-      // A group that reads an owner whose group refuses is refused by that refusal, which explains
-      // its own: as a module's refusal explains those of the modules that import it.
-      let explained = |g: GroupNamed|
-        fold(g.owners, false, |b: Bool, o: Bytes|
-          b
-            || (match map_get(facts, o) {
-              Some(f) ->
-                fold(f.mentions, false, |c: Bool, m: Mention|
-                  c
-                    || (m.module == named.module
-                    && fold(declared_in(read, m.name), false, |d: Bool, x: Bytes|
-                      d || (map_contains(refusing, x) && !contains(g.owners, x))))),
-              None -> false,
-            }));
-      let placed = map(answers, |x: { group: GroupNamed, answer: owned::GroupAnswer }|
+      let placed = map(groups, |g: GroupNamed|
         {
           items: laid_items(
-            map(x.group.owners, |o: Bytes|
+            map(g.owners, |o: Bytes|
               match map_get(facts, o) {
                 Some(f) -> f.read,
                 None -> panic("a group's owner is the module's"),
               }),
           ),
-          answer: if len(x.answer.refused) > 0 && explained(x.group) { { ..x.answer, refused: [] } }
-          else { x.answer },
+          answer: group_of(g),
         });
       let a = owned::assembled(
         named.module,
@@ -1321,10 +1317,25 @@ pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         bin::list_bin(diag_bin()),
         "a header's refusals",
       );
-      if len(a.refused) > 0 || len(header) > 0 {
+      // A module whose text or any group refuses says what a check of it whole says, which names
+      // each error once and none another explains.
+      let refused = if !read.refusing && len(a.refused) == 0 { header } else {
+        let whole = match offered {
+          Some(ds) -> ds,
+          None -> {
+            let checked = checked_whole(named, read);
+            match checked.pulled.out {
+              Refused(ds) -> map(ds, |d: Diag| own_labels(d, checked.at)),
+              Analysed(_) -> [],
+            }
+          },
+        };
+        if len(whole) > 0 { whole } else { concat(header, a.refused) }
+      };
+      if len(refused) > 0 {
         {
           ..absent(named.module),
-          refused: concat(header, a.refused),
+          refused: refused,
           imports: read.context.present,
           shape: { ..no_shape(named.module), written: read.shape.written },
         }
@@ -2351,7 +2362,7 @@ fn nothing_embedded(package: Int, module: Bytes, want: EmbedWant) -> EmbedRead =
 fn answered_over(
   held: Held,
   sources: List<Source>,
-) -> { held: Held, run: Run, outcome: AnalysisOutcome } / {abort.raise} = {
+) -> { held: Held, run: Run, outcome: AnalysisOutcome, fixing: Fixing } / {abort.raise} = {
   let w = world_of(
     { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
     [],
@@ -2364,10 +2375,11 @@ fn answered_over(
     || {
       let qs = fresh_registry();
       let all = asked_all(qs, w.own, [], false, started(qs));
-      {
-        run: if len(refused_first(all.value.answers)) > 0 { all.run }
-        else { hashed_all(qs, w.own, all.value.pulled, false, all.run).run },
-        answers: all.value.answers,
+      if len(refused_first(all.value.answers)) > 0 {
+        { run: all.run, answers: all.value.answers, fixing: no_fixing() }
+      } else {
+        let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
+        { run: fixed.run, answers: all.value.answers, fixing: fixed.value }
       }
     },
   );
@@ -2375,6 +2387,7 @@ fn answered_over(
   {
     held: done.held,
     run: done.value.run,
+    fixing: done.value.fixing,
     outcome: match refused_first(answers) {
       [] ->
         analyse_with(
@@ -2407,7 +2420,7 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       let now = said(warm.outcome);
       let whole = said(analyse(parse_all(step.sources)));
       let fresh = answered_over(nothing_held(), step.sources);
-      let agrees = now == said(fresh.outcome)
+      let agrees = now == said(fresh.outcome) && warm.fixing == fresh.fixing
         && (match whole {
           Publishing(_) -> now == whole,
           Refusing(_) -> match now { Refusing(_) -> true, Publishing(_) -> false },
@@ -2444,7 +2457,9 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         held: warm.held,
         inputs: inputs,
         hashes: hashes,
-        off: if !agrees { push(s.off, step.what) } else if off_by(s.inputs, inputs, group_query()) {
+        off: if !agrees {
+          push(s.off, bytes_concat_all([step.what, fixing_apart(warm.fixing, fresh.fixing)]))
+        } else if off_by(s.inputs, inputs, group_query()) {
           push(s.off, bytes_concat(step.what, b" (work)"))
         } else if off_by(s.hashes, now_hashes, group_hash_query()) {
           push(s.off, bytes_concat(step.what, b" (hash work)"))
@@ -2452,6 +2467,19 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       }
     },
   ).off
+
+/// Where `warm`'s hashing and `fresh`'s part: each node either fixes otherwise, by name.
+fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes / {abort.raise} = {
+  let by = |f: Fixing|
+    fold(f.nodes, map_new(), |acc: Map<Bytes, Bytes>, x: Fixed| map_insert(acc, x.name, x.hash));
+  let w = by(warm);
+  let c = by(fresh);
+  let names = sorted_bytes(
+    map_keys(map_fold(w, c, |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes| map_insert(acc, k, v))),
+  );
+  let apart = filter(names, |n: Bytes| map_get(w, n) != map_get(c, n));
+  if len(apart) == 0 { b"" } else { bytes_concat_all([b" (hashes of ", join(apart, b", "), b")"]) }
+}
 
 fn sorted_bytes(xs: List<Bytes>) -> List<Bytes> =
   sort_by(xs, |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true })
@@ -2985,6 +3013,29 @@ test "reordering, relabelling and re-exporting leave an answer through the store
   )
 }
 
+// `said` reads `say`, whose module refuses while its body panics, so its module is checked a group
+// at a time when it comes back; its test is labelled as it is named, and hashes apart from it.
+test "a test labelled as the function it tests hashes apart from it, through a refusal and back" {
+  let s0 = [
+    {
+      name: b"lib",
+      src: b"pub effect log {\n  write emit(Bytes) -> Unit\n  read peek() -> Int\n}\n\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
+    },
+    {
+      name: b"app",
+      src: b"import lib\n\npub fn said() -> Int =\n  handle {\n    lib::say(b\"a\");\n    2\n  } with {\n    lib::log.emit(_) -> (),\n  }\n\ntest \"said\" {\n  assert_eq(said(), 2)\n}\n",
+    },
+  ];
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a body that now panics", edited(s0, b"lib", b"= log.emit(b)", b"= panic(\"x\")")),
+      step(b"and undone", s0),
+    ]),
+    [],
+  )
+}
+
 test "edits undone, modules renamed and files emptied leave an answer through the store the fresh one" {
   let s0 = shop();
   let leaf2 = b"pub fn one() -> Int = 1\npub fn two() -> Int = one() + 1\n";
@@ -3286,10 +3337,6 @@ fn fixed_over(
   }
 }
 
-fn told(ds: List<Diag>) -> List<Bytes> =
-  sort_by(map(ds, |d: Diag| bytes_concat_all([d.code, b": ", d.message])), |a: Bytes, b: Bytes|
-    match compare_values(a, b) { Greater -> false, _ -> true })
-
 /// Cycles, an effect, a specification, a law, a cost, a test over cases and an `opaque` type, across
 /// modules.
 fn hashed_fixture() -> List<Source> =
@@ -3314,7 +3361,7 @@ test "a program hashed from its modules' answers hashes as it does hashed whole,
       (Ok(whole), Ok(taken)) -> {
         assert_eq(taken.hashes, whole.hashes);
         assert_eq(taken.unused, []);
-        assert_eq(told(fixed.warnings), told(whole.unused))
+        assert_eq(owned::told(fixed.warnings), owned::told(whole.unused))
       },
       _ -> panic("the fixture hashes"),
     }
