@@ -1,12 +1,12 @@
 //! `ply-pack BINARY` appends the pack of the checkout around the working directory to BINARY, in
 //! place of any it carries, and then what the shipped modules answer: BINARY answers them with
-//! `ply std --answers` into the memo store `BINARY-answers` beside it, emptied first, and BINARY is
-//! packed once more carrying it. `ply-pack --sources BINARY` appends
-//! the checkout's files alone, which a binary of another checkout's sources is made with to test
-//! `--check`. `ply-pack --check BINARY` exits 0 when BINARY carries exactly the checkout's files,
-//! 1 when it carries others, and 2 when it carries none or the question cannot be answered.
-//! `ply-pack --answered DIR` prints `<binary>\t<test>` for each test whose trace in DIR, as a
-//! test binary wrote it, still stands against that checkout.
+//! `ply std --answers` into the memo store `BINARY-answers` beside it, kept between packs, and BINARY
+//! is packed once more carrying it; a BINARY that carries both already is left as it is.
+//! `ply-pack --sources BINARY` appends the checkout's files alone, which a binary of another
+//! checkout's sources is made with to test `--check`. `ply-pack --check BINARY` exits 0 when BINARY
+//! carries exactly the checkout's files, 1 when it carries others, and 2 when it carries none or the
+//! question cannot be answered. `ply-pack --answered DIR` prints `<binary>\t<test>` for each test
+//! whose trace in DIR, as a test binary wrote it, still stands against that checkout.
 
 use ply_pack::{Checked, Pack};
 use std::path::Path;
@@ -43,7 +43,10 @@ fn main() -> ExitCode {
         Err(why) => return refused(&why),
     };
     let packed = match mode {
-        Mode::Whole => ply_pack::append(binary, &pack).and_then(|()| answered(binary, pack)),
+        Mode::Whole if ply_pack::current(binary, &pack).unwrap_or(false) => Ok(()),
+        Mode::Whole => Pack::of_binary(binary).and_then(|carried| {
+            ply_pack::append(binary, &pack).and_then(|()| answered(binary, pack, carried.as_ref()))
+        }),
         Mode::Sources => ply_pack::append(binary, &pack),
         Mode::Check => return checked(binary, &pack),
     };
@@ -68,15 +71,12 @@ fn checked(binary: &Path, pack: &Pack) -> ExitCode {
     }
 }
 
-/// `binary`, carrying `pack`, packed again with what it answers of its shipped modules.
-fn answered(binary: &Path, pack: Pack) -> Result<(), String> {
+/// `binary`, carrying `pack`, packed again with what it answers of its shipped modules, each answer
+/// `carried`, the pack it carried before, holds taken as it was deflated there.
+fn answered(binary: &Path, pack: Pack, carried: Option<&Pack>) -> Result<(), String> {
     let mut store = binary.as_os_str().to_owned();
     store.push("-answers");
     let store = std::path::PathBuf::from(store);
-    if store.exists() {
-        std::fs::remove_dir_all(&store)
-            .map_err(|e| format!("`{}` could not be emptied: {e}", store.display()))?;
-    }
     let status = std::process::Command::new(binary)
         .arg("std")
         .arg("--answers")
@@ -89,7 +89,7 @@ fn answered(binary: &Path, pack: Pack) -> Result<(), String> {
             binary.display()
         ));
     }
-    ply_pack::append(binary, &pack.with_answers(&store)?)
+    ply_pack::append(binary, &pack.with_answers(&store, carried)?)
 }
 
 fn traced(dir: &Path) -> ExitCode {

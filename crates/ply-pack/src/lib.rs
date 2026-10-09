@@ -142,8 +142,9 @@ impl Pack {
         self.listed()
     }
 
-    /// This pack carrying the memo store at `dir` below [`ANSWERS`], in place of any it carried.
-    pub fn with_answers(mut self, dir: &Path) -> Result<Pack, String> {
+    /// This pack carrying the memo store at `dir` below [`ANSWERS`], in place of any it carried. An
+    /// answer's name is its digest, so one `carried` holds is taken as it was deflated there.
+    pub fn with_answers(mut self, dir: &Path, carried: Option<&Pack>) -> Result<Pack, String> {
         use std::io::Write;
         self.entries.retain(|entry| !is_answer(&entry.path));
         for sub in ANSWER_DIRS {
@@ -156,6 +157,18 @@ impl Pack {
                 if name.starts_with('.') || name.ends_with(".tmp") || !entry.path().is_file() {
                     continue;
                 }
+                let path = format!("{ANSWERS}/{sub}/{name}");
+                let deflated_there = carried
+                    .filter(|_| sub == "outputs")
+                    .and_then(|c| c.entry_quietly(&path).map(|e| c.content(e).to_vec()));
+                if let Some(bytes) = deflated_there {
+                    self.entries.push(Entry {
+                        path,
+                        content: Content::Held(bytes),
+                        digest: OnceLock::new(),
+                    });
+                    continue;
+                }
                 let unread = |e: std::io::Error| {
                     format!("`{}` could not be read: {e}", entry.path().display())
                 };
@@ -164,7 +177,7 @@ impl Pack {
                     flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
                 deflated.write_all(&bytes).map_err(unread)?;
                 self.entries.push(Entry {
-                    path: format!("{ANSWERS}/{sub}/{name}"),
+                    path,
                     content: Content::Held(deflated.finish().map_err(unread)?),
                     digest: OnceLock::new(),
                 });
@@ -492,6 +505,16 @@ pub fn check(binary: &Path, wanted: &Pack) -> Result<Checked, String> {
         .find(|path| carried.digest_of(path) != wanted.digest_of(path))
         .expect("two packs whose digests differ differ on a path");
     Ok(Checked::Differs(differs.to_string()))
+}
+
+/// Whether `binary` carries `wanted` and what its shipped modules answer: what packing it again
+/// would leave as it is.
+pub fn current(binary: &Path, wanted: &Pack) -> Result<bool, String> {
+    if !matches!(check(binary, wanted)?, Checked::Same) {
+        return Ok(false);
+    }
+    Ok(Pack::of_binary(binary)?
+        .is_some_and(|carried| carried.entries.iter().any(|entry| is_answer(&entry.path))))
 }
 
 fn is_answer(path: &str) -> bool {
