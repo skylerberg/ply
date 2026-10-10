@@ -17,7 +17,7 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 named_node, needed_by, wanted_in, entry_bin, exports_bin, hash_entry_bin,
                 hashes_bin, placed_bin, mention_bin, owner_read_bin, module_scope, owner_reads,
                 owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
-                mention_key, unplaced_imports, laid_items, checked_owner)
+                mention_key, unplaced_imports, laid_items, checked_owner, needed_through, head_of)
 import owned
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
               KnownDefRow, KnownTestRow, Published, embeds_wanted, module_embeds_wanted,
@@ -52,7 +52,7 @@ pub type Placing = { package: Int, relative: Bytes }
 pub type Named = { module: Bytes, shipped: Bool, tested: Bool }
 
 /// An entry a query is asked for: the module's, under `name`, or under every name for none.
-pub type EntryNamed = { module: Bytes, shipped: Bool, name: Bytes }
+pub type EntryNamed = { module: Bytes, shipped: Bool, tested: Bool, name: Bytes }
 
 /// What an embed read: its files, or why it read none.
 pub type Embedding = { files: List<{ name: Bytes, bytes: Bytes }>, refused: Option<Bytes> }
@@ -207,7 +207,7 @@ fn entry_bytes_of(
     memo.ask(
       entry_query(),
       bin::encode(
-        { module: module, shipped: shipped_for(asker_shipped, module), name: name },
+        { module: module, shipped: shipped_for(asker_shipped, module), tested: false, name: name },
         entry_named_bin(),
       ),
     ),
@@ -746,7 +746,7 @@ pub fn group_imports_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = 
 /// The owners of a name a module declares, read as `EntryNamed` says: every owner for none.
 pub fn declared_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, entry_named_bin(), "an entry's name");
-  let read = owners_asked({ module: asked.module, shipped: asked.shipped, tested: false });
+  let read = owners_asked({ module: asked.module, shipped: asked.shipped, tested: asked.tested });
   match memo.offered() {
     Some(o) -> o,
     None -> bin::encode(declared_in(owners_of(read), asked.name), bin::list_bin(bin::bytes_bin())),
@@ -808,28 +808,30 @@ fn offered_projections(named: Named, read: OwnersAnswer) -> Unit / {memo.read, a
       bin::encode(group_holding(read, o.owner), bin::list_bin(bin::bytes_bin())),
     )
   });
-  if !named.tested {
-    map_fold(read.declared, (), |_: Unit, name: Bytes, os: List<Bytes>|
-      memo.offer(
-        declared_query(),
-        bin::encode(
-          { module: named.module, shipped: named.shipped, name: name },
-          entry_named_bin(),
-        ),
-        bin::encode(os, bin::list_bin(bin::bytes_bin())),
-      ))
-  }
+  map_fold(read.declared, (), |_: Unit, name: Bytes, os: List<Bytes>|
+    memo.offer(
+      declared_query(),
+      bin::encode(
+        { module: named.module, shipped: named.shipped, tested: named.tested, name: name },
+        entry_named_bin(),
+      ),
+      bin::encode(os, bin::list_bin(bin::bytes_bin())),
+    ))
 }
 
 fn declared_of(
   module: Bytes,
   shipped: Bool,
+  tested: Bool,
   name: Bytes,
 ) -> List<Bytes> / {memo.read, abort.raise} =
   decoded(
     memo.ask(
       declared_query(),
-      bin::encode({ module: module, shipped: shipped, name: name }, entry_named_bin()),
+      bin::encode(
+        { module: module, shipped: shipped, tested: tested, name: name },
+        entry_named_bin(),
+      ),
     ),
     bin::list_bin(bin::bytes_bin()),
     "a name's owners",
@@ -950,12 +952,12 @@ fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
   let modules = fold(mentions, map_new(), |acc: Map<Bytes, Bool>, m: Mention|
     if m.module == asked.module {
       if !contains(asked.owners, m.name) {
-        fold(declared_of(m.module, asked.shipped, m.name), (), |_: Unit, o: Bytes|
+        fold(declared_of(m.module, asked.shipped, asked.tested, m.name), (), |_: Unit, o: Bytes|
           if !contains(asked.owners, o) {
             memo.ask(
               owner_entry_query(),
               bin::encode(
-                { module: m.module, shipped: asked.shipped, tested: false, owner: o },
+                { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
                 owner_named_bin(),
               ),
             );
@@ -1024,17 +1026,21 @@ fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {memo.read
   // it, by its own entry.
   let entries = |module: Bytes, n: Bytes|
     if module == asked.module {
-      fold(declared_of(module, asked.shipped, n), [], |acc: List<HeldEntry>, o: Bytes|
-        if contains(asked.owners, o) { acc } else {
-          let e = memo.ask(
-            owner_entry_query(),
-            bin::encode(
-              { module: module, shipped: asked.shipped, tested: false, owner: o },
-              owner_named_bin(),
-            ),
-          );
-          if bytes_len(e) == 0 { acc } else { push(acc, held_entry(e)) }
-        })
+      fold(
+        declared_of(module, asked.shipped, asked.tested, n),
+        [],
+        |acc: List<HeldEntry>, o: Bytes|
+          if contains(asked.owners, o) { acc } else {
+            let e = memo.ask(
+              owner_entry_query(),
+              bin::encode(
+                { module: module, shipped: asked.shipped, tested: asked.tested, owner: o },
+                owner_named_bin(),
+              ),
+            );
+            if bytes_len(e) == 0 { acc } else { push(acc, held_entry(e)) }
+          },
+      )
     } else { map(entry_bytes_of(asked.shipped, module, n), held_entry) };
   let needed = group_needs(
     asked.module,
@@ -1044,25 +1050,8 @@ fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {memo.read
     entries,
     |e: HeldEntry| e.head,
     |module: Bytes, owner: Bytes|
-      if !published { [] } else {
-        decoded(
-          memo.ask(
-            published_query(),
-            bin::encode(
-              {
-                module: module,
-                shipped: if module == asked.module { asked.shipped }
-                else { shipped_for(asked.shipped, module) },
-                tested: false,
-                owner: owner,
-              },
-              owner_named_bin(),
-            ),
-          ),
-          bin::list_bin(mention_bin()),
-          "what a module publishes",
-        )
-      },
+      if !published || module == asked.module { [] }
+      else { published_for(asked.shipped, asked.module, module, owner) },
   );
   {
     needed: needed,
@@ -1155,35 +1144,39 @@ fn reach_of(
         else {
           let at = { ..s, seen: map_insert(s.seen, mention_key(m), true), work: rest };
           Continue(if m.module == asked.module {
-            fold(declared_of(m.module, asked.shipped, m.name), at, |acc: Reached, o: Bytes|
-              if map_contains(acc.local, o) { acc } else if contains(g.owners, o) {
-                let members = match acc.members {
-                  Some(ms) -> ms,
-                  None -> decoded(answer, owned::group_answer_bin(), "a group's answer").members,
-                };
-                let found = fold(members, None, |x: Option<Entry>, mb: owned::MemberAnswer|
-                  if mb.owner == o { mb.entry } else { x });
-                match found {
-                  Some(x) ->
-                    {
-                      ..acc,
-                      members: Some(members),
-                      local: map_insert(acc.local, o, x),
-                      work: concat(acc.work, x.mentions),
-                    },
-                  None -> { ..acc, members: Some(members) },
-                }
-              } else {
-                let b = memo.ask(
-                  owner_entry_query(),
-                  bin::encode(
-                    { module: m.module, shipped: asked.shipped, tested: false, owner: o },
-                    owner_named_bin(),
-                  ),
-                );
-                if bytes_len(b) == 0 { acc }
-                else { { ..acc, outside: map_insert(acc.outside, o, entry_head(b).reach) } }
-              })
+            fold(
+              declared_of(m.module, asked.shipped, asked.tested, m.name),
+              at,
+              |acc: Reached, o: Bytes|
+                if map_contains(acc.local, o) { acc } else if contains(g.owners, o) {
+                  let members = match acc.members {
+                    Some(ms) -> ms,
+                    None -> decoded(answer, owned::group_answer_bin(), "a group's answer").members,
+                  };
+                  let found = fold(members, None, |x: Option<Entry>, mb: owned::MemberAnswer|
+                    if mb.owner == o { mb.entry } else { x });
+                  match found {
+                    Some(x) ->
+                      {
+                        ..acc,
+                        members: Some(members),
+                        local: map_insert(acc.local, o, x),
+                        work: concat(acc.work, x.mentions),
+                      },
+                    None -> { ..acc, members: Some(members) },
+                  }
+                } else {
+                  let b = memo.ask(
+                    owner_entry_query(),
+                    bin::encode(
+                      { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
+                      owner_named_bin(),
+                    ),
+                  );
+                  if bytes_len(b) == 0 { acc }
+                  else { { ..acc, outside: map_insert(acc.outside, o, entry_head(b).reach) } }
+                },
+            )
           } else {
             let found = entry_bytes_of(asked.shipped, m.module, m.name);
             if len(found) == 0 {
@@ -1235,16 +1228,20 @@ fn owner_entry_of(o: OwnerNamed) -> Option<Entry> / {memo.read, abort.raise} = {
 pub fn entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, entry_named_bin(), "an entry's name");
   bin::encode(
-    fold(declared_of(asked.module, asked.shipped, asked.name), [], |acc: List<Bytes>, o: Bytes| {
-      let e = memo.ask(
-        owner_entry_query(),
-        bin::encode(
-          { module: asked.module, shipped: asked.shipped, tested: false, owner: o },
-          owner_named_bin(),
-        ),
-      );
-      if bytes_len(e) == 0 { acc } else { push(acc, e) }
-    }),
+    fold(
+      declared_of(asked.module, asked.shipped, asked.tested, asked.name),
+      [],
+      |acc: List<Bytes>, o: Bytes| {
+        let e = memo.ask(
+          owner_entry_query(),
+          bin::encode(
+            { module: asked.module, shipped: asked.shipped, tested: asked.tested, owner: o },
+            owner_named_bin(),
+          ),
+        );
+        if bytes_len(e) == 0 { acc } else { push(acc, e) }
+      },
+    ),
     bin::list_bin(bin::bytes_bin()),
   )
 }
@@ -1279,9 +1276,15 @@ fn offered_whole(
   if !(len(missing) > 1 && len(missing) == len(groups)) { None } else {
     let facts = facts_of(read);
     let module = named.module;
-    let checked = checked_whole(named, read);
+    let checked = checked_whole(named, read, false);
     match checked.pulled.out {
-      Refused(ds) -> Some(map(ds, |d: Diag| own_labels(d, checked.at))),
+      Refused(ds) -> {
+        let why = checked_whole(named, read, true);
+        Some(match why.pulled.out {
+          Refused(more) -> map(more, |d: Diag| own_labels(d, why.at)),
+          Analysed(_) -> map(ds, |d: Diag| own_labels(d, checked.at)),
+        })
+      },
       Analysed(w) -> {
         let said = owned::said_of(w, checked.at, read.text);
         let laid = map(missing, |g: GroupNamed| {
@@ -1309,15 +1312,49 @@ fn offered_whole(
   }
 }
 
-/// `read`, a module read as `named` says, checked whole against the entries it names.
+/// What `module` publishes for its owner `owner`, as a check of the module `own`, shipped where
+/// `shipped` says, reads it: the functions that answer or take an `opaque` type it declares. Only
+/// another module's are followed: a module builds its own `opaque` types, so its check never names
+/// them, and two of its groups that refuse would each wait on the other's entry.
+fn published_for(
+  shipped: Bool,
+  own: Bytes,
+  module: Bytes,
+  owner: Bytes,
+) -> List<Mention> / {memo.read, abort.raise} =
+  decoded(
+    memo.ask(
+      published_query(),
+      bin::encode(
+        {
+          module: module,
+          shipped: if module == own { shipped } else { shipped_for(shipped, module) },
+          tested: false,
+          owner: owner,
+        },
+        owner_named_bin(),
+      ),
+    ),
+    bin::list_bin(mention_bin()),
+    "what a module publishes",
+  )
+
+/// `read`, a module read as `named` says, checked whole against the entries it names, with what
+/// the modules of `opaque` types it names publish for them where `published` says: what a check
+/// that refuses follows to say why.
 fn checked_whole(
   named: Named,
   read: OwnersAnswer,
+  published: Bool,
 ) -> { pulled: Pulled, at: Int } / {memo.read, abort.raise} = {
-  let deps = needed_by(
+  let deps = needed_through(
     |d: Bytes, n: Bytes| entries_of(named.shipped, d, n),
+    head_of,
     read.wanted,
     read.context.present,
+    |module: Bytes, owner: Bytes|
+      if !published || module == named.module { [] }
+      else { published_for(named.shipped, named.module, module, owner) },
   );
   checked_against(
     { name: named.module, src: read.text },
@@ -1374,7 +1411,7 @@ pub fn module_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         let whole = match offered {
           Some(ds) -> ds,
           None -> {
-            let checked = checked_whole(named, read);
+            let checked = checked_whole(named, read, true);
             match checked.pulled.out {
               Refused(ds) -> map(ds, |d: Diag| own_labels(d, checked.at)),
               Analysed(_) -> [],
@@ -1529,14 +1566,14 @@ pub fn exported_query() -> Bytes = b"exported"
 pub fn exported_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, entry_named_bin(), "an entry's name");
   let shown = fold(
-    declared_of(asked.module, asked.shipped, asked.name),
+    declared_of(asked.module, asked.shipped, asked.tested, asked.name),
     false,
     |b: Bool, o: Bytes|
       b
         || (match owner_entry_of({
             module: asked.module,
             shipped: asked.shipped,
-            tested: false,
+            tested: asked.tested,
             owner: o,
           }) {
           Some(e) ->
@@ -1553,7 +1590,7 @@ fn exported(shipped: Bool, module: Bytes, name: Bytes) -> Bool / {memo.read, abo
       memo.ask(
         exported_query(),
         bin::encode(
-          { module: module, shipped: shipped_for(shipped, module), name: name },
+          { module: module, shipped: shipped_for(shipped, module), tested: false, name: name },
           entry_named_bin(),
         ),
       ),
@@ -1613,16 +1650,12 @@ fn group_hash_inputs(
         let m = named_node(s.name);
         let shipped = if m.module == asked.module { asked.shipped }
         else { shipped_for(asked.shipped, m.module) };
-        fold(declared_of(m.module, shipped, m.name), acc, |a: List<Fixed>, o: Bytes| {
+        let tested = if m.module == asked.module { asked.tested } else { false };
+        fold(declared_of(m.module, shipped, tested, m.name), acc, |a: List<Fixed>, o: Bytes| {
           let e = memo.ask(
             owner_hash_query(),
             bin::encode(
-              {
-                module: m.module,
-                shipped: shipped,
-                tested: if m.module == asked.module { asked.tested } else { false },
-                owner: o,
-              },
+              { module: m.module, shipped: shipped, tested: tested, owner: o },
               owner_named_bin(),
             ),
           );
@@ -2533,7 +2566,7 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
   ).off
 
 /// Where `warm`'s hashing and `fresh`'s part: each node either fixes otherwise, by name.
-fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes / {abort.raise} = {
+fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes = {
   let by = |f: Fixing|
     fold(f.nodes, map_new(), |acc: Map<Bytes, Bytes>, x: Fixed| map_insert(acc, x.name, x.hash));
   let w = by(warm);
@@ -3108,9 +3141,16 @@ test "an opaque type's module edited and undone leaves an answer through the sto
                     b"a function removed",
                     join(bytes_split(lib, b"\npub fn value(c: Count) -> Int = c.n\n"), b"\n"),
                   ),
-                  at(
-                    b"a test added",
-                    bytes_concat(lib, b"\ntest \"the gate's test\" {\n  assert(true)\n}\n"),
+                  concat(
+                    at(
+                      b"a test added",
+                      bytes_concat(lib, b"\ntest \"the gate's test\" {\n  assert(true)\n}\n"),
+                    ),
+                    // Every function that builds one refuses, each in a group of its own.
+                    at(
+                      b"a field added",
+                      join(bytes_split(lib, b"new { n: Int }"), b"new { n: Int, m: Int }"),
+                    ),
                   ),
                 ),
               ),
@@ -3120,6 +3160,34 @@ test "an opaque type's module edited and undone leaves an answer through the sto
       ),
     ),
     [],
+  )
+}
+
+// A signature leaves the region of each cell it names open, and only its body ties one to another:
+// a caller checked against the function's entry is held to what that check tied.
+test "a cell escapes no region through a function another group or another module checks" {
+  let escapes = |sources: List<Source>|
+    match said(answered_over(nothing_held(), sources).outcome) {
+      Refusing(ds) ->
+        len(filter(ds, |d: Bytes| bytes_starts_with(d, b"E0201: the cell escapes"))) > 0,
+      Publishing(_) -> false,
+    };
+  assert(
+    escapes([
+      {
+        name: b"m",
+        src: b"type Held = Cell<Int>\nfn keep(c: Held) -> Held = c\npub fn leak() -> Held = with_cell[k](42) { c -> keep(c) }\n",
+      },
+    ]),
+  );
+  assert(
+    escapes([
+      { name: b"lib", src: b"pub fn keep(c: Cell<Int>) -> Cell<Int> = c\n" },
+      {
+        name: b"app",
+        src: b"import lib\n\npub fn leak() -> Cell<Int> = with_cell[k](42) { c -> lib::keep(c) }\n",
+      },
+    ]),
   )
 }
 
