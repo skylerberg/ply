@@ -41,13 +41,7 @@ done
 if [ -n "${PLY_BIN:-}" ]; then
   ply="$PLY_BIN"
 else
-  cargo build --locked --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher --bins
-  (cd "$root" && target/release/ply-pack target/release/ply)
-  ply="$root/target/release/ply"
-fi
-if ! "$root/.github/binary-is-current.sh" "$ply"; then
-  echo "$ply is not built from this tree" >&2
-  exit 2
+  ply=$("$root/scripts/bootstrap.sh" --release)
 fi
 
 work="$(mktemp -d)"

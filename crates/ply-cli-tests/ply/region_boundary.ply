@@ -1,0 +1,102 @@
+//! What an entry may answer across the machine's boundary: data, and never a handle a region of the
+//! run holds. A continuation or a task in an entry's answer is the program's error, and a constant
+//! the boundary refuses keeps nothing for the next entry.
+
+import harness (Here, Shipped, bound_main, loaded, project)
+import cli.machine (machine, Called, default_options)
+import std.value (Value, VInt)
+
+effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+
+/// `Saved`'s field is an ordinary function type, so the checker lets `k` reach `parked`'s answer.
+fn parked() -> String =
+  \\effect amb {
+  \\  read flip[coin]() -> Bool
+  \\}
+  \\
+  \\type Saved = Nothing | Just((Bool) -> Int)
+  \\
+  \\fn main() -> Int = 0
+  \\
+  \\pub fn parked() -> Saved / {abort.raise} = with_cell[slot](Nothing) { s -> {
+  \\  let inner = with_cell[log](41) { c ->
+  \\    handle {
+  \\      let b = amb.flip[coin]();
+  \\      if b { cell_get(c) } else { 0 }
+  \\    } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 }, return x -> x }
+  \\  };
+  \\  assert_eq(inner, 0);
+  \\  cell_get(s)
+  \\} }
+  \\
+  \\fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
+  \\
+  \\pub fn resumed(n: Int) -> Int / {abort.raise} = n + resume_it(parked())
+  \\
+  \\fn simulated<| e>(on: (Task<Int>) -> Unit / e) -> Unit / {sim.read | e} =
+  \\  simulate { on(task.spawn(|| 1)) }
+  \\
+  \\pub fn spawned() -> Option<Task<Int>> / {sim.read} = with_cell[slot](None) { kept -> {
+  \\  simulated(|t: Task<Int>| cell_set(kept, Some(t)));
+  \\  cell_get(kept)
+  \\} }
+  \\
+  \\fn joined<a>(x: a, wait: (a) -> Int / {task.join, abort.raise}) -> Int / {sim.read, abort.raise} =
+  \\  simulate {
+  \\    let mine = task.spawn(|| 2);
+  \\    wait(x) + task.join(mine)
+  \\  }
+  \\
+  \\pub fn rejoined() -> Int / {sim.read, abort.raise} = match spawned() {
+  \\  Some(t) -> joined(t, |h: Task<Int>| task.join(h)),
+  \\  None -> 0,
+  \\}
+  \\
+
+fn parked_loaded() -> Unit / {Here, Shipped, Driving, abort.raise} = {
+  project([{ path: "inner.ply", text: parked() }]);
+  loaded(default_options());
+  bound_main()
+}
+
+/// What `name` raised, as its code and message; a call that answered is a failure.
+fn refused(name: String) -> { code: Bytes, message: String } / {Driving, abort.raise} =
+  match (machine.call[run](name, [])).answer {
+    Ok(_) -> panic("`" ++ name ++ "` answered"),
+    Err(r) -> { code: r.diag.code, message: string_of_bytes_lossy(r.diag.message) },
+  }
+
+test/nondet "a continuation in an entry's answer is the program's error, every time it is asked" {
+  parked_loaded();
+  fold(range(0, 2), (), |u: Unit, i: Int| {
+    let d = refused("inner.parked");
+    assert_eq(d.code, b"E0449");
+    assert(string_contains(d.message, "`inner.parked` answered a continuation"), Some(d.message));
+    assert(string_contains(d.message, "Just`'s argument 1"), Some(d.message))
+  });
+  // The memo keeps no answer that holds a continuation, so each entry resumes the one it parked.
+  let resumed = map(range(0, 2), |n: Int| (machine.call[run]("inner.resumed", [VInt(n)])).answer);
+  machine.drop[run]();
+  assert(
+    match resumed { [Ok(VInt(41)), Ok(VInt(42))] -> true, _ -> false },
+    Some("an entry resumed a continuation another entry parked"),
+  )
+}
+
+test/nondet "a task in an entry's answer is refused as a continuation is" {
+  parked_loaded();
+  let d = refused("inner.spawned");
+  machine.drop[run]();
+  assert_eq(d.code, b"E0449");
+  assert(string_contains(d.message, "`inner.spawned` answered a `Task`"), Some(d.message))
+}
+
+// A type parameter hides the task `spawned` let out from the next region, which numbers a task of its
+// own the same: joined there by id alone, the handle would answer that task's `2`.
+test/nondet "a task carried into another region fails its join rather than answering a stranger" {
+  parked_loaded();
+  let d = refused("inner.rejoined");
+  machine.drop[run]();
+  assert_eq(d.code, b"E0413");
+  assert(string_contains(d.message, "another region"), Some(d.message))
+}

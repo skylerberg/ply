@@ -4,9 +4,8 @@ Ply is a general-purpose programming language. Its compiler is written in Ply
 (`crates/ply-compiler/ply`), and `ply` is a native program: the CLI (`crates/ply-cli/ply`) compiled
 to C and linked with the runtime, a static library cargo builds (`crates/ply-native`). `ply`
 builds `ply`: `ply bootstrap` links a checkout's runtime library with what the checkout's builder
-makes of its CLI. After editing Rust, `cargo build -p ply-native` and then `ply bootstrap`; after
-editing Ply sources, `ply bootstrap` alone. A checkout with no `ply` starts from a release
-(`scripts/stage0.sh`).
+makes of its CLI. `scripts/bootstrap.sh` is the rebuild after any edit: cargo, then `ply
+bootstrap` run by the `ply` in `target/`, or by the last release in a checkout with none.
 
 ## Prose
 
@@ -49,17 +48,20 @@ editing Ply sources, `ply bootstrap` alone. A checkout with no `ply` starts from
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and cuts
   the nextest shards and the corpus partitions from the durations CI measured.
 - `ply bootstrap` builds the builder (`crates/ply-compiler/ply`'s `build.main`) with the `ply` that
-  runs it, the latest release in CI, and the builder builds the CLI. So only the compiler and the
-  shipped modules it imports (`grep '^import std' crates/ply-compiler/ply/*.ply` and what those
-  import) cannot use a language rule the same pull request introduces. The rest of
-  `crates/ply-std/ply` can, and so can `crates/ply-compiler/prelude.ply`, which declares the
-  builtins: the compiler embeds its text and parses it itself.
+  runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
+  `ply` that made. So only the compiler and the shipped modules it imports (`grep '^import std'
+  crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule the same pull
+  request introduces. The rest of `crates/ply-std/ply` can, and so can
+  `crates/ply-compiler/prelude.ply`, which declares the builtins: the compiler embeds its text and
+  parses it itself. Likewise the release's bootstrap drives the pull request's builder and links
+  its runtime, so the builder's arguments, the runtime's description and the pack's layout change
+  only in a form the release still speaks.
 - A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its
   path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
   load reads it whenever it pulls the module, so a test's fixtures stay in
   `crates/ply-corpus/stdlib`.
 - `crates/ply-cli` is the CLI as a Ply program; it is not a cargo crate. CI publishes each main
-  `ply` to the rolling `main` release, which `scripts/stage0.sh` downloads.
+  `ply` to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
 - Rust tests test the Rust: none compiles Ply or reads the shipped modules. What a Ply program
   does, the runtime's internals included, is tested by Ply tests.
 - A `ply.lock` records a path dependency in this checkout (prove, sim, store, suite) by name and

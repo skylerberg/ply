@@ -6,7 +6,7 @@
 //! and its own front end. Only the compiler and the shipped modules it imports are built by this
 //! `ply`'s compiler, so only they cannot use a language rule the checkout introduces.
 
-import args (Flags, style_of)
+import args (Flags, no_flags, style_of)
 import builder (builder)
 import env (env)
 import paths
@@ -43,7 +43,7 @@ fn absolute(pwd: String, path: String) -> String =
 
 fn options_of(flags: Flags) -> Options / {env.pwd[sys]} = {
   let pwd = env.pwd[sys]();
-  let root = absolute(pwd, match list_at(flags.paths, 0) { Some(r) -> r.spelling, None -> "." });
+  let root = match list_at(flags.paths, 0) { Some(r) -> r.absolute, None -> pwd };
   let profile = match flags.profile { Some("release") -> "release", _ -> "development" };
   let target = root ++ "/target/" ++ if profile == "release" { "release" } else { "debug" };
   {
@@ -161,7 +161,7 @@ fn over_shipping<a | e>(
 
 /// What a bootstrap reaches beside the loads it makes: the compilers and their cache, the checkout
 /// and where the `ply` it builds goes, below the filesystem's root.
-pub effect set Bootstraps = {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], env.pwd[sys], shipped.front}
+pub effect set Bootstraps = {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], env.pwd[sys], env.var[sys], shipped.front, time.elapsed_ms}
 
 fn failed<a>(why: String) -> Result<a, List<Diag>> = Err([nowhere(why)])
 
@@ -267,23 +267,27 @@ fn builder_built(
   }
 }
 
-/// The checkout's `ply` built by `builder`: its front end, and the sources of its C, which the cache
-/// keeps.
+/// The checkout's `ply` built by `builder`: its front end, the sources of its C, which the cache
+/// keeps, and what the builder said of its steps where `phases` asked it to.
 fn ply_built(
   options: Options,
   builder: String,
   work: String,
-) -> Result<{ front: Bytes, sources: List<cc::Source> }, List<Diag>> / {Bootstraps, abort.raise} = {
+  phases: Bool,
+) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {Bootstraps, abort.raise} = {
   let cache = toolchain.cache();
   let front = cache ++ "/" ++ work ++ "/ply.front";
   let manifest = cache ++ "/" ++ work ++ "/ply.sources";
   let memo = cache ++ "/memo-" ++ (if options.profile == "release" { "release" } else { "debug" });
-  let ran = toolchain.ran(relative(builder), [options.root ++ "/crates/ply-cli/ply", "ply.main", front, manifest, memo, "kept", "quiet"]);
+  let ran = toolchain.ran(
+    relative(builder),
+    [options.root ++ "/crates/ply-cli/ply", "ply.main", front, manifest, memo, "kept", if phases { "phases" } else { "quiet" }],
+  );
   if ran.code != 0 { failed("the builder did not build `ply`:\n" ++ string_of_bytes_lossy(ran.err)) }
   else {
     match ((fs.read_file[abs](under(front)), fs.read_file[abs](under(manifest)))) {
       (Some(f), Some(m)) -> match cc::manifested(m) {
-        Some(sources) -> Ok({ front: f, sources: sources }),
+        Some(sources) -> Ok({ front: f, sources: sources, said: ran.err }),
         None -> failed("the builder's manifest of `ply`'s C does not read"),
       },
       _ -> failed("what the builder built could not be read back"),
@@ -319,22 +323,112 @@ fn answers(ply: String, work: String) -> Result<List<Packed>, List<Diag>> / {Boo
   }
 }
 
-fn wrote(options: Options, answered: Int) -> Answer =
+/// A step of a bootstrap and the milliseconds it took.
+type Took = { step: String, ms: Int }
+
+fn took(steps: List<Took>, step: String, since: Int) -> List<Took> / {time.elapsed_ms} =
+  push(steps, { step: step, ms: time.elapsed_ms() - since })
+
+/// What a bootstrap that built `ply` made: how many records its answers are, what each step took,
+/// and what the builder said of its own.
+type Built = { answered: Int, steps: List<Took>, said: Bytes }
+
+fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
   {
     json: object([
       { key: "command", value: Str("bootstrap") },
       { key: "ok", value: Bool(true) },
       { key: "wrote", value: Str(options.out) },
     ]),
-    lines: [
-      "built `ply` from " ++ options.root ++ " under " ++ options.profile ++ ", its shipped modules answered in "
-        ++ int_to_string(answered)
-        ++ " records",
-      "wrote " ++ options.out,
-    ],
+    lines: concat(
+      [
+        "built `ply` from " ++ options.root ++ " under " ++ options.profile ++ ", its shipped modules answered in "
+          ++ int_to_string(built.answered)
+          ++ " records",
+        "wrote " ++ options.out,
+      ],
+      if !phases { [] } else {
+        concat(
+          map(built.steps, |t: Took| "phases: " ++ t.step ++ " " ++ int_to_string(t.ms) ++ "ms"),
+          filter(map(bytes_split(built.said, b"\n"), string_of_bytes_lossy), |l: String| l != ""),
+        )
+      },
+    ),
     errs: [],
     code: ok_code(),
   }
+
+/// The `ply` at `exe` written to `out` with its pack: by a copy beside `out` and a rename, so a
+/// process running the one there keeps its file.
+fn installed(exe: String, out: String, pack: Bytes) -> Result<Unit, List<Diag>> / {Bootstraps, entropy.next, abort.raise} = {
+  let tmp = out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
+  if fs.copy[abs](under(exe), under(tmp)) && fs.append[abs](under(tmp), pack) != None
+    && fs.rename[abs](under(tmp), under(out)) {
+    Ok(())
+  } else {
+    let _ = fs.remove[abs](under(tmp));
+    failed("the new `ply` could not be written to `" ++ out ++ "`")
+  }
+}
+
+/// The checkout's `ply` built below `work`, each step timed into `steps`.
+fn bootstrapped(
+  options: Options,
+  t: Toolchain,
+  files: List<Shipping>,
+  work: String,
+  phases: Bool,
+) -> Result<Built, List<Diag>> / {Bootstraps, Emits, shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+  let started = time.elapsed_ms();
+  match described(t, options.library, work) {
+    Err(diags) -> Err(diags),
+    Ok(runtime) -> {
+      let steps = took([], "described the runtime", started);
+      let at = time.elapsed_ms();
+      match builder_built(options, t, runtime, files, work) {
+        Err(diags) -> Err(diags),
+        Ok(builder) -> {
+          let steps = took(steps, "built the builder", at);
+          let at = time.elapsed_ms();
+          match ply_built(options, builder, work, phases) {
+            Err(diags) -> Err(diags),
+            Ok(made) -> {
+              let steps = took(steps, "built `ply`", at);
+              let at = time.elapsed_ms();
+              match linked(t, cc::objects_kept[cc](t, made.sources, native::native_flags(), work), options.library, work) {
+                Err(diags) -> Err(diags),
+                Ok(exe) -> {
+                  let steps = took(steps, "compiled and linked `ply`", at);
+                  let at = time.elapsed_ms();
+                  // A copy that carries only its front end answers the shipped modules for the one
+                  // that carries the answers too.
+                  let answering = exe ++ "-answering";
+                  if !fs.copy[abs](under(exe), under(answering)) { failed("the new `ply` could not be copied to answer with") }
+                  else {
+                    match packed_after(answering, packed_with(files, made.front, [])) {
+                      Err(diags) -> Err(diags),
+                      Ok(_) -> match answers(answering, work) {
+                        Err(diags) -> Err(diags),
+                        Ok(answered) -> {
+                          let steps = took(steps, "answered the shipped modules", at);
+                          let at = time.elapsed_ms();
+                          match installed(exe, options.out, packed_with(files, made.front, answered)) {
+                            Err(diags) -> Err(diags),
+                            Ok(_) -> Ok({ answered: len(answered), steps: took(steps, "packed and wrote `ply`", at), said: made.said }),
+                          }
+                        },
+                      },
+                    }
+                  }
+                },
+              }
+            },
+          }
+        },
+      }
+    },
+  }
+}
 
 pub fn run(
   flags: Flags,
@@ -342,53 +436,34 @@ pub fn run(
   let s = style_of(flags);
   let options = options_of(flags);
   let files = shipping(options.root);
+  let phases = env.var[sys]("PLY_C_PHASES") != None;
   let built = match ((toolchain_for(options.profile), toolchain.scratch())) {
     (Err(diags), _) -> Err(diags),
     (_, None) -> failed("the toolchain's cache has no room to build in"),
     (Ok(t), Some(work)) -> {
-      let result = match described(t, options.library, work) {
-        Err(diags) -> Err(diags),
-        Ok(runtime) -> match builder_built(options, t, runtime, files, work) {
-          Err(diags) -> Err(diags),
-          Ok(builder) -> match ply_built(options, builder, work) {
-            Err(diags) -> Err(diags),
-            Ok(made) -> match linked(t, cc::objects_kept[cc](t, made.sources, native::native_flags(), work), options.library, work) {
-              Err(diags) -> Err(diags),
-              Ok(exe) -> {
-                // A copy that carries only its front end answers the shipped modules for the one
-                // that carries the answers too.
-                let answering = exe ++ "-answering";
-                if !fs.copy[abs](under(exe), under(answering)) { failed("the new `ply` could not be copied to answer with") }
-                else {
-                  match packed_after(answering, packed_with(files, made.front, [])) {
-                    Err(diags) -> Err(diags),
-                    Ok(_) -> match answers(answering, work) {
-                      Err(diags) -> Err(diags),
-                      Ok(answered) -> {
-                        let tmp = options.out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
-                        if fs.copy[abs](under(exe), under(tmp))
-                          && fs.append[abs](under(tmp), packed_with(files, made.front, answered)) != None
-                          && fs.rename[abs](under(tmp), under(options.out)) {
-                          Ok(len(answered))
-                        } else {
-                          let _ = fs.remove[abs](under(tmp));
-                          failed("the new `ply` could not be written to `" ++ options.out ++ "`")
-                        }
-                      },
-                    },
-                  }
-                }
-              },
-            },
-          },
-        },
-      };
+      let result = bootstrapped(options, t, files, work, phases);
       toolchain.cleared(work);
       result
     },
   };
   match built {
     Err(diags) -> reported(s, "bootstrap", diags, []),
-    Ok(answered) -> wrote(options, answered),
+    Ok(b) -> wrote(options, b, phases),
   }
+}
+
+// A path outside the working directory is spelled under `abs` without its leading `/`.
+test "a checkout named outside the working directory is the path it names" {
+  let elsewhere = {
+    label: "abs",
+    spelling: "src/ply",
+    display: "/src/ply",
+    inside: ".",
+    absolute: "/src/ply",
+    machine: "/src/ply",
+  };
+  let options = handle { options_of({ ..no_flags(), paths: [elsewhere] }) } with { env.pwd[sys]() -> "/home/me" };
+  assert_eq(options.root, "/src/ply");
+  assert_eq(options.library, "/src/ply/target/debug/libply_native.a");
+  assert_eq(options.out, "/src/ply/target/debug/ply")
 }

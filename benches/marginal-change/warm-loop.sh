@@ -4,7 +4,8 @@
 #
 #   ./benches/marginal-change/warm-loop.sh            # prints the table
 #
-# Refuses a stale binary (exit 2) and waits for the load gate, refusing if it never comes (exit 3).
+# Measures the `ply` this tree bootstraps, and waits for the load gate, refusing if it never comes
+# (exit 3).
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -13,10 +14,7 @@ edits="${1:-5}"
 sizes=("10,25,125" "40,25,500" "160,25,2000")
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }
 
-cargo build --release --manifest-path "$root/Cargo.toml" -p ply-launcher --bins
-(cd "$root" && target/release/ply-pack target/release/ply)
-"$root/.github/binary-is-current.sh" || { echo "STALE -- rebuild before measuring" >&2; exit 2; }
-ply="$root/target/release/ply"
+ply=$("$root/scripts/bootstrap.sh" --release)
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

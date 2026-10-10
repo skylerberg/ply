@@ -44,6 +44,9 @@ pub unsafe extern "C" fn ply_native_main(
 
 unsafe fn run(symbols: *const Row, count: usize) -> c_int {
     ply_host::time::mark_start(std::time::Instant::now());
+    // Rust's own `main` does this before any user code, so a write to a closed pipe is an error the
+    // program answers rather than a signal that ends it; entered from C, the runtime does it here.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
     if let Err(why) = unsafe { ply_codegen::c::linked::install(symbols, count) } {
         eprintln!("ply: {why}");
         return 2;

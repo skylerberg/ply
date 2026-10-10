@@ -1,0 +1,270 @@
+//! The machine family a program drives another program with, end to end in this process: the
+//! program `compiler.load` reads and `compiler.cc` compiles is loaded under `run`, an entry bound,
+//! entered or called, and the label dropped, with what each step answers.
+
+import harness (Here, Shipped, bound_main, compiled_here, first_message, loaded, project, read, working, write)
+import cli.machine (machine, Called, Ended, Options, default_options, unconfigured)
+import compiler.resolve (Diag)
+import std.fs
+import std.fs (fs)
+import std.value (Value, VInt)
+
+/// The family's operations a test performs, under the label the suite's run lends.
+effect set Driving = {machine.configure[run], machine.load[run], machine.reload[run], machine.bound[run], machine.enter[run], machine.call[run], machine.accounting[run], machine.drop[run]}
+
+/// How `inner.main` of the module `inner` ended, entered under `options`.
+fn entered(inner: String, options: Options) -> Ended / {Here, Shipped, Driving, abort.raise} = {
+  project([{ path: "inner.ply", text: inner }]);
+  loaded(options);
+  bound_main();
+  let ended = machine.enter[run]();
+  machine.drop[run]();
+  ended
+}
+
+/// Bound to the host, whose trace facility closes what an entry leaves open, with a sink that
+/// writes nothing.
+fn hosted_quietly() -> Options = { ..default_options(), host: true, trace: { sink: "off", level: "info" } }
+
+fn leaves_a_span() -> String =
+  \\import std.trace
+  \\import std.trace (trace)
+  \\
+  \\fn main() -> Int / {trace.write[orders]} = {
+  \\  let order = trace.enter[orders]("order", map_new());
+  \\  3
+  \\}
+  \\
+
+fn warns_of_the_open_span(warnings: List<Diag>) -> Unit / {abort.raise} =
+  match warnings {
+    [w] -> {
+      assert_eq(w.code, b"W0609");
+      assert(
+        bytes_index_of(w.message, b"`order` on `orders`") != None,
+        Some(string_of_bytes_lossy(w.message)),
+      )
+    },
+    _ -> panic("one warning, not " ++ int_to_string(len(warnings))),
+  }
+
+test/nondet "a program loads, binds and enters a program, which answers its value" {
+  let ended = entered("fn main() -> Int = 40 + 2\n", default_options());
+  assert_eq(ended.value, Some(VInt(42)));
+  assert_eq(ended.exit, None);
+  assert(ended.raised == None, Some("the entry raised"))
+}
+
+test/nondet "a nested program may choose the exit code" {
+  let ended = entered(
+    "import std.process (process)\n\nfn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)\n",
+    { ..default_options(), host: true },
+  );
+  assert_eq(ended.exit, Some(7));
+  assert_eq(ended.value, None);
+  assert(ended.raised == None, Some("the exit was a raise"))
+}
+
+// A raise is a diagnostic value; the outer program does not unwind through it.
+test/nondet "a nested raise is a value, not an unwind" {
+  let ended = entered(
+    "fn main() -> Int / {abort.raise} = panic(\"the inner program's own bug\")\n",
+    default_options(),
+  );
+  assert_eq(ended.exit, None);
+  assert_eq(ended.value, None);
+  match ended.raised {
+    None -> panic("the raise is reported"),
+    Some(r) -> {
+      assert_eq(r.diag.code, b"E0502");
+      assert(
+        bytes_index_of(r.diag.message, b"the inner program's own bug") != None,
+        Some(string_of_bytes_lossy(r.diag.message)),
+      )
+    },
+  }
+}
+
+// What `ply run` reads once the entry is over.
+test/nondet "an entry that left a span open ends with W0609 beside its value" {
+  let ended = entered(leaves_a_span(), hosted_quietly());
+  assert_eq(ended.value, Some(VInt(3)));
+  warns_of_the_open_span(ended.warnings)
+}
+
+test/nondet "a call that left a span open answers W0609 beside its value" {
+  project([{ path: "inner.ply", text: leaves_a_span() }]);
+  loaded(hosted_quietly());
+  bound_main();
+  let called = machine.call[run]("inner.main", []);
+  machine.drop[run]();
+  match called.answer {
+    Ok(v) -> assert_eq(v, VInt(3)),
+    Err(r) -> panic("the call raised: " ++ string_of_bytes_lossy(r.diag.message)),
+  };
+  warns_of_the_open_span(called.warnings)
+}
+
+test/nondet "a reload after an edit enters the new program, and a load files nothing" {
+  project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
+  loaded(default_options());
+  bound_main();
+  assert_eq((machine.enter[run]()).value, Some(VInt(1)));
+  assert(
+    fs.kind[cwd](".ply-cache") == fs::Missing,
+    Some("a machine's load reads the program it was handed and files nothing"),
+  );
+  write("inner.ply", "fn main() -> Int = 2\n");
+  let c = compiled_here();
+  match machine.reload[run](c.front, c.library) {
+    Ok(_) -> (),
+    Err(r) -> panic("the edited program reloads: " ++ first_message(r.diags)),
+  };
+  bound_main();
+  let again = machine.enter[run]();
+  machine.drop[run]();
+  assert_eq(again.value, Some(VInt(2)))
+}
+
+// `configure` before `load`: a configured `--host` binds the nested program's host, and a `drop`
+// forgets the configuration with the program.
+test/nondet "a configured machine binds what its options say, and a drop forgets them" {
+  project([{ path: "inner.ply", text: "fn main() -> Int = 77\n" }]);
+  loaded({ ..default_options(), host: true });
+  match machine.bound[run]("inner.main", unconfigured()) {
+    Err(r) -> panic("binds: " ++ first_message(r.diags)),
+    Ok(b) -> {
+      assert(!b.hermetic, Some("the configured host was not bound"));
+      assert_eq((machine.enter[run]()).value, Some(VInt(77)))
+    },
+  };
+  machine.configure[run]({ ..default_options(), host: true });
+  machine.drop[run]();
+  let c = compiled_here();
+  match machine.load[run](working(), c.front, c.library) {
+    Err(r) -> panic("loads: " ++ first_message(r.diags)),
+    Ok(_) -> (),
+  };
+  let bound = machine.bound[run]("inner.main", unconfigured());
+  machine.drop[run]();
+  match bound {
+    Err(r) -> panic("binds: " ++ first_message(r.diags)),
+    Ok(b) -> assert(b.hermetic, Some("a load after a drop bound as the dropped configuration said")),
+  }
+}
+
+fn int_of(called: Called) -> Int =
+  match called.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
+
+test/nondet "a call enters a definition with its arguments, and what it spent is read once" {
+  project([
+    {
+      path: "inner.ply",
+      text: "fn main() -> Int = 0\n\npub fn double(x: Int) -> Int = x * 2\n\npub fn boom() -> Int / {abort.raise} = panic(\"oh no\")\n",
+    },
+  ]);
+  loaded(default_options());
+  bound_main();
+  assert_eq(int_of(machine.call[run]("inner.double", [VInt(21)])), 42);
+  let first = machine.accounting[run]();
+  let again = machine.accounting[run]();
+  let raised = machine.call[run]("inner.boom", []);
+  let after_raised = machine.accounting[run]();
+  machine.drop[run]();
+  assert(first.steps > 0, Some("the call's steps were not counted"));
+  assert_eq(again.steps, 0);
+  match raised.answer {
+    Ok(_) -> panic("`boom` answered"),
+    Err(r) -> assert(bytes_index_of(r.diag.message, b"oh no") != None, Some(string_of_bytes_lossy(r.diag.message))),
+  };
+  assert(after_raised.steps > 0, Some("the raising call's steps were not counted"))
+}
+
+// A driver totals each entry's own steps: a memo's answer and a declined call add none, so a
+// constant run and then answered from the memo costs one run of its body, not two.
+test/nondet "a memo's answer and a declined call add no steps to the accounting" {
+  project([
+    {
+      path: "inner.ply",
+      text: "fn main() -> Int = 0\n\nfn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }\n\npub fn constant() -> Int = deep(50)\n\npub fn twin() -> Int = deep(50)\n",
+    },
+  ]);
+  loaded(default_options());
+  bound_main();
+  let spent = || (machine.accounting[run]()).steps;
+  assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
+  let ran = spent();
+  assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
+  let remembered = spent();
+  assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
+  assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
+  let both = spent();
+  // A name the program never defined is declined, which the machine answers as a raise.
+  assert_eq(int_of(machine.call[run]("inner.absent", [])), 0 - 1);
+  let declined = spent();
+  machine.drop[run]();
+  assert(ran > 0, Some("the first call's steps were not counted"));
+  assert_eq(remembered, 0);
+  assert_eq(both, ran);
+  assert_eq(declined, 0)
+}
+
+// `table` is a constant, so what it answers crosses back in as words the memo holds.
+fn over_a_table() -> String =
+  \\import std.fs (fs)
+  \\
+  \\fn main() -> Int = 0
+  \\
+  \\fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
+  \\
+  \\pub fn table() -> List<Int> = [1, 2, 3]
+  \\
+  \\pub fn weigh(xs: List<Int>) -> Int = len(xs) + deep(50)
+  \\
+  \\pub fn post(xs: List<Int>) -> Int / {fs.write[cwd]} =
+  \\  match fs.append[cwd]("posted", bytes_of_string(int_to_string(len(xs)) ++ "\n")) {
+  \\    Some(n) -> n,
+  \\    None -> 0 - 1,
+  \\  }
+  \\
+
+test/nondet "a pure call over the memo's words is answered from the memo, and one that performs performs every time" {
+  project([{ path: "inner.ply", text: over_a_table() }]);
+  loaded({ ..default_options(), host: true, fs: [{ name: "cwd", path: working() }] });
+  bound_main();
+  let table = match (machine.call[run]("inner.table", [])).answer {
+    Ok(v) -> v,
+    Err(r) -> panic("`table` answers: " ++ string_of_bytes_lossy(r.diag.message)),
+  };
+  let spent = || (machine.accounting[run]()).steps;
+  let first = int_of(machine.call[run]("inner.weigh", [table]));
+  assert(spent() > 0, Some("the first call did not run the body"));
+  assert_eq(int_of(machine.call[run]("inner.weigh", [table])), first);
+  assert_eq(spent(), 0);
+  let posts = map(range(0, 2), |i: Int| int_of(machine.call[run]("inner.post", [table])));
+  machine.drop[run]();
+  assert_eq(posts, [0, 2]);
+  assert_eq(read("posted"), Some("3\n3\n"))
+}
+
+/// The calls `fib(n)` makes, itself included.
+fn fib_calls(n: Int) -> Int = if n < 2 { 1 } else { 1 + fib_calls(n - 1) + fib_calls(n - 2) }
+
+// Each branch fits the budget alone and the two do not: the block spends what evaluating them in turn
+// spends, wherever they ran.
+test/nondet "the branches of a parallel block spend one step budget between them" {
+  let program =
+    "fn main() -> Int = 0\n\nfn fib(n: Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }\n\npub fn pair(n: Int) -> Int = {\n  let p = parallel { fib(n), fib(n + 1) };\n  p._0 + p._1\n}\n";
+  let alone = fib_calls(20);
+  let both = alone + fib_calls(21);
+  let under = |steps: Int| {
+    project([{ path: "inner.ply", text: program }]);
+    loaded({ ..default_options(), steps: steps });
+    bound_main();
+    let answer = (machine.call[run]("inner.pair", [VInt(20)])).answer;
+    machine.drop[run]();
+    match answer { Ok(v) -> Ok(v), Err(r) -> Err(r.diag.code) }
+  };
+  assert_eq(under(both - alone / 2), Err(b"E0503"));
+  assert_eq(under(both + 16), Ok(VInt(6765 + 10946)))
+}

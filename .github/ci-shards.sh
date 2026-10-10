@@ -38,22 +38,14 @@
 #   ci-shards.sh corpus-line ID...
 #                                the package each run tests, its filter and its
 #                                part, tab-separated, a line a run
-#   ci-shards.sh exclude-filter  the filterset a partition leaves to the gates
-#                                job: the host packages, and the tree check it
-#                                runs alone
+#   ci-shards.sh exclude-filter  the filterset a shard leaves to the hosts and
+#                                gates jobs: the host packages and the tree checks
 #   ci-shards.sh gate-filter     the filterset the gates job runs: the tree checks
 #   ci-shards.sh host-filter     the filterset selecting the host packages
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                gates job holds to `ply fmt --check`
-#   ci-shards.sh rust-answered DIR OUT [SHARD]
-#                                a tool config at OUT leaving out the tests whose
-#                                traces in DIR still stand against this checkout,
-#                                and `<profile> <count>` of it
-#   ci-shards.sh rust-kept NEW JUNIT OUT
-#                                the traces in NEW of the tests JUNIT says passed,
-#                                copied into OUT
 #   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
 #                                `workflow_dispatch`, SWEEP_SHARDS shards of the part of the cases
 #                                the day names, so SWEEP_DAYS days sweep every case; none otherwise,
@@ -156,12 +148,6 @@ TREE_CHECKS=(
   "ply-eval-tests:suite:armed::ambiguous_enum_names_are_declared"
 )
 
-# The tree check the shards leave to the gates job, as a tree check is written: it builds the `ply`
-# program with this tree's own builder, and on main the gates job keeps what that build filed.
-GATES_ALONE=(
-  "ply-launcher-tests:suite:the_builder_these_sources_make_builds_the_program_and_it_runs"
-)
-
 # Checks on the tree in the CLI's suite, as `module:test`. Each runs with its module's entry, so the
 # table asserts it is still declared there: a check that stops being declared reports nothing.
 CLI_TREE_CHECKS=(
@@ -206,11 +192,11 @@ declare -a PROBE_JOBS=(
 # `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
 # of its own run is never a cache, which the repository's other runs evict while those jobs wait for
 # runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-nextest- rust-traces-)
+SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-macos-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-runtime- ply-c-stage-sources- ply-c-stage-own- ply-c-corpus-)
+NEWEST=(nextest-archive- ply-native- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -244,7 +230,7 @@ triples() {
   done
 }
 
-cmd_tree_checks() { triples "${TREE_CHECKS[@]}" "${GATES_ALONE[@]}"; }
+cmd_tree_checks() { triples "${TREE_CHECKS[@]}"; }
 
 # `(binary_id(=..) & test(=..)) | ...` over `package target test` lines on stdin.
 filter_of() {
@@ -619,61 +605,7 @@ cmd_tree_check_filter() {
 
 cmd_gate_filter() { cmd_tree_check_filter; }
 
-# A Rust test is answered by its trace when nothing it read of the pack or the checkout has moved:
-# the trace store is keyed by the Rust key, so a test binary that changed answers nothing. The
-# answered tests are left out through a profile's `default-filter` in the tool config written to
-# OUT, never on the command line, where they outgrow the length of one argument: SHARD's profile
-# with its filter narrowed, or else `answered`. Prints `<profile> <tests answered>`.
-cmd_rust_answered() {
-  local dir=${1:?a directory of traces} out=${2:?a tool config to write} shard=${3:-}
-  local pack=${PLY_PACK:-$root/target/debug/ply-pack} answered excluded count profile base
-  answered=$([ -d "$dir" ] && (cd "$root" && "$pack" --answered "$dir") || true)
-  if [ -z "$answered" ]; then
-    excluded='none()'
-    count=0
-  else
-    excluded=$(printf '%s\n' "$answered" | grouped_filter)
-    count=$(printf '%s\n' "$answered" | grep -c .)
-  fi
-  if [ -n "$shard" ]; then
-    profile=$(sed -n 's/^\[profile\.\(shard[0-9]*\)\]$/\1/p' "$shard" | head -n 1)
-    base=$(sed -n "s/^default-filter = '''\(.*\)'''\$/\1/p" "$shard" | head -n 1)
-    if [ -z "$profile" ] || [ -z "$base" ]; then
-      echo "FAIL: $shard declares no shard profile with a default-filter" >&2
-      return 1
-    fi
-    printf "[profile.%s]\ndefault-filter = '''(%s) and not (%s)'''\n" "$profile" "$base" "$excluded" > "$out"
-  else
-    profile=answered
-    printf "[profile.%s]\ndefault-filter = '''not (%s)'''\n" "$profile" "$excluded" > "$out"
-  fi
-  printf '%s %s\n' "$profile" "$count"
-}
-
-# Only a pass is kept: a trace whose test failed, or that the report does not name, is dropped.
-cmd_rust_kept() {
-  local new=${1:?a directory of new traces} junit=${2:?a nextest JUnit report} out=${3:?a directory}
-  mkdir -p "$out"
-  [ -d "$new" ] && [ -f "$junit" ] || return 0
-  python3 - "$new" "$junit" "$out" <<'PY'
-import os, shutil, sys
-import xml.etree.ElementTree as ET
-new, junit, out = sys.argv[1:4]
-passed = set()
-for case in ET.parse(junit).getroot().iter("testcase"):
-    if case.find("failure") is None and case.find("error") is None:
-        passed.add((case.get("classname"), case.get("name")))
-for name in os.listdir(new):
-    with open(os.path.join(new, name), encoding="utf-8", errors="replace") as f:
-        head = f.readline().rstrip("\n").split("\t")
-    if len(head) == 3 and head[0] == "test" and (head[1], head[2]) in passed:
-        shutil.copy(os.path.join(new, name), os.path.join(out, name))
-PY
-}
-
-cmd_exclude_filter() {
-  printf '%s | %s\n' "$(cmd_host_filter)" "$(triples "${GATES_ALONE[@]}" | filter_of)"
-}
+cmd_exclude_filter() { printf '%s | %s\n' "$(cmd_host_filter)" "$(cmd_tree_checks | filter_of)"; }
 
 cmd_partitions() { matrix "$PARTITIONS"; }
 
@@ -1751,12 +1683,6 @@ cmd_verify() {
   while read -r package target test; do
     check_test_exists "tree check" "$package" "$target" "$test" || failures=$((failures + 1))
   done < <(cmd_tree_checks)
-  # The archive carries `ply` only if ply-launcher has an integration test of its own.
-  if ! ls "$root"/crates/ply-launcher/tests/*.rs >/dev/null 2>&1; then
-    echo "FAIL: crates/ply-launcher/tests/ has no .rs file, so cargo builds no 'ply' for the Ply runs to drive" >&2
-    failures=$((failures + 1))
-  fi
-
   # --- the shards the durations cut -----------------------------------------
   local made_up
   if [[ $NEXTEST_SHARDS -lt 2 ]]; then
@@ -2085,7 +2011,7 @@ cmd_verify() {
   fi
   local cut="by test count, with nothing measured"
   [[ -s $TIMINGS ]] && cut="from $(grep -c . "$TIMINGS") measured durations"
-  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; $((${#TREE_CHECKS[@]} + ${#GATES_ALONE[@]})) tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
+  echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
 # The sweep's cases for a changed path, as a `--filter`: an example, a module of the compiler's
@@ -2115,8 +2041,6 @@ case "${1:-}" in
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" "${@:3}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
-  rust-answered) cmd_rust_answered "${2:-}" "${3:-}" "${4:-}" ;;
-  rust-kept) cmd_rust_kept "${2:-}" "${3:-}" "${4:-}" ;;
   host-filter) cmd_host_filter ;;
   tree-checks) cmd_tree_checks ;;
   formatted-sources) printf '%s\n' "${FORMATTED_SOURCES[@]}" ;;

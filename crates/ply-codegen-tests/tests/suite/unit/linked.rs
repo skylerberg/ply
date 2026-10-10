@@ -7,22 +7,21 @@ static SECOND: u8 = 2;
 
 #[test]
 fn a_linked_program_answers_each_name_its_table_holds_and_no_other() {
-    // Rows ascending by name, as a native program's `main` hands them over.
-    static ROWS: [Row; 2] = [
-        Row {
-            name: c"ply_a".as_ptr(),
-            address: &FIRST as *const u8 as *mut c_void,
-        },
-        Row {
-            name: c"ply_b".as_ptr(),
-            address: &SECOND as *const u8 as *mut c_void,
-        },
-    ];
-    struct Rows(&'static [Row; 2]);
+    struct Rows([Row; 2]);
     // SAFETY: the rows point at statics, which outlive every thread.
     unsafe impl Sync for Rows {}
-    static HELD: Rows = Rows(&ROWS);
-    static BACKWARDS: [Row; 2] = [
+    // Ascending by name, as a native program's `main` hands them over.
+    static HELD: Rows = Rows([
+        Row {
+            name: c"ply_a".as_ptr(),
+            address: &FIRST as *const u8 as *mut c_void,
+        },
+        Row {
+            name: c"ply_b".as_ptr(),
+            address: &SECOND as *const u8 as *mut c_void,
+        },
+    ]);
+    static OUT_OF_ORDER: Rows = Rows([
         Row {
             name: c"ply_b".as_ptr(),
             address: &SECOND as *const u8 as *mut c_void,
@@ -31,8 +30,7 @@ fn a_linked_program_answers_each_name_its_table_holds_and_no_other() {
             name: c"ply_a".as_ptr(),
             address: &FIRST as *const u8 as *mut c_void,
         },
-    ];
-    static OUT_OF_ORDER: Rows = Rows(&BACKWARDS);
+    ]);
     assert!(Library::linked().is_none(), "nothing is linked before a table is installed");
     assert!(
         unsafe { install(OUT_OF_ORDER.0.as_ptr(), OUT_OF_ORDER.0.len()) }.is_err(),
