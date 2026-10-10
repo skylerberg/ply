@@ -129,15 +129,18 @@ fn a_real_answer_reads_to_the_program_it_describes() {
         .iter()
         .map(|r| r.root.as_str())
         .collect();
+    let says = front.check.tests[0].root();
+    let picks = &front.check.laws[0];
+    let (guard, body) = (picks.root("guard"), picks.root("body"));
     assert_eq!(
         roots,
         [
             "m.say",
             "m.pick",
             "m.positive",
-            "m.test#0",
-            "m.law#0.guard",
-            "m.law#0.body"
+            says.as_str(),
+            guard.as_str(),
+            body.as_str()
         ]
     );
 
@@ -171,6 +174,8 @@ fn each_root_reads_the_purity_the_compiler_published() {
         .iter()
         .map(|r| (r.root.as_str(), r.pure))
         .collect();
+    let origin = front.check.tests[0].root();
+    let same = front.check.laws[0].root("body");
     assert_eq!(
         read,
         [
@@ -178,9 +183,9 @@ fn each_root_reads_the_purity_the_compiler_published() {
             ("m.hello", false),
             ("m.same", false),
             ("m.positive", true),
-            ("m.test#0", false),
+            (origin.as_str(), false),
             ("m.positive#requires#0", false),
-            ("m.law#0.body", false),
+            (same.as_str(), false),
         ]
     );
     let constants: Vec<&str> = front
@@ -210,6 +215,13 @@ fn each_root_reads_the_carries_the_compiler_published() {
         .iter()
         .map(|r| (r.root.as_str(), r.params.clone(), r.answer.clone()))
         .collect();
+    let (low, grows) = (&front.check.laws[0], &front.check.laws[1]);
+    let parts = [
+        low.root("guard"),
+        low.root("body"),
+        grows.root("guard"),
+        grows.root("body"),
+    ];
     assert_eq!(
         read,
         [
@@ -230,10 +242,10 @@ fn each_root_reads_the_carries_the_compiler_published() {
                 vec![Carry::Plain, Carry::Plain],
                 Carry::Plain
             ),
-            ("m.law#0.guard", vec![u8()], Carry::Plain),
-            ("m.law#0.body", vec![u8()], Carry::Plain),
-            ("m.law#1.guard", vec![Carry::Plain], Carry::Plain),
-            ("m.law#1.body", vec![Carry::Plain], Carry::Plain),
+            (parts[0].as_str(), vec![u8()], Carry::Plain),
+            (parts[1].as_str(), vec![u8()], Carry::Plain),
+            (parts[2].as_str(), vec![Carry::Plain], Carry::Plain),
+            (parts[3].as_str(), vec![Carry::Plain], Carry::Plain),
         ]
     );
 }

@@ -11,7 +11,7 @@ use ply_eval::{
     Ordinal, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl, Value,
     Visibility, intern_code,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// What every failure's path starts from.
 const ANSWER: &str = "the front end's answer";
@@ -104,43 +104,46 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
     Ok(front)
 }
 
-/// The hasher's rows in its item order. A test's or a law's row is numbered by the item it is
-/// about, so the tests and laws are read before them.
+/// The hasher's rows in its item order. A test's or a law's row names it by its key, so the tests
+/// and laws are read before them.
 fn hashes(rows: AnswerValue<'_>, front: &mut Analysis) -> Result<(), Error> {
-    let tests = front.check.tests.len();
-    let laws = front.check.laws.len();
-    let mut test_hashes: Vec<Option<DefHash>> = vec![None; tests];
-    let mut laws_hashed = vec![false; laws];
+    let tests: HashMap<Symbol, usize> = (front.check.tests.iter().enumerate())
+        .map(|(i, t)| (t.key.clone(), i))
+        .collect();
+    let laws: HashMap<Symbol, usize> = (front.check.laws.iter().enumerate())
+        .map(|(i, l)| (l.key.clone(), i))
+        .collect();
+    let mut test_hashes: Vec<Option<DefHash>> = vec![None; front.check.tests.len()];
+    let mut laws_hashed = vec![false; front.check.laws.len()];
     for row in rows.list()? {
         let c = row.ctor()?;
         let h = c.arg(0)?;
         match c.name() {
             "HDef" => def_hash(h, &mut front.hashes)?,
             "HTest" => {
-                let i = item(h, tests, "test")?;
-                let key = front.check.tests[i].key.clone();
+                let (key, i) = item(h, &tests, "test")?;
                 let hash = item_hash(h, &key, &mut front.hashes)?;
                 if test_hashes[i].replace(hash).is_some() {
-                    return Err(h.error(format!("test {i} is hashed twice")));
+                    return Err(h.error(format!("test `{key}` is hashed twice")));
                 }
             }
             "HLaw" => {
-                let i = item(h, laws, "law")?;
-                let key = front.check.laws[i].key.clone();
+                let (key, i) = item(h, &laws, "law")?;
                 item_hash(h, &key, &mut front.hashes)?;
                 if std::mem::replace(&mut laws_hashed[i], true) {
-                    return Err(h.error(format!("law {i} is hashed twice")));
+                    return Err(h.error(format!("law `{key}` is hashed twice")));
                 }
             }
             _ => return Err(c.unknown()),
         }
     }
-    for (i, hash) in test_hashes.into_iter().enumerate() {
-        let hash = hash.ok_or_else(|| rows.error(format!("test {i} has no hash row")))?;
+    for (test, hash) in front.check.tests.iter().zip(test_hashes) {
+        let hash =
+            hash.ok_or_else(|| rows.error(format!("test `{}` has no hash row", test.key)))?;
         front.hashes.tests.push(hash);
     }
-    if let Some(i) = laws_hashed.iter().position(|hashed| !hashed) {
-        return Err(rows.error(format!("law {i} has no hash row")));
+    if let Some(law) = (front.check.laws.iter().zip(laws_hashed)).find(|(_, hashed)| !hashed) {
+        return Err(rows.error(format!("law `{}` has no hash row", law.0.key)));
     }
     Ok(())
 }
@@ -161,28 +164,25 @@ fn def_hash(h: AnswerValue<'_>, out: &mut HashOutput) -> Result<(), Error> {
     Ok(())
 }
 
-/// The test or law a hash row numbers, which the rows before it declared.
-fn item(h: AnswerValue<'_>, declared: usize, of: &str) -> Result<usize, Error> {
-    let index = h.field("index")?;
-    let i: usize = index.number()?;
-    if i >= declared {
-        return Err(index.error(format!("names {of} {i}, and only {declared} were declared")));
+/// The key of the test or law a hash row is about, which the rows before it declared, and its place
+/// among them.
+fn item(
+    h: AnswerValue<'_>,
+    declared: &HashMap<Symbol, usize>,
+    of: &str,
+) -> Result<(Symbol, usize), Error> {
+    let key = h.field("key")?;
+    let name = Symbol::new(key.utf8()?);
+    match declared.get(&name) {
+        Some(&i) => Ok((name, i)),
+        None => Err(key.error(format!("names no {of} the program declares"))),
     }
-    Ok(i)
 }
 
 /// A test's or a law's hash; its references merge into what its key already holds.
-fn item_hash(
-    h: AnswerValue<'_>,
-    declared: &Symbol,
-    out: &mut HashOutput,
-) -> Result<DefHash, Error> {
-    let key = h.field("key")?;
-    if key.utf8()? != declared.as_str() {
-        return Err(key.error(format!("the item this row numbers is keyed `{declared}`")));
-    }
+fn item_hash(h: AnswerValue<'_>, key: &Symbol, out: &mut HashOutput) -> Result<DefHash, Error> {
     let hash = hash_of(h.field("hash")?)?;
-    let known = out.deps.entry(declared.clone()).or_default();
+    let known = out.deps.entry(key.clone()).or_default();
     for d in symbols(h.field("deps")?)? {
         if !known.contains(&d) {
             known.push(d);

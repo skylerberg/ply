@@ -7,12 +7,12 @@
 
 import std.bin
 import std.list (at, concat, contains, flatten, sort_by)
-import std.bytes (int_of_ascii)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
-              OLaw, OFn, LawOutline, read_outline, module_tables_bin, rows_bin, tagged_site_bin,
-              statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin, ModuleShape,
-              ModuleTables, Rows, KnownDefRow, KnownTestRow, TaggedSite, StatementSite, TypedConst,
-              module_facts, no_module_tables, rows_of, of_module, analyse_pulling_std_with, faceted)
+              OLaw, OFn, OTest, LawOutline, read_outline, module_tables_bin, rows_bin,
+              tagged_site_bin, statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin,
+              ModuleShape, ModuleTables, Rows, KnownDefRow, KnownTestRow, TaggedSite, StatementSite,
+              TypedConst, module_facts, no_module_tables, rows_of, of_module,
+              analyse_pulling_std_with, faceted)
 import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModule, exports_of,
                 entry_bin, entries_in, import_targets, owner_source, checked_owner, item_owner,
                 owner_reads, module_scope, owner_mentions, owner_groups, group_source,
@@ -20,7 +20,7 @@ import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModul
 import items (Item, IFn, parse, item_span, SCost)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
               NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, UpdateShape,
-              WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts)
+              WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts, test_owner)
 import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
 import exprs (TaggedPart)
@@ -255,7 +255,6 @@ pub fn owner_answer(
           unused: match r.unused { Some(d) -> Some(moved_diag(own_labels(d), back)), None -> None },
         }),
     },
-    at(w.mods, slot).name,
     if first_test < 0 { 0 } else { 0 - first_test },
     if first_law < 0 { 0 } else { 0 - first_law },
   )
@@ -439,51 +438,17 @@ pub fn said_group(
   }
 }
 
-/// `owner`, a test's place among its module's as a check files its sites under, moved on by `by`.
-fn test_moved(owner: Bytes, module: Bytes, by: Int) -> Bytes / {abort.raise} = {
-  let prefix = bytes_concat(module, b".test#");
-  if !bytes_starts_with(owner, prefix) { owner } else {
-    match int_of_ascii(bytes_slice(owner, bytes_len(prefix), bytes_len(owner))) {
-      Some(k) -> bytes_concat(prefix, bytes_of_string(int_to_string(k + by))),
-      None -> owner,
-    }
-  }
-}
-
-/// `a`, an owner of `module` whose tests and laws follow `tests` tests and `laws` laws of it: each
+/// `a`, an owner whose tests and laws follow `tests` tests and `laws` laws of its module: each
 /// numbered by its place among the module's.
-pub fn numbered(
-  a: OwnerAnswer,
-  module: Bytes,
-  tests: Int,
-  laws: Int,
-) -> OwnerAnswer / {abort.raise} = {
-  let t = a.tables;
-  let e = t.facts.elaboration;
-  let o = |owner: Bytes| test_moved(owner, module, tests);
+pub fn numbered(a: OwnerAnswer, tests: Int, laws: Int) -> OwnerAnswer =
   {
     ..a,
     tables: {
-      ..t,
-      tests: map(t.tests, |x: TestInfo| { ..x, index: x.index + tests }),
-      laws: map(t.laws, |x: LawInfo| { ..x, index: x.index + laws }),
-      facts: {
-        ..t.facts,
-        label_sites: map(t.facts.label_sites, |x: LabelSite| { ..x, owner: o(x.owner) }),
-        operands: map(t.facts.operands, |x: OperandSite| { ..x, owner: o(x.owner) }),
-        elaboration: {
-          ..e,
-          updates: map(e.updates, |x: UpdateShape| { ..x, owner: o(x.owner) }),
-          ops: map(e.ops, |x: WitnessOp| { ..x, owner: o(x.owner) }),
-          refs: map(e.refs, |x: WitnessRef| { ..x, owner: o(x.owner) }),
-          tries: map(e.tries, |x: TrySite| { ..x, owner: o(x.owner) }),
-        },
-      },
-      kept: map(t.kept, |k: KeptFacts| { ..k, name: o(k.name) }),
+      ..a.tables,
+      tests: map(a.tables.tests, |x: TestInfo| { ..x, index: x.index + tests }),
+      laws: map(a.tables.laws, |x: LawInfo| { ..x, index: x.index + laws }),
     },
-    rows: { ..a.rows, tests: map(a.rows.tests, |r: KnownTestRow| { ..r, owner: o(r.owner) }) },
   }
-}
 
 // --- A module put together from its groups -----------------------------------------------------
 
@@ -559,7 +524,7 @@ pub fn assembled(
     placed,
     { tests: 0, laws: 0, out: [] },
     |acc: { tests: Int, laws: Int, out: List<OwnerAnswer> }, x: { first: Int, member: MemberAnswer, answer: OwnerAnswer }| {
-      let a = numbered(x.answer, module, acc.tests, acc.laws);
+      let a = numbered(x.answer, acc.tests, acc.laws);
       {
         tests: acc.tests + len(a.tables.tests),
         laws: acc.laws + len(a.tables.laws),
@@ -568,7 +533,16 @@ pub fn assembled(
     },
   );
   let owners = numbered_all.out;
-  let prefix = bytes_concat(module, b".test#");
+  let test_at = fold(
+    shape.outline.items,
+    { next: 0, at: map_new() },
+    |acc: { next: Int, at: Map<Bytes, Int> }, x: Outlined|
+      match x {
+        OTest(t) ->
+          { next: acc.next + 1, at: map_insert(acc.at, test_owner(module, t.name), acc.next) },
+        _ -> acc,
+      },
+  ).at;
   let fn_spans = fold(shape.outline.items, [], |acc: List<Span>, x: Outlined|
     match x { OFn(f) -> push(acc, f.span), _ -> acc });
   let costs = fold(
@@ -599,13 +573,9 @@ pub fn assembled(
         if inside(costs, start) { 4000000000 + start }
         else if inside(fn_spans, start) { 1000000000 + start }
         else { 3000000000 + start }
-      } else if bytes_starts_with(owner, prefix) {
-        2000000000
-          + (match int_of_ascii(bytes_slice(owner, bytes_len(prefix), bytes_len(owner))) {
-            Some(k) -> k,
-            None -> 0,
-          })
-      } else { 3000000000 + start },
+      } else {
+        match map_get(test_at, owner) { Some(k) -> 2000000000 + k, None -> 3000000000 + start }
+      },
     };
   let tables = {
     defs: ranked(gathered(owners, |a: OwnerAnswer| a.tables.defs), |d: DefInfo| walked(d.name)),
@@ -841,11 +811,11 @@ fn settled_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
   }
 }
 
-/// The tables of `owners`, the answers of the owners of `module` in the order it writes them, put
+/// The tables of `owners`, the answers of the owners of a module in the order it writes them, put
 /// together.
-fn joined_tables(module: Bytes, owners: List<OwnerAnswer>) -> ModuleTables / {abort.raise} =
+fn joined_tables(owners: List<OwnerAnswer>) -> ModuleTables / {abort.raise} =
   fold(owners, no_module_tables(), |acc: ModuleTables, a: OwnerAnswer| {
-    let t = numbered(a, module, len(acc.tests), len(acc.laws)).tables;
+    let t = numbered(a, len(acc.tests), len(acc.laws)).tables;
     {
       defs: concat(acc.defs, t.defs),
       tests: concat(acc.tests, t.tests),
@@ -876,7 +846,7 @@ fn agrees(sources: List<Source>) -> Unit / {abort.raise} = {
     Refused(_) -> panic("the fixture checks"),
   };
   fold(owned_apart(whole, sources), (), |u: Unit, m: Whole| {
-    let apart = settled_tables(joined_tables(m.module, m.owners));
+    let apart = settled_tables(joined_tables(m.owners));
     let checked = settled_tables(m.whole.tables);
     assert_eq(map(apart.defs, |d: DefInfo| d.name), map(checked.defs, |d: DefInfo| d.name));
     assert_eq(apart.defs, checked.defs);
@@ -1048,7 +1018,7 @@ test "a module put together from its groups' answers is what its check answers" 
   assembles([
     {
       name: b"m",
-      src: b"import std.laws (idempotent)\n\npub fn enc(data: Bytes) -> String / {abort.raise}\n  cost bytes_len(data)\n= string_of_bytes(data)\n\npub fn plain(text: String) -> String = text\n\nlaw \"plain is idempotent\" = idempotent(plain)\n",
+      src: b"pub fn enc(data: Bytes) -> String / {abort.raise}\n  cost bytes_len(data)\n= string_of_bytes(data)\n\npub fn plain(text: String) -> String = text\n\nlaw \"plain is idempotent\" forall (t: String) { plain(plain(t)) == plain(t) }\n",
     },
   ])
 }

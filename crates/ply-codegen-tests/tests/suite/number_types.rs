@@ -254,9 +254,13 @@ fn record(fields: Vec<(&str, Value)>) -> Value {
 /// type says, however deep: the roots are entered, not declined, and each answer is typed.
 #[test]
 fn a_signature_naming_a_width_is_entered_and_answers_typed() {
-    let (_, unit) = unit(CROSSES);
+    let (front, unit) = unit(CROSSES);
     let bodies = unit.bodies().expect("the unit builds");
     let byte = |n: i128| Value::ctor("m.Byte", vec![u8(n)]);
+    let (word, byte_law) = (
+        front.check.laws[0].root("body"),
+        front.check.laws[1].root("body"),
+    );
     let cases: Vec<(&str, Vec<Value>, Value)> = vec![
         ("m.narrows", vec![Value::Int(7)], fixed(IntTy::U32, 7)),
         ("m.widens", vec![fixed(IntTy::U32, 7)], Value::Int(7)),
@@ -282,12 +286,12 @@ fn a_signature_naming_a_width_is_entered_and_answers_typed() {
             Value::Bool(false),
         ),
         (
-            "m.law#0.body",
+            word.as_str(),
             vec![fixed(IntTy::U32, 7)],
             Value::Bool(false),
         ),
         (
-            "m.law#0.body",
+            word.as_str(),
             vec![fixed(IntTy::U32, 4_294_967_295)],
             Value::Bool(true),
         ),
@@ -336,8 +340,8 @@ fn a_signature_naming_a_width_is_entered_and_answers_typed() {
         ),
         ("m.wrap", vec![u8(200)], byte(200)),
         ("m.unwrap", vec![byte(9)], u8(9)),
-        ("m.law#1.body", vec![byte(7)], Value::Bool(false)),
-        ("m.law#1.body", vec![byte(8)], Value::Bool(true)),
+        (byte_law.as_str(), vec![byte(7)], Value::Bool(false)),
+        (byte_law.as_str(), vec![byte(8)], Value::Bool(true)),
     ];
     for (name, args, want) in &cases {
         assert!(
