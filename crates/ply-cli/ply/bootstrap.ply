@@ -199,23 +199,26 @@ fn relative(path: String) -> String / {toolchain.read, abort.raise} = {
   else { path }
 }
 
-/// `c` and the native `main` linked with the runtime's library into an executable, and `pack` after
-/// it: its path below the cache.
+/// `objects` and the native `main` linked with the runtime's library into an executable: its path
+/// below the cache.
 fn linked(
   t: Toolchain,
-  c: Bytes,
+  objects: Result<List<String>, String>,
   library: String,
-  pack: Bytes,
   work: String,
 ) -> Result<String, List<Diag>> / {Bootstraps, abort.raise} =
-  match cc::objects[cc](t, cc::split(c), native::native_flags(), work) {
+  match objects {
     Err(why) -> failed(why),
     Ok(objects) -> match cc::executable[cc](t, native::main_c(), objects, concat([library], toolchain.libraries()), work) {
       Err(why) -> failed(why),
-      Ok(exe) -> if toolchain.appended(relative(exe), pack) { Ok(exe) }
-      else { failed("the pack could not be written after `" ++ exe ++ "`") },
+      Ok(exe) -> Ok(exe),
     },
   }
+
+/// The executable at `exe` with `pack` after it.
+fn packed_after(exe: String, pack: Bytes) -> Result<String, List<Diag>> / {Bootstraps, abort.raise} =
+  if toolchain.appended(relative(exe), pack) { Ok(exe) }
+  else { failed("the pack could not be written after `" ++ exe ++ "`") }
 
 /// What every native `ply` and builder carries: the shipped modules as a pack keeps them, and the
 /// program's own front end.
@@ -254,33 +257,35 @@ fn builder_built(
       match held(front.dump, offered, emission) {
         Err(diags) -> Err(diags),
         Ok(c) ->
-          linked(
-            t,
-            c,
-            options.library,
-            packed_with(files, shipped.front("build.main", shipped_dump(front.dump), len(front.files)), []),
-            work,
-          ),
+          match linked(t, cc::objects[cc](t, cc::split(c), native::native_flags(), work), options.library, work) {
+            Err(diags) -> Err(diags),
+            Ok(exe) ->
+              packed_after(exe, packed_with(files, shipped.front("build.main", shipped_dump(front.dump), len(front.files)), [])),
+          },
       }
     },
   }
 }
 
-/// The checkout's `ply` built by `builder` into its front end and C, both below `work`.
+/// The checkout's `ply` built by `builder`: its front end, and the sources of its C, which the cache
+/// keeps.
 fn ply_built(
   options: Options,
   builder: String,
   work: String,
-) -> Result<{ front: Bytes, c: Bytes }, List<Diag>> / {Bootstraps, abort.raise} = {
+) -> Result<{ front: Bytes, sources: List<cc::Source> }, List<Diag>> / {Bootstraps, abort.raise} = {
   let cache = toolchain.cache();
   let front = cache ++ "/" ++ work ++ "/ply.front";
-  let c = cache ++ "/" ++ work ++ "/ply.c";
+  let manifest = cache ++ "/" ++ work ++ "/ply.sources";
   let memo = cache ++ "/memo-" ++ (if options.profile == "release" { "release" } else { "debug" });
-  let ran = toolchain.ran(relative(builder), [options.root ++ "/crates/ply-cli/ply", "ply.main", front, c, memo, "kept", "quiet"]);
+  let ran = toolchain.ran(relative(builder), [options.root ++ "/crates/ply-cli/ply", "ply.main", front, manifest, memo, "kept", "quiet"]);
   if ran.code != 0 { failed("the builder did not build `ply`:\n" ++ string_of_bytes_lossy(ran.err)) }
   else {
-    match ((fs.read_file[abs](under(front)), fs.read_file[abs](under(c)))) {
-      (Some(f), Some(text)) -> Ok({ front: f, c: text }),
+    match ((fs.read_file[abs](under(front)), fs.read_file[abs](under(manifest)))) {
+      (Some(f), Some(m)) -> match cc::manifested(m) {
+        Some(sources) -> Ok({ front: f, sources: sources }),
+        None -> failed("the builder's manifest of `ply`'s C does not read"),
+      },
       _ -> failed("what the builder built could not be read back"),
     }
   }
@@ -289,6 +294,8 @@ fn ply_built(
 /// What `ply` answers of the shipped modules, as its pack carries it: each record and output of the
 /// store its `std --answers` wrote, gzipped, and the claim that they stand.
 fn answers(ply: String, work: String) -> Result<List<Packed>, List<Diag>> / {Bootstraps, abort.raise} = {
+  // What an earlier bootstrap left there answered for another `ply`.
+  toolchain.cleared("answers");
   let store = toolchain.cache() ++ "/answers";
   let ran = toolchain.ran(relative(ply), ["std", "--answers", store]);
   if ran.code != 0 { failed("the new `ply` did not answer the shipped modules:\n" ++ string_of_bytes_lossy(ran.err)) }
@@ -345,28 +352,33 @@ pub fn run(
           Err(diags) -> Err(diags),
           Ok(builder) -> match ply_built(options, builder, work) {
             Err(diags) -> Err(diags),
-            Ok(made) -> {
-              let front_only = packed_with(files, made.front, []);
-              match linked(t, made.c, options.library, front_only, work) {
-                Err(diags) -> Err(diags),
-                Ok(ply) -> match answers(ply, work) {
-                  Err(diags) -> Err(diags),
-                  Ok(answered) -> match fs.read_file[abs](under(ply)) {
-                    None -> failed("the new `ply` could not be read back"),
-                    Some(bytes) -> {
-                      // The pack it ran with is replaced by the one with its answers.
-                      let code = bytes_slice(bytes, 0, bytes_len(bytes) - bytes_len(front_only));
-                      let whole = bytes_concat(code, packed_with(files, made.front, answered));
-                      let tmp = options.out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
-                      if fs.write_file[abs](under(tmp), whole)
-                        && fs.set_mode[abs](under(tmp), { owner: { read: true, write: true, execute: true }, group: { read: true, write: false, execute: true }, other: { read: true, write: false, execute: true } })
-                        && fs.rename[abs](under(tmp), under(options.out)) {
-                        Ok(len(answered))
-                      } else { failed("the new `ply` could not be written to `" ++ options.out ++ "`") }
+            Ok(made) -> match linked(t, cc::objects_kept[cc](t, made.sources, native::native_flags(), work), options.library, work) {
+              Err(diags) -> Err(diags),
+              Ok(exe) -> {
+                // A copy that carries only its front end answers the shipped modules for the one
+                // that carries the answers too.
+                let answering = exe ++ "-answering";
+                if !fs.copy[abs](under(exe), under(answering)) { failed("the new `ply` could not be copied to answer with") }
+                else {
+                  match packed_after(answering, packed_with(files, made.front, [])) {
+                    Err(diags) -> Err(diags),
+                    Ok(_) -> match answers(answering, work) {
+                      Err(diags) -> Err(diags),
+                      Ok(answered) -> {
+                        let tmp = options.out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
+                        if fs.copy[abs](under(exe), under(tmp))
+                          && fs.append[abs](under(tmp), packed_with(files, made.front, answered)) != None
+                          && fs.rename[abs](under(tmp), under(options.out)) {
+                          Ok(len(answered))
+                        } else {
+                          let _ = fs.remove[abs](under(tmp));
+                          failed("the new `ply` could not be written to `" ++ options.out ++ "`")
+                        }
+                      },
                     },
-                  },
-                },
-              }
+                  }
+                }
+              },
             },
           },
         },

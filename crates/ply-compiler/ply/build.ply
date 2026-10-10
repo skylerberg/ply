@@ -4,8 +4,8 @@
 //! all that reaches, so where that hashes as a program this builder already built, what it made then
 //! is the program, whatever else of the text moved. Otherwise it checks the program seeded with the
 //! rows a build of it by this front end kept, emits its unit, keeping the emitter's answers between
-//! builds under this emitter's own identity, holds the value of each `const` definition, and writes
-//! the front end and the C.
+//! builds under this emitter's own identity, holds the value of each `const` definition, keeps the
+//! C's parts in the toolchain's cache, and writes the front end and their manifest.
 
 import cc
 import cc (compilers, toolchain)
@@ -24,7 +24,7 @@ import std.random (entropy)
 import std.time (time)
 
 fn usage() -> String =
-  "the builder takes ROOT ENTRY FRONT C MEMO KEPT PHASES: the program's package at the absolute path ROOT, the definition it enters, where its front end and its C are written, where what its modules answered is kept between builds (nothing kept: an empty MEMO), `kept` to keep the emitter's answers in the toolchain's cache (else `fresh`), and `phases` to say what each step took (else `quiet`)"
+  "the builder takes ROOT ENTRY FRONT SOURCES MEMO KEPT PHASES: the program's package at the absolute path ROOT, the definition it enters, where its front end and the manifest of its C, which is kept in the toolchain's cache, are written, where what its modules answered is kept between builds (nothing kept: an empty MEMO), `kept` to keep the emitter's answers in the toolchain's cache (else `fresh`), and `phases` to say what each step took (else `quiet`)"
 
 /// `path`, an absolute one, as the filesystem's root reads it.
 fn under(path: String) -> String / {abort.raise} =
@@ -66,17 +66,23 @@ fn texts(files: List<SourceFile>) -> List<Bytes> = map(files, |f: SourceFile| f.
 
 fn ms(from: Int, to: Int) -> String = int_to_string(to - from) ++ "ms"
 
-/// What a build made: the front end the runtime reads and the unit's C.
-type Made = { front: Bytes, c: Bytes }
+/// What a build made: the front end the runtime reads and the manifest of the unit's C, whose parts
+/// the toolchain's cache keeps.
+type Made = { front: Bytes, sources: Bytes }
 
-/// `made` as one value kept between builds: the front end's length, the front end, the C.
+/// `made` as one value kept between builds: the front end's length, the front end, the manifest.
 fn packed(made: Made) -> Bytes =
-  bytes_concat_all([u64_le(bytes_len(made.front)), made.front, made.c])
+  bytes_concat_all([u64_le(bytes_len(made.front)), made.front, made.sources])
 
-fn unpacked(bytes: Bytes) -> Option<Made> / {abort.raise} =
+/// What `packed` kept, while the cache still holds every part of its C.
+fn unpacked(bytes: Bytes) -> Option<Made> / {toolchain.read, abort.raise} =
   match u64_at(bytes, 0) {
     Some(n) -> if 8 + n > bytes_len(bytes) { None } else {
-      Some({ front: bytes_slice(bytes, 8, 8 + n), c: bytes_slice(bytes, 8 + n, bytes_len(bytes)) })
+      let made = { front: bytes_slice(bytes, 8, 8 + n), sources: bytes_slice(bytes, 8 + n, bytes_len(bytes)) };
+      match cc::manifested(made.sources) {
+        Some(sources) -> if cc::holds_sources(sources) { Some(made) } else { None },
+        None -> None,
+      }
     },
     None -> None,
   }
@@ -85,21 +91,21 @@ fn unpacked(bytes: Bytes) -> Option<Made> / {abort.raise} =
 /// runtime it runs on, which it emits for, the compilers and their cache, and its own streams.
 pub effect set Builds = {shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.front, shipped.values, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
 
-/// `made` written where its front end and its C go: 0 when both were, 2 when one could not be.
-fn written(made: Made, front: String, c: String) -> Int / {fs.write[abs], process.err[proc], abort.raise} =
-  if fs.write_file[abs](under(front), made.front) && fs.write_file[abs](under(c), made.c) { 0 } else {
-    process.err[proc]("what was built could not be written to `" ++ front ++ "` and `" ++ c ++ "`");
+/// `made` written where its front end and its manifest go: 0 when both were, 2 when one could not be.
+fn written(made: Made, front: String, sources: String) -> Int / {fs.write[abs], process.err[proc], abort.raise} =
+  if fs.write_file[abs](under(front), made.front) && fs.write_file[abs](under(sources), made.sources) { 0 } else {
+    process.err[proc]("what was built could not be written to `" ++ front ++ "` and `" ++ sources ++ "`");
     2
   }
 
-/// The program at `root` built: 0 when its front end and its C were written, 1 when the program
+/// The program at `root` built: 0 when its front end and its C's manifest were written, 1 when the program
 /// was refused, and 2 when what was built could not be written. `memo` is where what its modules
 /// answered is kept between builds (none where it is empty).
 pub fn built(
   root: String,
   entry: String,
   front: String,
-  c: String,
+  sources: String,
   memo: String,
   kept: Bool,
   phases: Bool,
@@ -128,7 +134,7 @@ pub fn built(
       };
       match had {
         Some(made) -> {
-          let wrote = written(made, front, c);
+          let wrote = written(made, front, sources);
           if phases {
             process.err[proc](
               "phases: " ++ entry ++ " answered " ++ ms(started, reading)
@@ -165,27 +171,33 @@ pub fn built(
                 told(diags, f.files);
                 1
               },
-              Ok(unit) -> {
-                let made = {
-                  front: shipped.front(entry, shipped_dump(f.dump), len(f.files)),
-                  c: unit,
-                };
-                let wrote = written(made, front, c);
-                match key {
-                  Some(k) -> if wrote == 0 { write_kept[abs](programs, k, packed(made)) },
-                  None -> (),
-                };
-                if phases {
-                  process.err[proc](
-                    "phases: " ++ entry ++ " answered " ++ ms(started, reading) ++ ", checked "
-                      ++ ms(reading, checking)
-                      ++ ", constants held "
-                      ++ ms(checking, valuing)
-                      ++ ", emitted and written "
-                      ++ ms(valuing, time.elapsed_ms()),
-                  )
-                };
-                wrote
+              Ok(unit) -> match cc::kept(cc::split(unit)) {
+                Err(why) -> {
+                  process.err[proc](why);
+                  2
+                },
+                Ok(kept_sources) -> {
+                  let made = {
+                    front: shipped.front(entry, shipped_dump(f.dump), len(f.files)),
+                    sources: cc::manifest(kept_sources),
+                  };
+                  let wrote = written(made, front, sources);
+                  match key {
+                    Some(k) -> if wrote == 0 { write_kept[abs](programs, k, packed(made)) },
+                    None -> (),
+                  };
+                  if phases {
+                    process.err[proc](
+                      "phases: " ++ entry ++ " answered " ++ ms(started, reading) ++ ", checked "
+                        ++ ms(reading, checking)
+                        ++ ", constants held "
+                        ++ ms(checking, valuing)
+                        ++ ", emitted and written "
+                        ++ ms(valuing, time.elapsed_ms()),
+                    )
+                  };
+                  wrote
+                },
               },
             }
           },
@@ -302,8 +314,8 @@ fn entered(
 
 pub fn main() -> Unit / {Builds, process.args[proc], process.exit[proc]} =
   match process.args[proc]() {
-    [root, entry, front, c, memo, kept, phases] ->
-      process.exit[proc](built(root, entry, front, c, memo, kept == "kept", phases == "phases")),
+    [root, entry, front, sources, memo, kept, phases] ->
+      process.exit[proc](built(root, entry, front, sources, memo, kept == "kept", phases == "phases")),
     _ -> {
       process.err[proc](usage());
       process.exit[proc](2)
