@@ -16,13 +16,21 @@ what the shipped modules answer checked (§1), and put `target/release/ply` on y
 
 ```ply
 // hello/main.ply
+import std.console (Console, print)
+
 fn greeting() -> String = "hello from ply"
 
-fn main() -> Unit = assert_eq(greeting(), "hello from ply")
+fn main() -> Unit / {Console} = print(greeting())
 ```
 
-`ply run hello` evaluates `main`, prints the value it returned (`()`) and exits
-`0`. There is no `print`: output is the `std.process` effect (`ply doc std.process`). The everyday commands are
+`ply run hello --host` evaluates `main`: `print` writes `hello from ply` to
+standard output, the run reports the value `main` returned (`()`) and exits `0`.
+Output is an effect, not a builtin: `print` takes a `String` and is
+`std.console`'s wrapper over `std.process`'s `out`, a value that is not one goes
+through interpolation (`print(f"n = {n}")`), `Console` is the two console
+streams as an effect set, and `--host` binds them to the run's own console
+(`ply doc std.console`, §14); a run
+without it is hermetic and refuses them (`E0424`). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a project root, defaulting to `.`.
 `ply check --types` prints every definition's inferred signature, each atom of
@@ -30,8 +38,9 @@ its row marked with how many times a call performs it (§6.2), and, under one
 whose row says `diverges`, why its calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
-`demo/main.ply` — a manifest (§3.3), a `main` and one test — and `cd demo &&
-ply test` runs that test. The directory's last segment names the package, so
+`demo/main.ply` — a manifest (§3.3), a `main` that prints and one test — and
+`cd demo && ply run . --host` prints `hello from demo` while `ply test` runs the
+test. The directory's last segment names the package, so
 `ply new store/orders` makes `orders`; `--name` overrides it when the
 directory is not a name (`ply new lib-src --name core`), and `--lib` writes a
 `lib.ply` with a `pub` definition and no `main` instead. A name is what a
@@ -2780,8 +2789,9 @@ deterministic handlers, whose answers are a function of what they are handed, as
 `std.password`'s hashes are, is cached like any other. An operation performed
 inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.signal`, `std.process` and `std.term` are bound only
-by `ply run --host`; `ply test --host` withholds them (`E0424`), except that a
+once per interleaving. `std.signal`, `std.process` (and `std.console` on top of
+it) and `std.term` are bound only by `ply run --host`; `ply test --host`
+withholds them (`E0424`), except that a
 test run binds `process.bound`, `process.spawn`, `process.start` and the
 operations on a started child, which reach only the programs `--exec` names. All
 flags below require `--host`.
