@@ -11,8 +11,11 @@ reached rather than guess from a file's bytes or its timestamp. Where a change
 still redoes more than it touched, that is a defect to fix, not a cost to live
 with.
 
-[`docs/GUIDE.md`](docs/GUIDE.md) is the language manual: syntax, types, effects,
-tests, the standard library, the `ply` command and the diagnostic codes.
+[`docs/book/`](docs/book/introduction.md) is the guide: it teaches the language in
+the order you need it, with programs that grow and run.
+[`docs/GUIDE.md`](docs/GUIDE.md) is the language reference: every rule, and a
+diagnostic code for each — syntax, types, effects, tests, the standard library,
+the `ply` command and the codes.
 [`docs/DIRECTION.md`](docs/DIRECTION.md) is what the language is for and what that asks
 of it next.
 

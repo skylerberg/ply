@@ -67,8 +67,9 @@ Rust, so after editing Ply sources `cargo pack` is the rebuild.
 - A `ply.lock` records a path dependency in this checkout (prove, sim, store, suite) by name and
   version only, so editing one moves no lock. Adding or dropping a dependency or bumping a version
   does: run `ply resolve` on the lock's directory, as CI's lock gate does for every `ply.lock`.
-- `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit
-  codes, or diagnostic codes updates it in the same PR. The builtins and the standard library are
+- `docs/GUIDE.md` is the language reference and `docs/book/` is the guide. A change to syntax, types,
+  CLI commands, flags or exit codes, or diagnostic codes updates the reference in the same PR, and
+  the guide where it teaches the same thing. The builtins and the standard library are
   documented by their doc comments, which a change to them updates.
 
 This file stays short. Don't add a rule in response to one incident; fix the cause instead.
