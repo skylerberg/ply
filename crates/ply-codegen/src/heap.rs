@@ -478,20 +478,22 @@ impl Layouts {
     }
 
     pub fn index_fields(&mut self, names: &[Symbol]) {
-        let rows: Box<[u16]> = self
-            .shapes
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .names
-            .iter()
-            .flat_map(|shape| {
-                names
-                    .iter()
-                    .map(move |name| shape.binary_search(name).map_or(NO_FIELD, |at| at as u16))
-            })
-            .collect();
+        let mut indices: HashMap<&Symbol, Vec<usize>> = HashMap::with_capacity(names.len());
+        for (index, name) in names.iter().enumerate() {
+            indices.entry(name).or_default().push(index);
+        }
+        let shapes = &self.shapes.get_mut().unwrap_or_else(|e| e.into_inner()).names;
+        let width = names.len();
+        let mut rows = vec![NO_FIELD; shapes.len() * width].into_boxed_slice();
+        for (row, shape) in shapes.iter().enumerate() {
+            for (at, field) in shape.iter().enumerate() {
+                for &index in indices.get(field).map_or(&[][..], Vec::as_slice) {
+                    rows[row * width + index] = at as u16;
+                }
+            }
+        }
         self.rows = rows;
-        self.width = names.len();
+        self.width = width;
     }
 
     /// The offset of `names[index]` in `shape`: a load for an indexed shape, else a search.

@@ -9,10 +9,10 @@ This guide is the reference for writing Ply and using the `ply` command.
 
 ## 1. Getting started
 
-Build with `cargo build --release -p ply-launcher --bins`, then `cargo pack
-target/release/ply` to append the shipped modules and the `ply` program to it, with
-what the shipped modules answer checked (§1), and put `target/release/ply` on your path. After editing Ply sources in the checkout,
-`cargo pack` again is the whole rebuild. A Ply file is a module:
+Build the runtime with `cargo build --release -p ply-native`, then
+`ply bootstrap --profile release` with a `ply` you have, or the one `scripts/stage0.sh`
+downloads to `target/stage0/ply`; put `target/release/ply` on your path. After editing Ply
+sources in the checkout, `ply bootstrap` again is the whole rebuild. A Ply file is a module:
 
 ```ply
 // hello/main.ply
@@ -2829,7 +2829,7 @@ checked against that declaration, so it performs none of it.
 | `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`) or `shipped` (declared in `compiler.unit`) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts` (`tcb`), `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers` and `toolchain`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime and the builtins this binary ships, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3099,7 +3099,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap <path>` | writes a program this binary ships as its launcher enters it: the builder (`build.main`) or `ply` (`ply.main`), as `<module>.run` beside the `<module>.digest` the launcher gates it on and the `<module>.key` a builder takes it under; the runnable's unit holds what the program reaches of the files its modules embed, a shipped module's data among them, so a binary that enters it reads none, and the value of each `const fn` the program holds (§3.5), evaluated as `ply build` evaluates them; the digest covers every data file the binary ships, and the report says how many bytes the modules embed; `--out DIR` (default `bootstrap`), `--verify` (compare, write nothing) |
+| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer and its own front end; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records of queries this `ply` no longer has and the answers no record names, and the store's definitions no pass record reaches |
 | `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
@@ -3116,10 +3116,11 @@ the machine is lent to the program as an effect: `ply run`, `ply test` and
 `ply cache` are answered what a run would bind and what the store holds, and
 `ply replace` is lent the text it puts in a definition's place, from
 `--with FILE` or stdin. The program emits the C of every unit a command runs,
-and of what `ply bootstrap` writes, itself: the emitter's answer for a
-definition is kept under the toolchain's cache and read back while the
-definition, the emitter and the runtime are the ones it was made by, and the
-machine compiles the C it is handed and loads it. What the emitter needs of a
+and of what `ply bootstrap` links, itself, and compiles it there too: the
+emitter's answer for a definition, and each object a part of a unit compiles
+to, are kept under the toolchain's cache and read back while the definition,
+the emitter, the runtime and the C compiler are the ones they were made by,
+and the machine loads the library the program hands it. What the emitter needs of a
 body beyond its text — the type each operator reads its operands at, the shape
 of each record update, the labels and witnesses each call passes — the front
 end's check files with the body's row, placed from where the definition

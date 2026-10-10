@@ -245,7 +245,7 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
     let read = ply_codegen::c::Exports::from_text(&produced.text).expect("the table reads back");
     assert_eq!(read.encode(), produced.exports.encode());
     let bound = read
-        .bound(&produced.text)
+        .bound(Some(&produced.text))
         .expect("the unit serves this runtime");
     for (helper, address) in read.helpers.iter().zip(&bound) {
         let runtime = helpers()
@@ -262,7 +262,7 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
         answers: true,
     });
     let bound = retired
-        .bound(&produced.text)
+        .bound(Some(&produced.text))
         .expect("a helper nothing calls is no reason to refuse the unit");
     assert!(bound.last().is_some_and(|address| address.is_null()));
     let calling = format!(
@@ -270,14 +270,14 @@ fn a_units_table_reads_back_from_its_text_and_says_whether_it_serves() {
         produced.text
     );
     let refused = retired
-        .bound(&calling)
+        .bound(Some(&calling))
         .expect_err("a unit that calls what the runtime lacks does not serve it");
     assert!(refused.to_string().contains("`rt_retired`"), "{refused}");
     // One the runtime has under another shape is another helper.
     let mut reshaped = read.clone();
     reshaped.helpers[0].args += 1;
     let refused = reshaped
-        .bound(&produced.text)
+        .bound(Some(&produced.text))
         .expect_err("a helper taking other words is not the one the unit was emitted against");
     assert!(
         refused.to_string().contains(&reshaped.helpers[0].name),

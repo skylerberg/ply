@@ -32,7 +32,7 @@ pub const PROGRAM: &str = "crates/ply-cli/ply";
 pub const MANIFEST: &str = "ply.pkg";
 
 /// The memo store of what every shipped module answers, as `ply std --answers` writes it: its
-/// `records/` and `outputs/` below this, each file deflated. No checkout holds it; a binary's pack
+/// `records/` and `outputs/` below this, each file gzipped. No checkout holds it; a binary's pack
 /// carries it.
 pub const ANSWERS: &str = "answers";
 
@@ -177,7 +177,7 @@ impl Pack {
                 };
                 let bytes = std::fs::read(entry.path()).map_err(unread)?;
                 let mut deflated =
-                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
                 deflated.write_all(&bytes).map_err(unread)?;
                 self.entries.push(Entry {
                     path,
@@ -195,7 +195,7 @@ impl Pack {
         };
         let claim = std::fs::read(&standing).map_err(unclaimed)?;
         let mut deflated =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         deflated.write_all(&claim).map_err(unclaimed)?;
         self.entries.push(Entry {
             path: format!("{ANSWERS}/{STANDING}"),
@@ -317,7 +317,7 @@ impl Pack {
         use std::io::Read;
         let deflated = self.bytes(&format!("{ANSWERS}/{path}"))?;
         let mut out = Vec::new();
-        flate2::read::DeflateDecoder::new(deflated)
+        flate2::read::GzDecoder::new(deflated)
             .read_to_end(&mut out)
             .ok()?;
         Some(out)

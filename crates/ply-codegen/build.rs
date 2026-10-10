@@ -13,10 +13,10 @@ const CRATES: &[&str] = &["ply-codegen", "ply-eval"];
 /// of it runs while a loaded unit computes.
 const OUTSIDE_SEMANTICS: &[&str] = &[
     "ply-codegen/src/c/dump.rs",
+    "ply-codegen/src/c/linked.rs",
     "ply-codegen/src/c/load.rs",
     "ply-codegen/src/c/stage.rs",
     "ply-codegen/src/c/sweep.rs",
-    "ply-codegen/src/c/toolchain.rs",
     "ply-codegen/src/source.rs",
 ];
 

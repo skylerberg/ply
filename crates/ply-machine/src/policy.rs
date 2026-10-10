@@ -48,6 +48,12 @@ pub const FAMILIES: &[Family] = &[
         hermetic: None,
         summary: "read the modules and the version this binary ships",
     },
+    Family {
+        name: "toolchain",
+        effect: "toolchain",
+        hermetic: None,
+        summary: "compile and link C with the host's compiler, below the toolchain's cache",
+    },
 ];
 
 /// Every family's name, in the order [`FAMILIES`] lists them.
@@ -69,6 +75,7 @@ fn own(effect: &str) -> String {
         "prover" => "claims",
         "tcb" => "hosts",
         "shipped" => "compiler.unit",
+        "toolchain" => "compiler.cc",
         other => other,
     }
     .to_string()
@@ -90,6 +97,7 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
         "claims" => crate::claims::lent(&declared("prover")),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "shipped" => crate::shipped::lent(),
+        "toolchain" => crate::toolchain::lent(),
         _ => return None,
     })
 }

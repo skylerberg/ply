@@ -117,7 +117,10 @@ impl Exports {
     /// The address each helper the unit records binds to, in the unit's order. One this runtime
     /// no longer has binds to nothing, which serves a unit whose C never calls it: `text` is
     /// that C.
-    pub fn bound(&self, text: &str) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
+    /// The address of each helper the unit binds, in its order. `text` is the unit's C, which says
+    /// whether a helper this runtime lacks is one the unit calls; a unit with none to read is
+    /// refused any it lacks.
+    pub fn bound(&self, text: Option<&str>) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
         let said = |h: &HelperShape| {
             format!(
                 "taking {} and {}",
@@ -146,7 +149,7 @@ impl Exports {
                             answers: h.answers,
                         }),
                     ))),
-                    None if calls(text, &mine.name) => Err(Unserved(format!(
+                    None if text.is_none_or(|text| calls(text, &mine.name)) => Err(Unserved(format!(
                         "it calls `{}`, which this runtime does not have",
                         mine.name
                     ))),

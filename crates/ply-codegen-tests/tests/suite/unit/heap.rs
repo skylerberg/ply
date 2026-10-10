@@ -288,6 +288,25 @@ fn a_record_is_laid_out_in_sorted_field_order_whatever_order_it_was_written_in()
 }
 
 #[test]
+fn an_indexed_field_reads_where_a_search_of_its_shape_finds_it() {
+    let mut l = layouts();
+    let names: Vec<Symbol> = ["a", "b", "z", "a", "q"].into_iter().map(Symbol::new).collect();
+    let shapes = [vec!["z", "a"], vec!["b"], vec!["q", "z", "b", "a"], vec![]].map(|fields| {
+        l.shape(fields.into_iter().map(Symbol::new).collect())
+    });
+    l.index_fields(&names);
+    for shape in shapes {
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(
+                l.offset_by_index(shape, index, &names),
+                l.offset(shape, name),
+                "`{name}` in shape {shape}"
+            );
+        }
+    }
+}
+
+#[test]
 fn the_last_holder_dismantles_and_the_memory_waits_for_the_end() {
     let mut h = Heap::new();
     let l = layouts();

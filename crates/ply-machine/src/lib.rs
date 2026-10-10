@@ -10,7 +10,6 @@
 //! forgets what the label was configured with. The run flow itself — targets, bindings, teardown —
 //! is `crate::drive`.
 
-pub mod builds;
 pub mod claims;
 pub mod config;
 pub mod drive;
@@ -31,6 +30,7 @@ pub mod support;
 pub mod tested;
 pub mod tester;
 pub mod testrun;
+pub mod toolchain;
 pub mod trace;
 
 use ply_eval::host::{
@@ -211,7 +211,7 @@ enum Request {
     },
     Reload {
         front: Box<crate::driver::LoadedAnalysis>,
-        unit: Vec<u8>,
+        unit: PathBuf,
         reply: Sender<Result<drive::FoundData, drive::Refused>>,
     },
 }
@@ -223,7 +223,7 @@ impl HostHandler for MachineHandler {
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front, unit]) => self.load(&label, root, front, unit, span)?,
-            ("opened", [path, runnable, entry, closure, names]) => self.opened(
+            ("opened", [path, runnable, entry, closure, names, library]) => self.opened(
                 &label,
                 &[
                     path.clone(),
@@ -231,6 +231,7 @@ impl HostHandler for MachineHandler {
                     entry.clone(),
                     closure.clone(),
                     names.clone(),
+                    library.clone(),
                 ],
                 span,
             )?,
@@ -238,7 +239,7 @@ impl HostHandler for MachineHandler {
             ("filed", [front, unit]) => filed(front, unit, span)?,
             ("reload", [front, unit]) => {
                 let front = Box::new(crate::driver::loaded_analysis_of(front, span)?);
-                let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
+                let unit = PathBuf::from(unit.as_str(span, "the program's library")?);
                 let answer: Result<drive::FoundData, drive::Refused> =
                     self.ask(&label, span, |reply| Request::Reload { reply, front, unit })?;
                 match answer {
@@ -316,7 +317,8 @@ impl HostHandler for MachineHandler {
 }
 
 /// The entry a later run's `reuse` takes `front` and `unit` back from: the places and modules of its
-/// files, the shipped modules' texts as placed, the front end's answer, and the unit's C. Only a load
+/// files, the shipped modules' texts as placed, the front end's answer, and the library its unit was
+/// compiled into. Only a load
 /// that held is worth filing, and none is answered for a load whose entry would not read back whole.
 fn filed(front: &Value, unit: &Value, span: Span) -> Result<Value, Diagnostic> {
     use crate::payload::field_of;
@@ -338,8 +340,8 @@ fn filed(front: &Value, unit: &Value, span: Span) -> Result<Value, Diagnostic> {
             })
         })
         .collect::<Result<_, Diagnostic>>()?;
-    let unit = unit.as_bytes(span, "the program's unit")?;
-    let entry = reused::entry(&placed, field_of(front, "dump", span)?, unit);
+    let library = unit.as_str(span, "the program's library")?;
+    let entry = reused::entry(&placed, field_of(front, "dump", span)?, library);
     Ok(payload::option(entry.map(Value::bytes)))
 }
 
@@ -373,7 +375,7 @@ impl MachineHandler {
         Ok(Value::Unit)
     }
 
-    /// The program the caller loaded and emitted: its front end and its unit's C.
+    /// The program the caller loaded and compiled: its front end and the library of its unit.
     fn load(
         &self,
         label: &str,
@@ -384,7 +386,7 @@ impl MachineHandler {
     ) -> Result<Value, Diagnostic> {
         let root = root.as_str(span, "the program's root")?.to_string();
         let handed = crate::driver::loaded_analysis_of(front, span)?;
-        let unit = unit.as_bytes(span, "the program's unit")?.to_vec();
+        let unit = PathBuf::from(unit.as_str(span, "the program's library")?);
         let mut options = self.taken(label);
         options.front = Some(handed);
         options.unit = Some(unit);
@@ -457,9 +459,10 @@ impl MachineHandler {
 
     /// The program the artifact at `path` holds, from the parts of it the caller read out of the
     /// container and checked: its runnable, the entry its namespace names, the closure it prints
-    /// and the hash it files each name under.
-    fn opened(&self, label: &str, args: &[Value; 5], span: Span) -> Result<Value, Diagnostic> {
-        let [path, runnable, entry, closure, names] = args;
+    /// and the hash it files each name under, and the library its caller compiled its unit into.
+    fn opened(&self, label: &str, args: &[Value; 6], span: Span) -> Result<Value, Diagnostic> {
+        let [path, runnable, entry, closure, names, library] = args;
+        let library = PathBuf::from(library.as_str(span, "the artifact's library")?);
         let path = PathBuf::from(path.as_str(span, "the artifact's path")?);
         let runnable = runnable.as_bytes(span, "the artifact's runnable")?.to_vec();
         let entry = entry.as_str(span, "the artifact's entry")?.to_string();
@@ -501,7 +504,9 @@ impl MachineHandler {
             .collect::<Result<Vec<_>, Diagnostic>>()?;
         let options = self.taken(label);
         let found = self.open(label, options, span, move |options| {
-            drive::Drive::open_deployed(options, &path, &runnable, &entry, &closure, &names)
+            drive::Drive::open_deployed(
+                options, &path, &runnable, &entry, &closure, &names, &library,
+            )
         })?;
         Ok(match found {
             Ok(_) => ok(Value::Unit),

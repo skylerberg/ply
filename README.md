@@ -21,8 +21,8 @@ of it next.
 | path | holds |
 | --- | --- |
 | `crates/ply-eval` | values, the evaluator, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
-| `crates/ply-codegen` | the C backend: emits C, builds it and loads it |
-| `crates/ply-compiler` | the compiler written in Ply (`ply/`), the builtins it declares (`prelude.ply`) and its builder, committed as a runnable (`bootstrap/`) |
+| `crates/ply-codegen` | the C backend's runtime: loads a compiled unit, or the one an executable was linked with, and runs it |
+| `crates/ply-compiler` | the compiler written in Ply (`ply/`), with its builder (`build.main`) and the C compiling and linking it drives (`cc.ply`, `native.ply`), and the builtins it declares (`prelude.ply`) |
 | `crates/ply-store` | what `ply` keeps under `.ply-cache`, as the `store` package in `ply/`; not a cargo crate |
 | `crates/ply-test` | what a test run decides, as the `suite` package in `ply/`; not a cargo crate |
 | `crates/ply-prove` | specification obligations and their discharge, as the `prove` package in `ply/`; not a cargo crate |
@@ -30,9 +30,10 @@ of it next.
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
 | `crates/ply-machine` | the nested-entry capability: a program loading and entering another program; and the runtime `ply test` and `ply prove` drive |
 | `crates/ply-std` | the standard library, as Ply source in `ply/` |
-| `crates/ply-cli` | the `ply` program, as Ply source in `ply/` and the runnable it is built into (`bootstrap/`); not a cargo crate |
+| `crates/ply-cli` | the `ply` program, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
-| `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
+| `crates/ply-launcher` | what enters a native program: its pack read, its roots and hosts lent, its entry called |
+| `crates/ply-native` | the runtime's static library a native program, `ply` among them, is linked with |
 | `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
 | `crates/<crate>-tests` | that crate's tests |
 | `editors/` | the tree-sitter grammar editors read |
@@ -48,15 +49,17 @@ CI is the verifier; every pull request runs these checks and the whole suite:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked --release -p ply-launcher --bins
-cargo pack target/release/ply
+cargo build --locked --release -p ply-native
+scripts/stage0.sh
+target/stage0/ply bootstrap --profile release
 cargo nextest run --workspace
 ```
 
-`ply` is a Rust runtime with the shipped modules, the builder and the `ply` program
-appended to it: `cargo pack BINARY` appends the checkout's, then runs BINARY to answer the
-shipped modules and appends those answers too, so an edit to Ply sources needs only that
-step, and a binary that carries no pack refuses to start.
+`ply` is a native program: the CLI compiled to C and linked with the runtime's static library,
+with a pack after it holding the shipped modules, what they answer and the CLI's own front end.
+`ply bootstrap` builds one from a checkout with an installed `ply`, or the one
+`scripts/stage0.sh` downloads; an edit to Ply sources needs only that step, and one to Rust the
+cargo build before it.
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.
@@ -70,16 +73,10 @@ name a server.
 
 ## The compiler bootstrap
 
-The compiler is Ply source under `crates/ply-compiler/ply`. Its builder, the
-compiler's own `build.main`, is committed as `crates/ply-compiler/bootstrap/build.run`
-beside `build.digest`: a runnable, the front end's answer and the unit's C, which the
-launcher enters without running a compiler. A binary whose `ply`
-(`crates/ply-cli/bootstrap/ply.run`) is behind its sources has the committed
-builder build it once and keeps it under the stages, so every such build reads
-back what the builds before it kept. Where the program needs a rule the
-committed builder lacks, that builder builds the sources' own builder, and it
-builds `ply`. So the compiler and the shipped modules it imports cannot use a
-language rule the same change introduces; the rest of the standard library can. Likewise the
-runtime reads the front end's answer the committed builder carries, so it can come
-to require a field of one only once main's builder writes it. Never commit the
-runnables: CI rebuilds them on main after each merge.
+The compiler is Ply source under `crates/ply-compiler/ply`. `ply bootstrap` describes the runtime's
+library cargo built of the checkout, builds the compiler's own `build.main` against it into the
+builder, a native program on that runtime, and runs the builder over the CLI, whose C it links with
+the library into the new `ply`. That `ply` answers the shipped modules, and its pack carries them.
+The builder is built by the `ply` that runs the bootstrap, a release in CI, so the compiler and the
+shipped modules it imports cannot use a language rule the same change introduces; the rest of the
+standard library can.

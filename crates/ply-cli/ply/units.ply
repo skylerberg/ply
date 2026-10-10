@@ -1,11 +1,14 @@
-//! A program made into the unit the runtime compiles and enters. The emitter's answers kept between
-//! runs are read from the toolchain's cache, the rest are asked of the emitter here, in this
-//! program, and the C is assembled over all of them: the runtime is handed C and compiles nothing
-//! it was not handed.
+//! A program made into the unit the runtime enters. The emitter's answers kept between runs are
+//! read from the toolchain's cache, the rest are asked of the emitter here, in this program, and the
+//! C is assembled over all of them and compiled here into a library: the runtime is handed the
+//! library and compiles nothing.
 
 import compiler.front (BakedRow)
 import compiler.load (every_root, LoadedAnalysis)
-import compiler.resolve (Diag)
+import compiler.resolve (Diag, error_at)
+import compiler.cc
+import compiler.cc (compilers, toolchain)
+import compiler.parsing (no_module)
 import compiler.unit (Baked, Dropped, Emission, Made, shipped, baked_key, emitted, emitter_identity,
                       held, kept_value, read_kept, write_kept)
 import env (env)
@@ -15,14 +18,18 @@ import std.process (process)
 import std.random (entropy)
 import std.time (time)
 
-/// A unit's C as the runtime compiles it, and what it was made of, which says what each root runs.
+/// A unit's C, and what it was made of, which says what each root runs.
 pub type Emitted = { text: Bytes, made: Made }
 
-/// A command asks for the unit a run enters; what answers is `emitting`'s, which `main` runs every
-/// command under, or a handler of the asker's own. The C is a function of what is asked, so the
-/// effect is a deterministic one, whatever the answering keeps.
+/// A command asks for the unit a run enters, and for the library its C compiles into; what answers
+/// is `emitting`'s, which `main` runs every command under, or a handler of the asker's own. The C
+/// is a function of what is asked, and the library of the C and the compiler, so the effect is a
+/// deterministic one, whatever the answering keeps.
 pub effect emit {
   read unit(front: LoadedAnalysis, offered: List<Bytes>) -> Result<Emitted, List<Diag>>
+  /// The library `text`, a unit's C, compiles into under `profile`, `development` or `release`:
+  /// its path, which the runtime opens.
+  read compiled(text: Bytes, profile: String) -> Result<String, List<Diag>>
 }
 
 fn emitted_of(
@@ -40,9 +47,9 @@ fn emitted_of(
   }
 
 /// What emitting a unit here reaches: the runtime it is compiled against, this program's own
-/// definitions, the emitter's among them, the answers kept between runs under the toolchain's cache,
-/// and what the environment asks to be told of it.
-pub effect set Emits = {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc]}
+/// definitions, the emitter's among them, the answers and objects kept between runs under the
+/// toolchain's cache, the compilers, and what the environment asks to be told of it.
+pub effect set Emits = {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write}
 
 fn kept_dir() -> String / {env.bodies[sys], abort.raise} = under_abs(env.bodies[sys]())
 
@@ -165,47 +172,111 @@ pub fn text_of(r: Result<Emitted, List<Diag>>) -> Result<Bytes, List<Diag>> =
   match r { Ok(e) -> Ok(e.text), Err(diags) -> Err(diags) }
 
 /// The whole program's unit, every root it offers, and what it was made of.
-pub fn whole_emitted(front: LoadedAnalysis) -> Result<Emitted, List<Diag>> / {emit.unit} =
+pub fn whole_emitted(front: LoadedAnalysis) -> Result<Emitted, List<Diag>> / {emit.unit, emit.compiled} =
   emit.unit(front, every_root(front))
 
 /// The whole program's unit, as the runtime compiles it.
-pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit} =
+pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, emit.compiled} =
   text_of(whole_emitted(front))
 
-/// The unit a run executes in, or none for a run that executes nothing.
+/// The library the whole program's unit compiles into under `profile`, or none for a run that
+/// executes nothing.
 pub fn wanted(
   front: LoadedAnalysis,
   build: Bool,
-) -> Result<Option<Bytes>, List<Diag>> / {emit.unit} =
-  if !build { Ok(None) }
-  else { match whole(front) { Ok(text) -> Ok(Some(text)), Err(diags) -> Err(diags) } }
+  profile: String,
+) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled} =
+  if !build { Ok(None) } else {
+    match whole(front) {
+      Err(diags) -> Err(diags),
+      Ok(text) -> match library(text, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
+    }
+  }
 
-/// `body` with every unit it asks for emitted here, the emitter's answers kept under the
-/// toolchain's cache.
-pub fn emitting<a | e>(body: () -> a / {emit.unit | e}) -> a / {abort.raise, Emits | e} =
-  handle { body() } with { emit.unit(front, offered) -> unit_of(front, offered) }
+/// The library `text` compiles into under `profile`, where there is a text.
+pub fn library_of(
+  text: Option<Bytes>,
+  profile: String,
+) -> Result<Option<String>, List<Diag>> / {emit.compiled} =
+  match text {
+    None -> Ok(None),
+    Some(t) -> match library(t, profile) { Ok(l) -> Ok(Some(l)), Err(diags) -> Err(diags) },
+  }
 
-/// `body` with every unit it asks for emitted afresh and kept nowhere: for a program that drives
-/// another and has no toolchain cache of its own.
-pub fn emitting_fresh<a | e>(
-  body: () -> a / {emit.unit | e},
-) -> a / {abort.raise, shipped.runtime | e} =
-  handle { body() } with { emit.unit(front, offered) -> fresh(front, offered) }
+/// `body` with every unit it asks for emitted and compiled here, the emitter's answers and the
+/// objects kept under the toolchain's cache.
+pub fn emitting<a | e>(
+  body: () -> a / {emit.unit, emit.compiled | e},
+) -> a / {abort.raise, Emits | e} =
+  handle { body() } with {
+    emit.unit(front, offered) -> unit_of(front, offered),
+    emit.compiled(text, profile) -> compiled_of(text, profile),
+  }
 
-fn fresh(
-  front: LoadedAnalysis,
-  offered: List<Bytes>,
-) -> Result<Emitted, List<Diag>> / {shipped.runtime, abort.raise} =
-  emitted_of(
-    front,
-    offered,
-    emitted(
-      shipped.runtime(),
-      front.dump,
-      texts(front),
-      offered,
-      b"",
-      |_: Bytes| None,
-      |_: Bytes, _: Bytes| (),
-    ),
-  )
+/// The library a unit's text compiles into under `profile`.
+pub fn library(text: Bytes, profile: String = "development") -> Result<String, List<Diag>> / {emit.compiled} =
+  emit.compiled(text, profile)
+
+/// The library an emitted unit compiles into under `profile`.
+pub fn library_over(
+  r: Result<Emitted, List<Diag>>,
+  profile: String = "development",
+) -> Result<String, List<Diag>> / {emit.compiled} =
+  match r { Ok(e) -> library(e.text, profile), Err(diags) -> Err(diags) }
+
+// --- Compiling a unit ---------------------------------------------------------------
+
+/// Which compiler a profile compiles with, and at what level. `PLY_C_PROFILE` wins over the flag.
+/// `development` compiles fast for code that runs slowly enough: tcc where it is installed, else
+/// `cc -O0`; `release` is `cc -O2`. `PLY_CC` names `cc`'s program and is used whatever the profile,
+/// and `PLY_CC_OPT` names the level.
+fn chosen(profile: String) -> { tcc: Bool, level: String } / {env.var[sys], compilers.found[tcc]} = {
+  let release = match env.var[sys]("PLY_C_PROFILE") {
+    Some(p) -> p == "release",
+    None -> profile == "release",
+  };
+  let level = match env.var[sys]("PLY_CC_OPT") {
+    Some(o) -> o,
+    None -> if release { "-O2" } else { "-O0" },
+  };
+  {
+    tcc: !release && env.var[sys]("PLY_CC") == None && compilers.found[tcc]() != None,
+    level: level,
+  }
+}
+
+fn unbuildable(why: String) -> Diag =
+  error_at(b"E0450", no_module(), { start: 0, end: 0 }, bytes_of_string(why), b"", [
+    b"the C backend shells out to `cc`; `PLY_CC` names another compiler",
+  ])
+
+/// The flags every object of a library compiles with.
+fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
+
+/// `text` compiled into a library the toolchain's cache keeps: an object for each part not compiled
+/// before, and a link where the cache holds none of them together.
+fn compiled_of(text: Bytes, profile: String) -> Result<String, List<Diag>> / {Emits, abort.raise} = {
+  let choice = chosen(profile);
+  let found = if choice.tcc { compilers.found[tcc]() } else { compilers.found[cc]() };
+  match ((found, toolchain.scratch())) {
+    (None, _) -> Err([unbuildable("no `cc` is installed to compile C with")]),
+    (_, None) -> Err([unbuildable("the toolchain's cache has no room to compile in")]),
+    (Some(compiler), Some(work)) -> {
+      let t = cc::toolchain_of(compiler, choice.level);
+      let parts = cc::split(text);
+      let built = if choice.tcc {
+        match cc::objects[tcc](t, parts, library_flags(), work) {
+          Err(why) -> Err(why),
+          Ok(objects) -> cc::shared[tcc](t, objects, work),
+        }
+      } else {
+        match cc::objects[cc](t, parts, library_flags(), work) {
+          Err(why) -> Err(why),
+          Ok(objects) -> cc::shared[cc](t, objects, work),
+        }
+      };
+      toolchain.cleared(work);
+      match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
+    },
+  }
+}

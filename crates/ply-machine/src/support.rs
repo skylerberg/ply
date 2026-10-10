@@ -45,34 +45,12 @@ pub fn attached_on(
 fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
     Diagnostic::error(
         codes::BACKEND_UNAVAILABLE,
-        format!("the C backend could not be built: {error:#}"),
+        format!("the compiled unit could not be loaded: {error:#}"),
     )
     .note(
         "compiled code is the only evaluator, so a run without a backend would be reported green \
          over a seam nothing reached",
     )
-    .note("the C backend shells out to `cc`; `PLY_CC` names another compiler")
-}
-
-/// Fixes the emitted C backend's toolchain before anything compiles; not part of the cache key,
-/// because both profiles must answer identically.
-pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
-    let Some(profile) = ply_codegen::Profile::parse(flag) else {
-        return Err(Diagnostic::error(
-            codes::BACKEND_UNAVAILABLE,
-            format!("`--profile {flag}` is not a profile"),
-        )
-        .note(
-            "`development` compiles fast for code that runs slowly enough; `release` compiles \
-             slowly for code that runs fast",
-        )
-        .note(
-            "the two are required to answer identically, so this decides what a run costs and \
-             not what it means",
-        ));
-    };
-    ply_codegen::select_profile(profile);
-    Ok(())
 }
 
 pub fn module_texts(
@@ -90,15 +68,14 @@ pub fn module_texts(
         .collect()
 }
 
-/// The unit the program produced for `front`, its C compiled and loaded here. What the program
-/// reaches was settled where the C was produced, so a refusal is this host failing to build it.
+/// The unit the program compiled for `front` into the library at `path`, loaded here. What the
+/// program reaches was settled where its C was produced, so a refusal is this host failing to load
+/// it.
 pub fn unit_of(
     front: &ply_eval::Analysis,
-    text: &[u8],
+    path: &std::path::Path,
 ) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
-    let text =
-        String::from_utf8(text.to_vec()).map_err(|_| unbuilt("the unit's C is not UTF-8"))?;
-    ply_codegen::Unit::handed(front, text)
+    ply_codegen::Unit::opened(front, path)
         .map(|unit| unit as Arc<dyn ply_eval::Provider>)
         .map_err(|error| unbuilt(&error))
 }

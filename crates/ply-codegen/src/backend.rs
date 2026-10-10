@@ -142,20 +142,45 @@ pub struct Unit {
     counters: Counters,
     codegen_nanos: AtomicU64,
     compiles: AtomicU64,
-    /// Workers whose load failed after the first in [`Unit::handed`] succeeded.
+    /// Workers whose load failed after the first load of the unit succeeded.
     poisoned: AtomicU64,
-    /// The unit's self-describing C, which a worker that finds no load on its thread loads again.
-    text: String,
+    /// What a worker that finds no load on its thread loads again.
+    code: Code,
+}
+
+/// Where a unit's code comes from.
+enum Code {
+    /// The program this executable was linked with.
+    Linked,
+    /// A library the unit's C was compiled and linked into.
+    Opened(std::path::PathBuf),
+}
+
+impl Code {
+    fn load(&self, source: &Source) -> Result<(crate::c::Native, Vec<crate::c::Refused>)> {
+        match self {
+            Code::Linked => crate::c::load_linked(Some(source)),
+            Code::Opened(path) => crate::c::load_opened(path, Some(source)),
+        }
+    }
 }
 
 impl Unit {
-    /// A unit produced elsewhere, its C handed over whole, loaded once: the first backend on this
-    /// thread takes that load, and one that does not serve this runtime is an
-    /// [`crate::c::Unserved`].
-    pub fn handed(front: &ply_eval::Analysis, text: String) -> Result<Arc<Unit>> {
+    /// The unit compiled into the library at `path`, loaded once: the first backend on this thread
+    /// takes that load, and one that does not serve this runtime is an [`crate::c::Unserved`].
+    pub fn opened(front: &ply_eval::Analysis, path: &std::path::Path) -> Result<Arc<Unit>> {
+        Unit::over(front, Code::Opened(path.to_path_buf()))
+    }
+
+    /// The program this executable was linked with, over `front`, its front end's answer.
+    pub fn linked(front: &ply_eval::Analysis) -> Result<Arc<Unit>> {
+        Unit::over(front, Code::Linked)
+    }
+
+    fn over(front: &ply_eval::Analysis, code: Code) -> Result<Arc<Unit>> {
         let identity = front.hashes_digest;
         let source = Arc::new(Source::from_analysis(Arc::new(front.clone())));
-        let (native, refused) = crate::c::load_unit(&text, Some(&source), "unit")?;
+        let (native, refused) = code.load(&source)?;
         let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let unit = Unit {
@@ -171,7 +196,7 @@ impl Unit {
             codegen_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
-            text,
+            code,
         };
         let unit = Arc::new(unit);
         PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((Arc::downgrade(&unit), native)));
@@ -227,7 +252,7 @@ impl Unit {
         });
         let native = match preflown {
             Some(native) => native,
-            None => crate::c::load_unit(&self.text, Some(&self.source), "unit")?.0,
+            None => self.code.load(&self.source)?.0,
         };
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
