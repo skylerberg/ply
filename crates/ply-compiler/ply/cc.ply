@@ -6,7 +6,7 @@
 
 import std.bytes (hex_of)
 import std.hash (blake3)
-import std.list (at, concat)
+import std.list (at, concat, find)
 import std.string (join)
 
 /// The C compilers by their labels: what each is, and each run of one. What a compiler makes is a
@@ -170,6 +170,85 @@ fn ran<[c]>(runs: List<List<String>>) -> Result<Unit, String> / {compilers.read[
   )
 }
 
+/// One part of a unit as a compiler is given it: its label, and the digest of its C with the head
+/// before it, which decides the object it compiles to.
+pub type Source = { label: String, digest: String }
+
+/// Each of `parts`' sources, in order.
+pub fn sources_of(parts: Parts) -> List<Source> / {abort.raise} =
+  map(parts.parts, |p: { label: String, text: Bytes }|
+    { label: p.label, digest: hex_of(blake3(bytes_concat(parts.head, p.text))) })
+
+/// Where the cache keeps a source's C.
+fn kept_source(s: Source) -> String = "src/" ++ s.digest ++ ".c"
+
+/// `parts`' sources, each one's C written below the cache where it is not there already: what
+/// `objects_kept` compiles from, in another process or a later run.
+pub fn kept(parts: Parts) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
+  let sources = sources_of(parts);
+  let landed = fold(range(0, len(sources)), true, |ok: Bool, i: Int| {
+    let path = kept_source(at(sources, i));
+    ok && (toolchain.holds(path) || toolchain.written(path, bytes_concat(parts.head, at(parts.parts, i).text)))
+  });
+  if landed { Ok(sources) } else { Err("a unit's C could not be kept in the toolchain's cache") }
+}
+
+/// `sources` as a line each, its label and its digest: what a builder hands the linker of a unit it
+/// kept.
+pub fn manifest(sources: List<Source>) -> Bytes =
+  bytes_concat_all(map(sources, |s: Source| bytes_of_string(s.label ++ " " ++ s.digest ++ "\n")))
+
+/// The sources `manifest` wrote, or `None` for anything else.
+pub fn manifested(text: Bytes) -> Option<List<Source>> / {abort.raise} =
+  fold(bytes_split(text, b"\n"), Some([]), |acc: Option<List<Source>>, line: Bytes|
+    match acc {
+      None -> None,
+      Some(xs) -> if bytes_len(line) == 0 { acc } else {
+        match bytes_split(line, b" ") {
+          [label, digest] -> if bytes_len(digest) == 64 {
+            Some(push(xs, { label: string_of_bytes_lossy(label), digest: string_of_bytes_lossy(digest) }))
+          } else { None },
+          _ -> None,
+        }
+      },
+    })
+
+/// Whether the cache still holds each of `sources`' C, which records a use of each.
+pub fn holds_sources(sources: List<Source>) -> Bool / {toolchain.read, abort.raise} =
+  fold(sources, true, |ok: Bool, s: Source| ok && toolchain.holds(kept_source(s)))
+
+fn object_of(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
+  "obj/" ++ key_of(t, flags, [bytes_of_string(s.digest)]) ++ ".o"
+
+/// The objects `targets` names, those of `missing` compiled from `inputs`, one each, into place.
+fn compiled<[c]>(
+  t: Toolchain,
+  flags: List<String>,
+  targets: List<String>,
+  missing: List<Int>,
+  inputs: List<String>,
+  work: String,
+) -> Result<List<String>, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let object = |k: Int| work ++ "/" ++ int_to_string(at(missing, k)) ++ ".o";
+  let runs = map(range(0, len(missing)), |k: Int|
+    concat(
+      concat(t.support, concat([t.level], flags)),
+      ["-c", "-o", cache ++ "/" ++ object(k), at(inputs, k)],
+    ));
+  match ran[c](runs) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      // Into place by a rename, so a reader never sees half an object, and two builds that made the
+      // same one leave one.
+      let placed = fold(range(0, len(missing)), true, |ok: Bool, k: Int|
+        ok && toolchain.moved(object(k), at(targets, at(missing, k))));
+      if placed { Ok(map(targets, |o: String| cache ++ "/" ++ o)) }
+      else { Err("an object could not be kept in the toolchain's cache") }
+    },
+  }
+}
+
 /// Each part's object, in order: held by the cache where this compiler already made one of the same
 /// C with the same flags, and compiled now where it did not. `work` is a directory of this build's own
 /// in the cache.
@@ -180,29 +259,31 @@ pub fn objects<[c]>(
   work: String,
 ) -> Result<List<String>, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
-  let targets = map(parts.parts, |p: { label: String, text: Bytes }|
-    "obj/" ++ key_of(t, flags, [parts.head, p.text]) ++ ".o");
+  let sources = sources_of(parts);
+  let targets = map(sources, |s: Source| object_of(t, flags, s));
   let missing = filter(range(0, len(targets)), |i: Int| !toolchain.holds(at(targets, i)));
-  let source = |i: Int| work ++ "/" ++ at(parts.parts, i).label ++ ".c";
-  let object = |i: Int| work ++ "/" ++ at(parts.parts, i).label ++ ".o";
+  let source = |i: Int| work ++ "/" ++ at(sources, i).label ++ ".c";
   let written = fold(missing, true, |ok: Bool, i: Int|
     ok && toolchain.written(source(i), bytes_concat(parts.head, at(parts.parts, i).text)));
-  if !written { Err("the C to compile could not be written to the toolchain's cache") } else {
-    let runs = map(missing, |i: Int|
-      concat(
-        concat(t.support, concat([t.level], flags)),
-        ["-c", "-o", cache ++ "/" ++ object(i), cache ++ "/" ++ source(i)],
-      ));
-    match ran[c](runs) {
-      Err(why) -> Err(why),
-      Ok(_) -> {
-        // Into place by a rename, so a reader never sees half an object, and two builds that made the
-        // same one leave one.
-        let kept = fold(missing, true, |ok: Bool, i: Int| ok && toolchain.moved(object(i), at(targets, i)));
-        if kept { Ok(map(targets, |o: String| cache ++ "/" ++ o)) }
-        else { Err("an object could not be kept in the toolchain's cache") }
-      },
-    }
+  if !written { Err("the C to compile could not be written to the toolchain's cache") }
+  else { compiled[c](t, flags, targets, missing, map(missing, |i: Int| cache ++ "/" ++ source(i)), work) }
+}
+
+/// [`objects`] of sources `kept` wrote: a part whose object the cache does not hold compiles from its
+/// kept C, and one whose C the cache no longer holds either is refused.
+pub fn objects_kept<[c]>(
+  t: Toolchain,
+  sources: List<Source>,
+  flags: List<String>,
+  work: String,
+) -> Result<List<String>, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let targets = map(sources, |s: Source| object_of(t, flags, s));
+  let missing = filter(range(0, len(targets)), |i: Int| !toolchain.holds(at(targets, i)));
+  match find(missing, |i: Int| !toolchain.holds(kept_source(at(sources, i)))) {
+    Some(i) -> Err("the C of part `" ++ at(sources, i).label ++ "` is no longer kept in the toolchain's cache"),
+    None ->
+      compiled[c](t, flags, targets, missing, map(missing, |i: Int| cache ++ "/" ++ kept_source(at(sources, i))), work),
   }
 }
 
@@ -271,6 +352,23 @@ test "a text with no marks is all head, beside an empty runtime part" {
   let p = split(b"int x;\n");
   assert_eq(p.head, b"int x;\n");
   assert_eq(p.parts, [{ label: "runtime", text: b"" }])
+}
+
+test "a part's source is the digest of its C with the head before it" {
+  let p = split(unit_text());
+  let sources = sources_of(p);
+  assert_eq(map(sources, |s: Source| s.label), ["0a", "1f", "runtime"]);
+  assert_eq(at(sources, 0).digest, hex_of(blake3(bytes_concat(p.head, at(p.parts, 0).text))));
+  let moved = sources_of({ ..p, head: b"#include <y>\n" });
+  assert(at(moved, 1).digest != at(sources, 1).digest, Some("the head is part of every source"))
+}
+
+test "a manifest reads back as the sources it was written from, and nothing else reads" {
+  let sources = sources_of(split(unit_text()));
+  assert_eq(manifested(manifest(sources)), Some(sources));
+  assert_eq(manifested(b""), Some([]));
+  assert_eq(manifested(b"0a short\n"), None);
+  assert_eq(manifested(b"just-a-label\n"), None)
 }
 
 test "an object's key moves with its compiler, its level, its flags and its C" {

@@ -76,8 +76,7 @@ pub fn install_own_pack() -> Result<(), String> {
             Ok(())
         }
         None => Err(format!(
-            "`{}` carries no pack; `cargo pack {}` appends the checkout's",
-            binary.display(),
+            "`{}` carries no pack: a native program is linked with one, as `ply bootstrap` links `ply`",
             binary.display()
         )),
     }

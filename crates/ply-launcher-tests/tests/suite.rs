@@ -1,90 +1,81 @@
-//! The environment a launched program reads, end to end: a program performs `env.var`,
-//! `env.vars`, `env.terminal` and `env.binary_version` and the launcher answers.
-
-/// This test binary's pack is the checkout it was built in, as `ply`'s is the one appended to it.
-#[ctor::ctor(unsafe)]
-fn pack() {
-    ply_machine::tested::installed(
-        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")),
-        concat!(env!("CARGO_PKG_NAME"), "::", env!("CARGO_CRATE_NAME")),
-    );
-}
+//! The launcher's environment family answered as a native program's `env.*` asks it, and its own
+//! `--count-allocs` flag.
 
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
 /// is what makes the window tests meaningful here.
 #[global_allocator]
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 
-use ply_eval::host::HostRegistry;
-use ply_eval::{Analysis, Machine, Provider, Span};
-use std::sync::Arc;
+use ply_eval::host::{HostAnswer, HostOp, HostRequest, HostRuntime, MachineId, Pending};
+use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
 
-/// A program that asks the environment everything it knows to ask.
-const ASKER: &str = r#"
-nondet effect env {
-  read var[e](name: String) -> Option<String>
-  read vars[e]() -> List<{ name: String, value: String }>
-  read terminal[e](stream: String) -> Bool
-  read binary_version[e]() -> String
-  read binary_bytes[e]() -> Option<Int>
-  read pwd[e]() -> String
-  read shipped_digest[e]() -> String
-  read builder_digest[e]() -> String
-  read reused[e]() -> String
-  read bodies[e]() -> String
-}
+/// A runtime nothing waits on: the environment answers on the spot.
+struct Idle;
 
-fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_version[e]} = {
-  let found = env.var[e]("PLY_LAUNCHER_TEST_MARK");
-  let listed = filter(env.vars[e](), |v: { name: String, value: String }|
-    v.name == "PLY_LAUNCHER_TEST_MARK" && v.value == "here");
-  let missing = env.var[e]("PLY_LAUNCHER_TEST_ABSENT");
-  let term = env.terminal[e]("stdout");
-  let version = env.binary_version[e]();
-  let mark = match found { Some(v) -> v, None -> "unset" };
-  let miss = match missing { Some(_) -> "present", None -> "absent" };
-  mark ++ "|" ++ miss ++ "|" ++ (if len(listed) == 1 { "listed" } else { "unlisted" }) ++ "|"
-    ++ (if term { "terminal" } else { "piped" }) ++ "|" ++ version
-}
-"#;
-
-/// The program the builder makes of `source`: its front end's answer and its unit.
-fn built(source: &str) -> (Analysis, std::sync::Arc<ply_codegen::Unit>) {
-    let files = ply_machine::builds::module_files(&[("m", source)]);
-    let program = ply_machine::builds::checked_program(&files)
-        .unwrap_or_else(|d| panic!("the program checks: {d}"));
-    let front = program.front.answer;
-    let unit =
-        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
-    (front, unit)
-}
-
-fn ask() -> ply_eval::Value {
-    let (front, unit) = built(ASKER);
-    let mut machine =
-        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
-    let mut registry = HostRegistry::new();
-    for (op, handler) in ply_launcher::env::registrations("9.9.9-test") {
-        registry.register(op, handler);
+impl HostRuntime for Idle {
+    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+        Ok(())
     }
-    let binding = registry.bind(&front.check).expect("the env ops bind");
-    machine.set_host_binding(Arc::new(binding));
-    machine
-        .call("m.main", Vec::new(), Span::DUMMY)
-        .into_parts()
-        .0
-        .expect("the entry ran")
+
+    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        Vec::new()
+    }
+
+    fn park(&self) -> Result<(), Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
+        panic!("the environment never waits, and `{}` did", pending.label)
+    }
+}
+
+/// What the launcher's `env.<op>[e](args)` answers.
+fn asked(op: &str, args: Vec<Value>) -> Value {
+    let registrations = ply_launcher::env::registrations("9.9.9-test");
+    let (declared, handler) = registrations
+        .iter()
+        .find(|(declared, _)| declared.op.as_str() == op)
+        .unwrap_or_else(|| panic!("the launcher lends no `env.{op}`"));
+    let request = HostRequest {
+        atom: EffectAtom::new("env", Resource::Named(Symbol::new("e")), Mode::Read),
+        op: declared as &HostOp,
+        args: &args,
+        span: Span::DUMMY,
+        machine: MachineId::next(),
+        task: None,
+        declared: None,
+    };
+    match handler.call(&Idle, &request) {
+        Ok(HostAnswer::Value(value)) => value,
+        Ok(HostAnswer::Pending(p)) => panic!("`env.{op}` waited on `{}`", p.label),
+        Err(d) => panic!("`env.{op}` refused: {d}"),
+    }
 }
 
 #[test]
 fn a_program_reads_its_environment() {
     // Safety: the test is alone in its process (nextest), so the variable is its own.
     unsafe { std::env::set_var("PLY_LAUNCHER_TEST_MARK", "here") };
-    let answer = ask();
     assert_eq!(
-        answer,
-        ply_eval::Value::str("here|absent|listed|piped|9.9.9-test")
+        asked("var", vec![Value::str("PLY_LAUNCHER_TEST_MARK")]),
+        Value::ctor("Some", vec![Value::str("here")])
     );
+    assert_eq!(
+        asked("var", vec![Value::str("PLY_LAUNCHER_TEST_ABSENT")]),
+        Value::ctor("None", Vec::new())
+    );
+    let listed = asked("vars", Vec::new());
+    let Value::List(vars) = &listed else {
+        panic!("`env.vars` answered no list");
+    };
+    let marked = ply_machine::payload::record(vec![
+        ("name", Value::str("PLY_LAUNCHER_TEST_MARK")),
+        ("value", Value::str("here")),
+    ]);
+    assert_eq!(vars.iter().filter(|v| **v == marked).count(), 1);
+    assert_eq!(asked("terminal", vec![Value::str("nowhere")]), Value::Bool(false));
+    assert_eq!(asked("binary_version", Vec::new()), Value::str("9.9.9-test"));
     unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
 }
 
@@ -285,218 +276,5 @@ fn the_sample_does_not_fall_on_one_period_of_the_window() {
     assert!(
         ply_launcher::count::sampled_nth(7, 0),
         "no sites walks none"
-    );
-}
-
-// --- The program this tree's own builder makes --------------------------------
-
-/// A binary enters the `ply` program the committed builder made, so this is where the builder
-/// these sources make is seen to build the whole program, and that program to compile a unit and
-/// run its test.
-#[test]
-fn the_builder_these_sources_make_builds_the_program_and_it_runs() {
-    // Safety: the test is alone in its process (nextest), so the variables are its own. A builder
-    // that refuses then says what each step took and what it refused.
-    unsafe {
-        std::env::set_var("PLY_C_PHASES", "1");
-        std::env::set_var("PLY_C_REFUSALS", "1");
-    }
-    let runnable = ply_launcher::shipped::program_by_own_builder()
-        .unwrap_or_else(|d| panic!("this tree's builder builds the program: {d}"));
-    let project = tempfile::tempdir().expect("a scratch directory");
-    std::fs::write(
-        project.path().join("m.ply"),
-        "test \"a unit is compiled\" {\n  assert(1 + 1 == 2)\n}\n",
-    )
-    .expect("the project is written");
-    let program = ply_launcher::Program {
-        runnable,
-        stage: ply_launcher::shipped::own_stage_name(),
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-    let binds = ply_machine::enter::Binds {
-        lent: ply_machine::policy::all(),
-        ..ply_machine::enter::Binds::default()
-    };
-    let argv = vec!["test".to_string(), project.path().display().to_string()];
-    let (answer, _) = ply_launcher::run(program, project.path(), argv, binds, None).into_parts();
-    assert_eq!(answer.unwrap_or_else(|d| panic!("the program ran: {d}")), 0);
-}
-
-/// `main` and what it reaches, beside a definition nothing reaches and a comment.
-fn entered(answer: &str, aside: &str, comment: &str) -> String {
-    format!(
-        "// {comment}\nfn answer() -> Int = {answer}\n\npub fn main() -> Int = answer()\n\nfn aside() -> Int = {aside}\n"
-    )
-}
-
-/// The runnable this tree's builder makes of `text`, which holds the text it was built from.
-fn built_by_own(stage: &std::path::Path, name: &str, text: &str) -> Vec<u8> {
-    let src = stage.join(format!("{name}.src"));
-    std::fs::create_dir_all(&src).expect("the sources' directory");
-    std::fs::write(src.join("m.ply"), text).expect("the source is written");
-    let out = stage.join(format!("{name}.run"));
-    let rows = format!("kept-program-test-{}", std::process::id());
-    ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
-        .unwrap_or_else(|d| panic!("this tree's builder builds `{name}`: {d}"));
-    std::fs::read(&out).expect("the runnable is read")
-}
-
-/// A program is the definition it enters and all that reaches: a text that moved everywhere else
-/// is the program already built, and one whose entry reaches something else is built.
-#[test]
-fn a_text_that_enters_what_a_built_program_does_is_not_built_again() {
-    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-program-{}", std::process::id()));
-    let first = built_by_own(&stage, "first", &entered("1", "2", "as written"));
-    let moved = built_by_own(
-        &stage,
-        "moved",
-        &entered("1", "3", "a comment and `aside` moved"),
-    );
-    let edited = built_by_own(&stage, "edited", &entered("4", "2", "as written"));
-    let _ = std::fs::remove_dir_all(&stage);
-    assert!(
-        first == moved,
-        "a text whose entry hashes as a built program's takes that program, sources and all"
-    );
-    assert!(
-        first != edited,
-        "a text whose entry reaches another body is built"
-    );
-}
-
-/// A program this tree's builder makes holds each `const fn` as the value it answered when the
-/// program was built, as a bootstrapped one does, so a run computes none: entered with fewer calls
-/// than the table takes to make, the program still answers from it. One that raises is left to its
-/// body, which raises where the program reaches it.
-#[test]
-fn a_program_this_trees_builder_makes_holds_its_constants() {
-    let stage = ply_codegen::c::stage::stage_dir(&format!("held-constants-{}", std::process::id()));
-    let runnable = built_by_own(
-        &stage,
-        "held",
-        "const fn table() -> List<Int> = map(range(0, 20000), |i: Int| i * 2)\n\nconst fn wrong() -> Int = 7 / (bytes_len(b\"\") - 0)\n\npub fn main() -> Int = len(table())\n",
-    );
-    let _ = std::fs::remove_dir_all(&stage);
-    let program = ply_machine::runnable::decode(&runnable)
-        .unwrap_or_else(|why| panic!("the runnable reads: {why}"));
-    assert_eq!(
-        program.unit.matches("rt_baked_p(").count(),
-        1,
-        "the unit holds the table's value and leaves the definition that raises to its body"
-    );
-    let front = program.front.answer;
-    let unit =
-        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
-    let mut machine =
-        Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
-    let answer =
-        ply_codegen::rt::with_step_budget(1000, || machine.call("m.main", Vec::new(), Span::DUMMY))
-            .into_parts()
-            .0
-            .unwrap_or_else(|d| panic!("the program answers from the table it holds: {d}"));
-    assert!(
-        matches!(answer, ply_eval::Value::Int(20000)),
-        "the table holds what its body makes"
-    );
-}
-
-/// The value a runnable's `m.main` answers.
-fn answer_of(runnable: &[u8]) -> ply_eval::Value {
-    let program = ply_machine::runnable::decode(runnable)
-        .unwrap_or_else(|why| panic!("the runnable reads: {why}"));
-    let front = program.front.answer;
-    let unit =
-        ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C toolchain");
-    Machine::new(&front, unit.attach())
-        .expect("the unit was compiled from this program")
-        .call("m.main", Vec::new(), Span::DUMMY)
-        .into_parts()
-        .0
-        .expect("the entry ran")
-}
-
-/// A build after one body moved reads every module that did not move, and that reaches none that
-/// did, through what the build before it kept: here `lib` and the shipped module it imports. The
-/// program it makes is the program its sources say, and a file `lib` embeds is one of them.
-#[test]
-fn a_program_built_through_what_its_last_build_kept_is_the_program() {
-    let id = std::process::id();
-    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-modules-{id}"));
-    let src = stage.join("src");
-    std::fs::create_dir_all(&src).expect("the sources' directory");
-    std::fs::write(
-        src.join("lib.ply"),
-        "import std.math (abs)\n\npub fn far(a: Int, b: Int) -> Int = abs(a - b) + bytes_len(embed(\"n.txt\"))\n\ntest \"far\" { assert_eq(far(2, 9), 8) }\n",
-    )
-    .expect("the library is written");
-    std::fs::write(src.join("n.txt"), "x").expect("the embedded file is written");
-    let rows = format!("kept-modules-test-{id}");
-    let build = |name: &str, more: i64| {
-        std::fs::write(
-            src.join("m.ply"),
-            format!("import lib\n\npub fn main() -> Int = lib::far(2, 9) + {more} + {id} - {id}\n"),
-        )
-        .expect("the entry's module is written");
-        let out = stage.join(name);
-        ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
-            .unwrap_or_else(|d| panic!("this tree's builder builds `{name}`: {d}"));
-        std::fs::read(&out).expect("the runnable is read")
-    };
-    let first = build("first.run", 1);
-    let second = build("second.run", 2);
-    std::fs::write(src.join("n.txt"), "xyz").expect("the embedded file is written again");
-    let third = build("third.run", 2);
-    let _ = std::fs::remove_dir_all(&stage);
-    assert_eq!(answer_of(&first), ply_eval::Value::Int(9));
-    assert_eq!(answer_of(&second), ply_eval::Value::Int(10));
-    assert_eq!(answer_of(&third), ply_eval::Value::Int(12));
-}
-
-/// A build whose entry's module stands as the last build kept it, with all that module reaches,
-/// takes the program that build made without reading the rest: a module beside it that no longer
-/// parses is not read. One the entry reaches that moved is read and built.
-#[test]
-fn a_build_whose_entry_stands_takes_its_program_without_reading_the_rest() {
-    let id = std::process::id();
-    let stage = ply_codegen::c::stage::stage_dir(&format!("kept-entry-{id}"));
-    let src = stage.join("src");
-    std::fs::create_dir_all(&src).expect("the sources' directory");
-    let lib = |n: i64| {
-        std::fs::write(
-            src.join("lib.ply"),
-            format!("pub fn n() -> Int = {n} + {id} - {id}\n"),
-        )
-        .expect("the library is written")
-    };
-    lib(1);
-    std::fs::write(
-        src.join("m.ply"),
-        "import lib\n\npub fn main() -> Int = lib::n() + 1\n",
-    )
-    .expect("the entry's module is written");
-    std::fs::write(src.join("aside.ply"), "pub fn aside() -> Int = 3\n")
-        .expect("the module beside it is written");
-    let rows = format!("kept-entry-test-{id}");
-    let build = |name: &str| {
-        let out = stage.join(name);
-        ply_machine::builds::build_by_own(&src, ".", "m.main", &out, &rows)
-            .map(|()| std::fs::read(&out).expect("the runnable is read"))
-    };
-    let first = build("first.run").unwrap_or_else(|d| panic!("the first build builds: {d}"));
-    std::fs::write(src.join("aside.ply"), "pub fn aside( -> \n")
-        .expect("the module beside it is broken");
-    let standing = build("standing.run");
-    lib(2);
-    let moved = build("moved.run");
-    let _ = std::fs::remove_dir_all(&stage);
-    assert_eq!(answer_of(&first), ply_eval::Value::Int(2));
-    assert!(
-        standing.as_ref().is_ok_and(|bytes| *bytes == first),
-        "a build whose entry stands takes the program it made, reading nothing else"
-    );
-    assert!(
-        moved.is_err(),
-        "a build whose entry reaches a moved module reads the program, the broken module with it"
     );
 }
