@@ -78,7 +78,8 @@ fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
     inc(child as Word);
     assert_eq!(reset(o as Word), o as Word);
     unsafe {
-        assert_eq!((*o).len, 0);
+        assert_eq!((*o).len, 2);
+        assert_eq!((*o).flags & FLAT, FLAT);
         assert_eq!((*o).rc, 1);
         assert_eq!((*o).kind, KIND_RECORD);
         assert_eq!((*child).rc, 1, "the field was let go once");
@@ -101,6 +102,27 @@ fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
 }
 
 #[test]
+fn a_reset_record_released_unused_goes_back_to_its_own_size() {
+    let mut h = Heap::new();
+    let child = h.alloc(KIND_RECORD, 0, 1, 0);
+    unsafe { set_word(child, 0, imm(1)) };
+    let o = h.alloc(KIND_RECORD, 0, 3, 0);
+    unsafe {
+        set_word(o, 0, child as Word);
+        set_word(o, 1, imm(2));
+        set_word(o, 2, imm(3));
+    }
+    ply_codegen::heap::enter(&mut h);
+    assert_eq!(reset(o as Word), o as Word);
+    dec(o as Word);
+    ply_codegen::heap::leave();
+    unsafe { assert_eq!((*child).kind, KIND_DEAD, "the field was let go") };
+    let one = h.alloc(KIND_RECORD, 0, 1, 0);
+    assert_ne!(one, o, "a three-word block was filed as a one-word one");
+    assert_eq!(h.alloc(KIND_RECORD, 0, 3, 0), o);
+}
+
+#[test]
 fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
     let mut h = Heap::new();
     let child = h.alloc(KIND_RECORD, 0, 1, 0);
@@ -110,7 +132,8 @@ fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
     inc(child as Word);
     assert_eq!(reset(o as Word), o as Word);
     unsafe {
-        assert_eq!((*o).len, 0);
+        assert_eq!((*o).len, 1);
+        assert_eq!((*o).flags & FLAT, FLAT);
         assert_eq!((*o).rc, 1);
         assert_eq!((*child).rc, 1, "the argument was let go once");
     }
