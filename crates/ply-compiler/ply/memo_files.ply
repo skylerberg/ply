@@ -6,16 +6,17 @@
 //! only the marks there are. A run reads the records it asks for and no other, and keeps what it
 //! answered as files of their own, each landed whole by a rename, so runs that keep the same answer
 //! at once leave one. What it keeps is written in batches, as it ends or once enough waits: marks at
-//! once, and a record only after the notes of what it read.
+//! once, a record only after the notes of what it read, and a mark's removal only after the record
+//! that settled it, so a run that dies leaves every record it had not kept marked.
 
 import std.bin
 import std.fs
 import std.fs (fs, under)
 import std.bytes (bytes_of_hex, hex_of)
 import std.list (contains)
-import memo (Record, Seen, memo_keep, digest_of, head_bytes, output_named, height_named,
-             inline_named, kept_inline, output_path, record_bytes, record_from, record_path,
-             seen_bin)
+import memo (Record, Seen, memo, memo_keep, answer, started, digest_of, head_bytes, output_named,
+             height_named, inline_named, kept_inline, output_path, record_bytes, record_from,
+             record_path, seen_bin)
 
 fn records_dir(dir: String) -> String = under(dir, "records")
 
@@ -34,16 +35,18 @@ fn runs_dir(dir: String) -> String = under(dir, "runs")
 fn at(dir: String, path: String) -> String = dir ++ "/" ++ path
 
 /// What a run kept and has not written yet: records by key, the answers no record holds by digest,
-/// and the keys of the records that read each place or asked each record, by its id; and about how
-/// many bytes that is.
+/// the keys of the records that read each place or asked each record, by its id, and the files of
+/// the marks it settled; and about how many bytes that is.
 type Pending = {
   records: Map<Bytes, Bytes>,
   outputs: Map<Bytes, Bytes>,
   links: Map<Bytes, Bytes>,
+  unmarks: Map<String, Bool>,
   size: Int,
 }
 
-fn no_pending() -> Pending = { records: map_new(), outputs: map_new(), links: map_new(), size: 0 }
+fn no_pending() -> Pending =
+  { records: map_new(), outputs: map_new(), links: map_new(), unmarks: map_new(), size: 0 }
 
 /// How many bytes a run holds unwritten before it writes them.
 fn pending_bound() -> Int = 67108864
@@ -156,7 +159,8 @@ pub fn kept<a, [r] | e>(
               }
             };
             // What the run kept so far, written: each answer, then each read's new readers, then each
-            // record, so a record is never there without the notes that mark it.
+            // record, so a record is never there without the notes that mark it, then the marks it
+            // settled, so a mark never goes before the record that settled it is there.
             let flushed = || {
               let p = cell_get(pending);
               map_fold(p.outputs, (), |_: Unit, digest: Bytes, output: Bytes| {
@@ -181,6 +185,10 @@ pub fn kept<a, [r] | e>(
               });
               map_fold(p.records, (), |_: Unit, key: Bytes, b: Bytes|
                 landed(at(dir, record_path(key)), b));
+              map_fold(p.unmarks, (), |_: Unit, path: String, _: Bool| {
+                fs.remove[r](path);
+                ()
+              });
               cell_set(pending, no_pending())
             };
             let held = |p: Pending| if p.size > pending_bound() { flushed() };
@@ -334,7 +342,17 @@ pub fn kept<a, [r] | e>(
                 None -> [],
               },
               memo_keep.marked() -> {
-                let now = marks_in[r](dir);
+                let gone = cell_get(pending).unmarks;
+                let now = map_fold(
+                  marks_in[r](dir),
+                  map_new(),
+                  |acc: Map<Bytes, List<Bytes>>, key: Bytes, ms: List<Bytes>|
+                    map_insert(
+                      acc,
+                      key,
+                      filter(ms, |m: Bytes| !map_contains(gone, mark_path(dir, key, m))),
+                    ),
+                );
                 cell_set(marking, now);
                 map_fold(now, [], |acc: List<Bytes>, k: Bytes, ms: List<Bytes>|
                   if len(ms) == 0 { acc } else { push(acc, k) })
@@ -353,10 +371,15 @@ pub fn kept<a, [r] | e>(
                 )
               },
               memo_keep.unmark(key, gone) -> {
-                fold(gone, (), |_: Unit, m: Bytes| {
-                  fs.remove[r](mark_path(dir, key, m));
-                  ()
-                });
+                let p = cell_get(pending);
+                let next = fold(gone, p, |acc: Pending, m: Bytes|
+                  {
+                    ..acc,
+                    unmarks: map_insert(acc.unmarks, mark_path(dir, key, m), true),
+                    size: acc.size + 160,
+                  });
+                cell_set(pending, next);
+                held(next);
                 let held = cell_get(marking);
                 cell_set(
                   marking,
@@ -615,4 +638,35 @@ test "a readers file's keys are each read once" {
     key(b"b"),
   ]);
   assert_eq(keys_in(None), [])
+}
+
+fn size_of(input: Bytes) -> Bytes / {memo.read} =
+  match memo.world(b"file", input) {
+    Some(text) -> bytes_of_string(int_to_string(bytes_len(text))),
+    None -> b"none",
+  }
+
+fn sized_up(input: Bytes) -> Bytes / {memo.read} = bytes_concat(b"size ", memo.ask(b"size", input))
+
+/// What `sized` answers over the store in `s` for a file holding `text`.
+fn sized_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} = {
+  let queries = map_insert(
+    map_insert(map_new(), b"size", { name: b"size", hash: b"s1", body: size_of }),
+    b"sized",
+    { name: b"sized", hash: b"u1", body: sized_up },
+  );
+  kept[r]("s", |_: String| None, |_: Bytes, _: Bytes| Some(text), ||
+    answer(queries, started(queries), b"sized", b"a").output)
+}
+
+test "a run that dies after any write leaves a store its next run answers from as a fresh one" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || sized_over[abs](b"four"));
+  assert_eq(first.value, b"size 4");
+  let whole = fs::on_mem[abs](first.tree, || sized_over[abs](b"forty")).tree;
+  let writes = iterate(0, 1000, |n: Int| {
+    let died = fs::on_mem_failing[abs](first.tree, n, || sized_over[abs](b"forty"));
+    assert_eq(fs::on_mem[abs](died.tree, || sized_over[abs](b"forty")).value, b"size 5");
+    if died.tree.files == whole.files { Stop(n) } else { Continue(n + 1) }
+  });
+  assert(writes > 0)
 }
