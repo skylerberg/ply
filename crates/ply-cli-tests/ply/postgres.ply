@@ -1,14 +1,17 @@
-//! A postgres cluster of a test's own, for the tests that drive a real server: initialised under the
-//! working directory, served on a port nothing held, reached over TCP with its superuser's password,
-//! and stopped when the test is done. The run binds `initdb`, `postgres` and `psql` with `--exec`;
+//! A postgres cluster of a test's own, for the tests that drive a real server: initialised in the
+//! working directory, which a launch empties first, so a test writes its program after the cluster
+//! starts; served on a port nothing held, reached over TCP with its superuser's password, and stopped
+//! when the test is done. The run binds `initdb`, `postgres` and `psql` with `--exec`;
 //! a run that binds none skips these tests, except under CI, which promises a postgres.
 
-import harness (Here, Wire, environment, reserve, working)
+import harness (Here, Wire, answered_text, environment, fresh, reserve, working)
+import cli.machine (machine)
 import std.config (config)
 import std.fs (fs)
 import std.list (concat)
-import std.process (process, Finished, Var, exit_code, Discard, Interrupt)
+import std.process (process, Finished, Var, exit_code, Discard, Interrupt, Keep)
 import std.time (time)
+import std.value (VStr)
 
 pub effect set Postgres = {process.read[initdb], process.write[initdb], process.read[postgres], process.write[postgres], process.read[psql], process.write[psql], config.get[env], time.read, time.write}
 
@@ -59,10 +62,17 @@ fn launched(
   password: String,
   tls: Option<(String, String)>,
 ) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} = {
-  let dir = "pg-" ++ name;
-  let data = working() ++ "/" ++ dir ++ "/data";
-  let _ = fs.create_dir[cwd](dir);
+  fresh();
+  let dir = match fs.temp_dir[cwd](".", "pg-" ++ name ++ "-") {
+    Some(d) -> d,
+    None -> panic("a directory for the cluster"),
+  };
   let _ = fs.write_file[cwd](dir ++ "/password", bytes_of_string(password));
+  let root = match fs.canonical[cwd](dir) {
+    Some(p) -> p,
+    None -> panic("the cluster's directory has a path"),
+  };
+  let data = root ++ "/data";
   let _ = ran(
     process.spawn[initdb](
       [
@@ -76,7 +86,7 @@ fn launched(
         "--locale=C",
         "--auth-local=" ++ auth,
         "--auth-host=" ++ auth,
-        "--pwfile=" ++ working() ++ "/" ++ dir ++ "/password",
+        "--pwfile=" ++ root ++ "/password",
       ],
       "",
       environment([]),
@@ -120,23 +130,35 @@ fn launched(
       ),
       "",
       environment([]),
-      { input: false, out: Discard, err: Discard },
+      { input: false, out: Discard, err: Keep },
     ) {
     Ok(child) -> child,
     Err(why) -> panic("postgres did not start: " ++ why),
   };
   let cluster = { dir: dir, port: port, server: server, password: password };
-  ready(cluster, 300);
+  match ready(cluster, 300, "") {
+    None -> (),
+    Some(why) -> {
+      let _ = process.signal[postgres](server, Interrupt);
+      let said = match process.wait[postgres](server, 10000) {
+        Some(f) -> string_of_bytes_lossy(f.err),
+        None -> "",
+      };
+      panic("postgres did not become ready within thirty seconds: " ++ why ++ "\n" ++ said)
+    },
+  };
   let _ = psql(cluster, "postgres", "create database " ++ name);
   cluster
 }
 
-/// The cluster once it answers, within `tries` tenths of a second.
-fn ready(c: Cluster, tries: Int) -> Unit / {Postgres, abort.raise, diverges} =
-  if tries <= 0 { panic("postgres did not become ready within thirty seconds") }
-  else if exit_code(asked(c, "postgres", "select 1")) == Some(0) { () } else {
-    time.sleep_ms(100);
-    ready(c, tries - 1)
+/// Why the cluster did not answer within `tries` tenths of a second, if it did not.
+fn ready(c: Cluster, tries: Int, last: String) -> Option<String> / {Postgres, diverges} =
+  if tries <= 0 { Some(last) } else {
+    let f = asked(c, "postgres", "select 1");
+    if exit_code(f) == Some(0) { None } else {
+      time.sleep_ms(100);
+      ready(c, tries - 1, string_of_bytes_lossy(f.err))
+    }
   }
 
 fn asked(c: Cluster, database: String, sql: String) -> Finished / {Postgres} =
@@ -171,6 +193,18 @@ pub fn stop(c: Cluster) -> Unit / {Postgres} = {
   let _ = process.wait[postgres](c.server, 10000);
   ()
 }
+
+/// The program loaded under `run` dropped, then the cluster stopped.
+pub fn done(c: Cluster) -> Unit / {machine.drop[run], Postgres} = {
+  machine.drop[run]();
+  stop(c)
+}
+
+/// What `inner.<entry>` answered given a connection string `url`, as `Ok`'s text or `Err`'s.
+pub fn over(
+  entry: String,
+  url: String,
+) -> Result<String, String> / {machine.call[run], abort.raise} = answered_text(entry, [VStr(url)])
 
 /// `postgres://ply:<password>@<host>:<port>/<database>?<query>`, the password as given.
 pub fn url(c: Cluster, host: String, database: String, query: String) -> String =

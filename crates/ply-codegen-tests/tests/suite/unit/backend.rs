@@ -40,7 +40,7 @@ fn defs() -> Vec<Def> {
 fn opened(dir: &std::path::Path, program: &[u8]) -> Option<(&'static Analysis, Arc<Unit>)> {
     let defs = defs();
     let lib = units::library(dir, &units::text(&defs, &units::exports_of(&defs)))?;
-    let front: &'static Analysis = Box::leak(Box::new(units::front(program, &defs)));
+    let front: &'static Analysis = Box::leak(Box::new(units::front(program, &defs, &[])));
     Some((front, Unit::opened(front, &lib).expect("the unit opens")))
 }
 
@@ -195,4 +195,57 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     );
     assert_eq!(call(&mut machine).ok(), Some(Value::Int(16)));
     assert_eq!(b.entered(), before + 1);
+}
+
+/// A constant's answer crosses back in as memo words, so a pure root entered over it again is
+/// answered from the memo and runs nothing; a root that is not pure runs every time it is entered.
+#[test]
+fn a_pure_root_over_memo_words_is_answered_from_the_memo() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let counted = "  ctx->ticks += 1;\n  return ply_imm(7);";
+    let defs = vec![
+        def(
+            "m.table",
+            0,
+            "  ctx->ticks += 1;\n  return builtin_int_to_string_p(ctx, ply_imm(123));",
+        ),
+        def("m.weigh", 1, counted),
+        def("m.post", 1, counted),
+    ];
+    let mut exports = units::exports_of(&defs);
+    exports.constants = vec!["m.table".to_string()];
+    exports.lambdas = vec![format!("{}_entry", units::symbol("m.table"))];
+    let Some(lib) = units::library(dir.path(), &units::text(&defs, &exports)) else {
+        return;
+    };
+    let front: &'static Analysis =
+        Box::leak(Box::new(units::front(b"p", &defs, &["m.table", "m.weigh"])));
+    let unit = Unit::opened(front, &lib).expect("the unit opens");
+    let b = bodies(&unit);
+    let mut machine = Machine::new(front, b.clone()).expect("the unit describes the program");
+    let mut call = |name: &str, args: Vec<Value>| {
+        let answer = machine
+            .call(name, args, Span::DUMMY)
+            .into_parts()
+            .0
+            .unwrap_or_else(|d| panic!("`{name}` raised: {d}"));
+        (answer, b.steps())
+    };
+    let (table, made) = call("m.table", vec![]);
+    assert_eq!(table, Value::str("123"));
+    assert!(made > 0, "the constant's first entry did not run its body");
+    assert_eq!(call("m.table", vec![]).1, 0, "the constant ran again");
+
+    let (first, ran) = call("m.weigh", vec![table.clone()]);
+    assert!(ran > 0, "the first entry did not run the body");
+    let (second, again) = call("m.weigh", vec![table.clone()]);
+    assert_eq!(second, first);
+    assert_eq!(again, 0, "the second entry ran the body again");
+
+    for entry in 1..=2 {
+        assert!(
+            call("m.post", vec![table.clone()]).1 > 0,
+            "entry {entry} of a root that is not pure was answered by an earlier one"
+        );
+    }
 }
