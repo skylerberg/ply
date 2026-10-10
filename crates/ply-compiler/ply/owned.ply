@@ -7,24 +7,25 @@
 
 import std.bin
 import std.list (at, concat, contains, flatten, sort_by)
+import std.bytes (join)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
               OLaw, OFn, OTest, LawOutline, read_outline, module_tables_bin, rows_bin,
               tagged_site_bin, statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin,
               ModuleShape, ModuleTables, Rows, KnownDefRow, KnownTestRow, TaggedSite, StatementSite,
               TypedConst, module_facts, no_module_tables, rows_of, of_module,
-              analyse_pulling_std_with, faceted)
+              analyse_pulling_std_with, faceted, names_embed)
 import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModule, exports_of,
-                entry_bin, entries_in, import_targets, owner_source, checked_owner, item_owner,
-                owner_reads, module_scope, owner_mentions, owner_groups, group_source,
-                unplaced_imports, group_imports)
-import items (Item, IFn, parse, item_span, SCost)
+                entry_bin, entries_in, import_targets, owner_source, checked_owner, owner_reads,
+                module_scope, owner_mentions, owner_groups, group_source, unplaced_imports,
+                group_imports, laid_items)
+import items (Item, IFn, parse, item_span, SCost, item_owner)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
               NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, UpdateShape,
               WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts, test_owner)
 import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
 import exprs (TaggedPart)
-import embed (EmbedAt, embed_at_bin)
+import embed (EmbedAt, EmbedWant, embed_at_bin, embed_key, wants_of)
 import hash (Shapes, UseNode, LawNode, kept_forms, shapes_bin, use_node_bin, unreached)
 
 /// What a check of a group of owners answered of one of them, every place module 0's and counted from
@@ -434,7 +435,18 @@ pub fn said_group(
       }),
     refused: [],
     forms: kept_forms(w.index, w.module_packages, slot, keeps),
-    embeds: filter(w.embeds, |e: EmbedAt| e.module == module),
+    // Only what its own items embed, as they are written: another group's files are that group's.
+    embeds: {
+      let text = join(
+        fold(members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.texts)),
+        b"\n\n",
+      );
+      let wanted = if !names_embed(text) { map_new() } else {
+        fold(wants_of(parse(text).node), map_new(), |acc: Map<Bytes, Bool>, want: EmbedWant|
+          map_insert(acc, embed_key(want), true))
+      };
+      filter(w.embeds, |e: EmbedAt| e.module == module && map_contains(wanted, e.key))
+    },
   }
 }
 
@@ -1021,6 +1033,39 @@ test "a module put together from its groups' answers is what its check answers" 
       src: b"pub fn enc(data: Bytes) -> String / {abort.raise}\n  cost bytes_len(data)\n= string_of_bytes(data)\n\npub fn plain(text: String) -> String = text\n\nlaw \"plain is idempotent\" forall (t: String) { plain(plain(t)) == plain(t) }\n",
     },
   ])
+}
+
+test "a group holds the files its own items embed, and no other group's" {
+  let src = b"pub fn a() -> Bytes = embed(\"x.txt\")\n\npub fn b() -> Bytes = embed(\"y.txt\")\n\npub fn c() -> Int = 1\n";
+  let file = |path: Bytes|
+    {
+      root: b"",
+      module: b"m",
+      want: { path: path, dir: false },
+      read: Ok([{ name: path, bytes: path }]),
+    };
+  let w = match analyse_pulling_std_with(
+      [{ name: b"m", src: src }],
+      [],
+      [],
+      [],
+      embeds: [file(b"x.txt"), file(b"y.txt")],
+    ).out {
+    Analysed(w) -> w,
+    Refused(_) -> panic("the fixture checks"),
+  };
+  let said = said_of(w, 0, src);
+  let reads = owner_reads(at(w.mods, 0), parse(src).node, src);
+  let held = |owner: Bytes| {
+    let members = filter(reads, |o: OwnerRead| o.owner == owner);
+    map(
+      said_group(said, b"m", members, laid_items(members), |x: ItemAt| x.to).embeds,
+      |e: EmbedAt| e.key,
+    )
+  };
+  assert_eq(held(b"a"), [b"file:x.txt"]);
+  assert_eq(held(b"b"), [b"file:y.txt"]);
+  assert_eq(held(b"c"), [])
 }
 
 fn core_fixture() -> Bytes =
