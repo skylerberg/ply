@@ -58,7 +58,8 @@ pub type Query = { name: Bytes, hash: Bytes, body: (Bytes) -> Bytes / {memo.read
 /// in order, the keys being answered now, which a query asking
 /// one of them again would wait on forever, and, by query, how many answers it took as kept and how
 /// many it ran the body for. While the run settles marks, `marked` holds the records it marked whose
-/// marks are still to settle, lowest first. `offers` holds what a body offered for another key.
+/// marks are still to settle, lowest first. `offers` holds what a body offered for another key, and
+/// `noted` the queries whose places the run has brought to the hashes it asks them under.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
@@ -69,6 +70,7 @@ pub type Run = {
   settling: Bool,
   marked: Map<Int, List<Bytes>>,
   offers: Map<Bytes, Bytes>,
+  noted: Map<Bytes, Bool>,
 }
 
 fn new_run() -> Run =
@@ -82,6 +84,7 @@ fn new_run() -> Run =
     settling: false,
     marked: map_new(),
     offers: map_new(),
+    noted: map_new(),
   }
 
 /// What the run's driver asked, each read by the digest of what it answered: what an answer made
@@ -388,17 +391,18 @@ fn seen_again(
 /// that asked it only where its answer moved. A record of a query this run does not answer, a
 /// command's answer among them, keeps its mark for the run that asks it.
 pub fn started(queries: Map<Bytes, Query>) -> Run / {memo_keep.read, memo_keep.write, abort.raise} = {
-  fold(memo_keep.places(), (), |_: Unit, s: Seen| {
+  let noted = fold(memo_keep.places(), map_new(), |acc: Map<Bytes, Bool>, s: Seen| {
     seen_now(queries, s.kind, s.at, |id: Bytes| {
       marked_readers(id, map_new());
       ()
     });
-    ()
+    if s.kind == query_kind() { map_insert(acc, s.at, true) } else { acc }
   });
   settled_marks(queries, {
     ..new_run(),
     settling: true,
     marked: queued(map_new(), memo_keep.marked()),
+    noted: noted,
   })
 }
 
@@ -620,16 +624,18 @@ fn read_ids(queries: Map<Bytes, Query>, reads: List<Read>) -> Map<Bytes, Bool> =
 fn asked_id(name: Bytes, input: Bytes) -> Bytes =
   blake3(bytes_concat_all([layout(), b".asked\x00", sized(name), input]))
 
-/// Notes the queries `reads` asked at their places, so a record that asked one is marked where its
-/// hash moves.
+/// `run` with the queries `reads` asked noted at their places, so a record that asked one is marked
+/// where its hash moves; a query `run` has noted already is not read again.
 fn noted_asked(
   queries: Map<Bytes, Query>,
+  run: Run,
   reads: List<Read>,
-) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} =
-  fold(map_keys(asked_names(reads)), (), |_: Unit, name: Bytes| {
-    seen_again(queries, query_kind(), name);
-    ()
-  })
+) -> Run / {memo_keep.read, memo_keep.write, abort.raise} =
+  fold(map_keys(asked_names(reads)), run, |r: Run, name: Bytes|
+    if map_contains(r.noted, name) { r } else {
+      seen_again(queries, query_kind(), name);
+      { ..r, noted: map_insert(r.noted, name, true) }
+    })
 
 /// The record the toolchain packed under `key`, kept in the run's store where each read it made
 /// answers as it did, each noted among the readers of what it reads before it is asked; else `q`'s
@@ -655,8 +661,8 @@ fn adopted(
         let before = memo_keep.head(key);
         let s = stands(queries, run, r.reads, left - 1);
         if s.ok {
-          noted_asked(queries, r.reads);
-          let changed = answer_moved(queries, s.run, asked_id(q.name, input), before, r.output);
+          let confirmed = noted_asked(queries, s.run, r.reads);
+          let changed = answer_moved(queries, confirmed, asked_id(q.name, input), before, r.output);
           memo_keep.adopt(key, r);
           if len(marks) > 0 { memo_keep.unmark(key, marks) };
           took(changed, q.name, r.output)
@@ -798,10 +804,10 @@ fn executed(
           World(kind, at, d) -> m || seen_again(queries, kind, at) != d,
           Asked(_, _, _) -> m,
         });
-      noted_asked(queries, s.reads);
+      let confirmed = noted_asked(queries, s.run, s.reads);
       if moved { memo_keep.mark(key) };
       let d = digest_of(Some(output));
-      let changed = answer_moved(queries, s.run, asked_id(q.name, input), before, d);
+      let changed = answer_moved(queries, confirmed, asked_id(q.name, input), before, d);
       // A height only orders settling, so it never falls: a record that read less for a while (its
       // group gone, say) still settles after what it reads once it reads it again.
       let was = memo_keep.height(key);
@@ -883,7 +889,7 @@ pub fn recorded(
     };
     m || now
   });
-  noted_asked(queries, reads);
+  noted_asked(queries, new_run(), reads);
   if moved { memo_keep.mark(key) };
   memo_keep.keep(
     key,
