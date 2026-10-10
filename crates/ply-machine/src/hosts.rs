@@ -743,7 +743,10 @@ const OPERATIONS: [(&str, &str); 2] = [
 
 const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
     ("preview", "ply_machine::hosts::hermetic::preview"),
-    ("registrations", "ply_machine::hosts::hermetic::registrations"),
+    (
+        "registrations",
+        "ply_machine::hosts::hermetic::registrations",
+    ),
 ];
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
