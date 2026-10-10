@@ -123,6 +123,37 @@ fn a_reset_record_released_unused_goes_back_to_its_own_size() {
 }
 
 #[test]
+fn an_ended_entry_gives_back_the_chunks_past_what_a_heap_keeps() {
+    let mut h = Heap::new();
+    h.alloc(KIND_RECORD, 0, 1, 0);
+    h.alloc_bytes(KIND_BYTES, 200 << 20);
+    assert!(h.chunk_bytes() > 200 << 20);
+    h.end();
+    assert!(
+        h.chunk_bytes() <= 64 << 20,
+        "{} bytes kept",
+        h.chunk_bytes()
+    );
+    assert!(
+        h.chunk_bytes() > 0,
+        "the first chunk is kept for the next entry"
+    );
+    let mut big_first = Heap::new();
+    big_first.alloc_bytes(KIND_BYTES, 100 << 20);
+    big_first.end();
+    assert_eq!(
+        big_first.chunk_bytes(),
+        0,
+        "a first chunk past the bound goes back too"
+    );
+    let o = big_first.alloc(KIND_RECORD, 0, 1, 0);
+    assert!(
+        big_first.is_object(o as Word),
+        "a heap that kept nothing allocates afresh"
+    );
+}
+
+#[test]
 fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
     let mut h = Heap::new();
     let child = h.alloc(KIND_RECORD, 0, 1, 0);
