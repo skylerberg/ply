@@ -411,6 +411,9 @@ pub type KnownDef = {
   raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
+  /// What its check gave it: a signature leaves the region of each cell it names open, which only
+  /// the body ties to another.
+  scheme: Scheme,
 }
 pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
 /// What the emitter reads of one body published from its rows: `name` is the definition, or a test
@@ -8631,6 +8634,21 @@ fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
 fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
   { atoms: atoms_sorted(map(atoms, |atom: Atom| settled_atom(checker, atom))), tail: None }
 
+/// `ty` with every row it holds, at any depth, empty: what its types say apart from what they do.
+fn rowless(ty: Type) -> Type =
+  match ty {
+    TyVar(_) -> ty,
+    TyCon(c) -> TyCon({ ..c, args: map(c.args, rowless) }),
+    TyFn(f) -> TyFn({ params: map(f.params, rowless), ret: rowless(f.ret), effects: row_empty() }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: rowless(f.ty) })),
+    TyNominal(n) ->
+      TyNominal({
+        ..n,
+        args: map(n.args, rowless),
+        fields: map(n.fields, |f: Field| { ..f, ty: rowless(f.ty) }),
+      }),
+  }
+
 /// The rows handed in for a definition.
 fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
   map_get(checker.known.defs, name)
@@ -8826,19 +8844,29 @@ fn check_component(
             match u.error {
               Some(_) -> None,
               None -> {
-                let c: Checker = with_unified(acc.checker, u);
-                Some({
-                  checker: c,
-                  row: settled_row(c, performed),
-                  count: {
-                    scaling: settled_row(c, scaling).atoms,
-                    sites: [],
-                    repeats: rows.repeats,
-                    tail_over: None,
-                    recursed: None,
-                    raises: rows.raises,
+                // Its check tied what its signature leaves open, the region of each cell it names:
+                // the types it gave tie them here, or the body is walked.
+                let c0: Checker = with_unified(acc.checker, u);
+                let given = instantiate(rows.scheme, c0.fresh);
+                let t = unify(c0.subst, given.fresh, rowless(sig.fn_ty), rowless(given.ty));
+                match t.error {
+                  Some(_) -> None,
+                  None -> {
+                    let c: Checker = with_unified(c0, t);
+                    Some({
+                      checker: c,
+                      row: settled_row(c, performed),
+                      count: {
+                        scaling: settled_row(c, scaling).atoms,
+                        sites: [],
+                        repeats: rows.repeats,
+                        tail_over: None,
+                        recursed: None,
+                        raises: rows.raises,
+                      },
+                    })
                   },
-                })
+                }
               },
             }
           },
@@ -15002,7 +15030,7 @@ fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
   else { bytes_concat(b"X;", dump_diags(dedup_diags(out.checker.diags))) }
 
 /// What a checked program publishes, as the interfaces a second check of it would be handed.
-fn known_of(checker: Checker) -> Known / {abort.raise} = {
+fn known_of(checker: Checker) -> Known = {
   let defs = fold(checker.defs, map_new(), |acc: Map<Bytes, KnownDef>, def_info: DefInfo|
     map_insert(acc, def_info.name, {
       footprint: def_info.footprint,
@@ -15013,6 +15041,7 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
       summary: def_info.summary,
       raises: def_info.raises,
       facts: b"",
+      scheme: def_info.scheme,
     }));
   let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
     map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));

@@ -6,7 +6,7 @@
 //! its items stand.
 
 import std.bin
-import std.list (at, at_or, concat, contains, flatten, sort_by)
+import std.list (at, at_or, concat, contains, flatten, push_unique, sort_by)
 import std.bytes (join)
 import std.map
 import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
@@ -397,21 +397,19 @@ pub fn said_groups(
     fold(o.names, [], |acc: List<Bytes>, n: Bytes|
       concat(acc, match map_get(costed, n) { Some(ls) -> ls, None -> [] }));
   // Whose each name a member declares is: its own names, a test or law by its label, and the laws
-  // its `cost` clauses make.
-  let declared = fold(members, map_new(), |acc: Map<Bytes, Bytes>, o: OwnerRead|
+  // its `cost` clauses make. A name two owners declare, in two namespaces, is each one's.
+  let declared = fold(members, map_new(), |acc: Map<Bytes, List<Bytes>>, o: OwnerRead|
     fold(
-      laws_of(o),
-      fold(o.names, map_insert(acc, o.owner, o.owner), |a: Map<Bytes, Bytes>, n: Bytes|
-        map_insert(a, n, o.owner)),
-      |a: Map<Bytes, Bytes>, l: Bytes| map_insert(a, bytes_concat(b"law ", l), o.owner),
+      push(concat(o.names, map(laws_of(o), |l: Bytes| bytes_concat(b"law ", l))), o.owner),
+      acc,
+      |a: Map<Bytes, List<Bytes>>, n: Bytes| map_insert(a, n, push_unique(share_in(a, n), o.owner)),
     ));
-  let named = |name: Bytes|
-    if !bytes_starts_with(name, prefix) { b"" } else {
-      match map_get(declared, bytes_slice(name, bytes_len(prefix), bytes_len(name))) {
-        Some(o) -> o,
-        None -> b"",
-      }
-    };
+  let whose = |name: Bytes| share_in(declared, name);
+  // `xs` under each owner `names_of` names, in their order.
+  let shared_by = |xs: List<SetView>, names_of: (SetView) -> List<Bytes>|
+    fold(xs, map_new(), |acc: Map<Bytes, List<SetView>>, x: SetView|
+      fold(names_of(x), acc, |a: Map<Bytes, List<SetView>>, o: Bytes|
+        map_insert(a, o, push(share_in(a, o), x))));
   let starts = fold(
     fold(groups, [], |acc: List<ItemAt>, g: { members: List<OwnerRead>, items: List<ItemAt> }|
       concat(acc, g.items)),
@@ -483,13 +481,20 @@ pub fn said_groups(
   let tagged = map::group_by(shape.tagged, |x: TaggedSite| placed(x.module, x.span));
   let statements = map::group_by(shape.statements, |x: StatementSite| placed(x.module, x.span));
   let consts = map::group_by(shape.consts, |x: TypedConst| def_named(x.name));
-  let sets = map::group_by(shape.outline.sets, |x: SetView|
-    match map_get(declared, x.name) { Some(o) -> o, None -> b"" });
-  let outlined = map::group_by(
-    fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
-      match x { OLaw(l) -> push(acc, l), _ -> acc }),
-    |l: LawOutline|
-      match map_get(declared, bytes_concat(b"law ", l.name)) { Some(o) -> o, None -> b"" },
+  let sets = shared_by(shape.outline.sets, |x: SetView| whose(x.name));
+  let outlined = fold(
+    shape.outline.items,
+    map_new(),
+    |acc: Map<Bytes, List<LawOutline>>, x: Outlined|
+      match x {
+        OLaw(l) ->
+          fold(
+            whose(bytes_concat(b"law ", l.name)),
+            acc,
+            |a: Map<Bytes, List<LawOutline>>, o: Bytes| map_insert(a, o, push(share_in(a, o), l)),
+          ),
+        _ -> acc,
+      },
   );
   let uses = map::group_by(w.uses, |r: UseNode| owning(r.module, slot, r.span));
   let share_of = |o: Bytes|
@@ -521,14 +526,6 @@ pub fn said_groups(
     };
   let chosen = chosen_in(w.index, slot);
   map(groups, |g: { members: List<OwnerRead>, items: List<ItemAt> }| {
-    let mine = fold(g.members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
-      map_insert(acc, o.owner, true));
-    let ours = |name: Bytes| map_contains(mine, named(name));
-    let filed = |kind: Bytes, key: Bytes|
-      match map_get(declared, named_as(kind, prefix, key)) {
-        Some(o) -> map_contains(mine, o),
-        None -> false,
-      };
     {
       members: map(g.members, |o: OwnerRead|
         {
@@ -537,11 +534,27 @@ pub fn said_groups(
           entry: map_get(said.shown.entries, o.owner),
         }),
       refused: [],
-      forms: chosen_forms(w.index, w.module_packages, {
-        own: filter(chosen.own, |v: Int| ours(at(w.index.nodes, v).name)),
-        tests: filter(chosen.tests, |x: TestNode| filed(b"test ", x.key)),
-        laws: filter(chosen.laws, |x: LawNode| filed(b"law ", x.key)),
-      }),
+      forms: {
+        let set = |pick: (OwnerRead) -> List<Bytes> / {abort.raise}|
+          fold(g.members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
+            fold(pick(o), acc, |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true)));
+        let labelled = |kind: Bytes, o: OwnerRead|
+          if bytes_starts_with(o.owner, kind) {
+            [bytes_slice(o.owner, bytes_len(kind), bytes_len(o.owner))]
+          } else { [] };
+        let among = |m: Map<Bytes, Bool>|
+          |name: Bytes|
+            bytes_starts_with(name, prefix)
+              && map_contains(m, bytes_slice(name, bytes_len(prefix), bytes_len(name)));
+        let node_kept = among(set(|o: OwnerRead| o.names));
+        let test_kept = among(set(|o: OwnerRead| labelled(b"test ", o)));
+        let law_kept = among(set(|o: OwnerRead| concat(labelled(b"law ", o), laws_of(o))));
+        chosen_forms(w.index, w.module_packages, {
+          own: filter(chosen.own, |v: Int| node_kept(at(w.index.nodes, v).name)),
+          tests: filter(chosen.tests, |x: TestNode| test_kept(x.key)),
+          laws: filter(chosen.laws, |x: LawNode| law_kept(x.key)),
+        })
+      },
       // Only what its own items embed, as they are written: another group's files are that group's.
       embeds: {
         let text = join(
@@ -561,12 +574,6 @@ pub fn said_groups(
 /// What `m` holds under `o`, or nothing.
 fn share_in<a>(m: Map<Bytes, List<a>>, o: Bytes) -> List<a> =
   match map_get(m, o) { Some(xs) -> xs, None -> [] }
-
-/// `kind` and the label of `key`, an item of the module `prefix` qualifies: the owner a test or
-/// law is filed under.
-fn named_as(kind: Bytes, prefix: Bytes, key: Bytes) -> Bytes / {abort.raise} =
-  if !bytes_starts_with(key, prefix) { b"" }
-  else { bytes_concat(kind, bytes_slice(key, bytes_len(prefix), bytes_len(key))) }
 
 /// `a`, an owner whose tests and laws follow `tests` tests and `laws` laws of its module: each
 /// numbered by its place among the module's.
@@ -943,7 +950,7 @@ fn settled_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
 
 /// The tables of `owners`, the answers of the owners of a module in the order it writes them, put
 /// together.
-fn joined_tables(owners: List<OwnerAnswer>) -> ModuleTables / {abort.raise} =
+fn joined_tables(owners: List<OwnerAnswer>) -> ModuleTables =
   fold(owners, no_module_tables(), |acc: ModuleTables, a: OwnerAnswer| {
     let t = numbered(a, len(acc.tests), len(acc.laws)).tables;
     {
