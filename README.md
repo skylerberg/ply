@@ -35,6 +35,7 @@ of it next.
 | `crates/ply-launcher` | the `ply` binary: enters the program the artifact holds |
 | `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
 | `crates/<crate>-tests` | that crate's tests |
+| `editors/` | the tree-sitter grammar editors read |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
 | `benches/` | benchmark scripts and their recorded output |
 | `probes/` | standalone C probes, each run by a CI job |
