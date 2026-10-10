@@ -6,6 +6,8 @@ enters to build `ply` itself. The Rust crates are the runtime and the launcher; 
 runnables a `ply` binary carries are appended to it by `cargo pack BINARY`, never compiled into
 Rust, so after editing Ply sources `cargo pack` is the rebuild.
 
+Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
+
 ## Prose
 
 - Prose is `README.md`, `docs/`, and this file. A document earns its place by being read: it
