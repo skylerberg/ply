@@ -6,8 +6,9 @@
 //! its items stand.
 
 import std.bin
-import std.list (at, concat, contains, flatten, sort_by)
+import std.list (at, at_or, concat, contains, flatten, sort_by)
 import std.bytes (join)
+import std.map
 import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
               OLaw, OFn, OTest, LawOutline, read_outline, module_tables_bin, rows_bin,
               tagged_site_bin, statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin,
@@ -26,7 +27,8 @@ import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
 import exprs (TaggedPart)
 import embed (EmbedAt, EmbedWant, embed_at_bin, embed_key, wants_of)
-import hash (Shapes, UseNode, LawNode, kept_forms, shapes_bin, use_node_bin, unreached)
+import hash (Shapes, UseNode, LawNode, TestNode, chosen_in, chosen_forms, shapes_bin, use_node_bin,
+             unreached)
 
 /// What a check of a group of owners answered of one of them, every place module 0's and counted from
 /// where the group's own text starts.
@@ -151,104 +153,57 @@ fn spotted(spots: List<Spot>, p: Int) -> Int =
   fold(spots, p, |acc: Int, x: Spot|
     if p >= x.at && p <= x.at + x.len { x.rel + (p - x.at) } else { acc })
 
-/// What `w`, a check that read a group of owners as its module at `slot`, answered of one of them,
-/// whose items stand where `spots` says and which declares `declared`, its own name among them: each
-/// place counted from where the group's text starts, module 0's.
-pub fn owner_answer(
-  said: Said,
-  spots: List<Spot>,
-  declared: Map<Bytes, Bool>,
-) -> OwnerAnswer / {abort.raise} = {
-  let w = said.w;
+/// What `said`, a check that read a group of owners as its module at its slot, answered of one of
+/// them, whose share of it is `share` and whose items stand where `spots` says: each place counted
+/// from where the group's text starts, module 0's.
+fn owner_answer(said: Said, share: Share, spots: List<Spot>) -> OwnerAnswer / {abort.raise} = {
   let slot = said.slot;
-  let mine = |module: Int, s: Span| within(module, s, 0, spots);
-  let here = |l: Location| mine(l.module, l.span);
-  let facts = said.facts;
-  let t = facts.tables;
-  let e = t.facts.elaboration;
+  let t = said.facts.tables;
   let kept = {
     ..t,
-    defs: filter(t.defs, |d: DefInfo| here(d.at)),
-    tests: filter(t.tests, |x: TestInfo| here(x.at)),
-    laws: filter(t.laws, |l: LawInfo| here(l.at)),
-    effects: filter(t.effects, |x: EffectInfo| here(x.at)),
-    ctors: filter(t.ctors, |c: CtorInfo| here(c.at)),
-    instances: filter(t.instances, |x: InstanceInfo| here(x.at)),
-    numeric: filter(t.numeric, |x: NumericInfo| here(x.at)),
+    defs: share.defs,
+    tests: share.tests,
+    laws: share.laws,
+    effects: share.effects,
+    ctors: share.ctors,
+    instances: share.instances,
+    numeric: share.numeric,
     facts: {
-      ..t.facts,
-      label_sites: filter(t.facts.label_sites, |x: LabelSite| mine(x.module, x.span)),
-      operands: filter(t.facts.operands, |x: OperandSite| mine(x.module, x.span)),
+      pure: share.pure,
+      label_sites: share.label_sites,
+      operands: share.operands,
       elaboration: {
-        updates: filter(e.updates, |x: UpdateShape| mine(x.module, x.span)),
-        ops: filter(e.ops, |x: WitnessOp| mine(x.module, x.span)),
-        refs: filter(e.refs, |x: WitnessRef| mine(x.module, x.span)),
-        orders: e.orders,
-        tries: filter(e.tries, |x: TrySite| mine(x.module, x.span)),
+        updates: share.updates,
+        ops: share.ops,
+        refs: share.refs,
+        orders: share.orders,
+        tries: share.tries,
       },
     },
+    kept: share.kept,
   };
-  let names = fold(kept.defs, map_new(), |acc: Map<Bytes, Bool>, d: DefInfo|
-    map_insert(acc, d.name, true));
   let back = { from: 0, to: 0, by: |p: Int| spotted(spots, p) };
-  let rows = said.rows;
   let placed = |l: Label| within(l.module, { start: l.start, end: l.end }, slot, spots);
-  let primary_mine = |d: Diag|
-    fold(d.labels, false, |b: Bool, l: Label| b || (l.primary && placed(l)));
   let own_labels = |d: Diag|
     { ..d, labels: map(filter(d.labels, placed), |l: Label| { ..l, module: 0 }) };
-  let shape = facts.shape;
   let lowest = |xs: List<Int>|
     fold(xs, 0 - 1, |acc: Int, k: Int| if acc < 0 || k < acc { k } else { acc });
-  let first_test = lowest(map(kept.tests, |x: TestInfo| x.index));
-  let first_law = lowest(map(kept.laws, |l: LawInfo| l.index));
+  let first_test = lowest(map(share.tests, |x: TestInfo| x.index));
+  let first_law = lowest(map(share.laws, |l: LawInfo| l.index));
   // Its tests and laws numbered from its first, as a check of it alone numbers them.
   numbered(
     {
-      tables: moved_tables(
-        {
-          ..kept,
-          facts: {
-            ..kept.facts,
-            pure: filter(kept.facts.pure, |n: Bytes| map_contains(names, n)),
-            elaboration: {
-              ..kept.facts.elaboration,
-              orders: filter(e.orders, |x: WitnessOrder|
-                map_contains(names, bytes_concat_all([at(w.mods, slot).name, b".", x.name]))),
-            },
-          },
-          kept: filter(t.kept, |k: KeptFacts| map_contains(names, k.name)),
-        },
-        back,
-      ),
+      tables: moved_tables(kept, back),
       // A row is counted from where its definition starts, so no row moves.
-      rows: {
-        defs: map(
-          filter(rows.defs, |r: KnownDefRow| map_contains(names, r.name)),
-          |r: KnownDefRow| { ..r, hash: b"" },
-        ),
-        tests: [],
-      },
+      rows: { defs: map(share.rows, |r: KnownDefRow| { ..r, hash: b"" }), tests: [] },
       refused: [],
-      warnings: map(
-        filter(w.warnings, |d: Diag| primary_mine(d) && d.code != b"W0611"),
-        |d: Diag| moved_diag(own_labels(d), back),
-      ),
-      tagged: map(filter(shape.tagged, |x: TaggedSite| mine(x.module, x.span)), |x: TaggedSite|
-        moved_tagged(x, back)),
-      statements: map(
-        filter(shape.statements, |x: StatementSite| mine(x.module, x.span)),
-        |x: StatementSite| { ..x, span: moved_at(x.span, back) },
-      ),
-      consts: filter(shape.consts, |x: TypedConst| map_contains(names, x.name)),
-      sets: filter(shape.outline.sets, |x: SetView| map_contains(declared, x.name)),
-      laws: fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
-        match x {
-          OLaw(l) -> if map_contains(declared, bytes_concat(b"law ", l.name)) { push(acc, l) }
-          else { acc },
-          _ -> acc,
-        }),
-      uses: map(filter(w.uses, |r: UseNode| within(r.module, r.span, slot, spots)), |r: UseNode|
+      warnings: map(share.warnings, |d: Diag| moved_diag(own_labels(d), back)),
+      tagged: map(share.tagged, |x: TaggedSite| moved_tagged(x, back)),
+      statements: map(share.statements, |x: StatementSite| { ..x, span: moved_at(x.span, back) }),
+      consts: share.consts,
+      sets: share.sets,
+      laws: share.outlined,
+      uses: map(share.uses, |r: UseNode|
         {
           ..r,
           module: 0,
@@ -259,6 +214,35 @@ pub fn owner_answer(
     if first_test < 0 { 0 } else { 0 - first_test },
     if first_law < 0 { 0 } else { 0 - first_law },
   )
+}
+
+/// What of a check of a module one owner's answer is made of: what of each table stands within one
+/// of its items, or that it names, each in the order the check holds it.
+type Share = {
+  defs: List<DefInfo>,
+  tests: List<TestInfo>,
+  laws: List<LawInfo>,
+  effects: List<EffectInfo>,
+  ctors: List<CtorInfo>,
+  instances: List<InstanceInfo>,
+  numeric: List<NumericInfo>,
+  pure: List<Bytes>,
+  label_sites: List<LabelSite>,
+  operands: List<OperandSite>,
+  updates: List<UpdateShape>,
+  ops: List<WitnessOp>,
+  refs: List<WitnessRef>,
+  orders: List<WitnessOrder>,
+  tries: List<TrySite>,
+  kept: List<KeptFacts>,
+  rows: List<KnownDefRow>,
+  warnings: List<Diag>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  consts: List<TypedConst>,
+  sets: List<SetView>,
+  outlined: List<LawOutline>,
+  uses: List<UseNode>,
 }
 
 /// `a`, one owner's answer, its places moved to where its group's items stand in its module, `items`.
@@ -351,7 +335,12 @@ pub fn group_answer(
         forms: { nodes: [], order: [], tests: [], laws: [] },
         embeds: [],
       },
-    Analysed(w) -> said_group(said_of(w, slot, text), module, members, items, at),
+    Analysed(w) ->
+      at_or(
+        said_groups(said_of(w, slot, text), module, [{ members: members, items: items }], at),
+        0,
+        no_group(),
+      ),
   }
 }
 
@@ -369,19 +358,28 @@ pub fn said_of(w: Analysis, slot: Int, text: Bytes) -> Said / {abort.raise} =
     shown: exports_of(w, slot, text),
   }
 
-/// What a check that `said` what it did of `module` answered of `members`, owners of it: `items`
-/// where their items stand as [`group_source`] lays them, and `at` where each item stands in the
-/// module the check read.
-pub fn said_group(
+/// What a check that `said` what it did of `module` answered of each of `groups`, owners of it whose
+/// items stand where `items` lays them, each item where `stands` says in the module the check read. Each table
+/// is walked once for all of them, so the answers cost what the module does, not that times its
+/// groups.
+pub fn said_groups(
   said: Said,
   module: Bytes,
-  members: List<OwnerRead>,
-  items: List<ItemAt>,
-  at: (ItemAt) -> Int / {abort.raise},
-) -> GroupAnswer / {abort.raise} = {
+  groups: List<{ members: List<OwnerRead>, items: List<ItemAt> }>,
+  stands: (ItemAt) -> Int / {abort.raise},
+) -> List<GroupAnswer> / {abort.raise} = {
   let w = said.w;
   let slot = said.slot;
   let prefix = bytes_concat(module, b".");
+  let t = said.facts.tables;
+  let e = t.facts.elaboration;
+  let shape = said.facts.shape;
+  let members = fold(
+    groups,
+    [],
+    |acc: List<OwnerRead>, g: { members: List<OwnerRead>, items: List<ItemAt> }|
+      concat(acc, g.members),
+  );
   // The laws a function's `cost` clauses make are the function's.
   let costed = fold(w.index.laws, map_new(), |acc: Map<Bytes, List<Bytes>>, l: LawNode|
     if l.module != slot { acc } else {
@@ -398,57 +396,177 @@ pub fn said_group(
   let laws_of = |o: OwnerRead|
     fold(o.names, [], |acc: List<Bytes>, n: Bytes|
       concat(acc, match map_get(costed, n) { Some(ls) -> ls, None -> [] }));
-  let named = |pick: (OwnerRead) -> List<Bytes> / {abort.raise}|
-    fold(members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
-      fold(pick(o), acc, |a: Map<Bytes, Bool>, n: Bytes| map_insert(a, n, true)));
-  let labelled = |kind: Bytes, o: OwnerRead|
-    if bytes_starts_with(o.owner, kind) {
-      [bytes_slice(o.owner, bytes_len(kind), bytes_len(o.owner))]
-    } else { [] };
-  let among = |set: Map<Bytes, Bool>|
-    |name: Bytes|
-      bytes_starts_with(name, prefix)
-        && map_contains(set, bytes_slice(name, bytes_len(prefix), bytes_len(name)));
-  let keeps = {
-    node: among(named(|o: OwnerRead| o.names)),
-    test: among(named(|o: OwnerRead| labelled(b"test ", o))),
-    law: among(named(|o: OwnerRead| concat(labelled(b"law ", o), laws_of(o)))),
-  };
-  {
-    members: map(members, |o: OwnerRead|
-      {
-        owner: o.owner,
-        answer: owner_answer(
-          said,
-          spots_of(items, o.owner, at),
-          fold(
-            laws_of(o),
-            fold(
-              o.names,
-              map_insert(map_new(), o.owner, true),
-              |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true),
-            ),
-            |acc: Map<Bytes, Bool>, l: Bytes| map_insert(acc, bytes_concat(b"law ", l), true),
-          ),
-        ),
-        entry: map_get(said.shown.entries, o.owner),
-      }),
-    refused: [],
-    forms: kept_forms(w.index, w.module_packages, slot, keeps),
-    // Only what its own items embed, as they are written: another group's files are that group's.
-    embeds: {
-      let text = join(
-        fold(members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.texts)),
-        b"\n\n",
-      );
-      let wanted = if !names_embed(text) { map_new() } else {
-        fold(wants_of(parse(text).node), map_new(), |acc: Map<Bytes, Bool>, want: EmbedWant|
-          map_insert(acc, embed_key(want), true))
-      };
-      filter(w.embeds, |e: EmbedAt| e.module == module && map_contains(wanted, e.key))
+  // Whose each name a member declares is: its own names, a test or law by its label, and the laws
+  // its `cost` clauses make.
+  let declared = fold(members, map_new(), |acc: Map<Bytes, Bytes>, o: OwnerRead|
+    fold(
+      laws_of(o),
+      fold(o.names, map_insert(acc, o.owner, o.owner), |a: Map<Bytes, Bytes>, n: Bytes|
+        map_insert(a, n, o.owner)),
+      |a: Map<Bytes, Bytes>, l: Bytes| map_insert(a, bytes_concat(b"law ", l), o.owner),
+    ));
+  let named = |name: Bytes|
+    if !bytes_starts_with(name, prefix) { b"" } else {
+      match map_get(declared, bytes_slice(name, bytes_len(prefix), bytes_len(name))) {
+        Some(o) -> o,
+        None -> b"",
+      }
+    };
+  let starts = fold(
+    fold(groups, [], |acc: List<ItemAt>, g: { members: List<OwnerRead>, items: List<ItemAt> }|
+      concat(acc, g.items)),
+    map_new(),
+    |acc: Map<Int, { end: Int, owner: Bytes }>, x: ItemAt| {
+      let p = stands(x);
+      map_insert(acc, p, { end: p + x.len, owner: x.owner })
     },
-  }
+  );
+  // The owner whose item `s`, in module `m` of the check, stands within, where it is module `here`.
+  let owning = |m: Int, here: Int, s: Span|
+    if m != here { b"" } else {
+      match map_floor(starts, s.start) {
+        Some(f) -> if s.end <= f.value.end { f.value.owner } else { b"" },
+        None -> b"",
+      }
+    };
+  let placed = |m: Int, s: Span| owning(m, 0, s);
+  let defs = map::group_by(t.defs, |d: DefInfo| placed(d.at.module, d.at.span));
+  let def_owner = map_fold(
+    defs,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, o: Bytes, ds: List<DefInfo>|
+      fold(ds, acc, |a: Map<Bytes, Bytes>, d: DefInfo| map_insert(a, d.name, o)),
+  );
+  let def_named = |name: Bytes| match map_get(def_owner, name) { Some(o) -> o, None -> b"" };
+  let tests = map::group_by(t.tests, |x: TestInfo| placed(x.at.module, x.at.span));
+  let test_owned = map_fold(
+    tests,
+    map_new(),
+    |acc: Map<Bytes, Bytes>, o: Bytes, ts: List<TestInfo>|
+      fold(ts, acc, |a: Map<Bytes, Bytes>, x: TestInfo|
+        map_insert(a, test_owner(x.module, x.name), o)),
+  );
+  let kept_owner = |name: Bytes|
+    match map_get(test_owned, name) { Some(o) -> o, None -> def_named(name) };
+  let laws = map::group_by(t.laws, |l: LawInfo| placed(l.at.module, l.at.span));
+  let effects = map::group_by(t.effects, |x: EffectInfo| placed(x.at.module, x.at.span));
+  let ctors = map::group_by(t.ctors, |c: CtorInfo| placed(c.at.module, c.at.span));
+  let instances = map::group_by(t.instances, |x: InstanceInfo| placed(x.at.module, x.at.span));
+  let numeric = map::group_by(t.numeric, |x: NumericInfo| placed(x.at.module, x.at.span));
+  let pure = map::group_by(t.facts.pure, def_named);
+  let label_sites = map::group_by(t.facts.label_sites, |x: LabelSite| placed(x.module, x.span));
+  let operands = map::group_by(t.facts.operands, |x: OperandSite| placed(x.module, x.span));
+  let updates = map::group_by(e.updates, |x: UpdateShape| placed(x.module, x.span));
+  let ops = map::group_by(e.ops, |x: WitnessOp| placed(x.module, x.span));
+  let refs = map::group_by(e.refs, |x: WitnessRef| placed(x.module, x.span));
+  let orders = map::group_by(e.orders, |x: WitnessOrder|
+    def_named(bytes_concat_all([module, b".", x.name])));
+  let tries = map::group_by(e.tries, |x: TrySite| placed(x.module, x.span));
+  let kept = map::group_by(t.kept, |k: KeptFacts| kept_owner(k.name));
+  let rows = map::group_by(said.rows.defs, |r: KnownDefRow| def_named(r.name));
+  // A warning is each owner's in which one of its primary labels stands.
+  let warnings = fold(
+    filter(w.warnings, |d: Diag| d.code != b"W0611"),
+    map_new(),
+    |acc: Map<Bytes, List<Diag>>, d: Diag|
+      fold(
+        fold(d.labels, [], |os: List<Bytes>, l: Label|
+          if !l.primary { os } else {
+            let o = owning(l.module, slot, { start: l.start, end: l.end });
+            if bytes_len(o) == 0 || contains(os, o) { os } else { push(os, o) }
+          }),
+        acc,
+        |a: Map<Bytes, List<Diag>>, o: Bytes|
+          map_insert(a, o, push(match map_get(a, o) { Some(ds) -> ds, None -> [] }, d)),
+      ),
+  );
+  let tagged = map::group_by(shape.tagged, |x: TaggedSite| placed(x.module, x.span));
+  let statements = map::group_by(shape.statements, |x: StatementSite| placed(x.module, x.span));
+  let consts = map::group_by(shape.consts, |x: TypedConst| def_named(x.name));
+  let sets = map::group_by(shape.outline.sets, |x: SetView|
+    match map_get(declared, x.name) { Some(o) -> o, None -> b"" });
+  let outlined = map::group_by(
+    fold(shape.outline.items, [], |acc: List<LawOutline>, x: Outlined|
+      match x { OLaw(l) -> push(acc, l), _ -> acc }),
+    |l: LawOutline|
+      match map_get(declared, bytes_concat(b"law ", l.name)) { Some(o) -> o, None -> b"" },
+  );
+  let uses = map::group_by(w.uses, |r: UseNode| owning(r.module, slot, r.span));
+  let share_of = |o: Bytes|
+    {
+      defs: share_in(defs, o),
+      tests: share_in(tests, o),
+      laws: share_in(laws, o),
+      effects: share_in(effects, o),
+      ctors: share_in(ctors, o),
+      instances: share_in(instances, o),
+      numeric: share_in(numeric, o),
+      pure: share_in(pure, o),
+      label_sites: share_in(label_sites, o),
+      operands: share_in(operands, o),
+      updates: share_in(updates, o),
+      ops: share_in(ops, o),
+      refs: share_in(refs, o),
+      orders: share_in(orders, o),
+      tries: share_in(tries, o),
+      kept: share_in(kept, o),
+      rows: share_in(rows, o),
+      warnings: share_in(warnings, o),
+      tagged: share_in(tagged, o),
+      statements: share_in(statements, o),
+      consts: share_in(consts, o),
+      sets: share_in(sets, o),
+      outlined: share_in(outlined, o),
+      uses: share_in(uses, o),
+    };
+  let chosen = chosen_in(w.index, slot);
+  map(groups, |g: { members: List<OwnerRead>, items: List<ItemAt> }| {
+    let mine = fold(g.members, map_new(), |acc: Map<Bytes, Bool>, o: OwnerRead|
+      map_insert(acc, o.owner, true));
+    let ours = |name: Bytes| map_contains(mine, named(name));
+    let filed = |kind: Bytes, key: Bytes|
+      match map_get(declared, named_as(kind, prefix, key)) {
+        Some(o) -> map_contains(mine, o),
+        None -> false,
+      };
+    {
+      members: map(g.members, |o: OwnerRead|
+        {
+          owner: o.owner,
+          answer: owner_answer(said, share_of(o.owner), spots_of(g.items, o.owner, stands)),
+          entry: map_get(said.shown.entries, o.owner),
+        }),
+      refused: [],
+      forms: chosen_forms(w.index, w.module_packages, {
+        own: filter(chosen.own, |v: Int| ours(at(w.index.nodes, v).name)),
+        tests: filter(chosen.tests, |x: TestNode| filed(b"test ", x.key)),
+        laws: filter(chosen.laws, |x: LawNode| filed(b"law ", x.key)),
+      }),
+      // Only what its own items embed, as they are written: another group's files are that group's.
+      embeds: {
+        let text = join(
+          fold(g.members, [], |acc: List<Bytes>, o: OwnerRead| concat(acc, o.texts)),
+          b"\n\n",
+        );
+        let wanted = if !names_embed(text) { map_new() } else {
+          fold(wants_of(parse(text).node), map_new(), |acc: Map<Bytes, Bool>, want: EmbedWant|
+            map_insert(acc, embed_key(want), true))
+        };
+        filter(w.embeds, |x: EmbedAt| x.module == module && map_contains(wanted, x.key))
+      },
+    }
+  })
 }
+
+/// What `m` holds under `o`, or nothing.
+fn share_in<a>(m: Map<Bytes, List<a>>, o: Bytes) -> List<a> =
+  match map_get(m, o) { Some(xs) -> xs, None -> [] }
+
+/// `kind` and the label of `key`, an item of the module `prefix` qualifies: the owner a test or
+/// law is filed under.
+fn named_as(kind: Bytes, prefix: Bytes, key: Bytes) -> Bytes / {abort.raise} =
+  if !bytes_starts_with(key, prefix) { b"" }
+  else { bytes_concat(kind, bytes_slice(key, bytes_len(prefix), bytes_len(key))) }
 
 /// `a`, an owner whose tests and laws follow `tests` tests and `laws` laws of its module: each
 /// numbered by its place among the module's.
@@ -1059,7 +1177,11 @@ test "a group holds the files its own items embed, and no other group's" {
   let held = |owner: Bytes| {
     let members = filter(reads, |o: OwnerRead| o.owner == owner);
     map(
-      said_group(said, b"m", members, laid_items(members), |x: ItemAt| x.to).embeds,
+      at(
+        said_groups(said, b"m", [{ members: members, items: laid_items(members) }], |x: ItemAt|
+          x.to),
+        0,
+      ).embeds,
       |e: EmbedAt| e.key,
     )
   };
