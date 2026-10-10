@@ -2731,26 +2731,50 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         None -> s.inputs,
       };
       // Likewise the groups it hashes again. A load that refuses asks for no hashing, so what is hashed
-      // again is what a run settles: each group hashed before whose hashing reads otherwise. A group
-      // that is gone is hashed anew where it comes back.
+      // again is what a run settles: the hashing of each module hashed before, which asks each group
+      // the module holds now, a group new to it among them. A group that is gone is hashed anew where
+      // it comes back.
       let refused = match fresh.outcome { Refused(_) -> true, Analysed(_) -> false };
+      let hashed_modules = map_fold(
+        s.hashes,
+        map_new(),
+        |acc: Map<Bytes, Bool>, k: Bytes, _: Bytes|
+          map_insert(acc, decoded(k, group_named_bin(), "a group's names").module, true),
+      );
       let now_hashes = match inputs_over(fresh.held, step.sources, b"hash inputs") {
         Some(h) -> if refused {
           map_fold(h, map_new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-            if map_contains(s.hashes, k) { map_insert(acc, k, v) } else { acc })
+            if map_contains(
+                hashed_modules,
+                decoded(k, group_named_bin(), "a group's names").module,
+              ) { map_insert(acc, k, v) }
+            else { acc })
         } else { h },
         None -> s.hashes,
       };
       let hashes = now_hashes;
       // A group runs once, or twice where the edit gives it something new to read: its height in
       // the store, which orders a run's settling, is from before it read that.
+      // Where the groups run are not those whose reads moved, each once or twice: which were, and
+      // which ran.
       let off_by = |was: Map<Bytes, Bytes>, now: Map<Bytes, Bytes>, query: Bytes| {
         let ran = filter(ran_for(warm.run, query), |k: Bytes| map_contains(now, k));
         let times = fold(ran, map_new(), |acc: Map<Bytes, Int>, k: Bytes|
           map_insert(acc, k, match map_get(acc, k) { Some(n) -> n + 1, None -> 1 }));
-        sorted_bytes(filter(map_keys(now), |k: Bytes| map_get(was, k) != map_get(now, k)))
-          != sorted_bytes(map_keys(times))
-          || map_fold(times, false, |b: Bool, _: Bytes, n: Int| b || n > 2)
+        let moved = sorted_bytes(
+          filter(map_keys(now), |k: Bytes| map_get(was, k) != map_get(now, k)),
+        );
+        if moved != sorted_bytes(map_keys(times))
+            || map_fold(times, false, |b: Bool, _: Bytes, n: Int| b || n > 2) {
+          Some(
+            bytes_concat_all([
+              b": moved ",
+              groups_shown(moved),
+              b", ran ",
+              groups_shown(sorted_bytes(map_keys(times))),
+            ]),
+          )
+        } else { None }
       };
       {
         held: warm.held,
@@ -2758,14 +2782,28 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         hashes: hashes,
         off: if !agrees {
           push(s.off, bytes_concat_all([step.what, fixing_apart(warm.fixing, fresh.fixing)]))
-        } else if off_by(s.inputs, inputs, group_query()) {
-          push(s.off, bytes_concat(step.what, b" (work)"))
-        } else if off_by(s.hashes, now_hashes, group_hash_query()) {
-          push(s.off, bytes_concat(step.what, b" (hash work)"))
-        } else { s.off },
+        } else {
+          match off_by(s.inputs, inputs, group_query()) {
+            Some(why) -> push(s.off, bytes_concat_all([step.what, b" (work)", why])),
+            None -> match off_by(s.hashes, now_hashes, group_hash_query()) {
+              Some(why) -> push(s.off, bytes_concat_all([step.what, b" (hash work)", why])),
+              None -> s.off,
+            },
+          }
+        },
       }
     },
   ).off
+
+/// Each of `groups`, encoded group names, as its module and owners.
+fn groups_shown(groups: List<Bytes>) -> Bytes / {abort.raise} =
+  join(
+    map(groups, |b: Bytes| {
+      let g = decoded(b, group_named_bin(), "a group's names");
+      bytes_concat_all([g.module, b"[", join(g.owners, b" "), b"]"])
+    }),
+    b", ",
+  )
 
 /// Where `warm`'s hashing and `fresh`'s part: each node either fixes otherwise, by name.
 fn fixing_apart(warm: Fixing, fresh: Fixing) -> Bytes = {
@@ -3460,6 +3498,11 @@ test "edits undone, modules renamed and files emptied leave an answer through th
     ]),
     [],
   )
+}
+
+test "a module fixed after it refused beside a renamed import answers as it does fresh" {
+  let off = disagreements(session([[LeafError, CoreRenamed], [LeafError]]));
+  assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
 }
 
 law "an answer through the store is the fresh one at every step of any session of edits"
