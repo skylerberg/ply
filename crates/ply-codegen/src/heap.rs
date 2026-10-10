@@ -1550,9 +1550,10 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
-/// Perceus's `reset`: a unique record or constructor drops its fields and keeps its memory with
-/// `len` zeroed, for the next record or constructor of its width, which writes the whole header;
-/// answers `w`, or `0` after releasing anything else.
+/// Perceus's `reset`: a unique record or constructor drops its fields and keeps its memory for the
+/// next record or constructor of its width, which writes the whole header; answers `w`, or `0`
+/// after releasing anything else. It keeps its width and is marked flat, so a token released unused
+/// walks nothing and goes back to the free list of its own size.
 pub fn reset(w: Word) -> Word {
     if is_imm(w) || w == 0 {
         return 0;
@@ -1570,8 +1571,8 @@ pub fn reset(w: Word) -> Word {
                     dec(c);
                 }
             }
+            (*o).flags |= FLAT;
         }
-        (*o).len = 0;
     }
     w
 }
