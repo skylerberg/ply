@@ -11,11 +11,6 @@ pub struct Source {
     tables: Tables,
 }
 
-/// A law's guard or body as a root, by its place among the module's laws; binders are its params.
-pub fn law_root_name(ordinal: usize, part: &str) -> Symbol {
-    Symbol::new(format!("law#{ordinal}.{part}"))
-}
-
 /// A definition's `requires` or `ensures` clause as a root: `<owner>#requires#<k>` over the
 /// owner's parameters, `<owner>#ensures#<k>` over them and then `result`.
 pub fn clause_root_name(owner: &Symbol, kind: &str, ordinal: usize) -> Symbol {

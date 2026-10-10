@@ -419,10 +419,33 @@ pub type KeptFacts = { name: Bytes, facts: Bytes }
 
 derive bin for KeptFacts
 
-/// The name a test's sites are filed under: its module and its place among the module's tests,
-/// since a test may share a definition's name.
-pub fn test_owner(module: Bytes, position: Int) -> Bytes =
-  bytes_concat_all([module, b".test#", ascii_of_int(position)])
+/// The name a test's roots and sites go by: its module, `test#` and a digest of its label, which
+/// the module's tests do not share (E0105) and which no definition's name can spell.
+pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  by_label(module, b"test", label)
+
+/// Whether `name` is one `test_owner` makes.
+pub fn is_test_owner(name: Bytes) -> Bool =
+  match bytes_split(name, b"#") {
+    [named, digest] ->
+      (named == b"test" || bytes_ends_with(named, b".test")) && bytes_len(digest) == 16
+        && bytes_position(digest, 0, |c: Int| bytes::hex_value(c) < 0) == None,
+    _ -> false,
+  }
+
+/// The root of `part` (`guard` or `body`) of the law labelled `label`, named as a test's is.
+pub fn law_root(module: Bytes, label: Bytes, part: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([by_label(module, b"law", label), b".", part])
+
+fn by_label(module: Bytes, kind: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  qualify(
+    module,
+    bytes_concat_all([
+      kind,
+      b"#",
+      bytes_of_string(bytes::hex_of(bytes_slice(blake3(label), 0, 8))),
+    ]),
+  )
 
 /// The root a test over cases lists its cases by, beside the root that runs one.
 pub fn cases_root(owner: Bytes) -> Bytes = bytes_concat(owner, b".cases")
@@ -438,14 +461,10 @@ pub fn listing_ty() -> Type / {abort.raise} =
       ]),
     ),
   )
-/// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own;
+/// `tests` is by test key. `root`: the modules below it are the run's own;
 /// a definition of any other is counted by what its row writes, whatever its body does, so its
 /// `bounded` promises were checked when its package was.
-pub type Known = {
-  defs: Map<Bytes, KnownDef>,
-  tests: Map<Bytes, List<Option<KnownTest>>>,
-  root: Int,
-}
+pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, KnownTest>, root: Int }
 
 pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62 }
 
@@ -8596,13 +8615,6 @@ pub fn walk_order(parsed: ParsedModule) -> List<Bytes> / {abort.raise} = {
     fold(comp, acc, |a: List<Bytes>, i: Int| push(a, qualify(parsed.name, at(fns, i).name.name))))
 }
 
-/// What was handed in for a test.
-fn known_test(checker: Checker, module: Bytes, position: Int) -> Option<KnownTest> =
-  match map_get(checker.known.tests, module) {
-    None -> None,
-    Some(slots) -> match list_at(slots, position) { Some(Some(t)) -> Some(t), _ -> None },
-  }
-
 /// An operation atom's mode is its declaration's; a row read back from text does not carry it.
 fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
   match atom.op {
@@ -10438,8 +10450,8 @@ fn labelled(labels: List<{ name: Bytes, span: Span }>, name: Bytes) -> Option<Sp
 fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let walked = fold(
     parsed.module.items,
-    { checker: checker, position: 0, labels: [] },
-    |acc: { checker: Checker, position: Int, labels: List<{ name: Bytes, span: Span }> }, item: Item|
+    { checker: checker, labels: [] },
+    |acc: { checker: Checker, labels: List<{ name: Bytes, span: Span }> }, item: Item|
       match item {
         ITest(def) -> {
           let seen: Checker = match labelled(acc.labels, def.name) {
@@ -10459,8 +10471,8 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               ),
           };
           let c: Checker = { ..seen, scope: seen.scope + 1 };
-          let owner = test_owner(parsed.name, acc.position);
-          let footprint: WithAtoms = match known_test(c, parsed.name, acc.position) {
+          let owner = test_owner(parsed.name, def.name);
+          let footprint: WithAtoms = match map_get(c.known.tests, qualify(parsed.name, def.name)) {
             Some(cached) ->
               {
                 checker: {
@@ -10528,7 +10540,6 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               }),
               walking: b"",
             },
-            position: acc.position + 1,
             labels: push(acc.labels, { name: def.name, span: def.name_span }),
           }
         },
@@ -15003,31 +15014,9 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
       raises: def_info.raises,
       facts: b"",
     }));
-  // Tests are in load order, then source order, so each `test` item takes the next entry.
-  let walked = fold(
-    checker.modules,
-    { next: 0, tests: map_new() },
-    |acc: { next: Int, tests: Map<Bytes, List<Option<KnownTest>>> }, parsed: ParsedModule| {
-      let slots = fold(
-        parsed.module.items,
-        { next: acc.next, slots: [] },
-        |a: { next: Int, slots: List<Option<KnownTest>> }, item: Item|
-          match item {
-            ITest(_) ->
-              {
-                next: a.next + 1,
-                slots: push(
-                  a.slots,
-                  Some({ footprint: at(checker.tests, a.next).footprint, facts: b"" }),
-                ),
-              },
-            _ -> a,
-          },
-      );
-      { next: slots.next, tests: map_insert(acc.tests, parsed.name, slots.slots) }
-    },
-  );
-  { defs: defs, tests: walked.tests, root: checker.known.root }
+  let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
+    map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));
+  { defs: defs, tests: tests, root: checker.known.root }
 }
 
 /// `check_dump`'s answer, and the program's checked a second time from the interfaces the first
