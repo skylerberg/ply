@@ -64,14 +64,17 @@ pub effect shipped {
   /// Each builtin the runtime implements, how many words a call to it passes, and whether a failure
   /// of it raises rather than ending the run.
   read builtins() -> List<{ name: Bytes, arity: Int, raises: Bool }>
-  /// A program as this binary's launcher enters it: the entry it runs, its front end's answer over
-  /// every source that answer's indices run over, in their order, and the C of its unit.
-  read runnable(entry: String, files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes) -> Bytes
-  /// What each of `roots`, each a `stored_root` of a `const` definition, answers on `unit` compiled
-  /// here over that front end's answer, each called alone with nothing lent and under `steps`
-  /// calls: the text its value is kept as, or none where it raised, ran past its calls, or the unit
-  /// holds no such root.
-  read values(files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, unit: Bytes, roots: List<String>, steps: Int) -> List<Option<Bytes>>
+  /// A program's front end as an artifact carries it for a machine to load: the entry it runs, and
+  /// its front end's answer over every source that answer's indices run over, in their order.
+  read runnable(entry: String, files: List<{ path: String, name: String, text: Bytes }>, dump: Dump) -> Bytes
+  /// A native program's front end as its pack carries it for the runtime it is linked with: the
+  /// entry it runs, its front end's answer, and how many modules that answer's indices run over.
+  read front(entry: String, dump: Dump, modules: Int) -> Bytes
+  /// What each of `roots`, each a `stored_root` of a `const` definition, answers on the unit
+  /// compiled over that front end's answer into the library `library`, each called alone with
+  /// nothing lent and under `steps` calls: the text its value is kept as, or none where it raised,
+  /// ran past its calls, or the unit holds no such root.
+  read values(files: List<{ path: String, name: String, text: Bytes }>, dump: Dump, library: String, roots: List<String>, steps: Int) -> List<Option<Bytes>>
 }
 
 /// The hash `definitions` holds for a definition of the compiler's, `name` as the compiler's own
@@ -764,6 +767,25 @@ fn embedded(exports: Bytes) -> Bytes / {abort.raise} =
     b";\n",
   ])
 
+/// Every symbol the loader looks up, by name in byte order, with its address: what a native
+/// program's `main` hands the runtime, so the program exports nothing for `dlsym` to find. `own` are
+/// defined beside the table and `buckets` in the buckets' objects.
+fn symbol_table(own: List<Bytes>, buckets: List<Bytes>) -> Bytes / {abort.raise} = {
+  let names = ordered(concat(own, buckets));
+  bytes_concat_all([
+    b"\n/* --- the symbols the loader looks up --- */\n",
+    b"struct ply_symbol { const char *name; void *address; };\n",
+    bytes_concat_all(map(ordered(buckets), |n: Bytes| bytes_concat_all([b"extern char ", n, b";\n"]))),
+    b"const struct ply_symbol ply_symbols[] = {\n",
+    bytes_concat_all(
+      map(names, |n: Bytes| bytes_concat_all([b"  { \"", n, b"\", (void *)&", n, b" },\n"])),
+    ),
+    b"};\nconst unsigned long ply_symbols_count = ",
+    ascii_of_int(len(names)),
+    b";\n",
+  ])
+}
+
 // --- Placing it -----------------------------------------------------------------
 
 type Placing = { name: Bytes, bucket: Int, text: Bytes, reaches: List<Bytes> }
@@ -796,6 +818,7 @@ fn assembled(
   sizes: Map<Int, Int>,
   taken: Map<Bytes, Taken>,
   exports: Bytes,
+  symbols: Bytes,
 ) -> Bytes / {abort.raise} = {
   let by_bucket = fold(bodies, map_new(), |acc: Map<Bytes, Placing>, p: Placing|
     map_insert(acc, bucket_key(p), p));
@@ -837,6 +860,7 @@ fn assembled(
     ),
     runtime.tail,
     embedded(exports),
+    symbols,
   ])
 }
 
@@ -939,6 +963,13 @@ pub fn produce(
         map_insert(acc, b, map_len(ks))),
       fold(taken, map_new(), |acc: Map<Bytes, Taken>, t: Taken| map_insert(acc, t.name, t)),
       exports,
+      symbol_table(
+        [b"ply_bind", b"ply_bind_singletons", b"ply_exports"],
+        concat(
+          concat(map(rows, |r: BucketRow| bucket_table(r.id)), pools.lambdas),
+          map(taken, |t: Taken| t.entry),
+        ),
+      ),
     ),
     taken: s.taken,
     dropped: s.dropped,

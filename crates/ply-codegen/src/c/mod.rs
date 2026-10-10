@@ -5,23 +5,20 @@ mod build;
 pub mod dump;
 mod encoding;
 pub mod exports;
+pub mod linked;
 mod load;
 mod prelude;
 pub mod stage;
 pub mod sweep;
 pub mod tables;
-pub mod toolchain;
 
-pub use build::{Native, load_unit};
+pub use build::{Native, load_linked, load_opened};
 pub use exports::{Exports, Unserved};
-pub use load::{
-    BUCKETS_COMPILED, BUCKETS_REUSED, Library, Parts, UNITS_MAPPED, compile_and_load, split,
-};
+pub use load::{Library, cache_dir};
 pub use prelude::{
     PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, pointer_name, runtime_header,
     runtime_object,
 };
-pub use toolchain::{Profile, select as select_profile};
 
 /// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
 /// change anywhere else in `ply`, or the other build profile, answers and emits the same.

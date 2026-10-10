@@ -6,6 +6,7 @@
 mod c;
 mod detached;
 mod heap;
+mod linked;
 mod list;
 mod map;
 mod parallel;
