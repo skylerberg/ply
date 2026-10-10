@@ -1286,7 +1286,7 @@ the one checked:
 
 ```ply
 reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
-  if n == 0 { xs } else { collect(push(xs, n), n - 1) }   // kept: xs is a parameter at its last use
+  if n <= 0 { xs } else { collect(push(xs, n), n - 1) }   // kept: xs is a parameter at its last use
 
 reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
   let ys = push(xs, n);
@@ -1337,7 +1337,7 @@ machine, so the verdict is too (§8.4).
 `iterate` is a loop with an early exit and a step budget:
 
 ```ply
-fn first_gap(xs: List<Int>) -> Int =
+fn first_gap(xs: List<Int>) -> Int / {abort.raise} =
   iterate({i: 0, want: 0}, 1000, |s: {i: Int, want: Int}|
     if s.i >= len(xs) { Stop(s.want) }
     else { Continue({i: s.i + 1, want: s.want + 1}) })
