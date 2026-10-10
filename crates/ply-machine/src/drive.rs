@@ -23,7 +23,7 @@ use std::time::Instant;
 
 /// What the machine is configured with when it is lent, as plain data: the options record the
 /// program parsed converts into this.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RunOptions {
     /// The front end the CLI ran and the library it compiled the unit it emitted into: the CLI
     /// walks the tree, runs the compiler, emits and compiles, and this side reads the answer and
@@ -48,28 +48,6 @@ pub struct RunOptions {
     pub allow: Vec<String>,
     /// No host, clock, load from disk or measurement.
     pub hermetic: bool,
-}
-
-impl Default for RunOptions {
-    fn default() -> RunOptions {
-        RunOptions {
-            front: None,
-            unit: None,
-            argv: Vec::new(),
-            json: false,
-            steps: 0,
-            timeout: 0,
-            seed: None,
-            host: false,
-            tls: crate::options::TlsOptions::default(),
-            fs: Vec::new(),
-            exec: Vec::new(),
-            trace: crate::trace::TraceOptions::default(),
-            shutdown: crate::options::ShutdownOptions::default(),
-            allow: Vec::new(),
-            hermetic: false,
-        }
-    }
 }
 
 // --- The target ---------------------------------------------------------------
