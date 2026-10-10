@@ -29,7 +29,9 @@ pub effect memo {
   /// takes in place of working it out: what a body that works out several answers at once hands on.
   /// The output must be what the body would work out from what it reads.
   read offer(query: Bytes, input: Bytes, output: Bytes) -> Unit
-  /// What was offered as the answer the running body works out, if anything was.
+  /// What was offered as the answer the running body works out, if anything was. Taking it reads
+  /// the definition of the query that offered it, so an answer made from an offer moves with the
+  /// code that made it.
   read offered() -> Option<Bytes>
 }
 
@@ -58,7 +60,8 @@ pub type Query = { name: Bytes, hash: Bytes, body: (Bytes) -> Bytes / {memo.read
 /// in order, the keys being answered now, which a query asking
 /// one of them again would wait on forever, and, by query, how many answers it took as kept and how
 /// many it ran the body for. While the run settles marks, `marked` holds the records it marked whose
-/// marks are still to settle, lowest first. `offers` holds what a body offered for another key, and
+/// marks are still to settle, lowest first. `offers` holds what a body offered for another key and
+/// the query whose body offered it, and
 /// `noted` the queries whose places the run has brought to the hashes it asks them under.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
@@ -69,7 +72,7 @@ pub type Run = {
   inputs: List<{ query: Bytes, input: Bytes }>,
   settling: Bool,
   marked: Map<Int, List<Bytes>>,
-  offers: Map<Bytes, Bytes>,
+  offers: Map<Bytes, { output: Bytes, by: Bytes }>,
   noted: Map<Bytes, Bool>,
 }
 
@@ -128,7 +131,7 @@ pub fn digest_of(answer: Option<Bytes>) -> Bytes =
 
 /// The layout of the store a key, a place's note or a reader's link is named in: a store shared by
 /// `ply`s of two layouts holds two stores apart, since one marks only through its own links.
-fn layout() -> Bytes = b"ply.memo.5"
+fn layout() -> Bytes = b"ply.memo.6"
 
 /// What a query's answer for `input` is kept under: its definition's hash and the input's digest.
 pub fn key_of(q: Query, input: Bytes) -> Bytes =
@@ -447,7 +450,12 @@ fn settled_marks(
         let next = { ..r, marked: first.rest };
         if len(memo_keep.marks(key)) == 0 { Continue(next) } else {
           match memo_keep.record(key) {
-            None -> Continue(next),
+            // A link outlives the record it named, so a place that moves marks keys no record is
+            // kept under: those marks mark nothing, and are let go.
+            None -> {
+              memo_keep.unmark(key, memo_keep.marks(key));
+              Continue(next)
+            },
             Some(rec) -> match map_get(by_hash, rec.query) {
               // A query's record under a hash no query has now is never asked again; a command's
               // answer, made over no input, keeps its mark for the run that asks it.
@@ -783,7 +791,10 @@ fn executed(
             ..s,
             run: {
               ..s.run,
-              offers: map_insert(s.run.offers, key_of(query_of(queries, name), asked), output),
+              offers: map_insert(s.run.offers, key_of(query_of(queries, name), asked), {
+                output: output,
+                by: q.name,
+              }),
             },
           })
         },
@@ -793,7 +804,8 @@ fn executed(
             None -> None,
             Some(o) -> {
               cell_set(st, { ..s, run: { ..s.run, offers: map_remove(s.run.offers, key) } });
-              Some(o)
+              world(query_kind(), o.by);
+              Some(o.output)
             },
           }
         },
@@ -1410,6 +1422,54 @@ test "a record whose answer is no longer kept is answered again" {
   );
   assert_eq(lost.output, b"4");
   assert_eq(lost.executed, 1)
+}
+
+fn offering(input: Bytes) -> Bytes / {memo.read} = {
+  memo.offer(b"taken", input, bytes_concat(b"v ", input));
+  b"offered"
+}
+
+fn taking(input: Bytes) -> Bytes / {memo.read} =
+  match memo.offered() { Some(o) -> o, None -> bytes_concat(b"v ", input) }
+
+fn both(input: Bytes) -> Bytes / {memo.read} = {
+  memo.ask(b"offering", input);
+  memo.ask(b"taken", input)
+}
+
+fn offer_queries(offering_hash: Bytes) -> Map<Bytes, Query> =
+  map_insert(
+    map_insert(
+      map_insert(map_new(), b"offering", {
+        name: b"offering",
+        hash: offering_hash,
+        body: offering,
+      }),
+      b"taken",
+      { name: b"taken", hash: b"t1", body: taking },
+    ),
+    b"both",
+    { name: b"both", hash: b"b1", body: both },
+  )
+
+test "an answer taken from an offer is made again when the query that offered it is defined anew" {
+  let first = asked_over(offer_queries(b"o1"), test_world([]), b"both", b"a");
+  assert_eq(first.output, b"v a");
+  let again = asked_over(offer_queries(b"o1"), first.world, b"both", b"a");
+  assert_eq(again.executed, 0);
+  // The offering query runs under its new definition, and the answer taken from its offer with it.
+  let moved = asked_over(offer_queries(b"o2"), again.world, b"both", b"a");
+  assert_eq(moved.output, b"v a");
+  assert_eq(moved.executed, 2)
+}
+
+test "a mark on a key no record is kept under is let go" {
+  let ghost = { ..nothing_held(), marks: map_insert(map_new(), b"ghost", [b"m"]) };
+  let done = over_held(ghost, |_: String| None, |_: Bytes, _: Bytes| None, || {
+    started(test_queries(b"h1"));
+    ()
+  });
+  assert_eq(match map_get(done.held.marks, b"ghost") { Some(ms) -> len(ms), None -> 0 }, 0)
 }
 
 test "a query asking for its own answer is refused" {
