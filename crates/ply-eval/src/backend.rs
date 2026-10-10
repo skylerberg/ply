@@ -96,8 +96,8 @@ pub trait Provider: Send + Sync {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Compilation {
-    pub analysis_nanos: u64,
-    /// Nanoseconds inside the code generator, summed over every backend built.
-    pub codegen_nanos: u64,
+    /// Nanoseconds loading the unit's code, summed over every backend built: a unit is emitted and
+    /// compiled before it is handed over, which the asker measures.
+    pub load_nanos: u64,
     pub units: u64,
 }

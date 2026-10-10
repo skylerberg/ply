@@ -620,12 +620,8 @@ fn compiled_value(provider: Option<&dyn ply_eval::Provider>, hermetic: bool) -> 
         ("converted_out", tally(offers.converted_out)),
         ("units", option(compiled.map(|c| tally(c.units)))),
         (
-            "analysis_nanos",
-            option(compiled.map(|c| tally(c.analysis_nanos))),
-        ),
-        (
-            "codegen_nanos",
-            option(compiled.map(|c| tally(c.codegen_nanos))),
+            "load_nanos",
+            option(compiled.map(|c| tally(c.load_nanos))),
         ),
         (
             "unbuilt",

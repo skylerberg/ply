@@ -127,7 +127,7 @@ pub fn toolchain_of(compiler: Compiler, level: String) -> Toolchain =
 /// Each of `runs` run to its end, `toolchain.jobs()` at a time and each waited for in the order it
 /// started: nothing, or what the first refusal said. Every job started is waited for, so none
 /// outlives the refusal it is part of.
-fn ran<[c]>(runs: List<List<String>>) -> Result<Unit, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+fn ran<[c]>(runs: List<List<String>>) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
   let jobs = toolchain.jobs();
   let waited = |run: { job: Int, args: List<String> }|
     match compilers.finished[c](run.job) {
@@ -199,7 +199,7 @@ pub fn manifest(sources: List<Source>) -> Bytes =
   bytes_concat_all(map(sources, |s: Source| bytes_of_string(s.label ++ " " ++ s.digest ++ "\n")))
 
 /// The sources `manifest` wrote, or `None` for anything else.
-pub fn manifested(text: Bytes) -> Option<List<Source>> / {abort.raise} =
+pub fn manifested(text: Bytes) -> Option<List<Source>> =
   fold(bytes_split(text, b"\n"), Some([]), |acc: Option<List<Source>>, line: Bytes|
     match acc {
       None -> None,
@@ -214,7 +214,7 @@ pub fn manifested(text: Bytes) -> Option<List<Source>> / {abort.raise} =
     })
 
 /// Whether the cache still holds each of `sources`' C, which records a use of each.
-pub fn holds_sources(sources: List<Source>) -> Bool / {toolchain.read, abort.raise} =
+pub fn holds_sources(sources: List<Source>) -> Bool / {toolchain.read} =
   fold(sources, true, |ok: Bool, s: Source| ok && toolchain.holds(kept_source(s)))
 
 fn object_of(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
@@ -295,7 +295,7 @@ pub fn shared<[c]>(
   work: String,
 ) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
-  let library = key_of(t, ["-shared"], map(objects, bytes_of_string)) ++ ".so";
+  let library = library_of(t, objects);
   if toolchain.holds(library) { Ok(cache ++ "/" ++ library) } else {
     let made = work ++ "/unit.so";
     match ran[c]([concat(t.support, concat(["-shared", "-o", cache ++ "/" ++ made], objects))]) {
@@ -305,6 +305,10 @@ pub fn shared<[c]>(
     }
   }
 }
+
+/// Where the cache keeps the library `objects`, by their paths in it, link into.
+fn library_of(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
+  key_of(t, ["-shared"], map(objects, bytes_of_string)) ++ ".so"
 
 /// The flags every object of a library a program loads compiles with.
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
@@ -316,17 +320,27 @@ pub fn library<[c]>(
   flags: List<String>,
   text: Bytes,
 ) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
-  match ((compilers.found[c](), toolchain.scratch())) {
-    (None, _) -> Err("no C compiler is installed to compile the unit with"),
-    (_, None) -> Err("the toolchain's cache has no room to compile in"),
-    (Some(compiler), Some(work)) -> {
+  match compilers.found[c]() {
+    None -> Err("no C compiler is installed to compile the unit with"),
+    Some(compiler) -> {
       let t = toolchain_of(compiler, level);
-      let built = match objects[c](t, split(text), flags, work) {
-        Err(why) -> Err(why),
-        Ok(objects) -> shared[c](t, objects, work),
-      };
-      toolchain.cleared(work);
-      built
+      let parts = split(text);
+      let cache = toolchain.cache();
+      let made = library_of(t, map(sources_of(parts), |s: Source| cache ++ "/" ++ object_of(t, flags, s)));
+      // A unit built before is a library the cache holds, which needs no room to build in.
+      if toolchain.holds(made) { Ok(cache ++ "/" ++ made) } else {
+        match toolchain.scratch() {
+          None -> Err("the toolchain's cache has no room to compile in"),
+          Some(work) -> {
+            let built = match objects[c](t, parts, flags, work) {
+              Err(why) -> Err(why),
+              Ok(objects) -> shared[c](t, objects, work),
+            };
+            toolchain.cleared(work);
+            built
+          },
+        }
+      }
     },
   }
 

@@ -2,8 +2,8 @@
 //! program `compiler.load` reads and `compiler.cc` compiles is loaded under `run`, an entry bound,
 //! entered or called, and the label dropped, with what each step answers.
 
-import harness (Here, Shipped, bound_main, compiled_here, first_message, loaded, project, read, working, write)
-import cli.machine (machine, Called, Ended, Options, default_options, unconfigured)
+import harness (Here, Shipped, answered, bound_main, compiled_here, first_message, loaded, project, read, working, write)
+import cli.machine (machine, Called, Ended, Held, Options, default_options, unconfigured)
 import compiler.resolve (Diag)
 import std.fs
 import std.fs (fs)
@@ -267,4 +267,68 @@ test/nondet "the branches of a parallel block spend one step budget between them
   };
   assert_eq(under(both - alone / 2), Err(b"E0503"));
   assert_eq(under(both + 16), Ok(VInt(6765 + 10946)))
+}
+
+/// Per round, a task nobody joins and one the root joins, each opening a region of its own; a task
+/// per round that is let go; and a cell per round.
+fn churning() -> String =
+  \\fn main() -> Int = 0
+  \\
+  \\fn counted(i: Int) -> Int =
+  \\  with_cell[work](i) { c -> {
+  \\    cell_set(c, cell_get(c) + 1);
+  \\    cell_get(c)
+  \\  } }
+  \\
+  \\pub fn churn(n: Int) -> Int / {task.write, abort.raise} =
+  \\  fold(range(0, n), 0, |sum: Int, i: Int| {
+  \\    task.spawn(|| counted(i));
+  \\    let t = task.spawn(|| counted(i));
+  \\    task.yield();
+  \\    sum + task.join(t)
+  \\  })
+  \\
+  \\pub fn fired(n: Int) -> Int / {task.write} =
+  \\  fold(range(0, n), 0, |sum: Int, i: Int| {
+  \\    task.spawn(|| counted(i));
+  \\    task.yield();
+  \\    sum + i
+  \\  })
+  \\
+  \\pub fn celled(n: Int) -> Int = fold(range(0, n), 0, |sum: Int, i: Int| sum + counted(i))
+  \\
+
+/// What `name(n)` answered and what the run held when its root returned.
+fn held_by(name: String, n: Int) -> { answer: Value, held: Held } / {Here, Shipped, Driving, abort.raise} = {
+  project([{ path: "inner.ply", text: churning() }]);
+  loaded({ ..default_options(), host: true });
+  bound_main();
+  let _ = machine.accounting[run]();
+  let answer = answered(name, [VInt(n)]);
+  let held = (machine.accounting[run]()).held;
+  machine.drop[run]();
+  { answer: answer, held: held }
+}
+
+// A server spawns per connection for as long as it runs, so its tables must follow the live tasks.
+test/nondet "a production region keeps its tables to the tasks still live" {
+  let h = held_by("churn", 200);
+  assert_eq(h.answer, VInt(200 * 201 / 2));
+  assert(h.held.scheduled <= 3, Some("the scheduler keeps " ++ int_to_string(h.held.scheduled) ++ " tasks after 400 spawns"));
+  assert(h.held.task_stacks <= 2, Some(int_to_string(h.held.task_stacks) ++ " task stacks after 400 spawns"));
+  assert(h.held.frame_tables <= 8, Some(int_to_string(h.held.frame_tables) ++ " frame tables after 400 spawns"));
+  assert(h.held.cell_owners <= h.held.frame_tables, Some("the arena keeps nestings for stacks no longer kept"))
+}
+
+// A spawn's handle and a `with_cell`'s cell are both bridges, which a server makes per request.
+test/nondet "a production region that drops its task handles gives their bridges back" {
+  let h = held_by("fired", 10000);
+  assert_eq(h.answer, VInt(10000 * 9999 / 2));
+  assert(h.held.bridges <= 4, Some(int_to_string(h.held.bridges) ++ " bridges after 10000 dropped handles and cells"))
+}
+
+test/nondet "a with_cell opened in a loop gives its cell's bridge back" {
+  let h = held_by("celled", 10000);
+  assert_eq(h.answer, VInt(10000 * 10001 / 2));
+  assert(h.held.bridges <= 4, Some(int_to_string(h.held.bridges) ++ " bridges after 10000 cells"))
 }

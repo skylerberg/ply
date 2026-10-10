@@ -114,6 +114,7 @@ CORPUS_LANES=2
 # until the code its test runs moves, where a test wrapping the run reruns whenever the CLI moves.
 PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
+  "kernel:benches/kernel"
   "lang:tests/lang"
   "registry:crates/ply-registry/ply"
   "prove:crates/ply-prove/ply"

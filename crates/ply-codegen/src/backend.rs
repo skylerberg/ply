@@ -140,7 +140,7 @@ pub struct Unit {
     /// Definitions the emitter refused, with the construct that refused each.
     refusals: Vec<(String, String)>,
     counters: Counters,
-    codegen_nanos: AtomicU64,
+    load_nanos: AtomicU64,
     compiles: AtomicU64,
     /// Workers whose load failed after the first load of the unit succeeded.
     poisoned: AtomicU64,
@@ -193,7 +193,7 @@ impl Unit {
                 .map(|r| (r.function, r.construct))
                 .collect(),
             counters: Counters::default(),
-            codegen_nanos: AtomicU64::new(0),
+            load_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
             code,
@@ -226,8 +226,7 @@ impl Unit {
     /// What this unit has spent compiling, in its two halves.
     pub fn compilation(&self) -> Compilation {
         Compilation {
-            analysis_nanos: 0,
-            codegen_nanos: self.codegen_nanos.load(Ordering::Relaxed),
+            load_nanos: self.load_nanos.load(Ordering::Relaxed),
             units: self.compiles.load(Ordering::Relaxed),
         }
     }
@@ -254,7 +253,7 @@ impl Unit {
             Some(native) => native,
             None => self.code.load(&self.source)?.0,
         };
-        self.codegen_nanos.fetch_add(
+        self.load_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
@@ -319,6 +318,7 @@ impl ply_eval::Compiled for Absent {
 #[derive(Default)]
 struct LastEntry {
     steps: u64,
+    held: ply_eval::Held,
     record: Option<ply_eval::region::Record>,
     performed: Vec<ply_eval::EffectAtom>,
 }
@@ -486,6 +486,14 @@ impl Bodies {
         // `handles` is `MAX_ARITY` wide, which `Bodies::new` refused to exceed.
         let mut out =
             unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
+        let production = ctx.sims.last().filter(|sim| sim.is_production());
+        let held = ply_eval::Held {
+            bridges: ctx.heap.bridges() as u64,
+            scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
+            task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
+            frame_tables: ctx.stack_slots() as u64,
+            cell_owners: ctx.cell_owners() as u64,
+        };
         if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
             out = unsafe { crate::simulate::finish_root(&mut *ctx as *mut crate::rt::Ctx, out) };
         }
@@ -495,6 +503,7 @@ impl Bodies {
         }
         *self.last.borrow_mut() = LastEntry {
             steps: u64::try_from(ctx.ticks).unwrap_or(0),
+            held,
             record: ctx.record.take(),
             performed: std::mem::take(&mut ctx.performed),
         };
@@ -649,6 +658,10 @@ impl ply_eval::Compiled for Bodies {
 
     fn steps(&self) -> u64 {
         self.last.borrow().steps
+    }
+
+    fn held(&self) -> ply_eval::Held {
+        self.last.borrow().held
     }
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
