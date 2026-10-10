@@ -4,6 +4,7 @@
 use crate::runnable::Runnable;
 use ply_eval::{Analysis, Diagnostic, Ended, SourceMap, Span, Symbol, codes};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What a caller lends an entered program: the roots it may reach, the programs its
 /// `process.spawn` labels may start, and the host operations only this entry may perform. What is
@@ -64,7 +65,7 @@ pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable
 pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) -> Ended<i32> {
     let OpenedRunnable { opened, unit } = program;
     let provider = ply_codegen::Unit::handed(&opened.front, unit)
-        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map(|unit| unit as Arc<dyn ply_eval::Provider>)
         .map_err(|e| {
             Diagnostic::error(
                 codes::BACKEND_UNAVAILABLE,
@@ -75,7 +76,7 @@ pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) 
 }
 
 fn entered_with(
-    provider: Result<&'static dyn ply_eval::Provider, Diagnostic>,
+    provider: Result<Arc<dyn ply_eval::Provider>, Diagnostic>,
     opened: &Opened,
     argv: Vec<String>,
     binds: Binds,
@@ -204,7 +205,7 @@ fn evaluate(
     span: Span,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_eval::Footprint>,
-    provider: &'static dyn ply_eval::Provider,
+    provider: Arc<dyn ply_eval::Provider>,
 ) -> Ended<ply_eval::Value> {
     let mut machine = match ply_eval::Machine::new(&opened.front, provider.attach()) {
         Ok(machine) => machine,

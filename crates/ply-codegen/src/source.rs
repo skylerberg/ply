@@ -3,17 +3,13 @@
 
 use ply_eval::{Analysis, EmitterRoot, Span, Symbol};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-/// A checked program, borrowed for as long as the unit compiled from it lives.
+/// A checked program, held for as long as the unit compiled from it lives.
 pub struct Source {
-    pub front: &'static Analysis,
+    pub front: Arc<Analysis>,
     /// [`Analysis::check`].
     tables: Tables,
-}
-
-/// A law's guard or body as a root, by its place among the module's laws; binders are its params.
-pub fn law_root_name(ordinal: usize, part: &str) -> Symbol {
-    Symbol::new(format!("law#{ordinal}.{part}"))
 }
 
 /// A definition's `requires` or `ensures` clause as a root: `<owner>#requires#<k>` over the
@@ -61,10 +57,10 @@ impl Tables {
 }
 
 impl Source {
-    pub fn from_analysis(front: &'static Analysis) -> Source {
+    pub fn from_analysis(front: Arc<Analysis>) -> Source {
         Source {
+            tables: Tables::of(&front),
             front,
-            tables: Tables::of(front),
         }
     }
 
@@ -79,9 +75,11 @@ impl Source {
     }
 
     /// The row the compiler published for `name`, which says how its values read.
-    pub fn row(&self, name: &str) -> Option<&'static EmitterRoot> {
-        let front: &'static Analysis = self.front;
-        self.tables.rows.get(name).map(|&i| &front.emitter_roots[i])
+    pub fn row(&self, name: &str) -> Option<&EmitterRoot> {
+        self.tables
+            .rows
+            .get(name)
+            .map(|&i| &self.front.emitter_roots[i])
     }
 
     /// Whether the compiler published the root pure.

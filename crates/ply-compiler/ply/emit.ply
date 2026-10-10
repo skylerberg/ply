@@ -18,7 +18,7 @@ import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, res
 import derive (expand_derives)
 import infer (LabelSite, OperandSite, expanded_mods, prelude_effects, EffectInfo, OpInfo, EmitFacts,
               RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder, facts_at,
-              test_owner, cases_root)
+              test_owner, law_root, cases_root)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with,
               analyse_pulling_std_with, dump_of, WalkedFacts, walked_facts_bin, facts_read,
@@ -8702,7 +8702,7 @@ fn sited_answers(sources: List<Source>, d: Dump) -> List<RootAnswer> / {abort.ra
     map(sources, |s: Source| s.src),
     [],
     [],
-    [b"a.moved", b"a.test#0", b"b.twice"],
+    [b"a.moved", test_owner(b"a", b"moves"), b"b.twice"],
     [],
     [],
     [],
@@ -8782,7 +8782,7 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
       0,
     ).answer;
   match call([b"a.moved"]) { Body(_) -> (), Refused(r) -> panic(string_of_bytes_lossy(r.why)) };
-  match call([b"a.test#0"]) {
+  match call([test_owner(b"a", b"moves")]) {
     Body(_) -> panic("a test the answer holds nothing of is not lowered from a guess"),
     Refused(_) -> (),
   }
@@ -8791,8 +8791,8 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
 test "a root is in the module its owner is in" {
   assert_eq(module_of_root(b"app.cli.main"), b"app.cli");
   assert_eq(module_of_root(b"app.cli.main#requires#0"), b"app.cli");
-  assert_eq(module_of_root(b"app.test#3"), b"app");
-  assert_eq(module_of_root(b"app.law#2.body"), b"app");
+  assert_eq(module_of_root(test_owner(b"app", b"a.b c")), b"app");
+  assert_eq(module_of_root(law_root(b"app", b"x.y", b"body")), b"app");
   assert_eq(module_of_root(b"main"), b"")
 }
 
@@ -9245,63 +9245,87 @@ fn emit_module(
       _ -> acc,
     });
   let groups = tail_groups(module, here, fns);
-  let walked = fold(
-    x.module.items,
-    { out: [], tests: 0, laws: 0, fns: 0 },
-    |acc: Walk, item: Item|
-      match item {
-        IFn(d) -> {
-          let p = match list_at(fns, acc.fns) {
-            Some(q) -> q,
-            None -> prepare(module, aliases, others, wanted, sites, d),
-          };
-          let out = match group_of(groups, acc.fns) {
-            None -> if !wants(wanted, p.full) { acc.out } else {
-              push(
-                acc.out,
-                emitted_from(
-                  module,
-                  p.base,
-                  here,
-                  imports,
-                  ctors,
-                  builtins,
-                  effects,
-                  release,
-                  operands,
-                  p.full,
-                  p.ps,
-                  p.known,
-                  p.body,
-                  p.code,
-                ),
-              )
-            },
-            // The group is emitted where its first member stands; the others are its cases.
-            Some(g) -> if list_at(g, 0) != Some(acc.fns) { acc.out } else {
-              fold(
-                group_emitted(
-                  module,
-                  here,
-                  imports,
-                  ctors,
-                  builtins,
-                  effects,
-                  release,
-                  operands,
-                  map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p }),
-                ),
-                acc.out,
-                |a: List<Emitted>, e: Emitted| push(a, e),
-              )
-            },
-          };
-          clause_roots(
-            { out: out, tests: acc.tests, laws: acc.laws, fns: acc.fns + 1 },
-            d,
-            p.names,
-            p.kinds,
+  let walked = fold(x.module.items, { out: [], fns: 0 }, |acc: Walk, item: Item|
+    match item {
+      IFn(d) -> {
+        let p = match list_at(fns, acc.fns) {
+          Some(q) -> q,
+          None -> prepare(module, aliases, others, wanted, sites, d),
+        };
+        let out = match group_of(groups, acc.fns) {
+          None -> if !wants(wanted, p.full) { acc.out } else {
+            push(
+              acc.out,
+              emitted_from(
+                module,
+                p.base,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                p.full,
+                p.ps,
+                p.known,
+                p.body,
+                p.code,
+              ),
+            )
+          },
+          // The group is emitted where its first member stands; the others are its cases.
+          Some(g) -> if list_at(g, 0) != Some(acc.fns) { acc.out } else {
+            fold(
+              group_emitted(
+                module,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p }),
+              ),
+              acc.out,
+              |a: List<Emitted>, e: Emitted| push(a, e),
+            )
+          },
+        };
+        clause_roots(
+          { out: out, fns: acc.fns + 1 },
+          d,
+          p.names,
+          p.kinds,
+          module,
+          here,
+          imports,
+          ctors,
+          builtins,
+          effects,
+          release,
+          operands,
+          aliases,
+          others,
+          wanted,
+          sites,
+        )
+      },
+      // A test is a root named by its label: nullary, or over cases entered with a case's place
+      // and identity beside a nullary root that lists them.
+      ITest(t) -> {
+        let full = test_owner(module, t.name);
+        let ps = if t.cases == None { [] } else {
+          [
+            { name: case_at(), kind: KInt, ty: TyOpen },
+            { name: case_identity(), kind: KBoxed, ty: TyBytes },
+          ]
+        };
+        let rooted = |name: Bytes, taken: List<EmitParam>, body: Expr|
+          root_emitted(
             module,
+            t.span.start,
             here,
             imports,
             ctors,
@@ -9309,115 +9333,84 @@ fn emit_module(
             effects,
             release,
             operands,
-            aliases,
-            others,
-            wanted,
+            name,
+            map(taken, |p: EmitParam| p.name),
+            taken,
+            true,
             sites,
-          )
-        },
-        // A test is a root named by its place among the module's tests: nullary, or over cases
-        // entered with a case's place and identity beside a nullary root that lists them.
-        ITest(t) -> {
-          let full = qualify(module, bytes_concat_all([b"test#", ascii_of_int(acc.tests)]));
-          let ps = if t.cases == None { [] } else {
-            [
-              { name: case_at(), kind: KInt, ty: TyOpen },
-              { name: case_identity(), kind: KBoxed, ty: TyBytes },
-            ]
-          };
-          let rooted = |name: Bytes, taken: List<EmitParam>, body: Expr|
-            root_emitted(
-              module,
-              t.span.start,
-              here,
-              imports,
-              ctors,
-              builtins,
-              effects,
-              release,
-              operands,
-              name,
-              map(taken, |p: EmitParam| p.name),
-              taken,
-              true,
-              sites,
-              body,
-            );
-          let run = if !wants(wanted, full) { acc.out }
-          else { push(acc.out, rooted(full, ps, test_run(t))) };
-          let out = match t.cases {
-            None -> run,
-            Some(c) -> if !wants(wanted, cases_root(full)) { run }
-            else { push(run, rooted(cases_root(full), [], test_listing(c))) },
-          };
-          { out: out, tests: acc.tests + 1, laws: acc.laws, fns: acc.fns }
-        },
-        // A law's guard and body are roots the judge enters with the binders' values.
-        ILaw(d) -> {
-          let names = map(d.binders, |binder: Binder| binder.name.name);
-          let kinds = map(d.binders, |binder: Binder|
-            param_kind_with(aliases, others, Some(binder.ty)));
-          let ps = params_of(names, kinds);
-          let known = fold(kinds, true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
-            acc2 && k != None);
-          let part = |which: Bytes|
-            qualify(module, bytes_concat_all([b"law#", ascii_of_int(acc.laws), which]));
-          let with_guard = match d.guard {
-            None -> acc.out,
-            Some(g) -> if !wants(wanted, part(b".guard")) { acc.out } else {
-              push(
-                acc.out,
-                root_emitted(
-                  module,
-                  d.span.start,
-                  here,
-                  imports,
-                  ctors,
-                  builtins,
-                  effects,
-                  release,
-                  operands,
-                  part(b".guard"),
-                  names,
-                  ps,
-                  known,
-                  sites,
-                  g,
-                ),
-              )
-            },
-          };
-          {
-            out: if !wants(wanted, part(b".body")) { with_guard } else {
-              push(
-                with_guard,
-                root_emitted(
-                  module,
-                  d.span.start,
-                  here,
-                  imports,
-                  ctors,
-                  builtins,
-                  effects,
-                  release,
-                  operands,
-                  part(b".body"),
-                  names,
-                  ps,
-                  known,
-                  sites,
-                  d.body,
-                ),
-              )
-            },
-            tests: acc.tests,
-            laws: acc.laws + 1,
-            fns: acc.fns,
-          }
-        },
-        _ -> acc,
+            body,
+          );
+        let run = if !wants(wanted, full) { acc.out }
+        else { push(acc.out, rooted(full, ps, test_run(t))) };
+        let out = match t.cases {
+          None -> run,
+          Some(c) -> if !wants(wanted, cases_root(full)) { run }
+          else { push(run, rooted(cases_root(full), [], test_listing(c))) },
+        };
+        { out: out, fns: acc.fns }
       },
-  );
+      // A law's guard and body are roots the judge enters with the binders' values.
+      ILaw(d) -> {
+        let names = map(d.binders, |binder: Binder| binder.name.name);
+        let kinds = map(d.binders, |binder: Binder|
+          param_kind_with(aliases, others, Some(binder.ty)));
+        let ps = params_of(names, kinds);
+        let known = fold(kinds, true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
+          acc2 && k != None);
+        let part = |which: Bytes| law_root(module, d.name, which);
+        let with_guard = match d.guard {
+          None -> acc.out,
+          Some(g) -> if !wants(wanted, part(b"guard")) { acc.out } else {
+            push(
+              acc.out,
+              root_emitted(
+                module,
+                d.span.start,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                part(b"guard"),
+                names,
+                ps,
+                known,
+                sites,
+                g,
+              ),
+            )
+          },
+        };
+        {
+          out: if !wants(wanted, part(b"body")) { with_guard } else {
+            push(
+              with_guard,
+              root_emitted(
+                module,
+                d.span.start,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                part(b"body"),
+                names,
+                ps,
+                known,
+                sites,
+                d.body,
+              ),
+            )
+          },
+          fns: acc.fns,
+        }
+      },
+      _ -> acc,
+    });
   walked.out
 }
 
@@ -9430,7 +9423,7 @@ pub type Emitted = {
   handles: List<Bytes>,
 }
 
-type Walk = { out: List<Emitted>, tests: Int, laws: Int, fns: Int }
+type Walk = { out: List<Emitted>, fns: Int }
 
 /// A definition lowered once, for grouping and for emission; `code` is `None` when it is not wanted or does not lower.
 type Prepared = {
@@ -9810,7 +9803,7 @@ fn clause_roots(
         SCost -> s,
       },
   );
-  { out: walked.out, tests: acc.tests, laws: acc.laws, fns: acc.fns }
+  { out: walked.out, fns: acc.fns }
 }
 
 fn concat_effects(a: List<EffectName>, b: List<EffectName>) -> List<EffectName> =

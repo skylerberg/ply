@@ -9,7 +9,8 @@ import compiler.memo_files
 import compiler.unit (shipped)
 import compiler.checking (Answered, OwnFile, OwnPackage, World, asked_all, evaluator_of, hashed_all,
                           identity_of, looked, refused_first, registry, shipped_all,
-                          shipped_queries, world_of, world_placing)
+                          shipped_queries, walked_covers, wanted_all, world_of, world_placing)
+import compiler.front (ShippedWants)
 import compiler.hash (Fixing, no_fixing)
 import sources (Project, File, DepPackage, Embed, embed_now, embed_of)
 import compiler.resolve (Diag, diag_bin)
@@ -130,11 +131,13 @@ fn running() -> Map<Bytes, Query> / {fs.read_file[shipped], abort.raise} =
     _ -> panic("the toolchain ships no `definitions` or no `stamps`"),
   }
 
-/// What each module of a load answered, the shipped modules it pulled in the order it pulled them,
-/// what hashing fixed of each where none refuses, and what the run did of each query to answer them.
+/// What each module of a load answered, the shipped modules it pulled in the order it pulled them
+/// and what each embeds of the shipped modules, what hashing fixed of each where none refuses, and
+/// what the run did of each query to answer them.
 pub type Queried = {
   answers: List<Answered>,
   pulled: List<Bytes>,
+  wants: Map<Bytes, ShippedWants>,
   fixing: Fixing,
   embeds: List<Embed>,
   asked: List<Read>,
@@ -143,9 +146,22 @@ pub type Queried = {
 
 /// What a load with no modules to answer answers.
 pub fn nothing() -> Queried =
-  { answers: [], pulled: [], fixing: no_fixing(), embeds: [], asked: [], tallies: [] }
+  {
+    answers: [],
+    pulled: [],
+    wants: map_new(),
+    fixing: no_fixing(),
+    embeds: [],
+    asked: [],
+    tallies: [],
+  }
 
-type Asked = { answers: List<Answered>, pulled: List<Bytes>, fixing: Fixing }
+type Asked = {
+  answers: List<Answered>,
+  pulled: List<Bytes>,
+  wants: Map<Bytes, ShippedWants>,
+  fixing: Fixing,
+}
 
 /// What `own` and each shipped module they pull answer over `run`, `asked` pulled whatever imports
 /// them and each shipped one read with its tests where `tested` says, and what hashing fixed of each
@@ -160,22 +176,31 @@ fn asked(
   let all = asked_all(qs, own, asked, tested, run);
   let answers = all.value.answers;
   let pulled = all.value.pulled;
+  let wanted = wanted_all(qs, pulled, tested, all.run);
   if len(refused_first(answers)) > 0 {
-    { run: all.run, value: { answers: answers, pulled: pulled, fixing: no_fixing() } }
+    {
+      run: wanted.run,
+      value: { answers: answers, pulled: pulled, wants: wanted.value, fixing: no_fixing() },
+    }
   } else {
-    let fixed = hashed_all(qs, own, pulled, tested, all.run);
-    { run: fixed.run, value: { answers: answers, pulled: pulled, fixing: fixed.value } }
+    let fixed = hashed_all(qs, own, pulled, tested, wanted.run);
+    {
+      run: fixed.run,
+      value: { answers: answers, pulled: pulled, wants: wanted.value, fixing: fixed.value },
+    }
   }
 }
 
 /// What each module of `project`'s own packages answers, and each shipped module they pull, `always`
 /// whatever imports them, read with its tests where `tested` says, through the memo store in `dir`,
-/// with what the toolchain ships answered for its shipped modules beside it.
+/// with what the toolchain ships answered for its shipped modules beside it. `whole` is whether the
+/// walk read its root package whole rather than one file of it.
 pub fn answered<[r]>(
   dir: String,
   project: Project,
   always: List<Bytes>,
   tested: Bool,
+  whole: Bool,
 ) -> Queried / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
@@ -184,10 +209,13 @@ pub fn answered<[r]>(
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
     || asked(qs, w.own, always, tested, started(qs)),
+    trusted: packed_stands(),
+    covers: |kind: Bytes, at: Bytes| whole || walked_covers(w, kind, at),
   );
   {
     answers: done.value.answers,
     pulled: done.value.pulled,
+    wants: done.value.wants,
     fixing: done.value.fixing,
     embeds: embeds_answered(project, w, done.value.answers),
     asked: asked_reads(done.run),
@@ -212,12 +240,13 @@ pub fn command_key(program: Bytes, asked: Bytes) -> Bytes =
 
 /// The answer kept under `key` in the memo store in `dir` for a command over `project`, where it
 /// stands, asked again where marked only when `checked`; beside the marks found on it, which keeping
-/// it again removes.
+/// it again removes. `whole` is whether the walk read its root package whole.
 pub fn command_kept<[r]>(
   dir: String,
   project: Project,
   key: Bytes,
   checked: Bool,
+  whole: Bool,
 ) -> { output: Option<Bytes>, marks: List<Bytes> } / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
   let qs = running();
   let w = world(project);
@@ -226,6 +255,8 @@ pub fn command_kept<[r]>(
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
     || standing(qs, started(qs), key, checked),
+    trusted: packed_stands(),
+    covers: |kind: Bytes, at: Bytes| whole || walked_covers(w, kind, at),
   );
   { output: kept.output, marks: kept.marks }
 }
@@ -253,11 +284,14 @@ pub fn keep_command<[r]>(
     dir,
     |path: String| shipped.answer(path),
     |kind: Bytes, at: Bytes| project_look(project, w, kind, at),
-    || {
-      recorded(qs, key, program, reads, output, marks);
-      memo_keep.head(key) == Some(digest_of(Some(output)))
-    },
-  )
+    || recorded(qs, key, program, reads, output, marks),
+    trusted: packed_stands(),
+  );
+  // Read back once the run has written what it kept, which a store it cannot write never holds.
+  match memo_files::record_at[r](dir, key) {
+    Some(rec) -> rec.output == digest_of(Some(output)),
+    None -> false,
+  }
 }
 
 /// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
@@ -288,17 +322,51 @@ pub fn shipped_answers<[r], [w]>(
   );
   let wanted = fold(shipped_queries(), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
     match map_get(qs, name) { Some(q) -> map_insert(acc, q.hash, true), None -> acc });
-  let keys = map_fold(done.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes| push(acc, key));
-  memo_files::copied[r, w](
-    work,
-    out,
-    filter(keys, |key: Bytes|
-      match memo_files::record_at[r](work, key) {
-        Some(rec) -> map_contains(wanted, rec.query),
-        None -> false,
-      }),
-  )
+  // Every record the run's answers read, at any depth: one taken as kept settles none of its reads.
+  let reached = iterate(
+    {
+      seen: map_new(),
+      work: map_fold(done.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes| push(acc, key)),
+      keys: [],
+    },
+    100000000,
+    |x: { seen: Map<Bytes, Bool>, work: List<Bytes>, keys: List<Bytes> }|
+      match x.work {
+        [] -> Stop(x.keys),
+        [key, ..rest] -> if map_contains(x.seen, key) { Continue({ ..x, work: rest }) } else {
+          let seen = map_insert(x.seen, key, true);
+          match memo_files::record_at[r](work, key) {
+            None -> Continue({ ..x, seen: seen, work: rest }),
+            Some(rec) ->
+              Continue({
+                seen: seen,
+                work: fold(rec.reads, rest, |w: List<Bytes>, read: Read|
+                  match read {
+                    memo::Asked(name, input, _) -> match map_get(qs, name) {
+                      Some(q) -> push(w, memo::key_of(q, input)),
+                      None -> w,
+                    },
+                    memo::World(_, _, _) -> w,
+                  }),
+                keys: if map_contains(wanted, rec.query) { push(x.keys, key) } else { x.keys },
+              }),
+          }
+        },
+      },
+  );
+  let copied = memo_files::copied[r, w](work, out, reached);
+  fs.write_file[w](out ++ "/" ++ standing_path(), b"");
+  copied
 }
+
+/// The file a store of what the shipped modules answer holds to say it was answered over the very
+/// modules a binary carrying it ships.
+fn standing_path() -> String = "standing"
+
+/// Whether the store the toolchain packed beside its shipped modules stands for the shipped modules
+/// this run reads, so that its records are taken as they are: a run handed others is not told so, and
+/// holds each record to what it read.
+fn packed_stands() -> Bool / {shipped.answer} = shipped.answer(standing_path()) != None
 
 /// The store `ply std --answers` answers the shipped modules through, beside the stage of reused
 /// answers `reused` names, under the identity of the queries that answer: what a later answering by
@@ -332,10 +400,12 @@ pub fn answered_afresh(
         at,
       ),
     || asked(qs, w.own, always, tested, started(qs)),
+    trusted: packed_stands(),
   );
   {
     answers: done.value.answers,
     pulled: done.value.pulled,
+    wants: done.value.wants,
     fixing: done.value.fixing,
     embeds: embeds_answered(project, w, done.value.answers),
     asked: asked_reads(done.run),

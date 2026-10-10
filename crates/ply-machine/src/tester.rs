@@ -154,7 +154,7 @@ struct Run {
 struct Unit {
     front: Arc<ply_eval::Analysis>,
     /// `None` when the run decided to execute nothing and so built nothing to run a test on.
-    provider: Option<&'static dyn ply_eval::Provider>,
+    provider: Option<Arc<dyn ply_eval::Provider>>,
     /// Whether its tests reach the binding: a mixture is run hermetically, whatever it mixes.
     hosted: bool,
 }
@@ -332,7 +332,7 @@ impl TesterHandler {
         let unit = run.units.first().ok_or_else(|| out_of_step("schema"))?;
         Ok(crate::config::schema_answer(crate::config::schema_of(
             &unit.front.check,
-            unit.provider,
+            unit.provider.clone(),
             name,
         )))
     }
@@ -425,7 +425,10 @@ impl TesterHandler {
             ("hosts", json(&hosts.summary_json())),
             ("reaches", PlyValue::list(reaches)),
             ("cores", count(cores)),
-            ("backend", compiled_value(unit.provider, self.hermetic)),
+            (
+                "backend",
+                compiled_value(unit.provider.as_deref(), self.hermetic),
+            ),
         ]))
     }
 
@@ -505,8 +508,9 @@ impl TesterHandler {
     /// performs nothing, so it reaches no binding and reads nothing a pass would stand on.
     fn cases(&self, unit: usize, test: usize) -> Result<PlyValue, Diagnostic> {
         let (unit, _) = self.unit_at(unit)?;
-        let cases = match unit.provider {
+        let cases = match &unit.provider {
             Some(provider) => {
+                let provider = Arc::clone(provider);
                 let executor = Executor {
                     front: &unit.front,
                     hosting: Hosting::default(),
@@ -539,8 +543,9 @@ impl TesterHandler {
         caller: MachineId,
     ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
-        let once = match unit.provider {
+        let once = match &unit.provider {
             Some(provider) => {
+                let provider = Arc::clone(provider);
                 let executor = Executor {
                     front: &unit.front,
                     hosting,
@@ -574,8 +579,9 @@ impl TesterHandler {
         caller: MachineId,
     ) -> Result<PlyValue, Diagnostic> {
         let (unit, hosting) = self.unit_at(unit)?;
-        let run = match unit.provider {
+        let run = match &unit.provider {
             Some(provider) => {
+                let provider = Arc::clone(provider);
                 let executor = Executor {
                     front: &unit.front,
                     hosting,
@@ -599,7 +605,7 @@ impl TesterHandler {
 }
 
 /// What the first unit's backend did, apart from the entries its tests counted.
-fn compiled_value(provider: Option<&'static dyn ply_eval::Provider>, hermetic: bool) -> PlyValue {
+fn compiled_value(provider: Option<&dyn ply_eval::Provider>, hermetic: bool) -> PlyValue {
     let offers = provider.map_or_else(Default::default, ply_eval::Provider::offers);
     // What compiling cost is the machine's state and clock, not the program's.
     let compiled = provider

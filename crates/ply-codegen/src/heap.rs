@@ -655,6 +655,9 @@ impl Default for Heap {
 const FIRST_CHUNK: usize = 1 << 20;
 const BRANCH_CHUNK: usize = 16 << 10;
 const LARGEST_CHUNK: usize = 64 << 20;
+/// The chunks an ended entry keeps for the next on its thread; past them, a run's every thread
+/// would hold what the most an entry on it ever took.
+const KEPT_AT_END: usize = 64 << 20;
 
 impl Heap {
     pub fn new() -> Heap {
@@ -1129,15 +1132,35 @@ impl Heap {
         }
     }
 
-    /// Resets the entry's memory, keeping its chunks; the answer is already copied out.
+    /// Resets the entry's memory, keeping the first chunks that fit in [`KEPT_AT_END`] and giving
+    /// the rest back; the answer is already copied out.
     pub fn end(&mut self) {
         if self.persistent {
             return;
         }
         self.drop_bridges();
-        if let Some((p, cap)) = self.chunks.first() {
-            self.cur = *p;
-            self.end = unsafe { p.add(*cap) };
+        let mut kept = 0;
+        let keep = self
+            .chunks
+            .iter()
+            .take_while(|(_, cap)| {
+                kept += cap;
+                kept <= KEPT_AT_END
+            })
+            .count();
+        for (p, cap) in self.chunks.drain(keep..) {
+            unsafe { dealloc(p, Layout::from_size_align(cap, 16).expect("a chunk layout")) };
+        }
+        self.starts.truncate(keep);
+        match self.chunks.first() {
+            Some((p, cap)) => {
+                self.cur = *p;
+                self.end = unsafe { p.add(*cap) };
+            }
+            None => {
+                self.cur = std::ptr::null_mut();
+                self.end = std::ptr::null_mut();
+            }
         }
         self.chunk = 0;
         self.count = 0;
@@ -1550,9 +1573,10 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
-/// Perceus's `reset`: a unique record or constructor drops its fields and keeps its memory with
-/// `len` zeroed, for the next record or constructor of its width, which writes the whole header;
-/// answers `w`, or `0` after releasing anything else.
+/// Perceus's `reset`: a unique record or constructor drops its fields and keeps its memory for the
+/// next record or constructor of its width, which writes the whole header; answers `w`, or `0`
+/// after releasing anything else. It keeps its width and is marked flat, so a token released unused
+/// walks nothing and goes back to the free list of its own size.
 pub fn reset(w: Word) -> Word {
     if is_imm(w) || w == 0 {
         return 0;
@@ -1570,8 +1594,8 @@ pub fn reset(w: Word) -> Word {
                     dec(c);
                 }
             }
+            (*o).flags |= FLAT;
         }
-        (*o).len = 0;
     }
     w
 }

@@ -221,7 +221,7 @@ impl<'a> Machine<'a> {
         self.compiled_call(&Symbol::new(format!("{root}.cases")), Vec::new(), span)
     }
 
-    /// A test's root, named by its place among its module's tests, and where the test is written.
+    /// A test's root, named by its label, and where the test is written.
     fn test_root(&self, index: usize) -> Result<(Symbol, Span), Diagnostic> {
         let tests = &self.front.check.tests;
         let Some(test) = tests.get(index) else {
@@ -234,12 +234,7 @@ impl<'a> Machine<'a> {
             )
             .primary(Span::DUMMY, "requested test does not exist"));
         };
-        let ordinal = tests[..index]
-            .iter()
-            .filter(|t| t.module == test.module)
-            .count();
-        let root = test.module.qualify(&Symbol::new(format!("test#{ordinal}")));
-        Ok((root, test.span))
+        Ok((test.root(), test.span))
     }
 
     /// The compiled front end is the authority: unit passes, a raise fails, and a missing body or

@@ -98,7 +98,7 @@ impl Configuration {
 /// crosses threads. Whether it is a `ConfigSpec` is the program's to read.
 pub fn schema_of(
     check: &CheckOutput,
-    provider: Option<&'static dyn ply_eval::Provider>,
+    provider: Option<Arc<dyn ply_eval::Provider>>,
     name: &str,
 ) -> Result<ply_eval::Plain, Diagnostic> {
     let Some(def) = check.defs.get(&Symbol::new(name)) else {

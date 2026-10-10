@@ -170,7 +170,7 @@ fn main(root: String, front: LoadedAnalysis, unit: Bytes) -> Ended / {machine.lo
 "#;
 
 /// The program checked with the standard library it imports, and compiled.
-fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
+fn built(source: &str) -> (Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::fixture::built("m", source)
 }
 
@@ -592,8 +592,8 @@ fn a_reload_after_an_edit_enters_the_new_program() {
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
 
     let call = |entry: &str, args: Vec<Value>| {
-        let mut machine =
-            Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+        let mut machine = Machine::new(&front, Arc::clone(&unit).attach())
+            .expect("the unit was compiled from this program");
         machine.set_host_binding(Arc::clone(&binding));
         machine
             .call(entry, args, Span::DUMMY)
@@ -831,8 +831,8 @@ fn forgotten(root: String, front: LoadedAnalysis, unit: Bytes) -> Bool / {machin
     ply_machine::register(&mut registry);
     let binding = Arc::new(registry.bind(&front.check).expect("the machine ops bind"));
     let call = |entry: &str| {
-        let mut machine =
-            Machine::new(&front, unit.attach()).expect("the unit was compiled from this program");
+        let mut machine = Machine::new(&front, Arc::clone(&unit).attach())
+            .expect("the unit was compiled from this program");
         machine.set_host_binding(Arc::clone(&binding));
         machine
             .call(

@@ -66,6 +66,14 @@ fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
         std::fs::create_dir_all(store.join(sub)).expect("the store's directory");
         std::fs::write(store.join(sub).join(name), bytes).expect("written");
     }
+    let unclaimed = Pack::of_checkout(&repo())
+        .expect("the checkout packs")
+        .with_answers(&store, None);
+    assert!(
+        unclaimed.is_err(),
+        "a store no answering finished was packed"
+    );
+    std::fs::write(store.join("standing"), b"claimed").expect("written");
     let binary = runtime(dir.path());
     let checkout = Pack::of_checkout(&repo()).expect("the checkout packs");
     let pack = Pack::of_checkout(&repo())
@@ -79,6 +87,7 @@ fn a_pack_carries_what_the_shipped_modules_answer_beside_the_checkouts_files() {
     assert_eq!(read.answer("records/aa"), Some(b"a record".to_vec()));
     assert_eq!(read.answer("outputs/bb"), Some(b"an answer".to_vec()));
     assert_eq!(read.answer("outputs/cc.tmp"), None);
+    assert_eq!(read.answer("standing"), Some(b"claimed".to_vec()));
     assert!(matches!(
         ply_pack::check(&binary, &checkout).expect("the binary reads"),
         ply_pack::Checked::Same
@@ -93,6 +102,7 @@ fn a_binary_is_current_once_it_carries_the_checkout_and_its_answers() {
         std::fs::create_dir_all(store.join(sub)).expect("the store's directory");
         std::fs::write(store.join(sub).join("aa"), b"kept").expect("written");
     }
+    std::fs::write(store.join("standing"), b"claimed").expect("written");
     let binary = runtime(dir.path());
     let checkout = || Pack::of_checkout(&repo()).expect("the checkout packs");
     assert!(!ply_pack::current(&binary, &checkout()).expect("the binary reads"));
@@ -116,6 +126,7 @@ fn packing_again_takes_each_answer_the_binary_carries_as_it_carries_it() {
     }
     std::fs::write(store.join("records/aa"), b"a record").expect("written");
     std::fs::write(store.join("outputs/bb"), b"an answer").expect("written");
+    std::fs::write(store.join("standing"), b"claimed").expect("written");
     let binary = runtime(dir.path());
     let checkout = || Pack::of_checkout(&repo()).expect("the checkout packs");
     let once = checkout()

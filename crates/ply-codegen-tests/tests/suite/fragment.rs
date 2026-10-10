@@ -1,19 +1,22 @@
 use crate::fixture;
 use ply_codegen::Unit;
 use ply_eval::{Analysis, Provider, Symbol, Value};
+use std::sync::Arc;
 
 /// `source` as a module named `m`, and the unit the builder made of it, every root offered.
-pub fn unit(source: &str) -> (&'static Analysis, &'static Unit) {
+pub fn unit(source: &str) -> (&'static Analysis, &'static Arc<Unit>) {
     unit_of(&[("m", source)])
 }
 
-fn unit_of(modules: &[(&str, &str)]) -> (&'static Analysis, &'static Unit) {
+fn unit_of(modules: &[(&str, &str)]) -> (&'static Analysis, &'static Arc<Unit>) {
     unit_from(fixture::answered(modules))
 }
 
-fn unit_from(answer: ply_machine::runnable::Runnable) -> (&'static Analysis, &'static Unit) {
+fn unit_from(answer: ply_machine::runnable::Runnable) -> (&'static Analysis, &'static Arc<Unit>) {
     let front: &'static Analysis = Box::leak(Box::new(answer.front.answer));
-    let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
+    let unit: &'static Arc<Unit> = Box::leak(Box::new(
+        Unit::handed(front, answer.unit).expect("this host has a C compiler"),
+    ));
     let _ = unit.bodies();
     (front, unit)
 }
@@ -174,15 +177,18 @@ fn counted_in(a: Array<Int>) -> Int = array_len(a)
 fn arrayed_back(n: Int) -> Int = fold(array_to_list(array_of_list(range(0, n))), 0, |s: Int, x: Int| s + x)
 "#;
 
-pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
-    let backend = unit.attach();
+pub fn call(unit: &'static Arc<Unit>, name: &str, args: &[Value]) -> Option<Value> {
+    let backend = Arc::clone(unit).attach();
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
 /// What `name` raised: the backend ran it, where [`call`]'s `None` is a raise and a decline alike.
 #[track_caller]
-pub fn raised(unit: &'static Unit, name: &str, args: &[Value]) -> ply_eval::Diagnostic {
-    match unit.attach().enter_whole(&Symbol::new(name), args, 10_000) {
+pub fn raised(unit: &'static Arc<Unit>, name: &str, args: &[Value]) -> ply_eval::Diagnostic {
+    match Arc::clone(unit)
+        .attach()
+        .enter_whole(&Symbol::new(name), args, 10_000)
+    {
         ply_eval::Entered::Raised(d) => d,
         other => panic!("`{name}{args:?}` did not raise: {other:?}"),
     }
@@ -890,7 +896,7 @@ fn a_call_of_the_wrong_arity_is_declined() {
 #[test]
 fn a_recursion_past_the_budget_declines_rather_than_running_it() {
     let (_, unit) = unit(ARITHMETIC);
-    let backend = unit.attach();
+    let backend = Arc::clone(unit).attach();
     let ladder = Symbol::new("m.ladder");
     assert_eq!(
         backend.enter(&ladder, &[Value::Int(100)], 8),
@@ -922,7 +928,7 @@ fn a_backend_declines_to_describe_a_program_it_was_not_built_from() {
     let edited = ARITHMETIC.replace("x * 2", "x * 3");
     assert_ne!(edited, ARITHMETIC, "the fixture spells `double`'s body");
     let other = fixture::answered(&[("m", &edited)]).front.answer;
-    let backend = unit.attach();
+    let backend = Arc::clone(unit).attach();
     assert!(backend.describes(front.hashes_digest));
     assert!(!backend.describes(other.hashes_digest));
 }

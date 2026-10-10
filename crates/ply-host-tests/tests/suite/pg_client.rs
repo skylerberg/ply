@@ -126,7 +126,7 @@ fn first_text(answer: Answer) -> String / {abort.raise} =
   }
 "#;
 
-fn compiled(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+fn compiled(service: &str) -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::support::answered::compiled("m", service)
 }
 struct Ran {

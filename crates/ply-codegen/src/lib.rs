@@ -23,4 +23,4 @@ pub mod stored;
 
 pub use backend::{Bodies, Declines, Unit};
 pub use c::{Profile, Refused, select_profile};
-pub use source::{Source, clause_root_name, law_root_name};
+pub use source::{Source, clause_root_name};

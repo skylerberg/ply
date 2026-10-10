@@ -27,12 +27,12 @@ import surface
 import machine
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysed, Refused, View, Embedded, analyse, analyse_pulling_std_with,
-                       FiledBody, FiledDef, KeyRow, ModuleSpan, Within, view_dump, view_of,
-                       filed_bodies, interfaces_of, test_roots, viewed_text)
+                       FiledBody, FiledDef, KeyRow, ModuleSpan, Within, EmitterRoot, view_dump,
+                       view_of, filed_bodies, interfaces_of, test_root_at, viewed_text)
 import compiler.embed (EmbedWant, ItemWants, wants_by_item)
 import compiler.unit (codes, shipped)
 import compiler.hash (TheItem, Which, listing_reach, reach, reached_functions)
-import compiler.infer (DefInfo, TestInfo, cases_root)
+import compiler.infer (DefInfo, TestInfo, cases_root, test_owner)
 import compiler.resolve (Diag, Label, Source, error_with_labels, qualify)
 import compiler.types
 import compiler.types (RAny, RNamed, RSingleton, RVar)
@@ -2195,7 +2195,13 @@ fn root_of(rs: List<paths::Resolved>) -> String / {fs.kind[cwd], fs.kind[abs]} =
 fn test_at(analysis: View, i: Int) -> Option<TestInfo> = list_at(analysis.checked.tests, i)
 
 fn hash_at(analysis: View, i: Int) -> Option<String> / {abort.raise} =
-  match list_at(analysis.frame.hashes.tests, i) { Some(h) -> Some(hex_of(h)), None -> None }
+  match test_at(analysis, i) {
+    Some(t) -> match map_get(analysis.frame.hashes.tests, t.key) {
+      Some(h) -> Some(hex_of(h)),
+      None -> None,
+    },
+    None -> None,
+  }
 
 /// Something in its closure entered a `simulate` region, so it reads a seed and is searched.
 fn seeded_of(atoms: List<types::Atom>) -> Bool =
@@ -2524,10 +2530,17 @@ fn listing_hash(
       let r = analysis.frame.hashes.refs;
       blake3(
         bytes_concat_all(
-          fold(at_or(analysis.frame.hashes.test_refs, i, []), [text], |acc: List<Bytes>, v: Int| {
-            let key = bytes_concat(if at(r.decls, v) { b"decl " } else { b"fn " }, at(r.names, v));
-            push(push(acc, key), match map_get(hashed, key) { Some(h) -> h, None -> b"" })
-          }),
+          fold(
+            match map_get(analysis.frame.hashes.test_refs, t.key) { Some(xs) -> xs, None -> [] },
+            [text],
+            |acc: List<Bytes>, v: Int| {
+              let key = bytes_concat(
+                if at(r.decls, v) { b"decl " } else { b"fn " },
+                at(r.names, v),
+              );
+              push(push(acc, key), match map_get(hashed, key) { Some(h) -> h, None -> b"" })
+            },
+          ),
         ),
       )
     },
@@ -2755,9 +2768,11 @@ fn listed(
     None -> Ok(map_new()),
     Some(l) -> {
       let handed = l.front;
-      let roots = test_roots(handed.dump);
       let tables = fold(asked, map_new(), |acc: Map<Bytes, Bool>, i: Int|
-        match list_at(roots, i) { Some(r) -> map_insert(acc, cases_root(r), true), None -> acc });
+        match test_root_at(handed.dump, i) {
+          Some(r) -> map_insert(acc, cases_root(r), true),
+          None -> acc,
+        });
       match emit.unit(handed, offered_over(handed, tables, l.reach)) {
         Err(diags) -> Err(diags),
         Ok(e) -> match tester.unit[corpus](handed, Some(e.text), true) {
@@ -2827,10 +2842,9 @@ fn run_unit(
 ) -> Result<Option<Emitted>, List<Diag>> / {emit.unit, abort.raise} =
   if schema { match whole_emitted(front) { Ok(e) -> Ok(Some(e)), Err(diags) -> Err(diags) } }
   else if len(tests) == 0 { Ok(None) } else {
-    let roots = test_roots(front.dump);
     let own = fold(tests, map_new(), |acc: Map<Bytes, Bool>, k: Int|
       match list_at(over.entries, k) {
-        Some(entry) -> match list_at(roots, entry.test) {
+        Some(entry) -> match test_root_at(front.dump, entry.test) {
           Some(r) -> map_insert(map_insert(acc, r, true), cases_root(r), true),
           None -> acc,
         },
@@ -2851,7 +2865,7 @@ type Ranged = { analysis: View, judged: View, entries: List<Entry> }
 
 type Ranging = {
   tests: List<TestInfo>,
-  hashes: List<Bytes>,
+  hashes: Map<Bytes, Bytes>,
   entries: List<Entry>,
   starts: Map<Bytes, List<Int>>,
   runs: Map<Bytes, List<Int>>,
@@ -2880,13 +2894,11 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
   let plain = map(range(0, len(tests)), |i: Int|
     entry_of(i, match list_at(tests, i) { Some(t) -> string_of_bytes_lossy(t.key), None -> "" }));
   if map_len(cases) == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {
-    // Every test hashed, or none is: a hash is read by the index its test has.
-    let hashed = len(analysis.frame.hashes.tests) == len(tests);
     let walked = fold(
       range(0, len(tests)),
       {
         tests: [],
-        hashes: [],
+        hashes: map_new(),
         entries: [],
         starts: analysis.frame.hashes.refs.items,
         runs: analysis.frame.hashes.refs.items,
@@ -2894,7 +2906,7 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
       |acc: Ranging, i: Int|
         match ((list_at(tests, i), list_at(plain, i))) {
           (Some(t), Some(whole)) -> {
-            let hash = at_or(analysis.frame.hashes.tests, i, b"");
+            let hash = map_get(analysis.frame.hashes.tests, t.key);
             match map_get(cases, i) {
               Some(Ok(listing)) ->
                 fold(range(0, len(listing)), acc, |a: Ranging, k: Int|
@@ -2909,7 +2921,10 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
                           key: key,
                           index: len(a.tests),
                         }),
-                        hashes: push(a.hashes, case_hash(hash, c.identity)),
+                        hashes: match hash {
+                          Some(h) -> map_insert(a.hashes, key, case_hash(h, c.identity)),
+                          None -> a.hashes,
+                        },
                         entries: push(a.entries, {
                           ..whole,
                           case: Some({ at: k, identity: c.identity }),
@@ -2931,7 +2946,10 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
                 {
                   ..acc,
                   tests: push(acc.tests, { ..t, index: len(acc.tests) }),
-                  hashes: push(acc.hashes, hash),
+                  hashes: match hash {
+                    Some(h) -> map_insert(acc.hashes, t.key, h),
+                    None -> acc.hashes,
+                  },
                   entries: push(acc.entries, match other {
                     Some(Err(why)) -> { ..whole, unlisted: Some(why) },
                     _ -> whole,
@@ -2948,7 +2966,7 @@ fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ra
           ..analysis.frame,
           hashes: {
             ..analysis.frame.hashes,
-            tests: if hashed { walked.hashes } else { [] },
+            tests: walked.hashes,
             refs: { ..analysis.frame.hashes.refs, items: starts },
           },
         },
@@ -2966,11 +2984,12 @@ fn codes_of(
   entries: List<Entry>,
 ) -> Map<Int, String> / {abort.raise} = {
   let ran = codes(emitted.made);
-  let roots = test_roots(front.dump);
+  let code_of = |k: Int|
+    match test_root_at(front.dump, k) { Some(r) -> map_get(ran, r), None -> None };
   fold(range(0, len(entries)), map_new(), |acc: Map<Int, String>, i: Int|
     match list_at(entries, i) {
       None -> acc,
-      Some(entry) -> match map_get(ran, at_or(roots, entry.test, b"")) {
+      Some(entry) -> match code_of(entry.test) {
         None -> acc,
         Some(code) ->
           map_insert(
@@ -5372,9 +5391,13 @@ test "a case is a test of its own: its label names it, its test's hash and its i
     Some({ at: 1, identity: b"two" }),
   ]);
   let hashes = over.analysis.frame.hashes.tests;
-  assert_eq(list_at(hashes, 0), list_at(whole.frame.hashes.tests, 0));
-  assert_eq(list_at(hashes, 1), Some(case_hash(at_or(whole.frame.hashes.tests, 1, b""), b"one")));
-  assert(list_at(hashes, 1) != list_at(hashes, 2), None);
+  let of_whole = |key: Bytes| map_get(whole.frame.hashes.tests, key);
+  assert_eq(map_get(hashes, b"m.plain"), of_whole(b"m.plain"));
+  assert_eq(map_get(hashes, b"m.holds 1"), match of_whole(b"m.holds {n}") {
+    Some(h) -> Some(case_hash(h, b"one")),
+    None -> None,
+  });
+  assert(map_get(hashes, b"m.holds 1") != map_get(hashes, b"m.holds 2"), None);
   // A case reaches its table where a definition is covered, and not where a failure is suspected.
   let reached = |a: View| map_keys(reach(a.frame.hashes, [TheItem(b"m.holds 1")]).fns);
   assert(
@@ -5394,8 +5417,9 @@ test "a run enters what the tests it runs reach, and listing enters what lists t
   assert(map_contains(case.owners, b"m.held") && map_contains(case.owners, b"m.table"));
   assert_eq(map_keys(case.tests), [b"m.holds {n}"]);
   let keyed = map(view_dump(whole, Some(case)).keys, |k: KeyRow| k.root);
-  assert(contains(keyed, b"m.test#1") && contains(keyed, b"m.test#1.cases"));
-  assert(!contains(keyed, b"m.test#0"));
+  let holds = test_owner(b"m", b"holds {n}");
+  assert(contains(keyed, holds) && contains(keyed, cases_root(holds)));
+  assert(!contains(keyed, test_owner(b"m", b"plain")));
   let listing = listing_within(whole, [1]);
   assert(map_contains(listing.owners, b"m.table") && !map_contains(listing.owners, b"m.held"));
   assert_eq(map_keys(listing.tests), [b"m.holds {n}"]);
@@ -5403,7 +5427,9 @@ test "a run enters what the tests it runs reach, and listing enters what lists t
   let idle = run_within(over, []);
   assert_eq(map_len(idle.owners) + map_len(idle.tests), 0);
   assert_eq(view_dump(whole, Some(idle)).keys, []);
-  assert_eq(test_roots(view_dump(whole, Some(idle))), [b"m.test#0", b"m.test#1"])
+  let rooted = map(view_dump(whole, Some(idle)).emitter_roots, |r: EmitterRoot| r.root);
+  assert(contains(rooted, test_owner(b"m", b"plain")));
+  assert(contains(rooted, test_owner(b"m", b"holds {n}")))
 }
 
 test "a test whose cases could not be listed stays one test, and ends as the listing did" {

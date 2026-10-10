@@ -195,7 +195,7 @@ fn front_of(source: &str) -> Analysis {
 }
 
 /// The program checked with the standard library it imports, and compiled.
-fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
+fn built(source: &str) -> (Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::fixture::built("proof.obligation", source)
 }
 

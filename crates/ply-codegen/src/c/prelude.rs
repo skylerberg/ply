@@ -86,7 +86,8 @@ static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v
 
 /* An immortal object carries `rc == UINT32_MAX` and is never counted, exactly as `heap.rs` says. */
 /* A record or constructor dying at a count of one, with no children to let go of, becomes the
-   token the next record or constructor of its size takes. That is the whole of `heap::reset` for
+   token the next record or constructor of its size takes, its header as it was, so one released
+   unused goes back to its own size. That is the whole of `heap::reset` for
    the shape the kernel builds, and inlining it here is what keeps a record's death off the call
    boundary --- the profile put `heap::reset` beside `round` itself, all of it the sixteen-child
    walk a FLAT record skips. */
@@ -94,7 +95,6 @@ static inline Word ply_reset_flat(Word w) {
   if (ply_is_imm(w) || w == 0) return 0;
   PlyObj *o = ply_obj(w);
   if ((o->kind != 3 && o->kind != 4) || o->rc != 1 || !(o->flags & 1)) return 0;
-  o->len = 0;
   return w;
 }
 
