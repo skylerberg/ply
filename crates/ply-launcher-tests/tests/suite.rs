@@ -74,8 +74,14 @@ fn a_program_reads_its_environment() {
         ("value", Value::str("here")),
     ]);
     assert_eq!(vars.iter().filter(|v| **v == marked).count(), 1);
-    assert_eq!(asked("terminal", vec![Value::str("nowhere")]), Value::Bool(false));
-    assert_eq!(asked("binary_version", Vec::new()), Value::str("9.9.9-test"));
+    assert_eq!(
+        asked("terminal", vec![Value::str("nowhere")]),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        asked("binary_version", Vec::new()),
+        Value::str("9.9.9-test")
+    );
     unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
 }
 

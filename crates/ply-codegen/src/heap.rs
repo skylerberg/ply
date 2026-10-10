@@ -482,7 +482,11 @@ impl Layouts {
         for (index, name) in names.iter().enumerate() {
             indices.entry(name).or_default().push(index);
         }
-        let shapes = &self.shapes.get_mut().unwrap_or_else(|e| e.into_inner()).names;
+        let shapes = &self
+            .shapes
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .names;
         let width = names.len();
         let mut rows = vec![NO_FIELD; shapes.len() * width].into_boxed_slice();
         for (row, shape) in shapes.iter().enumerate() {

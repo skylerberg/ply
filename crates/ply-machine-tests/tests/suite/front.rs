@@ -10,9 +10,18 @@ pub const JSON: &str = "pub type Json = | Null\n";
 /// The files this binary's pack holds, by their paths in it.
 pub const SHIPPED: &[(&str, &[u8])] = &[
     ("crates/ply-std/ply/json.ply", JSON.as_bytes()),
-    ("crates/ply-std/ply/hash.ply", b"pub fn sha256(b: Bytes) -> Bytes = b\n"),
-    ("crates/ply-std/ply/hash/legacy.ply", b"pub fn sha1(b: Bytes) -> Bytes = b\n"),
-    ("crates/ply-std/ply/oid.ply", b"pub fn names() -> Bytes = embed(\"oid/names.txt\")\n"),
+    (
+        "crates/ply-std/ply/hash.ply",
+        b"pub fn sha256(b: Bytes) -> Bytes = b\n",
+    ),
+    (
+        "crates/ply-std/ply/hash/legacy.ply",
+        b"pub fn sha1(b: Bytes) -> Bytes = b\n",
+    ),
+    (
+        "crates/ply-std/ply/oid.ply",
+        b"pub fn names() -> Bytes = embed(\"oid/names.txt\")\n",
+    ),
     ("crates/ply-std/ply/oid/names.txt", b"2.5.4.3 commonName\n"),
 ];
 

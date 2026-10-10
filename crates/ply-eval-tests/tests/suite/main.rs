@@ -1,7 +1,5 @@
 //! One binary: cargo links one per `.rs` directly under `tests/`, and linking dominates the build.
 
-mod sketch;
-
 mod armed;
 mod host_boundary;
 mod host_trust_audit;

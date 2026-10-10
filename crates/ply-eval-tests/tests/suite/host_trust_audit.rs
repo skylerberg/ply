@@ -12,7 +12,10 @@ fn a_handler_may_not_choose_the_code_its_failure_is_classified_under() {
         codes::REGION_ESCAPE_AT_BOUNDARY,
         codes::HERMETIC_BOUNDARY,
     ] {
-        assert!(is_reserved_code(claimed), "`{claimed}` is the run's to raise");
+        assert!(
+            is_reserved_code(claimed),
+            "`{claimed}` is the run's to raise"
+        );
         let d = attribute(
             Diagnostic::error(claimed, "the evaluator is broken"),
             "audit::impersonates",

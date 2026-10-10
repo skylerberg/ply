@@ -12,11 +12,7 @@ use std::sync::Arc;
 fn defs() -> Vec<Def> {
     let ladder = units::symbol("m.ladder");
     vec![
-        def(
-            "m.double",
-            1,
-            "  return ply_imm(ply_imm_value(p0) * 2);",
-        ),
+        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
         def(
             "m.ladder",
             1,
@@ -30,11 +26,7 @@ fn defs() -> Vec<Def> {
                  \x20 return r;"
             ),
         ),
-        def(
-            "m.fail",
-            1,
-            "  builtin_panic_p(ctx, p0);\n  return 0;",
-        ),
+        def("m.fail", 1, "  builtin_panic_p(ctx, p0);\n  return 0;"),
         def("m.seeded", 0, "  return ply_imm(80);"),
         def(
             "m.keyed",
@@ -185,7 +177,11 @@ fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     b.reset_counts();
     let before = b.entered();
     let inside = b.while_entered(|| call(&mut machine));
-    assert_eq!(b.entered(), before, "an entry was taken while the context was held");
+    assert_eq!(
+        b.entered(),
+        before,
+        "an entry was taken while the context was held"
+    );
     assert_eq!(b.declines().reentered, 1, "{:?}", b.declines());
     let declined = inside.expect_err("a reentrant entry is declined, not served");
     assert_eq!(

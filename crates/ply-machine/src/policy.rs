@@ -106,7 +106,10 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
 /// The effects a family's operations are performed under, one of which a program must declare to
 /// be lent it: `claims` lends `prover`, so the family's name is not it.
 pub fn effects_of(family: &str) -> Option<&'static [&'static str]> {
-    FAMILIES.iter().find(|f| f.name == family).map(|f| f.effects)
+    FAMILIES
+        .iter()
+        .find(|f| f.name == family)
+        .map(|f| f.effects)
 }
 
 pub fn hermetic_of(family: &str) -> Option<&'static str> {

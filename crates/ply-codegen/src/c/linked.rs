@@ -34,7 +34,10 @@ pub unsafe fn install(rows: *const Row, count: usize) -> Result<(), String> {
         unsafe { std::slice::from_raw_parts(rows, count) }
     };
     let name = |row: &Row| unsafe { CStr::from_ptr(row.name) }.to_bytes();
-    if let Some(pair) = rows.windows(2).find(|pair| name(&pair[0]) >= name(&pair[1])) {
+    if let Some(pair) = rows
+        .windows(2)
+        .find(|pair| name(&pair[0]) >= name(&pair[1]))
+    {
         return Err(format!(
             "the linked program's symbols are out of order at `{}`",
             String::from_utf8_lossy(name(&pair[1]))

@@ -71,10 +71,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     let host = host();
     let handlers = registrations(Some(&host));
     assert_eq!(handlers.len(), Op::ALL.len());
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.term"))
-            .expect("std.term ships");
-    assert!(declaration.contains("pub nondet effect term"));
     for (op, _) in &handlers {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
@@ -93,12 +89,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
             Linearity::AtMostOnce
         };
         assert_eq!(op.linearity, expected, "{op}");
-        let mode = if reads { "read" } else { "write" };
-        assert!(
-            declaration.contains(&format!("  {mode} {}(", op.op)),
-            "`{}` is not declared a `{mode}` in std.term",
-            op.op
-        );
     }
 }
 

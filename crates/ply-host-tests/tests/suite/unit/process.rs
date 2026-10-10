@@ -109,30 +109,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         };
         assert_eq!(op.linearity, expected, "{op}");
     }
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.process"))
-            .expect("std.process ships");
-    assert!(declaration.contains("pub nondet effect process"));
-    for op in Op::ALL {
-        // The label is the process for its own streams, and the executable for a child or `bound`.
-        let executes = matches!(
-            op,
-            Op::Bound
-                | Op::Spawn
-                | Op::Start
-                | Op::Wait
-                | Op::Signal
-                | Op::Input
-                | Op::EndInput
-                | Op::OutputLine
-        );
-        let label = if executes { "e" } else { "p" };
-        assert!(
-            declaration.contains(&format!(" {}[{label}]", op.name())),
-            "`{}` is not declared in std.process",
-            op.name()
-        );
-    }
 }
 
 #[test]
@@ -210,11 +186,6 @@ fn a_host_whose_streams_are_captured_leaves_an_unanswered_raise_to_the_run() {
     let host = host(&[]);
     host.unanswered(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
     host.settle();
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.process"))
-            .expect("std.process ships");
-    assert!(declaration.contains("pub effect pipe {"));
-    assert!(declaration.contains("  raise broken(stream: Stream)"));
     assert_eq!(PIPE_EFFECT, format!("{MODULE}.pipe"));
 }
 

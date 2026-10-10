@@ -1430,7 +1430,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, Linearity,
 };
-use crate::sketch::Sketch;
+use ply_sketch::Sketch;
 use std::sync::Arc;
 
 /// Enough of a program to bind against; these tests need only that it is bound.
@@ -1440,7 +1440,7 @@ fn binding() -> HostBinding {
         .def(
             "m",
             "lookup",
-            vec![crate::sketch::atom("m.db", "users", Mode::Read)],
+            vec![ply_sketch::atom("m.db", "users", Mode::Read)],
         )
         .check();
     let mut registry = HostRegistry::new();

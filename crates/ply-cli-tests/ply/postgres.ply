@@ -1,0 +1,167 @@
+//! A postgres cluster of a test's own, for the tests that drive a real server: initialised under the
+//! working directory, served on a port nothing held, reached over TCP with its superuser's password,
+//! and stopped when the test is done. The run binds `initdb`, `postgres` and `psql` with `--exec`;
+//! a run that binds none skips these tests, except under CI, which promises a postgres.
+
+import harness (Here, Wire, environment, reserve, working)
+import std.config (config)
+import std.fs (fs)
+import std.list (concat)
+import std.process (process, Finished, Var, exit_code, Discard, Interrupt)
+import std.time (time)
+
+pub effect set Postgres = {process.read[initdb], process.write[initdb], process.read[postgres], process.write[postgres], process.read[psql], process.write[psql], config.get[env], time.read, time.write}
+
+/// A running cluster: its directory below the working directory, its port, and the server's child.
+pub type Cluster = { dir: String, port: Int, server: Int, password: String }
+
+/// Whether this run can start a cluster. CI promises one, so there a run without one fails rather
+/// than skips.
+pub fn available() -> Bool / {Postgres, abort.raise} = {
+  let found = process.bound[initdb]() && process.bound[postgres]() && process.bound[psql]();
+  if !found && config.get[env]("CI") != None {
+    panic("CI runs the postgres-backed tests, and this run bound no initdb, postgres and psql")
+  };
+  found
+}
+
+/// TCP connections prove `password` by SCRAM.
+pub fn scram(name: String, password: String) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
+  launched(name, "scram-sha-256", password, None)
+
+/// TCP connections send `password` in the clear, which `password` authentication asks for.
+pub fn clear_text(name: String, password: String) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
+  launched(name, "password", password, None)
+
+/// [`scram`]'s cluster, speaking TLS with `certificate` and its `key` (PEM) as well as plaintext, so
+/// a client's `sslmode` decides which.
+pub fn secured(
+  name: String,
+  password: String,
+  certificate: String,
+  key: String,
+) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} =
+  launched(name, "scram-sha-256", password, Some((certificate, key)))
+
+fn ran(f: Finished) -> String / {abort.raise} =
+  if exit_code(f) == Some(0) { string_of_bytes_lossy(f.out) } else { panic(string_of_bytes_lossy(f.err)) }
+
+fn launched(
+  name: String,
+  auth: String,
+  password: String,
+  tls: Option<(String, String)>,
+) -> Cluster / {Here, Wire, Postgres, abort.raise, diverges} = {
+  let dir = "pg-" ++ name;
+  let data = working() ++ "/" ++ dir ++ "/data";
+  let _ = fs.create_dir[cwd](dir);
+  let _ = fs.write_file[cwd](dir ++ "/password", bytes_of_string(password));
+  let _ = ran(
+    process.spawn[initdb](
+      [
+        "-D",
+        data,
+        "-U",
+        "ply",
+        "--no-sync",
+        "-E",
+        "UTF8",
+        "--locale=C",
+        "--auth-local=" ++ auth,
+        "--auth-host=" ++ auth,
+        "--pwfile=" ++ working() ++ "/" ++ dir ++ "/password",
+      ],
+      "",
+      environment([]),
+    ),
+  );
+  let secured = match tls {
+    None -> [],
+    Some((certificate, key)) -> {
+      let _ = fs.write_file[cwd](dir ++ "/data/server.crt", bytes_of_string(certificate));
+      let _ = fs.write_file[cwd](dir ++ "/data/server.key", bytes_of_string(key));
+      // Postgres refuses a key that anyone but its owner can read.
+      let none = { read: false, write: false, execute: false };
+      let _ = fs.set_mode[cwd](dir ++ "/data/server.key", { owner: { read: true, write: true, execute: false }, group: none, other: none });
+      ["-c", "ssl=on", "-c", "ssl_cert_file=server.crt", "-c", "ssl_key_file=server.key"]
+    },
+  };
+  let port = reserve();
+  let server = match process.start[postgres](
+      concat(
+        [
+          "-D",
+          data,
+          "-p",
+          int_to_string(port),
+          "-c",
+          "listen_addresses=localhost",
+          "-c",
+          "unix_socket_directories=",
+          "-c",
+          "fsync=off",
+          "-c",
+          "full_page_writes=off",
+          "-c",
+          "synchronous_commit=off",
+        ],
+        secured,
+      ),
+      "",
+      environment([]),
+      { input: false, out: Discard, err: Discard },
+    ) {
+    Ok(child) -> child,
+    Err(why) -> panic("postgres did not start: " ++ why),
+  };
+  let cluster = { dir: dir, port: port, server: server, password: password };
+  ready(cluster, 300);
+  let _ = psql(cluster, "postgres", "create database " ++ name);
+  cluster
+}
+
+/// The cluster once it answers, within `tries` tenths of a second.
+fn ready(c: Cluster, tries: Int) -> Unit / {Postgres, abort.raise, diverges} =
+  if tries <= 0 { panic("postgres did not become ready within thirty seconds") }
+  else if exit_code(asked(c, "postgres", "select 1")) == Some(0) { () }
+  else {
+    time.sleep_ms(100);
+    ready(c, tries - 1)
+  }
+
+fn asked(c: Cluster, database: String, sql: String) -> Finished / {Postgres} =
+  process.spawn[psql](
+    [
+      "-h",
+      "127.0.0.1",
+      "-p",
+      int_to_string(c.port),
+      "-U",
+      "ply",
+      "-d",
+      database,
+      "-v",
+      "ON_ERROR_STOP=1",
+      "-t",
+      "-A",
+      "-c",
+      sql,
+    ],
+    "",
+    environment([{ name: "PGPASSWORD", value: c.password }]),
+  )
+
+/// What `sql` printed in `database`, trimmed; a statement that fails fails the test.
+pub fn psql(c: Cluster, database: String, sql: String) -> String / {Postgres, abort.raise} =
+  string_trim(ran(asked(c, database, sql)))
+
+/// Stops the server the fast way, which ends its sessions and frees its shared memory.
+pub fn stop(c: Cluster) -> Unit / {Postgres} = {
+  let _ = process.signal[postgres](c.server, Interrupt);
+  let _ = process.wait[postgres](c.server, 10000);
+  ()
+}
+
+/// `postgres://ply:<password>@<host>:<port>/<database>?<query>`, the password as given.
+pub fn url(c: Cluster, host: String, database: String, query: String) -> String =
+  "postgres://ply:" ++ c.password ++ "@" ++ host ++ ":" ++ int_to_string(c.port) ++ "/" ++ database ++ "?" ++ query

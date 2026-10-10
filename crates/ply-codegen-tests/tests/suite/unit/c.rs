@@ -63,7 +63,6 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
 }
 
-
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
 #[test]
 fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
@@ -91,7 +90,9 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_n
         args: 1,
         answers: true,
     });
-    let refused = retired.bound().expect_err("a helper the runtime lacks is refused");
+    let refused = retired
+        .bound()
+        .expect_err("a helper the runtime lacks is refused");
     assert!(refused.to_string().contains("`rt_retired`"), "{refused}");
     let mut reshaped = units::exports_of(&[]);
     reshaped.helpers[0].args += 1;
@@ -112,7 +113,9 @@ fn a_unit_recording_a_helper_this_runtime_lacks_or_has_otherwise_is_refused_by_n
     }) else {
         return;
     };
-    let refused = loaded.err().expect("a unit that does not serve is not loaded");
+    let refused = loaded
+        .err()
+        .expect("a unit that does not serve is not loaded");
     assert!(refused.contains("`rt_retired`"), "{refused}");
 }
 
@@ -145,7 +148,9 @@ fn prologue(entry: &str, args: &[&str]) -> String {
         for (i, a) in args.iter().enumerate() {
             held.push_str(&format!(" ply_grown[{i}] = {a};"));
         }
-        format!("{held} return rt_grow_p(ctx, (Word)(intptr_t)&{entry}, (Word)(intptr_t)ply_grown);")
+        format!(
+            "{held} return rt_grow_p(ctx, (Word)(intptr_t)&{entry}, (Word)(intptr_t)ply_grown);"
+        )
     };
     format!(
         "  if (ctx->fuel <= 0) {{ rt_no_fuel_p(ctx); return 0; }}\n\
@@ -314,7 +319,9 @@ fn a_unit_listing_arithmetic_of_another_arity_is_refused_by_the_function_it_name
     }) else {
         return;
     };
-    let refused = loaded.err().expect("an `add` that takes one word was bound");
+    let refused = loaded
+        .err()
+        .expect("an `add` that takes one word was bound");
     assert!(refused.contains("`m.neg`"), "{refused}");
 }
 

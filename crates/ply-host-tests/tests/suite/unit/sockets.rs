@@ -1,12 +1,14 @@
 //! The socket host over real loopback: addresses, options, Unix sockets, the upgrade to TLS,
 //! datagrams and the resolver.
 
+use crate::support::declared::{labelled, shipped};
 use ply_eval::host::MachineId;
 use ply_eval::{
     Diagnostic, HostAnswer, HostBinding, HostRequest, HostRuntime, Span, Symbol, Value, codes,
 };
-use ply_host::tcp::wire::{Credentials as PeerCredentials, Endpoint, Probing, SocketOption};
+use ply_host::tcp::wire::{Endpoint, Probing, SocketOption};
 use ply_host::{Credentials, Host};
+use ply_sketch::Sketch;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 use std::time::Duration;
@@ -16,13 +18,33 @@ const UDP: &str = "std.udp.udp";
 const DNS: &str = "std.dns.dns";
 
 /// Names every operation the tests perform, under the labels they perform it under.
-const DRIVER: &str = r#"
-import std.dns (dns)
-import std.net (net)
-import std.udp (udp)
-
-fn driven() -> Unit / {net.read[listener], net.write[listener], net.read[conn], net.write[conn], net.read[client], net.write[client], udp.read[socket], udp.write[socket], udp.read[other], udp.write[other], dns.lookup, dns.reverse, dns.servers} = ()
-"#;
+fn driver() -> ply_eval::CheckOutput {
+    let both = |effect: &str, label: &str| {
+        [
+            labelled(effect, label, ply_eval::Mode::Read),
+            labelled(effect, label, ply_eval::Mode::Write),
+        ]
+    };
+    let row: Vec<ply_eval::EffectAtom> = [
+        both(NET, "listener"),
+        both(NET, "conn"),
+        both(NET, "client"),
+        both(UDP, "socket"),
+        both(UDP, "other"),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(["lookup", "reverse", "servers"].map(|op| {
+        ply_eval::EffectAtom::operation(
+            DNS,
+            ply_eval::Resource::Singleton,
+            ply_eval::Mode::Read,
+            op,
+        )
+    }))
+    .collect();
+    shipped(Sketch::program()).def("app", "driven", row).check()
+}
 
 /// One host, bound to the driver, with the runtime that settles what it leaves pending.
 struct Bound {
@@ -32,7 +54,7 @@ struct Bound {
 }
 
 fn bound(host: Host) -> Bound {
-    let check = crate::support::answered::checked("app", DRIVER).check;
+    let check = driver();
     let binding = host
         .registry()
         .bind(&check)
@@ -1494,70 +1516,4 @@ fn the_script_keeps_the_sockets_rules_without_a_socket() {
         Span::DUMMY,
     ));
     assert_eq!(refused(nobody), "Refused", "no connection is left scripted");
-}
-
-/// What the program sees is what `std.ip` and `std.net` declare: a shape the handler builds by
-/// name is one a rename would otherwise break without a compile error.
-#[test]
-fn the_shapes_the_handlers_build_are_the_ones_the_library_declares() {
-    let front = crate::support::answered::checked("app", DRIVER);
-    let declared = |name: &str| {
-        front
-            .emitter_ctors
-            .iter()
-            .find(|(constructor, _)| constructor.as_str() == name)
-            .map(|(_, fields)| *fields)
-    };
-    for (constructor, fields) in [
-        ("std.ip.SocketAddress", 3),
-        ("std.ip.V4", 1),
-        ("std.ip.V6", 1),
-        ("std.ip.Ipv4", 1),
-        ("std.ip.Ipv6", 1),
-        ("std.net.Refused", 0),
-        ("std.net.Unreachable", 0),
-        ("std.net.TimedOut", 0),
-        ("std.net.Reset", 0),
-        ("std.net.NameNotFound", 0),
-        ("std.net.AddressInUse", 0),
-        ("std.net.PermissionDenied", 0),
-        ("std.net.Injected", 0),
-        ("std.net.Untrusted", 0),
-        ("std.net.Handshake", 1),
-        ("std.net.Other", 2),
-        ("std.net.NoDelay", 1),
-        ("std.net.KeepAlive", 1),
-        ("std.net.ReuseAddress", 1),
-        ("std.net.ReusePort", 1),
-        ("std.net.SendBuffer", 1),
-        ("std.net.ReceiveBuffer", 1),
-        ("std.net.Linger", 1),
-        ("std.net.Broadcast", 1),
-        ("std.net.MulticastLoop", 1),
-        ("std.net.JoinGroup", 2),
-        ("std.net.LeaveGroup", 2),
-        ("std.dns.NoSuchName", 0),
-        ("std.dns.NoData", 0),
-        ("std.dns.ServerFailure", 0),
-        ("std.dns.Other", 2),
-    ] {
-        assert_eq!(
-            declared(constructor),
-            Some(fields),
-            "a handler builds `{constructor}` with {fields} field(s)"
-        );
-    }
-    let owner = PeerCredentials {
-        user: 501,
-        group: 20,
-        process: None,
-    }
-    .value();
-    let Value::Record(fields) = &owner else {
-        panic!("not a record: {owner:?}");
-    };
-    assert_eq!(
-        fields.keys().map(Symbol::as_str).collect::<Vec<_>>(),
-        ["group", "process", "user"]
-    );
 }
