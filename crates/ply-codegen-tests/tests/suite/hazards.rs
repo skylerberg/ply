@@ -49,14 +49,15 @@ fn hazards() -> &'static Loaded {
 }
 
 struct Harness {
-    unit: &'static Unit,
+    unit: &'static std::sync::Arc<Unit>,
     bodies: Rc<ply_codegen::Bodies>,
     machine: Machine<'static>,
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit =
-        Unit::handed(&loaded.front, loaded.unit.clone()).expect("this host has a C compiler");
+    let unit: &'static std::sync::Arc<Unit> = Box::leak(Box::new(
+        Unit::handed(&loaded.front, loaded.unit.clone()).expect("this host has a C compiler"),
+    ));
     let bodies = unit.bodies().expect("the unit builds");
     let machine = Machine::new(&loaded.front, bodies.clone())
         .expect("the unit was compiled from this program");

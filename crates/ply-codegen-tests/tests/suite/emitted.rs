@@ -1040,9 +1040,11 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
         .iter()
         .map(|r| r.root.as_str())
         .collect();
+    let law = &source.front.check.laws[0];
+    let (guard, body) = (law.root("guard"), law.root("body"));
     for root in [
-        "m.law#0.guard",
-        "m.law#0.body",
+        guard.as_str(),
+        body.as_str(),
         "m.adjusted#requires#0",
         "m.adjusted#ensures#0",
     ] {
@@ -1075,9 +1077,9 @@ fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
             vec![account(1), Value::Int(5), account(7)],
             false,
         ),
-        ("m.law#0.guard", vec![account(1)], true),
-        ("m.law#0.guard", vec![account(0)], false),
-        ("m.law#0.body", vec![account(3)], true),
+        (guard.as_str(), vec![account(1)], true),
+        (guard.as_str(), vec![account(0)], false),
+        (body.as_str(), vec![account(3)], true),
     ];
     for (name, args, want) in cases {
         let entry = native

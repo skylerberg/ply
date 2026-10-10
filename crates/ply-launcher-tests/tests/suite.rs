@@ -49,7 +49,7 @@ fn main() -> String / {env.var[e], env.vars[e], env.terminal[e], env.binary_vers
 "#;
 
 /// The program the builder makes of `source`: its front end's answer and its unit.
-fn built(source: &str) -> (Analysis, &'static ply_codegen::Unit) {
+fn built(source: &str) -> (Analysis, std::sync::Arc<ply_codegen::Unit>) {
     let files = ply_machine::builds::module_files(&[("m", source)]);
     let program = ply_machine::builds::checked_program(&files)
         .unwrap_or_else(|d| panic!("the program checks: {d}"));

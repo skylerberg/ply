@@ -94,7 +94,7 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
 pub fn prover(
     loaded: &Loaded,
     hosting: Option<Hosting>,
-    backend: &'static dyn ply_eval::Provider,
+    backend: Arc<dyn ply_eval::Provider>,
 ) -> Prover {
     let prover = Prover::new(loaded, backend);
     match hosting {
@@ -112,21 +112,18 @@ enum Claim<'s> {
     },
     Law {
         info: &'s LawInfo,
-        /// Its place among the module's laws, which names its roots.
-        ordinal: usize,
     },
 }
 
 /// It owns what it judges, so a run can judge on whichever threads the program asks from.
 pub struct Prover {
     front: Arc<Analysis>,
-    /// Each law's place among its module's laws, which names its roots, and its place in the
-    /// program's.
-    laws: HashMap<Symbol, (usize, usize)>,
+    /// Each law's place among the program's, by its key.
+    laws: HashMap<Symbol, usize>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
-    backend: &'static dyn ply_eval::Provider,
+    backend: Arc<dyn ply_eval::Provider>,
 }
 
 /// The binding and the reactor a `law/host` runs against. The factory is owned rather than
@@ -139,14 +136,10 @@ pub struct Hosting {
 
 impl Prover {
     /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
-    pub fn new(loaded: &Loaded, backend: &'static dyn ply_eval::Provider) -> Prover {
-        let mut laws = HashMap::new();
-        let mut ordinals: HashMap<&Symbol, usize> = HashMap::new();
-        for (at, law) in loaded.front.check.laws.iter().enumerate() {
-            let ordinal = ordinals.entry(law.module.as_symbol()).or_default();
-            laws.insert(law.key.clone(), (*ordinal, at));
-            *ordinal += 1;
-        }
+    pub fn new(loaded: &Loaded, backend: Arc<dyn ply_eval::Provider>) -> Prover {
+        let laws = (loaded.front.check.laws.iter().enumerate())
+            .map(|(at, law)| (law.key.clone(), at))
+            .collect();
         Prover {
             front: Arc::clone(&loaded.front),
             laws,
@@ -158,18 +151,9 @@ impl Prover {
     /// The unit, attached once per thread: claims are judged on whichever threads the program asks from.
     fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
-            static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
-                const { RefCell::new(Vec::new()) };
+            static ATTACHED: crate::support::Attached = const { RefCell::new(Vec::new()) };
         }
-        let key = std::ptr::from_ref(self.backend).cast::<()>() as usize;
-        ATTACHED.with(|attached| {
-            if let Some((_, c)) = attached.borrow().iter().find(|(k, _)| *k == key) {
-                return Rc::clone(c);
-            }
-            let c = self.backend.attach();
-            attached.borrow_mut().push((key, Rc::clone(&c)));
-            c
-        })
+        ATTACHED.with(|attached| crate::support::attached_on(attached, &self.backend))
     }
 
     /// A proposition's body root: its program-wide name in the unit.
@@ -178,9 +162,7 @@ impl Prover {
             Claim::Ensures { owner, index, .. } => owner.module.qualify(
                 &ply_codegen::clause_root_name(&owner.simple_name, "ensures", *index),
             ),
-            Claim::Law { info, ordinal, .. } => info
-                .module
-                .qualify(&ply_codegen::law_root_name(*ordinal, "body")),
+            Claim::Law { info } => info.root("body"),
         }
     }
 
@@ -197,13 +179,10 @@ impl Prover {
                     ))
                 })
                 .collect(),
-            Claim::Law { info, ordinal } => obligation
+            Claim::Law { info } => obligation
                 .guards
                 .iter()
-                .map(|_| {
-                    info.module
-                        .qualify(&ply_codegen::law_root_name(*ordinal, "guard"))
-                })
+                .map(|_| info.root("guard"))
                 .collect(),
         }
     }
@@ -221,9 +200,12 @@ impl Prover {
                 index,
             }),
             ObligationKind::Law => {
-                let &(ordinal, at) = self.laws.get(&obligation.owner)?;
-                let info = self.front.check.laws.get(at)?;
-                Some(Claim::Law { info, ordinal })
+                let info = self
+                    .front
+                    .check
+                    .laws
+                    .get(*self.laws.get(&obligation.owner)?)?;
+                Some(Claim::Law { info })
             }
         }
     }

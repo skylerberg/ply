@@ -1,7 +1,7 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import parsing (Span, Ident, QName, is_bare, starts_upper)
+import parsing (Span, Ident, QName, is_bare, starts_upper, span_bin)
 import std.bin
 import lexer (widths, wide_decimal, utf8_of)
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
@@ -23,7 +23,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
-                label_at, dump_diags, qualify, default_binder, backticked)
+                label_at, dump_diags, qualify, default_binder, backticked, diag_bin)
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
@@ -2007,24 +2007,25 @@ pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
     }
   } else { None }
 
-/// `bodies` and `test_bodies`: each definition's and test's stored body, the bytes its hash is taken over.
+/// `bodies` and `test_bodies`: each definition's and test's stored body, the bytes its hash is taken
+/// over. What is said of each test or law is under its key.
 pub type HashOutput = {
   defs: List<{ name: Bytes, hash: Bytes }>,
   own: List<{ name: Bytes, hash: Bytes }>,
   decls: List<{ name: Bytes, hash: Bytes }>,
-  tests: List<Bytes>,
-  laws: List<Bytes>,
+  tests: Map<Bytes, Bytes>,
+  laws: Map<Bytes, Bytes>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-  law_texts: List<Bytes>,
+  law_texts: Map<Bytes, Bytes>,
   /// Every name each name or key mentions, whatever of that name does the mentioning: a superset
   /// of what any one node references, which is what a key over it may read. `refs` says which.
   deps: List<{ name: Bytes, names: List<Bytes> }>,
   refs: Refs,
   bodies: List<{ name: Bytes, body: Bytes }>,
-  test_bodies: List<Bytes>,
+  test_bodies: Map<Bytes, Bytes>,
   /// Each test's own form: its body with every reference written as the name it resolves to.
-  test_texts: List<Bytes>,
+  test_texts: Map<Bytes, Bytes>,
   /// What a definition's signature and specifications say to whoever references it.
   contracts: List<{ name: Bytes, hash: Bytes }>,
   /// What a definition's clauses are proved against: its body, with what that reaches in its own
@@ -2032,10 +2033,10 @@ pub type HashOutput = {
   checks: List<{ name: Bytes, hash: Bytes }>,
   /// What a clause's proof is filed under: its clause, over its definition's check.
   spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
-  /// By index, what each test references and runs and what each law references.
-  test_refs: List<List<Int>>,
-  test_runs: List<List<Int>>,
-  law_refs: List<List<Int>>,
+  /// What each test references and runs and what each law references.
+  test_refs: Map<Bytes, List<Int>>,
+  test_runs: Map<Bytes, List<Int>>,
+  law_refs: Map<Bytes, List<Int>>,
   /// By node, the effects its component sees, in the order that numbers them: what a reference to
   /// one of its effects is written under, from wherever it is referenced.
   enumerations: List<List<Int>>,
@@ -2068,22 +2069,22 @@ pub fn no_hashes() -> HashOutput =
     defs: [],
     own: [],
     decls: [],
-    tests: [],
-    laws: [],
+    tests: map_new(),
+    laws: map_new(),
     specs: [],
     spec_texts: [],
-    law_texts: [],
+    law_texts: map_new(),
     deps: [],
     refs: no_refs(),
     bodies: [],
-    test_bodies: [],
-    test_texts: [],
+    test_bodies: map_new(),
+    test_texts: map_new(),
     contracts: [],
     checks: [],
     spec_checks: [],
-    test_refs: [],
-    test_runs: [],
-    law_refs: [],
+    test_refs: map_new(),
+    test_runs: map_new(),
+    law_refs: map_new(),
     enumerations: [],
   }
 
@@ -2132,12 +2133,19 @@ pub fn digest(hashes: HashOutput) -> Bytes =
       bytes_concat_all(map(hashes.decls, |p: { name: Bytes, hash: Bytes }| digest_named(p))),
       u64_le(len(hashes.specs)),
       bytes_concat_all(map(hashes.specs, |s: { name: Bytes, hashes: List<Bytes> }| digest_spec(s))),
-      u64_le(len(hashes.tests)),
-      bytes_concat_all(hashes.tests),
-      u64_le(len(hashes.laws)),
-      bytes_concat_all(hashes.laws),
+      u64_le(map_len(hashes.tests)),
+      bytes_concat_all(map(map_entries(hashes.tests), digest_keyed)),
+      u64_le(map_len(hashes.laws)),
+      bytes_concat_all(map(map_entries(hashes.laws), digest_keyed)),
     ]),
   )
+
+fn digest_keyed(e: { key: Bytes, value: Bytes }) -> Bytes =
+  digest_named({ name: e.key, hash: e.value })
+
+/// What `m` says of `key`, which every table of tests or laws holds for each of them.
+pub fn of_key<a>(m: Map<Bytes, a>, key: Bytes) -> a / {abort.raise} =
+  match map_get(m, key) { Some(x) -> x, None -> panic("a key the table does not hold") }
 
 /// A kind byte, then the normalized bytes `blake3` keys the body by.
 fn solo_body(encoding: Bytes) -> Bytes = bytes_concat(b"\x00", encoding)
@@ -2746,19 +2754,38 @@ pub fn hashed_and_unused(
   index: Index,
   fixed: Fixing,
   packages: List<Int>,
-) -> { hashes: HashOutput, unused: List<Diag> } / {abort.raise} = {
+) -> { hashes: HashOutput, unused: List<Diag>, uses: List<UseNode> } / {abort.raise} = {
   let whole = hashed_whole(index, fixed, packages);
   let named = fold(fixed.nodes, map_new(), |acc: Map<Bytes, Bool>, f: Fixed|
     map_insert(acc, pin_key(f.name, f.decl), true));
   if fold(index.nodes, true, |all: Bool, node: Node|
       all && map_contains(named, pin_key(node.name, is_decl(node)))) {
-    { hashes: whole.hashes, unused: [] }
+    let tested = fold(fixed.tests, map_new(), |acc: Map<Bytes, Bool>, t: FixedTest|
+      map_insert(acc, t.key, true));
+    let lawed = fold(fixed.laws, map_new(), |acc: Map<Bytes, Bool>, l: FixedLaw|
+      map_insert(acc, l.key, true));
+    let tests = filter(index.tests, |t: TestNode| !map_contains(tested, t.key));
+    let laws = filter(index.laws, |l: LawNode| !map_contains(lawed, l.key));
+    {
+      hashes: whole.hashes,
+      unused: [],
+      uses: item_uses(
+        index,
+        tests,
+        map(tests, |t: TestNode| test_roots_of(index, t)),
+        laws,
+        map(laws, |l: LawNode| law_roots_of(index, l)),
+      ),
+    }
   } else {
-    let roots = concat(
-      map(index.tests, |t: TestNode| test_roots_of(index, t)),
-      map(index.laws, |l: LawNode| law_roots_of(index, l)),
-    );
-    { hashes: whole.hashes, unused: unused_over(index, whole.first, fixed.nodes, roots) }
+    let tests = map(index.tests, |t: TestNode| test_roots_of(index, t));
+    let laws = map(index.laws, |l: LawNode| law_roots_of(index, l));
+    let edges = node_edges_of(index, whole.first);
+    {
+      hashes: whole.hashes,
+      unused: unused_over(index, edges, fixed.nodes, concat(tests, laws)),
+      uses: use_nodes(index, edges, held_of(index, fixed.nodes), tests, laws),
+    }
   }
 }
 
@@ -3206,15 +3233,59 @@ fn renumbered(pieces: List<Piece>, ids: Map<Int, Int>) -> List<Piece> / {abort.r
 /// What hashing reads of the module at `module` of `index`, its modules in `packages`: each node
 /// of it, test and law with its forms, and each node of another module those reference, by what it
 /// is and the package it is in. Its own nodes come first, in the order the module lists them.
-pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / {abort.raise} = {
-  let own = fold(index.order, [], |acc: List<Int>, e: IndexEntry|
-    match e {
-      DefEntry(v) -> if at(index.nodes, v).module == module { push(acc, v) } else { acc },
-      _ -> acc,
-    });
+pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> Shapes / {abort.raise} =
+  kept_forms(index, packages, module, {
+    node: |_: Bytes| true,
+    test: |_: Bytes| true,
+    law: |_: Bytes| true,
+  })
+
+/// Which of a module's definitions, tests and laws a hashing of part of it keeps, each by its
+/// program-wide name: apart, since a test may be labelled as a definition is named.
+pub type Keeping = {
+  node: (Bytes) -> Bool / {abort.raise},
+  test: (Bytes) -> Bool / {abort.raise},
+  law: (Bytes) -> Bool / {abort.raise},
+}
+
+/// [`module_forms`] of what `keeps` keeps of the module, each other node it references read as
+/// another module's is.
+pub fn kept_forms(
+  index: Index,
+  packages: List<Int>,
+  module: Int,
+  keeps: Keeping,
+) -> Shapes / {abort.raise} = {
+  let c = chosen_in(index, module);
+  chosen_forms(index, packages, {
+    own: filter(c.own, |v: Int| (keeps.node)(at(index.nodes, v).name)),
+    tests: filter(c.tests, |t: TestNode| (keeps.test)(t.key)),
+    laws: filter(c.laws, |l: LawNode| (keeps.law)(l.key)),
+  })
+}
+
+/// Nodes, tests and laws of one module of an index: its nodes in the order the index lists them.
+pub type Chosen = { own: List<Int>, tests: List<TestNode>, laws: List<LawNode> }
+
+/// Every node, test and law of the module at `module` of `index`, found in one walk of it.
+pub fn chosen_in(index: Index, module: Int) -> Chosen / {abort.raise} =
+  {
+    own: fold(index.order, [], |acc: List<Int>, e: IndexEntry|
+      match e {
+        DefEntry(v) -> if at(index.nodes, v).module == module { push(acc, v) } else { acc },
+        _ -> acc,
+      }),
+    tests: filter(index.tests, |t: TestNode| t.module == module),
+    laws: filter(index.laws, |l: LawNode| l.module == module),
+  }
+
+/// The forms hashing reads of `chosen`, nodes, tests and laws of one module, numbered among
+/// themselves as `kept_forms` numbers them.
+pub fn chosen_forms(index: Index, packages: List<Int>, chosen: Chosen) -> Shapes / {abort.raise} = {
+  let own = chosen.own;
   let forms = map(own, |v: Int| node_form(index, v));
-  let tests = filter(index.tests, |t: TestNode| t.module == module);
-  let laws = filter(index.laws, |l: LawNode| l.module == module);
+  let tests = chosen.tests;
+  let laws = chosen.laws;
   let test_forms = map(tests, |t: TestNode| test_form(index, t));
   let law_forms = map(laws, |l: LawNode| law_form(index, l));
   let item_nodes = |acc: Taken, x: ItemForm|
@@ -3490,11 +3561,11 @@ pub fn fixing_of(
       if !kept(t.module) { acc } else {
         push(acc, {
           key: t.key,
-          hash: at(hashes.tests, i),
-          body: at(hashes.test_bodies, i),
-          text: at(hashes.test_texts, i),
-          refs: refs(at(hashes.test_refs, i)),
-          runs: refs(at(hashes.test_runs, i)),
+          hash: of_key(hashes.tests, t.key),
+          body: of_key(hashes.test_bodies, t.key),
+          text: of_key(hashes.test_texts, t.key),
+          refs: refs(of_key(hashes.test_refs, t.key)),
+          runs: refs(of_key(hashes.test_runs, t.key)),
           listing: refs(match map_get(hashes.refs.listings, t.key) { Some(xs) -> xs, None -> [] }),
         })
       }
@@ -3504,9 +3575,9 @@ pub fn fixing_of(
       if !kept(l.module) { acc } else {
         push(acc, {
           key: l.key,
-          hash: at(hashes.laws, i),
-          text: at(hashes.law_texts, i),
-          refs: refs(at(hashes.law_refs, i)),
+          hash: of_key(hashes.laws, l.key),
+          text: of_key(hashes.law_texts, l.key),
+          refs: refs(of_key(hashes.law_refs, l.key)),
         })
       }
     }),
@@ -3586,6 +3657,11 @@ fn skeleton_of(index: Index) -> Skeleton =
     laws: map(index.laws, |l: LawNode| l.key),
   }
 
+/// `xs`, each under the key at its place in `keys`.
+fn by_key<a>(keys: List<Bytes>, xs: List<a>) -> Map<Bytes, a> / {abort.raise} =
+  fold(range(0, len(keys)), map_new(), |acc: Map<Bytes, a>, i: Int|
+    map_insert(acc, at(keys, i), at(xs, i)))
+
 fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput / {abort.raise} = {
   let fns = fold(range(0, len(sk.nodes)), map_new(), |acc: Map<Bytes, Int>, v: Int| {
     let node = at(sk.nodes, v);
@@ -3600,15 +3676,16 @@ fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
   let items = fold(range(0, len(sk.laws)), tested, |acc: Map<Bytes, List<Int>>, i: Int|
     started(acc, at(sk.laws, i), at(h.law_refs, i)));
   let names_at = |refs: List<Int>| map(refs, |r: Int| at(sk.nodes, r).name);
+  let tests = map(sk.tests, |t: { key: Bytes, cases: Bool }| t.key);
   let empty: HashOutput = {
     defs: [],
     own: h.own,
     decls: [],
-    tests: h.tests,
-    laws: h.laws,
+    tests: by_key(tests, h.tests),
+    laws: by_key(sk.laws, h.laws),
     specs: h.specs,
     spec_texts: h.spec_texts,
-    law_texts: h.law_texts,
+    law_texts: by_key(sk.laws, h.law_texts),
     deps: [],
     refs: {
       names: map(sk.nodes, |node: NodeRef| node.name),
@@ -3628,14 +3705,14 @@ fn assemble(sk: Skeleton, edges: List<List<Int>>, h: Hashed) -> HashOutput / {ab
       }),
     },
     bodies: [],
-    test_bodies: h.test_bodies,
-    test_texts: h.test_texts,
+    test_bodies: by_key(tests, h.test_bodies),
+    test_texts: by_key(tests, h.test_texts),
     contracts: [],
     checks: [],
     spec_checks: h.spec_checks,
-    test_refs: h.test_refs,
-    test_runs: h.test_runs,
-    law_refs: h.law_refs,
+    test_refs: by_key(tests, h.test_refs),
+    test_runs: by_key(tests, h.test_runs),
+    law_refs: by_key(sk.laws, h.law_refs),
     enumerations: h.enumerations,
   };
   fold(sk.order, { out: empty, deps_at: map_new() }, |acc: Recording, e: IndexEntry|
@@ -3980,7 +4057,7 @@ pub fn walk(edges: List<List<Int>>, from: List<Int>) -> List<Int> / {abort.raise
 pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.raise} =
   unused_over(
     index,
-    first_pass(index),
+    node_edges_of(index, first_pass(index)),
     fixed,
     concat(
       map(index.tests, |t: TestNode| test_roots_of(index, t)),
@@ -3988,26 +4065,137 @@ pub fn unused(index: Index, fixed: List<Fixed> = []) -> List<Diag> / {abort.rais
     ),
   )
 
-fn unused_over(
-  index: Index,
-  first: List<Finished>,
-  fixed: List<Fixed>,
-  item_roots: List<List<Int>>,
-) -> List<Diag> / {abort.raise} = {
+/// Each node of `index` `first` normalized, by what the walk for what nothing uses leads to from it.
+fn node_edges_of(index: Index, first: List<Finished>) -> List<List<Int>> / {abort.raise} =
+  map(range(0, len(index.nodes)), |v: Int| node_edges(index, at(index.nodes, v), at(first, v).refs))
+
+/// The nodes of `index` that `fixed` holds.
+fn held_of(index: Index, fixed: List<Fixed>) -> Map<Int, Bool> / {abort.raise} = {
   let keys = node_keys(index);
-  let held = fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
+  fold(fixed, map_new(), |acc: Map<Int, Bool>, f: Fixed|
     match map_get(keys, pin_key(f.name, f.decl)) {
       Some(v) -> map_insert(acc, v, true),
       None -> acc,
-    });
+    })
+}
+
+fn unused_over(
+  index: Index,
+  edges: List<List<Int>>,
+  fixed: List<Fixed>,
+  item_roots: List<List<Int>>,
+) -> List<Diag> / {abort.raise} = {
+  let held = held_of(index, fixed);
   let n = len(index.nodes);
-  let edges = map(range(0, n), |v: Int| node_edges(index, at(index.nodes, v), at(first, v).refs));
   let own = filter(range(0, n), |v: Int| is_root(index, at(index.nodes, v)));
   let roots = fold(item_roots, own, |acc: List<Int>, rs: List<Int>| concat(acc, rs));
   let seen = walked(edges, roots).seen;
   fold(range(0, n), [], |acc: List<Diag>, v: Int|
     if at(seen, v) || map_contains(held, v) { acc }
     else { push(acc, never_used(index, at(index.nodes, v))) })
+}
+
+/// A node, a test or a law as the walk for what nothing uses meets it: where it stands, whether the
+/// walk starts at it, the nodes it leads to, each as [`pin_key`] files it, and, for a node, the
+/// warning it is given where nothing reaches it.
+pub type UseNode = {
+  key: Bytes,
+  module: Int,
+  span: Span,
+  root: Bool,
+  leads: List<Bytes>,
+  unused: Option<Diag>,
+}
+
+derive bin for UseNode
+
+fn node_span(node: Node) -> Span =
+  match node.body { NodeFn(d) -> d.span, NodeType(d) -> d.span, NodeEffect(d) -> d.span }
+
+/// Each node of `index` but those `held` holds, and each test and law, `tests` and `laws` what each
+/// test and law leads to, as the walk for what nothing uses meets them.
+fn use_nodes(
+  index: Index,
+  edges: List<List<Int>>,
+  held: Map<Int, Bool>,
+  tests: List<List<Int>>,
+  laws: List<List<Int>>,
+) -> List<UseNode> / {abort.raise} = {
+  let keys = map(index.nodes, |node: Node| pin_key(node.name, is_decl(node)));
+  concat(
+    fold(range(0, len(index.nodes)), [], |acc: List<UseNode>, v: Int|
+      if map_contains(held, v) { acc } else {
+        let node = at(index.nodes, v);
+        push(acc, {
+          key: at(keys, v),
+          module: node.module,
+          span: node_span(node),
+          root: is_root(index, node),
+          leads: map(at(edges, v), |w: Int| at(keys, w)),
+          unused: Some(never_used(index, node)),
+        })
+      }),
+    item_uses(index, index.tests, tests, index.laws, laws),
+  )
+}
+
+/// `tests` and `laws`, `test_leads` and `law_leads` what each leads to, as the walk for what nothing
+/// uses meets them: each a root.
+fn item_uses(
+  index: Index,
+  tests: List<TestNode>,
+  test_leads: List<List<Int>>,
+  laws: List<LawNode>,
+  law_leads: List<List<Int>>,
+) -> List<UseNode> / {abort.raise} = {
+  let named = |vs: List<Int>|
+    map(vs, |v: Int| {
+      let node = at(index.nodes, v);
+      pin_key(node.name, is_decl(node))
+    });
+  let item = |module: Int, span: Span, leads: List<Int>|
+    { key: b"", module: module, span: span, root: true, leads: named(leads), unused: None };
+  concat(
+    map(range(0, len(tests)), |i: Int| {
+      let t = at(tests, i);
+      item(t.module, t.def.span, at(test_leads, i))
+    }),
+    map(range(0, len(laws)), |i: Int| {
+      let l = at(laws, i);
+      item(l.module, l.def.span, at(law_leads, i))
+    }),
+  )
+}
+
+/// The warnings `uses`, the nodes, tests and laws of one module, give the nodes nothing reaches.
+pub fn unreached(uses: List<UseNode>) -> List<Diag> / {abort.raise} = {
+  let by_key = fold(uses, map_new(), |acc: Map<Bytes, UseNode>, r: UseNode|
+    if bytes_len(r.key) == 0 { acc } else { map_insert(acc, r.key, r) });
+  let seen = iterate(
+    {
+      seen: map_new(),
+      work: fold(uses, [], |acc: List<Bytes>, r: UseNode|
+        if !r.root { acc }
+        else if bytes_len(r.key) == 0 { concat(acc, r.leads) }
+        else { push(acc, r.key) }),
+    },
+    1000000000,
+    |x: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+      match x.work {
+        [] -> Stop(x.seen),
+        [k, ..rest] -> if map_contains(x.seen, k) { Continue({ ..x, work: rest }) } else {
+          Continue({
+            seen: map_insert(x.seen, k, true),
+            work: match map_get(by_key, k) { Some(r) -> concat(r.leads, rest), None -> rest },
+          })
+        },
+      },
+  );
+  fold(uses, [], |acc: List<Diag>, r: UseNode|
+    match r.unused {
+      Some(d) -> if map_contains(seen, r.key) { acc } else { push(acc, d) },
+      None -> acc,
+    })
 }
 
 /// What a test keeps from being unused: what it references, its cases' table and label among them,
@@ -4178,6 +4366,10 @@ fn names_text(ns: List<Bytes>) -> Bytes / {abort.raise} =
   fold(range(0, len(ns)), b"", |acc: Bytes, i: Int|
     if i == 0 { at(ns, i) } else { bytes_concat_all([acc, b",", at(ns, i)]) })
 
+fn dump_keyed(tag: Bytes, m: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
+  map_fold(m, b"", |acc: Bytes, key: Bytes, h: Bytes|
+    bytes_concat_all([acc, tag, b";", key, b";", hex(h), b";"]))
+
 fn dump_hashes(out: HashOutput) -> Bytes / {abort.raise} =
   bytes_concat_all([
     bytes_concat_all(
@@ -4188,9 +4380,9 @@ fn dump_hashes(out: HashOutput) -> Bytes / {abort.raise} =
       map(out.decls, |d: { name: Bytes, hash: Bytes }|
         bytes_concat_all([b"Y;", d.name, b";", hex(d.hash), b";"])),
     ),
-    bytes_concat_all(map(out.tests, |h: Bytes| bytes_concat_all([b"T;", hex(h), b";"]))),
-    bytes_concat_all(map(out.laws, |h: Bytes| bytes_concat_all([b"L;", hex(h), b";"]))),
-    bytes_concat_all(map(out.law_texts, |h: Bytes| bytes_concat_all([b"W;", hex(h), b";"]))),
+    dump_keyed(b"T", out.tests),
+    dump_keyed(b"L", out.laws),
+    dump_keyed(b"W", out.law_texts),
     bytes_concat_all(
       map(out.own, |d: { name: Bytes, hash: Bytes }|
         bytes_concat_all([b"O;", d.name, b";", hex(d.hash), b";"])),
@@ -6362,7 +6554,7 @@ test "hashing reads a fixed definition's contract and references as its run fixe
     held.unused,
     unused_over(
       index,
-      first_pass(index),
+      node_edges_of(index, first_pass(index)),
       fixed,
       concat(
         map(index.tests, |t: TestNode| test_roots_of(index, t)),
@@ -6697,7 +6889,7 @@ fn over_cases(label: Bytes, ty: Bytes, table: Bytes, body: Bytes) -> HashOutput 
 
 test "a test over cases hashes as what one case runs: its table and its label move nothing, its body and its case's type do" {
   let base = over_cases(b"n {n}", b"Int", b"few()", b"assert(held(n))");
-  let hashed = |h: HashOutput| at(h.tests, 0);
+  let hashed = |h: HashOutput| at(map_values(h.tests), 0);
   assert_eq(hashed(over_cases(b"n {n}", b"Int", b"more()", b"assert(held(n))")), hashed(base));
   assert_eq(hashed(over_cases(b"another", b"Int", b"few()", b"assert(held(n))")), hashed(base));
   assert(hashed(over_cases(b"n {n}", b"Int", b"few()", b"assert(!held(n))")) != hashed(base));
@@ -7887,16 +8079,16 @@ test "the published hashes digest to a pinned value" {
     ..no_hashes(),
     defs: [{ name: b"a", hash: h(1) }],
     decls: [{ name: b"b", hash: h(2) }],
-    tests: [h(5)],
-    laws: [h(6)],
+    tests: map_insert(map_new(), b"m.t", h(5)),
+    laws: map_insert(map_new(), b"m.l", h(6)),
     specs: [{ name: b"a", hashes: [h(3), h(4)] }],
   };
   assert_eq(
     hex(digest(sample)),
-    b"ac9e5970a91b7f3d7f83d63ec7ce2f66789c1204021e9ab1357f24a9878f07a8",
+    b"58459713bdbbf484f0cfe80dc6063329ec4260055e400360c45911707f0342ec",
   );
   // One more hash is a different digest, so a unit keyed on it is not reused.
-  let grown = { ..sample, tests: concat(sample.tests, [h(7)]) };
+  let grown = { ..sample, tests: map_insert(sample.tests, b"m.u", h(7)) };
   assert(digest(grown) != digest(sample))
 }
 

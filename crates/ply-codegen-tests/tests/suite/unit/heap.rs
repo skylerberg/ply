@@ -78,7 +78,8 @@ fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
     inc(child as Word);
     assert_eq!(reset(o as Word), o as Word);
     unsafe {
-        assert_eq!((*o).len, 0);
+        assert_eq!((*o).len, 2);
+        assert_eq!((*o).flags & FLAT, FLAT);
         assert_eq!((*o).rc, 1);
         assert_eq!((*o).kind, KIND_RECORD);
         assert_eq!((*child).rc, 1, "the field was let go once");
@@ -101,6 +102,58 @@ fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
 }
 
 #[test]
+fn a_reset_record_released_unused_goes_back_to_its_own_size() {
+    let mut h = Heap::new();
+    let child = h.alloc(KIND_RECORD, 0, 1, 0);
+    unsafe { set_word(child, 0, imm(1)) };
+    let o = h.alloc(KIND_RECORD, 0, 3, 0);
+    unsafe {
+        set_word(o, 0, child as Word);
+        set_word(o, 1, imm(2));
+        set_word(o, 2, imm(3));
+    }
+    ply_codegen::heap::enter(&mut h);
+    assert_eq!(reset(o as Word), o as Word);
+    dec(o as Word);
+    ply_codegen::heap::leave();
+    unsafe { assert_eq!((*child).kind, KIND_DEAD, "the field was let go") };
+    let one = h.alloc(KIND_RECORD, 0, 1, 0);
+    assert_ne!(one, o, "a three-word block was filed as a one-word one");
+    assert_eq!(h.alloc(KIND_RECORD, 0, 3, 0), o);
+}
+
+#[test]
+fn an_ended_entry_gives_back_the_chunks_past_what_a_heap_keeps() {
+    let mut h = Heap::new();
+    h.alloc(KIND_RECORD, 0, 1, 0);
+    h.alloc_bytes(KIND_BYTES, 200 << 20);
+    assert!(h.chunk_bytes() > 200 << 20);
+    h.end();
+    assert!(
+        h.chunk_bytes() <= 64 << 20,
+        "{} bytes kept",
+        h.chunk_bytes()
+    );
+    assert!(
+        h.chunk_bytes() > 0,
+        "the first chunk is kept for the next entry"
+    );
+    let mut big_first = Heap::new();
+    big_first.alloc_bytes(KIND_BYTES, 100 << 20);
+    big_first.end();
+    assert_eq!(
+        big_first.chunk_bytes(),
+        0,
+        "a first chunk past the bound goes back too"
+    );
+    let o = big_first.alloc(KIND_RECORD, 0, 1, 0);
+    assert!(
+        big_first.is_object(o as Word),
+        "a heap that kept nothing allocates afresh"
+    );
+}
+
+#[test]
 fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
     let mut h = Heap::new();
     let child = h.alloc(KIND_RECORD, 0, 1, 0);
@@ -110,7 +163,8 @@ fn a_reset_constructor_keeps_its_memory_and_lets_its_argument_go() {
     inc(child as Word);
     assert_eq!(reset(o as Word), o as Word);
     unsafe {
-        assert_eq!((*o).len, 0);
+        assert_eq!((*o).len, 1);
+        assert_eq!((*o).flags & FLAT, FLAT);
         assert_eq!((*o).rc, 1);
         assert_eq!((*child).rc, 1, "the argument was let go once");
     }

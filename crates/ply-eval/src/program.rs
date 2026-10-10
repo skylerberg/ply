@@ -125,6 +125,16 @@ pub struct LawInfo {
     pub span: Span,
 }
 
+impl LawInfo {
+    /// The root of the law's `part`, `guard` or `body`, as the front end's emitter names it.
+    pub fn root(&self, part: &str) -> Symbol {
+        self.module.qualify(&Symbol::new(format!(
+            "{}.{part}",
+            labelled("law", &self.name)
+        )))
+    }
+}
+
 /// Everywhere in [`CheckOutput`], `name` is the program-wide name and equals this entry's key;
 /// `simple_name` is what the source wrote.
 #[derive(Clone, Debug)]
@@ -151,6 +161,25 @@ pub struct TestInfo {
     pub nondet: bool,
     pub footprint: Footprint,
     pub span: Span,
+}
+
+impl TestInfo {
+    /// The root the test runs as, which the front end's emitter names by the test's label.
+    pub fn root(&self) -> Symbol {
+        self.module
+            .qualify(&Symbol::new(labelled("test", &self.name)))
+    }
+}
+
+/// `kind`, `#` and a digest of `label`: a test's or a law's name within its module, which only its
+/// label moves.
+fn labelled(kind: &str, label: &str) -> String {
+    let digest = blake3::hash(label.as_bytes());
+    let hex: String = digest.as_bytes()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{kind}#{hex}")
 }
 
 #[derive(Clone, Debug)]

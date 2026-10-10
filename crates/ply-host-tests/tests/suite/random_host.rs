@@ -22,7 +22,7 @@ pub fn named() -> String / {entropy.next} = nonce()
 pub fn no_range() -> Int / {entropy.below} = below(0)
 "#;
 
-fn compiled(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+fn compiled(service: &str) -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::support::answered::compiled("m", service)
 }
 fn call(entry: &str) -> Result<Value, ply_eval::Diagnostic> {

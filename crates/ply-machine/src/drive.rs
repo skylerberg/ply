@@ -249,10 +249,7 @@ impl Target {
     }
 
     /// The unit this run evaluates on, compiled from the C the target came with.
-    fn provider(
-        &self,
-        options: &RunOptions,
-    ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    fn provider(&self, options: &RunOptions) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
         // Which C compiler ran is no part of what a hermetic run answers.
         if !options.hermetic {
             select_profile(&options.profile)?;
@@ -284,7 +281,7 @@ fn unemitted(path: &std::path::Path) -> Refused {
 pub struct Bound {
     hosts: Hosts,
     declared: Option<ply_eval::Footprint>,
-    provider: &'static dyn ply_eval::Provider,
+    provider: Arc<dyn ply_eval::Provider>,
     /// The provider's backend, attached once and entered any number of times: building it per call
     /// would put the build in every measurement the call is asked for.
     compiled: RefCell<Option<std::rc::Rc<dyn ply_eval::Compiled>>>,
@@ -295,7 +292,8 @@ impl Bound {
     /// This binding's C backend, built on the first call that wants it.
     fn compiled(&self) -> std::rc::Rc<dyn ply_eval::Compiled> {
         let mut slot = self.compiled.borrow_mut();
-        slot.get_or_insert_with(|| self.provider.attach()).clone()
+        slot.get_or_insert_with(|| Arc::clone(&self.provider).attach())
+            .clone()
     }
 }
 
@@ -313,7 +311,7 @@ pub struct Drive {
     options: RunOptions,
     target: Target,
     /// The target's compiled unit, built once for the schema and the binding alike.
-    provider: Option<&'static dyn ply_eval::Provider>,
+    provider: Option<Arc<dyn ply_eval::Provider>>,
     bound: Option<(String, Bound)>,
     /// What the calls since the last `accounting` read measured, reset by that read.
     accounting: Measured,
@@ -375,12 +373,12 @@ impl Drive {
         Ok(())
     }
 
-    fn provider(&mut self) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-        if let Some(provider) = self.provider {
-            return Ok(provider);
+    fn provider(&mut self) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
+        if let Some(provider) = &self.provider {
+            return Ok(Arc::clone(provider));
         }
         let provider = self.target.provider(&self.options)?;
-        self.provider = Some(provider);
+        self.provider = Some(Arc::clone(&provider));
         Ok(provider)
     }
 

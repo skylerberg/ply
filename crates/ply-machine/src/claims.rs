@@ -522,7 +522,7 @@ fn serve(job: Job, told: &mpsc::Sender<Reply>, asked: &mpsc::Receiver<Request>) 
 
     // The unit the program handed over, and the hosts once bound: the schema and every batch a
     // discharge judges run on the same unit, and the batches over the same hosts.
-    let mut backend: Option<&'static dyn ply_eval::Provider> = None;
+    let mut backend: Option<Arc<dyn ply_eval::Provider>> = None;
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
         match asked.recv() {
@@ -533,15 +533,17 @@ fn serve(job: Job, told: &mpsc::Sender<Reply>, asked: &mpsc::Receiver<Request>) 
                 let _ = told.send(Reply::Compiled(built));
             }
             Ok(Request::Schema(name)) => {
-                let answer = match backend {
-                    Some(unit) => crate::config::schema_of(&loaded.check, Some(unit), &name),
+                let answer = match &backend {
+                    Some(unit) => {
+                        crate::config::schema_of(&loaded.check, Some(Arc::clone(unit)), &name)
+                    }
                     None => Err(uncompiled()),
                 };
                 let _ = told.send(Reply::Schema(answer));
             }
             Ok(Request::Prepare(step_budget, configuration)) => {
                 if prepared.is_none() {
-                    let built = backend.ok_or_else(uncompiled);
+                    let built = backend.clone().ok_or_else(uncompiled);
                     prepared = Some(prepare(&job, &loaded, built, step_budget, configuration));
                 }
                 let answer = match prepared.as_ref() {
@@ -680,7 +682,7 @@ impl Judging {
 fn prepare(
     job: &Job,
     loaded: &Loaded,
-    backend: Result<&'static dyn ply_eval::Provider, Diagnostic>,
+    backend: Result<Arc<dyn ply_eval::Provider>, Diagnostic>,
     step_budget: i64,
     configuration: Configuration,
 ) -> Result<Prepared, Refused> {

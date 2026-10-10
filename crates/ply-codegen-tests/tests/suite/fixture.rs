@@ -59,7 +59,9 @@ pub fn load(
     answer: ply_machine::runnable::Runnable,
 ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
     let front: &'static ply_eval::Analysis = Box::leak(Box::new(answer.front.answer));
-    let source: &'static Source = Box::leak(Box::new(Source::from_analysis(front)));
+    let source: &'static Source = Box::leak(Box::new(Source::from_analysis(std::sync::Arc::new(
+        front.clone(),
+    ))));
     match ply_codegen::c::load_unit(&answer.unit, Some(source), "unit") {
         Ok((native, refused)) => Some((source, native, refused)),
         Err(e) if e.to_string().contains("could not run") => None,

@@ -26,24 +26,25 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
-              TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity,
-              OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered, atoms_insert,
-              atoms_sorted, atoms_union, atoms_difference, resource_covers, row_empty, row_open,
-              row_closed, row_singleton, row_is_pure, row_is_pure_but_raise, without_raises,
-              run_needs, is_diverges, row_union, row_without, row_without_covered, atom_conflicts,
-              atom_covers, placed_labels, named_type, applied_type, int_type, bool_type,
-              string_type, bytes_type, float_type, decimal_type, unit_type, list_type, option_type,
-              map_type, iter_type, secret_type, fn_type, monomorphic, fields_sorted, field_get,
-              mentions_secret, ints_insert, ints_union, ints_difference, fresh_new, fresh_ty_var,
-              fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty, mark_rigid_row,
-              is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail, resolve_row, occurs_ty,
-              solve_continuation_row, free_vars, unify, unify_row, covariant_con, env_new, env_push,
-              env_pop, env_bind, env_bind_global, env_remove_global, env_lookup, env_local,
-              env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme, generalize,
-              region_prefix, region_of, label_type, label_of, resolve_atom, atom_text, atoms_text,
-              resource_text, scheme_text, type_text, row_text, Printer, printer_new, printer_naming,
-              print_ty, print_row, applied_args, at_arguments, over_arg, TyNominal, record_fields,
-              arg_label, arg_row, atom_bin, type_bin, scheme_bin)
+              canonical_beside, TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Free, UnifyError,
+              Mismatch, Arity, OccursTy, OccursRow, RowMismatch, Unified, atom_lt, atoms_covered,
+              atoms_insert, atoms_sorted, atoms_union, atoms_difference, resource_covers, row_empty,
+              row_open, row_closed, row_singleton, row_is_pure, row_is_pure_but_raise,
+              without_raises, run_needs, is_diverges, row_union, row_without, row_without_covered,
+              atom_conflicts, atom_covers, placed_labels, named_type, applied_type, int_type,
+              bool_type, string_type, bytes_type, float_type, decimal_type, unit_type, list_type,
+              option_type, map_type, iter_type, secret_type, fn_type, monomorphic, fields_sorted,
+              field_get, mentions_secret, ints_insert, ints_union, ints_difference, fresh_new,
+              fresh_ty_var, fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty,
+              mark_rigid_row, is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail,
+              resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
+              covariant_con, env_new, env_push, env_pop, env_bind, env_bind_global,
+              env_remove_global, env_lookup, env_local, env_depth_of, env_locals, instantiate_with,
+              instantiate, rename_scheme, generalize, region_prefix, region_of, label_type,
+              label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text, type_text,
+              row_text, Printer, printer_new, printer_naming, print_ty, print_row, applied_args,
+              at_arguments, over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin,
+              type_bin, scheme_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin, ending_bin)
@@ -410,6 +411,9 @@ pub type KnownDef = {
   raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
+  /// What its check gave it: a signature leaves the region of each cell it names open, which only
+  /// the body ties to another.
+  scheme: Scheme,
 }
 pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
 /// What the emitter reads of one body published from its rows: `name` is the definition, or a test
@@ -418,10 +422,33 @@ pub type KeptFacts = { name: Bytes, facts: Bytes }
 
 derive bin for KeptFacts
 
-/// The name a test's sites are filed under: its module and its place among the module's tests,
-/// since a test may share a definition's name.
-pub fn test_owner(module: Bytes, position: Int) -> Bytes =
-  bytes_concat_all([module, b".test#", ascii_of_int(position)])
+/// The name a test's roots and sites go by: its module, `test#` and a digest of its label, which
+/// the module's tests do not share (E0105) and which no definition's name can spell.
+pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  by_label(module, b"test", label)
+
+/// Whether `name` is one `test_owner` makes.
+pub fn is_test_owner(name: Bytes) -> Bool =
+  match bytes_split(name, b"#") {
+    [named, digest] ->
+      (named == b"test" || bytes_ends_with(named, b".test")) && bytes_len(digest) == 16
+        && bytes_position(digest, 0, |c: Int| bytes::hex_value(c) < 0) == None,
+    _ -> false,
+  }
+
+/// The root of `part` (`guard` or `body`) of the law labelled `label`, named as a test's is.
+pub fn law_root(module: Bytes, label: Bytes, part: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([by_label(module, b"law", label), b".", part])
+
+fn by_label(module: Bytes, kind: Bytes, label: Bytes) -> Bytes / {abort.raise} =
+  qualify(
+    module,
+    bytes_concat_all([
+      kind,
+      b"#",
+      bytes_of_string(bytes::hex_of(bytes_slice(blake3(label), 0, 8))),
+    ]),
+  )
 
 /// The root a test over cases lists its cases by, beside the root that runs one.
 pub fn cases_root(owner: Bytes) -> Bytes = bytes_concat(owner, b".cases")
@@ -437,14 +464,10 @@ pub fn listing_ty() -> Type / {abort.raise} =
       ]),
     ),
   )
-/// `tests` has one slot per `test` of each module. `root`: the modules below it are the run's own;
+/// `tests` is by test key. `root`: the modules below it are the run's own;
 /// a definition of any other is counted by what its row writes, whatever its body does, so its
 /// `bounded` promises were checked when its package was.
-pub type Known = {
-  defs: Map<Bytes, KnownDef>,
-  tests: Map<Bytes, List<Option<KnownTest>>>,
-  root: Int,
-}
+pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, KnownTest>, root: Int }
 
 pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62 }
 
@@ -8553,9 +8576,16 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
       },
   );
   let fns = map(collected.fns, |d: FnDef| carried(collected.checker, d));
-  let names = collected.names;
-  let index = fold(range(0, len(names)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
-    let n = at(names, i);
+  // Components come callees first, so a callee is solved before its callers.
+  fold(fn_components(fns), collected.checker, |c: Checker, comp: List<Int>|
+    check_component(c, parsed, fns, comp))
+}
+
+/// `fns`, a module's functions each named once, in the groups a check solves them in: each group
+/// the functions that call one another round a cycle, a group after every group it calls.
+fn fn_components(fns: List<FnDef>) -> List<List<Int>> / {abort.raise} = {
+  let index = fold(range(0, len(fns)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
+    let n = at(fns, i).name.name;
     if map_contains(acc, n) { acc } else { map_insert(acc, n, i) }
   });
   let adj = map(fns, |d: FnDef| {
@@ -8568,17 +8598,25 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
         }
       })
   });
-  // Components come callees first, so a callee is solved before its callers.
-  fold(graph::components({ out: adj }), collected.checker, |c: Checker, comp: List<Int>|
-    check_component(c, parsed, fns, comp))
+  graph::components({ out: adj })
 }
 
-/// What was handed in for a test.
-fn known_test(checker: Checker, module: Bytes, position: Int) -> Option<KnownTest> =
-  match map_get(checker.known.tests, module) {
-    None -> None,
-    Some(slots) -> match list_at(slots, position) { Some(Some(t)) -> Some(t), _ -> None },
-  }
+/// The functions of `parsed` a check walks, each by its program-wide name, in the order it walks
+/// them: a function named twice, or by a name a builtin holds, is refused rather than walked.
+pub fn walk_order(parsed: ParsedModule) -> List<Bytes> / {abort.raise} = {
+  let fns = fold(parsed.module.items, [], |acc: List<FnDef>, item: Item|
+    match item {
+      IFn(def) -> if fold(acc, false, |b: Bool, f: FnDef| b || f.name.name == def.name.name)
+          || is_cell_builtin(def.name.name)
+          || def.name.name == compare_values_name()
+          || call_operator(def.name.name) != None
+          || def.name.name == b"map_of_entries" { acc }
+      else { push(acc, def) },
+      _ -> acc,
+    });
+  fold(fn_components(fns), [], |acc: List<Bytes>, comp: List<Int>|
+    fold(comp, acc, |a: List<Bytes>, i: Int| push(a, qualify(parsed.name, at(fns, i).name.name))))
+}
 
 /// An operation atom's mode is its declaration's; a row read back from text does not carry it.
 fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
@@ -8595,6 +8633,21 @@ fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
 
 fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
   { atoms: atoms_sorted(map(atoms, |atom: Atom| settled_atom(checker, atom))), tail: None }
+
+/// `ty` with every row it holds, at any depth, empty: what its types say apart from what they do.
+fn rowless(ty: Type) -> Type =
+  match ty {
+    TyVar(_) -> ty,
+    TyCon(c) -> TyCon({ ..c, args: map(c.args, rowless) }),
+    TyFn(f) -> TyFn({ params: map(f.params, rowless), ret: rowless(f.ret), effects: row_empty() }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: rowless(f.ty) })),
+    TyNominal(n) ->
+      TyNominal({
+        ..n,
+        args: map(n.args, rowless),
+        fields: map(n.fields, |f: Field| { ..f, ty: rowless(f.ty) }),
+      }),
+  }
 
 /// The rows handed in for a definition.
 fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
@@ -8791,19 +8844,29 @@ fn check_component(
             match u.error {
               Some(_) -> None,
               None -> {
-                let c: Checker = with_unified(acc.checker, u);
-                Some({
-                  checker: c,
-                  row: settled_row(c, performed),
-                  count: {
-                    scaling: settled_row(c, scaling).atoms,
-                    sites: [],
-                    repeats: rows.repeats,
-                    tail_over: None,
-                    recursed: None,
-                    raises: rows.raises,
+                // Its check tied what its signature leaves open, the region of each cell it names:
+                // the types it gave tie them here, or the body is walked.
+                let c0: Checker = with_unified(acc.checker, u);
+                let given = instantiate(rows.scheme, c0.fresh);
+                let t = unify(c0.subst, given.fresh, rowless(sig.fn_ty), rowless(given.ty));
+                match t.error {
+                  Some(_) -> None,
+                  None -> {
+                    let c: Checker = with_unified(c0, t);
+                    Some({
+                      checker: c,
+                      row: settled_row(c, performed),
+                      count: {
+                        scaling: settled_row(c, scaling).atoms,
+                        sites: [],
+                        repeats: rows.repeats,
+                        tail_over: None,
+                        recursed: None,
+                        raises: rows.raises,
+                      },
+                    })
                   },
-                })
+                }
               },
             }
           },
@@ -10415,8 +10478,8 @@ fn labelled(labels: List<{ name: Bytes, span: Span }>, name: Bytes) -> Option<Sp
 fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let walked = fold(
     parsed.module.items,
-    { checker: checker, position: 0, labels: [] },
-    |acc: { checker: Checker, position: Int, labels: List<{ name: Bytes, span: Span }> }, item: Item|
+    { checker: checker, labels: [] },
+    |acc: { checker: Checker, labels: List<{ name: Bytes, span: Span }> }, item: Item|
       match item {
         ITest(def) -> {
           let seen: Checker = match labelled(acc.labels, def.name) {
@@ -10436,8 +10499,8 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               ),
           };
           let c: Checker = { ..seen, scope: seen.scope + 1 };
-          let owner = test_owner(parsed.name, acc.position);
-          let footprint: WithAtoms = match known_test(c, parsed.name, acc.position) {
+          let owner = test_owner(parsed.name, def.name);
+          let footprint: WithAtoms = match map_get(c.known.tests, qualify(parsed.name, def.name)) {
             Some(cached) ->
               {
                 checker: {
@@ -10505,7 +10568,6 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
               }),
               walking: b"",
             },
-            position: acc.position + 1,
             labels: push(acc.labels, { name: def.name, span: def.name_span }),
           }
         },
@@ -14373,7 +14435,7 @@ pub fn check_front_with(
   {
     ok: !failed,
     diags: if failed { dedup_diags(out.checker.diags) } else { [] },
-    defs: out.checker.defs,
+    defs: map(out.checker.defs, canonical_def),
     tests: out.checker.tests,
     laws: out.checker.laws,
     effects: out.checker.effects,
@@ -14384,6 +14446,27 @@ pub fn check_front_with(
     kept: out.checker.kept,
     instances: out.checker.instances,
     numeric_types: out.checker.numeric_types,
+  }
+}
+
+/// `d` with its variables numbered as its scheme's text names them: two checks that met them in
+/// another order answer one value.
+fn canonical_def(d: DefInfo) -> DefInfo / {abort.raise} = {
+  let c = canonical_beside(
+    d.scheme,
+    concat(
+      [d.footprint, d.performed, d.scaling, d.bounded],
+      map(d.spec, |s: SpecInfo| s.footprint),
+    ),
+  );
+  {
+    ..d,
+    scheme: c.scheme,
+    footprint: at(c.rows, 0),
+    performed: at(c.rows, 1),
+    scaling: at(c.rows, 2),
+    bounded: at(c.rows, 3),
+    spec: map(range(0, len(d.spec)), |i: Int| { ..at(d.spec, i), footprint: at(c.rows, 4 + i) }),
   }
 }
 
@@ -14947,7 +15030,7 @@ fn dump_outcome(out: Checked) -> Bytes / {abort.raise} =
   else { bytes_concat(b"X;", dump_diags(dedup_diags(out.checker.diags))) }
 
 /// What a checked program publishes, as the interfaces a second check of it would be handed.
-fn known_of(checker: Checker) -> Known / {abort.raise} = {
+fn known_of(checker: Checker) -> Known = {
   let defs = fold(checker.defs, map_new(), |acc: Map<Bytes, KnownDef>, def_info: DefInfo|
     map_insert(acc, def_info.name, {
       footprint: def_info.footprint,
@@ -14958,32 +15041,11 @@ fn known_of(checker: Checker) -> Known / {abort.raise} = {
       summary: def_info.summary,
       raises: def_info.raises,
       facts: b"",
+      scheme: def_info.scheme,
     }));
-  // Tests are in load order, then source order, so each `test` item takes the next entry.
-  let walked = fold(
-    checker.modules,
-    { next: 0, tests: map_new() },
-    |acc: { next: Int, tests: Map<Bytes, List<Option<KnownTest>>> }, parsed: ParsedModule| {
-      let slots = fold(
-        parsed.module.items,
-        { next: acc.next, slots: [] },
-        |a: { next: Int, slots: List<Option<KnownTest>> }, item: Item|
-          match item {
-            ITest(_) ->
-              {
-                next: a.next + 1,
-                slots: push(
-                  a.slots,
-                  Some({ footprint: at(checker.tests, a.next).footprint, facts: b"" }),
-                ),
-              },
-            _ -> a,
-          },
-      );
-      { next: slots.next, tests: map_insert(acc.tests, parsed.name, slots.slots) }
-    },
-  );
-  { defs: defs, tests: walked.tests, root: checker.known.root }
+  let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
+    map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));
+  { defs: defs, tests: tests, root: checker.known.root }
 }
 
 /// `check_dump`'s answer, and the program's checked a second time from the interfaces the first

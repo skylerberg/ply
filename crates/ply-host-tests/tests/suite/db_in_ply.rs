@@ -239,7 +239,7 @@ fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
   }
 "#;
 
-fn compiled(service: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+fn compiled(service: &str) -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::support::answered::compiled("m", service)
 }
 /// The entry, over the real network: the host's only part in this is the socket and the entropy.

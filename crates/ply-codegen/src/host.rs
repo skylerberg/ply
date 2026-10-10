@@ -57,7 +57,8 @@ pub(crate) fn err_continuation_resumed(
 /// The arguments `effect.op` takes, each read as the operation's declaration types it and taken
 /// as [`crate::rt::values_taken`] takes them; `None` when one does not read.
 fn arguments(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> Option<Vec<Value>> {
-    let declared = c.program.and_then(|program| {
+    let program = c.program.clone();
+    let declared = program.as_deref().and_then(|program| {
         let params = &program.check.effects.get(effect)?.ops.get(op)?.params;
         Some((params.as_slice(), &program.ctor_carries))
     });

@@ -2,7 +2,7 @@ use ply_codegen::Unit;
 use ply_eval::{Provider, Symbol, Value};
 
 /// As `ply test benches/kernel` loads it: the project's own `.ply` files, and no standard library.
-fn kernel() -> (&'static ply_eval::Analysis, &'static Unit) {
+fn kernel() -> (&'static ply_eval::Analysis, &'static std::sync::Arc<Unit>) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -30,7 +30,9 @@ fn kernel() -> (&'static ply_eval::Analysis, &'static Unit) {
         "the kernel checks: {:?}",
         front.diagnostics
     );
-    let unit = Unit::handed(front, answer.unit).expect("this host has a C compiler");
+    let unit = Box::leak(Box::new(
+        Unit::handed(front, answer.unit).expect("this host has a C compiler"),
+    ));
     (front, unit)
 }
 
@@ -55,7 +57,7 @@ fn the_whole_kernel_is_inside_the_fragment() {
 #[test]
 fn the_search_answers_through_compiled_code() {
     let (front, unit) = kernel();
-    let backend = unit.attach();
+    let backend = std::sync::Arc::clone(unit).attach();
     assert!(backend.describes(front.hashes_digest));
     let answer = backend.enter(&Symbol::new("mcts.plan_753"), &[Value::Int(200)], 10_000);
     assert!(
