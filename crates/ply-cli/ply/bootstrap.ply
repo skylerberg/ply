@@ -29,13 +29,11 @@ import std.string (replace)
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
+import std.path (below_root)
 
 /// What a bootstrap is told: the checkout, the profile it compiles under, the runtime's library and
 /// where the `ply` it builds goes.
 pub type Options = { root: String, profile: String, library: String, out: String }
-
-fn under(path: String) -> String / {abort.raise} =
-  if string_starts_with(path, "/") { string_slice(path, 1, string_len(path)) } else { path }
 
 /// `path` made absolute against the working directory `pwd`.
 fn absolute(pwd: String, path: String) -> String =
@@ -75,13 +73,13 @@ type Shipping = { name: String, path: String, bytes: Bytes }
 
 /// Every file below `dir` but those in a hidden directory, a cache, by its path below it.
 fn files_below(root: String, dir: String) -> List<{ rel: String, bytes: Bytes }> / {fs.read[abs], abort.raise} =
-  match fs.walk[abs](under(root ++ "/" ++ dir)) {
+  match fs.walk[abs](below_root(root ++ "/" ++ dir)) {
     None -> [],
     Some(entries) ->
       fold(entries, [], |acc: List<{ rel: String, bytes: Bytes }>, e: Entry|
         match e.kind {
           File -> {
-            let rel = string_slice(e.path, string_len(under(root ++ "/" ++ dir)) + 1, string_len(e.path));
+            let rel = string_slice(e.path, string_len(below_root(root ++ "/" ++ dir)) + 1, string_len(e.path));
             if string_starts_with(rel, ".") || string_contains(rel, "/.") { acc } else {
               match fs.read_file[abs](e.path) {
                 Some(bytes) -> push(acc, { rel: rel, bytes: bytes }),
@@ -113,7 +111,7 @@ fn shipping(root: String) -> List<Shipping> / {fs.read[abs], abort.raise} = {
         bytes: f.bytes,
       })
     } else { acc });
-  let prelude = match fs.read_file[abs](under(root ++ "/" ++ prelude_path())) {
+  let prelude = match fs.read_file[abs](below_root(root ++ "/" ++ prelude_path())) {
     Some(bytes) -> [{ name: "compiler.prelude.ply", path: prelude_path(), bytes: bytes }],
     None -> [],
   };
@@ -166,7 +164,7 @@ pub effect set Bootstraps = {compilers.read[cc], compilers.write[cc], toolchain.
 fn failed<a>(why: String) -> Result<a, List<Diag>> = Err([nowhere(why)])
 
 /// The toolchain native programs compile with under `profile`: `cc`, which links them too.
-fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc], abort.raise} =
+fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc]} =
   match compilers.found[cc]() {
     None -> failed("no `cc` is installed to compile C with"),
     Some(compiler) -> Ok(cc::toolchain_of(compiler, level_of(profile))),
@@ -177,7 +175,7 @@ fn described(
   t: Toolchain,
   library: String,
   work: String,
-) -> Result<Runtime, List<Diag>> / {Bootstraps, abort.raise} =
+) -> Result<Runtime, List<Diag>> / {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise} =
   match cc::executable[cc](t, native::describer_c(), [], concat([library], toolchain.libraries()), work) {
     Err(why) -> failed("the runtime's library at `" ++ library ++ "` does not link: " ++ why),
     Ok(exe) -> {
@@ -206,7 +204,7 @@ fn linked(
   objects: Result<List<String>, String>,
   library: String,
   work: String,
-) -> Result<String, List<Diag>> / {Bootstraps, abort.raise} =
+) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise} =
   match objects {
     Err(why) -> failed(why),
     Ok(objects) -> match cc::executable[cc](t, native::main_c(), objects, concat([library], toolchain.libraries()), work) {
@@ -216,7 +214,7 @@ fn linked(
   }
 
 /// The executable at `exe` with `pack` after it.
-fn packed_after(exe: String, pack: Bytes) -> Result<String, List<Diag>> / {Bootstraps, abort.raise} =
+fn packed_after(exe: String, pack: Bytes) -> Result<String, List<Diag>> / {toolchain.read, toolchain.write, abort.raise} =
   if toolchain.appended(relative(exe), pack) { Ok(exe) }
   else { failed("the pack could not be written after `" ++ exe ++ "`") }
 
@@ -237,14 +235,14 @@ fn builder_built(
   runtime: Runtime,
   files: List<Shipping>,
   work: String,
-) -> Result<String, List<Diag>> / {Bootstraps, Emits, shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
-  let t_load: Timed = over_shipping(files, || timed_load([paths::at_abs(under(options.root ++ "/" ++ compiler_dir()))], false, false));
+) -> Result<String, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+  let t_load: Timed = over_shipping(files, || timed_load([paths::at_abs(below_root(options.root ++ "/" ++ compiler_dir()))], false, false));
   match program_view(t_load.program) {
     None -> Err(t_load.program.diags),
     Some(w) -> {
       let front = front_of(t_load, w);
       let offered = every_root(front);
-      let kept = under(env.bodies[sys]());
+      let kept = below_root(env.bodies[sys]());
       let emission = emitted(
         runtime,
         front.dump,
@@ -274,7 +272,7 @@ fn ply_built(
   builder: String,
   work: String,
   phases: Bool,
-) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {Bootstraps, abort.raise} = {
+) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
   let cache = toolchain.cache();
   let front = cache ++ "/" ++ work ++ "/ply.front";
   let manifest = cache ++ "/" ++ work ++ "/ply.sources";
@@ -285,7 +283,7 @@ fn ply_built(
   );
   if ran.code != 0 { failed("the builder did not build `ply`:\n" ++ string_of_bytes_lossy(ran.err)) }
   else {
-    match ((fs.read_file[abs](under(front)), fs.read_file[abs](under(manifest)))) {
+    match ((fs.read_file[abs](below_root(front)), fs.read_file[abs](below_root(manifest)))) {
       (Some(f), Some(m)) -> match cc::manifested(m) {
         Some(sources) -> Ok({ front: f, sources: sources, said: ran.err }),
         None -> failed("the builder's manifest of `ply`'s C does not read"),
@@ -297,7 +295,7 @@ fn ply_built(
 
 /// What `ply` answers of the shipped modules, as its pack carries it: each record and output of the
 /// store its `std --answers` wrote, gzipped, and the claim that they stand.
-fn answers(ply: String, work: String) -> Result<List<Packed>, List<Diag>> / {Bootstraps, abort.raise} = {
+fn answers(ply: String, work: String) -> Result<List<Packed>, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
   // What an earlier bootstrap left there answered for another `ply`.
   toolchain.cleared("answers");
   let store = toolchain.cache() ++ "/answers";
@@ -305,18 +303,18 @@ fn answers(ply: String, work: String) -> Result<List<Packed>, List<Diag>> / {Boo
   if ran.code != 0 { failed("the new `ply` did not answer the shipped modules:\n" ++ string_of_bytes_lossy(ran.err)) }
   else {
     let gathered = fold(["records", "outputs"], [], |acc: List<Packed>, sub: String|
-      match fs.list_dir[abs](under(store ++ "/" ++ sub)) {
+      match fs.list_dir[abs](below_root(store ++ "/" ++ sub)) {
         None -> acc,
         Some(names) ->
           fold(names, acc, |a: List<Packed>, n: String|
             if string_starts_with(n, ".") || string_ends_with(n, ".tmp") { a } else {
-              match fs.read_file[abs](under(store ++ "/" ++ sub ++ "/" ++ n)) {
+              match fs.read_file[abs](below_root(store ++ "/" ++ sub ++ "/" ++ n)) {
                 Some(bytes) -> push(a, { path: "answers/" ++ sub ++ "/" ++ n, bytes: bytes_gzip(bytes) }),
                 None -> a,
               }
             }),
       });
-    match fs.read_file[abs](under(store ++ "/standing")) {
+    match fs.read_file[abs](below_root(store ++ "/standing")) {
       None -> failed("the new `ply` wrote no claim that its answers stand"),
       Some(claim) -> Ok(push(gathered, { path: "answers/standing", bytes: bytes_gzip(claim) })),
     }
@@ -360,13 +358,13 @@ fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
 
 /// The `ply` at `exe` written to `out` with its pack: by a copy beside `out` and a rename, so a
 /// process running the one there keeps its file.
-fn installed(exe: String, out: String, pack: Bytes) -> Result<Unit, List<Diag>> / {Bootstraps, entropy.next, abort.raise} = {
+fn installed(exe: String, out: String, pack: Bytes) -> Result<Unit, List<Diag>> / {fs.write[abs], entropy.next, abort.raise} = {
   let tmp = out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
-  if fs.copy[abs](under(exe), under(tmp)) && fs.append[abs](under(tmp), pack) != None
-    && fs.rename[abs](under(tmp), under(out)) {
+  if fs.copy[abs](below_root(exe), below_root(tmp)) && fs.append[abs](below_root(tmp), pack) != None
+    && fs.rename[abs](below_root(tmp), below_root(out)) {
     Ok(())
   } else {
-    let _ = fs.remove[abs](under(tmp));
+    let _ = fs.remove[abs](below_root(tmp));
     failed("the new `ply` could not be written to `" ++ out ++ "`")
   }
 }
@@ -403,7 +401,7 @@ fn bootstrapped(
                   // A copy that carries only its front end answers the shipped modules for the one
                   // that carries the answers too.
                   let answering = exe ++ "-answering";
-                  if !fs.copy[abs](under(exe), under(answering)) { failed("the new `ply` could not be copied to answer with") }
+                  if !fs.copy[abs](below_root(exe), below_root(answering)) { failed("the new `ply` could not be copied to answer with") }
                   else {
                     match packed_after(answering, packed_with(files, made.front, [])) {
                       Err(diags) -> Err(diags),

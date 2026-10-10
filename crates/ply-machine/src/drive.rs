@@ -299,6 +299,8 @@ impl Bound {
 pub struct Measured {
     pub steps: u64,
     pub micros: u64,
+    /// The most any entry since the last read held when its root returned.
+    pub held: ply_eval::Held,
     pub counters: ply_eval::rc::RcStats,
 }
 
@@ -662,6 +664,7 @@ fn note_measurement(
     hermetic: bool,
 ) {
     accounting.steps += compiled.steps();
+    accounting.held = accounting.held.most(compiled.held());
     if !hermetic {
         accounting.micros += u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     }
@@ -933,6 +936,16 @@ pub fn accounting_value(m: &Measured) -> PlyValue {
         ("steps", tally(m.steps)),
         ("micros", tally(m.micros)),
         ("counters", counters_value(&m.counters)),
+        (
+            "held",
+            record(vec![
+                ("bridges", tally(m.held.bridges)),
+                ("scheduled", tally(m.held.scheduled)),
+                ("task_stacks", tally(m.held.task_stacks)),
+                ("frame_tables", tally(m.held.frame_tables)),
+                ("cell_owners", tally(m.held.cell_owners)),
+            ]),
+        ),
     ])
 }
 
