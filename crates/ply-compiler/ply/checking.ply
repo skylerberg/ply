@@ -1071,17 +1071,33 @@ fn group_source_of(asked: GroupNamed, c: GroupCheck) -> OwnerSource / {abort.rai
 /// publish for them where `published` says: what a check that refuses follows to say why.
 fn group_check_of(asked: GroupNamed, published: Bool) -> GroupCheck / {memo.read, abort.raise} = {
   let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
-  let setting = decoded(
-    memo.ask(setting_query(), bin::encode(named, named_bin())),
-    setting_bin(),
-    "a module's setting",
-  );
   let imported = decoded(
     memo.ask(group_imports_query(), bin::encode(asked, group_named_bin())),
     bin::list_bin(imported_bin()),
     "a group's imports",
   );
-  let members = map(asked.owners, |o: Bytes| owner_facts(named, o));
+  owners_check(named, map(asked.owners, |o: Bytes| owner_facts(named, o)), imported, published)
+}
+
+/// What a check of `members`, owners of the module `named` names, together reads through the
+/// imports `imported`, as [`group_check_of`] says.
+fn owners_check(
+  named: Named,
+  members: List<OwnerFacts>,
+  imported: List<Imported>,
+  published: Bool,
+) -> GroupCheck / {memo.read, abort.raise} = {
+  let asked = {
+    module: named.module,
+    shipped: named.shipped,
+    tested: named.tested,
+    owners: map(members, |f: OwnerFacts| f.read.owner),
+  };
+  let setting = decoded(
+    memo.ask(setting_query(), bin::encode(named, named_bin())),
+    setting_bin(),
+    "a module's setting",
+  );
   let reads = map(members, |f: OwnerFacts| f.read);
   // A name a member declares is read as the group's own text writes it; any other owner declaring
   // it, by its own entry.
@@ -1341,9 +1357,10 @@ fn offered_whole(
 ) -> Offered / {memo.read, abort.raise} = {
   let missing = filter(groups, |g: GroupNamed|
     !memo.kept(group_query(), bin::encode(g, group_named_bin())));
-  // A module with any group kept is checked a group at a time: an edit costs the groups it moves.
-  if !(len(missing) > 1 && len(missing) == len(groups)) { { refused: None, answers: map_new() } }
-  else {
+  // A module with any group kept checks only the groups it lacks, those together, so an edit costs
+  // the groups it moves and reads what they share once.
+  if len(missing) <= 1 { { refused: None, answers: map_new() } }
+  else if len(missing) < len(groups) { offered_together(named, read, missing) } else {
     let facts = facts_of(read);
     let module = named.module;
     let checked = checked_whole(named, read, false);
@@ -1386,6 +1403,74 @@ fn offered_whole(
         }
       },
     }
+  }
+}
+
+/// Offers each of `missing`, groups of `read`, a module the store holds others of, what a check of
+/// them together answers of it. A check that refuses offers nothing: each group then checks alone
+/// and says why.
+fn offered_together(
+  named: Named,
+  read: OwnersAnswer,
+  missing: List<GroupNamed>,
+) -> Offered / {memo.read, abort.raise} = {
+  let members = fold(missing, [], |acc: List<OwnerFacts>, g: GroupNamed|
+    concat(acc, map(g.owners, |o: Bytes| owner_facts(named, o))));
+  let context = decoded(
+    memo.ask(context_query(), bin::encode(named, named_bin())),
+    context_bin(),
+    "a module's context",
+  );
+  let c = owners_check(
+    named,
+    members,
+    group_imports(
+      named.module,
+      map(members, |f: OwnerFacts| f.read),
+      fold(members, [], |acc: List<Mention>, f: OwnerFacts| concat(acc, f.mentions)),
+      context.imports,
+      context.targets,
+    ),
+    false,
+  );
+  let together = {
+    module: named.module,
+    shipped: named.shipped,
+    tested: named.tested,
+    owners: map(members, |f: OwnerFacts| f.read.owner),
+  };
+  let source = group_source_of(together, c);
+  let out = checked_owner(source, c.setting.placed, placing_in(c.places), reading_of(c.setting));
+  match out.pulled.out {
+    Refused(_) -> { refused: None, answers: map_new() },
+    Analysed(w) -> {
+      let laid = map(missing, |g: GroupNamed|
+        {
+          members: filter(c.reads, |r: OwnerRead| contains(g.owners, r.owner)),
+          items: filter(source.items, |x: ItemAt| contains(g.owners, x.owner)),
+        });
+      let answers = owned::said_groups(
+        owned::said_of(w, out.at, source.source.src),
+        named.module,
+        laid,
+        |x: ItemAt| source.offset + x.from,
+      );
+      {
+        refused: None,
+        answers: fold(
+          range(0, len(missing)),
+          map_new(),
+          |acc: Map<Bytes, owned::GroupAnswer>, i: Int| {
+            let g = at(missing, i);
+            let at_g = bin::encode(g, group_named_bin());
+            let answer = at(answers, i);
+            memo.offer(group_query(), at_g, bin::encode(answer, owned::group_answer_bin()));
+            offered_from(g, at(laid, i).members, answer);
+            map_insert(acc, at_g, answer)
+          },
+        ),
+      }
+    },
   }
 }
 
@@ -3835,6 +3920,33 @@ test "a signature edit checks the definitions that read it again, and no other" 
   ]);
   assert_eq(ran_of(warm.run, module_query()), 2);
   assert_eq(said(warm.outcome), said(analyse(parse_all(layered(widened)))))
+}
+
+fn spread(lib: Bytes) -> List<Source> =
+  [
+    { name: b"lib", src: lib },
+    {
+      name: b"app",
+      src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n",
+    },
+  ]
+
+test "the groups a signature edit moves in one module are checked together, and no other" {
+  let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let widened = spread(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
+  let warm = answered_over(cold.held, widened);
+  let ran = groups_ran(warm.run, group_query());
+  assert_eq(len(ran), 3);
+  assert(contains(ran, group_in(b"app", [b"go"])));
+  assert(contains(ran, group_in(b"app", [b"again"])));
+  assert_eq(said(warm.outcome), said(analyse(parse_all(widened))))
+}
+
+test "groups an edit breaks together each say why, as a fresh check says" {
+  let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let narrowed = spread(b"pub fn step(n: Int, by: Int) -> Int = n + by\n");
+  let warm = answered_over(cold.held, narrowed);
+  assert_eq(said(warm.outcome), said(analyse(parse_all(narrowed))))
 }
 
 test "a definition added is checked and hashed alone" {
