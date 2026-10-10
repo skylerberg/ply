@@ -458,7 +458,7 @@ fn a_body_left_without_returning_keeps_none_of_the_calls_it_nested() {
         .filter_map(|(name, sum)| miscounted(&native, name, sum(ROUNDS), None))
         .collect();
     // Tasks the host schedules, whose root is the entry's own stack.
-    let bound: Bound = std::sync::Arc::new(super::simulate::tasks_bound(source.front));
+    let bound: Bound = std::sync::Arc::new(super::simulate::tasks_bound(&source.front));
     wrong.extend(miscounted(
         &native,
         "m.served",

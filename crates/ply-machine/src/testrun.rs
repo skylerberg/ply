@@ -22,7 +22,7 @@ pub struct Hosting {
 pub struct Executor<'a> {
     pub front: &'a ply_eval::Analysis,
     pub hosting: Hosting,
-    pub provider: &'static dyn ply_eval::Provider,
+    pub provider: Arc<dyn ply_eval::Provider>,
 }
 
 impl<'a> Executor<'a> {
@@ -30,18 +30,9 @@ impl<'a> Executor<'a> {
     /// machine over it, never a fresh attachment.
     fn backend(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
-            static ATTACHED: std::cell::RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
-                const { std::cell::RefCell::new(Vec::new()) };
+            static ATTACHED: crate::support::Attached = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let key = std::ptr::from_ref(self.provider).cast::<()>() as usize;
-        ATTACHED.with(|attached| {
-            if let Some((_, backend)) = attached.borrow().iter().find(|(k, _)| *k == key) {
-                return Rc::clone(backend);
-            }
-            let backend = self.provider.attach();
-            attached.borrow_mut().push((key, Rc::clone(&backend)));
-            backend
-        })
+        ATTACHED.with(|attached| crate::support::attached_on(attached, &self.provider))
     }
 
     fn machine(&self, index: usize) -> Result<ply_eval::Machine<'a>, Diagnostic> {

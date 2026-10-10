@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Compiled {
     front: Analysis,
-    unit: &'static ply_codegen::Unit,
+    unit: std::sync::Arc<ply_codegen::Unit>,
 }
 
 impl Compiled {
@@ -99,7 +99,7 @@ fn run(compiled: &Compiled, index: usize, hosting: &Hosting, seeds: &Seeds) -> R
     let executor = Executor {
         front: &compiled.front,
         hosting: hosting.clone(),
-        provider: compiled.unit,
+        provider: compiled.unit.clone(),
     };
     if !compiled.seeded(index) {
         let e = testrun::executed(&executor, index, None);
@@ -981,4 +981,68 @@ fn verdicts_do_not_move_between_one_thread_and_many() {
         "the corpus is green: {one:?}"
     );
     assert_eq!(one, many, "a verdict moved between one thread and many");
+}
+
+/// A provider that compiles nothing, so a test of how backends are held needs no C compiler.
+struct Bare;
+
+struct Declining {
+    _held: Arc<Bare>,
+}
+
+impl ply_eval::Compiled for Declining {
+    fn describes(&self, _program: ply_eval::DefHash) -> bool {
+        false
+    }
+
+    fn enter(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Option<Value> {
+        None
+    }
+}
+
+impl ply_eval::Provider for Bare {
+    fn attach(self: Arc<Self>) -> Rc<dyn ply_eval::Compiled> {
+        Rc::new(Declining { _held: self })
+    }
+
+    fn name(&self) -> &'static str {
+        "bare"
+    }
+
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn offers(&self) -> ply_eval::Offers {
+        ply_eval::Offers::default()
+    }
+}
+
+#[test]
+fn a_thread_holds_the_backends_of_its_last_few_programs_and_lets_the_rest_go() {
+    let held = ply_machine::support::Attached::default();
+    let programs: Vec<Arc<dyn ply_eval::Provider>> = (0..6)
+        .map(|_| Arc::new(Bare) as Arc<dyn ply_eval::Provider>)
+        .collect();
+    let first = Arc::downgrade(&programs[0]);
+    let last = Arc::downgrade(&programs[5]);
+    for p in &programs {
+        ply_machine::support::attached_on(&held, p);
+    }
+    let latest = ply_machine::support::attached_on(&held, &programs[5]);
+    let again = ply_machine::support::attached_on(&held, &programs[5]);
+    assert!(
+        Rc::ptr_eq(&latest, &again),
+        "a held backend is attached again"
+    );
+    drop(programs);
+    assert!(
+        first.upgrade().is_none(),
+        "a thread kept a program it ran long ago"
+    );
+    assert!(
+        last.upgrade().is_some(),
+        "a thread let go of the program it ran last"
+    );
+    assert!(held.borrow().len() < 6);
 }

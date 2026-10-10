@@ -2,7 +2,45 @@
 //! materialisation, and `plural`.
 
 use ply_eval::{Diagnostic, SourceMap, Span, codes};
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
+use std::sync::Arc;
+
+/// How many programs' backends a thread keeps attached for the next ask.
+const ATTACHED_PER_THREAD: usize = 4;
+
+/// The backends a thread holds attached, the most recently asked last.
+pub type Attached = RefCell<Vec<(Arc<dyn ply_eval::Provider>, Rc<dyn ply_eval::Compiled>)>>;
+
+/// `provider` attached on this thread, through `held`, which keeps the few most recently asked: a
+/// thread that runs many programs one after another holds a handful of their units, not all.
+pub fn attached_on(
+    held: &Attached,
+    provider: &Arc<dyn ply_eval::Provider>,
+) -> Rc<dyn ply_eval::Compiled> {
+    let found = {
+        let mut held = held.borrow_mut();
+        held.iter()
+            .position(|(p, _)| Arc::ptr_eq(p, provider))
+            .map(|at| {
+                let entry = held.remove(at);
+                let c = Rc::clone(&entry.1);
+                held.push(entry);
+                c
+            })
+    };
+    if let Some(c) = found {
+        return c;
+    }
+    let c = Arc::clone(provider).attach();
+    let mut held = held.borrow_mut();
+    held.push((Arc::clone(provider), Rc::clone(&c)));
+    if held.len() > ATTACHED_PER_THREAD {
+        held.remove(0);
+    }
+    c
+}
 
 fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
     Diagnostic::error(
@@ -57,17 +95,17 @@ pub fn module_texts(
 pub fn unit_of(
     front: &ply_eval::Analysis,
     text: &[u8],
-) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
     let text =
         String::from_utf8(text.to_vec()).map_err(|_| unbuilt("the unit's C is not UTF-8"))?;
     ply_codegen::Unit::handed(front, text)
-        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map(|unit| unit as Arc<dyn ply_eval::Provider>)
         .map_err(|error| unbuilt(&error))
 }
 
 /// A pure nullary definition entered on `provider`'s unit: how a schema function is evaluated.
 pub fn enter_constant(
-    provider: Option<&'static dyn ply_eval::Provider>,
+    provider: Option<Arc<dyn ply_eval::Provider>>,
     name: &str,
 ) -> Result<ply_eval::Value, Diagnostic> {
     let name = ply_eval::Symbol::new(name);

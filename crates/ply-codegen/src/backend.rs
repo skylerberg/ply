@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// The widest arity this boundary carries without allocating an argument array.
 const MAX_ARITY: usize = 16;
@@ -22,27 +23,24 @@ struct Admitted {
     entry: Entry,
     arity: usize,
     memo: Memo,
-    params: &'static [Carry],
-    answer: &'static Carry,
-    witnesses: &'static [usize],
+    params: Vec<Carry>,
+    answer: Carry,
+    witnesses: Vec<usize>,
 }
-
-/// The carry of a root the compiler published none for.
-static UNPUBLISHED: Carry = Carry::Open;
 
 impl Admitted {
     /// How this entry's answer reads: its type, each variable bound by what the arguments show of
     /// it. What no argument shows stays open, since only a value of that type could show it, except
     /// a witnessed variable, which [`Admitted::entered_with`] passed as `Int`.
-    fn reading(&self, args: &[Value], ctors: &CtorCarries) -> Cow<'static, Carry> {
+    fn reading(&self, args: &[Value], ctors: &CtorCarries) -> Cow<'_, Carry> {
         if !self.answer.mentions_var() {
-            return Cow::Borrowed(self.answer);
+            return Cow::Borrowed(&self.answer);
         }
         let mut vars = Vec::new();
         for (param, arg) in self.written().iter().zip(args) {
             param.bind(arg, &mut vars, ctors);
         }
-        for &var in self.witnesses {
+        for &var in &self.witnesses {
             if vars.len() <= var {
                 vars.resize(var + 1, Carry::Open);
             }
@@ -54,7 +52,7 @@ impl Admitted {
     }
 
     /// The parameters a caller from outside passes: those after the witnesses.
-    fn written(&self) -> &'static [Carry] {
+    fn written(&self) -> &[Carry] {
         self.params.get(self.witnesses.len()..).unwrap_or(&[])
     }
 
@@ -124,17 +122,17 @@ impl Declines {
 }
 
 thread_local! {
-    /// The unit a pre-flight on this thread loaded, by the address of the `Unit` it is for: the
-    /// first worker on the thread takes it rather than mapping the same object a second time.
-    static PREFLIGHT: RefCell<Option<(usize, crate::c::Native)>> = const { RefCell::new(None) };
+    /// The unit a pre-flight on this thread loaded, beside the `Unit` it is for: the first worker
+    /// on the thread takes it rather than mapping the same object a second time.
+    static PREFLIGHT: RefCell<Option<(Weak<Unit>, crate::c::Native)>> = const { RefCell::new(None) };
 }
 
-/// One run's compiled unit, shared by every worker's backend.
+/// A program's compiled unit, shared by every worker's backend, and freed with the last of them.
 pub struct Unit {
     /// [`ply_eval::Analysis::hashes_digest`] of the program this was built over, for
     /// `Compiled::describes`.
     identity: DefHash,
-    source: &'static Source,
+    source: Arc<Source>,
     /// The set the emitter compiles as one unit, closed under calls.
     compiled: Vec<String>,
     /// The subset of `compiled` the machine may be offered.
@@ -151,18 +149,13 @@ pub struct Unit {
 }
 
 impl Unit {
-    fn address(&'static self) -> usize {
-        self as *const Unit as usize
-    }
-
     /// A unit produced elsewhere, its C handed over whole, loaded once: the first backend on this
     /// thread takes that load, and one that does not serve this runtime is an
     /// [`crate::c::Unserved`].
-    pub fn handed(front: &ply_eval::Analysis, text: String) -> Result<&'static Unit> {
+    pub fn handed(front: &ply_eval::Analysis, text: String) -> Result<Arc<Unit>> {
         let identity = front.hashes_digest;
-        let front: &'static ply_eval::Analysis = Box::leak(Box::new(front.clone()));
-        let source: &'static Source = Box::leak(Box::new(Source::from_analysis(front)));
-        let (native, refused) = crate::c::load_unit(&text, Some(source), "unit")?;
+        let source = Arc::new(Source::from_analysis(Arc::new(front.clone())));
+        let (native, refused) = crate::c::load_unit(&text, Some(&source), "unit")?;
         let compiled = native.names();
         let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
         let unit = Unit {
@@ -180,8 +173,8 @@ impl Unit {
             poisoned: AtomicU64::new(0),
             text,
         };
-        let unit: &'static Unit = Box::leak(Box::new(unit));
-        PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((unit.address(), native)));
+        let unit = Arc::new(unit);
+        PREFLIGHT.with(|slot| *slot.borrow_mut() = Some((Arc::downgrade(&unit), native)));
         Ok(unit)
     }
 
@@ -191,7 +184,7 @@ impl Unit {
     }
 
     /// The bodies this unit builds, as the concrete type rather than `dyn Compiled`, for tests.
-    pub fn bodies(&'static self) -> Result<Rc<Bodies>> {
+    pub fn bodies(self: &Arc<Self>) -> Result<Rc<Bodies>> {
         self.build().map(Rc::new)
     }
 
@@ -218,33 +211,35 @@ impl Unit {
         self.poisoned.load(Ordering::Relaxed)
     }
 
-    fn build(&'static self) -> Result<Bodies> {
+    fn build(self: &Arc<Self>) -> Result<Bodies> {
         let started = std::time::Instant::now();
         let preflown = PREFLIGHT.with(|slot| {
             let mut slot = slot.borrow_mut();
             match slot.take() {
-                Some((unit, native)) if unit == self.address() => Some(native),
-                other => {
-                    *slot = other;
+                Some((unit, native)) if Weak::ptr_eq(&unit, &Arc::downgrade(self)) => Some(native),
+                // A load left for a unit no one holds any more is let go.
+                Some((unit, native)) if unit.strong_count() > 0 => {
+                    *slot = Some((unit, native));
                     None
                 }
+                _ => None,
             }
         });
         let native = match preflown {
             Some(native) => native,
-            None => crate::c::load_unit(&self.text, Some(self.source), "unit")?.0,
+            None => crate::c::load_unit(&self.text, Some(&self.source), "unit")?.0,
         };
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        Bodies::new(self, native)
+        Bodies::new(Arc::clone(self), native)
     }
 }
 
 impl Provider for Unit {
-    fn attach(&'static self) -> Rc<dyn ply_eval::Compiled> {
+    fn attach(self: Arc<Self>) -> Rc<dyn ply_eval::Compiled> {
         if self.members.is_empty() {
             return Rc::new(Absent { unit: self });
         }
@@ -281,7 +276,7 @@ impl Provider for Unit {
 
 /// A worker whose compile failed: it declines everything and is counted.
 struct Absent {
-    unit: &'static Unit,
+    unit: Arc<Unit>,
 }
 
 impl ply_eval::Compiled for Absent {
@@ -305,7 +300,7 @@ struct LastEntry {
 
 /// One worker's compiled bodies, offered to a `Machine` through `ply_eval::Compiled`.
 pub struct Bodies {
-    unit: &'static Unit,
+    unit: Arc<Unit>,
     /// Kept alive because every [`Entry`] below points into its executable pages.
     _code: crate::c::Native,
     admitted: HashMap<Symbol, Admitted>,
@@ -318,7 +313,7 @@ pub struct Bodies {
 }
 
 impl Bodies {
-    fn new(unit: &'static Unit, code: crate::c::Native) -> Result<Bodies> {
+    fn new(unit: Arc<Unit>, code: crate::c::Native) -> Result<Bodies> {
         if let Some(what) = code.tables().retains_a_handle() {
             bail!(
                 "the constant pool holds {what}, which must not outlive the call that made it; \
@@ -356,14 +351,14 @@ impl Bodies {
                     entry,
                     arity,
                     memo,
-                    params: row.map_or(&[], |r| r.params.as_slice()),
-                    answer: row.map_or(&UNPUBLISHED, |r| &r.answer),
-                    witnesses: row.map_or(&[], |r| r.witnesses.as_slice()),
+                    params: row.map_or_else(Vec::new, |r| r.params.clone()),
+                    answer: row.map_or(Carry::Open, |r| r.answer.clone()),
+                    witnesses: row.map_or_else(Vec::new, |r| r.witnesses.clone()),
                 },
             );
         }
         let mut ctx = code.context();
-        ctx.program = Some(unit.source.front);
+        ctx.program = Some(Arc::clone(&unit.source.front));
         let ctx = RefCell::new(ctx);
         Ok(Bodies {
             unit,

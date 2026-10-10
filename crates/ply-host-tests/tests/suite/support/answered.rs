@@ -17,7 +17,10 @@ pub fn checked(module: &str, source: &str) -> ply_eval::Analysis {
 
 /// [`checked`], and the unit compiled from it.
 #[track_caller]
-pub fn compiled(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+pub fn compiled(
+    module: &str,
+    source: &str,
+) -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     let program = checked_program(module, source);
     let front = program.front.answer;
     let unit = ply_codegen::Unit::handed(&front, program.unit).expect("this host has a C compiler");

@@ -153,7 +153,7 @@ pub fn copies(url: String) -> Result<String, String> / {Wire, abort.raise, diver
   })
 "#;
 
-fn compiled() -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+fn compiled() -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     crate::support::answered::compiled("m", PROGRAM)
 }
 

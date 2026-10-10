@@ -19,7 +19,7 @@ impl HostHandler for Scheduled {
 fn built(text: &str) -> Option<(&'static Analysis, Native)> {
     let (source, native, refused) = crate::fixture::with_refusals(text)?;
     assert!(refused.is_empty(), "{refused:?}");
-    Some((source.front, native))
+    Some((&*source.front, native))
 }
 
 /// What `ply run --host` binds `task` to, which is what lets a `task` operation open a region.
