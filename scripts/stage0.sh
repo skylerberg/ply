@@ -12,6 +12,6 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 mkdir -p "$(dirname "$dest")"
-gh release download main --repo skylerberg/ply --pattern "$asset" --output "$dest" --clobber
+gh release download main-latest --repo skylerberg/ply --pattern "$asset" --output "$dest" --clobber
 chmod +x "$dest"
 echo "$dest"

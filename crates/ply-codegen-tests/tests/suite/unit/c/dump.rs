@@ -1,7 +1,7 @@
 use ply_codegen::c::dump;
 use ply_eval::{
-    Carry, Edit, EffectAtom, Fields, Fix, Footprint, IntTy, Mode, Ordinal, Resource, Severity,
-    SourceId, Span, Symbol, Value, Visibility, codes,
+    Carry, Edit, EffectAtom, Fields, Fix, Footprint, INT_TYPES, IntTy, Mode, Resource, Severity,
+    SourceId, Span, Symbol, Value, codes,
 };
 use std::sync::Arc;
 
@@ -45,330 +45,25 @@ fn first(list: &Value) -> Value {
     items.iter().next().expect("a first item").clone()
 }
 
-/// The front end's answer over modules that import nothing shipped, as the builder writes it.
-fn answer(modules: &[(&str, &str)]) -> Value {
-    let bytes = ply_machine::builds::answered(&ply_machine::builds::module_files(modules))
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    let answer = ply_machine::runnable::front_value(&bytes)
-        .unwrap_or_else(|why| panic!("the answer reads: {why}"));
-    field(&answer, "dump").clone()
-}
 
-const PROGRAM: &str = "pub effect log { write emit(Bytes) -> Unit }\n\
-pub type Shape = | Dot | Line(Int)\n\
-pub fn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\n\
-pub fn pick<a, b>(x: a, y: b) -> a = x\n\
-fn positive(n: Int) -> Bool = n > 0\n\
-test \"says\" { say(b\"x\") }\n\
-law \"picks the first\" forall (n: Int) where n > 2 { pick(n, true) == n }\n";
-
-#[test]
-fn a_real_answer_reads_to_the_program_it_describes() {
-    let front =
-        dump::read(&answer(&[("m", PROGRAM)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
-    let named = |name: &str| Symbol::new(name);
-
-    let say = &front.check.defs[&named("m.say")];
-    let log_write =
-        Footprint::from_atoms([EffectAtom::new("m.log", Resource::Singleton, Mode::Write)]);
-    assert_eq!(say.footprint, log_write);
-    // An operation atom takes the mode its declaration gives it.
-    assert_eq!(
-        say.performed,
-        Footprint::from_atoms([EffectAtom::operation(
-            "m.log",
-            Resource::Singleton,
-            Mode::Write,
-            "emit"
-        )])
-    );
-
-    let pick = &front.check.defs[&named("m.pick")];
-    assert!(pick.footprint.is_empty());
-
-    let test = &front.check.tests[0];
-    assert_eq!(test.key, named("m.says"));
-    assert_eq!(test.footprint, log_write);
-
-    let law = &front.check.laws[0];
-    assert_eq!(law.key, named("m.picks the first"));
-
-    let log = &front.check.effects[&named("m.log")];
-    let emit = &log.ops[&named("emit")];
-    assert_eq!(emit.mode, Mode::Write);
-    assert!(!emit.resource_param);
-
-    for ctor in [(named("m.Dot"), 0), (named("m.Line"), 1)] {
-        assert!(front.emitter_ctors.contains(&ctor), "{ctor:?}");
-    }
-    let shape = &front.types[&named("m.Shape")];
-    assert_eq!((shape.arity, shape.vis), (0, Visibility::Public));
-
-    for def in ["m.say", "m.pick", "m.positive"] {
-        assert!(front.hashes.defs.contains_key(&named(def)), "{def}");
-    }
-    assert_eq!(front.hashes.tests.len(), 1);
-    assert!(front.hashes.deps.contains_key(&named("m.picks the first")));
-
-    assert_eq!(
-        front.ordinals,
-        vec![(
-            named("m"),
-            vec![
-                Ordinal::Fn(named("m.say"), vec![]),
-                Ordinal::Fn(named("m.pick"), vec![]),
-                Ordinal::Fn(named("m.positive"), vec![]),
-                Ordinal::Test(named("m.says")),
-                Ordinal::Law(named("m.picks the first")),
-            ],
-        )]
-    );
-    assert_eq!(front.check.modules[&named("m")].source, SourceId(0));
-    let roots: Vec<&str> = front
-        .emitter_roots
-        .iter()
-        .map(|r| r.root.as_str())
-        .collect();
-    let says = front.check.tests[0].root();
-    let picks = &front.check.laws[0];
-    let (guard, body) = (picks.root("guard"), picks.root("body"));
-    assert_eq!(
-        roots,
-        [
-            "m.say",
-            "m.pick",
-            "m.positive",
-            says.as_str(),
-            guard.as_str(),
-            body.as_str()
-        ]
-    );
-
-    // A warning, placed in the module it is about.
-    assert!(!front.has_error());
-    let unused = front
-        .diagnostics
-        .iter()
-        .find(|d| d.message.contains("m.positive"))
-        .unwrap_or_else(|| panic!("no warning about `m.positive`: {:?}", front.diagnostics));
-    assert_eq!(unused.severity, Severity::Warning);
-    assert_eq!(unused.labels[0].span.source, SourceId(0));
-}
-
-const PURITY: &str = "effect log { write emit(Bytes) -> Unit }\n\
-fn origin() -> Int = 0\n\
-fn hello() -> Unit / { log.write } = log.emit(b\"hi\")\n\
-fn same<a>(x: a, y: a) -> Bool where derivable(eq, a) = x == y\n\
-fn positive(n: Int) -> Int requires n > 0 = n\n\
-test \"origin\" { assert_eq(origin(), 0) }\n\
-law \"same\" forall (n: Int) { same(n, n) }\n";
-
-/// A definition with a row or a constraint is impure, a test, a clause or a law part is never
-/// pure, and only a pure root of no arguments is a constant.
-#[test]
-fn each_root_reads_the_purity_the_compiler_published() {
-    let front =
-        dump::read(&answer(&[("m", PURITY)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
-    let read: Vec<(&str, bool)> = front
-        .emitter_roots
-        .iter()
-        .map(|r| (r.root.as_str(), r.pure))
-        .collect();
-    let origin = front.check.tests[0].root();
-    let same = front.check.laws[0].root("body");
-    assert_eq!(
-        read,
-        [
-            ("m.origin", true),
-            ("m.hello", false),
-            ("m.same", false),
-            ("m.positive", true),
-            (origin.as_str(), false),
-            ("m.positive#requires#0", false),
-            (same.as_str(), false),
-        ]
-    );
-    let constants: Vec<&str> = front
-        .emitter_roots
-        .iter()
-        .filter(|r| r.constant())
-        .map(|r| r.root.as_str())
-        .collect();
-    assert_eq!(constants, ["m.origin"]);
-}
-
-const WIDTHS: &str = "fn low_bit(b: U8) -> Int requires int_of_u8(b) < 200 ensures result < 2 = int_of_u8(b & 1u8)\n\
-fn narrow(n: Int) -> U8 / {abort.raise} requires n >= 0 ensures int_of_u8(result) == n = u8_of_int(n)\n\
-fn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\n\
-law \"low\" forall (b: U8) where int_of_u8(b) > 0 { low_bit(b) < 2 }\n\
-law \"grows\" forall (x: Int) where x > 0 { inc(x) > x }\n";
-
-/// A clause carries its owner's parameters, and `result` too for an `ensures`, and a law part its
-/// binders: each reads a width exactly where those types hold one.
-#[test]
-fn each_root_reads_the_carries_the_compiler_published() {
-    let front =
-        dump::read(&answer(&[("m", WIDTHS)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
-    let u8 = || Carry::Width(IntTy::U8);
-    let read: Vec<(&str, Vec<Carry>, Carry)> = front
-        .emitter_roots
-        .iter()
-        .map(|r| (r.root.as_str(), r.params.clone(), r.answer.clone()))
-        .collect();
-    let (low, grows) = (&front.check.laws[0], &front.check.laws[1]);
-    let parts = [
-        low.root("guard"),
-        low.root("body"),
-        grows.root("guard"),
-        grows.root("body"),
-    ];
-    assert_eq!(
-        read,
-        [
-            ("m.low_bit", vec![u8()], Carry::Plain),
-            ("m.narrow", vec![Carry::Plain], u8()),
-            ("m.inc", vec![Carry::Plain], Carry::Plain),
-            ("m.low_bit#requires#0", vec![u8()], Carry::Plain),
-            (
-                "m.low_bit#ensures#0",
-                vec![u8(), Carry::Plain],
-                Carry::Plain
-            ),
-            ("m.narrow#requires#0", vec![Carry::Plain], Carry::Plain),
-            ("m.narrow#ensures#0", vec![Carry::Plain, u8()], Carry::Plain),
-            ("m.inc#requires#0", vec![Carry::Plain], Carry::Plain),
-            (
-                "m.inc#ensures#0",
-                vec![Carry::Plain, Carry::Plain],
-                Carry::Plain
-            ),
-            (parts[0].as_str(), vec![u8()], Carry::Plain),
-            (parts[1].as_str(), vec![u8()], Carry::Plain),
-            (parts[2].as_str(), vec![Carry::Plain], Carry::Plain),
-            (parts[3].as_str(), vec![Carry::Plain], Carry::Plain),
-        ]
-    );
-}
-
-const NOMINAL: &str = "effect probe { write put(xs: List<U8>, n: Int) -> Unit }\n\
-type Byte = | Byte(U8)\n\
-type Pair<a, b> = | Pair(b, a)\n\
-fn pick<a>(xs: List<a>, r: { v: I16, n: Int }) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n\
-fn apply<a>(f: (Int) -> a, x: Int) -> a = f(x)\n\
-fn sent(xs: List<U8>) -> Unit / { probe.write } = probe.put(xs, 1)\n";
-
-/// A constructor's fields read over its type's parameters, a root's type variables by number, and
-/// an operation's arguments as its declaration types them.
-#[test]
-fn constructors_variables_and_operations_read_their_published_carries() {
-    let front =
-        dump::read(&answer(&[("m", NOMINAL)]), &[SourceId(0)]).unwrap_or_else(|e| panic!("{e}"));
-    let named = |name: &str| Symbol::new(name);
-    assert_eq!(
-        front.ctor_carries[&named("m.Byte")],
-        [Carry::Width(IntTy::U8)]
-    );
-    assert_eq!(
-        front.ctor_carries[&named("m.Pair")],
-        [Carry::Var(1), Carry::Var(0)]
-    );
-    assert_eq!(front.ctor_carries[&named("Some")], [Carry::Var(0)]);
-    let root = |name: &str| {
-        front
-            .emitter_roots
-            .iter()
-            .find(|r| r.root.as_str() == name)
-            .unwrap_or_else(|| panic!("no root `{name}`"))
-    };
-    let pick = root("m.pick");
-    assert_eq!(
-        pick.params,
-        [
-            Carry::List(Box::new(Carry::Var(0))),
-            Carry::Record(vec![
-                (named("n"), Carry::Plain),
-                (named("v"), Carry::Width(IntTy::I16)),
-            ]),
-        ]
-    );
-    assert_eq!(pick.answer, Carry::Sum(vec![Carry::Var(0)]));
-    let apply = root("m.apply");
-    assert_eq!(
-        apply.params,
-        [
-            Carry::Fn(vec![Carry::Plain], Box::new(Carry::Var(0))),
-            Carry::Plain
-        ]
-    );
-    assert_eq!(apply.answer, Carry::Var(0));
-    let put = &front.check.effects[&named("m.probe")].ops[&named("put")];
-    assert_eq!(
-        put.params,
-        [Carry::List(Box::new(Carry::Width(IntTy::U8))), Carry::Plain]
-    );
-}
-
-/// Each `.ply` file in `dir` as `(file name, text)`.
-fn ply_files(dir: &std::path::Path) -> Vec<(String, String)> {
-    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-        .map(|entry| entry.unwrap().path())
-        .filter(|p| p.extension().is_some_and(|x| x == "ply"))
-        .collect();
-    paths.sort();
-    paths
-        .into_iter()
-        .map(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            (name, std::fs::read_to_string(&p).unwrap())
-        })
-        .collect()
-}
-
-/// Every row the front end answers, over the compiler, as the committed builder carries it, and over
-/// the examples, reads, and reads to one structure however often it is read.
-#[test]
-fn an_answer_over_the_examples_and_the_compiler_reads_whole() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let examples = ply_machine::builds::answered(&ply_files(&root.join("examples")))
-        .unwrap_or_else(|d| panic!("the builder answers: {}", d.message));
-    for (what, bytes) in [
-        (
-            "the committed builder",
-            ply_pack::installed()
-                .bytes("crates/ply-compiler/bootstrap/build.run")
-                .expect("the pack carries the committed builder"),
-        ),
-        ("the examples", examples.as_slice()),
-    ] {
-        let answer = ply_machine::runnable::front_value(bytes)
-            .unwrap_or_else(|why| panic!("{what}: the answer reads: {why}"));
-        let Value::List(files) = field(&answer, "files") else {
-            panic!("{what}: the answer lists no files");
-        };
-        let ids: Vec<SourceId> = (0..files.len()).map(|i| SourceId(i as u32)).collect();
-        let dump = field(&answer, "dump");
-        let once = dump::read(dump, &ids).unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert!(
-            !once.has_error(),
-            "{what} does not check: {:?}",
-            once.diagnostics
-        );
-        assert!(!once.check.defs.is_empty() && !once.hashes.defs.is_empty());
-        assert_eq!(once.check.tests.len(), once.hashes.tests.len());
-        let again = dump::read(dump, &ids).unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert!(
-            format!("{again:?}") == format!("{once:?}"),
-            "{what}: one answer read twice reads to two structures"
-        );
-    }
+/// [`holding`] with the module that holds it, read from source 0.
+fn placed(footprint: Value) -> Value {
+    let module = record(vec![
+        ("name", Value::bytes("m")),
+        ("index", Value::Int(0)),
+        ("items", Value::list(vec![Value::bytes("m.f")])),
+        ("imports", Value::list(vec![])),
+    ]);
+    with(&holding(footprint), "modules", Value::list(vec![module]))
 }
 
 #[test]
 fn a_malformed_answer_names_the_path_to_what_is_wrong() {
-    let good = answer(&[("m", "pub fn one() -> Int = 1\n")]);
+    let good = placed(Value::list(vec![]));
     let ids = [SourceId(0)];
-    dump::read(&good, &ids).unwrap_or_else(|e| panic!("{e}"));
+    let front = dump::read(&good, &ids).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(front.check.modules[&Symbol::new("m")].source, SourceId(0));
+    assert!(front.check.defs.contains_key(&Symbol::new("m.f")));
 
     let def = with(&first(field(&good, "defs")), "footprint", Value::Int(7));
     let err = dump::read(&with(&good, "defs", Value::list(vec![def])), &ids).unwrap_err();
@@ -405,6 +100,109 @@ fn a_malformed_answer_names_the_path_to_what_is_wrong() {
     assert_eq!(
         err.path, "the front end's answer.defs[0].footprint[0].mode",
         "{err}"
+    );
+}
+
+fn width(ty: IntTy) -> Value {
+    let n = INT_TYPES
+        .iter()
+        .position(|t| *t == ty)
+        .expect("every width is numbered");
+    Value::ctor("CWidth", vec![Value::Int(n as i64)])
+}
+
+fn plain() -> Value {
+    Value::ctor("CPlain", vec![])
+}
+
+fn var(n: i64) -> Value {
+    Value::ctor("CVar", vec![Value::Int(n)])
+}
+
+/// A root's carries and a constructor's read back as the compiler published them: lists, records,
+/// sums, functions, widths and type variables by number.
+#[test]
+fn a_root_and_a_constructor_read_the_carries_published_for_them() {
+    let pick = record(vec![
+        ("root", Value::bytes("m.pick")),
+        ("arity", Value::Int(2)),
+        ("pure", Value::Bool(true)),
+        ("at", nowhere()),
+        (
+            "params",
+            Value::list(vec![
+                Value::ctor("CList", vec![var(0)]),
+                Value::ctor(
+                    "CRecord",
+                    vec![Value::list(vec![
+                        record(vec![("name", Value::bytes("n")), ("carry", plain())]),
+                        record(vec![("name", Value::bytes("v")), ("carry", width(IntTy::I16))]),
+                    ])],
+                ),
+            ]),
+        ),
+        ("answer", Value::ctor("CSum", vec![Value::list(vec![var(0)])])),
+        ("witnesses", Value::list(vec![])),
+    ]);
+    let apply = record(vec![
+        ("root", Value::bytes("m.apply")),
+        ("arity", Value::Int(2)),
+        ("pure", Value::Bool(false)),
+        ("at", nowhere()),
+        (
+            "params",
+            Value::list(vec![
+                Value::ctor("CFn", vec![Value::list(vec![plain()]), var(0)]),
+                Value::ctor("CMap", vec![width(IntTy::U8), plain()]),
+            ]),
+        ),
+        ("answer", var(0)),
+        ("witnesses", Value::list(vec![Value::Int(1)])),
+    ]);
+    let pair = record(vec![
+        ("name", Value::bytes("m.Pair")),
+        ("arity", Value::Int(2)),
+        ("fields", Value::list(vec![var(1), var(0)])),
+    ]);
+    let answer = with(
+        &with(
+            &holding(Value::list(vec![])),
+            "emitter_roots",
+            Value::list(vec![pick, apply]),
+        ),
+        "emitter_ctors",
+        Value::list(vec![pair]),
+    );
+    let front = dump::read(&answer, &[]).unwrap_or_else(|e| panic!("{e}"));
+    let [pick, apply] = &front.emitter_roots[..] else {
+        panic!("two roots: {:?}", front.emitter_roots);
+    };
+    assert_eq!((pick.root.as_str(), pick.arity, pick.pure), ("m.pick", 2, true));
+    assert!(!pick.constant());
+    assert_eq!(
+        pick.params,
+        [
+            Carry::List(Box::new(Carry::Var(0))),
+            Carry::Record(vec![
+                (Symbol::new("n"), Carry::Plain),
+                (Symbol::new("v"), Carry::Width(IntTy::I16)),
+            ]),
+        ]
+    );
+    assert_eq!(pick.answer, Carry::Sum(vec![Carry::Var(0)]));
+    assert_eq!(
+        apply.params,
+        [
+            Carry::Fn(vec![Carry::Plain], Box::new(Carry::Var(0))),
+            Carry::Map(Box::new(Carry::Width(IntTy::U8)), Box::new(Carry::Plain)),
+        ]
+    );
+    assert_eq!(apply.answer, Carry::Var(0));
+    assert_eq!(apply.witnesses, [1]);
+    assert_eq!(front.emitter_ctors, [(Symbol::new("m.Pair"), 2)]);
+    assert_eq!(
+        front.ctor_carries[&Symbol::new("m.Pair")],
+        [Carry::Var(1), Carry::Var(0)]
     );
 }
 

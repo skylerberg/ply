@@ -1,0 +1,309 @@
+effect gen {
+  write step() -> Unit
+  write give(v: Int) -> Unit
+}
+
+effect halt {
+  write stop(code: Int) -> Int
+}
+
+effect amb {
+  write flip() -> Bool
+}
+
+type Saved = Nothing | Just((Bool) -> Int)
+
+pub fn raised(n: Int) -> Int =
+  handle {
+    handle {
+      with_cell[acc](n) { c -> {
+        gen.step();
+        halt.stop(cell_get(c))
+      } }
+    } with {
+      gen.step() resume k -> {
+        k(());
+        0
+      },
+    }
+  } with {
+    halt.stop(code) resume k -> code,
+  }
+
+pub fn escaped(n: Int) -> Int / {sim.read, abort.raise} =
+  with_cell[opened](0) { opened -> handle {
+    simulate {
+      let t = task.spawn(|| with_cell[mine](1) { a -> {
+        cell_set(opened, 1);
+        task.yield();
+        cell_get(a)
+      } });
+      iterate(0, 1000, |i: Int| if cell_get(opened) == 1 { Stop(i) } else {
+        task.yield();
+        Continue(i + 1)
+      });
+      halt.stop(n) + task.join(t)
+    }
+  } with {
+    halt.stop(code) resume k -> code,
+  } }
+
+pub fn stopped(n: Int) -> Int =
+  with_cell[total](n) { t -> {
+    let first = handle {
+      with_cell[state](1) { c -> {
+        gen.give(cell_get(c));
+        gen.give(5);
+        cell_get(c)
+      } }
+    } with {
+      gen.give(v) resume k -> if v > 3 { 0 } else { v + k(()) },
+    };
+    first + cell_get(t)
+  } }
+
+pub fn resumed(n: Int) -> Int =
+  handle {
+    with_cell[inner](n) { b -> {
+      gen.step();
+      cell_get(b)
+    } }
+  } with {
+    gen.step() resume k -> with_cell[outer](10) { x -> {
+      let answered = k(());
+      answered + cell_get(x)
+    } },
+  }
+
+pub fn handshake(n: Int) -> Int / {sim.read, abort.raise} =
+  with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
+    let held = with_cell[root](n) { b -> {
+      let t = task.spawn(|| with_cell[mine](1) { a -> {
+        cell_set(opened, 1);
+        iterate(0, 1000, |n: Int| if cell_get(closed) == 1 { Stop(n) } else {
+          task.yield();
+          Continue(n + 1)
+        });
+        cell_get(a)
+      } });
+      iterate(0, 1000, |n: Int| if cell_get(opened) == 1 { Stop(n) } else {
+        task.yield();
+        Continue(n + 1)
+      });
+      { own: cell_get(b), task: t }
+    } };
+    cell_set(closed, 1);
+    held.own + task.join(held.task)
+  } } }
+
+pub fn unwound(n: Int) -> Int / {sim.read, abort.raise} =
+  with_cell[go](0) { go -> with_cell[opened](0) { opened -> with_cell[closed](0) { closed -> simulate {
+    let t = task.spawn(|| {
+      iterate(0, 1000, |n: Int| if cell_get(go) == 1 { Stop(n) } else {
+        task.yield();
+        Continue(n + 1)
+      });
+      with_cell[mine](2) { a -> {
+        cell_set(opened, 1);
+        iterate(0, 1000, |n: Int| if cell_get(closed) == 1 { Stop(n) } else {
+          task.yield();
+          Continue(n + 1)
+        });
+        cell_get(a)
+      } }
+    });
+    let got = handle {
+      cell_set(go, 1);
+      iterate(0, 1000, |n: Int| if cell_get(opened) == 1 { Stop(n) } else {
+        task.yield();
+        Continue(n + 1)
+      });
+      with_cell[gone](n) { g -> halt.stop(cell_get(g)) }
+    } with {
+      halt.stop(code) resume k -> code,
+    };
+    cell_set(closed, 1);
+    got + task.join(t)
+  } } } }
+
+pub fn threaded(n: Int) -> Int = {
+  let got = handle {
+    with_cell[inner](5) { c -> {
+      let b = amb.flip();
+      cell_set(c, cell_get(c) + (if b { 1 } else { 2 }));
+      cell_get(c)
+    } }
+  } with {
+    amb.flip() resume k -> k(true) + k(false),
+  };
+  n + got
+}
+
+pub fn later(n: Int) -> Int = {
+  let got = handle {
+    with_cell[inner](5) { c -> {
+      let b = amb.flip();
+      with_cell[step](if b { 1 } else { 2 }) { d -> {
+        cell_set(c, cell_get(c) + cell_get(d));
+        cell_get(c)
+      } }
+    } }
+  } with {
+    amb.flip() resume k -> k(true) + k(false),
+  };
+  n + got
+}
+
+pub fn parked(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
+  let first = with_cell[log](41) { c ->
+    handle {
+      let b = amb.flip();
+      if b { cell_get(c) } else { 0 }
+    } with {
+      amb.flip() resume k -> {
+        cell_set(s, Just(k));
+        0
+      },
+    }
+  };
+  let second = match cell_get(s) {
+    Just(k) -> k(true),
+    Nothing -> 0,
+  };
+  n + first + second
+} }
+
+pub fn dropped(n: Int) -> Int = with_cell[slot](Nothing) { s -> {
+  let first = with_cell[log](n) { c ->
+    handle {
+      with_cell[mine](1) { m -> {
+        let b = amb.flip();
+        if b { cell_get(c) + cell_get(m) } else { 0 }
+      } }
+    } with {
+      amb.flip() resume k -> {
+        cell_set(s, Just(k));
+        cell_get(c)
+      },
+    }
+  };
+  first + 1
+} }
+
+pub fn nested(n: Int) -> Int / {cell.read[log], cell.write[slot]} = with_cell[slot](Nothing) { s -> {
+  let first = with_cell[log](41) { c ->
+    handle {
+      handle {
+        let b = amb.flip();
+        if b { cell_get(c) } else { 0 }
+      } with {
+        amb.flip() resume j -> {
+          cell_set(s, Just(j));
+          0
+        },
+      }
+    } with {
+      gen.step() resume k -> k(()) + 0,
+    }
+  };
+  let second = match cell_get(s) {
+    Just(j) -> j(true),
+    Nothing -> 0,
+  };
+  n + first + second
+} }
+
+pub fn tasked(n: Int) -> Int / {sim.read, abort.raise} = with_cell[slot](Nothing) { s -> {
+  let first = with_cell[log](41) { c -> simulate {
+    let t = task.spawn(|| handle {
+      let b = amb.flip();
+      if b { cell_get(c) } else { 0 }
+    } with {
+      amb.flip() resume j -> {
+        cell_set(s, Just(j));
+        0
+      },
+    });
+    task.join(t)
+  } };
+  let second = match cell_get(s) {
+    Just(j) -> j(true),
+    Nothing -> 0,
+  };
+  n + first + second
+} }
+
+
+// Each entry answers what its program says whatever the schedule, and the runtime holds every
+// entry to giving back each region and slot it opened.
+
+// The body closes the region it opened before it stopped; the clause opened one after, on the stack
+// that resumed the body, and reads it once the body has finished.
+test "a clause keeps its cell when the body it resumed closes an older region" {
+  assert_eq(map(range(0, 4), resumed), map(range(0, 4), |n: Int| n + 10))
+}
+
+// The root opens its region and spawns; the task opens its own and signals; the root closes its
+// region, the older of the two, and signals back; only then does the task read its cell.
+test "a task keeps its cell when the root closes the region it opened first" {
+  assert_eq(handshake(3), 4)
+}
+
+// The task opens its region after the root installs a `handle`, and the root's zero-shot clause
+// abandons a body holding a cell of its own: the unwind reclaims that cell, the task reads its.
+test "an unwind reclaims the abandoned stack's region and no other" {
+  assert_eq(unwound(3), 5)
+}
+
+// The root unwinds out of the simulated region while a task it spawned is suspended in a region of
+// its own: the task will not run again, so its region goes back when the simulated one ends.
+test "a task its region never finished gives its region back as the region ends" {
+  assert_eq(escaped(3), 3)
+}
+
+// A clause that never resumes leaves its body suspended in the region it opened: nothing can resume
+// it once the entry has returned, so the region does not count against the entry.
+test "a body its clause abandons holds no region once the entry returns" {
+  assert_eq(map(range(0, 4), stopped), map(range(0, 4), |n: Int| n + 1))
+}
+
+// An unwind leaving a detached `handle` abandons the body, which stopped once and so keeps a
+// snapshot: the body's region leaves its stack as the unwind passes.
+test "an unwind leaving a detached handle takes the body's region off its stack as it passes" {
+  assert_eq(map(range(0, 4), raised), range(0, 4))
+}
+
+// The body opens its region before it stops and the clause resumes it twice: the second run is
+// restored into the region the first run closed, and reads what the first run wrote.
+test "a body resumed twice runs again in the region it opened before the stop" {
+  assert_eq(map(range(0, 4), threaded), map(range(0, 4), |n: Int| n + 14))
+}
+
+// A region the body opens after its stop is no snapshot's: each run's close gives its cell back.
+test "a region the body opens after its stop goes back at its own close" {
+  assert_eq(map(range(0, 4), later), map(range(0, 4), |n: Int| n + 14))
+}
+
+// The clause parks `k` in an older cell and answers without it, and `k` runs once `log`, the region
+// around the `handle`, has closed.
+test "a continuation resumed after the region around its handle closed reads that region's cell" {
+  assert_eq(map(range(0, 4), parked), map(range(0, 4), |n: Int| n + 41))
+}
+
+// The clause parks `k` and nothing resumes it: the entry's end drops the body with every region it
+// pins.
+test "a body nothing resumes gives back all it holds when the entry ends" {
+  assert_eq(map(range(0, 4), dropped), map(range(0, 4), |n: Int| n + 1))
+}
+
+// The inner body parks its `k`; the outer body finishes with no snapshot and lets go of `log`, which
+// the inner body still holds, so its `k` reads the cell once `log` has closed.
+test "a nested body's continuation reads the region around the outer handle" {
+  assert_eq(map(range(0, 4), nested), map(range(0, 4), |n: Int| n + 41))
+}
+
+// A task opens the `handle`, so the regions its body reaches are around the `simulate` it runs in;
+// its `k` runs once the region has ended and `log` has closed.
+test "a task's continuation reads the region around its simulate" {
+  assert_eq(tasked(3), 44)
+}

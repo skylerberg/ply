@@ -1,45 +1,4 @@
-use crate::fixture::Compiled;
 use ply_eval::codes;
-
-/// Storing the cell inside itself structurally asks for `T = List<Cell<T>>`.
-#[test]
-fn a_cell_cannot_be_stored_in_a_list_it_holds() {
-    let diags = Compiled::rejected(
-        r#"
-test "a cell that reaches itself" {
-  with_cell[log]([]) { c -> {
-    cell_set(c, [c]);
-    assert_eq(1, 1)
-  } }
-}
-"#,
-    );
-    assert!(
-        diags.iter().any(|d| d.code == codes::OCCURS_CHECK),
-        "a cell stored inside its own contents would be the leak the reference-counting pass accepts, and the occurs \
-         check is what stops it being written: {diags:#?}"
-    );
-}
-
-#[test]
-fn a_declared_field_cannot_hold_a_cell_for_a_cycle_to_run_through() {
-    let diags = Compiled::rejected(
-        r#"
-type Loop = Nil | Node(Cell<Loop>)
-
-test "a cell that reaches itself through a variant" {
-  with_cell[log](Nil) { c -> {
-    cell_set(c, Node(c));
-    assert_eq(1, 1)
-  } }
-}
-"#,
-    );
-    assert!(
-        diags.iter().any(|d| d.code == codes::REGION_ESCAPE),
-        "a declared `Cell` field is what a cycle would have to run through: {diags:#?}"
-    );
-}
 
 /// The guard compiled code runs before `cell_set` stores a value.
 #[test]

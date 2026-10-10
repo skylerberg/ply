@@ -1430,13 +1430,19 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, Linearity,
 };
+use crate::sketch::Sketch;
 use std::sync::Arc;
 
 /// Enough of a program to bind against; these tests need only that it is bound.
 fn binding() -> HostBinding {
-    let source = "nondet effect db { read get[r](k: Int) -> Int }\n\
-                  fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)";
-    let check = crate::fixture::port_check(&[("m", source)]);
+    let check = Sketch::program()
+        .effect("m", "db", true, &[("get", Mode::Read, true)])
+        .def(
+            "m",
+            "lookup",
+            vec![crate::sketch::atom("m.db", "users", Mode::Read)],
+        )
+        .check();
     let mut registry = HostRegistry::new();
     registry.register(
         HostOp {

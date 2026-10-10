@@ -1,51 +1,8 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use crate::fixture::Compiled;
-use ply_eval::{
-    ARGUMENT_VECTOR_CLASSES, Decimal, Diagnostic, Plain, Span, Value, assertion_failure,
-    first_difference, values_equal,
-};
+use ply_eval::{Decimal, Plain, Span, Value, assertion_failure, first_difference, values_equal};
 use std::sync::Arc;
-
-impl Compiled {
-    #[track_caller]
-    fn must_pass(&self, name: &str) {
-        if let Err(d) = self.machine().eval_test(self.index_of(name)).into_parts().0 {
-            panic!("{name:?} was expected to pass:\n{d:#?}");
-        }
-    }
-
-    #[track_caller]
-    fn answer_of(&self, name: &str, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        self.machine().call(name, args, Span::DUMMY).into_parts().0
-    }
-}
-
-const SECRET_ARGUMENTS: &str = r#"
-fn keep1(s: Secret<String>) -> Bool = secret_is_empty(s)
-fn keep2(a: Int, s: Secret<String>) -> Bool = secret_is_empty(s)
-fn keep3(a: Int, b: Int, s: Secret<String>) -> Bool = secret_is_empty(s)
-fn keep4(a: Int, b: Int, c: Int, s: Secret<String>) -> Bool = secret_is_empty(s)
-fn keep5(a: Int, b: Int, c: Int, d: Int, s: Secret<String>) -> Bool = secret_is_empty(s)
-
-pub fn carry1(s: Secret<String>) -> Bool = keep1(s)
-pub fn carry2(s: Secret<String>) -> Bool = keep2(1, s)
-pub fn carry3(s: Secret<String>) -> Bool = keep3(1, 2, s)
-pub fn carry4(s: Secret<String>) -> Bool = keep4(1, 2, 3, s)
-pub fn carry5(s: Secret<String>) -> Bool = keep5(1, 2, 3, 4, s)
-
-// Deeper than `argv::KEEP`, so the list fills, overflows and drains again while
-// a credential is in every frame's argument vector.
-fn descend(depth: Int, s: Secret<String>) -> Int =
-  if depth <= 0 { 0 } else { descend(depth - 1, s) + 1 }
-
-pub fn deep(s: Secret<String>) -> Int = descend(2000, s)
-
-// The observation a dirty buffer would break: a call of the same arity made
-// right after one that carried a credential must see exactly its own arguments.
-pub fn after4(a: Int, b: Int, c: Int, d: Int) -> Int = a * 1000 + b * 100 + c * 10 + d
-"#;
 
 /// A credential, and its payload held apart, to count who else holds it.
 fn credential(text: &str) -> (Value, Arc<ply_eval::Sealed>) {
@@ -55,62 +12,6 @@ fn credential(text: &str) -> (Value, Arc<ply_eval::Sealed>) {
     };
     let payload = Arc::clone(payload);
     (secret, payload)
-}
-
-#[test]
-fn a_credential_passed_as_an_argument_is_unreachable_once_the_call_returns() {
-    let compiled = Compiled::new(SECRET_ARGUMENTS);
-    for arity in 1..=ARGUMENT_VECTOR_CLASSES + 1 {
-        let (secret, payload) = credential("hunter2");
-        let answered = compiled
-            .answer_of(&format!("m.carry{arity}"), vec![secret])
-            .unwrap_or_else(|d| panic!("`carry{arity}` raised: {d:#?}"));
-        assert_eq!(answered, Value::Bool(false), "arity {arity}");
-        assert_eq!(
-            Arc::strong_count(&payload),
-            1,
-            "after a call at arity {arity} returned, a credential was still reachable from \
-             something the evaluator kept — a recycled argument buffer holds its contents"
-        );
-    }
-}
-
-#[test]
-fn a_recursion_deeper_than_the_free_lists_bound_leaves_no_credential_behind() {
-    let compiled = Compiled::new(SECRET_ARGUMENTS);
-    let (secret, payload) = credential("hunter2");
-    let answered = compiled
-        .answer_of("m.deep", vec![secret])
-        .unwrap_or_else(|d| panic!("`deep` raised: {d:#?}"));
-    assert_eq!(answered, Value::Int(2000));
-    assert_eq!(
-        Arc::strong_count(&payload),
-        1,
-        "a 2000-frame recursion carrying a credential left one reachable after it unwound"
-    );
-}
-
-#[test]
-fn a_call_made_after_one_that_carried_a_credential_sees_only_its_own_arguments() {
-    let compiled = Compiled::new(SECRET_ARGUMENTS);
-    for _ in 0..64 {
-        let secret = Value::secret_text("hunter2");
-        let _ = compiled
-            .answer_of("m.carry4", vec![secret])
-            .expect("`carry4` runs");
-        let answered = compiled
-            .answer_of(
-                "m.after4",
-                vec![Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
-            )
-            .expect("`after4` runs");
-        assert_eq!(
-            answered,
-            Value::Int(1234),
-            "the call after one that carried a credential was built from a buffer that was \
-             not empty"
-        );
-    }
 }
 
 /// A failing assertion's diagnostic is what a report prints and a failure document carries.
@@ -296,42 +197,6 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
 }
 
 #[test]
-fn map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling() {
-    let compiled = Compiled::new(
-        r#"
-pub fn last_wins(ignored: Int) -> String =
-  string_of_keys(map_insert(map_insert(map_new(), 1.50m, 1), 1.5m, 2))
-
-pub fn first_spelling(ignored: Int) -> String =
-  string_of_keys(map_insert(map_insert(map_new(), 1.5m, 1), 1.50m, 2))
-
-fn string_of_keys(m: Map<Decimal, Int>) -> String =
-  fold(map(map_keys(m), decimal_to_string), "", string_concat)
-
-test "the two maps are equal" {
-  assert_eq(
-    map_insert(map_insert(map_new(), 1.50m, 1), 1.5m, 2),
-    map_insert(map_insert(map_new(), 1.5m, 1), 1.50m, 2))
-}
-"#,
-    );
-    compiled.must_pass("the two maps are equal");
-    assert_eq!(
-        compiled
-            .answer_of("m.last_wins", vec![Value::Int(0)])
-            .unwrap(),
-        Value::str("1.5")
-    );
-    assert_eq!(
-        compiled
-            .answer_of("m.first_spelling", vec![Value::Int(0)])
-            .unwrap(),
-        Value::str("1.5"),
-        "two maps that `assert_eq` as one value answer `map_keys` with two different lists"
-    );
-}
-
-#[test]
 fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
     assert_eq!(
         size_of::<Value>(),
@@ -344,48 +209,6 @@ fn a_value_is_still_thirty_two_bytes_wide_and_an_optional_one_costs_nothing() {
         size_of::<Value>(),
         "`Option<Value>` stopped being niche-optimized, so every arena slot and every scope \
          binding grew"
-    );
-}
-
-#[test]
-fn a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too() {
-    let compiled = Compiled::new(
-        r#"
-type Line = {sku: String, price: Decimal}
-
-fn prices(m: Map<Line, Int>) -> String =
-  fold(map(map_keys(m), |l: Line| decimal_to_string(l.price)), "", string_concat)
-
-pub fn wrote_rounded(ignored: Int) -> String =
-  prices(map_insert(
-    map_insert(map_new(), {sku: "bolt", price: 1.50m}, 1),
-    {sku: "bolt", price: 1.5m}, 2))
-
-pub fn wrote_exact(ignored: Int) -> String =
-  prices(map_insert(
-    map_insert(map_new(), {sku: "bolt", price: 1.5m}, 1),
-    {sku: "bolt", price: 1.50m}, 2))
-
-test "one line, either way" {
-  assert_eq(map_len(map_insert(
-    map_insert(map_new(), {sku: "bolt", price: 1.50m}, 1),
-    {sku: "bolt", price: 1.5m}, 2)), 1)
-}
-"#,
-    );
-    compiled.must_pass("one line, either way");
-    assert_eq!(
-        compiled
-            .answer_of("m.wrote_rounded", vec![Value::Int(0)])
-            .unwrap(),
-        Value::str("1.5")
-    );
-    assert_eq!(
-        compiled
-            .answer_of("m.wrote_exact", vec![Value::Int(0)])
-            .unwrap(),
-        Value::str("1.5"),
-        "a record key holding a `Decimal` reads back a price the program did not write last"
     );
 }
 

@@ -3,16 +3,13 @@
 
 use super::encoding::{count, decode_tables, encode_tables, line};
 use super::load::Library;
-use super::prelude::{helpers, pointer_name};
+use super::prelude::helpers;
 use super::tables::Defined;
 use anyhow::{Result, anyhow};
 use ply_eval::{Symbol, Value};
 
 /// The symbol the table is read from.
 pub const SYMBOL: &str = "ply_exports";
-
-/// Bytes per C string literal, so no literal exceeds what compilers accept.
-const PIECE: usize = 2000;
 
 /// One runtime helper as a unit records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,18 +90,6 @@ pub struct Exports {
     pub numerics: Vec<(Symbol, [String; 5])>,
 }
 
-/// Whether `text` calls `helper` through its pointer, as the emitter writes a call: the name
-/// whole, then `(`.
-fn calls(text: &str, helper: &str) -> bool {
-    let call = format!("{}(", pointer_name(helper));
-    text.match_indices(&call).any(|(at, _)| {
-        !text[..at]
-            .bytes()
-            .next_back()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-    })
-}
-
 impl Exports {
     pub fn names(&self) -> Vec<String> {
         self.taken.iter().map(|t| t.name.clone()).collect()
@@ -114,13 +99,9 @@ impl Exports {
         self.taken.iter().find(|t| t.name == name)
     }
 
-    /// The address each helper the unit records binds to, in the unit's order. One this runtime
-    /// no longer has binds to nothing, which serves a unit whose C never calls it: `text` is
-    /// that C.
-    /// The address of each helper the unit binds, in its order. `text` is the unit's C, which says
-    /// whether a helper this runtime lacks is one the unit calls; a unit with none to read is
-    /// refused any it lacks.
-    pub fn bound(&self, text: Option<&str>) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
+    /// The address of each helper the unit binds, in its order; a unit recording one this runtime
+    /// lacks, or has under another shape, is refused.
+    pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
         let said = |h: &HelperShape| {
             format!(
                 "taking {} and {}",
@@ -149,11 +130,10 @@ impl Exports {
                             answers: h.answers,
                         }),
                     ))),
-                    None if text.is_none_or(|text| calls(text, &mine.name)) => Err(Unserved(format!(
+                    None => Err(Unserved(format!(
                         "it calls `{}`, which this runtime does not have",
                         mine.name
                     ))),
-                    None => Ok(std::ptr::null_mut()),
                 },
             )
             .collect()
@@ -321,72 +301,6 @@ impl Exports {
             instances,
             numerics,
         })
-    }
-
-    /// The table as C string literals, non-printable bytes in octal.
-    pub fn embed(&self) -> String {
-        let encoded = self.encode();
-        let mut out = String::with_capacity(encoded.len() + encoded.len() / 8);
-        out.push_str("\n/* --- what this unit says about itself, read by the loader --- */\n");
-        out.push_str(&format!("const char {SYMBOL}[] =\n"));
-        for l in encoded.lines() {
-            let bytes = l.as_bytes();
-            let mut pieces: Vec<&[u8]> = bytes.chunks(PIECE).collect();
-            if pieces.is_empty() {
-                pieces.push(&[]);
-            }
-            let last = pieces.len() - 1;
-            for (i, piece) in pieces.iter().enumerate() {
-                out.push('"');
-                for &b in *piece {
-                    match b {
-                        b'"' => out.push_str("\\\""),
-                        b'\\' => out.push_str("\\\\"),
-                        0x20..=0x7e if b != b'?' => out.push(b as char),
-                        _ => out.push_str(&format!("\\{b:03o}")),
-                    }
-                }
-                if i == last {
-                    out.push_str("\\n");
-                }
-                out.push_str("\"\n");
-            }
-        }
-        out.push_str(";\n");
-        out
-    }
-
-    /// The table [`Exports::embed`] wrote into a unit's C, read from the text without compiling it.
-    pub fn from_text(c: &str) -> Option<Exports> {
-        let head = format!("const char {SYMBOL}[] =\n");
-        let start = c.rfind(&head)? + head.len();
-        let mut encoded: Vec<u8> = Vec::new();
-        for line in c[start..].lines() {
-            if line == ";" {
-                return Exports::decode(&String::from_utf8(encoded).ok()?);
-            }
-            let piece = line.strip_prefix('"')?.strip_suffix('"')?.as_bytes();
-            let mut i = 0;
-            while i < piece.len() {
-                if piece[i] != b'\\' {
-                    encoded.push(piece[i]);
-                    i += 1;
-                    continue;
-                }
-                match *piece.get(i + 1)? {
-                    b'n' => encoded.push(b'\n'),
-                    b @ (b'"' | b'\\') => encoded.push(b),
-                    _ => {
-                        let octal = std::str::from_utf8(piece.get(i + 1..i + 4)?).ok()?;
-                        encoded.push(u8::from_str_radix(octal, 8).ok()?);
-                        i += 4;
-                        continue;
-                    }
-                }
-                i += 2;
-            }
-        }
-        None
     }
 
     pub fn read(lib: &Library) -> Result<Exports> {

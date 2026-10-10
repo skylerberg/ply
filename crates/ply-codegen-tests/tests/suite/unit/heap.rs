@@ -461,6 +461,37 @@ fn a_stale_word_meets_a_reused_bridge_block_poisoned() {
     Heap::to_value(&l, stale);
 }
 
+/// A credential handed to compiled code is held by its word and by nothing the heap keeps: once
+/// the last holder lets the word go, and once the entry ends, the payload is its owner's alone,
+/// however deep in a value it crossed.
+#[test]
+fn a_credential_crossing_into_a_word_is_let_go_with_the_word() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let secret = Value::secret_text("hunter2");
+    let Value::Secret(payload) = &secret else {
+        unreachable!("a secret is a `Secret`")
+    };
+    let payload = Arc::clone(payload);
+    for crossing in [
+        secret.clone(),
+        Value::list(vec![Value::Int(1), secret.clone()]),
+        Value::ctor("Some", vec![secret.clone()]),
+    ] {
+        let w = h.to_word(&l, &crossing);
+        assert_eq!(Heap::to_value(&l, w), crossing);
+        dec(w);
+        drop(crossing);
+    }
+    h.end();
+    drop(secret);
+    assert_eq!(
+        Arc::strong_count(&payload),
+        1,
+        "something the heap kept still holds a credential every word of was let go"
+    );
+}
+
 #[test]
 fn a_shared_child_survives_its_parent() {
     let mut h = Heap::new();
@@ -624,99 +655,6 @@ fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
         Heap::to_value(&l, w),
         Value::list(vec![Value::str("a"), Value::Int(1)])
     );
-}
-
-const NESTED: &str = r#"
-effect amb { read flip[coin]() -> Bool }
-
-type Saved = Nothing | Just((Bool) -> Int)
-
-fn parked() -> Saved / {abort.raise} = with_cell[slot](Nothing) { s -> {
-  let inner = handle {
-    if amb.flip[coin]() { 41 } else { 0 }
-  } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 } };
-  assert_eq(inner, 0);
-  cell_get(s)
-} }
-
-pub fn continuation_inside() -> { saved: List<Saved> } / {abort.raise} = { saved: [Nothing, parked()] }
-
-pub fn closure_inside(n: Int) -> { saved: List<Saved> } =
-  { saved: [Nothing, Just(|b: Bool| if b { n } else { 0 })] }
-"#;
-
-/// `NESTED`'s two entries, and whether each answer holds a continuation.
-fn nested_cases() -> [(&'static str, Vec<Word>, bool); 2] {
-    [
-        ("m.continuation_inside", Vec::new(), true),
-        ("m.closure_inside", vec![imm(41)], false),
-    ]
-}
-
-/// A continuation's captures are immediates, so only its code tells the memo it names a body its
-/// entry alone holds; an ordinary closure over an immediate is kept.
-#[test]
-fn a_continuation_however_deep_in_a_word_leaves_it_to_its_entry() {
-    let Some((_source, native)) = crate::fixture::unit(NESTED) else {
-        return;
-    };
-    let mut ctx = native.context();
-    for (name, args, continuation) in nested_cases() {
-        let entry = native
-            .entry(name)
-            .unwrap_or_else(|| panic!("`{name}` compiled"));
-        ctx.begin(10_000);
-        let out = unsafe { entry(&mut ctx, args.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}`: {:?}", ctx.diagnostic);
-        assert_eq!(world_independent(out), !continuation, "`{name}`");
-        ctx.end();
-    }
-}
-
-/// The conversion out of the heap is where a continuation stops being told apart by its code, so
-/// the value it makes says so to the escape check and the memo, and goes on saying so back through
-/// a word and through a bridge.
-#[test]
-fn a_continuation_word_converts_to_a_value_that_says_it_is_one() {
-    let Some((_source, native)) = crate::fixture::unit(NESTED) else {
-        return;
-    };
-    let layouts = &native.tables().layouts;
-    let mut ctx = native.context();
-    for (name, args, continuation) in nested_cases() {
-        let entry = native
-            .entry(name)
-            .unwrap_or_else(|| panic!("`{name}` compiled"));
-        ctx.begin(10_000);
-        let out = unsafe { entry(&mut ctx, args.as_ptr()) };
-        assert_eq!(ctx.failed, 0, "`{name}`: {:?}", ctx.diagnostic);
-        let value = Heap::to_value(layouts, out);
-        let rebuilt = ctx.heap.to_word(layouts, &value);
-        assert_eq!(
-            world_independent(rebuilt),
-            !continuation,
-            "`{name}` rebuilt"
-        );
-        let again = Heap::to_value(layouts, rebuilt);
-        let bridged = Heap::to_value(layouts, ctx.heap.bridge(value.clone()));
-        for (path, v) in [
-            ("converted", &value),
-            ("rebuilt", &again),
-            ("bridged", &bridged),
-        ] {
-            assert_eq!(
-                ply_eval::escape::carries(v).map(|found| found.handle),
-                continuation.then_some(ply_eval::escape::Handle::Continuation),
-                "`{name}` {path}: {v:?}"
-            );
-            assert_eq!(
-                ply_eval::memo::world_independent(v),
-                !continuation,
-                "`{name}` {path}"
-            );
-        }
-        ctx.end();
-    }
 }
 
 #[test]

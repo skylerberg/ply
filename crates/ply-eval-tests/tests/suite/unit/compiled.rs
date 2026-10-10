@@ -1,4 +1,4 @@
-use crate::fixture::port_front;
+use crate::sketch::Sketch;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
 use ply_eval::{Analysis, DefHash, Diagnostic, Plain, Span, Symbol, Value, codes, slot};
@@ -8,11 +8,6 @@ struct Checked {
     front: Analysis,
 }
 
-fn checked_source(source: &str) -> Checked {
-    Checked {
-        front: port_front(&[("m", source)]),
-    }
-}
 
 struct Roots {
     program: DefHash,
@@ -51,9 +46,15 @@ fn first_test_under(
     (outcome, machine.compiled_counts())
 }
 
-/// A test whose assertion fails: `double(21)` is 42.
-const DOUBLE_DOUBLES: &str =
-    "fn double(x: Int) -> Int = x * 2\n\ntest \"double doubles\" { assert_eq(double(21), 43) }\n";
+/// `fn double(x: Int) -> Int` and one test, which a backend here answers however it is told to.
+fn double_doubles() -> Checked {
+    Checked {
+        front: Sketch::program()
+            .def("m", "double", Vec::new())
+            .test("m", "double doubles")
+            .analysis(b"double doubles"),
+    }
+}
 
 fn assertion_raised() -> Entered {
     Entered::Raised(Diagnostic::error(codes::RUNTIME_ERROR, "assertion failed"))
@@ -61,16 +62,16 @@ fn assertion_raised() -> Entered {
 
 #[test]
 fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raises_too() {
-    let c = checked_source(DOUBLE_DOUBLES);
+    let c = double_doubles();
     let (outcome, _) = first_test_under(&c, assertion_raised);
-    let d = outcome.expect_err("the assertion fails in the machine");
+    let d = outcome.expect_err("the backend raised");
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert_eq!(d.message, "assertion failed");
 }
 
 #[test]
 fn a_backend_built_from_another_program_is_refused_before_anything_runs() {
-    let c = checked_source(DOUBLE_DOUBLES);
+    let c = double_doubles();
     let backend = Rc::new(Roots {
         program: DefHash::of(b"another program"),
         entered: Box::new(|| panic!("a refused backend was entered")),
@@ -89,7 +90,7 @@ fn a_backend_built_from_another_program_is_refused_before_anything_runs() {
 /// codes can be met by it.
 #[test]
 fn a_test_root_the_backend_did_not_run_is_plys_defect_and_counted_as_declined() {
-    let c = checked_source(DOUBLE_DOUBLES);
+    let c = double_doubles();
     let (outcome, counts) = first_test_under(&c, || Entered::Declined);
     let d = outcome.expect_err("a declined test answers nothing");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
@@ -104,7 +105,7 @@ fn a_test_root_the_backend_did_not_run_is_plys_defect_and_counted_as_declined() 
 /// decline: the backend did run the test.
 #[test]
 fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
-    let c = checked_source(DOUBLE_DOUBLES);
+    let c = double_doubles();
     let (outcome, counts) = first_test_under(&c, || Entered::Answered(Value::Int(7)));
     let d = outcome.expect_err("a test answers `()`");
     assert_eq!(d.code, codes::INTERNAL_ERROR, "{d:?}");
@@ -118,7 +119,7 @@ fn a_test_root_that_answers_a_value_is_plys_defect_and_counted_as_entered() {
 
 #[test]
 fn an_entry_point_the_backend_declined_is_plys_defect_and_counted_as_declined() {
-    let c = checked_source(DOUBLE_DOUBLES);
+    let c = double_doubles();
     let mut machine = machine_under(&c, || panic!("no test is entered here"));
     let d = machine
         .call("double", vec![Value::Int(21)], Span::DUMMY)

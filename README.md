@@ -49,17 +49,15 @@ CI is the verifier; every pull request runs these checks and the whole suite:
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo build --locked --release -p ply-native
-scripts/stage0.sh
-target/stage0/ply bootstrap --profile release
+scripts/bootstrap.sh --release
 cargo nextest run --workspace
 ```
 
 `ply` is a native program: the CLI compiled to C and linked with the runtime's static library,
 with a pack after it holding the shipped modules, what they answer and the CLI's own front end.
-`ply bootstrap` builds one from a checkout with an installed `ply`, or the one
-`scripts/stage0.sh` downloads; an edit to Ply sources needs only that step, and one to Rust the
-cargo build before it.
+`scripts/bootstrap.sh` has cargo build that library and `ply bootstrap` build the rest, run by the
+`ply` already in `target/` or, in a fresh checkout, the last release (`scripts/stage0.sh`). Cargo
+builds nothing after an edit to Ply sources alone.
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
 cut from the durations its last run measured.

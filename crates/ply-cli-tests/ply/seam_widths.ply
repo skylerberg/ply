@@ -1,0 +1,131 @@
+//! A width crosses the machine's boundary as the tagged `Int` compiled code holds it, and reads back
+//! as the width its signature, a field, a constructor or the arguments shown for a type variable
+//! say, however deep: a root entered with typed values answers typed ones.
+
+import harness (Here, Shipped, bound_main, loaded, project)
+import cli.machine (machine, Called, default_options)
+import std.value (Value, VBool, VCtor, VFixed, VFloat, VFn, VInt, VList, VRecord, VStr, FConst)
+
+effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+
+fn crosses() -> String =
+  \\type Byte = | Byte(U8)
+  \\type Word = { w: U32 }
+  \\type Sample = { level: I16, label: String }
+  \\
+  \\fn main() -> Int = 0
+  \\
+  \\pub fn narrows(n: Int) -> U32 / {abort.raise} requires n >= 0 ensures int_of_u32(result) == n = u32_of_int(n)
+  \\pub fn widens(w: U32) -> Int requires int_of_u32(w) > 0 = int_of_u32(w)
+  \\pub fn boxed(n: Int) -> Word / {abort.raise} = { w: u32_of_int(n) }
+  \\pub fn negated(b: I8) -> I8 = -b
+  \\pub fn doubled(w: U32) -> U32 = wrap_add(w, w)
+  \\pub fn flipped(w: U64) -> U64 = w ^ 1u64
+  \\pub fn bytes(n: Int) -> List<U8> / {abort.raise} = map(range(0, n), |i: Int| u8_of_int(i * 100 % 256))
+  \\pub fn summed(xs: List<U8>) -> Int = fold(xs, 0, |acc: Int, x: U8| acc + int_of_u8(x))
+  \\pub fn sample(n: Int) -> Sample / {abort.raise} = { level: i16_of_int(n), label: "s" }
+  \\pub fn level(s: Sample) -> I16 = s.level
+  \\pub fn wrap(b: U8) -> Byte = Byte(b)
+  \\pub fn unwrap(b: Byte) -> U8 = match b { Byte(x) -> x }
+  \\pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
+  \\pub fn made<a>(make: () -> a) -> a = make()
+  \\pub fn total<a>(xs: List<a>) -> a where numeric(a) = fold(xs, numeric_of_int(0), |s: a, x: a| s + x)
+  \\pub fn halved<a>(x: a) -> a / {abort.raise} where integer(a) = x / numeric_of_int(2)
+  \\
+
+fn width(ty: String, bits: U128) -> Value = VFixed(ty, bits)
+
+fn u8(n: U128) -> Value = VFixed("U8", n)
+
+fn sample(level: U128) -> Value = VRecord([{ name: "label", value: VStr("s") }, { name: "level", value: width("I16", level) }])
+
+/// What each root answered for its arguments, in order.
+fn answers(calls: List<{ name: String, args: List<Value> }>) -> List<Result<Value, Bytes>> / {Here, Shipped, Driving, abort.raise} = {
+  project([{ path: "inner.ply", text: crosses() }]);
+  loaded(default_options());
+  bound_main();
+  let answered = map(calls, |c: { name: String, args: List<Value> }|
+    match (machine.call[run]("inner." ++ c.name, c.args)).answer {
+      Ok(v) -> Ok(v),
+      Err(r) -> Err(r.diag.code),
+    });
+  machine.drop[run]();
+  answered
+}
+
+test/nondet "a signature, a field, a list or a constructor naming a width answers it typed" {
+  let got = answers([
+    { name: "narrows", args: [VInt(7)] },
+    { name: "widens", args: [width("U32", 7u128)] },
+    { name: "boxed", args: [VInt(7)] },
+    { name: "narrows#ensures#0", args: [VInt(7), width("U32", 7u128)] },
+    { name: "narrows#ensures#0", args: [VInt(7), width("U32", 8u128)] },
+    { name: "widens#requires#0", args: [width("U32", 0u128)] },
+    // `-5i8` is the pattern 0xFB, and `-127i8` 0x81.
+    { name: "negated", args: [width("I8", 0xFBu128)] },
+    { name: "negated", args: [width("I8", 127u128)] },
+    { name: "doubled", args: [width("U32", 3000000000u128)] },
+    // Past `2^63`, where a `U64` is the runtime's own object rather than an immediate.
+    { name: "flipped", args: [width("U64", 0xFFFF_FFFF_FFFF_FFFEu128)] },
+    { name: "bytes", args: [VInt(3)] },
+    { name: "summed", args: [VList([u8(200u128), u8(100u128)])] },
+    // `-300i16` is the pattern 0xFED4.
+    { name: "sample", args: [VInt(0 - 300)] },
+    { name: "level", args: [sample(0xFED4u128)] },
+    { name: "wrap", args: [u8(200u128)] },
+    { name: "unwrap", args: [VCtor("inner.Byte", [u8(9u128)])] },
+  ]);
+  assert_eq(
+    got,
+    [
+      Ok(width("U32", 7u128)),
+      Ok(VInt(7)),
+      Ok(VRecord([{ name: "w", value: width("U32", 7u128) }])),
+      Ok(VBool(true)),
+      Ok(VBool(false)),
+      Ok(VBool(false)),
+      Ok(width("I8", 5u128)),
+      Ok(width("I8", 0x81u128)),
+      Ok(width("U32", 1705032704u128)),
+      Ok(width("U64", 0xFFFF_FFFF_FFFF_FFFFu128)),
+      Ok(VList([u8(0u128), u8(100u128), u8(200u128)])),
+      Ok(VInt(300)),
+      Ok(sample(0xFED4u128)),
+      Ok(width("I16", 0xFED4u128)),
+      Ok(VCtor("inner.Byte", [u8(200u128)])),
+      Ok(u8(9u128)),
+    ],
+  )
+}
+
+// A prover's generated function shows its answer's type as a list's elements show theirs.
+test/nondet "a type variable reads as the arguments show it, and a numeric one is passed that type" {
+  let got = answers([
+    { name: "first", args: [VList([u8(5u128), u8(6u128)])] },
+    { name: "first", args: [VList([VInt(5)])] },
+    { name: "first", args: [VList([])] },
+    { name: "made", args: [VFn(FConst({ arity: 0u8, value: u8(3u128) }))] },
+    { name: "made", args: [VFn(FConst({ arity: 0u8, value: VInt(3) }))] },
+    { name: "total", args: [VList([u8(200u128), u8(55u128)])] },
+    { name: "total", args: [VList([VFloat(0.5), VFloat(0.25)])] },
+    { name: "total", args: [VList([VInt(2), VInt(3)])] },
+    { name: "total", args: [VList([])] },
+    // `-9i8` is 0xF7, and halved toward zero it is `-4i8`, 0xFC.
+    { name: "halved", args: [width("I8", 0xF7u128)] },
+  ]);
+  assert_eq(
+    got,
+    [
+      Ok(VCtor("Some", [u8(5u128)])),
+      Ok(VCtor("Some", [VInt(5)])),
+      Ok(VCtor("None", [])),
+      Ok(u8(3u128)),
+      Ok(VInt(3)),
+      Ok(u8(255u128)),
+      Ok(VFloat(0.75)),
+      Ok(VInt(5)),
+      Ok(VInt(0)),
+      Ok(width("I8", 0xFCu128)),
+    ],
+  )
+}

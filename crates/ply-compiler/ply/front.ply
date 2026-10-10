@@ -6033,13 +6033,44 @@ fn reachable() -> List<Source> =
     },
   ]
 
-test "only a definition no root reaches is warned, each once" {
+fn test_footprint(src: Bytes, name: Bytes) -> Bytes / {abort.raise} =
+  match filter(dump_of(analyse(parse_all([{ name: b"m", src: src }]))).tests, |t: TestRow| t.name == name) {
+    [t, ..] -> atoms_text(t.footprint, b","),
+    [] -> panic("the dump holds the test"),
+  }
+
+// What a test declares of a cell is its footprint; a region discharges its own label, so the same
+// atoms inside it reach nothing.
+test "a declared cell atom reaches a test's footprint, and a region's own never does" {
+  let src = b"fn touches(n: Int) -> Int / {cell.read[log]} = n\nfn writes(n: Int) -> Int / {cell.read[log], cell.write[log]} = n\n\ntest \"a read\" {\n  let seen = with_cell[log](41) { c -> cell_get(c) };\n  assert_eq(touches(seen), 41)\n}\n\ntest \"a read and a write\" {\n  let seen = with_cell[log](1) { c -> { cell_set(c, 9); cell_get(c) } };\n  assert_eq(writes(seen), 9)\n}\n\ntest \"inside the region\" {\n  with_cell[log](41) { c -> { cell_set(c, 9); assert_eq(cell_get(c), 9) } }\n}\n";
+  assert_eq(test_footprint(src, b"a read"), b"cell.read[log]");
+  assert_eq(test_footprint(src, b"a read and a write"), b"cell.read[log],cell.write[log]");
+  assert_eq(test_footprint(src, b"inside the region"), b"")
+}
+
+// A general clause resumes from outside the region, which carries the region's atoms out of it; a
+// tail-resumptive one, the shape handlers are written in, still discharges them. Were the first
+// ever empty, the escape brand's claim would have become true.
+test "a general clause inside a region carries that region's atoms out of it" {
+  let src = b"effect amb { read flip[coin]() -> Bool }\n\nfn leaks(n: Int) -> Int / {cell.read[t], cell.write[t]} =\n  with_cell[t](n) { c ->\n    handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() resume k -> k(true), return x -> x }\n  }\n\nfn discharges(n: Int) -> Int =\n  with_cell[t](n) { c ->\n    handle { cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() -> true, return x -> x }\n  }\n\ntest \"through a general clause\" { assert_eq(leaks(1), 2) }\ntest \"through a tail-resumptive one\" { assert_eq(discharges(1), 2) }\n";
+  assert_eq(test_footprint(src, b"through a general clause"), b"cell.read[t],cell.write[t]");
+  assert_eq(test_footprint(src, b"through a tail-resumptive one"), b"")
+}
+
+test "only a definition no root reaches is warned, each once at its name" {
   let d = dump_of(analyse(parse_all(reachable())));
   let said = map(d.diags, |diag: Diag| diag.message);
   assert(contains(said, b"fn `m.dead` is never used"));
   assert(contains(said, b"fn `m.deader` is never used"));
   assert(contains(said, b"type `m.Unused` is never used"));
   assert_eq(len(said), 3);
+  let src = at(reachable(), 0).src;
+  let named = map(d.diags, |diag: Diag|
+    match filter(diag.labels, |l: Label| l.primary) {
+      [l, ..] -> bytes_slice(src, l.start, l.end),
+      [] -> b"",
+    });
+  assert_eq(sort_by(named, |a: Bytes, b: Bytes| compare(a, b) == Less), [b"Unused", b"dead", b"deader"]);
   assert(len(d.order) > 0)
 }
 
