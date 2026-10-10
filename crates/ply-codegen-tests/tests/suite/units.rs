@@ -126,8 +126,8 @@ pub fn opened(
 }
 
 /// The front end's answer a unit of `defs` is opened over, its hashes digesting to `program`'s: each
-/// definition a root of plain `Int`s, none of them pure.
-pub fn front(program: &[u8], defs: &[Def]) -> ply_eval::Analysis {
+/// definition a root of plain words, pure where `pure` names it.
+pub fn front(program: &[u8], defs: &[Def], pure: &[&str]) -> ply_eval::Analysis {
     ply_eval::Analysis {
         hashes_digest: ply_eval::DefHash::of(program),
         emitter_roots: defs
@@ -135,7 +135,7 @@ pub fn front(program: &[u8], defs: &[Def]) -> ply_eval::Analysis {
             .map(|d| ply_eval::EmitterRoot {
                 root: ply_eval::Symbol::new(d.name),
                 arity: d.arity,
-                pure: false,
+                pure: pure.contains(&d.name),
                 span: ply_eval::Span::DUMMY,
                 params: vec![ply_eval::Carry::Plain; d.arity],
                 answer: ply_eval::Carry::Plain,

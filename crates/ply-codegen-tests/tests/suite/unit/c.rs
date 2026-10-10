@@ -353,7 +353,7 @@ fn doubling(dir: &std::path::Path) -> Option<(ply_eval::Analysis, std::path::Pat
         "  return ply_imm(ply_imm_value(p0) * 2);",
     )];
     let lib = units::library(dir, &units::text(&defs, &units::exports_of(&defs)))?;
-    Some((units::front(b"doubling", &defs), lib))
+    Some((units::front(b"doubling", &defs, &[]), lib))
 }
 
 /// The unit is loaded once to read what it holds, and every backend over it answers alike.

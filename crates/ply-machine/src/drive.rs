@@ -440,8 +440,8 @@ impl Drive {
     }
 
     /// Enter one definition with arguments, the way `call` asks: the value back, or what it
-    /// raised, and what the entry ended with. The binding stays up, so a load may be called any
-    /// number of times.
+    /// raised, and what the entry ended with. A host answer is held to that definition's own row,
+    /// not the bound entry's. The binding stays up, so a load may be called any number of times.
     pub fn call(
         &mut self,
         name: &str,
@@ -450,12 +450,9 @@ impl Drive {
     ) -> Ended<ply_eval::Plain> {
         let options = &self.options;
         let target = &self.target;
-        let span = target
-            .check()
-            .defs
-            .get(&Symbol::new(name))
-            .map(|d| d.span)
-            .unwrap_or(Span::DUMMY);
+        let def = target.check().defs.get(&Symbol::new(name));
+        let span = def.map(|d| d.span).unwrap_or(Span::DUMMY);
+        let declared = def.map(|d| d.footprint.clone());
         let Some((_, bound)) = self.bound.as_ref() else {
             return Ended::refused(Diagnostic::error(
                 codes::INTERNAL_ERROR,
@@ -490,7 +487,7 @@ impl Drive {
                     span,
                     &seed,
                     &bound.hosts,
-                    bound.declared.as_ref(),
+                    declared.as_ref(),
                     compiled.clone(),
                 )
             })
