@@ -9,6 +9,7 @@ language gains or drops fails a check here.
 | `grammar.js` | the grammar: the lexer's tokens and the parser's rules |
 | `src/` | what `tree-sitter generate` writes, the C parser among it, committed so a consumer builds nothing |
 | `queries/highlights.scm` | the highlight queries, in the captures every tree-sitter editor reads |
+| `queries/indents.scm` | the indent queries, laid out as `ply fmt` lays a program out |
 | `test/corpus/` | the cases `tree-sitter test` holds the tree to |
 | `scripts/parse-corpus.sh` | every Ply module in this tree, parsed with the grammar and refused on a syntax error |
 
@@ -27,29 +28,39 @@ change to `grammar.js` that is not followed by `tree-sitter generate` fails CI.
 ## Neovim
 
 Neovim reads a parser from `parser/<lang>.<ext>` and queries from
-`queries/<lang>/` on its `runtimepath`. Build the parser and copy both in:
+`queries/<lang>/` on its `runtimepath`. Build the parser and copy the queries in:
 
 ```sh
 npx tree-sitter build -o ~/.config/nvim/parser/ply.so
 mkdir -p ~/.config/nvim/queries/ply
-cp queries/highlights.scm ~/.config/nvim/queries/ply/
+cp queries/highlights.scm queries/indents.scm ~/.config/nvim/queries/ply/
 ```
 
-Then map the filetype and start the parser on it, in
-`~/.config/nvim/ftdetect/ply.vim` and a `FileType` autocmd:
+Then map the filetype, start the parser, and turn indentation on. The ftdetect
+guards the extension, since a 3D mesh opens with a line holding `ply`:
 
 ```vim
-au BufRead,BufNewFile *.ply setf ply
-au FileType ply lua vim.treesitter.start()
+" ~/.config/nvim/ftdetect/ply.vim
+au BufReadPost,BufNewFile *.ply if getline(1) !=# 'ply' | setfiletype ply | endif
 ```
 
-A checkout of this directory on `runtimepath` serves the same files, since
-Neovim finds `queries/` under it; `nvim-treesitter`'s archived `master` branch
-does not know `ply`, so the `FileType` autocmd above is what starts it.
+```lua
+-- ~/.config/nvim/ftplugin/ply.lua; two spaces a level, as `ply fmt` writes
+vim.bo.expandtab = true
+vim.bo.shiftwidth = 2
+vim.treesitter.start()
+require('nvim-treesitter.indent').attach(0)
+```
 
-The `.ply` extension is also the Polygon File Format's (a 3D mesh), which some
-editors detect by content or by name; a file that opens as a mesh needs the
-filetype set by hand.
+`indents.scm` is nvim-treesitter's query, so indentation there needs its indent
+module; an editor that reads `indents.scm` itself (Helix, Zed) needs neither
+this nor `vim.treesitter.start()`. A checkout of this directory on `runtimepath`
+serves the same files, since Neovim finds `queries/` under it; nvim-treesitter's
+archived `master` branch does not know `ply`, which is why the ftplugin starts it.
+
+The `.ply` extension is also the Polygon File Format's (a 3D mesh); the
+ftdetect above leaves such a file to whatever else claims it, since its first
+line is the mesh's header and not source.
 
 ## GitHub
 
