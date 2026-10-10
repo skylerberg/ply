@@ -37,6 +37,9 @@ pub const MANIFEST: &str = "ply.pkg";
 pub const ANSWERS: &str = "answers";
 
 const ANSWER_DIRS: [&str; 2] = ["records", "outputs"];
+/// The file a store `ply std --answers` writes holds to say it stands for the shipped modules it was
+/// answered over, which a load trusts it by.
+const STANDING: &str = "standing";
 
 /// What a trace names a directory's data by, after the directory.
 const DATA_BELOW: &str = "/**";
@@ -183,6 +186,22 @@ impl Pack {
                 });
             }
         }
+        let standing = dir.join(STANDING);
+        let unclaimed = |e: std::io::Error| {
+            format!(
+                "`{}` could not be read: {e}; `ply std --answers` writes it",
+                standing.display()
+            )
+        };
+        let claim = std::fs::read(&standing).map_err(unclaimed)?;
+        let mut deflated =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        deflated.write_all(&claim).map_err(unclaimed)?;
+        self.entries.push(Entry {
+            path: format!("{ANSWERS}/{STANDING}"),
+            content: Content::Held(deflated.finish().map_err(unclaimed)?),
+            digest: OnceLock::new(),
+        });
         self.entries.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(self)
     }
