@@ -85,7 +85,7 @@ impl Compiled {
     }
 
     /// The unit compiled from this program; each [`Provider::attach`] is a backend of its own.
-    pub fn unit(&self) -> &'static ply_codegen::Unit {
+    pub fn unit(&self) -> std::sync::Arc<ply_codegen::Unit> {
         ply_codegen::Unit::handed(&self.front, self.unit.clone())
             .expect("this host has a C compiler")
     }
@@ -97,10 +97,8 @@ impl Compiled {
 
     /// The unit over every definition, loaded bare, so a test enters its bodies without a machine.
     pub fn native(&self) -> ply_codegen::c::Native {
-        let front: &'static Analysis = Box::leak(Box::new(self.front.clone()));
-        let source: &'static ply_codegen::Source =
-            Box::leak(Box::new(ply_codegen::Source::from_analysis(front)));
-        ply_codegen::c::load_unit(&self.unit, Some(source), "unit")
+        let source = ply_codegen::Source::from_analysis(std::sync::Arc::new(self.front.clone()));
+        ply_codegen::c::load_unit(&self.unit, Some(&source), "unit")
             .expect("the unit loads")
             .0
     }

@@ -6,7 +6,7 @@ use ply_eval::{Analysis, Symbol, Value, codes};
 fn built(text: &str) -> Option<(&'static Analysis, Native)> {
     let (source, native, refused) = crate::fixture::with_refusals(text)?;
     assert!(refused.is_empty(), "{refused:?}");
-    Some((source.front, native))
+    Some((&*source.front, native))
 }
 
 const PROGRAM: &str = r#"

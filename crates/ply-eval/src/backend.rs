@@ -3,6 +3,7 @@
 use crate::compiled::Compiled;
 use crate::value::Value;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
@@ -65,9 +66,10 @@ pub struct Offers {
     pub converted_out: u64,
 }
 
-/// One per run, shared by every worker; the only way a shipping command installs a backend.
+/// A program's backend, shared by every worker that runs it; the only way a shipping command
+/// installs a backend. It lives while a worker or a holder keeps it.
 pub trait Provider: Send + Sync {
-    fn attach(&'static self) -> Rc<dyn Compiled>;
+    fn attach(self: Arc<Self>) -> Rc<dyn Compiled>;
 
     /// The name a report gives this provider.
     fn name(&self) -> &'static str;

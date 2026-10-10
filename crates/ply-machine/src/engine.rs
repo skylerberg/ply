@@ -94,7 +94,7 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
 pub fn prover(
     loaded: &Loaded,
     hosting: Option<Hosting>,
-    backend: &'static dyn ply_eval::Provider,
+    backend: Arc<dyn ply_eval::Provider>,
 ) -> Prover {
     let prover = Prover::new(loaded, backend);
     match hosting {
@@ -123,7 +123,7 @@ pub struct Prover {
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
-    backend: &'static dyn ply_eval::Provider,
+    backend: Arc<dyn ply_eval::Provider>,
 }
 
 /// The binding and the reactor a `law/host` runs against. The factory is owned rather than
@@ -136,7 +136,7 @@ pub struct Hosting {
 
 impl Prover {
     /// `backend` is the unit built from `loaded`, laws' and clauses' roots included.
-    pub fn new(loaded: &Loaded, backend: &'static dyn ply_eval::Provider) -> Prover {
+    pub fn new(loaded: &Loaded, backend: Arc<dyn ply_eval::Provider>) -> Prover {
         let laws = (loaded.front.check.laws.iter().enumerate())
             .map(|(at, law)| (law.key.clone(), at))
             .collect();
@@ -151,18 +151,9 @@ impl Prover {
     /// The unit, attached once per thread: claims are judged on whichever threads the program asks from.
     fn compiled(&self) -> Rc<dyn ply_eval::Compiled> {
         thread_local! {
-            static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
-                const { RefCell::new(Vec::new()) };
+            static ATTACHED: crate::support::Attached = const { RefCell::new(Vec::new()) };
         }
-        let key = std::ptr::from_ref(self.backend).cast::<()>() as usize;
-        ATTACHED.with(|attached| {
-            if let Some((_, c)) = attached.borrow().iter().find(|(k, _)| *k == key) {
-                return Rc::clone(c);
-            }
-            let c = self.backend.attach();
-            attached.borrow_mut().push((key, Rc::clone(&c)));
-            c
-        })
+        ATTACHED.with(|attached| crate::support::attached_on(attached, &self.backend))
     }
 
     /// A proposition's body root: its program-wide name in the unit.

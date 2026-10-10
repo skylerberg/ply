@@ -120,7 +120,7 @@ pub fn unit(path: &Path) -> ply_eval::Value {
 }
 
 /// The C backend over `loaded`, from the C handed over as the CLI hands it.
-pub fn backend(loaded: &ply_machine::load::Loaded) -> &'static dyn ply_eval::Provider {
+pub fn backend(loaded: &ply_machine::load::Loaded) -> std::sync::Arc<dyn ply_eval::Provider> {
     ply_machine::support::unit_of(&loaded.front, &unit_text(&loaded.root))
         .unwrap_or_else(|d| panic!("the unit compiles: {}", d.message))
 }
@@ -207,7 +207,10 @@ pub fn answer_for(module: &str, source: &str) -> ply_machine::runnable::Runnable
 
 /// The front end's answer for `source`, which has to check, and the unit compiled from it.
 #[track_caller]
-pub fn built(module: &str, source: &str) -> (ply_eval::Analysis, &'static ply_codegen::Unit) {
+pub fn built(
+    module: &str,
+    source: &str,
+) -> (ply_eval::Analysis, std::sync::Arc<ply_codegen::Unit>) {
     let files = ply_machine::builds::module_files(&[(module, source)]);
     let program = ply_machine::builds::checked_program(&files)
         .unwrap_or_else(|d| panic!("the fixture checks: {d}"));

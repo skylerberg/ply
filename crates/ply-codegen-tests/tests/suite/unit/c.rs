@@ -349,8 +349,8 @@ fn a_unit_lists_the_arithmetic_a_type_states_and_calls_it() {
     let miscounted = made
         .unit
         .replace(stated, "\"m.N m.held - m.neg m.add m.add m.neg m.of\\n\"");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(made.front.answer.clone()));
-    let source = ply_codegen::source::Source::from_analysis(front);
+    let source =
+        ply_codegen::source::Source::from_analysis(std::sync::Arc::new(made.front.answer.clone()));
     {
         let _config = fixture::CONFIG.read().unwrap_or_else(|e| e.into_inner());
         match ply_codegen::c::load_unit(&miscounted, Some(&source), "unit") {
@@ -393,8 +393,7 @@ fn a_unit_stating_a_function_of_more_than_the_value_is_refused() {
     let stated = "\"m.Box m.area -\\n\"";
     assert!(made.unit.contains(stated), "the unit states `Box`'s key");
     made.unit = made.unit.replace(stated, "\"m.Box m.scaled -\\n\"");
-    let front: &'static ply_eval::Analysis = Box::leak(Box::new(made.front.answer));
-    let source = ply_codegen::source::Source::from_analysis(front);
+    let source = ply_codegen::source::Source::from_analysis(std::sync::Arc::new(made.front.answer));
     let _config = fixture::CONFIG.read().unwrap_or_else(|e| e.into_inner());
     match ply_codegen::c::load_unit(&made.unit, Some(&source), "unit") {
         Ok(_) => panic!("a key that takes two words was bound"),
@@ -416,9 +415,9 @@ fn the_first_backend_on_the_handing_thread_takes_the_unit_it_loaded() {
     let unit = ply_codegen::Unit::handed(front, answer.unit).expect("this host has a C compiler");
     let mapped = || ply_codegen::c::UNITS_MAPPED.load(Relaxed);
     let before = mapped();
-    let first = unit.attach();
+    let first = std::sync::Arc::clone(&unit).attach();
     assert_eq!(mapped(), before, "the first backend mapped the unit again");
-    let second = unit.attach();
+    let second = std::sync::Arc::clone(&unit).attach();
     assert_eq!(mapped(), before + 1, "a later backend maps the unit anew");
     assert_eq!(unit.compilation().units, 2);
     for backend in [&first, &second] {
@@ -427,6 +426,22 @@ fn the_first_backend_on_the_handing_thread_takes_the_unit_it_loaded() {
             Some(Value::Int(42))
         );
     }
+}
+
+/// A program loaded and let go leaves nothing behind: its unit, the front end's answer it holds and
+/// its loaded image go with the last backend over it.
+#[test]
+fn a_unit_nothing_holds_is_freed() {
+    use ply_eval::Provider;
+    let answer = fixture::answered(&[("m", "fn double(x: Int) -> Int = x * 2\n")]);
+    let _config = fixture::CONFIG.read().unwrap_or_else(|e| e.into_inner());
+    let unit = ply_codegen::Unit::handed(&answer.front.answer, answer.unit)
+        .expect("this host has a C compiler");
+    let held = std::sync::Arc::downgrade(&unit);
+    let backend = unit.attach();
+    assert!(held.upgrade().is_some(), "a backend holds its unit");
+    drop(backend);
+    assert!(held.upgrade().is_none(), "a unit nothing holds was kept");
 }
 
 #[test]
