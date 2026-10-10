@@ -35,8 +35,8 @@ import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
 import embed (EmbedFile, EmbedRead, EmbedWant, ItemWants, embed_key, want_of_key, wants_by_item)
 import pkg (PackageSources, Judged, judged, judged_bin, placeless, place_token, package_sources_bin)
-import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, path_span,
-                import_module_name, source_bin)
+import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_at, import_binder,
+                path_span, import_module_name, source_bin)
 import parsing (Ident, Span, ParseDiag, span_bin)
 import infer (DefInfo, TestInfo, walk_order)
 import hash (Fixed, FixedTest, FixedLaw, Fixing, Shapes, Shape, no_fixing, module_forms,
@@ -643,8 +643,11 @@ pub fn owners_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
               _ -> acc,
             },
         ),
+        // Its text, or its imports alone: one naming no module there is, or two binding one name.
         refusing: fold(m.reading.given, false, |b: Bool, g: ParsedSource|
-          b || fold(g.diags, false, |c: Bool, d: Diag| c || d.severity == b"error")),
+            b || fold(g.diags, false, |c: Bool, d: Diag| c || d.severity == b"error"))
+          || len(m.present) < len(m.names)
+          || map_len(colliding(m.raw.imports)) > 0,
       }
     },
   };
@@ -851,7 +854,7 @@ fn owner_facts(named: Named, owner: Bytes) -> OwnerFacts / {memo.read, abort.rai
 pub fn group_answer_of(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let asked = decoded(input, group_named_bin(), "a group's names");
   if !current(asked) { bin::encode(owned::no_group(), owned::group_answer_bin()) } else {
-    match memo.offered() {
+    match taken_whole(asked) {
       Some(o) -> {
         group_reads_of(asked);
         o
@@ -892,6 +895,39 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   }
 }
 
+/// What a check of the whole module offered for the group `asked`, where it offered one: a group
+/// asked of a module the store holds no group of is answered with the rest of them, by one check of
+/// the module, whatever asks it first.
+fn taken_whole(asked: GroupNamed) -> Option<Bytes> / {memo.read, abort.raise} =
+  match memo.offered() {
+    Some(o) -> Some(o),
+    None -> {
+      memo.ask(
+        whole_query(),
+        bin::encode(
+          { module: asked.module, shipped: asked.shipped, tested: asked.tested },
+          named_bin(),
+        ),
+      );
+      memo.offered()
+    },
+  }
+
+pub fn whole_query() -> Bytes = b"whole"
+
+/// Nothing, read as `Named` says, once a check of the module whole has offered each of its groups
+/// what it answers, where the store holds none of them: what that check reads is this record's, not
+/// any group's, and what it answers moves nothing that reads it.
+pub fn whole_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let named = decoded(input, named_bin(), "a module's name");
+  let read = owners_read(named);
+  if read.found {
+    offered_whole(named, read, groups_named(named, read));
+    ()
+  };
+  b""
+}
+
 /// What a check of the group `asked` stands on, read without checking it: what a group whose answer
 /// a check of its whole module offered reads. Each entry it names carries the digest of all the
 /// entry reaches, so the entries those name are not read.
@@ -904,7 +940,12 @@ fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
     "a group's imports",
   );
   let targets = push(map(imported, |x: Imported| x.target), asked.module);
-  let mentions = fold(asked.owners, [], |acc: List<Mention>, o: Bytes|
+  let selected = fold(imported, [], |acc: List<Mention>, x: Imported|
+    match x.decl.kind {
+      INames(ns) -> concat(acc, map(ns, |n: Ident| { module: x.target, name: n.name })),
+      _ -> acc,
+    });
+  let mentions = fold(asked.owners, selected, |acc: List<Mention>, o: Bytes|
     concat(acc, owner_facts(named, o).mentions));
   let modules = fold(mentions, map_new(), |acc: Map<Bytes, Bool>, m: Mention|
     if m.module == asked.module {
@@ -1384,7 +1425,6 @@ pub fn header_text_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       None -> b"",
       Some(m) -> {
         let written = filter(m.imports, is_written);
-        let selecting = |d: ImportDecl| match d.kind { INames(_) -> true, _ -> false };
         if !fold(written, false, |b: Bool, d: ImportDecl| b || selecting(d)) { b"" } else {
           blanked(
             bytes_slice(src, 0, max_of(map(written, |d: ImportDecl| d.span.end))),
@@ -1397,6 +1437,19 @@ pub fn header_text_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 }
 
 fn max_of(xs: List<Int>) -> Int = fold(xs, 0, |m: Int, x: Int| if x > m { x } else { m })
+
+fn selecting(d: ImportDecl) -> Bool = match d.kind { INames(_) -> true, _ -> false }
+
+/// The module names more than one of `imports` binds, which their module refuses alone.
+fn colliding(imports: List<ImportDecl>) -> Map<Bytes, Bool> / {abort.raise} = {
+  let counted = fold(imports, map_new(), |acc: Map<Bytes, Int>, d: ImportDecl|
+    match import_binder(d) {
+      Some(b) -> map_insert(acc, b, match map_get(acc, b) { Some(n) -> n + 1, None -> 1 }),
+      None -> acc,
+    });
+  map_fold(counted, map_new(), |acc: Map<Bytes, Bool>, b: Bytes, n: Int|
+    if n > 1 { map_insert(acc, b, true) } else { acc })
+}
 
 /// What a module's imports alone refuse, read as `Named` says: each name one selects that its
 /// module does not declare, at its place. A group of the module writes only the imports it reads.
@@ -1686,6 +1739,7 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
     { name: context_query(), definition: b"checking.context_answer", body: context_answer },
     { name: setting_query(), definition: b"checking.setting_answer", body: setting_answer },
     { name: wants_query(), definition: b"checking.wants_answer", body: wants_answer },
+    { name: whole_query(), definition: b"checking.whole_answer", body: whole_answer },
     { name: published_query(), definition: b"checking.published_answer", body: published_answer },
     {
       name: group_imports_query(),
@@ -3013,6 +3067,52 @@ test "reordering, relabelling and re-exporting leave an answer through the store
   )
 }
 
+test "an opaque type's module edited and undone leaves an answer through the store the fresh one" {
+  let lib = b"pub opaque type Count = new { n: Int }\n\npub fn zero() -> Count = { n: 0 }\n\npub fn next(c: Count) -> Count = { n: c.n + 1 }\n\npub fn value(c: Count) -> Int = c.n\n";
+  let s0 = [
+    { name: b"lib", src: lib },
+    {
+      name: b"app",
+      src: b"import lib\n\npub fn two() -> Int = lib::value(lib::next(lib::next(lib::zero())))\n\ntest \"two steps\" {\n  assert_eq(two(), 2)\n}\n",
+    },
+  ];
+  let at = |what: Bytes, text: Bytes|
+    [step(what, with_module(s0, b"lib", text)), step(bytes_concat(what, b", undone"), s0)];
+  assert_eq(
+    disagreements(
+      concat(
+        [step(b"cold", s0)],
+        concat(
+          at(b"a function added", bytes_concat(lib, b"\npub fn gate_added() -> Int = 7\n")),
+          concat(
+            at(b"a body that now raises", join(bytes_split(lib, b"= { n: 0 }"), b"= panic(\"x\")")),
+            concat(
+              at(b"a function made private", join(bytes_split(lib, b"pub fn zero"), b"fn zero")),
+              concat(
+                at(
+                  b"a public function renamed",
+                  join(bytes_split(lib, b"pub fn zero()"), b"pub fn zero_moved()"),
+                ),
+                concat(
+                  at(
+                    b"a function removed",
+                    join(bytes_split(lib, b"\npub fn value(c: Count) -> Int = c.n\n"), b"\n"),
+                  ),
+                  at(
+                    b"a test added",
+                    bytes_concat(lib, b"\ntest \"the gate's test\" {\n  assert(true)\n}\n"),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+    [],
+  )
+}
+
 // `said` reads `say`, whose module refuses while its body panics, so its module is checked a group
 // at a time when it comes back; its test is labelled as it is named, and hashes apart from it.
 test "a test labelled as the function it tests hashes apart from it, through a refusal and back" {
@@ -3655,6 +3755,30 @@ test "a module refuses with what its refusing groups say, and nothing a group re
     fold(f.answers, [], |acc: List<Bytes>, a: Answered|
       concat(acc, map(a.answer.refused, |d: Diag| d.message))),
     [b"unknown name `missing`"],
+  )
+}
+
+test "an import that names no module refuses its module, though nothing reads it" {
+  let sources = [{ name: b"app", src: b"import nonesuch\npub fn f() -> Int = 1\n" }];
+  let f = fixed_over(nothing_held(), sources, []);
+  assert_eq(
+    fold(f.answers, [], |acc: List<Bytes>, a: Answered|
+      concat(acc, map(a.answer.refused, |d: Diag| d.code))),
+    [b"E0106"],
+  )
+}
+
+test "two imports that bind one module name refuse their module, though nothing reads either" {
+  let sources = [
+    { name: b"net", src: b"pub fn x() -> Int = 1\n" },
+    { name: b"lib.net", src: b"pub fn y() -> Int = 2\n" },
+    { name: b"app", src: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
+  ];
+  let f = fixed_over(nothing_held(), sources, []);
+  assert_eq(
+    fold(f.answers, [], |acc: List<Bytes>, a: Answered|
+      concat(acc, map(a.answer.refused, |d: Diag| d.code))),
+    [b"E0110"],
   )
 }
 
