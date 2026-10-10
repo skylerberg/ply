@@ -8,41 +8,29 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 
+use crate::support::declared::{labelled, performed, shipped};
+use ply_sketch::Sketch;
+
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
 /// Registrations resolve against the atoms the program performs; the declaration names no label.
-const DRIVER: &str = r#"
-fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn], net.local_port[listener], net.local_port[conn]} = {
-  let l = net.listen[listener](port);
-  let _ = net.local_port[listener](l);
-  let c = net.accept[listener](l);
-  let _ = net.local_port[conn](c);
-  let got = net.recv[conn](c, 16, 5000);
-  let sent = net.send[conn](c, payload, 5000);
-  net.close[conn](c);
-  net.close[listener](l);
-  bytes_len(bytes_or_empty(got)) + int_or_zero(sent)
-}
-
-fn client(host: String, port: Int) -> Int / {net.write[conn]} =
-  match net.connect[conn](host, port, 5000) { Some(c) -> c, None -> 0 }
-
-fn bytes_or_empty(answer: Option<Bytes>) -> Bytes =
-  match answer { Some(bs) -> bs, None -> b"" }
-
-fn int_or_zero(answer: Option<Int>) -> Int =
-  match answer { Some(n) -> n, None -> 0 }
-"#;
-
-/// The driver over the shipped `std.net`: only its declaration binds the shipped handlers, and a
-/// program reaches it by importing it.
-fn fixture() -> String {
-    format!("import std.net (net)\n{DRIVER}")
-}
-
-fn check(source: &str) -> CheckOutput {
-    crate::support::answered::checked("app", source).check
+/// A driver over the shipped `std.net`, whose `every_op` listens, accepts, reads its ports, receives,
+/// sends and closes, and whose `client` connects.
+fn fixture() -> CheckOutput {
+    shipped(Sketch::program())
+        .def(
+            "app",
+            "every_op",
+            vec![
+                labelled(EFFECT, "listener", Mode::Write),
+                labelled(EFFECT, "conn", Mode::Write),
+                performed(EFFECT, "listener", Mode::Read, "local_port"),
+                performed(EFFECT, "conn", Mode::Read, "local_port"),
+            ],
+        )
+        .def("app", "client", vec![labelled(EFFECT, "conn", Mode::Write)])
+        .check()
 }
 
 /// The shipped declaration as the binder reads it, which a test may change as no source can.
@@ -54,7 +42,7 @@ fn declared(check: &mut CheckOutput) -> &mut ply_eval::EffectInfo {
 }
 fn bind(net: Arc<dyn Net>) -> HostBinding {
     registry(net)
-        .bind(&check(&fixture()))
+        .bind(&fixture())
         .expect("the declaration and the registration agree")
 }
 
@@ -262,7 +250,7 @@ fn only_reading_what_a_socket_is_is_repeatable() {
 
 #[test]
 fn a_declaration_without_nondet_refuses_the_handler() {
-    let mut weakened = check(&fixture());
+    let mut weakened = fixture();
     declared(&mut weakened).nondet = false;
     let diagnostics = registry(Arc::new(TcpHost::new()))
         .bind(&weakened)
@@ -281,7 +269,7 @@ fn a_declaration_without_nondet_refuses_the_handler() {
 /// binds. That the registry names only what this tree declares is `unit::registry`'s to hold.
 #[test]
 fn an_operation_the_declaration_lacks_binds_nothing_and_the_rest_binds() {
-    let mut renamed = check(&fixture());
+    let mut renamed = fixture();
     let net = declared(&mut renamed);
     let recv = net
         .ops
@@ -1077,32 +1065,23 @@ fn open(binding: &HostBinding, rt: &dyn HostRuntime) -> (i64, i64) {
     (listener, accept(binding, rt, listener))
 }
 
-/// [`DRIVER`] with its listener created over TLS.
-const TLS_DRIVER: &str = r#"
-fn serve_tls(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
-  let l = net.listen_tls[listener](port, "api");
-  let c = net.accept[listener](l);
-  let got = net.recv[conn](c, 4096, 5000);
-  let sent = net.send[conn](c, payload, 5000);
-  net.close[conn](c);
-  net.close[listener](l);
-  bytes_len(unwrap_bytes(got)) + unwrap_int(sent)
-}
-
-fn unwrap_bytes(answer: Option<Bytes>) -> Bytes =
-  match answer { Some(bs) -> bs, None -> b"" }
-
-fn unwrap_int(answer: Option<Int>) -> Int =
-  match answer { Some(n) -> n, None -> 0 }
-"#;
-
-fn tls_fixture() -> String {
-    format!("import std.net (net)\n{TLS_DRIVER}")
+/// A driver whose listener is created over TLS, serving one connection.
+fn tls_fixture() -> CheckOutput {
+    shipped(Sketch::program())
+        .def(
+            "app",
+            "serve_tls",
+            vec![
+                labelled(EFFECT, "listener", Mode::Write),
+                labelled(EFFECT, "conn", Mode::Write),
+            ],
+        )
+        .check()
 }
 
 fn bind_tls(net: Arc<dyn Net>) -> HostBinding {
     registry(net)
-        .bind(&check(&tls_fixture()))
+        .bind(&tls_fixture())
         .expect("the declaration and the registration agree")
 }
 

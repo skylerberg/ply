@@ -348,9 +348,7 @@ fn net() -> CheckOutput {
 }
 
 fn tls_listing() -> HostListing {
-    tls_registry()
-        .preview(&net())
-        .expect("the fixture binds")
+    tls_registry().preview(&net()).expect("the fixture binds")
 }
 
 #[test]

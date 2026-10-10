@@ -1,4 +1,3 @@
-//! Shared harness for the tests that need a real peer.
+//! What the host tests share.
 
-pub mod answered;
-pub mod cluster;
+pub mod declared;

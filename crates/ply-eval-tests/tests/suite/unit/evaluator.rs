@@ -1,7 +1,7 @@
-use crate::sketch::Sketch;
 use ply_eval::compiled::{Compiled, Entered};
 use ply_eval::host::{HostRuntime, MachineId, Pending};
 use ply_eval::{Analysis, DefHash, Diagnostic, Machine, Span, Symbol, Value, codes};
+use ply_sketch::Sketch;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;

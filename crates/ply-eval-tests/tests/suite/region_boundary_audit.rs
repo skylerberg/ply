@@ -141,4 +141,3 @@ fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
     assert_eq!(arena.get(fresh), Some(&Value::Int(99)));
     arena.close(second);
 }
-

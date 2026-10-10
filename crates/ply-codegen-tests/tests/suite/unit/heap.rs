@@ -290,10 +290,12 @@ fn a_record_is_laid_out_in_sorted_field_order_whatever_order_it_was_written_in()
 #[test]
 fn an_indexed_field_reads_where_a_search_of_its_shape_finds_it() {
     let mut l = layouts();
-    let names: Vec<Symbol> = ["a", "b", "z", "a", "q"].into_iter().map(Symbol::new).collect();
-    let shapes = [vec!["z", "a"], vec!["b"], vec!["q", "z", "b", "a"], vec![]].map(|fields| {
-        l.shape(fields.into_iter().map(Symbol::new).collect())
-    });
+    let names: Vec<Symbol> = ["a", "b", "z", "a", "q"]
+        .into_iter()
+        .map(Symbol::new)
+        .collect();
+    let shapes = [vec!["z", "a"], vec!["b"], vec!["q", "z", "b", "a"], vec![]]
+        .map(|fields| l.shape(fields.into_iter().map(Symbol::new).collect()));
     l.index_fields(&names);
     for shape in shapes {
         for (index, name) in names.iter().enumerate() {

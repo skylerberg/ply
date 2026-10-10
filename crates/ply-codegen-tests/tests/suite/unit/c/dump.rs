@@ -45,7 +45,6 @@ fn first(list: &Value) -> Value {
     items.iter().next().expect("a first item").clone()
 }
 
-
 /// [`holding`] with the module that holds it, read from source 0.
 fn placed(footprint: Value) -> Value {
     let module = record(vec![
@@ -136,12 +135,18 @@ fn a_root_and_a_constructor_read_the_carries_published_for_them() {
                     "CRecord",
                     vec![Value::list(vec![
                         record(vec![("name", Value::bytes("n")), ("carry", plain())]),
-                        record(vec![("name", Value::bytes("v")), ("carry", width(IntTy::I16))]),
+                        record(vec![
+                            ("name", Value::bytes("v")),
+                            ("carry", width(IntTy::I16)),
+                        ]),
                     ])],
                 ),
             ]),
         ),
-        ("answer", Value::ctor("CSum", vec![Value::list(vec![var(0)])])),
+        (
+            "answer",
+            Value::ctor("CSum", vec![Value::list(vec![var(0)])]),
+        ),
         ("witnesses", Value::list(vec![])),
     ]);
     let apply = record(vec![
@@ -177,7 +182,10 @@ fn a_root_and_a_constructor_read_the_carries_published_for_them() {
     let [pick, apply] = &front.emitter_roots[..] else {
         panic!("two roots: {:?}", front.emitter_roots);
     };
-    assert_eq!((pick.root.as_str(), pick.arity, pick.pure), ("m.pick", 2, true));
+    assert_eq!(
+        (pick.root.as_str(), pick.arity, pick.pure),
+        ("m.pick", 2, true)
+    );
     assert!(!pick.constant());
     assert_eq!(
         pick.params,

@@ -302,7 +302,10 @@ impl TesterHandler {
             Err(refused) => return Ok(err(diags_value(&refused.diagnostics))),
         };
         // Opened outside the lock: a test of an earlier unit may be running meanwhile.
-        let provider = match unit.map(|library| unit_of(&loaded.front, &library)).transpose() {
+        let provider = match unit
+            .map(|library| unit_of(&loaded.front, &library))
+            .transpose()
+        {
             Ok(provider) => provider,
             Err(diagnostic) => return Ok(err(diags_value(&[diagnostic]))),
         };

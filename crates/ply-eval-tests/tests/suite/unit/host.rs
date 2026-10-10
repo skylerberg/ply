@@ -1,6 +1,6 @@
-use crate::sketch::{Sketch, atom, operation};
 use ply_eval::host::*;
 use ply_eval::{CheckOutput, Diagnostic, EffectAtom, Footprint, Mode, Resource, Symbol, codes};
+use ply_sketch::{Sketch, atom, operation};
 use std::sync::Arc;
 
 struct Never;
@@ -400,8 +400,16 @@ fn any_expands_to_the_labels_an_inferred_row_names_by_operation() {
                 ("put", Mode::Write, true),
             ],
         )
-        .def("m", "lookup", vec![operation("m.db", "users", Mode::Read, "get")])
-        .def("m", "store", vec![operation("m.db", "orders", Mode::Write, "put")])
+        .def(
+            "m",
+            "lookup",
+            vec![operation("m.db", "users", Mode::Read, "get")],
+        )
+        .def(
+            "m",
+            "store",
+            vec![operation("m.db", "orders", Mode::Write, "put")],
+        )
         .check();
     let binding = registry(vec![
         op("db", "get", HostResource::Any),
@@ -532,9 +540,7 @@ fn a_footprint_that_reaches_only_deterministic_handlers_reaches_nothing_that_act
         determinism: Determinism::Deterministic,
         ..op("db", "get", HostResource::Any)
     };
-    let binding = registry(vec![deterministic])
-        .bind(&db())
-        .expect("binds");
+    let binding = registry(vec![deterministic]).bind(&db()).expect("binds");
     let touched = Footprint::from_atoms([EffectAtom::new(
         "db",
         Resource::Named(Symbol::new("users")),
@@ -641,7 +647,11 @@ fn a_registration_names_the_declared_effect_and_resolves_to_the_program_wide_one
     // `db` declared in the module `store`, and read there.
     let check = Sketch::program()
         .effect("store", "db", true, &[("get", Mode::Read, true)])
-        .def("store", "lookup", vec![atom("store.db", "users", Mode::Read)])
+        .def(
+            "store",
+            "lookup",
+            vec![atom("store.db", "users", Mode::Read)],
+        )
         .check();
 
     let binding = registry(vec![op("db", "get", named("users"))])
@@ -664,7 +674,11 @@ fn a_registration_may_spell_a_program_wide_name_under_the_reserved_root() {
     // `app` writes through the shipped `std.net`'s `net`.
     let shipped = Sketch::program()
         .effect("std.net", "net", true, &[("send", Mode::Write, true)])
-        .def("app", "out", vec![atom("std.net.net", "socket", Mode::Write)])
+        .def(
+            "app",
+            "out",
+            vec![atom("std.net.net", "socket", Mode::Write)],
+        )
         .check();
     let binding = registry(vec![op("std.net.net", "send", named("socket"))])
         .bind(&shipped)
@@ -702,7 +716,11 @@ fn a_registration_spelling_the_program_wide_name_is_e0421() {
     // `db` declared in the module `store`, and read there.
     let check = Sketch::program()
         .effect("store", "db", true, &[("get", Mode::Read, true)])
-        .def("store", "lookup", vec![atom("store.db", "users", Mode::Read)])
+        .def(
+            "store",
+            "lookup",
+            vec![atom("store.db", "users", Mode::Read)],
+        )
         .check();
 
     let diagnostics = registry(vec![op("store.db", "get", named("users"))])

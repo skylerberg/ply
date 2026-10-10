@@ -1,0 +1,302 @@
+//! `std.sqlite` over files: a program's databases under a root the host binds, held to that root by
+//! the host's confinement and by the engine's own authorizer.
+
+import harness (Here, Shipped, answered, bound_main, called, loaded, project, working)
+import cli.machine (machine, Called, default_options)
+import std.fs
+import std.fs (fs, Entry, Dir)
+import std.list (sort_by)
+import std.value (Value, VInt, VList, VStr)
+
+effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+
+fn sqlite_program() -> String =
+  \\import std.sql (stmt, PInt, PText, Row)
+  \\import std.sqlite
+  \\import std.sqlite (sqlite, sql, Busy, Refused, Unopened, Create, ReadOnly, ReadWrite, Limits, Options)
+  \\
+  \\fn roomy() -> Limits = { sql_bytes: 10000, params: 100, rows: 100000, bytes: 10000000, steps: 1000000 }
+  \\
+  \\fn plain() -> Options = { strict: true, busy_ms: 50, statements: 8 }
+  \\
+  \\fn s(text: String) -> sqlite::Bound / {sql.refused, abort.raise} = sqlite::bound(stmt(text), [])
+  \\
+  \\fn refusal<a | e>(go: () -> a / {sql.refused | e}) -> String / e =
+  \\  match try[sql.refused] { go() } {
+  \\    Ok(_) -> "ran",
+  \\    Err(Busy) -> "busy",
+  \\    Err(Refused(_)) -> "refused",
+  \\    Err(Unopened(_)) -> "unopened",
+  \\    Err(_) -> "other",
+  \\  }
+  \\
+  \\fn names<[d]>(conn: Hold<sqlite::Connection<[d]>>) -> List<String> / {hold.read, sqlite.query[d], sql.refused, abort.raise} =
+  \\  map(sqlite::query(conn, s("select name from person order by id"), roomy()), |row: Row|
+  \\    sqlite::text(row, "name"))
+  \\
+  \\// Written, closed, opened again and read back.
+  \\pub fn round_trip() -> List<String> / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} = {
+  \\  with_hold[first](sqlite::opening[app]("data.db", Create, plain()), |c| sqlite::close(c)) { conn -> {
+  \\    sqlite::execute(conn, s("create table person (id integer primary key, name text not null) strict"), roomy());
+  \\    sqlite::transaction(conn, || {
+  \\      sqlite::execute(conn, sqlite::bound(stmt("insert into person (name) values (?1)"), [PText("Ada")]), roomy());
+  \\      sqlite::execute(conn, sqlite::bound(stmt("insert into person (name) values (?1)"), [PText("Grace")]), roomy())
+  \\    })
+  \\  } };
+  \\  with_hold[second](sqlite::opening[app]("data.db", ReadOnly, plain()), |c| sqlite::close(c)) { conn -> names(conn) }
+  \\}
+  \\
+  \\/// What the engine itself answers a statement the reader would have refused first.
+  \\fn raw(text: String) -> String / {sqlite.read[app], sqlite.write[app]} =
+  \\  match sqlite.open[app]("escape.db", Create, plain()) {
+  \\    Err(f) -> f.kind,
+  \\    Ok(conn) -> {
+  \\      let said = match sqlite.execute[app](conn, text, [], roomy()).failure {
+  \\        Some(f) -> f.kind,
+  \\        None -> "ran",
+  \\      };
+  \\      sqlite.close[app](conn);
+  \\      said
+  \\    },
+  \\  }
+  \\
+  \\pub fn escapes(outside: String) -> List<String> / {sqlite.read[app], sqlite.write[app]} =
+  \\  [
+  \\    raw("attach database '" ++ outside ++ "/attached.db' as other"),
+  \\    raw("attach database 'file:" ++ outside ++ "/uri.db?mode=rwc' as other"),
+  \\    raw("vacuum into '" ++ outside ++ "/vacuumed.db'"),
+  \\    raw("select readfile('" ++ outside ++ "/secret.txt')"),
+  \\    raw("select writefile('" ++ outside ++ "/written.txt', 'x')"),
+  \\    raw("pragma temp_store_directory = '" ++ outside ++ "'"),
+  \\    raw("select load_extension('" ++ outside ++ "/evil')"),
+  \\  ]
+  \\
+  \\pub fn opens(path: String) -> String / {sqlite.read[app], sqlite.write[app], abort.raise} =
+  \\  refusal(|| with_hold[opened_at](sqlite::opening[app](path, Create, plain()), |c| sqlite::close(c)) { conn ->
+  \\    sqlite::execute(conn, s("create table if not exists t (n integer) strict"), roomy()) })
+  \\
+  \\pub fn backs_up(path: String) -> String / {sqlite.read[app], sqlite.write[app], abort.raise} =
+  \\  refusal(|| with_hold[source](sqlite::opening[app]("data.db", ReadWrite, plain()), |c| sqlite::close(c)) { conn ->
+  \\    sqlite::backup(conn, path) })
+  \\
+  \\pub fn unbound() -> String / {sqlite.read[nowhere], sqlite.write[nowhere], abort.raise} =
+  \\  refusal(|| with_hold[nowhere_db](sqlite::opening[nowhere]("x.db", Create, plain()), |c| sqlite::close(c)) { conn -> 0 })
+  \\
+  \\// One connection writing in a transaction, another reading and then trying to write.
+  \\pub fn together() -> List<String> / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
+  \\  with_hold[one](sqlite::opening[app]("data.db", ReadWrite, plain()), |c| sqlite::close(c)) { one ->
+  \\    with_hold[two](sqlite::opening[app]("data.db", ReadWrite, plain()), |c| sqlite::close(c)) { two -> {
+  \\      let during = sqlite::transaction(one, || {
+  \\        sqlite::execute(one, sqlite::bound(stmt("insert into person (name) values (?1)"), [PText("Edsger")]), roomy());
+  \\        [
+  \\          string_of_int(len(names(two))),
+  \\          refusal(|| sqlite::execute(two, s("insert into person (name) values ('Barbara')"), roomy())),
+  \\          refusal(|| sqlite::transaction(two, || 0)),
+  \\          string_of_int(len(names(one))),
+  \\        ]
+  \\      });
+  \\      push(push(during, string_of_int(len(names(two)))), refusal(|| sqlite::execute(two, s("insert into person (name) values ('Barbara')"), roomy())))
+  \\    } } }
+  \\
+  \\fn string_of_int(n: Int) -> String = int_to_string(n)
+  \\
+  \\// A large answer read a page at a time, from a statement the connection keeps open between pages.
+  \\pub fn folded(rows: Int) -> Int / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
+  \\  with_hold[folding](sqlite::opening[app]("fold.db", Create, plain()), |c| sqlite::close(c)) { conn -> {
+  \\    sqlite::execute(conn, s("create table if not exists n (i integer primary key) strict"), roomy());
+  \\    sqlite::execute(conn, s("delete from n"), roomy());
+  \\    sqlite::execute(
+  \\      conn,
+  \\      sqlite::bound(
+  \\        stmt("with recursive c(i) as (select 1 union all select i + 1 from c where i < ?1) insert into n select i from c"),
+  \\        [PInt(rows)],
+  \\      ),
+  \\      roomy(),
+  \\    );
+  \\    sqlite::fold_rows(conn, s("select i from n order by i"), roomy(), 64, 0, |acc: Int, row: Row|
+  \\      acc + sqlite::int(row, "i"))
+  \\  } }
+  \\
+  \\/// One scenario, written against any root.
+  \\fn scenario<[d]>() -> List<String> / {sqlite.read[d], sqlite.write[d], sql.refused, abort.raise} =
+  \\  with_hold[scene](sqlite::opening[d]("scene.db", Create, plain()), |c| sqlite::close(c)) { conn -> {
+  \\    sqlite::execute(conn, s("create table person (id integer primary key, name text not null unique) strict"), roomy());
+  \\    let made = sqlite::execute(conn, s("insert into person (name) values ('Ada'), ('Grace')"), roomy());
+  \\    let twice = refusal(|| sqlite::execute(conn, s("insert into person (name) values ('Ada')"), roomy()));
+  \\    let undone = refusal(|| sqlite::transaction(conn, || {
+  \\      sqlite::execute(conn, s("delete from person"), roomy());
+  \\      sqlite::execute(conn, s("insert into person (id, name) values (1, null)"), roomy())
+  \\    }));
+  \\    let clocked = refusal(|| sqlite::execute(conn, sqlite::bound(stmt("insert into person (name) values (datetime(?1))"), [PText("now")]), roomy()));
+  \\    let dated = map(sqlite::query(conn, s("select date('2024-02-28', '+2 days') as d"), roomy()), |row: Row|
+  \\      sqlite::text(row, "d"));
+  \\    let loose = refusal(|| sqlite::execute(conn, s("create table loose (a)"), roomy()));
+  \\    concat_all([[int_to_string(made.rows), int_to_string(made.last_row_id), twice, undone, clocked, loose], dated, names(conn)])
+  \\  } }
+  \\
+  \\fn concat_all(lists: List<List<String>>) -> List<String> =
+  \\  fold(lists, [], |acc: List<String>, list: List<String>| fold(list, acc, |a: List<String>, x: String| push(a, x)))
+  \\
+  \\pub fn on_a_file() -> List<String> / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
+  \\  scenario[app]()
+  \\
+  \\pub fn on_the_twin() -> List<String> / {sql.refused, abort.raise} =
+  \\  sqlite::in_memory[app](|| scenario[app]())
+  \\
+  \\// A connection its entry never closes.
+  \\pub fn left_open() -> Int / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} = {
+  \\  let conn = sqlite::opening[app]("left.db", Create, plain());
+  \\  with_hold[left](conn, |_: sqlite::Connection<[app]>| ()) { held -> {
+  \\    sqlite::execute(held, s("create table if not exists t (n integer) strict"), roomy());
+  \\    sqlite::execute(held, s("insert into t values (1)"), roomy()).rows
+  \\  } }
+  \\}
+  \\
+  \\fn main() -> Int = 0
+  \\
+
+/// A host whose `app` is `root` in the working directory, beside an `outside` no label names.
+fn rooted() -> Unit / {Here, Shipped, Driving, abort.raise} = {
+  let _ = fs.create_dir[cwd]("root");
+  let _ = fs.create_dir[cwd]("outside");
+  project([{ path: "inner.ply", text: sqlite_program() }]);
+  loaded({ ..default_options(), host: true, fs: [{ name: "app", path: working() ++ "/root" }] });
+  bound_main()
+}
+
+/// The code `entry` raised, or none where it answered.
+fn refused(entry: String, args: List<Value>) -> Option<Bytes> / {Driving} =
+  match called(entry, args) { Err(d) -> Some(d.code), Ok(_) -> None }
+
+fn strings(values: List<String>) -> Value = VList(map(values, VStr))
+
+/// Every file below `dir`, by its path from it, a link to a directory among them.
+fn files(dir: String) -> List<String> / {Here, abort.raise} =
+  match fs.walk[cwd](dir) {
+    None -> [],
+    Some(entries) -> sort_by(
+      fold(entries, [], |acc: List<String>, e: Entry| match e.kind {
+        Dir -> acc,
+        _ -> push(acc, string_slice(e.path, string_len(dir) + 1, string_len(e.path))),
+      }),
+      |a: String, b: String| compare(a, b),
+    ),
+  }
+
+fn prefix(path: String, n: Int) -> Bytes / {Here, abort.raise} =
+  match fs.read_file[cwd](path) { Some(b) -> bytes_slice(b, 0, n), None -> b"" }
+
+fn at(path: String) -> String / {Here, abort.raise} = working() ++ "/" ++ path
+
+test/nondet "a database written and closed is read back from its file" {
+  rooted();
+  assert_eq(answered("round_trip", []), strings(["Ada", "Grace"]));
+  machine.drop[run]();
+  let file = match fs.read_file[cwd]("root/data.db") { Some(b) -> b, None -> b"" };
+  assert_eq(bytes_slice(file, 0, 16), b"SQLite format 3\x00");
+  // Bytes 18 and 19 are the file format's write and read versions: 2 is write-ahead logging.
+  assert_eq((bytes_at(file, 18), bytes_at(file, 19)), (2, 2));
+  // The log stays beside a database whose last connection only read.
+  assert_eq(files("root"), ["data.db", "data.db-shm", "data.db-wal"])
+}
+
+test/nondet "the engine itself refuses every way out of the root" {
+  rooted();
+  let _ = fs.write_file[cwd]("outside/secret.txt", b"secret");
+  let kinds = answered("escapes", [VStr(at("outside"))]);
+  machine.drop[run]();
+  // Attach, attach by URI, vacuum into, readfile, writefile, a pragma, load_extension.
+  assert_eq(kinds, strings(["refused", "refused", "refused", "statement", "statement", "refused", "statement"]));
+  assert_eq(files("outside"), ["secret.txt"]);
+  assert_eq(files("root"), ["escape.db"])
+}
+
+test/nondet "a path that leaves the root is refused before anything opens" {
+  rooted();
+  let outside = at("outside/abs.db");
+  fold(["../outside/up.db", outside, "a/../../outside/up.db"], (), |u: Unit, path: String|
+    assert_eq(refused("opens", [VStr(path)]), Some(b"E0452")));
+  let _ = answered("round_trip", []);
+  fold(["../outside/copy.db", outside], (), |u: Unit, path: String|
+    assert_eq(refused("backs_up", [VStr(path)]), Some(b"E0452")));
+  assert_eq(refused("unbound", []), Some(b"E0451"));
+  machine.drop[run]();
+  assert_eq(files("outside"), [])
+}
+
+test/nondet "a database is never opened through a symbolic link" {
+  rooted();
+  assert_eq(answered("opens", [VStr("real.db")]), VStr("ran"));
+  // A link to a database inside the root, a directory that is a link, and a link out of it.
+  let _ = fs.symlink[cwd]("root/link.db", at("root/real.db"));
+  let _ = fs.create_dir[cwd]("root/dir");
+  let _ = fs.symlink[cwd]("root/linked", at("root/dir"));
+  let _ = fs.symlink[cwd]("root/out.db", at("outside/out.db"));
+  let _ = fs.write_file[cwd]("outside/out.db", b"");
+  fold(["link.db", "linked/new.db"], (), |u: Unit, inside: String|
+    assert_eq(answered("opens", [VStr(inside)]), VStr("unopened")));
+  let _ = fs.symlink[cwd]("root/gone.db", at("outside/gone.db"));
+  fold(["out.db", "gone.db"], (), |u: Unit, leaving: String|
+    assert_eq(refused("opens", [VStr(leaving)]), Some(b"E0452")));
+  // The journal and the write-ahead log the engine would open beside a database, each a link to a
+  // file outside the root.
+  fold([("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")], (), |u: Unit, s: (String, String)| match s {
+    (stem, suffix) -> {
+      let name = "side" ++ stem ++ ".db";
+      let target = "outside/target" ++ suffix;
+      let _ = fs.symlink[cwd]("root/" ++ name ++ suffix, at(target));
+      assert_eq(answered("opens", [VStr(name)]), VStr("unopened"));
+      assert(!fs.exists[cwd](target), Some(target ++ " was written through the link"));
+      assert(!fs.exists[cwd]("root/" ++ name), Some(name ++ " was made"))
+    },
+  });
+  assert_eq(fs.read_file[cwd]("outside/out.db"), Some(b""));
+  assert_eq(files("outside"), ["out.db"]);
+  // A backup is written to a new file, never through a link already there, and a link to where
+  // nothing is outside the root leaves it whether or not anything is there.
+  let _ = answered("round_trip", []);
+  let _ = fs.symlink[cwd]("root/copy.db", at("root/missing.db"));
+  assert_eq(answered("backs_up", [VStr("copy.db")]), VStr("refused"));
+  assert(!fs.exists[cwd]("root/missing.db"), Some("the backup went through the link"));
+  let _ = fs.symlink[cwd]("root/away.db", at("outside/copied.db"));
+  assert_eq(refused("backs_up", [VStr("away.db")]), Some(b"E0452"));
+  assert_eq(answered("backs_up", [VStr("kept.db")]), VStr("ran"));
+  machine.drop[run]();
+  assert_eq(files("outside"), ["out.db"]);
+  assert_eq(prefix("root/kept.db", 16), b"SQLite format 3\x00")
+}
+
+// The reader's rows inside the writer's transaction, the second writer's statement and transaction,
+// the writer's own rows, then the reader's rows and its write after the commit.
+test/nondet "a reader sees what was committed and a second writer is busy" {
+  rooted();
+  let _ = answered("round_trip", []);
+  let together = answered("together", []);
+  machine.drop[run]();
+  assert_eq(together, strings(["2", "busy", "busy", "3", "3", "ran"]))
+}
+
+test/nondet "a fold reads a statement the connection keeps open between pages" {
+  rooted();
+  let sums = map([1000, 64, 1], |n: Int| answered("folded", [VInt(n)]));
+  machine.drop[run]();
+  assert_eq(sums, [VInt(500500), VInt(2080), VInt(1)])
+}
+
+test/nondet "a file and the twin answer one scenario alike" {
+  rooted();
+  let on_a_file = answered("on_a_file", []);
+  let on_the_twin = answered("on_the_twin", []);
+  machine.drop[run]();
+  assert_eq(on_a_file, on_the_twin);
+  assert_eq(on_a_file, strings(["2", "2", "other", "other", "refused", "refused", "2024-03-01", "Ada", "Grace"]))
+}
+
+test/nondet "a connection an entry leaves open is closed when the entry ends" {
+  rooted();
+  assert_eq(answered("left_open", []), VInt(1));
+  // Closed, so the log was folded into the database and removed with its index.
+  assert_eq(files("root"), ["left.db"]);
+  assert_eq(answered("left_open", []), VInt(1));
+  machine.drop[run]()
+}

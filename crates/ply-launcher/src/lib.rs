@@ -59,7 +59,10 @@ fn unlinked(why: String) -> Diagnostic {
         codes::INTERNAL_ERROR,
         format!("this executable's program cannot be entered: {why}"),
     )
-    .primary(ply_eval::Span::DUMMY, "this is Ply's fault, not the program's")
+    .primary(
+        ply_eval::Span::DUMMY,
+        "this is Ply's fault, not the program's",
+    )
 }
 
 /// The marker that says a shipped modules directory is whole; landed last, so a reader never sees
@@ -258,11 +261,7 @@ pub fn run(
             match count {
                 Some(asked) => {
                     let (answer, counted, sites) = crate::count::window_sampled(
-                        || {
-                            ply_codegen::rt::unbounded(|| {
-                                enter::enter_linked(opened, argv, binds)
-                            })
-                        },
+                        || ply_codegen::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
                         asked.every(),
                     );
                     // The entry's answer stands: the run happened, and a count that could not

@@ -1,13 +1,18 @@
-//! A program's checked declarations written out by hand: the effects it declares, the language's
-//! among them, and each definition's row, which is all a binding reads of a program.
+//! A program's checked declarations written out by hand, for the Rust tests of what reads them: the
+//! effects it declares, each definition's row, its tests and its modules' texts. A binding, a
+//! machine and a loader read no more of a program than this, so their tests compile none.
 
 use ply_eval::{
-    Analysis, CheckOutput, DefHash, DefInfo, EffectAtom, EffectInfo, Footprint, Mode, ModuleName,
-    OpInfo, Resource, SourceId, Span, Symbol, TestInfo,
+    Analysis, CheckOutput, DefHash, DefInfo, EffectAtom, EffectInfo, Footprint, Mode, ModuleInfo,
+    ModuleName, OpInfo, Resource, SourceId, Span, Symbol, TestInfo,
 };
 
 #[derive(Default)]
-pub struct Sketch(CheckOutput);
+pub struct Sketch {
+    check: CheckOutput,
+    /// Each module's path and text, its source the one its place here names.
+    texts: Vec<(String, String)>,
+}
 
 /// `name` as the module `module` declares it program-wide; the language's own are under no module.
 fn qualified(module: &str, name: &str) -> String {
@@ -19,17 +24,25 @@ fn qualified(module: &str, name: &str) -> String {
 }
 
 impl Sketch {
-    /// A program declaring nothing of its own: the effects every program is checked with.
+    /// A program declaring nothing of its own: the effects every program is checked with, as the
+    /// compiler's `prelude_effects` declares them.
     pub fn program() -> Sketch {
         Sketch::default()
             .effect(
                 "",
                 "task",
-                false,
+                true,
                 &[
                     ("spawn", Mode::Write, false),
                     ("join", Mode::Write, false),
                     ("yield", Mode::Write, false),
+                    ("cancel", Mode::Write, false),
+                    ("await", Mode::Write, false),
+                    ("channel", Mode::Write, false),
+                    ("send", Mode::Write, false),
+                    ("recv", Mode::Write, false),
+                    ("close", Mode::Write, false),
+                    ("select", Mode::Write, false),
                 ],
             )
             .effect(
@@ -79,7 +92,7 @@ impl Sketch {
             ops,
             span: Span::DUMMY,
         };
-        self.0.effects.insert(name, info);
+        self.check.effects.insert(name, info);
         self
     }
 
@@ -87,7 +100,7 @@ impl Sketch {
     pub fn def(mut self, module: &str, name: &str, atoms: Vec<EffectAtom>) -> Sketch {
         let full = Symbol::new(qualified(module, name));
         let footprint = Footprint::from_atoms(atoms);
-        let at = self.0.defs.len() as u32 * 10;
+        let at = self.check.defs.len() as u32 * 10;
         let info = DefInfo {
             name: full.clone(),
             module: ModuleName::from_dotted(module),
@@ -96,33 +109,53 @@ impl Sketch {
             performed: footprint,
             span: Span::new(SourceId(0), at, at + 5),
         };
-        self.0.defs.insert(full, info);
+        self.check.defs.insert(full, info);
         self
     }
 
-    /// `module` declares a deterministic test labelled `label`, after every test before it.
+    /// The module `name` at `path`, holding `text`.
+    pub fn module(mut self, name: &str, path: &str, text: &str) -> Sketch {
+        let source = SourceId(self.texts.len() as u32);
+        self.texts.push((path.to_string(), text.to_string()));
+        let info = ModuleInfo {
+            name: ModuleName::from_dotted(name),
+            source,
+            items: Vec::new(),
+            imports: Vec::new(),
+        };
+        self.check.modules.insert(Symbol::new(name), info);
+        self
+    }
+
+    /// `module` declares a deterministic test labelled `label`, which performs nothing, after every
+    /// test before it.
     pub fn test(mut self, module: &str, label: &str) -> Sketch {
-        let index = self.0.tests.len();
-        self.0.tests.push(TestInfo {
+        let info = TestInfo {
             name: label.to_string(),
             module: ModuleName::from_dotted(module),
             key: Symbol::new(qualified(module, label)),
-            index,
+            index: self.check.tests.len(),
             nondet: false,
-            footprint: Footprint::default(),
+            footprint: Footprint::empty(),
             span: Span::DUMMY,
-        });
+        };
+        self.check.tests.push(info);
         self
     }
 
     pub fn check(self) -> CheckOutput {
-        self.0
+        self.check
+    }
+
+    /// The checked declarations and each module's path and text, in source order.
+    pub fn into_parts(self) -> (CheckOutput, Vec<(String, String)>) {
+        (self.check, self.texts)
     }
 
     /// The front end's answer over this program, which a backend built from `program` describes.
     pub fn analysis(self, program: &[u8]) -> Analysis {
         Analysis {
-            check: self.0,
+            check: self.check,
             hashes_digest: DefHash::of(program),
             ..Analysis::default()
         }

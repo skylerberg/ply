@@ -1,13 +1,12 @@
-use crate::sketch::Sketch;
 use ply_eval::compiled::*;
 use ply_eval::evaluator::Machine;
 use ply_eval::{Analysis, DefHash, Diagnostic, Plain, Span, Symbol, Value, codes, slot};
+use ply_sketch::Sketch;
 use std::rc::Rc;
 
 struct Checked {
     front: Analysis,
 }
-
 
 struct Roots {
     program: DefHash,

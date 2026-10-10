@@ -47,7 +47,10 @@ fn a_binary_reads_back_each_file_of_the_pack_after_its_code() {
     let pack = read(&binary(
         b"\x7fELF code",
         &[
-            ("crates/ply-std/ply/option.ply", b"pub type Option<a> = Some(a) | None"),
+            (
+                "crates/ply-std/ply/option.ply",
+                b"pub type Option<a> = Some(a) | None",
+            ),
             ("program/front", b"front"),
         ],
     ))
@@ -136,7 +139,10 @@ fn a_torn_pack_is_refused_rather_than_read() {
     let mut lying = whole.clone();
     let trailer = lying.len() - 24;
     lying[trailer..trailer + 8].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
-    assert!(read(&lying).is_err(), "a trailer naming more than the binary holds");
+    assert!(
+        read(&lying).is_err(),
+        "a trailer naming more than the binary holds"
+    );
 
     // The table claims a file runs past where the table begins.
     let mut overrun = whole.clone();

@@ -11,7 +11,11 @@ const OWN: &str = "import std.json (Null)\n\nfn main() -> Int = 1\n";
 
 /// A front that pulled the shipped `std.json`, the entry a load that held over it files, and the
 /// library that entry names, which a read back requires the cache still holds.
-fn filed() -> (ply_machine::driver::LoadedAnalysis, Vec<u8>, tempfile::NamedTempFile) {
+fn filed() -> (
+    ply_machine::driver::LoadedAnalysis,
+    Vec<u8>,
+    tempfile::NamedTempFile,
+) {
     let value = handed(&[("m.ply", "m", OWN), ("std/json.ply", "std.json", JSON)]);
     let front = loaded_analysis_of(&value, Span::DUMMY).expect("the handed front reads");
     let library = tempfile::NamedTempFile::new().expect("a library's file");
@@ -33,7 +37,11 @@ fn a_filed_front_reads_back_over_the_walk_that_asks_for_it() {
     let (front, entry, library) = filed();
     let (back, kept) =
         reused::front(&entry, walk("elsewhere/m.ply"), Vec::new()).expect("the entry reads back");
-    assert_eq!(kept, library.path(), "the library is read back as it was filed");
+    assert_eq!(
+        kept,
+        library.path(),
+        "the library is read back as it was filed"
+    );
     assert_eq!(back.files.len(), front.files.len());
     let first = &back.files[0];
     assert_eq!(
@@ -43,7 +51,11 @@ fn a_filed_front_reads_back_over_the_walk_that_asks_for_it() {
     );
     let shipped = &back.files[1];
     assert_eq!(
-        (shipped.path.as_str(), shipped.name.as_str(), shipped.text.as_str()),
+        (
+            shipped.path.as_str(),
+            shipped.name.as_str(),
+            shipped.text.as_str()
+        ),
         ("std/json.ply", "std.json", JSON),
         "a shipped module is placed as the filed answer pulled it"
     );

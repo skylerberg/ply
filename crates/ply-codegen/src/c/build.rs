@@ -60,7 +60,10 @@ impl Native {
 
 /// The unit compiled into the library at `path`, finished against its own constructor table.
 /// `source` places its sites; without one, a failure names no place.
-pub fn load_opened(path: &std::path::Path, source: Option<&Source>) -> Result<(Native, Vec<Refused>)> {
+pub fn load_opened(
+    path: &std::path::Path,
+    source: Option<&Source>,
+) -> Result<(Native, Vec<Refused>)> {
     finish_unit(Library::open(path)?, source)
 }
 

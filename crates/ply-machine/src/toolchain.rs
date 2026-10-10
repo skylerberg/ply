@@ -25,7 +25,11 @@ const OPERATIONS: [(&str, &str, &str); 13] = [
     ("toolchain", "appended", "ply_machine::toolchain::appended"),
     ("toolchain", "scratch", "ply_machine::toolchain::scratch"),
     ("toolchain", "cleared", "ply_machine::toolchain::cleared"),
-    ("toolchain", "libraries", "ply_machine::toolchain::libraries"),
+    (
+        "toolchain",
+        "libraries",
+        "ply_machine::toolchain::libraries",
+    ),
     ("toolchain", "ran", "ply_machine::toolchain::ran"),
 ];
 
@@ -35,7 +39,15 @@ fn libraries() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
         &["-liconv", "-lSystem", "-lc", "-lm"]
     } else {
-        &["-lgcc_s", "-lutil", "-lrt", "-lpthread", "-lm", "-ldl", "-lc"]
+        &[
+            "-lgcc_s",
+            "-lutil",
+            "-lrt",
+            "-lpthread",
+            "-lm",
+            "-ldl",
+            "-lc",
+        ]
     }
 }
 
@@ -115,7 +127,10 @@ fn compiler_value(label: &str) -> PlyValue {
         "Some",
         vec![crate::payload::record(vec![
             ("path", PlyValue::str(&shown)),
-            ("identity", PlyValue::bytes(format!("{shown}\0{stamp}").as_bytes())),
+            (
+                "identity",
+                PlyValue::bytes(format!("{shown}\0{stamp}").as_bytes()),
+            ),
             (
                 "support",
                 PlyValue::list(
@@ -227,14 +242,16 @@ impl HostHandler for Toolchain {
                     }
                     None => PlyValue::ctor(
                         "Some",
-                        vec![PlyValue::bytes(b"the job was not started, or was waited for")],
+                        vec![PlyValue::bytes(
+                            b"the job was not started, or was waited for",
+                        )],
                     ),
                 }
             }
             ("cache", []) => PlyValue::str(ply_codegen::c::cache_dir().display().to_string()),
-            ("jobs", []) => PlyValue::Int(
-                std::thread::available_parallelism().map_or(1, |n| n.get()) as i64,
-            ),
+            ("jobs", []) => {
+                PlyValue::Int(std::thread::available_parallelism().map_or(1, |n| n.get()) as i64)
+            }
             ("holds", [path]) => {
                 let at = below(path.as_str(span, "a path")?, span)?;
                 let held = at.is_file();
@@ -250,7 +267,9 @@ impl HostHandler for Toolchain {
             ("moved", [from, to]) => {
                 let from = below(from.as_str(span, "a path")?, span)?;
                 let to = below(to.as_str(span, "a path")?, span)?;
-                let parent_made = to.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok());
+                let parent_made = to
+                    .parent()
+                    .is_some_and(|p| std::fs::create_dir_all(p).is_ok());
                 PlyValue::Bool(parent_made && std::fs::rename(&from, &to).is_ok())
             }
             ("appended", [path, bytes]) => {
@@ -275,7 +294,9 @@ impl HostHandler for Toolchain {
                 );
                 let at = ply_codegen::c::cache_dir().join(&name);
                 // A new directory, never one another build is writing into.
-                let made = at.parent().is_some_and(|p| std::fs::create_dir_all(p).is_ok())
+                let made = at
+                    .parent()
+                    .is_some_and(|p| std::fs::create_dir_all(p).is_ok())
                     && std::fs::create_dir(&at).is_ok();
                 if made {
                     PlyValue::ctor("Some", vec![PlyValue::str(name)])
@@ -283,7 +304,9 @@ impl HostHandler for Toolchain {
                     PlyValue::ctor("None", Vec::new())
                 }
             }
-            ("libraries", []) => PlyValue::list(libraries().iter().map(|l| PlyValue::str(*l)).collect()),
+            ("libraries", []) => {
+                PlyValue::list(libraries().iter().map(|l| PlyValue::str(*l)).collect())
+            }
             ("ran", [path, args]) => {
                 let program = below(path.as_str(span, "a path")?, span)?;
                 let args = args
@@ -291,9 +314,16 @@ impl HostHandler for Toolchain {
                     .iter()
                     .map(|a| a.as_str(span, "an argument").map(str::to_string))
                     .collect::<Result<Vec<_>, _>>()?;
-                match Command::new(&program).args(&args).stdin(Stdio::null()).output() {
+                match Command::new(&program)
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .output()
+                {
                     Ok(out) => crate::payload::record(vec![
-                        ("code", PlyValue::Int(out.status.code().map_or(-1, i64::from))),
+                        (
+                            "code",
+                            PlyValue::Int(out.status.code().map_or(-1, i64::from)),
+                        ),
                         ("out", PlyValue::bytes(&out.stdout)),
                         ("err", PlyValue::bytes(&out.stderr)),
                     ]),
