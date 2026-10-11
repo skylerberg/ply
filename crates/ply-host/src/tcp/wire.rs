@@ -461,7 +461,7 @@ impl Probing {
         })
     }
 
-    fn value(&self) -> Value {
+    pub fn value(&self) -> Value {
         record([
             (
                 "count",

@@ -736,17 +736,19 @@ const EFFECT: &str = "tcb";
 /// A preview that would read a credential or a root off the disk is refused.
 const HERMETIC: &str = "hermetic_tcb";
 
-const OPERATIONS: [(&str, &str); 2] = [
+const OPERATIONS: [(&str, &str); 3] = [
     ("preview", "ply_machine::hosts::preview"),
     ("registrations", "ply_machine::hosts::registrations"),
+    ("shapes", "ply_machine::hosts::shapes"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 2] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 3] = [
     ("preview", "ply_machine::hosts::hermetic::preview"),
     (
         "registrations",
         "ply_machine::hosts::hermetic::registrations",
     ),
+    ("shapes", "ply_machine::hosts::hermetic::shapes"),
 ];
 
 /// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
@@ -797,6 +799,7 @@ impl HostHandler for Facility {
                 Assembled::of(&path, &options, &front, configuration).preview(&self.module)
             }
             ("registrations", []) => registrations(),
+            ("shapes", []) => shapes(),
             (other, _) => return Err(unserved(EFFECT, other, span)),
         };
         Ok(HostAnswer::Value(value))
@@ -1004,6 +1007,23 @@ fn registrations() -> PlyValue {
                         PlyValue::Bool(op.linearity == ply_eval::Linearity::Repeatable),
                     ),
                     ("handler", PlyValue::str(op.path)),
+                ])
+            })
+            .collect(),
+    )
+}
+
+fn shapes() -> PlyValue {
+    PlyValue::list(
+        ply_host::shapes::shapes()
+            .iter()
+            .map(|(shape, value)| {
+                record(vec![
+                    ("shape", PlyValue::str(*shape)),
+                    (
+                        "value",
+                        ply_eval::reflect::value_of(&ply_eval::Plain::of(value)),
+                    ),
                 ])
             })
             .collect(),
