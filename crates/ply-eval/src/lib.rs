@@ -18,6 +18,7 @@ pub mod digest;
 pub mod escape;
 pub mod expr;
 pub mod files;
+pub mod float;
 mod footprint;
 pub mod handler;
 mod hash;
