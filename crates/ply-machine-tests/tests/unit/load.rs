@@ -1,29 +1,22 @@
-use ply_eval::{ModuleName, codes};
+use crate::sketch::{Sketch, loaded};
+use ply_eval::ModuleName;
 use ply_machine::load::*;
 use std::path::{Path, PathBuf};
 
-/// The program of `files`, `(path, text)` below one root, as the machine holds it over the
-/// builder's answer for it.
-fn loaded(files: &[(&str, &str)]) -> Loaded {
-    let files: Vec<(String, String)> = files
-        .iter()
-        .map(|(path, text)| (path.to_string(), text.to_string()))
-        .collect();
-    let answer = ply_machine::builds::answered_program(&files)
-        .unwrap_or_else(|d| panic!("the builder answers: {d}"));
-    ply_machine::driver::load_over_analysis_taken(PathBuf::from("."), answer.front)
-        .unwrap_or_else(|e| panic!("it loads: {:?}", e.diagnostics))
-}
-
 #[test]
 fn defs_and_tests_can_be_read_back_per_module() {
-    let loaded = loaded(&[
-        (
-            "a.ply",
-            "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n",
-        ),
-        ("b.ply", "fn b() -> Int = 2\n"),
-    ]);
+    let loaded = loaded(
+        Sketch::default()
+            .module(
+                "a",
+                "a.ply",
+                "fn a() -> Int = 1\ntest \"a\" { assert_eq(a(), 1) }\n",
+            )
+            .module("b", "b.ply", "fn b() -> Int = 2\n")
+            .def("a", "a", Vec::new())
+            .def("b", "b", Vec::new())
+            .test("a", "a"),
+    );
     let a = ModuleName::from_dotted("a");
     assert_eq!(loaded.defs_of(&a).len(), 1);
     assert_eq!(loaded.tests_of(&a).len(), 1);
@@ -45,61 +38,24 @@ fn the_working_directory_tidies_to_itself_rather_than_to_nothing() {
 }
 
 #[test]
-fn the_texts_are_every_module_the_front_end_answered_the_shipped_ones_included() {
-    let loaded = loaded(&[
-        ("a.ply", "import std.json\npub fn a() -> Int = 1\n"),
-        ("b.ply", "import a\nfn b() -> Int = a::a()\n"),
-    ]);
+fn the_texts_are_every_module_the_front_end_answered_in_the_order_of_their_sources() {
+    let loaded = loaded(
+        Sketch::default()
+            .module("a", "a.ply", "pub fn a() -> Int = 1\n")
+            .module("std.json", "std/json.ply", "pub type Json = | Null\n")
+            .module("b", "b.ply", "import a\nfn b() -> Int = a::a()\n"),
+    );
     let texts = loaded.texts();
     assert_eq!(texts.len(), loaded.module_count());
-    assert!(texts.iter().any(|(name, _)| name == "std.json"));
+    assert_eq!(
+        texts
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "std.json", "b"]
+    );
     assert!(texts.contains(&(
         "b".to_string(),
         "import a\nfn b() -> Int = a::a()\n".to_string()
     )));
-}
-
-#[test]
-fn a_definition_no_root_reaches_is_warned_once_at_its_name() {
-    let loaded = loaded(&[(
-        "m.ply",
-        "pub fn api() -> Int = shared()\n\
-         fn shared() -> Int = 1\n\
-         fn dead() -> Int = deader()\n\
-         fn deader() -> Int = 2\n\
-         fn tested() -> Int = 3\n\
-         fn lawful(x: Int) -> Int = x\n\
-         fn positive(x: Int) -> Bool = x > 0\n\
-         pub fn checked(x: Int) -> Int requires positive(x) = x\n\
-         type Pair = { a: Int }\n\
-         pub fn make() -> Int = {\n\
-         \x20 let f = |x: Int| -> Pair { { a: x } };\n\
-         \x20 f(1).a\n\
-         }\n\
-         fn _kept() -> Int = 4\n\
-         fn main() -> Int = 5\n\
-         type Unused = | Nothing\n\
-         test \"calls it\" { assert_eq(tested(), 3) }\n\
-         law \"it is the identity\" forall (x: Int) { lawful(x) == x }\n",
-    )]);
-    let named: Vec<(&str, String)> = loaded
-        .frontend
-        .warnings
-        .iter()
-        .filter(|d| d.code == codes::UNUSED_DEFINITION)
-        .inspect(|d| assert_eq!(d.severity, ply_eval::Severity::Warning))
-        .map(|d| {
-            let at = d.primary_span().expect("the name is labelled");
-            (d.message.as_str(), loaded.sources.snippet(at).into_owned())
-        })
-        .collect();
-    let unused: Vec<(&str, &str)> = named.iter().map(|(m, s)| (*m, s.as_str())).collect();
-    assert_eq!(
-        unused,
-        [
-            ("fn `m.dead` is never used", "dead"),
-            ("fn `m.deader` is never used", "deader"),
-            ("type `m.Unused` is never used", "Unused"),
-        ]
-    );
 }

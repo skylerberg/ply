@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 11] = [
+const OPERATIONS: [(&str, &str); 12] = [
     ("names", "ply_machine::shipped::names"),
     ("module", "ply_machine::shipped::module"),
     ("answer", "ply_machine::shipped::answer"),
@@ -15,6 +15,7 @@ const OPERATIONS: [(&str, &str); 11] = [
     ("stamps", "ply_machine::shipped::stamps"),
     ("runtime", "ply_machine::shipped::runtime"),
     ("runnable", "ply_machine::shipped::runnable"),
+    ("front", "ply_machine::shipped::front"),
     ("values", "ply_machine::shipped::values"),
     ("builtins", "ply_machine::shipped::builtins"),
     ("definitions", "ply_machine::shipped::definitions"),
@@ -180,10 +181,9 @@ impl HostHandler for Shipped {
                     })
                     .collect(),
             ),
-            ("runnable", [entry, files, dump, unit]) => {
+            ("runnable", [entry, files, dump]) => {
                 let entry = entry.as_str(span, "an entry point's name")?;
-                let unit = unit.as_bytes(span, "the program's unit")?;
-                let bytes = crate::runnable::encode(entry, files, dump, unit).map_err(|why| {
+                let bytes = crate::runnable::encode(entry, files, dump).map_err(|why| {
                     Diagnostic::error(
                         codes::INTERNAL_ERROR,
                         format!("the program does not encode as a runnable: {why}"),
@@ -192,6 +192,20 @@ impl HostHandler for Shipped {
                 })?;
                 PlyValue::bytes(bytes)
             }
+            ("front", [entry, dump, modules]) => PlyValue::bytes(
+                ply_eval::codec::encode(&crate::payload::record(vec![
+                    ("entry", entry.clone()),
+                    ("dump", dump.clone()),
+                    ("modules", modules.clone()),
+                ]))
+                .map_err(|why| {
+                    Diagnostic::error(
+                        codes::INTERNAL_ERROR,
+                        format!("the program's front end does not encode: {why}"),
+                    )
+                    .primary(span, "this is Ply's fault")
+                })?,
+            ),
             ("values", [files, dump, unit, roots, steps]) => {
                 values(files, dump, unit, roots, steps, span)?
             }
@@ -201,8 +215,8 @@ impl HostHandler for Shipped {
     }
 }
 
-/// What each stored root answers on the unit emitted over `files` and `dump`, as
-/// [`crate::enter::stored_values`] enters them.
+/// What each stored root answers on the unit emitted over `files` and `dump` and compiled into the
+/// library `unit`, as [`crate::enter::stored_values`] enters them.
 fn values(
     files: &PlyValue,
     dump: &PlyValue,
@@ -222,10 +236,7 @@ fn values(
         ]),
         span,
     )?;
-    let unit = String::from_utf8(unit.as_bytes(span, "the unit's C")?.to_vec()).map_err(|_| {
-        Diagnostic::error(codes::RUNTIME_ERROR, "the unit's C is not UTF-8")
-            .primary(span, "handed here")
-    })?;
+    let unit = std::path::PathBuf::from(unit.as_str(span, "the unit's library")?);
     let roots = roots
         .as_list(span, "the stored roots")?
         .iter()
@@ -239,6 +250,23 @@ fn values(
             .map(|value| crate::payload::option(value.map(PlyValue::bytes)))
             .collect(),
     ))
+}
+
+/// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
+/// of a program for this runtime by another `ply` reads it from.
+pub fn runtime_json() -> String {
+    use ply_codegen::c;
+    serde_json::json!({
+        "head": c::unit_head(),
+        "tail": c::runtime_object(),
+        "helpers": c::exports::runtime_helpers()
+            .into_iter()
+            .map(|h| serde_json::json!({ "name": h.name, "args": h.args, "answers": h.answers }))
+            .collect::<Vec<_>>(),
+        "builtins": ply_eval::Builtin::all().iter().map(|b| b.name()).collect::<Vec<_>>(),
+        "identity": c::runtime_identity(),
+    })
+    .to_string()
 }
 
 /// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens

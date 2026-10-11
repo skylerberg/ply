@@ -8,8 +8,9 @@ use ply_eval::{CheckOutput, Diagnostic, Span, codes};
 /// One family of capabilities, and what lending it lets a program do.
 pub struct Family {
     pub name: &'static str,
-    /// The effect whose operations the family lends, which a program must declare to reach them.
-    pub effect: &'static str,
+    /// The effects whose operations the family lends, one of which a program must declare to reach
+    /// any of them.
+    pub effects: &'static [&'static str],
     /// The same operations answered from what they are handed alone, by deterministic handlers.
     pub hermetic: Option<&'static str>,
     pub summary: &'static str,
@@ -20,33 +21,39 @@ pub struct Family {
 pub const FAMILIES: &[Family] = &[
     Family {
         name: "machine",
-        effect: "machine",
+        effects: &["machine"],
         hermetic: Some("hermetic_machine"),
         summary: "load, bind, enter and call a nested program",
     },
     Family {
         name: "tester",
-        effect: "tester",
+        effects: &["tester"],
         hermetic: Some("hermetic_tester"),
         summary: "run a project's tests, and report what ran; `hermetic_tester` runs them binding nothing",
     },
     Family {
         name: "claims",
-        effect: "prover",
+        effects: &["prover"],
         hermetic: Some("hermetic_prover"),
         summary: "discharge a project's obligations",
     },
     Family {
         name: "hosts",
-        effect: "tcb",
+        effects: &["tcb"],
         hermetic: Some("hermetic_tcb"),
         summary: "preview what a run would bind",
     },
     Family {
         name: "shipped",
-        effect: "shipped",
+        effects: &["shipped"],
         hermetic: None,
         summary: "read the modules and the version this binary ships",
+    },
+    Family {
+        name: "toolchain",
+        effects: &["compilers", "toolchain"],
+        hermetic: None,
+        summary: "compile and link C with the host's compiler, below the toolchain's cache",
     },
 ];
 
@@ -69,6 +76,7 @@ fn own(effect: &str) -> String {
         "prover" => "claims",
         "tcb" => "hosts",
         "shipped" => "compiler.unit",
+        "compilers" | "toolchain" => "compiler.cc",
         other => other,
     }
     .to_string()
@@ -90,14 +98,18 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
         "claims" => crate::claims::lent(&declared("prover")),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "shipped" => crate::shipped::lent(),
+        "toolchain" => crate::toolchain::lent(),
         _ => return None,
     })
 }
 
-/// The effect a family's operations are performed under, which is what a program must declare to
+/// The effects a family's operations are performed under, one of which a program must declare to
 /// be lent it: `claims` lends `prover`, so the family's name is not it.
-pub fn effect_of(family: &str) -> Option<&'static str> {
-    FAMILIES.iter().find(|f| f.name == family).map(|f| f.effect)
+pub fn effects_of(family: &str) -> Option<&'static [&'static str]> {
+    FAMILIES
+        .iter()
+        .find(|f| f.name == family)
+        .map(|f| f.effects)
 }
 
 pub fn hermetic_of(family: &str) -> Option<&'static str> {
@@ -134,20 +146,25 @@ pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<LentOp>, Dia
     let families: Vec<&str> = allow.iter().map(String::as_str).collect();
     for name in &families {
         // A name that is no family is refused by `lent_for`, which says what the families are.
-        let Some(effect) = effect_of(name) else {
+        let Some(effects) = effects_of(name) else {
             continue;
         };
-        if declared(effect).is_none() {
+        if effects.iter().all(|effect| declared(effect).is_none()) {
+            let named = effects
+                .iter()
+                .map(|e| format!("`{e}`"))
+                .collect::<Vec<_>>()
+                .join(" or ");
             return Err(Diagnostic::error(
                 codes::CAPABILITY_UNDECLARED,
-                format!("`--allow {name}` was granted and the program declares no `{effect}` effect"),
+                format!("`--allow {name}` was granted and the program declares no {named} effect"),
             )
             .primary(
                 Span::DUMMY,
                 "a family the program does not declare reaches nothing",
             )
             .note(format!(
-                "`{name}` lends the operations of `{effect}`, and a run lends only what the program \
+                "`{name}` lends the operations of {named}, and a run lends only what the program \
                  it runs can reach"
             )));
         }

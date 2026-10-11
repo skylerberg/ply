@@ -1717,10 +1717,22 @@ pub fn header_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
             && fold(x.names, true, |c: Bool, n: Bytes| c && exported(asked.shipped, x.module, n)),
       );
       if all_exported { [] } else {
+        // A check reads a module only through the entries named to it, so each selected module is
+        // named with all it exports, which a refusal of a name it does not export lists.
+        let exports_of = |m: Bytes|
+          if !contains(context.present, m) { [] } else {
+            let read = owners_of(
+              owners_asked({ module: m, shipped: shipped_for(asked.shipped, m), tested: false }),
+            );
+            filter(map_keys(read.declared), |n: Bytes| exported(asked.shipped, m, n))
+          };
         let deps = needed_by(
           |d: Bytes, n: Bytes| entries_of(asked.shipped, d, n),
           fold(selections, [], |acc: List<Mention>, x: { module: Bytes, names: List<Bytes> }|
-            concat(acc, map(x.names, |n: Bytes| { module: x.module, name: n }))),
+            concat(
+              acc,
+              map(concat(x.names, exports_of(x.module)), |n: Bytes| { module: x.module, name: n }),
+            )),
           filter(
             map(selections, |x: { module: Bytes, names: List<Bytes> }| x.module),
             |m: Bytes| contains(context.present, m),
@@ -2730,11 +2742,16 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         Some(i) -> i,
         None -> s.inputs,
       };
-      // Likewise the groups it hashes again. A load that refuses asks for no hashing, so what is hashed
-      // again is what a run settles: the hashing of each module hashed before, which asks each group
-      // the module holds now, a group new to it among them. A group that is gone is hashed anew where
-      // it comes back.
+      // Likewise the groups it hashes again. A load that refuses asks for no hashing of its own, so
+      // what is hashed again is what a run settles: the hashing of each module hashed before, which
+      // asks each group the module holds now, a group new to it among them, and each group whose hash
+      // one of those reads. A group that is gone is hashed anew where it comes back.
       let refused = match fresh.outcome { Refused(_) -> true, Analysed(_) -> false };
+      let asked = fold(
+        ran_for(warm.run, group_hash_query()),
+        map_new(),
+        |acc: Map<Bytes, Bool>, k: Bytes| map_insert(acc, k, true),
+      );
       let hashed_modules = map_fold(
         s.hashes,
         map_new(),
@@ -2744,10 +2761,11 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       let now_hashes = match inputs_over(fresh.held, step.sources, b"hash inputs") {
         Some(h) -> if refused {
           map_fold(h, map_new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-            if map_contains(
-                hashed_modules,
-                decoded(k, group_named_bin(), "a group's names").module,
-              ) { map_insert(acc, k, v) }
+            if map_contains(asked, k)
+                || map_contains(
+                  hashed_modules,
+                  decoded(k, group_named_bin(), "a group's names").module,
+                ) { map_insert(acc, k, v) }
             else { acc })
         } else { h },
         None -> s.hashes,
@@ -2764,14 +2782,19 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         let moved = sorted_bytes(
           filter(map_keys(now), |k: Bytes| map_get(was, k) != map_get(now, k)),
         );
-        if moved != sorted_bytes(map_keys(times))
-            || map_fold(times, false, |b: Bool, _: Bytes, n: Int| b || n > 2) {
+        let thrice = sorted_bytes(
+          map_fold(times, [], |acc: List<Bytes>, k: Bytes, n: Int|
+            if n > 2 { push(acc, k) } else { acc }),
+        );
+        if moved != sorted_bytes(map_keys(times)) || thrice != [] {
           Some(
             bytes_concat_all([
               b": moved ",
               groups_shown(moved),
               b", ran ",
               groups_shown(sorted_bytes(map_keys(times))),
+              if thrice == [] { b"" }
+              else { bytes_concat(b", more than twice ", groups_shown(thrice)) },
             ]),
           )
         } else { None }
@@ -3502,6 +3525,62 @@ test "edits undone, modules renamed and files emptied leave an answer through th
 
 test "a module fixed after it refused beside a renamed import answers as it does fresh" {
   let off = disagreements(session([[LeafError, CoreRenamed], [LeafError]]));
+  assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
+}
+
+test "a leaf deleted beside an error, moved twice and deleted again answers as it does fresh" {
+  let off = disagreements(
+    session([[LeafDeleted, LeafError], [TwiceMoved, LeafDeleted], [LeafError]]),
+  );
+  assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
+}
+
+test "an effect renamed beside a test, a type renamed as a definition moves, then renamed back answers as it does fresh" {
+  let off = disagreements(
+    session([[EffectRenamed, TestAdded], [TypeRenamed, TwiceMoved], [TypeRenamed, ShopBody]]),
+  );
+  assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
+}
+
+test "a session of renames, an error fixed and a twin added answers as it does fresh" {
+  let off = disagreements(
+    session([
+      [CoreRenamed],
+      [EffectRenamed, DefaultEdited, DefaultEdited, DefaultEdited, DefaultEdited, TestAdded],
+      [
+        TypeRenamed,
+        DefaultEdited,
+        CoreResultType,
+        LeafError,
+        LeafPrivate,
+        TestAdded,
+        DefaultEdited,
+        LeafError,
+      ],
+      [
+        CoreRenamed,
+        CoreBody,
+        DefaultEdited,
+        EffectRenamed,
+        LeafImportsCore,
+        TwinAdded,
+        LeafError,
+        LeafError,
+        CoreResultType,
+        LeafPrivate,
+        LeafBody,
+        ExtraAdded,
+        ShopBody,
+        TypeRenamed,
+        CoreRenamed,
+      ],
+    ]),
+  );
+  assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
+}
+
+test "a core body edited, then renamed beside a test added, answers as it does fresh" {
+  let off = disagreements(session([[CoreBody], [CoreRenamed, TestAdded]]));
   assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
 }
 

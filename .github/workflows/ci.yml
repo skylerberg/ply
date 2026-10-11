@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 # A newer push to a pull request supersedes its run; a merge to main never cancels the run before
-# it, whose `refresh` job is the one that commits the builder and the `ply` program back.
+# it, whose `publish` jobs put out the `ply` the next bootstraps start from.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -55,12 +55,16 @@ jobs:
     outputs:
       sweep: ${{ steps.sweep.outputs.sweep }}
       swept: ${{ steps.sweep.outputs.swept }}
+      shards: ${{ steps.cut.outputs.shards }}
+      nextest: ${{ steps.cut.outputs.nextest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # What the last run's test jobs measured, which `verify` holds the shards to.
+      # What the last run's test jobs measured, this branch's own or main's, which `verify` holds the
+      # shards to. A first run or a fork's leaves nothing here: the shards are then sliced by test
+      # count and the corpus runs dealt round robin.
       - name: Fetch the durations the last run measured
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,6 +72,34 @@ jobs:
 
       - name: Verify the CI tables, the shards and the cache keys
         run: .github/ci-shards.sh verify
+
+      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
+      # from tables a run apart could agree on no test at all. The table goes with the cut, so
+      # `passes` writes the next one over the table this run was cut by.
+      - name: Cut the shards from those durations
+        id: cut
+        run: |
+          set -euo pipefail
+          rc=0
+          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
+          case "$rc" in
+            0)
+              cp /tmp/ply-test-timings/timings.tsv /tmp/ply-shards/timings.tsv
+              echo "shards=true" >> "$GITHUB_OUTPUT"
+              ;;
+            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
+            *) exit "$rc" ;;
+          esac
+          echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
+      # An artifact and not a cache: every job after reads the cut and fails without it, and the
+      # repository's other runs evict a cache while those jobs wait for runners.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.cut.outputs.shards == 'true'
+        with:
+          name: test-shards
+          path: /tmp/ply-shards
+          retention-days: 1
+          if-no-files-found: error
 
       # The runner's awk is not the one a developer has. The self-test is what says the timestamps
       # and durations come out the same on both, and it is cheaper than a report someone acts on.
@@ -124,6 +156,13 @@ jobs:
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
+    outputs:
+      key: ${{ steps.rust.outputs.key }}
+      # Whether a run already passed every Rust test of this Rust, which then runs none.
+      passed: ${{ steps.passed.outputs.cache-hit == 'true' }}
+      # The tree checks read the Ply sources as well, so their pass is keyed by every crate's.
+      tree: ${{ steps.tree.outputs.key }}
+      tree-passed: ${{ steps.tree-passed.outputs.cache-hit == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,14 +170,35 @@ jobs:
       - uses: ./.github/actions/rust-key
         id: rust
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: passed
+        if: env.PLY_CI_COLD != 'true'
+        with:
+          path: /tmp/rust-passed
+          key: rust-passed-${{ steps.rust.outputs.key }}
+          lookup-only: true
+      - name: Key the tree checks by what they read
+        id: tree
+        env:
+          RUST: ${{ steps.rust.outputs.key }}
+          PLY: ${{ hashFiles('crates/**/*.ply') }}
+        run: echo "key=$(printf '%s\n' "$RUST" "$PLY" | sha256sum | cut -c1-40)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: tree-passed
+        if: env.PLY_CI_COLD != 'true'
+        with:
+          path: /tmp/tree-passed
+          key: tree-passed-${{ steps.tree.outputs.key }}
+          lookup-only: true
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cached
+        if: steps.passed.outputs.cache-hit != 'true' || steps.tree-passed.outputs.cache-hit != 'true'
         with:
           path: nextest.tar.zst
           key: nextest-archive-${{ steps.rust.outputs.key }}
           lookup-only: true
       - name: Download the archive a pull request built of this Rust
         id: reuse
-        if: steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
+        if: (steps.passed.outputs.cache-hit != 'true' || steps.tree-passed.outputs.cache-hit != 'true') && steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           NAME: nextest-archive-${{ steps.rust.outputs.key }}
@@ -152,7 +212,7 @@ jobs:
           echo "$NAME came back from run $run"
       - name: Decide whether to build the archive
         id: builds
-        if: steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
+        if: (steps.passed.outputs.cache-hit != 'true' || steps.tree-passed.outputs.cache-hit != 'true') && steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
         run: echo "yes=true" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         if: steps.builds.outputs.yes == 'true'
@@ -196,12 +256,13 @@ jobs:
           retention-days: 2
           if-no-files-found: error
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.cached.outputs.cache-hit != 'true'
+        if: (steps.passed.outputs.cache-hit != 'true' || steps.tree-passed.outputs.cache-hit != 'true') && steps.cached.outputs.cache-hit != 'true'
         with:
           path: nextest.tar.zst
           key: nextest-archive-${{ steps.rust.outputs.key }}
       # A save that cannot reserve its key only warns; fail here rather than in every job below.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.passed.outputs.cache-hit != 'true' || steps.tree-passed.outputs.cache-hit != 'true'
         with:
           path: nextest.tar.zst
           key: nextest-archive-${{ steps.rust.outputs.key }}
@@ -209,18 +270,14 @@ jobs:
           fail-on-cache-miss: true
 
   build-ply:
-    name: Build the ply binary and the ply program
+    name: Bootstrap ply
+    needs: [plan]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      SCCACHE_GHA_ENABLED: "true"
-      RUSTC_WRAPPER: sccache
+    timeout-minutes: 40
     outputs:
-      # The artifact holding the stage the run's jobs read, which a pull request whose stage this
-      # job did not find under its sources' key hands them; empty otherwise.
+      # The artifact holding the C cache and stages the run's jobs read, which a pull request whose
+      # cache this job did not find under its sources' key hands them; empty otherwise.
       stage: ${{ steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push' && steps.stage-name.outputs.name || '' }}
-      shards: ${{ steps.cut.outputs.shards }}
-      nextest: ${{ steps.cut.outputs.nextest }}
       partitions: ${{ steps.selected.outputs.partitions }}
       lanes: ${{ steps.selected.outputs.lanes }}
       corpus: ${{ steps.selected.outputs.corpus }}
@@ -229,110 +286,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      # What the last run's test jobs measured, this branch's own or main's. A first run or a fork's
-      # leaves nothing here: the shards are then sliced by test count and the corpus runs dealt
-      # round robin.
-      - name: Fetch the durations the last run measured
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/ci-shards.sh fetch-timings
-      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
-      # from tables a run apart could agree on no test at all. This one, since it asks what each
-      # partition of the cut has left to run before any starts. The table goes with the cut, so
-      # `passes` writes the next one over the table this run was cut by.
-      - name: Cut the shards from those durations
-        id: cut
-        run: |
-          set -euo pipefail
-          rc=0
-          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
-          case "$rc" in
-            0)
-              cp /tmp/ply-test-timings/timings.tsv /tmp/ply-shards/timings.tsv
-              echo "shards=true" >> "$GITHUB_OUTPUT"
-              ;;
-            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
-            *) exit "$rc" ;;
-          esac
-          echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
-      # An artifact and not a cache: every job after reads the cut and fails without it, and the
-      # repository's other runs evict a cache while those jobs wait for runners.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.cut.outputs.shards == 'true'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.plan.outputs.shards == 'true'
         with:
           name: test-shards
           path: /tmp/ply-shards
-          retention-days: 1
-          if-no-files-found: error
-
-      - uses: ./.github/actions/rust-key
-        id: rust
-      # The runtime alone, before any pack: what the Rust key is a key of.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: cached
-        with:
-          path: |
-            target/release/ply
-            target/release/ply-pack
-          key: ply-runtime-${{ steps.rust.outputs.key }}
-      - name: Download the runtime a pull request built of this Rust
-        id: reuse
-        if: steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NAME: ply-runtime-${{ steps.rust.outputs.key }}
-        run: |
-          set -euo pipefail
-          run=$(.github/artifact-run.sh "$NAME")
-          if [ -z "$run" ]; then echo "no run has built this Rust; building"; exit 0; fi
-          gh run download "$run" -n "$NAME" -D target/release
-          chmod +x target/release/ply target/release/ply-pack
-          echo "reused=true" >> "$GITHUB_OUTPUT"
-          echo "$NAME came back from run $run"
-      - name: Decide whether to build the runtime
-        id: builds
-        if: steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
-        run: echo "yes=true" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        if: steps.builds.outputs.yes == 'true'
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: steps.builds.outputs.yes == 'true'
-        with:
-          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
-      - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        if: steps.builds.outputs.yes == 'true'
-      - name: Build the runtime
-        if: steps.builds.outputs.yes == 'true'
-        run: cargo build --locked --release -p ply-launcher --bins
-      # A cached runtime is only as current as the key is whole: an input the key missed would be
-      # served stale to every run after.
-      - name: Check every input the build read is under the Rust key
-        if: steps.builds.outputs.yes == 'true'
-        run: .github/ci-shards.sh rust-inputs target/release/ply.d
-      # Here rather than in a later job: it compares mtimes, and a later checkout is newer than the
-      # binary. Only a binary this job built has the mtimes it compares.
-      - name: Check the runtime is built from this tree
-        if: steps.builds.outputs.yes == 'true'
-        run: .github/binary-is-current.sh --rust target/release/ply
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.builds.outputs.yes == 'true' && github.event_name == 'pull_request'
-        with:
-          name: ply-runtime-${{ steps.rust.outputs.key }}
-          path: |
-            target/release/ply
-            target/release/ply-pack
-          retention-days: 2
-          if-no-files-found: error
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.cached.outputs.cache-hit != 'true'
-        with:
-          path: |
-            target/release/ply
-            target/release/ply-pack
-          key: ply-runtime-${{ steps.rust.outputs.key }}
 
       # A cache rather than an artifact: every suite job wants these two files, and the artifact
       # service is the one part of a run that fails on its own.
@@ -341,7 +299,7 @@ jobs:
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
-      - name: Harvest tcc's packages for the jobs that run the archive
+      - name: Harvest tcc's packages for the jobs that run the suites
         if: steps.tcc.outputs.cache-hit != 'true'
         run: .github/ci-tcc.sh harvest
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -349,17 +307,12 @@ jobs:
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
-
-      # The run's first `ply` emits the emitter's own unit and compiles it with whatever
-      # `Profile::Development` finds — `cc -O0` when tcc is absent. Installed here it is tcc, the
-      # compiler every suite job compiles that unit with, so the emitted stage and the objects this
-      # job writes are the ones they read.
       - name: Install tcc
         run: .github/ci-tcc.sh install
 
-      # The run's first `ply` is minutes of checking and emitting. A tree whose sources have not
-      # moved has both from an earlier run; against any other tree the buckets of emitted C that
-      # did not move are already built, which is most of them.
+      # A tree whose sources have not moved has every answer and object of the bootstrap from an
+      # earlier run; against any other tree the parts of the C that did not move are already
+      # compiled, which is most of them.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
         id: stage-cache
@@ -367,15 +320,14 @@ jobs:
           path: |
             /tmp/ply-c-cache
             /tmp/ply-c-stage
-          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}
           restore-keys: ply-c-stage-
       # Before this job's first `ply`, so what it reads is newer than this and the rest is not.
       - name: Mark when this job's `ply` runs start
         run: touch /tmp/ply-c-used.mark
-      # The builder is in the name: a stage holds what the committed builder made of these sources.
       - name: Name the stage of these sources
         id: stage-name
-        run: echo "name=ply-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/bootstrap/build.digest') }}" >> "$GITHUB_OUTPUT"
+        run: echo "name=ply-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}" >> "$GITHUB_OUTPUT"
       # After the mark, so the cut below keeps it.
       - name: Download a stage another branch built from these sources
         id: shared
@@ -384,22 +336,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: .github/ci-warm.sh shared "${{ steps.stage-name.outputs.name }}"
 
-      # What this tree holds of Ply, appended to the runtime: the step a change to Ply sources alone
-      # costs where it used to cost a Rust build. The packed `ply` then answers the shipped modules,
-      # building its program first where no stage holds it, and is packed again carrying them.
-      - name: Pack this tree's Ply sources and what its shipped modules answer
-        env:
-          PLY_C_PHASES: 1
-        run: target/release/ply-pack target/release/ply
-      # A step of its own, so a run says what building it took and where.
-      - name: Build the `ply` program
-        run: .github/ci-warm.sh program target/release/ply
-      - name: Self-test the freshness check
-        run: .github/binary-is-current.sh --self-test
-      # The check above needs the `ply` program but not the emitter, which a restored `ply`
-      # program never asks for: without this, every later job's first compiles built it again.
-      - name: Warm the emitter for the jobs after this one
-        run: .github/ci-warm.sh target/release/ply
+      - uses: ./.github/actions/bootstrap
+        with:
+          out: target/release/ply
+
       # What earlier runs kept of each Ply run: the passes its tests took and the answer it kept.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
@@ -412,7 +352,7 @@ jobs:
       - name: Select the Ply runs left to run
         id: selected
         env:
-          SHARDS: ${{ steps.cut.outputs.shards }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -euo pipefail
           mkdir -p target/debug
@@ -424,20 +364,18 @@ jobs:
       - name: Cut the stage to what this job used
         if: steps.stage-cache.outputs.cache-hit != 'true'
         run: .github/ci-warm.sh used /tmp/ply-c-used.mark
-      # What those `ply`s emitted, for the rest of the run: the suite jobs restore it rather than
-      # repeat the emission. On main it is saved under the tree's own key, which a later run
-      # restores, so main's next pull requests find it as soon as this job ends. A pull request's
-      # cache reaches no other run, so it hands the stage over as an artifact, which its own jobs
-      # read and which a run of these sources on any branch, main's after the merge most of all,
-      # finds too (`ci-warm.sh shared`). Nothing was emitted when the restore above hit the tree's
-      # own key, and the suite jobs find that key themselves.
+      # What those `ply`s compiled and answered, for the rest of the run and the runs after. On main
+      # it is saved under the tree's own key, which a later run restores. A pull request's cache
+      # reaches no other run, so it hands the stage over as an artifact, which its own jobs read and
+      # which a run of these sources on any branch, main's after the merge most of all, finds too
+      # (`ci-warm.sh shared`).
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name == 'push'
         with:
           path: |
             /tmp/ply-c-cache
             /tmp/ply-c-stage
-          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}
       # Never a reason for a red run: a job that finds no stage builds what it needs.
       - name: Pack the stage for the run's jobs
         if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
@@ -453,88 +391,64 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
-      # For `refresh`, the one job that runs this binary, and repacks it with what it emits.
+      # The `ply` every suite job runs, and the one `publish` puts out on main.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.event_name == 'push'
         with:
           name: ply
-          path: |
-            target/release/ply
-            target/release/ply-pack
-          retention-days: 1
+          path: target/release/ply
+          retention-days: 2
           if-no-files-found: error
 
   # On runners of its own, so the corpus lanes have theirs to themselves. After `build-ply`, whose
   # stage it restores: a run that changed the compiler would otherwise have each shard emit the
   # emitter's stage itself, minutes of a runner the lanes are queued for. The builder its tests ask
   # this tree's compiler through is each shard's own to build, once.
+  # Rust tests test the Rust alone, so what they answer is a function of the archive: a run whose
+  # Rust key a run already passed runs none of them.
   nextest:
     name: Run Rust tests, shard ${{ matrix.shard }}/${{ matrix.of }}
-    needs: [plan, build, build-ply]
+    needs: [plan, build]
+    if: needs.build.outputs.passed != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.build-ply.outputs.nextest) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.nextest) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.build-ply.outputs.shards == 'true'
+        if: needs.plan.outputs.shards == 'true'
         with:
           name: test-shards
           path: /tmp/ply-shards
-      - uses: ./.github/actions/suite
-        with:
-          stage: ${{ needs.build-ply.outputs.stage }}
-      # What this shard's tests compiled and asked of the compiler on its last run: bodies and
-      # answers are each kept under what decides them, so one still current is read back.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        with:
-          path: /tmp/ply-c-nextest
-          key: ply-c-nextest-${{ matrix.shard }}-${{ github.run_id }}
-          restore-keys: |
-            ply-c-nextest-${{ matrix.shard }}-
-            ply-c-nextest-
-      - name: Restore what this shard's last run compiled and asked
-        run: |
-          set -euo pipefail
-          .github/ci-corpus.sh restore /tmp/ply-c-nextest
-          .github/ci-corpus.sh mark
-      - uses: ./.github/actions/rust-traces
+      - uses: ./.github/actions/archive
 
       # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
-      # every other shard: a test the durations do not name runs there, and only there. A test whose
-      # trace still stands is answered by it and not run: the config written beside the shard's
-      # narrows its profile's filter.
+      # every other shard: a test the durations do not name runs there, and only there.
       # The awk strips colour first: nextest colours its summary line.
       - name: Run the shard's tests
         id: run
         env:
           SHARD: ${{ matrix.shard }}
           OF: ${{ matrix.of }}
-          SHARDS: ${{ needs.build-ply.outputs.shards }}
-          PLY_TEST_TRACES: /tmp/ply-rust-traces-new
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -euo pipefail
-          mkdir -p "$PLY_TEST_TRACES"
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
           config=/tmp/ply-shards/shard-$SHARD.toml
           if [ "$SHARDS" = true ]; then
             [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
-            said=$(.github/ci-shards.sh rust-answered /tmp/ply-rust-traces /tmp/answered.toml "$config")
-            read -r profile answered <<< "$said"
-            cut=(--profile "$profile" --tool-config-file "answered:/tmp/answered.toml" --tool-config-file "shards:$config")
+            profile=$(sed -n 's/^\[profile\.\(shard[0-9]*\)\]$/\1/p' "$config" | head -n 1)
+            [ -n "$profile" ] || { echo "$config declares no shard profile" >&2; exit 1; }
+            cut=(--profile "$profile" --tool-config-file "shards:$config")
           else
-            said=$(.github/ci-shards.sh rust-answered /tmp/ply-rust-traces /tmp/answered.toml)
-            read -r profile answered <<< "$said"
-            cut=(--profile "$profile" --tool-config-file "answered:/tmp/answered.toml" --partition "slice:$SHARD/$OF")
+            profile=default
+            cut=(--partition "slice:$SHARD/$OF")
           fi
           echo "profile=$profile" >> "$GITHUB_OUTPUT"
-          echo "$answered Rust tests answered by their traces"
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
@@ -548,7 +462,7 @@ jobs:
             END { print n + 0 }
           ' /tmp/shard.log)
           echo "shard $SHARD ran $ran tests"
-          [ "$ran" -gt 0 ] || [ "$answered" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
+          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
 
       # What the next run cuts its shards from.
@@ -572,37 +486,29 @@ jobs:
           path: /tmp/timings-nextest-${{ matrix.shard }}.tsv
           retention-days: 1
           if-no-files-found: error
-      # Even from a red shard: a pass is a fact about its test.
-      - name: Keep the traces of the tests this shard passed
-        if: ${{ !cancelled() }}
-        env:
-          PROFILE: ${{ steps.run.outputs.profile }}
-        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-new "target/nextest/${PROFILE:-default}/junit.xml" /tmp/rust-traces-out
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: rust-traces-nextest-${{ matrix.shard }}
-          path: /tmp/rust-traces-out
-          retention-days: 1
-          if-no-files-found: ignore
 
-      - name: Keep what this shard compiled and asked
-        if: ${{ !cancelled() }}
-        run: .github/ci-corpus.sh keep /tmp/ply-c-nextest
+  # The mark a later run of this Rust finds, once every shard and the host packages' tests passed.
+  rust-passed:
+    name: Record that this Rust's tests passed
+    needs: [build, nextest, hosts]
+    if: needs.build.outputs.passed != 'true' && needs.nextest.result == 'success' && needs.hosts.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Write the mark
+        run: echo "${{ needs.build.outputs.key }}" > /tmp/rust-passed
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ !cancelled() }}
         with:
-          path: /tmp/ply-c-nextest
-          key: ply-c-nextest-${{ matrix.shard }}-${{ github.run_id }}
+          path: /tmp/rust-passed
+          key: rust-passed-${{ needs.build.outputs.key }}
 
   # The corpus runs a partition takes, each lane a process beside the others: only a partition
   # `build-ply` found a run no kept answer stands for.
   lanes:
     name: Run Ply tests, partition ${{ matrix.shard }}/${{ matrix.of }}
-    # After `build-ply`, whose stage it restores: a run that changed the compiler would otherwise
-    # have each lane emit the emitter's stage itself. On a pull request, where `refresh` does not
-    # run, this is the run's critical path.
-    needs: [plan, build, build-ply]
+    # After `build-ply`, whose `ply` it runs and whose stage it restores. This is the run's critical
+    # path.
+    needs: [plan, build-ply]
     if: needs.build-ply.outputs.lanes == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -619,7 +525,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.build-ply.outputs.shards == 'true'
+        if: needs.plan.outputs.shards == 'true'
         with:
           name: test-shards
           path: /tmp/ply-shards
@@ -682,7 +588,7 @@ jobs:
       - name: Run this partition's Ply tests
         env:
           SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ needs.build-ply.outputs.shards }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -euo pipefail
           plan=()
@@ -731,7 +637,7 @@ jobs:
   passes:
     name: Save the passes and test costs this run measured
     if: ${{ !cancelled() }}
-    needs: [build-ply, nextest, gates, hosts, lanes, corpus]
+    needs: [plan, build-ply, nextest, gates, hosts, lanes, corpus]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -759,28 +665,6 @@ jobs:
         with:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
-
-      # Every Rust test's last passing trace, the ones this run filed over the ones it read.
-      - uses: ./.github/actions/rust-traces
-        id: traces
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: rust-traces-*
-          merge-multiple: true
-          path: /tmp/rust-traces-parts
-      - name: Merge every job's Rust traces into one store
-        id: rust-traces
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/ply-rust-traces
-          if [ -d /tmp/rust-traces-parts ]; then cp -R /tmp/rust-traces-parts/. /tmp/ply-rust-traces/; fi
-          if [ -n "$(find /tmp/ply-rust-traces -type f -print -quit)" ]; then echo "any=true" >> "$GITHUB_OUTPUT"; fi
-          echo "$(find /tmp/ply-rust-traces -type f | wc -l) Rust tests answered by a trace"
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.rust-traces.outputs.any == 'true'
-        with:
-          path: /tmp/ply-rust-traces
-          key: rust-traces-${{ steps.traces.outputs.digest }}-${{ github.run_id }}
 
       # Every partition's C and the stores it wrote, as one entry each that every partition of the
       # next run restores: the cut moves runs between partitions as the durations move, and a
@@ -848,19 +732,19 @@ jobs:
       # (`ci-shards.sh fetch-timings`). An artifact and not a cache: a run whose table the
       # repository's other runs evicted deals its corpus runs round robin, and overruns a lane.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.build-ply.outputs.shards == 'true' && needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
+        if: needs.plan.outputs.shards == 'true' && contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         with:
           name: test-shards
           path: /tmp/ply-shards
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
+        if: contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         with:
           pattern: timings-*
           merge-multiple: true
           path: /tmp/ply-timings-parts
       - name: Write the table of one duration per test
         id: timings
-        if: needs.nextest.result == 'success' && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
+        if: contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
         run: |
           set -euo pipefail
           mkdir -p /tmp/ply-test-timings
@@ -927,65 +811,69 @@ jobs:
           fi
           .github/ci-shards.sh supersede "${{ github.run_id }}" "${{ github.ref }}"
 
-  # On main only: the builder and the `ply` program the sources build are committed back, so no
-  # pull request carries either and two of them never conflict on them.
-  # A push by the workflow's own token starts no run, so the commit is the tree the run tested
-  # plus what that run emitted.
-  refresh:
-    name: Commit the builder and the ply program these sources make
-    if: github.event_name == 'push'
-    needs: [plan, build, build-ply]
+  # Main's `ply`, once the run that tested it is green, to the rolling release `scripts/stage0.sh`
+  # downloads: the stage0 every later bootstrap starts from.
+  publish:
+    name: Publish main's ply for Linux
+    if: github.event_name == 'push' && needs.ci.result == 'success'
+    needs: [ci]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 10
     permissions:
       contents: write
       actions: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: true
-      - uses: ./.github/actions/suite
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ply
-          path: target/release
-      - name: Emit the builder and the `ply` program
+          path: /tmp/ply
+      - name: Upload it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          chmod +x target/release/ply target/release/ply-pack
-          target/release/ply bootstrap crates/ply-compiler/ply --out crates/ply-compiler/bootstrap
-          target/release/ply bootstrap crates/ply-cli/ply --out crates/ply-cli/bootstrap
-      # The pack refuses a bootstrap directory holding anything `ply bootstrap` does not write, and a
-      # binary carrying what was emitted must still start, so neither is committed for every checkout.
-      - name: Check a binary packed with what it emitted runs
+          mv /tmp/ply/ply /tmp/ply/ply-linux-x64
+          gh release upload main-latest /tmp/ply/ply-linux-x64 --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish-macos:
+    name: Bootstrap and publish main's ply for macOS
+    if: github.event_name == 'push' && needs.ci.result == 'success'
+    needs: [ci]
+    runs-on: macos-14
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      actions: read
+    env:
+      PLY_C_CACHE: /tmp/ply-c-cache
+      PLY_C_STAGE: /tmp/ply-c-stage
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-macos-${{ github.run_id }}
+          restore-keys: ply-c-macos-
+      - uses: ./.github/actions/bootstrap
+        with:
+          out: target/release/ply
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-macos-${{ github.run_id }}
+      - name: Upload it to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          target/release/ply-pack target/release/ply
-          target/release/ply --version
-      # The digest covers everything the build reads, so bytes that moved under it are a build that
-      # is not a function of its sources, which committing them would hide.
-      - name: Check the programs moved only with their digests
-        run: |
-          set -euo pipefail
-          for program in crates/ply-compiler/bootstrap/build crates/ply-cli/bootstrap/ply; do
-            git diff --quiet -- "$program.digest" || continue
-            git diff --quiet -- "$program.run" || {
-              echo "$program.run changed while $program.digest did not: the build is not a function of its sources" >&2
-              exit 1
-            }
-          done
-      - name: Commit what moved
-        run: |
-          set -euo pipefail
-          git add crates/ply-compiler/bootstrap crates/ply-cli/bootstrap
-          git diff --cached --quiet && { echo "the builder and the program already match main"; exit 0; }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m 'The builder and ply program CI emitted for these sources'
-          # Main may have moved under this run; the next run on main refreshes for both, and a
-          # prose-only merge starts none.
-          git pull --rebase origin main || { git rebase --abort; echo "main moved; the next run refreshes"; exit 0; }
-          git push origin HEAD:main || echo "main moved; the next run refreshes"
+          cp target/release/ply /tmp/ply-macos-arm64
+          gh release upload main-latest /tmp/ply-macos-arm64 --clobber --repo "$GITHUB_REPOSITORY"
 
   # Tests that must be seen to run: the tree checks, by name, then the checks of the tree's Ply sources
   # and lockfiles.
@@ -1002,28 +890,20 @@ jobs:
         with:
           stage: ${{ needs.build-ply.outputs.stage }}
 
-      - uses: ./.github/actions/rust-traces
+      - uses: ./.github/actions/archive
+        if: needs.build.outputs.tree-passed != 'true'
       - name: Run the tree checks
-        env:
-          PLY_TEST_TRACES: /tmp/ply-rust-traces-new
+        if: needs.build.outputs.tree-passed != 'true'
         run: |
           set -euo pipefail
-          mkdir -p "$PLY_TEST_TRACES"
           filter=$(.github/ci-shards.sh gate-filter)
-          .github/ci-shards.sh rust-answered /tmp/ply-rust-traces /tmp/answered-gates.toml
-          { [ -d /tmp/ply-rust-traces ] && target/debug/ply-pack --answered /tmp/ply-rust-traces; } > /tmp/answered.tsv || true
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --profile answered --tool-config-file "answered:/tmp/answered-gates.toml" \
             --no-fail-fast --no-tests=pass -E "$filter" 2>&1 | tee /tmp/gates.log
-      - name: Keep the traces of the tree checks that passed
-        if: ${{ !cancelled() }}
-        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-new target/nextest/answered/junit.xml /tmp/rust-traces-out
-
-      # A tree check ran here, or its trace answered for it: either way the binary has it.
       - name: Check every tree check ran
+        if: needs.build.outputs.tree-passed != 'true'
         run: |
           set -euo pipefail
           ran=0
@@ -1033,24 +913,22 @@ jobs:
               { gsub(/\033\[[0-9;]*m/, "") }
               $1 == "PASS" && $NF == test && $(NF - 1) == id { found = 1 }
               END { exit !found }
-            ' /tmp/gates.log || grep -qxF "$id"$'\t'"$test" /tmp/answered.tsv || {
+            ' /tmp/gates.log || {
               echo "'$id $test' did not run: the table names a test the binary does not have" >&2
               exit 1
             }
             ran=$((ran + 1))
           done < <(.github/ci-shards.sh tree-checks)
-          echo "$ran tree checks ran or were answered"
+          echo "$ran tree checks ran"
           [ "$ran" -gt 0 ] || { echo "the table is empty" >&2; exit 1; }
-      # The tree check that builds the `ply` program with this tree's own builder filed that build's
-      # rows and bodies under the compiler `refresh` is about to commit as main's builder. Kept, a
-      # pull request's first `ply` after that commit reads them back.
+      - name: Write the mark a later run of these sources finds
+        if: needs.build.outputs.tree-passed != 'true'
+        run: echo "${{ needs.build.outputs.tree }}" > /tmp/tree-passed
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.event_name == 'push'
+        if: needs.build.outputs.tree-passed != 'true'
         with:
-          path: |
-            /tmp/ply-c-cache
-            /tmp/ply-c-stage
-          key: ply-c-stage-own-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          path: /tmp/tree-passed
+          key: tree-passed-${{ needs.build.outputs.tree }}
 
       # A source committed unformatted puts its reformatting into the next change that touches it.
       - name: Check the maintained Ply sources are formatted
@@ -1063,9 +941,8 @@ jobs:
 
       # A lock pins the closure's names and versions; a path dependency in this checkout carries no
       # digest, so an edit to one moves no lock. On the merge with main, not only the branch: two
-      # changes that each moved a lock leave main's stale, and main's refresh is the first build that
-      # verifies it. Here, beside the partitions, rather than in `build-ply`, whose end every
-      # partition waits on.
+      # changes that each moved a lock leave main's stale. Here, beside the partitions, rather than in
+      # `build-ply`, whose end every partition waits on.
       - name: Check every lockfile pins this tree
         if: ${{ !cancelled() }}
         run: |
@@ -1074,53 +951,28 @@ jobs:
           for lock in $locks; do target/debug/ply resolve "$(dirname "$lock")" >/dev/null; done
           git diff --exit-code -- $locks || { echo "a ply.lock does not pin these sources: run 'ply resolve' on it" >&2; exit 1; }
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: rust-traces-gates
-          path: /tmp/rust-traces-out
-          retention-days: 1
-          if-no-files-found: ignore
-
   # The host packages, whose tests bind sockets and processes: beside the tree checks, which took
   # them one after the other.
   hosts:
     name: Run the host packages' tests
-    needs: [plan, build, build-ply]
+    needs: [plan, build]
+    if: needs.build.outputs.passed != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: ./.github/actions/suite
-        with:
-          stage: ${{ needs.build-ply.outputs.stage }}
-      - uses: ./.github/actions/rust-traces
+      - uses: ./.github/actions/archive
       - name: Run the host packages' tests
-        env:
-          PLY_TEST_TRACES: /tmp/ply-rust-traces-host
         run: |
           set -euo pipefail
-          mkdir -p "$PLY_TEST_TRACES"
           filter=$(.github/ci-shards.sh host-filter)
-          .github/ci-shards.sh rust-answered /tmp/ply-rust-traces /tmp/answered-host.toml
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --profile answered --tool-config-file "answered:/tmp/answered-host.toml" \
             --no-fail-fast --no-tests=pass --success-output immediate -E "$filter"
-      - name: Keep the traces of the host packages' tests that passed
-        if: ${{ !cancelled() }}
-        run: .github/ci-shards.sh rust-kept /tmp/ply-rust-traces-host target/nextest/answered/junit.xml /tmp/rust-traces-out
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: rust-traces-hosts
-          path: /tmp/rust-traces-out
-          retention-days: 1
-          if-no-files-found: ignore
 
   # The Ply runs that would starve a partition, on runners of their own (`ci-shards.sh corpus-matrix`):
   # the corpus's checks that start desks under load, cut by duration over the `desks-<k>` runners,
@@ -1131,7 +983,7 @@ jobs:
   # stands for start.
   corpus:
     name: Run ${{ matrix.id }} on a runner of its own
-    needs: [plan, build, build-ply]
+    needs: [plan, build-ply]
     if: needs.build-ply.outputs.solo == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1159,7 +1011,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.build-ply.outputs.shards == 'true' && startsWith(matrix.id, 'desks-')
+        if: needs.plan.outputs.shards == 'true' && startsWith(matrix.id, 'desks-')
         with:
           name: test-shards
           path: /tmp/ply-shards
@@ -1228,7 +1080,7 @@ jobs:
       - name: Run the Ply tests
         env:
           ID: ${{ matrix.id }}
-          SHARDS: ${{ needs.build-ply.outputs.shards }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -euo pipefail
           case "$ID" in
@@ -1300,7 +1152,7 @@ jobs:
   # after each (`edit_sweep`): nightly, the day's cases in shards.
   edit-sweep:
     name: Sweep edits, cases ${{ matrix.name }}
-    needs: [plan, build, build-ply]
+    needs: [plan, build-ply]
     if: needs.plan.outputs.swept == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -1361,26 +1213,26 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, refresh, edit-sweep, treesitter]
+    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, edit-sweep, treesitter]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Check every job succeeded
         env:
-          EVENT: ${{ github.event_name }}
+          PASSED: ${{ needs.build.outputs.passed }}
         run: |
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # `refresh` runs on a push to main only, `build-ply` starts no partition or corpus job whose
-          # runs what earlier runs kept answers, and the edit sweep runs only where it has cases.
-          not_ok=$(jq -r --arg event "$EVENT" '
+          # `build-ply` starts no partition or corpus job whose runs what earlier runs kept answers,
+          # the edit sweep runs only where it has cases, and a Rust a run passed runs no Rust test.
+          not_ok=$(jq -r --arg passed "$PASSED" '
             to_entries[]
             | select(.value.result != "success")
-            | select(($event != "push" and .value.result == "skipped"
-                and .key == "refresh") | not)
             | select((.value.result == "skipped"
                 and (.key == "lanes" or .key == "corpus" or .key == "edit-sweep")) | not)
+            | select(($passed == "true" and .value.result == "skipped"
+                and (.key == "nextest" or .key == "hosts")) | not)
             | "\(.key) = \(.value.result)"
           ' /tmp/needs.json)
           if [ -n "$not_ok" ]; then

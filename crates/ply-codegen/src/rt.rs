@@ -897,7 +897,8 @@ impl Ctx {
         // before the heap their words live in.
         crate::detached::release_all(self);
         self.cells.close_program_regions();
-        debug_assert!(
+        // A leak here is the runtime's, and cheap to see, so every build looks.
+        assert!(
             self.cells_balanced(),
             "closing the entry's regions left slots the arena did not reclaim"
         );

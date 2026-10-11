@@ -1,7 +1,6 @@
 //! The environment a launched program runs in, as a lent effect: the variables, whether the
-//! streams are terminals, the working directory, the binary's own version, size and shipped
-//! digest, the directory `ply run` and `ply check` file what they reuse in, and the one the
-//! emitter's answers are kept in.
+//! streams are terminals, the working directory, the binary's own version and size, the directory
+//! `ply run` and `ply check` file what they reuse in, and the one the emitter's answers are kept in.
 //! Bound by the launcher for the program it enters — user programs read configuration, not the
 //! environment.
 //!
@@ -16,15 +15,13 @@ use std::sync::Arc;
 /// `env.binary_version[e]()`.
 pub const EFFECT: &str = "env";
 
-const OPERATIONS: [(&str, &str); 10] = [
+const OPERATIONS: [(&str, &str); 8] = [
     ("var", "ply_launcher::env::var"),
     ("vars", "ply_launcher::env::vars"),
     ("terminal", "ply_launcher::env::terminal"),
     ("binary_version", "ply_launcher::env::binary_version"),
     ("binary_bytes", "ply_launcher::env::binary_bytes"),
     ("pwd", "ply_launcher::env::pwd"),
-    ("shipped_digest", "ply_launcher::env::shipped_digest"),
-    ("builder_digest", "ply_launcher::env::builder_digest"),
     ("reused", "ply_launcher::env::reused"),
     ("bodies", "ply_launcher::env::bodies"),
 ];
@@ -86,11 +83,6 @@ impl HostHandler for EnvHandler {
                 Ok(binary) => Value::ctor("Some", vec![Value::Int(binary.len() as i64)]),
                 Err(_) => Value::ctor("None", Vec::new()),
             },
-            // The digest the committed `ply` runnable is gated on: `ply bootstrap` writes it
-            // beside the runnable.
-            ("shipped_digest", []) => Value::str(crate::shipped::identity()),
-            // The digest the committed builder is gated on: `ply bootstrap` writes it beside it.
-            ("builder_digest", []) => Value::str(ply_machine::builds::identity()),
             // Under the stage root, where `sweep` keeps them to the cache's budget.
             ("reused", []) => Value::str(
                 ply_codegen::c::stage::stage_dir(ply_codegen::c::sweep::REUSED)

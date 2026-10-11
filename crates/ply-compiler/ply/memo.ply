@@ -356,6 +356,64 @@ fn marked_from(
   )
 }
 
+/// Whether `rec` asked the query and input `id` names.
+fn asks(rec: Record, id: Bytes) -> Bool =
+  fold(rec.reads, false, |found: Bool, r: Read|
+    found
+      || (match r {
+        Asked(name, input, _) -> asked_id(name, input) == id,
+        World(_, _, _) -> false,
+      }))
+
+/// The records to raise next, each with the height it is raised above, and those raised already.
+type Raising = { frontier: List<{ id: Bytes, height: Int }>, done: Map<Bytes, Bool> }
+
+/// Each record that asked the one `id` names raised above `height`, and each that asked one of those
+/// in turn: a record stands above every record it reads, however tall those grew since it ran, so a
+/// run settling marks lowest first settles what it reads before it. Records kept by runs apart may
+/// ask one another in a circle, which no heights order, so each is raised at most once.
+fn raised(
+  queries: Map<Bytes, Query>,
+  id: Bytes,
+  height: Int,
+) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let by_hash = map_fold(queries, map_new(), |acc: Map<Bytes, Bytes>, _: Bytes, q: Query|
+    map_insert(acc, q.hash, q.name));
+  iterate({ frontier: [{ id: id, height: height }], done: map_new() }, 1000000, |x: Raising|
+    if len(x.frontier) == 0 { Stop(()) } else {
+      Continue(
+        fold(
+          x.frontier,
+          { frontier: [], done: x.done },
+          |st: Raising, f: { id: Bytes, height: Int }|
+            fold(memo_keep.readers(f.id), st, |acc: Raising, k: Bytes|
+              if map_contains(acc.done, k) { acc } else {
+                match memo_keep.record(k) {
+                  // A link outlives the read that made it, so only a record that still asks it is
+                  // raised.
+                  Some(rec) -> if rec.height > f.height || !asks(rec, f.id) { acc } else {
+                    match ((memo_keep.output(rec.output), map_get(by_hash, rec.query))) {
+                      (Some(out), Some(name)) -> {
+                        memo_keep.keep(k, { ..rec, height: f.height + 1 }, out);
+                        {
+                          frontier: push(acc.frontier, {
+                            id: asked_id(name, rec.input),
+                            height: f.height + 1,
+                          }),
+                          done: map_insert(acc.done, k, true),
+                        }
+                      },
+                      _ -> acc,
+                    }
+                  },
+                  None -> acc,
+                }
+              }),
+        ),
+      )
+    })
+}
+
 /// The digest of what the world holds at `at` as `kind` reads it, with the store's note of the place
 /// brought to it. Where the note says otherwise, `marking` marks the records that read the place
 /// before the note moves, so no record stands on a read that moved unmarked; where another run holds
@@ -420,14 +478,18 @@ fn queued(
     map_insert(acc, h, push(match map_get(acc, h) { Some(ks) -> ks, None -> [] }, k))
   })
 
-/// The lowest of `pending`'s records, and the rest of them: none where none is left.
-fn lowest(pending: Map<Int, List<Bytes>>) -> Option<{ key: Bytes, rest: Map<Int, List<Bytes>> }> = {
+/// The lowest of `pending`'s records, the height it was queued at, and the rest of them: none where
+/// none is left.
+fn lowest(
+  pending: Map<Int, List<Bytes>>,
+) -> Option<{ key: Bytes, height: Int, rest: Map<Int, List<Bytes>> }> = {
   let h = map_fold(pending, 0 - 1, |acc: Int, k: Int, _: List<Bytes>|
     if acc < 0 || k < acc { k } else { acc });
   match map_get(pending, h) {
     Some([key, ..rest]) ->
       Some({
         key: key,
+        height: h,
         rest: if len(rest) == 0 { map_remove(pending, h) } else { map_insert(pending, h, rest) },
       }),
     _ -> None,
@@ -448,7 +510,11 @@ fn settled_marks(
       Some(first) -> {
         let key = first.key;
         let next = { ..r, marked: first.rest };
-        if len(memo_keep.marks(key)) == 0 { Continue(next) } else {
+        if len(memo_keep.marks(key)) == 0 { Continue(next) }
+        // Raised above where it was queued by something it reads, it settles after that.
+        else if memo_keep.height(key) > first.height {
+          Continue({ ..next, marked: queued(next.marked, [key]) })
+        } else {
           match memo_keep.record(key) {
             // A link outlives the record it named, so a place that moves marks keys no record is
             // kept under: those marks mark nothing, and are let go.
@@ -823,17 +889,15 @@ fn executed(
       // A height only orders settling, so it never falls: a record that read less for a while (its
       // group gone, say) still settles after what it reads once it reads it again.
       let was = memo_keep.height(key);
+      let height = if was > s.height { was } else { s.height };
       memo_keep.keep(
         key,
-        {
-          query: q.hash,
-          input: input,
-          reads: s.reads,
-          output: d,
-          height: if was > s.height { was } else { s.height },
-        },
+        { query: q.hash, input: input, reads: s.reads, output: d, height: height },
         output,
       );
+      // A new record's askers take their heights from it as they finish; one that grew lifts those
+      // that asked it before.
+      if was > 0 && height > was { raised(queries, asked_id(q.name, input), height) };
       if len(marks) > 0 { memo_keep.unmark(key, marks) };
       { run: changed, head: d }
     } }

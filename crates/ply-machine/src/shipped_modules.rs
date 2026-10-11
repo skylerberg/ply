@@ -126,21 +126,6 @@ pub fn digest_of(name: &str) -> Option<String> {
     Some(blake3::Hash::from(digest).to_hex().to_string())
 }
 
-/// What everything shipped is: every module's text, then each data file by its name and the digest
-/// the pack holds of its bytes, so no data file is read for it.
-pub fn digest() -> String {
-    let pack = ply_pack::installed();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(crate::builds::digest_of(&sources()).as_bytes());
-    for path in pack.data_below(ply_pack::STD) {
-        hasher.update(&[0]);
-        hasher.update(data_name(path).as_bytes());
-        hasher.update(&[0]);
-        hasher.update(&pack.digest_of(path).expect("a listed path is carried"));
-    }
-    hasher.finalize().to_hex()[..16].to_string()
-}
-
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {
     let (root, rest) = match module.as_str().strip_prefix("compiler.") {
         Some(rest) => (COMPILER_PSEUDO_ROOT, rest.replace('.', "/")),

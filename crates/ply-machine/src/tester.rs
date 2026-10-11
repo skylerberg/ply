@@ -10,7 +10,7 @@
 
 use crate::hosts::{self, Hosts, LentOp};
 use crate::payload::{count, diags_value, field_of, json, option, raised_value, record, strings};
-use crate::support::{select_profile, unit_of};
+use crate::support::unit_of;
 use crate::testrun::{
     Executed, Executor, Hosting, Interleaved, Usage, executed, interleaved, listed, status_word,
 };
@@ -61,7 +61,6 @@ pub struct TestOptions {
     pub path: PathBuf,
     pub steps: i64,
     pub timeout: u64,
-    pub profile: String,
     pub host: bool,
     pub tls: crate::options::TlsOptions,
     pub fs: Vec<ply_host::fs::RootSpec>,
@@ -77,7 +76,6 @@ impl Default for TestOptions {
             path: PathBuf::from("."),
             steps: ply_eval::DEFAULT_STEP_BUDGET,
             timeout: 60_000,
-            profile: "development".to_string(),
             host: false,
             tls: crate::options::TlsOptions::default(),
             fs: Vec::new(),
@@ -177,8 +175,8 @@ impl HostHandler for TesterHandler {
             }
             "unit" => self.unit(
                 arg(req, 0)?,
-                crate::payload::option_of(arg(req, 1)?, "the unit's C", span)?
-                    .map(|c| c.as_bytes(span, "the unit's C").map(|b| &b[..]))
+                crate::payload::option_of(arg(req, 1)?, "the unit's library", span)?
+                    .map(|c| c.as_str(span, "the unit's library").map(PathBuf::from))
                     .transpose()?,
                 arg(req, 2)?.as_bool(span, "whether the unit reaches the binding")?,
                 span,
@@ -281,24 +279,17 @@ fn err(value: PlyValue) -> PlyValue {
 // --- The units and the binding -------------------------------------------------
 
 impl TesterHandler {
-    /// A program the CLI ran the front end over and produced the C of, made a unit tests can run
+    /// A program the CLI ran the front end over and compiled the unit of, made a unit tests can run
     /// in: the loaded program, a mutant of it, or a mixture of two of its eras. `None` builds
     /// nothing, for a run that executes nothing.
     fn unit(
         &self,
         front: &PlyValue,
-        unit: Option<&[u8]>,
+        unit: Option<PathBuf>,
         hosted: bool,
         span: Span,
     ) -> Result<PlyValue, Diagnostic> {
         let path = lock(&self.options).path.clone();
-        let profile = lock(&self.options).profile.clone();
-        // Which C compiler ran is no part of what a test answers.
-        if !self.hermetic
-            && let Err(diagnostic) = select_profile(&profile)
-        {
-            return Ok(err(diags_value(&[diagnostic])));
-        }
         // Read on this thread: a `Value` may not cross to another.
         let handed = crate::driver::loaded_analysis_of(front, span)?;
         let root = if self.hermetic {
@@ -310,8 +301,11 @@ impl TesterHandler {
             Ok(loaded) => loaded,
             Err(refused) => return Ok(err(diags_value(&refused.diagnostics))),
         };
-        // Compiled outside the lock: a test of an earlier unit may be running meanwhile.
-        let provider = match unit.map(|text| unit_of(&loaded.front, text)).transpose() {
+        // Opened outside the lock: a test of an earlier unit may be running meanwhile.
+        let provider = match unit
+            .map(|library| unit_of(&loaded.front, &library))
+            .transpose()
+        {
             Ok(provider) => provider,
             Err(diagnostic) => return Ok(err(diags_value(&[diagnostic]))),
         };
@@ -625,14 +619,7 @@ fn compiled_value(provider: Option<&dyn ply_eval::Provider>, hermetic: bool) -> 
         ("converted_in", tally(offers.converted_in)),
         ("converted_out", tally(offers.converted_out)),
         ("units", option(compiled.map(|c| tally(c.units)))),
-        (
-            "analysis_nanos",
-            option(compiled.map(|c| tally(c.analysis_nanos))),
-        ),
-        (
-            "codegen_nanos",
-            option(compiled.map(|c| tally(c.codegen_nanos))),
-        ),
+        ("load_nanos", option(compiled.map(|c| tally(c.load_nanos)))),
         (
             "unbuilt",
             tally(provider.map_or(0, ply_eval::Provider::unbuilt)),
@@ -779,7 +766,6 @@ pub fn test_options_of(v: &PlyValue, span: Span) -> Result<TestOptions, Diagnost
         path: PathBuf::from(str_at("path")?),
         steps: int_at("steps")?,
         timeout: u64::try_from(int_at("timeout")?).unwrap_or(0),
-        profile: str_at("profile")?,
         host: bool_at("host")?,
         tls: crate::options::TlsOptions {
             tls: cred_list("tls")?,

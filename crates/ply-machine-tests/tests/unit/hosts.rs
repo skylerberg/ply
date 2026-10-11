@@ -1,6 +1,7 @@
 use self::fixture::{op, receives_secrets, registry};
+use crate::sketch::{Sketch, atom};
 use ply_eval::host::{HostListing, HostRegistry, HostResource, Linearity};
-use ply_eval::{CheckOutput, Footprint, Resource, Symbol};
+use ply_eval::{CheckOutput, Footprint, Mode, Resource, Symbol};
 use ply_host::tls;
 use ply_machine::config::Configuration;
 use ply_machine::hosts::*;
@@ -64,23 +65,32 @@ pub mod fixture {
     }
 }
 
-const DB: &str = r#"
-nondet effect db {
-  read  get[r](key: Int) -> Int
-  write put[r](key: Int, value: Int) -> Int
-}
-
-fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
-
-fn other(k: Int) -> Int / {db.read[orders]} = db.get[orders](k)
-
-fn store(k: Int) -> Int / {db.write[orders]} = db.put[orders](k, 1)
-
-fn stamp() -> Instant / {clock.read} = clock.now()
-"#;
-
-fn check(source: &str) -> CheckOutput {
-    crate::answered::checked("m", source).check
+/// What a front end answers of a program declaring `db` in module `m`:
+///
+/// ```text
+/// nondet effect db {
+///   read  get[r](key: Int) -> Int
+///   write put[r](key: Int, value: Int) -> Int
+/// }
+/// fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)
+/// fn other(k: Int) -> Int / {db.read[orders]} = db.get[orders](k)
+/// fn store(k: Int) -> Int / {db.write[orders]} = db.put[orders](k, 1)
+/// fn stamp() -> Instant / {clock.read} = clock.now()
+/// ```
+fn db() -> CheckOutput {
+    Sketch::default()
+        .effect("", "clock", true, &[("now", Mode::Read, false)])
+        .effect(
+            "m",
+            "db",
+            true,
+            &[("get", Mode::Read, true), ("put", Mode::Write, true)],
+        )
+        .def("m", "lookup", vec![atom("m.db", "users", Mode::Read)])
+        .def("m", "other", vec![atom("m.db", "orders", Mode::Read)])
+        .def("m", "store", vec![atom("m.db", "orders", Mode::Write)])
+        .def("m", "stamp", vec![atom("clock", "", Mode::Read)])
+        .check()
 }
 
 fn full() -> HostRegistry {
@@ -113,7 +123,7 @@ fn full() -> HostRegistry {
 }
 
 fn listing() -> HostListing {
-    full().preview(&check(DB)).expect("the fixture binds")
+    full().preview(&db()).expect("the fixture binds")
 }
 
 #[test]
@@ -134,7 +144,7 @@ fn the_listing_names_every_resource_an_any_handler_got() {
 
 #[test]
 fn the_listing_and_its_digest_are_stable_across_runs() {
-    let program = check(DB);
+    let program = db();
     let once = full().preview(&program).unwrap();
     let twice = full().preview(&program).unwrap();
     assert_eq!(once.rows, twice.rows);
@@ -143,7 +153,7 @@ fn the_listing_and_its_digest_are_stable_across_runs() {
 
 #[test]
 fn the_digest_moves_when_a_flag_alone_moves() {
-    let program = check(DB);
+    let program = db();
     let base = full().preview(&program).unwrap().digest_short();
 
     let clock = |linearity, blocking| {
@@ -216,7 +226,7 @@ fn only_the_password_hashes_and_the_two_secret_writes_declare_that_they_may_rece
 /// and the report tells them apart by the handler count.
 #[test]
 fn an_empty_registry_and_an_idle_one_are_told_apart_by_the_handler_count() {
-    let empty = HostRegistry::new().preview(&check(DB)).unwrap();
+    let empty = HostRegistry::new().preview(&db()).unwrap();
     assert!(empty.rows.is_empty());
     assert_eq!(empty.handlers, 0);
 
@@ -229,7 +239,10 @@ fn an_empty_registry_and_an_idle_one_are_told_apart_by_the_handler_count() {
         "ply_host::postgres::read",
     )]);
     // A driver linked into a program that declares the effect and never queries is idle, not wrong.
-    let quiet = check("nondet effect db {\n  read get[r](key: Int) -> Int\n}\nfn f() -> Int = 1\n");
+    let quiet = Sketch::default()
+        .effect("m", "db", true, &[("get", Mode::Read, true)])
+        .def("m", "f", Vec::new())
+        .check();
     let idle = idle.preview(&quiet).unwrap();
     assert!(idle.rows.is_empty());
     assert_eq!(idle.handlers, 1);
@@ -254,7 +267,7 @@ fn a_row_carries_the_declaration_side_of_the_determinism_pair() {
 
 #[test]
 fn hermetic_is_the_default_and_reaches_nothing() {
-    let program = check(DB);
+    let program = db();
     let hosts = Hosts::open(
         &program,
         false,
@@ -276,7 +289,7 @@ fn hermetic_is_the_default_and_reaches_nothing() {
 /// prints is `suite.schedule`'s.
 #[test]
 fn a_binding_reaches_the_tests_whose_footprint_it_serves_and_a_hermetic_one_reaches_none() {
-    let program = check(DB);
+    let program = db();
     let hosts = Hosts::bind(full(), &program, true).unwrap();
     assert_eq!(hosts.label(), "host");
 
@@ -319,18 +332,23 @@ fn tls_registry() -> HostRegistry {
     )])
 }
 
-const NET: &str = r#"
-nondet effect net {
-  write listen_tls[s](port: Int, credential: String) -> Int
+/// What a front end answers of a program that listens over TLS:
+///
+/// ```text
+/// nondet effect net {
+///   write listen_tls[s](port: Int, credential: String) -> Int
+/// }
+/// fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
+/// ```
+fn net() -> CheckOutput {
+    Sketch::default()
+        .effect("m", "net", true, &[("listen_tls", Mode::Write, true)])
+        .def("m", "serve", vec![atom("m.net", "api", Mode::Write)])
+        .check()
 }
 
-fn serve() -> Int / {net.write[api]} = net.listen_tls[api](443, "api")
-"#;
-
 fn tls_listing() -> HostListing {
-    tls_registry()
-        .preview(&check(NET))
-        .expect("the fixture binds")
+    tls_registry().preview(&net()).expect("the fixture binds")
 }
 
 #[test]

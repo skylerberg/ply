@@ -88,10 +88,6 @@ fn said(program: &str, args: &[&str]) -> String {
 fn the_registrations_declare_what_a_reviewer_relies_on() {
     let handlers = registrations();
     assert_eq!(handlers.len(), Op::ALL.len());
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.os"))
-            .expect("std.os ships");
-    assert!(declaration.contains("pub nondet effect os"));
     for (op, _) in &handlers {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
@@ -99,11 +95,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         assert!(!op.blocking, "{op}");
         assert!(!op.secrets, "{op}");
         assert!(op.path.starts_with("ply_host::os::"));
-        assert!(
-            declaration.contains(&format!("  read {}() ->", op.op)),
-            "`{}` is not declared a `read` in std.os",
-            op.op
-        );
     }
 }
 

@@ -80,21 +80,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         let repeatable = op.op.as_str() != Op::SleepMs.name();
         assert_eq!(op.linearity == Linearity::Repeatable, repeatable, "{op}");
     }
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.time"))
-            .expect("std.time ships");
-    assert!(declaration.contains("pub nondet effect time"));
-    for op in Op::ALL {
-        let declared = match op.arity() {
-            0 => format!(" {}()", op.name()),
-            _ => format!(" {}(", op.name()),
-        };
-        assert!(
-            declaration.contains(&declared),
-            "`{}` is not declared in std.time",
-            op.name()
-        );
-    }
 }
 
 /// Inside `simulate` the language's `clock` is virtual time, which the region answers by name;

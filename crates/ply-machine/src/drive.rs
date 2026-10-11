@@ -9,7 +9,7 @@ use crate::config::Configuration;
 use crate::hosts::Hosts;
 use crate::load::Loaded;
 use crate::payload::{count, diags_value, json, option, record, strings};
-use crate::support::{select_profile, unit_of};
+use crate::support::unit_of;
 use ply_eval::host::MachineId;
 use ply_eval::{
     Analysis, CheckOutput, DefHash, Diagnostic, Ended, SourceMap, Span, Symbol, Value as PlyValue,
@@ -23,12 +23,13 @@ use std::time::Instant;
 
 /// What the machine is configured with when it is lent, as plain data: the options record the
 /// program parsed converts into this.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RunOptions {
-    /// The front end the CLI ran and the C of the unit it emitted from it: the CLI walks the tree,
-    /// runs the compiler and emits, and this side reads the answer and compiles the C.
+    /// The front end the CLI ran and the library it compiled the unit it emitted into: the CLI
+    /// walks the tree, runs the compiler, emits and compiles, and this side reads the answer and
+    /// opens the library.
     pub front: Option<crate::driver::LoadedAnalysis>,
-    pub unit: Option<Vec<u8>>,
+    pub unit: Option<std::path::PathBuf>,
     /// The target's argument vector: what its `process.args` answers.
     pub argv: Vec<String>,
     /// `--json` promises stdout to the one object, so the program's own lines go to stderr.
@@ -42,7 +43,6 @@ pub struct RunOptions {
     pub exec: Vec<ply_host::process::ExecSpec>,
     pub trace: crate::trace::TraceOptions,
     pub shutdown: crate::options::ShutdownOptions,
-    pub profile: String,
     /// The privileged families `--allow` granted the program being run, by name. What may drive
     /// a machine is a decision with a name, and one the program has to have declared.
     pub allow: Vec<String>,
@@ -50,36 +50,13 @@ pub struct RunOptions {
     pub hermetic: bool,
 }
 
-impl Default for RunOptions {
-    fn default() -> RunOptions {
-        RunOptions {
-            front: None,
-            unit: None,
-            argv: Vec::new(),
-            json: false,
-            steps: 0,
-            timeout: 0,
-            seed: None,
-            host: false,
-            tls: crate::options::TlsOptions::default(),
-            fs: Vec::new(),
-            exec: Vec::new(),
-            trace: crate::trace::TraceOptions::default(),
-            shutdown: crate::options::ShutdownOptions::default(),
-            profile: "development".to_string(),
-            allow: Vec::new(),
-            hermetic: false,
-        }
-    }
-}
-
 // --- The target ---------------------------------------------------------------
 
-/// A program the front end loaded, with the C of the unit the program emitted for it, or the
-/// program an artifact's runnable holds.
+/// A program the front end loaded, with the library its unit was compiled into, or the program an
+/// artifact's runnable holds.
 pub struct Target {
     loaded: Box<Loaded>,
-    unit: Vec<u8>,
+    unit: std::path::PathBuf,
     /// Opened from an artifact, whose positions are in text printed at build time, which no
     /// reader wrote.
     deployed: bool,
@@ -105,12 +82,12 @@ pub struct Hashed {
 }
 
 impl Target {
-    /// The program the caller loaded and emitted: its front end, read here rather than repeated,
-    /// and the C of its unit, compiled here when the run first enters it.
+    /// The program the caller loaded and compiled: its front end, read here rather than repeated,
+    /// and the library of its unit, opened when the run first enters it.
     pub fn open(
         path: &std::path::Path,
         front: Option<&crate::driver::LoadedAnalysis>,
-        unit: Option<&[u8]>,
+        unit: Option<&std::path::Path>,
         hermetic: bool,
     ) -> Result<Target, Refused> {
         let (Some(front), Some(unit)) = (front, unit) else {
@@ -128,20 +105,21 @@ impl Target {
         })?;
         Ok(Target {
             loaded: Box::new(loaded),
-            unit: unit.to_vec(),
+            unit: unit.to_path_buf(),
             deployed: false,
         })
     }
 
     /// The program the artifact at `path` holds as its runnable, held to the parts of the artifact
     /// its caller read and checked: the entry its namespace names, the closure it prints, and the
-    /// hash it files each name under.
+    /// hash it files each name under. `library` is what the caller compiled the artifact's unit into.
     pub fn deployed(
         path: &std::path::Path,
         runnable: &[u8],
         entry: &str,
         closure: &[Closed],
         names: &[Hashed],
+        library: &std::path::Path,
     ) -> Result<Target, Refused> {
         let about = |message: String| Refused {
             diagnostics: vec![
@@ -211,7 +189,7 @@ impl Target {
         }
         Ok(Target {
             loaded: Box::new(loaded),
-            unit: held.unit.into_bytes(),
+            unit: library.to_path_buf(),
             deployed: true,
         })
     }
@@ -248,12 +226,8 @@ impl Target {
         }
     }
 
-    /// The unit this run evaluates on, compiled from the C the target came with.
-    fn provider(&self, options: &RunOptions) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
-        // Which C compiler ran is no part of what a hermetic run answers.
-        if !options.hermetic {
-            select_profile(&options.profile)?;
-        }
+    /// The unit this run evaluates on, opened from the library the target came with.
+    fn provider(&self) -> Result<Arc<dyn ply_eval::Provider>, Diagnostic> {
         unit_of(&self.loaded.front, &self.unit)
     }
 }
@@ -303,6 +277,8 @@ impl Bound {
 pub struct Measured {
     pub steps: u64,
     pub micros: u64,
+    /// The most any entry since the last read held when its root returned.
+    pub held: ply_eval::Held,
     pub counters: ply_eval::rc::RcStats,
 }
 
@@ -337,8 +313,9 @@ impl Drive {
         entry: &str,
         closure: &[Closed],
         names: &[Hashed],
+        library: &std::path::Path,
     ) -> Result<Drive, Refused> {
-        let target = Target::deployed(path, runnable, entry, closure, names)?;
+        let target = Target::deployed(path, runnable, entry, closure, names, library)?;
         Ok(Drive::over(options, target))
     }
 
@@ -364,7 +341,7 @@ impl Drive {
     pub fn reload(
         &mut self,
         front: &crate::driver::LoadedAnalysis,
-        unit: &[u8],
+        unit: &std::path::Path,
     ) -> Result<(), Refused> {
         let path = self.target.loaded.root.clone();
         self.target = Target::open(&path, Some(front), Some(unit), self.options.hermetic)?;
@@ -377,7 +354,7 @@ impl Drive {
         if let Some(provider) = &self.provider {
             return Ok(Arc::clone(provider));
         }
-        let provider = self.target.provider(&self.options)?;
+        let provider = self.target.provider()?;
         self.provider = Some(Arc::clone(&provider));
         Ok(provider)
     }
@@ -463,8 +440,8 @@ impl Drive {
     }
 
     /// Enter one definition with arguments, the way `call` asks: the value back, or what it
-    /// raised, and what the entry ended with. The binding stays up, so a load may be called any
-    /// number of times.
+    /// raised, and what the entry ended with. A host answer is held to that definition's own row,
+    /// not the bound entry's. The binding stays up, so a load may be called any number of times.
     pub fn call(
         &mut self,
         name: &str,
@@ -473,12 +450,9 @@ impl Drive {
     ) -> Ended<ply_eval::Plain> {
         let options = &self.options;
         let target = &self.target;
-        let span = target
-            .check()
-            .defs
-            .get(&Symbol::new(name))
-            .map(|d| d.span)
-            .unwrap_or(Span::DUMMY);
+        let def = target.check().defs.get(&Symbol::new(name));
+        let span = def.map(|d| d.span).unwrap_or(Span::DUMMY);
+        let declared = def.map(|d| d.footprint.clone());
         let Some((_, bound)) = self.bound.as_ref() else {
             return Ended::refused(Diagnostic::error(
                 codes::INTERNAL_ERROR,
@@ -513,7 +487,7 @@ impl Drive {
                     span,
                     &seed,
                     &bound.hosts,
-                    bound.declared.as_ref(),
+                    declared.as_ref(),
                     compiled.clone(),
                 )
             })
@@ -665,6 +639,7 @@ fn note_measurement(
     hermetic: bool,
 ) {
     accounting.steps += compiled.steps();
+    accounting.held = accounting.held.most(compiled.held());
     if !hermetic {
         accounting.micros += u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     }
@@ -936,6 +911,16 @@ pub fn accounting_value(m: &Measured) -> PlyValue {
         ("steps", tally(m.steps)),
         ("micros", tally(m.micros)),
         ("counters", counters_value(&m.counters)),
+        (
+            "held",
+            record(vec![
+                ("bridges", tally(m.held.bridges)),
+                ("scheduled", tally(m.held.scheduled)),
+                ("task_stacks", tally(m.held.task_stacks)),
+                ("frame_tables", tally(m.held.frame_tables)),
+                ("cell_owners", tally(m.held.cell_owners)),
+            ]),
+        ),
     ])
 }
 
@@ -985,7 +970,6 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
     };
     let bool_at = |name: &str| get(name).and_then(|v| v.as_bool(span, name));
     let int_at = |name: &str| get(name).and_then(|v| v.as_int(span, name));
-    let str_at = |name: &str| get(name).and_then(|v| v.as_str(span, name).map(str::to_string));
     let str_list = |name: &str| -> Result<Vec<String>, Diagnostic> {
         get(name)?
             .as_list(span, name)?
@@ -1089,6 +1073,5 @@ pub fn run_options_of(v: &PlyValue, span: Span) -> Result<RunOptions, Diagnostic
             drain_ms: int_at("drain_ms")? as u64,
             drain_lead_ms: int_at("drain_lead_ms")? as u64,
         },
-        profile: str_at("profile")?,
     })
 }

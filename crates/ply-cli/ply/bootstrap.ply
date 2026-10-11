@@ -1,302 +1,564 @@
-//! `ply bootstrap` — a program this binary ships written out as its launcher enters it: the builder
-//! (`build.main`, the compiler's own) or `ply` itself (`ply.main`), each as `<stem>.run` beside the
-//! `<stem>.digest` the launcher gates it on and the `<stem>.key` a builder takes it under for
-//! another text that enters the same definition. The front end, the emission and the runnable are this
-//! program's, and so is what `--verify` makes of them.
+//! `ply bootstrap` — a native `ply` built from a checkout by this one. The runtime's library is the
+//! one cargo built of the checkout's Rust, which describes itself; the checkout's compiler is built
+//! here against that description into the builder, a native program on that runtime; the builder
+//! builds the checkout's `ply` and holds its constants on that runtime; that is linked into a native
+//! `ply`, which answers the shipped modules; and its pack carries the shipped modules, those answers
+//! and its own front end. Only the compiler and the shipped modules it imports are built by this
+//! `ply`'s compiler, so only they cannot use a language rule the checkout introduces.
 
-import args (Flags, style_of, root_of)
-import build (Def, defs_of)
+import args (Flags, no_flags, style_of)
 import builder (builder)
-import diagnostic (Place)
 import env (env)
-import literals (literal, unsettled)
-import paths (Rooted, child, create_dir, read_file, spelled, write_file)
+import paths
 import program (Timed, front_of, timed_load, program_view)
 import report (Answer, ok_code, compile_error, refused, reported)
-import std.term (Style, plain)
-import units (emit, whole)
-import compiler.embed (EmbedAt, EmbedFile)
-import compiler.front (View, shipped_dump)
-import compiler.hash (hex)
-import compiler.load (every_root)
+import compiler.cc
+import compiler.cc (Toolchain, compilers, toolchain)
+import compiler.front (shipped_dump)
+import compiler.load (LoadedAnalysis, every_root)
+import compiler.native
+import compiler.native (Packed)
+import compiler.parsing (no_module)
 import compiler.resolve (Diag, error_at)
-import compiler.unit (shipped, program_key)
-import std.fs (fs)
-import std.hash (blake3)
-import std.json (Json, Str, Bool, Number, Array, object)
+import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, read_kept, write_kept)
+import std.fs
+import std.fs (fs, Entry, File)
+import std.json (Json, Str, Bool, object)
+import std.list (concat)
+import std.string (replace)
+import std.process (process)
 import std.random (entropy)
 import std.time (time)
-import compiler.parsing (no_module)
+import std.path (below_root, parent)
 
-/// What `ply bootstrap` is configured with, as the program parses it.
-pub type Options = { out: String, verify: Bool }
+/// What a bootstrap is told: the checkout, the profile it compiles under, the runtime's library and
+/// where the `ply` it builds goes.
+pub type Options = { root: String, profile: String, library: String, out: String }
 
-/// A program this binary ships: the definition it enters, and the name its files go by.
-pub type Shipped = { entry: String, stem: String }
+/// `path` made absolute against the working directory `pwd`.
+fn absolute(pwd: String, path: String) -> String =
+  if string_starts_with(path, "/") { path } else if path == "." { pwd } else { pwd ++ "/" ++ path }
 
-pub fn programs() -> List<Shipped> =
-  [{ entry: "build.main", stem: "build" }, { entry: "ply.main", stem: "ply" }]
-
-/// The two digests a runnable is described by: the one its launcher gates it on, and over its bytes.
-pub type Described = { digest: String, runnable: String }
-
-pub type Emitted = {
-  program: Shipped,
-  /// What the launcher gates the program on, which `<stem>.digest` holds.
-  digest: String,
-  /// Over `<stem>.run`, which is what `--verify` checks.
-  runnable: String,
-  /// What a builder keeps the program under, which `<stem>.key` holds; empty for an entry the front
-  /// end gave no hash.
-  key: String,
-  definitions: Int,
-  bytes: Int,
-  /// The bytes of every file the program's modules embed, a shipped module's data among them. The
-  /// runnable's unit holds what its definitions reach of them, so a binary that enters it reads none.
-  embedded: Int,
-  /// Where the files go, whether or not they are there.
-  at: String,
-  /// The files on disk as `--verify` read them; `None` when there are none, and on a run that wrote.
-  recorded: Option<Described>,
+fn options_of(flags: Flags) -> Options / {env.pwd[sys]} = {
+  let pwd = env.pwd[sys]();
+  let root = match list_at(flags.paths, 0) { Some(r) -> r.absolute, None -> pwd };
+  let profile = match flags.profile { Some("release") -> "release", _ -> "development" };
+  let target = root ++ "/target/" ++ (if profile == "release" { "release" } else { "debug" });
+  {
+    root: root,
+    profile: profile,
+    library: match flags.runtime {
+      Some(l) -> absolute(pwd, l),
+      None -> target ++ "/libply_native.a",
+    },
+    out: match flags.out { Some(o) -> absolute(pwd, o), None -> target ++ "/ply" },
+  }
 }
 
-fn described(emitted: Emitted) -> Json =
-  object([
-    { key: "digest", value: Str(emitted.digest) },
-    { key: "runnable", value: Str(emitted.runnable) },
-  ])
+fn nowhere(message: String) -> Diag =
+  error_at(b"E0502", no_module(), { start: 0, end: 0 }, bytes_of_string(message), b"", [])
 
-fn described_json(d: Described) -> Json =
-  object([{ key: "digest", value: Str(d.digest) }, { key: "runnable", value: Str(d.runnable) }])
+/// What a native program's objects compile at under `profile`.
+fn level_of(profile: String) -> String = if profile == "release" { "-O2" } else { "-O0" }
 
-// --- Refusals -----------------------------------------------------------------
+// --- The checkout's shipped modules ---------------------------------------------------
 
-fn nowhere(message: String, label: Bytes) -> Diag =
-  error_at(b"E0502", no_module(), { start: 0, end: 0 }, bytes_of_string(message), label, [])
+/// Where a checkout keeps the standard library, the compiler and the builtins it declares.
+fn std_dir() -> String = "crates/ply-std/ply"
 
-fn no_runnable(at: String) -> Diag =
-  nowhere("no runnable at " ++ at, b"`--verify` compares against a runnable already written")
+fn compiler_dir() -> String = "crates/ply-compiler/ply"
 
-fn not_shipped(found: List<Shipped>) -> Diag =
-  nowhere(
-    if len(found) == 0 { "this is no program this binary ships" }
-    else { "this is more than one program this binary ships" },
-    b"`ply bootstrap` writes the builder (`build.main`) or `ply` itself (`ply.main`); `ply build` builds any other program",
-  )
+fn prelude_path() -> String = "crates/ply-compiler/prelude.ply"
 
-fn refusing(style: Style, diag: Diag) -> Answer / {abort.raise} =
-  reported(style, "bootstrap", [diag], [])
+/// One file a shipped root holds, by the name it is read under there, and the path a pack keeps it
+/// under.
+type Shipping = { name: String, path: String, bytes: Bytes }
 
-// --- `--verify` -------------------------------------------------------------------
-
-fn agrees(emitted: Emitted) -> Answer =
-  {
-    json: object([
-      { key: "command", value: Str("bootstrap") },
-      { key: "ok", value: Bool(true) },
-      { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
-      { key: "verified", value: described(emitted) },
-    ]),
-    lines: ["the runnable describes this tree: " ++ emitted.digest],
-    errs: [],
-    code: ok_code(),
-  }
-
-fn differs(emitted: Emitted, recorded: Described) -> Answer =
-  {
-    json: object([
-      { key: "command", value: Str("bootstrap") },
-      { key: "ok", value: Bool(false) },
-      { key: "exit_code", value: Number(decimal_of_int(compile_error())) },
-      { key: "recorded", value: described_json(recorded) },
-      { key: "emitted", value: described(emitted) },
-    ]),
-    lines: [],
-    errs: [
-      "the runnable does not describe this tree:",
-      "  recorded " ++ recorded.digest ++ " " ++ recorded.runnable,
-      "  emitted  " ++ emitted.digest ++ " " ++ emitted.runnable,
-    ],
-    code: compile_error(),
-  }
-
-fn verified(style: Style, emitted: Emitted) -> Answer / {abort.raise} =
-  match emitted.recorded {
-    None -> refusing(style, no_runnable(emitted.at)),
-    Some(d) -> if d.digest == emitted.digest && d.runnable == emitted.runnable { agrees(emitted) }
-    else { differs(emitted, d) },
-  }
-
-// --- What a run writes ----------------------------------------------------------
-
-pub fn wrote(emitted: Emitted) -> Answer =
-  {
-    json: object([
-      { key: "command", value: Str("bootstrap") },
-      { key: "ok", value: Bool(true) },
-      { key: "exit_code", value: Number(decimal_of_int(ok_code())) },
-      { key: "entry", value: Str(emitted.program.entry) },
-      { key: "wrote", value: Str(emitted.at) },
-      { key: "embedded", value: Number(decimal_of_int(emitted.embedded)) },
-      { key: "runnable", value: described(emitted) },
-    ]),
-    lines: [
-      emitted.program.entry ++ ": " ++ int_to_string(emitted.definitions) ++ " definitions, "
-        ++ int_to_string(emitted.bytes)
-        ++ " bytes of C, "
-        ++ int_to_string(emitted.embedded)
-        ++ " bytes embedded",
-      "digest   " ++ emitted.digest,
-      "runnable " ++ emitted.runnable,
-      "wrote    " ++ emitted.at,
-    ],
-    errs: [],
-    code: ok_code(),
-  }
-
-fn runnable_file(p: Shipped) -> String = p.stem ++ ".run"
-
-fn digest_file(p: Shipped) -> String = p.stem ++ ".digest"
-
-fn unwritable(at: String) -> Diag =
-  nowhere("could not write the runnable at " ++ at, b"the runnable could not be written")
-
-fn recorded_at(
-  out: Rooted,
-  p: Shipped,
-) -> Option<Described> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match read_file(child(out, digest_file(p))) {
-    None -> None,
-    Some(digest) -> match read_file(child(out, runnable_file(p))) {
-      None -> None,
-      Some(bytes) ->
-        Some({
-          digest: string_trim(string_of_bytes(digest)),
-          runnable: string_of_bytes(hex(blake3(bytes))),
+/// Every file below `dir` but those in a hidden directory, a cache, by its path below it.
+fn files_below(
+  root: String,
+  dir: String,
+) -> List<{ rel: String, bytes: Bytes }> / {fs.read[abs], abort.raise} =
+  match fs.walk[abs](below_root(root ++ "/" ++ dir)) {
+    None -> [],
+    Some(entries) ->
+      fold(entries, [], |acc: List<{ rel: String, bytes: Bytes }>, e: Entry|
+        match e.kind {
+          File -> {
+            let rel = string_slice(
+              e.path,
+              string_len(below_root(root ++ "/" ++ dir)) + 1,
+              string_len(e.path),
+            );
+            if string_starts_with(rel, ".") || string_contains(rel, "/.") { acc } else {
+              match fs.read_file[abs](e.path) {
+                Some(bytes) -> push(acc, { rel: rel, bytes: bytes }),
+                None -> acc,
+              }
+            }
+          },
+          _ -> acc,
         }),
+  }
+
+/// The checkout's shipped modules and data, each as a shipped root names it and a pack keeps it:
+/// `std.hash.legacy.ply` for `hash/legacy.ply`, `std/<path>` for a data file, `compiler.<stem>.ply`
+/// for a module of the compiler, and `compiler.prelude.ply` for its builtins.
+fn shipping(root: String) -> List<Shipping> / {fs.read[abs], abort.raise} = {
+  let std_files = map(files_below(root, std_dir()), |f: { rel: String, bytes: Bytes }|
+    if string_ends_with(f.rel, ".ply") {
+      {
+        name: "std." ++ replace(string_slice(f.rel, 0, string_len(f.rel) - 4), "/", ".") ++ ".ply",
+        path: std_dir() ++ "/" ++ f.rel,
+        bytes: f.bytes,
+      }
+    } else { { name: "std/" ++ f.rel, path: std_dir() ++ "/" ++ f.rel, bytes: f.bytes } });
+  let compiler_files = fold(
+    files_below(root, compiler_dir()),
+    [],
+    |acc: List<Shipping>, f: { rel: String, bytes: Bytes }|
+      if string_ends_with(f.rel, ".ply") && !string_contains(f.rel, "/") {
+        push(acc, {
+          name: "compiler." ++ string_slice(f.rel, 0, string_len(f.rel) - 4) ++ ".ply",
+          path: compiler_dir() ++ "/" ++ f.rel,
+          bytes: f.bytes,
+        })
+      } else { acc },
+  );
+  let prelude = match fs.read_file[abs](below_root(root ++ "/" ++ prelude_path())) {
+    Some(bytes) -> [{ name: "compiler.prelude.ply", path: prelude_path(), bytes: bytes }],
+    None -> [],
+  };
+  concat(concat(std_files, compiler_files), prelude)
+}
+
+fn module_names(files: List<Shipping>) -> List<String> / {abort.raise} =
+  fold(files, [], |acc: List<String>, f: Shipping|
+    if string_ends_with(f.name, ".ply") {
+      push(acc, string_slice(f.name, 0, string_len(f.name) - 4))
+    } else { acc })
+
+/// `body` with the shipped modules as `files` hold them in place of this `ply`'s own: what a load of
+/// the checkout's compiler compiles it against. Packed answers still answer where they agree with
+/// what they read, but none is taken as standing for these files.
+fn over_shipping<a | e>(
+  files: List<Shipping>,
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.answer | e},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise | e} = {
+  let by_name = fold(files, map_new(), |acc: Map<String, Bytes>, f: Shipping|
+    map_insert(acc, f.name, f.bytes));
+  let names = module_names(files);
+  handle {
+    body()
+  } with {
+    fs.list_dir[shipped](dir) -> if dir == "." {
+      match fs.list_dir[shipped](".") {
+        Some(own) ->
+          Some(
+            concat(
+              filter(own, |n: String| !string_ends_with(n, ".ply") && n != "std"),
+              map_keys(by_name),
+            ),
+          ),
+        None -> Some(map_keys(by_name)),
+      }
+    } else { fs.list_dir[shipped](dir) },
+    fs.read_file[shipped](name) -> match map_get(by_name, name) {
+      Some(bytes) -> Some(bytes),
+      None -> fs.read_file[shipped](name),
+    },
+    shipped.names() -> names,
+    shipped.module(name) -> match map_get(by_name, name ++ ".ply") {
+      Some(bytes) -> Some(bytes),
+      None -> map_get(by_name, name),
+    },
+    shipped.answer(path) -> if path == "standing" { None } else { shipped.answer(path) },
+  }
+}
+
+// --- Building -------------------------------------------------------------------------
+
+/// What a bootstrap's builds reach beside the loads they make: the compilers and their cache, the
+/// checkout and where the `ply` it builds goes, below the filesystem's root.
+pub effect set Bootstraps = {compilers.write[cc], toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.front, time.elapsed_ms}
+
+fn failed<a>(why: String) -> Result<a, List<Diag>> = Err([nowhere(why)])
+
+/// The toolchain native programs compile with under `profile`: `cc`, which links them too.
+fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc]} =
+  match compilers.found[cc]() {
+    None -> failed("no `cc` is installed to compile C with"),
+    Some(compiler) -> Ok(cc::toolchain_of(compiler, level_of(profile))),
+  }
+
+/// The runtime the library at `library` is, as a program linked with it and nothing else says.
+fn described(
+  t: Toolchain,
+  library: String,
+  work: String,
+) -> Result<Runtime, List<Diag>> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise} =
+  match cc::executable[cc](
+      t,
+      native::describer_c(),
+      [],
+      concat([library], toolchain.libraries()),
+      work,
+    ) {
+    Err(why) -> failed("the runtime's library at `" ++ library ++ "` does not link: " ++ why),
+    Ok(exe) -> {
+      let ran = toolchain.ran(relative(exe), []);
+      if ran.code != 0 {
+        failed("the runtime's library does not describe itself: " ++ string_of_bytes_lossy(ran.err))
+      } else {
+        match native::runtime_of(ran.out) {
+          Some(r) -> Ok(r),
+          None ->
+            failed("the runtime's library describes itself in a form this `ply` does not read"),
+        }
+      }
     },
   }
 
-fn key_file(p: Shipped) -> String = p.stem ++ ".key"
+/// `path`, an absolute one below the toolchain's cache, as the cache names it.
+fn relative(path: String) -> String / {toolchain.read, abort.raise} = {
+  let cache = toolchain.cache();
+  if string_starts_with(path, cache ++ "/") {
+    string_slice(path, string_len(cache) + 1, string_len(path))
+  } else { path }
+}
 
-/// The runnable, the digest it is gated on, and the key a builder takes it under.
-fn landed(
-  out: Rooted,
-  emitted: Emitted,
-  bytes: Bytes,
-) -> Bool / {fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs]} =
-  create_dir(out) && write_file(child(out, runnable_file(emitted.program)), bytes)
-    && write_file(child(out, digest_file(emitted.program)), bytes_of_string(emitted.digest ++ "\n"))
-    && write_file(child(out, key_file(emitted.program)), bytes_of_string(emitted.key ++ "\n"))
+/// `objects` and the native `main` linked with the runtime's library into an executable: its path
+/// below the cache.
+fn linked(
+  t: Toolchain,
+  objects: Result<List<String>, String>,
+  library: String,
+  work: String,
+) -> Result<String, List<Diag>> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise} =
+  match objects {
+    Err(why) -> failed(why),
+    Ok(objects) -> match cc::executable[cc](
+        t,
+        native::main_c(),
+        objects,
+        concat([library], toolchain.libraries()),
+        work,
+      ) {
+      Err(why) -> failed(why),
+      Ok(exe) -> Ok(exe),
+    },
+  }
 
-fn embedded_bytes(embeds: List<EmbedAt>) -> Int =
-  fold(embeds, 0, |acc: Int, embed: EmbedAt|
-    match embed.read {
-      Ok(files) -> fold(files, acc, |sum: Int, file: EmbedFile| sum + bytes_len(file.bytes)),
-      Err(_) -> acc,
-    })
+/// The executable at `exe` with `pack` after it.
+fn packed_after(
+  exe: String,
+  pack: Bytes,
+) -> Result<String, List<Diag>> / {toolchain.read, toolchain.write, abort.raise} =
+  if toolchain.appended(relative(exe), pack) { Ok(exe) }
+  else { failed("the pack could not be written after `" ++ exe ++ "`") }
 
-/// What the definition the program enters hashes to.
-fn entry_hash(view: View, p: Shipped) -> Option<Bytes> =
-  fold(view.frame.hashes.defs, None, |acc: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
-    if d.name == bytes_of_string(p.entry) { Some(d.hash) } else { acc })
+/// What every native `ply` and builder carries: the shipped modules as a pack keeps them, and the
+/// program's own front end.
+fn packed_with(files: List<Shipping>, front: Bytes, more: List<Packed>) -> Bytes =
+  native::pack(
+    concat(
+      push(map(files, |f: Shipping| { path: f.path, bytes: f.bytes }), {
+        path: native::front_path(),
+        bytes: front,
+      }),
+      more,
+    ),
+  )
 
-/// Which program this binary ships the tree is, by the definition it holds that one of them enters.
-fn shipped_of(view: View) -> List<Shipped> = {
-  let names = map(defs_of(view), |def: Def| def.name);
-  filter(programs(), |p: Shipped| len(filter(names, |n: String| n == p.entry)) > 0)
+/// The checkout's compiler built here against `runtime` into the builder: its path below the cache.
+fn builder_built(
+  options: Options,
+  t: Toolchain,
+  runtime: Runtime,
+  files: List<Shipping>,
+  work: String,
+) -> Result<String, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+  let t_load: Timed = over_shipping(files, ||
+    timed_load([paths::at_abs(below_root(options.root ++ "/" ++ compiler_dir()))], false, false));
+  match program_view(t_load.program) {
+    None -> Err(t_load.program.diags),
+    Some(w) -> {
+      let front = front_of(t_load, w);
+      let offered = every_root(front);
+      let kept = below_root(env.bodies[sys]());
+      let emission = emitted(
+        runtime,
+        front.dump,
+        map(front.files, |f: { path: String, name: String, text: Bytes }| f.text),
+        offered,
+        emitter_identity(shipped.definitions()),
+        |k: Bytes| read_kept[abs](kept, k),
+        |k: Bytes, bytes: Bytes| write_kept[abs](kept, k, bytes),
+      );
+      match held(front.dump, offered, emission) {
+        Err(diags) -> Err(diags),
+        Ok(c) -> match linked(
+            t,
+            cc::objects[cc](t, cc::split(c), native::native_flags(), work),
+            options.library,
+            work,
+          ) {
+          Err(diags) -> Err(diags),
+          Ok(exe) ->
+            packed_after(
+              exe,
+              packed_with(
+                files,
+                shipped.front("build.main", shipped_dump(front.dump), len(front.files)),
+                [],
+              ),
+            ),
+        },
+      }
+    },
+  }
+}
+
+/// The checkout's `ply` built by `builder`: its front end, the sources of its C, which the cache
+/// keeps, and what the builder said of its steps where `phases` asked it to.
+fn ply_built(
+  options: Options,
+  builder: String,
+  work: String,
+  phases: Bool,
+) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
+  let cache = toolchain.cache();
+  let front = cache ++ "/" ++ work ++ "/ply.front";
+  let manifest = cache ++ "/" ++ work ++ "/ply.sources";
+  let memo = cache ++ "/memo-" ++ (if options.profile == "release" { "release" } else { "debug" });
+  let ran = toolchain.ran(relative(builder), [
+    options.root ++ "/crates/ply-cli/ply",
+    "ply.main",
+    front,
+    manifest,
+    memo,
+    "kept",
+    if phases { "phases" } else { "quiet" },
+  ]);
+  if ran.code != 0 {
+    failed("the builder did not build `ply`:\n" ++ string_of_bytes_lossy(ran.err))
+  } else {
+    match ((fs.read_file[abs](below_root(front)), fs.read_file[abs](below_root(manifest)))) {
+      (Some(f), Some(m)) -> match cc::manifested(m) {
+        Some(sources) -> Ok({ front: f, sources: sources, said: ran.err }),
+        None -> failed("the builder's manifest of `ply`'s C does not read"),
+      },
+      _ -> failed("what the builder built could not be read back"),
+    }
+  }
+}
+
+/// What `ply` answers of the shipped modules, as its pack carries it: each record and output of the
+/// store its `std --answers` wrote, gzipped, and the claim that they stand.
+fn answers(
+  ply: String,
+  work: String,
+) -> Result<List<Packed>, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
+  // What an earlier bootstrap left there answered for another `ply`.
+  toolchain.cleared("answers");
+  let store = toolchain.cache() ++ "/answers";
+  let ran = toolchain.ran(relative(ply), ["std", "--answers", store]);
+  if ran.code != 0 {
+    failed("the new `ply` did not answer the shipped modules:\n" ++ string_of_bytes_lossy(ran.err))
+  } else {
+    let gathered = fold(["records", "outputs"], [], |acc: List<Packed>, sub: String|
+      match fs.list_dir[abs](below_root(store ++ "/" ++ sub)) {
+        None -> acc,
+        Some(names) ->
+          fold(names, acc, |a: List<Packed>, n: String|
+            if string_starts_with(n, ".") || string_ends_with(n, ".tmp") { a } else {
+              match fs.read_file[abs](below_root(store ++ "/" ++ sub ++ "/" ++ n)) {
+                Some(bytes) ->
+                  push(a, { path: "answers/" ++ sub ++ "/" ++ n, bytes: bytes_gzip(bytes) }),
+                None -> a,
+              }
+            }),
+      });
+    match fs.read_file[abs](below_root(store ++ "/standing")) {
+      None -> failed("the new `ply` wrote no claim that its answers stand"),
+      Some(claim) -> Ok(push(gathered, { path: "answers/standing", bytes: bytes_gzip(claim) })),
+    }
+  }
+}
+
+/// A step of a bootstrap and the milliseconds it took.
+type Took = { step: String, ms: Int }
+
+fn took(steps: List<Took>, step: String, since: Int) -> List<Took> / {time.elapsed_ms} =
+  push(steps, { step: step, ms: time.elapsed_ms() - since })
+
+/// What a bootstrap that built `ply` made: how many records its answers are, what each step took,
+/// and what the builder said of its own.
+type Built = { answered: Int, steps: List<Took>, said: Bytes }
+
+fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
+  {
+    json: object([
+      { key: "command", value: Str("bootstrap") },
+      { key: "ok", value: Bool(true) },
+      { key: "wrote", value: Str(options.out) },
+    ]),
+    lines: concat(
+      [
+        "built `ply` from " ++ options.root ++ " under " ++ options.profile
+          ++ ", its shipped modules answered in "
+          ++ int_to_string(built.answered)
+          ++ " records",
+        "wrote " ++ options.out,
+      ],
+      if !phases { [] } else {
+        concat(
+          map(built.steps, |t: Took| "phases: " ++ t.step ++ " " ++ int_to_string(t.ms) ++ "ms"),
+          filter(map(bytes_split(built.said, b"\n"), string_of_bytes_lossy), |l: String| l != ""),
+        )
+      },
+    ),
+    errs: [],
+    code: ok_code(),
+  }
+
+/// The `ply` at `exe` written to `out` with its pack, every directory above `out` made: by a copy
+/// beside `out` and a rename, so a process running the one there keeps its file.
+fn installed(
+  exe: String,
+  out: String,
+  pack: Bytes,
+) -> Result<Unit, List<Diag>> / {fs.write[abs], entropy.next, abort.raise} = {
+  let tmp = out ++ "." ++ int_to_string(entropy.next()) ++ ".tmp";
+  if fs.create_dir[abs](below_root(parent(out))) && fs.copy[abs](below_root(exe), below_root(tmp))
+      && fs.append[abs](below_root(tmp), pack) != None
+      && fs.rename[abs](below_root(tmp), below_root(out)) { Ok(()) } else {
+    let _ = fs.remove[abs](below_root(tmp));
+    failed("the new `ply` could not be written to `" ++ out ++ "`")
+  }
+}
+
+/// The checkout's `ply` built below `work`, each step timed into `steps`.
+fn bootstrapped(
+  options: Options,
+  t: Toolchain,
+  files: List<Shipping>,
+  work: String,
+  phases: Bool,
+) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+  let started = time.elapsed_ms();
+  match described(t, options.library, work) {
+    Err(diags) -> Err(diags),
+    Ok(runtime) -> {
+      let steps = took([], "described the runtime", started);
+      let at = time.elapsed_ms();
+      match builder_built(options, t, runtime, files, work) {
+        Err(diags) -> Err(diags),
+        Ok(builder) -> {
+          let steps = took(steps, "built the builder", at);
+          let at = time.elapsed_ms();
+          match ply_built(options, builder, work, phases) {
+            Err(diags) -> Err(diags),
+            Ok(made) -> {
+              let steps = took(steps, "built `ply`", at);
+              let at = time.elapsed_ms();
+              match linked(
+                  t,
+                  cc::objects_kept[cc](t, made.sources, native::native_flags(), work),
+                  options.library,
+                  work,
+                ) {
+                Err(diags) -> Err(diags),
+                Ok(exe) -> {
+                  let steps = took(steps, "compiled and linked `ply`", at);
+                  let at = time.elapsed_ms();
+                  // A copy that carries only its front end answers the shipped modules for the one
+                  // that carries the answers too.
+                  let answering = exe ++ "-answering";
+                  if !fs.copy[abs](below_root(exe), below_root(answering)) {
+                    failed("the new `ply` could not be copied to answer with")
+                  } else {
+                    match packed_after(answering, packed_with(files, made.front, [])) {
+                      Err(diags) -> Err(diags),
+                      Ok(_) -> match answers(answering, work) {
+                        Err(diags) -> Err(diags),
+                        Ok(answered) -> {
+                          let steps = took(steps, "answered the shipped modules", at);
+                          let at = time.elapsed_ms();
+                          match installed(
+                              exe,
+                              options.out,
+                              packed_with(files, made.front, answered),
+                            ) {
+                            Err(diags) -> Err(diags),
+                            Ok(_) ->
+                              Ok({
+                                answered: len(answered),
+                                steps: took(steps, "packed and wrote `ply`", at),
+                                said: made.said,
+                              }),
+                          }
+                        },
+                      },
+                    }
+                  }
+                },
+              }
+            },
+          }
+        },
+      }
+    },
+  }
 }
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, emit.unit, env.shipped_digest[sys], env.builder_digest[sys], shipped.runnable, shipped.runtime, shipped.definitions, literal.verdicts, literal.statements, abort.raise, diverges, shipped.reached, env.reused[sys]} = {
+) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
   let s = style_of(flags);
   let options = options_of(flags);
-  let t: Timed = timed_load(flags.paths, false, false);
-  match program_view(t.program) {
-    None -> refused(s, "bootstrap", t.program.diags, t.program.places),
-    Some(w) -> match shipped_of(w) {
-      [p] -> {
-        let front = front_of(t, w);
-        // Each `const fn` is kept before the unit is made, so the runnable holds its value.
-        let unit = match unsettled(t, w.frame, root_of(flags).machine) {
-          [] -> whole(front),
-          unkept -> Err(unkept),
-        };
-        match unit {
-          Err(diags) -> reported(s, "bootstrap", diags, t.program.places),
-          Ok(unit) -> {
-            let bytes = shipped.runnable(p.entry, front.files, shipped_dump(front.dump), unit);
-            let out = spelled(options.out);
-            let emitted = {
-              program: p,
-              digest: if p.stem == "build" { env.builder_digest[sys]() }
-              else { env.shipped_digest[sys]() },
-              runnable: string_of_bytes(hex(blake3(bytes))),
-              key: match entry_hash(w, p) {
-                Some(h) ->
-                  string_of_bytes(program_key(h, shipped.runtime(), shipped.definitions())),
-                None -> "",
-              },
-              definitions: len(every_root(front)),
-              bytes: bytes_len(unit),
-              embedded: embedded_bytes(front.dump.embeds),
-              at: options.out,
-              recorded: None,
-            };
-            if options.verify { verified(s, { ..emitted, recorded: recorded_at(out, p) }) }
-            else if landed(out, emitted, bytes) { wrote(emitted) }
-            else { refusing(s, unwritable(options.out)) }
-          },
-        }
-      },
-      found -> refusing(s, not_shipped(found)),
+  let files = shipping(options.root);
+  let phases = env.var[sys]("PLY_C_PHASES") != None;
+  let built = match ((toolchain_for(options.profile), toolchain.scratch())) {
+    (Err(diags), _) -> Err(diags),
+    (_, None) -> failed("the toolchain's cache has no room to build in"),
+    (Ok(t), Some(work)) -> {
+      let result = bootstrapped(options, t, files, work, phases);
+      toolchain.cleared(work);
+      result
     },
+  };
+  match built {
+    Err(diags) -> reported(s, "bootstrap", diags, []),
+    Ok(b) -> wrote(options, b, phases),
   }
 }
 
-/// The options the runnable is written under, from the parsed line.
-fn options_of(flags: Flags) -> Options =
-  { out: match flags.out { Some(o) -> o, None -> "bootstrap" }, verify: flags.action == "verify" }
-
-// --- Tests ------------------------------------------------------------------
-
-fn a_runnable() -> Emitted =
-  {
-    program: { entry: "ply.main", stem: "ply" },
-    digest: "1a2b",
-    runnable: "3c4d",
-    key: "5e6f",
-    definitions: 12,
-    bytes: 4096,
-    embedded: 1810,
-    at: "bootstrap",
-    recorded: None,
-  }
-
-test "a run that wrote the runnable reports both digests and where it landed" {
-  let answer = wrote(a_runnable());
-  assert_eq(answer.code, 0);
-  assert_eq(answer.lines, [
-    "ply.main: 12 definitions, 4096 bytes of C, 1810 bytes embedded",
-    "digest   1a2b",
-    "runnable 3c4d",
-    "wrote    bootstrap",
-  ])
+// A path outside the working directory is spelled under `abs` without its leading `/`.
+test "a checkout named outside the working directory is the path it names" {
+  let elsewhere = {
+    label: "abs",
+    spelling: "src/ply",
+    display: "/src/ply",
+    inside: ".",
+    absolute: "/src/ply",
+    machine: "/src/ply",
+  };
+  let options = handle {
+    options_of({ ..no_flags(), paths: [elsewhere] })
+  } with {
+    env.pwd[sys]() -> "/home/me",
+  };
+  assert_eq(options.root, "/src/ply");
+  assert_eq(options.library, "/src/ply/target/debug/libply_native.a");
+  assert_eq(options.out, "/src/ply/target/debug/ply")
 }
 
-test "`--verify` takes a runnable that says what this tree builds, and refuses one that does not" {
-  let s = plain();
-  let same = verified(s, { ..a_runnable(), recorded: Some({ digest: "1a2b", runnable: "3c4d" }) });
-  assert_eq(same.code, 0);
-  assert_eq(same.lines, ["the runnable describes this tree: 1a2b"]);
-  let moved = verified(s, { ..a_runnable(), recorded: Some({ digest: "ffff", runnable: "3c4d" }) });
-  assert_eq(moved.code, 2);
-  assert_eq(list_at(moved.errs, 0), Some("the runnable does not describe this tree:"))
-}
-
-test "`--verify` with no runnable to compare against says where it looked" {
-  let answer = verified(plain(), a_runnable());
-  assert_eq(answer.code, 2);
-  assert(answer.errs != [])
+// The CI's first bootstrap writes below `target/stage1`, which no build made before it.
+test "a ply installed below a directory not yet made is written there" {
+  let ran = fs::on_mem[abs](fs::mem_of([{ path: "work/exe", body: b"code" }]), ||
+    handle { installed("/work/exe", "/out/stage1/ply", b"pack") } with { entropy.next() -> 7 });
+  assert_eq(ran.value, Ok(()));
+  assert_eq(fs::mem_read(ran.tree, "out/stage1/ply"), Some(b"codepack"));
+  assert_eq(fs::mem_list(ran.tree, "out/stage1"), Some(["ply"]))
 }

@@ -682,23 +682,40 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Every `.ply` source a `ply` binary ships — the shipped modules and the `ply` program's packages —
-/// which is production the same way `src/` is.
-fn ply_sources() -> Vec<Source> {
-    let pack = ply_pack::installed();
-    pack.paths()
-        .filter(|path| path.ends_with(".ply"))
-        .map(|path| {
-            let text = pack
-                .bytes(path)
-                .expect("the pack carries what it lists")
-                .to_vec();
-            let masked = ply_item_bodies_masked(&text);
-            Source {
-                rel: path.to_string(),
-                text,
-                masked,
+/// Every `.ply` source of this checkout's packages and the prelude, which is production the same
+/// way `src/` is; the corpus and the `-tests` crates are not.
+fn ply_sources(root: &Path) -> Vec<Source> {
+    fn ply_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("a readable source directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.is_dir() {
+                ply_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "ply") {
+                out.push(path);
             }
+        }
+    }
+    let mut paths = vec![root.join("crates/ply-compiler/prelude.ply")];
+    for entry in std::fs::read_dir(root.join("crates")).expect("a readable crates directory") {
+        let dir = entry.expect("a directory entry").path();
+        let name = dir.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with("-tests") || name == "ply-corpus" || !dir.join("ply").is_dir() {
+            continue;
+        }
+        ply_files(&dir.join("ply"), &mut paths);
+    }
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read(&path).expect("a readable source file");
+            let masked = ply_item_bodies_masked(&text);
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            Source { rel, text, masked }
         })
         .collect()
 }
@@ -1147,7 +1164,7 @@ fn tree() -> &'static Tree {
         let registry = registry_rows(&root);
         // A Ply source raises a code by its number, so an arming there is matched against the
         // constant's number rather than against `codes::NAME`.
-        let raised = ply_armed_numbers(&ply_sources());
+        let raised = ply_armed_numbers(&ply_sources(&root));
         let mut armed = armed_codes(&sources);
         for (name, (number, _)) in &declared {
             if raised.contains(number) {

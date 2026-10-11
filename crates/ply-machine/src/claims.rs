@@ -200,7 +200,9 @@ impl HostHandler for ProverHandler {
                 PlyValue::Unit
             }
             ("collected", _) => self.collected()?,
-            ("compiled", [unit]) => self.compiled(unit.as_bytes(span, "the program's unit")?)?,
+            ("compiled", [unit]) => self.compiled(std::path::PathBuf::from(
+                unit.as_str(span, "the program's library")?,
+            ))?,
             ("schema", [name]) => self.schema(name.as_str(span, "a definition's name")?)?,
             ("prepared", [step_budget, config]) => self.prepared(
                 step_budget.as_int(span, "the calls an evaluation may make")?,
@@ -326,12 +328,12 @@ impl ProverHandler {
         }
     }
 
-    /// The program's unit, compiled from the C it handed over: what the schema and every batch a
-    /// discharge judges run on.
-    fn compiled(&self, unit: &[u8]) -> Result<PlyValue, Diagnostic> {
+    /// The program's unit, opened from the library it compiled it into: what the schema and every
+    /// batch a discharge judges run on.
+    fn compiled(&self, unit: std::path::PathBuf) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("compiled"))?;
-        machine.ask(Request::Compiled(unit.to_vec()))?;
+        machine.ask(Request::Compiled(unit))?;
         match machine.reply()? {
             Reply::Compiled(Ok(())) => Ok(PlyValue::ctor("Ok", vec![PlyValue::Unit])),
             Reply::Compiled(Err(diagnostic)) => Ok(PlyValue::ctor(
@@ -435,7 +437,7 @@ impl ProverHandler {
 /// What the program asks the machine for next.
 enum Request {
     /// Compile the program's unit from the C it handed over.
-    Compiled(Vec<u8>),
+    Compiled(std::path::PathBuf),
     /// Enter the definition `--config-schema` names on the program's unit.
     Schema(String),
     /// Bind the hosts over the configuration the program resolved and build the prover a

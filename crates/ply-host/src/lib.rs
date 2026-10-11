@@ -80,6 +80,7 @@ pub mod process;
 pub mod random;
 pub mod registry;
 pub mod sched;
+pub mod shapes;
 pub mod signal;
 pub mod sqlite;
 pub mod stdio;

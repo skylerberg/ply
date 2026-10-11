@@ -53,7 +53,7 @@ pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, assert_failure, assertion_failure};
 pub use carry::{Carry, CtorCarries};
-pub use compiled::{Compiled, Entered};
+pub use compiled::{Compiled, Entered, Held};
 pub use escape::{Boundary, Escapee, Handle};
 pub use evaluator::{
     Case, Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,

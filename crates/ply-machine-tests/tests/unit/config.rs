@@ -168,15 +168,14 @@ fn a_run_with_no_schema_contributes_nothing_to_the_digest() {
     assert!(digest(&of(&configured(&[("K", "v", false)], None, true))).is_empty());
 }
 
-fn check(source: &str) -> ply_eval::CheckOutput {
-    crate::answered::checked("m", source).check
-}
-
 /// An artifact built without the schema carries none, and a definition no backend can enter has no
 /// value to read.
 #[test]
 fn a_schema_the_program_does_not_carry_or_cannot_evaluate_is_refused() {
-    let program = check("fn config() -> Int = 1\n");
+    // `fn config() -> Int = 1` in module `m`, which no backend is handed to enter.
+    let program = crate::sketch::Sketch::default()
+        .def("m", "config", Vec::new())
+        .check();
 
     let absent = schema_of(&program, None, "desk.config").expect_err("nothing is named so");
     assert_eq!(absent.code, codes::CONFIG_UNAVAILABLE);

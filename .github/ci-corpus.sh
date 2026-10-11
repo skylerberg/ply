@@ -75,16 +75,27 @@ durations=$caches/ply-test-durations.tsv
 
 # What a checks run is given after `ply test PATH`.
 grants=(--host --timeout 900000 --steps 0 --json
-  --exec "ply=$ply" --allow machine --allow claims --allow shipped --fs work=. --fs "repo=$root")
+  --exec "ply=$ply" --allow machine --allow claims --allow shipped --allow toolchain --fs work=. --fs "repo=$root")
+
+# The directory holding postgres and its tools, for the CLI suite's tests that start a cluster: the
+# first on PATH, else the newest of Debian's per-version directories, which are off PATH.
+postgres_bin() {
+  local found
+  found=$(command -v initdb 2>/dev/null || true)
+  if [[ -n $found ]]; then dirname "$found"; return; fi
+  find /usr/lib/postgresql -maxdepth 2 -name bin -type d 2>/dev/null | sort -V | tail -1
+}
+pg=$(postgres_bin)
 
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
-# it, its scratch directory and the filesystem, the repository, and every family a command drives a
-# machine with, since its tests run the commands in this process.
+# it, a postgres where there is one, its scratch directory and the filesystem, the repository, and
+# every family a command drives a machine with, since its tests run the commands in this process.
 cli_grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
+  ${pg:+--exec "initdb=$pg/initdb" --exec "postgres=$pg/postgres" --exec "psql=$pg/psql"}
   --fs cwd=. --fs abs=/ --fs "repo=$root"
   --allow machine --allow tester --allow claims --allow hosts
-  --allow shipped)
+  --allow shipped --allow toolchain)
 
 # What a desk run is given beside the checks' grants: the floors the served tables are compared with,
 # built where the workflow builds them, and the database the desk's schema is in.
