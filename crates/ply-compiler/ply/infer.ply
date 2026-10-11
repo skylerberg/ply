@@ -4,7 +4,7 @@ import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_
                 starts_upper)
 import std.bin
 import std.hash (blake3)
-import std.list (at, concat, contains, drop, push_unique, sort, sort_by, take, prepend)
+import std.list (at, at_or, concat, contains, drop, push_unique, sort, sort_by, take, prepend)
 import std.graph
 import type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead,
                     MWrite, MBad, MRaise, ty_span, mode_text, is_raise, ident_names, mode_bin)
@@ -44,7 +44,7 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text, type_text,
               row_text, Printer, printer_new, printer_naming, print_ty, print_row, applied_args,
               at_arguments, over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin,
-              type_bin, scheme_bin)
+              type_bin, scheme_bin, TypeTable, held_type, table_of, tables_joined, type_table_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin, ending_bin)
@@ -310,6 +310,15 @@ pub type LabelSite = { module: Int, span: Span, labels: List<Bytes>, owner: Byte
 /// type with no arguments, `""` for any other. A wrapping builtin's site is its name.
 pub type OperandSite = { module: Int, span: Span, ty: Bytes, owner: Bytes }
 type OperandAt = { module: Int, span: Span, ty: Type, owner: Bytes }
+/// A type the emitter reads off the checker rather than off what is written: a pattern's binder, a
+/// lambda, an empty list, a law's binder, and a global named at a use with the type arguments it is
+/// used at. Resolved when the check ends.
+type TypedAt = { module: Int, span: Span, ty: Type, args: List<Type>, owner: Bytes }
+/// A `TypedAt` resolved, with each variable its owner's scheme quantifies numbered as the scheme's
+/// canonical form numbers it and every other variable `-1`, and no function type carrying a row.
+/// `ty` and `args` are keys of a `TypeTable` beside the sites: a body names a few types at many
+/// places, and one record type can be large.
+pub type TypedSite = { module: Int, span: Span, ty: Bytes, args: List<Bytes>, owner: Bytes }
 type Assumed = { deriver: Deriver, vars: List<Int> }
 /// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
 type ClauseSite = { span: Span, op: Atom, ty: Type }
@@ -467,9 +476,15 @@ pub fn listing_ty() -> Type / {abort.raise} =
 /// `tests` is by test key. `root`: the modules below it are the run's own;
 /// a definition of any other is counted by what its row writes, whatever its body does, so its
 /// `bounded` promises were checked when its package was.
-pub type Known = { defs: Map<Bytes, KnownDef>, tests: Map<Bytes, KnownTest>, root: Int }
+/// `types` holds the types the rows' facts name, by key.
+pub type Known = {
+  defs: Map<Bytes, KnownDef>,
+  tests: Map<Bytes, KnownTest>,
+  root: Int,
+  types: TypeTable,
+}
 
-pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62 }
+pub fn no_known() -> Known = { defs: map_new(), tests: map_new(), root: 1 << 62, types: map_new() }
 
 type Checker = {
   resolved: Resolved,
@@ -524,6 +539,7 @@ type Checker = {
   numerics: List<Numeric>,
   bit_ops: List<BitOp>,
   operands: List<OperandAt>,
+  typed: List<TypedAt>,
   witnessed: Map<Int, Witnessed>,
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
@@ -3584,6 +3600,22 @@ fn note_operand(checker: Checker, span: Span, ty: Type) -> Checker =
     }),
   }
 
+/// Resolved once the whole program is checked, as an operand is. What the program does not write has
+/// no place a site could be found at, so none is noted for it.
+fn note_typed(checker: Checker, span: Span, ty: Type, args: List<Type>) -> Checker =
+  if span == dummy_span() { checker } else {
+    {
+      ..checker,
+      typed: push(checker.typed, {
+        module: checker.module,
+        span: span,
+        ty: ty,
+        args: args,
+        owner: checker.walking,
+      }),
+    }
+  }
+
 fn settle_bit_ops(checker: Checker) -> Checker / {abort.raise} = {
   let entries = checker.bit_ops;
   fold(entries, { ..checker, bit_ops: [] }, |c: Checker, entry: BitOp| {
@@ -4098,7 +4130,12 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
         None -> body.checker,
       };
       {
-        checker: leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
+        checker: note_typed(
+          leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
+          l.span,
+          fn_type(ps.tys, body.ty, row_empty()),
+          [],
+        ),
         ty: fn_type(ps.tys, body.ty, body.row),
         row: row_empty(),
       }
@@ -4266,7 +4303,13 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
           { checker: n.checker, row: j.row, ty: n.ty, tails: n.tails }
         },
       );
-      { checker: close_tails(items.checker, items.tails), ty: list_type(items.ty), row: items.row }
+      let closed: Checker = close_tails(items.checker, items.tails);
+      {
+        checker: if len(l.items) == 0 { note_typed(closed, l.span, list_type(items.ty), []) }
+        else { closed },
+        ty: list_type(items.ty),
+        row: items.row,
+      }
     },
     EPerform(p) -> infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args),
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
@@ -4786,7 +4829,12 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
           let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
           else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
           else { inst.labels };
-          { checker: note_labels(noted, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
+          let typed: Checker = match env_depth_of(noted.env, key.name) {
+            Some(d) -> if d > 0 { noted }
+            else { note_typed(noted, qname.span, inst.ty, inst.args) },
+            None -> note_typed(noted, qname.span, inst.ty, inst.args),
+          };
+          { checker: note_labels(typed, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
         None -> {
           let o: WithTy = new_ty(unknown_name(k.checker, qname));
@@ -6038,7 +6086,11 @@ fn bind_pattern(
   match p {
     PWild(_) -> { checker: checker, out: out },
     PBad(_) -> { checker: checker, out: out },
-    PVar(v) -> { checker: checker, out: push(out, { name: v.name.name, ty: scrutinee }) },
+    PVar(v) ->
+      {
+        checker: note_typed(checker, v.span, scrutinee, []),
+        out: push(out, { name: v.name.name, ty: scrutinee }),
+      },
     PLit(l) ->
       {
         checker: expect(checker, l.span, scrutinee, lit_type(l.lit), b"pattern literal").checker,
@@ -10854,7 +10906,10 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     { ..c, subst: mark_rigid_ty(c.subst, v) });
   let pushed: Checker = { ..rigid, env: env_push(rigid.env) };
   let bound: Checker = fold(range(0, len(def.binders)), pushed, |c: Checker, i: Int|
-    { ..c, env: env_bind(c.env, at(def.binders, i).name.name, monomorphic(at(types.tys, i))) });
+    {
+      ..note_typed(c, at(def.binders, i).name.span, at(types.tys, i), []),
+      env: env_bind(c.env, at(def.binders, i).name.name, monomorphic(at(types.tys, i))),
+    });
   let guarded: Checker = match def.guard {
     Some(g) -> {
       let o: Inferred = infer({ ..bound, performs: [] }, g);
@@ -11490,8 +11545,20 @@ fn check_clause(
         }),
   };
   let outer = with_result.spec_kind;
-  let o: Inferred = infer({ ..with_result, spec_kind: Some(clause.kind) }, clause.expr);
-  let popped: Checker = { ..o.checker, spec_kind: outer, env: env_pop(o.checker.env) };
+  let o: Inferred = infer(
+    {
+      ..with_result,
+      spec_kind: Some(clause.kind),
+      walking: if clause.kind == SCost { unlowered() } else { with_result.walking },
+    },
+    clause.expr,
+  );
+  let popped: Checker = {
+    ..o.checker,
+    spec_kind: outer,
+    walking: with_result.walking,
+    env: env_pop(o.checker.env),
+  };
   let c1: Checker = match clause.kind {
     SCost ->
       expect(
@@ -12277,7 +12344,7 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
           owner: site.owner,
         };
         match list_at(checker.witness_refs, n - 1) {
-          Some(r) -> if r.module == site.module && r.span == site.span {
+          Some(r) -> if r.module == site.module && r.span == site.span && r.owner == site.owner {
             if contains(r.params, site.param) { checker } else {
               {
                 ..checker,
@@ -14351,6 +14418,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     numerics: [],
     bit_ops: [],
     operands: [],
+    typed: [],
     witnessed: map_new(),
     witness_refs: [],
     witness_orders: [],
@@ -14481,6 +14549,8 @@ pub type EmitFacts = {
   label_sites: List<LabelSite>,
   elaboration: Elaboration,
   operands: List<OperandSite>,
+  typed: List<TypedSite>,
+  types: TypeTable,
 }
 
 /// What lowering reads that only the checker knows: the shape of every record update, the raise
@@ -14495,6 +14565,9 @@ pub type Elaboration = {
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
+  elaboration_in(lowered_only(checker))
+
+fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
   {
     tries: checker.try_sites,
     updates: checker.update_shapes,
@@ -14516,6 +14589,7 @@ derive bin for UpdateShape
 derive bin for TrySite
 derive bin for LabelSite
 derive bin for OperandSite
+derive bin for TypedSite
 derive bin for WitnessOp
 derive bin for WitnessRef
 derive bin for WitnessOrder
@@ -14530,12 +14604,30 @@ pub type RootFacts = {
   refs: List<WitnessRef>,
   operands: List<OperandSite>,
   tries: List<TrySite>,
+  typed: List<TypedSite>,
+  types: TypeTable,
 }
 
 derive bin for RootFacts
 
 pub fn no_root_facts() -> RootFacts =
-  { label_sites: [], updates: [], ops: [], refs: [], operands: [], tries: [] }
+  {
+    label_sites: [],
+    updates: [],
+    ops: [],
+    refs: [],
+    operands: [],
+    tries: [],
+    typed: [],
+    types: map_new(),
+  }
+
+/// The nodes of `all` the types `sites` name are made of, which is all a table of them needs.
+pub fn types_named(all: TypeTable, sites: List<TypedSite>) -> TypeTable =
+  table_of(all, fold(sites, [], |acc: List<Bytes>, s: TypedSite| push(concat(acc, s.args), s.ty)))
+
+/// Both tables of types, as one.
+pub fn types_joined(a: TypeTable, b: TypeTable) -> TypeTable = tables_joined(a, b)
 
 fn owned(m: Map<Bytes, RootFacts>, owner: Bytes) -> RootFacts =
   match map_get(m, owner) { Some(f) -> f, None -> no_root_facts() }
@@ -14571,10 +14663,16 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, tries: push(f.tries, x) })
   });
-  fold(facts.operands, tried, |m: Map<Bytes, RootFacts>, x: OperandSite| {
+  let operated = fold(facts.operands, tried, |m: Map<Bytes, RootFacts>, x: OperandSite| {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, operands: push(f.operands, x) })
-  })
+  });
+  let typed = fold(facts.typed, operated, |m: Map<Bytes, RootFacts>, x: TypedSite| {
+    let f = owned(m, x.owner);
+    map_insert(m, x.owner, { ..f, typed: push(f.typed, x) })
+  });
+  map_fold(typed, map_new(), |m: Map<Bytes, RootFacts>, owner: Bytes, f: RootFacts|
+    map_insert(m, owner, { ..f, types: types_named(facts.types, f.typed) }))
 }
 
 fn moved_span(span: Span, by: Int) -> Span = { start: span.start + by, end: span.end + by }
@@ -14594,6 +14692,9 @@ fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFac
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     tries: map(facts.tries, |x: TrySite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    typed: map(facts.typed, |x: TypedSite|
+      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    types: facts.types,
   }
 
 fn within(span: Span, at: Span) -> Bool = span.start >= at.start && span.end <= at.end
@@ -14605,16 +14706,20 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && fold(facts.refs, true, |b: Bool, x: WitnessRef| b && within(x.span, at))
     && fold(facts.operands, true, |b: Bool, x: OperandSite| b && within(x.span, at))
     && fold(facts.tries, true, |b: Bool, x: TrySite| b && within(x.span, at))
+    && fold(facts.typed, true, |b: Bool, x: TypedSite| b && within(x.span, at))
 
 /// One body's sites as its row files them, behind a byte that says how. Each span is counted from
 /// where the body's definition starts, so they hold wherever the definition moves to. A site
 /// outside the definition's own text is foreign: a default argument is written at its callee's
 /// positions and stands in the caller's body at those. A body that holds one is filed as it
 /// stands, and holds only while neither module's text moves.
-pub fn filed_facts(facts: RootFacts, at: Span) -> Bytes / {abort.raise} =
-  if all_within(facts, at) {
-    bytes_concat(b"\x00", bin::encode(placed_facts(facts, 0, 0 - at.start, b""), root_facts_bin()))
-  } else { bytes_concat(b"\x01", bin::encode(placed_facts(facts, 0, 0, b""), root_facts_bin())) }
+pub fn filed_facts(facts: RootFacts, at: Span) -> Bytes / {abort.raise} = {
+  // A row names its types by key; the table they are read from goes with the rows, held once.
+  let keyed = { ..facts, types: map_new() };
+  if all_within(keyed, at) {
+    bytes_concat(b"\x00", bin::encode(placed_facts(keyed, 0, 0 - at.start, b""), root_facts_bin()))
+  } else { bytes_concat(b"\x01", bin::encode(placed_facts(keyed, 0, 0, b""), root_facts_bin())) }
+}
 
 /// Whether a row's facts are of a body that holds a foreign site, or are no facts at all.
 pub fn foreign_facts(filed: Bytes) -> Bool = bytes_len(filed) == 0 || bytes_at(filed, 0) != 0
@@ -14635,14 +14740,105 @@ pub fn facts_at(
     }
   }
 
-fn facts_of(checker: Checker) -> EmitFacts / {abort.raise} =
+/// The owner a `cost` clause's walk with its definition's header records under: the law the clause
+/// makes is walked again, and only that walk is lowered.
+fn unlowered() -> Bytes = b"#"
+
+/// `checker` without the sites of a walk that is never lowered.
+fn lowered_only(checker: Checker) -> Checker = {
+  let kept = |owner: Bytes| owner != unlowered();
+  {
+    ..checker,
+    label_sites: filter(checker.label_sites, |x: LabelSite| kept(x.owner)),
+    try_sites: filter(checker.try_sites, |x: TrySite| kept(x.owner)),
+    update_shapes: filter(checker.update_shapes, |x: UpdateShape| kept(x.owner)),
+    operands: filter(checker.operands, |x: OperandAt| kept(x.owner)),
+    witness_refs: filter(checker.witness_refs, |x: WitnessRef| kept(x.owner)),
+    typed: filter(checker.typed, |x: TypedAt| kept(x.owner)),
+  }
+}
+
+fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
+  let checker = lowered_only(all);
+  let settled = settled_sites(checker);
   {
     pure: fold(checker.defs, [], |acc: List<Bytes>, def_info: DefInfo|
       if published_pure(def_info) { push(acc, def_info.name) } else { acc }),
     label_sites: checker.label_sites,
-    elaboration: elaboration_of(checker),
+    elaboration: elaboration_in(checker),
     operands: map(checker.operands, |o: OperandAt|
       { module: o.module, span: o.span, ty: operand_name(resolve(checker, o.ty)), owner: o.owner }),
+    typed: settled.sites,
+    types: settled.types,
+  }
+}
+
+/// Each typed site resolved and read in its owner's numbering, beside the table of what they name.
+/// A body's are only those in its own text: a default is walked in each call that omits it at its
+/// callee's positions, which a check reading the callee from an entry lays elsewhere.
+fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable } / {abort.raise} = {
+  let tests = fold(checker.tests, map_new(), |m: Map<Bytes, Location>, t: TestInfo|
+    map_insert(m, test_owner(t.module, t.name), t.at));
+  let in_own_text = |t: TypedAt|
+    match match def_of(checker, t.owner) {
+        Some(d) -> Some(d.at),
+        None -> map_get(tests, t.owner),
+      } {
+      Some(at) ->
+        at.module == t.module && t.span.start >= at.span.start && t.span.end <= at.span.end,
+      None -> true,
+    };
+  fold(
+    filter(checker.typed, in_own_text),
+    // The rows a body is published from name their types in the table handed in with them.
+    { sites: [], types: checker.known.types },
+    |acc: { sites: List<TypedSite>, types: TypeTable }, t: TypedAt| {
+      let quantified = match def_of(checker, t.owner) { Some(d) -> d.scheme.ty_vars, None -> [] };
+      let numbering = fold(range(0, len(quantified)), map_new(), |m: Map<Int, Int>, i: Int|
+        map_insert(m, at(quantified, i), i));
+      let read = |ty: Type| numbered(resolve(checker, ty), numbering);
+      let args = fold(
+        t.args,
+        { table: acc.types, keys: [] },
+        |h: { table: TypeTable, keys: List<Bytes> }, ty: Type| {
+          let held = held_type(h.table, read(ty));
+          { table: held.table, keys: push(h.keys, held.key) }
+        },
+      );
+      let own = held_type(args.table, read(t.ty));
+      {
+        sites: push(acc.sites, {
+          module: t.module,
+          span: t.span,
+          ty: own.key,
+          args: args.keys,
+          owner: t.owner,
+        }),
+        types: own.table,
+      }
+    },
+  )
+}
+
+/// `ty` with each variable `numbering` holds numbered by it and every other `-1`, and every
+/// function type's row left out: what a value is laid out by, which a row never decides.
+fn numbered(ty: Type, numbering: Map<Int, Int>) -> Type =
+  match ty {
+    TyVar(v) -> TyVar(match map_get(numbering, v) { Some(i) -> i, None -> 0 - 1 }),
+    TyCon(c) -> TyCon({ ..c, args: map(c.args, |a: Type| numbered(a, numbering)) }),
+    TyFn(f) ->
+      TyFn({
+        params: map(f.params, |p: Type| numbered(p, numbering)),
+        ret: numbered(f.ret, numbering),
+        effects: row_empty(),
+      }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: numbered(f.ty, numbering) })),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        args: map(x.args, |a: Type| numbered(a, numbering)),
+        fields: map(x.fields, |f: Field| { ..f, ty: numbered(f.ty, numbering) }),
+      }),
   }
 
 fn operand_name(ty: Type) -> Bytes =
@@ -15045,7 +15241,7 @@ fn known_of(checker: Checker) -> Known = {
     }));
   let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
     map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));
-  { defs: defs, tests: tests, root: checker.known.root }
+  { defs: defs, tests: tests, root: checker.known.root, types: checker.known.types }
 }
 
 /// `check_dump`'s answer, and the program's checked a second time from the interfaces the first

@@ -9,22 +9,24 @@ import std.bin
 import std.list (at, at_or, concat, contains, flatten, push_unique, sort_by)
 import std.bytes (join)
 import std.map
-import front (Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline, Outlined,
-              OLaw, OFn, OTest, LawOutline, read_outline, module_tables_bin, rows_bin,
+import front (no_rows, Analysis, AnalysisOutcome, Analysed, Refused, ModuleFacts, SetView, Outline,
+              Outlined, OLaw, OFn, OTest, LawOutline, read_outline, module_tables_bin, rows_bin,
               tagged_site_bin, statement_site_bin, typed_const_bin, set_view_bin, law_outline_bin,
               ModuleShape, ModuleTables, Rows, KnownDefRow, KnownTestRow, TaggedSite, StatementSite,
               TypedConst, module_facts, no_module_tables, rows_of, of_module,
-              analyse_pulling_std_with, faceted, names_embed)
+              analyse_pulling_std_with, faceted, names_embed, types_of_rows)
 import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModule, exports_of,
                 entry_bin, entries_in, import_targets, owner_source, checked_owner, owner_reads,
                 module_scope, owner_mentions, owner_groups, group_source, unplaced_imports,
                 group_imports, laid_items)
 import items (Item, IFn, parse, item_span, SCost, item_owner)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
-              NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, UpdateShape,
-              WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts, test_owner)
+              NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, TypedSite,
+              UpdateShape, WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts,
+              test_owner, types_named, types_joined)
 import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
+import types (TypeTable)
 import exprs (TaggedPart)
 import embed (EmbedAt, EmbedWant, embed_at_bin, embed_key, wants_of)
 import hash (Shapes, UseNode, LawNode, TestNode, chosen_in, chosen_forms, shapes_bin, use_node_bin,
@@ -99,6 +101,8 @@ fn moved_tables(t: ModuleTables, m: Mover) -> ModuleTables = {
         { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
       operands: map(t.facts.operands, |x: OperandSite|
         { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
+      typed: map(t.facts.typed, |x: TypedSite|
+        { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
       elaboration: {
         updates: map(e.updates, |x: UpdateShape|
           { ..x, module: moved_index(x.module, m), span: moved_spanned(x.module, x.span, m) }),
@@ -156,7 +160,7 @@ fn spotted(spots: List<Spot>, p: Int) -> Int =
 /// What `said`, a check that read a group of owners as its module at its slot, answered of one of
 /// them, whose share of it is `share` and whose items stand where `spots` says: each place counted
 /// from where the group's text starts, module 0's.
-fn owner_answer(said: Said, share: Share, spots: List<Spot>) -> OwnerAnswer = {
+fn owner_answer(said: Said, share: Share, spots: List<Spot>) -> OwnerAnswer / {abort.raise} = {
   let slot = said.slot;
   let t = said.facts.tables;
   let kept = {
@@ -172,6 +176,8 @@ fn owner_answer(said: Said, share: Share, spots: List<Spot>) -> OwnerAnswer = {
       pure: share.pure,
       label_sites: share.label_sites,
       operands: share.operands,
+      typed: share.typed,
+      types: share.types,
       elaboration: {
         updates: share.updates,
         ops: share.ops,
@@ -195,7 +201,11 @@ fn owner_answer(said: Said, share: Share, spots: List<Spot>) -> OwnerAnswer = {
     {
       tables: moved_tables(kept, back),
       // A row is counted from where its definition starts, so no row moves.
-      rows: { defs: map(share.rows, |r: KnownDefRow| { ..r, hash: b"" }), tests: [] },
+      rows: {
+        defs: map(share.rows, |r: KnownDefRow| { ..r, hash: b"" }),
+        tests: [],
+        types: types_of_rows(said.rows.types, share.rows, []),
+      },
       refused: [],
       warnings: map(share.warnings, |d: Diag| moved_diag(own_labels(d), back)),
       tagged: map(share.tagged, |x: TaggedSite| moved_tagged(x, back)),
@@ -229,6 +239,8 @@ type Share = {
   pure: List<Bytes>,
   label_sites: List<LabelSite>,
   operands: List<OperandSite>,
+  typed: List<TypedSite>,
+  types: TypeTable,
   updates: List<UpdateShape>,
   ops: List<WitnessOp>,
   refs: List<WitnessRef>,
@@ -454,6 +466,7 @@ pub fn said_groups(
   let pure = map::group_by(t.facts.pure, def_named);
   let label_sites = map::group_by(t.facts.label_sites, |x: LabelSite| placed(x.module, x.span));
   let operands = map::group_by(t.facts.operands, |x: OperandSite| placed(x.module, x.span));
+  let typed = map::group_by(t.facts.typed, |x: TypedSite| placed(x.module, x.span));
   let updates = map::group_by(e.updates, |x: UpdateShape| placed(x.module, x.span));
   let ops = map::group_by(e.ops, |x: WitnessOp| placed(x.module, x.span));
   let refs = map::group_by(e.refs, |x: WitnessRef| placed(x.module, x.span));
@@ -509,6 +522,8 @@ pub fn said_groups(
       pure: share_in(pure, o),
       label_sites: share_in(label_sites, o),
       operands: share_in(operands, o),
+      typed: share_in(typed, o),
+      types: types_named(t.facts.types, share_in(typed, o)),
       updates: share_in(updates, o),
       ops: share_in(ops, o),
       refs: share_in(refs, o),
@@ -698,18 +713,29 @@ pub fn assembled(
       },
   ).at;
   let outlined_at = |x: LawInfo| match map_get(law_at, x.name) { Some(k) -> k, None -> x.index };
-  let inside = |spans: List<Span>, start: Int|
-    fold(spans, false, |b: Bool, f: Span| b || (start >= f.start && start <= f.end));
+  let law_spans = map(gathered(owners, |a: OwnerAnswer| a.tables.laws), |x: LawInfo| x.at.span);
+  let enclosing = |spans: List<Span>, start: Int|
+    fold(spans, None, |found: Option<Int>, f: Span|
+      match found {
+        Some(_) -> found,
+        None -> if start >= f.start && start <= f.end { Some(f.start) } else { None },
+      });
   // A check walks the functions, then each one's clauses, then the tests, then laws and schemas,
   // then the laws `cost` clauses make: a clause's and a law's sites are filed under no owner, a
-  // clause's inside its function and a cost law's inside its clause.
+  // clause's inside its function and a cost law's inside its clause. Each ranks where what holds it
+  // starts, so the sites of one keep the order its walk recorded them in.
   let site_rank = |owner: Bytes, start: Int|
     match map_get(walk, owner) {
       Some(k) -> k,
       None -> if bytes_len(owner) == 0 {
-        if inside(costs, start) { 4000000000 + start }
-        else if inside(fn_spans, start) { 1000000000 + start }
-        else { 3000000000 + start }
+        match enclosing(costs, start) {
+          Some(at) -> 4000000000 + at,
+          None -> match enclosing(fn_spans, start) {
+            Some(at) -> 1000000000 + at,
+            None ->
+              3000000000 + (match enclosing(law_spans, start) { Some(at) -> at, None -> start }),
+          },
+        }
       } else {
         match map_get(test_at, owner) { Some(k) -> 2000000000 + k, None -> 3000000000 + start }
       },
@@ -740,6 +766,10 @@ pub fn assembled(
         gathered(owners, |a: OwnerAnswer| a.tables.facts.operands),
         |x: OperandSite| site_rank(x.owner, x.span.start),
       ),
+      typed: ranked(gathered(owners, |a: OwnerAnswer| a.tables.facts.typed), |x: TypedSite|
+        site_rank(x.owner, x.span.start)),
+      types: fold(owners, map_new(), |acc: TypeTable, a: OwnerAnswer|
+        types_joined(acc, a.tables.facts.types)),
       elaboration: {
         updates: ranked(
           gathered(owners, |a: OwnerAnswer| a.tables.facts.elaboration.updates),
@@ -801,6 +831,8 @@ pub fn assembled(
     rows: {
       defs: ranked(gathered(owners, |a: OwnerAnswer| a.rows.defs), |r: KnownDefRow| walked(r.name)),
       tests: gathered(owners, |a: OwnerAnswer| a.rows.tests),
+      types: fold(owners, map_new(), |acc: TypeTable, a: OwnerAnswer|
+        types_joined(acc, a.rows.types)),
     },
     warnings: ranked(
       concat(gathered(owners, |a: OwnerAnswer| a.warnings), if unused {
@@ -936,6 +968,8 @@ fn settled_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
       pure: sorted_by(t.facts.pure, |n: Bytes| n),
       label_sites: sorted_by(t.facts.label_sites, |x: LabelSite| span_text(x.span)),
       operands: sorted_by(t.facts.operands, |x: OperandSite| span_text(x.span)),
+      typed: sorted_by(t.facts.typed, |x: TypedSite| span_text(x.span)),
+      types: t.facts.types,
       elaboration: {
         updates: sorted_by(e.updates, |x: UpdateShape| span_text(x.span)),
         ops: sorted_by(e.ops, |x: WitnessOp| span_text(x.span)),
@@ -965,6 +999,8 @@ fn joined_tables(owners: List<OwnerAnswer>) -> ModuleTables =
         pure: concat(acc.facts.pure, t.facts.pure),
         label_sites: concat(acc.facts.label_sites, t.facts.label_sites),
         operands: concat(acc.facts.operands, t.facts.operands),
+        typed: concat(acc.facts.typed, t.facts.typed),
+        types: types_joined(acc.facts.types, t.facts.types),
         elaboration: {
           updates: concat(acc.facts.elaboration.updates, t.facts.elaboration.updates),
           ops: concat(acc.facts.elaboration.ops, t.facts.elaboration.ops),
@@ -978,7 +1014,7 @@ fn joined_tables(owners: List<OwnerAnswer>) -> ModuleTables =
   })
 
 fn agrees(sources: List<Source>) -> Unit / {abort.raise} = {
-  let whole = match analyse_pulling_std_with(sources, [], [], []).out {
+  let whole = match analyse_pulling_std_with(sources, [], no_rows()).out {
     Analysed(w) -> w,
     Refused(_) -> panic("the fixture checks"),
   };
@@ -1117,7 +1153,7 @@ pub fn told(ds: List<Diag>) -> List<Bytes> =
     match compare_values(a, b) { Greater -> false, _ -> true })
 
 fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
-  let whole = match analyse_pulling_std_with(sources, [], [], []).out {
+  let whole = match analyse_pulling_std_with(sources, [], no_rows()).out {
     Analysed(w) -> w,
     Refused(_) -> panic("the fixture checks"),
   };
@@ -1138,6 +1174,8 @@ fn assembles(sources: List<Source>) -> Unit / {abort.raise} = {
       assert_eq(a.tables.facts.pure, w.tables.facts.pure);
       assert_eq(a.tables.facts.label_sites, w.tables.facts.label_sites);
       assert_eq(a.tables.facts.operands, w.tables.facts.operands);
+      assert_eq(a.tables.facts.typed, w.tables.facts.typed);
+      assert_eq(a.tables.facts.types, w.tables.facts.types);
       assert_eq(a.tables.facts.elaboration, w.tables.facts.elaboration);
       assert_eq(a.tables.kept, w.tables.kept);
       assert_eq(a.shape.outline, w.shape.outline);
@@ -1172,8 +1210,7 @@ test "a group holds the files its own items embed, and no other group's" {
   let w = match analyse_pulling_std_with(
       [{ name: b"m", src: src }],
       [],
-      [],
-      [],
+      no_rows(),
       embeds: [file(b"x.txt"), file(b"y.txt")],
     ).out {
     Analysed(w) -> w,

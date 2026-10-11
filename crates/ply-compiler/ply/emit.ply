@@ -8,19 +8,20 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
              NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture,
              CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit, irrefutable, slots_read,
              all_read)
-import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias,
-              parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires,
-              SEnsures, SCost, FnDef, TDNominal, test_run, test_listing, IInstance, NGen,
-              VariantDef, TDSum, INumeric, NumericOp)
+import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, parse, ImportDecl,
+              ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, SCost,
+              FnDef, test_run, test_listing, IInstance, NGen, VariantDef, TDSum, INumeric,
+              NumericOp)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
                 default_binder, find_module_binding, qualify)
 import derive (expand_derives)
-import infer (LabelSite, OperandSite, expanded_mods, prelude_effects, EffectInfo, OpInfo, EmitFacts,
-              RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder, facts_at,
-              test_owner, law_root, cases_root)
+import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
+              EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
+              facts_at, test_owner, law_root, cases_root)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at)
 import front
-import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with,
+import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
               analyse_pulling_std_with, dump_of, WalkedFacts, walked_facts_bin, facts_read,
               lowered_modules, lowers, module_of_root, wants)
 import std.bin
@@ -32,8 +33,7 @@ import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, E
               ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList, EPerform, EWithCell,
               EWithHold, HandleClause, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr,
               is_arithmetic, case_at, case_identity)
-import type_syntax (Mode, MRead, MWrite, MRaise, MBad, TypeExpr, TVar, TCon, TRecord, is_raise,
-                    ident_names)
+import type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
 import rewrite (expand, named_program_wide, stated_witness_name)
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
@@ -190,6 +190,7 @@ pub type Emitter = {
   group: List<Bytes>,
   /// The checker's operand type at each operator's site, as `operand_at` reads it.
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
 }
 
 /// `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
@@ -199,13 +200,7 @@ pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: 
 /// `whole` binds the module itself, which only a qualified name reaches: a bare `map` is never `std.map`.
 pub type Imported = { name: Bytes, module: Bytes, defs: List<Def>, whole: Bool }
 
-pub type ModuleDefs = { module: Bytes, defs: List<Def>, aliases: List<Alias> }
-
-/// A `type` alias: its parameters and the type in its own module's scope.
-pub type Alias = { name: Bytes, params: List<Bytes>, ty: TypeExpr }
-
-/// A type variable an alias argument bound, resolved in the argument's scope.
-pub type Bound = { name: Bytes, kind: Kind, ty: Ty }
+pub type ModuleDefs = { module: Bytes, defs: List<Def> }
 
 /// A record this body built: a field read of it reuses the built value (sound: the values are this body's locals).
 pub type Built = { local: Bytes, names: List<Bytes>, vals: List<CValue> }
@@ -272,6 +267,7 @@ fn line(emitter: Emitter, text: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
@@ -316,6 +312,7 @@ fn indent(emitter: Emitter) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn outdent(emitter: Emitter) -> Emitter =
@@ -358,6 +355,7 @@ fn outdent(emitter: Emitter) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 /// Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
@@ -402,6 +400,7 @@ fn withtail(emitter: Emitter, t: Bool) -> Emitter =
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     }
   }
 
@@ -446,6 +445,7 @@ fn notail(emitter: Emitter) -> Emitter =
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     }
   }
 
@@ -490,6 +490,7 @@ fn rescope(emitter: Emitter, conv: List<Unboxed>) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
@@ -533,6 +534,7 @@ fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     },
     name: bytes_concat(b"t", ascii_of_int(emitter.temp_count + 1)),
   }
@@ -695,6 +697,7 @@ fn with_reads(emitter: Emitter, reads: List<Int>) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
@@ -737,6 +740,7 @@ fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
@@ -779,6 +783,7 @@ fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -821,6 +826,7 @@ fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -863,6 +869,7 @@ fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn note_deferred(emitter: Emitter, d: Deferred) -> Emitter =
@@ -908,6 +915,7 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 /// A flat record (all widths or `Bool`) built from locals is held back; others are built now, from a reuse token if one fits.
@@ -1164,6 +1172,7 @@ fn note_alias(emitter: Emitter, local: Bytes, root: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 /// Charge a slot's reads to the object the local holds, once per (object, slot).
@@ -1214,6 +1223,7 @@ fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     }
   }
 }
@@ -1288,6 +1298,7 @@ fn poison(emitter: Emitter, why: Bytes) -> Emitter =
         bound: emitter.bound,
         group: emitter.group,
         operands: emitter.operands,
+        typed: emitter.typed,
       },
   }
 
@@ -1343,6 +1354,7 @@ fn lambda_of(emitter: Emitter, sym: Bytes) -> { emitter: Emitter, i: Int } =
           bound: emitter.bound,
           group: emitter.group,
           operands: emitter.operands,
+          typed: emitter.typed,
         },
         i: len(emitter.lambdas),
       },
@@ -1388,6 +1400,7 @@ fn note_call(emitter: Emitter, full: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn spend_made(emitter: Emitter, name: Bytes) -> Emitter =
@@ -1878,6 +1891,7 @@ fn const_of(emitter: Emitter, literal: Lit) -> { emitter: Emitter, i: Int } =
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     },
     i: len(emitter.consts),
   }
@@ -3616,6 +3630,7 @@ fn builtin_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           bound: emitter.bound,
           group: emitter.group,
           operands: emitter.operands,
+          typed: emitter.typed,
         },
         i: len(emitter.called_builtins),
       },
@@ -3846,6 +3861,7 @@ fn emit_lambda(
     bound: [],
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   };
   let charged = fold(window, start, |acc: Emitter, w: Unboxed|
     note_bound(note_holder(charge(acc, w.slot, w.expr), w.expr), w.expr));
@@ -4008,6 +4024,7 @@ fn field_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           bound: emitter.bound,
           group: emitter.group,
           operands: emitter.operands,
+          typed: emitter.typed,
         },
         i: len(emitter.fields),
       },
@@ -4068,6 +4085,7 @@ fn remember_built(
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int } =
@@ -4118,6 +4136,7 @@ fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int 
           bound: emitter.bound,
           group: emitter.group,
           operands: emitter.operands,
+          typed: emitter.typed,
         },
         i: len(emitter.shapes),
       },
@@ -4182,6 +4201,7 @@ fn note_tok(emitter: Emitter, w: Int) -> Emitter =
       bound: emitter.bound,
       group: emitter.group,
       operands: emitter.operands,
+      typed: emitter.typed,
     }
   }
 
@@ -4225,6 +4245,7 @@ fn note_released(emitter: Emitter, root: Bytes) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 fn width_of(ty: Ty) -> Option<Int> = match ty { TyRec(fs) -> Some(len(fs)), _ -> None }
@@ -4386,6 +4407,7 @@ fn closure_value(
             bound: e.bound,
             group: e.group,
             operands: e.operands,
+            typed: e.typed,
           };
           let o = bind(
             grown,
@@ -5226,6 +5248,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         bound: js.emitter.bound,
                         group: js.emitter.group,
                         operands: js.emitter.operands,
+                        typed: js.emitter.typed,
                       },
                       names,
                       js.names,
@@ -5273,6 +5296,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         bound: e.emitter.bound,
                         group: e.emitter.group,
                         operands: e.emitter.operands,
+                        typed: e.emitter.typed,
                       },
                       bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]),
                     );
@@ -5340,6 +5364,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       bound: fin.bound,
                       group: fin.group,
                       operands: fin.operands,
+                      typed: fin.typed,
                     };
                     Some({
                       emitter: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
@@ -6725,7 +6750,9 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
     PxVar(v) -> match v.slot {
       None -> emitter,
       Some(s) -> {
-        let b = bind_keeping(emitter, KBoxed, subj.ty, subj.expr);
+        // What the subject's own shape does not say, the type the checker bound says.
+        let ty = match subj.ty { TyOpen -> typed_kind(emitter.typed, v.span).ty, known -> known };
+        let b = bind_keeping(emitter, KBoxed, ty, subj.expr);
         remember(ensure_owned(b.emitter, b.value), s, b.value)
       },
     },
@@ -6911,6 +6938,7 @@ fn blank(emitter: Emitter) -> Emitter =
     bound: emitter.bound,
     group: emitter.group,
     operands: emitter.operands,
+    typed: emitter.typed,
   }
 
 /// The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
@@ -7538,159 +7566,59 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
       },
     })
 
-/// A module's type aliases, under the binder an import gives it in the module being emitted.
-pub type ModAliases = { binder: Bytes, aliases: List<Alias> }
+/// How a value of `ty` is held: an `Int` or a `Bool` untagged, a width below 64 bits in its own C
+/// type, anything else a word, with what a field read or an inline builtin can take of its type.
+pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
+  match ty {
+    TyCon(c) -> if len(c.args) == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen } }
+    else if len(c.args) == 0 && c.name == b"Bool" { { kind: KBool, ty: TyOpen } }
+    else if len(c.args) == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
+    else if len(c.args) == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
+    else if len(c.args) == 1 && c.name == b"Array" { { kind: KBoxed, ty: TyArray } }
+    // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
+    else if len(c.args) == 0 {
+      match width_named(c.name) {
+        Some(w) -> if carried(w) { { kind: KNum(w), ty: TyOpen } } else { boxed() },
+        None -> boxed(),
+      }
+    } else { boxed() },
+    // Field order is the checker's, sorted by name.
+    TyRecord(fs) -> { kind: KBoxed, ty: TyRec(map(fs, field_ty)) },
+    // At run time a `new` record is the record it is written as.
+    TyNominal(x) -> { kind: KBoxed, ty: TyRec(map(x.fields, field_ty)) },
+    _ -> boxed(),
+  }
 
-/// With imported aliases in reach: `http::Response` resolves through `http`'s aliases to its record, read at offsets.
-fn param_kind_with(
-  aliases: List<Alias>,
-  others: List<ModAliases>,
-  ty: Option<TypeExpr>,
-) -> Option<{ kind: Kind, ty: Ty }> = {
-  // No alias names itself through others, so a type expands through each at most once.
-  let room = fold(others, len(aliases), |n: Int, o: ModAliases| n + len(o.aliases));
-  written_kind(aliases, others, [], ty, room)
+fn boxed() -> { kind: Kind, ty: Ty } = { kind: KBoxed, ty: TyOpen }
+
+fn field_ty(f: Field) -> FieldTy = {
+  let k = kind_of(f.ty);
+  { name: f.name, kind: k.kind, ty: k.ty }
 }
 
-/// An alias's arguments resolve where written, its body in the alias's own module with its parameters bound to them.
-fn bind_args(
-  aliases: List<Alias>,
-  others: List<ModAliases>,
-  vars: List<Bound>,
-  params: List<Bytes>,
-  args: List<TypeExpr>,
-  room: Int,
-) -> List<Bound> =
-  map(range(0, len(params)), |i: Int| {
-    let name = match list_at(params, i) { Some(n) -> n, None -> b"" };
-    match list_at(args, i) {
-      Some(arg) -> match written_type(aliases, others, vars, arg, room) {
-        Some(x) -> { name: name, kind: x.kind, ty: x.ty },
-        None -> { name: name, kind: KBoxed, ty: TyOpen },
-      },
-      None -> { name: name, kind: KBoxed, ty: TyOpen },
-    }
-  })
+/// What a definition's scheme says it takes and answers.
+type Sig = { params: List<Type>, ret: Type }
 
-fn alias_named(aliases: List<Alias>, name: Bytes) -> Option<Alias> =
-  fold(aliases, None, |acc: Option<Alias>, alias: Alias|
-    if alias.name == name { Some(alias) } else { acc })
-
-fn written_kind(
-  aliases: List<Alias>,
-  others: List<ModAliases>,
-  vars: List<Bound>,
-  ty: Option<TypeExpr>,
-  room: Int,
-) -> Option<{ kind: Kind, ty: Ty }> =
-  match ty { Some(t) -> written_type(aliases, others, vars, t, room), None -> param_kind(ty) }
-
-/// `room` is how many more aliases the type may expand through; past it the kind is refused.
-fn written_type(
-  aliases: List<Alias>,
-  others: List<ModAliases>,
-  vars: List<Bound>,
-  ty: TypeExpr,
-  room: Int,
-) -> Option<{ kind: Kind, ty: Ty }> =
-  match ty {
-    TVar(id) -> match fold(vars, None, |acc: Option<Bound>, b: Bound|
-        if b.name == id.name { Some(b) } else { acc }) {
-      Some(b) -> Some({ kind: b.kind, ty: b.ty }),
-      None -> type_kind(ty),
-    },
-    TCon(c) -> match c.name.module {
-      Some(binder) -> match fold(others, None, |acc: Option<List<Alias>>, o: ModAliases|
-          if o.binder == binder.name { Some(o.aliases) } else { acc }) {
-        None -> type_kind(ty),
-        Some(theirs) -> match alias_named(theirs, c.name.name.name) {
-          // Resolved in the other module's own scope: its aliases, and none of ours.
-          Some(a) -> if room <= 0 { None } else {
-            written_type(
-              theirs,
-              [],
-              bind_args(aliases, others, vars, a.params, c.args, room),
-              a.ty,
-              room - 1,
-            )
-          },
-          None -> type_kind(ty),
-        },
-      },
-      None -> match alias_named(aliases, c.name.name.name) {
-        Some(a) -> if room <= 0 { None } else {
-          written_type(
-            aliases,
-            others,
-            bind_args(aliases, others, vars, a.params, c.args, room),
-            a.ty,
-            room - 1,
-          )
-        },
-        None -> type_kind(ty),
-      },
-    },
-    // A record's fields resolve in the record's own scope.
-    TRecord(r) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
-        acc || written_type(aliases, others, vars, f.ty, room) == None) { None } else {
-      Some({
-        kind: KBoxed,
-        ty: TyRec(
-          map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-            match written_type(aliases, others, vars, f.ty, room) {
-              Some(x) -> { name: f.name.name, kind: x.kind, ty: x.ty },
-              None -> { name: f.name.name, kind: KBoxed, ty: TyOpen },
-            }),
-        ),
-      })
-    },
-    _ -> type_kind(ty),
+fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
+  match map_get(schemes, full) {
+    Some(s) -> match s.ty { TyFn(f) -> Some({ params: f.params, ret: f.ret }), _ -> None },
+    None -> None,
   }
 
-/// Only a missing annotation is refused.
-pub fn param_kind(ty: Option<TypeExpr>) -> Option<{ kind: Kind, ty: Ty }> =
-  match ty { Some(x) -> type_kind(x), None -> None }
+/// How each parameter of `def` arrives: the witnesses the expansion put before what the definition
+/// writes are `Int`s, and the rest are as its scheme says. A parameter no scheme speaks for is a word,
+/// which every parameter arrives as.
+fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
+  let given = match sig { Some(s) -> s.params, None -> [] };
+  let witnesses = len(def.params) - len(given);
+  map(range(0, len(def.params)), |i: Int|
+    if i < witnesses { { kind: KInt, ty: TyOpen } }
+    else { match list_at(given, i - witnesses) { Some(t) -> kind_of(t), None -> boxed() } })
+}
 
-fn type_kind(ty: TypeExpr) -> Option<{ kind: Kind, ty: Ty }> =
-  match ty {
-    // The prologue opens `Int` and `Bool`; everything else arrives and is read as a word.
-    TCon(c) ->      // Another module's type is a word of unknown shape.
-      if c.name.module != None { Some({ kind: KBoxed, ty: TyOpen }) }
-      else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ kind: KInt, ty: TyOpen }) }
-      else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ kind: KBool, ty: TyOpen }) }
-      // The inline builtins ask about these: with the kind known the read is a plain load.
-      else if c.name.name.name == b"Bytes" && len(c.args) == 0 {
-        Some({ kind: KBoxed, ty: TyBytes })
-      } else if c.name.name.name == b"List" && len(c.args) == 1 {
-        Some({ kind: KBoxed, ty: TyList })
-      } else if c.name.name.name == b"Array" && len(c.args) == 1 {
-        Some({ kind: KBoxed, ty: TyArray })
-      }
-      // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
-      else if len(c.args) == 0 && width_named(c.name.name.name) != None {
-        match width_named(c.name.name.name) {
-          Some(w) -> if carried(w) { Some({ kind: KNum(w), ty: TyOpen }) }
-          else { Some({ kind: KBoxed, ty: TyOpen }) },
-          None -> Some({ kind: KBoxed, ty: TyOpen }),
-        }
-      } else { Some({ kind: KBoxed, ty: TyOpen }) },
-    // Field order is the checker's (sorted by name), not the declaration's.
-    TRecord(r) -> if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
-        acc || type_kind(f.ty) == None) { None } else {
-      Some({
-        kind: KBoxed,
-        ty: TyRec(
-          map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-            match type_kind(f.ty) {
-              Some(x) -> { name: f.name.name, kind: x.kind, ty: x.ty },
-              None -> { name: f.name.name, kind: KBoxed, ty: TyOpen },
-            }),
-        ),
-      })
-    },
-    // Any other written type is a word.
-    _ -> Some({ kind: KBoxed, ty: TyOpen }),
-  }
+/// The type the checker filed at `span`, as a value of it is held; a word where it filed none.
+fn typed_kind(typed: Map<Bytes, Typed>, span: Span) -> { kind: Kind, ty: Ty } =
+  match map_get(typed, span_key(span)) { Some(t) -> kind_of(t.ty), None -> boxed() }
 
 pub fn emit_fn(
   module: Bytes,
@@ -7715,6 +7643,7 @@ pub fn emit_fn(
       [],
       false,
       map_new(),
+      map_new(),
     ) {
     None -> None,
     Some(f) -> Some(f.text),
@@ -7735,6 +7664,7 @@ pub fn emit_fn_full(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
 ) -> Option<{ text: Bytes, tables: Tables }> / {abort.raise} = {
   let name = symbol_of(full);
   let start = {
@@ -7776,6 +7706,7 @@ pub fn emit_fn_full(
     bound: [],
     group: [],
     operands: operands,
+    typed: typed,
   };
   match emit_body(start, params, body) {
     None -> None,
@@ -7847,6 +7778,7 @@ pub fn emit_fn_why(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
 ) -> Option<Bytes> / {abort.raise} = {
   let start = {
     out: [],
@@ -7887,6 +7819,7 @@ pub fn emit_fn_why(
     bound: [],
     group: [],
     operands: operands,
+    typed: typed,
   };
   match emit_body(start, params, body) {
     None -> Some(b"refused without a reason"),
@@ -7910,6 +7843,7 @@ pub fn emit_group_full(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
 ) -> Option<{ text: Bytes, tables: Tables }> / {abort.raise} = {
   let names = map(members, |m: Member| m.full);
   let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
@@ -7955,6 +7889,7 @@ pub fn emit_group_full(
     bound: [],
     group: names,
     operands: operands,
+    typed: typed,
   };
   match group_cases(start, members, 0) {
     None -> None,
@@ -8556,6 +8491,17 @@ test "an operator is compiled at the type the checker settled, whatever holds it
   assert_eq(has(b"(uint8_t)((uint64_t)(uint8_t)("), [false, false, true])
 }
 
+test "a record a pattern binds is read at the offsets its checked type gives" {
+  let src = bytes_concat_all([
+    b"type Point = { x: Int, y: Int }\n",
+    b"fn sum(ps: List<Point>) -> Int = match ps { [p, ..] -> p.x + p.y, _ -> 0 }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  assert_eq(map(out, |e: Emitted| e.why), [None]);
+  // `p` holds a `Point`, so each field is a load at its place rather than a search by name.
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"rt_field_p") != None), [false])
+}
+
 test "two operators on one span that the checker settled apart are left unsettled" {
   let at = { start: 3, end: 9 };
   let sites = [
@@ -8569,57 +8515,27 @@ test "two operators on one span that the checker settled apart are left unsettle
 
 // --- the emitter's entry ----------------------------------------------------
 
-fn aliases_in(module: Module) -> List<Alias> =
-  fold(module.items, [], |acc: List<Alias>, item: Item|
-    match item {
-      IType(t) -> match t.body {
-        TDAlias(u) ->
-          push(acc, { name: t.name.name, params: ident_names(t.generics.types), ty: u }),
-        // At run time a `new` record is the record it is written as.
-        TDNominal(u) ->
-          push(acc, { name: t.name.name, params: ident_names(t.generics.types), ty: u }),
-        _ -> acc,
-      },
-      _ -> acc,
-    })
-
-/// The imported modules' aliases, each under the binder this module gives it.
-fn others_of(module: Module, program: List<ModuleDefs>) -> List<ModAliases> =
-  fold(module.imports, [], |acc: List<ModAliases>, decl: ImportDecl| {
-    let path = bytes_join_dots(map(decl.path, |ident: Ident| ident.name));
-    let theirs = fold(program, [], |a: List<Alias>, md: ModuleDefs|
-      if md.module == path { md.aliases } else { a });
-    match decl.kind {
-      IModule -> push(acc, { binder: last_segment(decl.path), aliases: theirs }),
-      IAlias(a2) -> push(acc, { binder: a2.name, aliases: theirs }),
-      INames(_) -> acc,
-    }
-  })
+/// A definition as its callers read it, its answer as its scheme says.
+fn def_entry(module: Bytes, d: FnDef, pure: Map<Bytes, Bool>, schemes: Map<Bytes, Scheme>) -> Def = {
+  let full = qualify(module, d.name.name);
+  let ret = match sig_of(schemes, full) { Some(s) -> Some(kind_of(s.ret)), None -> None };
+  {
+    name: d.name.name,
+    ret: match ret { Some(r) -> Some(r.kind), None -> None },
+    ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen },
+    pure: map_contains(pure, full),
+    arity: len(d.params) + len(d.generics.labels),
+  }
+}
 
 fn defs_in(
   module: Bytes,
   m: Module,
   pure: Map<Bytes, Bool>,
-  program: List<ModuleDefs>,
-) -> List<Def> = {
-  let aliases = aliases_in(m);
-  let others = others_of(m, program);
+  schemes: Map<Bytes, Scheme>,
+) -> List<Def> =
   fold(m.items, [], |acc: List<Def>, item: Item|
-    match item {
-      IFn(d) ->
-        push(acc, {
-          name: d.name.name,
-          ret: match param_kind_with(aliases, others, d.ret) {
-            Some(r) -> Some(r.kind),
-            None -> None,
-          },
-          ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-          pure: map_contains(pure, qualify(module, d.name.name)),
-          arity: len(d.params) + len(d.generics.labels),
-        }),
-      _ -> acc,
-    })
-}
+    match item { IFn(d) -> push(acc, def_entry(module, d, pure, schemes)), _ -> acc })
 
 test "the emitter writes an embed out as the front end's answer says it was read" {
   let src = b"fn data() -> Bytes = embed(\"d.txt\")\n";
@@ -8628,8 +8544,7 @@ test "the emitter writes an embed out as the front end's answer says it was read
     analyse_pulling_std_with(
       [{ name: b"m", src: src }],
       [],
-      [],
-      [],
+      no_rows(),
       { root: b"", manifest: None, supplied: [] },
       [{ root: b"", module: b"m", want: want, read: Ok([{ name: b"", bytes: b"one" }]) }],
     ).out,
@@ -8722,7 +8637,7 @@ test "a body is lowered from what its row files of it, walked now or published f
       assert(len(f.operands) > 0)
     },
   };
-  let seeded = analyse_with(parse_all(sited(b"")), walked.rows.defs, walked.rows.tests);
+  let seeded = analyse_with(parse_all(sited(b"")), walked.rows);
   match seeded {
     front::Refused(_) -> panic("the program checks"),
     front::Analysed(w) -> assert_eq(len(w.checked.seeded), 2),
@@ -8731,10 +8646,10 @@ test "a body is lowered from what its row files of it, walked now or published f
 }
 
 fn seeded_with(sources: List<Source>, rows: Rows) -> front::AnalysisOutcome / {abort.raise} =
-  analyse_pulling_std_with(sources, [], rows.defs, rows.tests).out
+  analyse_pulling_std_with(sources, [], rows).out
 
 test "a body published from its row is lowered where its definition moved to" {
-  let before = dump_of(seeded_with(sited(b""), { defs: [], tests: [] }));
+  let before = dump_of(seeded_with(sited(b""), no_rows()));
   let after = sited(b"// a comment, and a definition, above it\nfn aside() -> Int = 7\n");
   let seeded = seeded_with(after, before.rows);
   match seeded {
@@ -8743,14 +8658,14 @@ test "a body published from its row is lowered where its definition moved to" {
   };
   assert_eq(
     sited_answers(after, dump_of(seeded)),
-    sited_answers(after, dump_of(seeded_with(after, { defs: [], tests: [] }))),
+    sited_answers(after, dump_of(seeded_with(after, no_rows()))),
   )
 }
 
 test "a module's roots are lowered only from an answer that holds what its check read" {
   let sources = sited(b"");
   let d = dump_of(analyse(parse_all(sources)));
-  let unread = { ..d, rows: { defs: [], tests: d.rows.tests } };
+  let unread = { ..d, rows: { ..d.rows, defs: [] } };
   match at(sited_answers(sources, unread), 0).answer {
     Body(_) -> panic("a body with no row is not lowered from a guess"),
     Refused(r) -> assert(bytes_index_of(r.why, b"nothing its check read") != None),
@@ -8776,7 +8691,7 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
         [],
         [],
         [],
-        { defs: d.rows.defs, tests: [] },
+        { ..d.rows, tests: [] },
         d.walked,
       ),
       0,
@@ -9044,14 +8959,13 @@ fn emit_program(
                 map_insert(acc, n, true));
               // The checker has the shape of every update, so the literals they stand for are written in here.
               let mods: List<ParsedModule> = expanded_mods(x.mods, facts.elaboration);
-              let with_aliases = map(mods, |m: ParsedModule|
-                { module: m.name, defs: [], aliases: aliases_in(m.module) });
+              let schemes = fold(
+                rows.defs,
+                map_new(),
+                |acc: Map<Bytes, Scheme>, row: KnownDefRow| map_insert(acc, row.name, row.scheme),
+              );
               let program = map(mods, |m: ParsedModule|
-                {
-                  module: m.name,
-                  defs: defs_in(m.name, m.module, pure, with_aliases),
-                  aliases: aliases_in(m.module),
-                });
+                { module: m.name, defs: defs_in(m.name, m.module, pure, schemes) });
               let stated = stated_by_tag(mods);
               fold(range(0, len(mods)), [], |acc: List<Emitted>, i: Int|
                 match list_at(mods, i) {
@@ -9064,12 +8978,14 @@ fn emit_program(
                         ctors,
                         builtins,
                         program,
+                        schemes,
                         pure,
                         effects_in(x.r, i, mods),
                         release,
                         wanted,
                         sites_in(facts.label_sites, i),
                         operands_in(facts.operands, i),
+                        typed_in(facts, i),
                         x.r,
                         i,
                         mods,
@@ -9240,6 +9156,39 @@ fn operands_in(all: List<OperandSite>, module: Int) -> Map<Bytes, Bytes> =
 /// Never a type's name.
 fn unsettled() -> Bytes = b"?"
 
+/// A type the checker filed at a site, and the type arguments a use there is at.
+pub type Typed = { ty: Type, args: List<Type> }
+
+/// Each typed site in this module, by its span. A default argument is written in its own module's
+/// positions, so two sites can share a span: where they differ, neither is read.
+fn typed_in(facts: EmitFacts, module: Int) -> Map<Bytes, Typed> =
+  fold(
+    facts.typed,
+    { sites: map_new(), read: map_new() },
+    |acc: { sites: Map<Bytes, Typed>, read: Map<Bytes, Type> }, site: TypedSite|
+      if site.module != module { acc } else {
+        let own = type_at(facts.types, site.ty, acc.read);
+        let args = fold(
+          site.args,
+          { tys: [], read: own.read },
+          |a: { tys: List<Type>, read: Map<Bytes, Type> }, k: Bytes| {
+            let t = type_at(facts.types, k, a.read);
+            { tys: push(a.tys, t.ty), read: t.read }
+          },
+        );
+        let key = span_key(site.span);
+        let here = { ty: own.ty, args: args.tys };
+        {
+          sites: match map_get(acc.sites, key) {
+            None -> map_insert(acc.sites, key, here),
+            Some(t) -> if t == here { acc.sites }
+            else { map_insert(acc.sites, key, { ty: TyVar(0 - 1), args: [] }) },
+          },
+          read: args.read,
+        }
+      },
+  ).sites
+
 /// What the front end's check read, or nothing when its answer carried none or one this program does
 /// not read.
 fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
@@ -9252,12 +9201,14 @@ fn emit_module(
   ctors: List<Bytes>,
   builtins: List<Bytes>,
   program: List<ModuleDefs>,
+  schemes: Map<Bytes, Scheme>,
   pure: Map<Bytes, Bool>,
   effects: List<EffectName>,
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
   sites: Map<Bytes, List<Bytes>>,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
   resolved: Resolved,
   index: Int,
   mods: List<ParsedModule>,
@@ -9266,36 +9217,17 @@ fn emit_module(
   let defs_of = |path: Bytes|
     fold(program, [], |acc: List<Def>, md: ModuleDefs|
       if md.module == path { md.defs } else { acc });
-  let others = others_of(x.module, program);
   let imports = resolved_imports(resolved, index, mods, x_module, defs_of);
-  let aliases = aliases_in(x.module);
-  let here = fold(x.module.items, [], |acc: List<Def>, item: Item|
-    match item {
-      IFn(d) ->
-        push(acc, {
-          name: d.name.name,
-          ret: match param_kind_with(aliases, others, d.ret) {
-            Some(r) -> Some(r.kind),
-            None -> None,
-          },
-          ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-          pure: map_contains(pure, qualify(module, d.name.name)),
-          arity: len(d.params) + len(d.generics.labels),
-        }),
-      _ -> acc,
-    });
+  let here = defs_in(module, x.module, pure, schemes);
   let fns = fold(x.module.items, [], |acc: List<Prepared>, item: Item|
-    match item {
-      IFn(d) -> push(acc, prepare(module, aliases, others, wanted, sites, d)),
-      _ -> acc,
-    });
+    match item { IFn(d) -> push(acc, prepare(module, schemes, wanted, sites, d)), _ -> acc });
   let groups = tail_groups(module, here, fns);
   let walked = fold(x.module.items, { out: [], fns: 0 }, |acc: Walk, item: Item|
     match item {
       IFn(d) -> {
         let p = match list_at(fns, acc.fns) {
           Some(q) -> q,
-          None -> prepare(module, aliases, others, wanted, sites, d),
+          None -> prepare(module, schemes, wanted, sites, d),
         };
         let out = match group_of(groups, acc.fns) {
           None -> if !wants(wanted, p.full) { acc.out } else {
@@ -9311,6 +9243,7 @@ fn emit_module(
                 effects,
                 release,
                 operands,
+                typed,
                 p.full,
                 p.ps,
                 p.known,
@@ -9331,6 +9264,7 @@ fn emit_module(
                 effects,
                 release,
                 operands,
+                typed,
                 map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p }),
               ),
               acc.out,
@@ -9351,8 +9285,8 @@ fn emit_module(
           effects,
           release,
           operands,
-          aliases,
-          others,
+          typed,
+          sig_of(schemes, qualify(module, d.name.name)),
           wanted,
           sites,
         )
@@ -9378,6 +9312,7 @@ fn emit_module(
             effects,
             release,
             operands,
+            typed,
             name,
             map(taken, |p: EmitParam| p.name),
             taken,
@@ -9397,8 +9332,7 @@ fn emit_module(
       // A law's guard and body are roots the judge enters with the binders' values.
       ILaw(d) -> {
         let names = map(d.binders, |binder: Binder| binder.name.name);
-        let kinds = map(d.binders, |binder: Binder|
-          param_kind_with(aliases, others, Some(binder.ty)));
+        let kinds = map(d.binders, |binder: Binder| Some(typed_kind(typed, binder.name.span)));
         let ps = params_of(names, kinds);
         let known = fold(kinds, true, |acc2: Bool, k: Option<{ kind: Kind, ty: Ty }>|
           acc2 && k != None);
@@ -9418,6 +9352,7 @@ fn emit_module(
                 effects,
                 release,
                 operands,
+                typed,
                 part(b"guard"),
                 names,
                 ps,
@@ -9442,6 +9377,7 @@ fn emit_module(
                 effects,
                 release,
                 operands,
+                typed,
                 part(b"body"),
                 names,
                 ps,
@@ -9485,14 +9421,16 @@ type Prepared = {
 /// A label parameter is a hidden trailing `Int`: the caller passes the resource's field-table entry.
 fn prepare(
   module: Bytes,
-  aliases: List<Alias>,
-  others: List<ModAliases>,
+  schemes: Map<Bytes, Scheme>,
   wanted: Option<Map<Bytes, Bool>>,
   sites: Map<Bytes, List<Bytes>>,
   def: FnDef,
 ) -> Prepared / {abort.raise} = {
   let names = map(def.params, |param: Param| param.name.name);
-  let kinds = map(def.params, |param: Param| param_kind_with(aliases, others, param.ty));
+  let kinds = map(
+    param_kinds(def, sig_of(schemes, qualify(module, def.name.name))),
+    |k: { kind: Kind, ty: Ty }| Some(k),
+  );
   let labels = map(def.generics.labels, |ident: Ident| ident.name);
   let all_names = fold(labels, names, |acc: List<Bytes>, n: Bytes| push(acc, n));
   let all_kinds = fold(labels, kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
@@ -9609,6 +9547,7 @@ fn group_emitted(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
   members: List<Prepared>,
 ) -> List<Emitted> / {abort.raise} = {
   let ms = fold(members, [], |acc: List<Member>, p: Prepared|
@@ -9618,7 +9557,7 @@ fn group_emitted(
     });
   let first = match list_at(members, 0) { Some(p) -> p.full, None -> b"" };
   let whole = if len(ms) == len(members) {
-    emit_group_full(module, here, imports, ctors, builtins, ms, effects, release, operands)
+    emit_group_full(module, here, imports, ctors, builtins, ms, effects, release, operands, typed)
   } else { None };
   match whole {
     Some(c) -> [{ name: first, text: c.text, tables: c.tables, why: None, handles: [] }],
@@ -9634,6 +9573,7 @@ fn group_emitted(
           effects,
           release,
           operands,
+          typed,
           p.full,
           p.ps,
           p.known,
@@ -9662,6 +9602,7 @@ fn root_emitted(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
   full: Bytes,
   names: List<Bytes>,
   ps: List<EmitParam>,
@@ -9679,6 +9620,7 @@ fn root_emitted(
     effects,
     release,
     operands,
+    typed,
     full,
     ps,
     known,
@@ -9698,6 +9640,7 @@ fn emitted_from(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
   full: Bytes,
   ps: List<EmitParam>,
   known: Bool,
@@ -9727,6 +9670,7 @@ fn emitted_from(
         effects,
         release,
         operands,
+        typed,
       ) {
       None ->
         {
@@ -9747,6 +9691,7 @@ fn emitted_from(
             effects,
             release,
             operands,
+            typed,
           ),
         },
       Some(o) -> { name: full, text: o.text, tables: o.tables, why: None, handles: [] },
@@ -9767,8 +9712,8 @@ fn clause_roots(
   effects: List<EffectName>,
   release: Bool,
   operands: Map<Bytes, Bytes>,
-  aliases: List<Alias>,
-  others: List<ModAliases>,
+  typed: Map<Bytes, Typed>,
+  sig: Option<Sig>,
   wanted: Option<Map<Bytes, Bool>>,
   sites: Map<Bytes, List<Bytes>>,
 ) -> Walk / {abort.raise} = {
@@ -9796,6 +9741,7 @@ fn clause_roots(
                   effects,
                   release,
                   operands,
+                  typed,
                   full,
                   names,
                   params_of(names, kinds),
@@ -9814,8 +9760,11 @@ fn clause_roots(
           Some(r) -> {
             let full = clause(b"ensures", s.ensures);
             let rnames = push(names, b"result");
-            let rkinds = push(kinds, param_kind_with(aliases, others, Some(r)));
-            let rknown = known && param_kind_with(aliases, others, Some(r)) != None;
+            let rkinds = push(
+              kinds,
+              Some(match sig { Some(s) -> kind_of(s.ret), None -> boxed() }),
+            );
+            let rknown = known;
             {
               out: if !wants(wanted, full) { s.out } else {
                 push(
@@ -9830,6 +9779,7 @@ fn clause_roots(
                     effects,
                     release,
                     operands,
+                    typed,
                     full,
                     rnames,
                     params_of(rnames, rkinds),
