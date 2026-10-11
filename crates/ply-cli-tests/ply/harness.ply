@@ -18,10 +18,13 @@ import cli.env (env)
 import compiler.unit (shipped)
 import compiler.front (module_of)
 import compiler.load
+import compiler.resolve (Diag)
 import cli.hosts (tcb, hermetic_tcb)
-import cli.machine (machine, hermetic_machine)
+import cli.machine (machine, hermetic_machine, Options, unconfigured)
 import cli.replace (edit)
 import cli.tester (tester, hermetic_tester)
+import compiler.cc
+import compiler.cc (compilers, toolchain)
 import std.bytes (hex_of)
 import std.config (config)
 import std.fs
@@ -38,6 +41,7 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
                     out_step, err_step, exit_step, with_input, line_step, Line, Keep, Lines,
                     Discard, Said, Signal, Kill, Terminate)
 import std.time (time)
+import std.value (Value, VCtor, VStr)
 import std.path (segments)
 import std.string (join, unlines)
 import std.text (shell_join)
@@ -159,12 +163,71 @@ pub fn loads_here() -> Bool / {Here, Shipped, machine.drop[run], machine.load[ru
   machine.drop[run]();
   match load::load[cwd](".") {
     Err(_) -> false,
-    Ok(loaded) -> match machine.load[run](working(), loaded.front, loaded.unit) {
-      Ok(_) -> true,
+    Ok(loaded) -> match cc::library[cc]("-O0", cc::library_flags(), loaded.unit) {
       Err(_) -> false,
+      Ok(library) -> match machine.load[run](working(), loaded.front, library) {
+        Ok(_) -> true,
+        Err(_) -> false,
+      },
     },
   }
 }
+
+/// What the first of `diags` says, for a test that stops where a step it relies on was refused.
+pub fn first_message(diags: List<Diag>) -> String =
+  match diags { [d, ..] -> string_of_bytes_lossy(d.message), [] -> "no diagnostic" }
+
+/// The library the program in the working directory compiles to, and its front end.
+pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {Here, Shipped, abort.raise} =
+  match load::load[cwd](".") {
+    Err(diags) -> panic("the program loads: " ++ first_message(diags)),
+    Ok(l) -> match cc::library[cc]("-O0", cc::library_flags(), l.unit) {
+      Err(why) -> panic("the program compiles: " ++ why),
+      Ok(library) -> { front: l.front, library: library },
+    },
+  }
+
+/// The program in the working directory loaded under `run`, configured by `options` first.
+pub fn loaded(
+  options: Options,
+) -> Unit / {Here, Shipped, machine.drop[run], machine.configure[run], machine.load[run], abort.raise} = {
+  machine.drop[run]();
+  machine.configure[run](options);
+  let c = compiled_here();
+  match machine.load[run](working(), c.front, c.library) {
+    Ok(_) -> (),
+    Err(r) -> panic("the machine loads the program: " ++ first_message(r.diags)),
+  }
+}
+
+/// `inner.main` of the program loaded under `run`, bound.
+pub fn bound_main() -> Unit / {machine.bound[run], abort.raise} =
+  match machine.bound[run]("inner.main", unconfigured()) {
+    Ok(_) -> (),
+    Err(r) -> panic("`inner.main` binds: " ++ first_message(r.diags)),
+  }
+
+/// What `inner.<entry>` answered under `run`, or what it raised.
+pub fn called(entry: String, args: List<Value>) -> Result<Value, Diag> / {machine.call[run]} =
+  match machine.call[run]("inner." ++ entry, args).answer { Ok(v) -> Ok(v), Err(r) -> Err(r.diag) }
+
+/// [`called`], where a raise is the test's failure.
+pub fn answered(entry: String, args: List<Value>) -> Value / {machine.call[run], abort.raise} =
+  match called(entry, args) {
+    Ok(v) -> v,
+    Err(d) -> panic("`" ++ entry ++ "` answers: " ++ string_of_bytes_lossy(d.message)),
+  }
+
+/// What `inner.<entry>` answered under `run` when it answers an `Ok` or an `Err` of text.
+pub fn answered_text(
+  entry: String,
+  args: List<Value>,
+) -> Result<String, String> / {machine.call[run], abort.raise} =
+  match answered(entry, args) {
+    VCtor("Ok", [VStr(text)]) -> Ok(text),
+    VCtor("Err", [VStr(text)]) -> Err(text),
+    _ -> panic("`" ++ entry ++ "` answered neither an Ok nor an Err of text"),
+  }
 
 /// The repository's absolute path, which a test hands `ply` to reach a tree it ships.
 pub fn repo() -> String / {Repo, abort.raise} =
@@ -500,20 +563,6 @@ pub fn program_packages() -> List<String> =
 pub fn shipped_dirs() -> List<String> =
   concat(map(shipped_trees(), |s: { prefix: String, dir: String }| s.dir), program_packages())
 
-/// The in-process `ply`'s identity, which keys what a command reuses. What it reuses is under the
-/// test's own directory, so only equality matters, and no module's text need be read for it.
-pub fn in_process_digest() -> String / {Shipped, abort.raise} =
-  hex_of(
-    bytes_blake3(
-      bytes_concat_all(
-        push(
-          map(shipped.names(), |n: String| bytes_concat_all([bytes_of_string(n), b"\0"])),
-          bytes_of_string(shipped.version()),
-        ),
-      ),
-    ),
-  )
-
 // --- In memory ---------------------------------------------------------------
 
 /// Where a tree in memory sits: its root is the filesystem's, and the run's working directory is
@@ -567,7 +616,7 @@ pub effect set Wire = {net.read[client], net.write[client], net.read[ports], net
 pub effect set Clock = {time.read, time.write}
 
 /// Where a run reads the shipped modules, which the harness keeps in memory and on disk alike.
-pub effect set Shipped = {shipped.module, shipped.answer, shipped.names, shipped.reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, shipped.runnable}
+pub effect set Shipped = {shipped.module, shipped.answer, shipped.names, shipped.reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, shipped.runnable, shipped.front, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write}
 
 pub type Over<a> = { value: a, tree: MemFs }
 
@@ -723,8 +772,8 @@ pub fn over_tree<a | e>(
           hermetic_tcb.preview[host](root, options, front, config),
         machine.configure[run](o) -> hermetic_machine.configure[run](o),
         machine.load[run](root, front, unit) -> hermetic_machine.load[run](root, front, unit),
-        machine.opened[run](path, runnable, entry, closure, names) ->
-          hermetic_machine.opened[run](path, runnable, entry, closure, names),
+        machine.opened[run](path, runnable, entry, closure, names, library) ->
+          hermetic_machine.opened[run](path, runnable, entry, closure, names, library),
         machine.reuse[run](root, walked, entry) -> hermetic_machine.reuse[run](root, walked, entry),
         machine.filed[run](front, unit) -> hermetic_machine.filed[run](front, unit),
         machine.reload[run](front, unit) -> hermetic_machine.reload[run](front, unit),
@@ -856,8 +905,6 @@ fn on_disk_over(
       // No binary is measured: which one runs a test is no part of what it asserts.
       env.binary_bytes[sys]() -> None,
       env.pwd[sys]() -> pwd,
-      env.shipped_digest[sys]() -> in_process_digest(),
-      env.builder_digest[sys]() -> in_process_digest(),
       env.reused[sys]() -> pwd ++ "/" ++ reused_dir(),
       env.bodies[sys]() -> pwd ++ "/" ++ bodies(),
       process.line[proc]() -> {
@@ -1257,6 +1304,10 @@ pub fn codes(v: Json) -> List<String> =
   map(items(at(v, "diagnostics")), |d: Json| str(at(d, "code")))
 
 pub fn diagnostic(report: Json) -> Json = nth(at(report, "diagnostics"), 0)
+
+/// The code of each failure a `ply test --json` report holds, in its order.
+pub fn failure_codes(report: Json) -> List<String> =
+  map(items(at(report, "failures")), |f: Json| str(path(f, ["diagnostic", "code"])))
 
 pub fn code_of(report: Json) -> String = str(at(diagnostic(report), "code"))
 

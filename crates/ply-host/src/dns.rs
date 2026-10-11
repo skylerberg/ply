@@ -73,6 +73,21 @@ impl Failure {
     }
 }
 
+/// One value of each `std.dns` type the handlers build, under that type's name.
+pub fn shapes() -> Vec<(&'static str, Value)> {
+    let mut shapes: Vec<(&'static str, Value)> = [
+        Failure::NoSuchName,
+        Failure::NoData,
+        Failure::ServerFailure,
+        Failure::Other(2, "the resolver's own words".to_string()),
+    ]
+    .iter()
+    .map(|failure| ("std.dns.Failure", failure.value()))
+    .collect();
+    shapes.push(("std.dns.Found", found(IpAddr::from([192, 0, 2, 1]))));
+    shapes
+}
+
 fn failed(failure: &Failure) -> Value {
     Value::ctor("Err", vec![failure.value()])
 }

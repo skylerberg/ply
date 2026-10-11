@@ -1,0 +1,128 @@
+//! What a socket handler builds is what the library declares. A handler builds a `std` constructor
+//! or record by its name and fields, so a rename on either side breaks no compile. Each constructor
+//! a module declares is held to that declaration's name, field count and type, since a module may
+//! keep its constructors to itself; each record is written back as a literal of its type, with those
+//! constructors left as holes, and that program checks.
+
+import harness (first_message, project)
+import cli.hosts (tcb, Shape)
+import compiler.front (CtorRow)
+import compiler.load
+import std.list (contains, drop_last, find, last)
+import std.string (ascii_lower, join, split)
+import std.value (Value, Field, VUnit, VBool, VInt, VFixed, VStr, VList, VRecord, VCtor, render_all)
+
+/// The module a program-wide name is declared in, if it is a module's rather than the prelude's.
+fn module_of(name: String) -> Option<List<String>> / {abort.raise} =
+  match split(name, ".") { [_] -> None, segments -> Some(drop_last(segments, 1)) }
+
+/// `name` as a module that imports its module spells it.
+fn spelled(name: String) -> String / {abort.raise} =
+  match ((module_of(name), last(split(name, ".")))) {
+    (Some(segments), Some(simple)) -> match last(segments) {
+      Some(m) -> m ++ "::" ++ simple,
+      None -> name,
+    },
+    _ -> name,
+  }
+
+/// `v` as the literal that builds it, each constructor a module declares a hole.
+fn literal(v: Value) -> String / {abort.raise} =
+  match v {
+    VUnit -> "()",
+    VBool(b) -> if b { "true" } else { "false" },
+    VInt(n) -> if n < 0 { "(0 - " ++ int_to_string(0 - n) ++ ")" } else { int_to_string(n) },
+    VFixed(ty, _) -> render_all(v) ++ ascii_lower(ty),
+    VStr(_) -> render_all(v),
+    VList(items) -> "[" ++ join(map(items, literal), ", ") ++ "]",
+    VRecord(fields) ->
+      "{ " ++ join(map(fields, |f: Field| f.name ++ ": " ++ literal(f.value)), ", ") ++ " }",
+    VCtor(name, args) -> if module_of(name) != None { "panic(\"held by its declaration\")" }
+    else if args == [] { name }
+    else { name ++ "(" ++ join(map(args, literal), ", ") ++ ")" },
+    _ -> panic("a host builds " ++ render_all(v) ++ ", which no literal writes"),
+  }
+
+/// Every module a name in `v` is declared in, added to `seen`.
+fn modules(seen: List<String>, v: Value) -> List<String> / {abort.raise} =
+  match v {
+    VList(items) -> fold(items, seen, modules),
+    VRecord(fields) -> fold(fields, seen, |acc: List<String>, f: Field| modules(acc, f.value)),
+    VCtor(name, args) -> fold(args, with_module(seen, name), modules),
+    _ -> seen,
+  }
+
+fn with_module(seen: List<String>, name: String) -> List<String> / {abort.raise} =
+  match module_of(name) {
+    None -> seen,
+    Some(segments) -> {
+      let m = join(segments, ".");
+      if contains(seen, m) { seen } else { push(seen, m) }
+    },
+  }
+
+/// What is wrong with each constructor a module declares in `v`, against `ctors`.
+fn misbuilt(ctors: List<CtorRow>, wrong: List<String>, v: Value) -> List<String> / {abort.raise} =
+  match v {
+    VList(items) -> fold(items, wrong, |acc: List<String>, x: Value| misbuilt(ctors, acc, x)),
+    VRecord(fields) ->
+      fold(fields, wrong, |acc: List<String>, f: Field| misbuilt(ctors, acc, f.value)),
+    VCtor(name, args) -> {
+      let here = if module_of(name) == None { wrong } else {
+        match find(ctors, |c: CtorRow| c.name == bytes_of_string(name)) {
+          None -> push(wrong, "`" ++ name ++ "` is declared nowhere"),
+          Some(c) -> if c.arity == len(args) { wrong } else {
+            push(
+              wrong,
+              "`" ++ name ++ "` is built with " ++ int_to_string(len(args))
+                ++ " field(s) and declared with "
+                ++ int_to_string(c.arity),
+            )
+          },
+        }
+      };
+      fold(args, here, |acc: List<String>, x: Value| misbuilt(ctors, acc, x))
+    },
+    _ -> wrong,
+  }
+
+/// Whether a constructor `s` was built as is one of the type it was meant to be.
+fn typed(ctors: List<CtorRow>, s: Shape) -> Bool / {abort.raise} =
+  match s.value {
+    VCtor(name, _) -> match find(ctors, |c: CtorRow| c.name == bytes_of_string(name)) {
+      Some(c) -> c.type_name == bytes_of_string(s.shape),
+      None -> true,
+    },
+    _ -> true,
+  }
+
+test/nondet "every value a socket handler builds is one the library declares, as it declares it" {
+  let shapes = tcb.shapes[host]();
+  assert(len(shapes) > 0, Some("the host names no shape"));
+  let imported = fold(shapes, [], |acc: List<String>, s: Shape|
+    modules(with_module(acc, s.shape), s.value));
+  let records = fold(range(0, len(shapes)), "", |acc: String, i: Int|
+    match list_at(shapes, i) {
+      Some(s) -> match s.value {
+        VRecord(_) ->
+          acc ++ "fn shape_" ++ int_to_string(i) ++ "() -> " ++ spelled(s.shape)
+            ++ " / {abort.raise} =\n  "
+            ++ literal(s.value)
+            ++ "\n\n",
+        _ -> acc,
+      },
+      None -> acc,
+    });
+  let text = join(map(imported, |m: String| "import " ++ m), "\n") ++ "\n\n" ++ records
+    ++ "fn main() -> Int = 0\n";
+  project([{ path: "app.ply", text: text }]);
+  let ctors = match load::load[cwd](".") {
+    Ok(l) -> l.front.dump.ctors,
+    Err(diags) -> panic(first_message(diags) ++ "\n" ++ text),
+  };
+  let wrong = fold(shapes, [], |acc: List<String>, s: Shape| {
+    let built = misbuilt(ctors, acc, s.value);
+    if typed(ctors, s) { built } else { push(built, render_all(s.value) ++ " is no " ++ s.shape) }
+  });
+  assert_eq(wrong, [])
+}

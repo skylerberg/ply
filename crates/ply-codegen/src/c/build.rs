@@ -3,7 +3,7 @@
 
 use super::Refused;
 use super::exports::{Exports, Taken};
-use super::load::{Library, compile_and_load};
+use super::load::Library;
 use super::tables::{UnitTables, root_id};
 use crate::heap::{Heap, Stated, Word, mark_immortal};
 use crate::rt::Entry;
@@ -58,26 +58,28 @@ impl Native {
     }
 }
 
-/// Load a unit produced elsewhere against its own constructor table. `source` places its sites;
-/// without one, as the bootstrap loads it, a failure names no place.
-pub fn load_unit(
-    text: &str,
+/// The unit compiled into the library at `path`, finished against its own constructor table.
+/// `source` places its sites; without one, a failure names no place.
+pub fn load_opened(
+    path: &std::path::Path,
     source: Option<&Source>,
-    stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    finish_unit(compile_and_load(text, stem)?, text, source)
+    finish_unit(Library::open(path)?, source)
 }
 
-/// A unit's object, however it was compiled, finished against what it says about itself and the
-/// C it was compiled from.
-pub(super) fn finish_unit(
-    lib: Library,
-    text: &str,
-    source: Option<&Source>,
-) -> Result<(Native, Vec<Refused>)> {
+/// The program this executable was linked with, finished as a loaded unit is.
+pub fn load_linked(source: Option<&Source>) -> Result<(Native, Vec<Refused>)> {
+    let Some(lib) = Library::linked() else {
+        bail!("this executable was linked with no program");
+    };
+    finish_unit(lib, source)
+}
+
+/// A unit's object, however it was compiled or linked, finished against what it says about itself.
+fn finish_unit(lib: Library, source: Option<&Source>) -> Result<(Native, Vec<Refused>)> {
     let exports = Exports::read(&lib)?;
     let refused = refused_of(&exports);
-    let native = finish(lib, exports, text, source)?;
+    let native = finish(lib, exports, source)?;
     Ok((native, refused))
 }
 
@@ -94,8 +96,8 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 
 /// A loaded object plus its `Exports`, made into an enterable `Native`; `source` places its sites.
 /// Invariant: every field of `UnitTables` must be recorded in `Exports`, or the ids move.
-fn finish(lib: Library, exports: Exports, text: &str, source: Option<&Source>) -> Result<Native> {
-    let helpers = exports.bound(text)?;
+fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Native> {
+    let helpers = exports.bound()?;
     let Exports {
         helpers: _,
         ctors,

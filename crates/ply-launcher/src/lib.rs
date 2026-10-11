@@ -1,25 +1,68 @@
-//! The launcher: enter a shipped program with the command line, the shipped modules beside it, and
-//! its environment lent.
+//! The launcher: enter the program this executable was linked with, with the command line, the
+//! shipped modules beside it, and its environment lent.
 //!
 //! This is the whole of what stands between the operating system and the program `ply` is: the
-//! big-stack thread, the runnable opened, the `cwd` and `shipped` roots, the process and
-//! environment bindings, and the exit code.
+//! big-stack thread, the program's front end read from the pack, the `cwd` and `shipped` roots, the
+//! process and environment bindings, and the exit code.
 
-use ply_eval::{Diagnostic, Ended, codes};
+use ply_eval::{Analysis, Diagnostic, Ended, SourceId, codes};
 use ply_machine::enter::{self, Binds};
-use ply_machine::runnable::Runnable;
 use std::path::{Path, PathBuf};
 
 /// The front end and emitter recurse once per node on the native stack.
 const STACK: usize = 256 << 20;
 
-/// What a launched program is: the runnable it is entered from and the binary's version for the
-/// environment it may ask about. It reads the pack's shipped modules as files.
+/// Where the pack carries the linked program's front end's answer: the value codec's record of the
+/// definition it enters, its front end's dump and how many modules the dump's indices run over.
+pub const FRONT: &str = "program/front";
+
+/// What a launched program is: the definition it enters, its front end's answer, the stage its
+/// shipped modules are laid out under, and the binary's version for the environment it may ask
+/// about.
 pub struct Program {
-    pub runnable: Runnable,
+    pub entry: String,
+    pub front: Analysis,
     /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
     pub version: String,
+}
+
+/// The program this executable was linked with, as its pack carries its front end's answer.
+pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
+    let pack = ply_pack::installed();
+    let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
+        return Err(unlinked(format!("its pack carries no `{FRONT}`")));
+    };
+    let value = ply_eval::codec::decode(bytes)
+        .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
+    let at = ply_eval::decode::AnswerValue::new("a linked program's front end", &value);
+    let read = || -> Result<(String, Analysis), ply_eval::decode::Error> {
+        let modules = at.field("modules")?.number::<u32>()?;
+        let ids: Vec<SourceId> = (0..modules).map(SourceId).collect();
+        let front = ply_codegen::c::dump::read(at.field("dump")?.value(), &ids)
+            .map_err(|e| at.error(format!("its dump does not read: {e}")))?;
+        Ok((at.field("entry")?.str()?.to_string(), front))
+    };
+    let (entry, front) = read().map_err(|why| unlinked(why.to_string()))?;
+    let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    Ok(Program {
+        entry,
+        front,
+        stage: format!("native-{stage}"),
+        version: version.to_string(),
+    })
+}
+
+#[cold]
+fn unlinked(why: String) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("this executable's program cannot be entered: {why}"),
+    )
+    .primary(
+        ply_eval::Span::DUMMY,
+        "this is Ply's fault, not the program's",
+    )
 }
 
 /// The marker that says a shipped modules directory is whole; landed last, so a reader never sees
@@ -36,8 +79,7 @@ pub fn install_own_pack() -> Result<(), String> {
             Ok(())
         }
         None => Err(format!(
-            "`{}` carries no pack; `cargo pack {}` appends the checkout's",
-            binary.display(),
+            "`{}` carries no pack: a native program is linked with one, as `ply bootstrap` links `ply`",
             binary.display()
         )),
     }
@@ -100,16 +142,16 @@ pub fn stamps() -> String {
 /// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
 /// name, and the stamps and definitions beside them. Each file lands by a rename and the marker
 /// last, so a run that finds the marker finds it whole, and reads nothing of the pack for it.
-pub fn shipped_modules(program: &Program, definitions: &str) -> Result<PathBuf, Diagnostic> {
+pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
     let mut laid = blake3::Hasher::new();
     laid.update(stamps.as_bytes());
     laid.update(&[0]);
     laid.update(definitions.as_bytes());
-    let dir = ply_codegen::c::stage::stage_dir(&program.stage)
+    let dir = ply_codegen::c::stage::stage_dir(stage)
         .join(format!("shipped-{}", &laid.finalize().to_hex()[..16]));
     if dir.join(SHIPPED_MARKER).exists() {
-        ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(&program.stage));
+        ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(stage));
         return Ok(dir);
     }
     lay_out(&dir, &stamps, definitions).map_err(|e| {
@@ -178,23 +220,18 @@ pub fn run(
     mut binds: Binds,
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
-    let definitions = ply_machine::shipped::definitions(
-        &program.runnable.front.answer,
-        Some(&program.runnable.entry),
-    );
-    let shipped = match shipped_modules(&program, &definitions) {
+    ply_codegen::c::sweep::once();
+    let definitions = ply_machine::shipped::definitions(&program.front, Some(&program.entry));
+    let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),
     };
     ply_host::observe::laid_out(&shipped, ply_codegen::c::kept_dirs());
     let reporting = reporting();
     ply_machine::shipped::stamp(stamps());
-    ply_machine::shipped::entered(&program.runnable.entry, definitions);
+    ply_machine::shipped::entered(&program.entry, definitions);
     let version = program.version.clone();
-    let opened = match enter::opened_runnable(program.runnable, Path::new(shipped::ROOT)) {
-        Ok(opened) => opened,
-        Err(refused) => return Ended::refused(refused),
-    };
+    let opened = enter::opened_linked(program.front, &program.entry);
     let mut roots = vec![
         ply_host::fs::RootSpec {
             name: "cwd".to_string(),
@@ -224,11 +261,7 @@ pub fn run(
             match count {
                 Some(asked) => {
                     let (answer, counted, sites) = crate::count::window_sampled(
-                        || {
-                            ply_codegen::rt::unbounded(|| {
-                                enter::enter_runnable(opened, argv, binds)
-                            })
-                        },
+                        || ply_codegen::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
                         asked.every(),
                     );
                     // The entry's answer stands: the run happened, and a count that could not
@@ -242,7 +275,7 @@ pub fn run(
                     }
                     answer
                 }
-                None => ply_codegen::rt::unbounded(|| enter::enter_runnable(opened, argv, binds)),
+                None => ply_codegen::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
             }
         });
     match work {
@@ -268,4 +301,3 @@ pub fn run(
 pub mod code;
 pub mod count;
 pub mod env;
-pub mod shipped;

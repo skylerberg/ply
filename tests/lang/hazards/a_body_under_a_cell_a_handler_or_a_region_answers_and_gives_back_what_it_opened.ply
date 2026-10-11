@@ -1,0 +1,141 @@
+import hazards.pure
+
+fn counted(n: Int) -> Int =
+  with_cell[tally](0) { c -> {
+    cell_set(c, pure::step(n));
+    cell_set(c, cell_get(c) + pure::mix(n, 2));
+    cell_get(c)
+  } }
+
+test "a definition that opens its own region answers what it set there" {
+  assert_eq(counted(0), 35);
+  assert_eq(counted(1), 69);
+  assert_eq(counted(7), 273);
+  assert_eq(counted(0 - 3), 0 - 67)
+}
+
+effect halt {
+  write stop(code: Int) -> Int
+}
+
+fn failing(n: Int) -> Int / {abort.raise} =
+  with_cell[held](n) { c -> {
+    cell_set(c, pure::share(n, 0));
+    cell_get(c)
+  } }
+
+fn abandoned(n: Int) -> Int =
+  handle {
+    with_cell[gone](n) { c -> {
+      cell_set(c, cell_get(c) + 1);
+      halt.stop(cell_get(c))
+    } }
+  } with {
+    halt.stop(code) resume k -> 0 - code,
+  }
+
+fn caught<a>(f: () -> a / {abort.raise}) -> Result<a, String> =
+  handle { f() } with { abort.raise(m) -> Err(m), return v -> Ok(v) }
+
+// Both leave past the close the body ends with: a region either kept would unbalance the entry, which
+// the runtime refuses as it ends.
+test "a with_cell left by a failure or by an unwind gives its region back" {
+  fold(range(0, 32), (), |u: Unit, n: Int| {
+    assert_eq(caught(|| failing(n)), Err("division by zero"));
+    assert_eq(abandoned(n), 0 - (n + 1))
+  })
+}
+
+fn each(xs: List<Int>, f: (Int) -> Int) -> List<Int> = map(xs, f)
+
+fn total(xs: List<Int>) -> Int = fold(xs, 0, |a, b| a + b)
+
+// Nothing in `Int -> Int` says a callback is under it.
+fn tripled(n: Int) -> Int = total(each([n, n + 1], |x| pure::step(x)))
+
+test "a higher-order builtin under a plain signature answers" {
+  assert_eq(tripled(0), 5);
+  assert_eq(tripled(1), 11);
+  assert_eq(tripled(5), 35);
+  assert_eq(total([]), 0);
+  assert_eq(total([0, 1, 2]), 3)
+}
+
+fn fadd(a: Float, b: Float) -> Float = a + b
+
+fn fless(a: Float, b: Float) -> Bool = a < b
+
+fn float_inside(n: Int) -> Int = if 1.5 + 1.5 > 2.0 { n } else { n * 2 }
+
+fn decimal_inside(n: Int) -> Int = if 1.5m + 1.5m > 2.0m { n } else { n * 2 }
+
+fn float_arith_inside(n: Int) -> Int = if 0.1 + 0.2 == 0.3 { n } else { n * 2 }
+
+test "a float or decimal inside a plain signature is never a wrong answer" {
+  assert_eq(fadd(0.1, 0.2), 0.30000000000000004);
+  assert_eq(fless(1.5, 1.5), false);
+  fold([1, 7], (), |u: Unit, n: Int| {
+    assert_eq(float_inside(n), n);
+    assert_eq(decimal_inside(n), n);
+    assert_eq(float_arith_inside(n), 2 * n)
+  })
+}
+
+test "a nullary constructor pattern is a test and not a binding" {
+  assert_eq(pure::tagged(1), 7);
+  assert_eq(pure::tagged(2), 99)
+}
+
+test "a raise inside an entry leaves the next call whole" {
+  fold(range(0, 2), (), |u: Unit, i: Int| {
+    assert_eq(caught(|| pure::share(1, 0)), Err("division by zero"));
+    assert_eq(pure::seeded(), 80);
+    assert_eq(pure::step(5), 16)
+  })
+}
+
+effect tally {
+  read base[r]() -> Int
+  write note[r](what: Int) -> Unit
+}
+
+fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
+  let b = tally.base[log]();
+  tally.note[log](pure::step(n));
+  pure::mix(b, n)
+}
+
+fn handled(n: Int) -> Int =
+  with_cell[log](0) { c -> {
+    let out = handle {
+      measured(n)
+    } with {
+      tally.base[log]() -> 7,
+      tally.note[log](what) -> cell_set(c, cell_get(c) + what),
+    };
+    pure::mix(out, cell_get(c))
+  } }
+
+test "a body under a live handler stack answers through it" {
+  assert_eq(handled(0), 6744);
+  assert_eq(handled(3), 8478);
+  assert_eq(handled(11), 13102)
+}
+
+fn raced(n: Int) -> Int / {sim.read, abort.raise} = {
+  let base = pure::step(n);
+  with_cell[shared](base) { c ->
+    simulate {
+      let a = task.spawn(|| cell_set(c, cell_get(c) + pure::step(n)));
+      let b = task.spawn(|| cell_set(c, cell_get(c) + pure::mix(n, 3)));
+      task.join(a);
+      task.join(b);
+      cell_get(c)
+    }
+  }
+}
+
+test "a region whose tasks race on a cell answers both writes" {
+  assert_eq(raced(1), 90);
+  assert_eq(raced(4), 201)
+}

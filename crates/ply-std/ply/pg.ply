@@ -2206,3 +2206,191 @@ test "a copy out answers its pieces, then none once the server is ready again" {
   );
   assert_eq(pieces, ["1\n", "2\n3\n", "end"])
 }
+
+// --- A client over a scripted server ----------------------------------------------
+
+/// Authentication that needs nothing, the server's version, its key, and readiness.
+fn t_greeting() -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    t_frame(82, u32_be(0)),
+    t_frame(83, bytes_concat(cstring("server_version"), cstring("16.0"))),
+    t_frame(75, bytes_concat(u32_be(7), u32_be(9))),
+    t_frame(90, b"I"),
+  ])
+
+/// One text column named `?column?`, of type `int4`, and one row holding `value`.
+fn t_one(value: String) -> Bytes / {abort.raise} =
+  bytes_concat(
+    t_frame(
+      84,
+      bytes_concat_all([
+        u16_be(1),
+        cstring("?column?"),
+        u32_be(0),
+        u16_be(0),
+        u32_be(23),
+        u16_be(4),
+        i32_be(0 - 1),
+        u16_be(0),
+      ]),
+    ),
+    t_frame(68, bytes_concat_all([u16_be(1), u32_be(string_len(value)), bytes_of_string(value)])),
+  )
+
+/// `select 1` answered the simple way: a description, one row, the tag, and readiness.
+fn t_select_one() -> Bytes / {abort.raise} =
+  bytes_concat_all([t_one("1"), t_frame(67, cstring("SELECT 1")), t_frame(90, b"I")])
+
+/// The same through the extended cycle, whose only extra is the two completions.
+fn t_extended_one(value: String) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    t_frame(49, b""),
+    t_frame(50, b""),
+    t_one(value),
+    t_frame(67, cstring("SELECT 1")),
+    t_frame(90, b"I"),
+  ])
+
+/// A refusal, and the readiness that says the connection is still good.
+fn t_refused(code: String, text: String) -> Bytes / {abort.raise} =
+  bytes_concat(
+    t_frame(
+      69,
+      bytes_concat_all([b"S", cstring("ERROR"), b"C", cstring(code), b"M", cstring(text), b"\x00"]),
+    ),
+    t_frame(90, b"I"),
+  )
+
+/// What the first row's first value reads as.
+fn t_first_text(answer: Answer) -> String / {abort.raise} =
+  match answer.rows {
+    [[Some(text), ..], ..] -> string_of_bytes(text),
+    [[None, ..], ..] -> "null",
+    _ -> "no value",
+  }
+
+/// What `ask` answered over a server that says `chunks`, and every byte the client sent.
+fn t_asked(
+  chunks: List<Bytes>,
+  password: Option<Secret<Bytes>>,
+  nonce: String,
+  ask: (Session) -> Result<String, ClientError> / {net.send[conn], net.recv[conn], net.close[conn], abort.raise, diverges},
+) -> { answer: Result<String, String>, sent: Bytes } / {abort.raise, diverges} = {
+  let server = ip::socket_at(ip::loopback_v4(), 5432);
+  let over = net::on_mem(
+    net::mem_serving(net::mem_empty(), server, [map(chunks, |c: Bytes| Says(c))]),
+    ||
+      match connect[conn](
+          "127.0.0.1",
+          5432,
+          NoTls,
+          "user",
+          "ply",
+          [],
+          password,
+          nonce,
+          default_client(),
+        ) {
+        Err(e) -> Err(client_error_text(e)),
+        Ok(session) -> match ask(session) {
+          Err(e) -> Err(client_error_text(e)),
+          Ok(text) -> Ok(text),
+        },
+      },
+  );
+  { answer: over.value, sent: net::mem_sent(over.net, 1) }
+}
+
+fn t_has(hay: Bytes, needle: Bytes) -> Bool = bytes_index_of(hay, needle) != None
+
+test "a client shakes hands, runs a query and terminates over a scripted server" {
+  let ran = t_asked([t_greeting(), t_select_one()], None, "n", |s: Session|
+    match simple_query[conn](s, "select 1", default_client()) {
+      Err(e) -> Err(e),
+      Ok(reply) -> {
+        finish[conn](reply.session, default_client());
+        Ok(t_first_text(reply.answer))
+      },
+    });
+  assert_eq(ran.answer, Ok("1"));
+  // A start-up frame whose length counts itself and whose next word is protocol 3.0, then the
+  // query, then the terminate that ends the connection.
+  let declared = match u32_be_at(ran.sent, 0) { Some(n) -> n, None -> 0 };
+  assert_eq(u32_be_at(ran.sent, 4), Some(196608));
+  assert_eq(bytes_at(ran.sent, declared), 81);
+  assert(t_has(ran.sent, b"user\x00user\x00database\x00ply\x00"));
+  assert(t_has(ran.sent, b"select 1"));
+  assert(bytes_ends_with(ran.sent, b"X\x00\x00\x00\x04"))
+}
+
+test "the extended cycle carries its parameters as text, in one parse" {
+  let ran = t_asked([t_greeting(), t_extended_one("hello")], None, "n", |s: Session|
+    match extended_query[conn](s, "select $1", [Some("hello")], default_client()) {
+      Err(e) -> Err(e),
+      Ok(reply) -> Ok(t_first_text(reply.answer)),
+    });
+  assert_eq(ran.answer, Ok("hello"));
+  assert(t_has(ran.sent, b"select $1") && t_has(ran.sent, b"hello"));
+  assert_eq(len(bytes_split(ran.sent, b"\x00P")) - 1, 1)
+}
+
+test "a refusal comes back with its SQLSTATE and leaves the connection usable" {
+  let ran = t_asked(
+    [t_greeting(), t_refused("42P01", "relation \"nope\" does not exist"), t_select_one()],
+    None,
+    "n",
+    |s: Session|
+      match simple_query[conn](s, "select nope", default_client()) {
+        Err(Rejected(after, refusal)) -> match simple_query[conn](
+            after,
+            "select 1",
+            default_client(),
+          ) {
+          Err(e) -> Err(e),
+          Ok(reply) -> Ok(server_text(refusal) ++ " then " ++ t_first_text(reply.answer)),
+        },
+        Err(e) -> Err(e),
+        Ok(_) -> Ok("the server accepted what it should have refused"),
+      },
+  );
+  match ran.answer {
+    Ok(text) ->
+      assert(string_contains(text, "42P01") && string_ends_with(text, "then 1"), Some(text)),
+    Err(why) -> panic(why),
+  };
+  assert(t_has(ran.sent, b"select nope") && t_has(ran.sent, b"select 1"))
+}
+
+/// RFC 7677's exchange from the server's side: the mechanisms on offer, its first message, its
+/// final one, then the authentication that completes and the readiness that follows it.
+fn t_scram_greeting() -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    t_frame(82, bytes_concat_all([u32_be(10), cstring("SCRAM-SHA-256"), b"\x00"])),
+    t_frame(
+      82,
+      bytes_concat(
+        u32_be(11),
+        b"r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+      ),
+    ),
+    t_frame(82, bytes_concat(u32_be(12), b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")),
+    t_frame(82, u32_be(0)),
+    t_frame(90, b"I"),
+  ])
+
+test "the client answers SCRAM with RFC 7677's proof and checks the server's" {
+  let ran = t_asked(
+    [t_scram_greeting(), t_select_one()],
+    Some(secret_bytes(secret_of_string("pencil"))),
+    "rOprNGfwEbeRWgbNEkqO",
+    |s: Session|
+      match simple_query[conn](s, "select 1", default_client()) {
+        Err(e) -> Err(e),
+        Ok(reply) -> Ok(t_first_text(reply.answer)),
+      },
+  );
+  assert_eq(ran.answer, Ok("1"));
+  assert(t_has(ran.sent, b"SCRAM-SHA-256"));
+  assert(t_has(ran.sent, b"n=user,r=rOprNGfwEbeRWgbNEkqO"));
+  assert(t_has(ran.sent, b"p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="))
+}

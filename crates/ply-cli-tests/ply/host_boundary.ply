@@ -1,0 +1,159 @@
+//! The host boundary as a test run meets it: what a `simulate` region answers itself and what it
+//! refuses, what a handler in scope keeps from the host, and an answer the host gives later, waited
+//! for outside a region and parked on inside a production one.
+
+import harness (at, failure_codes, json_of, nth, on_disk, path, program, read, said, shown, str)
+
+/// A test that reads a file inside a `simulate` region.
+fn reads_in_a_region() -> String =
+  \\import std.fs (fs)
+  \\
+  \\test/nondet "reads inside a region" {
+  \\  simulate {
+  \\    let read = fs.read_file[cwd]("m.ply");
+  \\    assert(read != None)
+  \\  }
+  \\}
+  \\
+
+// A search re-runs a region whole for every schedule it explores, so whatever any handler would
+// answer, bound or not, would differ between interleavings: E0425 is terminal, and a hermetic run
+// does not tell the program to pass `--host`.
+test/nondet "a host operation inside a simulate region is refused, bound or not" {
+  program(reads_in_a_region());
+  let bound = json_of(on_disk(["test", "--host", "--no-cache", "--json"]));
+  assert(failure_codes(bound) == ["E0425"], Some(shown(bound)));
+  let hermetic = json_of(on_disk(["test", "--no-cache", "--json"]));
+  assert(failure_codes(hermetic) == ["E0425"], Some(shown(hermetic)))
+}
+
+// What a region schedules itself never reaches the boundary, so a binding for it is shadowed.
+test/nondet "a region answers the task operations it schedules, bound or not" {
+  program(
+    "test/nondet \"spawns inside a region\" {\n  let n = simulate {\n    let t = task.spawn(|| 20 + 1);\n    task.join(t)\n  };\n  assert_eq(n, 21)\n}\n",
+  );
+  let bound = on_disk(["test", "--host", "--no-cache"]);
+  assert(bound.code == 0, Some(said(bound)));
+  let hermetic = on_disk(["test", "--no-cache"]);
+  assert(hermetic.code == 0, Some(said(hermetic)))
+}
+
+// A clause around the operation answers it, so a hermetic run reaches no handler and a bound one
+// binds nothing it was not asked to.
+test/nondet "a handler in scope shadows the host" {
+  program(
+    "import std.fs (fs)\n\ntest/nondet \"the double answers\" {\n  let read = handle { fs.read_file[cwd](\"absent\") } with {\n    fs.read_file[cwd](p) -> Some(b\"double\"),\n  };\n  assert_eq(read, Some(b\"double\"))\n}\n",
+  );
+  let hermetic = on_disk(["test", "--no-cache"]);
+  assert(hermetic.code == 0, Some(said(hermetic)))
+}
+
+/// Starts a shell that exits 7, a child the host waits on: an answer that comes later.
+fn waits_on_a_child(inside: String) -> String =
+  "import std.process (process, exit_code)\n\nfn child() -> Int / {process.spawn[sh]} =\n  match exit_code(process.spawn[sh]([\"-c\", \"exit 7\"], \"\", [])) { Some(c) -> c, None -> 0 }\n\ntest/nondet \"waits\" {\n"
+    ++ inside
+    ++ "\n}\n"
+
+// Outside any region nothing else could run meanwhile, so the run blocks on the answer.
+test/nondet "an answer the host gives later is waited for outside a region" {
+  program(waits_on_a_child("  assert_eq(child(), 7)"));
+  let ran = on_disk(["test", "--host", "--exec", "sh=/bin/sh", "--no-cache"]);
+  assert(ran.code == 0, Some(said(ran)))
+}
+
+// Bound, a task opens a production region, where a task waiting on the host parks and the others
+// run; each join answers its own task.
+test/nondet "tasks waiting on the host park in a production region and each join answers its own" {
+  program(
+    waits_on_a_child(
+      "  let ts = map(range(0, 4), |i: Int| task.spawn(|| child() + i));\n  assert_eq(map(ts, |t: Task<Int>| task.join(t)), [7, 8, 9, 10])",
+    ),
+  );
+  let ran = on_disk(["test", "--host", "--exec", "sh=/bin/sh", "--no-cache"]);
+  assert(ran.code == 0, Some(said(ran)))
+}
+
+// A program whose region nests inside a production one is refused as nesting, whatever ran first.
+test/nondet "a simulate inside a production task is refused as nesting" {
+  program(
+    "test/nondet \"nests\" {\n  let t = task.spawn(|| simulate { 1 });\n  assert_eq(task.join(t), 1)\n}\n",
+  );
+  let ran = json_of(on_disk(["test", "--host", "--no-cache", "--json"]));
+  assert(failure_codes(ran) == ["E0416"], Some(shown(ran)))
+}
+
+/// `ply test --host` over the working directory's program, its child processes started by `sh` and
+/// its files below the working directory.
+fn hosted() -> List<String> =
+  ["test", "--host", "--exec", "sh=/bin/sh", "--fs", "cwd=.", "--no-cache"]
+
+// A task opens a production region only where a host is bound, so a hermetic run refuses the spawn
+// and names it.
+test/nondet "a hermetic run never opens a production region" {
+  program("test/nondet \"spawns\" {\n  assert_eq(task.join(task.spawn(|| 1)), 1)\n}\n");
+  let ran = json_of(on_disk(["test", "--no-cache", "--json"]));
+  assert(failure_codes(ran) == ["E0424"], Some(shown(ran)));
+  assert(
+    string_contains(
+      str(path(nth(at(ran, "failures"), 0), ["diagnostic", "message"])),
+      "task.spawn",
+    ),
+    Some(shown(ran)),
+  )
+}
+
+// Tasks retire as they finish unheld, and a retired id is never reused, so no join lands on
+// another task's answer; a kept handle answers every join; and a handle inside a finished task's
+// answer keeps its task joinable.
+test/nondet "every join in a production region answers its own task" {
+  program(
+    "fn churn(n: Int) -> Int / {task.write, abort.raise} =\n  fold(range(0, n), 0, |sum: Int, i: Int| {\n    task.spawn(|| i);\n    let t = task.spawn(|| i * 2);\n    task.yield();\n    sum + task.join(t)\n  })\n\nfn kept(n: Int) -> Int / {task.write, abort.raise} = {\n  let held = fold(range(0, n), [], |tasks: List<Task<Int>>, i: Int| push(tasks, task.spawn(|| i)));\n  task.yield();\n  fold(held, 0, |sum: Int, t: Task<Int>| sum + task.join(t) + task.join(t))\n}\n\nfn relayed() -> Int / {task.write, abort.raise} = {\n  let outer = task.spawn(|| task.spawn(|| 21));\n  task.yield();\n  task.yield();\n  let inner = task.join(outer);\n  task.yield();\n  task.join(inner) * 2\n}\n\ntest/nondet \"churn\" { assert_eq(churn(300), 89700) }\ntest/nondet \"kept\" { assert_eq(kept(40), 1560) }\ntest/nondet \"relayed\" { assert_eq(relayed(), 42) }\n",
+  );
+  let ran = on_disk(hosted());
+  assert(ran.code == 0 && string_contains(said(ran), "3 passed"), Some(said(ran)))
+}
+
+// The spawner reads the clock once its `handle` has ended and the task as it first runs, which
+// answers without parking, so nothing else runs between: the task's reading is the later, and it
+// still answers from the clause around its spawn.
+test/nondet "a production task answers from the handle around its spawn after that handle ended" {
+  program(
+    \\effect ask {
+    \\  read get() -> Int
+    \\}
+    \\
+    \\fn now() -> Int / {clock.read} = match clock.now() { Instant(at) -> at }
+    \\
+    \\test/nondet "the task first runs after the handle around its spawn ended" {
+    \\  let t = handle { task.spawn(|| (now(), ask.get())) } with { ask.get() -> 7 };
+    \\  let ended = now();
+    \\  let answered = task.join(t);
+    \\  assert(ended <= answered._0, None);
+    \\  assert_eq(answered._1, 7)
+    \\}
+    \\
+  );
+  let ran = on_disk(hosted());
+  assert(ran.code == 0, Some(said(ran)))
+}
+
+// Each task opens its region, then waits on a child the host answers later and parks; each still
+// reads its own cell once it wakes, whichever region closed first.
+test/nondet "tasks parked on the host keep their cells when the other's region closes first" {
+  program(
+    "import std.process (process, exit_code)\n\nfn child(code: Int) -> Int / {process.spawn[sh]} =\n  match exit_code(process.spawn[sh]([\"-c\", \"exit \" ++ int_to_string(code)], \"\", [])) { Some(c) -> c, None -> 0 }\n\ntest/nondet \"each task reads its cell after the other's region closed\" {\n  let first = task.spawn(|| with_cell[a](10) { c -> {\n    let got = child(5);\n    cell_get(c) + got\n  } });\n  let second = task.spawn(|| with_cell[b](20) { c -> {\n    let got = child(5);\n    cell_get(c) + got\n  } });\n  assert_eq(task.join(first) + task.join(second), 40)\n}\n",
+  );
+  let ran = on_disk(hosted());
+  assert(ran.code == 0, Some(said(ran)))
+}
+
+// A region ends before the operation beside it, which the run performs once, outside any schedule.
+// A test that simulates is re-run by the search, so this is a run's.
+test/nondet "a host operation beside a simulate region is performed once" {
+  program(
+    "import std.fs (fs)\n\nfn main() -> Int / {fs.write[cwd], sim.read, abort.raise} = {\n  let inside = simulate {\n    let a = task.spawn(|| 1);\n    let b = task.spawn(|| 2);\n    task.join(a) + task.join(b)\n  };\n  match fs.append[cwd](\"sent\", bytes_of_string(int_to_string(inside) ++ \"\\n\")) { Some(at) -> at, None -> 1 }\n}\n",
+  );
+  let ran = on_disk(["run", "--host", "--fs", "cwd=."]);
+  assert(ran.code == 0, Some(said(ran)));
+  assert_eq(read("sent"), Some("3\n"))
+}

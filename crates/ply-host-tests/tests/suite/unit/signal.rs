@@ -313,9 +313,6 @@ fn the_drain_can_still_name_a_listener_it_closed() {
 #[test]
 fn the_registrations_declare_what_a_reviewer_relies_on() {
     let shutdown = Shutdown::new(Bounds::default());
-    let declaration =
-        ply_machine::shipped_modules::source(&ply_eval::ModuleName::from_dotted("std.signal"))
-            .expect("std.signal ships");
     for (op, _) in registrations(Some(&shutdown)) {
         assert_eq!(op.effect.as_str(), EFFECT);
         assert_eq!(op.determinism, Determinism::Nondeterministic);
@@ -329,12 +326,6 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
         assert!(!op.blocking);
         assert!(!op.secrets, "a stop flag is handed no value at all");
         assert!(op.path.starts_with("ply_host::signal::"));
-        let mode = if reads { "read" } else { "write" };
-        assert!(
-            declaration.contains(&format!("  {mode} {}() ->", op.op)),
-            "`{}` is not declared a `{mode}` in std.signal",
-            op.op
-        );
     }
 }
 

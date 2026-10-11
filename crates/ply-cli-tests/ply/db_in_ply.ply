@@ -1,0 +1,412 @@
+//! The `db` effect served by Ply itself, against a real server. `std.pg` speaks the protocol;
+//! this proves the effect can be served in Ply: the pool, the transaction scope and the text of
+//! every value are `std.db`'s, and the host sees only the network and entropy.
+
+import harness (Here, Shipped, Wire, bound_main, called, loaded, write)
+import postgres
+import postgres (Cluster, Postgres, done, over)
+import cli.machine (machine, default_options)
+import std.list (sort_by)
+import std.string (split)
+import std.value (VStr)
+
+effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+
+fn serving() -> String =
+  \\import std.net (net)
+  \\import std.random (entropy)
+  \\import std.db
+  \\import std.db (db, with_server, transaction, is_retryable, ReadCommitted, ReadWrite, Serializable, Rollback)
+  \\import std.sql (stmt, PInt, PText, CInt, CText, Answer, Rows, Count, Failed, Row)
+  \\
+  \\pub fn run(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  run_with(url, None)
+  \\
+  \\// `run`, its password given beside the connection string, as `config.secret` answers one.
+  \\pub fn run_given_password(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  run_with(url, Some(secret_of_bytes(b"p@ss:w")))
+  \\
+  \\fn run_with(url: String, password: Option<Secret<Bytes>>) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 4, password: password, body: || {
+  \\    match db.returning[items](
+  \\      stmt("insert into items (id, name) values ($1, $2) returning id"),
+  \\      [PInt(7), PText("seven")],
+  \\    ) {
+  \\      Failed(e) -> Err(e.detail),
+  \\      Count(_) -> Err("a count where rows were due"),
+  \\      Rows(rows) -> match rows {
+  \\        [] -> Err("no row came back from the insert"),
+  \\        [row, ..rest] -> match map_get(row, "id") {
+  \\          Some(CInt(n)) -> match db.query[items](
+  \\            stmt("select name from items where id = $1"),
+  \\            [PInt(7)],
+  \\          ) {
+  \\            Failed(e) -> Err(e.detail),
+  \\            Count(_) -> Err("a count where rows were due"),
+  \\            Rows(found) -> Ok(int_to_string(n) ++ " " ++ names(found)),
+  \\          },
+  \\          _ -> Err("the id is not an int"),
+  \\        },
+  \\      },
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\fn names(rows: List<Row>) -> String =
+  \\  match rows {
+  \\    [] -> "no rows",
+  \\    [row, ..rest] -> match map_get(row, "name") {
+  \\      Some(CText(t)) -> t,
+  \\      _ -> "the name is not text",
+  \\    },
+  \\  }
+  \\
+  \\// A statement that writes, performed as `db.query`: the scheduler would treat two of these as
+  \\// readers, so the driver refuses it before it reaches the server.
+  \\pub fn sneaky(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 4, || {
+  \\    match db.query[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(1), PText("x")]) {
+  \\      _ -> Ok("the write went through as a read"),
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\// A call site's label is the atom the scheduler records, so a statement that reaches a table the
+  \\// label never named would be scheduled against the wrong table.
+  \\pub fn mislabelled(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 4, || {
+  \\    match db.query[orders](stmt("select name from items where id = $1"), [PInt(7)]) {
+  \\      _ -> Ok("the statement ran under a label it does not touch"),
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\// A transaction commits what it did, through `begin` and `commit` on the same connection.
+  \\pub fn commit_one(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 4, || {
+  \\    match transaction(ReadCommitted, ReadWrite, || {
+  \\      db.execute[items](stmt("insert into items (id, name) values ($1, $2)"), [PInt(8), PText("eight")])
+  \\    }) {
+  \\      Err(roll) -> Err(roll.reason),
+  \\      Ok(_) -> match db.query[items](stmt("select count(*) as n from items"), []) {
+  \\        Failed(e) -> Err(e.detail),
+  \\        Count(_) -> Err("a count where rows were due"),
+  \\        Rows(rows) -> match rows {
+  \\          [row, ..rest] -> Ok(shown(row)),
+  \\          [] -> Err("no row"),
+  \\        },
+  \\      },
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\fn shown(row: Row) -> String =
+  \\  match map_get(row, "n") {
+  \\    Some(CText(t)) -> t,
+  \\    Some(CInt(n)) -> int_to_string(n),
+  \\    _ -> "not a count",
+  \\  }
+  \\
+  \\// The two timeouts as the server holds them for this session, which the connection string set.
+  \\pub fn timeouts(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 1, || {
+  \\    match db.query[pg_settings](
+  \\      stmt("select name, setting from pg_settings where name = 'statement_timeout' or name = 'idle_in_transaction_session_timeout' order by name"),
+  \\      [],
+  \\    ) {
+  \\      Failed(e) -> Err(e.detail),
+  \\      Count(_) -> Err("a count where rows were due"),
+  \\      Rows(rows) -> Ok(fold(rows, "", |acc: String, row: Row| acc ++ setting(row) ++ ";")),
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\fn setting(row: Row) -> String =
+  \\  match (map_get(row, "name"), map_get(row, "setting")) {
+  \\    (Some(CText(name)), Some(CText(value))) -> name ++ "=" ++ value,
+  \\    _ -> "not a setting",
+  \\  }
+  \\
+  \\// A statement that runs far past the timeout the connection string set, and what ended it.
+  \\pub fn overrun(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 1, || {
+  \\    match db.query[pg_class](
+  \\      stmt("select count(*) as n from pg_class a, pg_class b, pg_class c, pg_class d"),
+  \\      [],
+  \\    ) {
+  \\      Failed(e) -> Ok(e.code ++ ": " ++ e.detail),
+  \\      _ -> Err("the statement finished inside its timeout"),
+  \\    }
+  \\  }) {
+  \\    Err(why) -> Err(why),
+  \\    Ok(answered) -> answered,
+  \\  }
+  \\
+  \\fn bump(id: Int, by: Int) -> Answer / {db.execute[ledger]} =
+  \\  db.execute[ledger](stmt("update ledger set n = n + $2 where id = $1"), [PInt(id), PInt(by)])
+  \\
+  \\fn ended(out: Result<Unit, Rollback>) -> String =
+  \\  match out { Ok(_) -> "committed", Err(rolled) -> rolled.reason }
+  \\
+  \\// Two tasks in transactions at once on one pool, over one row: each holds a connection of its own,
+  \\// so the one that rolls back undoes only its own write, whichever takes the row first.
+  \\pub fn two_at_once(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} =
+  \\  with_server(url, 2, || {
+  \\    let kept = task.spawn(|| ended(transaction(ReadCommitted, ReadWrite, || {
+  \\      bump(1, 1);
+  \\      ()
+  \\    })));
+  \\    let undone = task.spawn(|| ended(transaction(ReadCommitted, ReadWrite, || {
+  \\      bump(1, 10);
+  \\      db.rollback("undone")
+  \\    })));
+  \\    task.join(kept) ++ " " ++ task.join(undone)
+  \\  })
+  \\
+  \\// Two serializable transactions writing one row: the one that writes second is refused with 40001,
+  \\// and run again from its `begin` it goes through. The other runs on a pool of its own, inside the
+  \\// first attempt.
+  \\pub fn serialized(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, abort.raise, diverges} =
+  \\  with_server(url, 1, || contended(url, 3, ""))
+  \\
+  \\fn contended(url: String, left: Int, seen: String) -> String / {db.query[ledger], db.execute[ledger], db.abort, db.begin, db.commit, db.rollback, net.close[link], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
+  \\  match transaction(Serializable, ReadWrite, || {
+  \\      db.query[ledger](stmt("select n from ledger where id = $1"), [PInt(1)]);
+  \\      if seen == "" {
+  \\        with_server(url, 1, || transaction(Serializable, ReadWrite, || bump(1, 10)));
+  \\        ()
+  \\      };
+  \\      match bump(1, 1) {
+  \\        Failed(e) -> db.rollback(if is_retryable(e) { "retry " ++ e.code } else { e.code }),
+  \\        _ -> (),
+  \\      }
+  \\    }) {
+  \\    Ok(_) -> seen ++ "committed",
+  \\    Err(rolled) -> if string_starts_with(rolled.reason, "retry ") && left > 1 {
+  \\      contended(url, left - 1, seen ++ string_slice(rolled.reason, 6, string_len(rolled.reason)) ++ " then ")
+  \\    } else { seen ++ rolled.reason },
+  \\  }
+  \\
+  \\// Two tasks, each on a pool of its own, taking two rows in opposite orders: the server breaks the
+  \\// deadlock by refusing one with 40P01, and the other commits once that one has rolled back.
+  \\pub fn deadlocked(url: String) -> Result<String, String>
+  \\  / {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.spawn, task.join, abort.raise, diverges} = {
+  \\  let a = task.spawn(|| crossing(url, 1, 2));
+  \\  let b = task.spawn(|| crossing(url, 2, 1));
+  \\  Ok(task.join(a) ++ " " ++ task.join(b))
+  \\}
+  \\
+  \\fn crossing(url: String, first: Int, second: Int) -> String / {net.close[link], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.recv[link], net.send[link], entropy.next, abort.raise, diverges} =
+  \\  match with_server(url, 1, || ended(transaction(ReadCommitted, ReadWrite, || {
+  \\      bump(first, 1);
+  \\      both_written(400);
+  \\      match bump(second, 1) { Failed(e) -> db.rollback(e.code), _ -> () }
+  \\    }))) {
+  \\    Err(why) -> why,
+  \\    Ok(text) -> text,
+  \\  }
+  \\
+  \\// Until both transactions have written, when each holds a transaction id of its own.
+  \\fn both_written(left: Int) -> Unit / {db.query[pg_locks]} =
+  \\  if left <= 0 { () } else {
+  \\    match db.query[pg_locks](
+  \\        stmt("select count(*) as n from pg_locks where locktype = 'transactionid' and granted"),
+  \\        [],
+  \\      ) {
+  \\      Rows([row, ..]) -> match map_get(row, "n") {
+  \\        Some(CInt(n)) -> if n >= 2 { () } else { both_written(left - 1) },
+  \\        _ -> both_written(left - 1),
+  \\      },
+  \\      _ -> both_written(left - 1),
+  \\    }
+  \\  }
+  \\
+  \\fn main() -> Int = 0
+  \\
+
+/// The program loaded under a host whose part in this is the socket and the entropy.
+fn hosted() -> Unit / {Here, Shipped, Driving, abort.raise} = {
+  write("inner.ply", serving());
+  loaded({ ..default_options(), host: true });
+  bound_main()
+}
+
+/// Why `entry` would not run over `url`, for the refusals that are the driver's, not the server's.
+fn refused(entry: String, url: String) -> String / {Driving, abort.raise} =
+  match called(entry, [VStr(url)]) {
+    Ok(_) -> panic("`" ++ entry ++ "` answered rather than refusing"),
+    Err(d) -> string_of_bytes_lossy(d.message),
+  }
+
+/// A cluster that asks for a password, so the connection is SCRAM rather than trust, with the
+/// program loaded beside it.
+fn scram() -> Cluster / {Here, Shipped, Wire, Driving, Postgres, abort.raise, diverges} = {
+  let c = postgres::scram("ply", "pencil");
+  hosted();
+  c
+}
+
+fn plain(c: Cluster) -> String = postgres::url(c, "127.0.0.1", "ply", "sslmode=disable")
+
+fn items(c: Cluster) -> Unit / {Postgres, abort.raise} = {
+  let _ = postgres::psql(
+    c,
+    "ply",
+    "create table if not exists items (id int4 primary key, name text)",
+  );
+  ()
+}
+
+/// A table of counters, one row per id, each starting at zero.
+fn ledger(c: Cluster, ids: List<Int>) -> Unit / {Postgres, abort.raise} = {
+  let _ = postgres::psql(c, "ply", "create table ledger (id int4 primary key, n int4 not null)");
+  fold(ids, (), |u: Unit, id: Int| {
+    let _ = postgres::psql(c, "ply", "insert into ledger values (" ++ int_to_string(id) ++ ", 0)");
+    ()
+  })
+}
+
+// `db.execute` carries statements, not a schema, so the table is made before the program starts.
+test/nondet "the db effect is served from a real server" {
+  if postgres::available() {
+    let c = scram();
+    items(c);
+    let ran = over("run", plain(c));
+    done(c);
+    assert_eq(ran, Ok("7 seven"))
+  }
+}
+
+// The password, sealed where it is read (the connection string, or settings beside it), sent in
+// the clear-text message a `password` cluster asks for.
+test/nondet "the db effect sends a password in the clear when asked, from the url or from settings" {
+  if postgres::available() {
+    let c = postgres::clear_text("ply", "p@ss:w");
+    hosted();
+    items(c);
+    let port = int_to_string(c.port);
+    let in_url = "postgres://ply:p%40ss%3Aw@127.0.0.1:" ++ port ++ "/ply?sslmode=disable";
+    let first = over("run", in_url);
+    let _ = postgres::psql(c, "ply", "delete from items");
+    let bare = over(
+      "run_given_password",
+      "postgres://ply@127.0.0.1:" ++ port ++ "/ply?sslmode=disable",
+    );
+    let both = over("run_given_password", in_url);
+    done(c);
+    assert_eq(first, Ok("7 seven"));
+    assert_eq(bare, Ok("7 seven"));
+    assert(match both { Err(why) -> string_contains(why, "give it once"), Ok(_) -> false }, None)
+  }
+}
+
+test/nondet "a write performed as a read is refused" {
+  if postgres::available() {
+    let c = scram();
+    let why = refused("sneaky", plain(c));
+    done(c);
+    assert(string_contains(why, "writes") && string_contains(why, "db.query"), Some(why))
+  }
+}
+
+test/nondet "a label the statement does not touch is refused" {
+  if postgres::available() {
+    let c = scram();
+    let why = refused("mislabelled", plain(c));
+    done(c);
+    assert(string_contains(why, "names `orders`") && string_contains(why, "items"), Some(why))
+  }
+}
+
+test/nondet "a transaction commits what it did" {
+  if postgres::available() {
+    let c = scram();
+    items(c);
+    let first = over("run", plain(c));
+    let committed = over("commit_one", plain(c));
+    done(c);
+    assert_eq(first, Ok("7 seven"));
+    assert_eq(committed, Ok("2"))
+  }
+}
+
+test/nondet "a connection string's timeouts bound every statement on the server" {
+  if postgres::available() {
+    let c = scram();
+    let bounded = plain(c) ++ "&statement_timeout=200&idle_in_transaction_session_timeout=1500";
+    let read_back = over("timeouts", bounded);
+    let overrun = over("overrun", bounded);
+    done(c);
+    assert_eq(read_back, Ok("idle_in_transaction_session_timeout=1500;statement_timeout=200;"));
+    assert(
+      match overrun {
+        Ok(why) -> string_starts_with(why, "57014: ") && string_contains(why, "statement timeout"),
+        Err(_) -> false,
+      },
+      None,
+    )
+  }
+}
+
+test/nondet "two tasks in transactions at once each hold a connection of their own" {
+  if postgres::available() {
+    let c = scram();
+    ledger(c, [1]);
+    let both = over("two_at_once", plain(c));
+    let n = postgres::psql(c, "ply", "select n from ledger where id = 1");
+    done(c);
+    assert_eq(both, Ok("committed undone"));
+    assert_eq(n, "1")
+  }
+}
+
+test/nondet "a serialization failure is 40001 and the retried transaction commits" {
+  if postgres::available() {
+    let c = scram();
+    ledger(c, [1]);
+    let retried = over("serialized", plain(c));
+    let n = postgres::psql(c, "ply", "select n from ledger where id = 1");
+    done(c);
+    assert_eq(retried, Ok("40001 then committed"));
+    assert_eq(n, "11")
+  }
+}
+
+test/nondet "a deadlock is 40P01 and the transaction left standing commits" {
+  if postgres::available() {
+    let c = scram();
+    ledger(c, [1, 2]);
+    let ended = over("deadlocked", plain(c));
+    let sum = postgres::psql(c, "ply", "select sum(n) from ledger");
+    done(c);
+    match ended {
+      Ok(text) ->
+        assert_eq(sort_by(split(text, " "), |a: String, b: String| compare(a, b) == Less), [
+          "40P01",
+          "committed",
+        ]),
+      Err(why) -> panic(why),
+    };
+    assert_eq(sum, "2")
+  }
+}

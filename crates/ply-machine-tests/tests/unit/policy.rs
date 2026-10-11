@@ -39,14 +39,14 @@ fn every_family_lends_something_and_has_a_name_and_a_summary() {
 #[test]
 fn a_family_lends_under_the_effect_a_program_declares_and_its_hermetic_half() {
     for family in policy::FAMILIES {
-        let effect = policy::effect_of(family.name)
+        let effects = policy::effects_of(family.name)
             .unwrap_or_else(|| panic!("`{}` lends under no effect", family.name));
         let hermetic = policy::hermetic_of(family.name);
         let ops = policy::lent(family.name, &own).expect("the family is listed");
         for (op, _) in &ops {
             let on_half = Some(op.effect.as_str()) == hermetic;
             assert!(
-                op.effect.as_str() == effect || on_half,
+                effects.contains(&op.effect.as_str()) || on_half,
                 "`{}` lends `{}.{}`, of an effect it does not name",
                 family.name,
                 op.effect,
@@ -69,14 +69,19 @@ fn a_family_lends_under_the_effect_a_program_declares_and_its_hermetic_half() {
             );
         }
     }
-    // The one whose effect is not named for the family: a grant is checked against the effect.
-    assert_eq!(policy::effect_of("claims"), Some("prover"));
-    assert_eq!(policy::effect_of("cache"), None);
-    assert_eq!(policy::effect_of("everything"), None);
+    // A family whose effect is not named for it, and one that lends two: a grant is checked
+    // against the effects.
+    assert_eq!(policy::effects_of("claims"), Some(&["prover"][..]));
+    assert_eq!(
+        policy::effects_of("toolchain"),
+        Some(&["compilers", "toolchain"][..])
+    );
+    assert_eq!(policy::effects_of("cache"), None);
+    assert_eq!(policy::effects_of("everything"), None);
 }
 
 #[test]
-fn lending_every_family_lends_what_the_launcher_lends() {
+fn lending_every_family_lends_what_a_native_program_is_lent() {
     let all = policy::all();
     let summed: usize = policy::FAMILIES
         .iter()

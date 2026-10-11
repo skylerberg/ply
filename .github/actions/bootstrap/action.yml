@@ -1,0 +1,96 @@
+name: Bootstrap ply
+description: >-
+  This tree's `ply`, built by `ply`: the runtime's static library cargo builds of this tree's Rust,
+  cached under the Rust key, then `ply bootstrap` run by the last `ply` main published (stage0) and
+  again by the `ply` that made, so the binary is what this tree's own bootstrap builds. The C both
+  compile is kept in the toolchain's cache, which the caller restores and saves.
+inputs:
+  out:
+    description: where the `ply` goes
+    required: false
+    default: target/release/ply
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/rust-key
+      id: rust
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: cached
+      with:
+        path: target/release/libply_native.a
+        key: ply-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.key }}
+    # Main cannot read a pull request's cache, so the run on main takes the library the pull
+    # request's run uploaded.
+    - name: Download the runtime's library a pull request built of this Rust
+      id: reuse
+      if: steps.cached.outputs.cache-hit != 'true' && github.event_name == 'push'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NAME: ply-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.key }}
+      run: |
+        set -euo pipefail
+        run=$(.github/artifact-run.sh "$NAME")
+        if [ -z "$run" ]; then echo "no run has built this Rust; building"; exit 0; fi
+        gh run download "$run" -n "$NAME" -D target/release
+        echo "reused=true" >> "$GITHUB_OUTPUT"
+        echo "$NAME came back from run $run"
+    - name: Decide whether to build the runtime's library
+      id: builds
+      if: steps.cached.outputs.cache-hit != 'true' && steps.reuse.outputs.reused != 'true'
+      shell: bash
+      run: echo "yes=true" >> "$GITHUB_OUTPUT"
+    - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      if: steps.builds.outputs.yes == 'true'
+      with:
+        toolchain: ${{ env.RUST_TOOLCHAIN }}
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      if: steps.builds.outputs.yes == 'true'
+      with:
+        save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      if: steps.builds.outputs.yes == 'true'
+    - name: Build the runtime's library
+      if: steps.builds.outputs.yes == 'true'
+      shell: bash
+      env:
+        SCCACHE_GHA_ENABLED: "true"
+        RUSTC_WRAPPER: sccache
+      run: cargo build --locked --release -p ply-native
+    # A cached library is only as current as the key is whole: an input the key missed would be
+    # served stale to every run after.
+    - name: Check every input the build read is under the Rust key
+      if: steps.builds.outputs.yes == 'true'
+      shell: bash
+      run: .github/ci-shards.sh rust-inputs target/release/libply_native.d
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      if: steps.builds.outputs.yes == 'true' && github.event_name == 'pull_request'
+      with:
+        name: ply-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.key }}
+        path: target/release/libply_native.a
+        retention-days: 2
+        if-no-files-found: error
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: steps.cached.outputs.cache-hit != 'true'
+      with:
+        path: target/release/libply_native.a
+        key: ply-native-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.key }}
+
+    - name: Download the last ply main published
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: scripts/stage0.sh target/stage0/ply
+    # Stage0's bootstrap builds this tree's builder with stage0's compiler; the `ply` that makes
+    # then bootstraps again, so the binary is what this tree's own bootstrap and compiler build.
+    # Where neither changed, the second finds every answer and object the first kept.
+    - name: Bootstrap this tree's ply
+      shell: bash
+      env:
+        OUT: ${{ inputs.out }}
+        PLY_C_PHASES: 1
+      run: |
+        set -euo pipefail
+        target/stage0/ply bootstrap . --profile release --out target/release/ply-stage1
+        target/release/ply-stage1 bootstrap . --profile release --out "$OUT"
+        "$OUT" --version

@@ -309,13 +309,17 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
     }
 }
 
-fn check(source: &str) -> ply_eval::CheckOutput {
-    crate::support::answered::checked("m", source).check
+/// `fn spin() -> Unit / {task.write}`: its footprint contains `task.write`, so the `Any`
+/// registrations have an atom to resolve against.
+fn spawns() -> ply_eval::CheckOutput {
+    ply_sketch::Sketch::program()
+        .def(
+            "m",
+            "spin",
+            vec![ply_sketch::atom("task", "", ply_eval::Mode::Write)],
+        )
+        .check()
 }
-/// Its footprint contains `task.write`, so the `Any` registrations have an atom to resolve against.
-const SPAWNS: &str = r#"
-fn spin() -> Unit / {task.write} = task.yield()
-"#;
 
 fn registry() -> HostRegistry {
     let mut registry = HostRegistry::new();
@@ -327,7 +331,7 @@ fn registry() -> HostRegistry {
 
 fn bound() -> HostBinding {
     registry()
-        .bind(&check(SPAWNS))
+        .bind(&spawns())
         .expect("the task registrations resolve against a program that spawns")
 }
 
@@ -500,7 +504,11 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
 #[test]
 fn a_program_that_never_spawns_binds_cleanly_and_lists_nothing() {
     let binding = registry()
-        .bind(&check("fn f(x: Int) -> Int = x"))
+        .bind(
+            &ply_sketch::Sketch::program()
+                .def("m", "f", Vec::new())
+                .check(),
+        )
         .expect("an idle scheduler is not an error");
     assert!(binding.listing().is_empty());
     assert!(binding.footprint().is_empty());

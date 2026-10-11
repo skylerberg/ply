@@ -3390,11 +3390,27 @@ fn analyse_closure(
     Ok(h) -> checked_closure(h, defs, tests),
   }
 
-/// The answer as a program ships it: what a load walked and what it warned of are functions of the
-/// caches it read as much as of the program, and a program that checked runs without either. What
-/// its modules embed is for a pass that parses their text again, and its unit is emitted: a module
-/// it pulled and reaches no embed of would ship that file's bytes for nothing.
-pub fn shipped_dump(d: Dump) -> Dump = { ..d, diags: [], walked: b"", embeds: [] }
+/// The answer as a program ships it: the tables the runtime binds the program's unit to and enters
+/// it by, and none of what only a compiler reads. The bodies, rows, keys and walk are the emitter's,
+/// and the program's unit is emitted; what a load warned of is a function of the caches it read as
+/// much as of the program, which checked; what its modules embed is for a pass that parses their
+/// text again.
+pub fn shipped_dump(d: Dump) -> Dump =
+  {
+    ..d,
+    diags: [],
+    order: [],
+    packages: [],
+    pins: [],
+    module_packages: [],
+    ctors: [],
+    keys: [],
+    baked: [],
+    bodies: [],
+    embeds: [],
+    rows: { defs: [], tests: [] },
+    walked: b"",
+  }
 
 /// Every table the answer holds, as rows.
 pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
@@ -5950,6 +5966,17 @@ test "a shipped answer carries neither what a load walked nor what it warned of"
   assert_eq(shipped.diags, []);
   assert_eq(shipped.walked, b"");
   assert_eq(shipped_dump({ ..d, walked: b"another walk", diags: [] }), shipped);
+  // Nor what only the emitter reads, which the shipped unit was emitted from.
+  assert(len(d.bodies) > 0 && len(d.keys) > 0, Some("the program has bodies and keys"));
+  assert_eq(shipped.bodies, []);
+  assert_eq(shipped.rows, { defs: [], tests: [] });
+  assert_eq(shipped.keys, []);
+  // And all the runtime binds the unit to and enters it by.
+  assert_eq(shipped.defs, d.defs);
+  assert_eq(shipped.hashes, d.hashes);
+  assert_eq(shipped.emitter_roots, d.emitter_roots);
+  assert_eq(shipped.emitter_ctors, d.emitter_ctors);
+  assert_eq(shipped.ordinals, d.ordinals);
   // Nor what its modules embed, which only a pass that parses them again reads.
   let embedding = dump_of(
     over_words(
@@ -6006,13 +6033,49 @@ fn reachable() -> List<Source> =
     },
   ]
 
-test "only a definition no root reaches is warned, each once" {
+fn test_footprint(src: Bytes, name: Bytes) -> Bytes / {abort.raise} =
+  match filter(dump_of(analyse(parse_all([{ name: b"m", src: src }]))).tests, |t: TestRow|
+      t.name == name) {
+    [t, ..] -> atoms_text(t.footprint, b","),
+    [] -> panic("the dump holds the test"),
+  }
+
+// What a test declares of a cell is its footprint; a region discharges its own label, so the same
+// atoms inside it reach nothing.
+test "a declared cell atom reaches a test's footprint, and a region's own never does" {
+  let src = b"fn touches(n: Int) -> Int / {cell.read[log]} = n\nfn writes(n: Int) -> Int / {cell.read[log], cell.write[log]} = n\n\ntest \"a read\" {\n  let seen = with_cell[log](41) { c -> cell_get(c) };\n  assert_eq(touches(seen), 41)\n}\n\ntest \"a read and a write\" {\n  let seen = with_cell[log](1) { c -> { cell_set(c, 9); cell_get(c) } };\n  assert_eq(writes(seen), 9)\n}\n\ntest \"inside the region\" {\n  with_cell[log](41) { c -> { cell_set(c, 9); assert_eq(cell_get(c), 9) } }\n}\n";
+  assert_eq(test_footprint(src, b"a read"), b"cell.read[log]");
+  assert_eq(test_footprint(src, b"a read and a write"), b"cell.read[log],cell.write[log]");
+  assert_eq(test_footprint(src, b"inside the region"), b"")
+}
+
+// A general clause resumes from outside the region, which carries the region's atoms out of it; a
+// tail-resumptive one, the shape handlers are written in, still discharges them. Were the first
+// ever empty, the escape brand's claim would have become true.
+test "a general clause inside a region carries that region's atoms out of it" {
+  let src = b"effect amb { read flip[coin]() -> Bool }\n\nfn leaks(n: Int) -> Int / {cell.read[t], cell.write[t]} =\n  with_cell[t](n) { c ->\n    handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() resume k -> k(true), return x -> x }\n  }\n\nfn discharges(n: Int) -> Int =\n  with_cell[t](n) { c ->\n    handle { cell_set(c, cell_get(c) + 1); cell_get(c) }\n    with { amb.flip[coin]() -> true, return x -> x }\n  }\n\ntest \"through a general clause\" { assert_eq(leaks(1), 2) }\ntest \"through a tail-resumptive one\" { assert_eq(discharges(1), 2) }\n";
+  assert_eq(test_footprint(src, b"through a general clause"), b"cell.read[t],cell.write[t]");
+  assert_eq(test_footprint(src, b"through a tail-resumptive one"), b"")
+}
+
+test "only a definition no root reaches is warned, each once at its name" {
   let d = dump_of(analyse(parse_all(reachable())));
   let said = map(d.diags, |diag: Diag| diag.message);
   assert(contains(said, b"fn `m.dead` is never used"));
   assert(contains(said, b"fn `m.deader` is never used"));
   assert(contains(said, b"type `m.Unused` is never used"));
   assert_eq(len(said), 3);
+  let src = at(reachable(), 0).src;
+  let named = map(d.diags, |diag: Diag|
+    match filter(diag.labels, |l: Label| l.primary) {
+      [l, ..] -> bytes_slice(src, l.start, l.end),
+      [] -> b"",
+    });
+  assert_eq(sort_by(named, |a: Bytes, b: Bytes| compare(a, b) == Less), [
+    b"Unused",
+    b"dead",
+    b"deader",
+  ]);
   assert(len(d.order) > 0)
 }
 

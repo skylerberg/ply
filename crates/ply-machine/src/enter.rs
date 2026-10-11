@@ -1,9 +1,8 @@
-//! Entering a program its runnable holds: its front end's answer read back over the sources it
-//! carries, its unit's C compiled, its hosts bound from what the caller lends, and its entry called.
+//! Entering the program an executable was linked with: its front end's answer, its unit bound to
+//! the runtime, its hosts bound from what the caller lends, and its entry called.
 
-use crate::runnable::Runnable;
 use ply_eval::{Analysis, Diagnostic, Ended, SourceMap, Span, Symbol, codes};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// What a caller lends an entered program: the roots it may reach, the programs its
@@ -29,47 +28,25 @@ pub struct Opened {
     pub entry: Symbol,
 }
 
-/// A runnable opened, with the C it is entered on.
-pub struct OpenedRunnable {
-    pub opened: Opened,
-    unit: String,
+/// The program this executable was linked with, over its front end's answer: what it enters is
+/// `entry`. No source is carried, so nothing places a span in a file.
+pub fn opened_linked(front: Analysis, entry: &str) -> Opened {
+    Opened {
+        sources: SourceMap::new(),
+        front,
+        entry: Symbol::new(entry),
+    }
 }
 
-/// The program a runnable holds: its front end's answer read back over its own sources, rooted at
-/// `root`, taking the runnable rather than copying out of it.
-pub fn opened_runnable(runnable: Runnable, root: &Path) -> Result<OpenedRunnable, Diagnostic> {
-    let Runnable { entry, front, unit } = runnable;
-    let loaded =
-        crate::driver::load_over_analysis_taken(root.to_path_buf(), front).map_err(|err| {
-            err.diagnostics.into_iter().next().unwrap_or_else(|| {
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    "the runnable's front end did not read, and nothing said why",
-                )
-            })
-        })?;
-    Ok(OpenedRunnable {
-        opened: Opened {
-            sources: loaded.sources,
-            front: std::sync::Arc::try_unwrap(loaded.front).unwrap_or_else(|f| (*f).clone()),
-            entry: Symbol::new(&entry),
-        },
-        unit,
-    })
-}
-
-/// One entry into the program a runnable holds, on the unit's C it carries, compiled here, with no
-/// line of its own on either stream: the program's output is the whole of what a caller sees. The
-/// answer is the code `process.exit` asked for, else `0` for a value returned and the diagnostic
-/// for a raise; what the entry ended with is the caller's to report.
-pub fn enter_runnable(program: OpenedRunnable, argv: Vec<String>, binds: Binds) -> Ended<i32> {
-    let OpenedRunnable { opened, unit } = program;
-    let provider = ply_codegen::Unit::handed(&opened.front, unit)
+/// One entry into the program this executable was linked with: its unit bound, its hosts bound
+/// from `binds`, and its entry called with `argv`.
+pub fn enter_linked(opened: Opened, argv: Vec<String>, binds: Binds) -> Ended<i32> {
+    let provider = ply_codegen::Unit::linked(&opened.front)
         .map(|unit| unit as Arc<dyn ply_eval::Provider>)
         .map_err(|e| {
             Diagnostic::error(
                 codes::BACKEND_UNAVAILABLE,
-                format!("the program's unit could not be compiled: {e:#}"),
+                format!("the program linked into this executable could not be bound: {e:#}"),
             )
         });
     entered_with(provider, &opened, argv, binds)
@@ -134,14 +111,14 @@ fn entered_with(
     })
 }
 
-/// What each of `roots` answers on `unit`, the C emitted over `front`, compiled here: each called
-/// alone with no arguments, nothing lent and under `steps` calls, on a thread of its own as every
-/// machine runs. A root's bytes are the text a build keeps a `const` definition's value as through
+/// What each of `roots` answers on the unit compiled over `front` into the library `unit`: each
+/// called alone with no arguments, nothing lent and under `steps` calls, on a thread of its own as
+/// every machine runs. A root's bytes are the text a build keeps a `const` definition's value as through
 /// its stored root; one that raised, ran past its calls, answered anything else or is not in the
 /// unit answers none.
 pub fn stored_values(
     front: crate::driver::LoadedAnalysis,
-    unit: String,
+    unit: PathBuf,
     roots: Vec<String>,
     steps: i64,
 ) -> Result<Vec<Option<Vec<u8>>>, Diagnostic> {
@@ -158,10 +135,10 @@ pub fn stored_values(
                         )
                     })
                 })?;
-            let unit = ply_codegen::Unit::handed(&loaded.front, unit).map_err(|e| {
+            let unit = ply_codegen::Unit::opened(&loaded.front, &unit).map_err(|e| {
                 Diagnostic::error(
                     codes::BACKEND_UNAVAILABLE,
-                    format!("the unit could not be compiled: {e:#}"),
+                    format!("the unit could not be loaded: {e:#}"),
                 )
             })?;
             let mut machine =

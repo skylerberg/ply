@@ -1,0 +1,462 @@
+//! Compiling a unit's C with the host's C compiler, and linking what it compiles: a library a program
+//! loads, or an executable a native program is. A unit's C is cut at the marks its emitter writes,
+//! and each part compiles to an object kept under the toolchain's cache by what decides it: the
+//! compiler, the flags and the part's C. So an edit recompiles the parts it reached, and a unit
+//! compiled once links from the cache.
+
+import std.bytes (hex_of)
+import std.hash (blake3)
+import std.list (at, concat, find)
+import std.string (join)
+
+/// The C compilers by their labels: what each is, and each run of one. What a compiler makes is a
+/// function of what it is given, so the effect is a deterministic one.
+pub effect compilers {
+  /// The compiler the label names, or `None` where it is not installed.
+  read found[c]() -> Option<Compiler>
+  /// Starts the compiler with `args` in the environment this run has: a job, or why it could not
+  /// start.
+  write started[c](args: List<String>) -> Result<Int, String>
+  /// How a job ended: `None` where the compiler succeeded, else what it said on standard error.
+  write finished[c](job: Int) -> Option<Bytes>
+}
+
+/// The toolchain's cache, which compiled objects and libraries are kept in between runs, and how
+/// many compilers run at once. A path here is below the cache. What the cache holds decides what
+/// is compiled again and never what a library is, so the effect is a deterministic one.
+pub effect toolchain {
+  /// The cache's directory.
+  read cache() -> String
+  /// How many compilers run at once.
+  read jobs() -> Int
+  /// Whether the cache holds `path`, which records a use of it.
+  read holds(path: String) -> Bool
+  /// `bytes` at `path`, written whole.
+  write written(path: String, bytes: Bytes) -> Bool
+  /// `from` moved to `to`, whole.
+  write moved(from: String, to: String) -> Bool
+  /// `bytes` added after what `path` holds, which keeps what it may be run as.
+  write appended(path: String, bytes: Bytes) -> Bool
+  /// A new directory of the asker's own, or `None` where none could be made.
+  write scratch() -> Option<String>
+  /// `dir` and everything below it, removed.
+  write cleared(dir: String) -> Unit
+  /// What the runtime's library needs linked after it on this platform.
+  read libraries() -> List<String>
+  /// The program at `path`, one linked below the cache, run to its end with `args` and the
+  /// environment this run has.
+  write ran(path: String, args: List<String>) -> Ran
+}
+
+/// How a program ran: its exit code, `-1` where a signal ended it, and its two streams.
+pub type Ran = { code: Int, out: Bytes, err: Bytes }
+
+/// A compiler: its path, what identifies it, which every key it makes holds, and what every
+/// invocation of it needs that others do not, as tcc's `-B` names where its support library is.
+pub type Compiler = { path: String, identity: Bytes, support: List<String> }
+
+/// The compiler a build runs, and what decides what it makes.
+pub type Toolchain = {
+  /// The compiler's identity: an upgrade in place keys every object anew.
+  identity: Bytes,
+  /// What every invocation of this compiler needs that others do not: tcc's `-B`.
+  support: List<String>,
+  /// The optimisation flag.
+  level: String,
+}
+
+/// A unit's C cut at its marks: the head every part compiles after, then each part by its label.
+pub type Parts = { head: Bytes, parts: List<{ label: String, text: Bytes }> }
+
+fn bucket_mark() -> Bytes = b"/* --- bucket "
+
+fn runtime_mark() -> Bytes = b"/* --- the runtime, bound at load --- */"
+
+/// Where `mark` begins a line of `text` at or after `from`.
+fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise} =
+  if from == 0 && bytes_starts_with(text, mark) { Some(0) } else {
+    match bytes_index_of_from(text, bytes_concat(b"\n", mark), from) {
+      Some(at) -> Some(at + 1),
+      None -> None,
+    }
+  }
+
+/// `text` cut into its head, each bucket from its mark to the next, and the runtime from its mark,
+/// labelled by the bucket's hex id and `runtime`. A text with no marks is all head and an empty
+/// runtime part; the parts concatenate back to the text.
+pub fn split(text: Bytes) -> Parts / {abort.raise} = {
+  let tail_at = match line_start(text, runtime_mark(), 0) {
+    Some(at) -> at,
+    None -> bytes_len(text),
+  };
+  let starts = iterate(
+    { from: 0, found: [] },
+    bytes_len(text) + 1,
+    |s: { from: Int, found: List<Int> }|
+      match line_start(text, bucket_mark(), s.from) {
+        Some(at) -> if at >= tail_at { Stop(s.found) }
+        else { Continue({ from: at + bytes_len(bucket_mark()), found: push(s.found, at) }) },
+        None -> Stop(s.found),
+      },
+  );
+  let buckets = map(range(0, len(starts)), |i: Int| {
+    let start = at(starts, i);
+    let end = match list_at(starts, i + 1) { Some(next) -> next, None -> tail_at };
+    let at_id = start + bytes_len(bucket_mark());
+    {
+      label: string_of_bytes(bytes_slice(text, at_id, at_id + 2)),
+      text: bytes_slice(text, start, end),
+    }
+  });
+  {
+    head: bytes_slice(text, 0, match list_at(starts, 0) { Some(first) -> first, None -> tail_at }),
+    parts: push(buckets, { label: "runtime", text: bytes_slice(text, tail_at, bytes_len(text)) }),
+  }
+}
+
+fn key_of(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String / {abort.raise} =
+  hex_of(
+    blake3(
+      bytes_concat_all(
+        concat(
+          [t.identity, b"\x00", bytes_of_string(t.level), b"\x00"],
+          concat(map(flags, |f: String| bytes_concat(bytes_of_string(f), b"\x00")), pieces),
+        ),
+      ),
+    ),
+  )
+
+/// What `compiler` compiles with at `level`.
+pub fn toolchain_of(compiler: Compiler, level: String) -> Toolchain =
+  { identity: compiler.identity, support: compiler.support, level: level }
+
+/// Each of `runs` run to its end, `toolchain.jobs()` at a time and each waited for in the order it
+/// started: nothing, or what the first refusal said. Every job started is waited for, so none
+/// outlives the refusal it is part of.
+fn ran<[c]>(
+  runs: List<List<String>>,
+) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
+  let jobs = toolchain.jobs();
+  let waited = |run: { job: Int, args: List<String> }|
+    match compilers.finished[c](run.job) {
+      None -> Ok(()),
+      Some(err) ->
+        Err(
+          "the C compiler refused `" ++ join(run.args, " ") ++ "`:\n" ++ string_of_bytes_lossy(err),
+        ),
+    };
+  iterate(
+    { next: 0, running: [], failed: None },
+    2 * len(runs) + 2,
+    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, failed: Option<String> }|
+      match s.failed {
+        Some(why) -> match s.running {
+          [] -> Stop(Err(why)),
+          [first, ..rest] -> {
+            let _ = waited(first);
+            Continue({ ..s, running: rest })
+          },
+        },
+        None -> if s.next < len(runs) && len(s.running) < jobs {
+          match compilers.started[c](at(runs, s.next)) {
+            Ok(job) ->
+              Continue({
+                ..s,
+                next: s.next + 1,
+                running: push(s.running, { job: job, args: at(runs, s.next) }),
+              }),
+            Err(why) ->
+              Continue({ ..s, failed: Some("the C compiler could not be started: " ++ why) }),
+          }
+        } else {
+          match s.running {
+            [] -> Stop(Ok(())),
+            [first, ..rest] -> match waited(first) {
+              Ok(_) -> Continue({ ..s, running: rest }),
+              Err(why) -> Continue({ ..s, running: rest, failed: Some(why) }),
+            },
+          }
+        },
+      },
+  )
+}
+
+/// One part of a unit as a compiler is given it: its label, and the digest of its C with the head
+/// before it, which decides the object it compiles to.
+pub type Source = { label: String, digest: String }
+
+/// Each of `parts`' sources, in order.
+pub fn sources_of(parts: Parts) -> List<Source> / {abort.raise} =
+  map(parts.parts, |p: { label: String, text: Bytes }|
+    { label: p.label, digest: hex_of(blake3(bytes_concat(parts.head, p.text))) })
+
+/// Where the cache keeps a source's C.
+fn kept_source(s: Source) -> String = "src/" ++ s.digest ++ ".c"
+
+/// `parts`' sources, each one's C written below the cache where it is not there already: what
+/// `objects_kept` compiles from, in another process or a later run.
+pub fn kept(
+  parts: Parts,
+) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
+  let sources = sources_of(parts);
+  let landed = fold(range(0, len(sources)), true, |ok: Bool, i: Int| {
+    let path = kept_source(at(sources, i));
+    ok
+      && (toolchain.holds(path)
+      || toolchain.written(path, bytes_concat(parts.head, at(parts.parts, i).text)))
+  });
+  if landed { Ok(sources) } else { Err("a unit's C could not be kept in the toolchain's cache") }
+}
+
+/// `sources` as a line each, its label and its digest: what a builder hands the linker of a unit it
+/// kept.
+pub fn manifest(sources: List<Source>) -> Bytes =
+  bytes_concat_all(map(sources, |s: Source| bytes_of_string(s.label ++ " " ++ s.digest ++ "\n")))
+
+/// The sources `manifest` wrote, or `None` for anything else.
+pub fn manifested(text: Bytes) -> Option<List<Source>> =
+  fold(bytes_split(text, b"\n"), Some([]), |acc: Option<List<Source>>, line: Bytes|
+    match acc {
+      None -> None,
+      Some(xs) -> if bytes_len(line) == 0 { acc } else {
+        match bytes_split(line, b" ") {
+          [label, digest] -> if bytes_len(digest) == 64 {
+            Some(
+              push(xs, {
+                label: string_of_bytes_lossy(label),
+                digest: string_of_bytes_lossy(digest),
+              }),
+            )
+          } else { None },
+          _ -> None,
+        }
+      },
+    })
+
+/// Whether the cache still holds each of `sources`' C, which records a use of each.
+pub fn holds_sources(sources: List<Source>) -> Bool / {toolchain.read} =
+  fold(sources, true, |ok: Bool, s: Source| ok && toolchain.holds(kept_source(s)))
+
+fn object_of(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
+  "obj/" ++ key_of(t, flags, [bytes_of_string(s.digest)]) ++ ".o"
+
+/// The objects `targets` names, those of `missing` compiled from `inputs`, one each, into place.
+fn compiled<[c]>(
+  t: Toolchain,
+  flags: List<String>,
+  targets: List<String>,
+  missing: List<Int>,
+  inputs: List<String>,
+  work: String,
+) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let object = |k: Int| work ++ "/" ++ int_to_string(at(missing, k)) ++ ".o";
+  let runs = map(range(0, len(missing)), |k: Int|
+    concat(concat(t.support, concat([t.level], flags)), [
+      "-c",
+      "-o",
+      cache ++ "/" ++ object(k),
+      at(inputs, k),
+    ]));
+  match ran[c](runs) {
+    Err(why) -> Err(why),
+    Ok(_) -> {
+      // Into place by a rename, so a reader never sees half an object, and two builds that made the
+      // same one leave one.
+      let placed = fold(range(0, len(missing)), true, |ok: Bool, k: Int|
+        ok && toolchain.moved(object(k), at(targets, at(missing, k))));
+      if placed { Ok(map(targets, |o: String| cache ++ "/" ++ o)) }
+      else { Err("an object could not be kept in the toolchain's cache") }
+    },
+  }
+}
+
+/// Each part's object, in order: held by the cache where this compiler already made one of the same
+/// C with the same flags, and compiled now where it did not. `work` is a directory of this build's own
+/// in the cache.
+pub fn objects<[c]>(
+  t: Toolchain,
+  parts: Parts,
+  flags: List<String>,
+  work: String,
+) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let sources = sources_of(parts);
+  let targets = map(sources, |s: Source| object_of(t, flags, s));
+  let missing = filter(range(0, len(targets)), |i: Int| !toolchain.holds(at(targets, i)));
+  let source = |i: Int| work ++ "/" ++ at(sources, i).label ++ ".c";
+  let written = fold(missing, true, |ok: Bool, i: Int|
+    ok && toolchain.written(source(i), bytes_concat(parts.head, at(parts.parts, i).text)));
+  if !written { Err("the C to compile could not be written to the toolchain's cache") } else {
+    compiled[c](t, flags, targets, missing, map(missing, |i: Int| cache ++ "/" ++ source(i)), work)
+  }
+}
+
+/// [`objects`] of sources `kept` wrote: a part whose object the cache does not hold compiles from its
+/// kept C, and one whose C the cache no longer holds either is refused.
+pub fn objects_kept<[c]>(
+  t: Toolchain,
+  sources: List<Source>,
+  flags: List<String>,
+  work: String,
+) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let targets = map(sources, |s: Source| object_of(t, flags, s));
+  let missing = filter(range(0, len(targets)), |i: Int| !toolchain.holds(at(targets, i)));
+  match find(missing, |i: Int| !toolchain.holds(kept_source(at(sources, i)))) {
+    Some(i) ->
+      Err(
+        "the C of part `" ++ at(sources, i).label ++ "` is no longer kept in the toolchain's cache",
+      ),
+    None ->
+      compiled[c](
+        t,
+        flags,
+        targets,
+        missing,
+        map(missing, |i: Int| cache ++ "/" ++ kept_source(at(sources, i))),
+        work,
+      ),
+  }
+}
+
+/// The library `objects` link into, kept in the cache by what decides it, so a unit linked once opens
+/// from the cache: its path.
+pub fn shared<[c]>(
+  t: Toolchain,
+  objects: List<String>,
+  work: String,
+) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let library = library_of(t, objects);
+  if toolchain.holds(library) { Ok(cache ++ "/" ++ library) } else {
+    let made = work ++ "/unit.so";
+    match ran[c]([concat(t.support, concat(["-shared", "-o", cache ++ "/" ++ made], objects))]) {
+      Err(why) -> Err(why),
+      Ok(_) -> if toolchain.moved(made, library) { Ok(cache ++ "/" ++ library) }
+      else { Err("the library could not be kept in the toolchain's cache") },
+    }
+  }
+}
+
+/// Where the cache keeps the library `objects`, by their paths in it, link into.
+fn library_of(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
+  key_of(t, ["-shared"], map(objects, bytes_of_string)) ++ ".so"
+
+/// The flags every object of a library a program loads compiles with.
+pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
+
+/// `text`, a unit's C, compiled by the compiler labelled `c` at `level` with `flags` and linked into a
+/// library the cache keeps: its path, or why it was not built.
+pub fn library<[c]>(
+  level: String,
+  flags: List<String>,
+  text: Bytes,
+) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+  match compilers.found[c]() {
+    None -> Err("no C compiler is installed to compile the unit with"),
+    Some(compiler) -> {
+      let t = toolchain_of(compiler, level);
+      let parts = split(text);
+      let cache = toolchain.cache();
+      let made = library_of(
+        t,
+        map(sources_of(parts), |s: Source| cache ++ "/" ++ object_of(t, flags, s)),
+      );
+      // A unit built before is a library the cache holds, which needs no room to build in.
+      if toolchain.holds(made) { Ok(cache ++ "/" ++ made) } else {
+        match toolchain.scratch() {
+          None -> Err("the toolchain's cache has no room to compile in"),
+          Some(work) -> {
+            let built = match objects[c](t, parts, flags, work) {
+              Err(why) -> Err(why),
+              Ok(objects) -> shared[c](t, objects, work),
+            };
+            toolchain.cleared(work);
+            built
+          },
+        }
+      }
+    },
+  }
+
+/// The executable `main`, a C translation unit, makes when compiled and linked after `objects` and
+/// before `libraries`, which name archives and the system libraries they need: its path below
+/// `work`, from which the asker moves it where it goes.
+pub fn executable<[c]>(
+  t: Toolchain,
+  main: Bytes,
+  objects: List<String>,
+  libraries: List<String>,
+  work: String,
+) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let cache = toolchain.cache();
+  let c = cache ++ "/" ++ work ++ "/main.c";
+  let o = cache ++ "/" ++ work ++ "/main.o";
+  let out = cache ++ "/" ++ work ++ "/program";
+  if !toolchain.written(work ++ "/main.c", main) {
+    Err("the program's `main` could not be written")
+  } else {
+    match ran[c]([concat(t.support, [t.level, "-c", "-o", o, c])]) {
+      Err(why) -> Err(why),
+      Ok(_) -> match ran[c]([
+          concat(concat(t.support, concat(["-o", out, o], objects)), libraries),
+        ]) {
+        Err(why) -> Err(why),
+        Ok(_) -> Ok(out),
+      },
+    }
+  }
+}
+
+// --- Tests -----------------------------------------------------------------------
+
+fn unit_text() -> Bytes =
+  b"#include <x>\n/* --- bucket 0a --- */\nint a;\n/* --- bucket 1f --- */\nint b;\n\n/* --- the runtime, bound at load --- */\nint r;\n"
+
+test "a unit cuts at its marks into a head, its buckets and the runtime, which join back to it" {
+  let p = split(unit_text());
+  assert_eq(p.head, b"#include <x>\n");
+  assert_eq(map(p.parts, |x: { label: String, text: Bytes }| x.label), ["0a", "1f", "runtime"]);
+  assert_eq(
+    bytes_concat(
+      p.head,
+      bytes_concat_all(map(p.parts, |x: { label: String, text: Bytes }| x.text)),
+    ),
+    unit_text(),
+  );
+  assert_eq(at(p.parts, 2).text, b"/* --- the runtime, bound at load --- */\nint r;\n")
+}
+
+test "a text with no marks is all head, beside an empty runtime part" {
+  let p = split(b"int x;\n");
+  assert_eq(p.head, b"int x;\n");
+  assert_eq(p.parts, [{ label: "runtime", text: b"" }])
+}
+
+test "a part's source is the digest of its C with the head before it" {
+  let p = split(unit_text());
+  let sources = sources_of(p);
+  assert_eq(map(sources, |s: Source| s.label), ["0a", "1f", "runtime"]);
+  assert_eq(at(sources, 0).digest, hex_of(blake3(bytes_concat(p.head, at(p.parts, 0).text))));
+  let moved = sources_of({ ..p, head: b"#include <y>\n" });
+  assert(at(moved, 1).digest != at(sources, 1).digest, Some("the head is part of every source"))
+}
+
+test "a manifest reads back as the sources it was written from, and nothing else reads" {
+  let sources = sources_of(split(unit_text()));
+  assert_eq(manifested(manifest(sources)), Some(sources));
+  assert_eq(manifested(b""), Some([]));
+  assert_eq(manifested(b"0a short\n"), None);
+  assert_eq(manifested(b"just-a-label\n"), None)
+}
+
+test "an object's key moves with its compiler, its level, its flags and its C" {
+  let t = { identity: b"cc 1", support: [], level: "-O2" };
+  let base = key_of(t, ["-c"], [b"head", b"text"]);
+  assert_eq(key_of(t, ["-c"], [b"head", b"text"]), base);
+  assert(key_of({ ..t, identity: b"cc 2" }, ["-c"], [b"head", b"text"]) != base);
+  assert(key_of({ ..t, level: "-O0" }, ["-c"], [b"head", b"text"]) != base);
+  assert(key_of(t, ["-c", "-fvisibility=hidden"], [b"head", b"text"]) != base);
+  assert(key_of(t, ["-c"], [b"head", b"text2"]) != base)
+}

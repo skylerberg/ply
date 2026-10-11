@@ -17,8 +17,7 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 bin="${CARGO_TARGET_DIR:-$root/target}/release"
 
-cargo build --release --quiet --manifest-path "$root/Cargo.toml" -p ply-launcher --bins
-(cd "$root" && "$bin/ply-pack" "$bin/ply")
+"$root/scripts/bootstrap.sh" --release >/dev/null
 
 # The program starts only what is bound here, so the floors its tables are compared with are built
 # here too; it asks `process.bound` for each. The libpq tool is built only where `pg_config` says
@@ -37,5 +36,5 @@ if command -v pg_config >/dev/null; then
   execs+=(--exec "pg_floor=$bin/pg-floor")
 fi
 
-exec "$bin/ply" run "$root/crates/ply-corpus/ply" --host --allow machine --allow claims --allow shipped \
+exec "$bin/ply" run "$root/crates/ply-corpus/ply" --host --allow machine --allow claims --allow shipped --allow toolchain \
   "${execs[@]}" --fs work=. --fs "repo=$root" -- "$@"

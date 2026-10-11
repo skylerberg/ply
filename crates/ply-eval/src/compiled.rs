@@ -8,6 +8,35 @@ use crate::{DefHash, Diagnostic, EffectAtom, Footprint, Symbol};
 use std::rc::Rc;
 use std::sync::Arc;
 
+/// What a run still held when an entry's root body returned, before its production region drained:
+/// what grows with the work a long-running program does if anything is never given back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// Heap objects standing for a runtime value, such as a task's handle or a region's cell.
+    pub bridges: u64,
+    /// Tasks the production region's scheduler still tracks.
+    pub scheduled: u64,
+    /// Task stacks the production region still keeps.
+    pub task_stacks: u64,
+    /// Frame tables kept for stacks that are or were running.
+    pub frame_tables: u64,
+    /// Stacks the cell arena keeps a nesting of regions for.
+    pub cell_owners: u64,
+}
+
+impl Held {
+    /// The larger of each count.
+    pub fn most(self, other: Held) -> Held {
+        Held {
+            bridges: self.bridges.max(other.bridges),
+            scheduled: self.scheduled.max(other.scheduled),
+            task_stacks: self.task_stacks.max(other.task_stacks),
+            frame_tables: self.frame_tables.max(other.frame_tables),
+            cell_owners: self.cell_owners.max(other.cell_owners),
+        }
+    }
+}
+
 pub trait Compiled {
     /// Whether this was built over the program [`crate::Analysis::hashes_digest`] names.
     fn describes(&self, program: DefHash) -> bool;
@@ -38,6 +67,11 @@ pub trait Compiled {
     /// The calls the last entry's body made: 0 when no body ran, as when a memo answered it.
     fn steps(&self) -> u64 {
         0
+    }
+
+    /// What the run held when the last entry's root returned; nothing when no body ran.
+    fn held(&self) -> Held {
+        Held::default()
     }
 
     /// What the `simulate` regions of the last entry's body did; none when no body ran.

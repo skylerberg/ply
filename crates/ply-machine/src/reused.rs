@@ -1,8 +1,8 @@
 //! The fronts `ply run` keeps, as bytes the program files and reads back: what a load of one
-//! closure was handed, its front end's answer and its unit's C, encoded and compressed once that
-//! load held, and decoded over a later run's walk in place of its front end and its emission. Where
-//! an entry lives, and when it is written, are the program's; an entry that does not read is no
-//! entry.
+//! closure was handed, its front end's answer and the library its unit was compiled into, encoded
+//! and compressed once that load held, and decoded over a later run's walk in place of its front end,
+//! its emission and its compile. Where an entry lives, and when it is written, are the program's; an
+//! entry that does not read, or whose library is gone, is no entry.
 
 use crate::driver::{LoadedAnalysis, LoadedFile};
 use crate::payload::record;
@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 /// What an entry is, as its `format` field says: one of any other shape is no entry.
-const FORMAT: &str = "ply run front 4";
+const FORMAT: &str = "ply run front 5";
 
 /// What an entry says of the `reuse fn` promises the load it was filed from checked.
 const HELD: &str = "held";
@@ -25,14 +25,14 @@ pub struct Walked {
 
 /// The front `entry` filed, over this run's own files: the walk's modules, the shipped modules the
 /// filed answer pulled, as the load that filed it placed them, then the walk's manifests, in the
-/// order its ids run, and the C of the unit it was emitted as. The places are this run's, so a span
-/// renders as this run's front end would have rendered it. `None` when the entry does not read or does
-/// not fit the walk.
+/// order its ids run, and the library its unit was compiled into. The places are this run's, so a
+/// span renders as this run's front end would have rendered it. `None` when the entry does not read,
+/// does not fit the walk, or names a library the cache no longer holds.
 pub fn front(
     entry: &[u8],
     modules: Vec<Walked>,
     manifests: Vec<Walked>,
-) -> Option<(LoadedAnalysis, Vec<u8>)> {
+) -> Option<(LoadedAnalysis, std::path::PathBuf)> {
     let started = Instant::now();
     let mut encoded = Vec::new();
     flate2::read::GzDecoder::new(entry)
@@ -40,6 +40,10 @@ pub fn front(
         .ok()?;
     let entry = ply_eval::codec::decode(&encoded).ok()?;
     let filed = Filed::read(AnswerValue::new("a front `ply run` filed", &entry)).ok()?;
+    let library = std::path::PathBuf::from(filed.library);
+    if !library.is_file() {
+        return None;
+    }
     let own = modules.len();
     let pulled = filed.files.len().checked_sub(own + manifests.len())?;
     let mut walked = modules.into_iter().chain(manifests);
@@ -71,16 +75,16 @@ pub fn front(
         write_back: Duration::ZERO,
         cached: false,
     };
-    Some((front, filed.unit.to_vec()))
+    Some((front, library))
 }
 
 /// An entry as it reads: every file's place, module and the text filed for it, the front end's answer
-/// and the unit's C. Only an entry that says its load's promises held is read at all, since that is
-/// the only kind ever filed.
+/// and the library its unit was compiled into. Only an entry that says its load's promises held is
+/// read at all, since that is the only kind ever filed.
 struct Filed<'v> {
     files: Vec<LoadedFile>,
     dump: &'v Value,
-    unit: &'v [u8],
+    library: &'v str,
 }
 
 impl<'v> Filed<'v> {
@@ -100,18 +104,18 @@ impl<'v> Filed<'v> {
                 })
             })?,
             dump: entry.field("dump")?.value(),
-            unit: entry.field("unit")?.bytes()?,
+            library: entry.field("library")?.str()?,
         })
     }
 }
 
-/// The entry for a load that held over the front and unit it was handed: every file's place and
+/// The entry for a load that held over the front and library it was handed: every file's place and
 /// module, the text of each shipped module as the load placed it, `dump`, the front end's answer, and
-/// the unit's C. A shipped module's placed text is what an importer reads of it, which the emitter
+/// the library its unit was compiled into. A shipped module's placed text is what an importer reads of it, which the emitter
 /// parses, so it is filed rather than read off the binary again; any other file is the walk's. `None`
 /// when the answer does not encode, or when the entry is more than one read of the file it is filed
 /// in would answer.
-pub fn entry(files: &[LoadedFile], dump: &Value, unit: &[u8]) -> Option<Vec<u8>> {
+pub fn entry(files: &[LoadedFile], dump: &Value, library: &str) -> Option<Vec<u8>> {
     let ships = crate::shipped_modules::name_set();
     let entry = record(vec![
         ("format", Value::str(FORMAT)),
@@ -136,7 +140,7 @@ pub fn entry(files: &[LoadedFile], dump: &Value, unit: &[u8]) -> Option<Vec<u8>>
         ),
         ("promises", Value::str(HELD)),
         ("dump", dump.clone()),
-        ("unit", Value::bytes(unit)),
+        ("library", Value::str(library)),
     ]);
     let encoded = ply_eval::codec::encode(&entry).ok()?;
     let mut packed = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
