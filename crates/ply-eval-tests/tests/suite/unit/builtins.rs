@@ -1,4 +1,5 @@
 use ply_eval::builtins::*;
+use ply_eval::float::CANONICAL_NAN_BITS;
 use ply_eval::{Diagnostic, Span, Value, codes};
 
 fn ints(xs: &[i64]) -> Value {
@@ -1243,7 +1244,7 @@ fn a_wrapping_builtin_refuses_a_non_int_and_nothing_else() {
 
 fn float_bits(b: Builtin, args: &[f64]) -> u64 {
     match found(b, args.iter().map(|x| Value::Float(*x)).collect()) {
-        Value::Float(x) => x.to_bits(),
+        Value::Float(x) => ply_eval::float::bits(x),
         other => panic!("`{}` answered {other:?}, not a Float", b.name()),
     }
 }
@@ -1256,7 +1257,7 @@ fn the_float_functions_answer_the_bits_the_c_backend_pins() {
         (Builtin::Sin, &[1.0], 0x3FEA_ED54_8F09_0CEE),
         (Builtin::Cos, &[1.0], 0x3FE1_4A28_0FB5_068C),
         (Builtin::Tan, &[1.0], 0x3FF8_EB24_5CBE_E3A6),
-        (Builtin::Exp, &[1.0], 0x4005_BF0A_8B14_576A),
+        (Builtin::Exp, &[1.0], 0x4005_BF0A_8B14_5769),
         (Builtin::Ln, &[2.0], 0x3FE6_2E42_FEFA_39EF),
         (Builtin::Pow, &[2.0, 0.5], 0x3FF6_A09E_667F_3BCD),
         (Builtin::Atan2, &[1.0, 2.0], 0x3FDD_AC67_0561_BB4F),
@@ -1270,7 +1271,7 @@ fn the_float_functions_answer_the_bits_the_c_backend_pins() {
             &[f64::from_bits(0xFFF8_0000_0000_0001), 2.0],
             CANONICAL_NAN_BITS,
         ),
-        (Builtin::Ceil, &[-0.5], (-0.0f64).to_bits()),
+        (Builtin::Ceil, &[-0.5], 0x8000_0000_0000_0000),
     ];
     for (b, args, want) in cases {
         assert_eq!(

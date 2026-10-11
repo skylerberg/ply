@@ -107,6 +107,11 @@ jobs:
       - name: Self-test the timings tool
         run: .github/ci-timings.sh --self-test
 
+      # `passes` merges the partitions' packs after every test has passed and is no part of `ci`, so
+      # nothing else holds a change to how they are packed or merged.
+      - name: Self-test the packing of what the lanes keep
+        run: .github/ci-corpus.sh --self-test
+
       - name: Run the ucontext probe
         run: ./probes/ucontext/run.sh
 
@@ -626,13 +631,14 @@ jobs:
       # every other partition's for the next run.
       - name: Pack what the lanes compiled and the stores they wrote
         if: ${{ !cancelled() }}
-        run: .github/ci-corpus.sh pack "/tmp/kept-lanes-${{ matrix.shard }}.tar"
+        run: .github/ci-corpus.sh pack "/tmp/kept-lanes-${{ matrix.shard }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: kept-lanes-${{ matrix.shard }}
-          path: /tmp/kept-lanes-${{ matrix.shard }}.tar
+          path: /tmp/kept-lanes-${{ matrix.shard }}
           retention-days: 1
+          compression-level: 0
           if-no-files-found: error
 
   # Not part of `ci`: a cache that could not be saved makes no run wrong.
@@ -814,10 +820,11 @@ jobs:
           .github/ci-shards.sh supersede "${{ github.run_id }}" "${{ github.ref }}"
 
   # Main's `ply`, once the run that tested it is green, to the rolling release `scripts/stage0.sh`
-  # downloads: the stage0 every later bootstrap starts from.
+  # downloads: the stage0 every later bootstrap starts from. `!cancelled()` stands in for the implicit
+  # `success()`, which a job skipped upstream of `ci` would fail.
   publish:
     name: Publish main's ply for Linux
-    if: github.event_name == 'push' && needs.ci.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.ci.result == 'success' }}
     needs: [ci]
     runs-on: *runner
     timeout-minutes: 10
@@ -839,9 +846,10 @@ jobs:
 
   publish-macos:
     name: Bootstrap and publish main's ply for macOS
-    if: github.event_name == 'push' && needs.ci.result == 'success'
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.ci.result == 'success' }}
     needs: [ci]
-    runs-on: macos-14
+    # The stage0 it starts from is built for macOS 15.
+    runs-on: macos-15
     timeout-minutes: 60
     permissions:
       contents: write
@@ -863,6 +871,12 @@ jobs:
       - uses: ./.github/actions/bootstrap
         with:
           out: target/release/ply
+      # A `Float` answers the same bits on every target: the float programs Linux checked, here too.
+      - name: Hold its floats to the digests the language suite pins
+        run: |
+          set -euo pipefail
+          target/release/ply test tests/lang/floats --no-cache
+          target/release/ply test tests/lang/floats --no-cache --profile release
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -1017,6 +1031,11 @@ jobs:
         with:
           name: test-shards
           path: /tmp/ply-shards
+      # Taken before a store is restored or a run writes into the trees it hashes, which would make
+      # the key read gigabytes of records and outrun `hashFiles`.
+      - name: Hash the sources
+        id: sources
+        run: echo "digest=${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}" >> "$GITHUB_OUTPUT"
       - uses: ./.github/actions/suite
         with:
           stage: ${{ needs.build-ply.outputs.stage }}
@@ -1026,7 +1045,7 @@ jobs:
         if: env.PLY_CI_COLD != 'true'
         with:
           path: /tmp/ply-c-corpus
-          key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          key: ply-c-corpus-${{ matrix.id }}-${{ steps.sources.outputs.digest }}
           restore-keys: |
             ply-c-corpus-${{ matrix.id }}-
             ply-c-corpus-
@@ -1154,7 +1173,7 @@ jobs:
         if: github.event_name == 'push'
         with:
           path: /tmp/ply-c-corpus
-          key: ply-c-corpus-${{ matrix.id }}-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**') }}
+          key: ply-c-corpus-${{ matrix.id }}-${{ steps.sources.outputs.digest }}
 
   # The one check that says a run is green.
   # Every module of the tree edited the ways `edit_gate` edits its fixtures, and checked warm and cold
