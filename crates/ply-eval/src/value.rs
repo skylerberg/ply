@@ -830,7 +830,7 @@ impl Ord for Value {
             // By value rather than by bits, so `I8` orders `-1` below `0`.
             (Value::Fixed(x), Value::Fixed(y)) => x.ty.cmp(&y.ty).then_with(|| x.value_cmp(*y)),
             (Value::Char(x), Value::Char(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+            (Value::Float(x), Value::Float(y)) => crate::float::total_cmp(*x, *y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
             (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
             (Value::Str(x), Value::Str(y)) => x.cmp(y),

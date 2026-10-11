@@ -67,7 +67,8 @@ impl<'v> Encoder<'v> {
             }
             Value::Float(x) => {
                 self.out.push(FLOAT);
-                self.out.extend_from_slice(&x.to_bits().to_le_bytes());
+                self.out
+                    .extend_from_slice(&crate::float::bits(*x).to_le_bytes());
             }
             Value::Decimal(d) => {
                 self.out.push(DECIMAL);
