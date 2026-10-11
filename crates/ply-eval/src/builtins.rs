@@ -5,7 +5,7 @@ use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, FixedOp, List, Value, first_difference, type_error, values_equal,
 };
-use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, map, slot};
+use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, float, map, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -1116,19 +1116,19 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::Floor => unary_float(&args[0], span, "`floor`", f64::floor),
         Builtin::Ceil => unary_float(&args[0], span, "`ceil`", f64::ceil),
         Builtin::Sqrt => unary_float(&args[0], span, "`sqrt`", f64::sqrt),
-        Builtin::Exp => unary_float(&args[0], span, "`exp`", libm::exp),
-        Builtin::Ln => unary_float(&args[0], span, "`ln`", libm::log),
-        Builtin::Log2 => unary_float(&args[0], span, "`log2`", libm::log2),
-        Builtin::Log10 => unary_float(&args[0], span, "`log10`", libm::log10),
-        Builtin::Sin => unary_float(&args[0], span, "`sin`", libm::sin),
-        Builtin::Cos => unary_float(&args[0], span, "`cos`", libm::cos),
-        Builtin::Tan => unary_float(&args[0], span, "`tan`", libm::tan),
-        Builtin::Asin => unary_float(&args[0], span, "`asin`", libm::asin),
-        Builtin::Acos => unary_float(&args[0], span, "`acos`", libm::acos),
-        Builtin::Atan => unary_float(&args[0], span, "`atan`", libm::atan),
-        Builtin::Pow => binary_float(args, span, "`pow`", libm::pow),
-        Builtin::Atan2 => binary_float(args, span, "`atan2`", libm::atan2),
-        Builtin::Hypot => binary_float(args, span, "`hypot`", libm::hypot),
+        Builtin::Exp => unary_float(&args[0], span, "`exp`", float::exp),
+        Builtin::Ln => unary_float(&args[0], span, "`ln`", float::ln),
+        Builtin::Log2 => unary_float(&args[0], span, "`log2`", float::log2),
+        Builtin::Log10 => unary_float(&args[0], span, "`log10`", float::log10),
+        Builtin::Sin => unary_float(&args[0], span, "`sin`", float::sin),
+        Builtin::Cos => unary_float(&args[0], span, "`cos`", float::cos),
+        Builtin::Tan => unary_float(&args[0], span, "`tan`", float::tan),
+        Builtin::Asin => unary_float(&args[0], span, "`asin`", float::asin),
+        Builtin::Acos => unary_float(&args[0], span, "`acos`", float::acos),
+        Builtin::Atan => unary_float(&args[0], span, "`atan`", float::atan),
+        Builtin::Pow => binary_float(args, span, "`pow`", float::pow),
+        Builtin::Atan2 => binary_float(args, span, "`atan2`", float::atan2),
+        Builtin::Hypot => binary_float(args, span, "`hypot`", float::hypot),
 
         Builtin::StringSlice => {
             let s = args[0].as_str(span, "`string_slice`")?;
@@ -1317,7 +1317,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
 
         Builtin::BitsOfFloat => {
             let f = args[0].as_float(span, "`bits_of_float`")?;
-            Ok(Value::Int(f.to_bits() as i64))
+            Ok(Value::Int(float::bits(f) as i64))
         }
 
         Builtin::FloatOfBits => {
@@ -1422,20 +1422,8 @@ fn option(v: Option<Value>) -> Value {
     }
 }
 
-/// The NaN every float function answers, whatever NaN the machine produced.
-pub const CANONICAL_NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
-
-/// Decided on the bits: the compiler may treat any NaN as any other, so a float-level choice
-/// between two NaNs can be folded away and an x86 sqrt's negative NaN kept.
-fn canonical(x: f64) -> f64 {
-    let bits = x.to_bits();
-    let nan =
-        bits & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && bits & 0x000F_FFFF_FFFF_FFFF != 0;
-    f64::from_bits(if nan { CANONICAL_NAN_BITS } else { bits })
-}
-
 fn unary_float(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {
-    Ok(Value::Float(canonical(f(x.as_float(span, what)?))))
+    Ok(Value::Float(f(x.as_float(span, what)?)))
 }
 
 fn binary_float(
@@ -1446,13 +1434,13 @@ fn binary_float(
 ) -> Result<Value, Diagnostic> {
     let x = args[0].as_float(span, what)?;
     let y = args[1].as_float(span, what)?;
-    Ok(Value::Float(canonical(f(x, y))))
+    Ok(Value::Float(f(x, y)))
 }
 
 /// `x` at a whole number, chosen as `mode` chooses a decimal's last digit.
 fn rounded(x: f64, mode: RoundingStrategy) -> f64 {
     if !x.is_finite() {
-        return canonical(x);
+        return x;
     }
     match mode {
         RoundingStrategy::MidpointAwayFromZero => x.round(),

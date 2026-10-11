@@ -51,7 +51,7 @@ pub(super) fn encode_const(v: &Value) -> String {
         Value::Bytes(b) => format!("b {}", hex(b)),
         Value::Fixed(f) => format!("f {} {}", f.ty as u8, f.bits()),
         Value::Char(c) => format!("c {}", u32::from(*c)),
-        Value::Float(x) => format!("x {:016x}", x.to_bits()),
+        Value::Float(x) => format!("x {:016x}", ply_eval::float::bits(*x)),
         Value::Decimal(d) => format!("d {} {}", d.mantissa(), d.scale()),
         other => unreachable!("a constant this backend does not pool: {other:?}"),
     }
