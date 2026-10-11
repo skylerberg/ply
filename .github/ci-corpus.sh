@@ -100,7 +100,7 @@ cli_grants=(--host --timeout 900000 --steps 0 --json
 # What a desk run is given beside the checks' grants: the floors the served tables are compared with,
 # built where the workflow builds them, and the database the desk's schema is in.
 desk_grants=(--exec "http_floor=$root/target/http-floor" --exec "pg_floor=$root/target/pg-floor"
-  --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk)
+  --set "CORPUS_DB=${CORPUS_DB:-postgres://postgres@127.0.0.1:5432/desk}")
 
 # What every `ply test` a lane starts is also asked: `select` asks only what an earlier run kept,
 # and takes each run's exit code as its answer.

@@ -50,7 +50,8 @@ env:
 jobs:
   plan:
     name: Check the CI tables and cache keys, and probe ucontext
-    runs-on: ubuntu-24.04
+    # A fork's pull request runs on hosted runners, every other run on this repository's own.
+    runs-on: &runner ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'ubuntu-24.04' || 'liquid' }}
     timeout-minutes: 5
     outputs:
       sweep: ${{ steps.sweep.outputs.sweep }}
@@ -124,7 +125,7 @@ jobs:
 
   clippy:
     name: Lint the Rust with clippy and rustfmt
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -151,7 +152,7 @@ jobs:
   # request's run uploaded, since main cannot read a pull request's cache.
   build:
     name: Build the Rust test archive
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
     env:
       SCCACHE_GHA_ENABLED: "true"
@@ -272,7 +273,7 @@ jobs:
   build-ply:
     name: Bootstrap ply
     needs: [plan]
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 40
     outputs:
       # The artifact holding the C cache and stages the run's jobs read, which a pull request whose
@@ -296,14 +297,15 @@ jobs:
       # service is the one part of a run that fails on its own.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: tcc
+        if: runner.environment == 'github-hosted'
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
       - name: Harvest tcc's packages for the jobs that run the suites
-        if: steps.tcc.outputs.cache-hit != 'true'
+        if: steps.tcc.outputs.cache-hit != 'true' && runner.environment == 'github-hosted'
         run: .github/ci-tcc.sh harvest
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.tcc.outputs.cache-hit != 'true'
+        if: steps.tcc.outputs.cache-hit != 'true' && runner.environment == 'github-hosted'
         with:
           path: tcc
           key: tcc-${{ runner.os }}-${{ runner.arch }}
@@ -409,7 +411,7 @@ jobs:
     name: Run Rust tests, shard ${{ matrix.shard }}/${{ matrix.of }}
     needs: [plan, build]
     if: needs.build.outputs.passed != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -492,7 +494,7 @@ jobs:
     name: Record that this Rust's tests passed
     needs: [build, nextest, hosts]
     if: needs.build.outputs.passed != 'true' && needs.nextest.result == 'success' && needs.hosts.result == 'success'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 5
     steps:
       - name: Write the mark
@@ -510,7 +512,7 @@ jobs:
     # path.
     needs: [plan, build-ply]
     if: needs.build-ply.outputs.lanes == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -638,7 +640,7 @@ jobs:
     name: Save the passes and test costs this run measured
     if: ${{ !cancelled() }}
     needs: [plan, build-ply, nextest, gates, hosts, lanes, corpus]
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 10
     permissions:
       actions: write
@@ -817,7 +819,7 @@ jobs:
     name: Publish main's ply for Linux
     if: github.event_name == 'push' && needs.ci.result == 'success'
     needs: [ci]
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 10
     permissions:
       contents: write
@@ -880,7 +882,7 @@ jobs:
   gates:
     name: Run the tree checks
     needs: [plan, build, build-ply]
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -957,7 +959,7 @@ jobs:
     name: Run the host packages' tests
     needs: [plan, build]
     if: needs.build.outputs.passed != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -985,16 +987,16 @@ jobs:
     name: Run ${{ matrix.id }} on a runner of its own
     needs: [plan, build-ply]
     if: needs.build-ply.outputs.solo == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.build-ply.outputs.corpus) }}
+    # A hosted runner is given a postgres; this repository's own have one installed.
     services:
       postgres:
-        image: postgres:17
+        image: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'postgres:17' || '' }}
         env:
-          POSTGRES_DB: desk
           POSTGRES_HOST_AUTH_METHOD: trust
         ports:
           - 5432:5432
@@ -1064,11 +1066,18 @@ jobs:
       - name: Install psql and the libpq the floor links
         if: ${{ startsWith(matrix.id, 'desks-') }}
         run: |
+          if command -v psql pg_config >/dev/null; then exit 0; fi
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client libpq-dev
+      # A database of the runner's own: this repository's runners share one postgres.
       - name: Load the desk's schema into postgres
         if: ${{ startsWith(matrix.id, 'desks-') }}
-        run: psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d desk -f examples/desk.sql
+        run: |
+          set -euo pipefail
+          db=desk_$(printf %s "$RUNNER_NAME" | tr -c 'a-z0-9' _)
+          psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d postgres -c "drop database if exists $db" -c "create database $db"
+          psql -v ON_ERROR_STOP=1 -q -h 127.0.0.1 -U postgres -d "$db" -f examples/desk.sql
+          echo "CORPUS_DB=postgres://postgres@127.0.0.1:5432/$db" >> "$GITHUB_ENV"
       # Built as `benches/corpus.sh` builds them; the checks ask `process.bound` for each.
       - name: Build the floors the served tables are compared with
         if: ${{ startsWith(matrix.id, 'desks-') }}
@@ -1154,7 +1163,7 @@ jobs:
     name: Sweep edits, cases ${{ matrix.name }}
     needs: [plan, build-ply]
     if: needs.plan.outputs.swept == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1183,7 +1192,7 @@ jobs:
   # parse every Ply module in the tree with it.
   treesitter:
     name: Generate and test the tree-sitter grammar
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1214,7 +1223,7 @@ jobs:
     name: CI
     if: always()
     needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, edit-sweep, treesitter]
-    runs-on: ubuntu-24.04
+    runs-on: *runner
     timeout-minutes: 5
     steps:
       - name: Check every job succeeded

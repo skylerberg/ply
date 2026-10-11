@@ -3,7 +3,8 @@
 # tcc, the C compiler `Profile::Development` shells out to.
 #
 #   .github/ci-tcc.sh harvest   the .deb packages, into ./tcc, for the cache the jobs share
-#   .github/ci-tcc.sh install   install it: those packages, or apt if the cache was evicted
+#   .github/ci-tcc.sh install   install it where the runner has none: those packages, or apt if the
+#                               cache was evicted
 #
 # The C backend keys every compiled object by the compiler and the flags it was given, so two jobs
 # that installed different tccs would share no object at all, and a job that installed none falls
@@ -23,7 +24,9 @@ case "${1:-}" in
     ;;
   install)
     # The cache is an optimisation, not the source: apt still has it if the entry was evicted.
-    if compgen -G 'tcc/*.deb' >/dev/null; then
+    if command -v tcc >/dev/null; then
+      :
+    elif compgen -G 'tcc/*.deb' >/dev/null; then
       sudo dpkg -i tcc/*.deb
     else
       sudo apt-get update -qq
