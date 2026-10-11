@@ -56,7 +56,6 @@ pub type Store = {
   puts: Map<Bytes, Bytes>,
   drops: Map<Bytes, Bool>,
   warnings: List<Warning>,
-  data: Bytes,
 }
 
 /// What a warning reports: the store could not be read or written, held something that did not
@@ -67,8 +66,7 @@ pub type Warning = { trouble: Trouble, message: String }
 
 pub type Found = | Hit(Bytes) | Miss | Bad(String)
 
-/// `data` is the data file read whole when it fits one read, else empty, and frames are read one by one.
-type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section>, data: Bytes }
+type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section> }
 
 type Problem = { trouble: Trouble, why: String }
 
@@ -78,7 +76,7 @@ fn corrupt(why: String) -> Problem = { trouble: Corrupt, why: why }
 
 fn foreign(why: String) -> Problem = { trouble: OtherVersion, why: why }
 
-fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [], data: b"" }
+fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [] }
 
 fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> Store =
   {
@@ -91,7 +89,6 @@ fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> St
     puts: map_new(),
     drops: map_new(),
     warnings: warnings,
-    data: d.data,
   }
 
 /// One warning per distinct reason, however often a run meets it.
@@ -128,30 +125,9 @@ fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r], abort.raise} =
     None -> Cold,
     Some(idx) -> match parse_index(idx, schema) {
       Err(p) -> Unusable(p),
-      Ok(d) -> match data_problem[r](dir, d, schema) {
-        None -> Valid({ ..d, data: whole[r](dir, d.data_len) }),
-        Some(p) -> Unusable(p),
-      },
+      Ok(d) -> match data_problem[r](dir, d, schema) { None -> Valid(d), Some(p) -> Unusable(p) },
     },
   }
-
-/// The most one read answers.
-fn read_cap() -> Int = 64 * 1024 * 1024
-
-/// The most data a store holds whole; past it, each entry is read when it is wanted.
-fn whole_cap() -> Int = 1024 * 1024 * 1024
-
-/// Only what the index vouches for: a torn append past it is never read.
-fn whole<[r]>(dir: String, data_len: Int) -> Bytes / {fs.read[r], abort.raise} =
-  if data_len > whole_cap() { b"" } else { pieced[r](join(dir, data_name()), data_len, read_cap()) }
-
-/// The first `len` bytes of `file` as one value, read `piece` bytes at a time; none if it is shorter.
-fn pieced<[r]>(file: String, len: Int, piece: Int) -> Bytes / {fs.read[r], abort.raise} = {
-  let pieces = map(range(0, (len + piece - 1) / piece), |i: Int|
-    fs.read_at[r](file, i * piece, min(piece, len - i * piece)));
-  let b = bytes_concat_all(map(pieces, |p: Option<Bytes>| match p { Some(x) -> x, None -> b"" }));
-  if bytes_len(b) == len { b } else { b"" }
-}
 
 fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> / {abort.raise} =
   if bytes_len(b) < index_header() || bytes_slice(b, 0, 8) != index_magic() {
@@ -175,13 +151,7 @@ fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> / {abort.raise}
       match sections_from(b, 0, count, records, 0 - 1, []) {
         Err(why) -> Err(why),
         Ok(secs) ->
-          Ok({
-            nonce: bytes_slice(b, 12, 28),
-            data_len: u64_at(b, 28),
-            index: b,
-            sections: secs,
-            data: b"",
-          }),
+          Ok({ nonce: bytes_slice(b, 12, 28), data_len: u64_at(b, 28), index: b, sections: secs }),
       }
     }
   }
@@ -296,7 +266,6 @@ pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Found / {fs.read[r], ab
         Some(at) ->
           frame_at[r](
             store.dir,
-            store.data,
             store.data_len,
             table,
             u64_at(store.index, at + key_width()),
@@ -327,9 +296,10 @@ pub fn unframe(table: Int, b: Bytes) -> Found / {abort.raise} =
     } else { Hit(payload) }
   }
 
+/// The frame of `table` the index places at `offset`, read alone: a store is never held whole, and
+/// nothing past what the index vouches for is read, so a torn append is never seen.
 fn frame_at<[r]>(
   dir: String,
-  data: Bytes,
   data_len: Int,
   table: Int,
   offset: Int,
@@ -338,10 +308,7 @@ fn frame_at<[r]>(
   if offset < data_header() || offset + frame_header() + len > data_len {
     Bad("an index entry points outside the data file")
   } else {
-    let read = if bytes_len(data) >= data_len {
-      Some(bytes_slice(data, offset, offset + frame_header() + len))
-    } else { fs.read_at[r](join(dir, data_name()), offset, frame_header() + len) };
-    match read {
+    match fs.read_at[r](join(dir, data_name()), offset, frame_header() + len) {
       None -> Bad("the data file could not be read"),
       Some(b) -> if bytes_len(b) != frame_header() + len {
         Bad("the data file ends inside a frame")
@@ -452,15 +419,13 @@ type Base = { disk: Option<Disk>, warnings: List<Warning> }
 fn base<[r]>(
   store: Store,
 ) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  if store.data_len > 0 && bytes_len(store.data) >= store.data_len
-      && fs.read_file[r](join(store.dir, index_name())) == Some(store.index) {
+  if store.data_len > 0 && fs.read_file[r](join(store.dir, index_name())) == Some(store.index) {
     {
       disk: Some({
         nonce: store.nonce,
         data_len: store.data_len,
         index: store.index,
         sections: store.sections,
-        data: store.data,
       }),
       warnings: store.warnings,
     }
@@ -481,7 +446,7 @@ fn started<[r]>(
   let file = join(dir, data_name());
   if fs.write_file[r](file, data_head(nonce, schema)) && fs.sync[r](file) {
     {
-      disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [], data: b"" }),
+      disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [] }),
       warnings: warnings,
     }
   } else { { disk: None, warnings: warnings } }
@@ -708,14 +673,7 @@ fn copy_table<[r]>(
     |acc: { frames: List<Bytes>, size: Int, records: List<Bytes>, dropped: Int }, i: Int| {
       let at = record_at(sec, i);
       let len = u32_at(d.index, at + key_width() + 8);
-      match frame_at[r](
-          dir,
-          d.data,
-          d.data_len,
-          sec.table,
-          u64_at(d.index, at + key_width()),
-          len,
-        ) {
+      match frame_at[r](dir, d.data_len, sec.table, u64_at(d.index, at + key_width()), len) {
         Hit(payload) -> {
           let f = frame(sec.table, payload);
           {
@@ -835,16 +793,6 @@ test "a run whose index is stale at its flush reads the store again and keeps th
   assert_eq(run.value, [])
 }
 
-test "a file larger than one read is read whole a piece at a time, and only as far as asked" {
-  let run = on_twin(mem_empty(), || {
-    assert(fs.write_file[mem]("f", b"0123456789abcdefghij"));
-    { whole: pieced[mem]("f", 20, 7), part: pieced[mem]("f", 15, 4), past: pieced[mem]("f", 25, 7) }
-  });
-  assert_eq(run.value.whole, b"0123456789abcdefghij");
-  assert_eq(run.value.part, b"0123456789abcde");
-  assert_eq(run.value.past, b"")
-}
-
 test "a torn append past what the index vouches for is never read and is written over" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"kept"));
@@ -859,17 +807,6 @@ test "a torn append past what the index vouches for is never read and is written
     all([s1.warnings, s3.warnings, s4.warnings])
   });
   assert_eq(run.value, [])
-}
-
-test "a load reads the data file as far as the index vouches for and no further" {
-  let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"kept"));
-    match fs.append[mem]("cache/store.dat", b"a torn tail") { _ -> () };
-    let s2 = open[mem]("cache", schema_a());
-    { read: bytes_len(s2.data), vouched: s2.data_len, warnings: all([s1.warnings, s2.warnings]) }
-  });
-  assert_eq(run.value.read, run.value.vouched);
-  assert_eq(run.value.warnings, [])
 }
 
 test "a frame that does not verify is a miss with its reason, never a half-read value" {
