@@ -44,17 +44,20 @@
 #                                      still applies. Objects stay out: one compiles from its bodies in
 #                                      seconds, and they were most of what a lane kept. The stages are
 #                                      build-ply's to ship, and the packages' stores are carried apart.
-#   ci-corpus.sh pack TAR              what a partition leaves the next run: `keep`'s C, and each package
-#                                      store its runs wrote since `mark`, compacted
-#   ci-corpus.sh unpack DIR C          every partition's TAR under DIR as one: their C merged into C,
-#                                      and each store written over the checkout's, so a later partition
-#                                      finds every package's whichever partition the cut gave it
+#   ci-corpus.sh pack DIR              what a partition leaves the next run, a file each under DIR:
+#                                      `keep`'s C, and each package store its runs wrote since `mark`,
+#                                      compacted
+#   ci-corpus.sh unpack DIR C          every partition's pack under DIR as one: their C merged into C,
+#                                      and each store written over the checkout's from the last
+#                                      partition that packed it, so a later partition finds every
+#                                      package's whichever partition the cut gave it
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
 #   ci-corpus.sh compact               every package's store compacted before a job saves them: a
 #                                      store only grows, and every later job restores what one saves
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
 #   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
+#   ci-corpus.sh --self-test           `pack` and `unpack`, against partitions the test builds
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -569,6 +572,115 @@ kept_answers() {
     tar --null -T - -cf -) | tar -xf - -C "$dir"
 }
 
+# What the runs since the mark left, a file each under OUT: the C `keep` gathers, and every store one
+# of them wrote, compacted.
+packed() {
+  local out=$1 work store rel package
+  rm -rf "$out"
+  mkdir -p "$out"
+  work=$(mktemp -d)
+  kept_answers "$work" || return 1
+  tar -C "$work" -cf - . | zstd -q -T0 -3 -o "$out/c.tar.zst" || return 1
+  rm -rf "$work"
+  # A store is one file set: it travels whole, from the partition that wrote it. Its file is named
+  # for its package and not its hidden directory, which an artifact leaves out.
+  for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache "$root"/crates/ply-corpus/stdlib/.ply-cache "$root"/tests/lang/.ply-cache; do
+    [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue
+    rel=${store#"$root"/}
+    package=${rel%/.ply-cache}
+    "$ply" cache compact "${store%/.ply-cache}" > /dev/null ||
+      echo "the store under $package was not compacted" >&2
+    mkdir -p "$(dirname "$out/stores/$package")"
+    tar -C "$root" -cf - "$rel" | zstd -q -T0 -3 -o "$out/stores/$package.tar.zst" || return 1
+    echo "packed the store under $package"
+  done
+  du -sh "$out"
+}
+
+# Every partition's pack under PARTS as one: the C of each into DIR, the first to hold a body keeping
+# it, and each store over the checkout's.
+unpacked() {
+  local parts=$1 dir=$2 file package
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  while IFS= read -r file; do
+    zstd -dc "$file" | tar -C "$dir" --skip-old-files -xf - || return 1
+  done < <(find "$parts" -type f -name c.tar.zst | sort)
+  # Only the last pack of a store is read: an earlier one would be written and then replaced.
+  while IFS= read -r file; do
+    package=${file#"$parts"/*/stores/}
+    package=${package%.tar.zst}
+    rm -rf "${root:?}/$package/.ply-cache"
+    zstd -dc "$file" | tar -C "$root" -xf - || return 1
+    echo "the store under $package from ${file#"$parts"/}"
+  done < <(find "$parts" -type f -path "$parts/*/stores/*.tar.zst" | sort |
+    awk -v parts="$parts/" '
+      { pack = substr($0, length(parts) + 1); last[substr(pack, index(pack, "/stores/"))] = $0 }
+      END { for (store in last) print last[store] }' | sort)
+  du -sh "$dir"
+}
+
+# `packed` over three partitions' checkouts and caches and `unpacked` over what they packed, all built
+# under a directory of the test's own: a pack is read only by the job that merges them, after every
+# test has passed and outside what says a run is green.
+self_test() {
+  local fail=0 got want work k log
+  check() {
+    got=$1; want=$2
+    [ "$got" = "$want" ] || { echo "FAIL: $3: got '$got', want '$want'" >&2; fail=1; }
+  }
+  filed() { mkdir -p "$(dirname "$1")" && echo "$2" > "$1"; }
+  held() { cat "$1" 2> /dev/null || echo absent; }
+  work=$(mktemp -d)
+  ply=$work/ply
+  printf '#!/bin/sh\necho "$3" >> "%s/compacted"\n' "$work" > "$ply"
+  chmod +x "$ply"
+  # Each partition writes the suite's store and a body of its own, and the first two the library's;
+  # each holds a store and a body older than its mark.
+  for k in 1 2 3; do
+    root=$work/part-$k
+    caches=$work/caches-$k
+    mark=$caches/ply-c-corpus.mark
+    filed "$root/crates/ply-sim/ply/.ply-cache/store.idx" "unwritten"
+    filed "$caches/ply-c-cache/bodies/before" "before"
+    touch -t 200101010000 "$root/crates/ply-sim/ply/.ply-cache/store.idx" "$caches/ply-c-cache/bodies/before"
+    touch -t 200201010000 "$mark"
+    filed "$root/crates/ply-cli-tests/ply/.ply-cache/store.idx" "suite $k"
+    filed "$root/crates/ply-cli-tests/ply/.ply-cache/memo/records/of-$k" "$k"
+    [ "$k" -eq 3 ] || filed "$root/crates/ply-corpus/stdlib/.ply-cache/store.idx" "library $k"
+    filed "$caches/ply-c-cache/bodies/of-$k" "$k"
+    filed "$caches/ply-c-cache/bodies/shared" "shared $k"
+    packed "$work/packs/kept-lanes-$k" > /dev/null
+    check $? 0 "partition $k packing"
+  done
+  check "$(sort -u "$work/compacted" | grep -c .)" 5 "stores compacted, each one packed and no other"
+  check "$(find "$work/packs" -type f | grep -c .)" 8 "files packed, one for each partition's C and each store it wrote"
+  check "$(find "$work/packs" -name '.*' | grep -c .)" 0 "packed paths an artifact leaves out as hidden"
+  # The merging job's checkout holds what the run before left of each store.
+  root=$work/merged
+  filed "$root/crates/ply-cli-tests/ply/.ply-cache/memo/records/of-the-run-before" "0"
+  filed "$root/crates/ply-sim/ply/.ply-cache/store.idx" "the run before"
+  log=$(unpacked "$work/packs" "$work/c")
+  check $? 0 "unpacking"
+  check "$(grep -c '^the store under ' <<< "$log")" 2 "stores unpacked, each once"
+  check "$(held "$root/crates/ply-cli-tests/ply/.ply-cache/store.idx")" "suite 3" \
+    "a store every partition wrote, which is the last one's"
+  check "$(ls "$root/crates/ply-cli-tests/ply/.ply-cache/memo/records" | tr '\n' ' ')" "of-3 " \
+    "what a store holds of the one it replaced and of a partition before the last"
+  check "$(held "$root/crates/ply-corpus/stdlib/.ply-cache/store.idx")" "library 2" \
+    "a store the last partition did not write"
+  check "$(held "$root/crates/ply-sim/ply/.ply-cache/store.idx")" "the run before" "a store no partition wrote"
+  check "$(ls "$work/c/ply-c-cache/bodies" | tr '\n' ' ')" "of-1 of-2 of-3 shared " \
+    "the C of every partition, none of it older than a mark"
+  check "$(held "$work/c/ply-c-cache/bodies/shared")" "shared 1" "a body two partitions kept"
+  head -c 20 "$work/packs/kept-lanes-3/c.tar.zst" > "$work/packs/kept-lanes-3/stores/crates/ply-cli-tests/ply.tar.zst"
+  unpacked "$work/packs" "$work/c" > /dev/null 2>&1
+  check $? 1 "unpacking a pack cut short"
+  rm -rf "$work"
+  [ "$fail" -eq 0 ] || exit 1
+  echo "self-test: a store is unpacked once, from the last partition that packed it, and the C is every partition's"
+}
+
 case "${1:-}" in
   partition)
     shard=${2:?a partition}
@@ -717,43 +829,11 @@ case "${1:-}" in
     du -sh "$dir"
     ;;
   pack)
-    tar_out=${2:?a tar file}
     marked || exit 2
-    work=$(mktemp -d)
-    kept_answers "$work/c" || exit 1
-    # A store is one file set: it travels whole, from the partition that wrote it.
-    for store in "$root"/crates/*/ply/.ply-cache "$root"/crates/ply-corpus/checks/.ply-cache "$root"/crates/ply-corpus/stdlib/.ply-cache "$root"/tests/lang/.ply-cache; do
-      [ -d "$store" ] && [ -n "$(find "$store" -type f -newer "$mark" -print -quit)" ] || continue
-      rel=${store#"$root"/}
-      "$ply" cache compact "${store%/.ply-cache}" > /dev/null ||
-        echo "the store under ${rel%/.ply-cache} was not compacted" >&2
-      mkdir -p "$work/stores/${rel%/.ply-cache}"
-      cp -R "$store" "$work/stores/$rel"
-      echo "packed the store under ${rel%/.ply-cache}"
-    done
-    tar -C "$work" -cf "$tar_out" .
-    rm -rf "$work"
-    du -h "$tar_out"
+    packed "${2:?a directory}"
     ;;
   unpack)
-    parts=${2:?a directory of packed tars}
-    dir=${3:?a directory for the C}
-    rm -rf "$dir"
-    mkdir -p "$dir"
-    while IFS= read -r part; do
-      work=$(mktemp -d)
-      tar -C "$work" -xf "$part" || { rm -rf "$work"; exit 1; }
-      [ -d "$work/c" ] && { tar -C "$work/c" -cf - . | tar -C "$dir" --skip-old-files -xf -; }
-      while IFS= read -r store; do
-        rel=${store#"$work/stores/"}
-        rm -rf "${root:?}/$rel"
-        mkdir -p "$(dirname "$root/$rel")"
-        cp -R "$store" "$root/$rel"
-        echo "the store under ${rel%/.ply-cache} from ${part#"$parts"/}"
-      done < <([ -d "$work/stores" ] && find "$work/stores" -type d -name .ply-cache)
-      rm -rf "$work"
-    done < <(find "$parts" -type f -name '*.tar' | sort)
-    du -sh "$dir"
+    unpacked "${2:?a directory of packs}" "${3:?a directory for the C}"
     ;;
   restore)
     dir=${2:?a directory}
@@ -800,8 +880,11 @@ case "${1:-}" in
     fi
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
+  --self-test)
+    self_test
+    ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | select [CUT] | mark | keep DIR | pack TAR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | select [CUT] | mark | keep DIR | pack DIR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR | --self-test" >&2
     exit 2
     ;;
 esac
