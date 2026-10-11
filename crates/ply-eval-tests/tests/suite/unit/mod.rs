@@ -11,6 +11,7 @@ mod crypto;
 mod decode;
 mod escape;
 mod evaluator;
+mod float;
 mod footprint;
 mod hash;
 mod host;
