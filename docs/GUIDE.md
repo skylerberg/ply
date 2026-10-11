@@ -698,6 +698,16 @@ given; they raise where 96 bits do not hold the answer at that scale.
 `decimal_scale` reads the scale a value has, and a `decimal_round` to no more
 digits than that only drops digits, so it cannot raise.
 
+A `Float` operation answers the same bits on every machine, every target and in
+every profile. Arithmetic is IEEE-754 binary64 with each operation rounded once,
+as written: no two are fused into one and none is reordered, and a subnormal is
+kept, never flushed to zero. `sqrt`, `exp`, `ln`, `log2`, `log10`, `sin`, `cos`,
+`tan`, `asin`, `acos`, `atan`, `atan2`, `pow` and `hypot` are correctly rounded:
+each answers the `Float` nearest the exact value, ties to even, which the
+specification fixes rather than an implementation. A program sees one `NaN`:
+whatever NaN a machine makes, `bits_of_float`, an encoding and an order read it
+as `0x7FF8_0000_0000_0000`, so it has no sign or payload to tell apart.
+
 ### 4.2 Records and tuples
 
 Records are structural; `type` names an alias, not a new type, unless its body
