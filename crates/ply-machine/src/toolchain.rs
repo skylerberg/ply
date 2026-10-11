@@ -13,13 +13,14 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-const OPERATIONS: [(&str, &str, &str); 13] = [
+const OPERATIONS: [(&str, &str, &str); 14] = [
     ("compilers", "found", "ply_machine::toolchain::found"),
     ("compilers", "started", "ply_machine::toolchain::started"),
     ("compilers", "finished", "ply_machine::toolchain::finished"),
     ("toolchain", "cache", "ply_machine::toolchain::cache"),
     ("toolchain", "jobs", "ply_machine::toolchain::jobs"),
     ("toolchain", "holds", "ply_machine::toolchain::holds"),
+    ("toolchain", "held", "ply_machine::toolchain::held"),
     ("toolchain", "written", "ply_machine::toolchain::written"),
     ("toolchain", "moved", "ply_machine::toolchain::moved"),
     ("toolchain", "appended", "ply_machine::toolchain::appended"),
@@ -259,6 +260,13 @@ impl HostHandler for Toolchain {
                     ply_codegen::c::sweep::used(&at);
                 }
                 PlyValue::Bool(held)
+            }
+            ("held", [path]) => {
+                let at = below(path.as_str(span, "a path")?, span)?;
+                match std::fs::read(&at) {
+                    Ok(bytes) => PlyValue::ctor("Some", vec![PlyValue::bytes(&bytes)]),
+                    Err(_) => PlyValue::ctor("None", Vec::new()),
+                }
             }
             ("written", [path, bytes]) => {
                 let at = below(path.as_str(span, "a path")?, span)?;
