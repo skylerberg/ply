@@ -95,10 +95,6 @@ impl Exports {
         self.taken.iter().map(|t| t.name.clone()).collect()
     }
 
-    pub fn taken_by_name(&self, name: &str) -> Option<&Taken> {
-        self.taken.iter().find(|t| t.name == name)
-    }
-
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
     /// lacks, or has under another shape, is refused.
     pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
