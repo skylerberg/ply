@@ -3,14 +3,14 @@
 
 import std.fs (fs)
 import compiler.memo
-import compiler.memo (Read, Record, Run, Tally, memo_keep, asked_reads, digest_of, recorded,
-                      lost_in, standing, started, tallies, vouched_to)
+import compiler.memo (Read, Record, Run, Tally, asked_reads, digest_of, reached, recorded, lost_in,
+                      standing, started, tallies, vouched_to)
 import compiler.memo_files
 import compiler.unit (shipped)
 import compiler.checking (Answered, CheckQuery, Driving, OwnFile, OwnPackage, World, asked_all,
                           decoding_once, evaluator_of, hashed_all, looked, refused_first, registry,
-                          shipped_all, shipped_queries, walked_covers, wanted_all, world_of,
-                          world_placing)
+                          shipped_all, shipped_covers, shipped_queries, walked_covers, wanted_all,
+                          world_of, world_placing)
 import compiler.front (ShippedWants)
 import compiler.hash (Fixing, no_fixing)
 import sources (Project, File, DepPackage, Embed, embed_now, embed_of)
@@ -303,7 +303,8 @@ pub fn keep_command<[r]>(
 /// What each of `shipped`, the shipped modules, answers to each query a load cannot cheaply answer
 /// again, through the memo store in `work`, written into the store `out`, which then holds those
 /// answers and nothing else: the store `ply bootstrap` packs beside the shipped modules. How many records
-/// it holds.
+/// it holds. The run reads no project, so what a load of one kept in `work` it neither looks at nor
+/// writes into `out`.
 pub fn shipped_answers<[r], [w]>(
   work: String,
   out: String,
@@ -313,7 +314,7 @@ pub fn shipped_answers<[r], [w]>(
   let nowhere = world_of({ root: b"", manifest: None, files: [] }, []);
   let wanted = fold(shipped_queries(), map_new(), |acc: Map<Bytes, Bool>, name: Bytes|
     match map_get(qs, name) { Some(q) -> map_insert(acc, q.hash, true), None -> acc });
-  let reached = memo_files::kept[r](
+  let keys = memo_files::kept[r](
     work,
     |_: String| None,
     |kind: Bytes, at: Bytes|
@@ -326,9 +327,10 @@ pub fn shipped_answers<[r], [w]>(
         kind,
         at,
       ),
-    || decoding_once(|| reached_of(qs, wanted, shipped_all(qs, shipped, started(qs)))),
+    || decoding_once(|| reached(qs, wanted, shipped_all(qs, shipped, started(qs)))),
+    covers: |kind: Bytes, _: Bytes| shipped_covers(kind),
   );
-  let copied = memo_files::copied[r, w](work, out, reached);
+  let copied = memo_files::copied[r, w](work, out, keys);
   let records = fold(
     match fs.list_dir[w](out ++ "/records") { Some(names) -> names, None -> [] },
     map_new(),
@@ -350,46 +352,6 @@ pub fn shipped_answers<[r], [w]>(
   copied
 }
 
-/// The key of each record of a query `wanted` holds the hash of among those the answers `run`
-/// settled read, at any depth: one taken as kept settles none of its reads, so each is read for
-/// what it asked.
-fn reached_of(
-  qs: Map<Bytes, CheckQuery>,
-  wanted: Map<Bytes, Bool>,
-  run: Run,
-) -> List<Bytes> / {memo_keep.read, abort.raise} =
-  iterate(
-    {
-      seen: map_new(),
-      work: map_fold(run.settled, [], |acc: List<Bytes>, key: Bytes, _: Bytes| push(acc, key)),
-      keys: [],
-    },
-    100000000,
-    |x: { seen: Map<Bytes, Bool>, work: List<Bytes>, keys: List<Bytes> }|
-      match x.work {
-        [] -> Stop(x.keys),
-        [key, ..rest] -> if map_contains(x.seen, key) { Continue({ ..x, work: rest }) } else {
-          let seen = map_insert(x.seen, key, true);
-          match memo_keep.record(key) {
-            None -> Continue({ ..x, seen: seen, work: rest }),
-            Some(rec) ->
-              Continue({
-                seen: seen,
-                work: fold(rec.reads, rest, |w: List<Bytes>, read: Read|
-                  match read {
-                    memo::Asked(name, input, _) -> match map_get(qs, name) {
-                      Some(q) -> push(w, memo::key_of(q, input)),
-                      None -> w,
-                    },
-                    memo::World(_, _, _) -> w,
-                  }),
-                keys: if map_contains(wanted, rec.query) { push(x.keys, key) } else { x.keys },
-              }),
-          }
-        },
-      },
-  )
-
 /// The file a store of what the shipped modules answer holds to say it was answered over the very
 /// modules a binary carrying it ships. It holds the digest of every record the store keeps, each of
 /// which names its answer, so two packs that answer anything otherwise hold another: a run that
@@ -401,8 +363,10 @@ fn standing_path() -> String = "standing"
 /// holds each record to what it read.
 fn packed_stands() -> Bool / {shipped.answer} = shipped.answer(standing_path()) != None
 
-/// The store `ply std --answers` answers the shipped modules through, beside the stage of reused
-/// answers `reused` names: what a later answering takes as kept, whichever `ply` answers.
+/// The store a toolchain's own shipped modules are answered through, beside the stage of reused
+/// answers `reused` names: a bootstrap's builder checks `ply` through it and `ply std --answers`
+/// answers every shipped module through it, so what one answered the other takes, and so does a
+/// later bootstrap, whichever `ply` answers.
 pub fn shipped_work(reused: String) -> String / {abort.raise} = {
   let cut = fold(range(0, string_len(reused)), 0 - 1, |acc: Int, i: Int|
     if string_slice(reused, i, i + 1) == "/" { i } else { acc });

@@ -4,14 +4,16 @@
 //! modules, which this `ply`'s packed answers answer for wherever they did not move; the builder
 //! builds the checkout's `ply` and holds its constants on that runtime; that is linked into a native
 //! `ply`, which answers the shipped modules; and its pack carries the shipped modules, those answers
-//! and what its front end answered of the definition it enters. The builder and the pack are each
-//! kept in the toolchain's cache under what decides them, so a bootstrap of what an earlier one built
-//! makes neither again. Only the shipped modules the builder pulls are built by this `ply`'s
-//! compiler, so only they cannot use a language rule the checkout introduces.
+//! and what its front end answered of the definition it enters. The builder and the answers are
+//! each kept in the toolchain's cache under what decides them, so a bootstrap of what an earlier one
+//! built makes neither again, and one whose `ply` answers as an earlier one's did answers nothing.
+//! Only the shipped modules the builder pulls are built by this `ply`'s compiler, so only they
+//! cannot use a language rule the checkout introduces.
 
 import args (Flags, no_flags, style_of)
 import env (env)
 import program (Timed, front_of, timed_uncached_over, program_view)
+import queried
 import report (Answer, ok_code, compile_error, refused, reported)
 import sources (Project, shipped_names)
 import compiler.cc
@@ -25,7 +27,8 @@ import compiler.parsing (no_module)
 import compiler.resolve (Diag, error_at)
 import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, identity_of, read_kept,
                       write_kept)
-import std.bytes (hex_of, u64_at, u64_le)
+import std.bin
+import std.bytes (hex_of)
 import std.fs
 import std.fs (fs, Entry, File)
 import std.hash (blake3)
@@ -366,49 +369,44 @@ fn builder_kept(shipped: Bytes, linking: Bytes, building: Bytes) -> String / {ab
   hex_of(key) ++ ".builder"
 }
 
-/// The definition a `ply`'s pack is a function of besides what it is made from: the one that makes
-/// it, whose hash covers how the shipped modules are answered, gathered and laid out.
-fn pack_roots() -> List<Bytes> = [b"bootstrap.packed"]
+/// The definition what a `ply` answered is kept as a function of on this side: the one that gathers
+/// it, whose hash covers what is read of the store the `ply` wrote and how it is laid into a pack.
+fn answers_roots() -> List<Bytes> = [b"bootstrap.answers"]
 
-/// Where the cache keeps the pack of the `ply` whose front end is `front` and whose C is `sources`,
-/// over the shipped modules `shipped` names, linked as `linking` names, and packed by the
-/// definitions `packing` identifies.
-fn pack_kept(
+/// Where the cache keeps what a `ply` answers of the shipped modules `shipped` names, linked as
+/// `linking` names: `answering` is what the `ply` says names how it answers them, and `gathering`
+/// identifies the definitions that gather what it answered. The `ply`'s own front end is no part of
+/// it, so one that differs only there takes what the other answered.
+fn answers_kept(
   shipped: Bytes,
   linking: Bytes,
-  front: Bytes,
-  sources: List<cc::Source>,
-  packing: Bytes,
+  answering: Bytes,
+  gathering: Bytes,
 ) -> String / {abort.raise} = {
   let key = blake3(
-    bytes_concat_all([
-      b"ply pack 1\0",
-      shipped,
-      linking,
-      blake3(front),
-      sized(cc::manifest(sources)),
-      sized(packing),
-    ]),
+    bytes_concat_all([b"ply answers 1\0", shipped, linking, sized(answering), sized(gathering)]),
   );
-  hex_of(key) ++ ".pack"
+  hex_of(key) ++ ".answers"
 }
 
-/// The pack a `ply` carries, and how many records its shipped modules are answered in.
-type Packing = { answered: Int, pack: Bytes }
+/// One file of what a `ply` answered, as the cache keeps it.
+type KeptFile = { path: String, bytes: Bytes }
 
-/// `p` as the cache keeps it: the count, then the pack.
-fn kept_of(p: Packing) -> Bytes = bytes_concat(u64_le(p.answered), p.pack)
+derive bin for KeptFile
 
-/// What `kept_of` kept: nothing for bytes that are not a count and then a whole pack.
-fn unkept(bytes: Bytes) -> Option<Packing> / {abort.raise} = {
-  let size = bytes_len(bytes);
-  match ((u64_at(bytes, 0), if size < 32 { None } else { u64_at(bytes, size - 24) })) {
-    (Some(answered), Some(held)) -> if held == size - 32 && bytes_ends_with(bytes, b"PLYPACK1") {
-      Some({ answered: answered, pack: bytes_slice(bytes, 8, size) })
-    } else { None },
-    _ -> None,
+/// `answered` as the cache keeps it.
+fn kept_of(answered: List<Packed>) -> Bytes / {abort.raise} =
+  bin::encode(
+    map(answered, |f: Packed| { path: f.path, bytes: f.bytes }),
+    bin::list_bin(kept_file_bin()),
+  )
+
+/// What `kept_of` kept: nothing for bytes that are not the whole of it.
+fn unkept(bytes: Bytes) -> Option<List<Packed>> / {abort.raise} =
+  match bin::decode(bytes, bin::list_bin(kept_file_bin())) {
+    Ok(files) -> Some(map(files, |f: KeptFile| { path: f.path, bytes: f.bytes })),
+    Err(_) -> None,
   }
-}
 
 // --- The builder ------------------------------------------------------------------------
 
@@ -500,17 +498,23 @@ fn builder_built(
 }
 
 /// The checkout's `ply` built by `builder`: its front end, the sources of its C, which the cache
-/// keeps, and what the builder said of its steps where `phases` asked it to.
+/// keeps, and what the builder said of its steps where `phases` asked it to. The builder checks
+/// through the store `ply std --answers` answers the shipped modules through, so each shipped
+/// module `ply` imports is answered once a bootstrap.
 fn ply_built(
   options: Options,
   builder: String,
   work: String,
   phases: Bool,
-) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
+) -> Result<{ front: Bytes, sources: List<cc::Source>, said: Bytes }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], env.reused[sys], abort.raise} = {
   let cache = toolchain.cache();
   let front = cache ++ "/" ++ work ++ "/ply.front";
   let manifest = cache ++ "/" ++ work ++ "/ply.sources";
-  let memo = cache ++ "/memo-" ++ (if options.profile == "release" { "release" } else { "debug" });
+  let memo = queried::shipped_work(env.reused[sys]());
+  if fs.create_dir[abs](below_root(memo)) {
+    fs.write_file[abs](below_root(memo) ++ "/.used", b"");
+    ()
+  };
   let ran = toolchain.ran(relative(builder), [
     options.root ++ "/crates/ply-cli/ply",
     "ply.main",
@@ -564,46 +568,56 @@ fn answers(
   }
 }
 
-/// The pack the `ply` at `exe` carries: the shipped modules, its front end and what it answers of
-/// them. A copy that carries only its front end answers for the one that carries the answers too.
-fn packed(
+/// What the `ply` at `exe` answers of the shipped modules, as its pack carries it: what an earlier
+/// bootstrap kept of a `ply` that answers them as this one does, or else what this one answers,
+/// which is kept. `taken` is whether it was kept. A copy that carries only its front end says how
+/// it answers and answers for the one that carries the answers too; one that cannot say answers
+/// and nothing is kept.
+fn answered(
   exe: String,
   files: List<Shipping>,
   front: Bytes,
+  keys: Keys,
   work: String,
-) -> Result<Packing, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+) -> Result<{ answered: List<Packed>, taken: Bool }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, abort.raise} = {
   let answering = exe ++ "-answering";
   if !fs.copy[abs](below_root(exe), below_root(answering)) {
     failed("the new `ply` could not be copied to answer with")
   } else {
     match packed_after(answering, packed_with(files, front, [])) {
       Err(diags) -> Err(diags),
-      Ok(_) -> match answers(answering, work) {
-        Err(diags) -> Err(diags),
-        Ok(answered) -> Ok({ answered: len(answered), pack: packed_with(files, front, answered) }),
+      Ok(_) -> {
+        let said = toolchain.ran(relative(answering), ["std", "--answering"]);
+        let kept = if said.code != 0 { None } else {
+          Some(
+            answers_kept(
+              keys.shipped,
+              keys.linking,
+              bytes_of_string(string_trim(string_of_bytes_lossy(said.out))),
+              identity_of(shipped.definitions(), answers_roots()),
+            ),
+          )
+        };
+        let had = match kept {
+          None -> None,
+          Some(at) -> if !toolchain.holds(at) { None }
+          else { match toolchain.held(at) { Some(bytes) -> unkept(bytes), None -> None } },
+        };
+        match had {
+          Some(a) -> Ok({ answered: a, taken: true }),
+          None -> match answers(answering, work) {
+            Err(diags) -> Err(diags),
+            Ok(a) -> match kept {
+              None -> Ok({ answered: a, taken: false }),
+              Some(at) -> if toolchain.written(at, kept_of(a)) { Ok({ answered: a, taken: false }) }
+              else {
+                failed("what the new `ply` answered could not be kept in the toolchain's cache")
+              },
+            },
+          },
+        }
       },
     }
-  }
-}
-
-/// The pack of the `ply` at `exe`, at `kept` below the cache: the one an earlier bootstrap kept
-/// there, or else made here and kept. `taken` is whether it was kept.
-fn pack_made(
-  exe: String,
-  files: List<Shipping>,
-  front: Bytes,
-  kept: String,
-  work: String,
-) -> Result<{ packing: Packing, taken: Bool }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
-  let had = if !toolchain.holds(kept) { None }
-  else { match toolchain.held(kept) { Some(bytes) -> unkept(bytes), None -> None } };
-  match had {
-    Some(p) -> Ok({ packing: p, taken: true }),
-    None -> match packed(exe, files, front, work) {
-      Err(diags) -> Err(diags),
-      Ok(p) -> if toolchain.written(kept, kept_of(p)) { Ok({ packing: p, taken: false }) }
-      else { failed("the pack could not be kept in the toolchain's cache") },
-    },
   }
 }
 
@@ -669,7 +683,7 @@ fn bootstrapped(
   files: List<Shipping>,
   work: String,
   phases: Bool,
-) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
+) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], env.reused[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
   let started = time.elapsed_ms();
   match described(t, options.library, work) {
     Err(diags) -> Err(diags),
@@ -745,27 +759,20 @@ fn finished(
   steps: List<Took>,
 ) -> Result<Built, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, time.elapsed_ms, entropy.next, abort.raise} = {
   let at = time.elapsed_ms();
-  let kept = pack_kept(
-    keys.shipped,
-    keys.linking,
-    made.front,
-    made.sources,
-    identity_of(shipped.definitions(), pack_roots()),
-  );
-  match pack_made(exe, files, made.front, kept, work) {
+  match answered(exe, files, made.front, keys, work) {
     Err(diags) -> Err(diags),
-    Ok(p) -> {
+    Ok(a) -> {
       let steps = took(
         steps,
-        if p.taken { "took the kept pack" } else { "answered the shipped modules" },
+        if a.taken { "took the kept answers" } else { "answered the shipped modules" },
         at,
       );
       let at = time.elapsed_ms();
-      match installed(exe, options.out, p.packing.pack) {
+      match installed(exe, options.out, packed_with(files, made.front, a.answered)) {
         Err(diags) -> Err(diags),
         Ok(_) ->
           Ok({
-            answered: p.packing.answered,
+            answered: len(a.answered),
             steps: took(steps, "packed and wrote `ply`", at),
             said: made.said,
           }),
@@ -776,7 +783,7 @@ fn finished(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
+) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], env.reused[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
   let s = style_of(flags);
   let options = options_of(flags);
   let files = shipping(options.root);
@@ -871,23 +878,23 @@ test "a builder is kept under its shipped modules, its link and the definitions 
   assert(builder_kept(b"shipped", b"linking", b"moved") != kept)
 }
 
-test "a pack is kept under its program's front end and C, and the definitions that pack it" {
-  let sources = [{ label: "0a", digest: "d1" }];
-  let kept = pack_kept(b"shipped", b"linking", b"front", sources, b"packing");
-  assert_eq(pack_kept(b"shipped", b"linking", b"front", sources, b"packing"), kept);
-  assert(pack_kept(b"shipped", b"linking", b"moved", sources, b"packing") != kept);
-  assert(
-    pack_kept(b"shipped", b"linking", b"front", [{ label: "0a", digest: "d2" }], b"packing")
-      != kept,
-  );
-  assert(pack_kept(b"shipped", b"linking", b"front", sources, b"moved") != kept);
-  assert(pack_kept(b"moved", b"linking", b"front", sources, b"packing") != kept)
+test "what a ply answered is kept under how it answers, and under nothing of its own front end" {
+  let kept = answers_kept(b"shipped", b"linking", b"answering", b"gathering");
+  assert(string_ends_with(kept, ".answers"));
+  assert_eq(answers_kept(b"shipped", b"linking", b"answering", b"gathering"), kept);
+  assert(answers_kept(b"moved", b"linking", b"answering", b"gathering") != kept);
+  assert(answers_kept(b"shipped", b"moved", b"answering", b"gathering") != kept);
+  assert(answers_kept(b"shipped", b"linking", b"moved", b"gathering") != kept);
+  assert(answers_kept(b"shipped", b"linking", b"answering", b"moved") != kept)
 }
 
-test "a kept pack reads back with its count, and bytes that are not a whole pack read as none" {
-  let p = { answered: 3, pack: packed_with(two_shipped(), b"front", []) };
-  let kept = kept_of(p);
-  assert_eq(unkept(kept), Some(p));
+test "what was kept of a ply's answers reads back, and bytes that are not the whole of it read as none" {
+  let answered = [
+    { path: "answers/records/0a", bytes: b"one" },
+    { path: "answers/standing", bytes: b"" },
+  ];
+  let kept = kept_of(answered);
+  assert_eq(unkept(kept), Some(answered));
   assert_eq(unkept(bytes_slice(kept, 0, bytes_len(kept) - 1)), None);
   assert_eq(unkept(bytes_concat(kept, b"x")), None);
   assert_eq(unkept(b"short"), None)
