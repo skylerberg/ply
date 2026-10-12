@@ -450,7 +450,7 @@ pub unsafe fn hold_raw(o: *mut Obj, at: usize, slot: Slot, w: Word) {
 pub fn raw_slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
     match kind(w) {
         KIND_FLOAT => Some(Slot::Float),
-        KIND_FIXED if layouts.layout.raw_widths && unsafe { (*obj(w)).len } == 1 => {
+        KIND_FIXED if unsafe { (*obj(w)).len } == 1 => {
             Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
         }
         KIND_DECIMAL if layouts.layout.raw_decimals => Some(Slot::Decimal),
@@ -790,18 +790,11 @@ pub struct Layouts {
     pub layout: RecordLayout,
 }
 
-/// How a unit's code reads a record, which the runtime lays out every record it makes as. A unit
-/// emitted by a `ply` before a layout, as a bootstrap's first builder is, reads it the older way.
+/// How a unit's code reads what a layout change moved, which the runtime lays out every value it
+/// makes as. A unit emitted by a `ply` before the change, as a bootstrap's first builder is, reads
+/// it the older way.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecordLayout {
-    /// A record of a record type held in place, rather than by its word.
-    pub in_place: bool,
-    /// A 64-bit width held as its bits, rather than by its word.
-    pub raw_widths: bool,
-    /// An array's records, `Float`s and 64-bit widths held in place, rather than by their words.
-    pub inline_arrays: bool,
-    /// A constructor's arguments held as its declaration types them, rather than by their words.
-    pub ctor_args: bool,
     /// A `Decimal` held as its own two words, rather than by its word.
     pub raw_decimals: bool,
     /// A long slice of a bytes value a view of its bytes, rather than a copy of them.
@@ -811,10 +804,6 @@ pub struct RecordLayout {
 impl RecordLayout {
     /// What this runtime's own emitter writes.
     pub const CURRENT: RecordLayout = RecordLayout {
-        in_place: true,
-        raw_widths: true,
-        inline_arrays: true,
-        ctor_args: true,
         raw_decimals: true,
         bytes_views: true,
     };
@@ -954,12 +943,9 @@ impl Layouts {
             .collect();
     }
 
-    /// The shape constructor `index` lays its arguments out as, where its unit's code reads them so.
+    /// The shape constructor `index` lays its arguments out as, where it holds one by type.
     #[inline]
     pub fn ctor_shape(&self, index: u32) -> Option<u32> {
-        if !self.layout.ctor_args {
-            return None;
-        }
         self.ctor_shapes.get(index as usize).copied().flatten()
     }
 
@@ -1413,7 +1399,7 @@ impl Heap {
                 continue;
             }
             match kind(*w) {
-                KIND_RECORD if layouts.layout.in_place => {
+                KIND_RECORD => {
                     let shape = unsafe { (*obj(*w)).layout };
                     spelled_fields.push(spelled_record(name, &layouts.shape_spelled(shape)));
                     words.push((*w, Slot::Record(shape)));

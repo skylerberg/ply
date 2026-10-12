@@ -366,32 +366,6 @@ fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds(
 }
 
 #[test]
-fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
-    let l = Layouts::of(
-        vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)],
-        &[],
-        RecordLayout {
-            in_place: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let mut h = Heap::new();
-    let value = segment("s", 0.5);
-    let w = h.to_word(&l, &value);
-    let shape = unsafe { (*obj(w)).layout };
-    assert_eq!(l.shape_words(shape), (3, 0));
-    assert!(
-        !l.shape_slots(shape)
-            .iter()
-            .any(|s| matches!(s, Slot::Record(_)))
-    );
-    assert_eq!(Heap::to_value(&l, w), value);
-    let (_into, read) = kept(&l, w);
-    assert_eq!(unsafe { (*obj(read)).layout }, shape);
-    dec(w);
-}
-
-#[test]
 fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is() {
     let l = layouts();
     let mut h = Heap::new();
@@ -469,21 +443,8 @@ fn a_record_holds_a_wide_width_as_its_bits() {
     assert_eq!(kind(offset), KIND_FIXED);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), value);
-    // A unit that holds a width's word in a record has the runtime lay it out so.
-    let words = Layouts::of(
-        vec![],
-        &[],
-        RecordLayout {
-            raw_widths: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let by_word = h.to_word(&words, &value);
-    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
-    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
     dec(w);
     dec(offset);
-    dec(by_word);
 }
 
 #[test]
@@ -546,16 +507,6 @@ fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
     let boxed = ply_codegen::array::element(&mut h, &l, obj(f), 1);
     assert_eq!(kind(boxed), KIND_FLOAT);
     assert_eq!(cmp_words(&l, f, h.to_word(&l, &floats)), Ordering::Equal);
-    let plain = Layouts::of(
-        vec![],
-        &[],
-        RecordLayout {
-            inline_arrays: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let words = h.to_word(&plain, &floats);
-    assert!(!ply_codegen::array::in_place(obj(words)));
     dec(shared);
     dec(boxed);
 }
@@ -591,8 +542,8 @@ fn a_char_is_its_own_word_ordered_and_kept_as_the_char_it_is() {
 }
 
 /// `m.Pair`'s arguments as its declaration types them: a segment in place, then a `Float`.
-fn laid_pair(layout: RecordLayout) -> Layouts {
-    let mut l = Layouts::of(layouts().ctors.clone(), &[], layout);
+fn laid_pair() -> Layouts {
+    let mut l = Layouts::of(layouts().ctors.clone(), &[], RecordLayout::CURRENT);
     l.set_ctor_args(&[
         vec![],
         vec![],
@@ -606,7 +557,7 @@ fn laid_pair(layout: RecordLayout) -> Layouts {
 
 #[test]
 fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
-    let l = laid_pair(RecordLayout::CURRENT);
+    let l = laid_pair();
     let mut h = Heap::new();
     let pair = |x: f64| Value::ctor("m.Pair", vec![segment("s", 0.5), Value::Float(x)]);
     let w = h.to_word(&l, &pair(2.5));
@@ -632,17 +583,8 @@ fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
     assert_eq!(cmp_words(&l, w, later), Ordering::Less);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), pair(2.5));
-    // A unit whose code reads a constructor's words has the runtime lay it out so.
-    let words = laid_pair(RecordLayout {
-        ctor_args: false,
-        ..RecordLayout::CURRENT
-    });
-    let plain = h.to_word(&words, &pair(2.5));
-    assert_eq!(unsafe { (*obj(plain)).len }, 2);
-    assert_eq!(Heap::to_value(&words, plain), pair(2.5));
     dec(w);
     dec(later);
-    dec(plain);
 }
 
 fn decimal(text: &str) -> Value {
