@@ -6,11 +6,14 @@
 
 import std.bin
 import std.hash (blake3)
-import std.bytes (join, hex_of)
+import std.bytes (join)
 import std.list (at, concat, contains, drop, flatten, reverse, sort_by)
+import std.fs
+import std.fs (fs)
 import memo
 import memo (memo, memo_keep, Held, Query, Record, Run, Tally, answer, nothing_held, over_held,
              ran_total, ran_for, started, tallies)
+import memo_files
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
                 Reading, Mention, OwnerRead, OwnerSource, ItemAt, Imported, EntryHead, imported_bin,
@@ -2114,21 +2117,6 @@ pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, Query> / {ab
       }),
   )
 
-/// What names the set of `qs`, each under its hash, in hex: two loads whose queries answer alike
-/// share it.
-pub fn identity_of(qs: Map<Bytes, Query>) -> String / {abort.raise} =
-  hex_of(
-    bytes_slice(
-      blake3(
-        bytes_concat_all(
-          map_fold(qs, [], |acc: List<Bytes>, _: Bytes, q: Query| push(acc, q.hash)),
-        ),
-      ),
-      0,
-      8,
-    ),
-  )
-
 /// The queries, each under its name for a hash: what a run that keeps nothing asks.
 pub fn fresh_registry() -> Map<Bytes, Query> =
   fold(
@@ -2588,50 +2576,136 @@ fn answered_over(
   held: Held,
   sources: List<Source>,
 ) -> { held: Held, run: Run, outcome: AnalysisOutcome, fixing: Fixing, answers: List<Answered> } / {abort.raise} = {
-  let w = world_of(
-    { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
-    [],
-  );
-  let none = |name: Bytes| None;
+  let w = world_alone(sources);
   let done = over_held(
     held,
     |path: String| None,
-    |kind: Bytes, at: Bytes| looked(w, none, none, || [], nothing_embedded, kind, at),
-    || {
-      let qs = fresh_registry();
-      let all = asked_all(qs, w.own, [], false, started(qs));
-      if len(refused_first(all.value.answers)) > 0 {
-        { run: all.run, answers: all.value.answers, fixing: no_fixing() }
-      } else {
-        let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-        { run: fixed.run, answers: all.value.answers, fixing: fixed.value }
-      }
-    },
+    |kind: Bytes, at: Bytes| looked_alone(w, kind, at),
+    || asked_alone(fresh_registry(), w),
   );
-  let answers = done.value.answers;
   {
     held: done.held,
     run: done.value.run,
     fixing: done.value.fixing,
-    answers: answers,
-    outcome: match refused_first(answers) {
-      [] ->
-        analyse_with(
-          parse_all(sources),
-          fold(answers, no_rows(), |acc: Rows, a: Answered| {
-            let r = rows_answered(a.answer);
-            {
-              defs: concat(acc.defs, r.defs),
-              tests: concat(acc.tests, r.tests),
-              types: tables_joined(acc.types, r.types),
-            }
-          }),
-        ),
-      first ->
-        Refused(fold(first, [], |acc: List<Diag>, a: Answered| concat(acc, a.answer.refused))),
-    },
+    answers: done.value.answers,
+    outcome: outcome_of(sources, done.value.answers),
   }
 }
+
+/// The world a load of `sources` and nothing else reads.
+fn world_alone(sources: List<Source>) -> World / {abort.raise} =
+  world_of(
+    { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
+    [],
+  )
+
+/// What `w` holds at a place, for a load that ships and embeds nothing.
+fn looked_alone(w: World, kind: Bytes, at: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let none = |name: Bytes| None;
+  looked(w, none, none, || [], nothing_embedded, kind, at)
+}
+
+/// Each module of `w` asked of `qs` over a run of its own, and hashed where none refuses.
+fn asked_alone(
+  qs: Map<Bytes, Query>,
+  w: World,
+) -> { run: Run, answers: List<Answered>, fixing: Fixing } / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let all = asked_all(qs, w.own, [], false, started(qs));
+  if len(refused_first(all.value.answers)) > 0 {
+    { run: all.run, answers: all.value.answers, fixing: no_fixing() }
+  } else {
+    let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
+    { run: fixed.run, answers: all.value.answers, fixing: fixed.value }
+  }
+}
+
+/// What a load makes of `answers`, what each module of `sources` answered.
+fn outcome_of(sources: List<Source>, answers: List<Answered>) -> AnalysisOutcome / {abort.raise} =
+  match refused_first(answers) {
+    [] ->
+      analyse_with(
+        parse_all(sources),
+        fold(answers, no_rows(), |acc: Rows, a: Answered| {
+          let r = rows_answered(a.answer);
+          {
+            defs: concat(acc.defs, r.defs),
+            tests: concat(acc.tests, r.tests),
+            types: tables_joined(acc.types, r.types),
+          }
+        }),
+      ),
+    first -> Refused(fold(first, [], |acc: List<Diag>, a: Answered| concat(acc, a.answer.refused))),
+  }
+
+/// Who else keeps the store a session's steps are answered through: nobody; a run of the same
+/// step that starts as each step first looks at the world and ends before it; or nobody, each
+/// step answered by a `ply` of other queries than the step before it.
+type Company = | Alone | Raced | Turns
+
+/// `sources` answered as [`answered_over`] answers them, through the memo store kept in `tree`'s
+/// files, as the `nth` step of a session in `company`.
+fn answered_in(
+  tree: fs::MemFs,
+  sources: List<Source>,
+  company: Company,
+  nth: Int,
+) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: Fixing } / {abort.raise} = {
+  let w = world_alone(sources);
+  // A query no module asks: its hash alone tells one `ply` from another.
+  let qs = map_insert(fresh_registry(), b"spare", {
+    name: b"spare",
+    hash: if company == Turns && nth % 2 == 1 { b"odd" } else { b"even" },
+    body: |input: Bytes| input,
+  });
+  let done = fs::on_mem[abs](tree, ||
+    with_cell[raced](company != Raced) { begun ->
+      memo_files::kept[abs](
+        "s",
+        |path: String| None,
+        |kind: Bytes, at: Bytes| {
+          if !cell_get(begun) {
+            cell_set(begun, true);
+            memo_files::kept[abs](
+              "s",
+              |path: String| None,
+              |k: Bytes, a: Bytes| looked_alone(w, k, a),
+              || asked_alone(qs, w).run,
+            );
+            ()
+          };
+          looked_alone(w, kind, at)
+        },
+        || asked_alone(qs, w),
+      )
+    });
+  {
+    tree: done.tree,
+    run: done.value.run,
+    fixing: done.value.fixing,
+    outcome: outcome_of(sources, done.value.answers),
+  }
+}
+
+/// The steps whose answer through the store's files, kept from step to step in `company`, is not
+/// the one the store held in memory answers, which the fresh one is held to above. Alone, a step
+/// also runs the bodies the store in memory runs and no other.
+fn files_apart(steps: List<Step>, company: Company) -> List<Bytes> / {abort.raise} =
+  fold(
+    range(0, len(steps)),
+    { tree: fs::mem_of([]), held: nothing_held(), off: [] },
+    |s: { tree: fs::MemFs, held: Held, off: List<Bytes> }, i: Int| {
+      let step = at(steps, i);
+      let filed = answered_in(s.tree, step.sources, company, i);
+      let held = answered_over(s.held, step.sources);
+      let agrees = said(filed.outcome) == said(held.outcome) && filed.fixing == held.fixing
+        && (company != Alone || ran_total(filed.run) == ran_total(held.run));
+      {
+        tree: filed.tree,
+        held: held.held,
+        off: if agrees { s.off } else { push(s.off, step.what) },
+      }
+    },
+  ).off
 
 // --- Through a session of edits -------------------------------------------------------------
 // Each step is answered through the store the steps before it kept and again from nothing, which must
@@ -3569,6 +3643,19 @@ test "an answer through the store is the fresh one at every step of a drawn sess
       gen::list_of_length(gen::list_of(changes(), 3), steps)),
     |edits: List<List<Change>>| { disagreements(session(edits)) == [] },
     cases: 12,
+  )
+}
+
+test "the store's files answer a drawn session as the store in memory does, whoever else keeps them" {
+  gen::check(
+    gen::and_then(gen::int_between(1, 3), |steps: Int|
+      gen::list_of_length(gen::list_of(changes(), 3), steps)),
+    |edits: List<List<Change>>| {
+      let steps = session(edits);
+      files_apart(steps, Alone) == [] && files_apart(steps, Raced) == []
+        && files_apart(steps, Turns) == []
+    },
+    cases: 4,
   )
 }
 

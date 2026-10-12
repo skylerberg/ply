@@ -132,7 +132,7 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
             }
         }
     }
-    assert!(objects > 1000, "the walk reached {objects} objects");
+    assert!(objects > 900, "the walk reached {objects} objects");
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn weighed(h: &mut Heap, l: &Layouts, name: &str, weight: f64) -> Word {
         Symbol::new("name"),
         spelled(&Symbol::new("weight"), Slot::Float),
     ]);
-    let o = h.alloc(KIND_RECORD, MIXED, 2, shape);
+    let o = h.alloc(KIND_RECORD, MIXED | RAW, 2, shape);
     let s = h.str(name);
     unsafe {
         set_word(o, 0, s);
@@ -262,12 +262,228 @@ fn a_record_of_any_width_holds_every_float_as_its_bits() {
     let w = h.to_word(&l, &value);
     let o = obj(w);
     // Past 64 fields the bitmap after the words takes a second word.
-    assert_eq!(unsafe { (*o).flags }, MIXED);
+    assert_eq!(unsafe { (*o).flags }, MIXED | RAW);
     assert!((0..70).all(|i| unsafe { counted(o, i) } == (i % 2 == 1)));
     assert_eq!(Heap::to_value(&l, w), value);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), value);
     dec(w);
+}
+
+/// `{from: {x, y}, label, to: {x, y}}`, each point two `Float`s.
+fn segment(label: &str, x: f64) -> Value {
+    let point = |x: f64| record(vec![("x", Value::Float(x)), ("y", Value::Float(x + 1.0))]);
+    record(vec![
+        ("from", point(x)),
+        ("label", Value::str(label)),
+        ("to", point(x + 10.0)),
+    ])
+}
+
+#[test]
+fn a_record_holds_a_record_in_place_and_reads_as_the_value_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = segment("s", 0.5);
+    let w = h.to_word(&l, &value);
+    let o = obj(w);
+    let shape = unsafe { (*o).layout };
+    // `from` takes a header's two words and its own two, `label` the fifth, `to` the four after,
+    // and a word of bitmap after them says the fifth alone is counted.
+    assert_eq!(l.shape_words(shape), (9, 1));
+    assert_eq!(&l.shape_offsets(shape)[..], &[0, 4, 5]);
+    assert_eq!(unsafe { (*o).flags }, MIXED | RAW);
+    assert!((0..9).all(|i| unsafe { counted(o, i) } == (i == 4)));
+    assert_eq!(Heap::to_value(&l, w), value);
+    let same = h.to_word(&l, &segment("s", 0.5));
+    assert_eq!(cmp_words(&l, w, same), Ordering::Equal);
+    let later = h.to_word(&l, &segment("s", 0.75));
+    assert_eq!(cmp_words(&l, w, later), Ordering::Less);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), value);
+    assert_eq!(unsafe { (*obj(read)).layout }, shape);
+    dec(w);
+    dec(same);
+    dec(later);
+}
+
+#[test]
+fn a_record_held_in_place_is_counted_by_the_record_holding_it() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let label = h.str("held");
+    inc(label);
+    let inner = h.record(&l, &[(Symbol::new("label"), label)]);
+    let outer = h.record(
+        &l,
+        &[
+            (Symbol::new("count"), imm(1)),
+            (Symbol::new("inner"), inner),
+        ],
+    );
+    // The inner record was copied in and let go: the string is held by this test and by the copy.
+    assert_eq!(unsafe { (*obj(label)).rc }, 2);
+    let shape = unsafe { (*obj(outer)).layout };
+    let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
+    let held = field_word(&mut h, obj(outer), at, l.slot_at(shape, at));
+    // A read of it is the holder's own words, which the holder counts for, and an object a stack
+    // scan finds.
+    assert_eq!(unsafe { (*obj(outer)).rc }, 2);
+    assert!(h.is_object(held));
+    assert_eq!(
+        Heap::to_value(&l, held),
+        record(vec![("label", Value::str("held"))])
+    );
+    assert!(share(&[held]));
+    assert_ne!(unsafe { (*obj(outer)).rc } & SHARED, 0);
+    dec(outer);
+    assert_eq!(unsafe { (*obj(label)).rc } & !SHARED, 2);
+    // The last holder lets the string go once, through the copy.
+    dec(held);
+    assert_eq!(unsafe { (*obj(label)).rc } & !SHARED, 1);
+}
+
+#[test]
+fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let mut fields: Vec<(&str, Value)> = (0..1100)
+        .map(|i| {
+            let name: &'static str = Box::leak(format!("f{i:04}").into_boxed_str());
+            (name, Value::Int(i))
+        })
+        .collect();
+    fields.push(("inner", record(vec![("label", Value::str("deep"))])));
+    let value = record(fields);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
+    let inner = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    assert!(h.is_object(inner));
+    assert_eq!(Heap::to_value(&l, w), value);
+    dec(inner);
+    dec(w);
+}
+
+#[test]
+fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
+    let l = Layouts::of(
+        vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)],
+        &[],
+        RecordLayout {
+            in_place: false,
+            raw_widths: true,
+        },
+    );
+    let mut h = Heap::new();
+    let value = segment("s", 0.5);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    assert_eq!(l.shape_words(shape), (3, 0));
+    assert!(
+        !l.shape_slots(shape)
+            .iter()
+            .any(|s| matches!(s, Slot::Record(_)))
+    );
+    assert_eq!(Heap::to_value(&l, w), value);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(unsafe { (*obj(read)).layout }, shape);
+    dec(w);
+}
+
+#[test]
+fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let wides = [
+        Value::Fixed(Fixed::new(IntTy::U64, 7)),
+        Value::Fixed(Fixed::new(IntTy::U64, 1 << 63)),
+        Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+    ];
+    let signed = [
+        Value::Fixed(Fixed::of(IntTy::I64, i128::from(i64::MIN)).expect("an i64")),
+        Value::Fixed(Fixed::of(IntTy::I64, -1).expect("an i64")),
+        Value::Fixed(Fixed::of(IntTy::I64, 5).expect("an i64")),
+    ];
+    for values in [&wides[..], &signed[..]] {
+        let words: Vec<Word> = values.iter().map(|v| h.to_word(&l, v)).collect();
+        for (w, v) in words.iter().zip(values) {
+            assert_eq!(kind(*w), KIND_FIXED);
+            assert!(native_key(*w));
+            assert_eq!(Heap::to_value(&l, *w), *v);
+            let (_into, read) = kept(&l, *w);
+            assert_eq!(Heap::to_value(&l, read), *v);
+        }
+        // Listed in ascending order, which for `U64` past 2^63 and for a negative `I64` is not
+        // the order of the bits read as an `Int`.
+        for pair in words.windows(2) {
+            assert_eq!(cmp_words(&l, pair[0], pair[1]), Ordering::Less);
+        }
+    }
+    let widest = Value::Fixed(Fixed::new(IntTy::U128, u128::MAX - 3));
+    let w = h.to_word(&l, &widest);
+    assert_eq!(kind(w), KIND_FIXED);
+    assert_eq!(Heap::to_value(&l, kept(&l, w).1), widest);
+}
+
+#[test]
+fn a_wide_width_a_store_bridged_reads_back_as_the_width_s_own_object() {
+    // A bridge holding the width is what a `ply` that bridged 64-bit widths stored.
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = Value::Fixed(Fixed::new(IntTy::U64, 1 << 63));
+    let bridged = h.bridge(value.clone());
+    let (_into, read) = kept(&l, bridged);
+    assert_eq!(kind(read), KIND_FIXED);
+    assert_eq!(Heap::to_value(&l, read), value);
+}
+
+#[test]
+fn a_record_holds_a_wide_width_as_its_bits() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = record(vec![
+        (
+            "count",
+            Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+        ),
+        ("label", Value::str("w")),
+        (
+            "offset",
+            Value::Fixed(Fixed::of(IntTy::I64, -9).expect("an i64")),
+        ),
+    ]);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    assert_eq!(
+        l.shape_spelled(shape)
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect::<Vec<_>>(),
+        ["count!u64", "label", "offset!i64"]
+    );
+    assert!((0..3).all(|i| unsafe { counted(obj(w), i) } == (i == 1)));
+    assert_eq!(Heap::to_value(&l, w), value);
+    let at = l.offset(shape, &Symbol::new("offset")).expect("the field");
+    let offset = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    assert_eq!(kind(offset), KIND_FIXED);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), value);
+    // A unit that holds a width's word in a record has the runtime lay it out so.
+    let words = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            in_place: true,
+            raw_widths: false,
+        },
+    );
+    let by_word = h.to_word(&words, &value);
+    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
+    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
+    dec(w);
+    dec(offset);
+    dec(by_word);
 }
 
 #[test]

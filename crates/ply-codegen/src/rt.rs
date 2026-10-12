@@ -174,12 +174,23 @@ impl Tables {
         }
         let o = obj(w);
         let parts: Vec<(Word, &Value)> = match v {
-            Value::Record(fields) => fields
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| unsafe { heap::counted(o, *i) })
-                .map(|(i, (_, part))| (unsafe { word_at(o, i) }, part))
-                .collect(),
+            // A `Float` held as its bits is no word of its own.
+            Value::Record(fields) => {
+                let shape = unsafe { (*o).layout };
+                let slots = self.layouts.shape_slots(shape);
+                let offsets = self.layouts.shape_offsets(shape);
+                fields
+                    .iter()
+                    .zip(slots.iter().zip(offsets.iter()))
+                    .filter_map(|((_, part), (slot, at))| match slot {
+                        heap::Slot::Word => Some((unsafe { word_at(o, *at) }, part)),
+                        heap::Slot::Record(_) => {
+                            Some((unsafe { heap::words(o).add(*at) } as Word, part))
+                        }
+                        heap::Slot::Float | heap::Slot::Wide(_) => None,
+                    })
+                    .collect()
+            }
             Value::Ctor { args, .. } => args
                 .iter()
                 .enumerate()
@@ -1432,6 +1443,42 @@ pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i6
         Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&vals[1]) => raise_error(ctx, d),
         Err(d) => ctx.fail(d),
     }
+}
+
+/// `rt_binary` over two 64-bit widths' bits, the width at `t` in [`ply_eval::INT_TYPES`]: the
+/// answer's bits, or a `Bool`'s 1 or 0, raised as the evaluator raises.
+pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, b: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (Some(op), Some(ty)) = (
+        usize::try_from(op)
+            .ok()
+            .and_then(|i| BINOPS.get(i).copied()),
+        usize::try_from(t)
+            .ok()
+            .and_then(|i| ply_eval::INT_TYPES.get(i).copied()),
+    ) else {
+        return ctx.fail(error("an operator this runtime has no code for"));
+    };
+    let of = |w: i64| Value::Fixed(ply_eval::Fixed::new(ty, w as u64 as u128));
+    let (x, y) = (of(a), of(b));
+    match ply_eval::strict_binary(op, &x, &y, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
+        Ok(Value::Fixed(f)) => f.bits() as u64 as i64,
+        Ok(Value::Bool(b)) => i64::from(b),
+        Ok(other) => ctx.fail(error(format!(
+            "a width's operator answered {}",
+            other.type_name()
+        ))),
+        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&y) => raise_error(ctx, d),
+        Err(d) => ctx.fail(d),
+    }
+}
+
+/// The object of a 64-bit width, the width at `t` in [`ply_eval::INT_TYPES`], holding `bits`.
+pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let ty = ply_eval::INT_TYPES[t as usize];
+    ctx.heap
+        .boxed_fixed(ply_eval::Fixed::new(ty, bits as u64 as u128))
 }
 
 /// A divisor `/` and `%` raise on rather than overflow.
@@ -2848,29 +2895,37 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
             // Any other entry shape is the value builtins' to raise on.
-            let mut pairs = Vec::with_capacity(n);
-            for e in entries {
-                if heap::kind(e) != KIND_RECORD
-                    || tables.layouts.holds_floats(unsafe { (*obj(e)).layout })
-                {
-                    return None;
+            let mut pairs: Vec<(Word, Word)> = Vec::with_capacity(n);
+            let let_go = |pairs: Vec<(Word, Word)>| {
+                for (k, v) in pairs {
+                    heap::dec(k);
+                    heap::dec(v);
                 }
-                let shape = unsafe { (*obj(e)).layout };
-                let (Some(ka), Some(va)) = (
-                    tables.layouts.offset(shape, &key),
-                    tables.layouts.offset(shape, &value),
-                ) else {
+            };
+            for e in entries {
+                let layouts = &tables.layouts;
+                let at = (heap::kind(e) == KIND_RECORD)
+                    .then(|| {
+                        let shape = unsafe { (*obj(e)).layout };
+                        Some((
+                            layouts.offset(shape, &key)?,
+                            layouts.offset(shape, &value)?,
+                            shape,
+                        ))
+                    })
+                    .flatten();
+                let Some((ka, va, shape)) = at else {
+                    let_go(pairs);
                     return None;
                 };
-                let (k, v) = unsafe { (word_at(obj(e), ka), word_at(obj(e), va)) };
+                let k = heap::field_word(&mut ctx.heap, obj(e), ka, layouts.slot_at(shape, ka));
                 if !heap::native_key(k) {
+                    heap::dec(k);
+                    let_go(pairs);
                     return None;
                 }
+                let v = heap::field_word(&mut ctx.heap, obj(e), va, layouts.slot_at(shape, va));
                 pairs.push((k, v));
-            }
-            for (k, v) in &pairs {
-                heap::inc(*k);
-                heap::inc(*v);
             }
             // Entries in key order, each key once, are the tree's leaves as they stand.
             let ascending = pairs.windows(2).all(|w| {
@@ -4366,14 +4421,13 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
         ));
         return ctx.fail(d);
     };
-    if ctx.tables.layouts.shape_slots(shape)[at] == heap::Slot::Float {
-        let f = ctx
-            .heap
-            .boxed_float(f64::from_bits(unsafe { word_at(o, at) } as u64));
+    let slot = ctx.tables.layouts.slot_at(shape, at);
+    if slot != heap::Slot::Word {
+        let w = heap::field_word(&mut ctx.heap, o, at, slot);
         if own == 1 || own == 3 {
             heap::dec(base);
         }
-        return f;
+        return w;
     }
     let w = unsafe { word_at(o, at) };
     match own {
@@ -4418,11 +4472,19 @@ pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64
 }
 
 /// Whether a value is a record a pattern admits: of exactly `len` fields when `exact`. Reads.
-pub unsafe extern "C" fn rt_record_fits(_ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
+pub unsafe extern "C" fn rt_record_fits(ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
     if heap::kind(value) != KIND_RECORD {
         return 0;
     }
-    i64::from(exact == 0 || unsafe { (*obj(value)).len } as i64 == len)
+    let ctx = unsafe { &*ctx };
+    i64::from(
+        exact == 0
+            || ctx
+                .tables
+                .layouts
+                .shape_fields(unsafe { (*obj(value)).layout }) as i64
+                == len,
+    )
 }
 
 /// Whether a record holds the field a pattern names; a missing one fails the match. Reads.
