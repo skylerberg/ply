@@ -17,23 +17,19 @@
 #       prints each run whole as it ends, so the log of a job stopped short shows every run it
 #       finished.
 #
-#   Every `ply` the partition, desk and lone runs start is stopped at PLY_CI_DEADLINE, the epoch
+#   Every `ply` the partition and lone runs start is stopped at PLY_CI_DEADLINE, the epoch
 #   second the job set its runs to end by, and none starts after it: the job then fails naming the
 #   runs it stopped and the ones it never started, and the steps after it still keep what the runs
 #   wrote, so a re-run starts from there rather than cold.
-#   ci-corpus.sh desks K TIMINGS CUT [ARG...]
-#       the desk runs runner K takes (`ci-shards.sh desks-for-runner K CUT`, round robin when CUT is
-#       empty) in one `ply test` with the desk's grants and ARGs added, their milliseconds onto
-#       TIMINGS as a partition's
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test` or `ply prove`
 #   ci-corpus.sh sweep [ARG...]        the edit sweep (`edit_sweep` of the CLI's suite) with the suite's
 #                                      grants: the cases its `--filter`s name, or else, with ARGs such as
 #                                      `--shard K/N` added, every case
 #   ci-corpus.sh select [CUT]
 #       the jobs a run has to start, as `KEY=VALUE` lines for the workflow's outputs: `partitions`
-#       and `corpus`, the matrices of the partitions, desk runners and runs alone holding a run no
+#       and `corpus`, the matrices of the partitions and of the runs alone holding a run no
 #       kept answer stands for, and `lanes` and `solo`, whether either holds one. Every `ply test`
-#       is the one `partition`, `desks` or `run` starts, asked only what an earlier run kept
+#       is the one `partition` or `run` starts, asked only what an earlier run kept
 #       (`--kept`), so a job none of whose runs has work is never started. No kept answer stands for
 #       a proof run.
 #   ci-corpus.sh mark                  the moment `keep` gathers from
@@ -99,11 +95,6 @@ cli_grants=(--host --timeout 900000 --steps 0 --json
   --fs cwd=. --fs abs=/ --fs "repo=$root"
   --allow machine --allow tester --allow claims --allow hosts
   --allow shipped --allow toolchain)
-
-# What a desk run is given beside the checks' grants: the floors the served tables are compared with,
-# built where the workflow builds them, and the database the desk's schema is in.
-desk_grants=(--exec "http_floor=$root/target/http-floor" --exec "pg_floor=$root/target/pg-floor"
-  --set CORPUS_DB=postgres://postgres@127.0.0.1:5432/desk)
 
 # What every `ply test` a lane starts is also asked: `select` asks only what an earlier run kept,
 # and takes each run's exit code as its answer.
@@ -712,33 +703,13 @@ case "${1:-}" in
     rm -rf "$work"
     exit "$failed"
     ;;
-  desks)
-    k=${2:?a desk runner}
-    timings=${3:?a file for the durations}
-    [ $# -ge 4 ] || { echo "usage: ci-corpus.sh desks K TIMINGS CUT [ARG...], CUT empty for none" >&2; exit 2; }
-    taken=$("$shards" desks-for-runner "$k" "$4") || exit 2
-    shift 4
-    : > "$timings"
-    : > "$durations"
-    if [ -z "$taken" ]; then
-      echo "desk runner $k takes no run: there are more runners than desk tests"
-      exit 0
-    fi
-    read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
-    echo "::group::corpus desks ${runs[*]}"
-    failed=0
-    run_modules "$timings" "${runs[@]}" -- "${desk_grants[@]}" "$@" || failed=1
-    echo "::endgroup::"
-    exit "$failed"
-    ;;
   select)
     cut=${2:-}
     selecting=1
     asked=(--kept)
     work=$(mktemp -d)
     : > "$durations"
-    # Each partition's lanes as `partition` runs them, each desk runner's runs as `desks` does and
-    # each run alone as `run` does, all at once.
+    # Each partition's lanes as `partition` runs them and each run alone as `run` does, all at once.
     pids=()
     asking=()
     for k in $(jq -r '.include[].shard' <<< "$("$shards" partitions)"); do
@@ -753,15 +724,7 @@ case "${1:-}" in
       asking+=("partition $k")
     done
     for id in $(jq -r '.include[].id' <<< "$("$shards" corpus-matrix)"); do
-      case "$id" in
-        desks-*)
-          taken=$("$shards" desks-for-runner "${id#desks-}" "$cut") || exit 2
-          [ -n "$taken" ] || { echo "$id: takes no run" >&2; continue; }
-          read -ra runs <<< "$(tr '\n' ' ' <<< "$taken")"
-          run_modules "$work/$id.tsv" "${runs[@]}" -- "${desk_grants[@]}" --kept > /dev/null 2>&1 &
-          ;;
-        *) run_one "" "$id" --kept > /dev/null 2>&1 & ;;
-      esac
+      run_one "" "$id" --kept > /dev/null 2>&1 &
       pids+=("$!")
       asking+=("$id")
     done
@@ -884,7 +847,7 @@ case "${1:-}" in
     self_test
     ;;
   *)
-    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | desks K TIMINGS CUT [ARG...] | run ID [ARG...] | select [CUT] | mark | keep DIR | pack DIR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR | --self-test" >&2
+    echo "usage: ci-corpus.sh partition K TIMINGS [CUT] | run ID [ARG...] | select [CUT] | mark | keep DIR | pack DIR | unpack DIR C | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR | --self-test" >&2
     exit 2
     ;;
 esac
