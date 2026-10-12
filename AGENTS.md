@@ -51,8 +51,8 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   runs, each one `ply test` of a package, and the jobs that take them.
 - `ply bootstrap` builds the builder (`crates/ply-compiler/ply`'s `build.main`) with the `ply` that
   runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
-  `ply` that made, which takes the builder and the pack the first kept unless the definitions that
-  make them moved. So only the compiler and the shipped modules it imports (`grep '^import std'
+  `ply` that made, which takes the builder and the shipped modules' answers the first kept unless
+  the definitions that make them moved. So only the compiler and the shipped modules it imports (`grep '^import std'
   crates/ply-compiler/ply/*.ply` and what those import) cannot use a language rule the same pull
   request introduces. The rest of `crates/ply-std/ply` can, and so can
   `crates/ply-compiler/prelude.ply`, which declares the builtins: the compiler embeds its text and
