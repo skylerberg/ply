@@ -12,6 +12,7 @@ import product
 import std.json (Json, Str, Object, object, array)
 import std.json
 import std.fs (fs)
+import std.list (flatten)
 import std.process (process)
 import std.config (config)
 import std.time (time)
@@ -52,7 +53,8 @@ pub fn members(
 
 // --- Measuring one --------------------------------------------------------------------------
 
-/// `ply check` on a tree: the front end's own numbers, its verdict, and the wall the user waits.
+/// `ply check` on a tree: its verdict, what it lists, the wall the user waits, and what its report
+/// says of the front end.
 pub fn check(
   dir: String,
 ) -> Result<List<Measurement>, String> / {process.spawn[ply], config.get[env], time.elapsed_ms, abort.raise} = {
@@ -61,27 +63,36 @@ pub fn check(
   let wall = time.elapsed_ms() - started;
   match product::document(done) {
     Err(why) -> Err(why),
-    Ok(Object(m)) ->
-      Ok([
-        number("ok", report::one_if(product::bool_field(m, "ok")), ""),
-        number("wall", wall, "ms"),
-        number(
-          "front",
-          match product::field(m, "front_end") {
-            Ok(fe) -> match product::field(fe, "phases") {
-              Ok(phases) -> product::int_field(phases, "total"),
-              Err(_) -> 0,
-            },
-            Err(_) -> 0,
-          },
-          "ms",
-        ),
-        number("modules", len(product::array_field(m, "modules")), "modules"),
-        number("definitions", len(product::array_field(m, "definitions")), "definitions"),
-        number("tests", len(product::array_field(m, "tests")), "tests"),
-      ]),
+    Ok(Object(m)) -> Ok(checked_of(m, wall)),
     _ -> Err("the check report is not an object"),
   }
+}
+
+/// What a check's report measures, beside the `wall` it took. `front` is the front end's own time,
+/// and is there only for a check that ran one: a check that took a kept answer back says `reused`
+/// and reports no phase.
+fn checked_of(m: Map<String, Json>, wall: Int) -> List<Measurement> = {
+  let front_end = match product::field(m, "front_end") { Ok(fe) -> fe, Err(_) -> map_new() };
+  let front = match product::field(front_end, "phases") {
+    Ok(phases) -> match product::opt_int_field(phases, "total") {
+      Some(ms) -> [number("front", ms, "ms")],
+      None -> [],
+    },
+    Err(_) -> [],
+  };
+  flatten([
+    [
+      number("ok", report::one_if(product::bool_field(m, "ok")), ""),
+      number("wall", wall, "ms"),
+      number("reused", report::one_if(product::bool_field(front_end, "reused")), ""),
+    ],
+    front,
+    [
+      number("modules", len(product::array_field(m, "modules")), "modules"),
+      number("definitions", len(product::array_field(m, "definitions")), "definitions"),
+      number("tests", len(product::array_field(m, "tests")), "tests"),
+    ],
+  ])
 }
 
 /// `ply test` on a tree: the suite's own verdict, and the wall.
@@ -172,6 +183,27 @@ fn member_json(m: Member) -> Json =
 // --- Tests -----------------------------------------------------------------------------
 
 fn a_member() -> Member = { name: "compiler", dir: ".", trees: ["."], digest: "b3:abc123" }
+
+test "a check that took its answer back measures no front end, and one that ran measures its own" {
+  let ran = "{\"ok\":true,\"front_end\":{\"reused\":false,\"phases\":{\"total\":33}},\"tests\":[{},{}]}";
+  let kept = "{\"ok\":true,\"front_end\":{\"reused\":true,\"key\":\"1f\"},\"tests\":[{},{}]}";
+  match ((json::parse_string(ran), json::parse_string(kept))) {
+    (Ok(Object(r)), Ok(Object(k))) -> {
+      let now = checked_of(r, 40);
+      let back = checked_of(k, 2);
+      assert_eq((report::value_of(now, "front"), report::value_of(now, "reused")), (
+        Some(33m),
+        Some(0m),
+      ));
+      assert_eq((report::value_of(back, "front"), report::value_of(back, "reused")), (
+        None,
+        Some(1m),
+      ));
+      assert_eq(report::value_of(back, "tests"), Some(2m))
+    },
+    _ -> panic("the reports are JSON objects"),
+  }
+}
 
 test "a member's check fails with the verdict the product gave" {
   let refused = [number("ok", 0, ""), number("wall", 1, "ms")];
