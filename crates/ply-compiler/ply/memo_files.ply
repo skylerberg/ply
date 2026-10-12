@@ -19,8 +19,8 @@
 //! while each is at most twice what follows it, so a store is a handful of segments and a byte is
 //! written again only as what follows it doubles. Writing all of them again keeps the records of
 //! the queries the run answers under and, of the queries only other `ply`s answer under, those most
-//! lately answered under, while they hold no more than twice what the run's own hold: a store
-//! several `ply`s share holds the few at work, and what only the dropped records named goes too.
+//! lately answered under, while they hold no more than the run's own hold: a store two `ply`s
+//! take turns on holds both, and what only the dropped records named goes too.
 
 import std.bin
 import std.fs
@@ -115,14 +115,11 @@ fn row_from(b: Bytes) -> Row / {abort.raise} = {
 
 /// The key an answer is found under: its digest without the byte every digest of an answer leads
 /// with.
-fn answer_key(digest: Bytes) -> Option<Bytes> / {abort.raise} =
+fn answer_key(digest: Bytes) -> Option<Bytes> =
   if bytes_len(digest) == 33 { Some(bytes_slice(digest, 1, 33)) } else { None }
 
 /// The digest of the answer kept under `key`.
 fn answer_digest(key: Bytes) -> Bytes = bytes_concat(b"=", key)
-
-/// What a query's hash is named by in a segment's queries.
-fn query_id(query: Bytes) -> Bytes = bytes_blake3(query)
 
 /// Where a frame lies in the segment `token` names, and how long its payload is.
 type Found = { token: Bytes, offset: Int, size: Int }
@@ -445,7 +442,7 @@ fn places_of<[r]>(
   }
 
 /// The bytes of the keys `bytes` lists, each once.
-fn keys_in(bytes: Bytes) -> List<Bytes> / {abort.raise} =
+fn keys_in(bytes: Bytes) -> List<Bytes> =
   map_keys(
     fold(range(0, bytes_len(bytes) / 32), map_new(), |acc: Map<Bytes, Bool>, i: Int|
       map_insert(acc, bytes_slice(bytes, i * 32, i * 32 + 32), true)),
@@ -708,7 +705,7 @@ fn carry_bound() -> Int = 16777216
 /// Which queries' records a rewrite of a whole store keeps, each query by its name in the store:
 /// those of `Only` and no other; or those of `Near`, the queries of the run that writes, and of
 /// the others the most lately answered under, while their records and the longer answers those
-/// name hold no more than twice what the run's own hold.
+/// name hold no more than the run's own hold.
 type Keeping = | Only(Map<Bytes, Bool>) | Near(Map<Bytes, Bool>)
 
 /// A query other than the writing run's, what its records hold and when it was last answered under.
@@ -849,7 +846,7 @@ fn living(
       );
       fold(
         others,
-        { live: own, room: 2 * mine },
+        { live: own, room: mine },
         |acc: { live: Map<Bytes, Bool>, room: Int }, x: Other|
           if x.bytes <= acc.room {
             { live: map_insert(acc.live, x.query, true), room: acc.room - x.bytes }
@@ -1251,7 +1248,7 @@ pub fn kept<a, [r] | e>(
             out: segments::appended_when_full[r](dir, shapes(), token, o3.out),
             mine: map_insert(o3.mine, key, {
               answer: name,
-              query: query_id(rec.query),
+              query: bytes_blake3(rec.query),
               seen: o3.now,
               height: if was > rec.height { was } else { rec.height },
               frame: Some({ offset: f.at, size: bytes_len(bytes) }),
@@ -1302,22 +1299,22 @@ pub fn kept<a, [r] | e>(
                 None -> if map_contains(o.unread, name) { { open: o, at: None } }
                 else { answer_row[r](dir, o, name) },
               };
-              match lies.at {
+              let read = match lies.at {
                 Some(at) -> match frame_of[r](dir, token, lies.open, at) {
-                  Some(a) -> {
-                    cell_set(st, holding(lies.open, name, a));
-                    Some(a)
-                  },
-                  None -> {
-                    cell_set(st, { ..lies.open, unread: map_insert(lies.open.unread, name, true) });
-                    beside(output_path(digest))
-                  },
+                  Some(a) -> { open: lies.open, answer: Some(a) },
+                  None ->
+                    {
+                      open: { ..lies.open, unread: map_insert(lies.open.unread, name, true) },
+                      answer: beside(output_path(digest)),
+                    },
                 },
-                None -> {
-                  cell_set(st, lies.open);
-                  beside(output_path(digest))
-                },
-              }
+                None -> { open: lies.open, answer: beside(output_path(digest)) },
+              };
+              cell_set(st, match read.answer {
+                Some(a) -> holding(read.open, name, a),
+                None -> read.open,
+              });
+              read.answer
             },
           },
         },
@@ -1418,12 +1415,17 @@ pub fn kept<a, [r] | e>(
           ..o,
           known: map_new(),
           own: fold(queries, map_new(), |own: Map<Bytes, Bool>, q: Bytes|
-            map_insert(own, query_id(q), true)),
+            map_insert(own, bytes_blake3(q), true)),
           stamp: match pack {
             Some(b) -> bytes_blake3(bytes_concat_all([named, b"\x00", b])),
             None -> stamp_of(named),
           },
         })
+      },
+      memo_keep.vouches() -> {
+        let o = cell_get(st);
+        fold(o.manifest.segments, false, |any: Bool, seg: Segment|
+          any || (!segments::below_floor(o.manifest, seg) && contains(seg.stamps, o.stamp)))
       },
     };
     match run { Some(path) -> committed[r](dir, path, token, cell_get(st)), None -> () };
@@ -1609,7 +1611,7 @@ pub fn compacted<[r]>(
 ) -> Compacted / {fs.read[r], fs.write[r], abort.raise} = {
   let run = segments::entered[r](dir);
   let kept = fold(queries, map_new(), |acc: Map<Bytes, Bool>, q: Bytes|
-    map_insert(acc, query_id(q), true));
+    map_insert(acc, bytes_blake3(q), true));
   let done = match run {
     None -> None,
     Some(path) -> {
@@ -1633,7 +1635,7 @@ fn quoted(input: Bytes) -> Bytes / {memo.read} =
   bytes_concat_all([b"\"", memo.ask(b"text", input), b"\""])
 
 /// The queries of the tests, and one nothing asks, whose hash alone tells two stamps apart.
-fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query> =
+fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
   map_insert(
     map_insert(
       map_insert(map_new(), b"text", { name: b"text", hash: b"t1", body: text_of }),
@@ -1707,6 +1709,23 @@ test "a record another stamp kept is checked before it is taken, and no body run
   let forth = fs::on_mem[abs](back.tree, || quoted_under[abs](b"four", two));
   assert_eq(forth.value.ran, 0);
   assert_eq(forth.tree.files, other.tree.files)
+}
+
+test "a store vouches to a run of a stamp that kept or checked in it, and to no other" {
+  let vouched_under = |tree: fs::MemFs, spare: Bytes| {
+    let queries = test_queries(spare);
+    fs::on_mem[abs](tree, ||
+      kept[abs]("s", |_: String| None, |_: Bytes, _: Bytes| Some(b"four"), ||
+        memo::vouched_to(answer(queries, started(queries), b"quoted", b"a").run)))
+  };
+  let first = vouched_under(fs::mem_of([]), b"one");
+  assert(!first.value);
+  assert(vouched_under(first.tree, b"one").value);
+  let other = vouched_under(first.tree, b"two");
+  assert(!other.value);
+  // Having checked what the first kept, the second is vouched to as well.
+  assert(vouched_under(other.tree, b"two").value);
+  assert(vouched_under(other.tree, b"one").value)
 }
 
 test "a run under queries a store never saw writes nothing until it asks" {
@@ -1795,18 +1814,18 @@ fn quoted_tagged<[r]>(tag: Bytes) -> Int / {fs.read[r], fs.write[r], abort.raise
     memo::ran_total(answer(queries, started(queries), b"quoted", b"a").run))
 }
 
-test "a store several `ply`s keep holds the latest of them, to twice what the one writing holds" {
+test "a store several `ply`s keep holds the one writing and as much again of the latest others" {
   let after = |tree: fs::MemFs, tag: Bytes| fs::on_mem[abs](tree, || quoted_tagged[abs](tag));
   let four = fold([b"a", b"b", b"c", b"d"], fs::mem_of([]), |tree: fs::MemFs, tag: Bytes| {
     let ran = after(tree, tag);
     assert_eq(ran.value, 2);
     ran.tree
   });
-  // The last three are held. The first went as the fourth wrote the store again: it was the
-  // longest unasked, past twice what the fourth's own records hold.
+  // The last two are held. The others went as the store was written again: each was the longest
+  // unasked, past what the writer's own records hold.
   assert_eq(after(four, b"d").value, 0);
   assert_eq(after(four, b"c").value, 0);
-  assert_eq(after(four, b"b").value, 0);
+  assert_eq(after(four, b"b").value, 2);
   assert_eq(after(four, b"a").value, 2)
 }
 

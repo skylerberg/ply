@@ -113,15 +113,9 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     } = exports;
     bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
-    let Some(unit) = UnitTables::from_tables(
-        ctors.clone(),
-        consts,
-        fields,
-        builtins,
-        shapes,
-        lambdas,
-        layout,
-    ) else {
+    let Some(unit) =
+        UnitTables::from_tables(ctors, consts, fields, builtins, shapes, lambdas, layout)
+    else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
     let constants = constants_of(&constants, &taken, &unit)?;
@@ -159,7 +153,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     if roots.windows(2).any(|w| w[0].id == w[1].id) {
         bail!("two roots of this unit share a site id");
     }
-    let mut tables = tables_of(unit, &ctors);
+    let mut tables = tables_of(unit);
     let taking = |function: &str, takes: usize| match (function, entries.get(function)) {
         ("-", _) => Ok(Stated::No),
         (_, None) => Ok(Stated::Absent),
@@ -169,7 +163,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         ),
     };
     let by = |function: &str| taking(function, 1);
-    let mut stated = vec![(Stated::No, Stated::No); ctors.len()];
+    let mut stated = vec![(Stated::No, Stated::No); tables.layouts.ctors.len()];
     for (ctor, key, show) in &instances {
         let Some(index) = tables.layouts.ctor_index(ctor) else {
             bail!("the unit states a `key` or a `show` of `{ctor}`, which it does not hold");
@@ -177,7 +171,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         stated[index as usize] = (by(key)?, by(show)?);
     }
     tables.layouts.state(stated);
-    let mut stated = vec![[Stated::No; 5]; ctors.len()];
+    let mut stated = vec![[Stated::No; 5]; tables.layouts.ctors.len()];
     for (ctor, functions) in &numerics {
         let Some(index) = tables.layouts.ctor_index(ctor) else {
             bail!("the unit states a `numeric` of `{ctor}`, which it does not hold");
@@ -265,15 +259,15 @@ fn bind(lib: &Library, helpers: &[*mut std::ffi::c_void]) -> Result<()> {
     Ok(())
 }
 
-fn tables_of(mut unit: UnitTables, ctors: &[(Symbol, usize)]) -> Tables {
+fn tables_of(mut unit: UnitTables) -> Tables {
     unit.layouts.index_fields(&unit.fields);
     let mut immortals = Heap::persistent();
     let mut const_words = Vec::with_capacity(unit.consts.len());
     for v in &unit.consts {
         const_words.push(immortals.immortal(&unit.layouts, v));
     }
-    let mut nullaries = Vec::with_capacity(ctors.len());
-    for (index, (_, arity)) in ctors.iter().enumerate() {
+    let mut nullaries = Vec::with_capacity(unit.layouts.ctors.len());
+    for (index, (_, arity)) in unit.layouts.ctors.iter().enumerate() {
         let w = if *arity == 0 {
             let w = immortals.alloc(crate::heap::KIND_CTOR, 0, 0, index as u32) as Word;
             mark_immortal(w);

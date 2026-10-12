@@ -442,9 +442,9 @@ fn snapshot(entries: &[(&str, &str, bool)]) -> Snapshot {
 #[test]
 fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
     let before = snapshot(&[
-        ("DESK_REGION", "eu", false),
-        ("DESK_PORT", "8137", false),
-        ("DESK_API_KEY", "hunter2", true),
+        ("SERVICE_REGION", "eu", false),
+        ("SERVICE_PORT", "8137", false),
+        ("SERVICE_API_KEY", "hunter2", true),
     ]);
     let shared = Arc::new(before.clone());
 
@@ -453,10 +453,10 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
             let shared = Arc::clone(&shared);
             scope.spawn(move || {
                 for _ in 0..100 {
-                    assert_eq!(shared.get("DESK_REGION"), Some("eu"));
-                    assert_eq!(shared.get("DESK_PORT"), Some("8137"));
+                    assert_eq!(shared.get("SERVICE_REGION"), Some("eu"));
+                    assert_eq!(shared.get("SERVICE_PORT"), Some("8137"));
                     // The `SSecret` gate: `config.get` answers `None` whatever the sources hold.
-                    assert_eq!(shared.get("DESK_API_KEY"), None);
+                    assert_eq!(shared.get("SERVICE_API_KEY"), None);
                     assert_eq!(shared.get("NOTHING_SUPPLIED"), None);
                 }
             });
@@ -472,14 +472,14 @@ fn every_entry_point_reads_one_configuration_and_none_can_move_it() {
 
 #[test]
 fn two_snapshots_in_one_process_do_not_see_each_other() {
-    let one = snapshot(&[("DESK_REGION", "eu", false)]);
-    let two = snapshot(&[("DESK_REGION", "us", false)]);
-    assert_eq!(one.get("DESK_REGION"), Some("eu"));
-    assert_eq!(two.get("DESK_REGION"), Some("us"));
+    let one = snapshot(&[("SERVICE_REGION", "eu", false)]);
+    let two = snapshot(&[("SERVICE_REGION", "us", false)]);
+    assert_eq!(one.get("SERVICE_REGION"), Some("eu"));
+    assert_eq!(two.get("SERVICE_REGION"), Some("us"));
     // Built second, and the first is unchanged: the only route between two tests' configurations.
-    assert_eq!(one.get("DESK_REGION"), Some("eu"));
+    assert_eq!(one.get("SERVICE_REGION"), Some("eu"));
     assert!(!Snapshot::unopened().has_spec());
-    assert_eq!(Snapshot::unopened().get("DESK_REGION"), None);
+    assert_eq!(Snapshot::unopened().get("SERVICE_REGION"), None);
 }
 
 fn listener_label() -> Resource {

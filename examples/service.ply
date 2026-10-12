@@ -1,11 +1,11 @@
-//! The parts desk: a multi-route HTTP service, over postgres or an in-memory twin of it, whose types
+//! A multi-route HTTP service that sells parts, over postgres or an in-memory twin of it, whose types
 //! are its documentation — and which can be started, watched, and stopped without losing a request.
 //! How it runs is configuration (`config` below):
 //!
-//!   ply run examples/desk.ply --host --config-schema desk.config \
-//!     --set DESK_API_KEY=… --set DESK_STORE=memory --set DESK_ACCEPT=task-per-connection
+//!   ply run examples/service.ply --host --config-schema service.config \
+//!     --set SERVICE_API_KEY=… --set SERVICE_STORE=memory --set SERVICE_ACCEPT=task-per-connection
 //!
-//! and over TLS it is given a credential and told its name: `--tls desk=CERT,KEY --set DESK_TLS=desk`.
+//! and over TLS it is given a credential and told its name: `--tls service=CERT,KEY --set SERVICE_TLS=service`.
 
 import std.net (net, send_all)
 import std.net
@@ -35,27 +35,27 @@ import std.process (process)
 
 // --- The store ----------------------------------------------------------------
 
-/// The desk used to declare `effect log { write note(line: String) -> Unit }`, a singleton atom for
+/// The service used to declare `effect log { write note(line: String) -> Unit }`, a singleton atom for
 /// the one audit trail it had.
 effect set Store = {db.query[items], db.execute[items], db.query[orders], db.execute[orders], db.returning[orders], db.begin, db.commit, db.abort, db.rollback}
 
 /// Placing an order and cancelling one both read the shelf, write the shelf, read the order book,
 /// write the order book, open a transaction, record on the order book's channel and record on the
 /// shelf's.
-effect set Desk = {Store, trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items]}
+effect set Service = {Store, trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items]}
 
 /// What the *serving* layer performs, which is strictly more: the request span on the `http`
 /// channel, the credential the API-key check reads, and the stop flag the readiness route consults.
-effect set Serving = {Desk, trace.enter[http], trace.exit[http], trace.event[http], config.secret[credentials], signal.stopping}
+effect set Serving = {Service, trace.enter[http], trace.exit[http], trace.event[http], config.secret[credentials], signal.stopping}
 
 /// What the *entry point* performs, which is `Serving` without the database: a run reads where to
 /// reach its database and serves every `db` operation from there, so no row names `db` and a host
 /// needs no database of its own.
 effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
 // A task per connection, when the settings ask for one.
-// The line that says which port the desk landed on.
+// The line that says which port the service landed on.
 
-// --- What the desk sells --------------------------------------------------------
+// --- What the service sells --------------------------------------------------------
 
 pub type Item = { sku: String, name: String, price: Decimal, on_hand: Int }
 
@@ -87,14 +87,14 @@ derive json for Health
 derive json for Readiness
 
 // The storage format, which nobody wrote either: a column per field, and a field that is not a
-// scalar is a `jsonb` document read through its own JSON codec, so what the desk stores and what
+// scalar is a `jsonb` document read through its own JSON codec, so what the service stores and what
 // it sends are one text.
 derive row for Item
 derive row for Order
 
 // --- The schema, which is a value ------------------------------------------------
 
-/// A `const fn` of `std.sql.Schema`, so the check holds every statement the desk runs to it: a
+/// A `const fn` of `std.sql.Schema`, so the check holds every statement the service runs to it: a
 /// column misspelled in one is an error before anything runs.
 pub const fn schema() -> sql::Schema =
   {
@@ -131,28 +131,28 @@ pub const fn schema() -> sql::Schema =
 
 // --- The configuration, which is also a value -----------------------------------------
 
-pub fn port_key() -> String = "DESK_PORT"
+pub fn port_key() -> String = "SERVICE_PORT"
 
-pub fn connections_key() -> String = "DESK_CONNECTIONS"
+pub fn connections_key() -> String = "SERVICE_CONNECTIONS"
 
-pub fn api_key() -> String = "DESK_API_KEY"
+pub fn api_key() -> String = "SERVICE_API_KEY"
 
-/// Where the desk's database is. Optional because the twin has no database: a desk over postgres
+/// Where the service's database is. Optional because the twin has no database: a service over postgres
 /// refuses to start without it, which is what `configured_url` below is for.
-pub fn database_key() -> String = "DESK_DATABASE"
+pub fn database_key() -> String = "SERVICE_DATABASE"
 
 /// Which store answers the routes: `postgres`, or `memory` for the twin.
-pub fn store_key() -> String = "DESK_STORE"
+pub fn store_key() -> String = "SERVICE_STORE"
 
 /// The credential to listen with, as `--tls NAME=CERT,KEY` named it; plaintext when unset.
-pub fn tls_key() -> String = "DESK_TLS"
+pub fn tls_key() -> String = "SERVICE_TLS"
 
 /// Which loop answers connections: `sequential`, or `task-per-connection`.
-pub fn accept_key() -> String = "DESK_ACCEPT"
+pub fn accept_key() -> String = "SERVICE_ACCEPT"
 
 pub fn config() -> config::ConfigSpec =
   config::spec([
-    // A default, so a developer runs `ply run --host --config-schema desk.config` and gets a desk
+    // A default, so a developer runs `ply run --host --config-schema service.config` and gets a service
     // on 8137 without a word of configuration.
     config::with_default(port_key(), config::SInt, "8137"),
     config::with_default(connections_key(), config::SInt, "64"),
@@ -165,12 +165,12 @@ pub fn config() -> config::ConfigSpec =
   ])
 
 /// The port a run was told to listen on, or the refusal to start. Port 0 asks for any free one, and
-/// the desk says which it got once it listens.
+/// the service says which it got once it listens.
 pub fn port_of(configured: Option<String>) -> Result<Int, String> / {abort.raise} =
   match configured {
     None ->
       Err(
-        port_key() ++ " is unset; pass `--config-schema desk.config` so the run "
+        port_key() ++ " is unset; pass `--config-schema service.config` so the run "
           ++ "refuses at start-up, or `--set "
           ++ port_key()
           ++ "=8137`",
@@ -199,7 +199,7 @@ pub type Storage = | Postgres | Memory
 /// bounded queue and drains at a stop.
 pub type Accept = | Sequential | TaskPerConnection | Pooled(http::Shedding)
 
-/// How a run serves the desk, read once at start-up.
+/// How a run serves the service, read once at start-up.
 pub type Settings = {
   port: Int,
   connections: Int,
@@ -312,7 +312,7 @@ fn listed<a>(
 
 fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 
-/// A SQLSTATE the desk has no answer for.
+/// A SQLSTATE the service has no answer for.
 fn unavailable(e: sql::DbError) -> http::Response<| {}> / {abort.raise} =
   problem(503, "the store is unavailable", e.code)
 
@@ -469,18 +469,14 @@ fn join(xs: List<String>) -> String =
 // --- Liveness and readiness, which are two different questions --------------------
 
 pub fn health() -> http::Response<| {}> / {abort.raise} =
-  json_body(200, { service: "parts desk", routes: len(table()) }, health_json())
+  json_body(200, { service: "parts", routes: len(table()) }, health_json())
 
 /// 503 while draining, 503 while the store is unreachable, 200 otherwise.
 pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
     match db.query[items](store_reachable(), []) {
       sql::Rows(_) ->
-        json_body(
-          200,
-          { service: "parts desk", store: "reachable", stopping: false },
-          readiness_json(),
-        ),
+        json_body(200, { service: "parts", store: "reachable", stopping: false }, readiness_json()),
       // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
       // client's action is the same whichever code the server sent, and an operator's is not.
       sql::Failed(e) -> unready(e.code, false),
@@ -489,7 +485,7 @@ pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abor
   }
 
 fn unready(store: String, stopping: Bool) -> http::Response<| {}> / {abort.raise} =
-  json_body(503, { service: "parts desk", store: store, stopping: stopping }, readiness_json())
+  json_body(503, { service: "parts", store: store, stopping: stopping }, readiness_json())
 
 /// Also pure: the pages are definitions, not rows, so serving one touches nothing.
 fn pages() -> Map<String, String> =
@@ -559,7 +555,7 @@ fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response<| {}>
 
 // --- The two that are transactions --------------------------------------------------
 
-pub fn place_order(body: Bytes) -> http::Response<| {}> / {Desk, abort.raise} =
+pub fn place_order(body: Bytes) -> http::Response<| {}> / {Service, abort.raise} =
   match json::decode_bytes(body, placement_json()) {
     Err(e) -> problem(400, "malformed body", json::error_to_string(e)),
     Ok(p) -> placed(p),
@@ -567,7 +563,7 @@ pub fn place_order(body: Bytes) -> http::Response<| {}> / {Desk, abort.raise} =
 
 /// The two refusals that need no database are answered before one is opened, so a malformed order
 /// costs no connection and no `BEGIN`.
-fn placed(p: Placement) -> http::Response<| {}> / {Desk, abort.raise} =
+fn placed(p: Placement) -> http::Response<| {}> / {Service, abort.raise} =
   if len(p.lines) == 0 { problem(422, "empty order", "an order needs at least one line") }
   else if bad_qty(p.lines) {
     problem(422, "bad quantity", "every line needs a quantity above zero")
@@ -577,7 +573,7 @@ fn placed(p: Placement) -> http::Response<| {}> / {Desk, abort.raise} =
 
 /// The span that shows where a placement's time went, and the one place in this file where a span is
 /// *not* closed by the program.
-fn placing(p: Placement) -> http::Response<| {}> / {Desk, abort.raise} = {
+fn placing(p: Placement) -> http::Response<| {}> / {Service, abort.raise} = {
   let span = trace.enter[orders](
     "reserving",
     map_of_entries([text_field("customer", p.customer), int_field("lines", len(p.lines))]),
@@ -596,7 +592,7 @@ fn recorded(
   p: Placement,
   stock: List<Item>,
   total: Decimal,
-) -> http::Response<| {}> / {Desk, abort.raise} =
+) -> http::Response<| {}> / {Service, abort.raise} =
   match listed(
       db::fetch_returning[orders](order_insert(), order_row(), [
         sql::PText(p.customer),
@@ -629,7 +625,7 @@ fn recorded(
   }
 
 /// One `UPDATE` per sku the order draws on, walked over the shelf rather than over the order, so a
-/// sku named on two lines is one reservation of their sum — which is how a desk avoids selling the
+/// sku named on two lines is one reservation of their sum — which is how a service avoids selling the
 /// same three widgets twice inside one order.
 fn move_stock(
   stock: List<Item>,
@@ -683,7 +679,7 @@ fn settled(
   }
 
 /// `Serializable`, and it is the only endpoint that asks for it.
-pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Desk, abort.raise} =
+pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Service, abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
@@ -693,7 +689,7 @@ pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Desk
       ),
   }
 
-fn cancelling(id: Int) -> http::Response<| {}> / {Desk, abort.raise} =
+fn cancelling(id: Int) -> http::Response<| {}> / {Service, abort.raise} =
   match order_row_of(id) {
     Err(r) -> r,
     Ok(found) -> match found {
@@ -708,7 +704,7 @@ fn cancelling(id: Int) -> http::Response<| {}> / {Desk, abort.raise} =
 /// A `DELETE` that raced another one and lost affects no row here, because the order it read is gone
 /// from under it; that answers 409 without a rollback — nothing had been written, so there is
 /// nothing to discard and committing an empty transaction is the honest end of it.
-fn cancelled_now(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
+fn cancelled_now(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
   match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::PInt(o.id)]) {
     sql::Count(n) -> if n == 1 { restocked(o) }
     else { problem(409, "already cancelled", int_to_string(o.id)) },
@@ -716,7 +712,7 @@ fn cancelled_now(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
     _ -> problem(500, "unreadable answer", "an update returned rows"),
   }
 
-fn restocked(o: Order) -> http::Response<| {}> / {Desk, abort.raise} =
+fn restocked(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
   match shelf() {
     Err(r) -> r,
     Ok(stock) -> {
@@ -916,7 +912,7 @@ fn dispatched(
   e: Endpoint,
   req: http::Request,
   params: Map<String, String>,
-) -> Reply / {Desk, signal.stopping, abort.raise} =
+) -> Reply / {Service, signal.stopping, abort.raise} =
   match e {
     Health -> Buffered(health()),
     Ready -> Buffered(ready()),
@@ -1309,7 +1305,7 @@ pub fn listen_and_serve(
   served
 }
 
-/// The desk as a run's settings describe it: over TLS when they name a credential, answered by the
+/// The service as a run's settings describe it: over TLS when they name a credential, answered by the
 /// loop they choose, and saying on stdout which port it landed on — which is how a run asked for
 /// port 0 is found.
 pub fn listening(
@@ -1332,7 +1328,7 @@ pub fn listening(
   served
 }
 
-// --- The desk, stocked and running ----------------------------------------------------
+// --- The service, stocked and running ----------------------------------------------------
 
 /// The twin on a plain listener, one connection at a time.
 pub fn run_memory(
@@ -1345,7 +1341,7 @@ pub fn run_memory(
 /// The API key the *tests* drive the twin with.
 pub fn twin_key() -> String = "twin-key-not-a-credential"
 
-/// The desk over a database that is a value, a sink that is a value and a stop flag that is a value:
+/// The service over a database that is a value, a sink that is a value and a stop flag that is a value:
 /// every operation `Serving` names is answered here, and the credential from `api`.
 pub fn twin<a | e>(
   api: Option<Secret<String>>,
@@ -1412,7 +1408,7 @@ pub fn twin<a | e>(
           trace.count[orders](name, delta, fs) ->
             cell_set(t, trace::count_step(cell_get(t), "orders", name, delta, fs)),
           trace.event[items](level, name, fs) -> noted("items", level, name, fs),
-          // Answered from the argument, and only for the key this desk declares.
+          // Answered from the argument, and only for the key this service declares.
           config.secret[credentials](key) -> if key == api_key() { api } else { None },
           signal.stopping() -> signal::stopping_step(cell_get(s)),
         }
@@ -1447,7 +1443,7 @@ fn postgres(
   handle {
     match with_server(configured_url(url), s.connections, || listening(s)) {
       Ok(served) -> served,
-      Err(why) -> panic("the desk will not start: " ++ why),
+      Err(why) -> panic("the service will not start: " ++ why),
     }
   } with {
     // Answered from the value read above, once.
@@ -1459,17 +1455,17 @@ fn configured_url(resolved: Option<String>) -> String / {abort.raise} =
     Some(url) -> url,
     None ->
       panic(
-        "the desk will not start: " ++ database_key()
-          ++ " is unset; pass `--config-schema desk.config` so the run refuses at start-up, or `--set "
+        "the service will not start: " ++ database_key()
+          ++ " is unset; pass `--config-schema service.config` so the run refuses at start-up, or `--set "
           ++ database_key()
-          ++ "=postgres://user@host/desk`",
+          ++ "=postgres://user@host/service`",
       ),
   }
 
 fn configured<a>(resolved: Result<a, String>) -> a / {abort.raise} =
-  match resolved { Ok(value) -> value, Err(why) -> panic("the desk will not start: " ++ why) }
+  match resolved { Ok(value) -> value, Err(why) -> panic("the service will not start: " ++ why) }
 
-// --- What the desk is stocked with ------------------------------------------------
+// --- What the service is stocked with ------------------------------------------------
 
 pub fn seed_shelf() -> List<Item> =
   [
@@ -1732,7 +1728,7 @@ fn against<a | e>(
     } }
   } }
 
-/// The desk as `examples/desk.sql` seeds it, with a key configured and nobody asking it to stop.
+/// The service as `examples/service.sql` seeds it, with a key configured and nobody asking it to stop.
 fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.raise | e} =
   handle {
     against(d, config::one_secret(api_key(), twin_key()), body)
@@ -1740,7 +1736,7 @@ fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / {abort.
     signal.stopping() -> false,
   }
 
-/// The desk as `examples/desk.sql` seeds it.
+/// The service as `examples/service.sql` seeds it.
 fn stock() -> db::MemDb / {abort.raise} = stocked(seed_shelf(), seed_orders())
 
 fn served_by(
@@ -1798,7 +1794,7 @@ test "GET /health is pure and counts the table it is served from" {
   assert_eq(r.out.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.out.body), health_json()),
-    Ok({ service: "parts desk", routes: 11 }),
+    Ok({ service: "parts", routes: 11 }),
   );
   // Pure means pure: the store this request was handed is the store it left.
   assert_eq(r.shelf, seed_shelf());
@@ -2053,7 +2049,7 @@ test "GET /health is 200 with no store, no clock and no stop flag in reach" {
   assert_eq(r.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.body), health_json()),
-    Ok({ service: "parts desk", routes: 11 }),
+    Ok({ service: "parts", routes: 11 }),
   )
 }
 
@@ -2062,7 +2058,7 @@ test "GET /ready is 200 when the store answers and nobody has asked it to stop" 
   assert_eq(r.out.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.out.body), readiness_json()),
-    Ok({ service: "parts desk", store: "reachable", stopping: false }),
+    Ok({ service: "parts", store: "reachable", stopping: false }),
   );
   // A readiness poll is one aggregate and leaves nothing behind.
   assert_eq(r.shelf, seed_shelf());
@@ -2077,7 +2073,7 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
     assert_eq(r.status, 503);
     assert_eq(
       json::decode_bytes(http::whole_bytes(r.body), readiness_json()),
-      Ok({ service: "parts desk", store: "57P01", stopping: false }),
+      Ok({ service: "parts", store: "57P01", stopping: false }),
     );
     // The same process, the same moment, the same outage.
     assert_eq(health().status, 200)
@@ -2089,19 +2085,19 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
   }
 }
 
-test "a draining desk answers 503 before it stops accepting, and asks no database" {
+test "a draining service answers 503 before it stops accepting, and asks no database" {
   handle {
     let r = ready();
     assert_eq(r.status, 503);
     assert_eq(
       json::decode_bytes(http::whole_bytes(r.body), readiness_json()),
-      Ok({ service: "parts desk", store: "draining", stopping: true }),
+      Ok({ service: "parts", store: "draining", stopping: true }),
     );
     assert_eq(health().status, 200)
   } with {
     signal.stopping() -> true,
     // The stop flag is read first, so a draining instance answers without spending a connection.
-    db.query[items](q, ps) -> panic("a draining desk must not ask the database"),
+    db.query[items](q, ps) -> panic("a draining service must not ask the database"),
   }
 }
 
@@ -2150,7 +2146,7 @@ test "POST /orders takes the configured key and refuses every other request" {
 }
 
 // The failure mode that matters more than a wrong key: no key at all.
-test "a desk with no credential configured refuses POST /orders rather than accepting it" {
+test "a service with no credential configured refuses POST /orders rather than accepting it" {
   let r = handle {
     against(stock(), config::no_values(), ||
       app(
@@ -2195,39 +2191,44 @@ fn shown_field(f: Option<trace::Field>) -> String =
 
 // --- Tests: the configuration a run refuses to start without ---------------------------
 
-test "the schema declares the keys the desk cannot start without, and defaults the rest" {
+test "the schema declares the keys the service cannot start without, and defaults the rest" {
   let keys = config().keys;
   assert_eq(len(keys), 7);
   // The credential is `SSecret` and required.
   assert_eq(
     key_named(keys, api_key()),
-    Some({ name: "DESK_API_KEY", shape: config::SSecret, required: true, default: None }),
+    Some({ name: "SERVICE_API_KEY", shape: config::SSecret, required: true, default: None }),
   );
-  // Where to reach the database is optional in the schema and required by a desk over postgres:
+  // Where to reach the database is optional in the schema and required by a service over postgres:
   // the twin has no database, so a run of it supplies no URL.
   assert_eq(
     key_named(keys, database_key()),
-    Some({ name: "DESK_DATABASE", shape: config::SText, required: false, default: None }),
+    Some({ name: "SERVICE_DATABASE", shape: config::SText, required: false, default: None }),
   );
-  // The port has a default, so `ply run --host --config-schema desk.config` starts a desk with no
+  // The port has a default, so `ply run --host --config-schema service.config` starts a service with no
   // configuration written anywhere.
   assert_eq(
     key_named(keys, port_key()),
-    Some({ name: "DESK_PORT", shape: config::SInt, required: false, default: Some("8137") }),
+    Some({ name: "SERVICE_PORT", shape: config::SInt, required: false, default: Some("8137") }),
   );
-  // Unset, a desk serves postgres in plaintext, one connection at a time.
+  // Unset, a service serves postgres in plaintext, one connection at a time.
   assert_eq(
     key_named(keys, store_key()),
-    Some({ name: "DESK_STORE", shape: config::SText, required: false, default: Some("postgres") }),
+    Some({
+      name: "SERVICE_STORE",
+      shape: config::SText,
+      required: false,
+      default: Some("postgres"),
+    }),
   );
   assert_eq(
     key_named(keys, tls_key()),
-    Some({ name: "DESK_TLS", shape: config::SText, required: false, default: None }),
+    Some({ name: "SERVICE_TLS", shape: config::SText, required: false, default: None }),
   );
   assert_eq(
     key_named(keys, accept_key()),
     Some({
-      name: "DESK_ACCEPT",
+      name: "SERVICE_ACCEPT",
       shape: config::SText,
       required: false,
       default: Some("sequential"),
@@ -2239,13 +2240,13 @@ fn key_named(keys: List<config::Key>, name: String) -> Option<config::Key> =
   fold(keys, None, |found: Option<config::Key>, k: config::Key|
     if k.name == name { Some(k) } else { found })
 
-// What a run that forgot `--config-schema` gets: a refusal that names the flag, rather than a desk
+// What a run that forgot `--config-schema` gets: a refusal that names the flag, rather than a service
 // listening on a port nobody chose.
-test "a desk told nothing about its port refuses to start and says which flag to pass" {
+test "a service told nothing about its port refuses to start and says which flag to pass" {
   match port_of(None) {
     Ok(port) -> panic("an unset port must not resolve to " ++ int_to_string(port)),
     Err(why) -> {
-      assert(mentions(why, b"DESK_PORT"));
+      assert(mentions(why, b"SERVICE_PORT"));
       assert(mentions(why, b"--config-schema"))
     },
   };
@@ -2264,28 +2265,28 @@ test "a connection budget that is absent defaults and one that is zero refuses" 
   assert_eq(connections_of(None), Ok(64));
   assert_eq(connections_of(Some("8")), Ok(8));
   match connections_of(Some("0")) {
-    Ok(_) -> panic("a desk that serves zero connections would look healthy"),
-    Err(why) -> assert(mentions(why, b"DESK_CONNECTIONS")),
+    Ok(_) -> panic("a service that serves zero connections would look healthy"),
+    Err(why) -> assert(mentions(why, b"SERVICE_CONNECTIONS")),
   }
 }
 
-test "a desk given only its port serves postgres in plaintext, one connection at a time" {
+test "a service given only its port serves postgres in plaintext, one connection at a time" {
   assert_eq(
     settings_of(port: Some("8137")),
     Ok({ port: 8137, connections: 64, store: Postgres, tls: None, accept: Sequential }),
   )
 }
 
-test "each way of running the desk is a setting, and a value it does not know refuses to start" {
+test "each way of running the service is a setting, and a value it does not know refuses to start" {
   assert_eq(
     settings_of(
       port: Some("0"),
       connections: Some("9"),
       store: Some("memory"),
-      tls: Some("desk"),
+      tls: Some("service"),
       accept: Some("task-per-connection"),
     ),
-    Ok({ port: 0, connections: 9, store: Memory, tls: Some("desk"), accept: TaskPerConnection }),
+    Ok({ port: 0, connections: 9, store: Memory, tls: Some("service"), accept: TaskPerConnection }),
   );
   assert_eq(
     settings_of(port: Some("0"), accept: Some("pooled")),
@@ -2298,17 +2299,17 @@ test "each way of running the desk is a setting, and a value it does not know re
     }),
   );
   match settings_of(port: Some("8137"), store: Some("sqlite")) {
-    Ok(_) -> panic("`sqlite` is not a store the desk has"),
-    Err(why) -> assert(mentions(why, b"DESK_STORE")),
+    Ok(_) -> panic("`sqlite` is not a store the service has"),
+    Err(why) -> assert(mentions(why, b"SERVICE_STORE")),
   };
   match settings_of(port: Some("8137"), accept: Some("threads")) {
-    Ok(_) -> panic("`threads` is not an accept loop the desk has"),
-    Err(why) -> assert(mentions(why, b"DESK_ACCEPT")),
+    Ok(_) -> panic("`threads` is not an accept loop the service has"),
+    Err(why) -> assert(mentions(why, b"SERVICE_ACCEPT")),
   };
   // An empty credential name would listen over TLS with nothing to present.
   match settings_of(port: Some("8137"), tls: Some("")) {
     Ok(_) -> panic("an empty credential name is not a credential"),
-    Err(why) -> assert(mentions(why, b"DESK_TLS")),
+    Err(why) -> assert(mentions(why, b"SERVICE_TLS")),
   }
 }
 
@@ -2318,7 +2319,7 @@ fn mentions(text: String, needle: Bytes) -> Bool =
 // --- Tests: the drain ------------------------------------------------------------------
 
 // the drain's exit criterion, and it is a claim about what is *absent*: not one line of
-// `serve`, `serve_connection` or the framing changed to make a signal drain this desk.
+// `serve`, `serve_connection` or the framing changed to make a signal drain this service.
 test "a signal drains the accept loop with no source change" {
   with_cell[stop](signal::running()) { s -> {
     with_cell[inbox]([get_line("/health")]) { queue -> {
@@ -2331,7 +2332,7 @@ test "a signal drains the accept loop with no source change" {
                 listen_and_serve(8137, 8)
               } with {
                 net.listen[listener](port) -> 1,
-                // Phase 2 of the shutdown sequence, as this desk sees it: the listening socket is closed,
+                // Phase 2 of the shutdown sequence, as this service sees it: the listening socket is closed,
                 // so `accept` answers `0`.
                 net.accept[listener](l) -> if signal::stopping_step(cell_get(s)) { 0 } else { 7 },
                 net.close[listener](l) -> cell_set(shut, cell_get(shut) + 1),
@@ -2356,7 +2357,7 @@ test "a signal drains the accept loop with no source change" {
           assert_eq(r.out, 1);
           let wrote = bytes_concat_all(cell_get(sent));
           assert_eq(status_of(wrote), 200);
-          assert(bytes_index_of(wrote, b"\"service\":\"parts desk\"") != None);
+          assert(bytes_index_of(wrote, b"\"service\":\"parts\"") != None);
           // And the listener was closed on the way out, which is what `serve` returning means.
           assert_eq(cell_get(shut), 1);
           // The drain left nothing open: every span the run produced is closed, so a reader of the
@@ -2368,11 +2369,11 @@ test "a signal drains the accept loop with no source change" {
   } }
 }
 
-/// What `count` clients each asking for `path` once were answered by a pooled desk of one worker
+/// What `count` clients each asking for `path` once were answered by a pooled service of one worker
 /// and a queue of one, and how the pool counted them.
 fn pooled_run(count: Int, path: String) -> net::Over<http::Pooled> / {sim.read, abort.raise} = {
   let asked = bytes_of_string(
-    "GET " ++ path ++ " HTTP/1.1\r\nHost: desk.example\r\nConnection: close\r\n\r\n",
+    "GET " ++ path ++ " HTTP/1.1\r\nHost: service.example\r\nConnection: close\r\n\r\n",
   );
   let callers = fold(range(0, count), net::mem_empty(), |m: net::MemNet, i: Int|
     net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Says(asked)]));
@@ -2384,7 +2385,7 @@ fn pooled_run(count: Int, path: String) -> net::Over<http::Pooled> / {sim.read, 
       }))
 }
 
-test "a pooled desk sheds what its queue cannot hold, and answers every connection it took" {
+test "a pooled service sheds what its queue cannot hold, and answers every connection it took" {
   let ran = pooled_run(2, "/health");
   let p = ran.value;
   // Whether the one worker was free as each arrived is the schedule's to say, in every one of them.
@@ -2403,7 +2404,7 @@ test "a pooled desk sheds what its queue cannot hold, and answers every connecti
   assert_eq(len(ran.net.closed), 2)
 }
 
-test "a kept-alive desk connection under a stop is answered as its last, and not waited on" {
+test "a kept-alive service connection under a stop is answered as its last, and not waited on" {
   let ran = twin(Some(secret_of_string(twin_key())), ||
     net::on_mem(
       net::mem_calling(net::mem_empty(), ip::socket_at(ip::loopback_v4(), 4000), [
@@ -2426,9 +2427,9 @@ test "a kept-alive desk connection under a stop is answered as its last, and not
 }
 
 // The other half of the drain, from the client's side: while a stop is pending but the listener is
-// still accepting — the `--drain-lead-ms` window — the desk answers `/ready` with 503 and keeps
+// still accepting — the `--drain-lead-ms` window — the service answers `/ready` with 503 and keeps
 // answering everything else.
-test "during the drain lead a desk is unready and still serving" {
+test "during the drain lead a service is unready and still serving" {
   let r = handle {
     against(stock(), config::one_secret(api_key(), twin_key()), || {
       let ready = app(request(http::Get, "/ready", b""));
@@ -2550,7 +2551,7 @@ fn head_end(raw: Bytes) -> Int =
   match bytes_index_of(raw, b"\r\n\r\n") { Some(at) -> at + 4, None -> bytes_len(raw) }
 
 fn get_line(path: String) -> Bytes =
-  bytes_of_string("GET " ++ path ++ " HTTP/1.1\r\nHost: desk.example\r\n\r\n")
+  bytes_of_string("GET " ++ path ++ " HTTP/1.1\r\nHost: service.example\r\n\r\n")
 
 test "a request over the simulated socket is answered and the connection closed" {
   let e = served(get_line("/health"));
@@ -2565,7 +2566,7 @@ test "two pipelined requests are answered in order on one connection" {
   let e = served(bytes_concat(get_line("/health"), get_line("/items")));
   assert_eq(e.sent, 2);
   assert_eq(e.closes, 1);
-  assert(bytes_index_of(e.wrote, b"\"service\":\"parts desk\"") != None);
+  assert(bytes_index_of(e.wrote, b"\"service\":\"parts\"") != None);
   assert(bytes_index_of(e.wrote, b"\"sku\":\"gasket\"") != None)
 }
 
@@ -2590,7 +2591,7 @@ test "a posted order travels the whole connection and moves the store" {
   let body = "{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"gasket\",\"qty\":2}]}";
   let e = served(
     bytes_of_string(
-      "POST /orders HTTP/1.1\r\nHost: desk.example\r\nContent-Type: application/json\r\n"
+      "POST /orders HTTP/1.1\r\nHost: service.example\r\nContent-Type: application/json\r\n"
         ++ "x-api-key: "
         ++ twin_key()
         ++ "\r\n"
@@ -2662,9 +2663,9 @@ test "a peer that opens a connection and says nothing is closed without a respon
   assert_eq(e.closes, 1)
 }
 
-// --- The desk as its settings describe it ----------------------------------------------
+// --- The service as its settings describe it ----------------------------------------------
 
-/// One connection's worth of the desk `listening` runs, over sockets that are values: what it
+/// One connection's worth of the service `listening` runs, over sockets that are values: what it
 /// wrote, how many responses that was, and what it said on stdout.
 fn over_socket(
   inbox: List<Bytes>,
@@ -2680,7 +2681,7 @@ fn over_socket(
           } with {
             net.listen[listener](port) -> 1,
             net.listen_tls[listener](port, credential) -> {
-              assert_eq(credential, "desk");
+              assert_eq(credential, "service");
               1
             },
             net.local_port[listener](l) -> Some(40123),
@@ -2713,7 +2714,7 @@ fn one_connection(tls: Option<String>, accept: Accept) -> Settings =
   { port: 0, connections: 1, store: Memory, tls: tls, accept: accept }
 
 test "the service answers the same bytes over a TLS listener as over a plain one" {
-  let encrypted = over_socket([get_line("/items")], one_connection(Some("desk"), Sequential));
+  let encrypted = over_socket([get_line("/items")], one_connection(Some("service"), Sequential));
   assert_eq(encrypted, over_socket([get_line("/items")], one_connection(None, Sequential)));
   assert_eq(status_of(encrypted.wrote), 200);
   assert(bytes_index_of(encrypted.wrote, b"\"sku\":\"gasket\"") != None)
@@ -2728,8 +2729,8 @@ test "a listener serves exactly the connections it was asked for" {
   assert_eq(e.sent, 2)
 }
 
-// The line a harness reads to find a desk it asked for port 0.
-test "a desk says on stdout which port it landed on" {
+// The line a harness reads to find a service it asked for port 0.
+test "a service says on stdout which port it landed on" {
   assert_eq(over_socket([get_line("/health")], one_connection(None, Sequential)).said, [
     "listening on 40123",
   ])
@@ -2751,14 +2752,14 @@ test "a task per connection writes the bytes one connection at a time writes" {
 }
 
 // The twin as `main` runs it when the settings name it: nothing granted but sockets and stdout.
-test "the twin serves the desk over TLS with a task per connection" {
+test "the twin serves the service over TLS with a task per connection" {
   with_cell[inbox]([get_line("/items")]) { queue -> {
     with_cell[outbox]([]) { sent -> {
       handle {
         twin(Some(secret_of_string(twin_key())), ||
-          simulate { assert_eq(listening(one_connection(Some("desk"), TaskPerConnection)), 1) })
+          simulate { assert_eq(listening(one_connection(Some("service"), TaskPerConnection)), 1) })
       } with {
-        net.listen[listener](port) -> panic("a desk told a credential listens over TLS"),
+        net.listen[listener](port) -> panic("a service told a credential listens over TLS"),
         net.listen_tls[listener](port, credential) -> 1,
         net.local_port[listener](l) -> Some(40123),
         net.accept[listener](l) -> 7,
@@ -2782,7 +2783,7 @@ test "the twin serves the desk over TLS with a task per connection" {
 }
 
 // The twin entry point, driven end to end with nothing granted but sockets.
-test "run_memory serves the desk with no database bound and no host at all" {
+test "run_memory serves the service with no database bound and no host at all" {
   with_cell[inbox]([bytes_concat(get_line("/items"), get_line("/orders"))]) { queue -> {
     with_cell[outbox]([]) { sent -> {
       handle {
@@ -2879,7 +2880,7 @@ test "a version that is not 1.0 or 1.1 is 505, and no version at all is 400" {
 }
 
 test "an authority-form target and a lone asterisk under GET are each refused" {
-  assert_eq(refused(b"GET desk.example:80 HTTP/1.1\r\nHost: d\r\n\r\n"), 400);
+  assert_eq(refused(b"GET service.example:80 HTTP/1.1\r\nHost: d\r\n\r\n"), 400);
   assert_eq(refused(b"GET * HTTP/1.1\r\nHost: d\r\n\r\n"), 400)
 }
 
@@ -2925,7 +2926,7 @@ test "trailers arrive in their own field and are never merged into the headers" 
       b"2\r\n{}\r\n0\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n",
     ),
   );
-  // The body was framed by the chunks and not by the trailer, so the desk saw `{}` and refused it
+  // The body was framed by the chunks and not by the trailer, so the service saw `{}` and refused it
   // as a `Placement` rather than as a framing error.
   assert_eq(status_of(e.wrote), 400);
   assert_eq(e.closes, 1)
@@ -2994,7 +2995,7 @@ pub fn reachable(e: Endpoint) -> Bool / {abort.raise} =
         == router::Found({ endpoint: e, params: sample_params(r.path) }),
   }
 
-law "every endpoint the desk can dispatch is reachable through the table"
+law "every endpoint the service can dispatch is reachable through the table"
   forall (e: Endpoint) {
     reachable(e)
   }
@@ -3107,7 +3108,7 @@ test "a placement the shelf cannot cover leaves no row behind" {
   gen::check(wants(), |ws: List<Want>| covered(ws) || refused_without_trace(ws))
 }
 
-/// And the other half, without which the first is satisfied by a desk that refuses everything: what
+/// And the other half, without which the first is satisfied by a service that refuses everything: what
 /// a placement that succeeds does to the shelf is exactly `draw_down`, the pure function the tests
 /// above check on its own.
 pub fn committed_as_specified(ws: List<Want>) -> Bool / {abort.raise} = {

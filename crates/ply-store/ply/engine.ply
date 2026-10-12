@@ -1,58 +1,61 @@
-//! The engine: frames appended to one data file and found through one index of sorted sections,
-//! rewritten whole. It knows a table by its number and a key as 32 bytes, never what a payload means.
+//! The engine: tables of payloads keyed by 32 bytes, kept as a manifest and a handful of segments
+//! (`compiler.segments`). A flush writes what a run put and dropped as one segment, which the
+//! manifest names under the store's lock and syncs, so a reader sees a flush whole or not at all,
+//! two runs flushing one store keep each other's entries, and what a flush kept outlives a loss of
+//! power. It knows a table by its number and a key as 32 bytes, never what a payload means.
 
 import std.fs (fs, mem_empty)
-import std.random (entropy)
-import std.time (time)
 import std.bytes (u32_le, u64_le)
-import twin (on_twin)
+import std.list (at)
 import std.path (join)
+import compiler.segments
+import compiler.segments (Manifest, Segment, Writing, Named, Held)
+import twin (on_twin)
 
 // --- Layout -----------------------------------------------------------------
 
 /// Moves whenever the bytes on disk change meaning; a store in another format reads as empty.
-pub fn format() -> Int = 1
+pub fn format() -> Int = 2
 
 pub fn key_width() -> Int = 32
 
-fn data_name() -> String = "store.dat"
-fn index_name() -> String = "store.idx"
-fn lock_name() -> String = "store.lock"
-fn temp_suffix() -> String = ".tmp"
-fn data_magic() -> Bytes = b"PLYSTDAT"
-fn index_magic() -> Bytes = b"PLYSTIDX"
+/// A table's number, then a key.
+fn slot_width() -> Int = 1 + key_width()
 
-/// Magic, format, nonce, schema.
-fn data_header() -> Int = 60
+/// A slot, whether its entry was dropped, where the entry's frame lies and how long its payload is.
+fn row_width() -> Int = slot_width() + 13
 
-/// Magic, format, nonce, data length, schema, checksum, table count.
-fn index_header() -> Int = 104
+fn rows_table() -> Int = 1
 
-/// Table, count, offset of the first record.
-fn table_width() -> Int = 16
+/// The files of a layout no `ply` reads, which the next flush removes.
+fn retired() -> List<String> =
+  ["store.dat", "store.idx", "store.lock", "store.dat.tmp", "store.idx.tmp"]
 
-/// Key, frame offset, payload length.
-fn record_width() -> Int = 44
+fn slot(table: Int, key: Bytes) -> Bytes / {abort.raise} = byte_of_int(table) ++ key
 
-/// Table, payload length, checksum.
-fn frame_header() -> Int = 13
+fn rest_of(dropped: Bool, offset: Int, size: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all([byte_of_int(if dropped { 1 } else { 0 }), u64_le(offset), u32_le(size)])
 
-fn u32_at(b: Bytes, at: Int) -> Int / {abort.raise} = int_of_u32(bytes_u32_le(b, at))
+fn dropped(row: Bytes) -> Bool / {abort.raise} = bytes_at(row, slot_width()) == 1
 
-fn u64_at(b: Bytes, at: Int) -> Int / {abort.raise} = u32_at(b, at) | u32_at(b, at + 4) << 32
+fn offset_of(row: Bytes) -> Int = segments::long_at(row, slot_width() + 1)
+
+fn size_of(row: Bytes) -> Int = segments::word_at(row, slot_width() + 9)
+
+fn row_at(rows: Bytes, i: Int) -> Bytes / {abort.raise} =
+  bytes_slice(rows, i * row_width(), (i + 1) * row_width())
 
 // --- The store --------------------------------------------------------------
 
-pub type Section = { table: Int, count: Int, start: Int }
-
-/// What one run holds: the index it read, and what it put and dropped since, which a read sees first.
+/// What one run holds: the manifest it read, each segment's rows, oldest first, the segments whose
+/// rows did not read, and what it put and dropped since, which a read sees first. `schema` names
+/// the stored types and this format, and the manifest by them.
 pub type Store = {
   dir: String,
   schema: Bytes,
-  nonce: Bytes,
-  data_len: Int,
-  index: Bytes,
-  sections: List<Section>,
+  manifest: Manifest,
+  rows: List<Bytes>,
+  lost: List<Bytes>,
   puts: Map<Bytes, Bytes>,
   drops: Map<Bytes, Bool>,
   warnings: List<Warning>,
@@ -66,31 +69,6 @@ pub type Warning = { trouble: Trouble, message: String }
 
 pub type Found = | Hit(Bytes) | Miss | Bad(String)
 
-type Disk = { nonce: Bytes, data_len: Int, index: Bytes, sections: List<Section> }
-
-type Problem = { trouble: Trouble, why: String }
-
-type Loaded = | Valid(Disk) | Cold | Unusable(Problem)
-
-fn corrupt(why: String) -> Problem = { trouble: Corrupt, why: why }
-
-fn foreign(why: String) -> Problem = { trouble: OtherVersion, why: why }
-
-fn empty_disk() -> Disk = { nonce: b"", data_len: 0, index: b"", sections: [] }
-
-fn with_disk(dir: String, schema: Bytes, d: Disk, warnings: List<Warning>) -> Store =
-  {
-    dir: dir,
-    schema: schema,
-    nonce: d.nonce,
-    data_len: d.data_len,
-    index: d.index,
-    sections: d.sections,
-    puts: map_new(),
-    drops: map_new(),
-    warnings: warnings,
-  }
-
 /// One warning per distinct reason, however often a run meets it.
 pub fn warn(store: Store, trouble: Trouble, message: String) -> Store =
   { ..store, warnings: noted(store.warnings, { trouble: trouble, message: message }) }
@@ -100,254 +78,167 @@ fn noted(ws: List<Warning>, w: Warning) -> List<Warning> =
 
 pub fn messages(ws: List<Warning>) -> List<String> = map(ws, |w: Warning| w.message)
 
-fn starts_empty(p: Problem) -> Warning =
-  {
-    trouble: p.trouble,
-    message: match p.trouble {
-      OtherVersion ->
-        "the store was written by another version (" ++ p.why ++ "); this run starts empty",
-      _ -> "the store is unreadable (" ++ p.why ++ "); this run starts empty",
-    },
+type Read = { rows: List<Bytes>, lost: List<Bytes> }
+
+/// Each segment's rows of `m`, taken from `had` where a run read them already: a segment whose
+/// rows do not read holds nothing a run can find, and is named among the lost.
+fn read_of<[r]>(
+  dir: String,
+  m: Manifest,
+  had: Map<Bytes, Bytes>,
+) -> Read / {fs.read[r], abort.raise} =
+  fold(m.segments, { rows: [], lost: [] }, |acc: Read, seg: Segment|
+    match map_get(had, seg.token) {
+      Some(b) -> { rows: push(acc.rows, b), lost: acc.lost },
+      None -> match segments::rows[r](dir, seg, rows_table()) {
+        Some(b) -> { rows: push(acc.rows, b), lost: acc.lost },
+        None -> { rows: push(acc.rows, b""), lost: push(acc.lost, seg.token) },
+      },
+    })
+
+fn unread(store: Store) -> Store =
+  if len(store.lost) == 0 { store } else {
+    warn(store, Corrupt, "a part of the store does not read; its entries are treated as absent")
   }
 
 /// `schema` names every stored type's encoding; a store written under another is read as empty.
 pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise} = {
-  let digest = bytes_blake3(schema);
-  match load[r](dir, digest) {
-    Valid(d) -> with_disk(dir, digest, d, []),
-    Cold -> with_disk(dir, digest, empty_disk(), []),
-    Unusable(p) -> with_disk(dir, digest, empty_disk(), [starts_empty(p)]),
-  }
-}
-
-fn load<[r]>(dir: String, schema: Bytes) -> Loaded / {fs.read[r], abort.raise} =
-  match fs.read_file[r](join(dir, index_name())) {
-    None -> Cold,
-    Some(idx) -> match parse_index(idx, schema) {
-      Err(p) -> Unusable(p),
-      Ok(d) -> match data_problem[r](dir, d, schema) { None -> Valid(d), Some(p) -> Unusable(p) },
-    },
-  }
-
-fn parse_index(b: Bytes, schema: Bytes) -> Result<Disk, Problem> / {abort.raise} =
-  if bytes_len(b) < index_header() || bytes_slice(b, 0, 8) != index_magic() {
-    Err(corrupt("the index is not a store index"))
-  } else if u32_at(b, 8) != format() {
-    Err(
-      foreign(
-        "the index is in format " ++ int_to_string(u32_at(b, 8)) ++ ", not "
-          ++ int_to_string(format()),
-      ),
+  let shapes = bytes_blake3(u32_le(format()) ++ schema);
+  let m = segments::manifest[r](dir, shapes);
+  let read = read_of[r](dir, m, map_new());
+  let store = unread({
+    dir: dir,
+    schema: shapes,
+    manifest: m,
+    rows: read.rows,
+    lost: read.lost,
+    puts: map_new(),
+    drops: map_new(),
+    warnings: [],
+  });
+  if m.generation > 0 { store } else if segments::unreadable[r](dir, shapes) {
+    warn(
+      store,
+      Corrupt,
+      "the store is unreadable (its manifest does not read); this run starts empty",
     )
-  } else if bytes_slice(b, 36, 68) != schema {
-    Err(foreign("the index was written for other stored types"))
-  } else if bytes_blake3(bytes_slice(b, index_header(), bytes_len(b))) != bytes_slice(b, 68, 100) {
-    Err(corrupt("the index does not match its checksum"))
-  } else if u64_at(b, 28) < data_header() { Err(corrupt("the index vouches for no data file")) }
-  else {
-    let count = u32_at(b, 100);
-    let records = index_header() + count * table_width();
-    if records > bytes_len(b) { Err(corrupt("the index's tables run past its end")) } else {
-      match sections_from(b, 0, count, records, 0 - 1, []) {
-        Err(why) -> Err(why),
-        Ok(secs) ->
-          Ok({ nonce: bytes_slice(b, 12, 28), data_len: u64_at(b, 28), index: b, sections: secs }),
-      }
-    }
-  }
-
-fn sections_from(
-  b: Bytes,
-  i: Int,
-  count: Int,
-  records: Int,
-  last: Int,
-  acc: List<Section>,
-) -> Result<List<Section>, Problem> / {abort.raise} =
-  if i >= count { Ok(acc) } else {
-    let at = index_header() + i * table_width();
-    let sec = { table: u32_at(b, at), count: u32_at(b, at + 4), start: u64_at(b, at + 8) };
-    if sec.table <= last { Err(corrupt("the index's tables are out of order")) }
-    else if sec.start < records || sec.start + sec.count * record_width() > bytes_len(b) {
-      Err(corrupt("a table lies outside the index"))
-    } else { sections_from(b, i + 1, count, records, sec.table, push(acc, sec)) }
-  }
-
-fn data_problem<[r]>(
-  dir: String,
-  d: Disk,
-  schema: Bytes,
-) -> Option<Problem> / {fs.read[r], abort.raise} = {
-  let file = join(dir, data_name());
-  match fs.read_at[r](file, 0, data_header()) {
-    None -> Some(corrupt("the data file is missing")),
-    Some(h) -> if bytes_len(h) < data_header() || bytes_slice(h, 0, 8) != data_magic() {
-      Some(corrupt("the data file is not a store's"))
-    } else if bytes_slice(h, 12, 28) != d.nonce {
-      Some(corrupt("the data file is not the one the index was written with"))
-    } else if u32_at(h, 8) != format() || bytes_slice(h, 28, 60) != schema {
-      Some(foreign("the data file was written for other stored types"))
-    } else {
-      match fs.file_size[r](file) {
-        Some(n) -> if n < d.data_len {
-          Some(corrupt("the data file is shorter than the index vouches for"))
-        } else { None },
-        None -> Some(corrupt("the data file is missing")),
-      }
-    },
-  }
+  } else if segments::others[r](dir, shapes) || fs.exists[r](join(dir, "store.idx")) {
+    warn(store, OtherVersion, "the store was written by another version; this run starts empty")
+  } else { store }
 }
 
 // --- Reading ----------------------------------------------------------------
 
-fn slot(table: Int, key: Bytes) -> Bytes / {abort.raise} = byte_of_int(table) ++ key
+type Placed = { token: Bytes, row: Bytes }
 
-fn section_of(secs: List<Section>, table: Int) -> Option<Section> =
-  fold(secs, None, |acc: Option<Section>, s: Section|
-    match acc { Some(_) -> acc, None -> if s.table == table { Some(s) } else { None } })
-
-fn record_at(sec: Section, i: Int) -> Int = sec.start + i * record_width()
-
-fn key_at(index: Bytes, sec: Section, i: Int) -> Bytes / {abort.raise} =
-  bytes_slice(index, record_at(sec, i), record_at(sec, i) + key_width())
-
-/// A key's first four bytes, high first: keys whose prefixes differ order as their prefixes do, so a
-/// search slices a key only where two prefixes tie.
-fn prefix_at(b: Bytes, at: Int) -> Int / {abort.raise} = {
-  let le = u32_at(b, at);
-  (le & 255) << 24 | (le >> 8 & 255) << 16 | (le >> 16 & 255) << 8 | le >> 24 & 255
-}
-
-fn below(index: Bytes, at: Int, key: Bytes, prefix: Int) -> Bool / {abort.raise} = {
-  let p = prefix_at(index, at);
-  if p != prefix { p < prefix }
-  else { compare_values(bytes_slice(index, at, at + key_width()), key) == Less }
-}
-
-/// Each round halves what is left, so 64 rounds take any span to nothing.
-fn lower_bound(
-  index: Bytes,
-  sec: Section,
-  key: Bytes,
-  prefix: Int,
-  lo: Int,
-  hi: Int,
-) -> Int / {abort.raise} =
-  iterate({ lo: lo, hi: hi }, 65, |span: { lo: Int, hi: Int }|
-    if span.lo >= span.hi { Stop(span.lo) } else {
-      let mid = span.lo + (span.hi - span.lo) / 2;
-      if below(index, record_at(sec, mid), key, prefix) { Continue({ lo: mid + 1, hi: span.hi }) }
-      else { Continue({ lo: span.lo, hi: mid }) }
+/// The newest row of `sl` and the segment that holds it.
+fn found(store: Store, sl: Bytes) -> Option<Placed> / {abort.raise} =
+  fold(range(0, len(store.rows)), None, |acc: Option<Placed>, back: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> {
+        let i = len(store.rows) - 1 - back;
+        match segments::row_of(at(store.rows, i), row_width(), sl) {
+          Some(row) -> Some({ token: at(store.manifest.segments, i).token, row: row }),
+          None -> None,
+        }
+      },
     })
 
-fn located(
-  index: Bytes,
-  table: Int,
-  sections: List<Section>,
-  key: Bytes,
-) -> Option<Int> / {abort.raise} =
-  if bytes_len(key) != key_width() { None } else {
-    match section_of(sections, table) {
-      None -> None,
-      Some(sec) -> {
-        let i = lower_bound(index, sec, key, prefix_at(key, 0), 0, sec.count);
-        if i < sec.count && key_at(index, sec, i) == key { Some(record_at(sec, i)) } else { None }
+pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Found / {fs.read[r], abort.raise} =
+  if bytes_len(key) != key_width() { Miss } else {
+    let sl = slot(table, key);
+    let unwritten = map_len(store.puts) == 0 && map_len(store.drops) == 0;
+    match if unwritten { None } else { map_get(store.puts, sl) } {
+      Some(payload) -> Hit(payload),
+      None -> if !unwritten && map_contains(store.drops, sl) { Miss } else {
+        match found(store, sl) {
+          None -> Miss,
+          // An entry that holds nothing is all in its row, which its table's checksum vouched for.
+          Some(p) -> if dropped(p.row) { Miss }
+          else if size_of(p.row) == 0 { Hit(b"") } else {
+            match segments::payload[r](store.dir, p.token, offset_of(p.row), size_of(p.row)) {
+              Some(payload) -> Hit(payload),
+              None -> Bad("a frame does not match its checksum"),
+            }
+          },
+        }
       },
     }
   }
 
-pub fn get<[r]>(store: Store, table: Int, key: Bytes) -> Found / {fs.read[r], abort.raise} = {
-  let unwritten = map_len(store.puts) == 0 && map_len(store.drops) == 0;
-  match if unwritten { None } else { map_get(store.puts, slot(table, key)) } {
-    Some(payload) -> Hit(payload),
-    None -> if !unwritten && map_contains(store.drops, slot(table, key)) { Miss } else {
-      match located(store.index, table, store.sections, key) {
-        None -> Miss,
-        Some(at) ->
-          frame_at[r](
-            store.dir,
-            store.data_len,
-            table,
-            u64_at(store.index, at + key_width()),
-            u32_at(store.index, at + key_width() + 8),
-          ),
-      }
+/// The rows of `table` among `rows`, in order: a table's rows lie together, since a row leads with
+/// its table.
+fn table_rows(rows: Bytes, table: Int) -> List<Bytes> / {abort.raise} =
+  iterate(
+    {
+      i: segments::below(rows, row_width(), bytes_concat(byte_of_int(table), b"\x00\x00\x00")),
+      out: [],
     },
-  }
-}
-
-fn checksum(head: Bytes, payload: Bytes) -> Bytes / {abort.raise} =
-  bytes_slice(bytes_blake3(head ++ payload), 0, 8)
-
-/// A payload as the store writes it anywhere: its table, its length and a checksum before it.
-pub fn frame(table: Int, payload: Bytes) -> Bytes / {abort.raise} = {
-  let head = byte_of_int(table) ++ u32_le(bytes_len(payload));
-  bytes_concat_all([head, checksum(head, payload), payload])
-}
-
-/// The payload of exactly one frame of `table`, or why these bytes are not one.
-pub fn unframe(table: Int, b: Bytes) -> Found / {abort.raise} =
-  if bytes_len(b) < frame_header() || u32_at(b, 1) != bytes_len(b) - frame_header() {
-    Bad("the bytes end inside a frame")
-  } else if bytes_at(b, 0) != table { Bad("a frame of another table") } else {
-    let payload = bytes_slice(b, frame_header(), bytes_len(b));
-    if checksum(bytes_slice(b, 0, 5), payload) != bytes_slice(b, 5, frame_header()) {
-      Bad("a frame does not match its checksum")
-    } else { Hit(payload) }
-  }
-
-/// The frame of `table` the index places at `offset`, read alone: a store is never held whole, and
-/// nothing past what the index vouches for is read, so a torn append is never seen.
-fn frame_at<[r]>(
-  dir: String,
-  data_len: Int,
-  table: Int,
-  offset: Int,
-  len: Int,
-) -> Found / {fs.read[r], abort.raise} =
-  if offset < data_header() || offset + frame_header() + len > data_len {
-    Bad("an index entry points outside the data file")
-  } else {
-    match fs.read_at[r](join(dir, data_name()), offset, frame_header() + len) {
-      None -> Bad("the data file could not be read"),
-      Some(b) -> if bytes_len(b) != frame_header() + len {
-        Bad("the data file ends inside a frame")
-      } else if bytes_at(b, 0) != table || u32_at(b, 1) != len {
-        Bad("an index entry does not name its frame")
-      } else { unframe(table, b) },
-    }
-  }
+    1000000000,
+    |x: { i: Int, out: List<Bytes> }|
+      if (x.i + 1) * row_width() <= bytes_len(rows) && bytes_at(rows, x.i * row_width()) == table {
+        Continue({ i: x.i + 1, out: push(x.out, row_at(rows, x.i)) })
+      } else { Stop(x.out) },
+  )
 
 /// Every key the table holds, ascending, what this run put and dropped included.
 pub fn keys(store: Store, table: Int) -> List<Bytes> / {abort.raise} = {
-  let on_disk = match section_of(store.sections, table) {
-    None -> [],
-    Some(sec) -> map(range(0, sec.count), |i: Int| key_at(store.index, sec, i)),
-  };
-  let kept = fold(on_disk, map_new(), |acc: Map<Bytes, Bool>, k: Bytes|
-    if map_contains(store.drops, slot(table, k)) { acc } else { map_insert(acc, k, true) });
+  let held = fold(store.rows, map_new(), |acc: Map<Bytes, Bool>, rows: Bytes|
+    fold(table_rows(rows, table), acc, |m: Map<Bytes, Bool>, row: Bytes| {
+      let key = bytes_slice(row, 1, slot_width());
+      if dropped(row) || map_contains(store.drops, slot(table, key)) { map_remove(m, key) }
+      else { map_insert(m, key, true) }
+    }));
   map_keys(
-    map_fold(store.puts, kept, |acc: Map<Bytes, Bool>, sl: Bytes, p: Bytes|
+    map_fold(store.puts, held, |acc: Map<Bytes, Bool>, sl: Bytes, _: Bytes|
       if bytes_at(sl, 0) == table { map_insert(acc, bytes_slice(sl, 1, bytes_len(sl)), true) }
       else { acc }),
   )
 }
 
+/// The newest row of each slot among the segments from the one at `from` on, and the segment that
+/// holds it.
+fn newest(store: Store, from: Int) -> Map<Bytes, Placed> / {abort.raise} =
+  fold(range(from, len(store.rows)), map_new(), |acc: Map<Bytes, Placed>, i: Int| {
+    let token = at(store.manifest.segments, i).token;
+    let rows = at(store.rows, i);
+    fold(range(0, bytes_len(rows) / row_width()), acc, |m: Map<Bytes, Placed>, j: Int| {
+      let row = row_at(rows, j);
+      map_insert(m, bytes_slice(row, 0, slot_width()), { token: token, row: row })
+    })
+  })
+
 pub type Stats = { entries: List<{ table: Int, count: Int }>, data_bytes: Int, live_bytes: Int }
 
-/// What the index on disk names, so `data_bytes - live_bytes` is what compaction reclaims.
+type Live = { counts: Map<Int, Int>, frames: Int, rows: Int }
+
+/// What the segments hold, and what one segment of the live entries alone would take, so
+/// `data_bytes - live_bytes` is what compaction reclaims.
 pub fn stats(store: Store) -> Stats / {abort.raise} = {
-  let live = fold(
-    store.sections,
-    if store.data_len == 0 { 0 } else { data_header() },
-    |acc: Int, sec: Section|
-      fold(range(0, sec.count), acc, |n: Int, i: Int|
-        n + frame_header() + u32_at(store.index, record_at(sec, i) + key_width() + 8)),
+  let live = map_fold(
+    newest(store, 0),
+    { counts: map_new(), frames: 0, rows: 0 },
+    |acc: Live, sl: Bytes, p: Placed|
+      if dropped(p.row) { acc } else {
+        let table = bytes_at(sl, 0);
+        {
+          counts: map_insert(
+            acc.counts,
+            table,
+            1 + (match map_get(acc.counts, table) { Some(n) -> n, None -> 0 }),
+          ),
+          frames: acc.frames + segments::framed_len(size_of(p.row)),
+          rows: acc.rows + 1,
+        }
+      },
   );
   {
-    entries: map(store.sections, |sec: Section| { table: sec.table, count: sec.count }),
-    data_bytes: store.data_len,
-    live_bytes: live,
+    entries: map_fold(live.counts, [], |acc: List<{ table: Int, count: Int }>, t: Int, n: Int|
+      push(acc, { table: t, count: n })),
+    data_bytes: fold(store.manifest.segments, 0, |n: Int, seg: Segment| n + seg.size),
+    live_bytes: if len(store.manifest.segments) == 0 { 0 }
+    else { segments::header_len() + live.frames + live.rows * row_width() },
   }
 }
 
@@ -374,326 +265,205 @@ pub fn pending(store: Store) -> Int = map_len(store.puts) + map_len(store.drops)
 fn not_kept(store: Store, why: String) -> Store =
   warn(store, Unreadable, why ++ "; this run's entries were not kept")
 
-pub fn fresh_nonce() -> Bytes / {entropy.next, time.now_ms, abort.raise} =
-  bytes_slice(bytes_blake3(u64_le(entropy.next()) ++ u64_le(time.now_ms())), 0, 16)
+/// `store` as the manifest `m` names it, with nothing waiting to be written.
+fn named<[r]>(store: Store, m: Manifest) -> Store / {fs.read[r], abort.raise} = {
+  let had = fold(range(0, len(store.rows)), map_new(), |acc: Map<Bytes, Bytes>, i: Int| {
+    let token = at(store.manifest.segments, i).token;
+    if fold(store.lost, false, |any: Bool, t: Bytes| any || t == token) { acc }
+    else { map_insert(acc, token, at(store.rows, i)) }
+  });
+  let read = read_of[r](store.dir, m, had);
+  unread({
+    ..store,
+    manifest: m,
+    rows: read.rows,
+    lost: read.lost,
+    puts: map_new(),
+    drops: map_new(),
+  })
+}
 
-fn data_head(nonce: Bytes, schema: Bytes) -> Bytes =
-  bytes_concat_all([data_magic(), u32_le(format()), nonce, schema])
+type Laid = { writing: Writing, rows: Map<Bytes, Bytes>, lost: Int }
 
-/// Read, merge and write under the lock, so two runs flushing one store keep each other's entries.
-pub fn flush<[r]>(
+fn framed_into<[r]>(
   store: Store,
-) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  if pending(store) == 0 { store } else if !fs.create_dir[r](store.dir) {
-    not_kept(store, "the store's directory could not be made")
-  } else if !fs.lock[r](join(store.dir, lock_name())) {
-    not_kept(store, "another run holds the store's lock")
-  } else {
-    sweep[r](store.dir);
-    let written = locked_flush[r](store);
-    // Every stamp change leaves the old entries behind, and past the read cap each lookup is a
-    // read of its own, so a data file mostly unreachable is rewritten while the lock is held.
-    let kept = if pending(written) == 0 && wasteful(stats(written)) { locked_compact[r](written) }
-    else { written };
-    if fs.unlock[r](join(store.dir, lock_name())) { kept }
-    else { warn(kept, Unreadable, "the store's lock could not be released") }
+  token: Bytes,
+  acc: Laid,
+  sl: Bytes,
+  payload: Bytes,
+) -> Laid / {fs.write[r], abort.raise} = {
+  let f = segments::framing(acc.writing, payload);
+  {
+    writing: segments::appended_when_full[r](store.dir, store.schema, token, f.writing),
+    rows: map_insert(acc.rows, sl, rest_of(false, f.at, bytes_len(payload))),
+    lost: acc.lost,
   }
+}
+
+fn finished<[r]>(
+  store: Store,
+  token: Bytes,
+  laid: Laid,
+) -> Option<Segment> / {fs.write[r], abort.raise} =
+  segments::finished[r](
+    store.dir,
+    store.schema,
+    token,
+    laid.writing,
+    [segments::table(rows_table(), laid.rows, |_: Bytes, rest: Bytes| Some(rest))],
+    [],
+  )
+
+fn unnamed<[r]>(store: Store, token: Bytes) -> Unit / {fs.write[r], abort.raise} = {
+  fs.remove[r](segments::segment_path(store.dir, token));
+  ()
+}
+
+/// What a run put and dropped written as one segment, which the store's manifest then names: read
+/// again under the lock, so two runs flushing one store keep each other's entries, and the later
+/// wins a key both wrote.
+pub fn flush<[r]>(store: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} =
+  if pending(store) == 0 { store } else {
+    match segments::entered[r](store.dir) {
+      None -> not_kept(store, "the store's directory could not be made"),
+      Some(run) -> {
+        let done = flushed[r](store, run);
+        segments::left[r](Some(run));
+        done
+      },
+    }
+  }
+
+fn flushed<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
+  let token = segments::token_of(Some(run), store.manifest.generation, 0);
+  let framed = map_fold(
+    store.puts,
+    { writing: segments::unwritten(), rows: map_new(), lost: 0 },
+    |acc: Laid, sl: Bytes, payload: Bytes| framed_into[r](store, token, acc, sl, payload),
+  );
+  let laid = {
+    ..framed,
+    rows: map_fold(store.drops, framed.rows, |acc: Map<Bytes, Bytes>, sl: Bytes, _: Bool|
+      map_insert(acc, sl, rest_of(true, 0, 0))),
+  };
+  match finished[r](store, token, laid) {
+    None -> not_kept(store, "the store's data could not be written"),
+    Some(seg) -> match segments::committed[r](
+        store.dir,
+        store.schema,
+        store.manifest.generation,
+        seg,
+        store.lost,
+        true,
+      ) {
+      Named(m) -> tidied[r](named[r](store, m), run),
+      Held -> {
+        unnamed[r](store, token);
+        not_kept(store, "another run holds the store's lock")
+      },
+      _ -> {
+        unnamed[r](store, token);
+        not_kept(store, "the store's manifest could not be written")
+      },
+    },
+  }
+}
 
 fn wasteful(st: Stats) -> Bool = (st.data_bytes - st.live_bytes) * 2 > st.data_bytes
 
-/// Every temp file is stale under the lock: only its holder writes one.
-fn sweep<[r]>(dir: String) -> Unit / {fs.read[r], fs.write[r]} =
-  match fs.list_dir[r](dir) {
-    None -> (),
-    Some(names) ->
-      fold(names, (), |u: Unit, name: String|
-        if string_starts_with(name, "store.") && string_ends_with(name, temp_suffix()) {
-          if fs.remove[r](join(dir, name)) { () } else { () }
-        } else { () }),
-  }
-
-type Base = { disk: Option<Disk>, warnings: List<Warning> }
-
-/// The store on disk now, which another run may have written since this one opened it: what this
-/// run holds, where the index it read is still the one on disk.
-fn base<[r]>(
-  store: Store,
-) -> Base / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  if store.data_len > 0 && fs.read_file[r](join(store.dir, index_name())) == Some(store.index) {
-    {
-      disk: Some({
-        nonce: store.nonce,
-        data_len: store.data_len,
-        index: store.index,
-        sections: store.sections,
-      }),
-      warnings: store.warnings,
-    }
-  } else {
-    match load[r](store.dir, store.schema) {
-      Valid(d) -> { disk: Some(d), warnings: store.warnings },
-      Cold -> started[r](store.dir, store.schema, store.warnings),
-      Unusable(p) -> started[r](store.dir, store.schema, noted(store.warnings, starts_empty(p))),
-    }
-  }
-
-fn started<[r]>(
-  dir: String,
-  schema: Bytes,
-  warnings: List<Warning>,
-) -> Base / {fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let nonce = fresh_nonce();
-  let file = join(dir, data_name());
-  if fs.write_file[r](file, data_head(nonce, schema)) && fs.sync[r](file) {
-    {
-      disk: Some({ nonce: nonce, data_len: data_header(), index: b"", sections: [] }),
-      warnings: warnings,
-    }
-  } else { { disk: None, warnings: warnings } }
+/// `store` after a flush: what no manifest names removed, then its newest segments written again
+/// as one where they are due, and all of them where most of what they hold is replaced or dropped.
+/// The segments that rewrite replaces stay until the next flush, since the store is read without a
+/// run's directory: a run that opened it before this flush still reads what it was shown.
+fn tidied<[r]>(store: Store, run: String) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
+  segments::swept[r](store.dir, store.schema, run, []);
+  fold(retired(), (), |_: Unit, name: String| {
+    fs.remove[r](join(store.dir, name));
+    ()
+  });
+  let from = if wasteful(stats(store)) { 0 } else { segments::merging(store.manifest) };
+  if from < len(store.manifest.segments) - 1 { rewritten[r](store, from, run, 1) } else { store }
 }
 
-type Placed = { slot: Bytes, at: Int, len: Int }
-type Batch = { frames: List<Bytes>, size: Int, placed: List<Placed> }
-
-fn batch_of(puts: Map<Bytes, Bytes>) -> Batch / {abort.raise} =
-  map_fold(puts, { frames: [], size: 0, placed: [] }, |acc: Batch, sl: Bytes, payload: Bytes| {
-    let f = frame(bytes_at(sl, 0), payload);
-    {
-      frames: push(acc.frames, f),
-      size: acc.size + bytes_len(f),
-      placed: push(acc.placed, { slot: sl, at: acc.size, len: bytes_len(payload) }),
-    }
-  })
-
-fn locked_flush<[r]>(
+/// The segments of `store` from the one at `from` on written again as one: of each slot its newest
+/// row and that row's payload. A dropped slot keeps its row while an older segment may still hold
+/// the entry.
+fn rewritten<[r]>(
   store: Store,
-) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
-  let b = base[r](store);
-  let s1 = { ..store, warnings: b.warnings };
-  match b.disk {
-    None -> not_kept(s1, "the store's data file could not be started"),
-    Some(d) -> {
-      let batch = batch_of(store.puts);
-      let file = join(store.dir, data_name());
-      let landed = if batch.size == 0 { Some(d.data_len) }
-      else { fs.append[r](file, bytes_concat_all(batch.frames)) };
-      match landed {
-        None -> not_kept(s1, "the store's data file could not be written"),
-        Some(at) -> if batch.size > 0 && !fs.sync[r](file) {
-          not_kept(s1, "the store's data file could not be synced")
-        } else {
-          let moved = map(batch.placed, |p: Placed| { slot: p.slot, at: at + p.at, len: p.len });
-          let tables = merged(d, store.drops, moved);
-          let index = index_bytes(
-            d.nonce,
-            if batch.size == 0 { d.data_len } else { at + batch.size },
-            store.schema,
-            tables,
-          );
-          published[r](s1, index)
-        },
-      }
-    },
-  }
-}
-
-/// Writes the index beside its place, then renames it there, so a reader sees the old or the new.
-fn published<[r]>(store: Store, index: Bytes) -> Store / {fs.write[r], abort.raise} = {
-  let tmp = join(store.dir, index_name() ++ temp_suffix());
-  if fs.write_file[r](tmp, index) && fs.sync[r](tmp)
-      && fs.rename[r](tmp, join(store.dir, index_name())) {
-    match parse_index(index, store.schema) {
-      Ok(d) -> {
-        let fresh = with_disk(store.dir, store.schema, d, store.warnings);
-        if store.dir == "" || fs.sync[r](store.dir) { fresh }
-        else { warn(fresh, Unreadable, "the store's directory could not be synced") }
+  from: Int,
+  run: String,
+  nth: Int,
+) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
+  let token = segments::token_of(Some(run), store.manifest.generation, nth);
+  let laid = map_fold(
+    newest(store, from),
+    { writing: segments::unwritten(), rows: map_new(), lost: 0 },
+    |acc: Laid, sl: Bytes, p: Placed|
+      if dropped(p.row) {
+        if from == 0 { acc } else { { ..acc, rows: map_insert(acc.rows, sl, rest_of(true, 0, 0)) } }
+      } else {
+        match segments::payload[r](store.dir, p.token, offset_of(p.row), size_of(p.row)) {
+          Some(payload) -> framed_into[r](store, token, acc, sl, payload),
+          None -> { ..acc, lost: acc.lost + 1 },
+        }
       },
-      Err(why) ->
-        not_kept(store, "the index this run wrote does not read back (" ++ why.why ++ ")"),
-    }
-  } else { not_kept(store, "the store's index could not be written") }
-}
-
-type New = { key: Bytes, record: Bytes }
-type Table = { table: Int, records: List<Bytes> }
-
-fn record(key: Bytes, at: Int, len: Int) -> Bytes = bytes_concat_all([key, u64_le(at), u32_le(len)])
-
-fn table_ids(secs: List<Section>, placed: List<Placed>) -> List<Int> / {abort.raise} =
-  map_keys(
-    fold(
-      placed,
-      fold(secs, map_new(), |m: Map<Int, Bool>, s: Section| map_insert(m, s.table, true)),
-      |m: Map<Int, Bool>, p: Placed| map_insert(m, bytes_at(p.slot, 0), true),
-    ),
-  )
-
-/// Each table's records, the old and the new merged in key order: a new one replaces an old one with
-/// its key, and a dropped key is left out.
-fn merged(d: Disk, drops: Map<Bytes, Bool>, placed: List<Placed>) -> List<Table> / {abort.raise} =
-  map(table_ids(d.sections, placed), |t: Int| {
-    let news = fold(placed, [], |acc: List<New>, p: Placed|
-      if bytes_at(p.slot, 0) != t { acc } else {
-        let key = bytes_slice(p.slot, 1, bytes_len(p.slot));
-        push(acc, { key: key, record: record(key, p.at, p.len) })
-      });
-    let sec = match section_of(d.sections, t) {
-      Some(x) -> x,
-      None -> { table: t, count: 0, start: 0 },
-    };
-    { table: t, records: merge_from(d.index, drops, sec, news, 0, 0, []) }
-  })
-
-fn keep_old(
-  index: Bytes,
-  drops: Map<Bytes, Bool>,
-  sec: Section,
-  i: Int,
-  out: List<Bytes>,
-) -> List<Bytes> / {abort.raise} =
-  if map_contains(drops, slot(sec.table, key_at(index, sec, i))) { out }
-  else { push(out, bytes_slice(index, record_at(sec, i), record_at(sec, i) + record_width())) }
-
-fn merge_from(
-  index: Bytes,
-  drops: Map<Bytes, Bool>,
-  sec: Section,
-  news: List<New>,
-  i: Int,
-  j: Int,
-  out: List<Bytes>,
-) -> List<Bytes> / {abort.raise} =
-  match list_at(news, j) {
-    None -> if i >= sec.count { out }
-    else { merge_from(index, drops, sec, news, i + 1, j, keep_old(index, drops, sec, i, out)) },
-    Some(n) -> if i >= sec.count {
-      merge_from(index, drops, sec, news, i, j + 1, push(out, n.record))
-    } else {
-      let order = compare_values(key_at(index, sec, i), n.key);
-      if order == Less {
-        merge_from(index, drops, sec, news, i + 1, j, keep_old(index, drops, sec, i, out))
-      } else if order == Equal {
-        merge_from(index, drops, sec, news, i + 1, j + 1, push(out, n.record))
-      } else { merge_from(index, drops, sec, news, i, j + 1, push(out, n.record)) }
+  );
+  let s1 = if laid.lost == 0 { store }
+  else { warn(store, Corrupt, "compaction dropped entries that did not verify") };
+  match finished[r](s1, token, laid) {
+    None -> warn(s1, Unreadable, "the store could not be compacted"),
+    Some(seg) -> match segments::swapped[r](s1.dir, s1.schema, s1.manifest, from, seg, true) {
+      Named(m) -> named[r](s1, m),
+      Held -> {
+        unnamed[r](s1, token);
+        warn(s1, Unreadable, "another run holds the store's lock; it was not compacted")
+      },
+      _ -> {
+        unnamed[r](s1, token);
+        s1
+      },
     },
   }
-
-type Dir = { start: Int, entries: List<Bytes> }
-
-fn index_bytes(nonce: Bytes, data_len: Int, schema: Bytes, tables: List<Table>) -> Bytes = {
-  let kept = filter(tables, |t: Table| len(t.records) > 0);
-  let first = index_header() + len(kept) * table_width();
-  let dir = fold(kept, { start: first, entries: [] }, |acc: Dir, t: Table|
-    {
-      start: acc.start + len(t.records) * record_width(),
-      entries: push(
-        acc.entries,
-        bytes_concat_all([u32_le(t.table), u32_le(len(t.records)), u64_le(acc.start)]),
-      ),
-    });
-  let body = bytes_concat_all([
-    bytes_concat_all(dir.entries),
-    bytes_concat_all(map(kept, |t: Table| bytes_concat_all(t.records))),
-  ]);
-  bytes_concat_all([
-    index_magic(),
-    u32_le(format()),
-    nonce,
-    u64_le(data_len),
-    schema,
-    bytes_blake3(body),
-    u32_le(len(kept)),
-    body,
-  ])
 }
 
 // --- Compaction -------------------------------------------------------------
 
-type Copied = { frames: List<Bytes>, size: Int, tables: List<Table>, dropped: Int }
-
-/// The live frames copied into a fresh data file, so what replaced or dropped entries left is gone.
-pub fn compact<[r]>(
-  s0: Store,
-) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
+/// The live entries written again as one segment, so what replaced or dropped entries left is gone
+/// at once: a run that opened the store before reads its entries as absent from then on.
+pub fn compact<[r]>(s0: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} = {
   let s = flush[r](s0);
-  if pending(s) > 0 { s } else if !fs.lock[r](join(s.dir, lock_name())) {
-    warn(s, Unreadable, "another run holds the store's lock; it was not compacted")
-  } else {
-    sweep[r](s.dir);
-    let done = locked_compact[r](s);
-    if fs.unlock[r](join(s.dir, lock_name())) { done }
-    else { warn(done, Unreadable, "the store's lock could not be released") }
+  let st = stats(s);
+  if pending(s) > 0 || (len(s.manifest.segments) < 2 && st.data_bytes == st.live_bytes) { s } else {
+    match segments::entered[r](s.dir) {
+      None -> warn(s, Unreadable, "the store could not be compacted"),
+      Some(run) -> {
+        let done = rewritten[r](s, 0, run, 0);
+        segments::swept[r](done.dir, done.schema, run, []);
+        segments::left[r](Some(run));
+        done
+      },
+    }
   }
 }
 
-fn locked_compact<[r]>(
-  store: Store,
-) -> Store / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} =
-  match load[r](store.dir, store.schema) {
-    Cold -> store,
-    Unusable(p) -> { ..store, warnings: noted(store.warnings, starts_empty(p)) },
-    Valid(d) -> {
-      let copied = fold(
-        d.sections,
-        { frames: [], size: data_header(), tables: [], dropped: 0 },
-        |acc: Copied, sec: Section| copy_table[r](store.dir, d, sec, acc),
-      );
-      let nonce = fresh_nonce();
-      let data = bytes_concat_all([
-        data_head(nonce, store.schema),
-        bytes_concat_all(copied.frames),
-      ]);
-      let index = index_bytes(nonce, copied.size, store.schema, copied.tables);
-      let dtmp = join(store.dir, data_name() ++ temp_suffix());
-      let itmp = join(store.dir, index_name() ++ temp_suffix());
-      let s1 = if copied.dropped == 0 { store }
-      else { warn(store, Corrupt, "compaction dropped entries that did not verify") };
-      if fs.write_file[r](dtmp, data) && fs.sync[r](dtmp) && fs.write_file[r](itmp, index)
-          && fs.sync[r](itmp)
-          && fs.rename[r](dtmp, join(store.dir, data_name()))
-          && fs.rename[r](itmp, join(store.dir, index_name())) {
-        match parse_index(index, store.schema) {
-          Ok(nd) -> with_disk(store.dir, store.schema, nd, s1.warnings),
-          Err(p) ->
-            warn(s1, Corrupt, "the index compaction wrote does not read back (" ++ p.why ++ ")"),
-        }
-      } else { warn(s1, Unreadable, "the store could not be compacted") }
-    },
+/// Everything a store keeps in `dir` removed, whatever format wrote it: whether all of it went.
+pub fn cleared<[r]>(dir: String) -> Bool / {fs.read[r], fs.write[r]} =
+  match fs.list_dir[r](dir) {
+    None -> true,
+    Some(names) ->
+      fold(names, true, |ok: Bool, name: String|
+        if string_starts_with(name, "manifest-") || string_starts_with(name, "seg-")
+            || fold(retired(), false, |any: Bool, old: String| any || old == name) {
+          fs.remove[r](join(dir, name)) && ok
+        } else { ok }),
   }
 
-fn copy_table<[r]>(
-  dir: String,
-  d: Disk,
-  sec: Section,
-  acc0: Copied,
-) -> Copied / {fs.read[r], abort.raise} = {
-  let walked = fold(
-    range(0, sec.count),
-    { frames: acc0.frames, size: acc0.size, records: [], dropped: acc0.dropped },
-    |acc: { frames: List<Bytes>, size: Int, records: List<Bytes>, dropped: Int }, i: Int| {
-      let at = record_at(sec, i);
-      let len = u32_at(d.index, at + key_width() + 8);
-      match frame_at[r](dir, d.data_len, sec.table, u64_at(d.index, at + key_width()), len) {
-        Hit(payload) -> {
-          let f = frame(sec.table, payload);
-          {
-            frames: push(acc.frames, f),
-            size: acc.size + bytes_len(f),
-            records: push(acc.records, record(key_at(d.index, sec, i), acc.size, len)),
-            dropped: acc.dropped,
-          }
-        },
-        _ -> { ..acc, dropped: acc.dropped + 1 },
-      }
-    },
-  );
-  {
-    frames: walked.frames,
-    size: walked.size,
-    tables: push(acc0.tables, { table: sec.table, records: walked.records }),
-    dropped: walked.dropped,
-  }
-}
+/// How many bytes the store's files in `dir` take, those no manifest names any more among them.
+pub fn kept_bytes<[r]>(dir: String) -> Int / {fs.read[r]} =
+  fold(match fs.list_dir[r](dir) { Some(names) -> names, None -> [] }, 0, |n: Int, name: String|
+    if string_starts_with(name, "manifest-") || string_starts_with(name, "seg-") {
+      n + (match fs.file_size[r](join(dir, name)) { Some(size) -> size, None -> 0 })
+    } else { n })
 
 pub fn name_key(name: String) -> Bytes = bytes_blake3(bytes_of_string(name))
 
@@ -710,6 +480,11 @@ fn all(xs: List<List<Warning>>) -> List<String> =
 
 fn missed(f: Found) -> Bool = match f { Miss -> true, _ -> false }
 
+/// The segments the store in `cache` is kept in, by name.
+fn segments_kept() -> List<String> / {fs.read[mem]} =
+  filter(match fs.list_dir[mem]("cache") { Some(names) -> names, None -> [] }, |name: String|
+    string_starts_with(name, "seg-"))
+
 test "what a store puts it reads at once, and again after a flush and a reopen" {
   let run = on_twin(mem_empty(), || {
     let s0 = open[mem]("cache", schema_a());
@@ -724,6 +499,7 @@ test "what a store puts it reads at once, and again after a flush and a reopen" 
     let s2 = flush[mem](s1);
     assert_eq(s2.warnings, []);
     assert_eq(pending(s2), 0);
+    assert_eq(hit(get[mem](s2, 1, name_key("b"))), b"beta");
     let s3 = open[mem]("cache", schema_a());
     assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"alpha");
     assert_eq(hit(get[mem](s3, 1, name_key("b"))), b"beta");
@@ -768,39 +544,43 @@ test "two runs flushing one store keep each other's entries, and the later wins 
     );
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
+    // The later flush reads the manifest again, so it holds what the earlier one kept.
+    assert_eq(hit(get[mem](b1, 1, name_key("mine"))), b"a");
     let c = open[mem]("cache", schema_a());
     assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
     assert_eq(hit(get[mem](c, 1, name_key("theirs"))), b"b");
     assert_eq(hit(get[mem](c, 1, name_key("both"))), b"from b");
+    assert_eq(keys(c, 1), keys(b1, 1));
     all([a1.warnings, b1.warnings, c.warnings])
   });
   assert_eq(run.value, [])
 }
 
-test "a run whose index is stale at its flush reads the store again and keeps the other's entries" {
+test "a drop by one run holds over what another flushed before it" {
   let run = on_twin(mem_empty(), || {
     let s0 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("first"), b"0"));
     let a = put(open[mem]("cache", schema_a()), 1, name_key("mine"), b"a");
-    let b = put(open[mem]("cache", schema_a()), 1, name_key("theirs"), b"b");
+    let b = drop(open[mem]("cache", schema_a()), 1, name_key("first"));
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
     let c = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](c, 1, name_key("first"))), b"0");
+    assert(missed(get[mem](c, 1, name_key("first"))));
     assert_eq(hit(get[mem](c, 1, name_key("mine"))), b"a");
-    assert_eq(hit(get[mem](c, 1, name_key("theirs"))), b"b");
+    assert_eq(keys(c, 1), [name_key("mine")]);
     all([s0.warnings, a1.warnings, b1.warnings, c.warnings])
   });
   assert_eq(run.value, [])
 }
 
-test "a torn append past what the index vouches for is never read and is written over" {
+test "a segment no manifest names is never read, and goes with the next flush" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"kept"));
-    match fs.append[mem]("cache/store.dat", b"\x01\x05\x00\x00\x00half") { _ -> () };
+    assert(fs.write_file[mem]("cache/seg-00000000000000ff", b"left by a run that died"));
     let s2 = open[mem]("cache", schema_a());
     assert_eq(s2.warnings, []);
     assert_eq(hit(get[mem](s2, 1, name_key("a"))), b"kept");
     let s3 = flush[mem](put(s2, 1, name_key("b"), b"after"));
+    assert(!fs.exists[mem]("cache/seg-00000000000000ff"));
     let s4 = open[mem]("cache", schema_a());
     assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"kept");
     assert_eq(hit(get[mem](s4, 1, name_key("b"))), b"after");
@@ -812,106 +592,138 @@ test "a torn append past what the index vouches for is never read and is written
 test "a frame that does not verify is a miss with its reason, never a half-read value" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"payload"));
-    let data = match fs.read_file[mem]("cache/store.dat") { Some(b) -> b, None -> b"" };
-    let n = bytes_len(data);
-    let broken = bytes_slice(data, 0, n - 1) ++ b"X";
-    assert(fs.write_file[mem]("cache/store.dat", broken));
+    let file = "cache/" ++ at(segments_kept(), 0);
+    let data = match fs.read_file[mem](file) { Some(b) -> b, None -> b"" };
+    let frame = segments::header_len();
+    let broken = bytes_concat_all([
+      bytes_slice(data, 0, frame + 12),
+      b"X",
+      bytes_slice(data, frame + 13, bytes_len(data)),
+    ]);
+    assert(fs.write_file[mem](file, broken));
     get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))
   });
   assert_eq(run.value, Bad("a frame does not match its checksum"))
 }
 
-test "a store written under another schema, or missing its data file, opens empty and says why" {
+test "a store written under another schema opens empty, says why, and leaves the other's entries" {
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     let other = open[mem]("cache", b"schema b");
     assert(missed(get[mem](other, 1, name_key("a"))));
-    assert(fs.remove[mem]("cache/store.dat"));
+    assert_eq(pending(flush[mem](put(other, 1, name_key("b"), b"y"))), 0);
+    assert_eq(messages(open[mem]("cache", b"schema b").warnings), []);
+    assert_eq(hit(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))), b"x");
+    all([s1.warnings, other.warnings])
+  });
+  assert_eq(run.value, ["the store was written by another version; this run starts empty"])
+}
+
+test "a store missing a segment says so, reads the rest, and names the segment no longer" {
+  let run = on_twin(mem_empty(), || {
+    // Long enough that the short segment after it is not written again with it as one.
+    let long = bytes_concat_all(map(range(0, 64), |i: Int| b"0123456789abcdef"));
+    let s1 = flush[mem](
+      put(put(open[mem]("cache", schema_a()), 1, name_key("a"), long), 1, name_key("b"), long),
+    );
+    let first = at(segments_kept(), 0);
+    let s2 = flush[mem](put(s1, 1, name_key("c"), b"x"));
+    assert_eq(len(s2.manifest.segments), 2);
+    assert(fs.remove[mem]("cache/" ++ first));
     let gone = open[mem]("cache", schema_a());
     assert(missed(get[mem](gone, 1, name_key("a"))));
-    let again = flush[mem](put(gone, 1, name_key("b"), b"y"));
-    assert_eq(hit(get[mem](open[mem]("cache", schema_a()), 1, name_key("b"))), b"y");
-    all([other.warnings, gone.warnings])
+    assert_eq(hit(get[mem](gone, 1, name_key("c"))), b"x");
+    let again = flush[mem](put(gone, 1, name_key("d"), b"y"));
+    assert_eq(pending(again), 0);
+    let back = open[mem]("cache", schema_a());
+    assert_eq(hit(get[mem](back, 1, name_key("d"))), b"y");
+    assert_eq(hit(get[mem](back, 1, name_key("c"))), b"x");
+    all([s2.warnings, gone.warnings, back.warnings])
   });
-  assert_eq(run.value, [
-    "the store was written by another version (the index was written for other stored types); this run starts empty",
-    "the store is unreadable (the data file is missing); this run starts empty",
-  ])
+  assert_eq(run.value, ["a part of the store does not read; its entries are treated as absent"])
 }
 
 test "a run that cannot take the lock writes nothing and says so" {
   let run = on_twin(mem_empty(), || {
     assert(fs.create_dir[mem]("cache"));
-    assert(fs.lock[mem]("cache/store.lock"));
+    assert(fs.lock[mem]("cache/lock"));
     let s = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     assert_eq(pending(s), 1);
     assert(missed(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))));
+    assert_eq(segments_kept(), []);
     messages(s.warnings)
   });
   assert_eq(run.value, ["another run holds the store's lock; this run's entries were not kept"])
 }
 
-test "compaction keeps the live frames, reclaims the rest, and sweeps a stale temp" {
+test "compaction keeps the live entries in one segment and reclaims the rest" {
   let run = on_twin(mem_empty(), || {
+    let long = bytes_concat_all(map(range(0, 64), |i: Int| b"0123456789abcdef"));
     let s1 = flush[mem](
       put(
-        put(open[mem]("cache", schema_a()), 1, name_key("a"), b"first"),
+        put(
+          put(open[mem]("cache", schema_a()), 1, name_key("a"), b"first"),
+          1,
+          name_key("b"),
+          b"gone",
+        ),
         1,
-        name_key("b"),
-        b"gone",
+        name_key("c"),
+        long,
       ),
     );
     let s2 = flush[mem](drop(put(s1, 1, name_key("a"), b"second"), 1, name_key("b")));
     assert(stats(s2).data_bytes > stats(s2).live_bytes);
-    assert(fs.write_file[mem]("cache/store.idx.tmp", b"left by a crash"));
     let s3 = compact[mem](s2);
     assert_eq(stats(s3).data_bytes, stats(s3).live_bytes);
-    assert(s3.nonce != s2.nonce);
-    assert(!fs.exists[mem]("cache/store.idx.tmp"));
+    assert_eq(len(s3.manifest.segments), 1);
+    assert_eq(len(segments_kept()), 1);
     let s4 = open[mem]("cache", schema_a());
     assert_eq(hit(get[mem](s4, 1, name_key("a"))), b"second");
     assert(missed(get[mem](s4, 1, name_key("b"))));
+    assert_eq(hit(get[mem](s4, 1, name_key("c"))), long);
+    assert_eq(keys(s4, 1), keys(s3, 1));
     all([s3.warnings, s4.warnings])
   });
   assert_eq(run.value, [])
 }
 
-test "a flush that leaves most of the data file unreachable compacts it" {
+test "a flush that leaves most of what the store holds unreachable writes it again" {
   let run = on_twin(mem_empty(), || {
     let big = bytes_concat_all(map(range(0, 64), |i: Int| b"0123456789abcdef"));
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), big));
+    let first = "cache/" ++ at(segments_kept(), 0);
     let s2 = flush[mem](put(s1, 1, name_key("a"), b"small"));
     assert_eq(stats(s2).data_bytes, stats(s2).live_bytes);
-    assert(s2.nonce != s1.nonce);
+    assert_eq(len(s2.manifest.segments), 1);
+    // A run that opened the store before the flush still reads what it was shown, until the next.
+    assert_eq(hit(get[mem](s1, 1, name_key("a"))), big);
     let s3 = open[mem]("cache", schema_a());
+    assert_eq(pending(flush[mem](put(s3, 1, name_key("b"), b"next"))), 0);
+    assert(!fs.exists[mem](first));
     assert_eq(hit(get[mem](s3, 1, name_key("a"))), b"small");
     all([s2.warnings, s3.warnings])
   });
   assert_eq(run.value, [])
 }
 
-test "an index that does not match its checksum opens empty and is replaced by the next flush" {
+test "what a store kept as two files reads as another version's, and the next flush removes it" {
   let run = on_twin(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
-    let idx = match fs.read_file[mem]("cache/store.idx") { Some(b) -> b, None -> b"" };
-    let n = bytes_len(idx);
-    let flipped = byte_of_int(bytes_at(idx, n - 4) ^ 1);
+    assert(fs.create_dir[mem]("cache"));
     assert(
-      fs.write_file[mem](
-        "cache/store.idx",
-        bytes_concat_all([bytes_slice(idx, 0, n - 4), flipped, bytes_slice(idx, n - 3, n)]),
-      ),
+      fs.write_file[mem]("cache/store.idx", b"PLYSTIDX")
+        && fs.write_file[mem]("cache/store.dat", b"PLYSTDAT"),
     );
+    let old = open[mem]("cache", schema_a());
+    let s1 = flush[mem](put(old, 1, name_key("a"), b"x"));
+    assert(!fs.exists[mem]("cache/store.idx") && !fs.exists[mem]("cache/store.dat"));
     let s2 = open[mem]("cache", schema_a());
-    assert(missed(get[mem](s2, 1, name_key("a"))));
-    let s3 = flush[mem](put(s2, 1, name_key("b"), b"y"));
-    let s4 = open[mem]("cache", schema_a());
-    assert_eq(hit(get[mem](s4, 1, name_key("b"))), b"y");
-    all([s2.warnings, s4.warnings])
+    assert_eq(hit(get[mem](s2, 1, name_key("a"))), b"x");
+    assert(cleared[mem]("cache"));
+    assert(missed(get[mem](open[mem]("cache", schema_a()), 1, name_key("a"))));
+    all([old.warnings, s2.warnings])
   });
-  assert_eq(run.value, [
-    "the store is unreadable (the index does not match its checksum); this run starts empty",
-  ])
+  assert_eq(run.value, ["the store was written by another version; this run starts empty"])
 }
 
 fn at_least(ws: List<Warning>) -> Warning =
@@ -921,9 +733,9 @@ test "a warning says whether the store was another version's, damaged, or out of
   let run = on_twin(mem_empty(), || {
     let s1 = flush[mem](put(open[mem]("cache", schema_a()), 1, name_key("a"), b"x"));
     let other = open[mem]("cache", b"schema b");
-    assert(fs.remove[mem]("cache/store.dat"));
+    assert(fs.remove[mem]("cache/" ++ at(segments_kept(), 0)));
     let gone = open[mem]("cache", schema_a());
-    assert(fs.lock[mem]("cache/store.lock"));
+    assert(fs.lock[mem]("cache/lock"));
     let held = flush[mem](put(gone, 1, name_key("b"), b"y"));
     map(push(held.warnings, at_least(other.warnings)), |w: Warning| w.trouble)
   });

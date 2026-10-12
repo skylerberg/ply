@@ -235,13 +235,20 @@ impl<'l> Writer<'l> {
                     self.varint(0);
                     return Ok(());
                 }
+                // Each argument is written as the value it is; the reader lays them out again.
                 self.out.push(CTOR);
                 self.ctor(layout);
                 self.out.push(flags);
-                self.varint(u64::from(len));
-                (0..len as usize)
-                    .map(|i| unsafe { word_at(o, i) })
-                    .collect()
+                let parts = self.layouts.parts(o);
+                self.varint(parts.len() as u64);
+                pending.push(Pending::Done(w as usize));
+                pending.extend(
+                    parts
+                        .into_iter()
+                        .rev()
+                        .map(|(at, slot)| Pending::Held(o, at, slot)),
+                );
+                return Ok(());
             }
             KIND_LIST => self.sequence(LIST, LIST_WORDS, list::to_vec(o)),
             KIND_ARRAY if array::in_place(o) => {
@@ -345,7 +352,7 @@ struct Open {
 
 enum Make {
     Record { shape: u32 },
-    Ctor { index: u32, flags: u8 },
+    Ctor { index: u32 },
     List,
     Array,
     Map,
@@ -504,7 +511,7 @@ impl<'a> Reader<'a> {
                         self.heap.alloc(KIND_CTOR, flags, 0, index) as Word
                     }));
                 }
-                (Make::Ctor { index, flags }, want)
+                (Make::Ctor { index }, want)
             }
             LIST => (Make::List, self.count()?),
             ARRAY => (Make::Array, self.count()?),
@@ -527,12 +534,6 @@ impl<'a> Reader<'a> {
     }
 
     fn made(&mut self, done: Open) -> Word {
-        let filled = |o: *mut heap::Obj, parts: &[Word]| {
-            for (i, w) in parts.iter().enumerate() {
-                unsafe { set_word(o, i, *w) };
-            }
-            o as Word
-        };
         let w = match done.make {
             Make::Record { shape } => {
                 for part in &done.parts {
@@ -548,11 +549,12 @@ impl<'a> Reader<'a> {
                     .collect();
                 self.heap.record(self.layouts, &fields)
             }
-            Make::Ctor { index, flags } => {
-                let o = self
-                    .heap
-                    .alloc(KIND_CTOR, flags, done.parts.len() as u32, index);
-                filled(o, &done.parts)
+            Make::Ctor { index } => {
+                for part in &done.parts {
+                    heap::inc(*part);
+                }
+                self.held.extend(done.parts.iter().copied());
+                self.heap.ctor(self.layouts, index, &done.parts)
             }
             Make::List => self.heap.list_from(&done.parts),
             Make::Array => {

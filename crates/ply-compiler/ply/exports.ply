@@ -15,14 +15,15 @@ import front (no_rows, Analysis, Analysed, Refused, Pulled, Staged, Hashed, Ship
 import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef, OpDef,
-              Derived, parse, header, is_written, item_span, import_decl_bin, owner_of, item_owner)
+              Derived, DRow, parse, header, is_written, item_span, import_decl_bin, owner_of,
+              item_owner)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span)
 import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
              hashed_forms, fixed_bin)
 import resolve (Source, ParsedModule, Diag, Label)
 import diagnostics (ParsedSource, parse_at)
-import derive (dotted, runtime_module)
+import derive (dotted, runtime_module, same_deriver)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
               is_ident_start)
 import parsing (Ident, Span)
@@ -37,8 +38,10 @@ pub type Mention = { module: Bytes, name: Bytes }
 /// reaches through what it mentions, its own among them, where the memo store answers it (empty
 /// elsewhere); `mentions` what their text names, `text` each printed alone, `imports` each import of
 /// the module that text needs, placed nowhere, and `rows` and `fixed` what its functions' checks and
-/// hashing published, which an importer takes in place of the bodies `text` leaves out. Its encoding
-/// starts with an [`EntryHead`].
+/// hashing published, which an importer takes in place of the bodies `text` leaves out. A `derive`
+/// is in `text` as the functions it generates, their bodies left out like any other, so no reader
+/// of the entry expands it; a `derive row` stays a statement, which says the shape a statement run
+/// against the type reads. Its encoding starts with an [`EntryHead`].
 pub type Entry = {
   reach: Bytes,
   owner: Bytes,
@@ -58,6 +61,13 @@ derive bin for EntryHead
 pub fn entry_head(b: Bytes) -> EntryHead / {abort.raise} =
   match entry_head_bin().take(b, 0) {
     Ok(t) -> t.value,
+    Err(_) -> panic("an entry's bytes hold no head"),
+  }
+
+/// The entry `b` encodes with `reach` for what it reaches, the rest of it as it is written.
+pub fn reaching(b: Bytes, reach: Bytes) -> Bytes / {abort.raise} =
+  match bin::take_bytes(b, 0) {
+    Ok(t) -> bytes_concat(bin::encode(reach, bin::bytes_bin()), bytes_slice(b, t.at, bytes_len(b))),
     Err(_) -> panic("an entry's bytes hold no head"),
   }
 
@@ -238,6 +248,10 @@ fn hidden_read(text: Bytes) -> List<Mention> / {abort.raise} =
 fn hidden_of(raw: Module) -> List<Mention> =
   fold(raw.imports, [], |acc: List<Mention>, d: ImportDecl|
     if is_written(d) { acc } else { push(acc, { module: dotted(d), name: b"" }) })
+
+/// Whether `item` is a `derive` an entry holds as the functions it generates.
+fn signed(item: Item) -> Bool =
+  match item { IDerive(d) -> !same_deriver(d.deriver, DRow), _ -> false }
 
 /// The runtime modules the `derive`s among `items` call into.
 fn runtimes_of(items: List<Item>) -> List<Bytes> =
@@ -500,24 +514,37 @@ pub fn exports_of(
   let items = grouped(filter(raw.items, |item: Item| owner_of(item) != None), |item: Item|
     match owner_of(item) { Some(o) -> o, None -> b"" });
   let generated = generated_by_owner(raw, parsed, fns);
+  let added = drop(parsed.module.imports, len(raw.imports));
   {
     module: module,
     owners: owners,
     entries: map_fold(items, map_new(), |acc: Map<Bytes, Entry>, o: Bytes, its: List<Item>| {
-      let printed = alone(text, map(its, bare));
-      let expansion = match map_get(generated, o) {
-        Some(fs) -> mentioned(sc.expanded, alone(text, fs)),
-        None -> [],
-      };
+      let stated = alone(text, map(filter(its, |item: Item| !signed(item)), bare));
+      let fs = match map_get(generated, o) { Some(fs) -> fs, None -> [] };
+      let derives = fold(its, map_new(), |spans: Map<Bytes, Bool>, item: Item|
+        if signed(item) { map_insert(spans, span_key(item_span(item)), true) } else { spans });
+      let printed = bytes_concat(
+        stated,
+        alone(text, map(filter(fs, |f: Item| map_contains(derives, span_key(item_span(f)))), bare)),
+      );
+      let expansion = if len(fs) == 0 { [] } else { mentioned(sc.expanded, alone(text, fs)) };
       let mentions = filter(
-        distinct(concat(concat(mentioned(sc.written, printed), expansion), hidden_read(printed))),
+        distinct(concat(concat(mentioned(sc.written, stated), expansion), hidden_read(printed))),
         |m: Mention| !(m.module == module && m.name == o),
       );
+      let runtimes = runtimes_of(its);
       map_insert(acc, o, {
         reach: b"",
         owner: o,
         text: printed,
-        imports: map(imports_for(raw.imports, targets, mentions, runtimes_of(its)), unplaced),
+        imports: map(
+          concat(
+            imports_for(raw.imports, targets, mentions, runtimes),
+            // The binder an expansion gave a runtime no import of the module's binds.
+            filter(added, |d: ImportDecl| is_written(d) && contains(runtimes, dotted(d))),
+          ),
+          unplaced,
+        ),
         mentions: mentions,
         rows: match map_get(rows, o) { Some(xs) -> xs, None -> [] },
         fixed: match map_get(fixed, o) { Some(xs) -> xs, None -> [] },
@@ -1387,6 +1414,43 @@ fn core_src() -> Bytes =
 fn shop_src() -> Bytes =
   b"import core\nfn total(items: List<core::Item>) -> Int =\n  fold(items, 0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"it adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
 
+fn kinds_src() -> Bytes =
+  b"pub type Shape =\n  | Dot\n  | Line(Int)\npub type Pair = { left: Shape, right: Shape }\nderive eq for Shape\nderive ord for Shape\nderive eq for Pair\npub fn same(a: Pair, b: Pair) -> Bool = pair_eq().eq(a, b)\n"
+
+fn sorter_src() -> Bytes =
+  b"import kinds\nfn alike(a: kinds::Shape, b: kinds::Shape) -> Bool = kinds::shape_eq().eq(a, b)\nfn order(a: kinds::Shape, b: kinds::Shape) -> Ordering = kinds::shape_ord().compare(a, b)\nfn paired(a: kinds::Shape) -> Bool = kinds::same({ left: a, right: a }, { left: a, right: a })\n"
+
+test "an entry holds a derive as the functions it generates, bodies left out, and checks against it agree with the whole program's" {
+  let sources = [{ name: b"kinds", src: kinds_src() }, { name: b"sorter", src: sorter_src() }];
+  let whole = outcome(analyse_pulling_std_with(sources, [], no_rows()));
+  let kinds = fold(range(0, len(whole.mods)), 0, |k: Int, i: Int|
+    if at(whole.mods, i).name == b"kinds" { i } else { k });
+  let shape = match map_get(exports_of(whole, kinds, kinds_src()).entries, b"Shape") {
+    Some(e) -> e.text,
+    None -> b"",
+  };
+  assert(bytes_index_of(shape, b"pub type Shape") != None);
+  assert(bytes_index_of(shape, b"fn shape_eq()") != None);
+  assert(bytes_index_of(shape, b"fn shape_ord()") != None);
+  assert_eq(bytes_index_of(shape, b"derive"), None);
+  assert_eq(bytes_index_of(shape, b"=="), None);
+  for_all(
+    per_module(whole, sources),
+    |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: Fixing, rehashed: Fixing }| {
+      assert_eq(f.apart, f.whole);
+      assert_eq(f.rehashed, f.hashed)
+    },
+  );
+  let apart = per_owner(whole, sources);
+  assert_eq(map(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
+    b"kinds.same",
+    b"sorter.alike",
+    b"sorter.order",
+    b"sorter.paired",
+  ]);
+  for_all(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| assert_eq(f.apart, f.whole))
+}
+
 test "each module checked and hashed against the entries it reads of its imports answers what the whole program does" {
   let sources = [{ name: b"core", src: core_src() }, { name: b"shop", src: shop_src() }];
   let found = per_module(outcome(analyse_pulling_std_with(sources, [], no_rows())), sources);
@@ -1407,7 +1471,7 @@ test "each module checked and hashed against the entries it reads of its imports
   )
 }
 
-test "an entry's head reads back from its bytes alone" {
+test "an entry's head reads back from its bytes alone, and its reach is written into them" {
   let sources = [{ name: b"core", src: core_src() }, { name: b"shop", src: shop_src() }];
   let whole = outcome(analyse_pulling_std_with(sources, [], no_rows()));
   let entries = fold(range(0, len(whole.mods)), [], |acc: List<Entry>, i: Int|
@@ -1417,7 +1481,11 @@ test "an entry's head reads back from its bytes alone" {
           push(b, e))
       }));
   assert(len(entries) > 4);
-  for_all(entries, |e: Entry| assert_eq(entry_head(bin::encode(e, entry_bin())), head_of(e)))
+  for_all(entries, |e: Entry| {
+    let b = bin::encode(e, entry_bin());
+    assert_eq(entry_head(b), head_of(e));
+    assert_eq(reaching(b, b"reached"), bin::encode({ ..e, reach: b"reached" }, entry_bin()))
+  })
 }
 
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =

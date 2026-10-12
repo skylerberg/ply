@@ -58,20 +58,21 @@ makes its parent the root and loads only that file.
 **The cache.** `.ply-cache/` at the root holds the memo store (`memo/`), which
 keeps what each module of the project answered checked, the store — the tests'
 passes and baselines, the discharged obligations, the review baselines and the
-definitions a passing test ran, in one data file (`store.dat`) found through one
-index (`store.idx`) — and the git dependencies that were fetched;
+definitions a passing test ran, in a manifest and a handful of segment files —
+and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
-the store and the memo store); add it to `.gitignore`. A run that files
-into the store compacts it, as `ply cache compact` does, once more than half of
-`store.dat` holds entries a later filing replaced or dropped. The memo store is
-one small manifest and a handful of segment files: a run writes what it kept as
-one segment, which the manifest names when the run ends, so a later run sees all
-of it or none, and a run that dies or races another costs a later one checking
-what it takes, never a wrong answer. A run that names a segment writes the
-newest again as one while each is at most twice what follows it; writing all of
-them again keeps the records of the `ply` that writes and, of other `ply`s', the
-most lately used, up to twice as much again.
+the store and the memo store); add it to `.gitignore`. Each is one small
+manifest and a handful of segment files: a run writes what it kept as one
+segment, which the manifest names when the run ends, so a later run sees all of
+it or none; a run that names a segment writes the newest again as one while each
+is at most twice what follows it. A run that files into the store writes all of
+it again, as `ply cache compact` does, once more than half of what it holds are
+entries a later filing replaced or dropped, and what it filed is synced to the
+disk. A run of the memo store that dies or races another costs a later one
+checking what it takes, never a wrong answer; writing all of it again keeps the
+records of the `ply` that writes and, of other `ply`s', the most lately used, up
+to as much again.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
@@ -3198,6 +3199,14 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read.
 
+Where a load ran, the `--json` documents of `ply check`, `ply test` and
+`ply prove` also say under `front_end` what the memo store gave it: `queries`,
+each query the load asked with the answers it took as kept (`taken`) and the
+bodies it ran (`run`); `vouched`, whether the store held, when the load opened
+it, a record it vouches for to this `ply`; and `lost`, how many answers the load
+made again because a record that stood named one no store held, which is none
+over a store that is whole.
+
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
 `ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the
@@ -3507,5 +3516,5 @@ and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
-answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
+answers); `service.ply` (a service over PostgreSQL or its in-memory twin, whose
 store, TLS and accept loop are configuration, with tracing and shutdown).
