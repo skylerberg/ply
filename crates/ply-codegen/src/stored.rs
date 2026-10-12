@@ -5,9 +5,9 @@
 //! met twice is written once. A closure, and a bridged cell, task, channel or secret, has no text.
 
 use crate::heap::{
-    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR, KIND_INT,
-    KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT, Layouts, Word, bridged, bytes_of,
-    is_imm, obj, set_word, word_at,
+    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
+    KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT, Layouts, Word,
+    bridged, bytes_of, is_imm, obj, set_word, word_at,
 };
 use crate::{array, list, map};
 use ply_eval::Symbol;
@@ -34,6 +34,7 @@ const AGAIN: u8 = 13;
 /// A list or an array holding immediates alone: its words as they are, eight bytes each.
 const LIST_WORDS: u8 = 14;
 const ARRAY_WORDS: u8 = 15;
+const FLOAT: u8 = 16;
 
 /// The text of `w`, which it reads: lowercase hex, so a C string literal holds it as it is.
 pub fn text(layouts: &Layouts, w: Word) -> Result<Vec<u8>, String> {
@@ -161,8 +162,8 @@ impl<'l> Writer<'l> {
                 self.out.push(if flags != 0 { TRUE } else { FALSE });
                 return Ok(());
             }
-            KIND_INT => {
-                self.out.push(INT);
+            KIND_INT | KIND_FLOAT => {
+                self.out.push(if kind == KIND_INT { INT } else { FLOAT });
                 self.out
                     .extend_from_slice(&unsafe { word_at(o, 0) }.to_le_bytes());
                 Vec::new()
@@ -350,9 +351,11 @@ impl<'a> Reader<'a> {
                     .ok_or("it names an object before writing it")?;
                 return Ok(Some(w));
             }
-            INT => {
+            INT | FLOAT => {
                 let n = i64::from_le_bytes(self.array()?);
-                let o = self.heap.alloc(KIND_INT, 0, 1, 0);
+                let o = self
+                    .heap
+                    .alloc(if tag == INT { KIND_INT } else { KIND_FLOAT }, 0, 1, 0);
                 unsafe { set_word(o, 0, n) };
                 return Ok(Some(self.kept(o as Word)));
             }

@@ -1316,6 +1316,30 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
+/// A `Float` held as a word, from its bits.
+pub unsafe extern "C" fn rt_box_float(ctx: *mut Ctx, bits: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap.boxed_float(f64::from_bits(bits as u64))
+}
+
+/// The bits of a `Float` held in a word compiled code cannot read in place.
+pub unsafe extern "C" fn rt_unbox_float(ctx: *mut Ctx, w: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match (w != 0).then(|| ctx.value(w)) {
+        Some(Value::Float(f)) => ply_eval::float::bits(f) as i64,
+        _ => {
+            let d = error(format!("a `Float` operation on a {}", ctx.type_name(w)));
+            ctx.fail(d)
+        }
+    }
+}
+
+/// `a % b` over two `Float`s' bits, which C reaches only through `fmod`.
+pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+    let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+    ply_eval::float::bits(a % b) as i64
+}
+
 /// The operator codes compiled code hands [`rt_binary`]; `emit.ply`'s `binary_code` must match.
 const BINOPS: [BinOp; 18] = [
     BinOp::Add,
