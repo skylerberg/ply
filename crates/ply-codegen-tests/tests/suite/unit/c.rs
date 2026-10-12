@@ -70,6 +70,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_KIND_FIXED 18"));
     assert_eq!(ply_codegen::heap::RAW, 4, "PLY_RAW");
     assert!(PRELUDE.contains("#define PLY_RAW 4"));
+    assert_eq!(ply_codegen::heap::VIEW, 8, "PLY_VIEW");
+    assert!(PRELUDE.contains("#define PLY_VIEW 8"));
     assert_eq!(ply_codegen::heap::EMBEDDED, 0xC000_0000, "ply_embedded");
     assert!(PRELUDE.contains("UINT32_C(0xC0000000) | (uint32_t)(PLY_HEADER / 8 + at)"));
 }
@@ -105,13 +107,14 @@ fn a_unit_says_how_it_lays_out_records_and_constructors() {
             spelled(&["a000!r(x!f,y!f)", "a001"]),
         ),
     ];
-    for bits in 0..32 {
+    for bits in 0..64 {
         exports.layout = ply_codegen::heap::RecordLayout {
             in_place: bits & 1 != 0,
             raw_widths: bits & 2 != 0,
             inline_arrays: bits & 4 != 0,
             ctor_args: bits & 8 != 0,
             raw_decimals: bits & 16 != 0,
+            bytes_views: bits & 32 != 0,
         };
         let read =
             ply_codegen::c::Exports::decode(&exports.encode()).expect("the table reads back");

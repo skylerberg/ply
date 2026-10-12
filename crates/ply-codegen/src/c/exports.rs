@@ -116,6 +116,10 @@ pub const CTOR_ARGS: &str = "constructors hold their arguments by type";
 /// holds as its two words; a unit without it reads the `Decimal`'s word.
 pub const RAW_DECIMALS: &str = "decimals held raw";
 
+/// A line after a unit's tables, where its C reads a bytes value's bytes through `ply_bytes`, which
+/// follows a view to the value it views; a unit without it reads them in place.
+pub const BYTES_VIEWS: &str = "bytes slices are views";
+
 impl Exports {
     pub fn names(&self) -> Vec<String> {
         self.taken.iter().map(|t| t.name.clone()).collect()
@@ -231,6 +235,9 @@ impl Exports {
         if self.layout.raw_decimals {
             out.push_str(&format!("{RAW_DECIMALS}\n"));
         }
+        if self.layout.bytes_views {
+            out.push_str(&format!("{BYTES_VIEWS}\n"));
+        }
         out
     }
 
@@ -336,6 +343,7 @@ impl Exports {
             inline_arrays: false,
             ctor_args: false,
             raw_decimals: false,
+            bytes_views: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
@@ -344,6 +352,7 @@ impl Exports {
                 INLINE_ARRAYS => layout.inline_arrays = true,
                 CTOR_ARGS => layout.ctor_args = true,
                 RAW_DECIMALS => layout.raw_decimals = true,
+                BYTES_VIEWS => layout.bytes_views = true,
                 _ => {}
             }
         }
