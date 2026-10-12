@@ -35,6 +35,7 @@ const AGAIN: u8 = 13;
 const LIST_WORDS: u8 = 14;
 const ARRAY_WORDS: u8 = 15;
 const FLOAT: u8 = 16;
+const CHAR: u8 = 17;
 
 /// The text of `w`, which it reads: lowercase hex, so a C string literal holds it as it is.
 pub fn text(layouts: &Layouts, w: Word) -> Result<Vec<u8>, String> {
@@ -150,6 +151,11 @@ impl<'l> Writer<'l> {
     }
 
     fn word(&mut self, w: Word, pending: &mut Vec<Pending>) -> Result<(), String> {
+        if heap::is_char(w) {
+            self.out.push(CHAR);
+            self.varint(heap::char_of(w) as u64);
+            return Ok(());
+        }
         if is_imm(w) {
             self.out.push(IMM);
             let n = heap::imm_value(w);
@@ -358,6 +364,11 @@ impl<'a> Reader<'a> {
                     return Err("it holds an immediate past sixty-three bits".to_string());
                 }
                 return Ok(Some(heap::imm(n)));
+            }
+            CHAR => {
+                let c = char::from_u32(self.varint()? as u32)
+                    .ok_or("it holds a character that is no code point")?;
+                return Ok(Some(heap::char_word(c)));
             }
             UNIT => return Ok(Some(heap::unit())),
             FALSE => return Ok(Some(heap::bool(false))),
