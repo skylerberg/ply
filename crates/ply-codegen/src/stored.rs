@@ -78,9 +78,9 @@ pub fn read(
         shapes: Vec::new(),
         ctors: Vec::new(),
         seen: Vec::new(),
+        held: Vec::new(),
     }
     .value()?;
-    heap::mark_immortal(w);
     Ok(w)
 }
 
@@ -189,19 +189,23 @@ impl<'l> Writer<'l> {
                 self.blob(unsafe { bytes_of(o) });
                 Vec::new()
             }
-            // A field held as a `Float`'s bits is written as a `Float`, which its shape says to hold
-            // as bits again.
+            // A field held as a `Float`'s bits is written as a `Float`, and one held in place as the
+            // record it is; the reader lays them out again as their values say.
             KIND_RECORD => {
                 self.out.push(RECORD);
                 self.shape(layout);
                 self.out.push(flags);
                 let slots = self.layouts.shape_slots(layout);
+                let offsets = self.layouts.shape_offsets(layout);
                 pending.push(Pending::Done(w as usize));
-                pending.extend((0..len as usize).rev().map(|i| {
-                    let x = unsafe { word_at(o, i) };
+                pending.extend((0..slots.len()).rev().map(|i| {
+                    let at = offsets[i];
                     match slots[i] {
-                        heap::Slot::Float => Pending::Raw(x),
-                        heap::Slot::Word => Pending::Word(x),
+                        heap::Slot::Float => Pending::Raw(unsafe { word_at(o, at) }),
+                        heap::Slot::Record(_) => {
+                            Pending::Word(unsafe { heap::words(o).add(at) } as Word)
+                        }
+                        heap::Slot::Word => Pending::Word(unsafe { word_at(o, at) }),
                     }
                 }));
                 return Ok(());
@@ -310,7 +314,7 @@ struct Open {
 }
 
 enum Make {
-    Record { shape: u32, flags: u8 },
+    Record { shape: u32 },
     Ctor { index: u32, flags: u8 },
     List,
     Array,
@@ -327,6 +331,9 @@ struct Reader<'a> {
     ctors: Vec<u32>,
     /// Each object read whole, in the order the writer finished them.
     seen: Vec<Word>,
+    /// The parts a record was laid out from, held until the value is read whole, since a later
+    /// part may name one again.
+    held: Vec<Word>,
 }
 
 impl<'a> Reader<'a> {
@@ -339,6 +346,10 @@ impl<'a> Reader<'a> {
                 let Some(top) = open.last_mut() else {
                     if self.at != self.bytes.len() {
                         return Err(format!("{} bytes follow it", self.bytes.len() - self.at));
+                    }
+                    heap::mark_immortal(w);
+                    for part in self.held {
+                        heap::dec(part);
                     }
                     return Ok(w);
                 };
@@ -426,9 +437,9 @@ impl<'a> Reader<'a> {
             }
             RECORD => {
                 let shape = self.shape()?;
-                let flags = self.byte()?;
-                let want = self.layouts.shape_width(shape);
-                (Make::Record { shape, flags }, want)
+                self.byte()?;
+                let want = self.layouts.shape_fields(shape);
+                (Make::Record { shape }, want)
             }
             CTOR => {
                 let index = self.ctor()?;
@@ -478,26 +489,19 @@ impl<'a> Reader<'a> {
             o as Word
         };
         let w = match done.make {
-            Make::Record { shape, flags } => {
-                let slots = self.layouts.shape_slots(shape);
-                let n = done.parts.len();
-                let o = self.heap.alloc(KIND_RECORD, flags, n as u32, shape);
-                for (i, w) in done.parts.iter().enumerate() {
-                    let word = match slots[i] {
-                        heap::Slot::Float => unsafe { word_at(obj(*w), 0) },
-                        heap::Slot::Word => *w,
-                    };
-                    unsafe { set_word(o, i, word) };
+            Make::Record { shape } => {
+                for part in &done.parts {
+                    heap::inc(*part);
                 }
-                if flags & heap::MIXED != 0 {
-                    for t in 0..heap::tail_words(n) {
-                        let bits = (t * 64..n.min(t * 64 + 64))
-                            .filter(|i| slots[*i] == heap::Slot::Word)
-                            .fold(0u64, |acc, i| acc | 1 << (i % 64));
-                        unsafe { set_word(o, n + t, bits as i64) };
-                    }
-                }
-                o as Word
+                self.held.extend(done.parts.iter().copied());
+                let fields: Vec<(Symbol, Word)> = self
+                    .layouts
+                    .shape_names(shape)
+                    .iter()
+                    .cloned()
+                    .zip(done.parts)
+                    .collect();
+                self.heap.record(self.layouts, &fields)
             }
             Make::Ctor { index, flags } => {
                 let o = self

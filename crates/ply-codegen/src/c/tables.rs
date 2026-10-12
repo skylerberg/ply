@@ -58,46 +58,6 @@ fn sorted(names: &[Symbol]) -> Vec<Symbol> {
 }
 
 impl UnitTables {
-    /// The union of what `bodies` name and the lambda symbols given, each table sorted by
-    /// content and duplicate-free.
-    pub fn of<'a>(
-        ctors: Vec<(Symbol, usize)>,
-        bodies: impl IntoIterator<Item = &'a BodyTables>,
-        lambdas: impl IntoIterator<Item = String>,
-    ) -> UnitTables {
-        let mut consts: Vec<(String, Value)> = Vec::new();
-        let mut fields: Vec<Symbol> = Vec::new();
-        let mut builtins: Vec<Builtin> = Vec::new();
-        let mut shapes: Vec<Vec<Symbol>> = vec![Layouts::entry_fields()];
-        let mut lambdas: Vec<String> = lambdas.into_iter().collect();
-        for t in bodies {
-            consts.extend(t.consts.iter().map(|v| (encode_const(v), v.clone())));
-            fields.extend(t.fields.iter().cloned());
-            builtins.extend(t.builtins.iter().copied());
-            shapes.extend(t.shapes.iter().map(|names| sorted(names)));
-            lambdas.extend(t.lambdas.iter().cloned());
-        }
-        consts.sort_by(|a, b| a.0.cmp(&b.0));
-        consts.dedup_by(|a, b| a.0 == b.0);
-        fields.sort();
-        fields.dedup();
-        builtins.sort_by_key(|b| b.name());
-        builtins.dedup();
-        shapes.sort();
-        shapes.dedup();
-        lambdas.sort();
-        lambdas.dedup();
-        UnitTables::from_tables(
-            ctors,
-            consts.into_iter().map(|(_, v)| v).collect(),
-            fields,
-            builtins,
-            shapes,
-            lambdas,
-        )
-        .expect("a sorted, duplicate-free shape list interns to its positions")
-    }
-
     /// The tables as a unit recorded them, positions as given; `None` if a shape would not
     /// intern to its position, since those are the ids its C bakes.
     pub fn from_tables(
@@ -107,8 +67,9 @@ impl UnitTables {
         builtins: Vec<Builtin>,
         shapes: Vec<Vec<Symbol>>,
         lambdas: Vec<String>,
+        in_place: bool,
     ) -> Option<UnitTables> {
-        let layouts = Layouts::of(ctors, &shapes);
+        let layouts = Layouts::of(ctors, &shapes, in_place);
         let placed = layouts.shape_count() >= shapes.len()
             && shapes
                 .iter()
