@@ -40,11 +40,12 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
               covariant_con, env_new, env_push, env_pop, env_bind, env_bind_global,
               env_remove_global, env_lookup, env_local, env_depth_of, env_locals, instantiate_with,
-              instantiate, rename_scheme, generalize, region_prefix, region_of, label_type,
-              label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text, type_text,
-              row_text, Printer, printer_new, printer_naming, print_ty, print_row, applied_args,
-              at_arguments, over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin,
-              type_bin, scheme_bin, TypeTable, held_type, table_of, tables_joined, type_table_bin)
+              instantiate, rename_scheme, generalize, region_prefix, region_of, region_mark,
+              written_label, leaving_row, leaving_type, label_type, label_of, resolve_atom,
+              atom_text, atoms_text, resource_text, scheme_text, type_text, row_text, Printer,
+              printer_new, printer_naming, print_ty, print_row, applied_args, at_arguments,
+              over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin, type_bin,
+              scheme_bin, TypeTable, held_type, table_of, tables_joined, type_table_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin, ending_bin)
@@ -331,6 +332,7 @@ type HandoffSite = { span: Span, ty: Type, op: Bytes }
 /// `hold`: a `with_hold` opened it, which no other region of its name may nest in.
 type OpenRegion = {
   name: Bytes,
+  label: Bytes,
   span: Span,
   hold: Bool,
   simulate_depth: Int,
@@ -341,6 +343,7 @@ type OuterBinding = { name: Bytes, ty: Type, site: Span }
 type RegionSite = {
   module: Int,
   name: Bytes,
+  label: Bytes,
   span: Span,
   hold: Bool,
   body_span: Span,
@@ -353,7 +356,7 @@ type RegionSite = {
 /// What may not outlive a region: a `with_cell[r]` region's cells, a `with_hold[r]` region's hold
 /// and every function that reads a hold, a `simulate` region's tasks.
 type Brand = | CellsOf(Bytes) | HoldsOf(Bytes) | Tasks
-type Opened = { name: Bytes, span: Span }
+type Opened = { name: Bytes, label: Bytes, span: Span }
 /// A local bound outside the innermost `simulate` region, named inside it.
 type Crossing = { name: Bytes, span: Span }
 type CellAccess = { span: Span, region: Bytes }
@@ -8004,11 +8007,30 @@ fn region_reopened(checker: Checker, resource: Ident, outer: OpenRegion, form: B
     ],
   )
 
-fn open_region(checker: Checker, name: Bytes, span: Span, hold: Bool) -> Checker =
+/// The label a region's cells and atoms carry: its written name beside the definition that opens it.
+/// No source can write it, so no other definition's row or region names this one's.
+fn region_label(checker: Checker, name: Bytes) -> Bytes =
+  bytes_concat_all([name, region_mark(), checker.walking])
+
+/// Opens the region `name` under `label`, the name standing for the label wherever the body writes it.
+fn open_region(
+  checker: Checker,
+  name: Bytes,
+  label: Bytes,
+  span: Span,
+  hold: Bool,
+) -> Checker / {abort.raise} = {
+  let named: WithVar = new_ty_var(checker);
+  let bound: Checker = with_unified(
+    named.checker,
+    unify(named.checker.subst, named.checker.fresh, TyVar(named.var), label_type(label)),
+  );
   {
-    ..checker,
-    open_regions: push(checker.open_regions, {
+    ..bound,
+    label_params: map_insert(bound.label_params, name, named.var),
+    open_regions: push(bound.open_regions, {
       name: name,
+      label: label,
       span: span,
       hold: hold,
       simulate_depth: checker.simulate_depth,
@@ -8016,6 +8038,7 @@ fn open_region(checker: Checker, name: Bytes, span: Span, hold: Bool) -> Checker
       handoffs: [],
     }),
   }
+}
 
 type ClosedRegion = { checker: Checker, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 
@@ -8153,7 +8176,11 @@ fn infer_with_cell(
   hint: Option<Hint>,
 ) -> Inferred / {abort.raise} = {
   let i: Inferred = infer(checker, init);
-  let cell_ty = TyCon({ name: b"Cell", args: [region_type(resource.name), i.ty] });
+  let label = match open_region_named(i.checker, resource.name) {
+    Some(around) -> around.label,
+    None -> region_label(i.checker, resource.name),
+  };
+  let cell_ty = TyCon({ name: b"Cell", args: [region_type(label), i.ty] });
   if region_is_open(i.checker, resource.name) {
     let nested: Checker = match open_region_named(i.checker, resource.name) {
       Some(outer) -> if outer.hold { region_reopened(i.checker, resource, outer, b"with_cell") }
@@ -8169,15 +8196,19 @@ fn infer_with_cell(
     { checker: j.checker, ty: b.ty, row: j.row }
   } else {
     let outer = outer_bindings(i.checker, body);
-    let opened: Checker = open_region(i.checker, resource.name, resource.span, false);
+    let opened: Checker = open_region(i.checker, resource.name, label, resource.span, false);
     let mark = len(opened.performs);
     let pushed: Checker = {
       ..opened,
       env: env_bind(env_push(opened.env), binder.name, monomorphic(cell_ty)),
     };
     let b: Inferred = infer(pushed, body, hint);
-    let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
-    let handled = cell_atoms(resource.name);
+    let closed: ClosedRegion = close_region({
+      ..b.checker,
+      env: env_pop(b.checker.env),
+      label_params: i.checker.label_params,
+    });
+    let handled = cell_atoms(label);
     let discharged: Checker = discharge(
       closed.checker,
       mark,
@@ -8187,6 +8218,7 @@ fn infer_with_cell(
     let site: RegionSite = {
       module: discharged.module,
       name: resource.name,
+      label: label,
       span: resource.span,
       hold: false,
       body_span: expr_span(body),
@@ -8198,7 +8230,7 @@ fn infer_with_cell(
     };
     let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
-    { checker: j.checker, ty: b.ty, row: j.row }
+    { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty)), row: j.row }
   }
 }
 
@@ -8230,7 +8262,8 @@ fn infer_with_hold(
     record_site(c, atom, expr_span(release), source));
   let before: WithRow = join(performed, span, a.row, r.row);
   let entering: WithRow = join(before.checker, span, before.row, let_go);
-  let hold_ty = TyCon({ name: b"Hold", args: [region_type(resource.name), a.ty] });
+  let label = region_label(entering.checker, resource.name);
+  let hold_ty = TyCon({ name: b"Hold", args: [region_type(label), a.ty] });
   match open_region_named(entering.checker, resource.name) {
     Some(around) -> {
       let refused: Checker = region_reopened(entering.checker, resource, around, b"with_hold");
@@ -8249,14 +8282,24 @@ fn infer_with_hold(
     },
     None -> {
       let outer = outer_bindings(entering.checker, body);
-      let opened: Checker = open_region(entering.checker, resource.name, resource.span, true);
+      let opened: Checker = open_region(
+        entering.checker,
+        resource.name,
+        label,
+        resource.span,
+        true,
+      );
       let mark = len(opened.performs);
       let b: Inferred = infer(
         { ..opened, env: env_bind(env_push(opened.env), binder.name, monomorphic(hold_ty)) },
         body,
         hint,
       );
-      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
+      let closed: ClosedRegion = close_region({
+        ..b.checker,
+        env: env_pop(b.checker.env),
+        label_params: entering.checker.label_params,
+      });
       let handled = [hold_atom()];
       let discharged: Checker = discharge(
         closed.checker,
@@ -8267,6 +8310,7 @@ fn infer_with_hold(
       let site: RegionSite = {
         module: discharged.module,
         name: resource.name,
+        label: label,
         span: resource.span,
         hold: true,
         body_span: expr_span(body),
@@ -8283,7 +8327,7 @@ fn infer_with_hold(
         entering.row,
         row_without_covered(resolve_row_in(recorded, b.row), handled),
       );
-      { checker: j.checker, ty: b.ty, row: j.row }
+      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty)), row: j.row }
     },
   }
 }
@@ -8308,7 +8352,7 @@ fn older_cells(
     let a = resolve_atom(checker.subst, site.atom);
     match a.resource {
       RNamed(r) -> if a.effect == cell() && mode_eq(a.mode, mode)
-          && fold(older, false, |b: Bool, opened: Opened| b || opened.name == r) {
+          && fold(older, false, |b: Bool, opened: Opened| b || opened.label == r) {
         push(acc, { span: site.span, region: r })
       } else { acc },
       _ -> acc,
@@ -8361,7 +8405,7 @@ fn infer_simulate(
   let mark = len(checker.performs);
   let crossed_at = len(checker.crossings);
   let older = map(checker.open_regions, |region: OpenRegion|
-    { name: region.name, span: region.span });
+    { name: region.name, label: region.label, span: region.span });
   let cells = filter(
     map(env_locals(checker.env), |l: { name: Bytes, sc: Scheme }| { name: l.name, ty: l.sc.ty }),
     |l: { name: Bytes, ty: Type }| holds_cell(resolve(checker, l.ty)),
@@ -9148,10 +9192,11 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     Some(at) -> check_const_shape(popped, def, at, signature),
     None -> popped,
   };
+  let left = leaving_row(resolve_row_in(shaped, body.row));
   let rowed: Checker = match signature.declared {
-    Some(declared) -> check_upper_bound(shaped, def, declared, body.row),
+    Some(declared) -> check_upper_bound(shaped, def, declared, left),
     None -> {
-      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, body.row);
+      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, left);
       let c = with_unified(shaped, u);
       match u.error {
         Some(e) -> report_unify(c, e, expr_span(def.body), b"inferred effect row"),
@@ -9159,7 +9204,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       }
     },
   };
-  let counted = counts_of(rowed, signature, body.row);
+  let counted = counts_of(rowed, signature, left);
   {
     checker: {
       ..rowed,
@@ -9172,7 +9217,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       guards: guards::none(),
       raise_notes: [],
     },
-    row: body.row,
+    row: left,
     scaling: counted.scaling,
     repeats: counted.repeats,
     tail_over: counted.tail_over,
@@ -10398,7 +10443,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 Some(cases) -> check_listing(answered, def, cases),
               };
               let popped: Checker = { ..listed, env: env_pop(listed.env) };
-              let row = resolve_row_in(popped, o.row);
+              let row = leaving_row(resolve_row_in(popped, o.row));
               // A table refused for what it performs is not also held to the test's determinism.
               let unlisted = len(listed.diags) > len(answered.diags);
               {
@@ -13331,10 +13376,10 @@ fn check_entering(checker: Checker, site: Simulation) -> Checker / {abort.raise}
 /// A region that also writes the cell is refused for the write, whose remedy covers the read.
 fn check_older_reads(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
-    match first_access(site.reads, opened.name) {
+    match first_access(site.reads, opened.label) {
       None -> c,
-      Some(read_span) -> if first_access(site.writes, opened.name) != None { c } else {
-        match task_holder(c, site.cells, opened.name) {
+      Some(read_span) -> if first_access(site.writes, opened.label) != None { c } else {
+        match task_holder(c, site.cells, opened.label) {
           None -> c,
           Some(b) ->
             err_labels(
@@ -13411,9 +13456,9 @@ fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abor
 /// `Task` is written in types, so a store into a cell typed to hold one shows only as the write.
 fn check_older_writes(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
-    match first_access(site.writes, opened.name) {
+    match first_access(site.writes, opened.label) {
       None -> c,
-      Some(write_span) -> match task_holder(c, site.cells, opened.name) {
+      Some(write_span) -> match task_holder(c, site.cells, opened.label) {
         None -> c,
         Some(b) ->
           err_labels(
@@ -13612,7 +13657,7 @@ fn check_regions(checker: Checker) -> Checker / {abort.raise} =
     ))
 
 fn brand_of(site: RegionSite) -> Brand =
-  if site.hold { HoldsOf(site.name) } else { CellsOf(site.name) }
+  if site.hold { HoldsOf(site.label) } else { CellsOf(site.label) }
 
 fn region_form(site: RegionSite) -> Bytes = if site.hold { b"with_hold" } else { b"with_cell" }
 
@@ -13641,7 +13686,7 @@ fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.ra
       },
     )
   } else {
-    let carries = if carries_brand_in_row(ty, CellsOf(n)) {
+    let carries = if carries_brand_in_row(ty, brand_of(site)) {
       [
         bytes_concat_all([
           b"the closure's row still carries `cell.read[",
@@ -13847,7 +13892,7 @@ fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort
             b"the closure's row still carries `hold.read`, so whoever handles the operation can read a hold the region has let go",
           ]
         } else { [] }
-      } else if carries_brand_in_row(ty, CellsOf(n)) {
+      } else if carries_brand_in_row(ty, brand_of(site)) {
         [
           bytes_concat_all([
             b"the closure's row still carries `cell.read[",
@@ -14517,8 +14562,9 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
         ],
       )
     } else {
+      // A region's label reaches a callee as the name its body writes, as its clauses name it.
       let names = fold(a.vars, [], |acc: List<Bytes>, v: Int|
-        match label_named(in_module, a, v) { Some(n) -> push(acc, n), None -> acc });
+        match label_named(in_module, a, v) { Some(n) -> push(acc, written_label(n)), None -> acc });
       if len(names) < len(a.vars) {
         let unfilled = error_at(
           b"E0306",
@@ -15354,6 +15400,24 @@ test "a hold's region is its own: neither it nor a cell's reuses a name that is 
   assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_cell[r](2)"), [b"E0330"]);
   assert_eq(nested(b"with_hold[r](1, |x: Int| ())", b"with_hold[s](2, |x: Int| ())"), []);
   assert_eq(nested(b"with_cell[r](1)", b"with_cell[r](2)"), [])
+}
+
+// A definition that opened a region of a caller's name used to answer for the caller's cell, and
+// hand back a closure whose row no longer said it read one.
+test "a region's label is its own: a row another definition writes names no region" {
+  let wrap = b"fn wrap(k: () -> Int / {cell.read[work]}) -> () -> Int = || with_cell[work](0) { d -> cell_get(d) + k() }\n";
+  let leak = b"fn leak() -> () -> Int = with_cell[work](41) { c -> wrap(|| cell_get(c)) }";
+  // Its region answers none of what `k` reads, so the closure it hands back still reads a cell.
+  assert(contains(check_codes(wrap), b"E0302"));
+  // And a closure over this region's cell is no `cell.read[work]` a parameter could ask for.
+  let asked = bytes_concat(b"fn wrap(k: () -> Int / {cell.read[work]}) -> Int = 0\n", leak);
+  assert(contains(check_codes(asked), b"E0302"));
+  // A callee generic over the row takes the closure, and its own region answers none of it.
+  let generic = bytes_concat_all([
+    b"fn each<| e>(k: () -> Int / e) -> Int / e = with_cell[work](0) { d -> cell_get(d) + k() }\n",
+    b"fn held() -> Int = with_cell[work](41) { c -> each(|| cell_get(c)) }",
+  ]);
+  assert_eq(check_codes(generic), [])
 }
 
 test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
