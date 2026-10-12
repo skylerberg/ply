@@ -1384,9 +1384,13 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
 * The branches spend one step budget between them (`E0503`, §8.4), as they would
   in turn.
 * A block whose branches could reach a `handle` around it or a `simulate` region
-  (§9) runs them in turn, which answers the same. So does one whose branches
-  hold a cell, a task or a continuation. Under `--host` each branch waits on a
-  reactor of its own.
+  (§9) runs them in turn, which answers the same. A block written in a
+  definition's own body is held to that definition's row: a `handle` that
+  answers no effect in it does not keep the block in turn. One inside a lambda
+  or the body of a `handle` is kept in turn by any `handle` around it. So is
+  one whose branches hold a cell, a task or a continuation, and so is every
+  block of a program entered on another's branch, as each test of a `ply test`
+  run is. Under `--host` each branch waits on a reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
   of them a `write`; or a branch's row is open (it calls a function value whose
   row is a variable) while another performs anything; or a branch opens a
