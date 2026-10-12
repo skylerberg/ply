@@ -33,6 +33,15 @@
 #                                      every other removed, before a job saves them: a store only
 #                                      grows, and the job's next run restores what it saves, which is
 #                                      then the stores its own runs use and no other job's
+#   ci-corpus.sh hand FILE             the stores this job keeps, as one file: a pull request's cache
+#                                      reaches no other run, so a run of its toolchain on another
+#                                      branch, main's after the merge most of all, takes them as an
+#                                      artifact
+#   ci-corpus.sh handed NAME           the artifact NAME, which a run of this toolchain packed with
+#                                      `hand`, as this job's stores: unpacked aside and laid only when
+#                                      whole, since a load fails over a store that lost an answer. Sets
+#                                      the step's `found`. Nothing found, or a download that failed,
+#                                      leaves the job to what a cache holds
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
 #   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
@@ -273,6 +282,14 @@ marked() {
   [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; return 1; }
 }
 
+# Every directory a run keeps a store under, as the workflow's cache steps list them.
+store_dirs() {
+  local dir
+  for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/examples "$root"/tests/lang; do
+    printf '%s\n' "$dir"
+  done
+}
+
 # The emitter's answers `ply` wrote or read since the mark, into DIR.
 kept_answers() {
   local dir=$1
@@ -351,7 +368,7 @@ case "${1:-}" in
     ;;
   compact)
     marked || exit 2
-    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/examples "$root"/tests/lang; do
+    for dir in $(store_dirs); do
       [ -d "$dir/.ply-cache" ] || continue
       # A `ply` that opens a store makes a directory of its own in it, so one nothing here is newer
       # than the mark in was opened by no run of this job.
@@ -363,6 +380,38 @@ case "${1:-}" in
       echo "=== ${dir#"$root"/}"
       "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
     done
+    ;;
+  hand)
+    file=${2:?a file}
+    kept=()
+    for dir in $(store_dirs); do
+      [ -d "$dir/.ply-cache" ] && kept+=("${dir#"$root"/}/.ply-cache")
+    done
+    [ "${#kept[@]}" -gt 0 ] || { echo "this job keeps no store"; exit 0; }
+    tar -cf - -C "$root" "${kept[@]}" | zstd -q -T0 -3 -o "$file" || exit 1
+    echo "packed ${#kept[@]} stores, $(du -sh "$file" | cut -f1): ${kept[*]}"
+    ;;
+  handed)
+    name=${2:?an artifact}
+    run=$("$root/.github/artifact-run.sh" "$name") || run=
+    [ -n "$run" ] || { echo "no run has handed over $name"; exit 0; }
+    dir=$(mktemp -d)
+    if gh run download "$run" -n "$name" -D "$dir" && mkdir "$dir/unpacked" &&
+      zstd -d -c "$dir/stores.tar.zst" | tar -xf - -C "$dir/unpacked"; then
+      laid=0
+      while IFS= read -r store; do
+        there=$root/${store#"$dir/unpacked/"}
+        rm -rf "$there"
+        mkdir -p "$(dirname "$there")"
+        mv "$store" "$there" || exit 1
+        laid=$((laid + 1))
+      done < <(find "$dir/unpacked" -type d -name .ply-cache -prune)
+      echo "$name came back from run $run: $laid stores"
+      echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+    else
+      echo "$name did not come back from run $run"
+    fi
+    rm -rf "$dir"
     ;;
   upstream-mark)
     mkdir -p "$upstream"
@@ -398,7 +447,7 @@ case "${1:-}" in
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
   *)
-    echo "usage: ci-corpus.sh run ID [ARG...] | nightly [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-corpus.sh run ID [ARG...] | nightly [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac
