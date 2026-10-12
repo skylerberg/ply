@@ -98,14 +98,20 @@ pub fn lent(module: &str) -> Vec<LentOp> {
 }
 
 fn lent_by(module: &str, hermetic: bool) -> Vec<LentOp> {
-    let handler: Arc<dyn HostHandler> = Arc::new(ProverHandler {
+    let module = module.to_string();
+    let made = move || ProverHandler {
         hermetic,
         job: Mutex::new(None),
         machine: Mutex::new(None),
         claims: Mutex::new(0),
         judging: RwLock::new(None),
-        module: module.to_string(),
-    });
+        module: module.clone(),
+    };
+    let handler: Arc<dyn HostHandler> = if hermetic {
+        crate::hosts::Apart::of(made)
+    } else {
+        Arc::new(made())
+    };
     let operations = if hermetic {
         HERMETIC_OPERATIONS
     } else {
