@@ -1,31 +1,37 @@
 //! `ply bootstrap` — a native `ply` built from a checkout by this one. The runtime's library is the
-//! one cargo built of the checkout's Rust, which describes itself; the checkout's compiler is built
-//! here against that description into the builder, a native program on that runtime; the builder
+//! one cargo built of the checkout's Rust, which describes itself; the builder is a program that
+//! enters the checkout's compiler, built here against that description over the checkout's shipped
+//! modules, which this `ply`'s packed answers answer for wherever they did not move; the builder
 //! builds the checkout's `ply` and holds its constants on that runtime; that is linked into a native
 //! `ply`, which answers the shipped modules; and its pack carries the shipped modules, those answers
-//! and its own front end. Only the compiler and the shipped modules it imports are built by this
-//! `ply`'s compiler, so only they cannot use a language rule the checkout introduces.
+//! and its own front end. The builder and the pack are each kept in the toolchain's cache under what
+//! decides them, so a bootstrap of what an earlier one built makes neither again. Only the shipped
+//! modules the builder pulls are built by this `ply`'s compiler, so only they cannot use a language
+//! rule the checkout introduces.
 
 import args (Flags, no_flags, style_of)
-import builder (builder)
 import env (env)
-import paths
-import program (Timed, front_of, timed_load, program_view)
+import program (Timed, front_of, timed_uncached_over, program_view)
 import report (Answer, ok_code, compile_error, refused, reported)
+import sources (Project, shipped_names)
 import compiler.cc
 import compiler.cc (Toolchain, compilers, toolchain)
 import compiler.front (shipped_dump)
+import compiler.interface (sized)
 import compiler.load (LoadedAnalysis, every_root)
 import compiler.native
 import compiler.native (Packed)
 import compiler.parsing (no_module)
 import compiler.resolve (Diag, error_at)
-import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, read_kept, write_kept)
+import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, identity_of, read_kept,
+                      write_kept)
+import std.bytes (hex_of, u64_at, u64_le)
 import std.fs
 import std.fs (fs, Entry, File)
+import std.hash (blake3)
 import std.json (Json, Str, Bool, object)
-import std.list (concat)
-import std.string (replace)
+import std.list (at, concat)
+import std.string (join, replace)
 import std.process (process)
 import std.random (entropy)
 import std.time (time)
@@ -138,9 +144,19 @@ fn module_names(files: List<Shipping>) -> List<String> / {abort.raise} =
       push(acc, string_slice(f.name, 0, string_len(f.name) - 4))
     } else { acc })
 
+/// Whether `files` are the very shipped modules this `ply` carries: each file as it carries it, and
+/// no module of its own left out.
+fn carried(
+  files: List<Shipping>,
+) -> Bool / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  len(shipped_names()) == len(module_names(files))
+    && fold(files, true, |same: Bool, f: Shipping|
+      same && fs.read_file[shipped](f.name) == Some(f.bytes))
+
 /// `body` with the shipped modules as `files` hold them in place of this `ply`'s own: what a load of
 /// the checkout's compiler compiles it against. Packed answers still answer where they agree with
-/// what they read, but none is taken as standing for these files.
+/// what they read, and are taken as standing for these files only where they are the very ones this
+/// `ply` carries.
 fn over_shipping<a | e>(
   files: List<Shipping>,
   body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.answer | e},
@@ -148,6 +164,7 @@ fn over_shipping<a | e>(
   let by_name = fold(files, map_new(), |acc: Map<String, Bytes>, f: Shipping|
     map_insert(acc, f.name, f.bytes));
   let names = module_names(files);
+  let stands = carried(files);
   handle {
     body()
   } with {
@@ -172,7 +189,7 @@ fn over_shipping<a | e>(
       Some(bytes) -> Some(bytes),
       None -> map_get(by_name, name),
     },
-    shipped.answer(path) -> if path == "standing" { None } else { shipped.answer(path) },
+    shipped.answer(path) -> if path == "standing" && !stands { None } else { shipped.answer(path) },
   }
 }
 
@@ -270,52 +287,193 @@ fn packed_with(files: List<Shipping>, front: Bytes, more: List<Packed>) -> Bytes
     ),
   )
 
-/// The checkout's compiler built here against `runtime` into the builder: its path below the cache.
+// --- What a bootstrap keeps ----------------------------------------------------------------
+
+/// What names the shipped modules `files` hold, whatever order they were read in.
+fn shipped_key(files: List<Shipping>) -> Bytes =
+  blake3(
+    bytes_concat_all(
+      map_fold(
+        fold(files, map_new(), |acc: Map<String, Bytes>, f: Shipping|
+          map_insert(acc, f.name, bytes_concat(sized(bytes_of_string(f.path)), blake3(f.bytes)))),
+        [b"ply shipped modules 1\0"],
+        |acc: List<Bytes>, name: String, held: Bytes|
+          push(push(acc, sized(bytes_of_string(name))), held),
+      ),
+    ),
+  )
+
+/// What an executable linked here is a function of besides its objects' C: the compiler and what
+/// every compile and link passes it, the `main` it is entered through, and the runtime's library,
+/// `library` its digest and `libraries` what is linked after it.
+fn linking_key(t: Toolchain, library: Bytes, libraries: List<String>) -> Bytes =
+  blake3(
+    bytes_concat_all([
+      b"ply native link 1\0",
+      sized(t.identity),
+      sized(bytes_of_string(t.level)),
+      sized(bytes_of_string(join(concat(cc::float_flags(), native::native_flags()), " "))),
+      sized(native::main_c()),
+      sized(library),
+      sized(bytes_of_string(join(libraries, " "))),
+    ]),
+  )
+
+/// The definition a builder is a function of besides what it is made from: the one that builds it,
+/// whose hash covers the front end, the emitter and how the builder's C is linked and packed. So a
+/// `ply` whose own differs builds its builder itself, and a bootstrap it could not run fails here
+/// and not in the checkouts a release of it would be handed.
+fn builder_roots() -> List<Bytes> = [b"bootstrap.builder_built"]
+
+/// Where the cache keeps the builder of the shipped modules `shipped` names, linked as `linking`
+/// names and built by the definitions `building` identifies.
+fn builder_kept(shipped: Bytes, linking: Bytes, building: Bytes) -> String / {abort.raise} = {
+  let key = blake3(
+    bytes_concat_all([
+      b"ply builder 1\0",
+      sized(builder_text()),
+      sized(bytes_of_string(builder_entry())),
+      shipped,
+      linking,
+      sized(building),
+    ]),
+  );
+  hex_of(key) ++ ".builder"
+}
+
+/// The definition a `ply`'s pack is a function of besides what it is made from: the one that makes
+/// it, whose hash covers how the shipped modules are answered, gathered and laid out.
+fn pack_roots() -> List<Bytes> = [b"bootstrap.packed"]
+
+/// Where the cache keeps the pack of the `ply` whose front end is `front` and whose C is `sources`,
+/// over the shipped modules `shipped` names, linked as `linking` names, and packed by the
+/// definitions `packing` identifies.
+fn pack_kept(
+  shipped: Bytes,
+  linking: Bytes,
+  front: Bytes,
+  sources: List<cc::Source>,
+  packing: Bytes,
+) -> String / {abort.raise} = {
+  let key = blake3(
+    bytes_concat_all([
+      b"ply pack 1\0",
+      shipped,
+      linking,
+      blake3(front),
+      sized(cc::manifest(sources)),
+      sized(packing),
+    ]),
+  );
+  hex_of(key) ++ ".pack"
+}
+
+/// The pack a `ply` carries, and how many records its shipped modules are answered in.
+type Packing = { answered: Int, pack: Bytes }
+
+/// `p` as the cache keeps it: the count, then the pack.
+fn kept_of(p: Packing) -> Bytes = bytes_concat(u64_le(p.answered), p.pack)
+
+/// What `kept_of` kept: nothing for bytes that are not a count and then a whole pack.
+fn unkept(bytes: Bytes) -> Option<Packing> / {abort.raise} = {
+  let size = bytes_len(bytes);
+  match ((u64_at(bytes, 0), if size < 32 { None } else { u64_at(bytes, size - 24) })) {
+    (Some(answered), Some(held)) -> if held == size - 32 && bytes_ends_with(bytes, b"PLYPACK1") {
+      Some({ answered: answered, pack: bytes_slice(bytes, 8, size) })
+    } else { None },
+    _ -> None,
+  }
+}
+
+// --- The builder ------------------------------------------------------------------------
+
+/// The builder's own module: it enters the checkout's compiler, and the rest of the builder is the
+/// shipped modules that reaches.
+fn builder_text() -> Bytes =
+  b"import compiler.build\nimport compiler.build (Builds)\nimport std.process (process)\n\npub fn main() -> Unit / {Builds, process.args[proc], process.exit[proc]} = build::main()\n"
+
+fn builder_entry() -> String = "builder.main"
+
+/// The builder as a load takes it: its one module, read from no directory.
+fn builder_project() -> Project = {
+  let text = builder_text();
+  {
+    files: [
+      {
+        path: "builder.ply",
+        module: "builder",
+        text: text,
+        at: { label: "abs", path: "builder.ply" },
+      },
+    ],
+    sources: [{ name: b"builder", src: text }],
+    diags: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  }
+}
+
+/// A builder below the cache, and whether it was taken as an earlier bootstrap kept it.
+type Builder = { path: String, taken: Bool }
+
+/// The builder of the checkout's shipped modules on `runtime`, at `kept` below the cache: the one an
+/// earlier bootstrap kept there, or else built here and kept. A shipped module that did not move
+/// since this `ply` was built is answered by what this `ply` carries.
 fn builder_built(
   options: Options,
   t: Toolchain,
   runtime: Runtime,
   files: List<Shipping>,
+  kept: String,
   work: String,
-) -> Result<String, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
-  let t_load: Timed = over_shipping(files, ||
-    timed_load([paths::at_abs(below_root(options.root ++ "/" ++ compiler_dir()))], false, false));
-  match program_view(t_load.program) {
-    None -> Err(t_load.program.diags),
-    Some(w) -> {
-      let front = front_of(t_load, w);
-      let offered = every_root(front);
-      let kept = below_root(env.bodies[sys]());
-      let emission = emitted(
-        runtime,
-        front.dump,
-        map(front.files, |f: { path: String, name: String, text: Bytes }| f.text),
-        offered,
-        emitter_identity(shipped.definitions()),
-        |k: Bytes| read_kept[abs](kept, k),
-        |k: Bytes, bytes: Bytes| write_kept[abs](kept, k, bytes),
-      );
-      match held(front.dump, offered, emission) {
-        Err(diags) -> Err(diags),
-        Ok(c) -> match linked(
-            t,
-            cc::objects[cc](t, cc::split(c), native::native_flags(), work),
-            options.library,
-            work,
-          ) {
+) -> Result<Builder, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
+  let path = toolchain.cache() ++ "/" ++ kept;
+  if toolchain.holds(kept) { Ok({ path: path, taken: true }) } else {
+    let started = time.elapsed_ms();
+    let t_load: Timed = over_shipping(files, ||
+      timed_uncached_over([], builder_project(), started));
+    match program_view(t_load.program) {
+      None -> Err(t_load.program.diags),
+      Some(w) -> {
+        let front = front_of(t_load, w);
+        let offered = every_root(front);
+        let bodies = below_root(env.bodies[sys]());
+        let emission = emitted(
+          runtime,
+          front.dump,
+          map(front.files, |f: { path: String, name: String, text: Bytes }| f.text),
+          offered,
+          emitter_identity(shipped.definitions()),
+          |k: Bytes| read_kept[abs](bodies, k),
+          |k: Bytes, bytes: Bytes| write_kept[abs](bodies, k, bytes),
+        );
+        match held(front.dump, offered, emission) {
           Err(diags) -> Err(diags),
-          Ok(exe) ->
-            packed_after(
-              exe,
-              packed_with(
-                files,
-                shipped.front("build.main", shipped_dump(front.dump), len(front.files)),
-                [],
-              ),
-            ),
-        },
-      }
-    },
+          Ok(c) -> match linked(
+              t,
+              cc::objects[cc](t, cc::split(c), native::native_flags(), work),
+              options.library,
+              work,
+            ) {
+            Err(diags) -> Err(diags),
+            Ok(exe) -> match packed_after(
+                exe,
+                packed_with(
+                  files,
+                  shipped.front(builder_entry(), shipped_dump(front.dump), len(front.files)),
+                  [],
+                ),
+              ) {
+              Err(diags) -> Err(diags),
+              Ok(whole) -> if toolchain.moved(relative(whole), kept) {
+                Ok({ path: path, taken: false })
+              } else { failed("the builder could not be kept in the toolchain's cache") },
+            },
+          },
+        }
+      },
+    }
   }
 }
 
@@ -354,14 +512,12 @@ fn ply_built(
 }
 
 /// What `ply` answers of the shipped modules, as its pack carries it: each record and output of the
-/// store its `std --answers` wrote, gzipped, and the claim that they stand.
+/// store its `std --answers` wrote below `work`, gzipped, and the claim that they stand.
 fn answers(
   ply: String,
   work: String,
 ) -> Result<List<Packed>, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
-  // What an earlier bootstrap left there answered for another `ply`.
-  toolchain.cleared("answers");
-  let store = toolchain.cache() ++ "/answers";
+  let store = toolchain.cache() ++ "/" ++ work ++ "/answers";
   let ran = toolchain.ran(relative(ply), ["std", "--answers", store]);
   if ran.code != 0 {
     failed("the new `ply` did not answer the shipped modules:\n" ++ string_of_bytes_lossy(ran.err))
@@ -383,6 +539,49 @@ fn answers(
       None -> failed("the new `ply` wrote no claim that its answers stand"),
       Some(claim) -> Ok(push(gathered, { path: "answers/standing", bytes: bytes_gzip(claim) })),
     }
+  }
+}
+
+/// The pack the `ply` at `exe` carries: the shipped modules, its front end and what it answers of
+/// them. A copy that carries only its front end answers for the one that carries the answers too.
+fn packed(
+  exe: String,
+  files: List<Shipping>,
+  front: Bytes,
+  work: String,
+) -> Result<Packing, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+  let answering = exe ++ "-answering";
+  if !fs.copy[abs](below_root(exe), below_root(answering)) {
+    failed("the new `ply` could not be copied to answer with")
+  } else {
+    match packed_after(answering, packed_with(files, front, [])) {
+      Err(diags) -> Err(diags),
+      Ok(_) -> match answers(answering, work) {
+        Err(diags) -> Err(diags),
+        Ok(answered) -> Ok({ answered: len(answered), pack: packed_with(files, front, answered) }),
+      },
+    }
+  }
+}
+
+/// The pack of the `ply` at `exe`, at `kept` below the cache: the one an earlier bootstrap kept
+/// there, or else made here and kept. `taken` is whether it was kept.
+fn pack_made(
+  exe: String,
+  files: List<Shipping>,
+  front: Bytes,
+  kept: String,
+  work: String,
+) -> Result<{ packing: Packing, taken: Bool }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+  let had = if !toolchain.holds(kept) { None }
+  else { match toolchain.held(kept) { Some(bytes) -> unkept(bytes), None -> None } };
+  match had {
+    Some(p) -> Ok({ packing: p, taken: true }),
+    None -> match packed(exe, files, front, work) {
+      Err(diags) -> Err(diags),
+      Ok(p) -> if toolchain.written(kept, kept_of(p)) { Ok({ packing: p, taken: false }) }
+      else { failed("the pack could not be kept in the toolchain's cache") },
+    },
   }
 }
 
@@ -438,6 +637,9 @@ fn installed(
   }
 }
 
+/// What names what every step of one bootstrap is made from: its shipped modules, and how it links.
+type Keys = { shipped: Bytes, linking: Bytes }
+
 /// The checkout's `ply` built below `work`, each step timed into `steps`.
 fn bootstrapped(
   options: Options,
@@ -445,68 +647,106 @@ fn bootstrapped(
   files: List<Shipping>,
   work: String,
   phases: Bool,
-) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, env.bodies[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
   let started = time.elapsed_ms();
   match described(t, options.library, work) {
     Err(diags) -> Err(diags),
-    Ok(runtime) -> {
-      let steps = took([], "described the runtime", started);
+    Ok(runtime) -> match fs.read_file[abs](below_root(options.library)) {
+      None -> failed("the runtime's library at `" ++ options.library ++ "` could not be read"),
+      Some(library) -> {
+        let keys = {
+          shipped: shipped_key(files),
+          linking: linking_key(t, blake3(library), toolchain.libraries()),
+        };
+        let steps = took([], "described the runtime", started);
+        let at = time.elapsed_ms();
+        match builder_built(
+            options,
+            t,
+            runtime,
+            files,
+            builder_kept(
+              keys.shipped,
+              keys.linking,
+              identity_of(shipped.definitions(), builder_roots()),
+            ),
+            work,
+          ) {
+          Err(diags) -> Err(diags),
+          Ok(builder) -> {
+            let steps = took(
+              steps,
+              if builder.taken { "took the kept builder" } else { "built the builder" },
+              at,
+            );
+            let at = time.elapsed_ms();
+            match ply_built(options, builder.path, work, phases) {
+              Err(diags) -> Err(diags),
+              Ok(made) -> {
+                let steps = took(steps, "built `ply`", at);
+                let at = time.elapsed_ms();
+                match linked(
+                    t,
+                    cc::objects_kept[cc](t, made.sources, native::native_flags(), work),
+                    options.library,
+                    work,
+                  ) {
+                  Err(diags) -> Err(diags),
+                  Ok(exe) ->
+                    finished(
+                      options,
+                      files,
+                      keys,
+                      made,
+                      exe,
+                      work,
+                      took(steps, "compiled and linked `ply`", at),
+                    ),
+                }
+              },
+            }
+          },
+        }
+      },
+    },
+  }
+}
+
+/// The `ply` linked at `exe` written where it goes with its pack, the last steps timed after `steps`.
+fn finished(
+  options: Options,
+  files: List<Shipping>,
+  keys: Keys,
+  made: { front: Bytes, sources: List<cc::Source>, said: Bytes },
+  exe: String,
+  work: String,
+  steps: List<Took>,
+) -> Result<Built, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, time.elapsed_ms, entropy.next, abort.raise} = {
+  let at = time.elapsed_ms();
+  let kept = pack_kept(
+    keys.shipped,
+    keys.linking,
+    made.front,
+    made.sources,
+    identity_of(shipped.definitions(), pack_roots()),
+  );
+  match pack_made(exe, files, made.front, kept, work) {
+    Err(diags) -> Err(diags),
+    Ok(p) -> {
+      let steps = took(
+        steps,
+        if p.taken { "took the kept pack" } else { "answered the shipped modules" },
+        at,
+      );
       let at = time.elapsed_ms();
-      match builder_built(options, t, runtime, files, work) {
+      match installed(exe, options.out, p.packing.pack) {
         Err(diags) -> Err(diags),
-        Ok(builder) -> {
-          let steps = took(steps, "built the builder", at);
-          let at = time.elapsed_ms();
-          match ply_built(options, builder, work, phases) {
-            Err(diags) -> Err(diags),
-            Ok(made) -> {
-              let steps = took(steps, "built `ply`", at);
-              let at = time.elapsed_ms();
-              match linked(
-                  t,
-                  cc::objects_kept[cc](t, made.sources, native::native_flags(), work),
-                  options.library,
-                  work,
-                ) {
-                Err(diags) -> Err(diags),
-                Ok(exe) -> {
-                  let steps = took(steps, "compiled and linked `ply`", at);
-                  let at = time.elapsed_ms();
-                  // A copy that carries only its front end answers the shipped modules for the one
-                  // that carries the answers too.
-                  let answering = exe ++ "-answering";
-                  if !fs.copy[abs](below_root(exe), below_root(answering)) {
-                    failed("the new `ply` could not be copied to answer with")
-                  } else {
-                    match packed_after(answering, packed_with(files, made.front, [])) {
-                      Err(diags) -> Err(diags),
-                      Ok(_) -> match answers(answering, work) {
-                        Err(diags) -> Err(diags),
-                        Ok(answered) -> {
-                          let steps = took(steps, "answered the shipped modules", at);
-                          let at = time.elapsed_ms();
-                          match installed(
-                              exe,
-                              options.out,
-                              packed_with(files, made.front, answered),
-                            ) {
-                            Err(diags) -> Err(diags),
-                            Ok(_) ->
-                              Ok({
-                                answered: len(answered),
-                                steps: took(steps, "packed and wrote `ply`", at),
-                                said: made.said,
-                              }),
-                          }
-                        },
-                      },
-                    }
-                  }
-                },
-              }
-            },
-          }
-        },
+        Ok(_) ->
+          Ok({
+            answered: p.packing.answered,
+            steps: took(steps, "packed and wrote `ply`", at),
+            said: made.said,
+          }),
       }
     },
   }
@@ -514,7 +754,7 @@ fn bootstrapped(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], time.elapsed_ms, entropy.next, time.now_ms, shipped.reached, abort.raise, diverges} = {
+) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, abort.raise} = {
   let s = style_of(flags);
   let options = options_of(flags);
   let files = shipping(options.root);
@@ -561,4 +801,72 @@ test "a ply installed below a directory not yet made is written there" {
   assert_eq(ran.value, Ok(()));
   assert_eq(fs::mem_read(ran.tree, "out/stage1/ply"), Some(b"codepack"));
   assert_eq(fs::mem_list(ran.tree, "out/stage1"), Some(["ply"]))
+}
+
+fn two_shipped() -> List<Shipping> =
+  [
+    { name: "std.a.ply", path: "pack/a.ply", bytes: b"pub fn a() -> Int = 1\n" },
+    { name: "std/a/data.txt", path: "pack/a/data.txt", bytes: b"data" },
+  ]
+
+test "the shipped modules' key moves with a module's bytes and its name, and not with their order" {
+  let files = two_shipped();
+  let key = shipped_key(files);
+  assert_eq(shipped_key([at(files, 1), at(files, 0)]), key);
+  assert(shipped_key([{ ..at(files, 0), bytes: b"pub fn a() -> Int = 2\n" }, at(files, 1)]) != key);
+  assert(shipped_key([{ ..at(files, 0), name: "std.b.ply" }, at(files, 1)]) != key);
+  assert(shipped_key([at(files, 0)]) != key)
+}
+
+test "a link's key moves with the compiler, its level, the library and what is linked after it" {
+  let t = { identity: b"cc 1", support: [], level: "-O2" };
+  let key = linking_key(t, b"library", ["-lm"]);
+  assert_eq(linking_key(t, b"library", ["-lm"]), key);
+  assert(linking_key({ ..t, identity: b"cc 2" }, b"library", ["-lm"]) != key);
+  assert(linking_key({ ..t, level: "-O0" }, b"library", ["-lm"]) != key);
+  assert(linking_key(t, b"another", ["-lm"]) != key);
+  assert(linking_key(t, b"library", ["-lm", "-ldl"]) != key)
+}
+
+test "a builder is kept under its shipped modules, its link and the definitions that build it" {
+  let kept = builder_kept(b"shipped", b"linking", b"building");
+  assert(string_ends_with(kept, ".builder"));
+  assert_eq(builder_kept(b"shipped", b"linking", b"building"), kept);
+  assert(builder_kept(b"moved", b"linking", b"building") != kept);
+  assert(builder_kept(b"shipped", b"moved", b"building") != kept);
+  assert(builder_kept(b"shipped", b"linking", b"moved") != kept)
+}
+
+test "a pack is kept under its program's front end and C, and the definitions that pack it" {
+  let sources = [{ label: "0a", digest: "d1" }];
+  let kept = pack_kept(b"shipped", b"linking", b"front", sources, b"packing");
+  assert_eq(pack_kept(b"shipped", b"linking", b"front", sources, b"packing"), kept);
+  assert(pack_kept(b"shipped", b"linking", b"moved", sources, b"packing") != kept);
+  assert(
+    pack_kept(b"shipped", b"linking", b"front", [{ label: "0a", digest: "d2" }], b"packing")
+      != kept,
+  );
+  assert(pack_kept(b"shipped", b"linking", b"front", sources, b"moved") != kept);
+  assert(pack_kept(b"moved", b"linking", b"front", sources, b"packing") != kept)
+}
+
+test "a kept pack reads back with its count, and bytes that are not a whole pack read as none" {
+  let p = { answered: 3, pack: packed_with(two_shipped(), b"front", []) };
+  let kept = kept_of(p);
+  assert_eq(unkept(kept), Some(p));
+  assert_eq(unkept(bytes_slice(kept, 0, bytes_len(kept) - 1)), None);
+  assert_eq(unkept(bytes_concat(kept, b"x")), None);
+  assert_eq(unkept(b"short"), None)
+}
+
+test "files are the ones this ply carries where each reads as it carries it and none is left out" {
+  let files = two_shipped();
+  let module = at(files, 0).bytes;
+  let own = |held: List<{ path: String, body: Bytes }>|
+    fs::on_mem[shipped](fs::mem_of(held), || carried(files)).value;
+  let data = { path: "std/a/data.txt", body: b"data" };
+  assert(own([{ path: "std.a.ply", body: module }, data]));
+  assert(!own([{ path: "std.a.ply", body: b"moved" }, data]));
+  assert(!own([{ path: "std.a.ply", body: module }, { path: "std.b.ply", body: b"" }, data]));
+  assert(!own([{ path: "std.a.ply", body: module }]))
 }

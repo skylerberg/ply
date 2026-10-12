@@ -53,7 +53,7 @@ pub fn exports_of(defs: &[Def]) -> Exports {
         buckets: Vec::new(),
         instances: Vec::new(),
         numerics: Vec::new(),
-        in_place: true,
+        layout: ply_codegen::heap::RecordLayout::CURRENT,
     }
 }
 

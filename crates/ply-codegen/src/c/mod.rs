@@ -59,6 +59,44 @@ pub fn kept_dirs() -> Vec<std::path::PathBuf> {
     vec![load::cache_dir(), stage::stage_root()]
 }
 
+/// The directory a run keeps `kind` of what it keeps in: the one the variable `named` names, else
+/// `ply/<kind>` under the user's caches, which a restart of the machine leaves as they were.
+pub(crate) fn kept_dir(kind: &str, named: &str) -> std::path::PathBuf {
+    let var = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+    kept_root(
+        kind,
+        var(named),
+        var("HOME"),
+        var("XDG_CACHE_HOME"),
+        cfg!(target_os = "macos"),
+        std::env::temp_dir(),
+    )
+}
+
+/// [`kept_dir`] of what the environment holds: `named` where it is set, else `ply/<kind>` under
+/// the user's caches, which are `Library/Caches` under `home` on macOS and `xdg`, when it is an
+/// absolute path, or `.cache` under `home` elsewhere; under `temp` for a user with no home.
+pub fn kept_root(
+    kind: &str,
+    named: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    xdg: Option<std::path::PathBuf>,
+    macos: bool,
+    temp: std::path::PathBuf,
+) -> std::path::PathBuf {
+    if let Some(named) = named {
+        return named;
+    }
+    let home = home.filter(|h| h.is_absolute());
+    let caches = if macos {
+        home.map(|h| h.join("Library/Caches"))
+    } else {
+        xdg.filter(|x| x.is_absolute())
+            .or(home.map(|h| h.join(".cache")))
+    };
+    caches.unwrap_or(temp).join("ply").join(kind)
+}
+
 /// What every unit's C opens with, up to its first bucket: the prelude and the runtime declared.
 pub fn unit_head() -> String {
     format!("{PRELUDE}{}\n", runtime_header())
