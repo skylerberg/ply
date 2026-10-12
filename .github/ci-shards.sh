@@ -388,9 +388,9 @@ cmd_corpus_line() {
 
 # The job of the workflow whose steps run COMMAND.
 job_running() {
-  awk -v c="${1//./\\.}" '
+  awk -v c="$1" '
     /^  [a-z-]+:$/ { job = $1; sub(/:$/, "", job) }
-    $0 ~ c { print job; exit }
+    index($0, c) { print job; exit }
   ' "$root/.github/workflows/ci.yml"
 }
 
@@ -662,6 +662,7 @@ cmd_cache_payloads() {
         # The tree itself, or its recursive form: `crates/*/ply/**` and `crates/*/ply` both
         # name the whole tree, and `crates/*/ply/*` -- one level -- names only some of it.
         base=${pat%%/\*\*}
+        # shellcheck disable=SC2053 # the pattern is a glob on purpose
         if [[ $tree == $pat || $tree == $base ]]; then
           covered=yes
           break
