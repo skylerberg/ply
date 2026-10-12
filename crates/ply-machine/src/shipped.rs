@@ -68,17 +68,17 @@ pub fn module_digest(name: &str) -> Option<String> {
     crate::shipped_modules::digest_of(name)
 }
 
-/// Every `fn` of a program, or each its `entry` reaches, and the hash its front end gave it, a
-/// `name hash` line each in name order. A hash covers all the definition reaches, so it is what an
-/// answer that definition computes is a function of on the program's side, and an entry's covers
-/// everything it reaches.
-pub fn definitions(program: &ply_eval::Analysis, entry: Option<&str>) -> String {
-    let reached = entry.map(|entry| program.hashes.reach([&ply_eval::Symbol::new(entry)]));
+/// Each `fn` of a program its `entry` reaches and the hash its front end gave it, a `name hash`
+/// line each in name order. A hash covers all the definition reaches, so it is what an answer that
+/// definition computes is a function of on the program's side, and an entry's covers everything it
+/// reaches.
+pub fn definitions(program: &ply_eval::Analysis, entry: &str) -> String {
+    let reached = program.hashes.reach([&ply_eval::Symbol::new(entry)]);
     let mut rows: Vec<(&str, String)> = program
         .hashes
         .defs
         .iter()
-        .filter(|(name, _)| reached.as_ref().is_none_or(|r| r.contains(*name)))
+        .filter(|(name, _)| reached.contains(*name))
         .map(|(name, hash)| (name.as_str(), hash.to_hex()))
         .collect();
     rows.sort();
@@ -89,19 +89,7 @@ pub fn definitions(program: &ply_eval::Analysis, entry: Option<&str>) -> String 
 
 /// The family as the launcher's program is lent it: `definitions` answers for that program.
 pub fn lent() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    lent_by(Arc::new(Shipped { definitions: None }))
-}
-
-/// The family as a program entered beside the launcher's is lent it: `definitions` answers for
-/// `program`, the one entered, every `fn` of it, since a builder files what it keeps under names
-/// it need not reach.
-pub fn lent_over(program: &ply_eval::Analysis) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    lent_by(Arc::new(Shipped {
-        definitions: Some(definitions(program, None)),
-    }))
-}
-
-fn lent_by(shipped: Arc<dyn HostHandler>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
+    let shipped: Arc<dyn HostHandler> = Arc::new(Shipped);
     OPERATIONS
         .into_iter()
         .map(|(op, path)| {
@@ -111,9 +99,7 @@ fn lent_by(shipped: Arc<dyn HostHandler>) -> Vec<(HostOp, Arc<dyn HostHandler>)>
         .collect()
 }
 
-struct Shipped {
-    definitions: Option<String>,
-}
+struct Shipped;
 
 impl HostHandler for Shipped {
     fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
@@ -126,9 +112,7 @@ impl HostHandler for Shipped {
                     ply_host::observe::shipped(req.machine, name);
                 }
             }
-            ("definitions", []) if self.definitions.is_none() => {
-                ply_host::observe::program(req.machine)
-            }
+            ("definitions", []) => ply_host::observe::program(req.machine),
             ("reached", [view, pulled]) => {
                 let view = view.as_bytes(span, "a load's view of the shipped modules")?;
                 let pulled = pulled.as_bool(span, "whether the load pulled its modules")?;
@@ -161,13 +145,9 @@ impl HostHandler for Shipped {
             }
             ("version", []) => PlyValue::str(env!("CARGO_PKG_VERSION")),
             ("stamps", []) => PlyValue::str(STAMPS.get().map_or("", String::as_str)),
-            ("definitions", []) => PlyValue::bytes(
-                self.definitions
-                    .as_deref()
-                    .or(ENTERED.get().map(String::as_str))
-                    .unwrap_or("")
-                    .as_bytes(),
-            ),
+            ("definitions", []) => {
+                PlyValue::bytes(ENTERED.get().map_or("", String::as_str).as_bytes())
+            }
             ("runtime", []) => runtime(),
             ("builtins", []) => PlyValue::list(
                 ply_eval::Builtin::all()

@@ -5,7 +5,7 @@
 //! listings and closures, and cannot be shadowed by a file in a project.
 
 use ply_eval::ModuleName;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The reserved first segments the standard library's and the compiler's modules answer to.
 pub const STD_ROOT: &str = "std";
@@ -140,11 +140,4 @@ pub fn pseudo_path(module: &ModuleName) -> PathBuf {
         ),
     };
     PathBuf::from(format!("{root}/{rest}.ply"))
-}
-
-pub fn is_pseudo_path(path: &Path) -> bool {
-    path.to_str().is_some_and(|p| {
-        p.starts_with(&format!("{STD_PSEUDO_ROOT}/"))
-            || p.starts_with(&format!("{COMPILER_PSEUDO_ROOT}/"))
-    })
 }

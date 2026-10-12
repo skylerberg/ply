@@ -221,7 +221,7 @@ pub fn run(
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
     ply_codegen::c::sweep::once();
-    let definitions = ply_machine::shipped::definitions(&program.front, Some(&program.entry));
+    let definitions = ply_machine::shipped::definitions(&program.front, &program.entry);
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),
