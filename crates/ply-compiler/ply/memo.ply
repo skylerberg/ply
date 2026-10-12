@@ -81,7 +81,8 @@ pub type Query<| e> = {
 /// marks are still to settle, lowest first. `offers` holds what a body offered for another key, the
 /// query whose body offered it, the key that body was answering and which of its runs made the
 /// offer; and `runs` how many times the run has run the body under each key. `vouched` is whether
-/// the store vouched for any record to the run when it started.
+/// the store vouched for any record to the run when it started, and `lost` how many answers a
+/// record that stood named and no store held, which the run made again.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
@@ -95,6 +96,7 @@ pub type Run = {
   offers: Map<Bytes, Offer>,
   runs: Map<Bytes, Int>,
   vouched: Bool,
+  lost: Int,
 }
 
 type Offer = { output: Bytes, by: Bytes, from: Bytes, nth: Int }
@@ -113,6 +115,7 @@ fn new_run() -> Run =
     offers: map_new(),
     runs: map_new(),
     vouched: false,
+    lost: 0,
   }
 
 /// What the run's driver asked, each read by the digest of what it answered: what an answer made
@@ -122,6 +125,10 @@ pub fn asked_reads(run: Run) -> List<Read> = run.asked
 /// Whether the store the run started over vouched for any record to it. Where it did, a run that
 /// ran bodies and took no answer was not served what the store holds.
 pub fn vouched_to(run: Run) -> Bool = run.vouched
+
+/// How many answers the run made again because a record that stood named one no store held: none
+/// over a store that is whole.
+pub fn lost_in(run: Run) -> Int = run.lost
 
 /// What a run did of one query: answers taken as kept, and bodies run.
 pub type Tally = { query: Bytes, took: Int, ran: Int }
@@ -240,7 +247,7 @@ pub fn height_named(b: Bytes) -> Int =
   else { match u64_at(b, 1) { Some(h) -> h, None -> 0 } }
 
 /// A record's bytes naming `height` where they name a lower one: bytes of no record as they are.
-pub fn at_height(b: Bytes, height: Int) -> Bytes / {abort.raise} =
+pub fn at_height(b: Bytes, height: Int) -> Bytes =
   if height <= height_named(b) || bytes_len(b) < 9 || bytes_slice(b, 0, 1) != record_format() { b }
   else { bytes_concat_all([record_format(), u64_le(height), bytes_slice(b, 9, bytes_len(b))]) }
 
@@ -365,7 +372,7 @@ fn now_at<| e>(
   queries: Map<Bytes, Query<| e>>,
   kind: Bytes,
   at: Bytes,
-) -> Option<Bytes> / {memo_keep.read, abort.raise} =
+) -> Option<Bytes> / {memo_keep.read} =
   if kind == query_kind() { match map_get(queries, at) { Some(q) -> Some(q.hash), None -> None } }
   else { memo_keep.now(kind, at) }
 
@@ -374,7 +381,7 @@ fn digest_at<| e>(
   queries: Map<Bytes, Query<| e>>,
   kind: Bytes,
   at: Bytes,
-) -> Bytes / {memo_keep.read, abort.raise} =
+) -> Bytes / {memo_keep.read} =
   if kind == query_kind() { digest_of(now_at(queries, kind, at)) }
   else { memo_keep.digest(kind, at) }
 
@@ -664,7 +671,7 @@ fn fetched<| e>(
       None -> {
         let e = executed(queries, s.run, q, key, input, [], None, left - 1);
         {
-          run: { ..e.run, settled: map_insert(e.run.settled, key, e.head) },
+          run: { ..e.run, lost: e.run.lost + 1, settled: map_insert(e.run.settled, key, e.head) },
           output: match memo_keep.output(e.head) {
             Some(o) -> o,
             None -> panic("a store does not hold an answer it was just handed to keep"),
@@ -1328,7 +1335,7 @@ fn asked_over(
   w: World,
   name: Bytes,
   input: Bytes,
-) -> { output: Bytes, executed: Int, read: Int, world: World } / {abort.raise} =
+) -> { output: Bytes, executed: Int, lost: Int, read: Int, world: World } / {abort.raise} =
   asked_with(queries, w, map_new(), None, name, input)
 
 /// [`asked_over`], with the files of a packed store `beside` the run's own, and the world holding
@@ -1340,7 +1347,7 @@ fn asked_with(
   after: Option<Map<Bytes, Bytes>>,
   name: Bytes,
   input: Bytes,
-) -> { output: Bytes, executed: Int, read: Int, world: World } / {abort.raise} =
+) -> { output: Bytes, executed: Int, lost: Int, read: Int, world: World } / {abort.raise} =
   with_cell[test_memo](0) { reads -> {
     let done = over_held(
       w.held,
@@ -1355,12 +1362,13 @@ fn asked_with(
       },
       || {
         let a = answer(queries, started(queries), name, input);
-        { output: a.output, executed: ran_total(a.run) }
+        { output: a.output, executed: ran_total(a.run), lost: lost_in(a.run) }
       },
     );
     {
       output: done.value.output,
       executed: done.value.executed,
+      lost: done.value.lost,
       read: cell_get(reads),
       world: { ..w, held: done.held, read: cell_get(reads) },
     }
@@ -1775,7 +1783,8 @@ test "a record whose answer is no longer kept is answered again" {
     b"a",
   );
   assert_eq(lost.output, b"4");
-  assert_eq(lost.executed, 1)
+  assert_eq(lost.executed, 1);
+  assert_eq([first.lost, lost.lost], [0, 1])
 }
 
 fn offering(input: Bytes) -> Bytes / {memo.read} = {
