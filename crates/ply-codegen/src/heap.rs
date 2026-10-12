@@ -70,7 +70,8 @@ pub const MIXED: u8 = 2;
 /// A record holding a `Float`'s bits or a record in place: not every word of it is a value.
 pub const RAW: u8 = 4;
 /// A string or bytes value whose bytes are another's: its first word is that value, held, and its
-/// second where its bytes begin there. It has no room to grow in place.
+/// second where its bytes begin there. It has no room to grow in place. The value it views counts
+/// its views in `aux`, so it still grows in place where they are its only other holders.
 pub const VIEW: u8 = 8;
 
 /// The fewest bytes a slice holds before it is a view of its value rather than a copy: below it a
@@ -1559,15 +1560,17 @@ impl Heap {
         unsafe {
             set_word(v, 0, of);
             set_word(v, 1, from as i64);
+            counted_view(obj(of), 1);
         }
         v as Word
     }
 
-    /// Takes `a` and appends `b`: in place when `a` is unique and has room, else a doubled copy.
+    /// Takes `a` and appends `b`: in place when `a` may grow in place and has room, else a doubled
+    /// copy.
     pub fn append(&mut self, a: Word, b: &[u8]) -> Word {
         let o = obj(a);
         let (len, cap) = unsafe { ((*o).len as usize, (*o).layout as usize) };
-        if is_unique(a) && len + b.len() <= cap {
+        if grows_in_place(a) && len + b.len() <= cap {
             unsafe {
                 std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(o).add(len), b.len());
                 (*o).len = (len + b.len()) as u32;
@@ -2273,6 +2276,9 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
         if (*o).kind == KIND_BRIDGE {
             std::ptr::drop_in_place(bridge_slot(o));
         }
+        if ((*o).kind == KIND_BYTES || (*o).kind == KIND_STR) && (*o).flags & VIEW != 0 {
+            counted_view(obj(word_at(o, 0)), -1);
+        }
         for i in child_ranges(o)
             .iter()
             .flat_map(|(first, last)| *first..*last)
@@ -2396,6 +2402,30 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
         }
     }
     false
+}
+
+/// Adds `by` to the views of `o` it counts; a count past its field stays there, so `o` is held by
+/// views it no longer counts and never grows in place again. A shared value counts none.
+unsafe fn counted_view(o: *mut Obj, by: i32) {
+    unsafe {
+        let views = (*o).aux;
+        if (*o).rc < SHARED && views < u16::MAX {
+            (*o).aux = (i32::from(views) + by).clamp(0, i32::from(u16::MAX)) as u16;
+        }
+    }
+}
+
+/// Whether bytes or a string `w` may grow in place: no holder but one has it, besides the views of
+/// it, which read only bytes it already holds.
+pub fn grows_in_place(w: Word) -> bool {
+    if is_imm(w) || w == 0 {
+        return false;
+    }
+    let o = obj(w);
+    unsafe {
+        let (rc, views) = ((*o).rc, (*o).aux);
+        (*o).flags & VIEW == 0 && rc < SHARED && views < u16::MAX && rc == 1 + u32::from(views)
+    }
 }
 
 /// Whether one holder alone has `w`: what lets an update write in place.
