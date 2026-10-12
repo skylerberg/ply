@@ -1,9 +1,29 @@
-//! The program an executable was linked with. Its `main` hands the runtime a table of every symbol
-//! the runtime looks up, so nothing of the program is exported for `dlsym` to find, and a unit the
-//! program loads later binds only to its own code.
+//! The program an executable was linked with. Its `main` hands the runtime the unit's descriptor,
+//! so nothing of the program is exported for `dlsym` to find, and a unit the program loads later
+//! binds only to its own code. A `main` the last release wrote hands over a table of symbols by
+//! name instead, which holds the descriptor where the unit lays one out.
 
+use super::descriptor::Descriptor;
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::OnceLock;
+
+static UNIT: OnceLock<&'static Descriptor> = OnceLock::new();
+
+/// Installs the descriptor `main` hands over. Refused when one is installed already.
+///
+/// # Safety
+/// `unit` points at a unit's descriptor, which lives as long as the process.
+pub unsafe fn install_unit(unit: *const Descriptor) -> Result<(), String> {
+    let Some(unit) = (unsafe { unit.as_ref() }) else {
+        return Err("the linked program handed over no unit".to_string());
+    };
+    UNIT.set(unit)
+        .map_err(|_| "a linked program's unit is installed already".to_string())
+}
+
+pub(super) fn unit() -> Option<&'static Descriptor> {
+    UNIT.get().copied()
+}
 
 /// One row of the table a native program's `main` hands over.
 #[repr(C)]
