@@ -178,10 +178,6 @@ impl<'a> Machine<'a> {
         (self.compiled_entries, self.compiled_declines)
     }
 
-    pub fn test_count(&self) -> usize {
-        self.front.check.tests.len()
-    }
-
     /// `index` into the front's tests: load order, then source order.
     pub fn eval_test(&mut self, index: usize) -> Ended<()> {
         let (root, span) = match self.test_root(index) {

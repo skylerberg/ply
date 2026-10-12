@@ -56,13 +56,6 @@ impl Linearity {
             Linearity::Repeatable => "repeatable",
         }
     }
-
-    pub fn as_json(self) -> &'static str {
-        match self {
-            Linearity::AtMostOnce => "at_most_once",
-            Linearity::Repeatable => "repeatable",
-        }
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

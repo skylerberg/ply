@@ -63,6 +63,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
     assert_eq!(ply_codegen::heap::KIND_FLOAT, 16, "PLY_KIND_FLOAT");
     assert!(PRELUDE.contains("#define PLY_KIND_FLOAT 16"));
+    assert_eq!(ply_codegen::heap::MIXED, 2, "PLY_MIXED");
+    assert!(PRELUDE.contains("#define PLY_MIXED 2"));
 }
 
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.

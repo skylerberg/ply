@@ -230,17 +230,6 @@ pub fn option_of<'v>(
     }
 }
 
-pub fn opt_int_at(value: &PlyValue, name: &str, span: Span) -> Result<Option<i64>, Diagnostic> {
-    match field_of(value, name, span)? {
-        PlyValue::Ctor { name, args } if name.as_str() == "Some" => Ok(args
-            .first()
-            .map(|v| v.as_int(span, "a number"))
-            .transpose()?),
-        PlyValue::Ctor { name, .. } if name.as_str() == "None" => Ok(None),
-        other => Err(shape(other, span)),
-    }
-}
-
 pub fn str_list_at(value: &PlyValue, name: &str, span: Span) -> Result<Vec<String>, Diagnostic> {
     field_of(value, name, span)?
         .as_list(span, name)?
@@ -253,20 +242,6 @@ pub fn missing(name: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("the options record has no `{name}`"),
-    )
-    .primary(
-        span,
-        "the program and the machine agree on the record; this is Ply's fault",
-    )
-}
-
-pub fn shape(value: &PlyValue, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "the machine read a {} where an Option was expected",
-            value.type_name()
-        ),
     )
     .primary(
         span,
