@@ -83,19 +83,19 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# Runs that take a runner each: the compiler's own tests take every core, the reach audit checks
-# three whole packages cold and the copies audit lists ten, and every proof run is one load of what it
-# proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
-CORPUS_ALONE=(package-compiler cli-reached cli-copies proofs)
+# Runs that take a runner each: the compiler's own tests take every core, and every proof run is one
+# load of what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
+CORPUS_ALONE=(package-compiler proofs)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
 CLI_BY_TEST=(artifact_program corpus incremental)
 # Modules of the CLI's suite no partition runs, which the `nightly` jobs do. CLI_SWEPT edits each module
 # of the tree one way and checks it warm and cold, days of runners over the tree, so a night takes a
-# part of its cases. The rest run whole each night: minutes each over the toolchain's whole trees, or
-# against a postgres they start.
-CLI_NIGHTLY=(edit_sweep phases_whole db_in_ply db_wire pg_client)
+# part of its cases. The rest run whole each night: minutes each over the toolchain's whole trees,
+# the reach audit checking three packages cold and the copies audit listing ten, or against a postgres
+# they start.
+CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
 CLI_SWEPT=edit_sweep
 SWEEP_SHARDS=16
 SWEEP_DAYS=14
