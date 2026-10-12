@@ -69,18 +69,16 @@ impl Drop for Library {
 // holds the `Bodies` it belongs to.
 unsafe impl Send for Library {}
 
-/// Where compiled units are kept between runs. `PLY_C_CACHE` names another directory; the default
-/// is under the system's temporary directory. Libraries sit at its root, bucket objects under
-/// `obj/`, the emitter's answers under `bodies/`.
+/// Where compiled units are kept between runs: the directory `PLY_C_CACHE` names, or the
+/// user's own. Libraries sit at its root, bucket objects under `obj/`, the emitter's answers under
+/// `bodies/`.
 ///
 /// **Nothing about that directory bounds it**: an entry is keyed by its content, so a changed
-/// definition writes a new one beside the old rather than replacing it, and the system's own
-/// sweep runs on a schedule measured in days. `super::sweep` is what bounds it, once a launch,
-/// and `PLY_C_CACHE_MAX` is the bound.
+/// definition writes a new one beside the old rather than replacing it, and the system sweeps
+/// nothing there. `super::sweep` is what bounds it, once a launch, and `PLY_C_CACHE_MAX` is the
+/// bound.
 pub fn cache_dir() -> std::path::PathBuf {
-    std::env::var("PLY_C_CACHE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("ply-c-cache"))
+    super::kept_dir("cache", "PLY_C_CACHE")
 }
 
 impl Library {
