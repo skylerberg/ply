@@ -525,7 +525,7 @@ fn a_native_programs_front_end_reads_as_an_answer_of_its_entry_alone() {
         front.ctor_carries[&Symbol::new("m.Pair")],
         [Carry::Var(1), Carry::Var(0)]
     );
-    assert!(front.hashes.deps.is_empty() && front.check.modules.is_empty());
+    assert!(front.hashes.defs.is_empty() && front.check.modules.is_empty());
 
     let err = dump::linked(&with(&carried, "modules", Value::Int(1)))
         .err()

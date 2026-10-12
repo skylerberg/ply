@@ -12,7 +12,7 @@ use ply_eval::{
     Ordinal, Resource, Severity, SourceId, Span, SpecKind, Symbol, TestInfo, TypeDecl, Value,
     Visibility, intern_code,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// What every failure's path starts from.
 const ANSWER: &str = "the front end's answer";
@@ -151,21 +151,22 @@ fn hashes(rows: AnswerValue<'_>, front: &mut Analysis) -> Result<(), Error> {
         .collect();
     let mut test_hashes: Vec<Option<DefHash>> = vec![None; front.check.tests.len()];
     let mut laws_hashed = vec![false; front.check.laws.len()];
+    let mut named: HashSet<Symbol> = HashSet::new();
     for row in rows.list()? {
         let c = row.ctor()?;
         let h = c.arg(0)?;
         match c.name() {
-            "HDef" => def_hash(h, &mut front.hashes)?,
+            "HDef" => def_hash(h, &mut named, &mut front.hashes)?,
             "HTest" => {
                 let (key, i) = item(h, &tests, "test")?;
-                let hash = item_hash(h, &key, &mut front.hashes)?;
+                let hash = hash_of(h.field("hash")?)?;
                 if test_hashes[i].replace(hash).is_some() {
                     return Err(h.error(format!("test `{key}` is hashed twice")));
                 }
             }
             "HLaw" => {
                 let (key, i) = item(h, &laws, "law")?;
-                item_hash(h, &key, &mut front.hashes)?;
+                hash_of(h.field("hash")?)?;
                 if std::mem::replace(&mut laws_hashed[i], true) {
                     return Err(h.error(format!("law `{key}` is hashed twice")));
                 }
@@ -184,19 +185,23 @@ fn hashes(rows: AnswerValue<'_>, front: &mut Analysis) -> Result<(), Error> {
     Ok(())
 }
 
-/// A `fn`'s, `type`'s or `effect`'s row: one per name, a name in two namespaces included.
-fn def_hash(h: AnswerValue<'_>, out: &mut HashOutput) -> Result<(), Error> {
+/// A `fn`'s, `type`'s or `effect`'s row: one per name, a name in two namespaces included, so
+/// `named` holds each name a row was read for.
+fn def_hash(
+    h: AnswerValue<'_>,
+    named: &mut HashSet<Symbol>,
+    out: &mut HashOutput,
+) -> Result<(), Error> {
     let name = Symbol::new(h.field("name")?.utf8()?);
-    if out.deps.contains_key(&name) {
+    if !named.insert(name.clone()) {
         return Err(h.error(format!("`{name}` is hashed twice")));
     }
     if let Some(x) = h.field("def")?.option()? {
         out.defs.insert(name.clone(), hash_of(x)?);
     }
     if let Some(x) = h.field("decl")?.option()? {
-        out.decls.insert(name.clone(), hash_of(x)?);
+        out.decls.insert(name, hash_of(x)?);
     }
-    out.deps.insert(name, symbols(h.field("deps")?)?);
     Ok(())
 }
 
@@ -213,18 +218,6 @@ fn item(
         Some(&i) => Ok((name, i)),
         None => Err(key.error(format!("names no {of} the program declares"))),
     }
-}
-
-/// A test's or a law's hash; its references merge into what its key already holds.
-fn item_hash(h: AnswerValue<'_>, key: &Symbol, out: &mut HashOutput) -> Result<DefHash, Error> {
-    let hash = hash_of(h.field("hash")?)?;
-    let known = out.deps.entry(key.clone()).or_default();
-    for d in symbols(h.field("deps")?)? {
-        if !known.contains(&d) {
-            known.push(d);
-        }
-    }
-    Ok(hash)
 }
 
 /// A hash as the hasher's rows hold one: sixty-four hex digits.
