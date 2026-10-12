@@ -1,9 +1,8 @@
 //! No claim is proved that the program does not establish, read where a person reads it: the
 //! document `ply prove --json` writes.
 
-import harness (scratch, program, project, on_disk, said, stderr, json_of, at, path, items, str,
-                int, truth, shown, Reached, Shipped, outcome_of, proved, proved_here, rules_of,
-                tier_of)
+import harness (scratch, program, on_disk, said, stderr, json_of, at, path, items, str, int, truth,
+                shown, Reached, Shipped, outcome_of, proved, proved_here, rules_of)
 import std.json (Json, Null, Str, Object, Array)
 import std.string
 import std.list (concat)
@@ -23,7 +22,7 @@ fn gap(o: Json) -> String = str(at(o, "gap"))
 
 fn never_proved(report: Json, needle: String) -> Json / {abort.raise} = {
   let o = obligation(report, needle);
-  assert(tier_of(o) != "proved", Some("`" ++ needle ++ "` came back proved: " ++ shown(o)));
+  assert(outcome_of(o) != "proved", Some("`" ++ needle ++ "` came back proved: " ++ shown(o)));
   o
 }
 
@@ -77,11 +76,7 @@ test "no false claim is ever proved" {
       |u: Unit, needle: String| {
         let o = never_proved(report, needle);
         assert(
-          len(
-              filter(["refuted", "property", "example", "unattempted"], |x: String|
-                x == outcome_of(o)),
-            )
-            == 1,
+          outcome_of(o) == "refuted" || outcome_of(o) == "unproved",
           Some("`" ++ needle ++ "` came back " ++ shown(o)),
         )
       },
@@ -107,10 +102,10 @@ test "an effectful call is not a function of its arguments" {
       ),
       "m.difference",
     );
-    assert(outcome_of(o) == "unattempted", Some(shown(o)));
+    assert(outcome_of(o) == "unproved", Some(shown(o)));
     assert(
       string_contains(gap(o), "no handler"),
-      Some("an ensures on an effectful definition is a reported gap: " ++ shown(o)),
+      Some("an ensures on an effectful definition says what stopped it: " ++ shown(o)),
     )
   })
 }
@@ -159,8 +154,8 @@ test "a binder of an uninhabited type never carries a proof" {
       proved("type Bad = Wrap(Bad)\n\nlaw \"a claim about nothing\" forall (b: Bad) { b == b }\n"),
       "a claim about nothing",
     );
-    assert(outcome_of(o) == "unattempted", Some(shown(o)));
-    assert(string_contains(gap(o), "can be generated for `b`"), Some(shown(o)))
+    assert(outcome_of(o) == "unproved", Some(shown(o)));
+    assert(str(at(o, "gap_kind")) == "unwitnessed", Some(shown(o)))
   })
 }
 
@@ -171,7 +166,7 @@ test "recursion stops the unfolding and the bound is named" {
       \\
       \\fn twice(x: Int) -> Int = x + x
       \\
-      \\law "the sum is triangular" forall (n: Int) where n > 0 && n < 1000
+      \\law "the sum is triangular" forall (n: Int) where n > 0
       \\  { sum_to(n) * 2 == n * n + n }
       \\law "twice is doubling" forall (x: Int) where x > -1000 && x < 1000
       \\  { twice(x) == 2 * x }
@@ -179,7 +174,7 @@ test "recursion stops the unfolding and the bound is named" {
     );
     let _ = never_proved(report, "the sum is triangular");
     let twice = obligation(report, "twice is doubling");
-    assert(tier_of(twice) == "proved", Some(shown(twice)));
+    assert(outcome_of(twice) == "proved", Some(shown(twice)));
     let depths = map(rules_of(twice, "unfold"), |fields: Json| int(at(fields, "depth")));
     assert(
       depths != [] && len(filter(depths, |d: Int| d < 0 || d > unfold_depth())) == 0,
@@ -215,7 +210,7 @@ fn concurrency_laws(laws: List<Concurrent>) -> String =
 /// What makes an interleaving proof one: an admitted guard, a search that ran, and a claim about one
 /// program rather than a polymorphic one.
 fn an_interleaving_proof(o: Json) -> Unit / {abort.raise} = {
-  assert(tier_of(o) == "proved", Some(shown(o)));
+  assert(outcome_of(o) == "proved", Some(shown(o)));
   assert(truth(path(o, ["certificate", "guard_satisfiable"])), Some(shown(o)));
   assert(path(o, ["certificate", "sorts"]) == Array([]), Some(shown(o)));
   let searched = rules_of(o, "exhaustive_interleaving");
@@ -264,24 +259,29 @@ test "a concurrency law is proved only when both domains were covered" {
   })
 }
 
-test "an Int binder drops a concurrency law to property" {
+// Exhaustive over schedules says nothing about an `Int` binder: only a guard that holds it between
+// two literals leaves values a run can cover.
+test "a concurrency law over an Int is proved only where its guard holds the Int" {
   scratch(|| {
-    project([
-      {
-        path: "concurrency_law_binder.ply",
-        text: string_of_bytes(embed("../../../tests/fixtures/concurrency_law_binder.ply")),
-      },
-    ]);
-    let report = proved_here([]);
-    let o = obligation(report, "no interleaving");
-    assert(
-      tier_of(o) == "property",
-      Some("exhaustive over schedules says nothing about an `Int` binder: " ++ shown(o)),
-    )
+    let report = proved(
+      concurrency_laws([
+        { label: "two writers over any", header: " forall (n: Int) where n > 0", spawned: "n" },
+        {
+          label: "two writers over three",
+          header: " forall (n: Int) where n > 0 && n <= 3",
+          spawned: "n",
+        },
+      ]),
+    );
+    let open = never_proved(report, "two writers over any");
+    assert(str(at(open, "gap_kind")) == "endless", Some(shown(open)));
+    let held = obligation(report, "two writers over three");
+    an_interleaving_proof(held);
+    assert(points_of(held) == [3], Some(shown(held)))
   })
 }
 
-test "a sampled schedule search never proves" {
+test "a schedule search that is not exhaustive never proves" {
   scratch(|| {
     program(concurrency_laws([{ label: "two writers land twice", header: "", spawned: "1" }]));
     fold(
@@ -359,7 +359,7 @@ test "gap: a definition that never returns still carries a proof" {
       |u: Unit, c: { needle: String, raised: String }| {
         let o = never_proved(report, c.needle);
         assert(
-          outcome_of(o) == "unattempted",
+          outcome_of(o) == "unproved",
           Some(
             "`" ++ c.needle ++ "` is a theorem about a total symbol and not about this program: "
               ++ shown(o),
@@ -367,17 +367,17 @@ test "gap: a definition that never returns still carries a proof" {
         );
         assert(
           string_starts_with(gap(o), "raised: ") && string_contains(gap(o), c.raised),
-          Some("`" ++ c.needle ++ "` is a gap because the program ran and raised: " ++ shown(o)),
+          Some("`" ++ c.needle ++ "` is unproved because the program ran and raised: " ++ shown(o)),
         )
       },
     );
-    // Nothing is covered, which is the half a reviewer reads: coverage counts only a claim that
-    // holds.
+    // Nothing is covered, which is the half a reviewer reads: coverage counts only a claim that is
+    // proved.
     assert(int(path(report, ["coverage", "covered"])) == 0, Some(shown(report)))
   })
 }
 
-test "gap: a guard outside the generator's range is still decided" {
+test "a guard over a narrow window far from zero is still decided" {
   scratch(|| {
     let o = obligation(
       proved(
@@ -386,7 +386,7 @@ test "gap: a guard outside the generator's range is still decided" {
       "a narrow window",
     );
     assert(
-      tier_of(o) == "proved",
+      outcome_of(o) == "proved",
       Some("the guard admits nine values and the body is decided over all of them: " ++ shown(o)),
     )
   })
@@ -415,7 +415,7 @@ test "no obligation that can reach a Float is proved" {
       \\
     );
     let over_claimed = map(
-      filter(items(at(report, "obligations")), |o: Json| tier_of(o) == "proved"),
+      filter(items(at(report, "obligations")), |o: Json| outcome_of(o) == "proved"),
       |o: Json| str(at(o, "label")),
     );
     assert(
@@ -465,7 +465,8 @@ test "no obligation that can reach a keyed value is proved" {
     );
     let over_claimed = map(
       filter(items(at(report, "obligations")), |o: Json|
-        tier_of(o) == "proved" && !string_contains(str(at(o, "label")), "a type that states none")),
+        outcome_of(o) == "proved"
+          && !string_contains(str(at(o, "label")), "a type that states none")),
       |o: Json| str(at(o, "label")),
     );
     assert(
@@ -476,11 +477,11 @@ test "no obligation that can reach a keyed value is proved" {
       ),
     );
     let plain = obligation(report, "a type that states none");
-    assert(tier_of(plain) == "proved", Some(shown(plain)));
+    assert(outcome_of(plain) == "proved", Some(shown(plain)));
     // A schema's instantiation is refused as its body written out is.
     let written = obligation(report, "written out");
     let made = obligation(report, "instantiated");
-    assert(gap(made) == gap(written) && tier_of(made) == tier_of(written), Some(shown(made)));
+    assert(gap(made) == gap(written) && outcome_of(made) == outcome_of(written), Some(shown(made)));
     assert(int(path(report, ["summary", "obligations"])) == 9, Some(shown(report)))
   })
 }
@@ -507,7 +508,8 @@ test "no obligation that computes at a type stating its own arithmetic is proved
     );
     let over_claimed = map(
       filter(items(at(report, "obligations")), |o: Json|
-        tier_of(o) == "proved" && !string_contains(str(at(o, "label")), "the integers still add")),
+        outcome_of(o) == "proved"
+          && !string_contains(str(at(o, "label")), "the integers still add")),
       |o: Json| str(at(o, "label")),
     );
     assert(
@@ -518,7 +520,7 @@ test "no obligation that computes at a type stating its own arithmetic is proved
       ),
     );
     let plain = obligation(report, "the integers still add");
-    assert(tier_of(plain) == "proved", Some(shown(plain)));
+    assert(outcome_of(plain) == "proved", Some(shown(plain)));
     assert(int(path(report, ["summary", "obligations"])) == 4, Some(shown(report)))
   })
 }
@@ -542,7 +544,7 @@ test "decimal is congruent and never arithmetic" {
     );
     fold(["\"congruence\"", "\"scale is value\""], (), |u: Unit, needle: String| {
       let o = obligation(report, needle);
-      assert(tier_of(o) == "proved", Some(shown(o)))
+      assert(outcome_of(o) == "proved", Some(shown(o)))
     });
     fold(["\"additive\"", "\"commutes\"", "\"ordered\""], (), |u: Unit, needle: String| {
       let _ = never_proved(report, needle);
@@ -558,7 +560,7 @@ test "a map is opaque to the prover" {
     let report = proved(
       "law \"reflexive\" forall (m: Map<String, Int>) { m == m }\nlaw \"get after insert\" forall (m: Map<String, Int>, k: String, v: Int) { map_get(map_insert(m, k, v), k) == Some(v) }\nlaw \"insert grows\" forall (m: Map<String, Int>, k: String, v: Int) { map_len(map_insert(m, k, v)) == map_len(m) + 1 }\nlaw \"keys match len\" forall (m: Map<String, Int>) { len(map_keys(m)) == map_len(m) }\n",
     );
-    assert(tier_of(obligation(report, "\"reflexive\"")) == "proved", Some(shown(report)));
+    assert(outcome_of(obligation(report, "\"reflexive\"")) == "proved", Some(shown(report)));
     fold(["get after insert", "insert grows", "keys match len"], (), |u: Unit, needle: String| {
       let _ = never_proved(report, needle);
       ()

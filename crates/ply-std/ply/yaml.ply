@@ -3399,9 +3399,7 @@ pub fn decode_document<a>(
       message: e.message,
     })
 
-// --- Laws -------------------------------------------------------------------
-
-gen for Yaml by yamls
+// --- Properties -------------------------------------------------------------
 
 /// What a sampled claim draws a value from: every kind of value, nested three deep, a mapping
 /// through `mapping` and a tagged value through `tagged`, so each is one a reader answers.
@@ -3502,74 +3500,83 @@ fn drawn_tags() -> List<String> =
     "",
   ]
 
-/// More than a value a law draws reaches, with every tag one is drawn under kept.
+/// More than a value a test draws reaches, with every tag one is drawn under kept.
 fn wide() -> Limits =
   { bytes: 1073741824, depth: 512, nodes: 1073741824, scalar: 1073741824, documents: 1073741824 }
 
 fn keeping() -> Options = { merge_keys: false, keep_tags: drawn_tags() }
 
-law "a value reads back from the document written of it" =
-  round_trip(to_bytes, |text: Bytes| result_ok(parse(text, wide(), keeping())))
+/// An `Entry` as a test draws one.
+fn entries() -> gen::Gen<Entry> =
+  gen::map2(yamls(), yamls(), |key: Yaml, value: Yaml| { key: key, value: value })
 
-law "a value reads back from its flow text" =
-  round_trip(inline, |text: String| result_ok(parse_string(text, wide(), keeping())))
-
-law "a value reads back as the value of a key and as an entry of a sequence" =
-  round_trip(
-    |v: Yaml| to_bytes(Mapping([entry("at", Sequence([v])), entry("after", Null)])),
-    |text: Bytes|
-      option_and_then(result_ok(parse(text, wide(), keeping())), |read: Yaml|
-        at(read, [Key("at"), Index(0)])),
-  )
-
-law "the documents of a stream read back from what is written of them" =
-  round_trip(stream_to_bytes, |text: Bytes| result_ok(parse_all(text, wide(), keeping())))
-
-law "a mapping is the same mapping whatever the order of its keys"
-  forall (entries: List<Entry>) {
-    match mapping(entries) {
-      Mapping(held) -> Mapping(reverse(held)) == mapping(entries),
-      _ -> false,
-    }
+/// A `Jseed` as a test draws one.
+fn jseeds_at(depth: Int) -> gen::Gen<Jseed> =
+  if depth <= 0 {
+    gen::one_of([
+      gen::constant(JNull),
+      gen::map(gen::bool(), |f0: Bool| JBoolean(f0)),
+      gen::map(gen::any_int(), |f0: Int| JInteger(f0)),
+      gen::map(gen::text(), |f0: String| JString(f0)),
+    ])
+  } else {
+    gen::one_of([
+      gen::constant(JNull),
+      gen::map(gen::bool(), |f0: Bool| JBoolean(f0)),
+      gen::map(gen::any_int(), |f0: Int| JInteger(f0)),
+      gen::map(gen::text(), |f0: String| JString(f0)),
+      gen::map(gen::list_of(jseeds_at(depth - 1), 3), |f0: List<Jseed>| JArray(f0)),
+      gen::map(
+        gen::list_of(
+          gen::map2(gen::text(), jseeds_at(depth - 1), |key: String, value: Jseed|
+            { key: key, value: value }),
+          3,
+        ),
+        |f0: List<Jsown>| JObject(f0),
+      ),
+    ])
   }
 
-law "a value put at a key is at it, and is gone without it"
-  forall (entries: List<Entry>, name: String, v: Yaml) {
-    let before = mapping(entries);
-    match put(before, [Key(name)], v) {
-      Some(after) ->
-        at(after, [Key(name)]) == Some(v)
-          && without(after, [Key(name)]) == without(before, [Key(name)]),
-      None -> false,
-    }
-  }
+fn jseeds() -> gen::Gen<Jseed> = gen::sized(|size: Int| jseeds_at(min(max(size / 16, 0), 3)))
 
-law "a document keeps the bytes it was read from, and means what a reader reads of them"
-  forall (v: Yaml) {
+test "a value reads back from the document written of it" {
+  gen::check(yamls(), |x: Yaml|
+    round_trip(to_bytes, |text: Bytes| result_ok(parse(text, wide(), keeping())), x))
+}
+
+test "a document keeps the bytes it was read from, and means what a reader reads of them" {
+  gen::check(yamls(), |v: Yaml| {
     let text = to_bytes(v);
     match parse_document(text, wide(), keeping()) {
       Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide(), keeping()),
       Err(_) -> false,
     }
-  }
+  })
+}
 
-law "a key set in a document is set in its value, and removed from both"
-  forall (entries: List<Entry>, name: String, v: Yaml) {
-    let before = mapping(entries);
-    let path = [Key(name)];
-    match parse_document(to_bytes(before), wide(), keeping()) {
-      Err(_) -> false,
-      Ok(d) -> match try { set(d, path, v) } {
+test "a key set in a document is set in its value, and removed from both" {
+  gen::check3(
+    gen::list(entries()),
+    gen::text(),
+    yamls(),
+    |entries: List<Entry>, name: String, v: Yaml| {
+      let before = mapping(entries);
+      let path = [Key(name)];
+      match parse_document(to_bytes(before), wide(), keeping()) {
         Err(_) -> false,
-        Ok(changed) -> {
-          let taken = try { value(remove(changed, path)) };
-          Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
+        Ok(d) -> match try { set(d, path, v) } {
+          Err(_) -> false,
+          Ok(changed) -> {
+            let taken = try { value(remove(changed, path)) };
+            Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
+          },
         },
-      },
-    }
-  }
+      }
+    },
+  )
+}
 
-/// What a law draws a JSON document from, numbers as the integers both formats write alike.
+/// What a test draws a JSON document from, numbers as the integers both formats write alike.
 type Jseed =
   | JNull
   | JBoolean(Bool)
@@ -3601,125 +3608,10 @@ fn as_yaml(s: Jseed) -> Yaml =
     JObject(fields) -> mapping(map(fields, |f: Jsown| entry(f.key, as_yaml(f.value)))),
   }
 
-law "a JSON document reads as the value JSON says it is" =
-  agrees(|s: Jseed| parse(json::to_bytes(as_json(s)), wide()), |s: Jseed| Ok(as_yaml(s)))
-
-fn mapping_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(
-        "key-" ++ int_to_string(i) ++ ": the value " ++ int_to_string(i) ++ " # said\n",
-      )),
-  )
-
-fn sequence_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(
-        "- name: p" ++ int_to_string(i) ++ "\n  ports:\n    - " ++ int_to_string(i)
-          ++ "\n    - 'two'\n  at: {x: 1.5, y: [a, \"b\"]}\n",
-      )),
-  )
-
-fn flow_text(n: Int) -> Bytes =
-  bytes_concat_all([
-    b"[",
-    bytes_concat_all(
-      map(range(0, n), |i: Int|
-        bytes_of_string("{k" ++ int_to_string(i) ++ ": [" ++ int_to_string(i) ++ ", x: y]},\n ")),
-    ),
-    b"]\n",
-  ])
-
-fn plain_text(n: Int) -> Bytes =
-  bytes_concat_all([b"v: a\n", bytes::repeat(b"  plain words on a line\n\n", n)])
-
-fn quoted_text(n: Int) -> Bytes =
-  bytes_concat_all([
-    b"v: \"",
-    bytes::repeat(b"a \\t line \\u00e9 'quoted' \\\n   \n   and folded\n", n),
-    b"\"\n",
-  ])
-
-fn block_text(n: Int) -> Bytes =
-  bytes_concat_all([b"v: >\n", bytes::repeat(b"  folded\n  lines\n\n    and kept\n", n), b"w: 1\n"])
-
-fn alias_text(n: Int) -> Bytes =
-  bytes_concat_all([b"base: &b {x: 1}\nall:\n", bytes::repeat(b"  - *b\n", n)])
-
-fn nested_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(string::repeat(" ", i % 40 * 2) ++ "k" ++ int_to_string(i) ++ ":\n")),
-  )
-
-law "reading the keys of a block mapping takes steps in proportion to them"
-  forall (n: Int) where n > 0 cost n {
-    parse(mapping_text(n), wide())
-  }
-
-law "reading a block sequence of mappings takes steps in proportion to its entries"
-  forall (n: Int) where n > 0 cost n {
-    parse(sequence_text(n), wide())
-  }
-
-law "reading a flow collection takes steps in proportion to its entries"
-  forall (n: Int) where n > 0 cost n {
-    parse(flow_text(n), wide())
-  }
-
-law "reading a plain scalar takes steps in proportion to its lines"
-  forall (n: Int) where n > 0 cost n {
-    parse(plain_text(n), wide())
-  }
-
-law "reading a quoted scalar takes steps in proportion to its lines and escapes"
-  forall (n: Int) where n > 0 cost n {
-    parse(quoted_text(n), wide())
-  }
-
-law "reading a block scalar takes steps in proportion to its lines"
-  forall (n: Int) where n > 0 cost n {
-    parse(block_text(n), wide())
-  }
-
-law "reading aliases takes steps in proportion to them"
-  forall (n: Int) where n > 0 cost n {
-    parse(alias_text(n), wide())
-  }
-
-law "reading mappings that open and close takes steps in proportion to their keys"
-  forall (n: Int) where n > 0 cost n {
-    parse(nested_text(n), wide())
-  }
-
-law "the events of a stream take steps in proportion to it"
-  forall (n: Int) where n > 0 cost n {
-    try { events(sequence_text(n), wide()) }
-  }
-
-law "setting a key takes steps in proportion to the document"
-  forall (n: Int) where n > 0 cost n {
-    match parse_document(sequence_text(n), wide()) {
-      Ok(d) -> try { set(d, [Index(n / 2), Key("name")], String("renamed")) },
-      Err(e) -> Err(e),
-    }
-  }
-
-law "writing a value takes steps in proportion to what it holds"
-  forall (n: Int) where n > 0 cost n {
-    to_bytes(
-      Mapping(
-        map(range(0, n), |i: Int|
-          entry(
-            int_to_string(i),
-            Mapping([
-              entry("at", Sequence([Integer(i), String("a\tb\\c"), String("two\nlines\n")])),
-            ]),
-          )),
-      ),
-    )
-  }
+test "a JSON document reads as the value JSON says it is" {
+  gen::check(jseeds(), |x: Jseed|
+    agrees(|s: Jseed| parse(json::to_bytes(as_json(s)), wide()), |s: Jseed| Ok(as_yaml(s)), x))
+}
 
 // --- Tests: values ----------------------------------------------------------
 

@@ -58,7 +58,6 @@ import compiler.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, Ro
 import std.bytes
 import std.gen
 import std.gen (Gen)
-import std.laws (idempotent)
 import std.list (at_or, concat, flat_map, sort_by)
 import std.place (Place, place_at)
 
@@ -200,8 +199,8 @@ pub type Kind =
   /// `test`, named by its label: over cases, the values in its label's holes, the case's
   /// `Parameter` and the table; then its body.
   | Test
-  /// `law`, named by its label: its binders as `Parameter`s, its guard and its cost bound where
-  /// written, then its body, which for an instantiation is the `Call` of the schema.
+  /// `law`, named by its label: its binders as `Parameter`s, its guard where written, then its
+  /// body, which for an instantiation is the `Call` of the schema.
   | Law
   /// `law schema`: its parameters, its binders, its guard where written, then its body.
   | LawSchema
@@ -211,7 +210,7 @@ pub type Kind =
   | EffectSet
   /// `extern fn`: its parameters, its result type, its `Row` and its clauses.
   | ExternFunction
-  /// `key for T by f`, `show for T by f` or `gen for T by f`, named by the type.
+  /// `key for T by f` or `show for T by f`, named by the type.
   | Instance
   /// `numeric for T by { .. }`, named by the type.
   | Numeric
@@ -437,12 +436,7 @@ fn item_parts(item: Item) -> List<At> =
         [AExpr(d.body)],
       ]),
     ILaw(d) ->
-      all_of([
-        as_binders(d.binders),
-        optional(d.guard, |e: Expr| AExpr(e)),
-        optional(d.cost, |e: Expr| AExpr(e)),
-        [AExpr(d.body)],
-      ]),
+      all_of([as_binders(d.binders), optional(d.guard, |e: Expr| AExpr(e)), [AExpr(d.body)]]),
     ISchema(d) ->
       all_of([
         as_binders(d.params),
@@ -1316,13 +1310,11 @@ pub fn fill(template: Template, holes: List<Node>) -> Node / {syntax.refused, ab
 
 // --- Sampling ---------------------------------------------------------------
 
-/// A small module that parses and checks, written with uneven layout and comments, for a claim
-/// about source to be sampled over: `forall (s: Sample)` draws programs where a `Bytes` draws
-/// noise no parser reads. Its definitions are `f0`, `f1` and so on, each of one `Int` named `x` to
-/// an `Int`, and a `let` in one binds `y`.
+/// A small module that parses and checks, written with uneven layout and comments, for a test
+/// about source to draw: `samples()` draws programs where a `Bytes` draws noise no parser reads.
+/// Its definitions are `f0`, `f1` and so on, each of one `Int` named `x` to an `Int`, and a `let`
+/// in one binds `y`.
 pub type Sample = | Sample(Bytes)
-
-gen for Sample by samples
 
 /// The source a `Sample` holds.
 pub fn sample_source(s: Sample) -> Bytes = match s { Sample(source) -> source }
@@ -1400,14 +1392,13 @@ fn sample_modules(atoms: List<Bytes>) -> Gen<Bytes> =
       ),
   )
 
-fn samples() -> Gen<Sample> =
+/// A `Sample` as a test draws one.
+pub fn samples() -> Gen<Sample> =
   gen::map(sample_modules(sample_atoms()), |source: Bytes| Sample(source))
 
 /// A module that parses and need not check: a sample's layouts over every form the formatter reads
 /// back from the source.
 type Spelled = | Spelled(Bytes)
-
-gen for Spelled by spellings
 
 fn spelled_text(s: Spelled) -> Bytes = match s { Spelled(source) -> source }
 
@@ -1417,8 +1408,6 @@ fn spellings() -> Gen<Spelled> =
 /// A text made of what Ply source is written in, most of it no module: openers of every literal,
 /// escapes, brackets, operators and characters cut short, which a `Bytes` rarely draws side by side.
 type Noise = | Noise(Bytes)
-
-gen for Noise by noises
 
 fn noise_text(n: Noise) -> Bytes = match n { Noise(text) -> text }
 
@@ -1774,24 +1763,6 @@ test "a hole that takes a name refuses anything else, and a text that is no modu
   )
 }
 
-/// Whether each node under `node`, `room` levels down, lies inside its parent and starts no earlier
-/// than the one before it.
-fn nested(node: Node, room: Int) -> Bool / {abort.raise} =
-  if room <= 0 { true } else {
-    let within = span(node);
-    fold(
-      children(node),
-      { ok: true, from: within.start },
-      |acc: { ok: Bool, from: Int }, child: Node| {
-        let at = span(child);
-        {
-          ok: acc.ok && acc.from <= at.start && at.end <= within.end && nested(child, room - 1),
-          from: at.start,
-        }
-      },
-    ).ok
-  }
-
 test "a sample is a module that parses" {
   let drawn = gen::sample(samples(), 7, b"sample", 16, None);
   match drawn.value {
@@ -1800,36 +1771,22 @@ test "a sample is a module that parses" {
   }
 }
 
-law "any text formats to itself once it is formatted" = idempotent(formatted)
-
-law "any text is read as a module, with diagnostics where it is none, and walked"
-  forall (n: Noise) {
+test "any text is read as a module, with diagnostics where it is none, and walked" {
+  gen::check(noises(), |n: Noise| {
     let read = parse(noise_text(n));
     kind(read.tree) == Module && len(walk(read.tree)) > 0
       && formatted(formatted(noise_text(n))) == formatted(noise_text(n))
-  }
+  })
+}
 
-law "a sample parses" forall (s: Sample) { parse(sample_source(s)).diagnostics == [] }
-
-law "a module that parses is formatted, whatever it is written with"
-  forall (s: Spelled) {
-    parse(spelled_text(s)).diagnostics == []
-      && (match format(spelled_text(s)) { Ok(_) -> true, Err(_) -> false })
-  }
-
-law "formatting a module a second time changes nothing"
-  forall (s: Spelled) {
+test "formatting a module a second time changes nothing" {
+  gen::check(spellings(), |s: Spelled| {
     formatted(formatted(spelled_text(s))) == formatted(spelled_text(s))
-  }
+  })
+}
 
-law "a formatted module parses to the tree its source does"
-  forall (s: Spelled) {
+test "a formatted module parses to the tree its source does" {
+  gen::check(spellings(), |s: Spelled| {
     shape(parse(formatted(spelled_text(s))).tree) == shape(parse(spelled_text(s)).tree)
-  }
-
-law "a walk of a module meets each node inside its parent, after the one before it"
-  forall (s: Spelled) {
-    nested(parse(spelled_text(s)).tree, 64)
-  }
-
-law "an edit of nothing is the source" forall (source: Bytes) { edited(source, []) == Some(source) }
+  })
+}

@@ -393,7 +393,7 @@ run_modules() {
 # Nothing an earlier run kept answers a proof, so a selecting run always has one to run. STOPPED when
 # the deadline ended it.
 run_proofs() {
-  local timings=$1 status=0 out all cached unattempted spent started wall
+  local timings=$1 status=0 out all cached spent started wall
   shift
   ((!selecting)) || return 1
   out=$(mktemp)
@@ -408,9 +408,7 @@ run_proofs() {
   spent=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  # Only a claim that held is filed, so an unattempted one is discharged again by every later run.
-  unattempted=$(jq '.summary.unattempted // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, $unattempted unattempted, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
+  echo "proved: $all claims, $cached from the cache, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
   [[ -z $timings ]] || printf 'cached\tproofs\t%s\n' "$cached" >> "$timings"
   if [ "$all" -eq 0 ]; then
     echo "corpus run proofs proved no claim" >&2
@@ -457,13 +455,13 @@ package_proofs() {
   rm -f "$out"
 }
 
-# What a red proof run said: each claim that does not hold, how and where, and a refused run's
+# What a red proof run said: each claim nothing proved, how and where, and a refused run's
 # diagnostics.
 disproved() {
   jq -r '
-    (.obligations[]? | select(.outcome | IN("refuted", "outgrown", "vacuous", "defect"))
+    (.obligations[]? | select(.outcome != "proved")
       | "FAILED \(.owner) \(.label): \(.outcome)\(if .location then " at \(.location)" else "" end)",
-        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome, .tier) | tojson)"),
+        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome) | tojson)"),
     (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
   ' "$1" 2>/dev/null || cat "$1"
 }
