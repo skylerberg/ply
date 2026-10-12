@@ -500,6 +500,13 @@ fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
     // Each element takes a header's two words beside a segment's nine and its bitmap's one.
     assert_eq!(unsafe { (*o).aux }, 12);
     assert_eq!(Heap::to_value(&l, w), points);
+    // Each element is a part whose word is its header's address in the array, twelve words apart.
+    let parts = l.parts(o);
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        unsafe { part_word(o, parts[1].0, parts[1].1) },
+        Some(unsafe { words(o).add(12) } as Word)
+    );
     let second = ply_codegen::array::element(&mut h, &l, o, 1);
     assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
     assert_eq!(unsafe { (*o).rc }, 2);

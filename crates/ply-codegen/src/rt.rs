@@ -94,6 +94,21 @@ pub enum Identity {
     Array(usize),
 }
 
+/// Each of `values`, the parts of record, constructor or array `o` in order, beside the word `o`
+/// holds it as; a part held as its bits is no word of its own and is left out.
+fn held_words<'v>(
+    layouts: &Layouts,
+    o: *mut heap::Obj,
+    values: impl Iterator<Item = &'v Value>,
+) -> Vec<(Word, &'v Value)> {
+    layouts
+        .parts(o)
+        .into_iter()
+        .zip(values)
+        .filter_map(|((at, slot), part)| unsafe { heap::part_word(o, at, slot) }.map(|w| (w, part)))
+        .collect()
+}
+
 fn identity(v: &Value) -> Option<Identity> {
     Some(match v {
         Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
@@ -173,39 +188,18 @@ impl Tables {
             return;
         }
         let o = obj(w);
+        let layouts = &self.layouts;
         let parts: Vec<(Word, &Value)> = match v {
-            // A `Float` held as its bits is no word of its own.
-            Value::Record(fields) => {
-                let shape = unsafe { (*o).layout };
-                let slots = self.layouts.shape_slots(shape);
-                let offsets = self.layouts.shape_offsets(shape);
-                fields
-                    .iter()
-                    .zip(slots.iter().zip(offsets.iter()))
-                    .filter_map(|((_, part), (slot, at))| match slot {
-                        heap::Slot::Word => Some((unsafe { word_at(o, *at) }, part)),
-                        heap::Slot::Record(_) => {
-                            Some((unsafe { heap::words(o).add(*at) } as Word, part))
-                        }
-                        heap::Slot::Float | heap::Slot::Wide(_) => None,
-                    })
-                    .collect()
-            }
-            Value::Ctor { args, .. } => args
-                .iter()
-                .enumerate()
-                .map(|(i, part)| (unsafe { word_at(o, i) }, part))
-                .collect(),
+            Value::Record(fields) => held_words(layouts, o, fields.iter().map(|(_, part)| part)),
+            Value::Ctor { args, .. } => held_words(layouts, o, args.iter()),
             Value::List(items) if items.len() <= PARTS_LIMIT => items
                 .iter()
                 .enumerate()
                 .map(|(i, part)| (list::get(o, i), part))
                 .collect(),
-            Value::Array(items) if items.len() <= PARTS_LIMIT => items
-                .iter()
-                .enumerate()
-                .map(|(i, part)| (unsafe { word_at(o, i) }, part))
-                .collect(),
+            Value::Array(items) if items.len() <= PARTS_LIMIT => {
+                held_words(layouts, o, items.iter())
+            }
             _ => Vec::new(),
         };
         for (part_word, part) in parts.into_iter().take(PARTS_LIMIT) {

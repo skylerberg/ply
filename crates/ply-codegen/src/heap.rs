@@ -530,6 +530,18 @@ pub(crate) unsafe fn drop_embedded(o: *mut Obj, at: usize) {
     }
 }
 
+/// The word a part `o` holds at `at` as `slot` is, as the object holds it: none for one held as its
+/// bits, and for a record held in place the address of its header there.
+pub unsafe fn part_word(o: *mut Obj, at: usize, slot: Slot) -> Option<Word> {
+    unsafe {
+        match slot {
+            Slot::Word => Some(word_at(o, at)),
+            Slot::Record(_) => Some(words(o).add(at) as Word),
+            Slot::Float | Slot::Wide(_) => None,
+        }
+    }
+}
+
 /// The word a record holds field `at`, of `slot`, as, held once more: a `Float` boxed, and a record
 /// held in place as the address of its header there.
 pub fn field_word(heap: &mut Heap, o: *mut Obj, at: usize, slot: Slot) -> Word {
@@ -813,6 +825,29 @@ impl Layouts {
 
     pub fn show(&self, ctor: u32) -> Stated {
         self.stated.get(ctor as usize).map_or(Stated::No, |s| s.1)
+    }
+
+    /// Where a record, a constructor or an array holds each of its parts, in order, and how; none
+    /// for any other object.
+    pub fn parts(&self, o: *mut Obj) -> Vec<(usize, Slot)> {
+        unsafe {
+            match (*o).kind {
+                KIND_RECORD => {
+                    let shape = (*o).layout;
+                    let offsets = self.shape_offsets(shape);
+                    let slots = self.shape_slots(shape);
+                    offsets.iter().copied().zip(slots.iter().copied()).collect()
+                }
+                KIND_CTOR => (0..(*o).len as usize).map(|i| (i, Slot::Word)).collect(),
+                KIND_ARRAY => {
+                    let (slot, stride) = held_as(self, o);
+                    (0..crate::array::len(o))
+                        .map(|k| (k * stride, slot))
+                        .collect()
+                }
+                _ => Vec::new(),
+            }
+        }
     }
 
     pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
