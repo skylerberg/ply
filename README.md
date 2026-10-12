@@ -71,9 +71,11 @@ name a server.
 ## The compiler bootstrap
 
 The compiler is Ply source under `crates/ply-compiler/ply`. `ply bootstrap` describes the runtime's
-library cargo built of the checkout, builds the compiler's own `build.main` against it into the
-builder, a native program on that runtime, and runs the builder over the CLI, whose C it links with
-the library into the new `ply`. That `ply` answers the shipped modules, and its pack carries them.
-The builder is built by the `ply` that runs the bootstrap, a release in CI, so the compiler and the
-shipped modules it imports cannot use a language rule the same change introduces; the rest of the
-standard library can.
+library cargo built of the checkout, builds the builder against it, a native program on that
+runtime that enters the compiler's own `build.main`, and runs the builder over the CLI, whose C it
+links with the library into the new `ply`. That `ply` answers the shipped modules, and its pack
+carries them. The builder and the pack are kept in the toolchain's cache under what decides them,
+so a bootstrap makes again only what moved. The builder is built by the `ply` that runs the
+bootstrap, a release in CI, so the shipped modules the builder pulls, the compiler's and the
+standard library's they import, cannot use a language rule the same change introduces; the rest
+of the standard library can.
