@@ -2,8 +2,9 @@
 //! unit says about itself, compiled by the host's C compiler into a library the runtime opens. What
 //! the emitter writes is the compiler's to test; these test what the runtime does with a unit.
 
-use ply_codegen::c::exports::{Taken, runtime_helpers};
+use ply_codegen::c::exports::runtime_helpers;
 use ply_codegen::c::{Exports, PRELUDE, runtime_header, runtime_object};
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 /// A definition the unit takes: its name, how many words it takes, and its body's C, which reads
@@ -27,41 +28,76 @@ pub fn symbol(name: &str) -> String {
     format!("ply_t_{}", name.replace('.', "_"))
 }
 
-/// The table a unit of `defs` says about itself: every helper this runtime has, and each definition
-/// taken under its own symbol.
-pub fn exports_of(defs: &[Def]) -> Exports {
-    Exports {
-        helpers: runtime_helpers(),
-        ctors: Vec::new(),
+/// One definition a unit holds: its Ply name, how many words it takes, and the C symbol of the
+/// entry the runtime calls it through.
+pub struct Taken {
+    pub name: String,
+    pub arity: usize,
+    pub entry: String,
+}
+
+/// A unit as a test writes one: what it says about itself, which it stands in for, and what its C
+/// lays out for the loader by address.
+pub struct Laid {
+    says: Exports,
+    /// The code table's rows, each by the C symbol of its function.
+    pub lambdas: Vec<String>,
+    pub taken: Vec<Taken>,
+    /// The definitions the seam memoizes, each of which takes the row of the code table its entry
+    /// is at.
+    pub constants: Vec<String>,
+}
+
+impl Deref for Laid {
+    type Target = Exports;
+
+    fn deref(&self) -> &Exports {
+        &self.says
+    }
+}
+
+impl DerefMut for Laid {
+    fn deref_mut(&mut self) -> &mut Exports {
+        &mut self.says
+    }
+}
+
+/// A unit of `defs`: it says every helper this runtime has, and lays out each definition under
+/// its own symbol.
+pub fn exports_of(defs: &[Def]) -> Laid {
+    Laid {
+        says: Exports {
+            helpers: runtime_helpers(),
+            ctors: Vec::new(),
+            constants: Vec::new(),
+            modules: 1,
+            refusals: Vec::new(),
+            consts: Vec::new(),
+            fields: Vec::new(),
+            builtins: Vec::new(),
+            shapes: Vec::new(),
+            instances: Vec::new(),
+            numerics: Vec::new(),
+            layout: ply_codegen::heap::RecordLayout::CURRENT,
+        },
+        lambdas: Vec::new(),
         taken: defs
             .iter()
             .map(|d| Taken {
                 name: d.name.to_string(),
                 arity: d.arity,
-                symbol: symbol(d.name),
                 entry: format!("{}_entry", symbol(d.name)),
             })
             .collect(),
         constants: Vec::new(),
-        modules: 1,
-        refusals: Vec::new(),
-        consts: Vec::new(),
-        fields: Vec::new(),
-        builtins: Vec::new(),
-        shapes: Vec::new(),
-        lambdas: Vec::new(),
-        buckets: Vec::new(),
-        instances: Vec::new(),
-        numerics: Vec::new(),
-        layout: ply_codegen::heap::RecordLayout::CURRENT,
     }
 }
 
 /// The unit's C: the prelude and the runtime declared, each definition and the entry the runtime
 /// calls it through, the runtime's object, and what the unit lays out for its loader: the table
 /// `exports` says, and the code table `exports.lambdas` names and the definitions `exports.taken`
-/// names, each by address, a constant's slot being its entry's row of that code table.
-pub fn text(defs: &[Def], exports: &Exports) -> String {
+/// names, each by address.
+pub fn text(defs: &[Def], exports: &Laid) -> String {
     let mut out = format!("{PRELUDE}{}\n", runtime_header());
     for d in defs {
         let params: String = (0..d.arity).map(|i| format!(", Word p{i}")).collect();
@@ -76,17 +112,18 @@ pub fn text(defs: &[Def], exports: &Exports) -> String {
         ));
     }
     out.push_str(&runtime_object());
-    let slot_of = |name: &str| {
-        let entry = &exports.taken.iter().find(|t| t.name == name)?.entry;
-        exports.lambdas.iter().position(|l| l == entry)
+    let slot_of = |name: &String| {
+        let entry = &(exports.taken.iter().find(|t| t.name == *name))
+            .unwrap_or_else(|| panic!("the unit does not take the constant `{name}`"))
+            .entry;
+        (exports.lambdas.iter().position(|l| l == entry))
+            .unwrap_or_else(|| panic!("the code table has no `{entry}`"))
     };
     let said = Exports {
-        taken: Vec::new(),
-        lambdas: Vec::new(),
         constants: (exports.constants.iter())
-            .map(|(name, slot)| (name.clone(), slot.or_else(|| slot_of(name))))
+            .map(|name| (name.clone(), slot_of(name)))
             .collect(),
-        ..exports.clone()
+        ..exports.says.clone()
     };
     out.push_str("const char ply_exports[] =\n");
     for line in said.encode().lines() {
@@ -159,7 +196,7 @@ pub fn library(dir: &Path, text: &str) -> Option<PathBuf> {
 pub fn opened(
     dir: &Path,
     defs: &[Def],
-    adjust: impl FnOnce(&mut Exports),
+    adjust: impl FnOnce(&mut Laid),
 ) -> Option<Result<(ply_codegen::c::Native, Vec<ply_codegen::Refused>), String>> {
     let mut exports = exports_of(defs);
     adjust(&mut exports);
