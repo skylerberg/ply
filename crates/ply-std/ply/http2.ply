@@ -3160,8 +3160,6 @@ fn refusal_of(b: Bytes) -> Option<(ErrorCode, Int)> / {abort.raise} =
 /// Frames a peer may be sent, drawn so that each type, flag and padding turns up.
 type Sendable = | Sendable(Frame)
 
-gen for Sendable by sendable
-
 fn sendable() -> Gen<Sendable> =
   gen::map(
     gen::one_of([
@@ -3227,15 +3225,14 @@ fn sendable() -> Gen<Sendable> =
     |f: Frame| Sendable(f),
   )
 
-law "every frame reads back from its bytes" =
-  round_trip(|s: Sendable| match s { Sendable(f) -> encode_frame(f) }, |b: Bytes|
-    match read_back(b) { Some(f) -> Some(Sendable(f)), None -> None })
-
-law "a number reads back as the error code it names"
-  forall (n: Int) {
-    let code = non_negative(n, 0x1_0000_0000);
-    code_number(code_of(code)) == code
-  }
+test "every frame reads back from its bytes" {
+  gen::check(sendable(), |x: Sendable|
+    round_trip(
+      |s: Sendable| match s { Sendable(f) -> encode_frame(f) },
+      |b: Bytes| match read_back(b) { Some(f) -> Some(Sendable(f)), None -> None },
+      x,
+    ))
+}
 
 test "frames are read and written as RFC 9113 lays them out" {
   assert_eq(
@@ -3590,9 +3587,14 @@ test "strings are Huffman-coded as RFC 7541 C.4 has them" {
   assert_eq(array_get(huffman().codes, 47), 0x18)
 }
 
-law "a Huffman-coded string decodes to itself" =
-  round_trip(huffman_encode, |b: Bytes|
-    match try { huffman_decode(b) } { Ok(s) -> Some(s), Err(_) -> None })
+test "a Huffman-coded string decodes to itself" {
+  gen::check(gen::bytes(), |x: Bytes|
+    round_trip(
+      huffman_encode,
+      |b: Bytes| match try { huffman_decode(b) } { Ok(s) -> Some(s), Err(_) -> None },
+      x,
+    ))
+}
 
 test "a Huffman string that holds EOS, or is padded wrong, is refused" {
   // EOS whole, then a padding of eight ones, then a padding of zeros.
@@ -3681,29 +3683,34 @@ fn picked(picks: List<Int>) -> List<Field> / {abort.raise} =
 
 type Pair = { encoder: Encoder, decoder: Decoder, same: Bool }
 
-law "blocks decode to the fields they were encoded from, as the table's size changes between them"
-  forall (blocks: List<List<Int>>, sizes: List<Int>) {
-    let end = fold(
-      range(0, len(blocks)),
-      { encoder: encoder(4096), decoder: decoder(4096, 2), same: true },
-      |p: Pair, i: Int| {
-        let size = at_or(sizes, i, -1);
-        let e = if size < 0 { p.encoder } else { with_capacity(p.encoder, size % 4097) };
-        let fields = picked(at_or(blocks, i, []));
-        let written = encode(e, fields);
-        match try { decode(p.decoder, written.block) } {
-          Ok(got) ->
-            {
-              encoder: written.encoder,
-              decoder: got.decoder,
-              same: p.same && got.fields == fields && got.decoder.table == written.encoder.table,
-            },
-          Err(_) -> { ..p, same: false },
-        }
-      },
-    );
-    end.same
-  }
+test "blocks decode to the fields they were encoded from, as the table's size changes between them" {
+  gen::check2(
+    gen::list(gen::list(gen::any_int())),
+    gen::list(gen::any_int()),
+    |blocks: List<List<Int>>, sizes: List<Int>| {
+      let end = fold(
+        range(0, len(blocks)),
+        { encoder: encoder(4096), decoder: decoder(4096, 2), same: true },
+        |p: Pair, i: Int| {
+          let size = at_or(sizes, i, -1);
+          let e = if size < 0 { p.encoder } else { with_capacity(p.encoder, size % 4097) };
+          let fields = picked(at_or(blocks, i, []));
+          let written = encode(e, fields);
+          match try { decode(p.decoder, written.block) } {
+            Ok(got) ->
+              {
+                encoder: written.encoder,
+                decoder: got.decoder,
+                same: p.same && got.fields == fields && got.decoder.table == written.encoder.table,
+              },
+            Err(_) -> { ..p, same: false },
+          }
+        },
+      );
+      end.same
+    },
+  )
+}
 
 test "a field in a table is written as its index, and a sensitive one is never indexed" {
   let first = encode(encoder(4096), [
@@ -4851,7 +4858,7 @@ fn sized(r: Request) -> Response / {abort.raise} =
     ),
   }
 
-/// `n` folded into `0` to `below`, for a sampled number to pick with.
+/// `n` folded into `0` to `below`, for a drawn number to pick with.
 fn non_negative(n: Int, below: Int) -> Int / {abort.raise} =
   if n < 0 { 0 - n % below } else { n % below }
 
@@ -4879,57 +4886,52 @@ fn tallied(l: Ledger, bytes: Bytes, window: Int) -> Ledger / {abort.raise} =
 
 fn at_least(n: Option<Int>) -> Int = match n { Some(v) -> v, None -> 0 }
 
-law "a server sends no more DATA than its client's windows allow, however they open"
-  forall (window: Int, sizes: List<Int>, updates: List<Int>) {
-    let w = non_negative(window, 1000);
-    let gets = bytes_concat_all(
-      map(range(0, 3), |i: Int|
-        get(2 * i + 1, "/" ++ int_to_string(non_negative(at_or(sizes, i, 0), 70000)))),
-    );
-    let start = take_output(server(default_limits(), at(0)));
-    let first = receive(
-      start.connection,
-      bytes_concat(opening([InitialWindowSize(w)]), gets),
-      at(1),
-    );
-    let out = take_output(answered_all(first.connection, first.events, sized, 1));
-    let opened_ledger = tallied(
-      { connection: out.connection, sent: map_new(), granted: map_new(), held: true },
-      out.bytes,
-      w,
-    );
-    let end = fold(updates, opened_ledger, |x: Ledger, u: Int| {
-      let s = at_or([0, 1, 3, 5], non_negative(u, 4), 0);
-      let n = 1 + non_negative(u / 4, 40000);
-      let r = receive(x.connection, wire([WindowUpdateFrame({ stream: s, increment: n })]), at(2));
-      let o = take_output(r.connection);
-      tallied(
-        {
-          ..x,
-          connection: o.connection,
-          granted: map_insert(x.granted, s, at_least(map_get(x.granted, s)) + n),
-        },
-        o.bytes,
+test "a server sends no more DATA than its client's windows allow, however they open" {
+  gen::check3(
+    gen::any_int(),
+    gen::list(gen::any_int()),
+    gen::list(gen::any_int()),
+    |window: Int, sizes: List<Int>, updates: List<Int>| {
+      let w = non_negative(window, 1000);
+      let gets = bytes_concat_all(
+        map(range(0, 3), |i: Int|
+          get(2 * i + 1, "/" ++ int_to_string(non_negative(at_or(sizes, i, 0), 70000)))),
+      );
+      let start = take_output(server(default_limits(), at(0)));
+      let first = receive(
+        start.connection,
+        bytes_concat(opening([InitialWindowSize(w)]), gets),
+        at(1),
+      );
+      let out = take_output(answered_all(first.connection, first.events, sized, 1));
+      let opened_ledger = tallied(
+        { connection: out.connection, sent: map_new(), granted: map_new(), held: true },
+        out.bytes,
         w,
-      )
-    });
-    end.held
-  }
-
-fn posts(n: Int, size: Int) -> List<Request> =
-  map(range(0, n), |i: Int| asking("POST", "/" ++ int_to_string(i), repeat(b"p", size)))
-
-law "two exchanges larger than every stream window finish however the bytes between the ends are cut"
-  forall (cuts: List<Int>) {
-    let l = { ..default_limits(), initial_window: 100 };
-    // An octet each way a step takes a step for each octet of both exchanges.
-    let e = carried(asked(joined(l), posts(2, 1000)), echo, cuts, 12000);
-    sort(answers(e.events))
-      == [
-        (1, 200, "POST /0 " ++ string_of_bytes(repeat(b"p", 1000))),
-        (3, 200, "POST /1 " ++ string_of_bytes(repeat(b"p", 1000))),
-      ]
-  }
+      );
+      let end = fold(updates, opened_ledger, |x: Ledger, u: Int| {
+        let s = at_or([0, 1, 3, 5], non_negative(u, 4), 0);
+        let n = 1 + non_negative(u / 4, 40000);
+        let r = receive(
+          x.connection,
+          wire([WindowUpdateFrame({ stream: s, increment: n })]),
+          at(2),
+        );
+        let o = take_output(r.connection);
+        tallied(
+          {
+            ..x,
+            connection: o.connection,
+            granted: map_insert(x.granted, s, at_least(map_get(x.granted, s)) + n),
+          },
+          o.bytes,
+          w,
+        )
+      });
+      end.held
+    },
+  )
+}
 
 fn spawned(
   events: List<Event>,

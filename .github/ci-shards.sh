@@ -10,9 +10,11 @@
 #                                in the last table, every cache key a job
 #                                writes is one a job reads, every key that
 #                                names the run is one a later run reads and no
-#                                job needs, and every key over a crate's Ply
-#                                sources names every crate's
-#   ci-shards.sh cache-keys      just that last check
+#                                job needs, every key over a crate's Ply
+#                                sources names every crate's, and the toolchain
+#                                key names what `ply bootstrap` reads
+#   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads
+#   ci-shards.sh toolchain-inputs  just that last check
 #   ci-shards.sh fetch-timings   the table the last run measured, from this
 #                                pull request's branch or else from main, into
 #                                the place the cut reads it from
@@ -43,10 +45,11 @@
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                gates job holds to `ply fmt --check`
-#   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
-#                                `workflow_dispatch`, SWEEP_SHARDS shards of the part of the cases
-#                                the day names, so SWEEP_DAYS days sweep every case; none otherwise,
-#                                since `edit_gate` holds a pull request to every kind of edit
+#   ci-shards.sh nightly-matrix EVENT  the JSON matrix of the nightly jobs, each the arguments of a
+#                                `ci-corpus.sh nightly`: under `schedule` or `workflow_dispatch`,
+#                                SWEEP_SHARDS shards of the part of the edit sweep's cases the day
+#                                names, so SWEEP_DAYS days sweep every case, and one job of the other
+#                                modules no partition runs; none otherwise
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -82,17 +85,20 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# Runs that take a runner each: the compiler's own tests, compiled, take every core, the reach audit
-# checks three whole packages cold and the copies audit lists ten, and every proof run is one load of
-# what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
-CORPUS_ALONE=(cli-compiler_compiled cli-reached cli-copies proofs)
+# Runs that take a runner each: the compiler's own tests take every core, and every proof run is one
+# load of what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
+CORPUS_ALONE=(package-compiler proofs)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program corpus desk_operations incremental)
-# Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
-# of the tree one way and checks it warm and cold, days of runners over the tree.
-CLI_NIGHTLY=(edit_sweep)
+CLI_BY_TEST=(artifact_program corpus incremental)
+# Modules of the CLI's suite no partition runs, which the `nightly` jobs do. CLI_SWEPT edits each module
+# of the tree one way and checks it warm and cold, days of runners over the tree, so a night takes a
+# part of its cases. The rest run whole each night: minutes each over the toolchain's whole trees,
+# the reach audit checking three packages cold and the copies audit listing ten, or against a postgres
+# they start.
+CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
+CLI_SWEPT=edit_sweep
 SWEEP_SHARDS=16
 SWEEP_DAYS=14
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
@@ -107,6 +113,7 @@ CORPUS_LANES=2
 # until the code its test runs moves, where a test wrapping the run reruns whenever the CLI moves.
 PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
+  "compiler:crates/ply-compiler/ply"
   "kernel:benches/kernel"
   "lang:tests/lang"
   "registry:crates/ply-registry/ply"
@@ -117,9 +124,7 @@ PACKAGE_SUITES=(
 )
 # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
 # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
-PACKAGE_PROOFS=(
-  "compiler:crates/ply-compiler/ply"
-)
+PACKAGE_PROOFS=()
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
 # gates job runs them after its own tests.
@@ -190,7 +195,12 @@ SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-macos-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-native- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+
+# The key the `ply` a run bootstrapped and the stage it left are kept under, and the source that says
+# what a bootstrap reads of a checkout (`toolchain_inputs`).
+TOOLCHAIN_KEY=.github/actions/toolchain-key/action.yml
+TOOLCHAIN_BOOTSTRAP=crates/ply-cli/ply/bootstrap.ply
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -248,7 +258,7 @@ corpus_entries() {
   printf 'proofs\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
   module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
 }
@@ -342,7 +352,7 @@ package_path() {
 
 proofs_path() {
   local entry
-  for entry in "${PACKAGE_PROOFS[@]}"; do
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do
     [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
   done
   return 1
@@ -351,7 +361,7 @@ proofs_path() {
 # Each `.ply` of a package below `crates/` other than the library's that states a law or an `ensures`
 # or `cost` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
     grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
@@ -364,7 +374,7 @@ corpus_test_names() {
 alone_entries() {
   local entry
   printf '%s\n' "${CORPUS_ALONE[@]}"
-  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
 }
 
 corpus_alone() {
@@ -1111,14 +1121,18 @@ cmd_cache_keys() {
   ' "${files[@]}"
 }
 
-# What each key above is a key *of*. The stage, its emitted bodies and its objects are built from
+# What each key above is a key *of*. What a lane compiled and what a tree check passed are built from
 # every tree that holds Ply sources, so a key that enumerates those trees by name goes stale the
 # moment a package is added -- and a stale hit serves a build of sources that moved, which no test
 # sees, because the tests then run against the cache rather than the sources. Any `hashFiles` that
-# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them.
+# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them. The
+# toolchain key alone names trees one by one, since `ply` is built from some of them and not from the
+# rest: `cmd_toolchain_inputs` holds it to the ones a bootstrap reads.
 cmd_cache_payloads() {
   local pattern tree pat base covered missing=0 files=() file
-  while IFS= read -r file; do files+=("$file"); done < <(ci_files)
+  while IFS= read -r file; do
+    [[ $file == "$root/$TOOLCHAIN_KEY" ]] || files+=("$file")
+  done < <(ci_files)
   while IFS= read -r pattern; do
     case "$pattern" in *"/ply/"*) ;; *) continue ;; esac
     for tree in "$root"/crates/*/ply; do
@@ -1146,6 +1160,97 @@ cmd_cache_payloads() {
     printf 'cache payloads: every key over crate sources names every tree holding Ply sources\n'
   fi
   return $((missing > 0))
+}
+
+# A path with each `..` taken with the segment before it and each `.` dropped, as text.
+lexical() {
+  awk -v p="$1" 'BEGIN {
+    n = split(p, s, "/"); k = 0
+    for (i = 1; i <= n; i++) {
+      if (s[i] == "" || s[i] == ".") continue
+      if (s[i] == "..") { if (k > 0) k--; continue }
+      out[++k] = s[i]
+    }
+    for (i = 1; i <= k; i++) printf "%s%s", (i > 1 ? "/" : ""), out[i]
+    printf "\n"
+  }'
+}
+
+# Each path of the repository a bootstrap reads Ply from, one a line: every path under `crates/` its
+# source names, and every package the manifest of one of those names by path, and theirs.
+toolchain_inputs() {
+  local all prev dir rel
+  all=$(grep -oE '"/?crates/[^"]*"' "$root/$TOOLCHAIN_BOOTSTRAP" | tr -d '"' | sed 's|^/||' | LC_ALL=C sort -u)
+  prev=
+  while [[ $all != "$prev" ]]; do
+    prev=$all
+    all=$(
+      {
+        printf '%s\n' "$prev"
+        while IFS= read -r dir; do
+          [ -f "$root/$dir/ply.pkg" ] || continue
+          sed -n 's/.*source: *Path("\([^"]*\)").*/\1/p' "$root/$dir/ply.pkg" |
+            while IFS= read -r rel; do lexical "$dir/$rel"; done
+        done <<< "$prev"
+      } | grep . | LC_ALL=C sort -u
+    )
+  done
+  printf '%s\n' "$all"
+}
+
+# The toolchain key held to what a bootstrap reads: it hashes each input whole, a tree by `<tree>/**`
+# and a file by its path, and nothing else of the Ply sources. A `ply` kept under a key that missed an
+# input would stand for sources that moved, and one that hashed more would bootstrap for a change the
+# bootstrap never reads. An `embed` that leaves its tree is an input too, and must land in one.
+cmd_toolchain_inputs() {
+  local inputs keyed wanted path file rel target covered bad=0
+  inputs=$(toolchain_inputs)
+  if [[ -z $inputs ]]; then
+    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is held to nothing" >&2
+    return 1
+  fi
+  keyed=$(grep -oh 'hashFiles([^)]*)' "$root/$TOOLCHAIN_KEY" | sed -e 's/.*hashFiles(//' -e 's/)$//' |
+    tr ',' '\n' | tr -d "\"' " | grep . | LC_ALL=C sort -u)
+  wanted=$(while IFS= read -r path; do
+    if [ -d "$root/$path" ]; then printf '%s/**\n' "$path"; else printf '%s\n' "$path"; fi
+  done <<< "$inputs" | LC_ALL=C sort -u)
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    if ! grep -qxF -- "$path" <<< "$keyed"; then
+      echo "FAIL: a bootstrap reads $path, which $TOOLCHAIN_KEY does not hash: a \`ply\` kept under the key would stand for sources that moved" >&2
+      bad=$((bad + 1))
+    fi
+  done <<< "$wanted"
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    if ! grep -qxF -- "$path" <<< "$wanted"; then
+      echo "FAIL: $TOOLCHAIN_KEY hashes $path, which no bootstrap reads: a change there would bootstrap for nothing" >&2
+      bad=$((bad + 1))
+    fi
+  done <<< "$keyed"
+  while IFS=: read -r file rel; do
+    [[ -n $rel ]] || continue
+    target=$(lexical "$(dirname "${file#"$root"/}")/$rel")
+    covered=no
+    while IFS= read -r path; do
+      [[ $target == "$path" || $target == "$path"/* ]] && covered=yes
+    done <<< "$inputs"
+    if [ "$covered" = no ]; then
+      echo "FAIL: ${file#"$root"/} embeds $target, outside every tree the toolchain key hashes" >&2
+      bad=$((bad + 1))
+    fi
+  done < <(while IFS= read -r path; do
+    [ -d "$root/$path" ] || continue
+    # `file:path` per embed that climbs out of its module's directory; a line of a `\\` text is a
+    # program a test writes, not this tree's.
+    { grep -rHE --include='*.ply' 'embed(_dir)?\("[^"]*\.\.[^"]*"' "$root/$path" || true; } |
+      { grep -vE '^[^:]*:[[:space:]]*\\\\' || true; } |
+      sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/'
+  done <<< "$inputs")
+  if [ "$bad" -eq 0 ]; then
+    printf 'toolchain key: hashes the %d paths a bootstrap reads Ply from, and no other\n' "$(grep -c . <<< "$inputs")"
+  fi
+  return $((bad > 0))
 }
 
 # Every input a fresh build's dep-info lists, held to the patterns the Rust key hashes: an input the
@@ -1804,13 +1909,13 @@ cmd_verify() {
   while IFS= read -r file; do
     [[ -n $file ]] || continue
     claimed=0
-    for entry in "${PACKAGE_PROOFS[@]}"; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
+    for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
     if ((!claimed)); then
       echo "FAIL: $file states a law or contract, and no PACKAGE_PROOFS entry proves its package, so CI never discharges it" >&2
       failures=$((failures + 1))
     fi
   done < <(claiming_files)
-  for entry in "${PACKAGE_PROOFS[@]}"; do
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do
     if ! grep -q "^${entry#*:}/" < <(claiming_files); then
       echo "FAIL: PACKAGE_PROOFS names ${entry#*:}, which states no law or contract — delete the entry" >&2
       failures=$((failures + 1))
@@ -1843,6 +1948,16 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  for module in "${CLI_NIGHTLY[@]}"; do
+    if [[ -z $(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
+      echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly jobs" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if ! named_in "$CLI_SWEPT" "${CLI_NIGHTLY[@]}"; then
+    echo "FAIL: CLI_SWEPT names '$CLI_SWEPT', which CLI_NIGHTLY does not, so the partitions run it whole" >&2
+    failures=$((failures + 1))
+  fi
   # Every entry is a partition's or alone, once, so the round robin stays total.
   local placed k
   placed=$(
@@ -1858,7 +1973,7 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh run"; do
+  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh run" "ci-corpus.sh nightly"; do
     corpus_job=$(job_running "$corpus_command")
     if [[ -z $corpus_job ]]; then
       echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its corpus runs run nowhere" >&2
@@ -1909,6 +2024,7 @@ cmd_verify() {
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
+  cmd_toolchain_inputs || failures=$((failures + 1))
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -1919,14 +2035,19 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
-# The sweep's cases for a changed path, as a `--filter`: an example, a module of the compiler's
-# package, or one of the standard library; nothing for any other path.
-cmd_sweep_matrix() {
-  local event=$1
+# The nightly jobs, each by the arguments its `ci-corpus.sh nightly` takes: the day's shards of
+# CLI_SWEPT's cases, and CLI_NIGHTLY's other modules in one job.
+cmd_nightly_matrix() {
+  local event=$1 module whole=""
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
+    for module in "${CLI_NIGHTLY[@]}"; do
+      [[ $module == "$CLI_SWEPT" ]] || whole+="${whole:+ }$module"
+    done
     jq -cn --argjson n "$SWEEP_SHARDS" --argjson days "$SWEEP_DAYS" --argjson day "$(($(date -u +%s) / 86400))" \
-      '($n * $days) as $of | {include: [range(1; $n + 1) | (($day % $days) * $n + .) as $k
-        | {name: "\($k)/\($of)", shard: "\($k)/\($of)", filter: ""}]}'
+      --arg swept "$CLI_SWEPT" --arg whole "$whole" \
+      '($n * $days) as $of | {include: ([range(1; $n + 1) | (($day % $days) * $n + .) as $k
+        | {name: "\($swept) \($k)/\($of)", args: "\($swept) --shard \($k)/\($of)"}]
+        + [{name: $whole, args: $whole}])}'
   else
     echo '{"include":[]}'
   fi
@@ -1935,6 +2056,7 @@ cmd_sweep_matrix() {
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys) cmd_cache_keys ;;
+  toolchain-inputs) cmd_toolchain_inputs ;;
   partitions) cmd_partitions ;;
   nextest-shards) cmd_nextest_shards ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
@@ -1952,7 +2074,7 @@ case "${1:-}" in
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
-  sweep-matrix) cmd_sweep_matrix "${2:?an event}" ;;
+  nightly-matrix) cmd_nightly_matrix "${2:?an event}" ;;
   *)
     echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2

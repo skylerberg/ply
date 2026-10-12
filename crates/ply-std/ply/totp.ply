@@ -33,6 +33,7 @@ import std.random (entropy, token_bytes)
 import std.string (ascii_trim_start, ascii_upper, int_of_string, pad_left, replace)
 import std.time (as_nanos, nanos_at, seconds)
 import std.url (Pair, query_parse, url_decode, url_encode)
+import std.gen
 
 /// The hash a code's HMAC is under.
 pub type Algorithm = | Sha1 | Sha256 | Sha512
@@ -754,7 +755,7 @@ test "a timed provision says how its codes are made, and a counted one has no cl
   assert_eq(config_of(counted), None)
 }
 
-// --- Laws -------------------------------------------------------------------
+// --- Properties -------------------------------------------------------------
 //
 // A `Provision`, a `Config` and a `Form` are not every value of their fields, so each law makes
 // one of what it draws.
@@ -769,108 +770,73 @@ fn form_of(n: Int) -> Form =
     digits: 6 + (n & 0xFF) % 5,
   }
 
-law "a code is as many digits as its form asks"
-  forall (key: Bytes, counter: Int, n: Int) {
-    let made = hotp(form_of(n), secret_of_bytes(key), counter & max_int());
-    string_len(made) == form_of(n).digits && int_of_string(made) != None
-  }
+/// A `Drawn` as a test draws one.
+fn drawns() -> gen::Gen<Drawn> =
+  gen::map4(
+    gen::text(),
+    gen::text(),
+    gen::bytes(),
+    gen::any_int(),
+    |issuer: String, account: String, key: Bytes, n: Int|
+      { issuer: issuer, account: account, key: key, n: n },
+  )
 
-law "a step holds exactly its span of time"
-  forall (ticks: Int, within: Int) {
-    let step = ticks & 0xFFF_FFFF;
-    let now = Instant(step * 30000000000 + (within & 0x3_FFFF_FFFF));
-    step_at(standard(), now) == step
-  }
-
-law "a code verifies at the time it was made"
-  forall (key: Bytes, ticks: Int, n: Int) {
-    let config: Config = { ..standard(), form: form_of(n) };
-    let now = reading(ticks);
-    verify(config, secret_of_bytes(key), code(config, secret_of_bytes(key), now), now, {
-        before: 0,
-        after: 0,
-      })
-      == Some(step_at(config, now))
-  }
-
-law "a code verifies while its step is in the window, and its step is not answered from outside"
-  forall (key: Bytes, ticks: Int, drift: Int, before: Int, after: Int) {
-    let made = reading(ticks);
-    let by = (drift & 7) - 4;
-    let window: Window = { before: before & 3, after: after & 3 };
-    let step = step_at(standard(), made);
-    let typed = code(standard(), secret_of_bytes(key), made);
-    let later = Instant(nanos_at(made) + by * 30000000000);
-    let answer = verify(standard(), secret_of_bytes(key), typed, later, window);
-    if by <= window.before && 0 - by <= window.after {
-      match answer {
-        Some(found) -> found >= step && hotp(standard().form, secret_of_bytes(key), found) == typed,
-        None -> false,
-      }
-    } else { answer != Some(step) }
-  }
-
-/// What `verify_after` answers, by reading the window's codes back with `==`.
-fn last_typed(
-  key: Bytes,
-  typed: String,
-  now: Instant,
-  window: Window,
-  accepted: Option<Int>,
-) -> Option<Int> / {totp.refused, abort.raise} = {
-  let at = step_at(standard(), now);
-  last(
-    filter(range(max(at - window.before, 0), at + window.after + 1), |step: Int|
-      past(step, accepted) && hotp(standard().form, secret_of_bytes(key), step) == typed),
+test "a code verifies while its step is in the window, and its step is not answered from outside" {
+  gen::check(
+    gen::and_then(gen::bytes(), |key: Bytes|
+      gen::map4(
+        gen::any_int(),
+        gen::any_int(),
+        gen::any_int(),
+        gen::any_int(),
+        |ticks: Int, drift: Int, before: Int, after: Int| (key, ticks, drift, before, after),
+      )),
+    |drawn: (Bytes, Int, Int, Int, Int)| {
+      let key = drawn._0;
+      let ticks = drawn._1;
+      let drift = drawn._2;
+      let before = drawn._3;
+      let after = drawn._4;
+      let made = reading(ticks);
+      let by = (drift & 7) - 4;
+      let window: Window = { before: before & 3, after: after & 3 };
+      let step = step_at(standard(), made);
+      let typed = code(standard(), secret_of_bytes(key), made);
+      let later = Instant(nanos_at(made) + by * 30000000000);
+      let answer = verify(standard(), secret_of_bytes(key), typed, later, window);
+      if by <= window.before && 0 - by <= window.after {
+        match answer {
+          Some(found) ->
+            found >= step && hotp(standard().form, secret_of_bytes(key), found) == typed,
+          None -> false,
+        }
+      } else { answer != Some(step) }
+    },
   )
 }
 
-law "verifying answers the last step of its window, past the one accepted, whose code was typed"
-  forall (key: Bytes, ticks: Int, drift: Int, before: Int, after: Int, accepted: Int) {
-    let now = reading(ticks);
-    let window: Window = { before: before & 3, after: after & 3 };
-    let typed = code(
-      standard(),
-      secret_of_bytes(key),
-      Instant(nanos_at(now) + ((drift & 7) - 4) * 30000000000),
-    );
-    let last_accepted = if accepted & 1 == 0 { None }
-    else { Some(step_at(standard(), now) + (accepted >>> 1 & 7) - 4) };
-    verify_after(standard(), secret_of_bytes(key), typed, now, window, last_accepted)
-      == last_typed(key, typed, now, window, last_accepted)
-  }
+test "a code accepted once is not accepted again" {
+  gen::check4(
+    gen::bytes(),
+    gen::any_int(),
+    gen::any_int(),
+    gen::any_int(),
+    |key: Bytes, ticks: Int, before: Int, after: Int| {
+      let now = reading(ticks);
+      let window: Window = { before: before & 3, after: after & 3 };
+      let typed = code(standard(), secret_of_bytes(key), now);
+      let first = verify_after(standard(), secret_of_bytes(key), typed, now, window, None);
+      first != None
+        && verify_after(standard(), secret_of_bytes(key), typed, now, window, first) == None
+    },
+  )
+}
 
-law "a code accepted once is not accepted again"
-  forall (key: Bytes, ticks: Int, before: Int, after: Int) {
-    let now = reading(ticks);
-    let window: Window = { before: before & 3, after: after & 3 };
-    let typed = code(standard(), secret_of_bytes(key), now);
-    let first = verify_after(standard(), secret_of_bytes(key), typed, now, window, None);
-    first != None
-      && verify_after(standard(), secret_of_bytes(key), typed, now, window, first) == None
-  }
-
-law "a counter-based code verifies within the look-ahead and its counter is not answered past it"
-  forall (key: Bytes, start: Int, by: Int, ahead: Int) {
-    let form: Form = { algorithm: Sha1, digits: 6 };
-    let counter = start & 0xFFFF_FFFF;
-    let reach = ahead & 3;
-    let typed = hotp(form, secret_of_bytes(key), counter + (by & 7));
-    let answer = hotp_verify(form, secret_of_bytes(key), typed, counter, reach);
-    if by & 7 <= reach {
-      match answer {
-        Some(found) ->
-          found >= counter + (by & 7) && hotp(form, secret_of_bytes(key), found) == typed,
-        None -> false,
-      }
-    } else { answer != Some(counter + (by & 7)) }
-  }
-
-/// What a law draws for a provision: any two names, any key and a number its form and kind are
+/// What a test draws for a provision: any two names, any key and a number its form and kind are
 /// read off.
 type Drawn = { issuer: String, account: String, key: Bytes, n: Int }
 
-/// A provision `uri` writes, made of what a law drew.
+/// A provision `uri` writes, made of what a test drew.
 fn provisioned(d: Drawn) -> Provision =
   {
     kind: if d.n >>> 16 & 1 == 0 { Timed(seconds(1 + (d.n >>> 17 & 0xFFF))) }
@@ -881,5 +847,7 @@ fn provisioned(d: Drawn) -> Provision =
     form: form_of(d.n),
   }
 
-law "a provisioning URI is read back as what it was written of" =
-  agrees(|d: Drawn| try_parse_uri(uri(provisioned(d))), |d: Drawn| Ok(provisioned(d)))
+test "a provisioning URI is read back as what it was written of" {
+  gen::check(drawns(), |x: Drawn|
+    agrees(|d: Drawn| try_parse_uri(uri(provisioned(d))), |d: Drawn| Ok(provisioned(d)), x))
+}

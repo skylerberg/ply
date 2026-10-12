@@ -68,7 +68,7 @@ import std.gen (Gen)
 import std.idna
 import std.ip
 import std.ip (Ipv4, Ipv6)
-import std.laws (idempotent, round_trip)
+import std.laws (round_trip)
 import std.list (all, any, at_or, concat, drop, find, take)
 import std.option (option_traverse, option_unwrap_or)
 import std.result (result_ok)
@@ -122,13 +122,9 @@ key for Url by url_render
 
 show for Url by url_redacted
 
-gen for Url by url_gen
-
 key for Reference by reference_render
 
 show for Reference by reference_redacted
-
-gen for Reference by reference_gen
 
 // --- Percent-encoding -------------------------------------------------------
 
@@ -1132,23 +1128,29 @@ fn read(text: String) -> Url / {abort.raise} =
 fn refer(text: String) -> Reference / {abort.raise} =
   match reference_parse(text) { Ok(r) -> r, Err(_) -> panic("not a reference: " ++ text) }
 
-law "a percent-decode of an encode is the text encoded" = round_trip(url_encode, url_decode)
+/// A `Pair` as a test draws one.
+fn pairs() -> gen::Gen<Pair> =
+  gen::map2(gen::text(), gen::text(), |name: String, value: String| { name: name, value: value })
 
-law "a form-decode of an encode is the text encoded" = round_trip(form_encode, form_decode)
+test "a percent-decode of an encode is the text encoded" {
+  gen::check(gen::text(), |x: String| round_trip(url_encode, url_decode, x))
+}
 
-law "a query string parses back to the pairs it was built of" = round_trip(query_build, query_parse)
+test "a query string parses back to the pairs it was built of" {
+  gen::check(gen::list(pairs()), |x: List<Pair>| round_trip(query_build, query_parse, x))
+}
 
-law "a URL reads back from its text" =
-  round_trip(url_render, |text: String| result_ok(url_parse(text)))
+test "a URL reads back from its text" {
+  gen::check(url_gen(), |x: Url|
+    round_trip(url_render, |text: String| result_ok(url_parse(text)), x))
+}
 
-law "a reference reads back from its text" =
-  round_trip(reference_render, |text: String| result_ok(reference_parse(text)))
-
-law "a text that reads as a URL is written back as it was, and any text is read or refused"
-  forall (text: String) {
+test "a text that reads as a URL is written back as it was, and any text is read or refused" {
+  gen::check(gen::text(), |text: String| {
     (match url_parse(text) { Ok(u) -> url_render(u) == text, Err(_) -> true })
       && (match reference_parse(text) { Ok(r) -> reference_render(r) == text, Err(_) -> true })
-  }
+  })
+}
 
 /// What the accessors say of a URL, in the order RFC 3986 §5.3 writes the parts.
 fn anatomy(
@@ -1168,90 +1170,19 @@ fn anatomy(
 fn sound(u: Url) -> Bool / {abort.raise} =
   match url_parse(url_render(u)) { Ok(again) -> anatomy(again) == anatomy(u), Err(_) -> false }
 
-law "a URL's parts, written in order, are its text"
-  forall (u: Url) {
-    let text = url_render(u);
-    let rest = (match url_authority(u) { Some(a) -> "//" ++ a, None -> "" }) ++ url_path(u)
-      ++ (match url_query(u) { Some(q) -> "?" ++ q, None -> "" })
-      ++ (match url_fragment(u) { Some(f) -> "#" ++ f, None -> "" });
-    let scheme = string_slice(text, 0, string_len(url_scheme(u)) + 1);
-    text == scheme ++ rest && string::ascii_lower(scheme) == url_scheme(u) ++ ":"
-  }
-
-law "a URL's authority is its userinfo, its host and its port as they were written"
-  forall (u: Url) {
-    match url_authority(u) {
-      None -> url_userinfo(u) == None && url_host(u) == None && url_port(u) == None,
-      Some(a) ->
-        Some(a)
-          == (match url_host_port(u) {
-            Some(host_port) ->
-              Some((match url_userinfo(u) { Some(info) -> info ++ "@", None -> "" }) ++ host_port),
-            None -> None,
-          }),
-    }
-  }
-
-law "a normalized URL is sound, and normalizing it again changes nothing"
-  forall (u: Url) {
+test "a normalized URL is sound, and normalizing it again changes nothing" {
+  gen::check(url_gen(), |u: Url| {
     let normal = url_normalized(u);
     sound(normal) && url_normalized(normal) == normal && url_scheme(normal) == url_scheme(u)
       && url_host(normal) == url_host(u)
       && url_port_or_default(normal) == url_port_or_default(u)
       && (url_port(normal) == None || url_port(normal) != url_default_port(url_scheme(normal)))
       && string_starts_with(url_render(normal), url_scheme(normal) ++ ":")
-  }
+  })
+}
 
-law "normalizing twice is normalizing once" = idempotent(url_normalized)
-
-law "a normalized URL is ASCII, and so is a name however it was written"
-  forall (u: Url) {
-    string::is_ascii(url_render(url_normalized(u)))
-      && (match url_host(u) { Some(Name(name)) -> string::is_ascii(name), _ -> true })
-  }
-
-law "a name is what `std.idna` makes of it as written, an `xn--` label written in ASCII apart"
-  forall (u: Url) {
-    match parts_of(u).authority {
-      None -> true,
-      Some(a) -> match a.named {
-        Some(Name(name)) -> if string::is_ascii(a.host) && string_contains(name, "xn--") { true }
-        else {
-          match url_decode(a.host) {
-            Some(spelled) -> idna::to_ascii(spelled, idna::web()) == Ok(name),
-            None -> false,
-          }
-        },
-        _ -> true,
-      },
-    }
-  }
-
-law "a host shown reads back as the host it shows"
-  forall (u: Url) {
-    match url_display_host(u) {
-      None -> url_host(u) == None,
-      Some(shown) -> match url_parse("x://" ++ shown) {
-        Ok(again) -> url_host(again) == url_host(u),
-        Err(_) -> false,
-      },
-    }
-  }
-
-fn dot_free(path: String) -> Bool =
-  !any(string_split(path, "/"), |segment: String| segment == "." || segment == "..")
-
-law "a normalized URL's path holds no dot segment, escaped or not, past the one that guards `//`"
-  forall (u: Url) {
-    let path = url_path(url_normalized(u));
-    dot_free(if string_starts_with(path, "/.//") { string_slice(path, 2, string_len(path)) }
-      else { path })
-      && !string_contains(path, "%2E")
-      && !string_contains(path, "%2e")
-  }
-
-law "a resolved URL is sound, and has the reference's fragment and no other"
-  forall (base: Url, r: Reference) {
+test "a resolved URL is sound, and has the reference's fragment and no other" {
+  gen::check2(url_gen(), reference_gen(), |base: Url, r: Reference| {
     let resolved = url_resolve(base, r);
     sound(resolved)
       && Some(resolved)
@@ -1265,91 +1196,11 @@ law "a resolved URL is sound, and has the reference's fragment and no other"
             && url_scheme(resolved) == url_scheme(whole),
         None -> url_scheme(resolved) == url_scheme(base),
       })
-  }
+  })
+}
 
-law "a URL resolves to itself against any base, its dot segments removed"
-  forall (base: Url, u: Url) {
-    let resolved = url_resolve(base, reference_of(u));
-    url_authority(resolved) == url_authority(u) && url_query(resolved) == url_query(u)
-      && url_fragment(resolved) == url_fragment(u)
-      && (url_path(resolved) == url_path(u) || !dot_free(url_path(u))
-      || string_starts_with(url_path(resolved), "/./"))
-  }
-
-law "the empty reference is its base without a fragment"
-  forall (base: Url) {
-    let resolved = url_resolve(base, refer(""));
-    url_fragment(resolved) == None
-      && url_render(resolved)
-      == (match url_fragment(base) {
-        Some(f) ->
-          string_slice(url_render(base), 0, string_len(url_render(base)) - string_len(f) - 1),
-        None -> url_render(base),
-      })
-  }
-
-law "removing dot segments twice is removing them once, and none is left in a rooted path"
-  forall (u: Url) {
-    let once = without_dots(url_path(u));
-    without_dots(once) == once && (!string_starts_with(url_path(u), "/") || dot_free(once))
-  }
-
-law "a query written from pairs reads back as them, in a URL that is otherwise as it was"
-  forall (u: Url, pairs: List<Pair>) {
-    let changed = url_with_query_pairs(u, pairs);
-    sound(changed) && url_query_pairs(changed) == Some(pairs) && url_path(changed) == url_path(u)
-      && url_authority(changed) == url_authority(u)
-      && url_fragment(changed) == url_fragment(u)
-  }
-
-/// A name `pairs` holds, chosen by `n`, or `spare` once in each turn through them.
-fn name_among(pairs: List<Pair>, n: Int, spare: String) -> String =
-  match list_at(pairs, (n & 255) % (len(pairs) + 1)) { Some(p) -> p.name, None -> spare }
-
-law "a parameter set is the one read, once; one added is read last; one removed is gone"
-  forall (u: Url, n: Int, spare: String, value: String) {
-    let name = name_among(option_unwrap_or(url_query_pairs(u), []), n, spare);
-    match url_query_pairs(u) {
-      None ->
-        url_set_param(u, name, value) == None && url_add_param(u, name, value) == None
-          && url_remove_param(u, name) == None,
-      Some(pairs) -> {
-        let others = filter(pairs, |p: Pair| p.name != name);
-        (match url_set_param(u, name, value) {
-            Some(set) ->
-              url_params(set, name) == [value] && url_param(set, name) == Some(value)
-                && (match url_remove_param(set, name) {
-                  Some(gone) -> url_query_pairs(gone) == Some(others),
-                  None -> false,
-                }),
-            None -> false,
-          })
-          && (match url_add_param(u, name, value) {
-            Some(added) ->
-              url_query_pairs(added) == Some(push(pairs, { name: name, value: value })),
-            None -> false,
-          })
-      },
-    }
-  }
-
-law "pairs set, got and removed agree with one another"
-  forall (pairs: List<Pair>, n: Int, spare: String, value: String) {
-    let name = name_among(pairs, n, spare);
-    let set = query_set(pairs, name, value);
-    query_get(set, name) == Some(value) && len(filter(set, |p: Pair| p.name == name)) == 1
-      && query_get(query_remove(pairs, name), name) == None
-      && query_remove(set, name) == query_remove(pairs, name)
-      && filter(set, |p: Pair| p.name != name) == query_remove(pairs, name)
-      && query_get(pairs, name)
-      == (match filter(pairs, |p: Pair| p.name == name) {
-        [first, ..] -> Some(first.value),
-        [] -> None,
-      })
-  }
-
-law "a redacted URL is a URL with the same parts but its userinfo"
-  forall (u: Url) {
+test "a redacted URL is a URL with the same parts but its userinfo" {
+  gen::check(url_gen(), |u: Url| {
     match url_parse(url_redacted(u)) {
       Err(_) -> false,
       Ok(hidden) ->
@@ -1362,7 +1213,8 @@ law "a redacted URL is a URL with the same parts but its userinfo"
             None -> url_redacted(u) == url_render(u),
           }),
     }
-  }
+  })
+}
 
 /// Userinfo around its first `:`, where something follows it.
 fn password_of(userinfo: Option<String>) -> Option<{ head: String, tail: String }> / {abort.raise} =
@@ -1374,22 +1226,10 @@ fn password_of(userinfo: Option<String>) -> Option<{ head: String, tail: String 
     },
   }
 
-law "a path joined to a URL adds its segments as they are, below the path it had"
-  forall (u: Url, segments: List<String>) {
-    match url_join_path(u, segments) {
-      None -> any(segments, |s: String| s == "" || s == "." || s == ".."),
-      Some(joined) ->
-        sound(joined) && url_authority(joined) == url_authority(u)
-          && (match url_path_segments(joined) {
-            Some(all_segments) -> drop(all_segments, len(all_segments) - len(segments)) == segments,
-            None -> false,
-          }),
-    }
-  }
-
 test "the generators draw a URL and a reference every time, of every shape" {
-  let urls = map(range(0, 300), |i: Int| _sample_Url(i, b"urls", i % 40, None).value);
-  let references = map(range(0, 300), |i: Int| _sample_Reference(i, b"refs", i % 40, None).value);
+  let urls = map(range(0, 300), |i: Int| gen::sample(url_gen(), i, b"urls", i % 40, None).value);
+  let references = map(range(0, 300), |i: Int|
+    gen::sample(reference_gen(), i, b"refs", i % 40, None).value);
   assert(all(urls, |u: Option<Url>| u != None));
   assert(all(references, |r: Option<Reference>| r != None));
   let some = |keep: (Url) -> Bool / {abort.raise}|

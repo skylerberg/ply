@@ -92,8 +92,8 @@ struct Entry {
     last_used: std::time::SystemTime,
 }
 
-/// Remove entries under `root`, least recently used first, until the rest fits in `budget`. Errors
-/// are ignored.
+/// Remove entries under `root`, least recently used first, until the rest fits in `budget` or only
+/// entries used within [`RECENT`] are left. Errors are ignored.
 pub fn sweep(root: &Path, budget: u64) -> u64 {
     let mut entries = Vec::new();
     let mut total: u64 = 0;
@@ -129,13 +129,18 @@ pub fn sweep(root: &Path, budget: u64) -> u64 {
     if total <= budget {
         return 0;
     }
+    let now = SystemTime::now();
+    entries.retain(|e| {
+        now.duration_since(e.last_used)
+            .is_ok_and(|age| age >= RECENT)
+    });
     entries.sort_by_key(|e| e.last_used);
     let mut freed = 0;
     for entry in entries {
         if total <= budget {
             break;
         }
-        // Unlinking an open file is safe here; a reader that has not yet opened it just rebuilds.
+        // Unlinking an open file is safe here.
         if std::fs::remove_file(&entry.path).is_ok() {
             total -= entry.bytes.min(total);
             freed += entry.bytes;
@@ -163,7 +168,8 @@ pub const PROGRAMS: &str = "programs";
 /// whole.
 const BY_FILE: [&str; 3] = [ANSWERED, REUSED, PROGRAMS];
 
-/// An entry used within this long is never swept: a run may still be reading it.
+/// An entry used within this long is never swept: a run may be reading it, or about to open what
+/// it just wrote.
 const RECENT: Duration = Duration::from_secs(3600);
 
 /// Records that a stage directory or a cached file was just used. A file is opened for reading
