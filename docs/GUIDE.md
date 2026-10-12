@@ -941,12 +941,7 @@ A bracketed name binds a resource label:
 among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
-row or type names one (§6.2). A call inside a recursive group — to the definition itself
-or to one it is mutually recursive with — keeps the labels the group was called
-with: it writes none, or names this definition's own binders in order, and any
-other label there is `E0306`. The members of such a group are checked with one
-set of binders, positionally, whatever each calls them, so each binds the same
-number of them; members that disagree are `E0307`. A printed signature shows
+row or type names one (§6.2). A printed signature shows
 the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
 `<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
 `n`, then `l1` — stepping past any of those a resource in the same signature
@@ -954,22 +949,19 @@ holds, so a row naming `[l]` prints its variable as `[m]` and the two stay
 apart. Filling the wrong number of labels, leaving one unfilled, or
 using a label-generic definition as a value instead of calling it, is `E0306`.
 
-Row parameters are shared the same way: one recursive group is checked with one
-set of row binders, taken in order whatever each member calls them, so a
-definition generic over a row may call a mutually recursive sibling and the row
-crosses the cycle. Members binding different numbers of them are `E0307`, as
-with labels, and a call inside the group keeps the row the group was called
-with: an argument may perform less than it, and one that performs anything the
-group's row does not hold is `E0308`. Type parameters are *not*
-shared: each definition keeps its own, and a call inside a group fills its
-callee's as a call from anywhere does, so `even<a>` and `odd<a>` call each
-other, whatever order each writes its parameters in and however many it binds,
-and a constraint on one (`where numeric(a)`) is the caller's to meet. What such
-a call may not do is fill one with a type built from a member's own parameter,
-as `f<a>` calling itself at `List<a>` does: each time round would need the
-callee at a larger type, so no finite set of copies of it serves the group. That
-is polymorphic recursion, `E0308` as well. A parameter passed along as it is,
-and a type that names none (`Int`), do not grow.
+A call inside a recursive group, to the definition itself or to one it is
+mutually recursive with, fills its callee's type, label and row parameters as a
+call from anywhere does. So `even<a>` and `odd<a>` call each other, whatever
+order each writes its parameters in and however many it binds; a recursive call
+whose label no argument names writes it, `drain[l](c, rest)`; a call may pass
+another label or a callback of another row than its caller was given, and what
+it then performs is the caller's row to hold (`E0302`); and a constraint on a
+type parameter (`where numeric(a)`) is the caller's to meet. What such a call
+may not do is fill a type parameter with a type built from a member's own
+parameter, as `f<a>` calling itself at `List<a>` does: each time round would
+need the callee at a larger type, so no finite set of copies of it serves the
+group. That is polymorphic recursion, `E0308`. A parameter passed along as it
+is, and a type that names none (`Int`), do not grow.
 
 A `type` binds all three kinds where a `fn` does, on an alias, a sum and a `new`
 record, and a use fills them in the same places:
@@ -3446,8 +3438,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0304` | resource label required |
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
-| `E0307` | mutually recursive definitions binding different label or row parameters |
-| `E0308` | polymorphic recursion: a call inside a recursive group asks for another row than the group was checked with, or fills a type parameter with a type that grows each time round |
+| `E0308` | polymorphic recursion: a call inside a recursive group fills a type parameter with a type that grows each time round |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, or a parameter its signature never mentions |
 | `E0311` | `try` whose body's row names no `raise` operation to answer |
