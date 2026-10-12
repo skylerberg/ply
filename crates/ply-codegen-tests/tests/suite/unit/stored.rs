@@ -522,6 +522,17 @@ fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
     );
     assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
     dec(second);
+    // An array that counts some of its words takes a word of bitmap after them.
+    let items: Vec<Word> = (0..3)
+        .map(|i| h.to_word(&l, &segment("p", f64::from(i))))
+        .collect();
+    let before = h.allocated_bytes();
+    let built = h.array_of(&l, &items);
+    assert_eq!(
+        h.allocated_bytes() - before,
+        Heap::object_size(8 * (36 + 1))
+    );
+    dec(built);
     let floats = Value::array(vec![Value::Float(0.5), Value::Float(-2.0)]);
     let f = h.to_word(&l, &floats);
     assert!(ply_codegen::array::in_place(obj(f)));

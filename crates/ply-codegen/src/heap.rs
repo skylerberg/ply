@@ -967,24 +967,20 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
     CURRENT.with(|c| c.replace(heap))
 }
 
-/// The payload bytes an object was allocated with, from its header; `usize::MAX` if unsized.
-/// A record's payload: its words, then a mixed one's tail.
-fn record_bytes(flags: u8, len: u32) -> usize {
+/// The payload bytes of an object [`Heap::alloc`] makes: its words, and after a mixed record's,
+/// array's or constructor's words the bitmap saying which of them it counts.
+fn words_bytes(kind: u8, flags: u8, len: u32) -> usize {
     let len = len as usize;
-    8 * (len
-        + if flags & MIXED != 0 {
-            tail_words(len)
-        } else {
-            0
-        })
+    let tailed = matches!(kind, KIND_RECORD | KIND_ARRAY | KIND_CTOR) && flags & MIXED != 0;
+    8 * (len + if tailed { tail_words(len) } else { 0 })
 }
 
+/// The payload bytes an object was allocated with, from its header; `usize::MAX` if unsized.
 unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
-            KIND_RECORD => record_bytes((*o).flags, (*o).len),
-            KIND_ARRAY => record_bytes((*o).flags, (*o).len),
-            KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_FIXED => (*o).len as usize * 8,
+            KIND_RECORD | KIND_ARRAY | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT
+            | KIND_FIXED => words_bytes((*o).kind, (*o).flags, (*o).len),
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1236,12 +1232,7 @@ impl Heap {
     /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
     /// fill every word before anything can release it, or [`dec`] follows garbage.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
-        let bytes = if kind == KIND_RECORD {
-            record_bytes(flags, len)
-        } else {
-            len as usize * 8
-        };
-        self.raw_alloc(kind, flags, len, layout, bytes)
+        self.raw_alloc(kind, flags, len, layout, words_bytes(kind, flags, len))
     }
 
     /// A record of `fields`, which it takes, in the order of the names: laid out as a record of
