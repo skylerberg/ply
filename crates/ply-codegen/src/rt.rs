@@ -3,12 +3,12 @@
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged,
-    bytes_of, is_unique, obj, set_word, str_of, word_at,
+    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word,
+    bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::map;
 use crate::stack::{Stack, switch};
-use crate::{array, list};
+use crate::{array, columns, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
 use ply_eval::builtins::{cell_in_update, hold_released, no_such_cell};
 use ply_eval::region::StepSite;
@@ -1595,6 +1595,42 @@ pub unsafe extern "C" fn rt_decimal_negate(_ctx: *mut Ctx, lo: i64, hi: i64, out
     unsafe { write_decimal(out, -decimal_of(lo, hi)) }
 }
 
+/// Field `k`, in its records' shape's order, of record `i` of `Columns` `xs`, held once more: a
+/// scalar boxed and a record in place the address of its header there. What is not a columnar
+/// value's in-range record is read through `columns_get`, which raises as it does. Borrows `xs`.
+pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    let k = k as usize;
+    if heap::kind(xs) == KIND_COLUMNS
+        && let Some(at) = usize::try_from(i)
+            .ok()
+            .filter(|at| *at < columns::len(obj(xs)))
+    {
+        return array::element(
+            &mut c.heap,
+            &tables.layouts,
+            columns::column(obj(xs), k),
+            at,
+        );
+    }
+    heap::inc(xs);
+    let index = c.heap.boxed_int(i);
+    let r = builtin(c, Builtin::ColumnsGet, &[xs, index]);
+    if c.failed != 0 {
+        return 0;
+    }
+    let o = obj(r);
+    let shape = unsafe { (*o).layout };
+    let (at, slot) = (
+        tables.layouts.shape_offsets(shape)[k],
+        tables.layouts.shape_slots(shape)[k],
+    );
+    let w = heap::field_word(&mut c.heap, o, at, slot);
+    heap::dec(r);
+    w
+}
+
 /// A divisor `/` and `%` raise on rather than overflow.
 fn is_zero(v: &Value) -> bool {
     match v {
@@ -2577,6 +2613,94 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let item = array::element(&mut ctx.heap, &tables.layouts, obj(*xs), index);
             heap::dec(*xs);
             Some(item)
+        }
+        (Builtin::ColumnsOfList, [xs]) if heap::kind(*xs) == KIND_LIST => {
+            let items = list::to_vec(obj(*xs));
+            for w in &items {
+                heap::inc(*w);
+            }
+            let tables = Arc::clone(&ctx.tables);
+            match ctx.heap.columns_of(&tables.layouts, &items) {
+                Some(c) => {
+                    heap::dec(*xs);
+                    Some(c)
+                }
+                None => {
+                    for w in &items {
+                        heap::dec(*w);
+                    }
+                    None
+                }
+            }
+        }
+        (Builtin::ColumnsNew, [n, x]) if heap::kind(*x) == KIND_RECORD => {
+            let n = heap::as_int(*n)?;
+            if !(1..=ply_eval::builtins::MAX_ARRAY_LEN).contains(&n) {
+                return None;
+            }
+            let items = vec![*x; n as usize];
+            for _ in 1..n {
+                heap::inc(*x);
+            }
+            let tables = Arc::clone(&ctx.tables);
+            let made = ctx.heap.columns_of(&tables.layouts, &items);
+            if made.is_none() {
+                for w in &items[1..] {
+                    heap::dec(*w);
+                }
+            }
+            made
+        }
+        (Builtin::ColumnsLen, [xs]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let n = columns::len(obj(*xs)) as i64;
+            heap::dec(*xs);
+            Some(heap::imm(n))
+        }
+        (Builtin::ColumnsGet, [xs, i]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let at = usize::try_from(heap::as_int(*i)?)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))?;
+            let tables = Arc::clone(&ctx.tables);
+            let r = columns::record(&mut ctx.heap, &tables.layouts, obj(*xs), at);
+            heap::dec(*xs);
+            Some(r)
+        }
+        (Builtin::ColumnsAt, [xs, i]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let index = heap::as_int(*i)?;
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
+            let tables = Arc::clone(&ctx.tables);
+            let held = usize::try_from(index)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))
+                .map(|at| columns::record(&mut ctx.heap, &tables.layouts, obj(*xs), at));
+            let answer = match held {
+                Some(item) => {
+                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+                    unsafe { set_word(c, 0, item) };
+                    c as Word
+                }
+                None => ctx.nullary(none),
+            };
+            heap::dec(*xs);
+            Some(answer)
+        }
+        (Builtin::ColumnsSet, [xs, i, v])
+            if heap::kind(*xs) == KIND_COLUMNS
+                && heap::kind(*v) == KIND_RECORD
+                && unsafe { (*obj(*v)).layout == (*obj(*xs)).layout } =>
+        {
+            let at = usize::try_from(heap::as_int(*i)?)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))?;
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.columns_set(&tables.layouts, *xs, at, *v))
+        }
+        (Builtin::ColumnsToList, [xs]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let tables = Arc::clone(&ctx.tables);
+            let items = columns::records(&mut ctx.heap, &tables.layouts, obj(*xs));
+            heap::dec(*xs);
+            Some(ctx.heap.list_from(&items))
         }
         (Builtin::ArrayAt, [xs, i]) if heap::kind(*xs) == KIND_ARRAY => {
             let index = heap::as_int(*i)?;

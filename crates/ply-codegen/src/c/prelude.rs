@@ -26,6 +26,7 @@ typedef struct {
 #define PLY_VIEW 8
 #define PLY_KIND_FLOAT 16
 #define PLY_KIND_FIXED 18
+#define PLY_KIND_COLUMNS 20
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
    pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
@@ -186,6 +187,7 @@ helpers![
     (rt_decimal_binary, 6, false),
     (rt_decimal_compare, 4, true),
     (rt_decimal_negate, 3, false),
+    (rt_columns_field, 3, true),
     (rt_unbox_float, 1, true),
     (rt_float_rem, 2, true),
     (rt_no_fuel, 0, false),

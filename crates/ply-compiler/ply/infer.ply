@@ -260,6 +260,10 @@ pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
 type GroupFill = { module: Int, span: Span, callee: Bytes, args: List<Type> }
 /// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 type ConcatSite = { module: Int, span: Span, ty: Type }
+
+/// A definition named at `span` whose answer at its instantiation, `ty`, holds a `Columns`, waiting
+/// to be settled.
+type ColumnsSite = { module: Int, span: Span, ty: Type }
 /// A written field of `{..b, f: e}` with the type its value inferred to.
 type UpdateField = { name: Bytes, span: Span, ty: Type }
 /// An update whose base was still a variable where it was written; `result` is what the site answered.
@@ -544,6 +548,7 @@ type Checker = {
   /// How each definition checked so far calls the functions it is handed, and what it answers.
   summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
+  columns: List<ColumnsSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
@@ -775,6 +780,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Unit", arity: 0 },
     { name: b"List", arity: 1 },
     { name: b"Array", arity: 1 },
+    { name: b"Columns", arity: 1 },
     { name: b"Map", arity: 2 },
     { name: b"Cell", arity: 1 },
     { name: b"Hold", arity: 1 },
@@ -3734,6 +3740,77 @@ fn settle_concats(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
+/// Whether `ty` names a `Columns` anywhere in it.
+fn mentions_columns(ty: Type) -> Bool =
+  match ty {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      c.name == b"Columns" || fold(c.args, false, |any: Bool, a: Type| any || mentions_columns(a)),
+    TyFn(f) ->
+      mentions_columns(f.ret)
+        || fold(f.params, false, |any: Bool, p: Type| any || mentions_columns(p)),
+    TyRecord(fs) -> fold(fs, false, |any: Bool, f: Field| any || mentions_columns(f.ty)),
+    TyNominal(x) -> fold(x.args, false, |any: Bool, a: Type| any || mentions_columns(a)),
+  }
+
+/// The element types of the `Columns` `ty` names, outermost first.
+fn columns_elements(ty: Type) -> List<Type> =
+  match ty {
+    TyVar(_) -> [],
+    TyCon(c) ->
+      fold(
+        c.args,
+        if c.name == b"Columns" && len(c.args) == 1 { c.args } else { [] },
+        |acc: List<Type>, a: Type| concat(acc, columns_elements(a)),
+      ),
+    TyFn(f) ->
+      fold(f.params, columns_elements(f.ret), |acc: List<Type>, p: Type|
+        concat(acc, columns_elements(p))),
+    TyRecord(fs) -> fold(fs, [], |acc: List<Type>, f: Field| concat(acc, columns_elements(f.ty))),
+    TyNominal(x) -> fold(x.args, [], |acc: List<Type>, a: Type| concat(acc, columns_elements(a))),
+  }
+
+/// A `Columns` holds each field of its records apart, so wherever a call answers one, the element
+/// must settle to a record of at least one field, or stay a type parameter, which the definition's
+/// own callers settle.
+fn settle_columns(checker: Checker) -> Checker / {abort.raise} = {
+  let entries = checker.columns;
+  fold(entries, { ..checker, columns: [] }, |c: Checker, entry: ColumnsSite| {
+    let in_module: Checker = { ..c, module: entry.module };
+    let judged: Checker = fold(
+      columns_elements(resolve(in_module, entry.ty)),
+      in_module,
+      |k: Checker, elem: Type|
+        match elem {
+          TyVar(_) -> k,
+          TyRecord(fs) -> if len(fs) > 0 { k } else {
+            columns_refused(k, entry.span, b"a record of no fields has no column to count it by")
+          },
+          TyNominal(x) -> if len(x.fields) > 0 { k } else {
+            columns_refused(
+              k,
+              entry.span,
+              bytes_concat_all([b"`", type_text(elem), b"` is not a record of fields"]),
+            )
+          },
+          other ->
+            columns_refused(
+              k,
+              entry.span,
+              bytes_concat_all([b"`", type_text(other), b"` is not a record"]),
+            ),
+        },
+    );
+    { ..judged, module: c.module }
+  })
+}
+
+fn columns_refused(checker: Checker, span: Span, why: Bytes) -> Checker / {abort.raise} =
+  report_error_at(checker, b"E0224", span, b"a `Columns` holds records, each field apart", why, [
+    b"a `Columns<T>` lays out every field of `T` as an array of its own; `T` is a record type of at least one field",
+    b"an `Array<T>` holds any type",
+  ])
+
 fn bind_all(
   checker: Checker,
   bindings: List<{ name: Bytes, ty: Type }>,
@@ -4852,10 +4929,18 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
           let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
           else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
           else { inst.labels };
-          let typed: Checker = match env_depth_of(noted.env, key.name) {
-            Some(d) -> if d > 0 { noted }
-            else { note_typed(noted, qname.span, inst.ty, inst.args) },
-            None -> note_typed(noted, qname.span, inst.ty, inst.args),
+          // Every `Columns` is made by a call that answers one, so its element is judged there.
+          let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
+          let columned: Checker = if mentions_columns(made) {
+            {
+              ..noted,
+              columns: push(noted.columns, { module: noted.module, span: qname.span, ty: made }),
+            }
+          } else { noted };
+          let typed: Checker = match env_depth_of(columned.env, key.name) {
+            Some(d) -> if d > 0 { columned }
+            else { note_typed(columned, qname.span, inst.ty, inst.args) },
+            None -> note_typed(columned, qname.span, inst.ty, inst.args),
           };
           { checker: note_labels(typed, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
@@ -9000,9 +9085,11 @@ fn check_component(
       |m: Map<Bytes, Summary>, slot: Int| map_insert(m, at(qualified, slot), summary_of(slot)),
     ),
   };
-  let settled: Checker = settle_bit_ops(
-    settle_numerics(
-      settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
+  let settled: Checker = settle_columns(
+    settle_bit_ops(
+      settle_numerics(
+        settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
+      ),
     ),
   );
   let grown: Checker = refuse_growth(settled, grouped.group_defs);
@@ -14064,6 +14151,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     group_fills: [],
     summaries: map_new(),
     concats: [],
+    columns: [],
     updates: [],
     update_shapes: [],
     try_sites: [],
@@ -14702,8 +14790,8 @@ pub fn check_program_with(
       at(mods, i),
     ));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Checker = settle_bit_ops(
-    settle_numerics(settle_concats(settle_updates(check_instances(tested)))),
+  let settled: Checker = settle_columns(
+    settle_bit_ops(settle_numerics(settle_concats(settle_updates(check_instances(tested))))),
   );
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
@@ -19315,5 +19403,25 @@ test "a hold of an opaque value is read where the value's module is called, and 
   assert_eq(
     over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> hold_get(h) }"),
     [],
+  )
+}
+
+test "a `Columns` holds a record type of at least one field wherever its type settles" {
+  assert_eq(
+    check_codes(
+      b"type P = { x: Float, y: Float }\nfn f(xs: List<P>) -> Columns<P> = columns_of_list(xs)\n",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Columns<Int> = columns_of_list(xs)\n"), [
+    b"E0224",
+  ]);
+  assert_eq(check_codes(b"fn f(xs: List<{}>) -> Columns<{}> = columns_of_list(xs)\n"), [b"E0224"]);
+  // A type parameter is its callers' to settle.
+  let generic = b"fn f<a>(xs: List<a>) -> Columns<a> = columns_of_list(xs)\n";
+  assert_eq(check_codes(generic), []);
+  assert_eq(
+    check_codes(bytes_concat(generic, b"fn g(xs: List<Int>) -> Int = columns_len(f(xs))\n")),
+    [b"E0224"],
   )
 }

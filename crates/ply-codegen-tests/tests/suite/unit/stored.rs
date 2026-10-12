@@ -761,3 +761,64 @@ fn a_long_slice_of_bytes_is_a_view_that_holds_its_value_and_never_grows_in_place
     dec(copied);
     dec(whole);
 }
+
+#[test]
+fn marking_a_view_immortal_marks_the_value_it_views() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let whole = h.bytes(&all);
+    inc(whole);
+    let view = h.slice(&l, whole, 0, 100);
+    mark_immortal(view);
+    assert_eq!(unsafe { (*obj(whole)).rc }, IMMORTAL);
+}
+
+/// `{label, x}`, `x` a `Float`.
+fn tagged(x: f64, label: &str) -> Value {
+    record(vec![("label", Value::str(label)), ("x", Value::Float(x))])
+}
+
+#[test]
+fn columns_hold_each_field_of_their_records_apart() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let items: Vec<Word> = (0..3)
+        .map(|i| h.to_word(&l, &tagged(f64::from(i), "p")))
+        .collect();
+    let cs = h.columns_of(&l, &items).expect("records of one shape");
+    let o = obj(cs);
+    assert_eq!(kind(cs), KIND_COLUMNS);
+    assert_eq!(ply_codegen::columns::len(o), 3);
+    // `x` is the second field, its column the `Float`s' bits in place.
+    assert!(ply_codegen::array::in_place(ply_codegen::columns::column(
+        o, 1
+    )));
+    let all = Value::array((0..3).map(|i| tagged(f64::from(i), "p")).collect());
+    assert_eq!(Heap::to_value(&l, cs), all);
+    let second = ply_codegen::columns::record(&mut h, &l, o, 1);
+    assert_eq!(Heap::to_value(&l, second), tagged(1.0, "p"));
+    // Set on a copy where another holds them, and in place where none does.
+    inc(cs);
+    let replaced = h.to_word(&l, &tagged(9.0, "q"));
+    let set = h.columns_set(&l, cs, 0, replaced);
+    assert_ne!(set, cs);
+    assert_eq!(Heap::to_value(&l, cs), all);
+    let again = h.to_word(&l, &tagged(7.0, "r"));
+    let in_place = h.columns_set(&l, set, 2, again);
+    assert_eq!(in_place, set);
+    assert_eq!(
+        Heap::to_value(&l, in_place),
+        Value::array(vec![tagged(9.0, "q"), tagged(1.0, "p"), tagged(7.0, "r")])
+    );
+    assert_eq!(cmp_words(&l, cs, h.to_word(&l, &all)), Ordering::Equal);
+    let (_into, read) = kept(&l, in_place);
+    assert_eq!(kind(read), KIND_COLUMNS);
+    assert_eq!(Heap::to_value(&l, read), Heap::to_value(&l, in_place));
+    // What is not records of one shape is not held in columns.
+    let ints = [h.to_word(&l, &Value::Int(1))];
+    assert!(h.columns_of(&l, &ints).is_none());
+    for w in [cs, second, in_place] {
+        dec(w);
+    }
+}

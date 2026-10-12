@@ -5168,6 +5168,134 @@ fn read_field(
     },
   }
 
+/// Whether `name` called is the builtin `builtin`: no definition of this module and no import takes
+/// it.
+fn names_builtin(emitter: Emitter, name: Bytes, builtin: Bytes) -> Bool =
+  name == builtin && !fold(emitter.here, false, |acc: Bool, h: Def| acc || h.name == name)
+    && from_import(emitter.imports, name) == None
+
+/// Where call `a` read at `field` is `columns_get(xs, i).field` of a `Columns` the checker settled
+/// to records: the field's place among its record's fields, and how the record holds it.
+fn columns_field(
+  emitter: Emitter,
+  a: { func: Code, args: List<Code> },
+  field: Bytes,
+) -> Option<{ k: Int, f: FieldTy }> =
+  match a.func.node {
+    NVar(fv) -> if fv.slot != None || len(a.args) != 2
+        || !names_builtin(emitter, fv.name, b"columns_get") { None } else {
+      match map_get(emitter.typed, span_key(a.func.span)) {
+        None -> None,
+        Some(t) -> match list_at(t.args, 0) {
+          None -> None,
+          Some(element) -> match kind_of(element).ty {
+            TyRec(fs) ->
+              fold(range(0, len(fs)), None, |found: Option<{ k: Int, f: FieldTy }>, k: Int|
+                match list_at(fs, k) {
+                  Some(x) -> if x.name == field { Some({ k: k, f: x }) } else { found },
+                  None -> found,
+                }),
+            _ -> None,
+          },
+        },
+      }
+    },
+    _ -> None,
+  }
+
+/// Field `at.f` of record `i` of `xs`, given as `words`, which it takes: loaded from its column
+/// where `xs` is laid out in columns and `i` is in range, with no record made; otherwise read by the
+/// runtime, which raises as `columns_get` does.
+fn columns_load(
+  emitter: Emitter,
+  words: List<Bytes>,
+  at: { k: Int, f: FieldTy },
+  span: Span,
+) -> WithValue / {abort.raise} = {
+  let xs = match list_at(words, 0) { Some(w) -> w, None -> b"0" };
+  let given = match list_at(words, 1) { Some(w) -> w, None -> b"0" };
+  let idx = bind(site(emitter, span), KInt, as_int({ kind: KBoxed, expr: given, ty: TyOpen }));
+  let kind = at.f.kind;
+  let out = fresh(idx.emitter);
+  let column = bytes_concat_all([b"ply_words(", xs, b")[", ascii_of_int(at.k), b"]"]);
+  let opened = line(
+    line(out.emitter, bytes_concat_all([ctype(kind), b" ", out.name, b" = ", zero_of(kind), b";"])),
+    bytes_concat_all([
+      b"if (ply_obj(",
+      xs,
+      b")->kind == PLY_KIND_COLUMNS && (uint64_t)",
+      idx.value.expr,
+      b" < (uint64_t)ply_array_len(",
+      column,
+      b")) {",
+    ]),
+  );
+  let fast = line(
+    indent(opened),
+    bytes_concat_all([
+      out.name,
+      b" = ",
+      column_read(column, idx.value.expr, at.f),
+      b";",
+      if kind == KBoxed { bytes_concat_all([b" ply_inc(", out.name, b");"]) } else { b"" },
+    ]),
+  );
+  let call = bytes_concat_all([
+    b"rt_columns_field_p(ctx, ",
+    xs,
+    b", ",
+    idx.value.expr,
+    b", ",
+    ascii_of_int(at.k),
+    b")",
+  ]);
+  let otherwise = indent(line(outdent(fast), b"} else {"));
+  let slow = if kind == KBoxed {
+    check(line(otherwise, bytes_concat_all([out.name, b" = ", call, b";"])))
+  } else {
+    let w = fresh(otherwise);
+    line(
+      check(line(w.emitter, bytes_concat_all([b"Word ", w.name, b" = ", call, b";"]))),
+      bytes_concat_all([
+        out.name,
+        b" = ",
+        as_kind({ kind: KBoxed, expr: w.name, ty: TyOpen }, kind),
+        b"; ply_dec(ctx, ",
+        w.name,
+        b");",
+      ]),
+    )
+  };
+  let closed = line(
+    line(outdent(slow), b"}"),
+    bytes_concat_all([b"ply_dec(ctx, ", xs, b"); ply_dec(ctx, ", given, b");"]),
+  );
+  {
+    emitter: if kind == KBoxed { note_made(closed, out.name) } else { closed },
+    value: { kind: kind, expr: out.name, ty: at.f.ty },
+  }
+}
+
+/// Element `i` of `column`, an array of field `f`'s values, read as the field is held: a record in
+/// place as the address of its header, a scalar its record holds raw as its kind, any other as the
+/// kind its word holds.
+fn column_read(column: Bytes, i: Bytes, f: FieldTy) -> Bytes = {
+  let at = bytes_concat_all([b"(", i, b") * ply_obj(", column, b")->aux"]);
+  match f.ty {
+    TyRec(_) -> bytes_concat_all([b"((Word)(intptr_t)(ply_words(", column, b") + ", at, b"))"]),
+    _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) } else {
+      as_kind(
+        {
+          kind: KBoxed,
+          expr: bytes_concat_all([b"ply_words(", column, b")[", i, b"]"]),
+          ty: TyOpen,
+        },
+        f.kind,
+      )
+    },
+  }
+}
+
 fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue> / {abort.raise} =
   match c.node {
     NLabel(n) -> {
@@ -5462,7 +5590,17 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
         Some({ emitter: check(o.emitter), value: o.value })
       },
     },
-    NField(f) -> read_field(emitter, c, f, params, true),
+    // `columns_get(xs, i).f` reads its field from its column.
+    NField(f) -> match f.base.node {
+      NApp(a) -> match columns_field(emitter, a, f.field) {
+        Some(at) -> match items(emitter, a.args, params, 0, []) {
+          None -> None,
+          Some(w) -> Some(columns_load(w.emitter, w.names, at, c.span)),
+        },
+        None -> read_field(emitter, c, f, params, true),
+      },
+      _ -> read_field(emitter, c, f, params, true),
+    },
     // `{..b, f: e}` reuses the base's memory: the base is released before the allocation, so its cells are the token.
     // Order: the written fields are evaluated, then the base read, then each field filled in shape order.
     NUpdate(u) -> {
@@ -10184,13 +10322,32 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
 test "a byte is read through `ply_bytes`, which follows a view to the value it views" {
   let src = bytes_concat_all([
     b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = bytes_at(b, i)\n",
-    b"fn word(b: Bytes, i: Int) -> Int / {abort.raise} = bytes_u32_le(b, i)\n",
+    b"fn word(b: Bytes, i: Int) -> U32 / {abort.raise} = bytes_u32_le(b, i)\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"bytes_at", b"bytes_u32_le"], true);
   let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
   assert_eq(map(out, |e: Emitted| e.why), [None, None]);
   assert_eq(has(b"ply_bytes("), [true, true]);
   assert_eq(has(b"(unsigned char *)ply_words("), [false, false])
+}
+
+test "a field of a `Columns`' record is loaded from its column, with no record made" {
+  let src = bytes_concat_all([
+    b"type P = { label: String, x: Float }\n",
+    b"fn x_at(ps: Columns<P>, i: Int) -> Float / {abort.raise} = columns_get(ps, i).x\n",
+    b"fn label_at(ps: Columns<P>, i: Int) -> String / {abort.raise} = columns_get(ps, i).label\n",
+    b"fn whole(ps: Columns<P>, i: Int) -> P / {abort.raise} = columns_get(ps, i)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"columns_get"], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  // A field's column is its place among the record's fields: `label` the first, `x` the second.
+  assert_eq(has(b"PLY_KIND_COLUMNS"), [true, true, false]);
+  assert_eq(has(b")[1])) {"), [true, false, false]);
+  assert_eq(has(b")[0])) {"), [false, true, false]);
+  assert_eq(has(b"ply_f64(ply_words("), [true, false, false]);
+  // What is not a columnar value's in-range record the runtime reads.
+  assert_eq(has(b"rt_columns_field_p(ctx, "), [true, true, false])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {

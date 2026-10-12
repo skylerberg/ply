@@ -5,9 +5,10 @@
 //! met twice is written once. A closure, and a bridged cell, task, channel or secret, has no text.
 
 use crate::heap::{
-    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
-    KIND_DECIMAL, KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR,
-    KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word, word_at,
+    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,
+    KIND_CTOR, KIND_DECIMAL, KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD,
+    KIND_STR, KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word,
+    word_at,
 };
 use crate::{array, list, map};
 use ply_eval::Symbol;
@@ -40,6 +41,8 @@ const CHAR: u8 = 17;
 const FIXED: u8 = 18;
 /// A `Decimal`: its sixteen bytes as `rust_decimal` serializes it.
 const DECIMAL: u8 = 19;
+/// A `Columns`: its records' shape, then an array per field.
+const COLUMNS: u8 = 20;
 
 /// The text of `w`, which it reads: lowercase hex, so a C string literal holds it as it is.
 pub fn text(layouts: &Layouts, w: Word) -> Result<Vec<u8>, String> {
@@ -266,6 +269,13 @@ impl<'l> Writer<'l> {
                 return Ok(());
             }
             KIND_ARRAY => self.sequence(ARRAY, ARRAY_WORDS, array::items(o).to_vec()),
+            KIND_COLUMNS => {
+                self.out.push(COLUMNS);
+                self.shape(layout);
+                (0..len as usize)
+                    .map(|k| unsafe { word_at(o, k) })
+                    .collect()
+            }
             KIND_MAP => {
                 let entries = map::to_vec(o);
                 self.out.push(MAP);
@@ -367,6 +377,7 @@ struct Open {
 
 enum Make {
     Record { shape: u32 },
+    Columns { shape: u32 },
     Ctor { index: u32 },
     List,
     Array,
@@ -535,6 +546,10 @@ impl<'a> Reader<'a> {
                 }
                 (Make::Ctor { index }, want)
             }
+            COLUMNS => {
+                let shape = self.shape()?;
+                (Make::Columns { shape }, self.layouts.shape_fields(shape))
+            }
             LIST => (Make::List, self.count()?),
             ARRAY => (Make::Array, self.count()?),
             MAP => {
@@ -578,6 +593,7 @@ impl<'a> Reader<'a> {
                 self.held.extend(done.parts.iter().copied());
                 self.heap.ctor(self.layouts, index, &done.parts)
             }
+            Make::Columns { shape } => self.heap.columns_from(shape, &done.parts),
             Make::List => self.heap.list_from(&done.parts),
             Make::Array => {
                 for part in &done.parts {
