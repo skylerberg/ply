@@ -39,6 +39,46 @@ fn two_byte_strings_compare_in_byte_order_at_every_length() {
 }
 
 #[test]
+fn a_float_is_its_own_object_ordered_and_read_back_as_the_evaluator_orders_and_reads_it() {
+    let mut h = Heap::new();
+    let l = layouts();
+    let nan = f64::from_bits(0x7FF8_0000_0000_0001);
+    let floats = [
+        f64::NEG_INFINITY,
+        -1.5,
+        -0.0,
+        0.0,
+        f64::from_bits(1),
+        2.5,
+        f64::INFINITY,
+        nan,
+    ];
+    let words: Vec<Word> = floats
+        .iter()
+        .map(|x| h.to_word(&l, &Value::Float(*x)))
+        .collect();
+    for (w, x) in words.iter().zip(&floats) {
+        assert_eq!(kind(*w), KIND_FLOAT);
+        assert_eq!(Heap::to_value(&l, *w), Value::Float(*x));
+    }
+    for (a, x) in words.iter().zip(&floats) {
+        for (b, y) in words.iter().zip(&floats) {
+            assert_eq!(
+                cmp_words(&l, *a, *b),
+                Value::Float(*x).cmp(&Value::Float(*y)),
+                "{x} against {y}"
+            );
+        }
+    }
+    let canonical = h.to_word(&l, &Value::Float(f64::NAN));
+    assert_eq!(
+        cmp_words(&l, canonical, words[7]),
+        std::cmp::Ordering::Equal,
+        "every NaN is one key"
+    );
+}
+
+#[test]
 fn a_flat_record_is_released_without_a_walk_and_loses_the_flag_when_it_gains_a_count() {
     let mut h = Heap::new();
     let o = h.alloc(KIND_RECORD, FLAT, 2, 0);

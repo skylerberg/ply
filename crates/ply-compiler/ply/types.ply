@@ -1095,6 +1095,187 @@ pub fn generalize(
   }
 }
 
+// --- A table of types --------------------------------------------------------------------------
+// A type kept beside many others is kept as nodes, each part by the key of its node: a record type
+// every function of a module mentions is held once, and so is each type inside it.
+
+/// One node of a type: what it is, each part by the key of its node. A function's row is no part.
+pub type TypeNode =
+  | NodeVar(Int)
+  | NodeCon({ name: Bytes, args: List<Bytes> })
+  | NodeFn({ params: List<Bytes>, ret: Bytes })
+  | NodeRecord(List<NodeField>)
+  | NodeNominal({ name: Bytes, args: List<Bytes>, fields: List<NodeField> })
+
+pub type NodeField = { name: Bytes, ty: Bytes }
+
+derive bin for NodeField
+
+derive bin for TypeNode
+
+/// Nodes by their keys.
+pub type TypeTable = Map<Bytes, TypeNode>
+
+derive bin for TypeTable
+
+fn node_key(node: TypeNode) -> Bytes / {abort.raise} =
+  bytes_slice(bytes_blake3(bin::encode(node, type_node_bin())), 0, 16)
+
+type HeldParts = { table: TypeTable, keys: List<Bytes> }
+type HeldFields = { table: TypeTable, fields: List<NodeField> }
+
+fn held_parts(table: TypeTable, tys: List<Type>) -> HeldParts / {abort.raise} =
+  fold(tys, { table: table, keys: [] }, |acc: HeldParts, ty: Type| {
+    let h = held_type(acc.table, ty);
+    { table: h.table, keys: push(acc.keys, h.key) }
+  })
+
+fn held_fields(table: TypeTable, fs: List<Field>) -> HeldFields / {abort.raise} =
+  fold(fs, { table: table, fields: [] }, |acc: HeldFields, f: Field| {
+    let h = held_type(acc.table, f.ty);
+    { table: h.table, fields: push(acc.fields, { name: f.name, ty: h.key }) }
+  })
+
+/// `ty` held in `table`: the key of its node, beside the table holding it and each part of it.
+pub fn held_type(table: TypeTable, ty: Type) -> { table: TypeTable, key: Bytes } / {abort.raise} = {
+  let made = match ty {
+    TyVar(v) -> { table: table, node: NodeVar(v) },
+    TyCon(c) -> {
+      let p = held_parts(table, c.args);
+      { table: p.table, node: NodeCon({ name: c.name, args: p.keys }) }
+    },
+    TyFn(f) -> {
+      let p = held_parts(table, f.params);
+      let r = held_type(p.table, f.ret);
+      { table: r.table, node: NodeFn({ params: p.keys, ret: r.key }) }
+    },
+    TyRecord(fs) -> {
+      let p = held_fields(table, fs);
+      { table: p.table, node: NodeRecord(p.fields) }
+    },
+    TyNominal(x) -> {
+      let a = held_parts(table, x.args);
+      let p = held_fields(a.table, x.fields);
+      { table: p.table, node: NodeNominal({ name: x.name, args: a.keys, fields: p.fields }) }
+    },
+  };
+  let key = node_key(made.node);
+  { table: map_insert(made.table, key, made.node), key: key }
+}
+
+/// The parts of a node, by key.
+fn node_parts(node: TypeNode) -> List<Bytes> =
+  match node {
+    NodeVar(_) -> [],
+    NodeCon(c) -> c.args,
+    NodeFn(f) -> push(f.params, f.ret),
+    NodeRecord(fs) -> map(fs, |f: NodeField| f.ty),
+    NodeNominal(x) -> concat(x.args, map(x.fields, |f: NodeField| f.ty)),
+  }
+
+/// The nodes of `table` the types `keys` name are made of.
+pub fn table_of(table: TypeTable, keys: List<Bytes>) -> TypeTable =
+  fold(keys, map_new(), |acc: TypeTable, k: Bytes| reached_nodes(table, k, acc, map_len(table)))
+
+/// `room` is how many more nodes a path may pass: keys are digests of what they name, so no path
+/// meets a node twice.
+fn reached_nodes(table: TypeTable, key: Bytes, acc: TypeTable, room: Int) -> TypeTable =
+  if room <= 0 || map_contains(acc, key) { acc } else {
+    match map_get(table, key) {
+      None -> acc,
+      Some(node) ->
+        fold(node_parts(node), map_insert(acc, key, node), |a: TypeTable, k: Bytes|
+          reached_nodes(table, k, a, room - 1)),
+    }
+  }
+
+/// Both tables as one.
+pub fn tables_joined(a: TypeTable, b: TypeTable) -> TypeTable =
+  map_fold(b, a, |acc: TypeTable, k: Bytes, node: TypeNode| map_insert(acc, k, node))
+
+type ReadTypes = { tys: List<Type>, read: Map<Bytes, Type> }
+
+/// The type `key` names in `table`, beside every type read on the way by its key, so a part many
+/// types share is read once. A key the table does not hold is a variable no one numbered, `-1`.
+pub fn type_at(
+  table: TypeTable,
+  key: Bytes,
+  read: Map<Bytes, Type>,
+) -> { ty: Type, read: Map<Bytes, Type> } = type_within(table, key, read, map_len(table))
+
+fn type_within(
+  table: TypeTable,
+  key: Bytes,
+  read: Map<Bytes, Type>,
+  room: Int,
+) -> { ty: Type, read: Map<Bytes, Type> } =
+  match map_get(read, key) {
+    Some(t) -> { ty: t, read: read },
+    None -> if room <= 0 { { ty: TyVar(0 - 1), read: read } } else {
+      let made = match map_get(table, key) {
+        None -> { ty: TyVar(0 - 1), read: read },
+        Some(node) -> type_of_node(table, node, read, room - 1),
+      };
+      { ty: made.ty, read: map_insert(made.read, key, made.ty) }
+    },
+  }
+
+fn types_within(
+  table: TypeTable,
+  keys: List<Bytes>,
+  read: Map<Bytes, Type>,
+  room: Int,
+) -> ReadTypes =
+  fold(keys, { tys: [], read: read }, |acc: ReadTypes, k: Bytes| {
+    let t = type_within(table, k, acc.read, room);
+    { tys: push(acc.tys, t.ty), read: t.read }
+  })
+
+fn fields_within(
+  table: TypeTable,
+  fs: List<NodeField>,
+  read: Map<Bytes, Type>,
+  room: Int,
+) -> { fields: List<Field>, read: Map<Bytes, Type> } = {
+  let r = types_within(table, map(fs, |f: NodeField| f.ty), read, room);
+  {
+    fields: map(range(0, len(fs)), |i: Int|
+      {
+        name: match list_at(fs, i) { Some(f) -> f.name, None -> b"" },
+        ty: match list_at(r.tys, i) { Some(t) -> t, None -> TyVar(0 - 1) },
+      }),
+    read: r.read,
+  }
+}
+
+fn type_of_node(
+  table: TypeTable,
+  node: TypeNode,
+  read: Map<Bytes, Type>,
+  room: Int,
+) -> { ty: Type, read: Map<Bytes, Type> } =
+  match node {
+    NodeVar(v) -> { ty: TyVar(v), read: read },
+    NodeCon(c) -> {
+      let r = types_within(table, c.args, read, room);
+      { ty: TyCon({ name: c.name, args: r.tys }), read: r.read }
+    },
+    NodeFn(f) -> {
+      let p = types_within(table, f.params, read, room);
+      let r = type_within(table, f.ret, p.read, room);
+      { ty: TyFn({ params: p.tys, ret: r.ty, effects: row_empty() }), read: r.read }
+    },
+    NodeRecord(fs) -> {
+      let r = fields_within(table, fs, read, room);
+      { ty: TyRecord(r.fields), read: r.read }
+    },
+    NodeNominal(x) -> {
+      let a = types_within(table, x.args, read, room);
+      let r = fields_within(table, x.fields, a.read, room);
+      { ty: TyNominal({ name: x.name, args: a.tys, fields: r.fields }), read: r.read }
+    },
+  }
+
 // --- One numbering per text ------------------------------------------------------------------
 // The checker numbers variables as it meets them, so two answers about one program may number
 // them apart. Renamed in the order their text names them, a scheme's head first, the two are one
