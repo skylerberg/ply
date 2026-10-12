@@ -1,4 +1,5 @@
 mod dump;
+mod stage;
 mod sweep;
 
 use crate::units::{self, def};
@@ -65,6 +66,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
     assert!(PRELUDE.contains("#define PLY_KIND_FLOAT 16"));
     assert_eq!(ply_codegen::heap::MIXED, 2, "PLY_MIXED");
     assert!(PRELUDE.contains("#define PLY_MIXED 2"));
+    assert_eq!(ply_codegen::heap::KIND_FIXED, 18, "PLY_KIND_FIXED");
+    assert!(PRELUDE.contains("#define PLY_KIND_FIXED 18"));
     assert_eq!(ply_codegen::heap::RAW, 4, "PLY_RAW");
     assert!(PRELUDE.contains("#define PLY_RAW 4"));
     assert_eq!(ply_codegen::heap::EMBEDDED, 0xC000_0000, "ply_embedded");
@@ -88,15 +91,18 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A unit says whether its C holds a record of a record type in place, after whatever else it says.
+/// A unit says how its C lays out records, after whatever else it says.
 #[test]
-fn a_unit_says_whether_it_holds_records_in_place() {
+fn a_unit_says_how_it_lays_out_records() {
     let mut exports = units::exports_of(&[]);
-    for in_place in [true, false] {
-        exports.in_place = in_place;
+    for (in_place, raw_widths) in [(true, true), (true, false), (false, true), (false, false)] {
+        exports.layout = ply_codegen::heap::RecordLayout {
+            in_place,
+            raw_widths,
+        };
         let read =
             ply_codegen::c::Exports::decode(&exports.encode()).expect("the table reads back");
-        assert_eq!(read.in_place, in_place);
+        assert_eq!(read.layout, exports.layout);
     }
 }
 
