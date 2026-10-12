@@ -172,7 +172,8 @@ impl Unit {
         Unit::over(front, Code::Opened(path.to_path_buf()))
     }
 
-    /// The program this executable was linked with, over `front`, its front end's answer.
+    /// The program this executable was linked with, over `front`, what its front end answered of
+    /// the roots it is entered by: the machine is offered those and no other definition it holds.
     pub fn linked(front: &ply_eval::Analysis) -> Result<Arc<Unit>> {
         Unit::over(front, Code::Linked)
     }
@@ -182,7 +183,11 @@ impl Unit {
         let source = Arc::new(Source::from_analysis(Arc::new(front.clone())));
         let (native, refused) = code.load(&source)?;
         let compiled = native.names();
-        let members: BTreeSet<Symbol> = compiled.iter().map(Symbol::new).collect();
+        let offered = |name: &&String| match code {
+            Code::Linked => source.row(name).is_some(),
+            Code::Opened(_) => true,
+        };
+        let members: BTreeSet<Symbol> = compiled.iter().filter(offered).map(Symbol::new).collect();
         let unit = Unit {
             identity,
             source,

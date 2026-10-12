@@ -9,16 +9,18 @@ use ply_eval::{Analysis, Diagnostic, Ended, SourceId, codes};
 use ply_machine::enter::{self, Binds};
 use std::path::{Path, PathBuf};
 
-/// Where the pack carries the linked program's front end's answer: the value codec's record of the
-/// definition it enters, its front end's dump and how many modules the dump's indices run over.
+/// Where the pack carries what the linked program's front end answered of the definition it
+/// enters: a `front.Linked` in the value codec.
 pub const FRONT: &str = "program/front";
 
-/// What a launched program is: the definition it enters, its front end's answer, the stage its
-/// shipped modules are laid out under, and the binary's version for the environment it may ask
-/// about.
+/// What a launched program is: the definition it enters, what its front end answered of that
+/// definition, the stage its shipped modules are laid out under, and the binary's version for the
+/// environment it may ask about.
 pub struct Program {
     pub entry: String,
     pub front: Analysis,
+    /// Each `fn` the entry reaches and its hash, a `name hash` line each in name order.
+    pub definitions: String,
     /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
     pub version: String,
@@ -32,22 +34,41 @@ pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
     };
     let value = ply_eval::codec::decode(bytes)
         .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    let at = ply_eval::decode::AnswerValue::new("a linked program's front end", &value);
-    let read = || -> Result<(String, Analysis), ply_eval::decode::Error> {
-        let modules = at.field("modules")?.number::<u32>()?;
-        let ids: Vec<SourceId> = (0..modules).map(SourceId).collect();
-        let front = ply_codegen::c::dump::read(at.field("dump")?.value(), &ids)
-            .map_err(|e| at.error(format!("its dump does not read: {e}")))?;
-        Ok((at.field("entry")?.str()?.to_string(), front))
-    };
-    let (entry, front) = read().map_err(|why| unlinked(why.to_string()))?;
+    let linked = match whole_answer(&value) {
+        Some(whole) => whole,
+        None => ply_codegen::c::dump::linked(&value),
+    }
+    .map_err(|why| unlinked(why.to_string()))?;
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
-        entry,
-        front,
+        entry: linked.entry.to_string(),
+        front: linked.front,
+        definitions: linked.definitions,
         stage: format!("native-{stage}"),
         version: version.to_string(),
     })
+}
+
+/// The last release packs a program's whole answer, and it links the builder a bootstrap of this
+/// checkout starts with: `value` read as that, where it holds a `dump`.
+fn whole_answer(
+    value: &ply_eval::Value,
+) -> Option<Result<ply_codegen::c::dump::Linked, ply_eval::decode::Error>> {
+    let at = ply_eval::decode::AnswerValue::new("a linked program's front end", value);
+    let dump = at.field("dump").ok()?;
+    let read = || {
+        let modules = at.field("modules")?.number::<u32>()?;
+        let ids: Vec<SourceId> = (0..modules).map(SourceId).collect();
+        let front = ply_codegen::c::dump::read(dump.value(), &ids)
+            .map_err(|e| at.error(format!("its dump does not read: {e}")))?;
+        let entry = at.field("entry")?.str()?;
+        Ok(ply_codegen::c::dump::Linked {
+            entry: ply_eval::Symbol::new(entry),
+            definitions: ply_machine::shipped::definitions(&front, entry),
+            front,
+        })
+    };
+    Some(read())
 }
 
 #[cold]
@@ -230,7 +251,7 @@ pub fn run(
     count: Option<crate::count::Asked>,
 ) -> Ended<i32> {
     ply_codegen::c::sweep::once();
-    let definitions = ply_machine::shipped::definitions(&program.front, &program.entry);
+    let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
         Err(refused) => return Ended::refused(refused),

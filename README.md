@@ -54,10 +54,10 @@ cargo nextest run --workspace
 ```
 
 `ply` is a native program: the CLI compiled to C and linked with the runtime's static library,
-with a pack after it holding the shipped modules, what they answer and the CLI's own front end.
-`scripts/bootstrap.sh` has cargo build that library and `ply bootstrap` build the rest, run by the
-`ply` already in `target/` or, in a fresh checkout, the last release (`scripts/stage0.sh`). Cargo
-builds nothing after an edit to Ply sources alone.
+with a pack after it holding the shipped modules, what they answer and what the CLI's front end
+answered of the definition it enters. `scripts/bootstrap.sh` has cargo build that library and
+`ply bootstrap` build the rest, run by the `ply` already in `target/` or, in a fresh checkout, the
+last release (`scripts/stage0.sh`). Cargo builds nothing after an edit to Ply sources alone.
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards.
 The Ply tests run as the runs `.github/ci-shards.sh` lists, each one `ply test` or `ply prove` of a

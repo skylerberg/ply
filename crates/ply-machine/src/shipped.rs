@@ -172,20 +172,15 @@ impl HostHandler for Shipped {
                 })?;
                 PlyValue::bytes(bytes)
             }
-            ("front", [entry, dump, modules]) => PlyValue::bytes(
-                ply_eval::codec::encode(&crate::payload::record(vec![
-                    ("entry", entry.clone()),
-                    ("dump", dump.clone()),
-                    ("modules", modules.clone()),
-                ]))
-                .map_err(|why| {
+            ("front", [linked]) => {
+                PlyValue::bytes(ply_eval::codec::encode(linked).map_err(|why| {
                     Diagnostic::error(
                         codes::INTERNAL_ERROR,
                         format!("the program's front end does not encode: {why}"),
                     )
                     .primary(span, "this is Ply's fault")
-                })?,
-            ),
+                })?)
+            }
             ("values", [files, dump, unit, roots, steps]) => {
                 values(files, dump, unit, roots, steps, span)?
             }
