@@ -3034,7 +3034,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply hash [path]` | `--deps` (references and transitive closure) |
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
-| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer and its own front end; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
+| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer and its own front end; the builder and the pack are taken from the toolchain's cache where an earlier bootstrap kept them; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
 | `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records no run of this `ply` can ask for again (those of queries it no longer has, of another `ply`'s commands, or kept under another layout's names), then the answers, notes, reader links and marks no record left reaches, and the store's definitions no pass record reaches |
 | `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
@@ -3063,8 +3063,12 @@ starts, so a body is walked once however often it is lowered or moved.
 `ply` is a native program: the runtime's static library linked with the C of the CLI, and a pack
 after them holding the shipped modules, what they answer, and the tables of the CLI's front end
 the runtime binds its code to, so starting runs no compiler and opens no library. `ply bootstrap`
-builds it. The running `ply` builds the checkout's compiler into the builder, the compiler's own
-`build.main` as a native program. The builder reads the CLI's sources and hashes them, and where
+builds it. The running `ply` builds the builder, a native program that enters the checkout's
+compiler at its `build.main`: it loads the compiler as the shipped modules that definition reaches,
+so each one that did not move since the running `ply` was built is answered by what its pack
+carries. The builder is kept in the toolchain's cache under the checkout's shipped modules, the
+runtime's library, the C compiler and the definitions of the running `ply` that build it, and a
+bootstrap that finds one there builds none. The builder reads the CLI's sources and hashes them, and where
 the definition the program enters hashes as one of a program it already built, for this runtime
 and by this builder, what it made then is the program: a hash covers all its definition reaches
 and no comment, layout, test or definition nothing reaches. Otherwise it checks the sources, each
@@ -3073,7 +3077,9 @@ kept, holds the value of each `const fn` as `ply build` does (§3.5), keeps each
 C in the toolchain's cache, and writes the front end and the list of those parts, keeping both
 under that key in `programs/` below the cache. A program it builds holds no test and no law, which
 nothing it enters reaches. The bootstrap compiles the parts no earlier build compiled, links them
-with the runtime's library, and has the new `ply` answer the shipped modules for its pack.
+with the runtime's library, and has the new `ply` answer the shipped modules for its pack, which it
+keeps as it keeps the builder, under the program's front end and C: a bootstrap of a `ply` an
+earlier one packed answers nothing again.
 `ply std`
 needs no project: it reads the shipped modules off a second, read-only root.
 `--count-allocs=PATH` is the runtime's own flag rather than the program's: it is
