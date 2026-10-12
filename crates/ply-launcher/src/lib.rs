@@ -9,9 +9,6 @@ use ply_eval::{Analysis, Diagnostic, Ended, SourceId, codes};
 use ply_machine::enter::{self, Binds};
 use std::path::{Path, PathBuf};
 
-/// The front end and emitter recurse once per node on the native stack.
-const STACK: usize = 256 << 20;
-
 /// Where the pack carries the linked program's front end's answer: the value codec's record of the
 /// definition it enters, its front end's dump and how many modules the dump's indices run over.
 pub const FRONT: &str = "program/front";
@@ -268,7 +265,7 @@ pub fn run(
     // end's recursion wants.
     let work = std::thread::Builder::new()
         .name("ply".to_string())
-        .stack_size(STACK)
+        .stack_size(ply_codegen::rt::PROGRAM_STACK)
         .spawn(move || {
             match count {
                 Some(asked) => {
