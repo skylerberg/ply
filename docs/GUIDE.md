@@ -2119,7 +2119,9 @@ effect, or write `test/nondet "label" { ... }`, which is cached as any test is
 
 Tests whose footprints do not conflict run concurrently, under `parallel`
 blocks (§5.9) on one thread per core; a test whose effects are all discharged in
-a region conflicts with nothing. A raise is in no footprint, since the run
+a region conflicts with nothing. Only an atom of a `nondet` effect or of a
+region's `cell` conflicts with another test's: what answers any other is a
+function of the test's own state. A raise is in no footprint, since the run
 answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, each
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.

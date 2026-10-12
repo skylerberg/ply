@@ -92,12 +92,17 @@ pub fn hermetic_registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
 }
 
 fn lent_by(options: drive::RunOptions, hermetic: bool) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    let handler: Arc<dyn HostHandler> = Arc::new(MachineHandler {
+    let made = move || MachineHandler {
         hermetic,
-        options,
+        options: options.clone(),
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
-    });
+    };
+    let handler: Arc<dyn HostHandler> = if hermetic {
+        hosts::Apart::of(made)
+    } else {
+        Arc::new(made())
+    };
     let (effect, operations) = if hermetic {
         (HERMETIC, HERMETIC_OPERATIONS)
     } else {

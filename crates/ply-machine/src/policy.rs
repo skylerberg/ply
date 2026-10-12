@@ -90,11 +90,7 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
             ops.extend(crate::hermetic_registrations());
             ops
         }
-        "tester" => {
-            let mut ops = crate::tester::Session::new().lent();
-            ops.extend(crate::tester::Session::hermetic().lent());
-            ops
-        }
+        "tester" => crate::tester::lent(),
         "claims" => crate::claims::lent(&declared("prover")),
         "hosts" => crate::hosts::lent(&declared("tcb")),
         "shipped" => crate::shipped::lent(),
