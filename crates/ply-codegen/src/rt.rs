@@ -174,12 +174,23 @@ impl Tables {
         }
         let o = obj(w);
         let parts: Vec<(Word, &Value)> = match v {
-            Value::Record(fields) => fields
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| unsafe { heap::counted(o, *i) })
-                .map(|(i, (_, part))| (unsafe { word_at(o, i) }, part))
-                .collect(),
+            // A `Float` held as its bits is no word of its own.
+            Value::Record(fields) => {
+                let shape = unsafe { (*o).layout };
+                let slots = self.layouts.shape_slots(shape);
+                let offsets = self.layouts.shape_offsets(shape);
+                fields
+                    .iter()
+                    .zip(slots.iter().zip(offsets.iter()))
+                    .filter_map(|((_, part), (slot, at))| match slot {
+                        heap::Slot::Word => Some((unsafe { word_at(o, *at) }, part)),
+                        heap::Slot::Record(_) => {
+                            Some((unsafe { heap::words(o).add(*at) } as Word, part))
+                        }
+                        heap::Slot::Float => None,
+                    })
+                    .collect()
+            }
             Value::Ctor { args, .. } => args
                 .iter()
                 .enumerate()
@@ -2500,7 +2511,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(ctx.heap.list_from(&items))
         }
         (Builtin::NumericBinary, [op, w, x, y])
-            if heap::is_imm(*op) && heap::is_imm(*w) && heap::is_imm(*x) && heap::is_imm(*y) =>
+            if heap::is_int(*op) && heap::is_int(*w) && heap::is_int(*x) && heap::is_int(*y) =>
         {
             narrow_binary(
                 heap::imm_value(*op),
@@ -2509,7 +2520,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::imm_value(*y),
             )
         }
-        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_imm(*x) && heap::is_imm(*y) => {
+        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_int(*x) && heap::is_int(*y) => {
             let (a, b) = (heap::imm_value(*x), heap::imm_value(*y));
             Some(heap::imm(if (a <= b) == (which == Builtin::Min) {
                 a
@@ -2904,29 +2915,37 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
             // Any other entry shape is the value builtins' to raise on.
-            let mut pairs = Vec::with_capacity(n);
-            for e in entries {
-                if heap::kind(e) != KIND_RECORD
-                    || tables.layouts.holds_floats(unsafe { (*obj(e)).layout })
-                {
-                    return None;
+            let mut pairs: Vec<(Word, Word)> = Vec::with_capacity(n);
+            let let_go = |pairs: Vec<(Word, Word)>| {
+                for (k, v) in pairs {
+                    heap::dec(k);
+                    heap::dec(v);
                 }
-                let shape = unsafe { (*obj(e)).layout };
-                let (Some(ka), Some(va)) = (
-                    tables.layouts.offset(shape, &key),
-                    tables.layouts.offset(shape, &value),
-                ) else {
+            };
+            for e in entries {
+                let layouts = &tables.layouts;
+                let at = (heap::kind(e) == KIND_RECORD)
+                    .then(|| {
+                        let shape = unsafe { (*obj(e)).layout };
+                        Some((
+                            layouts.offset(shape, &key)?,
+                            layouts.offset(shape, &value)?,
+                            shape,
+                        ))
+                    })
+                    .flatten();
+                let Some((ka, va, shape)) = at else {
+                    let_go(pairs);
                     return None;
                 };
-                let (k, v) = unsafe { (word_at(obj(e), ka), word_at(obj(e), va)) };
+                let k = heap::field_word(&mut ctx.heap, obj(e), ka, layouts.slot_at(shape, ka));
                 if !heap::native_key(k) {
+                    heap::dec(k);
+                    let_go(pairs);
                     return None;
                 }
+                let v = heap::field_word(&mut ctx.heap, obj(e), va, layouts.slot_at(shape, va));
                 pairs.push((k, v));
-            }
-            for (k, v) in &pairs {
-                heap::inc(*k);
-                heap::inc(*v);
             }
             // Entries in key order, each key once, are the tree's leaves as they stand.
             let ascending = pairs.windows(2).all(|w| {
@@ -4445,14 +4464,13 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
         ));
         return ctx.fail(d);
     };
-    if ctx.tables.layouts.shape_slots(shape)[at] == heap::Slot::Float {
-        let f = ctx
-            .heap
-            .boxed_float(f64::from_bits(unsafe { word_at(o, at) } as u64));
+    let slot = ctx.tables.layouts.slot_at(shape, at);
+    if slot != heap::Slot::Word {
+        let w = heap::field_word(&mut ctx.heap, o, at, slot);
         if own == 1 || own == 3 {
             heap::dec(base);
         }
-        return f;
+        return w;
     }
     let w = unsafe { word_at(o, at) };
     match own {
@@ -4497,11 +4515,19 @@ pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64
 }
 
 /// Whether a value is a record a pattern admits: of exactly `len` fields when `exact`. Reads.
-pub unsafe extern "C" fn rt_record_fits(_ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
+pub unsafe extern "C" fn rt_record_fits(ctx: *mut Ctx, value: i64, len: i64, exact: i64) -> i64 {
     if heap::kind(value) != KIND_RECORD {
         return 0;
     }
-    i64::from(exact == 0 || unsafe { (*obj(value)).len } as i64 == len)
+    let ctx = unsafe { &*ctx };
+    i64::from(
+        exact == 0
+            || ctx
+                .tables
+                .layouts
+                .shape_fields(unsafe { (*obj(value)).layout }) as i64
+                == len,
+    )
 }
 
 /// Whether a record holds the field a pattern names; a missing one fails the match. Reads.

@@ -209,7 +209,7 @@ fn weighed(h: &mut Heap, l: &Layouts, name: &str, weight: f64) -> Word {
         Symbol::new("name"),
         spelled(&Symbol::new("weight"), Slot::Float),
     ]);
-    let o = h.alloc(KIND_RECORD, MIXED, 2, shape);
+    let o = h.alloc(KIND_RECORD, MIXED | RAW, 2, shape);
     let s = h.str(name);
     unsafe {
         set_word(o, 0, s);
@@ -262,10 +262,158 @@ fn a_record_of_any_width_holds_every_float_as_its_bits() {
     let w = h.to_word(&l, &value);
     let o = obj(w);
     // Past 64 fields the bitmap after the words takes a second word.
-    assert_eq!(unsafe { (*o).flags }, MIXED);
+    assert_eq!(unsafe { (*o).flags }, MIXED | RAW);
     assert!((0..70).all(|i| unsafe { counted(o, i) } == (i % 2 == 1)));
     assert_eq!(Heap::to_value(&l, w), value);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), value);
     dec(w);
+}
+
+/// `{from: {x, y}, label, to: {x, y}}`, each point two `Float`s.
+fn segment(label: &str, x: f64) -> Value {
+    let point = |x: f64| record(vec![("x", Value::Float(x)), ("y", Value::Float(x + 1.0))]);
+    record(vec![
+        ("from", point(x)),
+        ("label", Value::str(label)),
+        ("to", point(x + 10.0)),
+    ])
+}
+
+#[test]
+fn a_record_holds_a_record_in_place_and_reads_as_the_value_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = segment("s", 0.5);
+    let w = h.to_word(&l, &value);
+    let o = obj(w);
+    let shape = unsafe { (*o).layout };
+    // `from` takes a header's two words and its own two, `label` the fifth, `to` the four after,
+    // and a word of bitmap after them says the fifth alone is counted.
+    assert_eq!(l.shape_words(shape), (9, 1));
+    assert_eq!(&l.shape_offsets(shape)[..], &[0, 4, 5]);
+    assert_eq!(unsafe { (*o).flags }, MIXED | RAW);
+    assert!((0..9).all(|i| unsafe { counted(o, i) } == (i == 4)));
+    assert_eq!(Heap::to_value(&l, w), value);
+    let same = h.to_word(&l, &segment("s", 0.5));
+    assert_eq!(cmp_words(&l, w, same), Ordering::Equal);
+    let later = h.to_word(&l, &segment("s", 0.75));
+    assert_eq!(cmp_words(&l, w, later), Ordering::Less);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), value);
+    assert_eq!(unsafe { (*obj(read)).layout }, shape);
+    dec(w);
+    dec(same);
+    dec(later);
+}
+
+#[test]
+fn a_record_held_in_place_is_counted_by_the_record_holding_it() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let label = h.str("held");
+    inc(label);
+    let inner = h.record(&l, &[(Symbol::new("label"), label)]);
+    let outer = h.record(
+        &l,
+        &[
+            (Symbol::new("count"), imm(1)),
+            (Symbol::new("inner"), inner),
+        ],
+    );
+    // The inner record was copied in and let go: the string is held by this test and by the copy.
+    assert_eq!(unsafe { (*obj(label)).rc }, 2);
+    let shape = unsafe { (*obj(outer)).layout };
+    let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
+    let held = field_word(&mut h, obj(outer), at, l.slot_at(shape, at));
+    // A read of it is the holder's own words, which the holder counts for, and an object a stack
+    // scan finds.
+    assert_eq!(unsafe { (*obj(outer)).rc }, 2);
+    assert!(h.is_object(held));
+    assert_eq!(
+        Heap::to_value(&l, held),
+        record(vec![("label", Value::str("held"))])
+    );
+    assert!(share(&[held]));
+    assert_ne!(unsafe { (*obj(outer)).rc } & SHARED, 0);
+    dec(outer);
+    assert_eq!(unsafe { (*obj(label)).rc } & !SHARED, 2);
+    // The last holder lets the string go once, through the copy.
+    dec(held);
+    assert_eq!(unsafe { (*obj(label)).rc } & !SHARED, 1);
+}
+
+#[test]
+fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let mut fields: Vec<(&str, Value)> = (0..1100)
+        .map(|i| {
+            let name: &'static str = Box::leak(format!("f{i:04}").into_boxed_str());
+            (name, Value::Int(i))
+        })
+        .collect();
+    fields.push(("inner", record(vec![("label", Value::str("deep"))])));
+    let value = record(fields);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
+    let inner = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    assert!(h.is_object(inner));
+    assert_eq!(Heap::to_value(&l, w), value);
+    dec(inner);
+    dec(w);
+}
+
+#[test]
+fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
+    let l = Layouts::of(
+        vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)],
+        &[],
+        false,
+    );
+    let mut h = Heap::new();
+    let value = segment("s", 0.5);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    assert_eq!(l.shape_words(shape), (3, 0));
+    assert!(
+        !l.shape_slots(shape)
+            .iter()
+            .any(|s| matches!(s, Slot::Record(_)))
+    );
+    assert_eq!(Heap::to_value(&l, w), value);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(unsafe { (*obj(read)).layout }, shape);
+    dec(w);
+}
+
+#[test]
+fn a_char_is_its_own_word_ordered_and_kept_as_the_char_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let chars = ['\0', 'a', 'z', 'é', '\u{10ffff}'];
+    let words: Vec<Word> = chars
+        .iter()
+        .map(|c| h.to_word(&l, &Value::Char(*c)))
+        .collect();
+    for (w, c) in words.iter().zip(&chars) {
+        assert!(is_imm(*w) && !is_int(*w), "{c:?} is held in its word");
+        assert_eq!(kind(*w), KIND_CHAR);
+        assert_eq!(Heap::to_value(&l, *w), Value::Char(*c));
+        assert_eq!(as_int(*w), None);
+    }
+    for (a, x) in words.iter().zip(&chars) {
+        for (b, y) in words.iter().zip(&chars) {
+            assert_eq!(cmp_words(&l, *a, *b), x.cmp(y), "{x:?} against {y:?}");
+        }
+    }
+    let text = Value::list(chars.iter().map(|c| Value::Char(*c)).collect());
+    let w = h.to_word(&l, &text);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), text);
+    let pair = record(vec![("c", Value::Char('q')), ("n", Value::Int(7))]);
+    let p = h.to_word(&l, &pair);
+    let (_into, read) = kept(&l, p);
+    assert_eq!(Heap::to_value(&l, read), pair);
 }

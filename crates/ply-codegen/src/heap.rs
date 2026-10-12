@@ -36,6 +36,8 @@ pub const KIND_MBRANCH: u8 = 14;
 pub const KIND_ARRAY: u8 = 15;
 /// A `Float`: one payload word, its bits.
 pub const KIND_FLOAT: u8 = 16;
+/// What [`kind`] answers for a `Char`'s word: no object has it.
+pub const KIND_CHAR: u8 = 17;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -56,8 +58,10 @@ pub const HEADER: usize = 16;
 
 /// A record or constructor none of whose fields holds a count: releasing it walks nothing.
 pub const FLAT: u8 = 1;
-/// A record holding both words it counts and a `Float`'s bits: a bitmap after its words says which.
+/// A record holding both words it counts and words it does not: a bitmap after its words says which.
 pub const MIXED: u8 = 2;
+/// A record holding a `Float`'s bits or a record in place: not every word of it is a value.
+pub const RAW: u8 = 4;
 
 /// `len`: payload words, byte count or list length; `layout`: shape, ctor index, capacity, arity
 /// or dropped list prefix; `flags`/`aux`: a `Bool`'s value, a list's tail length and capacity.
@@ -110,9 +114,35 @@ pub fn bool(b: bool) -> Word {
     }
 }
 
+/// Whether `w` is held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`).
+/// An object's address is a multiple of eight.
 #[inline]
 pub fn is_imm(w: Word) -> bool {
+    w & 7 != 0
+}
+
+/// Whether `w` is an `Int` held in the word.
+#[inline]
+pub fn is_int(w: Word) -> bool {
     w & 1 == 1
+}
+
+/// Whether `w` is a `Char` held in the word: its code point above the tag `010`.
+#[inline]
+pub fn is_char(w: Word) -> bool {
+    w & 7 == 2
+}
+
+/// A `Char`'s word.
+#[inline]
+pub fn char_word(c: char) -> Word {
+    (c as i64) << 3 | 2
+}
+
+/// The `Char` a `Char`'s word holds.
+#[inline]
+pub fn char_of(w: Word) -> char {
+    char::from_u32((w >> 3) as u32).unwrap_or('\u{fffd}')
 }
 
 /// Whether `v` fits the sixty-three bits an immediate carries.
@@ -309,30 +339,160 @@ pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
     }
 }
 
-/// How a record holds a field: a word, or a `Float`'s bits.
+/// How a record holds a field: a word, a `Float`'s bits, or a record of the shape named in place,
+/// its header and words inside the record's own.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Slot {
     Word,
     Float,
+    Record(u32),
 }
 
 /// What a field a record holds as a `Float`'s bits is spelled with in a shape: after its name, and
 /// below every byte a name holds, so a shape sorts as its names do.
 pub const FLOAT_SLOT: &str = "!f";
 
-/// A shape's field as its name and how it is held.
-pub fn slot_of(field: &Symbol) -> (Symbol, Slot) {
-    match field.as_str().strip_suffix(FLOAT_SLOT) {
-        Some(name) => (Symbol::new(name), Slot::Float),
-        None => (field.clone(), Slot::Word),
+/// What a field a record holds in place as a record is spelled with: after its name, and its shape's
+/// fields after that, between parentheses and parted by commas.
+pub const RECORD_SLOT: &str = "!r(";
+
+/// A field held as a word or a `Float`'s bits, as a shape spells it.
+pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
+    match slot {
+        Slot::Float => Symbol::new(format!("{}{FLOAT_SLOT}", name.as_str())),
+        _ => name.clone(),
     }
 }
 
-/// A field as a shape spells it.
-pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
+/// A field held in place as a record of fields `nested` spells, as a shape spells it.
+pub fn spelled_record(name: &Symbol, nested: &[Symbol]) -> Symbol {
+    let inner: Vec<&str> = nested.iter().map(Symbol::as_str).collect();
+    Symbol::new(format!(
+        "{}{RECORD_SLOT}{})",
+        name.as_str(),
+        inner.join(",")
+    ))
+}
+
+/// A nested shape's fields, parted at the commas outside parentheses.
+fn split_fields(s: &str) -> Vec<Symbol> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0usize, 0usize);
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(Symbol::new(&s[start..i]));
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !s.is_empty() {
+        out.push(Symbol::new(&s[start..]));
+    }
+    out
+}
+
+/// What a record's count holds where the record is held in place inside another: these two top
+/// bits set, and below them how many words before it the header of the record holding it starts.
+pub const EMBEDDED: u32 = 0xC000_0000;
+
+/// The record holding `o` in place, where `o` is held in place.
+#[inline]
+pub unsafe fn holder(o: *mut Obj) -> Option<*mut Obj> {
+    let rc = unsafe { (*o).rc };
+    (rc & EMBEDDED == EMBEDDED && rc != IMMORTAL)
+        .then(|| unsafe { (o as *mut Word).sub((rc & !EMBEDDED) as usize) as *mut Obj })
+}
+
+/// The object whose count stands for `o`'s: `o`, or the outermost record holding it in place.
+#[inline]
+pub unsafe fn counted_by(mut o: *mut Obj) -> *mut Obj {
+    while let Some(h) = unsafe { holder(o) } {
+        o = h;
+    }
+    o
+}
+
+/// A record's flags: flat when it counts none of its words, mixed when it counts some and holds a
+/// tail saying which, raw when it holds words that are not values.
+pub fn record_flags(width: usize, counted: &[usize], tail: usize, raw: bool) -> u8 {
+    let raw = if raw { RAW } else { 0 };
+    if width > 0 && counted.is_empty() {
+        FLAT | raw
+    } else if tail > 0 {
+        MIXED | raw
+    } else {
+        raw
+    }
+}
+
+/// Writes the bitmap of a mixed record's `tail` words after its `width`, a bit set for each
+/// word it counts.
+unsafe fn write_tail(o: *mut Obj, width: usize, tail: usize, counted: &[usize]) {
+    for t in 0..tail {
+        let bits = counted
+            .iter()
+            .filter(|i| **i / 64 == t)
+            .fold(0u64, |acc, i| acc | 1 << (i % 64));
+        unsafe { set_word(o, width + t, bits as i64) };
+    }
+}
+
+/// Copies record `w`, of shape `shape`, into `o` at word `at`, header and all, holding what it
+/// counts once more, and lets `w` go. The tail its shape reserves is written whether or not `w`
+/// holds one: a flat record built where its fields' types were known has none.
+unsafe fn embed(layouts: &Layouts, o: *mut Obj, at: usize, shape: u32, w: Word) {
+    unsafe {
+        let src = obj(w);
+        let dst = words(o).add(at) as *mut Obj;
+        let (flags, len) = ((*src).flags, (*src).len as usize);
+        std::ptr::copy_nonoverlapping(words(src), words(dst), len);
+        let (_, tail) = layouts.shape_words(shape);
+        if tail > 0 {
+            if flags & MIXED != 0 {
+                std::ptr::copy_nonoverlapping(words(src).add(len), words(dst).add(len), tail);
+            } else {
+                write_tail(dst, len, tail, &layouts.shape_counted(shape));
+            }
+        }
+        for i in 0..len {
+            if counted(src, i) {
+                inc(word_at(src, i));
+            }
+        }
+        std::ptr::write(
+            dst,
+            Obj {
+                rc: EMBEDDED | (HEADER / 8 + at) as u32,
+                kind: KIND_RECORD,
+                flags,
+                aux: 0,
+                len: len as u32,
+                layout: shape,
+            },
+        );
+        dec(w);
+    }
+}
+
+/// The word a record holds field `at`, of `slot`, as, held once more: a `Float` boxed, and a record
+/// held in place as the address of its header there.
+pub fn field_word(heap: &mut Heap, o: *mut Obj, at: usize, slot: Slot) -> Word {
+    let w = unsafe { word_at(o, at) };
     match slot {
-        Slot::Word => name.clone(),
-        Slot::Float => Symbol::new(format!("{}{FLOAT_SLOT}", name.as_str())),
+        Slot::Float => heap.boxed_float(f64::from_bits(w as u64)),
+        Slot::Record(_) => {
+            let inner = unsafe { words(o).add(at) } as Word;
+            inc(inner);
+            inner
+        }
+        Slot::Word => {
+            inc(w);
+            w
+        }
     }
 }
 
@@ -369,29 +529,83 @@ pub unsafe fn str_of<'a>(o: *mut Obj) -> &'a str {
     unsafe { std::str::from_utf8_unchecked(bytes_of(o)) }
 }
 
-/// Record shapes: a shape is its sorted fields, each spelled with how the record holds it, and a
-/// field's offset is its position among them.
+/// Record shapes: a shape is its sorted fields, each spelled with how the record holds it. A field
+/// takes a word, or a record held in place takes its header's two words, its own and its tail's.
 #[derive(Default)]
 pub struct Shapes {
     ids: HashMap<Arc<[Symbol]>, u32>,
     spelled: Vec<Arc<[Symbol]>>,
     names: Vec<Arc<[Symbol]>>,
     slots: Vec<Arc<[Slot]>>,
+    /// Where each field's words start.
+    offsets: Vec<Arc<[usize]>>,
+    /// The words a record of the shape holds, its tail apart.
+    widths: Vec<usize>,
+    /// The words after them a mixed record of the shape holds its bitmap in.
+    tails: Vec<usize>,
+    /// Which of its words a record of the shape counts.
+    counted: Vec<Arc<[usize]>>,
 }
 
 impl Shapes {
+    /// A shape held in place by another is interned first, so it has the lower id.
     fn intern(&mut self, mut fields: Vec<Symbol>) -> u32 {
         fields.sort();
         if let Some(id) = self.ids.get(fields.as_slice()) {
             return *id;
         }
+        let mut names = Vec::with_capacity(fields.len());
+        let mut slots = Vec::with_capacity(fields.len());
+        for field in &fields {
+            let s = field.as_str();
+            match s.find(RECORD_SLOT).filter(|_| s.ends_with(')')) {
+                Some(open) => {
+                    let inner = &s[open + RECORD_SLOT.len()..s.len() - 1];
+                    let nested = self.intern(split_fields(inner));
+                    names.push(Symbol::new(&s[..open]));
+                    slots.push(Slot::Record(nested));
+                }
+                None => match s.strip_suffix(FLOAT_SLOT) {
+                    Some(name) => {
+                        names.push(Symbol::new(name));
+                        slots.push(Slot::Float);
+                    }
+                    None => {
+                        names.push(field.clone());
+                        slots.push(Slot::Word);
+                    }
+                },
+            }
+        }
+        let mut offsets = Vec::with_capacity(slots.len());
+        let mut counted = Vec::new();
+        let mut at = 0;
+        for slot in &slots {
+            offsets.push(at);
+            match slot {
+                Slot::Word => {
+                    counted.push(at);
+                    at += 1;
+                }
+                Slot::Float => at += 1,
+                Slot::Record(n) => {
+                    let n = *n as usize;
+                    counted.extend(self.counted[n].iter().map(|c| at + 2 + c));
+                    at += 2 + self.widths[n] + self.tails[n];
+                }
+            }
+        }
+        let mixed = !counted.is_empty() && counted.len() < at;
         let id = self.spelled.len() as u32;
-        let (names, slots): (Vec<Symbol>, Vec<Slot>) = fields.iter().map(slot_of).unzip();
         let rc: Arc<[Symbol]> = Arc::from(fields);
         self.ids.insert(rc.clone(), id);
         self.spelled.push(rc);
         self.names.push(Arc::from(names));
         self.slots.push(Arc::from(slots));
+        self.offsets.push(Arc::from(offsets));
+        self.widths.push(at);
+        self.tails.push(if mixed { tail_words(at) } else { 0 });
+        self.counted.push(Arc::from(counted));
         id
     }
 }
@@ -419,6 +633,10 @@ pub struct Layouts {
     /// Per constructor, the arithmetic its type's module states, by [`ply_eval::instances`]'
     /// roles; empty for a unit that states none.
     numeric: Box<[[Stated; 5]]>,
+    /// Whether a record the runtime lays out holds a record of a record type in place, as the
+    /// unit's code reads one; a unit emitted by a `ply` that holds every record by its word, as a
+    /// bootstrap's first builder is, reads it as a word.
+    pub in_place: bool,
 }
 
 /// A function a type's module states its values go through, as a unit holds it.
@@ -434,10 +652,12 @@ pub enum Stated {
 
 /// No field at that index.
 const NO_FIELD: u16 = u16::MAX;
+/// A field past the offsets a row holds, which is searched for.
+const SEARCHED: u16 = u16::MAX - 1;
 
 impl Layouts {
     pub fn new(ctors: Vec<(Symbol, usize)>) -> Layouts {
-        Layouts::of(ctors, &[])
+        Layouts::of(ctors, &[], true)
     }
 
     /// The fields of a `{key, value}` entry.
@@ -446,7 +666,7 @@ impl Layouts {
     }
 
     /// With `shapes` interned first, in order, so each one's id is its position.
-    pub fn of(ctors: Vec<(Symbol, usize)>, shapes: &[Vec<Symbol>]) -> Layouts {
+    pub fn of(ctors: Vec<(Symbol, usize)>, shapes: &[Vec<Symbol>], in_place: bool) -> Layouts {
         let ctor_ids: HashMap<Symbol, u32> = ctors
             .iter()
             .enumerate()
@@ -475,6 +695,7 @@ impl Layouts {
             width: 0,
             stated: Box::default(),
             numeric: Box::default(),
+            in_place,
         }
     }
 
@@ -518,17 +739,16 @@ impl Layouts {
         for (index, name) in names.iter().enumerate() {
             indices.entry(name).or_default().push(index);
         }
-        let shapes = &self
-            .shapes
-            .get_mut()
-            .unwrap_or_else(|e| e.into_inner())
-            .names;
+        let interned = self.shapes.get_mut().unwrap_or_else(|e| e.into_inner());
         let width = names.len();
-        let mut rows = vec![NO_FIELD; shapes.len() * width].into_boxed_slice();
-        for (row, shape) in shapes.iter().enumerate() {
+        let mut rows = vec![NO_FIELD; interned.names.len() * width].into_boxed_slice();
+        for (row, shape) in interned.names.iter().enumerate() {
             for (at, field) in shape.iter().enumerate() {
                 for &index in indices.get(field).map_or(&[][..], Vec::as_slice) {
-                    rows[row * width + index] = at as u16;
+                    rows[row * width + index] = u16::try_from(interned.offsets[row][at])
+                        .ok()
+                        .filter(|o| *o < SEARCHED)
+                        .unwrap_or(SEARCHED);
                 }
             }
         }
@@ -540,8 +760,9 @@ impl Layouts {
     #[inline]
     pub fn offset_by_index(&self, shape: u32, index: usize, names: &[Symbol]) -> Option<usize> {
         match self.rows.get(shape as usize * self.width + index) {
-            Some(&at) => (at != NO_FIELD).then_some(at as usize),
-            None => self.offset(shape, &names[index]),
+            Some(&NO_FIELD) => None,
+            Some(&at) if at != SEARCHED => Some(at as usize),
+            _ => self.offset(shape, &names[index]),
         }
     }
 
@@ -580,18 +801,46 @@ impl Layouts {
         self.read().slots[shape as usize].clone()
     }
 
-    /// Whether a shape's records hold a `Float` as its bits.
-    pub fn holds_floats(&self, shape: u32) -> bool {
-        self.read().slots[shape as usize].contains(&Slot::Float)
+    /// Whether a shape's records hold anything but words: a `Float`'s bits, or a record in place.
+    pub fn holds_raw(&self, shape: u32) -> bool {
+        self.read().slots[shape as usize]
+            .iter()
+            .any(|s| *s != Slot::Word)
     }
 
     /// How many fields a shape has.
-    pub fn shape_width(&self, shape: u32) -> usize {
+    pub fn shape_fields(&self, shape: u32) -> usize {
         self.read().names[shape as usize].len()
     }
 
+    /// Where each of a shape's fields starts among its records' words.
+    pub fn shape_offsets(&self, shape: u32) -> Arc<[usize]> {
+        self.read().offsets[shape as usize].clone()
+    }
+
+    /// The words a record of the shape holds, and the tail after them a mixed one's bitmap takes.
+    pub fn shape_words(&self, shape: u32) -> (usize, usize) {
+        let r = self.read();
+        (r.widths[shape as usize], r.tails[shape as usize])
+    }
+
+    /// Which of its words a record of the shape counts.
+    pub fn shape_counted(&self, shape: u32) -> Arc<[usize]> {
+        self.read().counted[shape as usize].clone()
+    }
+
+    /// How a record of `shape` holds the field starting at word `at`.
+    pub fn slot_at(&self, shape: u32, at: usize) -> Slot {
+        let r = self.read();
+        let i = r.offsets[shape as usize].partition_point(|o| *o < at);
+        r.slots[shape as usize][i]
+    }
+
+    /// Where field `name` of `shape` starts among a record's words.
     pub fn offset(&self, shape: u32, name: &Symbol) -> Option<usize> {
-        self.read().names[shape as usize].binary_search(name).ok()
+        let r = self.read();
+        let at = r.names[shape as usize].binary_search(name).ok()?;
+        Some(r.offsets[shape as usize][at])
     }
 }
 
@@ -873,13 +1122,26 @@ impl Heap {
         p
     }
 
-    /// Whether `w` is a live object this heap allocated in the running entry.
+    /// Whether `w` is a live object this heap allocated in the running entry, or a record held in
+    /// place inside one.
     pub fn is_object(&self, w: Word) -> bool {
         if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
             return false;
         }
-        if !self.blocks.holds(w as usize) {
-            return false;
+        let address = w as usize;
+        if !self.blocks.holds(address) {
+            if !self.blocks.within(address) {
+                return false;
+            }
+            let o = address as *const Obj;
+            let (rc, kind) = unsafe { ((*o).rc, (*o).kind) };
+            let back = 8 * (rc & !EMBEDDED) as usize;
+            return rc & EMBEDDED == EMBEDDED
+                && rc != IMMORTAL
+                && kind == KIND_RECORD
+                && back > 0
+                && back <= address
+                && self.is_object((address - back) as Word);
         }
         let o = w as *const Obj;
         unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 }
@@ -896,49 +1158,57 @@ impl Heap {
         self.raw_alloc(kind, flags, len, layout, bytes)
     }
 
-    /// A record of `fields`, each named as its shape spells it and in its order: each `Float`
-    /// held as its bits, and each other word as the record's.
+    /// A record of `fields`, which it takes, in the order of the names: laid out as a record of
+    /// their type is wherever it is made, each `Float` held as its bits and each record in place.
     pub fn record(&mut self, layouts: &Layouts, fields: &[(Symbol, Word)]) -> Word {
         let mut spelled_fields = Vec::with_capacity(fields.len());
         let mut words = Vec::with_capacity(fields.len());
         for (name, w) in fields {
-            if kind(*w) == KIND_FLOAT {
-                spelled_fields.push(spelled(name, Slot::Float));
-                words.push((unsafe { word_at(obj(*w), 0) }, Slot::Float));
-                dec(*w);
-            } else {
-                spelled_fields.push(name.clone());
-                words.push((*w, Slot::Word));
+            match kind(*w) {
+                KIND_FLOAT => {
+                    spelled_fields.push(spelled(name, Slot::Float));
+                    words.push((unsafe { word_at(obj(*w), 0) }, Slot::Float));
+                    dec(*w);
+                }
+                KIND_RECORD if layouts.in_place => {
+                    let shape = unsafe { (*obj(*w)).layout };
+                    spelled_fields.push(spelled_record(name, &layouts.shape_spelled(shape)));
+                    words.push((*w, Slot::Record(shape)));
+                }
+                _ => {
+                    spelled_fields.push(name.clone());
+                    words.push((*w, Slot::Word));
+                }
             }
         }
         let shape = layouts.shape(spelled_fields);
-        self.record_of(shape, &words)
+        self.record_of(layouts, shape, &words)
     }
 
-    /// A record of `shape` holding `words`, each as its slot says, flagged for what it counts.
-    fn record_of(&mut self, shape: u32, words: &[(Word, Slot)]) -> Word {
-        let n = words.len();
-        let floats = words.iter().filter(|(_, s)| *s == Slot::Float).count();
-        let flags = if floats == 0 {
-            0
-        } else if floats == n {
-            FLAT
-        } else {
-            MIXED
-        };
-        let o = self.alloc(KIND_RECORD, flags, n as u32, shape);
+    /// A record of `shape` holding `words`, which it takes, each as its slot says.
+    fn record_of(&mut self, layouts: &Layouts, shape: u32, words: &[(Word, Slot)]) -> Word {
+        let (width, tail) = layouts.shape_words(shape);
+        let counted = layouts.shape_counted(shape);
+        let o = self.alloc(
+            KIND_RECORD,
+            record_flags(
+                width,
+                &counted,
+                tail,
+                words.iter().any(|(_, s)| *s != Slot::Word),
+            ),
+            width as u32,
+            shape,
+        );
+        let offsets = layouts.shape_offsets(shape);
         unsafe {
-            for (i, (w, _)) in words.iter().enumerate() {
-                set_word(o, i, *w);
-            }
-            if flags == MIXED {
-                for t in 0..tail_words(n) {
-                    let bits = (t * 64..n.min(t * 64 + 64))
-                        .filter(|i| words[*i].1 == Slot::Word)
-                        .fold(0u64, |acc, i| acc | 1 << (i % 64));
-                    set_word(o, n + t, bits as i64);
+            for ((w, slot), at) in words.iter().zip(offsets.iter()) {
+                match slot {
+                    Slot::Record(inner) => embed(layouts, o, *at, *inner, *w),
+                    _ => set_word(o, *at, *w),
                 }
             }
+            write_tail(o, width, tail, &counted);
         }
         o as Word
     }
@@ -1133,28 +1403,18 @@ impl Heap {
             Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
             Value::Bool(b) => bool(*b),
             Value::Float(f) => self.boxed_float(*f),
+            Value::Char(c) => char_word(*c),
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
             Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
             // Each `Float` is held as its bits, as a record of its type is wherever it is made.
             // `Fields` iterates sorted, which is the layout's order.
             Value::Record(fields) => {
-                let mut spelled_fields = Vec::with_capacity(fields.len());
-                let mut words = Vec::with_capacity(fields.len());
-                for (name, value) in fields.iter() {
-                    match value {
-                        Value::Float(f) => {
-                            spelled_fields.push(spelled(name, Slot::Float));
-                            words.push((ply_eval::float::bits(*f) as i64, Slot::Float));
-                        }
-                        _ => {
-                            spelled_fields.push(name.clone());
-                            words.push((self.to_word(layouts, value), Slot::Word));
-                        }
-                    }
-                }
-                let shape = layouts.shape(spelled_fields);
-                self.record_of(shape, &words)
+                let words: Vec<(Symbol, Word)> = fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), self.to_word(layouts, value)))
+                    .collect();
+                self.record(layouts, &words)
             }
             Value::Ctor { name, args } => match layouts.ctor_index(name) {
                 Some(index) => {
@@ -1248,6 +1508,9 @@ impl Heap {
         ctors: &CtorCarries,
         walked: &mut Walked,
     ) -> Value {
+        if is_char(w) {
+            return Value::Char(char_of(w));
+        }
         if is_imm(w) {
             return read_int(imm_value(w), carry, walked);
         }
@@ -1264,15 +1527,24 @@ impl Heap {
                 KIND_RECORD => {
                     let names = layouts.shape_names((*o).layout);
                     let slots = layouts.shape_slots((*o).layout);
+                    let offsets = layouts.shape_offsets((*o).layout);
                     let fields: Vec<(Symbol, Value)> = names
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
                             let field = carry.field(name);
+                            let at = offsets[i];
                             let value = match slots[i] {
-                                Slot::Float => Value::Float(f64::from_bits(word_at(o, i) as u64)),
+                                Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
+                                Slot::Record(_) => Heap::read(
+                                    layouts,
+                                    words(o).add(at) as Word,
+                                    &field,
+                                    ctors,
+                                    walked,
+                                ),
                                 Slot::Word => {
-                                    Heap::read(layouts, word_at(o, i), &field, ctors, walked)
+                                    Heap::read(layouts, word_at(o, at), &field, ctors, walked)
                                 }
                             };
                             (name.clone(), value)
@@ -1433,14 +1705,25 @@ pub fn dec(w: Word) {
     unsafe { release(o, heap) }
 }
 
-/// [`inc`] of an object [`share`] marked.
+/// [`inc`] of an object [`share`] marked, or of a record held in place, which its holder counts.
 pub fn inc_shared(w: Word) {
-    count(obj(w)).fetch_add(1, Relaxed);
+    let o = obj(w);
+    match unsafe { holder(o) } {
+        Some(h) => inc(h as Word),
+        None => {
+            count(o).fetch_add(1, Relaxed);
+        }
+    }
 }
 
-/// [`dec`] of an object [`share`] marked: the holder that takes the count to none dismantles it.
+/// [`dec`] of an object [`share`] marked, the holder that takes the count to none dismantling it,
+/// or of a record held in place, which its holder counts.
 pub fn dec_shared(w: Word) {
     let o = obj(w);
+    if let Some(h) = unsafe { holder(o) } {
+        dec(h as Word);
+        return;
+    }
     if count(o).fetch_sub(1, Release) == SHARED | 1 {
         std::sync::atomic::fence(Acquire);
         let heap = CURRENT.with(|c| c.get());
@@ -1457,7 +1740,7 @@ pub fn share(words: &[Word]) -> bool {
         if is_imm(w) || w == 0 {
             continue;
         }
-        let o = obj(w);
+        let o = unsafe { counted_by(obj(w)) };
         let rc = count(o).load(Relaxed);
         // Immortal, or shared already, and so judged when it was marked.
         if rc >= SHARED {
@@ -1620,7 +1903,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
             if is_imm(c) || c == 0 {
                 continue;
             }
-            let co = obj(c);
+            let co = counted_by(obj(c));
             let rc = count(co).load(Relaxed);
             if rc == IMMORTAL {
                 continue;
@@ -1658,7 +1941,7 @@ pub fn mark_immortal(w: Word) {
         if is_imm(w) {
             continue;
         }
-        let o = obj(w);
+        let o = unsafe { counted_by(obj(w)) };
         unsafe {
             if (*o).rc == IMMORTAL {
                 continue;
@@ -1808,8 +2091,10 @@ pub fn is_unique(w: Word) -> bool {
 
 #[inline]
 pub fn kind(w: Word) -> u8 {
-    if is_imm(w) {
+    if is_int(w) {
         KIND_INT
+    } else if is_char(w) {
+        KIND_CHAR
     } else if w == 0 {
         // Zero is "no word here"; reading its header would fault at address 4.
         KIND_DEAD
@@ -1821,8 +2106,11 @@ pub fn kind(w: Word) -> u8 {
 /// The `Int` a word carries, if it is one.
 #[inline]
 pub fn as_int(w: Word) -> Option<i64> {
-    if is_imm(w) {
+    if is_int(w) {
         return Some(imm_value(w));
+    }
+    if is_char(w) {
+        return None;
     }
     if w == 0 {
         return None;
@@ -1854,6 +2142,9 @@ pub fn as_bool(w: Word) -> Option<bool> {
 
 /// `Value`'s rank of a variant (its `discriminant`), which orders values of different kinds.
 fn rank(w: Word) -> u8 {
+    if is_char(w) {
+        return 16;
+    }
     if is_imm(w) {
         return 2;
     }
@@ -1922,6 +2213,10 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     if ka != kb {
         return Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b));
     }
+    // A `Char`'s word is its code point shifted above a tag, so words order as code points do.
+    if ka == KIND_CHAR {
+        return a.cmp(&b);
+    }
     unsafe {
         match ka {
             KIND_UNIT => Ordering::Equal,
@@ -1964,11 +2259,22 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                 }
                 xs.len().cmp(&ys.len())
             }
-            KIND_RECORD
-                if layouts.holds_floats((*obj(a)).layout)
-                    || layouts.holds_floats((*obj(b)).layout) =>
-            {
-                Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b))
+            KIND_RECORD if ((*obj(a)).flags | (*obj(b)).flags) & RAW != 0 => {
+                let (x, y) = (obj(a), obj(b));
+                let (sx, sy) = ((*x).layout, (*y).layout);
+                let (names_x, names_y) = (layouts.shape_names(sx), layouts.shape_names(sy));
+                let (slots_x, slots_y) = (layouts.shape_slots(sx), layouts.shape_slots(sy));
+                let (at_x, at_y) = (layouts.shape_offsets(sx), layouts.shape_offsets(sy));
+                let (n, m) = (names_x.len(), names_y.len());
+                for i in 0..n.min(m) {
+                    let c = names_x[i].cmp(&names_y[i]).then_with(|| {
+                        cmp_fields(layouts, (x, slots_x[i], at_x[i]), (y, slots_y[i], at_y[i]))
+                    });
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
             }
             KIND_RECORD => {
                 let (x, y) = (obj(a), obj(b));
@@ -2016,6 +2322,29 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     }
 }
 
+/// Two fields of records, each as its record holds it.
+unsafe fn cmp_fields(
+    layouts: &Layouts,
+    (x, sx, ax): (*mut Obj, Slot, usize),
+    (y, sy, ay): (*mut Obj, Slot, usize),
+) -> Ordering {
+    let word = |o: *mut Obj, slot: Slot, at: usize| unsafe {
+        match slot {
+            Slot::Word => Some(word_at(o, at)),
+            Slot::Record(_) => Some(words(o).add(at) as Word),
+            Slot::Float => None,
+        }
+    };
+    let value = |o: *mut Obj, slot: Slot, at: usize| match word(o, slot, at) {
+        Some(w) => Heap::to_value(layouts, w),
+        None => Value::Float(f64::from_bits(unsafe { word_at(o, at) } as u64)),
+    };
+    match (word(x, sx, ax), word(y, sy, ay)) {
+        (Some(p), Some(q)) => cmp_words(layouts, p, q),
+        _ => value(x, sx, ax).cmp(&value(y, sy, ay)),
+    }
+}
+
 /// Whether a word can be a native map's key: ordered in place and canonical.
 pub fn native_key(w: Word) -> bool {
     if is_imm(w) {
@@ -2030,8 +2359,7 @@ pub fn native_key(w: Word) -> bool {
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
             ),
             KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                ((*o).kind != KIND_RECORD || (*o).flags & MIXED == 0)
-                    && (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
+                (0..(*o).len as usize).all(|i| !counted(o, i) || native_key(word_at(o, i)))
             }
             KIND_LIST => list::children(o).all(native_key),
             KIND_MAP => {
