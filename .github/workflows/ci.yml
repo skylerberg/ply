@@ -16,7 +16,8 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**"]
   # Nightly, and on demand: every job starts from nothing an earlier run kept (`PLY_CI_COLD`), so no
-  # kept answer goes unchecked, and a fourteenth of the edit sweep runs, the whole of it in two weeks.
+  # kept answer goes unchecked, and the modules of the CLI's suite no partition takes run: a fourteenth
+  # of the edit sweep, the whole of it in two weeks, and the rest whole.
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -53,8 +54,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      sweep: ${{ steps.sweep.outputs.sweep }}
-      swept: ${{ steps.sweep.outputs.swept }}
+      nightly: ${{ steps.nightly.outputs.nightly }}
+      nights: ${{ steps.nightly.outputs.nights }}
       shards: ${{ steps.cut.outputs.shards }}
       nextest: ${{ steps.cut.outputs.nextest }}
     steps:
@@ -114,18 +115,19 @@ jobs:
       - name: Run the ucontext probe
         run: ./probes/ucontext/run.sh
 
-      # Nightly, the day's cases of the edit sweep in shards; a pull request runs none, `edit_gate`
-      # holding it to every kind of edit in its lanes.
-      - name: List the edit sweep's jobs
-        id: sweep
+      # Nightly, the day's cases of the edit sweep in shards and the suite's other nightly modules; a
+      # pull request runs none, `edit_gate` and `phases` holding it to every kind of edit and to the
+      # mined programs in its lanes.
+      - name: List the nightly jobs
+        id: nightly
         env:
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          sweep=$(.github/ci-shards.sh sweep-matrix "$EVENT")
-          echo "sweep=$sweep" >> "$GITHUB_OUTPUT"
-          echo "swept=$(jq -r '.include | length > 0' <<< "$sweep")" >> "$GITHUB_OUTPUT"
-          jq -r '.include[].name' <<< "$sweep"
+          nightly=$(.github/ci-shards.sh nightly-matrix "$EVENT")
+          echo "nightly=$nightly" >> "$GITHUB_OUTPUT"
+          echo "nights=$(jq -r '.include | length > 0' <<< "$nightly")" >> "$GITHUB_OUTPUT"
+          jq -r '.include[].name' <<< "$nightly"
 
   clippy:
     name: Lint the Rust with clippy and rustfmt
@@ -275,14 +277,14 @@ jobs:
           fail-on-cache-miss: true
 
   build-ply:
-    name: Bootstrap ply
+    name: Bootstrap ply, unless main bootstrapped this toolchain
     needs: [plan]
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     outputs:
-      # The artifact holding the C cache and stages the run's jobs read, which a pull request whose
-      # cache this job did not find under its sources' key hands them; empty otherwise.
-      stage: ${{ steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push' && steps.stage-name.outputs.name || '' }}
+      # The artifact holding the C cache and stages the run's jobs read, which a pull request that
+      # bootstrapped a toolchain no cache held a stage of hands them; empty otherwise.
+      stage: ${{ steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push' && steps.stage-name.outputs.name || '' }}
       partitions: ${{ steps.selected.outputs.partitions }}
       lanes: ${{ steps.selected.outputs.lanes }}
       corpus: ${{ steps.selected.outputs.corpus }}
@@ -315,35 +317,69 @@ jobs:
       - name: Install tcc
         run: .github/ci-tcc.sh install
 
-      # A tree whose sources have not moved has every answer and object of the bootstrap from an
-      # earlier run; against any other tree the parts of the C that did not move are already
-      # compiled, which is most of them.
+      # What `ply bootstrap` reads of this tree: the `ply` and the stage below are kept under it.
+      - uses: ./.github/actions/toolchain-key
+        id: toolchain
+      # The `ply` main bootstrapped of this toolchain, and whether the stage that bootstrap left is
+      # still kept: with both, this job bootstraps nothing, and the run's jobs restore that stage
+      # themselves. A change that moves no source the bootstrap reads finds both.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
+        id: built
+        with:
+          path: target/release/ply
+          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.built.outputs.cache-hit == 'true'
+        id: stage-kept
+        with:
+          path: |
+            /tmp/ply-c-cache
+            /tmp/ply-c-stage
+          key: ply-c-stage-sources-${{ steps.toolchain.outputs.key }}
+          lookup-only: true
+      - name: Decide whether to bootstrap
+        id: boots
+        if: steps.built.outputs.cache-hit != 'true' || steps.stage-kept.outputs.cache-hit != 'true'
+        run: echo "yes=true" >> "$GITHUB_OUTPUT"
+
+      # A toolchain that has not moved has every answer and object of the bootstrap from an earlier
+      # run; against any other the parts of the C that did not move are already compiled, which is
+      # most of them.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.boots.outputs.yes == 'true' && env.PLY_CI_COLD != 'true'
         id: stage-cache
         with:
           path: |
             /tmp/ply-c-cache
             /tmp/ply-c-stage
-          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}
+          key: ply-c-stage-sources-${{ steps.toolchain.outputs.key }}
           restore-keys: ply-c-stage-
       # Before this job's first `ply`, so what it reads is newer than this and the rest is not.
       - name: Mark when this job's `ply` runs start
         run: touch /tmp/ply-c-used.mark
-      - name: Name the stage of these sources
+      - name: Name the stage of this toolchain
         id: stage-name
-        run: echo "name=ply-stage-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}" >> "$GITHUB_OUTPUT"
+        run: echo "name=ply-stage-${{ steps.toolchain.outputs.key }}" >> "$GITHUB_OUTPUT"
       # After the mark, so the cut below keeps it.
-      - name: Download a stage another branch built from these sources
+      - name: Download a stage another branch built from this toolchain
         id: shared
-        if: steps.stage-cache.outputs.cache-hit != 'true' && env.PLY_CI_COLD != 'true'
+        if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && env.PLY_CI_COLD != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: .github/ci-warm.sh shared "${{ steps.stage-name.outputs.name }}"
 
       - uses: ./.github/actions/bootstrap
+        if: steps.boots.outputs.yes == 'true'
         with:
           out: target/release/ply
+      # From main alone, as the stage is: a pull request's cache reaches no other run, and a `ply`
+      # kept without its stage would leave every job after to compile the toolchain's C again.
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.built.outputs.cache-hit != 'true' && github.event_name == 'push'
+        with:
+          path: target/release/ply
+          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
 
       # What earlier runs kept of each Ply run: the passes its tests took and the answer it kept.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -367,27 +403,27 @@ jobs:
           .github/ci-corpus.sh select "$cut" | tee -a "$GITHUB_OUTPUT"
       # Every job restores what this one saves, so it saves what this job's `ply`s read and wrote.
       - name: Cut the stage to what this job used
-        if: steps.stage-cache.outputs.cache-hit != 'true'
+        if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true'
         run: .github/ci-warm.sh used /tmp/ply-c-used.mark
       # What those `ply`s compiled and answered, for the rest of the run and the runs after. On main
-      # it is saved under the tree's own key, which a later run restores. A pull request's cache
+      # it is saved under the toolchain's key, which a later run restores. A pull request's cache
       # reaches no other run, so it hands the stage over as an artifact, which its own jobs read and
-      # which a run of these sources on any branch, main's after the merge most of all, finds too
+      # which a run of this toolchain on any branch, main's after the merge most of all, finds too
       # (`ci-warm.sh shared`).
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name == 'push'
+        if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name == 'push'
         with:
           path: |
             /tmp/ply-c-cache
             /tmp/ply-c-stage
-          key: ply-c-stage-sources-${{ hashFiles('crates/*/src/**', 'crates/*/Cargo.toml', 'Cargo.lock', 'crates/*/ply/**', 'crates/ply-compiler/prelude.ply') }}
+          key: ply-c-stage-sources-${{ steps.toolchain.outputs.key }}
       # Never a reason for a red run: a job that finds no stage builds what it needs.
       - name: Pack the stage for the run's jobs
-        if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
+        if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
         continue-on-error: true
         run: .github/ci-warm.sh pack /tmp/stage.tar.zst
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
+        if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push'
         continue-on-error: true
         with:
           name: ${{ steps.stage-name.outputs.name }}
@@ -866,9 +902,23 @@ jobs:
             /tmp/ply-c-stage
           key: ply-c-macos-${{ github.run_id }}
           restore-keys: ply-c-macos-
+      # The `ply` a run on main bootstrapped here of this toolchain is the one this run would build.
+      - uses: ./.github/actions/toolchain-key
+        id: toolchain
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: built
+        with:
+          path: target/release/ply
+          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
       - uses: ./.github/actions/bootstrap
+        if: steps.built.outputs.cache-hit != 'true'
         with:
           out: target/release/ply
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.built.outputs.cache-hit != 'true'
+        with:
+          path: target/release/ply
+          key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
       # A `Float` answers the same bits on every target: the float programs Linux checked, here too.
       - name: Hold its floats to the digests the language suite pins
         run: |
@@ -989,7 +1039,7 @@ jobs:
             --no-fail-fast --no-tests=pass --success-output immediate -E "$filter"
 
   # The Ply runs that would starve a partition, on runners of their own (`ci-shards.sh corpus-matrix`):
-  # the CLI suite's `cli-` runs that take every core, and the proof runs, each one load of what it
+  # the compiler's own tests, which take every core, and the proof runs, each one load of what it
   # proves. Only the ones `build-ply` found a run no kept answer stands for start.
   corpus:
     name: Run ${{ matrix.id }} on a runner of its own
@@ -1111,18 +1161,21 @@ jobs:
           path: /tmp/ply-c-corpus
           key: ply-c-corpus-${{ matrix.id }}-${{ steps.sources.outputs.digest }}
 
-  # The one check that says a run is green.
-  # Every module of the tree edited the ways `edit_gate` edits its fixtures, and checked warm and cold
-  # after each (`edit_sweep`): nightly, the day's cases in shards.
-  edit-sweep:
-    name: Sweep edits, cases ${{ matrix.name }}
+  # The modules of the CLI's suite no partition takes (`ci-shards.sh nightly-matrix`), nightly: every
+  # module of the tree edited the ways `edit_gate` edits its fixtures and checked warm and cold after
+  # each (`edit_sweep`), the day's cases in shards; and in one job the compiler's phases over the
+  # toolchain's whole trees, the audits of the repository's own code for definitions nothing reaches
+  # and functions written twice, and the library's database client against a postgres of the test's
+  # own, which the runner's image holds.
+  nightly:
+    name: Run ${{ matrix.name }}, nightly
     needs: [plan, build-ply]
-    if: needs.plan.outputs.swept == 'true'
+    if: needs.plan.outputs.nights == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.sweep) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.nightly) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1130,17 +1183,11 @@ jobs:
       - uses: ./.github/actions/suite
         with:
           stage: ${{ needs.build-ply.outputs.stage }}
-      - name: Run this job's cases of the edit sweep
+      # Unquoted: the job's modules and what its `ply test` is also given are words of one string.
+      - name: Run this job's modules of the CLI's suite
         env:
-          SHARD: ${{ matrix.shard }}
-          FILTER: ${{ matrix.filter }}
-        run: |
-          set -euo pipefail
-          if [ -n "$FILTER" ]; then
-            .github/ci-corpus.sh sweep --filter "$FILTER" --shard "$SHARD"
-          else
-            .github/ci-corpus.sh sweep --shard "$SHARD"
-          fi
+          ARGS: ${{ matrix.args }}
+        run: .github/ci-corpus.sh nightly $ARGS
 
   # The editor grammar is a second reading of the language beside `crates/ply-compiler/ply`, so it
   # gets its own check: regenerate the committed parser, hold the corpus trees to the grammar, and
@@ -1174,10 +1221,11 @@ jobs:
       - name: Parse every Ply module in the tree
         run: editors/tree-sitter-ply/scripts/parse-corpus.sh
 
+  # The one check that says a run is green.
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, edit-sweep, treesitter]
+    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, nightly, treesitter]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -1189,12 +1237,12 @@ jobs:
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
           # `build-ply` starts no partition or corpus job whose runs what earlier runs kept answers,
-          # the edit sweep runs only where it has cases, and a Rust a run passed runs no Rust test.
+          # the nightly jobs run only at night, and a Rust a run passed runs no Rust test.
           not_ok=$(jq -r --arg passed "$PASSED" '
             to_entries[]
             | select(.value.result != "success")
             | select((.value.result == "skipped"
-                and (.key == "lanes" or .key == "corpus" or .key == "edit-sweep")) | not)
+                and (.key == "lanes" or .key == "corpus" or .key == "nightly")) | not)
             | select(($passed == "true" and .value.result == "skipped"
                 and (.key == "nextest" or .key == "hosts")) | not)
             | "\(.key) = \(.value.result)"

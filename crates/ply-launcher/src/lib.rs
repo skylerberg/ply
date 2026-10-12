@@ -139,17 +139,29 @@ pub fn stamps() -> String {
     )
 }
 
-/// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
-/// name, and the stamps and definitions beside them. Each file lands by a rename and the marker
-/// last, so a run that finds the marker finds it whole, and reads nothing of the pack for it.
-pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
-    let stamps = stamps();
+/// The directory a stage keeps its shipped modules in, named for all it holds: the stamps, the
+/// definitions, and every shipped file by `files`, their digest. The program a stage is named for
+/// reaches only some of them, so a `ply` rebuilt over an edit to another lays out its own.
+pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Digest) -> String {
     let mut laid = blake3::Hasher::new();
     laid.update(stamps.as_bytes());
     laid.update(&[0]);
     laid.update(definitions.as_bytes());
-    let dir = ply_codegen::c::stage::stage_dir(stage)
-        .join(format!("shipped-{}", &laid.finalize().to_hex()[..16]));
+    laid.update(&[0]);
+    laid.update(files);
+    format!("shipped-{}", &laid.finalize().to_hex()[..16])
+}
+
+/// The shipped modules as files, `<dotted name>.ply` each, the data files they embed below them by
+/// name, and the stamps and definitions beside them. Each file lands by a rename and the marker
+/// last, so a run that finds the marker finds it whole, and reads no file of the pack for it.
+pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
+    let stamps = stamps();
+    let dir = ply_codegen::c::stage::stage_dir(stage).join(shipped_dir_name(
+        &stamps,
+        definitions,
+        &ply_machine::shipped_modules::digest(),
+    ));
     if dir.join(SHIPPED_MARKER).exists() {
         ply_codegen::c::sweep::used(&ply_codegen::c::stage::stage_dir(stage));
         return Ok(dir);

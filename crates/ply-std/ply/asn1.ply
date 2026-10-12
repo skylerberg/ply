@@ -39,8 +39,9 @@ import std.bytes (bytes_of_hex, hex_of, is_digit, repeat, scan, strip_leading_ze
                   u64_be, xor_byte)
 import std.date
 import std.date (DateTime, OffsetDateTime)
-import std.laws (agrees, round_trip)
+import std.laws (round_trip)
 import std.list (all, concat, is_sorted, sort)
+import std.gen
 import std.oid
 import std.oid (Oid)
 import std.result (result_ok)
@@ -1147,7 +1148,7 @@ fn height(v: Value) -> Int =
     _ -> 0,
   }
 
-/// Whether `t` is a day and a time of day `std.date` makes, which a law's draw of its
+/// Whether `t` is a day and a time of day `std.date` makes, which a test's draw of its
 /// constructors need not be.
 fn in_calendar(t: OffsetDateTime) -> Bool =
   match t {
@@ -1182,109 +1183,83 @@ fn altered(data: Bytes, at: Int, octet: Int) -> Bytes / {abort.raise} =
     ])
   }
 
-law "a value that writes reads back as itself"
-  forall (v: Value) where writable(v) {
-    decode(write(v), height(v)) == Ok(v)
+/// An object identifier of any arcs, whether or not it is one that writes.
+fn oids() -> gen::Gen<Oid> = gen::map(gen::list(gen::any_int()), |arcs: List<Int>| Oid(arcs))
+
+/// A `Value` as a test draws one.
+fn values_at(depth: Int) -> gen::Gen<Value> =
+  if depth <= 0 {
+    gen::one_of([
+      gen::map(gen::bool(), |f0: Bool| Boolean(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Integer(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Enumerated(f0)),
+      gen::map(bits_drawn(), |f0: Bits| BitString(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| OctetString(f0)),
+      gen::constant(Null),
+      gen::map(oids(), |f0: Oid| ObjectId(f0)),
+      gen::map2(string_kinds(), gen::text(), |f0: StringKind, f1: String| Text(f0, f1)),
+      gen::map(date::offset_date_times(), |f0: OffsetDateTime| UtcTime(f0)),
+      gen::map(date::offset_date_times(), |f0: OffsetDateTime| GeneralizedTime(f0)),
+      gen::map2(tags(), gen::bytes(), |f0: Tag, f1: Bytes| Primitive(f0, f1)),
+    ])
+  } else {
+    gen::one_of([
+      gen::map(gen::bool(), |f0: Bool| Boolean(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Integer(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Enumerated(f0)),
+      gen::map(bits_drawn(), |f0: Bits| BitString(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| OctetString(f0)),
+      gen::constant(Null),
+      gen::map(oids(), |f0: Oid| ObjectId(f0)),
+      gen::map2(string_kinds(), gen::text(), |f0: StringKind, f1: String| Text(f0, f1)),
+      gen::map(date::offset_date_times(), |f0: OffsetDateTime| UtcTime(f0)),
+      gen::map(date::offset_date_times(), |f0: OffsetDateTime| GeneralizedTime(f0)),
+      gen::map(gen::list_of(values_at(depth - 1), 3), |f0: List<Value>| Sequence(f0)),
+      gen::map(gen::list_of(values_at(depth - 1), 3), |f0: List<Value>| Set(f0)),
+      gen::map2(tags(), gen::list_of(values_at(depth - 1), 3), |f0: Tag, f1: List<Value>|
+        Constructed(f0, f1)),
+      gen::map2(tags(), gen::bytes(), |f0: Tag, f1: Bytes| Primitive(f0, f1)),
+    ])
   }
 
-law "bytes that read are the bytes their value writes" forall (data: Bytes) { rewritten(data) }
+fn values() -> gen::Gen<Value> = gen::sized(|size: Int| values_at(min(max(size / 16, 0), 3)))
 
-law "a written value with one octet changed is refused or is another value's encoding"
-  forall (v: Value, at: Int, octet: Int) where writable(v) {
-    rewritten(altered(write(v), at, octet))
-  }
+/// A `Bits` as a test draws one.
+fn bits_drawn() -> gen::Gen<Bits> =
+  gen::map2(gen::any_int(), gen::bytes(), |unused: Int, bytes: Bytes|
+    { unused: unused, bytes: bytes })
 
-law "what the builders write is one value's encoding"
-  forall (flag: Bool, n: Int, octets: Bytes, text: String, numbers: List<Int>) {
-    let der = sequence([
-      boolean(flag),
-      int(n),
-      integer(octets),
-      unsigned(octets),
-      enumerated(n),
-      octet_string(octets),
-      string(Utf8String, text),
-      named_bits(map(numbers, |position: Int| position & 63)),
-      set_of(map(numbers, int)),
-      explicit(context(n & 1023), null()),
-    ]);
-    match decode(der, 2) { Ok(v) -> encode(v) == Ok(der), Err(_) -> false }
-  }
+/// A `StringKind` as a test draws one.
+fn string_kinds() -> gen::Gen<StringKind> =
+  gen::elements([
+    Utf8String,
+    NumericString,
+    PrintableString,
+    Ia5String,
+    VisibleString,
+    UniversalString,
+    BmpString,
+  ])
 
-/// An instant a law draws, at UTC: `days` brought round into the `span` days from the day `first`,
-/// and `nanos` nanoseconds into that day, brought round into it.
-fn drawn(first: Int, span: Int, days: Int, nanos: Int) -> Option<OffsetDateTime> / {abort.raise} =
-  match ((
-      date::of_unix_days(first + (days % span + span) % span),
-      date::time_of_nanos((nanos % 86400000000000 + 86400000000000) % 86400000000000),
-    )) {
-    (Some(on), Some(clock)) -> Some(date::utc(date::at(on, clock))),
-    _ -> None,
-  }
+/// A `Tag` as a test draws one.
+fn tags() -> gen::Gen<Tag> =
+  gen::map2(classes(), gen::any_int(), |class: Class, number: Int| { class: class, number: number })
 
-/// Any instant of the calendar's ten thousand years.
-fn any_instant(days: Int, nanos: Int) -> Option<OffsetDateTime> / {abort.raise} =
-  drawn(date::unix_days(date::earliest()), 3652425, days, nanos)
+/// A `Class` as a test draws one.
+fn classes() -> gen::Gen<Class> = gen::elements([Universal, Application, Context, Private])
 
-law "an instant reads back from its GeneralizedTime, which is written as UTC reads it"
-  forall (days: Int, nanos: Int, minutes: Int) {
-    match any_instant(days, nanos) {
-      Some(t) ->
-        decode_with(generalized_time(t), 0, read_generalized_time) == Ok(t)
-          && (match date::in_offset(t, minutes % 1440) {
-            Some(held) -> generalized_time(held) == generalized_time(t),
-            None -> true,
-          }),
-      None -> false,
-    }
-  }
+test "a value that writes reads back as itself" {
+  gen::check(values(), |v: Value|
+    if writable(v) { decode(write(v), height(v)) == Ok(v) } else { true })
+}
 
-law "a second of 1950 to 2049 reads back from its UTCTime, which a certificate writes of it"
-  forall (days: Int, second: Int) {
-    match drawn(-7305, 36525, days, second % 86400 * 1000000000) {
-      Some(t) ->
-        decode_with(utc_time(t), 0, read_utc_time) == Ok(t) && time(t) == utc_time(t)
-          && decode_with(time(t), 0, read_time) == Ok(t),
-      None -> false,
-    }
-  }
-
-law "a certificate's time is its second's UTCTime where it has one, and reads back either way"
-  forall (days: Int, second: Int) {
-    match any_instant(days, second % 86400 * 1000000000) {
-      Some(t) ->
-        decode_with(time(t), 0, read_time) == Ok(t)
-          && time(t) == (if utc_time_text(t) == None { generalized_time(t) } else { utc_time(t) }),
-      None -> false,
-    }
-  }
-
-law "an Int reads back from the INTEGER written for it" =
-  round_trip(int, |der: Bytes| result_ok(decode_with(der, 0, read_int)))
+test "a written value with one octet changed is refused or is another value's encoding" {
+  gen::check3(values(), gen::any_int(), gen::any_int(), |v: Value, at: Int, octet: Int|
+    if writable(v) { rewritten(altered(write(v), at, octet)) } else { true })
+}
 
 law "a Bool reads back from the BOOLEAN written for it" =
   round_trip(boolean, |der: Bytes| result_ok(decode_with(der, 0, read_boolean)))
-
-law "octets read back from the OCTET STRING written for them" =
-  round_trip(octet_string, |der: Bytes| result_ok(decode_with(der, 0, read_octet_string)))
-
-law "an Int reads back from its content" = round_trip(integer_of_int, int_of_integer)
-
-law "an Int's content is the same written as a BigInt" =
-  agrees(integer_of_int, |n: Int| integer_of_big_int(bigint::of_int(n)))
-
-law "an INTEGER of any size reads back from the BigInt it names"
-  forall (octets: Bytes) {
-    integer_of_big_int(big_int_of_integer(minimal(octets))) == minimal(octets)
-  }
-
-law "reading and writing are linear in the elements"
-  forall (n: Int) where n > 0 cost n {
-    let der = sequence(
-      map(range(0, n), |i: Int| set_of([int(i), string(PrintableString, "x"), null()])),
-    );
-    match decode(der, 2) { Ok(v) -> encode(v) == Ok(der), Err(_) -> false }
-  }
 
 // --- Tests ----------------------------------------------------------------------
 

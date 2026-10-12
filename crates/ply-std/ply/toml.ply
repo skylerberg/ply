@@ -47,7 +47,7 @@ import std.float (infinity, is_infinite, is_nan, nan, neg_infinity)
 import std.json (escaped_byte)
 import std.gen
 import std.gen (Gen)
-import std.laws (agrees, round_trip)
+import std.laws (agrees)
 import std.list (all, any, concat, drop, reverse, take)
 import std.option (option_map, option_unwrap_or)
 import std.place (DecodeError, Index, Key, Place, Step, decode_error, decode_fields, decode_items)
@@ -1942,7 +1942,7 @@ pub fn encode_bytes<a>(x: a, codec: TomlCodec<a>) -> Bytes / {abort.raise} =
 pub fn encode_string<a>(x: a, codec: TomlCodec<a>) -> String / {abort.raise} =
   to_string((codec.encode)(x))
 
-// --- Laws -------------------------------------------------------------------
+// --- Properties -------------------------------------------------------------
 
 /// Any count as a day of the calendar, which has 3,652,425 of them.
 fn some_date(n: Int) -> date::Date = {
@@ -1964,8 +1964,6 @@ fn some_instant(days: Int, nanos: Int, minutes: Int) -> date::OffsetDateTime = {
   let east = (if minutes >= 0 { minutes % 2879 } else { (minutes + 1) % 2879 + 2878 }) - 1439;
   option_unwrap_or(date::at_offset(reading, east), date::utc(reading))
 }
-
-gen for Toml by tomls
 
 /// What a sampled claim draws a value from: every kind of value, nested three deep, a date and
 /// a time through `std.date`'s makers and a table through `table`, so each is one a reader
@@ -2040,133 +2038,53 @@ fn drawn_text() -> Gen<String> =
     |parts: List<String>| join(parts, ""),
   )
 
-/// More than a value a law draws reaches.
+/// More than a value a test draws reaches.
 fn wide() -> Limits = { bytes: 1073741824, depth: 512 }
 
-law "a document reads back from what was written of it" =
-  agrees(|entries: List<Entry>| parse(to_bytes(table(entries)), wide()), |entries: List<Entry>|
-    Ok(table(entries)))
+/// An `Entry` as a test draws one.
+fn entries() -> gen::Gen<Entry> =
+  gen::map2(gen::text(), tomls(), |key: String, value: Toml| { key: key, value: value })
 
-law "a value reads back from its inline text" =
-  round_trip(|t: Toml| "v = " ++ inline(t), |text: String|
-    match parse_string(text, wide()) { Ok(read) -> get(read, "v"), Err(_) -> None })
+test "a document reads back from what was written of it" {
+  gen::check(gen::list(entries()), |x: List<Entry>|
+    agrees(
+      |entries: List<Entry>| parse(to_bytes(table(entries)), wide()),
+      |entries: List<Entry>| Ok(table(entries)),
+      x,
+    ))
+}
 
-law "a table is the same table whatever the order of its keys"
-  forall (entries: List<Entry>) {
-    match table(entries) { Table(held) -> Table(reverse(held)) == table(entries), _ -> false }
-  }
-
-law "a document keeps the bytes it was read from, and means what a reader reads of them"
-  forall (entries: List<Entry>) {
+test "a document keeps the bytes it was read from, and means what a reader reads of them" {
+  gen::check(gen::list(entries()), |entries: List<Entry>| {
     let text = to_bytes(table(entries));
     match parse_document(text, wide()) {
       Ok(d) -> source(d) == text && Ok(value(d)) == parse(text, wide()),
       Err(_) -> false,
     }
-  }
+  })
+}
 
-law "a key set in a document is set in its value, and removed from both"
-  forall (entries: List<Entry>, key: String, v: Toml) {
-    let before = table(entries);
-    let path = [Key(key)];
-    match parse_document(to_bytes(before), wide()) {
-      Err(_) -> false,
-      Ok(d) -> match try { set(d, path, v) } {
+test "a key set in a document is set in its value, and removed from both" {
+  gen::check3(
+    gen::list(entries()),
+    gen::text(),
+    tomls(),
+    |entries: List<Entry>, key: String, v: Toml| {
+      let before = table(entries);
+      let path = [Key(key)];
+      match parse_document(to_bytes(before), wide()) {
         Err(_) -> false,
-        Ok(changed) -> {
-          let taken = try { value(remove(changed, path)) };
-          Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
+        Ok(d) -> match try { set(d, path, v) } {
+          Err(_) -> false,
+          Ok(changed) -> {
+            let taken = try { value(remove(changed, path)) };
+            Some(value(changed)) == put(before, path, v) && taken == Ok(without(before, path))
+          },
         },
-      },
-    }
-  }
-
-fn pairs_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(
-        "key-" ++ int_to_string(i) ++ " = \"the value " ++ int_to_string(i) ++ "\"\n",
-      )),
+      }
+    },
   )
-
-fn rows_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(
-        "[[package]]\nname = \"p" ++ int_to_string(i)
-          ++ "\"\nrequires = [\"a\", 'b', 1.5, 2026-10-05]\nat.x = { y = "
-          ++ int_to_string(i)
-          ++ " }\n\n",
-      )),
-  )
-
-fn tables_text(n: Int) -> Bytes =
-  bytes_concat_all(
-    map(range(0, n), |i: Int|
-      bytes_of_string(
-        "[servers.s" ++ int_to_string(i) ++ "]\nport = " ++ int_to_string(i) ++ "\n",
-      )),
-  )
-
-fn array_text(n: Int) -> Bytes =
-  bytes_concat_all([
-    b"v = [",
-    bytes_concat_all(map(range(0, n), |i: Int| bytes_of_string(int_to_string(i) ++ ", # one\n"))),
-    b"]\n",
-  ])
-
-fn escapes_text(n: Int) -> Bytes =
-  bytes_concat_all([
-    b"v = \"\"\"\n",
-    bytes_concat_all(map(range(0, n), |_: Int| b"a \\t line \\u00e9 \"quoted\" \\\n   \n")),
-    b"\"\"\"\n",
-  ])
-
-law "reading the keys of one table takes steps in proportion to them"
-  forall (n: Int) where n > 0 cost n {
-    parse(pairs_text(n), wide())
-  }
-
-law "reading an array of tables takes steps in proportion to its tables"
-  forall (n: Int) where n > 0 cost n {
-    parse(rows_text(n), wide())
-  }
-
-law "reading tables under one table takes steps in proportion to them"
-  forall (n: Int) where n > 0 cost n {
-    parse(tables_text(n), wide())
-  }
-
-law "reading an array takes steps in proportion to its values and comments"
-  forall (n: Int) where n > 0 cost n {
-    parse(array_text(n), wide())
-  }
-
-law "reading a string takes steps in proportion to its escapes"
-  forall (n: Int) where n > 0 cost n {
-    parse(escapes_text(n), wide())
-  }
-
-law "writing a document takes steps in proportion to what it holds"
-  forall (n: Int) where n > 0 cost n {
-    to_bytes(
-      Table(
-        map(range(0, n), |i: Int|
-          {
-            key: int_to_string(i),
-            value: Table([{ key: "at", value: Array([Integer(i), String("a\tb\\c")]) }]),
-          }),
-      ),
-    )
-  }
-
-law "setting a key takes steps in proportion to the document"
-  forall (n: Int) where n > 0 cost n {
-    match parse_document(rows_text(n), wide()) {
-      Ok(d) -> try { set(d, [Key("package"), Index(n / 2), Key("name")], String("renamed")) },
-      Err(e) -> Err(e),
-    }
-  }
+}
 
 // --- Tests: values ----------------------------------------------------------
 

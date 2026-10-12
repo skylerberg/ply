@@ -130,6 +130,24 @@ impl Pack {
         *hasher.finalize().as_bytes()
     }
 
+    /// The files at or below `roots`: each one's path and what its bytes digest to, so it moves
+    /// when one of them is added, dropped or edited, and with nothing outside them.
+    pub fn digest_below(&self, roots: &[&str]) -> Digest {
+        let mut hasher = blake3::Hasher::new();
+        let below = |path: &str| {
+            roots.iter().any(|root| {
+                path.strip_prefix(root)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        };
+        for entry in self.entries.iter().filter(|entry| below(&entry.path)) {
+            hasher.update(&(entry.path.len() as u64).to_le_bytes());
+            hasher.update(entry.path.as_bytes());
+            hasher.update(&entry.digest);
+        }
+        *hasher.finalize().as_bytes()
+    }
+
     fn entry(&self, path: &str) -> Option<&Entry> {
         self.entries
             .binary_search_by(|entry| entry.path.as_str().cmp(path))

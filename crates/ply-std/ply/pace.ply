@@ -1,0 +1,187 @@
+//! Whether the steps a computation takes keep pace with a bound as its size doubles.
+//!
+//! `paced` runs a body at the sizes 1, 2, 4 … 4096, counting its steps as `metered` does, and
+//! asserts they grow no faster than the bound over the last two spans between the sizes it read,
+//! so constant factors and lower-order terms do not count. It is a test's evidence about the sizes
+//! it ran and no proof: a bound on every call is a `cost` clause, which `ply prove` proves or
+//! refuses.
+//!
+//! This module imports no other, so that any module may import it to test itself.
+
+/// One size a body was run at: the steps it took there, and its bound there.
+pub type Measure = { size: Int, steps: Int, bound: Int }
+
+/// Every power of two up to 4096.
+pub fn sizes() -> List<Int> = map(range(0, 13), |k: Int| 1 << k)
+
+/// A size that took more steps than this is the last one run, so a test of a steep bound stays
+/// quick: its pace is read off the sizes below.
+pub fn size_limit() -> Int = 200000
+
+/// Two spans are what a verdict reads, so fewer sizes than this decide nothing.
+pub fn least_sizes() -> Int = 3
+
+/// Whether the steps outgrew the bound: they grew past the slack over both of the last two spans.
+/// One span alone is not enough, since a body can change strategies at one size. Fewer than
+/// `least_sizes` measures outgrow nothing.
+pub fn outgrown(measures: List<Measure>) -> Bool = {
+  let n = len(measures);
+  let at = |i: Int|
+    match list_at(measures, i) { Some(m) -> m, None -> { size: 0, steps: 0, bound: 0 } };
+  n >= least_sizes() && outgrew(at(n - 3), at(n - 2)) && outgrew(at(n - 2), at(n - 1))
+}
+
+/// 2^0.05: how much faster than the bound a doubling may grow the steps.
+fn slack() -> Float = 1.0352649238413776
+
+fn outgrew(was: Measure, now: Measure) -> Bool = {
+  let allowed = fold(range(0, doublings(was.size, now.size)), 1.0, |a: Float, _i: Int| a * slack());
+  float_of_int(now.steps) * float_of_int(was.bound)
+    > float_of_int(was.steps) * float_of_int(now.bound) * allowed
+}
+
+/// A positive `Int` doubled 63 times is past any other.
+fn doublings(from: Int, to: Int) -> Int =
+  fold(range(0, 64), { at: from, n: 0 }, |s: { at: Int, n: Int }, _round: Int|
+    if s.at <= 0 || s.at >= to { s } else { { at: s.at * 2, n: s.n + 1 } }).n
+
+/// The steps `body` takes at each of `sizes` from `least` up whose bound is positive, in order,
+/// ending after the first that takes more than `size_limit` steps.
+pub fn measured<a | e>(
+  least: Int,
+  bound: (Int) -> Int / {abort.raise},
+  body: (Int) -> a / e,
+) -> List<Measure> / {abort.raise | e} =
+  fold(
+    filter(sizes(), |n: Int| n >= least),
+    { measures: [], spent: false },
+    |acc: { measures: List<Measure>, spent: Bool }, n: Int|
+      if acc.spent { acc } else {
+        let allowed = bound(n);
+        if allowed <= 0 { acc } else {
+          let steps = metered(|| body(n)).steps;
+          {
+            measures: push(acc.measures, { size: n, steps: steps, bound: allowed }),
+            spent: steps > size_limit(),
+          }
+        }
+      },
+  ).measures
+
+fn lines(measures: List<Measure>) -> String =
+  fold(measures, "", |acc: String, m: Measure|
+    (if acc == "" { "" } else { acc ++ "; " }) ++ "at " ++ int_to_string(m.size) ++ ": "
+      ++ int_to_string(m.steps)
+      ++ " steps, bound "
+      ++ int_to_string(m.bound))
+
+/// Asserts the steps `body` takes grow no faster than `bound` does as the size doubles from 1 to
+/// 4096, give or take a twentieth of a doubling over each of the last two spans read. A size whose
+/// bound is not positive is not run. The test fails where the steps outgrew the bound over both
+/// spans, and where fewer than three sizes were read, naming every size with its steps and bound.
+pub fn paced<a | e>(
+  bound: (Int) -> Int / {abort.raise},
+  body: (Int) -> a / e,
+) -> Unit / {abort.raise | e} = paced_from(1, bound, body)
+
+/// `paced` over the sizes from `least` up.
+pub fn paced_from<a | e>(
+  least: Int,
+  bound: (Int) -> Int / {abort.raise},
+  body: (Int) -> a / e,
+) -> Unit / {abort.raise | e} = held(measured(least, bound, body))
+
+fn held(measures: List<Measure>) -> Unit / {abort.raise} =
+  if len(measures) < least_sizes() {
+    panic(
+      "too few sizes to read a pace from, which takes " ++ int_to_string(least_sizes()) ++ ": "
+        ++ lines(measures),
+    )
+  } else if outgrown(measures) { panic("the steps outgrew the bound: " ++ lines(measures)) }
+  else { () }
+
+// --- Tests ------------------------------------------------------------------
+
+fn measured_by(steps: (Int) -> Int, bound: (Int) -> Int) -> List<Measure> =
+  map(sizes(), |n: Int| { size: n, steps: steps(n), bound: bound(n) })
+
+fn ilog2(n: Int) -> Int =
+  fold(range(0, 63), 0, |k: Int, i: Int| if n >> i + 1 > 0 { i + 1 } else { k })
+
+fn failure(run: () -> Unit / {abort.raise}) -> Option<String> =
+  handle { run() } with { abort.raise(message) -> Some(message), return _done -> None }
+
+fn total(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + x)
+
+fn pairs(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, x: Int| a + total(xs) * x)
+
+test "the sizes are the powers of two up to 4096" {
+  assert_eq(len(sizes()), 13);
+  assert_eq(list_at(sizes(), 0), Some(1));
+  assert_eq(list_at(sizes(), 12), Some(4096))
+}
+
+test "a linear count under a linear bound holds, whatever its constants" {
+  assert(!outgrown(measured_by(|n: Int| 5 * n + 1000, |n: Int| n)));
+  assert(!outgrown(measured_by(|n: Int| 3 * n, |n: Int| n)));
+  // Growing more slowly than the bound is within it.
+  assert(!outgrown(measured_by(|n: Int| 7, |n: Int| n)))
+}
+
+test "a count growing faster than its bound is outgrown, and one matching it is not" {
+  assert(outgrown(measured_by(|n: Int| n * n, |n: Int| n)));
+  assert(!outgrown(measured_by(|n: Int| 2 * n * n + n, |n: Int| n * n)));
+  assert(outgrown(measured_by(|n: Int| n * ilog2(n) + n, |n: Int| n)));
+  assert(
+    !outgrown(
+      filter(measured_by(|n: Int| n * ilog2(n) + n, |n: Int| n * ilog2(n)), |m: Measure|
+        m.bound > 0),
+    ),
+  );
+  // A constant bound is outgrown by anything that grows.
+  assert(outgrown(measured_by(|n: Int| n, |n: Int| 1)))
+}
+
+test "only the last two spans decide, so a body that changes strategy at one size still holds" {
+  // Quadratic until 64, then linear: the tail is what the bound is about.
+  assert(!outgrown(measured_by(|n: Int| if n <= 64 { n * n } else { 64 * n }, |n: Int| n)));
+  // One span past the slack is not two.
+  assert(!outgrown(measured_by(|n: Int| if n < 4096 { n } else { 3 * n }, |n: Int| n)))
+}
+
+test "a span over a skipped size allows its doublings, and too few sizes decide nothing" {
+  let skipping = [
+    { size: 1, steps: 1, bound: 1 },
+    { size: 4, steps: 4, bound: 4 },
+    { size: 16, steps: 16, bound: 16 },
+  ];
+  assert(!outgrown(skipping));
+  assert(outgrown(map(skipping, |m: Measure| { ..m, steps: m.size * m.size })));
+  assert(!outgrown([{ size: 1, steps: 1, bound: 1 }, { size: 2, steps: 100, bound: 1 }]))
+}
+
+test "a body is run at each size from the least whose bound is positive" {
+  let read = measured(2, |n: Int| if n == 8 { 0 } else { n }, |n: Int| total(range(0, n)));
+  assert_eq(map(read, |m: Measure| m.size), [2, 4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]);
+  // The fold's two calls, `total`'s, the body's, and the one that enters it.
+  assert_eq(list_at(read, 0), Some({ size: 2, steps: 5, bound: 2 }))
+}
+
+test "a body that keeps pace passes, and one that outgrows its bound fails naming its sizes" {
+  assert_eq(failure(|| paced(|n: Int| n, |n: Int| total(range(0, n)))), None);
+  assert_eq(failure(|| paced(|n: Int| n * n, |n: Int| pairs(range(0, n)))), None);
+  let outgrew = failure(|| paced(|n: Int| n, |n: Int| pairs(range(0, n))));
+  assert(match outgrew {
+    // A steep body stops at the first size past the limit, which is what keeps this quick.
+    Some(message) ->
+      string_starts_with(message, "the steps outgrew the bound: at 1: ")
+        && !string_contains(message, "; at 4096: "),
+    None -> false,
+  });
+  let few = failure(|| paced_from(2048, |n: Int| n, |n: Int| total(range(0, n))));
+  assert(match few {
+    Some(message) ->
+      string_starts_with(message, "too few sizes to read a pace from, which takes 3: "),
+    None -> false,
+  })
+}

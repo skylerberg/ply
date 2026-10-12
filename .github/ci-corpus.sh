@@ -22,9 +22,10 @@
 #   runs it stopped and the ones it never started, and the steps after it still keep what the runs
 #   wrote, so a re-run starts from there rather than cold.
 #   ci-corpus.sh run ID [ARG...]       one run, with ARGs added to its `ply test` or `ply prove`
-#   ci-corpus.sh sweep [ARG...]        the edit sweep (`edit_sweep` of the CLI's suite) with the suite's
-#                                      grants: the cases its `--filter`s name, or else, with ARGs such as
-#                                      `--shard K/N` added, every case
+#   ci-corpus.sh nightly [MODULE...] [ARG...]
+#       the modules of the CLI's suite no partition runs (`ci-shards.sh`'s CLI_NIGHTLY), every MODULE
+#       in one `ply test` with the suite's grants and ARGs such as `--shard K/N` or a case's
+#       `--filter` added
 #   ci-corpus.sh select [CUT]
 #       the jobs a run has to start, as `KEY=VALUE` lines for the workflow's outputs: `partitions`
 #       and `corpus`, the matrices of the partitions and of the runs alone holding a run no
@@ -392,7 +393,7 @@ run_modules() {
 # Nothing an earlier run kept answers a proof, so a selecting run always has one to run. STOPPED when
 # the deadline ended it.
 run_proofs() {
-  local timings=$1 status=0 out all cached unattempted spent started wall
+  local timings=$1 status=0 out all cached spent started wall
   shift
   ((!selecting)) || return 1
   out=$(mktemp)
@@ -407,9 +408,7 @@ run_proofs() {
   spent=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  # Only a claim that held is filed, so an unattempted one is discharged again by every later run.
-  unattempted=$(jq '.summary.unattempted // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, $unattempted unattempted, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
+  echo "proved: $all claims, $cached from the cache, the rest discharged in $((spent / 1000))s of the $((wall / 1000))s the prove took"
   [[ -z $timings ]] || printf 'cached\tproofs\t%s\n' "$cached" >> "$timings"
   if [ "$all" -eq 0 ]; then
     echo "corpus run proofs proved no claim" >&2
@@ -456,13 +455,13 @@ package_proofs() {
   rm -f "$out"
 }
 
-# What a red proof run said: each claim that does not hold, how and where, and a refused run's
+# What a red proof run said: each claim nothing proved, how and where, and a refused run's
 # diagnostics.
 disproved() {
   jq -r '
-    (.obligations[]? | select(.outcome | IN("refuted", "outgrown", "vacuous", "defect"))
+    (.obligations[]? | select(.outcome != "proved")
       | "FAILED \(.owner) \(.label): \(.outcome)\(if .location then " at \(.location)" else "" end)",
-        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome, .tier) | tojson)"),
+        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome) | tojson)"),
     (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
   ' "$1" 2>/dev/null || cat "$1"
 }
@@ -755,27 +754,23 @@ case "${1:-}" in
     : > "$durations"
     run_one "" "${2:?a corpus entry}" "${@:3}"
     ;;
-  sweep)
+  nightly)
     : > "$durations"
     out=$(mktemp)
     status=0
-    # Filters are alternatives, so one naming the whole module beside a case's would run every case.
-    # A part of a module's cases may hold none of them.
-    named=0
-    parted=0
+    # The modules, each a filter, up to the first of what `ply test` is also given.
+    args=()
+    given=0
     for arg in "${@:2}"; do
-      [[ $arg == --filter* ]] && named=1
-      [[ $arg == --shard* ]] && parted=1
+      [[ $arg == -* ]] && given=1
+      if ((given)); then args+=("$arg"); else args+=(--filter "$arg."); fi
     done
-    if ((named)); then
-      tested "$cli_suite" "${@:2}" > "$out" || status=$?
-    else
-      tested "$cli_suite" --filter "edit_sweep." "${@:2}" > "$out" || status=$?
-    fi
+    [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-corpus.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
+    tested "$cli_suite" "${args[@]}" > "$out" || status=$?
     listed "$out"
     selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
-    if [ "$status" -ne 0 ] || { [ "$selected" -eq 0 ] && ! ((named && parted)); }; then
-      [ "$selected" -gt 0 ] || echo "the sweep selected no case" >&2
+    if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
+      [ "$selected" -gt 0 ] || echo "the nightly run selected no test" >&2
       red "$out"
       rm -f "$out"
       exit 1
