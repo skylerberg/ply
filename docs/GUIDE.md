@@ -58,20 +58,21 @@ makes its parent the root and loads only that file.
 **The cache.** `.ply-cache/` at the root holds the memo store (`memo/`), which
 keeps what each module of the project answered checked, the store — the tests'
 passes and baselines, the discharged obligations, the review baselines and the
-definitions a passing test ran, in one data file (`store.dat`) found through one
-index (`store.idx`) — and the git dependencies that were fetched;
+definitions a passing test ran, in a manifest and a handful of segment files —
+and the git dependencies that were fetched;
 `vendor/` holds the ones `ply vendor` copied, which is what a checkout that must
 not reach the network carries. It is safe to delete (`ply cache clear` discards
-the store and the memo store); add it to `.gitignore`. A run that files
-into the store compacts it, as `ply cache compact` does, once more than half of
-`store.dat` holds entries a later filing replaced or dropped. The memo store is
-one small manifest and a handful of segment files: a run writes what it kept as
-one segment, which the manifest names when the run ends, so a later run sees all
-of it or none, and a run that dies or races another costs a later one checking
-what it takes, never a wrong answer. A run that names a segment writes the
-newest again as one while each is at most twice what follows it; writing all of
-them again keeps the records of the `ply` that writes and, of other `ply`s', the
-most lately used, up to as much again.
+the store and the memo store); add it to `.gitignore`. Each is one small
+manifest and a handful of segment files: a run writes what it kept as one
+segment, which the manifest names when the run ends, so a later run sees all of
+it or none; a run that names a segment writes the newest again as one while each
+is at most twice what follows it. A run that files into the store writes all of
+it again, as `ply cache compact` does, once more than half of what it holds are
+entries a later filing replaced or dropped, and what it filed is synced to the
+disk. A run of the memo store that dies or races another costs a later one
+checking what it takes, never a wrong answer; writing all of it again keeps the
+records of the `ply` that writes and, of other `ply`s', the most lately used, up
+to as much again.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this

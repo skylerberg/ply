@@ -340,7 +340,6 @@ case "${1:-}" in
         echo "=== ${dir#"$root"/}: opened by no run of this job, and not kept"
         continue
       fi
-      [ -f "$dir/.ply-cache/store.idx" ] || continue
       echo "=== ${dir#"$root"/}"
       "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
     done
