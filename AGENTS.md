@@ -7,6 +7,8 @@ builds `ply`: `ply bootstrap` links a checkout's runtime library with what the c
 makes of its CLI. `scripts/bootstrap.sh` is the rebuild after any edit: cargo, then `ply
 bootstrap` run by the `ply` in `target/`, or by the last release in a checkout with none.
 
+Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
+
 ## Prose
 
 - Prose is `README.md`, `docs/`, and this file. A document earns its place by being read: it

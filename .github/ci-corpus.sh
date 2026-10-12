@@ -8,8 +8,9 @@
 #   ci-corpus.sh all [EVENT]      every run, as many side by side as the machine's cores carry, each
 #                                 printed whole as it ends. The CLI's suite is loaded once, by a
 #                                 `ply test` that picks no test, and then runs in parts beside
-#                                 each other. Under `schedule` or `workflow_dispatch` the day's
-#                                 parts of the edit sweep run too.
+#                                 each other. Under `schedule` or `workflow_dispatch` the suite's
+#                                 nightly modules run too: the day's parts of the edit sweep, and
+#                                 the rest whole.
 #   ci-corpus.sh run ID [ARG...]  one run, or one module of the checks (`<module>`) or of the CLI's
 #                                 suite (`cli-<module>`), with ARGs added to its `ply test` or
 #                                 `ply prove`
@@ -59,6 +60,18 @@ lock=
 said() {
   if [[ -n $lock ]]; then flock "$lock" cat "$1"; else cat "$1"; fi
   rm -f "$1"
+}
+
+# Milliseconds since the epoch, by bash's own clock where it has one: `date +%s%3N` is not three
+# digits of the second under every `date`.
+now_ms() {
+  local t
+  if [[ -n ${EPOCHREALTIME:-} ]]; then
+    t=${EPOCHREALTIME/[.,]/}
+    printf '%s\n' "${t:0:13}"
+  else
+    printf '%s000\n' "$(date +%s)"
+  fi
 }
 
 say() {
@@ -118,13 +131,13 @@ spent() {
   ' "$1" 2>/dev/null
 }
 
-# What a red proof run said: each claim that does not hold, how and where, and a refused run's
+# What a red proof run said: each claim nothing proved, how and where, and a refused run's
 # diagnostics.
 disproved() {
   jq -r '
-    (.obligations[]? | select(.outcome | IN("refuted", "outgrown", "vacuous", "defect"))
+    (.obligations[]? | select(.outcome != "proved")
       | "FAILED \(.owner) \(.label): \(.outcome)\(if .location then " at \(.location)" else "" end)",
-        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome, .tier) | tojson)"),
+        "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome) | tojson)"),
     (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
   ' "$1" 2>/dev/null || cat "$1"
 }
@@ -148,14 +161,14 @@ tests_of() {
   placed "$id" || return 2
   for arg in "$@"; do [[ $arg == --shard ]] && parted=1; done
   out=$(mktemp)
-  started=$(date +%s%3N)
+  started=$(now_ms)
   case "$id" in
     package-* | fixture-*) "$ply" test "$path" --json "$@" > "$out" || status=$? ;;
     *) tested "$path" ${picked[@]+"${picked[@]}"} "$@" > "$out" || status=$? ;;
   esac
   listed "$out"
   timed "$out" "$path" >> "$durations"
-  spent "$out" "$(($(date +%s%3N) - started))"
+  spent "$out" "$(($(now_ms) - started))"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$selected" -eq 0 ] && ((!parted)); then
     echo "the run $id selected no test" >&2
@@ -172,12 +185,12 @@ tests_of() {
 # `ply prove` of the run ID with ARGs added, the library's and its fixtures' claims (`proofs`) or a
 # package's (`laws-<id>`); it fails when it proves no claim.
 proofs_of() {
-  local id=$1 path status=0 out started all cached unattempted
+  local id=$1 path status=0 out started all cached
   local -a picked=()
   shift
   placed "$id" || return 2
   out=$(mktemp)
-  started=$(date +%s%3N)
+  started=$(now_ms)
   if [[ $id == proofs ]]; then
     "$ply" prove --std "$path" "$@" --json > "$out" || status=$?
   else
@@ -185,9 +198,7 @@ proofs_of() {
   fi
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  # Only a claim that held is filed, so an unattempted one is discharged again by every later run.
-  unattempted=$(jq '.summary.unattempted // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, $unattempted unattempted, in $((($(date +%s%3N) - started) / 1000))s"
+  echo "proved: $all claims, $cached from the cache, in $((($(now_ms) - started) / 1000))s"
   if [ "$all" -eq 0 ]; then
     echo "the run $id proved no claim" >&2
     status=1
@@ -273,6 +284,9 @@ case "${1:-}" in
           for part in $("$tables" sweep-parts "${event:-push}"); do
             queue+=("the edit sweep, part $part|cli|run sweep --shard $part")
           done
+          if [[ $event == schedule || $event == workflow_dispatch ]]; then
+            queue+=("the CLI's suite, its nightly modules|cli|run nightly")
+          fi
           ;;
         *) queue+=("$id||run $id") ;;
       esac

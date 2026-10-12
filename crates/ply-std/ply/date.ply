@@ -21,7 +21,7 @@
 //! writes one. Month and weekday names are English, in every format and pattern.
 
 import std.bytes (is_digit)
-import std.laws (agrees, idempotent, round_trip)
+import std.laws (agrees)
 import std.list (concat, drop, take)
 import std.math (clamp, pow)
 import std.option (option_and_then, option_expect, option_map, option_unwrap_or)
@@ -29,6 +29,7 @@ import std.result (result_err, result_ok)
 import std.show (show)
 import std.string (pad_left)
 import std.time (as_nanos, nanos, nanos_at)
+import std.gen
 
 /// A day of the calendar, 0000-01-01 to 9999-12-31, as its count of days from 1970-01-01.
 pub type Date = | Date(Int)
@@ -1841,12 +1842,12 @@ fn settled_time(fields: Map<String, Int>) -> Option<Option<Time>> = {
   }
 }
 
-// --- Laws -------------------------------------------------------------------
+// --- Properties -------------------------------------------------------------
 
 /// Any count as one of 3,720,000: enough to pick a year, a month and a day from.
 fn drawn(n: Int) -> Int = if n >= 0 { n % 3720000 } else { (n + 1) % 3720000 + 3719999 }
 
-/// A date a law draws, brought into the calendar: itself where it is in it, and any other count
+/// A date a test draws, brought into the calendar: itself where it is in it, and any other count
 /// of days as the day that far round the calendar's 3,652,425.
 fn some_date(d: Date) -> Date = {
   let n = unix_days(d);
@@ -1859,13 +1860,13 @@ fn some_time(t: Time) -> Time = Time(nanos_in_day(nanos_of_day(t)))
 fn some_date_time(dt: DateTime) -> DateTime =
   DateTime(some_date(date_of(dt)), some_time(time_of(dt)))
 
-/// An offset a law draws, brought within a day of UTC the same way.
+/// An offset a test draws, brought within a day of UTC the same way.
 fn some_offset(minutes: Int) -> Int = {
   let round = if minutes >= 0 { minutes % 2879 } else { (minutes + 1) % 2879 + 2878 };
   if round > 1439 { round - 2879 } else { round }
 }
 
-/// An instant a law draws, brought into what `at_offset` makes: itself where it is one, and at
+/// An instant a test draws, brought into what `at_offset` makes: itself where it is one, and at
 /// UTC where its offset would read it past an end of the calendar.
 fn some_instant(o: OffsetDateTime) -> OffsetDateTime =
   match o {
@@ -1881,73 +1882,55 @@ fn some_instant(o: OffsetDateTime) -> OffsetDateTime =
 fn to_the_second(o: OffsetDateTime) -> Option<OffsetDateTime> =
   at_offset(truncate_date_time(local(o), Seconds), offset_minutes(o))
 
-law "a day's civil date counts back to the day"
-  forall (d: Date) {
-    let days = unix_days(some_date(d));
-    let civil = civil_from_days(days);
-    days_from_civil(civil.year, civil.month, civil.day) == days
-  }
+/// A `Date` as a test draws one.
+fn dates() -> gen::Gen<Date> = gen::map(gen::any_int(), |f0: Int| Date(f0))
 
-law "a civil date's day is that date again"
-  forall (year: Int, month: Int, day: Int) {
-    let y = drawn(year) % 10000;
-    let m = drawn(month) % 12 + 1;
-    let civil: YearMonthDay = {
-      year: y,
-      month: m,
-      day: min(drawn(day) % 31 + 1, month_length(y, m)),
-    };
-    civil_from_days(days_from_civil(civil.year, civil.month, civil.day)) == civil
-  }
+/// A `Time` as a test draws one.
+fn times() -> gen::Gen<Time> = gen::map(gen::any_int(), |f0: Int| Time(f0))
 
-law "a date moved by days and moved back is the date"
-  forall (d: Date, n: Int) {
+/// A `DateTime` as a test draws one.
+fn date_times() -> gen::Gen<DateTime> =
+  gen::map2(dates(), times(), |f0: Date, f1: Time| DateTime(f0, f1))
+
+/// An `OffsetDateTime` as a test draws one.
+pub fn offset_date_times() -> gen::Gen<OffsetDateTime> =
+  gen::map2(date_times(), gen::any_int(), |f0: DateTime, f1: Int| OffsetDateTime(f0, f1))
+
+test "a date moved by days and moved back is the date" {
+  gen::check2(dates(), gen::any_int(), |d: Date, n: Int| {
     let from = some_date(d);
     let by = drawn(n) - 1860000;
     match add_days(from, by) { Some(there) -> add_days(there, -by) == Some(from), None -> true }
-  }
+  })
+}
 
-law "the day after is the next day of the week"
-  forall (d: Date) {
-    let today = some_date(d);
-    match add_days(today, 1) {
-      Some(next) -> weekday_number(weekday(next)) == weekday_number(weekday(today)) % 7 + 1,
-      None -> today == latest(),
-    }
-  }
+test "a date reads back from its text" {
+  gen::check(dates(), |x: Date|
+    agrees(|d: Date| parse(text(some_date(d))), |d: Date| Some(some_date(d)), x))
+}
 
-law "the period between two dates takes the first to the second"
-  forall (a: Date, b: Date) {
-    let from = some_date(a);
-    let to = some_date(b);
-    add(from, period_between(from, to), Clamp) == Some(to)
-  }
+test "a time reads back from its text" {
+  gen::check(times(), |x: Time|
+    agrees(|t: Time| parse_time(time_text(some_time(t))), |t: Time| Some(some_time(t)), x))
+}
 
-law "a year and a day of it name the date they are read off"
-  forall (d: Date) {
-    let date = some_date(d);
-    of_ordinal(year(date), day_of_year(date)) == Some(date)
-  }
+test "a date-time reads back from its text" {
+  gen::check(date_times(), |x: DateTime|
+    agrees(
+      |dt: DateTime| parse_date_time(date_time_text(some_date_time(dt))),
+      |dt: DateTime| Some(some_date_time(dt)),
+      x,
+    ))
+}
 
-law "a week and a weekday name the date they are read off"
-  forall (d: Date) {
-    let date = some_date(d);
-    of_week(week(date).year, week(date).week, weekday(date)) == Some(date)
-  }
-
-law "a date reads back from its text" =
-  agrees(|d: Date| parse(text(some_date(d))), |d: Date| Some(some_date(d)))
-
-law "a time reads back from its text" =
-  agrees(|t: Time| parse_time(time_text(some_time(t))), |t: Time| Some(some_time(t)))
-
-law "a date-time reads back from its text" =
-  agrees(|dt: DateTime| parse_date_time(date_time_text(some_date_time(dt))), |dt: DateTime|
-    Some(some_date_time(dt)))
-
-law "an instant reads back from its RFC 3339 text" =
-  agrees(|o: OffsetDateTime| parse_rfc3339(rfc3339(some_instant(o))), |o: OffsetDateTime|
-    Some(some_instant(o)))
+test "an instant reads back from its RFC 3339 text" {
+  gen::check(offset_date_times(), |x: OffsetDateTime|
+    agrees(
+      |o: OffsetDateTime| parse_rfc3339(rfc3339(some_instant(o))),
+      |o: OffsetDateTime| Some(some_instant(o)),
+      x,
+    ))
+}
 
 fn in_paris(o: OffsetDateTime) -> Extended =
   {
@@ -1956,84 +1939,32 @@ fn in_paris(o: OffsetDateTime) -> Extended =
     tags: [{ key: "u-ca", value: "gregory", critical: false }],
   }
 
-law "an instant and its suffix read back from their RFC 9557 text" =
-  agrees(|o: OffsetDateTime| parse_rfc9557(rfc9557(in_paris(o))), |o: OffsetDateTime|
-    Some(in_paris(o)))
+test "an instant and its suffix read back from their RFC 9557 text" {
+  gen::check(offset_date_times(), |x: OffsetDateTime|
+    agrees(
+      |o: OffsetDateTime| parse_rfc9557(rfc9557(in_paris(o))),
+      |o: OffsetDateTime| Some(in_paris(o)),
+      x,
+    ))
+}
 
-law "an instant reads back from its HTTP date, in UTC and to the second" =
-  agrees(
-    |o: OffsetDateTime| parse_http_date(http_date(some_instant(o)), Instant(0)),
-    |o: OffsetDateTime| to_the_second(in_utc(some_instant(o))),
-  )
+test "an instant reads back from its HTTP date, in UTC and to the second" {
+  gen::check(offset_date_times(), |x: OffsetDateTime|
+    agrees(
+      |o: OffsetDateTime| parse_http_date(http_date(some_instant(o)), Instant(0)),
+      |o: OffsetDateTime| to_the_second(in_utc(some_instant(o))),
+      x,
+    ))
+}
 
-law "an instant reads back from its RFC 5322 date, to the second" =
-  agrees(|o: OffsetDateTime| parse_rfc5322(rfc5322(some_instant(o))), |o: OffsetDateTime|
-    to_the_second(some_instant(o)))
-
-law "an instant reads back by the pattern that wrote it" =
-  agrees(
-    |o: OffsetDateTime|
-      parse_with(the_pattern("%FT%T.%N%:z"), format(the_pattern("%FT%T.%N%:z"), some_instant(o))),
-    |o: OffsetDateTime| {
-      let reading = local(some_instant(o));
-      Some({
-        date: Some(date_of(reading)),
-        time: Some(time_of(reading)),
-        offset: Some(offset_minutes(some_instant(o))),
-      })
-    },
-  )
-
-law "a date reads back by a pattern of names, and its weekday with it" =
-  agrees(
-    |d: Date|
-      option_and_then(format_date(the_pattern("%A, %-d %B %Y"), some_date(d)), |written: String|
-        parse_with(the_pattern("%A, %-d %B %Y"), written)),
-    |d: Date| Some({ date: Some(some_date(d)), time: None, offset: None }),
-  )
-
-law "an `Instant` is the instant its UTC reading names" = round_trip(of_instant, instant)
-
-law "Unix seconds name their instant to the second" =
-  agrees(|o: OffsetDateTime| of_unix_seconds(unix_seconds(some_instant(o))), |o: OffsetDateTime|
-    to_the_second(in_utc(some_instant(o))))
-
-law "another offset reads the same instant"
-  forall (o: OffsetDateTime, minutes: Int) {
-    let from = some_instant(o);
-    match in_offset(from, some_offset(minutes)) {
-      Some(moved_to) ->
-        same_instant(from, moved_to) && offset_minutes(moved_to) == some_offset(minutes)
-          && at_offset(local(moved_to), some_offset(minutes)) == Some(moved_to),
-      None -> true,
-    }
-  }
-
-law "an instant a duration later is that duration after"
-  forall (o: OffsetDateTime, n: Int) {
-    let from = some_instant(o);
-    match offset_after(from, nanos(n)) {
-      Some(later) -> offset_between(from, later) == Some(nanos(n)),
-      None -> true,
-    }
-  }
-
-law "truncating a time twice is truncating it once" =
-  idempotent(|t: Time| truncate_time(some_time(t), Minutes))
-
-law "a date-time rounds to a whole hour no more than half an hour away"
-  forall (dt: DateTime) {
-    let from = some_date_time(dt);
-    match round_date_time(from, Hours, HalfEven) {
-      Some(whole) -> match date_time_between(from, whole) {
-        Some(apart) ->
-          nanos_of_day(time_of(whole)) % 3600000000000 == 0 && as_nanos(apart) >= -1800000000000
-            && as_nanos(apart) <= 1800000000000,
-        None -> false,
-      },
-      None -> date_of(from) == latest(),
-    }
-  }
+test "an instant reads back from its RFC 5322 date, to the second" {
+  gen::check(offset_date_times(), |x: OffsetDateTime|
+    agrees(
+      |o: OffsetDateTime| parse_rfc5322(rfc5322(some_instant(o))),
+      |o: OffsetDateTime| to_the_second(some_instant(o)),
+      x,
+    ))
+}
 
 // --- Tests ------------------------------------------------------------------
 

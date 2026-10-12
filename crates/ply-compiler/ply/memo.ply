@@ -20,6 +20,7 @@ import std.bin
 import std.bytes (hex_of, u64_at, u64_le)
 import std.list (contains)
 import std.hash (blake3)
+import std.gen
 
 pub effect memo {
   /// What the world holds at `at`, as `kind` reads it, or nothing there.
@@ -62,35 +63,43 @@ pub type Query = { name: Bytes, hash: Bytes, body: (Bytes) -> Bytes / {memo.read
 
 /// What a run has settled: the digest of the answer under each key it settled, what its driver asked,
 /// in order, the keys being answered now, which a query asking
-/// one of them again would wait on forever, and, by query, how many answers it took as kept and how
+/// one of them again would wait on forever, with the queries answering them, outermost first, and,
+/// by query, how many answers it took as kept and how
 /// many it ran the body for. While the run settles marks, `marked` holds the records it marked whose
-/// marks are still to settle, lowest first. `offers` holds what a body offered for another key and
-/// the query whose body offered it, and
+/// marks are still to settle, lowest first. `offers` holds what a body offered for another key, the
+/// query whose body offered it, the key that body was answering and which of its runs made the
+/// offer; `runs` how many times the run has run the body under each key; and
 /// `noted` the queries whose places the run has brought to the hashes it asks them under.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
   open: Map<Bytes, Bool>,
+  trail: List<{ query: Bytes, input: Bytes }>,
   took: Map<Bytes, Int>,
   ran: Map<Bytes, Int>,
   inputs: List<{ query: Bytes, input: Bytes }>,
   settling: Bool,
   marked: Map<Int, List<Bytes>>,
-  offers: Map<Bytes, { output: Bytes, by: Bytes }>,
+  offers: Map<Bytes, Offer>,
+  runs: Map<Bytes, Int>,
   noted: Map<Bytes, Bool>,
 }
+
+type Offer = { output: Bytes, by: Bytes, from: Bytes, nth: Int }
 
 fn new_run() -> Run =
   {
     settled: map_new(),
     asked: [],
     open: map_new(),
+    trail: [],
     took: map_new(),
     ran: map_new(),
     inputs: [],
     settling: false,
     marked: map_new(),
     offers: map_new(),
+    runs: map_new(),
     noted: map_new(),
   }
 
@@ -677,10 +686,20 @@ fn settled_at(
     match map_get(run.settled, key) {
       Some(h) -> { run: run, head: h },
       None -> {
+        let step = { query: name, input: input };
         if map_contains(run.open, key) {
-          panic("the query `" ++ string_of_bytes_lossy(name) ++ "` asks for its own answer")
+          panic(
+            "the query `" ++ string_of_bytes_lossy(name) ++ "` asks for its own answer, through"
+              ++ fold(
+                push(run.trail, step),
+                "",
+                |acc: String, s: { query: Bytes, input: Bytes }|
+                  acc ++ "\n  " ++ string_of_bytes_lossy(s.query) ++ " "
+                    ++ string_of_bytes_lossy(bytes_slice(s.input, 0, min(bytes_len(s.input), 120))),
+              ),
+          )
         };
-        let opened = { ..run, open: map_insert(run.open, key, true) };
+        let opened = { ..run, open: map_insert(run.open, key, true), trail: push(run.trail, step) };
         let done = match memo_keep.head(key) {
           None -> adopted(queries, opened, q, key, input, [], None, left - 1),
           Some(out) -> {
@@ -707,6 +726,7 @@ fn settled_at(
             ..done.run,
             settled: map_insert(done.run.settled, key, done.head),
             open: map_remove(done.run.open, key),
+            trail: run.trail,
           },
           head: done.head,
         }
@@ -826,6 +846,14 @@ fn answer_moved(
     },
   }
 
+/// Whether `o` still stands as what its key answers: the last run of the body that offered it made
+/// it, and nothing that run read has been found moved since it ended. What a body offers it works
+/// out from what it read, so taking it past either would keep an answer under reads that never
+/// made it.
+fn offer_stands(run: Run, o: Offer) -> Bool / {memo_keep.read} =
+  map_get(run.runs, o.from) == Some(o.nth)
+    && (map_contains(run.open, o.from) || len(memo_keep.marks(o.from)) == 0)
+
 /// `q`'s body run for `input`, its record kept under `key`, and `marks`, the marks a run found on
 /// the record before running it, removed. Each read is noted among the readers of what it reads
 /// before it reads it, so a run that marks what it read after that marks the record too; `prior`,
@@ -849,6 +877,7 @@ fn executed(
           ..run,
           ran: bumped(run.ran, q.name),
           inputs: push(run.inputs, { query: q.name, input: input }),
+          runs: bumped(run.runs, key),
         },
         reads: [],
         worlds: map_new(),
@@ -908,8 +937,9 @@ fn executed(
         },
         memo.kept(name, asked) -> {
           let k = key_of(query_of(queries, name), asked);
+          let run = cell_get(st).run;
           (memo_keep.head(k) != None && len(memo_keep.marks(k)) == 0)
-            || map_contains(cell_get(st).run.offers, k)
+            || (match map_get(run.offers, k) { Some(o) -> offer_stands(run, o), None -> false })
         },
         memo.offer(name, asked, output) -> {
           let s = cell_get(st);
@@ -920,6 +950,8 @@ fn executed(
               offers: map_insert(s.run.offers, key_of(query_of(queries, name), asked), {
                 output: output,
                 by: q.name,
+                from: key,
+                nth: match map_get(s.run.runs, key) { Some(n) -> n, None -> 0 },
               }),
             },
           })
@@ -930,8 +962,10 @@ fn executed(
             None -> None,
             Some(o) -> {
               cell_set(st, { ..s, run: { ..s.run, offers: map_remove(s.run.offers, key) } });
-              world(query_kind(), o.by);
-              Some(o.output)
+              if offer_stands(s.run, o) {
+                world(query_kind(), o.by);
+                Some(o.output)
+              } else { None }
             },
           }
         },
@@ -1689,30 +1723,61 @@ test "a query asking for its own answer is refused" {
   assert_eq(try_answer(|| asked_over(looping, test_world([]), b"self", b"x").output), None)
 }
 
-law "a record reads back as it was kept, with the answer it holds"
-  forall (r: Record, inline: Option<Bytes>) where r.height >= 0 {
-    let b = record_bytes(r, inline);
-    record_from(b) == Some(r) && inline_named(b) == inline
-  }
+/// A `Record` as a test draws one.
+fn records() -> gen::Gen<Record> =
+  gen::and_then(gen::bytes(), |query: Bytes|
+    gen::map4(
+      gen::bytes(),
+      gen::list(reads()),
+      gen::bytes(),
+      gen::any_int(),
+      |input: Bytes, reads: List<Read>, output: Bytes, height: Int|
+        { query: query, input: input, reads: reads, output: output, height: height },
+    ))
 
-law "a record's first bytes name its answer, and hold one it keeps inside"
-  forall (r: Record, o: Bytes) where bytes_len(r.output) <= 64 && r.height >= 0 {
-    let inline = kept_inline(o);
-    let b = record_bytes(r, inline);
-    let head = bytes_slice(b, 0, if bytes_len(b) < head_bytes() { bytes_len(b) }
-    else { head_bytes() });
-    output_named(head) == Some(r.output) && inline_named(head) == inline
-  }
+/// A `Read` as a test draws one.
+fn reads() -> gen::Gen<Read> =
+  gen::one_of([
+    gen::map3(gen::bytes(), gen::bytes(), gen::bytes(), |f0: Bytes, f1: Bytes, f2: Bytes|
+      World(f0, f1, f2)),
+    gen::map3(gen::bytes(), gen::bytes(), gen::bytes(), |f0: Bytes, f1: Bytes, f2: Bytes|
+      Asked(f0, f1, f2)),
+  ])
 
-law "bytes of another format read as no record"
-  forall (b: Bytes) where bytes_len(b) == 0 || bytes_at(b, 0) != 5 {
-    record_from(b) == None && output_named(b) == None && inline_named(b) == None
-  }
+/// A `Seen` as a test draws one.
+fn seens() -> gen::Gen<Seen> =
+  gen::map3(gen::bytes(), gen::bytes(), gen::bytes(), |kind: Bytes, at: Bytes, digest: Bytes|
+    { kind: kind, at: at, digest: digest })
 
-law "a place's note reads back as it was noted"
-  forall (s: Seen) {
-    bin::decode(bin::encode(s, seen_bin()), seen_bin()) == Ok(s)
-  }
+test "a record reads back as it was kept, with the answer it holds" {
+  gen::check2(records(), gen::option_of(gen::bytes()), |r: Record, inline: Option<Bytes>|
+    if r.height >= 0 {
+      let b = record_bytes(r, inline);
+      record_from(b) == Some(r) && inline_named(b) == inline
+    } else { true })
+}
+
+test "a record's first bytes name its answer, and hold one it keeps inside" {
+  gen::check2(records(), gen::bytes(), |r: Record, o: Bytes|
+    if bytes_len(r.output) <= 64 && r.height >= 0 {
+      let inline = kept_inline(o);
+      let b = record_bytes(r, inline);
+      let head = bytes_slice(b, 0, if bytes_len(b) < head_bytes() { bytes_len(b) }
+      else { head_bytes() });
+      output_named(head) == Some(r.output) && inline_named(head) == inline
+    } else { true })
+}
+
+test "bytes of another format read as no record" {
+  gen::check(gen::bytes(), |b: Bytes|
+    if bytes_len(b) == 0 || bytes_at(b, 0) != 5 {
+      record_from(b) == None && output_named(b) == None && inline_named(b) == None
+    } else { true })
+}
+
+test "a place's note reads back as it was noted" {
+  gen::check(seens(), |s: Seen| { bin::decode(bin::encode(s, seen_bin()), seen_bin()) == Ok(s) })
+}
 
 fn try_answer(f: () -> Bytes / {abort.raise}) -> Option<Bytes> =
   handle { Some(f()) } with { abort.raise(_) -> None }
