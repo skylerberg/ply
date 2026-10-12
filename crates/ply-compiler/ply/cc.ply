@@ -4,7 +4,7 @@
 //! compiler, the flags and the part's C. So an edit recompiles the parts it reached, and a unit
 //! compiled once links from the cache.
 
-import std.bytes (hex_of)
+import std.bytes (hex_of, repeat)
 import std.hash (blake3)
 import std.list (at, concat, find)
 import std.string (join)
@@ -31,6 +31,8 @@ pub effect toolchain {
   read jobs() -> Int
   /// Whether the cache holds `path`, which records a use of it.
   read holds(path: String) -> Bool
+  /// What `path` holds, or `None` where the cache has no such file.
+  read held(path: String) -> Option<Bytes>
   /// `bytes` at `path`, written whole.
   write written(path: String, bytes: Bytes) -> Bool
   /// `from` moved to `to`, whole.
@@ -341,15 +343,66 @@ pub fn shared<[c]>(
     let made = work ++ "/unit.so";
     match ran[c]([concat(t.support, concat(["-shared", "-o", cache ++ "/" ++ made], objects))]) {
       Err(why) -> Err(why),
-      Ok(_) -> if toolchain.moved(made, library) { Ok(cache ++ "/" ++ library) }
-      else { Err("the library could not be kept in the toolchain's cache") },
+      Ok(_) -> match toolchain.held(made) {
+        None -> Err("the C compiler linked no library"),
+        Some(linked) -> if toolchain.written(made, stack_marked(linked))
+            && toolchain.moved(made, library) { Ok(cache ++ "/" ++ library) }
+        else { Err("the library could not be kept in the toolchain's cache") },
+      },
     }
   }
 }
 
 /// Where the cache keeps the library `objects`, by their paths in it, link into.
 fn library_of(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
-  key_of(t, ["-shared"], map(objects, bytes_of_string)) ++ ".so"
+  key_of(t, ["-shared", "stack-marked"], map(objects, bytes_of_string)) ++ ".so"
+
+/// The integer `count` bytes of `b` from `from` hold, least significant first.
+fn le(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
+  fold(range(0, count), 0, |n: Int, k: Int| n * 256 + bytes_at(b, from + count - 1 - k))
+
+/// `n` as `count` bytes, least significant first.
+fn le_of(n: Int, count: Int) -> Bytes / {abort.raise} =
+  fold(range(0, count), { rest: n, out: b"" }, |s: { rest: Int, out: Bytes }, _k: Int|
+    { rest: s.rest / 256, out: bytes_concat(s.out, byte_of_int(s.rest % 256)) }).out
+
+fn gnu_stack() -> Int = 0x6474E551
+
+/// `library` saying its code needs no executable stack: a 64-bit little-endian ELF file with no
+/// `PT_GNU_STACK` program header gains one, and anything else comes back as it is. A loader takes a
+/// library without the header to need an executable stack, which glibc refuses to give one it opens,
+/// and tcc links none. tcc leaves no room after the headers, so they move to the end of the file.
+pub fn stack_marked(library: Bytes) -> Bytes / {abort.raise} = {
+  let size = bytes_len(library);
+  if size < 64 || !bytes_starts_with(library, b"\x7FELF\x02\x01") { library } else {
+    let at = le(library, 32, 8);
+    let each = le(library, 54, 2);
+    let count = le(library, 56, 2);
+    let whole = each == 56 && at + count * each <= size;
+    let marked = whole
+      && (match find(range(0, count), |i: Int| le(library, at + i * each, 4) == gnu_stack()) {
+        Some(_) -> true,
+        None -> false,
+      });
+    if !whole || marked { library } else {
+      let pad = (8 - size % 8) % 8;
+      bytes_concat_all([
+        bytes_slice(library, 0, 32),
+        le_of(size + pad, 8),
+        bytes_slice(library, 40, 56),
+        le_of(count + 1, 2),
+        bytes_slice(library, 58, size),
+        repeat(b"\x00", pad),
+        bytes_slice(library, at, at + count * each),
+        le_of(gnu_stack(), 4),
+        // Readable and writable, not executable.
+        le_of(6, 4),
+        repeat(b"\x00", 40),
+        le_of(16, 8),
+      ])
+    }
+  }
+}
 
 /// The flags every object of a library a program loads compiles with.
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
@@ -469,4 +522,38 @@ test "an object's key moves with its compiler, its level, its flags and its C" {
   assert(key_of({ ..t, level: "-O0" }, ["-c"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c", "-fvisibility=hidden"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c"], [b"head", b"text2"]) != base)
+}
+
+fn elf_of(headers: Bytes, count: Int) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    b"\x7FELF\x02\x01",
+    repeat(b"\x00", 26),
+    le_of(64, 8),
+    repeat(b"\x00", 14),
+    le_of(56, 2),
+    le_of(count, 2),
+    repeat(b"\x00", 6),
+    headers,
+  ])
+
+test "a library with no stack header gains one after its end, and one that has it is left alone" {
+  let load = bytes_concat(le_of(1, 4), repeat(b"\x00", 52));
+  let marked = stack_marked(bytes_concat(elf_of(load, 1), b"body"));
+  assert_eq(bytes_len(marked), 128 + 2 * 56);
+  assert_eq(le(marked, 32, 8), 128);
+  assert_eq(le(marked, 56, 2), 2);
+  assert_eq(bytes_slice(marked, 120, 124), b"body");
+  assert_eq(bytes_slice(marked, 128, 184), load);
+  assert_eq(le(marked, 184, 4), gnu_stack());
+  assert_eq(le(marked, 188, 4), 6);
+  assert_eq(stack_marked(marked), marked)
+}
+
+test "what is not a 64-bit little-endian ELF file is left as it is" {
+  assert_eq(
+    stack_marked(b"\xCF\xFA\xED\xFE a Mach-O library"),
+    b"\xCF\xFA\xED\xFE a Mach-O library",
+  );
+  let big_endian = bytes_concat(b"\x7FELF\x02\x02", repeat(b"\x00", 120));
+  assert_eq(stack_marked(big_endian), big_endian)
 }
