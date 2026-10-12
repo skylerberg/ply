@@ -1,7 +1,7 @@
 use ply_codegen::c::dump;
 use ply_eval::{
-    Carry, Edit, EffectAtom, Fields, Fix, Footprint, INT_TYPES, IntTy, Mode, Resource, Severity,
-    SourceId, Span, Symbol, Value, codes,
+    Carry, DefHash, Edit, EffectAtom, Fields, Fix, Footprint, INT_TYPES, IntTy, Mode, Resource,
+    Severity, SourceId, Span, Symbol, Value, codes,
 };
 use std::sync::Arc;
 
@@ -425,5 +425,113 @@ fn a_footprint_reads_back_numbered_as_its_labels_first_appear() {
     assert_eq!(
         f.footprint.to_string(),
         "{m.net.read[l], m.net.read[m], m.net.recv[m], m.net.send[n]}"
+    );
+}
+
+// --- A native program's ---------------------------------------------------------------
+
+/// What a native program carries reads as an answer of its entry alone: the one definition and the
+/// one root, its row's atoms given the modes their operations declare, and the lines of its hashes
+/// as they were written.
+#[test]
+fn a_native_programs_front_end_reads_as_an_answer_of_its_entry_alone() {
+    let emit = record(vec![
+        ("name", Value::bytes("emit")),
+        ("mode", Value::bytes("read")),
+        ("resource_param", Value::Bool(false)),
+        ("at", nowhere()),
+        ("carries", Value::list(vec![width(IntTy::U8)])),
+    ]);
+    let log = record(vec![
+        ("name", Value::bytes("m.log")),
+        ("module", Value::bytes("m")),
+        ("simple_name", Value::bytes("log")),
+        ("nondet", Value::Bool(false)),
+        ("ops", Value::list(vec![emit])),
+        ("at", nowhere()),
+    ]);
+    let row = Value::list(vec![atom(
+        "m.log",
+        Value::ctor("RSingleton", vec![]),
+        "MWrite",
+        Some("emit"),
+    )]);
+    let entry = record(vec![
+        ("name", Value::bytes("m.main")),
+        ("module", Value::bytes("m")),
+        ("simple_name", Value::bytes("main")),
+        ("footprint", row.clone()),
+        ("performed", row),
+        (
+            "at",
+            record(vec![
+                ("module", Value::Int(1)),
+                ("start", Value::Int(3)),
+                ("end", Value::Int(9)),
+            ]),
+        ),
+    ]);
+    let root = record(vec![
+        ("root", Value::bytes("m.main")),
+        ("arity", Value::Int(0)),
+        ("pure", Value::Bool(false)),
+        ("at", nowhere()),
+        ("params", Value::list(vec![])),
+        ("answer", plain()),
+        ("witnesses", Value::list(vec![])),
+    ]);
+    let pair = record(vec![
+        ("name", Value::bytes("m.Pair")),
+        ("arity", Value::Int(2)),
+        ("fields", Value::list(vec![var(1), var(0)])),
+    ]);
+    let carried = record(vec![
+        ("entry", entry),
+        ("root", root),
+        ("effects", Value::list(vec![log])),
+        ("ctors", Value::list(vec![pair])),
+        ("digest", Value::bytes([7u8; 32])),
+        ("definitions", Value::bytes("m.main ab\n")),
+        ("modules", Value::Int(2)),
+    ]);
+    let linked = dump::linked(&carried).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(linked.entry.as_str(), "m.main");
+    assert_eq!(linked.definitions, "m.main ab\n");
+
+    let front = &linked.front;
+    let main = &front.check.defs[&Symbol::new("m.main")];
+    assert_eq!(front.check.defs.len(), 1);
+    assert_eq!(main.span, Span::new(SourceId(1), 3, 9));
+    assert_eq!(
+        main.footprint,
+        Footprint::from_atoms([EffectAtom::operation(
+            "m.log",
+            Resource::Singleton,
+            Mode::Read,
+            "emit"
+        )])
+    );
+    assert_eq!(
+        front.check.effects[&Symbol::new("m.log")].ops[&Symbol::new("emit")].params,
+        [Carry::Width(IntTy::U8)]
+    );
+    let [root] = &front.emitter_roots[..] else {
+        panic!("one root: {:?}", front.emitter_roots);
+    };
+    assert_eq!((root.root.as_str(), root.arity), ("m.main", 0));
+    assert_eq!(front.hashes_digest, DefHash([7u8; 32]));
+    assert_eq!(front.emitter_ctors, [(Symbol::new("m.Pair"), 2)]);
+    assert_eq!(
+        front.ctor_carries[&Symbol::new("m.Pair")],
+        [Carry::Var(1), Carry::Var(0)]
+    );
+    assert!(front.hashes.deps.is_empty() && front.check.modules.is_empty());
+
+    let err = dump::linked(&with(&carried, "modules", Value::Int(1)))
+        .err()
+        .expect("a span past the modules the program says its spans run over");
+    assert_eq!(
+        err.path, "a native program's front end.entry.at.module",
+        "{err}"
     );
 }

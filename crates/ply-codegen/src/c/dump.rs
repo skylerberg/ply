@@ -2,7 +2,8 @@
 //! into a [`Analysis`]. No type is read: the runtime reasons about none, and a value's words read back
 //! as the carries the compiler published. A footprint is read from the checker's own atoms, its
 //! label variables numbered where they first appear, so an answer reads to one structure however
-//! the checker happened to number them.
+//! the checker happened to number them. What a native program carries of its answer, a
+//! `front.Linked`, reads into the same record holding its entry alone.
 
 use ply_eval::decode::{AnswerValue, Error};
 use ply_eval::{
@@ -74,26 +75,8 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
     }
     hashes(d.field("hashes")?, &mut front)?;
     front.hashes_digest = DefHash(d.field("hashes_digest")?.byte_array()?);
-    front.emitter_roots = d.field("emitter_roots")?.items(|e| {
-        Ok(EmitterRoot {
-            root: Symbol::new(e.field("root")?.utf8()?),
-            arity: e.field("arity")?.number()?,
-            pure: e.field("pure")?.bool()?,
-            span: r.span(e.field("at")?)?,
-            params: carries(e.field("params")?)?,
-            answer: carry(e.field("answer")?)?,
-            witnesses: e.field("witnesses")?.items(|w| w.number())?,
-        })
-    })?;
-    for k in d.field("emitter_ctors")?.list()? {
-        let name = Symbol::new(k.field("name")?.utf8()?);
-        front
-            .ctor_carries
-            .insert(name.clone(), carries(k.field("fields")?)?);
-        front
-            .emitter_ctors
-            .push((name, k.field("arity")?.number()?));
-    }
+    front.emitter_roots = d.field("emitter_roots")?.items(|e| r.root(e))?;
+    ctors(d.field("emitter_ctors")?, &mut front)?;
     front.ordinals = d.field("ordinals")?.items(|o| {
         Ok((
             Symbol::new(o.field("module")?.utf8()?),
@@ -102,6 +85,59 @@ pub fn read(dump: &Value, sources: &[SourceId]) -> Result<Analysis, Error> {
     })?;
     resolve_op_modes(&mut front);
     Ok(front)
+}
+
+/// A native program as its pack carries it, a `front.Linked` read.
+pub struct Linked {
+    /// The definition the program enters.
+    pub entry: Symbol,
+    /// The entry's rows and no other definition's: the one root a unit linked with it is entered
+    /// by, the row the host is bound for, the effects it is bound to, and how a constructor's
+    /// fields read.
+    pub front: Analysis,
+    /// Each `fn` the entry reaches and the hash its front end gave it, a `name hash` line each in
+    /// name order.
+    pub definitions: String,
+}
+
+/// A `front.Linked`, which says itself how many modules its spans' indices run over.
+pub fn linked(carried: &Value) -> Result<Linked, Error> {
+    let l = AnswerValue::new("a native program's front end", carried);
+    let sources: Vec<SourceId> = (0..l.field("modules")?.number::<u32>()?)
+        .map(SourceId)
+        .collect();
+    let r = Reader { sources: &sources };
+    let mut front = Analysis::default();
+    let entry = r.def(l.field("entry")?)?;
+    for e in l.field("effects")?.list()? {
+        let effect = r.effect(e)?;
+        front.check.effects.insert(effect.name.clone(), effect);
+    }
+    front.hashes_digest = DefHash(l.field("digest")?.byte_array()?);
+    front.emitter_roots = vec![r.root(l.field("root")?)?];
+    ctors(l.field("ctors")?, &mut front)?;
+    let name = entry.name.clone();
+    front.check.defs.insert(name.clone(), entry);
+    resolve_op_modes(&mut front);
+    Ok(Linked {
+        entry: name,
+        front,
+        definitions: l.field("definitions")?.utf8()?.to_string(),
+    })
+}
+
+/// The emitter's constructors in its order, and how each one's fields read.
+fn ctors(rows: AnswerValue<'_>, front: &mut Analysis) -> Result<(), Error> {
+    for k in rows.list()? {
+        let name = Symbol::new(k.field("name")?.utf8()?);
+        front
+            .ctor_carries
+            .insert(name.clone(), carries(k.field("fields")?)?);
+        front
+            .emitter_ctors
+            .push((name, k.field("arity")?.number()?));
+    }
+    Ok(())
 }
 
 /// The hasher's rows in its item order. A test's or a law's row names it by its key, so the tests
@@ -298,6 +334,18 @@ impl Reader<'_> {
                 })?
                 .into(),
             values: ply_eval::Sparse::new(),
+        })
+    }
+
+    fn root(&self, e: AnswerValue<'_>) -> Result<EmitterRoot, Error> {
+        Ok(EmitterRoot {
+            root: Symbol::new(e.field("root")?.utf8()?),
+            arity: e.field("arity")?.number()?,
+            pure: e.field("pure")?.bool()?,
+            span: self.span(e.field("at")?)?,
+            params: carries(e.field("params")?)?,
+            answer: carry(e.field("answer")?)?,
+            witnesses: e.field("witnesses")?.items(|w| w.number())?,
         })
     }
 

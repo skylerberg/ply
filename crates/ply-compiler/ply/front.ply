@@ -3526,6 +3526,121 @@ pub fn shipped_dump(d: Dump) -> Dump =
     walked: b"",
   }
 
+/// An operation as a native program carries it: what a handler is bound to and how each argument
+/// reads out of compiled code, and none of the types a compiler checks a call against.
+pub type LinkedOp = {
+  name: Bytes,
+  mode: Bytes,
+  resource_param: Bool,
+  at: ModuleSpan,
+  carries: List<Carry>,
+}
+
+pub type LinkedEffect = {
+  name: Bytes,
+  module: Bytes,
+  simple_name: Bytes,
+  nondet: Bool,
+  ops: List<LinkedOp>,
+  at: ModuleSpan,
+}
+
+/// The answer as a native program carries it. A program runs the one definition it enters, so it
+/// carries that definition's rows and no other's: `entry`, whose row is all the host is bound for,
+/// and `root`, how it is entered. Beside them it carries what a value crossing to the host is read
+/// with, the effects' operations and `ctors`; `digest`, which names the program its unit was emitted
+/// from; and `definitions`, a `name hash` line in name order for each `fn` the entry reaches, which
+/// a process would else walk the hasher's rows for. Its spans' indices run over `modules` modules.
+pub type Linked = {
+  entry: DefRow,
+  root: EmitterRoot,
+  effects: List<LinkedEffect>,
+  ctors: List<EmitterCtor>,
+  digest: Bytes,
+  definitions: Bytes,
+  modules: Int,
+}
+
+type Reaching = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
+
+/// Every name `entry` reaches through what each hashed definition references, itself included. A
+/// name declared in two namespaces is one node.
+fn names_reached(hashes: List<HashFrame>, entry: Bytes) -> Map<Bytes, Bool> / {abort.raise} = {
+  let deps = fold(hashes, map_new(), |acc: Map<Bytes, List<Bytes>>, frame: HashFrame|
+    match frame { HDef(row) -> map_insert(acc, row.name, row.deps), _ -> acc });
+  iterate(
+    { seen: map_insert(map_new(), entry, true), frontier: [entry] },
+    len(hashes) + 2,
+    |w: Reaching|
+      if len(w.frontier) == 0 { Stop(w.seen) } else {
+        Continue(
+          fold(w.frontier, { seen: w.seen, frontier: [] }, |acc: Reaching, name: Bytes|
+            fold(
+              match map_get(deps, name) { Some(named) -> named, None -> [] },
+              acc,
+              |met: Reaching, dep: Bytes|
+                if map_contains(met.seen, dep) { met } else {
+                  { seen: map_insert(met.seen, dep, true), frontier: push(met.frontier, dep) }
+                },
+            )),
+        )
+      },
+  )
+}
+
+/// Each `fn` that `entry` reaches and the hash the hasher gave it, a `name hash` line each in name
+/// order: a hash covers all its definition reaches, so the entry's covers the program.
+fn definitions_reached(hashes: List<HashFrame>, entry: Bytes) -> Bytes / {abort.raise} = {
+  let reached = names_reached(hashes, entry);
+  let held = fold(hashes, map_new(), |acc: Map<Bytes, Bytes>, frame: HashFrame|
+    match frame {
+      HDef(row) -> match row.def {
+        Some(h) -> if map_contains(reached, row.name) { map_insert(acc, row.name, h) } else { acc },
+        None -> acc,
+      },
+      _ -> acc,
+    });
+  bytes_concat_all(
+    map_fold(held, [], |lines: List<Bytes>, name: Bytes, h: Bytes|
+      push(lines, bytes_concat_all([name, b" ", h, b"\n"]))),
+  )
+}
+
+/// `d` as a native program that enters `entry` carries it, its spans' indices over `modules`
+/// modules: none where the program defines no `entry` to enter.
+pub fn linked_of(d: Dump, entry: Bytes, modules: Int) -> Option<Linked> / {abort.raise} =
+  match ((
+      list::find(d.defs, |row: DefRow| row.name == entry),
+      list::find(d.emitter_roots, |root: EmitterRoot| root.root == entry),
+    )) {
+    (Some(def), Some(root)) ->
+      Some({
+        entry: def,
+        root: root,
+        effects: map(d.effects, |e: EffectRow|
+          {
+            name: e.name,
+            module: e.module,
+            simple_name: e.simple_name,
+            nondet: e.nondet,
+            ops: map(e.ops, |o: OpRow|
+              {
+                name: o.name,
+                mode: o.mode,
+                resource_param: o.resource_param,
+                at: o.at,
+                carries: o.carries,
+              }),
+            at: e.at,
+          }),
+        ctors: d.emitter_ctors,
+        digest: d.hashes_digest,
+        definitions: definitions_reached(d.hashes, entry),
+        modules: modules,
+      }),
+    _ -> None,
+  }
+
 /// Every table the answer holds, as rows.
 pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
   match outcome {
@@ -6059,6 +6174,50 @@ test "a shipped answer carries neither what a load walked nor what it warned of"
   );
   assert_eq(len(embedding.embeds), 1);
   assert_eq(shipped_dump(embedding).embeds, [])
+}
+
+test "a native program carries its entry's rows and the hash of each fn its entry reaches" {
+  let d = dump_of(analyse(parse_all(faceted())));
+  let hash_of = |name: Bytes|
+    fold(d.hashes, b"", |found: Bytes, frame: HashFrame|
+      match frame {
+        HDef(row) -> if row.name == name { match row.def { Some(h) -> h, None -> found } }
+        else { found },
+        _ -> found,
+      });
+  match linked_of(d, b"app.worth", 2) {
+    None -> assert(false, Some("the program defines its entry")),
+    Some(l) -> {
+      assert_eq(l.entry.name, b"app.worth");
+      assert_eq(l.root.root, b"app.worth");
+      assert_eq(l.root.arity, 1);
+      assert_eq(l.digest, d.hashes_digest);
+      assert_eq(l.ctors, d.emitter_ctors);
+      assert_eq(l.modules, 2);
+      // Each effect's operations as the host is bound to them, a declared one beside the language's.
+      assert(
+        list::any(l.effects, |e: LinkedEffect| e.name == b"base.tick"),
+        Some("the program's own effect is carried"),
+      );
+      assert_eq(
+        map(l.effects, |e: LinkedEffect|
+          map(e.ops, |o: LinkedOp| { name: o.name, mode: o.mode, carries: o.carries })),
+        map(d.effects, |e: EffectRow|
+          map(e.ops, |o: OpRow| { name: o.name, mode: o.mode, carries: o.carries })),
+      );
+      // `tagged` and `even` are the program's and not the entry's.
+      assert_eq(
+        l.definitions,
+        bytes_concat_all(
+          map(
+            [b"app.worth", b"base.cents", b"base.coin", b"base.half", b"base.seven"],
+            |n: Bytes| bytes_concat_all([n, b" ", hash_of(n), b"\n"]),
+          ),
+        ),
+      )
+    },
+  };
+  assert_eq(linked_of(d, b"app.gone", 2), None)
 }
 
 test "a program's answer holds its warnings, its order, its packages and its modules" {
