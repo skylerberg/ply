@@ -45,10 +45,11 @@
 #   ci-shards.sh formatted-sources
 #                                the maintained Ply sources, one a line, which the
 #                                gates job holds to `ply fmt --check`
-#   ci-shards.sh sweep-matrix EVENT  the JSON matrix of the edit sweep's jobs: under `schedule` or
-#                                `workflow_dispatch`, SWEEP_SHARDS shards of the part of the cases
-#                                the day names, so SWEEP_DAYS days sweep every case; none otherwise,
-#                                since `edit_gate` holds a pull request to every kind of edit
+#   ci-shards.sh nightly-matrix EVENT  the JSON matrix of the nightly jobs, each the arguments of a
+#                                `ci-corpus.sh nightly`: under `schedule` or `workflow_dispatch`,
+#                                SWEEP_SHARDS shards of the part of the edit sweep's cases the day
+#                                names, so SWEEP_DAYS days sweep every case, and one job of the other
+#                                modules no partition runs; none otherwise
 #   ci-shards.sh supersede RUN REF
 #                                delete the entries of REF that this run's replaced
 
@@ -84,17 +85,20 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# Runs that take a runner each: the compiler's own suite takes every core, the reach audit
-# checks three whole packages cold and the copies audit lists ten, and every proof run is one load of
-# what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
-CORPUS_ALONE=(package-compiler cli-reached cli-copies proofs)
+# Runs that take a runner each: the compiler's own tests take every core, and every proof run is one
+# load of what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
+CORPUS_ALONE=(package-compiler proofs)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
-CLI_BY_TEST=(artifact_program corpus desk_operations incremental)
-# Modules of the CLI's suite no partition runs, which the `edit-sweep` jobs do: each case edits a module
-# of the tree one way and checks it warm and cold, days of runners over the tree.
-CLI_NIGHTLY=(edit_sweep)
+CLI_BY_TEST=(artifact_program corpus incremental)
+# Modules of the CLI's suite no partition runs, which the `nightly` jobs do. CLI_SWEPT edits each module
+# of the tree one way and checks it warm and cold, days of runners over the tree, so a night takes a
+# part of its cases. The rest run whole each night: minutes each over the toolchain's whole trees,
+# the reach audit checking three packages cold and the copies audit listing ten, or against a postgres
+# they start.
+CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
+CLI_SWEPT=edit_sweep
 SWEEP_SHARDS=16
 SWEEP_DAYS=14
 # Minutes of a corpus job's limit left after the deadline its runs end at (`PLY_CI_DEADLINE`), for the
@@ -1946,6 +1950,16 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  for module in "${CLI_NIGHTLY[@]}"; do
+    if [[ -z $(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
+      echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly jobs" >&2
+      failures=$((failures + 1))
+    fi
+  done
+  if ! named_in "$CLI_SWEPT" "${CLI_NIGHTLY[@]}"; then
+    echo "FAIL: CLI_SWEPT names '$CLI_SWEPT', which CLI_NIGHTLY does not, so the partitions run it whole" >&2
+    failures=$((failures + 1))
+  fi
   # Every entry is a partition's or alone, once, so the round robin stays total.
   local placed k
   placed=$(
@@ -1961,7 +1975,7 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh run"; do
+  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh run" "ci-corpus.sh nightly"; do
     corpus_job=$(job_running "$corpus_command")
     if [[ -z $corpus_job ]]; then
       echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its corpus runs run nowhere" >&2
@@ -2023,14 +2037,19 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(corpus_entries | grep -c .) corpus test runs in $PARTITIONS partitions; $NEXTEST_SHARDS nextest shards cut $cut"
 }
 
-# The sweep's cases for a changed path, as a `--filter`: an example, a module of the compiler's
-# package, or one of the standard library; nothing for any other path.
-cmd_sweep_matrix() {
-  local event=$1
+# The nightly jobs, each by the arguments its `ci-corpus.sh nightly` takes: the day's shards of
+# CLI_SWEPT's cases, and CLI_NIGHTLY's other modules in one job.
+cmd_nightly_matrix() {
+  local event=$1 module whole=""
   if [[ $event == schedule || $event == workflow_dispatch ]]; then
+    for module in "${CLI_NIGHTLY[@]}"; do
+      [[ $module == "$CLI_SWEPT" ]] || whole+="${whole:+ }$module"
+    done
     jq -cn --argjson n "$SWEEP_SHARDS" --argjson days "$SWEEP_DAYS" --argjson day "$(($(date -u +%s) / 86400))" \
-      '($n * $days) as $of | {include: [range(1; $n + 1) | (($day % $days) * $n + .) as $k
-        | {name: "\($k)/\($of)", shard: "\($k)/\($of)", filter: ""}]}'
+      --arg swept "$CLI_SWEPT" --arg whole "$whole" \
+      '($n * $days) as $of | {include: ([range(1; $n + 1) | (($day % $days) * $n + .) as $k
+        | {name: "\($swept) \($k)/\($of)", args: "\($swept) --shard \($k)/\($of)"}]
+        + [{name: $whole, args: $whole}])}'
   else
     echo '{"include":[]}'
   fi
@@ -2057,7 +2076,7 @@ case "${1:-}" in
   rust-inputs) cmd_rust_inputs "${2:-}" ;;
   fetch-timings) cmd_fetch_timings ;;
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
-  sweep-matrix) cmd_sweep_matrix "${2:?an event}" ;;
+  nightly-matrix) cmd_nightly_matrix "${2:?an event}" ;;
   *)
     echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2

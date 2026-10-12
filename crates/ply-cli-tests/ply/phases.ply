@@ -1,33 +1,25 @@
 //! The compiler's phases over the inputs under `crates/ply-cli-tests/phases` -- the parser's
-//! fixtures and corpora mined from the Rust reference's tests -- and over the standard library, the
-//! compiler, the examples and the language corpus. Each test holds what every answer must be, never
-//! a record of an earlier one.
+//! fixtures and corpora mined from the Rust reference's tests -- and over the examples and each
+//! module of the standard library and the compiler. Each test holds what every answer must be, never
+//! a record of an earlier one. `phases_whole` reads those trees whole.
 
 import compiler.code
 import compiler.derive
-import compiler.derive (Expansion)
-import compiler.embed (EmbedAt, want_of_key)
-import compiler.front (no_rows, Dump, Embedded, KnownDefRow, ShippedData, Analysed, Refused,
-                       checked_staged, dump_of, embeds_wanted, pulls_bin, pulls_of, rows_of,
-                       shipped_data_embeds, staged_pulling_std_with)
+import compiler.front (pulls_bin, pulls_of)
 import compiler.hash
-import compiler.hash (HashOutput, Node, TestNode, Printed, Unprintable)
 import compiler.infer
 import compiler.items
 import compiler.lexer
-import compiler.load (shipped_for, tell_viewed)
 import compiler.resolve
-import compiler.resolve (Source, Diag, ResolveSucceeded, ResolveFailed)
+import compiler.resolve (Source)
 import compiler.rewrite
-import harness (compiler_tree, example_files, lang_corpus, module_in, phase_files, prelude_file,
-                std_data, std_tree)
+import harness (compiler_tree, example_files, module_in, phase_files, std_tree)
 import std.bin
 import std.bytes
-import std.list (any, at, concat, find, flatten, last, somes, take)
-import std.show (show)
+import std.list (any, concat, find, flatten, last, take)
 import std.string
 
-type File = { name: String, bytes: Bytes }
+pub type File = { name: String, bytes: Bytes }
 
 // --- The inputs -----------------------------------------------------------------
 
@@ -44,7 +36,7 @@ fn top_level(files: List<File>) -> List<File> / {abort.raise} =
 
 /// Each `.ply` file of a tree as the module its place names below `prefix`: `a/b.ply` is
 /// `<prefix>a.b`.
-fn modules_of(files: List<File>, prefix: String) -> List<Source> / {abort.raise} =
+pub fn modules_of(files: List<File>, prefix: String) -> List<Source> / {abort.raise} =
   map(filter(files, is_ply), |file: File|
     { name: bytes_of_string(module_in(prefix, file.name)), src: file.bytes })
 
@@ -314,21 +306,6 @@ test "a mined program checked from its own interfaces answers as its walked bodi
 fn tree_modules() -> List<Source> / {abort.raise} =
   concat(modules_of(std_tree(), "std."), modules_of(compiler_tree(), ""))
 
-/// What each module of the compiler's tree embeds, read where a driver that read the tree finds it:
-/// a file of the tree under its name, and the prelude beside the tree.
-fn compiler_embeds() -> List<Embedded> / {abort.raise} =
-  map(embeds_wanted(b"", modules_of(compiler_tree(), "")), |asked: Embedded|
-    {
-      ..asked,
-      read: if asked.want.path == b"../prelude.ply" { Ok([{ name: b"", bytes: prelude_file() }]) }
-      else {
-        match filter(compiler_tree(), |file: File| bytes_of_string(file.name) == asked.want.path) {
-          [file, ..] -> Ok([{ name: b"", bytes: file.bytes }]),
-          [] -> Err(b"the compiler's tree holds no such file"),
-        }
-      },
-    })
-
 // What a load reads a module's imports from: its header alone, wherever that says all of them.
 test "{string_of_bytes_lossy(s.name)}'s header holds the imports its whole parse finds" for s: Source in tree_modules(
   ) {
@@ -343,273 +320,6 @@ test "{string_of_bytes_lossy(s.name)}'s pulls read back as they were kept" for s
   ) {
   let pulls = pulls_of(s);
   assert_eq(bin::decode(bin::encode(pulls, pulls_bin()), pulls_bin()), Ok(pulls))
-}
-
-/// A program the checker is run over: the standard library read apart from any program, as the
-/// toolchain's own tree is, with the data files it embeds and the compiler's modules it imports
-/// pulled for what it reaches; or the compiler with what it embeds.
-type Part = { name: String, modules: List<Source>, embeds: List<Embedded>, apart: Bool }
-
-fn parts() -> List<Part> / {abort.raise} = {
-  let data: List<ShippedData> = map(std_data(), |d: File|
-    { name: bytes_of_string(d.name), bytes: d.bytes });
-  let library = modules_of(std_tree(), "std.");
-  [
-    {
-      name: "the standard library",
-      modules: library,
-      embeds: flatten(
-        map(library, |s: Source|
-          map(shipped_data_embeds(s, data), |e: EmbedAt|
-            { root: b"", module: s.name, want: want_of_key(e.key), read: e.read })),
-      ),
-      apart: true,
-    },
-    {
-      name: "the compiler",
-      modules: modules_of(compiler_tree(), ""),
-      embeds: compiler_embeds(),
-      apart: false,
-    },
-  ]
-}
-
-fn refusal(diags: List<Diag>) -> String / {abort.raise} =
-  string::join(
-    map(take(diags, 10), |d: Diag|
-      string_of_bytes_lossy(d.code) ++ " " ++ string_of_bytes_lossy(d.message)),
-    "\n",
-  )
-
-/// The first entry two tables part at, each as `show` writes it.
-fn parting<a>(table: String, walked: List<a>, seeded: List<a>) -> Option<String> / {abort.raise}
-  where derivable(eq, a), derivable(show, a)
-=
-  if walked == seeded { None } else {
-    let n = max(len(walked), len(seeded));
-    let at = match find(range(0, n), |i: Int| list_at(walked, i) != list_at(seeded, i)) {
-      Some(i) -> i,
-      None -> n,
-    };
-    let shown = |row: Option<a>| {
-      let s = show(row);
-      if string_len(s) > 1500 { string_slice(s, 0, 1500) ++ "..." } else { s }
-    };
-    Some(
-      table ++ " " ++ int_to_string(at) ++ "\n  walked: " ++ shown(list_at(walked, at))
-        ++ "\n  seeded: "
-        ++ shown(list_at(seeded, at)),
-    )
-  }
-
-/// Where the answer a walk made parts from the one made from the rows that walk published.
-fn partings(walked: Dump, seeded: Dump) -> List<String> / {abort.raise} =
-  somes([
-    parting("diagnostic", walked.diags, seeded.diags),
-    parting("definition", walked.defs, seeded.defs),
-    parting("test", walked.tests, seeded.tests),
-    parting("law", walked.laws, seeded.laws),
-    parting("effect", walked.effects, seeded.effects),
-    parting("constructor", walked.ctors, seeded.ctors),
-    parting("definition's rows", walked.rows.defs, seeded.rows.defs),
-    parting("test's rows", walked.rows.tests, seeded.rows.tests),
-    parting("root", walked.emitter_roots, seeded.emitter_roots),
-    parting("body", walked.bodies, seeded.bodies),
-    parting("key", walked.keys, seeded.keys),
-    if walked.walked == seeded.walked { None }
-    else { Some("what the emitter reads of the bodies") },
-  ])
-
-// The same seam over the toolchain's own tree, a part at a time, and through the front end as the
-// CLI seeds it: the rows a load files under their check keys, handed to the next load.
-test "{p.name} checked from the rows its walk published answers as the walk did" for p: Part in parts(
-  ) {
-  let pkgs = { root: b"", manifest: None, supplied: [] };
-  let shipping = shipped_for(p.modules, pkgs);
-  let staged = staged_pulling_std_with(
-    p.modules,
-    shipping.read,
-    pkgs,
-    embeds: p.embeds,
-    unread: shipping.unread,
-    data: shipping.data,
-    apart: p.apart,
-  );
-  tell_viewed(staged.viewed, true);
-  match checked_staged(staged, no_rows()).out {
-    Refused(diags) -> panic(p.name ++ " does not check:\n" ++ refusal(diags)),
-    Analysed(walk) -> {
-      let rows = rows_of(walk);
-      match checked_staged(staged, rows).out {
-        Refused(diags) ->
-          panic(p.name ++ " does not check from the rows its walk published:\n" ++ refusal(diags)),
-        Analysed(seeding) -> {
-          let walked = dump_of(Analysed(walk));
-          let seeded = dump_of(Analysed(seeding));
-          assert(
-            walked == seeded,
-            Some(
-              "a definition published from its rows does not answer as its walked body did:\n"
-                ++ string::join(partings(walked, seeded), "\n"),
-            ),
-          );
-          let taken = fold(seeding.checked.seeded, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
-            map_insert(acc, n, true));
-          assert_eq(
-            filter(map(rows.defs, |r: KnownDefRow| r.name), |n: Bytes| !map_contains(taken, n)),
-            [],
-          );
-          assert_eq(len(seeding.checked.seeded_tests), len(rows.tests))
-        },
-      }
-    },
-  }
-}
-
-// --- The printer -----------------------------------------------------------------------------
-
-type Named = { name: Bytes, hash: Bytes }
-
-/// A test as the hasher stores it, and the module that holds it.
-type Kept = { module: Bytes, key: Bytes, hash: Bytes, body: Bytes }
-
-/// What the hasher stores of a program, and the module each of its names is declared in. `tests`
-/// leaves out the tests over cases, which no search prints.
-type Stored = { out: HashOutput, homes: Map<Bytes, Bytes>, tests: List<Kept> }
-
-fn stored(program: List<Source>) -> Stored / {abort.raise} =
-  match resolve::resolve_modules(
-      map(range(0, len(program)), |i: Int| {
-        let s = at(program, i);
-        let r = items::parse(s.src);
-        let d: Expansion = derive::expand_derives(
-          i,
-          s.name,
-          rewrite::expand(r.node, r.parser.diags).module,
-        );
-        { name: s.name, module: d.module, derived: d.derived }
-      }),
-    ) {
-    ResolveFailed(ds) ->
-      panic("these modules do not resolve: " ++ string_of_bytes_lossy(resolve::dump_diags(ds))),
-    ResolveSucceeded(x) -> {
-      let index = hash::build_index(x.mods, x.r).index;
-      let out = hash::hash_index(index);
-      {
-        out: out,
-        homes: fold(index.nodes, map_new(), |acc: Map<Bytes, Bytes>, n: Node|
-          map_insert(acc, n.name, at(program, n.module).name)),
-        tests: fold(index.tests, [], |acc: List<Kept>, t: TestNode|
-          match t.def.cases {
-            Some(_) -> acc,
-            None ->
-              push(acc, {
-                module: at(program, t.module).name,
-                key: t.key,
-                hash: hash::of_key(out.tests, t.key),
-                body: hash::of_key(out.test_bodies, t.key),
-              }),
-          }),
-      }
-    },
-  }
-
-fn names_of(s: Stored) -> List<Named> = concat(s.out.defs, s.out.decls)
-
-/// A name with the hash it is filed under: a function and an effect of one module may share a name.
-fn filed(x: Named) -> Bytes = bytes_concat_all([x.name, b"\x00", x.hash])
-
-/// What of the modules `of` picks, and of what they reach, does not print back to itself: a
-/// definition or a test that, printed beside the rest and stored again, is filed under another hash
-/// or under none.
-fn unfaithful(s: Stored, of: (Bytes) -> Bool) -> List<String> / {abort.raise} = {
-  let tests = filter(s.tests, |t: Kept| of(t.module));
-  let own = filter(names_of(s), |x: Named|
-    match map_get(s.homes, x.name) { Some(m) -> of(m), None -> false });
-  let reached = hash::closure_of(
-    s.out,
-    concat(map(own, |x: Named| x.name), map(tests, |t: Kept| t.key)),
-  );
-  let named = filter(names_of(s), |x: Named| map_contains(reached, x.name));
-  match hash::print_bodies(
-      map(
-        filter(s.out.bodies, |b: { name: Bytes, body: Bytes }| map_contains(reached, b.name)),
-        |b: { name: Bytes, body: Bytes }| b.body,
-      ),
-      map(named, |x: Named| { name: x.name, hash: x.hash, public: true }),
-      map(tests, |t: Kept| t.body),
-      [],
-      [],
-    ) {
-    Unprintable(why) -> [string_of_bytes_lossy(why.message)],
-    Printed(modules) -> {
-      let again = stored(
-        map(modules, |m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text }),
-      );
-      let now = fold(names_of(again), map_new(), |acc: Map<Bytes, Bool>, x: Named|
-        map_insert(acc, filed(x), true));
-      let run = fold(map_values(again.out.tests), map_new(), |acc: Map<Bytes, Bool>, h: Bytes|
-        map_insert(acc, h, true));
-      concat(
-        map(filter(named, |x: Named| !map_contains(now, filed(x))), |x: Named|
-          string_of_bytes_lossy(x.name)),
-        map(filter(tests, |t: Kept| !map_contains(run, t.hash)), |t: Kept|
-          "test " ++ string_of_bytes_lossy(t.key)),
-      )
-    },
-  }
-}
-
-/// The modules of `sources` that need no package but the library: none that imports the
-/// compiler, and none that imports such a module, however far.
-fn alone(sources: List<Source>) -> List<Source> / {abort.raise} = {
-  let imports = map(sources, |s: Source|
-    { name: s.name, of: map(items::parse(s.src).node.imports, resolve::import_module_name) });
-  let direct = fold(
-    imports,
-    map_new(),
-    |acc: Map<Bytes, Bool>, m: { name: Bytes, of: List<Bytes> }|
-      if any(m.of, |n: Bytes| bytes_starts_with(n, b"compiler.")) { map_insert(acc, m.name, true) }
-      else { acc },
-  );
-  let needing = iterate(direct, len(sources) + 1, |held: Map<Bytes, Bool>| {
-    let grown = fold(imports, held, |acc: Map<Bytes, Bool>, m: { name: Bytes, of: List<Bytes> }|
-      if !map_contains(acc, m.name) && any(m.of, |n: Bytes| map_contains(acc, n)) {
-        map_insert(acc, m.name, true)
-      } else { acc });
-    if map_len(grown) == map_len(held) { Stop(grown) } else { Continue(grown) }
-  });
-  filter(sources, |s: Source| !map_contains(needing, s.name))
-}
-
-// A program prints with what it reaches, as a bisection prints it: two of them may declare one
-// effect alike, which no print of both can name.
-test "every body and test of the library, the examples and the language corpus prints back to what it was stored under" {
-  let held = alone(
-    flatten([
-      modules_of(std_tree(), "std."),
-      modules_of(example_files(), ""),
-      modules_of(lang_corpus(), ""),
-    ]),
-  );
-  let programs = filter(held, |p: Source| !bytes_starts_with(p.name, b"std."));
-  let s = stored(held);
-  let wrong = flatten([
-    unfaithful(s, |m: Bytes| bytes_starts_with(m, b"std.")),
-    flatten(
-      map(programs, |p: Source|
-        map(unfaithful(s, |m: Bytes| m == p.name), |w: String|
-          string_of_bytes_lossy(p.name) ++ ": " ++ w)),
-    ),
-  ]);
-  assert(len(names_of(s)) > 3000 && len(s.tests) > 1000, Some("the corpora have been lost"));
-  assert(
-    wrong == [],
-    Some(
-      int_to_string(len(wrong)) ++ " do not print back to what they were stored under:\n"
-        ++ string::join(take(wrong, 40), "\n"),
-    ),
-  )
 }
 
 // --- Effects ---------------------------------------------------------------------------------
