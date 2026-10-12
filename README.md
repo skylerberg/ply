@@ -59,11 +59,10 @@ with a pack after it holding the shipped modules, what they answer and the CLI's
 `ply` already in `target/` or, in a fresh checkout, the last release (`scripts/stage0.sh`). Cargo
 builds nothing after an edit to Ply sources alone.
 
-CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
-cut from the durations its last run measured.
-The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
-each `lanes` job runs a partition of them, apart from the `nextest` jobs. The proof runs, `proofs` for the
-standard library and `laws-<id>` for a package, each take a `corpus` job of their own.
+CI builds one `cargo nextest archive --locked --workspace` and runs it in shards.
+The Ply tests run as the runs `.github/ci-shards.sh` lists, each one `ply test` or `ply prove` of a
+package in a `corpus` job: the library's tests and its proofs, the corpus's checks
+(`crates/ply-corpus/checks`), the CLI's suite in parts, and the packages' own suites.
 `.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
