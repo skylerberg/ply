@@ -1115,7 +1115,20 @@ pub type Over<a> = { value: a, tree: MemFs }
 pub fn on_mem<a, [l] | e>(
   tree: MemFs,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Over<a> / {abort.raise | e bounded} = over_mem[l](tree, -1, go)
+) -> Over<a> / {abort.raise | e bounded} = {
+  let ran = over_mem[l](tree, -1, go);
+  { value: ran.value, tree: ran.tree }
+}
+
+/// What `go` answered over a twin, the tree it left, and how many operations it asked of it.
+pub type Counted<a> = { value: a, tree: MemFs, asked: Int }
+
+/// `go` run as `on_mem` runs it, beside how many operations it asked of the file system, a read as
+/// much as a write: what a test holds the cost of a run to.
+pub fn on_mem_counted<a, [l] | e>(
+  tree: MemFs,
+  go: () -> a / {fs.read[l], fs.write[l] | e},
+) -> Counted<a> / {abort.raise | e bounded} = over_mem[l](tree, -1, go)
 
 /// `go` run as `on_mem` runs it, over a disk that takes `writes` more operations and then no more:
 /// from there on every operation that would change what the tree holds changes nothing and answers
@@ -1127,7 +1140,10 @@ pub fn on_mem_failing<a, [l] | e>(
   tree: MemFs,
   writes: Int,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Over<a> / {abort.raise | e bounded} = over_mem[l](tree, max(writes, 0), go)
+) -> Over<a> / {abort.raise | e bounded} = {
+  let ran = over_mem[l](tree, max(writes, 0), go);
+  { value: ran.value, tree: ran.tree }
+}
 
 /// What an operation the failing disk refused answers where it answers a `Refused`.
 fn failed() -> Refused = Other(5, "input/output error")
@@ -1137,9 +1153,14 @@ fn over_mem<a, [l] | e>(
   tree: MemFs,
   left: Int,
   go: () -> a / {fs.read[l], fs.write[l] | e},
-) -> Over<a> / {abort.raise | e bounded} =
-  with_cell[mem_tree]({ tree: tree, left: left }) { t -> {
-    let now = || cell_get(t).tree;
+) -> Counted<a> / {abort.raise | e bounded} =
+  with_cell[mem_tree]({ tree: tree, left: left, asked: 0 }) { t -> {
+    // Every operation reads the tree once, as it begins.
+    let now = || {
+      let s = cell_get(t);
+      cell_set(t, { ..s, asked: s.asked + 1 });
+      s.tree
+    };
     let moved_on = |next: MemFs| cell_set(t, { ..cell_get(t), tree: next });
     let taken = || {
       let s = cell_get(t);
@@ -1232,7 +1253,8 @@ fn over_mem<a, [l] | e>(
         } else { Err(failed()) }
       },
     };
-    { value: value, tree: now() }
+    let end = cell_get(t);
+    { value: value, tree: end.tree, asked: end.asked }
   } }
 
 // --- Writing a file whole or not at all ----------------------------------------
@@ -2834,6 +2856,17 @@ test "a loss of power keeps a file's bytes as it was synced and its name as its 
   assert(!mem_sync(base, "d/absent").ok);
   let held = mem_open(base, "d/old", ToRead);
   assert_eq(map_len(mem_crashed(mem_lock(held.fs, "d/lock").fs).opened), 0)
+}
+
+test "a counted run says how many operations it asked, a read as much as a write" {
+  let ran = on_mem_counted[d](mem_of([{ path: "a", body: b"1" }]), || {
+    fs.read_file[d]("a");
+    fs.exists[d]("b");
+    fs.write_file[d]("b", b"2")
+  });
+  assert(ran.value);
+  assert_eq(ran.asked, 3);
+  assert_eq(mem_list(ran.tree, ""), Some(["a", "b"]))
 }
 
 test "a disk that fails after so many writes changes nothing from there on, and says it failed" {

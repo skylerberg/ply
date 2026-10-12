@@ -10,7 +10,6 @@ import compiler.front
 import compiler.front (View, Outlined, OType, FiledBody, FiledDef, KnownTestRow, body_encoding,
                        filed_bodies, interfaces_of)
 import compiler.infer (CtorInfo, DefInfo, EffectInfo, OpInfo, TestInfo, Location)
-import compiler.memo (Record)
 import compiler.memo_files
 import compiler.resolve (Diag, qualify)
 import compiler.type_syntax (mode_text)
@@ -213,6 +212,8 @@ fn memo_json(u: memo_files::Usage) -> Json =
     { key: "answers", value: int(u.answers) },
     { key: "answer_bytes", value: int(u.answer_bytes) },
     { key: "unread_bytes", value: int(u.unread_bytes) },
+    { key: "segments", value: int(u.segments) },
+    { key: "bytes", value: int(u.bytes) },
   ])
 
 fn stats_json(stats: Stats) -> Json / {abort.raise} =
@@ -279,8 +280,12 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
     indent() ++ "memo · " ++ bold(style, int_to_string(stats.memo.records)) ++ " "
       ++ plural(stats.memo.records, "record")
       ++ " · "
-      ++ count_of(stats.memo.answers, "answer"),
-    indent() ++ "  answers " ++ dim(style, size_text(stats.memo.answer_bytes)) ++ " · reclaimable "
+      ++ count_of(stats.memo.answers, "longer answer"),
+    indent() ++ "  " ++ count_of(stats.memo.segments, "segment") ++ " "
+      ++ dim(style, size_text(stats.memo.bytes))
+      ++ " · answers "
+      ++ dim(style, size_text(stats.memo.answer_bytes))
+      ++ " · reclaimable "
       ++ dim(style, size_text(stats.memo.unread_bytes)),
   ];
   let advised = if compact_suggested(stats) {
@@ -692,22 +697,20 @@ fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us, a
   }
 }
 
-/// Bytes the store and the memo store's answers take on disk.
+/// Bytes the store and the memo store's segments take on disk.
 fn kept_bytes<[r]>(place: loads::Place) -> Int / {fs.read[r], abort.raise} =
   size_of[r](place, "store.idx") + size_of[r](place, "store.dat")
-    + memo_files::usage[r](memo_dir(place)).answer_bytes
+    + memo_files::usage[r](memo_dir(place)).bytes
 
 fn compacted_of<[r]>(
   place: loads::Place,
   current: Map<Bytes, Bool>,
-  mine: Bytes,
 ) -> Compacted / {fs.read[r], fs.write[r], entropy.next, time.now_ms, abort.raise} = {
   let before = kept_bytes[r](place);
   let c = tables::open_cache[r](place.dir, place.stamps);
   let pruned = tables::prune[r](c);
   let done = tables::compact_cache[r](pruned.cache);
-  let memo = memo_files::compacted[r](memo_dir(place), |name: String, rec: Record|
-    queried::askable(current, mine, name, rec));
+  let memo = memo_files::compacted[r](memo_dir(place), map_keys(current));
   {
     directory: shown(place, ""),
     warnings: loads::diags_of(tables::warnings(done)),
@@ -949,11 +952,9 @@ pub fn run(
     stats_answer(s, Ok(if cwd { stats_of[cwd](place) } else { stats_of[abs](place) }))
   } else if flags.action == "compact" {
     let current = queried::current();
-    let mine = queried::program();
     compact_answer(
       s,
-      Ok(if cwd { compacted_of[cwd](place, current, mine) }
-      else { compacted_of[abs](place, current, mine) }),
+      Ok(if cwd { compacted_of[cwd](place, current) } else { compacted_of[abs](place, current) }),
     )
   } else if flags.action == "clear" {
     clear_answer(s, if cwd { cleared_of[cwd](place) } else { cleared_of[abs](place) })
@@ -984,7 +985,7 @@ fn no_stats() -> Stats =
     index_bytes: 0,
     data_bytes: 0,
     garbage_bytes: 0,
-    memo: { records: 0, answers: 0, answer_bytes: 0, unread_bytes: 0 },
+    memo: { records: 0, answers: 0, answer_bytes: 0, unread_bytes: 0, segments: 0, bytes: 0 },
   }
 
 fn an_entry() -> Entry =
@@ -1014,7 +1015,14 @@ test "a half-wasted data file is where compaction starts being suggested" {
   assert(!compact_suggested(half));
   assert(compact_suggested({ ..half, garbage_bytes: 501 }));
   assert(!compact_suggested({ ..half, data_bytes: 0, garbage_bytes: 0 }));
-  let answers = { records: 2, answers: 2, answer_bytes: 1000, unread_bytes: 501 };
+  let answers = {
+    records: 2,
+    answers: 2,
+    answer_bytes: 1000,
+    unread_bytes: 501,
+    segments: 1,
+    bytes: 1200,
+  };
   assert(compact_suggested({ ..half, memo: answers }))
 }
 
@@ -1031,7 +1039,7 @@ test "the statistics read as five lines and the sizes under them" {
     index_bytes: 512,
     data_bytes: 1000,
     garbage_bytes: 250,
-    memo: { records: 3, answers: 5, answer_bytes: 2048, unread_bytes: 0 },
+    memo: { records: 3, answers: 5, answer_bytes: 2048, unread_bytes: 0, segments: 2, bytes: 4096 },
   };
   let lines = stats_lines(plain(), st);
   assert_eq(at_or(lines, 0, ""), "   /p/.ply-cache");
@@ -1041,8 +1049,8 @@ test "the statistics read as five lines and the sizes under them" {
   assert_eq(at_or(lines, 4, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
   assert_eq(at_or(lines, 5, ""), "   history · 4 definitions · 4 bodies");
   assert_eq(at_or(lines, 6, ""), "     index 512 B · data 1000 B · reclaimable 250 B (25%)");
-  assert_eq(at_or(lines, 7, ""), "   memo · 3 records · 5 answers");
-  assert_eq(at_or(lines, 8, ""), "     answers 2.00 KiB · reclaimable 0 B");
+  assert_eq(at_or(lines, 7, ""), "   memo · 3 records · 5 longer answers");
+  assert_eq(at_or(lines, 8, ""), "     2 segments 4.00 KiB · answers 2.00 KiB · reclaimable 0 B");
   assert_eq(at_or(lines, 9, ""), "     a result entry is one proven configuration, not one test")
 }
 
