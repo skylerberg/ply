@@ -120,6 +120,7 @@ module.exports = grammar({
       $.requires_clause,
       $.ensures_clause,
       $.cost_clause,
+      $.space_clause,
     ),
 
     where_clause: $ => seq('where', seq($.predicate, repeat(seq(',', $.predicate)))),
@@ -144,6 +145,7 @@ module.exports = grammar({
     requires_clause: $ => seq('requires', field('condition', $._expression)),
     ensures_clause: $ => seq('ensures', field('condition', $._expression)),
     cost_clause: $ => seq('cost', field('measure', $._expression)),
+    space_clause: $ => seq('space', field('bound', $._expression)),
 
     parameter_list: $ => seq('(', optional(commaSep1($.parameter)), ')'),
     parameter: $ => seq(

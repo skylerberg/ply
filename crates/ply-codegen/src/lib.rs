@@ -10,6 +10,7 @@ pub mod array;
 pub mod backend;
 pub mod blocks;
 pub mod c;
+pub mod columns;
 pub mod detached;
 pub mod heap;
 pub mod host;

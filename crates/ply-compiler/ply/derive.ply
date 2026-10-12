@@ -39,7 +39,8 @@ pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
       || name == b"Decimal"
       || name == b"Char" { Leaf } else if name == b"Float" {
     match deriver { DOrd -> Refused(HoldsFloat), DHash -> Refused(HoldsFloat), _ -> Leaf }
-  } else if name == b"List" || name == b"Array" || name == b"Option" || name == b"Map"
+  } else if name == b"List" || name == b"Array" || name == b"Columns" || name == b"Option"
+      || name == b"Map"
       || name == b"Result"
       || name == b"Ordering"
       || name == b"Rounding"
@@ -360,6 +361,99 @@ fn written_params(m: Member) -> List<Bytes> =
 fn param_names(m: Member) -> List<Bytes> = map(m.params, |p: { name: Bytes, ty: Bytes }| p.name)
 
 /// A dictionary whose fields are `members`, each a lambda.
+/// The JSON or binary codec of a `Columns` of `elem`, whose records' codec is `item`: the list
+/// codec's, over the records `columns_to_list` lists and `columns_of_list` holds again.
+fn columns_codec(emitter: DeriveEmitter, item: Bytes, elem: Bytes) -> Bytes = {
+  let b = emitter.b;
+  let rt = emitter.rt;
+  let held = bytes_concat_all([b"Columns<", elem, b">"]);
+  if same_deriver(emitter.d, DJson) {
+    let list = bytes_concat_all([rt, b"list_json(", item, b")"]);
+    bytes_concat_all([
+      b"{encode: |",
+      b,
+      b"c: ",
+      held,
+      b"| (",
+      list,
+      b".encode)(columns_to_list(",
+      b,
+      b"c)), ",
+      b"decode: |",
+      b,
+      b"j: ",
+      rt,
+      b"Json| match (",
+      list,
+      b".decode)(",
+      b,
+      b"j) {",
+      b"Ok(",
+      b,
+      b"l) -> Ok(columns_of_list(",
+      b,
+      b"l)), Err(",
+      b,
+      b"e) -> Err(",
+      b,
+      b"e)}}",
+    ])
+  } else {
+    bytes_concat_all([
+      b"{put: |",
+      b,
+      b"w: Bytes, ",
+      b,
+      b"c: ",
+      held,
+      b"| ",
+      rt,
+      b"put_list(",
+      b,
+      b"w, ",
+      b"columns_to_list(",
+      b,
+      b"c), (",
+      item,
+      b").put), ",
+      b"take: |",
+      b,
+      b"d: Bytes, ",
+      b,
+      b"n: Int| match ",
+      rt,
+      b"take_list(",
+      b,
+      b"d, ",
+      b,
+      b"n, (",
+      item,
+      b").take) {Ok(",
+      b,
+      b"t) -> Ok({value: columns_of_list(",
+      b,
+      b"t.value), at: ",
+      b,
+      b"t.at}), Err(",
+      b,
+      b"e) -> Err(",
+      b,
+      b"e)}, ",
+      b"shape: |",
+      b,
+      b"s: ",
+      rt,
+      b"Shapes| ",
+      rt,
+      b"applied_shape(",
+      b,
+      b"s, \"Columns\", [(",
+      item,
+      b").shape])}",
+    ])
+  }
+}
+
 fn literal(members: List<Member>) -> Bytes =
   bytes_concat_all([
     b"{",
@@ -801,8 +895,10 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
     TCon(c) -> {
       let simple = c.name.name.name;
       let codecs = map(c.args, |a: TypeExpr| codec(emitter, a, render_type(a)));
-      // A JSON object's keys are strings, so a `Map<String, v>` has an object form.
-      if same_deriver(emitter.d, DJson) && simple == b"Map" && len(c.args) == 2
+      // A `Columns` is written as the list of its records, through its builtins.
+      if simple == b"Columns" && len(c.args) == 1 {
+        columns_codec(emitter, at(codecs, 0), render_type(at(c.args, 0)))
+      } else if same_deriver(emitter.d, DJson) && simple == b"Map" && len(c.args) == 2
           && is_string(emitter, at(c.args, 0)) {
         bytes_concat_all([emitter.rt, b"string_map_json(", at(codecs, 1), b")"])
       } else {
@@ -1202,7 +1298,7 @@ fn bin_call(
       Some(call) -> call,
       None -> match ty {
         TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
-          Structural ->
+          Structural -> if c.name.name.name == b"Columns" { through() } else {
             bytes_concat_all([
               emitter.rt,
               member,
@@ -1214,7 +1310,8 @@ fn bin_call(
                 b", ",
               ),
               b")",
-            ]),
+            ])
+          },
           _ -> through(),
         },
         _ -> through(),
@@ -2379,6 +2476,15 @@ test "the bin form writes scalars straight, composes the rest, and keys a sum by
     at(out, 1),
     b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = {put: |dw: Bytes, dv: Tree<a>| tree_bin_put(a, bin::max_depth(), dw, dv), take: |dd: Bytes, dn: Int| tree_bin_take(a, bin::max_depth(), dd, dn), shape: |ds: bin::Shapes| tree_bin_shape(a, bin::max_depth(), ds)}\nfn tree_bin_put<a>(a: bin::BinCodec<a>, ddepth: Int, dw: Bytes, dv: Tree<a>) -> Bytes / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().put)(dw, dv)} else {match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)(tree_bin_put(a, ddepth - 1, bin::put_tag(dw, 1), d0), d1)}}\nfn tree_bin_take<a>(a: bin::BinCodec<a>, ddepth: Int, dd: Bytes, dn: Int) -> Result<bin::Taken<Tree<a>>, bin::BinError> / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().take)(dd, dn)} else {match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match tree_bin_take(a, ddepth - 1, dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}}\nfn tree_bin_shape<a>(a: bin::BinCodec<a>, ddepth: Int, ds: bin::Shapes) -> bin::Shaped / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().shape)(ds)} else {bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [|ds: bin::Shapes| tree_bin_shape(a, ddepth - 1, ds), a.shape]}])}",
   )
+}
+
+test "a `Columns` is coded as the list of its records, through its builtins" {
+  let src = b"import std.bin\nimport std.json\ntype P = {x: Int}\ntype Batch = {ps: Columns<P>}\nderive bin for P\nderive json for P\nderive bin for Batch\nderive json for Batch";
+  let all = bytes_concat_all(preview(b"m", parse(src).node));
+  assert(bytes_index_of(all, b"columns_to_list(") != None);
+  assert(bytes_index_of(all, b"columns_of_list(") != None);
+  assert(bytes_index_of(all, b"put_columns") == None);
+  assert(bytes_index_of(all, b"columns_json(") == None)
 }
 
 test "a row reads a column per field, and a field that is no scalar as a document through its codec" {

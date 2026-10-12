@@ -1,11 +1,11 @@
 //! The compiled array: its elements laid out in the object's own payload, so an index is a load.
-//! An array of records, `Float`s or 64-bit widths holds each in place, as field `e` of a run of
-//! one-field records: `layout` names that record's shape and `aux` its words, the array's stride,
-//! and the bitmap after the words says which of them it counts.
+//! An array of records, `Float`s, 64-bit widths or `Decimal`s holds each in place, as field `e` of
+//! a run of one-field records: `layout` names that record's shape and `aux` its words, the array's
+//! stride, and the bitmap after the words says which of them it counts.
 
 use crate::heap::{
-    self, FLAT, Heap, KIND_ARRAY, KIND_FIXED, KIND_FLOAT, KIND_RECORD, Layouts, MIXED, Obj, RAW,
-    Slot, Word, counted, dec, field_word, inc, is_unique, obj, set_word, word_at,
+    self, FLAT, Heap, KIND_ARRAY, KIND_RECORD, Layouts, MIXED, Obj, RAW, Slot, Word, counted, dec,
+    field_word, inc, is_unique, obj, set_word, word_at,
 };
 use ply_eval::Symbol;
 
@@ -55,16 +55,12 @@ pub fn elements(heap: &mut Heap, layouts: &Layouts, o: *mut Obj) -> Vec<Word> {
     (0..len(o)).map(|i| element(heap, layouts, o, i)).collect()
 }
 
-/// The field `e` an array holds elements of `w`'s kind in place as: a record of its shape, a
-/// `Float`'s bits or a 64-bit width's; `None` for any other element, which it holds as its word.
+/// The field `e` an array holds elements of `w`'s kind in place as: a record of its shape, or a
+/// scalar as its own words; `None` for any other element, which it holds as its word.
 fn slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
     match heap::kind(w) {
-        KIND_RECORD if layouts.layout.in_place => Some(Slot::Record(unsafe { (*obj(w)).layout })),
-        KIND_FLOAT => Some(Slot::Float),
-        KIND_FIXED if layouts.layout.raw_widths && unsafe { (*obj(w)).len } == 1 => {
-            Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
-        }
-        _ => None,
+        KIND_RECORD => Some(Slot::Record(unsafe { (*obj(w)).layout })),
+        _ => heap::raw_slot_of(layouts, w),
     }
 }
 
@@ -86,12 +82,10 @@ impl Heap {
     }
 
     /// An array of `items`, which it takes, laid out as an array of their type is wherever it is
-    /// made: records, `Float`s and 64-bit widths in place, where the unit's code reads them so.
+    /// made: records and scalars in place.
     pub fn array_of(&mut self, layouts: &Layouts, items: &[Word]) -> Word {
-        let held = layouts.layout.inline_arrays && !items.is_empty();
         let Some(slot) = items
             .first()
-            .filter(|_| held)
             .and_then(|w| slot_of(layouts, *w))
             .filter(|s| items.iter().all(|w| slot_of(layouts, *w) == Some(*s)))
         else {
@@ -119,10 +113,7 @@ impl Heap {
             for (k, w) in items.iter().enumerate() {
                 match slot {
                     Slot::Record(inner) => heap::embed(layouts, o, k * stride, inner, *w),
-                    _ => {
-                        set_word(o, k * stride, word_at(obj(*w), 0));
-                        dec(*w);
-                    }
+                    raw => heap::hold_raw(o, k * stride, raw, *w),
                 }
             }
             heap::write_tail(o, width, tail, &counted);
@@ -165,10 +156,7 @@ impl Heap {
                         heap::drop_embedded(o, at);
                         heap::embed(layouts, o, at, inner, v);
                     }
-                    _ => {
-                        set_word(o, at, word_at(obj(v), 0));
-                        dec(v);
-                    }
+                    raw => heap::hold_raw(o, at, raw, v),
                 }
             } else {
                 let old = word_at(o, i);

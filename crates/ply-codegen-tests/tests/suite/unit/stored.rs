@@ -366,32 +366,6 @@ fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds(
 }
 
 #[test]
-fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
-    let l = Layouts::of(
-        vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)],
-        &[],
-        RecordLayout {
-            in_place: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let mut h = Heap::new();
-    let value = segment("s", 0.5);
-    let w = h.to_word(&l, &value);
-    let shape = unsafe { (*obj(w)).layout };
-    assert_eq!(l.shape_words(shape), (3, 0));
-    assert!(
-        !l.shape_slots(shape)
-            .iter()
-            .any(|s| matches!(s, Slot::Record(_)))
-    );
-    assert_eq!(Heap::to_value(&l, w), value);
-    let (_into, read) = kept(&l, w);
-    assert_eq!(unsafe { (*obj(read)).layout }, shape);
-    dec(w);
-}
-
-#[test]
 fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is() {
     let l = layouts();
     let mut h = Heap::new();
@@ -409,7 +383,7 @@ fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is()
         let words: Vec<Word> = values.iter().map(|v| h.to_word(&l, v)).collect();
         for (w, v) in words.iter().zip(values) {
             assert_eq!(kind(*w), KIND_FIXED);
-            assert!(native_key(*w));
+            assert!(native_key(&l, *w));
             assert_eq!(Heap::to_value(&l, *w), *v);
             let (_into, read) = kept(&l, *w);
             assert_eq!(Heap::to_value(&l, read), *v);
@@ -469,21 +443,8 @@ fn a_record_holds_a_wide_width_as_its_bits() {
     assert_eq!(kind(offset), KIND_FIXED);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), value);
-    // A unit that holds a width's word in a record has the runtime lay it out so.
-    let words = Layouts::of(
-        vec![],
-        &[],
-        RecordLayout {
-            raw_widths: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let by_word = h.to_word(&words, &value);
-    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
-    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
     dec(w);
     dec(offset);
-    dec(by_word);
 }
 
 #[test]
@@ -546,16 +507,6 @@ fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
     let boxed = ply_codegen::array::element(&mut h, &l, obj(f), 1);
     assert_eq!(kind(boxed), KIND_FLOAT);
     assert_eq!(cmp_words(&l, f, h.to_word(&l, &floats)), Ordering::Equal);
-    let plain = Layouts::of(
-        vec![],
-        &[],
-        RecordLayout {
-            inline_arrays: false,
-            ..RecordLayout::CURRENT
-        },
-    );
-    let words = h.to_word(&plain, &floats);
-    assert!(!ply_codegen::array::in_place(obj(words)));
     dec(shared);
     dec(boxed);
 }
@@ -591,8 +542,8 @@ fn a_char_is_its_own_word_ordered_and_kept_as_the_char_it_is() {
 }
 
 /// `m.Pair`'s arguments as its declaration types them: a segment in place, then a `Float`.
-fn laid_pair(layout: RecordLayout) -> Layouts {
-    let mut l = Layouts::of(layouts().ctors.clone(), &[], layout);
+fn laid_pair() -> Layouts {
+    let mut l = Layouts::of(layouts().ctors.clone(), &[], RecordLayout::CURRENT);
     l.set_ctor_args(&[
         vec![],
         vec![],
@@ -606,7 +557,7 @@ fn laid_pair(layout: RecordLayout) -> Layouts {
 
 #[test]
 fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
-    let l = laid_pair(RecordLayout::CURRENT);
+    let l = laid_pair();
     let mut h = Heap::new();
     let pair = |x: f64| Value::ctor("m.Pair", vec![segment("s", 0.5), Value::Float(x)]);
     let w = h.to_word(&l, &pair(2.5));
@@ -632,15 +583,213 @@ fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
     assert_eq!(cmp_words(&l, w, later), Ordering::Less);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), pair(2.5));
-    // A unit whose code reads a constructor's words has the runtime lay it out so.
-    let words = laid_pair(RecordLayout {
-        ctor_args: false,
-        ..RecordLayout::CURRENT
-    });
-    let plain = h.to_word(&words, &pair(2.5));
-    assert_eq!(unsafe { (*obj(plain)).len }, 2);
-    assert_eq!(Heap::to_value(&words, plain), pair(2.5));
     dec(w);
     dec(later);
-    dec(plain);
+}
+
+fn decimal(text: &str) -> Value {
+    Value::Decimal(text.parse().expect("a decimal"))
+}
+
+#[test]
+fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_words() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let price = decimal("19.990");
+    let w = h.to_word(&l, &price);
+    assert_eq!(kind(w), KIND_DECIMAL);
+    assert_eq!(Heap::to_value(&l, w), price);
+    // Ordered as the numbers they are, whatever their scales.
+    let same = h.to_word(&l, &decimal("19.99"));
+    assert_eq!(cmp_words(&l, w, same), Ordering::Equal);
+    // A map keeps one spelling of a number: only the least scale is a key as it stands.
+    assert!(!native_key(&l, w));
+    assert!(native_key(&l, same));
+    let line = record(vec![("price", price.clone()), ("qty", Value::Int(3))]);
+    let r = h.to_word(&l, &line);
+    // `price` takes two words, `qty` the third, and a word of bitmap says the third alone counts.
+    let shape = unsafe { (*obj(r)).layout };
+    assert_eq!(l.shape_words(shape), (3, 1));
+    assert_eq!(&l.shape_offsets(shape)[..], &[0, 2]);
+    assert_eq!(Heap::to_value(&l, r), line);
+    let prices = Value::array(vec![decimal("1.5"), decimal("-2.25")]);
+    let a = h.to_word(&l, &prices);
+    assert!(ply_codegen::array::in_place(obj(a)));
+    assert_eq!(unsafe { (*obj(a)).aux }, 2);
+    assert_eq!(Heap::to_value(&l, a), prices);
+    let second = ply_codegen::array::element(&mut h, &l, obj(a), 1);
+    assert_eq!(kind(second), KIND_DECIMAL);
+    assert_eq!(Heap::to_value(&l, second), decimal("-2.25"));
+    for x in [w, r, a] {
+        let (_into, read) = kept(&l, x);
+        assert_eq!(Heap::to_value(&l, read), Heap::to_value(&l, x));
+    }
+    // A unit that reads a `Decimal`'s word has the runtime hold it so.
+    let words = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            raw_decimals: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    let by_word = h.to_word(&words, &line);
+    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
+    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
+    assert_eq!(Heap::to_value(&words, by_word), line);
+    for x in [w, same, r, a, second, by_word] {
+        dec(x);
+    }
+}
+
+#[test]
+fn a_long_slice_of_bytes_is_a_view_that_holds_its_value_and_never_grows_in_place() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let whole = h.bytes(&all);
+    inc(whole);
+    let view = h.slice(&l, whole, 10, 150);
+    let o = obj(view);
+    assert_eq!(unsafe { (*o).flags } & VIEW, VIEW);
+    assert_eq!(unsafe { bytes_of(o) }, &all[10..150]);
+    assert_eq!(
+        unsafe { (*obj(whole)).rc },
+        2,
+        "the view holds the value it views"
+    );
+    // A view of a view views the value under both, and a short slice is a copy.
+    inc(view);
+    let inner = h.slice(&l, view, 20, 100);
+    assert_eq!(unsafe { word_at(obj(inner), 0) }, whole);
+    assert_eq!(unsafe { bytes_of(obj(inner)) }, &all[30..110]);
+    inc(view);
+    let short = h.slice(&l, view, 0, 8);
+    assert_eq!(unsafe { (*obj(short)).flags } & VIEW, 0);
+    assert_eq!(unsafe { bytes_of(obj(short)) }, &all[10..18]);
+    // All of a value is the value itself.
+    inc(view);
+    assert_eq!(h.slice(&l, view, 0, 140), view);
+    dec(view);
+    // Appending to a view copies, leaving the value it views as it was.
+    inc(view);
+    let grown = h.append(view, b"!");
+    assert_ne!(grown, view);
+    assert_eq!(unsafe { bytes_of(obj(grown)) }.len(), 141);
+    assert_eq!(unsafe { bytes_of(obj(whole)) }, &all[..]);
+    assert_eq!(Heap::to_value(&l, view), Value::bytes(&all[10..150]));
+    let (_into, read) = kept(&l, inner);
+    assert_eq!(Heap::to_value(&l, read), Value::bytes(&all[30..110]));
+    for w in [view, inner, short, grown] {
+        dec(w);
+    }
+    assert_eq!(
+        unsafe { (*obj(whole)).rc },
+        1,
+        "letting the views go lets the value go"
+    );
+    // A unit whose code reads bytes in place has the runtime copy them.
+    let copies = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            bytes_views: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    inc(whole);
+    let copied = h.slice(&copies, whole, 10, 150);
+    assert_eq!(unsafe { (*obj(copied)).flags } & VIEW, 0);
+    dec(copied);
+    dec(whole);
+}
+
+#[test]
+fn marking_a_view_immortal_marks_the_value_it_views() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let whole = h.bytes(&all);
+    inc(whole);
+    let view = h.slice(&l, whole, 0, 100);
+    mark_immortal(view);
+    assert_eq!(unsafe { (*obj(whole)).rc }, IMMORTAL);
+}
+
+/// `{label, x}`, `x` a `Float`.
+fn tagged(x: f64, label: &str) -> Value {
+    record(vec![("label", Value::str(label)), ("x", Value::Float(x))])
+}
+
+#[test]
+fn columns_hold_each_field_of_their_records_apart() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let items: Vec<Word> = (0..3)
+        .map(|i| h.to_word(&l, &tagged(f64::from(i), "p")))
+        .collect();
+    let cs = h.columns_of(&l, &items).expect("records of one shape");
+    let o = obj(cs);
+    assert_eq!(kind(cs), KIND_COLUMNS);
+    assert_eq!(ply_codegen::columns::len(o), 3);
+    // `x` is the second field, its column the `Float`s' bits in place.
+    assert!(ply_codegen::array::in_place(ply_codegen::columns::column(
+        o, 1
+    )));
+    let all = Value::array((0..3).map(|i| tagged(f64::from(i), "p")).collect());
+    assert_eq!(Heap::to_value(&l, cs), all);
+    let second = ply_codegen::columns::record(&mut h, &l, o, 1);
+    assert_eq!(Heap::to_value(&l, second), tagged(1.0, "p"));
+    // Set on a copy where another holds them, and in place where none does.
+    inc(cs);
+    let replaced = h.to_word(&l, &tagged(9.0, "q"));
+    let set = h.columns_set(&l, cs, 0, replaced);
+    assert_ne!(set, cs);
+    assert_eq!(Heap::to_value(&l, cs), all);
+    let again = h.to_word(&l, &tagged(7.0, "r"));
+    let in_place = h.columns_set(&l, set, 2, again);
+    assert_eq!(in_place, set);
+    assert_eq!(
+        Heap::to_value(&l, in_place),
+        Value::array(vec![tagged(9.0, "q"), tagged(1.0, "p"), tagged(7.0, "r")])
+    );
+    assert_eq!(cmp_words(&l, cs, h.to_word(&l, &all)), Ordering::Equal);
+    let (_into, read) = kept(&l, in_place);
+    assert_eq!(kind(read), KIND_COLUMNS);
+    assert_eq!(Heap::to_value(&l, read), Heap::to_value(&l, in_place));
+    // What is not records of one shape is not held in columns.
+    let ints = [h.to_word(&l, &Value::Int(1))];
+    assert!(h.columns_of(&l, &ints).is_none());
+    for w in [cs, second, in_place] {
+        dec(w);
+    }
+}
+
+#[test]
+fn a_buffer_a_view_holds_still_grows_in_place_where_the_view_reads_none_of_the_growth() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let start = h.bytes(&all[..100]);
+    let buf = h.append(start, &all[100..]);
+    inc(buf);
+    let view = h.slice(&l, buf, 0, 100);
+    assert_eq!(unsafe { (*obj(buf)).aux }, 1, "the buffer counts its view");
+    assert!(grows_in_place(buf));
+    let grown = h.append(buf, b"!");
+    assert_eq!(grown, buf, "appended in place past the view");
+    assert_eq!(unsafe { bytes_of(obj(view)) }, &all[..100]);
+    assert_eq!(unsafe { bytes_of(obj(grown)) }.len(), 201);
+    dec(view);
+    assert_eq!(
+        unsafe { (*obj(grown)).aux },
+        0,
+        "letting the view go uncounts it"
+    );
+    // A second full holder is no view: the buffer is copied.
+    inc(grown);
+    let copied = h.append(grown, b"?");
+    assert_ne!(copied, grown);
+    dec(copied);
+    dec(grown);
 }
