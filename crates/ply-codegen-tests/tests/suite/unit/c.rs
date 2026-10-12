@@ -284,19 +284,29 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     assert!(raised.contains("bound on nested calls"), "{raised}");
 }
 
-/// Each bucket's table reads back as the loader fills it, and a table whose C writes the unit's
-/// positions itself names none.
+/// A unit whose C lays its tables out names neither its definitions, its code table's rows nor
+/// its bucket tables, and says each constant's slot; one that leaves them to the loader names
+/// them, and each bucket's table reads back as the loader fills it.
 #[test]
 fn a_units_bucket_tables_read_back_and_a_table_without_them_names_none() {
-    let tables = "helpers 0\nctors 0\ntaken 0\nconstants 0\nmodules 0\nrefused 0\n\
-                  consts 0\nbuiltins 0\nfields 0\nshapes 0\nlambdas 0\n";
-    let with = format!("{tables}buckets 2\n3 0 2\n58 1\n");
-    let read = ply_codegen::c::Exports::decode(&with).expect("the table reads");
-    assert_eq!(read.buckets, vec![(3, vec![0, 2]), (58, vec![1])]);
-    assert_eq!(read.encode(), with);
+    let tables = "helpers 0\nctors 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\n\
+                  consts 0\nbuiltins 0\nfields 0\nshapes 0\n";
     let without = ply_codegen::c::Exports::decode(tables).expect("the table reads");
+    assert!(without.taken.is_empty() && without.lambdas.is_empty());
+    assert_eq!(without.constants, [("m.table".to_string(), Some(4))]);
     assert!(without.buckets.is_empty());
     assert!(without.instances.is_empty());
+    assert_eq!(without.encode(), tables);
+    let named = "helpers 0\nctors 0\ntaken 1\nm.table 0 f_table e_table\nconstants 1\nm.table\n\
+                 modules 0\nrefused 0\nconsts 0\nbuiltins 0\nfields 0\nshapes 0\n\
+                 lambdas 1\ne_table\n";
+    let with = format!("{named}buckets 2\n3 0 2\n58 1\n");
+    let read = ply_codegen::c::Exports::decode(&with).expect("the table reads");
+    assert_eq!(read.taken[0].entry, "e_table");
+    assert_eq!(read.lambdas, ["e_table"]);
+    assert_eq!(read.constants, [("m.table".to_string(), None)]);
+    assert_eq!(read.buckets, vec![(3, vec![0, 2]), (58, vec![1])]);
+    assert_eq!(read.encode(), with);
     // What a type's module states its values are read through follows the buckets, in a unit
     // that holds such a type: `-` for none, `!` for a function the unit does not take.
     let stating = format!("{with}instances 2\nm.Box m.area !\nm.Date - m.written\n");

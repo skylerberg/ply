@@ -58,7 +58,9 @@ pub fn exports_of(defs: &[Def]) -> Exports {
 }
 
 /// The unit's C: the prelude and the runtime declared, each definition and the entry the runtime
-/// calls it through, the runtime's object, and `exports` as the loader reads it.
+/// calls it through, the runtime's object, and what the unit lays out for its loader: the table
+/// `exports` says, and the code table `exports.lambdas` names and the definitions `exports.taken`
+/// names, each by address, a constant's slot being its entry's row of that code table.
 pub fn text(defs: &[Def], exports: &Exports) -> String {
     let mut out = format!("{PRELUDE}{}\n", runtime_header());
     for d in defs {
@@ -74,8 +76,20 @@ pub fn text(defs: &[Def], exports: &Exports) -> String {
         ));
     }
     out.push_str(&runtime_object());
+    let slot_of = |name: &str| {
+        let entry = &exports.taken.iter().find(|t| t.name == name)?.entry;
+        exports.lambdas.iter().position(|l| l == entry)
+    };
+    let said = Exports {
+        taken: Vec::new(),
+        lambdas: Vec::new(),
+        constants: (exports.constants.iter())
+            .map(|(name, slot)| (name.clone(), slot.or_else(|| slot_of(name))))
+            .collect(),
+        ..exports.clone()
+    };
     out.push_str("const char ply_exports[] =\n");
-    for line in exports.encode().lines() {
+    for line in said.encode().lines() {
         out.push('"');
         for b in line.bytes() {
             match b {
@@ -88,6 +102,33 @@ pub fn text(defs: &[Def], exports: &Exports) -> String {
         out.push_str("\\n\"\n");
     }
     out.push_str(";\n");
+    out.push_str("void *const ply_code[] = {");
+    for lambda in &exports.lambdas {
+        out.push_str(&format!(" (void *){lambda},"));
+    }
+    out.push_str(" 0 };\n");
+    let mut taken: Vec<&Taken> = exports.taken.iter().collect();
+    taken.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    out.push_str(
+        "struct ply_taken { const char *name; void *entry; unsigned long arity; };\n\
+         const struct ply_taken ply_taken[] = {",
+    );
+    for t in &taken {
+        out.push_str(&format!(
+            " {{ \"{}\", (void *){}, {} }},",
+            t.name, t.entry, t.arity
+        ));
+    }
+    out.push_str(&format!(
+        " {{ 0, 0, 0 }} }};\n\
+         struct ply_descriptor {{ const char *exports; unsigned long exports_len; void *bind; \
+         void *bind_singletons; void *const *code; unsigned long code_count; \
+         const struct ply_taken *taken; unsigned long taken_count; }};\n\
+         const struct ply_descriptor ply_descriptor = {{ ply_exports, sizeof ply_exports - 1, \
+         (void *)ply_bind, (void *)ply_bind_singletons, ply_code, {}, ply_taken, {} }};\n",
+        exports.lambdas.len(),
+        taken.len()
+    ));
     out
 }
 

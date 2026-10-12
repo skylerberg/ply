@@ -1,6 +1,7 @@
 //! Loading a unit: a library its C was compiled and linked into, opened with `dlopen`, or the
-//! program this executable was linked with, read through its symbol table.
+//! program this executable was linked with.
 
+use super::descriptor::{self, Descriptor};
 use anyhow::{Result, bail};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -27,8 +28,10 @@ pub struct Library {
 
 enum Handle {
     Opened(*mut c_void),
-    /// The program this executable was linked with, read through its symbol table.
-    Linked(&'static super::linked::Symbols),
+    /// The program this executable was linked with, by the descriptor its `main` handed over.
+    Linked(&'static Descriptor),
+    /// The program this executable was linked with, read through a table of its symbols.
+    Named(&'static super::linked::Symbols),
 }
 
 impl Library {
@@ -39,7 +42,20 @@ impl Library {
                 let p = unsafe { dlsym(handle, c.as_ptr()) };
                 (!p.is_null()).then_some(p)
             }
-            Handle::Linked(symbols) => symbols.find(name),
+            Handle::Linked(_) => None,
+            Handle::Named(symbols) => symbols.find(name),
+        }
+    }
+
+    /// What the unit's C lays out for its loader; `None` for a unit that names its symbols for
+    /// the loader to look up instead.
+    pub fn descriptor(&self) -> Option<&Descriptor> {
+        match self.handle {
+            Handle::Linked(unit) => Some(unit),
+            // SAFETY: a unit defines the symbol as its descriptor, which lives as long as it does.
+            _ => self
+                .symbol(descriptor::SYMBOL)
+                .map(|p| unsafe { &*p.cast::<Descriptor>() }),
         }
     }
 
@@ -49,8 +65,12 @@ impl Library {
 
     /// The program linked into this executable, where its `main` installed one.
     pub fn linked() -> Option<Library> {
+        let handle = match super::linked::unit() {
+            Some(unit) => Handle::Linked(unit),
+            None => Handle::Named(super::linked::installed()?),
+        };
         Some(Library {
-            handle: Handle::Linked(super::linked::installed()?),
+            handle,
             path: std::env::current_exe().unwrap_or_default(),
         })
     }

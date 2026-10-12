@@ -2,6 +2,7 @@
 //! about itself read back into the tables its code runs against.
 
 use super::Refused;
+use super::descriptor::Descriptor;
 use super::exports::{Exports, Taken};
 use super::load::Library;
 use super::tables::{UnitTables, root_id};
@@ -12,6 +13,7 @@ use crate::source::Source;
 use anyhow::{Result, bail};
 use ply_eval::{Span, Symbol};
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 
@@ -19,25 +21,59 @@ use std::sync::atomic::AtomicI64;
 pub struct Native {
     /// Kept alive because every [`Entry`] below points into its pages.
     _lib: Library,
-    entries: HashMap<String, (Entry, usize)>,
+    entries: Entries,
     constants: HashMap<String, usize>,
     tables: Arc<Tables>,
+}
+
+/// The definitions a unit holds, each with the entry the runtime calls it through and how many
+/// words it takes.
+enum Entries {
+    /// As the unit's C lays them out, read where they lie. The library they lie in is the
+    /// [`Native`]'s own, which is all that makes the lifetime true.
+    Laid(&'static Descriptor),
+    /// Each looked up by name, in a unit that lays none out.
+    Named(HashMap<String, (Entry, usize)>),
+}
+
+impl Entries {
+    fn get(&self, name: &str) -> Option<(Entry, usize)> {
+        match self {
+            Entries::Laid(unit) => {
+                let row = unit.taking(name)?;
+                Some((entry_at(row.entry()), row.arity()))
+            }
+            Entries::Named(held) => held.get(name).copied(),
+        }
+    }
+
+    fn names(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        match self {
+            Entries::Laid(unit) => Box::new(unit.taken().iter().map(|row| row.name())),
+            Entries::Named(held) => Box::new(held.keys().map(String::as_str)),
+        }
+    }
+}
+
+fn entry_at(address: *mut c_void) -> Entry {
+    // SAFETY: a unit defines each entry it names as a function of an entry's type.
+    unsafe { std::mem::transmute::<*mut c_void, Entry>(address) }
 }
 
 impl Native {
     /// The definitions the unit holds, in name order.
     pub fn names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.entries.keys().cloned().collect();
+        let mut names: Vec<String> = self.entries.names().map(str::to_string).collect();
         names.sort();
         names
     }
 
     pub fn entry(&self, name: &str) -> Option<Entry> {
-        self.entries.get(name).map(|(e, _)| *e)
+        self.entries.get(name).map(|(e, _)| e)
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
-        self.entries.get(name).map(|(_, a)| *a)
+        self.entries.get(name).map(|(_, a)| a)
     }
 
     /// The memo index of a pure nullary root, if `name` is one.
@@ -111,42 +147,32 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         numerics,
         layout,
     } = exports;
-    bind(&lib, &helpers)?;
+    // SAFETY: the descriptor lies in `lib`, which the `Native` made here holds beside all that
+    // reads it.
+    let laid: Option<&'static Descriptor> = lib
+        .descriptor()
+        .map(|unit| unsafe { &*std::ptr::from_ref(unit) });
+    bind(&lib, laid, &helpers)?;
     filled(&lib, &buckets)?;
     let Some(unit) =
         UnitTables::from_tables(ctors, consts, fields, builtins, shapes, lambdas, layout)
     else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
-    let constants = constants_of(&constants, &taken, &unit)?;
-    let mut functions = Vec::with_capacity(unit.lambdas.len());
-    for symbol in &unit.lambdas {
-        let Some(p) = lib.symbol(symbol) else {
-            bail!("the unit the C backend built has no `{symbol}`");
-        };
-        functions.push(p as usize);
-    }
-    let mut entries = HashMap::new();
-    for t in &taken {
-        let Some(p) = lib.symbol(&t.entry) else {
-            bail!("the unit the C backend built has no `{}`", t.entry);
-        };
-        entries.insert(
-            t.name.clone(),
-            (
-                unsafe { std::mem::transmute::<*mut std::ffi::c_void, Entry>(p) },
-                t.arity,
-            ),
-        );
-    }
-    let mut roots: Vec<Root> = taken
-        .iter()
-        .map(|t| Root {
-            id: root_id(&t.name),
-            name: Symbol::new(&t.name),
-            span: source
-                .and_then(|s| s.span_of(&t.name))
-                .unwrap_or(Span::DUMMY),
+    let constants = constants_of(constants, &taken, &unit)?;
+    let (functions, entries) = match laid {
+        Some(laid) => (
+            laid.code().iter().map(|p| *p as usize).collect(),
+            Entries::Laid(laid),
+        ),
+        None => named(&lib, &unit, &taken)?,
+    };
+    let mut roots: Vec<Root> = entries
+        .names()
+        .map(|name| Root {
+            id: root_id(name),
+            name: Symbol::new(name),
+            span: source.and_then(|s| s.span_of(name)).unwrap_or(Span::DUMMY),
         })
         .collect();
     roots.sort_by_key(|r| r.id);
@@ -157,7 +183,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     let taking = |function: &str, takes: usize| match (function, entries.get(function)) {
         ("-", _) => Ok(Stated::No),
         (_, None) => Ok(Stated::Absent),
-        (_, Some((entry, words))) if *words == takes => Ok(Stated::By(*entry as usize)),
+        (_, Some((entry, words))) if words == takes => Ok(Stated::By(entry as usize)),
         (name, Some((_, words))) => bail!(
             "`{name}` is stated of a type and takes {words} words, where it is called with {takes}"
         ),
@@ -197,9 +223,10 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     })
 }
 
-/// Each pure nullary root's memo slot: its code-table row, so the seam and `rt_constant` agree.
+/// Each pure nullary root's memo slot: its code-table row, so the seam and `rt_constant` agree. A
+/// unit that names its code table's rows says no slot, and each is found by its entry's name.
 fn constants_of(
-    constants: &[String],
+    constants: Vec<(String, Option<usize>)>,
     taken: &[Taken],
     unit: &UnitTables,
 ) -> Result<HashMap<String, usize>> {
@@ -208,21 +235,43 @@ fn constants_of(
         .map(|t| (t.name.as_str(), t.entry.as_str()))
         .collect();
     constants
-        .iter()
-        .map(|name| {
+        .into_iter()
+        .map(|(name, slot)| {
+            if let Some(slot) = slot {
+                return Ok((name, slot));
+            }
             let Some(entry) = entries.get(name.as_str()) else {
                 bail!("the unit calls `{name}` a constant but does not take it");
             };
             let Some(slot) = unit.lambda(entry) else {
                 bail!("the unit's code table has no `{entry}`");
             };
-            Ok((name.clone(), slot))
+            Ok((name, slot))
         })
         .collect()
 }
 
-/// Each bucket's table, written before any of its C runs: the unit's position of every key the
-/// bucket's C names by its own.
+/// The code table and the entries of a unit that names them, each looked up in `lib`.
+fn named(lib: &Library, unit: &UnitTables, taken: &[Taken]) -> Result<(Vec<usize>, Entries)> {
+    let mut functions = Vec::with_capacity(unit.lambdas.len());
+    for symbol in &unit.lambdas {
+        let Some(p) = lib.symbol(symbol) else {
+            bail!("the unit the C backend built has no `{symbol}`");
+        };
+        functions.push(p as usize);
+    }
+    let mut entries = HashMap::new();
+    for t in taken {
+        let Some(p) = lib.symbol(&t.entry) else {
+            bail!("the unit the C backend built has no `{}`", t.entry);
+        };
+        entries.insert(t.name.clone(), (entry_at(p), t.arity));
+    }
+    Ok((functions, Entries::Named(entries)))
+}
+
+/// Each bucket's table, written before any of its C runs, in a unit whose C leaves them to the
+/// loader: the unit's position of every key the bucket's C names by its own.
 fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
     for (id, places) in buckets {
         let name = format!("ply_bk_{id:02x}");
@@ -237,17 +286,17 @@ fn filled(lib: &Library, buckets: &[(u8, Vec<u32>)]) -> Result<()> {
     Ok(())
 }
 
-/// `helpers` are the addresses the unit's own table binds, in its order.
-fn bind(lib: &Library, helpers: &[*mut std::ffi::c_void]) -> Result<()> {
-    let Some(p) = lib.symbol("ply_bind") else {
-        bail!("the unit the C backend built has no `ply_bind`");
+/// `helpers` are the addresses the unit's own table binds, in its order. The unit's two binders
+/// are the ones `laid` holds, or else looked up by name.
+fn bind(lib: &Library, laid: Option<&Descriptor>, helpers: &[*mut c_void]) -> Result<()> {
+    let binder = |held: Option<*mut c_void>, name: &str| match held.or_else(|| lib.symbol(name)) {
+        Some(p) if !p.is_null() => Ok(p),
+        _ => bail!("the unit the C backend built has no `{name}`"),
     };
-    let bind: unsafe extern "C" fn(*const *mut std::ffi::c_void) =
-        unsafe { std::mem::transmute(p) };
+    let p = binder(laid.map(Descriptor::bind), "ply_bind")?;
+    let bind: unsafe extern "C" fn(*const *mut c_void) = unsafe { std::mem::transmute(p) };
     unsafe { bind(helpers.as_ptr()) };
-    let Some(p) = lib.symbol("ply_bind_singletons") else {
-        bail!("the unit the C backend built has no `ply_bind_singletons`");
-    };
+    let p = binder(laid.map(Descriptor::bind_singletons), "ply_bind_singletons")?;
     let singletons: unsafe extern "C" fn(Word, Word, Word) = unsafe { std::mem::transmute(p) };
     unsafe {
         singletons(
