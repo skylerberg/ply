@@ -8,6 +8,7 @@ import std.bin
 import std.hash (blake3)
 import std.bytes (join, hex_of)
 import std.list (at, concat, contains, drop, flatten, reverse, sort_by)
+import memo
 import memo (memo, memo_keep, Held, Query, Run, Tally, answer, nothing_held, over_held, ran_total,
              ran_for, started, tallies)
 import unit (definition_hash)
@@ -961,21 +962,21 @@ pub fn group_answer_of(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 
 /// What a check of the whole module offered for the group `asked`, where it offered one: a group
 /// asked of a module the store holds no group of is answered with the rest of them, by one check of
-/// the module, whatever asks it first. One asked while that check runs is answered alone: the check
-/// reads the entries of the groups it holds records of, and through one of them this group.
-fn taken_whole(asked: GroupNamed) -> Option<Bytes> / {memo.read, abort.raise} = {
-  let whole = bin::encode(
-    { module: asked.module, shipped: asked.shipped, tested: asked.tested },
-    named_bin(),
-  );
+/// the module, whatever asks it first.
+fn taken_whole(asked: GroupNamed) -> Option<Bytes> / {memo.read, abort.raise} =
   match memo.offered() {
     Some(o) -> Some(o),
-    None -> if memo.open(whole_query(), whole) { None } else {
-      memo.ask(whole_query(), whole);
+    None -> {
+      memo.ask(
+        whole_query(),
+        bin::encode(
+          { module: asked.module, shipped: asked.shipped, tested: asked.tested },
+          named_bin(),
+        ),
+      );
       memo.offered()
     },
   }
-}
 
 pub fn whole_query() -> Bytes = b"whole"
 
@@ -1358,10 +1359,9 @@ fn offered_whole(
 ) -> Offered / {memo.read, abort.raise} = {
   let missing = filter(groups, |g: GroupNamed|
     !memo.kept(group_query(), bin::encode(g, group_named_bin())));
-  // A module with any group kept checks only the groups it lacks, those together, so an edit costs
-  // the groups it moves and reads what they share once.
-  if len(missing) <= 1 { { refused: None, answers: map_new() } }
-  else if len(missing) < len(groups) { offered_together(named, read, missing) } else {
+  // Checked together beside kept groups, one would be read through a kept owner's entry unanswered.
+  if len(missing) <= 1 || len(missing) < len(groups) { { refused: None, answers: map_new() } }
+  else {
     let facts = facts_of(read);
     let module = named.module;
     let checked = checked_whole(named, read, false);
@@ -1406,117 +1406,6 @@ fn offered_whole(
     }
   }
 }
-
-/// Offers each of `missing`, groups of `read`, a module the store holds others of, what a check of
-/// them together answers of it. A check that refuses offers nothing: each group then checks alone
-/// and says why.
-fn offered_together(
-  named: Named,
-  read: OwnersAnswer,
-  missing: List<GroupNamed>,
-) -> Offered / {memo.read, abort.raise} = {
-  let members = fold(missing, [], |acc: List<OwnerFacts>, g: GroupNamed|
-    concat(acc, map(g.owners, |o: Bytes| owner_facts(named, o))));
-  let own = map(members, |f: OwnerFacts| f.read.owner);
-  let reading = fold(members, [], |acc: List<Bytes>, f: OwnerFacts|
-    fold(f.mentions, acc, |a: List<Bytes>, m: Mention|
-      if m.module != named.module { a } else {
-        fold(
-          declared_of(m.module, named.shipped, named.tested, m.name),
-          a,
-          |b: List<Bytes>, o: Bytes|
-            if contains(own, o) || contains(b, o) { b } else { push(b, o) },
-        )
-      }));
-  let still_open = fold(reading, false, |any: Bool, o: Bytes|
-    any
-      || memo.open(
-        owner_entry_query(),
-        bin::encode(
-          { module: named.module, shipped: named.shipped, tested: named.tested, owner: o },
-          owner_named_bin(),
-        ),
-      ));
-  // An entry the check would read that this run is still working out is what asked for it: each
-  // group then answers alone, reading only what it reads.
-  if still_open { { refused: None, answers: map_new() } } else {
-    let context = decoded(
-      memo.ask(context_query(), bin::encode(named, named_bin())),
-      context_bin(),
-      "a module's context",
-    );
-    let c = owners_check(
-      named,
-      members,
-      group_imports(
-        named.module,
-        map(members, |f: OwnerFacts| f.read),
-        fold(members, [], |acc: List<Mention>, f: OwnerFacts| concat(acc, f.mentions)),
-        context.imports,
-        context.targets,
-      ),
-      false,
-    );
-    let together = {
-      module: named.module,
-      shipped: named.shipped,
-      tested: named.tested,
-      owners: map(members, |f: OwnerFacts| f.read.owner),
-    };
-    let source = group_source_of(together, c);
-    let out = checked_owner(source, c.setting.placed, placing_in(c.places), reading_of(c.setting));
-    match out.pulled.out {
-      Refused(_) -> { refused: None, answers: map_new() },
-      Analysed(w) -> {
-        // Each group's answer is laid out as its own text would be, so its items are laid apart and
-        // each paired, in order, with where the text of all of them puts it.
-        let laid = map(missing, |g: GroupNamed| {
-          let members = filter(c.reads, |r: OwnerRead| contains(g.owners, r.owner));
-          { members: members, items: laid_items(members) }
-        });
-        let together_at = fold(
-          laid,
-          map_new(),
-          |acc: Map<Bytes, Int>, g: { members: List<OwnerRead>, items: List<ItemAt> }| {
-            let all = filter(source.items, |x: ItemAt|
-              contains(map(g.members, |r: OwnerRead| r.owner), x.owner));
-            fold(range(0, len(g.items)), acc, |a: Map<Bytes, Int>, i: Int|
-              map_insert(a, item_key(at(g.items, i)), at(all, i).from))
-          },
-        );
-        let answers = owned::said_groups(
-          owned::said_of(w, out.at, source.source.src),
-          named.module,
-          laid,
-          |x: ItemAt|
-            source.offset
-              + (match map_get(together_at, item_key(x)) {
-                Some(p) -> p,
-                None -> panic("an item of a group checked with others was not laid among them"),
-              }),
-        );
-        {
-          refused: None,
-          answers: fold(
-            range(0, len(missing)),
-            map_new(),
-            |acc: Map<Bytes, owned::GroupAnswer>, i: Int| {
-              let g = at(missing, i);
-              let at_g = bin::encode(g, group_named_bin());
-              let answer = at(answers, i);
-              memo.offer(group_query(), at_g, bin::encode(answer, owned::group_answer_bin()));
-              offered_from(g, at(laid, i).members, answer);
-              map_insert(acc, at_g, answer)
-            },
-          ),
-        }
-      },
-    }
-  }
-}
-
-fn item_key(x: ItemAt) -> Bytes =
-  bytes_concat_all([x.owner, b"\x00", bytes_of_string(int_to_string(x.from))])
 
 /// What `module` publishes for its owner `owner`, as a check of the module `own`, shipped where
 /// `shipped` says, reads it: the functions that answer or take an `opaque` type it declares. Only
@@ -4113,7 +4002,7 @@ fn spread(lib: Bytes) -> List<Source> =
     },
   ]
 
-test "the groups a signature edit moves in one module are checked together, and no other" {
+test "the groups a signature edit moves in one module are checked again, and no other" {
   let cold = answered_over(nothing_held(), spread(b"pub fn step(n: Int) -> Int = n + 1\n"));
   let widened = spread(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
   let warm = answered_over(cold.held, widened);
@@ -4123,6 +4012,49 @@ test "the groups a signature edit moves in one module are checked together, and 
   assert(contains(ran, group_in(b"app", [b"again"])));
   assert_eq(said(warm.outcome), said(analyse(parse_all(widened))));
   assert_eq(tables_of(warm.answers), tables_of(answered_over(nothing_held(), widened).answers));
+  assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
+}
+
+/// A module whose `go` and `again` read `lib::step` and `base`, an owner of their own module,
+/// beside an owner that reads none of them.
+fn leaning(lib: Bytes) -> List<Source> =
+  [
+    { name: b"lib", src: lib },
+    {
+      name: b"app",
+      src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + base()\n\npub fn again(n: Int) -> Int = lib::step(n) * 2 + base()\n\npub fn base() -> Int = 1\n\npub fn aside() -> Int = 7\n",
+    },
+  ]
+
+/// Whether `held` keeps a check of a module whole that asked for a group of that module or for an
+/// owner's entry there: a group asks for that check, so the check would wait on what waits on it.
+fn whole_asked_its_own(held: Held) -> Bool / {abort.raise} =
+  map_fold(held.records, false, |found: Bool, _: Bytes, r: memo::Record|
+    found
+      || (r.query == whole_query()
+      && {
+        let module = decoded(r.input, named_bin(), "a module's name").module;
+        fold(r.reads, false, |own: Bool, read: memo::Read|
+          own
+            || (match read {
+              memo::Asked(name, input, _) ->
+                (name == owner_entry_query()
+                  && decoded(input, owner_named_bin(), "an owner's name").module == module)
+                  || (name == group_query()
+                  && decoded(input, group_named_bin(), "a group's names").module == module),
+              memo::World(_, _, _) -> false,
+            }))
+      }))
+
+test "a check of a module whole that a group asks for reads nothing of the module's groups" {
+  let cold = answered_over(nothing_held(), leaning(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let widened = leaning(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
+  let warm = answered_over(cold.held, widened);
+  let ran = groups_ran(warm.run, group_query());
+  assert(contains(ran, group_in(b"app", [b"go"])));
+  assert(contains(ran, group_in(b"app", [b"again"])));
+  assert(!contains(ran, group_in(b"app", [b"aside"])));
+  assert(!whole_asked_its_own(warm.held));
   assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
 }
 
