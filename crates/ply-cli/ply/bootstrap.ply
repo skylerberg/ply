@@ -4,10 +4,10 @@
 //! modules, which this `ply`'s packed answers answer for wherever they did not move; the builder
 //! builds the checkout's `ply` and holds its constants on that runtime; that is linked into a native
 //! `ply`, which answers the shipped modules; and its pack carries the shipped modules, those answers
-//! and its own front end. The builder and the pack are each kept in the toolchain's cache under what
-//! decides them, so a bootstrap of what an earlier one built makes neither again. Only the shipped
-//! modules the builder pulls are built by this `ply`'s compiler, so only they cannot use a language
-//! rule the checkout introduces.
+//! and what its front end answered of the definition it enters. The builder and the pack are each
+//! kept in the toolchain's cache under what decides them, so a bootstrap of what an earlier one built
+//! makes neither again. Only the shipped modules the builder pulls are built by this `ply`'s
+//! compiler, so only they cannot use a language rule the checkout introduces.
 
 import args (Flags, no_flags, style_of)
 import env (env)
@@ -16,7 +16,7 @@ import report (Answer, ok_code, compile_error, refused, reported)
 import sources (Project, shipped_names)
 import compiler.cc
 import compiler.cc (Toolchain, compilers, toolchain)
-import compiler.front (shipped_dump)
+import compiler.front (linked_of)
 import compiler.interface (sized)
 import compiler.load (LoadedAnalysis, every_root)
 import compiler.native
@@ -319,6 +319,31 @@ fn linking_key(t: Toolchain, library: Bytes, libraries: List<String>) -> Bytes =
     ]),
   )
 
+/// How many bytes of the runtime's library one read takes: under what a read may answer at once.
+fn library_range() -> Int = 16777216
+
+/// What the file at `path` holds, as the digest of the digests of each `step` bytes of it in turn,
+/// so a file larger than one read answers is still named by its bytes: none where it does not read.
+fn ranged_digest(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort.raise} =
+  match fs.file_size[abs](path) {
+    None -> None,
+    Some(size) -> match fold(
+        range(0, (size + step - 1) / step),
+        Some([]),
+        |held: Option<List<Bytes>>, i: Int|
+          match held {
+            None -> None,
+            Some(digests) -> match fs.read_at[abs](path, i * step, step) {
+              Some(bytes) -> Some(push(digests, blake3(bytes))),
+              None -> None,
+            },
+          },
+      ) {
+      Some(digests) -> Some(blake3(bytes_concat_all(digests))),
+      None -> None,
+    },
+  }
+
 /// The definition a builder is a function of besides what it is made from: the one that builds it,
 /// whose hash covers the front end, the emitter and how the builder's C is linked and packed. So a
 /// `ply` whose own differs builds its builder itself, and a bootstrap it could not run fails here
@@ -448,23 +473,20 @@ fn builder_built(
           |k: Bytes| read_kept[abs](bodies, k),
           |k: Bytes, bytes: Bytes| write_kept[abs](bodies, k, bytes),
         );
-        match held(front.dump, offered, emission) {
-          Err(diags) -> Err(diags),
-          Ok(c) -> match linked(
+        match ((
+            held(front.dump, offered, emission),
+            linked_of(front.dump, bytes_of_string(builder_entry()), len(front.files)),
+          )) {
+          (Err(diags), _) -> Err(diags),
+          (_, None) -> failed("the builder defines no `" ++ builder_entry() ++ "` to enter"),
+          (Ok(c), Some(carried)) -> match linked(
               t,
               cc::objects[cc](t, cc::split(c), native::native_flags(), work),
               options.library,
               work,
             ) {
             Err(diags) -> Err(diags),
-            Ok(exe) -> match packed_after(
-                exe,
-                packed_with(
-                  files,
-                  shipped.front(builder_entry(), shipped_dump(front.dump), len(front.files)),
-                  [],
-                ),
-              ) {
+            Ok(exe) -> match packed_after(exe, packed_with(files, shipped.front(carried), [])) {
               Err(diags) -> Err(diags),
               Ok(whole) -> if toolchain.moved(relative(whole), kept) {
                 Ok({ path: path, taken: false })
@@ -651,12 +673,12 @@ fn bootstrapped(
   let started = time.elapsed_ms();
   match described(t, options.library, work) {
     Err(diags) -> Err(diags),
-    Ok(runtime) -> match fs.read_file[abs](below_root(options.library)) {
+    Ok(runtime) -> match ranged_digest(below_root(options.library), library_range()) {
       None -> failed("the runtime's library at `" ++ options.library ++ "` could not be read"),
       Some(library) -> {
         let keys = {
           shipped: shipped_key(files),
-          linking: linking_key(t, blake3(library), toolchain.libraries()),
+          linking: linking_key(t, library, toolchain.libraries()),
         };
         let steps = took([], "described the runtime", started);
         let at = time.elapsed_ms();
@@ -826,6 +848,18 @@ test "a link's key moves with the compiler, its level, the library and what is l
   assert(linking_key({ ..t, level: "-O0" }, b"library", ["-lm"]) != key);
   assert(linking_key(t, b"another", ["-lm"]) != key);
   assert(linking_key(t, b"library", ["-lm", "-ldl"]) != key)
+}
+
+// A development build's library is larger than one read answers.
+test "a file's digest is of its ranges' digests, however many reads it takes" {
+  let tree = fs::mem_of([{ path: "lib/a", body: b"0123456789" }]);
+  let over = |path: String, step: Int| fs::on_mem[abs](tree, || ranged_digest(path, step)).value;
+  assert_eq(
+    over("lib/a", 4),
+    Some(blake3(bytes_concat_all([blake3(b"0123"), blake3(b"4567"), blake3(b"89")]))),
+  );
+  assert_eq(over("lib/a", 16), Some(blake3(blake3(b"0123456789"))));
+  assert_eq(over("lib/absent", 4), None)
 }
 
 test "a builder is kept under its shipped modules, its link and the definitions that build it" {
