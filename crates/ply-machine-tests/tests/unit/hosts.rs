@@ -475,3 +475,70 @@ fn refused_handshakes_are_counted_and_named_rather_than_raised() {
         "no application protocol in common"
     );
 }
+
+mod apart {
+    use ply_eval::host::{
+        HostAnswer, HostHandler, HostRequest, HostRuntime, Linearity, MachineId, Pending,
+    };
+    use ply_eval::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
+    use ply_machine::hosts::{Apart, hermetic_op};
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// Answers how many operations it has been asked.
+    #[derive(Default)]
+    struct Counting(AtomicI64);
+
+    impl HostHandler for Counting {
+        fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+            Ok(HostAnswer::Value(Value::Int(
+                self.0.fetch_add(1, Ordering::Relaxed) + 1,
+            )))
+        }
+    }
+
+    struct NoRuntime;
+
+    impl HostRuntime for NoRuntime {
+        fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
+            unreachable!("the handler answers at once")
+        }
+        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+            unreachable!("the handler answers at once")
+        }
+        fn park(&self) -> Result<(), Diagnostic> {
+            unreachable!("the handler answers at once")
+        }
+        fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
+            unreachable!("the handler answers at once")
+        }
+    }
+
+    #[test]
+    fn a_hermetic_halfs_state_is_the_asking_machines_and_goes_when_it_ends() {
+        let handler = Apart::of(Counting::default);
+        let op = hermetic_op("hermetic_machine", "load", Linearity::Repeatable, "a test");
+        let asked = |machine: MachineId| {
+            let request = HostRequest {
+                atom: EffectAtom::new(
+                    Symbol::new("hermetic_machine"),
+                    Resource::Named(Symbol::new("run")),
+                    Mode::Write,
+                ),
+                op: &op,
+                args: &[],
+                span: Span::DUMMY,
+                machine,
+                task: None,
+                declared: None,
+            };
+            match handler.call(&NoRuntime, &request) {
+                Ok(HostAnswer::Value(Value::Int(n))) => n,
+                _ => panic!("the handler counts"),
+            }
+        };
+        let (one, other) = (MachineId::next(), MachineId::next());
+        assert_eq!([asked(one), asked(one), asked(other)], [1, 2, 1]);
+        handler.machine_ended(one);
+        assert_eq!([asked(one), asked(other)], [1, 2]);
+    }
+}

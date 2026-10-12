@@ -325,6 +325,8 @@ type DeriveEmitter = {
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  /// Whether each function of a codec on the cycle is a definition of its own.
+  by_function: Bool,
   json: Bytes,
 }
 
@@ -335,13 +337,23 @@ fn emitter(
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  by_function: Bool,
   json: Bytes,
 ) -> DeriveEmitter / {abort.raise} = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
     if fold(params, false, |acc: Bool, ident: Ident| acc || bytes_starts_with(ident.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle, json: json }
+  {
+    d: deriver,
+    rt: rt,
+    b: b,
+    aliases: aliases,
+    path: path,
+    cycle: cycle,
+    by_function: by_function,
+    json: json,
+  }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
@@ -350,9 +362,38 @@ fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
 
 pub fn target_type(def: TypeDef) -> Bytes = bytes_concat(def.name.name, generics_text(def.generics))
 
-/// A codec on a cycle is two definitions: the named one starts `_at` at the runtime's `max_depth`, and
-/// `_at` hands its cycle one less, so its recursion is seen to end.
-fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
+/// One of a codec's functions as it is generated: what it takes after the dictionaries, what it
+/// answers, and a body that reads its parameters by name.
+type Member = { name: Bytes, params: List<{ name: Bytes, ty: Bytes }>, ret: Bytes, body: Bytes }
+
+fn written_params(m: Member) -> List<Bytes> =
+  map(m.params, |p: { name: Bytes, ty: Bytes }| bytes_concat_all([p.name, b": ", p.ty]))
+
+fn param_names(m: Member) -> List<Bytes> = map(m.params, |p: { name: Bytes, ty: Bytes }| p.name)
+
+/// A dictionary whose fields are `members`, each a lambda.
+fn literal(members: List<Member>) -> Bytes =
+  bytes_concat_all([
+    b"{",
+    join(
+      map(members, |m: Member|
+        bytes_concat_all([m.name, b": |", join(written_params(m), b", "), b"| ", m.body])),
+      b", ",
+    ),
+    b"}",
+  ])
+
+/// A codec off every cycle is one definition, its dictionary. One on a cycle takes how much deeper
+/// it may nest and hands its cycle one less, so the recursion is seen to end. By function, each of
+/// its functions is a definition that calls its cycle's by name, so no level makes a dictionary,
+/// and the named one hands each to its definition at the runtime's `max_depth`. Otherwise it is
+/// two definitions: the named one starts `_at` at `max_depth`.
+///
+/// Only a `bin` codec whose cycle takes no type parameter is written by function. A function that
+/// hands another codec the whole codec of its cycle calls every function of it, so the definitions
+/// are one recursive group, whose members may not call each other where they take type parameters;
+/// `std.json` takes whole codecs throughout.
+fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise} = {
   let name = generated_name(emitter.d, def.name.name);
   let target = target_type(def);
   let ps = map(def.generics.types, |p: Ident| p.name);
@@ -361,7 +402,7 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
   let constraints = if len(ps) == 0 { b"" } else {
     bytes_concat(b" where ", join(map(ps, |p: Bytes| constraint_written(emitter.d, p)), b", "))
   };
-  let head = |fname: Bytes, params: List<Bytes>|
+  let head = |fname: Bytes, params: List<Bytes>, ret: Bytes|
     bytes_concat_all([
       b"fn ",
       fname,
@@ -369,31 +410,85 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> Bytes / {abort.raise} = {
       b"(",
       join(params, b", "),
       b") -> ",
-      dict_type(emitter, target),
+      ret,
       constraints,
       b" = ",
     ]);
   let vis = match def.vis { VPub -> b"pub ", VPriv -> b"" };
+  let dict = dict_type(emitter, target);
   if len(emitter.cycle) == 0 {
-    bytes_concat_all([vis, head(name, dicts), dictionary(emitter, def, target)])
-  } else {
+    [bytes_concat_all([vis, head(name, dicts, dict), dictionary(emitter, def, target)])]
+  } else if !emitter.by_function {
     let at_name = bytes_concat(name, b"_at");
-    bytes_concat_all([
-      vis,
-      head(name, dicts),
-      at_name,
-      b"(",
-      join(push(ps, bytes_concat(emitter.rt, b"max_depth()")), b", "),
-      b")\n",
-      head(at_name, push(dicts, bytes_concat(emitter.b, b"depth: Int"))),
-      b"if ",
-      emitter.b,
-      b"depth <= 0 {",
-      emitter.rt,
-      b"too_deep()} else {",
-      dictionary(emitter, def, target),
-      b"}",
-    ])
+    [
+      bytes_concat_all([
+        vis,
+        head(name, dicts, dict),
+        at_name,
+        b"(",
+        join(push(ps, bytes_concat(emitter.rt, b"max_depth()")), b", "),
+        b")",
+      ]),
+      bytes_concat_all([
+        head(at_name, push(dicts, bytes_concat(emitter.b, b"depth: Int")), dict),
+        b"if ",
+        emitter.b,
+        b"depth <= 0 {",
+        emitter.rt,
+        b"too_deep()} else {",
+        dictionary(emitter, def, target),
+        b"}",
+      ]),
+    ]
+  } else {
+    let depth = bytes_concat(emitter.b, b"depth");
+    let deep = push(dicts, bytes_concat(depth, b": Int"));
+    let members = cycle_members(emitter, def, target);
+    let function = |m: Member| bytes_concat_all([name, b"_", m.name]);
+    let deepest = push(ps, bytes_concat(emitter.rt, b"max_depth()"));
+    concat(
+      [
+        bytes_concat_all([
+          vis,
+          head(name, dicts, dict),
+          b"{",
+          join(
+            map(members, |m: Member|
+              bytes_concat_all([
+                m.name,
+                b": |",
+                join(written_params(m), b", "),
+                b"| ",
+                function(m),
+                b"(",
+                join(concat(deepest, param_names(m)), b", "),
+                b")",
+              ])),
+            b", ",
+          ),
+          b"}",
+        ]),
+      ],
+      map(members, |m: Member|
+        bytes_concat_all([
+          head(
+            function(m),
+            concat(deep, written_params(m)),
+            bytes_concat(m.ret, b" / {abort.raise}"),
+          ),
+          b"if ",
+          depth,
+          b" <= 0 {(",
+          emitter.rt,
+          b"too_deep().",
+          m.name,
+          b")(",
+          join(param_names(m), b", "),
+          b")} else {",
+          m.body,
+          b"}",
+        ])),
+    )
   }
 }
 
@@ -462,18 +557,62 @@ fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {a
     DJson -> match def.body {
       TDAlias(body) -> codec(emitter, body, target),
       TDNominal(body) -> codec(emitter, body, target),
-      TDSum(variants) -> json_sum(emitter, variants, target),
+      TDSum(variants) -> literal(json_sum(emitter, variants, target)),
     },
     DBin -> match def.body {
       TDAlias(body) -> codec(emitter, body, target),
       TDNominal(body) -> codec(emitter, body, target),
-      TDSum(variants) -> bin_sum(emitter, def, variants, target),
+      TDSum(variants) -> literal(bin_sum(emitter, def, variants, target)),
     },
     DRow -> match row_fields(def) {
       Some(fields) -> row_record(emitter, fields, target),
       None -> b"()",
     },
     _ -> b"()",
+  }
+
+/// The functions of the `bin` codec of `def`, a type on a cycle.
+fn cycle_members(
+  emitter: DeriveEmitter,
+  def: TypeDef,
+  target: Bytes,
+) -> List<Member> / {abort.raise} =
+  match def.body {
+    TDAlias(body) -> aliased_members(emitter, body, target),
+    TDNominal(body) -> aliased_members(emitter, body, target),
+    TDSum(variants) -> bin_sum(emitter, def, variants, target),
+  }
+
+/// The functions of the `bin` codec of a type on a cycle that is written as `body`.
+fn aliased_members(
+  emitter: DeriveEmitter,
+  body: TypeExpr,
+  target: Bytes,
+) -> List<Member> / {abort.raise} =
+  match body {
+    TRecord(r) -> bin_record(emitter, r.fields, target),
+    _ ->
+      bin_members(
+        emitter,
+        target,
+        bin_put(emitter, body, bytes_concat(emitter.b, b"w"), bytes_concat(emitter.b, b"v")),
+        bin_take(emitter, body, bytes_concat(emitter.b, b"n"), b""),
+        match cycle_call(emitter, body, b"shape", [bytes_concat(emitter.b, b"s")]) {
+          Some(call) -> call,
+          None ->
+            bytes_concat_all([b"(", codec(emitter, body, target), b".shape)(", emitter.b, b"s)"]),
+        },
+      ),
+  }
+
+fn record_members(
+  emitter: DeriveEmitter,
+  fields: List<{ name: Ident, ty: TypeExpr }>,
+  annotation: Bytes,
+) -> List<Member> / {abort.raise} =
+  match emitter.d {
+    DBin -> bin_record(emitter, fields, annotation),
+    _ -> json_record(emitter, fields, annotation),
   }
 
 // --- A record's row --------------------------------------------------------------------------
@@ -537,7 +676,7 @@ pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abo
     Some(def) -> match row_fields(def) {
       None -> None,
       Some(fields) -> {
-        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], b"");
+        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], false, b"");
         Some(
           map(fields, |f: { name: Ident, ty: TypeExpr }|
             { name: f.name.name, read: row_read(e, f.ty, 8) }),
@@ -674,10 +813,7 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
     TUnit(_) -> bytes_concat_all([emitter.rt, b"unit_", deriver_text(emitter.d), b"()"]),
     TBad(_) -> b"()",
     TFn(_) -> b"()",
-    TRecord(r) -> match emitter.d {
-      DBin -> bin_record(emitter, r.fields, annotation),
-      _ -> json_record(emitter, r.fields, annotation),
-    },
+    TRecord(r) -> literal(record_members(emitter, r.fields, annotation)),
     TCon(c) -> {
       let simple = c.name.name.name;
       let codecs = map(c.args, |a: TypeExpr| codec(emitter, a, render_type(a)));
@@ -698,7 +834,8 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
         match constructor_shape(emitter.d, simple) {
           Nominal -> match c.name.module {
             Some(m) -> bytes_concat_all([m.name, b"::", call]),
-            None -> if contains(emitter.cycle, simple) {
+            None -> if !contains(emitter.cycle, simple) { call }
+            else if emitter.by_function { forwarded(emitter, te) } else {
               bytes_concat_all([
                 snake_case(simple),
                 b"_",
@@ -707,7 +844,7 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
                 join(push(codecs, bytes_concat(emitter.b, b"depth - 1")), b", "),
                 b")",
               ])
-            } else { call },
+            },
           },
           _ -> bytes_concat(emitter.rt, call),
         }
@@ -731,34 +868,113 @@ fn is_string(emitter: DeriveEmitter, ty: TypeExpr) -> Bool / {abort.raise} =
       }
     })
 
+/// The `bin` codec of `te`, a type on the target's cycle written by function, one level deeper:
+/// each of its functions handed to the definition of that name.
+fn forwarded(emitter: DeriveEmitter, te: TypeExpr) -> Bytes / {abort.raise} = {
+  let call = |member: Bytes, args: List<Bytes>|
+    match cycle_call(emitter, te, member, args) { Some(c) -> c, None -> b"()" };
+  let named = |x: Bytes| bytes_concat(emitter.b, x);
+  literal(
+    bin_members(
+      emitter,
+      render_type(te),
+      call(b"put", [named(b"w"), named(b"v")]),
+      call(b"take", [named(b"d"), named(b"n")]),
+      call(b"shape", [named(b"s")]),
+    ),
+  )
+}
+
+/// Whether `te` is a type of this module's on the target's cycle whose codec's functions are
+/// definitions.
+fn on_cycle(emitter: DeriveEmitter, te: TypeExpr) -> Bool =
+  match te {
+    TCon(c) -> emitter.by_function && is_bare(c.name) && contains(emitter.cycle, c.name.name.name),
+    _ -> false,
+  }
+
+/// The call of `member` of the codec of `te` on `args`, where `te` is on the target's cycle: its
+/// definition by name, one level deeper, and no dictionary made for it.
+fn cycle_call(
+  emitter: DeriveEmitter,
+  te: TypeExpr,
+  member: Bytes,
+  args: List<Bytes>,
+) -> Option<Bytes> / {abort.raise} =
+  match te {
+    TCon(c) -> if !on_cycle(emitter, te) { None } else {
+      let codecs = map(c.args, |a: TypeExpr| codec(emitter, a, render_type(a)));
+      Some(
+        bytes_concat_all([
+          snake_case(c.name.name.name),
+          b"_",
+          deriver_text(emitter.d),
+          b"_",
+          member,
+          b"(",
+          join(concat(push(codecs, bytes_concat(emitter.b, b"depth - 1")), args), b", "),
+          b")",
+        ]),
+      )
+    },
+    _ -> None,
+  }
+
+fn json_members(
+  emitter: DeriveEmitter,
+  annotation: Bytes,
+  encode: Bytes,
+  decode: Bytes,
+) -> List<Member> =
+  [
+    {
+      name: b"encode",
+      params: [{ name: bytes_concat(emitter.b, b"v"), ty: annotation }],
+      ret: bytes_concat(emitter.rt, b"Json"),
+      body: encode,
+    },
+    {
+      name: b"decode",
+      params: [{ name: bytes_concat(emitter.b, b"j"), ty: bytes_concat(emitter.rt, b"Json") }],
+      ret: bytes_concat_all([b"Result<", annotation, b", ", emitter.rt, b"DecodeError>"]),
+      body: decode,
+    },
+  ]
+
+/// The document of `x`, a value of the type `te`: a record's is written in place.
+fn json_encode(emitter: DeriveEmitter, te: TypeExpr, x: Bytes) -> Bytes / {abort.raise} =
+  match te {
+    TRecord(r) -> json_object(emitter, r.fields, x),
+    _ -> bytes_concat_all([b"(", codec(emitter, te, render_type(te)), b".encode)(", x, b")"]),
+  }
+
+fn json_object(
+  emitter: DeriveEmitter,
+  fields: List<{ name: Ident, ty: TypeExpr }>,
+  x: Bytes,
+) -> Bytes / {abort.raise} =
+  bytes_concat_all([
+    emitter.rt,
+    b"object([",
+    join(
+      map(fields, |f: { name: Ident, ty: TypeExpr }|
+        bytes_concat_all([
+          b"{key: \"",
+          f.name.name,
+          b"\", value: ",
+          json_encode(emitter, f.ty, bytes_concat_all([x, b".", f.name.name])),
+          b"}",
+        ])),
+      b", ",
+    ),
+    b"])",
+  ])
+
 fn json_record(
   emitter: DeriveEmitter,
   fields: List<{ name: Ident, ty: TypeExpr }>,
   annotation: Bytes,
-) -> Bytes / {abort.raise} = {
-  let entries = map(fields, |f: { name: Ident, ty: TypeExpr }|
-    bytes_concat_all([
-      b"{key: \"",
-      f.name.name,
-      b"\", value: (",
-      codec(emitter, f.ty, render_type(f.ty)),
-      b".encode)(",
-      emitter.b,
-      b"v.",
-      f.name.name,
-      b")}",
-    ]));
-  let encode = bytes_concat_all([
-    b"|",
-    emitter.b,
-    b"v: ",
-    annotation,
-    b"| ",
-    emitter.rt,
-    b"object([",
-    join(entries, b", "),
-    b"])",
-  ]);
+) -> List<Member> / {abort.raise} = {
   let built = map(range(0, len(fields)), |i: Int|
     bytes_concat_all([at(fields, i).name.name, b": ", emitter.b, ascii_of_int(i)]));
   let decode = fold(
@@ -789,17 +1005,12 @@ fn json_record(
       ])
     },
   );
-  bytes_concat_all([
-    b"{encode: ",
-    encode,
-    b", decode: |",
-    emitter.b,
-    b"j: ",
-    emitter.rt,
-    b"Json| ",
+  json_members(
+    emitter,
+    annotation,
+    json_object(emitter, fields, bytes_concat(emitter.b, b"v")),
     decode,
-    b"}",
-  ])
+  )
 }
 
 /// A variant is encoded by its declared name and its fields in order.
@@ -807,20 +1018,13 @@ fn json_sum(
   emitter: DeriveEmitter,
   variants: List<VariantDef>,
   target: Bytes,
-) -> Bytes / {abort.raise} = {
+) -> List<Member> / {abort.raise} = {
   let arms = map(variants, |v: VariantDef| {
     let binders = map(range(0, len(v.fields)), |i: Int| bytes_concat(emitter.b, ascii_of_int(i)));
     let pat = if len(binders) == 0 { v.name.name }
     else { bytes_concat_all([v.name.name, b"(", join(binders, b", "), b")"]) };
     let values = map(range(0, len(v.fields)), |i: Int|
-      bytes_concat_all([
-        b"(",
-        codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
-        b".encode)(",
-        emitter.b,
-        ascii_of_int(i),
-        b")",
-      ]));
+      json_encode(emitter, at(v.fields, i), at(binders, i)));
     bytes_concat_all([
       pat,
       b" -> ",
@@ -832,17 +1036,7 @@ fn json_sum(
       b"])",
     ])
   });
-  let encode = bytes_concat_all([
-    b"|",
-    emitter.b,
-    b"v: ",
-    target,
-    b"| match ",
-    emitter.b,
-    b"v {",
-    join(arms, b", "),
-    b"}",
-  ]);
+  let encode = bytes_concat_all([b"match ", emitter.b, b"v {", join(arms, b", "), b"}"]);
   let names = map(variants, |v: VariantDef| bytes_concat_all([b"\"", v.name.name, b"\""]));
   let chain = fold(
     range(0, len(variants)),
@@ -906,11 +1100,7 @@ fn json_sum(
     },
   );
   let decode = bytes_concat_all([
-    b"|",
-    emitter.b,
-    b"j: ",
-    emitter.rt,
-    b"Json| match ",
+    b"match ",
     emitter.rt,
     b"variant_of(",
     emitter.b,
@@ -924,8 +1114,50 @@ fn json_sum(
     chain,
     b"}",
   ]);
-  bytes_concat_all([b"{encode: ", encode, b", decode: ", decode, b"}"])
+  json_members(emitter, target, encode, decode)
 }
+
+fn bin_members(
+  emitter: DeriveEmitter,
+  annotation: Bytes,
+  put: Bytes,
+  take: Bytes,
+  shape: Bytes,
+) -> List<Member> =
+  [
+    {
+      name: b"put",
+      params: [
+        { name: bytes_concat(emitter.b, b"w"), ty: b"Bytes" },
+        { name: bytes_concat(emitter.b, b"v"), ty: annotation },
+      ],
+      ret: b"Bytes",
+      body: put,
+    },
+    {
+      name: b"take",
+      params: [
+        { name: bytes_concat(emitter.b, b"d"), ty: b"Bytes" },
+        { name: bytes_concat(emitter.b, b"n"), ty: b"Int" },
+      ],
+      ret: bytes_concat_all([
+        b"Result<",
+        emitter.rt,
+        b"Taken<",
+        annotation,
+        b">, ",
+        emitter.rt,
+        b"BinError>",
+      ]),
+      body: take,
+    },
+    {
+      name: b"shape",
+      params: [{ name: bytes_concat(emitter.b, b"s"), ty: bytes_concat(emitter.rt, b"Shapes") }],
+      ret: bytes_concat(emitter.rt, b"Shaped"),
+      body: shape,
+    },
+  ]
 
 /// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
 fn bin_scalar(ty: TypeExpr) -> Option<Bytes> =
@@ -938,27 +1170,118 @@ fn bin_scalar(ty: TypeExpr) -> Option<Bytes> =
     _ -> None,
   }
 
+/// `x`, a value of the type `ty`, appended to `w`: a record's fields in place.
 fn bin_put(emitter: DeriveEmitter, ty: TypeExpr, w: Bytes, x: Bytes) -> Bytes / {abort.raise} =
-  match bin_scalar(ty) {
-    Some(s) -> bytes_concat_all([emitter.rt, b"put_", s, b"(", w, b", ", x, b")"]),
-    None ->
-      bytes_concat_all([b"(", codec(emitter, ty, render_type(ty)), b".put)(", w, b", ", x, b")"]),
+  match ty {
+    TRecord(r) ->
+      fold(r.fields, w, |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
+        bin_put(emitter, f.ty, acc, bytes_concat_all([x, b".", f.name.name]))),
+    _ -> bin_call(emitter, ty, b"put", [w, x]),
   }
 
-fn bin_take(emitter: DeriveEmitter, ty: TypeExpr, from: Bytes) -> Bytes / {abort.raise} =
-  match bin_scalar(ty) {
-    Some(s) -> bytes_concat_all([emitter.rt, b"take_", s, b"(", emitter.b, b"d, ", from, b")"]),
-    None ->
-      bytes_concat_all([
-        b"(",
-        codec(emitter, ty, render_type(ty)),
-        b".take)(",
-        emitter.b,
-        b"d, ",
-        from,
-        b")",
-      ]),
+/// The read of a value of the type `ty` at `from`: a record's fields in place. `path` tells the
+/// binders of a record's fields from those of the record it is written inside.
+fn bin_take(
+  emitter: DeriveEmitter,
+  ty: TypeExpr,
+  from: Bytes,
+  path: Bytes,
+) -> Bytes / {abort.raise} =
+  match ty {
+    TRecord(r) -> record_take(emitter, r.fields, from, path),
+    _ -> bin_call(emitter, ty, b"take", [bytes_concat(emitter.b, b"d"), from]),
   }
+
+/// The call of `member`, `put` or `take`, of the codec of `ty`, no record, on `args`: `std.bin`'s
+/// function for a scalar, and for a type the language declares over the functions of its parts; the
+/// definition of a type on the cycle; and a dictionary's field for any other.
+fn bin_call(
+  emitter: DeriveEmitter,
+  ty: TypeExpr,
+  member: Bytes,
+  args: List<Bytes>,
+) -> Bytes / {abort.raise} = {
+  let through = ||
+    bytes_concat_all([
+      b"(",
+      codec(emitter, ty, render_type(ty)),
+      b".",
+      member,
+      b")(",
+      join(args, b", "),
+      b")",
+    ]);
+  match bin_scalar(ty) {
+    Some(s) -> bytes_concat_all([emitter.rt, member, b"_", s, b"(", join(args, b", "), b")"]),
+    None -> match cycle_call(emitter, ty, member, args) {
+      Some(call) -> call,
+      None -> match ty {
+        TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
+          Structural ->
+            bytes_concat_all([
+              emitter.rt,
+              member,
+              b"_",
+              snake_case(c.name.name.name),
+              b"(",
+              join(
+                concat(args, map(c.args, |a: TypeExpr| bin_function(emitter, a, member))),
+                b", ",
+              ),
+              b")",
+            ]),
+          _ -> through(),
+        },
+        _ -> through(),
+      },
+    },
+  }
+}
+
+/// `member`, `put` or `take`, of the codec of `ty` as a function: a name where one is all of it,
+/// else a lambda around the call.
+fn bin_function(emitter: DeriveEmitter, ty: TypeExpr, member: Bytes) -> Bytes / {abort.raise} = {
+  let field = || bytes_concat_all([codec(emitter, ty, render_type(ty)), b".", member]);
+  let named = match bin_scalar(ty) {
+    Some(s) -> Some(bytes_concat_all([emitter.rt, member, b"_", s])),
+    None -> match ty {
+      TRecord(_) -> None,
+      TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
+        Structural -> if len(c.args) > 0 { None }
+        else { Some(bytes_concat_all([emitter.rt, member, b"_", snake_case(c.name.name.name)])) },
+        _ -> if on_cycle(emitter, ty) { None } else { Some(field()) },
+      },
+      _ -> Some(field()),
+    },
+  };
+  match named {
+    Some(f) -> f,
+    None -> if member == b"put" {
+      let w = bytes_concat(emitter.b, b"w");
+      let v = bytes_concat(emitter.b, b"v");
+      bytes_concat_all([
+        b"|",
+        w,
+        b": Bytes, ",
+        v,
+        b": ",
+        render_type(ty),
+        b"| ",
+        bin_put(emitter, ty, w, v),
+      ])
+    } else {
+      let n = bytes_concat(emitter.b, b"n");
+      bytes_concat_all([
+        b"|",
+        emitter.b,
+        b"d: Bytes, ",
+        n,
+        b": Int| ",
+        bin_take(emitter, ty, n, b""),
+      ])
+    },
+  }
+}
 
 /// Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
 fn bin_takes(
@@ -966,10 +1289,11 @@ fn bin_takes(
   tys: List<TypeExpr>,
   start: Bytes,
   built: Bytes,
+  path: Bytes,
 ) -> Bytes / {abort.raise} = {
   let n = len(tys);
-  let end_of = |i: Int|
-    if i < 0 { start } else { bytes_concat_all([emitter.b, ascii_of_int(i), b".at"]) };
+  let binder = |i: Int| bytes_concat_all([emitter.b, path, ascii_of_int(i)]);
+  let end_of = |i: Int| if i < 0 { start } else { bytes_concat(binder(i), b".at") };
   fold(
     range(0, n),
     bytes_concat_all([b"Ok({value: ", built, b", at: ", end_of(n - 1), b"})"]),
@@ -977,14 +1301,18 @@ fn bin_takes(
       let i = n - 1 - k;
       bytes_concat_all([
         b"match ",
-        bin_take(emitter, at(tys, i), end_of(i - 1)),
+        bin_take(
+          emitter,
+          at(tys, i),
+          end_of(i - 1),
+          bytes_concat_all([path, ascii_of_int(i), b"_"]),
+        ),
         b" {Err(",
         emitter.b,
         b"e) -> Err(",
         emitter.b,
         b"e), Ok(",
-        emitter.b,
-        ascii_of_int(i),
+        binder(i),
         b") -> ",
         acc,
         b"}",
@@ -993,66 +1321,64 @@ fn bin_takes(
   )
 }
 
-fn values_of(emitter: DeriveEmitter, n: Int) -> List<Bytes> =
-  map(range(0, n), |i: Int| bytes_concat_all([emitter.b, ascii_of_int(i), b".value"]))
+fn values_of(emitter: DeriveEmitter, n: Int, path: Bytes) -> List<Bytes> =
+  map(range(0, n), |i: Int| bytes_concat_all([emitter.b, path, ascii_of_int(i), b".value"]))
+
+/// A record's fields read in order from `from`, and the record built of them.
+fn record_take(
+  emitter: DeriveEmitter,
+  fields: List<{ name: Ident, ty: TypeExpr }>,
+  from: Bytes,
+  path: Bytes,
+) -> Bytes / {abort.raise} = {
+  let values = values_of(emitter, len(fields), path);
+  let built = map(range(0, len(fields)), |i: Int|
+    bytes_concat_all([at(fields, i).name.name, b": ", at(values, i)]));
+  bin_takes(
+    emitter,
+    map(fields, |f: { name: Ident, ty: TypeExpr }| f.ty),
+    from,
+    bytes_concat_all([b"{", join(built, b", "), b"}"]),
+    path,
+  )
+}
+
+/// The shape of the type `ty` as a function of the shapes walked: a type on the cycle by its
+/// definition, one level deeper.
+fn bin_shape(emitter: DeriveEmitter, ty: TypeExpr) -> Bytes / {abort.raise} = {
+  let s = bytes_concat(emitter.b, b"s");
+  match cycle_call(emitter, ty, b"shape", [s]) {
+    Some(call) -> bytes_concat_all([b"|", s, b": ", emitter.rt, b"Shapes| ", call]),
+    None -> bytes_concat(codec(emitter, ty, render_type(ty)), b".shape"),
+  }
+}
 
 fn shapes_of(emitter: DeriveEmitter, tys: List<TypeExpr>) -> Bytes / {abort.raise} =
-  join(map(tys, |ty: TypeExpr| bytes_concat(codec(emitter, ty, render_type(ty)), b".shape")), b", ")
+  join(map(tys, |ty: TypeExpr| bin_shape(emitter, ty)), b", ")
 
 fn bin_record(
   emitter: DeriveEmitter,
   fields: List<{ name: Ident, ty: TypeExpr }>,
   annotation: Bytes,
-) -> Bytes / {abort.raise} = {
-  let put = fold(
-    fields,
-    bytes_concat(emitter.b, b"w"),
-    |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
-      bin_put(emitter, f.ty, acc, bytes_concat_all([emitter.b, b"v.", f.name.name])),
-  );
-  let values = values_of(emitter, len(fields));
-  let built = map(range(0, len(fields)), |i: Int|
-    bytes_concat_all([at(fields, i).name.name, b": ", at(values, i)]));
+) -> List<Member> / {abort.raise} = {
+  let v = bytes_concat(emitter.b, b"v");
   let shapes = map(fields, |f: { name: Ident, ty: TypeExpr }|
-    bytes_concat_all([
-      b"{name: \"",
-      f.name.name,
-      b"\", shape: ",
-      codec(emitter, f.ty, render_type(f.ty)),
-      b".shape}",
-    ]));
-  bytes_concat_all([
-    b"{put: |",
-    emitter.b,
-    b"w: Bytes, ",
-    emitter.b,
-    b"v: ",
+    bytes_concat_all([b"{name: \"", f.name.name, b"\", shape: ", bin_shape(emitter, f.ty), b"}"]));
+  bin_members(
+    emitter,
     annotation,
-    b"| ",
-    put,
-    b", take: |",
-    emitter.b,
-    b"d: Bytes, ",
-    emitter.b,
-    b"n: Int| ",
-    bin_takes(
-      emitter,
-      map(fields, |f: { name: Ident, ty: TypeExpr }| f.ty),
-      bytes_concat(emitter.b, b"n"),
-      bytes_concat_all([b"{", join(built, b", "), b"}"]),
-    ),
-    b", shape: |",
-    emitter.b,
-    b"s: ",
-    emitter.rt,
-    b"Shapes| ",
-    emitter.rt,
-    b"record_shape(",
-    emitter.b,
-    b"s, [",
-    join(shapes, b", "),
-    b"])}",
-  ])
+    fold(fields, bytes_concat(emitter.b, b"w"), |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
+      bin_put(emitter, f.ty, acc, bytes_concat_all([v, b".", f.name.name]))),
+    record_take(emitter, fields, bytes_concat(emitter.b, b"n"), b""),
+    bytes_concat_all([
+      emitter.rt,
+      b"record_shape(",
+      emitter.b,
+      b"s, [",
+      join(shapes, b", "),
+      b"])",
+    ]),
+  )
 }
 
 /// A variant is its index among the declared constructors, then its fields in order.
@@ -1061,7 +1387,7 @@ fn bin_sum(
   def: TypeDef,
   variants: List<VariantDef>,
   target: Bytes,
-) -> Bytes / {abort.raise} = {
+) -> List<Member> / {abort.raise} = {
   let count = len(variants);
   let arms = map(range(0, count), |vi: Int| {
     let v = at(variants, vi);
@@ -1083,7 +1409,7 @@ fn bin_sum(
   let cases = map(range(0, count), |vi: Int| {
     let v = at(variants, vi);
     let args = if len(v.fields) == 0 { b"" }
-    else { bytes_concat_all([b"(", join(values_of(emitter, len(v.fields)), b", "), b")"]) };
+    else { bytes_concat_all([b"(", join(values_of(emitter, len(v.fields), b""), b", "), b")"]) };
     bytes_concat_all([
       if vi == count - 1 { b"_" } else { ascii_of_int(vi) },
       b" -> ",
@@ -1092,6 +1418,7 @@ fn bin_sum(
         v.fields,
         bytes_concat(emitter.b, b"t.at"),
         bytes_concat(v.name.name, args),
+        b"",
       ),
     ])
   });
@@ -1107,59 +1434,48 @@ fn bin_sum(
     map(def.generics.types, |ident: Ident| bytes_concat(ident.name, b".shape")),
     b", ",
   );
-  bytes_concat_all([
-    b"{put: |",
-    emitter.b,
-    b"w: Bytes, ",
-    emitter.b,
-    b"v: ",
+  bin_members(
+    emitter,
     target,
-    b"| match ",
-    emitter.b,
-    b"v {",
-    join(arms, b", "),
-    b"}, take: |",
-    emitter.b,
-    b"d: Bytes, ",
-    emitter.b,
-    b"n: Int| match ",
-    emitter.rt,
-    b"take_tag(",
-    emitter.b,
-    b"d, ",
-    emitter.b,
-    b"n, ",
-    ascii_of_int(count),
-    b") {Err(",
-    emitter.b,
-    b"e) -> Err(",
-    emitter.b,
-    b"e), Ok(",
-    emitter.b,
-    b"t) -> match ",
-    emitter.b,
-    b"t.value {",
-    join(cases, b", "),
-    b"}}, shape: |",
-    emitter.b,
-    b"s: ",
-    emitter.rt,
-    b"Shapes| ",
-    emitter.rt,
-    b"sum_shape(",
-    emitter.b,
-    b"s, \"",
-    emitter.path,
-    b".",
-    def.name.name,
-    b"\", \"",
-    def.name.name,
-    b"\", [",
-    params,
-    b"], [",
-    join(shapes, b", "),
-    b"])}",
-  ])
+    bytes_concat_all([b"match ", emitter.b, b"v {", join(arms, b", "), b"}"]),
+    bytes_concat_all([
+      b"match ",
+      emitter.rt,
+      b"take_tag(",
+      emitter.b,
+      b"d, ",
+      emitter.b,
+      b"n, ",
+      ascii_of_int(count),
+      b") {Err(",
+      emitter.b,
+      b"e) -> Err(",
+      emitter.b,
+      b"e), Ok(",
+      emitter.b,
+      b"t) -> match ",
+      emitter.b,
+      b"t.value {",
+      join(cases, b", "),
+      b"}}",
+    ]),
+    bytes_concat_all([
+      emitter.rt,
+      b"sum_shape(",
+      emitter.b,
+      b"s, \"",
+      emitter.path,
+      b".",
+      def.name.name,
+      b"\", \"",
+      def.name.name,
+      b"\", [",
+      params,
+      b"], [",
+      join(shapes, b", "),
+      b"])",
+    ]),
+  )
 }
 
 /// A type back as source, for the annotations a generated lambda needs.
@@ -1655,7 +1971,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
             match ((rt.prefix, json.prefix)) {
               (Some(prefix), Some(documents)) -> {
                 let cycle = cycle_of(codec_calls(ex1, def.deriver), def.target.name);
-                let source = emit_item(
+                let written = emit_item(
                   emitter(
                     def.deriver,
                     prefix,
@@ -1663,11 +1979,13 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
                     ex1.aliases,
                     ex1.path,
                     cycle,
+                    same_deriver(def.deriver, DBin) && !takes_parameter(ex1.types, cycle),
                     documents,
                   ),
                   target,
                 );
-                match parse_generated(source, def.span, if len(cycle) == 0 { 1 } else { 2 }) {
+                let source = join(written, b"\n");
+                match parse_generated(source, def.span, len(written)) {
                   None -> internal(ex1, def, source),
                   Some(defs) ->
                     {
@@ -1697,9 +2015,11 @@ fn documents_prefix(
   target: TypeDef,
 ) -> WithPrefix / {abort.raise} =
   if !same_deriver(def.deriver, DRow)
-      || !row_wants_json(emitter(DRow, b"", [], expander.aliases, expander.path, [], b""), target) {
-    { ex: expander, prefix: Some(b"") }
-  } else { runtime_prefix(expander, { ..def, deriver: DJson }) }
+      || !row_wants_json(
+        emitter(DRow, b"", [], expander.aliases, expander.path, [], false, b""),
+        target,
+      ) { { ex: expander, prefix: Some(b"") } }
+  else { runtime_prefix(expander, { ..def, deriver: DJson }) }
 
 /// Parsing what was just printed is the deriver's own round-trip check.
 fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
@@ -1773,6 +2093,11 @@ fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
     fold(seen, seen, |acc: List<Bytes>, n: Bytes|
       fold(callees(calls, n), acc, |more: List<Bytes>, m: Bytes|
         if contains(more, m) { more } else { push(more, m) })))
+
+/// Whether a type named in `cycle` takes a type parameter.
+fn takes_parameter(types: List<TypeDef>, cycle: List<Bytes>) -> Bool =
+  fold(cycle, false, |acc: Bool, name: Bytes|
+    acc || (match find_type(types, name) { Some(t) -> len(t.generics.types) > 0, None -> false }))
 
 /// Empty unless `target`'s codec calls itself, through any of the others.
 fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
@@ -2071,7 +2396,7 @@ test "the bin form writes scalars straight, composes the rest, and keys a sum by
   assert_eq(len(out), 2);
   assert_eq(
     at(out, 0),
-    b"fn line_bin() -> bin::BinCodec<Line> = {put: |dw: Bytes, dv: Line| (bin::list_bin(bin::string_bin()).put)(bin::put_u32(bin::put_string(dw, dv.sku), dv.qty), dv.tags), take: |dd: Bytes, dn: Int| match bin::take_string(dd, dn) {Err(de) -> Err(de), Ok(d0) -> match bin::take_u32(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> match (bin::list_bin(bin::string_bin()).take)(dd, d1.at) {Err(de) -> Err(de), Ok(d2) -> Ok({value: {sku: d0.value, qty: d1.value, tags: d2.value}, at: d2.at})}}}, shape: |ds: bin::Shapes| bin::record_shape(ds, [{name: \"sku\", shape: bin::string_bin().shape}, {name: \"qty\", shape: bin::u32_bin().shape}, {name: \"tags\", shape: bin::list_bin(bin::string_bin()).shape}])}",
+    b"fn line_bin() -> bin::BinCodec<Line> = {put: |dw: Bytes, dv: Line| bin::put_list(bin::put_u32(bin::put_string(dw, dv.sku), dv.qty), dv.tags, bin::put_string), take: |dd: Bytes, dn: Int| match bin::take_string(dd, dn) {Err(de) -> Err(de), Ok(d0) -> match bin::take_u32(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> match bin::take_list(dd, d1.at, bin::take_string) {Err(de) -> Err(de), Ok(d2) -> Ok({value: {sku: d0.value, qty: d1.value, tags: d2.value}, at: d2.at})}}}, shape: |ds: bin::Shapes| bin::record_shape(ds, [{name: \"sku\", shape: bin::string_bin().shape}, {name: \"qty\", shape: bin::u32_bin().shape}, {name: \"tags\", shape: bin::list_bin(bin::string_bin()).shape}])}",
   );
   assert_eq(
     at(out, 1),
@@ -2105,6 +2430,45 @@ test "a row reads a column per field, and a field that is no scalar as a documen
   assert(len(parse(b"fn f<a>(x: a) -> a where derivable(row, a) = x").parser.diags) > 0)
 }
 
+test "a bin codec on a cycle calls its cycle by name through a list, and reads a variant's record in place" {
+  let src = b"import std.bin\ntype Expr = Num(Int) | Block(List<Stmt>)\ntype Stmt = Let({name: String, value: Expr})\nderive bin for Expr\nderive bin for Stmt";
+  let out = preview(b"t", parse(src).node);
+  assert_eq(len(out), 2);
+  let expr = at(out, 0);
+  let stmt = at(out, 1);
+  assert(
+    bytes_index_of(
+        expr,
+        b"Block(d0) -> bin::put_list(bin::put_tag(dw, 1), d0, |dw: Bytes, dv: Stmt| stmt_bin_put(ddepth - 1, dw, dv))",
+      )
+      != None,
+  );
+  assert(
+    bytes_index_of(
+        expr,
+        b"bin::take_list(dd, dt.at, |dd: Bytes, dn: Int| stmt_bin_take(ddepth - 1, dd, dn))",
+      )
+      != None,
+  );
+  assert(
+    bytes_index_of(
+        stmt,
+        b"Let(d0) -> expr_bin_put(ddepth - 1, bin::put_string(bin::put_tag(dw, 0), d0.name), d0.value)",
+      )
+      != None,
+  );
+  assert(
+    bytes_index_of(
+        stmt,
+        b"match bin::take_string(dd, dt.at) {Err(de) -> Err(de), Ok(d0_0) -> match expr_bin_take(ddepth - 1, dd, d0_0.at) {Err(de) -> Err(de), Ok(d0_1) -> Ok({value: {name: d0_0.value, value: d0_1.value}, at: d0_1.at})}} {Err(de) -> Err(de), Ok(d0) -> Ok({value: Let(d0.value), at: d0.at})}",
+      )
+      != None,
+  );
+  let x = expand_derives(0, b"t", parse(src).node);
+  assert_eq(len(x.diags), 0);
+  assert_eq(len(x.module.items), 4 + 4 + 4)
+}
+
 test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
   let src = b"import std.json\ntype Expr = Num(Int) | Block(List<Stmt>) | Lit(Literal)\ntype Stmt = Bare(Expr) | Let({name: String, value: Expr})\ntype Literal = Text(String)\nderive json for Expr\nderive json for Stmt\nderive json for Literal\nderive eq for Expr";
   let out = preview(b"t", parse(src).node);
@@ -2120,9 +2484,12 @@ test "a codec on a cycle hands the cycle one depth less, and calls a codec off i
   assert(bytes_index_of(expr, b"(literal_json().encode)") != None);
   assert(bytes_index_of(expr, b"json::has_tag(dt, \"Num\")") != None);
   assert(bytes_index_of(at(out, 2), b"dt.tag == \"Text\"") != None);
-  assert(bytes_index_of(at(out, 1), b"(expr_json_at(ddepth - 1).encode)(dv.value)") != None);
-  assert(bytes_index_of(at(out, 2), b"_at") == None);
-  assert(bytes_index_of(at(out, 3), b"_at") == None);
+  assert(
+    bytes_index_of(at(out, 1), b"value: (expr_json_at(ddepth - 1).encode)(d0.value)}") != None,
+  );
+  // A type off the cycle, and a derivation that is no codec, are one definition each.
+  assert(bytes_index_of(at(out, 2), b"\nfn ") == None);
+  assert(bytes_index_of(at(out, 3), b"\nfn ") == None);
   let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.diags), 0);
   assert_eq(len(x.derived), 4);

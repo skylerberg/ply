@@ -63,10 +63,10 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: the suite
-# drives `ply` in one working directory, so a `ply test` takes its tests one after another, and one job
-# would outlast its limit.
-CLI_PARTS=4
+# The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
+# `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
+# another, and with them one job would run close to its limit.
+CLI_PARTS=2
 # The program's, a fixture's and a package's own tests share one job, `packages`, in turn: each loads
 # little. These take a job of their own instead: the compiler's own tests take every core.
 CORPUS_ALONE=(package-compiler)

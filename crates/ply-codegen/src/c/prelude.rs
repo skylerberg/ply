@@ -122,6 +122,12 @@ static inline Word ply_embedded(Word base, int at, uint8_t flags, uint32_t len, 
   return (Word)(intptr_t)e;
 }
 
+/* An array's length: its words a stride at a time where it holds its elements in place. */
+static inline int64_t ply_array_len(Word w) {
+  PlyObj *o = ply_obj(w);
+  return o->aux ? (int64_t)(o->len / o->aux) : (int64_t)o->len;
+}
+
 /* The word a field holds, at a statically known offset. */
 static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at]; }
 static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
@@ -213,6 +219,7 @@ helpers![
     (rt_inc_shared, 1, false),
     (rt_dec_shared, 1, false),
     (rt_parallel, 2, false),
+    (rt_parallel_past, 4, false),
     (rt_array_lookup, 2, true),
     (rt_baked, 2, true),
     (rt_stored, 1, true),
