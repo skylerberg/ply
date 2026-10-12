@@ -13,7 +13,7 @@ repeats="${PLY_BENCH_REPEATS:-1}"
 
 sizes=("${@}")
 if [ ${#sizes[@]} -eq 0 ]; then
-  sizes=(10,25,125 20,25,250 40,25,500 80,25,1000 160,25,2000 200,50,5000)
+  sizes=("10,25,125" "20,25,250" "40,25,500" "80,25,1000" "160,25,2000" "200,50,5000")
 fi
 
 # The corpus writes and reads under its working directory, so the corpora are named from inside it.
