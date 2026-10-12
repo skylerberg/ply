@@ -3192,9 +3192,10 @@ beside the phases of this run, all of it read.
 Where a load ran, the `--json` documents of `ply check`, `ply test` and
 `ply prove` also say under `front_end` what the memo store gave it: `queries`,
 each query the load asked with the answers it took as kept (`taken`) and the
-bodies it ran (`run`), and `vouched`, whether the store held, when the load
-opened it, a record it vouches for to this `ply`. A store that vouches while a
-load runs bodies and takes nothing is one whose answers were not found.
+bodies it ran (`run`); `vouched`, whether the store held, when the load opened
+it, a record it vouches for to this `ply`; and `lost`, how many answers the load
+made again because a record that stood named one no store held, which is none
+over a store that is whole.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
