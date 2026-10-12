@@ -1527,78 +1527,84 @@ pub fn module_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
     if !read.found { absent(named.module) } else {
       let groups = groups_named(named, read);
       let offered = offered_whole(named, read, groups);
-      let facts = facts_of(read);
-      let placed = map(groups, |g: GroupNamed|
-        {
-          items: laid_items(
-            map(g.owners, |o: Bytes|
-              match map_get(facts, o) {
-                Some(f) -> f.read,
-                None -> panic("a group's owner is the module's"),
-              }),
-          ),
-          // Asked for the module's reads; the whole check's answer is not decoded again.
-          answer: {
-            let at_g = bin::encode(g, group_named_bin());
-            match map_get(offered.answers, at_g) {
-              Some(a) -> {
-                memo.ask(group_query(), at_g);
-                a
-              },
-              None -> group_of(g),
-            }
-          },
-        });
-      let a = owned::assembled(
-        named.module,
-        read.shape,
-        read.order,
-        placed,
-        read.context.setting.placed == InRoot,
-      );
-      let header = decoded(
-        memo.ask(header_query(), input),
-        bin::list_bin(diag_bin()),
-        "a header's refusals",
-      );
-      // A module whose text or any group refuses says what a check of it whole says, which names
-      // each error once and none another explains.
-      let refused = if !read.refusing && len(a.refused) == 0 { header } else {
-        let whole = match offered.refused {
-          Some(ds) -> ds,
-          None -> {
-            let checked = checked_whole(named, read, true);
-            match checked.pulled.out {
-              Refused(ds) -> map(ds, |d: Diag| own_labels(d, checked.at)),
-              Analysed(_) -> [],
-            }
-          },
+      let whole = match offered.refused { Some(ds) -> ds, None -> [] };
+      // No group's answer is part of a refusal's: a module its whole check refuses asks none.
+      if len(whole) > 0 { refused_for(named.module, read, whole) } else {
+        let facts = facts_of(read);
+        let placed = map(groups, |g: GroupNamed|
+          {
+            items: laid_items(
+              map(g.owners, |o: Bytes|
+                match map_get(facts, o) {
+                  Some(f) -> f.read,
+                  None -> panic("a group's owner is the module's"),
+                }),
+            ),
+            // Asked for the module's reads; the whole check's answer is not decoded again.
+            answer: {
+              let at_g = bin::encode(g, group_named_bin());
+              match map_get(offered.answers, at_g) {
+                Some(a) -> {
+                  memo.ask(group_query(), at_g);
+                  a
+                },
+                None -> group_of(g),
+              }
+            },
+          });
+        let a = owned::assembled(
+          named.module,
+          read.shape,
+          read.order,
+          placed,
+          read.context.setting.placed == InRoot,
+        );
+        let header = decoded(
+          memo.ask(header_query(), input),
+          bin::list_bin(diag_bin()),
+          "a header's refusals",
+        );
+        // A module whose text or any group refuses says what a check of it whole says, which names
+        // each error once and none another explains.
+        let refused = if !read.refusing && len(a.refused) == 0 { header } else {
+          let checked = checked_whole(named, read, true);
+          let said = match checked.pulled.out {
+            Refused(ds) -> map(ds, |d: Diag| own_labels(d, checked.at)),
+            Analysed(_) -> [],
+          };
+          if len(said) > 0 { said } else { concat(header, a.refused) }
         };
-        if len(whole) > 0 { whole } else { concat(header, a.refused) }
-      };
-      if len(refused) > 0 {
-        {
-          ..absent(named.module),
-          refused: refused,
-          imports: read.context.present,
-          shape: { ..no_shape(named.module), written: read.shape.written },
-        }
-      } else {
-        {
-          imports: read.context.present,
-          refused: [],
-          warnings: a.warnings,
-          defs: a.defs,
-          tests: a.tests,
-          rows: bin::encode(a.rows, rows_bin()),
-          shape: a.facts.shape,
-          tables: bin::encode(a.facts.tables, module_tables_bin()),
+        if len(refused) > 0 { refused_for(named.module, read, refused) } else {
+          {
+            imports: read.context.present,
+            refused: [],
+            warnings: a.warnings,
+            defs: a.defs,
+            tests: a.tests,
+            rows: bin::encode(a.rows, rows_bin()),
+            shape: a.facts.shape,
+            tables: bin::encode(a.facts.tables, module_tables_bin()),
+          }
         }
       }
     },
     module_answer_bin(),
   )
 }
+
+/// What `module`, read as `read`, answers refused for `refused`: nothing but why, what it imports
+/// and the imports it writes.
+fn refused_for(
+  module: Bytes,
+  read: OwnersAnswer,
+  refused: List<Diag>,
+) -> ModuleAnswer / {abort.raise} =
+  {
+    ..absent(module),
+    refused: refused,
+    imports: read.context.present,
+    shape: { ..no_shape(module), written: read.shape.written },
+  }
 
 pub fn header_text_query() -> Bytes = b"header text"
 
@@ -2183,7 +2189,10 @@ pub type Asking = { answers: List<Answered>, pulled: List<Bytes> }
 /// asked of `qs` over a run: each round, every shipped module a module answered so far imports as
 /// written, and each of `asked` from the first, each read with its tests where `tested` says. Where
 /// the own modules import one another in a cycle, no module is checked, since none has an order to
-/// be checked in: what answers is the module whose import closes each cycle, refused for it.
+/// be checked in: what answers is the module whose import closes each cycle, refused for it. An own
+/// module that imports one that refused, or one left unchecked for that, is not checked either: a
+/// load that refuses says only what [`refused_first`] keeps, and its answer is an absent module's
+/// with its imports.
 pub fn asked_all(
   qs: Map<Bytes, CheckQuery>,
   own: List<Bytes>,
@@ -2211,13 +2220,27 @@ pub fn asked_all(
     );
     let asked_own = fold(
       ordered.order,
-      { run: ordered.run, answered: map_new(), written: map_new() },
-      |acc: { run: Run, answered: Map<Bytes, Answered>, written: Map<Bytes, List<Bytes>> }, n: Named| {
-        let a = ask(acc.run, n);
-        {
-          run: a.run,
-          answered: map_insert(acc.answered, n.module, a.answered),
-          written: map_insert(acc.written, n.module, a.answered.answer.shape.written),
+      { run: ordered.run, answered: map_new(), written: map_new(), stopped: map_new() },
+      |acc: { run: Run, answered: Map<Bytes, Answered>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: Named| {
+        let imports = match map_get(ordered.edges, n.module) { Some(ms) -> ms, None -> [] };
+        if fold(imports, false, |b: Bool, m: Bytes| b || map_contains(acc.stopped, m)) {
+          {
+            ..acc,
+            answered: map_insert(acc.answered, n.module, {
+              module: n.module,
+              answer: { ..absent(n.module), imports: imports },
+            }),
+            stopped: map_insert(acc.stopped, n.module, true),
+          }
+        } else {
+          let a = ask(acc.run, n);
+          {
+            run: a.run,
+            answered: map_insert(acc.answered, n.module, a.answered),
+            written: map_insert(acc.written, n.module, a.answered.answer.shape.written),
+            stopped: if len(a.answered.answer.refused) == 0 { acc.stopped }
+            else { map_insert(acc.stopped, n.module, true) },
+          }
         }
       },
     );
@@ -2318,12 +2341,12 @@ pub fn wanted_all(
 
 /// `modules` in an order that has each after those of them it imports, as each one's imports say,
 /// the rest in the order they came: a module answered before what reads it is checked whole, not a
-/// group at a time as an importer reaches each.
+/// group at a time as an importer reaches each. `edges` holds the modules each one imports.
 fn dependencies_first(
   qs: Map<Bytes, CheckQuery>,
   run: Run,
   modules: List<Named>,
-) -> { run: Run, order: List<Named> } / {Driving, abort.raise} = {
+) -> { run: Run, order: List<Named>, edges: Map<Bytes, List<Bytes>> } / {Driving, abort.raise} = {
   let read = fold(
     modules,
     { run: run, edges: map_new() },
@@ -2362,7 +2385,7 @@ fn dependencies_first(
       }
     },
   );
-  { run: read.run, order: order }
+  { run: read.run, order: order, edges: read.edges }
 }
 
 /// What refuses a load's packages before any of its modules is read: each root module that claims a
@@ -4412,6 +4435,30 @@ test "a module refuses with what its refusing groups say, and nothing a group re
       concat(acc, map(a.answer.refused, |d: Diag| d.message))),
     [b"unknown name `missing`"],
   )
+}
+
+test "a load that refuses checks no module that imports a refused one, and no group of a module its whole check refuses" {
+  let sources = [
+    { name: b"lib", src: b"pub fn broken() -> Int = missing()\n\npub fn fine() -> Int = 1\n" },
+    { name: b"app", src: b"import lib\npub fn go() -> Int = lib::fine()\n" },
+    { name: b"top", src: b"import app\npub fn main() -> Int = app::go()\n" },
+    { name: b"aside", src: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n" },
+  ];
+  let cold = answered_over(nothing_held(), sources);
+  assert_eq(sorted_bytes(map(refused_first(cold.answers), |a: Answered| a.module)), [
+    b"aside",
+    b"lib",
+  ]);
+  assert_eq(ran_of(cold.run, module_query()), 2);
+  assert_eq(ran_of(cold.run, group_query()), 0);
+  let mended = with_module(
+    with_module(sources, b"lib", b"pub fn broken() -> Int = 3\n\npub fn fine() -> Int = 1\n"),
+    b"aside",
+    b"pub fn alone() -> Int = 4\n\npub fn other() -> Int = 2\n",
+  );
+  let warm = answered_over(cold.held, mended);
+  assert_eq(ran_of(warm.run, module_query()), 4);
+  assert_eq(said(warm.outcome), said(answered_over(nothing_held(), mended).outcome))
 }
 
 test "an import that names no module refuses its module, though nothing reads it" {
