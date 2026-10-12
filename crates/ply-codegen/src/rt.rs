@@ -177,6 +177,7 @@ impl Tables {
             Value::Record(fields) => fields
                 .iter()
                 .enumerate()
+                .filter(|(i, _)| unsafe { heap::counted(o, *i) })
                 .map(|(i, (_, part))| (unsafe { word_at(o, i) }, part))
                 .collect(),
             Value::Ctor { args, .. } => args
@@ -2849,7 +2850,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             // Any other entry shape is the value builtins' to raise on.
             let mut pairs = Vec::with_capacity(n);
             for e in entries {
-                if heap::kind(e) != KIND_RECORD {
+                if heap::kind(e) != KIND_RECORD
+                    || tables.layouts.holds_floats(unsafe { (*obj(e)).layout })
+                {
                     return None;
                 }
                 let shape = unsafe { (*obj(e)).layout };
@@ -2948,15 +2951,15 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::dec(rest);
                 return Some(ctx.nullary(none));
             };
-            let r = ctx
-                .heap
-                .alloc(KIND_RECORD, 0, 3, tables.layouts.popped_shape());
-            unsafe {
-                set_word(r, 0, k);
-                set_word(r, 1, rest);
-                set_word(r, 2, v);
-            }
-            Some(wrapped(ctx, some, r as Word))
+            let r = ctx.heap.record(
+                &tables.layouts,
+                &[
+                    (Symbol::new("key"), k),
+                    (Symbol::new("rest"), rest),
+                    (Symbol::new("value"), v),
+                ],
+            );
+            Some(wrapped(ctx, some, r))
         }
         (Builtin::MapRange, [m, lo, lo_inclusive, hi, hi_inclusive, limit])
             if heap::kind(*m) == KIND_MAP =>
@@ -2994,15 +2997,14 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 Some(v) => wrapped(ctx, some, v),
                 None => ctx.nullary(none),
             };
-            let r = ctx
-                .heap
-                .alloc(KIND_RECORD, 0, 3, tables.layouts.split_shape());
-            unsafe {
-                set_word(r, 0, above);
-                set_word(r, 1, at);
-                set_word(r, 2, below);
-            }
-            Some(r as Word)
+            Some(ctx.heap.record(
+                &tables.layouts,
+                &[
+                    (Symbol::new("above"), above),
+                    (Symbol::new("at"), at),
+                    (Symbol::new("below"), below),
+                ],
+            ))
         }
         // At `Int`, which is all a call from compiled code holds as a native integer: a narrower
         // width is computed in place, and a 64-bit or wider one is no integer word.
@@ -3052,14 +3054,11 @@ fn wrapped(ctx: &mut Ctx, some: u32, inner: Word) -> Word {
 fn entry(ctx: &mut Ctx, k: Word, v: Word) -> Word {
     heap::inc(k);
     heap::inc(v);
-    let e = ctx
-        .heap
-        .alloc(KIND_RECORD, 0, 2, ctx.tables.layouts.entry_shape());
-    unsafe {
-        set_word(e, 0, k);
-        set_word(e, 1, v);
-    }
-    e as Word
+    let tables = Arc::clone(&ctx.tables);
+    ctx.heap.record(
+        &tables.layouts,
+        &[(Symbol::new("key"), k), (Symbol::new("value"), v)],
+    )
 }
 
 /// `Some` of the entry, or `None`; nothing where the unit holds neither constructor.
@@ -3777,22 +3776,16 @@ fn metered(ctx: &mut Ctx, f: Word) -> Word {
         })
         .collect();
     let performs = ctx.heap.list_from(&items);
-    let shape = tables.layouts.shape(vec![
-        Symbol::new("allocations"),
-        Symbol::new("bytes"),
-        Symbol::new("performs"),
-        Symbol::new("steps"),
-        Symbol::new("value"),
-    ]);
-    let r = ctx.heap.alloc(KIND_RECORD, 0, 5, shape);
-    unsafe {
-        set_word(r, 0, heap::imm(spent.allocations));
-        set_word(r, 1, heap::imm(spent.bytes));
-        set_word(r, 2, performs);
-        set_word(r, 3, heap::imm(spent.steps));
-        set_word(r, 4, value);
-    }
-    r as Word
+    ctx.heap.record(
+        &tables.layouts,
+        &[
+            (Symbol::new("allocations"), heap::imm(spent.allocations)),
+            (Symbol::new("bytes"), heap::imm(spent.bytes)),
+            (Symbol::new("performs"), performs),
+            (Symbol::new("steps"), heap::imm(spent.steps)),
+            (Symbol::new("value"), value),
+        ],
+    )
 }
 
 /// The value of the pure nullary function at `index`, memoized when world-independent.
@@ -4373,6 +4366,15 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
         ));
         return ctx.fail(d);
     };
+    if ctx.tables.layouts.shape_slots(shape)[at] == heap::Slot::Float {
+        let f = ctx
+            .heap
+            .boxed_float(f64::from_bits(unsafe { word_at(o, at) } as u64));
+        if own == 1 || own == 3 {
+            heap::dec(base);
+        }
+        return f;
+    }
     let w = unsafe { word_at(o, at) };
     match own {
         0 => heap::inc(w),
@@ -4393,6 +4395,20 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
         }
     }
     w
+}
+
+/// A record of `shape`'s fields holding `n` words at `args`, which it takes: laid out as a record of
+/// the values they are, as one of its type is wherever it is made.
+pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let tables = Arc::clone(&ctx.tables);
+    let names = tables.layouts.shape_names(shape as u32);
+    let fields: Vec<(Symbol, Word)> = names
+        .iter()
+        .cloned()
+        .zip(args_of(args, n).iter().copied())
+        .collect();
+    ctx.heap.record(&tables.layouts, &fields)
 }
 
 /// A list literal. Takes the items.
