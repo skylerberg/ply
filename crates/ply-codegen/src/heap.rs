@@ -34,6 +34,8 @@ pub const KIND_MLEAF: u8 = 13;
 pub const KIND_MBRANCH: u8 = 14;
 /// `len` elements, a word each.
 pub const KIND_ARRAY: u8 = 15;
+/// A `Float`: one payload word, its bits.
+pub const KIND_FLOAT: u8 = 16;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -603,7 +605,9 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
 unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
-            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_ARRAY => (*o).len as usize * 8,
+            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_ARRAY => {
+                (*o).len as usize * 8
+            }
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1055,6 +1059,12 @@ impl Heap {
         o as Word
     }
 
+    pub fn boxed_float(&mut self, f: f64) -> Word {
+        let o = self.alloc(KIND_FLOAT, 0, 1, 0);
+        unsafe { set_word(o, 0, ply_eval::float::bits(f) as i64) };
+        o as Word
+    }
+
     pub fn bridge(&mut self, v: Value) -> Word {
         let at = u32::try_from(self.bridges.len()).expect("a bridge table a header can index");
         let o = self.raw_alloc(KIND_BRIDGE, 0, 0, at, BRIDGE_BYTES);
@@ -1101,6 +1111,7 @@ impl Heap {
             let out = match (*o).kind {
                 KIND_UNIT | KIND_BOOL => return w,
                 KIND_INT => self.boxed_int(word_at(o, 0)),
+                KIND_FLOAT => self.boxed_float(f64::from_bits(word_at(o, 0) as u64)),
                 KIND_STR | KIND_BYTES => self.joined((*o).kind, bytes_of(o), &[], 0) as Word,
                 KIND_BRIDGE => self.bridge(bridged(o).clone()),
                 KIND_LIST => {
@@ -1194,6 +1205,7 @@ impl Heap {
             // bits cut to 64 are; at 64 bits and past it is the runtime's own.
             Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
             Value::Bool(b) => bool(*b),
+            Value::Float(f) => self.boxed_float(*f),
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
             Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
@@ -1310,6 +1322,7 @@ impl Heap {
                 KIND_UNIT => Value::Unit,
                 KIND_BOOL => Value::Bool((*o).flags != 0),
                 KIND_INT => read_int(word_at(o, 0), carry, walked),
+                KIND_FLOAT => Value::Float(f64::from_bits(word_at(o, 0) as u64)),
                 KIND_STR => Value::Str(Arc::from(str_of(o))),
                 KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
@@ -1907,6 +1920,7 @@ fn rank(w: Word) -> u8 {
             KIND_UNIT => 0,
             KIND_BOOL => 1,
             KIND_INT => 2,
+            KIND_FLOAT => 3,
             KIND_STR => 5,
             KIND_BYTES => 6,
             KIND_LIST => 7,
@@ -1971,6 +1985,10 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
             KIND_BOOL => (*obj(a)).flags.cmp(&(*obj(b)).flags),
             // Byte order, which is the order `str` and `[u8]` have.
             KIND_STR | KIND_BYTES => bytes_of(obj(a)).cmp(bytes_of(obj(b))),
+            KIND_FLOAT => ply_eval::float::total_cmp(
+                f64::from_bits(word_at(obj(a), 0) as u64),
+                f64::from_bits(word_at(obj(b), 0) as u64),
+            ),
             KIND_BRIDGE => bridged(obj(a)).cmp(bridged(obj(b))),
             KIND_LIST => {
                 let (xs, ys) = (list::to_vec(obj(a)), list::to_vec(obj(b)));
