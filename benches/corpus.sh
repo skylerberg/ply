@@ -11,7 +11,7 @@
 #   benches/corpus.sh serve --sections layers,scans,load
 #   benches/corpus.sh statements --db postgres://me@localhost/bench
 #   benches/corpus.sh operating --sections drain,deploy
-#   benches/corpus.sh take-ladder --db postgres://postgres@127.0.0.1/desk --out benches
+#   benches/corpus.sh take-ladder --db postgres://postgres@127.0.0.1/service --out benches
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

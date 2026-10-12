@@ -79,24 +79,24 @@ fn of(value: &Value) -> Configuration {
 fn a_binding_answers_from_the_values_the_program_resolved() {
     let configuration = of(&configured(
         &[
-            ("DESK_API_KEY", "s3cret", true),
-            ("DESK_REGION", "eu", false),
+            ("SERVICE_API_KEY", "s3cret", true),
+            ("SERVICE_REGION", "eu", false),
         ],
         Some((
-            "desk.config",
-            &[("DESK_API_KEY", "secret"), ("DESK_REGION", "text")],
+            "service.config",
+            &[("SERVICE_API_KEY", "secret"), ("SERVICE_REGION", "text")],
         )),
         true,
     ));
     assert!(configuration.is_opened());
     assert!(configuration.is_pinned());
-    assert_eq!(configuration.snapshot.get("DESK_REGION"), Some("eu"));
-    assert_eq!(configuration.snapshot.get("DESK_API_KEY"), None);
+    assert_eq!(configuration.snapshot.get("SERVICE_REGION"), Some("eu"));
+    assert_eq!(configuration.snapshot.get("SERVICE_API_KEY"), None);
     assert_eq!(
-        configuration.snapshot.plaintext("DESK_API_KEY"),
+        configuration.snapshot.plaintext("SERVICE_API_KEY"),
         Some("s3cret")
     );
-    assert_eq!(configuration.snapshot.plaintext("DESK_REGION"), None);
+    assert_eq!(configuration.snapshot.plaintext("SERVICE_REGION"), None);
 }
 
 #[test]
@@ -134,17 +134,29 @@ fn digest(configuration: &Configuration) -> String {
 }
 
 fn pinned(values: &[(&str, &str, bool)], keys: &[(&str, &str)]) -> Configuration {
-    of(&configured(values, Some(("desk.config", keys)), true))
+    of(&configured(values, Some(("service.config", keys)), true))
 }
 
 #[test]
 fn the_digest_covers_a_keys_name_and_shape() {
-    let base = pinned(&[("DESK_REGION", "eu", false)], &[("DESK_REGION", "text")]);
-    let renamed = pinned(&[("DESK_AREA", "eu", false)], &[("DESK_AREA", "text")]);
-    let reshaped = pinned(&[("DESK_REGION", "1", false)], &[("DESK_REGION", "int")]);
+    let base = pinned(
+        &[("SERVICE_REGION", "eu", false)],
+        &[("SERVICE_REGION", "text")],
+    );
+    let renamed = pinned(
+        &[("SERVICE_AREA", "eu", false)],
+        &[("SERVICE_AREA", "text")],
+    );
+    let reshaped = pinned(
+        &[("SERVICE_REGION", "1", false)],
+        &[("SERVICE_REGION", "int")],
+    );
     let added = pinned(
-        &[("DESK_REGION", "eu", false), ("DESK_PORT", "1", false)],
-        &[("DESK_REGION", "text"), ("DESK_PORT", "int")],
+        &[
+            ("SERVICE_REGION", "eu", false),
+            ("SERVICE_PORT", "1", false),
+        ],
+        &[("SERVICE_REGION", "text"), ("SERVICE_PORT", "int")],
     );
     assert_ne!(digest(&base), digest(&renamed));
     assert_ne!(digest(&base), digest(&reshaped));
@@ -153,11 +165,17 @@ fn the_digest_covers_a_keys_name_and_shape() {
 
 #[test]
 fn the_digest_does_not_cover_a_resolved_value() {
-    let one = pinned(&[("DESK_REGION", "eu", false)], &[("DESK_REGION", "text")]);
-    let other = pinned(&[("DESK_REGION", "us", false)], &[("DESK_REGION", "text")]);
+    let one = pinned(
+        &[("SERVICE_REGION", "eu", false)],
+        &[("SERVICE_REGION", "text")],
+    );
+    let other = pinned(
+        &[("SERVICE_REGION", "us", false)],
+        &[("SERVICE_REGION", "text")],
+    );
     assert_ne!(
-        one.snapshot.get("DESK_REGION"),
-        other.snapshot.get("DESK_REGION")
+        one.snapshot.get("SERVICE_REGION"),
+        other.snapshot.get("SERVICE_REGION")
     );
     assert_eq!(digest(&one), digest(&other));
 }
@@ -177,7 +195,7 @@ fn a_schema_the_program_does_not_carry_or_cannot_evaluate_is_refused() {
         .def("m", "config", Vec::new())
         .check();
 
-    let absent = schema_of(&program, None, "desk.config").expect_err("nothing is named so");
+    let absent = schema_of(&program, None, "service.config").expect_err("nothing is named so");
     assert_eq!(absent.code, codes::CONFIG_UNAVAILABLE);
     assert!(
         absent.message.contains("names no definition"),

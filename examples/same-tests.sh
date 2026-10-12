@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# `examples/desk.ply`'s endpoints run unchanged against its in-memory twin and against postgres,
+# `examples/service.ply`'s endpoints run unchanged against its in-memory twin and against postgres,
 # checked the two ways that can be checked:
 #
-#   1. `ply test examples/desk.ply --no-cache`: the whole suite against the twin, hermetic, and
+#   1. `ply test examples/service.ply --no-cache`: the whole suite against the twin, hermetic, and
 #      every test evaluated rather than served from a cache.
-#   2. The one desk started twice, `DESK_STORE=memory` and `DESK_STORE=postgres`, the same requests
+#   2. The one service started twice, `SERVICE_STORE=memory` and `SERVICE_STORE=postgres`, the same requests
 #      sent to both, and the answers compared byte for byte.
 #   3. The transactional route against postgres, checked in the database: an order that commits
 #      leaves a row, and one refused after its row was inserted leaves none.
@@ -57,7 +57,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== 1. the whole suite against the twin, hermetically =="
-"$ply" --color never test "$here/desk.ply" --no-cache | tee "$work/step1.out"
+"$ply" --color never test "$here/service.ply" --no-cache | tee "$work/step1.out"
 # `ply test` exits 0 over a run that evaluated nothing, so the counts are read, not the status.
 counts="$(grep -E '^[[:space:]]*[0-9]+ failed, [0-9]+ passed, [0-9]+ cached' "$work/step1.out" | tail -n 1 || true)"
 if [ -z "$counts" ]; then
@@ -81,13 +81,13 @@ if [ -z "$db" ]; then
   pg_ctl -D "$work/pgdata" -l "$work/pg.log" \
     -o "-p $cluster_port -k $sock -c listen_addresses=127.0.0.1" start >/dev/null
   owned_cluster=1
-  psql -h 127.0.0.1 -p "$cluster_port" -U ply -d postgres -q -c 'create database desk'
-  db="postgres://ply@127.0.0.1:$cluster_port/desk"
+  psql -h 127.0.0.1 -p "$cluster_port" -U ply -d postgres -q -c 'create database service'
+  db="postgres://ply@127.0.0.1:$cluster_port/service"
   reset=1
   echo "started a postgres for this run: $db"
 fi
 
-echo "== 2. the schema, from examples/desk.sql =="
+echo "== 2. the schema, from examples/service.sql =="
 # Both stores start from the seeded state, so a database with the tables in it is reset only when
 # asked: one named with `--db` may hold data.
 if psql -tA -d "$db" -c "select to_regclass('public.items')" | grep -q items; then
@@ -97,22 +97,22 @@ if psql -tA -d "$db" -c "select to_regclass('public.items')" | grep -q items; th
       -c 'drop table if exists "items"' \
       -c 'drop sequence if exists "orders_id_seq"'
   else
-    echo "   $db already holds the desk's tables; pass --reset, or name an empty database" >&2
+    echo "   $db already holds the service's tables; pass --reset, or name an empty database" >&2
     exit 2
   fi
 fi
-psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/desk.sql"
+psql -v ON_ERROR_STOP=1 -q -d "$db" -f "$here/service.sql"
 echo
 
-# One credential for both desks: two that refused each other's key would agree on every 401.
-export DESK_API_KEY="${DESK_API_KEY:-same-tests-key}"
+# One credential for both services: two that refused each other's key would agree on every 401.
+export SERVICE_API_KEY="${SERVICE_API_KEY:-same-tests-key}"
 
 serve() {
   local store="$1" port="$2" log="$3"
-  local settings=(--config-schema desk.config --set "DESK_STORE=$store" --set "DESK_PORT=$port"
-    --set DESK_CONNECTIONS=400 --set "DESK_API_KEY=$DESK_API_KEY")
-  if [ "$store" = postgres ]; then settings+=(--set "DESK_DATABASE=$db"); fi
-  "$ply" run "$here/desk.ply" --host "${settings[@]}" >"$log" 2>&1 &
+  local settings=(--config-schema service.config --set "SERVICE_STORE=$store" --set "SERVICE_PORT=$port"
+    --set SERVICE_CONNECTIONS=400 --set "SERVICE_API_KEY=$SERVICE_API_KEY")
+  if [ "$store" = postgres ]; then settings+=(--set "SERVICE_DATABASE=$db"); fi
+  "$ply" run "$here/service.ply" --host "${settings[@]}" >"$log" 2>&1 &
   echo $!
 }
 
@@ -130,14 +130,14 @@ pg_pid="$(serve postgres "$pg_port" "$work/postgres.log")"
 wait_for "$mem_port" || { echo "the twin never answered:"; cat "$work/memory.log"; exit 1; }
 wait_for "$pg_port" || { echo "postgres never answered:"; cat "$work/postgres.log"; exit 1; }
 
-# One request to both desks. The writes move both stores in step, so the reads after them compare
+# One request to both services. The writes move both stores in step, so the reads after them compare
 # two stores that have seen the same history.
 ask() {
   local method="$1" path="$2" body="${3:-}" port out
   for port in "$mem_port" "$pg_port"; do
     if [ -n "$body" ]; then
       out="$(curl -sS -m 20 -w '\n%{http_code}' -X "$method" \
-        -H 'content-type: application/json' -H "x-api-key: $DESK_API_KEY" --data "$body" \
+        -H 'content-type: application/json' -H "x-api-key: $SERVICE_API_KEY" --data "$body" \
         "http://127.0.0.1:$port$path" 2>&1 || true)"
     else
       out="$(curl -sS -m 20 -w '\n%{http_code}' -X "$method" "http://127.0.0.1:$port$path" 2>&1 || true)"
@@ -193,7 +193,7 @@ echo "== 4. the transaction, in the database rather than in the response =="
 count_orders() { psql -tA -d "$db" -c 'select count(*) from "orders"'; }
 place() {
   curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \
-    -H "x-api-key: $DESK_API_KEY" --data "$1" "http://127.0.0.1:$pg_port/orders"
+    -H "x-api-key: $SERVICE_API_KEY" --data "$1" "http://127.0.0.1:$pg_port/orders"
 }
 
 before="$(count_orders)"

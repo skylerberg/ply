@@ -18,11 +18,12 @@ import derive (expand_derives)
 import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
               EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
               facts_at, test_owner, law_root, cases_root)
-import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
+              is_diverges)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
               analyse_pulling_std_with, dump_of, WalkedFacts, walked_facts_bin, facts_read,
-              lowered_modules, lowers, module_of_root, wants)
+              lowered_modules, lowers, module_of_root, wants, CtorRow)
 import std.bin
 import std.list (at, concat, contains)
 import std.graph
@@ -119,7 +120,15 @@ fn as_num(value: CValue, width: Width) -> Bytes =
 /// An emitted value: the kind it is held at and the C expression naming it.
 pub type CValue = { kind: Kind, expr: Bytes, ty: Ty }
 
-pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
+/// `TyArr`: an array, with how it holds its elements where its element type says (as a record's field
+/// `e` of that type is held), and `None` where the type is a variable's.
+/// The program's constructor table: the names its tags are positions of, and the arguments of each
+/// constructor whose declaration lays one out other than as its word.
+pub type Ctors = { names: List<Bytes>, laid: Map<Bytes, List<FieldTy>> }
+
+fn no_ctors() -> Ctors = { names: [], laid: map_new() }
+
+pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArr(Option<FieldTy>)
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
@@ -164,7 +173,7 @@ pub type Emitter = {
   /// Literals in first-met order: a body indexes the unit's tables by its own positions.
   consts: List<Lit>,
   /// Every constructor's program-wide name; a tag is its index here.
-  ctors: List<Bytes>,
+  ctors: Ctors,
   /// Lambda sub-functions, written after the function that builds the closure.
   lambda_bodies: Bytes,
   /// This body's code table: each lambda's entry and each pure nullary constant's entry.
@@ -1012,7 +1021,7 @@ fn laid_of(fs: List<FieldTy>) -> Laid = {
 /// A field as a shape spells it: a `Float` held as its bits after its name, and a record held in
 /// place after its name with its own shape's fields, both below every byte a name holds so a shape
 /// sorts as its names do.
-fn spelled_field(f: FieldTy) -> Bytes =
+pub fn spelled_field(f: FieldTy) -> Bytes =
   match f.ty {
     TyRec(inner) ->
       bytes_concat_all([f.name, b"!r(", bytes_join(map(inner, spelled_field), b","), b")"]),
@@ -1137,29 +1146,7 @@ fn build_record(
   let l = laid_of(fields);
   let flags = record_flags(fields, l);
   let nests = fold(fields, false, |acc: Bool, f: FieldTy| acc || in_place(f) != None);
-  let word = |i: Int| match list_at(words, i) { Some(w) -> w, None -> b"0" };
-  let cells = concat(
-    map(range(0, n), |i: Int| {
-      let f = match list_at(fields, i) {
-        Some(x) -> x,
-        None -> { name: b"", kind: KBoxed, ty: TyOpen },
-      };
-      {
-        at: match list_at(l.offsets, i) { Some(o) -> o, None -> i },
-        expr: word(i),
-        tail: match in_place(f) { Some(inner) -> Some(laid_of(inner).tail), None -> None },
-      }
-    }),
-    if has_tail(flags) {
-      let bits = tail_bits(l);
-      map(range(0, len(bits)), |t: Int|
-        {
-          at: l.width + t,
-          expr: match list_at(bits, t) { Some(b) -> b, None -> b"0" },
-          tail: None,
-        })
-    } else { [] },
-  );
+  let cells = cells_of(fields, words, l, flags);
   let ty = TyRec(fields);
   // What a field held in place was is copied and let go, so only the record's other fields are
   // remembered as values.
@@ -1194,19 +1181,49 @@ fn build_record(
       }
     } else {
       let k = kept(vs);
-      built_now(sh.emitter, k.names, cells, sh.i, l.width, flags, ty, Some(k.vals))
+      built_now(sh.emitter, k.names, cells, 3, shape_text(sh.i), l.width, flags, ty, Some(k.vals))
     },
-    None -> built_now(sh.emitter, names, cells, sh.i, l.width, flags, ty, None),
+    None -> built_now(sh.emitter, names, cells, 3, shape_text(sh.i), l.width, flags, ty, None),
   }
 }
 
-/// A record of `n` words built of `cells`. A token is taken for a mixed record only when it was
-/// one, so it has room for the bitmap.
+/// The words an object laid out as a record of `fields` is holds: `words`, one per field, each at
+/// its offset, and the bitmap after them where `flags` says it is mixed.
+fn cells_of(fields: List<FieldTy>, words: List<Bytes>, l: Laid, flags: Int) -> List<WordAt> =
+  concat(
+    map(range(0, len(fields)), |i: Int| {
+      let f = match list_at(fields, i) {
+        Some(x) -> x,
+        None -> { name: b"", kind: KBoxed, ty: TyOpen },
+      };
+      {
+        at: match list_at(l.offsets, i) { Some(o) -> o, None -> i },
+        expr: match list_at(words, i) { Some(w) -> w, None -> b"0" },
+        tail: match in_place(f) { Some(inner) -> Some(laid_of(inner).tail), None -> None },
+      }
+    }),
+    if has_tail(flags) {
+      let bits = tail_bits(l);
+      map(range(0, len(bits)), |t: Int|
+        {
+          at: l.width + t,
+          expr: match list_at(bits, t) { Some(b) -> b, None -> b"0" },
+          tail: None,
+        })
+    } else { [] },
+  )
+
+fn shape_text(shape: Int) -> Bytes = bytes_concat_all([b"@@s", ascii_of_int(shape), b"@@"])
+
+/// An object of `kind` (a record's 3, a constructor's 4) and `n` words built of `cells`, its header
+/// naming `layout`. A token is taken for a mixed object only when it was one, so it has room for
+/// the bitmap.
 fn built_now(
   emitter: Emitter,
   names: List<Bytes>,
   cells: List<WordAt>,
-  shape: Int,
+  kind: Int,
+  layout: Bytes,
   n: Int,
   flags: Int,
   ty: Ty,
@@ -1241,7 +1258,9 @@ fn built_now(
       rec.value.expr,
       b")->rc = 1; ply_obj(",
       rec.value.expr,
-      b")->kind = 3; ply_obj(",
+      b")->kind = ",
+      ascii_of_int(kind),
+      b"; ply_obj(",
       rec.value.expr,
       b")->flags = ",
       ascii_of_int(flags),
@@ -1251,9 +1270,9 @@ fn built_now(
       ascii_of_int(n),
       b"; ply_obj(",
       rec.value.expr,
-      b")->layout = @@s",
-      ascii_of_int(shape),
-      b"@@;",
+      b")->layout = ",
+      layout,
+      b";",
     ]),
   );
   let made = check(
@@ -1261,11 +1280,13 @@ fn built_now(
       indent(line(outdent(took), b"} else {")),
       bytes_concat_all([
         rec.value.expr,
-        b" = rt_alloc_p(ctx, 3, ",
+        b" = rt_alloc_p(ctx, ",
+        ascii_of_int(kind),
+        b", ",
         ascii_of_int(n),
-        b", @@s",
-        ascii_of_int(shape),
-        b"@@, ",
+        b", ",
+        layout,
+        b", ",
         ascii_of_int(flags),
         b");",
       ]),
@@ -1385,6 +1406,41 @@ fn ctor_built(emitter: Emitter, tag: Int, words: List<Bytes>) -> WithValue / {ab
     value: { kind: KBoxed, expr: r, ty: TyOpen },
   }
 }
+
+/// A constructor whose declaration lays its arguments out as `fields`, built of `words`: a raw
+/// argument's bits and a record held in place, which it takes, as a record of `fields` holds them.
+fn ctor_laid(
+  emitter: Emitter,
+  tag: Int,
+  fields: List<FieldTy>,
+  words: List<Bytes>,
+) -> WithValue / {abort.raise} = {
+  let l = laid_of(fields);
+  let flags = record_flags(fields, l);
+  built_now(
+    emitter,
+    [],
+    cells_of(fields, words, l, flags),
+    4,
+    tag_text(emitter, tag),
+    l.width,
+    flags,
+    TyOpen,
+    None,
+  )
+}
+
+/// How constructor `tag` holds its arguments, where its declaration lays one out other than as its
+/// word; `None` where it holds each as its word.
+fn ctor_fields(emitter: Emitter, tag: Int) -> Option<List<FieldTy>> =
+  match list_at(emitter.ctors.names, tag) {
+    Some(name) -> map_get(emitter.ctors.laid, name),
+    None -> None,
+  }
+
+/// The words a constructor object of `tag` with `arity` arguments holds.
+fn ctor_width(emitter: Emitter, tag: Int, arity: Int) -> Int =
+  match ctor_fields(emitter, tag) { Some(fs) -> laid_of(fs).width, None -> arity }
 
 /// Like `bind`, keeping the value's shape so a record's fields survive block boundaries.
 fn bind_keeping(emitter: Emitter, k: Kind, ty: Ty, expr: Bytes) -> WithValue = {
@@ -2025,8 +2081,12 @@ fn let_go(emitter: Emitter, subj: CValue, pattern: CodePattern) -> Emitter =
   if emitter.release && subj.kind == KBoxed && spendable(emitter, subj.expr) {
     let spent = spend_made(emitter, subj.expr);
     match pattern {
-      PxCtor(c) -> if len(c.args) == 0 { release_holder(spent, subj) }
-      else { into_token(spent, subj.expr, len(c.args)) },
+      PxCtor(c) -> if len(c.args) == 0 { release_holder(spent, subj) } else {
+        match tag_of(emitter, c.name) {
+          Some(tag) -> into_token(spent, subj.expr, ctor_width(emitter, tag, len(c.args))),
+          None -> release_holder(spent, subj),
+        }
+      },
       _ -> release_holder(spent, subj),
     }
   } else { emitter }
@@ -2178,7 +2238,7 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
     },
     None -> qualify(emitter.module, name),
   };
-  match ctor_index(emitter.ctors, want, name) {
+  match ctor_index(emitter.ctors.names, want, name) {
     Some(t) -> Some(t),
     // Only an import that bound this name can be where it came from. Two modules may declare a
     // constructor of the same name, so matching on the module alone would take the wrong one.
@@ -2187,7 +2247,7 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
         match acc {
           Some(_) -> acc,
           None -> if !imp.whole && imp.name == written {
-            ctor_index(emitter.ctors, bytes_concat_all([imp.module, b".", written]), b"")
+            ctor_index(emitter.ctors.names, bytes_concat_all([imp.module, b".", written]), b"")
           } else { None },
         }),
   }
@@ -2202,7 +2262,7 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
 fn stated_witness(emitter: Emitter, args: List<Code>) -> Option<WithValue> / {abort.raise} =
   match match list_at(args, 0) {
       Some(c) -> match c.node {
-        NLit(LStr(name)) -> ctor_index(emitter.ctors, name, b""),
+        NLit(LStr(name)) -> ctor_index(emitter.ctors.names, name, b""),
         _ -> None,
       },
       None -> None,
@@ -2220,7 +2280,7 @@ fn stated_witness(emitter: Emitter, args: List<Code>) -> Option<WithValue> / {ab
   }
 
 fn tag_text(emitter: Emitter, tag: Int) -> Bytes / {abort.raise} =
-  match list_at(emitter.ctors, tag) {
+  match list_at(emitter.ctors.names, tag) {
     Some(name) -> bytes_concat_all([b"@@T", name, b"@@"]),
     None -> panic("a tag is a position in the program's constructor table"),
   }
@@ -3078,18 +3138,12 @@ fn inline_len(
           let fits = match o.value.ty {
             TyList -> name == b"len",
             TyBytes -> name == b"bytes_len",
-            TyArray -> name == b"array_len",
+            TyArr(_) -> name == b"array_len",
             _ -> false,
           };
           if !fits { Some(kind_tested(o.emitter, name, o.value, None)) } else {
             let t = bind(o.emitter, KBoxed, as_word(o.value));
-            Some(
-              bind(
-                t.emitter,
-                KInt,
-                bytes_concat_all([b"(int64_t)ply_obj(", t.value.expr, b")->len"]),
-              ),
-            )
+            Some(bind(t.emitter, KInt, length_of(name, t.value.expr)))
           }
         },
       },
@@ -3348,7 +3402,7 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
     NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
     NLambda(l) -> NLambda({ ..l, body: go(l.body) }),
     NSimulate(x) -> NSimulate({ ..x, body: go(x.body) }),
-    NParallel(pr) -> NParallel({ branches: map(pr.branches, go) }),
+    NParallel(pr) -> NParallel({ ..pr, branches: map(pr.branches, go) }),
     NHandle(h) ->
       NHandle({
         body: go(h.body),
@@ -3558,6 +3612,12 @@ fn wrapped(emitter: Emitter, name: Bytes, v0: CValue, v1: CValue, t: Width) -> W
   }
 }
 
+/// A list's, a byte string's or an array's length, read off its header: an array holding its
+/// elements in place counts its words a stride at a time.
+fn length_of(name: Bytes, w: Bytes) -> Bytes =
+  if name == b"array_len" { bytes_concat_all([b"ply_array_len(", w, b")"]) }
+  else { bytes_concat_all([b"(int64_t)ply_obj(", w, b")->len"]) }
+
 /// A kind test: the header's field (or a bounds-tested byte) fast, the runtime's call slow, which raises on a wrong kind.
 fn kind_tested(
   emitter: Emitter,
@@ -3640,9 +3700,9 @@ fn kind_tested(
           ok.name,
           b") { ",
           out.name,
-          b" = (int64_t)ply_obj(",
-          t.value.expr,
-          b")->len; } else {",
+          b" = ",
+          length_of(name, t.value.expr),
+          b"; } else {",
         ]),
       );
       line(
@@ -3811,66 +3871,117 @@ fn inline_get(
       None -> None,
       Some(i0) -> match expr(notail(emitter), a0, params) {
         None -> None,
-        Some(av0) -> if av0.value.ty != TyArray { None } else {
-          // The array is read before the index and bound after, as `inline_at` reads its bytes.
-          let av = secure_across(av0.emitter, av0.value, i0, params);
-          match expr(notail(av.emitter), i0, params) {
-            None -> None,
-            Some(iv0) -> {
-              let t = bind(site(iv0.emitter, span), KBoxed, as_word(av.value));
-              let idx = bind(t.emitter, KInt, as_int(iv0.value));
-              let g = line(
-                idx.emitter,
-                bytes_concat_all([
-                  b"if ((uint64_t)",
-                  idx.value.expr,
-                  b" >= (uint64_t)ply_obj(",
-                  t.value.expr,
-                  b")->len) { ply_inc(",
-                  t.value.expr,
-                  b"); ",
-                  builtin_call_over(b"array_get", [
+        Some(av0) -> match av0.value.ty {
+          TyArr(Some(element)) -> {
+            // The array is read before the index and bound after, as `inline_at` reads its bytes.
+            let av = secure_across(av0.emitter, av0.value, i0, params);
+            match expr(notail(av.emitter), i0, params) {
+              None -> None,
+              Some(iv0) -> {
+                let t = bind(site(iv0.emitter, span), KBoxed, as_word(av.value));
+                let idx = bind(t.emitter, KInt, as_int(iv0.value));
+                let g = line(
+                  idx.emitter,
+                  bytes_concat_all([
+                    b"if ((uint64_t)",
+                    idx.value.expr,
+                    b" >= (uint64_t)ply_array_len(",
                     t.value.expr,
-                    bytes_concat_all([
-                      b"(ply_fits_imm(",
-                      idx.value.expr,
-                      b") ? ply_imm(",
-                      idx.value.expr,
-                      b") : rt_box_int_p(ctx, ",
-                      idx.value.expr,
-                      b"))",
+                    b")) { ply_inc(",
+                    t.value.expr,
+                    b"); ",
+                    builtin_call_over(b"array_get", [
+                      t.value.expr,
+                      bytes_concat_all([
+                        b"(ply_fits_imm(",
+                        idx.value.expr,
+                        b") ? ply_imm(",
+                        idx.value.expr,
+                        b") : rt_box_int_p(ctx, ",
+                        idx.value.expr,
+                        b"))",
+                      ]),
                     ]),
+                    b"; ",
+                    leaving(idx.emitter),
+                    b" }",
                   ]),
-                  b"; ",
-                  leaving(idx.emitter),
-                  b" }",
-                ]),
-              );
-              let r = fresh(g);
-              let loaded = line(
-                r.emitter,
-                bytes_concat_all([
-                  b"Word ",
-                  r.name,
-                  b" = ply_words(",
-                  t.value.expr,
-                  b")[",
-                  idx.value.expr,
-                  b"]; ply_inc(",
-                  r.name,
-                  b");",
-                ]),
-              );
-              Some({
-                emitter: note_holder(loaded, r.name),
-                value: { kind: KBoxed, expr: r.name, ty: TyOpen },
-              })
-            },
-          }
+                );
+                Some(element_read(g, t.value.expr, idx.value.expr, element))
+              },
+            }
+          },
+          _ -> None,
         },
       },
     },
   }
+
+/// Element `i` of array `a`, whose elements are held as a record's field `e` of their type is: a
+/// record in place as the address of its header there, a `Float` or a 64-bit width as its bits,
+/// anything else as its word, each held as the array's element is once read.
+fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithValue = {
+  let r = fresh(emitter);
+  match element.ty {
+    TyRec(fs) -> {
+      let l = laid_of(fs);
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          b"Word ",
+          r.name,
+          b" = (Word)(intptr_t)(ply_words(",
+          a,
+          b") + ",
+          i,
+          b" * ",
+          ascii_of_int(2 + l.width + l.tail),
+          b"); ply_inc(",
+          r.name,
+          b");",
+        ]),
+      );
+      {
+        emitter: note_holder(loaded, r.name),
+        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+      }
+    },
+    _ -> if raw_slot(element.kind) {
+      let word = bytes_concat_all([b"ply_words(", a, b")[", i, b"]"]);
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          ctype(element.kind),
+          b" ",
+          r.name,
+          b" = ",
+          raw_read(word, element.kind),
+          b";",
+        ]),
+      );
+      { emitter: loaded, value: { kind: element.kind, expr: r.name, ty: TyOpen } }
+    } else {
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          b"Word ",
+          r.name,
+          b" = ply_words(",
+          a,
+          b")[",
+          i,
+          b"]; ply_inc(",
+          r.name,
+          b");",
+        ]),
+      );
+      {
+        emitter: note_holder(loaded, r.name),
+        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+      }
+    },
+  }
+}
 
 fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
@@ -5516,23 +5627,29 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           match tag_of(emitter, fv.name) {
             None ->
               Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", fv.name))),
-            Some(tag) -> match items(emitter, a.args, params, 0, []) {
-              None -> None,
-              Some(w) -> if len(w.names) > 0 { Some(ctor_built(w.emitter, tag, w.names)) } else {
-                let arr = fresh(w.emitter);
-                let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
-                let o = bind(
-                  e,
-                  KBoxed,
-                  bytes_concat_all([
-                    b"rt_ctor_p(ctx, ",
-                    tag_text(emitter, tag),
-                    b", (Word)(intptr_t)",
-                    arr.name,
-                    b", 0)",
-                  ]),
-                );
-                Some({ emitter: check(o.emitter), value: o.value })
+            Some(tag) -> match ctor_fields(emitter, tag) {
+              Some(fs) -> match items_laid(emitter, a.args, params, kinds_of(fs)) {
+                None -> None,
+                Some(w) -> Some(ctor_laid(w.emitter, tag, fs, w.names)),
+              },
+              None -> match items(emitter, a.args, params, 0, []) {
+                None -> None,
+                Some(w) -> if len(w.names) > 0 { Some(ctor_built(w.emitter, tag, w.names)) } else {
+                  let arr = fresh(w.emitter);
+                  let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
+                  let o = bind(
+                    e,
+                    KBoxed,
+                    bytes_concat_all([
+                      b"rt_ctor_p(ctx, ",
+                      tag_text(emitter, tag),
+                      b", (Word)(intptr_t)",
+                      arr.name,
+                      b", 0)",
+                    ]),
+                  );
+                  Some({ emitter: check(o.emitter), value: o.value })
+                },
               },
             },
           }
@@ -6067,7 +6184,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       }
     },
     // `parallel { .. }`: the branches' closures go to the runtime, which runs them at once where it may
-    // and in order where it must, and writes each one's answer over its closure.
+    // and in order where it must, and writes each one's answer over its closure. Where the block's
+    // definition says what the branches may perform, the runtime is told, so a handler none of it
+    // reaches does not keep them in order.
     NParallel(pr) -> match items(emitter, pr.branches, params, 0, []) {
       None -> None,
       Some(w) -> {
@@ -6077,18 +6196,68 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           arr.emitter,
           bytes_concat_all([b"Word ", arr.name, b"[] = {", bytes_join(w.names, b", "), b"};"]),
         );
-        let ran = check(
-          line(
-            site(held, c.span),
-            bytes_concat_all([
-              b"rt_parallel_p(ctx, (Word)(intptr_t)",
-              arr.name,
-              b", ",
-              ascii_of_int(n),
-              b");",
-            ]),
-          ),
-        );
+        let ran = match if pr.rooted { owner_reach(held) } else { None } {
+          None ->
+            check(
+              line(
+                site(held, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b");",
+                ]),
+              ),
+            ),
+          Some(reach) -> {
+            let named = fold(
+              reach,
+              { emitter: held, words: [] },
+              |acc: { emitter: Emitter, words: List<Bytes> }, r: Reached| {
+                let ef = field_of(acc.emitter, r.effect);
+                match r.resource {
+                  None ->
+                    { emitter: ef.emitter, words: concat(acc.words, [field_ref(ef.i), b"-1"]) },
+                  Some(name) -> {
+                    let res = field_of(ef.emitter, name);
+                    {
+                      emitter: res.emitter,
+                      words: concat(acc.words, [field_ref(ef.i), field_ref(res.i)]),
+                    }
+                  },
+                }
+              },
+            );
+            let table = fresh(named.emitter);
+            let listed = line(
+              table.emitter,
+              bytes_concat_all([
+                b"Word ",
+                table.name,
+                b"[] = {",
+                if len(named.words) == 0 { b"0" } else { bytes_join(named.words, b", ") },
+                b"};",
+              ]),
+            );
+            check(
+              line(
+                site(listed, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_past_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b", (Word)(intptr_t)",
+                  table.name,
+                  b", ",
+                  ascii_of_int(len(reach)),
+                  b");",
+                ]),
+              ),
+            )
+          },
+        };
         let names = map(range(0, n), |i: Int| bytes_concat(b"_", ascii_of_int(i)));
         let words = map(range(0, n), |i: Int|
           bytes_concat_all([arr.name, b"[", ascii_of_int(i), b"]"]));
@@ -6099,6 +6268,41 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
     },
     _ -> Some(refused(emitter, b"an effect construct or another node this port does not emit")),
+  }
+
+/// What a `parallel` block's branches may perform of one effect, by its program-wide name: on the
+/// resource named, or on any.
+type Reached = { effect: Bytes, resource: Option<Bytes> }
+
+/// Every operation the definition being emitted may perform and does not answer, as its row has
+/// it: what a block in its own body may reach of the handlers its callers installed. `None` where
+/// the row does not say: a root that is no definition, a group's shared function and a row left
+/// open. A row names an effect program-wide, as a frame's clause does.
+fn owner_reach(emitter: Emitter) -> Option<List<Reached>> =
+  if len(emitter.group) > 0 { None } else {
+    match fold(emitter.here, None, |found: Option<Scheme>, d: Def| {
+        let full = qualify(emitter.module, d.name);
+        if full == emitter.owner || bytes_starts_with(emitter.owner, bytes_concat(full, b"@")) {
+          d.scheme
+        } else { found }
+      }) {
+      None -> None,
+      Some(s) -> match s.ty {
+        TyFn(f) -> match f.effects.tail {
+          Some(_) -> None,
+          None ->
+            Some(
+              // Nothing performs `diverges`: it says only that the body may not return.
+              map(filter(f.effects.atoms, |atom: Atom| !is_diverges(atom)), |atom: Atom|
+                {
+                  effect: atom.effect,
+                  resource: match atom.resource { RNamed(name) -> Some(name), _ -> None },
+                }),
+            ),
+        },
+        _ -> None,
+      },
+    }
   }
 
 /// The operations a `simulate` region answers, named as the fixpoint names a handled operation.
@@ -7172,9 +7376,10 @@ fn pat_test(
           b" && ply_obj(",
           subj.expr,
           b")->len == ",
-          ascii_of_int(len(c.args)),
+          ascii_of_int(ctor_width(emitter, tag, len(c.args))),
           b")",
         ]);
+        let laid = ctor_fields(emitter, tag);
         fold(
           range(0, len(c.args)),
           Some({ emitter: emitter, expr: head }),
@@ -7184,19 +7389,7 @@ fn pat_test(
               Some(t) -> match list_at(c.args, k) {
                 None -> None,
                 Some(sub) -> if irrefutable(sub) { Some(t) } else {
-                  let field = bind(
-                    t.emitter,
-                    KBoxed,
-                    bytes_concat_all([
-                      b"(",
-                      t.expr,
-                      b" ? ply_words(",
-                      subj.expr,
-                      b")[",
-                      ascii_of_int(k),
-                      b"] : 0)",
-                    ]),
-                  );
+                  let field = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
                   match pat_test(sub, field.value, field.emitter) {
                     None -> None,
                     Some(inner) ->
@@ -7318,6 +7511,50 @@ fn pat_test(
     },
   }
 
+/// Argument `k` of constructor object `subj` as a word, read where `so_far` holds and zero where it
+/// does not: borrowed from the object, but for a raw argument, boxed and held by this body.
+fn arg_tested(
+  emitter: Emitter,
+  so_far: Bytes,
+  subj: Bytes,
+  k: Int,
+  laid: Option<List<FieldTy>>,
+) -> WithValue =
+  match match laid { Some(fs) -> arg_at(fs, k), None -> None } {
+    None ->
+      bind(
+        emitter,
+        KBoxed,
+        bytes_concat_all([b"(", so_far, b" ? ply_words(", subj, b")[", ascii_of_int(k), b"] : 0)"]),
+      ),
+    Some(f) -> if raw_slot(f.kind) {
+      let boxed = bind(
+        emitter,
+        KBoxed,
+        bytes_concat_all([
+          b"(",
+          so_far,
+          b" ? ",
+          as_word({ kind: f.kind, expr: raw_read(field_read(subj, f), f.kind), ty: TyOpen }),
+          b" : 0)",
+        ]),
+      );
+      { emitter: note_holder(check(boxed.emitter), boxed.value.expr), value: boxed.value }
+    } else {
+      bind(emitter, KBoxed, bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]))
+    },
+  }
+
+/// Where argument `k` of a constructor laid out as `fs` starts, and how it is held.
+fn arg_at(fs: List<FieldTy>, k: Int) -> Option<{ at: Int, kind: Kind, ty: Ty }> =
+  match list_at(fs, k) {
+    Some(f) -> match list_at(laid_of(fs).offsets, k) {
+      Some(at) -> Some({ at: at, kind: f.kind, ty: f.ty }),
+      None -> None,
+    },
+    None -> None,
+  }
+
 /// A constructor's argument is duplicated when bound: the object still holds it.
 fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {abort.raise} =
   match pattern {
@@ -7327,24 +7564,38 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
       Some(s) -> {
         // What the subject's own shape does not say, the type the checker bound says.
         let ty = match subj.ty { TyOpen -> typed_kind(emitter.typed, v.span).ty, known -> known };
-        let b = bind_keeping(emitter, KBoxed, ty, subj.expr);
+        let b = bind_keeping(emitter, subj.kind, ty, subj.expr);
         remember(ensure_owned(b.emitter, b.value), s, b.value)
       },
     },
     // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
-    PxCtor(c) ->
+    PxCtor(c) -> {
+      let laid = match tag_of(emitter, c.name) {
+        Some(tag) -> ctor_fields(emitter, tag),
+        None -> None,
+      };
       fold(range(0, len(c.args)), emitter, |acc: Emitter, i: Int| {
-        let w = bind(
-          acc,
-          KBoxed,
-          bytes_concat_all([b"ply_words(", subj.expr, b")[", ascii_of_int(i), b"]"]),
-        );
-        let inc = note_holder(
-          line(w.emitter, bytes_concat_all([b"ply_inc(", w.value.expr, b");"])),
-          w.value.expr,
-        );
-        match list_at(c.args, i) { Some(sub) -> pat_bind(inc, sub, w.value), None -> inc }
-      }),
+        let f = match laid { Some(fs) -> arg_at(fs, i), None -> None };
+        let w = match f {
+          Some(x) -> if raw_slot(x.kind) {
+            bind(acc, x.kind, raw_read(field_read(subj.expr, x), x.kind))
+          } else { bind_keeping(acc, KBoxed, x.ty, field_read(subj.expr, x)) },
+          None ->
+            bind(
+              acc,
+              KBoxed,
+              bytes_concat_all([b"ply_words(", subj.expr, b")[", ascii_of_int(i), b"]"]),
+            ),
+        };
+        let held = if w.value.kind != KBoxed { w.emitter } else {
+          note_holder(
+            line(w.emitter, bytes_concat_all([b"ply_inc(", w.value.expr, b");"])),
+            w.value.expr,
+          )
+        };
+        match list_at(c.args, i) { Some(sub) -> pat_bind(held, sub, w.value), None -> held }
+      })
+    },
     // The runtime's read by name answers the field duplicated; no increment here.
     PxRecord(r) ->
       fold(r.fields, emitter, |acc: Emitter, f: CodePatternField| {
@@ -8294,7 +8545,12 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
     else if len(c.args) == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
     else if len(c.args) == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
-    else if len(c.args) == 1 && c.name == b"Array" { { kind: KBoxed, ty: TyArray } }
+    else if len(c.args) == 1 && c.name == b"Array" {
+      {
+        kind: KBoxed,
+        ty: TyArr(match list_at(c.args, 0) { Some(e) -> laid_field(b"e", e), None -> None }),
+      }
+    }
     // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
     else if len(c.args) == 0 {
       match width_named(c.name) {
@@ -8314,6 +8570,39 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
   }
 
 fn boxed() -> { kind: Kind, ty: Ty } = { kind: KBoxed, ty: TyOpen }
+
+/// Each constructor whose declaration lays out an argument other than as its word: its arguments,
+/// `a000` first, each held as a record's field of its declared type is. An argument of a variable's
+/// type, or of a record holding one, is its word, so a constructor's layout is its own.
+pub fn ctor_layouts(ctors: List<CtorRow>) -> Map<Bytes, List<FieldTy>> =
+  fold(ctors, map_new(), |acc: Map<Bytes, List<FieldTy>>, c: CtorRow| {
+    let args = map(range(0, len(c.fields)), |i: Int| {
+      let name = bytes_concat_all([
+        b"a",
+        ascii_of_int(i / 100),
+        ascii_of_int(i / 10 % 10),
+        ascii_of_int(i % 10),
+      ]);
+      match match list_at(c.fields, i) { Some(t) -> laid_field(name, t), None -> None } {
+        Some(f) -> f,
+        None -> { name: name, kind: KBoxed, ty: TyOpen },
+      }
+    });
+    if fold(args, false, |laid: Bool, f: FieldTy| laid || raw_slot(f.kind) || in_place(f) != None) {
+      map_insert(acc, c.name, args)
+    } else { acc }
+  })
+
+/// How a record's field `name` of type `t` is held, wherever the record is made; `None` where that
+/// depends on what the field turns out to hold: a variable's type, or a record holding one.
+fn laid_field(name: Bytes, t: Type) -> Option<FieldTy> =
+  match t {
+    TyVar(_) -> None,
+    TyRecord(fs) -> if open_fields(fs) { None } else { Some(field_ty({ name: name, ty: t })) },
+    TyNominal(x) -> if open_fields(x.fields) { None }
+    else { Some(field_ty({ name: name, ty: t })) },
+    _ -> Some(field_ty({ name: name, ty: t })),
+  }
 
 fn open_fields(fs: List<Field>) -> Bool =
   fold(fs, false, |open: Bool, f: Field|
@@ -8575,7 +8864,7 @@ fn specialised_emitted(
   sites: Map<Bytes, List<Bytes>>,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
@@ -8663,7 +8952,7 @@ pub fn emit_fn(
       0,
       here,
       imports,
-      ctors,
+      { names: ctors, laid: map_new() },
       builtins,
       full,
       params,
@@ -8684,7 +8973,7 @@ pub fn emit_fn_full(
   base: Int,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   full: Bytes,
   params: List<EmitParam>,
@@ -8798,7 +9087,7 @@ pub fn emit_fn_why(
   base: Int,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   full: Bytes,
   params: List<EmitParam>,
@@ -8865,7 +9154,7 @@ pub fn emit_group_full(
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   members: List<Member>,
   effects: List<EffectName>,
@@ -9453,6 +9742,22 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   assert_eq(map(bodies, |body: Bytes| bytes_index_of(body, b"return")), [None, None])
 }
 
+test "a `parallel` block tells the runtime its definition's row only where that row holds all its branches reach" {
+  let src = bytes_concat_all([
+    b"effect meter { read level() -> Int }\n",
+    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
+    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
+    b"fn handled() -> (Int, Int) = handle { parallel { meter.level(), meter.level() } } with { meter.level() -> 0 }\n",
+    b"fn nested(xs: List<Int>) -> List<(Int, Int)> = map(xs, |m: Int| parallel { m + 1, m + 2 })\n",
+    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"map"], true);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
+  let calls = |helper: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, helper) != None);
+  assert_eq(calls(b"rt_parallel_past_p(ctx, "), [true, true, false, false, false]);
+  assert_eq(calls(b"rt_parallel_p(ctx, "), [false, false, true, true, true])
+}
+
 test "a `return` a `handle` body emitted is seen, however its lines were joined since" {
   let failing = b"  if (ctx->failed) return 0;\n";
   assert(leaves_unlanded([b"  x;\n"], [b"  x;\n", failing]));
@@ -9646,6 +9951,53 @@ test "a 64-bit width is held in a C register of its type, and in a record as its
   assert_eq(has(b"rt_record_p"), [false, false, false, false, true])
 }
 
+test "an array holds its records in place and its floats as their bits" {
+  let src = bytes_concat_all([
+    b"type Point = { x: Float, y: Float }\n",
+    b"fn second_x(ps: Array<Point>) -> Float / {abort.raise} = array_get(ps, 1).x\n",
+    b"fn bumped(xs: Array<Float>, i: Int) -> Float / {abort.raise} = array_get(xs, i) + 1.0\n",
+    b"fn count(ps: Array<Point>) -> Int = array_len(ps)\n",
+    b"fn element_of<a>(xs: Array<a>, i: Int) -> a / {abort.raise} = array_get(xs, i)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"array_get", b"array_len"], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  // A point takes a header's two words and its own two: element `i` is the header `4 * i` words in.
+  assert_eq(has(b" * 4); ply_inc("), [true, false, false, false]);
+  assert_eq(has(b"ply_f64(ply_words("), [false, true, false, false]);
+  assert_eq(has(b"ply_array_len("), [true, true, true, false]);
+  // An array of a variable's type is the runtime's to read.
+  assert_eq(has(b"array_get"), [true, true, false, true])
+}
+
+test "a constructor holds its arguments as its declaration types them" {
+  let src = bytes_concat_all([
+    b"type Point = { x: Float, y: Float }\n",
+    b"type Shape = | Circle(Point, Float) | Label(String)\n",
+    b"fn circle(at: Point, r: Float) -> Shape = Circle(at, r)\n",
+    b"fn radius(s: Shape) -> Float = match s { Circle(_, r) -> r, _ -> 0.0 }\n",
+    b"fn centre_x(s: Shape) -> Float = match s { Circle(p, _) -> p.x, _ -> 0.0 }\n",
+    b"fn unit(s: Shape) -> Bool = match s { Circle(_, 1.0) -> true, _ -> false }\n",
+    b"fn label(s: String) -> Shape = Label(s)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"m.Circle", b"m.Label"], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
+  // A circle holds its point in place, a header's two words and its own two, and its radius's bits
+  // after them: five words, none counted, so flat and raw.
+  assert_eq(has(b"rt_alloc_p(ctx, 4, 5, @@Tm.Circle@@, 5);"), [true, false, false, false, false]);
+  assert_eq(has(b"ply_embed(ctx, "), [true, false, false, false, false]);
+  assert_eq(has(b"->len == 5)"), [false, true, true, true, false]);
+  // A match reads each argument where it is held: the radius a load of its bits, and the point
+  // the address of its header in the circle.
+  assert_eq(has(b")[4])"), [false, true, true, true, false]);
+  assert_eq(has(b") + 0))"), [false, true, true, true, false]);
+  // A test of the radius against a literal boxes it to compare it as `==` does.
+  assert_eq(has(b"rt_equal_p(ctx, "), [false, false, false, true, false]);
+  // A label holds its word, as a constructor of no raw or record argument does.
+  assert_eq(has(b"rt_ctor_p"), [false, false, false, false, true])
+}
+
 test "a `Char` is its own word, compared as C compares the words" {
   let src = bytes_concat_all([
     b"fn lower(c: Char) -> Bool = c >= 'a' && c <= 'z'\n",
@@ -9720,7 +10072,18 @@ test "the emitter writes an embed out as the front end's answer says it was read
     ).out,
   );
   match at(
-      emit_roots_answer([b"m"], [src], [], [], [b"m.data"], [], [], d.embeds, d.rows, d.walked),
+      emit_roots_answer(
+        [b"m"],
+        [src],
+        no_ctors(),
+        [],
+        [b"m.data"],
+        [],
+        [],
+        d.embeds,
+        d.rows,
+        d.walked,
+      ),
       0,
     ).answer {
     Body(b) -> assert_eq(b.tables.consts, [ConstBytes(b"one")]),
@@ -9736,7 +10099,18 @@ fn answers_of(
   wanted: List<Bytes>,
 ) -> List<RootAnswer> / {abort.raise} = {
   let d = dump_of(analyse(parse_all(zip_sources(names, srcs))));
-  emit_roots_answer(names, srcs, ctors, [], wanted, [], [], d.embeds, d.rows, d.walked)
+  emit_roots_answer(
+    names,
+    srcs,
+    { names: ctors, laid: ctor_layouts(d.ctors) },
+    [],
+    wanted,
+    [],
+    [],
+    d.embeds,
+    d.rows,
+    d.walked,
+  )
 }
 
 test "a generic definition reached at a type held apart from a word is emitted again at it" {
@@ -9800,7 +10174,7 @@ test "a module no wanted root is in, read as its stub under its rows, lowers wha
   let stub = stub_module(b, at(parsed, 1).module);
   assert(bytes_index_of(stub, b"x * 2") == None);
   let call = |srcs: List<Bytes>|
-    emit_roots_answer([b"a", b"b"], srcs, [], [], [b"a.f"], [], [], [], d.rows, d.walked);
+    emit_roots_answer([b"a", b"b"], srcs, no_ctors(), [], [b"a.f"], [], [], [], d.rows, d.walked);
   assert_eq(call([a, stub]), call([a, b]))
 }
 
@@ -9827,7 +10201,7 @@ fn sited_answers(sources: List<Source>, d: Dump) -> List<RootAnswer> / {abort.ra
   emit_roots_answer(
     map(sources, |s: Source| s.name),
     map(sources, |s: Source| s.src),
-    [],
+    no_ctors(),
     [],
     [b"a.moved", test_owner(b"a", b"moves"), b"b.twice"],
     [],
@@ -9897,7 +10271,7 @@ test "a wanted body is lowered though the answer holds nothing of a test beside 
       emit_roots_answer(
         map(sources, |s: Source| s.name),
         map(sources, |s: Source| s.src),
-        [],
+        no_ctors(),
         [],
         wanted,
         [],
@@ -10044,7 +10418,18 @@ fn emit_all_program(
     front::Refused(diags) -> refused_rather_than_emitted(sources, None, said(diags)),
     front::Analysed(w) -> {
       let d = dump_of(front::Analysed(w));
-      emit_program(sources, ctors, builtins, release, None, [], [], d.embeds, d.rows, d.walked)
+      emit_program(
+        sources,
+        { names: ctors, laid: ctor_layouts(d.ctors) },
+        builtins,
+        release,
+        None,
+        [],
+        [],
+        d.embeds,
+        d.rows,
+        d.walked,
+      )
     },
   }
 
@@ -10096,7 +10481,7 @@ fn refused_rather_than_emitted(
 /// resolution then treats every module as one package's, which is what no packages means.
 fn emit_program(
   sources: List<Source>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
@@ -10431,7 +10816,7 @@ type SitesRead = {
 fn emit_module(
   module: Bytes,
   x_module: Module,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   program: List<ModuleDefs>,
   schemes: Map<Bytes, Scheme>,
@@ -10801,7 +11186,7 @@ fn group_emitted(
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
@@ -10856,7 +11241,7 @@ fn root_emitted(
   base: Int,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
@@ -10894,7 +11279,7 @@ fn emitted_from(
   base: Int,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
@@ -10966,7 +11351,7 @@ fn clause_roots(
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   effects: List<EffectName>,
   release: Bool,
@@ -11190,7 +11575,7 @@ derive bin for Answer
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
-  ctors: List<Bytes>,
+  ctors: Ctors,
   builtins: List<Bytes>,
   wanted: List<Bytes>,
   pkgs: List<PackageDeps>,
