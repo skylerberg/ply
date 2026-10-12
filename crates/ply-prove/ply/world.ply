@@ -12,8 +12,8 @@ import compiler.front (no_rows, Analysis, Analysed, Refused, analyse, analyse_pu
                        claim_literals, literals_of, schema_definitions, Bounded, bounds_of,
                        guard_bounds)
 import compiler.infer (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo, InstanceInfo, NumericInfo)
-import compiler.items (Item, IFn, IType, ILaw, SCost, SEnsures, SRequires, SpecClause, SpecKind,
-                       NKey)
+import compiler.items (Item, IFn, IType, ILaw, SCost, SEnsures, SRequires, SSpace, SpecClause,
+                       SpecKind, NKey)
 import compiler.exprs (Expr, Param, expr_span)
 import compiler.hash (HashOutput, NodeRef, TheItem, hex, named_in)
 import compiler.resolve (Diag, ParsedModule, error_at, qualify)
@@ -25,7 +25,7 @@ import compiler.types (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar,
 import compiler.type_syntax (MWrite)
 import domain (Cases, Con, Decl, Domain, Ends, Fn, Record, Scalar, Shape, Ty, Var, Variant,
                finite_within, name_of)
-import obligation (Cost, Def, Ensures, Frame, Kind, Law, Pure, Writes, Written)
+import obligation (Cost, Def, Ensures, Frame, Kind, Law, Pure, Space, Writes, Written)
 import std.list (at, contains, push_unique)
 
 /// A definition as a callee: its signature, and whether its published row is empty. The static
@@ -545,9 +545,9 @@ fn unhashed(name: Bytes, module: Int, s: Span) -> Diag = {
   { ..d, severity: b"warning" }
 }
 
-/// A definition's `ensures` clauses and `cost` bounds, each numbered among its kind and keyed by
-/// its place among all the owner's clauses, as the spec hash covers them. A `requires` alone claims
-/// nothing to discharge.
+/// A definition's `ensures` clauses and `cost` and `space` bounds, each numbered among its kind and
+/// keyed by its place among all the owner's clauses, as the spec hash covers them. A `requires`
+/// alone claims nothing to discharge.
 fn clauses_of(
   acc: Owed,
   d: DefInfo,
@@ -557,7 +557,7 @@ fn clauses_of(
   runs: Map<Bytes, List<Bytes>>,
   closing: Closing,
 ) -> Owed / {abort.raise} = {
-  let claimed = filter(d.spec, |s: SpecInfo| s.kind == SEnsures || s.kind == SCost);
+  let claimed = filter(d.spec, |s: SpecInfo| s.kind != SRequires);
   if len(claimed) == 0 { acc } else {
     let shape = match d.scheme.ty {
       TyFn(f) -> { params: f.params, ret: f.ret },
@@ -586,11 +586,14 @@ fn clauses_of(
     let ran = match map_get(runs, d.name) { Some(hs) -> hs, None -> [] };
     fold(
       claimed,
-      { owed: acc, ensures: 0, costs: 0 },
-      |st: { owed: Owed, ensures: Int, costs: Int }, clause: SpecInfo| {
-        let bound = clause.kind == SCost;
-        let next = if bound { { ..st, costs: st.costs + 1 } }
-        else { { ..st, ensures: st.ensures + 1 } };
+      { owed: acc, ensures: 0, costs: 0, spaces: 0 },
+      |st: { owed: Owed, ensures: Int, costs: Int, spaces: Int }, clause: SpecInfo| {
+        let bound = clause.kind != SEnsures;
+        let next = match clause.kind {
+          SCost -> { ..st, costs: st.costs + 1 },
+          SSpace -> { ..st, spaces: st.spaces + 1 },
+          _ -> { ..st, ensures: st.ensures + 1 },
+        };
         match list_at(hashed, clause.index) {
           None ->
             {
@@ -611,7 +614,11 @@ fn clauses_of(
                     hex(match list_at(ran, clause.index) { Some(r) -> r, None -> key }),
                   ),
                   owner: string_of_bytes_lossy(d.name),
-                  kind: if bound { Cost(st.costs) } else { Ensures(st.ensures) },
+                  kind: match clause.kind {
+                    SCost -> Cost(st.costs),
+                    SSpace -> Space(st.spaces),
+                    _ -> Ensures(st.ensures),
+                  },
                   at: at_of(d.at.module, clause.span),
                   binders: binders,
                   // A bound holds at every size, and says nothing of what its owner answers.
@@ -962,20 +969,20 @@ test "a law over a simulate region searches its interleavings, at every point it
   assert_eq(searched(b"", b"1"), [Interleave(Every({ shapes: [], points: 1 }, "unit"))])
 }
 
-test "a cost bound is a claim of its own, numbered apart from the clauses beside it" {
+test "a cost or space bound is a claim of its own, numbered apart from the clauses beside it" {
   let built = built_of(
-    b"fn total(xs: List<Int>) -> Int requires len(xs) >= 0 cost len(xs) ensures result == result cost len(xs) * len(xs) = fold(xs, 0, |a: Int, x: Int| a + x)\n",
+    b"fn total(xs: List<Int>) -> Int requires len(xs) >= 0 cost len(xs) ensures result == result space 0 cost len(xs) * len(xs) = fold(xs, 0, |a: Int, x: Int| a + x)\n",
   );
   assert_eq(built.warnings, []);
   let os = owned_by(built.world.obligations, "m.total");
-  assert_eq(map(os, |o: Obligation| o.kind), [Cost(0), Ensures(0), Cost(1)]);
-  assert_eq(map(os, |o: Obligation| o.strategy == Bounded), [true, false, true]);
+  assert_eq(map(os, |o: Obligation| o.kind), [Cost(0), Ensures(0), Space(0), Cost(1)]);
+  assert_eq(map(os, |o: Obligation| o.strategy == Bounded), [true, false, true, true]);
   // A bound is stated over the parameters alone, at every size.
   let bound = at(os, 0);
   assert_eq(map(bound.binders, |b: Binder| b.name), ["xs"]);
   assert_eq(bound.result, None);
   assert_eq(bound.guards, []);
-  assert(bound.key != at(os, 2).key)
+  assert(bound.key != at(os, 2).key && at(os, 2).key != at(os, 3).key)
 }
 
 test "a law's guard is its `where`, where it is written" {
