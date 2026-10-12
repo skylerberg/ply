@@ -36,6 +36,8 @@ pub const KIND_MBRANCH: u8 = 14;
 pub const KIND_ARRAY: u8 = 15;
 /// A `Float`: one payload word, its bits.
 pub const KIND_FLOAT: u8 = 16;
+/// What [`kind`] answers for a `Char`'s word: no object has it.
+pub const KIND_CHAR: u8 = 17;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -110,9 +112,35 @@ pub fn bool(b: bool) -> Word {
     }
 }
 
+/// Whether `w` is held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`).
+/// An object's address is a multiple of eight.
 #[inline]
 pub fn is_imm(w: Word) -> bool {
+    w & 7 != 0
+}
+
+/// Whether `w` is an `Int` held in the word.
+#[inline]
+pub fn is_int(w: Word) -> bool {
     w & 1 == 1
+}
+
+/// Whether `w` is a `Char` held in the word: its code point above the tag `010`.
+#[inline]
+pub fn is_char(w: Word) -> bool {
+    w & 7 == 2
+}
+
+/// A `Char`'s word.
+#[inline]
+pub fn char_word(c: char) -> Word {
+    (c as i64) << 3 | 2
+}
+
+/// The `Char` a `Char`'s word holds.
+#[inline]
+pub fn char_of(w: Word) -> char {
+    char::from_u32((w >> 3) as u32).unwrap_or('\u{fffd}')
 }
 
 /// Whether `v` fits the sixty-three bits an immediate carries.
@@ -1133,6 +1161,7 @@ impl Heap {
             Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
             Value::Bool(b) => bool(*b),
             Value::Float(f) => self.boxed_float(*f),
+            Value::Char(c) => char_word(*c),
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
             Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
@@ -1248,6 +1277,9 @@ impl Heap {
         ctors: &CtorCarries,
         walked: &mut Walked,
     ) -> Value {
+        if is_char(w) {
+            return Value::Char(char_of(w));
+        }
         if is_imm(w) {
             return read_int(imm_value(w), carry, walked);
         }
@@ -1808,8 +1840,10 @@ pub fn is_unique(w: Word) -> bool {
 
 #[inline]
 pub fn kind(w: Word) -> u8 {
-    if is_imm(w) {
+    if is_int(w) {
         KIND_INT
+    } else if is_char(w) {
+        KIND_CHAR
     } else if w == 0 {
         // Zero is "no word here"; reading its header would fault at address 4.
         KIND_DEAD
@@ -1821,8 +1855,11 @@ pub fn kind(w: Word) -> u8 {
 /// The `Int` a word carries, if it is one.
 #[inline]
 pub fn as_int(w: Word) -> Option<i64> {
-    if is_imm(w) {
+    if is_int(w) {
         return Some(imm_value(w));
+    }
+    if is_char(w) {
+        return None;
     }
     if w == 0 {
         return None;
@@ -1854,6 +1891,9 @@ pub fn as_bool(w: Word) -> Option<bool> {
 
 /// `Value`'s rank of a variant (its `discriminant`), which orders values of different kinds.
 fn rank(w: Word) -> u8 {
+    if is_char(w) {
+        return 16;
+    }
     if is_imm(w) {
         return 2;
     }
@@ -1921,6 +1961,10 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     let (ka, kb) = (kind(a), kind(b));
     if ka != kb {
         return Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b));
+    }
+    // A `Char`'s word is its code point shifted above a tag, so words order as code points do.
+    if ka == KIND_CHAR {
+        return a.cmp(&b);
     }
     unsafe {
         match ka {
