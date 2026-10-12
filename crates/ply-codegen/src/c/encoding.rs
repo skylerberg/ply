@@ -1,16 +1,22 @@
-//! The tables a unit names, written into its C and read back from it: one encoding, so what a
-//! unit says about itself is what loading it reads.
+//! The pools a unit names, written into its C and read back from it: one encoding, so what a unit
+//! says about itself is what loading it reads.
 
-use super::tables::BodyTables;
-use ply_eval::{Symbol, Value};
+use ply_eval::{Builtin, Symbol, Value};
 
-/// The five tables a body and a whole unit both name, in one shared encoding.
-pub(super) fn encode_tables(
+/// The pools a unit's positions index, each in the unit's order.
+#[derive(Default)]
+pub(super) struct Pools {
+    pub consts: Vec<Value>,
+    pub builtins: Vec<Builtin>,
+    pub fields: Vec<Symbol>,
+    pub shapes: Vec<Vec<Symbol>>,
+}
+
+pub(super) fn encode_pools(
     consts: &[Value],
-    builtins: &[ply_eval::Builtin],
+    builtins: &[Builtin],
     fields: &[Symbol],
     shapes: &[Vec<Symbol>],
-    lambdas: &[String],
 ) -> String {
     let mut out = format!("consts {}\n", consts.len());
     for v in consts {
@@ -36,17 +42,11 @@ pub(super) fn encode_tables(
                 .join(" ")
         ));
     }
-    if !lambdas.is_empty() {
-        out.push_str(&format!("lambdas {}\n", lambdas.len()));
-        for l in lambdas {
-            out.push_str(&format!("{l}\n"));
-        }
-    }
     out
 }
 
 /// One pooled constant's line: its identity, so the pool sorts and deduplicates by it.
-pub(super) fn encode_const(v: &Value) -> String {
+fn encode_const(v: &Value) -> String {
     match v {
         Value::Unit => "u".to_string(),
         Value::Str(s) => format!("s {}", hex(s.as_bytes())),
@@ -59,9 +59,9 @@ pub(super) fn encode_const(v: &Value) -> String {
     }
 }
 
-/// Inverse of [`encode_tables`]; leaves the cursor after them.
-pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<BodyTables> {
-    let mut t = BodyTables::default();
+/// Inverse of [`encode_pools`]; leaves the cursor after them.
+pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
+    let mut t = Pools::default();
     let n = count(line(s, at)?, "consts")?;
     for _ in 0..n {
         let l = line(s, at)?;
@@ -95,7 +95,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<BodyTables> {
     let n = count(line(s, at)?, "builtins")?;
     for _ in 0..n {
         t.builtins
-            .push(ply_eval::Builtin::from_name(&Symbol::new(line(s, at)?))?);
+            .push(Builtin::from_name(&Symbol::new(line(s, at)?))?);
     }
     let n = count(line(s, at)?, "fields")?;
     for _ in 0..n {
@@ -105,10 +105,6 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<BodyTables> {
     for _ in 0..n {
         t.shapes
             .push(line(s, at)?.split_whitespace().map(Symbol::new).collect());
-    }
-    let n = section(s, at, "lambdas")?;
-    for _ in 0..n {
-        t.lambdas.push(line(s, at)?.to_string());
     }
     Some(t)
 }
