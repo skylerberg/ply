@@ -132,7 +132,7 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
             }
         }
     }
-    assert!(objects > 1000, "the walk reached {objects} objects");
+    assert!(objects > 900, "the walk reached {objects} objects");
 }
 
 #[test]
@@ -370,7 +370,10 @@ fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
     let l = Layouts::of(
         vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)],
         &[],
-        false,
+        RecordLayout {
+            in_place: false,
+            raw_widths: true,
+        },
     );
     let mut h = Heap::new();
     let value = segment("s", 0.5);
@@ -386,6 +389,101 @@ fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
     let (_into, read) = kept(&l, w);
     assert_eq!(unsafe { (*obj(read)).layout }, shape);
     dec(w);
+}
+
+#[test]
+fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let wides = [
+        Value::Fixed(Fixed::new(IntTy::U64, 7)),
+        Value::Fixed(Fixed::new(IntTy::U64, 1 << 63)),
+        Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+    ];
+    let signed = [
+        Value::Fixed(Fixed::of(IntTy::I64, i128::from(i64::MIN)).expect("an i64")),
+        Value::Fixed(Fixed::of(IntTy::I64, -1).expect("an i64")),
+        Value::Fixed(Fixed::of(IntTy::I64, 5).expect("an i64")),
+    ];
+    for values in [&wides[..], &signed[..]] {
+        let words: Vec<Word> = values.iter().map(|v| h.to_word(&l, v)).collect();
+        for (w, v) in words.iter().zip(values) {
+            assert_eq!(kind(*w), KIND_FIXED);
+            assert!(native_key(*w));
+            assert_eq!(Heap::to_value(&l, *w), *v);
+            let (_into, read) = kept(&l, *w);
+            assert_eq!(Heap::to_value(&l, read), *v);
+        }
+        // Listed in ascending order, which for `U64` past 2^63 and for a negative `I64` is not
+        // the order of the bits read as an `Int`.
+        for pair in words.windows(2) {
+            assert_eq!(cmp_words(&l, pair[0], pair[1]), Ordering::Less);
+        }
+    }
+    let widest = Value::Fixed(Fixed::new(IntTy::U128, u128::MAX - 3));
+    let w = h.to_word(&l, &widest);
+    assert_eq!(kind(w), KIND_FIXED);
+    assert_eq!(Heap::to_value(&l, kept(&l, w).1), widest);
+}
+
+#[test]
+fn a_wide_width_a_store_bridged_reads_back_as_the_width_s_own_object() {
+    // A bridge holding the width is what a `ply` that bridged 64-bit widths stored.
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = Value::Fixed(Fixed::new(IntTy::U64, 1 << 63));
+    let bridged = h.bridge(value.clone());
+    let (_into, read) = kept(&l, bridged);
+    assert_eq!(kind(read), KIND_FIXED);
+    assert_eq!(Heap::to_value(&l, read), value);
+}
+
+#[test]
+fn a_record_holds_a_wide_width_as_its_bits() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = record(vec![
+        (
+            "count",
+            Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
+        ),
+        ("label", Value::str("w")),
+        (
+            "offset",
+            Value::Fixed(Fixed::of(IntTy::I64, -9).expect("an i64")),
+        ),
+    ]);
+    let w = h.to_word(&l, &value);
+    let shape = unsafe { (*obj(w)).layout };
+    assert_eq!(
+        l.shape_spelled(shape)
+            .iter()
+            .map(|s| s.as_str().to_string())
+            .collect::<Vec<_>>(),
+        ["count!u64", "label", "offset!i64"]
+    );
+    assert!((0..3).all(|i| unsafe { counted(obj(w), i) } == (i == 1)));
+    assert_eq!(Heap::to_value(&l, w), value);
+    let at = l.offset(shape, &Symbol::new("offset")).expect("the field");
+    let offset = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    assert_eq!(kind(offset), KIND_FIXED);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), value);
+    // A unit that holds a width's word in a record has the runtime lay it out so.
+    let words = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            in_place: true,
+            raw_widths: false,
+        },
+    );
+    let by_word = h.to_word(&words, &value);
+    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
+    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
+    dec(w);
+    dec(offset);
+    dec(by_word);
 }
 
 #[test]

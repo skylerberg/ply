@@ -56,14 +56,20 @@ pub type Width = { bits: Int, signed: Bool }
 pub fn ctype(k: Kind) -> Bytes =
   match k {
     KNum(w) -> if w.signed {
-      if w.bits == 8 { b"int8_t" } else if w.bits == 16 { b"int16_t" } else { b"int32_t" }
+      if w.bits == 8 { b"int8_t" }
+      else if w.bits == 16 { b"int16_t" }
+      else if w.bits == 32 { b"int32_t" }
+      else { b"int64_t" }
     } else { unsigned_ctype(w) },
     KFloat -> b"double",
     _ -> b"int64_t",
   }
 
 fn unsigned_ctype(width: Width) -> Bytes =
-  if width.bits == 8 { b"uint8_t" } else if width.bits == 16 { b"uint16_t" } else { b"uint32_t" }
+  if width.bits == 8 { b"uint8_t" }
+  else if width.bits == 16 { b"uint16_t" }
+  else if width.bits == 32 { b"uint32_t" }
+  else { b"uint64_t" }
 
 /// `width_index`'s order is the runtime's width numbering.
 fn width_named(name: Bytes) -> Option<Width> =
@@ -88,7 +94,12 @@ fn width_index(width: Width) -> Int =
       else { 3 })
   }
 
-fn carried(width: Width) -> Bool = width.bits < 64
+/// Whether a value of the width is held in a C register of its own type: up to 64 bits.
+fn carried(width: Width) -> Bool = width.bits <= 64
+
+/// Whether the width's word is an `Int`'s immediate, as below 64 bits; at 64 it is an object of
+/// the width's own, which compares by the width's order.
+fn in_imm(width: Width) -> Bool = width.bits < 64
 
 fn width_min(width: Width) -> Int = if width.signed { 0 - pow(2, width.bits - 1) } else { 0 }
 
@@ -99,7 +110,9 @@ fn as_num(value: CValue, width: Width) -> Bytes =
   match value.kind {
     KNum(h) -> if h == width { value.expr }
     else { bytes_concat_all([b"(", ctype(KNum(width)), b")(", value.expr, b")"]) },
-    KBoxed -> bytes_concat_all([b"(", ctype(KNum(width)), b")ply_imm_value(", value.expr, b")"]),
+    KBoxed -> if in_imm(width) {
+      bytes_concat_all([b"(", ctype(KNum(width)), b")ply_imm_value(", value.expr, b")"])
+    } else { bytes_concat_all([b"(", ctype(KNum(width)), b")ply_words(", value.expr, b")[0]"]) },
     _ -> bytes_concat_all([b"(", ctype(KNum(width)), b")(", value.expr, b")"]),
   }
 
@@ -930,11 +943,31 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     typed: emitter.typed,
   }
 
-/// Whether a record holds a value of `kind` as a `Float`'s bits rather than as a word.
-fn raw_slot(kind: Kind) -> Bool = kind == KFloat
+/// Whether a record holds a value of `kind` as its bits rather than as a word: a `Float`, or a
+/// 64-bit width.
+fn raw_slot(kind: Kind) -> Bool = match kind { KFloat -> true, KNum(w) -> !in_imm(w), _ -> false }
 
-/// The word a record holds `value` in where `raw_slot` says it holds its bits.
-fn raw_word(value: CValue) -> Bytes = bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"])
+/// The word a record holds `value` in, held at the kind `raw_slot` says it holds as its bits.
+fn raw_word(value: CValue) -> Bytes =
+  match value.kind {
+    KNum(_) -> bytes_concat_all([b"(Word)(", value.expr, b")"]),
+    _ -> bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"]),
+  }
+
+/// A record's word holding a field of `kind` as its bits, read back as the kind.
+fn raw_read(word: Bytes, kind: Kind) -> Bytes =
+  match kind {
+    KNum(w) -> bytes_concat_all([b"(", ctype(KNum(w)), b")(", word, b")"]),
+    _ -> bytes_concat_all([b"ply_f64(", word, b")"]),
+  }
+
+/// `value` held at `kind`, a kind `raw_slot` holds of, in a register.
+fn held_raw(emitter: Emitter, value: CValue, kind: Kind) -> WithValue =
+  match kind {
+    KNum(w) -> if value.kind == kind { { emitter: emitter, value: value } }
+    else { bind(emitter, kind, as_num(value, w)) },
+    _ -> float_held(emitter, value),
+  }
 
 /// The fields of the record a field holds in place: one of a record type, which its record copies
 /// into its own words.
@@ -983,7 +1016,13 @@ fn spelled_field(f: FieldTy) -> Bytes =
   match f.ty {
     TyRec(inner) ->
       bytes_concat_all([f.name, b"!r(", bytes_join(map(inner, spelled_field), b","), b")"]),
-    _ -> if raw_slot(f.kind) { bytes_concat(f.name, b"!f") } else { f.name },
+    _ -> match f.kind {
+      KFloat -> bytes_concat(f.name, b"!f"),
+      KNum(w) -> if raw_slot(f.kind) {
+        bytes_concat(f.name, if w.signed { b"!i64" } else { b"!u64" })
+      } else { f.name },
+      _ -> f.name,
+    },
   }
 
 /// A record's flags: flat when none of its words holds a count, mixed when its tail says which
@@ -3354,8 +3393,10 @@ fn width_builtin(
         Some(e0) -> {
           let e = site(e0.emitter, span);
           match t {
-            OWidth(w) -> if !carried(w) { Some(builtin_call(e, name, e0.vals)) }
-            else if is_checked(name) { checked_num(e, name, e0.vals, w) } else {
+            // Saturating and checked arithmetic is exact in 64 bits below them, and the runtime's at 64.
+            OWidth(w) -> if !in_imm(w) && !(carried(w) && is_wrap(name)) {
+              Some(builtin_call(e, name, e0.vals))
+            } else if is_checked(name) { checked_num(e, name, e0.vals, w) } else {
               match list_at(e0.vals, 0) {
                 None -> None,
                 Some(v0) -> match list_at(e0.vals, 1) {
@@ -3379,7 +3420,29 @@ fn width_builtin(
         Some(v0) -> {
           let e = { emitter: site(e0.emitter, span), vals: e0.vals };
           match of_int_width(name) {
-            Some(t) -> if carried(t) {
+            Some(t) -> if carried(t) && !in_imm(t) {
+              // An `I64` is any `Int`; a `U64` any but a negative one.
+              let held = bind(e.emitter, KInt, as_int(v0));
+              let g = if t.signed { held.emitter } else {
+                line(
+                  held.emitter,
+                  bytes_concat_all([
+                    b"if (",
+                    held.value.expr,
+                    b" < 0) { rt_not_that_width_p(ctx, ",
+                    ascii_of_int(width_index(t)),
+                    b", ",
+                    held.value.expr,
+                    b"); ",
+                    leaving(held.emitter),
+                    b" }",
+                  ]),
+                )
+              };
+              Some(
+                bind(g, KNum(t), bytes_concat_all([b"(", ctype(KNum(t)), b")", held.value.expr])),
+              )
+            } else if carried(t) {
               let held = bind(e.emitter, KInt, as_int(v0));
               let g = line(
                 held.emitter,
@@ -3406,8 +3469,10 @@ fn width_builtin(
               )
             } else { Some(builtin_call(e.emitter, name, e.vals)) },
             None -> match int_of_width(name) {
-              Some(t) -> if carried(t) { Some(bind(e.emitter, KInt, as_int(v0))) }
-              else { Some(builtin_call(e.emitter, name, e.vals)) },
+              // A `U64` past an `Int` is the runtime's to refuse.
+              Some(t) -> if carried(t) && (in_imm(t) || t.signed) {
+                Some(bind(e.emitter, KInt, as_int(v0)))
+              } else { Some(builtin_call(e.emitter, name, e.vals)) },
               None -> None,
             },
           }
@@ -4556,7 +4621,15 @@ fn as_word(value: CValue) -> Bytes =
   match value.kind {
     KBoxed -> value.expr,
     // The C type the value is held in decides sign or zero extension.
-    KNum(_) -> bytes_concat_all([b"ply_imm((int64_t)", value.expr, b")"]),
+    KNum(w) -> if in_imm(w) { bytes_concat_all([b"ply_imm((int64_t)", value.expr, b")"]) } else {
+      bytes_concat_all([
+        b"rt_box_fixed_p(ctx, (Word)(",
+        value.expr,
+        b"), ",
+        ascii_of_int(width_index(w)),
+        b")",
+      ])
+    },
     KBool -> bytes_concat_all([b"(", value.expr, b" ? ply_true : ply_false)"]),
     KInt ->
       bytes_concat_all([
@@ -4723,8 +4796,12 @@ fn in_place_update(
         None -> acc,
         Some(v) -> {
           let nm = match list_at(sets, i) { Some(f) -> f.name, None -> b"" };
-          let raw = fold(fs, false, |r: Bool, f: FieldTy| r || (f.name == nm && raw_slot(f.kind)));
-          let w = if raw { float_held(acc.emitter, v) } else { owned(acc.emitter, v) };
+          let raw = fold(fs, None, |r: Option<Kind>, f: FieldTy|
+            if f.name == nm && raw_slot(f.kind) { Some(f.kind) } else { r });
+          let w = match raw {
+            Some(k) -> held_raw(acc.emitter, v, k),
+            None -> owned(acc.emitter, v),
+          };
           { emitter: w.emitter, vals: push(acc.vals, w.value) }
         },
       },
@@ -4877,9 +4954,10 @@ fn read_field(
                 Some({ emitter: note_made(taken, w.value.expr), value: w.value })
               } else { Some({ emitter: w.emitter, value: w.value }) },
               _ -> {
-                let out = bind(w.emitter, i.kind, if i.kind == KFloat {
-                  bytes_concat_all([b"ply_f64(", w.value.expr, b")"])
-                } else { as_kind(w.value, i.kind) });
+                let out = bind(w.emitter, i.kind, if raw_slot(i.kind) {
+                  raw_read(w.value.expr, i.kind)
+                } else if i.kind == KFloat { bytes_concat_all([b"ply_f64(", w.value.expr, b")"]) }
+                else { as_kind(w.value, i.kind) });
                 match release_base(out.emitter, f.base, hv, params) {
                   None -> None,
                   Some(r) -> Some({ emitter: r, value: out.value }),
@@ -4942,13 +5020,26 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             emitter: emitter,
             value: {
               kind: KNum(w),
-              expr: bytes_concat_all([b"((", ctype(KNum(w)), b")", ascii_of_int(bits), b")"]),
+              expr: bytes_concat_all([b"((", ctype(KNum(w)), b")", int_lit(bits), b")"]),
               ty: TyOpen,
             },
           })
         } else { Some(from_table(emitter, l)) },
       },
-      LWide(_, _, _) -> Some(from_table(emitter, l)),
+      // A 64-bit literal past an `Int` is its low word's bits.
+      LWide(name, _, low) -> match width_named(name) {
+        Some(w) -> if carried(w) {
+          Some({
+            emitter: emitter,
+            value: {
+              kind: KNum(w),
+              expr: bytes_concat_all([b"((", ctype(KNum(w)), b")", int_lit(low), b")"]),
+              ty: TyOpen,
+            },
+          })
+        } else { Some(from_table(emitter, l)) },
+        None -> Some(from_table(emitter, l)),
+      },
       LUnit -> Some(from_table(emitter, l)),
       LFloat(x) ->
         Some({
@@ -5220,7 +5311,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               match laid { Some(fs) -> kind_at(kinds_of(fs), at), None -> KBoxed };
             // A field the new record holds as a `Float`'s bits, from a value it holds as a `Float`.
             let as_bits = |acc: { emitter: Emitter, ws: List<Bytes>, kinds: List<Kind>, vals: List<CValue>, known: Bool }, em: Emitter, v: CValue, at: Int| {
-              let d = float_held(em, v);
+              let d = held_raw(em, v, target(at));
               {
                 emitter: d.emitter,
                 ws: push(acc.ws, raw_word(d.value)),
@@ -5254,13 +5345,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         // Read at the field's place in the base's shape, which differs from the new record's when the update adds a field.
                         Some(f) -> {
                           let w = bind_word_of(acc.emitter, field_read(held.value.expr, f));
-                          // A base of a known type holds a `Float` as its bits.
-                          if f.kind == KFloat {
-                            let d = bind(
-                              w.emitter,
-                              KFloat,
-                              bytes_concat_all([b"ply_f64(", w.value.expr, b")"]),
-                            );
+                          // A base of a known type holds a `Float` or a 64-bit width as its bits.
+                          if raw_slot(f.kind) {
+                            let d = bind(w.emitter, f.kind, raw_read(w.value.expr, f.kind));
                             if raw_slot(tk) { as_bits(acc, d.emitter, d.value, at) } else {
                               {
                                 emitter: d.emitter,
@@ -6399,7 +6486,7 @@ fn items_from(
         None -> None,
         Some(o) -> {
           let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
-          let d = if raw { float_held(o.emitter, o.value) }
+          let d = if raw { held_raw(o.emitter, o.value, kind_at(kinds, i)) }
           else { { emitter: o.emitter, value: o.value } };
           let w = if raw { bind(d.emitter, KInt, raw_word(d.value)) }
           else { owned(o.emitter, o.value) };
@@ -7037,7 +7124,7 @@ fn pat_test(
       // At 64 bits a width is the runtime's own object, not an immediate.
       LFixed(name, bits) -> match width_named(name) {
         None -> None,
-        Some(w) -> if carried(w) { Some({ emitter: emitter, expr: int_test(subj.expr, bits) }) }
+        Some(w) -> if in_imm(w) { Some({ emitter: emitter, expr: int_test(subj.expr, bits) }) }
         else { Some(equal_test(emitter, l, subj)) },
       },
       LBool(b) ->
@@ -7060,9 +7147,8 @@ fn pat_test(
       (LInt(lo), LInt(hi)) -> Some({ emitter: emitter, expr: int_between(subj.expr, lo, hi) }),
       (LFixed(name, lo), LFixed(_, hi)) -> match width_named(name) {
         None -> None,
-        Some(w) -> if carried(w) {
-          Some({ emitter: emitter, expr: int_between(subj.expr, lo, hi) })
-        } else { Some(between_test(emitter, r.lo, r.hi, subj)) },
+        Some(w) -> if in_imm(w) { Some({ emitter: emitter, expr: int_between(subj.expr, lo, hi) }) }
+        else { Some(between_test(emitter, r.lo, r.hi, subj)) },
       },
       (LWide(_, _, _), LWide(_, _, _)) -> Some(between_test(emitter, r.lo, r.hi, subj)),
       _ -> None,
@@ -7565,12 +7651,27 @@ fn narrow(wide: WithValue, width: Width, code: Int) -> Option<WithValue> = {
 fn negated(emitter: Emitter, value: CValue, t: Operand, span: Span) -> Option<WithValue> =
   match t {
     // A width negates wide and narrows back, under the same guard as a subtraction.
-    OWidth(w) -> if carried(w) {
+    OWidth(w) -> if in_imm(w) {
       narrow(
         bind(site(emitter, span), KInt, bytes_concat_all([b"-(int64_t)(", as_num(value, w), b")"])),
         w,
         overflow_code(b"neg"),
       )
+    } else if carried(w) && w.signed {
+      let a = bind(site(emitter, span), KNum(w), as_num(value, w));
+      let g = line(
+        a.emitter,
+        bytes_concat_all([
+          b"if (",
+          a.value.expr,
+          b" == INT64_MIN) { rt_overflow_p(ctx, ",
+          ascii_of_int(overflow_code(b"neg")),
+          b"); ",
+          leaving(emitter),
+          b" }",
+        ]),
+      );
+      Some(bind(g, KNum(w), bytes_concat_all([b"-(", a.value.expr, b")"])))
     } else { by_runtime(site(emitter, span), b"rt_negate_p", value) },
     OInt -> {
       // Negation overflows at one input; the guard runs before the value exists.
@@ -7659,10 +7760,12 @@ fn shift(emitter: Emitter, op: Bytes, l: CValue, r: CValue, width: Option<Width>
 }
 
 /// Arithmetic over a width is done wide and narrowed back under the overflow guard; the rest in the width itself.
+/// At 64 bits there is no wider type: a sum or difference is guarded as it is formed, and the rest is the runtime's.
 fn width_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Width) -> Option<WithValue> = {
   let a = as_num(l, t);
   let bb = as_num(r, t);
-  if is_arithmetic(op) {
+  if is_arithmetic(op) && !in_imm(t) { Some(wide_arithmetic(emitter, op, a, bb, t)) }
+  else if is_arithmetic(op) {
     let wide = if op == b"add" {
       bind(emitter, KInt, bytes_concat_all([b"(int64_t)(", a, b") + (int64_t)(", bb, b")"]))
     } else if op == b"sub" {
@@ -7697,6 +7800,68 @@ fn width_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Width) -> 
     }
   }
 }
+
+/// `a op b` over a 64-bit width.
+fn wide_arithmetic(emitter: Emitter, op: Bytes, a: Bytes, b: Bytes, t: Width) -> WithValue =
+  if op == b"add" || op == b"sub" {
+    let r = fresh(emitter);
+    let declared = line(r.emitter, bytes_concat_all([ctype(KNum(t)), b" ", r.name, b";"]));
+    let over = if t.signed {
+      bytes_concat_all([
+        if op == b"add" { b"ply_add_ov(" } else { b"ply_sub_ov(" },
+        a,
+        b", ",
+        b,
+        b", &",
+        r.name,
+        b")",
+      ])
+    } else {
+      bytes_concat_all([
+        b"(",
+        r.name,
+        b" = (uint64_t)(",
+        a,
+        if op == b"add" { b") + (uint64_t)(" } else { b") - (uint64_t)(" },
+        b,
+        b"), ",
+        if op == b"add" { bytes_concat_all([r.name, b" < (uint64_t)(", a, b"))"]) }
+        else { bytes_concat_all([b"(uint64_t)(", a, b") < (uint64_t)(", b, b"))"]) },
+      ])
+    };
+    let g = line(
+      declared,
+      bytes_concat_all([
+        b"if (",
+        over,
+        b") { rt_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        leaving(emitter),
+        b" }",
+      ]),
+    );
+    { emitter: g, value: { kind: KNum(t), expr: r.name, ty: TyOpen } }
+  } else {
+    let w = bind(
+      emitter,
+      KNum(t),
+      bytes_concat_all([
+        b"(",
+        ctype(KNum(t)),
+        b")rt_wide_binary_p(ctx, ",
+        ascii_of_int(binary_code(op)),
+        b", ",
+        ascii_of_int(width_index(t)),
+        b", (Word)(",
+        a,
+        b"), (Word)(",
+        b,
+        b"))",
+      ]),
+    );
+    { emitter: check(w.emitter), value: w.value }
+  }
 
 /// The operand type decides the whole operator, wherever the operands came from.
 fn binary_rest(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Operand) -> Option<WithValue> =
@@ -9456,6 +9621,29 @@ test "a record of a record type holds it in place, header and all" {
   assert_eq(has(b"ply_drop_embedded(ctx, "), [false, false, false, false, false, true]);
   // A record holding one of a variable's type in place is laid out when it is made.
   assert_eq(has(b"rt_record_p"), [false, false, false, false, true, false])
+}
+
+test "a 64-bit width is held in a C register of its type, and in a record as its bits" {
+  let src = bytes_concat_all([
+    b"type Tally = { count: U64, label: String, offset: I64 }\n",
+    b"fn bumped(t: Tally, by: U64) -> Tally = { ..t, count: t.count + by }\n",
+    b"fn scaled(a: U64, b: U64) -> U64 = a * b\n",
+    b"fn turned(a: I64) -> I64 = -a\n",
+    b"fn largest() -> U64 = 0xFFFF_FFFF_FFFF_FFFFu64\n",
+    b"fn kept<a>(x: a) -> { inner: a } = { inner: x }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
+  // A sum is formed and guarded in the width itself; a product is the runtime's.
+  assert_eq(has(b"(uint64_t)"), [true, true, false, true, false]);
+  assert_eq(has(b"rt_binary_p"), [false, false, false, false, false]);
+  assert_eq(has(b"rt_wide_binary_p(ctx, 2, 3, "), [false, true, false, false, false]);
+  assert_eq(has(b"== INT64_MIN"), [false, false, true, false, false]);
+  // The record holds its count's bits where its type says, and boxes nothing but its answer.
+  assert_eq(has(b"] = (Word)("), [true, false, false, false, false]);
+  assert_eq(has(b"rt_box_fixed_p"), [false, true, true, true, false]);
+  assert_eq(has(b"rt_record_p"), [false, false, false, false, true])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {

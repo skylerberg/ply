@@ -109,7 +109,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         buckets,
         instances,
         numerics,
-        in_place,
+        layout,
     } = exports;
     bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
@@ -120,7 +120,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         builtins,
         shapes,
         lambdas,
-        in_place,
+        layout,
     ) else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
