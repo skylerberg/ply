@@ -39,8 +39,8 @@ pub const FAMILIES: &[Family] = &[
     },
     Family {
         name: "hosts",
-        effects: &["tcb"],
-        hermetic: Some("hermetic_tcb"),
+        effects: &["hosts"],
+        hermetic: Some("hermetic_hosts"),
         summary: "preview what a run would bind",
     },
     Family {
@@ -74,7 +74,6 @@ pub type Declared<'a> = &'a dyn Fn(&str) -> String;
 fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
-        "tcb" => "hosts",
         "shipped" => "compiler.unit",
         "compilers" | "toolchain" => "compiler.cc",
         other => other,
@@ -92,7 +91,7 @@ pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
         }
         "tester" => crate::tester::lent(),
         "claims" => crate::claims::lent(&declared("prover")),
-        "hosts" => crate::hosts::lent(&declared("tcb")),
+        "hosts" => crate::hosts::lent(&declared("hosts")),
         "shipped" => crate::shipped::lent(),
         "toolchain" => crate::toolchain::lent(),
         _ => return None,
