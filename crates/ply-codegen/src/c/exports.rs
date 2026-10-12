@@ -1,7 +1,7 @@
 //! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
 //! bind by name, so a unit serves while the runtime has every helper its C calls.
 
-use super::encoding::{count, decode_tables, encode_tables, line};
+use super::encoding::{count, decode_tables, encode_tables, line, section};
 use super::load::Library;
 use super::prelude::helpers;
 use super::tables::Defined;
@@ -69,10 +69,12 @@ pub struct Exports {
     /// The constructor table the C's tags index: each one's name, arity, and arguments as a shape
     /// spells them, `a000` first, none where it holds every argument as its word.
     pub ctors: Vec<(Symbol, usize, Vec<Symbol>)>,
-    /// Every function the unit holds.
+    /// Every function the unit holds, where it names them here for the loader to look up; a unit
+    /// that lays out a [`super::descriptor::Descriptor`] holds them there instead.
     pub taken: Vec<Taken>,
-    /// The pure nullary functions, which the seam memoizes.
-    pub constants: Vec<String>,
+    /// The pure nullary functions, which the seam memoizes, each with its row of the code table;
+    /// a unit that names that table's rows says none.
+    pub constants: Vec<(String, Option<usize>)>,
     /// How many modules the unit was emitted from.
     pub modules: usize,
     /// What the fixpoint dropped and why.
@@ -81,8 +83,10 @@ pub struct Exports {
     pub fields: Vec<Symbol>,
     pub builtins: Vec<ply_eval::Builtin>,
     pub shapes: Vec<Vec<Symbol>>,
+    /// The code table's rows by name, in a unit that leaves them to the loader to look up.
     pub lambdas: Vec<String>,
-    /// Each bucket's table by the bucket's id: the unit's position of every key its C names.
+    /// Each bucket's table by the bucket's id, in a unit that leaves them to the loader to fill:
+    /// the unit's position of every key its C names.
     pub buckets: Vec<(u8, Vec<u32>)>,
     /// Each constructor whose type's module states a `key` or a `show`, with the function of
     /// each: `-` where it states none, `!` for one the unit does not take.
@@ -170,16 +174,21 @@ impl Exports {
             }
             out.push('\n');
         }
-        out.push_str(&format!("taken {}\n", self.taken.len()));
-        for t in &self.taken {
-            out.push_str(&format!(
-                "{} {} {} {}\n",
-                t.name, t.arity, t.symbol, t.entry
-            ));
+        if !self.taken.is_empty() {
+            out.push_str(&format!("taken {}\n", self.taken.len()));
+            for t in &self.taken {
+                out.push_str(&format!(
+                    "{} {} {} {}\n",
+                    t.name, t.arity, t.symbol, t.entry
+                ));
+            }
         }
         out.push_str(&format!("constants {}\n", self.constants.len()));
-        for name in &self.constants {
-            out.push_str(&format!("{name}\n"));
+        for (name, slot) in &self.constants {
+            match slot {
+                Some(slot) => out.push_str(&format!("{name} {slot}\n")),
+                None => out.push_str(&format!("{name}\n")),
+            }
         }
         out.push_str(&format!("modules {}\n", self.modules));
         out.push_str(&format!("refused {}\n", self.refusals.len()));
@@ -193,13 +202,15 @@ impl Exports {
             &self.shapes,
             &self.lambdas,
         ));
-        out.push_str(&format!("buckets {}\n", self.buckets.len()));
-        for (id, places) in &self.buckets {
-            out.push_str(&id.to_string());
-            for place in places {
-                out.push_str(&format!(" {place}"));
+        if !self.buckets.is_empty() {
+            out.push_str(&format!("buckets {}\n", self.buckets.len()));
+            for (id, places) in &self.buckets {
+                out.push_str(&id.to_string());
+                for place in places {
+                    out.push_str(&format!(" {place}"));
+                }
+                out.push('\n');
             }
-            out.push('\n');
         }
         // Written only by a unit one of whose types states a `key` or a `show`.
         if !self.instances.is_empty() {
@@ -254,7 +265,7 @@ impl Exports {
             let arity = parts.next()?.parse().ok()?;
             ctors.push((name, arity, parts.map(Symbol::new).collect()));
         }
-        let n = count(line(s, &mut at)?, "taken")?;
+        let n = section(s, &mut at, "taken")?;
         let mut taken = Vec::with_capacity(n);
         for _ in 0..n {
             let mut parts = line(s, &mut at)?.split(' ');
@@ -274,7 +285,11 @@ impl Exports {
         let n = count(line(s, &mut at)?, "constants")?;
         let mut constants = Vec::with_capacity(n);
         for _ in 0..n {
-            constants.push(line(s, &mut at)?.to_string());
+            let row = line(s, &mut at)?;
+            constants.push(match row.split_once(' ') {
+                Some((name, slot)) => (name.to_string(), Some(slot.parse().ok()?)),
+                None => (row.to_string(), None),
+            });
         }
         let modules = count(line(s, &mut at)?, "modules")?;
         let n = count(line(s, &mut at)?, "refused")?;
@@ -285,12 +300,8 @@ impl Exports {
             refusals.push((function, construct));
         }
         let t = decode_tables(s, &mut at)?;
-        // A unit whose C writes the unit's positions itself has no bucket tables to fill.
-        let n = if at == s.len() {
-            0
-        } else {
-            count(line(s, &mut at)?, "buckets")?
-        };
+        // A unit whose C lays its bucket tables out filled has none for the loader to fill.
+        let n = section(s, &mut at, "buckets")?;
         let mut buckets = Vec::with_capacity(n);
         for _ in 0..n {
             let mut parts = line(s, &mut at)?.split(' ');
@@ -301,11 +312,7 @@ impl Exports {
             buckets.push((id, places));
         }
         // A unit none of whose types states a `key` or a `show` has no such table.
-        let n = if s[at..].starts_with("instances ") {
-            count(line(s, &mut at)?, "instances")?
-        } else {
-            0
-        };
+        let n = section(s, &mut at, "instances")?;
         let mut instances = Vec::with_capacity(n);
         let mut numerics = Vec::new();
         for _ in 0..n {
@@ -358,15 +365,21 @@ impl Exports {
     }
 
     pub fn read(lib: &Library) -> Result<Exports> {
-        let Some(p) = lib.symbol(SYMBOL) else {
-            return Err(anyhow!(
-                "the unit at {} carries no `{SYMBOL}`",
-                lib.path().display()
-            ));
+        let text = match lib.descriptor() {
+            Some(unit) => unit.exports(),
+            None => {
+                let Some(p) = lib.symbol(SYMBOL) else {
+                    return Err(anyhow!(
+                        "the unit at {} carries no `{SYMBOL}`",
+                        lib.path().display()
+                    ));
+                };
+                unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) }
+                    .to_str()
+                    .ok()
+            }
         };
-        let text = unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) }
-            .to_str()
-            .map_err(|_| anyhow!("the unit's `{SYMBOL}` is not UTF-8"))?;
+        let text = text.ok_or_else(|| anyhow!("the unit's `{SYMBOL}` is not UTF-8"))?;
         Exports::decode(text)
             .ok_or_else(|| anyhow!("the unit's `{SYMBOL}` does not decode as a unit's table"))
     }

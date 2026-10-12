@@ -213,7 +213,7 @@ fn a_pure_root_over_memo_words_is_answered_from_the_memo() {
         def("m.post", 1, counted),
     ];
     let mut exports = units::exports_of(&defs);
-    exports.constants = vec!["m.table".to_string()];
+    exports.constants = vec![("m.table".to_string(), None)];
     exports.lambdas = vec![format!("{}_entry", units::symbol("m.table"))];
     let Some(lib) = units::library(dir.path(), &units::text(&defs, &exports)) else {
         return;
