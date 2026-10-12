@@ -71,7 +71,7 @@ of it or none, and a run that dies or races another costs a later one checking
 what it takes, never a wrong answer. A run that names a segment writes the
 newest again as one while each is at most twice what follows it; writing all of
 them again keeps the records of the `ply` that writes and, of other `ply`s', the
-most lately used, up to twice as much again.
+most lately used, up to as much again.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
@@ -3197,6 +3197,13 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read.
+
+Where a load ran, the `--json` documents of `ply check`, `ply test` and
+`ply prove` also say under `front_end` what the memo store gave it: `queries`,
+each query the load asked with the answers it took as kept (`taken`) and the
+bodies it ran (`run`), and `vouched`, whether the store held, when the load
+opened it, a record it vouches for to this `ply`. A store that vouches while a
+load runs bodies and takes nothing is one whose answers were not found.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
