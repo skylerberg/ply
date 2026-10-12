@@ -82,10 +82,10 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# Runs that take a runner each: the compiler's own tests, compiled, take every core, the reach audit
+# Runs that take a runner each: the compiler's own suite takes every core, the reach audit
 # checks three whole packages cold and the copies audit lists ten, and every proof run is one load of
 # what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
-CORPUS_ALONE=(cli-compiler_compiled cli-reached cli-copies proofs)
+CORPUS_ALONE=(package-compiler cli-reached cli-copies proofs)
 # Modules the cut may split, a lane taking a run of neighbouring tests (`corpus_cut`): whole, each
 # would outlast a lane.
 CORPUS_BY_TEST=(audit generated toolchain)
@@ -107,6 +107,7 @@ CORPUS_LANES=2
 # until the code its test runs moves, where a test wrapping the run reruns whenever the CLI moves.
 PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
+  "compiler:crates/ply-compiler/ply"
   "kernel:benches/kernel"
   "lang:tests/lang"
   "registry:crates/ply-registry/ply"
