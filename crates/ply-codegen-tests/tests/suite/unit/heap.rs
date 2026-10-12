@@ -163,34 +163,56 @@ fn a_reset_record_released_unused_goes_back_to_its_own_size() {
 }
 
 #[test]
-fn an_ended_entry_gives_back_the_chunks_past_what_a_heap_keeps() {
+fn an_ended_entry_gives_back_what_it_held() {
     let mut h = Heap::new();
     h.alloc(KIND_RECORD, 0, 1, 0);
     h.alloc_bytes(KIND_BYTES, 200 << 20);
-    assert!(h.chunk_bytes() > 200 << 20);
+    assert!(h.held() > 200 << 20);
     h.end();
-    assert!(
-        h.chunk_bytes() <= 64 << 20,
-        "{} bytes kept",
-        h.chunk_bytes()
-    );
-    assert!(
-        h.chunk_bytes() > 0,
-        "the first chunk is kept for the next entry"
-    );
-    let mut big_first = Heap::new();
-    big_first.alloc_bytes(KIND_BYTES, 100 << 20);
-    big_first.end();
-    assert_eq!(
-        big_first.chunk_bytes(),
-        0,
-        "a first chunk past the bound goes back too"
-    );
-    let o = big_first.alloc(KIND_RECORD, 0, 1, 0);
-    assert!(
-        big_first.is_object(o as Word),
-        "a heap that kept nothing allocates afresh"
-    );
+    assert_eq!(h.held(), 0);
+    let o = h.alloc(KIND_RECORD, 0, 1, 0);
+    assert!(h.is_object(o as Word), "an ended heap allocates afresh");
+}
+
+/// A block is its object's size rounded up by an eighth at most, and a page ends short of one more.
+#[test]
+fn a_heap_holds_little_more_than_its_objects_take() {
+    let mut h = Heap::new();
+    for _ in 0..4096 {
+        h.alloc_bytes(KIND_BYTES, 4096);
+    }
+    let held = h.held();
+    assert!(held < 4096 * (4096 + HEADER) * 5 / 4, "{held} bytes held");
+    let mut big = Heap::new();
+    big.alloc_bytes(KIND_BYTES, 1 << 20);
+    assert_eq!(big.held(), (1 << 20) + HEADER);
+}
+
+/// What an object held serves an object of any other size once every block beside it is dead.
+#[test]
+fn memory_one_size_gave_up_serves_another() {
+    let mut h = Heap::new();
+    enter(&mut h);
+    let small: Vec<*mut Obj> = (0..100_000)
+        .map(|_| {
+            let o = h.alloc(KIND_RECORD, 0, 1, 0);
+            unsafe { set_word(o, 0, imm(1)) };
+            o
+        })
+        .collect();
+    let peak = h.held();
+    for o in small {
+        dec(o as Word);
+    }
+    for _ in 0..40_000 {
+        let o = h.alloc(KIND_RECORD, 0, 5, 0);
+        for i in 0..5 {
+            unsafe { set_word(o, i, imm(1)) };
+        }
+    }
+    assert!(h.held() <= peak, "{} bytes held past {peak}", h.held());
+    leave();
+    h.end();
 }
 
 #[test]
@@ -741,14 +763,57 @@ fn sharing_marks_everything_under_the_words_and_counts_it_apart() {
     inc(outer);
     dec(outer);
     assert_eq!(kind(outer), KIND_CTOR);
-    // The last holder dismantles it, and the block is no free list's: no thread knows whose it is.
     dec(outer);
     assert_eq!(kind(outer), KIND_DEAD);
     assert_eq!(kind(inner), KIND_DEAD);
     let next = h.to_word(&l, &Value::ctor("Some", vec![Value::Int(1)]));
-    assert_ne!(next, outer);
+    assert_eq!(next, outer, "its heap took the dead object's block back");
     leave();
     h.end();
+}
+
+/// A thread that is not the heap's own hands a dead object's block back to it.
+#[test]
+fn an_object_another_thread_lets_go_of_last_is_its_heaps_again() {
+    let mut h = Heap::new();
+    enter(&mut h);
+    let l = layouts();
+    let made = h.to_word(&l, &Value::ctor("Some", vec![Value::Int(1)]));
+    let filler: Vec<Word> = (0..10_000)
+        .map(|i| h.to_word(&l, &Value::ctor("Some", vec![Value::Int(i)])))
+        .collect();
+    assert!(share(&[made]));
+    std::thread::scope(|s| {
+        s.spawn(|| dec(made));
+    });
+    assert_eq!(kind(made), KIND_DEAD);
+    let again: Vec<Word> = (0..100_000)
+        .map(|i| h.to_word(&l, &Value::ctor("Some", vec![Value::Int(i)])))
+        .collect();
+    assert!(
+        again.contains(&made),
+        "the block was never handed out again"
+    );
+    drop(filler);
+    leave();
+    h.end();
+}
+
+/// An entry running inside another's hands the outer one's dead objects back to the outer heap.
+#[test]
+fn an_object_dying_under_another_heap_goes_back_to_its_own() {
+    let mut outer = Heap::new();
+    let mut inner = Heap::new();
+    let l = layouts();
+    let made = outer.to_word(&l, &Value::ctor("Some", vec![Value::Int(1)]));
+    enter(&mut inner);
+    dec(made);
+    let other = inner.to_word(&l, &Value::ctor("Some", vec![Value::Int(2)]));
+    assert_ne!(other, made, "a heap took a block of another's");
+    leave();
+    assert!(inner.is_object(other) && !outer.is_object(other));
+    inner.end();
+    outer.end();
 }
 
 /// A cell is a slot of one entry's arena: nothing under words that reach one is marked.
@@ -777,7 +842,7 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     let l = layouts();
     let mut parent = Heap::new();
     let before = parent.to_word(&l, &Value::str("before"));
-    let mut branch = Heap::branch();
+    let mut branch = Heap::new();
     let made = branch.to_word(&l, &Value::list(vec![Value::Int(7), Value::str("x")]));
     let float = branch.bridge(Value::Float(2.5));
     parent.adopt_heap(branch);
