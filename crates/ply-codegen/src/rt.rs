@@ -2436,8 +2436,11 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::ArrayGet, [xs, i]) if heap::kind(*xs) == KIND_ARRAY => {
             let index = usize::try_from(heap::as_int(*i)?).ok()?;
-            let item = *array::items(obj(*xs)).get(index)?;
-            heap::inc(item);
+            if index >= array::len(obj(*xs)) {
+                return None;
+            }
+            let tables = Arc::clone(&ctx.tables);
+            let item = array::element(&mut ctx.heap, &tables.layouts, obj(*xs), index);
             heap::dec(*xs);
             Some(item)
         }
@@ -2445,12 +2448,13 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let index = heap::as_int(*i)?;
             let some = ctx.tables.layouts.some?;
             let none = ctx.tables.layouts.none?;
+            let tables = Arc::clone(&ctx.tables);
             let held = usize::try_from(index)
                 .ok()
-                .and_then(|at| array::items(obj(*xs)).get(at).copied());
+                .filter(|at| *at < array::len(obj(*xs)))
+                .map(|at| array::element(&mut ctx.heap, &tables.layouts, obj(*xs), at));
             let answer = match held {
                 Some(item) => {
-                    heap::inc(item);
                     let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
                     unsafe { set_word(c, 0, item) };
                     c as Word
@@ -2465,14 +2469,16 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if index >= array::len(obj(*xs)) {
                 return None;
             }
-            Some(ctx.heap.array_set(*xs, index, *v))
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.array_set(&tables.layouts, *xs, index, *v))
         }
         (Builtin::ArrayNew, [n, x]) => {
             let n = heap::as_int(*n)?;
             if !(0..=ply_eval::builtins::MAX_ARRAY_LEN).contains(&n) {
                 return None;
             }
-            Some(ctx.heap.array_new(n as usize, *x))
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.array_new(&tables.layouts, n as usize, *x))
         }
         (Builtin::ArrayOfList, [xs]) if heap::kind(*xs) == KIND_LIST => {
             let items = list::to_vec(obj(*xs));
@@ -2480,13 +2486,12 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::inc(*w);
             }
             heap::dec(*xs);
-            Some(ctx.heap.array_from(&items))
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.array_of(&tables.layouts, &items))
         }
         (Builtin::ArrayToList, [xs]) if heap::kind(*xs) == KIND_ARRAY => {
-            let items = array::items(obj(*xs)).to_vec();
-            for w in &items {
-                heap::inc(*w);
-            }
+            let tables = Arc::clone(&ctx.tables);
+            let items = array::elements(&mut ctx.heap, &tables.layouts, obj(*xs));
             heap::dec(*xs);
             Some(ctx.heap.list_from(&items))
         }
@@ -4601,12 +4606,11 @@ pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 
     if heap::kind(xs) == KIND_ARRAY
         && let Some(index) = heap::as_int(i)
     {
+        let tables = Arc::clone(&ctx.tables);
         let held = usize::try_from(index)
             .ok()
-            .and_then(|at| array::items(obj(xs)).get(at).copied());
-        if let Some(item) = held {
-            heap::inc(item);
-        }
+            .filter(|at| *at < array::len(obj(xs)))
+            .map(|at| array::element(&mut ctx.heap, &tables.layouts, obj(xs), at));
         heap::dec(xs);
         return held.unwrap_or(0);
     }

@@ -373,6 +373,7 @@ fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
         RecordLayout {
             in_place: false,
             raw_widths: true,
+            inline_arrays: true,
         },
     );
     let mut h = Heap::new();
@@ -476,6 +477,7 @@ fn a_record_holds_a_wide_width_as_its_bits() {
         RecordLayout {
             in_place: true,
             raw_widths: false,
+            inline_arrays: true,
         },
     );
     let by_word = h.to_word(&words, &value);
@@ -484,6 +486,63 @@ fn a_record_holds_a_wide_width_as_its_bits() {
     dec(w);
     dec(offset);
     dec(by_word);
+}
+
+#[test]
+fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let points = Value::array((0..3).map(|i| segment("p", f64::from(i))).collect());
+    let w = h.to_word(&l, &points);
+    let o = obj(w);
+    assert!(ply_codegen::array::in_place(o));
+    assert_eq!(ply_codegen::array::len(o), 3);
+    // Each element takes a header's two words beside a segment's nine and its bitmap's one.
+    assert_eq!(unsafe { (*o).aux }, 12);
+    assert_eq!(Heap::to_value(&l, w), points);
+    let second = ply_codegen::array::element(&mut h, &l, o, 1);
+    assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
+    assert_eq!(unsafe { (*o).rc }, 2);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), points);
+    // Set in place where it holds the array alone, and on a copy where another holds it too.
+    let replaced = h.to_word(&l, &segment("q", 9.0));
+    let shared = h.array_set(&l, w, 0, replaced);
+    assert_ne!(
+        shared, w,
+        "the element read out holds the array, so the set copies it"
+    );
+    assert_eq!(
+        Heap::to_value(&l, shared),
+        Value::array(vec![
+            segment("q", 9.0),
+            segment("p", 1.0),
+            segment("p", 2.0)
+        ])
+    );
+    assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
+    dec(second);
+    let floats = Value::array(vec![Value::Float(0.5), Value::Float(-2.0)]);
+    let f = h.to_word(&l, &floats);
+    assert!(ply_codegen::array::in_place(obj(f)));
+    assert_eq!(unsafe { (*obj(f)).aux }, 1);
+    assert_eq!(Heap::to_value(&l, f), floats);
+    let boxed = ply_codegen::array::element(&mut h, &l, obj(f), 1);
+    assert_eq!(kind(boxed), KIND_FLOAT);
+    assert_eq!(cmp_words(&l, f, h.to_word(&l, &floats)), Ordering::Equal);
+    let plain = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            in_place: true,
+            raw_widths: true,
+            inline_arrays: false,
+        },
+    );
+    let words = h.to_word(&plain, &floats);
+    assert!(!ply_codegen::array::in_place(obj(words)));
+    dec(shared);
+    dec(boxed);
 }
 
 #[test]

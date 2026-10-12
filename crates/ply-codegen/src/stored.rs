@@ -248,6 +248,26 @@ impl<'l> Writer<'l> {
                     .collect()
             }
             KIND_LIST => self.sequence(LIST, LIST_WORDS, list::to_vec(o)),
+            KIND_ARRAY if array::in_place(o) => {
+                // Each element is written as the value it is; the reader lays them in place again.
+                self.out.push(ARRAY);
+                self.varint(array::len(o) as u64);
+                let slot = array::slot(self.layouts, o);
+                let stride = unsafe { (*o).aux } as usize;
+                pending.push(Pending::Done(w as usize));
+                pending.extend((0..array::len(o)).rev().map(|k| {
+                    let at = k * stride;
+                    match slot {
+                        heap::Slot::Float => Pending::Raw(unsafe { word_at(o, at) }),
+                        heap::Slot::Wide(t) => Pending::Wide(unsafe { word_at(o, at) }, t),
+                        heap::Slot::Record(_) => {
+                            Pending::Word(unsafe { heap::words(o).add(at) } as Word)
+                        }
+                        heap::Slot::Word => Pending::Word(unsafe { word_at(o, at) }),
+                    }
+                }));
+                return Ok(());
+            }
             KIND_ARRAY => self.sequence(ARRAY, ARRAY_WORDS, array::items(o).to_vec()),
             KIND_MAP => {
                 let entries = map::to_vec(o);
@@ -545,7 +565,13 @@ impl<'a> Reader<'a> {
                 filled(o, &done.parts)
             }
             Make::List => self.heap.list_from(&done.parts),
-            Make::Array => self.heap.array_from(&done.parts),
+            Make::Array => {
+                for part in &done.parts {
+                    heap::inc(*part);
+                }
+                self.held.extend(done.parts.iter().copied());
+                self.heap.array_of(self.layouts, &done.parts)
+            }
             Make::Map => {
                 let entries: Vec<(Word, Word)> = done
                     .parts
