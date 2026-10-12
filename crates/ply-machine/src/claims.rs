@@ -8,9 +8,8 @@
 //! baseline come to, every line and key of both reports and the code each run exits with are the
 //! program's too, in `crates/ply-cli/ply/claims.ply`, `prove.ply` and `review.ply`.
 
-use crate::config::Configuration;
 use crate::engine::{Interleaved, Judgement, Mode, Obligation};
-use crate::hosts::{Hosts, LentOp};
+use crate::hosts::LentOp;
 use crate::load::{LoadError, Loaded};
 use crate::payload::{ctor, diags_value, places_value, record, strings};
 use crate::support::unit_of;
@@ -26,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 /// obligations and nowhere else.
 const EFFECT: &str = "prover";
 
-/// A law that reaches the host is refused rather than bound.
+/// `prover` answered from what it is handed alone.
 const HERMETIC: &str = "hermetic_prover";
 
 /// Where each type this side marshals is declared, by the type's own name, with every case of it
@@ -42,16 +41,7 @@ const HERMETIC: &str = "hermetic_prover";
 pub const MARSHALLED: &[(&str, &str, &[&str])] = &[(
     "proof.obligation",
     "Judged",
-    &[
-        "JHeld",
-        "JFailed",
-        "JRejected",
-        "JRaised",
-        "JFaulted",
-        "JMeasured",
-        "JSpent",
-        "JDrew",
-    ],
+    &["JHeld", "JFailed", "JRejected", "JRaised", "JFaulted"],
 )];
 
 /// One case of a type this side marshals, under the name the program declares it by.
@@ -67,22 +57,20 @@ fn case(ty: &str, name: &str, args: Vec<PlyValue>) -> PlyValue {
     ctor(home, name, args)
 }
 
-const OPERATIONS: [(&str, &str); 8] = [
+const OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::claims::configure"),
     ("collected", "ply_machine::claims::collected"),
     ("compiled", "ply_machine::claims::compiled"),
-    ("schema", "ply_machine::claims::schema"),
     ("prepared", "ply_machine::claims::prepared"),
     ("judged", "ply_machine::claims::judged"),
     ("interleaved", "ply_machine::claims::interleaved"),
     ("ended", "ply_machine::claims::ended"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 8] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 7] = [
     ("configure", "ply_machine::claims::hermetic::configure"),
     ("collected", "ply_machine::claims::hermetic::collected"),
     ("compiled", "ply_machine::claims::hermetic::compiled"),
-    ("schema", "ply_machine::claims::hermetic::schema"),
     ("prepared", "ply_machine::claims::hermetic::prepared"),
     ("judged", "ply_machine::claims::hermetic::judged"),
     ("interleaved", "ply_machine::claims::hermetic::interleaved"),
@@ -101,18 +89,8 @@ pub struct Job {
     pub front: Option<crate::driver::LoadedAnalysis>,
     /// The obligations the program owes, as it built them.
     pub obligations: Vec<Obligation>,
-    /// What `--host` binds, which a `law/host` is discharged against; `None` without it, which
-    /// is every `ply review`.
-    pub binding: Option<Binding>,
-    /// Loads only what it is handed and binds no host: see [`HERMETIC`].
+    /// Loads only what it is handed: see [`HERMETIC`].
     pub hermetic: bool,
-}
-
-/// What a `law/host` is discharged against.
-pub struct Binding {
-    pub tls: crate::options::TlsOptions,
-    pub fs: Vec<ply_host::fs::RootSpec>,
-    pub trace: crate::trace::TraceOptions,
 }
 
 /// The operations, for a program that declares `prover` in `module`: a value this side builds of a
@@ -165,7 +143,7 @@ fn registration(op: &str, path: &'static str, hermetic: bool) -> HostOp {
 }
 
 struct ProverHandler {
-    /// Loads only what it is handed and binds no host.
+    /// Loads only what it is handed.
     hermetic: bool,
     /// Taken by the first operation, which is what starts the machine.
     job: Mutex<Option<Job>>,
@@ -203,11 +181,9 @@ impl HostHandler for ProverHandler {
             ("compiled", [unit]) => self.compiled(std::path::PathBuf::from(
                 unit.as_str(span, "the program's library")?,
             ))?,
-            ("schema", [name]) => self.schema(name.as_str(span, "a definition's name")?)?,
-            ("prepared", [step_budget, config]) => self.prepared(
-                step_budget.as_int(span, "the calls an evaluation may make")?,
-                Configuration::of(config, span)?,
-            )?,
+            ("prepared", [step_budget]) => {
+                self.prepared(step_budget.as_int(span, "the calls an evaluation may make")?)?
+            }
             ("judged", [batches]) => self.judged(batches_of(batches, span)?)?,
             ("interleaved", [claim, point, seed, steps]) => self.interleaved(
                 usize::try_from(claim.as_int(span, "the claim's place")?).unwrap_or(usize::MAX),
@@ -232,13 +208,13 @@ pub struct Batch {
     mode: Mode,
 }
 
-/// The `proof.property.Batch`es the program sent.
+/// The `proof.discharge.Batch`es the program sent.
 fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
     use crate::payload::field_of;
     let mut out = Vec::new();
     for batch in value.as_list(span, "the batches to judge")? {
         let claim = field_of(batch, "claim", span)?.as_int(span, "a claim's place")?;
-        let (mode, args) = case_of(field_of(batch, "mode", span)?, "a mode", span)?;
+        let mode = case_of(field_of(batch, "mode", span)?, "a mode", span)?;
         out.push(Batch {
             claim: usize::try_from(claim).unwrap_or(usize::MAX),
             points: points_of(field_of(batch, "points", span)?, span)?,
@@ -246,13 +222,6 @@ fn batches_of(value: &PlyValue, span: Span) -> Result<Vec<Batch>, Diagnostic> {
                 "MWhole" => Mode::Whole,
                 "MWitness" => Mode::Witness,
                 "MDomain" => Mode::Domain,
-                "MDrawn" => Mode::Drawn,
-                "MCost" => match args {
-                    [limit] => Mode::Cost {
-                        limit: limit.as_int(span, "the steps one size may take")?,
-                    },
-                    _ => return Err(malformed("`MCost` carries one limit", span)),
-                },
                 other => return Err(malformed(&format!("`{other}` is no mode"), span)),
             },
         });
@@ -273,19 +242,13 @@ fn points_of(value: &PlyValue, span: Span) -> Result<Vec<Vec<ply_eval::Plain>>, 
     Ok(out)
 }
 
-/// A constructor's simple name and its arguments.
-fn case_of<'v>(
-    value: &'v PlyValue,
-    what: &str,
-    span: Span,
-) -> Result<(&'v str, &'v [PlyValue]), Diagnostic> {
+/// A constructor's simple name.
+fn case_of<'v>(value: &'v PlyValue, what: &str, span: Span) -> Result<&'v str, Diagnostic> {
     match value {
-        PlyValue::Ctor { name, args } => Ok((
-            name.as_str()
-                .rsplit_once('.')
-                .map_or(name.as_str(), |(_, simple)| simple),
-            args,
-        )),
+        PlyValue::Ctor { name, .. } => Ok(name
+            .as_str()
+            .rsplit_once('.')
+            .map_or(name.as_str(), |(_, simple)| simple)),
         _ => Err(malformed(&format!("{what} is no constructor"), span)),
     }
 }
@@ -344,27 +307,12 @@ impl ProverHandler {
         }
     }
 
-    /// The value of the definition `--config-schema` names, entered on the program's unit.
-    fn schema(&self, name: &str) -> Result<PlyValue, Diagnostic> {
-        let held = self.held();
-        let machine = held.as_ref().ok_or_else(|| unstarted("schema"))?;
-        machine.ask(Request::Schema(name.to_string()))?;
-        match machine.reply()? {
-            Reply::Schema(answer) => Ok(crate::config::schema_answer(answer)),
-            _ => Err(out_of_step("schema")),
-        }
-    }
-
-    /// Binds the hosts, answering `config` as the program resolved it, and builds the prover a
-    /// discharge runs against, once, each evaluation of a claim bounded by `step_budget` calls.
-    fn prepared(
-        &self,
-        step_budget: i64,
-        configuration: Configuration,
-    ) -> Result<PlyValue, Diagnostic> {
+    /// Builds the prover a discharge runs on, once, each evaluation of a claim bounded by
+    /// `step_budget` calls.
+    fn prepared(&self, step_budget: i64) -> Result<PlyValue, Diagnostic> {
         let held = self.held();
         let machine = held.as_ref().ok_or_else(|| unstarted("prepared"))?;
-        machine.ask(Request::Prepare(step_budget, configuration))?;
+        machine.ask(Request::Prepare(step_budget))?;
         match machine.reply()? {
             Reply::Prepared(answer) => Ok(self.answered((*answer).map(|ready| {
                 *self.judging.write().unwrap_or_else(|e| e.into_inner()) = Some(ready.judging);
@@ -438,17 +386,13 @@ impl ProverHandler {
 enum Request {
     /// Compile the program's unit from the C it handed over.
     Compiled(std::path::PathBuf),
-    /// Enter the definition `--config-schema` names on the program's unit.
-    Schema(String),
-    /// Bind the hosts over the configuration the program resolved and build the prover a
-    /// discharge runs against, with the calls each evaluation of a claim may make.
-    Prepare(i64, Configuration),
+    /// Build the prover a discharge runs on, with the calls each evaluation of a claim may make.
+    Prepare(i64),
 }
 
 enum Reply {
     Collected(Box<Result<Collection, Refused>>),
     Compiled(Result<(), Diagnostic>),
-    Schema(Result<ply_eval::Plain, Diagnostic>),
     Prepared(Box<Result<Ready, Refused>>),
 }
 
@@ -519,11 +463,9 @@ fn serve(job: Job, told: &mpsc::Sender<Reply>, asked: &mpsc::Receiver<Request>) 
         sources: loaded.sources.clone(),
         warnings: std::mem::take(&mut warnings),
         obligations: obligations.len(),
-        host: job.binding.is_some(),
     }))));
 
-    // The unit the program handed over, and the hosts once bound: the schema and every batch a
-    // discharge judges run on the same unit, and the batches over the same hosts.
+    // The unit the program handed over: every batch a discharge judges runs on it.
     let mut backend: Option<Arc<dyn ply_eval::Provider>> = None;
     let mut prepared: Option<Result<Prepared, Refused>> = None;
     loop {
@@ -534,19 +476,10 @@ fn serve(job: Job, told: &mpsc::Sender<Reply>, asked: &mpsc::Receiver<Request>) 
                 });
                 let _ = told.send(Reply::Compiled(built));
             }
-            Ok(Request::Schema(name)) => {
-                let answer = match &backend {
-                    Some(unit) => {
-                        crate::config::schema_of(&loaded.check, Some(Arc::clone(unit)), &name)
-                    }
-                    None => Err(uncompiled()),
-                };
-                let _ = told.send(Reply::Schema(answer));
-            }
-            Ok(Request::Prepare(step_budget, configuration)) => {
+            Ok(Request::Prepare(step_budget)) => {
                 if prepared.is_none() {
                     let built = backend.clone().ok_or_else(uncompiled);
-                    prepared = Some(prepare(&job, &loaded, built, step_budget, configuration));
+                    prepared = Some(prepare(&job, &loaded, built, step_budget));
                 }
                 let answer = match prepared.as_ref() {
                     Some(Ok(ready)) => Ok(Ready {
@@ -590,22 +523,19 @@ fn load(job: &Job) -> Result<Loaded, LoadError> {
 
 // --- Discharging ---------------------------------------------------------------
 
-/// The prover and the hosts a run discharges and re-runs points with, built when the first step
-/// that needs them asks: a discharge of many claims and a re-run of one case are the same engine.
+/// The prover a run discharges with, built when the first step that needs it asks.
 struct Prepared {
-    /// Kept alive for the prover's lifetime, which is the run's.
-    _hosts: Option<Hosts>,
     judging: Arc<Judging>,
 }
 
 impl Drop for Prepared {
-    /// Before the hosts go: nothing is judged against a stopped host.
+    /// Nothing is judged once the run that prepared it is over.
     fn drop(&mut self) {
         self.judging.open.store(false, Ordering::Release);
     }
 }
 
-/// What preparing answers: what opening the hosts had to say, and the prover it built.
+/// What preparing answers: the prover it built.
 struct Ready {
     judging: Arc<Judging>,
 }
@@ -686,39 +616,15 @@ fn prepare(
     loaded: &Loaded,
     backend: Result<Arc<dyn ply_eval::Provider>, Diagnostic>,
     step_budget: i64,
-    configuration: Configuration,
 ) -> Result<Prepared, Refused> {
-    let unbound = |diagnostics: Vec<Diagnostic>| Refused {
-        kind: RefusalKind::Unbound,
-        diagnostics,
+    let backend = backend.map_err(|d| Refused {
+        kind: RefusalKind::Broken,
+        diagnostics: vec![d],
         sources: loaded.sources.clone(),
-    };
-    let backend = backend.map_err(|d| unbound(vec![d]))?;
-    if job.hermetic && job.binding.is_some() {
-        return Err(unbound(vec![hermetic_host()]));
-    }
-    let hosts = match &job.binding {
-        None => None,
-        Some(binding) => Some(
-            Hosts::open(
-                &loaded.check,
-                true,
-                &binding.tls,
-                &binding.fs,
-                configuration,
-                &binding.trace,
-            )
-            .map_err(&unbound)?,
-        ),
-    };
-    let hosting = hosts.as_ref().map(|hosts| crate::engine::Hosting {
-        binding: hosts.binding(),
-        runtime: hosts.runtime_factory(),
-    });
+    })?;
     Ok(Prepared {
-        _hosts: hosts,
         judging: Arc::new(Judging {
-            prover: crate::engine::prover(loaded, hosting, backend),
+            prover: crate::engine::prover(loaded, backend),
             obligations: job.obligations.clone(),
             step_budget,
             open: AtomicBool::new(true),
@@ -741,16 +647,15 @@ fn values_of(points: &[Vec<ply_eval::Plain>]) -> Result<Vec<Vec<PlyValue>>, Diag
         .map_err(|why| {
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                format!("a point the program drew is no runtime value: {why}"),
+                format!("a point the program named is no runtime value: {why}"),
             )
-            .note("the program draws only values of its claims' types; this is Ply's fault")
+            .note("the program names only values of its claims' types; this is Ply's fault")
         })
 }
 
 #[derive(Clone)]
 enum RefusalKind {
     Broken,
-    Unbound,
 }
 
 #[derive(Clone)]
@@ -766,8 +671,6 @@ struct Collection {
     sources: SourceMap,
     warnings: Vec<Diagnostic>,
     obligations: usize,
-    /// Whether a `law/host` has a host bound to run against.
-    host: bool,
 }
 
 // --- The values the program reads -------------------------------------------------
@@ -775,7 +678,6 @@ struct Collection {
 fn refusal_value(refused: &Refused, module: &str) -> PlyValue {
     let named = match refused.kind {
         RefusalKind::Broken => "Broken",
-        RefusalKind::Unbound => "Unbound",
     };
     ctor(
         module,
@@ -791,7 +693,6 @@ fn collection_value(collection: Collection) -> PlyValue {
     record(vec![
         ("places", places_value(&collection.sources)),
         ("warnings", diags_value(&collection.warnings)),
-        ("host", PlyValue::Bool(collection.host)),
     ])
 }
 
@@ -806,7 +707,7 @@ fn shown_values(diagnostic: &Diagnostic) -> PlyValue {
     )
 }
 
-/// A `proof.property.Interleaved` reply's payload: the recording as `sim.recording` spells it.
+/// A `proof.discharge.Interleaved` reply's payload: the recording as `sim.recording` spells it.
 fn interleaved_value(run: &crate::engine::Interleaved) -> PlyValue {
     record(vec![
         (
@@ -846,16 +747,6 @@ fn judged_value(judgement: &Judgement) -> PlyValue {
                 ("values", shown_values(diagnostic)),
             ])],
         ),
-        Judgement::Measured { steps, bound } => case(
-            "Judged",
-            "JMeasured",
-            vec![record(vec![
-                ("bound", PlyValue::Int(*bound)),
-                ("steps", PlyValue::Int(*steps)),
-            ])],
-        ),
-        Judgement::Spent { limit } => case("Judged", "JSpent", vec![PlyValue::Int(*limit)]),
-        Judgement::Drew(plain) => case("Judged", "JDrew", vec![ply_eval::reflect::value_of(plain)]),
     }
 }
 
@@ -937,83 +828,15 @@ fn unread_world(why: &ply_eval::decode::Error, span: Span) -> Diagnostic {
 
 // --- The job the program parses ---------------------------------------------------
 
-/// The job record as the program builds it from the parsed line, read field by field.
+/// The job record as the program builds it from the parsed line.
 fn job_of(v: &PlyValue, span: Span) -> Result<Job, Diagnostic> {
-    use crate::payload::{field_of, str_list_at};
-    let bool_at = |name: &str| field_of(v, name, span)?.as_bool(span, name);
-    let str_at = |name: &str| {
-        field_of(v, name, span)?
-            .as_str(span, name)
-            .map(str::to_string)
-    };
-    let binding = if bool_at("host")? {
-        let tls_list = field_of(v, "tls", span)?;
-        let mut tls = Vec::new();
-        for item in tls_list.as_list(span, "tls")?.iter() {
-            tls.push(ply_host::tls::CredentialSpec {
-                name: field_of(item, "name", span)?
-                    .as_str(span, "a name")?
-                    .to_string(),
-                certificate: PathBuf::from(
-                    field_of(item, "cert", span)?.as_str(span, "a certificate")?,
-                ),
-                key: PathBuf::from(field_of(item, "key", span)?.as_str(span, "a key")?),
-            });
-        }
-        let fs_list = field_of(v, "fs", span)?;
-        let mut fs = Vec::new();
-        for item in fs_list.as_list(span, "fs")?.iter() {
-            fs.push(ply_host::fs::RootSpec {
-                name: field_of(item, "name", span)?
-                    .as_str(span, "a name")?
-                    .to_string(),
-                path: PathBuf::from(field_of(item, "path", span)?.as_str(span, "a path")?),
-            });
-        }
-        let trace = field_of(v, "trace", span)?;
-        Some(Binding {
-            tls: crate::options::TlsOptions {
-                tls,
-                trust: str_list_at(v, "trust", span)?
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect(),
-                mtls: str_list_at(v, "mtls", span)?,
-            },
-            fs,
-            trace: crate::trace::TraceOptions {
-                sink: match field_of(trace, "sink", span)?.as_str(span, "the trace sink")? {
-                    "text" => crate::trace::SinkArg::Text,
-                    "off" => crate::trace::SinkArg::Off,
-                    _ => crate::trace::SinkArg::Json,
-                },
-                level: match field_of(trace, "level", span)?.as_str(span, "the trace level")? {
-                    "debug" => crate::trace::LevelArg::Debug,
-                    "warn" => crate::trace::LevelArg::Warn,
-                    "error" => crate::trace::LevelArg::Error,
-                    _ => crate::trace::LevelArg::Info,
-                },
-            },
-        })
-    } else {
-        None
-    };
+    let path = crate::payload::field_of(v, "path", span)?.as_str(span, "path")?;
     Ok(Job {
-        path: PathBuf::from(str_at("path")?),
+        path: PathBuf::from(path),
         front: None,
         obligations: Vec::new(),
-        binding,
         hermetic: false,
     })
-}
-
-#[cold]
-fn hermetic_host() -> Diagnostic {
-    Diagnostic::error(
-        codes::CAPABILITY_UNDECLARED,
-        format!("`{HERMETIC}` binds no host, and the run asked for `--host`"),
-    )
-    .note("a program that discharges a `law/host` reaches the host, and performs `prover`")
 }
 
 /// A step that enters the program's unit, asked before the program handed one over.

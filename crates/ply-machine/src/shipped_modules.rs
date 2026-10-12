@@ -118,6 +118,11 @@ pub fn data(name: &str) -> Option<&'static [u8]> {
     ply_pack::installed().bytes(&data_path_of(name)?)
 }
 
+/// Every shipped module and data file, digested: it moves with any of them. No bytes are read.
+pub fn digest() -> ply_pack::Digest {
+    ply_pack::installed().digest_below(&[ply_pack::STD, ply_pack::COMPILER, ply_pack::PRELUDE])
+}
+
 /// What `name` is of the shipped modules, as a trace holds it: a module's text or a data file's
 /// bytes, digested.
 pub fn digest_of(name: &str) -> Option<String> {

@@ -20,6 +20,10 @@
 #                                or `workflow_dispatch`, SWEEP_PARTS of them, so SWEEP_DAYS days
 #                                sweep every case; none otherwise, since `edit_gate` holds a pull
 #                                request to every kind of edit
+#   ci-tables.sh toolchain-key   a digest of what `ply bootstrap` reads of this checkout: the
+#                                runtime's library as cargo built it, and each file of the Ply
+#                                packages `ply` is built from. A `ply` built under it is the one a
+#                                bootstrap would build now
 
 set -euo pipefail
 
@@ -39,9 +43,13 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# Modules of the CLI's suite only the nightly run takes: each case edits a module of the tree one way
-# and checks it warm and cold, days of a machine over the tree.
-CLI_NIGHTLY=(edit_sweep)
+# Modules of the CLI's suite only the nightly run takes. CLI_SWEPT edits each module of the tree one
+# way and checks it warm and cold, days of a machine over the tree, so a night takes a part of its
+# cases. The rest run whole each night: minutes each over the toolchain's whole trees, the reach
+# audit checking three packages cold and the copies audit listing ten, or against a postgres they
+# start.
+CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
+CLI_SWEPT=edit_sweep
 SWEEP_PARTS=16
 SWEEP_DAYS=14
 # Packages whose own suites are runs too, as `id:path`, the run `package-<id>`.
@@ -58,9 +66,12 @@ PACKAGE_SUITES=(
 )
 # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the run
 # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
-PACKAGE_PROOFS=(
-  "compiler:crates/ply-compiler/ply"
-)
+PACKAGE_PROOFS=()
+
+# The source that says what a bootstrap reads of a checkout (`toolchain_inputs`), and the runtime's
+# library it links, as cargo builds it for the `ply` the job tests.
+TOOLCHAIN_BOOTSTRAP=crates/ply-cli/ply/bootstrap.ply
+TOOLCHAIN_LIBRARY=target/release/libply_native.a
 
 # The packages whose tests bind sockets and processes, which run after every other Rust test.
 HOST_PACKAGES=(ply-host-tests)
@@ -197,7 +208,7 @@ path_in() {
 # Each `.ply` of a package below `crates/` other than the library's that states a law or an `ensures`
 # or `cost` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
     grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
@@ -205,7 +216,7 @@ claiming_files() {
 cmd_runs() {
   local entry file
   printf 'checks\ncli\nstdlib\nproofs\n'
-  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   printf 'program\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
@@ -228,7 +239,8 @@ cmd_line() {
     checks) printf '%s\t\n' "$CORPUS_CHECKS" ;;
     stdlib | proofs) printf '%s\t\n' "$CORPUS_STDLIB" ;;
     cli) printf '%s\t%s\n' "$CLI_SUITE" "$(filters_but "$CLI_SUITE" "${CLI_NIGHTLY[@]}")" ;;
-    sweep) printf '%s\t%s\n' "$CLI_SUITE" "$(printf '%s. ' "${CLI_NIGHTLY[@]}")" ;;
+    sweep) printf '%s\t%s.\n' "$CLI_SUITE" "$CLI_SWEPT" ;;
+    nightly) printf '%s\t%s\n' "$CLI_SUITE" "$(for module in "${CLI_NIGHTLY[@]}"; do [[ $module == "$CLI_SWEPT" ]] || printf '%s. ' "$module"; done)" ;;
     fixture-*)
       [[ -f "$root/$CORPUS_FIXTURES/${id#fixture-}.ply" ]] || { echo "no fixture named '${id#fixture-}'" >&2; return 1; }
       printf '%s/%s.ply\t\n' "$CORPUS_FIXTURES" "${id#fixture-}"
@@ -238,7 +250,7 @@ cmd_line() {
       printf '%s\t\n' "$path"
       ;;
     laws-*)
-      path=$(path_in "${id#laws-}" "${PACKAGE_PROOFS[@]}") || { echo "no package's proofs named '${id#laws-}'" >&2; return 1; }
+      path=$(path_in "${id#laws-}" ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}) || { echo "no package's proofs named '${id#laws-}'" >&2; return 1; }
       printf '%s\t\n' "$path"
       ;;
     cli-*)
@@ -258,6 +270,64 @@ cmd_sweep_parts() {
   [[ $event == schedule || $event == workflow_dispatch ]] || return 0
   day=$(($(date -u +%s) / 86400 % SWEEP_DAYS))
   for ((k = 1; k <= SWEEP_PARTS; k++)); do printf '%d/%d\n' $((day * SWEEP_PARTS + k)) "$of"; done
+}
+
+# A path with each `..` taken with the segment before it and each `.` dropped, as text.
+lexical() {
+  awk -v p="$1" 'BEGIN {
+    n = split(p, s, "/"); k = 0
+    for (i = 1; i <= n; i++) {
+      if (s[i] == "" || s[i] == ".") continue
+      if (s[i] == "..") { if (k > 0) k--; continue }
+      out[++k] = s[i]
+    }
+    for (i = 1; i <= k; i++) printf "%s%s", (i > 1 ? "/" : ""), out[i]
+    printf "\n"
+  }'
+}
+
+# Each path of the repository a bootstrap reads Ply from, one a line: every path under `crates/` its
+# source names, and every package the manifest of one of those names by path, and theirs.
+toolchain_inputs() {
+  local all prev dir rel
+  all=$(grep -oE '"/?crates/[^"]*"' "$root/$TOOLCHAIN_BOOTSTRAP" | tr -d '"' | sed 's|^/||' | LC_ALL=C sort -u)
+  prev=
+  while [[ $all != "$prev" ]]; do
+    prev=$all
+    all=$(
+      {
+        printf '%s\n' "$prev"
+        while IFS= read -r dir; do
+          [ -f "$root/$dir/ply.pkg" ] || continue
+          sed -n 's/.*source: *Path("\([^"]*\)").*/\1/p' "$root/$dir/ply.pkg" |
+            while IFS= read -r rel; do lexical "$dir/$rel"; done
+        done <<< "$prev"
+      } | grep . | LC_ALL=C sort -u
+    )
+  done
+  printf '%s\n' "$all"
+}
+
+# A change that moves none of what this hashes bootstraps nothing: the files are the checkout's own,
+# as git lists them, so a store or a cache a run left in a package's tree is no part of it.
+cmd_toolchain_key() {
+  local inputs
+  inputs=$(toolchain_inputs)
+  if [[ -z $inputs ]]; then
+    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is of nothing" >&2
+    return 1
+  fi
+  if [[ ! -f $root/$TOOLCHAIN_LIBRARY ]]; then
+    echo "FAIL: no $TOOLCHAIN_LIBRARY: build the runtime's library before asking for the key" >&2
+    return 1
+  fi
+  local -a sha=(sha256sum)
+  command -v sha256sum > /dev/null || sha=(shasum -a 256)
+  {
+    "${sha[@]}" < "$root/$TOOLCHAIN_LIBRARY"
+    # shellcheck disable=SC2086
+    (cd "$root" && git ls-files -z -- $inputs | LC_ALL=C sort -z | xargs -0 "${sha[@]}")
+  } | "${sha[@]}" | cut -c1-40
 }
 
 # Workspace members under `crates/`, read out of `Cargo.toml` as text.
@@ -442,17 +512,25 @@ cmd_verify() {
       fi
     done
   done
+  if ! named_in "$CLI_SWEPT" "${CLI_NIGHTLY[@]}"; then
+    echo "FAIL: CLI_SWEPT names '$CLI_SWEPT', which CLI_NIGHTLY does not, so every run takes it whole" >&2
+    failures=$((failures + 1))
+  fi
+  if [[ -z $(toolchain_inputs) ]]; then
+    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is of nothing" >&2
+    failures=$((failures + 1))
+  fi
   local file claimed
   while IFS= read -r file; do
     [[ -n $file ]] || continue
     claimed=0
-    for entry in "${PACKAGE_PROOFS[@]}"; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
+    for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
     if ((!claimed)); then
       echo "FAIL: $file states a law or contract, and no PACKAGE_PROOFS entry proves its package, so CI never discharges it" >&2
       failures=$((failures + 1))
     fi
   done < <(claiming_files)
-  for entry in "${PACKAGE_PROOFS[@]}"; do
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do
     if ! grep -q "^${entry#*:}/" < <(claiming_files); then
       echo "FAIL: PACKAGE_PROOFS names ${entry#*:}, which states no law or contract — delete the entry" >&2
       failures=$((failures + 1))
@@ -502,8 +580,9 @@ case "${1:-}" in
   tree-checks) cmd_tree_checks ;;
   formatted-sources) printf '%s\n' "${FORMATTED_SOURCES[@]}" ;;
   sweep-parts) cmd_sweep_parts "${2:?an event}" ;;
+  toolchain-key) cmd_toolchain_key ;;
   *)
-    echo "usage: ci-tables.sh {verify|runs|line ID|host-filter|tree-checks|formatted-sources|sweep-parts EVENT}" >&2
+    echo "usage: ci-tables.sh {verify|runs|line ID|host-filter|tree-checks|formatted-sources|sweep-parts EVENT|toolchain-key}" >&2
     exit 2
     ;;
 esac

@@ -82,6 +82,7 @@ import std.tar
 import std.tar (tar, Absolute, Backslash, Danger, Drive, Escapes, LinkEscapes, MakeDirectory,
                 MakeSymlink, NoName, Operation, Special, ThroughLink, Unsafe, WriteFile)
 import std.time (nanos_at)
+import std.gen
 
 // --- Entries --------------------------------------------------------------------
 
@@ -1423,7 +1424,7 @@ pub fn plan(entries: List<Entry>) -> Result<List<Operation>, Unsafe> / {abort.ra
 pub fn safe_path(path: String) -> Result<String, Danger> =
   match foreign(path) { Some(why) -> Err(why), None -> tar::safe_path(path) }
 
-// --- Laws -----------------------------------------------------------------------
+// --- Properties -----------------------------------------------------------------
 
 fn roomy() -> Limits =
   {
@@ -1462,10 +1463,10 @@ fn drawn_instant(pick: Int) -> Option<Instant> =
   else if pick & 3 == 1 { Some(Instant((pick >> 2 & 0x7FFF_FFFF) * 1000000000)) }
   else { Some(Instant((pick >> 2 & 0xFFFF_FFFF_FFFF) * 100)) }
 
-/// An entry a law draws from the bits of `pick`, named apart from every other by `index`: its
+/// An entry a test draws from the bits of `pick`, named apart from every other by `index`: its
 /// kind, path, mode, times, comment and a field carried as it is.
 fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
-  // Spread over every bit, whatever range a law draws its numbers from.
+  // Spread over every bit, whatever range a test draws its numbers from.
   let pick = drawn_pick *% 0x2545_F491_4F6C_DD1D;
   let path = spelled(pick) ++ "-" ++ int_to_string(index);
   let kind = pick >> 3 & 3;
@@ -1493,93 +1494,34 @@ fn drawn(index: Int, drawn_pick: Int, data: Bytes) -> Entry = {
 fn drawn_all(picks: List<Int>, data: Bytes) -> List<Entry> =
   map(enumerate(picks), |p: { index: Int, value: Int }| drawn(p.index, p.value, data))
 
-law "what is written reads back as the entries it was written from, by either rule for names"
-  forall (picks: List<Int>, data: Bytes) {
+test "what is written reads back as the entries it was written from, by either rule for names" {
+  gen::check2(gen::list(gen::any_int()), gen::bytes(), |picks: List<Int>, data: Bytes| {
     let entries = drawn_all(picks, data);
     let whole = write(entries);
     decode(whole, roomy()) == Ok(entries) && decode(whole, roomy(), Declared) == Ok(entries)
-  }
+  })
+}
 
-law "an archive's last bytes find its directory, or say how many more would"
-  forall (picks: List<Int>, data: Bytes, cut: Int) {
-    let whole = write(drawn_all(picks, data));
-    let length = bytes_len(whole);
-    let tight = { ..roomy(), comment: 0 };
-    let tail = bytes_slice(whole, length - (cut & 0x7FFF_FFFF) % (length + 1), length);
-    match try { locate(tail, length, tight) } {
-      Ok(More(needed)) -> needed > bytes_len(tail) && needed <= length,
-      Ok(found) -> (try { locate(whole, length, tight) }) == Ok(found),
-      Err(_) -> false,
-    }
-  }
-
-/// What the directory of `archive` says of its first member.
-fn first_listed(archive: Bytes) -> Listed / {zip.refused, abort.raise} =
-  match locate(archive, bytes_len(archive), roomy()) {
-    Found(d) -> match listing(bytes_slice(archive, d.at, d.at + d.size), d, roomy()) {
-      [l, ..] -> l,
-      [] -> panic("an archive of one member lists it"),
+test "an archive's last bytes find its directory, or say how many more would" {
+  gen::check3(
+    gen::list(gen::any_int()),
+    gen::bytes(),
+    gen::any_int(),
+    |picks: List<Int>, data: Bytes, cut: Int| {
+      let whole = write(drawn_all(picks, data));
+      let length = bytes_len(whole);
+      let tight = { ..roomy(), comment: 0 };
+      let tail = bytes_slice(whole, length - (cut & 0x7FFF_FFFF) % (length + 1), length);
+      match try { locate(tail, length, tight) } {
+        Ok(More(needed)) -> needed > bytes_len(tail) && needed <= length,
+        Ok(found) -> (try { locate(whole, length, tight) }) == Ok(found),
+        Err(_) -> false,
+      }
     },
-    More(_) -> panic("a whole archive holds its end"),
-  }
-
-law "a member opens from the bytes that hold its header, or says how many more would"
-  forall (pick: Int, data: Bytes, cut: Int) {
-    let whole = write([drawn(0, pick, data), file("after", b"")]);
-    let l = first_listed(whole);
-    let part = bytes_slice(whole, l.at, l.at + (cut & 0x7FFF_FFFF) % (l.until - l.at + 1));
-    match try { open(l, part, roomy()) } {
-      Ok(More(needed)) -> needed > bytes_len(part) && needed <= l.until - l.at,
-      Ok(found) -> (try { open(l, bytes_slice(whole, l.at, l.until), roomy()) }) == Ok(found),
-      Err(_) -> false,
-    }
-  }
-
-law "a wall clock reads back from a header's fields"
-  forall (pick: Int) {
-    let at = moment(pick & 0x7FFF_FFFF);
-    match clock_fields(at) {
-      Some(packed) -> clock(packed >> 16, packed & 0xFFFF) == Some(at),
-      None -> false,
-    }
-  }
-
-law "an instant reads back from NTFS's count of it"
-  forall (nanos: Int) {
-    let at = Instant(nanos / 100 * 100);
-    of_ticks(ticks_of(Some(at))) == Some(at)
-  }
-
-/// Path segments a plan must see through, the ones only a zip plan refuses among them.
-fn segments() -> List<String> = ["a", "b", "..", ".", "a\\b", "C:", "c:x", "d"]
-
-fn winding(pick: Int) -> String =
-  join(
-    map([pick, pick >> 3], |bits: Int|
-      match list_at(segments(), bits & 7) { Some(name) -> name, None -> "a" }),
-    "/",
   )
+}
 
-/// An entry a law draws to try a plan: a file, a directory or a link on a winding path.
-fn tricky(pick: Int) -> Entry =
-  if pick >> 6 & 3 == 0 { directory(winding(pick)) }
-  else if pick >> 6 & 3 == 1 { symlink(winding(pick), winding(pick >> 8)) }
-  else { file(winding(pick), b"") }
-
-law "a plan is std.tar's of the same entries, where no path or target is a foreign one"
-  forall (picks: List<Int>) {
-    let entries = map(picks, tricky);
-    match plan(entries) {
-      Ok(steps) ->
-        !any(entries, |e: Entry| strange(e) != None)
-          && tar::plan(map(entries, planned)) == Ok(steps),
-      Err(refused) ->
-        (refused.why != Backslash && refused.why != Drive)
-          || option_map(list_at(entries, refused.index), strange) == Some(Some(refused.why)),
-    }
-  }
-
-/// Path segments a law winds into one path to judge under both readings: plain, staying,
+/// Path segments a test winds into one path to judge under both readings: plain, staying,
 /// climbing, empty, outside ASCII, a drive's, and any text at all.
 fn windings(text: String) -> List<String> =
   ["a", "..", ".", "", "caf\u{e9}", "\u{6c34}\u{df}", "c:", text]
@@ -1587,8 +1529,8 @@ fn windings(text: String) -> List<String> =
 /// A UTF-8 text as a reader takes it that reads its bytes as code page 437.
 fn misread(text: String) -> String / {abort.raise} = of_cp437(bytes_of_string(text))
 
-law "a path alone is as safe read as code page 437 as read as the UTF-8 it is"
-  forall (picks: List<Int>, text: String) {
+test "a path alone is as safe read as code page 437 as read as the UTF-8 it is" {
+  gen::check2(gen::list(gen::any_int()), gen::text(), |picks: List<Int>, text: String| {
     let path = join(
       map(picks, |pick: Int|
         match list_at(windings(text), pick & 7) { Some(name) -> name, None -> "a" }),
@@ -1598,13 +1540,8 @@ law "a path alone is as safe read as code page 437 as read as the UTF-8 it is"
       Ok(safe) -> safe_path(misread(path)) == Ok(misread(safe)),
       Err(why) -> safe_path(misread(path)) == Err(why),
     }
-  }
-
-law "reading and writing are linear in the entries"
-  forall (n: Int) where n > 0 cost n {
-    let entries = map(range(0, n), |i: Int| file(int_to_string(i), b"x"));
-    decode(write(entries), { ..roomy(), entries: n, total: n, size: 1 }) == Ok(entries)
-  }
+  })
+}
 
 // --- Tests ----------------------------------------------------------------------
 

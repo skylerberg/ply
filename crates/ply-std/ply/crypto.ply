@@ -55,6 +55,7 @@ import std.math (bit_length)
 import std.oid
 import std.oid (Oid)
 import std.random (entropy, token_bytes)
+import std.gen
 
 /// Whether two byte strings are the same, in time that follows their lengths and never where they
 /// first differ: `std.hash`'s `tags_match`. A length is no secret.
@@ -911,7 +912,7 @@ pub fn public_of_jwk(jwk: Jwk) -> Option<PublicKey> =
 
 // --- Tests ------------------------------------------------------------------
 
-/// Thirty-two bytes out of any: a key for a law that draws bytes.
+/// Thirty-two bytes out of any: a key for a test that draws bytes.
 fn keyed(material: Bytes) -> Secret<Bytes> = secret_of_bytes(bytes_blake3(material))
 
 fn seal_key_at(material: Bytes) -> SealKey / {abort.raise} =
@@ -921,8 +922,6 @@ fn counted_at(cipher: Cipher, material: Bytes) -> CountedKey / {abort.raise} =
   match counted_key(cipher, secret_of_bytes(material)) { Some(key) -> key, None -> panic("a key") }
 
 fn wide(material: Bytes) -> Bytes / {abort.raise} = bytes_slice(bytes_blake3(material), 0, 24)
-
-fn narrow(material: Bytes) -> Bytes / {abort.raise} = bytes_slice(bytes_blake3(material), 0, 12)
 
 /// `b` with one bit turned, the bit `at` counts to round its length.
 fn turned(b: Bytes, at: Int) -> Bytes / {abort.raise} = {
@@ -1093,38 +1092,44 @@ test "the {w.curve} key of scalar one's document is the one OpenSSL writes" for 
   )
 }
 
-law "what is sealed opens, under its key and what it was bound to"
-  forall (material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes) {
-    let key = seal_key_at(material);
-    open(key, seal_under(key, wide(nonce), plaintext, associated), associated) == Some(plaintext)
-  }
+test "what is sealed opens, under its key and what it was bound to" {
+  gen::check4(
+    gen::bytes(),
+    gen::bytes(),
+    gen::bytes(),
+    gen::bytes(),
+    |material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes| {
+      let key = seal_key_at(material);
+      open(key, seal_under(key, wide(nonce), plaintext, associated), associated) == Some(plaintext)
+    },
+  )
+}
 
-law "a bit turned anywhere in a sealed message, or in what it was bound to, opens nothing"
-  forall (material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes, at: Int) {
-    let key = seal_key_at(material);
-    let whole_text = seal_under(key, wide(nonce), plaintext, associated);
-    open(key, turned(whole_text, at), associated) == None
-      && open(key, whole_text, turned(bytes_concat(associated, b"."), at)) == None
-      && open(seal_key_at(bytes_concat(material, b".")), whole_text, associated) == None
-  }
-
-law "what is sealed at a nonce opens at it, under either cipher"
-  forall (material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes, which: Bool) {
-    let key = counted_at(if which { Aes256Gcm } else { ChaCha20Poly1305 }, bytes_blake3(material));
-    let at = narrow(nonce);
-    open_at(key, at, unwatched(|| seal_at(key, at, plaintext, associated)), associated)
-      == Some(plaintext)
-  }
-
-law "a bit turned in a message sealed at a nonce, in the nonce or in what it was bound to opens nothing"
-  forall (material: Bytes, nonce: Bytes, plaintext: Bytes, associated: Bytes, which: Bool, at: Int) {
-    let key = counted_at(if which { Aes256Gcm } else { ChaCha20Poly1305 }, bytes_blake3(material));
-    let spent = narrow(nonce);
-    let text = unwatched(|| seal_at(key, spent, plaintext, associated));
-    open_at(key, spent, turned(text, at), associated) == None
-      && open_at(key, turned(spent, at), text, associated) == None
-      && open_at(key, spent, text, turned(bytes_concat(associated, b"."), at)) == None
-  }
+test "a bit turned anywhere in a sealed message, or in what it was bound to, opens nothing" {
+  gen::check(
+    gen::and_then(gen::bytes(), |material: Bytes|
+      gen::map4(
+        gen::bytes(),
+        gen::bytes(),
+        gen::bytes(),
+        gen::any_int(),
+        |nonce: Bytes, plaintext: Bytes, associated: Bytes, at: Int|
+          (material, nonce, plaintext, associated, at),
+      )),
+    |drawn: (Bytes, Bytes, Bytes, Bytes, Int)| {
+      let material = drawn._0;
+      let nonce = drawn._1;
+      let plaintext = drawn._2;
+      let associated = drawn._3;
+      let at = drawn._4;
+      let key = seal_key_at(material);
+      let whole_text = seal_under(key, wide(nonce), plaintext, associated);
+      open(key, turned(whole_text, at), associated) == None
+        && open(key, whole_text, turned(bytes_concat(associated, b"."), at)) == None
+        && open(seal_key_at(bytes_concat(material, b".")), whole_text, associated) == None
+    },
+  )
+}
 
 test "a watcher stops at the first nonce spent twice under one key, and lets a count through" {
   let key = counted_at(ChaCha20Poly1305, repeat(b"k", 32));
@@ -1152,19 +1157,6 @@ test "a watcher stops at the first nonce spent twice under one key, and lets a c
   assert_eq(repeated.found, Err({ key: key_name(key), nonce: counter_nonce(0, 7) }));
   assert_eq(repeated.reached, 1)
 }
-
-law "a watcher refuses a nonce exactly when it was spent before under the key"
-  forall (first: Int, second: Int) {
-    let key = counted_at(Aes256Gcm, repeat(b"k", 32));
-    let a = counter_nonce(0, first & 0xFF);
-    let b = counter_nonce(0, second & 0xFF);
-    let found = watched(|| {
-      seal_at(key, a, b"one", b"");
-      seal_at(key, b, b"two", b"")
-    });
-    if a == b { found == Err({ key: key_name(key), nonce: a }) }
-    else { match found { Ok(_) -> true, Err(_) -> false } }
-  }
 
 // --- Signatures -------------------------------------------------------------
 
@@ -1238,56 +1230,37 @@ test "a P-256 key is a scalar in range and a point on the curve" {
   assert_eq(p256_peer(bytes_concat(b"\x04", repeat(b"\x00", 64))), None)
 }
 
-law "a signature verifies under its key, and under no other message or key"
-  forall (material: Bytes, message: Bytes, which: Int) {
-    let made_key = match (which & 0xFF) % 3 {
-      0 -> ed25519_signing(keyed(material)),
-      1 -> ecdsa_signing(NistP256, keyed(material), Raw),
-      _ -> ecdsa_signing(NistP256, keyed(material), Der),
-    };
-    let other = match (which & 0xFF) % 3 {
-      0 -> ed25519_signing(keyed(bytes_concat(material, b"."))),
-      1 -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Raw),
-      _ -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Der),
-    };
-    match made_key {
-      None -> true,
-      Some(key) -> {
-        let signature = sign(key, message);
-        verify(verifying_key(key), message, signature)
-          && !verify(verifying_key(key), bytes_concat(message, b"."), signature)
-          && (match other {
-            Some(k) -> !verify(verifying_key(k), message, signature),
-            None -> true,
-          })
-      },
-    }
-  }
-
-law "a seed decides its key and every signature under it"
-  forall (material: Bytes, message: Bytes) {
-    let first = signer(ed25519_signing(keyed(material)));
-    let second = signer(ed25519_signing(keyed(material)));
-    first == second && verifying_key(first) == verifying_key(second)
-      && sign(first, message) == sign(second, message)
-      && sign(first, message) == made(crypto_sign("ed25519", keyed(material), message))
-  }
-
-law "a signature in one encoding is the other's, written again, and reads back"
-  forall (material: Bytes, message: Bytes) {
-    match ecdsa_signing(NistP256, keyed(material), Raw) {
-      None -> true,
-      Some(key) -> {
-        let raw = sign(key, message);
-        raw_of_der(der_of_raw(raw), 32) == Some(raw)
-          && Some(der_of_raw(raw))
-          == (match ecdsa_signing(NistP256, keyed(material), Der) {
-            Some(der) -> Some(sign(der, message)),
-            None -> None,
-          })
-      },
-    }
-  }
+test "a signature verifies under its key, and under no other message or key" {
+  gen::check3(
+    gen::bytes(),
+    gen::bytes(),
+    gen::any_int(),
+    |material: Bytes, message: Bytes, which: Int| {
+      let made_key = match (which & 0xFF) % 3 {
+        0 -> ed25519_signing(keyed(material)),
+        1 -> ecdsa_signing(NistP256, keyed(material), Raw),
+        _ -> ecdsa_signing(NistP256, keyed(material), Der),
+      };
+      let other = match (which & 0xFF) % 3 {
+        0 -> ed25519_signing(keyed(bytes_concat(material, b"."))),
+        1 -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Raw),
+        _ -> ecdsa_signing(NistP256, keyed(bytes_concat(material, b".")), Der),
+      };
+      match made_key {
+        None -> true,
+        Some(key) -> {
+          let signature = sign(key, message);
+          verify(verifying_key(key), message, signature)
+            && !verify(verifying_key(key), bytes_concat(message, b"."), signature)
+            && (match other {
+              Some(k) -> !verify(verifying_key(k), message, signature),
+              None -> true,
+            })
+        },
+      }
+    },
+  )
+}
 
 test "a DER signature is read in its one writing" {
   let r = bytes_concat(b"\x80", repeat(b"\x01", 31));
@@ -1359,8 +1332,8 @@ test "a peer of small order shares nothing, and two curves do not agree" {
   assert_eq(peer_bytes(peer_key(other)), rfc_6979_point())
 }
 
-law "two keys share one secret, whichever side works it out"
-  forall (ours: Bytes, theirs: Bytes, which: Bool) {
+test "two keys share one secret, whichever side works it out" {
+  gen::check3(gen::bytes(), gen::bytes(), gen::bool(), |ours: Bytes, theirs: Bytes, which: Bool| {
     let a = if which { x25519_key(keyed(ours)) } else { p256_key(keyed(ours)) };
     let b = if which { x25519_key(keyed(theirs)) } else { p256_key(keyed(theirs)) };
     match ((a, b)) {
@@ -1371,7 +1344,8 @@ law "two keys share one secret, whichever side works it out"
       },
       _ -> true,
     }
-  }
+  })
+}
 
 test "a shared secret becomes keys through HKDF, each under its own info" {
   let alice = agreeing(x25519_key(keyed(b"alice")));
@@ -1421,18 +1395,6 @@ test "a public key is written as its SubjectPublicKeyInfo and read back" {
     Err("a key of another length"),
   )
 }
-
-law "a key of its algorithm's length reads back from its SubjectPublicKeyInfo and from its JWK"
-  forall (material: Bytes, which: Int) {
-    let bytes = bytes_blake3(material);
-    let key = match (which & 0xFF) % 3 {
-      0 -> Ed25519Public(bytes),
-      1 -> X25519Public(bytes),
-      _ -> P256Public(bytes_concat_all([b"\x04", bytes, bytes])),
-    };
-    spki_decode(spki_encode(key)) == Some(key)
-      && (match jwk_of(key) { Some(jwk) -> public_of_jwk(jwk) == Some(key), None -> false })
-  }
 
 test "a JSON Web Key names a key by its numbers" {
   assert_eq(

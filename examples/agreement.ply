@@ -1,8 +1,10 @@
-//! The agreement claim: for any generated operation sequence, `std.db`'s in-memory twin and postgres
-//! produce the same answers.
+//! The agreement claim: for any run of operations, `std.db`'s in-memory twin and postgres produce
+//! the same answers. `main` checks it over drawn runs against whatever database the run is lent.
 import std.db
+import std.gen
 import std.sql
 import std.db (db)
+import std.gen (Gen)
 
 // --- The fixture ------------------------------------------------------------
 
@@ -296,7 +298,7 @@ pub fn replay_live(
 
 /// The live side starts where `db::open(fixture())` starts, and it has to be said out loud because
 /// the database design does not say it: `replay_memory` builds a fresh `MemDb` per case and postgres does
-/// not forget between them, so without this the law is refuted at the second case by rows the first
+/// not forget between them, so without this the claim fails at the second case by rows the first
 /// one committed — a divergence that is an artefact of the harness rather than a defect in either
 /// side.
 fn reset_live() -> Unit / {db.write[part], db.write[bin]} = {
@@ -380,31 +382,115 @@ fn datum_agrees(a: sql::Datum, b: sql::Datum) -> Bool =
     _ -> a == b,
   }
 
+// --- What is drawn ----------------------------------------------------------
+
+/// A column of either table beside a value its type takes.
+type Held = { table: Which, column: Col, value: Val }
+
+fn texts() -> Gen<String> = gen::elements(["a", "B", "b", ""])
+
+fn counts() -> Gen<Int> = gen::int_between(-2, 9)
+
+/// A negative price is refused by the table's check, and both sides have to say so.
+fn prices() -> Gen<Decimal> = gen::elements([0m, 1m, 1.5m, 2.2500m, -1m])
+
+fn held() -> Gen<Held> = {
+  let at = |table: Which, column: Col, values: Gen<Val>|
+    gen::map(gen::one_of([values, gen::constant(VNull)]), |v: Val|
+      { table: table, column: column, value: v });
+  let text = gen::map(texts(), |s: String| VText(s));
+  let int = gen::map(counts(), |n: Int| VInt(n));
+  let num = gen::map(prices(), |d: Decimal| VNum(d));
+  gen::one_of([
+    at(Part, CSku, text),
+    at(Part, CPrice, num),
+    at(Part, CTag, text),
+    at(Part, CN, int),
+    at(Bin, CId, int),
+    at(Bin, CSku, text),
+    at(Bin, CQty, int),
+  ])
+}
+
+fn ops() -> Gen<Op> =
+  gen::one_of([
+    gen::map4(
+      texts(),
+      prices(),
+      gen::option_of(texts()),
+      gen::option_of(counts()),
+      |sku: String, price: Decimal, tag: Option<String>, n: Option<Int>|
+        Insert(PartVals(sku, price, tag, n)),
+    ),
+    gen::map3(
+      counts(),
+      gen::option_of(texts()),
+      gen::option_of(counts()),
+      |id: Int, sku: Option<String>, qty: Option<Int>| Insert(BinVals(id, sku, qty)),
+    ),
+    gen::map2(held(), held(), |set: Held, at: Held|
+      Update({
+        table: set.table,
+        column: set.column,
+        to: set.value,
+        where_col: at.column,
+        eq: at.value,
+      })),
+    gen::map(held(), |at: Held| Delete({ table: at.table, where_col: at.column, eq: at.value })),
+    gen::map2(held(), gen::int_between(0, 5), |by: Held, limit: Int|
+      Select({ table: by.table, order_by: by.column, limit: limit })),
+    gen::map(gen::elements([Part, Bin]), |w: Which| Count(w)),
+    gen::map(
+      gen::elements([db::ReadCommitted, db::RepeatableRead, db::Serializable]),
+      |level: db::Isolation| Begin(level),
+    ),
+    gen::constant(Commit),
+    gen::constant(Abort),
+  ])
+
+/// `ops` with each `Commit` and `Abort` that closes nothing dropped, and what is left open
+/// committed.
+fn closed(ops: List<Op>) -> List<Op> = {
+  let walked = fold(ops, { depth: 0, out: [] }, |acc: { depth: Int, out: List<Op> }, o: Op|
+    match o {
+      Begin(_) -> if acc.depth < db::max_savepoints() {
+        { depth: acc.depth + 1, out: push(acc.out, o) }
+      } else { acc },
+      Commit -> if acc.depth > 0 { { depth: acc.depth - 1, out: push(acc.out, o) } } else { acc },
+      Abort -> if acc.depth > 0 { { depth: acc.depth - 1, out: push(acc.out, o) } } else { acc },
+      _ -> { ..acc, out: push(acc.out, o) },
+    });
+  fold(range(0, walked.depth), walked.out, |out: List<Op>, _i: Int| push(out, Commit))
+}
+
+/// Runs the claim has an opinion about: every operation typed, and every transaction closed.
+pub fn runs() -> Gen<List<Op>> =
+  gen::map(gen::list_of(ops(), 12), |drawn: List<Op>|
+    closed(filter(drawn, |o: Op| typed(fixture(), o))))
+
 // --- The claim --------------------------------------------------------------
-law/host "the memory engine agrees with postgres"
-  forall (ops: List<Op>) where well_formed(fixture(), ops) {
-    agree(replay_memory(fixture(), ops), replay_live(ops))
-  }
 
-// --- What the hermetic run can claim ----------------------------------------
+/// The claim, which only a run lent a database can check: over drawn runs the twin answers what
+/// the database does. It raises at the least run the two differ on.
+pub fn main() -> Unit / {db.write, db.read[part], db.write[part], db.read[bin], db.write[bin], abort.raise} =
+  gen::check(runs(), |ops: List<Op>| agree(replay_memory(fixture(), ops), replay_live(ops)))
 
-law "a replay answers exactly once per operation"
-  forall (ops: List<Op>) where well_formed(fixture(), ops) {
-    len(replay_memory(fixture(), ops)) == len(ops)
-  }
+// --- What a hermetic run can check ------------------------------------------
 
-law "a replay is a function of its operations"
-  forall (ops: List<Op>) where well_formed(fixture(), ops) {
-    agree(replay_memory(fixture(), ops), replay_memory(fixture(), ops))
-  }
+test "every drawn run is one the claim has an opinion about" {
+  gen::check(runs(), |ops: List<Op>| well_formed(fixture(), ops))
+}
 
-law "agreement is reflexive, which is the weakest thing that must hold"
-  forall (ops: List<Op>) where well_formed(fixture(), ops) {
-    match first_difference(replay_memory(fixture(), ops), replay_memory(fixture(), ops), 0) {
-      None -> true,
-      Some(_) -> false,
-    }
-  }
+test "a replay answers exactly once per operation" {
+  gen::check(runs(), |ops: List<Op>| len(replay_memory(fixture(), ops)) == len(ops))
+}
+
+test "agreement is reflexive, which is the weakest thing that must hold" {
+  gen::check(runs(), |ops: List<Op>| {
+    let answers = replay_memory(fixture(), ops);
+    agree(answers, answers) && first_difference(answers, answers, 0) == None
+  })
+}
 
 // --- Recorded transcripts ---------------------------------------------------
 
@@ -594,9 +680,9 @@ test "a numeric compares by its digits, because that is what its scale means" {
   )
 }
 
-// The domain the law is actually quantified over, which is the number the database design's argument
-// turns on: "the agreement law passes" is a statement about the generator's reach and nothing else.
-test "the domain the law quantifies over contains statements" {
+// The domain the claim ranges over, which is the number the database design's argument turns on:
+// "the twin agrees" is a statement about the reach of the runs drawn and nothing else.
+test "the domain the claim ranges over contains statements" {
   assert(well_formed(fixture(), [Insert(PartVals("a", 1m, Some("t"), Some(1)))]));
   assert(well_formed(fixture(), [Insert(BinVals(1, Some("a"), Some(2)))]));
   assert(

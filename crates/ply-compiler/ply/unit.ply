@@ -5,7 +5,8 @@
 import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
-             tables_bin, emit_roots_answer, symbol_of, entry_of, no_tables, without, literal_bits)
+             tables_bin, emit_roots_answer, symbol_of, entry_of, no_tables, without, literal_bits,
+             specialisation_of, own_definition, digits)
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow, analyse, dump_of,
               module_of_root)
 import diagnostics (parse_all)
@@ -526,9 +527,6 @@ pub fn bucket_of(name: Bytes) -> Int = root_id(name) >>> 57
 fn bucket_mark(id: Int) -> Bytes / {abort.raise} =
   bytes_concat_all([b"/* --- bucket ", hex_digit(id / 16), hex_digit(id % 16), b" --- */"])
 
-fn digits_of(b: Bytes) -> Int =
-  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int| acc * 10 + bytes_at(b, i) - 48)
-
 /// A placeholder in a body's C, `@@kN@@`: where it opens and closes, its kind byte, and what
 /// follows the kind.
 type Hole = { open: Int, close: Int, kind: Int, digits: Bytes }
@@ -557,7 +555,7 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
 fn hole_key(h: Hole, tables: Tables, lines: List<Bytes>) -> Option<Bytes> / {abort.raise} =
   if h.kind == 84 { Some(bytes_concat(b"T", h.digits)) }
   else if h.kind == 114 { None } else {
-    let i = digits_of(h.digits);
+    let i = digits(h.digits);
     if h.kind == 99 { Some(bytes_concat(b"c", at(lines, i))) }
     else if h.kind == 98 { Some(bytes_concat(b"b", at(tables.builtins, i))) }
     else if h.kind == 102 { Some(bytes_concat(b"f", at(tables.fields, i))) }
@@ -600,8 +598,8 @@ fn resolved(
       let h = at(hs, i);
       let value = match at(keys, i) {
         None ->
-          ascii_of_int(if bytes_len(h.digits) == 0 { root_id(name) }
-          else { root_id(at(tables.members, digits_of(h.digits))) }),
+          ascii_of_int(if bytes_len(h.digits) == 0 { root_id(own_definition(name)) }
+          else { root_id(at(tables.members, digits(h.digits))) }),
         Some(k) -> bytes_concat_all([table, b"[", ascii_of_int(place(local, k)), b"]"]),
       };
       { from: h.close + 2, out: push(push(s.out, bytes_slice(text, s.from, h.open)), value) }
@@ -1105,7 +1103,18 @@ fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
 /// what its module embeds, which that text's calls are written out as. `None` for a root with no key
 /// or no place, which is asked again every time.
-fn root_material(program: Program, name: Bytes) -> Option<Bytes> =
+/// What a root's answer is a function of: its definition's text, key and embeds, and for a
+/// specialisation the kinds it is at, which its name spells.
+fn root_material(program: Program, name: Bytes) -> Option<Bytes> / {abort.raise} =
+  match specialisation_of(name) {
+    Some(s) -> match definition_material(program, s.base) {
+      Some(m) -> Some(bytes_concat_all([m, b"\x00", name])),
+      None -> None,
+    },
+    None -> definition_material(program, name),
+  }
+
+fn definition_material(program: Program, name: Bytes) -> Option<Bytes> =
   match map_get(program.keys, name) {
     None -> None,
     Some(key) -> match map_get(program.roots, name) {
@@ -1501,7 +1510,6 @@ pub fn emitted<| e>(
   let values = fold(baked, map_new(), |acc: Map<Bytes, Baked>, b: Baked|
     if map_contains(wanted, b.name) { map_insert(acc, b.name, b) } else { acc });
   let offered = filter(every, |n: Bytes| !map_contains(values, n) && stored_of(n) == None);
-  let asked = fold(offered, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
   // No constructor table: a body names each tag by its constructor, which its key's read
   // declarations already cover, so one answer serves every program that holds the root.
   let common = [
@@ -1510,29 +1518,84 @@ pub fn emitted<| e>(
     runtime.identity,
     emitter,
   ];
+  match answered_round(runtime, dump, p, ctors, common, offered, read, write) {
+    Err(why) -> Err(why),
+    Ok(first) -> match closed_rounds(runtime, dump, p, ctors, common, read, write, first, 64) {
+      Err(why) -> Err(why),
+      Ok(all) -> {
+        let held = map_fold(values, all.answers, |acc: Map<Bytes, Answer>, n: Bytes, b: Baked|
+          map_insert(acc, n, baked_body(b)));
+        Ok({
+          produced: produce(
+            runtime,
+            ctors,
+            map(concat(every, all.added), |n: Bytes|
+              match map_get(p.roots, own_definition(n)) {
+                Some(r) ->
+                  {
+                    name: n,
+                    arity: r.arity,
+                    constant: r.pure && r.arity == 0 && specialisation_of(n) == None,
+                  },
+                None -> { name: n, arity: 0, constant: false },
+              }),
+            len(p.modules),
+            fold(every, held, |acc: Map<Bytes, Answer>, n: Bytes|
+              match stored_of(n) {
+                Some(of) -> map_insert(acc, n, stored_body(n, of)),
+                None -> acc,
+              }),
+            fold(dump.emitter_ctors, [], |acc: List<Stated>, c: EmitterCtor|
+              if c.key == None && c.show == None && len(c.numeric) == 0 { acc }
+              else { push(acc, { ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
+          ),
+          kept: all.kept,
+          asked: all.asked,
+        })
+      },
+    },
+  }
+}
+
+/// The answers to `names`, and how many came from what an earlier run kept and how many were asked
+/// of the emitter: each kept answer read where it stands, the emitter entered once for the rest, and
+/// what it answered kept for the next run.
+type Answered = { answers: Map<Bytes, Answer>, kept: Int, asked: Int, added: List<Bytes> }
+
+fn answered_round<| e>(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  common: List<Bytes>,
+  names: List<Bytes>,
+  read: (Bytes) -> Option<Bytes> / e,
+  write: (Bytes, Bytes) -> Unit / e,
+) -> Result<Answered, Bytes> / {abort.raise | e} = {
+  let asked = fold(names, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
   let body_key = |m: Bytes| kept_key(concat(common, [b"body", m]));
-  let materials = fold(offered, map_new(), |acc: Map<Bytes, Bytes>, n: Bytes|
+  let materials = fold(names, map_new(), |acc: Map<Bytes, Bytes>, n: Bytes|
     match root_material(p, n) { Some(m) -> map_insert(acc, n, m), None -> acc });
   let buckets = bucketed(map_keys(materials));
-  let pack_key = |names: List<Bytes>|
+  let pack_key = |ns: List<Bytes>|
     kept_key(
       concat(
         concat(common, [b"pack", hex(bin::shape_digest(pack_bin()))]),
-        map(names, |n: Bytes| match map_get(materials, n) { Some(m) -> m, None -> b"" }),
+        map(ns, |n: Bytes| match map_get(materials, n) { Some(m) -> m, None -> b"" }),
       ),
     );
   let packs = map_fold(
     buckets,
     map_new(),
-    |acc: Map<Int, Map<Bytes, Answer>>, b: Int, names: List<Bytes>|
-      match unpacked(p.keys, read(pack_key(names))) {
+    |acc: Map<Int, Map<Bytes, Answer>>, b: Int, ns: List<Bytes>|
+      match unpacked(p.keys, read(pack_key(ns))) {
         Some(found) -> map_insert(acc, b, found),
         None -> acc,
       },
   );
   let looked = looked_up(materials, packs, |m: Bytes| decoded(p.keys, read(body_key(m))));
   let kept = standing(looked, asked);
-  let missed = filter(offered, |n: Bytes| !map_contains(kept, n));
+  let missed = filter(names, |n: Bytes| !map_contains(kept, n));
   let fresh = if len(missed) == 0 { [] } else {
     let pieces = dealt(p, missed);
     answers_at_once(runtime, dump, p, ctors, pieces, 0, len(pieces), 64)
@@ -1558,29 +1621,63 @@ pub fn emitted<| e>(
       });
     fold(repacked(p.keys, buckets, packs, looked, answered), (), |_: Unit, r: Repack|
       write(pack_key(r.names), bin::encode(r.pack, pack_bin())));
-    let lowered = map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
-      map_insert(acc, n, a));
-    let held = map_fold(values, lowered, |acc: Map<Bytes, Answer>, n: Bytes, b: Baked|
-      map_insert(acc, n, baked_body(b)));
     Ok({
-      produced: produce(
-        runtime,
-        ctors,
-        map(every, |n: Bytes|
-          match map_get(p.roots, n) {
-            Some(r) -> { name: n, arity: r.arity, constant: r.pure && r.arity == 0 },
-            None -> { name: n, arity: 0, constant: false },
-          }),
-        len(p.modules),
-        fold(every, held, |acc: Map<Bytes, Answer>, n: Bytes|
-          match stored_of(n) { Some(of) -> map_insert(acc, n, stored_body(n, of)), None -> acc }),
-        fold(dump.emitter_ctors, [], |acc: List<Stated>, c: EmitterCtor|
-          if c.key == None && c.show == None && len(c.numeric) == 0 { acc }
-          else { push(acc, { ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
-      ),
+      answers: map_fold(answered, kept, |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
+        map_insert(acc, n, a)),
       kept: map_len(kept),
       asked: len(missed),
+      added: [],
     })
+  }
+}
+
+/// `had` with each specialisation a body of it calls answered too, round after round until no body
+/// calls one it lacks; `room` is the rounds left.
+fn closed_rounds<| e>(
+  runtime: Runtime,
+  dump: Dump,
+  p: Program,
+  ctors: List<Ctor>,
+  common: List<Bytes>,
+  read: (Bytes) -> Option<Bytes> / e,
+  write: (Bytes, Bytes) -> Unit / e,
+  had: Answered,
+  room: Int,
+) -> Result<Answered, Bytes> / {abort.raise | e} = {
+  let more = map_fold(had.answers, map_new(), |acc: Map<Bytes, Bool>, _: Bytes, a: Answer|
+    match a {
+      Body(b) ->
+        fold(b.tables.calls, acc, |m: Map<Bytes, Bool>, c: Bytes|
+          if specialisation_of(c) != None && !map_contains(had.answers, c) {
+            map_insert(m, c, true)
+          } else { m }),
+      Refused(_) -> acc,
+    });
+  if map_len(more) == 0 || room <= 0 { Ok(had) } else {
+    match answered_round(runtime, dump, p, ctors, common, map_keys(more), read, write) {
+      Err(why) -> Err(why),
+      Ok(r) ->
+        closed_rounds(
+          runtime,
+          dump,
+          p,
+          ctors,
+          common,
+          read,
+          write,
+          {
+            answers: map_fold(
+              r.answers,
+              had.answers,
+              |acc: Map<Bytes, Answer>, n: Bytes, a: Answer| map_insert(acc, n, a),
+            ),
+            kept: had.kept + r.kept,
+            asked: had.asked + r.asked,
+            added: concat(had.added, map_keys(more)),
+          },
+          room - 1,
+        ),
+    }
   }
 }
 
