@@ -165,7 +165,7 @@ declare -a PROBE_JOBS=(
 # `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
 # of its own run is never a cache, which the repository's other runs evict while those jobs wait for
 # runners: it is an artifact (`cache-keys` refuses a key that names the run and no later run reads).
-SUPERSEDED=(ply-upstream- ply-stores- ply-c-macos-)
+SUPERSEDED=(ply-upstream- ply-stores-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
