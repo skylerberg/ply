@@ -3,7 +3,7 @@
 //! the unit holds and never of the order its definitions were taken in.
 
 use super::encoding::encode_const;
-use crate::heap::Layouts;
+use crate::heap::{Layouts, RecordLayout};
 use ply_eval::{Builtin, Symbol, Value};
 use std::collections::HashMap;
 
@@ -67,9 +67,9 @@ impl UnitTables {
         builtins: Vec<Builtin>,
         shapes: Vec<Vec<Symbol>>,
         lambdas: Vec<String>,
-        in_place: bool,
+        layout: RecordLayout,
     ) -> Option<UnitTables> {
-        let layouts = Layouts::of(ctors, &shapes, in_place);
+        let layouts = Layouts::of(ctors, &shapes, layout);
         let placed = layouts.shape_count() >= shapes.len()
             && shapes
                 .iter()

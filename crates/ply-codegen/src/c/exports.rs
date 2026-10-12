@@ -5,6 +5,7 @@ use super::encoding::{count, decode_tables, encode_tables, line};
 use super::load::Library;
 use super::prelude::helpers;
 use super::tables::Defined;
+use crate::heap::RecordLayout;
 use anyhow::{Result, anyhow};
 use ply_eval::{Symbol, Value};
 
@@ -88,13 +89,18 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// Whether the unit's C holds a record of a record type in place, as [`IN_PLACE`] says.
-    pub in_place: bool,
+    /// How the unit's C reads a record, as its [`IN_PLACE`] and [`RAW_WIDTHS`] lines say.
+    pub layout: RecordLayout,
 }
 
-/// The last line of a unit whose C holds a record of a record type in place. A unit without it was
-/// emitted by a `ply` that holds every record by its word, as a bootstrap's first builder is.
+/// A line after a unit's tables, where its C holds a record of a record type in place. A unit
+/// without it was emitted by a `ply` that holds every record by its word, as a bootstrap's first
+/// builder is.
 pub const IN_PLACE: &str = "records held in place";
+
+/// A line after a unit's tables, where its C holds a 64-bit width as its bits wherever a record
+/// holds one; a unit without it holds the width's word there.
+pub const RAW_WIDTHS: &str = "widths held raw";
 
 impl Exports {
     pub fn names(&self) -> Vec<String> {
@@ -192,8 +198,11 @@ impl Exports {
                 out.push('\n');
             }
         }
-        if self.in_place {
+        if self.layout.in_place {
             out.push_str(&format!("{IN_PLACE}\n"));
+        }
+        if self.layout.raw_widths {
+            out.push_str(&format!("{RAW_WIDTHS}\n"));
         }
         out
     }
@@ -290,7 +299,19 @@ impl Exports {
                 numerics.push((ctor, <[String; 5]>::try_from(rest).ok()?));
             }
         }
-        let in_place = at < s.len() && line(s, &mut at)? == IN_PLACE;
+        // What layout its C reads, a line each, in any order; one this runtime does not know reads
+        // as nothing.
+        let mut layout = RecordLayout {
+            in_place: false,
+            raw_widths: false,
+        };
+        while at < s.len() {
+            match line(s, &mut at)? {
+                IN_PLACE => layout.in_place = true,
+                RAW_WIDTHS => layout.raw_widths = true,
+                _ => {}
+            }
+        }
         Some(Exports {
             helpers,
             ctors,
@@ -306,7 +327,7 @@ impl Exports {
             buckets,
             instances,
             numerics,
-            in_place,
+            layout,
         })
     }
 

@@ -187,7 +187,7 @@ impl Tables {
                         heap::Slot::Record(_) => {
                             Some((unsafe { heap::words(o).add(*at) } as Word, part))
                         }
-                        heap::Slot::Float => None,
+                        heap::Slot::Float | heap::Slot::Wide(_) => None,
                     })
                     .collect()
             }
@@ -1443,6 +1443,42 @@ pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i6
         Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&vals[1]) => raise_error(ctx, d),
         Err(d) => ctx.fail(d),
     }
+}
+
+/// `rt_binary` over two 64-bit widths' bits, the width at `t` in [`ply_eval::INT_TYPES`]: the
+/// answer's bits, or a `Bool`'s 1 or 0, raised as the evaluator raises.
+pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, b: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (Some(op), Some(ty)) = (
+        usize::try_from(op)
+            .ok()
+            .and_then(|i| BINOPS.get(i).copied()),
+        usize::try_from(t)
+            .ok()
+            .and_then(|i| ply_eval::INT_TYPES.get(i).copied()),
+    ) else {
+        return ctx.fail(error("an operator this runtime has no code for"));
+    };
+    let of = |w: i64| Value::Fixed(ply_eval::Fixed::new(ty, w as u64 as u128));
+    let (x, y) = (of(a), of(b));
+    match ply_eval::strict_binary(op, &x, &y, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
+        Ok(Value::Fixed(f)) => f.bits() as u64 as i64,
+        Ok(Value::Bool(b)) => i64::from(b),
+        Ok(other) => ctx.fail(error(format!(
+            "a width's operator answered {}",
+            other.type_name()
+        ))),
+        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&y) => raise_error(ctx, d),
+        Err(d) => ctx.fail(d),
+    }
+}
+
+/// The object of a 64-bit width, the width at `t` in [`ply_eval::INT_TYPES`], holding `bits`.
+pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let ty = ply_eval::INT_TYPES[t as usize];
+    ctx.heap
+        .boxed_fixed(ply_eval::Fixed::new(ty, bits as u64 as u128))
 }
 
 /// A divisor `/` and `%` raise on rather than overflow.

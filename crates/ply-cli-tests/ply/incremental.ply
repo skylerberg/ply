@@ -121,6 +121,28 @@ fn ran_at(dir: String) -> Map<String, Int> / {Reached, Shipped, abort.raise, div
 
 fn ran_of(runs: Map<String, Int>, query: String) -> Int = map::get_or(runs, query, 0)
 
+/// A module of `n` definitions, each calling the one before it: what it answers is longer than a
+/// record holds inside it.
+fn chained(n: Int) -> String =
+  fold(range(1, n), "pub fn f0() -> Int = 0\n", |text: String, i: Int|
+    text ++ "pub fn f" ++ int_to_string(i) ++ "() -> Int = f" ++ int_to_string(i - 1) ++ "() + 1\n")
+
+test "a check after a compaction, and one after an edit, runs no answer the store holds again" {
+  scratch(|| {
+    project([{ path: "long.ply", text: chained(120) }, { path: "leaf.ply", text: leaf() }]);
+    assert(ran_of(ran(), "group") > 0, Some("a cold store checks"));
+    let all = |runs: Map<String, Int>| map_fold(runs, 0, |n: Int, _: String, k: Int| n + k);
+    assert_eq(all(ran()), 0);
+    let r = on_disk(["cache", "compact"]);
+    assert(r.code == 0, Some(said(r)));
+    assert_eq(all(ran()), 0);
+    // An edit's run writes the store's segments again as one, being as much as what it found.
+    edit("leaf.ply", "one() + one()", "one() + one() + 0");
+    assert(ran_of(ran(), "group") > 0, Some("the edited group is checked"));
+    assert_eq(all(ran()), 0)
+  })
+}
+
 // A group is checked against the entries it names, so an edit that leaves a definition's entry as it
 // was checks that definition's group and no other; one that moves the entry checks every group that
 // names it, here `total` in `shop` and the test in `core` that calls `price`.
@@ -554,57 +576,46 @@ test "two definitions that share a hash each keep their own interface" {
   })
 }
 
-/// Each record the memo store here keeps, rewritten as `f` makes it of what it held.
-fn records_rewritten(f: (Bytes) -> Bytes / {abort.raise}) -> Unit / {Here, abort.raise} = {
-  let dir = ".ply-cache/memo/records";
-  match fs.list_dir[cwd](dir) {
-    None -> panic("the run kept no records"),
-    Some(names) ->
-      fold(names, (), |u: Unit, name: String| {
-        let path = dir ++ "/" ++ name;
-        let bytes = match fs.read_file[cwd](path) { Some(b) -> b, None -> b"" };
-        assert(fs.write_file[cwd](path, f(bytes)), Some("a record is written"))
-      }),
-  }
+/// Each segment the memo store here keeps, rewritten as `f` makes it of what it held.
+fn segments_rewritten(f: (Bytes) -> Bytes / {abort.raise}) -> Unit / {Here, abort.raise} = {
+  let dir = ".ply-cache/memo";
+  let names = filter(
+    match fs.list_dir[cwd](dir) { Some(names) -> names, None -> [] },
+    |name: String| string_starts_with(name, "seg-"),
+  );
+  if len(names) == 0 { panic("the run kept no segment") };
+  fold(names, (), |u: Unit, name: String| {
+    let path = dir ++ "/" ++ name;
+    let bytes = match fs.read_file[cwd](path) { Some(b) -> b, None -> b"" };
+    assert(fs.write_file[cwd](path, f(bytes)), Some("a segment is written"))
+  })
 }
 
 test "a memo store whose records do not read degrades to a cold check and is repaired" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
-    records_rewritten(|_: Bytes| b"not a record at all");
+    segments_rewritten(|_: Bytes| b"not a segment at all");
     assert(seeding().taken == 0, Some("nothing is taken from a record that did not read"));
     let _ = warm_agrees("after the records were rewritten");
     assert(seeding().checked == 0, Some("the run that met the damage kept its records again"))
   })
 }
 
-// Mangled in the payload rather than replaced: a record that still decodes is held to the reads it
-// names, and one that does not is no record.
+// Mangled past its first bytes rather than replaced: a segment whose rows do not match their
+// checksum is no segment.
 test "a cache mangled mid-session degrades and recovers" {
   scratch(|| {
     corpus();
     let _ = warm_agrees("cold");
     edit("leaf.ply", "pub fn one() -> Int = 1", "pub fn one() -> Int = 2");
     let _ = warm_agrees("edited");
-    records_rewritten(|bytes: Bytes|
+    segments_rewritten(|bytes: Bytes|
       bytes_concat_all(
         map(range(0, bytes_len(bytes)), |i: Int|
           byte_of_int(if i < 8 { bytes_at(bytes, i) } else { bytes_at(bytes, i) ^ 90 })),
       ));
     let _ = warm_agrees("the cache was mangled");
-    let _ = warm_agrees("and the run after that");
-    ()
-  })
-}
-
-// The shape a half-finished compaction would leave: records whose answers are gone.
-test "records without their answers are answered again rather than believed" {
-  scratch(|| {
-    corpus();
-    let _ = warm_agrees("cold");
-    assert(fs.remove_tree[cwd](".ply-cache/memo/outputs"), Some("the answers are removed"));
-    let _ = warm_agrees("records with no answers behind them");
     let _ = warm_agrees("and the run after that");
     ()
   })

@@ -64,7 +64,14 @@ index (`store.idx`) — and the git dependencies that were fetched;
 not reach the network carries. It is safe to delete (`ply cache clear` discards
 the store and the memo store); add it to `.gitignore`. A run that files
 into the store compacts it, as `ply cache compact` does, once more than half of
-`store.dat` holds entries a later filing replaced or dropped.
+`store.dat` holds entries a later filing replaced or dropped. The memo store is
+one small manifest and a handful of segment files: a run writes what it kept as
+one segment, which the manifest names when the run ends, so a later run sees all
+of it or none, and a run that dies or races another costs a later one checking
+what it takes, never a wrong answer. A run that names a segment writes the
+newest again as one while each is at most twice what follows it; writing all of
+them again keeps the records of the `ply` that writes and, of other `ply`s', the
+most lately used, up to twice as much again.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
@@ -100,7 +107,12 @@ something the edit changed: a body edit that leaves its definition's signature,
 row and counts as they were checks nothing else again. A module the store holds
 no group of is checked whole once, and each of its groups takes what that check
 says of it. A record is filed under the hash of the query's definition and the
-evaluator that ran it, so a `ply` that answers otherwise answers afresh. A shipped module (§13) answers
+evaluator that ran it, so a `ply` that answers otherwise answers afresh. The
+store vouches for a record only to a `ply` whose queries hash as those of the
+one that kept or checked it: another holds each read the record made to what it
+answers now before taking it, and notes that it did, so a `ply` that changed
+writes no mark on what an earlier one kept, and two taking turns over one cache
+each keep what they checked. A shipped module (§13) answers
 alike in every project, so the binary carries what each answers, which `cargo
 pack` writes with `ply std --answers` and every load reads beside its own store.
 
@@ -3035,7 +3047,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer and its own front end; the builder and the pack are taken from the toolchain's cache where an earlier bootstrap kept them; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
-| `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records no run of this `ply` can ask for again (those of queries it no longer has, of another `ply`'s commands, or kept under another layout's names), then the answers, notes, reader links and marks no record left reaches, and the store's definitions no pass record reaches |
+| `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store written again as one segment that keeps the records of this `ply`'s queries and the answers of its own commands, with the answers and reader links those records reach, and the store's definitions no pass record reaches |
 | `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
