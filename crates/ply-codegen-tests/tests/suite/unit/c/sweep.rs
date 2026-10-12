@@ -68,6 +68,17 @@ fn an_object_is_as_removable_as_an_answer() {
     assert_eq!(present(dir.path(), &names), vec!["bodies/new".to_string()]);
 }
 
+/// A run about to open the unit it just linked finds it, however far the cache is over its budget.
+#[test]
+fn an_entry_of_the_last_hour_is_never_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let names = ["bodies/old", "obj/older.o"];
+    stock(dir.path(), &names, 100);
+    std::fs::write(dir.path().join("linked.so"), vec![b'x'; 100]).unwrap();
+    assert_eq!(sweep(dir.path(), 0), 200);
+    assert!(dir.path().join("linked.so").exists());
+}
+
 /// An object every run loads was written once, long ago: its use, not its writing, is its age.
 #[test]
 fn an_object_used_lately_outlives_one_written_later() {
