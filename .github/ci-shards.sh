@@ -28,13 +28,10 @@
 #   ci-shards.sh timings BEFORE  the table the next run is cut by, from this
 #                                run's rows on stdin and the table BEFORE
 #   ci-shards.sh corpus-matrix   the JSON matrix of the corpus runs that get
-#                                runners of their own: the desk runners, then
-#                                each run alone
+#                                runners of their own
 #   ci-shards.sh corpus-for-partition K [DIR]
 #                                `lane entry` per corpus run partition K takes,
 #                                from the cut in DIR, or round robin without one
-#   ci-shards.sh desks-for-runner K [DIR]
-#                                the desk runs runner K takes, likewise
 #   ci-shards.sh corpus-line ID...
 #                                the package each run tests, its filter and its
 #                                part, tab-separated, a line a run
@@ -85,10 +82,6 @@ CORPUS_CHECKS=crates/ply-corpus/checks
 CORPUS_STDLIB=crates/ply-corpus/stdlib
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
-# The checks that start desks under load and drive them over postgres: a test at a time, cut by
-# duration over `DESK_RUNNERS` runners beside a postgres each, the `corpus` job's `desks-<k>`.
-CORPUS_DESKS=(serving database)
-DESK_RUNNERS=3
 # Runs that take a runner each: the compiler's own tests, compiled, take every core, the reach audit
 # checks three whole packages cold and the copies audit lists ten, and every proof run is one load of
 # what it proves. Each package's `laws-<id>` run is alone too (`alone_entries`).
@@ -256,7 +249,7 @@ corpus_entries() {
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
-  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}" "${CORPUS_DESKS[@]}"
+  module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
 }
 
@@ -380,19 +373,9 @@ corpus_alone() {
   [[ $1 == laws-* ]] && proofs_path "${1#laws-}" > /dev/null
 }
 
-# Whether the entry is a test of a module whose checks start desks.
-corpus_desk() {
-  named_in "${1%%:*}" "${CORPUS_DESKS[@]}"
-}
-
 cmd_corpus_matrix() {
-  local id k first=1
+  local id first=1
   printf '{"include":['
-  for ((k = 1; k <= DESK_RUNNERS; k++)); do
-    ((first)) || printf ','
-    first=0
-    printf '{"id":"desks-%d"}' "$k"
-  done
   while read -r id; do
     ((first)) || printf ','
     first=0
@@ -401,19 +384,11 @@ cmd_corpus_matrix() {
   printf ']}\n'
 }
 
-# Every entry the partitions take: neither alone nor a desk run.
+# Every entry the partitions take: each that does not run alone.
 corpus_placed() {
   local id
   while read -r id; do
-    corpus_alone "$id" || corpus_desk "$id" || printf '%s\n' "$id"
-  done < <(corpus_entries)
-}
-
-# Every entry the desk runners take.
-desk_placed() {
-  local id
-  while read -r id; do
-    if corpus_desk "$id"; then printf '%s\n' "$id"; fi
+    corpus_alone "$id" || printf '%s\n' "$id"
   done < <(corpus_entries)
 }
 
@@ -468,13 +443,13 @@ run_limit() {
   [[ -z $minutes ]] || printf '%d\n' $((minutes * 60000 / 3))
 }
 
-# `run seconds` per run the job running COMMAND takes, the partitions' as the rows in TABLE part them,
-# that TABLE measured over the job's limit.
+# `run seconds` per run the partitions take, as the rows in TABLE part them, that TABLE measured over
+# the limit of the job running COMMAND.
 overlong() {
   local table=$1 command=$2 limit
   limit=$(run_limit "$command")
   [[ -n $limit ]] || return 0
-  if [[ $command == *partition ]]; then corpus_parted "$table" "$limit"; else desk_placed; fi |
+  corpus_parted "$table" "$limit" |
     awk -v rows="$table" -v limit="$limit" '
       BEGIN {
         while ((getline line < rows) > 0) {
@@ -492,20 +467,6 @@ unparted() {
     *#*) printf 'a part takes the tests whose keys hash to it, and one of these, or the few it took, outlast the limit: place its module a test at a time (CORPUS_BY_TEST, CLI_BY_TEST), or split the longest test\n' ;;
     *) printf 'a single test has no parts: split it into tests\n' ;;
   esac
-}
-
-# The desk runs runner K takes, one a line: the plan's cut when DIR holds one, else round robin.
-cmd_desks_for_runner() {
-  local k=$1 dir=${2:-} id n=0
-  if [[ -n $dir ]]; then
-    [[ -f $dir/desks-$k.txt ]] || { echo "the plan's cut in $dir holds no desks-$k.txt" >&2; return 1; }
-    cat "$dir/desks-$k.txt"
-    return 0
-  fi
-  while read -r id; do
-    (((n % DESK_RUNNERS) + 1 == k)) && printf '%s\n' "$id"
-    n=$((n + 1))
-  done < <(desk_placed)
 }
 
 # `lane entry` per corpus run partition K takes: the plan's cut when DIR holds one, which it does for
@@ -767,7 +728,7 @@ living_durations() {
   }
   # A corpus row is an entry's own or a part's of it, and lives while the entry does; a startup row is
   # a package's.
-  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$({ corpus_placed; desk_placed; } | tr '\n' ' ')" '
+  dropped=$(printf '%s\n' "$built" | awk -F"$TAB" -v out="$2" -v placed="$(corpus_placed | tr '\n' ' ')" '
     BEGIN {
       n = split(placed, ids, " ")
       for (i = 1; i <= n; i++) corpus[ids[i]] = 1
@@ -784,7 +745,7 @@ living_durations() {
 }
 
 # One `shard-<i>.toml` per nextest shard: the tests it runs as its profile's `default-filter`, and
-# the order to start them in, then the corpus and desk cuts. 3 when there is nothing measured to cut,
+# the order to start them in, then the corpus cut. 3 when there is nothing measured to cut,
 # so the caller slices by count.
 shard_configs() {
   local dir=$1 timings=$2 tmp catchall first i
@@ -853,46 +814,7 @@ shard_configs() {
   ' "$tmp/assigned"
   touch "$tmp/corpus"
   corpus_cut "$dir" "$tmp/corpus"
-  desk_cut "$dir" "$tmp/corpus"
   rm -rf "$tmp"
-}
-
-# The desk runs, longest first onto the runner that would end soonest with it, as `desks-<k>.txt` of
-# an entry a line. Every runner loads the checks once, so no startup tips the choice. A run nothing
-# measured counts as the median of those that were, and is placed after them.
-desk_cut() {
-  local dir=$1 rows=$2 k
-  for ((k = 1; k <= DESK_RUNNERS; k++)); do : > "$dir/desks-$k.txt"; done
-  desk_placed | awk -v rows="$rows" -v dir="$dir" -v n="$DESK_RUNNERS" '
-    BEGIN {
-      FS = "\t"
-      while ((getline line < rows) > 0) {
-        split(line, f, "\t")
-        if (f[1] == "corpus") ms[f[2]] = f[3] + 0
-      }
-      FS = " "
-    }
-    { ids[++m] = $1 }
-    END {
-      for (i = 1; i <= m; i++) if (ids[i] in ms) { t++; order[t] = ids[i] }
-      # Longest first, ties in entry order.
-      for (i = 2; i <= t; i++) {
-        x = order[i]
-        for (j = i - 1; j >= 1 && ms[order[j]] < ms[x]; j--) order[j + 1] = order[j]
-        order[j + 1] = x
-      }
-      median = t ? ms[order[int((t + 1) / 2)]] : 60000
-      for (i = 1; i <= m; i++) if (!(ids[i] in ms)) { order[++t] = ids[i]; ms[ids[i]] = median }
-      for (i = 1; i <= t; i++) {
-        best = 1
-        for (k = 2; k <= n; k++) if (load[k] < load[best]) best = k
-        load[best] += ms[order[i]]
-        held[best]++
-        print order[i] >> (dir "/desks-" best ".txt")
-      }
-      for (k = 1; k <= n; k++) printf "desks %d: %d runs, %.1fs\n", k, held[k], load[k] / 1000
-    }
-  '
 }
 
 # The corpus runs the partitions take, as `corpus-<k>.txt` of `lane entry` lines. The tests of a module
@@ -1441,13 +1363,6 @@ check_shards() {
     echo "FAIL: the $what cut's corpus runs are not every run a partition takes, each once or as its parts" >&2
     bad=1
   fi
-  for ((i = 1; i <= DESK_RUNNERS; i++)); do
-    cmd_desks_for_runner "$i" "$dir"
-  done | LC_ALL=C sort > "$tmp/desks-cut"
-  if ! cmp -s "$tmp/desks-cut" <(desk_placed | LC_ALL=C sort); then
-    echo "FAIL: the $what cut's desk runs are not every desk run, each once" >&2
-    bad=1
-  fi
   rm -rf "$tmp"
   return "$bad"
 }
@@ -1837,16 +1752,6 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  for module in "${CORPUS_DESKS[@]}"; do
-    if ! grep -q "^$module:" <<< "$entries"; then
-      echo "FAIL: '$module' runs on the desk runners and $CORPUS_CHECKS/$module.ply declares no test" >&2
-      failures=$((failures + 1))
-    fi
-  done
-  if [[ $DESK_RUNNERS -lt 1 ]]; then
-    echo "FAIL: DESK_RUNNERS is $DESK_RUNNERS, so the desk runs run nowhere" >&2
-    failures=$((failures + 1))
-  fi
   # The ids a developer's awk derives are the ones the runner's cut and lanes use.
   if [[ $(printf 'ä — non-ascii\n' | label_ids | cut -f1) != ebwzok ]]; then
     echo "FAIL: this awk hashes a label to another id than every other awk does" >&2
@@ -1856,7 +1761,7 @@ cmd_verify() {
   # no test of another module may hold, and a test placed by name by its own, which no other test of
   # its module may hold.
   local module names keys pair outside
-  for pair in "$CORPUS_CHECKS:${CORPUS_BY_TEST[*]} ${CORPUS_DESKS[*]}" "$CLI_SUITE:${CLI_BY_TEST[*]}"; do
+  for pair in "$CORPUS_CHECKS:${CORPUS_BY_TEST[*]}" "$CLI_SUITE:${CLI_BY_TEST[*]}"; do
     dir=${pair%%:*}
     keys=$(package_keys "$dir")
     for module in $(sed 's/\..*//' <<< "$keys" | sort -u); do
@@ -1938,15 +1843,14 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
-  # Every entry is a partition's, a desk runner's or alone, once, so the round robins stay total.
+  # Every entry is a partition's or alone, once, so the round robin stays total.
   local placed k
   placed=$(
     for ((k = 1; k <= PARTITIONS; k++)); do cmd_corpus_for_partition "$k" | cut -d' ' -f2; done
-    for ((k = 1; k <= DESK_RUNNERS; k++)); do cmd_desks_for_runner "$k"; done
     alone_entries
   )
   if [[ $(sort <<< "$placed") != "$(sort <<< "$entries")" ]]; then
-    echo "FAIL: the partitions', desk runners' and lone corpus runs are not every entry, each once" >&2
+    echo "FAIL: the partitions' and the lone corpus runs are not every entry, each once" >&2
     failures=$((failures + 1))
   fi
   if ! grep -q 'ci-corpus\.sh' "$workflow"; then
@@ -1954,7 +1858,7 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh desks"; do
+  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh partition" "ci-corpus.sh run"; do
     corpus_job=$(job_running "$corpus_command")
     if [[ -z $corpus_job ]]; then
       echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its corpus runs run nowhere" >&2
@@ -1967,7 +1871,7 @@ cmd_verify() {
   # A job that starts corpus runs ends them at a deadline that leaves its steps after them
   # RUNS_MARGIN minutes of its limit: a job the limit cancels keeps nothing its runs wrote.
   local limit budget
-  for corpus_command in "ci-corpus.sh partition" "ci-corpus.sh desks"; do
+  for corpus_command in "ci-corpus.sh partition" "ci-corpus.sh run"; do
     corpus_job=$(job_running "$corpus_command")
     [[ -n $corpus_job ]] || continue
     limit=$(job_block "$corpus_job" | sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p')
@@ -1981,7 +1885,7 @@ cmd_verify() {
     fi
     # The cut parts a `ply test` the partitions take that outlasts the job's limit (`run_limit`); a run
     # it cannot part is too long for the cut to balance the lanes, and cold it can outlast one.
-    if [[ -s $TIMINGS ]]; then
+    if [[ -s $TIMINGS && $corpus_command == *partition ]]; then
       while read -r id seconds; do
         echo "FAIL: corpus run $id took ${seconds}s in the last table, over a third of job '$corpus_job''s ${budget}-minute deadline, and the cut cannot part it: $(unparted "$id")" >&2
         failures=$((failures + 1))
@@ -2038,7 +1942,6 @@ case "${1:-}" in
   timings) cmd_timings "${2:?the table this run was cut by, which need not exist}" ;;
   corpus-matrix) cmd_corpus_matrix ;;
   corpus-for-partition) cmd_corpus_for_partition "${2:?a partition}" "${3:-}" ;;
-  desks-for-runner) cmd_desks_for_runner "${2:?a desk runner}" "${3:-}" ;;
   corpus-line) cmd_corpus_line "${2:?a corpus entry}" "${@:3}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
@@ -2051,7 +1954,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   sweep-matrix) cmd_sweep_matrix "${2:?an event}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|desks-for-runner K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|fetch-timings|partitions|nextest-shards|shard-configs DIR|durations FILE|timings BEFORE|corpus-matrix|corpus-for-partition K [DIR]|corpus-line ID...|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|rust-inputs DEPINFO|supersede RUN REF}" >&2
     exit 2
     ;;
 esac
