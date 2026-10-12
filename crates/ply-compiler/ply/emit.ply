@@ -33,8 +33,9 @@ import exprs (Param, Expr, EHandle, ESimulate, EUnary, EBinary, ELambda, EApp, E
               ERecord, ERecordUpdate, ETry, ETryBlock, EField, EList, EPerform, EWithCell,
               EWithHold, HandleClause, MatchArm, RecField, Stmt, SLet, SLetElse, SExpr,
               is_arithmetic, case_at, case_identity)
-import type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
-import rewrite (expand, named_program_wide, stated_witness_name)
+import type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise, TypeExpr, TVar, TCon, TFn)
+import rewrite (expand, named_program_wide, stated_witness_name, map_expr, unwitnessed,
+                witness_param)
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.list
@@ -198,7 +199,14 @@ pub type Emitter = {
 }
 
 /// `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
-pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: Int }
+pub type Def = {
+  name: Bytes,
+  ret: Option<Kind>,
+  ret_ty: Ty,
+  pure: Bool,
+  arity: Int,
+  scheme: Option<Scheme>,
+}
 
 /// An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
 /// `whole` binds the module itself, which only a qualified name reaches: a bare `map` is never `std.map`.
@@ -5075,12 +5083,17 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 Some(w) -> {
                   let m = imp.module;
                   let callee = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
-                  let full = bytes_concat_all([m, b".", callee]);
+                  let target = call_target(
+                    w.emitter,
+                    bytes_concat_all([m, b".", callee]),
+                    def_named(imp.defs, callee),
+                    a.func.span,
+                  );
                   let o = bind(
-                    note_call(site(w.emitter, c.span), full),
+                    note_call(site(w.emitter, c.span), target.full),
                     KBoxed,
                     bytes_concat_all([
-                      symbol_of(full),
+                      symbol_of(target.full),
                       b"(ctx",
                       fold(w.names, b"", |acc: Bytes, nm: Bytes|
                         bytes_concat_all([acc, b", ", nm])),
@@ -5088,7 +5101,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                     ]),
                   );
                   // Opened to the callee's declared type when its module was resolved alongside; a word otherwise.
-                  Some(opened_to(check(o.emitter), o.value, ret_of(imp.defs, callee)))
+                  Some(opened_to(check(o.emitter), o.value, target.ret))
                 },
               },
             }
@@ -5107,23 +5120,29 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             }
           } else if emitter.tail && emitter.landing == None
               && self_tail_leaf(emitter, fv.name, a.args, params) {
-            self_tail(note_call(emitter, qualify(emitter.module, fv.name)), fv.name, a.args, params)
+            self_tail(note_call(emitter, emitter.owner), fv.name, a.args, params)
           } else {
             match args_one_pass(emitter, a.args, params, 0, []) {
               None -> None,
               Some(w) -> {
+                let target = call_target(
+                  w.emitter,
+                  qualify(emitter.module, fv.name),
+                  def_named(emitter.here, fv.name),
+                  a.func.span,
+                );
                 let o = bind(
-                  note_call(site(w.emitter, c.span), qualify(emitter.module, fv.name)),
+                  note_call(site(w.emitter, c.span), target.full),
                   KBoxed,
                   bytes_concat_all([
-                    symbol_of(qualify(emitter.module, fv.name)),
+                    symbol_of(target.full),
                     b"(ctx",
                     fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
                     b")",
                   ]),
                 );
                 // Opened to the callee's declared type here, so a body whose answer is already a word hands it straight back.
-                Some(opened_to(check(o.emitter), o.value, ret_of(emitter.here, fv.name)))
+                Some(opened_to(check(o.emitter), o.value, target.ret))
               },
             }
           }
@@ -7401,7 +7420,9 @@ fn self_tail_leaf(
   args: List<Code>,
   params: List<EmitParam>,
 ) -> Bool =
-  len(args) == len(params) && qualify(emitter.module, name) == emitter.owner
+  len(args) == len(params)
+    && (qualify(emitter.module, name) == emitter.owner
+    || bytes_starts_with(emitter.owner, bytes_concat(qualify(emitter.module, name), b"@")))
     && fold(emitter.here, false, |acc: Bool, h: Def|
       acc || (h.name == name && h.arity == len(args)))
 
@@ -7673,6 +7694,299 @@ fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
 /// The type the checker filed at `span`, as a value of it is held; a word where it filed none.
 fn typed_kind(typed: Map<Bytes, Typed>, span: Span) -> { kind: Kind, ty: Ty } =
   match map_get(typed, span_key(span)) { Some(t) -> kind_of(t.ty), None -> boxed() }
+
+// --- Specialisation ----------------------------------------------------------------------------
+// A generic definition reached with a type argument held apart from a word is emitted again for the
+// kinds its arguments are held as, under a root that spells them: the body holds its values as their
+// own and does their arithmetic with no witness.
+
+/// The root `full` is emitted under for type arguments held as `args` say.
+pub fn specialised(full: Bytes, args: List<Kind>) -> Bytes =
+  bytes_concat_all([full, b"@", bytes_join(map(args, kind_name), b",")])
+
+/// The definition and kinds of the root `specialised` named; `None` for any other root.
+pub fn specialisation_of(root: Bytes) -> Option<{ base: Bytes, args: List<Kind> }> / {abort.raise} =
+  if bytes_index_of(root, b"#") != None { None } else {
+    match bytes_index_of(root, b"@") {
+      None -> None,
+      Some(at) -> {
+        let read = map(bytes_split(bytes_slice(root, at + 1, bytes_len(root)), b","), kind_named);
+        if fold(read, false, |missing: Bool, k: Option<Kind>| missing || k == None) { None } else {
+          Some({
+            base: bytes_slice(root, 0, at),
+            args: map(read, |k: Option<Kind>| match k { Some(x) -> x, None -> KBoxed }),
+          })
+        }
+      },
+    }
+  }
+
+/// The definition a root runs: its own, or the one it specialises.
+pub fn own_definition(root: Bytes) -> Bytes / {abort.raise} =
+  match specialisation_of(root) { Some(s) -> s.base, None -> root }
+
+fn kind_name(k: Kind) -> Bytes =
+  match k {
+    KInt -> b"Int",
+    KBool -> b"Bool",
+    KFloat -> b"Float",
+    KNum(w) -> width_name(w),
+    KBoxed -> b"_",
+  }
+
+fn kind_named(name: Bytes) -> Option<Kind> =
+  if name == b"Int" { Some(KInt) }
+  else if name == b"Bool" { Some(KBool) }
+  else if name == b"Float" { Some(KFloat) }
+  else if name == b"_" { Some(KBoxed) } else {
+    match width_named(name) {
+      Some(w) -> if carried(w) { Some(KNum(w)) } else { None },
+      None -> None,
+    }
+  }
+
+fn width_name(w: Width) -> Bytes =
+  bytes_concat(if w.signed { b"I" } else { b"U" }, ascii_of_int(w.bits))
+
+/// The one type whose values are held as `k`; none for a word, which holds every other.
+fn held_as(k: Kind) -> Option<Type> =
+  match k {
+    KInt -> Some(TyCon({ name: b"Int", args: [] })),
+    KBool -> Some(TyCon({ name: b"Bool", args: [] })),
+    KFloat -> Some(TyCon({ name: b"Float", args: [] })),
+    KNum(w) -> Some(TyCon({ name: width_name(w), args: [] })),
+    KBoxed -> None,
+  }
+
+/// `ty`, in a definition's numbering, with each variable whose argument is held as one type alone
+/// read as that type.
+fn substituted(ty: Type, args: List<Kind>) -> Type =
+  match ty {
+    TyVar(v) -> match list_at(args, v) {
+      Some(k) -> match held_as(k) { Some(t) -> t, None -> ty },
+      None -> ty,
+    },
+    TyCon(c) -> TyCon({ ..c, args: map(c.args, |a: Type| substituted(a, args)) }),
+    TyFn(f) ->
+      TyFn({
+        ..f,
+        params: map(f.params, |p: Type| substituted(p, args)),
+        ret: substituted(f.ret, args),
+      }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: substituted(f.ty, args) })),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        args: map(x.args, |a: Type| substituted(a, args)),
+        fields: map(x.fields, |f: Field| { ..f, ty: substituted(f.ty, args) }),
+      }),
+  }
+
+fn digits(b: Bytes) -> Int =
+  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int| acc * 10 + bytes_at(b, i) - 48)
+
+fn def_named(defs: List<Def>, name: Bytes) -> Option<Def> =
+  fold(defs, None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc })
+
+/// The root a call of `full` through the reference at `at` reaches, and how its answer is held. A
+/// specialisation's call of itself stays in it; a generic callee whose type arguments there are
+/// held apart from a word is reached as its specialisation at them.
+fn call_target(
+  emitter: Emitter,
+  full: Bytes,
+  d: Option<Def>,
+  at: Span,
+) -> { full: Bytes, ret: { kind: Option<Kind>, ty: Ty } } / {abort.raise} = {
+  let plain = {
+    full: full,
+    ret: match d { Some(x) -> { kind: x.ret, ty: x.ret_ty }, None -> { kind: None, ty: TyOpen } },
+  };
+  match match d { Some(x) -> x.scheme, None -> None } {
+    None -> plain,
+    Some(scheme) -> if len(scheme.ty_vars) == 0 { plain } else {
+      let at_args = |root: Bytes, args: List<Kind>|
+        match scheme.ty {
+          TyFn(f) -> {
+            let k = kind_of(substituted(f.ret, args));
+            { full: root, ret: { kind: Some(k.kind), ty: k.ty } }
+          },
+          _ -> plain,
+        };
+      match specialisation_of(emitter.owner) {
+        Some(own) -> if own.base == full { at_args(emitter.owner, own.args) }
+        else { by_arguments(emitter, full, len(scheme.ty_vars), at, at_args, plain) },
+        None -> by_arguments(emitter, full, len(scheme.ty_vars), at, at_args, plain),
+      }
+    },
+  }
+}
+
+fn by_arguments(
+  emitter: Emitter,
+  full: Bytes,
+  vars: Int,
+  at: Span,
+  at_args: (Bytes, List<Kind>) -> { full: Bytes, ret: { kind: Option<Kind>, ty: Ty } } / {abort.raise},
+  plain: { full: Bytes, ret: { kind: Option<Kind>, ty: Ty } },
+) -> { full: Bytes, ret: { kind: Option<Kind>, ty: Ty } } / {abort.raise} =
+  match map_get(emitter.typed, span_key(at)) {
+    None -> plain,
+    Some(t) -> if len(t.args) != vars { plain } else {
+      let kinds = map(t.args, |a: Type| kind_of(a).kind);
+      if fold(kinds, true, |boxed: Bool, k: Kind| boxed && k == KBoxed) { plain }
+      else { at_args(specialised(full, kinds), kinds) }
+    },
+  }
+
+/// Each typed site of `typed` read at `args`, for a specialisation whose sites are these.
+fn typed_at(typed: Map<Bytes, Typed>, args: List<Kind>) -> Map<Bytes, Typed> =
+  map_fold(typed, map_new(), |acc: Map<Bytes, Typed>, k: Bytes, t: Typed|
+    map_insert(acc, k, {
+      ty: substituted(t.ty, args),
+      args: map(t.args, |a: Type| substituted(a, args)),
+    }))
+
+/// The scheme's number of each type parameter `def` writes by name, read off where its parameters'
+/// and answer's written types and its scheme's agree.
+fn generics_numbered(def: FnDef, scheme: Scheme) -> Map<Bytes, Int> =
+  match scheme.ty {
+    TyFn(f) -> {
+      let written = map(def.params, |p: Param| p.ty);
+      let paired = fold(range(0, len(written)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+        match list_at(written, i) {
+          Some(Some(w)) -> match list_at(f.params, i) {
+            Some(t) -> numbered_by(w, t, acc),
+            None -> acc,
+          },
+          _ -> acc,
+        });
+      match def.ret { Some(w) -> numbered_by(w, f.ret, paired), None -> paired }
+    },
+    _ -> map_new(),
+  }
+
+fn numbered_by(written: TypeExpr, ty: Type, acc: Map<Bytes, Int>) -> Map<Bytes, Int> =
+  match written {
+    TVar(id) -> match ty { TyVar(v) -> map_insert(acc, id.name, v), _ -> acc },
+    TCon(c) -> match ty {
+      TyCon(k) -> pairwise(c.args, k.args, acc),
+      TyNominal(x) -> pairwise(c.args, x.args, acc),
+      _ -> acc,
+    },
+    TFn(w) -> match ty {
+      TyFn(f) -> numbered_by(w.ret, f.ret, pairwise(w.params, f.params, acc)),
+      _ -> acc,
+    },
+    _ -> acc,
+  }
+
+fn pairwise(written: List<TypeExpr>, tys: List<Type>, acc: Map<Bytes, Int>) -> Map<Bytes, Int> =
+  if len(written) != len(tys) { acc } else {
+    fold(range(0, len(written)), acc, |m: Map<Bytes, Int>, i: Int|
+      match list_at(written, i) {
+        Some(w) -> match list_at(tys, i) { Some(t) -> numbered_by(w, t, m), None -> m },
+        None -> m,
+      })
+  }
+
+/// The root names `wanted` holds of `full`'s specialisations, each with the kinds it is at.
+fn specialisations_wanted(
+  wanted: Option<Map<Bytes, Bool>>,
+  full: Bytes,
+) -> List<List<Kind>> / {abort.raise} =
+  match wanted {
+    None -> [],
+    Some(w) ->
+      map_fold(w, [], |acc: List<List<Kind>>, root: Bytes, _: Bool|
+        match specialisation_of(root) {
+          Some(s) -> if s.base == full { push(acc, s.args) } else { acc },
+          None -> acc,
+        }),
+  }
+
+/// `def` emitted at `args`: its parameters and sites read at them, and each operator whose witness
+/// is a parameter now held as one numeric type alone done as that type's own.
+fn specialised_emitted(
+  module: Bytes,
+  def: FnDef,
+  args: List<Kind>,
+  schemes: Map<Bytes, Scheme>,
+  ops: List<WitnessOp>,
+  sites: Map<Bytes, List<Bytes>>,
+  here: List<Def>,
+  imports: List<Imported>,
+  ctors: List<Bytes>,
+  builtins: List<Bytes>,
+  effects: List<EffectName>,
+  release: Bool,
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+) -> Emitted / {abort.raise} = {
+  let full = qualify(module, def.name.name);
+  let scheme = map_get(schemes, full);
+  let numbering = match scheme { Some(sc) -> generics_numbered(def, sc), None -> map_new() };
+  // The type a witnessed parameter is at, where its argument is held as one numeric type alone.
+  let numeric = |param: Bytes|
+    match map_get(numbering, param) {
+      Some(i) -> match list_at(args, i) {
+        Some(k) -> match held_as(k) {
+          Some(TyCon(c)) -> if c.name == b"Bool" { None } else { Some(c.name) },
+          _ -> None,
+        },
+        None -> None,
+      },
+      None -> None,
+    };
+  let concrete = map_fold(numbering, map_new(), |acc: Map<Bytes, Bool>, param: Bytes, _: Int|
+    if numeric(param) == None { acc } else { map_insert(acc, witness_param(param), true) });
+  let body = map_expr(def.body, |e: Expr| unwitnessed(e, |w: Bytes| map_contains(concrete, w)));
+  // An operand the checker filed at a variable of the definition is read as the type it is at.
+  let at_args = map_fold(operands, operands, |acc: Map<Bytes, Bytes>, k: Bytes, name: Bytes|
+    if bytes_len(name) < 2 || bytes_at(name, 0) != 39 { acc } else {
+      match list_at(args, digits(bytes_slice(name, 1, bytes_len(name)))) {
+        Some(kind) -> match held_as(kind) {
+          Some(TyCon(c)) -> map_insert(acc, k, c.name),
+          _ -> acc,
+        },
+        None -> acc,
+      }
+    });
+  let settled = fold(ops, at_args, |acc: Map<Bytes, Bytes>, o: WitnessOp|
+    if o.owner != full { acc } else {
+      match numeric(o.param) { Some(n) -> map_insert(acc, span_key(o.span), n), None -> acc }
+    });
+  let sig = match sig_of(schemes, full) {
+    Some(s) ->
+      Some({
+        params: map(s.params, |t: Type| substituted(t, args)),
+        ret: substituted(s.ret, args),
+      }),
+    None -> None,
+  };
+  let names = map(def.params, |param: Param| param.name.name);
+  let kinds = map(param_kinds(def, sig), |k: { kind: Kind, ty: Ty }| Some(k));
+  let labels = map(def.generics.labels, |ident: Ident| ident.name);
+  let all_names = fold(labels, names, |acc: List<Bytes>, n: Bytes| push(acc, n));
+  let all_kinds = fold(labels, kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
+    push(acc, Some({ kind: KInt, ty: TyOpen })));
+  emitted_from(
+    module,
+    def.span.start,
+    here,
+    imports,
+    ctors,
+    builtins,
+    effects,
+    release,
+    settled,
+    typed_at(typed, args),
+    specialised(full, args),
+    params_of(all_names, all_kinds),
+    true,
+    body,
+    match lower_to_emit(names, labels, sites, body) { Some(l) -> Some(l.code), None -> None },
+  )
+}
 
 pub fn emit_fn(
   module: Bytes,
@@ -8613,6 +8927,7 @@ fn def_entry(module: Bytes, d: FnDef, pure: Map<Bytes, Bool>, schemes: Map<Bytes
     ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen },
     pure: map_contains(pure, full),
     arity: len(d.params) + len(d.generics.labels),
+    scheme: map_get(schemes, full),
   }
 }
 
@@ -8655,6 +8970,48 @@ fn answers_of(
 ) -> List<RootAnswer> / {abort.raise} = {
   let d = dump_of(analyse(parse_all(zip_sources(names, srcs))));
   emit_roots_answer(names, srcs, ctors, [], wanted, [], [], d.embeds, d.rows, d.walked)
+}
+
+test "a generic definition reached at a type held apart from a word is emitted again at it" {
+  let src = bytes_concat_all([
+    b"fn twice<a>(x: a) -> a where numeric(a) = x + x\n",
+    b"fn go(f: Float) -> Float = twice(f)\n",
+    b"fn id<a>(x: a) -> a = x\n",
+    b"fn same(s: String) -> String = id(s)\n",
+    b"fn down<a>(n: Int, x: a) -> a where numeric(a) = if n <= 0 { x } else { down(n - 1, x + x) }\n",
+    b"fn fall(n: Int) -> Int = down(n, 1)\n",
+  ]);
+  let wanted = [b"m.go", b"m.same", b"m.fall", b"m.twice@Float", b"m.down@Int"];
+  let answers = answers_of([b"m"], [src], [], wanted);
+  let body = |name: Bytes|
+    match fold(answers, None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer { Body(b) -> b, Refused(r) -> panic(string_of_bytes_lossy(r.why)) },
+      None -> panic("no answer"),
+    };
+  let has = |name: Bytes, text: Bytes| bytes_index_of(body(name).text, text) != None;
+  // A `Float` is held apart from a word, so `go` calls `twice` at it; a `String` is a word, so
+  // `same` calls `id` itself.
+  assert(has(b"m.go", symbol_of(b"m.twice@Float")));
+  assert_eq(body(b"m.go").tables.calls, [b"m.twice@Float"]);
+  assert_eq(body(b"m.same").tables.calls, [b"m.id"]);
+  // At `Float` the witnessed `+` is C's own, and the parameter a `double`.
+  assert(has(b"m.twice@Float", b"double "));
+  assert(!has(b"m.twice@Float", b"numeric_binary"));
+  // A specialisation's call of itself stays in it, here as a loop.
+  assert(has(b"m.down@Int", b"goto ply_loop;"));
+  assert(!has(b"m.down@Int", b"numeric_binary"));
+  assert_eq(body(b"m.down@Int").tables.calls, [b"m.down@Int"])
+}
+
+test "an operator the checker filed at a definition's variable is done at the type it is at" {
+  let src = b"fn same<a>(x: a, y: a) -> Bool = x == y\nfn floats(x: Float, y: Float) -> Bool = same(x, y)\n";
+  let answers = answers_of([b"m"], [src], [], [b"m.same", b"m.floats", b"m.same@Float"]);
+  let texts = map(answers, |a: RootAnswer|
+    match a.answer { Body(b) -> b.text, Refused(r) -> r.why });
+  assert_eq(map(answers, |a: RootAnswer| a.name), [b"m.same@Float", b"m.same", b"m.floats"]);
+  // A word is compared by the runtime; a `Float` the specialisation holds is compared by C.
+  assert_eq(map(texts, |t: Bytes| bytes_index_of(t, b"rt_equal_p") != None), [false, true, false])
 }
 
 // A body names each constructor it builds or tests by name, so it reads the same whatever else the
@@ -9033,13 +9390,22 @@ fn emit_program(
         ) {
         ResolveFailed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
         ResolveSucceeded(x) -> {
-          let lowered = lowered_modules(wanted);
+          // A specialisation is lowered from its definition's facts.
+          let reading = match wanted {
+            None -> None,
+            Some(w) ->
+              Some(
+                map_fold(w, w, |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
+                  map_insert(acc, own_definition(root), true)),
+              ),
+          };
+          let lowered = lowered_modules(reading);
           match match walked_read(walked) {
               None ->
                 Err(
                   b"the front end's answer carries nothing its check read, so nothing is lowered from it",
                 ),
-              Some(w) -> facts_read(rows, w, wanted, x.mods),
+              Some(w) -> facts_read(rows, w, reading, x.mods),
             } {
             Err(why) -> refused_rather_than_emitted(sources, wanted, why),
             Ok(facts) -> {
@@ -9071,9 +9437,12 @@ fn emit_program(
                         effects_in(x.r, i, mods),
                         release,
                         wanted,
-                        sites_in(facts.label_sites, i),
-                        operands_in(facts.operands, i),
-                        typed_in(facts, i),
+                        {
+                          labels: sites_in(facts.label_sites, i),
+                          operands: operands_in(facts.operands, i),
+                          typed: typed_in(facts, i),
+                          ops: filter(facts.elaboration.ops, |o: WitnessOp| o.module == i),
+                        },
                         x.r,
                         i,
                         mods,
@@ -9283,6 +9652,15 @@ fn walked_read(walked: Bytes) -> Option<WalkedFacts> / {abort.raise} =
   if bytes_len(walked) == 0 { None }
   else { match bin::decode(walked, walked_facts_bin()) { Ok(w) -> Some(w), Err(_) -> None } }
 
+/// What the checker filed of one module's sites, by span: each call's labels, each operator's
+/// operand type, each typed site, and each operator done through a witness.
+type SitesRead = {
+  labels: Map<Bytes, List<Bytes>>,
+  operands: Map<Bytes, Bytes>,
+  typed: Map<Bytes, Typed>,
+  ops: List<WitnessOp>,
+}
+
 fn emit_module(
   module: Bytes,
   x_module: Module,
@@ -9294,13 +9672,15 @@ fn emit_module(
   effects: List<EffectName>,
   release: Bool,
   wanted: Option<Map<Bytes, Bool>>,
-  sites: Map<Bytes, List<Bytes>>,
-  operands: Map<Bytes, Bytes>,
-  typed: Map<Bytes, Typed>,
+  read: SitesRead,
   resolved: Resolved,
   index: Int,
   mods: List<ParsedModule>,
 ) -> List<Emitted> / {abort.raise} = {
+  let sites = read.labels;
+  let operands = read.operands;
+  let typed = read.typed;
+  let ops = read.ops;
   let x = { module: x_module };
   let defs_of = |path: Bytes|
     fold(program, [], |acc: List<Def>, md: ModuleDefs|
@@ -9317,10 +9697,34 @@ fn emit_module(
           Some(q) -> q,
           None -> prepare(module, schemes, wanted, sites, d),
         };
-        let out = match group_of(groups, acc.fns) {
-          None -> if !wants(wanted, p.full) { acc.out } else {
+        let specialisations = fold(
+          specialisations_wanted(wanted, p.full),
+          acc.out,
+          |a: List<Emitted>, args: List<Kind>|
             push(
-              acc.out,
+              a,
+              specialised_emitted(
+                module,
+                d,
+                args,
+                schemes,
+                ops,
+                sites,
+                here,
+                imports,
+                ctors,
+                builtins,
+                effects,
+                release,
+                operands,
+                typed,
+              ),
+            ),
+        );
+        let out = match group_of(groups, acc.fns) {
+          None -> if !wants(wanted, p.full) { specialisations } else {
+            push(
+              specialisations,
               emitted_from(
                 module,
                 p.base,
@@ -9341,7 +9745,7 @@ fn emit_module(
             )
           },
           // The group is emitted where its first member stands; the others are its cases.
-          Some(g) -> if list_at(g, 0) != Some(acc.fns) { acc.out } else {
+          Some(g) -> if list_at(g, 0) != Some(acc.fns) { specialisations } else {
             fold(
               group_emitted(
                 module,
@@ -9355,7 +9759,7 @@ fn emit_module(
                 typed,
                 map(g, |i: Int| match list_at(fns, i) { Some(q) -> q, None -> p }),
               ),
-              acc.out,
+              specialisations,
               |a: List<Emitted>, e: Emitted| push(a, e),
             )
           },
