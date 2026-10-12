@@ -1,17 +1,16 @@
 //! `std.sqlite` over files: a program's databases under a root the host binds, held to that root by
 //! the host's confinement and by the engine's own authorizer.
 
-import harness (Here, Shipped, answered, bound_main, called, loaded, project, working)
-import cli.machine (machine, Called, default_options)
+import harness (Here, Ran, Spawned, project, spawned, stderr, working)
 import std.fs
 import std.fs (fs, Entry, Dir)
-import std.list (sort_by)
-import std.value (Value, VInt, VList, VStr)
-
-effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+import std.list (concat, flatten, sort_by)
+import std.string (join, split)
 
 fn sqlite_program() -> String =
+  \\import std.process (process)
   \\import std.sql (stmt, PInt, PText, Row)
+  \\import std.string (int_of_string, join)
   \\import std.sqlite
   \\import std.sqlite (sqlite, sql, Busy, Refused, Unopened, Create, ReadOnly, ReadWrite, Limits, Options)
   \\
@@ -117,32 +116,6 @@ fn sqlite_program() -> String =
   \\      acc + sqlite::int(row, "i"))
   \\  } }
   \\
-  \\/// One scenario, written against any root.
-  \\fn scenario<[d]>() -> List<String> / {sqlite.read[d], sqlite.write[d], sql.refused, abort.raise} =
-  \\  with_hold[scene](sqlite::opening[d]("scene.db", Create, plain()), |c| sqlite::close(c)) { conn -> {
-  \\    sqlite::execute(conn, s("create table person (id integer primary key, name text not null unique) strict"), roomy());
-  \\    let made = sqlite::execute(conn, s("insert into person (name) values ('Ada'), ('Grace')"), roomy());
-  \\    let twice = refusal(|| sqlite::execute(conn, s("insert into person (name) values ('Ada')"), roomy()));
-  \\    let undone = refusal(|| sqlite::transaction(conn, || {
-  \\      sqlite::execute(conn, s("delete from person"), roomy());
-  \\      sqlite::execute(conn, s("insert into person (id, name) values (1, null)"), roomy())
-  \\    }));
-  \\    let clocked = refusal(|| sqlite::execute(conn, sqlite::bound(stmt("insert into person (name) values (datetime(?1))"), [PText("now")]), roomy()));
-  \\    let dated = map(sqlite::query(conn, s("select date('2024-02-28', '+2 days') as d"), roomy()), |row: Row|
-  \\      sqlite::text(row, "d"));
-  \\    let loose = refusal(|| sqlite::execute(conn, s("create table loose (a)"), roomy()));
-  \\    concat_all([[int_to_string(made.rows), int_to_string(made.last_row_id), twice, undone, clocked, loose], dated, names(conn)])
-  \\  } }
-  \\
-  \\fn concat_all(lists: List<List<String>>) -> List<String> =
-  \\  fold(lists, [], |acc: List<String>, list: List<String>| fold(list, acc, |a: List<String>, x: String| push(a, x)))
-  \\
-  \\pub fn on_a_file() -> List<String> / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
-  \\  scenario[app]()
-  \\
-  \\pub fn on_the_twin() -> List<String> / {sql.refused, abort.raise} =
-  \\  sqlite::in_memory[app](|| scenario[app]())
-  \\
   \\// A connection its entry never closes.
   \\pub fn left_open() -> Int / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} = {
   \\  let conn = sqlite::opening[app]("left.db", Create, plain());
@@ -152,23 +125,78 @@ fn sqlite_program() -> String =
   \\  } }
   \\}
   \\
-  \\fn main() -> Int = 0
+  \\fn asked(scenario: List<String>) -> String / {sqlite.read[app], sqlite.write[app], sqlite.read[nowhere], sqlite.write[nowhere], sql.refused, abort.raise} =
+  \\  match scenario {
+  \\    ["round_trip"] -> join(round_trip(), ","),
+  \\    ["escapes", outside] -> join(escapes(outside), ","),
+  \\    ["opens", path] -> opens(path),
+  \\    ["backs_up", path] -> backs_up(path),
+  \\    ["unbound"] -> unbound(),
+  \\    ["together"] -> join(together(), ","),
+  \\    ["folded", rows] -> match int_of_string(rows) { Some(n) -> int_to_string(folded(n)), None -> panic("rows") },
+  \\    ["left_open"] -> int_to_string(left_open()),
+  \\    _ -> panic("no such scenario: " ++ join(scenario, " ")),
+  \\  }
+  \\
+  \\/// The arguments as the scenarios they spell, a `+` between two.
+  \\fn scenarios(args: List<String>) -> List<List<String>> = {
+  \\  let split = fold(args, { done: [], open: [] }, |s: { done: List<List<String>>, open: List<String> }, a: String|
+  \\    if a == "+" { { done: push(s.done, s.open), open: [] } } else { { ..s, open: push(s.open, a) } });
+  \\  push(split.done, split.open)
+  \\}
+  \\
+  \\// A line a scenario, in the order asked.
+  \\fn main() -> Unit / {process.args[proc], process.out[proc], sqlite.read[app], sqlite.write[app], sqlite.read[nowhere], sqlite.write[nowhere], abort.raise} =
+  \\  fold(scenarios(process.args[proc]()), (), |u: Unit, scenario: List<String>|
+  \\    process.out[proc]("answer " ++ refusal_or(|| asked(scenario))))
+  \\
+  \\fn refusal_or<| e>(go: () -> String / {sql.refused | e}) -> String / e =
+  \\  match try[sql.refused] { go() } { Ok(said) -> said, Err(_) -> "the engine refused" }
   \\
 
-/// A host whose `app` is `root` in the working directory, beside an `outside` no label names.
-fn rooted() -> Unit / {Here, Shipped, Driving, abort.raise} = {
-  project([{ path: "inner.ply", text: sqlite_program() }]);
+/// The program in a working directory holding the `root` a run binds as `app`, beside an `outside`
+/// no label names.
+fn rooted() -> Unit / {Here, abort.raise} = {
+  project([{ path: "m.ply", text: sqlite_program() }]);
   let _ = fs.create_dir[cwd]("root");
   let _ = fs.create_dir[cwd]("outside");
-  loaded({ ..default_options(), host: true, fs: [{ name: "app", path: working() ++ "/root" }] });
-  bound_main()
 }
 
-/// The code `entry` raised, or none where it answered.
-fn refused(entry: String, args: List<Value>) -> Option<Bytes> / {Driving} =
-  match called(entry, args) { Err(d) -> Some(d.code), Ok(_) -> None }
+/// The program run once over `scenarios`, in turn, by a `ply` whose `app` is `root`.
+fn run_of(scenarios: List<List<String>>) -> Ran / {Here, Spawned, abort.raise} =
+  spawned(
+    fold(
+      scenarios,
+      ["run", "m.ply", "--host", "--fs", "app=" ++ working() ++ "/root", "--"],
+      |argv: List<String>, scenario: List<String>|
+        flatten([argv, if len(argv) > 6 { ["+"] } else { [] }, scenario]),
+    ),
+    [],
+  )
 
-fn strings(values: List<String>) -> Value = VList(map(values, VStr))
+/// What each of `scenarios` answered, in one run of the program.
+fn answers(scenarios: List<List<String>>) -> List<String> / {Here, Spawned, abort.raise} = {
+  let r = run_of(scenarios);
+  let said = fold(r.out, [], |acc: List<String>, line: String|
+    if string_starts_with(line, "answer ") { push(acc, string_slice(line, 7, string_len(line))) }
+    else { acc });
+  assert(r.code == 0 && len(said) == len(scenarios), Some(stderr(r)));
+  said
+}
+
+fn answer(scenario: List<String>) -> String / {Here, Spawned, abort.raise} =
+  join(answers([scenario]), "")
+
+/// The code of the diagnostic a run of `scenario` ended with, or none where it answered.
+fn refused(scenario: List<String>) -> Option<String> / {Here, Spawned, abort.raise} = {
+  let r = run_of([scenario]);
+  if r.code == 0 { None } else {
+    match split(stderr(r), "Error[") {
+      [_, after, ..] -> Some(string_slice(after, 0, 5)),
+      _ -> panic("the run failed and named no diagnostic:\n" ++ stderr(r)),
+    }
+  }
+}
 
 /// Every file below `dir`, by its path from it, a link to a directory among them.
 fn files(dir: String) -> List<String> / {Here, abort.raise} =
@@ -195,10 +223,12 @@ fn from_root(path: String) -> String / {abort.raise} =
   if string_starts_with(path, "root/") { string_slice(path, 5, string_len(path)) }
   else { "../" ++ path }
 
+fn linked(link: String, to: String) -> Unit / {Here, abort.raise} =
+  assert(fs.symlink[cwd](link, from_root(to)), Some("a link is made"))
+
 test/nondet "a database written and closed is read back from its file" {
   rooted();
-  assert_eq(answered("round_trip", []), strings(["Ada", "Grace"]));
-  machine.drop[run]();
+  assert_eq(answer(["round_trip"]), "Ada,Grace");
   let file = match fs.read_file[cwd]("root/data.db") { Some(b) -> b, None -> b"" };
   assert_eq(bytes_slice(file, 0, 16), b"SQLite format 3\x00");
   // Bytes 18 and 19 are the file format's write and read versions: 2 is write-ahead logging.
@@ -210,12 +240,10 @@ test/nondet "a database written and closed is read back from its file" {
 test/nondet "the engine itself refuses every way out of the root" {
   rooted();
   let _ = fs.write_file[cwd]("outside/secret.txt", b"secret");
-  let kinds = answered("escapes", [VStr(at("outside"))]);
-  machine.drop[run]();
   // Attach, attach by URI, vacuum into, readfile, writefile, a pragma, load_extension.
   assert_eq(
-    kinds,
-    strings(["refused", "refused", "refused", "statement", "statement", "refused", "statement"]),
+    answer(["escapes", at("outside")]),
+    "refused,refused,refused,statement,statement,refused,statement",
   );
   assert_eq(files("outside"), ["secret.txt"]);
   assert_eq(files("root"), ["escape.db"])
@@ -225,61 +253,63 @@ test/nondet "a path that leaves the root is refused before anything opens" {
   rooted();
   let outside = at("outside/abs.db");
   fold(["../outside/up.db", outside, "a/../../outside/up.db"], (), |u: Unit, path: String|
-    assert_eq(refused("opens", [VStr(path)]), Some(b"E0452")));
-  let _ = answered("round_trip", []);
+    assert_eq(refused(["opens", path]), Some("E0452")));
+  assert_eq(answer(["round_trip"]), "Ada,Grace");
   fold(["../outside/copy.db", outside], (), |u: Unit, path: String|
-    assert_eq(refused("backs_up", [VStr(path)]), Some(b"E0452")));
-  assert_eq(refused("unbound", []), Some(b"E0451"));
-  machine.drop[run]();
+    assert_eq(refused(["backs_up", path]), Some("E0452")));
+  assert_eq(refused(["unbound"]), Some("E0451"));
   assert_eq(files("outside"), [])
 }
 
 test/nondet "a database is never opened through a symbolic link" {
   rooted();
-  assert_eq(answered("opens", [VStr("real.db")]), VStr("ran"));
-  // A link to a database inside the root, a directory that is a link, and a link out of it.
-  assert(fs.symlink[cwd]("root/link.db", from_root("root/real.db")), Some("a link is made"));
   let _ = fs.create_dir[cwd]("root/dir");
-  assert(fs.symlink[cwd]("root/linked", from_root("root/dir")), Some("a link is made"));
-  assert(fs.symlink[cwd]("root/out.db", from_root("outside/out.db")), Some("a link is made"));
   let _ = fs.write_file[cwd]("outside/out.db", b"");
-  fold(["link.db", "linked/new.db"], (), |u: Unit, inside: String|
-    assert_eq(answered("opens", [VStr(inside)]), VStr("unopened")));
-  assert(fs.symlink[cwd]("root/gone.db", from_root("outside/gone.db")), Some("a link is made"));
-  fold(["out.db", "gone.db"], (), |u: Unit, leaving: String|
-    assert_eq(refused("opens", [VStr(leaving)]), Some(b"E0452")));
-  // The journal and the write-ahead log the engine would open beside a database, each a link to a
-  // file outside the root.
-  fold(
-    [("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")],
-    (),
-    |u: Unit, s: (String, String)|
-      match s {
-        (stem, suffix) -> {
-          let name = "side" ++ stem ++ ".db";
-          let target = "outside/target" ++ suffix;
-          assert(
-            fs.symlink[cwd]("root/" ++ name ++ suffix, from_root(target)),
-            Some("a link is made"),
-          );
-          assert_eq(answered("opens", [VStr(name)]), VStr("unopened"));
-          assert(!fs.exists[cwd](target), Some(target ++ " was written through the link"));
-          assert(!fs.exists[cwd]("root/" ++ name), Some(name ++ " was made"))
-        },
-      },
+  // A link to a database inside the root, a directory that is a link, links out of the root to a
+  // file and to nothing, and the journal, the write-ahead log and its index the engine would open
+  // beside a database, each a link to a file outside the root.
+  linked("root/link.db", "root/real.db");
+  linked("root/linked", "root/dir");
+  linked("root/out.db", "outside/out.db");
+  linked("root/gone.db", "outside/gone.db");
+  let sides = [("_wal", "-wal"), ("_journal", "-journal"), ("_shm", "-shm")];
+  fold(sides, (), |u: Unit, s: (String, String)|
+    match s {
+      (stem, suffix) -> linked("root/side" ++ stem ++ ".db" ++ suffix, "outside/target" ++ suffix),
+    });
+  assert_eq(
+    answers(
+      concat(
+        [["opens", "real.db"], ["opens", "link.db"], ["opens", "linked/new.db"]],
+        map(sides, |s: (String, String)|
+          match s { (stem, _) -> ["opens", "side" ++ stem ++ ".db"] }),
+      ),
+    ),
+    ["ran", "unopened", "unopened", "unopened", "unopened", "unopened"],
   );
+  fold(["out.db", "gone.db"], (), |u: Unit, leaving: String|
+    assert_eq(refused(["opens", leaving]), Some("E0452")));
+  fold(sides, (), |u: Unit, s: (String, String)|
+    match s {
+      (stem, suffix) -> {
+        let target = "outside/target" ++ suffix;
+        assert(!fs.exists[cwd](target), Some(target ++ " was written through the link"));
+        assert(
+          !fs.exists[cwd]("root/side" ++ stem ++ ".db"),
+          Some("side" ++ stem ++ ".db was made"),
+        )
+      },
+    });
   assert_eq(fs.read_file[cwd]("outside/out.db"), Some(b""));
   assert_eq(files("outside"), ["out.db"]);
   // A backup is written to a new file, never through a link already there, and a link to where
   // nothing is outside the root leaves it whether or not anything is there.
-  let _ = answered("round_trip", []);
-  assert(fs.symlink[cwd]("root/copy.db", from_root("root/missing.db")), Some("a link is made"));
-  assert_eq(answered("backs_up", [VStr("copy.db")]), VStr("refused"));
+  linked("root/copy.db", "root/missing.db");
+  linked("root/away.db", "outside/copied.db");
+  assert_eq(answers([["round_trip"], ["backs_up", "copy.db"]]), ["Ada,Grace", "refused"]);
   assert(!fs.exists[cwd]("root/missing.db"), Some("the backup went through the link"));
-  assert(fs.symlink[cwd]("root/away.db", from_root("outside/copied.db")), Some("a link is made"));
-  assert_eq(refused("backs_up", [VStr("away.db")]), Some(b"E0452"));
-  assert_eq(answered("backs_up", [VStr("kept.db")]), VStr("ran"));
-  machine.drop[run]();
+  assert_eq(refused(["backs_up", "away.db"]), Some("E0452"));
+  assert_eq(answer(["backs_up", "kept.db"]), "ran");
   assert_eq(files("outside"), ["out.db"]);
   assert_eq(prefix("root/kept.db", 16), b"SQLite format 3\x00")
 }
@@ -288,36 +318,22 @@ test/nondet "a database is never opened through a symbolic link" {
 // the writer's own rows, then the reader's rows and its write after the commit.
 test/nondet "a reader sees what was committed and a second writer is busy" {
   rooted();
-  let _ = answered("round_trip", []);
-  let together = answered("together", []);
-  machine.drop[run]();
-  assert_eq(together, strings(["2", "busy", "busy", "3", "3", "ran"]))
+  assert_eq(answers([["round_trip"], ["together"]]), ["Ada,Grace", "2,busy,busy,3,3,ran"])
 }
 
 test/nondet "a fold reads a statement the connection keeps open between pages" {
   rooted();
-  let sums = map([1000, 64, 1], |n: Int| answered("folded", [VInt(n)]));
-  machine.drop[run]();
-  assert_eq(sums, [VInt(500500), VInt(2080), VInt(1)])
+  assert_eq(answers([["folded", "1000"], ["folded", "64"], ["folded", "1"]]), [
+    "500500",
+    "2080",
+    "1",
+  ])
 }
 
-test/nondet "a file and the twin answer one scenario alike" {
+test/nondet "a connection a run leaves open is closed when the run ends" {
   rooted();
-  let on_a_file = answered("on_a_file", []);
-  let on_the_twin = answered("on_the_twin", []);
-  machine.drop[run]();
-  assert_eq(on_a_file, on_the_twin);
-  assert_eq(
-    on_a_file,
-    strings(["2", "2", "other", "other", "refused", "refused", "2024-03-01", "Ada", "Grace"]),
-  )
-}
-
-test/nondet "a connection an entry leaves open is closed when the entry ends" {
-  rooted();
-  assert_eq(answered("left_open", []), VInt(1));
+  assert_eq(answer(["left_open"]), "1");
   // Closed, so the log was folded into the database and removed with its index.
   assert_eq(files("root"), ["left.db"]);
-  assert_eq(answered("left_open", []), VInt(1));
-  machine.drop[run]()
+  assert_eq(answer(["left_open"]), "1")
 }

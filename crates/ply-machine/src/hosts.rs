@@ -772,10 +772,10 @@ const SHUTDOWN_DOMAIN: &[u8] = b"ply.hosts.shutdown.v1\0";
 
 /// The effect `crates/ply-cli/ply/hosts.ply` declares. It is lent to that one entry and nowhere
 /// else: what a run would bind is assembled here, and the program is handed what it says.
-const EFFECT: &str = "tcb";
+const EFFECT: &str = "hosts";
 
 /// A preview that would read a credential or a root off the disk is refused.
-const HERMETIC: &str = "hermetic_tcb";
+const HERMETIC: &str = "hermetic_hosts";
 
 const OPERATIONS: [(&str, &str); 3] = [
     ("preview", "ply_machine::hosts::preview"),
@@ -792,7 +792,7 @@ const HERMETIC_OPERATIONS: [(&str, &str); 3] = [
     ("shapes", "ply_machine::hosts::hermetic::shapes"),
 ];
 
-/// `module` is where the program lent it declares `tcb`, which is where `Stage` is declared too.
+/// `module` is where the program lent it declares `hosts`, which is where `Stage` is declared too.
 pub fn lent(module: &str) -> Vec<LentOp> {
     let mut ops = lent_by(module, false);
     ops.extend(lent_by(module, true));
@@ -1025,7 +1025,7 @@ fn hermetic_disk() -> Diagnostic {
             "`{HERMETIC}` reads nothing off the disk, and the run names a credential or a root"
         ),
     )
-    .note("a preview of `--tls`, `--trust` or `--fs` reads files, and performs `tcb`")
+    .note("a preview of `--tls`, `--trust` or `--fs` reads files, and performs `hosts`")
 }
 
 // --- The payload -------------------------------------------------------------

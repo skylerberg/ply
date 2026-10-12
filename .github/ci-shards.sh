@@ -73,8 +73,8 @@ CLI_SUITE=crates/ply-cli-tests/ply
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
 # another, and with them one job would run close to its limit.
 CLI_PARTS=2
-# The program's, a fixture's and a package's own tests share one job, `packages`, in turn: each loads
-# little. These take a job of their own instead: the compiler's own tests take every core.
+# The program's, a fixture's and a package's own tests and proofs share one job, `packages`, in turn:
+# each loads little. These take a job of their own instead: the compiler's own tests take every core.
 CORPUS_ALONE=(package-compiler)
 # Modules of the CLI's suite no pull request runs, which the `nightly` jobs do. CLI_SWEPT edits each
 # module of the tree one way and checks it warm and cold, days of runners over the tree, so a night
@@ -94,6 +94,7 @@ RUNS_MARGIN=4
 PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
   "compiler:crates/ply-compiler/ply"
+  "examples:examples"
   "kernel:benches/kernel"
   "lang:tests/lang"
   "registry:crates/ply-registry/ply"
@@ -104,7 +105,9 @@ PACKAGE_SUITES=(
 )
 # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
 # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
-PACKAGE_PROOFS=()
+PACKAGE_PROOFS=(
+  "examples:examples"
+)
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
 # gates job runs them after its own tests.
@@ -278,10 +281,10 @@ proofs_path() {
   return 1
 }
 
-# Each `.ply` of a package below `crates/` other than the library's that states a law or an `ensures`
-# or `cost` clause, which only a `ply prove` discharges.
+# Each `.ply` of a package below `crates/` other than the library's, and each example, that states a
+# law or an `ensures` or `cost` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply "$root"/examples 2>/dev/null |
     grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
@@ -309,11 +312,11 @@ runs() {
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
 }
 
-# The job that takes the run $1: `packages` for the program's, a fixture's and a package's own tests,
-# but those CORPUS_ALONE names, and a job of its own for every other run.
+# The job that takes the run $1: `packages` for the program's, a fixture's and a package's own tests
+# and a package's proofs, but those CORPUS_ALONE names, and a job of its own for every other run.
 job_of() {
   case "$1" in
-    program | package-* | fixture-*)
+    program | package-* | fixture-* | laws-*)
       if named_in "$1" "${CORPUS_ALONE[@]}"; then printf '%s\n' "$1"; else printf 'packages\n'; fi
       ;;
     *) printf '%s\n' "$1" ;;

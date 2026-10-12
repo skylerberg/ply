@@ -2,8 +2,8 @@
 //! given, what moves the binding's digest, how a credential that does not load is refused, the
 //! protocol two ends agree over it, and the certificate a client presents and `--mtls` requires.
 
-import harness (scratch, Ran, program, write, working, on_disk, in_memory, one, said, stdout,
-                stderr, json_of, at, path, nth, items, str, int, shown, Here, Reached, Shipped)
+import harness (scratch, Ran, program, write, working, on_disk, in_memory, one, spawned, said,
+                stdout, stderr, json_of, at, path, nth, items, str, int, shown, Here, Spawned)
 import std.certgen (certgen)
 import std.json (Json, Str, Array)
 
@@ -306,9 +306,12 @@ fn credential(name: String) -> Credential / {Here, certgen.issue, abort.raise} =
 
 fn spec(name: String, c: Credential) -> String = name ++ "=" ++ c.cert ++ "," ++ c.key
 
+/// `ply` as a process in the working directory, which is what holds a real socket and a credential.
+fn child(argv: List<String>) -> Ran / {Spawned, abort.raise} = spawned(argv, [])
+
 test/nondet "the listing discloses the TLS stack and the credential it was given" {
   program(secure());
-  let r = on_disk(["hosts", "--host", "--tls", spec("api", credential("api"))]);
+  let r = child(["hosts", "--host", "--tls", spec("api", credential("api"))]);
   assert(r.code == 0, Some(stderr(r)));
   let text = stdout(r);
   assert(
@@ -334,10 +337,10 @@ test/nondet "the listing discloses the TLS stack and the credential it was given
 test/nondet "an open connection is secured at both ends by a run that holds and trusts the credential" {
   program(upgrading());
   let api = credential("api");
-  let r = on_disk(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
+  let r = child(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
   assert(r.code == 0, Some(said(r)));
   // The same run without the certificate trusted: the client's half refuses it, typed.
-  let untrusted = on_disk(["run", "--host", "--tls", spec("api", api)]);
+  let untrusted = child(["run", "--host", "--tls", spec("api", api)]);
   assert(untrusted.code != 0, Some(said(untrusted)));
   assert(
     string_contains(
@@ -352,10 +355,10 @@ test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, prove
   program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n"));
   let api = credential("api");
   let trusted = ["run", "--host", "--tls", spec("api", api), "--trust", api.cert];
-  let r = on_disk(trusted);
+  let r = child(trusted);
   assert(r.code == 0, Some(said(r)));
   // The same server without its certificate trusted: the handshake is refused, typed.
-  let untrusted = on_disk(["run", "--host", "--tls", spec("api", api)]);
+  let untrusted = child(["run", "--host", "--tls", spec("api", api)]);
   assert(
     untrusted.code != 0
       && string_contains(said(untrusted), "the client refused: HandshakeFailed(Untrusted)"),
@@ -365,7 +368,7 @@ test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, prove
   // the server's answer over TLS.
   program(smtp_upgrading("220 2.0.0 Ready to start TLS\\r\\n250 AUTH PLAIN\\r\\n"));
   let again = credential("api");
-  let injected = on_disk(["run", "--host", "--tls", spec("api", again), "--trust", again.cert]);
+  let injected = child(["run", "--host", "--tls", spec("api", again), "--trust", again.cert]);
   assert(
     injected.code != 0 && string_contains(said(injected), "the client refused: Injected"),
     Some(said(injected)),
@@ -375,7 +378,7 @@ test/nondet "an SMTP session upgrades by STARTTLS to a server it verifies, prove
 test/nondet "a std.http server and client agree h2 over TLS, and a client offering http/1.1 alone is served HTTP/1.1" {
   program(alpn_serving());
   let api = credential("api");
-  let r = on_disk(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
+  let r = child(["run", "--host", "--tls", spec("api", api), "--trust", api.cert]);
   assert(r.code == 0, Some(said(r)))
 }
 
@@ -385,18 +388,18 @@ test/nondet "a request over a --tls listener carries the certificate its client 
   let caller = credential("caller");
   let tls = ["--tls", spec("api", api), "--tls", spec("caller", caller)];
   let trust = ["--trust", api.cert, "--trust", caller.cert];
-  let listed = json_of(on_disk(fold(trust, fold(tls, ["hosts", "--host", "--json"], push), push)));
+  let listed = json_of(child(fold(trust, fold(tls, ["hosts", "--host", "--json"], push), push)));
   let presented = nth(path(listed, ["transport", "credentials"]), 1);
   assert(str(at(presented, "name")) == "caller", Some(shown(listed)));
   let carried = " / localhost / " ++ str(at(presented, "fingerprint"));
-  let r = on_disk(fold(trust, fold(tls, ["run", "--host"], push), push));
+  let r = child(fold(trust, fold(tls, ["run", "--host"], push), push));
   assert(r.code == 0, Some(said(r)));
   assert(
     string_contains(stdout(r), "presenting: CN=") && string_contains(stdout(r), carried ++ " | "),
     Some(said(r)),
   );
   assert(string_contains(stdout(r), "anonymous: none"), Some(said(r)));
-  let required = on_disk(
+  let required = child(
     fold(["--mtls", "api"], fold(trust, fold(tls, ["run", "--host"], push), push), push),
   );
   assert(required.code == 0, Some(said(required)));
@@ -448,8 +451,8 @@ test "a TLS program with no credential is told what will happen" {
   })
 }
 
-fn digest(args: List<String>) -> String / {Reached, Shipped, abort.raise, diverges} =
-  string_trim(stdout(on_disk(fold(args, ["hosts", "--host", "--digest"], push))))
+fn digest(args: List<String>) -> String / {Spawned, abort.raise} =
+  string_trim(stdout(child(fold(args, ["hosts", "--host", "--digest"], push))))
 
 test/nondet "the digest is stable across a rotation and moves when a credential is added" {
   program(secure());
@@ -473,7 +476,7 @@ test/nondet "the digest is stable across a rotation and moves when a credential 
 test/nondet "the JSON object carries the transport and the full fingerprint" {
   program(secure());
   let report = json_of(
-    on_disk(["hosts", "--host", "--json", "--tls", spec("api", credential("api"))]),
+    child(["hosts", "--host", "--json", "--tls", spec("api", credential("api"))]),
   );
   assert(str(at(report, "command")) == "hosts", Some(shown(report)));
   assert(str(path(report, ["transport", "library"])) == "rustls", Some(shown(report)));
@@ -497,13 +500,13 @@ test/nondet "a credential that does not load is E0430 naming the file" {
   let broken = { cert: working() ++ "/broken.pem", key: api.key };
   let missing = { cert: working() ++ "/absent.pem", key: api.key };
   fold([broken, missing], (), |u: Unit, bad: Credential| {
-    let r = on_disk(["run", "--host", "--tls", spec("api", bad)]);
+    let r = child(["run", "--host", "--tls", spec("api", bad)]);
     assert(r.code == 2, Some(said(r)));
     assert(string_contains(said(r), "E0430"), Some(said(r)))
   });
   // A key that is not the leaf's needs both files to catch, and is the one a deploy gets wrong.
   let other = credential("other");
-  let r = on_disk(["run", "--host", "--tls", spec("api", { cert: api.cert, key: other.key })]);
+  let r = child(["run", "--host", "--tls", spec("api", { cert: api.cert, key: other.key })]);
   assert(string_contains(said(r), "E0430"), Some(said(r)))
 }
 
