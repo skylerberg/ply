@@ -5,7 +5,9 @@
 # the proof runs, the standard library's (`proofs`) and each package's (`laws-<id>`), are a
 # `ply prove` each. A run fails when a test fails or a claim does not hold, when the run refuses, and
 # when it selects no test or proves no claim, so a renamed test never stops being run quietly; a part
-# of the CLI's suite takes the tests whose keys hash to it, which may be none.
+# of the CLI's suite takes the tests whose keys hash to it, which may be none. It fails too when its
+# load ran a body again because a store had lost the answer its record names, which is a run made
+# cold by a defect and not by an edit.
 #
 #   ci-corpus.sh run ID [ARG...]
 #       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
@@ -141,6 +143,16 @@ listed() {
       (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
 }
 
+# What a report's load took of the stores as kept, what it ran anew, and how many of those it ran
+# although their records stood, the answers they name being in no store. Nothing for a report no load
+# made: a kept answer's, or a refusal's.
+answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) answers taken, \([.front_end.queries[].run] | add // 0) run and \(.front_end.lost // 0) lost" else "" end)'
+
+# Whether a report's load lost an answer: none is lost over stores that are whole, whatever moved.
+lost() {
+  jq -s -e 'any(.[]; (.front_end.lost // 0) > 0)' "$1" > /dev/null 2>&1
+}
+
 # Where a `ply test` spent its wall clock WALL (ms), from its report: the phases its clock, which
 # counts from the process's start, measured, and `other` for what follows the report.
 spent() {
@@ -148,7 +160,7 @@ spent() {
     def s(ms): (ms / 1000 | floor | tostring) + "s";
     (.phases // {}) as $p
     | (if .front_end.reused then "spent: a kept answer, read in \(s(.front_end.phases.total // 0)); it was filed by a run that spent " else "spent: " end)
-      + "before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))"
+      + "before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
   ' "$1" 2>/dev/null
 }
 
@@ -195,6 +207,10 @@ tests_of() {
     echo "the run $id selected no test" >&2
     status=1
   fi
+  if lost "$out"; then
+    echo "the run $id ran bodies again whose answers a store had kept and lost" >&2
+    status=1
+  fi
   if [ "$status" -ne 0 ]; then
     red "$out"
     rm -f "$out"
@@ -225,9 +241,13 @@ proofs_of() {
   discharging=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, the rest discharged in $((discharging / 1000))s of the $((($(date +%s%3N) - started) / 1000))s the prove took"
+  echo "proved: $all claims, $cached from the cache, the rest discharged in $((discharging / 1000))s of the $((($(date +%s%3N) - started) / 1000))s the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
   if [ "$all" -eq 0 ]; then
     echo "the run $id proved no claim" >&2
+    status=1
+  fi
+  if lost "$out"; then
+    echo "the run $id ran bodies again whose answers a store had kept and lost" >&2
     status=1
   fi
   if [ "$status" -ne 0 ]; then
