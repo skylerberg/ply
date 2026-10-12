@@ -269,3 +269,33 @@ fn a_record_of_any_width_holds_every_float_as_its_bits() {
     assert_eq!(Heap::to_value(&l, read), value);
     dec(w);
 }
+
+#[test]
+fn a_char_is_its_own_word_ordered_and_kept_as_the_char_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let chars = ['\0', 'a', 'z', 'é', '\u{10ffff}'];
+    let words: Vec<Word> = chars
+        .iter()
+        .map(|c| h.to_word(&l, &Value::Char(*c)))
+        .collect();
+    for (w, c) in words.iter().zip(&chars) {
+        assert!(is_imm(*w) && !is_int(*w), "{c:?} is held in its word");
+        assert_eq!(kind(*w), KIND_CHAR);
+        assert_eq!(Heap::to_value(&l, *w), Value::Char(*c));
+        assert_eq!(as_int(*w), None);
+    }
+    for (a, x) in words.iter().zip(&chars) {
+        for (b, y) in words.iter().zip(&chars) {
+            assert_eq!(cmp_words(&l, *a, *b), x.cmp(y), "{x:?} against {y:?}");
+        }
+    }
+    let text = Value::list(chars.iter().map(|c| Value::Char(*c)).collect());
+    let w = h.to_word(&l, &text);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), text);
+    let pair = record(vec![("c", Value::Char('q')), ("n", Value::Int(7))]);
+    let p = h.to_word(&l, &pair);
+    let (_into, read) = kept(&l, p);
+    assert_eq!(Heap::to_value(&l, read), pair);
+}
