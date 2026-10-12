@@ -5772,7 +5772,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 ),
             }
           } else if emitter.tail && emitter.landing == None
-              && self_tail_leaf(emitter, fv.name, a.args, params) {
+              && self_tail_leaf(emitter, fv.name, a.func.span, a.args, params) {
             self_tail(note_call(emitter, emitter.owner), fv.name, a.args, params)
           } else {
             match args_one_pass(emitter, a.args, params, 0, []) {
@@ -8309,18 +8309,24 @@ fn emit_body(
   )
 }
 
-/// A call of the definition being emitted that fills every parameter: from tail position it restarts the body.
+/// A call, through the reference at `at`, of the root being emitted that fills every parameter:
+/// from tail position it restarts the body. A specialisation's call of its definition at other
+/// type arguments is a call of the definition as it stands.
 fn self_tail_leaf(
   emitter: Emitter,
   name: Bytes,
+  at: Span,
   args: List<Code>,
   params: List<EmitParam>,
-) -> Bool =
+) -> Bool / {abort.raise} = {
+  let full = qualify(emitter.module, name);
   len(args) == len(params)
-    && (qualify(emitter.module, name) == emitter.owner
-    || bytes_starts_with(emitter.owner, bytes_concat(qualify(emitter.module, name), b"@")))
     && fold(emitter.here, false, |acc: Bool, h: Def|
       acc || (h.name == name && h.arity == len(args)))
+    && (full == emitter.owner
+    || (bytes_starts_with(emitter.owner, bytes_concat(full, b"@"))
+    && call_target(emitter, full, def_named(emitter.here, name), at).full == emitter.owner))
+}
 
 /// Whether a body reaches a self call in tail position; the walk is the positions `tail` is kept into.
 fn loops_to_self(emitter: Emitter, code: Code, params: List<EmitParam>) -> Bool / {abort.raise} =
@@ -8328,7 +8334,7 @@ fn loops_to_self(emitter: Emitter, code: Code, params: List<EmitParam>) -> Bool 
     NApp(a) -> match a.func.node {
       NVar(fv) ->
         fv.slot == None && !is_ctor_name(fv.name)
-          && self_tail_leaf(emitter, fv.name, a.args, params),
+          && self_tail_leaf(emitter, fv.name, a.func.span, a.args, params),
       _ -> false,
     },
     NBinary(b) -> (b.op == b"and" || b.op == b"or") && loops_to_self(emitter, b.rhs, params),
@@ -8737,9 +8743,11 @@ pub fn digits(b: Bytes) -> Int =
 fn def_named(defs: List<Def>, name: Bytes) -> Option<Def> =
   fold(defs, None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc })
 
-/// The root a call of `full` through the reference at `at` reaches, and how its answer is held. A
-/// specialisation's call of itself stays in it; a generic callee whose type arguments there are
-/// held apart from a word is reached as its specialisation at them.
+/// The root a call of `full` through the reference at `at` reaches, and how its answer is held: a
+/// generic callee whose type arguments there are held apart from a word is reached as its
+/// specialisation at them. A specialisation's call of its own definition at other type arguments is
+/// of the definition as it stands, whose body restarts where a specialisation's cannot become
+/// another's: a tail call that would loop loops at every type.
 fn call_target(
   emitter: Emitter,
   full: Bytes,
@@ -8761,10 +8769,11 @@ fn call_target(
           },
           _ -> plain,
         };
+      let reached = by_arguments(emitter, full, len(scheme.ty_vars), at, at_args, plain);
       match specialisation_of(emitter.owner) {
-        Some(own) -> if own.base == full { at_args(emitter.owner, own.args) }
-        else { by_arguments(emitter, full, len(scheme.ty_vars), at, at_args, plain) },
-        None -> by_arguments(emitter, full, len(scheme.ty_vars), at, at_args, plain),
+        Some(own) -> if own.base == full && reached.full != emitter.owner { plain }
+        else { reached },
+        None -> reached,
       }
     },
   }
@@ -10145,6 +10154,39 @@ test "a generic definition reached at a type held apart from a word is emitted a
   assert_eq(body(b"m.down@Int").tables.calls, [b"m.down@Int"])
 }
 
+test "a specialisation hands its recursion on to the definitions as they stand where it leaves them" {
+  let src = bytes_concat_all([
+    b"fn spin<a, b>(x: a, y: b, n: Int) -> Int = if n <= 0 { 0 } else { spin(y, x, n - 1) }\n",
+    b"fn ping<a>(x: a, n: Int) -> a = if n <= 0 { x } else { pong(x, n - 1) }\n",
+    b"fn pong<a>(x: a, n: Int) -> a = if n <= 0 { x } else { ping(x, n - 1) }\n",
+    b"fn go() -> Float = { let _ = spin(1.5, 7, 3); ping(1.5, 3) }\n",
+  ]);
+  let answers = answers_of([b"m"], [src], [], [
+    b"m.go",
+    b"m.spin",
+    b"m.spin@Float,Int",
+    b"m.ping",
+    b"m.pong",
+    b"m.ping@Float",
+  ]);
+  let body = |name: Bytes|
+    match fold(answers, None, |acc: Option<RootAnswer>, a: RootAnswer|
+        if a.name == name { Some(a) } else { acc }) {
+      Some(a) -> match a.answer { Body(b) -> b, Refused(r) -> panic(string_of_bytes_lossy(r.why)) },
+      None -> panic("no answer"),
+    };
+  let loops = |name: Bytes| bytes_index_of(body(name).text, b"goto ply_loop;") != None;
+  assert_eq(body(b"m.go").tables.calls, [b"m.spin@Float,Int", b"m.ping@Float"]);
+  // The call hands `y` on as `x`: what is a `Float` here is an `Int` there, so the call is of the
+  // definition as it stands, whose own body restarts.
+  assert_eq(body(b"m.spin@Float,Int").tables.calls, [b"m.spin"]);
+  assert(!loops(b"m.spin@Float,Int"));
+  assert(loops(b"m.spin"));
+  // `ping` and `pong` are one loop under `ping`'s name, which the specialisation enters by `pong`.
+  assert_eq(body(b"m.ping@Float").tables.calls, [b"m.pong"]);
+  assert(loops(b"m.ping"))
+}
+
 test "an operator the checker filed at a definition's variable is done at the type it is at" {
   let src = b"fn same<a>(x: a, y: a) -> Bool = x == y\nfn floats(x: Float, y: Float) -> Bool = same(x, y)\n";
   let answers = answers_of([b"m"], [src], [], [b"m.same", b"m.floats", b"m.same@Float"]);
@@ -10862,7 +10904,7 @@ fn emit_module(
                 schemes,
                 ops,
                 sites,
-                here,
+                held_whole(here, tail_cycle(here, sites, x.module.items, d)),
                 imports,
                 ctors,
                 builtins,
@@ -11094,6 +11136,62 @@ fn prepare(
     } else { None },
   }
 }
+
+/// The other definitions of the module whose tail calls lead from `def` round to it again, each
+/// lowered as far as the walk reaches, wanted or not: the members of the loop `def` runs in.
+fn tail_cycle(
+  here: List<Def>,
+  sites: Map<Bytes, List<Bytes>>,
+  items: List<Item>,
+  def: FnDef,
+) -> List<Bytes> / {abort.raise} = {
+  let fns = fold(items, map_new(), |acc: Map<Bytes, FnDef>, item: Item|
+    match item { IFn(d) -> map_insert(acc, d.name.name, d), _ -> acc });
+  let callees = |name: Bytes|
+    match map_get(fns, name) {
+      None -> [],
+      Some(d) -> match lower_to_emit(
+          map(d.params, |param: Param| param.name.name),
+          map(d.generics.labels, |ident: Ident| ident.name),
+          sites,
+          d.body,
+        ) {
+        Some(l) -> tail_callees(here, l.code, []),
+        None -> [],
+      },
+    };
+  let own = def.name.name;
+  let edges = iterate(
+    { edges: map_new(), work: [own] },
+    1000000,
+    |s: { edges: Map<Bytes, List<Bytes>>, work: List<Bytes> }|
+      match s.work {
+        [] -> Stop(s),
+        [n, ..rest] -> if map_contains(s.edges, n) { Continue({ ..s, work: rest }) } else {
+          let out = callees(n);
+          Continue({ edges: map_insert(s.edges, n, out), work: concat(rest, out) })
+        },
+      },
+  ).edges;
+  let back = iterate(
+    map_insert(map_new(), own, true),
+    map_len(edges) + 1,
+    |seen: Map<Bytes, Bool>| {
+      let more = map_fold(edges, seen, |acc: Map<Bytes, Bool>, n: Bytes, out: List<Bytes>|
+        if map_contains(acc, n)
+            || !fold(out, false, |b: Bool, m: Bytes| b || map_contains(acc, m)) { acc }
+        else { map_insert(acc, n, true) });
+      if map_len(more) == map_len(seen) { Stop(seen) } else { Continue(more) }
+    },
+  );
+  filter(map_keys(back), |n: Bytes| n != own)
+}
+
+/// `here` with each definition named in `names` as a call reaches one that takes no type parameter:
+/// as it stands, at no specialisation.
+fn held_whole(here: List<Def>, names: List<Bytes>) -> List<Def> =
+  if len(names) == 0 { here }
+  else { map(here, |d: Def| if contains(names, d.name) { { ..d, scheme: None } } else { d }) }
 
 /// The module's definitions in tail-call cycles of two or more, each cycle's members in module order: a call in tail
 /// position of one member from another is an edge, so a group is exactly what can run as one loop. A member holding a
