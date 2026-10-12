@@ -29,13 +29,15 @@ fn refused(at: Int, message: String) -> BinError = { at: at, message: message }
 /// A value read, and the offset after it.
 pub type Taken<a> = { value: a, at: Int }
 
+/// How a value is appended to the bytes written so far.
+pub type Put<a> = (Bytes, a) -> Bytes / {abort.raise}
+
+/// How a value is read at an offset: the value and the offset after it, or why the bytes hold none.
+pub type Take<a> = (Bytes, Int) -> Result<Taken<a>, BinError> / {abort.raise}
+
 /// `shape` digests the type's structure, names included, so bytes written under another
 /// definition of a type are told apart from its own.
-pub type BinCodec<a> = {
-  put: (Bytes, a) -> Bytes / {abort.raise},
-  take: (Bytes, Int) -> Result<Taken<a>, BinError> / {abort.raise},
-  shape: Shape,
-}
+pub type BinCodec<a> = { put: Put<a>, take: Take<a>, shape: Shape }
 
 /// The deepest a derived codec over a recursive type nests, which is as deep as calls nest.
 pub fn max_depth() -> Int = 10000
@@ -552,41 +554,28 @@ pub fn i64_bin() -> BinCodec<I64> = { put: put_i64, take: take_i64, shape: leaf_
 pub fn i128_bin() -> BinCodec<I128> = { put: put_i128, take: take_i128, shape: leaf_shape("I128") }
 
 // --- Structural codecs ------------------------------------------------------
+// Each is its writer and its reader over those of its parts, which a derived codec calls with its
+// own; the codec is the two beside the shape.
 
-/// A count and the items.
-pub fn list_bin<a>(item: BinCodec<a>) -> BinCodec<List<a>> =
-  {
-    put: |w: Bytes, xs: List<a>| fold(xs, put_varint(w, len(xs)), item.put),
-    take: |d: Bytes, at: Int|
-      match take_count(d, at) {
-        Err(e) -> Err(e),
-        Ok(n) -> take_items(d, n.at, n.value, item.take, []),
-      },
-    shape: |shapes: Shapes| applied_shape(shapes, "List", [item.shape]),
-  }
+/// Appends a count and the items, each by `put`.
+pub fn put_list<a>(w: Bytes, xs: List<a>, put: Put<a>) -> Bytes / {abort.raise} =
+  fold(xs, put_varint(w, len(xs)), put)
 
-/// An array is written as a list is, under a shape of its own, so turning one into the other moves
-/// the shape's digest.
-pub fn array_bin<a>(item: BinCodec<a>) -> BinCodec<Array<a>> = {
-  let items = list_bin(item);
-  {
-    put: |w: Bytes, xs: Array<a>| (items.put)(w, array_to_list(xs)),
-    take: |d: Bytes, at: Int|
-      match (items.take)(d, at) {
-        Ok(t) -> Ok({ value: array_of_list(t.value), at: t.at }),
-        Err(e) -> Err(e),
-      },
-    shape: |shapes: Shapes| applied_shape(shapes, "Array", [item.shape]),
-  }
-}
+/// Reads a count and that many items, each by `take`.
+pub fn take_list<a>(
+  d: Bytes,
+  at: Int,
+  take: Take<a>,
+) -> Result<Taken<List<a>>, BinError> / {abort.raise} =
+  match take_count(d, at) { Err(e) -> Err(e), Ok(n) -> take_items(d, n.at, n.value, take, []) }
 
-fn take_items<a | e>(
+fn take_items<a>(
   d: Bytes,
   at: Int,
   left: Int,
-  take: (Bytes, Int) -> Result<Taken<a>, BinError> / e,
+  take: Take<a>,
   acc: List<a>,
-) -> Result<Taken<List<a>>, BinError> / e =
+) -> Result<Taken<List<a>>, BinError> / {abort.raise} =
   if left <= 0 { t_ok(acc, at) } else {
     match take(d, at) {
       Err(e) -> Err(e),
@@ -594,48 +583,88 @@ fn take_items<a | e>(
     }
   }
 
-/// Entries in key order; a reader refuses keys out of order, so a map has one encoding.
-pub fn map_bin<k, v>(key: BinCodec<k>, value: BinCodec<v>) -> BinCodec<Map<k, v>>
+/// A count and the items.
+pub fn list_bin<a>(item: BinCodec<a>) -> BinCodec<List<a>> =
+  {
+    put: |w: Bytes, xs: List<a>| put_list(w, xs, item.put),
+    take: |d: Bytes, at: Int| take_list(d, at, item.take),
+    shape: |shapes: Shapes| applied_shape(shapes, "List", [item.shape]),
+  }
+
+/// Appends an array as the list of its items.
+pub fn put_array<a>(w: Bytes, xs: Array<a>, put: Put<a>) -> Bytes / {abort.raise} =
+  put_list(w, array_to_list(xs), put)
+
+/// Reads an array as a list is read.
+pub fn take_array<a>(
+  d: Bytes,
+  at: Int,
+  take: Take<a>,
+) -> Result<Taken<Array<a>>, BinError> / {abort.raise} =
+  match take_list(d, at, take) {
+    Ok(t) -> Ok({ value: array_of_list(t.value), at: t.at }),
+    Err(e) -> Err(e),
+  }
+
+/// An array is written as a list is, under a shape of its own, so turning one into the other moves
+/// the shape's digest.
+pub fn array_bin<a>(item: BinCodec<a>) -> BinCodec<Array<a>> =
+  {
+    put: |w: Bytes, xs: Array<a>| put_array(w, xs, item.put),
+    take: |d: Bytes, at: Int| take_array(d, at, item.take),
+    shape: |shapes: Shapes| applied_shape(shapes, "Array", [item.shape]),
+  }
+
+/// Appends a count and the entries in key order, a key by `put_key` and its value by `put_value`.
+pub fn put_map<k, v>(
+  w: Bytes,
+  m: Map<k, v>,
+  put_key: Put<k>,
+  put_value: Put<v>,
+) -> Bytes / {abort.raise}
+  where derivable(ord, k)
+= map_fold(m, put_varint(w, map_len(m)), |acc: Bytes, x: k, y: v| put_value(put_key(acc, x), y))
+
+/// Reads a count and that many entries, refusing keys out of order.
+pub fn take_map<k, v>(
+  d: Bytes,
+  at: Int,
+  take_key: Take<k>,
+  take_value: Take<v>,
+) -> Result<Taken<Map<k, v>>, BinError> / {abort.raise}
   where derivable(ord, k)
 =
-  {
-    put: |w: Bytes, m: Map<k, v>|
-      map_fold(m, put_varint(w, map_len(m)), |acc: Bytes, x: k, y: v|
-        (value.put)((key.put)(acc, x), y)),
-    take: |d: Bytes, at: Int|
-      match take_count(d, at) {
-        Err(e) -> Err(e),
-        Ok(n) -> take_entries(d, n.at, n.value, key, value, None, map_new()),
-      },
-    shape: |shapes: Shapes| applied_shape(shapes, "Map", [key.shape, value.shape]),
+  match take_count(d, at) {
+    Err(e) -> Err(e),
+    Ok(n) -> take_entries(d, n.at, n.value, take_key, take_value, None, map_new()),
   }
 
 fn take_entries<k, v>(
   d: Bytes,
   at: Int,
   left: Int,
-  key: BinCodec<k>,
-  value: BinCodec<v>,
+  take_key: Take<k>,
+  take_value: Take<v>,
   last: Option<k>,
   acc: Map<k, v>,
 ) -> Result<Taken<Map<k, v>>, BinError> / {abort.raise}
   where derivable(ord, k)
 =
   if left <= 0 { t_ok(acc, at) } else {
-    match (key.take)(d, at) {
+    match take_key(d, at) {
       Err(e) -> Err(e),
       Ok(x) -> {
         let ordered = match last { None -> true, Some(l) -> compare_values(l, x.value) == Less };
         if !ordered { Err(refused(at, "a map key out of order")) } else {
-          match (value.take)(d, x.at) {
+          match take_value(d, x.at) {
             Err(e) -> Err(e),
             Ok(y) ->
               take_entries(
                 d,
                 y.at,
                 left - 1,
-                key,
-                value,
+                take_key,
+                take_value,
                 Some(x.value),
                 map_insert(acc, x.value, y.value),
               ),
@@ -645,116 +674,173 @@ fn take_entries<k, v>(
     }
   }
 
+/// Entries in key order; a reader refuses keys out of order, so a map has one encoding.
+pub fn map_bin<k, v>(key: BinCodec<k>, value: BinCodec<v>) -> BinCodec<Map<k, v>>
+  where derivable(ord, k)
+=
+  {
+    put: |w: Bytes, m: Map<k, v>| put_map(w, m, key.put, value.put),
+    take: |d: Bytes, at: Int| take_map(d, at, key.take, value.take),
+    shape: |shapes: Shapes| applied_shape(shapes, "Map", [key.shape, value.shape]),
+  }
+
+/// Appends `None` or `Some`, tagged as a variant.
+pub fn put_option<a>(w: Bytes, o: Option<a>, put: Put<a>) -> Bytes / {abort.raise} =
+  match o { None -> put_tag(w, 0), Some(x) -> put(put_tag(w, 1), x) }
+
+/// Reads an `Option` at `at`.
+pub fn take_option<a>(
+  d: Bytes,
+  at: Int,
+  take: Take<a>,
+) -> Result<Taken<Option<a>>, BinError> / {abort.raise} =
+  match take_tag(d, at, 2) {
+    Err(e) -> Err(e),
+    Ok(t) -> if t.value == 0 { t_ok(None, t.at) }
+    else { match take(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Some(x.value), x.at) } },
+  }
+
 /// `None` or `Some`, tagged as a variant.
 pub fn option_bin<a>(item: BinCodec<a>) -> BinCodec<Option<a>> =
   {
-    put: |w: Bytes, o: Option<a>|
-      match o { None -> put_tag(w, 0), Some(x) -> (item.put)(put_tag(w, 1), x) },
-    take: |d: Bytes, at: Int|
-      match take_tag(d, at, 2) {
-        Err(e) -> Err(e),
-        Ok(t) -> if t.value == 0 { t_ok(None, t.at) } else {
-          match (item.take)(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Some(x.value), x.at) }
-        },
-      },
+    put: |w: Bytes, o: Option<a>| put_option(w, o, item.put),
+    take: |d: Bytes, at: Int| take_option(d, at, item.take),
     shape: |shapes: Shapes| applied_shape(shapes, "Option", [item.shape]),
+  }
+
+/// Appends `Ok` or `Err`, tagged as a variant.
+pub fn put_result<a, b>(
+  w: Bytes,
+  r: Result<a, b>,
+  put_ok: Put<a>,
+  put_err: Put<b>,
+) -> Bytes / {abort.raise} =
+  match r { Ok(x) -> put_ok(put_tag(w, 0), x), Err(x) -> put_err(put_tag(w, 1), x) }
+
+/// Reads a `Result` at `at`.
+pub fn take_result<a, b>(
+  d: Bytes,
+  at: Int,
+  take_ok: Take<a>,
+  take_err: Take<b>,
+) -> Result<Taken<Result<a, b>>, BinError> / {abort.raise} =
+  match take_tag(d, at, 2) {
+    Err(e) -> Err(e),
+    Ok(t) -> if t.value == 0 {
+      match take_ok(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Ok(x.value), x.at) }
+    } else { match take_err(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Err(x.value), x.at) } },
   }
 
 /// `Ok` or `Err`, tagged as a variant.
 pub fn result_bin<a, b>(ok: BinCodec<a>, err: BinCodec<b>) -> BinCodec<Result<a, b>> =
   {
-    put: |w: Bytes, r: Result<a, b>|
-      match r { Ok(x) -> (ok.put)(put_tag(w, 0), x), Err(x) -> (err.put)(put_tag(w, 1), x) },
-    take: |d: Bytes, at: Int|
-      match take_tag(d, at, 2) {
-        Err(e) -> Err(e),
-        Ok(t) -> if t.value == 0 {
-          match (ok.take)(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Ok(x.value), x.at) }
-        } else {
-          match (err.take)(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Err(x.value), x.at) }
-        },
-      },
+    put: |w: Bytes, r: Result<a, b>| put_result(w, r, ok.put, err.put),
+    take: |d: Bytes, at: Int| take_result(d, at, ok.take, err.take),
     shape: |shapes: Shapes| applied_shape(shapes, "Result", [ok.shape, err.shape]),
+  }
+
+/// Appends `Continue` or `Stop`, tagged as a variant.
+pub fn put_iter<a, b>(
+  w: Bytes,
+  i: Iter<a, b>,
+  put_more: Put<a>,
+  put_done: Put<b>,
+) -> Bytes / {abort.raise} =
+  match i { Continue(x) -> put_more(put_tag(w, 0), x), Stop(x) -> put_done(put_tag(w, 1), x) }
+
+/// Reads an `Iter` at `at`.
+pub fn take_iter<a, b>(
+  d: Bytes,
+  at: Int,
+  take_more: Take<a>,
+  take_done: Take<b>,
+) -> Result<Taken<Iter<a, b>>, BinError> / {abort.raise} =
+  match take_tag(d, at, 2) {
+    Err(e) -> Err(e),
+    Ok(t) -> if t.value == 0 {
+      match take_more(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Continue(x.value), x.at) }
+    } else { match take_done(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Stop(x.value), x.at) } },
   }
 
 /// `Continue` or `Stop`, tagged as a variant.
 pub fn iter_bin<a, b>(more: BinCodec<a>, done: BinCodec<b>) -> BinCodec<Iter<a, b>> =
   {
-    put: |w: Bytes, i: Iter<a, b>|
-      match i {
-        Continue(x) -> (more.put)(put_tag(w, 0), x),
-        Stop(x) -> (done.put)(put_tag(w, 1), x),
-      },
-    take: |d: Bytes, at: Int|
-      match take_tag(d, at, 2) {
-        Err(e) -> Err(e),
-        Ok(t) -> if t.value == 0 {
-          match (more.take)(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Continue(x.value), x.at) }
-        } else {
-          match (done.take)(d, t.at) { Err(e) -> Err(e), Ok(x) -> t_ok(Stop(x.value), x.at) }
-        },
-      },
+    put: |w: Bytes, i: Iter<a, b>| put_iter(w, i, more.put, done.put),
+    take: |d: Bytes, at: Int| take_iter(d, at, more.take, done.take),
     shape: |shapes: Shapes| applied_shape(shapes, "Iter", [more.shape, done.shape]),
   }
+
+/// Appends an `Instant` as its nanoseconds.
+pub fn put_instant(w: Bytes, t: Instant) -> Bytes / {abort.raise} =
+  match t { Instant(n) -> put_int(w, n) }
+
+/// Reads an `Instant` at `at`.
+pub fn take_instant(d: Bytes, at: Int) -> Result<Taken<Instant>, BinError> / {abort.raise} =
+  match take_int(d, at) { Err(e) -> Err(e), Ok(t) -> t_ok(Instant(t.value), t.at) }
 
 /// An `Instant` and a `Duration` are their nanoseconds.
 pub fn instant_bin() -> BinCodec<Instant> =
   {
-    put: |w: Bytes, t: Instant| match t { Instant(n) -> put_int(w, n) },
-    take: |d: Bytes, at: Int|
-      match take_int(d, at) { Err(e) -> Err(e), Ok(t) -> t_ok(Instant(t.value), t.at) },
+    put: put_instant,
+    take: take_instant,
     shape: |shapes: Shapes| applied_shape(shapes, "Instant", []),
   }
+
+/// Appends a `Duration` as its nanoseconds.
+pub fn put_duration(w: Bytes, t: Duration) -> Bytes / {abort.raise} =
+  match t { Duration(n) -> put_int(w, n) }
+
+/// Reads a `Duration` at `at`.
+pub fn take_duration(d: Bytes, at: Int) -> Result<Taken<Duration>, BinError> / {abort.raise} =
+  match take_int(d, at) { Err(e) -> Err(e), Ok(t) -> t_ok(Duration(t.value), t.at) }
 
 /// The codec of `Duration`, as its nanoseconds.
 pub fn duration_bin() -> BinCodec<Duration> =
   {
-    put: |w: Bytes, t: Duration| match t { Duration(n) -> put_int(w, n) },
-    take: |d: Bytes, at: Int|
-      match take_int(d, at) { Err(e) -> Err(e), Ok(t) -> t_ok(Duration(t.value), t.at) },
+    put: put_duration,
+    take: take_duration,
     shape: |shapes: Shapes| applied_shape(shapes, "Duration", []),
+  }
+
+/// Appends an `Ordering` as its constructor's index.
+pub fn put_ordering(w: Bytes, o: Ordering) -> Bytes / {abort.raise} =
+  put_tag(w, match o { Less -> 0, Equal -> 1, Greater -> 2 })
+
+/// Reads an `Ordering` at `at`.
+pub fn take_ordering(d: Bytes, at: Int) -> Result<Taken<Ordering>, BinError> / {abort.raise} =
+  match take_tag(d, at, 3) {
+    Err(e) -> Err(e),
+    Ok(t) -> t_ok(match t.value { 0 -> Less, 1 -> Equal, _ -> Greater }, t.at),
   }
 
 /// The codec of `Ordering`.
 pub fn ordering_bin() -> BinCodec<Ordering> =
   {
-    put: |w: Bytes, o: Ordering| put_tag(w, match o { Less -> 0, Equal -> 1, Greater -> 2 }),
-    take: |d: Bytes, at: Int|
-      match take_tag(d, at, 3) {
-        Err(e) -> Err(e),
-        Ok(t) -> t_ok(match t.value { 0 -> Less, 1 -> Equal, _ -> Greater }, t.at),
-      },
+    put: put_ordering,
+    take: take_ordering,
     shape: |shapes: Shapes| applied_shape(shapes, "Ordering", []),
+  }
+
+/// Appends a `Rounding` as its constructor's index.
+pub fn put_rounding(w: Bytes, r: Rounding) -> Bytes / {abort.raise} =
+  put_tag(w, match r { HalfEven -> 0, HalfUp -> 1, Down -> 2, Up -> 3, Ceiling -> 4, Floor -> 5 })
+
+/// Reads a `Rounding` at `at`.
+pub fn take_rounding(d: Bytes, at: Int) -> Result<Taken<Rounding>, BinError> / {abort.raise} =
+  match take_tag(d, at, 6) {
+    Err(e) -> Err(e),
+    Ok(t) ->
+      t_ok(
+        match t.value { 0 -> HalfEven, 1 -> HalfUp, 2 -> Down, 3 -> Up, 4 -> Ceiling, _ -> Floor },
+        t.at,
+      ),
   }
 
 /// The codec of `Rounding`.
 pub fn rounding_bin() -> BinCodec<Rounding> =
   {
-    put: |w: Bytes, r: Rounding|
-      put_tag(w, match r {
-        HalfEven -> 0,
-        HalfUp -> 1,
-        Down -> 2,
-        Up -> 3,
-        Ceiling -> 4,
-        Floor -> 5,
-      }),
-    take: |d: Bytes, at: Int|
-      match take_tag(d, at, 6) {
-        Err(e) -> Err(e),
-        Ok(t) ->
-          t_ok(
-            match t.value {
-              0 -> HalfEven,
-              1 -> HalfUp,
-              2 -> Down,
-              3 -> Up,
-              4 -> Ceiling,
-              _ -> Floor,
-            },
-            t.at,
-          ),
-      },
+    put: put_rounding,
+    take: take_rounding,
     shape: |shapes: Shapes| applied_shape(shapes, "Rounding", []),
   }
 

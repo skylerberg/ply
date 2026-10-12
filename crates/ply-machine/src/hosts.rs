@@ -4,13 +4,14 @@ use crate::config::Configuration;
 use crate::payload::{count, diags_value, option, places_value, record, strings};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
-    HostRequest, HostResource, HostRow, HostRuntime, Linearity,
+    HostRequest, HostResource, HostRow, HostRuntime, Linearity, MachineId,
 };
 use ply_eval::{CheckOutput, Diagnostic, Footprint, SourceMap, Span, Symbol, Value as PlyValue};
 use ply_host::tls;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// The trusted computing base this binary was built with.
 pub fn registry() -> HostRegistry {
@@ -42,6 +43,46 @@ pub fn hermetic_op(effect: &str, op: &str, linearity: Linearity, path: &'static 
     HostOp {
         determinism: Determinism::Deterministic,
         ..privileged_op(effect, op, linearity, path)
+    }
+}
+
+/// A hermetic half's handler as each machine that asks holds it: a state of its own, made at its
+/// first operation and gone when it ends. A deterministic handler answers from the asking program's
+/// state alone, so two tests that perform its operations at once share nothing of it.
+pub struct Apart<H> {
+    made: Box<dyn Fn() -> H + Send + Sync>,
+    held: Mutex<HashMap<MachineId, Arc<H>>>,
+}
+
+impl<H: HostHandler + 'static> Apart<H> {
+    pub fn of(made: impl Fn() -> H + Send + Sync + 'static) -> Arc<dyn HostHandler> {
+        Arc::new(Apart {
+            made: Box::new(made),
+            held: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
+impl<H: HostHandler> HostHandler for Apart<H> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+        let own = Arc::clone(
+            self.held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(req.machine)
+                .or_insert_with(|| Arc::new((self.made)())),
+        );
+        own.call(rt, req)
+    }
+
+    fn machine_ended(&self, machine: MachineId) {
+        // Dropped after the lock is: a state may join a thread on its way out.
+        let gone = self
+            .held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&machine);
+        drop(gone);
     }
 }
 

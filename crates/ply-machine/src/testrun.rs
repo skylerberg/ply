@@ -83,6 +83,17 @@ impl Drop for Observing {
     }
 }
 
+/// What the binding's handlers kept for a test's machine goes when the test ends, however it does.
+struct Ending<'a>(&'a Hosting, ply_eval::host::MachineId);
+
+impl Drop for Ending<'_> {
+    fn drop(&mut self) {
+        if let Some(binding) = &self.0.binding {
+            binding.machine_ended(self.1);
+        }
+    }
+}
+
 fn entered(
     executor: &Executor<'_>,
     index: usize,
@@ -90,6 +101,7 @@ fn entered(
     seeded: Option<(&Seed, u32, bool)>,
 ) -> Result<Entered, Diagnostic> {
     let mut machine = executor.machine(index)?;
+    let _ending = Ending(&executor.hosting, machine.id());
     let observing = Observing(ply_host::observe::begin(machine.id()));
     if let Some((seed, steps, re_executed)) = seeded {
         machine.set_re_executed(re_executed);

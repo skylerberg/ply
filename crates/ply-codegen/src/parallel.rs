@@ -2,18 +2,14 @@
 //! threads of their own and answered as evaluating them left to right answers.
 
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, call_value, stack_floor};
+use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, PROGRAM_STACK, Reached, call_value, stack_floor};
 use std::cell::Cell;
 use std::sync::OnceLock;
 
 thread_local! {
-    /// The floor of the stack a block waits on, while it waits: the pool runs other branches on a
-    /// waiting worker, on that same stack.
-    static WAITING_FLOOR: Cell<usize> = const { Cell::new(0) };
+    /// The machine whose branch this thread is running, while it runs one, and 0 otherwise.
+    static BRANCH_OF: Cell<u64> = const { Cell::new(0) };
 }
-
-/// Each pool thread's own stack; a branch nesting deeper grows onto stacks of the runtime's own.
-const STACK: usize = 16 << 20;
 
 /// The threads branches run on, one per core; none on a machine with one.
 fn pool() -> Option<&'static rayon::ThreadPool> {
@@ -24,7 +20,7 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
             .then(|| {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(threads)
-                    .stack_size(STACK)
+                    .stack_size(PROGRAM_STACK)
                     .thread_name(|i| format!("ply-parallel-{i}"))
                     .build()
                     .ok()
@@ -34,10 +30,16 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-/// Runs the `n` nullary closures at `slots`, writing each one's answer over it.
-pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize) {
+/// Runs the `n` nullary closures at `slots`, writing each one's answer over it. `reach` is what the
+/// closures may perform, where the block's site knows it.
+pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, reach: Option<&[Reached]>) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
-    let at_once = unsafe { &*ctx }.runs_branches_at_once();
+    let c = unsafe { &*ctx };
+    // A thread that waits on a block takes up the pool's other branches meanwhile. A machine
+    // entered inside another's branch, as a test a run's lane enters is, would then carry a whole
+    // other test on its stack and its clock, so its own blocks run in turn.
+    let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
+    let at_once = !nested && c.runs_branches_at_once(reach);
     match pool() {
         Some(pool) if n >= 2 && at_once && heap::share(branches) => unsafe {
             in_parallel(ctx, pool, branches)
@@ -82,8 +84,8 @@ impl Handed {
         let branch = unsafe { &mut *self.0 };
         let ctx: *mut Ctx = &mut *branch.ctx;
         let c = unsafe { &mut *ctx };
-        let waiting = WAITING_FLOOR.with(|f| f.get());
-        c.stack_floor = if waiting != 0 { waiting } else { stack_floor() };
+        c.stack_floor = stack_floor();
+        let branch_was = BRANCH_OF.with(|of| of.replace(c.id.0));
         let heap_was = heap::swap_current(&mut c.heap);
         let site_was = heap::poison::swap(&raw const c.site_root);
         let mine = c.instances();
@@ -95,6 +97,7 @@ impl Handed {
         ply_eval::instances::swap(instances_were);
         heap::poison::swap(site_was);
         heap::swap_current(heap_was);
+        BRANCH_OF.with(|of| of.set(branch_was));
     }
 }
 
@@ -108,14 +111,12 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
             answer: 0,
         })
         .collect();
-    let waited = WAITING_FLOOR.with(|f| f.replace(parent.stack_floor));
     pool.in_place_scope(|scope| {
         for run in runs.iter_mut() {
             let handed = Handed(run);
             scope.spawn(move |_| unsafe { handed.run() });
         }
     });
-    WAITING_FLOOR.with(|f| f.set(waited));
     // Left to right: the first branch that failed, or that ran past what the budget had left once
     // the branches before it had spent theirs, is how evaluating them in turn would have ended.
     let left = parent.steps_left();

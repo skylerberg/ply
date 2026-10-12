@@ -77,10 +77,6 @@ const HERMETIC_OPERATIONS: [(&str, &str); 7] = [
     ("ended", "ply_machine::claims::hermetic::ended"),
 ];
 
-/// A compiled body honours its call bound on the native stack, where unoptimised frames run to
-/// kilobytes. Reserved, not committed.
-const CLAIMS_STACK: usize = 256 << 20;
-
 /// What the machine is asked to work with, which is every flag that is not about the report.
 pub struct Job {
     pub path: PathBuf,
@@ -102,14 +98,20 @@ pub fn lent(module: &str) -> Vec<LentOp> {
 }
 
 fn lent_by(module: &str, hermetic: bool) -> Vec<LentOp> {
-    let handler: Arc<dyn HostHandler> = Arc::new(ProverHandler {
+    let module = module.to_string();
+    let made = move || ProverHandler {
         hermetic,
         job: Mutex::new(None),
         machine: Mutex::new(None),
         claims: Mutex::new(0),
         judging: RwLock::new(None),
-        module: module.to_string(),
-    });
+        module: module.clone(),
+    };
+    let handler: Arc<dyn HostHandler> = if hermetic {
+        crate::hosts::Apart::of(made)
+    } else {
+        Arc::new(made())
+    };
     let operations = if hermetic {
         HERMETIC_OPERATIONS
     } else {
@@ -409,7 +411,7 @@ impl Machine {
         let (requests, asked) = mpsc::channel();
         let (told, replies) = mpsc::channel();
         let thread = std::thread::Builder::new()
-            .stack_size(CLAIMS_STACK)
+            .stack_size(ply_codegen::rt::PROGRAM_STACK)
             .spawn(move || serve(job, &told, &asked))
             .map_err(|e| unspawned(&e))?;
         Ok(Machine {

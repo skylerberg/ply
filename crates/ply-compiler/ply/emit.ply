@@ -18,7 +18,8 @@ import derive (expand_derives)
 import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
               EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
               facts_at, test_owner, law_root, cases_root)
-import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
+              is_diverges)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
               analyse_pulling_std_with, dump_of, WalkedFacts, walked_facts_bin, facts_read,
@@ -119,7 +120,9 @@ fn as_num(value: CValue, width: Width) -> Bytes =
 /// An emitted value: the kind it is held at and the C expression naming it.
 pub type CValue = { kind: Kind, expr: Bytes, ty: Ty }
 
-pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
+/// `TyArr`: an array, with how it holds its elements where its element type says (as a record's field
+/// `e` of that type is held), and `None` where the type is a variable's.
+pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArr(Option<FieldTy>)
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
@@ -3078,18 +3081,12 @@ fn inline_len(
           let fits = match o.value.ty {
             TyList -> name == b"len",
             TyBytes -> name == b"bytes_len",
-            TyArray -> name == b"array_len",
+            TyArr(_) -> name == b"array_len",
             _ -> false,
           };
           if !fits { Some(kind_tested(o.emitter, name, o.value, None)) } else {
             let t = bind(o.emitter, KBoxed, as_word(o.value));
-            Some(
-              bind(
-                t.emitter,
-                KInt,
-                bytes_concat_all([b"(int64_t)ply_obj(", t.value.expr, b")->len"]),
-              ),
-            )
+            Some(bind(t.emitter, KInt, length_of(name, t.value.expr)))
           }
         },
       },
@@ -3348,7 +3345,7 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
     NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
     NLambda(l) -> NLambda({ ..l, body: go(l.body) }),
     NSimulate(x) -> NSimulate({ ..x, body: go(x.body) }),
-    NParallel(pr) -> NParallel({ branches: map(pr.branches, go) }),
+    NParallel(pr) -> NParallel({ ..pr, branches: map(pr.branches, go) }),
     NHandle(h) ->
       NHandle({
         body: go(h.body),
@@ -3558,6 +3555,12 @@ fn wrapped(emitter: Emitter, name: Bytes, v0: CValue, v1: CValue, t: Width) -> W
   }
 }
 
+/// A list's, a byte string's or an array's length, read off its header: an array holding its
+/// elements in place counts its words a stride at a time.
+fn length_of(name: Bytes, w: Bytes) -> Bytes =
+  if name == b"array_len" { bytes_concat_all([b"ply_array_len(", w, b")"]) }
+  else { bytes_concat_all([b"(int64_t)ply_obj(", w, b")->len"]) }
+
 /// A kind test: the header's field (or a bounds-tested byte) fast, the runtime's call slow, which raises on a wrong kind.
 fn kind_tested(
   emitter: Emitter,
@@ -3640,9 +3643,9 @@ fn kind_tested(
           ok.name,
           b") { ",
           out.name,
-          b" = (int64_t)ply_obj(",
-          t.value.expr,
-          b")->len; } else {",
+          b" = ",
+          length_of(name, t.value.expr),
+          b"; } else {",
         ]),
       );
       line(
@@ -3811,66 +3814,117 @@ fn inline_get(
       None -> None,
       Some(i0) -> match expr(notail(emitter), a0, params) {
         None -> None,
-        Some(av0) -> if av0.value.ty != TyArray { None } else {
-          // The array is read before the index and bound after, as `inline_at` reads its bytes.
-          let av = secure_across(av0.emitter, av0.value, i0, params);
-          match expr(notail(av.emitter), i0, params) {
-            None -> None,
-            Some(iv0) -> {
-              let t = bind(site(iv0.emitter, span), KBoxed, as_word(av.value));
-              let idx = bind(t.emitter, KInt, as_int(iv0.value));
-              let g = line(
-                idx.emitter,
-                bytes_concat_all([
-                  b"if ((uint64_t)",
-                  idx.value.expr,
-                  b" >= (uint64_t)ply_obj(",
-                  t.value.expr,
-                  b")->len) { ply_inc(",
-                  t.value.expr,
-                  b"); ",
-                  builtin_call_over(b"array_get", [
+        Some(av0) -> match av0.value.ty {
+          TyArr(Some(element)) -> {
+            // The array is read before the index and bound after, as `inline_at` reads its bytes.
+            let av = secure_across(av0.emitter, av0.value, i0, params);
+            match expr(notail(av.emitter), i0, params) {
+              None -> None,
+              Some(iv0) -> {
+                let t = bind(site(iv0.emitter, span), KBoxed, as_word(av.value));
+                let idx = bind(t.emitter, KInt, as_int(iv0.value));
+                let g = line(
+                  idx.emitter,
+                  bytes_concat_all([
+                    b"if ((uint64_t)",
+                    idx.value.expr,
+                    b" >= (uint64_t)ply_array_len(",
                     t.value.expr,
-                    bytes_concat_all([
-                      b"(ply_fits_imm(",
-                      idx.value.expr,
-                      b") ? ply_imm(",
-                      idx.value.expr,
-                      b") : rt_box_int_p(ctx, ",
-                      idx.value.expr,
-                      b"))",
+                    b")) { ply_inc(",
+                    t.value.expr,
+                    b"); ",
+                    builtin_call_over(b"array_get", [
+                      t.value.expr,
+                      bytes_concat_all([
+                        b"(ply_fits_imm(",
+                        idx.value.expr,
+                        b") ? ply_imm(",
+                        idx.value.expr,
+                        b") : rt_box_int_p(ctx, ",
+                        idx.value.expr,
+                        b"))",
+                      ]),
                     ]),
+                    b"; ",
+                    leaving(idx.emitter),
+                    b" }",
                   ]),
-                  b"; ",
-                  leaving(idx.emitter),
-                  b" }",
-                ]),
-              );
-              let r = fresh(g);
-              let loaded = line(
-                r.emitter,
-                bytes_concat_all([
-                  b"Word ",
-                  r.name,
-                  b" = ply_words(",
-                  t.value.expr,
-                  b")[",
-                  idx.value.expr,
-                  b"]; ply_inc(",
-                  r.name,
-                  b");",
-                ]),
-              );
-              Some({
-                emitter: note_holder(loaded, r.name),
-                value: { kind: KBoxed, expr: r.name, ty: TyOpen },
-              })
-            },
-          }
+                );
+                Some(element_read(g, t.value.expr, idx.value.expr, element))
+              },
+            }
+          },
+          _ -> None,
         },
       },
     },
   }
+
+/// Element `i` of array `a`, whose elements are held as a record's field `e` of their type is: a
+/// record in place as the address of its header there, a `Float` or a 64-bit width as its bits,
+/// anything else as its word, each held as the array's element is once read.
+fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithValue = {
+  let r = fresh(emitter);
+  match element.ty {
+    TyRec(fs) -> {
+      let l = laid_of(fs);
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          b"Word ",
+          r.name,
+          b" = (Word)(intptr_t)(ply_words(",
+          a,
+          b") + ",
+          i,
+          b" * ",
+          ascii_of_int(2 + l.width + l.tail),
+          b"); ply_inc(",
+          r.name,
+          b");",
+        ]),
+      );
+      {
+        emitter: note_holder(loaded, r.name),
+        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+      }
+    },
+    _ -> if raw_slot(element.kind) {
+      let word = bytes_concat_all([b"ply_words(", a, b")[", i, b"]"]);
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          ctype(element.kind),
+          b" ",
+          r.name,
+          b" = ",
+          raw_read(word, element.kind),
+          b";",
+        ]),
+      );
+      { emitter: loaded, value: { kind: element.kind, expr: r.name, ty: TyOpen } }
+    } else {
+      let loaded = line(
+        r.emitter,
+        bytes_concat_all([
+          b"Word ",
+          r.name,
+          b" = ply_words(",
+          a,
+          b")[",
+          i,
+          b"]; ply_inc(",
+          r.name,
+          b");",
+        ]),
+      );
+      {
+        emitter: note_holder(loaded, r.name),
+        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+      }
+    },
+  }
+}
 
 fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
@@ -6067,7 +6121,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       }
     },
     // `parallel { .. }`: the branches' closures go to the runtime, which runs them at once where it may
-    // and in order where it must, and writes each one's answer over its closure.
+    // and in order where it must, and writes each one's answer over its closure. Where the block's
+    // definition says what the branches may perform, the runtime is told, so a handler none of it
+    // reaches does not keep them in order.
     NParallel(pr) -> match items(emitter, pr.branches, params, 0, []) {
       None -> None,
       Some(w) -> {
@@ -6077,18 +6133,68 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           arr.emitter,
           bytes_concat_all([b"Word ", arr.name, b"[] = {", bytes_join(w.names, b", "), b"};"]),
         );
-        let ran = check(
-          line(
-            site(held, c.span),
-            bytes_concat_all([
-              b"rt_parallel_p(ctx, (Word)(intptr_t)",
-              arr.name,
-              b", ",
-              ascii_of_int(n),
-              b");",
-            ]),
-          ),
-        );
+        let ran = match if pr.rooted { owner_reach(held) } else { None } {
+          None ->
+            check(
+              line(
+                site(held, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b");",
+                ]),
+              ),
+            ),
+          Some(reach) -> {
+            let named = fold(
+              reach,
+              { emitter: held, words: [] },
+              |acc: { emitter: Emitter, words: List<Bytes> }, r: Reached| {
+                let ef = field_of(acc.emitter, r.effect);
+                match r.resource {
+                  None ->
+                    { emitter: ef.emitter, words: concat(acc.words, [field_ref(ef.i), b"-1"]) },
+                  Some(name) -> {
+                    let res = field_of(ef.emitter, name);
+                    {
+                      emitter: res.emitter,
+                      words: concat(acc.words, [field_ref(ef.i), field_ref(res.i)]),
+                    }
+                  },
+                }
+              },
+            );
+            let table = fresh(named.emitter);
+            let listed = line(
+              table.emitter,
+              bytes_concat_all([
+                b"Word ",
+                table.name,
+                b"[] = {",
+                if len(named.words) == 0 { b"0" } else { bytes_join(named.words, b", ") },
+                b"};",
+              ]),
+            );
+            check(
+              line(
+                site(listed, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_past_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b", (Word)(intptr_t)",
+                  table.name,
+                  b", ",
+                  ascii_of_int(len(reach)),
+                  b");",
+                ]),
+              ),
+            )
+          },
+        };
         let names = map(range(0, n), |i: Int| bytes_concat(b"_", ascii_of_int(i)));
         let words = map(range(0, n), |i: Int|
           bytes_concat_all([arr.name, b"[", ascii_of_int(i), b"]"]));
@@ -6099,6 +6205,41 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
     },
     _ -> Some(refused(emitter, b"an effect construct or another node this port does not emit")),
+  }
+
+/// What a `parallel` block's branches may perform of one effect, by its program-wide name: on the
+/// resource named, or on any.
+type Reached = { effect: Bytes, resource: Option<Bytes> }
+
+/// Every operation the definition being emitted may perform and does not answer, as its row has
+/// it: what a block in its own body may reach of the handlers its callers installed. `None` where
+/// the row does not say: a root that is no definition, a group's shared function and a row left
+/// open. A row names an effect program-wide, as a frame's clause does.
+fn owner_reach(emitter: Emitter) -> Option<List<Reached>> =
+  if len(emitter.group) > 0 { None } else {
+    match fold(emitter.here, None, |found: Option<Scheme>, d: Def| {
+        let full = qualify(emitter.module, d.name);
+        if full == emitter.owner || bytes_starts_with(emitter.owner, bytes_concat(full, b"@")) {
+          d.scheme
+        } else { found }
+      }) {
+      None -> None,
+      Some(s) -> match s.ty {
+        TyFn(f) -> match f.effects.tail {
+          Some(_) -> None,
+          None ->
+            Some(
+              // Nothing performs `diverges`: it says only that the body may not return.
+              map(filter(f.effects.atoms, |atom: Atom| !is_diverges(atom)), |atom: Atom|
+                {
+                  effect: atom.effect,
+                  resource: match atom.resource { RNamed(name) -> Some(name), _ -> None },
+                }),
+            ),
+        },
+        _ -> None,
+      },
+    }
   }
 
 /// The operations a `simulate` region answers, named as the fixpoint names a handled operation.
@@ -8294,7 +8435,12 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
     else if len(c.args) == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
     else if len(c.args) == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
-    else if len(c.args) == 1 && c.name == b"Array" { { kind: KBoxed, ty: TyArray } }
+    else if len(c.args) == 1 && c.name == b"Array" {
+      {
+        kind: KBoxed,
+        ty: TyArr(match list_at(c.args, 0) { Some(e) -> array_element(e), None -> None }),
+      }
+    }
     // A width below 64 bits is carried in a register; the wider ones are the runtime's own words.
     else if len(c.args) == 0 {
       match width_named(c.name) {
@@ -8314,6 +8460,18 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
   }
 
 fn boxed() -> { kind: Kind, ty: Ty } = { kind: KBoxed, ty: TyOpen }
+
+/// How an array of `t` holds each element, as a record's field `e` of the type is held; `None`
+/// where that depends on what the elements turn out to be: a variable's type, or a record holding
+/// one.
+fn array_element(t: Type) -> Option<FieldTy> =
+  match t {
+    TyVar(_) -> None,
+    TyRecord(fs) -> if open_fields(fs) { None } else { Some(field_ty({ name: b"e", ty: t })) },
+    TyNominal(x) -> if open_fields(x.fields) { None }
+    else { Some(field_ty({ name: b"e", ty: t })) },
+    _ -> Some(field_ty({ name: b"e", ty: t })),
+  }
 
 fn open_fields(fs: List<Field>) -> Bool =
   fold(fs, false, |open: Bool, f: Field|
@@ -9453,6 +9611,22 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   assert_eq(map(bodies, |body: Bytes| bytes_index_of(body, b"return")), [None, None])
 }
 
+test "a `parallel` block tells the runtime its definition's row only where that row holds all its branches reach" {
+  let src = bytes_concat_all([
+    b"effect meter { read level() -> Int }\n",
+    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
+    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
+    b"fn handled() -> (Int, Int) = handle { parallel { meter.level(), meter.level() } } with { meter.level() -> 0 }\n",
+    b"fn nested(xs: List<Int>) -> List<(Int, Int)> = map(xs, |m: Int| parallel { m + 1, m + 2 })\n",
+    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"map"], true);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
+  let calls = |helper: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, helper) != None);
+  assert_eq(calls(b"rt_parallel_past_p(ctx, "), [true, true, false, false, false]);
+  assert_eq(calls(b"rt_parallel_p(ctx, "), [false, false, true, true, true])
+}
+
 test "a `return` a `handle` body emitted is seen, however its lines were joined since" {
   let failing = b"  if (ctx->failed) return 0;\n";
   assert(leaves_unlanded([b"  x;\n"], [b"  x;\n", failing]));
@@ -9644,6 +9818,25 @@ test "a 64-bit width is held in a C register of its type, and in a record as its
   assert_eq(has(b"] = (Word)("), [true, false, false, false, false]);
   assert_eq(has(b"rt_box_fixed_p"), [false, true, true, true, false]);
   assert_eq(has(b"rt_record_p"), [false, false, false, false, true])
+}
+
+test "an array holds its records in place and its floats as their bits" {
+  let src = bytes_concat_all([
+    b"type Point = { x: Float, y: Float }\n",
+    b"fn second_x(ps: Array<Point>) -> Float / {abort.raise} = array_get(ps, 1).x\n",
+    b"fn bumped(xs: Array<Float>, i: Int) -> Float / {abort.raise} = array_get(xs, i) + 1.0\n",
+    b"fn count(ps: Array<Point>) -> Int = array_len(ps)\n",
+    b"fn element_of<a>(xs: Array<a>, i: Int) -> a / {abort.raise} = array_get(xs, i)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"array_get", b"array_len"], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  // A point takes a header's two words and its own two: element `i` is the header `4 * i` words in.
+  assert_eq(has(b" * 4); ply_inc("), [true, false, false, false]);
+  assert_eq(has(b"ply_f64(ply_words("), [false, true, false, false]);
+  assert_eq(has(b"ply_array_len("), [true, true, true, false]);
+  // An array of a variable's type is the runtime's to read.
+  assert_eq(has(b"array_get"), [true, true, false, true])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {
