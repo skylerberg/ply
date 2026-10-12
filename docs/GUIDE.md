@@ -3479,5 +3479,5 @@ and `hello.ply` (sockets, an HTTP endpoint); `orders.ply` (`derive json`);
 own type);
 `store.ply` (a handler as a capability grant); `agreement.ply` and
 `twin_divergence_audit.ply` (`std.db`'s twin against recorded PostgreSQL
-answers); `desk.ply` (a service over PostgreSQL or its in-memory twin, whose
+answers); `service.ply` (a service over PostgreSQL or its in-memory twin, whose
 store, TLS and accept loop are configuration, with tracing and shutdown).

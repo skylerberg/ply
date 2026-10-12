@@ -406,9 +406,9 @@ LOG
     "12.0 Cache restored from key: fixture-key" "a cache line and its offset"
   rm -f "$fixture"
 
-  check "$(printf '%s\t%s\t%s\n' 0 100 build 103 500 lanes 600 101 refresh 602 700 desks 705 705 gate |
+  check "$(printf '%s\t%s\t%s\n' 0 100 build 103 500 lanes 600 101 refresh 602 700 services 705 705 gate |
     chain 0 705 | awk '{ printf "%s%s %s", sep, $1, $2; sep = ", " }')" \
-    "100s build, 397s lanes, 98s desks, 0s gate, 110s not" \
+    "100s build, 397s lanes, 98s services, 0s gate, 110s not" \
     "the chain past a job stamped as ending before it starts and one that took no time"
 
   [ "$fail" -eq 0 ] || exit 1
