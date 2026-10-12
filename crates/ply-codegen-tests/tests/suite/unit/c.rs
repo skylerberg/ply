@@ -95,10 +95,11 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
 #[test]
 fn a_unit_says_how_it_lays_out_records() {
     let mut exports = units::exports_of(&[]);
-    for (in_place, raw_widths) in [(true, true), (true, false), (false, true), (false, false)] {
+    for bits in 0..8 {
         exports.layout = ply_codegen::heap::RecordLayout {
-            in_place,
-            raw_widths,
+            in_place: bits & 1 != 0,
+            raw_widths: bits & 2 != 0,
+            inline_arrays: bits & 4 != 0,
         };
         let read =
             ply_codegen::c::Exports::decode(&exports.encode()).expect("the table reads back");
