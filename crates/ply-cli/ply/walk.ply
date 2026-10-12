@@ -1,7 +1,8 @@
 //! Finding the files a path names, each under the root its path resolved to, which is the root it
 //! is read and written through. A file named on the command line is taken whatever it is called, a
 //! directory is walked for `.ply` files, and a symlink is refused rather than followed, since a
-//! rewrite through one leaves the root.
+//! rewrite through one leaves the root. A load reads a package's own modules: a directory below
+//! its root that holds a `ply.pkg` is another package's.
 
 import paths
 import paths (Rooted, child, displayed, kind, list_dir, at_abs)
@@ -34,21 +35,44 @@ pub fn named(
 ) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
   match kind(rooted) {
     File -> keep(found, rooted),
-    Dir -> walk(found, rooted, walk_room()),
+    Dir -> walk(found, rooted, walk_room(), false),
     Symlink -> refuse(found, rooted, "a symlink is not followed"),
     Missing -> refuse(found, rooted, "could not read"),
   }
 
+/// A package's modules: every `.ply` file under its root but those of a package below it, which a
+/// directory holding a `ply.pkg` of its own is.
+pub fn package(
+  found: Found,
+  root: Rooted,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
+  walk(found, root, walk_room(), true)
+
+/// What a load reads of a path: the modules of its root where that holds a `ply.pkg`, which is a
+/// package whatever the line named in it, and otherwise what the line named, as it stands.
+pub fn loading(
+  found: Found,
+  resolved: paths::Resolved,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+  let root: Rooted = { label: resolved.label, path: resolved.spelling };
+  if kind(child(root, "ply.pkg")) == Missing { named(found, paths::rooted(resolved)) }
+  else { package(found, root) }
+}
+
 /// One entry of a directory, never followed; a `.ply` one it cannot look at is refused as unread.
+/// `own` passes over a directory that is a package of its own.
 fn entry(
   found: Found,
   rooted: Rooted,
   name: String,
   room: Int,
+  own: Bool,
 ) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
   match kind(rooted) {
     File -> if is_ply(name) { keep(found, rooted) } else { found },
-    Dir -> if skipped(name) || room <= 0 { found } else { walk(found, rooted, room - 1) },
+    Dir -> if skipped(name) || room <= 0 || (own && kind(child(rooted, "ply.pkg")) != Missing) {
+      found
+    } else { walk(found, rooted, room - 1, own) },
     Symlink -> found,
     Missing -> if is_ply(name) { refuse(found, rooted, "could not read") } else { found },
   }
@@ -57,11 +81,12 @@ fn walk(
   found: Found,
   dir: Rooted,
   room: Int,
+  own: Bool,
 ) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
   match list_dir(dir) {
     None -> refuse(found, dir, "could not read"),
     Some(names) ->
-      fold(names, found, |acc: Found, name: String| entry(acc, child(dir, name), name, room)),
+      fold(names, found, |acc: Found, name: String| entry(acc, child(dir, name), name, room, own)),
   }
 
 /// Every path a command was given, each under the root it resolved to, merged into one answer; no
@@ -71,6 +96,14 @@ pub fn sweep(
 ) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
   let rs = if len(rs) == 0 { [paths::here()] } else { rs };
   fold(rs, nothing(), |acc: Found, resolved: paths::Resolved| named(acc, paths::rooted(resolved)))
+}
+
+/// Every file a load of the paths a command was given reads, merged into one answer.
+pub fn loads(
+  rs: List<paths::Resolved>,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+  let rs = if len(rs) == 0 { [paths::here()] } else { rs };
+  fold(rs, nothing(), |acc: Found, resolved: paths::Resolved| loading(acc, resolved))
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -98,6 +131,33 @@ test "the walk passes over a symlink, a hidden directory, `target` and anything 
   assert_eq(found.errors, [])
 }
 
+/// The files found under a package with a vendored one below it: as its own modules, or as files.
+fn found_with_vendored(own: Bool) -> List<String> / {abort.raise} = {
+  let tree = mem_of([
+    { path: "ply.pkg", body: b"" },
+    { path: "m.ply", body: b"fn m() -> Int = 1" },
+    { path: "sub/deep.ply", body: b"fn d() -> Int = 1" },
+    { path: "vendor/lib/ply.pkg", body: b"" },
+    { path: "vendor/lib/lib.ply", body: b"pub fn l() -> Int = 1" },
+  ]);
+  handle {
+    map_keys(
+      (if own { loading(nothing(), paths::at_cwd(".")) }
+      else { named(nothing(), in_cwd(".")) }).files,
+    )
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+  }
+}
+
+test "a package's walk passes over a package below it, which a walk of the files there does not" {
+  assert_eq(found_with_vendored(true), ["m.ply", "sub/deep.ply"]);
+  assert_eq(found_with_vendored(false), ["m.ply", "sub/deep.ply", "vendor/lib/lib.ply"])
+}
+
 test "a named symlink is refused rather than followed" {
   let found = handle {
     named(nothing(), in_cwd("link.ply"))
@@ -114,7 +174,7 @@ test "a named symlink is refused rather than followed" {
 test "a named file is taken whatever it is called, and a walked one only when it is `.ply`" {
   let tree = mem_of([{ path: "notes.txt", body: b"x" }]);
   let both = handle {
-    walk(named(nothing(), in_cwd("notes.txt")), in_cwd("."), walk_room())
+    walk(named(nothing(), in_cwd("notes.txt")), in_cwd("."), walk_room(), false)
   } with {
     fs.list_dir[cwd](p) -> mem_list(tree, p),
     fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
