@@ -2999,7 +2999,6 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 | 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
@@ -3012,7 +3011,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
@@ -3169,14 +3168,7 @@ the program while every pass it took is still in the test store; otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
-beside the phases of this run, all of it read. A `--json` run of several
-`--filter`s also keeps, for each, the answer a run of it alone gives. `--kept`
-answers only from what was kept, and only from an answer no mark is on, so it
-asks nothing again: where no kept answer of the whole command line stands, a run
-of several filters asks each what a run of it alone kept, exits 0 where every
-one is answered and otherwise lists the rest under `unanswered`; exit 4 is a run
-nothing kept answers, with nothing loaded, so a caller can tell which runs have
-work before starting them.
+beside the phases of this run, all of it read.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,

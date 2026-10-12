@@ -47,8 +47,8 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
 - The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-corpus.sh run
   cli-<module>` runs one module with the grants CI gives it.
-- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and cuts
-  the nextest shards and the corpus partitions from the durations CI measured.
+- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and lists the Ply
+  runs, each one `ply test` of a package, and the jobs that take them.
 - `ply bootstrap` builds the builder (`crates/ply-compiler/ply`'s `build.main`) with the `ply` that
   runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
   `ply` that made. So only the compiler and the shipped modules it imports (`grep '^import std'
