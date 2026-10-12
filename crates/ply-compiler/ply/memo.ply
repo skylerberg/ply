@@ -147,8 +147,12 @@ pub fn digest_of(answer: Option<Bytes>) -> Bytes =
 fn layout() -> Bytes = b"ply.memo.7"
 
 /// What a query's answer for `input` is kept under: its definition's hash and the input's digest.
-pub fn key_of(q: Query, input: Bytes) -> Bytes =
-  blake3(bytes_concat_all([layout(), b"\x00", q.hash, b"\x00", blake3(input)]))
+pub fn key_of(q: Query, input: Bytes) -> Bytes = key_under(q.hash, input)
+
+/// What the answer of the query that hashes to `hash` is kept under for `input`: what a record that
+/// holds the two is named by, where a store of this layout kept it.
+pub fn key_under(hash: Bytes, input: Bytes) -> Bytes =
+  blake3(bytes_concat_all([layout(), b"\x00", hash, b"\x00", blake3(input)]))
 
 fn sized(b: Bytes) -> Bytes = bytes_concat(u64_le(bytes_len(b)), b)
 
@@ -759,8 +763,22 @@ fn asked_names(reads: List<Read>) -> Map<Bytes, Bool> =
   fold(reads, map_new(), |acc: Map<Bytes, Bool>, r: Read|
     match r { Asked(name, _, _) -> map_insert(acc, name, true), World(_, _, _) -> acc })
 
+/// The places a record that made `reads` stands on, by what a store notes each under: what it read
+/// of the world, the hash of each query it asked, and what a trusted packed record answered it.
+pub fn places_read(reads: List<Read>) -> Map<Bytes, Bool> =
+  fold(reads, map_new(), |acc: Map<Bytes, Bool>, r: Read|
+    match r {
+      World(kind, at, _) -> map_insert(acc, place_id(kind, at), true),
+      Asked(name, input, _) ->
+        map_insert(
+          map_insert(acc, place_id(query_kind(), name), true),
+          place_id(stood_kind(), stood_at(name, input)),
+          true,
+        ),
+    })
+
 /// What a record's reads are noted under among the readers of what they read.
-fn read_ids(queries: Map<Bytes, Query>, reads: List<Read>) -> Map<Bytes, Bool> =
+pub fn read_ids(reads: List<Read>) -> Map<Bytes, Bool> =
   fold(reads, map_new(), |acc: Map<Bytes, Bool>, r: Read|
     match r {
       World(kind, at, _) -> map_insert(acc, place_id(kind, at), true),
@@ -809,8 +827,8 @@ fn adopted(
     match memo_keep.packed(key) {
       None -> executed(queries, run, q, key, input, marks, prior, left - 1),
       Some(r) -> {
-        let noted = match prior { Some(p) -> read_ids(queries, p.reads), None -> map_new() };
-        map_fold(read_ids(queries, r.reads), (), |_: Unit, id: Bytes, _: Bool|
+        let noted = match prior { Some(p) -> read_ids(p.reads), None -> map_new() };
+        map_fold(read_ids(r.reads), (), |_: Unit, id: Bytes, _: Bool|
           if !map_contains(noted, id) { memo_keep.link(id, key) });
         let before = memo_keep.head(key);
         let s = stands(queries, run, r.reads, left - 1);
@@ -870,7 +888,7 @@ fn executed(
   left: Int,
 ) -> { run: Run, head: Bytes } / {memo_keep.read, memo_keep.write, abort.raise} =
   if left <= 0 { panic(string_of_bytes_lossy(too_deep())) } else {
-    let linked = match prior { Some(r) -> read_ids(queries, r.reads), None -> map_new() };
+    let linked = match prior { Some(r) -> read_ids(r.reads), None -> map_new() };
     let before = memo_keep.head(key);
     with_cell[memo]({
         run: {
@@ -1042,11 +1060,8 @@ pub fn recorded(
   output: Bytes,
   marks: List<Bytes>,
 ) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} = {
-  let noted = match memo_keep.record(key) {
-    Some(r) -> read_ids(queries, r.reads),
-    None -> map_new(),
-  };
-  map_fold(read_ids(queries, reads), (), |_: Unit, id: Bytes, _: Bool|
+  let noted = match memo_keep.record(key) { Some(r) -> read_ids(r.reads), None -> map_new() };
+  map_fold(read_ids(reads), (), |_: Unit, id: Bytes, _: Bool|
     if !map_contains(noted, id) { memo_keep.link(id, key) });
   // Every read is asked again, so each place it read is noted.
   let moved = fold(reads, false, |m: Bool, r: Read| {
