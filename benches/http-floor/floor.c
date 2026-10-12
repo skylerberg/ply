@@ -1,7 +1,7 @@
-// The request path's floor: the answer `examples/desk.ply` gives `GET /health`, served with no
-// language in the path, so that a row against it and a row against the desk differ only in the
+// The request path's floor: the answer `examples/service.ply` gives `GET /health`, served with no
+// language in the path, so that a row against it and a row against the service differ only in the
 // server. `benches/corpus.sh` builds it with `cc` and binds it as `http_floor`, and the corpus loads
-// it with the client it loads the desk with.
+// it with the client it loads the service with.
 //
 //   floor sequential|threads [PORT]
 //
@@ -22,10 +22,10 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define BODY "{\"routes\":11,\"service\":\"parts desk\"}"
+#define BODY "{\"routes\":11,\"service\":\"parts\"}"
 
-// The desk's own fields in `http::encode`'s order: the program's, the length, then `Connection:
-// close` on the exchange that ends the connection. The corpus checks this against the desk's answer
+// The service's own fields in `http::encode`'s order: the program's, the length, then `Connection:
+// close` on the exchange that ends the connection. The corpus checks this against the service's answer
 // before it measures anything.
 #define HEAD_OPEN "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nContent-Length: %zu\r\n"
 
