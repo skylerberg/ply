@@ -109,12 +109,19 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
         buckets,
         instances,
         numerics,
+        layout,
     } = exports;
     bind(&lib, &helpers)?;
     filled(&lib, &buckets)?;
-    let Some(unit) =
-        UnitTables::from_tables(ctors.clone(), consts, fields, builtins, shapes, lambdas)
-    else {
+    let Some(unit) = UnitTables::from_tables(
+        ctors.clone(),
+        consts,
+        fields,
+        builtins,
+        shapes,
+        lambdas,
+        layout,
+    ) else {
         bail!("a unit's shapes do not intern to the ids its C was emitted against");
     };
     let constants = constants_of(&constants, &taken, &unit)?;
