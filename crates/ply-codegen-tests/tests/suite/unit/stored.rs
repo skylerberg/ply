@@ -372,7 +372,7 @@ fn a_unit_that_holds_records_by_their_words_has_the_runtime_lay_them_out_so() {
         &[],
         RecordLayout {
             in_place: false,
-            raw_widths: true,
+            ..RecordLayout::CURRENT
         },
     );
     let mut h = Heap::new();
@@ -474,8 +474,8 @@ fn a_record_holds_a_wide_width_as_its_bits() {
         vec![],
         &[],
         RecordLayout {
-            in_place: true,
             raw_widths: false,
+            ..RecordLayout::CURRENT
         },
     );
     let by_word = h.to_word(&words, &value);
@@ -484,6 +484,80 @@ fn a_record_holds_a_wide_width_as_its_bits() {
     dec(w);
     dec(offset);
     dec(by_word);
+}
+
+#[test]
+fn an_array_holds_its_records_in_place_and_its_floats_as_their_bits() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let points = Value::array((0..3).map(|i| segment("p", f64::from(i))).collect());
+    let w = h.to_word(&l, &points);
+    let o = obj(w);
+    assert!(ply_codegen::array::in_place(o));
+    assert_eq!(ply_codegen::array::len(o), 3);
+    // Each element takes a header's two words beside a segment's nine and its bitmap's one.
+    assert_eq!(unsafe { (*o).aux }, 12);
+    assert_eq!(Heap::to_value(&l, w), points);
+    // Each element is a part whose word is its header's address in the array, twelve words apart.
+    let parts = l.parts(o);
+    assert_eq!(parts.len(), 3);
+    assert_eq!(
+        unsafe { part_word(o, parts[1].0, parts[1].1) },
+        Some(unsafe { words(o).add(12) } as Word)
+    );
+    let second = ply_codegen::array::element(&mut h, &l, o, 1);
+    assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
+    assert_eq!(unsafe { (*o).rc }, 2);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), points);
+    // Set in place where it holds the array alone, and on a copy where another holds it too.
+    let replaced = h.to_word(&l, &segment("q", 9.0));
+    let shared = h.array_set(&l, w, 0, replaced);
+    assert_ne!(
+        shared, w,
+        "the element read out holds the array, so the set copies it"
+    );
+    assert_eq!(
+        Heap::to_value(&l, shared),
+        Value::array(vec![
+            segment("q", 9.0),
+            segment("p", 1.0),
+            segment("p", 2.0)
+        ])
+    );
+    assert_eq!(Heap::to_value(&l, second), segment("p", 1.0));
+    dec(second);
+    // An array that counts some of its words takes a word of bitmap after them.
+    let items: Vec<Word> = (0..3)
+        .map(|i| h.to_word(&l, &segment("p", f64::from(i))))
+        .collect();
+    let before = h.allocated_bytes();
+    let built = h.array_of(&l, &items);
+    assert_eq!(
+        h.allocated_bytes() - before,
+        Heap::object_size(8 * (36 + 1))
+    );
+    dec(built);
+    let floats = Value::array(vec![Value::Float(0.5), Value::Float(-2.0)]);
+    let f = h.to_word(&l, &floats);
+    assert!(ply_codegen::array::in_place(obj(f)));
+    assert_eq!(unsafe { (*obj(f)).aux }, 1);
+    assert_eq!(Heap::to_value(&l, f), floats);
+    let boxed = ply_codegen::array::element(&mut h, &l, obj(f), 1);
+    assert_eq!(kind(boxed), KIND_FLOAT);
+    assert_eq!(cmp_words(&l, f, h.to_word(&l, &floats)), Ordering::Equal);
+    let plain = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            inline_arrays: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    let words = h.to_word(&plain, &floats);
+    assert!(!ply_codegen::array::in_place(obj(words)));
+    dec(shared);
+    dec(boxed);
 }
 
 #[test]
@@ -514,4 +588,59 @@ fn a_char_is_its_own_word_ordered_and_kept_as_the_char_it_is() {
     let p = h.to_word(&l, &pair);
     let (_into, read) = kept(&l, p);
     assert_eq!(Heap::to_value(&l, read), pair);
+}
+
+/// `m.Pair`'s arguments as its declaration types them: a segment in place, then a `Float`.
+fn laid_pair(layout: RecordLayout) -> Layouts {
+    let mut l = Layouts::of(layouts().ctors.clone(), &[], layout);
+    l.set_ctor_args(&[
+        vec![],
+        vec![],
+        vec![
+            Symbol::new("a000!r(from!r(x!f,y!f),label,to!r(x!f,y!f))"),
+            Symbol::new("a001!f"),
+        ],
+    ]);
+    l
+}
+
+#[test]
+fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
+    let l = laid_pair(RecordLayout::CURRENT);
+    let mut h = Heap::new();
+    let pair = |x: f64| Value::ctor("m.Pair", vec![segment("s", 0.5), Value::Float(x)]);
+    let w = h.to_word(&l, &pair(2.5));
+    let o = obj(w);
+    // The segment takes a header's two words, its own nine and its bitmap's one; the `Float` its
+    // bits after them; and a word of bitmap after those says which the constructor counts.
+    assert_eq!(kind(w), KIND_CTOR);
+    assert_eq!(unsafe { (*o).len }, 13);
+    assert_eq!(l.ctor_arity(o), 2);
+    assert!(l.ctor_arg(o, 1) == (12, Slot::Float));
+    // The segment is a part whose word is its header's address in the constructor.
+    let parts = l.parts(o);
+    assert_eq!(parts.len(), 2);
+    assert_eq!(
+        unsafe { part_word(o, parts[0].0, parts[0].1) },
+        Some(unsafe { words(o) } as Word)
+    );
+    assert_eq!(unsafe { part_word(o, parts[1].0, parts[1].1) }, None);
+    assert_eq!(unsafe { (*o).flags }, MIXED | RAW);
+    assert!((0..13).all(|i| unsafe { counted(o, i) } == (i == 6)));
+    assert_eq!(Heap::to_value(&l, w), pair(2.5));
+    let later = h.to_word(&l, &pair(3.0));
+    assert_eq!(cmp_words(&l, w, later), Ordering::Less);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), pair(2.5));
+    // A unit whose code reads a constructor's words has the runtime lay it out so.
+    let words = laid_pair(RecordLayout {
+        ctor_args: false,
+        ..RecordLayout::CURRENT
+    });
+    let plain = h.to_word(&words, &pair(2.5));
+    assert_eq!(unsafe { (*obj(plain)).len }, 2);
+    assert_eq!(Heap::to_value(&words, plain), pair(2.5));
+    dec(w);
+    dec(later);
+    dec(plain);
 }

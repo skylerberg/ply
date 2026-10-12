@@ -61,7 +61,7 @@ impl UnitTables {
     /// The tables as a unit recorded them, positions as given; `None` if a shape would not
     /// intern to its position, since those are the ids its C bakes.
     pub fn from_tables(
-        ctors: Vec<(Symbol, usize)>,
+        ctors: Vec<(Symbol, usize, Vec<Symbol>)>,
         consts: Vec<Value>,
         fields: Vec<Symbol>,
         builtins: Vec<Builtin>,
@@ -69,7 +69,11 @@ impl UnitTables {
         lambdas: Vec<String>,
         layout: RecordLayout,
     ) -> Option<UnitTables> {
-        let layouts = Layouts::of(ctors, &shapes, layout);
+        let (table, args): (Vec<_>, Vec<_>) = ctors
+            .into_iter()
+            .map(|(name, arity, args)| ((name, arity), args))
+            .unzip();
+        let mut layouts = Layouts::of(table, &shapes, layout);
         let placed = layouts.shape_count() >= shapes.len()
             && shapes
                 .iter()
@@ -78,6 +82,7 @@ impl UnitTables {
         if !placed {
             return None;
         }
+        layouts.set_ctor_args(&args);
         Some(UnitTables {
             consts,
             fields,

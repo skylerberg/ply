@@ -7,7 +7,7 @@
 use crate::heap::{
     self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
     KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT,
-    Layouts, Word, bridged, bytes_of, is_imm, obj, set_word, word_at,
+    Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word, word_at,
 };
 use crate::{array, list, map};
 use ply_eval::Symbol;
@@ -102,14 +102,12 @@ fn unhex(text: &[u8]) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// What is left to write: a word, or the end of an object whose parts are all written.
+/// What is left to write: a word, the end of an object whose parts are all written, or a part an
+/// object holds from a word on as a slot says, which is written as the value it is.
 enum Pending {
     Word(Word),
     Done(usize),
-    /// A record's word that holds a `Float`'s bits, written as a `Float` of its own.
-    Raw(Word),
-    /// A record's word that holds a 64-bit width's bits, written as that width's value.
-    Wide(Word, u8),
+    Held(*mut Obj, usize, Slot),
 }
 
 struct Writer<'l> {
@@ -143,17 +141,21 @@ impl<'l> Writer<'l> {
                     self.done.insert(address, self.places);
                     self.places += 1;
                 }
-                Pending::Raw(bits) => {
-                    self.out.push(FLOAT);
-                    self.out.extend_from_slice(&bits.to_le_bytes());
-                    self.places += 1;
-                }
-                Pending::Wide(bits, t) => {
-                    self.out.push(FIXED);
-                    self.out.push(t);
-                    self.out.extend_from_slice(&bits.to_le_bytes());
-                    self.places += 1;
-                }
+                Pending::Held(o, at, slot) => match unsafe { heap::part_word(o, at, slot) } {
+                    Some(w) => self.word(w, &mut pending)?,
+                    None => {
+                        let bits = unsafe { word_at(o, at) };
+                        match slot {
+                            Slot::Wide(t) => {
+                                self.out.push(FIXED);
+                                self.out.push(t);
+                            }
+                            _ => self.out.push(FLOAT),
+                        }
+                        self.out.extend_from_slice(&bits.to_le_bytes());
+                        self.places += 1;
+                    }
+                },
                 Pending::Word(w) => self.word(w, &mut pending)?,
             }
         }
@@ -214,20 +216,14 @@ impl<'l> Writer<'l> {
                 self.out.push(RECORD);
                 self.shape(layout);
                 self.out.push(flags);
-                let slots = self.layouts.shape_slots(layout);
-                let offsets = self.layouts.shape_offsets(layout);
                 pending.push(Pending::Done(w as usize));
-                pending.extend((0..slots.len()).rev().map(|i| {
-                    let at = offsets[i];
-                    match slots[i] {
-                        heap::Slot::Float => Pending::Raw(unsafe { word_at(o, at) }),
-                        heap::Slot::Wide(t) => Pending::Wide(unsafe { word_at(o, at) }, t),
-                        heap::Slot::Record(_) => {
-                            Pending::Word(unsafe { heap::words(o).add(at) } as Word)
-                        }
-                        heap::Slot::Word => Pending::Word(unsafe { word_at(o, at) }),
-                    }
-                }));
+                let parts = self.layouts.parts(o);
+                pending.extend(
+                    parts
+                        .into_iter()
+                        .rev()
+                        .map(|(at, slot)| Pending::Held(o, at, slot)),
+                );
                 return Ok(());
             }
             KIND_CTOR => {
@@ -239,15 +235,36 @@ impl<'l> Writer<'l> {
                     self.varint(0);
                     return Ok(());
                 }
+                // Each argument is written as the value it is; the reader lays them out again.
                 self.out.push(CTOR);
                 self.ctor(layout);
                 self.out.push(flags);
-                self.varint(u64::from(len));
-                (0..len as usize)
-                    .map(|i| unsafe { word_at(o, i) })
-                    .collect()
+                let parts = self.layouts.parts(o);
+                self.varint(parts.len() as u64);
+                pending.push(Pending::Done(w as usize));
+                pending.extend(
+                    parts
+                        .into_iter()
+                        .rev()
+                        .map(|(at, slot)| Pending::Held(o, at, slot)),
+                );
+                return Ok(());
             }
             KIND_LIST => self.sequence(LIST, LIST_WORDS, list::to_vec(o)),
+            KIND_ARRAY if array::in_place(o) => {
+                // Each element is written as the value it is; the reader lays them in place again.
+                self.out.push(ARRAY);
+                self.varint(array::len(o) as u64);
+                pending.push(Pending::Done(w as usize));
+                let parts = self.layouts.parts(o);
+                pending.extend(
+                    parts
+                        .into_iter()
+                        .rev()
+                        .map(|(at, slot)| Pending::Held(o, at, slot)),
+                );
+                return Ok(());
+            }
             KIND_ARRAY => self.sequence(ARRAY, ARRAY_WORDS, array::items(o).to_vec()),
             KIND_MAP => {
                 let entries = map::to_vec(o);
@@ -335,7 +352,7 @@ struct Open {
 
 enum Make {
     Record { shape: u32 },
-    Ctor { index: u32, flags: u8 },
+    Ctor { index: u32 },
     List,
     Array,
     Map,
@@ -494,7 +511,7 @@ impl<'a> Reader<'a> {
                         self.heap.alloc(KIND_CTOR, flags, 0, index) as Word
                     }));
                 }
-                (Make::Ctor { index, flags }, want)
+                (Make::Ctor { index }, want)
             }
             LIST => (Make::List, self.count()?),
             ARRAY => (Make::Array, self.count()?),
@@ -517,12 +534,6 @@ impl<'a> Reader<'a> {
     }
 
     fn made(&mut self, done: Open) -> Word {
-        let filled = |o: *mut heap::Obj, parts: &[Word]| {
-            for (i, w) in parts.iter().enumerate() {
-                unsafe { set_word(o, i, *w) };
-            }
-            o as Word
-        };
         let w = match done.make {
             Make::Record { shape } => {
                 for part in &done.parts {
@@ -538,14 +549,21 @@ impl<'a> Reader<'a> {
                     .collect();
                 self.heap.record(self.layouts, &fields)
             }
-            Make::Ctor { index, flags } => {
-                let o = self
-                    .heap
-                    .alloc(KIND_CTOR, flags, done.parts.len() as u32, index);
-                filled(o, &done.parts)
+            Make::Ctor { index } => {
+                for part in &done.parts {
+                    heap::inc(*part);
+                }
+                self.held.extend(done.parts.iter().copied());
+                self.heap.ctor(self.layouts, index, &done.parts)
             }
             Make::List => self.heap.list_from(&done.parts),
-            Make::Array => self.heap.array_from(&done.parts),
+            Make::Array => {
+                for part in &done.parts {
+                    heap::inc(*part);
+                }
+                self.held.extend(done.parts.iter().copied());
+                self.heap.array_of(self.layouts, &done.parts)
+            }
             Make::Map => {
                 let entries: Vec<(Word, Word)> = done
                     .parts

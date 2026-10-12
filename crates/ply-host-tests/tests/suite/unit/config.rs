@@ -33,20 +33,20 @@ fn an_unopened_snapshot_answers_nothing() {
 fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
     let snapshot = snapshot(
         &[
-            ("DESK_API_KEY", "s3cret", true),
-            ("DESK_REGION", "eu", false),
+            ("SERVICE_API_KEY", "s3cret", true),
+            ("SERVICE_REGION", "eu", false),
         ],
         true,
     );
     assert_eq!(
-        snapshot.get("DESK_API_KEY"),
+        snapshot.get("SERVICE_API_KEY"),
         None,
         "a credential must not leave as a `String`"
     );
-    assert_eq!(snapshot.plaintext("DESK_API_KEY"), Some("s3cret"));
-    assert_eq!(snapshot.get("DESK_REGION"), Some("eu"));
+    assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), Some("s3cret"));
+    assert_eq!(snapshot.get("SERVICE_REGION"), Some("eu"));
     assert_eq!(
-        snapshot.plaintext("DESK_REGION"),
+        snapshot.plaintext("SERVICE_REGION"),
         None,
         "a plain key must not be laundered into a credential"
     );
@@ -54,17 +54,17 @@ fn get_refuses_a_secret_key_and_secret_refuses_a_plain_one() {
 
 #[test]
 fn without_a_schema_containment_is_only_as_strong_as_the_schema() {
-    let snapshot = snapshot(&[("DESK_API_KEY", "s3cret", false)], false);
-    assert_eq!(snapshot.get("DESK_API_KEY"), Some("s3cret"));
-    assert_eq!(snapshot.plaintext("DESK_API_KEY"), Some("s3cret"));
+    let snapshot = snapshot(&[("SERVICE_API_KEY", "s3cret", false)], false);
+    assert_eq!(snapshot.get("SERVICE_API_KEY"), Some("s3cret"));
+    assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), Some("s3cret"));
 }
 
 /// `None`, not an empty `Secret`, so unset and set-to-nothing stay distinguishable.
 #[test]
 fn an_unsupplied_secret_answers_none_from_both() {
     let snapshot = snapshot(&[], true);
-    assert_eq!(snapshot.get("DESK_API_KEY"), None);
-    assert_eq!(snapshot.plaintext("DESK_API_KEY"), None);
+    assert_eq!(snapshot.get("SERVICE_API_KEY"), None);
+    assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), None);
 }
 
 #[test]

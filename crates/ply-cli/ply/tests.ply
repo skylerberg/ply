@@ -34,7 +34,7 @@ import compiler.front (no_rows, Analysed, Refused, View, Embedded, analyse,
 import compiler.embed (EmbedWant, ItemWants, wants_by_item)
 import compiler.unit (codes, shipped)
 import compiler.hash (TheItem, Which, listing_reach, reach, reached_functions)
-import compiler.infer (DefInfo, TestInfo, cases_root, test_owner)
+import compiler.infer (DefInfo, EffectInfo, TestInfo, cases_root, prelude_effects, test_owner)
 import compiler.resolve (Diag, Label, Source, error_with_labels, qualify)
 import compiler.types
 import compiler.types (RAny, RNamed, RSingleton, RVar)
@@ -2176,7 +2176,21 @@ fn footprint_text(atoms: List<types::Atom>) -> String / {abort.raise} =
 
 fn mode_writes(m: type_syntax::Mode) -> Bool = match m { MWrite -> true, _ -> false }
 
-fn case_view(analysis: View, i: Int, test_info: TestInfo) -> Case / {abort.raise} = {
+/// Every effect the program or the prelude declares, by its program-wide name, with whether it is
+/// `nondet`.
+fn declared_effects(analysis: View) -> Map<Bytes, Bool> =
+  fold(
+    concat(prelude_effects(), analysis.checked.effects),
+    map_new(),
+    |acc: Map<Bytes, Bool>, e: EffectInfo| map_insert(acc, e.name, e.nondet),
+  )
+
+fn case_view(
+  analysis: View,
+  declared: Map<Bytes, Bool>,
+  i: Int,
+  test_info: TestInfo,
+) -> Case / {abort.raise} = {
   let atoms = canonical(test_info.footprint);
   let texts = atom_texts(atoms);
   {
@@ -2196,10 +2210,12 @@ fn case_view(analysis: View, i: Int, test_info: TestInfo) -> Case / {abort.raise
               effect: string_of_bytes_lossy(a.effect),
               resource: string_of_bytes_lossy(types::resource_text(a.resource)),
               writes: mode_writes(a.mode),
+              // An effect no declaration names is the language's own.
+              nondet: match map_get(declared, a.effect) { Some(known) -> known, None -> true },
             },
             text: at_or(texts, j, ""),
           },
-        None -> { atom: { effect: "", resource: "", writes: false }, text: "" },
+        None -> { atom: { effect: "", resource: "", writes: false, nondet: false }, text: "" },
       }),
     seeded: seeded_of(test_info.footprint),
   }
@@ -2273,10 +2289,11 @@ fn program_of(
   opened: List<Diag>,
   filed_under: Option<String>,
 ) -> Program / {abort.raise} = {
+  let declared = declared_effects(analysis);
   let cases = fold(scope.visible, [], |acc: List<Case>, i: Int|
     match test_at(analysis, i) {
       Some(test_info) -> {
-        let view = case_view(analysis, i, test_info);
+        let view = case_view(analysis, declared, i, test_info);
         push(acc, { ..view, entry: at_or(entries, i, view.entry) })
       },
       None -> acc,
@@ -4609,8 +4626,11 @@ test "a test's contended atoms are in the document unprinted, beside whether it 
   let c = {
     ..a_case(0, "one"),
     atoms: [
-      { atom: { effect: "cell", resource: "users", writes: true }, text: "cell.write[users]" },
-      { atom: { effect: "sim", resource: "", writes: false }, text: "sim.read" },
+      {
+        atom: { effect: "cell", resource: "users", writes: true, nondet: true },
+        text: "cell.write[users]",
+      },
+      { atom: { effect: "sim", resource: "", writes: false, nondet: false }, text: "sim.read" },
     ],
     seeded: true,
   };
@@ -4799,10 +4819,13 @@ test "a test the binding can reach is host rather than isolated" {
   // A test is shared exactly when one of the atoms the row carries can be contended over, and a
   // seed it reads is not one of them.
   let fs_write = {
-    atom: { effect: "fs", resource: "/tmp/x", writes: true },
+    atom: { effect: "fs", resource: "/tmp/x", writes: true, nondet: true },
     text: "fs.write[/tmp/x]",
   };
-  let seed = { atom: { effect: "sim", resource: "", writes: false }, text: "sim.read" };
+  let seed = {
+    atom: { effect: "sim", resource: "", writes: false, nondet: false },
+    text: "sim.read",
+  };
   assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed] }), "region");
   assert_eq(isolated_as(hermetic.reaches, { ..c, atoms: [seed, fs_write] }), "shared");
   assert_eq(shared_of({ ..c, atoms: [seed, fs_write] }), "{fs.write[/tmp/x]}")
@@ -4813,11 +4836,11 @@ test "a test the binding can reach is host rather than isolated" {
 test "`--explain` names and counts the tests that contend only over a region label" {
   let cell = |label: String|
     {
-      atom: { effect: "cell", resource: label, writes: true },
+      atom: { effect: "cell", resource: label, writes: true, nondet: true },
       text: "cell.write[" ++ label ++ "]",
     };
   let ledger = {
-    atom: { effect: "db", resource: "ledger", writes: true },
+    atom: { effect: "db", resource: "ledger", writes: true, nondet: true },
     text: "db.write[ledger]",
   };
   let labelled = { ..a_case(0, "one"), atoms: [cell("users")] };
@@ -4843,7 +4866,7 @@ test "`--explain` names and counts the tests that contend only over a region lab
 test "classes over every test are coloured only for a mutation" {
   let cell = |label: String|
     {
-      atom: { effect: "cell", resource: label, writes: true },
+      atom: { effect: "cell", resource: label, writes: true, nondet: true },
       text: "cell.write[" ++ label ++ "]",
     };
   let p = a_program([
@@ -4993,9 +5016,14 @@ fn analysed_as(name: String, src: String) -> View / {abort.raise} =
 
 fn compiled(src: String) -> View / {abort.raise} = analysed_as("", src)
 
-fn cases_of_whole(analysis: View) -> List<Case> / {abort.raise} =
+fn cases_of_whole(analysis: View) -> List<Case> / {abort.raise} = {
+  let declared = declared_effects(analysis);
   fold(range(0, len(analysis.checked.tests)), [], |acc: List<Case>, i: Int|
-    match test_at(analysis, i) { Some(t) -> push(acc, case_view(analysis, i, t)), None -> acc })
+    match test_at(analysis, i) {
+      Some(t) -> push(acc, case_view(analysis, declared, i, t)),
+      None -> acc,
+    })
+}
 
 /// The classes every test of a program is coloured into, as a run that executes them all colours them.
 fn coloured(analysis: View) -> List<List<Int>> / {abort.raise} = {
@@ -5010,26 +5038,32 @@ fn texts_of_case(analysis: View, i: Int) -> List<String> / {abort.raise} =
   }
 
 fn a_store() -> String =
-  "effect store {\n  read  all[r]() -> Int\n  write save[r](n: Int) -> Unit\n}\n"
+  "nondet effect store {\n  read  all[r]() -> Int\n  write save[r](n: Int) -> Unit\n}\n"
 
 fn precise() -> String =
   a_store()
-    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} { store.save[orders](1); 2 }\ntest \"items\" { assert_eq(list_items(), 0) }\ntest \"orders\" { assert_eq(place_order(), 2) }\n"
+    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
 
 fn aliased() -> String =
   a_store()
-    ++ "effect set Desk = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Desk} = store.all[items]()\nfn place_order() -> Int / {Desk} { store.save[orders](1); 2 }\ntest \"items\" { assert_eq(list_items(), 0) }\ntest \"orders\" { assert_eq(place_order(), 2) }\n"
+    ++ "effect set Service = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Service} = store.all[items]()\nfn place_order() -> Int / {Service} { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
+
+/// `src` with its effects and tests declared deterministic.
+fn deterministic(src: String) -> String =
+  join(string_split(join(string_split(src, "nondet effect "), "effect "), "test/nondet "), "test ")
 
 test "precise rows leave two endpoints nothing to contend over, and one broad set serialises them" {
   assert_eq(coloured(compiled(precise())), [[0, 1]]);
-  assert_eq(coloured(compiled(aliased())), [[0], [1]])
+  assert_eq(coloured(compiled(aliased())), [[0], [1]]);
+  // What answers an effect that is not `nondet` answers each test from that test's own state.
+  assert_eq(coloured(compiled(deterministic(aliased()))), [[0, 1]])
 }
 
 test "the atoms that serialise them are the set's expansion, and an alias only ever widens" {
   let broad = texts_of_case(compiled(aliased()), 0);
   let narrow = texts_of_case(compiled(precise()), 0);
   assert(len(filter(broad, |t: String| string_ends_with(t, "store.write[orders]"))) > 0);
-  assert(len(filter(broad, |t: String| string_contains(t, "Desk"))) == 0);
+  assert(len(filter(broad, |t: String| string_contains(t, "Service"))) == 0);
   assert(len(filter(narrow, |t: String| string_ends_with(t, "store.write[orders]"))) == 0);
   assert(fold(narrow, true, |ok: Bool, t: String| ok && contains(broad, t)))
 }
@@ -5060,7 +5094,7 @@ test "tests naming one region label all conflict, and tests on distinct labels n
 
 test "an effect whose name merely resembles a region's names a real resource" {
   let w = compiled(
-    "effect cells {\n  write put[rows](v: Int) -> Unit\n}\ntest \"one\" { cells.put[rows](1) }\ntest \"two\" { cells.put[rows](2) }\n",
+    "nondet effect cells {\n  write put[rows](v: Int) -> Unit\n}\ntest/nondet \"one\" { cells.put[rows](1) }\ntest/nondet \"two\" { cells.put[rows](2) }\n",
   );
   assert_eq(texts_of_case(w, 0), ["cells.put[rows]"]);
   assert_eq(coloured(w), [[0], [1]])
@@ -5068,7 +5102,7 @@ test "an effect whose name merely resembles a region's names a real resource" {
 
 test "a region label beside a real write does not launder the write" {
   let w = compiled(
-    "effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {cell.read[table]} = n\ntest \"cell only\" { let seen = with_cell[table](1) { c -> cell_get(c) }; assert_eq(touches(seen), 1) }\ntest \"cell and a real write\" { let seen = with_cell[table](1) { c -> cell_get(c) }; db.put[users](touches(seen)) }\ntest \"a real read\" { assert_eq(db.get[users](), 0) }\n",
+    "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {cell.read[table]} = n\ntest \"cell only\" { let seen = with_cell[table](1) { c -> cell_get(c) }; assert_eq(touches(seen), 1) }\ntest/nondet \"cell and a real write\" { let seen = with_cell[table](1) { c -> cell_get(c) }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
   );
   assert_eq(texts_of_case(w, 1), ["cell.read[table]", "db.put[users]"]);
   // Two readers of one region label share a worker; a writer and a reader of `users` do not.
