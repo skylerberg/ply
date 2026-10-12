@@ -850,15 +850,27 @@ prune_plan() {
       while (match(key, /-[0-9a-f]+$/) && RLENGTH > 8) key = substr(key, 1, RSTART - 1)
       return key
     }
-    { id[NR] = $1; key[NR] = $3; held[$3] = 1 }
+    # The run a key of a run-scoped family ends in, and the family: the key less that run and the
+    # digests before it, so a job'"'"'s stores are one family whichever toolchain wrote them.
+    function run_of(key,   f) {
+      f = key
+      sub(/-[0-9]+$/, "", f)
+      return substr(key, length(f) + 2) + 0
+    }
+    function scoped(key) {
+      sub(/-[0-9]+$/, "", key)
+      return family(key)
+    }
+    {
+      id[NR] = $1; key[NR] = $3
+      if (named($3, superseded) && run_of($3) == run + 0) saved[scoped($3)] = 1
+    }
     END {
       for (i = 1; i <= NR; i++) {
         k = key[i]
         if (named(k, fixed)) continue
         if (named(k, superseded)) {
-          f = k
-          sub(/-[0-9]+$/, "", f)
-          if (substr(k, length(f) + 2) + 0 < run + 0 && (f "-" run) in held) print id[i], "superseded", k
+          if (run_of(k) < run + 0 && scoped(k) in saved) print id[i], "superseded", k
         } else if (named(k, newest)) {
           if (seen[family(k)]++) print id[i], "superseded", k
         } else {
@@ -874,10 +886,10 @@ cmd_prune_check() {
   local a b got want
   a=$(printf 'a%.0s' {1..40})
   b=$(printf 'b%.0s' {1..40})
-  want="1 superseded;4 unnamed;5 superseded;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;"
+  want="1 superseded;4 unnamed;5 superseded;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;19 superseded;"
   got=$(printf '%s\t%s\t%s\n' \
     1 2026-01-01T00:00:00Z ply-stores-stdlib-100 \
-    2 2026-01-02T00:00:00Z ply-stores-stdlib-200 \
+    2 2026-01-02T00:00:00Z "ply-stores-stdlib-$b-200" \
     3 2026-01-01T00:00:00Z ply-stores-checks-100 \
     4 2026-01-01T00:00:00Z ply-stores-cli-part-3-100 \
     5 2026-01-01T00:00:00Z ply-upstream-100 \
@@ -893,7 +905,8 @@ cmd_prune_check() {
     15 2026-01-01T00:00:00Z v0-rust-clippy-Linux-x64-11111111-22222222 \
     16 2026-01-01T00:00:00Z tcc-Linux-X64 \
     17 2026-01-02T00:00:00Z sccache/a/b/c/abcdef \
-    18 2026-01-03T00:00:00Z ply-stores-stdlib-300 |
+    18 2026-01-03T00:00:00Z "ply-stores-stdlib-$b-300" \
+    19 2026-01-01T00:00:00Z "ply-stores-stdlib-$a-150" |
     prune_plan 200 "ply-upstream- ply-stores-stdlib- ply-stores-checks-" "ply-built- ply-c-corpus-stdlib- v0-rust-" "tcc-" |
     cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
   if [[ $got != "$want" ]]; then
