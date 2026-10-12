@@ -56,6 +56,8 @@ pub const HEADER: usize = 16;
 
 /// A record or constructor none of whose fields holds a count: releasing it walks nothing.
 pub const FLAT: u8 = 1;
+/// A record holding both words it counts and a `Float`'s bits: a bitmap after its words says which.
+pub const MIXED: u8 = 2;
 
 /// `len`: payload words, byte count or list length; `layout`: shape, ctor index, capacity, arity
 /// or dropped list prefix; `flags`/`aux`: a `Bool`'s value, a list's tail length and capacity.
@@ -281,6 +283,59 @@ pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
     unsafe { *words(o).add(i) = w }
 }
 
+/// The words after a mixed record's fields that say which fields are words it counts: one bit
+/// each, set for a counted word.
+#[inline]
+pub fn tail_words(len: usize) -> usize {
+    len.div_ceil(64)
+}
+
+/// Whether word `i` of `o` is one it counts: every word of an object but a flat record's, and a
+/// mixed record's where its tail says so. A record's other words are a `Float`'s bits or immediates.
+#[inline]
+pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
+    unsafe {
+        if (*o).kind != KIND_RECORD {
+            return true;
+        }
+        if (*o).flags & FLAT != 0 {
+            return false;
+        }
+        if (*o).flags & MIXED == 0 {
+            return true;
+        }
+        let len = (*o).len as usize;
+        (word_at(o, len + i / 64) as u64 >> (i % 64)) & 1 == 1
+    }
+}
+
+/// How a record holds a field: a word, or a `Float`'s bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Slot {
+    Word,
+    Float,
+}
+
+/// What a field a record holds as a `Float`'s bits is spelled with in a shape: after its name, and
+/// below every byte a name holds, so a shape sorts as its names do.
+pub const FLOAT_SLOT: &str = "!f";
+
+/// A shape's field as its name and how it is held.
+pub fn slot_of(field: &Symbol) -> (Symbol, Slot) {
+    match field.as_str().strip_suffix(FLOAT_SLOT) {
+        Some(name) => (Symbol::new(name), Slot::Float),
+        None => (field.clone(), Slot::Word),
+    }
+}
+
+/// A field as a shape spells it.
+pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
+    match slot {
+        Slot::Word => name.clone(),
+        Slot::Float => Symbol::new(format!("{}{FLOAT_SLOT}", name.as_str())),
+    }
+}
+
 /// A closure's payload: its compiled code's address first, then the captured values.
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
@@ -314,11 +369,14 @@ pub unsafe fn str_of<'a>(o: *mut Obj) -> &'a str {
     unsafe { std::str::from_utf8_unchecked(bytes_of(o)) }
 }
 
-/// Record shapes: a shape is its sorted field names, and a field's offset its position in them.
+/// Record shapes: a shape is its sorted fields, each spelled with how the record holds it, and a
+/// field's offset is its position among them.
 #[derive(Default)]
 pub struct Shapes {
     ids: HashMap<Arc<[Symbol]>, u32>,
+    spelled: Vec<Arc<[Symbol]>>,
     names: Vec<Arc<[Symbol]>>,
+    slots: Vec<Arc<[Slot]>>,
 }
 
 impl Shapes {
@@ -327,10 +385,13 @@ impl Shapes {
         if let Some(id) = self.ids.get(fields.as_slice()) {
             return *id;
         }
-        let id = self.names.len() as u32;
+        let id = self.spelled.len() as u32;
+        let (names, slots): (Vec<Symbol>, Vec<Slot>) = fields.iter().map(slot_of).unzip();
         let rc: Arc<[Symbol]> = Arc::from(fields);
         self.ids.insert(rc.clone(), id);
-        self.names.push(rc);
+        self.spelled.push(rc);
+        self.names.push(Arc::from(names));
+        self.slots.push(Arc::from(slots));
         id
     }
 }
@@ -352,11 +413,6 @@ pub struct Layouts {
     /// Field offsets by shape and index, `width` to a row, for shapes interned before indexing.
     rows: Box<[u16]>,
     width: usize,
-    /// The shape of a `{key, value}` entry.
-    entry_shape: u32,
-    /// The shapes of a `{key, value, rest}` and of a `{below, at, above}`, interned on first use.
-    popped_shape: std::sync::OnceLock<u32>,
-    split_shape: std::sync::OnceLock<u32>,
     /// Per constructor, what its type's module states its values are compared and shown through;
     /// empty for a unit that states none.
     stated: Box<[(Stated, Stated)]>,
@@ -403,7 +459,7 @@ impl Layouts {
         for names in shapes {
             interned.intern(names.clone());
         }
-        let entry_shape = interned.intern(Layouts::entry_fields());
+        interned.intern(Layouts::entry_fields());
         Layouts {
             shapes: std::sync::RwLock::new(interned),
             ctors,
@@ -417,9 +473,6 @@ impl Layouts {
             greater,
             rows: Box::default(),
             width: 0,
-            entry_shape,
-            popped_shape: std::sync::OnceLock::new(),
-            split_shape: std::sync::OnceLock::new(),
             stated: Box::default(),
             numeric: Box::default(),
         }
@@ -458,24 +511,6 @@ impl Layouts {
 
     pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
         self.ctor_ids.get(name).copied()
-    }
-
-    pub fn entry_shape(&self) -> u32 {
-        self.entry_shape
-    }
-
-    /// The shape of what `map_pop_first` answers: `key`, `rest`, `value`, in a record's order.
-    pub fn popped_shape(&self) -> u32 {
-        *self
-            .popped_shape
-            .get_or_init(|| self.shape(["key", "rest", "value"].map(Symbol::new).to_vec()))
-    }
-
-    /// The shape of what `map_split` answers: `above`, `at`, `below`, in a record's order.
-    pub fn split_shape(&self) -> u32 {
-        *self
-            .split_shape
-            .get_or_init(|| self.shape(["above", "at", "below"].map(Symbol::new).to_vec()))
     }
 
     pub fn index_fields(&mut self, names: &[Symbol]) {
@@ -530,8 +565,24 @@ impl Layouts {
         self.read().names.len()
     }
 
+    /// A shape's fields' names, in its order.
     pub fn shape_names(&self, shape: u32) -> Arc<[Symbol]> {
         self.read().names[shape as usize].clone()
+    }
+
+    /// A shape's fields as a unit's table and a stored value spell them.
+    pub fn shape_spelled(&self, shape: u32) -> Arc<[Symbol]> {
+        self.read().spelled[shape as usize].clone()
+    }
+
+    /// How a shape's records hold each field, in its order.
+    pub fn shape_slots(&self, shape: u32) -> Arc<[Slot]> {
+        self.read().slots[shape as usize].clone()
+    }
+
+    /// Whether a shape's records hold a `Float` as its bits.
+    pub fn holds_floats(&self, shape: u32) -> bool {
+        self.read().slots[shape as usize].contains(&Slot::Float)
     }
 
     /// How many fields a shape has.
@@ -583,12 +634,22 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
 }
 
 /// The payload bytes an object was allocated with, from its header; `usize::MAX` if unsized.
+/// A record's payload: its words, then a mixed one's tail.
+fn record_bytes(flags: u8, len: u32) -> usize {
+    let len = len as usize;
+    8 * (len
+        + if flags & MIXED != 0 {
+            tail_words(len)
+        } else {
+            0
+        })
+}
+
 unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
-            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_ARRAY => {
-                (*o).len as usize * 8
-            }
+            KIND_RECORD => record_bytes((*o).flags, (*o).len),
+            KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_ARRAY => (*o).len as usize * 8,
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -827,7 +888,59 @@ impl Heap {
     /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
     /// fill every word before anything can release it, or [`dec`] follows garbage.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
-        self.raw_alloc(kind, flags, len, layout, len as usize * 8)
+        let bytes = if kind == KIND_RECORD {
+            record_bytes(flags, len)
+        } else {
+            len as usize * 8
+        };
+        self.raw_alloc(kind, flags, len, layout, bytes)
+    }
+
+    /// A record of `fields`, each named as its shape spells it and in its order: each `Float`
+    /// held as its bits, and each other word as the record's.
+    pub fn record(&mut self, layouts: &Layouts, fields: &[(Symbol, Word)]) -> Word {
+        let mut spelled_fields = Vec::with_capacity(fields.len());
+        let mut words = Vec::with_capacity(fields.len());
+        for (name, w) in fields {
+            if kind(*w) == KIND_FLOAT {
+                spelled_fields.push(spelled(name, Slot::Float));
+                words.push((unsafe { word_at(obj(*w), 0) }, Slot::Float));
+                dec(*w);
+            } else {
+                spelled_fields.push(name.clone());
+                words.push((*w, Slot::Word));
+            }
+        }
+        let shape = layouts.shape(spelled_fields);
+        self.record_of(shape, &words)
+    }
+
+    /// A record of `shape` holding `words`, each as its slot says, flagged for what it counts.
+    fn record_of(&mut self, shape: u32, words: &[(Word, Slot)]) -> Word {
+        let n = words.len();
+        let floats = words.iter().filter(|(_, s)| *s == Slot::Float).count();
+        let flags = if floats == 0 {
+            0
+        } else if floats == n {
+            FLAT
+        } else {
+            MIXED
+        };
+        let o = self.alloc(KIND_RECORD, flags, n as u32, shape);
+        unsafe {
+            for (i, (w, _)) in words.iter().enumerate() {
+                set_word(o, i, *w);
+            }
+            if flags == MIXED {
+                for t in 0..tail_words(n) {
+                    let bits = (t * 64..n.min(t * 64 + 64))
+                        .filter(|i| words[*i].1 == Slot::Word)
+                        .fold(0u64, |acc, i| acc | 1 << (i % 64));
+                    set_word(o, n + t, bits as i64);
+                }
+            }
+        }
+        o as Word
     }
 
     /// [`dec`] of a mortal word held once, into this heap without the thread-local lookup.
@@ -976,8 +1089,18 @@ impl Heap {
                         0
                     };
                     for i in first..len as usize {
-                        let x = self.copy(word_at(o, i), copies);
+                        let x = if counted(o, i) {
+                            self.copy(word_at(o, i), copies)
+                        } else {
+                            word_at(o, i)
+                        };
                         set_word(c, i, x);
+                    }
+                    if kind == KIND_RECORD && flags & MIXED != 0 {
+                        let len = len as usize;
+                        for t in len..len + tail_words(len) {
+                            set_word(c, t, word_at(o, t));
+                        }
                     }
                     c as Word
                 }
@@ -1013,16 +1136,25 @@ impl Heap {
             Value::Unit => unit(),
             Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
             Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
+            // Each `Float` is held as its bits, as a record of its type is wherever it is made.
+            // `Fields` iterates sorted, which is the layout's order.
             Value::Record(fields) => {
-                let shape = layouts.shape(fields.keys().cloned().collect::<Vec<Symbol>>());
-                let n = fields.len() as u32;
-                let o = self.alloc(KIND_RECORD, 0, n, shape);
-                // `Fields` iterates sorted, which is the layout's order.
-                for (i, (_, value)) in fields.iter().enumerate() {
-                    let w = self.to_word(layouts, value);
-                    unsafe { set_word(o, i, w) };
+                let mut spelled_fields = Vec::with_capacity(fields.len());
+                let mut words = Vec::with_capacity(fields.len());
+                for (name, value) in fields.iter() {
+                    match value {
+                        Value::Float(f) => {
+                            spelled_fields.push(spelled(name, Slot::Float));
+                            words.push((ply_eval::float::bits(*f) as i64, Slot::Float));
+                        }
+                        _ => {
+                            spelled_fields.push(name.clone());
+                            words.push((self.to_word(layouts, value), Slot::Word));
+                        }
+                    }
                 }
-                o as Word
+                let shape = layouts.shape(spelled_fields);
+                self.record_of(shape, &words)
             }
             Value::Ctor { name, args } => match layouts.ctor_index(name) {
                 Some(index) => {
@@ -1131,15 +1263,19 @@ impl Heap {
                 KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
                     let names = layouts.shape_names((*o).layout);
+                    let slots = layouts.shape_slots((*o).layout);
                     let fields: Vec<(Symbol, Value)> = names
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
                             let field = carry.field(name);
-                            (
-                                name.clone(),
-                                Heap::read(layouts, word_at(o, i), &field, ctors, walked),
-                            )
+                            let value = match slots[i] {
+                                Slot::Float => Value::Float(f64::from_bits(word_at(o, i) as u64)),
+                                Slot::Word => {
+                                    Heap::read(layouts, word_at(o, i), &field, ctors, walked)
+                                }
+                            };
+                            (name.clone(), value)
                         })
                         .collect();
                     Value::Record(Arc::new(Fields::from_unsorted(fields)))
@@ -1346,7 +1482,9 @@ pub fn share(words: &[Word]) -> bool {
         marked.push(o);
         for (first, last) in unsafe { child_ranges(o) } {
             for i in first..last {
-                pending.push(unsafe { word_at(o, i) });
+                if unsafe { counted(o, i) } {
+                    pending.push(unsafe { word_at(o, i) });
+                }
             }
         }
     }
@@ -1410,7 +1548,7 @@ pub fn reset(w: Word) -> Word {
         if (*o).flags & FLAT == 0 {
             for i in 0..(*o).len as usize {
                 let c = word_at(o, i);
-                if !is_imm(c) && c != 0 {
+                if counted(o, i) && !is_imm(c) && c != 0 {
                     dec(c);
                 }
             }
@@ -1475,6 +1613,9 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
             .iter()
             .flat_map(|(first, last)| *first..*last)
         {
+            if !counted(o, i) {
+                continue;
+            }
             let c = word_at(o, i);
             if is_imm(c) || c == 0 {
                 continue;
@@ -1526,7 +1667,9 @@ pub fn mark_immortal(w: Word) {
             match (*o).kind {
                 KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
-                        pending.push(word_at(o, i));
+                        if counted(o, i) {
+                            pending.push(word_at(o, i));
+                        }
                     }
                 }
                 KIND_LIST => pending.extend(list::children(o)),
@@ -1562,7 +1705,9 @@ pub fn world_independent(w: Word) -> bool {
             match (*o).kind {
                 KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
-                        pending.push(word_at(o, i));
+                        if counted(o, i) {
+                            pending.push(word_at(o, i));
+                        }
                     }
                 }
                 KIND_LIST => pending.extend(list::children(o)),
@@ -1616,7 +1761,9 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
             match (*o).kind {
                 KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
                     for i in 0..(*o).len as usize {
-                        pending.push(word_at(o, i));
+                        if counted(o, i) {
+                            pending.push(word_at(o, i));
+                        }
                     }
                 }
                 KIND_LIST => pending.extend(list::children(o)),
@@ -1817,6 +1964,12 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                 }
                 xs.len().cmp(&ys.len())
             }
+            KIND_RECORD
+                if layouts.holds_floats((*obj(a)).layout)
+                    || layouts.holds_floats((*obj(b)).layout) =>
+            {
+                Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b))
+            }
             KIND_RECORD => {
                 let (x, y) = (obj(a), obj(b));
                 let (names_a, names_b) = (
@@ -1877,7 +2030,8 @@ pub fn native_key(w: Word) -> bool {
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
             ),
             KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
+                ((*o).kind != KIND_RECORD || (*o).flags & MIXED == 0)
+                    && (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
             }
             KIND_LIST => list::children(o).all(native_key),
             KIND_MAP => {

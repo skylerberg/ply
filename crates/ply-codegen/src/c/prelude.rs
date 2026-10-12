@@ -21,6 +21,7 @@ typedef struct {
 
 #define PLY_HEADER 16
 #define PLY_FLAT 1
+#define PLY_MIXED 2
 #define PLY_KIND_FLOAT 16
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
@@ -169,6 +170,7 @@ helpers![
     (rt_ctor, 3, true),
     (rt_field, 3, true),
     (rt_list, 2, true),
+    (rt_record, 3, true),
     (rt_record_fits, 3, true),
     (rt_record_has, 2, true),
     (rt_list_fits, 3, true),

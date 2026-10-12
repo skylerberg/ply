@@ -113,7 +113,7 @@ impl UnitTables {
             && shapes
                 .iter()
                 .enumerate()
-                .all(|(id, names)| layouts.shape_names(id as u32)[..] == names[..]);
+                .all(|(id, names)| layouts.shape_spelled(id as u32)[..] == names[..]);
         if !placed {
             return None;
         }

@@ -116,7 +116,11 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
             assert_eq!((*o).rc, IMMORTAL, "an object of kind {}", (*o).kind);
             match (*o).kind {
                 KIND_RECORD | KIND_CTOR | KIND_ARRAY => {
-                    pending.extend((0..(*o).len as usize).map(|i| word_at(o, i)));
+                    pending.extend(
+                        (0..(*o).len as usize)
+                            .filter(|i| counted(o, *i))
+                            .map(|i| word_at(o, i)),
+                    );
                 }
                 KIND_LIST => pending.extend(ply_codegen::list::to_vec(o)),
                 KIND_MAP => pending.extend(
@@ -197,4 +201,71 @@ fn a_function_has_no_text_and_a_text_cut_short_reads_as_none() {
         err.contains("a constructor this unit does not have"),
         "{err}"
     );
+}
+
+/// A record as compiled code builds `{ name: String, weight: Float }`: `weight` held as its bits.
+fn weighed(h: &mut Heap, l: &Layouts, name: &str, weight: f64) -> Word {
+    let shape = l.shape(vec![
+        Symbol::new("name"),
+        spelled(&Symbol::new("weight"), Slot::Float),
+    ]);
+    let o = h.alloc(KIND_RECORD, MIXED, 2, shape);
+    let s = h.str(name);
+    unsafe {
+        set_word(o, 0, s);
+        set_word(o, 1, ply_eval::float::bits(weight) as i64);
+        set_word(o, 2, 0b01);
+    }
+    o as Word
+}
+
+#[test]
+fn a_record_holds_its_floats_as_bits_whoever_makes_it_and_reads_as_the_value_it_is() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let r = weighed(&mut h, &l, "a", 2.5);
+    let value = record(vec![
+        ("name", Value::str("a")),
+        ("weight", Value::Float(2.5)),
+    ]);
+    assert_eq!(Heap::to_value(&l, r), value);
+    // Whoever makes the record, it holds its `Float` as its bits.
+    let made = h.to_word(&l, &value);
+    assert_eq!(unsafe { (*obj(made)).layout }, unsafe { (*obj(r)).layout });
+    assert!(unsafe { !counted(obj(made), 1) });
+    assert_eq!(cmp_words(&l, r, made), Ordering::Equal);
+    let (_into, read) = kept(&l, r);
+    assert!(unsafe { !counted(obj(read), 1) });
+    assert_eq!(Heap::to_value(&l, read), value);
+    // The bits are no child: the record lets go of its string alone.
+    dec(r);
+    dec(made);
+}
+
+#[test]
+fn a_record_of_any_width_holds_every_float_as_its_bits() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let value = record(
+        (0..70)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("f{i:02}").into_boxed_str());
+                let v = if i % 2 == 0 {
+                    Value::Float(i as f64 + 0.5)
+                } else {
+                    Value::str(format!("s{i}"))
+                };
+                (name, v)
+            })
+            .collect(),
+    );
+    let w = h.to_word(&l, &value);
+    let o = obj(w);
+    // Past 64 fields the bitmap after the words takes a second word.
+    assert_eq!(unsafe { (*o).flags }, MIXED);
+    assert!((0..70).all(|i| unsafe { counted(o, i) } == (i % 2 == 1)));
+    assert_eq!(Heap::to_value(&l, w), value);
+    let (_into, read) = kept(&l, w);
+    assert_eq!(Heap::to_value(&l, read), value);
+    dec(w);
 }
