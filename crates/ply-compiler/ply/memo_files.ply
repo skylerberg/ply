@@ -16,7 +16,7 @@ import std.bytes (bytes_of_hex, hex_of)
 import std.list (contains)
 import memo (Record, Seen, memo, memo_keep, answer, started, digest_of, head_bytes, output_named,
              height_named, inline_named, kept_inline, output_path, record_bytes, record_from,
-             record_path, seen_bin)
+             record_path, seen_bin, places_read, read_ids)
 
 fn records_dir(dir: String) -> String = under(dir, "records")
 
@@ -564,18 +564,27 @@ pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} = {
 /// What a compaction dropped: records it did not keep, and answers no record names.
 pub type Compacted = { records: Int, answers: Int, bytes: Int }
 
-/// Drops every record `keeps` does not keep, asked with the hex of its key, and then every answer no
-/// record left names. A dropped record is answered again by the next run that asks it.
+/// Drops every record `keeps` does not keep, asked with the name of its file, and then what no
+/// record left reaches: each answer none names, each note of a place none reads, each reader link
+/// and each mark of a record that is gone. A dropped record is answered again by the next run that
+/// asks it.
 pub fn compacted<[r]>(
   dir: String,
-  keeps: (String, Record) -> Bool,
+  keeps: (String, Record) -> Bool / {abort.raise},
 ) -> Compacted / {fs.read[r], fs.write[r], abort.raise} = {
   let all = records_in[r](dir);
   let kept = filter(all, |x: { name: String, record: Record, inside: Option<Int> }|
     keeps(x.name, x.record));
+  let names = fold(
+    kept,
+    map_new(),
+    |acc: Map<String, Bool>, x: { name: String, record: Record, inside: Option<Int> }|
+      map_insert(acc, x.name, true),
+  );
   let gone = fold(all, 0, |n: Int, x: { name: String, record: Record, inside: Option<Int> }|
-    if keeps(x.name, x.record) || !fs.remove[r](records_dir(dir) ++ "/" ++ x.name) { n }
+    if map_contains(names, x.name) || !fs.remove[r](records_dir(dir) ++ "/" ++ x.name) { n }
     else { n + 1 });
+  swept_notes[r](dir, kept, names);
   let named = named_digests(kept);
   let dropped = fold(
     landed_in[r](outputs_dir(dir)),
@@ -588,6 +597,70 @@ pub fn compacted<[r]>(
       },
   );
   { records: gone, answers: dropped.answers, bytes: dropped.bytes }
+}
+
+/// Drops from the store in `dir` what no record of `kept`, whose files `names` names, reaches: the
+/// note of each place none of them reads, each reader link that names another record or a read its
+/// record does not make, and each mark on another record.
+fn swept_notes<[r]>(
+  dir: String,
+  kept: List<{ name: String, record: Record, inside: Option<Int> }>,
+  names: Map<String, Bool>,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} = {
+  let places = fold(
+    kept,
+    map_new(),
+    |acc: Map<String, Bool>, x: { name: String, record: Record, inside: Option<Int> }|
+      map_fold(places_read(x.record.reads), acc, |a: Map<String, Bool>, id: Bytes, _: Bool|
+        map_insert(a, hex_of(id), true)),
+  );
+  fold(landed_in[r](places_dir(dir)), (), |_: Unit, n: String|
+    if !map_contains(places, n) {
+      fs.remove[r](places_dir(dir) ++ "/" ++ n);
+      ()
+    });
+  let linked = fold(
+    kept,
+    map_new(),
+    |acc: Map<String, Map<Bytes, Bool>>, x: { name: String, record: Record, inside: Option<Int> }|
+      map_insert(acc, x.name, read_ids(x.record.reads)),
+  );
+  fold(landed_in[r](links_dir(dir)), (), |_: Unit, n: String| {
+    let path = links_dir(dir) ++ "/" ++ n;
+    match fs.read_file[r](path) {
+      None -> (),
+      Some(b) -> {
+        let left = bytes_concat_all(
+          map_keys(
+            fold(range(0, bytes_len(b) / 64), map_new(), |acc: Map<Bytes, Bool>, i: Int| {
+              let id = bytes_slice(b, i * 64, i * 64 + 32);
+              let key = bytes_slice(b, i * 64 + 32, i * 64 + 64);
+              match map_get(linked, hex_of(key)) {
+                Some(ids) -> if map_contains(ids, id) {
+                  map_insert(acc, bytes_concat(id, key), true)
+                } else { acc },
+                None -> acc,
+              }
+            }),
+          ),
+        );
+        if bytes_len(left) == 0 {
+          fs.remove[r](path);
+          ()
+        } else if left != b {
+          if fs.write_file[r](path ++ ".tmp", left) {
+            fs.rename[r](path ++ ".tmp", path);
+            ()
+          }
+        }
+      },
+    }
+  });
+  fold(landed_in[r](marks_dir(dir)), (), |_: Unit, n: String|
+    if string_len(n) < 64 || !map_contains(names, string_slice(n, 0, 64)) {
+      fs.remove[r](marks_dir(dir) ++ "/" ++ n);
+      ()
+    })
 }
 
 test "a copy leaves its store holding the records asked for and their answers, and nothing else" {
@@ -659,6 +732,31 @@ fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.rais
   );
   kept[r]("s", |_: String| None, |_: Bytes, _: Bytes| Some(text), ||
     answer(queries, started(queries), b"quoted", b"a").output)
+}
+
+test "a compaction keeps what a kept record reaches, and a record it drops takes its notes with it" {
+  let filled = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four")).tree;
+  let listed = |tree: fs::MemFs, sub: String|
+    match fs::mem_list(tree, "s/" ++ sub) { Some(names) -> names, None -> [] };
+  let other = hex_of(bytes_concat_all(map(range(0, 32), |_: Int| b"k")));
+  // A mark and a note of a place that belong to no record of the store, as another layout leaves.
+  let strewn = fs::mem_write(
+    fs::mem_write(filled, "s/marked/" ++ other ++ "-run.0", b"").fs,
+    "s/places/" ++ other,
+    b"",
+  ).fs;
+  let all = fs::on_mem[abs](strewn, || compacted[abs]("s", |_: String, _: Record| true));
+  assert_eq(all.value, { records: 0, answers: 0, bytes: 0 });
+  assert_eq(listed(all.tree, "marked"), []);
+  assert_eq(listed(all.tree, "places"), listed(filled, "places"));
+  // What marks a kept record where the world moves is still there.
+  assert_eq(fs::on_mem[abs](all.tree, || quoted_over[abs](b"five")).value, b"\"five\"");
+  let none = fs::on_mem[abs](strewn, || compacted[abs]("s", |_: String, _: Record| false));
+  assert_eq(none.value.records, 2);
+  assert_eq(listed(none.tree, "records"), []);
+  assert_eq(listed(none.tree, "places"), []);
+  assert_eq(listed(none.tree, "links"), []);
+  assert_eq(listed(none.tree, "marked"), [])
 }
 
 test "a run that dies after any write leaves a store its next run answers from as a fresh one" {
