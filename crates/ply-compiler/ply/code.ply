@@ -38,7 +38,8 @@ pub type Node =
   /// One label argument of a call: the field-table entry of a resource named here.
   | NLabel(Bytes)
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
-  | NLambda({ params: Int, size: Int, captures: List<Capture>, body: Code })
+  /// `at` is where the lambda is written, which names it among its owner's.
+  | NLambda({ params: Int, size: Int, captures: List<Capture>, body: Code, at: Span })
   | NSimulate({ size: Int, captures: List<Capture>, body: Code })
   /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses. `rooted`
   /// is whether the block is in its definition's own barrier, none of a lambda's, a clause's or a
@@ -705,7 +706,8 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
       },
     },
     // A lambda opens its own barrier; a name it reads from outside becomes a capture.
-    ELambda(x) -> lower_lambda(map(x.params, |param: Param| param.name.name), x.body, stack),
+    ELambda(x) ->
+      lower_lambda(map(x.params, |param: Param| param.name.name), x.body, stack, expr_span(e)),
     // `simulate` opens a barrier, as a lambda does, and takes no parameters.
     ESimulate(x) -> match lower_in(x.body, st_push(stack, empty_frame())) {
       None -> None,
@@ -732,7 +734,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
         |acc: Option<Seq>, b: Expr|
           match acc {
             None -> None,
-            Some(sq) -> match lower_lambda([], b, sq.stack) {
+            Some(sq) -> match lower_lambda([], b, sq.stack, expr_span(b)) {
               Some(o) -> Some({ codes: push(sq.codes, o.code), stack: o.stack }),
               None -> None,
             },
@@ -1149,17 +1151,25 @@ fn lower_seq(exprs: List<Expr>, stack: Stack) -> Option<Seq> / {abort.raise} =
     })
 
 /// A lambda over `params`: its body lowered behind a barrier, which the captures cross.
-fn lower_lambda(params: List<Bytes>, body: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} = {
+fn lower_lambda(
+  params: List<Bytes>,
+  body: Expr,
+  stack: Stack,
+  at: Span,
+) -> Option<Lowered> / {abort.raise} = {
   let inner = fold(
     params,
     { names: [], scope: [], captures: [], capture_names: [] },
     |g: Frame, n: Bytes| bind(g, n),
   );
-  match lower_in(body, st_push(stack, inner)) { None -> None, Some(b) -> Some(lam_of(params, b)) }
+  match lower_in(body, st_push(stack, inner)) {
+    None -> None,
+    Some(b) -> Some(lam_of(params, b, at)),
+  }
 }
 
 /// Pops the lambda's barrier; the stack below keeps the captures threaded into it.
-fn lam_of(params: List<Bytes>, b: Lowered) -> Lowered = {
+fn lam_of(params: List<Bytes>, b: Lowered, at: Span) -> Lowered = {
   let inner = st_top(b.stack);
   {
     code: {
@@ -1170,6 +1180,7 @@ fn lam_of(params: List<Bytes>, b: Lowered) -> Lowered = {
         size: len(inner.names),
         captures: inner.captures,
         body: mark(b.code, nothing_live(), moves_of(b.stack.moves, b.code)).code,
+        at: at,
       }),
     },
     stack: st_pop(b.stack),
@@ -1760,11 +1771,7 @@ pub fn mark(c: Code, live: Live, mv: Moves) -> Marked =
     NLambda(l) -> {
       let w = mark_caps(l.captures, live);
       {
-        code: {
-          own: Borrowed,
-          span: c.span,
-          node: NLambda({ params: l.params, size: l.size, captures: w.captures, body: l.body }),
-        },
+        code: { own: Borrowed, span: c.span, node: NLambda({ ..l, captures: w.captures }) },
         live: w.live,
       }
     },
