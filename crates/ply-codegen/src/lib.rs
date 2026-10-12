@@ -8,6 +8,7 @@
 
 pub mod array;
 pub mod backend;
+pub mod blocks;
 pub mod c;
 pub mod detached;
 pub mod heap;
@@ -20,6 +21,7 @@ pub mod simulate;
 pub mod source;
 pub mod stack;
 pub mod stored;
+mod vm;
 
 pub use backend::{Bodies, Declines, Unit};
 pub use c::Refused;
