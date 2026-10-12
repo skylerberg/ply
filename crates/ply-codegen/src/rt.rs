@@ -2337,7 +2337,7 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
     }
     // A unique accumulator grows in place; a fresh buffer per step would be quadratic.
     if let Some((&first, rest)) = pieces.split_first()
-        && heap::is_unique(first)
+        && heap::grows_in_place(first)
     {
         let mut out = first;
         for w in rest {
@@ -2828,7 +2828,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::is_unique(*xs) {
                 let items = list::to_vec(o);
                 if let Some(&first) = items.first()
-                    && heap::is_unique(first)
+                    && heap::grows_in_place(first)
                 {
                     for &w in &items {
                         heap::inc(w);

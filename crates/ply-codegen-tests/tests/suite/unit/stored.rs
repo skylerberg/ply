@@ -822,3 +822,32 @@ fn columns_hold_each_field_of_their_records_apart() {
         dec(w);
     }
 }
+
+#[test]
+fn a_buffer_a_view_holds_still_grows_in_place_where_the_view_reads_none_of_the_growth() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let start = h.bytes(&all[..100]);
+    let buf = h.append(start, &all[100..]);
+    inc(buf);
+    let view = h.slice(&l, buf, 0, 100);
+    assert_eq!(unsafe { (*obj(buf)).aux }, 1, "the buffer counts its view");
+    assert!(grows_in_place(buf));
+    let grown = h.append(buf, b"!");
+    assert_eq!(grown, buf, "appended in place past the view");
+    assert_eq!(unsafe { bytes_of(obj(view)) }, &all[..100]);
+    assert_eq!(unsafe { bytes_of(obj(grown)) }.len(), 201);
+    dec(view);
+    assert_eq!(
+        unsafe { (*obj(grown)).aux },
+        0,
+        "letting the view go uncounts it"
+    );
+    // A second full holder is no view: the buffer is copied.
+    inc(grown);
+    let copied = h.append(grown, b"?");
+    assert_ne!(copied, grown);
+    dec(copied);
+    dec(grown);
+}
