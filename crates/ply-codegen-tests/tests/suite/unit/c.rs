@@ -91,19 +91,31 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A unit says how its C lays out records, after whatever else it says.
+/// A unit says how its C lays out records, after whatever else it says, and how each constructor
+/// lays out its arguments.
 #[test]
-fn a_unit_says_how_it_lays_out_records() {
+fn a_unit_says_how_it_lays_out_records_and_constructors() {
     let mut exports = units::exports_of(&[]);
-    for bits in 0..8 {
+    let spelled = |names: &[&str]| names.iter().copied().map(ply_eval::Symbol::new).collect();
+    exports.ctors = vec![
+        (ply_eval::Symbol::new("None"), 0, vec![]),
+        (
+            ply_eval::Symbol::new("m.Pair"),
+            2,
+            spelled(&["a000!r(x!f,y!f)", "a001"]),
+        ),
+    ];
+    for bits in 0..16 {
         exports.layout = ply_codegen::heap::RecordLayout {
             in_place: bits & 1 != 0,
             raw_widths: bits & 2 != 0,
             inline_arrays: bits & 4 != 0,
+            ctor_args: bits & 8 != 0,
         };
         let read =
             ply_codegen::c::Exports::decode(&exports.encode()).expect("the table reads back");
         assert_eq!(read.layout, exports.layout);
+        assert_eq!(read.ctors, exports.ctors);
     }
 }
 
@@ -320,7 +332,7 @@ fn numbered() -> Vec<units::Def> {
 }
 
 fn stating(e: &mut ply_codegen::c::Exports, functions: [&str; 5]) {
-    e.ctors = vec![(ply_eval::Symbol::new("m.N"), 1)];
+    e.ctors = vec![(ply_eval::Symbol::new("m.N"), 1, vec![])];
     e.instances = vec![(
         ply_eval::Symbol::new("m.N"),
         "m.held".to_string(),
@@ -359,7 +371,7 @@ fn a_unit_stating_a_function_of_more_than_the_value_is_refused() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let defs = [def("m.scaled", 2, "  (void)p1; return p0;")];
     let Some(loaded) = units::opened(dir.path(), &defs, |e| {
-        e.ctors = vec![(ply_eval::Symbol::new("m.Box"), 1)];
+        e.ctors = vec![(ply_eval::Symbol::new("m.Box"), 1, vec![])];
         e.instances = vec![(
             ply_eval::Symbol::new("m.Box"),
             "m.scaled".to_string(),
