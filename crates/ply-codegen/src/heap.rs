@@ -43,6 +43,8 @@ pub const KIND_CHAR: u8 = 17;
 pub const KIND_FIXED: u8 = 18;
 /// A `Decimal`: its 16 bytes, as `rust_decimal` serializes it, in two words.
 pub const KIND_DECIMAL: u8 = 19;
+/// A `Columns`: an array per field of its records (`crate::columns`).
+pub const KIND_COLUMNS: u8 = 20;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -1140,7 +1142,9 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
             KIND_RECORD | KIND_ARRAY | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT
-            | KIND_FIXED | KIND_DECIMAL => words_bytes((*o).kind, (*o).flags, (*o).len),
+            | KIND_FIXED | KIND_DECIMAL | KIND_COLUMNS => {
+                words_bytes((*o).kind, (*o).flags, (*o).len)
+            }
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1900,6 +1904,46 @@ impl Heap {
                             .collect(),
                     )
                 }
+                // The array of its records, which is the value it is.
+                KIND_COLUMNS => {
+                    let item = carry.item();
+                    let names = layouts.shape_names((*o).layout);
+                    let fields: Vec<Vec<Value>> = names
+                        .iter()
+                        .enumerate()
+                        .map(|(k, name)| {
+                            let column = crate::columns::column(o, k);
+                            let field = item.field(name);
+                            let (slot, stride) = held_as(layouts, column);
+                            (0..crate::array::len(column))
+                                .map(|i| {
+                                    read_held(
+                                        layouts,
+                                        column,
+                                        i * stride,
+                                        slot,
+                                        &field,
+                                        ctors,
+                                        walked,
+                                    )
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    Value::array(
+                        (0..crate::columns::len(o))
+                            .map(|i| {
+                                Value::Record(Arc::new(Fields::from_unsorted(
+                                    names
+                                        .iter()
+                                        .zip(&fields)
+                                        .map(|(name, column)| (name.clone(), column[i].clone()))
+                                        .collect(),
+                                )))
+                            })
+                            .collect(),
+                    )
+                }
                 KIND_MAP => {
                     let (key, value) = carry.entry();
                     Value::map(map::to_vec(o).into_iter().map(|(k, v)| {
@@ -2180,12 +2224,26 @@ fn cmp_bytes(x: &[u8], y: &[u8]) -> Ordering {
 /// How deep dismantling recurses on the stack before deferring to a heap list.
 const DISMANTLE_DEPTH: usize = 32;
 
+/// The objects `o` holds a count of: what releasing it lets go of, and what reaches anything
+/// through it.
+unsafe fn children(o: *mut Obj) -> Vec<Word> {
+    unsafe {
+        child_ranges(o)
+            .iter()
+            .flat_map(|(first, last)| *first..*last)
+            .filter(|i| counted(o, *i))
+            .map(|i| word_at(o, i))
+            .filter(|c| !is_imm(*c) && *c != 0)
+            .collect()
+    }
+}
+
 /// The payload words of `o` that hold counted children.
 unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
     unsafe {
         match (*o).kind {
             KIND_RECORD | KIND_CTOR | KIND_ARRAY if (*o).flags & FLAT != 0 => [(0, 0), (0, 0)],
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY | KIND_COLUMNS => {
                 [(0, (*o).len as usize), (0, 0)]
             }
             KIND_MLEAF => [(0, 2 * (*o).len as usize), (0, 0)],
@@ -2270,31 +2328,7 @@ pub fn mark_immortal(w: Word) {
                 continue;
             }
             (*o).rc = IMMORTAL;
-            match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                    for i in 0..(*o).len as usize {
-                        if counted(o, i) {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                }
-                KIND_LIST => pending.extend(list::children(o)),
-                KIND_MAP => {
-                    let r = word_at(o, 0);
-                    if r != 0 {
-                        pending.push(r);
-                    }
-                }
-                KIND_MLEAF | KIND_MBRANCH => {
-                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
-                }
-                KIND_CLOSURE => {
-                    for i in CLOSURE_CAPTURES..(*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
-                }
-                _ => {}
-            }
+            pending.extend(children(o));
         }
     }
 }
@@ -2309,31 +2343,11 @@ pub fn world_independent(w: Word) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                    for i in 0..(*o).len as usize {
-                        if counted(o, i) {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                }
-                KIND_LIST => pending.extend(list::children(o)),
-                KIND_MAP => {
-                    let r = word_at(o, 0);
-                    if r != 0 {
-                        pending.push(r);
-                    }
-                }
-                KIND_MLEAF | KIND_MBRANCH => {
-                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
-                }
-                KIND_CLOSURE => {
-                    // A continuation's captures are immediates naming a body its entry alone holds.
-                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) {
-                        return false;
-                    }
-                    for i in CLOSURE_CAPTURES..(*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
+                // A continuation's captures are immediates naming a body its entry alone holds.
+                KIND_CLOSURE
+                    if crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) =>
+                {
+                    return false;
                 }
                 KIND_BRIDGE => {
                     // A handle must not outlive its entry, and the memo would keep it.
@@ -2343,7 +2357,7 @@ pub fn world_independent(w: Word) -> bool {
                         return false;
                     }
                 }
-                _ => {}
+                _ => pending.extend(children(o)),
             }
         }
     }
@@ -2365,28 +2379,6 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                    for i in 0..(*o).len as usize {
-                        if counted(o, i) {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                }
-                KIND_LIST => pending.extend(list::children(o)),
-                KIND_MAP => {
-                    let r = word_at(o, 0);
-                    if r != 0 {
-                        pending.push(r);
-                    }
-                }
-                KIND_MLEAF | KIND_MBRANCH => {
-                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
-                }
-                KIND_CLOSURE => {
-                    for i in CLOSURE_CAPTURES..(*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
-                }
                 KIND_BRIDGE => match bridged(o) {
                     Value::Cell(s) => {
                         if *s == slot {
@@ -2399,7 +2391,7 @@ pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
                         }
                     }
                 },
-                _ => {}
+                _ => pending.extend(children(o)),
             }
         }
     }
@@ -2487,7 +2479,7 @@ fn rank(w: Word) -> u8 {
             KIND_RECORD => 9,
             KIND_CTOR => 10,
             KIND_CLOSURE => 11,
-            KIND_ARRAY => 17,
+            KIND_ARRAY | KIND_COLUMNS => 17,
             KIND_BRIDGE => match bridged(o) {
                 Value::Unit => 0,
                 Value::Bool(_) => 1,
@@ -2577,6 +2569,7 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                 }
                 n.cmp(&m)
             }
+            KIND_COLUMNS => Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b)),
             KIND_MAP => {
                 let (xs, ys) = (map::to_vec(obj(a)), map::to_vec(obj(b)));
                 for ((xk, xv), (yk, yv)) in xs.iter().zip(&ys) {
@@ -2723,7 +2716,7 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
                     _ => part_word(o, at, slot).is_some_and(|p| native_key(layouts, p)),
                 })
             }
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY | KIND_COLUMNS => {
                 (0..(*o).len as usize).all(|i| !counted(o, i) || native_key(layouts, word_at(o, i)))
             }
             KIND_LIST => list::children(o).all(|w| native_key(layouts, w)),

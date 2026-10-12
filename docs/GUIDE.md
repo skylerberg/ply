@@ -669,12 +669,13 @@ depth, are checked against it before anything runs (§16). A module whose
 statements reach two is `E0471`.
 
 A value is kept as it is laid out, so a table that is compact is one that reads
-quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
-width below 64 is held in that word: an `Array` of those is one object, kept as
-its words and read back in one piece, as a `Bytes` or a `String` is. Any other
-element is an object of its own, made when the value is read: an `Array` of
-30,000 records is 30,001 objects. A map is kept in its order and read back
-without comparing a key, and what a value shares is kept once.
+quickly. An `Array` of `Int`s within 63 bits or widths below 64 holds each in a
+word: it is one object, kept as its words and read back in one piece, as a
+`Bytes` or a `String` is. One of records, `Float`s, 64-bit widths or `Decimal`s
+holds each element in place, so an `Array` of 30,000 records is one object too,
+kept element by element. Any other element is an object of its own, made when
+the value is read. A map is kept in its order and read back without comparing a
+key, and what a value shares is kept once.
 
 ## 4. Types
 
@@ -809,7 +810,12 @@ and either with whether it is `opaque` (§3.2).
 is a fixed number of elements laid out one after another, so reading or
 replacing one by its index is a load or a store; it is a value like a list,
 compared, ordered and derived element by element, and has no literal: build it
-with `array_new` or `array_of_list` (§12). `Map<k, v>`
+with `array_new` or `array_of_list` (§12). `Columns<a>` is an array of records
+that holds each field apart, an array per field: `columns_get(xs, i).f` reads
+field `f` of record `i` without the rest of it, so a pass over one field reads
+only that field's array. It is a value like an array, compared and ordered as
+the array of its records, built with `columns_new` or `columns_of_list`, and
+its element type is a record of at least one field (`E0224`). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
@@ -3398,6 +3404,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0221` | `opaque` on an alias, which has no values of its own |
 | `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
 | `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
+| `E0224` | a `Columns` of a type that is not a record of at least one field |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
