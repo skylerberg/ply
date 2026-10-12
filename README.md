@@ -39,8 +39,8 @@ of it next.
 | `editors/` | the tree-sitter grammar editors read |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
 | `benches/` | benchmark scripts and their recorded output |
-| `probes/` | standalone C probes, each run by a CI job |
-| `.github/` | CI: `workflows/ci.yml`, the job tables in `ci-shards.sh`, and `ci-timings.sh` to read a run |
+| `probes/` | standalone C probes, each run by CI |
+| `.github/` | CI: `workflows/ci.yml`, its tables in `ci-tables.sh`, and `ci-timings.sh` to read a run |
 
 ## Building and testing
 
@@ -59,13 +59,12 @@ with a pack after it holding the shipped modules, what they answer and the CLI's
 `ply` already in `target/` or, in a fresh checkout, the last release (`scripts/stage0.sh`). Cargo
 builds nothing after an edit to Ply sources alone.
 
-CI builds one `cargo nextest archive --locked --workspace` and runs it in shards
-cut from the durations its last run measured.
-The corpus's tests are the Ply package `crates/ply-corpus/checks`, run by `.github/ci-corpus.sh`:
-each `lanes` job runs a partition of them, apart from the `nextest` jobs, and the `corpus` jobs `desks-<k>`
-run the tests of `serving` and `database`, cut by duration, against a postgres. The proof runs, `proofs` for the
-standard library and `laws-<id>` for a package, each take a `corpus` job of their own.
-`.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
+CI is one job, in a checkout its runner keeps between runs, so a run builds and tests what moved
+since the last. The Ply tests are the runs `.github/ci-tables.sh runs` lists, each a `ply test` or a
+`ply prove` of a package: the corpus's checks (`crates/ply-corpus/checks`), the CLI's suite, the
+standard library's tests and its `proofs`, and each package's own suite and laws.
+`.github/ci-corpus.sh all` runs them side by side, and `.github/ci-corpus.sh run <id>` runs one with
+the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 
