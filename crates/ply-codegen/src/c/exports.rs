@@ -89,7 +89,8 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// How the unit's C reads a record, as its [`IN_PLACE`] and [`RAW_WIDTHS`] lines say.
+    /// How the unit's C reads a record or an array, as its [`IN_PLACE`], [`RAW_WIDTHS`] and
+    /// [`INLINE_ARRAYS`] lines say.
     pub layout: RecordLayout,
 }
 
@@ -101,6 +102,10 @@ pub const IN_PLACE: &str = "records held in place";
 /// A line after a unit's tables, where its C holds a 64-bit width as its bits wherever a record
 /// holds one; a unit without it holds the width's word there.
 pub const RAW_WIDTHS: &str = "widths held raw";
+
+/// A line after a unit's tables, where its C reads an array's records, `Float`s and 64-bit widths
+/// in place; a unit without it reads each element's word.
+pub const INLINE_ARRAYS: &str = "arrays hold their elements in place";
 
 impl Exports {
     pub fn names(&self) -> Vec<String> {
@@ -204,6 +209,9 @@ impl Exports {
         if self.layout.raw_widths {
             out.push_str(&format!("{RAW_WIDTHS}\n"));
         }
+        if self.layout.inline_arrays {
+            out.push_str(&format!("{INLINE_ARRAYS}\n"));
+        }
         out
     }
 
@@ -304,11 +312,13 @@ impl Exports {
         let mut layout = RecordLayout {
             in_place: false,
             raw_widths: false,
+            inline_arrays: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
                 IN_PLACE => layout.in_place = true,
                 RAW_WIDTHS => layout.raw_widths = true,
+                INLINE_ARRAYS => layout.inline_arrays = true,
                 _ => {}
             }
         }

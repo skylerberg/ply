@@ -77,9 +77,6 @@ const HERMETIC_OPERATIONS: [(&str, &str); 12] = [
     ("drop", "ply_machine::hermetic::drop"),
 ];
 
-/// The front end and the emitter recurse once per node on the native stack.
-const STACK: usize = 256 << 20;
-
 /// The ops and the one handler serving them, configured as the run being lent is configured.
 pub fn registrations_with(options: drive::RunOptions) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     lent_by(options, false)
@@ -95,12 +92,17 @@ pub fn hermetic_registrations() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
 }
 
 fn lent_by(options: drive::RunOptions, hermetic: bool) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    let handler: Arc<dyn HostHandler> = Arc::new(MachineHandler {
+    let made = move || MachineHandler {
         hermetic,
-        options,
+        options: options.clone(),
         labels: Mutex::new(HashMap::new()),
         configured: Mutex::new(HashMap::new()),
-    });
+    };
+    let handler: Arc<dyn HostHandler> = if hermetic {
+        hosts::Apart::of(made)
+    } else {
+        Arc::new(made())
+    };
     let (effect, operations) = if hermetic {
         (HERMETIC, HERMETIC_OPERATIONS)
     } else {
@@ -541,7 +543,7 @@ impl MachineHandler {
         let (requests, hearing) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name(format!("machine-{label}"))
-            .stack_size(STACK)
+            .stack_size(ply_codegen::rt::PROGRAM_STACK)
             .spawn(move || serve(start(options), reply, hearing))
             .map_err(|e| unspawned(label, &e))?;
         let found = answered.recv().map_err(|_| unanswered(label))?;

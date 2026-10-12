@@ -1384,9 +1384,13 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
 * The branches spend one step budget between them (`E0503`, §8.4), as they would
   in turn.
 * A block whose branches could reach a `handle` around it or a `simulate` region
-  (§9) runs them in turn, which answers the same. So does one whose branches
-  hold a cell, a task or a continuation. Under `--host` each branch waits on a
-  reactor of its own.
+  (§9) runs them in turn, which answers the same. A block written in a
+  definition's own body is held to that definition's row: a `handle` that
+  answers no effect in it does not keep the block in turn. One inside a lambda
+  or the body of a `handle` is kept in turn by any `handle` around it. So is
+  one whose branches hold a cell, a task or a continuation, and so is every
+  block of a program entered on another's branch, as each test of a `ply test`
+  run is. Under `--host` each branch waits on a reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
   of them a `write`; or a branch's row is open (it calls a function value whose
   row is a variable) while another performs anything; or a branch opens a
@@ -2115,7 +2119,9 @@ effect, or write `test/nondet "label" { ... }`, which is cached as any test is
 
 Tests whose footprints do not conflict run concurrently, under `parallel`
 blocks (§5.9) on one thread per core; a test whose effects are all discharged in
-a region conflicts with nothing. A raise is in no footprint, since the run
+a region conflicts with nothing. Only an atom of a `nondet` effect or of a
+region's `cell` conflicts with another test's: what answers any other is a
+function of the test's own state. A raise is in no footprint, since the run
 answers it as the test's failure. `--jobs N`/`-j` deals them into `N` lanes, each
 lane's tests in turn (default: a lane per test). `ply prove --jobs N` deals its
 claims' points the same way.
@@ -2626,11 +2632,15 @@ plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2)
 derives as an alias of its fields does: the same documents, bytes and shape.
 
 A `json` or `bin` codec whose type reaches itself, directly or through the
-other types the module derives, is two definitions: `tree_json()` starts
-`tree_json_at(json::max_depth())`, and each level hands the next one less, so
-the recursion is seen to end (§5.10). Past the bound, a decode is an error and an
-encode panics. `json`'s bound is 128 levels, as deep as `parse` reads, and
-`bin`'s is 10,000, as deep as calls nest (§5.7).
+other types the module derives, takes how many levels deeper it may nest and
+hands its cycle one less, so the recursion is seen to end (§5.10). It is two
+definitions: `tree_json()` starts `tree_json_at(json::max_depth())`. A `bin`
+codec whose cycle has no type that takes a parameter is instead a definition for
+each of its functions (`tree_bin_put`, `tree_bin_take` and `tree_bin_shape`),
+which call their cycle's by name, so no level makes a codec; `tree_bin()` hands
+each to its definition at `bin::max_depth()`. Past the bound, a decode is an
+error and an encode panics. `json`'s bound is 128 levels, as deep as `parse`
+reads, and `bin`'s is 10,000, as deep as calls nest (§5.7).
 
 `E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
 and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,

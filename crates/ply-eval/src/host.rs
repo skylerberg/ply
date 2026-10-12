@@ -144,6 +144,11 @@ impl fmt::Display for Pending {
 
 pub trait HostHandler: Send + Sync {
     fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic>;
+
+    /// `machine` has ended and asks nothing more: what the handler kept for it alone goes.
+    fn machine_ended(&self, machine: MachineId) {
+        let _ = machine;
+    }
 }
 
 /// Makes a reactor for the thread that calls it: one belongs to its thread, and a machine, a test
@@ -610,6 +615,13 @@ impl HostBinding {
 
     pub fn listing(&self) -> &HostListing {
         &self.listing
+    }
+
+    /// Tells every handler that `machine` has ended.
+    pub fn machine_ended(&self, machine: MachineId) {
+        for (_, handler) in &self.entries {
+            handler.machine_ended(machine);
+        }
     }
 
     pub fn resolve(
