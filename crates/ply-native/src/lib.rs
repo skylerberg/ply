@@ -93,3 +93,4 @@ unsafe fn run(symbols: *const Row, count: usize) -> c_int {
     };
     std::process::exit(code)
 }
+// Test only, never merged: moves the toolchain so a run's jobs hand their stores over.
