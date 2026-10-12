@@ -124,9 +124,7 @@ PACKAGE_SUITES=(
 )
 # Packages whose laws and contracts a `ply prove` of their own discharges, as `id:path`, the entry
 # `laws-<id>`: the library's are the `proofs` run's, and a law in any other package fails `verify`.
-PACKAGE_PROOFS=(
-  "compiler:crates/ply-compiler/ply"
-)
+PACKAGE_PROOFS=()
 
 # The packages the shards exclude, whose tests bind what a shard cannot: sockets and processes. The
 # gates job runs them after its own tests.
@@ -260,7 +258,7 @@ corpus_entries() {
   printf 'proofs\n'
   for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
-  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
   module_entries "$CORPUS_CHECKS" "" "${CORPUS_BY_TEST[@]}"
   module_entries "$CLI_SUITE" cli- "${CLI_BY_TEST[@]}" | grep -vE "^cli-($(IFS='|'; echo "${CLI_NIGHTLY[*]}"))(:|$)"
 }
@@ -354,7 +352,7 @@ package_path() {
 
 proofs_path() {
   local entry
-  for entry in "${PACKAGE_PROOFS[@]}"; do
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do
     [[ ${entry%%:*} == "$1" ]] && { printf '%s\n' "${entry#*:}"; return 0; }
   done
   return 1
@@ -363,7 +361,7 @@ proofs_path() {
 # Each `.ply` of a package below `crates/` other than the library's that states a law or an `ensures`
 # or `cost` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law(/[a-z]+)? "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply 2>/dev/null |
     grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
@@ -376,7 +374,7 @@ corpus_test_names() {
 alone_entries() {
   local entry
   printf '%s\n' "${CORPUS_ALONE[@]}"
-  for entry in "${PACKAGE_PROOFS[@]}"; do printf 'laws-%s\n' "${entry%%:*}"; done
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
 }
 
 corpus_alone() {
@@ -1911,13 +1909,13 @@ cmd_verify() {
   while IFS= read -r file; do
     [[ -n $file ]] || continue
     claimed=0
-    for entry in "${PACKAGE_PROOFS[@]}"; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
+    for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do [[ $file == "${entry#*:}"/* ]] && claimed=1; done
     if ((!claimed)); then
       echo "FAIL: $file states a law or contract, and no PACKAGE_PROOFS entry proves its package, so CI never discharges it" >&2
       failures=$((failures + 1))
     fi
   done < <(claiming_files)
-  for entry in "${PACKAGE_PROOFS[@]}"; do
+  for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do
     if ! grep -q "^${entry#*:}/" < <(claiming_files); then
       echo "FAIL: PACKAGE_PROOFS names ${entry#*:}, which states no law or contract — delete the entry" >&2
       failures=$((failures + 1))

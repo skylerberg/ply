@@ -1,10 +1,9 @@
 //! The runtime's half of a discharge: a claim's propositions entered at the points the program
-//! drew, and a law over interleavings searched at the points its guard kept. What a claim's points
+//! names, and a law over interleavings run at the points its guard kept. What a claim's points
 //! are, and what their judgements come to, is the program's.
 
 use crate::load::Loaded;
 use ply_eval::decode::{AnswerValue, Error as DecodeError};
-use ply_eval::host::HostBinding;
 use ply_eval::{
     Analysis, DEFAULT_MAX_CALLS, DefInfo, Diagnostic, LawInfo, Machine, Seed, SourceId, Span,
     Symbol, Value, codes,
@@ -23,7 +22,7 @@ pub struct Obligation {
     pub owner: Symbol,
     pub kind: ObligationKind,
     pub span: Span,
-    /// Whether the clause binds `result`, the owner's answer, which a point never draws.
+    /// Whether the clause binds `result`, the owner's answer, which no point assigns.
     pub result: bool,
     /// Each guard's place: an owner's `requires` clauses, or a law's `where`.
     pub guards: Vec<Span>,
@@ -36,6 +35,8 @@ pub enum ObligationKind {
     Ensures {
         index: usize,
     },
+    /// A `cost` bound, read off its owner's body and never entered.
+    Cost,
     Law,
 }
 
@@ -44,12 +45,10 @@ pub enum ObligationKind {
 pub enum Strategy {
     /// A law over a `simulate` region: its interleavings are searched at each of its points.
     Interleave,
-    /// A `law/host`, run against the host the run binds.
-    Hosted,
     /// The static prover first, then the claim's points.
     Static,
-    /// A cost law, measured at its sizes.
-    Fitting,
+    /// A `cost` bound, which nothing runs.
+    Bounded,
 }
 
 /// The obligations a `proof.world.World` owes, in the order the program listed them, which is the
@@ -74,6 +73,7 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
             "Ensures" => ObligationKind::Ensures {
                 index: kind.arg(0)?.number()?,
             },
+            "Cost" => ObligationKind::Cost,
             "Law" => ObligationKind::Law,
             _ => return Err(kind.unknown()),
         },
@@ -82,25 +82,16 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
         guards: at.field("guards")?.items(span)?,
         strategy: match strategy.name() {
             "Interleave" => Strategy::Interleave,
-            "Hosted" => Strategy::Hosted,
             "Static" => Strategy::Static,
-            "Fitting" => Strategy::Fitting,
+            "Bounded" => Strategy::Bounded,
             _ => return Err(strategy.unknown()),
         },
     })
 }
 
 /// The prover this build drives over the program. One built once serves a whole run.
-pub fn prover(
-    loaded: &Loaded,
-    hosting: Option<Hosting>,
-    backend: Arc<dyn ply_eval::Provider>,
-) -> Prover {
-    let prover = Prover::new(loaded, backend);
-    match hosting {
-        Some(hosting) => prover.with_hosting(hosting),
-        None => prover,
-    }
+pub fn prover(loaded: &Loaded, backend: Arc<dyn ply_eval::Provider>) -> Prover {
+    Prover::new(loaded, backend)
 }
 
 /// Where an obligation's claim is written, found once per run.
@@ -120,18 +111,8 @@ pub struct Prover {
     front: Arc<Analysis>,
     /// Each law's place among the program's, by its key.
     laws: HashMap<Symbol, usize>,
-    /// What a `law/host` is discharged against.
-    hosting: Option<Hosting>,
     /// A compiled unit holding the laws' and clauses' roots, where those propositions are entered.
     backend: Arc<dyn ply_eval::Provider>,
-}
-
-/// The binding and the reactor a `law/host` runs against. The factory is owned rather than
-/// borrowed, so a prover holding a hosting borrows the program and nothing else, and a caller can
-/// keep one prover across many steps.
-pub struct Hosting {
-    pub binding: Arc<HostBinding>,
-    pub runtime: Option<ply_eval::RuntimeFactory>,
 }
 
 impl Prover {
@@ -143,7 +124,6 @@ impl Prover {
         Prover {
             front: Arc::clone(&loaded.front),
             laws,
-            hosting: None,
             backend,
         }
     }
@@ -187,18 +167,13 @@ impl Prover {
         }
     }
 
-    /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
-    pub fn with_hosting(mut self, hosting: Hosting) -> Prover {
-        self.hosting = Some(hosting);
-        self
-    }
-
     fn claim(&self, obligation: &Obligation) -> Option<Claim<'_>> {
         match obligation.kind {
             ObligationKind::Ensures { index } => Some(Claim::Ensures {
                 owner: self.front.check.defs.get(&obligation.owner)?,
                 index,
             }),
+            ObligationKind::Cost => None,
             ObligationKind::Law => {
                 let info = self
                     .front
@@ -211,19 +186,9 @@ impl Prover {
     }
 
     /// What every entry a claim makes goes through, its owner's call included: this thread's
-    /// backend, bound to the run's host and a reactor for this thread when the claim is a
-    /// `law/host`.
-    fn machine(&self, obligation: &Obligation) -> Result<Machine<'_>, Diagnostic> {
-        let mut machine =
-            Machine::new(&self.front, self.compiled())?.with_max_calls(DEFAULT_MAX_CALLS);
-        if let Strategy::Hosted = obligation.strategy {
-            let hosting = self.hosting.as_ref().ok_or_else(|| unhosted(obligation))?;
-            machine.set_host_binding(Arc::clone(&hosting.binding));
-            if let Some(factory) = &hosting.runtime {
-                machine.set_host_runtime(Arc::clone(factory));
-            }
-        }
-        Ok(machine)
+    /// backend, with no host bound.
+    fn machine(&self) -> Result<Machine<'_>, Diagnostic> {
+        Ok(Machine::new(&self.front, self.compiled())?.with_max_calls(DEFAULT_MAX_CALLS))
     }
 }
 
@@ -237,17 +202,6 @@ pub enum Judgement {
     Raised(Diagnostic),
     /// Ply failed rather than the program, so the point says nothing about the claim.
     Faulted(Diagnostic),
-    /// A cost law's size: the steps its body took, and its bound there.
-    Measured {
-        steps: i64,
-        bound: i64,
-    },
-    /// A cost law's size whose run took more than `limit` steps.
-    Spent {
-        limit: i64,
-    },
-    /// What the definition a point named answered at its arguments.
-    Drew(ply_eval::Plain),
 }
 
 impl Judgement {
@@ -269,11 +223,6 @@ pub enum Mode {
     Witness,
     /// The guard alone at every point, until it raises.
     Domain,
-    /// A cost law's sizes, each within `limit` steps, until one raises or takes more.
-    Cost { limit: i64 },
-    /// Each point a definition's name and then its arguments, answered with what the definition
-    /// answers there: how a type's stated generator draws.
-    Drawn,
 }
 
 impl Mode {
@@ -284,10 +233,6 @@ impl Mode {
                 | (Mode::Whole, Judgement::Failed | Judgement::Raised(_))
                 | (Mode::Witness, Judgement::Held)
                 | (Mode::Domain, Judgement::Raised(_))
-                | (
-                    Mode::Cost { .. },
-                    Judgement::Raised(_) | Judgement::Spent { .. }
-                )
         )
     }
 }
@@ -304,23 +249,6 @@ fn unclaimed(obligation: &Obligation) -> Diagnostic {
         "this obligation was named, and no claim states it",
     )
     .note("`proof.world` and the front end's claims are read from one program; this is Ply's fault")
-}
-
-/// A `law/host` judged with no host bound: the program asked for what the run never opened.
-#[cold]
-fn unhosted(obligation: &Obligation) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "`{}` reaches the host, and this run binds none",
-            obligation.owner
-        ),
-    )
-    .primary(
-        obligation.span,
-        "a `law/host` is judged against the host a run binds",
-    )
-    .note("the program judges a `law/host` only under `--host`; this is Ply's fault")
 }
 
 impl Prover {
@@ -346,8 +274,6 @@ impl Prover {
         for values in points {
             let judgement = match mode {
                 Mode::Whole => cases.judge(values),
-                Mode::Cost { limit } => cases.measure(values, limit),
-                Mode::Drawn => cases.drawn(values),
                 Mode::Witness | Mode::Domain => match cases.guard(values) {
                     Ok(true) => Judgement::Held,
                     Ok(false) => Judgement::Rejected,
@@ -419,7 +345,7 @@ impl Prover {
             Claim::Ensures { .. } | Claim::Law { .. } => None,
         };
         Ok(Cases {
-            machine: self.machine(obligation)?,
+            machine: self.machine()?,
             guard_roots: self.guard_roots(obligation, &claim),
             body_root: self.body_root(&claim),
             span: obligation.span,
@@ -453,16 +379,7 @@ impl Cases<'_> {
     /// One entry through the claim's machine, within the claim's budget, keeping what it ended
     /// with.
     fn enter(&mut self, root: &Symbol, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        self.enter_within(root, args, self.step_budget)
-    }
-
-    fn enter_within(
-        &mut self,
-        root: &Symbol,
-        args: Vec<Value>,
-        step_budget: i64,
-    ) -> Result<Value, Diagnostic> {
-        let (machine, span) = (&mut self.machine, self.span);
+        let (machine, span, step_budget) = (&mut self.machine, self.span, self.step_budget);
         let (answer, warnings) = ply_codegen::rt::with_step_budget(step_budget, || {
             machine.call(root.as_str(), args, span)
         })
@@ -496,43 +413,6 @@ impl Cases<'_> {
                 Ok(true) => Judgement::Held,
                 Ok(false) => Judgement::Failed,
             },
-        }
-    }
-
-    /// A cost law's size: guard first, then its body within `limit` steps, or the claim's budget
-    /// where that is smaller. A body that takes more is spent rather than raised: running out is
-    /// what ends the measuring, not a fault of the program.
-    fn measure(&mut self, values: &[Value], limit: i64) -> Judgement {
-        match self.guard(values) {
-            Err(d) => return Judgement::stopped(d),
-            Ok(false) => return Judgement::Rejected,
-            Ok(true) => {}
-        }
-        let budget = if self.step_budget > 0 {
-            self.step_budget.min(limit)
-        } else {
-            limit
-        };
-        let root = self.body_root.clone();
-        match self.enter_within(&root, values.to_vec(), budget) {
-            Ok(value) => match measure_of(&value) {
-                Some((steps, bound)) => Judgement::Measured { steps, bound },
-                None => Judgement::Faulted(body_was_not_a_measure(&value, self.span)),
-            },
-            Err(d) if d.code == codes::STEP_BUDGET => Judgement::Spent { limit: budget },
-            Err(d) => Judgement::stopped(d),
-        }
-    }
-
-    /// The definition a point names, entered at the arguments after its name.
-    fn drawn(&mut self, point: &[Value]) -> Judgement {
-        let Some((Value::Str(name), args)) = point.split_first() else {
-            return Judgement::Faulted(unnamed_draw(self.span));
-        };
-        let root = Symbol::new(&**name);
-        match self.enter(&root, args.to_vec()) {
-            Ok(value) => Judgement::Drew(ply_eval::Plain::of(&value)),
-            Err(d) => Judgement::stopped(d),
         }
     }
 
@@ -579,36 +459,6 @@ impl Interleaved {
             warnings: Vec::new(),
         }
     }
-}
-
-/// A draw that names no definition: the program and this reader disagree about a point's shape.
-#[cold]
-fn unnamed_draw(span: Span) -> Diagnostic {
-    Diagnostic::error(codes::INTERNAL_ERROR, "a draw names no definition to enter")
-        .primary(span, "a point of this claim was to be drawn")
-        .note("`proof.drawn` and this reader are written together; this is Ply's fault")
-}
-
-/// A cost law's body answers `{bound, steps}`.
-fn measure_of(value: &Value) -> Option<(i64, i64)> {
-    let Value::Record(fields) = value else {
-        return None;
-    };
-    let int = |name: &str| match fields.named(name) {
-        Some(Value::Int(n)) => Some(*n),
-        _ => None,
-    };
-    Some((int("steps")?, int("bound")?))
-}
-
-fn body_was_not_a_measure(value: &Value, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("a cost law's body came to `{}` rather than to a measure", ply_eval::slot(0)),
-    )
-    .showing(vec![ply_eval::Plain::shown(value)])
-    .primary(span, "a cost law's body is `{bound: Int, steps: Int}`")
-    .note("the rewrite builds that record and the checker holds it to the type, so reaching this is a defect in Ply")
 }
 
 fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
