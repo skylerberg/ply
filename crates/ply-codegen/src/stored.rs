@@ -103,6 +103,8 @@ fn unhex(text: &[u8]) -> Result<Vec<u8>, String> {
 enum Pending {
     Word(Word),
     Done(usize),
+    /// A record's word that holds a `Float`'s bits, written as a `Float` of its own.
+    Raw(Word),
 }
 
 struct Writer<'l> {
@@ -112,6 +114,8 @@ struct Writer<'l> {
     ctors: HashMap<u32, u64>,
     /// Each object written whole, by its address, and its place among them.
     done: HashMap<usize, u64>,
+    /// How many objects are written whole: the place the next one takes.
+    places: u64,
 }
 
 impl<'l> Writer<'l> {
@@ -122,6 +126,7 @@ impl<'l> Writer<'l> {
             shapes: HashMap::new(),
             ctors: HashMap::new(),
             done: HashMap::new(),
+            places: 0,
         }
     }
 
@@ -130,8 +135,13 @@ impl<'l> Writer<'l> {
         while let Some(next) = pending.pop() {
             match next {
                 Pending::Done(address) => {
-                    let place = self.done.len() as u64;
-                    self.done.insert(address, place);
+                    self.done.insert(address, self.places);
+                    self.places += 1;
+                }
+                Pending::Raw(bits) => {
+                    self.out.push(FLOAT);
+                    self.out.extend_from_slice(&bits.to_le_bytes());
+                    self.places += 1;
                 }
                 Pending::Word(w) => self.word(w, &mut pending)?,
             }
@@ -173,13 +183,22 @@ impl<'l> Writer<'l> {
                 self.blob(unsafe { bytes_of(o) });
                 Vec::new()
             }
+            // A field held as a `Float`'s bits is written as a `Float`, which its shape says to hold
+            // as bits again.
             KIND_RECORD => {
                 self.out.push(RECORD);
                 self.shape(layout);
                 self.out.push(flags);
-                (0..len as usize)
-                    .map(|i| unsafe { word_at(o, i) })
-                    .collect()
+                let slots = self.layouts.shape_slots(layout);
+                pending.push(Pending::Done(w as usize));
+                pending.extend((0..len as usize).rev().map(|i| {
+                    let x = unsafe { word_at(o, i) };
+                    match slots[i] {
+                        heap::Slot::Float => Pending::Raw(x),
+                        heap::Slot::Word => Pending::Word(x),
+                    }
+                }));
+                return Ok(());
             }
             KIND_CTOR => {
                 // A nullary constructor is its unit's one object of it, which a place would not name.
@@ -245,7 +264,7 @@ impl<'l> Writer<'l> {
             return self.varint(place + 1);
         }
         self.shapes.insert(shape, self.shapes.len() as u64);
-        let names = self.layouts.shape_names(shape);
+        let names = self.layouts.shape_spelled(shape);
         self.varint(0);
         self.varint(names.len() as u64);
         for name in names.iter() {
@@ -449,10 +468,25 @@ impl<'a> Reader<'a> {
         };
         let w = match done.make {
             Make::Record { shape, flags } => {
-                let o = self
-                    .heap
-                    .alloc(KIND_RECORD, flags, done.parts.len() as u32, shape);
-                filled(o, &done.parts)
+                let slots = self.layouts.shape_slots(shape);
+                let n = done.parts.len();
+                let o = self.heap.alloc(KIND_RECORD, flags, n as u32, shape);
+                for (i, w) in done.parts.iter().enumerate() {
+                    let word = match slots[i] {
+                        heap::Slot::Float => unsafe { word_at(obj(*w), 0) },
+                        heap::Slot::Word => *w,
+                    };
+                    unsafe { set_word(o, i, word) };
+                }
+                if flags & heap::MIXED != 0 {
+                    for t in 0..heap::tail_words(n) {
+                        let bits = (t * 64..n.min(t * 64 + 64))
+                            .filter(|i| slots[*i] == heap::Slot::Word)
+                            .fold(0u64, |acc, i| acc | 1 << (i % 64));
+                        unsafe { set_word(o, n + t, bits as i64) };
+                    }
+                }
+                o as Word
             }
             Make::Ctor { index, flags } => {
                 let o = self
