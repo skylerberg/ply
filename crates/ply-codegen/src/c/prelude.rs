@@ -91,6 +91,12 @@ static inline double ply_f64(int64_t bits) { union { int64_t i; double d; } u; u
 static inline int64_t ply_f64_bits(double d) { union { int64_t i; double d; } u; u.d = d; return u.i; }
 static inline int ply_is_float(Word w) { return w != 0 && !ply_is_imm(w) && ply_obj(w)->kind == PLY_KIND_FLOAT; }
 
+/* A `Decimal` in registers: the two words of its object, as `rust_decimal` serializes it. */
+typedef struct { Word lo, hi; } PlyDec;
+static inline PlyDec ply_dec_at(Word base, int64_t at) { PlyDec d; d.lo = ply_words(base)[at]; d.hi = ply_words(base)[at + 1]; return d; }
+static inline PlyDec ply_dec_of(Word w) { return ply_dec_at(w, 0); }
+static inline void ply_set_dec(Word base, int64_t at, PlyDec d) { ply_words(base)[at] = d.lo; ply_words(base)[at + 1] = d.hi; }
+
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
@@ -167,6 +173,10 @@ helpers![
     (rt_unbox_bool, 1, true),
     (rt_box_float, 1, true),
     (rt_box_fixed, 2, true),
+    (rt_box_decimal, 2, true),
+    (rt_decimal_binary, 6, false),
+    (rt_decimal_compare, 4, true),
+    (rt_decimal_negate, 3, false),
     (rt_unbox_float, 1, true),
     (rt_float_rem, 2, true),
     (rt_no_fuel, 0, false),

@@ -51,6 +51,8 @@ pub type Kind =
   | KNum(Width)
   /// A `Float` in a C `double`, whose arithmetic is IEEE-754's own once contraction is off.
   | KFloat
+  /// A `Decimal` in a `PlyDec`, the two words of its object, whose arithmetic is the runtime's.
+  | KDec
 
 pub type Width = { bits: Int, signed: Bool }
 
@@ -63,8 +65,13 @@ pub fn ctype(k: Kind) -> Bytes =
       else { b"int64_t" }
     } else { unsigned_ctype(w) },
     KFloat -> b"double",
+    KDec -> b"PlyDec",
     _ -> b"int64_t",
   }
+
+/// What a local of `k` is declared holding before a branch assigns it: a `Decimal`'s struct needs
+/// its braces.
+fn zero_of(k: Kind) -> Bytes = match k { KDec -> b"{0, 0}", _ -> b"0" }
 
 fn unsigned_ctype(width: Width) -> Bytes =
   if width.bits == 8 { b"uint8_t" }
@@ -132,8 +139,8 @@ pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArr(Option<
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
-/// runtime's own operators: `Decimal`, and whatever `==` compares structurally.
-type Operand = | OInt | OBool | OWidth(Width) | OFloat | OChar | OWord
+/// runtime's own operators: whatever `==` compares structurally.
+type Operand = | OInt | OBool | OWidth(Width) | OFloat | ODec | OChar | OWord
 
 /// `None` where the checker settled no type, which it does for every operator of a checked program.
 fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
@@ -143,6 +150,7 @@ fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
     else if name == b"Int" { Some(OInt) }
     else if name == b"Bool" { Some(OBool) }
     else if name == b"Float" { Some(OFloat) }
+    else if name == b"Decimal" { Some(ODec) }
     else if name == b"Char" { Some(OChar) }
     else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
   }
@@ -239,7 +247,15 @@ pub type ModuleDefs = { module: Bytes, defs: List<Def> }
 /// A record this body built: a field read of it reuses the built value (sound: the values are this body's locals).
 pub type Built = { local: Bytes, names: List<Bytes>, vals: List<CValue> }
 
-pub type Deferred = { name: Bytes, shape: Int, n: Int, flags: Int, words: List<Bytes> }
+/// A flat record held back until something reads it as a word: `n` words of `shape`, each of
+/// `cells` written at its place.
+pub type Deferred = {
+  name: Bytes,
+  shape: Int,
+  n: Int,
+  flags: Int,
+  cells: List<{ at: Int, expr: Bytes }>,
+}
 
 /// A C local holding one count, released at its block's close unless spent first.
 pub type CountLocal = { name: Bytes, indent: Int }
@@ -667,18 +683,10 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
         ]),
       );
       let o6 = line(outdent(check(o5)), b"}");
-      let o7 = fold(range(0, len(d.words)), o6, |acc: Emitter, at: Int|
+      let o7 = fold(d.cells, o6, |acc: Emitter, c: { at: Int, expr: Bytes }|
         line(
           acc,
-          bytes_concat_all([
-            b"ply_words(",
-            name,
-            b")[",
-            ascii_of_int(at),
-            b"] = ",
-            match list_at(d.words, at) { Some(w) -> w, None -> b"0" },
-            b";",
-          ]),
+          bytes_concat_all([b"ply_words(", name, b")[", ascii_of_int(c.at), b"] = ", c.expr, b";"]),
         ));
       line(outdent(o7), b"}")
     },
@@ -952,29 +960,48 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     typed: emitter.typed,
   }
 
-/// Whether a record holds a value of `kind` as its bits rather than as a word: a `Float`, or a
-/// 64-bit width.
-fn raw_slot(kind: Kind) -> Bool = match kind { KFloat -> true, KNum(w) -> !in_imm(w), _ -> false }
+/// Whether a record holds a value of `kind` as its own words rather than as a word: a `Float`, a
+/// 64-bit width or a `Decimal`.
+fn raw_slot(kind: Kind) -> Bool =
+  match kind { KFloat -> true, KDec -> true, KNum(w) -> !in_imm(w), _ -> false }
 
-/// The word a record holds `value` in, held at the kind `raw_slot` says it holds as its bits.
+/// The words a record holds a field of `kind` in: a `Decimal`'s two, and one for any other.
+fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
+
+/// What a record holds `value` in, held at the kind `raw_slot` says it holds as its own words: its
+/// word, or for a `Decimal` the local holding its two, which `cells_of` writes apart.
 fn raw_word(value: CValue) -> Bytes =
   match value.kind {
     KNum(_) -> bytes_concat_all([b"(Word)(", value.expr, b")"]),
+    KDec -> value.expr,
     _ -> bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"]),
   }
 
-/// A record's word holding a field of `kind` as its bits, read back as the kind.
-fn raw_read(word: Bytes, kind: Kind) -> Bytes =
+/// The field of `kind` that `base` holds as its own words from word `at` on, read as the kind.
+fn raw_at(base: Bytes, at: Bytes, kind: Kind) -> Bytes = {
+  let word = bytes_concat_all([b"ply_words(", base, b")[", at, b"]"]);
   match kind {
     KNum(w) -> bytes_concat_all([b"(", ctype(KNum(w)), b")(", word, b")"]),
+    KDec -> bytes_concat_all([b"ply_dec_at(", base, b", ", at, b")"]),
     _ -> bytes_concat_all([b"ply_f64(", word, b")"]),
   }
+}
 
-/// `value` held at `kind`, a kind `raw_slot` holds of, in a register.
+/// The statement writing `value` over the field of `kind` that `base` holds as its own words from
+/// word `at` on.
+fn raw_store(base: Bytes, at: Bytes, value: CValue, kind: Kind) -> Bytes =
+  match kind {
+    KDec -> bytes_concat_all([b"ply_set_dec(", base, b", ", at, b", ", as_dec(value), b");"]),
+    _ -> bytes_concat_all([b"ply_words(", base, b")[", at, b"] = ", raw_word(value), b";"]),
+  }
+
+/// `value` held at `kind`, a kind `raw_slot` holds of, in a register: a `Decimal` in a local.
 fn held_raw(emitter: Emitter, value: CValue, kind: Kind) -> WithValue =
   match kind {
     KNum(w) -> if value.kind == kind { { emitter: emitter, value: value } }
     else { bind(emitter, kind, as_num(value, w)) },
+    KDec -> if value.kind == KDec && is_local(value.expr) { { emitter: emitter, value: value } }
+    else { bind(emitter, KDec, as_dec(value)) },
     _ -> float_held(emitter, value),
   }
 
@@ -1003,7 +1030,7 @@ fn laid_of(fs: List<FieldTy>) -> Laid = {
         },
         _ ->
           {
-            at: acc.at + 1,
+            at: acc.at + raw_words(f.kind),
             offsets: push(acc.offsets, acc.at),
             counted: if raw_slot(f.kind) { acc.counted } else { push(acc.counted, acc.at) },
           },
@@ -1027,6 +1054,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
       bytes_concat_all([f.name, b"!r(", bytes_join(map(inner, spelled_field), b","), b")"]),
     _ -> match f.kind {
       KFloat -> bytes_concat(f.name, b"!f"),
+      KDec -> bytes_concat(f.name, b"!d"),
       KNum(w) -> if raw_slot(f.kind) {
         bytes_concat(f.name, if w.signed { b"!i64" } else { b"!u64" })
       } else { f.name },
@@ -1048,7 +1076,13 @@ fn leaves_uncounted(fs: List<FieldTy>) -> Bool =
     acc
       && (match f.ty {
         TyRec(inner) -> leaves_uncounted(inner),
-        _ -> match f.kind { KNum(_) -> true, KBool -> true, KFloat -> true, _ -> false },
+        _ -> match f.kind {
+          KNum(_) -> true,
+          KBool -> true,
+          KFloat -> true,
+          KDec -> true,
+          _ -> false,
+        },
       }))
 
 fn has_tail(flags: Int) -> Bool = flags & 2 != 0
@@ -1172,7 +1206,13 @@ fn build_record(
     Some(vs) -> if flags % 2 == 1 && !nests {
       let f = fresh(sh.emitter);
       let held = line(
-        note_deferred(f.emitter, { name: f.name, shape: sh.i, n: n, flags: flags, words: words }),
+        note_deferred(f.emitter, {
+          name: f.name,
+          shape: sh.i,
+          n: l.width,
+          flags: flags,
+          cells: map(cells, |c: WordAt| { at: c.at, expr: c.expr }),
+        }),
         bytes_concat_all([f.name, b" = 0;"]),
       );
       {
@@ -1188,18 +1228,28 @@ fn build_record(
 }
 
 /// The words an object laid out as a record of `fields` is holds: `words`, one per field, each at
-/// its offset, and the bitmap after them where `flags` says it is mixed.
+/// its offset, a `Decimal`'s local written as its two words, and the bitmap after them where
+/// `flags` says it is mixed.
 fn cells_of(fields: List<FieldTy>, words: List<Bytes>, l: Laid, flags: Int) -> List<WordAt> =
   concat(
-    map(range(0, len(fields)), |i: Int| {
+    fold(range(0, len(fields)), [], |acc: List<WordAt>, i: Int| {
       let f = match list_at(fields, i) {
         Some(x) -> x,
         None -> { name: b"", kind: KBoxed, ty: TyOpen },
       };
-      {
-        at: match list_at(l.offsets, i) { Some(o) -> o, None -> i },
-        expr: match list_at(words, i) { Some(w) -> w, None -> b"0" },
-        tail: match in_place(f) { Some(inner) -> Some(laid_of(inner).tail), None -> None },
+      let at = match list_at(l.offsets, i) { Some(o) -> o, None -> i };
+      let expr = match list_at(words, i) { Some(w) -> w, None -> b"0" };
+      if f.kind == KDec && in_place(f) == None {
+        concat(acc, [
+          { at: at, expr: bytes_concat(expr, b".lo"), tail: None },
+          { at: at + 1, expr: bytes_concat(expr, b".hi"), tail: None },
+        ])
+      } else {
+        push(acc, {
+          at: at,
+          expr: expr,
+          tail: match in_place(f) { Some(inner) -> Some(laid_of(inner).tail), None -> None },
+        })
       }
     }),
     if has_tail(flags) {
@@ -1954,6 +2004,7 @@ fn as_int(value: CValue) -> Bytes =
     KBool -> value.expr,
     KNum(_) -> bytes_concat_all([b"(int64_t)(", value.expr, b")"]),
     KFloat -> bytes_concat_all([b"rt_unbox_int_p(ctx, ", as_word(value), b")"]),
+    KDec -> bytes_concat_all([b"rt_unbox_int_p(ctx, ", as_word(value), b")"]),
     KBoxed ->
       bytes_concat_all([
         b"(ply_is_imm(",
@@ -2324,6 +2375,7 @@ fn opened_to(emitter: Emitter, value: CValue, d: { kind: Option<Kind>, ty: Ty })
     Some(KBool) -> bind(emitter, KBool, as_bool(value)),
     Some(KNum(w)) -> bind(emitter, KNum(w), as_num(value, w)),
     Some(KFloat) -> bind(emitter, KFloat, as_float(value)),
+    Some(KDec) -> bind(emitter, KDec, as_dec(value)),
     // The callee's declared type makes a later field read a load rather than a search.
     _ -> { emitter: emitter, value: { kind: value.kind, expr: value.expr, ty: d.ty } },
   }
@@ -3947,7 +3999,8 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
       }
     },
     _ -> if raw_slot(element.kind) {
-      let word = bytes_concat_all([b"ply_words(", a, b")[", i, b"]"]);
+      let at = if raw_words(element.kind) == 1 { i }
+      else { bytes_concat_all([b"(", i, b") * ", ascii_of_int(raw_words(element.kind))]) };
       let loaded = line(
         r.emitter,
         bytes_concat_all([
@@ -3955,7 +4008,7 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
           b" ",
           r.name,
           b" = ",
-          raw_read(word, element.kind),
+          raw_at(a, at, element.kind),
           b";",
         ]),
       );
@@ -4709,6 +4762,7 @@ fn as_bool(value: CValue) -> Bytes =
     KInt -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", value.expr, b")"]),
     KFloat -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", as_word(value), b")"]),
+    KDec -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", as_word(value), b")"]),
   }
 
 /// A word is read in place when it is a `Float`'s own object; the runtime reads any other.
@@ -4753,6 +4807,16 @@ fn as_word(value: CValue) -> Bytes =
         b"))",
       ]),
     KFloat -> bytes_concat_all([b"rt_box_float_p(ctx, ply_f64_bits(", value.expr, b"))"]),
+    KDec ->
+      bytes_concat_all([b"rt_box_decimal_p(ctx, (", value.expr, b").lo, (", value.expr, b").hi)"]),
+  }
+
+/// `value` as a `Decimal`'s two words: a word is the `Decimal`'s own object.
+fn as_dec(value: CValue) -> Bytes =
+  match value.kind {
+    KDec -> value.expr,
+    KBoxed -> bytes_concat_all([b"ply_dec_of(", value.expr, b")"]),
+    _ -> bytes_concat_all([b"ply_dec_of(", as_word(value), b")"]),
   }
 
 /// `rt_arith`'s opcode numbering.
@@ -4942,9 +5006,7 @@ fn in_place_update(
               b");",
             ]),
           ),
-        None -> if raw_slot(f.kind) {
-          line(acc, bytes_concat_all([b"ply_words(", base, b")[", at, b"] = ", raw_word(v), b";"]))
-        } else {
+        None -> if raw_slot(f.kind) { line(acc, raw_store(base, at, v, f.kind)) } else {
           line(
             acc,
             bytes_concat_all([
@@ -5066,7 +5128,7 @@ fn read_field(
               } else { Some({ emitter: w.emitter, value: w.value }) },
               _ -> {
                 let out = bind(w.emitter, i.kind, if raw_slot(i.kind) {
-                  raw_read(w.value.expr, i.kind)
+                  raw_at(held.value.expr, ascii_of_int(i.at), i.kind)
                 } else if i.kind == KFloat { bytes_concat_all([b"ply_f64(", w.value.expr, b")"]) }
                 else { as_kind(w.value, i.kind) });
                 match release_base(out.emitter, f.base, hv, params) {
@@ -5458,7 +5520,11 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                           let w = bind_word_of(acc.emitter, field_read(held.value.expr, f));
                           // A base of a known type holds a `Float` or a 64-bit width as its bits.
                           if raw_slot(f.kind) {
-                            let d = bind(w.emitter, f.kind, raw_read(w.value.expr, f.kind));
+                            let d = bind(
+                              w.emitter,
+                              f.kind,
+                              raw_at(held.value.expr, ascii_of_int(f.at), f.kind),
+                            );
                             if raw_slot(tk) { as_bits(acc, d.emitter, d.value, at) } else {
                               {
                                 emitter: d.emitter,
@@ -5869,7 +5935,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         {
                           emitter: line(
                             f.emitter,
-                            bytes_concat_all([ctype(k), b" ", f.name, b" = 0;"]),
+                            bytes_concat_all([ctype(k), b" ", f.name, b" = ", zero_of(k), b";"]),
                           ),
                           names: push(acc.names, { kind: k, expr: f.name, ty: TyOpen }),
                         }
@@ -5981,7 +6047,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         operands: e.emitter.operands,
                         typed: e.emitter.typed,
                       },
-                      bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]),
+                      bytes_concat_all([ctype(kt), b" ", j.name, b" = ", zero_of(kt), b";"]),
                     );
                     let ta = assigned(decl, t.emitter, t.text, decl.indent, kt, t.value, j.name);
                     let ea = assigned(
@@ -6692,8 +6758,9 @@ fn items_from(
           let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
           let d = if raw { held_raw(o.emitter, o.value, kind_at(kinds, i)) }
           else { { emitter: o.emitter, value: o.value } };
-          let w = if raw { bind(d.emitter, KInt, raw_word(d.value)) }
-          else { owned(o.emitter, o.value) };
+          let w = if !raw { owned(o.emitter, o.value) }
+          else if kind_at(kinds, i) == KDec { d }
+          else { bind(d.emitter, KInt, raw_word(d.value)) };
           items_from(
             w.emitter,
             codes,
@@ -7535,7 +7602,7 @@ fn arg_tested(
           b"(",
           so_far,
           b" ? ",
-          as_word({ kind: f.kind, expr: raw_read(field_read(subj, f), f.kind), ty: TyOpen }),
+          as_word({ kind: f.kind, expr: raw_at(subj, ascii_of_int(f.at), f.kind), ty: TyOpen }),
           b" : 0)",
         ]),
       );
@@ -7578,7 +7645,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let f = match laid { Some(fs) -> arg_at(fs, i), None -> None };
         let w = match f {
           Some(x) -> if raw_slot(x.kind) {
-            bind(acc, x.kind, raw_read(field_read(subj.expr, x), x.kind))
+            bind(acc, x.kind, raw_at(subj.expr, ascii_of_int(x.at), x.kind))
           } else { bind_keeping(acc, KBoxed, x.ty, field_read(subj.expr, x)) },
           None ->
             bind(
@@ -7690,6 +7757,7 @@ fn as_kind(value: CValue, k: Kind) -> Bytes =
     KBool -> as_bool(value),
     KNum(w) -> as_num(value, w),
     KFloat -> as_float(value),
+    KDec -> as_dec(value),
   }
 
 /// A record-valued join: one assignment per field, from the values the record was built from.
@@ -7942,6 +8010,25 @@ fn negated(emitter: Emitter, value: CValue, t: Operand, span: Span) -> Option<Wi
       Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
     },
     OFloat -> Some(bind(emitter, KFloat, bytes_concat_all([b"-(", as_float(value), b")"]))),
+    ODec -> {
+      let d = held_raw(emitter, value, KDec);
+      let out = fresh(d.emitter);
+      let e = line(
+        out.emitter,
+        bytes_concat_all([
+          b"PlyDec ",
+          out.name,
+          b"; rt_decimal_negate_p(ctx, ",
+          d.value.expr,
+          b".lo, ",
+          d.value.expr,
+          b".hi, (Word)(intptr_t)&",
+          out.name,
+          b");",
+        ]),
+      );
+      Some({ emitter: e, value: { kind: KDec, expr: out.name, ty: TyOpen } })
+    },
     _ -> by_runtime(site(emitter, span), b"rt_negate_p", value),
   }
 
@@ -8136,6 +8223,7 @@ fn binary_rest(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Operand) ->
       )
     } else { Some(unsettled_operator(emitter, op)) },
     OFloat -> float_binary(emitter, op, l, r),
+    ODec -> dec_binary(emitter, op, l, r),
     // A `Char`'s word is its code point above a tag, so its words compare as its code points do.
     OChar -> match compare_op(op) {
       Some(c) ->
@@ -8178,6 +8266,45 @@ fn float_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<Wit
         ),
       )
     } else { Some(unsettled_operator(emitter, op)) },
+  }
+}
+
+/// The runtime's own `Decimal` operators over the two words of each operand, which allocate
+/// nothing: arithmetic writes its answer into a local, and a comparison orders the two as numbers,
+/// equal at any scale that holds the same one.
+fn dec_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<WithValue> = {
+  let a = held_raw(emitter, l, KDec);
+  let b = held_raw(a.emitter, r, KDec);
+  let x = a.value.expr;
+  let y = b.value.expr;
+  let words = bytes_concat_all([x, b".lo, ", x, b".hi, ", y, b".lo, ", y, b".hi"]);
+  match compare_op(op) {
+    Some(c) ->
+      Some(
+        bind(
+          b.emitter,
+          KBool,
+          bytes_concat_all([b"(rt_decimal_compare_p(ctx, ", words, b") ", c, b" 0)"]),
+        ),
+      ),
+    None -> if op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem" {
+      let out = fresh(b.emitter);
+      let e = line(
+        out.emitter,
+        bytes_concat_all([
+          b"PlyDec ",
+          out.name,
+          b"; rt_decimal_binary_p(ctx, ",
+          ascii_of_int(binary_code(op)),
+          b", ",
+          words,
+          b", (Word)(intptr_t)&",
+          out.name,
+          b");",
+        ]),
+      );
+      Some({ emitter: check(e), value: { kind: KDec, expr: out.name, ty: TyOpen } })
+    } else { Some(unsettled_operator(b.emitter, op)) },
   }
 }
 
@@ -8521,6 +8648,14 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
             );
             remember(o.emitter, i, o.value)
           },
+          KDec -> {
+            let o = bind(
+              acc,
+              KDec,
+              as_dec({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(i)), ty: TyOpen }),
+            );
+            remember(o.emitter, i, o.value)
+          },
           _ -> {
             let o = bind(
               acc,
@@ -8549,6 +8684,7 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
     TyCon(c) -> if len(c.args) == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bool" { { kind: KBool, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen } }
+    else if len(c.args) == 0 && c.name == b"Decimal" { { kind: KDec, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
     else if len(c.args) == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
     else if len(c.args) == 1 && c.name == b"Array" {
@@ -8684,6 +8820,7 @@ fn kind_name(k: Kind) -> Bytes =
     KInt -> b"Int",
     KBool -> b"Bool",
     KFloat -> b"Float",
+    KDec -> b"Decimal",
     KNum(w) -> width_name(w),
     KBoxed -> b"_",
   }
@@ -8692,6 +8829,7 @@ fn kind_named(name: Bytes) -> Option<Kind> =
   if name == b"Int" { Some(KInt) }
   else if name == b"Bool" { Some(KBool) }
   else if name == b"Float" { Some(KFloat) }
+  else if name == b"Decimal" { Some(KDec) }
   else if name == b"_" { Some(KBoxed) } else {
     match width_named(name) {
       Some(w) -> if carried(w) { Some(KNum(w)) } else { None },
@@ -8708,6 +8846,7 @@ fn held_as(k: Kind) -> Option<Type> =
     KInt -> Some(TyCon({ name: b"Int", args: [] })),
     KBool -> Some(TyCon({ name: b"Bool", args: [] })),
     KFloat -> Some(TyCon({ name: b"Float", args: [] })),
+    KDec -> Some(TyCon({ name: b"Decimal", args: [] })),
     KNum(w) -> Some(TyCon({ name: width_name(w), args: [] })),
     KBoxed -> None,
   }
@@ -9972,8 +10111,9 @@ test "an array holds its records in place and its floats as their bits" {
   let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
   // A point takes a header's two words and its own two: element `i` is the header `4 * i` words in.
+  // A `Float`, an element or a point's field, is a load of its bits.
   assert_eq(has(b" * 4); ply_inc("), [true, false, false, false]);
-  assert_eq(has(b"ply_f64(ply_words("), [false, true, false, false]);
+  assert_eq(has(b"ply_f64(ply_words("), [true, true, false, false]);
   assert_eq(has(b"ply_array_len("), [true, true, true, false]);
   // An array of a variable's type is the runtime's to read.
   assert_eq(has(b"array_get"), [true, true, false, true])
@@ -10005,6 +10145,40 @@ test "a constructor holds its arguments as its declaration types them" {
   assert_eq(has(b"rt_equal_p(ctx, "), [false, false, false, true, false]);
   // A label holds its word, as a constructor of no raw or record argument does.
   assert_eq(has(b"rt_ctor_p"), [false, false, false, false, true])
+}
+
+test "a `Decimal` is held in registers as its two words, and in a record or an array as them" {
+  let src = bytes_concat_all([
+    b"type Line = { price: Decimal, qty: Int }\n",
+    b"fn line(price: Decimal, qty: Int) -> Line = { price: price, qty: qty }\n",
+    b"fn doubled(l: Line) -> Decimal = l.price * 2.00m\n",
+    b"fn cheaper(a: Line, b: Line) -> Bool = a.price < b.price\n",
+    b"fn negated(d: Decimal) -> Decimal = -d\n",
+    b"fn priced(ds: Array<Decimal>, i: Int) -> Decimal / {abort.raise} = array_get(ds, i)\n",
+    b"fn picked(up: Bool, d: Decimal) -> Decimal = if up { d + 1m } else { d - 1m }\n",
+    b"fn listed(d: Decimal) -> List<{ price: Decimal }> = [{ price: d }]\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"array_get"], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None, None, None]);
+  // A line holds its price as two words and its count after them: mixed and raw.
+  assert_eq(has(b".lo;"), [true, false, false, false, false, false, true]);
+  assert_eq(has(b"@@, 6);"), [true, false, false, false, false, false, false]);
+  // A branch's answer is declared as the struct it is before either arm assigns it.
+  assert_eq(has(b" = {0, 0};"), [false, false, false, false, false, true, false]);
+  // A price's second word is written after its first, in a line and in a record of a price
+  // alone, which is held back until it is first a word.
+  assert_eq(has(b")[1] = "), [true, false, false, false, false, false, true]);
+  // A field read loads both words, an array's element is two words a step, and nothing is boxed
+  // but an answer.
+  assert_eq(has(b"ply_dec_at("), [false, true, true, false, true, false, false]);
+  assert_eq(has(b") * 2)"), [false, false, false, false, true, false, false]);
+  assert_eq(has(b"rt_box_decimal_p"), [false, true, false, true, true, true, false]);
+  // Arithmetic and comparison are the runtime's, over the words, allocating nothing.
+  assert_eq(has(b"rt_decimal_binary_p(ctx, 2, "), [false, true, false, false, false, false, false]);
+  assert_eq(has(b") < 0)"), [false, false, true, false, false, false, false]);
+  assert_eq(has(b"rt_decimal_negate_p"), [false, false, false, true, false, false, false]);
+  assert_eq(has(b"rt_binary_p"), [false, false, false, false, false, false, false])
 }
 
 test "a `Char` is its own word, compared as C compares the words" {
