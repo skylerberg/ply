@@ -8,14 +8,14 @@
 #   .github/ci-timings.sh why [RUN] [NAME]   one job: its steps, what the actions inside it did,
 #                                            the cache entries it found and wrote, its pauses
 #   .github/ci-timings.sh tests [RUN] [N]    the N slowest tests of RUN (default 40), from the
-#                                            `test-durations` artifact its `passes` job uploads
+#                                            `test-durations` artifact it uploads
 #   .github/ci-timings.sh --self-test        the timestamp arithmetic and the chain, against fixtures
 #
 # RUN is a run id, a run URL, or a branch with a run; with none, the newest run of `CI`. NAME is a
 # case-insensitive substring of a job's name; with none, `why` explains the run's longest job.
 #
 # `jobs` is the API's view, and it reports a composite action as the one step that invokes it.
-# `why` also reads the job's log, which is where the steps inside `./.github/actions/suite` and
+# `why` also reads the job's log, which is where the steps inside `./.github/actions/bootstrap` and
 # every action beside it are timed, and the only place a cache entry is visible: two runs that
 # differ by minutes differ in `Cache restored from key:`. Neither shows the time inside a step
 # that emits nothing while it works, so `why` reports the pauses between lines as well: gaps of
@@ -312,7 +312,7 @@ cmd_tests() {
   local run=$1 n=$2
   [ -n "$run" ] || die "no run of CI to read"
   gh run download "$run" -n test-durations -D "$tmp/durations" >/dev/null ||
-    die "run $run has no test-durations artifact: an older run, or one whose passes job did not finish"
+    die "run $run has no test-durations artifact: an older run, or one that built no `ply`"
   awk -F'\t' -v n="$n" '
     NR <= n { printf "%8.1fs  %-32s %s\n", $1 / 1000, $2, $3 }
     { t += $1 }
