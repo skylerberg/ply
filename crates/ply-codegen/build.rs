@@ -1,9 +1,9 @@
-//! Two digests of the runtime. `PLY_RUNTIME_DIGEST` is every file under `src/` of this crate and of
-//! the workspace crates it links. `PLY_SEMANTICS_DIGEST` leaves out the files that only compile,
-//! keep, sweep and load C and read the compiler's answers: what an answer the program's own
-//! emitter gives, running inside a loaded unit, is a function of. `ply-std` and `ply-compiler` are
-//! left out of both: what they hold is Ply sources and the builder, which a body's key already
-//! names through its definition's key and the emitter's identity.
+//! A digest of the runtime. `PLY_SEMANTICS_DIGEST` is every file under `src/` of this crate and of
+//! the workspace crates it links, less the files that only compile, keep, sweep and load C and read
+//! the compiler's answers: what an answer the program's own emitter gives, running inside a loaded
+//! unit, is a function of. `ply-std` and `ply-compiler` are left out: what they hold is Ply sources
+//! and the builder, which a body's key already names through its definition's key and the
+//! emitter's identity.
 
 use std::path::{Path, PathBuf};
 
@@ -52,10 +52,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest.display());
         semantic.push(manifest);
     }
-    println!(
-        "cargo:rustc-env=PLY_RUNTIME_DIGEST={}",
-        digest(&files, &named)
-    );
     println!(
         "cargo:rustc-env=PLY_SEMANTICS_DIGEST={}",
         digest(&semantic, &named)

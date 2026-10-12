@@ -2999,7 +2999,6 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| 4 | `ply test --kept`: what earlier runs kept does not answer the run |
 | *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
 | 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
@@ -3012,7 +3011,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
@@ -3036,7 +3035,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default `target/<profile>/libply_native.a`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer and its own front end; the builder and the pack are taken from the toolchain's cache where an earlier bootstrap kept them; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
-| `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records of queries this `ply` no longer has and the answers no record names, and the store's definitions no pass record reaches |
+| `ply cache clear\|stats\|compact [path]` | discard the store and the memo store / report what they hold and their reclaimable space / reclaim it: the memo store's records no run of this `ply` can ask for again (those of queries it no longer has, of another `ply`'s commands, or kept under another layout's names), then the answers, notes, reader links and marks no record left reaches, and the store's definitions no pass record reaches |
 | `ply cache inspect <DEF> [path]` | what a load answers for a definition, a declaration or a test, by full name, simple name or 4+ hex hash prefix: its place, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
 
 `ply new`, `ply check`, `ply fmt`, `ply defs`, `ply hash`, `ply doc`,
@@ -3175,14 +3174,7 @@ the program while every pass it took is still in the test store; otherwise it
 loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 `--no-cache` and a configuration file or schema always load. In the `--json`
 document, `front_end` carries `reused` and `key` for an answer taken back,
-beside the phases of this run, all of it read. A `--json` run of several
-`--filter`s also keeps, for each, the answer a run of it alone gives. `--kept`
-answers only from what was kept, and only from an answer no mark is on, so it
-asks nothing again: where no kept answer of the whole command line stands, a run
-of several filters asks each what a run of it alone kept, exits 0 where every
-one is answered and otherwise lists the rest under `unanswered`; exit 4 is a run
-nothing kept answers, with nothing loaded, so a caller can tell which runs have
-work before starting them.
+beside the phases of this run, all of it read.
 
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,

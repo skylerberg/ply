@@ -51,7 +51,7 @@ fn a_programs_definitions_are_each_fn_its_entry_reaches_under_its_hash() {
             .deps
             .insert(Symbol::new(name), deps.iter().map(Symbol::new).collect());
     }
-    let listed = ply_machine::shipped::definitions(&program, Some("m.main"));
+    let listed = ply_machine::shipped::definitions(&program, "m.main");
     assert_eq!(
         listed,
         format!(
@@ -60,6 +60,4 @@ fn a_programs_definitions_are_each_fn_its_entry_reaches_under_its_hash() {
             DefHash([3; 32]).to_hex()
         )
     );
-    let every = ply_machine::shipped::definitions(&program, None);
-    assert_eq!(every.lines().count(), 3, "with no entry, every definition");
 }

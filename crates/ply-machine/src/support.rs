@@ -1,7 +1,7 @@
 //! The helpers the machines share: backend selection, the C backend over a load, schema
 //! materialisation, and `plural`.
 
-use ply_eval::{Diagnostic, SourceMap, Span, codes};
+use ply_eval::{Diagnostic, Span, codes};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -51,21 +51,6 @@ fn unbuilt(error: impl std::fmt::Display) -> Diagnostic {
         "compiled code is the only evaluator, so a run without a backend would be reported green \
          over a seam nothing reached",
     )
-}
-
-pub fn module_texts(
-    check: &ply_eval::CheckOutput,
-    sources: &SourceMap,
-) -> std::collections::HashMap<String, String> {
-    check
-        .modules
-        .values()
-        .filter_map(|m| {
-            sources
-                .get(m.source)
-                .map(|f| (m.name.to_string(), f.text.to_string()))
-        })
-        .collect()
 }
 
 /// The unit the program compiled for `front` into the library at `path`, loaded here. What the
