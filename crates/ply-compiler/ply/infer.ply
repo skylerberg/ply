@@ -299,6 +299,8 @@ type Signature = {
 type LabelApplication = {
   module: Int,
   span: Span,
+  /// Where the callee's name ends: where a call writes the labels it fills.
+  named: Int,
   callee: Bytes,
   vars: List<Int>,
   params: Map<Bytes, Int>,
@@ -406,8 +408,6 @@ type SpecEnv = {
 /// A member of the recursive group being walked, with the variables its binders took: `types` are
 /// its own type parameters a call fills, in its scheme's order.
 type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
-/// The label and row variables one recursive group is checked with, taken by every member in order.
-type Shared = { labels: List<Int>, rows: List<Int> }
 
 /// The rows the driver hands in for a definition, which are taken as they are. The rest of a
 /// published interface is the written signature, which is on hand.
@@ -509,9 +509,8 @@ type Checker = {
   label_params: Map<Bytes, Int>,
   label_apps: List<LabelApplication>,
   label_sites: List<LabelSite>,
-  /// The group being walked: its labels and rows are one set, which a call inside it reuses.
+  /// The group being walked.
   group_defs: List<GroupDef>,
-  group_rows: List<Int>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -3068,27 +3067,30 @@ fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
   })
 
 /// A member of the group being walked as a call inside the group reads it: each call fills its own
-/// type parameters, as a call from outside does, and its rows and labels are the group's one set.
+/// type, row and label parameters, as a call from outside does.
 fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {abort.raise} = {
-  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] }).tys;
+  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] });
   {
     ty_vars: fold(def.generics.types, [], |vs: List<Int>, ident: Ident|
       match map_get(sig.ty_params, ident.name) {
-        Some(TyVar(v)) -> if contains(free, v) { push(vs, v) } else { vs },
+        Some(TyVar(v)) -> if contains(free.tys, v) { push(vs, v) } else { vs },
         _ -> vs,
       }),
-    row_vars: [],
-    label_vars: [],
+    row_vars: fold(def.generics.effects, [], |vs: List<Int>, ident: Ident|
+      match map_get(sig.row_params, ident.name) {
+        Some(v) -> if contains(free.rows, v) { push(vs, v) } else { vs },
+        None -> vs,
+      }),
+    label_vars: fold(def.generics.labels, [], |vs: List<Int>, ident: Ident|
+      match map_get(sig.label_params, ident.name) { Some(v) -> push(vs, v), None -> vs }),
     ty: sig.fn_ty,
   }
 }
 
-/// `shared` holds the label and row variables the recursive group is checked with: a member's
-/// binders take them in order, so a call inside the group passes the caller's along.
-fn signature_sharing(
+/// A definition's signature as it is written, each of its type, row and label parameters rigid.
+fn written_signature(
   outer: Checker,
   def: FnDef,
-  shared: Shared,
 ) -> { checker: Checker, sig: Signature } / {abort.raise} = {
   let checker: Checker = {
     ..outer,
@@ -3098,34 +3100,23 @@ fn signature_sharing(
     label_params: map_new(),
   };
   let tys: Checker = bind_ty_params(checker, def.generics.types);
-  let rows: Checker = fold(range(0, len(def.generics.effects)), tys, |c: Checker, i: Int| {
-    let p: Ident = at(def.generics.effects, i);
-    match list_at(shared.rows, i) {
-      Some(v) -> { ..c, row_params: map_insert(c.row_params, p.name, v) },
-      None -> {
-        let o: WithVar = new_row_var(c);
-        {
-          ..o.checker,
-          subst: mark_rigid_row(o.checker.subst, o.var),
-          row_params: map_insert(o.checker.row_params, p.name, o.var),
-        }
-      },
+  let rows: Checker = fold(def.generics.effects, tys, |c: Checker, p: Ident| {
+    let o: WithVar = new_row_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_row(o.checker.subst, o.var),
+      row_params: map_insert(o.checker.row_params, p.name, o.var),
     }
   });
   // A label parameter is a type variable, rigid in the body, that the row's atoms name.
-  let labels: Checker = fold(range(0, len(def.generics.labels)), rows, |c: Checker, i: Int|
-    match list_at(shared.labels, i) {
-      Some(v) ->
-        { ..c, label_params: map_insert(c.label_params, at(def.generics.labels, i).name, v) },
-      None -> {
-        let o: WithVar = new_ty_var(c);
-        {
-          ..o.checker,
-          subst: mark_rigid_ty(o.checker.subst, o.var),
-          label_params: map_insert(o.checker.label_params, at(def.generics.labels, i).name, o.var),
-        }
-      },
-    });
+  let labels: Checker = fold(def.generics.labels, rows, |c: Checker, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_ty(o.checker.subst, o.var),
+      label_params: map_insert(o.checker.label_params, p.name, o.var),
+    }
+  });
   let assumed: Checker = witnessing(
     { ..labels, assumed: constraints_in_force(labels, def.constraints) },
     def.constraints,
@@ -4929,10 +4920,8 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
               }),
             }
           };
-          let group = group_label_vars(noted, key.name);
           // A constructor's labels are its type's arguments, which no call fills.
-          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
-          else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
+          let ls = if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
           else { inst.labels };
           // Every `Columns` is made by a call that answers one, so its element is judged there.
           let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
@@ -5316,10 +5305,6 @@ fn joined_callbacks(
   }
 }
 
-fn group_label_vars(checker: Checker, name: Bytes) -> List<Int> =
-  fold(checker.group_defs, [], |acc: List<Int>, g: GroupDef|
-    if g.name == name { g.labels } else { acc })
-
 fn group_member(checker: Checker, name: Bytes) -> Bool =
   fold(checker.group_defs, false, |acc: Bool, g: GroupDef| acc || g.name == name)
 
@@ -5332,6 +5317,7 @@ fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) 
       label_apps: push(checker.label_apps, {
         module: checker.module,
         span: span,
+        named: span.end,
         callee: callee,
         vars: map(labels, |ty: Type| match ty { TyVar(v) -> v, _ -> 0 - 1 }),
         params: checker.label_params,
@@ -5371,6 +5357,7 @@ fn fill_labels(
         label_apps: list_set(checker.label_apps, len(checker.label_apps) - 1, {
           module: a.module,
           span: span,
+          named: a.named,
           callee: a.callee,
           vars: a.vars,
           params: a.params,
@@ -5378,70 +5365,16 @@ fn fill_labels(
           owner: a.owner,
         }),
       };
-      if len(labels) > 0 && is_sibling(marked, a.callee) { group_labels_written(marked, a, labels) }
-      else {
-        // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
-        fold(range(0, len(labels)), marked, |c: Checker, i: Int| {
-          let want = match map_get(c.label_params, at(labels, i).name) {
-            Some(w) -> TyVar(w),
-            None -> label_type(at(labels, i).name),
-          };
-          with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
-        })
-      }
+      // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+      fold(range(0, len(labels)), marked, |c: Checker, i: Int| {
+        let want = match map_get(c.label_params, at(labels, i).name) {
+          Some(w) -> TyVar(w),
+          None -> label_type(at(labels, i).name),
+        };
+        with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
+      })
     },
   }
-
-/// A callee checked in the same recursive group as the body calling it: its labels are the group's.
-fn is_sibling(checker: Checker, name: Bytes) -> Bool = len(group_label_vars(checker, name)) > 0
-
-/// A call inside a recursive group keeps the labels the group was called with, so a label written
-/// there names the caller's own binder in that place, and anything else is refused.
-fn group_labels_written(
-  checker: Checker,
-  a: LabelApplication,
-  labels: List<Ident>,
-) -> Checker / {abort.raise} =
-  fold(range(0, len(labels)), checker, |c: Checker, i: Int|
-    match map_get(c.label_params, at(labels, i).name) {
-      Some(v) -> if v == at(a.vars, i) { c } else { group_label_refused(c, a, at(labels, i)) },
-      None -> group_label_refused(c, a, at(labels, i)),
-    })
-
-fn group_label_refused(
-  checker: Checker,
-  a: LabelApplication,
-  written: Ident,
-) -> Checker / {abort.raise} = {
-  let own = fold(a.vars, [], |acc: List<Bytes>, v: Int|
-    match param_named(a.params, v) { Some(n) -> push(acc, n), None -> acc });
-  let callee = simple_name_of(a.callee);
-  let help = if len(own) < len(a.vars) {
-    b"a call inside a recursive group passes the caller's labels along, so it writes none of its own"
-  } else {
-    bytes_concat_all([
-      b"write `",
-      callee,
-      b"(..)`, or name this definition's own binders in order, as `",
-      callee,
-      b"[",
-      bytes::join(own, b", "),
-      b"](..)`",
-    ])
-  };
-  report_error_at(
-    checker,
-    b"E0306",
-    written.span,
-    bytes_concat_all([
-      b"a call to `",
-      callee,
-      b"` inside its own recursive group keeps the labels the group was called with",
-    ]),
-    bytes_concat_all([b"`", written.name, b"` is written here"]),
-    [help],
-  )
-}
 
 fn wrong_labels(
   checker: Checker,
@@ -5552,9 +5485,6 @@ fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
     PerformVia(name) -> if group_member(checker, name) { Some(name) } else { None },
     _ -> None,
   }
-
-fn group_row_tail(checker: Checker, tail: Option<Int>) -> Bool =
-  match tail { Some(v) -> contains(checker.group_rows, v), None -> false }
 
 type Met = { checker: Checker, tails: List<Int> }
 
@@ -5757,70 +5687,15 @@ fn close_tail(checker: Checker, tail: Int) -> Checker / {abort.raise} =
     None -> checker,
   }
 
-/// An argument against its parameter, where a call inside the group being walked keeps the
-/// group's row: a mismatch on that row is refused as that.
 fn expect_argument(
   checker: Checker,
   span: Span,
   expected: Type,
   found: Type,
-  callee: Option<Bytes>,
 ) -> Checker / {abort.raise} = {
   let u = unify(checker.subst, checker.fresh, expected, found);
   let c: Checker = with_unified(checker, u);
-  match u.error {
-    None -> c,
-    Some(e) -> match callee {
-      Some(name) -> group_argument_refused(c, e, span, name),
-      None -> report_unify(c, e, span, b"argument type"),
-    },
-  }
-}
-
-fn group_argument_refused(
-  checker: Checker,
-  error: UnifyError,
-  span: Span,
-  callee: Bytes,
-) -> Checker / {abort.raise} =
-  match error {
-    // A tail that differs is the group's row itself being asked to become another; atoms that
-    // differ under one tail are an ordinary row mismatch.
-    RowMismatch(m) -> {
-      let want = resolve_row_in(checker, m.expected);
-      let got = resolve_row_in(checker, m.found);
-      if group_row_tail(checker, want.tail) && want.tail != got.tail {
-        group_row_refused(checker, span, callee, want, got)
-      } else { report_unify(checker, error, span, b"argument type") }
-    },
-    _ -> report_unify(checker, error, span, b"argument type"),
-  }
-
-/// The group's row binders are one allocation, so a call inside it cannot ask for another row.
-fn group_row_refused(
-  checker: Checker,
-  span: Span,
-  callee: Bytes,
-  want: Row,
-  got: Row,
-) -> Checker / {abort.raise} = {
-  let pe = print_row(printer_new(), want);
-  let pf = print_row(pe.printer, got);
-  report_error_at(
-    checker,
-    b"E0308",
-    span,
-    bytes_concat_all([
-      b"a call to `",
-      simple_name_of(callee),
-      b"` inside its own recursive group keeps the row the group was called with",
-    ]),
-    bytes_concat_all([b"the group's row here is ", pe.text, b", and this argument's is ", pf.text]),
-    [
-      b"the members of a recursive group are checked with one set of row parameters, taken in order, so a call inside it passes the caller's row along",
-      b"give this argument the group's row, or break the cycle so the callee is checked on its own",
-    ],
-  )
+  match u.error { None -> c, Some(e) -> report_unify(c, e, span, b"argument type") }
 }
 
 /// Each call inside the group just walked, `members`, that fills a member's type parameter with a
@@ -5965,7 +5840,7 @@ fn infer_app_general(
         fn_.params,
         handed.tys,
         |cc: Checker, i: Int|
-          expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i), callee),
+          expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i)),
       );
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let noted: Checker = if is_int_builtin(func) && len(fn_.params) > 0 {
@@ -8791,107 +8666,6 @@ fn rowless(ty: Type) -> Type =
 fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
   map_get(checker.known.defs, name)
 
-fn binders_text(n: Int, what: Bytes) -> Bytes =
-  if n == 0 { bytes_concat_all([b"binds no ", what, b" parameters"]) }
-  else { bytes_concat_all([b"binds ", ascii_of_int(n), b" ", what, b" parameter", plural(n)]) }
-
-fn binders_differ(
-  checker: Checker,
-  def: FnDef,
-  first: FnDef,
-  what: Bytes,
-  many: Bytes,
-  mine: Int,
-  theirs: Int,
-) -> Checker =
-  report_error_at_and(
-    checker,
-    b"E0307",
-    def.name.span,
-    bytes_concat_all([
-      b"`",
-      def.name.name,
-      b"` and `",
-      first.name.name,
-      b"` are mutually recursive, so they are checked with one set of ",
-      what,
-      b" parameters",
-    ]),
-    binders_text(mine, what),
-    location_of(checker, first.name.span),
-    binders_text(theirs, what),
-    [
-      bytes_concat_all([
-        b"a call inside a recursive group passes the caller's ",
-        many,
-        b" along, so every member binds the same number, in the same order",
-      ]),
-    ],
-  )
-
-/// The label and row variables a recursive group is checked with: the first member's binders, taken
-/// by every member in order. A member that binds another number of either is refused.
-fn component_params(
-  checker: Checker,
-  fns: List<FnDef>,
-  comp: List<Int>,
-) -> { checker: Checker, shared: Shared } / {abort.raise} = {
-  let first: FnDef = at(
-    fns,
-    fold(comp, at(comp, 0), |acc: Int, i: Int| if i < acc { i } else { acc }),
-  );
-  let judged: Checker = if len(comp) < 2 { checker } else {
-    fold(comp, checker, |c: Checker, i: Int| {
-      let def: FnDef = at(fns, i);
-      let labelled: Checker = if len(def.generics.labels) == len(first.generics.labels) { c } else {
-        binders_differ(
-          c,
-          def,
-          first,
-          b"label",
-          b"labels",
-          len(def.generics.labels),
-          len(first.generics.labels),
-        )
-      };
-      if len(def.generics.effects) == len(first.generics.effects) { labelled } else {
-        binders_differ(
-          labelled,
-          def,
-          first,
-          b"row",
-          b"rows",
-          len(def.generics.effects),
-          len(first.generics.effects),
-        )
-      }
-    })
-  };
-  let labels: { checker: Checker, vars: List<Int> } = fold(
-    first.generics.labels,
-    { checker: judged, vars: [] },
-    |acc: { checker: Checker, vars: List<Int> }, ident: Ident| {
-      let o: WithVar = new_ty_var(acc.checker);
-      {
-        checker: { ..o.checker, subst: mark_rigid_ty(o.checker.subst, o.var) },
-        vars: push(acc.vars, o.var),
-      }
-    },
-  );
-  let rows: { checker: Checker, vars: List<Int> } = fold(
-    first.generics.effects,
-    { checker: labels.checker, vars: [] },
-    |acc: { checker: Checker, vars: List<Int> }, ident: Ident| {
-      let o: WithVar = new_row_var(acc.checker);
-      {
-        checker: { ..o.checker, subst: mark_rigid_row(o.checker.subst, o.var) },
-        vars: push(acc.vars, o.var),
-      }
-    },
-  );
-  { checker: rows.checker, shared: { labels: labels.vars, rows: rows.vars } }
-}
-
 /// What a name the termination walk leaves free refers to.
 fn group_callee_kind(
   checker: Checker,
@@ -8916,19 +8690,14 @@ fn check_component(
   comp: List<Int>,
 ) -> Checker / {abort.raise} = {
   let qualified = map(comp, |i: Int| qualify(parsed.name, at(fns, i).name.name));
-  let params: { checker: Checker, shared: Shared } = component_params(checker, fns, comp);
   // The constraints a member's signature writes stand for the walk, so a call inside the group
   // answers for them as a call from outside will.
   let sigs: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> } = fold(
     range(0, len(comp)),
-    { checker: params.checker, sigs: [], schemes: [] },
+    { checker: checker, sigs: [], schemes: [] },
     |acc: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> }, slot: Int| {
       let def = at(fns, at(comp, slot));
-      let s: WithSig = signature_sharing(
-        { ..acc.checker, derived: derived_of(parsed, def) },
-        def,
-        params.shared,
-      );
+      let s: WithSig = written_signature({ ..acc.checker, derived: derived_of(parsed, def) }, def);
       let scheme = member_scheme(s.checker, def, s.sig);
       {
         checker: {
@@ -8948,7 +8717,6 @@ fn check_component(
   );
   let grouped: Checker = {
     ..sigs.checker,
-    group_rows: params.shared.rows,
     group_defs: fold(range(0, len(comp)), [], |acc: List<GroupDef>, slot: Int| {
       let def = at(fns, at(comp, slot));
       let sig = at(sigs.sigs, slot);
@@ -9092,9 +8860,7 @@ fn check_component(
   };
   let settled: Checker = settle_columns(
     settle_bit_ops(
-      settle_numerics(
-        settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
-      ),
+      settle_numerics(settle_concats(settle_updates({ ..summarized, group_defs: [] }))),
     ),
   );
   let grown: Checker = refuse_growth(settled, grouped.group_defs);
@@ -14160,7 +13926,6 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     label_apps: [],
     label_sites: [],
     group_defs: [],
-    group_rows: [],
     auto_ty_params: false,
     alias_stack: [],
     aliases: map_new(),
@@ -14755,9 +14520,9 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
       let names = fold(a.vars, [], |acc: List<Bytes>, v: Int|
         match label_named(in_module, a, v) { Some(n) -> push(acc, n), None -> acc });
       if len(names) < len(a.vars) {
-        report_error_at(
-          in_module,
+        let unfilled = error_at(
           b"E0306",
+          a.module,
           a.span,
           bytes_concat_all([
             b"this call leaves a label of `",
@@ -14772,7 +14537,15 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
               b"[<label>](..)`, or pass an argument whose row or type names it",
             ]),
           ],
-        )
+        );
+        // One binder for one label is the only label this definition can pass along.
+        report(in_module, match ((map_keys(a.params), a.vars)) {
+          ([own], [_]) ->
+            with_fix(unfilled, bytes_concat_all([b"pass `", own, b"` along"]), [
+              insertion(a.module, a.named, bytes_concat_all([b"[", own, b"]"])),
+            ]),
+          _ -> unfilled,
+        })
       } else {
         {
           ..in_module,
@@ -15179,122 +14952,70 @@ test "two label parameters stay apart, and each names its own atom" {
   )
 }
 
-// The group's binders are positional, so `pong` takes `ping`'s first, whatever it calls it.
-test "mutually recursive definitions are checked with one set of label binders" {
-  let src = bytes_concat_all([
-    b"effect net { write send[r](Bytes) -> Unit }\n",
-    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
-    b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping(n - 1, b)\n",
-    b"fn go(b: Bytes) -> Unit / {net.send[conn]} = ping[conn](2, b)",
-  ]);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(
-    string_contains(
-      dump,
-      "F;m.ping;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];",
-    ),
-  );
-  assert(
-    string_contains(
-      dump,
-      "F;m.pong;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];",
-    ),
-  );
-  assert(string_contains(dump, "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];"))
-}
-
-test "a call inside a recursive group writes no labels, or the caller's own binders" {
-  let pair = |call: Bytes|
+test "a call inside a recursive group fills its callee's labels as any call does" {
+  let alone = |call: Bytes, row: Bytes|
     bytes_concat_all([
       b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
-      call,
-      b" }\n",
-      b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
-    ]);
-  assert_eq(check_codes(pair(b"pong(n - 1, b)")), []);
-  assert_eq(check_codes(pair(b"pong[l](n - 1, b)")), []);
-  assert_eq(check_codes(pair(b"pong[conn](n - 1, b)")), [b"E0306"]);
-  let diags = check_diags(pair(b"pong[conn](n - 1, b)"));
-  assert_eq(map(diags, |diag: Diag| diag.message), [
-    b"a call to `pong` inside its own recursive group keeps the labels the group was called with",
-  ]);
-  assert_eq(map(diags, |diag: Diag| diag.notes_text), [
-    [b"write `pong(..)`, or name this definition's own binders in order, as `pong[l](..)`"],
-  ]);
-  // A self call is the same rule: its own binder, or nothing.
-  let alone = |call: Bytes|
-    bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
+      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {",
+      row,
+      b"} = if n <= 0 { net.send[l](b) } else { ",
       call,
       b" }",
     ]);
-  assert_eq(check_codes(alone(b"walk(n - 1, b)")), []);
-  assert_eq(check_codes(alone(b"walk[l](n - 1, b)")), []);
-  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)")), [b"E0306"])
+  assert_eq(check_codes(alone(b"walk[l](n - 1, b)", b"net.send[l]")), []);
+  // Another label than its own is what the call performs, which the caller's row must hold.
+  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)", b"net.send[l], net.send[conn]")), []);
+  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)", b"net.send[l]")), [b"E0302"]);
+  // No argument names the label, so the call writes it, and the one binder in scope is offered.
+  let bare = alone(b"walk(n - 1, b)", b"net.send[l]");
+  let unfilled = filter(check_diags(bare), |diag: Diag| diag.code == b"E0306");
+  assert_eq(map(unfilled, |diag: Diag| diag.message), [
+    b"this call leaves a label of `walk` unfilled",
+  ]);
+  assert_eq(map(fixes_of(unfilled), |fix: Fix| fix.title), [b"pass `l` along"]);
+  assert_eq(map(fixes_of(unfilled), |fix: Fix| fixed_by(bare, fix)), [
+    alone(b"walk[l](n - 1, b)", b"net.send[l]"),
+  ]);
+  // Each member keeps its own binder, whatever it calls it and however many it binds.
+  let pair = bytes_concat_all([
+    b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong[l](n - 1, b) }\n",
+    b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping[k](n - 1, b)",
+  ]);
+  assert_eq(check_codes(pair), []);
+  let uneven = bytes_concat_all([
+    b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l, k]>(n: Int, b: Bytes) -> Unit / {net.send[l], net.send[k]} = if n <= 0 { net.send[l](b) } else { pong[k](n - 1, b) }\n",
+    b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ping[l, l](n - 1, b) }",
+  ]);
+  assert_eq(check_codes(uneven), [])
 }
 
-test "the members of a recursive group bind the same label parameters" {
-  let group = |first: Bytes, second: Bytes|
+test "a call inside a recursive group fills its callee's row as any call does" {
+  let alone = |row: Bytes, handed: Bytes|
     bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn ping",
-      first,
-      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
-      b"fn pong",
-      second,
-      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
+      b"effect tick { write now() -> Unit }\n",
+      b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / ",
+      row,
+      b" = if n <= 0 { f() } else { each(n - 1, ",
+      handed,
+      b") }",
     ]);
-  assert_eq(check_codes(group(b"<[l]>", b"<[l]>")), []);
-  assert(contains(check_codes(group(b"<[l]>", b"")), b"E0307"));
-  assert(contains(check_codes(group(b"<[l]>", b"<[l, k]>")), b"E0307"));
-  assert(contains(check_codes(group(b"", b"<[l]>")), b"E0307"));
-  let diags = check_diags(group(b"<[l]>", b""));
-  assert_eq(
-    at(map(diags, |diag: Diag| diag.message), 0),
-    b"`pong` and `ping` are mutually recursive, so they are checked with one set of label parameters",
-  );
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"binds no label parameters",
-    b"binds 1 label parameter",
-  ])
-}
-
-// The group's row binders are positional too, so `pong` takes `ping`'s first, whatever it calls it.
-test "mutually recursive definitions are checked with one set of row binders" {
-  let src = bytes_concat_all([
-    b"effect tick { write now() -> Unit }\n",
+  assert_eq(check_codes(alone(b"e", b"f")), []);
+  // A callback of another row is what the call performs, which the caller's row must hold.
+  assert_eq(check_codes(alone(b"{tick.now | e}", b"|| tick.now()")), []);
+  assert_eq(check_codes(alone(b"e", b"|| tick.now()")), [b"E0302"]);
+  // Each member keeps its own binder, and one that takes no row calls one that does.
+  let pair = bytes_concat_all([
     b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|t>(n: Int, f: () -> Unit / t) -> Unit / t = ping(n - 1, f)\n",
-    b"fn go() -> Unit / {tick.now} = ping(2, || tick.now())",
+    b"fn pong<|t>(n: Int, f: () -> Unit / t) -> Unit / t = ping(n - 1, f)",
   ]);
-  assert_eq(check_codes(src), []);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(string_contains(dump, "F;m.ping;<| e>(Int, () -> Unit / e) -> Unit / e;"));
-  assert(string_contains(dump, "F;m.pong;<| e>(Int, () -> Unit / e) -> Unit / e;"));
-  assert(string_contains(dump, "F;m.go;() -> Unit / {m.tick.now};"))
-}
-
-test "a call inside a recursive group keeps the row the group was called with" {
-  let src = bytes_concat_all([
-    b"effect tick { write now() -> Unit }\n",
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || tick.now())",
+  assert_eq(check_codes(pair), []);
+  let mixed = bytes_concat_all([
+    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { plain(n - 1) }\n",
+    b"fn plain(n: Int) -> Unit = if n <= 0 { () } else { each(n - 1, || ()) }",
   ]);
-  assert_eq(check_codes(src), [b"E0308"]);
-  let diags = check_diags(src);
-  assert_eq(map(diags, |diag: Diag| diag.message), [
-    b"a call to `ping` inside its own recursive group keeps the row the group was called with",
-  ]);
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"the group's row here is e, and this argument's is {m.tick.now}",
-  ]);
-  let quiet = bytes_concat_all([
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || ())",
-  ]);
-  assert_eq(check_codes(quiet), [])
+  assert_eq(check_codes(mixed), [])
 }
 
 test "two callbacks that perform different things fill one row variable with both" {
@@ -15401,35 +15122,6 @@ test "a function's parameter and a declared type hold their rows exactly" {
     b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = open(Box(f))",
   ]);
   assert_eq(check_codes(boxed), [b"E0302"])
-}
-
-test "the members of a recursive group bind the same row parameters" {
-  let group = |first: Bytes, second: Bytes|
-    bytes_concat_all([
-      b"fn ping",
-      first,
-      b"(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-      b"fn pong",
-      second,
-      b"(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, f)",
-    ]);
-  assert_eq(check_codes(group(b"<|e>", b"<|e>")), []);
-  assert(contains(check_codes(group(b"<|e>", b"")), b"E0307"));
-  let diags = check_diags(group(b"<|e>", b""));
-  assert_eq(
-    at(map(diags, |diag: Diag| diag.message), 0),
-    b"`pong` and `ping` are mutually recursive, so they are checked with one set of row parameters",
-  );
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"binds no row parameters",
-    b"binds 1 row parameter",
-  ]);
-  // A group mixing a row-generic member with one that binds none is refused where they disagree.
-  let mixed = bytes_concat_all([
-    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { plain(n - 1) }\n",
-    b"fn plain(n: Int) -> Unit = if n <= 0 { () } else { each(n - 1, || ()) }",
-  ]);
-  assert(contains(check_codes(mixed), b"E0307"))
 }
 
 test "a call inside a recursive group fills its callee's type parameters, and may not grow one" {
