@@ -154,7 +154,7 @@ listed() {
 
 # What a report's load took of the stores as kept, what it ran anew, and how many of those it ran
 # although their records stood, the answers they name being in no store. Nothing for a report no load
-# made: a kept answer's, or a refusal's.
+# made: a kept answer's.
 answers='(if .front_end.queries then "; \([.front_end.queries[].taken] | add // 0) answers taken, \([.front_end.queries[].run] | add // 0) run and \(.front_end.lost // 0) lost" else "" end)'
 
 # Whether a report's load lost an answer: none is lost over stores that are whole, whatever moved.
