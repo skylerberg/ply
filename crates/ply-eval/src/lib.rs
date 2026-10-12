@@ -73,8 +73,7 @@ pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use program::{
     Analysis, CheckOutput, DefInfo, EffectInfo, EmitterRoot, LawInfo, ModuleInfo, ModuleName,
-    OpInfo, Ordinal, SpecKind, TestInfo, TypeDecl, Visibility, is_ident, is_ident_continue,
-    is_ident_start,
+    OpInfo, Ordinal, SpecKind, TestInfo, TypeDecl, Visibility,
 };
 pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};

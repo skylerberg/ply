@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicI64;
 /// A loaded C unit, with the surface `crate::backend::Bodies` asks a compiled unit for.
 pub struct Native {
     /// Kept alive because every [`Entry`] below points into its pages.
-    lib: Library,
+    _lib: Library,
     entries: HashMap<String, (Entry, usize)>,
     constants: HashMap<String, usize>,
     tables: Arc<Tables>,
@@ -51,10 +51,6 @@ impl Native {
 
     pub fn context(&self) -> Ctx {
         Ctx::new(self.tables.clone())
-    }
-
-    pub fn source_path(&self) -> &std::path::Path {
-        self.lib.path()
     }
 }
 
@@ -193,7 +189,7 @@ fn finish(lib: Library, exports: Exports, source: Option<&Source>) -> Result<Nat
     tables.functions = functions;
     tables.roots = roots;
     Ok(Native {
-        lib,
+        _lib: lib,
         entries,
         constants,
         tables: Arc::new(tables),

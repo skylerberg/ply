@@ -41,25 +41,6 @@ fn value_of(bytes: &[u8]) -> Result<Value, String> {
     ply_eval::codec::decode(&encoded)
 }
 
-/// The front end's answer `bytes` hold, as the value a program hands `machine.load`.
-pub fn front_value(bytes: &[u8]) -> Result<Value, String> {
-    let value = value_of(bytes)?;
-    let at = AnswerValue::new("a runnable", &value);
-    let field = |name: &str| {
-        at.field(name)
-            .map(|f| f.value().clone())
-            .map_err(|e| e.to_string())
-    };
-    Ok(record(vec![
-        ("dump", field("dump")?),
-        ("files", field("files")?),
-        ("read_ms", Value::Int(0)),
-        ("front_ms", Value::Int(0)),
-        ("file_ms", Value::Int(0)),
-        ("cached", Value::Bool(false)),
-    ]))
-}
-
 /// The program `bytes` hold, or why they hold none.
 pub fn decode(bytes: &[u8]) -> Result<Runnable, String> {
     let started = Instant::now();
