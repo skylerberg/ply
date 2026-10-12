@@ -36,9 +36,11 @@ pub(super) fn encode_tables(
                 .join(" ")
         ));
     }
-    out.push_str(&format!("lambdas {}\n", lambdas.len()));
-    for l in lambdas {
-        out.push_str(&format!("{l}\n"));
+    if !lambdas.is_empty() {
+        out.push_str(&format!("lambdas {}\n", lambdas.len()));
+        for l in lambdas {
+            out.push_str(&format!("{l}\n"));
+        }
     }
     out
 }
@@ -104,11 +106,25 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<BodyTables> {
         t.shapes
             .push(line(s, at)?.split_whitespace().map(Symbol::new).collect());
     }
-    let n = count(line(s, at)?, "lambdas")?;
+    let n = section(s, at, "lambdas")?;
     for _ in 0..n {
         t.lambdas.push(line(s, at)?.to_string());
     }
     Some(t)
+}
+
+/// How many rows a table `label` holds where the text opens one here, its line stepped past, and
+/// none where the text holds no such table here.
+pub(super) fn section(s: &str, at: &mut usize, label: &str) -> Option<usize> {
+    let opens = s
+        .get(*at..)?
+        .strip_prefix(label)
+        .is_some_and(|rest| rest.starts_with(' '));
+    if opens {
+        count(line(s, at)?, label)
+    } else {
+        Some(0)
+    }
 }
 
 /// Read one line and step the cursor past it; the text is found by offset, never by a marker.
