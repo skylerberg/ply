@@ -28,7 +28,7 @@ fn manifest_magic() -> Bytes = b"PLYSEGS1"
 fn frame_head() -> Int = 12
 
 /// Magic, format, token and shapes.
-fn header_len() -> Int = 52
+pub fn header_len() -> Int = 52
 
 /// The most one read asks for: a table or an answer longer than this is read in parts.
 fn read_bound() -> Int = 33554432
@@ -168,6 +168,27 @@ pub fn manifest<[r]>(dir: String, shapes: Bytes) -> Manifest / {fs.read[r], abor
     None -> nothing(),
     Some(b) -> match manifest_from(b) { Some(m) -> m, None -> nothing() },
   }
+
+/// Whether the store in `dir` holds a manifest for `shapes` that does not read as one.
+pub fn unreadable<[r]>(dir: String, shapes: Bytes) -> Bool / {fs.read[r], abort.raise} =
+  match fs.read_file[r](dir ++ "/" ++ manifest_name(shapes)) {
+    None -> false,
+    Some(b) -> manifest_from(b) == None,
+  }
+
+/// Whether the store in `dir` holds a manifest of other shapes than `shapes`: what another program
+/// keeps there, which this one does not read.
+pub fn others<[r]>(dir: String, shapes: Bytes) -> Bool / {fs.read[r], abort.raise} = {
+  let own = manifest_name(shapes);
+  fold(
+    match fs.list_dir[r](dir) { Some(names) -> names, None -> [] },
+    false,
+    |any: Bool, name: String|
+      any
+        || (string_starts_with(name, "manifest-") && name != own
+        && !string_starts_with(name, own ++ ".")),
+  )
+}
 
 /// Whether `seg` lies below `m`'s floor.
 pub fn below_floor(m: Manifest, seg: Segment) -> Bool = seg.at < m.floor
@@ -485,15 +506,22 @@ pub fn finished<[r]>(
 /// where the file system refused.
 pub type Committed = | Named(Manifest) | Held | Moved | Unwritten
 
+/// The manifest of the store in `dir` replaced by `m`, which names the segment of `token` last:
+/// where `lasting`, that segment, the manifest and the directory are each synced, so what the
+/// manifest names outlives a loss of power.
 fn replaced<[r]>(
   dir: String,
   shapes: Bytes,
   token: Bytes,
   m: Manifest,
+  lasting: Bool,
 ) -> Bool / {fs.write[r], abort.raise} = {
   let path = dir ++ "/" ++ manifest_name(shapes);
   let tmp = path ++ "." ++ hex_of(token) ++ ".tmp";
-  fs.write_file[r](tmp, manifest_bytes(m)) && fs.rename[r](tmp, path)
+  (!lasting || fs.sync[r](segment_path(dir, token))) && fs.write_file[r](tmp, manifest_bytes(m))
+    && (!lasting || fs.sync[r](tmp))
+    && fs.rename[r](tmp, path)
+    && (!lasting || fs.sync[r](dir))
 }
 
 /// `seg` named as the newest segment of the store in `dir`: the manifest is read again under the
@@ -501,13 +529,15 @@ fn replaced<[r]>(
 /// the generation of the manifest the run that wrote `seg` read. Where another run has committed
 /// since, the floor goes above `seg` too: neither run saw what the other wrote, so nothing either
 /// kept is vouched for until it is checked again. `without` names segments the run found damaged:
-/// they are named no longer, and the floor rises to `seg`, which alone is vouched for.
+/// they are named no longer, and the floor rises to `seg`, which alone is vouched for. A `lasting`
+/// commit is synced to the disk before it answers.
 pub fn committed<[r]>(
   dir: String,
   shapes: Bytes,
   read: Int,
   seg: Segment,
   without: List<Bytes> = [],
+  lasting: Bool = false,
 ) -> Committed / {fs.read[r], fs.write[r], abort.raise} =
   if !fs.lock[r](lock_path(dir)) { Held } else {
     let now = manifest[r](dir, shapes);
@@ -522,7 +552,7 @@ pub fn committed<[r]>(
         at: at,
       }),
     };
-    let done = replaced[r](dir, shapes, seg.token, next);
+    let done = replaced[r](dir, shapes, seg.token, next, lasting);
     fs.unlock[r](lock_path(dir));
     if done { Named(next) } else { Unwritten }
   }
@@ -536,6 +566,7 @@ pub fn swapped<[r]>(
   m: Manifest,
   from: Int,
   seg: Segment,
+  lasting: Bool = false,
 ) -> Committed / {fs.read[r], fs.write[r], abort.raise} =
   if !fs.lock[r](lock_path(dir)) { Held } else {
     let now = manifest[r](dir, shapes);
@@ -545,7 +576,7 @@ pub fn swapped<[r]>(
       floor: m.floor,
       segments: push(take(m.segments, from), { ..seg, at: at }),
     };
-    let done = now.generation == m.generation && replaced[r](dir, shapes, seg.token, next);
+    let done = now.generation == m.generation && replaced[r](dir, shapes, seg.token, next, lasting);
     fs.unlock[r](lock_path(dir));
     if now.generation != m.generation { Moved } else if done { Named(next) } else { Unwritten }
   }

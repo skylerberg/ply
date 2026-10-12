@@ -62,10 +62,27 @@ test "cache clear makes the next run re-prove everything" {
   })
 }
 
+/// The files of the store here whose names start with `prefix`: its manifest, or its segments.
+fn store_files(prefix: String) -> List<String> / {fs.read[cwd], abort.raise} =
+  map(
+    filter(
+      match fs.list_dir[cwd](".ply-cache") { Some(names) -> names, None -> [] },
+      |name: String| string_starts_with(name, prefix),
+    ),
+    |name: String| ".ply-cache/" ++ name,
+  )
+
+/// The store's manifest here written over with `text`.
+fn manifest_as(text: String) -> Unit / {fs.read[cwd], fs.write[cwd], abort.raise} =
+  match store_files("manifest-") {
+    [file, ..] -> write(file, text),
+    [] -> panic("the run filed no store"),
+  }
+
 test "a corrupt cache degrades to an empty one rather than crashing" {
   scratch(|| {
     tested_once();
-    write(".ply-cache/store.idx", "{ truncated");
+    manifest_as("{ truncated");
     let r = on_disk(["test"]);
     assert(r.code == 0, Some(said(r)));
     assert(string_contains(stdout(r), "selected 2 of 2 (0 cached)"), Some(stdout(r)));
@@ -76,19 +93,21 @@ test "a corrupt cache degrades to an empty one rather than crashing" {
   })
 }
 
-/// Every entry the store's data file holds mangled past its header: what a half-written append leaves.
-fn mangle_the_store() -> Unit / {fs.read_file[cwd], fs.write_file[cwd], abort.raise} = {
-  let data = ".ply-cache/store.dat";
-  match fs.read_file[cwd](data) {
-    None -> panic("the run filed no store"),
-    Some(b) -> if bytes_len(b) > 64 {
-      let mangled = bytes_concat(
-        bytes_slice(b, 0, 64),
-        xor_byte(bytes_slice(b, 64, bytes_len(b)), 0x5a),
-      );
-      if !fs.write_file[cwd](data, mangled) { panic("could not mangle the store") }
-    },
-  }
+/// Every segment of the store mangled past its header: what a disk that lost a write leaves.
+fn mangle_the_store() -> Unit / {fs.read[cwd], fs.write[cwd], abort.raise} = {
+  let segments = store_files("seg-");
+  if len(segments) == 0 { panic("the run filed no store") };
+  fold(segments, (), |_: Unit, file: String|
+    match fs.read_file[cwd](file) {
+      None -> panic("a segment of the store does not read"),
+      Some(b) -> if bytes_len(b) > 64 {
+        let mangled = bytes_concat(
+          bytes_slice(b, 0, 64),
+          xor_byte(bytes_slice(b, 64, bytes_len(b)), 0x5a),
+        );
+        if !fs.write_file[cwd](file, mangled) { panic("could not mangle the store") }
+      },
+    })
 }
 
 // Damage is said in the text and in the document, and the run goes on as if nothing was kept.
@@ -114,12 +133,12 @@ test "cache stats reports open time, the store's files and the memo store" {
     tested_once();
     let text = stdout(on_disk(["cache", "stats"]));
     assert(string_contains(text, "opened in"), Some("the open cost is the claim:\n" ++ text));
-    assert(string_contains(text, "index"), Some("the store's files must be sized:\n" ++ text));
+    assert(string_contains(text, "segment"), Some("the store's files must be sized:\n" ++ text));
     assert(string_contains(text, "memo"), Some(text));
     assert(string_contains(text, "reclaimable"), Some(text));
     let v = stats();
     assert(is_number(at(v, "open_ms")), Some(shown(v)));
-    assert(int(path(v, ["store", "index_bytes"])) > 0, Some(shown(v)));
+    assert(int(path(v, ["store", "segments"])) > 0, Some(shown(v)));
     assert(is_number(path(v, ["store", "data_bytes"])), Some(shown(v)));
     assert(int(path(v, ["memo", "records"])) >= 1, Some(shown(v)));
     assert(int(path(v, ["memo", "segments"])) >= 1, Some(shown(v)));
@@ -268,7 +287,7 @@ test "cache inspect reports a test and whether it is proven" {
 test "cache stats reports a discarded store too" {
   scratch(|| {
     tested_once();
-    write(".ply-cache/store.idx", "PLYSTIDX not really an index");
+    manifest_as("PLYSEGS1 not really a manifest");
     let v = stats();
     assert(contains(codes_of(at(v, "warnings")), "W0602"), Some(shown(at(v, "warnings"))))
   })
