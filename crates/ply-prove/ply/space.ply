@@ -1,0 +1,1495 @@
+//! The memory a call holds beyond what it is handed, read off its body as monomials over its
+//! parameters' sizes, each up to a constant factor: every object it makes, though it let some go
+//! before it returns, and a frame for each call back into itself that is not a tail call. A number
+//! is no object. A body is read with each argument held by nothing else, all the way down, as an
+//! update in place needs: an update of a value something else holds copies it, and a constructor
+//! built after a `match` let go of a subject held once takes the subject's cells, as compiled code
+//! does.
+
+import compiler.code (Code, Owned, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
+                      NMatch, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel, NHandle,
+                      NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
+                      CodePattern, PxVar, PxCtor, PxRecord, PxList, CodePatternField, Capture)
+import compiler.front (ClaimClause)
+import compiler.infer (Builtin, builtins)
+import compiler.items (SSpace)
+import compiler.patterns (Lit, LInt, LStr, LBytes)
+import compiler.types (Type, TyCon, TyFn, TyRecord)
+import context (Context, Def, ctor, signature, is_recursive)
+import cost (Poly, Of, Same, Part, Other, zero, constant, size_of, plus, product, at_args,
+             ceiling_of, callees, reachable, params_sized, arithmetic, holding_keyed, descent, kept,
+             is_length, dominated, stated, cx_owning)
+import domain (Ty, Fn, Con, Record)
+import std.list (concat, contains)
+
+/// Who else holds a value: `Alone`, nothing, nor anything it holds; `Top`, nothing, though what it
+/// holds may be held elsewhere; `Many`, something.
+type Holders = | Alone | Top | Many
+
+/// A local as `cost` reads one, the space one call of it takes where it is a function, who else
+/// holds it, and whether it is a number, which nothing holds.
+type Slot = { size: Option<Poly>, of: Of, fun: Option<Poly>, holders: Holders, number: Bool }
+
+/// Where a path stands: each local, and the constructor a `match` let go of, whose cells the next
+/// one built of it takes.
+type State = { slots: List<Slot>, credit: Option<Bytes> }
+
+/// What walking an expression finds: the state after it; the space it holds on any path, and on
+/// the paths that call back into the definition being read; what it is, as a local is; the local it
+/// reads, where that local goes on holding it; how many calls back one path makes, and the
+/// arguments of each; and whether each of those hands every parameter that is not a number a value
+/// held alone.
+type Walked = {
+  state: State,
+  space: Poly,
+  looped: Poly,
+  size: Option<Poly>,
+  of: Of,
+  fun: Option<Poly>,
+  holders: Holders,
+  number: Bool,
+  read: Option<Int>,
+  calls: Int,
+  back: List<List<Of>>,
+  handed: Bool,
+}
+
+/// A definition's space and who else holds what it answers, read with each argument held alone and
+/// with each held anywhere.
+type Known = { alone: Result<Spent, String>, anyhow: Result<Spent, String> }
+
+type Spent = { space: Poly, holders: Holders }
+
+/// What a builtin answers: a number, an `Option` of one, or any other value.
+type Answer = | ANumber | AOptionNumber | AValue
+
+/// `own` is the definition being read, and `numbers` which of its parameters are numbers; `known`,
+/// what it calls; `answers`, what each builtin answers; `lambda`, whether the walk is inside a
+/// function value, whose code is read letting no subject go; `tail`, whether nothing in the frame
+/// follows the expression; `empty`, a list parameter known empty.
+type Env = {
+  cx: Context,
+  own: String,
+  numbers: List<Bool>,
+  known: Map<String, Known>,
+  answers: Map<String, Answer>,
+  lambda: Bool,
+  tail: Bool,
+  empty: Option<Int>,
+}
+
+/// The bound a `space` clause states, read from below as a `cost` bound is, where `0` is no space
+/// that grows with what a call is given.
+pub fn stated_space(bound: Code, params: Int) -> Option<Poly> =
+  match bound.node {
+    NLit(l) -> match l {
+      LInt(k) -> if k == 0 { Some(zero()) } else { stated(bound, params, []) },
+      _ -> None,
+    },
+    _ -> stated(bound, params, []),
+  }
+
+/// The bound on the space a call of `def` holds, over its parameters' sizes, with each argument held
+/// alone; what it reaches is read first, as `steps` reads it.
+pub fn space(cx: Context, def: String) -> Result<Poly, String> / {abort.raise} = {
+  let answers = answers_of_builtins();
+  let reach = reachable(cx, def);
+  let known = iterate(map_new(), len(reach) + 1, |known: Map<String, Known>| {
+    let ready = filter(reach, |n: String|
+      !map_contains(known, n)
+        && fold(callees(cx, n), true, |all: Bool, c: String|
+          all && (c == n || map_contains(known, c))));
+    if len(ready) == 0 { Stop(known) } else {
+      Continue(
+        fold(ready, known, |k: Map<String, Known>, n: String|
+          map_insert(k, n, known_of(cx, answers, n, k))),
+      )
+    }
+  });
+  match holding_keyed(cx, reach) {
+    Some(n) ->
+      Err(
+        "`" ++ n
+          ++ "` holds a value compared by its type's `key`, which a comparison calls and no body shows",
+      ),
+    None -> match map_get(known, def) {
+      Some(k) -> match spent_for(k, true) { Ok(s) -> Ok(s.space), Err(why) -> Err(why) },
+      None -> Err("`" ++ def ++ "` reaches definitions that call each other"),
+    },
+  }
+}
+
+/// What a definition holds for arguments held alone, which what it holds for any also bounds.
+fn spent_for(k: Known, once: Bool) -> Result<Spent, String> =
+  if !once { k.anyhow } else {
+    match k.alone {
+      Ok(s) -> Ok(s),
+      Err(why) -> match k.anyhow { Ok(s) -> Ok(s), Err(_) -> Err(why) },
+    }
+  }
+
+fn known_of(
+  cx: Context,
+  answers: Map<String, Answer>,
+  def: String,
+  known: Map<String, Known>,
+) -> Known / {abort.raise} =
+  match map_get(cx.claims.defs, def) {
+    None -> {
+      let why = "`" ++ def ++ "` has no body here to read";
+      { alone: Err(why), anyhow: Err(why) }
+    },
+    Some(d) -> match d.moved {
+      None ->
+        {
+          alone: promised(def, d),
+          anyhow: Err(
+            "`" ++ def
+              ++ "` is handed a value something else holds, and its `space` bound is for arguments held alone",
+          ),
+        },
+      Some(body) ->
+        {
+          alone: held(cx, answers, def, d.params, body, known, true),
+          anyhow: held(cx, answers, def, d.params, body, known, false),
+        },
+    },
+  }
+
+/// A definition read by its contract, as another package's is: its first `space` bound read from
+/// above.
+fn promised(def: String, d: Def) -> Result<Spent, String> =
+  match fold(
+      filter(d.spec, |c: ClaimClause| c.kind == SSpace),
+      None,
+      |found: Option<Poly>, c: ClaimClause|
+        match found {
+          Some(_) -> found,
+          None -> match c.clause.code { Some(b) -> ceiling_of(b, d.params), None -> None },
+        },
+    ) {
+    Some(p) -> Ok({ space: p, holders: Many }),
+    None ->
+      Err("`" ++ def ++ "` has no body here to read, and no `space` bound to read as its space"),
+  }
+
+/// The space a call of `def` holds, its parameters held alone or each held anywhere. A recursion
+/// whose paths that call back hold nothing more, and call back last, holds what the path that ends
+/// does, with no parameter it grows with grown on the way; any other is read as `steps` reads one.
+fn held(
+  cx: Context,
+  answers: Map<String, Answer>,
+  def: String,
+  params: Int,
+  body: Code,
+  known: Map<String, Known>,
+  alone: Bool,
+) -> Result<Spent, String> / {abort.raise} = {
+  let sized = params_sized(cx, def, params);
+  let numbers = numbers_of(cx, def, params);
+  let env = {
+    cx: cx,
+    own: def,
+    numbers: numbers,
+    known: known,
+    answers: answers,
+    lambda: false,
+    tail: true,
+    empty: None,
+  };
+  let start = {
+    slots: map(range(0, params), |i: Int| {
+      let number = at_or(numbers, i);
+      {
+        size: if at_or(sized, i) { Some(size_of(i)) } else { None },
+        of: Same(i),
+        fun: None,
+        holders: if alone || number { Alone } else { Many },
+        number: number,
+      }
+    }),
+    credit: None,
+  };
+  match walk(env, start, body) {
+    Err(why) -> Err(why),
+    Ok(w) -> if !is_recursive(cx, def) { Ok({ space: w.space, holders: w.holders }) }
+    else if !map_contains(cx.self_recursive, def) {
+      Err("`" ++ def ++ "` is in a group with others")
+    } else if alone && !w.handed {
+      Err("`" ++ def ++ "` hands itself a value something else holds")
+    } else if w.looped == zero() {
+      if kept(w.space, w.back) { Ok({ space: w.space, holders: w.holders }) }
+      else { Err("`" ++ def ++ "` hands on a parameter its space grows with, changed") }
+    } else {
+      match descent(def, w.calls, w.back, w.space, "space grows") {
+        Err(why) -> Err(why),
+        Ok(None) -> Ok({ space: w.space, holders: w.holders }),
+        // As `steps` reads it: a call enters with that list empty at most once.
+        Ok(Some(p)) -> match walk(
+            { ..env, empty: Some(p) },
+            {
+              ..start,
+              slots: list_set(start.slots, p, { ..slot_at(start, p), size: Some(zero()) }),
+            },
+            body,
+          ) {
+          Err(why) -> Err(why),
+          Ok(e) -> match product(size_of(p), w.space) {
+            Ok(chain) -> Ok({ space: plus(chain, e.space), holders: weaker(w.holders, e.holders) }),
+            Err(why) -> Err(why),
+          },
+        },
+      }
+    },
+  }
+}
+
+// --- Holders and states -------------------------------------------------------------------------
+
+fn weaker(a: Holders, b: Holders) -> Holders =
+  if a == Many || b == Many { Many } else if a == Top || b == Top { Top } else { Alone }
+
+/// A value made of `parts` is held alone where each part is, and else is held once at its top.
+fn made_of(parts: List<Holders>) -> Holders =
+  if fold(parts, true, |all: Bool, h: Holders| all && h == Alone) { Alone } else { Top }
+
+/// Who else holds what a walk found, a number being held by nothing.
+fn part_of(w: Walked) -> Holders = if w.number { Alone } else { w.holders }
+
+fn held_alone(w: Walked) -> Bool = part_of(w) == Alone
+
+fn unknown_slot() -> Slot = { size: None, of: Other, fun: None, holders: Many, number: false }
+
+fn slot_at(st: State, k: Int) -> Slot =
+  match list_at(st.slots, k) { Some(s) -> s, None -> unknown_slot() }
+
+fn slot_of(w: Walked) -> Slot =
+  { size: w.size, of: w.of, fun: w.fun, holders: w.holders, number: w.number }
+
+fn bind(st: State, k: Int, s: Slot) -> State / {abort.raise} = {
+  let grown = if len(st.slots) <= k {
+    fold(range(len(st.slots), k + 1), st.slots, |acc: List<Slot>, _i: Int|
+      push(acc, unknown_slot()))
+  } else { st.slots };
+  { ..st, slots: list_set(grown, k, s) }
+}
+
+/// The state once the local a value was read from goes on holding it beside whatever took it as
+/// `to` says: `Many` where the value is held whole, `Top` where only parts of it are.
+fn retain(st: State, read: Option<Int>, to: Holders) -> State / {abort.raise} =
+  match read {
+    None -> st,
+    Some(k) -> match list_at(st.slots, k) {
+      Some(s) -> if s.number { st }
+      else { { ..st, slots: list_set(st.slots, k, { ..s, holders: weaker(s.holders, to) }) } },
+      None -> st,
+    },
+  }
+
+/// Where two paths meet: each local held as the weaker path holds it, and a constructor's cells left
+/// over only where both left them.
+fn merged(a: State, b: State) -> State =
+  {
+    slots: map(range(0, max(len(a.slots), len(b.slots))), |i: Int|
+      match ((list_at(a.slots, i), list_at(b.slots, i))) {
+        (Some(x), Some(y)) -> { ..x, holders: weaker(x.holders, y.holders) },
+        (Some(x), None) -> x,
+        (None, Some(y)) -> y,
+        _ -> unknown_slot(),
+      }),
+    credit: if a.credit == b.credit { a.credit } else { None },
+  }
+
+fn none(st: State) -> Walked =
+  {
+    state: st,
+    space: zero(),
+    looped: zero(),
+    size: None,
+    of: Other,
+    fun: None,
+    holders: Alone,
+    number: false,
+    read: None,
+    calls: 0,
+    back: [],
+    handed: true,
+  }
+
+/// `w`, then an object of `p` words made.
+fn made(w: Walked, p: Poly) -> Walked =
+  { ..w, space: plus(w.space, p), looped: if w.calls > 0 { plus(w.looped, p) } else { w.looped } }
+
+/// `a`, then `b`: a path that calls back through either holds what the other holds too.
+fn then(a: Walked, b: Walked) -> Walked =
+  {
+    state: b.state,
+    space: plus(a.space, b.space),
+    looped: plus(if a.calls > 0 { plus(a.looped, b.space) } else { zero() }, if b.calls > 0 {
+      plus(a.space, b.looped)
+    } else { zero() }),
+    size: b.size,
+    of: b.of,
+    fun: b.fun,
+    holders: b.holders,
+    number: b.number,
+    read: b.read,
+    calls: a.calls + b.calls,
+    back: concat(a.back, b.back),
+    handed: a.handed && b.handed,
+  }
+
+/// Either branch.
+fn either(a: Walked, b: Walked) -> Walked =
+  {
+    state: merged(a.state, b.state),
+    space: plus(a.space, b.space),
+    looped: plus(a.looped, b.looped),
+    size: match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
+    of: Other,
+    fun: match ((a.fun, b.fun)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None },
+    holders: weaker(part_of(a), part_of(b)),
+    number: a.number && b.number,
+    read: None,
+    calls: max(a.calls, b.calls),
+    back: concat(a.back, b.back),
+    handed: a.handed && b.handed,
+  }
+
+/// A value of `w`'s walk, with nothing of what it is beyond who holds it.
+fn valued(w: Walked, holders: Holders, number: Bool) -> Walked =
+  { ..w, size: None, of: Other, fun: None, holders: holders, number: number, read: None }
+
+// --- The walk -----------------------------------------------------------------------------------
+
+fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} =
+  match c.node {
+    NLit(l) -> Ok(literal(st, l)),
+    NVar(v) ->
+      Ok(match v.slot {
+        Some(k) -> {
+          let s = slot_at(st, k);
+          let moved = c.own == Owned || s.number;
+          {
+            ..none(st),
+            size: s.size,
+            of: s.of,
+            fun: s.fun,
+            number: s.number,
+            holders: if moved { s.holders } else { Many },
+            read: if moved { None } else { Some(k) },
+          }
+        },
+        None -> { ..none(st), fun: fun_named(env, string_of_bytes_lossy(v.name)), holders: Many },
+      }),
+    NLabel(_) -> Ok(none(st)),
+    NUnary(u) -> match walk({ ..env, tail: false }, st, u.operand) {
+      Err(why) -> Err(why),
+      Ok(w) -> Ok({ ..w, of: Other, fun: None, holders: Alone, number: true, read: None }),
+    },
+    NBinary(b) -> binary(env, st, b.op, b.lhs, b.rhs),
+    NIf(i) -> match walk({ ..env, tail: false }, st, i.cond) {
+      Err(why) -> Err(why),
+      Ok(cond) -> match walk(env, cond.state, i.then_branch) {
+        Err(why) -> Err(why),
+        Ok(t) -> match walk(env, cond.state, i.else_branch) {
+          Err(why) -> Err(why),
+          Ok(e) -> Ok(then(cond, either(t, e))),
+        },
+      },
+    },
+    NBlock(b) -> block(env, st, b.stmts, b.tail),
+    NList(l) -> match walked_all(env, st, l.items, |_i: Int| Some(Many)) {
+      Err(why) -> Err(why),
+      Ok(a) ->
+        Ok({
+          ..valued(made(a.walked, constant()), made_of(map(a.all, part_of)), false),
+          size: Some(constant()),
+        }),
+    },
+    NRecord(r) -> match walked_all(env, st, map(r.fields, |f: CodeField| f.value), |_i: Int|
+        Some(Many)) {
+      Err(why) -> Err(why),
+      Ok(a) -> Ok(valued(made(a.walked, constant()), made_of(map(a.all, part_of)), false)),
+    },
+    NField(f) -> match walk({ ..env, tail: false }, st, f.base) {
+      Err(why) -> Err(why),
+      Ok(w) -> Ok(valued({ ..w, state: retain(w.state, w.read, Top) }, Many, false)),
+    },
+    // The written fields are read before the base, as compiled code reads them.
+    NUpdate(u) -> match walked_all(env, st, map(u.sets, |f: CodeField| f.value), |_i: Int|
+        Some(Many)) {
+      Err(why) -> Err(why),
+      Ok(a) -> match walk({ ..env, tail: false }, a.walked.state, u.base) {
+        Err(why) -> Err(why),
+        Ok(b) -> {
+          let base = { ..b, state: retain(b.state, b.read, Top) };
+          Ok(
+            valued(
+              made(then(a.walked, base), constant()),
+              made_of(push(map(a.all, part_of), part_of(b))),
+              false,
+            ),
+          )
+        },
+      },
+    },
+    NMatch(m) -> match walk({ ..env, tail: false }, st, m.scrutinee) {
+      Err(why) -> Err(why),
+      Ok(s) -> {
+        let subject = { ..s, state: retain(s.state, s.read, Top) };
+        match arms(env, subject, m.scrutinee, m.arms) {
+          Err(why) -> Err(why),
+          Ok(a) -> Ok(then(subject, a)),
+        }
+      },
+    },
+    NApp(a) -> application(env, st, a.func, a.args),
+    // A raise ends the call; any other operation runs a handler the bound does not read.
+    NPerform(p) -> if p.effect != b"abort" {
+      Err("an operation whose handler the bound does not read")
+    } else {
+      match walked_all(env, st, p.args, |_i: Int| Some(Many)) {
+        Err(why) -> Err(why),
+        Ok(a) -> Ok(valued(made(a.walked, constant()), Many, false)),
+      }
+    },
+    NLambda(l) -> {
+      let caught = fold(l.captures, st, |s: State, cap: Capture|
+        if cap.own == Owned { s } else { retain(s, Some(cap.src), Many) });
+      let fun = match lambda_walk(
+          env,
+          st,
+          l.params,
+          l.captures,
+          l.body,
+          map(range(0, l.params), |_i: Int| unknown_slot()),
+        ) {
+        Ok(w) -> if w.calls > 0 { None } else { Some(w.space) },
+        Err(_) -> None,
+      };
+      Ok({ ..made(none(caught), constant()), fun: fun, holders: Top })
+    },
+    NCell(_) -> Err("a cell the bound does not read"),
+    NSimulate(_) -> Err("a `simulate` region the bound does not read"),
+    NParallel(_) -> Err("a `parallel` block the bound does not read"),
+    NHandle(_) -> Err("a handler the bound does not read"),
+  }
+
+/// A literal is a constant, held by the program where it is text.
+fn literal(st: State, l: Lit) -> Walked =
+  match l {
+    LInt(_) -> { ..none(st), size: Some(constant()), number: true },
+    LStr(_) -> { ..none(st), size: Some(constant()), holders: Many },
+    LBytes(_) -> { ..none(st), size: Some(constant()), holders: Many },
+    _ -> { ..none(st), number: true },
+  }
+
+/// Each of `cs` walked in turn, a local read and not moved held after as `keeps` says of its place:
+/// once more by what takes it, or not at all.
+fn walked_all(
+  env: Env,
+  st: State,
+  cs: List<Code>,
+  keeps: (Int) -> Option<Holders>,
+) -> Result<{ walked: Walked, all: List<Walked> }, String> / {abort.raise} =
+  fold(
+    range(0, len(cs)),
+    Ok({ walked: none(st), all: [] }),
+    |acc: Result<{ walked: Walked, all: List<Walked> }, String>, i: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(sofar) -> match list_at(cs, i) {
+          None -> acc,
+          Some(c) -> match walk({ ..env, tail: false }, sofar.walked.state, c) {
+            Err(why) -> Err(why),
+            Ok(w) -> {
+              let after = match keeps(i) { Some(h) -> retain(w.state, w.read, h), None -> w.state };
+              Ok({ walked: then(sofar.walked, { ..w, state: after }), all: push(sofar.all, w) })
+            },
+          },
+        },
+      },
+  )
+
+fn binary(
+  env: Env,
+  st: State,
+  op: Bytes,
+  lhs: Code,
+  rhs: Code,
+) -> Result<Walked, String> / {abort.raise} =
+  match walk({ ..env, tail: false }, st, lhs) {
+    Err(why) -> Err(why),
+    Ok(l) -> {
+      let short = op == b"and" || op == b"or";
+      match walk({ ..env, tail: env.tail && short }, l.state, rhs) {
+        Err(why) -> Err(why),
+        Ok(r) -> if op == b"concat" { appended(l, r) }
+        else { Ok({ ..valued(then(l, r), Alone, true), size: arithmetic(op, l.size, r.size) }) },
+      }
+    },
+  }
+
+/// `a ++ b`: in place, where `a` is held once, it grows by what `b` holds; else both are copied.
+fn appended(a: Walked, b: Walked) -> Result<Walked, String> / {abort.raise} =
+  match if a.holders != Many { b.size }
+    else { match ((a.size, b.size)) { (Some(x), Some(y)) -> Some(plus(x, y)), _ -> None } } {
+    None -> Err("an append whose size is not read"),
+    Some(p) ->
+      Ok({
+        ..valued(made(then(a, { ..b, state: retain(b.state, b.read, Top) }), p), if held_alone(a) && held_alone(b) { Alone } else { Top }, false),
+        size: arithmetic(b"concat", a.size, b.size),
+      }),
+  }
+
+fn block(
+  env: Env,
+  st: State,
+  stmts: List<CodeStmt>,
+  tail: Option<Code>,
+) -> Result<Walked, String> / {abort.raise} =
+  match fold(stmts, Ok(none(st)), |acc: Result<Walked, String>, s: CodeStmt|
+      match acc {
+        Err(_) -> acc,
+        Ok(sofar) -> match statement({ ..env, tail: false }, sofar.state, s) {
+          Err(why) -> Err(why),
+          Ok(w) -> Ok(then(sofar, w)),
+        },
+      }) {
+    Err(why) -> Err(why),
+    Ok(ran) -> match tail {
+      None -> Ok(valued(ran, Alone, true)),
+      Some(t) -> match walk(env, ran.state, t) { Err(why) -> Err(why), Ok(w) -> Ok(then(ran, w)) },
+    },
+  }
+
+fn statement(env: Env, st: State, s: CodeStmt) -> Result<Walked, String> / {abort.raise} =
+  match s {
+    CDo(d) -> walk(env, st, d.code),
+    CLet(l) -> match walk(env, st, l.value) {
+      Err(why) -> Err(why),
+      Ok(w) -> Ok({ ..w, state: bind(retain(w.state, w.read, Many), l.slot, slot_of(w)) }),
+    },
+    CLetPat(l) -> match walk(env, st, l.value) {
+      Err(why) -> Err(why),
+      Ok(w) -> {
+        let go = let_go(env, l.value, w);
+        let before = retain(w.state, w.read, Top);
+        let opened = { ..before, credit: credit_after(go, before.credit, l.pat) };
+        Ok(made({ ..w, state: patterned(env, opened, l.pat, w, go) }, rests(l.pat)))
+      },
+    },
+  }
+
+/// Whether compiled code lets a pattern's subject go once its binders hold its fields: where it is
+/// a local's last read, held once, outside a function value.
+fn let_go(env: Env, subject: Code, w: Walked) -> Bool =
+  !env.lambda && subject.own == Owned && !w.number && w.holders != Many
+    && (match subject.node { NVar(v) -> v.slot != None, _ -> false })
+
+/// The cells a let-go subject leaves for the next constructor of its kind to take, where no other
+/// constructor's wait: a constructor with fields leaves them.
+fn credit_after(go: Bool, credit: Option<Bytes>, pat: CodePattern) -> Option<Bytes> =
+  if !go || credit != None { credit }
+  else { match pat { PxCtor(c) -> if len(c.args) > 0 { Some(c.name) } else { None }, _ -> None } }
+
+/// The objects a pattern makes: a list's rest is one of its own.
+fn rests(pat: CodePattern) -> Poly =
+  match pat {
+    PxList(l) ->
+      fold(
+        l.items,
+        if l.rest == None { zero() } else { constant() },
+        |acc: Poly, p: CodePattern| plus(acc, rests(p)),
+      ),
+    PxCtor(c) -> fold(c.args, zero(), |acc: Poly, p: CodePattern| plus(acc, rests(p))),
+    PxRecord(r) -> fold(r.fields, zero(), |acc: Poly, f: CodePatternField| plus(acc, rests(f.pat))),
+    _ -> zero(),
+  }
+
+/// The locals a pattern binds of `subject`: the subject itself where it binds it whole, and its
+/// parts held alone only where the subject was, and was let go.
+fn patterned(
+  env: Env,
+  st: State,
+  pat: CodePattern,
+  subject: Walked,
+  go: Bool,
+) -> State / {abort.raise} =
+  bound(
+    env,
+    st,
+    pat,
+    { ..slot_of(subject), holders: if go || subject.number { subject.holders } else { Many } },
+    if go && subject.holders == Alone { Alone } else { Many },
+  )
+
+fn bound(
+  env: Env,
+  st: State,
+  pat: CodePattern,
+  whole: Slot,
+  parts: Holders,
+) -> State / {abort.raise} =
+  match pat {
+    PxVar(v) -> match v.slot { Some(k) -> bind(st, k, whole), None -> st },
+    PxList(l) -> {
+      let heads = fold(l.items, st, |s: State, p: CodePattern|
+        bound(env, s, p, part(parts, false), parts));
+      match l.rest {
+        None -> heads,
+        Some(r) ->
+          bound(
+            env,
+            heads,
+            r,
+            {
+              ..part(parts, false),
+              size: whole.size,
+              of: if len(l.items) == 0 { whole.of }
+              else { match whole.of { Same(i) -> Part(i), Part(i) -> Part(i), Other -> Other } },
+            },
+            parts,
+          ),
+      }
+    },
+    PxCtor(c) -> {
+      let fields = match ctor(env.cx, string_of_bytes_lossy(c.name)) {
+        Some(k) -> k.variant.fields,
+        None -> [],
+      };
+      fold(range(0, len(c.args)), st, |s: State, i: Int|
+        match list_at(c.args, i) {
+          Some(p) ->
+            bound(
+              env,
+              s,
+              p,
+              part(parts, match list_at(fields, i) { Some(t) -> is_number(t), None -> false }),
+              parts,
+            ),
+          None -> s,
+        })
+    },
+    PxRecord(r) ->
+      fold(r.fields, st, |s: State, f: CodePatternField|
+        bound(env, s, f.pat, part(parts, false), parts)),
+    _ -> st,
+  }
+
+fn part(parts: Holders, number: Bool) -> Slot =
+  { size: None, of: Other, fun: None, holders: if number { Alone } else { parts }, number: number }
+
+/// An arm that takes a head off the list known to be empty is never taken.
+fn needs_head(env: Env, subject: Walked, pat: CodePattern) -> Bool =
+  match ((env.empty, subject.of, pat)) {
+    (Some(p), Same(i), PxList(l)) -> p == i && len(l.items) > 0,
+    _ -> false,
+  }
+
+/// The arm taken, after its guard and every guard before it. An arm with a guard keeps its subject
+/// for the arms after, and one without lets it go.
+fn arms(
+  env: Env,
+  subject: Walked,
+  scrutinee: Code,
+  xs: List<CodeArm>,
+) -> Result<Walked, String> / {abort.raise} =
+  match fold(
+      xs,
+      Ok({ guards: none(subject.state), taken: None }),
+      |acc: Result<{ guards: Walked, taken: Option<Walked> }, String>, arm: CodeArm|
+        match acc {
+          Err(_) -> acc,
+          Ok(sofar) -> if needs_head(env, subject, arm.pat) { acc } else {
+            let go = arm.guard == None && let_go(env, scrutinee, subject);
+            let here = sofar.guards.state;
+            let start = patterned(
+              env,
+              { ..here, credit: credit_after(go, here.credit, arm.pat) },
+              arm.pat,
+              subject,
+              go,
+            );
+            match match arm.guard {
+                None -> Ok(made(none(start), rests(arm.pat))),
+                Some(g) -> match walk({ ..env, tail: false }, start, g) {
+                  Err(why) -> Err(why),
+                  Ok(w) -> Ok(made(w, rests(arm.pat))),
+                },
+              } {
+              Err(why) -> Err(why),
+              Ok(g) -> match walk(env, g.state, arm.body) {
+                Err(why) -> Err(why),
+                Ok(b) -> {
+                  let tried = then(sofar.guards, g);
+                  let path = then(tried, b);
+                  Ok({
+                    guards: if arm.guard == None { sofar.guards } else { tried },
+                    taken: Some(match sofar.taken { None -> path, Some(t) -> either(t, path) }),
+                  })
+                },
+              },
+            }
+          },
+        },
+    ) {
+    Err(why) -> Err(why),
+    Ok(found) -> Ok(match found.taken { Some(w) -> w, None -> none(subject.state) }),
+  }
+
+// --- Calls --------------------------------------------------------------------------------------
+
+fn application(
+  env: Env,
+  st: State,
+  func: Code,
+  args: List<Code>,
+) -> Result<Walked, String> / {abort.raise} =
+  match func.node {
+    NVar(f) -> match f.slot {
+      Some(k) -> match walked_all(env, st, args, |_i: Int| Some(Many)) {
+        Err(why) -> Err(why),
+        Ok(a) -> match slot_at(a.walked.state, k).fun {
+          Some(p) -> Ok(valued(made(a.walked, p), Many, false)),
+          None -> Err("a call of a function value whose space is not read"),
+        },
+      },
+      None -> {
+        let name = string_of_bytes_lossy(f.name);
+        if name == env.own { called_back(env, st, args) }
+        else if ctor(env.cx, name) != None { built(env, st, f.name, args) }
+        else if map_contains(env.cx.claims.defs, name) { called(env, st, name, args) }
+        else { builtin(env, st, name, args) }
+      },
+    },
+    NLambda(l) -> match walked_all(env, st, args, |_i: Int| Some(Many)) {
+      Err(why) -> Err(why),
+      Ok(a) -> match lambda_walk(
+          env,
+          a.walked.state,
+          l.params,
+          l.captures,
+          l.body,
+          map(a.all, |w: Walked| { ..slot_of(w), of: Other, holders: part_of(w) }),
+        ) {
+        Err(why) -> Err(why),
+        Ok(w) -> if w.calls > 0 { Err("a call back inside a function value") }
+        else { Ok(valued(made(a.walked, plus(constant(), w.space)), part_of(w), w.number)) },
+      },
+    },
+    _ -> Err("a call of a computed function the bound does not read"),
+  }
+
+/// A call back into the definition being read: a frame of its own unless it is a tail call, which
+/// compiled code makes a jump.
+fn called_back(env: Env, st: State, args: List<Code>) -> Result<Walked, String> / {abort.raise} =
+  if env.lambda { Err("a call back inside a function value") } else {
+    match walked_all(env, st, args, |_i: Int| Some(Many)) {
+      Err(why) -> Err(why),
+      Ok(a) -> {
+        let frame = if env.tail { zero() } else { constant() };
+        let handed = fold(range(0, len(a.all)), true, |ok: Bool, i: Int|
+          ok
+            && (at_or(env.numbers, i)
+            || (match list_at(a.all, i) { Some(w) -> held_alone(w), None -> false })));
+        Ok(
+          then(a.walked, {
+            ..none(a.walked.state),
+            space: frame,
+            looped: frame,
+            holders: Many,
+            calls: 1,
+            back: [map(a.all, |w: Walked| w.of)],
+            handed: handed,
+          }),
+        )
+      },
+    }
+  }
+
+/// A constructor with fields takes the cells a `match` left of one like it, or is a new object.
+fn built(
+  env: Env,
+  st: State,
+  name: Bytes,
+  args: List<Code>,
+) -> Result<Walked, String> / {abort.raise} =
+  match walked_all(env, st, args, |_i: Int| Some(Many)) {
+    Err(why) -> Err(why),
+    Ok(a) -> {
+      let now = a.walked.state;
+      let reused = len(args) > 0 && now.credit == Some(name);
+      Ok(
+        valued(
+          made(
+            { ..a.walked, state: if reused { { ..now, credit: None } } else { now } },
+            if len(args) == 0 || reused { zero() } else { constant() },
+          ),
+          made_of(map(a.all, part_of)),
+          false,
+        ),
+      )
+    },
+  }
+
+/// A call of a definition holds its space at the sizes of its arguments: as read with them held
+/// alone where each is, and else with them held anywhere.
+fn called(
+  env: Env,
+  st: State,
+  name: String,
+  args: List<Code>,
+) -> Result<Walked, String> / {abort.raise} = {
+  let numbers = numbers_of(env.cx, name, len(args));
+  let numeric = answers_number(env.cx, name);
+  match walked_all(env, st, args, |_i: Int| if numeric { None } else { Some(Many) }) {
+    Err(why) -> Err(why),
+    Ok(a) -> {
+      let alone_all = fold(range(0, len(a.all)), true, |ok: Bool, i: Int|
+        ok
+          && (at_or(numbers, i)
+          || (match list_at(a.all, i) { Some(w) -> held_alone(w), None -> false })));
+      match map_get(env.known, name) {
+        None -> Err("`" ++ name ++ "` reaches definitions that call each other"),
+        Some(k) -> match spent_for(k, alone_all) {
+          Err(why) -> Err(why),
+          Ok(s) -> match at_args(
+              s.space,
+              map(a.all, |w: Walked| w.size),
+              map(a.all, |w: Walked| w.fun),
+            ) {
+            Err(why) -> Err(why),
+            Ok(q) ->
+              Ok(valued(made(a.walked, q), if numeric { Alone } else { s.holders }, numeric)),
+          },
+        },
+      }
+    },
+  }
+}
+
+/// The space one call of a definition or constructor named as a value holds, handed values held
+/// anywhere, where it grows with nothing it is given.
+fn fun_named(env: Env, name: String) -> Option<Poly> =
+  if ctor(env.cx, name) != None { Some(constant()) } else {
+    match map_get(env.known, name) {
+      Some(k) -> match k.anyhow {
+        Ok(s) -> match at_args(s.space, [], []) { Ok(q) -> Some(q), Err(_) -> None },
+        Err(_) -> None,
+      },
+      None -> None,
+    }
+  }
+
+/// A function value's body, its parameters as `params` and what it captured held by it as well.
+fn lambda_walk(
+  env: Env,
+  outer: State,
+  params: Int,
+  captures: List<Capture>,
+  body: Code,
+  slots: List<Slot>,
+) -> Result<Walked, String> / {abort.raise} = {
+  let start = fold(range(0, params), { slots: [], credit: None }, |s: State, i: Int|
+    bind(s, i, match list_at(slots, i) { Some(x) -> x, None -> unknown_slot() }));
+  let captured = fold(captures, start, |s: State, cap: Capture| {
+    let from = slot_at(outer, cap.src);
+    bind(s, cap.dst, { ..from, holders: if from.number { Alone } else { Many } })
+  });
+  walk({ ..env, lambda: true, tail: false, empty: None }, captured, body)
+}
+
+// --- Builtins -----------------------------------------------------------------------------------
+
+/// What each builtin answers, by name.
+fn answers_of_builtins() -> Map<String, Answer> / {abort.raise} =
+  fold(builtins(), map_new(), |m: Map<String, Answer>, b: Builtin|
+    map_insert(m, string_of_bytes_lossy(b.name), match b.scheme.ty {
+      TyFn(f) -> answer_of(f.ret),
+      other -> answer_of(other),
+    }))
+
+fn answer_of(t: Type) -> Answer =
+  match t {
+    TyCon(c) -> if len(c.args) == 0 && is_number_name(string_of_bytes_lossy(c.name)) { ANumber }
+    else if c.name == b"Option" && len(c.args) == 1 {
+      match list_at(c.args, 0) {
+        Some(x) -> if answer_of(x) == ANumber { AOptionNumber } else { AValue },
+        None -> AValue,
+      }
+    } else { AValue },
+    TyRecord(fs) -> if len(fs) == 0 { ANumber } else { AValue },
+    _ -> AValue,
+  }
+
+fn is_number_name(n: String) -> Bool =
+  contains(
+    [
+      "Int",
+      "Bool",
+      "Float",
+      "Char",
+      "Decimal",
+      "Unit",
+      "Ordering",
+      "U8",
+      "U16",
+      "U32",
+      "U64",
+      "U128",
+      "I8",
+      "I16",
+      "I32",
+      "I64",
+      "I128",
+    ],
+    n,
+  )
+
+fn is_number(t: Ty) -> Bool =
+  match t {
+    Con(n, args) -> len(args) == 0 && is_number_name(n),
+    Record(fs) -> len(fs) == 0,
+    _ -> false,
+  }
+
+/// Which of `def`'s first `n` parameters are numbers, by its signature.
+fn numbers_of(cx: Context, def: String, n: Int) -> List<Bool> =
+  match signature(cx, def) {
+    Some(s) -> match s.ty {
+      Fn(ps, _, _) ->
+        map(range(0, n), |i: Int| match list_at(ps, i) { Some(t) -> is_number(t), None -> false }),
+      _ -> map(range(0, n), |_i: Int| false),
+    },
+    None -> map(range(0, n), |_i: Int| false),
+  }
+
+fn answers_number(cx: Context, def: String) -> Bool =
+  match signature(cx, def) {
+    Some(s) -> match s.ty { Fn(_, ret, _) -> is_number(ret), other -> is_number(other) },
+    None -> false,
+  }
+
+fn at_or(xs: List<Bool>, i: Int) -> Bool = match list_at(xs, i) { Some(x) -> x, None -> false }
+
+/// The builtins that answer their first argument updated: in place where it is held once.
+fn updates(name: String) -> Bool =
+  name == "push" || name == "list_set" || name == "array_set" || name == "columns_set"
+    || name == "map_insert"
+    || name == "map_remove"
+    || name == "map_update"
+    || name == "map_pop_first"
+    || name == "map_pop_last"
+    || name == "map_split"
+
+/// The builtins whose answer shares what their first argument holds: an element of it, or all of
+/// them in another collection or in a call of a function.
+fn reads_parts(name: String) -> Bool =
+  name == "list_at" || name == "array_at" || name == "array_get" || name == "columns_at"
+    || name == "columns_get"
+    || name == "map_get"
+    || name == "map_first"
+    || name == "map_last"
+    || name == "map_floor"
+    || name == "map_ceiling"
+    || name == "map_below"
+    || name == "map_above"
+    || name == "map_range"
+    || name == "map_keys"
+    || name == "map_values"
+    || name == "map_entries"
+    || name == "array_of_list"
+    || name == "array_to_list"
+    || name == "columns_of_list"
+    || name == "columns_to_list"
+    || name == "map"
+    || name == "filter"
+    || name == "fold"
+    || name == "map_fold"
+
+/// How an argument a builtin reads without moving is held after the call: not at all where the
+/// answer holds nothing of it, by parts where the answer shares them, and else whole.
+fn kept_by(name: String, answer: Answer, i: Int) -> Option<Holders> =
+  if answer != AValue || name == "bytes_concat" || name == "string_concat" || name == "bytes_slice"
+      || name == "string_slice" { None }
+  else if i == 0 && updates(name) { None }
+  else if i == 0 && reads_parts(name) { Some(Top) }
+  else { Some(Many) }
+
+fn builtin(
+  env: Env,
+  st: State,
+  name: String,
+  args: List<Code>,
+) -> Result<Walked, String> / {abort.raise} =
+  match map_get(env.answers, name) {
+    None -> Err("`" ++ name ++ "` has no body here to read"),
+    Some(answer) -> match walked_all(env, st, args, |i: Int| kept_by(name, answer, i)) {
+      Err(why) -> Err(why),
+      Ok(a) -> match made_by(env, name, answer, args, a.walked.state, a.all) {
+        Err(why) -> Err(why),
+        Ok(m) -> Ok({ ..valued(made(a.walked, m.space), m.holders, m.number), size: m.size }),
+      },
+    },
+  }
+
+/// What a builtin's own call makes, who else holds its answer, and the answer's size.
+type Made = { space: Poly, holders: Holders, number: Bool, size: Option<Poly> }
+
+fn object(space: Poly, holders: Holders, size: Option<Poly>) -> Result<Made, String> =
+  Ok({ space: space, holders: holders, number: false, size: size })
+
+/// `s` and `extra`, where the size `s` is read.
+fn over(name: String, s: Option<Poly>, extra: Poly) -> Result<Poly, String> =
+  match s {
+    Some(p) -> Ok(plus(p, extra)),
+    None -> Err("`" ++ name ++ "` over a value whose size is not read"),
+  }
+
+/// An update of the first argument: in place, making `extra`, where it is held once; else a copy of
+/// it too.
+fn updated(
+  name: String,
+  first: Walked,
+  extra: Poly,
+  parts: Holders,
+  size: Option<Poly>,
+) -> Result<Made, String> =
+  if !first.number && first.holders != Many { object(extra, made_of([first.holders, parts]), size) }
+  else {
+    match over(name, first.size, extra) { Ok(p) -> object(p, Top, size), Err(why) -> Err(why) }
+  }
+
+/// A new value as large as the first argument, and `extra` beside.
+fn as_large(name: String, first: Walked, extra: Poly, holders: Holders) -> Result<Made, String> =
+  match over(name, first.size, extra) {
+    Ok(p) -> object(p, holders, first.size),
+    Err(why) -> Err(why),
+  }
+
+/// Each call of the function at `position`, `times` over.
+fn iterated(
+  env: Env,
+  st: State,
+  args: List<Code>,
+  times: Option<Poly>,
+  position: Int,
+  params: List<Slot>,
+) -> Result<Poly, String> / {abort.raise} =
+  match times {
+    None -> Err("an iteration over a value whose size is not read"),
+    Some(n) -> match callback(env, st, args, position, params) {
+      Err(why) -> Err(why),
+      Ok(cb) -> product(n, cb.space),
+    },
+  }
+
+fn number_slot() -> Slot = { ..unknown_slot(), holders: Alone, number: true }
+
+/// What a builtin's own call makes once its arguments are walked, each function it is handed called
+/// as many times as an argument's size allows.
+fn made_by(
+  env: Env,
+  name: String,
+  answer: Answer,
+  args: List<Code>,
+  st: State,
+  all: List<Walked>,
+) -> Result<Made, String> / {abort.raise} = {
+  let arg = |i: Int| match list_at(all, i) { Some(w) -> w, None -> none(st) };
+  let grown = match arg(0).size { Some(s) -> Some(plus(s, constant())), None -> None };
+  if name == "map" || name == "filter" {
+    match iterated(env, st, args, arg(0).size, 1, [unknown_slot()]) {
+      Err(why) -> Err(why),
+      Ok(p) -> as_large(name, arg(0), p, Top),
+    }
+  } else if name == "fold" || name == "map_fold" { folded(env, name, st, all, args) }
+  else if name == "iterate" {
+    match iterated(env, st, args, arg(1).size, 2, [unknown_slot()]) {
+      Err(why) -> Err(why),
+      Ok(p) -> object(p, Many, None),
+    }
+  } else if name == "bytes_position" {
+    match iterated(
+        env,
+        st,
+        args,
+        match ((arg(0).size, arg(1).size)) { (Some(b), Some(f)) -> Some(plus(b, f)), _ -> None },
+        2,
+        [number_slot()],
+      ) {
+      Err(why) -> Err(why),
+      Ok(p) -> Ok({ space: p, holders: Alone, number: true, size: None }),
+    }
+  } else if name == "metered" {
+    match iterated(env, st, args, Some(constant()), 0, []) {
+      Err(why) -> Err(why),
+      Ok(p) -> object(plus(constant(), p), Top, None),
+    }
+  } else if name == "map_update" {
+    let value = {
+      ..unknown_slot(),
+      holders: if !arg(0).number && arg(0).holders == Alone { Alone } else { Many },
+    };
+    match iterated(env, st, args, Some(constant()), 2, [value]) {
+      Err(why) -> Err(why),
+      Ok(p) -> updated(name, arg(0), plus(constant(), p), Top, arg(0).size),
+    }
+  } else if answer == ANumber {
+    Ok({
+      space: zero(),
+      holders: Alone,
+      number: true,
+      size: if is_length(name) { arg(0).size } else { None },
+    })
+  } else if answer == AOptionNumber { object(constant(), Alone, None) }
+  else if name == "push" { updated(name, arg(0), constant(), part_of(arg(1)), grown) }
+  else if name == "map_insert" {
+    updated(name, arg(0), constant(), made_of([part_of(arg(1)), part_of(arg(2))]), grown)
+  } else if name == "list_set" || name == "array_set" || name == "columns_set" {
+    updated(name, arg(0), zero(), part_of(arg(2)), arg(0).size)
+  } else if name == "map_remove" { updated(name, arg(0), constant(), Alone, arg(0).size) }
+  else if name == "map_pop_first" || name == "map_pop_last" {
+    updated(name, arg(0), constant(), Top, None)
+  } else if name == "map_split" { as_large(name, arg(0), constant(), Top) }
+  else if name == "bytes_concat" || name == "string_concat" {
+    match appended(arg(0), arg(1)) {
+      Err(why) -> Err(why),
+      Ok(w) -> Ok({ space: w.space, holders: w.holders, number: false, size: w.size }),
+    }
+  } else if name == "range" {
+    match ((arg(0).size, arg(1).size)) {
+      (Some(lo), Some(hi)) -> object(plus(lo, hi), Alone, Some(plus(lo, hi))),
+      _ -> Err("`range` over a value whose size is not read"),
+    }
+  } else if name == "map_new" { object(constant(), Alone, Some(constant())) }
+  else if name == "array_new" || name == "columns_new" {
+    as_large(name, arg(0), zero(), made_of([part_of(arg(1))]))
+  } else if name == "array_of_list" || name == "array_to_list" || name == "columns_of_list"
+      || name == "columns_to_list"
+      || name == "map_keys"
+      || name == "map_values"
+      || name == "map_entries"
+      || name == "map_of_entries"
+      || name == "map_range" { as_large(name, arg(0), constant(), Top) }
+  else if name == "string_chars" || name == "string_of_chars" || name == "string_trim"
+      || name == "string_lower"
+      || name == "string_upper"
+      || name == "bytes_of_string"
+      || name == "string_of_bytes"
+      || name == "string_of_bytes_lossy"
+      || name == "string_slice"
+      || name == "bytes_gzip" { as_large(name, arg(0), constant(), Alone) }
+  else if name == "string_split" || name == "bytes_split" {
+    match over(name, arg(0).size, constant()) {
+      Ok(p) -> object(p, Alone, Some(p)),
+      Err(why) -> Err(why),
+    }
+  } else if name == "map_merge" {
+    match ((arg(0).size, arg(1).size)) {
+      (Some(x), Some(y)) -> object(plus(plus(x, y), constant()), Top, Some(plus(x, y))),
+      _ -> Err("`map_merge` over a value whose size is not read"),
+    }
+  } else if name == "bytes_slice" {
+    // A view of what it slices, or a short copy; either is copied to grow.
+    object(constant(), Many, arg(0).size)
+  } else if name == "int_to_string" || name == "float_to_string" || name == "decimal_to_string"
+      || name == "u128_to_string"
+      || name == "i128_to_string"
+      || name == "bytes_blake3"
+      || name == "digest" { object(constant(), Alone, Some(constant())) }
+  else if name == "byte_of_int" { object(zero(), Many, Some(constant())) }
+  else if name == "list_at" || name == "array_at" || name == "columns_at" || name == "map_get"
+      || name == "map_first"
+      || name == "map_last"
+      || name == "map_floor"
+      || name == "map_ceiling"
+      || name == "map_below"
+      || name == "map_above"
+      || name == "checked_add"
+      || name == "checked_sub"
+      || name == "checked_mul"
+      || name == "checked_neg"
+      || name == "columns_get" { object(constant(), Top, None) }
+  else if name == "array_get" { object(zero(), Many, None) }
+  else if name == "min" || name == "max" {
+    Ok({
+      space: zero(),
+      holders: weaker(part_of(arg(0)), part_of(arg(1))),
+      number: arg(0).number && arg(1).number,
+      size: None,
+    })
+  } else if name == "observe" {
+    Ok({ space: zero(), holders: part_of(arg(0)), number: arg(0).number, size: arg(0).size })
+  } else if name == "numeric_of_int" || name == "wrap_add" || name == "wrap_sub"
+      || name == "wrap_mul"
+      || name == "saturating_add"
+      || name == "saturating_sub"
+      || name == "saturating_mul"
+      || name == "rotr"
+      || name == "rotl" { Ok({ space: zero(), holders: Alone, number: true, size: None }) }
+  else if name == "panic" { object(constant(), Many, None) }
+  else { Err("`" ++ name ++ "` holds what the bound does not read") }
+}
+
+/// A fold: its first call is handed the seed, and each after it what the one before answered, so
+/// only the first copies a seed something else holds.
+fn folded(
+  env: Env,
+  name: String,
+  st: State,
+  all: List<Walked>,
+  args: List<Code>,
+) -> Result<Made, String> / {abort.raise} = {
+  let seed = match list_at(all, 1) { Some(w) -> w, None -> none(st) };
+  let others = if name == "fold" { [unknown_slot()] } else { [unknown_slot(), unknown_slot()] };
+  let number = seed.number;
+  match match list_at(all, 0) { Some(w) -> w.size, None -> None } {
+    None -> Err("an iteration over a value whose size is not read"),
+    Some(n) -> match callback(
+        env,
+        st,
+        args,
+        2,
+        concat([{ ..slot_of(seed), of: Other, holders: part_of(seed) }], others),
+      ) {
+      Err(why) -> Err(why),
+      Ok(first) -> match steadied(env, st, args, others, first.holders, number && first.number, 3) {
+        Err(why) -> Err(why),
+        Ok(rest) -> match product(n, rest.space) {
+          Err(why) -> Err(why),
+          Ok(p) ->
+            Ok({
+              space: plus(first.space, p),
+              holders: weaker(part_of(seed), rest.holders),
+              number: number && first.number,
+              size: None,
+            }),
+        },
+      },
+    },
+  }
+}
+
+/// A fold's callback read with its accumulator held as what the callback answers is, which a more
+/// widely held answer widens until they agree.
+fn steadied(
+  env: Env,
+  st: State,
+  args: List<Code>,
+  others: List<Slot>,
+  holders: Holders,
+  number: Bool,
+  tries: Int,
+) -> Result<{ space: Poly, holders: Holders, number: Bool }, String> / {abort.raise} =
+  match callback(
+      env,
+      st,
+      args,
+      2,
+      concat([{ ..unknown_slot(), holders: holders, number: number }], others),
+    ) {
+    Err(why) -> Err(why),
+    Ok(cb) -> if weaker(holders, cb.holders) == holders || tries <= 0 {
+      Ok({ ..cb, holders: weaker(holders, cb.holders) })
+    } else { steadied(env, st, args, others, weaker(holders, cb.holders), number, tries - 1) },
+  }
+
+/// What one call of a builtin's callback holds and answers, its parameters as `params`.
+fn callback(
+  env: Env,
+  outer: State,
+  args: List<Code>,
+  position: Int,
+  params: List<Slot>,
+) -> Result<{ space: Poly, holders: Holders, number: Bool }, String> / {abort.raise} =
+  match list_at(args, position) {
+    None -> Err("a builtin called without its callback"),
+    Some(cb) -> match cb.node {
+      NLambda(l) -> match lambda_walk(env, outer, l.params, l.captures, l.body, params) {
+        Err(why) -> Err(why),
+        Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") }
+        else { Ok({ space: w.space, holders: part_of(w), number: w.number }) },
+      },
+      NVar(f) -> match f.slot {
+        Some(k) -> match slot_at(outer, k).fun {
+          Some(p) -> Ok({ space: p, holders: Many, number: false }),
+          None -> Err("a callback whose space is not read"),
+        },
+        None -> {
+          let name = string_of_bytes_lossy(f.name);
+          if ctor(env.cx, name) != None { Ok({ space: constant(), holders: Top, number: false }) }
+          else if name == env.own { Err("a call back inside an iteration") } else {
+            match map_get(env.known, name) {
+              None -> Err("a callback the bound does not read"),
+              Some(k) -> match k.anyhow {
+                Err(why) -> Err(why),
+                Ok(s) -> match at_args(
+                    s.space,
+                    map(params, |_p: Slot| None),
+                    map(params, |_p: Slot| None),
+                  ) {
+                  Err(why) -> Err(why),
+                  Ok(q) ->
+                    Ok({ space: q, holders: s.holders, number: answers_number(env.cx, name) }),
+                },
+              },
+            }
+          }
+        },
+      },
+      _ -> Err("a callback the bound does not read"),
+    },
+  }
+
+// --- Tests ---------------------------------------------------------------------------------------
+
+/// The space of `m.<def>` against its first `space` clause: `Ok(true)` where the clause is shown.
+fn shown(src: Bytes, def: String) -> Result<Bool, String> / {abort.raise} = {
+  let cx = cx_owning([{ name: b"m", src: src }], |_m: Bytes| true);
+  match map_get(cx.claims.defs, "m." ++ def) {
+    None -> panic("a definition of the fixture"),
+    Some(d) -> match filter(d.spec, |c: ClaimClause| c.kind == SSpace) {
+      [c, ..] -> match c.clause.code {
+        None -> panic("a lowered bound"),
+        Some(b) -> match stated_space(b, d.params) {
+          None -> Err("the bound is not read"),
+          Some(bound) -> match space(cx, "m." ++ def) {
+            Err(why) -> Err(why),
+            Ok(p) -> Ok(dominated(p, bound)),
+          },
+        },
+      },
+      [] -> panic("a `space` clause"),
+    },
+  }
+}
+
+test "a fold that makes nothing holds no space, and a map holds a list as long as the one it maps" {
+  assert_eq(
+    shown(b"fn f(xs: List<Int>) -> Int space 0 = fold(xs, 0, |a: Int, x: Int| a + x)", "f"),
+    Ok(true),
+  );
+  assert_eq(
+    shown(b"fn f(xs: List<Int>) -> List<Int> space 0 = map(xs, |x: Int| x + 1)", "f"),
+    Ok(false),
+  );
+  assert_eq(
+    shown(b"fn f(xs: List<Int>) -> List<Int> space len(xs) = map(xs, |x: Int| x + 1)", "f"),
+    Ok(true),
+  )
+}
+
+fn chain() -> Bytes = b"type Chain = | Link(Int, Chain) | End\n"
+
+test "a tail call back that builds what its match let go of holds nothing more" {
+  assert_eq(
+    shown(
+      bytes_concat(
+        chain(),
+        b"fn rev(xs: Chain, acc: Chain) -> Chain space 0 = match xs { End -> acc, Link(x, rest) -> rev(rest, Link(x, acc)) }",
+      ),
+      "rev",
+    ),
+    Ok(true),
+  );
+  // Two links built for one let go: the second is new on every call.
+  assert_eq(
+    shown(
+      bytes_concat(
+        chain(),
+        b"fn twice(xs: Chain, acc: Chain) -> Chain space 0 = match xs { End -> acc, Link(x, rest) -> twice(rest, Link(x, Link(x, acc))) }",
+      ),
+      "twice",
+    ),
+    Err("`m.twice` does not call itself on a part of one list parameter every time"),
+  );
+  // A subject read again after its match is not let go.
+  assert_eq(
+    shown(
+      bytes_concat(
+        chain(),
+        b"fn other(a: Chain, b: Chain) -> Chain = a\nfn kept(xs: Chain, acc: Chain) -> Chain space 0 = match xs { End -> acc, Link(x, rest) -> kept(rest, Link(x, other(acc, xs))) }",
+      ),
+      "kept",
+    ),
+    Err("`m.kept` hands itself a value something else holds"),
+  )
+}
+
+test "an update of an array held alone is in place, and of one read after it a copy" {
+  assert_eq(
+    shown(
+      b"fn fill(a: Array<Int>, i: Int, n: Int) -> Array<Int> / {abort.raise} space 0 = if i >= n { a } else { fill(array_set(a, i, 0), i + 1, n) }",
+      "fill",
+    ),
+    Ok(true),
+  );
+  let copy = |bound: Bytes|
+    shown(
+      bytes_concat_all([
+        b"fn copy(a: Array<Int>) -> Int / {abort.raise} space ",
+        bound,
+        b" = { let b = array_set(a, 0, 1); array_len(a) + array_len(b) }",
+      ]),
+      "copy",
+    );
+  assert_eq(copy(b"0"), Ok(false));
+  assert_eq(copy(b"array_len(a)"), Ok(true))
+}
+
+test "a call back that is no tail call holds a frame for each" {
+  let count = |bound: Bytes|
+    shown(
+      bytes_concat_all([
+        b"fn count(xs: List<Int>) -> Int space ",
+        bound,
+        b" = match xs { [] -> 0, [_, ..rest] -> 1 + count(rest) }",
+      ]),
+      "count",
+    );
+  assert_eq(count(b"0"), Ok(false));
+  assert_eq(count(b"len(xs)"), Ok(true))
+}
+
+test "a fold's first call alone copies a seed something else holds" {
+  let grow = b"fn grow(xs: List<Int>, ys: List<Int>) -> List<Int> space len(ys) = fold(ys, xs, |a: List<Int>, y: Int| push(a, y))\n";
+  assert_eq(shown(grow, "grow"), Ok(true));
+  let shared = |bound: Bytes|
+    shown(
+      bytes_concat_all([
+        grow,
+        b"fn shared(xs: List<Int>, ys: List<Int>) -> Int space ",
+        bound,
+        b" = len(grow(xs, ys)) + len(xs)",
+      ]),
+      "shared",
+    );
+  assert_eq(shared(b"len(ys)"), Ok(false));
+  assert_eq(shared(b"len(xs) + len(ys)"), Ok(true))
+}
+
+test "another package's definition holds what its `space` bound says, for arguments held alone" {
+  let cx = cx_owning(
+    [
+      {
+        name: b"base",
+        src: b"pub fn ones(xs: List<Int>) -> List<Int> space len(xs) = map(xs, |_x: Int| 1)\n",
+      },
+      {
+        name: b"app",
+        src: b"import base\nfn f(xs: List<Int>) -> List<Int> = base::ones(xs)\nfn g(xs: List<Int>) -> Int = len(base::ones(xs)) + len(xs)\n",
+      },
+    ],
+    |m: Bytes| m == b"app",
+  );
+  assert_eq(space(cx, "app.f"), Ok([map_insert(map_new(), 0, 1)]));
+  assert_eq(
+    space(cx, "app.g"),
+    Err(
+      "`base.ones` is handed a value something else holds, and its `space` bound is for arguments held alone",
+    ),
+  )
+}

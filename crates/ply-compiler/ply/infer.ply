@@ -12,7 +12,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder, Constraint,
               Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow, is_predicate,
-              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
+              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
               NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin, deriver_bin,
@@ -1203,6 +1203,7 @@ fn contract_of(
         SRequires -> concat(acc, conjuncts(source, c.expr)),
         SEnsures -> acc,
         SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
+        SSpace -> panic(misdeclared(b"states a `space`", def.name.name)),
       }),
     ensures: fold(def.spec, [], |acc: List<Clause>, c: SpecClause|
       match c.kind { SEnsures -> push(acc, written_clause(source, c.expr)), _ -> acc }),
@@ -1723,6 +1724,10 @@ fn unknown_name_here(checker: Checker, qname: QName) -> Checker / {abort.raise} 
       Some(SCost) ->
         [
           b"`result` is bound only in an `ensures`: a `cost` bound is over the parameters a call is given",
+        ],
+      Some(SSpace) ->
+        [
+          b"`result` is bound only in an `ensures`: a `space` bound is over the parameters a call is given",
         ],
       _ -> [],
     }
@@ -10093,18 +10098,20 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
 }
 
 /// A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
-/// it is read from the body, whose steps a handler of anything but a raise could change. A row
-/// variable is what a function parameter performs, whose steps its cost name stands for.
+/// a bound on its steps or its space is read from the body, which a handler of anything but a raise
+/// could change. A row variable is what a function parameter performs, whose steps its cost name
+/// stands for.
 fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort.raise} = {
   let row = resolve_row_in(checker, sig.published_row);
   let diverges = fold(row.atoms, false, |found: Bool, a: Atom| found || is_diverges(a));
   let performs = len(run_needs(row.atoms)) > 0;
   let written = match def.effects { Some(r) -> r.span, None -> def.name.span };
   fold(
-    filter(def.spec, |c: SpecClause| c.kind == SCost),
+    filter(def.spec, |c: SpecClause| c.kind == SCost || c.kind == SSpace),
     checker,
-    |c: Checker, clause: SpecClause|
-      if diverges {
+    |c: Checker, clause: SpecClause| {
+      let what = if clause.kind == SCost { b"steps" } else { b"space" };
+      if diverges && clause.kind == SCost {
         report(
           c,
           error_with_labels(
@@ -10129,18 +10136,25 @@ fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort
             bytes_concat_all([
               b"`",
               def.name.name,
-              b"` bounds its steps, and performs more than a raise",
+              b"` bounds its ",
+              what,
+              b", and performs more than a raise",
             ]),
             [
               label_at(c.module, clause.span, true, b"this bound is proved from the body alone"),
               label_at(c.module, written, false, b"its row is written here"),
             ],
             [
-              b"a handler could change the steps a call takes, so only a definition that performs nothing but raises states a bound",
+              bytes_concat_all([
+                b"a handler could change the ",
+                what,
+                b" a call takes, so only a definition that performs nothing but raises states a bound",
+              ]),
             ],
           ),
         )
-      } else { c },
+      } else { c }
+    },
   )
 }
 
@@ -11221,13 +11235,22 @@ fn ungeneratable_within(
       first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
   }
 
-type SpecSite = | InRequires | InEnsures | InCost | SSDecreases | InWhere | InLawBody | InSchemaBody
+type SpecSite =
+  | InRequires
+  | InEnsures
+  | InCost
+  | InSpace
+  | SSDecreases
+  | InWhere
+  | InLawBody
+  | InSchemaBody
 
 fn site_phrase(s: SpecSite) -> Bytes =
   match s {
     InRequires -> b"a `requires` clause",
     InEnsures -> b"an `ensures` clause",
     InCost -> b"a `cost` bound",
+    InSpace -> b"a `space` bound",
     SSDecreases -> b"a `decreases` measure",
     InWhere -> b"a `where` guard",
     InLawBody -> b"a law body",
@@ -11239,6 +11262,7 @@ fn site_short(s: SpecSite) -> Bytes =
     InRequires -> b"`requires`",
     InEnsures -> b"`ensures`",
     InCost -> b"`cost` bound",
+    InSpace -> b"`space` bound",
     SSDecreases -> b"`decreases` measure",
     InWhere -> b"`where` guard",
     InLawBody -> b"law body",
@@ -11458,6 +11482,7 @@ fn check_clause(
   let with_result: Checker = match clause.kind {
     SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), monomorphic(env.ret)) },
     SRequires -> bound,
+    SSpace -> bound,
     // A cost name is the steps one call of its parameter takes.
     SCost ->
       fold(def.params, bound, |c: Checker, param: Param|
@@ -11471,7 +11496,8 @@ fn check_clause(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
-      walking: if clause.kind == SCost { unlowered() } else { with_result.walking },
+      walking: if clause.kind == SCost || clause.kind == SSpace { unlowered() }
+      else { with_result.walking },
     },
     clause.expr,
   );
@@ -11490,6 +11516,14 @@ fn check_clause(
         o.ty,
         b"a `cost` bound is an `Int`",
       ).checker,
+    SSpace ->
+      expect(
+        popped,
+        expr_span(clause.expr),
+        int_type(),
+        o.ty,
+        b"a `space` bound is an `Int`",
+      ).checker,
     _ ->
       expect(
         popped,
@@ -11503,7 +11537,12 @@ fn check_clause(
   {
     checker: check_spec_purity(
       { ..c1, assumed: checker.assumed },
-      match clause.kind { SRequires -> InRequires, SEnsures -> InEnsures, SCost -> InCost },
+      match clause.kind {
+        SRequires -> InRequires,
+        SEnsures -> InEnsures,
+        SCost -> InCost,
+        SSpace -> InSpace,
+      },
       [],
       clause.span,
       row,
@@ -11546,10 +11585,7 @@ fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
 /// `result` is introduced beside the parameters, so a definition that has both is reported.
 fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
   match fold(def.spec, None, |acc: Option<Span>, c: SpecClause|
-      match acc {
-        Some(_) -> acc,
-        None -> match c.kind { SEnsures -> Some(c.span), SRequires -> None, SCost -> None },
-      }) {
+      match acc { Some(_) -> acc, None -> match c.kind { SEnsures -> Some(c.span), _ -> None } }) {
     None -> checker,
     Some(ensures) ->
       fold(def.params, checker, |c: Checker, param: Param|
