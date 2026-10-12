@@ -3,11 +3,10 @@
 
 use crate::{
     Carry, CtorCarries, DefHash, Diagnostic, Footprint, HashOutput, Mode, Severity, SourceId, Span,
-    Symbol, codes,
+    Symbol,
 };
 use indexmap::IndexMap;
 use std::fmt;
-use std::path::Path;
 
 /// One keyable item of a module, in source order: what the backend's cache keys are minted from.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -220,47 +219,9 @@ impl ModuleName {
         self.0.as_str().is_empty()
     }
 
-    /// Every directory component and the file stem must be a Ply identifier.
-    pub fn from_relative_path(path: &Path) -> Result<ModuleName, Diagnostic> {
-        let invalid = |what: &str| {
-            Diagnostic::error(
-                codes::INVALID_MODULE_PATH,
-                format!("`{}` cannot be a module: {what}", path.display()),
-            )
-            .primary(Span::DUMMY, "this file is not addressable as a module")
-            .note("rename it so every directory and the file stem is a plain identifier")
-        };
-
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| invalid("its file name is not valid UTF-8"))?;
-
-        let mut segments: Vec<&str> = Vec::new();
-        for component in path.parent().into_iter().flat_map(|p| p.components()) {
-            let text = component
-                .as_os_str()
-                .to_str()
-                .ok_or_else(|| invalid("a directory name is not valid UTF-8"))?;
-            segments.push(text);
-        }
-        segments.push(stem);
-
-        for segment in &segments {
-            if !is_ident(segment) {
-                return Err(invalid(&format!("`{segment}` is not an identifier")));
-            }
-        }
-        Ok(ModuleName(Symbol::new(segments.join("."))))
-    }
-
     /// Trusts the caller that every segment is an identifier.
     pub fn from_dotted(name: impl AsRef<str>) -> ModuleName {
         ModuleName(Symbol::new(name.as_ref()))
-    }
-
-    pub fn as_symbol(&self) -> &Symbol {
-        &self.0
     }
 
     pub fn as_str(&self) -> &str {
@@ -286,34 +247,12 @@ impl fmt::Display for ModuleName {
     }
 }
 
-/// The grammar's identifier rule, which module paths are held to as well. It is ASCII, the rule
-/// the lexer implements (`crates/ply-compiler/ply/lexer.ply`) and the walk repeats
-/// (`crates/ply-cli/ply/sources.ply`).
-pub fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
-}
-
-pub fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-pub fn is_ident_continue(c: char) -> bool {
-    is_ident_start(c) || c.is_ascii_digit()
-}
-
 /// `pub` exports an item.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Visibility {
     #[default]
     Private,
     Public,
-}
-
-impl Visibility {
-    pub fn is_public(self) -> bool {
-        self == Visibility::Public
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
