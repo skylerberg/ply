@@ -68,25 +68,6 @@ pub fn module_digest(name: &str) -> Option<String> {
     crate::shipped_modules::digest_of(name)
 }
 
-/// Each `fn` of a program its `entry` reaches and the hash its front end gave it, a `name hash`
-/// line each in name order. A hash covers all the definition reaches, so it is what an answer that
-/// definition computes is a function of on the program's side, and an entry's covers everything it
-/// reaches.
-pub fn definitions(program: &ply_eval::Analysis, entry: &str) -> String {
-    let reached = program.hashes.reach([&ply_eval::Symbol::new(entry)]);
-    let mut rows: Vec<(&str, String)> = program
-        .hashes
-        .defs
-        .iter()
-        .filter(|(name, _)| reached.contains(*name))
-        .map(|(name, hash)| (name.as_str(), hash.to_hex()))
-        .collect();
-    rows.sort();
-    rows.into_iter()
-        .map(|(name, hash)| format!("{name} {hash}\n"))
-        .collect()
-}
-
 /// The family as the launcher's program is lent it: `definitions` answers for that program.
 pub fn lent() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let shipped: Arc<dyn HostHandler> = Arc::new(Shipped);

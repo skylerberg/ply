@@ -5,7 +5,7 @@
 //! big-stack thread, the program's front end read from the pack, the `cwd` and `shipped` roots, the
 //! process and environment bindings, and the exit code.
 
-use ply_eval::{Analysis, Diagnostic, Ended, SourceId, codes};
+use ply_eval::{Analysis, Diagnostic, Ended, codes};
 use ply_machine::enter::{self, Binds};
 use std::path::{Path, PathBuf};
 
@@ -34,11 +34,7 @@ pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
     };
     let value = ply_eval::codec::decode(bytes)
         .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    let linked = match whole_answer(&value) {
-        Some(whole) => whole,
-        None => ply_codegen::c::dump::linked(&value),
-    }
-    .map_err(|why| unlinked(why.to_string()))?;
+    let linked = ply_codegen::c::dump::linked(&value).map_err(|why| unlinked(why.to_string()))?;
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
         entry: linked.entry.to_string(),
@@ -47,28 +43,6 @@ pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
         stage: format!("native-{stage}"),
         version: version.to_string(),
     })
-}
-
-/// The last release packs a program's whole answer, and it links the builder a bootstrap of this
-/// checkout starts with: `value` read as that, where it holds a `dump`.
-fn whole_answer(
-    value: &ply_eval::Value,
-) -> Option<Result<ply_codegen::c::dump::Linked, ply_eval::decode::Error>> {
-    let at = ply_eval::decode::AnswerValue::new("a linked program's front end", value);
-    let dump = at.field("dump").ok()?;
-    let read = || {
-        let modules = at.field("modules")?.number::<u32>()?;
-        let ids: Vec<SourceId> = (0..modules).map(SourceId).collect();
-        let front = ply_codegen::c::dump::read(dump.value(), &ids)
-            .map_err(|e| at.error(format!("its dump does not read: {e}")))?;
-        let entry = at.field("entry")?.str()?;
-        Ok(ply_codegen::c::dump::Linked {
-            entry: ply_eval::Symbol::new(entry),
-            definitions: ply_machine::shipped::definitions(&front, entry),
-            front,
-        })
-    };
-    Some(read())
 }
 
 #[cold]
