@@ -48,6 +48,8 @@ pub type Kind =
   | KBool
   /// Below 64 bits a width has its own C type; signed overflow is undefined in C, so casts carry signedness.
   | KNum(Width)
+  /// A `Float` in a C `double`, whose arithmetic is IEEE-754's own once contraction is off.
+  | KFloat
 
 pub type Width = { bits: Int, signed: Bool }
 
@@ -56,6 +58,7 @@ pub fn ctype(k: Kind) -> Bytes =
     KNum(w) -> if w.signed {
       if w.bits == 8 { b"int8_t" } else if w.bits == 16 { b"int16_t" } else { b"int32_t" }
     } else { unsigned_ctype(w) },
+    KFloat -> b"double",
     _ -> b"int64_t",
   }
 
@@ -107,8 +110,8 @@ pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
 
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
-/// runtime's own operators: `Float`, `Decimal`, and whatever `==` compares structurally.
-type Operand = | OInt | OBool | OWidth(Width) | OWord
+/// runtime's own operators: `Decimal`, and whatever `==` compares structurally.
+type Operand = | OInt | OBool | OWidth(Width) | OFloat | OWord
 
 /// `None` where the checker settled no type, which it does for every operator of a checked program.
 fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
@@ -117,6 +120,7 @@ fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
     Some(name) -> if name == unsettled() { None }
     else if name == b"Int" { Some(OInt) }
     else if name == b"Bool" { Some(OBool) }
+    else if name == b"Float" { Some(OFloat) }
     else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
   }
 
@@ -1627,6 +1631,7 @@ fn as_int(value: CValue) -> Bytes =
     KInt -> value.expr,
     KBool -> value.expr,
     KNum(_) -> bytes_concat_all([b"(int64_t)(", value.expr, b")"]),
+    KFloat -> bytes_concat_all([b"rt_unbox_int_p(ctx, ", as_word(value), b")"]),
     KBoxed ->
       bytes_concat_all([
         b"(ply_is_imm(",
@@ -1656,7 +1661,7 @@ fn release_from(
   params: List<EmitParam>,
   at_tail: Bool,
 ) -> Option<Emitter> =
-  if emitter.release {
+  if value.kind != KBoxed { Some(emitter) } else if emitter.release {
     if base_owned(base) && spendable(emitter, value.expr) {
       Some(release_holder(spend_made(emitter, value.expr), value))
     } else { Some(emitter) }
@@ -1992,6 +1997,7 @@ fn opened_to(emitter: Emitter, value: CValue, d: { kind: Option<Kind>, ty: Ty })
     Some(KInt) -> bind(emitter, KInt, as_int(value)),
     Some(KBool) -> bind(emitter, KBool, as_bool(value)),
     Some(KNum(w)) -> bind(emitter, KNum(w), as_num(value, w)),
+    Some(KFloat) -> bind(emitter, KFloat, as_float(value)),
     // The callee's declared type makes a later field read a load rather than a search.
     _ -> { emitter: emitter, value: { kind: value.kind, expr: value.expr, ty: d.ty } },
   }
@@ -4269,6 +4275,24 @@ fn as_bool(value: CValue) -> Bytes =
     KNum(_) -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KInt -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", value.expr, b")"]),
+    KFloat -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", as_word(value), b")"]),
+  }
+
+/// A word is read in place when it is a `Float`'s own object; the runtime reads any other.
+fn as_float(value: CValue) -> Bytes =
+  match value.kind {
+    KFloat -> value.expr,
+    KBoxed ->
+      bytes_concat_all([
+        b"(ply_is_float(",
+        value.expr,
+        b") ? ply_f64(ply_words(",
+        value.expr,
+        b")[0]) : ply_f64(rt_unbox_float_p(ctx, ",
+        value.expr,
+        b")))",
+      ]),
+    _ -> bytes_concat_all([b"ply_f64(rt_unbox_float_p(ctx, ", as_word(value), b"))"]),
   }
 
 fn as_word(value: CValue) -> Bytes =
@@ -4287,6 +4311,7 @@ fn as_word(value: CValue) -> Bytes =
         value.expr,
         b"))",
       ]),
+    KFloat -> bytes_concat_all([b"rt_box_float_p(ctx, ply_f64_bits(", value.expr, b"))"]),
   }
 
 /// `rt_arith`'s opcode numbering.
@@ -4314,28 +4339,6 @@ fn binary_code(op: Bytes) -> Int =
   else { 17 }
 
 fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
-
-pub fn covers() -> List<Bytes> =
-  [
-    b"integer literals",
-    b"parameters read as integers",
-    b"add, sub, mul, div and rem on Int",
-    b"lt, le, gt, ge, eq and ne on Int",
-    b"if, with either branch's value joined in one temporary",
-    b"a block, and the `let`s in it",
-    b"a list of values",
-    b"neg and not, and the Bool literals",
-    b"a field of a record whose shape a parameter's type gives",
-    b"a record literal, through this body's reuse token for its width",
-    b"a direct call to a definition of the same module",
-    b"a call of a builtin, through the runtime's helper for it",
-    b"a match over every pattern form, guards included",
-    b"a call of a name another module exports by name",
-    b"a Str or Bytes literal, from the unit's constant table",
-    b"a constructor, tagged by its place in the unit's table",
-    b"a constructor pattern whose arguments are names",
-    b"a lambda, as the closure over the slots it copies in",
-  ]
 
 /// A lambda's closure: its body emitted as an entry of its own, and its captures copied in.
 fn closure_value(
@@ -4463,7 +4466,15 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
       LWide(_, _, _) -> Some(from_table(emitter, l)),
       LUnit -> Some(from_table(emitter, l)),
-      LFloat(_) -> Some(from_table(emitter, l)),
+      LFloat(x) ->
+        Some({
+          emitter: emitter,
+          value: {
+            kind: KFloat,
+            expr: bytes_concat_all([b"ply_f64(", int_lit(literal_bits(x)), b")"]),
+            ty: TyOpen,
+          },
+        }),
       LDec(_) -> Some(from_table(emitter, l)),
       LChar(_) -> Some(from_table(emitter, l)),
       _ -> Some(refused(emitter, b"a literal this port does not pool")),
@@ -6154,7 +6165,7 @@ fn stmts(
             Some(o) ->
               stmts(
                 drop_value(
-                  line(o.emitter, bytes_concat_all([b"(void)(", as_word(o.value), b");"])),
+                  line(o.emitter, bytes_concat_all([b"(void)(", o.value.expr, b");"])),
                   o.value,
                 ),
                 xs,
@@ -6863,6 +6874,7 @@ fn as_kind(value: CValue, k: Kind) -> Bytes =
     KInt -> as_int(value),
     KBool -> as_bool(value),
     KNum(w) -> as_num(value, w),
+    KFloat -> as_float(value),
   }
 
 /// A record-valued join: one assignment per field, from the values the record was built from.
@@ -7090,6 +7102,7 @@ fn negated(emitter: Emitter, value: CValue, t: Operand, span: Span) -> Option<Wi
       );
       Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
     },
+    OFloat -> Some(bind(emitter, KFloat, bytes_concat_all([b"-(", as_float(value), b")"]))),
     _ -> by_runtime(site(emitter, span), b"rt_negate_p", value),
   }
 
@@ -7219,8 +7232,39 @@ fn binary_rest(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Operand) ->
         ),
       )
     } else { Some(unsettled_operator(emitter, op)) },
+    OFloat -> float_binary(emitter, op, l, r),
     OWord -> word_binary(emitter, op, l, r),
   }
+
+/// C's own `double` operators, which round as IEEE-754 does and compare as the evaluator does:
+/// `NaN` is unordered and unequal to itself.
+fn float_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> Option<WithValue> = {
+  let a = as_float(l);
+  let b = as_float(r);
+  let infix = |kind: Kind, c: Bytes|
+    Some(bind(emitter, kind, bytes_concat_all([b"(", a, b") ", c, b" (", b, b")"])));
+  match compare_op(op) {
+    Some(c) -> infix(KBool, c),
+    None -> if op == b"add" { infix(KFloat, b"+") }
+    else if op == b"sub" { infix(KFloat, b"-") }
+    else if op == b"mul" { infix(KFloat, b"*") }
+    else if op == b"div" { infix(KFloat, b"/") } else if op == b"rem" {
+      Some(
+        bind(
+          emitter,
+          KFloat,
+          bytes_concat_all([
+            b"ply_f64(rt_float_rem_p(ctx, ply_f64_bits(",
+            a,
+            b"), ply_f64_bits(",
+            b,
+            b")))",
+          ]),
+        ),
+      )
+    } else { Some(unsettled_operator(emitter, op)) },
+  }
+}
 
 fn int_binary(emitter: Emitter, op: Bytes, l: CValue, r: CValue) -> WithValue =
   if is_shift(op) { shift(emitter, op, l, r, None) } else if is_bitop(op) {
@@ -7546,6 +7590,14 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
             );
             remember(o.emitter, i, o.value)
           },
+          KFloat -> {
+            let o = bind(
+              acc,
+              KFloat,
+              as_float({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(i)), ty: TyOpen }),
+            );
+            remember(o.emitter, i, o.value)
+          },
           _ -> {
             let o = bind(
               acc,
@@ -7567,11 +7619,13 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
     })
 
 /// How a value of `ty` is held: an `Int` or a `Bool` untagged, a width below 64 bits in its own C
-/// type, anything else a word, with what a field read or an inline builtin can take of its type.
+/// type, a `Float` in a `double`, anything else a word, with what a field read or an inline builtin
+/// can take of its type.
 pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
   match ty {
     TyCon(c) -> if len(c.args) == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bool" { { kind: KBool, ty: TyOpen } }
+    else if len(c.args) == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen } }
     else if len(c.args) == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
     else if len(c.args) == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
     else if len(c.args) == 1 && c.name == b"Array" { { kind: KBoxed, ty: TyArray } }
@@ -8065,6 +8119,20 @@ pub fn no_tables() -> Tables =
     symbols: [],
   }
 
+/// `s` with every `byte` taken out.
+pub fn without(s: Bytes, byte: Int) -> Bytes =
+  bytes_concat_all(
+    map(range(0, bytes_len(s)), |i: Int|
+      if bytes_at(s, i) == byte { b"" } else { bytes_slice(s, i, i + 1) }),
+  )
+
+/// The bits of the `Float` a literal's text names, its `_`s read past.
+pub fn literal_bits(literal: Bytes) -> Int / {abort.raise} =
+  match float_of_string(string_of_bytes(without(unspaced(literal), 95))) {
+    Some(x) -> bits_of_float(x),
+    None -> panic("a float literal that does not read"),
+  }
+
 fn const_of_lit(literal: Lit) -> Const =
   match literal {
     LStr(x) -> ConstStr(x),
@@ -8489,6 +8557,26 @@ test "an operator is compiled at the type the checker settled, whatever holds it
   assert_eq(has(b" > INT64_C(255)) { rt_overflow_p"), [true, false, false]);
   assert_eq(has(b"ply_add_ov("), [false, true, false]);
   assert_eq(has(b"(uint8_t)((uint64_t)(uint8_t)("), [false, false, true])
+}
+
+test "a `Float` is a C `double`: its operators are C's own and a literal is its bits" {
+  let src = bytes_concat_all([
+    b"fn poly(x: Float) -> Float = (0.5 * x + 0.25) * x - 1.5\n",
+    b"fn less(a: Float, b: Float) -> Bool = a < b || a == -b\n",
+    b"fn rest(a: Float, b: Float) -> Float = a % b\n",
+    b"type Point = { x: Float, y: Float }\n",
+    b"fn norm(p: Point) -> Float = p.x * p.x + p.y * p.y\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  assert_eq(has(b"rt_binary_p"), [false, false, false, false]);
+  assert_eq(has(b"rt_negate_p"), [false, false, false, false]);
+  assert_eq(has(b"double "), [true, true, true, true]);
+  // `0.5` is `0x3FE0_0000_0000_0000`.
+  assert_eq(has(b"ply_f64(INT64_C(4602678819172646912))"), [true, false, false, false]);
+  // C has no `%` on doubles; the runtime answers it as the evaluator does.
+  assert_eq(has(b"rt_float_rem_p"), [false, false, true, false])
 }
 
 test "a record a pattern binds is read at the offsets its checked type gives" {
