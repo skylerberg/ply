@@ -1,6 +1,6 @@
-# `build` compiles the workspace into one nextest archive; each `nextest` job runs a shard of it and
-# each `lanes` job a partition of the Ply runs, both cut by `.github/ci-shards.sh` from the
-# durations the last run measured. `ci` is the one check that says a run is green.
+# `build` compiles the workspace into one nextest archive, and each `nextest` job runs a shard of it;
+# `build-ply` bootstraps `ply`, and each `corpus` job takes the Ply runs `.github/ci-shards.sh` lists
+# for it. `ci` is the one check that says a run is green.
 # The toolchain pin recurs in every workflow under .github/: raise it everywhere at once.
 
 name: CI
@@ -16,8 +16,8 @@ on:
   pull_request:
     paths-ignore: ["**.md", "docs/**"]
   # Nightly, and on demand: every job starts from nothing an earlier run kept (`PLY_CI_COLD`), so no
-  # kept answer goes unchecked, and the modules of the CLI's suite no partition takes run: a fourteenth
-  # of the edit sweep, the whole of it in two weeks, and the rest whole.
+  # kept answer goes unchecked, and the modules of the CLI's suite no pull request takes run: a
+  # fourteenth of the edit sweep, the whole of it in two weeks, and the rest whole.
   schedule:
     - cron: "17 6 * * *"
   workflow_dispatch:
@@ -56,68 +56,36 @@ jobs:
     outputs:
       nightly: ${{ steps.nightly.outputs.nightly }}
       nights: ${{ steps.nightly.outputs.nights }}
-      shards: ${{ steps.cut.outputs.shards }}
-      nextest: ${{ steps.cut.outputs.nextest }}
+      nextest: ${{ steps.jobs.outputs.nextest }}
+      corpus: ${{ steps.jobs.outputs.corpus }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # What the last run's test jobs measured, this branch's own or main's, which `verify` holds the
-      # shards to. A first run or a fork's leaves nothing here: the shards are then sliced by test
-      # count and the corpus runs dealt round robin.
-      - name: Fetch the durations the last run measured
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: .github/ci-shards.sh fetch-timings
-
-      - name: Verify the CI tables, the shards and the cache keys
+      - name: Verify the CI tables and the cache keys
         run: .github/ci-shards.sh verify
 
-      # One job cuts the shards, and every partition runs the cut it left: two that cut their own
-      # from tables a run apart could agree on no test at all. The table goes with the cut, so
-      # `passes` writes the next one over the table this run was cut by.
-      - name: Cut the shards from those durations
-        id: cut
+      - name: List the nextest shards and the jobs of the Ply runs
+        id: jobs
         run: |
           set -euo pipefail
-          rc=0
-          .github/ci-shards.sh shard-configs /tmp/ply-shards || rc=$?
-          case "$rc" in
-            0)
-              cp /tmp/ply-test-timings/timings.tsv /tmp/ply-shards/timings.tsv
-              echo "shards=true" >> "$GITHUB_OUTPUT"
-              ;;
-            3) echo "shards=false" >> "$GITHUB_OUTPUT" ;;
-            *) exit "$rc" ;;
-          esac
           echo "nextest=$(.github/ci-shards.sh nextest-shards)" >> "$GITHUB_OUTPUT"
-      # An artifact and not a cache: every job after reads the cut and fails without it, and the
-      # repository's other runs evict a cache while those jobs wait for runners.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: steps.cut.outputs.shards == 'true'
-        with:
-          name: test-shards
-          path: /tmp/ply-shards
-          retention-days: 1
-          if-no-files-found: error
+          corpus=$(.github/ci-shards.sh corpus-matrix)
+          echo "corpus=$corpus" >> "$GITHUB_OUTPUT"
+          jq -r '.include[].id' <<< "$corpus"
 
       # The runner's awk is not the one a developer has. The self-test is what says the timestamps
       # and durations come out the same on both, and it is cheaper than a report someone acts on.
       - name: Self-test the timings tool
         run: .github/ci-timings.sh --self-test
 
-      # `passes` merges the partitions' packs after every test has passed and is no part of `ci`, so
-      # nothing else holds a change to how they are packed or merged.
-      - name: Self-test the packing of what the lanes keep
-        run: .github/ci-corpus.sh --self-test
-
       - name: Run the ucontext probe
         run: ./probes/ucontext/run.sh
 
       # Nightly, the day's cases of the edit sweep in shards and the suite's other nightly modules; a
       # pull request runs none, `edit_gate` and `phases` holding it to every kind of edit and to the
-      # mined programs in its lanes.
+      # mined programs.
       - name: List the nightly jobs
         id: nightly
         env:
@@ -285,19 +253,10 @@ jobs:
       # The artifact holding the C cache and stages the run's jobs read, which a pull request that
       # bootstrapped a toolchain no cache held a stage of hands them; empty otherwise.
       stage: ${{ steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true' && github.event_name != 'push' && steps.stage-name.outputs.name || '' }}
-      partitions: ${{ steps.selected.outputs.partitions }}
-      lanes: ${{ steps.selected.outputs.lanes }}
-      corpus: ${{ steps.selected.outputs.corpus }}
-      solo: ${{ steps.selected.outputs.solo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.plan.outputs.shards == 'true'
-        with:
-          name: test-shards
-          path: /tmp/ply-shards
 
       # A cache rather than an artifact: every suite job wants these two files, and the artifact
       # service is the one part of a run that fails on its own.
@@ -381,26 +340,6 @@ jobs:
           path: target/release/ply
           key: ply-built-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}
 
-      # What earlier runs kept of each Ply run: the passes its tests took and the answer it kept.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        with:
-          path: /tmp/ply-upstream
-          key: ply-upstream-${{ github.run_id }}
-          restore-keys: ply-upstream-
-      # The partitions and corpus jobs to start: those holding a run no kept answer stands for. Each
-      # is asked as its job asks it, by the `ply` the suite jobs run at the path their grants name.
-      - name: Select the Ply runs left to run
-        id: selected
-        env:
-          SHARDS: ${{ needs.plan.outputs.shards }}
-        run: |
-          set -euo pipefail
-          mkdir -p target/debug
-          cp target/release/ply target/debug/ply
-          cut=
-          if [ "$SHARDS" = true ]; then cut=/tmp/ply-shards; fi
-          .github/ci-corpus.sh select "$cut" | tee -a "$GITHUB_OUTPUT"
       # Every job restores what this one saves, so it saves what this job's `ply`s read and wrote.
       - name: Cut the stage to what this job used
         if: steps.boots.outputs.yes == 'true' && steps.stage-cache.outputs.cache-hit != 'true'
@@ -440,10 +379,6 @@ jobs:
           retention-days: 2
           if-no-files-found: error
 
-  # On runners of its own, so the corpus lanes have theirs to themselves. After `build-ply`, whose
-  # stage it restores: a run that changed the compiler would otherwise have each shard emit the
-  # emitter's stage itself, minutes of a runner the lanes are queued for. The builder its tests ask
-  # this tree's compiler through is each shard's own to build, once.
   # Rust tests test the Rust alone, so what they answer is a function of the archive: a run whose
   # Rust key a run already passed runs none of them.
   nextest:
@@ -459,42 +394,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.plan.outputs.shards == 'true'
-        with:
-          name: test-shards
-          path: /tmp/ply-shards
       - uses: ./.github/actions/archive
 
-      # A shard's profile names the tests it runs, except the catch-all's, which is the negation of
-      # every other shard: a test the durations do not name runs there, and only there.
       # The awk strips colour first: nextest colours its summary line.
       - name: Run the shard's tests
         id: run
         env:
           SHARD: ${{ matrix.shard }}
           OF: ${{ matrix.of }}
-          SHARDS: ${{ needs.plan.outputs.shards }}
         run: |
           set -euo pipefail
           exclude=$(.github/ci-shards.sh exclude-filter)
           [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
-          config=/tmp/ply-shards/shard-$SHARD.toml
-          if [ "$SHARDS" = true ]; then
-            [ -f "$config" ] || { echo "the plan cut the shards and $config did not come back" >&2; exit 1; }
-            profile=$(sed -n 's/^\[profile\.\(shard[0-9]*\)\]$/\1/p' "$config" | head -n 1)
-            [ -n "$profile" ] || { echo "$config declares no shard profile" >&2; exit 1; }
-            cut=(--profile "$profile" --tool-config-file "shards:$config")
-          else
-            profile=default
-            cut=(--partition "slice:$SHARD/$OF")
-          fi
-          echo "profile=$profile" >> "$GITHUB_OUTPUT"
           cargo-nextest nextest run \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
-            --no-fail-fast --no-tests=pass "${cut[@]}" \
+            --no-fail-fast --no-tests=pass --partition "slice:$SHARD/$OF" \
             -E "not ($exclude)" 2>&1 | tee /tmp/shard.log || nextest=$?
           [ "${nextest:-0}" -eq 0 ] || exit "$nextest"
           ran=$(awk '
@@ -506,15 +422,14 @@ jobs:
           [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
           echo "ran=$ran" >> "$GITHUB_OUTPUT"
 
-      # What the next run cuts its shards from.
+      # For the run's table of what each test cost.
       - name: Record the durations this shard measured
         env:
           SHARD: ${{ matrix.shard }}
-          PROFILE: ${{ steps.run.outputs.profile }}
           RAN: ${{ steps.run.outputs.ran }}
         run: |
           set -euo pipefail
-          .github/ci-shards.sh durations "target/nextest/$PROFILE/junit.xml" > "/tmp/timings-nextest-$SHARD.tsv"
+          .github/ci-shards.sh durations target/nextest/default/junit.xml > "/tmp/timings-nextest-$SHARD.tsv"
           lines=$(grep -c . "/tmp/timings-nextest-$SHARD.tsv" || true)
           [ "$lines" -eq "$RAN" ] || {
             echo "the report has $lines durations and the shard ran $RAN tests" >&2
@@ -543,143 +458,11 @@ jobs:
           path: /tmp/rust-passed
           key: rust-passed-${{ needs.build.outputs.key }}
 
-  # The corpus runs a partition takes, each lane a process beside the others: only a partition
-  # `build-ply` found a run no kept answer stands for.
-  lanes:
-    name: Run Ply tests, partition ${{ matrix.shard }}/${{ matrix.of }}
-    # After `build-ply`, whose `ply` it runs and whose stage it restores. This is the run's critical
-    # path.
-    needs: [plan, build-ply]
-    if: needs.build-ply.outputs.lanes == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.build-ply.outputs.partitions) }}
-    steps:
-      # The partition stops its runs four minutes before the job's limit, which leaves the steps
-      # after it the time to keep what the runs wrote: a job the limit cancels keeps nothing, and its
-      # re-run is as cold as it was.
-      - name: Set the deadline the partition's runs end by
-        run: echo "PLY_CI_DEADLINE=$(($(date +%s) + 26 * 60))" >> "$GITHUB_ENV"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.plan.outputs.shards == 'true'
-        with:
-          name: test-shards
-          path: /tmp/ply-shards
-      - uses: ./.github/actions/suite
-        with:
-          stage: ${{ needs.build-ply.outputs.stage }}
-      # The C every partition compiled and read last run, which `passes` made one: without it a
-      # lane's first `ply test` emits its package's whole unit before its first test.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        id: lanes-c
-        with:
-          path: /tmp/ply-c-lanes
-          key: ply-c-lanes-${{ github.run_id }}
-          restore-keys: ply-c-lanes-
-      # A partition no run has kept C for starts from what main's corpus jobs kept.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: ${{ (steps.lanes-c.outputs.cache-matched-key == '') && env.PLY_CI_COLD != 'true' }}
-        with:
-          path: /tmp/ply-c-corpus
-          key: ply-c-corpus-
-          restore-keys: ply-c-corpus-
-      - name: Merge the lanes' compiled C under the stage
-        run: |
-          .github/ci-corpus.sh restore /tmp/ply-c-lanes
-          .github/ci-corpus.sh restore /tmp/ply-c-corpus
-          .github/ci-corpus.sh mark
-      # Passes earlier runs published, each filed under the runtime stamp that earned it.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        with:
-          path: /tmp/ply-upstream
-          key: ply-upstream-${{ github.run_id }}
-          restore-keys: ply-upstream-
-      - name: Mark the passes this partition starts from
-        run: .github/ci-corpus.sh upstream-mark
-      # Each package's front-end store as the last partition to load it left it.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        with:
-          path: |
-            crates/ply-cli/ply/.ply-cache
-            crates/ply-compiler/ply/.ply-cache
-            crates/ply-corpus/checks/.ply-cache
-            crates/ply-corpus/ply/.ply-cache
-            crates/ply-corpus/stdlib/.ply-cache
-            crates/ply-cli-tests/ply/.ply-cache
-            crates/ply-prove/ply/.ply-cache
-            crates/ply-registry/ply/.ply-cache
-            crates/ply-sim/ply/.ply-cache
-            crates/ply-std/ply/.ply-cache
-            crates/ply-store/ply/.ply-cache
-            crates/ply-test/ply/.ply-cache
-            tests/lang/.ply-cache
-          key: ply-stores-lanes-${{ github.run_id }}
-          restore-keys: |
-            ply-stores-lanes-
-            ply-stores-
-
-      - name: Run this partition's Ply tests
-        env:
-          SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ needs.plan.outputs.shards }}
-        run: |
-          set -euo pipefail
-          plan=()
-          if [ "$SHARDS" = true ]; then plan=(/tmp/ply-shards); fi
-          .github/ci-corpus.sh partition "$SHARD" "/tmp/timings-lanes-$SHARD.tsv" "${plan[@]}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: timings-lanes-${{ matrix.shard }}
-          path: /tmp/timings-lanes-${{ matrix.shard }}.tsv
-          retention-days: 1
-          if-no-files-found: error
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: durations-lanes-${{ matrix.shard }}
-          path: /tmp/ply-test-durations.tsv
-          retention-days: 1
-          if-no-files-found: error
-
-      # Even from a red job: a pass is a fact about its test.
-      - name: Collect the passes this partition published
-        if: ${{ !cancelled() }}
-        run: .github/ci-corpus.sh upstream-new "/tmp/upstream-${{ matrix.shard }}.tar"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: upstream-${{ matrix.shard }}
-          path: /tmp/upstream-${{ matrix.shard }}.tar
-          retention-days: 1
-          if-no-files-found: error
-      # What the lanes compiled or read and the stores they wrote, which `passes` makes one with
-      # every other partition's for the next run.
-      - name: Pack what the lanes compiled and the stores they wrote
-        if: ${{ !cancelled() }}
-        run: .github/ci-corpus.sh pack "/tmp/kept-lanes-${{ matrix.shard }}"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: kept-lanes-${{ matrix.shard }}
-          path: /tmp/kept-lanes-${{ matrix.shard }}
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-
   # Not part of `ci`: a cache that could not be saved makes no run wrong.
   passes:
     name: Save the passes and test costs this run measured
     if: ${{ !cancelled() }}
-    needs: [plan, build-ply, nextest, gates, hosts, lanes, corpus]
+    needs: [plan, build-ply, nextest, gates, hosts, corpus]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -708,96 +491,8 @@ jobs:
           path: /tmp/ply-upstream
           key: ply-upstream-${{ github.run_id }}
 
-      # Every partition's C and the stores it wrote, as one entry each that every partition of the
-      # next run restores: the cut moves runs between partitions as the durations move, and a
-      # partition holding only its own last run's would load and emit a package it was just given
-      # from nothing. A store no partition wrote this run stays as the last run left it.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.PLY_CI_COLD != 'true'
-        with:
-          path: |
-            crates/ply-cli/ply/.ply-cache
-            crates/ply-compiler/ply/.ply-cache
-            crates/ply-corpus/checks/.ply-cache
-            crates/ply-corpus/ply/.ply-cache
-            crates/ply-corpus/stdlib/.ply-cache
-            crates/ply-cli-tests/ply/.ply-cache
-            crates/ply-prove/ply/.ply-cache
-            crates/ply-registry/ply/.ply-cache
-            crates/ply-sim/ply/.ply-cache
-            crates/ply-std/ply/.ply-cache
-            crates/ply-store/ply/.ply-cache
-            crates/ply-test/ply/.ply-cache
-            tests/lang/.ply-cache
-          key: ply-stores-lanes-${{ github.run_id }}
-          restore-keys: ply-stores-lanes-
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: kept-lanes-*
-          path: /tmp/kept-lanes
-      - name: Merge every partition's C and stores
-        id: kept
-        run: |
-          set -euo pipefail
-          .github/ci-corpus.sh unpack /tmp/kept-lanes /tmp/ply-c-lanes
-          if [ -n "$(find /tmp/ply-c-lanes -type f -print -quit)" ]; then echo "c=true" >> "$GITHUB_OUTPUT"; fi
-          if [ -n "$(find crates -path '*/.ply-cache/*' -type f -print -quit)" ]; then echo "stores=true" >> "$GITHUB_OUTPUT"; fi
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.kept.outputs.c == 'true'
-        with:
-          path: /tmp/ply-c-lanes
-          key: ply-c-lanes-${{ github.run_id }}
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: steps.kept.outputs.stores == 'true'
-        with:
-          path: |
-            crates/ply-cli/ply/.ply-cache
-            crates/ply-compiler/ply/.ply-cache
-            crates/ply-corpus/checks/.ply-cache
-            crates/ply-corpus/ply/.ply-cache
-            crates/ply-corpus/stdlib/.ply-cache
-            crates/ply-cli-tests/ply/.ply-cache
-            crates/ply-prove/ply/.ply-cache
-            crates/ply-registry/ply/.ply-cache
-            crates/ply-sim/ply/.ply-cache
-            crates/ply-std/ply/.ply-cache
-            crates/ply-store/ply/.ply-cache
-            crates/ply-test/ply/.ply-cache
-            tests/lang/.ply-cache
-          key: ply-stores-lanes-${{ github.run_id }}
-
-      # The table the next run cuts its shards from, from every shard and partition, so a
-      # run that went red leaves the last whole one in place rather than a table missing whatever did
-      # not report. Written over the table this run was cut by, which came with the cut, and carried
-      # to the next run in the `test-durations` artifact below. A pull request writes one too: a
-      # branch cuts by what its own tree measured, and main is never cut by a branch's
-      # (`ci-shards.sh fetch-timings`). An artifact and not a cache: a run whose table the
-      # repository's other runs evicted deals its corpus runs round robin, and overruns a lane.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: needs.plan.outputs.shards == 'true' && contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
-        with:
-          name: test-shards
-          path: /tmp/ply-shards
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        if: contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
-        with:
-          pattern: timings-*
-          merge-multiple: true
-          path: /tmp/ply-timings-parts
-      - name: Write the table of one duration per test
-        id: timings
-        if: contains(fromJSON('["success", "skipped"]'), needs.nextest.result) && contains(fromJSON('["success", "skipped"]'), needs.lanes.result) && contains(fromJSON('["success", "skipped"]'), needs.corpus.result)
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/ply-test-timings
-          find /tmp/ply-timings-parts -name '*.tsv' -exec cat {} + |
-            .github/ci-shards.sh timings /tmp/ply-shards/timings.tsv > /tmp/ply-test-timings/timings.tsv
-          lines=$(grep -c . /tmp/ply-test-timings/timings.tsv || true)
-          [ "$lines" -gt 0 ] || { echo "no durations came back from the partitions" >&2; exit 1; }
-          echo "$lines test durations"
-
       # What each test cost, slowest first, whichever jobs went red: the Ply tests' own durations and
-      # nextest's, with the table the next run is cut by when this run wrote one.
+      # nextest's.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         if: ${{ !cancelled() }}
         with:
@@ -819,7 +514,6 @@ jobs:
             find /tmp/durations-parts -name '*.tsv' -exec cat {} +
             find /tmp/nextest-parts -name '*.tsv' -exec awk -F'\t' -v OFS='\t' '{ print $3, "nextest " $1, $2 }' {} +
           } | LC_ALL=C sort -t$'\t' -k1,1nr -k2,2 -k3,3 > "$out/tests.tsv"
-          if [ -f /tmp/ply-test-timings/timings.tsv ]; then cp /tmp/ply-test-timings/timings.tsv "$out/"; fi
           tests=$(grep -c . "$out/tests.tsv" || true)
           [ "$tests" -gt 0 ] || { echo "no job reported what its tests cost" >&2; exit 1; }
           {
@@ -839,7 +533,7 @@ jobs:
           retention-days: 14
           if-no-files-found: error
 
-      # Whatever the table came to: a family keeps its entries unless this run saved one.
+      # A family keeps its entries unless this run saved one.
       - name: Delete the cache entries this run replaced
         if: ${{ !cancelled() }}
         env:
@@ -1005,8 +699,8 @@ jobs:
 
       # A lock pins the closure's names and versions; a path dependency in this checkout carries no
       # digest, so an edit to one moves no lock. On the merge with main, not only the branch: two
-      # changes that each moved a lock leave main's stale. Here, beside the partitions, rather than in
-      # `build-ply`, whose end every partition waits on.
+      # changes that each moved a lock leave main's stale. Here, beside the Ply runs, rather than in
+      # `build-ply`, whose end every one of them waits on.
       - name: Check every lockfile pins this tree
         if: ${{ !cancelled() }}
         run: |
@@ -1038,20 +732,20 @@ jobs:
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --no-fail-fast --no-tests=pass --success-output immediate -E "$filter"
 
-  # The Ply runs that would starve a partition, on runners of their own (`ci-shards.sh corpus-matrix`):
-  # the compiler's own tests, which take every core, and the proof runs, each one load of what it
-  # proves. Only the ones `build-ply` found a run no kept answer stands for start.
+  # The Ply runs, each job the runs `ci-shards.sh` lists under its id: a package is loaded once, by the
+  # one `ply test` or `ply prove` that takes all it asks of it, and the job keeps that package's store
+  # for its own next run. A run nothing has moved for is answered from what its last one kept.
   corpus:
-    name: Run ${{ matrix.id }} on a runner of its own
+    name: Run ${{ matrix.id }}
     needs: [plan, build-ply]
-    if: needs.build-ply.outputs.solo == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.build-ply.outputs.corpus) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.corpus) }}
     steps:
-      # As a partition's: the steps after the runs keep what they wrote.
+      # Four minutes before the job's limit, which leaves the steps after the runs the time to keep
+      # what they wrote: a job the limit cancels keeps nothing, and its re-run is as cold as it was.
       - name: Set the deadline the job's runs end by
         run: echo "PLY_CI_DEADLINE=$(($(date +%s) + 26 * 60))" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1065,8 +759,8 @@ jobs:
       - uses: ./.github/actions/suite
         with:
           stage: ${{ needs.build-ply.outputs.stage }}
-      # The C main's corpus runs compiled (`ci-corpus.sh keep`): without it a lane's first `ply test`
-      # emits the checks package's whole closure, the compiler's included, before its first check.
+      # The C main's run of this job compiled (`ci-corpus.sh keep`): without it the job's first
+      # `ply test` emits its package's whole closure before its first test.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: env.PLY_CI_COLD != 'true'
         with:
@@ -1102,10 +796,8 @@ jobs:
             crates/ply-store/ply/.ply-cache
             crates/ply-test/ply/.ply-cache
             tests/lang/.ply-cache
-          key: ply-stores-corpus-${{ matrix.id }}-${{ github.run_id }}
-          restore-keys: |
-            ply-stores-corpus-${{ matrix.id }}-
-            ply-stores-
+          key: ply-stores-${{ matrix.id }}-${{ github.run_id }}
+          restore-keys: ply-stores-${{ matrix.id }}-
       - name: Mark when this job's compiling starts
         run: .github/ci-corpus.sh mark
       # A check may take minutes and make any number of calls; a quarter of an hour abandons one.
@@ -1150,8 +842,8 @@ jobs:
             crates/ply-store/ply/.ply-cache
             crates/ply-test/ply/.ply-cache
             tests/lang/.ply-cache
-          key: ply-stores-corpus-${{ matrix.id }}-${{ github.run_id }}
-      # From main, what this run compiled, for every later run's corpus lanes.
+          key: ply-stores-${{ matrix.id }}-${{ github.run_id }}
+      # From main, what this run compiled, for every later run of this job.
       - name: Keep what this run compiled
         if: github.event_name == 'push'
         run: .github/ci-corpus.sh keep /tmp/ply-c-corpus
@@ -1161,7 +853,7 @@ jobs:
           path: /tmp/ply-c-corpus
           key: ply-c-corpus-${{ matrix.id }}-${{ steps.sources.outputs.digest }}
 
-  # The modules of the CLI's suite no partition takes (`ci-shards.sh nightly-matrix`), nightly: every
+  # The modules of the CLI's suite no pull request takes (`ci-shards.sh nightly-matrix`), nightly: every
   # module of the tree edited the ways `edit_gate` edits its fixtures and checked warm and cold after
   # each (`edit_sweep`), the day's cases in shards; and in one job the compiler's phases over the
   # toolchain's whole trees, the audits of the repository's own code for definitions nothing reaches
@@ -1225,7 +917,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [plan, clippy, build, build-ply, nextest, lanes, gates, hosts, corpus, nightly, treesitter]
+    needs: [plan, clippy, build, build-ply, nextest, gates, hosts, corpus, nightly, treesitter]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -1236,13 +928,11 @@ jobs:
           set -euo pipefail
           echo '${{ toJSON(needs) }}' > /tmp/needs.json
           cat /tmp/needs.json
-          # `build-ply` starts no partition or corpus job whose runs what earlier runs kept answers,
-          # the nightly jobs run only at night, and a Rust a run passed runs no Rust test.
+          # The nightly jobs run only at night, and a Rust a run passed runs no Rust test.
           not_ok=$(jq -r --arg passed "$PASSED" '
             to_entries[]
             | select(.value.result != "success")
-            | select((.value.result == "skipped"
-                and (.key == "lanes" or .key == "corpus" or .key == "nightly")) | not)
+            | select((.value.result == "skipped" and .key == "nightly") | not)
             | select(($passed == "true" and .value.result == "skipped"
                 and (.key == "nextest" or .key == "hosts")) | not)
             | "\(.key) = \(.value.result)"
