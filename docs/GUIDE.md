@@ -2614,13 +2614,14 @@ plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2)
 derives as an alias of its fields does: the same documents, bytes and shape.
 
 A `json` or `bin` codec whose type reaches itself, directly or through the
-other types the module derives, is a definition for each of its functions
-(`tree_json_encode` and `tree_json_decode`; `tree_bin_put`, `tree_bin_take` and
-`tree_bin_shape`). Each takes how many levels deeper it may nest and calls its
-cycle's by name with one less, so the recursion is seen to end (§5.10) and no
-level makes a codec. `tree_json_at(depth)` is the codec of them at a depth, and
-`tree_json()` is that codec at `json::max_depth()`. Past the bound, a decode is
-an error and an encode panics. `json`'s bound is 128 levels, as deep as `parse`
+other types the module derives, takes how many levels deeper it may nest and
+hands its cycle one less, so the recursion is seen to end (§5.10). It is two
+definitions: `tree_json()` starts `tree_json_at(json::max_depth())`. A `bin`
+codec whose cycle has no type that takes a parameter is instead a definition for
+each of its functions (`tree_bin_put`, `tree_bin_take` and `tree_bin_shape`),
+which call their cycle's by name, so no level makes a codec; `tree_bin()` hands
+each to its definition at `bin::max_depth()`. Past the bound, a decode is an
+error and an encode panics. `json`'s bound is 128 levels, as deep as `parse`
 reads, and `bin`'s is 10,000, as deep as calls nest (§5.7).
 
 `E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
