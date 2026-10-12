@@ -712,7 +712,6 @@ impl Ctx {
     /// what is left of its bounds, and nothing of its own, so it can run on another thread.
     pub(crate) fn branch(&self) -> Ctx {
         let mut b = Ctx::new(Arc::clone(&self.tables));
-        b.heap = Heap::branch();
         b.fuel = self.fuel;
         // Zero is no bound, so a budget spent to the last call stays a bound of one.
         b.step_budget = if self.step_budget > 0 {
@@ -909,10 +908,10 @@ impl Ctx {
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
-                "entry: {} objects allocated, {} recycled, {}MB of chunks, {} stacks grown",
+                "entry: {} objects allocated, {} recycled, {}MB held, {} stacks grown",
                 self.heap.allocated(),
                 self.heap.recycled(),
-                self.heap.chunk_bytes() / 1_000_000,
+                self.heap.held() / 1_000_000,
                 self.grown
             );
             let by_kind = self.heap.allocated_by_kind();

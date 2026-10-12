@@ -4,6 +4,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod backend;
+mod blocks;
 mod c;
 mod heap;
 mod linked;

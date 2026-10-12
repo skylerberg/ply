@@ -1,10 +1,10 @@
 //! The value model compiled code runs on: one word per value, an `Int` immediate (low bit set)
 //! or a pointer to a counted [`Obj`]; anything not laid out natively is bridged as a [`Value`].
 
+use crate::blocks::{self, Blocks};
 use crate::list;
 use crate::map;
 use ply_eval::{Carry, Closure, ClosureKind, CtorCarries, Fields, Fixed, Symbol, Value};
-use std::alloc::{Layout, alloc, dealloc};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,9 +39,8 @@ pub const KIND_DEAD: u8 = 255;
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
 pub const IMMORTAL: u32 = u32::MAX;
 
-/// Set on the count of an object another thread may hold. The count changes atomically, the object
-/// is never unique, so nothing reuses it in place, and its block is not recycled when it dies: which
-/// heap's free list it belongs on is not something the thread that drops it knows.
+/// Set on the count of an object another thread may hold. The count changes atomically, and the
+/// object is never unique, so nothing reuses it in place.
 pub const SHARED: u32 = 1 << 31;
 
 /// An object's count, read and changed as an atomic: another thread may hold a shared object.
@@ -543,42 +542,24 @@ impl Layouts {
     }
 }
 
-/// An entry's bump allocator over chunks recycled at its end; a persistent heap never recycles.
-#[repr(C)]
+/// An entry's objects, whose memory goes back whole at its end; a persistent heap's never does.
 pub struct Heap {
-    /// First so compiled code can bump them at fixed offsets from the context.
-    cur: *mut u8,
-    end: *mut u8,
-    chunks: Vec<(*mut u8, usize)>,
-    /// One bit per word of each chunk, set at each object start, for [`Heap::is_object`].
-    starts: Vec<Vec<u64>>,
-    /// Which chunk `cur` is in.
-    chunk: usize,
+    blocks: Blocks,
     /// The bridges whose `Value` the end drops, each block's `layout` its index here.
     bridges: Vec<*mut Obj>,
     persistent: bool,
-    /// The bytes the first chunk takes, which each next one doubles.
-    first: usize,
     /// Objects allocated since the last reset, the bytes they took, and the objects by kind.
     count: usize,
     bytes: usize,
     by_kind: [usize; 16],
     /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
-    recycled: usize,
-    /// Dead objects by size class in words, taken before the bump pointer moves.
-    free: Vec<Vec<*mut Obj>>,
-    /// Dead blocks past the small classes, by the power of two their size was rounded up to.
-    large: Vec<Vec<*mut Obj>>,
-    /// Dead blocks not yet on a free list, oldest first, under `delay()`.
+    /// Dead blocks not yet given back, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
     poison: bool,
     delay: usize,
     census: bool,
 }
-
-/// Small size classes, in words; larger blocks are reused by power of two.
-const REUSE_CLASSES: usize = 64;
 
 thread_local! {
     /// The running entry's heap, which dying objects return to; entries never nest on a thread.
@@ -616,21 +597,27 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
     }
 }
 
-/// Returns a dead object to its free list; a bridge leaves the table first, so the bridge that
-/// takes its block next is not listed twice.
+/// Gives a dead object's block back. Only the heap that owns the block may: its bridge leaves the
+/// table first, so the bridge that takes the block next is not listed twice, and a bridge another
+/// heap owns stays listed there, dead, until that heap's end.
 unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
-    if heap.is_null() {
-        return;
-    }
     unsafe {
-        if (*o).kind == KIND_BRIDGE {
-            (*heap).unlist(o);
-        }
         let size = payload_bytes(o);
+        let bridge = (*o).kind == KIND_BRIDGE;
+        (*o).kind = KIND_DEAD;
         if size == usize::MAX {
             return;
         }
         let object = Heap::object_size(size);
+        if heap.is_null() || !(*heap).blocks.owns(o.cast(), object) {
+            if !bridge {
+                blocks::hand_back(o.cast(), object);
+            }
+            return;
+        }
+        if bridge {
+            (*heap).unlist(o);
+        }
         // Reused even when poisoned: holding dead blocks back exhausts memory.
         if (*heap).poison {
             let words = (object - HEADER) / 8;
@@ -640,14 +627,14 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         }
         let delay = (*heap).delay;
         if delay == 0 {
-            (*heap).free_list(object).push(o);
+            (*heap).blocks.give(o.cast(), object);
             return;
         }
         (*heap).delayed.push_back((o, object));
         if (*heap).delayed.len() > delay
             && let Some((o, object)) = (*heap).delayed.pop_front()
         {
-            (*heap).free_list(object).push(o);
+            (*heap).blocks.give(o.cast(), object);
         }
     }
 }
@@ -658,31 +645,16 @@ impl Default for Heap {
     }
 }
 
-const FIRST_CHUNK: usize = 1 << 20;
-const BRANCH_CHUNK: usize = 16 << 10;
-const LARGEST_CHUNK: usize = 64 << 20;
-/// The chunks an ended entry keeps for the next on its thread; past them, a run's every thread
-/// would hold what the most an entry on it ever took.
-const KEPT_AT_END: usize = 64 << 20;
-
 impl Heap {
     pub fn new() -> Heap {
         Heap {
-            cur: std::ptr::null_mut(),
-            end: std::ptr::null_mut(),
-            chunks: Vec::new(),
-            starts: Vec::new(),
-            chunk: 0,
+            blocks: Blocks::default(),
             bridges: Vec::new(),
             persistent: false,
-            first: FIRST_CHUNK,
             count: 0,
             bytes: 0,
             by_kind: [0; 16],
             by_layout: HashMap::new(),
-            recycled: 0,
-            free: Vec::new(),
-            large: Vec::new(),
             delayed: std::collections::VecDeque::new(),
             poison: poisoning(),
             delay: delay(),
@@ -690,60 +662,12 @@ impl Heap {
         }
     }
 
-    /// The free list for a dead block of `object` bytes: its size class or its power of two.
-    fn free_list(&mut self, object: usize) -> &mut Vec<*mut Obj> {
-        let (lists, class) = match Heap::large_class(object) {
-            Some(class) => (&mut self.large, class),
-            None => (&mut self.free, object / 8),
-        };
-        if lists.len() <= class {
-            lists.resize_with(class + 1, Vec::new);
-        }
-        &mut lists[class]
-    }
-
-    /// A `parallel` branch's heap, which its block adopts: it starts small, since a branch is
-    /// often a few allocations and every chunk it takes outlives it.
-    pub fn branch() -> Heap {
-        let mut h = Heap::new();
-        h.first = BRANCH_CHUNK;
-        h
-    }
-
-    /// Takes over a finished branch's memory: its objects are this entry's from here on. Its used
-    /// chunks go before the one bumping, which keeps the chunks after it the empty ones.
+    /// Takes over a finished branch's memory: its objects are this entry's from here on.
     pub fn adopt_heap(&mut self, mut other: Heap) {
-        let used = if other.chunks.is_empty() {
-            0
-        } else {
-            other.chunk + 1
-        };
-        if used > 0 && self.cur.is_null() {
-            self.grow(0);
-        }
-        let spare_chunks = other.chunks.split_off(used);
-        let spare_starts = other.starts.split_off(used);
-        let at = self.chunk;
-        self.chunk += used;
-        self.chunks.splice(at..at, other.chunks.drain(..));
-        self.starts.splice(at..at, other.starts.drain(..));
-        self.chunks.extend(spare_chunks);
-        self.starts.extend(spare_starts);
+        self.blocks.adopt(std::mem::take(&mut other.blocks));
         for o in other.bridges.drain(..) {
             unsafe { (*o).layout = self.bridges.len() as u32 };
             self.bridges.push(o);
-        }
-        for (class, list) in other.free.drain(..).enumerate() {
-            if self.free.len() <= class {
-                self.free.resize_with(class + 1, Vec::new);
-            }
-            self.free[class].extend(list);
-        }
-        for (class, list) in other.large.drain(..).enumerate() {
-            if self.large.len() <= class {
-                self.large.resize_with(class + 1, Vec::new);
-            }
-            self.large[class].extend(list);
         }
         self.delayed.extend(other.delayed.drain(..));
         self.count += other.count;
@@ -751,7 +675,6 @@ impl Heap {
         for (mine, theirs) in self.by_kind.iter_mut().zip(other.by_kind) {
             *mine += theirs;
         }
-        self.recycled += other.recycled;
     }
 
     /// A heap whose entries never end: what outlives every entry lives here.
@@ -764,43 +687,24 @@ impl Heap {
     /// Live objects by kind, with their count and payload bytes.
     pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
         let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
-        for (i, (base, cap)) in self.chunks.iter().enumerate() {
-            let limit = if i == self.chunk {
-                self.cur as usize
-            } else {
-                *base as usize + *cap
-            };
-            let bits = &self.starts[i];
-            for (word, bitmap) in bits.iter().enumerate() {
-                if *bitmap == 0 {
-                    continue;
-                }
-                for b in 0..64 {
-                    if bitmap & (1u64 << b) == 0 {
-                        continue;
-                    }
-                    let address = *base as usize + (word * 64 + b) * 8;
-                    if address >= limit {
-                        break;
-                    }
-                    let o = address as *mut Obj;
-                    let (kind, rc, size) = unsafe { ((*o).kind, (*o).rc, payload_bytes(o)) };
-                    if kind == KIND_DEAD || rc == 0 {
-                        continue;
-                    }
-                    let e = tally.entry(kind).or_insert((0, 0));
-                    e.0 += 1;
-                    // `usize::MAX` means unsized: count the header alone.
-                    e.1 += if size == usize::MAX { HEADER } else { size };
-                }
+        self.blocks.each(|block| {
+            let o: *mut Obj = block.cast();
+            let (kind, rc) = unsafe { ((*o).kind, (*o).rc) };
+            if kind == KIND_DEAD || rc == 0 {
+                return;
             }
-        }
+            let size = unsafe { payload_bytes(o) };
+            let e = tally.entry(kind).or_insert((0, 0));
+            e.0 += 1;
+            // `usize::MAX` means unsized: count the header alone.
+            e.1 += if size == usize::MAX { HEADER } else { size };
+        });
         tally.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
     }
 
-    /// The bytes the entry's chunks reserve, whatever is live in them.
-    pub fn chunk_bytes(&self) -> usize {
-        self.chunks.iter().map(|(_, cap)| *cap).sum()
+    /// The bytes of the memory holding the entry's objects, whatever is live in it.
+    pub fn held(&self) -> usize {
+        self.blocks.held()
     }
 
     /// Objects allocated since the last reset.
@@ -827,9 +731,9 @@ impl Heap {
         out
     }
 
-    /// Allocations served from a free list rather than fresh memory.
+    /// Allocations that took a dead object's block rather than fresh memory.
     pub fn recycled(&self) -> usize {
-        self.recycled
+        self.blocks.reused()
     }
 
     /// How many bridges the table lists: what a leak of them grows.
@@ -862,46 +766,9 @@ impl Heap {
         }
     }
 
-    /// Moves to a chunk with `need` bytes free: the next fitting one on hand, or a new, larger one.
-    fn grow(&mut self, need: usize) {
-        while self.chunk + 1 < self.chunks.len() {
-            self.chunk += 1;
-            let (p, cap) = self.chunks[self.chunk];
-            if cap >= need {
-                self.cur = p;
-                self.end = unsafe { p.add(cap) };
-                return;
-            }
-        }
-        let last = self.chunks.last().map_or(0, |c| c.1);
-        let cap = need.max(self.first).max((last * 2).min(LARGEST_CHUNK));
-        let p = unsafe { alloc(Layout::from_size_align(cap, 16).expect("a chunk layout")) };
-        assert!(!p.is_null(), "the heap is out of memory");
-        self.chunks.push((p, cap));
-        self.starts.push(vec![0; cap / 512 + 1]);
-        self.chunk = self.chunks.len() - 1;
-        self.cur = p;
-        self.end = unsafe { p.add(cap) };
-    }
-
     /// The bytes an object with this payload takes, header included and rounded to a word.
     pub fn object_size(payload_bytes: usize) -> usize {
         (HEADER + payload_bytes.max(8) + 7) & !7
-    }
-
-    /// A block's size: the object size in the small classes, else the next power of two.
-    fn block_size(payload_bytes: usize) -> usize {
-        let size = Heap::object_size(payload_bytes);
-        match Heap::large_class(size) {
-            Some(class) => 1 << class,
-            None => size,
-        }
-    }
-
-    /// The power-of-two class of a block past the small classes.
-    fn large_class(size: usize) -> Option<usize> {
-        (size / 8 >= REUSE_CLASSES)
-            .then(|| usize::BITS as usize - (size - 1).leading_zeros() as usize)
     }
 
     pub(crate) fn raw_alloc(
@@ -912,29 +779,8 @@ impl Heap {
         layout: u32,
         payload_bytes: usize,
     ) -> *mut Obj {
-        let size = Heap::block_size(payload_bytes);
-        let recycled = match Heap::large_class(size) {
-            Some(class) => self.large.get_mut(class).and_then(Vec::pop),
-            None => self.free.get_mut(size / 8).and_then(Vec::pop),
-        };
-        let p = match recycled {
-            // Its start bit is still set: only `end` clears bits, and it empties every free list.
-            Some(p) => {
-                self.recycled += 1;
-                p
-            }
-            None => {
-                if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null()
-                {
-                    self.grow(size);
-                }
-                let p = self.cur as *mut Obj;
-                let bit = (p as usize - self.chunks[self.chunk].0 as usize) / 8;
-                self.starts[self.chunk][bit / 64] |= 1 << (bit % 64);
-                self.cur = unsafe { self.cur.add(size) };
-                p
-            }
-        };
+        let size = Heap::object_size(payload_bytes);
+        let p: *mut Obj = self.blocks.take(size).cast();
         unsafe {
             p.write(Obj {
                 rc: 1,
@@ -967,19 +813,11 @@ impl Heap {
         if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
             return false;
         }
-        let address = w as usize;
-        for (i, (base, cap)) in self.chunks.iter().enumerate() {
-            let base = *base as usize;
-            if address >= base && address < base + *cap {
-                let bit = (address - base) / 8;
-                if self.starts[i][bit / 64] & (1 << (bit % 64)) == 0 {
-                    return false;
-                }
-                let o = address as *const Obj;
-                return unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 };
-            }
+        if !self.blocks.holds(w as usize) {
+            return false;
         }
-        false
+        let o = w as *const Obj;
+        unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 }
     }
 
     /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
@@ -1138,52 +976,18 @@ impl Heap {
         }
     }
 
-    /// Resets the entry's memory, keeping the first chunks that fit in [`KEPT_AT_END`] and giving
-    /// the rest back; the answer is already copied out.
+    /// Gives the entry's memory back; the answer is already copied out.
     pub fn end(&mut self) {
         if self.persistent {
             return;
         }
         self.drop_bridges();
-        let mut kept = 0;
-        let keep = self
-            .chunks
-            .iter()
-            .take_while(|(_, cap)| {
-                kept += cap;
-                kept <= KEPT_AT_END
-            })
-            .count();
-        for (p, cap) in self.chunks.drain(keep..) {
-            unsafe { dealloc(p, Layout::from_size_align(cap, 16).expect("a chunk layout")) };
-        }
-        self.starts.truncate(keep);
-        match self.chunks.first() {
-            Some((p, cap)) => {
-                self.cur = *p;
-                self.end = unsafe { p.add(*cap) };
-            }
-            None => {
-                self.cur = std::ptr::null_mut();
-                self.end = std::ptr::null_mut();
-            }
-        }
-        self.chunk = 0;
+        self.blocks.reset();
         self.count = 0;
         self.bytes = 0;
         self.by_kind = [0; 16];
         self.by_layout.clear();
-        self.recycled = 0;
-        for class in &mut self.free {
-            class.clear();
-        }
-        for class in &mut self.large {
-            class.clear();
-        }
         self.delayed.clear();
-        for bits in &mut self.starts {
-            bits.fill(0);
-        }
     }
 
     /// The compiled word for a `Value`: deep, and every object fresh in the entry.
@@ -1431,9 +1235,6 @@ fn read_int(n: i64, carry: &Carry, walked: &mut Walked) -> Value {
 impl Drop for Heap {
     fn drop(&mut self) {
         self.drop_bridges();
-        for (p, cap) in self.chunks.drain(..) {
-            unsafe { dealloc(p, Layout::from_size_align(cap, 16).expect("a chunk layout")) };
-        }
     }
 }
 
@@ -1568,7 +1369,7 @@ fn crosses_threads(v: &Value) -> bool {
     }
 }
 
-/// `o`, held once, released with its children, into `heap`'s free lists when it has them.
+/// `o`, held once, released with its children, their blocks back to `heap` where they are its.
 unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     let mut deferred = Vec::new();
     unsafe {
@@ -1652,8 +1453,7 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
 unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
     unsafe {
         // A shared object reaches here with its count's own bits spent.
-        let shared = (*o).rc == SHARED;
-        debug_assert!((shared || (*o).rc == 1) && (*o).kind != KIND_DEAD);
+        debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
         if (*o).kind == KIND_BRIDGE {
             std::ptr::drop_in_place(bridge_slot(o));
@@ -1693,11 +1493,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
                 deferred.push(co);
             }
         }
-        // The class is read off the header before it is marked dead.
-        if !shared {
-            recycle(o, heap);
-        }
-        (*o).kind = KIND_DEAD;
+        recycle(o, heap);
     }
 }
 
