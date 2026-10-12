@@ -55,8 +55,6 @@ pub type Stats = {
   warnings: List<Diag>,
   format: Int,
   root: String,
-  index_file: String,
-  data_file: String,
   /// Whole microseconds; the report prints milliseconds.
   open_us: Int,
   results: Int,
@@ -66,9 +64,9 @@ pub type Stats = {
   /// What the store keeps of the definitions a pass ran, which a later era's bisection reads.
   defs: Int,
   bodies: Int,
-  index_bytes: Int,
+  segments: Int,
   data_bytes: Int,
-  /// The data bytes no index record names, which compaction reclaims.
+  /// The bytes of entries a later filing replaced or dropped, which compaction reclaims.
   garbage_bytes: Int,
   memo: memo_files::Usage,
 }
@@ -198,7 +196,7 @@ fn nothing_cached(query: String) -> Diag =
 fn store_json(stats: Stats) -> Json = {
   let ratio = decimal(fixed_point(share(stats.garbage_bytes, stats.data_bytes, 1000000), 6));
   object([
-    { key: "index_bytes", value: int(stats.index_bytes) },
+    { key: "segments", value: int(stats.segments) },
     { key: "data_bytes", value: int(stats.data_bytes) },
     { key: "garbage_bytes", value: int(stats.garbage_bytes) },
     { key: "garbage_ratio", value: ratio },
@@ -225,8 +223,6 @@ fn stats_json(stats: Stats) -> Json / {abort.raise} =
     { key: "format", value: int(stats.format) },
     { key: "root", value: Str(stats.root) },
     { key: "directory", value: Str(stats.directory) },
-    { key: "index_file", value: Str(stats.index_file) },
-    { key: "data_file", value: Str(stats.data_file) },
     { key: "open_ms", value: decimal(fixed_point(stats.open_us, 3)) },
     { key: "entries", value: int(stats.results) },
     { key: "definitions_seen", value: int(stats.definitions_seen) },
@@ -273,7 +269,7 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
       ++ plural(stats.defs, "definition")
       ++ " · "
       ++ count_of(stats.bodies, "body"),
-    indent() ++ "  index " ++ dim(style, size_text(stats.index_bytes)) ++ " · data "
+    indent() ++ "  " ++ count_of(stats.segments, "segment") ++ " "
       ++ dim(style, size_text(stats.data_bytes))
       ++ " · reclaimable "
       ++ reclaimable(style, stats),
@@ -662,9 +658,6 @@ fn shown(place: loads::Place, name: String) -> String =
     path: if name == "" { place.dir } else { place.dir ++ "/" ++ name },
   })
 
-fn size_of<[r]>(place: loads::Place, name: String) -> Int / {fs.read[r]} =
-  match fs.file_size[r](place.dir ++ "/" ++ name) { Some(n) -> n, None -> 0 }
-
 fn memo_dir(place: loads::Place) -> String = place.dir ++ "/memo"
 
 fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us, abort.raise} = {
@@ -681,8 +674,6 @@ fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us, a
       path: if place.label == "cwd" { place.root }
       else { string_slice(place.root, 1, string_len(place.root)) },
     }),
-    index_file: shown(place, "store.idx"),
-    data_file: shown(place, "store.dat"),
     open_us: open_us,
     results: u.counts.passed,
     definitions_seen: u.counts.seen,
@@ -690,7 +681,7 @@ fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us, a
     reviews: u.counts.reviews,
     defs: u.counts.defs,
     bodies: u.counts.bodies,
-    index_bytes: size_of[r](place, "store.idx"),
+    segments: u.segments,
     data_bytes: u.data_bytes,
     garbage_bytes: if u.data_bytes > u.live_bytes { u.data_bytes - u.live_bytes } else { 0 },
     memo: memo_files::usage[r](memo_dir(place)),
@@ -699,8 +690,7 @@ fn stats_of<[r]>(place: loads::Place) -> Stats / {fs.read[r], time.elapsed_us, a
 
 /// Bytes the store and the memo store's segments take on disk.
 fn kept_bytes<[r]>(place: loads::Place) -> Int / {fs.read[r], abort.raise} =
-  size_of[r](place, "store.idx") + size_of[r](place, "store.dat")
-    + memo_files::usage[r](memo_dir(place)).bytes
+  engine::kept_bytes[r](place.dir) + memo_files::usage[r](memo_dir(place)).bytes
 
 fn compacted_of<[r]>(
   place: loads::Place,
@@ -727,9 +717,7 @@ fn cleared_of<[r]>(
 ) -> Result<Cleared, Refusal> / {fs.read[r], fs.write[r], abort.raise} = {
   let c = tables::open_cache[r](place.dir, place.stamps);
   let before = tables::counts(c).passed;
-  let stored = fold(["store.dat", "store.idx"], true, |ok: Bool, name: String|
-    if fs.exists[r](place.dir ++ "/" ++ name) { fs.remove[r](place.dir ++ "/" ++ name) && ok }
-    else { ok });
+  let stored = engine::cleared[r](place.dir);
   let memo = memo_dir(place);
   let gone = (!fs.exists[r](memo) || fs.remove_tree[r](memo)) && stored;
   let warnings = loads::diags_of(tables::warnings(c));
@@ -973,8 +961,6 @@ fn no_stats() -> Stats =
     warnings: [],
     format: 1,
     root: "/p",
-    index_file: "/p/.ply-cache/store.idx",
-    data_file: "/p/.ply-cache/store.dat",
     open_us: 0,
     results: 0,
     definitions_seen: 0,
@@ -982,7 +968,7 @@ fn no_stats() -> Stats =
     reviews: 0,
     defs: 0,
     bodies: 0,
-    index_bytes: 0,
+    segments: 0,
     data_bytes: 0,
     garbage_bytes: 0,
     memo: { records: 0, answers: 0, answer_bytes: 0, unread_bytes: 0, segments: 0, bytes: 0 },
@@ -1010,7 +996,7 @@ test "a size is exact in bytes and two decimals above that" {
   assert_eq(size_text(1048575), "1.00 MiB")
 }
 
-test "a half-wasted data file is where compaction starts being suggested" {
+test "a store half of whose bytes are unreachable is where compaction starts being suggested" {
   let half: Stats = { ..no_stats(), data_bytes: 1000, garbage_bytes: 400 };
   assert(!compact_suggested(half));
   assert(compact_suggested({ ..half, garbage_bytes: 501 }));
@@ -1036,7 +1022,7 @@ test "the statistics read as five lines and the sizes under them" {
     reviews: 0,
     defs: 4,
     bodies: 4,
-    index_bytes: 512,
+    segments: 2,
     data_bytes: 1000,
     garbage_bytes: 250,
     memo: { records: 3, answers: 5, answer_bytes: 2048, unread_bytes: 0, segments: 2, bytes: 4096 },
@@ -1048,15 +1034,15 @@ test "the statistics read as five lines and the sizes under them" {
   assert_eq(at_or(lines, 3, ""), "   results · 2 cached results · 3 definitions seen");
   assert_eq(at_or(lines, 4, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
   assert_eq(at_or(lines, 5, ""), "   history · 4 definitions · 4 bodies");
-  assert_eq(at_or(lines, 6, ""), "     index 512 B · data 1000 B · reclaimable 250 B (25%)");
+  assert_eq(at_or(lines, 6, ""), "     2 segments 1000 B · reclaimable 250 B (25%)");
   assert_eq(at_or(lines, 7, ""), "   memo · 3 records · 5 longer answers");
   assert_eq(at_or(lines, 8, ""), "     2 segments 4.00 KiB · answers 2.00 KiB · reclaimable 0 B");
   assert_eq(at_or(lines, 9, ""), "     a result entry is one proven configuration, not one test")
 }
 
 test "an empty store has nothing to reclaim and no note about what an entry counts" {
-  let lines = stats_lines(plain(), { ..no_stats(), index_bytes: 1, data_bytes: 2 });
-  assert_eq(at_or(lines, 6, ""), "     index 1 B · data 2 B · reclaimable 0 B (0%)");
+  let lines = stats_lines(plain(), { ..no_stats(), segments: 1, data_bytes: 2 });
+  assert_eq(at_or(lines, 6, ""), "     1 segment 2 B · reclaimable 0 B (0%)");
   assert_eq(len(lines), 9)
 }
 
