@@ -1,6 +1,6 @@
 //! `statics` — the static prover over a run's obligations: the claims it reads, lowered from the
 //! modules that own something to ask about and everything they import; each obligation's goal; and
-//! what a decision leaves the runtime to carry out.
+//! what a decision leaves a discharge to carry out.
 
 import compiler.diagnostics (parse_all)
 import compiler.front (Analysed, Claim, ClaimClause, ClaimDef, Refused, Analysis, analyse,
@@ -9,16 +9,16 @@ import compiler.items (SCost, SEnsures, SRequires)
 import compiler.resolve (ParsedModule)
 import context (Context, Claims, claims_of, context, ctor, signature, group_of)
 import decide (Certified, Diagnosed, Static, Undecided, GuardRefuted, Unwitnessed, Proved, Unknown,
-               decide_and_diagnose, static_of)
+               decide_and_diagnose, static_of, unasked)
 import goal (Goal, Binder, Limits, BudgetSpent, Open, default_limits, default_prove_budget)
 import lemma (Lemma, lemma_of)
 import cost (dominated, stated, steps)
 import lower (Blocker, Unbounded, blocker_parts)
 import measure (descent_of)
-import obligation (Ensures, Law)
+import obligation (Cost, Ensures, Law)
 import rules (CostBound)
 import sort (canonical)
-import world (Drawn, Fitting, Measure, Obligation, World, Interleave, Hosted, measures_in,
+import world (Bounded, Unwalked, Measure, Obligation, World, Interleave, measures_in,
               measures_world, unsettled, world_of)
 import world
 import std.list (concat)
@@ -246,8 +246,8 @@ fn closure(mods: List<ParsedModule>, from: List<Int>) -> List<Int> / {abort.rais
   filter(range(0, len(mods)), |i: Int| map_contains(seen, i))
 }
 
-/// The obligation's goal, or none when no claim states it. Binder `i` is slot `i` of every clause:
-/// the drawn binders, then `result`.
+/// The obligation's goal, or none when no claim states it or it is a `cost` bound, which is read
+/// off its owner's body. Binder `i` is slot `i` of every clause: the binders, then `result`.
 pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
   let binders = map(
     concat(obligation.binders, match obligation.result { Some(r) -> [r], None -> [] }),
@@ -271,6 +271,7 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
           }),
       },
     },
+    Cost(_) -> None,
     Law(_) -> match map_get(p.claims.laws, obligation.owner) {
       None -> None,
       Some(l) ->
@@ -292,9 +293,9 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
 pub fn diagnosed(p: Prover, obligation: Obligation) -> Option<Diagnosed> / {abort.raise} =
   match obligation.strategy {
     Interleave(_) -> None,
-    Fitting -> match map_get(p.claims.laws, obligation.owner) {
-      Some(l) -> match l.costs { Some(c) -> Some(bounded(p.cx, c.def, c.index)), None -> None },
-      None -> None,
+    Bounded -> match obligation.kind {
+      Cost(index) -> Some(bounded(p.cx, obligation.owner, index)),
+      _ -> None,
     },
     _ -> match map_get(p.decided, obligation.key) {
       Some(d) -> Some(d),
@@ -305,27 +306,17 @@ pub fn diagnosed(p: Prover, obligation: Obligation) -> Option<Diagnosed> / {abor
     },
   }
 
-/// What the runtime is left to carry out, from what the static tier answered: only a claim whose
+/// What a discharge is left to carry out, from what the static tier answered: only a claim whose
 /// strategy starts at the static prover is settled by it.
 pub fn settled_by(obligation: Obligation, d: Option<Diagnosed>) -> Static =
   match obligation.strategy {
-    Interleave(_) -> Undecided,
-    Hosted -> Undecided,
-    // A fit is measured unless a proof shows the bound.
-    Fitting -> match d {
-      Some(x) -> match x.decision {
-        Proved(_) -> static_of(x.decision, obligation.variables),
-        _ -> Undecided,
-      },
-      None -> Undecided,
-    },
-    _ -> match d { Some(x) -> static_of(x.decision, obligation.variables), None -> Undecided },
+    Interleave(_) -> unasked(),
+    _ -> match d { Some(x) -> static_of(x, obligation.variables), None -> unasked() },
   }
 
 pub fn settled(p: Prover, obligation: Obligation) -> Static / {abort.raise} =
   match obligation.strategy {
-    Interleave(_) -> Undecided,
-    Hosted -> Undecided,
+    Interleave(_) -> unasked(),
     _ -> settled_by(obligation, diagnosed(p, obligation)),
   }
 
@@ -421,14 +412,11 @@ test "an obligation is settled by what the prover decides, and only when its str
   assert(match settled(p, bump) { Unwitnessed(_) -> true, _ -> false });
   assert(settled(p, owed(w, "m.never")) == GuardRefuted);
   // An interleaving search never starts at the static prover, so nothing settles it.
-  assert(settled(p, { ..bump, strategy: Interleave(Drawn) }) == Undecided);
-  assert(diagnosed(p, { ..bump, strategy: Interleave(Drawn) }) == None);
-  // Nor a cost law's fit, which is measured.
-  assert(settled(p, { ..bump, strategy: Fitting }) == Undecided);
-  assert(diagnosed(p, { ..bump, strategy: Fitting }) == None)
+  assert(settled(p, { ..bump, strategy: Interleave(Unwalked) }) == unasked());
+  assert(diagnosed(p, { ..bump, strategy: Interleave(Unwalked) }) == None)
 }
 
-test "a `cost` clause its body shows settles the law it became, and one it does not is left to the fit" {
+test "a `cost` bound its owner's body shows is certified, and one it does not is left open with why" {
   let sources = [
     {
       name: b"m",
@@ -437,22 +425,21 @@ test "a `cost` clause its body shows settles the law it became, and one it does 
   ];
   let w = whole_of(sources);
   let p = prover_of(claims_for(w, [0]), world_of(w, world::every).world, 10000);
-  assert(match settled(p, owed(w, "m.cost of total")) {
+  assert(match settled(p, owed(w, "m.total")) {
     Certified(s) -> s.rules == [CostBound({ def: "m.total" })],
     _ -> false,
   });
-  let wrong = owed(w, "m.cost of wrong");
-  assert_eq(settled(p, wrong), Undecided);
-  assert(match diagnosed(p, wrong) {
-    Some(d) ->
-      d.blockers
-        == [
-          Unbounded(
-            "its steps are not within a constant times the bound at every size, zero included",
-          ),
-        ],
-    None -> false,
-  })
+  assert_eq(
+    settled(p, owed(w, "m.wrong")),
+    Undecided({
+      spent: false,
+      blockers: [
+        Unbounded(
+          "its steps are not within a constant times the bound at every size, zero included",
+        ),
+      ],
+    }),
+  )
 }
 
 test "a module the run does not own is claimed by its specifications, and a transparent definition by its body" {

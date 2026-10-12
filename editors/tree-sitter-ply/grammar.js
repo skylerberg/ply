@@ -82,7 +82,6 @@ module.exports = grammar({
       $.derive_declaration,
       $.key_declaration,
       $.show_declaration,
-      $.gen_declaration,
       $.numeric_declaration,
     ),
 
@@ -316,14 +315,12 @@ module.exports = grammar({
 
     law_declaration: $ => seq(
       'law',
-      optional(seq('/', 'host')),
       field('label', $.label),
       optional(choice(
         seq('=', field('instantiation', $._expression)),
         seq(
           optional(seq('forall', '(', commaSep1($.binder), ')')),
           optional(seq('where', field('guard', $._expression))),
-          optional($.cost_clause),
           field('body', $.block),
         ),
       )),
@@ -337,7 +334,6 @@ module.exports = grammar({
       $.parameter_list,
       optional(seq('forall', '(', commaSep1($.binder), ')')),
       optional(seq('where', field('guard', $._expression))),
-      optional($.cost_clause),
       field('body', $.block),
     ),
 
@@ -353,7 +349,6 @@ module.exports = grammar({
 
     key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', $.identifier)),
     show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', $.identifier)),
-    gen_declaration: $ => seq(optional('pub'), 'gen', 'for', field('type', $._type), 'by', field('function', $.identifier)),
     numeric_declaration: $ => seq(
       optional('pub'),
       'numeric',
@@ -380,7 +375,7 @@ module.exports = grammar({
       $.call_expression,
       $.try_expression,
       $.unary_expression,
-      $._binary_expression,
+      $.binary_expression,
       $.if_expression,
       $.match_expression,
       $.lambda_expression,
@@ -428,7 +423,9 @@ module.exports = grammar({
       field('operand', $._expression),
     )),
 
-    _binary_expression: $ => choice(
+    // A node of its own: were it hidden, an expression would recurse through hidden rules, and a
+    // query that walks past one never finishes compiling.
+    binary_expression: $ => choice(
       $._or_expression,
       $._and_expression,
       $._comparison_expression,

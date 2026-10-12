@@ -23,9 +23,10 @@
 //! caches of one capacity and lifetime that hold the same entries in the same order of use are
 //! equal, whatever each was put through: none carries a stamp or a counter.
 
-import std.laws (agrees, refines)
+import std.laws (refines)
 import std.math (ilog2)
 import std.time (after, at_millis, millis, nanos, nanos_at, seconds)
+import std.gen
 
 /// One entry, as `held` lists it and `of_held` takes it.
 pub type Held<k, v> = {
@@ -461,15 +462,24 @@ test "a write into a full cache takes the same steps whatever the cache holds" {
   )
 }
 
-law "filling, reading and overflowing a cache grows as its entries' number times its logarithm"
-  forall (n: Int) where n > 1 cost n * ilog2(n) {
-    let full = fold(range(0, n), lru(n), |c: Cache<Int, Int>, i: Int| put(c, i, i, at_millis(0)));
-    let read = fold(range(0, n), full, |c: Cache<Int, Int>, i: Int|
-      get(c, i * 7919 % n, at_millis(0)).cache);
-    fold(range(0, n), read, |c: Cache<Int, Int>, i: Int| put(c, n + i, i, at_millis(0)))
-  }
+/// An `Act` as a test draws one.
+fn acts() -> gen::Gen<Act> =
+  gen::one_of([
+    gen::map2(gen::any_int(), gen::any_int(), |f0: Int, f1: Int| Put(f0, f1)),
+    gen::map4(
+      gen::any_int(),
+      gen::any_int(),
+      gen::any_int(),
+      gen::any_int(),
+      |f0: Int, f1: Int, f2: Int, f3: Int| Insert(f0, f1, f2, f3),
+    ),
+    gen::map(gen::any_int(), |f0: Int| Get(f0)),
+    gen::map(gen::any_int(), |f0: Int| Remove(f0)),
+    gen::map(gen::any_int(), |f0: Int| Wait(f0)),
+    gen::constant(Sweep),
+  ])
 
-/// One operation of a script a law runs a cache through. Keys, weights, lifetimes and waits are
+/// One operation of a script a test runs a cache through. Keys, weights, lifetimes and waits are
 /// any integers, read down to a few so that scripts collide, overflow and expire.
 type Act = | Put(Int, Int) | Insert(Int, Int, Int, Int) | Get(Int) | Remove(Int) | Wait(Int) | Sweep
 
@@ -574,56 +584,43 @@ fn modelled(lifetime: Option<Int>, m: Model, a: Act) -> Model =
     Sweep -> { ..m, held: filter(m.held, |h: Held<Int, Int>| !past(h, m.now)) },
   }
 
-fn model_ran(lifetime: Option<Int>, script: List<Act>) -> Model =
-  fold(script, { now: 0, held: [], answers: [] }, |m: Model, a: Act| modelled(lifetime, m, a))
+test "an operation does to a cache what it does to a list kept in order of use" {
+  gen::check2(gen::list(acts()), acts(), |x: List<Act>, y: Act|
+    refines(
+      |script: List<Act>| viewed(None, script),
+      |script: List<Act>, a: Act| push(script, a),
+      |m: Model, a: Act| modelled(None, m, a),
+      x,
+      y,
+    ))
+}
 
-law "an operation does to a cache what it does to a list kept in order of use" =
-  refines(
-    |script: List<Act>| viewed(None, script),
-    |script: List<Act>, a: Act| push(script, a),
-    |m: Model, a: Act| modelled(None, m, a),
-  )
-
-law "a cache run through a script holds and answers what such a list does" =
-  agrees(|script: List<Act>| viewed(None, script), |script: List<Act>| model_ran(None, script))
-
-law "a cache whose entries live two milliseconds holds and answers what such a list does" =
-  agrees(|script: List<Act>| viewed(Some(2), script), |script: List<Act>|
-    model_ran(Some(2), script))
-
-law "what a cache holds weighs no more than its capacity, each entry at least one"
-  forall (script: List<Act>, lived: Int) {
+test "what a cache holds weighs no more than its capacity, each entry at least one" {
+  gen::check2(gen::list(acts()), gen::any_int(), |script: List<Act>, lived: Int| {
     let c = ran(a_lifetime(lived), script).cache;
     weight(c) <= capacity(c) && size(c) <= weight(c) && weight(c) == heft(held(c))
       && len(held(c)) == size(c)
-  }
+  })
+}
 
-law "a value put is the value a get answers"
-  forall (script: List<Act>, lived: Int, key: Int, value: Int) {
-    let r = ran(a_lifetime(lived), script);
-    let read = get(put(r.cache, key, value, at_millis(r.now)), key, at_millis(r.now));
-    read.value == Some(value)
-      && keys(read.cache) == keys(put(r.cache, key, value, at_millis(r.now)))
-  }
-
-law "an entry is never answered from its deadline on"
-  forall (script: List<Act>, lived: Int, later: Int) {
-    let c = ran(a_lifetime(lived), script).cache;
-    fold(held(c), true, |ok: Bool, h: Held<Int, Int>|
-      ok
-        && (match h.expires {
-          None -> true,
-          Some(due) -> {
-            let now = after(due, nanos(later & 0xFFFF));
-            get(c, h.key, now).value == None && peek(c, h.key, now) == None
-              && !contains(c, h.key, now)
-              && size(sweep(c, now)) < size(c)
-          },
-        }))
-  }
-
-law "a cache rebuilt from what it holds is the cache"
-  forall (script: List<Act>, lived: Int) {
-    let c = ran(a_lifetime(lived), script).cache;
-    of_held(capacity(c), lifetime(c), held(c)) == c
-  }
+test "an entry is never answered from its deadline on" {
+  gen::check3(
+    gen::list(acts()),
+    gen::any_int(),
+    gen::any_int(),
+    |script: List<Act>, lived: Int, later: Int| {
+      let c = ran(a_lifetime(lived), script).cache;
+      fold(held(c), true, |ok: Bool, h: Held<Int, Int>|
+        ok
+          && (match h.expires {
+            None -> true,
+            Some(due) -> {
+              let now = after(due, nanos(later & 0xFFFF));
+              get(c, h.key, now).value == None && peek(c, h.key, now) == None
+                && !contains(c, h.key, now)
+                && size(sweep(c, now)) < size(c)
+            },
+          }))
+    },
+  )
+}

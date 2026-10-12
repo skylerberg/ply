@@ -117,9 +117,7 @@ pub struct LawInfo {
     pub key: Symbol,
     /// Position in [`CheckOutput::laws`].
     pub index: usize,
-    /// `law/host`: the body may carry any row.
-    pub host: bool,
-    /// `{}`, `{sim.read}` for a concurrency law, or any row when [`host`](LawInfo::host) is set.
+    /// `{}`, or `{sim.read}` for a concurrency law.
     pub footprint: Footprint,
     pub span: Span,
 }

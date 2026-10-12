@@ -24,8 +24,8 @@ import type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode
                     row_member, no_generics, dump_ty, dump_row, dump_atom, dump_generics, dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span, no_expr,
-              fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, gen_binder,
-              set_binder, hidden_binder, case_at, case_identity, case_body, listing)
+              fn_param, param, dump_expr, dump_param, shown_binder, cases_binder, set_binder,
+              hidden_binder, case_at, case_identity, case_body, listing)
 import patterns (LStr)
 
 // --- The tree ---------------------------------------------------------------
@@ -126,16 +126,11 @@ pub type FnDef = {
 
 pub type Binder = { name: Ident, ty: TypeExpr, span: Span }
 
-/// `cost`: the bound a cost law's body is measured against, over its one size binder.
 pub type LawDef = {
   name: Bytes,
   name_span: Span,
-  host: Bool,
   binders: List<Binder>,
   guard: Option<Expr>,
-  cost: Option<Expr>,
-  /// The definition and the `cost` clause the rewrite made this law of, which no source writes.
-  costs: Option<{ def: Ident, index: Int }>,
   of: Option<OfSchema>,
   body: Expr,
   span: Span,
@@ -232,27 +227,14 @@ pub type DeriveDef = { deriver: Deriver, deriver_span: Span, target: Ident, span
 pub type Derived = { deriver: Deriver, target: Bytes, span: Span }
 
 /// What a nominal type's own module says its values go through: `key for Deque by to_list` for
-/// `==`, `compare`, `digest` and a `Map`'s order, `show for Date by render` for `show`, and
-/// `gen for Uuid by arbitrary` for what a sampled claim draws.
-pub type InstanceKind = | NKey | NShow | NGen
+/// `==`, `compare`, `digest` and a `Map`'s order, and `show for Date by render` for `show`.
+pub type InstanceKind = | NKey | NShow
 
 derive bin for InstanceKind
 
 pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Span }
 
-pub fn instance_text(kind: InstanceKind) -> Bytes =
-  match kind { NKey -> b"key", NShow -> b"show", NGen -> b"gen" }
-
-/// The definition a `gen for T by f` is beside its statement: `f`'s generator sampled at a seed,
-/// which is what a prover enters to draw a `T`. Led by `_`, so nothing reports it unused.
-pub fn sampler_name(target: Bytes) -> Bytes = bytes_concat(b"_sample_", target)
-
-/// The sampler a module's item states, by its simple name.
-pub fn sampler_of(item: Item) -> Option<Bytes> =
-  match item {
-    IInstance(d) -> match d.kind { NGen -> Some(sampler_name(d.target.name)), _ -> None },
-    _ -> None,
-  }
+pub fn instance_text(kind: InstanceKind) -> Bytes = match kind { NKey -> b"key", NShow -> b"show" }
 
 /// One function a `numeric` names, and the operation it names it for.
 pub type NumericOp = { op: Ident, by: Ident }
@@ -464,8 +446,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
 /// `key` and `show` are contextual: one opens an item only before `for`, so `fn key(..)` and a field
 /// named `show` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
-  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show")
-    || at_ident_text(input, parser, b"gen"))
+  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show"))
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
@@ -1141,14 +1122,6 @@ pub fn quoted(
     _ -> Err(error_here(input, parser, what)),
   }
 
-fn law_host(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} = {
-  let sl = eat(input, parser, token_slash());
-  if !sl.ok { Ok({ parser: sl.parser, node: false }) }
-  else if !at_ident_text(input, sl.parser, b"host") {
-    Err(error_here(input, sl.parser, b"`host` after `law/`"))
-  } else { Ok({ parser: advance(input, sl.parser).parser, node: true }) }
-}
-
 fn law_guard(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parser> / {abort.raise} =
   if !at_ident_text(input, parser, b"where") { Ok({ parser: parser, node: None }) } else {
     let a = advance(input, parser);
@@ -1156,41 +1129,28 @@ fn law_guard(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parse
     Ok({ parser: parser, node: Some(e) })
   }
 
-fn law_cost(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parser> / {abort.raise} =
-  if !at_ident_text(input, parser, b"cost") { Ok({ parser: parser, node: None }) } else {
-    let a = advance(input, parser);
-    let { parser, node: e } = scrutinee(input, a.parser)?;
-    Ok({ parser: parser, node: Some(e) })
-  }
-
 pub fn law_def(input: Input, parser: Parser) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
-  let { parser, node: h } = law_host(input, st.parser)?;
-  let nm = quoted(input, parser, b"a quoted law label")?;
-  if at_token(input, nm.parser, token_eq()) { instantiation(input, st.node, h, nm) }
-  else { written_law(input, st.node, h, nm) }
+  let nm = quoted(input, st.parser, b"a quoted law label")?;
+  if at_token(input, nm.parser, token_eq()) { instantiation(input, st.node, nm) }
+  else { written_law(input, st.node, nm) }
 }
 
 fn written_law(
   input: Input,
   start: Span,
-  host: Bool,
   nm: ParsedName,
 ) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
   let { parser, node: bs } = law_binders(input, nm.parser)?;
   let { parser, node: g } = law_guard(input, parser)?;
-  let { parser, node: k } = law_cost(input, parser)?;
   let { parser, node: body } = block_expr(input, parser)?;
   Ok({
     parser: parser,
     node: {
       name: nm.name,
       name_span: nm.span,
-      host: host,
       binders: bs,
       guard: g,
-      cost: k,
-      costs: None,
       of: None,
       body: body,
       span: span_to(start, expr_span(body)),
@@ -1202,7 +1162,6 @@ fn written_law(
 fn instantiation(
   input: Input,
   start: Span,
-  host: Bool,
   nm: ParsedName,
 ) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
   let eq = advance(input, nm.parser);
@@ -1222,28 +1181,13 @@ fn instantiation(
     b"`)` to close the arguments",
   )?;
   let span = span_to(q.span, cl);
-  let pure = if !host { parser } else {
-    push_diag(
-      parser,
-      error_at(
-        unexpected(),
-        span_to(start, nm.span),
-        b"an instantiation cannot be `law/host`",
-        b"write `law`",
-        [b"a schema's body is pure, so no instantiation of one reaches the host"],
-      ),
-    )
-  };
   Ok({
-    parser: pure,
+    parser: parser,
     node: {
       name: nm.name,
       name_span: nm.span,
-      host: false,
       binders: [],
       guard: None,
-      cost: None,
-      costs: None,
       of: Some({ schema: q, home: None, shown: [], span: span }),
       body: EApp({
         span: span,
@@ -1299,18 +1243,6 @@ fn schema_generics(
 fn take_one(idents: List<Ident>) -> List<Ident> =
   match list_at(idents, 0) { Some(first) -> [first], None -> [] }
 
-fn uncosted(parser: Parser, cost: Option<Expr>) -> Parser =
-  match cost {
-    None -> parser,
-    Some(bound) ->
-      push_diag(
-        parser,
-        error_at(unexpected(), expr_span(bound), b"a law schema states no `cost`", b"remove it", [
-          b"a cost law measures one body at its sizes: write the bound on the law that has the body",
-        ]),
-      ),
-  }
-
 pub fn schema_def(
   input: Input,
   parser: Parser,
@@ -1336,8 +1268,7 @@ pub fn schema_def(
   )?;
   let { parser, node: bs } = law_binders(input, parser)?;
   let { parser, node: guard } = law_guard(input, parser)?;
-  let { parser, node: k } = law_cost(input, parser)?;
-  let { parser, node: body } = block_expr(input, uncosted(parser, k))?;
+  let { parser, node: body } = block_expr(input, parser)?;
   Ok({
     parser: parser,
     node: {
@@ -1874,16 +1805,14 @@ pub fn derive_def(
   }
 }
 
-// --- `key`, `show` and `gen` ------------------------------------------------
+// --- `key` and `show` -------------------------------------------------------
 
-/// One `key for T by f`, `show for T by f` or `gen for T by f`.
+/// One `key for T by f` or `show for T by f`.
 pub fn instance_def(
   input: Input,
   parser: Parser,
 ) -> Result<Parsed<InstanceDef>, Parser> / {abort.raise} = {
-  let kind = if at_ident_text(input, parser, b"key") { NKey }
-  else if at_ident_text(input, parser, b"show") { NShow }
-  else { NGen };
+  let kind = if at_ident_text(input, parser, b"key") { NKey } else { NShow };
   let st = advance(input, parser);
   let f = advance(input, st.parser);
   let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
@@ -2241,13 +2170,9 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
     None -> shown,
     Some(sp) -> push(shown, hidden_import(b"cases", cases_binder(), sp)),
   };
-  let drawn = match first_gen(done.items) {
-    None -> ranged,
-    Some(sp) -> push(ranged, hidden_import(b"gen", gen_binder(), sp)),
-  };
   let gathered = match first_set(input) {
-    None -> drawn,
-    Some(sp) -> push(drawn, hidden_import(b"set", set_binder(), sp)),
+    None -> ranged,
+    Some(sp) -> push(ranged, hidden_import(b"set", set_binder(), sp)),
   };
   {
     parser: done.parser,
@@ -2307,17 +2232,6 @@ fn published(items: List<Item>) -> List<Item> =
       })
   }
 
-/// Where the module first states a `gen`: its sampler calls `std.gen`.
-fn first_gen(items: List<Item>) -> Option<Span> =
-  fold(items, None, |acc: Option<Span>, item: Item|
-    match acc {
-      Some(_) -> acc,
-      None -> match item {
-        IInstance(d) -> match d.kind { NGen -> Some(d.span), _ -> None },
-        _ -> None,
-      },
-    })
-
 /// Where the module's first test over cases says `for`: listing and choosing a case call `std.cases`.
 fn first_cases(items: List<Item>) -> Option<Span> =
   fold(items, None, |acc: Option<Span>, item: Item|
@@ -2367,13 +2281,7 @@ pub fn is_written(decl: ImportDecl) -> Bool =
   match decl.kind { IAlias(a) -> !hidden_binder(a.name), _ -> true }
 
 /// Where `header`'s walk over a module's tokens stands, and the first of each hidden import it found.
-type HeaderScan = {
-  at: Int,
-  whole: Bool,
-  shown: Option<Span>,
-  cased: Option<Span>,
-  drawn: Option<Span>,
-}
+type HeaderScan = { at: Int, whole: Bool, shown: Option<Span>, cased: Option<Span> }
 
 /// The module `src` with its imports alone, the hidden ones among them, and none of its items:
 /// what a load reads to find the modules a program pulls, without parsing a body. `None` where only
@@ -2403,7 +2311,7 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
       }).at;
   // One walk over the tokens, which stops where only a whole parse can say what the module imports.
   let scanned = iterate(
-    { at: 0, whole: false, shown: None, cased: None, drawn: None },
+    { at: 0, whole: false, shown: None, cased: None },
     n + 1,
     |h: HeaderScan|
       if h.whole || h.at >= n { Stop(h) } else {
@@ -2434,13 +2342,6 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
               if after != label && ident(after, b"for") { Some(span_at(after)) } else { None }
             },
           },
-          // A `gen for T by f` is five tokens, and the span of the statement is its import's.
-          drawn: match h.drawn {
-            Some(_) -> h.drawn,
-            None -> if ident(i, b"gen") && ident(i + 1, b"for") {
-              Some({ start: span_at(i).start, end: span_at(i + 4).end })
-            } else { None },
-          },
         })
       },
   );
@@ -2453,15 +2354,11 @@ pub fn header(src: Bytes) -> Option<Module> / {abort.raise} = {
       None -> with_shown,
       Some(sp) -> push(with_shown, hidden_import(b"cases", cases_binder(), sp)),
     };
-    let with_drawn = match scanned.drawn {
-      None -> with_cased,
-      Some(sp) -> push(with_cased, hidden_import(b"gen", gen_binder(), sp)),
-    };
     Some({
       doc: module_doc(input),
       imports: match first_set(input) {
-        None -> with_drawn,
-        Some(sp) -> push(with_drawn, hidden_import(b"set", set_binder(), sp)),
+        None -> with_cased,
+        Some(sp) -> push(with_cased, hidden_import(b"set", set_binder(), sp)),
       },
       items: [],
     })
@@ -2552,7 +2449,6 @@ fn may_start(k: TokenKind) -> Bool =
         || n == b"extern"
         || n == b"key"
         || n == b"show"
-        || n == b"gen"
         || n == b"numeric",
     _ -> false,
   }
@@ -2856,10 +2752,8 @@ pub fn dump_law(law_def: LawDef) -> Bytes / {abort.raise} =
     dump_node(law_def.span, b"law"),
     dump_node(law_def.name_span, b"lnm"),
     dump_payload(law_def.name),
-    dump_bool(law_def.host),
     dump_list(law_def.binders, dump_binder),
     dump_opt(law_def.guard, dump_expr),
-    dump_opt(law_def.cost, dump_expr),
     dump_expr(law_def.body),
     match law_def.of {
       Some(i) -> bytes_concat(dump_node(i.span, b"of"), dump_qname(i.schema)),
@@ -3186,10 +3080,10 @@ test "an effect set collects atoms and the sets it includes" {
   )
 }
 
-test "a law carries a host flag, binders, a guard and a body" {
+test "a law carries its binders, a guard and a body" {
   assert_eq(
-    dump(b"law/host \"l\" forall (a: Int) where a { a }\n"),
-    "#0;#1;0:42:law;9:12:lnm;@6c;%true;#1;21:27:bnd;21:22:ident;@61;24:27:tcon;24:27:qname;?0;24:27:ident;@496e74;#0;?1;35:36:evar;35:36:qname;?0;35:36:ident;@61;?0;37:42:eblk;#0;?1;39:40:evar;39:40:qname;?0;39:40:ident;@61;#0;",
+    dump(b"law \"l\" forall (a: Int) where a { a }\n"),
+    "#0;#1;0:37:law;4:7:lnm;@6c;#1;16:22:bnd;16:17:ident;@61;19:22:tcon;19:22:qname;?0;19:22:ident;@496e74;#0;?1;30:31:evar;30:31:qname;?0;30:31:ident;@61;32:37:eblk;#0;?1;34:35:evar;34:35:qname;?0;34:35:ident;@61;#0;",
   )
 }
 
@@ -3374,7 +3268,7 @@ test "a law schema carries its parameters, its binders, a guard and a body, and 
 test "an instantiation is a law whose body is the call it writes" {
   assert_eq(
     dump(b"law \"l\" = m::s(f, 1)\n"),
-    "#0;#1;0:20:law;4:7:lnm;@6c;%false;#0;?0;?0;10:20:eapp;10:14:evar;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#2;15:16:evar;15:16:qname;?0;15:16:ident;@66;18:19:elit;%int;@31;#0;#0;10:20:of;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#0;",
+    "#0;#1;0:20:law;4:7:lnm;@6c;#0;?0;10:20:eapp;10:14:evar;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#2;15:16:evar;15:16:qname;?0;15:16:ident;@66;18:19:elit;%int;@31;#0;#0;10:20:of;10:14:qname;?1;10:11:ident;@6d;13:14:ident;@73;#0;",
   )
 }
 
@@ -3395,17 +3289,10 @@ test "a schema takes types and one row, binds no label, states no bound and writ
       "#1;!E0001:14:15:1:1;=14:15:1;",
     ),
   );
-  assert(
-    string_ends_with(
-      dump(b"law schema s(f: Int) forall (n: Int) cost n { true }\n"),
-      "#1;!E0001:42:43:1:1;=42:43:1;",
-    ),
-  );
   assert_eq(dump(b"law schema s(f) { true }\n"), "#0;#0;#1;!E0001:14:15:1:0;=14:15:1;")
 }
 
-test "an instantiation is never `law/host` or `pub`, and `schema` stays a name" {
-  assert(string_ends_with(dump(b"law/host \"l\" = s(f)\n"), "#1;!E0001:0:12:1:1;=0:12:1;"));
+test "an instantiation is never `pub`, and `schema` stays a name" {
   assert(string_ends_with(dump(b"pub law \"l\" = s(f)\n"), "#1;!E0001:0:3:1:1;=0:3:1;"));
   assert_eq(
     len(parse(b"fn law(schema: Int) -> Int = schema\nfn f() -> Int = law(1)\n").parser.diags),
@@ -3598,7 +3485,6 @@ test "a header holds the imports a whole parse finds, the hidden ones among them
   assert(same(b"test \"each {n}\" for n: Int in [1, 2] { assert(n > 0) }\n"), None);
   assert(same(b"test/nondet \"each\" for n: Int in [1] { assert(n > 0) }\n"), None);
   assert(same(b"test \"plain\" { assert(true) }\nfn for_each() -> Int = 1\n"), None);
-  assert(same(b"type T = | T(Int)\ngen for T by f\nfn f() -> Int = 0\n"), None);
   assert(same(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n"), None);
   assert(same(b"import std.bin\ntype T = { a: Int }\nderive bin for T\n"), None);
   assert_eq(header(b"fn f() -> Int = 1\nimport std.list\n"), None)
@@ -3618,31 +3504,4 @@ test "an importer reads no test or law, nor a private item or an import only the
   // Whatever a `pub` item or a `derive` spells stays, and so does what that spells in turn.
   let held = b"import std.bin\n\ntype Kept = { a: Int }\n\nderive bin for Kept\n\nfn helper() -> Int = 1\n\npub fn shown() -> Int = helper()\n";
   assert_eq(unimported(held), [])
-}
-
-test "`gen for T by f` is an item that brings `std.gen` under a name no source writes" {
-  let r = parse(b"type T = | T(Int)\ngen for T by f\nfn f() -> Int = 0\n");
-  assert_eq(len(r.parser.diags), 0);
-  match r.node.items {
-    [IType(_), IInstance(g), IFn(_)] -> {
-      assert_eq(instance_text(g.kind), b"gen");
-      assert_eq(g.target.name, b"T");
-      assert_eq(g.by.name, b"f");
-      assert_eq(g.span, { start: 18, end: 32 });
-      assert_eq(sampler_of(IInstance(g)), Some(b"_sample_T"))
-    },
-    _ -> panic("a type, a gen and a function"),
-  };
-  match r.node.imports {
-    [hidden] -> {
-      assert_eq(map(hidden.path, |part: Ident| part.name), [b"std", b"gen"]);
-      assert(!is_written(hidden))
-    },
-    _ -> panic("one import, the parser's"),
-  };
-  // A module that states none imports nothing, and `gen` is a name like any other.
-  let plain = parse(b"type T = | T(Int)\nkey for T by gen\nfn gen(t: T) -> Int = 0\n");
-  assert_eq(len(plain.parser.diags), 0);
-  assert_eq(len(plain.node.imports), 0);
-  assert_eq(map(plain.node.items, sampler_of), [None, None, None])
 }

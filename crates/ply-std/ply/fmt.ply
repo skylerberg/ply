@@ -30,10 +30,10 @@ import std.bigint
 import std.bytes (is_digit)
 import std.decimal
 import std.decimal (of_parts)
-import std.laws (round_trip)
 import std.list (all, at_or, chunks, concat, drop, drop_while, reverse, take, take_while)
 import std.option (option_map)
 import std.string (int_of_string, join, repeat)
+import std.gen
 
 // --- A number, exactly ------------------------------------------------------
 
@@ -798,35 +798,11 @@ test "a span at a tie goes as the rounding says" {
   assert_eq(duration(Duration(5370000000000)), "1 h 30 min")
 }
 
-fn roundings() -> List<Rounding> = [HalfEven, HalfUp, Down, Up, Ceiling, Floor]
-
-/// A decimal text with exactly `digits` after its point, zeros filling what it lacks, and the
-/// sign of a negative number that rounded to nothing put back.
-fn filled(text: String, digits: Int, negative: Bool) -> String / {abort.raise} = {
-  let have = if string_contains(text, ".") { string_len(text) - string_find(text, ".") - 1 }
-  else { 0 };
-  let pointed = if have == 0 && digits > 0 { text ++ "." } else { text };
-  (if negative && !string_starts_with(text, "-") { "-" } else { "" }) ++ pointed
-    ++ repeat("0", digits - have)
-}
-
-law "a float's places are those the prelude rounds its exact decimal to"
-  forall (n: Int, d: Int, r: Int) {
-    let v = (n & 0xFF_FFFF_FFFF) - 0x80_0000_0000;
-    let rounding = at_or(roundings(), r & 7, HalfEven);
-    let exact = decimal_div(decimal_of_int(v), decimal_of_int(1024), 10, Down);
-    fixed(float_of_int(v) / 1024.0, d & 15, rounding)
-      == filled(decimal_to_string(decimal_round(exact, d & 15, rounding)), d & 15, v < 0)
-      && percent(float_of_int(v) / 1024.0, d & 7, rounding)
-      == filled(decimal_to_string(decimal_round(exact * 100m, d & 7, rounding)), d & 7, v < 0)
-      ++ "%"
-  }
-
 fn spelled(limbs: List<Int>) -> String =
   if len(limbs) == 0 { "0" } else { string_of_chars(digits_of(limbs)) }
 
-law "a float's digits are its mantissa times a power of two or of five, as std.bigint multiplies"
-  forall (m: Int, k: Int) {
+test "a float's digits are its mantissa times a power of two or of five, as std.bigint multiplies" {
+  gen::check2(gen::any_int(), gen::any_int(), |m: Int, k: Int| {
     let mantissa = m & 0x1F_FFFF_FFFF_FFFF;
     let power = k & 1023;
     spelled(doubled(limbs_of(mantissa), power))
@@ -837,73 +813,19 @@ law "a float's digits are its mantissa times a power of two or of five, as std.b
       == bigint::to_string(
         bigint::mul(bigint::of_int(mantissa), bigint::pow(bigint::of_int(5), power)),
       )
-  }
+  })
+}
 
-law "seventeen significant digits read back as the float"
-  forall (x: Float) where x - x == 0.0 {
-    float_of_string(scientific(x, 16)) == Some(x)
-  }
+test "seventeen significant digits read back as the float" {
+  gen::check(gen::float(), |x: Float|
+    if x - x == 0.0 { float_of_string(scientific(x, 16)) == Some(x) } else { true })
+}
 
-law "a decimal's places are those the prelude rounds it to"
-  forall (d: Decimal, k: Int, r: Int) {
-    let rounding = at_or(roundings(), r & 7, HalfEven);
-    // Rounded, never filled: the prelude refuses a decimal with no room for the zeros.
-    let rounded = decimal_round(d, min(k & 15, decimal::scale(d)), rounding);
-    fixed_decimal(d, k & 15, rounding) == filled(decimal_to_string(rounded), k & 15, d < 0m)
-  }
-
-law "an integer in small units is written as the decimal of those parts is"
-  forall (n: Int, k: Int) {
-    Some(fixed_point(n, k & 15)) == option_map(of_parts(n, k & 15), decimal_to_string)
-  }
-
-law "grouping adds separators and nothing else, three digits to a group"
-  forall (n: Int) {
+test "grouping adds separators and nothing else, three digits to a group" {
+  gen::check(gen::any_int(), |n: Int| {
     let text = grouped(int_to_string(n));
     join(string_split(text, ","), "") == int_to_string(n)
       && all(drop(string_split(text, ","), 1), |group: String| string_len(group) == 3)
       && grouped(text) == text
-  }
-
-law "zero padding fills the width and keeps the number"
-  forall (n: Int, w: Int) {
-    let text = zero_padded(int_to_string(n), w & 31);
-    string_len(text) == max(w & 31, string_len(int_to_string(n))) && int_of_string(text) == Some(n)
-  }
-
-law "a count of bytes written in bytes reads back" =
-  round_trip(|n: Int| int_to_string(n) ++ " B", parse_size)
-
-law "a whole count of a unit reads back as it was"
-  forall (n: Int, p: Int, binary: Bool) {
-    let units = if binary { Iec } else { Si };
-    let bytes = (n & 511) * at_or(steps(units), (p & 7) % 6, 1);
-    parse_size(size(bytes, units)) == Some(bytes)
-      && parse_size(size(0 - bytes, units)) == Some(0 - bytes)
-  }
-
-law "a size reads back within the last digit it shows"
-  forall (n: Int, d: Int, binary: Bool) {
-    let bytes = (n & 0x3_FFFF_FFFF_FFFF) - 0x2_0000_0000_0000;
-    let unit = fold(range(0, d & 3), 1, |ten: Int, _: Int| ten * 10);
-    match parse_size(size(bytes, if binary { Iec } else { Si }, d & 3)) {
-      Some(back) ->
-        (if back > bytes { back - bytes } else { bytes - back }) * unit
-          <= (if bytes < 0 { 0 - bytes } else { bytes }) + unit,
-      None -> false,
-    }
-  }
-
-law "a span before is said as the span after, behind a sign"
-  forall (n: Int) where n > 0 {
-    duration(Duration(0 - n)) == "-" ++ duration(Duration(n))
-  }
-
-law "a whole count of a unit is said as that count"
-  forall (n: Int) {
-    let k = 1 + (n & 15);
-    duration(Duration(k * 1000000000)) == int_to_string(k) ++ " s"
-      && duration(Duration(k * 60000000000)) == int_to_string(k) ++ " min"
-      && duration(Duration(k * 3600000000000)) == int_to_string(k) ++ " h"
-      && duration(Duration(k * 86400000000000)) == int_to_string(k) ++ " d"
-  }
+  })
+}

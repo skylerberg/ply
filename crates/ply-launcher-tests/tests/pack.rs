@@ -128,6 +128,58 @@ fn a_packs_digest_moves_with_any_file_and_with_nothing_else() {
 }
 
 #[test]
+fn a_digest_below_directories_moves_with_a_file_there_and_with_none_outside() {
+    let below = |files: &[(&str, &[u8])]| {
+        read(&binary(b"", files))
+            .expect("the pack reads")
+            .expect("the binary carries one")
+            .digest_below(&[ply_pack::STD, ply_pack::PRELUDE])
+    };
+    let base = below(&[
+        ("crates/ply-std/ply/option.ply", b"a"),
+        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("program/front", b"f"),
+    ]);
+    let moved = |files: &[(&str, &[u8])]| below(files) != base;
+    assert!(moved(&[
+        ("crates/ply-std/ply/option.ply", b"b"),
+        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("program/front", b"f"),
+    ]));
+    assert!(moved(&[
+        ("crates/ply-std/ply/option.ply", b"a"),
+        ("crates/ply-std/ply/oid/names.txt", b"n"),
+        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("program/front", b"f"),
+    ]));
+    assert!(moved(&[
+        ("crates/ply-std/ply/option.ply", b"a"),
+        ("crates/ply-compiler/prelude.ply", b"q"),
+        ("program/front", b"f"),
+    ]));
+    // The program, and a file whose path only starts as a root's does, are no part of it.
+    assert!(!moved(&[
+        ("crates/ply-std/ply/option.ply", b"a"),
+        ("crates/ply-std/ply.txt", b"d"),
+        ("crates/ply-compiler/prelude.ply", b"p"),
+        ("program/front", b"another"),
+    ]));
+}
+
+// A stage is named for the program, which reaches only some shipped modules: an edit to another,
+// or to a test in one, must still move the directory a rebuilt `ply` reads them from.
+#[test]
+fn a_stages_shipped_directory_moves_with_any_shipped_file() {
+    let name = ply_launcher::shipped_dir_name;
+    let base = name("stamps", "definitions", &[1; 32]);
+    assert_eq!(name("stamps", "definitions", &[1; 32]), base);
+    assert_ne!(name("stamps", "definitions", &[2; 32]), base);
+    assert_ne!(name("stamps", "other", &[1; 32]), base);
+    assert_ne!(name("other", "definitions", &[1; 32]), base);
+    assert!(base.starts_with("shipped-"));
+}
+
+#[test]
 fn a_binary_with_no_pack_carries_none() {
     assert!(read(b"just code").expect("reads").is_none());
     assert!(read(b"").expect("reads").is_none());

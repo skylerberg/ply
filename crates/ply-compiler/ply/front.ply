@@ -5,9 +5,8 @@ import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_lab
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
               VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
               VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub, DRow,
-              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, NGen,
-              stated_type, sampler_of, item_span, IAlias, IModule, IDerive, IInstance, INumeric,
-              spec_kind_bin)
+              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, stated_type,
+              item_span, IAlias, IModule, IDerive, IInstance, INumeric, spec_kind_bin)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
@@ -40,10 +39,10 @@ import infer (CheckOutput, Location, DefInfo, DefConstraint, SpecInfo, TestInfo,
               foreign_facts, no_root_facts, root_facts_bin, test_owner, is_test_owner, law_root,
               cases_root, listing_ty, witness_order_bin, elaborated, ended, stated,
               elaboration_with, updated_mods, check_front_with, is_prelude_effect, Builtin,
-              builtins, published_pure, measure_ty, EmitFacts, emit_facts_bin, written_counts,
-              InstanceInfo, NumericInfo, Raise, raise_bin, Elaboration, def_info_bin, test_info_bin,
-              law_info_bin, effect_info_bin, ctor_info_bin, instance_info_bin, numeric_info_bin,
-              kept_facts_bin, prelude_tables)
+              builtins, published_pure, EmitFacts, emit_facts_bin, written_counts, InstanceInfo,
+              NumericInfo, Raise, raise_bin, Elaboration, def_info_bin, test_info_bin, law_info_bin,
+              effect_info_bin, ctor_info_bin, instance_info_bin, numeric_info_bin, kept_facts_bin,
+              prelude_tables)
 import termination (Ending, Ends, Summary, ending_bin, summary_bin, unknown_summary)
 import diagnostics (ParsedSource, headed_at, parse_all, parse_at, outside_every_module, placed)
 import pkg (PackageSources, Supplied, Closure, Package, Pinned, Judged, closure, closed, empty,
@@ -147,10 +146,9 @@ pub type Outline = {
   schemas: List<Bytes>,
   sets: List<SetView>,
   cuts: List<Cut>,
-  /// Each type a `key`, `show`, `gen` or `numeric` names, and each sampler a `gen` writes, by its
-  /// program-wide name: what a load reads of a module it pulls whatever the program reaches.
+  /// Each type a `key`, `show` or `numeric` names, by its program-wide name: what a load reads of
+  /// a module it pulls whatever the program reaches.
   stated: List<Bytes>,
-  samplers: List<Bytes>,
   /// Each `effect set` as written.
   set_texts: List<Bytes>,
 }
@@ -190,7 +188,7 @@ fn outline_of(
           ),
         ITest(d) ->
           push(acc, OTest({ name: d.name, name_span: d.name_span, cases: d.cases != None })),
-        ILaw(d) -> push(acc, OLaw({ name: d.name, literals: guard_literals(mods, d) })),
+        ILaw(d) -> push(acc, OLaw({ name: d.name, literals: claim_literals(mods, d) })),
         IType(d) ->
           push(
             acc,
@@ -211,8 +209,6 @@ fn outline_of(
     cuts: cuts,
     stated: fold(parsed.module.items, [], |acc: List<Bytes>, item: Item|
       match stated_type(item) { Some(t) -> push(acc, qualify(parsed.name, t.name)), None -> acc }),
-    samplers: fold(parsed.module.items, [], |acc: List<Bytes>, item: Item|
-      match sampler_of(item) { Some(n) -> push(acc, qualify(parsed.name, n)), None -> acc }),
     set_texts: fold(parsed.module.items, [], |acc: List<Bytes>, item: Item|
       match item { IEffectSet(_) -> push(acc, dump_item(item)), _ -> acc }),
   }
@@ -275,8 +271,8 @@ fn test_name_spans(outlines: List<Outline>) -> List<Location> / {abort.raise} =
     fold(at(outlines, i).items, acc, |a: List<Location>, item: Outlined|
       match item { OTest(t) -> push(a, { module: i, span: t.name_span }), _ -> a }))
 
-// --- A guard's literals -------------------------------------------------------
-// The order seeds the prover's witness search, so it is the stack walk's first-reached order, not sorted.
+// --- A claim's literals -------------------------------------------------------
+// The order seeds the prover's search for a point, so it is the stack walk's first-reached order, not sorted.
 
 fn int_lit(k: Int) -> Bytes = bytes_concat(b"int ", ascii_of_int(k))
 
@@ -348,10 +344,10 @@ fn lits(acc: List<Bytes>, expr: Expr) -> List<Bytes> / {abort.raise} = {
   }
 }
 
-/// The literals these guards are written with, one guard at a time, as `<int|str|bytes> <value>`:
-/// where a guard's domain is, which a witness search tries first.
-pub fn literals_of(guards: List<Expr>) -> List<Bytes> / {abort.raise} =
-  fold(guards, [], |acc: List<Bytes>, expr: Expr| lits(acc, expr))
+/// The literals `written` holds, one expression at a time, as `<int|str|bytes> <value>`: where a
+/// claim's guards turn and where it may fail, which a search for a point tries first.
+pub fn literals_of(written: List<Expr>) -> List<Bytes> / {abort.raise} =
+  fold(written, [], |acc: List<Bytes>, expr: Expr| lits(acc, expr))
 
 /// The definitions a program's schemas are, by program-wide name: what a claim states, which is not
 /// itself something to carry one.
@@ -389,19 +385,119 @@ pub fn schemas_instantiated(mods: List<ParsedModule>) -> Map<Bytes, Bytes> =
         _ -> a,
       }))
 
-/// The literals a law's guard is written with: its own, or of an instantiation its schema's.
-pub fn guard_literals(mods: List<ParsedModule>, law_def: LawDef) -> List<Bytes> / {abort.raise} = {
-  let schema = match law_def.of {
-    Some(of) -> match home_of(mods, of) {
-      Some(home) -> schema_named(at(mods, home).module, of.schema.name.name),
-      None -> None,
-    },
+/// What the schema a law instantiates states, where the law instantiates one.
+fn schema_stated(
+  mods: List<ParsedModule>,
+  law_def: LawDef,
+) -> Option<{ guard: Option<Expr>, body: Expr }> / {abort.raise} =
+  match law_def.of {
     None -> None,
-  };
-  match match schema { Some(s) -> s.guard, None -> law_def.guard } {
-    Some(g) -> lits([], g),
-    None -> [],
+    Some(of) -> match home_of(mods, of) {
+      None -> None,
+      Some(home) -> match schema_named(at(mods, home).module, of.schema.name.name) {
+        Some(s) -> Some({ guard: s.guard, body: s.body }),
+        None -> None,
+      },
+    },
   }
+
+/// A law's guard: its own, or of an instantiation its schema's.
+fn guard_of(mods: List<ParsedModule>, law_def: LawDef) -> Option<Expr> / {abort.raise} =
+  match schema_stated(mods, law_def) { Some(s) -> s.guard, None -> law_def.guard }
+
+/// The literals a law is written with, its guard's first: of an instantiation its schema's, and
+/// then what it hands the schema.
+pub fn claim_literals(mods: List<ParsedModule>, law_def: LawDef) -> List<Bytes> / {abort.raise} = {
+  let guarded = match guard_of(mods, law_def) { Some(g) -> lits([], g), None -> [] };
+  let stated = match schema_stated(mods, law_def) {
+    Some(s) -> lits(guarded, s.body),
+    None -> guarded,
+  };
+  lits(stated, law_def.body)
+}
+
+/// The names a law's guard holds between two `Int` literals.
+pub fn guard_bounds(mods: List<ParsedModule>, law_def: LawDef) -> List<Bounded> / {abort.raise} =
+  match guard_of(mods, law_def) { Some(g) -> bounds_of([g]), None -> [] }
+
+// --- What a guard holds between two literals --------------------------------------
+
+/// A name the guards admit only from `low` to `high`, both included.
+pub type Bounded = { name: Bytes, low: Int, high: Int }
+
+/// One side a comparison holds a name to.
+type End = { name: Bytes, lower: Bool, at: Int }
+
+/// A literal past this is no end of a domain anyone walks, and keeps the ends' arithmetic exact.
+fn farthest_end() -> Int = 1000000000000
+
+fn int_of(e: Expr) -> Option<Int> =
+  match e {
+    ELit(v) -> match v.lit { LInt(k) -> Some(k), _ -> None },
+    EUnary(v) -> if v.op != b"neg" { None } else {
+      match v.operand { ELit(x) -> match x.lit { LInt(k) -> Some(0 - k), _ -> None }, _ -> None }
+    },
+    _ -> None,
+  }
+
+fn bare_name(e: Expr) -> Option<Bytes> =
+  match e { EVar(v) -> if is_bare(v.name) { Some(v.name.name.name) } else { None }, _ -> None }
+
+/// `acc` and the ends `name op k` holds `name` to.
+fn end_of(acc: List<End>, name: Bytes, op: Bytes, k: Int) -> List<End> =
+  if k > farthest_end() || k < 0 - farthest_end() { acc }
+  else if op == b"gt" { push(acc, { name: name, lower: true, at: k + 1 }) }
+  else if op == b"ge" { push(acc, { name: name, lower: true, at: k }) }
+  else if op == b"lt" { push(acc, { name: name, lower: false, at: k - 1 }) }
+  else if op == b"le" { push(acc, { name: name, lower: false, at: k }) } else if op == b"eq" {
+    push(push(acc, { name: name, lower: true, at: k }), { name: name, lower: false, at: k })
+  } else { acc }
+
+/// The comparison that says of `k op name` what `name op k` says.
+fn turned(op: Bytes) -> Bytes =
+  if op == b"gt" { b"lt" }
+  else if op == b"ge" { b"le" }
+  else if op == b"lt" { b"gt" }
+  else if op == b"le" { b"ge" }
+  else { op }
+
+/// The ends `guard` holds names to: a comparison of a bare name with a literal that is the guard
+/// or one side of its `&&`s, which the guard cannot hold without.
+fn ends_in(acc: List<End>, guard: Expr) -> List<End> =
+  match guard {
+    EBinary(v) -> if v.op == b"and" { ends_in(ends_in(acc, v.lhs), v.rhs) } else {
+      match bare_name(v.lhs) {
+        Some(name) -> match int_of(v.rhs) { Some(k) -> end_of(acc, name, v.op, k), None -> acc },
+        None -> match bare_name(v.rhs) {
+          Some(name) -> match int_of(v.lhs) {
+            Some(k) -> end_of(acc, name, turned(v.op), k),
+            None -> acc,
+          },
+          None -> acc,
+        },
+      }
+    },
+    _ -> acc,
+  }
+
+/// The names `guards`, which hold together, admit only between two `Int` literals: each is
+/// compared with a literal from below and from above, so no value outside is one the guards admit.
+/// A name they hold to nothing, `low` past `high`, is listed as they wrote it.
+pub fn bounds_of(guards: List<Expr>) -> List<Bounded> = {
+  let ends = fold(guards, [], ends_in);
+  fold(ends, [], |acc: List<Bounded>, e: End|
+    if fold(acc, false, |seen: Bool, b: Bounded| seen || b.name == e.name) { acc } else {
+      let own = filter(ends, |x: End| x.name == e.name);
+      let lows = filter(own, |x: End| x.lower);
+      let highs = filter(own, |x: End| !x.lower);
+      if len(lows) == 0 || len(highs) == 0 { acc } else {
+        push(acc, {
+          name: e.name,
+          low: fold(lows, 0 - farthest_end() - 1, |m: Int, x: End| max(m, x.at)),
+          high: fold(highs, farthest_end() + 1, |m: Int, x: End| min(m, x.at)),
+        })
+      }
+    })
 }
 
 fn law_literals(outlines: List<Outline>) -> List<List<Bytes>> =
@@ -649,7 +745,6 @@ pub fn no_shape(module: Bytes) -> ModuleShape =
       sets: [],
       cuts: [],
       stated: [],
-      samplers: [],
       set_texts: [],
     },
     imports: [],
@@ -822,12 +917,7 @@ fn reached_of(
 ) -> Map<Bytes, Bool> / {abort.raise} = {
   let roots = fold(shapes, [], |acc: List<Which>, s: ModuleShape| {
     let o = s.outline;
-    if map_contains(shipped, o.name) {
-      concat(
-        concat(acc, map(o.stated, |t: Bytes| TheDecl(t))),
-        map(o.samplers, |n: Bytes| TheFn(n)),
-      )
-    } else {
+    if map_contains(shipped, o.name) { concat(acc, map(o.stated, |t: Bytes| TheDecl(t))) } else {
       let own = fold(o.items, acc, |a: List<Which>, item: Outlined|
         match item {
           OFn(x) -> push(a, TheFn(qualify(o.name, x.name))),
@@ -925,24 +1015,10 @@ fn without_first(names: List<Bytes>, n: Bytes) -> List<Bytes> / {abort.raise} = 
 /// Whether a site in module `module` is of the walk of its definitions, which takes each module
 /// in the order they are checked in: a body's own, or a clause's, inside its definition. A test's,
 /// a schema's and a law's are walked after every definition, each module in its place.
-fn of_definitions(
-  fn_spans: List<List<Span>>,
-  costs: List<List<Span>>,
-  module: Int,
-  owner: Bytes,
-  span: Span,
-) -> Bool =
+fn of_definitions(fn_spans: List<List<Span>>, module: Int, owner: Bytes, span: Span) -> Bool =
   if bytes_len(owner) == 0 {
-    let among = |spans: Option<List<Span>>|
-      match spans { Some(xs) -> within_any(xs, span), None -> false };
-    // A site in a `cost` clause is of the law the clause makes, which is checked with the laws.
-    among(list_at(fn_spans, module)) && !among(list_at(costs, module))
+    match list_at(fn_spans, module) { Some(xs) -> within_any(xs, span), None -> false }
   } else { !is_test_owner(owner) }
-
-/// Where each `cost` clause of the definitions `t` holds stands.
-fn cost_spans(t: ModuleTables) -> List<Span> =
-  fold(t.defs, [], |acc: List<Span>, d: DefInfo|
-    concat(acc, map(filter(d.spec, |x: SpecInfo| x.kind == SCost), |x: SpecInfo| x.span)))
 
 /// What `pick` holds of each of `checked`, the modules in the order they are checked in, that
 /// `first` says is of the walk of definitions, then the rest of each of `placed`, the modules in
@@ -984,8 +1060,7 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
 
 /// `t`, the tables of the module `o` outlines, read without its tests and laws.
 fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables = {
-  let ours = |owner: Bytes, span: Span|
-    of_definitions([fn_spans_of(o)], [cost_spans(t)], 0, owner, span);
+  let ours = |owner: Bytes, span: Span| of_definitions([fn_spans_of(o)], 0, owner, span);
   let e = t.facts.elaboration;
   {
     ..t,
@@ -1348,14 +1423,13 @@ fn merged_tables(
   placed: List<ModuleTables>,
 ) -> CheckOutput / {abort.raise} = {
   let fn_spans = map(outlines, fn_spans_of);
-  let costs = map(placed, cost_spans);
   let at_name = fold(range(0, len(outlines)), map_new(), |acc: Map<Bytes, Int>, k: Int|
     map_insert(acc, at(outlines, k).name, k));
   // The checker takes the modules in the order they are checked in, which its tables hold.
   let checked_order = fold(order, [], |acc: List<ModuleTables>, n: Bytes|
     match map_get(at_name, n) { Some(k) -> push(acc, at(placed, k)), None -> acc });
   let of_walk = |module: Int, owner: Bytes, span: Span|
-    of_definitions(fn_spans, costs, module, owner, span);
+    of_definitions(fn_spans, module, owner, span);
   {
     ok: true,
     diags: [],
@@ -1438,16 +1512,10 @@ derive bin for Cut
 fn keeps_body(def: FnDef) -> Bool =
   len(def.generics.labels) > 0 || (match def.transparent { Some(_) -> true, None -> false })
 
-/// A generated definition carries the span of the item that regenerates it: its `derive`, or the
-/// `gen` its sampler is beside.
+/// A generated definition carries the span of the item that regenerates it: its `derive`.
 pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
-  let derived = fold(parsed.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
+  let generated = fold(parsed.derived, map_new(), |acc: Map<Bytes, Bool>, d: Derived|
     map_insert(acc, span_key(d.span), true));
-  let generated = fold(parsed.module.items, derived, |acc: Map<Bytes, Bool>, item: Item|
-    match sampler_of(item) {
-      Some(_) -> map_insert(acc, span_key(item_span(item)), true),
-      None -> acc,
-    });
   fold(parsed.module.items, [], |acc: List<Cut>, item: Item|
     match item {
       IFn(d) -> if map_contains(generated, span_key(d.span)) || keeps_body(d) { acc } else {
@@ -1531,8 +1599,6 @@ fn law_row(law_info: LawInfo, lits: List<Bytes>) -> LawRow / {abort.raise} =
     binders: map(law_info.binders, |b: LawBinder|
       { name: b.name, at: span_at(law_info.at.module, b.span), ty: canonical_type(b.ty) }),
     has_guard: law_info.has_guard,
-    host: law_info.host,
-    cost: law_info.cost,
     footprint: canonical_atoms(law_info.footprint),
     at: loc_at(law_info.at),
     literals: lits,
@@ -1926,9 +1992,8 @@ fn emitter_ctors_of(
     concat(acc, filter(checked.ctors, |ctor_info: CtorInfo| ctor_info.module == o.name)));
   let through = |type_name: Bytes, key: Bool|
     fold(checked.instances, None, |acc: Option<Bytes>, x: InstanceInfo|
-      if x.type_name == type_name && (match x.kind { NKey -> key, NShow -> !key, NGen -> false }) {
-        Some(x.by)
-      } else { acc });
+      if x.type_name == type_name && (match x.kind { NKey -> key, NShow -> !key }) { Some(x.by) }
+      else { acc });
   map(concat(prelude, rest), |ctor_info: CtorInfo|
     {
       name: ctor_info.name,
@@ -2240,7 +2305,6 @@ fn emitter_roots(
             let name = qualify(o.name, l.name);
             let law = map_get(laws, name);
             let guarded = match law { Some(x) -> x.has_guard, None -> false };
-            let measured = match law { Some(x) -> x.cost, None -> false };
             let binders = match law { Some(x) -> map(x.binders, |b: LawBinder| b.ty), None -> [] };
             let vars = vars_in(binders);
             let place = match law {
@@ -2248,10 +2312,7 @@ fn emitter_roots(
               None -> no_module_span(),
             };
             let rows = map(if guarded { [b"guard", b"body"] } else { [b"body"] }, |part: Bytes| {
-              let root = law_root(o.name, l.name, part);
-              if measured && part == b"body" {
-                emit_root(cr, vars, [], root, binders, measure_ty(), 0, false, place)
-              } else { emit_proposition(cr, vars, [], root, binders, place) }
+              emit_proposition(cr, vars, [], law_root(o.name, l.name, part), binders, place)
             });
             { ..a, specs: concat(a.specs, rows) }
           },
@@ -2273,7 +2334,7 @@ fn ordinal_row(o: Outline) -> OrdinalRow =
     items: fold(o.items, [], |acc: List<Bytes>, item: Outlined|
       match item {
         OFn(f) -> {
-          // A `cost` clause is measured through the law it becomes, so it is no clause root.
+          // A `cost` clause is proved, never run, so it is no clause root.
           let rooted = filter(f.spec, |kind: SpecKind| kind != SCost);
           let kinds = if len(rooted) == 0 { b"" }
           else { bytes_concat(b" ", join(map(rooted, spec_kind_text), b",")) };
@@ -3647,7 +3708,7 @@ pub type Claim =
   /// `costed`: the parameters with a cost name, whose names a `cost` clause binds after the parameters.
   | ClaimDef({ name: Bytes, params: Int, costed: List<Int>, body: Option<Code>, spec: List<ClaimClause>, measure: Option<Code>, ends: Bool, stated: Bool })
   | ClaimSum({ name: Bytes, variants: Int })
-  | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code>, costs: Option<{ def: Bytes, index: Int }> })
+  | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code> })
 
 /// A clause lowered under its binders, and where it is written.
 pub type Lowered = { at: ModuleSpan, code: Option<Code> }
@@ -3946,10 +4007,6 @@ fn law_claim(
       None -> None,
     },
     body: stating(mods, r, m, law_def, law_def.body),
-    costs: match law_def.costs {
-      Some(c) -> Some({ def: qualify(module, c.def.name), index: c.index }),
-      None -> None,
-    },
   })
 
 fn claims_of_modules(
@@ -4982,19 +5039,14 @@ fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
         _ -> a,
       }));
   // Every type a shipped module declares is read, reached or not, and so is what the module states
-  // of it: the type's node holds those functions, and a `gen`'s sampler is what a prover enters.
+  // of it: the type's node holds those functions.
   let stated = fold(range(first, len(h.mods)), [], |acc: List<Which>, i: Int| {
     let m = at(h.mods, i);
-    fold(m.module.items, acc, |a: List<Which>, item: Item| {
-      let typed = match stated_type(item) {
+    fold(m.module.items, acc, |a: List<Which>, item: Item|
+      match stated_type(item) {
         Some(target) -> push(a, TheDecl(qualify(m.name, target.name))),
         None -> a,
-      };
-      match sampler_of(item) {
-        Some(name) -> push(typed, TheFn(qualify(m.name, name))),
-        None -> typed,
-      }
-    })
+      })
   });
   reached_functions(
     h.hashes,
@@ -5535,8 +5587,6 @@ pub type LawRow = {
   index: Int,
   binders: List<BinderRow>,
   has_guard: Bool,
-  host: Bool,
-  cost: Bool,
   footprint: List<Atom>,
   at: ModuleSpan,
   literals: List<Bytes>,
@@ -6326,6 +6376,37 @@ test "a guard's literals are in the search's order, a negation folded" {
   ])
 }
 
+fn bounds_written(guard: Bytes) -> List<Bounded> / {abort.raise} = {
+  let mods = map(
+    parse_all([
+      {
+        name: b"m",
+        src: bytes_concat_all([b"law \"l\" forall (n: Int, m: Int) where ", guard, b" { true }\n"]),
+      },
+    ]),
+    |p: ParsedSource| p.module,
+  );
+  fold(at(mods, 0).module.items, [], |acc: List<Bounded>, item: Item|
+    match item { ILaw(d) -> guard_bounds(mods, d), _ -> acc })
+}
+
+test "a guard holds a name between two literals it compares the name with at the top of its `&&`s" {
+  assert_eq(bounds_written(b"n > 0 && n <= 100"), [{ name: b"n", low: 1, high: 100 }]);
+  assert_eq(bounds_written(b"3 <= n && 9 > n && m == -2"), [
+    { name: b"n", low: 3, high: 8 },
+    { name: b"m", low: -2, high: -2 },
+  ]);
+  // The tightest of several, and a span that holds nothing as it is written.
+  assert_eq(bounds_written(b"n >= 0 && n >= 5 && n < 9 && n < 20"), [
+    { name: b"n", low: 5, high: 8 },
+  ]);
+  assert_eq(bounds_written(b"n > 5 && n < 3"), [{ name: b"n", low: 6, high: 2 }]);
+  // One end holds nothing in, nor does a comparison the guard can hold without, nor one with a name.
+  assert_eq(bounds_written(b"n > 0"), []);
+  assert_eq(bounds_written(b"(n > 0 && n < 9) || m == 1"), []);
+  assert_eq(bounds_written(b"!(n > 0) && n < 9 && m > n && m < 4"), [])
+}
+
 test "a law's row holds its binders with their spans and types, and its hashes carry the sentence" {
   let d = dump_of(analyse(parse_all(specified())));
   assert_eq(d.laws, [
@@ -6336,8 +6417,6 @@ test "a law's row holds its binders with their spans and types, and its hashes c
       index: 0,
       binders: [{ name: b"x", at: { module: 0, start: 203, end: 209 }, ty: named_type(b"Int") }],
       has_guard: true,
-      host: false,
-      cost: false,
       footprint: [],
       at: { module: 0, start: 179, end: 237 },
       literals: [b"int 0"],
@@ -6676,42 +6755,6 @@ test "a data file a shipped function embeds moves what reaches the function, and
   assert_eq(dump_of(one.out).embeds, [
     { module: b"std.w", key: b"file:w/table.txt", read: Ok([{ name: b"", bytes: b"one\n" }]) },
   ])
-}
-
-test "a shipped type's sampler is read with its generator, though the program reaches neither" {
-  let stating = [
-    {
-      name: b"std.n",
-      src: b"import std.gen (Gen, constant)\npub type N = new { n: Int }\ngen for N by drawn\nfn drawn() -> Gen<N> = constant({ n: 1 })\npub fn unused() -> Int = 2\n",
-    },
-    {
-      name: b"std.gen",
-      src: b"pub type Gen<a> = | Gen((Int) -> Option<a>)\npub type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\npub fn sample<a>(g: Gen<a>, root: Int, key: Bytes, size: Int, replay: Option<List<Int>>) -> Sample<a> = match g { Gen(f) -> { value: f(root), record: [], discards: 0 } }\npub fn elements<a>(xs: List<a>) -> Gen<a> = Gen(|i: Int| list_at(xs, i))\npub fn constant<a>(x: a) -> Gen<a> = Gen(|_i: Int| Some(x))\n",
-    },
-  ];
-  let idle = analyse_pulling_std_with(
-    [{ name: b"m", src: b"import std.n\npub fn f() -> Int = 1\n" }],
-    stating,
-    no_rows(),
-  );
-  assert_eq(
-    match idle.out { Analysed(_) -> [], Refused(diags) -> map(diags, |d: Diag| d.code) },
-    [],
-  );
-  // A prover enters the sampler by name, so it stands wherever its type's module is read.
-  assert_eq(def_names(idle), [
-    b"m.f",
-    b"std.gen.constant",
-    b"std.gen.sample",
-    b"std.n._sample_N",
-    b"std.n.drawn",
-  ])
-}
-
-test "a stub keeps a gen's statement whole: its sampler has no body there to blank" {
-  let src = b"import std.gen (Gen, constant)\npub type N = new { n: Int }\ngen for N by drawn\nfn drawn() -> Gen<N> = { constant({ n: 1 }) }\n";
-  let cuts = cuts_of(parse_at(0, { name: b"m", src: src }).module);
-  assert_eq(map(cuts, |c: Cut| c.name), [b"m.drawn"])
 }
 
 test "a shipped compiler module's bare sibling import keeps only what the program reaches" {
