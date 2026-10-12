@@ -181,7 +181,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `set` | `effect set X = {..}` |
 | `new` | right after the `=` of a `type` declaration |
 | `opaque` | before `type` at item position (§3.2) |
-| `law`, `schema`, `forall`, `cost` | `law "..."` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
+| `law`, `schema`, `forall`, `cost`, `space` | `law "..."` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` and `space` among a `fn`'s `requires` and `ensures`, and `cost` after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
@@ -669,12 +669,13 @@ depth, are checked against it before anything runs (§16). A module whose
 statements reach two is `E0471`.
 
 A value is kept as it is laid out, so a table that is compact is one that reads
-quickly. An `Array` holds a word an element, and an `Int` within 63 bits or a
-width below 64 is held in that word: an `Array` of those is one object, kept as
-its words and read back in one piece, as a `Bytes` or a `String` is. Any other
-element is an object of its own, made when the value is read: an `Array` of
-30,000 records is 30,001 objects. A map is kept in its order and read back
-without comparing a key, and what a value shares is kept once.
+quickly. An `Array` of `Int`s within 63 bits or widths below 64 holds each in a
+word: it is one object, kept as its words and read back in one piece, as a
+`Bytes` or a `String` is. One of records, `Float`s, 64-bit widths or `Decimal`s
+holds each element in place, so an `Array` of 30,000 records is one object too,
+kept element by element. Any other element is an object of its own, made when
+the value is read. A map is kept in its order and read back without comparing a
+key, and what a value shares is kept once.
 
 ## 4. Types
 
@@ -809,7 +810,12 @@ and either with whether it is `opaque` (§3.2).
 is a fixed number of elements laid out one after another, so reading or
 replacing one by its index is a load or a store; it is a value like a list,
 compared, ordered and derived element by element, and has no literal: build it
-with `array_new` or `array_of_list` (§12). `Map<k, v>`
+with `array_new` or `array_of_list` (§12). `Columns<a>` is an array of records
+that holds each field apart, an array per field: `columns_get(xs, i).f` reads
+field `f` of record `i` without the rest of it, so a pass over one field reads
+only that field's array. It is a value like an array, compared and ordered as
+the array of its records, built with `columns_new` or `columns_of_list`, and
+its element type is a record of at least one field (`E0224`). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
 must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
@@ -2365,7 +2371,7 @@ law "a credit and a matching debit leave an account exactly as it was"
 ```
 
 * `requires`/`ensures` go between the signature and body, in any number, as
-  does `cost` (below); `result` is bound in `ensures`. `requires` restricts the domain of its
+  do `cost` and `space` (below); `result` is bound in `ensures`. `requires` restricts the domain of its
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified, as a sum whose function performs the type's row parameter
@@ -2382,7 +2388,7 @@ obligation it reports on is `proved`.
 
 | outcome | claim |
 | --- | --- |
-| `proved` | holds for every input its guard admits, or a `cost` bound read off the body |
+| `proved` | holds for every input its guard admits, or a `cost` or `space` bound read off the body |
 | `refuted` (`E0419`) | false at the point shown |
 | `vacuous` (`E0420`) | its guard admits no value |
 | `unproved` (`E0474`) | nothing proves it, and nothing refutes it |
@@ -2453,9 +2459,9 @@ law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) ==
 Both are `proved`, the second by structural induction on `xs` citing the
 first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
 its `law` and `label`, each induction as `induction` with its `binder`,
-`def`, `over` (`int` or `list`) and `step`, and a `cost` bound read off its
-body (below) as `cost_bound` with its `def`; `ran` says whether a run helped
-make the proof.
+`def`, `over` (`int` or `list`) and `step`, and a `cost` or `space` bound read
+off its body (below) as `cost_bound` or `space_bound` with its `def`; `ran` says
+whether a run helped make the proof.
 
 A `law schema` states a law once, over the definitions it is about, and a law
 instantiates it:
@@ -2583,7 +2589,8 @@ call back takes a part of one list parameter that a list pattern took a head
 off, no path calls back twice, and every other parameter its steps grow with is
 handed on unchanged or as a part of itself: it takes that list's length in
 calls. The bound is read from below: the lengths of parameters (`len`,
-`map_len`, `string_len`, `bytes_len`), cost names, positive literals, `+`, `*`,
+`map_len`, `string_len`, `bytes_len`, `array_len`, `columns_len`), cost names,
+positive literals, `+`, `*`,
 and `ilog2` alone or beside sizes of the one length it is of. Steps within the
 bound are `proved`. Anything else, such as another operation, a call of a
 function value with no cost name, a group of definitions calling each other, a
@@ -2593,6 +2600,40 @@ states a `key` or a `numeric` (§4.4), whose comparisons and operators call it
 unseen, leaves the bound `unproved` (`E0474`), stopped at `unbounded` with why.
 A bound the reading does not show is no bound to state: delete the clause and
 pace the definition in a test, as `std.pace::paced` does.
+
+A `space` clause bounds the memory a call holds beyond what it is handed:
+
+```ply
+type Chain = | Link(Int, Chain) | End
+
+fn reversed(xs: Chain, onto: Chain) -> Chain
+  space 0
+= match xs { End -> onto, Link(x, rest) -> reversed(rest, Link(x, onto)) }
+```
+
+The bound is read as a `cost` bound is, over the parameters, and `0` reads as a
+bound too: `space 0` says a call runs in place, holding no more than a constant
+whatever it is handed. A call's space is every object it makes, though it may
+let one go before it returns, and a frame for each call back into itself that
+is not a tail call; a number is no object. The bound holds where each argument
+is held by nothing else, all the way down, as an update in place needs (§5.6):
+a `match` or `let` pattern without a guard lets go of a subject at its last
+read held alone, and the next constructor of the same name the body builds
+takes its cells, so `reversed` makes no `Link` it did not take apart. `push`,
+`list_set`, `array_set`, `columns_set`, `map_insert` and `++` update a value
+held once in place and copy one held anywhere else, and only a fold's first
+call copies a seed held anywhere else. A record, a record update, a list
+literal, a closure and a list pattern's rest each make an object, as does a
+constructor no subject left cells for.
+
+A `space` bound is an obligation, `<owner> space #<n>`, that `ply prove` reads
+off the body with the reading of calls and recursion a `cost` bound has, except
+that a recursion whose paths that call back make nothing and call back last
+holds what its last call does, whatever it descends on. A call of a definition
+whose body another package keeps holds its first `space` bound, and only where
+each argument it is handed that is not a number is held alone. A clause on a
+definition that performs more than a raise is `E0463`. Anything else leaves the
+bound `unproved` (`E0474`), stopped at `unbounded` with why.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -3398,6 +3439,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0221` | `opaque` on an alias, which has no values of its own |
 | `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
 | `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
+| `E0224` | a `Columns` of a type that is not a record of at least one field |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
@@ -3462,7 +3504,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
 | `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
 | `E0462` | key file that cannot be read, decoded or written |
-| `E0463` | `cost` bound on a definition that performs more than a raise |
+| `E0463` | `cost` or `space` bound on a definition that performs more than a raise |
 | `E0465` | an operation a row promises `bounded` that grows with the input |
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |

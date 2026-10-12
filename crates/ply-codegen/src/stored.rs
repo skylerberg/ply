@@ -5,9 +5,10 @@
 //! met twice is written once. A closure, and a bridged cell, task, channel or secret, has no text.
 
 use crate::heap::{
-    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
-    KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT,
-    Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word, word_at,
+    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,
+    KIND_CTOR, KIND_DECIMAL, KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD,
+    KIND_STR, KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word,
+    word_at,
 };
 use crate::{array, list, map};
 use ply_eval::Symbol;
@@ -38,6 +39,10 @@ const FLOAT: u8 = 16;
 const CHAR: u8 = 17;
 /// A 64- or 128-bit width: its place in `INT_TYPES`, then its bits, eight bytes or sixteen.
 const FIXED: u8 = 18;
+/// A `Decimal`: its sixteen bytes as `rust_decimal` serializes it.
+const DECIMAL: u8 = 19;
+/// A `Columns`: its records' shape, then an array per field.
+const COLUMNS: u8 = 20;
 
 /// The text of `w`, which it reads: lowercase hex, so a C string literal holds it as it is.
 pub fn text(layouts: &Layouts, w: Word) -> Result<Vec<u8>, String> {
@@ -144,15 +149,10 @@ impl<'l> Writer<'l> {
                 Pending::Held(o, at, slot) => match unsafe { heap::part_word(o, at, slot) } {
                     Some(w) => self.word(w, &mut pending)?,
                     None => {
-                        let bits = unsafe { word_at(o, at) };
-                        match slot {
-                            Slot::Wide(t) => {
-                                self.out.push(FIXED);
-                                self.out.push(t);
-                            }
-                            _ => self.out.push(FLOAT),
-                        }
-                        self.out.extend_from_slice(&bits.to_le_bytes());
+                        let words: Vec<Word> = (0..slot.raw_words())
+                            .map(|i| unsafe { word_at(o, at + i) })
+                            .collect();
+                        self.scalar(slot, &words);
                         self.places += 1;
                     }
                 },
@@ -190,19 +190,22 @@ impl<'l> Writer<'l> {
                 self.out.push(if flags != 0 { TRUE } else { FALSE });
                 return Ok(());
             }
-            KIND_INT | KIND_FLOAT => {
-                self.out.push(if kind == KIND_INT { INT } else { FLOAT });
+            KIND_INT => {
+                self.out.push(INT);
                 self.out
                     .extend_from_slice(&unsafe { word_at(o, 0) }.to_le_bytes());
                 Vec::new()
             }
-            KIND_FIXED => {
-                self.out.push(FIXED);
-                self.out.push(layout as u8);
-                for i in 0..len as usize {
-                    self.out
-                        .extend_from_slice(&unsafe { word_at(o, i) }.to_le_bytes());
-                }
+            KIND_FLOAT | KIND_FIXED | KIND_DECIMAL => {
+                let slot = match kind {
+                    KIND_FLOAT => Slot::Float,
+                    KIND_FIXED => Slot::Wide(layout as u8),
+                    _ => Slot::Decimal,
+                };
+                let words: Vec<Word> = (0..len as usize)
+                    .map(|i| unsafe { word_at(o, i) })
+                    .collect();
+                self.scalar(slot, &words);
                 Vec::new()
             }
             KIND_STR | KIND_BYTES => {
@@ -266,6 +269,13 @@ impl<'l> Writer<'l> {
                 return Ok(());
             }
             KIND_ARRAY => self.sequence(ARRAY, ARRAY_WORDS, array::items(o).to_vec()),
+            KIND_COLUMNS => {
+                self.out.push(COLUMNS);
+                self.shape(layout);
+                (0..len as usize)
+                    .map(|k| unsafe { word_at(o, k) })
+                    .collect()
+            }
             KIND_MAP => {
                 let entries = map::to_vec(o);
                 self.out.push(MAP);
@@ -286,6 +296,21 @@ impl<'l> Writer<'l> {
         pending.push(Pending::Done(w as usize));
         pending.extend(parts.into_iter().rev().map(Pending::Word));
         Ok(())
+    }
+
+    /// A scalar as the object of it is written: its tag, a width's place, and its words.
+    fn scalar(&mut self, slot: Slot, words: &[Word]) {
+        match slot {
+            Slot::Float => self.out.push(FLOAT),
+            Slot::Wide(t) => {
+                self.out.push(FIXED);
+                self.out.push(t);
+            }
+            _ => self.out.push(DECIMAL),
+        }
+        for w in words {
+            self.out.extend_from_slice(&w.to_le_bytes());
+        }
     }
 
     /// A list's or an array's header, and the elements still to write: none where every one is an
@@ -352,6 +377,7 @@ struct Open {
 
 enum Make {
     Record { shape: u32 },
+    Columns { shape: u32 },
     Ctor { index: u32 },
     List,
     Array,
@@ -442,6 +468,13 @@ impl<'a> Reader<'a> {
                 let w = self.heap.boxed_fixed(ply_eval::Fixed::new(ty, high | low));
                 return Ok(Some(self.kept(w)));
             }
+            DECIMAL => {
+                let bytes = self.array()?;
+                let w = self
+                    .heap
+                    .boxed_decimal(ply_eval::Decimal::deserialize(bytes));
+                return Ok(Some(self.kept(w)));
+            }
             INT | FLOAT => {
                 let n = i64::from_le_bytes(self.array()?);
                 let o = self
@@ -513,6 +546,10 @@ impl<'a> Reader<'a> {
                 }
                 (Make::Ctor { index }, want)
             }
+            COLUMNS => {
+                let shape = self.shape()?;
+                (Make::Columns { shape }, self.layouts.shape_fields(shape))
+            }
             LIST => (Make::List, self.count()?),
             ARRAY => (Make::Array, self.count()?),
             MAP => {
@@ -556,6 +593,7 @@ impl<'a> Reader<'a> {
                 self.held.extend(done.parts.iter().copied());
                 self.heap.ctor(self.layouts, index, &done.parts)
             }
+            Make::Columns { shape } => self.heap.columns_from(shape, &done.parts),
             Make::List => self.heap.list_from(&done.parts),
             Make::Array => {
                 for part in &done.parts {

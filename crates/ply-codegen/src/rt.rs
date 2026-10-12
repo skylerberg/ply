@@ -3,12 +3,12 @@
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged,
-    bytes_of, is_unique, obj, set_word, str_of, word_at,
+    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Stated, Word,
+    bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
 };
 use crate::map;
 use crate::stack::{Stack, switch};
-use crate::{array, list};
+use crate::{array, columns, list};
 use ply_eval::arena::{Owner, RegionId, Slot};
 use ply_eval::builtins::{cell_in_update, hold_released, no_such_cell};
 use ply_eval::region::StepSite;
@@ -1511,6 +1511,126 @@ pub unsafe extern "C" fn rt_box_fixed(ctx: *mut Ctx, bits: i64, t: i64) -> i64 {
         .boxed_fixed(ply_eval::Fixed::new(ty, bits as u64 as u128))
 }
 
+/// The `Decimal` two words of compiled code's `PlyDec` hold.
+fn decimal_of(lo: i64, hi: i64) -> ply_eval::Decimal {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&lo.to_le_bytes());
+    bytes[8..].copy_from_slice(&hi.to_le_bytes());
+    ply_eval::Decimal::deserialize(bytes)
+}
+
+/// Writes `d`'s two words at `out`, compiled code's `PlyDec`.
+unsafe fn write_decimal(out: i64, d: ply_eval::Decimal) {
+    let bytes = d.serialize();
+    let words = out as *mut i64;
+    unsafe {
+        words.write(i64::from_le_bytes(
+            bytes[..8].try_into().expect("eight bytes"),
+        ));
+        words.add(1).write(i64::from_le_bytes(
+            bytes[8..].try_into().expect("eight bytes"),
+        ));
+    }
+}
+
+/// The object of the `Decimal` whose two words are `lo` and `hi`.
+pub unsafe extern "C" fn rt_box_decimal(ctx: *mut Ctx, lo: i64, hi: i64) -> i64 {
+    unsafe { &mut *ctx }.heap.boxed_decimal(decimal_of(lo, hi))
+}
+
+/// An arithmetic operator, `op` in `BINOPS`, over two `Decimal`s' words: its answer's two words
+/// written at `out`, raised as the evaluator raises.
+pub unsafe extern "C" fn rt_decimal_binary(
+    ctx: *mut Ctx,
+    op: i64,
+    a_lo: i64,
+    a_hi: i64,
+    b_lo: i64,
+    b_hi: i64,
+    out: i64,
+) {
+    let ctx = unsafe { &mut *ctx };
+    let Some(op) = usize::try_from(op)
+        .ok()
+        .and_then(|i| BINOPS.get(i).copied())
+    else {
+        ctx.fail(error("an operator this runtime has no code for"));
+        return;
+    };
+    let (x, y) = (
+        Value::Decimal(decimal_of(a_lo, a_hi)),
+        Value::Decimal(decimal_of(b_lo, b_hi)),
+    );
+    match ply_eval::strict_binary(op, &x, &y, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
+        Ok(Value::Decimal(d)) => unsafe { write_decimal(out, d) },
+        Ok(other) => {
+            ctx.fail(error(format!(
+                "a `Decimal` operator answered {}",
+                other.type_name()
+            )));
+        }
+        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&y) => {
+            raise_error(ctx, d);
+        }
+        Err(d) => {
+            ctx.fail(d);
+        }
+    }
+}
+
+/// How two `Decimal`s' words order as `Decimal`s: -1, 0 or 1, equal at any scale that holds the
+/// same number.
+pub unsafe extern "C" fn rt_decimal_compare(
+    _ctx: *mut Ctx,
+    a_lo: i64,
+    a_hi: i64,
+    b_lo: i64,
+    b_hi: i64,
+) -> i64 {
+    decimal_of(a_lo, a_hi).cmp(&decimal_of(b_lo, b_hi)) as i64
+}
+
+/// A `Decimal`'s negation, its two words written at `out`.
+pub unsafe extern "C" fn rt_decimal_negate(_ctx: *mut Ctx, lo: i64, hi: i64, out: i64) {
+    unsafe { write_decimal(out, -decimal_of(lo, hi)) }
+}
+
+/// Field `k`, in its records' shape's order, of record `i` of `Columns` `xs`, held once more: a
+/// scalar boxed and a record in place the address of its header there. What is not a columnar
+/// value's in-range record is read through `columns_get`, which raises as it does. Borrows `xs`.
+pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let tables = Arc::clone(&c.tables);
+    let k = k as usize;
+    if heap::kind(xs) == KIND_COLUMNS
+        && let Some(at) = usize::try_from(i)
+            .ok()
+            .filter(|at| *at < columns::len(obj(xs)))
+    {
+        return array::element(
+            &mut c.heap,
+            &tables.layouts,
+            columns::column(obj(xs), k),
+            at,
+        );
+    }
+    heap::inc(xs);
+    let index = c.heap.boxed_int(i);
+    let r = builtin(c, Builtin::ColumnsGet, &[xs, index]);
+    if c.failed != 0 {
+        return 0;
+    }
+    let o = obj(r);
+    let shape = unsafe { (*o).layout };
+    let (at, slot) = (
+        tables.layouts.shape_offsets(shape)[k],
+        tables.layouts.shape_slots(shape)[k],
+    );
+    let w = heap::field_word(&mut c.heap, o, at, slot);
+    heap::dec(r);
+    w
+}
+
 /// A divisor `/` and `%` raise on rather than overflow.
 fn is_zero(v: &Value) -> bool {
     match v {
@@ -2217,7 +2337,7 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
     }
     // A unique accumulator grows in place; a fresh buffer per step would be quadratic.
     if let Some((&first, rest)) = pieces.split_first()
-        && heap::is_unique(first)
+        && heap::grows_in_place(first)
     {
         let mut out = first;
         for w in rest {
@@ -2494,6 +2614,94 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*xs);
             Some(item)
         }
+        (Builtin::ColumnsOfList, [xs]) if heap::kind(*xs) == KIND_LIST => {
+            let items = list::to_vec(obj(*xs));
+            for w in &items {
+                heap::inc(*w);
+            }
+            let tables = Arc::clone(&ctx.tables);
+            match ctx.heap.columns_of(&tables.layouts, &items) {
+                Some(c) => {
+                    heap::dec(*xs);
+                    Some(c)
+                }
+                None => {
+                    for w in &items {
+                        heap::dec(*w);
+                    }
+                    None
+                }
+            }
+        }
+        (Builtin::ColumnsNew, [n, x]) if heap::kind(*x) == KIND_RECORD => {
+            let n = heap::as_int(*n)?;
+            if !(1..=ply_eval::builtins::MAX_ARRAY_LEN).contains(&n) {
+                return None;
+            }
+            let items = vec![*x; n as usize];
+            for _ in 1..n {
+                heap::inc(*x);
+            }
+            let tables = Arc::clone(&ctx.tables);
+            let made = ctx.heap.columns_of(&tables.layouts, &items);
+            if made.is_none() {
+                for w in &items[1..] {
+                    heap::dec(*w);
+                }
+            }
+            made
+        }
+        (Builtin::ColumnsLen, [xs]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let n = columns::len(obj(*xs)) as i64;
+            heap::dec(*xs);
+            Some(heap::imm(n))
+        }
+        (Builtin::ColumnsGet, [xs, i]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let at = usize::try_from(heap::as_int(*i)?)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))?;
+            let tables = Arc::clone(&ctx.tables);
+            let r = columns::record(&mut ctx.heap, &tables.layouts, obj(*xs), at);
+            heap::dec(*xs);
+            Some(r)
+        }
+        (Builtin::ColumnsAt, [xs, i]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let index = heap::as_int(*i)?;
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
+            let tables = Arc::clone(&ctx.tables);
+            let held = usize::try_from(index)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))
+                .map(|at| columns::record(&mut ctx.heap, &tables.layouts, obj(*xs), at));
+            let answer = match held {
+                Some(item) => {
+                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+                    unsafe { set_word(c, 0, item) };
+                    c as Word
+                }
+                None => ctx.nullary(none),
+            };
+            heap::dec(*xs);
+            Some(answer)
+        }
+        (Builtin::ColumnsSet, [xs, i, v])
+            if heap::kind(*xs) == KIND_COLUMNS
+                && heap::kind(*v) == KIND_RECORD
+                && unsafe { (*obj(*v)).layout == (*obj(*xs)).layout } =>
+        {
+            let at = usize::try_from(heap::as_int(*i)?)
+                .ok()
+                .filter(|at| *at < columns::len(obj(*xs)))?;
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.columns_set(&tables.layouts, *xs, at, *v))
+        }
+        (Builtin::ColumnsToList, [xs]) if heap::kind(*xs) == KIND_COLUMNS => {
+            let tables = Arc::clone(&ctx.tables);
+            let items = columns::records(&mut ctx.heap, &tables.layouts, obj(*xs));
+            heap::dec(*xs);
+            Some(ctx.heap.list_from(&items))
+        }
         (Builtin::ArrayAt, [xs, i]) if heap::kind(*xs) == KIND_ARRAY => {
             let index = heap::as_int(*i)?;
             let some = ctx.tables.layouts.some?;
@@ -2591,11 +2799,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(heap::imm(i64::from(w)))
         }
         (Builtin::BytesSlice, [b, s, e]) if heap::kind(*b) == KIND_BYTES => {
-            let bytes = unsafe { bytes_of(obj(*b)) };
-            let (start, end) = slice_range(*s, *e, bytes.len())?;
-            let out = ctx.heap.bytes(&bytes[start..end]);
-            heap::dec(*b);
-            Some(out)
+            let (start, end) = slice_range(*s, *e, unsafe { (*obj(*b)).len } as usize)?;
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.slice(&tables.layouts, *b, start, end))
         }
         (Builtin::BytesConcat, [a, b])
             if heap::kind(*a) == KIND_BYTES && heap::kind(*b) == KIND_BYTES =>
@@ -2622,7 +2828,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             if heap::is_unique(*xs) {
                 let items = list::to_vec(o);
                 if let Some(&first) = items.first()
-                    && heap::is_unique(first)
+                    && heap::grows_in_place(first)
                 {
                     for &w in &items {
                         heap::inc(w);
@@ -2868,7 +3074,8 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(heap::imm(n))
         }
         (Builtin::Compare | Builtin::CompareValues, [a, b])
-            if heap::native_key(*a) && heap::native_key(*b) =>
+            if heap::native_key(&ctx.tables.layouts, *a)
+                && heap::native_key(&ctx.tables.layouts, *b) =>
         {
             let layouts = &ctx.tables.layouts;
             let index = match heap::cmp_words(layouts, *a, *b) {
@@ -2881,11 +3088,15 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(ctx.nullary(index))
         }
         (Builtin::MapNew, []) => Some(ctx.tables.empty_map),
-        (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        (Builtin::MapInsert, [m, k, v])
+            if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) =>
+        {
             let tables = Arc::clone(&ctx.tables);
             Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
         }
-        (Builtin::MapGet, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        (Builtin::MapGet, [m, k])
+            if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) =>
+        {
             let some = ctx.tables.layouts.some?;
             let none = ctx.tables.layouts.none?;
             let o = obj(*m);
@@ -2902,13 +3113,17 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*k);
             Some(answer)
         }
-        (Builtin::MapContains, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        (Builtin::MapContains, [m, k])
+            if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) =>
+        {
             let found = map::get(&ctx.tables.layouts, obj(*m), *k).is_some();
             heap::dec(*m);
             heap::dec(*k);
             Some(heap::bool(found))
         }
-        (Builtin::MapRemove, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        (Builtin::MapRemove, [m, k])
+            if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) =>
+        {
             let tables = Arc::clone(&ctx.tables);
             let out = ctx.heap.map_remove(&tables.layouts, *m, *k);
             heap::dec(*k);
@@ -2974,7 +3189,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     return None;
                 };
                 let k = heap::field_word(&mut ctx.heap, obj(e), ka, layouts.slot_at(shape, ka));
-                if !heap::native_key(k) {
+                if !heap::native_key(layouts, k) {
                     heap::dec(k);
                     let_go(pairs);
                     return None;
@@ -3038,7 +3253,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         (
             Builtin::MapFloor | Builtin::MapCeiling | Builtin::MapBelow | Builtin::MapAbove,
             [m, k],
-        ) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        ) if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) => {
             let o = obj(*m);
             let (below, found) = map::locate(&ctx.tables.layouts, o, *k);
             let index = match which {
@@ -3098,7 +3313,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             }
             Some(out)
         }
-        (Builtin::MapSplit, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+        (Builtin::MapSplit, [m, k])
+            if heap::kind(*m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, *k) =>
+        {
             let (some, none) = (ctx.tables.layouts.some?, ctx.tables.layouts.none?);
             let tables = Arc::clone(&ctx.tables);
             let (below, at, above) = ctx.heap.map_split(&tables.layouts, *m, *k);
@@ -3196,7 +3413,7 @@ fn bound_key(layouts: &Layouts, w: Word) -> Option<Option<Word>> {
     }
     if Some(ctor) == layouts.some && held == 1 {
         let k = unsafe { word_at(o, 0) };
-        return heap::native_key(k).then_some(Some(k));
+        return heap::native_key(layouts, k).then_some(Some(k));
     }
     None
 }
@@ -3250,7 +3467,7 @@ fn position(ctx: &mut Ctx, at: Option<usize>) -> Word {
 /// `map_update(m, k, f)`: the entry leaves the map while `f` runs, so a map held once lends `f` a
 /// value held once. Takes all three.
 fn map_update(ctx: &mut Ctx, m: Word, k: Word, f: Word) -> Word {
-    let (rest, current) = if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+    let (rest, current) = if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
         let tables = Arc::clone(&ctx.tables);
         match map::get(&tables.layouts, obj(m), k) {
             Some(v) => {
@@ -4612,7 +4829,7 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
 /// with no constructor built. Takes the map and the key.
 pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+    if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
         let found = map::get(&ctx.tables.layouts, obj(m), k);
         if let Some(v) = found {
             heap::inc(v);
@@ -4705,7 +4922,7 @@ pub unsafe extern "C" fn rt_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
 
 pub unsafe extern "C" fn rt_map_insert(ctx: *mut Ctx, m: i64, k: i64, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+    if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
         let tables = Arc::clone(&ctx.tables);
         return ctx.heap.map_insert(&tables.layouts, m, k, v);
     }
@@ -4714,7 +4931,7 @@ pub unsafe extern "C" fn rt_map_insert(ctx: *mut Ctx, m: i64, k: i64, v: i64) ->
 
 pub unsafe extern "C" fn rt_map_contains(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+    if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
         let found = map::get(&ctx.tables.layouts, obj(m), k).is_some();
         heap::dec(m);
         heap::dec(k);

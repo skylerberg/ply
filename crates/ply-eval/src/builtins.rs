@@ -221,6 +221,15 @@ builtins! { $
     ArrayGet = "array_get", 2, raises;
     /// In place while the array has one holder; raises out of range.
     ArraySet = "array_set", 3, raises;
+    /// An array of records holding each field apart, the compiled runtime's columns; as a value it
+    /// is the array of its records, and each builtin answers as its `array_` namesake does.
+    ColumnsNew = "columns_new", 2, raises;
+    ColumnsOfList = "columns_of_list", 1, ends;
+    ColumnsToList = "columns_to_list", 1, ends;
+    ColumnsLen = "columns_len", 1, ends;
+    ColumnsAt = "columns_at", 2, ends;
+    ColumnsGet = "columns_get", 2, raises;
+    ColumnsSet = "columns_set", 3, raises;
     /// The value as a `std.value.Value`, whole.
     Reflect = "reflect", 1, ends;
     /// As `reflect`, with a value whose type states a `show` as `VShown` of what that function
@@ -449,17 +458,18 @@ fn numeric_op(op: &Value, span: Span) -> Result<BinOp, Diagnostic> {
         })
 }
 
-/// `array_set`, taking the array out of its arguments so the last holder writes in place.
-fn array_set(args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+/// `array_set` or `columns_set`, taking the array out of its arguments so the last holder writes in
+/// place.
+fn array_set(args: &mut Vec<Value>, span: Span, what: &str) -> Result<Value, Diagnostic> {
     let v = args.pop().expect("arity checked");
     let index = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
     let Value::Array(items) = &mut xs else {
-        return Err(type_error(span, "`array_set`", "Array", &xs));
+        return Err(type_error(span, &format!("`{what}`"), "Array", &xs));
     };
-    let i = index.as_int(span, "`array_set`")?;
+    let i = index.as_int(span, &format!("`{what}`"))?;
     let Some(at) = usize::try_from(i).ok().filter(|at| *at < items.len()) else {
-        return Err(out_of_range(span, "array_set", i, items.len(), "elements"));
+        return Err(out_of_range(span, what, i, items.len(), "elements"));
     };
     let in_place = std::sync::Arc::get_mut(items).is_some();
     crate::rc::note_update_of(in_place, if in_place { 0 } else { items.len() }, span);
@@ -971,48 +981,48 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             args[0].as_str(span, "`string_len`")?.chars().count() as i64,
         )),
 
-        Builtin::ArrayNew => {
-            let n = args[0].as_int(span, "`array_new`")?;
+        Builtin::ArrayNew | Builtin::ColumnsNew => {
+            let n = args[0].as_int(span, &format!("`{}`", b.name()))?;
             if !(0..=MAX_ARRAY_LEN).contains(&n) {
-                return Err(array_length(span, n));
+                return Err(array_length(span, b.name(), n));
             }
             Ok(Value::array(vec![args[1].clone(); n as usize]))
         }
 
-        Builtin::ArrayOfList => Ok(Value::array(
+        Builtin::ArrayOfList | Builtin::ColumnsOfList => Ok(Value::array(
             args[0]
-                .as_list(span, "`array_of_list`")?
+                .as_list(span, &format!("`{}`", b.name()))?
                 .iter()
                 .cloned()
                 .collect(),
         )),
 
-        Builtin::ArrayToList => Ok(Value::list(
-            args[0].as_array(span, "`array_to_list`")?.to_vec(),
+        Builtin::ArrayToList | Builtin::ColumnsToList => Ok(Value::list(
+            args[0].as_array(span, &format!("`{}`", b.name()))?.to_vec(),
         )),
 
-        Builtin::ArrayLen => Ok(Value::Int(
-            args[0].as_array(span, "`array_len`")?.len() as i64
+        Builtin::ArrayLen | Builtin::ColumnsLen => Ok(Value::Int(
+            args[0].as_array(span, &format!("`{}`", b.name()))?.len() as i64,
         )),
 
-        Builtin::ArrayAt => {
-            let xs = args[0].as_array(span, "`array_at`")?;
-            let i = args[1].as_int(span, "`array_at`")?;
+        Builtin::ArrayAt | Builtin::ColumnsAt => {
+            let xs = args[0].as_array(span, &format!("`{}`", b.name()))?;
+            let i = args[1].as_int(span, &format!("`{}`", b.name()))?;
             Ok(option(
                 usize::try_from(i).ok().and_then(|i| xs.get(i)).cloned(),
             ))
         }
 
-        Builtin::ArrayGet => {
-            let xs = args[0].as_array(span, "`array_get`")?;
-            let i = args[1].as_int(span, "`array_get`")?;
+        Builtin::ArrayGet | Builtin::ColumnsGet => {
+            let xs = args[0].as_array(span, &format!("`{}`", b.name()))?;
+            let i = args[1].as_int(span, &format!("`{}`", b.name()))?;
             match usize::try_from(i).ok().and_then(|at| xs.get(at)) {
                 Some(x) => Ok(x.clone()),
-                None => Err(out_of_range(span, "array_get", i, xs.len(), "elements")),
+                None => Err(out_of_range(span, b.name(), i, xs.len(), "elements")),
             }
         }
 
-        Builtin::ArraySet => array_set(args, span),
+        Builtin::ArraySet | Builtin::ColumnsSet => array_set(args, span, b.name()),
 
         Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
 
@@ -1786,10 +1796,10 @@ fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
 }
 
 #[cold]
-pub fn array_length(span: Span, n: i64) -> Diagnostic {
+pub fn array_length(span: Span, what: &str, n: i64) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("`array_new` of {n} elements is outside `0` to `{MAX_ARRAY_LEN}`"),
+        format!("`{what}` of {n} elements is outside `0` to `{MAX_ARRAY_LEN}`"),
     )
     .primary(span, "no array has this length")
 }

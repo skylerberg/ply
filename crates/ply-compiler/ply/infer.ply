@@ -12,7 +12,7 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               FnDef, ExternDef, ImportDecl, INames, TypeDef, TypeDefBody, TDAlias, TDSum,
               VariantDef, EffectDef, OpDef, TestDef, Cases, LawDef, OfSchema, Binder, Constraint,
               Deriver, DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger, DRow, is_predicate,
-              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost,
+              deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
               NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin, deriver_bin,
@@ -260,6 +260,10 @@ pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
 type GroupFill = { module: Int, span: Span, callee: Bytes, args: List<Type> }
 /// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 type ConcatSite = { module: Int, span: Span, ty: Type }
+
+/// A definition named at `span` whose answer at its instantiation, `ty`, holds a `Columns`, waiting
+/// to be settled.
+type ColumnsSite = { module: Int, span: Span, ty: Type }
 /// A written field of `{..b, f: e}` with the type its value inferred to.
 type UpdateField = { name: Bytes, span: Span, ty: Type }
 /// An update whose base was still a variable where it was written; `result` is what the site answered.
@@ -544,6 +548,7 @@ type Checker = {
   /// How each definition checked so far calls the functions it is handed, and what it answers.
   summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
+  columns: List<ColumnsSite>,
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
@@ -775,6 +780,7 @@ fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
     { name: b"Unit", arity: 0 },
     { name: b"List", arity: 1 },
     { name: b"Array", arity: 1 },
+    { name: b"Columns", arity: 1 },
     { name: b"Map", arity: 2 },
     { name: b"Cell", arity: 1 },
     { name: b"Hold", arity: 1 },
@@ -1197,6 +1203,7 @@ fn contract_of(
         SRequires -> concat(acc, conjuncts(source, c.expr)),
         SEnsures -> acc,
         SCost -> panic(misdeclared(b"states a `cost`", def.name.name)),
+        SSpace -> panic(misdeclared(b"states a `space`", def.name.name)),
       }),
     ensures: fold(def.spec, [], |acc: List<Clause>, c: SpecClause|
       match c.kind { SEnsures -> push(acc, written_clause(source, c.expr)), _ -> acc }),
@@ -1717,6 +1724,10 @@ fn unknown_name_here(checker: Checker, qname: QName) -> Checker / {abort.raise} 
       Some(SCost) ->
         [
           b"`result` is bound only in an `ensures`: a `cost` bound is over the parameters a call is given",
+        ],
+      Some(SSpace) ->
+        [
+          b"`result` is bound only in an `ensures`: a `space` bound is over the parameters a call is given",
         ],
       _ -> [],
     }
@@ -3734,6 +3745,77 @@ fn settle_concats(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
+/// Whether `ty` names a `Columns` anywhere in it.
+fn mentions_columns(ty: Type) -> Bool =
+  match ty {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      c.name == b"Columns" || fold(c.args, false, |any: Bool, a: Type| any || mentions_columns(a)),
+    TyFn(f) ->
+      mentions_columns(f.ret)
+        || fold(f.params, false, |any: Bool, p: Type| any || mentions_columns(p)),
+    TyRecord(fs) -> fold(fs, false, |any: Bool, f: Field| any || mentions_columns(f.ty)),
+    TyNominal(x) -> fold(x.args, false, |any: Bool, a: Type| any || mentions_columns(a)),
+  }
+
+/// The element types of the `Columns` `ty` names, outermost first.
+fn columns_elements(ty: Type) -> List<Type> =
+  match ty {
+    TyVar(_) -> [],
+    TyCon(c) ->
+      fold(
+        c.args,
+        if c.name == b"Columns" && len(c.args) == 1 { c.args } else { [] },
+        |acc: List<Type>, a: Type| concat(acc, columns_elements(a)),
+      ),
+    TyFn(f) ->
+      fold(f.params, columns_elements(f.ret), |acc: List<Type>, p: Type|
+        concat(acc, columns_elements(p))),
+    TyRecord(fs) -> fold(fs, [], |acc: List<Type>, f: Field| concat(acc, columns_elements(f.ty))),
+    TyNominal(x) -> fold(x.args, [], |acc: List<Type>, a: Type| concat(acc, columns_elements(a))),
+  }
+
+/// A `Columns` holds each field of its records apart, so wherever a call answers one, the element
+/// must settle to a record of at least one field, or stay a type parameter, which the definition's
+/// own callers settle.
+fn settle_columns(checker: Checker) -> Checker / {abort.raise} = {
+  let entries = checker.columns;
+  fold(entries, { ..checker, columns: [] }, |c: Checker, entry: ColumnsSite| {
+    let in_module: Checker = { ..c, module: entry.module };
+    let judged: Checker = fold(
+      columns_elements(resolve(in_module, entry.ty)),
+      in_module,
+      |k: Checker, elem: Type|
+        match elem {
+          TyVar(_) -> k,
+          TyRecord(fs) -> if len(fs) > 0 { k } else {
+            columns_refused(k, entry.span, b"a record of no fields has no column to count it by")
+          },
+          TyNominal(x) -> if len(x.fields) > 0 { k } else {
+            columns_refused(
+              k,
+              entry.span,
+              bytes_concat_all([b"`", type_text(elem), b"` is not a record of fields"]),
+            )
+          },
+          other ->
+            columns_refused(
+              k,
+              entry.span,
+              bytes_concat_all([b"`", type_text(other), b"` is not a record"]),
+            ),
+        },
+    );
+    { ..judged, module: c.module }
+  })
+}
+
+fn columns_refused(checker: Checker, span: Span, why: Bytes) -> Checker =
+  report_error_at(checker, b"E0224", span, b"a `Columns` holds records, each field apart", why, [
+    b"a `Columns<T>` lays out every field of `T` as an array of its own; `T` is a record type of at least one field",
+    b"an `Array<T>` holds any type",
+  ])
+
 fn bind_all(
   checker: Checker,
   bindings: List<{ name: Bytes, ty: Type }>,
@@ -4852,10 +4934,18 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
           let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
           else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
           else { inst.labels };
-          let typed: Checker = match env_depth_of(noted.env, key.name) {
-            Some(d) -> if d > 0 { noted }
-            else { note_typed(noted, qname.span, inst.ty, inst.args) },
-            None -> note_typed(noted, qname.span, inst.ty, inst.args),
+          // Every `Columns` is made by a call that answers one, so its element is judged there.
+          let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
+          let columned: Checker = if mentions_columns(made) {
+            {
+              ..noted,
+              columns: push(noted.columns, { module: noted.module, span: qname.span, ty: made }),
+            }
+          } else { noted };
+          let typed: Checker = match env_depth_of(columned.env, key.name) {
+            Some(d) -> if d > 0 { columned }
+            else { note_typed(columned, qname.span, inst.ty, inst.args) },
+            None -> note_typed(columned, qname.span, inst.ty, inst.args),
           };
           { checker: note_labels(typed, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
@@ -9000,9 +9090,11 @@ fn check_component(
       |m: Map<Bytes, Summary>, slot: Int| map_insert(m, at(qualified, slot), summary_of(slot)),
     ),
   };
-  let settled: Checker = settle_bit_ops(
-    settle_numerics(
-      settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
+  let settled: Checker = settle_columns(
+    settle_bit_ops(
+      settle_numerics(
+        settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
+      ),
     ),
   );
   let grown: Checker = refuse_growth(settled, grouped.group_defs);
@@ -10006,18 +10098,20 @@ fn check_unwritten(unclosed: Checker, def: FnDef, inferred: Row) -> Checker / {a
 }
 
 /// A bound on the steps a call takes says the call ends, which a row writing `diverges` denies; and
-/// it is read from the body, whose steps a handler of anything but a raise could change. A row
-/// variable is what a function parameter performs, whose steps its cost name stands for.
+/// a bound on its steps or its space is read from the body, which a handler of anything but a raise
+/// could change. A row variable is what a function parameter performs, whose steps its cost name
+/// stands for.
 fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort.raise} = {
   let row = resolve_row_in(checker, sig.published_row);
   let diverges = fold(row.atoms, false, |found: Bool, a: Atom| found || is_diverges(a));
   let performs = len(run_needs(row.atoms)) > 0;
   let written = match def.effects { Some(r) -> r.span, None -> def.name.span };
   fold(
-    filter(def.spec, |c: SpecClause| c.kind == SCost),
+    filter(def.spec, |c: SpecClause| c.kind == SCost || c.kind == SSpace),
     checker,
-    |c: Checker, clause: SpecClause|
-      if diverges {
+    |c: Checker, clause: SpecClause| {
+      let what = if clause.kind == SCost { b"steps" } else { b"space" };
+      if diverges && clause.kind == SCost {
         report(
           c,
           error_with_labels(
@@ -10042,18 +10136,25 @@ fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort
             bytes_concat_all([
               b"`",
               def.name.name,
-              b"` bounds its steps, and performs more than a raise",
+              b"` bounds its ",
+              what,
+              b", and performs more than a raise",
             ]),
             [
               label_at(c.module, clause.span, true, b"this bound is proved from the body alone"),
               label_at(c.module, written, false, b"its row is written here"),
             ],
             [
-              b"a handler could change the steps a call takes, so only a definition that performs nothing but raises states a bound",
+              bytes_concat_all([
+                b"a handler could change the ",
+                what,
+                b" a call takes, so only a definition that performs nothing but raises states a bound",
+              ]),
             ],
           ),
         )
-      } else { c },
+      } else { c }
+    },
   )
 }
 
@@ -11134,13 +11235,22 @@ fn ungeneratable_within(
       first_reason(n.fields, |f: Field| ungeneratable_within(checker, f.ty, seen, room)),
   }
 
-type SpecSite = | InRequires | InEnsures | InCost | SSDecreases | InWhere | InLawBody | InSchemaBody
+type SpecSite =
+  | InRequires
+  | InEnsures
+  | InCost
+  | InSpace
+  | SSDecreases
+  | InWhere
+  | InLawBody
+  | InSchemaBody
 
 fn site_phrase(s: SpecSite) -> Bytes =
   match s {
     InRequires -> b"a `requires` clause",
     InEnsures -> b"an `ensures` clause",
     InCost -> b"a `cost` bound",
+    InSpace -> b"a `space` bound",
     SSDecreases -> b"a `decreases` measure",
     InWhere -> b"a `where` guard",
     InLawBody -> b"a law body",
@@ -11152,6 +11262,7 @@ fn site_short(s: SpecSite) -> Bytes =
     InRequires -> b"`requires`",
     InEnsures -> b"`ensures`",
     InCost -> b"`cost` bound",
+    InSpace -> b"`space` bound",
     SSDecreases -> b"`decreases` measure",
     InWhere -> b"`where` guard",
     InLawBody -> b"law body",
@@ -11371,6 +11482,7 @@ fn check_clause(
   let with_result: Checker = match clause.kind {
     SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), monomorphic(env.ret)) },
     SRequires -> bound,
+    SSpace -> bound,
     // A cost name is the steps one call of its parameter takes.
     SCost ->
       fold(def.params, bound, |c: Checker, param: Param|
@@ -11384,7 +11496,8 @@ fn check_clause(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
-      walking: if clause.kind == SCost { unlowered() } else { with_result.walking },
+      walking: if clause.kind == SCost || clause.kind == SSpace { unlowered() }
+      else { with_result.walking },
     },
     clause.expr,
   );
@@ -11403,6 +11516,14 @@ fn check_clause(
         o.ty,
         b"a `cost` bound is an `Int`",
       ).checker,
+    SSpace ->
+      expect(
+        popped,
+        expr_span(clause.expr),
+        int_type(),
+        o.ty,
+        b"a `space` bound is an `Int`",
+      ).checker,
     _ ->
       expect(
         popped,
@@ -11416,7 +11537,12 @@ fn check_clause(
   {
     checker: check_spec_purity(
       { ..c1, assumed: checker.assumed },
-      match clause.kind { SRequires -> InRequires, SEnsures -> InEnsures, SCost -> InCost },
+      match clause.kind {
+        SRequires -> InRequires,
+        SEnsures -> InEnsures,
+        SCost -> InCost,
+        SSpace -> InSpace,
+      },
       [],
       clause.span,
       row,
@@ -11459,10 +11585,7 @@ fn check_cost_names(checker: Checker, def: FnDef) -> Checker / {abort.raise} =
 /// `result` is introduced beside the parameters, so a definition that has both is reported.
 fn check_result_shadow(checker: Checker, def: FnDef) -> Checker =
   match fold(def.spec, None, |acc: Option<Span>, c: SpecClause|
-      match acc {
-        Some(_) -> acc,
-        None -> match c.kind { SEnsures -> Some(c.span), SRequires -> None, SCost -> None },
-      }) {
+      match acc { Some(_) -> acc, None -> match c.kind { SEnsures -> Some(c.span), _ -> None } }) {
     None -> checker,
     Some(ensures) ->
       fold(def.params, checker, |c: Checker, param: Param|
@@ -14064,6 +14187,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     group_fills: [],
     summaries: map_new(),
     concats: [],
+    columns: [],
     updates: [],
     update_shapes: [],
     try_sites: [],
@@ -14702,8 +14826,8 @@ pub fn check_program_with(
       at(mods, i),
     ));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Checker = settle_bit_ops(
-    settle_numerics(settle_concats(settle_updates(check_instances(tested)))),
+  let settled: Checker = settle_columns(
+    settle_bit_ops(settle_numerics(settle_concats(settle_updates(check_instances(tested))))),
   );
   let constrained: Checker = check_constraints(
     check_map_keys(check_comparisons(check_label_apps(settled))),
@@ -19315,5 +19439,25 @@ test "a hold of an opaque value is read where the value's module is called, and 
   assert_eq(
     over(b"fn kept(n: Int) -> Token = with_hold[t](mint(n), spend) { h -> hold_get(h) }"),
     [],
+  )
+}
+
+test "a `Columns` holds a record type of at least one field wherever its type settles" {
+  assert_eq(
+    check_codes(
+      b"type P = { x: Float, y: Float }\nfn f(xs: List<P>) -> Columns<P> = columns_of_list(xs)\n",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Columns<Int> = columns_of_list(xs)\n"), [
+    b"E0224",
+  ]);
+  assert_eq(check_codes(b"fn f(xs: List<{}>) -> Columns<{}> = columns_of_list(xs)\n"), [b"E0224"]);
+  // A type parameter is its callers' to settle.
+  let generic = b"fn f<a>(xs: List<a>) -> Columns<a> = columns_of_list(xs)\n";
+  assert_eq(check_codes(generic), []);
+  assert_eq(
+    check_codes(bytes_concat(generic, b"fn g(xs: List<Int>) -> Int = columns_len(f(xs))\n")),
+    [b"E0224"],
   )
 }

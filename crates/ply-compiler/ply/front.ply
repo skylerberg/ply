@@ -3,10 +3,10 @@
 import parsing (Span, Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, span_key,
                 is_bare, no_module, span_bin)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet, TDSum,
-              VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, ImportDecl, INames, Vis,
-              VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived, is_pub, DRow,
-              spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow, stated_type,
-              item_span, IAlias, IModule, IDerive, IInstance, INumeric, spec_kind_bin)
+              VariantDef, SpecClause, SpecKind, SRequires, SEnsures, SCost, SSpace, ImportDecl,
+              INames, Vis, VPub, VPriv, FnDef, LawDef, OfSchema, Binder, is_predicate, Derived,
+              is_pub, DRow, spec_kind_text, schema_named, schema_guard_name, dump_item, NKey, NShow,
+              stated_type, item_span, IAlias, IModule, IDerive, IInstance, INumeric, spec_kind_bin)
 import type_syntax (Mode, MRead, MWrite, MBad, AtomExpr, mode_text, TCon)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
@@ -17,7 +17,7 @@ import patterns (Lit, LInt, LStr, LBytes)
 import code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform,
              NLabel, NCell, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, CodeField,
              CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern, CodePatternField,
-             Capture, PxCtor, PxRecord, PxList, lower_fn, dump)
+             Capture, PxCtor, PxRecord, PxList, lower_fn, lower_to_emit, dump)
 import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyRecord, TyVar,
               atoms_text, atoms_insert, filed_atoms_text, read_atoms, scheme_text, type_text,
               Printer, printer_new, print_ty, Field, canonical_atoms, canonical_scheme,
@@ -180,6 +180,7 @@ fn outline_of(
                   SRequires -> lits(found, clause.expr),
                   SEnsures -> found,
                   SCost -> found,
+                  SSpace -> found,
                 }),
               spec: map(d.spec, |clause: SpecClause| clause.kind),
               baked: d.baked != None,
@@ -1876,8 +1877,8 @@ fn key_fn(
         { out: a, requires: 0, ensures: 0 },
         |b: { out: List<KeyRow>, requires: Int, ensures: Int }, i: Int| {
           let kind = at(spec, i);
-          // A `cost` clause is keyed as the law it becomes.
-          if kind == SCost { b } else {
+          // A bound is keyed as the law it becomes.
+          if kind == SCost || kind == SSpace { b } else {
             let text = spec_kind_text(kind);
             let k = if kind == SRequires { b.requires } else { b.ensures };
             let sentence = match list_at(sents, i) { Some(s) -> s, None -> owner };
@@ -2134,7 +2135,7 @@ fn carry(cr: Carrier, vars: List<Int>, ty: Type) -> Carry / {abort.raise} =
       None -> {
         let args = carries(cr, vars, c.args);
         let plain = fold(args, true, |b: Bool, a: Carry| b && is_plain(a));
-        if (c.name == b"List" || c.name == b"Array") && len(args) == 1 {
+        if (c.name == b"List" || c.name == b"Array" || c.name == b"Columns") && len(args) == 1 {
           if plain { CPlain } else { CList(at(args, 0)) }
         } else if c.name == b"Map" && len(args) == 2 {
           if plain { CPlain } else { CMap(at(args, 0), at(args, 1)) }
@@ -2315,6 +2316,7 @@ fn emitter_roots(
                       { rows: push(b.rows, row), requires: b.requires, ensures: b.ensures + 1 }
                     },
                     SCost -> b,
+                    SSpace -> b,
                   }
                 },
               );
@@ -2374,8 +2376,8 @@ fn ordinal_row(o: Outline) -> OrdinalRow =
     items: fold(o.items, [], |acc: List<Bytes>, item: Outlined|
       match item {
         OFn(f) -> {
-          // A `cost` clause is proved, never run, so it is no clause root.
-          let rooted = filter(f.spec, |kind: SpecKind| kind != SCost);
+          // A bound is proved, never run, so it is no clause root.
+          let rooted = filter(f.spec, |kind: SpecKind| kind != SCost && kind != SSpace);
           let kinds = if len(rooted) == 0 { b"" }
           else { bytes_concat(b" ", join(map(rooted, spec_kind_text), b",")) };
           push(acc, bytes_concat_all([b"fn ", qualify(o.name, f.name), kinds]))
@@ -3915,7 +3917,9 @@ fn named(resolved: Resolved, m: Int, c: Code) -> Code / {abort.raise} = {
 /// as unreached.
 pub type Claim =
   /// `costed`: the parameters with a cost name, whose names a `cost` clause binds after the parameters.
-  | ClaimDef({ name: Bytes, params: Int, costed: List<Int>, body: Option<Code>, spec: List<ClaimClause>, measure: Option<Code>, ends: Bool, stated: Bool })
+  /// `moved`: the body as the emitter lowers it, where a value is moved at the read the compiled code
+  /// moves it at.
+  | ClaimDef({ name: Bytes, params: Int, costed: List<Int>, body: Option<Code>, moved: Option<Code>, spec: List<ClaimClause>, measure: Option<Code>, ends: Bool, stated: Bool })
   | ClaimSum({ name: Bytes, variants: Int })
   | ClaimLaw({ key: Bytes, guard: Option<Lowered>, body: Option<Code> })
 
@@ -3926,6 +3930,17 @@ pub type ClaimClause = { kind: SpecKind, clause: Lowered }
 
 fn lowered(r: Resolved, m: Int, params: List<Bytes>, expr: Expr) -> Option<Code> / {abort.raise} =
   match lower_fn(params, [], map_new(), expr) { Some(l) -> Some(named(r, m, l.code)), None -> None }
+
+fn lowered_moving(
+  r: Resolved,
+  m: Int,
+  params: List<Bytes>,
+  expr: Expr,
+) -> Option<Code> / {abort.raise} =
+  match lower_to_emit(params, [], map_new(), expr) {
+    Some(l) -> Some(named(r, m, l.code)),
+    None -> None,
+  }
 
 fn lowered_at(
   resolved: Resolved,
@@ -3959,6 +3974,7 @@ fn def_claim(
     params: len(params),
     costed: costed,
     body: if shown { lowered(resolved, m, params, def.body) } else { None },
+    moved: if shown { lowered_moving(resolved, m, params, def.body) } else { None },
     measure: match def.decreases {
       Some(e) -> if shown { lowered(resolved, m, params, e) } else { None },
       None -> None,
@@ -3973,6 +3989,7 @@ fn def_claim(
             SRequires -> params,
             SEnsures -> push(params, b"result"),
             SCost -> concat(params, cost_names),
+            SSpace -> params,
           },
           clause.expr,
         ),

@@ -35,8 +35,8 @@ pub enum ObligationKind {
     Ensures {
         index: usize,
     },
-    /// A `cost` bound, read off its owner's body and never entered.
-    Cost,
+    /// A `cost` or `space` bound, read off its owner's body and never entered.
+    Bound,
     Law,
 }
 
@@ -73,7 +73,7 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
             "Ensures" => ObligationKind::Ensures {
                 index: kind.arg(0)?.number()?,
             },
-            "Cost" => ObligationKind::Cost,
+            "Cost" | "Space" => ObligationKind::Bound,
             "Law" => ObligationKind::Law,
             _ => return Err(kind.unknown()),
         },
@@ -173,7 +173,7 @@ impl Prover {
                 owner: self.front.check.defs.get(&obligation.owner)?,
                 index,
             }),
-            ObligationKind::Cost => None,
+            ObligationKind::Bound => None,
             ObligationKind::Law => {
                 let info = self
                     .front

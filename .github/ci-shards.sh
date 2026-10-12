@@ -282,9 +282,9 @@ proofs_path() {
 }
 
 # Each `.ply` of a package below `crates/` other than the library's, and each example, that states a
-# law or an `ensures` or `cost` clause, which only a `ply prove` discharges.
+# law or an `ensures`, `cost` or `space` clause, which only a `ply prove` discharges.
 claiming_files() {
-  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost) ' "$root"/crates/*/ply "$root"/examples 2>/dev/null |
+  grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost|space) ' "$root"/crates/*/ply "$root"/examples 2>/dev/null |
     grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
