@@ -40,8 +40,11 @@ pub type Node =
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NLambda({ params: Int, size: Int, captures: List<Capture>, body: Code })
   | NSimulate({ size: Int, captures: List<Capture>, body: Code })
-  /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses.
-  | NParallel({ branches: List<Code> })
+  /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses. `rooted`
+  /// is whether the block is in its definition's own barrier, none of a lambda's, a clause's or a
+  /// `simulate`'s between them, and in no `handle`'s body there: every operation its branches
+  /// perform and do not answer is then in the definition's row.
+  | NParallel({ branches: List<Code>, rooted: Bool })
   | NHandle({ body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> })
   | NField({ base: Code, field: Bytes })
   /// `{..b, f: e}`, recognised in a plain literal where some field is `b.<its own name>` for one slot variable `b`.
@@ -392,12 +395,14 @@ fn find(frame: Frame, name: Bytes) -> Option<Int> =
     if b.name == name { Some(b.slot) } else { acc })
 
 /// The barriers in scope, innermost last. A free name is threaded through every barrier between use and binding.
-/// `moves`: lowered for the code generator, which `lower_to_emit` describes.
+/// `moves`: lowered for the code generator, which `lower_to_emit` describes. `handled`: inside the
+/// body of a `handle`, which runs in the barrier its `handle` is written in.
 type Stack = {
   frames: List<Frame>,
   labels: List<Bytes>,
   sites: Map<Bytes, List<Bytes>>,
   moves: Bool,
+  handled: Bool,
 }
 
 fn st_top(stack: Stack) -> Frame =
@@ -410,10 +415,8 @@ fn st_at(stack: Stack, i: Int) -> Frame =
 
 fn st_set(stack: Stack, i: Int, frame: Frame) -> Stack =
   {
+    ..stack,
     frames: map(range(0, len(stack.frames)), |j: Int| if j == i { frame } else { st_at(stack, j) }),
-    labels: stack.labels,
-    sites: stack.sites,
-    moves: stack.moves,
   }
 
 fn st_top_set(stack: Stack, frame: Frame) -> Stack = st_set(stack, len(stack.frames) - 1, frame)
@@ -738,17 +741,24 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
       None -> None,
       Some(r) ->
         Some({
-          code: { own: Borrowed, span: expr_span(e), node: NParallel({ branches: r.codes }) },
+          code: {
+            own: Borrowed,
+            span: expr_span(e),
+            node: NParallel({
+              branches: r.codes,
+              rooted: len(stack.frames) == 1 && !stack.handled,
+            }),
+          },
           stack: r.stack,
         }),
     },
     // The body runs in the enclosing barrier; each clause opens its own, led by its parameters and `resume`.
-    EHandle(x) -> match lower_in(x.body, stack) {
+    EHandle(x) -> match lower_in(x.body, { ..stack, handled: true }) {
       None -> None,
       Some(b) -> {
         let cls = fold(
           x.clauses,
-          { clauses: [], stack: b.stack, ok: true },
+          { clauses: [], stack: { ..b.stack, handled: stack.handled }, ok: true },
           |acc: ClauseAcc, c: HandleClause|
             if !acc.ok { acc } else {
               let named = map(c.params, |i: Ident| i.name);
@@ -1761,7 +1771,7 @@ pub fn mark(c: Code, live: Live, mv: Moves) -> Marked =
     NParallel(pr) -> {
       let r = mark_seq(pr.branches, live, mv);
       {
-        code: { own: Borrowed, span: c.span, node: NParallel({ branches: r.codes }) },
+        code: { own: Borrowed, span: c.span, node: NParallel({ ..pr, branches: r.codes }) },
         live: r.live,
       }
     },
@@ -2100,7 +2110,13 @@ fn lowered(
     ),
     |frame: Frame, l: Bytes| bind(frame, label_binder(l)),
   );
-  match lower_in(body, { frames: [start], labels: labels, sites: sites, moves: moves }) {
+  match lower_in(body, {
+      frames: [start],
+      labels: labels,
+      sites: sites,
+      moves: moves,
+      handled: false,
+    }) {
     None -> None,
     Some(o) ->
       Some({

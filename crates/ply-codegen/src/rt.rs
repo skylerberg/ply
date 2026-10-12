@@ -449,6 +449,35 @@ impl FrameClause {
                 (Some(_), None) => false,
             }
     }
+
+    /// Whether some operation `reached` stands for could be this clause's to answer: one of its
+    /// effect, on its resource or on one `reached` does not name.
+    fn may_answer(&self, reached: &Reached) -> bool {
+        self.effect == reached.effect
+            && match (&self.resource, &reached.resource) {
+                (None, _) | (_, None) => true,
+                (Some(mine), _) if mine.as_str() == "*" => true,
+                (Some(mine), Some(theirs)) => mine == theirs,
+            }
+    }
+}
+
+/// What a `parallel` block's branches may perform of one effect: on the resource named, or on any
+/// where the block's row names none or leaves it to a label parameter.
+pub(crate) struct Reached {
+    pub(crate) effect: Symbol,
+    pub(crate) resource: Option<Symbol>,
+}
+
+impl HandlerFrame {
+    /// Whether a branch performing what `reach` lists could reach this frame.
+    fn within(&self, reach: &[Reached]) -> bool {
+        self.simulate
+            || self
+                .clauses
+                .iter()
+                .any(|cl| reach.iter().any(|reached| cl.may_answer(reached)))
+    }
 }
 
 /// The frames a captured continuation holds, each closure held once more for the copy.
@@ -767,15 +796,22 @@ impl Ctx {
 
     /// Whether a `parallel` block's branches may run on other threads: nothing they perform can then
     /// reach a handler this entry holds, a region's scheduler or this thread's host runtime, all of
-    /// which live on this thread.
-    pub(crate) fn runs_branches_at_once(&self) -> bool {
+    /// which live on this thread. `reach` is every operation the branches may perform that they do
+    /// not answer themselves, where the block's site knows it; a block that does not is kept from any
+    /// handler at all.
+    pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
         // A reactor this thread holds and no factory could make again belongs to this thread alone.
         if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
             return false;
         }
         let mut stack = Some(self.current);
         while let Some(s) = stack {
-            if !self.stacks[s].list.is_empty() {
+            let frames = &self.stacks[s].list;
+            let held = match reach {
+                Some(reach) => frames.iter().any(|f| f.within(reach)),
+                None => !frames.is_empty(),
+            };
+            if held {
                 return false;
             }
             stack = self.stacks[s].parent;
@@ -1624,19 +1660,37 @@ pub fn time_budget_ms() -> u64 {
     THREAD_TIME_BUDGET_MS.with(|t| t.get()).unwrap_or(0)
 }
 
+/// The stack of a thread that runs a program: the runtime recurses on the native stack, a compiled
+/// body honours its call bound there, and an unoptimised frame runs to kilobytes. Reserved, not
+/// committed. A `parallel` block's thread is one: a run's lane enters a whole test on it.
+pub const PROGRAM_STACK: usize = 256 << 20;
+
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.
 pub(crate) const STACK_MARGIN: usize = 512 * 1024;
 
-/// The floor for this thread, asked of the platform once per thread (it can be a `/proc` read).
+/// The floor a computation begun here runs under: this thread's, where it begins on the thread's
+/// own stack. On any other, one a call grew onto and a host call or a waiting block then began
+/// more work on, nothing here knows how deep that stack runs, so the floor is above every address
+/// and the first compiled frame takes a stack of its own.
 pub(crate) fn stack_floor() -> usize {
     thread_local! {
-        static FLOOR: usize = stack_floor_of_this_thread();
+        // Asked of the platform once per thread: it can be a `/proc` read.
+        static OWN: (usize, usize) = stack_of_this_thread();
     }
-    FLOOR.with(|f| *f)
+    let here = 0u8;
+    let at = std::ptr::from_ref(&here) as usize;
+    OWN.with(|&(bottom, top)| {
+        if (bottom..top).contains(&at) {
+            bottom.saturating_add(STACK_MARGIN)
+        } else {
+            usize::MAX
+        }
+    })
 }
 
+/// This thread's stack, from its lowest address to its top.
 #[cfg(target_os = "macos")]
-fn stack_floor_of_this_thread() -> usize {
+fn stack_of_this_thread() -> (usize, usize) {
     unsafe extern "C" {
         fn pthread_self() -> *mut std::ffi::c_void;
         fn pthread_get_stackaddr_np(thread: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
@@ -1650,11 +1704,11 @@ fn stack_floor_of_this_thread() -> usize {
             pthread_get_stacksize_np(me),
         )
     };
-    top.saturating_sub(size).saturating_add(STACK_MARGIN)
+    (top.saturating_sub(size), top)
 }
 
 #[cfg(target_os = "linux")]
-fn stack_floor_of_this_thread() -> usize {
+fn stack_of_this_thread() -> (usize, usize) {
     // Room for the opaque `pthread_attr_t`, at most 56 bytes on 64-bit libcs.
     #[repr(C, align(8))]
     struct Attr([u8; 64]);
@@ -1673,28 +1727,30 @@ fn stack_floor_of_this_thread() -> usize {
     let mut size = 0usize;
     let bottom = unsafe {
         if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
-            return fallback_floor();
+            return fallback_stack();
         }
         let ok = pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
         pthread_attr_destroy(&mut attr);
         if !ok {
-            return fallback_floor();
+            return fallback_stack();
         }
         addr as usize
     };
-    bottom.saturating_add(STACK_MARGIN)
+    (bottom, bottom.saturating_add(size))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn stack_floor_of_this_thread() -> usize {
-    fallback_floor()
+fn stack_of_this_thread() -> (usize, usize) {
+    fallback_stack()
 }
 
-/// Assumes a spawned thread's default stack below this frame: refusing early beats overflowing.
+/// Assumes a spawned thread's default stack below this frame, and every address above that the
+/// thread's: refusing early beats overflowing.
 #[cfg(not(target_os = "macos"))]
-fn fallback_floor() -> usize {
+fn fallback_stack() -> (usize, usize) {
     let here = 0u8;
-    (std::ptr::from_ref(&here) as usize).saturating_sub(1 << 20)
+    let bottom = (std::ptr::from_ref(&here) as usize).saturating_sub((1 << 20) + STACK_MARGIN);
+    (bottom, usize::MAX)
 }
 
 /// Whichever of `checked_mul`, `checked_div` and `checked_rem` the operator was.
@@ -3758,7 +3814,30 @@ pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
 
 /// `parallel { .. }`: the `n` nullary closures at `slots`, each answer written over its closure.
 pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
-    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize) }
+    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, None) }
+}
+
+/// A `parallel` block whose site knows what its branches may perform: `reach` holds `count` pairs
+/// of field-table indices, an effect and its resource (negative for any).
+pub unsafe extern "C" fn rt_parallel_past(
+    ctx: *mut Ctx,
+    slots: i64,
+    n: i64,
+    reach: *const i64,
+    count: i64,
+) {
+    let reach: Vec<Reached> = {
+        let c = unsafe { &*ctx };
+        let name = |i: i64| c.tables.fields[i as usize].clone();
+        args_of(reach, count * 2)
+            .chunks(2)
+            .map(|w| Reached {
+                effect: name(w[0]),
+                resource: (w[1] >= 0).then(|| name(w[1])),
+            })
+            .collect()
+    };
+    unsafe { crate::parallel::run(ctx, slots as usize as *mut Word, n as usize, Some(&reach)) }
 }
 
 /// What a computation cost: the calls it made, the objects it allocated and the bytes they took.
