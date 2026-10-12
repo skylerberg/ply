@@ -2675,11 +2675,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(heap::imm(i64::from(w)))
         }
         (Builtin::BytesSlice, [b, s, e]) if heap::kind(*b) == KIND_BYTES => {
-            let bytes = unsafe { bytes_of(obj(*b)) };
-            let (start, end) = slice_range(*s, *e, bytes.len())?;
-            let out = ctx.heap.bytes(&bytes[start..end]);
-            heap::dec(*b);
-            Some(out)
+            let (start, end) = slice_range(*s, *e, unsafe { (*obj(*b)).len } as usize)?;
+            let tables = Arc::clone(&ctx.tables);
+            Some(ctx.heap.slice(&tables.layouts, *b, start, end))
         }
         (Builtin::BytesConcat, [a, b])
             if heap::kind(*a) == KIND_BYTES && heap::kind(*b) == KIND_BYTES =>

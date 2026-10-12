@@ -23,6 +23,7 @@ typedef struct {
 #define PLY_FLAT 1
 #define PLY_MIXED 2
 #define PLY_RAW 4
+#define PLY_VIEW 8
 #define PLY_KIND_FLOAT 16
 #define PLY_KIND_FIXED 18
 
@@ -126,6 +127,14 @@ static inline Word ply_embedded(Word base, int at, uint8_t flags, uint32_t len, 
   e->len = len;
   e->layout = layout;
   return (Word)(intptr_t)e;
+}
+
+/* A string's or bytes value's first byte: its own, or for a view the one its value holds where the
+   view begins. */
+static inline unsigned char *ply_bytes(Word w) {
+  return (ply_obj(w)->flags & PLY_VIEW)
+    ? (unsigned char *)ply_words(ply_words(w)[0]) + ply_words(w)[1]
+    : (unsigned char *)ply_words(w);
 }
 
 /* An array's length: its words a stride at a time where it holds its elements in place. */

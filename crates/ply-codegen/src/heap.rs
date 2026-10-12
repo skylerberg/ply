@@ -67,6 +67,13 @@ pub const FLAT: u8 = 1;
 pub const MIXED: u8 = 2;
 /// A record holding a `Float`'s bits or a record in place: not every word of it is a value.
 pub const RAW: u8 = 4;
+/// A string or bytes value whose bytes are another's: its first word is that value, held, and its
+/// second where its bytes begin there. It has no room to grow in place.
+pub const VIEW: u8 = 8;
+
+/// The fewest bytes a slice holds before it is a view of its value rather than a copy: below it a
+/// copy costs no more than the view's own object, and keeps nothing larger alive.
+const VIEW_MIN: usize = 64;
 
 /// `len`: payload words, byte count or list length; `layout`: shape, ctor index, capacity, arity
 /// or dropped list prefix; `flags`/`aux`: a `Bool`'s value, a list's tail length and capacity.
@@ -649,7 +656,13 @@ pub unsafe fn bridged<'a>(o: *mut Obj) -> &'a Value {
 /// Where a string's or a bytes value's payload starts.
 #[inline]
 pub unsafe fn bytes_ptr(o: *mut Obj) -> *mut u8 {
-    unsafe { (o as *mut u8).add(HEADER) }
+    unsafe {
+        if (*o).flags & VIEW != 0 {
+            bytes_ptr(obj(word_at(o, 0))).add(word_at(o, 1) as usize)
+        } else {
+            (o as *mut u8).add(HEADER)
+        }
+    }
 }
 
 /// The bytes a string or a bytes value holds, borrowed.
@@ -788,6 +801,8 @@ pub struct RecordLayout {
     pub ctor_args: bool,
     /// A `Decimal` held as its own two words, rather than by its word.
     pub raw_decimals: bool,
+    /// A long slice of a bytes value a view of its bytes, rather than a copy of them.
+    pub bytes_views: bool,
 }
 
 impl RecordLayout {
@@ -798,6 +813,7 @@ impl RecordLayout {
         inline_arrays: true,
         ctor_args: true,
         raw_decimals: true,
+        bytes_views: true,
     };
 }
 
@@ -1130,6 +1146,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_MAP => 8,
             KIND_MLEAF => (*o).layout as usize * 16,
             KIND_MBRANCH => map::BRANCH_BYTES,
+            KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => 16,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
             KIND_BRIDGE => BRIDGE_BYTES,
             _ => usize::MAX,
@@ -1507,6 +1524,39 @@ impl Heap {
 
     pub fn bytes(&mut self, b: &[u8]) -> Word {
         self.joined(KIND_BYTES, b, &[], 0) as Word
+    }
+
+    /// Bytes `start..end` of string or bytes value `w`, which it takes: the value itself where that
+    /// is all of it, a view of its bytes where the unit's code reads one and the slice is long, and
+    /// a copy otherwise. A view of a view views the value under both.
+    pub fn slice(&mut self, layouts: &Layouts, w: Word, start: usize, end: usize) -> Word {
+        let o = obj(w);
+        let (kind, len) = unsafe { ((*o).kind, (*o).len as usize) };
+        if start == 0 && end == len {
+            return w;
+        }
+        if !layouts.layout.bytes_views || end - start < VIEW_MIN {
+            let out = self.joined(kind, unsafe { &bytes_of(o)[start..end] }, &[], 0) as Word;
+            dec(w);
+            return out;
+        }
+        let (of, from) = unsafe {
+            if (*o).flags & VIEW != 0 {
+                let under = word_at(o, 0);
+                inc(under);
+                let from = word_at(o, 1) as usize;
+                dec(w);
+                (under, from + start)
+            } else {
+                (w, start)
+            }
+        };
+        let v = self.raw_alloc(kind, VIEW, (end - start) as u32, 0, 16);
+        unsafe {
+            set_word(v, 0, of);
+            set_word(v, 1, from as i64);
+        }
+        v as Word
     }
 
     /// Takes `a` and appends `b`: in place when `a` is unique and has room, else a doubled copy.
@@ -2149,6 +2199,8 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
                 (map::KEYS, map::KEYS + (*o).len as usize),
             ],
             KIND_CLOSURE => [(CLOSURE_CAPTURES, (*o).len as usize), (0, 0)],
+            // The value whose bytes it views.
+            KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => [(0, 1), (0, 0)],
             _ => [(0, 0), (0, 0)],
         }
     }

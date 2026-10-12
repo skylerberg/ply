@@ -699,3 +699,65 @@ fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_word
         dec(x);
     }
 }
+
+#[test]
+fn a_long_slice_of_bytes_is_a_view_that_holds_its_value_and_never_grows_in_place() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let all: Vec<u8> = (0..200u8).collect();
+    let whole = h.bytes(&all);
+    inc(whole);
+    let view = h.slice(&l, whole, 10, 150);
+    let o = obj(view);
+    assert_eq!(unsafe { (*o).flags } & VIEW, VIEW);
+    assert_eq!(unsafe { bytes_of(o) }, &all[10..150]);
+    assert_eq!(
+        unsafe { (*obj(whole)).rc },
+        2,
+        "the view holds the value it views"
+    );
+    // A view of a view views the value under both, and a short slice is a copy.
+    inc(view);
+    let inner = h.slice(&l, view, 20, 100);
+    assert_eq!(unsafe { word_at(obj(inner), 0) }, whole);
+    assert_eq!(unsafe { bytes_of(obj(inner)) }, &all[30..110]);
+    inc(view);
+    let short = h.slice(&l, view, 0, 8);
+    assert_eq!(unsafe { (*obj(short)).flags } & VIEW, 0);
+    assert_eq!(unsafe { bytes_of(obj(short)) }, &all[10..18]);
+    // All of a value is the value itself.
+    inc(view);
+    assert_eq!(h.slice(&l, view, 0, 140), view);
+    dec(view);
+    // Appending to a view copies, leaving the value it views as it was.
+    inc(view);
+    let grown = h.append(view, b"!");
+    assert_ne!(grown, view);
+    assert_eq!(unsafe { bytes_of(obj(grown)) }.len(), 141);
+    assert_eq!(unsafe { bytes_of(obj(whole)) }, &all[..]);
+    assert_eq!(Heap::to_value(&l, view), Value::bytes(&all[10..150]));
+    let (_into, read) = kept(&l, inner);
+    assert_eq!(Heap::to_value(&l, read), Value::bytes(&all[30..110]));
+    for w in [view, inner, short, grown] {
+        dec(w);
+    }
+    assert_eq!(
+        unsafe { (*obj(whole)).rc },
+        1,
+        "letting the views go lets the value go"
+    );
+    // A unit whose code reads bytes in place has the runtime copy them.
+    let copies = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            bytes_views: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    inc(whole);
+    let copied = h.slice(&copies, whole, 10, 150);
+    assert_eq!(unsafe { (*obj(copied)).flags } & VIEW, 0);
+    dec(copied);
+    dec(whole);
+}
