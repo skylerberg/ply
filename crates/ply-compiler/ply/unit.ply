@@ -6,7 +6,7 @@ import hash (hex)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, answer_bin,
              tables_bin, emit_roots_answer, symbol_of, entry_of, no_tables, without, literal_bits,
-             specialisation_of, own_definition, digits)
+             specialisation_of, own_definition, digits, ctor_layouts, spelled_field)
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, ModuleRow, OrdinalRow, analyse, dump_of,
               module_of_root)
 import diagnostics (parse_all)
@@ -207,7 +207,9 @@ pub fn write_kept<[r]>(
 /// gives a memo slot.
 pub type Offered = { name: Bytes, arity: Int, constant: Bool }
 
-pub type Ctor = { name: Bytes, arity: Int }
+/// A constructor of the unit's table: its arity, and its arguments as a shape spells them where its
+/// declaration lays them out by type, none where it holds each as its word.
+pub type Ctor = { name: Bytes, arity: Int, args: List<Bytes> }
 
 /// A constructor whose type's module states what its values are compared and shown through, and the
 /// function of each.
@@ -655,7 +657,16 @@ fn exports_text(
       map(helpers, |h: Helper|
         bytes_concat_all([h.name, b" ", ascii_of_int(h.args), b" ", dump_flag(h.answers)])),
     ),
-    lines(b"ctors", map(ctors, |c: Ctor| bytes_concat_all([c.name, b" ", ascii_of_int(c.arity)]))),
+    lines(
+      b"ctors",
+      map(ctors, |c: Ctor|
+        bytes_concat_all(
+          concat(
+            [c.name, b" ", ascii_of_int(c.arity)],
+            map(c.args, |a: Bytes| bytes_concat(b" ", a)),
+          ),
+        )),
+    ),
     lines(
       b"taken",
       map(taken, |t: Taken|
@@ -697,11 +708,12 @@ fn exports_text(
           )),
       )
     },
-    // The runtime lays a record or an array out as this unit's C reads it: `IN_PLACE`,
-    // `RAW_WIDTHS` and `INLINE_ARRAYS` in `exports.rs`.
+    // The runtime lays a record, an array or a constructor out as this unit's C reads it:
+    // `IN_PLACE`, `RAW_WIDTHS`, `INLINE_ARRAYS` and `CTOR_ARGS` in `exports.rs`.
     b"records held in place\n",
     b"widths held raw\n",
     b"arrays hold their elements in place\n",
+    b"constructors hold their arguments by type\n",
   ])
 }
 
@@ -1307,7 +1319,7 @@ fn emitter_answers(
   emit_roots_answer(
     names,
     map(placed, |i: Int| text_of(at(p.modules, i))),
-    map(ctors, |c: Ctor| c.name),
+    { names: map(ctors, |c: Ctor| c.name), laid: ctor_layouts(dump.ctors) },
     runtime.builtins,
     missed,
     if len(dump.packages) == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
@@ -1522,7 +1534,13 @@ pub fn emitted<| e>(
   baked: List<Baked> = [],
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
   let p = program_of(dump, sources);
-  let ctors = map(dump.emitter_ctors, |c: EmitterCtor| { name: c.name, arity: c.arity });
+  let laid = ctor_layouts(dump.ctors);
+  let ctors = map(dump.emitter_ctors, |c: EmitterCtor|
+    {
+      name: c.name,
+      arity: c.arity,
+      args: match map_get(laid, c.name) { Some(fs) -> map(fs, spelled_field), None -> [] },
+    });
   let wanted = fold(every, map_new(), |acc: Map<Bytes, Bool>, n: Bytes| map_insert(acc, n, true));
   let values = fold(baked, map_new(), |acc: Map<Bytes, Baked>, b: Baked|
     if map_contains(wanted, b.name) { map_insert(acc, b.name, b) } else { acc });
@@ -2013,16 +2031,16 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
       map_insert(map_new(), b"m.f", answer),
     ).text;
   let alone = unit([
-    { name: b"None", arity: 0 },
-    { name: b"m.Dot", arity: 0 },
-    { name: b"m.Line", arity: 1 },
+    { name: b"None", arity: 0, args: [] },
+    { name: b"m.Dot", arity: 0, args: [] },
+    { name: b"m.Line", arity: 1, args: [] },
   ]);
   let beside = unit([
-    { name: b"None", arity: 0 },
-    { name: b"a.One", arity: 0 },
-    { name: b"a.Two", arity: 0 },
-    { name: b"m.Dot", arity: 0 },
-    { name: b"m.Line", arity: 1 },
+    { name: b"None", arity: 0, args: [] },
+    { name: b"a.One", arity: 0, args: [] },
+    { name: b"a.Two", arity: 0, args: [] },
+    { name: b"m.Dot", arity: 0, args: [] },
+    { name: b"m.Line", arity: 1, args: [] },
   ]);
   let table = bucket_table(bucket_of(b"m.f"));
   let body = bytes_concat_all([b"{ return ", table, b"[1] + ", table, b"[0]; }"]);
@@ -2059,7 +2077,7 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
   let unit = |names: List<Bytes>|
     produce(
       runtime,
-      [{ name: b"None", arity: 0 }],
+      [{ name: b"None", arity: 0, args: [] }],
       map(names, |n: Bytes| { name: n, arity: 0, constant: false }),
       1,
       fold(names, map_new(), |acc: Map<Bytes, Answer>, n: Bytes|
@@ -2440,7 +2458,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
   );
   let p = produce(
     runtime,
-    [{ name: b"None", arity: 0 }],
+    [{ name: b"None", arity: 0, args: [] }],
     [{ name: b"m.g", arity: 0, constant: false }, { name: b"m.f", arity: 0, constant: true }],
     1,
     answers,
@@ -2477,7 +2495,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
 test "a unit says which constructors are read through a function, and which function it lacks" {
   let p = produce(
     { head: b"/* head */\n", tail: b"/* tail */\n", helpers: [], builtins: [], identity: b"r" },
-    [{ name: b"m.Box", arity: 2 }, { name: b"m.Dot", arity: 0 }],
+    [{ name: b"m.Box", arity: 2, args: [] }, { name: b"m.Dot", arity: 0, args: [] }],
     [
       { name: b"m.area", arity: 1, constant: false },
       { name: b"m.make", arity: 0, constant: false },
@@ -2494,7 +2512,7 @@ test "a unit says which constructors are read through a function, and which func
   // A body that names the constructor is not taken without the key its type states.
   let alone = produce(
     { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
-    [{ name: b"m.Box", arity: 2 }],
+    [{ name: b"m.Box", arity: 2, args: [] }],
     [{ name: b"m.make", arity: 0, constant: false }],
     1,
     map_of_entries([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),

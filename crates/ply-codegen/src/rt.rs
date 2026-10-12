@@ -4073,11 +4073,8 @@ fn applied(ctx: *mut Ctx, callee: Word, args: &[Word], give: bool) -> i64 {
                     }
                     match c.tables.layouts.ctor_index(name) {
                         Some(index) => {
-                            let o = c.heap.alloc(KIND_CTOR, 0, args.len() as u32, index);
-                            for (i, w) in args.iter().enumerate() {
-                                unsafe { set_word(o, i, *w) };
-                            }
-                            o as Word
+                            let tables = Arc::clone(&c.tables);
+                            c.heap.ctor(&tables.layouts, index, args)
                         }
                         None => {
                             let values = values_taken(c, args);
@@ -4465,14 +4462,9 @@ pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n:
     if n == 0 {
         return ctx.nullary(index as u32);
     }
-    let args = args_of(args, n);
-    let o = ctx
-        .heap
-        .alloc(KIND_CTOR, flat_over(args), n as u32, index as u32);
-    for (i, w) in args.iter().enumerate() {
-        unsafe { set_word(o, i, *w) };
-    }
-    o as Word
+    let tables = Arc::clone(&ctx.tables);
+    ctx.heap
+        .ctor(&tables.layouts, index as u32, args_of(args, n))
 }
 
 /// One field of a record by name. `own`: 0 reads the base and holds the field once more; 2 moves
@@ -4631,15 +4623,6 @@ pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     }
     let answer = builtin_over_values(ctx, Builtin::MapGet, &[m, k]);
     unwrapped(ctx, answer)
-}
-
-/// [`heap::FLAT`] when none of `words` holds a count.
-fn flat_over(words: &[Word]) -> u8 {
-    if words.iter().all(|w| heap::is_imm(*w)) {
-        heap::FLAT
-    } else {
-        0
-    }
 }
 
 /// A fresh object of `kind` with `len` words, whose fields the compiled caller stores itself.

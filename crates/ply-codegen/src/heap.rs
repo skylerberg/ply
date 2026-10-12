@@ -329,7 +329,7 @@ pub fn tail_words(len: usize) -> usize {
 #[inline]
 pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
     unsafe {
-        if (*o).kind != KIND_RECORD && (*o).kind != KIND_ARRAY {
+        if (*o).kind != KIND_RECORD && (*o).kind != KIND_ARRAY && (*o).kind != KIND_CTOR {
             return true;
         }
         if (*o).flags & FLAT != 0 {
@@ -690,6 +690,9 @@ pub struct Layouts {
     shapes: std::sync::RwLock<Shapes>,
     pub ctors: Vec<(Symbol, usize)>,
     ctor_ids: HashMap<Symbol, u32>,
+    /// Per constructor, the shape its arguments are laid out as, its fields `a000`, `a001`, ... in
+    /// order; none where it holds every argument as its word.
+    ctor_shapes: Box<[Option<u32>]>,
     /// The prelude constructors the runtime builds itself, resolved once.
     pub some: Option<u32>,
     pub none: Option<u32>,
@@ -721,6 +724,8 @@ pub struct RecordLayout {
     pub raw_widths: bool,
     /// An array's records, `Float`s and 64-bit widths held in place, rather than by their words.
     pub inline_arrays: bool,
+    /// A constructor's arguments held as its declaration types them, rather than by their words.
+    pub ctor_args: bool,
 }
 
 impl RecordLayout {
@@ -729,6 +734,7 @@ impl RecordLayout {
         in_place: true,
         raw_widths: true,
         inline_arrays: true,
+        ctor_args: true,
     };
 }
 
@@ -792,6 +798,7 @@ impl Layouts {
             width: 0,
             stated: Box::default(),
             numeric: Box::default(),
+            ctor_shapes: Box::default(),
             layout,
         }
     }
@@ -838,7 +845,9 @@ impl Layouts {
                     let slots = self.shape_slots(shape);
                     offsets.iter().copied().zip(slots.iter().copied()).collect()
                 }
-                KIND_CTOR => (0..(*o).len as usize).map(|i| (i, Slot::Word)).collect(),
+                KIND_CTOR => (0..self.ctor_arity(o))
+                    .map(|i| self.ctor_arg(o, i))
+                    .collect(),
                 KIND_ARRAY => {
                     let (slot, stride) = held_as(self, o);
                     (0..crate::array::len(o))
@@ -852,6 +861,43 @@ impl Layouts {
 
     pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
         self.ctor_ids.get(name).copied()
+    }
+
+    /// Lays each constructor's arguments out as `args` spells them, one list per constructor in
+    /// the table's order; an empty one holds every argument as its word.
+    pub fn set_ctor_args(&mut self, args: &[Vec<Symbol>]) {
+        self.ctor_shapes = args
+            .iter()
+            .map(|spelled| (!spelled.is_empty()).then(|| self.shape(spelled.clone())))
+            .collect();
+    }
+
+    /// The shape constructor `index` lays its arguments out as, where its unit's code reads them so.
+    #[inline]
+    pub fn ctor_shape(&self, index: u32) -> Option<u32> {
+        if !self.layout.ctor_args {
+            return None;
+        }
+        self.ctor_shapes.get(index as usize).copied().flatten()
+    }
+
+    /// Where argument `i` of constructor object `o` starts among its words, and how it holds it.
+    pub fn ctor_arg(&self, o: *mut Obj, i: usize) -> (usize, Slot) {
+        match self.ctor_shape(unsafe { (*o).layout }) {
+            Some(shape) => {
+                let r = self.read();
+                (r.offsets[shape as usize][i], r.slots[shape as usize][i])
+            }
+            None => (i, Slot::Word),
+        }
+    }
+
+    /// How many arguments constructor object `o` holds.
+    pub fn ctor_arity(&self, o: *mut Obj) -> usize {
+        match self.ctor_shape(unsafe { (*o).layout }) {
+            Some(_) => self.ctors[unsafe { (*o).layout } as usize].1,
+            None => (unsafe { (*o).len }) as usize,
+        }
     }
 
     pub fn index_fields(&mut self, names: &[Symbol]) {
@@ -1305,10 +1351,23 @@ impl Heap {
 
     /// A record of `shape` holding `words`, which it takes, each as its slot says.
     fn record_of(&mut self, layouts: &Layouts, shape: u32, words: &[(Word, Slot)]) -> Word {
+        self.laid_out(layouts, KIND_RECORD, shape, shape, words)
+    }
+
+    /// An object of `kind` whose header names `layout`, holding `words`, which it takes, as `shape`
+    /// lays them out.
+    fn laid_out(
+        &mut self,
+        layouts: &Layouts,
+        kind: u8,
+        layout: u32,
+        shape: u32,
+        words: &[(Word, Slot)],
+    ) -> Word {
         let (width, tail) = layouts.shape_words(shape);
         let counted = layouts.shape_counted(shape);
         let o = self.alloc(
-            KIND_RECORD,
+            kind,
             record_flags(
                 width,
                 &counted,
@@ -1316,7 +1375,7 @@ impl Heap {
                 words.iter().any(|(_, s)| *s != Slot::Word),
             ),
             width as u32,
-            shape,
+            layout,
         );
         let offsets = layouts.shape_offsets(shape);
         unsafe {
@@ -1329,6 +1388,37 @@ impl Heap {
             write_tail(o, width, tail, &counted);
         }
         o as Word
+    }
+
+    /// Constructor `index` applied to `args`, which it takes: its arguments laid out as its
+    /// declaration types them, where its unit's code reads them so.
+    pub fn ctor(&mut self, layouts: &Layouts, index: u32, args: &[Word]) -> Word {
+        let Some(shape) = layouts.ctor_shape(index) else {
+            let flat = if args.iter().all(|w| is_imm(*w)) {
+                FLAT
+            } else {
+                0
+            };
+            let o = self.alloc(KIND_CTOR, flat, args.len() as u32, index);
+            for (i, w) in args.iter().enumerate() {
+                unsafe { set_word(o, i, *w) };
+            }
+            return o as Word;
+        };
+        let slots = layouts.shape_slots(shape);
+        let words: Vec<(Word, Slot)> = args
+            .iter()
+            .zip(slots.iter())
+            .map(|(w, slot)| match slot {
+                Slot::Float | Slot::Wide(_) => {
+                    let bits = unsafe { word_at(obj(*w), 0) };
+                    dec(*w);
+                    (bits, *slot)
+                }
+                _ => (*w, *slot),
+            })
+            .collect();
+        self.laid_out(layouts, KIND_CTOR, index, shape, &words)
     }
 
     /// [`dec`] of a mortal word held once, into this heap without the thread-local lookup.
@@ -1499,7 +1589,9 @@ impl Heap {
                         };
                         set_word(c, i, x);
                     }
-                    if (kind == KIND_RECORD || kind == KIND_ARRAY) && flags & MIXED != 0 {
+                    if (kind == KIND_RECORD || kind == KIND_ARRAY || kind == KIND_CTOR)
+                        && flags & MIXED != 0
+                    {
                         let len = len as usize;
                         for t in len..len + tail_words(len) {
                             set_word(c, t, word_at(o, t));
@@ -1552,12 +1644,8 @@ impl Heap {
             }
             Value::Ctor { name, args } => match layouts.ctor_index(name) {
                 Some(index) => {
-                    let o = self.alloc(KIND_CTOR, 0, args.len() as u32, index);
-                    for (i, a) in args.iter().enumerate() {
-                        let w = self.to_word(layouts, a);
-                        unsafe { set_word(o, i, w) };
-                    }
-                    o as Word
+                    let words: Vec<Word> = args.iter().map(|a| self.to_word(layouts, a)).collect();
+                    self.ctor(layouts, index, &words)
                 }
                 None => self.bridge(v.clone()),
             },
@@ -1673,10 +1761,11 @@ impl Heap {
                 }
                 KIND_CTOR => {
                     let name = layouts.ctors[(*o).layout as usize].0.clone();
-                    let args = (0..(*o).len as usize)
+                    let args = (0..layouts.ctor_arity(o))
                         .map(|i| {
                             let field = carry.ctor_field(&name, i, ctors);
-                            Heap::read(layouts, word_at(o, i), &field, ctors, walked)
+                            let (at, slot) = layouts.ctor_arg(o, i);
+                            read_held(layouts, o, at, slot, &field, ctors, walked)
                         })
                         .collect();
                     Value::ctor(name, args)
@@ -2430,9 +2519,10 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                 if by_name != Ordering::Equal {
                     return by_name;
                 }
-                let (n, m) = ((*x).len as usize, (*y).len as usize);
+                let (n, m) = (layouts.ctor_arity(x), layouts.ctor_arity(y));
                 for i in 0..n.min(m) {
-                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                    let ((ax, sx), (ay, sy)) = (layouts.ctor_arg(x, i), layouts.ctor_arg(y, i));
+                    let c = cmp_fields(layouts, (x, sx, ax), (y, sy, ay));
                     if c != Ordering::Equal {
                         return c;
                     }
