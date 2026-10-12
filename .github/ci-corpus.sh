@@ -27,8 +27,10 @@
 #                                      seconds. The stages are build-ply's to ship, and the packages'
 #                                      stores are carried apart.
 #   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
-#   ci-corpus.sh compact               every package's store compacted before a job saves them: a
-#                                      store only grows, and the job's next run restores what it saves
+#   ci-corpus.sh compact               each package's store a run since `mark` opened compacted, and
+#                                      every other removed, before a job saves them: a store only
+#                                      grows, and the job's next run restores what it saves, which is
+#                                      then the stores its own runs use and no other job's
 #   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
 #   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
 #   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
@@ -328,7 +330,16 @@ case "${1:-}" in
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
     ;;
   compact)
+    marked || exit 2
     for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/tests/lang; do
+      [ -d "$dir/.ply-cache" ] || continue
+      # A `ply` that opens a store makes a directory of its own in it, so one nothing here is newer
+      # than the mark in was opened by no run of this job.
+      if [ -z "$(find "$dir/.ply-cache" -newer "$mark" -print -quit)" ]; then
+        rm -rf "$dir/.ply-cache"
+        echo "=== ${dir#"$root"/}: opened by no run of this job, and not kept"
+        continue
+      fi
       [ -f "$dir/.ply-cache/store.idx" ] || continue
       echo "=== ${dir#"$root"/}"
       "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
