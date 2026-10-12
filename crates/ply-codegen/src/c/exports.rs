@@ -90,30 +90,14 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// How the unit's C reads a record or an array, as its [`IN_PLACE`], [`RAW_WIDTHS`] and
-    /// [`INLINE_ARRAYS`] lines say.
+    /// How the unit's C reads a `Decimal` and a bytes slice, as its [`RAW_DECIMALS`] and
+    /// [`BYTES_VIEWS`] lines say.
     pub layout: RecordLayout,
 }
 
-/// A line after a unit's tables, where its C holds a record of a record type in place. A unit
-/// without it was emitted by a `ply` that holds every record by its word, as a bootstrap's first
-/// builder is.
-pub const IN_PLACE: &str = "records held in place";
-
-/// A line after a unit's tables, where its C holds a 64-bit width as its bits wherever a record
-/// holds one; a unit without it holds the width's word there.
-pub const RAW_WIDTHS: &str = "widths held raw";
-
-/// A line after a unit's tables, where its C reads an array's records, `Float`s and 64-bit widths
-/// in place; a unit without it reads each element's word.
-pub const INLINE_ARRAYS: &str = "arrays hold their elements in place";
-
-/// A line after a unit's tables, where its C reads a constructor's arguments as its declaration
-/// types them, as the unit's constructor table spells them; a unit without it reads their words.
-pub const CTOR_ARGS: &str = "constructors hold their arguments by type";
-
 /// A line after a unit's tables, where its C reads a `Decimal` a record, an array or a constructor
-/// holds as its two words; a unit without it reads the `Decimal`'s word.
+/// holds as its two words. A unit without it was emitted by a `ply` that reads the `Decimal`'s word,
+/// as a bootstrap's first builder is.
 pub const RAW_DECIMALS: &str = "decimals held raw";
 
 /// A line after a unit's tables, where its C reads a bytes value's bytes through `ply_bytes`, which
@@ -219,18 +203,6 @@ impl Exports {
                 }
                 out.push('\n');
             }
-        }
-        if self.layout.in_place {
-            out.push_str(&format!("{IN_PLACE}\n"));
-        }
-        if self.layout.raw_widths {
-            out.push_str(&format!("{RAW_WIDTHS}\n"));
-        }
-        if self.layout.inline_arrays {
-            out.push_str(&format!("{INLINE_ARRAYS}\n"));
-        }
-        if self.layout.ctor_args {
-            out.push_str(&format!("{CTOR_ARGS}\n"));
         }
         if self.layout.raw_decimals {
             out.push_str(&format!("{RAW_DECIMALS}\n"));
@@ -338,19 +310,11 @@ impl Exports {
         // What layout its C reads, a line each, in any order; one this runtime does not know reads
         // as nothing.
         let mut layout = RecordLayout {
-            in_place: false,
-            raw_widths: false,
-            inline_arrays: false,
-            ctor_args: false,
             raw_decimals: false,
             bytes_views: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
-                IN_PLACE => layout.in_place = true,
-                RAW_WIDTHS => layout.raw_widths = true,
-                INLINE_ARRAYS => layout.inline_arrays = true,
-                CTOR_ARGS => layout.ctor_args = true,
                 RAW_DECIMALS => layout.raw_decimals = true,
                 BYTES_VIEWS => layout.bytes_views = true,
                 _ => {}

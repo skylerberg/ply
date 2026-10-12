@@ -59,7 +59,7 @@ pub fn elements(heap: &mut Heap, layouts: &Layouts, o: *mut Obj) -> Vec<Word> {
 /// scalar as its own words; `None` for any other element, which it holds as its word.
 fn slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
     match heap::kind(w) {
-        KIND_RECORD if layouts.layout.in_place => Some(Slot::Record(unsafe { (*obj(w)).layout })),
+        KIND_RECORD => Some(Slot::Record(unsafe { (*obj(w)).layout })),
         _ => heap::raw_slot_of(layouts, w),
     }
 }
@@ -82,12 +82,10 @@ impl Heap {
     }
 
     /// An array of `items`, which it takes, laid out as an array of their type is wherever it is
-    /// made: records and scalars in place, where the unit's code reads them so.
+    /// made: records and scalars in place.
     pub fn array_of(&mut self, layouts: &Layouts, items: &[Word]) -> Word {
-        let held = layouts.layout.inline_arrays && !items.is_empty();
         let Some(slot) = items
             .first()
-            .filter(|_| held)
             .and_then(|w| slot_of(layouts, *w))
             .filter(|s| items.iter().all(|w| slot_of(layouts, *w) == Some(*s)))
         else {
