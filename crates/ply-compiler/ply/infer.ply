@@ -40,12 +40,12 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
               covariant_con, env_new, env_push, env_pop, env_bind, env_bind_global,
               env_remove_global, env_lookup, env_local, env_depth_of, env_locals, instantiate_with,
-              instantiate, rename_scheme, generalize, region_prefix, region_of, region_mark,
-              written_label, leaving_row, leaving_type, label_type, label_of, resolve_atom,
-              atom_text, atoms_text, resource_text, scheme_text, type_text, row_text, Printer,
-              printer_new, printer_naming, print_ty, print_row, applied_args, at_arguments,
-              over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin, type_bin,
-              scheme_bin, TypeTable, held_type, table_of, tables_joined, type_table_bin)
+              instantiate, rename_scheme, generalize, region_mark, written_label, leaving_row,
+              leaving_type, label_type, label_of, resolve_atom, atom_text, atoms_text,
+              resource_text, scheme_text, type_text, row_text, Printer, printer_new, printer_naming,
+              print_ty, print_row, applied_args, at_arguments, over_arg, TyNominal, record_fields,
+              arg_label, arg_row, atom_bin, type_bin, scheme_bin, TypeTable, held_type, table_of,
+              tables_joined, type_table_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin, ending_bin)
@@ -637,7 +637,9 @@ fn cell() -> Bytes = b"cell"
 /// The effect of reading a hold, which a `with_hold` region answers.
 fn hold() -> Bytes = b"hold"
 
-fn hold_atom() -> Atom = { effect: hold(), resource: RSingleton, mode: MRead, op: None }
+/// A read of the hold a region labelled `resource` holds.
+fn hold_atom(resource: Resource) -> Atom =
+  { effect: hold(), resource: resource, mode: MRead, op: None }
 
 /// The effects a region answers and nothing declares.
 fn is_region_effect(name: Bytes) -> Bool = name == cell() || name == hold()
@@ -1069,6 +1071,7 @@ pub type Builtin = {
 type Declaring = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
+  labels: Map<Bytes, Type>,
   rows: Map<Bytes, Int>,
   imported: Map<Bytes, Bytes>,
 }
@@ -1121,6 +1124,15 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
             let args = declared_types(d, c.args);
             if builtin_type_arity(name) != Some(len(args.tys)) {
               panic(misdeclared(b"names a type that is not the language's own at that arity", name))
+            } else if name == b"Hold" {
+              match c.labels {
+                [l] -> match map_get(args.d.labels, l.name) {
+                  Some(label) ->
+                    { d: args.d, ty: TyCon({ name: name, args: [label, at(args.tys, 0)] }) },
+                  None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
+                },
+                _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+              }
             } else if is_region_type(name) {
               let region = fresh_ty(args.d.fresh);
               {
@@ -1134,7 +1146,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
     },
   }
 
-/// A declaration's row: `abort.raise`, `hold.read`, a row variable, or none of them.
+/// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1146,7 +1158,14 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
             atoms_insert(acc, abort_atom())
           } else if is_bare(a.eff) && a.eff.name.name == hold()
               && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
-            atoms_insert(acc, hold_atom())
+            match a.resource {
+              Some(l) -> match map_get(d.labels, l.name) {
+                Some(TyVar(v)) -> atoms_insert(acc, hold_atom(RVar(v))),
+                _ ->
+                  panic(misdeclared(b"reads a hold under a label no generic list binds", l.name)),
+              },
+              None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
+            }
           } else {
             panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
           }),
@@ -1232,16 +1251,25 @@ fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Built
       { fresh: o.fresh, tys: map_insert(acc.tys, p.name, o.ty) }
     },
   );
+  // A label a declaration binds is what an argument's type fixes, so it is a variable like the rest.
+  let labels = fold(
+    def.generics.labels,
+    { fresh: tys.fresh, tys: map_new() },
+    |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
+      let o = fresh_ty(acc.fresh);
+      { fresh: o.fresh, tys: map_insert(acc.tys, p.name, o.ty) }
+    },
+  );
   let rows = fold(
     def.generics.effects,
-    { fresh: tys.fresh, rows: map_new() },
+    { fresh: labels.fresh, rows: map_new() },
     |acc: { fresh: Fresh, rows: Map<Bytes, Int> }, p: Ident| {
       let o = fresh_row_var(acc.fresh);
       { fresh: o.fresh, rows: map_insert(acc.rows, p.name, o.var) }
     },
   );
   let params = declared_types(
-    { fresh: rows.fresh, tys: tys.tys, rows: rows.rows, imported: imported },
+    { fresh: rows.fresh, tys: tys.tys, labels: labels.tys, rows: rows.rows, imported: imported },
     map(def.params, |p: Param|
       match p.ty {
         Some(t) -> t,
@@ -1995,6 +2023,16 @@ fn conv_con(
         new_ty(
           arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments", []),
         )
+      } else if name.name.name == b"Hold" {
+        // A hold's type names its region's label, as its reads do.
+        if len(over.labels) != 1 || len(over.rows) != 0 {
+          new_ty(over_refused(c, span, name.name.name, 1, 0, over))
+        } else {
+          {
+            checker: c,
+            ty: TyCon({ name: name.name.name, args: [at(over.labels, 0), at(converted.tys, 0)] }),
+          }
+        }
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
       } else if is_region_type(name.name.name) {
@@ -5972,7 +6010,7 @@ fn infer_cell_op(
       },
     };
     let ret = match form { CellGet -> elem.ty, _ -> unit_type() };
-    match region_of(resolve(after.checker, region.ty)) {
+    match label_of(resolve(after.checker, region.ty)) {
       None ->
         {
           checker: report_error_at(
@@ -7961,8 +7999,6 @@ fn note_universal_clause(
   }
 }
 
-fn region_type(name: Bytes) -> Type = named_type(bytes_concat(region_prefix(), name))
-
 fn cell_atoms(resource: Bytes) -> List<Atom> =
   [
     { effect: cell(), resource: RNamed(resource), mode: MRead, op: None },
@@ -8180,7 +8216,7 @@ fn infer_with_cell(
     Some(around) -> around.label,
     None -> region_label(i.checker, resource.name),
   };
-  let cell_ty = TyCon({ name: b"Cell", args: [region_type(label), i.ty] });
+  let cell_ty = TyCon({ name: b"Cell", args: [label_type(label), i.ty] });
   if region_is_open(i.checker, resource.name) {
     let nested: Checker = match open_region_named(i.checker, resource.name) {
       Some(outer) -> if outer.hold { region_reopened(i.checker, resource, outer, b"with_cell") }
@@ -8263,7 +8299,7 @@ fn infer_with_hold(
   let before: WithRow = join(performed, span, a.row, r.row);
   let entering: WithRow = join(before.checker, span, before.row, let_go);
   let label = region_label(entering.checker, resource.name);
-  let hold_ty = TyCon({ name: b"Hold", args: [region_type(label), a.ty] });
+  let hold_ty = TyCon({ name: b"Hold", args: [label_type(label), a.ty] });
   match open_region_named(entering.checker, resource.name) {
     Some(around) -> {
       let refused: Checker = region_reopened(entering.checker, resource, around, b"with_hold");
@@ -8300,7 +8336,7 @@ fn infer_with_hold(
         env: env_pop(b.checker.env),
         label_params: entering.checker.label_params,
       });
-      let handled = [hold_atom()];
+      let handled = [hold_atom(RNamed(label))];
       let discharged: Checker = discharge(
         closed.checker,
         mark,
@@ -13536,7 +13572,7 @@ fn task_holder(
 fn holds_tasks(t: Type, region: Bytes) -> Bool / {abort.raise} =
   match t {
     TyCon(c) ->
-      (c.name == b"Cell" && len(c.args) == 2 && region_of(at(c.args, 0)) == Some(region)
+      (c.name == b"Cell" && len(c.args) == 2 && label_of(at(c.args, 0)) == Some(region)
         && brand_in(at(c.args, 1), Tasks))
         || fold(c.args, false, |b: Bool, a: Type| b || holds_tasks(a, region)),
     TyRecord(fs) -> fold(fs, false, |b: Bool, field: Field| b || holds_tasks(field.ty, region)),
@@ -13606,8 +13642,9 @@ fn row_brands(row: Row, brand: Brand) -> Bool =
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, atom: Atom|
         b || (atom.effect == cell() && atom.resource == RNamed(r))),
-    // A row does not say which hold it reads, so one that reads any may read this region's.
-    HoldsOf(_) -> fold(row.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()),
+    HoldsOf(r) ->
+      fold(row.atoms, false, |b: Bool, atom: Atom|
+        b || (atom.effect == hold() && atom.resource == RNamed(r))),
     Tasks ->
       fold(
         concat([b"join", b"await", b"cancel"], channel_ops()),
@@ -13622,8 +13659,8 @@ fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
     TyVar(_) -> false,
     TyCon(c) ->
       (match brand {
-          CellsOf(r) -> region_of(t) == Some(r),
-          HoldsOf(r) -> region_of(t) == Some(r),
+          CellsOf(r) -> label_of(t) == Some(r),
+          HoldsOf(r) -> label_of(t) == Some(r),
           Tasks -> scheduler_handle(c.name),
         })
         || fold(c.args, false, |b: Bool, a: Type| b || brand_in(a, brand)),
@@ -15331,14 +15368,34 @@ test "a hold is read inside its region, whose row is its acquire's, its release'
   ])
 }
 
-test "a function handed a hold reads it under `hold.read`, which the region answers" {
+test "a function handed a hold reads it under its region's label, which the region answers" {
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
   assert_eq(
     check_codes(
-      b"fn peek(h: Hold<Int>) -> Int / {hold.read} = hold_get(h)\nfn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+      bytes_concat(
+        peek,
+        b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+      ),
     ),
     [],
   );
-  assert_eq(check_codes(b"fn peek(h: Hold<Int>) -> Int = hold_get(h)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int = hold_get(h)"), [b"E0302"]);
+  // A hold's type names its region's label, as its reads do.
+  assert_eq(check_codes(b"fn kept(h: Hold<Int>) -> Int = 0"), [b"E0202"]);
+  // A region answers the reads of its own hold and of no other: one inside a closure that reads an
+  // outer hold too leaves that read in the closure's row, where the outer region sees it leave.
+  assert_eq(
+    refusals(
+      b"fn f() -> Int = { let k = with_hold[outer](41, |x: Int| ()) { h -> || with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) } }; 0 }",
+    ),
+    [
+      [
+        b"E0446",
+        b"a hold escapes its `with_hold[outer]` region",
+        b"|| with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) }",
+      ],
+    ],
+  );
   assert_eq(check_codes(b"fn f() -> Unit / {hold.read} = hold.read()"), [b"E0103"]);
   assert_eq(check_codes(b"effect hold { read get() -> Int }"), [b"E0105"])
 }
@@ -15356,11 +15413,13 @@ test "a hold that leaves its region is refused where it leaves" {
   // A function that answers a closure over a hold says `hold.read` in the closure's row.
   assert_eq(
     check_codes(
-      b"fn later(h: Hold<Int>) -> () -> Int / {hold.read} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
+      b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int / {hold.read[l]} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
     ),
     [b"E0446"],
   );
-  assert_eq(check_codes(b"fn later(h: Hold<Int>) -> () -> Int = || hold_get(h)"), [b"E0302"])
+  assert_eq(check_codes(b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int = || hold_get(h)"), [
+    b"E0302",
+  ])
 }
 
 test "a hold kept in an older cell, handed to an operation, or given an older scheduler's task is refused" {
@@ -15421,11 +15480,11 @@ test "a region's label is its own: a row another definition writes names no regi
 }
 
 test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
-  assert_eq(refusals(b"type Kept = Kept(Hold<Int>)"), [
-    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int>"],
+  assert_eq(refusals(b"type Kept<[r]> = Kept(Hold<Int, [r]>)"), [
+    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int, [r]>"],
   ]);
-  assert_eq(check_codes(b"effect io { write put(h: Hold<Int>) -> Unit }"), [b"E0446"]);
-  assert_eq(check_codes(b"type Hidden = Hidden(() -> Int / {hold.read})"), [b"E0446"])
+  assert_eq(check_codes(b"effect io { write put[r](h: Hold<Int, [r]>) -> Unit }"), [b"E0446"]);
+  assert_eq(check_codes(b"type Hidden<[r]> = Hidden(() -> Int / {hold.read[r]})"), [b"E0446"])
 }
 
 // A cycle through a cell is the one leak reference counting accepts, so neither shape it needs is
@@ -19161,10 +19220,12 @@ test "a `forall` ranges over an opaque type another module declares" {
 }
 
 test "a `forall` never ranges over a `Hold`, alone or inside another type" {
-  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int>) { true }"), [b"E0418"]);
-  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int>>) { len(hs) >= 0 }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int, [r]>) { true }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int, [r]>>) { len(hs) >= 0 }"), [
+    b"E0418",
+  ]);
   assert_eq(
-    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int>>) { true }"),
+    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int, [r]>>) { true }"),
     [b"E0418"],
   )
 }
@@ -19182,7 +19243,10 @@ test "a hold of an opaque value is read where the value's module is called, and 
     over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(hold_get(h)) }"),
     [],
   );
-  assert_eq(over(b"fn peek(h: Hold<Token>) -> Int / {hold.read} = worth(hold_get(h))"), []);
+  assert_eq(
+    over(b"fn peek<[r]>(h: Hold<Token, [r]>) -> Int / {hold.read[r]} = worth(hold_get(h))"),
+    [],
+  );
   // Holding one opens nothing: its constructor is still its module's alone.
   assert_eq(
     over(
