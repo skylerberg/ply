@@ -112,6 +112,10 @@ pub const INLINE_ARRAYS: &str = "arrays hold their elements in place";
 /// types them, as the unit's constructor table spells them; a unit without it reads their words.
 pub const CTOR_ARGS: &str = "constructors hold their arguments by type";
 
+/// A line after a unit's tables, where its C reads a `Decimal` a record, an array or a constructor
+/// holds as its two words; a unit without it reads the `Decimal`'s word.
+pub const RAW_DECIMALS: &str = "decimals held raw";
+
 impl Exports {
     pub fn names(&self) -> Vec<String> {
         self.taken.iter().map(|t| t.name.clone()).collect()
@@ -224,6 +228,9 @@ impl Exports {
         if self.layout.ctor_args {
             out.push_str(&format!("{CTOR_ARGS}\n"));
         }
+        if self.layout.raw_decimals {
+            out.push_str(&format!("{RAW_DECIMALS}\n"));
+        }
         out
     }
 
@@ -328,6 +335,7 @@ impl Exports {
             raw_widths: false,
             inline_arrays: false,
             ctor_args: false,
+            raw_decimals: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
@@ -335,6 +343,7 @@ impl Exports {
                 RAW_WIDTHS => layout.raw_widths = true,
                 INLINE_ARRAYS => layout.inline_arrays = true,
                 CTOR_ARGS => layout.ctor_args = true,
+                RAW_DECIMALS => layout.raw_decimals = true,
                 _ => {}
             }
         }

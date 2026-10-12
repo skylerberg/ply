@@ -105,12 +105,13 @@ fn a_unit_says_how_it_lays_out_records_and_constructors() {
             spelled(&["a000!r(x!f,y!f)", "a001"]),
         ),
     ];
-    for bits in 0..16 {
+    for bits in 0..32 {
         exports.layout = ply_codegen::heap::RecordLayout {
             in_place: bits & 1 != 0,
             raw_widths: bits & 2 != 0,
             inline_arrays: bits & 4 != 0,
             ctor_args: bits & 8 != 0,
+            raw_decimals: bits & 16 != 0,
         };
         let read =
             ply_codegen::c::Exports::decode(&exports.encode()).expect("the table reads back");

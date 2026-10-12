@@ -41,6 +41,8 @@ pub const KIND_CHAR: u8 = 17;
 /// A width of 64 or 128 bits: its bits in one payload word or two, `layout` the width's place in
 /// [`ply_eval::INT_TYPES`].
 pub const KIND_FIXED: u8 = 18;
+/// A `Decimal`: its 16 bytes, as `rust_decimal` serializes it, in two words.
+pub const KIND_DECIMAL: u8 = 19;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -344,47 +346,104 @@ pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
 }
 
 /// How a record holds a field: a word, a `Float`'s bits, a 64-bit width's bits (the width's place
-/// in [`ply_eval::INT_TYPES`]), or a record of the shape named in place, its header and words
-/// inside the record's own.
+/// in [`ply_eval::INT_TYPES`]), a `Decimal`'s two words, or a record of the shape named in place,
+/// its header and words inside the record's own.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Slot {
     Word,
     Float,
     Wide(u8),
+    Decimal,
     Record(u32),
 }
 
-/// What a field a record holds as a `Float`'s bits is spelled with in a shape: after its name, and
-/// below every byte a name holds, so a shape sorts as its names do.
-pub const FLOAT_SLOT: &str = "!f";
+impl Slot {
+    /// The words a field held as its scalar's own takes: the payload of the object it would be.
+    pub fn raw_words(self) -> usize {
+        match self {
+            Slot::Decimal => 2,
+            _ => 1,
+        }
+    }
+
+    /// Whether a field of the slot is a scalar held as its own words: a `Float`, a 64-bit width
+    /// or a `Decimal`.
+    pub fn is_raw(self) -> bool {
+        matches!(self, Slot::Float | Slot::Wide(_) | Slot::Decimal)
+    }
+}
 
 /// What a field a record holds in place as a record is spelled with: after its name, and its shape's
 /// fields after that, between parentheses and parted by commas.
 pub const RECORD_SLOT: &str = "!r(";
 
-/// A field held as a word, a `Float`'s bits or a 64-bit width's, as a shape spells it.
+/// A field held as a word, or as its scalar's own words, as a shape spells it: a scalar's spelling
+/// after its name and `!`, below every byte a name holds, so a shape sorts as its names do.
 pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
-    match slot {
-        Slot::Float => Symbol::new(format!("{}{FLOAT_SLOT}", name.as_str())),
-        Slot::Wide(t) => Symbol::new(format!("{}!{}", name.as_str(), wide_spelling(t))),
-        _ => name.clone(),
-    }
+    let spelling = match slot {
+        Slot::Float => "f",
+        Slot::Wide(t) if t == ply_eval::IntTy::I64 as u8 => "i64",
+        Slot::Wide(_) => "u64",
+        Slot::Decimal => "d",
+        Slot::Word | Slot::Record(_) => return name.clone(),
+    };
+    Symbol::new(format!("{}!{spelling}", name.as_str()))
 }
 
-/// What a 64-bit width held as its bits is spelled with in a shape, after the field's name and `!`.
-fn wide_spelling(t: u8) -> &'static str {
-    if t == ply_eval::IntTy::I64 as u8 {
-        "i64"
-    } else {
-        "u64"
-    }
-}
-
-/// The width a field spelled `name!<width>` holds as its bits.
-fn wide_of(spelling: &str) -> Option<u8> {
+/// The scalar a field spelled `name!<spelling>` holds as its own words.
+fn raw_of(spelling: &str) -> Option<Slot> {
     match spelling {
-        "u64" => Some(ply_eval::IntTy::U64 as u8),
-        "i64" => Some(ply_eval::IntTy::I64 as u8),
+        "f" => Some(Slot::Float),
+        "u64" => Some(Slot::Wide(ply_eval::IntTy::U64 as u8)),
+        "i64" => Some(Slot::Wide(ply_eval::IntTy::I64 as u8)),
+        "d" => Some(Slot::Decimal),
+        _ => None,
+    }
+}
+
+/// The `Decimal` two words of `o` from `at` hold.
+pub unsafe fn decimal_at(o: *mut Obj, at: usize) -> ply_eval::Decimal {
+    let mut bytes = [0u8; 16];
+    unsafe {
+        bytes[..8].copy_from_slice(&word_at(o, at).to_le_bytes());
+        bytes[8..].copy_from_slice(&word_at(o, at + 1).to_le_bytes());
+    }
+    ply_eval::Decimal::deserialize(bytes)
+}
+
+/// The scalar field `at` of `o` holds as its own words, as a value.
+unsafe fn raw_value(o: *mut Obj, at: usize, slot: Slot) -> Value {
+    unsafe {
+        match slot {
+            Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
+            Slot::Wide(t) => Value::Fixed(Fixed::new(
+                ply_eval::INT_TYPES[t as usize],
+                word_at(o, at) as u64 as u128,
+            )),
+            Slot::Decimal => Value::Decimal(decimal_at(o, at)),
+            Slot::Word | Slot::Record(_) => unreachable!("a field held as a word or a record"),
+        }
+    }
+}
+
+/// Copies scalar object `w`'s payload into the words of `o` from `at`, and lets `w` go.
+pub unsafe fn hold_raw(o: *mut Obj, at: usize, slot: Slot, w: Word) {
+    unsafe {
+        for i in 0..slot.raw_words() {
+            set_word(o, at + i, word_at(obj(w), i));
+        }
+    }
+    dec(w);
+}
+
+/// The raw slot a record or an array holds a scalar object `w` as, where its unit's code reads one so.
+pub fn raw_slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
+    match kind(w) {
+        KIND_FLOAT => Some(Slot::Float),
+        KIND_FIXED if layouts.layout.raw_widths && unsafe { (*obj(w)).len } == 1 => {
+            Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
+        }
+        KIND_DECIMAL if layouts.layout.raw_decimals => Some(Slot::Decimal),
         _ => None,
     }
 }
@@ -530,14 +589,14 @@ pub(crate) unsafe fn drop_embedded(o: *mut Obj, at: usize) {
     }
 }
 
-/// The word a part `o` holds at `at` as `slot` is, as the object holds it: none for one held as its
-/// bits, and for a record held in place the address of its header there.
+/// The word a part `o` holds at `at` as `slot` is, as the object holds it: none for a scalar held
+/// as its own words, and for a record held in place the address of its header there.
 pub unsafe fn part_word(o: *mut Obj, at: usize, slot: Slot) -> Option<Word> {
     unsafe {
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) => None,
+            Slot::Float | Slot::Wide(_) | Slot::Decimal => None,
         }
     }
 }
@@ -547,11 +606,18 @@ pub unsafe fn part_word(o: *mut Obj, at: usize, slot: Slot) -> Option<Word> {
 pub fn field_word(heap: &mut Heap, o: *mut Obj, at: usize, slot: Slot) -> Word {
     let w = unsafe { word_at(o, at) };
     match slot {
-        Slot::Float => heap.boxed_float(f64::from_bits(w as u64)),
-        Slot::Wide(t) => heap.boxed_fixed(Fixed::new(
-            ply_eval::INT_TYPES[t as usize],
-            w as u64 as u128,
-        )),
+        Slot::Float | Slot::Wide(_) | Slot::Decimal => {
+            let (kind, layout) = match slot {
+                Slot::Wide(t) => (KIND_FIXED, u32::from(t)),
+                Slot::Decimal => (KIND_DECIMAL, 0),
+                _ => (KIND_FLOAT, 0),
+            };
+            let b = heap.alloc(kind, 0, slot.raw_words() as u32, layout);
+            for i in 0..slot.raw_words() {
+                unsafe { set_word(b, i, word_at(o, at + i)) };
+            }
+            b as Word
+        }
         Slot::Record(_) => {
             let inner = unsafe { words(o).add(at) } as Word;
             inc(inner);
@@ -633,21 +699,15 @@ impl Shapes {
                     names.push(Symbol::new(&s[..open]));
                     slots.push(Slot::Record(nested));
                 }
-                None => match s.strip_suffix(FLOAT_SLOT) {
-                    Some(name) => {
+                None => match s.rsplit_once('!').and_then(|(n, r)| Some((n, raw_of(r)?))) {
+                    Some((name, slot)) => {
                         names.push(Symbol::new(name));
-                        slots.push(Slot::Float);
+                        slots.push(slot);
                     }
-                    None => match s.rsplit_once('!').and_then(|(n, w)| Some((n, wide_of(w)?))) {
-                        Some((name, t)) => {
-                            names.push(Symbol::new(name));
-                            slots.push(Slot::Wide(t));
-                        }
-                        None => {
-                            names.push(field.clone());
-                            slots.push(Slot::Word);
-                        }
-                    },
+                    None => {
+                        names.push(field.clone());
+                        slots.push(Slot::Word);
+                    }
                 },
             }
         }
@@ -661,7 +721,7 @@ impl Shapes {
                     counted.push(at);
                     at += 1;
                 }
-                Slot::Float | Slot::Wide(_) => at += 1,
+                Slot::Float | Slot::Wide(_) | Slot::Decimal => at += slot.raw_words(),
                 Slot::Record(n) => {
                     let n = *n as usize;
                     counted.extend(self.counted[n].iter().map(|c| at + 2 + c));
@@ -726,6 +786,8 @@ pub struct RecordLayout {
     pub inline_arrays: bool,
     /// A constructor's arguments held as its declaration types them, rather than by their words.
     pub ctor_args: bool,
+    /// A `Decimal` held as its own two words, rather than by its word.
+    pub raw_decimals: bool,
 }
 
 impl RecordLayout {
@@ -735,6 +797,7 @@ impl RecordLayout {
         raw_widths: true,
         inline_arrays: true,
         ctor_args: true,
+        raw_decimals: true,
     };
 }
 
@@ -1061,7 +1124,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
             KIND_RECORD | KIND_ARRAY | KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT
-            | KIND_FIXED => words_bytes((*o).kind, (*o).flags, (*o).len),
+            | KIND_FIXED | KIND_DECIMAL => words_bytes((*o).kind, (*o).flags, (*o).len),
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1322,18 +1385,12 @@ impl Heap {
         let mut spelled_fields = Vec::with_capacity(fields.len());
         let mut words = Vec::with_capacity(fields.len());
         for (name, w) in fields {
+            if let Some(slot) = raw_slot_of(layouts, *w) {
+                spelled_fields.push(spelled(name, slot));
+                words.push((*w, slot));
+                continue;
+            }
             match kind(*w) {
-                KIND_FLOAT => {
-                    spelled_fields.push(spelled(name, Slot::Float));
-                    words.push((unsafe { word_at(obj(*w), 0) }, Slot::Float));
-                    dec(*w);
-                }
-                KIND_FIXED if layouts.layout.raw_widths && unsafe { (*obj(*w)).len } == 1 => {
-                    let t = unsafe { (*obj(*w)).layout } as u8;
-                    spelled_fields.push(spelled(name, Slot::Wide(t)));
-                    words.push((unsafe { word_at(obj(*w), 0) }, Slot::Wide(t)));
-                    dec(*w);
-                }
                 KIND_RECORD if layouts.layout.in_place => {
                     let shape = unsafe { (*obj(*w)).layout };
                     spelled_fields.push(spelled_record(name, &layouts.shape_spelled(shape)));
@@ -1355,7 +1412,7 @@ impl Heap {
     }
 
     /// An object of `kind` whose header names `layout`, holding `words`, which it takes, as `shape`
-    /// lays them out.
+    /// lays them out: a scalar a raw slot holds as its object's own words, and a record in place.
     fn laid_out(
         &mut self,
         layouts: &Layouts,
@@ -1382,7 +1439,8 @@ impl Heap {
             for ((w, slot), at) in words.iter().zip(offsets.iter()) {
                 match slot {
                     Slot::Record(inner) => embed(layouts, o, *at, *inner, *w),
-                    _ => set_word(o, *at, *w),
+                    Slot::Word => set_word(o, *at, *w),
+                    raw => hold_raw(o, *at, *raw, *w),
                 }
             }
             write_tail(o, width, tail, &counted);
@@ -1406,18 +1464,7 @@ impl Heap {
             return o as Word;
         };
         let slots = layouts.shape_slots(shape);
-        let words: Vec<(Word, Slot)> = args
-            .iter()
-            .zip(slots.iter())
-            .map(|(w, slot)| match slot {
-                Slot::Float | Slot::Wide(_) => {
-                    let bits = unsafe { word_at(obj(*w), 0) };
-                    dec(*w);
-                    (bits, *slot)
-                }
-                _ => (*w, *slot),
-            })
-            .collect();
+        let words: Vec<(Word, Slot)> = args.iter().copied().zip(slots.iter().copied()).collect();
         self.laid_out(layouts, KIND_CTOR, index, shape, &words)
     }
 
@@ -1494,6 +1541,18 @@ impl Heap {
         o as Word
     }
 
+    /// A `Decimal`'s object.
+    pub fn boxed_decimal(&mut self, d: ply_eval::Decimal) -> Word {
+        let bytes = d.serialize();
+        let half = |i: usize| i64::from_le_bytes(bytes[i..i + 8].try_into().expect("eight bytes"));
+        let o = self.alloc(KIND_DECIMAL, 0, 2, 0);
+        unsafe {
+            set_word(o, 0, half(0));
+            set_word(o, 1, half(8));
+        }
+        o as Word
+    }
+
     /// A 64- or 128-bit width's object: its bits in one word or two.
     pub fn boxed_fixed(&mut self, f: Fixed) -> Word {
         let wide = f.ty.bits() > 64;
@@ -1555,6 +1614,7 @@ impl Heap {
                 KIND_INT => self.boxed_int(word_at(o, 0)),
                 KIND_FLOAT => self.boxed_float(f64::from_bits(word_at(o, 0) as u64)),
                 KIND_FIXED => self.boxed_fixed(fixed_of(o)),
+                KIND_DECIMAL => self.boxed_decimal(decimal_at(o, 0)),
                 KIND_STR | KIND_BYTES => self.joined((*o).kind, bytes_of(o), &[], 0) as Word,
                 KIND_BRIDGE => self.bridge(bridged(o).clone()),
                 KIND_LIST => {
@@ -1627,6 +1687,7 @@ impl Heap {
             // bits cut to 64 are; at 64 bits and past it is the runtime's own.
             Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
             Value::Fixed(f) => self.boxed_fixed(*f),
+            Value::Decimal(d) => self.boxed_decimal(*d),
             Value::Bool(b) => bool(*b),
             Value::Float(f) => self.boxed_float(*f),
             Value::Char(c) => char_word(*c),
@@ -1741,6 +1802,7 @@ impl Heap {
                 KIND_INT => read_int(word_at(o, 0), carry, walked),
                 KIND_FLOAT => Value::Float(f64::from_bits(word_at(o, 0) as u64)),
                 KIND_FIXED => Value::Fixed(fixed_of(o)),
+                KIND_DECIMAL => Value::Decimal(decimal_at(o, 0)),
                 KIND_STR => Value::Str(Arc::from(str_of(o))),
                 KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
@@ -2364,6 +2426,7 @@ fn rank(w: Word) -> u8 {
             KIND_BOOL => 1,
             KIND_INT => 2,
             KIND_FLOAT => 3,
+            KIND_DECIMAL => 4,
             KIND_FIXED => 15,
             KIND_STR => 5,
             KIND_BYTES => 6,
@@ -2434,6 +2497,7 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
             // Byte order, which is the order `str` and `[u8]` have.
             KIND_STR | KIND_BYTES => bytes_of(obj(a)).cmp(bytes_of(obj(b))),
             KIND_FIXED => fixed_of(obj(a)).value_cmp(fixed_of(obj(b))),
+            KIND_DECIMAL => decimal_at(obj(a), 0).cmp(&decimal_at(obj(b), 0)),
             KIND_FLOAT => ply_eval::float::total_cmp(
                 f64::from_bits(word_at(obj(a), 0) as u64),
                 f64::from_bits(word_at(obj(b), 0) as u64),
@@ -2555,11 +2619,7 @@ fn read_held(
 ) -> Value {
     unsafe {
         match slot {
-            Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
-            Slot::Wide(t) => Value::Fixed(Fixed::new(
-                ply_eval::INT_TYPES[t as usize],
-                word_at(o, at) as u64 as u128,
-            )),
+            Slot::Float | Slot::Wide(_) | Slot::Decimal => raw_value(o, at, slot),
             Slot::Record(_) => Heap::read(layouts, words(o).add(at) as Word, carry, ctors, walked),
             Slot::Word => Heap::read(layouts, word_at(o, at), carry, ctors, walked),
         }
@@ -2576,16 +2636,12 @@ unsafe fn cmp_fields(
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) => None,
+            Slot::Float | Slot::Wide(_) | Slot::Decimal => None,
         }
     };
-    let value = |o: *mut Obj, slot: Slot, at: usize| match (word(o, slot, at), slot) {
-        (Some(w), _) => Heap::to_value(layouts, w),
-        (None, Slot::Wide(t)) => Value::Fixed(Fixed::new(
-            ply_eval::INT_TYPES[t as usize],
-            unsafe { word_at(o, at) } as u64 as u128,
-        )),
-        (None, _) => Value::Float(f64::from_bits(unsafe { word_at(o, at) } as u64)),
+    let value = |o: *mut Obj, slot: Slot, at: usize| match word(o, slot, at) {
+        Some(w) => Heap::to_value(layouts, w),
+        None => unsafe { raw_value(o, at, slot) },
     };
     match (word(x, sx, ax), word(y, sy, ay)) {
         (Some(p), Some(q)) => cmp_words(layouts, p, q),
@@ -2593,8 +2649,9 @@ unsafe fn cmp_fields(
     }
 }
 
-/// Whether a word can be a native map's key: ordered in place and canonical.
-pub fn native_key(w: Word) -> bool {
+/// Whether a word can be a native map's key: ordered in place and canonical. A `Decimal` is canonical
+/// at its least scale, so `1.50` is not and goes the way that makes it so.
+pub fn native_key(layouts: &Layouts, w: Word) -> bool {
     if is_imm(w) {
         return true;
     }
@@ -2602,20 +2659,35 @@ pub fn native_key(w: Word) -> bool {
     unsafe {
         match (*o).kind {
             KIND_UNIT | KIND_BOOL | KIND_INT | KIND_FIXED | KIND_STR | KIND_BYTES => true,
+            KIND_DECIMAL => least_scale(decimal_at(o, 0)),
             KIND_BRIDGE => matches!(
                 bridged(o),
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
             ),
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
-                (0..(*o).len as usize).all(|i| !counted(o, i) || native_key(word_at(o, i)))
+            KIND_RECORD | KIND_CTOR | KIND_ARRAY if (*o).flags & RAW != 0 => {
+                layouts.parts(o).into_iter().all(|(at, slot)| match slot {
+                    Slot::Decimal => least_scale(decimal_at(o, at)),
+                    Slot::Float | Slot::Wide(_) => true,
+                    _ => part_word(o, at, slot).is_some_and(|p| native_key(layouts, p)),
+                })
             }
-            KIND_LIST => list::children(o).all(native_key),
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH | KIND_ARRAY => {
+                (0..(*o).len as usize).all(|i| !counted(o, i) || native_key(layouts, word_at(o, i)))
+            }
+            KIND_LIST => list::children(o).all(|w| native_key(layouts, w)),
             KIND_MAP => {
                 let mut fine = true;
-                map::for_each(o, |k, v| fine = fine && native_key(k) && native_key(v));
+                map::for_each(o, |k, v| {
+                    fine = fine && native_key(layouts, k) && native_key(layouts, v)
+                });
                 fine
             }
             _ => false,
         }
     }
+}
+
+/// Whether `d` is written at its least scale, the one spelling a map keeps of its number.
+fn least_scale(d: ply_eval::Decimal) -> bool {
+    d.serialize() == d.normalize().serialize()
 }

@@ -409,7 +409,7 @@ fn a_wide_width_is_an_object_of_its_own_ordered_by_its_value_and_kept_as_it_is()
         let words: Vec<Word> = values.iter().map(|v| h.to_word(&l, v)).collect();
         for (w, v) in words.iter().zip(values) {
             assert_eq!(kind(*w), KIND_FIXED);
-            assert!(native_key(*w));
+            assert!(native_key(&l, *w));
             assert_eq!(Heap::to_value(&l, *w), *v);
             let (_into, read) = kept(&l, *w);
             assert_eq!(Heap::to_value(&l, read), *v);
@@ -643,4 +643,59 @@ fn a_constructor_holds_its_arguments_as_its_declaration_types_them() {
     dec(w);
     dec(later);
     dec(plain);
+}
+
+fn decimal(text: &str) -> Value {
+    Value::Decimal(text.parse().expect("a decimal"))
+}
+
+#[test]
+fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_words() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let price = decimal("19.990");
+    let w = h.to_word(&l, &price);
+    assert_eq!(kind(w), KIND_DECIMAL);
+    assert_eq!(Heap::to_value(&l, w), price);
+    // Ordered as the numbers they are, whatever their scales.
+    let same = h.to_word(&l, &decimal("19.99"));
+    assert_eq!(cmp_words(&l, w, same), Ordering::Equal);
+    // A map keeps one spelling of a number: only the least scale is a key as it stands.
+    assert!(!native_key(&l, w));
+    assert!(native_key(&l, same));
+    let line = record(vec![("price", price.clone()), ("qty", Value::Int(3))]);
+    let r = h.to_word(&l, &line);
+    // `price` takes two words, `qty` the third, and a word of bitmap says the third alone counts.
+    let shape = unsafe { (*obj(r)).layout };
+    assert_eq!(l.shape_words(shape), (3, 1));
+    assert_eq!(&l.shape_offsets(shape)[..], &[0, 2]);
+    assert_eq!(Heap::to_value(&l, r), line);
+    let prices = Value::array(vec![decimal("1.5"), decimal("-2.25")]);
+    let a = h.to_word(&l, &prices);
+    assert!(ply_codegen::array::in_place(obj(a)));
+    assert_eq!(unsafe { (*obj(a)).aux }, 2);
+    assert_eq!(Heap::to_value(&l, a), prices);
+    let second = ply_codegen::array::element(&mut h, &l, obj(a), 1);
+    assert_eq!(kind(second), KIND_DECIMAL);
+    assert_eq!(Heap::to_value(&l, second), decimal("-2.25"));
+    for x in [w, r, a] {
+        let (_into, read) = kept(&l, x);
+        assert_eq!(Heap::to_value(&l, read), Heap::to_value(&l, x));
+    }
+    // A unit that reads a `Decimal`'s word has the runtime hold it so.
+    let words = Layouts::of(
+        vec![],
+        &[],
+        RecordLayout {
+            raw_decimals: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    let by_word = h.to_word(&words, &line);
+    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
+    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
+    assert_eq!(Heap::to_value(&words, by_word), line);
+    for x in [w, same, r, a, second, by_word] {
+        dec(x);
+    }
 }
