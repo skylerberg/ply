@@ -6,12 +6,16 @@
 #                                exists, every `probes/` directory is run by a
 #                                job the `ci` aggregate requires, the jobs take
 #                                every Ply run exactly once, every cache key a
-#                                job writes is one a job reads, every key that
-#                                names the run is one a later run reads and no
-#                                job needs, every key over a crate's Ply
-#                                sources names every crate's, and the toolchain
-#                                key names what `ply bootstrap` reads
-#   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads
+#                                job writes is one a job reads and a family
+#                                `supersede` prunes, every key that names the
+#                                run is one a later run reads and no job needs,
+#                                every action a workflow uses is one listed with
+#                                the cache entries it saves, every key over a
+#                                crate's Ply sources names every crate's, and
+#                                the toolchain key names what `ply bootstrap`
+#                                reads
+#   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads,
+#                                of what `supersede` deletes and of the actions
 #   ci-shards.sh toolchain-inputs  just that last check
 #   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
@@ -40,7 +44,9 @@
 #                                names, so SWEEP_DAYS days sweep every case, and one job of the other
 #                                modules no pull request runs; none otherwise
 #   ci-shards.sh supersede RUN REF
-#                                delete the entries of REF that this run's replaced
+#                                delete the entries of REF nothing restores again:
+#                                those this run's replaced, and those no family
+#                                here names
 
 set -euo pipefail
 
@@ -170,6 +176,27 @@ SUPERSEDED=(ply-upstream- ply-stores-)
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
 NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+
+# Families of the two above that hold an entry a job, `<family><job id>-...`: one whose job the tree
+# no longer lists is restored by no run.
+PER_JOB=(ply-stores- ply-c-corpus-)
+
+# A key that never moves: nothing replaces its one entry.
+FIXED=(tcc-)
+
+# The actions the workflows use: `action:family` for one that saves cache entries under keys of its
+# own, of which a run restores the newest, and the bare name of one that saves none but those a step
+# spells. `supersede` deletes an entry no family names, so an action left out would lose its cache
+# every run: `verify` refuses a workflow that uses one.
+ACTIONS=(
+  actions/cache
+  actions/checkout
+  actions/download-artifact
+  actions/upload-artifact
+  dtolnay/rust-toolchain
+  "Swatinem/rust-cache:v0-rust-"
+  taiki-e/install-action
+)
 
 # The key the `ply` a run bootstrapped and the stage it left are kept under, and the source that says
 # what a bootstrap reads of a checkout (`toolchain_inputs`).
@@ -442,13 +469,24 @@ ci_files() {
 # for runners, so a key that names the run is one a later run reads, and none is restored with
 # `fail-on-cache-miss`.
 cmd_cache_keys() {
-  local files=() file
+  local files=() file family
+  for family in ${PER_JOB[@]+"${PER_JOB[@]}"}; do
+    if ! named_in "$family" "${SUPERSEDED[@]}" "${NEWEST[@]}"; then
+      echo "FAIL: PER_JOB names \"$family\", which neither SUPERSEDED nor NEWEST does" >&2
+      return 1
+    fi
+  done
   while IFS= read -r file; do files+=("$file"); done < <(ci_files)
-  awk -v families="${SUPERSEDED[*]} ${NEWEST[*]}" '
+  awk -v families="${SUPERSEDED[*]} ${NEWEST[*]} ${FIXED[*]-}" -v perjob="${PER_JOB[*]-}" '
     function literal(s) {
       sub(/\$\{\{.*/, "", s)
       gsub(/^[[:space:]"]+|[[:space:]"]+$/, "", s)
       return s
+    }
+    function per_job(key,   p, i, m) {
+      m = split(perjob, p, " ")
+      for (i = 1; i <= m; i++) if (key == p[i]) return 1
+      return 0
     }
     # `key:` inside a save step is written, inside a restore step or in a `restore-keys` list it
     # is read. An entry with no literal at all is all expression, and nothing to compare. A write
@@ -459,6 +497,7 @@ cmd_cache_keys() {
       if (key == "") return
       steplit[++nlit] = key
       if (kind == "save") {
+        if (per_job(key) && index(value, key "${{ matrix.id }}-") == 0) jobless[++njobless] = FILENAME ":" FNR " saves \"" key "\""
         if (key in saved) return
         saved[key] = 1
         where[key] = FILENAME ":" FNR
@@ -576,12 +615,25 @@ cmd_cache_keys() {
         ok = 0
         for (k in saved) if (index(k, fk[j]) == 1) { ok = 1; break }
         if (!ok) {
-          printf "FAIL: SUPERSEDED or NEWEST names \"%s\", which no save writes\n", fk[j] > "/dev/stderr"
+          printf "FAIL: SUPERSEDED, NEWEST or FIXED names \"%s\", which no save writes\n", fk[j] > "/dev/stderr"
           bad = 1
         }
       }
+      # `supersede` deletes an entry no family names: a key outside them is gone by the next run.
+      for (i = 1; i <= n; i++) {
+        ok = 0
+        for (j = 1; j <= nf; j++) if (fk[j] != "" && index(order[i], fk[j]) == 1) { ok = 1; break }
+        if (!ok) {
+          printf "FAIL: %s writes cache key \"%s\", which no family of SUPERSEDED, NEWEST or FIXED names, so `supersede` would delete it before a run restored it\n", where[order[i]], order[i] > "/dev/stderr"
+          bad = 1
+        }
+      }
+      for (i = 1; i <= njobless; i++) {
+        printf "FAIL: %s without the job id next: PER_JOB reads an entry as its family, then its job, and deletes one of a job the tree does not list\n", jobless[i] > "/dev/stderr"
+        bad = 1
+      }
       if (bad) exit 1
-      printf "cache keys: %d written and %d restored, each side matched by the other; %d run-scoped, each read by a later run and needed by no job\n", n, length(read), length(run_scoped)
+      printf "cache keys: %d written and %d restored, each side matched by the other and each of a family `supersede` prunes; %d run-scoped, each read by a later run and needed by no job\n", n, length(read), length(run_scoped)
     }
   ' "${files[@]}"
 }
@@ -766,44 +818,160 @@ cmd_rust_inputs() {
   return $((missing > 0))
 }
 
-# A family only this run's entry replaces, so a job that wrote nothing keeps what it had; and of a
-# family keyed by content, the newest entry on the ref. A ref runs one run at a time. On main, every
-# entry of a pull request that is closed, which no run reads again.
-cmd_supersede() {
-  local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref} prefix listing current key id
-  for prefix in "${SUPERSEDED[@]}"; do
-    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&per_page=100" \
-      -q '.actions_caches[] | "\(.key) \(.id)"')
-    current=$(awk -v suffix="-$run" '{ k = $1; n = length(suffix); if (substr(k, length(k) - n + 1) == suffix) print substr(k, 1, length(k) - n) }' <<< "$listing" | sort -u)
-    while read -r key id; do
-      [[ -n $id && $key != *-"$run" ]] || continue
-      grep -qxF "${key%-*}" <<< "$current" || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
-    done <<< "$listing"
-  done
-  for prefix in "${NEWEST[@]}"; do
-    listing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?key=$prefix&ref=$ref&sort=created_at&direction=desc&per_page=100" \
-      -q '.actions_caches[] | "\(.key) \(.id)"')
-    while read -r key id; do
-      [[ -n $id ]] || continue
-      gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "superseded $key"
-    done < <(awk '{ family = $1; sub(/[0-9a-f]+$/, "", family); if (seen[family]++) print }' <<< "$listing")
-  done
-  [[ $ref == refs/heads/main ]] || return 0
-  local pull last= number state=
-  while read -r pull id; do
-    [[ -n $id ]] || continue
-    if [[ $pull != "$last" ]]; then
-      last=$pull
-      number=${pull#refs/pull/}
-      number=${number%/merge}
-      state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" -q .state 2> /dev/null || echo open)
+# The families the table entry PREFIX names, on one line: one a job where PER_JOB lists it, else
+# itself.
+families_of() {
+  local id
+  if named_in "$1" ${PER_JOB[@]+"${PER_JOB[@]}"}; then
+    jobs | while read -r id; do printf '%s%s- ' "$1" "$id"; done
+  else
+    printf '%s ' "$1"
+  fi
+}
+
+# What `supersede` deletes of a ref's entries, read as `id created key` lines with tabs between,
+# written as `id why key`. Of a family SUPERSEDED names, an entry of an earlier run where RUN saved
+# one: a job that wrote nothing keeps what it had. Of a family NEWEST names, every entry but the
+# newest. And an entry no family names, which nothing in this tree restores: a retired job's, or a
+# family's the tables dropped.
+prune_plan() {
+  LC_ALL=C sort -t "$TAB" -k2,2r | awk -F'\t' -v OFS='\t' -v run="$1" -v superseded="$2" -v newest="$3" -v fixed="$4" '
+    function named(key, list,   p, i, m) {
+      m = split(list, p, " ")
+      for (i = 1; i <= m; i++) if (index(key, p[i]) == 1) return 1
+      return 0
+    }
+    # A key less the digests it ends in, each eight hex digits or more.
+    function family(key) {
+      while (match(key, /-[0-9a-f]+$/) && RLENGTH > 8) key = substr(key, 1, RSTART - 1)
+      return key
+    }
+    { id[NR] = $1; key[NR] = $3; held[$3] = 1 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        k = key[i]
+        if (named(k, fixed)) continue
+        if (named(k, superseded)) {
+          f = k
+          sub(/-[0-9]+$/, "", f)
+          if (substr(k, length(f) + 2) + 0 < run + 0 && (f "-" run) in held) print id[i], "superseded", k
+        } else if (named(k, newest)) {
+          if (seen[family(k)]++) print id[i], "superseded", k
+        } else {
+          print id[i], "unnamed", k
+        }
+      }
+    }
+  '
+}
+
+# `prune_plan` over a listing in which each of its rules decides an entry.
+cmd_prune_check() {
+  local a b got want
+  a=$(printf 'a%.0s' {1..40})
+  b=$(printf 'b%.0s' {1..40})
+  want="1 superseded;4 unnamed;5 superseded;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;"
+  got=$(printf '%s\t%s\t%s\n' \
+    1 2026-01-01T00:00:00Z ply-stores-stdlib-100 \
+    2 2026-01-02T00:00:00Z ply-stores-stdlib-200 \
+    3 2026-01-01T00:00:00Z ply-stores-checks-100 \
+    4 2026-01-01T00:00:00Z ply-stores-cli-part-3-100 \
+    5 2026-01-01T00:00:00Z ply-upstream-100 \
+    6 2026-01-02T00:00:00Z ply-upstream-200 \
+    7 2026-01-01T00:00:00Z "ply-built-Linux-X64-$a" \
+    8 2026-01-02T00:00:00Z "ply-built-Linux-X64-$b" \
+    9 2026-01-01T00:00:00Z "ply-built-macOS-ARM64-$a" \
+    10 2026-01-02T00:00:00Z "ply-c-corpus-stdlib-$a" \
+    11 2026-01-01T00:00:00Z "ply-c-corpus-stdlib-$b" \
+    12 2026-01-02T00:00:00Z "ply-c-corpus-cli-part-3-$a" \
+    13 2026-01-01T00:00:00Z v0-rust-build-Linux-x64-11111111-22222222 \
+    14 2026-01-02T00:00:00Z v0-rust-build-Linux-x64-11111111-33333333 \
+    15 2026-01-01T00:00:00Z v0-rust-clippy-Linux-x64-11111111-22222222 \
+    16 2026-01-01T00:00:00Z tcc-Linux-X64 \
+    17 2026-01-02T00:00:00Z sccache/a/b/c/abcdef \
+    18 2026-01-03T00:00:00Z ply-stores-stdlib-300 |
+    prune_plan 200 "ply-upstream- ply-stores-stdlib- ply-stores-checks-" "ply-built- ply-c-corpus-stdlib- v0-rust-" "tcc-" |
+    cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
+  if [[ $got != "$want" ]]; then
+    echo "FAIL: of the listing it is held to, \`supersede\` would delete '$got' and should delete '$want'" >&2
+    return 1
+  fi
+  echo "cache pruning: each rule of \`supersede\` decides the listing it is held to"
+}
+
+# Every action a workflow uses is one ACTIONS lists, with the cache entries it saves or as saving
+# none, and every one it lists is used.
+cmd_actions() {
+  local file use entry name bad=0 listed="" used=""
+  for entry in "${ACTIONS[@]}"; do listed+="${entry%%:*}"$'\n'; done
+  while IFS= read -r file; do
+    while IFS= read -r use; do
+      name=$(awk -F/ '{ print $1 "/" $2 }' <<< "${use%%@*}")
+      used+="$name"$'\n'
+      if ! grep -qxF -- "$name" <<< "$listed"; then
+        echo "FAIL: ${file#"$root"/} uses $name, which ACTIONS does not list: \`supersede\` deletes an entry no family names, so say whether it saves cache entries under keys of its own" >&2
+        bad=$((bad + 1))
+      fi
+    done < <(sed -n -E 's/^[[:space:]-]*uses:[[:space:]]*([^[:space:]#]+).*/\1/p' "$file" | grep -v '^\./' || true)
+  done < <(ci_files)
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    if ! grep -qxF -- "$name" <<< "$used"; then
+      echo "FAIL: ACTIONS lists $name, which no workflow uses -- delete the entry" >&2
+      bad=$((bad + 1))
     fi
-    [[ $state == closed ]] || continue
+  done <<< "$listed"
+  [ "$bad" -eq 0 ] && echo "actions: each of the $(grep -c . <<< "$listed") the workflows use is listed with the cache entries it saves"
+  return $((bad > 0))
+}
+
+# Whether no run restores an entry of REF again: a pull request's once it is closed, a branch's
+# while no pull request is open from it. A ref that cannot be asked about keeps its entries.
+ref_done() {
+  local ref=$1 number state open
+  case "$ref" in
+    refs/pull/*/merge)
+      number=${ref#refs/pull/}
+      number=${number%/merge}
+      state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$number" -q .state 2> /dev/null) || return 1
+      [[ $state == closed ]]
+      ;;
+    refs/heads/*)
+      open=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" -f state=open -f per_page=1 \
+        -f head="${GITHUB_REPOSITORY%%/*}:${ref#refs/heads/}" -q length 2> /dev/null) || return 1
+      [[ $open == 0 ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# The entries of REF nothing restores again (`prune_plan`). On main, the entries of every other ref
+# no run reads again (`ref_done`), which that ref's own runs are no longer there to delete.
+cmd_supersede() {
+  local run=${1:?usage: ci-shards.sh supersede RUN_ID REF} ref=${2:?a ref}
+  local prefix entry id why key other last="" gone="" superseded="" newest=""
+  [[ -n $(jobs) ]] || { echo "the tree lists no job, so every job's entries would go" >&2; return 1; }
+  for prefix in "${SUPERSEDED[@]}"; do superseded+=$(families_of "$prefix"); done
+  for prefix in "${NEWEST[@]}"; do newest+=$(families_of "$prefix"); done
+  for entry in "${ACTIONS[@]}"; do [[ $entry != *:* ]] || newest+="${entry#*:} "; done
+  while IFS=$TAB read -r id why key; do
+    [[ -n $key ]] || continue
+    gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null && echo "$why $key"
+  done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?ref=$ref&per_page=100" \
+    -q '.actions_caches[] | [.id, .created_at, .key] | @tsv' |
+    prune_plan "$run" "$superseded" "$newest" "${FIXED[*]-}")
+  [[ $ref == refs/heads/main ]] || return 0
+  while IFS=$TAB read -r other id; do
+    [[ -n $id ]] || continue
+    if [[ $other != "$last" ]]; then
+      last=$other
+      if ref_done "$other"; then gone=yes; else gone=no; fi
+    fi
+    [[ $gone == yes ]] || continue
     gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" > /dev/null &&
-      echo "gave back cache $id of closed pull request #$number"
+      echo "gave back cache $id of $other"
   done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
-    -q '.actions_caches[] | select(.ref | startswith("refs/pull/")) | "\(.ref) \(.id)"' | sort)
+    -q '.actions_caches[] | select(.ref != "refs/heads/main") | [.ref, .id] | @tsv' | LC_ALL=C sort)
 }
 
 # Workspace members under `crates/`, read out of `Cargo.toml` as text.
@@ -1141,6 +1309,8 @@ cmd_verify() {
 
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
+  cmd_prune_check || failures=$((failures + 1))
+  cmd_actions || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
   cmd_toolchain_inputs || failures=$((failures + 1))
 
@@ -1171,7 +1341,11 @@ cmd_nightly_matrix() {
 
 case "${1:-}" in
   verify) cmd_verify ;;
-  cache-keys) cmd_cache_keys ;;
+  cache-keys)
+    cmd_cache_keys
+    cmd_prune_check
+    cmd_actions
+    ;;
   toolchain-inputs) cmd_toolchain_inputs ;;
   nextest-shards) cmd_nextest_shards ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
