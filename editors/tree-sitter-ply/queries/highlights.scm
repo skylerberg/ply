@@ -45,6 +45,7 @@
   "requires"
   "ensures"
   "cost"
+  "space"
   "bounded"
   "derivable"
   "integer"
