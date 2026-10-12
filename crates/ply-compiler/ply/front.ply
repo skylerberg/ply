@@ -22,7 +22,8 @@ import types (Atom, Resource, RNamed, RSingleton, Scheme, Type, TyCon, TyFn, TyR
               atoms_text, atoms_insert, filed_atoms_text, read_atoms, scheme_text, type_text,
               Printer, printer_new, print_ty, Field, canonical_atoms, canonical_scheme,
               canonical_type, bool_type, int_type, bytes_type, unit_type, named_type, TyNominal,
-              atom_bin, scheme_bin, TypeTable, table_of, tables_joined, type_table_bin, type_at)
+              atom_bin, scheme_bin, TypeTable, table_of, tables_joined, type_table_bin, type_at,
+              HeldType, held_type_bin, types_held, types_of)
 import resolve (Source, ParsedModule, Diag, Label, Resolved, ResolveSucceeded, ResolveFailed,
                 Namespace, ValueSpace, EffectSpace, resolve_modules, qualify, lookup, find,
                 error_at, backticked, import_module_name, path_span, post_order)
@@ -755,6 +756,39 @@ pub fn no_shape(module: Bytes) -> ModuleShape =
     tagged: [],
     statements: [],
     consts: [],
+  }
+
+/// A module's tables as an answer keeps them: each definition's type among `types`, held once, at
+/// the place `at` gives it in the definitions' order, and left out of `tables`.
+pub type KeptTables = { types: List<HeldType>, at: List<Int>, tables: ModuleTables }
+
+derive bin for KeptTables
+
+fn untyped(d: DefInfo) -> DefInfo = { ..d, scheme: { ..d.scheme, ty: unit_type() } }
+
+/// `t` as an answer keeps it, which [`tables_read`] reads back.
+pub fn tables_kept(t: ModuleTables) -> Bytes / {abort.raise} = {
+  let h = types_held(map(t.defs, |d: DefInfo| d.scheme.ty));
+  bin::encode(
+    { types: h.held, at: h.at, tables: { ..t, defs: map(t.defs, untyped) } },
+    kept_tables_bin(),
+  )
+}
+
+/// The tables `tables_kept` kept as `b`: a type two definitions share is one value in both.
+pub fn tables_read(b: Bytes) -> ModuleTables / {abort.raise} =
+  match bin::decode(b, kept_tables_bin()) {
+    Err(e) -> panic("a module's tables do not read back: " ++ e.message),
+    Ok(k) -> {
+      let tys = types_of(k.types);
+      {
+        ..k.tables,
+        defs: map(range(0, len(k.tables.defs)), |i: Int| {
+          let d = at(k.tables.defs, i);
+          { ..d, scheme: { ..d.scheme, ty: at(tys, at(k.at, i)) } }
+        }),
+      }
+    },
   }
 
 /// The tables of a module that answers nothing.
@@ -2963,6 +2997,44 @@ pub type Rows = { defs: List<KnownDefRow>, tests: List<KnownTestRow>, types: Typ
 
 pub fn no_rows() -> Rows = { defs: [], tests: [], types: map_new() }
 
+/// Rows as an answer keeps them: each definition's type among `types`, held once, at the place `at`
+/// gives it in the rows' order, and left out of `rows`.
+pub type KeptRows = { types: List<HeldType>, at: List<Int>, rows: Rows }
+
+derive bin for KeptRows
+
+/// `r` as an answer keeps it, which [`rows_read`] reads back.
+pub fn rows_kept(r: Rows) -> Bytes / {abort.raise} = {
+  let h = types_held(map(r.defs, |row: KnownDefRow| row.scheme.ty));
+  bin::encode(
+    {
+      types: h.held,
+      at: h.at,
+      rows: {
+        ..r,
+        defs: map(r.defs, |row: KnownDefRow| { ..row, scheme: { ..row.scheme, ty: unit_type() } }),
+      },
+    },
+    kept_rows_bin(),
+  )
+}
+
+/// The rows `rows_kept` kept as `b`.
+pub fn rows_read(b: Bytes) -> Rows / {abort.raise} =
+  match bin::decode(b, kept_rows_bin()) {
+    Err(e) -> panic("a module's rows do not read back: " ++ e.message),
+    Ok(k) -> {
+      let tys = types_of(k.types);
+      {
+        ..k.rows,
+        defs: map(range(0, len(k.rows.defs)), |i: Int| {
+          let row = at(k.rows.defs, i);
+          { ..row, scheme: { ..row.scheme, ty: at(tys, at(k.at, i)) } }
+        }),
+      }
+    },
+  }
+
 /// The types the facts of `defs` and `tests` name, read from `table`.
 pub fn types_of_rows(
   table: TypeTable,
@@ -3206,13 +3278,21 @@ pub type FiledBody = { hash: Bytes, body: Bytes }
 pub type FiledDef = { name: Bytes, hash: Bytes, interface: DefInterface }
 
 /// Each definition `analysis` checked, as `FiledDef` keeps it.
-pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef> / {abort.raise} = {
+pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef> / {abort.raise} =
+  interfaces_among(checked, hashes, |_: Bytes| true)
+
+/// [`interfaces_of`] for the definitions whose hash `wanted` takes: no other's is worked out.
+pub fn interfaces_among(
+  checked: CheckOutput,
+  hashes: HashOutput,
+  wanted: (Bytes) -> Bool / {abort.raise},
+) -> List<FiledDef> / {abort.raise} = {
   let hashed = by_name(hashes.defs);
   let decls = by_name(hashes.decls);
   let read = bodies_read(checked);
   fold(checked.defs, [], |acc: List<FiledDef>, def_info: DefInfo|
     match map_get(hashed, def_info.name) {
-      Some(h) ->
+      Some(h) -> if !wanted(h) { acc } else {
         push(acc, {
           name: def_info.name,
           hash: h,
@@ -3220,7 +3300,8 @@ pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef>
             row: def_known_row(decls, def_info, h, read),
             scheme: scheme_text(def_info.scheme),
           },
-        }),
+        })
+      },
       None -> acc,
     })
 }
@@ -8429,4 +8510,16 @@ test "the shipped modules parse for a listing with their data written out, as a 
   assert_eq(refused_codes(listed), []);
   assert_eq(Some(def_hash_in(listed, b"std.words.list")), pulled_hash(pulled, b"std.words.list"));
   assert_eq(refused_codes(analyse(parse_shipped([module], [module], []))), [b"E0146"])
+}
+
+test "a module's tables and rows read back as an answer kept them" {
+  match analyse(parse_all(program())) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> {
+      let t = module_facts(w, 0).tables;
+      assert_eq(tables_read(tables_kept(t)), t);
+      let r = rows_of(w);
+      assert_eq(rows_read(rows_kept(r)), r)
+    },
+  }
 }

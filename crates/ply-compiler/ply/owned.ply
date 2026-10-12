@@ -19,14 +19,15 @@ import exports (Entry, Exports, ItemAt, OwnerRead, Mention, InRoot, ShippedModul
                 entry_bin, entries_in, import_targets, owner_source, checked_owner, owner_reads,
                 module_scope, owner_mentions, owner_groups, group_source, unplaced_imports,
                 group_imports, laid_items)
-import items (Item, IFn, parse, item_span, item_owner)
+import items (Item, IFn, Module, parse, item_span, item_owner)
 import infer (DefInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo, InstanceInfo,
               NumericInfo, Location, walk_order, SpecInfo, LabelSite, OperandSite, TypedSite,
               UpdateShape, WitnessOp, WitnessRef, WitnessOrder, TrySite, KeptFacts, EmitFacts,
               test_owner, types_named, types_joined)
 import resolve (Diag, Label, Edit, Fix, Source, diag_bin)
 import parsing (Span)
-import types (TypeTable)
+import types (HeldType, Holding, Type, TypeTable, held_part, held_type_bin, no_types_held,
+              types_held, types_held_in, types_of, unit_type)
 import exprs (TaggedPart)
 import embed (EmbedAt, EmbedWant, embed_at_bin, embed_key, wants_of)
 import hash (Shapes, UseNode, LawNode, TestNode, chosen_in, chosen_forms, shapes_bin, use_node_bin,
@@ -308,14 +309,63 @@ pub fn no_group() -> GroupAnswer =
 pub type Shown = { owner: Bytes, entry: Bytes }
 
 /// A group's answer as its record keeps it: each member's entry before the rest, which holds none,
-/// so what reads an entry decodes no member's tables. Its encoding starts with the entries.
-pub type KeptGroup = { shown: List<Shown>, rest: GroupAnswer }
+/// so what reads an entry decodes no member's tables; and each definition's type among `types`,
+/// held once, where `at` gives it in the order [`typed`] walks them, and left out of `rest`. Its
+/// encoding starts with the entries.
+pub type KeptGroup = { shown: List<Shown>, types: List<HeldType>, at: List<Int>, rest: GroupAnswer }
 
 derive bin for Shown
 derive bin for KeptGroup
 
-/// `a` as its record keeps it.
-pub fn group_kept(a: GroupAnswer) -> Bytes / {abort.raise} =
+/// The type of each definition `a`'s members hold, in their tables and then their rows, member by
+/// member.
+fn typed(a: GroupAnswer) -> List<Type> =
+  fold(a.members, [], |acc: List<Type>, m: MemberAnswer|
+    concat(
+      concat(acc, map(m.answer.tables.defs, |d: DefInfo| d.scheme.ty)),
+      map(m.answer.rows.defs, |r: KnownDefRow| r.scheme.ty),
+    ))
+
+/// `a` with each of those types read as `ty` gives the one at its place among them.
+fn retyped(a: GroupAnswer, ty: (Int) -> Type / {abort.raise}) -> GroupAnswer / {abort.raise} =
+  {
+    ..a,
+    members: fold(
+      a.members,
+      { out: [], next: 0 },
+      |acc: { out: List<MemberAnswer>, next: Int }, m: MemberAnswer| {
+        let defs = m.answer.tables.defs;
+        let rows = m.answer.rows.defs;
+        let from = acc.next + len(defs);
+        {
+          out: push(acc.out, {
+            ..m,
+            answer: {
+              ..m.answer,
+              tables: {
+                ..m.answer.tables,
+                defs: map(range(0, len(defs)), |i: Int| {
+                  let d = at(defs, i);
+                  { ..d, scheme: { ..d.scheme, ty: ty(acc.next + i) } }
+                }),
+              },
+              rows: {
+                ..m.answer.rows,
+                defs: map(range(0, len(rows)), |i: Int| {
+                  let r = at(rows, i);
+                  { ..r, scheme: { ..r.scheme, ty: ty(from + i) } }
+                }),
+              },
+            },
+          }),
+          next: from + len(rows),
+        }
+      },
+    ).out,
+  }
+
+/// `a` as its record keeps it, its definitions' types the ones `held` holds once, at `at`.
+fn kept_with(a: GroupAnswer, held: List<HeldType>, at: List<Int>) -> Bytes / {abort.raise} =
   bin::encode(
     {
       shown: map(a.members, |m: MemberAnswer|
@@ -323,10 +373,34 @@ pub fn group_kept(a: GroupAnswer) -> Bytes / {abort.raise} =
           owner: m.owner,
           entry: match m.entry { Some(e) -> bin::encode(e, entry_bin()), None -> b"" },
         }),
-      rest: { ..a, members: map(a.members, |m: MemberAnswer| { ..m, entry: None }) },
+      types: held,
+      at: at,
+      rest: retyped(
+        { ..a, members: map(a.members, |m: MemberAnswer| { ..m, entry: None }) },
+        |_: Int| unit_type(),
+      ),
     },
     kept_group_bin(),
   )
+
+/// `a` as its record keeps it.
+pub fn group_kept(a: GroupAnswer) -> Bytes / {abort.raise} = {
+  let h = types_held(typed(a));
+  kept_with(a, h.held, h.at)
+}
+
+/// Each of `answers` as [`group_kept`] keeps it, byte for byte: their types are held together while
+/// they are laid out, so a type many groups of a module mention is walked once for all of them.
+pub fn groups_kept(answers: List<GroupAnswer>) -> List<Bytes> / {abort.raise} =
+  fold(
+    answers,
+    { h: no_types_held(), out: [] },
+    |acc: { h: Holding, out: List<Bytes> }, a: GroupAnswer| {
+      let p = types_held_in(acc.h, typed(a));
+      let part = held_part(p.h, p.at);
+      { h: p.h, out: push(acc.out, kept_with(a, part.held, part.at)) }
+    },
+  ).out
 
 /// The answer `k` keeps, each member with its entry again.
 pub fn group_whole(k: KeptGroup) -> GroupAnswer / {abort.raise} = {
@@ -337,10 +411,14 @@ pub fn group_whole(k: KeptGroup) -> GroupAnswer / {abort.raise} = {
         Err(_) -> panic("a group's record keeps an entry that does not decode"),
       }
     });
-  {
-    ..k.rest,
-    members: map(k.rest.members, |m: MemberAnswer| { ..m, entry: map_get(entries, m.owner) }),
-  }
+  let tys = types_of(k.types);
+  retyped(
+    {
+      ..k.rest,
+      members: map(k.rest.members, |m: MemberAnswer| { ..m, entry: map_get(entries, m.owner) }),
+    },
+    |i: Int| at(tys, at(k.at, i)),
+  )
 }
 
 /// Each member's entry of the answer `b` keeps, by owner, read without the rest of it.
@@ -409,14 +487,22 @@ pub fn group_answer(
 pub type Said = { w: Analysis, slot: Int, facts: ModuleFacts, rows: Rows, shown: Exports }
 
 /// What `w` said of its module at `slot`, written as `text`, read once for every owner of it.
-pub fn said_of(w: Analysis, slot: Int, text: Bytes) -> Said / {abort.raise} =
+pub fn said_of(
+  w: Analysis,
+  slot: Int,
+  text: Bytes,
+  // What `parse` made of `text`, where a caller has it.
+  read: Option<Module> = None,
+) -> Said / {abort.raise} = {
+  let rows = rows_of(w);
   {
     w: w,
     slot: slot,
     facts: module_facts(w, slot),
-    rows: rows_of(w),
-    shown: exports_of(w, slot, text),
+    rows: rows,
+    shown: exports_of(w, slot, text, read: read, published: Some(rows)),
   }
+}
 
 /// What a check that `said` what it did of `module` answered of each of `groups`, owners of it whose
 /// items stand where `items` lays them, each item where `stands` says in the module the check read. Each table
@@ -1153,6 +1239,8 @@ fn assembled_apart(
             ),
           }
         });
+        let answers = map(placed, |x: { items: List<ItemAt>, answer: GroupAnswer }| x.answer);
+        assert_eq(groups_kept(answers), map(answers, group_kept));
         push(acc, {
           module: parsed.name,
           whole: facts,
