@@ -124,7 +124,7 @@ pub fn stored_values(
 ) -> Result<Vec<Option<Vec<u8>>>, Diagnostic> {
     let entered = std::thread::Builder::new()
         .name("ply constants".to_string())
-        .stack_size(crate::STACK)
+        .stack_size(ply_codegen::rt::PROGRAM_STACK)
         .spawn(move || {
             let loaded = crate::driver::load_over_analysis_taken(PathBuf::from("."), front)
                 .map_err(|err| {
