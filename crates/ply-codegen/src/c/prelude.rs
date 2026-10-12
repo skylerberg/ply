@@ -21,6 +21,7 @@ typedef struct {
 
 #define PLY_HEADER 16
 #define PLY_FLAT 1
+#define PLY_KIND_FLOAT 16
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
    pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
@@ -80,6 +81,11 @@ static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {
 }
 #endif
 
+/* A `Float` is an object of kind `PLY_KIND_FLOAT` whose one payload word is its bits. */
+static inline double ply_f64(int64_t bits) { union { int64_t i; double d; } u; u.i = bits; return u.d; }
+static inline int64_t ply_f64_bits(double d) { union { int64_t i; double d; } u; u.d = d; return u.i; }
+static inline int ply_is_float(Word w) { return w != 0 && !ply_is_imm(w) && ply_obj(w)->kind == PLY_KIND_FLOAT; }
+
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
@@ -135,6 +141,9 @@ helpers![
     (rt_box_int, 1, true),
     (rt_unbox_int, 1, true),
     (rt_unbox_bool, 1, true),
+    (rt_box_float, 1, true),
+    (rt_unbox_float, 1, true),
+    (rt_float_rem, 2, true),
     (rt_no_fuel, 0, false),
     (rt_no_stack, 0, false),
     (rt_binary, 3, true),
