@@ -88,7 +88,13 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
+    /// Whether the unit's C holds a record of a record type in place, as [`IN_PLACE`] says.
+    pub in_place: bool,
 }
+
+/// The last line of a unit whose C holds a record of a record type in place. A unit without it was
+/// emitted by a `ply` that holds every record by its word, as a bootstrap's first builder is.
+pub const IN_PLACE: &str = "records held in place";
 
 impl Exports {
     pub fn names(&self) -> Vec<String> {
@@ -186,6 +192,9 @@ impl Exports {
                 out.push('\n');
             }
         }
+        if self.in_place {
+            out.push_str(&format!("{IN_PLACE}\n"));
+        }
         out
     }
 
@@ -261,10 +270,10 @@ impl Exports {
             buckets.push((id, places));
         }
         // A unit none of whose types states a `key` or a `show` has no such table.
-        let n = if at == s.len() {
-            0
-        } else {
+        let n = if s[at..].starts_with("instances ") {
             count(line(s, &mut at)?, "instances")?
+        } else {
+            0
         };
         let mut instances = Vec::with_capacity(n);
         let mut numerics = Vec::new();
@@ -281,6 +290,7 @@ impl Exports {
                 numerics.push((ctor, <[String; 5]>::try_from(rest).ok()?));
             }
         }
+        let in_place = at < s.len() && line(s, &mut at)? == IN_PLACE;
         Some(Exports {
             helpers,
             ctors,
@@ -296,6 +306,7 @@ impl Exports {
             buckets,
             instances,
             numerics,
+            in_place,
         })
     }
 
