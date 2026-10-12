@@ -10,9 +10,11 @@
 #                                in the last table, every cache key a job
 #                                writes is one a job reads, every key that
 #                                names the run is one a later run reads and no
-#                                job needs, and every key over a crate's Ply
-#                                sources names every crate's
-#   ci-shards.sh cache-keys      just that last check
+#                                job needs, every key over a crate's Ply
+#                                sources names every crate's, and the toolchain
+#                                key names what `ply bootstrap` reads
+#   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads
+#   ci-shards.sh toolchain-inputs  just that last check
 #   ci-shards.sh fetch-timings   the table the last run measured, from this
 #                                pull request's branch or else from main, into
 #                                the place the cut reads it from
@@ -191,7 +193,12 @@ SUPERSEDED=(ply-upstream- ply-stores- ply-c-lanes- ply-c-macos-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-native- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+
+# The key the `ply` a run bootstrapped and the stage it left are kept under, and the source that says
+# what a bootstrap reads of a checkout (`toolchain_inputs`).
+TOOLCHAIN_KEY=.github/actions/toolchain-key/action.yml
+TOOLCHAIN_BOOTSTRAP=crates/ply-cli/ply/bootstrap.ply
 
 # The path of the file a `package target test` triple names, for tests in `tests/`.
 test_source_file() {
@@ -1112,14 +1119,18 @@ cmd_cache_keys() {
   ' "${files[@]}"
 }
 
-# What each key above is a key *of*. The stage, its emitted bodies and its objects are built from
+# What each key above is a key *of*. What a lane compiled and what a tree check passed are built from
 # every tree that holds Ply sources, so a key that enumerates those trees by name goes stale the
 # moment a package is added -- and a stale hit serves a build of sources that moved, which no test
 # sees, because the tests then run against the cache rather than the sources. Any `hashFiles` that
-# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them.
+# names a crate's own `ply/` sources -- or any crate tree at all -- must name every one of them. The
+# toolchain key alone names trees one by one, since `ply` is built from some of them and not from the
+# rest: `cmd_toolchain_inputs` holds it to the ones a bootstrap reads.
 cmd_cache_payloads() {
   local pattern tree pat base covered missing=0 files=() file
-  while IFS= read -r file; do files+=("$file"); done < <(ci_files)
+  while IFS= read -r file; do
+    [[ $file == "$root/$TOOLCHAIN_KEY" ]] || files+=("$file")
+  done < <(ci_files)
   while IFS= read -r pattern; do
     case "$pattern" in *"/ply/"*) ;; *) continue ;; esac
     for tree in "$root"/crates/*/ply; do
@@ -1147,6 +1158,97 @@ cmd_cache_payloads() {
     printf 'cache payloads: every key over crate sources names every tree holding Ply sources\n'
   fi
   return $((missing > 0))
+}
+
+# A path with each `..` taken with the segment before it and each `.` dropped, as text.
+lexical() {
+  awk -v p="$1" 'BEGIN {
+    n = split(p, s, "/"); k = 0
+    for (i = 1; i <= n; i++) {
+      if (s[i] == "" || s[i] == ".") continue
+      if (s[i] == "..") { if (k > 0) k--; continue }
+      out[++k] = s[i]
+    }
+    for (i = 1; i <= k; i++) printf "%s%s", (i > 1 ? "/" : ""), out[i]
+    printf "\n"
+  }'
+}
+
+# Each path of the repository a bootstrap reads Ply from, one a line: every path under `crates/` its
+# source names, and every package the manifest of one of those names by path, and theirs.
+toolchain_inputs() {
+  local all prev dir rel
+  all=$(grep -oE '"/?crates/[^"]*"' "$root/$TOOLCHAIN_BOOTSTRAP" | tr -d '"' | sed 's|^/||' | LC_ALL=C sort -u)
+  prev=
+  while [[ $all != "$prev" ]]; do
+    prev=$all
+    all=$(
+      {
+        printf '%s\n' "$prev"
+        while IFS= read -r dir; do
+          [ -f "$root/$dir/ply.pkg" ] || continue
+          sed -n 's/.*source: *Path("\([^"]*\)").*/\1/p' "$root/$dir/ply.pkg" |
+            while IFS= read -r rel; do lexical "$dir/$rel"; done
+        done <<< "$prev"
+      } | grep . | LC_ALL=C sort -u
+    )
+  done
+  printf '%s\n' "$all"
+}
+
+# The toolchain key held to what a bootstrap reads: it hashes each input whole, a tree by `<tree>/**`
+# and a file by its path, and nothing else of the Ply sources. A `ply` kept under a key that missed an
+# input would stand for sources that moved, and one that hashed more would bootstrap for a change the
+# bootstrap never reads. An `embed` that leaves its tree is an input too, and must land in one.
+cmd_toolchain_inputs() {
+  local inputs keyed wanted path file rel target covered bad=0
+  inputs=$(toolchain_inputs)
+  if [[ -z $inputs ]]; then
+    echo "FAIL: $TOOLCHAIN_BOOTSTRAP names no path under crates/, so the toolchain key is held to nothing" >&2
+    return 1
+  fi
+  keyed=$(grep -oh 'hashFiles([^)]*)' "$root/$TOOLCHAIN_KEY" | sed -e 's/.*hashFiles(//' -e 's/)$//' |
+    tr ',' '\n' | tr -d "\"' " | grep . | LC_ALL=C sort -u)
+  wanted=$(while IFS= read -r path; do
+    if [ -d "$root/$path" ]; then printf '%s/**\n' "$path"; else printf '%s\n' "$path"; fi
+  done <<< "$inputs" | LC_ALL=C sort -u)
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    if ! grep -qxF -- "$path" <<< "$keyed"; then
+      echo "FAIL: a bootstrap reads $path, which $TOOLCHAIN_KEY does not hash: a \`ply\` kept under the key would stand for sources that moved" >&2
+      bad=$((bad + 1))
+    fi
+  done <<< "$wanted"
+  while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    if ! grep -qxF -- "$path" <<< "$wanted"; then
+      echo "FAIL: $TOOLCHAIN_KEY hashes $path, which no bootstrap reads: a change there would bootstrap for nothing" >&2
+      bad=$((bad + 1))
+    fi
+  done <<< "$keyed"
+  while IFS=: read -r file rel; do
+    [[ -n $rel ]] || continue
+    target=$(lexical "$(dirname "${file#"$root"/}")/$rel")
+    covered=no
+    while IFS= read -r path; do
+      [[ $target == "$path" || $target == "$path"/* ]] && covered=yes
+    done <<< "$inputs"
+    if [ "$covered" = no ]; then
+      echo "FAIL: ${file#"$root"/} embeds $target, outside every tree the toolchain key hashes" >&2
+      bad=$((bad + 1))
+    fi
+  done < <(while IFS= read -r path; do
+    [ -d "$root/$path" ] || continue
+    # `file:path` per embed that climbs out of its module's directory; a line of a `\\` text is a
+    # program a test writes, not this tree's.
+    { grep -rHE --include='*.ply' 'embed(_dir)?\("[^"]*\.\.[^"]*"' "$root/$path" || true; } |
+      { grep -vE '^[^:]*:[[:space:]]*\\\\' || true; } |
+      sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/'
+  done <<< "$inputs")
+  if [ "$bad" -eq 0 ]; then
+    printf 'toolchain key: hashes the %d paths a bootstrap reads Ply from, and no other\n' "$(grep -c . <<< "$inputs")"
+  fi
+  return $((bad > 0))
 }
 
 # Every input a fresh build's dep-info lists, held to the patterns the Rust key hashes: an input the
@@ -1910,6 +2012,7 @@ cmd_verify() {
   # --- cache keys -----------------------------------------------------------
   cmd_cache_keys || failures=$((failures + 1))
   cmd_cache_payloads || failures=$((failures + 1))
+  cmd_toolchain_inputs || failures=$((failures + 1))
 
   if [[ $failures -gt 0 ]]; then
     echo "$failures problem(s) in the CI tables" >&2
@@ -1936,6 +2039,7 @@ cmd_sweep_matrix() {
 case "${1:-}" in
   verify) cmd_verify ;;
   cache-keys) cmd_cache_keys ;;
+  toolchain-inputs) cmd_toolchain_inputs ;;
   partitions) cmd_partitions ;;
   nextest-shards) cmd_nextest_shards ;;
   shard-configs) cmd_shard_configs "${2:-}" ;;
