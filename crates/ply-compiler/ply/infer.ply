@@ -255,9 +255,9 @@ pub type WitnessRef = {
 /// A definition's witnessed type parameters in its scheme's order, which is the order a call passes
 /// their witnesses in.
 pub type WitnessOrder = { module: Int, name: Bytes, params: List<Bytes> }
-/// A reference to a member of the group being walked, whose witnesses are known once the group is;
-/// `caller` is the member whose body holds it.
-type GroupRef = { module: Int, span: Span, callee: Bytes, caller: Bytes, called: Bool }
+/// A reference inside the group being walked that filled a member's type parameters: `args` are
+/// what it gave them, in the order the member's scheme takes them.
+type GroupFill = { module: Int, span: Span, callee: Bytes, args: List<Type> }
 /// The one type both sides of a `++` share, kept until the substitution has it: `String` and `Bytes` both join.
 type ConcatSite = { module: Int, span: Span, ty: Type }
 /// A written field of `{..b, f: e}` with the type its value inferred to.
@@ -399,9 +399,9 @@ type SpecEnv = {
   params: List<Type>,
   ret: Type,
 }
-/// A member of the recursive group being walked, with the variables its binders took.
+/// A member of the recursive group being walked, with the variables its binders took: `types` are
+/// its own type parameters a call fills, in its scheme's order.
 type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
-type GroupOwner = { owner: Bytes, name: Bytes }
 /// The label and row variables one recursive group is checked with, taken by every member in order.
 type Shared = { labels: List<Int>, rows: List<Int> }
 
@@ -505,7 +505,7 @@ type Checker = {
   label_params: Map<Bytes, Int>,
   label_apps: List<LabelApplication>,
   label_sites: List<LabelSite>,
-  /// The group being walked: recursion there is monomorphic, so a call reuses these.
+  /// The group being walked: its labels and rows are one set, which a call inside it reuses.
   group_defs: List<GroupDef>,
   group_rows: List<Int>,
   auto_ty_params: Bool,
@@ -540,7 +540,7 @@ type Checker = {
   witnessed: Map<Int, Witnessed>,
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
-  group_refs: List<GroupRef>,
+  group_fills: List<GroupFill>,
   /// How each definition checked so far calls the functions it is handed, and what it answers.
   summaries: Map<Bytes, Summary>,
   concats: List<ConcatSite>,
@@ -3056,6 +3056,22 @@ fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
     }
   })
 
+/// A member of the group being walked as a call inside the group reads it: each call fills its own
+/// type parameters, as a call from outside does, and its rows and labels are the group's one set.
+fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {abort.raise} = {
+  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] }).tys;
+  {
+    ty_vars: fold(def.generics.types, [], |vs: List<Int>, ident: Ident|
+      match map_get(sig.ty_params, ident.name) {
+        Some(TyVar(v)) -> if contains(free, v) { push(vs, v) } else { vs },
+        _ -> vs,
+      }),
+    row_vars: [],
+    label_vars: [],
+    ty: sig.fn_ty,
+  }
+}
+
 /// `shared` holds the label and row variables the recursive group is checked with: a member's
 /// binders take them in order, so a call inside the group passes the caller's along.
 fn signature_sharing(
@@ -4818,15 +4834,16 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             key.name,
             inst.args,
           );
-          let noted: Checker = if !group_member(constrained, key.name) { constrained } else {
+          let noted: Checker = if len(inst.args) == 0 || !group_member(constrained, key.name) {
+            constrained
+          } else {
             {
               ..constrained,
-              group_refs: push(constrained.group_refs, {
+              group_fills: push(constrained.group_fills, {
                 module: constrained.module,
                 span: qname.span,
                 callee: key.name,
-                caller: b"",
-                called: false,
+                args: inst.args,
               }),
             }
           };
@@ -5449,44 +5466,6 @@ fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
 fn group_row_tail(checker: Checker, tail: Option<Int>) -> Bool =
   match tail { Some(v) -> contains(checker.group_rows, v), None -> false }
 
-/// The group member whose signature wrote this type parameter, when one did.
-fn group_owner(checker: Checker, ty: Type) -> Option<GroupOwner> =
-  match ty {
-    TyVar(v) ->
-      fold(checker.group_defs, None, |acc: Option<GroupOwner>, g: GroupDef|
-        match acc {
-          Some(_) -> acc,
-          None ->
-            fold(g.types, None, |a: Option<GroupOwner>, p: RigidParam|
-              match a {
-                Some(_) -> a,
-                None -> if p.var == v { Some({ owner: g.name, name: p.name }) } else { None },
-              }),
-        }),
-    _ -> None,
-  }
-
-/// The callee's own type parameter a mismatch landed on, under the name its signature wrote.
-fn group_ty_param(checker: Checker, callee: Bytes, ty: Type) -> Option<Bytes> =
-  match group_owner(checker, ty) {
-    Some(o) -> if o.owner == callee { Some(o.name) } else { None },
-    None -> None,
-  }
-
-/// A printer naming the group's type parameters as their signatures wrote them.
-fn group_printer(checker: Checker) -> Printer =
-  fold(checker.group_defs, printer_new(), |acc: Printer, g: GroupDef|
-    fold(g.types, acc, |printer: Printer, x: RigidParam| printer_naming(printer, x.var, x.name)))
-
-/// What a refusal calls a type: a member's own parameter as that member wrote it, else the type
-/// printed with those names in place.
-fn group_ty_text(checker: Checker, callee: Bytes, ty: Type) -> Bytes / {abort.raise} =
-  match group_owner(checker, ty) {
-    Some(o) -> if o.owner == callee { bytes_concat_all([b"`", o.name, b"`"]) }
-    else { bytes_concat_all([b"`", o.name, b"` of `", simple_name_of(o.owner), b"`"]) },
-    None -> bytes_concat_all([b"`", print_ty(group_printer(checker), ty).text, b"`"]),
-  }
-
 type Met = { checker: Checker, tails: List<Int> }
 
 type Widened = { checker: Checker, ty: Type, tails: List<Int> }
@@ -5688,8 +5667,8 @@ fn close_tail(checker: Checker, tail: Int) -> Checker / {abort.raise} =
     None -> checker,
   }
 
-/// An argument against its parameter, where a call inside the group being walked is monomorphic:
-/// a mismatch on the group's row, or on the callee's own type parameter, is refused as that.
+/// An argument against its parameter, where a call inside the group being walked keeps the
+/// group's row: a mismatch on that row is refused as that.
 fn expect_argument(
   checker: Checker,
   span: Span,
@@ -5724,10 +5703,6 @@ fn group_argument_refused(
         group_row_refused(checker, span, callee, want, got)
       } else { report_unify(checker, error, span, b"argument type") }
     },
-    Mismatch(m) -> match group_ty_param(checker, callee, resolve(checker, m.expected)) {
-      Some(p) -> group_type_refused(checker, span, callee, p, resolve(checker, m.found)),
-      None -> report_unify(checker, error, span, b"argument type"),
-    },
     _ -> report_unify(checker, error, span, b"argument type"),
   }
 
@@ -5758,43 +5733,58 @@ fn group_row_refused(
   )
 }
 
-/// Type parameters are per definition, so a call inside a group cannot instantiate the callee's at
-/// another type: that is polymorphic recursion, which inference cannot decide.
-fn group_type_refused(
-  checker: Checker,
-  span: Span,
-  callee: Bytes,
-  param: Bytes,
-  found: Type,
-) -> Checker / {abort.raise} = {
-  let name = simple_name_of(callee);
-  report_error_at(
-    checker,
-    b"E0308",
-    span,
-    bytes_concat_all([
-      b"a call to `",
-      name,
-      b"` inside its own recursive group cannot give `",
-      param,
-      b"` another type",
-    ]),
-    bytes_concat_all([
-      b"`",
-      param,
-      b"` would have to be ",
-      group_ty_text(checker, callee, found),
-      b" here",
-    ]),
-    [
-      b"the members of a recursive group are checked with one set of type parameters each, so every call inside it uses the callee's own; calling one at another type is polymorphic recursion, which type inference cannot decide",
-      bytes_concat_all([
-        b"break the cycle so `",
-        name,
-        b"` is checked on its own before this call, or monomorphise it: write the type this call needs",
-      ]),
-    ],
-  )
+/// Each call inside the group just walked, `members`, that fills a member's type parameter with a
+/// type built from a member's own: each round of the recursion would call for the member at a
+/// larger type, so no finite set of copies of it serves the group. A parameter passed along as it
+/// is, and a type that names none, do not grow.
+fn refuse_growth(checker: Checker, members: List<GroupDef>) -> Checker / {abort.raise} = {
+  let own = fold(members, [], |vs: List<Int>, g: GroupDef|
+    fold(g.types, vs, |acc: List<Int>, p: RigidParam| push(acc, p.var)));
+  let naming = fold(members, printer_new(), |acc: Printer, g: GroupDef|
+    fold(g.types, acc, |printer: Printer, p: RigidParam| printer_naming(printer, p.var, p.name)));
+  fold(checker.group_fills, { ..checker, group_fills: [] }, |c: Checker, f: GroupFill| {
+    let params = fold(members, [], |acc: List<RigidParam>, g: GroupDef|
+      if g.name == f.callee { g.types } else { acc });
+    fold(range(0, min(len(f.args), len(params))), c, |inner: Checker, i: Int| {
+      let ty = resolve(inner, at(f.args, i));
+      let grows = match ty {
+        TyVar(_) -> false,
+        _ ->
+          fold(free_vars(inner.subst, ty, { tys: [], rows: [] }).tys, false, |b: Bool, v: Int|
+            b || contains(own, v)),
+      };
+      if !grows { inner } else {
+        let name = simple_name_of(f.callee);
+        let param = at(params, i).name;
+        let refused = report_error_at(
+          { ..inner, module: f.module },
+          b"E0308",
+          f.span,
+          bytes_concat_all([
+            b"a call to `",
+            name,
+            b"` inside its own recursive group gives `",
+            param,
+            b"` a type that grows",
+          ]),
+          bytes_concat_all([b"`", param, b"` would be `", print_ty(naming, ty).text, b"` here"]),
+          [
+            bytes_concat_all([
+              b"each time round the recursion `",
+              name,
+              b"` would be called at a larger type, so no finite set of copies of it serves the group: that is polymorphic recursion",
+            ]),
+            bytes_concat_all([
+              b"pass a type parameter along as it is, or a type that names none; or break the cycle so `",
+              name,
+              b"` is checked on its own before this call",
+            ]),
+          ],
+        );
+        { ..refused, module: inner.module }
+      }
+    })
+  })
 }
 
 fn infer_app_general(
@@ -8837,23 +8827,32 @@ fn check_component(
 ) -> Checker / {abort.raise} = {
   let qualified = map(comp, |i: Int| qualify(parsed.name, at(fns, i).name.name));
   let params: { checker: Checker, shared: Shared } = component_params(checker, fns, comp);
-  let sigs: { checker: Checker, sigs: List<Signature> } = fold(
+  // The constraints a member's signature writes stand for the walk, so a call inside the group
+  // answers for them as a call from outside will.
+  let sigs: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> } = fold(
     range(0, len(comp)),
-    { checker: params.checker, sigs: [] },
-    |acc: { checker: Checker, sigs: List<Signature> }, slot: Int| {
+    { checker: params.checker, sigs: [], schemes: [] },
+    |acc: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> }, slot: Int| {
       let def = at(fns, at(comp, slot));
       let s: WithSig = signature_sharing(
         { ..acc.checker, derived: derived_of(parsed, def) },
         def,
         params.shared,
       );
+      let scheme = member_scheme(s.checker, def, s.sig);
       {
         checker: {
           ..s.checker,
           derived: None,
-          env: env_bind_global(s.checker.env, at(qualified, slot), monomorphic(s.sig.fn_ty)),
+          env: env_bind_global(s.checker.env, at(qualified, slot), scheme),
+          constraints: map_insert(
+            s.checker.constraints,
+            at(qualified, slot),
+            published_constraints({ ..s.checker, ty_params: s.sig.ty_params }, def, scheme),
+          ),
         },
         sigs: push(acc.sigs, s.sig),
+        schemes: push(acc.schemes, scheme),
       }
     },
   );
@@ -8865,9 +8864,11 @@ fn check_component(
       let sig = at(sigs.sigs, slot);
       let labels = fold(def.generics.labels, [], |vs: List<Int>, ident: Ident|
         match map_get(sig.label_params, ident.name) { Some(v) -> push(vs, v), None -> vs });
+      let filled = at(sigs.schemes, slot).ty_vars;
       let types = fold(def.generics.types, [], |ps: List<RigidParam>, ident: Ident|
         match map_get(sig.ty_params, ident.name) {
-          Some(TyVar(v)) -> push(ps, { name: ident.name, var: v }),
+          Some(TyVar(v)) -> if contains(filled, v) { push(ps, { name: ident.name, var: v }) }
+          else { ps },
           _ -> ps,
         });
       push(acc, { name: at(qualified, slot), labels: labels, types: types })
@@ -8965,18 +8966,8 @@ fn check_component(
           }
         },
       };
-      let refs = stepped.checker.group_refs;
-      let tagged: Checker = {
-        ..stepped.checker,
-        group_refs: fold(
-          range(len(acc.checker.group_refs), len(refs)),
-          refs,
-          |rs: List<GroupRef>, i: Int|
-            list_set(rs, i, { ..at(rs, i), caller: at(qualified, slot) }),
-        ),
-      };
       {
-        checker: record_spec_env(tagged, def, at(qualified, slot), sig),
+        checker: record_spec_env(stepped.checker, def, at(qualified, slot), sig),
         rows: push(acc.rows, stepped.row),
         counts: push(acc.counts, stepped.count),
         filed: push(acc.filed, match taken { Some(_) -> handed, None -> None }),
@@ -9014,7 +9005,8 @@ fn check_component(
       settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
     ),
   );
-  let required: Checker = fold(range(0, len(comp)), settled, |c: Checker, slot: Int|
+  let grown: Checker = refuse_growth(settled, grouped.group_defs);
+  let required: Checker = fold(range(0, len(comp)), grown, |c: Checker, slot: Int|
     require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
   // Only the run's own definitions are counted off their bodies, so only they are held to `bounded`.
   let kept: Checker = fold(range(0, len(comp)), required, |c: Checker, slot: Int|
@@ -9107,69 +9099,8 @@ fn check_component(
       },
     )
   });
-  group_witnesses(published)
+  published
 }
-
-/// A call to a member of the group just walked passes the witnesses the member now has an order
-/// for, which only its own body holds: a recursive call passes its caller's own.
-fn group_witnesses(checker: Checker) -> Checker / {abort.raise} =
-  fold(checker.group_refs, { ..checker, group_refs: [] }, |c: Checker, g: GroupRef| {
-    let callee = simple_name_of(g.callee);
-    let order = fold(c.witness_orders, None, |acc: Option<List<Bytes>>, o: WitnessOrder|
-      if o.module == g.module && o.name == callee { Some(o.params) } else { acc });
-    match order {
-      None -> c,
-      Some(ws) -> if !g.called {
-        report_error_at(
-          { ..c, module: g.module },
-          b"E0310",
-          g.span,
-          bytes_concat_all([b"`", callee, b"` must be called directly"]),
-          b"used as a value",
-          [
-            bytes_concat_all([
-              b"`",
-              callee,
-              b"` takes the types its `numeric` and `integer` constraints are about as hidden arguments each call fills",
-            ]),
-            b"wrap it in a lambda that calls it",
-          ],
-        )
-      } else if g.caller != g.callee {
-        report_error_at(
-          { ..c, module: g.module },
-          b"E0310",
-          g.span,
-          bytes_concat_all([
-            b"a call to `",
-            callee,
-            b"` inside its own recursive group cannot pass the type `",
-            at(ws, 0),
-            b"` is",
-          ]),
-          bytes_concat_all([b"called from `", simple_name_of(g.caller), b"`"]),
-          [
-            bytes_concat_all([
-              b"only `",
-              callee,
-              b"`'s own body holds the type its `numeric` or `integer` constraint is about; call it from outside the group",
-            ]),
-          ],
-        )
-      } else {
-        {
-          ..c,
-          witness_refs: push(c.witness_refs, {
-            module: g.module,
-            span: g.span,
-            witnesses: map(ws, |w: Bytes| ParamWitness(w)),
-            params: range(0, len(ws)),
-            owner: g.caller,
-          }),
-        }
-      },
-    }
-  })
 
 /// The signature's label parameters generalize among the type variables; they belong in their own
 /// list, in the order the generic list wrote them, and a phantom one is still a parameter.
@@ -12017,14 +11948,7 @@ fn called(checker: Checker, span: Span) -> Checker / {abort.raise} = {
         None -> Stop(s),
       },
   );
-  let g = len(checker.group_refs);
-  let refs = match list_at(checker.group_refs, g - 1) {
-    Some(r) -> if r.module == checker.module && r.span == span {
-      list_set(checker.group_refs, g - 1, { ..r, called: true })
-    } else { checker.group_refs },
-    None -> checker.group_refs,
-  };
-  { ..checker, constrained_uses: marked.uses, group_refs: refs }
+  { ..checker, constrained_uses: marked.uses }
 }
 
 /// The type parameters a definition's `numeric` and `integer` constraints make witnesses of.
@@ -14137,7 +14061,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     witnessed: map_new(),
     witness_refs: [],
     witness_orders: [],
-    group_refs: [],
+    group_fills: [],
     summaries: map_new(),
     concats: [],
     updates: [],
@@ -15384,43 +15308,63 @@ test "the members of a recursive group bind the same row parameters" {
   assert(contains(check_codes(mixed), b"E0307"))
 }
 
-test "a call inside a recursive group cannot instantiate a type parameter" {
-  // A concrete argument where the callee's own parameter stands.
+test "a call inside a recursive group fills its callee's type parameters, and may not grow one" {
+  // A member called at a type that names no parameter.
   let concrete = bytes_concat_all([
     b"fn ping<a>(n: Int, x: a) -> Int = if n <= 0 { 0 } else { pong(n - 1) }\n",
     b"fn pong(n: Int) -> Int = ping(n - 1, 0)",
   ]);
-  assert_eq(check_codes(concrete), [b"E0308"]);
-  let diags = check_diags(concrete);
-  assert_eq(map(diags, |diag: Diag| diag.message), [
-    b"a call to `ping` inside its own recursive group cannot give `a` another type",
+  assert_eq(check_codes(concrete), []);
+  // Members that pass their own parameter to each other, each writing its parameters its own way.
+  let crossed = bytes_concat_all([
+    b"fn even<a>(xs: List<a>, n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1, 0, xs) }\n",
+    b"fn odd<k, b>(n: Int, key: k, xs: List<b>) -> Bool = if n <= 0 { false } else { even(xs, n - 1) }",
   ]);
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"`a` would have to be `Int` here",
-  ]);
-  assert_eq(
-    at(at(diags, 0).notes_text, 0),
-    b"the members of a recursive group are checked with one set of type parameters each, so every call inside it uses the callee's own; calling one at another type is polymorphic recursion, which type inference cannot decide",
-  );
-  // Two members each generic over their own parameter: neither call can pass the other's.
+  assert_eq(check_codes(crossed), []);
+  // Each time round, `ping` would be called at a list of what it was called at.
   let both = bytes_concat_all([
     b"fn ping<a>(n: Int, x: a) -> Int = if n <= 0 { 0 } else { pong(n - 1, [x]) }\n",
     b"fn pong<b>(n: Int, xs: List<b>) -> Int = ping(n - 1, xs)",
   ]);
-  assert_eq(check_codes(both), [b"E0308", b"E0308"]);
-  let messages = map(check_diags(both), |diag: Diag| diag.message);
-  assert(
-    contains(
-      messages,
-      b"a call to `pong` inside its own recursive group cannot give `b` another type",
-    ),
+  let diags = check_diags(both);
+  assert_eq(map(diags, |diag: Diag| diag.code), [b"E0308"]);
+  assert_eq(map(diags, |diag: Diag| diag.message), [
+    b"a call to `ping` inside its own recursive group gives `a` a type that grows",
+  ]);
+  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [b"`a` would be `List<b>` here"]);
+  assert_eq(
+    at(at(diags, 0).notes_text, 0),
+    b"each time round the recursion `ping` would be called at a larger type, so no finite set of copies of it serves the group: that is polymorphic recursion",
   );
-  assert(
-    contains(
-      messages,
-      b"a call to `ping` inside its own recursive group cannot give `a` another type",
+  // The same of a definition that calls itself.
+  assert_eq(
+    map(
+      check_diags(b"fn grow<a>(x: a, n: Int) -> Int = if n <= 0 { 0 } else { grow([x], n - 1) }"),
+      |diag: Diag| diag.message,
     ),
+    [b"a call to `grow` inside its own recursive group gives `a` a type that grows"],
   )
+}
+
+test "a call inside a recursive group answers for its callee's constraints as any call does" {
+  let cycle = |up: Bytes|
+    bytes_concat_all([
+      b"fn up<a>(x: a, n: Int) -> a",
+      up,
+      b" = if n <= 0 { x } else { down(n - 1, x) }\n",
+      b"fn down<b>(n: Int, x: b) -> b where numeric(b) = if n <= 0 { x } else { up(x + x, n - 1) }\n",
+      b"fn go() -> U8 = up(1u8, 3)",
+    ]);
+  let checker = checked_cx(cycle(b" where numeric(a)"));
+  let passed = map_values(refs_in(checker.witness_refs, 0));
+  assert_eq(len(passed), 3);
+  let passes = |w: NumericWitness|
+    fold(passed, false, |b: Bool, ws: List<NumericWitness>| b || ws == [w]);
+  assert(passes(ParamWitness(b"a")));
+  assert(passes(ParamWitness(b"b")));
+  assert(passes(ConcreteWitness(b"U8")));
+  // A member that does not hold the constraint cannot pass its parameter to one that needs it.
+  assert_eq(check_codes(cycle(b"")), [b"E0201"])
 }
 
 test "a unit pattern covers its type" {
@@ -15447,6 +15391,7 @@ test "a numeric constraint is refused where no call could pass its type" {
     ),
     [b"E0310"],
   );
+  // A call from another member of its group is a call like any other: here nothing says what `b` is.
   assert_eq(
     check_codes(
       bytes_concat_all([
@@ -15455,7 +15400,7 @@ test "a numeric constraint is refused where no call could pass its type" {
         b"fn pong(n: Int) -> Int = { let _ = ping(n); n }",
       ]),
     ),
-    [b"E0310"],
+    [b"E0210"],
   )
 }
 

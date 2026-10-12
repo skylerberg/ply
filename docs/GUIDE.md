@@ -955,10 +955,15 @@ crosses the cycle. Members binding different numbers of them are `E0307`, as
 with labels, and a call inside the group keeps the row the group was called
 with: an argument may perform less than it, and one that performs anything the
 group's row does not hold is `E0308`. Type parameters are *not*
-shared — each definition keeps its own — so a call inside a group that would
-need the callee's type parameter at another type is polymorphic recursion, which
-Ply does not infer. That is `E0308` as well: break the cycle so the callee is
-checked on its own before the call, or monomorphise it.
+shared: each definition keeps its own, and a call inside a group fills its
+callee's as a call from anywhere does, so `even<a>` and `odd<a>` call each
+other, whatever order each writes its parameters in and however many it binds,
+and a constraint on one (`where numeric(a)`) is the caller's to meet. What such
+a call may not do is fill one with a type built from a member's own parameter,
+as `f<a>` calling itself at `List<a>` does: each time round would need the
+callee at a larger type, so no finite set of copies of it serves the group. That
+is polymorphic recursion, `E0308` as well. A parameter passed along as it is,
+and a type that names none (`Int`), do not grow.
 
 A `type` binds all three kinds where a `fn` does, on an alias, a sum and a `new`
 record, and a use fills them in the same places:
@@ -2636,12 +2641,12 @@ A `json` or `bin` codec whose type reaches itself, directly or through the
 other types the module derives, takes how many levels deeper it may nest and
 hands its cycle one less, so the recursion is seen to end (§5.10). It is two
 definitions: `tree_json()` starts `tree_json_at(json::max_depth())`. A `bin`
-codec whose cycle has no type that takes a parameter is instead a definition for
-each of its functions (`tree_bin_put`, `tree_bin_take` and `tree_bin_shape`),
-which call their cycle's by name, so no level makes a codec; `tree_bin()` hands
-each to its definition at `bin::max_depth()`. Past the bound, a decode is an
-error and an encode panics. `json`'s bound is 128 levels, as deep as `parse`
-reads, and `bin`'s is 10,000, as deep as calls nest (§5.7).
+codec is instead a definition for each of its functions (`tree_bin_put`,
+`tree_bin_take` and `tree_bin_shape`), which call their cycle's by name, so no
+level makes a codec; `tree_bin()` hands each to its definition at
+`bin::max_depth()`. Past the bound, a decode is an error and an encode panics.
+`json`'s bound is 128 levels, as deep as `parse` reads, and `bin`'s is 10,000, as
+deep as calls nest (§5.7).
 
 `E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
 and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
@@ -3400,9 +3405,9 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0305` | `handle` leaves an operation, or a mode atom, under a handled mode atom unanswered |
 | `E0306` | label instantiation: a call leaves a label unfilled or writes the wrong number of them, or a label-generic definition is used as a value |
 | `E0307` | mutually recursive definitions binding different label or row parameters |
-| `E0308` | polymorphic recursion: a call inside a recursive group asks for another row or type parameter than the group was checked with |
+| `E0308` | polymorphic recursion: a call inside a recursive group asks for another row than the group was checked with, or fills a type parameter with a type that grows each time round |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
-| `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, a parameter its signature never mentions, or a call from another member of its recursive group |
+| `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, or a parameter its signature never mentions |
 | `E0311` | `try` whose body's row names no `raise` operation to answer |
 | `E0312` | `try` whose body's row names several `raise` operations, and it names none |
 | `E0313` | `try` naming an operation that is not a `raise` |
