@@ -44,7 +44,9 @@ typedef struct {
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
-static inline int ply_is_imm(Word w) { return (w & 1) != 0; }
+/* Held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`, its code point
+   above them). An object's address is a multiple of eight. */
+static inline int ply_is_imm(Word w) { return (w & 7) != 0; }
 /* Four bytes read least-significant-first, whatever this machine's order is. */
 static inline uint32_t ply_le32(uint32_t v) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__

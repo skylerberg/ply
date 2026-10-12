@@ -111,7 +111,7 @@ pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
 /// runtime's own operators: `Decimal`, and whatever `==` compares structurally.
-type Operand = | OInt | OBool | OWidth(Width) | OFloat | OWord
+type Operand = | OInt | OBool | OWidth(Width) | OFloat | OChar | OWord
 
 /// `None` where the checker settled no type, which it does for every operator of a checked program.
 fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
@@ -121,6 +121,7 @@ fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
     else if name == b"Int" { Some(OInt) }
     else if name == b"Bool" { Some(OBool) }
     else if name == b"Float" { Some(OFloat) }
+    else if name == b"Char" { Some(OChar) }
     else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
   }
 
@@ -4591,7 +4592,15 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           },
         }),
       LDec(_) -> Some(from_table(emitter, l)),
-      LChar(_) -> Some(from_table(emitter, l)),
+      LChar(v) ->
+        Some({
+          emitter: emitter,
+          value: {
+            kind: KBoxed,
+            expr: bytes_concat_all([b"((Word)", int_lit(v * 8 + 2), b")"]),
+            ty: TyOpen,
+          },
+        }),
       _ -> Some(refused(emitter, b"a literal this port does not pool")),
     },
     NVar(v) -> match v.slot {
@@ -7431,6 +7440,18 @@ fn binary_rest(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Operand) ->
       )
     } else { Some(unsettled_operator(emitter, op)) },
     OFloat -> float_binary(emitter, op, l, r),
+    // A `Char`'s word is its code point above a tag, so its words compare as its code points do.
+    OChar -> match compare_op(op) {
+      Some(c) ->
+        Some(
+          bind(
+            emitter,
+            KBool,
+            bytes_concat_all([b"(", as_word(l), b") ", c, b" (", as_word(r), b")"]),
+          ),
+        ),
+      None -> Some(unsettled_operator(emitter, op)),
+    },
     OWord -> word_binary(emitter, op, l, r),
   }
 
@@ -9112,6 +9133,20 @@ test "a record holds every `Float` field as its bits, wherever the field stands"
   assert(bytes_index_of(at(out, 4).text, b")[69]") != None);
   // A field of a variable's type is laid out as what it holds when the record is made.
   assert_eq(has(b"rt_record_p"), [false, false, false, false, false, true])
+}
+
+test "a `Char` is its own word, compared as C compares the words" {
+  let src = bytes_concat_all([
+    b"fn lower(c: Char) -> Bool = c >= 'a' && c <= 'z'\n",
+    b"fn same(a: Char, b: Char) -> Bool = a == b\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None]);
+  assert_eq(has(b"rt_binary_p"), [false, false]);
+  assert_eq(has(b"rt_equal_p"), [false, false]);
+  // `'a'` is code point 97: `97 << 3 | 2`.
+  assert_eq(has(b"((Word)INT64_C(778))"), [true, false])
 }
 
 test "a record a pattern binds is read at the offsets its checked type gives" {

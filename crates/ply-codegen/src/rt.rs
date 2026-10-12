@@ -2444,7 +2444,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(ctx.heap.list_from(&items))
         }
         (Builtin::NumericBinary, [op, w, x, y])
-            if heap::is_imm(*op) && heap::is_imm(*w) && heap::is_imm(*x) && heap::is_imm(*y) =>
+            if heap::is_int(*op) && heap::is_int(*w) && heap::is_int(*x) && heap::is_int(*y) =>
         {
             narrow_binary(
                 heap::imm_value(*op),
@@ -2453,7 +2453,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 heap::imm_value(*y),
             )
         }
-        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_imm(*x) && heap::is_imm(*y) => {
+        (Builtin::Min | Builtin::Max, [x, y]) if heap::is_int(*x) && heap::is_int(*y) => {
             let (a, b) = (heap::imm_value(*x), heap::imm_value(*y));
             Some(heap::imm(if (a <= b) == (which == Builtin::Min) {
                 a
