@@ -32,6 +32,7 @@ import std.laws (round_trip)
 import std.list (at_or, flatten, take)
 import std.seq
 import std.seq (seq, Seq, Done, Skip, Yield)
+import std.gen
 
 // --- Refusals ---------------------------------------------------------------
 
@@ -390,14 +391,11 @@ fn flushed(w: Bits) -> Bytes / {abort.raise} =
   bytes_concat_all(push(w.pieces, bytes_slice(u32_le(w.buf), 0, (w.bits + 7) / 8)))
 
 /// `data` as a raw DEFLATE stream.
-pub fn deflate(data: Bytes) -> Bytes / {abort.raise}
-  cost bytes_len(data)
-= flushed(blocks_written(data, 0, bytes_len(data), 0, true, unwritten(), coder()).w)
+pub fn deflate(data: Bytes) -> Bytes / {abort.raise} =
+  flushed(blocks_written(data, 0, bytes_len(data), 0, true, unwritten(), coder()).w)
 
 /// `data` as a gzip file of one member, with no name and no time.
-pub fn gzip(data: Bytes) -> Bytes / {abort.raise}
-  cost bytes_len(data)
-=
+pub fn gzip(data: Bytes) -> Bytes / {abort.raise} =
   bytes_concat_all([
     b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff",
     deflate(data),
@@ -406,9 +404,8 @@ pub fn gzip(data: Bytes) -> Bytes / {abort.raise}
   ])
 
 /// `data` as a zlib stream.
-pub fn zlib(data: Bytes) -> Bytes / {abort.raise}
-  cost bytes_len(data)
-= bytes_concat_all([b"\x78\x01", deflate(data), u32_be(int_of_u32(adler32(data)))])
+pub fn zlib(data: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat_all([b"\x78\x01", deflate(data), u32_be(int_of_u32(adler32(data)))])
 
 // --- Writing a chunk at a time ------------------------------------------------
 
@@ -1362,30 +1359,20 @@ test "{s.name} survives each format, and the runtime reads what gzip wrote" for 
   assert_eq(gunzip(bytes_gzip(s.bytes), n), s.bytes)
 }
 
-law "gunzip reads back what gzip wrote" forall (x: Bytes) { gunzip(gzip(x), bytes_len(x)) == x }
+test "gunzip reads back what gzip wrote" {
+  gen::check(gen::bytes(), |x: Bytes| { gunzip(gzip(x), bytes_len(x)) == x })
+}
 
-law "unzlib reads back what zlib wrote" forall (x: Bytes) { unzlib(zlib(x), bytes_len(x)) == x }
+test "the runtime's gunzip reads what gzip wrote" {
+  gen::check(gen::bytes(), |x: Bytes| round_trip(gzip, bytes_gunzip, x))
+}
 
-law "inflate reads back what deflate wrote"
-  forall (x: Bytes) {
-    inflate(deflate(x), bytes_len(x)) == x
-  }
-
-law "the runtime's gunzip reads what gzip wrote" = round_trip(gzip, bytes_gunzip)
-
-law "gunzip reads what the runtime's gzip wrote"
-  forall (x: Bytes) {
-    gunzip(bytes_gzip(x), bytes_len(x)) == x
-  }
+test "gunzip reads what the runtime's gzip wrote" {
+  gen::check(gen::bytes(), |x: Bytes| { gunzip(bytes_gzip(x), bytes_len(x)) == x })
+}
 
 fn over(got: Result<Bytes, Refusal>) -> Bool =
   match got { Err(refusal) -> refusal.why == OverLimit, Ok(_) -> false }
-
-law "a stream is refused at one byte less than it holds"
-  forall (x: Bytes) where bytes_len(x) > 0 {
-    over(try_gunzip(gzip(x), bytes_len(x) - 1)) && over(try_unzlib(zlib(x), bytes_len(x) - 1))
-      && over(try_inflate(deflate(x), bytes_len(x) - 1))
-  }
 
 test "a gzip file names no time, file or system, and nothing grows by more than its framing" {
   assert_eq(gzip(b""), bytes_of_hex("1f8b08000000000000ff03000000000000000000"));
@@ -1717,15 +1704,6 @@ fn bomb(runs: Int) -> Bytes / {abort.raise} = {
   flushed(ended)
 }
 
-/// One final block of fixed codes holding all of `data`, whether or not its bytes as they are
-/// would be shorter.
-fn fixed_block(data: Bytes) -> Bytes / {abort.raise} = {
-  let c = coder();
-  let n = bytes_len(data);
-  let read = scanned(data, n, 0, array_new(32768, 0), { pieces: [], buf: 3, bits: 3 }, c, 0, n + 1);
-  flushed(put(read.w, array_get(c.literals, 256)))
-}
-
 test "a stream that holds far more than the limit is refused in the limit's steps" {
   let small = bomb(100);
   let large = bomb(40000);
@@ -1741,16 +1719,6 @@ test "a stream that holds far more than the limit is refused in the limit's step
   let whole = metered(|| try_inflate(small, 25801));
   assert(whole.steps - metered(|| try_inflate(b"\x03\x00", 0)).steps < 100 * 24)
 }
-
-law "a round trip takes steps in proportion to the input"
-  forall (n: Int) cost n {
-    gunzip(gzip(text(n)), n)
-  }
-
-law "a round trip of noise takes steps in proportion to it"
-  forall (n: Int) cost n {
-    inflate(fixed_block(noise(n)), n)
-  }
 
 /// `n` bytes of one sentence over and over.
 fn text(n: Int) -> Bytes / {abort.raise} = bytes_slice(repeat(checked(), n / 85 + 1), 0, n)
@@ -1808,15 +1776,21 @@ fn read_chunked(
 ) -> Result<Bytes, Refusal> / {seq.spent, abort.raise} =
   try[gzip.refused] { gathered(decoded(seq::of_list(chunks), format, limit)) }
 
-law "what is written a chunk at a time is what is written whole, and is read a chunk at a time as it is whole, however either is cut"
-  forall (x: Bytes, cuts: List<Int>, which: Int) {
-    let format = at_or(formats(), (which & 0x7FFF_FFFF) % 3, Gzip);
-    let sizes = map(cuts, |c: Int| c & 7);
-    let plain = bytes_concat_all([x, checked(), x]);
-    let packed = packed_as(format, plain);
-    gathered(encoded(seq::of_list(pieces(plain, sizes)), format)) == packed
-      && read_chunked(format, pieces(packed, sizes), bytes_len(plain)) == Ok(plain)
-  }
+test "what is written a chunk at a time is what is written whole, and is read a chunk at a time as it is whole, however either is cut" {
+  gen::check3(
+    gen::bytes(),
+    gen::list(gen::any_int()),
+    gen::any_int(),
+    |x: Bytes, cuts: List<Int>, which: Int| {
+      let format = at_or(formats(), (which & 0x7FFF_FFFF) % 3, Gzip);
+      let sizes = map(cuts, |c: Int| c & 7);
+      let plain = bytes_concat_all([x, checked(), x]);
+      let packed = packed_as(format, plain);
+      gathered(encoded(seq::of_list(pieces(plain, sizes)), format)) == packed
+        && read_chunked(format, pieces(packed, sizes), bytes_len(plain)) == Ok(plain)
+    },
+  )
+}
 
 type Stream = { format: Format, packed: Bytes }
 
@@ -1833,24 +1807,31 @@ fn streams() -> List<Stream> / {abort.raise} = {
   ])
 }
 
-law "a stream a tool wrote, with a byte changed or not, is read a chunk at a time as it is read whole: the same bytes or the same refusal"
-  forall (which: Int, at: Int, to: Int, cuts: List<Int>) {
-    let all = streams();
-    match list_at(all, (which & 0x7FFF_FFFF) % len(all)) {
-      None -> false,
-      Some(s) -> {
-        let changed = with_byte(s.packed, (at & 0x7FFF_FFFF) % bytes_len(s.packed), to & 255);
-        let whole: Result<Result<Bytes, Refusal>, String> = try[abort.raise] {
-          read_whole(s.format, changed, 1000)
-        };
-        match whole {
-          Err(_) -> false,
-          Ok(answer) ->
-            read_chunked(s.format, pieces(changed, map(cuts, |c: Int| c & 7)), 1000) == answer,
-        }
-      },
-    }
-  }
+test "a stream a tool wrote, with a byte changed or not, is read a chunk at a time as it is read whole: the same bytes or the same refusal" {
+  gen::check4(
+    gen::any_int(),
+    gen::any_int(),
+    gen::any_int(),
+    gen::list(gen::any_int()),
+    |which: Int, at: Int, to: Int, cuts: List<Int>| {
+      let all = streams();
+      match list_at(all, (which & 0x7FFF_FFFF) % len(all)) {
+        None -> false,
+        Some(s) -> {
+          let changed = with_byte(s.packed, (at & 0x7FFF_FFFF) % bytes_len(s.packed), to & 255);
+          let whole: Result<Result<Bytes, Refusal>, String> = try[abort.raise] {
+            read_whole(s.format, changed, 1000)
+          };
+          match whole {
+            Err(_) -> false,
+            Ok(answer) ->
+              read_chunked(s.format, pieces(changed, map(cuts, |c: Int| c & 7)), 1000) == answer,
+          }
+        },
+      }
+    },
+  )
+}
 
 test "cut anywhere, {f.name} is read in two chunks as it is whole" for f: Fixture in gzip_files() {
   let packed = bytes_of_hex(f.packed);

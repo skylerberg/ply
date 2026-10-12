@@ -1,6 +1,7 @@
 //! Stacks the runtime owns, and the [`switch`] between them: a suspended computation in the
 //! C backend is a C stack, and nothing emitted knows which stack it is on.
 
+use crate::vm;
 use std::ptr;
 
 /// Reserved per stack, mapped on first touch; a guard page below turns an overrun into a fault.
@@ -21,11 +22,11 @@ impl Stack {
     /// A stack of its own, or nothing when the platform would map no more.
     pub fn reserve() -> Option<Stack> {
         let size = STACK_SIZE + GUARD;
-        let base = unsafe { mmap_anonymous(size) };
+        let base = unsafe { vm::map(size) };
         if base.is_null() {
             return None;
         }
-        unsafe { mprotect_none(base, GUARD) };
+        unsafe { vm::forbid(base, GUARD) };
         Some(Stack { base, size })
     }
 
@@ -66,7 +67,7 @@ impl Stack {
 
 impl Drop for Stack {
     fn drop(&mut self) {
-        unsafe { munmap(self.base, self.size) };
+        unsafe { vm::unmap(self.base, self.size) };
     }
 }
 
@@ -200,37 +201,4 @@ pub unsafe fn switch(from: &mut usize, to: usize) {
 
 unsafe fn lay_out(top: usize, entry: usize, arg: usize) -> usize {
     unsafe { arch::lay_out(top, entry, arg) }
-}
-
-unsafe extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-}
-
-const PROT_NONE: i32 = 0;
-const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-const MAP_PRIVATE: i32 = 0x02;
-#[cfg(target_os = "macos")]
-const MAP_ANONYMOUS: i32 = 0x1000;
-#[cfg(target_os = "linux")]
-const MAP_ANONYMOUS: i32 = 0x20;
-
-unsafe fn mmap_anonymous(len: usize) -> *mut u8 {
-    let p = unsafe {
-        mmap(
-            ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if p as isize == -1 { ptr::null_mut() } else { p }
-}
-
-unsafe fn mprotect_none(addr: *mut u8, len: usize) {
-    unsafe { mprotect(addr, len, PROT_NONE) };
 }

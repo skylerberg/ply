@@ -351,7 +351,6 @@ impl Reader<'_> {
             module: ModuleName::from_dotted(l.field("module")?.utf8()?),
             key: Symbol::new(l.field("key")?.utf8()?),
             index: self.placed(l, at)?,
-            host: l.field("host")?.bool()?,
             footprint: footprint(l.field("footprint")?)?,
             span: self.span(l.field("at")?)?,
         })
