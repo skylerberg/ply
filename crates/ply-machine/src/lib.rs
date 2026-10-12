@@ -131,12 +131,6 @@ pub fn register(registry: &mut HostRegistry) {
     }
 }
 
-pub fn register_with(registry: &mut HostRegistry, options: drive::RunOptions) {
-    for (op, handler) in registrations_with(options) {
-        registry.register(op, handler);
-    }
-}
-
 fn ok(value: Value) -> Value {
     Value::ctor("Ok", vec![value])
 }

@@ -111,7 +111,7 @@ pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyArray
 /// The type the checker settled an operator's operands at, which alone decides what the operator
 /// means; how an operand happens to be held only decides how it is read. `OWord` is read by the
 /// runtime's own operators: `Decimal`, and whatever `==` compares structurally.
-type Operand = | OInt | OBool | OWidth(Width) | OFloat | OWord
+type Operand = | OInt | OBool | OWidth(Width) | OFloat | OChar | OWord
 
 /// `None` where the checker settled no type, which it does for every operator of a checked program.
 fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
@@ -121,6 +121,7 @@ fn operand_at(emitter: Emitter, span: Span) -> Option<Operand> =
     else if name == b"Int" { Some(OInt) }
     else if name == b"Bool" { Some(OBool) }
     else if name == b"Float" { Some(OFloat) }
+    else if name == b"Char" { Some(OChar) }
     else { match width_named(name) { Some(w) -> Some(OWidth(w)), None -> Some(OWord) } },
   }
 
@@ -930,6 +931,96 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
   }
 
 /// A flat record (all widths or `Bool`) built from locals is held back; others are built now, from a reuse token if one fits.
+/// Whether a record holds a value of `kind` as a `Float`'s bits rather than as a word.
+fn raw_slot(kind: Kind) -> Bool = kind == KFloat
+
+/// The word a record holds `value` in where `raw_slot` says it holds its bits.
+fn raw_word(value: CValue) -> Bytes = bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"])
+
+/// A field as a shape spells it: a `Float` the record holds as its bits is named apart from one it
+/// holds as a word, below every byte a name holds so a shape sorts as its names do.
+fn spelled_field(name: Bytes, kind: Kind) -> Bytes =
+  if raw_slot(kind) { bytes_concat(name, b"!f") } else { name }
+
+/// A record's flags for words of `kinds`: flat when it counts none, mixed when it holds a `Float`'s
+/// bits beside a word it counts, which the bitmap after its words then names.
+fn record_flags(kinds: List<Kind>) -> Int = {
+  let uncounted = |k: Kind| match k { KNum(_) -> true, KBool -> true, KFloat -> true, _ -> false };
+  if len(kinds) > 0 && fold(kinds, true, |acc: Bool, k: Kind| acc && uncounted(k)) { 1 }
+  else if fold(kinds, false, |acc: Bool, k: Kind| acc || raw_slot(k)) { 2 }
+  else { 0 }
+}
+
+/// The bitmap after a mixed record's words: a bit set for each word it counts, 64 to a word.
+fn counted_words(kinds: List<Kind>) -> List<Bytes> =
+  map(range(0, (len(kinds) + 63) / 64), |t: Int| {
+    let bits = fold(range(t * 64, min_int(len(kinds), t * 64 + 64)), 0, |acc: Int, i: Int|
+      match list_at(kinds, i) {
+        Some(k) -> if raw_slot(k) { acc } else { acc | 1 << i % 64 },
+        None -> acc,
+      });
+    int_lit(bits)
+  })
+
+fn min_int(a: Int, b: Int) -> Int = if a < b { a } else { b }
+
+/// The kinds a record written at `at` holds `names`, its fields, as: read off the type the checker
+/// filed there. A record whose type names a field of a variable's type has none, and is laid out by
+/// what its fields hold when it is made.
+fn laid_out(emitter: Emitter, at: Span, names: List<Bytes>) -> Option<List<Kind>> =
+  match map_get(emitter.typed, span_key(at)) {
+    None -> None,
+    Some(t) -> match kind_of(t.ty).ty {
+      TyRec(fs) ->
+        Some(
+          map(names, |nm: Bytes|
+            fold(fs, KBoxed, |k: Kind, f: FieldTy| if f.name == nm { f.kind } else { k })),
+        ),
+      _ -> None,
+    },
+  }
+
+fn kind_at(kinds: List<Kind>, at: Int) -> Kind =
+  match list_at(kinds, at) { Some(k) -> k, None -> KBoxed }
+
+/// A record of `names` holding `words`, which it takes, laid out by the runtime as a record of the
+/// values they are: the layout its type has wherever it is made.
+fn record_by_value(emitter: Emitter, names: List<Bytes>, words: List<Bytes>) -> WithValue = {
+  let sh = shape_of(emitter, names);
+  let arr = fresh(sh.emitter);
+  let e = line(
+    arr.emitter,
+    bytes_concat_all([
+      b"Word ",
+      arr.name,
+      b"[] = {",
+      if len(words) == 0 { b"0" } else { bytes_join(words, b", ") },
+      b"};",
+    ]),
+  );
+  let o = bind(
+    e,
+    KBoxed,
+    bytes_concat_all([
+      b"rt_record_p(ctx, @@s",
+      ascii_of_int(sh.i),
+      b"@@, (Word)(intptr_t)",
+      arr.name,
+      b", ",
+      ascii_of_int(len(words)),
+      b")",
+    ]),
+  );
+  { emitter: check(o.emitter), value: o.value }
+}
+
+/// `value` as a `Float` held in a register.
+fn float_held(emitter: Emitter, value: CValue) -> WithValue =
+  if value.kind == KFloat { { emitter: emitter, value: value } }
+  else { bind(emitter, KFloat, as_float(value)) }
+
+/// `words` are the record's in its shape's order; one where `raw_slot` holds of its kind must be
+/// a `Float`'s bits.
 fn build_record(
   emitter: Emitter,
   names: List<Bytes>,
@@ -937,12 +1028,18 @@ fn build_record(
   kinds: List<Kind>,
   vals: Option<List<CValue>>,
 ) -> WithValue = {
-  let sh = shape_of(emitter, names);
   let n = len(names);
-  let flat = n > 0
-    && fold(kinds, true, |acc: Bool, k: Kind|
-      acc && (match k { KNum(_) -> true, KBool -> true, _ -> false }));
-  let flags = if flat { 1 } else { 0 };
+  let sh = shape_of(
+    emitter,
+    map(range(0, n), |i: Int|
+      spelled_field(
+        match list_at(names, i) { Some(x) -> x, None -> b"" },
+        match list_at(kinds, i) { Some(k) -> k, None -> KBoxed },
+      )),
+  );
+  let flags = record_flags(kinds);
+  let flat = flags == 1;
+  let tail = if flags == 2 { counted_words(kinds) } else { [] };
   let ty = TyRec(
     map(range(0, n), |i: Int|
       {
@@ -965,11 +1062,13 @@ fn build_record(
         emitter: remember_built(held, f.name, names, vs),
         value: { kind: KBoxed, expr: f.name, ty: ty },
       }
-    } else { built_now(sh.emitter, names, words, sh.i, n, flags, ty, Some(vs)) },
-    None -> built_now(sh.emitter, names, words, sh.i, n, flags, ty, None),
+    } else { built_now(sh.emitter, names, concat(words, tail), sh.i, n, flags, ty, Some(vs)) },
+    None -> built_now(sh.emitter, names, concat(words, tail), sh.i, n, flags, ty, None),
   }
 }
 
+/// `words` are the record's, then a mixed one's bitmap. A token is taken for a mixed record only when
+/// it was one, so it has room for the bitmap.
 fn built_now(
   emitter: Emitter,
   names: List<Bytes>,
@@ -981,7 +1080,17 @@ fn built_now(
   vals: Option<List<CValue>>,
 ) -> WithValue = {
   let rec = bind(note_tok(emitter, n), KBoxed, b"0");
-  let opened = line(rec.emitter, bytes_concat_all([b"if (tok", ascii_of_int(n), b") {"]));
+  let opened = line(
+    rec.emitter,
+    bytes_concat_all([
+      b"if (tok",
+      ascii_of_int(n),
+      if flags == 2 {
+        bytes_concat_all([b" && (ply_obj(tok", ascii_of_int(n), b")->flags & PLY_MIXED)"])
+      } else { b"" },
+      b") {",
+    ]),
+  );
   let took = line(
     line(
       indent(opened),
@@ -1030,7 +1139,7 @@ fn built_now(
     ),
   );
   let closed = line(outdent(made), b"}");
-  let stored = fold(range(0, n), closed, |acc: Emitter, at: Int|
+  let stored = fold(range(0, len(words)), closed, |acc: Emitter, at: Int|
     line(
       acc,
       bytes_concat_all([
@@ -4483,7 +4592,15 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           },
         }),
       LDec(_) -> Some(from_table(emitter, l)),
-      LChar(_) -> Some(from_table(emitter, l)),
+      LChar(v) ->
+        Some({
+          emitter: emitter,
+          value: {
+            kind: KBoxed,
+            expr: bytes_concat_all([b"((Word)", int_lit(v * 8 + 2), b")"]),
+            ty: TyOpen,
+          },
+        }),
       _ -> Some(refused(emitter, b"a literal this port does not pool")),
     },
     NVar(v) -> match v.slot {
@@ -4769,7 +4886,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   Some({ emitter: note_made(taken, w.value.expr), value: w.value })
                 } else { Some({ emitter: w.emitter, value: w.value }) },
                 _ -> {
-                  let out = bind(w.emitter, i.kind, as_kind(w.value, i.kind));
+                  let out = bind(w.emitter, i.kind, if i.kind == KFloat {
+                    bytes_concat_all([b"ply_f64(", w.value.expr, b")"])
+                  } else { as_kind(w.value, i.kind) });
                   match release_base(out.emitter, f.base, hv, params) {
                     None -> None,
                     Some(r) -> Some({ emitter: r, value: out.value }),
@@ -4811,6 +4930,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     // Order: the written fields are evaluated, then the base read, then each field filled in shape order.
     NUpdate(u) -> {
       let names = sorted_names(concat(u.copies, map(u.sets, |f: CodeField| f.name)));
+      let laid = laid_out(emitter, c.span, names);
       // Each written field is evaluated and bound before the base is read.
       match sets_bound(emitter, map(u.sets, |f: CodeField| f.value), params, 0, []) {
         None -> None,
@@ -4821,21 +4941,35 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             let hv = if bv.emitter.release {
               { kind: KBoxed, expr: held.value.expr, ty: bv.value.ty }
             } else { bv.value };
+            // The kind the new record holds its field `at` as: none but a word where it is laid out by
+            // what it holds.
+            let target = |at: Int| match laid { Some(ks) -> kind_at(ks, at), None -> KBoxed };
+            // A field the new record holds as a `Float`'s bits, from a value it holds as a `Float`.
+            let as_bits = |acc: { emitter: Emitter, ws: List<Bytes>, kinds: List<Kind>, vals: List<CValue>, known: Bool }, em: Emitter, v: CValue, at: Int| {
+              let d = float_held(em, v);
+              {
+                emitter: d.emitter,
+                ws: push(acc.ws, raw_word(d.value)),
+                kinds: push(acc.kinds, target(at)),
+                vals: push(acc.vals, d.value),
+                known: acc.known,
+              }
+            };
             // A copy the base remembered is its value, not a load; any word read from memory stops the record being held back.
             let filled = fold(
               range(0, len(names)),
               { emitter: held.emitter, ws: [], kinds: [], vals: [], known: true },
               |acc: { emitter: Emitter, ws: List<Bytes>, kinds: List<Kind>, vals: List<CValue>, known: Bool }, at: Int| {
                 let nm = match list_at(names, at) { Some(x) -> x, None -> b"" };
+                let tk = target(at);
                 if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
-                  let fk = match field_at(bv.value.ty, nm) { Some(f) -> f.kind, None -> KBoxed };
                   match built_field(acc.emitter, held.value.expr, nm) {
-                    Some(v) -> {
+                    Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
                       let o = owned(acc.emitter, v);
                       {
                         emitter: o.emitter,
                         ws: push(acc.ws, o.value.expr),
-                        kinds: push(acc.kinds, fk),
+                        kinds: push(acc.kinds, tk),
                         vals: push(acc.vals, taken_as(o.emitter, v, o.value)),
                         known: acc.known,
                       }
@@ -4853,30 +4987,48 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             b"]",
                           ]),
                         );
-                        let inc = line(
-                          w.emitter,
-                          bytes_concat_all([b"ply_inc(", w.value.expr, b");"]),
-                        );
-                        // A scalar copy is read into a register of its kind, then unused: the store takes the word.
-                        match f.kind {
-                          KBoxed ->
+                        // A base of a known type holds a `Float` as its bits.
+                        if f.kind == KFloat {
+                          let d = bind(
+                            w.emitter,
+                            KFloat,
+                            bytes_concat_all([b"ply_f64(", w.value.expr, b")"]),
+                          );
+                          if raw_slot(tk) { as_bits(acc, d.emitter, d.value, at) } else {
                             {
-                              emitter: inc,
-                              ws: push(acc.ws, w.value.expr),
-                              kinds: push(acc.kinds, fk),
-                              vals: acc.vals,
-                              known: false,
-                            },
-                          _ -> {
-                            let c = bind(inc, f.kind, as_kind(w.value, f.kind));
-                            {
-                              emitter: c.emitter,
-                              ws: push(acc.ws, w.value.expr),
-                              kinds: push(acc.kinds, fk),
-                              vals: push(acc.vals, c.value),
+                              emitter: d.emitter,
+                              ws: push(acc.ws, as_word(d.value)),
+                              kinds: push(acc.kinds, tk),
+                              vals: push(acc.vals, d.value),
                               known: acc.known,
                             }
-                          },
+                          }
+                        } else {
+                          let inc = line(
+                            w.emitter,
+                            bytes_concat_all([b"ply_inc(", w.value.expr, b");"]),
+                          );
+                          // A scalar copy is read into a register of its kind, then unused: the store takes the word.
+                          match f.kind {
+                            KBoxed ->
+                              {
+                                emitter: inc,
+                                ws: push(acc.ws, w.value.expr),
+                                kinds: push(acc.kinds, tk),
+                                vals: acc.vals,
+                                known: false,
+                              },
+                            _ -> {
+                              let c = bind(inc, f.kind, as_kind(w.value, f.kind));
+                              {
+                                emitter: c.emitter,
+                                ws: push(acc.ws, w.value.expr),
+                                kinds: push(acc.kinds, tk),
+                                vals: push(acc.vals, c.value),
+                                known: acc.known,
+                              }
+                            },
+                          }
                         }
                       },
                       None -> {
@@ -4892,13 +5044,16 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             b"@@, 0)",
                           ]),
                         );
-                        // The runtime answers the copy duplicated, and the record takes it.
-                        {
-                          emitter: spend_made(check(w.emitter), w.value.expr),
-                          ws: push(acc.ws, w.value.expr),
-                          kinds: push(acc.kinds, fk),
-                          vals: acc.vals,
-                          known: false,
+                        // The runtime answers the copy duplicated, and the record takes it, or keeps
+                        // it until the block closes where the record holds the `Float` it is as bits.
+                        if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) } else {
+                          {
+                            emitter: spend_made(check(w.emitter), w.value.expr),
+                            ws: push(acc.ws, w.value.expr),
+                            kinds: push(acc.kinds, tk),
+                            vals: acc.vals,
+                            known: false,
+                          }
                         }
                       },
                     },
@@ -4913,13 +5068,13 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         vals: acc.vals,
                         known: false,
                       },
-                    // The written field's word is duplicated: the record being built takes it.
-                    Some(v) -> {
+                    Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
+                      // The written field's word is duplicated: the record being built takes it.
                       let w = owned(acc.emitter, v);
                       {
                         emitter: w.emitter,
                         ws: push(acc.ws, w.value.expr),
-                        kinds: push(acc.kinds, v.kind),
+                        kinds: push(acc.kinds, tk),
                         vals: push(acc.vals, taken_as(w.emitter, v, w.value)),
                         known: acc.known,
                       }
@@ -4931,12 +5086,14 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             // At the body's tail the release skips the one-read guard: no later read can exist.
             match release_from(filled.emitter, u.base, hv, params, emitter.tail) {
               None -> None,
-              Some(rel) ->
-                Some(
-                  build_record(rel, names, filled.ws, filled.kinds, if filled.known {
-                    Some(filled.vals)
-                  } else { None }),
-                ),
+              Some(rel) -> match laid {
+                None -> Some(record_by_value(rel, names, filled.ws)),
+                Some(ks) ->
+                  Some(
+                    build_record(rel, names, filled.ws, ks, if filled.known { Some(filled.vals) }
+                    else { None }),
+                  ),
+              },
             }
           },
         },
@@ -4945,28 +5102,46 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     // Values evaluated in written order, assembled in sorted-name order, from a reuse token of this width when there is one.
     NRecord(r) -> {
       let names = map(r.fields, |f: CodeField| f.name);
-      match items(emitter, map(r.fields, |f: CodeField| f.value), params, 0, []) {
-        None -> None,
-        Some(w) -> {
-          let sorted = sorted_names(names);
-          let vals = map(sorted, |nm: Bytes|
-            match fold(range(0, len(names)), None, |acc: Option<CValue>, i: Int|
-                match list_at(names, i) {
-                  Some(x) -> if x == nm { list_at(w.vals, i) } else { acc },
-                  None -> acc,
-                }) {
-              Some(v) -> v,
-              None -> { kind: KBoxed, expr: b"0", ty: TyOpen },
-            });
-          Some(
-            build_record(
-              w.emitter,
-              sorted,
-              map(range(0, len(sorted)), |at: Int| word_at_rank(names, w.names, at)),
-              map(vals, |v: CValue| v.kind),
-              Some(vals),
+      let sorted = sorted_names(names);
+      match laid_out(emitter, c.span, sorted) {
+        None -> match items(emitter, map(r.fields, |f: CodeField| f.value), params, 0, []) {
+          None -> None,
+          Some(w) ->
+            Some(
+              record_by_value(
+                w.emitter,
+                sorted,
+                map(range(0, len(sorted)), |at: Int| word_at_rank(names, w.names, at)),
+              ),
             ),
-          )
+        },
+        Some(kinds) -> match items_laid(
+            emitter,
+            map(r.fields, |f: CodeField| f.value),
+            params,
+            map(names, |nm: Bytes| kind_at(kinds, rank_of(names, nm))),
+          ) {
+          None -> None,
+          Some(w) -> {
+            let vals = map(sorted, |nm: Bytes|
+              match fold(range(0, len(names)), None, |acc: Option<CValue>, i: Int|
+                  match list_at(names, i) {
+                    Some(x) -> if x == nm { list_at(w.vals, i) } else { acc },
+                    None -> acc,
+                  }) {
+                Some(v) -> v,
+                None -> { kind: KBoxed, expr: b"0", ty: TyOpen },
+              });
+            Some(
+              build_record(
+                w.emitter,
+                sorted,
+                map(range(0, len(sorted)), |at: Int| word_at_rank(names, w.names, at)),
+                kinds,
+                Some(vals),
+              ),
+            )
+          },
         },
       }
     },
@@ -5557,13 +5732,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           bytes_concat_all([arr.name, b"[", ascii_of_int(i), b"]"]));
         let sorted = sorted_names(names);
         Some(
-          build_record(
-            ran,
-            sorted,
-            map(range(0, n), |at: Int| word_at_rank(names, words, at)),
-            map(sorted, |_x: Bytes| KBoxed),
-            None,
-          ),
+          record_by_value(ran, sorted, map(range(0, n), |at: Int| word_at_rank(names, words, at))),
         )
       },
     },
@@ -5927,7 +6096,17 @@ fn items(
   i: Int,
   acc: List<Bytes>,
 ) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
-  items_from(emitter, codes, params, i, acc, [])
+  items_from(emitter, codes, params, i, acc, [], [])
+
+/// A record's fields, each held as `kinds` says the record holds it: a word the record takes, or a
+/// `Float`'s bits.
+fn items_laid(
+  emitter: Emitter,
+  codes: List<Code>,
+  params: List<EmitParam>,
+  kinds: List<Kind>,
+) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
+  items_from(emitter, codes, params, 0, [], [], kinds)
 
 fn items_from(
   emitter: Emitter,
@@ -5936,6 +6115,7 @@ fn items_from(
   i: Int,
   acc: List<Bytes>,
   values: List<CValue>,
+  kinds: List<Kind>,
 ) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
   if i >= len(codes) { Some({ emitter: emitter, names: acc, vals: values }) } else {
     match list_at(codes, i) {
@@ -5943,14 +6123,19 @@ fn items_from(
       Some(x) -> match expr(notail(emitter), x, params) {
         None -> None,
         Some(o) -> {
-          let w = owned(o.emitter, o.value);
+          let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
+          let d = if raw { float_held(o.emitter, o.value) }
+          else { { emitter: o.emitter, value: o.value } };
+          let w = if raw { bind(d.emitter, KInt, raw_word(d.value)) }
+          else { owned(o.emitter, o.value) };
           items_from(
             w.emitter,
             codes,
             params,
             i + 1,
             push(acc, w.value.expr),
-            push(values, taken_as(w.emitter, o.value, w.value)),
+            push(values, if raw { d.value } else { taken_as(w.emitter, o.value, w.value) }),
+            kinds,
           )
         },
       },
@@ -7001,7 +7186,11 @@ fn rebuild(emitter: Emitter, names: List<Bytes>, values: List<CValue>) -> Option
     build_record(
       emitter,
       names,
-      map(values, |value: CValue| as_word(value)),
+      map(range(0, len(values)), |at: Int|
+        match list_at(values, at) {
+          Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { as_word(value) },
+          None -> b"0",
+        }),
       map(values, |value: CValue| value.kind),
       Some(values),
     ),
@@ -7251,6 +7440,18 @@ fn binary_rest(emitter: Emitter, op: Bytes, l: CValue, r: CValue, t: Operand) ->
       )
     } else { Some(unsettled_operator(emitter, op)) },
     OFloat -> float_binary(emitter, op, l, r),
+    // A `Char`'s word is its code point above a tag, so its words compare as its code points do.
+    OChar -> match compare_op(op) {
+      Some(c) ->
+        Some(
+          bind(
+            emitter,
+            KBool,
+            bytes_concat_all([b"(", as_word(l), b") ", c, b" (", as_word(r), b")"]),
+          ),
+        ),
+      None -> Some(unsettled_operator(emitter, op)),
+    },
     OWord -> word_binary(emitter, op, l, r),
   }
 
@@ -7656,14 +7857,20 @@ pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
         None -> boxed(),
       }
     } else { boxed() },
-    // Field order is the checker's, sorted by name.
-    TyRecord(fs) -> { kind: KBoxed, ty: TyRec(map(fs, field_ty)) },
+    // Field order is the checker's, sorted by name. A field of a variable's type may hold any kind's
+    // word or bits, so such a record is read by name, as the runtime reads it.
+    TyRecord(fs) -> if open_fields(fs) { boxed() }
+    else { { kind: KBoxed, ty: TyRec(map(fs, field_ty)) } },
     // At run time a `new` record is the record it is written as.
-    TyNominal(x) -> { kind: KBoxed, ty: TyRec(map(x.fields, field_ty)) },
+    TyNominal(x) -> if open_fields(x.fields) { boxed() }
+    else { { kind: KBoxed, ty: TyRec(map(x.fields, field_ty)) } },
     _ -> boxed(),
   }
 
 fn boxed() -> { kind: Kind, ty: Ty } = { kind: KBoxed, ty: TyOpen }
+
+fn open_fields(fs: List<Field>) -> Bool =
+  fold(fs, false, |open: Bool, f: Field| open || (match f.ty { TyVar(_) -> true, _ -> false }))
 
 fn field_ty(f: Field) -> FieldTy = {
   let k = kind_of(f.ty);
@@ -8891,6 +9098,55 @@ test "a `Float` is a C `double`: its operators are C's own and a literal is its 
   assert_eq(has(b"ply_f64(INT64_C(4602678819172646912))"), [true, false, false, false]);
   // C has no `%` on doubles; the runtime answers it as the evaluator does.
   assert_eq(has(b"rt_float_rem_p"), [false, false, true, false])
+}
+
+test "a record holds every `Float` field as its bits, wherever the field stands" {
+  let fields = bytes_join(
+    map(range(0, 70), |k: Int| bytes_concat_all([b"f", ascii_of_int(k + 10), b": Float"])),
+    b", ",
+  );
+  let src = bytes_concat_all([
+    b"type Point = { x: Float, y: Float }\n",
+    b"fn point(x: Float, y: Float) -> Point = { x: x, y: y }\n",
+    b"fn sum(p: Point) -> Float = p.x + p.y\n",
+    b"fn weighed(name: String, weight: Float) -> { name: String, weight: Float } = { name: name, weight: weight }\n",
+    b"fn moved(p: Point, by: Float) -> Point = { ..p, x: p.x + by }\n",
+    b"type Wide = { ",
+    fields,
+    b", tag: String }\n",
+    b"fn last(wide: Wide) -> Float = wide.f79\n",
+    b"fn wrapped<a>(x: a) -> { inner: a } = { inner: x }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None, None]);
+  // No `Float` a record holds is boxed into an object of its own; `sum` and `last` box only their
+  // answers.
+  assert_eq(has(b"rt_box_float_p"), [false, true, false, false, true, false]);
+  // `Point` holds bits alone, so it is flat; `weighed` holds a word it counts beside them, so it is
+  // mixed and the word after its fields says its first is the counted one.
+  assert_eq(has(b"@@, 1);"), [true, false, false, true, false, false]);
+  assert_eq(has(b"@@, 2);"), [false, false, true, false, false, false]);
+  assert_eq(has(b"[2] = INT64_C(1);"), [false, false, true, false, false, false]);
+  // A record of a known type holds a `Float` as its bits wherever it was made, so a read is a load,
+  // the 70th field's at its place as the first's.
+  assert(bytes_index_of(at(out, 4).text, b")[69]") != None);
+  // A field of a variable's type is laid out as what it holds when the record is made.
+  assert_eq(has(b"rt_record_p"), [false, false, false, false, false, true])
+}
+
+test "a `Char` is its own word, compared as C compares the words" {
+  let src = bytes_concat_all([
+    b"fn lower(c: Char) -> Bool = c >= 'a' && c <= 'z'\n",
+    b"fn same(a: Char, b: Char) -> Bool = a == b\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None]);
+  assert_eq(has(b"rt_binary_p"), [false, false]);
+  assert_eq(has(b"rt_equal_p"), [false, false]);
+  // `'a'` is code point 97: `97 << 3 | 2`.
+  assert_eq(has(b"((Word)INT64_C(778))"), [true, false])
 }
 
 test "a record a pattern binds is read at the offsets its checked type gives" {

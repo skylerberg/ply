@@ -20,17 +20,10 @@ pub use prelude::{
     runtime_object,
 };
 
-/// The sources of the runtime the emitter runs on, as `build.rs` digests them. Not the binary: a
-/// change anywhere else in `ply`, or the other build profile, answers and emits the same.
-const RUNTIME: &str = env!("PLY_RUNTIME_DIGEST");
-
-/// [`RUNTIME`], for what is kept under the runtime that answered it.
-pub fn runtime_digest() -> &'static str {
-    RUNTIME
-}
-
-/// The runtime's sources less how C is compiled, kept, swept and loaded and how Rust asks the
-/// compiler: what an answer computed inside a loaded unit is a function of.
+/// The runtime's sources, as `build.rs` digests them, less how C is compiled, kept, swept and
+/// loaded and how Rust asks the compiler: what an answer computed inside a loaded unit is a
+/// function of. Not the binary: a change anywhere else in `ply`, or the other build profile,
+/// answers the same.
 pub fn semantics_digest() -> &'static str {
     env!("PLY_SEMANTICS_DIGEST")
 }
