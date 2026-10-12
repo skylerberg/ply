@@ -71,7 +71,7 @@ of it or none, and a run that dies or races another costs a later one checking
 what it takes, never a wrong answer. A run that names a segment writes the
 newest again as one while each is at most twice what follows it; writing all of
 them again keeps the records of the `ply` that writes and, of other `ply`s', the
-most lately used, up to twice as much again.
+most lately used, up to as much again.
 `PLY_CACHE_UPSTREAM=DIR` names a second
 cache shared between checkouts and machines, a directory on any storage they all
 reach: the passes and discharged obligations found there count here, and this
