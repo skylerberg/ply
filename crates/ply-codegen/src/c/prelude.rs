@@ -22,7 +22,9 @@ typedef struct {
 #define PLY_HEADER 16
 #define PLY_FLAT 1
 #define PLY_MIXED 2
+#define PLY_RAW 4
 #define PLY_KIND_FLOAT 16
+#define PLY_KIND_FIXED 18
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
    pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
@@ -107,6 +109,19 @@ static inline Word ply_reset_flat(Word w) {
   return w;
 }
 
+/* A record held in place at word `at` of `base`'s, its header written as `heap::embed` writes it:
+   its count is how many words before it its holder's header starts. */
+static inline Word ply_embedded(Word base, int at, uint8_t flags, uint32_t len, uint32_t layout) {
+  PlyObj *e = (PlyObj *)&ply_words(base)[at];
+  e->rc = UINT32_C(0xC0000000) | (uint32_t)(PLY_HEADER / 8 + at);
+  e->kind = 3;
+  e->flags = flags;
+  e->aux = 0;
+  e->len = len;
+  e->layout = layout;
+  return (Word)(intptr_t)e;
+}
+
 /* The word a field holds, at a statically known offset. */
 static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at]; }
 static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
@@ -145,11 +160,13 @@ helpers![
     (rt_unbox_int, 1, true),
     (rt_unbox_bool, 1, true),
     (rt_box_float, 1, true),
+    (rt_box_fixed, 2, true),
     (rt_unbox_float, 1, true),
     (rt_float_rem, 2, true),
     (rt_no_fuel, 0, false),
     (rt_no_stack, 0, false),
     (rt_binary, 3, true),
+    (rt_wide_binary, 4, true),
     (rt_negate, 1, true),
     (rt_arith, 3, true),
     (rt_lit, 1, true),
@@ -254,23 +271,82 @@ pub fn runtime_header() -> String {
     out.push_str("extern Word ply_true, ply_false, ply_unit;\n");
     // Trap: `rt_dec` frees unconditionally (it is `release_last`); only call it once `rc == 1`.
     // A count with its top bit set is shared (`heap::SHARED`): tcc has no atomics, so the runtime
-    // changes it.
+    // changes it. One with its top two set is a record's held in place (`heap::EMBEDDED`), which
+    // the record holding it counts for it.
     out.push_str(
-        "\nstatic inline void ply_inc(Word w) {\n\
+        "\nstatic inline PlyObj *ply_counted_by(PlyObj *o) {\n\
+         \x20 uint32_t rc = o->rc;\n\
+         \x20 while (rc >= UINT32_C(0xC0000000) && rc != UINT32_MAX) {\n\
+         \x20   o = (PlyObj *)((Word *)o - (rc & UINT32_C(0x3FFFFFFF)));\n\
+         \x20   rc = o->rc;\n\
+         \x20 }\n\
+         \x20 return o;\n\
+         }\n\
+         \nstatic inline void ply_inc(Word w) {\n\
          \x20 if (ply_is_imm(w) || w == 0) return;\n\
-         \x20 PlyObj *o = ply_obj(w);\n\
+         \x20 PlyObj *o = ply_counted_by(ply_obj(w));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
-         \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, w);\n\
+         \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
          }\n\
          \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
          \x20 if (ply_is_imm(w) || w == 0) return;\n\
-         \x20 PlyObj *o = ply_obj(w);\n\
+         \x20 PlyObj *o = ply_counted_by(ply_obj(w));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc == UINT32_MAX) return;\n\
-         \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, w); return; }\n\
+         \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, (Word)o); return; }\n\
          \x20 if (rc > 1) { o->rc = rc - 1; return; }\n\
-         \x20 rt_dec_p(ctx, w);\n\
+         \x20 rt_dec_p(ctx, (Word)o);\n\
+         }\n",
+    );
+    // `heap::embed`: a unique record's words move, so only its shell is let go.
+    out.push_str(
+        "\nstatic inline void ply_embed(PlyCtx *ctx, Word base, int at, Word child, int tail) {\n\
+         \x20 PlyObj *c = ply_obj(child);\n\
+         \x20 uint32_t len = c->len;\n\
+         \x20 uint8_t flags = c->flags;\n\
+         \x20 Word *src = ply_words(child);\n\
+         \x20 Word *dst = ply_words(base) + at + PLY_HEADER / 8;\n\
+         \x20 memcpy(dst, src, (size_t)len * 8);\n\
+         \x20 if (tail) {\n\
+         \x20   if (flags & PLY_MIXED) memcpy(dst + len, src + len, (size_t)tail * 8);\n\
+         \x20   else memset(dst + len, 0, (size_t)tail * 8);\n\
+         \x20 }\n\
+         \x20 ply_embedded(base, at, flags, len, c->layout);\n\
+         \x20 if (c->rc == 1) c->flags = flags | PLY_FLAT;\n\
+         \x20 else if (!(flags & PLY_FLAT))\n\
+         \x20   for (uint32_t i = 0; i < len; i++)\n\
+         \x20     if (!(flags & PLY_MIXED) || ((uint64_t)src[len + i / 64] >> (i % 64)) & 1) ply_inc(src[i]);\n\
+         \x20 ply_dec(ctx, child);\n\
+         }\n",
+    );
+    // What a record held in place counts, let go of before another is written over it.
+    out.push_str(
+        "\nstatic inline void ply_drop_embedded(PlyCtx *ctx, Word base, int at) {\n\
+         \x20 PlyObj *e = (PlyObj *)&ply_words(base)[at];\n\
+         \x20 uint32_t len = e->len;\n\
+         \x20 uint8_t flags = e->flags;\n\
+         \x20 Word *w = ply_words(base) + at + PLY_HEADER / 8;\n\
+         \x20 if (flags & PLY_FLAT) return;\n\
+         \x20 for (uint32_t i = 0; i < len; i++)\n\
+         \x20   if (!(flags & PLY_MIXED) || ((uint64_t)w[len + i / 64] >> (i % 64)) & 1) ply_dec(ctx, w[i]);\n\
+         }\n",
+    );
+    // A field's last read, where the record is its only holder: what it counts moves with it.
+    out.push_str(
+        "\nstatic inline Word ply_take(PlyCtx *ctx, Word base, int at) {\n\
+         \x20 Word inner = (Word)(intptr_t)(ply_words(base) + at);\n\
+         \x20 if (ply_obj(base)->rc != 1) { ply_inc(inner); return inner; }\n\
+         \x20 PlyObj *e = ply_obj(inner);\n\
+         \x20 uint32_t len = e->len;\n\
+         \x20 uint8_t flags = e->flags;\n\
+         \x20 Word *src = ply_words(inner);\n\
+         \x20 Word out = rt_alloc_p(ctx, 3, len, e->layout, flags);\n\
+         \x20 memcpy(ply_words(out), src, ((size_t)len + ((flags & PLY_MIXED) ? (len + 63) / 64 : 0)) * 8);\n\
+         \x20 if (!(flags & PLY_FLAT))\n\
+         \x20   for (uint32_t i = 0; i < len; i++)\n\
+         \x20     if (!(flags & PLY_MIXED) || ((uint64_t)src[len + i / 64] >> (i % 64)) & 1) src[i] = 0;\n\
+         \x20 return out;\n\
          }\n",
     );
     out

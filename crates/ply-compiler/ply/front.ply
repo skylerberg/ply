@@ -947,10 +947,13 @@ fn kept_in_cut(o: Outline, reached: Map<Bytes, Bool>, item: Outlined) -> Bool =
 /// its text.
 fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape / {abort.raise} = {
   let o = s.outline;
-  let gone = fold(o.items, [], |acc: List<Bytes>, item: Outlined|
+  // How many times each function the cut leaves out is declared.
+  let gone = fold(o.items, map_new(), |acc: Map<Bytes, Int>, item: Outlined|
     match item {
-      OFn(x) -> if kept_in_cut(o, reached, item) { acc }
-      else { push(acc, qualify(o.name, x.name)) },
+      OFn(x) -> if kept_in_cut(o, reached, item) { acc } else {
+        let name = qualify(o.name, x.name);
+        map_insert(acc, name, match map_get(acc, name) { Some(n) -> n + 1, None -> 1 })
+      },
       _ -> acc,
     });
   {
@@ -958,8 +961,18 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape / {abort.
     outline: {
       ..o,
       items: filter(o.items, |item: Outlined| kept_in_cut(o, reached, item)),
-      declared: fold(gone, o.declared, |names: List<Bytes>, n: Bytes| without_first(names, n)),
-      cuts: filter(o.cuts, |c: Cut| !contains(gone, c.name)),
+      // Each leaves the names declared once, the first of its name.
+      declared: fold(
+        o.declared,
+        { left: gone, names: [] },
+        |acc: { left: Map<Bytes, Int>, names: List<Bytes> }, n: Bytes|
+          match map_get(acc.left, n) {
+            Some(k) -> if k > 0 { { ..acc, left: map_insert(acc.left, n, k - 1) } }
+            else { { ..acc, names: push(acc.names, n) } },
+            None -> { ..acc, names: push(acc.names, n) },
+          },
+      ).names,
+      cuts: filter(o.cuts, |c: Cut| !map_contains(gone, c.name)),
     },
   }
 }
@@ -1003,13 +1016,6 @@ fn cut_tables(t: ModuleTables, o: Outline, reached: Map<Bytes, Bool>) -> ModuleT
     },
     kept: filter(t.kept, |k: KeptFacts| map_contains(reached, k.name)),
   }
-}
-
-/// `names` without the first of them that is `n`.
-fn without_first(names: List<Bytes>, n: Bytes) -> List<Bytes> / {abort.raise} = {
-  let k = fold(range(0, len(names)), 0 - 1, |acc: Int, i: Int|
-    if acc >= 0 { acc } else if at(names, i) == n { i } else { acc });
-  if k < 0 { names } else { concat(take(names, k), drop(names, k + 1)) }
 }
 
 /// Whether a site in module `module` is of the walk of its definitions, which takes each module
@@ -2537,13 +2543,22 @@ pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
 
 /// Every `const` definition the program holds, whichever package declares it. One in a shipped
 /// module that the program does not reach has no hash, and is none of the program's.
-pub fn const_sites(outlines: List<Outline>, hashes: HashOutput) -> List<ConstSite> / {abort.raise} = {
+pub fn const_sites(outlines: List<Outline>, hashes: HashOutput) -> List<ConstSite> / {abort.raise} =
+  const_sites_where(outlines, hashes, |_: Bytes| true)
+
+/// Those of [`const_sites`] `wanted` says of, asked by program-wide name before a site is made:
+/// what a site is kept under costs a walk of all its definition reaches.
+fn const_sites_where(
+  outlines: List<Outline>,
+  hashes: HashOutput,
+  wanted: (Bytes) -> Bool,
+) -> List<ConstSite> / {abort.raise} = {
   let hashed = by_name(hashes.defs);
   fold(range(0, len(outlines)), [], |acc: List<ConstSite>, i: Int| {
     let o = at(outlines, i);
     fold(o.items, acc, |sites: List<ConstSite>, item: Outlined|
       match item {
-        OFn(f) -> if !f.baked { sites } else {
+        OFn(f) -> if !f.baked || !wanted(qualify(o.name, f.name)) { sites } else {
           let name = qualify(o.name, f.name);
           match map_get(hashed, name) {
             Some(h) ->
@@ -2607,11 +2622,9 @@ fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List<Typ
 /// Every `const` definition of `frame`'s root package declared as the type named `type_name`
 /// program-wide.
 pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
-  let named = map(
-    filter(frame.consts, |c: TypedConst| c.type_name == type_name),
-    |c: TypedConst| c.name,
-  );
-  filter(const_sites(frame.outlines, frame.hashes), |site: ConstSite| contains(named, site.name))
+  let named = fold(frame.consts, map_new(), |acc: Map<Bytes, Bool>, c: TypedConst|
+    if c.type_name == type_name { map_insert(acc, c.name, true) } else { acc });
+  const_sites_where(frame.outlines, frame.hashes, |name: Bytes| map_contains(named, name))
 }
 
 /// An argument as a check reads it before anything runs: text as written, literals joined by `++`

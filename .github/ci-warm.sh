@@ -47,7 +47,15 @@ case "${1:-}" in
     mark=${2:?usage: ci-warm.sh used MARK}
     [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
     before=$(megabytes "$cache" "$stage")
-    [ -d "$cache" ] && find "$cache" -type f ! -newer "$mark" -delete
+    if [ -d "$cache" ]; then
+      # A memo store goes whole, as a stage does: its manifest names every segment it holds, and a
+      # run that opens it makes a directory of its own in it.
+      for dir in "$cache"/memo-*/; do
+        [ -d "$dir" ] || continue
+        [ -n "$(find "$dir" -newer "$mark" -print -quit)" ] || rm -rf "$dir"
+      done
+      find "$cache" -type f ! -newer "$mark" ! -path "$cache/memo-*" -delete
+    fi
     if [ -d "$stage" ]; then
       for dir in "$stage"/*/; do
         [ -d "$dir" ] || continue
