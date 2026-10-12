@@ -5,7 +5,7 @@
 
 use crate::vm;
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -222,7 +222,7 @@ pub struct Blocks {
     empty: usize,
     segments: BTreeSet<usize>,
     /// The bytes of each block the system allocator holds, by its address.
-    large: HashMap<usize, usize>,
+    large: BTreeMap<usize, usize>,
     reused: usize,
 }
 
@@ -236,7 +236,7 @@ impl Default for Blocks {
             clean: null_mut(),
             empty: 0,
             segments: BTreeSet::new(),
-            large: HashMap::new(),
+            large: BTreeMap::new(),
             reused: 0,
         }
     }
@@ -448,6 +448,22 @@ impl Blocks {
         }
     }
 
+    /// Whether `address` lies inside a block this heap handed out, where it may begin something held
+    /// in place.
+    pub fn within(&self, address: usize) -> bool {
+        if !self.segments.contains(&(address & !(SEGMENT - 1))) {
+            return self
+                .large
+                .range(..=address)
+                .next_back()
+                .is_some_and(|(start, bytes)| address < start + bytes);
+        }
+        unsafe {
+            let page = page_of(address as *mut u8);
+            (*page).block != 0 && address >= room(page).0.addr() && address < (*page).fresh.addr()
+        }
+    }
+
     /// Every block handed out and not since emptied with its page, dead ones among them.
     pub fn each(&self, mut f: impl FnMut(*mut u8)) {
         unsafe {
@@ -518,7 +534,7 @@ impl Blocks {
                 owner(address as *mut u8, bytes).store(self.name(), Release);
             }
             self.segments.append(&mut other.segments);
-            self.large.extend(other.large.drain());
+            self.large.append(&mut other.large);
             self.reused += other.reused;
             self.regain(other.name());
         }
@@ -527,7 +543,7 @@ impl Blocks {
     /// Gives back everything but one segment, which the next blocks come from.
     pub fn reset(&mut self) {
         unsafe {
-            for (address, bytes) in self.large.drain() {
+            for (address, bytes) in std::mem::take(&mut self.large) {
                 dealloc((address as *mut u8).sub(LEAD), large(bytes));
             }
             let kept = self.segments.first().copied();
