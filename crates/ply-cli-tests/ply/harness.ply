@@ -22,16 +22,18 @@ import compiler.resolve (Diag)
 import cli.hosts (hosts, hermetic_hosts)
 import cli.machine (machine, hermetic_machine, Options, unconfigured)
 import cli.replace (edit)
+import cli.surface (spec)
 import cli.tester (tester, hermetic_tester)
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import std.bytes (hex_of)
+import std.cli as command_line
 import std.config (config)
 import std.fs
 import std.fs (fs, MemFs, Entry, File, Seen)
 import std.json
 import std.json (Json, Null, Number, Str, Array, Object)
-import std.list (sort_by, concat, contains)
+import std.list (sort_by, concat, contains, drop, find_index, take)
 import std.net
 import std.net (net)
 import std.os
@@ -814,6 +816,44 @@ fn input_lines(stdin: Option<String>) -> List<String> / {abort.raise} =
     },
   }
 
+// --- The line ----------------------------------------------------------------
+
+/// The command `path` names, as the surface declares it.
+fn declared(root: command_line::Command, path: List<String>) -> Option<command_line::Body> =
+  fold(path, Some(command_line::body(root)), |at: Option<command_line::Body>, word: String|
+    match at {
+      None -> None,
+      Some(node) -> match filter(node.subs, |c: command_line::Command|
+          command_line::body(c).name == word) {
+        [c, ..] -> Some(command_line::body(c)),
+        [] -> None,
+      },
+    })
+
+/// `argv` naming the working directory where it leaves its path off. A test's tree is a directory
+/// of modules that no package holds: a program when a line names it, and nothing to find when one
+/// does not.
+fn here_named(argv: List<String>) -> List<String> / {abort.raise} = {
+  let surface = spec("0.0.0-test");
+  let left_off = match command_line::parse(surface, argv) {
+    command_line::Run(p) -> match declared(surface.root, p.path) {
+      None -> false,
+      Some(node) -> match list_at(node.positionals, len(node.positionals) - 1) {
+        Some(last) ->
+          !last.required && last.default == "" && len(p.positionals) < len(node.positionals),
+        None -> false,
+      },
+    },
+    _ -> false,
+  };
+  if !left_off { argv } else {
+    match find_index(argv, |word: String| word == "--") {
+      Some(i) -> concat(concat(take(argv, i), ["."]), drop(argv, i)),
+      None -> push(argv, "."),
+    }
+  }
+}
+
 // --- On disk -----------------------------------------------------------------
 
 /// `ply` in the working directory, bound as the launcher binds it: `cwd` and `abs` are the run's
@@ -857,7 +897,7 @@ fn on_disk_over(
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = {
   // Tests share the machine they are lent, so a command starts and ends with the label empty.
   machine.drop[run]();
-  let ran = with_cell[disk_io](with_input(captured(argv), input_lines(stdin))) { io -> {
+  let ran = with_cell[disk_io](with_input(captured(here_named(argv)), input_lines(stdin))) { io -> {
     let pwd = working();
     handle {
       main()
@@ -930,6 +970,11 @@ pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
   fold(inherited(), vars, |acc: List<Var>, name: String|
     match config.get[env](name) { Some(v) -> push(acc, { name: name, value: v }), None -> acc })
 
+/// The words the binary is started with: `--color never` ahead of the line, so one that spells
+/// `--color` itself wins.
+fn started(argv: List<String>) -> List<String> / {abort.raise} =
+  concat(["--color", "never"], here_named(argv))
+
 /// The binary `--exec ply` names, started in the working directory with `--color never` ahead of
 /// `argv`, so one that spells `--color` itself wins.
 pub fn spawned(argv: List<String>, vars: List<Var>) -> Ran / {Spawned, abort.raise} =
@@ -941,12 +986,12 @@ pub fn spawned_in(
   argv: List<String>,
   vars: List<Var>,
 ) -> Ran / {Spawned, abort.raise} =
-  finished(process.spawn[ply](concat(["--color", "never"], argv), dir, environment(vars)))
+  finished(process.spawn[ply](started(argv), dir, environment(vars)))
 
 /// Each of `argvs` run as `spawned` runs one, all started at once and answered in order.
 pub fn spawned_together(argvs: List<List<String>>) -> List<Ran> / {Spawned, abort.raise} = {
   let children = map(argvs, |argv: List<String>|
-    match process.start[ply](concat(["--color", "never"], argv), "", environment([]), {
+    match process.start[ply](started(argv), "", environment([]), {
         input: false,
         out: Keep,
         err: Keep,
@@ -987,7 +1032,7 @@ pub fn reserve() -> Int / {Wire, abort.raise} = {
 
 /// The binary started as `spawned` starts it and left running, its streams kept for `ended`.
 pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", environment(vars), {
       input: false,
       out: Keep,
       err: Keep,
@@ -1007,7 +1052,7 @@ pub fn listening(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abor
   talking(argv, vars, true)
 
 fn talking(argv: List<String>, vars: List<Var>, input: Bool) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", environment(vars), {
       input: input,
       out: Lines,
       err: Discard,
@@ -1034,7 +1079,7 @@ pub fn spawned_fed(
   vars: List<Var>,
   input: Bytes,
 ) -> Finished / {Spawned, abort.raise} =
-  match process.start[ply](concat(["--color", "never"], argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", environment(vars), {
       input: true,
       out: Keep,
       err: Keep,
@@ -1064,7 +1109,7 @@ pub fn this_ply() -> String / {os.executable, abort.raise} =
 /// The words a shell starts `ply` with, as `spawned` starts it: `--color never` ahead of `argv`.
 /// `$PLY` is the binary, which `shell_environment` sets.
 fn shell_ply(argv: List<String>) -> String / {abort.raise} =
-  match shell_join(concat(["--color", "never"], argv)) {
+  match shell_join(started(argv)) {
     Some(words) -> "\"$PLY\" " ++ words,
     None -> panic("an argument no shell word spells"),
   }
