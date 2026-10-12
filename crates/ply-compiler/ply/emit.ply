@@ -18,7 +18,8 @@ import derive (expand_derives)
 import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
               EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
               facts_at, test_owner, law_root, cases_root)
-import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, type_at)
+import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
+              is_diverges)
 import front
 import front (Rows, KnownDefRow, KnownTestRow, Dump, analyse, analyse_with, no_rows,
               analyse_pulling_std_with, dump_of, WalkedFacts, walked_facts_bin, facts_read,
@@ -3197,7 +3198,7 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
     NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
     NLambda(l) -> NLambda({ ..l, body: go(l.body) }),
     NSimulate(x) -> NSimulate({ ..x, body: go(x.body) }),
-    NParallel(pr) -> NParallel({ branches: map(pr.branches, go) }),
+    NParallel(pr) -> NParallel({ ..pr, branches: map(pr.branches, go) }),
     NHandle(h) ->
       NHandle({
         body: go(h.body),
@@ -5696,7 +5697,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       }
     },
     // `parallel { .. }`: the branches' closures go to the runtime, which runs them at once where it may
-    // and in order where it must, and writes each one's answer over its closure.
+    // and in order where it must, and writes each one's answer over its closure. Where the block's
+    // definition says what the branches may perform, the runtime is told, so a handler none of it
+    // reaches does not keep them in order.
     NParallel(pr) -> match items(emitter, pr.branches, params, 0, []) {
       None -> None,
       Some(w) -> {
@@ -5706,18 +5709,68 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           arr.emitter,
           bytes_concat_all([b"Word ", arr.name, b"[] = {", bytes_join(w.names, b", "), b"};"]),
         );
-        let ran = check(
-          line(
-            site(held, c.span),
-            bytes_concat_all([
-              b"rt_parallel_p(ctx, (Word)(intptr_t)",
-              arr.name,
-              b", ",
-              ascii_of_int(n),
-              b");",
-            ]),
-          ),
-        );
+        let ran = match if pr.rooted { owner_reach(held) } else { None } {
+          None ->
+            check(
+              line(
+                site(held, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b");",
+                ]),
+              ),
+            ),
+          Some(reach) -> {
+            let named = fold(
+              reach,
+              { emitter: held, words: [] },
+              |acc: { emitter: Emitter, words: List<Bytes> }, r: Reached| {
+                let ef = field_of(acc.emitter, r.effect);
+                match r.resource {
+                  None ->
+                    { emitter: ef.emitter, words: concat(acc.words, [field_ref(ef.i), b"-1"]) },
+                  Some(name) -> {
+                    let res = field_of(ef.emitter, name);
+                    {
+                      emitter: res.emitter,
+                      words: concat(acc.words, [field_ref(ef.i), field_ref(res.i)]),
+                    }
+                  },
+                }
+              },
+            );
+            let table = fresh(named.emitter);
+            let listed = line(
+              table.emitter,
+              bytes_concat_all([
+                b"Word ",
+                table.name,
+                b"[] = {",
+                if len(named.words) == 0 { b"0" } else { bytes_join(named.words, b", ") },
+                b"};",
+              ]),
+            );
+            check(
+              line(
+                site(listed, c.span),
+                bytes_concat_all([
+                  b"rt_parallel_past_p(ctx, (Word)(intptr_t)",
+                  arr.name,
+                  b", ",
+                  ascii_of_int(n),
+                  b", (Word)(intptr_t)",
+                  table.name,
+                  b", ",
+                  ascii_of_int(len(reach)),
+                  b");",
+                ]),
+              ),
+            )
+          },
+        };
         let names = map(range(0, n), |i: Int| bytes_concat(b"_", ascii_of_int(i)));
         let words = map(range(0, n), |i: Int|
           bytes_concat_all([arr.name, b"[", ascii_of_int(i), b"]"]));
@@ -5728,6 +5781,41 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
     },
     _ -> Some(refused(emitter, b"an effect construct or another node this port does not emit")),
+  }
+
+/// What a `parallel` block's branches may perform of one effect, by its program-wide name: on the
+/// resource named, or on any.
+type Reached = { effect: Bytes, resource: Option<Bytes> }
+
+/// Every operation the definition being emitted may perform and does not answer, as its row has
+/// it: what a block in its own body may reach of the handlers its callers installed. `None` where
+/// the row does not say: a root that is no definition, a group's shared function and a row left
+/// open. A row names an effect program-wide, as a frame's clause does.
+fn owner_reach(emitter: Emitter) -> Option<List<Reached>> =
+  if len(emitter.group) > 0 { None } else {
+    match fold(emitter.here, None, |found: Option<Scheme>, d: Def| {
+        let full = qualify(emitter.module, d.name);
+        if full == emitter.owner || bytes_starts_with(emitter.owner, bytes_concat(full, b"@")) {
+          d.scheme
+        } else { found }
+      }) {
+      None -> None,
+      Some(s) -> match s.ty {
+        TyFn(f) -> match f.effects.tail {
+          Some(_) -> None,
+          None ->
+            Some(
+              // Nothing performs `diverges`: it says only that the body may not return.
+              map(filter(f.effects.atoms, |atom: Atom| !is_diverges(atom)), |atom: Atom|
+                {
+                  effect: atom.effect,
+                  resource: match atom.resource { RNamed(name) -> Some(name), _ -> None },
+                }),
+            ),
+        },
+        _ -> None,
+      },
+    }
   }
 
 /// The operations a `simulate` region answers, named as the fixpoint names a handled operation.
@@ -8977,6 +9065,22 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
   assert_eq(leaves(b"builtin_bytes_at_p(ctx, "), [true, true]);
   assert_eq(map(bodies, |body: Bytes| bytes_index_of(body, b"return")), [None, None])
+}
+
+test "a `parallel` block tells the runtime its definition's row only where that row holds all its branches reach" {
+  let src = bytes_concat_all([
+    b"effect meter { read level() -> Int }\n",
+    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
+    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
+    b"fn handled() -> (Int, Int) = handle { parallel { meter.level(), meter.level() } } with { meter.level() -> 0 }\n",
+    b"fn nested(xs: List<Int>) -> List<(Int, Int)> = map(xs, |m: Int| parallel { m + 1, m + 2 })\n",
+    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [b"map"], true);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None]);
+  let calls = |helper: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, helper) != None);
+  assert_eq(calls(b"rt_parallel_past_p(ctx, "), [true, true, false, false, false]);
+  assert_eq(calls(b"rt_parallel_p(ctx, "), [false, false, true, true, true])
 }
 
 test "a `return` a `handle` body emitted is seen, however its lines were joined since" {

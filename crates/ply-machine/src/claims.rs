@@ -77,10 +77,6 @@ const HERMETIC_OPERATIONS: [(&str, &str); 7] = [
     ("ended", "ply_machine::claims::hermetic::ended"),
 ];
 
-/// A compiled body honours its call bound on the native stack, where unoptimised frames run to
-/// kilobytes. Reserved, not committed.
-const CLAIMS_STACK: usize = 256 << 20;
-
 /// What the machine is asked to work with, which is every flag that is not about the report.
 pub struct Job {
     pub path: PathBuf,
@@ -409,7 +405,7 @@ impl Machine {
         let (requests, asked) = mpsc::channel();
         let (told, replies) = mpsc::channel();
         let thread = std::thread::Builder::new()
-            .stack_size(CLAIMS_STACK)
+            .stack_size(ply_codegen::rt::PROGRAM_STACK)
             .spawn(move || serve(job, &told, &asked))
             .map_err(|e| unspawned(&e))?;
         Ok(Machine {
