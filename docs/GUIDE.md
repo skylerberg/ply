@@ -3188,6 +3188,13 @@ loads and selects as usual. `--watch`, `--explain`, `--coverage`, `--mutate`,
 document, `front_end` carries `reused` and `key` for an answer taken back,
 beside the phases of this run, all of it read.
 
+Where a load ran, the `--json` documents of `ply check`, `ply test` and
+`ply prove` also say under `front_end` what the memo store gave it: `queries`,
+each query the load asked with the answers it took as kept (`taken`) and the
+bodies it ran (`run`), and `vouched`, whether the store held, when the load
+opened it, a record it vouches for to this `ply`. A store that vouches while a
+load runs bodies and takes nothing is one whose answers were not found.
+
 A load that checked has not yet run a tagged literal's parser, its `literal` or the
 `compile` of one with holes (§2.3). `ply check`,
 `ply run`, `ply test`, `ply build` and `ply prove` settle the literals of the

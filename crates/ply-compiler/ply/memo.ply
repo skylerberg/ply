@@ -80,7 +80,8 @@ pub type Query<| e> = {
 /// many it ran the body for. While the run settles marks, `marked` holds the records it marked whose
 /// marks are still to settle, lowest first. `offers` holds what a body offered for another key, the
 /// query whose body offered it, the key that body was answering and which of its runs made the
-/// offer; and `runs` how many times the run has run the body under each key.
+/// offer; and `runs` how many times the run has run the body under each key. `vouched` is whether
+/// the store vouched for any record to the run when it started.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
@@ -93,6 +94,7 @@ pub type Run = {
   marked: Map<Int, List<Bytes>>,
   offers: Map<Bytes, Offer>,
   runs: Map<Bytes, Int>,
+  vouched: Bool,
 }
 
 type Offer = { output: Bytes, by: Bytes, from: Bytes, nth: Int }
@@ -110,11 +112,16 @@ fn new_run() -> Run =
     marked: map_new(),
     offers: map_new(),
     runs: map_new(),
+    vouched: false,
   }
 
 /// What the run's driver asked, each read by the digest of what it answered: what an answer made
 /// over them is a function of.
 pub fn asked_reads(run: Run) -> List<Read> = run.asked
+
+/// Whether the store the run started over vouched for any record to it. Where it did, a run that
+/// ran bodies and took no answer was not served what the store holds.
+pub fn vouched_to(run: Run) -> Bool = run.vouched
 
 /// What a run did of one query: answers taken as kept, and bodies run.
 pub type Tally = { query: Bytes, took: Int, ran: Int }
@@ -338,6 +345,9 @@ pub effect memo_keep {
   /// vouches for a record only to a run of the stamp that kept or checked it, and the hash of each
   /// of its `queries`, since a store drops in time the records of queries no run answers under.
   write stamped(stamp: Bytes, queries: List<Bytes>) -> Unit
+  /// Whether the store holds a record it vouches for to the stamp the run named: one a run of
+  /// that stamp kept or checked.
+  read vouches() -> Bool
 }
 
 pub type Answered = { run: Run, output: Bytes }
@@ -524,6 +534,7 @@ pub fn started<| e>(
   queries: Map<Bytes, Query<| e>>,
 ) -> Run / {memo_keep.read, memo_keep.write, abort.raise | e} = {
   memo_keep.stamped(stamp_of(queries), hashes_of(queries));
+  let vouched = memo_keep.vouches();
   fold(memo_keep.places(), (), |_: Unit, s: Seen| {
     seen_now(queries, s.kind, s.at, |id: Bytes| {
       marked_readers(id, map_new());
@@ -533,6 +544,7 @@ pub fn started<| e>(
   });
   settled_marks(queries, {
     ..new_run(),
+    vouched: vouched,
     settling: true,
     marked: queued(map_new(), memo_keep.marked()),
   })
@@ -1259,6 +1271,11 @@ pub fn over_held<a | e>(
               },
             })
           },
+          memo_keep.vouches() -> {
+            let stamp = cell_get(running).stamp;
+            map_fold(cell_get(cell).said, false, |any: Bool, _: Bytes, vs: List<Vouch>|
+              any || fold(vs, false, |b: Bool, v: Vouch| b || v.stamp == stamp))
+          },
         };
         { held: cell_get(cell), value: value }
       } }
@@ -1404,6 +1421,18 @@ test "an answer asked for by its digest is the read an ask makes, and is handed 
   );
   assert_eq(moved.output, b"long 5!");
   assert_eq(moved.executed, 3)
+}
+
+test "a store held in memory vouches to a run of a stamp that kept in it, and to no other" {
+  let vouched_over = |held: Held, hash: Bytes| {
+    let q = test_queries(hash);
+    over_held(held, |_: String| None, |_: Bytes, _: Bytes| Some(b"four"), ||
+      vouched_to(answer(q, started(q), b"length", b"a").run))
+  };
+  let first = vouched_over(nothing_held(), b"h1");
+  assert(!first.value);
+  assert(vouched_over(first.held, b"h1").value);
+  assert(!vouched_over(first.held, b"h2").value)
 }
 
 test "an edit marks the records that read what moved, and what asked them only where it moved" {
