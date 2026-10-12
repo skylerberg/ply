@@ -3,7 +3,7 @@
 //! entered or called, and the label dropped, with what each step answers.
 
 import harness (Here, Shipped, answered, bound_main, compiled_here, first_message, loaded, project,
-                working, write)
+                scratch, working, write)
 import cli.machine (machine, Called, Ended, Held, Options, default_options, unconfigured)
 import compiler.resolve (Diag)
 import std.fs
@@ -50,11 +50,13 @@ fn warns_of_the_open_span(warnings: List<Diag>) -> Unit / {abort.raise} =
     _ -> panic("one warning, not " ++ int_to_string(len(warnings))),
   }
 
-test/nondet "a program loads, binds and enters a program, which answers its value" {
-  let ended = entered("fn main() -> Int = 40 + 2\n", default_options());
-  assert_eq(ended.value, Some(VInt(42)));
-  assert_eq(ended.exit, None);
-  assert(ended.raised == None, Some("the entry raised"))
+test "a program loads, binds and enters a program, which answers its value" {
+  scratch(|| {
+    let ended = entered("fn main() -> Int = 40 + 2\n", default_options());
+    assert_eq(ended.value, Some(VInt(42)));
+    assert_eq(ended.exit, None);
+    assert(ended.raised == None, Some("the entry raised"))
+  })
 }
 
 test/nondet "a nested program may choose the exit code" {
@@ -68,35 +70,35 @@ test/nondet "a nested program may choose the exit code" {
 }
 
 // A raise is a diagnostic value; the outer program does not unwind through it.
-test/nondet "a nested raise is a value, not an unwind" {
-  let ended = entered(
-    "fn main() -> Int / {abort.raise} = panic(\"the inner program's own bug\")\n",
-    default_options(),
-  );
-  assert_eq(ended.exit, None);
-  assert_eq(ended.value, None);
-  match ended.raised {
-    None -> panic("the raise is reported"),
-    Some(r) -> {
-      assert_eq(r.diag.code, b"E0502");
-      assert(
-        bytes_index_of(r.diag.message, b"the inner program's own bug") != None,
-        Some(string_of_bytes_lossy(r.diag.message)),
-      )
-    },
-  }
+test "a nested raise is a value, not an unwind" {
+  scratch(|| {
+    let ended = entered(
+      "fn main() -> Int / {abort.raise} = panic(\"the inner program's own bug\")\n",
+      default_options(),
+    );
+    assert_eq(ended.exit, None);
+    assert_eq(ended.value, None);
+    match ended.raised {
+      None -> panic("the raise is reported"),
+      Some(r) -> {
+        assert_eq(r.diag.code, b"E0502");
+        assert(
+          bytes_index_of(r.diag.message, b"the inner program's own bug") != None,
+          Some(string_of_bytes_lossy(r.diag.message)),
+        )
+      },
+    }
+  })
 }
 
-// What `ply run` reads once the entry is over.
-test/nondet "an entry that left a span open ends with W0609 beside its value" {
-  let ended = entered(leaves_a_span(), hosted_quietly());
-  assert_eq(ended.value, Some(VInt(3)));
-  warns_of_the_open_span(ended.warnings)
-}
-
-test/nondet "a call that left a span open answers W0609 beside its value" {
+// What `ply run` reads once the entry is over, and what a driver reads of a call.
+test/nondet "an entry or a call that left a span open answers W0609 beside its value" {
   project([{ path: "inner.ply", text: leaves_a_span() }]);
   loaded(hosted_quietly());
+  bound_main();
+  let ended = machine.enter[run]();
+  assert_eq(ended.value, Some(VInt(3)));
+  warns_of_the_open_span(ended.warnings);
   bound_main();
   let called = machine.call[run]("inner.main", []);
   machine.drop[run]();
@@ -107,25 +109,27 @@ test/nondet "a call that left a span open answers W0609 beside its value" {
   warns_of_the_open_span(called.warnings)
 }
 
-test/nondet "a reload after an edit enters the new program, and a load files nothing" {
-  project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
-  loaded(default_options());
-  bound_main();
-  assert_eq(machine.enter[run]().value, Some(VInt(1)));
-  assert(
-    fs.kind[cwd](".ply-cache") == fs::Missing,
-    Some("a machine's load reads the program it was handed and files nothing"),
-  );
-  write("inner.ply", "fn main() -> Int = 2\n");
-  let c = compiled_here();
-  match machine.reload[run](c.front, c.library) {
-    Ok(_) -> (),
-    Err(r) -> panic("the edited program reloads: " ++ first_message(r.diags)),
-  };
-  bound_main();
-  let again = machine.enter[run]();
-  machine.drop[run]();
-  assert_eq(again.value, Some(VInt(2)))
+test "a reload after an edit enters the new program, and a load files nothing" {
+  scratch(|| {
+    project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
+    loaded(default_options());
+    bound_main();
+    assert_eq(machine.enter[run]().value, Some(VInt(1)));
+    assert(
+      fs.kind[cwd](".ply-cache") == fs::Missing,
+      Some("a machine's load reads the program it was handed and files nothing"),
+    );
+    write("inner.ply", "fn main() -> Int = 2\n");
+    let c = compiled_here();
+    match machine.reload[run](c.front, c.library) {
+      Ok(_) -> (),
+      Err(r) -> panic("the edited program reloads: " ++ first_message(r.diags)),
+    };
+    bound_main();
+    let again = machine.enter[run]();
+    machine.drop[run]();
+    assert_eq(again.value, Some(VInt(2)))
+  })
 }
 
 // `configure` before `load`: a configured `--host` binds the nested program's host, and a `drop`
@@ -159,61 +163,65 @@ test/nondet "a configured machine binds what its options say, and a drop forgets
 fn int_of(called: Called) -> Int =
   match called.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
 
-test/nondet "a call enters a definition with its arguments, and what it spent is read once" {
-  project([
-    {
-      path: "inner.ply",
-      text: "fn main() -> Int = 0\n\npub fn double(x: Int) -> Int = x * 2\n\npub fn boom() -> Int / {abort.raise} = panic(\"oh no\")\n",
-    },
-  ]);
-  loaded(default_options());
-  bound_main();
-  assert_eq(int_of(machine.call[run]("inner.double", [VInt(21)])), 42);
-  let first = machine.accounting[run]();
-  let again = machine.accounting[run]();
-  let raised = machine.call[run]("inner.boom", []);
-  let after_raised = machine.accounting[run]();
-  machine.drop[run]();
-  assert(first.steps > 0, Some("the call's steps were not counted"));
-  assert_eq(again.steps, 0);
-  match raised.answer {
-    Ok(_) -> panic("`boom` answered"),
-    Err(r) ->
-      assert(
-        bytes_index_of(r.diag.message, b"oh no") != None,
-        Some(string_of_bytes_lossy(r.diag.message)),
-      ),
-  };
-  assert(after_raised.steps > 0, Some("the raising call's steps were not counted"))
+test "a call enters a definition with its arguments, and what it spent is read once" {
+  scratch(|| {
+    project([
+      {
+        path: "inner.ply",
+        text: "fn main() -> Int = 0\n\npub fn double(x: Int) -> Int = x * 2\n\npub fn boom() -> Int / {abort.raise} = panic(\"oh no\")\n",
+      },
+    ]);
+    loaded(default_options());
+    bound_main();
+    assert_eq(int_of(machine.call[run]("inner.double", [VInt(21)])), 42);
+    let first = machine.accounting[run]();
+    let again = machine.accounting[run]();
+    let raised = machine.call[run]("inner.boom", []);
+    let after_raised = machine.accounting[run]();
+    machine.drop[run]();
+    assert(first.steps > 0, Some("the call's steps were not counted"));
+    assert_eq(again.steps, 0);
+    match raised.answer {
+      Ok(_) -> panic("`boom` answered"),
+      Err(r) ->
+        assert(
+          bytes_index_of(r.diag.message, b"oh no") != None,
+          Some(string_of_bytes_lossy(r.diag.message)),
+        ),
+    };
+    assert(after_raised.steps > 0, Some("the raising call's steps were not counted"))
+  })
 }
 
 // A driver totals each entry's own steps: a memo's answer and a declined call add none, so a
 // constant run and then answered from the memo costs one run of its body, not two.
-test/nondet "a memo's answer and a declined call add no steps to the accounting" {
-  project([
-    {
-      path: "inner.ply",
-      text: "fn main() -> Int = 0\n\nfn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }\n\npub fn constant() -> Int = deep(50)\n\npub fn twin() -> Int = deep(50)\n",
-    },
-  ]);
-  loaded(default_options());
-  bound_main();
-  let spent = || machine.accounting[run]().steps;
-  assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
-  let ran = spent();
-  assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
-  let remembered = spent();
-  assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
-  assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
-  let both = spent();
-  // A name the program never defined is declined, which the machine answers as a raise.
-  assert_eq(int_of(machine.call[run]("inner.absent", [])), 0 - 1);
-  let declined = spent();
-  machine.drop[run]();
-  assert(ran > 0, Some("the first call's steps were not counted"));
-  assert_eq(remembered, 0);
-  assert_eq(both, ran);
-  assert_eq(declined, 0)
+test "a memo's answer and a declined call add no steps to the accounting" {
+  scratch(|| {
+    project([
+      {
+        path: "inner.ply",
+        text: "fn main() -> Int = 0\n\nfn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }\n\npub fn constant() -> Int = deep(50)\n\npub fn twin() -> Int = deep(50)\n",
+      },
+    ]);
+    loaded(default_options());
+    bound_main();
+    let spent = || machine.accounting[run]().steps;
+    assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
+    let ran = spent();
+    assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
+    let remembered = spent();
+    assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
+    assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
+    let both = spent();
+    // A name the program never defined is declined, which the machine answers as a raise.
+    assert_eq(int_of(machine.call[run]("inner.absent", [])), 0 - 1);
+    let declined = spent();
+    machine.drop[run]();
+    assert(ran > 0, Some("the first call's steps were not counted"));
+    assert_eq(remembered, 0);
+    assert_eq(both, ran);
+    assert_eq(declined, 0)
+  })
 }
 
 /// The calls `fib(n)` makes, itself included.

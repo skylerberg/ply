@@ -19,7 +19,7 @@ import compiler.unit (shipped)
 import compiler.front (module_of)
 import compiler.load
 import compiler.resolve (Diag)
-import cli.hosts (tcb, hermetic_tcb)
+import cli.hosts (hosts, hermetic_hosts)
 import cli.machine (machine, hermetic_machine, Options, unconfigured)
 import cli.replace (edit)
 import cli.tester (tester, hermetic_tester)
@@ -566,9 +566,9 @@ pub fn kept_in_memory(
 }
 
 /// Written out, so an operation `main` gains and `over_tree` misses is a type error, not a disk read.
-pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], tcb.preview[host], machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.filed[run], machine.reload[run], machine.schema[run], machine.bound[run], machine.enter[run], machine.drop[run], machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], tester.read[corpus], tester.write[corpus], prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
+pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], hosts.preview[host], machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.filed[run], machine.reload[run], machine.schema[run], machine.bound[run], machine.enter[run], machine.call[run], machine.accounting[run], machine.drop[run], machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], tester.read[corpus], tester.write[corpus], prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
 
-pub effect set Hermetic = {hermetic_tester.read[corpus], hermetic_tester.write[corpus], hermetic_prover.read[claims], hermetic_prover.write[claims], hermetic_tcb.read[host], hermetic_machine.configure[run], hermetic_machine.load[run], hermetic_machine.opened[run], hermetic_machine.reuse[run], hermetic_machine.filed[run], hermetic_machine.reload[run], hermetic_machine.schema[run], hermetic_machine.bound[run], hermetic_machine.enter[run], hermetic_machine.drop[run], hermetic_machine.configure[literals], hermetic_machine.load[literals], hermetic_machine.bound[literals], hermetic_machine.call[literals], hermetic_machine.drop[literals]}
+pub effect set Hermetic = {hermetic_tester.read[corpus], hermetic_tester.write[corpus], hermetic_prover.read[claims], hermetic_prover.write[claims], hermetic_hosts.read[host], hermetic_machine.configure[run], hermetic_machine.load[run], hermetic_machine.opened[run], hermetic_machine.reuse[run], hermetic_machine.filed[run], hermetic_machine.reload[run], hermetic_machine.schema[run], hermetic_machine.bound[run], hermetic_machine.enter[run], hermetic_machine.call[run], hermetic_machine.accounting[run], hermetic_machine.drop[run], hermetic_machine.configure[literals], hermetic_machine.load[literals], hermetic_machine.bound[literals], hermetic_machine.call[literals], hermetic_machine.drop[literals]}
 
 /// The test's working directory, the checkout the tests run from, `ply` run as a process with the
 /// environment it inherits, the connections a test makes to a server it started, and the wall clock
@@ -732,8 +732,8 @@ pub fn over_tree<a | e>(
         time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
         process.bound[git]() -> false,
         process.spawn[git](args, dir, vars) -> panic(no_machine("`git`")),
-        tcb.preview[host](root, options, front, config) ->
-          hermetic_tcb.preview[host](root, options, front, config),
+        hosts.preview[host](root, options, front, config) ->
+          hermetic_hosts.preview[host](root, options, front, config),
         machine.configure[run](o) -> hermetic_machine.configure[run](o),
         machine.load[run](root, front, unit) -> hermetic_machine.load[run](root, front, unit),
         machine.opened[run](path, runnable, entry, closure, names, library) ->
@@ -744,6 +744,8 @@ pub fn over_tree<a | e>(
         machine.schema[run](name) -> hermetic_machine.schema[run](name),
         machine.bound[run](entry, config) -> hermetic_machine.bound[run](entry, config),
         machine.enter[run]() -> hermetic_machine.enter[run](),
+        machine.call[run](name, args) -> hermetic_machine.call[run](name, args),
+        machine.accounting[run]() -> hermetic_machine.accounting[run](),
         machine.drop[run]() -> hermetic_machine.drop[run](),
         machine.configure[literals](o) -> hermetic_machine.configure[literals](o),
         machine.load[literals](root, front, unit) ->
@@ -816,7 +818,10 @@ fn input_lines(stdin: Option<String>) -> List<String> / {abort.raise} =
 
 /// `ply` in the working directory, bound as the launcher binds it: `cwd` and `abs` are the run's
 /// own roots and every family a command drives a machine with is lent by `--allow`. The streams,
-/// the environment, the text `ply replace` reads and the shipped modules are the harness's.
+/// the environment, the text `ply replace` reads and the shipped modules are the harness's. The
+/// command is this suite's own copy of the CLI, compiled as a test is and keeping no emitter answer
+/// from one test to the next, so a program that imports much of the library loads far slower here
+/// than under `spawned`.
 pub fn on_disk(argv: List<String>) -> Ran / {Reached, Shipped, abort.raise, diverges} =
   on_disk_with(argv, [], None)
 
@@ -914,10 +919,12 @@ fn on_disk_over(
 
 // --- As a process ------------------------------------------------------------
 
-/// What a `ply` child inherits of this run's environment: where the toolchain is found and where
-/// caches default to, and nothing else, so no variable in the shell that started the run decides
-/// what a test asserts.
-fn inherited() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP"]
+/// What a `ply` child inherits of this run's environment: where the toolchain is found, where caches
+/// default to and where this run was told to keep its own, so a child takes the emitter answers
+/// the run already holds, and nothing else, so no variable in the shell that started the run
+/// decides what a test asserts.
+fn inherited() -> List<String> =
+  ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE", "PLY_C_STAGE"]
 
 pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
   fold(inherited(), vars, |acc: List<Var>, name: String|

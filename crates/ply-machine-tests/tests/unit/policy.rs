@@ -6,7 +6,6 @@ use ply_machine::policy;
 fn own(effect: &str) -> String {
     match effect {
         "prover" => "claims",
-        "tcb" => "hosts",
         "shipped" => "compiler.unit",
         other => other,
     }

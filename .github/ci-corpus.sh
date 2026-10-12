@@ -351,7 +351,7 @@ case "${1:-}" in
     ;;
   compact)
     marked || exit 2
-    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/tests/lang; do
+    for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/examples "$root"/tests/lang; do
       [ -d "$dir/.ply-cache" ] || continue
       # A `ply` that opens a store makes a directory of its own in it, so one nothing here is newer
       # than the mark in was opened by no run of this job.
