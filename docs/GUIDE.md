@@ -390,14 +390,14 @@ Definitions may refer to each other and recurse across the whole program.
 ```ply
 type Account = { name: String, balance: Int }
 
-fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account {
+fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account = {
   let moved = a.balance + amount;
   {name: a.name, balance: moved}
 }
 ```
 
-A body is `= expression`, or a block with no `=`. There is no `return`. A body
-that binds is written as a block: `fn f() -> Int = { let x = 1; x }`, never
+A body is `= expression`. There is no `return`. A body that binds is written
+as a block: `fn f() -> Int = { let x = 1; x }`, never
 `fn f() -> Int = let x = 1; x`, which does not parse — a `let` statement is not
 an expression. Every parameter and return type of a top-level `fn` must be
 written (`E0126`, which names the inferred type). A parameter the body never
