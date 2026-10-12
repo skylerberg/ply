@@ -85,54 +85,43 @@ impl Default for TestOptions {
     }
 }
 
-/// One process's tester: every iteration of a watching run is lent the same one, so the cache and
-/// the last compiled program outlive the report that opened them.
-pub struct Session(Arc<TesterHandler>);
-
-impl Session {
-    pub fn new() -> Session {
-        Session::of(false)
-    }
-
-    /// Binds no host, reads no clock, builds every unit afresh and measures nothing.
-    pub fn hermetic() -> Session {
-        Session::of(true)
-    }
-
-    fn of(hermetic: bool) -> Session {
-        Session(Arc::new(TesterHandler {
-            hermetic,
-            options: Mutex::new(TestOptions::default()),
-            run: RwLock::new(Run::default()),
-        }))
-    }
-
-    pub fn lent(&self) -> Vec<LentOp> {
-        let handler: Arc<dyn HostHandler> = Arc::clone(&self.0) as Arc<dyn HostHandler>;
-        let (effect, operations) = if self.0.hermetic {
-            (HERMETIC, HERMETIC_OPERATIONS)
-        } else {
-            (EFFECT, OPERATIONS)
-        };
-        // A watching run asks for report after report from inside one entry.
-        operations
-            .into_iter()
-            .map(|(op, path)| {
-                let op = if self.0.hermetic {
-                    crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
-                } else {
-                    crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
-                };
-                (op, Arc::clone(&handler))
-            })
-            .collect()
-    }
+/// Both halves' operations. `tester` is one for the process, so a watching run's cache and last
+/// compiled program outlive the report that opened them; `hermetic_tester` binds no host, reads no
+/// clock, builds every unit afresh and measures nothing.
+pub fn lent() -> Vec<LentOp> {
+    let mut ops = lent_by(false);
+    ops.extend(lent_by(true));
+    ops
 }
 
-impl Default for Session {
-    fn default() -> Session {
-        Session::new()
-    }
+fn lent_by(hermetic: bool) -> Vec<LentOp> {
+    let made = move || TesterHandler {
+        hermetic,
+        options: Mutex::new(TestOptions::default()),
+        run: RwLock::new(Run::default()),
+    };
+    let handler: Arc<dyn HostHandler> = if hermetic {
+        crate::hosts::Apart::of(made)
+    } else {
+        Arc::new(made())
+    };
+    let (effect, operations) = if hermetic {
+        (HERMETIC, HERMETIC_OPERATIONS)
+    } else {
+        (EFFECT, OPERATIONS)
+    };
+    // A watching run asks for report after report from inside one entry.
+    operations
+        .into_iter()
+        .map(|(op, path)| {
+            let op = if hermetic {
+                crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
+            } else {
+                crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
+            };
+            (op, Arc::clone(&handler))
+        })
+        .collect()
 }
 
 struct TesterHandler {
