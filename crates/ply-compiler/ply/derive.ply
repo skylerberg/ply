@@ -325,6 +325,8 @@ type DeriveEmitter = {
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  /// Whether each function of a codec on the cycle is a definition of its own.
+  by_function: Bool,
   json: Bytes,
 }
 
@@ -335,13 +337,23 @@ fn emitter(
   aliases: List<Alias>,
   path: Bytes,
   cycle: List<Bytes>,
+  by_function: Bool,
   json: Bytes,
 ) -> DeriveEmitter / {abort.raise} = {
   let b = iterate(b"d", len(params) + 2, |x: Bytes|
     if fold(params, false, |acc: Bool, ident: Ident| acc || bytes_starts_with(ident.name, x)) {
       Continue(bytes_concat(x, b"_"))
     } else { Stop(x) });
-  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle, json: json }
+  {
+    d: deriver,
+    rt: rt,
+    b: b,
+    aliases: aliases,
+    path: path,
+    cycle: cycle,
+    by_function: by_function,
+    json: json,
+  }
 }
 
 fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
@@ -371,10 +383,16 @@ fn literal(members: List<Member>) -> Bytes =
     b"}",
   ])
 
-/// A codec off every cycle is one definition, its dictionary. One on a cycle is each of its
-/// functions as a definition that takes how much deeper it may nest and calls its cycle's by name
-/// with one less, so the recursion is seen to end and no level makes a dictionary; `_at` is their
-/// dictionary at a depth, and the named one is `_at` at the runtime's `max_depth`.
+/// A codec off every cycle is one definition, its dictionary. One on a cycle takes how much deeper
+/// it may nest and hands its cycle one less, so the recursion is seen to end. By function, each of
+/// its functions is a definition that calls its cycle's by name, so no level makes a dictionary,
+/// and the named one hands each to its definition at the runtime's `max_depth`. Otherwise it is
+/// two definitions: the named one starts `_at` at `max_depth`.
+///
+/// Only a `bin` codec whose cycle takes no type parameter is written by function. A function that
+/// hands another codec the whole codec of its cycle calls every function of it, so the definitions
+/// are one recursive group, whose members may not call each other where they take type parameters;
+/// `std.json` takes whole codecs throughout.
 fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise} = {
   let name = generated_name(emitter.d, def.name.name);
   let target = target_type(def);
@@ -400,24 +418,39 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise
   let dict = dict_type(emitter, target);
   if len(emitter.cycle) == 0 {
     [bytes_concat_all([vis, head(name, dicts, dict), dictionary(emitter, def, target)])]
+  } else if !emitter.by_function {
+    let at_name = bytes_concat(name, b"_at");
+    [
+      bytes_concat_all([
+        vis,
+        head(name, dicts, dict),
+        at_name,
+        b"(",
+        join(push(ps, bytes_concat(emitter.rt, b"max_depth()")), b", "),
+        b")",
+      ]),
+      bytes_concat_all([
+        head(at_name, push(dicts, bytes_concat(emitter.b, b"depth: Int")), dict),
+        b"if ",
+        emitter.b,
+        b"depth <= 0 {",
+        emitter.rt,
+        b"too_deep()} else {",
+        dictionary(emitter, def, target),
+        b"}",
+      ]),
+    ]
   } else {
     let depth = bytes_concat(emitter.b, b"depth");
     let deep = push(dicts, bytes_concat(depth, b": Int"));
-    let at_name = bytes_concat(name, b"_at");
     let members = cycle_members(emitter, def, target);
     let function = |m: Member| bytes_concat_all([name, b"_", m.name]);
+    let deepest = push(ps, bytes_concat(emitter.rt, b"max_depth()"));
     concat(
       [
         bytes_concat_all([
           vis,
           head(name, dicts, dict),
-          at_name,
-          b"(",
-          join(push(ps, bytes_concat(emitter.rt, b"max_depth()")), b", "),
-          b")",
-        ]),
-        bytes_concat_all([
-          head(at_name, deep, dict),
           b"{",
           join(
             map(members, |m: Member|
@@ -428,7 +461,7 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise
                 b"| ",
                 function(m),
                 b"(",
-                join(concat(push(ps, depth), param_names(m)), b", "),
+                join(concat(deepest, param_names(m)), b", "),
                 b")",
               ])),
             b", ",
@@ -538,7 +571,7 @@ fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {a
     _ -> b"()",
   }
 
-/// The functions of the codec of `def`, a type on a cycle.
+/// The functions of the `bin` codec of `def`, a type on a cycle.
 fn cycle_members(
   emitter: DeriveEmitter,
   def: TypeDef,
@@ -547,37 +580,29 @@ fn cycle_members(
   match def.body {
     TDAlias(body) -> aliased_members(emitter, body, target),
     TDNominal(body) -> aliased_members(emitter, body, target),
-    TDSum(variants) -> match emitter.d {
-      DBin -> bin_sum(emitter, def, variants, target),
-      _ -> json_sum(emitter, variants, target),
-    },
+    TDSum(variants) -> bin_sum(emitter, def, variants, target),
   }
 
-/// The functions of the codec of a type on a cycle that is written as `body`.
+/// The functions of the `bin` codec of a type on a cycle that is written as `body`.
 fn aliased_members(
   emitter: DeriveEmitter,
   body: TypeExpr,
   target: Bytes,
 ) -> List<Member> / {abort.raise} =
   match body {
-    TRecord(r) -> record_members(emitter, r.fields, target),
-    _ -> match emitter.d {
-      DBin ->
-        bin_members(
-          emitter,
-          target,
-          bin_put(emitter, body, bytes_concat(emitter.b, b"w"), bytes_concat(emitter.b, b"v")),
-          bin_take(emitter, body, bytes_concat(emitter.b, b"n"), b""),
-          bytes_concat_all([b"(", codec(emitter, body, target), b".shape)(", emitter.b, b"s)"]),
-        ),
-      _ ->
-        json_members(
-          emitter,
-          target,
-          json_encode(emitter, body, bytes_concat(emitter.b, b"v")),
-          json_decode(emitter, body, bytes_concat(emitter.b, b"j")),
-        ),
-    },
+    TRecord(r) -> bin_record(emitter, r.fields, target),
+    _ ->
+      bin_members(
+        emitter,
+        target,
+        bin_put(emitter, body, bytes_concat(emitter.b, b"w"), bytes_concat(emitter.b, b"v")),
+        bin_take(emitter, body, bytes_concat(emitter.b, b"n"), b""),
+        match cycle_call(emitter, body, b"shape", [bytes_concat(emitter.b, b"s")]) {
+          Some(call) -> call,
+          None ->
+            bytes_concat_all([b"(", codec(emitter, body, target), b".shape)(", emitter.b, b"s)"]),
+        },
+      ),
   }
 
 fn record_members(
@@ -651,7 +676,7 @@ pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abo
     Some(def) -> match row_fields(def) {
       None -> None,
       Some(fields) -> {
-        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], b"");
+        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], false, b"");
         Some(
           map(fields, |f: { name: Ident, ty: TypeExpr }|
             { name: f.name.name, read: row_read(e, f.ty, 8) }),
@@ -809,7 +834,8 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
         match constructor_shape(emitter.d, simple) {
           Nominal -> match c.name.module {
             Some(m) -> bytes_concat_all([m.name, b"::", call]),
-            None -> if contains(emitter.cycle, simple) {
+            None -> if !contains(emitter.cycle, simple) { call }
+            else if emitter.by_function { forwarded(emitter, te) } else {
               bytes_concat_all([
                 snake_case(simple),
                 b"_",
@@ -818,7 +844,7 @@ fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {ab
                 join(push(codecs, bytes_concat(emitter.b, b"depth - 1")), b", "),
                 b")",
               ])
-            } else { call },
+            },
           },
           _ -> bytes_concat(emitter.rt, call),
         }
@@ -842,9 +868,30 @@ fn is_string(emitter: DeriveEmitter, ty: TypeExpr) -> Bool / {abort.raise} =
       }
     })
 
-/// Whether `te` is a type of this module's on the target's cycle.
+/// The `bin` codec of `te`, a type on the target's cycle written by function, one level deeper:
+/// each of its functions handed to the definition of that name.
+fn forwarded(emitter: DeriveEmitter, te: TypeExpr) -> Bytes / {abort.raise} = {
+  let call = |member: Bytes, args: List<Bytes>|
+    match cycle_call(emitter, te, member, args) { Some(c) -> c, None -> b"()" };
+  let named = |x: Bytes| bytes_concat(emitter.b, x);
+  literal(
+    bin_members(
+      emitter,
+      render_type(te),
+      call(b"put", [named(b"w"), named(b"v")]),
+      call(b"take", [named(b"d"), named(b"n")]),
+      call(b"shape", [named(b"s")]),
+    ),
+  )
+}
+
+/// Whether `te` is a type of this module's on the target's cycle whose codec's functions are
+/// definitions.
 fn on_cycle(emitter: DeriveEmitter, te: TypeExpr) -> Bool =
-  match te { TCon(c) -> is_bare(c.name) && contains(emitter.cycle, c.name.name.name), _ -> false }
+  match te {
+    TCon(c) -> emitter.by_function && is_bare(c.name) && contains(emitter.cycle, c.name.name.name),
+    _ -> false,
+  }
 
 /// The call of `member` of the codec of `te` on `args`, where `te` is on the target's cycle: its
 /// definition by name, one level deeper, and no dictionary made for it.
@@ -898,17 +945,7 @@ fn json_members(
 fn json_encode(emitter: DeriveEmitter, te: TypeExpr, x: Bytes) -> Bytes / {abort.raise} =
   match te {
     TRecord(r) -> json_object(emitter, r.fields, x),
-    _ -> match cycle_call(emitter, te, b"encode", [x]) {
-      Some(call) -> call,
-      None -> bytes_concat_all([b"(", codec(emitter, te, render_type(te)), b".encode)(", x, b")"]),
-    },
-  }
-
-/// The document `j` read as the type `te`.
-fn json_decode(emitter: DeriveEmitter, te: TypeExpr, j: Bytes) -> Bytes / {abort.raise} =
-  match cycle_call(emitter, te, b"decode", [j]) {
-    Some(call) -> call,
-    None -> bytes_concat_all([b"(", codec(emitter, te, render_type(te)), b".decode)(", j, b")"]),
+    _ -> bytes_concat_all([b"(", codec(emitter, te, render_type(te)), b".encode)(", x, b")"]),
   }
 
 fn json_object(
@@ -932,14 +969,6 @@ fn json_object(
     ),
     b"])",
   ])
-
-/// How a document is read as the type `te`, as a function.
-fn json_decoder(emitter: DeriveEmitter, te: TypeExpr) -> Bytes / {abort.raise} = {
-  let j = bytes_concat(emitter.b, b"j");
-  if on_cycle(emitter, te) {
-    bytes_concat_all([b"|", j, b": ", emitter.rt, b"Json| ", json_decode(emitter, te, j)])
-  } else { bytes_concat(codec(emitter, te, render_type(te)), b".decode") }
-}
 
 fn json_record(
   emitter: DeriveEmitter,
@@ -1046,8 +1075,8 @@ fn json_sum(
             b"t, ",
             ascii_of_int(i),
             b"), ",
-            json_decoder(emitter, at(v.fields, i)),
-            b") {Err(",
+            codec(emitter, at(v.fields, i), render_type(at(v.fields, i))),
+            b".decode) {Err(",
             emitter.b,
             b"e) -> Err(",
             emitter.b,
@@ -1314,8 +1343,18 @@ fn record_take(
   )
 }
 
+/// The shape of the type `ty` as a function of the shapes walked: a type on the cycle by its
+/// definition, one level deeper.
+fn bin_shape(emitter: DeriveEmitter, ty: TypeExpr) -> Bytes / {abort.raise} = {
+  let s = bytes_concat(emitter.b, b"s");
+  match cycle_call(emitter, ty, b"shape", [s]) {
+    Some(call) -> bytes_concat_all([b"|", s, b": ", emitter.rt, b"Shapes| ", call]),
+    None -> bytes_concat(codec(emitter, ty, render_type(ty)), b".shape"),
+  }
+}
+
 fn shapes_of(emitter: DeriveEmitter, tys: List<TypeExpr>) -> Bytes / {abort.raise} =
-  join(map(tys, |ty: TypeExpr| bytes_concat(codec(emitter, ty, render_type(ty)), b".shape")), b", ")
+  join(map(tys, |ty: TypeExpr| bin_shape(emitter, ty)), b", ")
 
 fn bin_record(
   emitter: DeriveEmitter,
@@ -1324,13 +1363,7 @@ fn bin_record(
 ) -> List<Member> / {abort.raise} = {
   let v = bytes_concat(emitter.b, b"v");
   let shapes = map(fields, |f: { name: Ident, ty: TypeExpr }|
-    bytes_concat_all([
-      b"{name: \"",
-      f.name.name,
-      b"\", shape: ",
-      codec(emitter, f.ty, render_type(f.ty)),
-      b".shape}",
-    ]));
+    bytes_concat_all([b"{name: \"", f.name.name, b"\", shape: ", bin_shape(emitter, f.ty), b"}"]));
   bin_members(
     emitter,
     annotation,
@@ -1946,6 +1979,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
                     ex1.aliases,
                     ex1.path,
                     cycle,
+                    same_deriver(def.deriver, DBin) && !takes_parameter(ex1.types, cycle),
                     documents,
                   ),
                   target,
@@ -1981,9 +2015,11 @@ fn documents_prefix(
   target: TypeDef,
 ) -> WithPrefix / {abort.raise} =
   if !same_deriver(def.deriver, DRow)
-      || !row_wants_json(emitter(DRow, b"", [], expander.aliases, expander.path, [], b""), target) {
-    { ex: expander, prefix: Some(b"") }
-  } else { runtime_prefix(expander, { ..def, deriver: DJson }) }
+      || !row_wants_json(
+        emitter(DRow, b"", [], expander.aliases, expander.path, [], false, b""),
+        target,
+      ) { { ex: expander, prefix: Some(b"") } }
+  else { runtime_prefix(expander, { ..def, deriver: DJson }) }
 
 /// Parsing what was just printed is the deriver's own round-trip check.
 fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
@@ -2057,6 +2093,11 @@ fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
     fold(seen, seen, |acc: List<Bytes>, n: Bytes|
       fold(callees(calls, n), acc, |more: List<Bytes>, m: Bytes|
         if contains(more, m) { more } else { push(more, m) })))
+
+/// Whether a type named in `cycle` takes a type parameter.
+fn takes_parameter(types: List<TypeDef>, cycle: List<Bytes>) -> Bool =
+  fold(cycle, false, |acc: Bool, name: Bytes|
+    acc || (match find_type(types, name) { Some(t) -> len(t.generics.types) > 0, None -> false }))
 
 /// Empty unless `target`'s codec calls itself, through any of the others.
 fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
@@ -2359,7 +2400,7 @@ test "the bin form writes scalars straight, composes the rest, and keys a sum by
   );
   assert_eq(
     at(out, 1),
-    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = tree_bin_at(a, bin::max_depth())\nfn tree_bin_at<a>(a: bin::BinCodec<a>, ddepth: Int) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = {put: |dw: Bytes, dv: Tree<a>| tree_bin_put(a, ddepth, dw, dv), take: |dd: Bytes, dn: Int| tree_bin_take(a, ddepth, dd, dn), shape: |ds: bin::Shapes| tree_bin_shape(a, ddepth, ds)}\nfn tree_bin_put<a>(a: bin::BinCodec<a>, ddepth: Int, dw: Bytes, dv: Tree<a>) -> Bytes / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().put)(dw, dv)} else {match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)(tree_bin_put(a, ddepth - 1, bin::put_tag(dw, 1), d0), d1)}}\nfn tree_bin_take<a>(a: bin::BinCodec<a>, ddepth: Int, dd: Bytes, dn: Int) -> Result<bin::Taken<Tree<a>>, bin::BinError> / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().take)(dd, dn)} else {match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match tree_bin_take(a, ddepth - 1, dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}}\nfn tree_bin_shape<a>(a: bin::BinCodec<a>, ddepth: Int, ds: bin::Shapes) -> bin::Shaped / {abort.raise} where derivable(bin, a) = if ddepth <= 0 {(bin::too_deep().shape)(ds)} else {bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin_at(a, ddepth - 1).shape, a.shape]}])}",
+    b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = tree_bin_at(a, bin::max_depth())\nfn tree_bin_at<a>(a: bin::BinCodec<a>, ddepth: Int) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = if ddepth <= 0 {bin::too_deep()} else {{put: |dw: Bytes, dv: Tree<a>| match dv {Leaf -> bin::put_tag(dw, 0), Node(d0, d1) -> (a.put)((tree_bin_at(a, ddepth - 1).put)(bin::put_tag(dw, 1), d0), d1)}, take: |dd: Bytes, dn: Int| match bin::take_tag(dd, dn, 2) {Err(de) -> Err(de), Ok(dt) -> match dt.value {0 -> Ok({value: Leaf, at: dt.at}), _ -> match (tree_bin_at(a, ddepth - 1).take)(dd, dt.at) {Err(de) -> Err(de), Ok(d0) -> match (a.take)(dd, d0.at) {Err(de) -> Err(de), Ok(d1) -> Ok({value: Node(d0.value, d1.value), at: d1.at})}}}}, shape: |ds: bin::Shapes| bin::sum_shape(ds, \"shop.Tree\", \"Tree\", [a.shape], [{name: \"Leaf\", fields: []}, {name: \"Node\", fields: [tree_bin_at(a, ddepth - 1).shape, a.shape]}])}}",
   )
 }
 
@@ -2425,7 +2466,7 @@ test "a bin codec on a cycle calls its cycle by name through a list, and reads a
   );
   let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.diags), 0);
-  assert_eq(len(x.module.items), 4 + 5 + 5)
+  assert_eq(len(x.module.items), 4 + 4 + 4)
 }
 
 test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
@@ -2436,27 +2477,23 @@ test "a codec on a cycle hands the cycle one depth less, and calls a codec off i
   assert(
     bytes_starts_with(
       expr,
-      b"fn expr_json() -> json::JsonCodec<Expr> = expr_json_at(json::max_depth())\nfn expr_json_at(ddepth: Int) -> json::JsonCodec<Expr> = {encode: |dv: Expr| expr_json_encode(ddepth, dv), decode: |dj: json::Json| expr_json_decode(ddepth, dj)}\nfn expr_json_encode(ddepth: Int, dv: Expr) -> json::Json / {abort.raise} = if ddepth <= 0 {(json::too_deep().encode)(dv)} else {match dv {",
+      b"fn expr_json() -> json::JsonCodec<Expr> = expr_json_at(json::max_depth())\nfn expr_json_at(ddepth: Int) -> json::JsonCodec<Expr> = if ddepth <= 0 {json::too_deep()} else {{encode:",
     ),
   );
   assert(bytes_index_of(expr, b"json::list_json(stmt_json_at(ddepth - 1))") != None);
   assert(bytes_index_of(expr, b"(literal_json().encode)") != None);
   assert(bytes_index_of(expr, b"json::has_tag(dt, \"Num\")") != None);
   assert(bytes_index_of(at(out, 2), b"dt.tag == \"Text\"") != None);
-  assert(bytes_index_of(at(out, 1), b"value: expr_json_encode(ddepth - 1, d0.value)}") != None);
   assert(
-    bytes_index_of(
-        at(out, 1),
-        b"json::decode_and_then(json::variant_value(dt, 0), |dj: json::Json| expr_json_decode(ddepth - 1, dj))",
-      )
-      != None,
+    bytes_index_of(at(out, 1), b"value: (expr_json_at(ddepth - 1).encode)(d0.value)}") != None,
   );
-  assert(bytes_index_of(at(out, 2), b"_at") == None);
-  assert(bytes_index_of(at(out, 3), b"_at") == None);
+  // A type off the cycle, and a derivation that is no codec, are one definition each.
+  assert(bytes_index_of(at(out, 2), b"\nfn ") == None);
+  assert(bytes_index_of(at(out, 3), b"\nfn ") == None);
   let x = expand_derives(0, b"t", parse(src).node);
   assert_eq(len(x.diags), 0);
   assert_eq(len(x.derived), 4);
-  assert_eq(len(x.module.items), 7 + 4 + 4 + 1 + 1)
+  assert_eq(len(x.module.items), 7 + 2 + 2 + 1 + 1)
 }
 
 test "a selective import of std.json still writes a module binder, stepping around a taken name" {
