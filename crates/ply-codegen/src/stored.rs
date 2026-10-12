@@ -6,8 +6,8 @@
 
 use crate::heap::{
     self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
-    KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT, Layouts, Word,
-    bridged, bytes_of, is_imm, obj, set_word, word_at,
+    KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, KIND_UNIT,
+    Layouts, Word, bridged, bytes_of, is_imm, obj, set_word, word_at,
 };
 use crate::{array, list, map};
 use ply_eval::Symbol;
@@ -36,6 +36,8 @@ const LIST_WORDS: u8 = 14;
 const ARRAY_WORDS: u8 = 15;
 const FLOAT: u8 = 16;
 const CHAR: u8 = 17;
+/// A 64- or 128-bit width: its place in `INT_TYPES`, then its bits, eight bytes or sixteen.
+const FIXED: u8 = 18;
 
 /// The text of `w`, which it reads: lowercase hex, so a C string literal holds it as it is.
 pub fn text(layouts: &Layouts, w: Word) -> Result<Vec<u8>, String> {
@@ -106,6 +108,8 @@ enum Pending {
     Done(usize),
     /// A record's word that holds a `Float`'s bits, written as a `Float` of its own.
     Raw(Word),
+    /// A record's word that holds a 64-bit width's bits, written as that width's value.
+    Wide(Word, u8),
 }
 
 struct Writer<'l> {
@@ -141,6 +145,12 @@ impl<'l> Writer<'l> {
                 }
                 Pending::Raw(bits) => {
                     self.out.push(FLOAT);
+                    self.out.extend_from_slice(&bits.to_le_bytes());
+                    self.places += 1;
+                }
+                Pending::Wide(bits, t) => {
+                    self.out.push(FIXED);
+                    self.out.push(t);
                     self.out.extend_from_slice(&bits.to_le_bytes());
                     self.places += 1;
                 }
@@ -184,6 +194,15 @@ impl<'l> Writer<'l> {
                     .extend_from_slice(&unsafe { word_at(o, 0) }.to_le_bytes());
                 Vec::new()
             }
+            KIND_FIXED => {
+                self.out.push(FIXED);
+                self.out.push(layout as u8);
+                for i in 0..len as usize {
+                    self.out
+                        .extend_from_slice(&unsafe { word_at(o, i) }.to_le_bytes());
+                }
+                Vec::new()
+            }
             KIND_STR | KIND_BYTES => {
                 self.out.push(if kind == KIND_STR { STR } else { BYTES });
                 self.blob(unsafe { bytes_of(o) });
@@ -202,6 +221,7 @@ impl<'l> Writer<'l> {
                     let at = offsets[i];
                     match slots[i] {
                         heap::Slot::Float => Pending::Raw(unsafe { word_at(o, at) }),
+                        heap::Slot::Wide(t) => Pending::Wide(unsafe { word_at(o, at) }, t),
                         heap::Slot::Record(_) => {
                             Pending::Word(unsafe { heap::words(o).add(at) } as Word)
                         }
@@ -392,6 +412,19 @@ impl<'a> Reader<'a> {
                     .ok_or("it names an object before writing it")?;
                 return Ok(Some(w));
             }
+            FIXED => {
+                let ty = *ply_eval::INT_TYPES
+                    .get(usize::from(self.byte()?))
+                    .ok_or("it holds a width this runtime does not have")?;
+                let low = u64::from_le_bytes(self.array()?) as u128;
+                let high = if ty.bits() > 64 {
+                    (u64::from_le_bytes(self.array()?) as u128) << 64
+                } else {
+                    0
+                };
+                let w = self.heap.boxed_fixed(ply_eval::Fixed::new(ty, high | low));
+                return Ok(Some(self.kept(w)));
+            }
             INT | FLOAT => {
                 let n = i64::from_le_bytes(self.array()?);
                 let o = self
@@ -412,9 +445,11 @@ impl<'a> Reader<'a> {
                 let w = self.heap.bytes(b);
                 return Ok(Some(self.kept(w)));
             }
+            // As the runtime holds the value now, which may be natively where a store that is older
+            // bridged it: a 64-bit width.
             BRIDGE => {
                 let value = ply_eval::codec::decode(self.blob()?)?;
-                let w = self.heap.bridge(value);
+                let w = self.heap.to_word(self.layouts, &value);
                 return Ok(Some(self.kept(w)));
             }
             LIST_WORDS | ARRAY_WORDS => {

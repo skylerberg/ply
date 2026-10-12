@@ -38,6 +38,9 @@ pub const KIND_ARRAY: u8 = 15;
 pub const KIND_FLOAT: u8 = 16;
 /// What [`kind`] answers for a `Char`'s word: no object has it.
 pub const KIND_CHAR: u8 = 17;
+/// A width of 64 or 128 bits: its bits in one payload word or two, `layout` the width's place in
+/// [`ply_eval::INT_TYPES`].
+pub const KIND_FIXED: u8 = 18;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -339,12 +342,14 @@ pub unsafe fn counted(o: *mut Obj, i: usize) -> bool {
     }
 }
 
-/// How a record holds a field: a word, a `Float`'s bits, or a record of the shape named in place,
-/// its header and words inside the record's own.
+/// How a record holds a field: a word, a `Float`'s bits, a 64-bit width's bits (the width's place
+/// in [`ply_eval::INT_TYPES`]), or a record of the shape named in place, its header and words
+/// inside the record's own.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Slot {
     Word,
     Float,
+    Wide(u8),
     Record(u32),
 }
 
@@ -356,11 +361,44 @@ pub const FLOAT_SLOT: &str = "!f";
 /// fields after that, between parentheses and parted by commas.
 pub const RECORD_SLOT: &str = "!r(";
 
-/// A field held as a word or a `Float`'s bits, as a shape spells it.
+/// A field held as a word, a `Float`'s bits or a 64-bit width's, as a shape spells it.
 pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
     match slot {
         Slot::Float => Symbol::new(format!("{}{FLOAT_SLOT}", name.as_str())),
+        Slot::Wide(t) => Symbol::new(format!("{}!{}", name.as_str(), wide_spelling(t))),
         _ => name.clone(),
+    }
+}
+
+/// What a 64-bit width held as its bits is spelled with in a shape, after the field's name and `!`.
+fn wide_spelling(t: u8) -> &'static str {
+    if t == ply_eval::IntTy::I64 as u8 {
+        "i64"
+    } else {
+        "u64"
+    }
+}
+
+/// The width a field spelled `name!<width>` holds as its bits.
+fn wide_of(spelling: &str) -> Option<u8> {
+    match spelling {
+        "u64" => Some(ply_eval::IntTy::U64 as u8),
+        "i64" => Some(ply_eval::IntTy::I64 as u8),
+        _ => None,
+    }
+}
+
+/// The width a 64- or 128-bit width's object holds, and its value.
+pub unsafe fn fixed_of(o: *mut Obj) -> Fixed {
+    unsafe {
+        let ty = ply_eval::INT_TYPES[(*o).layout as usize];
+        let low = word_at(o, 0) as u64 as u128;
+        let high = if (*o).len > 1 {
+            (word_at(o, 1) as u64 as u128) << 64
+        } else {
+            0
+        };
+        Fixed::new(ty, high | low)
     }
 }
 
@@ -484,6 +522,10 @@ pub fn field_word(heap: &mut Heap, o: *mut Obj, at: usize, slot: Slot) -> Word {
     let w = unsafe { word_at(o, at) };
     match slot {
         Slot::Float => heap.boxed_float(f64::from_bits(w as u64)),
+        Slot::Wide(t) => heap.boxed_fixed(Fixed::new(
+            ply_eval::INT_TYPES[t as usize],
+            w as u64 as u128,
+        )),
         Slot::Record(_) => {
             let inner = unsafe { words(o).add(at) } as Word;
             inc(inner);
@@ -570,10 +612,16 @@ impl Shapes {
                         names.push(Symbol::new(name));
                         slots.push(Slot::Float);
                     }
-                    None => {
-                        names.push(field.clone());
-                        slots.push(Slot::Word);
-                    }
+                    None => match s.rsplit_once('!').and_then(|(n, w)| Some((n, wide_of(w)?))) {
+                        Some((name, t)) => {
+                            names.push(Symbol::new(name));
+                            slots.push(Slot::Wide(t));
+                        }
+                        None => {
+                            names.push(field.clone());
+                            slots.push(Slot::Word);
+                        }
+                    },
                 },
             }
         }
@@ -587,7 +635,7 @@ impl Shapes {
                     counted.push(at);
                     at += 1;
                 }
-                Slot::Float => at += 1,
+                Slot::Float | Slot::Wide(_) => at += 1,
                 Slot::Record(n) => {
                     let n = *n as usize;
                     counted.extend(self.counted[n].iter().map(|c| at + 2 + c));
@@ -633,10 +681,26 @@ pub struct Layouts {
     /// Per constructor, the arithmetic its type's module states, by [`ply_eval::instances`]'
     /// roles; empty for a unit that states none.
     numeric: Box<[[Stated; 5]]>,
-    /// Whether a record the runtime lays out holds a record of a record type in place, as the
-    /// unit's code reads one; a unit emitted by a `ply` that holds every record by its word, as a
-    /// bootstrap's first builder is, reads it as a word.
+    /// How a record the runtime makes is laid out: as the unit's code reads one.
+    pub layout: RecordLayout,
+}
+
+/// How a unit's code reads a record, which the runtime lays out every record it makes as. A unit
+/// emitted by a `ply` before a layout, as a bootstrap's first builder is, reads it the older way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RecordLayout {
+    /// A record of a record type held in place, rather than by its word.
     pub in_place: bool,
+    /// A 64-bit width held as its bits, rather than by its word.
+    pub raw_widths: bool,
+}
+
+impl RecordLayout {
+    /// What this runtime's own emitter writes.
+    pub const CURRENT: RecordLayout = RecordLayout {
+        in_place: true,
+        raw_widths: true,
+    };
 }
 
 /// A function a type's module states its values go through, as a unit holds it.
@@ -657,7 +721,7 @@ const SEARCHED: u16 = u16::MAX - 1;
 
 impl Layouts {
     pub fn new(ctors: Vec<(Symbol, usize)>) -> Layouts {
-        Layouts::of(ctors, &[], true)
+        Layouts::of(ctors, &[], RecordLayout::CURRENT)
     }
 
     /// The fields of a `{key, value}` entry.
@@ -666,7 +730,11 @@ impl Layouts {
     }
 
     /// With `shapes` interned first, in order, so each one's id is its position.
-    pub fn of(ctors: Vec<(Symbol, usize)>, shapes: &[Vec<Symbol>], in_place: bool) -> Layouts {
+    pub fn of(
+        ctors: Vec<(Symbol, usize)>,
+        shapes: &[Vec<Symbol>],
+        layout: RecordLayout,
+    ) -> Layouts {
         let ctor_ids: HashMap<Symbol, u32> = ctors
             .iter()
             .enumerate()
@@ -695,7 +763,7 @@ impl Layouts {
             width: 0,
             stated: Box::default(),
             numeric: Box::default(),
-            in_place,
+            layout,
         }
     }
 
@@ -898,7 +966,9 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
     unsafe {
         match (*o).kind {
             KIND_RECORD => record_bytes((*o).flags, (*o).len),
-            KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_ARRAY => (*o).len as usize * 8,
+            KIND_CTOR | KIND_CLOSURE | KIND_INT | KIND_FLOAT | KIND_FIXED | KIND_ARRAY => {
+                (*o).len as usize * 8
+            }
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
             KIND_MAP => 8,
@@ -1170,7 +1240,13 @@ impl Heap {
                     words.push((unsafe { word_at(obj(*w), 0) }, Slot::Float));
                     dec(*w);
                 }
-                KIND_RECORD if layouts.in_place => {
+                KIND_FIXED if layouts.layout.raw_widths && unsafe { (*obj(*w)).len } == 1 => {
+                    let t = unsafe { (*obj(*w)).layout } as u8;
+                    spelled_fields.push(spelled(name, Slot::Wide(t)));
+                    words.push((unsafe { word_at(obj(*w), 0) }, Slot::Wide(t)));
+                    dec(*w);
+                }
+                KIND_RECORD if layouts.layout.in_place => {
                     let shape = unsafe { (*obj(*w)).layout };
                     spelled_fields.push(spelled_record(name, &layouts.shape_spelled(shape)));
                     words.push((*w, Slot::Record(shape)));
@@ -1286,6 +1362,19 @@ impl Heap {
         o as Word
     }
 
+    /// A 64- or 128-bit width's object: its bits in one word or two.
+    pub fn boxed_fixed(&mut self, f: Fixed) -> Word {
+        let wide = f.ty.bits() > 64;
+        let o = self.alloc(KIND_FIXED, 0, if wide { 2 } else { 1 }, f.ty as u32);
+        unsafe {
+            set_word(o, 0, f.bits() as u64 as i64);
+            if wide {
+                set_word(o, 1, (f.bits() >> 64) as u64 as i64);
+            }
+        }
+        o as Word
+    }
+
     pub fn bridge(&mut self, v: Value) -> Word {
         let at = u32::try_from(self.bridges.len()).expect("a bridge table a header can index");
         let o = self.raw_alloc(KIND_BRIDGE, 0, 0, at, BRIDGE_BYTES);
@@ -1333,6 +1422,7 @@ impl Heap {
                 KIND_UNIT | KIND_BOOL => return w,
                 KIND_INT => self.boxed_int(word_at(o, 0)),
                 KIND_FLOAT => self.boxed_float(f64::from_bits(word_at(o, 0) as u64)),
+                KIND_FIXED => self.boxed_fixed(fixed_of(o)),
                 KIND_STR | KIND_BYTES => self.joined((*o).kind, bytes_of(o), &[], 0) as Word,
                 KIND_BRIDGE => self.bridge(bridged(o).clone()),
                 KIND_LIST => {
@@ -1401,6 +1491,7 @@ impl Heap {
             // Below 64 bits a width is held as the `Int` it stands for, which its sign-extended
             // bits cut to 64 are; at 64 bits and past it is the runtime's own.
             Value::Fixed(f) if f.ty.bits() < 64 => imm(f.bits() as i64),
+            Value::Fixed(f) => self.boxed_fixed(*f),
             Value::Bool(b) => bool(*b),
             Value::Float(f) => self.boxed_float(*f),
             Value::Char(c) => char_word(*c),
@@ -1522,6 +1613,7 @@ impl Heap {
                 KIND_BOOL => Value::Bool((*o).flags != 0),
                 KIND_INT => read_int(word_at(o, 0), carry, walked),
                 KIND_FLOAT => Value::Float(f64::from_bits(word_at(o, 0) as u64)),
+                KIND_FIXED => Value::Fixed(fixed_of(o)),
                 KIND_STR => Value::Str(Arc::from(str_of(o))),
                 KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
@@ -1536,6 +1628,10 @@ impl Heap {
                             let at = offsets[i];
                             let value = match slots[i] {
                                 Slot::Float => Value::Float(f64::from_bits(word_at(o, at) as u64)),
+                                Slot::Wide(t) => Value::Fixed(Fixed::new(
+                                    ply_eval::INT_TYPES[t as usize],
+                                    word_at(o, at) as u64 as u128,
+                                )),
                                 Slot::Record(_) => Heap::read(
                                     layouts,
                                     words(o).add(at) as Word,
@@ -2155,6 +2251,7 @@ fn rank(w: Word) -> u8 {
             KIND_BOOL => 1,
             KIND_INT => 2,
             KIND_FLOAT => 3,
+            KIND_FIXED => 15,
             KIND_STR => 5,
             KIND_BYTES => 6,
             KIND_LIST => 7,
@@ -2223,6 +2320,7 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
             KIND_BOOL => (*obj(a)).flags.cmp(&(*obj(b)).flags),
             // Byte order, which is the order `str` and `[u8]` have.
             KIND_STR | KIND_BYTES => bytes_of(obj(a)).cmp(bytes_of(obj(b))),
+            KIND_FIXED => fixed_of(obj(a)).value_cmp(fixed_of(obj(b))),
             KIND_FLOAT => ply_eval::float::total_cmp(
                 f64::from_bits(word_at(obj(a), 0) as u64),
                 f64::from_bits(word_at(obj(b), 0) as u64),
@@ -2332,12 +2430,16 @@ unsafe fn cmp_fields(
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float => None,
+            Slot::Float | Slot::Wide(_) => None,
         }
     };
-    let value = |o: *mut Obj, slot: Slot, at: usize| match word(o, slot, at) {
-        Some(w) => Heap::to_value(layouts, w),
-        None => Value::Float(f64::from_bits(unsafe { word_at(o, at) } as u64)),
+    let value = |o: *mut Obj, slot: Slot, at: usize| match (word(o, slot, at), slot) {
+        (Some(w), _) => Heap::to_value(layouts, w),
+        (None, Slot::Wide(t)) => Value::Fixed(Fixed::new(
+            ply_eval::INT_TYPES[t as usize],
+            unsafe { word_at(o, at) } as u64 as u128,
+        )),
+        (None, _) => Value::Float(f64::from_bits(unsafe { word_at(o, at) } as u64)),
     };
     match (word(x, sx, ax), word(y, sy, ay)) {
         (Some(p), Some(q)) => cmp_words(layouts, p, q),
@@ -2353,7 +2455,7 @@ pub fn native_key(w: Word) -> bool {
     let o = obj(w);
     unsafe {
         match (*o).kind {
-            KIND_UNIT | KIND_BOOL | KIND_INT | KIND_STR | KIND_BYTES => true,
+            KIND_UNIT | KIND_BOOL | KIND_INT | KIND_FIXED | KIND_STR | KIND_BYTES => true,
             KIND_BRIDGE => matches!(
                 bridged(o),
                 Value::Str(_) | Value::Bytes(_) | Value::Fixed(_)
