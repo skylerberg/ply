@@ -66,8 +66,9 @@ pub struct Taken {
 #[derive(Clone)]
 pub struct Exports {
     pub helpers: Vec<HelperShape>,
-    /// The constructor table the C's tags index.
-    pub ctors: Vec<(Symbol, usize)>,
+    /// The constructor table the C's tags index: each one's name, arity, and arguments as a shape
+    /// spells them, `a000` first, none where it holds every argument as its word.
+    pub ctors: Vec<(Symbol, usize, Vec<Symbol>)>,
     /// Every function the unit holds.
     pub taken: Vec<Taken>,
     /// The pure nullary functions, which the seam memoizes.
@@ -106,6 +107,10 @@ pub const RAW_WIDTHS: &str = "widths held raw";
 /// A line after a unit's tables, where its C reads an array's records, `Float`s and 64-bit widths
 /// in place; a unit without it reads each element's word.
 pub const INLINE_ARRAYS: &str = "arrays hold their elements in place";
+
+/// A line after a unit's tables, where its C reads a constructor's arguments as its declaration
+/// types them, as the unit's constructor table spells them; a unit without it reads their words.
+pub const CTOR_ARGS: &str = "constructors hold their arguments by type";
 
 impl Exports {
     pub fn names(&self) -> Vec<String> {
@@ -158,8 +163,12 @@ impl Exports {
             out.push_str(&format!("{} {} {}\n", h.name, h.args, u8::from(h.answers)));
         }
         out.push_str(&format!("ctors {}\n", self.ctors.len()));
-        for (name, arity) in &self.ctors {
-            out.push_str(&format!("{name} {arity}\n"));
+        for (name, arity, args) in &self.ctors {
+            out.push_str(&format!("{name} {arity}"));
+            for a in args {
+                out.push_str(&format!(" {a}"));
+            }
+            out.push('\n');
         }
         out.push_str(&format!("taken {}\n", self.taken.len()));
         for t in &self.taken {
@@ -212,6 +221,9 @@ impl Exports {
         if self.layout.inline_arrays {
             out.push_str(&format!("{INLINE_ARRAYS}\n"));
         }
+        if self.layout.ctor_args {
+            out.push_str(&format!("{CTOR_ARGS}\n"));
+        }
         out
     }
 
@@ -237,8 +249,10 @@ impl Exports {
         let n = count(line(s, &mut at)?, "ctors")?;
         let mut ctors = Vec::with_capacity(n);
         for _ in 0..n {
-            let (name, arity) = line(s, &mut at)?.rsplit_once(' ')?;
-            ctors.push((Symbol::new(name), arity.parse().ok()?));
+            let mut parts = line(s, &mut at)?.split(' ');
+            let name = Symbol::new(parts.next()?);
+            let arity = parts.next()?.parse().ok()?;
+            ctors.push((name, arity, parts.map(Symbol::new).collect()));
         }
         let n = count(line(s, &mut at)?, "taken")?;
         let mut taken = Vec::with_capacity(n);
@@ -313,12 +327,14 @@ impl Exports {
             in_place: false,
             raw_widths: false,
             inline_arrays: false,
+            ctor_args: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
                 IN_PLACE => layout.in_place = true,
                 RAW_WIDTHS => layout.raw_widths = true,
                 INLINE_ARRAYS => layout.inline_arrays = true,
+                CTOR_ARGS => layout.ctor_args = true,
                 _ => {}
             }
         }
