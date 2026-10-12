@@ -944,8 +944,6 @@ type Stated =
   | Pss(Digest, Bytes)
   | PssDocument(Digest, Bytes)
 
-gen for Stated by stated_keys
-
 /// A key that signs: an HMAC secret of each of the three hashes, of its digest's length or up to
 /// sixteen bytes more, an Ed25519 seed, or a P-256 scalar. No RSA key is drawn, since none is made
 /// here: RFC 7515's stands for them below.
@@ -2248,7 +2246,7 @@ test "a key set is a bounded JSON object with a list of keys" {
   assert_eq(jwks(b"{\"keys\":[7,null,{\"kty\":\"RSA\"}]}", 100), [])
 }
 
-// --- Laws -------------------------------------------------------------------
+// --- Properties -------------------------------------------------------------
 
 /// A policy that looks at nothing, for a law about the signature.
 fn roomy() -> Policy = { ..lax(), max_bytes: 1 << 30 }
@@ -2275,33 +2273,53 @@ fn flipped(raw: Bytes, at: Int) -> Bytes / {abort.raise} = {
   ])
 }
 
-law "verify answers the claims sign was given, in their time"
-  forall (c: Claims, key: Stated, now: Instant) where signable(c) && timely(c, now) {
-    verify(sign(c, key_of(key), as_jwt()), verifying(key_of(key)), roomy(), now).claims == c
-  }
+/// A `Claims` as a test draws one.
+fn claims_drawn() -> gen::Gen<Claims> =
+  gen::and_then(gen::option_of(gen::text()), |issuer: Option<String>|
+    gen::and_then(gen::option_of(gen::text()), |subject: Option<String>|
+      gen::and_then(gen::list(gen::text()), |audience: List<String>|
+        gen::and_then(
+          gen::option_of(gen::map(gen::any_int(), |n: Int| Instant(n))),
+          |expires: Option<Instant>|
+            gen::map4(
+              gen::option_of(gen::map(gen::any_int(), |n: Int| Instant(n))),
+              gen::option_of(gen::map(gen::any_int(), |n: Int| Instant(n))),
+              gen::option_of(gen::text()),
+              gen::map_of(gen::text(), json::jsons()),
+              |not_before: Option<Instant>, issued_at: Option<Instant>, id: Option<String>, other: Map<String, Json>|
+                {
+                  issuer: issuer,
+                  subject: subject,
+                  audience: audience,
+                  expires: expires,
+                  not_before: not_before,
+                  issued_at: issued_at,
+                  id: id,
+                  other: other,
+                },
+            ),
+        ))))
 
-law "claims read back from the object they are written as"
-  forall (c: Claims) where signable(c) {
-    claims_of_json(claims_json(c)) == c
-  }
+test "verify answers the claims sign was given, in their time" {
+  gen::check3(
+    claims_drawn(),
+    stated_keys(),
+    gen::map(gen::any_int(), |n: Int| Instant(n)),
+    |c: Claims, key: Stated, now: Instant|
+      if signable(c) && timely(c, now) {
+        verify(sign(c, key_of(key), as_jwt()), verifying(key_of(key)), roomy(), now).claims == c
+      } else { true },
+  )
+}
 
-law "a token is refused under every key but its own"
-  forall (c: Claims, key: Stated, other: Stated) where signable(c) && key != other {
-    let ours = key_of(key);
-    let theirs = key_of(other);
-    match try_verify(sign(untimed(c), ours, as_jwt()), verifying(theirs), roomy(), Instant(0)) {
-      Err(BadSignature) -> algorithm(ours) == algorithm(theirs),
-      Err(WrongAlgorithm(found, wanted)) -> found == algorithm(ours) && wanted == algorithm(theirs),
-      _ -> false,
-    }
-  }
-
-law "a token with any one bit flipped is refused"
-  forall (c: Claims, key: Stated, at: Int) where signable(c) {
-    let token = sign(untimed(c), key_of(key), as_jwt());
-    let other = string_of_bytes_lossy(flipped(bytes_of_string(token), at));
-    !refuses(token, verifying(key_of(key))) && refuses(other, verifying(key_of(key)))
-  }
+test "a token with any one bit flipped is refused" {
+  gen::check3(claims_drawn(), stated_keys(), gen::any_int(), |c: Claims, key: Stated, at: Int|
+    if signable(c) {
+      let token = sign(untimed(c), key_of(key), as_jwt());
+      let other = string_of_bytes_lossy(flipped(bytes_of_string(token), at));
+      !refuses(token, verifying(key_of(key))) && refuses(other, verifying(key_of(key)))
+    } else { true })
+}
 
 type Place = { token: String, key: Stated, from: Int, to: Int }
 

@@ -8,8 +8,8 @@ import std.bin
 import std.hash (blake3)
 import std.bytes (join, hex_of)
 import std.list (at, concat, contains, drop, flatten, reverse, sort_by)
-import memo (memo, memo_keep, Held, Query, Run, Tally, answer, nothing_held, over_held, ran_total,
-             ran_for, started, tallies)
+import memo (memo, memo_keep, Held, Query, Record, Run, Tally, answer, nothing_held, over_held,
+             ran_total, ran_for, started, tallies)
 import unit (definition_hash)
 import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, ShippedModule,
                 Reading, Mention, OwnerRead, OwnerSource, ItemAt, Imported, EntryHead, imported_bin,
@@ -42,6 +42,7 @@ import parsing (Ident, Span, ParseDiag, span_bin)
 import infer (DefInfo, TestInfo, walk_order)
 import hash (Fixed, FixedTest, FixedLaw, Fixing, Shapes, Shape, no_fixing, module_forms,
              hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key)
+import std.gen
 
 /// Where a module of the load's own packages is: its package (0 the root, then each dependency in
 /// the order the load's packages list them) and its name there. Where its file is, is no part of it.
@@ -3613,10 +3614,74 @@ test "a core body edited, then renamed beside a test added, answers as it does f
   assert(len(off) == 0, Some(string_of_bytes_lossy(join(off, b"; "))))
 }
 
-law "an answer through the store is the fresh one at every step of any session of edits"
-  forall (edits: List<List<Change>>) {
-    disagreements(session(edits)) == []
-  }
+/// A `Change` as a test draws one.
+fn changes() -> gen::Gen<Change> =
+  gen::elements([
+    LeafBody,
+    LeafSignature,
+    LeafPrivate,
+    LeafError,
+    LeafImportsCore,
+    LeafReformatted,
+    LeafDeleted,
+    CoreRenamed,
+    CoreBody,
+    CoreResultType,
+    TypeRenamed,
+    EffectRenamed,
+    TwiceMoved,
+    DoubledRemoved,
+    ShopBody,
+    ShopImportsLeaf,
+    DefaultEdited,
+    TestAdded,
+    ExtraAdded,
+    ExtraBody,
+    TwinAdded,
+  ])
+
+/// A `Named` as a test draws one.
+fn nameds() -> gen::Gen<Named> =
+  gen::map3(gen::bytes(), gen::bool(), gen::bool(), |module: Bytes, shipped: Bool, tested: Bool|
+    { module: module, shipped: shipped, tested: tested })
+
+/// A `EntryNamed` as a test draws one.
+fn entry_nameds() -> gen::Gen<EntryNamed> =
+  gen::map4(
+    gen::bytes(),
+    gen::bool(),
+    gen::bool(),
+    gen::bytes(),
+    |module: Bytes, shipped: Bool, tested: Bool, name: Bytes|
+      { module: module, shipped: shipped, tested: tested, name: name },
+  )
+
+/// A `Embedding` as a test draws one.
+fn embeddings() -> gen::Gen<Embedding> =
+  gen::map2(
+    gen::list(
+      gen::map2(gen::bytes(), gen::bytes(), |name: Bytes, bytes: Bytes|
+        { name: name, bytes: bytes }),
+    ),
+    gen::option_of(gen::bytes()),
+    |files: List<{ name: Bytes, bytes: Bytes }>, refused: Option<Bytes>|
+      { files: files, refused: refused },
+  )
+
+/// A `Placing` as a test draws one.
+fn placings() -> gen::Gen<Placing> =
+  gen::map2(gen::any_int(), gen::bytes(), |package: Int, relative: Bytes|
+    { package: package, relative: relative })
+
+// Each case checks a program afresh at every step, so a dozen sessions is what a run pays for.
+test "an answer through the store is the fresh one at every step of a drawn session of edits" {
+  gen::check(
+    gen::and_then(gen::int_between(1, 3), |steps: Int|
+      gen::list_of_length(gen::list_of(changes(), 3), steps)),
+    |edits: List<List<Change>>| { disagreements(session(edits)) == [] },
+    cases: 12,
+  )
+}
 
 fn chain_lib(label: Bytes) -> Bytes =
   bytes_concat_all([
@@ -3783,37 +3848,55 @@ test "adding an unrelated effect keeps an answer through the store the fresh one
 
 // --- What a store keeps reads back ------------------------------------------------------------
 
-law "a module's answer reads back as it was filed"
-  forall (a: ModuleAnswer) {
-    bin::round_trips(a, module_answer_bin())
-  }
+/// Every answer the query `name` kept over a check of a small program, as its body wrote it.
+fn kept_answers(name: Bytes) -> List<Bytes> / {abort.raise} = {
+  let held = fixed_over(nothing_held(), layered(b"pub fn step(n: Int) -> Int = n + 1\n"), []).held;
+  map_fold(held.records, [], |acc: List<Bytes>, _key: Bytes, r: Record|
+    if r.query != name { acc }
+    else { match map_get(held.outputs, r.output) { Some(out) -> push(acc, out), None -> acc } })
+}
 
-law "a module read for its owners reads back as it was filed"
-  forall (a: OwnersAnswer) {
-    bin::round_trips(a, owners_answer_bin())
-  }
+/// Whether there are `answers`, and each reads by `codec` as a value that writes its bytes again.
+fn read_back<a>(answers: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
+  len(answers) > 0
+    && fold(answers, true, |ok: Bool, b: Bytes| {
+      let value = decoded(b, codec, "a kept answer");
+      ok && bin::encode(value, codec) == b && bin::round_trips(value, codec)
+    })
 
-law "what hashing fixed of a group reads back as it was filed"
-  forall (h: GroupHashes) {
-    bin::round_trips(h, group_hashes_bin())
-  }
+test "a module's answer reads back as it was filed" {
+  assert(read_back(kept_answers(module_query()), module_answer_bin()))
+}
 
-law "a module's imports read back as they were filed"
-  forall (i: ImportsOf) {
-    bin::round_trips(i, imports_of_bin())
-  }
+test "a module read for its owners reads back as it was filed" {
+  assert(read_back(kept_answers(owners_query()), owners_answer_bin()))
+}
 
-law "a module's hashes read back as they were filed"
-  forall (h: HashAnswer) {
-    bin::round_trips(h, hash_answer_bin())
-  }
+test "what hashing fixed of a group reads back as it was filed" {
+  assert(read_back(kept_answers(group_hash_query()), group_hashes_bin()))
+}
 
-law "what a module query is asked reads back as it was asked"
-  forall (n: Named, e: EntryNamed, m: Embedding, p: Placing) {
-    bin::round_trips(n, named_bin()) && bin::round_trips(e, entry_named_bin())
-      && bin::round_trips(m, embedding_bin())
-      && bin::round_trips(p, placing_bin())
-  }
+test "a module's imports read back as they were filed" {
+  assert(read_back(kept_answers(imports_query()), imports_of_bin()))
+}
+
+test "a module's hashes read back as they were filed" {
+  assert(read_back(kept_answers(hashes_query()), hash_answer_bin()))
+}
+
+test "what a module query is asked reads back as it was asked" {
+  gen::check4(
+    nameds(),
+    entry_nameds(),
+    embeddings(),
+    placings(),
+    |n: Named, e: EntryNamed, m: Embedding, p: Placing| {
+      bin::round_trips(n, named_bin()) && bin::round_trips(e, entry_named_bin())
+        && bin::round_trips(m, embedding_bin())
+        && bin::round_trips(p, placing_bin())
+    },
+  )
+}
 
 // --- What an edit runs again ------------------------------------------------------------------
 
@@ -4124,6 +4207,42 @@ test "the groups a signature edit moves in one module are checked together, and 
   assert_eq(said(warm.outcome), said(analyse(parse_all(widened))));
   assert_eq(tables_of(warm.answers), tables_of(answered_over(nothing_held(), widened).answers));
   assert_eq(warm.answers, answered_over(nothing_held(), widened).answers)
+}
+
+fn staled(inner: Bytes, first: Bytes, go: Bytes) -> List<Source> =
+  [
+    {
+      name: b"lib",
+      src: bytes_concat_all([inner, b"\n\npub fn step(n: Int) -> Int = inner(n) + 1\n"]),
+    },
+    {
+      name: b"zed",
+      src: bytes_concat_all([
+        b"import lib\nfn seed() -> Int = 1\n\nfn sprout() -> Int = seed() + 1\n\n",
+        first,
+        b"\n\nfn shown(n: Int) -> Int = lib::step(n)\n\n",
+        go,
+        b"\n",
+      ]),
+    },
+  ]
+
+// `first` and `go` check together. `go` reads `lib::step`, which answers anew and so marks
+// `shown`, a group of their own module that stood when they were chosen, before `go` reads it.
+test "a group that goes stale while its module's others check together is checked after them" {
+  let before = staled(
+    b"fn inner(n: Int) -> Int = n + 1",
+    b"pub fn first() -> Int = sprout() + 1",
+    b"pub fn go(n: Int) -> Int = lib::step(0) + shown(n)",
+  );
+  let after = staled(
+    b"fn inner(n: Int) -> Int = n + 2",
+    b"pub fn first() -> Int = sprout() + 2",
+    b"pub fn go(n: Int) -> Int = lib::step(1) + shown(n)",
+  );
+  let warm = answered_over(answered_over(nothing_held(), before).held, after);
+  assert_eq(said(warm.outcome), said(analyse(parse_all(after))));
+  assert_eq(warm.answers, answered_over(nothing_held(), after).answers)
 }
 
 test "a test edited beside a definition it calls answers what a fresh check answers" {

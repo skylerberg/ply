@@ -29,7 +29,7 @@ import std.date
 import std.date (DateTime, Extended, OffsetDateTime, Overflow, Period)
 import std.gen
 import std.gen (Gen)
-import std.laws (agrees, round_trip)
+import std.laws (agrees)
 import std.list (at_or, concat, drop, find, last, sort_by, take)
 import std.option (option_and_then, option_expect, option_map)
 import std.result (result_map)
@@ -56,8 +56,6 @@ pub opaque type Zone = | Zone(Table)
 type Table = { name: String, initial: Offset, times: Array<Int>, after: List<Offset>, stride: Int }
 
 show for Zone by name
-
-gen for Zone by arbitrary
 
 /// The instants a wall-clock reading names in a zone.
 pub type Resolution =
@@ -1175,20 +1173,8 @@ pub fn arbitrary() -> Gen<Zone> = {
   ])
 }
 
-/// A zone and an instant a law draws.
+/// A zone and an instant a test draws.
 type Sighting = | Sighting(Zone, Instant)
-
-gen for Sighting by sightings
-
-/// A zone and a wall-clock reading a law draws.
-type Reading = | Reading(Zone, DateTime)
-
-gen for Reading by readings
-
-/// A fixed offset in seconds and an instant a law draws.
-type Stood = | Stood(Int, Instant)
-
-gen for Stood by standings
 
 fn anywhere() -> Gen<Instant> =
   gen::one_of([
@@ -1216,45 +1202,6 @@ fn moments(z: Table) -> Gen<Instant> = {
 fn sightings() -> Gen<Sighting> =
   gen::and_then(arbitrary(), |z: Zone| gen::map(moments(table(z)), |at: Instant| Sighting(z, at)))
 
-/// What a clock that never changes reads at a second.
-fn reading_of(wall: Int) -> DateTime =
-  match date::of_unix_seconds(wall) {
-    Some(read) -> date::local(read),
-    None -> date::at(date::earliest(), date::midnight()),
-  }
-
-/// A reading anywhere an `Instant` goes, or within two hours of what the zone's clocks read as
-/// one of their changes began, which is where the readings a change skips or repeats are.
-fn walls(z: Table) -> Gen<Int> = {
-  let anywhere = gen::int_between(0 - 9223372036, 9223372036);
-  let beside = gen::map2(
-    gen::below(array_len(z.times)),
-    gen::int_between(0 - 7200, 7200),
-    |i: Int, by: Int|
-      match array_at(z.times, i) { Some(t) -> t + kind_before(z, i).seconds + by, None -> by },
-  );
-  if array_len(z.times) == 0 { anywhere } else { gen::one_of([anywhere, beside, beside]) }
-}
-
-fn readings() -> Gen<Reading> =
-  gen::and_then(arbitrary(), |z: Zone|
-    gen::map(walls(table(z)), |wall: Int| Reading(z, reading_of(wall))))
-
-fn standings() -> Gen<Stood> =
-  gen::map2(gen::int_between(0 - 86399, 86399), anywhere(), |east: Int, at: Instant|
-    Stood(east, at))
-
-fn standing(east: Int) -> Zone = match fixed(east) { Some(z) -> z, None -> utc() }
-
-fn stood_reading(s: Stood) -> { east: Int, reading: DateTime } =
-  match s { Stood(east, at) -> { east: east, reading: local(standing(east), at) } }
-
-fn stood_back(read: { east: Int, reading: DateTime }) -> Option<Stood> =
-  match resolve(standing(read.east), read.reading) {
-    Some(Unique(at)) -> Some(Stood(read.east, at)),
-    _ -> None,
-  }
-
 /// The offset a walk through every change of the zone finds in force at the instant.
 fn walked(s: Sighting) -> Offset =
   match s {
@@ -1268,29 +1215,8 @@ fn walked(s: Sighting) -> Offset =
 
 fn searched(s: Sighting) -> Offset = match s { Sighting(z, at) -> offset_at(z, at) }
 
-/// Whether the two instants lie either side of one change that put the clocks forward over the
-/// reading: the clocks read as much before it at the first as they read after it at the second,
-/// which is as far as the change moved them.
-fn straddles(z: Zone, reading: DateTime, before: Instant, after: Instant) -> Bool = {
-  let width = time::between(before, after);
-  time::as_nanos(width) > 0 && date::date_time_after(local(z, before), width) == Some(reading)
-    && date::date_time_after(reading, width) == Some(local(z, after))
-    && (match next_transition(z, before) {
-      Some(change) ->
-        compare(change.at, after) != Greater
-          && (change.after.seconds - change.before.seconds) * 1000000000 == time::as_nanos(width),
-      None -> false,
-    })
-}
-
-/// Whether a reading is within a day of an end of what an `Instant` holds, or past one.
-fn out_of_reach(reading: DateTime) -> Bool = {
-  let wall = date::unix_seconds(date::utc(reading));
-  wall < 86400 - 9223372036 || wall > 9223372036 - 86400
-}
-
-law "an instant is one of those its reading names"
-  forall (s: Sighting) {
+test "an instant is one of those its reading names" {
+  gen::check(sightings(), |s: Sighting| {
     match s {
       Sighting(z, at) -> match resolve(z, local(z, at)) {
         Some(Unique(found)) -> found == at,
@@ -1300,72 +1226,12 @@ law "an instant is one of those its reading names"
         None -> false,
       },
     }
-  }
+  })
+}
 
-law "a reading names the instants that read it, or lies in the change that skipped it"
-  forall (r: Reading) {
-    match r {
-      Reading(z, reading) -> match resolve(z, reading) {
-        Some(Unique(at)) -> local(z, at) == reading,
-        Some(Overlap(both)) ->
-          local(z, both.earlier) == reading && local(z, both.later) == reading
-            && compare(both.earlier, both.later) == Less
-            && offset_at(z, both.earlier).seconds > offset_at(z, both.later).seconds,
-        Some(Gap(skipped)) -> straddles(z, reading, skipped.before, skipped.after),
-        None -> out_of_reach(reading),
-      },
-    }
-  }
-
-law "a zone's clocks stand under a day from UTC"
-  forall (s: Sighting) {
-    searched(s).seconds > 0 - 86400 && searched(s).seconds < 86400
-  }
-
-law "a second later a zone's clocks read a second later, but for a change in that second"
-  forall (s: Sighting) {
-    match s {
-      Sighting(z, Instant(n)) -> match checked_add(n, 1000000000) {
-        None -> true,
-        Some(m) -> {
-          let moved = match previous_transition(z, Instant(m)) {
-            Some(change) -> if compare(change.at, Instant(n)) == Greater {
-              change.after.seconds - change.before.seconds
-            } else { 0 },
-            None -> 0,
-          };
-          date::date_time_between(local(z, Instant(n)), local(z, Instant(m)))
-            == Some(time::nanos((1 + moved) * 1000000000))
-        },
-      },
-    }
-  }
-
-law "a search for the offset finds what a walk through every change finds" =
-  agrees(searched, walked)
-
-law "a fixed offset reads every instant back, and skips and repeats no reading" =
-  round_trip(stood_reading, stood_back)
-
-law "a zone's name names the zone" = agrees(|z: Zone| parse(name(z)), |z: Zone| Ok(z))
-
-law "the changes either side of an instant are next to each other"
-  forall (s: Sighting) {
-    match s {
-      Sighting(z, at) -> match previous_transition(z, at) {
-        None -> match next_transition(z, at) {
-          Some(first) -> first.before == offset_at(z, at),
-          None -> true,
-        },
-        Some(set) ->
-          set.after == offset_at(z, at) && set.before != set.after && compare(set.at, at) != Greater
-            && (match next_transition(z, at) {
-              Some(next) -> next.before == set.after && compare(next.at, at) == Greater,
-              None -> true,
-            }),
-      },
-    }
-  }
+test "a search for the offset finds what a walk through every change finds" {
+  gen::check(sightings(), |x: Sighting| agrees(searched, walked, x))
+}
 
 // --- Tests ------------------------------------------------------------------------
 

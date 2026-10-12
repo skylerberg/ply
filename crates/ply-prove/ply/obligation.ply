@@ -1,16 +1,15 @@
 //! `obligation` — selecting, and reporting on, the proofs a program owes.
 //!
 //! An obligation is discharged once and read many times, so the first question is what the cache
-//! already answered: a *proof* may only sit under the bare key, and a *sample* only under the key of
-//! the plan that produced it, because a sample proved with one search says nothing about another.
-//! Anything else is a miss to discharge — including a `law/host`, which is never cached at all, since
-//! a verdict against a real database is about that moment.
+//! already answered. A proof read off the claim alone sits under the claim's own key, and one a run
+//! helped make under the key of what the claim executes, because what a run saw is a fact about the
+//! definitions it ran.
 //!
-//! The second question is what a reader still has to read: which definitions any discharge covers,
-//! how many are covered and at what tier, and — since the last time a person accepted the program's
-//! claims — which definitions moved, whether their *claims* moved with them, and what became of those
-//! claims. A definition whose implementation moved but whose spec did not is exactly the case where a
-//! green check is worth re-reading.
+//! The second question is what a reader still has to read: which definitions a proof covers, and —
+//! since the last time a person accepted the program's claims — which definitions moved, whether
+//! their *claims* moved with them, and what became of those claims. A definition whose
+//! implementation moved but whose spec did not is exactly the case where a green check is worth
+//! re-reading.
 //!
 //! The laws are the vocabulary all of this speaks: a law names definitions, and rewriting the law
 //! changes its targets' spec, so a law's text is part of the spec of everything it names.
@@ -20,29 +19,12 @@ import std.json (Array, Json, Null, Number, Object, Str)
 import std.value (Value, filled)
 import std.list (at, concat, contains, sort)
 import rules (Rule, Unfold, Cited, Descent, Spine, induction_rule, rule_json, rule_bin)
-import fit (Fit, fit_bin, fit_summary, fitted, min_fitted_sizes, unfitted_summary)
 import std.string (join)
 import std.map (get_or)
 
-/// What an obligation is about: one of a definition's own `ensures` clauses, or a whole law.
-pub type Kind = | Ensures(Int) | Law(Option<String>)
-
-/// How strong a discharge was. `Proved` is the only one that covers every case; a sampled discharge
-/// is what it is, a cost law's fit is a trend over its sizes, and an example is an example.
-pub type Tier = | Proved | Property | Example | Fitted
-
-pub fn tier_word(t: Tier) -> String =
-  match t { Proved -> "proved", Property -> "property", Example -> "example", Fitted -> "fitted" }
-
-/// The strength order, which is not the declaration order: `Proved` is last, not first.
-pub fn tier_rank(t: Tier) -> Int = match t { Proved -> 3, Property -> 2, Fitted -> 1, Example -> 0 }
-
-/// Ascending strength, which is the order a coverage summary reads in.
-pub fn tiers() -> List<Tier> = [Example, Fitted, Property, Proved]
-
-/// A fit over enough sizes is a trend; over fewer, an example.
-pub fn fit_tier(fit: Fit) -> Tier =
-  if len(fitted(fit)) >= min_fitted_sizes() { Fitted } else { Example }
+/// What an obligation is about: one of a definition's own `ensures` clauses, one of its `cost`
+/// bounds, or a whole law.
+pub type Kind = | Ensures(Int) | Cost(Int) | Law(Option<String>)
 
 /// What each law speaks about, and the sentence it was written as.
 pub type Laws = {
@@ -153,16 +135,15 @@ fn own_specs(spec_texts: Map<String, List<String>>, name: String) -> List<String
 
 // --- What the cache answered --------------------------------------------------
 
-pub type Reason = | Fresh | FromProof | FromSample | Uncached | CacheRefused
+pub type Reason = | Fresh | FromProof | Uncached | CacheRefused
 
 /// Whether the cache answered, as against answered that it could not.
-pub fn reason_hit(r: Reason) -> Bool = match r { FromProof -> true, FromSample -> true, _ -> false }
+pub fn reason_hit(r: Reason) -> Bool = r == FromProof
 
 pub fn reason_word(r: Reason) -> String =
   match r {
     Fresh -> "new",
     FromProof -> "cached proof",
-    FromSample -> "cached sample",
     Uncached -> "uncached",
     CacheRefused -> "cache refused",
   }
@@ -173,25 +154,25 @@ pub type Answer = { reason: Reason, from: Option<String>, warning: Option<String
 
 pub fn missed(reason: Reason) -> Answer = { reason: reason, from: None, warning: None }
 
-/// What the obligation cache holds under one key, as the runtime spells it back: a proof, a sampled
-/// discharge, or `other` for something it cannot read at all. Absent when nothing is filed there.
+/// What the obligation cache holds under one key: `proof` for a proof read off the claim alone,
+/// `run` for one a run helped make, or `other` for something it cannot read at all. Absent when
+/// nothing is filed there.
 pub type Held = Option<String>
 
-/// A proof may only sit under the bare key, and a sample only under the key of the plan that
-/// produced it. The reason to give, where the evidence is read from, and — when something was filed
-/// under the wrong key — what was wrong with it.
+/// A proof read off the claim alone may only sit under the bare key, and one a run helped make only
+/// under the key of what the claim executes. The reason to give, where the evidence is read from,
+/// and — when something was filed under the wrong key — what was wrong with it.
 pub fn verdict_of(
   bare_key: String,
-  plan_key: String,
+  run_key: String,
   bare: Held,
-  planned: Held,
+  ran: Held,
 ) -> Answer / {abort.raise} =
   match bare {
-    None -> match planned {
+    None -> match ran {
       None -> missed(Fresh),
-      Some(kind) -> if kind == "sample" {
-        { reason: FromSample, from: Some(plan_key), warning: None }
-      } else { refused(kind, false, bare_key) },
+      Some(kind) -> if kind == "run" { { reason: FromProof, from: Some(run_key), warning: None } }
+      else { refused(kind, false, bare_key) },
     },
     Some(kind) -> if kind == "proof" { { reason: FromProof, from: Some(bare_key), warning: None } }
     else { refused(kind, true, bare_key) },
@@ -200,10 +181,10 @@ pub fn verdict_of(
 /// `bare` is which key was filled. A cache that silently declines looks like a slow prover, so a
 /// refusal is reported.
 fn refused(kind: String, bare: Bool, key: String) -> Answer / {abort.raise} = {
-  let what = if kind == "sample" { "a sampled discharge" }
-  else if kind == "proof" { "a proof" }
+  let what = if kind == "run" { "a proof a run helped make" }
+  else if kind == "proof" { "a proof read off the claim alone" }
   else { "something it cannot read" };
-  let where = if bare { "the bare key" } else { "a plan key" };
+  let where = if bare { "the bare key" } else { "a run key" };
   {
     reason: CacheRefused,
     from: None,
@@ -227,15 +208,9 @@ pub type Selection = {
 
 pub fn hits(s: Selection) -> Int = len(filter(s.reasons, reason_hit))
 
-/// `hosted` is whether each obligation reaches the world, and `answers` what the cache held for it.
-/// A `law/host` is never cached: a verdict against a real database is about that moment.
-pub fn select(
-  hosted: List<Bool>,
-  answers: List<Answer>,
-  use_cache: Bool,
-) -> Selection / {abort.raise} = {
-  let decided = map(range(0, len(hosted)), |i: Int|
-    if use_cache && !at(hosted, i) { at(answers, i) } else { missed(Uncached) });
+/// `answers` is what the cache held for each obligation, which a run that reads no cache discards.
+pub fn select(answers: List<Answer>, use_cache: Bool) -> Selection / {abort.raise} = {
+  let decided = map(answers, |a: Answer| if use_cache { a } else { missed(Uncached) });
   {
     reasons: map(decided, |a: Answer| a.reason),
     from: map(decided, |a: Answer| a.from),
@@ -245,81 +220,54 @@ pub fn select(
   }
 }
 
-/// Where each discharge just made is filed: a proof under the obligation's own key, anything weaker
-/// under the plan's. Only what held is filed — a refutation, a vacuity and a gap re-run until they
-/// go green — and nothing is when the cache is off or the claim reaches the world.
+/// Where each proof just made is filed: one read off the claim alone under the obligation's own key,
+/// one a run helped make under the key of what the claim executes. `proofs` says of each outcome
+/// whether a run helped make its proof, with none where nothing was proved: a refutation, a vacuity
+/// and a gap re-run until they go green. Nothing is filed when the cache is off.
 pub fn filings(
-  keys: List<{ bare: String, planned: String }>,
-  hosted: List<Bool>,
-  outcomes: List<Option<Tier>>,
+  keys: List<{ bare: String, ran: String }>,
+  proofs: List<Option<Bool>>,
   to_discharge: List<Int>,
   use_cache: Bool,
 ) -> List<{ at: Int, key: String }> / {abort.raise} =
   if !use_cache { [] } else {
     fold(to_discharge, [], |acc: List<{ at: Int, key: String }>, position: Int|
-      if at(hosted, position) { acc } else {
-        match at(outcomes, position) {
-          None -> acc,
-          Some(tier) -> {
-            let k = at(keys, position);
-            push(acc, { at: position, key: if tier == Proved { k.bare } else { k.planned } })
-          },
-        }
+      match at(proofs, position) {
+        None -> acc,
+        Some(ran) -> {
+          let k = at(keys, position);
+          push(acc, { at: position, key: if ran { k.ran } else { k.bare } })
+        },
       })
   }
 
 // --- How much of the program a reader still has to read ------------------------
 
-pub type Coverage = {
-  definitions: Int,
-  covered: Int,
-  uncovered: List<String>,
-  by_tier: List<{ tier: Tier, count: Int }>,
-}
+pub type Coverage = { definitions: Int, covered: Int, uncovered: List<String> }
 
-/// One obligation's result, as everything below needs it: what it is about, how strongly it was
-/// discharged, whether the machine established it, and whether a discharge reached a verdict at all.
-/// `tier` is present exactly when something held, so a refuted claim has none.
-pub type ClaimRow = { owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, discharged: Bool }
+/// One obligation's result, as everything below needs it: what it is about, whether a proof
+/// established it, and whether a discharge reached a verdict at all.
+pub type ClaimRow = { owner: String, kind: Kind, holds: Bool, discharged: Bool }
 
-/// The definitions each discharge covers. A clause covers its owner; a law covers everything it
-/// names, which is why a law is worth writing.
+/// The definitions each proof covers. A clause covers its owner; a law covers everything it names,
+/// which is why a law is worth writing.
 pub fn covered_by(claim: ClaimRow, laws: Laws) -> List<String> = owners(claim, laws)
 
-/// How many definitions each tier covers, so a reader knows whether the check was a proof or a
-/// sample. `uncovered` is in name order, since it is a list to work through.
+/// How many definitions a proof covers. `uncovered` is in name order, since it is a list to work
+/// through.
 pub fn coverage(defs: List<String>, laws: Laws, results: List<ClaimRow>) -> Coverage = {
   let held = map_of_entries(map(defs, |name: String| { key: name, value: true }));
-  let strongest = fold(results, map_new(), |acc: Map<String, Tier>, r: ClaimRow|
-    match r.tier {
-      None -> acc,
-      Some(tier) ->
-        fold(covered_by(r, laws), acc, |m: Map<String, Tier>, name: String|
-          if map_contains(held, name) {
-            map_insert(m, name, strongest_tier(map_get(m, name), tier))
-          } else { m }),
+  let covered = fold(results, map_new(), |acc: Map<String, Bool>, r: ClaimRow|
+    if !r.holds { acc } else {
+      fold(covered_by(r, laws), acc, |m: Map<String, Bool>, name: String|
+        if map_contains(held, name) { map_insert(m, name, true) } else { m })
     });
-  let names = map_keys(strongest);
   {
     definitions: len(defs),
-    covered: len(names),
-    uncovered: sort(filter(defs, |name: String| !map_contains(strongest, name))),
-    by_tier: map(tiers(), |t: Tier|
-      {
-        tier: t,
-        count: len(filter(names, |name: String| tier_of(strongest, name) == tier_word(t))),
-      }),
+    covered: map_len(covered),
+    uncovered: sort(filter(defs, |name: String| !map_contains(covered, name))),
   }
 }
-
-fn strongest_tier(held: Option<Tier>, tier: Tier) -> Tier =
-  match held {
-    None -> tier,
-    Some(had) -> if tier_rank(tier) > tier_rank(had) { tier } else { had },
-  }
-
-fn tier_of(strongest: Map<String, Tier>, name: String) -> String =
-  match map_get(strongest, name) { Some(t) -> tier_word(t), None -> "" }
 
 /// What an obligation is about, before anything became of it.
 pub type Claimed = { owner: String, kind: Kind }
@@ -436,7 +384,7 @@ pub fn review(
 fn owners(r: ClaimRow, laws: Laws) -> List<String> = owners_of(r.owner, r.kind, laws)
 
 fn owners_of(owner: String, kind: Kind, laws: Laws) -> List<String> =
-  match kind { Ensures(_) -> [owner], Law(_) -> law_targets(laws, owner) }
+  match kind { Ensures(_) -> [owner], Cost(_) -> [owner], Law(_) -> law_targets(laws, owner) }
 
 fn moved(same: Bool) -> Moved = if same { Unchanged } else { Changed }
 
@@ -445,66 +393,33 @@ fn moved(same: Bool) -> Moved = if same { Unchanged } else { Changed }
 // --- Tests ------------------------------------------------------------------
 //
 // The selection is a decision table, and the coverage and review are accounting over rows, so these
-// pin every branch: what the cache answered, which tier wins, which definitions moved, and which
-// claims went with them.
+// pin every branch: what the cache answered, which definitions moved, and which claims went with
+// them.
 
-fn a_row(owner: String, kind: Kind, tier: Option<Tier>, holds: Bool, discharged: Bool) -> ClaimRow =
-  { owner: owner, kind: kind, tier: tier, holds: holds, discharged: discharged }
+fn a_row(owner: String, kind: Kind, holds: Bool, discharged: Bool) -> ClaimRow =
+  { owner: owner, kind: kind, holds: holds, discharged: discharged }
 
-fn a_clause(owner: String, tier: Option<Tier>) -> ClaimRow =
-  a_row(owner, Ensures(0), tier, tier != None, tier != None)
+fn a_clause(owner: String, holds: Bool) -> ClaimRow = a_row(owner, Ensures(0), holds, holds)
 
-fn a_law(owner: String, tier: Option<Tier>) -> ClaimRow =
-  a_row(owner, Law(None), tier, tier != None, tier != None)
+fn a_law(owner: String, holds: Bool) -> ClaimRow = a_row(owner, Law(None), holds, holds)
 
 /// The rules are the prover's own document, placed under `rules` as it wrote them: a certificate
-/// crosses once, and what a rule is called is its business rather than this report's.
+/// crosses once, and what a rule is called is its business rather than this report's. `ran` is
+/// whether a run helped make it: every point of the claim's domain walked, or a value found that its
+/// guard admits.
 pub type Certificate = {
   rules: List<Rule>,
   steps: Int,
   guard_satisfiable: Bool,
   sorts: List<String>,
+  ran: Bool,
 }
 
-pub type Instantiation = { var: String, ty: String }
-
-pub type Cases = {
-  generated: Int,
-  kept: Int,
-  rejected: Int,
-  /// The values the generators the cases were drawn through turned away on the way to them.
-  discarded: Int,
-  roots: List<Int>,
-  instantiations: List<Instantiation>,
-}
-
-pub type Evidence = | Proof(Certificate) | Sampled(Cases) | Measured(Fit)
-
-derive bin for Tier
 derive bin for Certificate
-derive bin for Instantiation
-derive bin for Cases
-derive bin for Evidence
 
-pub type Counter = {
-  bindings: List<Binding>,
-  original: List<Binding>,
-  shrinks: Int,
-  root: Int,
-  case: Int,
-  seed: Option<String>,
-}
-
-/// What re-running one case answered. `Kept` is a point the guard admitted and the body held,
-/// `Falsified` one the guard admitted and the body did not, and `Rejected` one the guard drew the
-/// line on: exactly what one turn of a search over cases sees. `Faulted` is Ply failing on it, which
-/// says nothing about the claim.
-pub type Point =
-  | Kept(List<Binding>)
-  | Falsified(List<Binding>)
-  | Rejected
-  | Undrawn(Gap)
-  | Faulted(Fault)
+/// A point a claim does not hold at, and for a law over a `simulate` region, the seed of the
+/// interleaving it failed under.
+pub type Counter = { bindings: List<Binding>, seed: Option<String> }
 
 /// What the runtime answered for one point. Judging a guard alone, `JHeld` is a point it admitted.
 pub type Judged =
@@ -515,24 +430,22 @@ pub type Judged =
   | JRaised({ message: String, values: List<Value> })
   /// Ply failed, which says nothing about the claim.
   | JFaulted({ code: String, message: String, notes: List<String>, values: List<Value> })
-  /// A cost law's size: the steps its body took, and its bound there.
-  | JMeasured({ steps: Int, bound: Int })
-  /// A cost law's size whose run took more steps than it was allowed, which were this many.
-  | JSpent(Int)
-  /// What the definition a point named answered at its arguments.
-  | JDrew(Value)
+
+/// What became of a claim. Only `Proved` lets a run pass: a claim nothing proved is one the program
+/// may not rest on, whether or not anything refuted it.
+/// Whether a claim came back proved, the one outcome a run does not fail on.
+pub fn is_proved(outcome: Outcome) -> Bool = match outcome { Proved(_) -> true, _ -> false }
 
 pub type Outcome =
-  | Held({ tier: Tier, evidence: Evidence })
+  | Proved(Certificate)
   | Refuted(Counter)
-  /// A cost law whose steps grew faster than its bound over the last sizes it was measured at.
-  | Outgrown(Fit)
-  /// Where the claim is written, as the CLI points at it, spelled out so this package carries no
-  /// opinion about a label.
-  | Vacuous({ guard: { module: Int, start: Int, end: Int }, why: Vacuity })
-  | Unattempted(Gap)
+  /// A guard that admits no value, where it is written, as the CLI points at it, spelled out so
+  /// this package carries no opinion about a label.
+  | Vacuous({ guard: { module: Int, start: Int, end: Int } })
+  | Unproved(Gap)
   /// Ply failed rather than the program: neither a verdict on the claim nor a gap in it.
   | Defect(Fault)
+
 // --- What a discharge has to say for itself ---------------------------------
 
 fn field(fields: Map<String, Json>, key: String) -> Json =
@@ -613,33 +526,6 @@ pub fn certificate_summary(c: Certificate) -> String / {abort.raise} = {
   join(push(sorted, int_to_string(c.steps) ++ " steps"), " · ")
 }
 
-/// Below the property tier a run has concrete cases and no coverage claim, so it says how many of
-/// what it drew the guard let through.
-pub fn cases_summary(tier: Tier, c: Cases) -> String / {abort.raise} = {
-  let head = match tier {
-    Example ->
-      int_to_string(c.kept) ++ " of " ++ int_to_string(c.generated)
-        ++ " cases kept · guard rejected "
-        ++ int_to_string(c.rejected),
-    _ ->
-      int_to_string(c.kept) ++ " " ++ plural(c.kept, "case") ++ " · " ++ int_to_string(c.rejected)
-        ++ " rejected",
-  };
-  let drawn = if c.discarded > 0 { head ++ " · " ++ int_to_string(c.discarded) ++ " discarded" }
-  else { head };
-  let rooted = if len(c.roots) > 1 { drawn ++ " · " ++ int_to_string(len(c.roots)) ++ " roots" }
-  else { drawn };
-  fold(c.instantiations, rooted, |acc: String, i: Instantiation|
-    acc ++ " · " ++ i.var ++ " := " ++ i.ty)
-}
-
-pub fn evidence_summary(tier: Tier, e: Evidence) -> String / {abort.raise} =
-  match e {
-    Proof(c) -> certificate_summary(c),
-    Sampled(c) -> cases_summary(tier, c),
-    Measured(f) -> fit_summary(f),
-  }
-
 /// A count of them wears its word. This is a package, so it carries the one it needs rather than
 /// reaching into the CLI's report.
 pub fn plural(n: Int, word: String) -> String / {abort.raise} =
@@ -654,22 +540,19 @@ pub fn ends_in_vowel(stem: String) -> Bool =
     || string_ends_with(stem, "o")
     || string_ends_with(stem, "u")
 
-test "the cache answers per obligation, and a host is never cached" {
+test "the cache answers per obligation, and a run that reads none discharges each" {
   let answers = [
     { reason: FromProof, from: Some("k0"), warning: None },
     { reason: Fresh, from: None, warning: None },
-    { reason: FromSample, from: Some("p2"), warning: None },
+    { reason: FromProof, from: Some("r2"), warning: None },
   ];
-  let hosted = [false, false, true];
-  let s = select(hosted, answers, true);
-  // The third reaches the world, so it is discharged whatever the cache holds.
-  assert_eq(s.reasons, [FromProof, Fresh, Uncached]);
-  assert_eq(s.from, [Some("k0"), None, None]);
-  assert_eq(s.to_discharge, [1, 2]);
-  assert_eq(hits(s), 1);
+  let s = select(answers, true);
+  assert_eq(s.reasons, [FromProof, Fresh, FromProof]);
+  assert_eq(s.from, [Some("k0"), None, Some("r2")]);
+  assert_eq(s.to_discharge, [1]);
+  assert_eq(hits(s), 2);
   assert_eq(s.warnings, []);
-  // `--no-cache` makes every obligation unanswerable, host or not.
-  let s = select(hosted, answers, false);
+  let s = select(answers, false);
   assert_eq(s.reasons, [Uncached, Uncached, Uncached]);
   assert_eq(s.from, [None, None, None]);
   assert_eq(s.to_discharge, [0, 1, 2]);
@@ -682,7 +565,7 @@ test "the cache answers per obligation, and a host is never cached" {
       warning: Some("the obligation cache holds something else for `ab`; it was discarded"),
     },
   ];
-  let s = select([false], refused, true);
+  let s = select(refused, true);
   assert_eq(s.reasons, [CacheRefused]);
   assert_eq(s.to_discharge, [0]);
   assert_eq(s.warnings, ["the obligation cache holds something else for `ab`; it was discarded"])
@@ -690,44 +573,39 @@ test "the cache answers per obligation, and a host is never cached" {
 
 fn bare() -> String = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-fn planned() -> String = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+fn ran() -> String = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-fn verdict(b: Held, p: Held) -> Answer / {abort.raise} = verdict_of(bare(), planned(), b, p)
+fn verdict(b: Held, r: Held) -> Answer / {abort.raise} = verdict_of(bare(), ran(), b, r)
 
-// Every combination of what the two keys can hold: nothing, a proof, a sample, or an entry the
-// runtime could not read.
-test "a proof is read under the bare key and a sample under the plan's, and nothing else" {
+// Every combination of what the two keys can hold: nothing, a proof read off the claim, one a run
+// helped make, or an entry the cache could not read.
+test "a proof read off the claim sits under the bare key, and one a run helped make under the run's" {
   assert_eq(verdict(None, None), { reason: Fresh, from: None, warning: None });
   assert_eq(verdict(Some("proof"), None), { reason: FromProof, from: Some(bare()), warning: None });
-  // A sample under the plan's key is exactly what belongs there.
-  assert_eq(verdict(None, Some("sample")), {
-    reason: FromSample,
-    from: Some(planned()),
-    warning: None,
-  });
-  // The bare key decides whatever the plan's holds.
-  assert_eq(verdict(Some("proof"), Some("sample")).reason, FromProof);
+  assert_eq(verdict(None, Some("run")), { reason: FromProof, from: Some(ran()), warning: None });
+  // The bare key decides whatever the run's holds.
+  assert_eq(verdict(Some("proof"), Some("run")).from, Some(bare()));
   assert_eq(verdict(Some("proof"), Some("proof")).from, Some(bare()));
-  assert_eq(verdict(Some("sample"), Some("sample")).reason, CacheRefused);
-  assert_eq(verdict(Some("other"), Some("sample")).reason, CacheRefused)
+  assert_eq(verdict(Some("run"), Some("run")).reason, CacheRefused);
+  assert_eq(verdict(Some("other"), Some("run")).reason, CacheRefused)
 }
 
 test "anything under the wrong key is refused, and says which key it was under" {
-  let bare_sample = verdict(Some("sample"), None);
-  assert_eq(bare_sample.reason, CacheRefused);
-  assert_eq(bare_sample.from, None);
+  let bare_run = verdict(Some("run"), None);
+  assert_eq(bare_run.reason, CacheRefused);
+  assert_eq(bare_run.from, None);
   assert_eq(
-    bare_sample.warning,
+    bare_run.warning,
     Some(
-      "the obligation cache holds a sampled discharge under the bare key for `0123456789ab`; it was discarded",
+      "the obligation cache holds a proof a run helped make under the bare key for `0123456789ab`; it was discarded",
     ),
   );
-  let planned_proof = verdict(None, Some("proof"));
-  assert_eq(planned_proof.reason, CacheRefused);
+  let run_proof = verdict(None, Some("proof"));
+  assert_eq(run_proof.reason, CacheRefused);
   assert_eq(
-    planned_proof.warning,
+    run_proof.warning,
     Some(
-      "the obligation cache holds a proof under a plan key for `0123456789ab`; it was discarded",
+      "the obligation cache holds a proof read off the claim alone under a run key for `0123456789ab`; it was discarded",
     ),
   );
   assert_eq(
@@ -739,38 +617,23 @@ test "anything under the wrong key is refused, and says which key it was under" 
   assert_eq(
     verdict(None, Some("other")).warning,
     Some(
-      "the obligation cache holds something it cannot read under a plan key for `0123456789ab`; it was discarded",
+      "the obligation cache holds something it cannot read under a run key for `0123456789ab`; it was discarded",
     ),
   );
   // A refusal is discharged again, and its warning reaches the run.
-  let s = select([false, false], [planned_proof, verdict(None, Some("sample"))], true);
+  let s = select([run_proof, verdict(None, Some("run"))], true);
   assert_eq(s.to_discharge, [0]);
   assert_eq(len(s.warnings), 1);
   assert_eq(hits(s), 1)
 }
 
-test "a proof is filed under the bare key, anything weaker under the plan's, and a failure nowhere" {
-  let keys = [
-    { bare: "b0", planned: "p0" },
-    { bare: "b1", planned: "p1" },
-    { bare: "b2", planned: "p2" },
-    { bare: "b3", planned: "p3" },
-  ];
-  let outcomes = [Some(Proved), Some(Property), None, Some(Example)];
-  assert_eq(filings(keys, [false, false, false, false], outcomes, [0, 1, 2, 3], true), [
-    { at: 0, key: "b0" },
-    { at: 1, key: "p1" },
-    { at: 3, key: "p3" },
-  ]);
+test "a proof is filed under the key its making reads, and a claim nothing proved nowhere" {
+  let keys = [{ bare: "b0", ran: "r0" }, { bare: "b1", ran: "r1" }, { bare: "b2", ran: "r2" }];
+  let proofs = [Some(false), Some(true), None];
+  assert_eq(filings(keys, proofs, [0, 1, 2], true), [{ at: 0, key: "b0" }, { at: 1, key: "r1" }]);
   // Only what this run discharged: an answer from the cache is already filed.
-  assert_eq(filings(keys, [false, false, false, false], outcomes, [1], true), [
-    { at: 1, key: "p1" },
-  ]);
-  // A claim that reaches the world is about that moment, and `--no-cache` writes nothing at all.
-  assert_eq(filings(keys, [true, false, false, false], outcomes, [0, 1], true), [
-    { at: 1, key: "p1" },
-  ]);
-  assert_eq(filings(keys, [false, false, false, false], outcomes, [0, 1, 2, 3], false), [])
+  assert_eq(filings(keys, proofs, [1], true), [{ at: 1, key: "r1" }]);
+  assert_eq(filings(keys, proofs, [0, 1, 2], false), [])
 }
 
 test "a law names definitions, and the sentence it was written as is part of their spec" {
@@ -795,38 +658,24 @@ test "a law names definitions, and the sentence it was written as is part of the
   assert_eq(spec_hashes("m.nothing", texts, laws), [])
 }
 
-test "the strongest discharge is what a definition is covered by" {
+test "a definition is covered by a claim about it that was proved" {
   let laws = add_law(no_laws(), "m.sorted", "h-law", ["m.sort"]);
   let defs = ["m.sort", "m.insert", "m.other"];
-  // The same definition at two tiers: the stronger one covers it.
   let results = [
-    a_clause("m.sort", Some(Example)),
-    a_clause("m.sort", Some(Proved)),
-    a_clause("m.insert", Some(Property)),
-    a_law("m.sorted", Some(Example)),
+    a_clause("m.sort", false),
+    { ..a_clause("m.sort", true), kind: Cost(0) },
+    a_clause("m.insert", true),
+    a_law("m.sorted", false),
   ];
   let c = coverage(defs, laws, results);
   assert_eq(c.definitions, 3);
   assert_eq(c.covered, 2);
   // In name order, since it is a list to work through.
   assert_eq(c.uncovered, ["m.other"]);
-  // Ascending strength, and `proved` is last because it is the strongest.
-  assert_eq(c.by_tier, [
-    { tier: Example, count: 0 },
-    { tier: Fitted, count: 0 },
-    { tier: Property, count: 1 },
-    { tier: Proved, count: 1 },
-  ]);
-  // A claim that held nothing covers nothing, whatever it is about.
-  let c = coverage(defs, laws, [a_row("m.sort", Ensures(0), None, false, true)]);
+  // A claim nothing proved covers nothing, whatever it is about.
+  let c = coverage(defs, laws, [a_row("m.sort", Ensures(0), false, true)]);
   assert_eq(c.covered, 0);
-  assert_eq(c.uncovered, ["m.insert", "m.other", "m.sort"]);
-  assert_eq(c.by_tier, [
-    { tier: Example, count: 0 },
-    { tier: Fitted, count: 0 },
-    { tier: Property, count: 0 },
-    { tier: Proved, count: 0 },
-  ])
+  assert_eq(c.uncovered, ["m.insert", "m.other", "m.sort"])
 }
 
 test "a law covers every definition it names, and a definition named twice is still one" {
@@ -851,13 +700,11 @@ test "a law covers the definitions it mentions, and nothing else it names" {
   ]);
   assert_eq(law_targets(laws, "m.cancel"), ["m.credited", "m.debited"]);
   assert_eq(law_text(laws, "m.cancel"), Some("h9"));
-  let c = coverage(["m.credited", "m.debited", "m.helper"], laws, [
-    a_law("m.cancel", Some(Proved)),
-  ]);
+  let c = coverage(["m.credited", "m.debited", "m.helper"], laws, [a_law("m.cancel", true)]);
   assert_eq(c.covered, 2);
   assert_eq(c.uncovered, ["m.helper"]);
   // A law that does not hold covers nothing.
-  let refuted = coverage(["m.credited"], laws, [a_row("m.cancel", Law(None), None, false, true)]);
+  let refuted = coverage(["m.credited"], laws, [a_row("m.cancel", Law(None), false, true)]);
   assert_eq(refuted.covered, 0);
   assert_eq(refuted.uncovered, ["m.credited"])
 }
@@ -868,22 +715,19 @@ test "a definition with no obligation is never covered, and each covered one cou
   assert_eq(none.uncovered, ["m.f"]);
   // Only an obligation that holds covers its definition.
   let c = coverage(["m.f", "m.g", "m.h", "m.i"], no_laws(), [
-    a_clause("m.f", Some(Proved)),
-    a_row("m.g", Ensures(0), None, false, true),
-    a_row("m.h", Ensures(0), None, false, false),
+    a_clause("m.f", true),
+    a_row("m.g", Ensures(0), false, true),
+    a_row("m.h", Ensures(0), false, false),
   ]);
   assert_eq(c.definitions, 4);
   assert_eq(c.covered, 1);
   assert_eq(c.uncovered, ["m.g", "m.h", "m.i"]);
   let both = coverage(["m.f", "m.g"], no_laws(), [
-    a_clause("m.f", Some(Example)),
-    { ..a_clause("m.f", Some(Proved)), kind: Ensures(1) },
-    a_clause("m.g", Some(Property)),
+    a_clause("m.f", true),
+    { ..a_clause("m.f", true), kind: Ensures(1) },
+    a_clause("m.g", true),
   ]);
-  assert_eq(
-    fold(both.by_tier, 0, |n: Int, b: { tier: Tier, count: Int }| n + b.count),
-    both.covered,
-  )
+  assert_eq(both.covered, 2)
 }
 
 test "a definition's record is its hash, its own clauses and the laws naming it" {
@@ -930,10 +774,10 @@ test "the review names what moved, and what became of the claims that went with 
     { name: "m.same", def_hash: "h1", specs: ["s1"] },
   ]);
   let results = [
-    a_clause("m.moved", Some(Proved)),
-    a_row("m.spec_moved", Ensures(0), None, false, true),
-    a_row("m.fresh", Ensures(0), None, false, false),
-    a_clause("m.same", Some(Proved)),
+    a_clause("m.moved", true),
+    a_row("m.spec_moved", Ensures(0), false, true),
+    a_row("m.fresh", Ensures(0), false, false),
+    a_clause("m.same", true),
   ];
   let r = review(defs, laws, current, baselines, results);
   assert_eq(r.reviewed, 3);
@@ -1005,7 +849,7 @@ test "what a review names: the moved half, the claims that went with it, and not
     no_laws(),
     [def("m.f", "h1", ["h7"])],
     no_laws(),
-    [a_clause("m.f", Some(Proved))],
+    [a_clause("m.f", true)],
   );
   assert_eq(same.changed, []);
   assert_eq(same.reviewed, 1);
@@ -1028,7 +872,7 @@ test "what a review names: the moved half, the claims that went with it, and not
     no_laws(),
     [def("m.f", "h2", ["h7"]), def("m.g", "h4", [])],
     no_laws(),
-    [a_clause("m.f", Some(Proved))],
+    [a_clause("m.f", true)],
   );
   assert_eq(len(two.changed), 2);
   assert_eq(specified_changes(two), 1);
@@ -1040,12 +884,12 @@ test "a refuted claim is broken, and one never discharged is broken and undischa
   let before = [def("m.f", "h1", ["h7"])];
   let after = [def("m.f", "h2", ["h7"])];
   let refuted = reviewed_after(["m.f"], before, no_laws(), after, no_laws(), [
-    a_row("m.f", Ensures(0), None, false, true),
+    a_row("m.f", Ensures(0), false, true),
   ]);
   assert_eq(refuted.broken, 1);
   assert_eq(refuted.undischarged, 0);
   let gap = reviewed_after(["m.f"], before, no_laws(), after, no_laws(), [
-    a_row("m.f", Ensures(0), None, false, false),
+    a_row("m.f", Ensures(0), false, false),
   ]);
   assert_eq(gap.broken, 1);
   assert_eq(gap.undischarged, 1);
@@ -1078,7 +922,7 @@ test "a law's text is its targets' spec, wherever the law is declared" {
     add_law(no_laws(), "a.cancel", "h9", ["m.f"]),
     f,
     add_law(no_laws(), "b.cancel", "h9", ["m.f"]),
-    [a_law("b.cancel", Some(Proved))],
+    [a_law("b.cancel", true)],
   );
   assert_eq(moved_law.changed, []);
   // Rewriting it, or deleting it, is a spec change on everything it named.
@@ -1088,7 +932,7 @@ test "a law's text is its targets' spec, wherever the law is declared" {
     add_law(no_laws(), "m.cancel", "h9", ["m.f"]),
     f,
     add_law(no_laws(), "m.cancel", "h10", ["m.f"]),
-    [a_law("m.cancel", Some(Proved))],
+    [a_law("m.cancel", true)],
   );
   assert_eq(map(rewritten.changed, |change: Change| moved_word(change.spec)), ["changed"]);
   assert_eq(map(rewritten.changed, |change: Change| moved_word(change.implementation)), [
@@ -1105,78 +949,81 @@ test "a law's text is its targets' spec, wherever the law is declared" {
   assert_eq(map(deleted.changed, |change: Change| moved_word(change.spec)), ["changed"])
 }
 
-test "every word a report prints for a reason, a tier, or a move" {
+test "every word a report prints for a reason or a move" {
   assert_eq(reason_word(Fresh), "new");
   assert_eq(reason_word(FromProof), "cached proof");
-  assert_eq(reason_word(FromSample), "cached sample");
   assert_eq(reason_word(Uncached), "uncached");
   assert_eq(reason_word(CacheRefused), "cache refused");
   assert_eq(reason_hit(FromProof), true);
   assert_eq(reason_hit(Fresh), false);
-  assert_eq(tier_word(Proved), "proved");
-  assert_eq(tier_word(Example), "example");
-  assert_eq(tier_rank(Proved) > tier_rank(Property), true);
-  assert_eq(tier_rank(Property) > tier_rank(Fitted), true);
-  assert_eq(tier_rank(Fitted) > tier_rank(Example), true);
-  assert_eq(tiers(), [Example, Fitted, Property, Proved]);
   assert_eq(moved_word(Never), "never")
 }
 
 /// A binder a discharge saw, and the value it was given.
 pub type Binding = { name: String, ty: String, value: Value }
 
-/// Why a guard admitted nothing: it is unsatisfiable, or a full budget kept no case of it.
-pub type Vacuity = | Unsatisfiable | NoCaseKept(Int)
+/// A place the static prover left the fragment it decides: `kind` names the construct, and
+/// `about` the definition or reason it names.
+pub type Stuck = { kind: String, about: Option<String> }
 
-/// What a discharge could not establish. A gap is not a failure: nothing was established, and
-/// nothing was refuted.
+/// What stands between a claim and a proof of it. Nothing refuted the claim and nothing established
+/// it, so the run fails on it.
 pub type Gap =
+  /// The static prover closed no proof, within its budget or not, and no run walks every point of
+  /// the claim's domain.
+  | Open({ spent: Bool, stuck: List<Stuck> })
   /// `None` when the owner's row is empty, which names nothing to hold a handler for.
   | UnhandledEffect(Option<String>)
-  | Ungeneratable({ param: String, ty: String })
   /// `message` names `values` by their slots.
   | Raised({ message: String, values: List<Value>, bindings: List<Binding> })
-  | GuardNotSampled({ generated: Int, witness: List<Binding> })
-  | ReachesHost(String)
-  /// The obligation's points are not drawn one at a time, so there is no case to re-run.
-  | NotDrawn
-  /// A cost law measured at too few sizes to read a trend from.
-  | Unfitted(Fit)
-  /// The generator a type states drew no value of it: `such_that` spent its budget, having turned
-  /// that many away, or there was nothing to choose from.
-  | GaveUp({ ty: String, discards: Int })
+  /// Proved of every value the guard admits, with no value found that it admits.
+  | NoWitness
+  /// A law over a `simulate` region whose binders' domain no run walks whole.
+  | Endless
+  /// A law over a `simulate` region with more interleavings than the search explores: how many it
+  /// ran.
+  | Unsearched(Int)
 
 pub fn gap_summary(g: Gap) -> String / {abort.raise} =
   match g {
+    Open(o) -> if o.spent { "no proof within the prover's budget" } else { "no proof" },
     UnhandledEffect(row) -> match row {
       None -> "no handler for what it performs",
       Some(text) -> "performs " ++ text ++ ": no handler",
     },
-    Ungeneratable(u) -> "no value of `" ++ u.ty ++ "` can be generated for `" ++ u.param ++ "`",
     Raised(r) -> "raised: " ++ filled(r.message, r.values),
-    GuardNotSampled(g2) ->
-      "the guard kept none of " ++ int_to_string(g2.generated)
-        ++ " cases, but it does admit a value",
-    ReachesHost(row) -> "reaches the host (" ++ row ++ "); run `ply prove --host`",
-    NotDrawn -> "its points are not drawn one at a time",
-    Unfitted(f) -> unfitted_summary(f),
-    GaveUp(u) ->
-      "the generator of `" ++ u.ty ++ "` drew no value, having discarded "
-        ++ int_to_string(u.discards),
+    NoWitness -> "proved of every value its guard admits, and no value found that it admits",
+    Endless -> "its binders' domain is not one a run walks whole",
+    Unsearched(ran) ->
+      "more interleavings than the search explores, " ++ int_to_string(ran) ++ " of them run",
   }
 
 /// A gap's kind, as a document names it for a reader that counts gaps rather than reading them.
 pub fn gap_word(g: Gap) -> String =
   match g {
+    Open(_) -> "open",
     UnhandledEffect(_) -> "unhandled_effect",
-    Ungeneratable(_) -> "ungeneratable",
     Raised(_) -> "raised",
-    GuardNotSampled(_) -> "guard_not_sampled",
-    ReachesHost(_) -> "reaches_host",
-    NotDrawn -> "not_drawn",
-    Unfitted(_) -> "unfitted",
-    GaveUp(_) -> "gave_up",
+    NoWitness -> "unwitnessed",
+    Endless -> "endless",
+    Unsearched(_) -> "unsearched",
   }
+
+/// Where the static prover stopped, as a line under an unproved claim reads: the construct it does
+/// not decide, with the definition it names, or the reason an induction or a `cost` bound gave.
+pub fn stuck_summary(s: Stuck) -> String = {
+  let stopped = |what: String|
+    "the prover stopped at "
+      ++ (match s.about { Some(a) -> what ++ " `" ++ a ++ "`", None -> what });
+  if s.kind == "recursive_call" { stopped("a call of the recursive") }
+  else if s.kind == "effectful_call" { stopped("a call that performs, of") }
+  else if s.kind == "unfold_limit" { stopped("calls nested deeper than it unfolds, at") }
+  else if s.kind == "opaque_call" {
+    stopped("a call of a builtin or of a name from outside the program,")
+  } else if s.kind == "induction" || s.kind == "unbounded" {
+    match s.about { Some(why) -> why, None -> stopped(s.kind) }
+  } else { stopped(join(string_split(s.kind, "_"), " ")) }
+}
 
 /// Ply's own failure while discharging a claim, and the point it was judging, if one was.
 /// `message` and `notes` name `values` by their slots.
@@ -1197,24 +1044,37 @@ pub fn fault_notes(f: Fault) -> List<String> / {abort.raise} =
 pub fn fault_summary(f: Fault) -> String / {abort.raise} =
   "Ply failed rather than the program, so this is a defect in Ply: " ++ fault_message(f)
 
-pub fn vacuity_summary(v: Vacuity) -> String =
-  match v {
-    Unsatisfiable -> "the guard admits no value",
-    NoCaseKept(generated) -> "the guard kept none of " ++ int_to_string(generated) ++ " cases",
-  }
+pub fn vacuity_summary() -> String = "the guard admits no value"
 
-test "a gap and a vacuity read as one line each" {
-  assert_eq(gap_summary(NotDrawn), "its points are not drawn one at a time");
+test "a gap reads as one line" {
+  assert_eq(gap_summary(Open({ spent: false, stuck: [] })), "no proof");
+  assert_eq(gap_summary(Open({ spent: true, stuck: [] })), "no proof within the prover's budget");
   assert_eq(
-    gap_summary(Ungeneratable({ param: "f", ty: "(Int) -> Int" })),
-    "no value of `(Int) -> Int` can be generated for `f`",
+    gap_summary(NoWitness),
+    "proved of every value its guard admits, and no value found that it admits",
+  );
+  assert_eq(gap_summary(Endless), "its binders' domain is not one a run walks whole");
+  assert_eq(
+    gap_summary(Unsearched(4096)),
+    "more interleavings than the search explores, 4096 of them run",
+  )
+}
+
+test "a place the prover stopped at names the construct, and the definition where there is one" {
+  assert_eq(stuck_summary({ kind: "lambda", about: None }), "the prover stopped at lambda");
+  assert_eq(
+    stuck_summary({ kind: "nonlinear_multiplication", about: None }),
+    "the prover stopped at nonlinear multiplication",
   );
   assert_eq(
-    gap_summary(GaveUp({ ty: "m.Even", discards: 100 })),
-    "the generator of `m.Even` drew no value, having discarded 100",
+    stuck_summary({ kind: "recursive_call", about: Some("m.f") }),
+    "the prover stopped at a call of the recursive `m.f`",
   );
-  assert_eq(vacuity_summary(Unsatisfiable), "the guard admits no value");
-  assert_eq(vacuity_summary(NoCaseKept(8)), "the guard kept none of 8 cases")
+  // An induction that declined and a bound the reading does not show say why themselves.
+  assert_eq(
+    stuck_summary({ kind: "unbounded", about: Some("its steps are not within the bound") }),
+    "its steps are not within the bound",
+  )
 }
 
 test "the program's raise and Ply's failure each read one way, and only Ply's names Ply" {
@@ -1236,25 +1096,20 @@ test "the program's raise and Ply's failure each read one way, and only Ply's na
 
 test "every kind of gap has a word of its own" {
   let every = [
+    Open({ spent: false, stuck: [] }),
     UnhandledEffect(None),
-    Ungeneratable({ param: "f", ty: "(Int) -> Int" }),
     Raised({ message: "division by zero", values: [], bindings: [] }),
-    GuardNotSampled({ generated: 200, witness: [] }),
-    ReachesHost("{db.read[users]}"),
-    NotDrawn,
-    Unfitted({ measures: [], spent: None }),
-    GaveUp({ ty: "m.Even", discards: 100 }),
+    NoWitness,
+    Endless,
+    Unsearched(8),
   ];
-  let words = map(every, gap_word);
-  assert_eq(words, [
+  assert_eq(map(every, gap_word), [
+    "open",
     "unhandled_effect",
-    "ungeneratable",
     "raised",
-    "guard_not_sampled",
-    "reaches_host",
-    "not_drawn",
-    "unfitted",
-    "gave_up",
+    "unwitnessed",
+    "endless",
+    "unsearched",
   ]);
   // Two gaps of one kind with different particulars are one word.
   assert_eq(gap_word(UnhandledEffect(Some("{db.read[rows]}"))), gap_word(UnhandledEffect(None)))
@@ -1271,57 +1126,32 @@ test "a frame reads as one line too" {
   assert_eq(frame_summary(Writes(["std.io.file", "clock"])), "writes std.io.file, clock")
 }
 
-test "a certificate and a sample each read as one line" {
+test "a certificate reads as one line" {
   assert_eq(
-    evidence_summary(
-      Example,
-      Sampled({ generated: 3, kept: 3, rejected: 0, discarded: 0, roots: [0], instantiations: [] }),
-    ),
-    "3 of 3 cases kept · guard rejected 0",
-  );
-  assert_eq(
-    evidence_summary(
-      Property,
-      Sampled({
-        generated: 9,
-        kept: 8,
-        rejected: 1,
-        discarded: 4,
-        roots: [],
-        instantiations: [{ var: "x", ty: "Int" }],
-      }),
-    ),
-    "8 cases · 1 rejected · 4 discarded · x := Int",
-  );
-  assert_eq(
-    evidence_summary(
-      Proved,
-      Proof({
-        rules: [
-          induction_rule("n", Descent(1), "m.f"),
-          Unfold({ def: "m.f", depth: 1 }),
-          Unfold({ def: "m.g", depth: 1 }),
-        ],
-        steps: 3,
-        guard_satisfiable: true,
-        sorts: ["T"],
-      }),
-    ),
+    certificate_summary({
+      rules: [
+        induction_rule("n", Descent(1), "m.f"),
+        Unfold({ def: "m.f", depth: 1 }),
+        Unfold({ def: "m.g", depth: 1 }),
+      ],
+      steps: 3,
+      guard_satisfiable: true,
+      sorts: ["T"],
+      ran: false,
+    }),
     "induction on n, unrolling m.f · 2 unfoldings · uninterpreted T · 3 steps",
   );
   assert_eq(
-    evidence_summary(
-      Proved,
-      Proof({
-        rules: [
-          induction_rule("xs", Spine(1), "m.reverse"),
-          Cited({ law: "m.a push reversed leads", label: "a push reversed leads" }),
-        ],
-        steps: 9,
-        guard_satisfiable: true,
-        sorts: [],
-      }),
-    ),
+    certificate_summary({
+      rules: [
+        induction_rule("xs", Spine(1), "m.reverse"),
+        Cited({ law: "m.a push reversed leads", label: "a push reversed leads" }),
+      ],
+      steps: 9,
+      guard_satisfiable: true,
+      sorts: [],
+      ran: false,
+    }),
     "structural induction on xs, unrolling m.reverse · lemma \"a push reversed leads\" · 9 steps",
   )
 }

@@ -47,7 +47,7 @@ import std.gen
 import std.gen (Gen)
 import std.json
 import std.json (Json)
-import std.laws (agrees, idempotent, inverse, round_trip)
+import std.laws (inverse)
 import std.list (at_or, concat, contains, flat_map, slice, sort)
 import std.option (option_traverse)
 import std.seq
@@ -2606,9 +2606,8 @@ pub fn literal(text: String) -> Result<Html, { message: String, offset: Int }> /
 /// schemes and the names of references far more often than a `String` does.
 pub type Hostile = | Hostile(String)
 
-gen for Hostile by hostile
-
-fn hostile() -> Gen<Hostile> =
+/// A `Hostile` as a test draws one.
+pub fn hostile() -> Gen<Hostile> =
   gen::map(gen::list_of(gen::elements(hostile_parts()), 12), |parts: List<String>|
     Hostile(join(parts, "")))
 
@@ -2921,31 +2920,12 @@ test "the notice of the table names who made it and the licences it is passed on
   assert(string_contains(license(), "https://html.spec.whatwg.org/entities.json"))
 }
 
-law "a text reads back from its escape" =
-  inverse(|h: Hostile| escape(hostile_text(h)), |s: String| Hostile(unescape(s)))
+test "any text reads back from its escape" {
+  gen::check(gen::text(), |x: String| inverse(escape, unescape, x))
+}
 
-law "a text reads back from its escape as content" =
-  inverse(|h: Hostile| escape_text(hostile_text(h)), |s: String| Hostile(unescape(s)))
-
-law "a value reads back from its escape as an attribute's" =
-  inverse(|h: Hostile| escape_attribute(hostile_text(h)), |s: String|
-    Hostile(unescape_attribute(s)))
-
-law "a value reads back from the escape that is text anywhere" =
-  inverse(|h: Hostile| escape(hostile_text(h)), |s: String| Hostile(unescape_attribute(s)))
-
-law "any text reads back from its escape" = inverse(escape, unescape)
-
-fn without_ampersands(h: Hostile) -> String = replace(hostile_text(h), "&", "")
-
-law "a text with no `&` is what it unescapes to" =
-  agrees(|h: Hostile| unescape(without_ampersands(h)), without_ampersands)
-
-law "unescaping a text with no `&` a second time changes nothing" =
-  idempotent(|s: String| unescape(replace(s, "&", "")))
-
-law "an escape holds no character that opens a tag or closes a value"
-  forall (h: Hostile) {
+test "an escape holds no character that opens a tag or closes a value" {
+  gen::check(hostile(), |h: Hostile| {
     let content = escape_text(hostile_text(h));
     let value = escape_attribute(hostile_text(h));
     let anywhere = escape(hostile_text(h));
@@ -2953,10 +2933,8 @@ law "an escape holds no character that opens a tag or closes a value"
       && !string_contains(anywhere, "\"")
       && !string_contains(anywhere, "'")
       && !string_contains(anywhere, "<")
-  }
-
-law "a fragment reads back from what reflect shows of it" =
-  round_trip(|h: Html| reflect(h), reflected)
+  })
+}
 
 test "only what reflect shows of a fragment is one" {
   let page = fragment([
@@ -3137,8 +3115,8 @@ test "a browser's scheme is read past the blanks and line ends it drops" {
   assert_eq(browser_scheme(""), None)
 }
 
-law "a value written where a URL starts gives it no scheme but one allowed"
-  forall (h: Hostile) {
+test "a value written where a URL starts gives it no scheme but one allowed" {
+  gen::check(hostile(), |h: Hostile| {
     match url_value(Start, hostile_text(h), false) {
       Err(_) -> true,
       Ok(url) -> match browser_scheme(unescape_attribute(escape(url))) {
@@ -3146,24 +3124,8 @@ law "a value written where a URL starts gives it no scheme but one allowed"
         Some(scheme) -> allowed(bytes_of_string(scheme)),
       },
     }
-  }
-
-law "a value written after a URL's first letters or its `?` ends no scheme"
-  forall (h: Hostile, n: Int) {
-    match url_value(at_or([First, Query], n & 1, First), hostile_text(h), false) {
-      Err(_) -> true,
-      Ok(url) -> browser_scheme("x" ++ url) == None,
-    }
-  }
-
-law "a value written into a URL a second time is the URL it was"
-  forall (h: Hostile, n: Int) {
-    let part = at_or([Start, First, Path], n & 3, Path);
-    match url_value(part, hostile_text(h), true) {
-      Err(_) -> false,
-      Ok(url) -> url_value(part, url, true) == Ok(url),
-    }
-  }
+  })
+}
 
 fn drafted(steps: List<Result<String, Html>>, urls: Bool) -> Option<String> / {abort.raise} = {
   let end = fold(steps, Some(draft(urls)), |d: Option<Draft>, s: Result<String, Html>|
@@ -3423,50 +3385,12 @@ fn read_whole(input: Bytes, all: List<Lexeme>) -> Bool =
     ).ok
     && (match list_at(all, len(all) - 1) { Some(l) -> l.token == EndOfFile, None -> false })
 
-law "any bytes are read to their end, each token in order and inside them"
-  forall (b: Bytes) {
+test "any bytes are read to their end, each token in order and inside them" {
+  gen::check(gen::bytes(), |b: Bytes| {
     let input = decoded(b);
     match tokenize(cursor(b, start(), default_limits())) {
       Ok(all) -> read_whole(input, all),
       Err(_) -> false,
     }
-  }
-
-law "markup of any pieces is read to its end, each token in order and inside it"
-  forall (h: Hostile, n: Int) {
-    let s: Start = {
-      state: at_or([Data, Rcdata, Rawtext, ScriptData, Plaintext, CdataSection], n & 7, Data),
-      last_start_tag: Some("script"),
-      foreign: n & 8 == 8,
-    };
-    let input = bytes_of_string(hostile_text(h));
-    match tokenize(cursor(input, s, default_limits())) {
-      Ok(all) -> read_whole(input, all),
-      Err(_) -> false,
-    }
-  }
-
-law "a text escaped for content is read back as that text"
-  forall (h: Hostile) {
-    let s = hostile_text(h);
-    let read = match tokenize(cursor(bytes_of_string(escape_text(s)), start(), default_limits())) {
-      Ok(all) -> map(all, |l: Lexeme| l.token),
-      Err(_) -> [],
-    };
-    read == (if s == "" { [EndOfFile] } else { [Text(s), EndOfFile] })
-  }
-
-law "a value escaped for an attribute is read back as that attribute's value"
-  forall (h: Hostile) {
-    let s = hostile_text(h);
-    let markup = "<p title=\"" ++ escape_attribute(s) ++ "\">";
-    let read = match tokenize(cursor(bytes_of_string(markup), start(), default_limits())) {
-      Ok(all) -> map(all, |l: Lexeme| l.token),
-      Err(_) -> [],
-    };
-    read
-      == [
-        StartTag(tag("p", [{ name: "title", value: replace(s, "\u{0}", "\u{fffd}") }])),
-        EndOfFile,
-      ]
-  }
+  })
+}

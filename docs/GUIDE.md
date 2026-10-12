@@ -168,11 +168,11 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `set` | `effect set X = {..}` |
 | `new` | right after the `=` of a `type` declaration |
 | `opaque` | before `type` at item position (§3.2) |
-| `law`, `host`, `schema`, `forall`, `cost` | `law "..."`, `law/host` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` after a law's binders and guard, among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
+| `law`, `schema`, `forall`, `cost` | `law "..."` or `law schema <name>` at item position; `forall` after a law's label or a schema's parameters; `cost` among a `fn`'s `requires` and `ensures`, or after a `fn` parameter's function type |
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
-| `key`, `show`, `gen`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `gen for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
 | `where`, `derivable` | after a signature's row, or after a law's binders |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -448,11 +448,12 @@ publishes for the type:
 * a constructor of an opaque sum, called, passed, imported or matched, is
   `E0107`: the type's module keeps it, as it keeps a private name;
 * a record literal where an opaque record is expected, and an update of one,
-  is `E0220`;
-* a `forall` over a type that holds one is `E0418` (§10): a value drawn there
-  would be built there. The law is stated in the type's module, or over what
-  its functions take; or the module states a `gen` for the type (§4.4), whose
-  values are then the module's own wherever they are drawn.
+  is `E0220`.
+
+A law in another module may quantify over the type all the same: its proof
+reads every value the declaration admits, which holds every value the type's
+module builds, and such a law is never proved by running it at values made
+there (§10).
 
 An opaque record's fields are still read, by `d.year` and by a record pattern,
 in any module; a module that keeps what a value holds to itself declares a sum
@@ -907,49 +908,6 @@ a numeric type: it fills `numeric(a)` (§4.5), as `std.math.sum(xs)` over a
 `numeric(a)`, which holds the ordered comparisons. `==`, `compare` and `digest`
 are the key's, whatever arithmetic is stated. Each of these is `E0201` where
 the type does not have it.
-
-A type states how its values are drawn, where a claim over it is sampled (§10):
-
-```ply
-import std.gen
-import std.gen (Gen)
-
-pub type Date = new { year: Int, month: Int, day: Int }
-
-gen for Date by dates
-
-fn dates() -> Gen<Date> =
-  gen::map2(gen::int_between(1, 12), gen::int_between(1, 28), |month: Int, day: Int|
-    { year: 2000, month: month, day: day })
-```
-
-`gen for T by f` names a function of the same module that answers a `std.gen`
-generator of the type (`ply doc std.gen`): `f: () -> Gen<T>`, or for a type with
-parameters one that takes a generator for each, `f: (Gen<a>, Gen<b>) -> Gen<T<a, b>>`.
-It performs nothing but `abort.raise`. A `forall` over `T` then draws each `T`
-through `f` and never from the type's fields, wherever the type sits in a
-binder: a `List<T>`, a record or a sum that holds one, a `T<U>`. So a sampled
-claim sees only values the module makes, a month 13 never among them, and a law
-in any module may quantify over an `opaque` type (§3.2) that states one: its
-generator is the module building the value. A module
-that states a `gen` imports `std.gen` itself, under a name no source can write,
-so `std.gen` states none.
-
-`T` is a sum or a `new` record the module declares (`E0208`), and states one
-generator (`E0105`). An alias is the type it names, and nothing says which label
-or row a drawn value of a type that binds one is at, so neither states one; a
-function that is no generator of the type is refused where it is stated, with
-what it was held to (`E0473`). A generator holds a function, which no build
-keeps, so `f` is no `const fn` (`E0156`, §3.5). The statement is also the definition `_sample_T`
-(`E0105` if the module declares one): `f`'s generator sampled at a root, a key
-and a size, or from a record of draws, each generator `f` takes choosing among
-values handed in. It is what `ply prove` enters to draw a `T`, and what a test
-calls to see what a generator makes.
-
-A generator decides what a sample draws and nothing a program computes. It is
-no part of its type's hash: an edit to one re-checks no definition that holds a
-`T` and re-runs no test, and draws again exactly the samples drawn through it
-(§10).
 
 ### 4.5 Generics
 
@@ -2033,7 +1991,7 @@ test "ten more elements cost twenty more steps: one in each closure" {
 }
 ```
 
-A cost law (§10) states how `steps` grows with a size instead of pinning it.
+`std.pace::paced` checks how `steps` grows with a size instead of pinning it.
 
 A test may range over a table, and is then a test for each of its elements, a
 *case*:
@@ -2387,28 +2345,28 @@ law "a credit and a matching debit leave an account exactly as it was"
   `ensures`; it is not checked at call sites and laws do not inherit it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified, as a sum whose function performs the type's row parameter
-  cannot, whatever row it is given, nor a type that holds one another module
-  declares `opaque` and states no `gen` for, §3.2), an optional `where` guard,
-  an optional `cost` bound (below) and a block body.
+  cannot, whatever row it is given), an optional `where` guard and a block body.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
   raise (§6.8) or may not return (§5.10), and a law body may be a `simulate`
-  region; a proposition that raises, or runs past its steps, is a gap in the
-  claim. `law/host "..." { }` allows any effect but is
-  never `proved` or cached, and is `W0604` under a hermetic run. Under `--host`
-  its guard and body run against the host the run binds, and what their entries
-  end with, such as a span left open (`W0609`), is reported once.
+  region.
 * Specs do not change a definition's hash. An `ensures` implies every resource
   outside the footprint is unchanged; there is no `old()`.
 * `Int` arithmetic is checked, so bound the domain with guards as above.
 
-| tier | claim |
+A claim is proved or it fails the run: `ply prove` exits 0 only where every
+obligation it reports on is `proved`.
+
+| outcome | claim |
 | --- | --- |
-| `proved` | holds for every input satisfying the guard, or a `cost` clause read off the body |
-| `property` | randomized cases passed; failures shrink |
-| `example` | concrete cases passed |
-| `fitted` | a cost law's steps kept its bound's pace over eight or more sizes |
-| `unattempted` (`W0604`) | undecided; never green, never cached |
-| `defect` | Ply failed rather than the program: nothing is claimed, never cached, exit 1 |
+| `proved` | holds for every input its guard admits, or a `cost` bound read off the body |
+| `refuted` (`E0419`) | false at the point shown |
+| `vacuous` (`E0420`) | its guard admits no value |
+| `unproved` (`E0474`) | nothing proves it, and nothing refutes it |
+| `defect` | Ply failed rather than the program: nothing is claimed, under Ply's own code |
+
+What no proof closes is not a claim a program may rest on. Check it in a test
+(§8.1) instead, over values `std.gen` draws or sizes `std.pace` doubles, and it
+says what a test says: that it held where it was run.
 
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
@@ -2428,27 +2386,28 @@ Congruence and injectivity read `==` as what a value's constructors and fields
 say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
 not, and arithmetic as the integers', which an operator at a type that states
 `numeric` is not. A claim that holds a value of any of them, at any depth, is
-never `proved`: it is run, over every point of a finite domain or over a sample.
-Under `--reach` the place is `float_term` or `keyed_term`.
+proved only by a walk of every point of a finite domain. An `unproved` claim
+names each place the prover stopped, such as `float term` or `keyed term`.
 
-A sampled claim draws each binder from its type: a scalar, a list, a record or
-a sum from its structure, and a type that states a generator (§4.4) through it,
-at any depth. The generator is handed a size, the case's place in its run up to
-63, so early cases are small, and for each of its type's parameters a generator
-that chooses among sixteen values drawn of the argument. A counterexample
-shrinks as it was drawn: a structural value by its parts, and a generated one by
-replaying a shorter or lower record of the draws that made it, and by shrinking
-the values it chose among, so what a refutation shows is still a value its
-generator makes. A domain that holds such a type is what its generator draws,
-so it is sampled, however small, and never enumerated; the static tier reads
-the type as it reads any other. A generator that draws no value, as
-`such_that` does past its budget, leaves the claim `unattempted` (`gave_up`)
-rather than narrowed, and a sample counts the values its generators turned away
-as `discarded`. A value of a type another module declares `opaque` (§3.2) is
-drawn through the generator that module states and no other way: an `ensures`
-over a parameter that holds one with none stated is sampled nowhere
-(`ungeneratable`), where a law would be `E0418`. Inside the type's own module
-it is drawn from its structure, as any type that states no generator is.
+A run proves a claim only where it covers all of it. A domain of at most 4096
+points is walked whole, and a law over a `simulate` region is searched at every
+interleaving of each point its guard admits (§9); a search that stops short of
+all of them, or binders whose domain is not finite, leave such a law
+`unproved`. An `Int` binder is finite where the claim's guards hold it between
+two literals: each end a comparison of the binder with a literal (`n > 0`,
+`n <= 100`, `3 <= n`, `n == 7`) that is a guard or one side of its `&&`s, so
+`where n > 0 && n <= 100` is a hundred points. Over any other domain a claim the
+prover left open is tried at a few small points: zero and its neighbours, each
+literal the claim and its guards are written with and that literal's
+neighbours, two texts, `NaN` among the floats, the empty list and lists of one
+and of two elements, a map of no entry and of one, each variant of a sum, a
+record with each field in turn at its second value, a type variable as an
+`Int`. Holding at them proves nothing. A point the claim is false at refutes
+it, a point it raises at is named, and a proof made of the claim under its
+guard stands once one of them is a value the guard admits. A value of a type
+another module declares `opaque` (§3.2) is one only that module builds, and no
+run makes a function, so a claim over either is proved by the prover or not at
+all.
 
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose
@@ -2470,8 +2429,9 @@ law "reverse twice is identity" forall (xs: List<Int>) { reverse(reverse(xs)) ==
 Both are `proved`, the second by structural induction on `xs` citing the
 first. Under `--json` a certificate's `rules` name each lemma as `lemma` with
 its `law` and `label`, each induction as `induction` with its `binder`,
-`def`, `over` (`int` or `list`) and `step`, and a `cost` clause read off its
-body (below) as `cost_bound` with its `def`.
+`def`, `over` (`int` or `list`) and `step`, and a `cost` bound read off its
+body (below) as `cost_bound` with its `def`; `ran` says whether a run helped
+make the proof.
 
 A `law schema` states a law once, over the definitions it is about, and a law
 instantiates it:
@@ -2484,7 +2444,7 @@ law "a URL round-trips" = round_trip(url_encode, url_decode)
 ```
 
 A schema has a name, type parameters and at most one row parameter, parameters
-whose types are written, and then what a law has but a `cost`: binders, a guard
+whose types are written, and then what a law has: binders, a guard
 and a body, pure as a law's are (`E0417`), so what a function parameter's
 written row performs past a raise or `diverges` is refused where the body calls
 it. The row parameter is what the definitions a schema is given may raise:
@@ -2498,15 +2458,15 @@ binders: the schema's are quantified at the types the arguments settle, a `new`
 record's among them, which a `forall` must be able to range over (`E0418`, at
 the instantiation, naming the schema's binder), and a type parameter no argument
 settles stays a variable of the claim. What is instantiated must be a schema
-(`E0472`), and an instantiation is never `law/host`.
+(`E0472`).
 
 An instantiation is the law its schema's guard and body are with each parameter
-replaced by what it was given. It has its own label, key, tier, certificate and
-cache entry; it is proved, sampled and shrunk as that law written out is, and,
-proved with no guard, it is a lemma by the trigger that body has. Its hash
-covers the schema's guard and body, in this package or another, with what it
-was given. Under `--json` its obligation carries `schema`, the schema's
-program-wide name, which `--explain` and a refutation print.
+replaced by what it was given. It has its own label, key, outcome, certificate
+and cache entry; it is proved as that law written out is, and, proved with no
+guard, it is a lemma by the trigger that body has. Its hash covers the schema's
+guard and body, in this package or another, with what it was given. Under
+`--json` its obligation carries `schema`, the schema's program-wide name, which
+`--explain` and a refutation print.
 
 A schema also declares the definition its body is, over its parameters and then
 its binders, so `round_trip(url_encode, url_decode, "a b")` is the claim at one
@@ -2526,62 +2486,33 @@ claimed by its body too: a proof anywhere may unfold it, so its body, and all
 it reaches, is part of what its dependents are checked and proved against.
 
 `ply prove` reports the definitions carrying no obligation, then each
-obligation's tier; `E0419` is a counterexample and `E0420` a guard admitting no
-values. A proposition that raises is a gap in the claim; one the C backend
-declines, or any other failure that is Ply's own, is a `defect` reported under
-Ply's code (`E0505`), as `ply test` reports one. Under `--json` a gap carries
-its sentence as `gap` and its kind as `gap_kind` (`unhandled_effect`,
-`ungeneratable`, `raised`, `guard_not_sampled`, `reaches_host`, `not_drawn`,
-`unfitted`, `gave_up`), a
-defect carries `defect` — its `code`, `message`, the `bindings` Ply failed at,
-and a `summary` — and `summary` counts defects as `defect`. A claim's type
-variables are lettered by where they first appear among
-its binders (`forall (x: a, y: List<b>)`); a sample draws each as `Int`
-(`a := Int`), and a proof leaves each an uninterpreted sort
-(`uninterpreted a, b`). Flags: `--filter SUBSTRING` (the obligations whose
-owner's name holds it; repeated, those any of them matches),
-`--prove-cases N` (below 25 kept cases only `example`), `--prove-roots N`, `--prove-budget N` (spent reports `property`),
-`--shrink-budget N`, `--prove-steps N` (calls per evaluation of a claim, default
-1000000000; an evaluation past it leaves the obligation `unattempted`, and the
-number keys the cached result, so more budget is a stronger claim). A `proved`
-obligation is cached under its claim's hash, which reads another package's
-definitions by their contracts, so it stands across an edit to a dependency's
-body; a sampled one is cached under the hash of every implementation its cases
-run and of each generator its points are drawn through, and is drawn again when
-any of them moves. Only a claim that held is cached: one that ended any other
-way, `unattempted` among them, is discharged again by every run. `--reach`
-asks the static tier alone about every obligation the run reports on, cached or
-not, and under `--json` each then carries `reach`: what it decided (`proved`,
+obligation's outcome. An `unproved` claim says what stands between it and a
+proof: under `--json` its sentence as `gap` and its kind as `gap_kind` (`open`,
+with each place the prover stopped as `stuck`; `unhandled_effect`, an `ensures`
+whose owner performs, which only the prover closes; `raised`, with the point as
+`raised_at`; `unwitnessed`, proved under a guard no value was found to satisfy;
+`endless`, a law over a `simulate` region whose binders no run walks whole;
+`unsearched`, one with more interleavings than the search ran). A failure that
+is Ply's own, such as a proposition the C backend declines, is a `defect`
+reported under Ply's code (`E0505`), as `ply test` reports one, carrying
+`defect` — its `code`, `message`, the `bindings` Ply failed at, and a `summary`.
+`summary` counts `proved`, `refuted`, `vacuous`, `unproved` and `defect`. A
+claim's type variables are lettered by where they first appear among its
+binders (`forall (x: a, y: List<b>)`), and a proof leaves each an uninterpreted
+sort (`uninterpreted a, b`). Flags: `--filter SUBSTRING` (the obligations whose
+owner's name holds it; repeated, those any of them matches), `--prove-budget N`
+(static inference steps per obligation; one whose budget runs out is
+`unproved`), `--prove-steps N` (calls per evaluation of a claim, default
+1000000000). A proof read off the claim alone is cached under the claim's hash,
+which reads another package's definitions by their contracts, so it stands
+across an edit to a dependency's body; one a run helped make is cached under the
+hash of every implementation the claim executes. Only a proof is cached: a
+claim that ended any other way is discharged again by every run. `--reach` asks
+the static prover alone about every obligation the run reports on, cached or not,
+and under `--json` each then carries `reach`: what it decided (`proved`,
 `guard_unsatisfiable`, `open` or `budget_spent`), the steps it spent, and each
 place it left the decidable fragment as `{kind, about}` — `null` for a law over
-interleavings, which the static tier never sees.
-
-A cost law states how fast a body's steps may grow with a size:
-
-```ply
-import std.list (sort)
-import std.math (ilog2)
-
-law "sorting is n log n" forall (n: Int) where n > 1 cost n * ilog2(n) {
-  sort(map(range(0, n), |i: Int| i * 7919 % n))
-}
-```
-
-`cost` follows the guard with the bound, an `Int` over the law's one binder,
-which is an `Int` size; a cost law is never `law/host`, and its body performs
-nothing (`E0463`). `ply prove` runs the body at each of the sizes 1, 2, 4 …
-4096 the guard keeps, counting its steps as `metered` (§8.1) does, and stops at
-a size that takes more than 10000000 (or `--prove-steps`, if lower). A size
-whose bound is not positive is not read. Over the last two spans between the
-sizes read, the steps may grow no faster than the bound does, give or take a
-twentieth of a doubling each, so constant factors and lower-order terms do not
-count. Steps that outgrow the bound over both spans are `outgrown` (`E0464`),
-which fails the run as a refutation does and lists every size with its steps
-and bound. A law that keeps pace is `fitted` over eight sizes or more and
-`example` over fewer, and one with fewer than three sizes to read is the gap
-`unfitted`. Under `--json` each carries `fit`: its `measures` (`size`, `steps`,
-`bound`), the size that took more steps than it was allowed as `spent` (`size`,
-`limit`), and a `summary`; and `summary` counts `fitted` and `outgrown`.
+interleavings, which the static prover never sees.
 
 A `cost` clause bounds the steps a call of its definition takes:
 
@@ -2617,7 +2548,8 @@ body, a named definition's, or the caller's own parameter's cost name, so
 `pairs` composes `each_of`'s bound with its lambda's. A function given whose
 steps grow with what it is given leaves the call unread.
 
-`ply prove` first reads the steps off the body. A builtin is at most a step;
+A `cost` bound is an obligation, `<owner> cost #<n>`, that `ply prove` reads
+off the body and never runs. A builtin is at most a step;
 `map`, `filter`, `fold`, `map_fold`, `iterate`, `map_update`, `bytes_position`
 and `metered` call a literal lambda or a named definition back as many times as
 an argument's size allows; a call of a definition costs its steps at the sizes
@@ -2634,15 +2566,9 @@ function value with no cost name, a group of definitions calling each other, a
 body another package keeps with no `cost` bound, an `Int` parameter the steps
 grow with, or a definition that takes, answers or builds a value of a type that
 states a `key` or a `numeric` (§4.4), whose comparisons and operators call it
-unseen, leaves the clause to
-the cost law `cost of <name>` (`#2` and on for
-later clauses): it makes each parameter of one size `n`, an `Int` being `n` and
-a list, map, string or bytes holding `n` elements made of their index, and a
-function parameter with a cost name a closure of one step, its cost name 1, and
-meters the call alone, so it is `fitted`, `outgrown` (`E0464`) or a gap as
-above. A parameter of any other type is not made, which leaves the law
-`unattempted`. Under `--reach` a clause the body does not show carries the
-blocker `unbounded`, with why.
+unseen, leaves the bound `unproved` (`E0474`), stopped at `unbounded` with why.
+A bound the reading does not show is no bound to state: delete the clause and
+pace the definition in a test, as `std.pace::paced` does.
 
 `ply review` reports, per definition changed since the last
 `ply review --accept`, whether the implementation, the spec and the obligations
@@ -2972,7 +2898,7 @@ A registry with an **attester** vouches for what it serves. `ply attest NAME
 VERSION` lays the published version out as a project of its own, fetched and
 checked as a resolve fetches it, and runs `ply test` and `ply prove` over it:
 whether it checks, whether its `reuse fn` and `returns` promises are kept, its
-tests and the tier each claim was discharged at, under this `ply`'s semantics.
+tests and whether each claim is proved, under this `ply`'s semantics.
 With `--sign KEY` the answer, a `std.pkg.Attestation`, is signed as §15.2 signs
 a build and sent back; the registry keeps it only when its `attester`'s public key
 signed it, for the version's own archive and the semantics the path names.
@@ -2980,7 +2906,7 @@ Without `--sign` nothing is sent, which is how anyone runs an attestation again.
 A registry run with `--set attester=<public key hex>`, `--set attest.key=<secret
 key file>`, `--set url=<where the attester reaches it>` and `--exec
 attest=<a ply>` attests every version published, one at a time between
-connections, with that `ply`. A version whose tests fail or whose claim is refuted
+connections, with that `ply`. A version whose tests fail or whose claim is not proved
 is published all the same, and its attestation says so. `ply resolve` fetches
 each dependency's attestation and believes it only when a key `PLY_ATTESTERS`
 names (public key files, separated as `PATH` separates directories) signed it for
@@ -3078,8 +3004,8 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
 Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
-and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
-`--shrink-budget`, `--prove-steps`), *trace* (`--trace`, `--trace-level`),
+and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
+`--trace-level`),
 *drain* (`--drain-ms`, `--drain-lead-ms`).
 
 | command | flags |
@@ -3088,7 +3014,7 @@ and drain), *prove* (`--prove-cases`, `--prove-roots`, `--prove-budget`,
 | `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases, how many answers of each query the memo store took as kept and how many it ran again, and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--kept`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, host, trace, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
@@ -3501,8 +3427,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0460` | artifact `--require-signer` refuses: unsigned, signed for other bytes, or by no trusted key |
 | `E0461` | `ply build --verify`: a file or signature that is not what these sources build |
 | `E0462` | key file that cannot be read, decoded or written |
-| `E0463` | cost law or `cost` bound that cannot be measured: not one `Int` size, `law/host`, or a body or definition that performs |
-| `E0464` | cost law or `cost` bound whose steps outgrew it |
+| `E0463` | `cost` bound on a definition that performs more than a raise |
 | `E0465` | an operation a row promises `bounded` that grows with the input |
 | `E0466` | `bounded` outside a definition's own row |
 | `E0467` | `decreases` no proof shows descends at every call its group makes |
@@ -3511,7 +3436,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0470` | a statement checked against the schema written past what the check follows |
 | `E0471` | a module whose statements reach two `const fn`s of `std.sql.Schema` |
 | `E0472` | a law instantiating a definition that is not a `law schema` |
-| `E0473` | `gen` for an alias or a type that binds a label or a row, or one whose function is no generator of the type |
+| `E0474` | obligation nothing proves |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
@@ -3519,7 +3444,6 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `W0601` | cache unreadable |
 | `W0602` | cache corrupt |
 | `W0603` | cache from another build |
-| `W0604` | obligation undecided at every tier |
 | `W0607` | supplied configuration key the schema does not declare |
 | `W0608` | drain deadline expired with requests in flight |
 | `W0609` | spans still open when their task or the entry point ended |

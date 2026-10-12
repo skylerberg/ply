@@ -9,7 +9,7 @@
 //! Which points exist, how many there are, and whether asking for all of them is a proof or an
 //! enumeration nobody can afford, are decided here, and so is each point's value.
 
-import std.value (Value, VUnit, VBool, VFixed, VRecord, VCtor, Field)
+import std.value (Value, VUnit, VBool, VInt, VFixed, VRecord, VCtor, Field)
 import std.list (concat, contains)
 import std.string (join)
 import std.math (pow)
@@ -33,17 +33,18 @@ pub type Variant = { name: String, fields: List<Ty> }
 /// the same declaration under `Pair<Int>` is not finite at all.
 pub type Decl = { name: String, params: Int, variants: List<Variant> }
 
-/// What a finite type came to, as the runtime builds its values from an index: a builtin by name, a
-/// declared type's cases in declaration order, or a record's fields in the order the type lists them.
-/// Every node carries how many values it holds, so decoding a point counts nothing: the sizes are
-/// decided here, once.
+/// What a finite type came to, as the runtime builds its values from an index: a builtin by name,
+/// the `Int`s from a least one on, a declared type's cases in declaration order, or a record's
+/// fields in the order the type lists them. Every node carries how many values it holds, so
+/// decoding a point counts nothing: the sizes are decided here, once.
 pub type Shape =
   | Scalar(String, Int)
+  | Ints(Int, Int)
   | Cases(Int, List<{ name: String, size: Int, fields: List<Shape> }>)
   | Fields(Int, List<{ name: String, shape: Shape }>)
 
 pub fn shape_size(s: Shape) -> Int =
-  match s { Scalar(_, n) -> n, Cases(n, _) -> n, Fields(n, _) -> n }
+  match s { Scalar(_, n) -> n, Ints(_, n) -> n, Cases(n, _) -> n, Fields(n, _) -> n }
 
 /// The `index`-th point, the first binder varying slowest; `None` past the last, where decoding
 /// would wrap round to a point already named.
@@ -77,6 +78,7 @@ fn value_at(s: Shape, index: Int) -> Option<Value> / {abort.raise} =
     Scalar(name, _) -> if name == "Unit" { Some(VUnit) }
     else if name == "Bool" { Some(VBool(index == 1)) }
     else { fixed_at(name, index) },
+    Ints(low, _) -> Some(VInt(low + index)),
     Cases(_, cases) ->
       fold(
         cases,
@@ -168,22 +170,48 @@ pub fn shape_of(ty: Ty, decls: List<Decl>) -> Option<Shape> =
 pub fn size(ty: Ty, decls: List<Decl>) -> Option<Int> =
   match shape_of(ty, decls) { Some(s) -> Some(shape_size(s)), None -> None }
 
+/// The `Int`s a claim's guards admit a binder at, both ends included.
+pub type Ends = { low: Int, high: Int }
+
 /// The binders' domain, when every one of them is finite and the product is within [`bound`].
 pub fn finite(binders: List<Ty>, decls: List<Decl>) -> Option<Domain> =
-  fold(binders, Some({ shapes: [], points: 1 }), |acc: Option<Domain>, ty: Ty|
-    match acc {
-      None -> None,
-      Some(seen) -> match shape_of(ty, decls) {
+  finite_within(map(binders, |ty: Ty| { ty: ty, within: None }), decls)
+
+/// [`finite`], an `Int` binder being finite between the ends its claim's guards hold it to.
+pub fn finite_within(
+  binders: List<{ ty: Ty, within: Option<Ends> }>,
+  decls: List<Decl>,
+) -> Option<Domain> =
+  fold(
+    binders,
+    Some({ shapes: [], points: 1 }),
+    |acc: Option<Domain>, b: { ty: Ty, within: Option<Ends> }|
+      match acc {
         None -> None,
-        Some(shape) -> {
-          let n = shape_size(shape);
-          let points = seen.points * n;
-          // A domain of no points is a vacuity, not a proof.
-          if n == 0 || points > bound() { None }
-          else { Some({ shapes: push(seen.shapes, shape), points: points }) }
+        Some(seen) -> match held_shape(b.ty, b.within, decls) {
+          None -> None,
+          Some(shape) -> {
+            let n = shape_size(shape);
+            let points = seen.points * n;
+            // A domain of no points is a vacuity, not a proof.
+            if n == 0 || points > bound() { None }
+            else { Some({ shapes: push(seen.shapes, shape), points: points }) }
+          },
         },
       },
-    })
+  )
+
+fn held_shape(ty: Ty, within: Option<Ends>, decls: List<Decl>) -> Option<Shape> =
+  match within {
+    None -> shape_of(ty, decls),
+    Some(ends) -> match ty {
+      Con(name, _) -> if name != "Int" { shape_of(ty, decls) }
+      // Past the bound before it is measured, so the count never overflows.
+      else if ends.high < ends.low || ends.high - ends.low >= bound() { None }
+      else { Some(Ints(ends.low, ends.high - ends.low + 1)) },
+      _ -> shape_of(ty, decls),
+    },
+  }
 
 /// What a domain is called in an artifact: the name of a product with no binders is `unit`, since a
 /// ground claim still has exactly one point. The texts are the compiler's own printing of each
@@ -503,6 +531,36 @@ test "a domain is the binders' shapes and the product of their sizes" {
       assert_eq(sizes_of(domain), [2, 3]);
       assert_eq(domain.points, 6)
     },
+  }
+}
+
+test "an Int is finite between the ends its guards hold it to, and walked from the least" {
+  let held = |low: Int, high: Int|
+    finite_within([{ ty: con("Int"), within: Some({ low: low, high: high }) }], []);
+  assert_eq(held(1, 100), Some({ shapes: [Ints(1, 100)], points: 100 }));
+  assert_eq(held(-2, -2), Some({ shapes: [Ints(-2, 1)], points: 1 }));
+  // Ends that hold nothing, or more than a walk pays for, are no domain.
+  assert_eq(held(6, 2), None);
+  assert_eq(held(0, bound()), None);
+  assert_eq(held(0, bound() - 1), Some({ shapes: [Ints(0, bound())], points: bound() }));
+  // Ends say nothing of a binder of another type, and an `Int` they do not hold is not finite.
+  assert_eq(
+    finite_within([{ ty: con("Bool"), within: Some({ low: 0, high: 9 }) }], []),
+    finite([con("Bool")], []),
+  );
+  assert_eq(finite_within([{ ty: con("Int"), within: None }], []), None);
+  match finite_within(
+      [{ ty: con("Bool"), within: None }, { ty: con("Int"), within: Some({ low: 3, high: 4 }) }],
+      [],
+    ) {
+    Some(domain) ->
+      assert_eq(map(range(0, 4), |i: Int| point_at(domain, i)), [
+        Some([VBool(false), VInt(3)]),
+        Some([VBool(false), VInt(4)]),
+        Some([VBool(true), VInt(3)]),
+        Some([VBool(true), VInt(4)]),
+      ]),
+    None -> assert(false),
   }
 }
 

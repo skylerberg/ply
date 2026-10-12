@@ -1,5 +1,8 @@
 //! A double-entry ledger, in cents.
 
+import std.gen
+import std.gen (Gen)
+
 type Kind = | Asset | Liability | Equity | Revenue | Expense
 
 pub type Account = { code: String, kind: Kind }
@@ -29,15 +32,14 @@ fn credit(account: String, amount: Int) -> Posting
 fn entry(date: Int, memo: String, postings: List<Posting>) -> Entry =
   { date: date, memo: memo, postings: postings }
 
-/// Each `ensures` is its own obligation with its own tier, which is why the two about the header and
-/// the one about the postings are written apart: the first two unfold `entry` and reduce to `date ==
-/// date`, and the third goes through `sum_postings`, a recursion a proof does not unroll here.
+/// Each `ensures` is its own obligation: both unfold `entry` and reduce to `date == date`. That a
+/// transfer balances goes through `sum_postings`, a recursion a proof does not unroll, so it is a
+/// test below and no claim here.
 fn transfer(date: Int, memo: String, from: String, to: String, amount: Int) -> Entry
   requires amount > 0
   requires from != to
   ensures result.date == date
   ensures result.memo == memo
-  ensures sum_postings(result.postings) == 0
 = entry(date, memo, [debit(to, amount), credit(from, amount)])
 
 fn sum_postings(ps: List<Posting>) -> Int =
@@ -66,11 +68,7 @@ fn balance(ledger: List<Entry>, account: String) -> Int =
 fn trial_balance(ledger: List<Entry>) -> Int =
   fold(ledger, 0, |acc, e: Entry| acc + sum_postings(e.postings))
 
-/// `kind_of` recurses over a list, so this postcondition is sampled rather than decided: the
-/// prover's induction is over `Int` binders only.
-fn kind_of(chart: List<Account>, code: String) -> Option<Kind>
-  ensures result == None == (len(filter(chart, |a: Account| a.code == code)) == 0)
-=
+fn kind_of(chart: List<Account>, code: String) -> Option<Kind> =
   match chart {
     [a, ..rest] -> if a.code == code { Some(a.kind) } else { kind_of(rest, code) },
     _ -> None,
@@ -82,10 +80,8 @@ fn normal_sign(kind: Kind) -> Int
   ensures result == 1 || result == -1
 = match kind { Asset -> 1, Expense -> 1, Liability -> -1, Equity -> -1, Revenue -> -1 }
 
-/// No postcondition, and the reason is worth naming rather than hiding: checking one means calling
-/// `presented` over drawn journals, `Int` is `i64`, and the generator draws `i64::MAX` on every run
-/// — so summing two drawn amounts raises and the obligation would come back as a gap rather than as
-/// a claim.
+/// The figure the account `code` is reported at: its balance under its kind's normal sign, and
+/// nothing for a code outside `chart`.
 pub fn presented(chart: List<Account>, ledger: List<Entry>, code: String) -> Option<Int> =
   match kind_of(chart, code) {
     Some(kind) -> Some(normal_sign(kind) * balance(ledger, code)),
@@ -142,32 +138,60 @@ law "an asset and an expense present as they are posted, and nothing else does"
     normal_sign(kind) == 1 == (kind == Asset || kind == Expense)
   }
 
-// The general form of the test "an account nobody posted to is flat".
-law "an account no entry mentions has a flat balance"
-  forall (ledger: List<Entry>, account: String)
-  where len(filter(ledger, |e: Entry| mentions(e.postings, account))) == 0 {
-    balance(ledger, account) == 0
-  }
+// The rest go through recursions over a list, which no proof here unrolls, so they are tests over
+// drawn values.
+
+fn amounts() -> Gen<Int> = gen::int_between(1, 1000000)
+
+fn transfers() -> Gen<Entry> =
+  gen::map3(
+    gen::elements(["cash", "receivable", "rent"]),
+    gen::elements(["capital", "loan", "sales"]),
+    amounts(),
+    |from: String, to: String, amount: Int| transfer(20260101, "recorded", from, to, amount),
+  )
+
+test "a transfer balances" { gen::check(transfers(), |e: Entry| sum_postings(e.postings) == 0) }
+
+test "a code has a kind exactly when the chart lists it" {
+  let accounts = gen::map2(
+    gen::elements(["cash", "loan", "sales"]),
+    gen::elements([Asset, Liability, Revenue]),
+    |code: String, kind: Kind| { code: code, kind: kind },
+  );
+  gen::check2(
+    gen::list_of(accounts, 4),
+    gen::elements(["cash", "loan", "sales", "goodwill"]),
+    |chart: List<Account>, code: String|
+      kind_of(chart, code) == None == (len(filter(chart, |a: Account| a.code == code)) == 0),
+  )
+}
+
+test "an account no entry mentions has a flat balance" {
+  gen::check2(
+    gen::list_of(transfers(), 6),
+    gen::elements(["cash", "loan", "goodwill"]),
+    |ledger: List<Entry>, account: String|
+      len(filter(ledger, |e: Entry| mentions(e.postings, account))) > 0
+        || balance(ledger, account) == 0,
+  )
+}
 
 // The invariant the whole design exists for, over an arbitrary run of transfers rather than over
 // the four in `journal()`.
-law "no run of transfers can unbalance a journal"
-  forall (amounts: List<Int>) where len(filter(amounts, |n: Int| n <= 0)) == 0 {
-    trial_balance(map(amounts, |n: Int| transfer(20260101, "recorded", "cash", "capital", n))) == 0
-  }
+test "no run of transfers can unbalance a journal" {
+  gen::check(gen::list_of(transfers(), 12), |ledger: List<Entry>| trial_balance(ledger) == 0)
+}
 
 // `post`'s comment says an entry that does not balance never lands.
-law "an entry that does not balance never lands"
-  forall (date: Int, memo: String, account: String, amount: Int) where amount > 0 {
-    post([], entry(date, memo, [debit(account, amount)])) == Rejected(amount)
-  }
+test "an entry that does not balance never lands" {
+  gen::check(amounts(), |amount: Int|
+    post([], entry(20260101, "typo", [debit("cash", amount)])) == Rejected(amount))
+}
 
-law "a balanced entry lands, and the ledger grows by exactly that entry"
-  forall (date: Int, memo: String, from: String, to: String, amount: Int)
-  where amount > 0 && from != to {
-    post(journal(), transfer(date, memo, from, to, amount))
-      == Accepted(push(journal(), transfer(date, memo, from, to, amount)))
-  }
+test "a balanced entry lands, and the ledger grows by exactly that entry" {
+  gen::check(transfers(), |e: Entry| post(journal(), e) == Accepted(push(journal(), e)))
+}
 
 test "a transfer moves one amount between two accounts" {
   let e = transfer(20260104, "seed capital", "capital", "cash", 500000);

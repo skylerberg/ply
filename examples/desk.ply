@@ -18,6 +18,8 @@ import std.sql
 import std.db (db, with_server)
 import std.random (entropy)
 import std.json
+import std.gen
+import std.gen (Gen)
 import std.http
 import std.seq
 import std.seq (Seq)
@@ -2615,7 +2617,7 @@ test "a receipt is written as chunks and ends with the terminating chunk" {
   assert(bytes_index_of(e.wrote, b"Content-Length") == None);
   assert(bytes_ends_with(e.wrote, b"0\r\n\r\n"));
   // The chunk sizes are the only thing between the streamed bytes and the buffered ones, which is
-  // what the law at the foot of the file says.
+  // what the test at the foot of the file says.
   assert(bytes_index_of(e.wrote, b"receipt for order 1\ncustomer: ada\n") != None);
   assert(bytes_index_of(e.wrote, b"total: 4.00\n") != None)
 }
@@ -3005,12 +3007,35 @@ law "no two routes overlap ambiguously, and every pattern is well formed" {
 pub fn conflicts_and_defects() -> Int / {abort.raise} =
   len(router::conflicts(table())) + len(router::well_formed(table()))
 
-// The claim a streaming encoder has to earn and almost never states: the bytes pulled out of the
-// cursor are the bytes a buffered body would have held.
-law "a streamed receipt is byte-for-byte what a buffered one would have been"
-  forall (o: Order) {
-    drained(cursor_for(o, seed_shelf())) == buffered_receipt(o)
-  }
+fn drawn_lines() -> Gen<List<Line>> =
+  gen::list_of(
+    gen::map2(
+      gen::elements(["bolt", "gasket", "widget", "sprocket"]),
+      gen::int_between(-5, 60),
+      |sku: String, qty: Int| { sku: sku, qty: qty },
+    ),
+    5,
+  )
+
+fn drawn_orders() -> Gen<Order> =
+  gen::map2(
+    gen::map4(
+      gen::any_int(),
+      gen::text(),
+      drawn_lines(),
+      gen::decimal(),
+      |id: Int, customer: String, lines: List<Line>, total: Decimal|
+        { id: id, customer: customer, lines: lines, total: total, state: Open },
+    ),
+    gen::elements([Open, Cancelled]),
+    |o: Order, state: State| { ..o, state: state },
+  )
+
+// What a streaming encoder has to earn and almost never states: the bytes pulled out of the cursor
+// are the bytes a buffered body would have held.
+test "a streamed receipt is byte-for-byte what a buffered one would have been" {
+  gen::check(drawn_orders(), |o: Order| drained(cursor_for(o, seed_shelf())) == buffered_receipt(o))
+}
 
 pub fn buffered_receipt(o: Order) -> Bytes =
   bytes_concat_all(
@@ -3023,12 +3048,12 @@ pub fn buffered_receipt(o: Order) -> Bytes =
 // Drawing a shelf down and putting the same lines back is the identity, which is what makes a
 // cancellation safe to answer twice — the second one is refused by `state`, and this says the first
 // one moved exactly what it should have.
-law "a drawdown is undone exactly by putting the same lines back"
-  forall (lines: List<Line>) {
-    put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf()
-  }
+test "a drawdown is undone exactly by putting the same lines back" {
+  gen::check(drawn_lines(), |lines: List<Line>|
+    put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf())
+}
 
-// --- Laws the store being a value makes possible ----------------------------------------
+// --- What the store being a value makes checkable ----------------------------------------
 
 pub type Pick = | Bolt | Gasket | Widget
 
@@ -3038,14 +3063,27 @@ pub type Want = { pick: Pick, amount: Amount }
 
 fn sku_of(p: Pick) -> String = match p { Bolt -> "bolt", Gasket -> "gasket", Widget -> "widget" }
 
-/// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so a generated order
-/// lands on both sides of the refusal rather than on one.
+/// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so a drawn order lands
+/// on both sides of the refusal rather than on one.
 fn qty_of(a: Amount) -> Int = match a { One -> 1, Couple -> 2, Handful -> 5, Crate -> 40 }
 
 pub fn lines_of(ws: List<Want>) -> List<Line> =
   map(ws, |w: Want| { sku: sku_of(w.pick), qty: qty_of(w.amount) })
 
-/// Through the whole route — the key check, the decode and the span — so the law covers what a
+fn wants() -> Gen<List<Want>> =
+  gen::and_then(gen::int_between(1, 4), |n: Int|
+    gen::list_of_length(
+      gen::map2(
+        gen::elements([Bolt, Gasket, Widget]),
+        gen::elements([One, Couple, Handful, Crate]),
+        |pick: Pick, amount: Amount| { pick: pick, amount: amount },
+      ),
+      n,
+    ))
+
+fn covered(ws: List<Want>) -> Bool = len(short_skus(seed_shelf(), lines_of(ws))) == 0
+
+/// Through the whole route — the key check, the decode and the span — so the tests cover what a
 /// client actually reaches rather than starting after it.
 pub fn placed_over(ws: List<Want>) -> Ran<http::Response<| {}>> / {abort.raise} =
   under(stocked(seed_shelf(), []), ||
@@ -3065,10 +3103,9 @@ pub fn refused_without_trace(ws: List<Want>) -> Bool / {abort.raise} = {
     && trace::counter_total(r.records, "orders placed") == 0
 }
 
-law "a placement the shelf cannot cover leaves no row behind"
-  forall (ws: List<Want>) where len(ws) > 0 && len(short_skus(seed_shelf(), lines_of(ws))) > 0 {
-    refused_without_trace(ws)
-  }
+test "a placement the shelf cannot cover leaves no row behind" {
+  gen::check(wants(), |ws: List<Want>| covered(ws) || refused_without_trace(ws))
+}
 
 /// And the other half, without which the first is satisfied by a desk that refuses everything: what
 /// a placement that succeeds does to the shelf is exactly `draw_down`, the pure function the tests
@@ -3078,10 +3115,9 @@ pub fn committed_as_specified(ws: List<Want>) -> Bool / {abort.raise} = {
   r.out.status == 201 && r.shelf == draw_down(seed_shelf(), lines_of(ws)) && len(r.book) == 1
 }
 
-law "a placement the shelf can cover moves the shelf by exactly the drawdown"
-  forall (ws: List<Want>) where len(ws) > 0 && len(short_skus(seed_shelf(), lines_of(ws))) == 0 {
-    committed_as_specified(ws)
-  }
+test "a placement the shelf can cover moves the shelf by exactly the drawdown" {
+  gen::check(wants(), |ws: List<Want>| !covered(ws) || committed_as_specified(ws))
+}
 
 /// The statement and the predicate it replaced, over every id.
 pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
@@ -3094,7 +3130,6 @@ pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
   }
 }
 
-law "the route that finds one order finds what `order_by` names"
-  forall (id: Int) {
-    one_order_agrees(id)
-  }
+test "the route that finds one order finds what `order_by` names" {
+  gen::check(gen::one_of([gen::elements([1, 2]), gen::any_int()]), one_order_agrees)
+}
