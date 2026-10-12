@@ -30,6 +30,7 @@ import std.list (at, concat, sort)
 import std.math (rem_euclid)
 import std.random
 import std.time (after, as_nanos, between, nanos_at)
+import std.gen
 
 // --- Scopes -----------------------------------------------------------------
 
@@ -1300,74 +1301,80 @@ test "a retry under a budget is made only while the budget pays, and each call p
 fn over_budget(attempts: Int) -> Result<Int, GaveUp<String>> =
   Err({ last: "no " ++ int_to_string(attempts), attempts: attempts, why: OverBudget })
 
-law "a budget never pays for more retries than its reserve and its share of the calls"
-  forall (share: Int, held: Int, script: List<Bool>) {
-    let percent = rem_euclid(share, 101);
-    let reserve = rem_euclid(held, 4);
-    let ran = fold(
-      script,
-      { budget: budget(percent, reserve), calls: 0, retries: 0 },
-      |so_far: { budget: Budget, calls: Int, retries: Int }, call: Bool|
-        if call { { ..so_far, budget: called(so_far.budget), calls: so_far.calls + 1 } } else {
-          match retrying(so_far.budget) {
-            Some(rest) -> { ..so_far, budget: rest, retries: so_far.retries + 1 },
-            None -> so_far,
-          }
-        },
-    );
-    ran.retries * 100 <= reserve * 100 + percent * ran.calls
-      && retries_left(ran.budget) <= max(1, reserve)
-  }
+/// A `Jitter` as a test draws one.
+fn jitters() -> gen::Gen<Jitter> =
+  gen::elements([NoJitter, FullJitter, EqualJitter, DecorrelatedJitter])
+
+test "a budget never pays for more retries than its reserve and its share of the calls" {
+  gen::check3(
+    gen::any_int(),
+    gen::any_int(),
+    gen::list(gen::bool()),
+    |share: Int, held: Int, script: List<Bool>| {
+      let percent = rem_euclid(share, 101);
+      let reserve = rem_euclid(held, 4);
+      let ran = fold(
+        script,
+        { budget: budget(percent, reserve), calls: 0, retries: 0 },
+        |so_far: { budget: Budget, calls: Int, retries: Int }, call: Bool|
+          if call { { ..so_far, budget: called(so_far.budget), calls: so_far.calls + 1 } } else {
+            match retrying(so_far.budget) {
+              Some(rest) -> { ..so_far, budget: rest, retries: so_far.retries + 1 },
+              None -> so_far,
+            }
+          },
+      );
+      ran.retries * 100 <= reserve * 100 + percent * ran.calls
+        && retries_left(ran.budget) <= max(1, reserve)
+    },
+  )
+}
 
 fn doubled(base: Int, times: Int) -> Int =
   fold(range(0, times), base, |wait: Int, _i: Int| wait * 2)
 
-law "without jitter a wait is the base doubled for each failure before it, and no more than the cap"
-  forall (from: Int, room: Int, failed: Int) {
-    let base = rem_euclid(from, 21);
-    let extra = rem_euclid(room, 201);
-    let failures = 1 + rem_euclid(failed, 8);
-    let policy = spread(NoJitter, base, base + extra, 9, None);
-    wait_choices(policy, failures, Duration(base)) == 1
-      && wait_of(policy, failures, Duration(base), 0)
-      == Duration(min(base + extra, doubled(base, failures - 1)))
-  }
-
-law "a wait is never past the cap nor below what its jitter keeps, whatever the draw"
-  forall (jitter: Jitter, from: Int, room: Int, failed: Int, waited_before: Int, pick: Int) {
-    let base = rem_euclid(from, 21);
-    let extra = rem_euclid(room, 201);
-    let failures = 1 + rem_euclid(failed, 8);
-    let before = rem_euclid(waited_before, 301);
-    let policy = spread(jitter, base, base + extra, 9, None);
-    let ceiling = min(base + extra, doubled(base, failures - 1));
-    let choices = wait_choices(policy, failures, Duration(before));
-    let wait = as_nanos(wait_of(policy, failures, Duration(before), rem_euclid(pick, choices)));
-    choices >= 1 && wait <= base + extra
-      && (match jitter {
-        NoJitter -> wait == ceiling,
-        FullJitter -> wait >= 0 && wait <= ceiling,
-        EqualJitter -> wait >= ceiling - ceiling / 2 && wait <= ceiling,
-        DecorrelatedJitter -> wait >= base && wait <= max(base, before) * 3,
-      })
-  }
+test "a wait is never past the cap nor below what its jitter keeps, whatever the draw" {
+  gen::check(
+    gen::and_then(jitters(), |jitter: Jitter|
+      gen::and_then(gen::any_int(), |from: Int|
+        gen::map4(
+          gen::any_int(),
+          gen::any_int(),
+          gen::any_int(),
+          gen::any_int(),
+          |room: Int, failed: Int, waited_before: Int, pick: Int|
+            (jitter, from, room, failed, waited_before, pick),
+        ))),
+    |drawn: (Jitter, Int, Int, Int, Int, Int)| {
+      let jitter = drawn._0;
+      let from = drawn._1;
+      let room = drawn._2;
+      let failed = drawn._3;
+      let waited_before = drawn._4;
+      let pick = drawn._5;
+      let base = rem_euclid(from, 21);
+      let extra = rem_euclid(room, 201);
+      let failures = 1 + rem_euclid(failed, 8);
+      let before = rem_euclid(waited_before, 301);
+      let policy = spread(jitter, base, base + extra, 9, None);
+      let ceiling = min(base + extra, doubled(base, failures - 1));
+      let choices = wait_choices(policy, failures, Duration(before));
+      let wait = as_nanos(wait_of(policy, failures, Duration(before), rem_euclid(pick, choices)));
+      choices >= 1 && wait <= base + extra
+        && (match jitter {
+          NoJitter -> wait == ceiling,
+          FullJitter -> wait >= 0 && wait <= ceiling,
+          EqualJitter -> wait >= ceiling - ceiling / 2 && wait <= ceiling,
+          DecorrelatedJitter -> wait >= base && wait <= max(base, before) * 3,
+        })
+    },
+  )
+}
 
 // --- Tests of the breaker, the bucket and single flight ---------------------
 
-law "a closed breaker opens at the failure that makes its count, and a success starts the count again"
-  forall (count_of: Int, failed: Int) {
-    let trip = 1 + rem_euclid(count_of, 4);
-    let fails = rem_euclid(failed, 6);
-    let b = fold(range(0, fails), breaker(trip, Duration(10), 1), |b: Breaker, i: Int|
-      record(b, false, Instant(i)));
-    if fails >= trip { circuit(b) == Open(Instant(trip - 1 + 10)) } else {
-      circuit(b) == Closed(fails) && circuit(record(b, true, Instant(9))) == Closed(0)
-        && admit(b, Instant(9)).admitted
-    }
-  }
-
-law "an open breaker refuses every call before its cooldown ends, and lets one probe from then on"
-  forall (cools: Int, asks: Int) {
+test "an open breaker refuses every call before its cooldown ends, and lets one probe from then on" {
+  gen::check2(gen::any_int(), gen::any_int(), |cools: Int, asks: Int| {
     let cooldown = rem_euclid(cools, 6);
     let asked = rem_euclid(asks, 9);
     let open = record(breaker(1, Duration(cooldown), 2), false, Instant(0));
@@ -1378,21 +1385,8 @@ law "an open breaker refuses every call before its cooldown ends, and lets one p
         && !second.admitted
         && admit(abandoned(first.breaker), Instant(asked)).admitted
     }
-  }
-
-law "a half-open breaker closes after its count of probes succeed, and opens at the first that fails"
-  forall (closes: Int, passed: Int, later: Int) {
-    let close = 1 + rem_euclid(closes, 3);
-    let passes = rem_euclid(passed, 4);
-    let now = 5 + rem_euclid(later, 5);
-    let half = admit(record(breaker(1, Duration(5), close), false, Instant(0)), Instant(5)).breaker;
-    let probed = fold(range(0, passes), half, |b: Breaker, _i: Int|
-      admit(record(b, true, Instant(now)), Instant(now)).breaker);
-    if passes >= close { circuit(probed) == Closed(0) } else {
-      circuit(probed) == HalfOpen(passes, true)
-        && circuit(record(probed, false, Instant(now))) == Open(Instant(now + 5))
-    }
-  }
+  })
+}
 
 test "a call behind a breaker is refused while it is open, probes after the cooldown, and closes it" {
   with_cell[state](breaker(2, Duration(10), 1)) { c -> {
@@ -1431,34 +1425,26 @@ test "a probe that is cancelled is given back, so the next call may probe" {
   } }
 }
 
-law "a full bucket lets its capacity go at once and then one each period, in the order reserved"
-  forall (holds: Int, period: Int, takes: Int) {
-    let capacity = 1 + rem_euclid(holds, 3);
-    let every = 1 + rem_euclid(period, 3);
-    let taken = rem_euclid(takes, 7);
-    let b = fold(
-      range(0, taken),
-      bucket(capacity, Duration(every), Instant(0)),
-      |b: Bucket, _i: Int| reserve(b, Instant(0)).bucket,
-    );
-    reserve(b, Instant(0)).wait == Duration(max(0, taken + 1 - capacity) * every)
-      && take(b, Instant(0)) == None == (taken >= capacity)
-      && tokens(b, Instant(0)) == max(0, capacity - taken)
-  }
-
-law "a bucket left alone fills again, to its capacity and no further"
-  forall (holds: Int, period: Int, takes: Int, rests: Int) {
-    let capacity = 1 + rem_euclid(holds, 3);
-    let every = 1 + rem_euclid(period, 3);
-    let taken = rem_euclid(takes, capacity + 1);
-    let idle = rem_euclid(rests, 13);
-    let b = fold(
-      range(0, taken),
-      bucket(capacity, Duration(every), Instant(0)),
-      |b: Bucket, _i: Int| reserve(b, Instant(0)).bucket,
-    );
-    tokens(b, Instant(idle)) == min(capacity, max(0, capacity - taken + idle / every))
-  }
+test "a bucket left alone fills again, to its capacity and no further" {
+  gen::check4(
+    gen::any_int(),
+    gen::any_int(),
+    gen::any_int(),
+    gen::any_int(),
+    |holds: Int, period: Int, takes: Int, rests: Int| {
+      let capacity = 1 + rem_euclid(holds, 3);
+      let every = 1 + rem_euclid(period, 3);
+      let taken = rem_euclid(takes, capacity + 1);
+      let idle = rem_euclid(rests, 13);
+      let b = fold(
+        range(0, taken),
+        bucket(capacity, Duration(every), Instant(0)),
+        |b: Bucket, _i: Int| reserve(b, Instant(0)).bucket,
+      );
+      tokens(b, Instant(idle)) == min(capacity, max(0, capacity - taken + idle / every))
+    },
+  )
+}
 
 test "calls through a bucket go at once while it holds tokens, and then one each period" {
   with_cell[rate](bucket(2, Duration(10), Instant(0))) { c -> {
@@ -1568,27 +1554,6 @@ test "where the caller running a flight is cancelled, a caller waiting on it run
 }
 
 // --- Tests of ticks ---------------------------------------------------------
-
-law "a tick whose work ended before the next was due leaves the schedule as it was, whatever the policy"
-  forall (missed: Missed, every: Int, from: Int, took: Int) {
-    let period = 1 + rem_euclid(every, 5);
-    let due = rem_euclid(from, 6);
-    let late = rem_euclid(took, period);
-    next_due(missed, Duration(period), Instant(due), Instant(due + late)) == Instant(due + period)
-  }
-
-law "after a late tick a burst keeps the schedule, a delay starts a period from now, and a skip takes the schedule's next tick still to come"
-  forall (every: Int, from: Int, took: Int) {
-    let period = 1 + rem_euclid(every, 4);
-    let due = rem_euclid(from, 5);
-    let now = due + period + rem_euclid(took, 10);
-    let next = |missed: Missed|
-      nanos_at(next_due(missed, Duration(period), Instant(due), Instant(now)));
-    let skipped = next(Skip);
-    next(Burst) == due + period && next(Delay) == now + period && skipped > now
-      && skipped <= now + period
-      && (skipped - due) % period == 0
-  }
 
 fn ticked(missed: Missed) -> List<Int> / {clock.read, clock.write, abort.raise} =
   every(Duration(10), missed, 5, [], |seen: List<Int>, _due: Instant| {

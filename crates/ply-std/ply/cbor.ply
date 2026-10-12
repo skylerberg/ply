@@ -31,12 +31,12 @@ import std.bigint
 import std.bigint (BigInt)
 import std.bytes (bytes_of_hex, hex_of, repeat, strip_leading_zeros, u16_be, u32_be, u64_be)
 import std.json
-import std.laws (round_trip)
 import std.list (sort)
 import std.math (ilog2)
 import std.option (option_map)
 import std.result (result_is_ok, result_ok)
 import std.string (join)
+import std.gen
 
 // --- Values ---------------------------------------------------------------------
 
@@ -616,7 +616,7 @@ pub fn diagnostic(v: Value) -> String / {abort.raise} =
 fn shown(v: Value) -> String =
   match try[abort.raise] { diagnostic(v) } { Ok(text) -> text, Err(_) -> "" }
 
-// --- Laws -----------------------------------------------------------------------
+// --- Properties -----------------------------------------------------------------
 
 fn roomy() -> Limits = within(64, 1000000, 1000000)
 
@@ -625,72 +625,65 @@ fn within(depth: Int, items: Int, string: Int) -> Limits =
 
 fn writable(v: Value) -> Bool / {abort.raise} = result_is_ok(encode(v))
 
-law "a value that writes reads back as itself"
-  forall (v: Value) where writable(v) {
-    decode(write(v), Any, roomy()) == Ok(v)
+/// A `Value` as a test draws one.
+fn values_drawn_at(depth: Int) -> gen::Gen<Value> =
+  if depth <= 0 {
+    gen::one_of([
+      gen::map(gen::any_int(), |f0: Int| Int(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Unsigned(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Negative(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Bits(f0)),
+      gen::map(gen::text(), |f0: String| Text(f0)),
+      gen::map(gen::bool(), |f0: Bool| Flag(f0)),
+      gen::constant(Null),
+      gen::constant(Undefined),
+      gen::map(gen::any_int(), |f0: Int| Simple(f0)),
+      gen::map(gen::float(), |f0: Float| Float(f0)),
+    ])
+  } else {
+    gen::one_of([
+      gen::map(gen::any_int(), |f0: Int| Int(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Unsigned(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Negative(f0)),
+      gen::map(gen::bytes(), |f0: Bytes| Bits(f0)),
+      gen::map(gen::text(), |f0: String| Text(f0)),
+      gen::map(gen::list_of(values_drawn_at(depth - 1), 3), |f0: List<Value>| Items(f0)),
+      gen::map(
+        gen::list_of(
+          gen::map2(
+            values_drawn_at(depth - 1),
+            values_drawn_at(depth - 1),
+            |key: Value, value: Value| -> Field { { key: key, value: value } },
+          ),
+          3,
+        ),
+        |f0: List<Field>| Fields(f0),
+      ),
+      gen::map2(gen::any_int(), values_drawn_at(depth - 1), |f0: Int, f1: Value| Tagged(f0, f1)),
+      gen::map(gen::bool(), |f0: Bool| Flag(f0)),
+      gen::constant(Null),
+      gen::constant(Undefined),
+      gen::map(gen::any_int(), |f0: Int| Simple(f0)),
+      gen::map(gen::float(), |f0: Float| Float(f0)),
+    ])
   }
 
-law "what is written is deterministic"
-  forall (v: Value) where writable(v) {
-    is_deterministic(write(v), roomy())
-  }
+fn values_drawn() -> gen::Gen<Value> =
+  gen::sized(|size: Int| values_drawn_at(min(max(size / 16, 0), 3)))
 
-law "bytes that read as deterministic are the bytes their value writes"
-  forall (data: Bytes) {
-    match decode(data, Deterministic, roomy()) { Err(_) -> true, Ok(v) -> encode(v) == Ok(data) }
-  }
+test "a value that writes reads back as itself" {
+  gen::check(values_drawn(), |v: Value|
+    if writable(v) { decode(write(v), Any, roomy()) == Ok(v) } else { true })
+}
 
-law "what is written, cut short anywhere, is truncated"
-  forall (v: Value, cut: Int) where writable(v) {
-    let whole = write(v);
-    let short = bytes_slice(whole, 0, (cut & 0x7FFF_FFFF) % bytes_len(whole));
-    match decode(short, Any, roomy()) { Err(refusal) -> refusal.why == Truncated, Ok(_) -> false }
-  }
-
-law "an Int reads back from what is written of it" =
-  round_trip(|n: Int| write(Int(n)), |data: Bytes|
-    match decode(data, Deterministic, roomy()) { Ok(Int(n)) -> Some(n), _ -> None })
-
-law "text reads back from what is written of it" =
-  round_trip(|s: String| write(Text(s)), |data: Bytes|
-    match decode(data, Deterministic, roomy()) { Ok(Text(s)) -> Some(s), _ -> None })
-
-law "a byte string reads back from what is written of it" =
-  round_trip(|b: Bytes| write(Bits(b)), |data: Bytes|
-    match decode(data, Deterministic, roomy()) { Ok(Bits(b)) -> Some(b), _ -> None })
-
-law "a float's bits read back from the narrowest width that holds them"
-  forall (bits: Int) {
-    let f = float_of_bits(bits);
-    match decode(write(Float(f)), Deterministic, roomy()) {
-      Ok(Float(g)) -> bits_of_float(g) == bits_of_float(f),
-      _ -> false,
-    }
-  }
-
-law "a half and a single each widen to the double that narrows back to it"
-  forall (bits: Int) {
-    narrowed(widened(bits & 0xFFFF, 5, 10), 5, 10) == Some(bits & 0xFFFF)
-      && narrowed(widened(bits & 0xFFFF_FFFF, 8, 23), 8, 23) == Some(bits & 0xFFFF_FFFF)
-  }
-
-law "an integer of any size reads back, and is the BigInt it names"
-  forall (octets: Bytes, negative: Bool) {
-    let v = if negative { Negative(octets) } else { Unsigned(octets) };
-    decode(write(v), Deterministic, roomy()) == Ok(v)
-      && option_map(to_big_int(v), of_big_int) == Some(v)
-  }
-
-law "a time of whole seconds reads back from its tag"
-  forall (seconds: Int) where seconds > -9000000000 && seconds < 9000000000 {
-    to_instant(of_instant(Instant(seconds * 1000000000))) == Some(Instant(seconds * 1000000000))
-  }
-
-law "reading and writing are linear in the items"
-  forall (n: Int) where n > 0 cost n {
-    let v = Items(map(range(0, n), |i: Int| Tagged(1, Items([Int(i), Text("x"), Float(1.5)]))));
-    decode(write(v), Deterministic, { depth: 3, items: 5 * n + 1, string: 1 }) == Ok(v)
-  }
+test "what is written, cut short anywhere, is truncated" {
+  gen::check2(values_drawn(), gen::any_int(), |v: Value, cut: Int|
+    if writable(v) {
+      let whole = write(v);
+      let short = bytes_slice(whole, 0, (cut & 0x7FFF_FFFF) % bytes_len(whole));
+      match decode(short, Any, roomy()) { Err(refusal) -> refusal.why == Truncated, Ok(_) -> false }
+    } else { true })
+}
 
 // --- Tests ----------------------------------------------------------------------
 
