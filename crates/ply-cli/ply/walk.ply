@@ -2,20 +2,26 @@
 //! is read and written through. A file named on the command line is taken whatever it is called, a
 //! directory is walked for `.ply` files, and a symlink is refused rather than followed, since a
 //! rewrite through one leaves the root. A load reads a package's own modules: a directory below
-//! its root that holds a `ply.pkg` is another package's.
+//! its root that holds a `ply.pkg` is another package's. Where no package holds a `.ply` file a
+//! load is given, it reads the file and the modules it imports, and walks nothing.
 
 import paths
-import paths (Rooted, child, displayed, kind, list_dir, at_abs)
-import std.fs (fs, File, Dir, Symlink, Missing, mem_of, mem_kind, mem_list)
+import paths (Rooted, child, displayed, kind, list_dir, read_file, at_abs)
+import std.fs (fs, File, Dir, Symlink, Missing, MemFs, mem_of, mem_kind, mem_list, mem_read)
+import std.list (contains, take)
 import std.path (extension)
+import compiler.derive (dotted)
+import compiler.items (ImportDecl, header, parse)
 import compiler.load (skipped)
 
 pub type Failure = { path: String, why: String }
 
-/// Keyed by the path a report prints, which no two roots share: sorted, and each file once.
-pub type Found = { files: Map<String, Rooted>, errors: List<Failure> }
+/// Keyed by the path a report prints, which no two roots share: sorted, and each file once. `absent`
+/// holds the modules a load that followed a file's imports looked for below its root and did not
+/// find: each a shipped module, or no module at all.
+pub type Found = { files: Map<String, Rooted>, errors: List<Failure>, absent: List<String> }
 
-pub fn nothing() -> Found = { files: map_new(), errors: [] }
+pub fn nothing() -> Found = { files: map_new(), errors: [], absent: [] }
 
 fn keep(found: Found, rooted: Rooted) -> Found =
   { ..found, files: map_insert(found.files, displayed(rooted), rooted) }
@@ -48,15 +54,82 @@ pub fn package(
 ) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} =
   walk(found, root, walk_room(), true)
 
-/// What a load reads of a path: the modules of its root where that holds a `ply.pkg`, which is a
-/// package whatever the line named in it, and otherwise what the line named, as it stands.
+/// The modules `text` imports, as its imports name them, those no source writes among them.
+fn imported(text: Bytes) -> List<String> / {abort.raise} =
+  map((match header(text) { Some(m) -> m, None -> parse(text).node }).imports, |d: ImportDecl|
+    string_of_bytes_lossy(dotted(d)))
+
+/// The file below `root` that is the module `name`, where a walk of `root` would find one: no
+/// directory on the way to it is a symlink or one a walk passes over.
+fn module_file(
+  root: Rooted,
+  name: String,
+) -> Option<Rooted> / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+  let segments = string_split(name, ".");
+  let dir = fold(take(segments, len(segments) - 1), Some(root), |at: Option<Rooted>, d: String|
+    match at {
+      None -> None,
+      Some(up) -> if skipped(d) || kind(child(up, d)) != Dir { None } else { Some(child(up, d)) },
+    });
+  match ((dir, list_at(segments, len(segments) - 1))) {
+    (Some(d), Some(stem)) -> if kind(child(d, stem ++ ".ply")) == File {
+      Some(child(d, stem ++ ".ply"))
+    } else { None },
+    _ -> None,
+  }
+}
+
+/// A load that follows imports: the files it has, those whose imports it has yet to read, and the
+/// modules it has looked for.
+type Following = { found: Found, todo: List<Rooted>, seen: List<String> }
+
+/// Each module the files of `f.todo` import that a file below `root` is, and each those import in
+/// turn. A module no file is, is `absent`.
+fn followed(
+  f: Following,
+  root: Rooted,
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
+  match f.todo {
+    [] -> f.found,
+    [file, ..rest] ->
+      followed(
+        fold(
+          match read_file(file) { Some(text) -> imported(text), None -> [] },
+          { ..f, todo: rest },
+          |acc: Following, name: String|
+            if contains(acc.seen, name) { acc } else {
+              let seen = push(acc.seen, name);
+              match module_file(root, name) {
+                None ->
+                  {
+                    ..acc,
+                    found: { ..acc.found, absent: push(acc.found.absent, name) },
+                    seen: seen,
+                  },
+                Some(at) -> if map_contains(acc.found.files, displayed(at)) {
+                  { ..acc, seen: seen }
+                } else { { found: keep(acc.found, at), todo: push(acc.todo, at), seen: seen } },
+              }
+            },
+        ),
+        root,
+      ),
+  }
+
+/// What a load reads of a path. The modules of its root where that holds a `ply.pkg`, which is a
+/// package whatever the line named in it. Otherwise what the line named: a directory as it stands,
+/// and a `.ply` file with each module it imports that a file below its root is, followed from one
+/// to the next.
 pub fn loading(
   found: Found,
   resolved: paths::Resolved,
-) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
   let root: Rooted = { label: resolved.label, path: resolved.spelling };
-  if kind(child(root, "ply.pkg")) == Missing { named(found, paths::rooted(resolved)) }
-  else { package(found, root) }
+  let at = paths::rooted(resolved);
+  if kind(child(root, "ply.pkg")) != Missing { package(found, root) }
+  else if resolved.inside != "." && is_ply(resolved.inside) && kind(at) == File {
+    followed({ found: keep(found, at), todo: [at], seen: [] }, root)
+  } else { named(found, at) }
 }
 
 /// One entry of a directory, never followed; a `.ply` one it cannot look at is refused as unread.
@@ -101,7 +174,7 @@ pub fn sweep(
 /// Every file a load of the paths a command was given reads, merged into one answer.
 pub fn loads(
   rs: List<paths::Resolved>,
-) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs]} = {
+) -> Found / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
   let rs = if len(rs) == 0 { [paths::here()] } else { rs };
   fold(rs, nothing(), |acc: Found, resolved: paths::Resolved| loading(acc, resolved))
 }
@@ -131,8 +204,21 @@ test "the walk passes over a symlink, a hidden directory, `target` and anything 
   assert_eq(found.errors, [])
 }
 
+/// What a load of `resolved` reads of `tree`, the working directory.
+fn loading_in(tree: MemFs, resolved: paths::Resolved) -> Found / {abort.raise, diverges} =
+  handle {
+    loading(nothing(), resolved)
+  } with {
+    fs.list_dir[cwd](p) -> mem_list(tree, p),
+    fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.kind[cwd](p) -> mem_kind(tree, p),
+    fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+    fs.read_file[cwd](p) -> mem_read(tree, p),
+    fs.read_file[abs](p) -> panic("nothing here leaves the working directory"),
+  }
+
 /// The files found under a package with a vendored one below it: as its own modules, or as files.
-fn found_with_vendored(own: Bool) -> List<String> / {abort.raise} = {
+fn found_with_vendored(own: Bool) -> List<String> / {abort.raise, diverges} = {
   let tree = mem_of([
     { path: "ply.pkg", body: b"" },
     { path: "m.ply", body: b"fn m() -> Int = 1" },
@@ -140,22 +226,70 @@ fn found_with_vendored(own: Bool) -> List<String> / {abort.raise} = {
     { path: "vendor/lib/ply.pkg", body: b"" },
     { path: "vendor/lib/lib.ply", body: b"pub fn l() -> Int = 1" },
   ]);
-  handle {
-    map_keys(
-      (if own { loading(nothing(), paths::at_cwd(".")) }
-      else { named(nothing(), in_cwd(".")) }).files,
-    )
-  } with {
-    fs.list_dir[cwd](p) -> mem_list(tree, p),
-    fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
-    fs.kind[cwd](p) -> mem_kind(tree, p),
-    fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+  if own { map_keys(loading_in(tree, paths::at_cwd(".")).files) } else {
+    handle {
+      map_keys(named(nothing(), in_cwd(".")).files)
+    } with {
+      fs.list_dir[cwd](p) -> mem_list(tree, p),
+      fs.list_dir[abs](p) -> panic("nothing here leaves the working directory"),
+      fs.kind[cwd](p) -> mem_kind(tree, p),
+      fs.kind[abs](p) -> panic("nothing here leaves the working directory"),
+    }
   }
 }
 
 test "a package's walk passes over a package below it, which a walk of the files there does not" {
   assert_eq(found_with_vendored(true), ["m.ply", "sub/deep.ply"]);
   assert_eq(found_with_vendored(false), ["m.ply", "sub/deep.ply", "vendor/lib/lib.ply"])
+}
+
+/// A directory no package holds: `main` imports a module beside it, one below it that imports
+/// back, one a walk passes over and a shipped one, and `other` is imported by none.
+fn unpackaged() -> MemFs / {abort.raise} =
+  mem_of([
+    {
+      path: "app/main.ply",
+      body: b"import beside\nimport util.text\nimport target.built\nimport std.list\n",
+    },
+    { path: "app/beside.ply", body: b"pub fn b() -> Int = 1" },
+    { path: "app/util/text.ply", body: b"import main\nimport util.chars\n" },
+    { path: "app/util/chars.ply", body: b"pub fn c() -> Int = 1" },
+    { path: "app/target/built.ply", body: b"pub fn g() -> Int = 1" },
+    { path: "app/other.ply", body: b"import util.unread\n" },
+    { path: "app/util/unread.ply", body: b"pub fn u() -> Int = 1" },
+  ])
+
+test "a file no package holds is read with the modules it imports, each followed, and no other" {
+  let found = loading_in(unpackaged(), { ..paths::at_cwd("app"), inside: "main.ply" });
+  assert_eq(map_keys(found.files), [
+    "app/beside.ply",
+    "app/main.ply",
+    "app/util/chars.ply",
+    "app/util/text.ply",
+  ]);
+  assert_eq(found.absent, ["target.built", "std.list"]);
+  assert_eq(found.errors, [])
+}
+
+test "a directory no package holds is read as it stands, whatever its files import" {
+  let found = loading_in(unpackaged(), paths::at_cwd("app/util"));
+  assert_eq(map_keys(found.files), [
+    "app/util/chars.ply",
+    "app/util/text.ply",
+    "app/util/unread.ply",
+  ]);
+  assert_eq(found.absent, [])
+}
+
+test "a file a package holds is read with its package, not with what it imports" {
+  let tree = mem_of([
+    { path: "ply.pkg", body: b"" },
+    { path: "m.ply", body: b"import absent\n" },
+    { path: "n.ply", body: b"pub fn n() -> Int = 1" },
+  ]);
+  let found = loading_in(tree, { ..paths::at_cwd("."), inside: "m.ply" });
+  assert_eq(map_keys(found.files), ["m.ply", "n.ply"]);
+  assert_eq(found.absent, [])
 }
 
 test "a named symlink is refused rather than followed" {
