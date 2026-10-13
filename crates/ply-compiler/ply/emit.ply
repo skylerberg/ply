@@ -14,11 +14,11 @@ import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, pa
               NumericOp)
 import resolve (ParsedModule, Source, ResolveSucceeded, ResolveFailed, Diag, resolve_modules,
                 Resolved, Scope, Binding, ModuleBinding, PackageDeps, resolve_packaged, no_packages,
-                default_binder, find_module_binding, qualify)
+                default_binder, find_module_binding, qualify, of_module)
 import derive (expand_derives)
 import infer (LabelSite, OperandSite, TypedSite, expanded_mods, prelude_effects, EffectInfo, OpInfo,
-              EmitFacts, RootFacts, UpdateShape, TrySite, WitnessOp, WitnessRef, WitnessOrder,
-              facts_at, test_owner, law_root, cases_root)
+              EmitFacts, RootFacts, UpdateShape, TrySite, MemberSite, WitnessOp, WitnessRef,
+              WitnessOrder, facts_at, test_owner, law_root, cases_root)
 import types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom, RNamed, type_at,
               is_diverges)
 import front
@@ -13240,7 +13240,14 @@ fn emit_program(
                               code: code,
                               module: m.name,
                               here: defs_in(m.name, m.module, pure, schemes),
-                              imports: resolved_imports(x.r, i, mods, m.module, defs_of),
+                              imports: resolved_imports(
+                                x.r,
+                                i,
+                                mods,
+                                m.module,
+                                defs_of,
+                                filter(facts.elaboration.members, |s: MemberSite| s.module == i),
+                              ),
                               effects: effects_in(x.r, i, mods),
                               typed: typed_in(facts, i),
                               operands: operands_in(facts.operands, i),
@@ -13273,6 +13280,7 @@ fn emit_program(
                           operands: operands_in(facts.operands, i),
                           typed: typed_in(facts, i),
                           ops: filter(facts.elaboration.ops, |o: WitnessOp| o.module == i),
+                          members: filter(facts.elaboration.members, |s: MemberSite| s.module == i),
                         },
                         x.r,
                         i,
@@ -13391,6 +13399,7 @@ fn resolved_imports(
   mods: List<ParsedModule>,
   x_module: Module,
   defs_of: (Bytes) -> List<Def>,
+  members: List<MemberSite>,
 ) -> List<Imported> / {abort.raise} = {
   let written = fold(range(0, len(x_module.imports)), [], |acc: List<Imported>, j: Int| {
     let im = at(x_module.imports, j);
@@ -13410,11 +13419,20 @@ fn resolved_imports(
       IAlias(a2) -> push(acc, { name: a2.name, module: full, defs: defs_of(full), whole: true }),
     }
   });
+  // A function of a type is named through a binder of its module no import wrote.
+  let through = fold(members, written, |acc: List<Imported>, m: MemberSite|
+    match of_module(m.qualifier) {
+      None -> acc,
+      Some(home) -> match module_import(acc, m.qualifier) {
+        Some(_) -> acc,
+        None -> push(acc, { name: m.qualifier, module: home, defs: defs_of(home), whole: true }),
+      },
+    });
   // A default copied into a call names its own module through a binder no import wrote.
   match list_at(resolved.scopes, index) {
-    None -> written,
+    None -> through,
     Some(scope) ->
-      fold(scope.modules, written, |acc: List<Imported>, mb: ModuleBinding|
+      fold(scope.modules, through, |acc: List<Imported>, mb: ModuleBinding|
         match module_import(acc, mb.binder) {
           Some(_) -> acc,
           None -> {
@@ -13491,6 +13509,7 @@ type SitesRead = {
   operands: Map<Bytes, Bytes>,
   typed: Map<Bytes, Typed>,
   ops: List<WitnessOp>,
+  members: List<MemberSite>,
 }
 
 fn emit_module(
@@ -13518,7 +13537,7 @@ fn emit_module(
   let defs_of = |path: Bytes|
     fold(program, [], |acc: List<Def>, md: ModuleDefs|
       if md.module == path { md.defs } else { acc });
-  let imports = resolved_imports(resolved, index, mods, x_module, defs_of);
+  let imports = resolved_imports(resolved, index, mods, x_module, defs_of, read.members);
   let here = defs_in(module, x.module, pure, schemes);
   let fns = fold(x.module.items, [], |acc: List<Prepared>, item: Item|
     match item { IFn(d) -> push(acc, prepare(module, schemes, wanted, sites, d)), _ -> acc });

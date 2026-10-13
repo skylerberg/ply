@@ -55,7 +55,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error, closed_ctor, closed_notes,
-                find_module_binding, find_of_type, declaring_type)
+                find_module_binding, find_of_type, declaring_type, of_binder, of_module)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
                 expand_tagged, expand_holds, expand_member_calls, MemberCallee)
@@ -245,9 +245,11 @@ type Maybe = { callee: Bytes, param: Option<Int>, span: Span }
 type Repeated = { var: Int, over: Option<Span>, maybe: List<Maybe> }
 /// A call of a function of the module being checked.
 type OwnCall = { callee: Bytes, span: Span }
-/// A call on a value, `base.name(args)`, that is a call of a function of the value's type: the
-/// expression at `span` calls `qualifier::name` with the value first, or the bare `name` where
-/// `qualifier` is empty. `callee` is the function's qualified name.
+/// A use of a function of a type, or a call on a value, which the rewrite writes as later passes
+/// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
+/// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
+/// function the value holds in the field written. A name written `T::name` at `span` is
+/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's.
 pub type MemberSite = {
   module: Int,
   span: Span,
@@ -4688,6 +4690,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         p.args,
         match p.resource { Some(r) -> [r], None -> [] },
         hint,
+        true,
       )
     },
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
@@ -5195,8 +5198,29 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             inst.args,
           );
           let own = map_contains(constrained.own_fns, key.name);
-          let referred: Checker = if !own { constrained }
-          else { { ..constrained, refs: push(constrained.refs, key.name) } };
+          let through = match qname.module {
+            Some(binder) -> if of_module(binder.name) != None
+                || find_module_binding(scope_of(constrained).modules, binder.name) != None { None }
+            else { declaring_type(constrained.resolved, constrained.module, binder.name) },
+            None -> None,
+          };
+          let named: Checker = match through {
+            None -> constrained,
+            Some(t) ->
+              {
+                ..constrained,
+                member_sites: push(constrained.member_sites, {
+                  module: constrained.module,
+                  span: qname.span,
+                  qualifier: of_binder(at(constrained.resolved.scopes, t.owner).module),
+                  name: member_name(t.simple, qname.name.name),
+                  callee: b"",
+                  owner: constrained.walking,
+                }),
+              },
+          };
+          let referred: Checker = if !own { named }
+          else { { ..named, refs: push(named.refs, key.name) } };
           let noted: Checker = if len(inst.args) == 0 || !own { referred } else {
             {
               ..referred,
@@ -5574,7 +5598,8 @@ fn infer_app(
       None ->
         infer_app_general(operator_hidden(checker, func, args), span, func, args, labels, hint),
     },
-    EField(f) -> infer_dotted(span, infer(checker, f.base), f.base, f.field, args, labels, hint),
+    EField(f) ->
+      infer_dotted(span, infer(checker, f.base), f.base, f.field, args, labels, hint, false),
     _ -> infer_app_general(checker, span, func, args, labels, hint),
   }
 
@@ -5585,14 +5610,24 @@ fn member_function(
   of: Bytes,
   name: Ident,
 ) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} =
-  match find_of_type(checker.resolved, checker.module, of, name.name) {
-    Some(b) ->
+  match ((
+      find_of_type(checker.resolved, checker.module, of, name.name),
+      declaring_type(checker.resolved, checker.module, of),
+    )) {
+    (Some(b), Some(t)) ->
       Some({
-        qname: { module: Some({ name: of, span: name.span }), name: name, span: name.span },
+        qname: {
+          module: Some({
+            name: of_binder(at(checker.resolved.scopes, t.owner).module),
+            span: name.span,
+          }),
+          name: { name: member_name(t.simple, name.name), span: name.span },
+          span: name.span,
+        },
         callee: b.qualified,
       }),
     // A type of the language's: the prelude declares its functions under the type's name.
-    None -> {
+    _ -> {
       let declared = member_name(of, name.name);
       if env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) { None }
       else {
@@ -5638,6 +5673,7 @@ fn infer_dotted(
   args: List<Expr>,
   labels: List<Ident>,
   hint: Option<Hint>,
+  performed: Bool,
 ) -> Inferred / {abort.raise} = {
   let ty = resolve(b.checker, b.ty);
   let called = |o: Inferred, noted: Checker| {
@@ -5656,7 +5692,20 @@ fn infer_dotted(
         labels,
         hint,
       );
-      called(o, o.checker)
+      // Written as a perform, it is filed for the rewrite to write as the call of a field.
+      called(o, if !performed { o.checker } else {
+        {
+          ..o.checker,
+          member_sites: push(o.checker.member_sites, {
+            module: o.checker.module,
+            span: span,
+            qualifier: b"",
+            name: b"",
+            callee: b"",
+            owner: o.checker.walking,
+          }),
+        }
+      })
     },
     None -> {
       let head = match ty { TyCon(c) -> Some(c.name), TyNominal(n) -> Some(n.name), _ -> None };
@@ -9678,8 +9727,13 @@ fn walked_fn(
       let walked: Checker = { ..o.checker, derived: None, walking: b"" };
       // Typed, its operators and comparisons say which of the module's functions they call, as
       // its calls on values do.
-      let members = map(drop(walked.member_sites, len(checker.member_sites)), |m: MemberSite|
-        { callee: m.callee, span: m.span });
+      let members = fold(
+        drop(walked.member_sites, len(checker.member_sites)),
+        [],
+        |acc: List<OwnCall>, m: MemberSite|
+          if bytes_len(m.callee) == 0 { acc }
+          else { push(acc, { callee: m.callee, span: m.span }) },
+      );
       let calls = if map_len(stated) == 0 { members } else {
         concat(
           members,
