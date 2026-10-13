@@ -8153,14 +8153,23 @@ fn ranked(names: List<Bytes>, placed: List<Placed>) -> List<Placed> =
 
 /// The fields of the record `slot` holds in place when `code` is a literal of exactly them.
 fn placeable(code: Code, slot: FieldTy) -> Option<List<FieldTy>> =
-  match code.node {
-    NRecord(r) -> match in_place(slot) {
-      Some(fs) -> if sorted_names(map(r.fields, |f: CodeField| f.name))
-          == map(fs, |f: FieldTy| f.name) { Some(fs) }
-      else { None },
-      None -> None,
+  match in_place(slot) {
+    None -> None,
+    Some(fs) -> {
+      // An update that copies no field of its base writes every field: a literal, its base only
+      // the cells it would have reused.
+      let written = match code.node {
+        NRecord(r) -> Some(r.fields),
+        NUpdate(u) -> if len(u.copies) == 0 { Some(u.sets) } else { None },
+        _ -> None,
+      };
+      match written {
+        Some(cs) -> if sorted_names(map(cs, |f: CodeField| f.name))
+            == map(fs, |f: FieldTy| f.name) { Some(fs) }
+        else { None },
+        None -> None,
+      }
     },
-    _ -> None,
   }
 
 /// The cells a literal of `inner` held in place takes from its header's word, its fields' words
@@ -8204,44 +8213,66 @@ fn items_from(
       Some(x) -> match match list_at(slots, i) { Some(f) -> placeable(x, f), None -> None } {
         // A record literal where a record is held in place: its fields evaluated here, in written
         // order, into words the holder writes in its place.
-        Some(inner) -> match x.node {
-          NRecord(r) -> {
-            let names = map(r.fields, |f: CodeField| f.name);
-            let evaluated = fold(
-              r.fields,
-              Some({ emitter: notail(emitter), words: [] }),
-              |got: Option<{ emitter: Emitter, words: List<Bytes> }>, f: CodeField|
-                match got {
-                  None -> None,
-                  Some(g) -> match expr(g.emitter, f.value, params) {
+        Some(inner) -> {
+          let names = match x.node {
+            NRecord(r) -> map(r.fields, |f: CodeField| f.name),
+            NUpdate(u) -> map(u.sets, |f: CodeField| f.name),
+            _ -> [],
+          };
+          let start = Some({ emitter: notail(emitter), words: [] });
+          let evaluated = match x.node {
+            NRecord(r) ->
+              fold(
+                r.fields,
+                start,
+                |got: Option<{ emitter: Emitter, words: List<Bytes> }>, f: CodeField|
+                  match got {
                     None -> None,
-                    Some(o) -> {
-                      let h = held_item(o, nth_field(inner, rank_of(names, f.name)).kind);
-                      Some({ emitter: h.emitter, words: push(g.words, h.word) })
+                    Some(g) -> match expr(g.emitter, f.value, params) {
+                      None -> None,
+                      Some(o) -> {
+                        let h = held_item(o, nth_field(inner, rank_of(names, f.name)).kind);
+                        Some({ emitter: h.emitter, words: push(g.words, h.word) })
+                      },
                     },
                   },
-                },
-            );
-            match evaluated {
-              None -> None,
-              Some(w) -> {
-                let p = placed_cells(w.emitter, inner, names, w.words, []);
-                items_from(
-                  p.emitter,
-                  codes,
-                  params,
-                  i + 1,
-                  {
-                    names: push(acc, b"0"),
-                    vals: push(values, { kind: KBoxed, expr: b"0", ty: TyOpen([]) }),
-                    placed: push(so_far.placed, { slot: i, cells: p.cells }),
+              ),
+            NUpdate(u) ->
+              fold(
+                u.sets,
+                start,
+                |got: Option<{ emitter: Emitter, words: List<Bytes> }>, f: CodeField|
+                  match got {
+                    None -> None,
+                    Some(g) -> match expr(g.emitter, f.value, params) {
+                      None -> None,
+                      Some(o) -> {
+                        let h = held_item(o, nth_field(inner, rank_of(names, f.name)).kind);
+                        Some({ emitter: h.emitter, words: push(g.words, h.word) })
+                      },
+                    },
                   },
-                  slots,
-                )
-              },
-            }
-          },
-          _ -> None,
+              ),
+            _ -> None,
+          };
+          match evaluated {
+            None -> None,
+            Some(w) -> {
+              let p = placed_cells(w.emitter, inner, names, w.words, []);
+              items_from(
+                p.emitter,
+                codes,
+                params,
+                i + 1,
+                {
+                  names: push(acc, b"0"),
+                  vals: push(values, { kind: KBoxed, expr: b"0", ty: TyOpen([]) }),
+                  placed: push(so_far.placed, { slot: i, cells: p.cells }),
+                },
+                slots,
+              )
+            },
+          }
         },
         None -> match expr(notail(emitter), x, params) {
           None -> None,
@@ -12753,15 +12784,16 @@ test "a record literal held in place is written there, with no record made first
     b"fn made(n: Bytes, a: List<Int>) -> T = TyC({ name: n, args: a })\n",
     b"fn stepped(v: Int) -> { counter: Counter, at: Int } = { counter: { next: v + 1, last: v }, at: v }\n",
     b"fn copied(c: Counter, v: Int) -> { counter: Counter, at: Int } = { counter: c, at: v }\n",
+    b"fn read(n: { v: Bytes }, a: { v: List<Int> }) -> T = TyC({ name: n.v, args: a.v })\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [b"m.TyC", b"m.TyV"], [], true);
   let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
-  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
-  // The literal's fields are written in place under a header of their own; a record that is not a
-  // literal is copied in.
-  assert_eq(has(b"ply_embedded("), [true, true, false]);
-  assert_eq(has(b"ply_embed(ctx, "), [false, false, true]);
-  assert_eq(has(b"rt_alloc_p(ctx, 3, 2, "), [false, false, false])
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  // The literal's fields are written in place under a header of their own, read out of other
+  // records as well; a record that is not a literal is copied in.
+  assert_eq(has(b"ply_embedded("), [true, true, false, true]);
+  assert_eq(has(b"ply_embed(ctx, "), [false, false, true, false]);
+  assert_eq(has(b"rt_alloc_p(ctx, 3, 2, "), [false, false, false, false])
 }
 
 test "a `Decimal` is held in registers as its two words, and in a record or an array as them" {
