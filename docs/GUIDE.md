@@ -2090,9 +2090,10 @@ values and their first difference. Any other failure is `E0502`.
 `metered(f)` answers `f()` with what it cost, in resources the runtime counts
 rather than time: `steps`, the calls it made, each counted as `--steps`
 counts them; `allocations`, the objects it built; `bytes`, the memory those
-took, which an update in place does not spend and a copy does; and
-`performs`, each atom it performed with how many times, ordered by the atom's
-qualified name. A
+took, which an update in place does not spend and a copy does; `live`, how many
+more objects are live once it answers, so an `f` answering a number that leaves
+it above zero leaked; and `performs`, each atom it performed with how many
+times, ordered by the atom's qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
