@@ -59,7 +59,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 ParamInfo, filled_args)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, expand_holds, expand_member_calls, MemberCallee)
+                expand_tagged, expand_holds, expand_member_calls, MemberCallee, with_member_calls)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -711,6 +711,8 @@ type ModuleFns = {
   names: List<Bytes>,
   members: List<GroupDef>,
   bodies: List<Body>,
+  /// What each call on a value in the module calls, by the call's span.
+  written: Map<Bytes, MemberCallee>,
 }
 
 /// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.
@@ -9761,7 +9763,17 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
           None -> acc,
         },
     ));
-  let module: ModuleFns = { fns: fns, names: names, members: signed.members, bodies: bodies };
+  let module: ModuleFns = {
+    fns: fns,
+    names: names,
+    members: signed.members,
+    bodies: bodies,
+    written: members_in(
+      walked.checker.member_sites,
+      walked.checker.module,
+      walked.checker.resolved.signatures,
+    ),
+  };
   // Groups come callees first, so a callee is counted before its callers.
   fold(
     graph::components({ out: out }),
@@ -10434,14 +10446,20 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
   let names = fold(bodies, map_new(), |acc: Map<Bytes, Callee>, b: Body|
     fold(b.names, acc, |held: Map<Bytes, Callee>, x: NamedCallee|
       map_insert(held, name_key(x.module, x.name), member_or(qualified, x.callee))));
-  let named = |qname: QName|
-    match map_get(
-        names,
-        name_key(match qname.module { Some(x) -> x.name, None -> b"" }, qname.name.name),
-      ) {
-      Some(callee) -> callee,
-      None -> OtherCallee,
-    };
+  // A body is read with its calls on values written out: one of a builtin through the prelude's
+  // binder, one of a function of a type through its module's.
+  let named = |qname: QName| {
+    let through = match qname.module { Some(x) -> x.name, None -> b"" };
+    if through == prelude_binder() { BuiltinCallee(qname.name.name) } else {
+      match of_module(through) {
+        Some(home) -> member_or(qualified, DefinedCallee(qualify(home, qname.name.name))),
+        None -> match map_get(names, name_key(through, qname.name.name)) {
+          Some(callee) -> callee,
+          None -> OtherCallee,
+        },
+      }
+    }
+  };
   let stated = fold(bodies, map_new(), |acc: Map<Bytes, List<Callee>>, b: Body|
     fold(b.stated, acc, |held: Map<Bytes, List<Callee>>, call: OwnCall| {
       let key = span_key(call.span);
@@ -10456,7 +10474,7 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
     }));
   let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
     verdict({
-      defs: defs,
+      defs: map(defs, |d: FnDef| with_member_calls(d, m.written)),
       names: qualified,
       params: map(bodies, |b: Body| b.params),
       resolve: named,
@@ -21188,6 +21206,25 @@ test "a guard written on a value's own length lets a builtin that needs it raise
     [],
   );
   assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.slice(0, 1)"), [b"E0302"])
+}
+
+test "a recursion a builtin called on a value bounds, or runs a lambda of, is seen to end" {
+  assert_eq(
+    check_codes(
+      b"fn f(xs: List<Int>, i: Int) -> Int = if i >= xs.len() { 0 } else { match xs.at(i) { Some(x) -> x + f(xs, i + 1), None -> 0 } }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"type Tree = | Leaf(Int) | Node(List<Tree>)\nfn total(t: Tree) -> Int = match t { Leaf(n) -> n, Node(ts) -> ts.fold(0, |acc, c| acc + total(c)) }",
+    ),
+    [],
+  );
+  // One that hands itself the same list back does not descend.
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = if xs.len() == 0 { 0 } else { f(xs) }"), [
+    b"E0302",
+  ])
 }
 
 test "a recursion through a call on a value is a recursion, and a type states its own functions" {
