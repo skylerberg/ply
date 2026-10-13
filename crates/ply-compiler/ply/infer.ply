@@ -22,7 +22,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
               NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
               is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
-              case_identity, call_operator, written_operator)
+              case_identity, call_operator, written_operator, Slot, FromName, FromDefault)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -55,7 +55,8 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error, closed_ctor, closed_notes,
-                find_module_binding, find_of_type, declaring_type, of_binder, of_module)
+                find_module_binding, find_of_type, declaring_type, of_binder, of_module, Parameters,
+                ParamInfo, filled_args)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
                 expand_tagged, expand_holds, expand_member_calls, MemberCallee)
@@ -249,7 +250,8 @@ type OwnCall = { callee: Bytes, span: Span }
 /// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
 /// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
 /// function the value holds in the field written. A name written `T::name` at `span` is
-/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's.
+/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
+/// `reaches` the modules the defaults the call copies name.
 pub type MemberSite = {
   module: Int,
   span: Span,
@@ -257,6 +259,7 @@ pub type MemberSite = {
   name: Bytes,
   callee: Bytes,
   owner: Bytes,
+  reaches: List<Bytes>,
 }
 /// A tagged literal whose tag's function `name` is one of the module being checked.
 type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
@@ -591,6 +594,8 @@ type Checker = {
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
   member_sites: List<MemberSite>,
+  /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
+  copied_defaults: List<{ expr: Expr, ty: Type }>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
@@ -4201,6 +4206,27 @@ fn infer_args(
   { checker: walked.checker, tys: walked.tys, row: walked.row }
 }
 
+/// An expression nothing encloses, typed with each default its calls on values copied: a default
+/// is no part of the expression a walk reads, so it is typed where the walk ends.
+fn infer_whole(
+  checker: Checker,
+  expr: Expr,
+  hint: Option<Hint> = None,
+) -> Inferred / {abort.raise} = {
+  let o: Inferred = infer(checker, expr, hint);
+  {
+    ..o,
+    checker: fold(
+      o.checker.copied_defaults,
+      { ..o.checker, copied_defaults: [] },
+      |c: Checker, d: { expr: Expr, ty: Type }| {
+        let typed: Inferred = infer(c, d.expr, hint_of(d.ty));
+        expect_met(typed.checker, expr_span(d.expr), d.ty, typed.ty, b"a parameter's default")
+      },
+    ),
+  }
+}
+
 /// The parameters a callee calls a number of times that grows with its input. A builtin's count is
 /// fixed when the argument it iterates over is written out; a function value's is unknown, so each
 /// of its parameters is taken to. `waits` is the callee where it is a definition: its counts are
@@ -4437,6 +4463,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EBinary(b) -> infer_binary(checker, b.span, b.op, b.lhs, b.rhs),
     ELambda(l) -> {
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
+      let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = fold(
         l.params,
         { checker: pushed, tys: [] },
@@ -4446,7 +4473,14 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
               let o: WithTy = conv_type(acc.checker, te);
               { checker: hold_written(o.checker, te, o.ty, true), ty: o.ty }
             },
-            None -> new_ty(acc.checker),
+            // Unwritten, it is what the place expects there, where that is settled by now.
+            None -> match list_at(expected, len(acc.tys)) {
+              Some(e) -> match hinted(acc.checker, Some({ ty: e, met: met_of(hint) })) {
+                Some(settled) -> { checker: acc.checker, ty: settled },
+                None -> new_ty(acc.checker),
+              },
+              None -> new_ty(acc.checker),
+            },
           };
           {
             checker: { ..t.checker, env: env_bind(t.checker.env, p.name.name, monomorphic(t.ty)) },
@@ -4508,7 +4542,55 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         row: row_empty(),
       }
     },
-    EApp(a) -> infer_app(checker, a.span, a.func, a.args, a.labels, hint),
+    EApp(a) -> match a.func {
+      EField(f) -> {
+        let b: Inferred = infer(checker, f.base);
+        let d = dotted_callee(a.span, b, f.base, f.field, a.args, a.named, a.labels);
+        // A named value is typed as an argument is, expected at its parameter's type.
+        let taken: Took = fold(
+          range(0, len(d.rest)),
+          { checker: d.checker, rest: [], row: row_empty() },
+          |acc: Took, k: Int|
+            match at(d.rest, k) {
+              FromName(j) -> {
+                let x = at(a.named, j).value;
+                let i = d.before + len(a.args) + k;
+                let expected = match list_at(d.params, i) {
+                  Some(p) -> Some({ ty: p, met: d.met }),
+                  None -> None,
+                };
+                let o: Inferred = match ((d.waits, x)) {
+                  (Some(g), ELambda(_)) -> {
+                    let inner: Inferred = infer(
+                      {
+                        ..acc.checker,
+                        maybe: concat(
+                          [{ callee: g, param: Some(i), span: a.span }],
+                          acc.checker.maybe,
+                        ),
+                      },
+                      x,
+                      expected,
+                    );
+                    { ..inner, checker: { ..inner.checker, maybe: acc.checker.maybe } }
+                  },
+                  _ -> infer(acc.checker, x, expected),
+                };
+                let j1: WithRow = join(o.checker, a.span, acc.row, o.row);
+                {
+                  checker: j1.checker,
+                  rest: push(acc.rest, Settled({ written: x, ty: o.ty })),
+                  row: j1.row,
+                }
+              },
+              FromDefault(copied) -> { ..acc, rest: push(acc.rest, Copied(copied)) },
+              _ -> acc,
+            },
+        );
+        dotted(a.span, d, taken, b, f.base, f.field, a.args, a.labels, hint, false)
+      },
+      _ -> infer_app(checker, a.span, a.func, a.args, a.labels, hint),
+    },
     EIf(i) -> {
       let c: Inferred = infer(checker, i.cond);
       let cc: Checker = expect(
@@ -4682,16 +4764,11 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EPerform(p) -> if !on_a_local(checker, p.eff) {
       infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args)
     } else {
-      infer_dotted(
-        p.span,
-        infer_var(both_named(checker, p.eff), p.eff),
-        EVar({ span: p.eff.span, name: p.eff }),
-        p.op,
-        p.args,
-        match p.resource { Some(r) -> [r], None -> [] },
-        hint,
-        true,
-      )
+      let b: Inferred = infer_var(both_named(checker, p.eff), p.eff);
+      let on = EVar({ span: p.eff.span, name: p.eff });
+      let labels = match p.resource { Some(r) -> [r], None -> [] };
+      let d = dotted_callee(p.span, b, on, p.op, p.args, [], labels);
+      dotted(p.span, d, defaults_taken(d), b, on, p.op, p.args, labels, hint, true)
     },
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
@@ -5210,6 +5287,7 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
               {
                 ..constrained,
                 member_sites: push(constrained.member_sites, {
+                  reaches: [],
                   module: constrained.module,
                   span: qname.span,
                   qualifier: of_binder(at(constrained.resolved.scopes, t.owner).module),
@@ -5598,9 +5676,20 @@ fn infer_app(
       None ->
         infer_app_general(operator_hidden(checker, func, args), span, func, args, labels, hint),
     },
-    EField(f) ->
-      infer_dotted(span, infer(checker, f.base), f.base, f.field, args, labels, hint, false),
     _ -> infer_app_general(checker, span, func, args, labels, hint),
+  }
+
+/// The function a call on a value names in full, `value.m::f(..)`: `m::f`, whatever the value's
+/// type, or nothing where `name` is one name.
+fn written_function(name: Ident) -> Option<QName> / {abort.raise} =
+  match member_of(name.name) {
+    None -> None,
+    Some(m) ->
+      Some({
+        module: Some({ name: m.of, span: name.span }),
+        name: { name: m.member, span: name.span },
+        span: name.span,
+      }),
   }
 
 /// What `of`, the head of a receiver's type, has for a function `name`: the name a call of it is
@@ -5661,53 +5750,152 @@ fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.
     ],
   )
 
-/// A call on a value, `base.name(args)`: the call of a function a record holds in its field
-/// `name`, or of the function `name` of the head of the value's type, with the value first. `b`
-/// is the value as its caller typed it and `base` as it is written, so nothing of it is walked
-/// twice.
-fn infer_dotted(
+/// What each parameter of `callee` after those a call on a value fills with the value and `args`
+/// takes: one of `named`, or its default, as a call by name is filled; and the modules those
+/// defaults name. Nothing where the call is refused.
+fn member_args(
+  checker: Checker,
+  span: Span,
+  callee: Bytes,
+  base: Expr,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> { checker: Checker, rest: List<Slot>, reaches: List<Bytes> } / {abort.raise} =
+  match map_get(checker.resolved.signatures, callee) {
+    None -> { checker: unnamed(checker, named), rest: [], reaches: [] },
+    // Over-application is `E0202`'s to report, with the callee's own type in hand.
+    Some(signature) -> if 1 + len(args) > len(signature.params) {
+      { checker: checker, rest: [], reaches: [] }
+    } else {
+      let filled = filled_args(checker.module, span, signature, concat([base], args), named);
+      {
+        checker: fold(filled.diags, checker, report),
+        rest: drop(filled.slots, 1 + len(args)),
+        reaches: map(filled.imports, |b: ModuleBinding|
+          at(checker.resolved.scopes, b.target).module),
+      }
+    },
+  }
+
+/// A named argument where the callee is a value: it names no parameter.
+fn unnamed(checker: Checker, named: List<NamedArg>) -> Checker / {abort.raise} =
+  fold(named, checker, |c: Checker, arg: NamedArg|
+    report_error_at(
+      c,
+      b"E0123",
+      arg.name.span,
+      bytes_concat_all([b"`", arg.name.name, b"` names no parameter here"]),
+      b"no signature to match this against",
+      [
+        b"a named argument needs a callee reached by name or by the type of the value it is called on; a call through a value, a lambda or a constructor is positional",
+      ],
+    ))
+
+/// What a call on a value calls: a function its value holds in a field, a function of the value's
+/// type, typed, with its labels filled already where a named value is typed before the call is,
+/// or nothing, which is reported.
+type DottedCallee =
+  | HeldInField(Type)
+  | OfType({ qname: QName, callee: Bytes, ty: Type, row: Row, labelled: Bool })
+  | NoCallee(Type)
+
+/// A call on a value read as far as its callee: the callee's parameters, what the value met of
+/// them, the callee itself where a lambda handed it may be one it repeats, what each parameter
+/// after the written arguments takes, and the modules the defaults among those name.
+type Dotted = {
+  checker: Checker,
+  callee: DottedCallee,
+  params: List<Type>,
+  /// How many of `params` come before the call's written arguments: the value, for a function
+  /// of its type.
+  before: Int,
+  met: Meetings,
+  waits: Option<Bytes>,
+  rest: List<Slot>,
+  reaches: List<Bytes>,
+}
+
+/// What the parameters after a call's written arguments take, typed.
+type Took = { checker: Checker, rest: List<Taken>, row: Row }
+
+/// What `d` takes where no argument is named: each default.
+fn defaults_taken(d: Dotted) -> Took =
+  {
+    checker: d.checker,
+    rest: fold(d.rest, [], |acc: List<Taken>, slot: Slot|
+      match slot { FromDefault(copied) -> push(acc, Copied(copied)), _ -> acc }),
+    row: row_empty(),
+  }
+
+/// A call on a value, `base.name(args)`, as far as its callee: a function a record holds in its
+/// field `name`, or the function `name` of the head of the value's type; `base.m::f(args)` calls
+/// `m::f`. `b` is the value as its caller typed it and `base` as it is written.
+fn dotted_callee(
   span: Span,
   b: Inferred,
   base: Expr,
   name: Ident,
   args: List<Expr>,
+  named: List<NamedArg>,
   labels: List<Ident>,
-  hint: Option<Hint>,
-  performed: Bool,
-) -> Inferred / {abort.raise} = {
+) -> Dotted / {abort.raise} = {
   let ty = resolve(b.checker, b.ty);
-  let called = |o: Inferred, noted: Checker| {
-    let j: WithRow = join(noted, span, b.row, o.row);
-    { checker: j.checker, ty: o.ty, row: j.row }
+  let none = |c: Checker, callee: DottedCallee|
+    {
+      checker: c,
+      callee: callee,
+      params: [],
+      before: 0,
+      met: NothingMet,
+      waits: None,
+      rest: [],
+      reaches: [],
+    };
+  let of_type = |m: { qname: QName, callee: Bytes }| {
+    let filled = member_args(b.checker, span, m.callee, base, args, named);
+    let func = EVar({ span: name.span, name: m.qname });
+    let f0: Inferred = infer_var(filled.checker, m.qname);
+    let params = match shallow(f0.checker.subst, f0.ty) { TyFn(fn_) -> fn_.params, _ -> [] };
+    // A named value is typed after the callee's labels are filled, as any argument is, and
+    // before another use of a label-generic definition hides the callee's.
+    let names = fold(filled.rest, false, |any: Bool, slot: Slot|
+      any || (match slot { FromName(_) -> true, _ -> false }));
+    let ready: Checker = if !names { f0.checker } else {
+      fill_labels(called(f0.checker, name.span), span, labels, callee_labels(f0.checker, name.span))
+    };
+    {
+      checker: ready,
+      callee: OfType({ qname: m.qname, callee: m.callee, ty: f0.ty, row: f0.row, labelled: names }),
+      params: params,
+      before: 1,
+      met: match list_at(params, 0) {
+        Some(p) -> Meeting({ expected: p, found: b.ty, before: NothingMet }),
+        None -> NothingMet,
+      },
+      waits: if names { callee_repeats(ready, func, concat([base], args)).waits } else { None },
+      rest: filled.rest,
+      reaches: filled.reaches,
+    }
   };
   let field = match record_fields(ty) { Some(fs) -> field_get(fs, name.name), None -> None };
-  match field {
-    Some(held) -> {
-      let o: Inferred = applied_call(
-        span,
-        EField({ span: span_to(expr_span(base), name.span), base: base, field: name }),
-        { checker: b.checker, ty: held, row: row_empty() },
-        None,
-        args,
-        labels,
-        hint,
-      );
-      // Written as a perform, it is filed for the rewrite to write as the call of a field.
-      called(o, if !performed { o.checker } else {
-        {
-          ..o.checker,
-          member_sites: push(o.checker.member_sites, {
-            module: o.checker.module,
-            span: span,
-            qualifier: b"",
-            name: b"",
-            callee: b"",
-            owner: o.checker.walking,
-          }),
-        }
-      })
+  match ((written_function(name), field)) {
+    (Some(q), _) -> match find(b.checker.resolved, b.checker.module, ValueSpace, q) {
+      Some(found) -> of_type({ qname: q, callee: found.qualified }),
+      // Nothing so named: the name is read as any other, which says so.
+      None -> {
+        let o: Inferred = infer_var(b.checker, q);
+        none(o.checker, NoCallee(o.ty))
+      },
     },
-    None -> {
+    // A function a field holds has no parameter to name: each named value is refused, and typed
+    // as the argument it would be after those written.
+    (None, Some(held)) ->
+      {
+        ..none(unnamed(b.checker, named), HeldInField(held)),
+        params: match shallow(b.checker.subst, held) { TyFn(fn_) -> fn_.params, _ -> [] },
+        rest: map(range(0, len(named)), |j: Int| FromName(j)),
+      },
+    (None, None) -> {
       let head = match ty { TyCon(c) -> Some(c.name), TyNominal(n) -> Some(n.name), _ -> None };
       match head {
         None -> {
@@ -5724,37 +5912,91 @@ fn infer_dotted(
               ],
             ),
           );
-          { checker: o.checker, ty: o.ty, row: b.row }
+          none(o.checker, NoCallee(o.ty))
         },
         Some(of) -> match member_function(b.checker, of, name) {
           None -> {
             let o: WithTy = new_ty(no_function_of(b.checker, of, name));
-            { checker: o.checker, ty: o.ty, row: b.row }
+            none(o.checker, NoCallee(o.ty))
           },
-          Some(m) -> {
-            let o: Inferred = applied_call(
-              span,
-              EVar({ span: name.span, name: m.qname }),
-              infer_var(b.checker, m.qname),
-              Some({ written: base, ty: b.ty }),
-              args,
-              labels,
-              hint,
-            );
-            called(o, {
-              ..o.checker,
-              member_sites: push(o.checker.member_sites, {
-                module: o.checker.module,
-                span: span,
-                qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
-                name: m.qname.name.name,
-                callee: m.callee,
-                owner: o.checker.walking,
-              }),
-            })
-          },
+          Some(m) -> of_type(m),
         },
       }
+    },
+  }
+}
+
+/// The call on a value `d` reads, typed: `taken` is what the parameters after its written
+/// arguments take, and `b` the value, so nothing of the call is walked twice.
+fn dotted(
+  span: Span,
+  d: Dotted,
+  taken: Took,
+  b: Inferred,
+  base: Expr,
+  name: Ident,
+  args: List<Expr>,
+  labels: List<Ident>,
+  hint: Option<Hint>,
+  performed: Bool,
+) -> Inferred / {abort.raise} = {
+  let answered = |o: Inferred, noted: Checker| {
+    let j: WithRow = join(noted, span, b.row, o.row);
+    let k: WithRow = join(j.checker, span, j.row, taken.row);
+    { checker: k.checker, ty: o.ty, row: k.row }
+  };
+  match d.callee {
+    NoCallee(ty) -> { checker: taken.checker, ty: ty, row: b.row },
+    HeldInField(held) -> {
+      let o: Inferred = applied_call(
+        span,
+        EField({ span: span_to(expr_span(base), name.span), base: base, field: name }),
+        { checker: taken.checker, ty: held, row: row_empty() },
+        None,
+        args,
+        labels,
+        hint,
+        rest: taken.rest,
+      );
+      // Written as a perform, it is filed for the rewrite to write as the call of a field.
+      answered(o, if !performed { o.checker } else {
+        {
+          ..o.checker,
+          member_sites: push(o.checker.member_sites, {
+            module: o.checker.module,
+            span: span,
+            qualifier: b"",
+            name: b"",
+            callee: b"",
+            owner: o.checker.walking,
+            reaches: [],
+          }),
+        }
+      })
+    },
+    OfType(m) -> {
+      let o: Inferred = applied_call(
+        span,
+        EVar({ span: name.span, name: m.qname }),
+        { checker: taken.checker, ty: m.ty, row: m.row },
+        Some({ written: base, ty: b.ty }),
+        args,
+        if m.labelled { [] } else { labels },
+        hint,
+        rest: taken.rest,
+      );
+      answered(o, {
+        ..o.checker,
+        member_sites: push(o.checker.member_sites, {
+          module: o.checker.module,
+          span: span,
+          qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
+          name: m.qname.name.name,
+          callee: m.callee,
+          owner: o.checker.walking,
+          reaches: d.reaches,
+        }),
+      })
     },
   }
 }
@@ -6281,8 +6523,13 @@ fn infer_app_general(
 ) -> Inferred / {abort.raise} =
   applied_call(span, func, infer(checker, func), None, args, labels, hint)
 
+/// What a parameter after a call's written arguments takes: a named value, typed already, or its
+/// default.
+type Taken = | Settled({ written: Expr, ty: Type }) | Copied(Expr)
+
 /// A call of a callee typed already, `f0`, which `func` only writes: `on` is the value a call is
-/// made on, the callee's first argument, typed already too, and `given` the arguments after it.
+/// made on, the callee's first argument, typed already too, `given` the arguments after it, and
+/// `rest` what the parameters after those take.
 fn applied_call(
   span: Span,
   func: Expr,
@@ -6291,9 +6538,13 @@ fn applied_call(
   given: List<Expr>,
   labels: List<Ident>,
   hint: Option<Hint>,
+  rest: List<Taken> = [],
 ) -> Inferred / {abort.raise} = {
-  // Every argument as it is written, for what reads the arguments without typing them.
-  let args = match on { Some(x) -> concat([x.written], given), None -> given };
+  // Every argument in its parameter's place, for what reads the arguments without typing them.
+  let args = concat(
+    match on { Some(x) -> concat([x.written], given), None -> given },
+    map(rest, |t: Taken| match t { Settled(x) -> x.written, Copied(d) -> d }),
+  );
   // Before the arguments, so a written label is what an argument's row is checked against.
   let f: Inferred = {
     checker: fill_labels(
@@ -6324,7 +6575,7 @@ fn applied_call(
     _ -> { params: [], met: NothingMet },
   };
   let builtin = prelude_named(f.checker, func);
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
+  let written: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     f.checker,
     given,
     span,
@@ -6334,6 +6585,25 @@ fn applied_call(
     called.met,
     ranged_lambda(f.checker, builtin, args),
     first: match on { Some(x) -> Some(x.ty), None -> None },
+  );
+  // A default is typed where the walk of the body ends: it is no part of the call.
+  let as_: { checker: Checker, tys: List<Type>, row: Row } = fold(
+    range(0, len(rest)),
+    written,
+    |acc: { checker: Checker, tys: List<Type>, row: Row }, k: Int|
+      match ((at(rest, k), list_at(called.params, len(written.tys) + k))) {
+        (Settled(x), _) -> { ..acc, tys: push(acc.tys, x.ty) },
+        (Copied(d), Some(p)) ->
+          {
+            ..acc,
+            checker: {
+              ..acc.checker,
+              copied_defaults: push(acc.checker.copied_defaults, { expr: d, ty: p }),
+            },
+            tys: push(acc.tys, p),
+          },
+        _ -> acc,
+      },
   );
   let j0: WithRow = join(as_.checker, span, f.row, as_.row);
   let c: Checker = j0.checker;
@@ -10227,7 +10497,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
     match at(def.params, i).default {
       None -> c,
       Some(d) -> {
-        let o: Inferred = infer(
+        let o: Inferred = infer_whole(
           { ..c, copied: is_pub(def.vis) },
           d,
           hint_of(at(signature.params, i)),
@@ -10247,7 +10517,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
       ..c,
       env: env_bind(c.env, at(def.params, i).name.name, monomorphic(at(signature.params, i))),
     });
-  let body: Inferred = infer(bound, def.body, hint_of(signature.ret));
+  let body: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
   let checked: Checker = expect_met(
     body.checker,
     expr_span(def.body),
@@ -11576,7 +11846,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                     ),
                   },
               };
-              let o: Inferred = infer(entered, test_run(def), hint_of(unit_type()));
+              let o: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
               let answered: Checker = check_test_answer(o.checker, def, o.ty);
               let listed: Checker = match def.cases {
                 None -> answered,
@@ -11651,7 +11921,7 @@ fn tail_value(expr: Expr) -> Expr =
 /// A test's cases are listed before any of them runs, where nothing answers an effect: the table
 /// and the label may raise, and perform nothing else.
 fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
-  let o: Inferred = infer(checker, test_listing(cases), hint_of(listing_ty()));
+  let o: Inferred = infer_whole(checker, test_listing(cases), hint_of(listing_ty()));
   let c = o.checker;
   match list_at(run_needs(resolve_row_in(c, o.row).atoms), 0) {
     None -> c,
@@ -11859,7 +12129,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     });
   let guarded: Checker = match def.guard {
     Some(g) -> {
-      let o: Inferred = infer({ ..bound, performs: [] }, g);
+      let o: Inferred = infer_whole({ ..bound, performs: [] }, g);
       let c: Checker = unfilled(
         expect(
           o.checker,
@@ -11875,7 +12145,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     },
     None -> bound,
   };
-  let body: Inferred = infer({ ..guarded, performs: [] }, def.body);
+  let body: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
   let stated: Checker = expect(
     body.checker,
     expr_span(def.body),
@@ -12405,7 +12675,7 @@ fn check_measure(
   expr: Expr,
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
-  let o: Inferred = infer(spec_scope(checker, def, env), expr);
+  let o: Inferred = infer_whole(spec_scope(checker, def, env), expr);
   let popped: Checker = { ..o.checker, env: env_pop(o.checker.env) };
   let c1: Checker = expect(
     popped,
@@ -12443,7 +12713,7 @@ fn check_clause(
         }),
   };
   let outer = with_result.spec_kind;
-  let o: Inferred = infer(
+  let o: Inferred = infer_whole(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
@@ -15079,7 +15349,15 @@ fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort
 /// effects and its constructors, in that order.
 pub fn prelude_tables() -> { effects: List<EffectInfo>, ctors: List<CtorInfo> } / {abort.raise} = {
   let c = fresh_cx(
-    { names: [], scopes: [], declarations: [], declared: [], order: [], imports: [] },
+    {
+      names: [],
+      scopes: [],
+      declarations: [],
+      declared: [],
+      order: [],
+      imports: [],
+      signatures: map_new(),
+    },
     [],
     no_known(),
   );
@@ -15149,6 +15427,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     update_shapes: [],
     try_sites: [],
     member_sites: [],
+    copied_defaults: [],
     simulate_depth: 0,
     sim_scope: 0,
     crossings: [],
@@ -15284,7 +15563,9 @@ pub type Elaboration = {
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
-  elaboration_in(lowered_only(checker))
+  if len(checker.copied_defaults) > 0 {
+    panic("a default a call on a value copied was left untyped")
+  } else { elaboration_in(lowered_only(checker)) }
 
 fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
   {
@@ -15646,21 +15927,37 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
     else { map_insert(acc, span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
 
 /// One module's calls on values that call a function of the value's type, keyed by span, as
-/// `expand_member_calls` reads them.
-fn members_in(all: List<MemberSite>, module: Int) -> Map<Bytes, MemberCallee> =
+/// `expand_member_calls` reads them, each with its callee's parameters out of `signatures`.
+fn members_in(
+  all: List<MemberSite>,
+  module: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Map<Bytes, MemberCallee> =
   fold(all, map_new(), |acc: Map<Bytes, MemberCallee>, s: MemberSite|
-    if s.module != module { acc }
-    else { map_insert(acc, span_key(s.span), { qualifier: s.qualifier, name: s.name }) })
+    if s.module != module { acc } else {
+      let params = match map_get(signatures, s.callee) { Some(g) -> g.params, None -> [] };
+      map_insert(acc, span_key(s.span), {
+        qualifier: s.qualifier,
+        name: s.name,
+        names: map(params, |p: ParamInfo| p.name),
+        defaults: map(params, |p: ParamInfo| p.default),
+      })
+    })
 
 /// A module with every tagged literal written out as the call it runs as, every call on a value
 /// as the call of its type's function, every record update as the literal it stands for, and
 /// every `try` as its `handle`. The tagged literals go first: they need nothing of the checker,
 /// and what they become is forms the others already walk.
-fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
+fn written_out(
+  module: Module,
+  elaboration: Elaboration,
+  i: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Module =
   expand_holds(
     expand_try_blocks(
       expand_record_updates(
-        expand_member_calls(expand_tagged(module), members_in(elaboration.members, i)),
+        expand_member_calls(expand_tagged(module), members_in(elaboration.members, i, signatures)),
         shapes_in(elaboration.updates, i),
       ),
       answered_in(elaboration.tries, i),
@@ -15668,17 +15965,19 @@ fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
   )
 
 /// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
-/// what the emitter lowers, and what only the checker knows.
+/// what the emitter lowers, and what only the checker knows. `signatures` are the resolver's of
+/// these modules, which say what a call on a value fills.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
+  signatures: Map<Bytes, Parameters>,
 ) -> List<ParsedModule> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: ParsedModule = at(mods, i);
     {
       name: m.name,
       module: expand_witnesses(
-        written_out(m.module, elaboration, i),
+        written_out(m.module, elaboration, i, signatures),
         ops_in(elaboration.ops, i),
         refs_in(elaboration.refs, i),
         orders_in(elaboration.orders, i),
@@ -15692,10 +15991,11 @@ pub fn expanded_mods(
 pub fn updated_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
+  signatures: Map<Bytes, Parameters>,
 ) -> List<ParsedModule> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: ParsedModule = at(mods, i);
-    { name: m.name, module: written_out(m.module, elaboration, i), derived: m.derived }
+    { name: m.name, module: written_out(m.module, elaboration, i, signatures), derived: m.derived }
   })
 
 fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
@@ -20630,6 +20930,55 @@ test "a call on a value reads a record's field, a binding before an effect, and 
       b"cannot call `size` on this value",
     ),
   )
+}
+
+test "a call on a value names its arguments and leaves the rest to their defaults" {
+  let grown = |rest: Bytes|
+    check_codes(
+      with_stack(
+        bytes_concat(
+          b"type Mode = | Fast | Slow\nfn Stack::grown(s: Stack, by: Int = 1, mode: Mode = Fast) -> Stack = s\n",
+          rest,
+        ),
+      ),
+    );
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown().size() + s.grown(2).size()"), []);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(mode: Slow).size()"), []);
+  assert_eq(grown(b"fn f() -> Int = Stack([1]).grown(mode: Slow, by: 3).size()"), []);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(depth: 1).size()"), [b"E0123"]);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(2, by: 3).size()"), [b"E0123"]);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(by: true).size()"), [b"E0201"]);
+  // A function a record holds in a field has no parameter to name.
+  assert_eq(check_codes(b"fn f(codec: { decode: (Int) -> Int }) -> Int = codec.decode(from: 1)"), [
+    b"E0123",
+  ])
+}
+
+test "`value.m::f(..)` calls the function it names with the value first" {
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"fn deep(s: Stack, by: Int) -> Int = by\nfn f(s: Stack) -> Int = s.Stack::size() + Stack([1]).Stack::size()",
+      ),
+    ),
+    [],
+  );
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.Stack::depth()")), [b"E0101"])
+}
+
+test "a lambda's unwritten parameter is what the arguments before it settle" {
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"type P = { side: Int }\nfn sides(ps: List<P>) -> List<Int> = map(ps, |p| p.side)\nfn sizes(ss: List<Stack>) -> List<Int> = map(ss, |s| s.size())",
+      ),
+    ),
+    [],
+  );
+  // Nothing settles it where the lambda stands alone.
+  assert_eq(check_codes(b"type P = { side: Int }\nfn f() -> Int = { let g = |p| p.side; 1 }"), [
+    b"E0201",
+  ])
 }
 
 test "a recursion through a call on a value is a recursion, and a type states its own functions" {
