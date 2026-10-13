@@ -424,9 +424,6 @@ pub type KnownDef = {
   raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
-  /// What its check gave it: a signature leaves the region of each cell it names open, which only
-  /// the body ties to another.
-  scheme: Scheme,
 }
 pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
 /// What the emitter reads of one body published from its rows: `name` is the definition, or a test
@@ -584,6 +581,9 @@ type Checker = {
   keyed_names: List<Bytes>,
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
   copied: Bool,
+  /// True while the first argument of `cell_get`, `cell_set` or `cell_update` is read, which is the
+  /// one place a cell's name stands.
+  cell_named: Bool,
 }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
@@ -2036,12 +2036,17 @@ fn conv_con(
         }
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
-      } else if is_region_type(name.name.name) {
-        let region: WithTy = new_ty(c);
-        {
-          checker: region.checker,
-          ty: TyCon({ name: name.name.name, args: [region.ty, at(converted.tys, 0)] }),
-        }
+      } else if name.name.name == b"Cell" {
+        new_ty(
+          report_error_at(
+            c,
+            b"E0446",
+            span,
+            b"`Cell` is no type a program writes",
+            b"a cell is a name, not a value",
+            cell_is_a_name(),
+          ),
+        )
       } else {
         let built = TyCon({ name: name.name.name, args: converted.tys });
         { checker: note_map_keys(c, span, built), ty: built }
@@ -3171,7 +3176,7 @@ fn written_signature(
       match p.ty {
         Some(t) -> {
           let o: WithTy = conv_type(acc.checker, t);
-          { checker: o.checker, tys: push(acc.tys, o.ty) }
+          { checker: hold_written(o.checker, t, o.ty, true), tys: push(acc.tys, o.ty) }
         },
         None -> {
           let o: WithTy = new_ty(acc.checker);
@@ -3179,8 +3184,11 @@ fn written_signature(
         },
       },
   );
-  let ret = match def.ret {
-    Some(t) -> conv_type(params.checker, t),
+  let ret: WithTy = match def.ret {
+    Some(t) -> {
+      let o: WithTy = conv_type(params.checker, t);
+      { checker: hold_written(o.checker, t, o.ty, false), ty: o.ty }
+    },
     None -> new_ty(params.checker),
   };
   // A function's row is what its signature writes: with no `/`, the empty one.
@@ -4214,7 +4222,10 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         { checker: pushed, tys: [] },
         |acc: { checker: Checker, tys: List<Type> }, p: Param| {
           let t: WithTy = match p.ty {
-            Some(te) -> conv_type(acc.checker, te),
+            Some(te) -> {
+              let o: WithTy = conv_type(acc.checker, te);
+              { checker: hold_written(o.checker, te, o.ty, true), ty: o.ty }
+            },
             None -> new_ty(acc.checker),
           };
           {
@@ -4243,7 +4254,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let written: { checker: Checker, ty: Option<Type> } = match l.ret {
         Some(te) -> {
           let w: WithTy = conv_type(entered, te);
-          { checker: w.checker, ty: Some(w.ty) }
+          { checker: hold_written(w.checker, te, w.ty, false), ty: Some(w.ty) }
         },
         None -> { checker: entered, ty: None },
       };
@@ -4978,7 +4989,18 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             else { note_typed(columned, qname.span, inst.ty, inst.args) },
             None -> note_typed(columned, qname.span, inst.ty, inst.args),
           };
-          { checker: note_labels(typed, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
+          let named: Checker = if typed.cell_named || !is_cell(resolve(typed, inst.ty)) { typed }
+          else {
+            report_error_at(
+              typed,
+              b"E0446",
+              qname.span,
+              bytes_concat_all([b"the cell `", qname.name.name, b"` is used as a value"]),
+              b"a cell is a name, not a value",
+              cell_is_a_name(),
+            )
+          };
+          { checker: note_labels(named, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
         },
         None -> {
           let o: WithTy = new_ty(unknown_name(k.checker, qname));
@@ -5283,7 +5305,7 @@ fn let_bound(
   let annotated: { checker: Checker, ty: Type, row: Row } = match annotation {
     Some(te) -> {
       let w: WithTy = conv_type(checker, te);
-      let v: Inferred = infer(w.checker, value, hint_of(w.ty));
+      let v: Inferred = infer(hold_written(w.checker, te, w.ty, false), value, hint_of(w.ty));
       {
         checker: expect_met(v.checker, expr_span(value), w.ty, v.ty, b"`let` annotation"),
         ty: w.ty,
@@ -5956,6 +5978,67 @@ fn infer_app_general(
   }
 }
 
+fn is_cell(ty: Type) -> Bool = match ty { TyCon(c) -> c.name == b"Cell", _ -> false }
+
+fn cell_is_a_name() -> List<Bytes> =
+  [
+    b"a cell is read and written where its `with_cell` binds it, by `cell_get`, `cell_set` and `cell_update`, and a closure may capture it",
+    b"to let other code reach it, pass a closure that reads or writes it, or declare an effect the region's handler answers",
+  ]
+
+/// The arguments of a cell builtin. The first names the cell, which is all a cell's name does.
+fn infer_cell_args(
+  checker: Checker,
+  args: List<Expr>,
+  span: Span,
+) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} =
+  fold(
+    range(0, len(args)),
+    { checker: checker, tys: [], row: row_empty() },
+    |acc: { checker: Checker, tys: List<Type>, row: Row }, i: Int| {
+      let names = i == 0 && (match at(args, i) { EVar(_) -> true, _ -> false });
+      let o: Inferred = infer({ ..acc.checker, cell_named: names }, at(args, i));
+      let j: WithRow = join({ ..o.checker, cell_named: false }, span, acc.row, o.row);
+      { checker: j.checker, tys: push(acc.tys, o.ty), row: j.row }
+    },
+  )
+
+/// Whether `ty` names a hold anywhere but as a parameter: its own, where `passed`, or one of a
+/// function type it holds.
+fn keeps_hold(ty: Type, passed: Bool) -> Bool =
+  match ty {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      (c.name == b"Hold" && !passed)
+        || fold(c.args, false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+    TyFn(f) ->
+      fold(f.params, false, |b: Bool, p: Type| b || keeps_hold(p, true))
+        || keeps_hold(f.ret, false),
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
+    TyNominal(n) -> fold(n.args, false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+  }
+
+/// A hold is passed down and never kept, so `Hold` is written only as a parameter's type.
+fn hold_written(
+  checker: Checker,
+  written: TypeExpr,
+  ty: Type,
+  passed: Bool,
+) -> Checker / {abort.raise} =
+  if !keeps_hold(resolve(checker, ty), passed) { checker } else {
+    report_error_at(
+      checker,
+      b"E0446",
+      ty_span(written),
+      b"a `Hold` is written where it would be kept",
+      b"a hold is passed down, never kept",
+      [
+        b"a hold is a parameter of a definition, a lambda or a function type: it is not answered, held in another value or bound by an annotation",
+        b"read it where it is passed, with `hold_get`, and keep what the read answers",
+      ],
+    )
+  }
+
 fn cell_form_name(form: CellForm) -> Bytes =
   match form { CellGet -> b"cell_get", CellSet -> b"cell_set", CellUpdate -> b"cell_update" }
 
@@ -5966,7 +6049,7 @@ fn infer_cell_op(
   form: CellForm,
 ) -> Inferred / {abort.raise} = {
   let expected = match form { CellGet -> 1, CellSet -> 2, CellUpdate -> 2 };
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_all(checker, args, span);
+  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_cell_args(checker, args, span);
   if len(args) != expected {
     let o: WithTy = new_ty(
       arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments", []),
@@ -8712,21 +8795,6 @@ fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
 fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
   { atoms: atoms_sorted(map(atoms, |atom: Atom| settled_atom(checker, atom))), tail: None }
 
-/// `ty` with every row it holds, at any depth, empty: what its types say apart from what they do.
-fn rowless(ty: Type) -> Type =
-  match ty {
-    TyVar(_) -> ty,
-    TyCon(c) -> TyCon({ ..c, args: map(c.args, rowless) }),
-    TyFn(f) -> TyFn({ params: map(f.params, rowless), ret: rowless(f.ret), effects: row_empty() }),
-    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: rowless(f.ty) })),
-    TyNominal(n) ->
-      TyNominal({
-        ..n,
-        args: map(n.args, rowless),
-        fields: map(n.fields, |f: Field| { ..f, ty: rowless(f.ty) }),
-      }),
-  }
-
 /// The rows handed in for a definition.
 fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
   map_get(checker.known.defs, name)
@@ -8826,29 +8894,19 @@ fn check_component(
             match u.error {
               Some(_) -> None,
               None -> {
-                // Its check tied what its signature leaves open, the region of each cell it names:
-                // the types it gave tie them here, or the body is walked.
-                let c0: Checker = with_unified(acc.checker, u);
-                let given = instantiate(rows.scheme, c0.fresh);
-                let t = unify(c0.subst, given.fresh, rowless(sig.fn_ty), rowless(given.ty));
-                match t.error {
-                  Some(_) -> None,
-                  None -> {
-                    let c: Checker = with_unified(c0, t);
-                    Some({
-                      checker: c,
-                      row: settled_row(c, performed),
-                      count: {
-                        scaling: settled_row(c, scaling).atoms,
-                        sites: [],
-                        repeats: rows.repeats,
-                        tail_over: None,
-                        recursed: None,
-                        raises: rows.raises,
-                      },
-                    })
+                let c: Checker = with_unified(acc.checker, u);
+                Some({
+                  checker: c,
+                  row: settled_row(c, performed),
+                  count: {
+                    scaling: settled_row(c, scaling).atoms,
+                    sites: [],
+                    repeats: rows.repeats,
+                    tail_over: None,
+                    recursed: None,
+                    raises: rows.raises,
                   },
-                }
+                })
               },
             }
           },
@@ -14045,6 +14103,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     numeric_types: [],
     keyed_names: [],
     copied: false,
+    cell_named: false,
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
@@ -14854,7 +14913,6 @@ fn known_of(checker: Checker) -> Known = {
       summary: def_info.summary,
       raises: def_info.raises,
       facts: b"",
-      scheme: def_info.scheme,
     }));
   let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
     map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));
@@ -15522,7 +15580,10 @@ test "a constructor does not launder a cell inside the closure it holds" {
 // A generator cannot inhabit a handle, so a law over a record that holds one is refused where the
 // law is written and no generated value can carry a cell.
 test "a law cannot quantify over a record that reaches a region" {
-  assert(contains(check_codes(b"law \"no\" forall (r: {c: Cell<Int>}) { true }\n"), b"E0418"), None)
+  assert(
+    contains(check_codes(b"law \"no\" forall (r: {h: Hold<Int, [x]>}) { true }\n"), b"E0418"),
+    None,
+  )
 }
 
 fn escapes(src: Bytes) -> Bool / {abort.raise} =
@@ -15677,38 +15738,23 @@ test "every carrier of a cell out of its region is refused before it can dangle"
   )
 }
 
-// An alias is the type it names, so it neither erases a cell's brand on the way out nor lets a
-// definition that only names `Cell<Int>` read one.
-test "a cell round-tripped through a type alias keeps its brand" {
-  let alias = b"type Held = Cell<Int>\nfn keep(c: Held) -> Held = c\n";
-  assert_eq(
-    check_codes(
-      bytes_concat(
-        alias,
-        b"pub fn read_it() -> Int = with_cell[k](42) { c -> cell_get(keep(c)) }\n",
-      ),
-    ),
-    [],
-  );
+test "a cell is a name: read and written where it is bound, captured by a closure, and no value" {
+  let bound = |body: Bytes|
+    check_codes(bytes_concat_all([b"fn f() -> Int = with_cell[k](1) { c -> ", body, b" }"]));
+  assert_eq(bound(b"{ cell_set(c, 2); cell_update(c, |n: Int| n + 1); cell_get(c) }"), []);
+  assert_eq(bound(b"{ let bump = || cell_set(c, cell_get(c) + 1); bump(); cell_get(c) }"), []);
+  assert(contains(bound(b"{ let x = c; 0 }"), b"E0446"));
+  assert(contains(bound(b"{ let x = [c]; 0 }"), b"E0446"));
+  assert(contains(bound(b"{ let x = Some(c); 0 }"), b"E0446"));
+  assert(contains(bound(b"cell_get(match 0 { _ -> c })"), b"E0446"));
   assert(
     refused_with(
-      bytes_concat(alias, b"pub fn leak() -> Held = with_cell[k](42) { c -> keep(c) }\n"),
-      b"E0201",
-      b"escapes its `with_cell[k]` region",
+      b"fn f() -> Int = with_cell[k](1) { c -> { let x = c; 0 } }",
+      b"E0446",
+      b"the cell `c` is used as a value",
     ),
-    Some("the alias erased the brand on the way out"),
   );
-  assert(
-    len(
-        filter(
-          check_diags(bytes_concat(alias, b"fn peek(c: Held) -> Int = cell_get(c)\n")),
-          |diag: Diag|
-            bytes_index_of(diag.message, b"cannot tell which `with_cell` region") != None,
-        ),
-      )
-      > 0,
-    Some("a definition holding a written `Cell<Int>` could read it"),
-  )
+  assert_eq(check_codes(b"fn peek(c: Cell<Int>) -> Int = 0"), [b"E0446"])
 }
 
 test "a region in a law's body reports its escape" {
@@ -16142,7 +16188,7 @@ test "a law binder naming a type nothing declares is refused, and a lowercase on
 test "an instantiation is checked where it is written: what it is given, and what its schema quantifies there" {
   let over = |law: Bytes|
     bytes_concat(
-      b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(c: Cell<Int>) -> Cell<Int> = c\nfn x(n: Int) -> Int = n\n",
+      b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(t: Task<Int>) -> Task<Int> = t\nfn x(n: Int) -> Int = n\n",
       law,
     );
   assert_eq(check_codes(over(b"law \"l\" = same(id)")), []);
@@ -16187,7 +16233,7 @@ test "a schema's guard and body are a law's: pure but for a raise, over binders 
     ),
     [],
   );
-  assert_eq(check_codes(b"law schema s(f: (Int) -> Int) forall (c: Cell<Int>) { f(1) == 1 }"), [
+  assert_eq(check_codes(b"law schema s(f: (Int) -> Int) forall (t: Task<Int>) { f(1) == 1 }"), [
     b"E0418",
   ]);
   assert_eq(messages(b"law schema s(f: (Int) -> Int) forall (x: Int) { f(x) }"), [
@@ -17335,10 +17381,10 @@ test "functions cannot be compared and a Float cannot key a Map, judged once the
 }
 
 test "a cell leaving its region is reported at the exit, under the code its form has always used" {
-  let dump = check_dump([
-    { name: b"m", src: b"fn escape() -> Int = { let k = with_cell[r](1) { c -> c }; 0 }" },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0201:0:54:55:1:1;=0:54:55:1;")
+  assert_eq(
+    refusals(b"fn escape() -> Int = { let k = with_cell[r](1) { c -> || cell_get(c) }; 0 }"),
+    [[b"E0201", b"the cell escapes its `with_cell[r]` region", b"|| cell_get(c)"]],
+  )
 }
 
 test "a cell reaches a task only where the scheduler cannot outlive the region" {
@@ -17416,7 +17462,7 @@ test "a declaration that mentions a `Cell` or a `Task` is refused at the type th
     [b"E0446", b"`Held`'s field 1 mentions a `Task`", b"Task<Int>"],
   ]);
   assert_eq(refusals(b"type Held = Held(Cell<Int>)"), [
-    [b"E0446", b"`Held`'s field 1 mentions a `Cell`", b"Cell<Int>"],
+    [b"E0446", b"`Cell` is no type a program writes", b"Cell<Int>"],
   ]);
   assert_eq(refusals(b"type Pool = Idle | Busy(Int, List<Task<Unit>>)"), [
     [b"E0446", b"`Busy`'s field 2 mentions a `Task`", b"List<Task<Unit>>"],
