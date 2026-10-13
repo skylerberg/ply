@@ -811,7 +811,18 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
     None -> emitter,
     Some(d) -> {
       let o1 = line(note_tok(emitter, d.n), bytes_concat_all([b"if (!", name, b") {"]));
-      let o2 = line(indent(o1), bytes_concat_all([b"if (tok", ascii_of_int(d.n), b") {"]));
+      // A token takes a mixed record only where it was one, with room for the bitmap.
+      let o2 = line(
+        indent(o1),
+        bytes_concat_all([
+          b"if (tok",
+          ascii_of_int(d.n),
+          if has_tail(d.flags) {
+            bytes_concat_all([b" && (ply_obj(tok", ascii_of_int(d.n), b")->flags & PLY_MIXED)"])
+          } else { b"" },
+          b") {",
+        ]),
+      );
       let o3 = line(
         indent(o2),
         bytes_concat_all([
@@ -1312,6 +1323,21 @@ fn leaves_uncounted(fs: List<FieldTy>) -> Bool =
 
 fn has_tail(flags: Int) -> Bool = flags & 2 != 0
 
+/// Whether a record of `fs` is held back as its fields' values until its word is asked for: every
+/// field a scalar or an `Int`, which its word is made of when it is, and none a record in place.
+fn holdable(fs: List<FieldTy>) -> Bool =
+  len(fs) > 0
+    && fold(fs, true, |ok: Bool, f: FieldTy|
+      ok && in_place(f) == None
+        && (match f.kind {
+          KInt -> true,
+          KNum(_) -> true,
+          KBool -> true,
+          KFloat -> true,
+          KDec -> true,
+          _ -> false,
+        }))
+
 /// The bitmap after a mixed record's words: a bit set for each word it counts, 64 to a word.
 fn tail_bits(l: Laid) -> List<Bytes> =
   map(range(0, l.tail), |t: Int|
@@ -1490,7 +1516,7 @@ fn build_record(
         },
     );
   match vals {
-    Some(vs) -> if flags % 2 == 1 && !nests {
+    Some(vs) -> if holdable(fields) {
       let f = fresh(sh.emitter);
       let held = line(
         note_deferred(f.emitter, {
@@ -8276,25 +8302,69 @@ fn items_from(
         },
         None -> match expr(notail(emitter), x, params) {
           None -> None,
-          Some(o) -> {
-            let h = held_item(o, kind_at(kinds, i));
-            items_from(
-              h.emitter,
-              codes,
-              params,
-              i + 1,
-              { names: push(acc, h.word), vals: push(values, h.val), placed: so_far.placed },
-              slots,
-            )
+          Some(o) -> match deferred_cells(o.emitter, o.value, list_at(slots, i)) {
+            // A record held back where a record is held in place writes its cells there, made
+            // nowhere else: they hold no count.
+            Some(cells) ->
+              items_from(
+                o.emitter,
+                codes,
+                params,
+                i + 1,
+                {
+                  names: push(acc, b"0"),
+                  vals: push(values, { kind: KBoxed, expr: b"0", ty: TyOpen([]) }),
+                  placed: push(so_far.placed, { slot: i, cells: cells }),
+                },
+                slots,
+              ),
+            None -> {
+              let h = held_item(o, kind_at(kinds, i));
+              items_from(
+                h.emitter,
+                codes,
+                params,
+                i + 1,
+                { names: push(acc, h.word), vals: push(values, h.val), placed: so_far.placed },
+                slots,
+              )
+            },
           },
         },
       },
     }
   }
 
+/// The cells a record held back writes where `slot` holds a record in place, from its header's word.
+fn deferred_cells(emitter: Emitter, value: CValue, slot: Option<FieldTy>) -> Option<List<WordAt>> =
+  match slot {
+    Some(f) -> if in_place(f) == None { None } else {
+      match deferred_of(emitter, value.expr) {
+        Some(d) ->
+          Some(
+            push(
+              map(d.cells, |c: { at: Int, expr: Bytes }| held_inside(Put(c))),
+              Header({ at: 0, flags: d.flags, len: d.n, shape: d.shape, holder: None }),
+            ),
+          ),
+        None -> None,
+      }
+    },
+    None -> None,
+  }
+
 /// `o` held as a field of `kind`: the word the object takes or a `Float`'s bits, and the value the
 /// object is remembered to hold.
-fn held_item(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } = {
+fn held_item(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } =
+
+  // An `Int` is held as its value until the object is made, which boxes one past the word's range;
+  // a record held back and never made then holds no count.
+  if kind == KInt {
+    let b = bind(o.emitter, KInt, as_int(o.value));
+    { emitter: b.emitter, word: as_word(b.value), val: b.value }
+  } else { held_word_of(o, kind) }
+
+fn held_word_of(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } = {
   let raw = raw_slot(kind);
   let d = if raw { held_raw(o.emitter, o.value, kind) } else { o };
   let maybe = kind == KSum(Zeroed);
@@ -12588,7 +12658,8 @@ test "a record of a record type holds it in place, header and all" {
   assert_eq(has(b", 9, @@s"), [true, false, false, true, false, true]);
   assert_eq(has(b"@@, 6);"), [true, false, false, true, false, true]);
   assert_eq(has(b"[9] = INT64_C(16);"), [true, false, false, true, false, true]);
-  assert_eq(has(b"ply_embed(ctx, "), [true, false, false, true, false, true]);
+  // `segment`'s points arrive as their fields and are written in place; an update copies one in.
+  assert_eq(has(b"ply_embed(ctx, "), [false, false, false, true, false, true]);
   // A read of a record held in place is the address of its header inside its holder.
   assert_eq(has(b"+ 5))"), [false, true, false, true, false, false]);
   assert_eq(has(b"rt_box_float_p"), [false, true, false, false, false, false]);
@@ -12765,7 +12836,7 @@ test "a constructor holds its arguments as its declaration types them" {
   // A circle holds its point in place, a header's two words and its own two, and its radius's bits
   // after them: five words, none counted, so flat and raw.
   assert_eq(has(b"rt_alloc_p(ctx, 4, 5, @@Tm.Circle@@, 5);"), [true, false, false, false, false]);
-  assert_eq(has(b"ply_embed(ctx, "), [true, false, false, false, false]);
+  assert_eq(has(b"ply_embedded("), [true, false, false, false, false]);
   assert_eq(has(b"->len == 5)"), [false, true, true, true, false]);
   // A match reads each argument where it is held: the radius a load of its bits, and the point
   // the address of its header in the circle.
@@ -12777,13 +12848,30 @@ test "a constructor holds its arguments as its declaration types them" {
   assert_eq(has(b"rt_ctor_p"), [false, false, false, false, true])
 }
 
+test "a record of ints crosses a call as its fields and is made only where its word is asked for" {
+  let src = bytes_concat_all([
+    b"type Span = { start: Int, end: Int }\n",
+    b"fn widened(s: Span, by: Int) -> Span = { start: s.start - by, end: s.end + by }\n",
+    b"fn width(s: Span) -> Int = s.end - s.start\n",
+    b"fn twice(s: Span) -> Int = width(widened(widened(s, 1), 2))\n",
+    b"fn kept(s: Span) -> List<Span> = [widened(s, 1)]\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  assert_eq(has(b"rt_alloc_p(ctx, 3, "), [false, false, false, true]);
+  assert_eq(map(at(out, 1).tables.symbols, |d: Defined| d.head), [
+    { answer: b"Word", params: [b"int64_t", b"int64_t"] },
+  ])
+}
+
 test "a record literal held in place is written there, with no record made first" {
   let src = bytes_concat_all([
     b"type T = | TyC({ name: Bytes, args: List<Int> }) | TyV(Int)\n",
     b"type Counter = { next: Int, last: Int }\n",
     b"fn made(n: Bytes, a: List<Int>) -> T = TyC({ name: n, args: a })\n",
     b"fn stepped(v: Int) -> { counter: Counter, at: Int } = { counter: { next: v + 1, last: v }, at: v }\n",
-    b"fn copied(c: Counter, v: Int) -> { counter: Counter, at: Int } = { counter: c, at: v }\n",
+    b"fn copied(c: { tag: Bytes, n: Int }, v: Int) -> { counter: { tag: Bytes, n: Int }, at: Int } = { counter: c, at: v }\n",
     b"fn read(n: { v: Bytes }, a: { v: List<Int> }) -> T = TyC({ name: n.v, args: a.v })\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [b"m.TyC", b"m.TyV"], [], true);
@@ -12810,17 +12898,18 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   let out = emit_all_program([{ name: b"m", src: src }], [], [b"array_get"], true);
   let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(e.text, text) != None);
   assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None, None, None]);
-  // A line holds its price as two words and its count after them: mixed and raw.
-  assert_eq(has(b".lo;"), [true, false, false, false, false, false, true]);
-  assert_eq(has(b"@@, 6);"), [true, false, false, false, false, false, false]);
+  // A line holds its price as two words and its count after them: mixed and raw. It crosses a call
+  // as its fields, which an entry handed its word loads and a stack's growth makes it of.
+  assert_eq(has(b".lo;"), [true, true, true, false, false, false, true]);
+  assert_eq(has(b"@@, 6);"), [true, true, true, false, false, false, false]);
   // A branch's answer is declared as the struct it is before either arm assigns it.
   assert_eq(has(b" = (PlyDec){0, 0};"), [false, false, false, false, false, true, false]);
   // A price's second word is written after its first, in a line and in a record of a price
   // alone, which is held back until it is first a word.
-  assert_eq(has(b")[1] = "), [true, false, false, false, false, false, true]);
+  assert_eq(has(b")[1] = "), [true, true, true, false, false, false, true]);
   // A field read loads both words, an array's element is two words a step, and nothing is boxed:
   // a function takes and answers its decimals as their words.
-  assert_eq(has(b"ply_dec_at("), [false, true, true, false, true, false, false]);
+  assert_eq(has(b"ply_dec_at("), [true, true, true, false, true, false, false]);
   assert_eq(has(b") * 2)"), [false, false, false, false, true, false, false]);
   assert_eq(
     map(out, |e: Emitted| bytes_index_of(own_code(e.text), b"rt_box_decimal_p") != None),
@@ -13096,19 +13185,9 @@ fn carrier_of(t: Type) -> Carrier = {
   }
 }
 
-/// A record that crosses a call as its fields: flat, every field bits no count is kept of and none
-/// a record held in place, and at most four words.
-fn carried_record(fs: List<FieldTy>) -> Bool =
-  len(fs) > 0 && laid_of(fs).width <= 4
-    && fold(fs, true, |ok: Bool, f: FieldTy|
-      ok && in_place(f) == None
-        && (match f.kind {
-          KFloat -> true,
-          KDec -> true,
-          KNum(_) -> true,
-          KBool -> true,
-          _ -> false,
-        }))
+/// A record that crosses a call as its fields: every field a scalar or an `Int`, held in a
+/// register of its own, none a record held in place, and at most four words.
+fn carried_record(fs: List<FieldTy>) -> Bool = holdable(fs) && laid_of(fs).width <= 4
 
 /// The C types `c` crosses a call in, one per C parameter.
 fn carried_types(c: Carrier) -> List<Bytes> =
