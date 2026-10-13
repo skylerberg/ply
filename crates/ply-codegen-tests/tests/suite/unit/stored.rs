@@ -107,7 +107,7 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
     let mut pending = vec![read];
     let mut objects = 0;
     while let Some(w) = pending.pop() {
-        if is_imm(w) {
+        if is_imm(w) || w == 0 {
             continue;
         }
         objects += 1;
@@ -132,7 +132,7 @@ fn everything_read_is_immortal_and_none_of_it_is_the_entrys() {
             }
         }
     }
-    assert!(objects > 900, "the walk reached {objects} objects");
+    assert!(objects > 800, "the walk reached {objects} objects");
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn a_record_held_in_place_is_counted_by_the_record_holding_it() {
     assert_eq!(unsafe { (*obj(label)).rc }, 2);
     let shape = unsafe { (*obj(outer)).layout };
     let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
-    let held = field_word(&mut h, obj(outer), at, l.slot_at(shape, at));
+    let held = field_word(&mut h, &l, obj(outer), at, l.slot_at(shape, at));
     // A read of it is the holder's own words, which the holder counts for, and an object a stack
     // scan finds.
     assert_eq!(unsafe { (*obj(outer)).rc }, 2);
@@ -358,7 +358,7 @@ fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds(
     let w = h.to_word(&l, &value);
     let shape = unsafe { (*obj(w)).layout };
     let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
-    let inner = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    let inner = field_word(&mut h, &l, obj(w), at, l.slot_at(shape, at));
     assert!(h.is_object(inner));
     assert_eq!(Heap::to_value(&l, w), value);
     dec(inner);
@@ -439,7 +439,7 @@ fn a_record_holds_a_wide_width_as_its_bits() {
     assert!((0..3).all(|i| unsafe { counted(obj(w), i) } == (i == 1)));
     assert_eq!(Heap::to_value(&l, w), value);
     let at = l.offset(shape, &Symbol::new("offset")).expect("the field");
-    let offset = field_word(&mut h, obj(w), at, l.slot_at(shape, at));
+    let offset = field_word(&mut h, &l, obj(w), at, l.slot_at(shape, at));
     assert_eq!(kind(offset), KIND_FIXED);
     let (_into, read) = kept(&l, w);
     assert_eq!(Heap::to_value(&l, read), value);
@@ -638,6 +638,75 @@ fn a_decimal_is_an_object_of_its_own_and_a_record_or_an_array_holds_its_two_word
     assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
     assert_eq!(Heap::to_value(&words, by_word), line);
     for x in [w, same, r, a, second, by_word] {
+        dec(x);
+    }
+}
+
+#[test]
+fn a_record_or_an_array_holds_an_option_as_its_payloads_word() {
+    let l = layouts();
+    let mut h = Heap::new();
+    let some = |v: Value| Value::ctor("Some", vec![v]);
+    let none = || Value::ctor("None", vec![]);
+    let line = record(vec![
+        ("best", some(Value::Float(1.5))),
+        ("note", none()),
+        ("qty", Value::Int(3)),
+    ]);
+    let r = h.to_word(&l, &line);
+    let o = obj(r);
+    // Each option is a word the record counts, its payload's or zero, so the record is three words.
+    let shape = unsafe { (*o).layout };
+    assert_eq!(l.shape_words(shape).0, 3);
+    let spelled = l.shape_spelled(shape);
+    assert!(spelled.iter().any(|s| s.as_str() == "best!m"));
+    assert!(spelled.iter().any(|s| s.as_str() == "note!m"));
+    let at = |i: usize| unsafe { word_at(o, l.shape_offsets(shape)[i]) };
+    assert_eq!(kind(at(0)), KIND_FLOAT);
+    assert_eq!(at(1), 0);
+    assert_eq!(unsafe { (*o).flags } & RAW, RAW);
+    // Read, compared, keyed and stored as the record of objects it stands for.
+    assert_eq!(Heap::to_value(&l, r), line);
+    let absent = h.to_word(
+        &l,
+        &record(vec![
+            ("best", none()),
+            ("note", none()),
+            ("qty", Value::Int(3)),
+        ]),
+    );
+    assert_eq!(cmp_words(&l, absent, r), Ordering::Less);
+    assert!(native_key(&l, absent));
+    assert!(
+        !native_key(&l, r),
+        "a `Float` is no map's key, held in an option or not"
+    );
+    let (_into, read) = kept(&l, r);
+    assert_eq!(Heap::to_value(&l, read), line);
+    let best = field_word(&mut h, &l, o, l.shape_offsets(shape)[0], Slot::Maybe);
+    assert_eq!(Heap::to_value(&l, best), some(Value::Float(1.5)));
+    let opts = Value::array(vec![some(Value::Int(1)), none(), some(Value::Int(2))]);
+    let a = h.to_word(&l, &opts);
+    assert!(ply_codegen::array::in_place(obj(a)));
+    assert_eq!(Heap::to_value(&l, a), opts);
+    let second = ply_codegen::array::element(&mut h, &l, obj(a), 1);
+    assert_eq!(Heap::to_value(&l, second), none());
+    let (_into, read) = kept(&l, a);
+    assert_eq!(Heap::to_value(&l, read), opts);
+    // A unit that reads an `Option`'s word has the runtime hold it so.
+    let words = Layouts::of(
+        layouts().ctors.clone(),
+        &[],
+        RecordLayout {
+            option_words: false,
+            ..RecordLayout::CURRENT
+        },
+    );
+    let by_word = h.to_word(&words, &line);
+    let spelled = words.shape_spelled(unsafe { (*obj(by_word)).layout });
+    assert!(spelled.iter().all(|s| !s.as_str().contains('!')));
+    assert_eq!(Heap::to_value(&words, by_word), line);
+    for x in [r, absent, best, a, second, by_word] {
         dec(x);
     }
 }

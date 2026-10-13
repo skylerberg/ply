@@ -1176,6 +1176,11 @@ fn raw_word(value: CValue) -> Bytes =
     _ -> bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"]),
   }
 
+/// The word a record holds `value` in where it holds it as a word: an `Option` held as its
+/// payload's word as that word.
+fn held_word(value: CValue) -> Bytes =
+  if value.kind == KMaybe { value.expr } else { as_word(value) }
+
 /// The field of `kind` that `base` holds as its own words from word `at` on, read as the kind.
 fn raw_at(base: Bytes, at: Bytes, kind: Kind) -> Bytes = {
   let word = bytes_concat_all([b"ply_words(", base, b")[", at, b"]"]);
@@ -1254,6 +1259,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
     _ -> match f.kind {
       KFloat -> bytes_concat(f.name, b"!f"),
       KDec -> bytes_concat(f.name, b"!d"),
+      KMaybe -> bytes_concat(f.name, b"!m"),
       KNum(w) -> if raw_slot(f.kind) {
         bytes_concat(f.name, if w.signed { b"!i64" } else { b"!u64" })
       } else { f.name },
@@ -1265,7 +1271,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
 /// do, raw when it holds a `Float`'s bits or a record in place.
 fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
   let raw = if fold(fs, false, |acc: Bool, f: FieldTy|
-      acc || raw_slot(f.kind) || in_place(f) != None) { 4 }
+      acc || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) { 4 }
   else { 0 };
   if l.width > 0 && leaves_uncounted(fs) { 1 + raw } else if l.tail > 0 { 2 + raw } else { raw }
 }
@@ -4757,7 +4763,11 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
       );
       {
         emitter: note_holder(loaded, r.name),
-        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+        value: {
+          kind: if element.kind == KMaybe { KMaybe } else { KBoxed },
+          expr: r.name,
+          ty: element.ty,
+        },
       }
     },
   }
@@ -5311,7 +5321,7 @@ fn held_record(emitter: Emitter, fs: List<FieldTy>, vals: List<CValue>) -> WithV
   build_record(
     emitter,
     map(fs, |f: FieldTy| f.name),
-    map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { as_word(v) }),
+    map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) }),
     fs,
     Some(vals),
   )
@@ -5903,8 +5913,9 @@ fn in_place_update(
         Some(v) -> {
           let nm = match list_at(sets, i) { Some(f) -> f.name, None -> b"" };
           let raw = fold(fs, None, |r: Option<Kind>, f: FieldTy|
-            if f.name == nm && raw_slot(f.kind) { Some(f.kind) } else { r });
+            if f.name == nm && (raw_slot(f.kind) || f.kind == KMaybe) { Some(f.kind) } else { r });
           let w = match raw {
+            Some(KMaybe) -> maybe_owned(acc.emitter, v),
             Some(k) -> held_raw(acc.emitter, v, k),
             None -> owned(acc.emitter, v),
           };
@@ -5953,7 +5964,7 @@ fn in_place_update(
               b")[",
               at,
               b"] = ",
-              as_word(v),
+              held_word(v),
               b";",
             ]),
           )
@@ -6024,11 +6035,16 @@ fn read_field(
         match field_at(b.value.ty, f.field) {
           // A known shape reads at the field's offset; a scalar field goes into a register of its kind.
           Some(i) -> {
-            let w = bind_keeping(held.emitter, KBoxed, i.ty, field_read(held.value.expr, i));
+            let w = bind_keeping(
+              held.emitter,
+              if i.kind == KMaybe { KMaybe } else { KBoxed },
+              i.ty,
+              field_read(held.value.expr, i),
+            );
             match i.kind {
               // Without release a word-kinded field never releases its base: there is no in-place field take.
               // Under release a base at its last use is let go here, the field duplicated first, as `rt_field` does.
-              KBoxed -> if w.emitter.release && base_owned(f.base)
+              k if counted(k) -> if w.emitter.release && base_owned(f.base)
                   && spendable(w.emitter, hv.expr) {
                 let once = if width_of(i.ty) != None && moves {
                   took(w.emitter, held.value.expr, i.at, w.value.expr)
@@ -6052,7 +6068,8 @@ fn read_field(
                       held.value.expr,
                       b")[",
                       ascii_of_int(i.at),
-                      b"] = ply_unit; } else { ply_inc(",
+                      if i.kind == KMaybe { b"] = 0; } else { ply_inc(" }
+                      else { b"] = ply_unit; } else { ply_inc(" },
                       w.value.expr,
                       b"); }",
                     ]),
@@ -6171,7 +6188,7 @@ fn columns_load(
       b" = ",
       column_read(column, idx.value.expr, at.f),
       b";",
-      if kind == KBoxed { bytes_concat_all([b" ply_inc(", out.name, b");"]) } else { b"" },
+      if counted(kind) { bytes_concat_all([b" ply_inc(", out.name, b");"]) } else { b"" },
     ]),
   );
   let call = bytes_concat_all([
@@ -6186,6 +6203,9 @@ fn columns_load(
   let otherwise = indent(line(outdent(fast), b"} else {"));
   let slow = if kind == KBoxed {
     check(line(otherwise, bytes_concat_all([out.name, b" = ", call, b";"])))
+  } else if kind == KMaybe {
+    // The runtime answers the `Option`'s object, which opening takes.
+    check(line(otherwise, bytes_concat_all([out.name, b" = rt_maybe_open_p(ctx, ", call, b");"])))
   } else {
     let w = fresh(otherwise);
     line(
@@ -6205,7 +6225,7 @@ fn columns_load(
     bytes_concat_all([b"ply_dec(ctx, ", xs, b"); ply_dec(ctx, ", given, b");"]),
   );
   {
-    emitter: if kind == KBoxed { note_made(closed, out.name) } else { closed },
+    emitter: if counted(kind) { note_made(closed, out.name) } else { closed },
     value: { kind: kind, expr: out.name, ty: at.f.ty },
   }
 }
@@ -6217,7 +6237,8 @@ fn column_read(column: Bytes, i: Bytes, f: FieldTy) -> Bytes = {
   let at = bytes_concat_all([b"(", i, b") * ply_obj(", column, b")->aux"]);
   match f.ty {
     TyRec(_) -> bytes_concat_all([b"((Word)(intptr_t)(ply_words(", column, b") + ", at, b"))"]),
-    _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) } else {
+    _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) }
+    else if f.kind == KMaybe { bytes_concat_all([b"ply_words(", column, b")[", i, b"]"]) } else {
       as_kind(
         {
           kind: KBoxed,
@@ -6593,7 +6614,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
                     match built_field(acc.emitter, held.value.expr, nm) {
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
-                        let o = owned(acc.emitter, v);
+                        let o = if tk == KMaybe { maybe_owned(acc.emitter, v) }
+                        else { owned(acc.emitter, v) };
                         {
                           emitter: o.emitter,
                           ws: push(acc.ws, o.value.expr),
@@ -6629,7 +6651,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             );
                             // A scalar copy is read into a register of its kind, then unused: the store takes the word.
                             match f.kind {
-                              KBoxed ->
+                              k if counted(k) ->
                                 {
                                   emitter: inc,
                                   ws: push(acc.ws, w.value.expr),
@@ -6665,7 +6687,17 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                           );
                           // The runtime answers the copy duplicated, and the record takes it, or keeps
                           // it until the block closes where the record holds the `Float` it is as bits.
-                          if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) } else {
+                          if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) }
+                          else if tk == KMaybe {
+                            let o = maybe_owned(check(w.emitter), w.value);
+                            {
+                              emitter: o.emitter,
+                              ws: push(acc.ws, o.value.expr),
+                              kinds: push(acc.kinds, tk),
+                              vals: acc.vals,
+                              known: false,
+                            }
+                          } else {
                             {
                               emitter: spend_made(check(w.emitter), w.value.expr),
                               ws: push(acc.ws, w.value.expr),
@@ -6690,6 +6722,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
                         // The written field's word is duplicated: the record being built takes it.
                         let w = if owned_already { { emitter: acc.emitter, value: v } }
+                        else if tk == KMaybe { maybe_owned(acc.emitter, v) }
                         else { owned(acc.emitter, v) };
                         {
                           emitter: w.emitter,
@@ -7899,7 +7932,9 @@ fn items_from(
           let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
           let d = if raw { held_raw(o.emitter, o.value, kind_at(kinds, i)) }
           else { { emitter: o.emitter, value: o.value } };
-          let w = if !raw { owned(o.emitter, o.value) }
+          let maybe = kind_at(kinds, i) == KMaybe && len(kinds) > i;
+          let w = if maybe { maybe_owned(o.emitter, o.value) }
+          else if !raw { owned(o.emitter, o.value) }
           else if kind_at(kinds, i) == KDec { d }
           else { bind(d.emitter, KInt, raw_word(d.value)) };
           items_from(
@@ -7908,7 +7943,8 @@ fn items_from(
             params,
             i + 1,
             push(acc, w.value.expr),
-            push(values, if raw { d.value } else { taken_as(w.emitter, o.value, w.value) }),
+            push(values, if raw || maybe { if raw { d.value } else { w.value } }
+            else { taken_as(w.emitter, o.value, w.value) }),
             kinds,
           )
         },
@@ -7918,7 +7954,7 @@ fn items_from(
 
 /// Under release the temporary a field came from is null once the record takes it, so the held word is remembered instead.
 fn taken_as(emitter: Emitter, v: CValue, w: CValue) -> CValue =
-  if emitter.release && counted(v.kind) { { kind: KBoxed, expr: w.expr, ty: v.ty } } else { v }
+  if emitter.release && counted(v.kind) { { kind: w.kind, expr: w.expr, ty: v.ty } } else { v }
 
 /// Under release a value read now and taken later is duplicated now: a read in between may be its last use and move it.
 fn secure(emitter: Emitter, value: CValue) -> WithValue =
@@ -8674,7 +8710,11 @@ fn arg_tested(
       );
       { emitter: note_holder(check(boxed.emitter), boxed.value.expr), value: boxed.value }
     } else {
-      bind(emitter, KBoxed, bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]))
+      bind(
+        emitter,
+        if f.kind == KMaybe { KMaybe } else { KBoxed },
+        bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]),
+      )
     },
   }
 
@@ -8725,7 +8765,14 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let w = match f {
           Some(x) -> if raw_slot(x.kind) {
             bind(acc, x.kind, raw_at(subj.expr, ascii_of_int(x.at), x.kind))
-          } else { bind_keeping(acc, KBoxed, x.ty, field_read(subj.expr, x)) },
+          } else {
+            bind_keeping(
+              acc,
+              if x.kind == KMaybe { KMaybe } else { KBoxed },
+              x.ty,
+              field_read(subj.expr, x),
+            )
+          },
           None ->
             bind(
               acc,
@@ -8733,7 +8780,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
               bytes_concat_all([b"ply_words(", subj.expr, b")[", ascii_of_int(i), b"]"]),
             ),
         };
-        let held = if w.value.kind != KBoxed { w.emitter } else {
+        let held = if !counted(w.value.kind) { w.emitter } else {
           note_holder(
             line(w.emitter, bytes_concat_all([b"ply_inc(", w.value.expr, b");"])),
             w.value.expr,
@@ -8873,8 +8920,7 @@ fn joined(
         b";",
       ]),
     );
-    if jk == KBoxed { match fv { Some(x) -> assign_owned(l, target, x.expr), None -> l } }
-    else { l }
+    if counted(jk) { match fv { Some(x) -> assign_owned(l, target, x.expr), None -> l } } else { l }
   });
   let a2 = release_at(a1, emitter.indent + 1);
   { text: bytes_concat_all([text, bytes_join(a2.out, b"")]), made: a2.count_locals }
@@ -8939,7 +8985,7 @@ fn shared_shape(emitter: Emitter, a: CValue, b: CValue) -> Option<List<Bytes>> =
                 None -> false,
                 Some(x) -> match built_field(emitter, b.expr, nm) {
                   None -> false,
-                  Some(y) -> x.kind == y.kind && x.kind != KBoxed,
+                  Some(y) -> x.kind == y.kind && !counted(x.kind),
                 },
               })) { Some(sorted_names(names_of(na))) }
       else { None },
@@ -8960,7 +9006,7 @@ fn rebuild(emitter: Emitter, names: List<Bytes>, values: List<CValue>) -> Option
       names,
       map(range(0, len(values)), |at: Int|
         match list_at(values, at) {
-          Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { as_word(value) },
+          Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { held_word(value) },
           None -> b"0",
         }),
       map(range(0, len(values)), |at: Int|
@@ -9900,7 +9946,8 @@ pub fn ctor_layouts(ctors: List<CtorRow>) -> Map<Bytes, List<FieldTy>> =
         None -> { name: name, kind: KBoxed, ty: TyOpen([]) },
       }
     });
-    if fold(args, false, |laid: Bool, f: FieldTy| laid || raw_slot(f.kind) || in_place(f) != None) {
+    if fold(args, false, |laid: Bool, f: FieldTy|
+        laid || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) {
       map_insert(acc, c.name, args)
     } else { acc }
   })
@@ -9928,7 +9975,8 @@ fn open_fields(fs: List<Field>) -> Bool =
 
 fn field_ty(f: Field) -> FieldTy = {
   let k = kind_of(f.ty);
-  { name: f.name, kind: k.kind, ty: k.ty }
+  // An `Option` is held as its payload's word, as the runtime holds one it lays out.
+  { name: f.name, kind: if is_option_type(f.ty) { KMaybe } else { k.kind }, ty: k.ty }
 }
 
 /// What a definition's scheme says it takes and answers.
@@ -10037,14 +10085,15 @@ pub fn own_definition(root: Bytes) -> Bytes / {abort.raise} =
   match specialisation_of(root) { Some(s) -> s.base, None -> root }
 
 /// What a value's layout reads of its type, every other part a known word, `_`: a scalar, a byte
-/// string, a list, an array or columns by its element, a record by its fields, and a variable as
-/// itself, for what the type it stands for reads.
+/// string, an `Option` or a list whatever it holds, an array or columns by its element, a record by
+/// its fields, and a variable as itself, for what the type it stands for reads.
 pub fn erased(ty: Type) -> Type =
   match ty {
     TyVar(_) -> ty,
     TyCon(c) -> if len(c.args) == 0 && laid_scalar(c.name) { ty }
-    else if len(c.args) == 1 && c.name == b"List" { TyCon({ name: b"List", args: [word_type()] }) }
-    else if len(c.args) == 1 && (c.name == b"Array" || c.name == b"Columns") {
+    else if len(c.args) == 1 && (c.name == b"List" || c.name == b"Option") {
+      TyCon({ name: c.name, args: [word_type()] })
+    } else if len(c.args) == 1 && (c.name == b"Array" || c.name == b"Columns") {
       TyCon({ name: c.name, args: map(c.args, erased) })
     } else { word_type() },
     TyRecord(fs) -> TyRecord(map(fs, erased_field)),
@@ -12247,6 +12296,30 @@ test "an Option is its payload's word in the code that knows it, and its object 
   assert_eq(at(out, 8).tables.generics.expects, [{ callee: b"m.kept", head: maybe }])
 }
 
+test "a record holds an Option as its payload's word" {
+  let src = bytes_concat_all([
+    b"type Entry = { name: String, note: Option<String> }\n",
+    b"fn made(s: String) -> Entry = { name: s, note: Some(s) }\n",
+    b"fn noted(e: Entry) -> Int = match e.note { Some(_) -> 1, None -> 0 }\n",
+    b"fn cleared(e: Entry) -> Entry = { ..e, note: None }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  // Built, read and matched, updated: the field is the payload's word throughout, no object made.
+  assert_eq(has(b"rt_maybe_take_p"), [false, false, false]);
+  assert_eq(has(b"rt_maybe_box_p"), [false, false, false]);
+  assert_eq(has(b"rt_ctor_p"), [false, false, false]);
+  // Its shape says so, which is how the runtime reads it.
+  assert(
+    fold(out, false, |acc: Bool, e: Emitted|
+      acc
+        || fold(e.tables.shapes, false, |seen: Bool, sh: List<Bytes>|
+          seen || contains(sh, b"note!m"))),
+    None,
+  )
+}
+
 test "a constructor holds its arguments as its declaration types them" {
   let src = bytes_concat_all([
     b"type Point = { x: Float, y: Float }\n",
@@ -12668,7 +12741,7 @@ fn record_word_lines(
 ) -> Bytes = {
   let l = laid_of(fs);
   let flags = record_flags(fs, l);
-  let words = map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { as_word(v) });
+  let words = map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) });
   bytes_concat_all([
     b"Word ",
     name,
@@ -12928,7 +13001,7 @@ test "a specialisation's root spells its layouts and the lambdas it runs, and re
   // What a layout does not read is a word.
   assert_eq(
     erased(TyCon({ name: b"Option", args: [TyCon({ name: b"Float", args: [] })] })),
-    TyCon({ name: b"_", args: [] }),
+    TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] }),
   );
   assert_eq(
     erased(TyCon({ name: b"List", args: [TyCon({ name: b"Float", args: [] })] })),

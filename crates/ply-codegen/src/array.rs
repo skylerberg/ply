@@ -42,7 +42,7 @@ fn start(o: *mut Obj, i: usize) -> usize {
 /// Element `i`, held once more: its word, or as a record's field of its slot is read.
 pub fn element(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, i: usize) -> Word {
     if in_place(o) {
-        field_word(heap, o, start(o, i), slot(layouts, o))
+        field_word(heap, layouts, o, start(o, i), slot(layouts, o))
     } else {
         let w = unsafe { word_at(o, i) };
         inc(w);
@@ -155,6 +155,11 @@ impl Heap {
                     Slot::Record(inner) => {
                         heap::drop_embedded(o, at);
                         heap::embed(layouts, o, at, inner, v);
+                    }
+                    Slot::Maybe => {
+                        let old = word_at(o, at);
+                        heap::hold_raw(o, at, Slot::Maybe, v);
+                        dec(old);
                     }
                     raw => heap::hold_raw(o, at, raw, v),
                 }

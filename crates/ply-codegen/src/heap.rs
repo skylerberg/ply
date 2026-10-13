@@ -365,6 +365,8 @@ pub enum Slot {
     Wide(u8),
     Decimal,
     Record(u32),
+    /// An `Option` as its payload's word, counted, and zero for `None`.
+    Maybe,
 }
 
 impl Slot {
@@ -395,6 +397,7 @@ pub fn spelled(name: &Symbol, slot: Slot) -> Symbol {
         Slot::Wide(t) if t == ply_eval::IntTy::I64 as u8 => "i64",
         Slot::Wide(_) => "u64",
         Slot::Decimal => "d",
+        Slot::Maybe => "m",
         Slot::Word | Slot::Record(_) => return name.clone(),
     };
     Symbol::new(format!("{}!{spelling}", name.as_str()))
@@ -407,6 +410,7 @@ fn raw_of(spelling: &str) -> Option<Slot> {
         "u64" => Some(Slot::Wide(ply_eval::IntTy::U64 as u8)),
         "i64" => Some(Slot::Wide(ply_eval::IntTy::I64 as u8)),
         "d" => Some(Slot::Decimal),
+        "m" => Some(Slot::Maybe),
         _ => None,
     }
 }
@@ -431,16 +435,30 @@ unsafe fn raw_value(o: *mut Obj, at: usize, slot: Slot) -> Value {
                 word_at(o, at) as u64 as u128,
             )),
             Slot::Decimal => Value::Decimal(decimal_at(o, at)),
-            Slot::Word | Slot::Record(_) => unreachable!("a field held as a word or a record"),
+            Slot::Word | Slot::Record(_) | Slot::Maybe => {
+                unreachable!("a field held as a word, a record or an option")
+            }
         }
     }
 }
 
-/// Copies scalar object `w`'s payload into the words of `o` from `at`, and lets `w` go.
+/// Copies scalar object `w`'s payload into the words of `o` from `at`, and lets `w` go: for an
+/// `Option`, its payload's word with a count of its own, or zero.
 pub unsafe fn hold_raw(o: *mut Obj, at: usize, slot: Slot, w: Word) {
     unsafe {
-        for i in 0..slot.raw_words() {
-            set_word(o, at + i, word_at(obj(w), i));
+        if slot == Slot::Maybe {
+            let held = if (*obj(w)).len == 1 {
+                let p = word_at(obj(w), 0);
+                inc(p);
+                p
+            } else {
+                0
+            };
+            set_word(o, at, held);
+        } else {
+            for i in 0..slot.raw_words() {
+                set_word(o, at + i, word_at(obj(w), i));
+            }
         }
     }
     dec(w);
@@ -454,7 +472,41 @@ pub fn raw_slot_of(layouts: &Layouts, w: Word) -> Option<Slot> {
             Some(Slot::Wide(unsafe { (*obj(w)).layout } as u8))
         }
         KIND_DECIMAL if layouts.layout.raw_decimals => Some(Slot::Decimal),
+        KIND_CTOR if layouts.layout.option_words && is_option(layouts, w) => Some(Slot::Maybe),
         _ => None,
+    }
+}
+
+/// Whether `w` is the prelude's `Some` of one argument or its `None`.
+pub fn is_option(layouts: &Layouts, w: Word) -> bool {
+    let o = obj(w);
+    let (layout, len) = unsafe { ((*o).layout, (*o).len) };
+    (len == 1 && layouts.some == Some(layout)) || (len == 0 && layouts.none == Some(layout))
+}
+
+/// The `Option` object an `Option` held as its payload's word stands for, holding the payload once
+/// more.
+pub fn option_word(heap: &mut Heap, layouts: &Layouts, w: Word) -> Word {
+    match (w, layouts.some, layouts.none) {
+        // As the unit's own `None` is: no arguments and no flags.
+        (0, _, Some(none)) => heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+        (_, Some(some), _) if w != 0 => {
+            inc(w);
+            heap.ctor(layouts, some, &[w])
+        }
+        _ => unreachable!("an `Option` held as its payload's word in a program with no `Option`"),
+    }
+}
+
+/// The `Option` an `Option` held as its payload's word stands for, as a value.
+fn option_value(layouts: &Layouts, payload: Option<Value>) -> Value {
+    let name = |index: Option<u32>, bare: &str| match index {
+        Some(i) => layouts.ctors[i as usize].0.clone(),
+        None => Symbol::new(bare),
+    };
+    match payload {
+        Some(v) => Value::ctor(name(layouts.some, "Some"), vec![v]),
+        None => Value::ctor(name(layouts.none, "None"), vec![]),
     }
 }
 
@@ -606,16 +658,17 @@ pub unsafe fn part_word(o: *mut Obj, at: usize, slot: Slot) -> Option<Word> {
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) | Slot::Decimal => None,
+            Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
         }
     }
 }
 
-/// The word a record holds field `at`, of `slot`, as, held once more: a `Float` boxed, and a record
-/// held in place as the address of its header there.
-pub fn field_word(heap: &mut Heap, o: *mut Obj, at: usize, slot: Slot) -> Word {
+/// The word a record holds field `at`, of `slot`, as, held once more: a `Float` boxed, an `Option`
+/// made the object it stands for, and a record held in place as the address of its header there.
+pub fn field_word(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, at: usize, slot: Slot) -> Word {
     let w = unsafe { word_at(o, at) };
     match slot {
+        Slot::Maybe => option_word(heap, layouts, w),
         Slot::Float | Slot::Wide(_) | Slot::Decimal => {
             let (kind, layout) = match slot {
                 Slot::Wide(t) => (KIND_FIXED, u32::from(t)),
@@ -738,6 +791,10 @@ impl Shapes {
                     at += 1;
                 }
                 Slot::Float | Slot::Wide(_) | Slot::Decimal => at += slot.raw_words(),
+                Slot::Maybe => {
+                    counted.push(at);
+                    at += 1;
+                }
                 Slot::Record(n) => {
                     let n = *n as usize;
                     counted.extend(self.counted[n].iter().map(|c| at + 2 + c));
@@ -799,6 +856,8 @@ pub struct RecordLayout {
     pub raw_decimals: bool,
     /// A long slice of a bytes value a view of its bytes, rather than a copy of them.
     pub bytes_views: bool,
+    /// An `Option` held as its payload's word, rather than by its word.
+    pub option_words: bool,
 }
 
 impl RecordLayout {
@@ -806,6 +865,7 @@ impl RecordLayout {
     pub const CURRENT: RecordLayout = RecordLayout {
         raw_decimals: true,
         bytes_views: true,
+        option_words: true,
     };
 }
 
@@ -1641,7 +1701,8 @@ impl Heap {
     }
 
     fn copy(&mut self, w: Word, copies: &mut HashMap<usize, Word>) -> Word {
-        if is_imm(w) {
+        // Zero is an `Option` held as its payload's word: `None`.
+        if is_imm(w) || w == 0 {
             return w;
         }
         let o = obj(w);
@@ -2681,6 +2742,18 @@ fn read_held(
     unsafe {
         match slot {
             Slot::Float | Slot::Wide(_) | Slot::Decimal => raw_value(o, at, slot),
+            Slot::Maybe => {
+                let p = word_at(o, at);
+                let payload = (p != 0).then(|| {
+                    let name = layouts.some.map(|i| layouts.ctors[i as usize].0.clone());
+                    let field = match name {
+                        Some(n) => carry.ctor_field(&n, 0, ctors),
+                        None => carry.item(),
+                    };
+                    Heap::read(layouts, p, &field, ctors, walked)
+                });
+                option_value(layouts, payload)
+            }
             Slot::Record(_) => Heap::read(layouts, words(o).add(at) as Word, carry, ctors, walked),
             Slot::Word => Heap::read(layouts, word_at(o, at), carry, ctors, walked),
         }
@@ -2693,15 +2766,29 @@ unsafe fn cmp_fields(
     (x, sx, ax): (*mut Obj, Slot, usize),
     (y, sy, ay): (*mut Obj, Slot, usize),
 ) -> Ordering {
+    // `None` sorts before `Some`, as their names do, and two `Some`s as their payloads.
+    if sx == Slot::Maybe && sy == Slot::Maybe {
+        let (p, q) = unsafe { (word_at(x, ax), word_at(y, ay)) };
+        return match (p, q) {
+            (0, 0) => Ordering::Equal,
+            (0, _) => Ordering::Less,
+            (_, 0) => Ordering::Greater,
+            _ => cmp_words(layouts, p, q),
+        };
+    }
     let word = |o: *mut Obj, slot: Slot, at: usize| unsafe {
         match slot {
             Slot::Word => Some(word_at(o, at)),
             Slot::Record(_) => Some(words(o).add(at) as Word),
-            Slot::Float | Slot::Wide(_) | Slot::Decimal => None,
+            Slot::Float | Slot::Wide(_) | Slot::Decimal | Slot::Maybe => None,
         }
     };
     let value = |o: *mut Obj, slot: Slot, at: usize| match word(o, slot, at) {
         Some(w) => Heap::to_value(layouts, w),
+        None if slot == Slot::Maybe => {
+            let p = unsafe { word_at(o, at) };
+            option_value(layouts, (p != 0).then(|| Heap::to_value(layouts, p)))
+        }
         None => unsafe { raw_value(o, at, slot) },
     };
     match (word(x, sx, ax), word(y, sy, ay)) {
@@ -2729,6 +2816,10 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
                 layouts.parts(o).into_iter().all(|(at, slot)| match slot {
                     Slot::Decimal => least_scale(decimal_at(o, at)),
                     Slot::Float | Slot::Wide(_) => true,
+                    Slot::Maybe => {
+                        let p = word_at(o, at);
+                        p == 0 || native_key(layouts, p)
+                    }
                     _ => part_word(o, at, slot).is_some_and(|p| native_key(layouts, p)),
                 })
             }

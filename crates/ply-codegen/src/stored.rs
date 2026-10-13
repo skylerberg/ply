@@ -5,7 +5,7 @@
 //! met twice is written once. A closure, and a bridged cell, task, channel or secret, has no text.
 
 use crate::heap::{
-    self, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,
+    self, FLAT, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,
     KIND_CTOR, KIND_DECIMAL, KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD,
     KIND_STR, KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word,
     word_at,
@@ -113,6 +113,9 @@ enum Pending {
     Word(Word),
     Done(usize),
     Held(*mut Obj, usize, Slot),
+    /// The place of a `Some` written for an `Option` held as its payload's word, which no address
+    /// names again.
+    Placed,
 }
 
 struct Writer<'l> {
@@ -145,6 +148,10 @@ impl<'l> Writer<'l> {
                 Pending::Done(address) => {
                     self.done.insert(address, self.places);
                     self.places += 1;
+                }
+                Pending::Placed => self.places += 1,
+                Pending::Held(o, at, Slot::Maybe) => {
+                    self.option(unsafe { word_at(o, at) }, &mut pending)?
                 }
                 Pending::Held(o, at, slot) => match unsafe { heap::part_word(o, at, slot) } {
                     Some(w) => self.word(w, &mut pending)?,
@@ -295,6 +302,29 @@ impl<'l> Writer<'l> {
         };
         pending.push(Pending::Done(w as usize));
         pending.extend(parts.into_iter().rev().map(Pending::Word));
+        Ok(())
+    }
+
+    /// An `Option` held as its payload's word, written as the object it stands for: `None` as the
+    /// unit's one, and `Some` as a constructor of the payload, as its object would be.
+    fn option(&mut self, p: Word, pending: &mut Vec<Pending>) -> Result<(), String> {
+        match (p, self.layouts.some, self.layouts.none) {
+            (0, _, Some(none)) => {
+                self.out.push(CTOR);
+                self.ctor(none);
+                self.out.push(0);
+                self.varint(0);
+            }
+            (_, Some(some), _) if p != 0 => {
+                self.out.push(CTOR);
+                self.ctor(some);
+                self.out.push(if is_imm(p) { FLAT } else { 0 });
+                self.varint(1);
+                pending.push(Pending::Placed);
+                pending.push(Pending::Word(p));
+            }
+            _ => return Err("an `Option` held as its payload's word, with no `Option`".to_string()),
+        }
         Ok(())
     }
 
