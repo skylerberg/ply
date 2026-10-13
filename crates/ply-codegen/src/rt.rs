@@ -4870,11 +4870,10 @@ pub unsafe extern "C" fn rt_maybe_take(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
-/// The payload of the `Option` object `w` with a count of its own, or zero for `None`: the `Option`
-/// compiled code holds as its payload's word. `w` keeps its count.
+/// The `Option` object `w`, which it takes, as compiled code holds it: its payload's word with a
+/// count of its own, or zero for `None`. A box nothing else holds hands its payload over whole.
 pub unsafe extern "C" fn rt_maybe_open(ctx: *mut Ctx, w: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    heap::inc(w);
     unwrapped(ctx, w)
 }
 
