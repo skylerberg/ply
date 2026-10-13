@@ -92,7 +92,7 @@ module.exports = grammar({
         'const',
       )),
       'fn',
-      field('name', $.identifier),
+      field('name', choice($.identifier, $.qualified_name)),
       optional($.generic_parameters),
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type), optional($.effect_row))),
@@ -102,7 +102,7 @@ module.exports = grammar({
 
     extern_function: $ => seq(
       'extern', 'fn',
-      field('name', $.identifier),
+      field('name', choice($.identifier, $.qualified_name)),
       optional($.generic_parameters),
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type))),
@@ -346,8 +346,8 @@ module.exports = grammar({
       field('type', $._type),
     ),
 
-    key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', $.identifier)),
-    show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', $.identifier)),
+    key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
+    show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     numeric_declaration: $ => seq(
       optional('pub'),
       'numeric',
@@ -361,7 +361,7 @@ module.exports = grammar({
     numeric_operation: $ => seq(
       field('operation', choice('add', 'sub', 'mul', 'neg', 'of_int')),
       ':',
-      field('function', $.identifier),
+      field('function', choice($.identifier, $.qualified_name)),
     ),
 
     // --- Expressions --------------------------------------------------------
