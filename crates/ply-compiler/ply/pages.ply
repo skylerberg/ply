@@ -1,0 +1,517 @@
+//! What a module documents: a page for the module and one for each name it declares, as `ply doc`
+//! prints them. A page is read off the module's text for what was written (a doc, the names of the
+//! parameters, the clauses and the members) and off its check and its hashing for what they decided
+//! (a definition's type, footprint and hash), so a kept answer documents a module whose text no
+//! command parses again.
+
+import diagnostics (parse_all)
+import exprs (Param)
+import front (analyse, Analysed, Refused)
+import hash (hex)
+import infer (DefInfo)
+import items (Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef, TDAlias, TDSum, TDNominal,
+              VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc, SpecClause, ReturnsFresh,
+              ReturnsParam, Vis, VPub, VPriv, SchemaDef, schema_of)
+import parsing (Doc, Ident, Span)
+import resolve (ParsedModule, qualify)
+import type_syntax (TypeExpr, TRecord, ty_span, generics_text)
+import types (Printer, Scheme, Type, TyFn, printer_new, print_scheme, print_ty, print_row,
+              scheme_text, row_text)
+import std.bin
+import std.list (find)
+import std.string (ascii_trim, join, replace)
+
+/// A parameter as a signature writes it.
+pub type Typed = { name: String, ty: String }
+
+/// A variant, field or operation of a declaration, or what a module publishes.
+pub type Member = { kind: String, name: String, signature: String, doc: List<String> }
+
+pub type Page = {
+  kind: String,
+  /// Its program-wide name.
+  name: String,
+  /// What a query may name it by alone: a declaration's own name, an operation's `effect.op`, and
+  /// nothing for a module, which only its full name names.
+  simple: String,
+  signature: String,
+  ty: String,
+  params: List<Typed>,
+  doc: List<String>,
+  clauses: List<String>,
+  members: List<Member>,
+  /// Where its module's text declares it: the offset its place is counted from.
+  at: Int,
+  hash: Option<String>,
+  footprint: Option<String>,
+  /// The laws whose text names it.
+  laws: List<String>,
+}
+
+/// A module's pages: its own first, then one for each name it declares.
+pub type Pages = { pages: List<Page> }
+
+derive bin for Typed
+derive bin for Member
+derive bin for Page
+derive bin for Pages
+
+/// What a module's pages are read from beside its text.
+pub type Decided = {
+  /// What its check published of each definition, by program-wide name.
+  defs: List<DefInfo>,
+  /// Each definition's hash, by program-wide name.
+  hashes: Map<Bytes, Bytes>,
+  /// The laws whose text names a declaration, by the name it declares.
+  laws: Map<Bytes, List<Bytes>>,
+}
+
+pub fn bare_page(kind: String, name: String, signature: String) -> Page =
+  {
+    kind: kind,
+    name: name,
+    simple: "",
+    signature: signature,
+    ty: "",
+    params: [],
+    doc: [],
+    clauses: [],
+    members: [],
+    at: 0,
+    hash: None,
+    footprint: None,
+    laws: [],
+  }
+
+// --- The signature ----------------------------------------------------------
+// `prefix name<generics>(p: T, ...) -> R / row`, with the parameters named as the source did and
+// every variable named by one printer, so the generics, the parameters and the row agree.
+
+type Printing = { printer: Printer, pairs: List<Typed> }
+
+pub type Signed = { text: String, params: List<Typed> }
+
+fn printed_params(
+  printer: Printer,
+  ts: List<Type>,
+  names: List<String>,
+) -> Printing / {abort.raise} =
+  fold(range(0, len(ts)), { printer: printer, pairs: [] }, |acc: Printing, i: Int|
+    match list_at(ts, i) {
+      None -> acc,
+      Some(t) -> {
+        let out = print_ty(acc.printer, t);
+        let written = match list_at(names, i) { Some(n) -> n, None -> "_" ++ int_to_string(i) };
+        {
+          printer: out.printer,
+          pairs: push(acc.pairs, { name: written, ty: string_of_bytes_lossy(out.text) }),
+        }
+      },
+    })
+
+/// What the scheme prints before its first `(`: the quantifier list, or nothing.
+fn generics_of(full: Bytes) -> String / {abort.raise} =
+  match bytes_index_of(full, b"(") {
+    Some(i) -> string_of_bytes_lossy(bytes_slice(full, 0, i)),
+    None -> "",
+  }
+
+pub fn signature(
+  prefix: String,
+  name: String,
+  scheme: Scheme,
+  names: List<String>,
+) -> Signed / {abort.raise} = {
+  let full = print_scheme(printer_new(), scheme);
+  match scheme.ty {
+    TyFn(f) -> {
+      let ps: Printing = printed_params(full.printer, f.params, names);
+      let row = print_row(ps.printer, f.effects);
+      let effects = if row.text == b"{}" { "" } else { " / " ++ string_of_bytes_lossy(row.text) };
+      let ret = print_ty(row.printer, f.ret);
+      {
+        text: prefix ++ name ++ generics_of(full.text) ++ "("
+          ++ join(map(ps.pairs, |named: Typed| named.name ++ ": " ++ named.ty), ", ")
+          ++ ") -> "
+          ++ string_of_bytes_lossy(ret.text)
+          ++ effects,
+        params: ps.pairs,
+      }
+    },
+    _ -> { text: prefix ++ name ++ ": " ++ string_of_bytes_lossy(full.text), params: [] },
+  }
+}
+
+// --- What the text wrote ------------------------------------------------------
+
+pub fn lines_of(doc: Option<Doc>) -> List<String> =
+  match doc { Some(d) -> map(d.lines, |l: Bytes| string_of_bytes_lossy(l)), None -> [] }
+
+/// Written text on one line: comment lines dropped, each line break one space, and no space or
+/// trailing comma left against a closing bracket.
+pub fn one_line(text: String) -> String = {
+  let kept = filter(map(string_split(text, "\n"), |l: String| ascii_trim(l)), |l: String|
+    l != "" && !string_starts_with(l, "//"));
+  let joined = join(kept, " ");
+  let closed = replace(replace(replace(joined, ", )", ")"), ", ]", "]"), ", }", " }");
+  replace(replace(replace(closed, "( ", "("), "[ ", "["), " )", ")")
+}
+
+/// A module as its pages read it: its parse, its text, and what its check and hashing decided.
+type Reading = { parsed: ParsedModule, text: Bytes, defs: Map<Bytes, DefInfo>, decided: Decided }
+
+fn sliced(reading: Reading, span: Span) -> String / {abort.raise} =
+  if span.start > span.end || span.end > bytes_len(reading.text) { "" }
+  else { one_line(string_of_bytes_lossy(bytes_slice(reading.text, span.start, span.end))) }
+
+fn visibility(v: Vis) -> String = match v { VPub -> "pub ", VPriv -> "" }
+
+fn fn_named(parsed: ParsedModule, name: Bytes) -> Option<FnDef> =
+  fold(parsed.module.items, None, |acc: Option<FnDef>, it: Item|
+    match acc {
+      Some(_) -> acc,
+      None -> match it {
+        IFn(d) -> if qualify(parsed.name, d.name.name) == name { Some(d) } else { None },
+        _ -> None,
+      },
+    })
+
+fn fn_signature(def_info: DefInfo, found: Option<FnDef>) -> Signed / {abort.raise} = {
+  let prefix = match found {
+    None -> "fn ",
+    Some(d) ->
+      visibility(d.vis) ++ (if d.reuse == None { "" } else { "reuse " })
+        ++ (if d.baked == None { "" } else { "const " })
+        ++ "fn ",
+  };
+  signature(prefix, string_of_bytes_lossy(def_info.simple_name), def_info.scheme, match found {
+    Some(d) -> map(d.params, |p: Param| string_of_bytes_lossy(p.name.name)),
+    None -> [],
+  })
+}
+
+/// What a caller may rely on beyond the signature: what the answer shares, then each clause as written.
+fn clauses_of(reading: Reading, d: FnDef) -> List<String> / {abort.raise} = {
+  let returns = match d.returns {
+    Some(ReturnsFresh(_)) -> ["returns fresh"],
+    Some(ReturnsParam(p)) -> ["returns " ++ string_of_bytes_lossy(p.name)],
+    None -> [],
+  };
+  fold(d.spec, returns, |acc: List<String>, c: SpecClause| push(acc, sliced(reading, c.span)))
+}
+
+/// A schema as it is written: its parameters, its binders and guard, and the body it claims.
+fn schema_signature(reading: Reading, d: SchemaDef) -> String / {abort.raise} =
+  visibility(d.vis) ++ sliced(reading, d.span)
+
+fn laws_naming(reading: Reading, name: Bytes) -> List<String> =
+  match map_get(reading.decided.laws, name) {
+    Some(laws) -> map(laws, |l: Bytes| string_of_bytes_lossy(l)),
+    None -> [],
+  }
+
+// --- The pages ------------------------------------------------------------------
+
+/// A definition a schema declares is documented as the schema: what it is written as, and the laws
+/// that instantiate it.
+fn definition_page(reading: Reading, def_info: DefInfo) -> Page / {abort.raise} = {
+  let found = fn_named(reading.parsed, def_info.name);
+  let schema = match found { Some(d) -> schema_of(reading.parsed.module, d), None -> None };
+  let signed: Signed = fn_signature(def_info, found);
+  {
+    kind: match schema { Some(_) -> "law schema", None -> "definition" },
+    name: string_of_bytes_lossy(def_info.name),
+    simple: string_of_bytes_lossy(def_info.simple_name),
+    signature: match schema { Some(d) -> schema_signature(reading, d), None -> signed.text },
+    ty: string_of_bytes_lossy(scheme_text(def_info.scheme)),
+    params: signed.params,
+    doc: match found { Some(d) -> lines_of(d.doc), None -> [] },
+    clauses: match found { Some(d) -> clauses_of(reading, d), None -> [] },
+    members: [],
+    at: def_info.at.span.start,
+    hash: match map_get(reading.decided.hashes, def_info.name) {
+      Some(h) -> Some(string_of_bytes_lossy(hex(h))),
+      None -> None,
+    },
+    footprint: Some(string_of_bytes_lossy(row_text({ atoms: def_info.footprint, tail: None }))),
+    laws: laws_naming(reading, def_info.simple_name),
+  }
+}
+
+fn type_head(d: TypeDef) -> String =
+  visibility(d.vis) ++ (if d.opaque == None { "" } else { "opaque " }) ++ "type "
+    ++ string_of_bytes_lossy(d.name.name)
+    ++ string_of_bytes_lossy(generics_text(d.generics))
+
+fn field_doc(docs: List<FieldDoc>, name: Bytes) -> List<String> =
+  match find(docs, |f: FieldDoc| f.name == name) { Some(f) -> lines_of(Some(f.doc)), None -> [] }
+
+fn type_signature(reading: Reading, d: TypeDef) -> String / {abort.raise} =
+  match d.body {
+    TDAlias(t) -> match t {
+      TRecord(_) -> type_head(d),
+      _ -> type_head(d) ++ " = " ++ sliced(reading, ty_span(t)),
+    },
+    // Its fields are its members, as an alias's are; the head says it is a type of its own.
+    TDNominal(_) -> type_head(d) ++ " = new { .. }",
+    TDSum(_) -> type_head(d),
+  }
+
+fn field_members(reading: Reading, d: TypeDef, t: TypeExpr) -> List<Member> / {abort.raise} =
+  match t {
+    TRecord(r) ->
+      map(r.fields, |f: { name: Ident, ty: TypeExpr }|
+        {
+          kind: "field",
+          name: string_of_bytes_lossy(f.name.name),
+          signature: string_of_bytes_lossy(f.name.name) ++ ": " ++ sliced(reading, ty_span(f.ty)),
+          doc: field_doc(d.field_docs, f.name.name),
+        }),
+    _ -> [],
+  }
+
+fn type_members(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} =
+  match d.body {
+    // An opaque sum's constructors are its module's alone, so they are no part of what it publishes.
+    TDSum(vs) -> if d.opaque != None { [] } else {
+      map(vs, |v: VariantDef|
+        {
+          kind: "variant",
+          name: string_of_bytes_lossy(v.name.name),
+          signature: sliced(reading, v.span),
+          doc: lines_of(v.doc),
+        })
+    },
+    TDAlias(t) -> field_members(reading, d, t),
+    TDNominal(t) -> field_members(reading, d, t),
+  }
+
+fn effect_head(d: EffectDef) -> String =
+  visibility(d.vis) ++ (if d.is_nondet { "nondet " } else { "" }) ++ "effect "
+    ++ string_of_bytes_lossy(d.name.name)
+
+fn op_member(reading: Reading, op: OpDef) -> Member / {abort.raise} =
+  {
+    kind: "operation",
+    name: string_of_bytes_lossy(op.name.name),
+    signature: sliced(reading, op.span),
+    doc: lines_of(op.doc),
+  }
+
+fn set_signature(reading: Reading, d: EffectSetDef) -> String / {abort.raise} =
+  visibility(d.vis) ++ sliced(reading, d.span)
+
+/// A declaration's page: what kind it is, the names it goes by, and where it is declared.
+fn declared(reading: Reading, kind: String, own: Bytes, span: Span) -> Page =
+  {
+    ..bare_page(kind, string_of_bytes_lossy(qualify(reading.parsed.name, own)), ""),
+    simple: string_of_bytes_lossy(own),
+    at: span.start,
+  }
+
+/// The pages of what one item declares: a type's, an effect's and each of its operations', or an
+/// effect set's. A function's page is its definition's, which its check publishes.
+fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
+  match it {
+    IType(d) ->
+      [
+        {
+          ..declared(reading, "type", d.name.name, d.span),
+          signature: type_signature(reading, d),
+          doc: lines_of(d.doc),
+          members: type_members(reading, d),
+        },
+      ],
+    IEffect(d) ->
+      fold(
+        d.ops,
+        [
+          {
+            ..declared(reading, "effect", d.name.name, d.span),
+            signature: effect_head(d),
+            doc: lines_of(d.doc),
+            members: map(d.ops, |op: OpDef| op_member(reading, op)),
+          },
+        ],
+        |acc: List<Page>, op: OpDef|
+          push(acc, {
+            ..declared(reading, "operation", bytes_concat_all([d.name.name, b".", op.name.name]), op.span),
+            signature: sliced(reading, op.span),
+            doc: lines_of(op.doc),
+          }),
+      ),
+    IEffectSet(d) ->
+      [
+        {
+          ..declared(reading, "effect set", d.name.name, d.span),
+          signature: set_signature(reading, d),
+          doc: lines_of(d.doc),
+        },
+      ],
+    _ -> [],
+  }
+
+/// What a module publishes, in its order, each with its signature and doc.
+fn module_members(reading: Reading) -> List<Member> / {abort.raise} = {
+  let parsed = reading.parsed;
+  fold(parsed.module.items, [], |acc: List<Member>, it: Item|
+    match it {
+      IFn(d) -> match d.vis {
+        VPriv -> acc,
+        VPub -> match ((
+            map_get(reading.defs, qualify(parsed.name, d.name.name)),
+            schema_of(parsed.module, d),
+          )) {
+          (None, _) -> acc,
+          (Some(def_info), None) ->
+            push(acc, {
+              kind: "definition",
+              name: string_of_bytes_lossy(d.name.name),
+              signature: fn_signature(def_info, Some(d)).text,
+              doc: lines_of(d.doc),
+            }),
+          // A schema is listed once, as itself, and not again as the definition its guard is.
+          (Some(_), Some(schema)) -> if schema.name.name != d.name.name { acc } else {
+            push(acc, {
+              kind: "law schema",
+              name: string_of_bytes_lossy(d.name.name),
+              signature: schema_signature(reading, schema),
+              doc: lines_of(d.doc),
+            })
+          },
+        },
+      },
+      IType(d) -> match d.vis {
+        VPriv -> acc,
+        VPub ->
+          push(acc, {
+            kind: "type",
+            name: string_of_bytes_lossy(d.name.name),
+            signature: type_signature(reading, d),
+            doc: lines_of(d.doc),
+          }),
+      },
+      IEffect(d) -> match d.vis {
+        VPriv -> acc,
+        VPub ->
+          push(acc, {
+            kind: "effect",
+            name: string_of_bytes_lossy(d.name.name),
+            signature: effect_head(d),
+            doc: lines_of(d.doc),
+          }),
+      },
+      IEffectSet(d) -> match d.vis {
+        VPriv -> acc,
+        VPub ->
+          push(acc, {
+            kind: "effect set",
+            name: string_of_bytes_lossy(d.name.name),
+            signature: set_signature(reading, d),
+            doc: lines_of(d.doc),
+          }),
+      },
+      _ -> acc,
+    })
+}
+
+/// The pages of the module `parsed`, whose text is `text`: its own, one for each definition its
+/// check published, in that order, and one for each type, effect, operation and effect set it
+/// declares, in the order its text does.
+pub fn documented(parsed: ParsedModule, text: Bytes, decided: Decided) -> Pages / {abort.raise} = {
+  let reading: Reading = {
+    parsed: parsed,
+    text: text,
+    defs: fold(decided.defs, map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
+      map_insert(acc, d.name, d)),
+    decided: decided,
+  };
+  let name = string_of_bytes_lossy(parsed.name);
+  let own = {
+    ..bare_page("module", name, name),
+    doc: lines_of(parsed.module.doc),
+    members: module_members(reading),
+  };
+  let defined = fold(decided.defs, [own], |acc: List<Page>, d: DefInfo|
+    push(acc, definition_page(reading, d)));
+  {
+    pages: fold(parsed.module.items, defined, |acc: List<Page>, it: Item|
+      fold(item_pages(reading, it), acc, |a: List<Page>, page: Page| push(a, page))),
+  }
+}
+
+// --- Tests ------------------------------------------------------------------
+
+test "written text reads on one line, without a comment or a closing comma" {
+  assert_eq(
+    one_line("read walk[r](\n    path: String,\n  ) -> Option<List<Entry>>"),
+    "read walk[r](path: String) -> Option<List<Entry>>",
+  );
+  assert_eq(
+    one_line("{\n  // the label\n  name: String,\n  size: Int,\n}"),
+    "{ name: String, size: Int }",
+  )
+}
+
+/// The pages of the module `m`, checked alone, with `law` naming `named`.
+fn pages_of(src: Bytes, named: Bytes, law: Bytes) -> List<Page> / {abort.raise} =
+  match parse_all([{ name: b"m", src: src }]) {
+    [p] -> match analyse([p]) {
+      Refused(_) -> panic("the fixture checks"),
+      Analysed(w) ->
+        documented(p.module, src, {
+          defs: w.checked.defs,
+          hashes: fold(
+            w.hashes.defs,
+            map_new(),
+            |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+              map_insert(acc, x.name, x.hash),
+          ),
+          laws: map_insert(map_new(), named, [law]),
+        }).pages,
+    },
+    _ -> panic("one module parses to one"),
+  }
+
+test "a module documents itself, each definition its check published and each name it declares" {
+  let src = b"//! Counting.\n\n/// One more.\npub fn more(x: Int) -> Int\n  ensures result > x\n= x + 1\n\n/// A shape.\npub type Shape = | Dot | Line(Int)\n\npub effect ledger {\n  /// Writes it down.\n  write record(n: Int) -> Unit\n}\n";
+  let pages = pages_of(src, b"more", b"more grows");
+  assert_eq(map(pages, |p: Page| p.kind ++ " " ++ p.name ++ " as " ++ p.simple), [
+    "module m as ",
+    "definition m.more as more",
+    "type m.Shape as Shape",
+    "effect m.ledger as ledger",
+    "operation m.ledger.record as ledger.record",
+  ]);
+  let page = |name: String|
+    match find(pages, |p: Page| p.name == name) {
+      Some(p) -> p,
+      None -> panic("`" ++ name ++ "` has a page"),
+    };
+  assert_eq(page("m").doc, ["Counting."]);
+  assert_eq(map(page("m").members, |m: Member| m.kind ++ " " ++ m.signature), [
+    "definition pub fn more(x: Int) -> Int",
+    "type pub type Shape",
+    "effect pub effect ledger",
+  ]);
+  let more = page("m.more");
+  assert_eq(more.signature, "pub fn more(x: Int) -> Int");
+  assert_eq(more.params, [{ name: "x", ty: "Int" }]);
+  assert_eq(more.doc, ["One more."]);
+  assert_eq(more.clauses, ["ensures result > x"]);
+  assert_eq(more.footprint, Some("{}"));
+  assert_eq(more.laws, ["more grows"]);
+  assert(more.hash != None);
+  assert_eq(bytes_slice(src, more.at, more.at + 7), b"fn more");
+  assert_eq(map(page("m.Shape").members, |m: Member| m.signature), ["Dot", "Line(Int)"]);
+  assert_eq(page("m.Shape").laws, []);
+  assert_eq(page("m.ledger").members, [
+    {
+      kind: "operation",
+      name: "record",
+      signature: "write record(n: Int) -> Unit",
+      doc: ["Writes it down."],
+    },
+  ]);
+  assert_eq(page("m.ledger.record").signature, "write record(n: Int) -> Unit")
+}
