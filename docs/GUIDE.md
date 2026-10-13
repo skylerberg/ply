@@ -56,9 +56,12 @@ path inside the package narrows the command and never moves the root:
 `ply test store` runs the tests of the modules under `store/`, and
 `ply run tools/gen.ply` enters that file's `main`. Where no directory up to the
 filesystem's root holds a `ply.pkg`, a directory a command names is a root as it
-stands and a file it names is a program of that one file; a command that names
-no path there loads nothing and says so (`E0502`), rather than take whatever is
-under the working directory for a program.
+stands, and a file it names is a program rooted at the file's own directory: the
+file and the modules it imports, each found by its name below that directory and
+followed to what it imports in turn, so `ply run gen.ply` reads `shared.ply` for
+`import shared` and no other file there. A command that names no path there
+loads nothing and says so (`E0502`), rather than take whatever is under the
+working directory for a program.
 
 Every `*.ply` file under the root is a module named by its relative path with
 `/` → `.` and `.ply` dropped: `store/orders/place.ply` is `store.orders.place`.
