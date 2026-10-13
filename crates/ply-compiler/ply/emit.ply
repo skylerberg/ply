@@ -395,9 +395,10 @@ pub type Carrier = | Whole(Kind) | Fields(List<FieldTy>)
 
 pub type WithValue = { emitter: Emitter, value: CValue }
 
-/// Where a `match` arm's answer goes: the answer local, or a fused `iterate` step's loop control.
+/// Where a `match` arm's answer goes: the answer local of its kind, or a fused `iterate` step's loop
+/// control.
 pub type Sink =
-  | ToValue(Bytes)
+  | ToValue({ name: Bytes, kind: Kind })
   | ToLoop({ state: Bytes, answer: Bytes, stop: Int, go: Int, depth: Int })
 
 /// Lines are joined once at the end; appending to one string would be quadratic.
@@ -2621,6 +2622,13 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
         }),
   }
 }
+
+fn is_option_type(t: Type) -> Bool =
+  match t { TyCon(c) -> c.name == b"Option" && len(c.args) == 1, _ -> false }
+
+/// Whether the checker typed the expression at `span` an `Option`.
+fn option_at(emitter: Emitter, span: Span) -> Bool =
+  match map_get(emitter.typed, span_key(span)) { Some(t) -> is_option_type(t.ty), None -> false }
 
 /// Whether `tag` is the prelude's `Option` constructor `name`, which the table names bare.
 fn is_option(emitter: Emitter, tag: Int, name: Bytes) -> Bool =
@@ -6993,14 +7001,15 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     NMatch(m) -> match match_subject(emitter, m.scrutinee, params) {
       None -> None,
       Some(s) -> {
+        let k = if option_at(s.emitter, c.span) { KMaybe } else { KBoxed };
         let ans = fresh(s.emitter);
-        let declared = line(ans.emitter, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
+        let declared = line(ans.emitter, bytes_concat_all([ctype(k), b" ", ans.name, b" = 0;"]));
         match match_arms(
             declared,
             s.subj,
             m.arms,
             params,
-            ToValue(ans.name),
+            ToValue({ name: ans.name, kind: k }),
             c.span,
             emitter.tail,
           ) {
@@ -7008,7 +7017,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           Some(after) ->
             Some({
               emitter: note_holder(after, ans.name),
-              value: { kind: KBoxed, expr: ans.name, ty: TyOpen([]) },
+              value: { kind: k, expr: ans.name, ty: TyOpen([]) },
             }),
         }
       },
@@ -8259,10 +8268,17 @@ fn arm_body(
   match sink {
     ToValue(ans) -> match expr(emitter, body, params) {
       None -> None,
-      Some(o) -> {
+      Some(o) -> if ans.kind == KMaybe {
+        let w = maybe_owned(o.emitter, o.value);
+        Some(line(w.emitter, bytes_concat_all([ans.name, b" = ", w.value.expr, b";"])))
+      } else {
         let w = word_of(o.emitter, o.value);
         Some(
-          assign_owned(line(w.emitter, bytes_concat_all([ans, b" = ", w.expr, b";"])), ans, w.expr),
+          assign_owned(
+            line(w.emitter, bytes_concat_all([ans.name, b" = ", w.expr, b";"])),
+            ans.name,
+            w.expr,
+          ),
         )
       },
     },
@@ -8802,9 +8818,10 @@ fn assigned(
   join: Bytes,
 ) -> { emitter: Emitter, text: Bytes, made: List<CountLocal> } = {
   // The join takes the arm's value; the arm's own holders are released behind it.
-  let m2 = if value.kind == KMaybe && k != KMaybe {
-    // An `Option` held as its payload's word joins other arms as the object it stands for.
-    let o = owned(with_made(indent(with_out(emitter, [])), arm_em.count_locals), value);
+  let m2 = if k == KMaybe || value.kind == KMaybe {
+    // An `Option` joins as its payload's word where it does as one, and as its object elsewhere.
+    let arm = with_made(indent(with_out(emitter, [])), arm_em.count_locals);
+    let o = if k == KMaybe { maybe_owned(arm, value) } else { owned(arm, value) };
     line(o.emitter, bytes_concat_all([join, b" = ", o.value.expr, b";"]))
   } else {
     let m0 = match k {
@@ -9007,7 +9024,9 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> =
   }
 
 /// Where two arms disagree the join is a word, and each is converted into it.
-fn join_kind(a: Kind, b: Kind) -> Kind = if a == b { a } else { KBoxed }
+/// Two arms of one type: an `Option` either holds as its payload's word joins as one.
+fn join_kind(a: Kind, b: Kind) -> Kind =
+  if a == b { a } else if a == KMaybe || b == KMaybe { KMaybe } else { KBoxed }
 
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
@@ -12541,8 +12560,7 @@ fn reference_args(emitter: Emitter, scheme: Option<Scheme>, at: Span) -> List<Ty
 /// fields; anything else as its word.
 fn carrier_of(t: Type) -> Carrier = {
   let k = kind_of(t);
-  let option = match t { TyCon(c) -> c.name == b"Option" && len(c.args) == 1, _ -> false };
-  if option { Whole(KMaybe) } else {
+  if is_option_type(t) { Whole(KMaybe) } else {
     match k.ty {
       TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
       _ -> match k.kind {
