@@ -1626,7 +1626,7 @@ pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64
         tables.layouts.shape_offsets(shape)[k],
         tables.layouts.shape_slots(shape)[k],
     );
-    let w = heap::field_word(&mut c.heap, o, at, slot);
+    let w = heap::field_word(&mut c.heap, &tables.layouts, o, at, slot);
     heap::dec(r);
     w
 }
@@ -3188,13 +3188,25 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     let_go(pairs);
                     return None;
                 };
-                let k = heap::field_word(&mut ctx.heap, obj(e), ka, layouts.slot_at(shape, ka));
+                let k = heap::field_word(
+                    &mut ctx.heap,
+                    layouts,
+                    obj(e),
+                    ka,
+                    layouts.slot_at(shape, ka),
+                );
                 if !heap::native_key(layouts, k) {
                     heap::dec(k);
                     let_go(pairs);
                     return None;
                 }
-                let v = heap::field_word(&mut ctx.heap, obj(e), va, layouts.slot_at(shape, va));
+                let v = heap::field_word(
+                    &mut ctx.heap,
+                    layouts,
+                    obj(e),
+                    va,
+                    layouts.slot_at(shape, va),
+                );
                 pairs.push((k, v));
             }
             // Entries in key order, each key once, are the tree's leaves as they stand.
@@ -4710,7 +4722,8 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
     };
     let slot = ctx.tables.layouts.slot_at(shape, at);
     if slot != heap::Slot::Word {
-        let w = heap::field_word(&mut ctx.heap, o, at, slot);
+        let tables = Arc::clone(&ctx.tables);
+        let w = heap::field_word(&mut ctx.heap, &tables.layouts, o, at, slot);
         if own == 1 || own == 3 {
             heap::dec(base);
         }
@@ -4825,8 +4838,8 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// `map_get` for a `match` that unwraps it at once: the value held once more, or `0` when absent,
-/// with no constructor built. Takes the map and the key.
+/// `map_get` as an `Option` held as its payload's word: the value held once more, or `0` when
+/// absent, with no constructor built. Takes the map and the key.
 pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(m) == KIND_MAP && heap::native_key(&ctx.tables.layouts, k) {
@@ -4856,6 +4869,33 @@ pub unsafe extern "C" fn rt_alloc(
 }
 
 /// The value inside an `Option` answer, held once more, or `0` for `None`; the answer is let go.
+/// An `Option` compiled code held as its payload's word, zero for `None`, as the object it stands
+/// for, which takes the payload's count.
+pub unsafe extern "C" fn rt_maybe_take(ctx: *mut Ctx, w: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let tables = Arc::clone(&ctx.tables);
+    match (w, tables.layouts.some, tables.layouts.none) {
+        (0, _, Some(none)) => ctx.nullary(none),
+        (_, Some(some), _) if w != 0 => ctx.heap.ctor(&tables.layouts, some, &[w]),
+        _ => ctx.fail(error(
+            "an `Option` held as its payload's word in a program with no `Option`",
+        )),
+    }
+}
+
+/// The `Option` object `w`, which it takes, as compiled code holds it: its payload's word with a
+/// count of its own, or zero for `None`. A box nothing else holds hands its payload over whole.
+pub unsafe extern "C" fn rt_maybe_open(ctx: *mut Ctx, w: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    unwrapped(ctx, w)
+}
+
+/// As `rt_maybe_take`, holding one more count of the payload, which the caller keeps its own of.
+pub unsafe extern "C" fn rt_maybe_box(ctx: *mut Ctx, w: i64) -> i64 {
+    heap::inc(w);
+    unsafe { rt_maybe_take(ctx, w) }
+}
+
 fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     if ctx.failed != 0 {
         return 0;
@@ -4873,7 +4913,7 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     v
 }
 
-/// `array_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
+/// `array_at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
 pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(xs) == KIND_ARRAY
@@ -4891,7 +4931,7 @@ pub unsafe extern "C" fn rt_array_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 
     unwrapped(ctx, answer)
 }
 
-/// `list_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
+/// `list_at` as an `Option` held as its payload's word, like [`rt_map_lookup`].
 pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(xs) == KIND_LIST

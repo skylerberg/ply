@@ -54,6 +54,13 @@ pub type Kind =
   | KFloat
   /// A `Decimal` in a `PlyDec`, the two words of its object, whose arithmetic is the runtime's.
   | KDec
+  /// An `Option` as its payload's word, `0` for `None`: no word of a value is zero. Counted as the
+  /// payload's word is, and made an `Option` object only where it leaves the code that knows it.
+  | KMaybe
+
+/// Whether a value of kind `k` is a word that holds a count: a value's word, or an `Option`'s
+/// payload word, zero holding none.
+fn counted(k: Kind) -> Bool = k == KBoxed || k == KMaybe
 
 pub type Width = { bits: Int, signed: Bool }
 
@@ -67,6 +74,7 @@ pub fn ctype(k: Kind) -> Bytes =
     } else { unsigned_ctype(w) },
     KFloat -> b"double",
     KDec -> b"PlyDec",
+    KMaybe -> b"PlyMaybe",
     _ -> b"int64_t",
   }
 
@@ -387,9 +395,10 @@ pub type Carrier = | Whole(Kind) | Fields(List<FieldTy>)
 
 pub type WithValue = { emitter: Emitter, value: CValue }
 
-/// Where a `match` arm's answer goes: the answer local, or a fused `iterate` step's loop control.
+/// Where a `match` arm's answer goes: the answer local of its kind, or a fused `iterate` step's loop
+/// control.
 pub type Sink =
-  | ToValue(Bytes)
+  | ToValue({ name: Bytes, kind: Kind })
   | ToLoop({ state: Bytes, answer: Bytes, stop: Int, go: Int, depth: Int })
 
 /// Lines are joined once at the end; appending to one string would be quadratic.
@@ -748,7 +757,7 @@ fn conv_of(emitter: Emitter, slot: Int) -> Option<CValue> =
 
 fn remember(em0: Emitter, slot: Int, value: CValue) -> Emitter = {
   let emitter = charge(em0, slot, value.expr);
-  let em1: Emitter = if value.kind == KBoxed { note_bound(emitter, value.expr) } else { emitter };
+  let em1: Emitter = if counted(value.kind) { note_bound(emitter, value.expr) } else { emitter };
   {
     ..em1,
     unboxed: push(em1.unboxed, { slot: slot, kind: value.kind, expr: value.expr, ty: value.ty }),
@@ -768,8 +777,8 @@ fn bind(emitter: Emitter, k: Kind, expr: Bytes) -> WithValue = {
       None -> o,
     };
     let kept = if is_local(expr) { note_alias(kept0, f.name, root_of(kept0, expr)) } else { kept0 };
-    let held = if k == KBoxed && answers_owned(kept, expr) { note_made(kept, f.name) }
-    else if k == KBoxed && kept.release && spendable(kept, expr) {
+    let held = if counted(k) && answers_owned(kept, expr) { note_made(kept, f.name) }
+    else if counted(k) && kept.release && spendable(kept, expr) {
       note_made(line(spend_made(kept, expr), bytes_concat_all([expr, b" = 0;"])), f.name)
     } else { kept };
     { emitter: held, value: { kind: k, expr: f.name, ty: TyOpen([]) } }
@@ -846,6 +855,15 @@ fn materialise(emitter: Emitter, name: Bytes) -> Emitter =
 fn word_of(emitter: Emitter, value: CValue) -> { emitter: Emitter, expr: Bytes } =
   match value.kind {
     KBoxed -> { emitter: materialise(emitter, value.expr), expr: value.expr },
+    // A box of its own, which this scope lets go; the value keeps its count.
+    KMaybe -> {
+      let b = bind(emitter, KBoxed, bytes_concat_all([b"rt_maybe_box_p(ctx, ", value.expr, b")"]));
+      {
+        emitter: if is_made(b.emitter, b.value.expr) { b.emitter }
+        else { note_made(b.emitter, b.value.expr) },
+        expr: b.value.expr,
+      }
+    },
     _ -> { emitter: emitter, expr: as_word(value) },
   }
 
@@ -1158,6 +1176,11 @@ fn raw_word(value: CValue) -> Bytes =
     _ -> bytes_concat_all([b"ply_f64_bits(", as_float(value), b")"]),
   }
 
+/// The word a record holds `value` in where it holds it as a word: an `Option` held as its
+/// payload's word as that word.
+fn held_word(value: CValue) -> Bytes =
+  if value.kind == KMaybe { value.expr } else { as_word(value) }
+
 /// The field of `kind` that `base` holds as its own words from word `at` on, read as the kind.
 fn raw_at(base: Bytes, at: Bytes, kind: Kind) -> Bytes = {
   let word = bytes_concat_all([b"ply_words(", base, b")[", at, b"]"]);
@@ -1236,6 +1259,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
     _ -> match f.kind {
       KFloat -> bytes_concat(f.name, b"!f"),
       KDec -> bytes_concat(f.name, b"!d"),
+      KMaybe -> bytes_concat(f.name, b"!m"),
       KNum(w) -> if raw_slot(f.kind) {
         bytes_concat(f.name, if w.signed { b"!i64" } else { b"!u64" })
       } else { f.name },
@@ -1247,7 +1271,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
 /// do, raw when it holds a `Float`'s bits or a record in place.
 fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
   let raw = if fold(fs, false, |acc: Bool, f: FieldTy|
-      acc || raw_slot(f.kind) || in_place(f) != None) { 4 }
+      acc || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) { 4 }
   else { 0 };
   if l.width > 0 && leaves_uncounted(fs) { 1 + raw } else if l.tail > 0 { 2 + raw } else { raw }
 }
@@ -2077,7 +2101,7 @@ fn close(emitter: Emitter) -> Emitter = line(outdent(release_at(emitter, emitter
 /// skips it. A held-back record moves held back: the fresh name takes its cells and the values it was
 /// built from, and is made only when its word is asked for.
 fn move_read(emitter: Emitter, own: Own, value: CValue) -> WithValue =
-  if !emitter.release || own != Owned || value.kind != KBoxed || !is_made(emitter, value.expr)
+  if !emitter.release || own != Owned || !counted(value.kind) || !is_made(emitter, value.expr)
       || is_pinned(emitter, value.expr) { { emitter: emitter, value: value } } else {
     match deferred_of(emitter, value.expr) {
       Some(d) -> {
@@ -2096,13 +2120,13 @@ fn move_read(emitter: Emitter, own: Own, value: CValue) -> WithValue =
         }
       },
       None -> {
-        let b = bind_keeping(emitter, KBoxed, value.ty, value.expr);
+        let b = bind_keeping(emitter, value.kind, value.ty, value.expr);
         {
           emitter: note_made(
             line(spend_made(b.emitter, value.expr), bytes_concat_all([value.expr, b" = 0;"])),
             b.value.expr,
           ),
-          value: { kind: KBoxed, expr: b.value.expr, ty: value.ty },
+          value: { kind: value.kind, expr: b.value.expr, ty: value.ty },
         }
       },
     }
@@ -2110,7 +2134,7 @@ fn move_read(emitter: Emitter, own: Own, value: CValue) -> WithValue =
 
 /// A local a slot will name must hold its own count: taken over from a temporary, or added.
 fn ensure_owned(emitter: Emitter, value: CValue) -> Emitter =
-  if !emitter.release || value.kind != KBoxed || is_made(emitter, value.expr) { emitter }
+  if !emitter.release || !counted(value.kind) || is_made(emitter, value.expr) { emitter }
   else { note_made(line(emitter, bytes_concat_all([b"ply_inc(", value.expr, b");"])), value.expr) }
 
 /// After `target = word;` the target holds a count: a temporary's moves, a shared name's is duplicated, an expression's is fresh.
@@ -2122,7 +2146,7 @@ fn assign_owned(emitter: Emitter, target: Bytes, c: Bytes) -> Emitter =
 
 /// A statement's unused value, released where it is.
 fn drop_value(emitter: Emitter, value: CValue) -> Emitter =
-  if emitter.release && value.kind == KBoxed && spendable(emitter, value.expr) {
+  if emitter.release && counted(value.kind) && spendable(emitter, value.expr) {
     line(
       spend_made(emitter, value.expr),
       bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]),
@@ -2183,8 +2207,38 @@ fn bind_word(emitter: Emitter, value: CValue) -> WithValue = {
   }
 }
 
-/// Duplicate a word before a callee takes it; scalars are immediates and hold no count.
-fn owned(emitter: Emitter, value: CValue) -> WithValue = {
+/// Duplicate a word before a callee takes it; scalars are immediates and hold no count. An `Option`
+/// held as its payload's word is made the object it stands for, which takes that payload's count.
+fn owned(emitter: Emitter, value: CValue) -> WithValue =
+  if value.kind == KMaybe {
+    let payload = owned_word(emitter, { ..value, kind: KBoxed });
+    let boxed = bind(
+      payload.emitter,
+      KBoxed,
+      bytes_concat_all([b"rt_maybe_take_p(ctx, ", payload.value.expr, b")"]),
+    );
+    owned_word(boxed.emitter, boxed.value)
+  } else { owned_word(emitter, value) }
+
+/// `value`, an `Option` as its object or as its payload's word, as its payload's word with a count
+/// this scope hands on.
+fn maybe_owned(emitter: Emitter, value: CValue) -> WithValue =
+  if value.kind == KMaybe {
+    let w = owned_word(emitter, { ..value, kind: KBoxed });
+    { emitter: w.emitter, value: { ..w.value, kind: KMaybe } }
+  } else {
+    // The object is taken, so one this scope holds alone hands its payload over without a copy.
+    let w = owned(emitter, value);
+    let opened = bind(
+      w.emitter,
+      KMaybe,
+      bytes_concat_all([b"rt_maybe_open_p(ctx, ", w.value.expr, b")"]),
+    );
+    let o = owned_word(opened.emitter, { ..opened.value, kind: KBoxed });
+    { emitter: o.emitter, value: { ..o.value, kind: KMaybe } }
+  }
+
+fn owned_word(emitter: Emitter, value: CValue) -> WithValue = {
   let spend = if emitter.release { spendable(emitter, value.expr) }
   else { is_made(emitter, value.expr) };
   let w = bind_word(if spend { spend_made(emitter, value.expr) } else { emitter }, value);
@@ -2266,6 +2320,7 @@ fn failing_return(k: Kind) -> Bytes = bytes_concat_all([b"return ", zero_of(k), 
 fn as_int(value: CValue) -> Bytes =
   match value.kind {
     KInt -> value.expr,
+    KMaybe -> b"ply_maybe_unrouted",
     KBool -> value.expr,
     KNum(_) -> bytes_concat_all([b"(int64_t)(", value.expr, b")"]),
     KFloat -> bytes_concat_all([b"rt_unbox_int_p(ctx, ", as_word(value), b")"]),
@@ -2299,7 +2354,7 @@ fn release_from(
   params: List<EmitParam>,
   at_tail: Bool,
 ) -> Option<Emitter> =
-  if value.kind != KBoxed { Some(emitter) } else if emitter.release {
+  if !counted(value.kind) { Some(emitter) } else if emitter.release {
     if base_owned(base) && spendable(emitter, value.expr) {
       Some(release_holder(spend_made(emitter, value.expr), value))
     } else { Some(emitter) }
@@ -2344,7 +2399,7 @@ fn release_from(
                 ),
               None -> match width_of(value.ty) {
                 None ->
-                  Some(line(emitter, bytes_concat_all([b"ply_dec(ctx, ", as_word(value), b");"]))),
+                  Some(line(emitter, bytes_concat_all([b"ply_dec(ctx, ", value.expr, b");"]))),
                 Some(n) -> {
                   let emitter = note_tok(emitter, n);
                   Some(
@@ -2356,15 +2411,15 @@ fn release_from(
                         b" == 0) { tok",
                         ascii_of_int(n),
                         b" = ply_reset_flat(",
-                        as_word(value),
+                        value.expr,
                         b"); if (!tok",
                         ascii_of_int(n),
                         b") tok",
                         ascii_of_int(n),
                         b" = rt_reset_p(ctx, ",
-                        as_word(value),
+                        value.expr,
                         b"); } else { ply_dec(ctx, ",
-                        as_word(value),
+                        value.expr,
                         b"); }",
                       ]),
                     ),
@@ -2394,10 +2449,10 @@ fn takes_field(emitter: Emitter, read: Code, base: Code, holder: Bytes) -> Bool 
 /// once where this body holds it alone, so a field the subject alone held is its binder's alone;
 /// its cells are the token the next record or constructor of its width takes.
 fn let_go(emitter: Emitter, subj: CValue, pattern: CodePattern) -> Emitter =
-  if emitter.release && subj.kind == KBoxed && spendable(emitter, subj.expr) {
+  if emitter.release && counted(subj.kind) && spendable(emitter, subj.expr) {
     let spent = spend_made(emitter, subj.expr);
     match pattern {
-      PxCtor(c) -> if len(c.args) == 0 { release_holder(spent, subj) } else {
+      PxCtor(c) -> if len(c.args) == 0 || subj.kind == KMaybe { release_holder(spent, subj) } else {
         match tag_of(emitter, c.name) {
           Some(tag) -> into_token(spent, subj.expr, ctor_width(emitter, tag, len(c.args))),
           None -> release_holder(spent, subj),
@@ -2473,7 +2528,7 @@ fn into_token(emitter: Emitter, name: Bytes, n: Int) -> Emitter =
 
 /// A forwarded field of a record about to be released is duplicated first, as `rt_field` does.
 fn secure_field(emitter: Emitter, base: Code, b: CValue, v: CValue) -> WithValue =
-  if !emitter.release || v.kind != KBoxed || !base_owned(base) || !spendable(emitter, b.expr) {
+  if !emitter.release || !counted(v.kind) || !base_owned(base) || !spendable(emitter, b.expr) {
     { emitter: emitter, value: v }
   } else {
     let t = bind_word_of(emitter, v.expr);
@@ -2572,6 +2627,53 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
           } else { None },
         }),
   }
+}
+
+fn is_option_type(t: Type) -> Bool =
+  match t { TyCon(c) -> c.name == b"Option" && len(c.args) == 1, _ -> false }
+
+/// Whether `tag` is the prelude's `Option` constructor `name`, which the table names bare.
+fn is_option(emitter: Emitter, tag: Int, name: Bytes) -> Bool =
+  list_at(emitter.ctors.names, tag) == Some(name)
+
+/// `payload`, a word this scope now holds, as an `Option` held as that word.
+fn held_maybe(emitter: Emitter, payload: Bytes, ty: Ty) -> WithValue = {
+  let b = bind(emitter, KMaybe, payload);
+  {
+    emitter: if is_made(b.emitter, b.value.expr) { b.emitter }
+    else { note_made(b.emitter, b.value.expr) },
+    value: { ..b.value, ty: ty },
+  }
+}
+
+/// The runtime's helper for a builtin answering an element or `None`, which hands the element back
+/// with a count or zero: an `Option` held as its payload's word, no object made.
+fn lookup_helper(name: Bytes, n: Int) -> Option<Bytes> =
+  if n != 2 { None }
+  else if name == b"list_at" { Some(b"rt_list_lookup_p") }
+  else if name == b"array_at" { Some(b"rt_array_lookup_p") }
+  else if name == b"map_get" { Some(b"rt_map_lookup_p") }
+  else { None }
+
+/// `helper` called over `names`, which it takes; a failed call answers zero too, so failure is read
+/// before zero is taken for `None`.
+fn looked_up(emitter: Emitter, helper: Bytes, names: List<Bytes>) -> WithValue = {
+  let called = fresh(emitter);
+  let read = check(
+    line(
+      called.emitter,
+      bytes_concat_all([
+        b"int64_t ",
+        called.name,
+        b" = ",
+        helper,
+        b"(ctx",
+        fold(names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
+        b");",
+      ]),
+    ),
+  );
+  held_maybe(read, called.name, TyOpen([]))
 }
 
 /// A constructor's tag as the C writes it: by its name in the program's table, which a unit resolves
@@ -3140,13 +3242,13 @@ fn inlined_frame(
     vals,
     { emitter: opened, vals: [] },
     |acc: { emitter: Emitter, vals: List<CValue> }, v: CValue|
-      match v.kind {
-        KBoxed -> {
-          let o = owned(acc.emitter, v);
-          { emitter: note_holder(o.emitter, o.value.expr), vals: push(acc.vals, o.value) }
-        },
-        _ -> { emitter: acc.emitter, vals: push(acc.vals, v) },
-      },
+      if counted(v.kind) {
+        let o = owned_word(acc.emitter, { ..v, kind: KBoxed });
+        {
+          emitter: note_holder(o.emitter, o.value.expr),
+          vals: push(acc.vals, { ..o.value, kind: v.kind }),
+        }
+      } else { { emitter: acc.emitter, vals: push(acc.vals, v) } },
   );
   let caps = fold(
     range(0, len(lambda.captures)),
@@ -3195,10 +3297,10 @@ fn inlined_frame(
 /// What a lambda run in place answered, made the caller's of `emitter` before what the frame
 /// opened at depth `from` held is released.
 fn inlined_answer(emitter: Emitter, from: Int, r: WithValue) -> WithValue = {
-  let answered = match r.value.kind {
-    KBoxed -> owned(r.emitter, r.value),
-    k -> bind(r.emitter, k, r.value.expr),
-  };
+  let answered = if counted(r.value.kind) {
+    let w = owned_word(r.emitter, { ..r.value, kind: KBoxed });
+    { emitter: w.emitter, value: { ..w.value, kind: r.value.kind } }
+  } else { bind(r.emitter, r.value.kind, r.value.expr) };
   let restored = {
     ..answered.emitter,
     module: emitter.module,
@@ -3214,7 +3316,7 @@ fn inlined_answer(emitter: Emitter, from: Int, r: WithValue) -> WithValue = {
     release_at(with_reads(rescope(restored, emitter.unboxed), emitter.reads), from),
   );
   {
-    emitter: if answered.value.kind == KBoxed { note_holder(released, answered.value.expr) }
+    emitter: if counted(answered.value.kind) { note_holder(released, answered.value.expr) }
     else { released },
     value: { ..answered.value, ty: TyOpen([]) },
   }
@@ -3311,18 +3413,16 @@ fn capture_window(
       Some(w) -> match conv_of(emitter, capture.src) {
         Some(v) -> Some(push(w, { slot: capture.dst, kind: v.kind, expr: v.expr, ty: v.ty })),
         None -> match list_at(params, capture.src) {
-          Some(p) -> match p.kind {
-            KBoxed ->
-              Some(
-                push(w, {
-                  slot: capture.dst,
-                  kind: KBoxed,
-                  expr: bytes_concat(b"p", ascii_of_int(capture.src)),
-                  ty: p.ty,
-                }),
-              ),
-            _ -> None,
-          },
+          Some(p) -> if counted(p.kind) {
+            Some(
+              push(w, {
+                slot: capture.dst,
+                kind: p.kind,
+                expr: bytes_concat(b"p", ascii_of_int(capture.src)),
+                ty: p.ty,
+              }),
+            )
+          } else { None },
           None -> None,
         },
       },
@@ -3427,13 +3527,12 @@ fn emit_step(
           emit_step(rescope(after, after.unboxed), t, state, answer, stop, go, params, depth),
       },
     },
-    NMatch(m) -> match match_subject(emitter, m.scrutinee, m.arms, params) {
+    NMatch(m) -> match match_subject(emitter, m.scrutinee, params) {
       None -> None,
       Some(s) ->
         match_arms(
           s.emitter,
           s.subj,
-          s.lookup,
           m.arms,
           params,
           ToLoop({ state: state, answer: answer, stop: stop, go: go, depth: depth }),
@@ -3634,7 +3733,8 @@ fn inlined_fold(
             match expr(notail(n.emitter), init, params) {
               None -> None,
               Some(iv) -> {
-                let k = iv.value.kind;
+                // An `Option` held as its payload's word is carried round the loop as its object.
+                let k = if iv.value.kind == KMaybe { KBoxed } else { iv.value.kind };
                 // The accumulator holds its count between steps; a step's holder takes it over.
                 let seeded = match k {
                   KBoxed -> if iv.emitter.release { owned(iv.emitter, iv.value) }
@@ -4661,7 +4761,11 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
       );
       {
         emitter: note_holder(loaded, r.name),
-        value: { kind: KBoxed, expr: r.name, ty: element.ty },
+        value: {
+          kind: if element.kind == KMaybe { KMaybe } else { KBoxed },
+          expr: r.name,
+          ty: element.ty,
+        },
       }
     },
   }
@@ -4879,11 +4983,9 @@ fn caps_owned(
         let found = match conv_of(emitter, c.src) {
           Some(v) -> Some(v),
           None -> match list_at(params, c.src) {
-            Some(p) -> match p.kind {
-              KBoxed ->
-                Some({ kind: KBoxed, expr: bytes_concat(b"p", ascii_of_int(c.src)), ty: p.ty }),
-              _ -> None,
-            },
+            Some(p) -> if counted(p.kind) {
+              Some({ kind: p.kind, expr: bytes_concat(b"p", ascii_of_int(c.src)), ty: p.ty })
+            } else { None },
             None -> None,
           },
         };
@@ -5109,6 +5211,10 @@ fn carried_arg(
       let w = owned(emitter, value);
       { emitter: w.emitter, names: [w.value.expr] }
     },
+    Whole(KMaybe) -> {
+      let w = maybe_owned(emitter, value);
+      { emitter: w.emitter, names: [w.value.expr] }
+    },
     Whole(k) -> {
       let w = bind(emitter, k, as_kind(value, k));
       { emitter: w.emitter, names: [w.value.expr] }
@@ -5213,7 +5319,7 @@ fn held_record(emitter: Emitter, fs: List<FieldTy>, vals: List<CValue>) -> WithV
   build_record(
     emitter,
     map(fs, |f: FieldTy| f.name),
-    map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { as_word(v) }),
+    map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) }),
     fs,
     Some(vals),
   )
@@ -5583,6 +5689,7 @@ fn names_of(fs: List<FieldTy>) -> List<Bytes> = map(fs, |field: FieldTy| field.n
 fn as_bool(value: CValue) -> Bytes =
   match value.kind {
     KBool -> value.expr,
+    KMaybe -> b"ply_maybe_unrouted",
     KNum(_) -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KInt -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", value.expr, b")"]),
@@ -5610,6 +5717,8 @@ fn as_float(value: CValue) -> Bytes =
 fn as_word(value: CValue) -> Bytes =
   match value.kind {
     KBoxed -> value.expr,
+    // Made an object only by `owned` or `word_of`, which know whose its count is.
+    KMaybe -> b"ply_maybe_unrouted",
     // The C type the value is held in decides sign or zero extension.
     KNum(w) -> if in_imm(w) { bytes_concat_all([b"ply_imm((int64_t)", value.expr, b")"]) } else {
       bytes_concat_all([
@@ -5802,8 +5911,9 @@ fn in_place_update(
         Some(v) -> {
           let nm = match list_at(sets, i) { Some(f) -> f.name, None -> b"" };
           let raw = fold(fs, None, |r: Option<Kind>, f: FieldTy|
-            if f.name == nm && raw_slot(f.kind) { Some(f.kind) } else { r });
+            if f.name == nm && (raw_slot(f.kind) || f.kind == KMaybe) { Some(f.kind) } else { r });
           let w = match raw {
+            Some(KMaybe) -> maybe_owned(acc.emitter, v),
             Some(k) -> held_raw(acc.emitter, v, k),
             None -> owned(acc.emitter, v),
           };
@@ -5852,7 +5962,7 @@ fn in_place_update(
               b")[",
               at,
               b"] = ",
-              as_word(v),
+              held_word(v),
               b";",
             ]),
           )
@@ -5923,11 +6033,16 @@ fn read_field(
         match field_at(b.value.ty, f.field) {
           // A known shape reads at the field's offset; a scalar field goes into a register of its kind.
           Some(i) -> {
-            let w = bind_keeping(held.emitter, KBoxed, i.ty, field_read(held.value.expr, i));
+            let w = bind_keeping(
+              held.emitter,
+              if i.kind == KMaybe { KMaybe } else { KBoxed },
+              i.ty,
+              field_read(held.value.expr, i),
+            );
             match i.kind {
               // Without release a word-kinded field never releases its base: there is no in-place field take.
               // Under release a base at its last use is let go here, the field duplicated first, as `rt_field` does.
-              KBoxed -> if w.emitter.release && base_owned(f.base)
+              k if counted(k) -> if w.emitter.release && base_owned(f.base)
                   && spendable(w.emitter, hv.expr) {
                 let once = if width_of(i.ty) != None && moves {
                   took(w.emitter, held.value.expr, i.at, w.value.expr)
@@ -5951,7 +6066,8 @@ fn read_field(
                       held.value.expr,
                       b")[",
                       ascii_of_int(i.at),
-                      b"] = ply_unit; } else { ply_inc(",
+                      if i.kind == KMaybe { b"] = 0; } else { ply_inc(" }
+                      else { b"] = ply_unit; } else { ply_inc(" },
                       w.value.expr,
                       b"); }",
                     ]),
@@ -6070,7 +6186,7 @@ fn columns_load(
       b" = ",
       column_read(column, idx.value.expr, at.f),
       b";",
-      if kind == KBoxed { bytes_concat_all([b" ply_inc(", out.name, b");"]) } else { b"" },
+      if counted(kind) { bytes_concat_all([b" ply_inc(", out.name, b");"]) } else { b"" },
     ]),
   );
   let call = bytes_concat_all([
@@ -6085,6 +6201,9 @@ fn columns_load(
   let otherwise = indent(line(outdent(fast), b"} else {"));
   let slow = if kind == KBoxed {
     check(line(otherwise, bytes_concat_all([out.name, b" = ", call, b";"])))
+  } else if kind == KMaybe {
+    // The runtime answers the `Option`'s object, which opening takes.
+    check(line(otherwise, bytes_concat_all([out.name, b" = rt_maybe_open_p(ctx, ", call, b");"])))
   } else {
     let w = fresh(otherwise);
     line(
@@ -6104,7 +6223,7 @@ fn columns_load(
     bytes_concat_all([b"ply_dec(ctx, ", xs, b"); ply_dec(ctx, ", given, b");"]),
   );
   {
-    emitter: if kind == KBoxed { note_made(closed, out.name) } else { closed },
+    emitter: if counted(kind) { note_made(closed, out.name) } else { closed },
     value: { kind: kind, expr: out.name, ty: at.f.ty },
   }
 }
@@ -6116,7 +6235,8 @@ fn column_read(column: Bytes, i: Bytes, f: FieldTy) -> Bytes = {
   let at = bytes_concat_all([b"(", i, b") * ply_obj(", column, b")->aux"]);
   match f.ty {
     TyRec(_) -> bytes_concat_all([b"((Word)(intptr_t)(ply_words(", column, b") + ", at, b"))"]),
-    _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) } else {
+    _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) }
+    else if f.kind == KMaybe { bytes_concat_all([b"ply_words(", column, b")[", i, b"]"]) } else {
       as_kind(
         {
           kind: KBoxed,
@@ -6202,7 +6322,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       None -> if is_ctor_name(v.name) {
         match tag_of(emitter, v.name) {
           None -> Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", v.name))),
-          Some(tag) -> {
+          Some(tag) -> if is_option(emitter, tag, b"None") { Some(bind(emitter, KMaybe, b"0")) }
+          else {
             let o = bind(
               emitter,
               KBoxed,
@@ -6265,6 +6386,14 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               Some(
                 move_read(emitter, c.own, {
                   kind: KBoxed,
+                  expr: bytes_concat(b"p", ascii_of_int(s)),
+                  ty: p.ty,
+                }),
+              ),
+            KMaybe ->
+              Some(
+                move_read(emitter, c.own, {
+                  kind: KMaybe,
                   expr: bytes_concat(b"p", ascii_of_int(s)),
                   ty: p.ty,
                 }),
@@ -6483,7 +6612,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
                     match built_field(acc.emitter, held.value.expr, nm) {
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
-                        let o = owned(acc.emitter, v);
+                        let o = if tk == KMaybe { maybe_owned(acc.emitter, v) }
+                        else { owned(acc.emitter, v) };
                         {
                           emitter: o.emitter,
                           ws: push(acc.ws, o.value.expr),
@@ -6519,7 +6649,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                             );
                             // A scalar copy is read into a register of its kind, then unused: the store takes the word.
                             match f.kind {
-                              KBoxed ->
+                              k if counted(k) ->
                                 {
                                   emitter: inc,
                                   ws: push(acc.ws, w.value.expr),
@@ -6555,7 +6685,17 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                           );
                           // The runtime answers the copy duplicated, and the record takes it, or keeps
                           // it until the block closes where the record holds the `Float` it is as bits.
-                          if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) } else {
+                          if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) }
+                          else if tk == KMaybe {
+                            let o = maybe_owned(check(w.emitter), w.value);
+                            {
+                              emitter: o.emitter,
+                              ws: push(acc.ws, o.value.expr),
+                              kinds: push(acc.kinds, tk),
+                              vals: acc.vals,
+                              known: false,
+                            }
+                          } else {
                             {
                               emitter: spend_made(check(w.emitter), w.value.expr),
                               ws: push(acc.ws, w.value.expr),
@@ -6580,6 +6720,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
                         // The written field's word is duplicated: the record being built takes it.
                         let w = if owned_already { { emitter: acc.emitter, value: v } }
+                        else if tk == KMaybe { maybe_owned(acc.emitter, v) }
                         else { owned(acc.emitter, v) };
                         {
                           emitter: w.emitter,
@@ -6677,30 +6818,47 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           match tag_of(emitter, fv.name) {
             None ->
               Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", fv.name))),
-            Some(tag) -> match ctor_fields(emitter, tag) {
-              Some(fs) -> match items_laid(emitter, a.args, params, kinds_of(fs)) {
+            Some(tag) -> if is_option(emitter, tag, b"Some") && len(a.args) == 1 {
+              match items(emitter, a.args, params, 0, []) {
                 None -> None,
-                Some(w) -> Some(ctor_laid(w.emitter, tag, fs, w.names)),
-              },
-              None -> match items(emitter, a.args, params, 0, []) {
-                None -> None,
-                Some(w) -> if len(w.names) > 0 { Some(ctor_built(w.emitter, tag, w.names)) } else {
-                  let arr = fresh(w.emitter);
-                  let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
-                  let o = bind(
-                    e,
-                    KBoxed,
-                    bytes_concat_all([
-                      b"rt_ctor_p(ctx, ",
-                      tag_text(emitter, tag),
-                      b", (Word)(intptr_t)",
-                      arr.name,
-                      b", 0)",
-                    ]),
-                  );
-                  Some({ emitter: check(o.emitter), value: o.value })
+                Some(w) -> match list_at(w.names, 0) {
+                  None -> None,
+                  Some(payload) ->
+                    Some(
+                      held_maybe(w.emitter, payload, match list_at(w.vals, 0) {
+                        Some(v) -> v.ty,
+                        None -> TyOpen([]),
+                      }),
+                    ),
                 },
-              },
+              }
+            } else {
+              match ctor_fields(emitter, tag) {
+                Some(fs) -> match items_laid(emitter, a.args, params, kinds_of(fs)) {
+                  None -> None,
+                  Some(w) -> Some(ctor_laid(w.emitter, tag, fs, w.names)),
+                },
+                None -> match items(emitter, a.args, params, 0, []) {
+                  None -> None,
+                  Some(w) -> if len(w.names) > 0 { Some(ctor_built(w.emitter, tag, w.names)) }
+                  else {
+                    let arr = fresh(w.emitter);
+                    let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
+                    let o = bind(
+                      e,
+                      KBoxed,
+                      bytes_concat_all([
+                        b"rt_ctor_p(ctx, ",
+                        tag_text(emitter, tag),
+                        b", (Word)(intptr_t)",
+                        arr.name,
+                        b", 0)",
+                      ]),
+                    );
+                    Some({ emitter: check(o.emitter), value: o.value })
+                  },
+                },
+              }
             },
           }
         } else {
@@ -6726,7 +6884,13 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 None -> from_import(emitter.imports, fv.name),
               } {
               // Callback and inline builtins outside their fused shapes are refused: a plain call for them is a wrong answer, not a slow one.
-              None -> match fused_fold(emitter, fv.name, a.args, params, c.span) {
+              None -> match match lookup_helper(fv.name, len(a.args)) {
+                  Some(h) -> match args_owned_at(notail(emitter), a.args, params, c.span) {
+                    None -> None,
+                    Some(w) -> Some(looked_up(w.emitter, h, w.names)),
+                  },
+                  None -> fused_fold(emitter, fv.name, a.args, params, c.span),
+                } {
                 Some(o) -> Some(o),
                 None -> match iterate_call(emitter, fv.name, a.args, params, c.span) {
                   Some(o) -> Some(o),
@@ -6861,18 +7025,18 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
         },
       },
     },
-    NMatch(m) -> match match_subject(emitter, m.scrutinee, m.arms, params) {
+    NMatch(m) -> match match_subject(emitter, m.scrutinee, params) {
       None -> None,
       Some(s) -> {
+        let k = if answers_maybe(emitter) { KMaybe } else { KBoxed };
         let ans = fresh(s.emitter);
-        let declared = line(ans.emitter, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
+        let declared = line(ans.emitter, bytes_concat_all([ctype(k), b" ", ans.name, b" = 0;"]));
         match match_arms(
             declared,
             s.subj,
-            s.lookup,
             m.arms,
             params,
-            ToValue(ans.name),
+            ToValue({ name: ans.name, kind: k }),
             c.span,
             emitter.tail,
           ) {
@@ -6880,7 +7044,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           Some(after) ->
             Some({
               emitter: note_holder(after, ans.name),
-              value: { kind: KBoxed, expr: ans.name, ty: TyOpen([]) },
+              value: { kind: k, expr: ans.name, ty: TyOpen([]) },
             }),
         }
       },
@@ -7000,7 +7164,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                     )
                   },
                   None -> {
-                    let kt = join_kind(t.value.kind, e.value.kind);
+                    let kt = join_kind(emitter, t.value.kind, e.value.kind);
                     let decl = line(
                       {
                         out: [],
@@ -7122,7 +7286,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       written: fin.written,
                     };
                     Some({
-                      emitter: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
+                      emitter: if counted(kt) { note_holder(fin_em, j.name) } else { fin_em },
                       value: {
                         kind: kt,
                         expr: j.name,
@@ -7766,7 +7930,9 @@ fn items_from(
           let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
           let d = if raw { held_raw(o.emitter, o.value, kind_at(kinds, i)) }
           else { { emitter: o.emitter, value: o.value } };
-          let w = if !raw { owned(o.emitter, o.value) }
+          let maybe = kind_at(kinds, i) == KMaybe && len(kinds) > i;
+          let w = if maybe { maybe_owned(o.emitter, o.value) }
+          else if !raw { owned(o.emitter, o.value) }
           else if kind_at(kinds, i) == KDec { d }
           else { bind(d.emitter, KInt, raw_word(d.value)) };
           items_from(
@@ -7775,7 +7941,8 @@ fn items_from(
             params,
             i + 1,
             push(acc, w.value.expr),
-            push(values, if raw { d.value } else { taken_as(w.emitter, o.value, w.value) }),
+            push(values, if raw || maybe { if raw { d.value } else { w.value } }
+            else { taken_as(w.emitter, o.value, w.value) }),
             kinds,
           )
         },
@@ -7785,17 +7952,17 @@ fn items_from(
 
 /// Under release the temporary a field came from is null once the record takes it, so the held word is remembered instead.
 fn taken_as(emitter: Emitter, v: CValue, w: CValue) -> CValue =
-  if emitter.release && v.kind == KBoxed { { kind: KBoxed, expr: w.expr, ty: v.ty } } else { v }
+  if emitter.release && counted(v.kind) { { kind: w.kind, expr: w.expr, ty: v.ty } } else { v }
 
 /// Under release a value read now and taken later is duplicated now: a read in between may be its last use and move it.
 fn secure(emitter: Emitter, value: CValue) -> WithValue =
-  if !emitter.release || value.kind != KBoxed || spendable(emitter, value.expr) {
+  if !emitter.release || !counted(value.kind) || spendable(emitter, value.expr) {
     { emitter: emitter, value: value }
   } else {
-    let w = owned(emitter, value);
+    let w = owned_word(emitter, { ..value, kind: KBoxed });
     {
       emitter: note_made(w.emitter, w.value.expr),
-      value: { kind: KBoxed, expr: w.value.expr, ty: value.ty },
+      value: { kind: value.kind, expr: w.value.expr, ty: value.ty },
     }
   }
 
@@ -7809,7 +7976,7 @@ fn secure_across(
   later: Code,
   params: List<EmitParam>,
 ) -> WithValue =
-  if !emitter.release || value.kind != KBoxed || spendable(emitter, value.expr) {
+  if !emitter.release || !counted(value.kind) || spendable(emitter, value.expr) {
     { emitter: emitter, value: value }
   } else {
     let r = root_of(emitter, value.expr);
@@ -7866,7 +8033,7 @@ fn last_read(code: Code) -> Option<{ slot: Int, field: Option<Bytes> }> =
 /// The count a slot's local holds let go, where this body holds it and no loop reads it again.
 fn released_slot(emitter: Emitter, s: Int, params: List<EmitParam>) -> Emitter =
   match slot_value(emitter, params, s) {
-    Some(v) -> if emitter.release && v.kind == KBoxed && is_made(emitter, v.expr)
+    Some(v) -> if emitter.release && counted(v.kind) && is_made(emitter, v.expr)
         && !is_pinned(emitter, v.expr) { release_holder(spend_made(emitter, v.expr), v) }
     else { emitter },
     None -> emitter,
@@ -7878,7 +8045,7 @@ fn released_slot(emitter: Emitter, s: Int, params: List<EmitParam>) -> Emitter =
 fn released_field(emitter: Emitter, s: Int, name: Bytes, params: List<EmitParam>) -> Emitter =
   match slot_value(emitter, params, s) {
     None -> emitter,
-    Some(v) -> if !emitter.release || v.kind != KBoxed || !is_made(emitter, v.expr)
+    Some(v) -> if !emitter.release || !counted(v.kind) || !is_made(emitter, v.expr)
         || is_pinned(emitter, v.expr)
         || deferred_of(emitter, v.expr) != None
         || built_of(emitter, v.expr) != None { emitter } else {
@@ -8033,7 +8200,6 @@ fn arms(
   flag: Bytes,
   base: List<CountLocal>,
   seen: List<CountLocal>,
-  lookup: Bool,
 ) -> Option<Emitter> / {abort.raise} =
   if i >= len(xs) { Some(with_made(emitter, if i == 0 { emitter.count_locals } else { seen })) }
   else {
@@ -8043,8 +8209,7 @@ fn arms(
         let guarded = indent(
           line(with_made(emitter, base), bytes_concat_all([b"if (!", flag, b") {"])),
         );
-        match if lookup { Some({ emitter: guarded, expr: lookup_test(a.pat, subj.expr) }) }
-          else { pat_test(a.pat, subj, guarded) } {
+        match pat_test(a.pat, subj, guarded) {
           None -> Some(poison(emitter, b"a pattern this port cannot test")),
           Some(t) -> {
             let opened = line(t.emitter, bytes_concat_all([b"if (", t.expr, b") {"]));
@@ -8054,8 +8219,7 @@ fn arms(
               None -> inner,
               Some(_) -> with_pinned(inner, push(inner.pinned, subj.expr)),
             };
-            let bound = if lookup { lookup_bind(binding, a.pat, subj) }
-            else { let_go(pat_bind(binding, a.pat, subj), subj, a.pat) };
+            let bound = let_go(pat_bind(binding, a.pat, subj), subj, a.pat);
             match guarded_body(
                 bound,
                 inner.pinned,
@@ -8080,7 +8244,6 @@ fn arms(
                   flag,
                   base,
                   union_made(seen, closed.count_locals),
-                  lookup,
                 )
               },
             }
@@ -8135,51 +8298,38 @@ fn arm_body(
   match sink {
     ToValue(ans) -> match expr(emitter, body, params) {
       None -> None,
-      Some(o) -> {
+      Some(o) -> if ans.kind == KMaybe {
+        let w = maybe_owned(o.emitter, o.value);
+        Some(line(w.emitter, bytes_concat_all([ans.name, b" = ", w.value.expr, b";"])))
+      } else {
         let w = word_of(o.emitter, o.value);
         Some(
-          assign_owned(line(w.emitter, bytes_concat_all([ans, b" = ", w.expr, b";"])), ans, w.expr),
+          assign_owned(
+            line(w.emitter, bytes_concat_all([ans.name, b" = ", w.expr, b";"])),
+            ans.name,
+            w.expr,
+          ),
         )
       },
     },
     ToLoop(l) -> emit_step(emitter, body, l.state, l.answer, l.stop, l.go, params, l.depth),
   }
 
-/// Under `lookup_of` the subject is the element or zero; check failure before reading zero as `None`, as a failed call answers zero too.
+/// A match's subject: an `Option` held as its payload's word as it is, anything else as its word.
 fn match_subject(
   emitter: Emitter,
   scrutinee: Code,
-  xs: List<CodeArm>,
   params: List<EmitParam>,
-) -> Option<{ emitter: Emitter, subj: CValue, lookup: Bool }> / {abort.raise} =
-  match lookup_of(emitter, scrutinee, xs) {
-    // Only a call is a lookup.
-    Some(helper) -> match scrutinee.node {
-      NApp(a) -> match args_owned_at(notail(emitter), a.args, params, scrutinee.span) {
-        None -> None,
-        Some(w) -> {
-          let held = bind(
-            w.emitter,
-            KBoxed,
-            bytes_concat_all([
-              helper,
-              b"(ctx",
-              fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
-              b")",
-            ]),
-          );
-          Some({ emitter: check(held.emitter), subj: held.value, lookup: true })
-        },
-      },
-      _ -> None,
-    },
-    None -> match expr(notail(emitter), scrutinee, params) {
-      None -> None,
-      Some(sc) -> {
-        let sw = word_of(sc.emitter, sc.value);
-        let subj = bind_keeping(sw.emitter, KBoxed, sc.value.ty, sw.expr);
-        Some({ emitter: subj.emitter, subj: subj.value, lookup: false })
-      },
+) -> Option<{ emitter: Emitter, subj: CValue }> / {abort.raise} =
+  match expr(notail(emitter), scrutinee, params) {
+    None -> None,
+    Some(sc) -> if sc.value.kind == KMaybe {
+      let subj = bind_keeping(sc.emitter, KMaybe, sc.value.ty, sc.value.expr);
+      Some({ emitter: subj.emitter, subj: subj.value })
+    } else {
+      let sw = word_of(sc.emitter, sc.value);
+      let subj = bind_keeping(sw.emitter, KBoxed, sc.value.ty, sw.expr);
+      Some({ emitter: subj.emitter, subj: subj.value })
     },
   }
 
@@ -8187,7 +8337,6 @@ fn match_subject(
 fn match_arms(
   emitter: Emitter,
   subj: CValue,
-  lookup: Bool,
   xs: List<CodeArm>,
   params: List<EmitParam>,
   sink: Sink,
@@ -8196,18 +8345,8 @@ fn match_arms(
 ) -> Option<Emitter> / {abort.raise} = {
   let flag = fresh(emitter);
   let opened = line(flag.emitter, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
-  match arms(
-      withtail(opened, tail),
-      xs,
-      params,
-      0,
-      subj,
-      sink,
-      flag.name,
-      opened.count_locals,
-      [],
-      lookup,
-    ) {
+  match arms(withtail(opened, tail), xs, params, 0, subj, sink, flag.name, opened.count_locals, [
+    ]) {
     None -> None,
     Some(after) ->
       Some(
@@ -8224,75 +8363,6 @@ fn match_arms(
       ),
   }
 }
-
-/// `match list_at(..)` or `map_get(..)` with unguarded `Some(x)`/`None` arms: the helper answering the element or zero, which takes the call's arguments.
-fn lookup_of(emitter: Emitter, scrutinee: Code, xs: List<CodeArm>) -> Option<Bytes> =
-  match scrutinee.node {
-    NApp(a) -> match a.func.node {
-      NVar(fv) -> if fv.slot != None || len(a.args) != 2 || len(xs) != 2
-          || fold(emitter.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) { None } else {
-        match if fv.name == b"list_at" { Some(b"rt_list_lookup_p") }
-          else if fv.name == b"array_at" { Some(b"rt_array_lookup_p") }
-          else if fv.name == b"map_get" { Some(b"rt_map_lookup_p") }
-          else { None } {
-          None -> None,
-          Some(h) -> match list_at(xs, 0) {
-            None -> None,
-            Some(x) -> match list_at(xs, 1) {
-              None -> None,
-              Some(y) -> if x.guard != None || y.guard != None { None } else {
-                match unwraps(emitter, x.pat) {
-                  None -> None,
-                  Some(ux) -> match unwraps(emitter, y.pat) {
-                    None -> None,
-                    Some(uy) -> if ux != uy { Some(h) } else { None },
-                  },
-                }
-              },
-            },
-          },
-        }
-      },
-      _ -> None,
-    },
-    _ -> None,
-  }
-
-/// `true` for `Some(x)` or `Some(_)`, `false` for `None`, and nothing for any other pattern.
-fn unwraps(emitter: Emitter, pattern: CodePattern) -> Option<Bool> =
-  match pattern {
-    PxCtor(c) -> if tag_of(emitter, c.name) == None { None }
-    else if c.name == b"Some" && len(c.args) == 1 {
-      match list_at(c.args, 0) {
-        Some(sub) -> match sub {
-          PxWild -> Some(true),
-          PxVar(v) -> if v.slot != None { Some(true) } else { None },
-          _ -> None,
-        },
-        None -> None,
-      }
-    } else if c.name == b"None" && len(c.args) == 0 { Some(false) }
-    else { None },
-    _ -> None,
-  }
-
-/// A lookup's arm tests the answer itself: an element for `Some`, zero for `None`.
-fn lookup_test(pattern: CodePattern, held: Bytes) -> Bytes =
-  match pattern {
-    PxCtor(c) -> if len(c.args) == 1 { bytes_concat_all([b"(", held, b" != 0)"]) }
-    else { bytes_concat_all([b"(", held, b" == 0)"]) },
-    _ -> bytes_concat_all([b"(", held, b" == 0)"]),
-  }
-
-/// The helper handed back a count, so binding it adds no increment.
-fn lookup_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {abort.raise} =
-  match pattern {
-    PxCtor(c) -> match list_at(c.args, 0) {
-      Some(sub) -> pat_bind(emitter, sub, subj),
-      None -> emitter,
-    },
-    _ -> emitter,
-  }
 
 /// Outside the immediate range an `Int` is boxed, and so is every word that can equal it.
 fn int_test(subj: Bytes, n: Int) -> Bytes =
@@ -8434,50 +8504,72 @@ fn pat_test(
     },
     // A constructor tests its tag and width over an object; an argument with its own test is read into a local under the test so far.
     // A nested subject is zero when an enclosing test failed, and its header must not be read then.
-    PxCtor(c) -> match tag_of(emitter, c.name) {
-      None -> None,
-      Some(tag) -> {
-        let head = bytes_concat_all([
-          b"(",
-          subj.expr,
-          b" != 0 && !ply_is_imm(",
-          subj.expr,
-          b") && ply_obj(",
-          subj.expr,
-          b")->kind == 4 && ply_obj(",
-          subj.expr,
-          b")->layout == ",
-          tag_text(emitter, tag),
-          b" && ply_obj(",
-          subj.expr,
-          b")->len == ",
-          ascii_of_int(ctor_width(emitter, tag, len(c.args))),
-          b")",
-        ]);
-        let laid = ctor_fields(emitter, tag);
-        fold(
-          range(0, len(c.args)),
-          Some({ emitter: emitter, expr: head }),
-          |acc: Option<{ emitter: Emitter, expr: Bytes }>, k: Int|
-            match acc {
+    // An `Option` held as its payload's word is `None` at zero and `Some` of that word otherwise.
+    PxCtor(c) -> if subj.kind == KMaybe {
+      if len(c.args) == 0 {
+        Some({ emitter: emitter, expr: bytes_concat_all([b"(", subj.expr, b" == 0)"]) })
+      } else {
+        let head = bytes_concat_all([b"(", subj.expr, b" != 0)"]);
+        match list_at(c.args, 0) {
+          None -> None,
+          Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: head }) } else {
+            match pat_test(sub, { kind: KBoxed, expr: subj.expr, ty: subj.ty }, emitter) {
               None -> None,
-              Some(t) -> match list_at(c.args, k) {
+              Some(inner) ->
+                Some({
+                  emitter: inner.emitter,
+                  expr: bytes_concat_all([b"(", head, b" && ", inner.expr, b")"]),
+                }),
+            }
+          },
+        }
+      }
+    } else {
+      match tag_of(emitter, c.name) {
+        None -> None,
+        Some(tag) -> {
+          let head = bytes_concat_all([
+            b"(",
+            subj.expr,
+            b" != 0 && !ply_is_imm(",
+            subj.expr,
+            b") && ply_obj(",
+            subj.expr,
+            b")->kind == 4 && ply_obj(",
+            subj.expr,
+            b")->layout == ",
+            tag_text(emitter, tag),
+            b" && ply_obj(",
+            subj.expr,
+            b")->len == ",
+            ascii_of_int(ctor_width(emitter, tag, len(c.args))),
+            b")",
+          ]);
+          let laid = ctor_fields(emitter, tag);
+          fold(
+            range(0, len(c.args)),
+            Some({ emitter: emitter, expr: head }),
+            |acc: Option<{ emitter: Emitter, expr: Bytes }>, k: Int|
+              match acc {
                 None -> None,
-                Some(sub) -> if irrefutable(sub) { Some(t) } else {
-                  let field = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
-                  match pat_test(sub, field.value, field.emitter) {
-                    None -> None,
-                    Some(inner) ->
-                      Some({
-                        emitter: inner.emitter,
-                        expr: bytes_concat_all([b"(", t.expr, b" && ", inner.expr, b")"]),
-                      }),
-                  }
+                Some(t) -> match list_at(c.args, k) {
+                  None -> None,
+                  Some(sub) -> if irrefutable(sub) { Some(t) } else {
+                    let field = arg_tested(t.emitter, t.expr, subj.expr, k, laid);
+                    match pat_test(sub, field.value, field.emitter) {
+                      None -> None,
+                      Some(inner) ->
+                        Some({
+                          emitter: inner.emitter,
+                          expr: bytes_concat_all([b"(", t.expr, b" && ", inner.expr, b")"]),
+                        }),
+                    }
+                  },
                 },
               },
-            },
-        )
-      },
+          )
+        },
+      }
     },
     // Refutable despite the shape: a non-record, the field count without `..`, or a missing field.
     PxRecord(r) -> {
@@ -8616,7 +8708,11 @@ fn arg_tested(
       );
       { emitter: note_holder(check(boxed.emitter), boxed.value.expr), value: boxed.value }
     } else {
-      bind(emitter, KBoxed, bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]))
+      bind(
+        emitter,
+        if f.kind == KMaybe { KMaybe } else { KBoxed },
+        bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]),
+      )
     },
   }
 
@@ -8646,8 +8742,18 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         remember(ensure_owned(b.emitter, b.value), s, b.value)
       },
     },
-    // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
-    PxCtor(c) -> {
+    // The payload of an `Option` held as its word is that word; its binder takes the subject's count
+    // where the subject moves into it, and holds one of its own where it does not.
+    PxCtor(c) -> if subj.kind == KMaybe {
+      match list_at(c.args, 0) {
+        None -> emitter,
+        Some(sub) -> {
+          let w = bind_keeping(emitter, KBoxed, subj.ty, subj.expr);
+          pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
+        },
+      }
+    } else {
+      // Every argument is read and duplicated whether or not the pattern names it, so the arm's scope has one shape.
       let laid = match tag_of(emitter, c.name) {
         Some(tag) -> ctor_fields(emitter, tag),
         None -> None,
@@ -8657,7 +8763,14 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let w = match f {
           Some(x) -> if raw_slot(x.kind) {
             bind(acc, x.kind, raw_at(subj.expr, ascii_of_int(x.at), x.kind))
-          } else { bind_keeping(acc, KBoxed, x.ty, field_read(subj.expr, x)) },
+          } else {
+            bind_keeping(
+              acc,
+              if x.kind == KMaybe { KMaybe } else { KBoxed },
+              x.ty,
+              field_read(subj.expr, x),
+            )
+          },
           None ->
             bind(
               acc,
@@ -8665,7 +8778,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
               bytes_concat_all([b"ply_words(", subj.expr, b")[", ascii_of_int(i), b"]"]),
             ),
         };
-        let held = if w.value.kind != KBoxed { w.emitter } else {
+        let held = if !counted(w.value.kind) { w.emitter } else {
           note_holder(
             line(w.emitter, bytes_concat_all([b"ply_inc(", w.value.expr, b");"])),
             w.value.expr,
@@ -8745,14 +8858,21 @@ fn assigned(
   value: CValue,
   join: Bytes,
 ) -> { emitter: Emitter, text: Bytes, made: List<CountLocal> } = {
-  let m0 = match k {
-    KBoxed -> materialise(indent(with_out(emitter, [])), value.expr),
-    _ -> indent(with_out(emitter, [])),
-  };
-  let m1 = line(m0, bytes_concat_all([join, b" = ", as_kind(value, k), b";"]));
   // The join takes the arm's value; the arm's own holders are released behind it.
-  let m2 = if k == KBoxed { assign_owned(with_made(m1, arm_em.count_locals), join, value.expr) }
-  else { with_made(m1, arm_em.count_locals) };
+  let m2 = if k == KMaybe || value.kind == KMaybe {
+    // An `Option` joins as its payload's word where it does as one, and as its object elsewhere.
+    let arm = with_made(indent(with_out(emitter, [])), arm_em.count_locals);
+    let o = if k == KMaybe { maybe_owned(arm, value) } else { owned(arm, value) };
+    line(o.emitter, bytes_concat_all([join, b" = ", o.value.expr, b";"]))
+  } else {
+    let m0 = match k {
+      KBoxed -> materialise(indent(with_out(emitter, [])), value.expr),
+      _ -> indent(with_out(emitter, [])),
+    };
+    let m1 = line(m0, bytes_concat_all([join, b" = ", as_kind(value, k), b";"]));
+    if counted(k) { assign_owned(with_made(m1, arm_em.count_locals), join, value.expr) }
+    else { with_made(m1, arm_em.count_locals) }
+  };
   let m3 = release_at(m2, ind + 1);
   {
     emitter: outdent(with_out(with_made(m3, emitter.count_locals), emitter.out)),
@@ -8764,6 +8884,7 @@ fn assigned(
 fn as_kind(value: CValue, k: Kind) -> Bytes =
   match k {
     KBoxed -> as_word(value),
+    KMaybe -> if value.kind == KMaybe { value.expr } else { b"ply_maybe_unrouted" },
     KInt -> as_int(value),
     KBool -> as_bool(value),
     KNum(w) -> as_num(value, w),
@@ -8797,8 +8918,7 @@ fn joined(
         b";",
       ]),
     );
-    if jk == KBoxed { match fv { Some(x) -> assign_owned(l, target, x.expr), None -> l } }
-    else { l }
+    if counted(jk) { match fv { Some(x) -> assign_owned(l, target, x.expr), None -> l } } else { l }
   });
   let a2 = release_at(a1, emitter.indent + 1);
   { text: bytes_concat_all([text, bytes_join(a2.out, b"")]), made: a2.count_locals }
@@ -8863,7 +8983,7 @@ fn shared_shape(emitter: Emitter, a: CValue, b: CValue) -> Option<List<Bytes>> =
                 None -> false,
                 Some(x) -> match built_field(emitter, b.expr, nm) {
                   None -> false,
-                  Some(y) -> x.kind == y.kind && x.kind != KBoxed,
+                  Some(y) -> x.kind == y.kind && !counted(x.kind),
                 },
               })) { Some(sorted_names(names_of(na))) }
       else { None },
@@ -8884,7 +9004,7 @@ fn rebuild(emitter: Emitter, names: List<Bytes>, values: List<CValue>) -> Option
       names,
       map(range(0, len(values)), |at: Int|
         match list_at(values, at) {
-          Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { as_word(value) },
+          Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { held_word(value) },
           None -> b"0",
         }),
       map(range(0, len(values)), |at: Int|
@@ -8943,8 +9063,15 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> =
     if p / a == b && p % a == 0 { Some(p) } else { None }
   }
 
-/// Where two arms disagree the join is a word, and each is converted into it.
-fn join_kind(a: Kind, b: Kind) -> Kind = if a == b { a } else { KBoxed }
+/// The kind two arms of one type join as: an `Option` either arm holds as its payload's word joins
+/// as that word where it is the root's answer, handed back as one, and as its object elsewhere.
+fn join_kind(emitter: Emitter, a: Kind, b: Kind) -> Kind =
+  if a == b { a }
+  else if answers_maybe(emitter) && (a == KMaybe || b == KMaybe) { KMaybe }
+  else { KBoxed }
+
+/// Whether the value at hand is the root's answer, an `Option` it hands back as its payload's word.
+fn answers_maybe(emitter: Emitter) -> Bool = emitter.tail && emitter.answer == KMaybe
 
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
@@ -9544,6 +9671,10 @@ fn tail_args(
             );
             tail_args(held.emitter, codes, params, i + 1, push(acc, held.names))
           },
+          Whole(KMaybe) -> {
+            let t = maybe_owned(o.emitter, o.value);
+            tail_args(t.emitter, codes, params, i + 1, push(acc, [t.value.expr]))
+          },
           Whole(_) -> {
             let t = match param_local(o.emitter, i) {
               Some(p) -> bind(o.emitter, p.kind, as_kind(o.value, p.kind)),
@@ -9680,7 +9811,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
   fold(range(0, len(params)), emitter, |acc: Emitter, i: Int|
     match list_at(params, i) {
       None -> acc,
-      Some(p) -> if p.carrier != Whole(KBoxed) {
+      Some(p) -> if p.carrier != Whole(KBoxed) && p.carrier != Whole(KMaybe) {
         match p.carrier {
           Fields(fs) -> {
             let r = held_record(
@@ -9702,6 +9833,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
         match p.kind {
           // A record arrives as its word and is never opened, but its reads are still charged, or the release rule sees nothing read it.
           KBoxed -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
+          KMaybe -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
           KBool -> {
             let o = bind(
               acc,
@@ -9812,7 +9944,8 @@ pub fn ctor_layouts(ctors: List<CtorRow>) -> Map<Bytes, List<FieldTy>> =
         None -> { name: name, kind: KBoxed, ty: TyOpen([]) },
       }
     });
-    if fold(args, false, |laid: Bool, f: FieldTy| laid || raw_slot(f.kind) || in_place(f) != None) {
+    if fold(args, false, |laid: Bool, f: FieldTy|
+        laid || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) {
       map_insert(acc, c.name, args)
     } else { acc }
   })
@@ -9840,7 +9973,8 @@ fn open_fields(fs: List<Field>) -> Bool =
 
 fn field_ty(f: Field) -> FieldTy = {
   let k = kind_of(f.ty);
-  { name: f.name, kind: k.kind, ty: k.ty }
+  // An `Option` is held as its payload's word, as the runtime holds one it lays out.
+  { name: f.name, kind: if is_option_type(f.ty) { KMaybe } else { k.kind }, ty: k.ty }
 }
 
 /// What a definition's scheme says it takes and answers.
@@ -9949,14 +10083,15 @@ pub fn own_definition(root: Bytes) -> Bytes / {abort.raise} =
   match specialisation_of(root) { Some(s) -> s.base, None -> root }
 
 /// What a value's layout reads of its type, every other part a known word, `_`: a scalar, a byte
-/// string, a list, an array or columns by its element, a record by its fields, and a variable as
-/// itself, for what the type it stands for reads.
+/// string, an `Option` or a list whatever it holds, an array or columns by its element, a record by
+/// its fields, and a variable as itself, for what the type it stands for reads.
 pub fn erased(ty: Type) -> Type =
   match ty {
     TyVar(_) -> ty,
     TyCon(c) -> if len(c.args) == 0 && laid_scalar(c.name) { ty }
-    else if len(c.args) == 1 && c.name == b"List" { TyCon({ name: b"List", args: [word_type()] }) }
-    else if len(c.args) == 1 && (c.name == b"Array" || c.name == b"Columns") {
+    else if len(c.args) == 1 && (c.name == b"List" || c.name == b"Option") {
+      TyCon({ name: c.name, args: [word_type()] })
+    } else if len(c.args) == 1 && (c.name == b"Array" || c.name == b"Columns") {
       TyCon({ name: c.name, args: map(c.args, erased) })
     } else { word_type() },
     TyRecord(fs) -> TyRecord(map(fs, erased_field)),
@@ -10654,6 +10789,10 @@ pub fn emit_fn_full(
 fn answered(emitter: Emitter, value: CValue, answer: Carrier) -> { emitter: Emitter, expr: Bytes } =
   match answer {
     Whole(KBoxed) -> returned(emitter, value),
+    Whole(KMaybe) -> {
+      let w = maybe_owned(emitter, value);
+      { emitter: release_at(w.emitter, 0), expr: w.value.expr }
+    },
     Whole(k) -> {
       let b = bind(emitter, k, as_kind(value, k));
       { emitter: release_at(b.emitter, 0), expr: b.value.expr }
@@ -10711,6 +10850,14 @@ fn grown_words(
       match list_at(params, i) {
         None -> acc,
         Some(p) -> match p.carrier {
+          Whole(KMaybe) ->
+            {
+              ..acc,
+              words: push(
+                acc.words,
+                bytes_concat_all([b"rt_maybe_take_p(ctx, p", ascii_of_int(i), b")"]),
+              ),
+            },
           Whole(k) ->
             {
               ..acc,
@@ -10760,6 +10907,21 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
         None -> acc,
         Some(p) -> match p.carrier {
           Whole(KBoxed) -> { ..acc, args: push(acc.args, arg) },
+          // The argument's object is taken, its payload handed on.
+          Whole(KMaybe) -> {
+            let local = bytes_concat(b"a", ascii_of_int(i));
+            {
+              text: bytes_concat_all([
+                acc.text,
+                b"  PlyMaybe ",
+                local,
+                b" = rt_maybe_open_p(ctx, ",
+                arg,
+                b");\n",
+              ]),
+              args: push(acc.args, local),
+            }
+          },
           Whole(k) -> {
             let local = bytes_concat(b"a", ascii_of_int(i));
             {
@@ -10830,7 +10992,8 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
           b" r = ",
           call,
           b";\n  if (ctx->failed) return 0;\n  return ",
-          as_word({ kind: k, expr: b"r", ty: TyOpen([]) }),
+          if k == KMaybe { b"rt_maybe_take_p(ctx, r)" }
+          else { as_word({ kind: k, expr: b"r", ty: TyOpen([]) }) },
           b";\n",
         ]),
       Fields(fs) ->
@@ -11119,7 +11282,8 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
           owner: m.full,
           base: m.base,
         };
-        let words = map(m.params, |p: EmitParam| { ..p, carrier: Whole(KBoxed) });
+        let words = map(m.params, |p: EmitParam|
+          { ..p, carrier: Whole(KBoxed), kind: if p.kind == KMaybe { KBoxed } else { p.kind } });
         match expr(prologue(entered, words), widths_closed(entered, m.body), words) {
           None -> None,
           Some(o) -> {
@@ -11184,6 +11348,12 @@ fn group_wrapper(
       if bytes_len(grown.prep) == 0 { b"" } else { bytes_concat_all([b"  ", grown.prep, b"\n"]) },
       match answer {
         Whole(KBoxed) -> bytes_concat_all([b"  return ", call, b";\n"]),
+        Whole(KMaybe) ->
+          bytes_concat_all([
+            b"  Word r = ",
+            call,
+            b";\n  if (ctx->failed) return 0;\n  return rt_maybe_open_p(ctx, r);\n",
+          ]),
         Whole(_) ->
           opened([
             {
@@ -11436,6 +11606,13 @@ fn grow_call(entry: Bytes, args: List<Bytes>, answer: Carrier) -> Bytes =
 fn grown_return(grown: Bytes, answer: Carrier) -> Bytes =
   match answer {
     Whole(KBoxed) -> bytes_concat_all([b"return ", grown, b";"]),
+    // The answer's object is taken, its payload handed back.
+    Whole(KMaybe) ->
+      bytes_concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return 0; return rt_maybe_open_p(ctx, ply_back);",
+      ]),
     _ -> {
       let k = returned_kind(answer);
       let fail = bytes_concat_all([b"if (ctx->failed) ", failing_return(k), b" "]);
@@ -12065,6 +12242,82 @@ test "an array holds its records in place and its floats as their bits" {
   assert_eq(has(b"array_get"), [true, true, false, true])
 }
 
+test "an Option is its payload's word in the code that knows it, and its object where it leaves" {
+  let src = bytes_concat_all([
+    b"fn picked(c: Bool, s: String) -> Int = match if c { Some(s) } else { None } { Some(_) -> 1, None -> 0 }\n",
+    b"fn found(xs: List<String>, i: Int) -> String = match list_at(xs, i) { Some(s) -> s, None -> \"\" }\n",
+    b"fn nested(s: String) -> Int = match Some(Some(s)) { Some(Some(_)) -> 2, Some(None) -> 1, None -> 0 }\n",
+    b"fn kept(s: String) -> Option<String> = Some(s)\n",
+    b"fn held(s: String) -> List<Option<String>> = [Some(s), None]\n",
+    b"fn same(a: String, b: String) -> Bool = Some(a) == Some(b)\n",
+    b"fn either(c: Bool, s: String, o: Option<String>) -> Option<String> = if c { Some(s) } else { o }\n",
+    b"fn guarded(xs: List<Int>) -> Int = match list_at(xs, 0) { Some(n) if n > 1 -> n, Some(1) -> 10, _ -> 0 }\n",
+    b"fn asked(o: Option<String>) -> Int = match kept(\"k\") { Some(_) -> 1, None -> 0 }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [b"list_at"], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None, None, None, None, None, None]);
+  // Nothing reads one as a word or a scalar but through `owned` or `word_of`.
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"ply_maybe_unrouted") != None), [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+  ]);
+  // Built, matched, handed across a call or answered, no object is made; one stored, nested or
+  // compared is made the object it stands for.
+  assert_eq(has(b"rt_ctor_p"), [false, false, false, false, false, false, false, false, false]);
+  assert_eq(has(b"rt_maybe_take_p"), [false, false, true, false, true, false, false, false, false]);
+  assert_eq(has(b"rt_maybe_box_p"), [false, false, false, false, false, true, false, false, false]);
+  assert_eq(has(b"rt_list_lookup_p"), [
+    false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    true,
+    false,
+  ]);
+  // It crosses a call as its payload's word, a C type of its own so a stale caller fails the build.
+  let maybe = { answer: b"PlyMaybe", params: [b"Word"] };
+  assert_eq(map(at(out, 3).tables.symbols, |d: Defined| d.head), [maybe]);
+  assert_eq(map(at(out, 6).tables.symbols, |d: Defined| d.head), [
+    { answer: b"PlyMaybe", params: [b"Word", b"Word", b"PlyMaybe"] },
+  ]);
+  assert_eq(at(out, 8).tables.generics.expects, [{ callee: b"m.kept", head: maybe }])
+}
+
+test "a record holds an Option as its payload's word" {
+  let src = bytes_concat_all([
+    b"type Entry = { name: String, note: Option<String> }\n",
+    b"fn made(s: String) -> Entry = { name: s, note: Some(s) }\n",
+    b"fn noted(e: Entry) -> Int = match e.note { Some(_) -> 1, None -> 0 }\n",
+    b"fn cleared(e: Entry) -> Entry = { ..e, note: None }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Some", b"None"], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  // Built, read and matched, updated: the field is the payload's word throughout, no object made.
+  assert_eq(has(b"rt_maybe_take_p"), [false, false, false]);
+  assert_eq(has(b"rt_maybe_box_p"), [false, false, false]);
+  assert_eq(has(b"rt_ctor_p"), [false, false, false]);
+  // Its shape says so, which is how the runtime reads it.
+  assert(
+    fold(out, false, |acc: Bool, e: Emitted|
+      acc
+        || fold(e.tables.shapes, false, |seen: Bool, sh: List<Bytes>|
+          seen || contains(sh, b"note!m"))),
+    None,
+  )
+}
+
 test "a constructor holds its arguments as its declaration types them" {
   let src = bytes_concat_all([
     b"type Point = { x: Float, y: Float }\n",
@@ -12277,7 +12530,8 @@ fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {ab
     TyFn(f) ->
       filter(range(0, len(args)), |j: Int|
         (contains(f.params, TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
-          && carrier_of(at(args, j)) != Whole(KBoxed)),
+          && carrier_of(at(args, j)) != Whole(KBoxed)
+          && carrier_of(at(args, j)) != Whole(KMaybe)),
     _ -> [],
   }
 
@@ -12378,14 +12632,16 @@ fn reference_args(emitter: Emitter, scheme: Option<Scheme>, at: Span) -> List<Ty
 /// fields; anything else as its word.
 fn carrier_of(t: Type) -> Carrier = {
   let k = kind_of(t);
-  match k.ty {
-    TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
-    _ -> match k.kind {
-      KFloat -> Whole(KFloat),
-      KDec -> Whole(KDec),
-      KNum(w) -> if in_imm(w) || !carried(w) { Whole(KBoxed) } else { Whole(KNum(w)) },
-      _ -> Whole(KBoxed),
-    },
+  if is_option_type(t) { Whole(KMaybe) } else {
+    match k.ty {
+      TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
+      _ -> match k.kind {
+        KFloat -> Whole(KFloat),
+        KDec -> Whole(KDec),
+        KNum(w) -> if in_imm(w) || !carried(w) { Whole(KBoxed) } else { Whole(KNum(w)) },
+        _ -> Whole(KBoxed),
+      },
+    }
   }
 }
 
@@ -12483,7 +12739,7 @@ fn record_word_lines(
 ) -> Bytes = {
   let l = laid_of(fs);
   let flags = record_flags(fs, l);
-  let words = map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { as_word(v) });
+  let words = map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) });
   bytes_concat_all([
     b"Word ",
     name,
@@ -12743,7 +12999,7 @@ test "a specialisation's root spells its layouts and the lambdas it runs, and re
   // What a layout does not read is a word.
   assert_eq(
     erased(TyCon({ name: b"Option", args: [TyCon({ name: b"Float", args: [] })] })),
-    TyCon({ name: b"_", args: [] }),
+    TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] }),
   );
   assert_eq(
     erased(TyCon({ name: b"List", args: [TyCon({ name: b"Float", args: [] })] })),
@@ -14068,7 +14324,10 @@ fn params_carried(
   map(range(0, len(names)), |i: Int|
     {
       name: match list_at(names, i) { Some(n) -> n, None -> b"" },
-      kind: match list_at(kinds, i) { Some(Some(p)) -> p.kind, _ -> KInt },
+      kind: match list_at(carriers, i) {
+        Some(Whole(KMaybe)) -> KMaybe,
+        _ -> match list_at(kinds, i) { Some(Some(p)) -> p.kind, _ -> KInt },
+      },
       ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },
       carrier: match list_at(carriers, i) { Some(c) -> c, None -> Whole(KBoxed) },
       lambda: None,
