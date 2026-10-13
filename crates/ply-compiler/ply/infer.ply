@@ -15,8 +15,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              member_name, NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin,
-              deriver_bin, instance_kind_bin)
+              member_name, member_of, NumericOp, numeric_ops, numeric_by, is_pub, Opaque,
+              spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
@@ -9214,9 +9214,11 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
   );
   let fns = map(collected.fns, |d: FnDef| carried(collected.checker, d));
   let names = map(fns, |d: FnDef| qualify(parsed.name, d.name.name));
+  let placed: Checker = fold(fns, collected.checker, |c: Checker, d: FnDef|
+    member_declared(c, parsed, d));
   let signed: Signed = fold(
     range(0, len(fns)),
-    { checker: collected.checker, sigs: [], members: [] },
+    { checker: placed, sigs: [], members: [] },
     |acc: Signed, i: Int| signed_fn(acc, parsed, at(fns, i), at(names, i)),
   );
   let own = fold(range(0, len(names)), map_new(), |m: Map<Bytes, Int>, i: Int|
@@ -9265,6 +9267,82 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     |c: Checker, comp: List<Int>| settle_group(c, module, comp),
   )
 }
+
+/// The module that declares the functions of the language's type `of` beside the prelude's.
+fn home_module(of: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat(b"std.", bytes_of_string(ascii_lower(string_of_bytes(of))))
+
+/// A function of a type, `fn T::name`, is declared by the module that declares `T`, a sum or a
+/// `new` record, under no name a field of the record has: a call on a value finds it by the type
+/// alone, and reads a record's fields first.
+fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
+  match member_of(def.name.name) {
+    None -> checker,
+    Some(m) -> {
+      let type_name = qualify(parsed.name, m.of);
+      match map_get(checker.types, type_name) {
+        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name { checker }
+        else {
+          report_error_at(
+            checker,
+            b"E0208",
+            def.name.span,
+            bytes_concat_all([b"`", m.of, b"` is not a type this module declares"]),
+            b"declared in another module, or not at all",
+            [
+              b"a function of a type is found by the type alone, with no search, so only the module that declares the type declares one",
+            ],
+          )
+        },
+        Some(decl) -> match decl.declared {
+          DeclaredAlias(_) ->
+            report_error_at_and(
+              checker,
+              b"E0217",
+              def.name.span,
+              bytes_concat_all([
+                b"`",
+                m.of,
+                b"` is an alias, and a function of a type is of a sum or a `new` record",
+              ]),
+              b"no type of its own",
+              { module: decl.owner, span: decl.span },
+              b"declared here",
+              [
+                b"an alias is the type it names, so a function of one would be of every value of that type",
+              ],
+            ),
+          DeclaredRecord(_) -> match map_get(checker.nominals, type_name) {
+            Some(r) -> match record_fields(r.ty) {
+              Some(fs) -> if field_get(fs, m.member) == None { checker } else {
+                report_error_at_and(
+                  checker,
+                  b"E0105",
+                  def.name.span,
+                  bytes_concat_all([
+                    b"`",
+                    m.of,
+                    b"` has a field `",
+                    m.member,
+                    b"` and a function of that name",
+                  ]),
+                  b"declared again here",
+                  { module: decl.owner, span: decl.span },
+                  b"the field is declared here",
+                  [
+                    b"`value.name` reads a record's field and `value.name(..)` calls it, so a function of the record under the same name could never be called on a value; rename one",
+                  ],
+                )
+              },
+              None -> checker,
+            },
+            None -> checker,
+          },
+          DeclaredSum -> checker,
+        },
+      }
+    },
+  }
 
 /// The order a module's bodies are walked in: each after those its body names, where the names
 /// alone say. Nothing a module that checks means turns on it. A body that performs more than its
@@ -20442,4 +20520,81 @@ test "a call on a value is a call of its type's function with the value first" {
   );
   assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.depth()")), [b"E0101"]);
   assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.size(1)")), [b"E0202"])
+}
+
+test "a function of a type is declared by the type's module, for a sum or a `new` record" {
+  assert_eq(check_codes(b"fn Option::size(o: Option<Int>) -> Int = 0"), [b"E0208"]);
+  assert_eq(check_codes(b"fn Missing::size(n: Int) -> Int = n"), [b"E0208"]);
+  assert_eq(
+    check_codes(b"type Pair = { a: Int, b: Int }\nfn Pair::sum(p: Pair) -> Int = p.a + p.b"),
+    [b"E0217"],
+  );
+  let date = b"type Date = new { year: Int, day: Int }\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        date,
+        b"fn Date::next(d: Date) -> Date = { year: d.year, day: d.day + 1 }\nfn f(d: Date) -> Int = d.next().day",
+      ),
+    ),
+    [],
+  );
+  // A field is read first, so a function under a field's name could never be called on a value.
+  assert(
+    refused_with(
+      bytes_concat(date, b"fn Date::year(d: Date) -> Int = d.year"),
+      b"E0105",
+      b"`Date` has a field `year` and a function of that name",
+    ),
+  )
+}
+
+test "a call on a value reads a record's field, a binding before an effect, and a known type" {
+  // A record that holds a function is called through its field.
+  assert_eq(check_codes(b"fn f(codec: { decode: (Int) -> Int }) -> Int = codec.decode(1)"), []);
+  // A binding and an effect of one name leave the call two readings.
+  assert(
+    refused_with(
+      with_stack(b"effect s { read size() -> Int }\nfn f(s: Stack) -> Int = s.size()"),
+      b"E0105",
+      b"`s` is a binding here and an effect",
+    ),
+  );
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"effect log { write say(n: Int) -> Unit }\nfn f(s: Stack) -> Unit / {log.say} = log.say(s.size())",
+      ),
+    ),
+    [],
+  );
+  // A type parameter has no function: the receiver's type is known where the call stands.
+  assert(
+    refused_with(
+      with_stack(b"fn f<a>(x: a) -> Int = x.size()"),
+      b"E0201",
+      b"cannot call `size` on this value",
+    ),
+  )
+}
+
+test "a recursion through a call on a value is a recursion, and a type states its own functions" {
+  let list = b"type Chain = | End | Link(Int, Chain)\nfn Chain::len(c: Chain) -> Int = match c { End -> 0, Link(_, rest) -> 1 + rest.len() }\n";
+  assert_eq(check_codes(list), []);
+  // It does not descend, so it may not return.
+  assert_eq(
+    check_codes(
+      b"type Chain = | End | Link(Int, Chain)\nfn Chain::len(c: Chain) -> Int = 1 + c.len()\n",
+    ),
+    [b"E0302"],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        list,
+        b"key for Chain by Chain::len\nfn same(a: Chain, b: Chain) -> Bool = a == b\n",
+      ),
+    ),
+    [],
+  )
 }
