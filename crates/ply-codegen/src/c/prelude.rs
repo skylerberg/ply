@@ -97,6 +97,8 @@ static inline int ply_is_float(Word w) { return w != 0 && !ply_is_imm(w) && ply_
 typedef struct { Word lo, hi; } PlyDec;
 /* An `Option` held as its payload's word, zero for `None`. */
 typedef Word PlyMaybe;
+/* A `Result` as one word: its `Ok`'s argument's, or its `Err`'s object's with the low bits `100`. */
+typedef Word PlyTagged;
 static inline PlyDec ply_dec_at(Word base, int64_t at) { PlyDec d; d.lo = ply_words(base)[at]; d.hi = ply_words(base)[at + 1]; return d; }
 static inline PlyDec ply_dec_of(Word w) { return ply_dec_at(w, 0); }
 static inline void ply_set_dec(Word base, int64_t at, PlyDec d) { ply_words(base)[at] = d.lo; ply_words(base)[at + 1] = d.hi; }
@@ -239,6 +241,9 @@ helpers![
     (rt_maybe_take, 1, true),
     (rt_maybe_box, 1, true),
     (rt_maybe_open, 1, true),
+    (rt_tagged_take, 1, true),
+    (rt_tagged_box, 1, true),
+    (rt_tagged_open, 1, true),
     (rt_tick, 0, false),
     (rt_grow, 2, true),
     (rt_bitnot, 1, true),
@@ -316,15 +321,15 @@ pub fn runtime_header() -> String {
          \x20 return o;\n\
          }\n\
          \nstatic inline void ply_inc(Word w) {\n\
-         \x20 if (ply_is_imm(w) || w == 0) return;\n\
-         \x20 PlyObj *o = ply_counted_by(ply_obj(w));\n\
+         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
          \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
          }\n\
          \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
-         \x20 if (ply_is_imm(w) || w == 0) return;\n\
-         \x20 PlyObj *o = ply_counted_by(ply_obj(w));\n\
+         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc == UINT32_MAX) return;\n\
          \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, (Word)o); return; }\n\
