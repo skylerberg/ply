@@ -469,10 +469,9 @@ fn a_frame_reads_back_what_it_wrote_and_nothing_it_did_not() {
 
 fn rsa_document() -> Vec<u8> {
     std::fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../ply-corpus/stdlib/asn1/rsa_key.der"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rsa_key.der"),
     )
-    .expect("the corpus's RSA key")
+    .expect("the tests' RSA key")
 }
 
 #[test]

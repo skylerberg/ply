@@ -3011,7 +3011,7 @@ again whole. The **semantics version** names what a definition's hashes, its
 checked rows and a claim's verdict mean — `ply publish --json` reports it — and
 moves only when one of them does, so a `ply` that changes nothing they mean
 reads an interface another cut. It is a digest of what they come to over a
-corpus, which the build of `ply` evaluates (§3.5). `ply resolve` fetches the interface beside each
+fixed program, which the build of `ply` evaluates (§3.5). `ply resolve` fetches the interface beside each
 archive into the dependency's slot. A load checks a dependency's modules from their source,
 through the memo store as it checks its own; `--verify-deps` (`check`, `test`, `prove`)
 refuses a dependency whose interface does not re-derive from its source, `E0149`.
