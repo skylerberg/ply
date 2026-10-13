@@ -4,16 +4,16 @@
 import parsing (positional, Span, Ident, QName, Input, Parser, Parsed, Eaten, SoFar, ParseStart,
                 ParseDiag, span_to, dummy_span, no_ident, bare, unexpected, error_at, error_at_and,
                 push_diag, error_here, unclosed, parsed_or, failed, default_not_allowed,
-                unknown_argument_name, argument_order, token_kind, token_kind_at, current_span,
-                previous_span, at_token, at_eof, at_ident_text, advance, bump, eat, expect,
-                expect_close, expect_ident, expect_binder, expect_field_name, keyword_pun_refusal,
-                with_no_brace, too_deep, start, qname, comma_list, token_lparen, token_rparen,
-                token_lbrace, token_rbrace, token_lbracket, token_rbracket, token_comma, token_semi,
-                token_colon, token_coloncolon, token_dot, token_dotdot, token_arrow, token_eq,
-                token_pipe, token_pipepipe, token_question, token_star, keyword_let, keyword_if,
-                keyword_else, keyword_with, dump_node, dump_count, dump_presence, dump_word,
-                dump_list, dump_opt, dump_ident, dump_qname, dump_diags, with_no_pipe, advance_n,
-                token_at, token_gt, token_lt, max_depth, span_bin)
+                argument_order, token_kind, token_kind_at, current_span, previous_span, at_token,
+                at_eof, at_ident_text, advance, bump, eat, expect, expect_close, expect_ident,
+                expect_binder, expect_field_name, keyword_pun_refusal, with_no_brace, too_deep,
+                start, qname, comma_list, token_lparen, token_rparen, token_lbrace, token_rbrace,
+                token_lbracket, token_rbracket, token_comma, token_semi, token_colon,
+                token_coloncolon, token_dot, token_dotdot, token_arrow, token_eq, token_pipe,
+                token_pipepipe, token_question, token_star, keyword_let, keyword_if, keyword_else,
+                keyword_with, dump_node, dump_count, dump_presence, dump_word, dump_list, dump_opt,
+                dump_ident, dump_qname, dump_diags, with_no_pipe, advance_n, token_at, token_gt,
+                token_lt, max_depth, span_bin)
 import lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral, FloatLiteral,
               DecimalLiteral, StringLiteral, LineString, BytesLiteral, InterpolatedHead,
               InterpolatedMiddle, InterpolatedTail, CharLiteral, Keyword, Punctuation, EndOfInput)
@@ -75,6 +75,85 @@ pub type RecField = { name: Ident, value: Expr }
 pub type NamedArg = { name: Ident, value: Expr, span: Span }
 
 type Arg = | APos(Expr) | ANamed(NamedArg)
+
+/// Why a named argument fills nothing: it names no parameter, or one an argument before it filled.
+pub type Unplaced = | NoSuchParameter | FilledByPosition | GivenByName
+
+/// What a call passes a parameter: its positional argument or its named argument at a place, or
+/// the parameter's default.
+pub type Slot = | FromArg(Int) | FromName(Int) | FromDefault(Expr)
+
+/// A call's arguments put where its callee's parameters are: `slots` one per parameter in order
+/// where `missing` names none, the named arguments that fill nothing, and the parameters left
+/// with neither an argument nor a default.
+pub type Slotted = {
+  slots: List<Slot>,
+  unplaced: List<{ arg: NamedArg, why: Unplaced }>,
+  missing: List<Bytes>,
+}
+
+/// `args` and then `named` put where a callee's parameters are, `names` each parameter's name and
+/// `defaults` what a call that leaves it out passes.
+pub fn slotted(
+  names: List<Bytes>,
+  defaults: List<Option<Expr>>,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> Slotted = {
+  let index = |name: Bytes|
+    fold(range(0, len(names)), None, |found: Option<Int>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> if list_at(names, i) == Some(name) { Some(i) } else { None },
+      });
+  let placed = fold(
+    range(0, len(named)),
+    { taken: [], unplaced: [] },
+    |acc: { taken: List<{ at: Int, from: Int }>, unplaced: List<{ arg: NamedArg, why: Unplaced }> }, j: Int|
+      match list_at(named, j) {
+        None -> acc,
+        Some(arg) -> {
+          let refused = |why: Unplaced|
+            { ..acc, unplaced: push(acc.unplaced, { arg: arg, why: why }) };
+          match index(arg.name.name) {
+            None -> refused(NoSuchParameter),
+            Some(i) -> if i < len(args) { refused(FilledByPosition) }
+            else if fold(acc.taken, false, |b: Bool, t: { at: Int, from: Int }| b || t.at == i) {
+              refused(GivenByName)
+            } else { { ..acc, taken: push(acc.taken, { at: i, from: j }) } },
+          }
+        },
+      },
+  );
+  fold(
+    range(0, len(names)),
+    { slots: [], unplaced: placed.unplaced, missing: [] },
+    |acc: Slotted, i: Int| {
+      let by_name = fold(placed.taken, None, |found: Option<Int>, t: { at: Int, from: Int }|
+        if t.at == i { Some(t.from) } else { found });
+      if i < len(args) { { ..acc, slots: push(acc.slots, FromArg(i)) } } else {
+        match ((by_name, list_at(defaults, i))) {
+          (Some(j), _) -> { ..acc, slots: push(acc.slots, FromName(j)) },
+          (None, Some(Some(d))) -> { ..acc, slots: push(acc.slots, FromDefault(d)) },
+          _ ->
+            {
+              ..acc,
+              missing: push(acc.missing, match list_at(names, i) { Some(n) -> n, None -> b"" }),
+            },
+        }
+      }
+    },
+  )
+}
+
+/// The arguments `slots` pass, out of a call's `args` and `named`.
+pub fn slot_args(slots: List<Slot>, args: List<Expr>, named: List<NamedArg>) -> List<Expr> =
+  fold(slots, [], |acc: List<Expr>, slot: Slot|
+    match slot {
+      FromArg(i) -> match list_at(args, i) { Some(x) -> push(acc, x), None -> acc },
+      FromName(j) -> match list_at(named, j) { Some(n) -> push(acc, n.value), None -> acc },
+      FromDefault(d) -> push(acc, d),
+    })
 
 /// A parameter; only a `fn` parameter may carry a `default`, or name with `cost` the steps a call of
 /// it takes, which only that definition's `cost` clauses read.
@@ -430,7 +509,32 @@ fn postfix_expr(input: Input, parser: Parser) -> Result<Parsed<Expr>, Parser> / 
     } else { Stop(Ok(s)) })
 }
 
-/// A name, `.`, a name, then `[` or `(` is a perform; anything else is a field read.
+/// What a dot is followed by: a field's name, or `m::f` and a call's arguments, the call of `m::f`
+/// with the value first, which is kept as a field of that name.
+fn dotted_name(input: Input, parser: Parser) -> Result<Parsed<Ident>, Parser> / {abort.raise} = {
+  let { parser, node: f } = expect_field_name(input, parser, b"a field name after `.`")?;
+  if f.keyword || !at_token(input, parser, token_coloncolon()) {
+    Ok({ parser: parser, node: f.name })
+  } else {
+    let through = advance(input, parser);
+    let { parser, node: g } = expect_ident(input, through.parser, b"a function's name after `::`")?;
+    if !follows_op(token_kind(input, parser)) {
+      Err(error_here(input, parser, b"`(`: `value.m::f(..)` calls `m::f` with the value first"))
+    } else {
+      Ok({
+        parser: parser,
+        node: {
+          name: bytes_concat_all([f.name.name, b"::", g.name]),
+          span: span_to(f.name.span, g.span),
+        },
+      })
+    }
+  }
+}
+
+/// A name, `.`, a name, then `[` or `(` is a perform, or a call on the value a binding of that name
+/// holds; anything else is a field read. An operation takes no named argument, so a call that
+/// writes one is kept as the call on a value.
 fn postfix_dot(input: Input, s: Parsed<Expr>) -> Result<Parsed<Expr>, Parser> / {abort.raise} = {
   let is_perform = match s.node {
     EVar(v) -> match token_kind_at(input, s.parser, 1) {
@@ -442,36 +546,42 @@ fn postfix_dot(input: Input, s: Parsed<Expr>) -> Result<Parsed<Expr>, Parser> / 
   };
   let dot = advance(input, s.parser);
   if !is_perform {
-    let { parser, node: f } = expect_field_name(input, dot.parser, b"a field name after `.`")?;
+    let { parser, node: f } = dotted_name(input, dot.parser)?;
     Ok({
       parser: parser,
-      node: EField({ span: span_to(expr_span(s.node), f.name.span), base: s.node, field: f.name }),
+      node: EField({ span: span_to(expr_span(s.node), f.span), base: s.node, field: f }),
     })
   } else {
     let eff = match s.node { EVar(v) -> v.name, _ -> bare(no_ident()) };
     let { parser, node: op } = expect_ident(input, dot.parser, b"an operation name")?;
     let { parser, node: res } = opt_resource(input, parser)?;
     let a = call_args(input, parser)?;
-    // An operation takes no named arguments: each is refused and dropped.
+    let span = span_to(expr_span(s.node), a.close);
     Ok({
-      parser: refuse_named(a.parser, eff, op, a.named),
-      node: EPerform({
-        span: span_to(expr_span(s.node), a.close),
-        eff: eff,
-        op: op,
-        resource: res,
-        args: a.args,
-      }),
+      parser: a.parser,
+      node: if len(a.named) == 0 {
+        EPerform({ span: span, eff: eff, op: op, resource: res, args: a.args })
+      } else {
+        EApp({
+          span: span,
+          func: EField({ span: span_to(expr_span(s.node), op.span), base: s.node, field: op }),
+          named: a.named,
+          args: a.args,
+          labels: match res { Some(r) -> [r], None -> [] },
+        })
+      },
     })
   }
 }
 
 fn follows_op(kind: TokenKind) -> Bool = kind == token_lbracket() || kind == token_lparen()
 
-/// `relay[conn](c)`: a `[` after a name, holding names, then `(`, fills the callee's label parameters.
+/// `relay[conn](c)`: a `[` after a name, holding names, then `(`, fills the callee's label
+/// parameters; after a field's name, those of the function called on the value.
 fn at_label_args(input: Input, s: Parsed<Expr>) -> Bool / {abort.raise} =
   match s.node {
     EVar(v) -> at_token(input, s.parser, token_lbracket()) && label_args_ahead(input, s.parser),
+    EField(_) -> at_token(input, s.parser, token_lbracket()) && label_args_ahead(input, s.parser),
     _ -> false,
   }
 
@@ -561,24 +671,6 @@ fn clause_resource(
   }
 
 type ParsedArgs = { parser: Parser, close: Span, named: List<NamedArg>, args: List<Expr> }
-
-fn refuse_named(parser: Parser, eff: QName, ident: Ident, named: List<NamedArg>) -> Parser = {
-  let written = match eff.module {
-    Some(m) -> bytes_concat_all([m.name, b"::", eff.name.name]),
-    None -> eff.name.name,
-  };
-  fold(named, parser, |q: Parser, arg: NamedArg|
-    push_diag(
-      q,
-      error_at(
-        unknown_argument_name(),
-        arg.span,
-        bytes_concat_all([b"`", written, b".", ident.name, b"` takes no named arguments"]),
-        b"named",
-        [b"an effect operation's arguments are positional"],
-      ),
-    ))
-}
 
 fn call_args(input: Input, parser: Parser) -> Result<ParsedArgs, Parser> / {abort.raise} = {
   let saved = parser.no_brace;
@@ -2451,14 +2543,6 @@ test "a positional argument after a named one is refused, once each" {
     "0:13:eapp;0:1:evar;0:1:qname;?0;0:1:ident;@66;#2;8:9:elit;%int;@32;"
       ++ "11:12:elit;%int;@33;#1;2:6:narg;2:3:ident;@61;5:6:elit;%int;@31;#0;"
       ++ "#2;!E0124:8:9:2:1;=8:9:1;=2:6:0;!E0124:11:12:2:1;=11:12:1;=2:6:0;",
-  )
-}
-
-test "an effect operation takes no named argument" {
-  // Dropped as well as refused: the `eprf` carries no arguments.
-  assert_eq(
-    dump_expr_of(b"d.op(k: 1)"),
-    "0:10:eprf;0:1:qname;?0;0:1:ident;@64;2:4:ident;@6f70;?0;#0;" ++ "#1;!E0123:5:9:1:1;=5:9:1;",
   )
 }
 

@@ -11,14 +11,14 @@ import hash (hex)
 import infer (DefInfo)
 import items (Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef, TDAlias, TDSum, TDNominal,
               VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc, SpecClause, ReturnsFresh,
-              ReturnsParam, Vis, VPub, VPriv, SchemaDef, schema_of)
+              ReturnsParam, Vis, VPub, VPriv, SchemaDef, schema_of, member_of)
 import parsing (Doc, Ident, Span)
 import resolve (ParsedModule, qualify)
 import type_syntax (TypeExpr, TRecord, ty_span, generics_text)
 import types (Printer, Scheme, Type, TyFn, printer_new, print_scheme, print_ty, print_row,
               scheme_text, row_text)
 import std.bin
-import std.list (find)
+import std.list (concat, find)
 import std.string (ascii_trim, join, replace)
 
 /// A parameter as a signature writes it.
@@ -301,6 +301,34 @@ fn op_member(reading: Reading, op: OpDef) -> Member / {abort.raise} =
 fn set_signature(reading: Reading, d: EffectSetDef) -> String / {abort.raise} =
   visibility(d.vis) ++ sliced(reading, d.span)
 
+/// The functions of the type `d`, in its module's order: those the module publishes where it
+/// publishes the type, and every one of a type it keeps.
+fn type_functions(reading: Reading, d: TypeDef) -> List<Member> / {abort.raise} = {
+  let parsed = reading.parsed;
+  fold(parsed.module.items, [], |acc: List<Member>, it: Item|
+    match it {
+      IFn(f) -> match member_of(f.name.name) {
+        None -> acc,
+        Some(m) -> {
+          let kept = match ((d.vis, f.vis)) { (VPub, VPriv) -> true, _ -> false };
+          if m.of != d.name.name || kept { acc } else {
+            match map_get(reading.defs, qualify(parsed.name, f.name.name)) {
+              None -> acc,
+              Some(def_info) ->
+                push(acc, {
+                  kind: "function",
+                  name: string_of_bytes_lossy(m.member),
+                  signature: fn_signature(def_info, Some(f)).text,
+                  doc: lines_of(f.doc),
+                }),
+            }
+          }
+        },
+      },
+      _ -> acc,
+    })
+}
+
 /// A declaration's page: what kind it is, the names it goes by, and where it is declared.
 fn declared(reading: Reading, kind: String, own: Bytes, span: Span) -> Page =
   {
@@ -319,7 +347,7 @@ fn item_pages(reading: Reading, it: Item) -> List<Page> / {abort.raise} =
           ..declared(reading, "type", d.name.name, d.span),
           signature: type_signature(reading, d),
           doc: lines_of(d.doc),
-          members: type_members(reading, d),
+          members: concat(type_members(reading, d), type_functions(reading, d)),
         },
       ],
     IEffect(d) ->
@@ -514,4 +542,23 @@ test "a module documents itself, each definition its check published and each na
     },
   ]);
   assert_eq(page("m.ledger.record").signature, "write record(n: Int) -> Unit")
+}
+
+test "a type's page lists its functions after what it is made of, those it publishes where it is published" {
+  let src = b"pub type Shape = | Dot | Line(Int)\n\n/// How long.\npub fn Shape::length(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }\n\nfn Shape::kept(s: Shape) -> Int = 0\n\ntype Inner = | Inner\n\nfn Inner::made() -> Inner = Inner\n";
+  let pages = pages_of(src, b"none", b"none");
+  let members = |name: String|
+    match find(pages, |p: Page| p.name == name) {
+      Some(p) -> map(p.members, |m: Member| m.kind ++ " " ++ m.name ++ ": " ++ m.signature),
+      None -> panic("`" ++ name ++ "` has a page"),
+    };
+  assert_eq(members("m.Shape"), [
+    "variant Dot: Dot",
+    "variant Line: Line(Int)",
+    "function length: pub fn Shape::length(s: m.Shape) -> Int",
+  ]);
+  assert_eq(members("m.Inner"), [
+    "variant Inner: Inner",
+    "function made: fn Inner::made() -> m.Inner",
+  ])
 }
