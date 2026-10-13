@@ -171,10 +171,9 @@ fn hex(bytes: &[u8]) -> String {
 
 fn rsa_document() -> Vec<u8> {
     std::fs::read(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../ply-corpus/stdlib/asn1/rsa_key.der"),
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rsa_key.der"),
     )
-    .expect("the corpus's RSA key")
+    .expect("the tests' RSA key")
 }
 
 fn paths() -> Vec<Path> {

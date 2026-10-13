@@ -20,15 +20,14 @@
 #   ci-shards.sh nextest-shards  the JSON matrix of the nextest shards
 #   ci-shards.sh durations FILE  `binary_id test milliseconds` per test in a
 #                                nextest JUnit report
-#   ci-shards.sh corpus-matrix   the JSON matrix of the jobs that take the Ply
+#   ci-shards.sh runs-matrix     the JSON matrix of the jobs that take the Ply
 #                                runs, each by its id
 #   ci-shards.sh job-runs ID     the runs the job ID takes, one a line
-#   ci-shards.sh corpus-line ID  the package a run tests, the substrings of the
+#   ci-shards.sh run-line ID     the package a run tests, the substrings of the
 #                                tests' qualified names `ply test --filter`
 #                                picks its tests by, and its part `K/N`,
 #                                tab-separated, a field empty where it has
-#                                none: of a run, or of one module of the
-#                                corpus's checks (`<module>`) or of the CLI's
+#                                none: of a run, or of one module of the CLI's
 #                                suite (`cli-<module>`)
 #   ci-shards.sh exclude-filter  the filterset a shard leaves to the hosts and
 #                                gates jobs: the host packages and the tree checks
@@ -39,7 +38,7 @@
 #                                the maintained Ply sources, one a line, which the
 #                                gates job holds to `ply fmt --check`
 #   ci-shards.sh nightly-matrix EVENT  the JSON matrix of the nightly jobs, each the arguments of a
-#                                `ci-corpus.sh nightly`: under `schedule` or `workflow_dispatch`,
+#                                `ci-ply.sh nightly`: under `schedule` or `workflow_dispatch`,
 #                                SWEEP_SHARDS shards of the part of the edit sweep's cases the day
 #                                names, so SWEEP_DAYS days sweep every case, and one job of the other
 #                                modules no pull request runs; none otherwise
@@ -57,29 +56,24 @@ NEXTEST_SHARDS=2
 TAB=$'\t'
 
 # The Ply runs, each one `ply test` or `ply prove` of a package, which loads the package once: the
-# library's tests (`stdlib`) and its proofs (`proofs`), the corpus's checks (`checks`), the CLI's suite
-# in parts, the corpus program's own tests (`program`), each fixture's (`fixture-<name>`), each
-# package's suite (`package-<id>`) and each package's proofs (`laws-<id>`).
-CORPUS_PROGRAM=crates/ply-corpus/ply
-# The programs the corpus program runs, each a `ply test` of its own whose tests must pass.
-CORPUS_FIXTURES=crates/ply-corpus/fixtures
-CORPUS_CHECKS=crates/ply-corpus/checks
-# The fixtures the standard library's tests read, as a project: `--std` over it tests and proves every
-# module of the library beside its own.
-CORPUS_STDLIB=crates/ply-corpus/stdlib
+# library's tests (`stdlib`) and its proofs (`proofs`), the CLI's suite in parts, each package's suite
+# (`package-<id>`) and each package's proofs (`laws-<id>`).
+# The standard library's tests that read fixtures, as a project: `--std` over it tests and proves
+# every module of the library beside its own.
+STD_TESTS=crates/ply-std-tests/ply
 STD_LIBRARY=crates/ply-std/ply
 CLI_SUITE=crates/ply-cli-tests/ply
 # The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
 # another, and with them one job would run close to its limit.
 CLI_PARTS=2
-# The program's, a fixture's and a package's own tests and proofs share one job, `packages`, in turn:
-# each loads little. These take a job of their own instead: the compiler's own tests take every core.
-CORPUS_ALONE=(package-compiler)
+# A package's own tests and proofs share one job, `packages`, in turn: each loads little. These take
+# a job of their own instead: the compiler's own tests take every core.
+RUNS_ALONE=(package-compiler)
 # Modules of the CLI's suite no pull request runs, which the `nightly` jobs do. CLI_SWEPT edits each
 # module of the tree one way and checks it warm and cold, days of runners over the tree, so a night
 # takes a part of its cases. The rest run whole each night: minutes each over the toolchain's whole
-# trees, the reach audit checking three packages cold and the copies audit listing ten, or against a
+# trees, the reach audit checking packages cold and the copies audit listing every one, or against a
 # postgres they start.
 CLI_NIGHTLY=(edit_sweep phases_whole reached copies db_in_ply db_wire pg_client)
 CLI_SWEPT=edit_sweep
@@ -95,7 +89,6 @@ PACKAGE_SUITES=(
   "cli:crates/ply-cli/ply"
   "compiler:crates/ply-compiler/ply"
   "examples:examples"
-  "kernel:benches/kernel"
   "lang:tests/lang"
   "registry:crates/ply-registry/ply"
   "prove:crates/ply-prove/ply"
@@ -142,17 +135,14 @@ CLI_TREE_CHECKS=(
 # committed unformatted puts its reformatting into the next change that touches it. Every committed
 # `.ply` is under one of these or of the fixtures, whose spelling is their point (`verify`).
 FORMATTED_SOURCES=(
-  benches
   crates/ply-cli-tests/ply
   crates/ply-cli/ply
   crates/ply-compiler/ply
   crates/ply-compiler/prelude.ply
-  crates/ply-corpus/checks
-  crates/ply-corpus/ply
-  crates/ply-corpus/stdlib
   crates/ply-prove/ply
   crates/ply-registry/ply
   crates/ply-sim/ply
+  crates/ply-std-tests/ply
   crates/ply-std/ply
   crates/ply-store/ply
   crates/ply-test/ply
@@ -162,7 +152,6 @@ FORMATTED_SOURCES=(
 FIXTURE_SOURCES=(
   crates/ply-cli-tests/phases
   crates/ply-codegen-tests/tests
-  crates/ply-corpus/fixtures
   tests/fixtures
 )
 
@@ -178,11 +167,11 @@ SUPERSEDED=(ply-upstream- ply-stores-)
 
 # `<family>-<digest>` entries keyed by what they hold: a run restores the newest one a `restore-keys`
 # prefix matches, so an older one only holds the repository's 10 GB against what a run does read.
-NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-corpus-)
+NEWEST=(nextest-archive- ply-native- ply-built- rust-passed- tree-passed- ply-c-stage-sources- ply-c-runs-)
 
 # Families of the two above that hold an entry a job, `<family><job id>-...`: one whose job the tree
 # no longer lists is restored by no run.
-PER_JOB=(ply-stores- ply-c-corpus-)
+PER_JOB=(ply-stores- ply-c-runs-)
 
 # A key that never moves: nothing replaces its one entry.
 FIXED=(tcc-)
@@ -261,7 +250,7 @@ named_in() {
 package_keys() {
   local file
   for file in "$root/$1"/*.ply; do
-    corpus_test_names "$file" | sed "s/^/$(basename "$file" .ply)./"
+    test_names "$file" | sed "s/^/$(basename "$file" .ply)./"
   done
 }
 
@@ -281,15 +270,15 @@ proofs_path() {
   return 1
 }
 
-# Each `.ply` of a package below `crates/` other than the library's, and each example, that states a
-# law or an `ensures`, `cost` or `space` clause, which only a `ply prove` discharges.
+# Each `.ply` of a package below `crates/` other than the library's and its tests', and each example,
+# that states a law or an `ensures`, `cost` or `space` clause, which only a `ply prove` discharges.
 claiming_files() {
   grep -rlE --include='*.ply' '^law "|^[[:space:]]+(ensures|cost|space) ' "$root"/crates/*/ply "$root"/examples 2>/dev/null |
-    grep -v "^$root/$STD_LIBRARY/" | sed "s|^$root/||" | LC_ALL=C sort || true
+    grep -v -e "^$root/$STD_LIBRARY/" -e "^$root/$STD_TESTS/" | sed "s|^$root/||" | LC_ALL=C sort || true
 }
 
 # The labels of a module's tests, in the order it declares them.
-corpus_test_names() {
+test_names() {
   sed -nE 's/^test(\/[a-z]+)? "([^"]*)".*/\2/p' "$1"
 }
 
@@ -303,21 +292,19 @@ modules_of() {
 
 # Every Ply run a pull request takes, one id a line.
 runs() {
-  local entry file k
-  printf 'stdlib\nproofs\nchecks\n'
+  local entry k
+  printf 'stdlib\nproofs\n'
   for ((k = 1; k <= CLI_PARTS; k++)); do printf 'cli-part-%d\n' "$k"; done
-  printf 'program\n'
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
-  for file in "$root/$CORPUS_FIXTURES"/*.ply; do printf 'fixture-%s\n' "$(basename "$file" .ply)"; done
 }
 
-# The job that takes the run $1: `packages` for the program's, a fixture's and a package's own tests
-# and a package's proofs, but those CORPUS_ALONE names, and a job of its own for every other run.
+# The job that takes the run $1: `packages` for a package's own tests and a package's proofs, but
+# those RUNS_ALONE names, and a job of its own for every other run.
 job_of() {
   case "$1" in
-    program | package-* | fixture-* | laws-*)
-      if named_in "$1" "${CORPUS_ALONE[@]}"; then printf '%s\n' "$1"; else printf 'packages\n'; fi
+    package-* | laws-*)
+      if named_in "$1" "${RUNS_ALONE[@]}"; then printf '%s\n' "$1"; else printf 'packages\n'; fi
       ;;
     *) printf '%s\n' "$1" ;;
   esac
@@ -329,7 +316,7 @@ jobs() {
   runs | while read -r id; do job_of "$id"; done | awk '!seen[$0]++'
 }
 
-cmd_corpus_matrix() { jobs | jq -Rnc '{include: [inputs | {id: .}]}'; }
+cmd_runs_matrix() { jobs | jq -Rnc '{include: [inputs | {id: .}]}'; }
 
 # The runs the job ID takes, one a line; a run or a module that is no job is itself.
 cmd_job_runs() {
@@ -352,12 +339,10 @@ cli_filters() {
   done
 }
 
-cmd_corpus_line() {
+cmd_run_line() {
   local id=$1 path part
   case "$id" in
-    program) printf '%s\t\t\n' "$CORPUS_PROGRAM" ;;
-    stdlib | proofs) printf '%s\t\t\n' "$CORPUS_STDLIB" ;;
-    checks) printf '%s\t\t\n' "$CORPUS_CHECKS" ;;
+    stdlib | proofs) printf '%s\t\t\n' "$STD_TESTS" ;;
     cli-part-*)
       part=${id#cli-part-}
       if ! [[ $part =~ ^[1-9][0-9]*$ ]] || ((part > CLI_PARTS)); then
@@ -365,10 +350,6 @@ cmd_corpus_line() {
         return 1
       fi
       printf '%s\t%s\t%d/%d\n' "$CLI_SUITE" "$(cli_filters)" "$part" "$CLI_PARTS"
-      ;;
-    fixture-*)
-      [[ -f "$root/$CORPUS_FIXTURES/${id#fixture-}.ply" ]] || { echo "no fixture named '${id#fixture-}'" >&2; return 1; }
-      printf '%s/%s.ply\t\t\n' "$CORPUS_FIXTURES" "${id#fixture-}"
       ;;
     package-*)
       path=$(package_path "${id#package-}") || { echo "no package suite named '${id#package-}'" >&2; return 1; }
@@ -383,8 +364,8 @@ cmd_corpus_line() {
       printf '%s\t%s.\t\n' "$CLI_SUITE" "${id#cli-}"
       ;;
     *)
-      [[ -f "$root/$CORPUS_CHECKS/$id.ply" ]] || { echo "no run named '$id'" >&2; return 1; }
-      printf '%s\t%s.\t\n' "$CORPUS_CHECKS" "$id"
+      echo "no run named '$id'" >&2
+      return 1
       ;;
   esac
 }
@@ -890,16 +871,16 @@ cmd_prune_check() {
   got=$(printf '%s\t%s\t%s\n' \
     1 2026-01-01T00:00:00Z ply-stores-stdlib-100 \
     2 2026-01-02T00:00:00Z "ply-stores-stdlib-$b-200" \
-    3 2026-01-01T00:00:00Z ply-stores-checks-100 \
+    3 2026-01-01T00:00:00Z ply-stores-proofs-100 \
     4 2026-01-01T00:00:00Z ply-stores-cli-part-3-100 \
     5 2026-01-01T00:00:00Z ply-upstream-100 \
     6 2026-01-02T00:00:00Z ply-upstream-200 \
     7 2026-01-01T00:00:00Z "ply-built-Linux-X64-$a" \
     8 2026-01-02T00:00:00Z "ply-built-Linux-X64-$b" \
     9 2026-01-01T00:00:00Z "ply-built-macOS-ARM64-$a" \
-    10 2026-01-02T00:00:00Z "ply-c-corpus-stdlib-$a" \
-    11 2026-01-01T00:00:00Z "ply-c-corpus-stdlib-$b" \
-    12 2026-01-02T00:00:00Z "ply-c-corpus-cli-part-3-$a" \
+    10 2026-01-02T00:00:00Z "ply-c-runs-stdlib-$a" \
+    11 2026-01-01T00:00:00Z "ply-c-runs-stdlib-$b" \
+    12 2026-01-02T00:00:00Z "ply-c-runs-cli-part-3-$a" \
     13 2026-01-01T00:00:00Z v0-rust-build-Linux-x64-11111111-22222222 \
     14 2026-01-02T00:00:00Z v0-rust-build-Linux-x64-11111111-33333333 \
     15 2026-01-01T00:00:00Z v0-rust-clippy-Linux-x64-11111111-22222222 \
@@ -907,7 +888,7 @@ cmd_prune_check() {
     17 2026-01-02T00:00:00Z sccache/a/b/c/abcdef \
     18 2026-01-03T00:00:00Z "ply-stores-stdlib-$b-300" \
     19 2026-01-01T00:00:00Z "ply-stores-stdlib-$a-150" |
-    prune_plan 200 "ply-upstream- ply-stores-stdlib- ply-stores-checks-" "ply-built- ply-c-corpus-stdlib- v0-rust-" "tcc-" |
+    prune_plan 200 "ply-upstream- ply-stores-stdlib- ply-stores-proofs-" "ply-built- ply-c-runs-stdlib- v0-rust-" "tcc-" |
     cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
   if [[ $got != "$want" ]]; then
     echo "FAIL: of the listing it is held to, \`supersede\` would delete '$got' and should delete '$want'" >&2
@@ -1071,7 +1052,7 @@ cmd_verify() {
   while read -r allow; do
     echo "FAIL: $allow silences dead-code warnings — delete what nothing calls instead" >&2
     failures=$((failures + 1))
-  done < <(grep -rn -E "allow\((dead_code|unused)\)" --include=*.rs "$root/crates" "$root/benches" | sed "s|^$root/||" || true)
+  done < <(grep -rn -E "allow\((dead_code|unused)\)" --include=*.rs "$root/crates" | sed "s|^$root/||" || true)
 
   for package in "${HOST_PACKAGES[@]}"; do
     if ! printf '%s\n' "${all_members[@]}" | grep -qx "$package"; then
@@ -1192,19 +1173,9 @@ cmd_verify() {
   fi
 
   # --- the Ply tests ----------------------------------------------------------
-  local corpus_job
-  for dir in "$CORPUS_PROGRAM" "$CORPUS_CHECKS" "$CLI_SUITE"; do
-    if [[ ! -f "$root/$dir/ply.pkg" ]]; then
-      echo "FAIL: $dir holds no ply.pkg, and a corpus run tests it as a package" >&2
-      failures=$((failures + 1))
-    fi
-  done
-  if [[ -f "$root/$CORPUS_CHECKS/program.ply" ]]; then
-    echo "FAIL: $CORPUS_CHECKS/program.ply would be run under the id of the program's own tests" >&2
-    failures=$((failures + 1))
-  fi
-  if [[ -z $(modules_of "$CORPUS_CHECKS") ]]; then
-    echo "FAIL: no module of $CORPUS_CHECKS declares a test, so the corpus's checks run nowhere" >&2
+  local runs_job runs_command
+  if [[ ! -f "$root/$CLI_SUITE/ply.pkg" ]]; then
+    echo "FAIL: $CLI_SUITE holds no ply.pkg, and a run tests it as a package" >&2
     failures=$((failures + 1))
   fi
   local listed
@@ -1213,23 +1184,21 @@ cmd_verify() {
     echo "FAIL: the run '$(sort <<< "$listed" | uniq -d | head -1)' is listed twice, so two jobs would take it" >&2
     failures=$((failures + 1))
   fi
-  for id in "${CORPUS_ALONE[@]}"; do
-    if ! grep -qx "$id" <<< "$listed" || [[ $id != program && $id != package-* && $id != fixture-* ]]; then
-      echo "FAIL: CORPUS_ALONE names '$id', which is no run the \`packages\` job would take" >&2
+  for id in "${RUNS_ALONE[@]}"; do
+    if ! grep -qx "$id" <<< "$listed" || [[ $id != package-* && $id != laws-* ]]; then
+      echo "FAIL: RUNS_ALONE names '$id', which is no run the \`packages\` job would take" >&2
       failures=$((failures + 1))
     fi
   done
   # A module's tests are picked out by `<module>.`, which no test of another module may hold.
   local module names keys outside
-  for dir in "$CORPUS_CHECKS" "$CLI_SUITE"; do
-    keys=$(package_keys "$dir")
-    for module in $(modules_of "$dir"); do
-      outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
-      if [[ -n $outside ]]; then
-        echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $dir/$module.ply, so the module's filter picks that test too" >&2
-        failures=$((failures + 1))
-      fi
-    done
+  keys=$(package_keys "$CLI_SUITE")
+  for module in $(modules_of "$CLI_SUITE"); do
+    outside=$(grep -F -- "$module." <<< "$keys" | grep -v "^$module\." || true)
+    if [[ -n $outside ]]; then
+      echo "FAIL: '$module.' is part of '${outside%%$'\n'*}', outside $CLI_SUITE/$module.ply, so the module's filter picks that test too" >&2
+      failures=$((failures + 1))
+    fi
   done
   local file claimed
   while IFS= read -r file; do
@@ -1268,14 +1237,14 @@ cmd_verify() {
   done
   for entry in "${CLI_TREE_CHECKS[@]}"; do
     module=${entry%%:*}
-    names=$(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
+    names=$(test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true)
     if ! grep -qxF -- "${entry#*:}" <<< "$names"; then
       echo "FAIL: $CLI_SUITE/$module.ply declares no test '${entry#*:}', and CLI_TREE_CHECKS names it" >&2
       failures=$((failures + 1))
     fi
   done
   for module in "${CLI_NIGHTLY[@]}"; do
-    if [[ -z $(corpus_test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
+    if [[ -z $(test_names "$root/$CLI_SUITE/$module.ply" 2>/dev/null || true) ]]; then
       echo "FAIL: $CLI_SUITE/$module.ply declares no test, and CLI_NIGHTLY leaves it to the nightly jobs" >&2
       failures=$((failures + 1))
     fi
@@ -1285,28 +1254,28 @@ cmd_verify() {
     failures=$((failures + 1))
   fi
   # Each command's runs must reach a job the \`ci\` job waits on, or they run nowhere that counts.
-  for corpus_command in "ci-shards.sh corpus-matrix" "ci-corpus.sh run" "ci-corpus.sh nightly"; do
-    corpus_job=$(job_running "$corpus_command")
-    if [[ -z $corpus_job ]]; then
-      echo "FAIL: no job in $workflow runs \`$corpus_command\`, so its Ply runs run nowhere" >&2
+  for runs_command in "ci-shards.sh runs-matrix" "ci-ply.sh run" "ci-ply.sh nightly"; do
+    runs_job=$(job_running "$runs_command")
+    if [[ -z $runs_job ]]; then
+      echo "FAIL: no job in $workflow runs \`$runs_command\`, so its Ply runs run nowhere" >&2
       failures=$((failures + 1))
-    elif [[ " ${needs//[][,]/ } " != *" $corpus_job "* ]]; then
-      echo "FAIL: job '$corpus_job' runs Ply tests, and is not in the \`ci\` job's needs list" >&2
+    elif [[ " ${needs//[][,]/ } " != *" $runs_job "* ]]; then
+      echo "FAIL: job '$runs_job' runs Ply tests, and is not in the \`ci\` job's needs list" >&2
       failures=$((failures + 1))
     fi
   done
   # The job that starts the runs ends them at a deadline that leaves its steps after them RUNS_MARGIN
   # minutes of its limit: a job the limit cancels keeps nothing its runs wrote.
   local limit budget
-  corpus_job=$(job_running "ci-corpus.sh run")
-  if [[ -n $corpus_job ]]; then
-    limit=$(job_block "$corpus_job" | sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p')
-    budget=$(deadline_of "$corpus_job")
+  runs_job=$(job_running "ci-ply.sh run")
+  if [[ -n $runs_job ]]; then
+    limit=$(job_block "$runs_job" | sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\)$/\1/p')
+    budget=$(deadline_of "$runs_job")
     if [[ -z $budget ]]; then
-      echo "FAIL: job '$corpus_job' runs \`ci-corpus.sh run\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
+      echo "FAIL: job '$runs_job' runs \`ci-ply.sh run\` and sets no PLY_CI_DEADLINE, so its limit cancels it with nothing kept" >&2
       failures=$((failures + 1))
     elif [[ -z $limit ]] || ((budget > limit - RUNS_MARGIN)); then
-      echo "FAIL: job '$corpus_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
+      echo "FAIL: job '$runs_job' ends its runs ${budget} minutes in, which leaves less than $RUNS_MARGIN of its ${limit:-unset} for the steps that keep what they wrote" >&2
       failures=$((failures + 1))
     fi
   fi
@@ -1338,7 +1307,7 @@ cmd_verify() {
   echo "${#all_members[@]} members under crates/ (plus $(members_outside_crates | grep -c . || true) outside); ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#CLI_TREE_CHECKS[@]} in the CLI's suite, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $(grep -c . <<< "$listed") Ply runs in $(jobs | grep -c .) jobs; $NEXTEST_SHARDS nextest shards"
 }
 
-# The nightly jobs, each by the arguments its `ci-corpus.sh nightly` takes: the day's shards of
+# The nightly jobs, each by the arguments its `ci-ply.sh nightly` takes: the day's shards of
 # CLI_SWEPT's cases, and CLI_NIGHTLY's other modules in one job.
 cmd_nightly_matrix() {
   local event=$1 module whole=""
@@ -1366,9 +1335,9 @@ case "${1:-}" in
   toolchain-inputs) cmd_toolchain_inputs ;;
   nextest-shards) cmd_nextest_shards ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
-  corpus-matrix) cmd_corpus_matrix ;;
+  runs-matrix) cmd_runs_matrix ;;
   job-runs) cmd_job_runs "${2:?a job}" ;;
-  corpus-line) cmd_corpus_line "${2:?a run}" ;;
+  run-line) cmd_run_line "${2:?a run}" ;;
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   host-filter) cmd_host_filter ;;
@@ -1379,7 +1348,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-matrix) cmd_nightly_matrix "${2:?an event}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|nextest-shards|durations FILE|corpus-matrix|job-runs ID|corpus-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-matrix EVENT}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-matrix EVENT}" >&2
     exit 2
     ;;
 esac

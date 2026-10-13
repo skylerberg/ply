@@ -14,7 +14,7 @@ root=$(cd "$grammar/../.." && pwd)
 paths=$(mktemp)
 trap 'rm -f "$paths"' EXIT
 
-find "$root/crates" "$root/examples" "$root/tests/lang" "$root/benches" \
+find "$root/crates" "$root/examples" "$root/tests/lang" \
   -type f -name '*.ply' \
   ! -path '*/target/*' ! -path '*/bootstrap/*' ! -path '*/phases/*' \
   ! -path "$root/tests/fixtures/*" > "$paths"
