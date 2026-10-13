@@ -1,8 +1,11 @@
 //! `ply doc` — what a name documents, as an agent reads it. A definition: its signature with the
 //! parameter names the source wrote, its doc and clauses, its place, hash and footprint, and the
-//! tests and laws that name it. A law schema: the same, under the schema as it is written. A type,
-//! an effect or a module: its doc and its members'. A builtin: what the prelude declares. A name
-//! the program does not hold is looked for among the builtins, then the shipped modules.
+//! laws that name it. A law schema: the same, under the schema as it is written. A type, an effect
+//! or a module: its doc and its members'. A builtin: what the prelude declares. Each page is read
+//! off what its module answers it documents, which the memo store keeps for a project's modules
+//! and the toolchain carries for the standard library's, so no command parses a module to print
+//! one. A name under `std` is the toolchain's wherever the command runs; any other is looked for
+//! in the program, then among the builtins, then the standard library.
 
 import env (env)
 import compiler.unit (shipped)
@@ -11,136 +14,30 @@ import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
 import diagnostic (Place, spot_of)
-import program (Program, Tables, load_program, published, tables_of, hash_of, unknown_def, noted,
-                pseudo_path, whole_of, program_view)
+import program (Program, timed_over, unknown_def, noted, pseudo_path, is_shipped)
+import program
+import queried (shipped_documented)
 import report (Answer, schema_version, ok_code, indent, refused, reported)
-import sources (is_std, shipped_data, shipped_modules)
+import sources (is_std, load_resolved, shipped_names)
+import sources
 import std.term (Style, bold, dim, plain)
-import compiler.diagnostics (ParsedSource, parse_all)
-import compiler.hash
-import compiler.hash (TheFn)
-import compiler.front (Analysis, View, Analysed, Refused, analyse_shipped, view_of)
-import compiler.infer (DefInfo, TestInfo, LawInfo, Builtin, builtin_named, builtins)
+import compiler.front (Frame, Outline)
+import compiler.infer (Builtin, builtin_named, builtins)
+import compiler.items (parse)
+import compiler.pages (Page, Member, Typed, Pages, Signed, bare_page, lines_of, signature)
 import compiler.prelude_source
-import compiler.items (parse, header, Module, Item, IFn, IType, IEffect, IEffectSet, FnDef, TypeDef,
-                       TDAlias, TDSum, VariantDef, EffectDef, OpDef, EffectSetDef, FieldDoc,
-                       SpecClause, ImportDecl, ReturnsFresh, ReturnsParam, Vis, VPub, VPriv,
-                       TDNominal, SchemaDef, schema_of)
-import compiler.exprs (Param)
-import compiler.parsing (Doc, Ident, Span)
-import compiler.resolve (ParsedModule, Diag, Source, qualify)
-import compiler.type_syntax (TypeExpr, TRecord, ty_span, generics_text)
-import compiler.types (Printer, Scheme, Type, TyFn, printer_new, print_scheme, print_ty, print_row,
-                       scheme_text, row_text)
-import std.bytes
+import compiler.resolve (Diag, qualify)
+import compiler.types (scheme_text)
 import std.fs (fs)
 import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null, strings)
-import std.list (concat, contains, find)
-import std.string (ascii_trim, join, index_of, replace)
+import std.list (contains, find)
+import std.string (join, index_of)
 
-pub type Named = { name: String, ty: String }
+/// A page as an answer prints it: with the module that declares what it documents, and its place
+/// where it has one.
+pub type Placed = { page: Page, module: Option<String>, location: Option<String> }
 
-/// A variant, field or operation of a declaration, or what a module publishes.
-pub type Member = { kind: String, name: String, signature: String, doc: List<String> }
-
-pub type Page = {
-  kind: String,
-  name: String,
-  signature: String,
-  ty: String,
-  params: List<Named>,
-  doc: List<String>,
-  clauses: List<String>,
-  members: List<Member>,
-  module: Option<String>,
-  location: Option<String>,
-  hash: Option<String>,
-  footprint: Option<String>,
-  tests: List<String>,
-  laws: List<String>,
-}
-
-fn bare_page(kind: String, name: String, signature: String) -> Page =
-  {
-    kind: kind,
-    name: name,
-    signature: signature,
-    ty: "",
-    params: [],
-    doc: [],
-    clauses: [],
-    members: [],
-    module: None,
-    location: None,
-    hash: None,
-    footprint: None,
-    tests: [],
-    laws: [],
-  }
-
-// --- The signature ----------------------------------------------------------
-// `prefix name<generics>(p: T, ...) -> R / row`, with the parameters named as the source did and
-// every variable named by one printer, so the generics, the parameters and the row agree.
-
-type Printing = { printer: Printer, pairs: List<Named> }
-
-pub type Signed = { text: String, params: List<Named> }
-
-fn printed_params(
-  printer: Printer,
-  ts: List<Type>,
-  names: List<String>,
-) -> Printing / {abort.raise} =
-  fold(range(0, len(ts)), { printer: printer, pairs: [] }, |acc: Printing, i: Int|
-    match list_at(ts, i) {
-      None -> acc,
-      Some(t) -> {
-        let out = print_ty(acc.printer, t);
-        let written = match list_at(names, i) { Some(n) -> n, None -> "_" ++ int_to_string(i) };
-        {
-          printer: out.printer,
-          pairs: push(acc.pairs, { name: written, ty: string_of_bytes_lossy(out.text) }),
-        }
-      },
-    })
-
-/// What the scheme prints before its first `(`: the quantifier list, or nothing.
-fn generics_of(full: Bytes) -> String / {abort.raise} =
-  match bytes_index_of(full, b"(") {
-    Some(i) -> string_of_bytes_lossy(bytes_slice(full, 0, i)),
-    None -> "",
-  }
-
-pub fn signature(
-  prefix: String,
-  name: String,
-  scheme: Scheme,
-  names: List<String>,
-) -> Signed / {abort.raise} = {
-  let full = print_scheme(printer_new(), scheme);
-  match scheme.ty {
-    TyFn(f) -> {
-      let ps: Printing = printed_params(full.printer, f.params, names);
-      let row = print_row(ps.printer, f.effects);
-      let effects = if row.text == b"{}" { "" } else { " / " ++ string_of_bytes_lossy(row.text) };
-      let ret = print_ty(row.printer, f.ret);
-      {
-        text: prefix ++ name ++ generics_of(full.text) ++ "("
-          ++ join(map(ps.pairs, |named: Named| named.name ++ ": " ++ named.ty), ", ")
-          ++ ") -> "
-          ++ string_of_bytes_lossy(ret.text)
-          ++ effects,
-        params: ps.pairs,
-      }
-    },
-    _ -> { text: prefix ++ name ++ ": " ++ string_of_bytes_lossy(full.text), params: [] },
-  }
-}
-
-// --- Docs -------------------------------------------------------------------
-
-fn lines_of(doc: Option<Doc>) -> List<String> =
-  match doc { Some(d) -> map(d.lines, |l: Bytes| string_of_bytes_lossy(l)), None -> [] }
+fn unplaced(page: Page) -> Placed = { page: page, module: None, location: None }
 
 /// A doc's first sentence: its first paragraph as one line, up to the first `. `.
 pub fn summary_of(doc: List<String>) -> String / {abort.raise} = {
@@ -158,504 +55,7 @@ pub fn summary_of(doc: List<String>) -> String / {abort.raise} = {
   }
 }
 
-/// Written text on one line: comment lines dropped, each line break one space, and no space or
-/// trailing comma left against a closing bracket.
-pub fn one_line(text: String) -> String = {
-  let kept = filter(map(string_split(text, "\n"), |l: String| ascii_trim(l)), |l: String|
-    l != "" && !string_starts_with(l, "//"));
-  let joined = join(kept, " ");
-  let closed = replace(replace(replace(joined, ", )", ")"), ", ]", "]"), ", }", " }");
-  replace(replace(replace(closed, "( ", "("), "[ ", "["), " )", ")")
-}
-
-// --- Where a page reads from ------------------------------------------------------
-
-/// The modules a page is written from: their analysis, its tables, and each one's place by the
-/// index a location names.
-type Documented = { analysis: Analysis, view: View, places: List<Place> }
-
-fn text_of(documented: Documented, module: Int) -> Bytes =
-  match list_at(documented.places, module) { Some(p) -> p.text, None -> b"" }
-
-fn sliced(documented: Documented, module: Int, span: Span) -> String / {abort.raise} = {
-  let text = text_of(documented, module);
-  if span.start > span.end || span.end > bytes_len(text) { "" }
-  else { one_line(string_of_bytes_lossy(bytes_slice(text, span.start, span.end))) }
-}
-
-/// `path:line:col`, one-based, as every other command prints a place.
-fn placed(documented: Documented, module: Int, span: Span) -> Option<String> / {abort.raise} =
-  match list_at(documented.places, module) {
-    None -> None,
-    Some(place) -> {
-      let spot = spot_of(place.text, span.start);
-      Some(place.path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col))
-    },
-  }
-
-fn module_name_at(documented: Documented, module: Int) -> Option<String> =
-  match list_at(documented.analysis.mods, module) {
-    Some(m) -> Some(string_of_bytes_lossy(m.name)),
-    None -> None,
-  }
-
-/// The modules a query could name something in: the one its full name is under, and each that
-/// declares its simple name.
-fn could_name(parsed: ParsedModule, q: Bytes) -> Bool =
-  q == parsed.name || bytes_starts_with(q, bytes_concat(parsed.name, b"."))
-    || len(filter(declared_in(0, parsed), |e: Entry| e.simple == q)) > 0
-    || len(
-      filter(parsed.module.items, |it: Item| match it { IFn(d) -> d.name.name == q, _ -> false }),
-    )
-    > 0
-
-fn imports_of(module: Module) -> List<Bytes> =
-  map(module.imports, |d: ImportDecl| bytes::join(map(d.path, |i: Ident| i.name), b"."))
-
-/// What `src` imports, read off its header where that says all of it.
-fn header_imports(src: Bytes) -> List<Bytes> / {abort.raise} =
-  imports_of(match header(src) { Some(m) -> m, None -> parse(src).node })
-
-/// `names` and every module of `srcs` they import, transitively.
-fn imported_closure(srcs: List<Source>, names: List<Bytes>) -> List<Bytes> / {abort.raise} = {
-  let texts = fold(srcs, map_new(), |acc: Map<Bytes, Bytes>, src: Source|
-    map_insert(acc, src.name, src.src));
-  iterate(
-    { held: names, open: names },
-    len(srcs) + 1,
-    |c: { held: List<Bytes>, open: List<Bytes> }|
-      if len(c.open) == 0 { Stop(c) } else {
-        let found = fold(c.open, [], |acc: List<Bytes>, n: Bytes|
-          match map_get(texts, n) {
-            Some(src) ->
-              fold(header_imports(src), acc, |a: List<Bytes>, m: Bytes|
-                if contains(c.held, m) || contains(a, m) { a } else { push(a, m) }),
-            None -> acc,
-          });
-        Continue({ held: concat(c.held, found), open: found })
-      },
-  ).held
-}
-
-/// Whether `src`, the module `name`, could declare what `q` names, or be what `q` names or the module
-/// of it: a module whose text never spells `q` declares nothing by that name.
-fn could_spell(name: Bytes, src: Bytes, q: Bytes) -> Bool =
-  q == name || bytes_starts_with(q, bytes_concat(name, b".")) || bytes_index_of(src, q) != None
-
-/// The shipped modules a query could name something in, and what they import, analysed apart from any
-/// program: where a name no program holds is looked for. A name none of them declares analyses nothing.
-fn shipped_documented(
-  query: String,
-) -> Option<Documented> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let shipped = shipped_modules();
-  let srcs = filter(shipped, |src: Source| is_std(string_of_bytes_lossy(src.name)));
-  let q = bytes_of_string(query);
-  let parsed = parse_all(filter(srcs, |src: Source| could_spell(src.name, src.src, q)));
-  let wanted = map(filter(parsed, |p: ParsedSource| could_name(p.module, q)), |p: ParsedSource|
-    p.name);
-  if len(wanted) == 0 { None } else {
-    let closure = imported_closure(srcs, wanted);
-    let chosen = filter(srcs, |src: Source| contains(closure, src.name));
-    match analyse_shipped(chosen, shipped, shipped_data(chosen)).out {
-      Refused(_) -> None,
-      Analysed(w) -> {
-        let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, src: Source|
-          map_insert(acc, src.name, src.src));
-        Some({
-          analysis: w,
-          view: view_of(w),
-          places: map(w.mods, |m: ParsedModule|
-            {
-              path: pseudo_path(string_of_bytes_lossy(m.name)),
-              text: match map_get(texts, m.name) { Some(t) -> t, None -> b"" },
-            }),
-        })
-      },
-    }
-  }
-}
-
-// --- What a name can name ----------------------------------------------------------
-
-type Target =
-  | TDef(DefInfo)
-  | TType({ module: Int, def: TypeDef })
-  | TEffect({ module: Int, def: EffectDef })
-  | TOp({ module: Int, effect: EffectDef, op: OpDef })
-  | TSet({ module: Int, def: EffectSetDef })
-  | TModule(Int)
-
-/// `simple` is what a query may name it by alone: a declaration's own name, an operation's
-/// `effect.op`, and nothing for a module, which only its full name names.
-type Entry = { full: Bytes, simple: Bytes, kind: String, target: Target }
-
-fn declared_in(index: Int, parsed: ParsedModule) -> List<Entry> =
-  fold(
-    parsed.module.items,
-    [{ full: parsed.name, simple: b"", kind: "module", target: TModule(index) }],
-    |acc: List<Entry>, it: Item|
-      match it {
-        IType(d) ->
-          push(acc, {
-            full: qualify(parsed.name, d.name.name),
-            simple: d.name.name,
-            kind: "type",
-            target: TType({ module: index, def: d }),
-          }),
-        IEffect(d) -> {
-          let full = qualify(parsed.name, d.name.name);
-          let own = {
-            full: full,
-            simple: d.name.name,
-            kind: "effect",
-            target: TEffect({ module: index, def: d }),
-          };
-          fold(d.ops, push(acc, own), |a: List<Entry>, op: OpDef|
-            push(a, {
-              full: bytes_concat_all([full, b".", op.name.name]),
-              simple: bytes_concat_all([d.name.name, b".", op.name.name]),
-              kind: "operation",
-              target: TOp({ module: index, effect: d, op: op }),
-            }))
-        },
-        IEffectSet(d) ->
-          push(acc, {
-            full: qualify(parsed.name, d.name.name),
-            simple: d.name.name,
-            kind: "effect set",
-            target: TSet({ module: index, def: d }),
-          }),
-        _ -> acc,
-      },
-  )
-
-fn entries_of(documented: Documented) -> List<Entry> = {
-  let defs = map(published(documented.view), |d: DefInfo|
-    { full: d.name, simple: d.simple_name, kind: "definition", target: TDef(d) });
-  fold(range(0, len(documented.analysis.mods)), defs, |acc: List<Entry>, i: Int|
-    match list_at(documented.analysis.mods, i) {
-      Some(m) -> concat(acc, declared_in(i, m)),
-      None -> acc,
-    })
-}
-
-fn entry_label(e: Entry) -> String =
-  if e.kind == "definition" { string_of_bytes_lossy(e.full) }
-  else { string_of_bytes_lossy(e.full) ++ " (" ++ e.kind ++ ")" }
-
-/// The entry a query names: a full name, or a simple name that names exactly one. `Err` holds what a
-/// simple name matched, and is empty when nothing did.
-fn resolved(entries: List<Entry>, query: String) -> Result<Entry, List<String>> = {
-  let q = bytes_of_string(query);
-  match find(entries, |e: Entry| e.full == q) {
-    Some(e) -> Ok(e),
-    None -> {
-      let matching = filter(entries, |e: Entry| e.simple == q);
-      match list_at(matching, 0) {
-        None -> Err([]),
-        Some(e) -> if len(matching) == 1 { Ok(e) } else { Err(map(matching, entry_label)) },
-      }
-    },
-  }
-}
-
-// --- The pages ------------------------------------------------------------------
-
-fn visibility(v: Vis) -> String = match v { VPub -> "pub ", VPriv -> "" }
-
-pub type Written = { public: Bool, reuse: Bool, baked: Bool, params: List<String> }
-
-fn of_fn(d: FnDef) -> Written =
-  {
-    public: match d.vis { VPub -> true, VPriv -> false },
-    reuse: match d.reuse { Some(_) -> true, None -> false },
-    baked: match d.baked { Some(_) -> true, None -> false },
-    params: map(d.params, |p: Param| string_of_bytes_lossy(p.name.name)),
-  }
-
-fn fn_named(parsed: ParsedModule, name: Bytes) -> Option<FnDef> =
-  fold(parsed.module.items, None, |acc: Option<FnDef>, it: Item|
-    match acc {
-      Some(_) -> acc,
-      None -> match it {
-        IFn(d) -> if qualify(parsed.name, d.name.name) == name { Some(d) } else { None },
-        _ -> None,
-      },
-    })
-
-fn fn_signature(def_info: DefInfo, found: Option<FnDef>) -> Signed / {abort.raise} = {
-  let written = match found {
-    Some(d) -> of_fn(d),
-    None -> { public: false, reuse: false, baked: false, params: [] },
-  };
-  let prefix = (if written.public { "pub " } else { "" })
-    ++ (if written.reuse { "reuse " } else { "" })
-    ++ (if written.baked { "const " } else { "" })
-    ++ "fn ";
-  signature(prefix, string_of_bytes_lossy(def_info.simple_name), def_info.scheme, written.params)
-}
-
-/// What a caller may rely on beyond the signature: what the answer shares, then each clause as written.
-fn clauses_of(documented: Documented, module: Int, d: FnDef) -> List<String> / {abort.raise} = {
-  let returns = match d.returns {
-    Some(ReturnsFresh(_)) -> ["returns fresh"],
-    Some(ReturnsParam(p)) -> ["returns " ++ string_of_bytes_lossy(p.name)],
-    None -> [],
-  };
-  concat(returns, map(d.spec, |c: SpecClause| sliced(documented, module, c.span)))
-}
-
-type Naming = { tests: List<String>, laws: List<String> }
-
-/// The tests and laws whose own text names the function `name`: the examples it is shown by.
-fn named_by(documented: Documented, tables: Tables, name: Bytes) -> Naming / {abort.raise} = {
-  let keys = fold(
-    hash::naming(tables.hashes, TheFn(name), false).items,
-    map_new(),
-    |acc: Map<Bytes, Bool>, key: Bytes| map_insert(acc, key, true),
-  );
-  {
-    tests: fold(documented.analysis.checked.tests, [], |acc: List<String>, t: TestInfo|
-      if map_contains(keys, t.key) { push(acc, string_of_bytes_lossy(t.name)) } else { acc }),
-    laws: fold(documented.analysis.checked.laws, [], |acc: List<String>, l: LawInfo|
-      if map_contains(keys, l.key) { push(acc, string_of_bytes_lossy(l.name)) } else { acc }),
-  }
-}
-
-/// A schema as it is written: its parameters, its binders and guard, and the body it claims.
-fn schema_signature(documented: Documented, module: Int, d: SchemaDef) -> String / {abort.raise} =
-  visibility(d.vis) ++ sliced(documented, module, d.span)
-
-/// A definition a schema declares is documented as the schema: what it is written as, and the laws
-/// that instantiate it.
-fn definition_page(
-  documented: Documented,
-  tables: Tables,
-  def_info: DefInfo,
-) -> Page / {abort.raise} = {
-  let module = def_info.at.module;
-  let parsed = list_at(documented.analysis.mods, module);
-  let found = match parsed { Some(m) -> fn_named(m, def_info.name), None -> None };
-  let schema = match ((parsed, found)) { (Some(m), Some(d)) -> schema_of(m.module, d), _ -> None };
-  let signed: Signed = fn_signature(def_info, found);
-  let naming = named_by(documented, tables, def_info.name);
-  {
-    kind: match schema { Some(_) -> "law schema", None -> "definition" },
-    name: string_of_bytes_lossy(def_info.name),
-    signature: match schema {
-      Some(d) -> schema_signature(documented, module, d),
-      None -> signed.text,
-    },
-    ty: string_of_bytes_lossy(scheme_text(def_info.scheme)),
-    params: signed.params,
-    doc: match found { Some(d) -> lines_of(d.doc), None -> [] },
-    clauses: match found { Some(d) -> clauses_of(documented, module, d), None -> [] },
-    members: [],
-    module: Some(string_of_bytes_lossy(def_info.module)),
-    location: placed(documented, module, def_info.at.span),
-    hash: hash_of(tables, def_info.name),
-    footprint: Some(string_of_bytes_lossy(row_text({ atoms: def_info.footprint, tail: None }))),
-    tests: naming.tests,
-    laws: naming.laws,
-  }
-}
-
-fn type_head(d: TypeDef) -> String =
-  visibility(d.vis) ++ (if d.opaque == None { "" } else { "opaque " }) ++ "type "
-    ++ string_of_bytes_lossy(d.name.name)
-    ++ string_of_bytes_lossy(generics_text(d.generics))
-
-fn field_doc(docs: List<FieldDoc>, name: Bytes) -> List<String> =
-  match find(docs, |f: FieldDoc| f.name == name) { Some(f) -> lines_of(Some(f.doc)), None -> [] }
-
-fn type_signature(documented: Documented, module: Int, d: TypeDef) -> String / {abort.raise} =
-  match d.body {
-    TDAlias(t) -> match t {
-      TRecord(_) -> type_head(d),
-      _ -> type_head(d) ++ " = " ++ sliced(documented, module, ty_span(t)),
-    },
-    // Its fields are its members, as an alias's are; the head says it is a type of its own.
-    TDNominal(_) -> type_head(d) ++ " = new { .. }",
-    TDSum(_) -> type_head(d),
-  }
-
-fn type_members(documented: Documented, module: Int, d: TypeDef) -> List<Member> / {abort.raise} =
-  match d.body {
-    // An opaque sum's constructors are its module's alone, so they are no part of what it publishes.
-    TDSum(vs) -> if d.opaque != None { [] } else {
-      map(vs, |v: VariantDef|
-        {
-          kind: "variant",
-          name: string_of_bytes_lossy(v.name.name),
-          signature: sliced(documented, module, v.span),
-          doc: lines_of(v.doc),
-        })
-    },
-    TDAlias(t) -> field_members(documented, module, d, t),
-    TDNominal(t) -> field_members(documented, module, d, t),
-  }
-
-fn field_members(
-  documented: Documented,
-  module: Int,
-  d: TypeDef,
-  t: TypeExpr,
-) -> List<Member> / {abort.raise} =
-  match t {
-    TRecord(r) ->
-      map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-        {
-          kind: "field",
-          name: string_of_bytes_lossy(f.name.name),
-          signature: string_of_bytes_lossy(f.name.name) ++ ": "
-            ++ sliced(documented, module, ty_span(f.ty)),
-          doc: field_doc(d.field_docs, f.name.name),
-        }),
-    _ -> [],
-  }
-
-/// A declaration's page: its place, and its hash where the program hashes one under its name.
-fn declared_page(
-  documented: Documented,
-  tables: Tables,
-  kind: String,
-  full: Bytes,
-  module: Int,
-  span: Span,
-) -> Page / {abort.raise} =
-  {
-    ..bare_page(kind, string_of_bytes_lossy(full), ""),
-    module: module_name_at(documented, module),
-    location: placed(documented, module, span),
-    hash: hash_of(tables, full),
-  }
-
-fn effect_head(d: EffectDef) -> String =
-  visibility(d.vis) ++ (if d.is_nondet { "nondet " } else { "" }) ++ "effect "
-    ++ string_of_bytes_lossy(d.name.name)
-
-fn op_member(documented: Documented, module: Int, op: OpDef) -> Member / {abort.raise} =
-  {
-    kind: "operation",
-    name: string_of_bytes_lossy(op.name.name),
-    signature: sliced(documented, module, op.span),
-    doc: lines_of(op.doc),
-  }
-
-fn set_signature(documented: Documented, module: Int, d: EffectSetDef) -> String / {abort.raise} =
-  visibility(d.vis) ++ sliced(documented, module, d.span)
-
-/// What a module publishes, in its order, each with its signature and doc.
-fn module_members(
-  documented: Documented,
-  module: Int,
-  parsed: ParsedModule,
-) -> List<Member> / {abort.raise} = {
-  let defs = fold(published(documented.view), map_new(), |acc: Map<Bytes, DefInfo>, d: DefInfo|
-    map_insert(acc, d.name, d));
-  fold(parsed.module.items, [], |acc: List<Member>, it: Item|
-    match it {
-      IFn(d) -> match d.vis {
-        VPriv -> acc,
-        VPub -> match ((
-            map_get(defs, qualify(parsed.name, d.name.name)),
-            schema_of(parsed.module, d),
-          )) {
-          (None, _) -> acc,
-          (Some(def_info), None) ->
-            push(acc, {
-              kind: "definition",
-              name: string_of_bytes_lossy(d.name.name),
-              signature: fn_signature(def_info, Some(d)).text,
-              doc: lines_of(d.doc),
-            }),
-          // A schema is listed once, as itself, and not again as the definition its guard is.
-          (Some(_), Some(schema)) -> if schema.name.name != d.name.name { acc } else {
-            push(acc, {
-              kind: "law schema",
-              name: string_of_bytes_lossy(d.name.name),
-              signature: schema_signature(documented, module, schema),
-              doc: lines_of(d.doc),
-            })
-          },
-        },
-      },
-      IType(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
-          push(acc, {
-            kind: "type",
-            name: string_of_bytes_lossy(d.name.name),
-            signature: type_signature(documented, module, d),
-            doc: lines_of(d.doc),
-          }),
-      },
-      IEffect(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
-          push(acc, {
-            kind: "effect",
-            name: string_of_bytes_lossy(d.name.name),
-            signature: effect_head(d),
-            doc: lines_of(d.doc),
-          }),
-      },
-      IEffectSet(d) -> match d.vis {
-        VPriv -> acc,
-        VPub ->
-          push(acc, {
-            kind: "effect set",
-            name: string_of_bytes_lossy(d.name.name),
-            signature: set_signature(documented, module, d),
-            doc: lines_of(d.doc),
-          }),
-      },
-      _ -> acc,
-    })
-}
-
-fn page_of(documented: Documented, e: Entry) -> Page / {abort.raise} = {
-  let tables = tables_of(documented.analysis.hashes);
-  match e.target {
-    TDef(d) -> definition_page(documented, tables, d),
-    TType(x) ->
-      {
-        ..declared_page(documented, tables, "type", e.full, x.module, x.def.span),
-        signature: type_signature(documented, x.module, x.def),
-        doc: lines_of(x.def.doc),
-        members: type_members(documented, x.module, x.def),
-      },
-    TEffect(x) ->
-      {
-        ..declared_page(documented, tables, "effect", e.full, x.module, x.def.span),
-        signature: effect_head(x.def),
-        doc: lines_of(x.def.doc),
-        members: map(x.def.ops, |op: OpDef| op_member(documented, x.module, op)),
-      },
-    TOp(x) ->
-      {
-        ..declared_page(documented, tables, "operation", e.full, x.module, x.op.span),
-        signature: sliced(documented, x.module, x.op.span),
-        doc: lines_of(x.op.doc),
-      },
-    TSet(x) ->
-      {
-        ..declared_page(documented, tables, "effect set", e.full, x.module, x.def.span),
-        signature: set_signature(documented, x.module, x.def),
-        doc: lines_of(x.def.doc),
-      },
-    TModule(i) -> match list_at(documented.analysis.mods, i) {
-      None -> bare_page("module", string_of_bytes_lossy(e.full), string_of_bytes_lossy(e.full)),
-      Some(parsed) ->
-        {
-          ..bare_page("module", string_of_bytes_lossy(e.full), string_of_bytes_lossy(e.full)),
-          doc: lines_of(parsed.module.doc),
-          members: module_members(documented, i, parsed),
-          location: match list_at(documented.places, i) { Some(p) -> Some(p.path), None -> None },
-        },
-    },
-  }
-}
+// --- The prelude ------------------------------------------------------------------
 
 fn builtin_signature(found: Builtin) -> Signed / {abort.raise} =
   signature(
@@ -703,22 +103,135 @@ fn unknown_name(query: String, names: List<String>) -> Diag = {
   else { noted(d, b"a builtin is named by its bare name, as in `ply doc map`") }
 }
 
-type Lookup = | Found(Page) | Many(List<String>) | Nothing
+/// A page, beside the module that documents it.
+type Held = { module: Bytes, page: Page }
 
-/// A name the program does not hold: a builtin's, else a shipped module's.
-fn elsewhere(query: String) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  if query == "prelude" { Found(prelude_page()) } else {
-    match builtin_page(query) {
-      Some(page) -> Found(page),
-      None -> match shipped_documented(query) {
-        None -> Nothing,
-        Some(documented) -> match resolved(entries_of(documented), query) {
-          Ok(e) -> Found(page_of(documented, e)),
-          Err(names) -> if len(names) > 0 { Many(names) } else { Nothing },
-        },
-      },
+type Lookup = | Found(Placed) | Many(List<String>) | Nothing
+
+/// The modules a full name may be under: each whose name it is, or leads it.
+fn holding(modules: List<Bytes>, q: Bytes) -> List<Bytes> =
+  filter(modules, |m: Bytes| q == m || bytes_starts_with(q, bytes_concat(m, b".")))
+
+/// Each page of each of `modules`, as `documented` answers them in that order.
+fn held_of(modules: List<Bytes>, documented: List<Pages>) -> List<Held> =
+  fold(range(0, len(modules)), [], |acc: List<Held>, i: Int|
+    match ((list_at(modules, i), list_at(documented, i))) {
+      (Some(m), Some(d)) ->
+        fold(d.pages, acc, |held: List<Held>, page: Page| push(held, { module: m, page: page })),
+      _ -> acc,
+    })
+
+fn label(h: Held) -> String =
+  if h.page.kind == "definition" { h.page.name } else { h.page.name ++ " (" ++ h.page.kind ++ ")" }
+
+/// The page a query names: a full name, or a simple name that names exactly one. `Err` holds what a
+/// simple name matched, and is empty when nothing did.
+fn resolved(held: List<Held>, query: String) -> Result<Held, List<String>> =
+  match find(held, |h: Held| h.page.name == query) {
+    Some(h) -> Ok(h),
+    None -> match filter(held, |h: Held| h.page.simple == query) {
+      [] -> Err([]),
+      [only] -> Ok(only),
+      many -> Err(map(many, label)),
+    },
+  }
+
+/// `path:line:col`, one-based, as every other command prints a place.
+fn place_in(path: String, text: Bytes, at: Int) -> String / {abort.raise} = {
+  let spot = spot_of(text, at);
+  path ++ ":" ++ int_to_string(spot.line) ++ ":" ++ int_to_string(spot.col)
+}
+
+/// A page of a module read at `path`, whose text is `text`: a module's own page stands at its file,
+/// and any other where the text declares it.
+fn placed(h: Held, path: String, text: Bytes) -> Placed / {abort.raise} =
+  if h.page.kind == "module" { { page: h.page, module: None, location: Some(path) } } else {
+    {
+      page: h.page,
+      module: Some(string_of_bytes_lossy(h.module)),
+      location: Some(place_in(path, text, h.page.at)),
     }
   }
+
+fn looked<| e>(
+  found: Result<Held, List<String>>,
+  place: (Held) -> Placed / {abort.raise | e},
+) -> Lookup / {abort.raise | e} =
+  match found {
+    Ok(h) -> Found(place(h)),
+    Err(names) -> if len(names) > 0 { Many(names) } else { Nothing },
+  }
+
+/// What a simple name's first word is: the declaration an `effect.op` is under, or the name itself.
+fn head_of(q: Bytes) -> Bytes / {abort.raise} =
+  match bytes_index_of(q, b".") { Some(i) -> bytes_slice(q, 0, i), None -> q }
+
+/// A name among the standard library's modules: under the module that leads a full name, or in
+/// whichever declares a simple one.
+fn shipped_named(
+  query: String,
+) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} = {
+  let q = bytes_of_string(query);
+  let std = filter(shipped_names(), |n: Bytes| is_std(string_of_bytes_lossy(n)));
+  let under = holding(std, q);
+  let asked = if len(under) > 0 { under } else { std };
+  looked(resolved(held_of(asked, shipped_documented(asked)), query), |h: Held| {
+    let module = string_of_bytes_lossy(h.module);
+    placed(h, pseudo_path(module), match fs.read_file[shipped](module ++ ".ply") {
+      Some(text) -> text,
+      None -> b"",
+    })
+  })
+}
+
+/// A name the program does not hold: a builtin's, else one of the standard library's.
+fn elsewhere(
+  query: String,
+) -> Lookup / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
+  if query == "prelude" { Found(unplaced(prelude_page())) } else {
+    match builtin_page(query) { Some(page) -> Found(unplaced(page)), None -> shipped_named(query) }
+  }
+
+/// Whether the module `o` outlines could declare what a simple name whose first word is `head`
+/// names: a function, a type or an effect its outline lists, or an effect set, which it does not.
+fn could_declare(o: Outline, head: Bytes) -> Bool =
+  len(o.set_texts) > 0 || contains(o.declared, qualify(o.name, head))
+
+/// A name among a load's modules, its own and each it pulled: under the module that leads a full
+/// name, or in whichever could declare a simple one.
+fn in_program(
+  flags: Flags,
+  project: sources::Project,
+  loaded: Program,
+  frame: Frame,
+) -> Lookup / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.answer, abort.raise} = {
+  let q = bytes_of_string(flags.query);
+  let under = holding(map(frame.outlines, |o: Outline| o.name), q);
+  let asked = if len(under) > 0 { under } else {
+    let head = head_of(q);
+    map(filter(frame.outlines, |o: Outline| could_declare(o, head)), |o: Outline| o.name)
+  };
+  let documented = program::documented(
+    flags.paths,
+    project,
+    map(asked, |m: Bytes|
+      { module: m, shipped: is_shipped(string_of_bytes_lossy(m)), tested: false }),
+  );
+  looked(resolved(held_of(asked, documented), flags.query), |h: Held| {
+    let at = fold(range(0, len(frame.outlines)), None, |found: Option<Place>, i: Int|
+      match found {
+        Some(_) -> found,
+        None -> match list_at(frame.outlines, i) {
+          Some(o) -> if o.name == h.module { list_at(loaded.places, i) } else { None },
+          None -> None,
+        },
+      });
+    match at {
+      Some(place) -> placed(h, place.path, place.text),
+      None -> { page: h.page, module: Some(string_of_bytes_lossy(h.module)), location: None },
+    }
+  })
+}
 
 // --- The answer -----------------------------------------------------------------
 
@@ -735,7 +248,8 @@ fn member_json(m: Member) -> Json / {abort.raise} =
     { key: "summary", value: Str(summary_of(m.doc)) },
   ])
 
-fn page_json(page: Page) -> Json / {abort.raise} =
+fn page_json(p: Placed) -> Json / {abort.raise} = {
+  let page = p.page;
   object([
     { key: "command", value: Str("doc") },
     { key: "schema_version", value: Number(decimal_of_int(schema_version())) },
@@ -748,7 +262,7 @@ fn page_json(page: Page) -> Json / {abort.raise} =
     {
       key: "params",
       value: Array(
-        map(page.params, |named: Named|
+        map(page.params, |named: Typed|
           object([{ key: "name", value: Str(named.name) }, { key: "type", value: Str(named.ty) }])),
       ),
     },
@@ -756,13 +270,13 @@ fn page_json(page: Page) -> Json / {abort.raise} =
     { key: "summary", value: Str(summary_of(page.doc)) },
     { key: "clauses", value: strings(page.clauses) },
     { key: "members", value: Array(map(page.members, member_json)) },
-    { key: "module", value: string_or_null(page.module) },
-    { key: "location", value: string_or_null(page.location) },
+    { key: "module", value: string_or_null(p.module) },
+    { key: "location", value: string_or_null(p.location) },
     { key: "hash", value: string_or_null(page.hash) },
     { key: "footprint", value: string_or_null(page.footprint) },
-    { key: "tests", value: strings(page.tests) },
     { key: "laws", value: strings(page.laws) },
   ])
+}
 
 fn said(style: Style, label: String, value: Option<String>, lines: List<String>) -> List<String> =
   match value { None -> lines, Some(v) -> push(lines, indent() ++ dim(style, label) ++ " " ++ v) }
@@ -788,7 +302,8 @@ fn member_lines(whole: Bool, m: Member, lines: List<String>) -> List<String> / {
 /// A line of prose under a heading; an empty one stays empty rather than ending in blanks.
 fn deep(l: String) -> String = if l == "" { "" } else { indent() ++ indent() ++ l }
 
-pub fn page_text(style: Style, page: Page) -> List<String> / {abort.raise} = {
+pub fn page_text(style: Style, p: Placed) -> List<String> / {abort.raise} = {
+  let page = p.page;
   let head = fold(
     page.doc,
     ["", indent() ++ bold(style, page.signature)],
@@ -798,51 +313,64 @@ pub fn page_text(style: Style, page: Page) -> List<String> / {abort.raise} = {
     push(acc, indent() ++ indent() ++ dim(style, c)));
   let members = fold(page.members, clauses, |acc: List<String>, m: Member|
     member_lines(page.kind != "module", m, acc));
-  let placed = said(style, "at", page.location, push(members, ""));
-  let touched = said(style, "touches", page.footprint, placed);
+  let stood = said(style, "at", p.location, push(members, ""));
+  let touched = said(style, "touches", page.footprint, stood);
   let hashed = said(style, "hash", page.hash, touched);
-  let tested = listed(style, "tests", page.tests, hashed);
-  let lawed = listed(style, "laws", page.laws, tested);
-  let kinded = match page.location {
+  let lawed = listed(style, "laws", page.laws, hashed);
+  let kinded = match p.location {
     Some(_) -> lawed,
     None -> push(lawed, indent() ++ dim(style, "kind") ++ " " ++ page.kind),
   };
   push(kinded, "")
 }
 
-fn answered(style: Style, page: Page) -> Answer / {abort.raise} =
-  { json: page_json(page), lines: page_text(style, page), errs: [], code: ok_code() }
+fn answered(style: Style, p: Placed) -> Answer / {abort.raise} =
+  { json: page_json(p), lines: page_text(style, p), errs: [], code: ok_code() }
 
+/// The answer for a name no program holds: a builtin's page or a standard library module's, else
+/// `fallback`, what refused the program, or that nothing is so named, beside `more`.
 fn looked_elsewhere(
   style: Style,
   query: String,
-  program: Program,
+  places: List<Place>,
   fallback: List<Diag>,
-) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
+  more: List<Diag>,
+) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
   match elsewhere(query) {
-    Found(page) -> answered(style, page),
-    Many(names) -> reported(style, "doc", [unknown_name(query, names)], program.places),
-    Nothing -> if len(fallback) > 0 { refused(style, "doc", fallback, program.places) }
-    else { reported(style, "doc", [unknown_name(query, [])], program.places) },
+    Found(p) -> answered(style, p),
+    Many(names) -> reported(style, "doc", [unknown_name(query, names)], places),
+    Nothing -> if len(fallback) > 0 { refused(style, "doc", fallback, places) }
+    else { reported(style, "doc", push_all([unknown_name(query, [])], more), places) },
   }
+
+fn push_all(to: List<Diag>, more: List<Diag>) -> List<Diag> =
+  fold(more, to, |acc: List<Diag>, d: Diag| push(acc, d))
+
+/// The page for a name where no package holds the working directory: a builtin's or a standard
+/// library module's, which no project decides. `nowhere` says so beside a name neither holds.
+pub fn unrooted(
+  flags: Flags,
+  nowhere: Diag,
+) -> Answer / {fs.list_dir[shipped], fs.read_file[shipped], shipped.answer, abort.raise} =
+  looked_elsewhere(style_of(flags), flags.query, [], [], [nowhere])
 
 pub fn run(
   flags: Flags,
-) -> Answer / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise, diverges, shipped.reached} = {
-  let loaded: Program = load_program(flags.paths);
+) -> Answer / {shipped.answer, env.reused[sys], builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, abort.raise, diverges, shipped.reached} = {
   let s = style_of(flags);
-  match ((program_view(loaded), whole_of(loaded))) {
-    (_, Err(diags)) -> looked_elsewhere(s, flags.query, loaded, diags),
-    (None, Ok(_)) -> looked_elsewhere(s, flags.query, loaded, loaded.diags),
-    (Some(v), Ok(w)) -> {
-      let documented = { analysis: w, view: v, places: loaded.places };
-      match resolved(entries_of(documented), flags.query) {
-        Ok(e) -> answered(s, page_of(documented, e)),
-        Err(names) -> if len(names) > 0 {
-          reported(s, "doc", [unknown_name(flags.query, names)], loaded.places)
-        } else { looked_elsewhere(s, flags.query, loaded, []) },
-      }
-    },
+  // `std` is the toolchain's: its pages are the same wherever the command runs, and no project is
+  // read for one.
+  if is_std(flags.query) { looked_elsewhere(s, flags.query, [], [], []) } else {
+    let project = load_resolved(flags.paths);
+    let loaded: Program = timed_over(flags.paths, project, time.elapsed_ms()).program;
+    match loaded.frame {
+      None -> looked_elsewhere(s, flags.query, loaded.places, loaded.diags, []),
+      Some(frame) -> match in_program(flags, project, loaded, frame) {
+        Found(p) -> answered(s, p),
+        Many(names) -> reported(s, "doc", [unknown_name(flags.query, names)], loaded.places),
+        Nothing -> looked_elsewhere(s, flags.query, loaded.places, [], []),
+      },
+    }
   }
 }
 
@@ -861,25 +389,12 @@ test "a doc's summary is its first sentence, its first paragraph joined into one
   assert_eq(summary_of([]), "")
 }
 
-test "written text reads on one line, without a comment or a closing comma" {
-  assert_eq(
-    one_line("read walk[r](\n    path: String,\n  ) -> Option<List<Entry>>"),
-    "read walk[r](path: String) -> Option<List<Entry>>",
-  );
-  assert_eq(
-    one_line("{\n  // the label\n  name: String,\n  size: Int,\n}"),
-    "{ name: String, size: Int }",
-  )
-}
-
 test "a builtin prints with the parameter names and the doc the prelude declares" {
   match builtin_page("map") {
     None -> panic("`map` is a builtin"),
     Some(page) -> {
       assert_eq(page.kind, "builtin");
-      assert_eq(page.signature, "map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e");
-      assert_eq(page.module, None);
-      assert_eq(page.location, None)
+      assert_eq(page.signature, "map<a, b | e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e")
     },
   };
   match builtin_page("list_at") {
@@ -908,13 +423,46 @@ test "a name nothing declares is `E0101`, and an ambiguous one says which" {
   assert_eq(many.notes_text, [b"one of: a.total, b.total (effect)"])
 }
 
+/// The pages two modules document, each beside its module.
+fn two_modules() -> List<Held> =
+  held_of([b"a", b"b"], [
+    {
+      pages: [
+        bare_page("module", "a", "a"),
+        { ..bare_page("definition", "a.total", "fn total() -> Int"), simple: "total" },
+        {
+          ..bare_page("operation", "a.ledger.record", "write record() -> Unit"),
+          simple: "ledger.record",
+        },
+      ],
+    },
+    {
+      pages: [
+        bare_page("module", "b", "b"),
+        { ..bare_page("effect", "b.total", "effect total"), simple: "total" },
+      ],
+    },
+  ])
+
+test "a query names a page by its full name, or by a simple name only one page goes by" {
+  let named = |query: String|
+    match resolved(two_modules(), query) { Ok(h) -> [h.page.name], Err(names) -> names };
+  assert_eq(named("a.total"), ["a.total"]);
+  assert_eq(named("b"), ["b"]);
+  assert_eq(named("ledger.record"), ["a.ledger.record"]);
+  assert_eq(named("total"), ["a.total", "b.total (effect)"]);
+  assert_eq(named("nothing_here"), []);
+  // A full name is under the module that leads it, and under no other.
+  assert_eq(holding([b"a", b"ab", b"a.b"], b"a.b.c"), [b"a", b"a.b"])
+}
+
 test "a page with no place names its kind instead" {
   let page: Page = {
     ..bare_page("builtin", "len", "len<a>(xs: List<a>) -> Int"),
     ty: "<a>(List<a>) -> Int",
     params: [{ name: "xs", ty: "List<a>" }],
   };
-  assert_eq(page_text(plain(), page), [
+  assert_eq(page_text(plain(), unplaced(page)), [
     "",
     "   len<a>(xs: List<a>) -> Int",
     "",
@@ -929,16 +477,16 @@ test "a module lists each member by summary, and a type gives each member its wh
   ];
   assert_eq(
     page_text(plain(), {
-      ..bare_page("module", "m", "m"),
-      members: members,
+      page: { ..bare_page("module", "m", "m"), members: members },
+      module: None,
       location: Some("m.ply"),
     }),
     ["", "   m", "", "   pub fn one() -> Int", "      One.", "", "   at m.ply", ""],
   );
   assert_eq(
     page_text(plain(), {
-      ..bare_page("type", "m.T", "type T"),
-      members: members,
+      page: { ..bare_page("type", "m.T", "type T"), members: members },
+      module: Some("m"),
       location: Some("m.ply:1:1"),
     }),
     [
@@ -952,6 +500,29 @@ test "a module lists each member by summary, and a type gives each member its wh
       "",
     ],
   )
+}
+
+test "a page says the laws that name what it documents, and where it stands by line and column" {
+  let h: Held = {
+    module: b"m",
+    page: {
+      ..bare_page("definition", "m.twice", "pub fn twice(n: Int) -> Int"),
+      simple: "twice",
+      at: 12,
+      laws: ["twice doubles"],
+    },
+  };
+  let p = placed(h, "m.ply", b"// a line\n  fn twice");
+  assert_eq(p.module, Some("m"));
+  assert_eq(p.location, Some("m.ply:2:3"));
+  assert_eq(page_text(plain(), p), [
+    "",
+    "   pub fn twice(n: Int) -> Int",
+    "",
+    "   at m.ply:2:3",
+    "   laws \"twice doubles\"",
+    "",
+  ])
 }
 
 test "the prelude is a module page: its doc and every builtin with its own" {
