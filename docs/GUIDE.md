@@ -1255,8 +1255,11 @@ literals, so a match over one ends in a `_` arm.
 |r: Result<Int, E>| -> Result<Int, E> { Ok(r? + 1) }
 ```
 
-Annotations are optional (usually needed on the element of a `fold` or `map`
-over records). A lambda captures by value, and its row flows into the enclosing
+Annotations are optional. A parameter written without one is what the call the
+lambda is handed to expects there, where the arguments before it settle that:
+in `map(accounts, |a| a.balance)` `a` is an `Account`. One nothing settles is
+inferred from how the body uses it, which reads no field and calls nothing on
+it (`E0201`). A lambda captures by value, and its row flows into the enclosing
 function's. A written return type requires a block body and enables `?` inside
 it.
 
@@ -1271,6 +1274,11 @@ known where the call stands: a type parameter and a function have none to call
 (`E0201`), and a type with no function of the name is `E0101`. A label is
 written as on any call, `s.note[audit]()`.
 
+`value.m::f(args)` is `m::f(value, args)`, whatever the value's type: a
+function that is no function of the type takes its place in a chain,
+`text.trim().parse::number()`. `m` is a module or a type in scope, as before
+any `::`.
+
 A bare name before the dot is read by what it names: a binding makes
 `x.name(..)` a call on its value, and anything else a perform of the effect `x`
 (§6.3). A binding and an effect of one name, in scope where such a call
@@ -1279,9 +1287,10 @@ stands, is `E0105`.
 Positional arguments fill parameters left to right; the rest must be named
 (`greet("ada", greeting: "hey")`) or defaulted. A positional argument after a
 named one is `E0124`; an unknown or repeated name `E0123`; too few arguments
-`E0202`; a parameter left unfilled in a call that used names `E0125`. Only a
-callee reached by name takes named arguments and defaults, so a call on a
-value writes every argument by position, or is written `T::name(value, ..)`.
+`E0202`; a parameter left unfilled in a call that used names `E0125`. A call on
+a value fills the parameters after the value the same way,
+`s.scaled(by: 3)`. A callee that is itself a value, a lambda or a function a
+field holds, has no parameter to name (`E0123`), and neither has an operation.
 There is no partial application.
 
 ### 5.5 Record update
@@ -2846,7 +2855,8 @@ module `ply std` lists, whichever of them the project imports.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one
-operation of an effect; and `ply std --show std.json` prints one source, `ply
+operation of an effect, and `ply doc` of a type what it is made of and its
+functions (§3.1), each of which `ply doc Stack::size` documents; and `ply std --show std.json` prints one source, `ply
 std --show` alone every one. A shipped module embeds (§3.4) data files `ply`
 ships beside it, each named by its place below the library (`std/oid/names.txt`):
 `ply std` lists them with the module that embeds each, `ply std --show
