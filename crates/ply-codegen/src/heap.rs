@@ -1315,6 +1315,11 @@ impl Heap {
         tally.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
     }
 
+    /// How many objects are live.
+    pub fn live(&self) -> usize {
+        self.live_by_kind().iter().map(|(_, n, _)| n).sum()
+    }
+
     /// The bytes of the memory holding the entry's objects, whatever is live in it.
     pub fn held(&self) -> usize {
         self.blocks.held()
