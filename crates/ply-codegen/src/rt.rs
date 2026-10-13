@@ -4814,6 +4814,14 @@ pub unsafe extern "C" fn rt_list_fits(_ctx: *mut Ctx, value: i64, len: i64, exac
     i64::from(if exact != 0 { n == len } else { n >= len })
 }
 
+/// An empty list with room in its tail for `n` elements, at most a leaf's: a loop pushing that
+/// many onto it grows it in place.
+pub unsafe extern "C" fn rt_list_room(ctx: *mut Ctx, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap
+        .alloc_list(n.clamp(0, crate::list::WIDTH as i64) as u32) as Word
+}
+
 /// One element of a list, once [`rt_list_fits`] has admitted its length: held once more. Reads.
 pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
