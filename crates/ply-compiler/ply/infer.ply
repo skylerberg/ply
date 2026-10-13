@@ -15,8 +15,8 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin, deriver_bin,
-              instance_kind_bin)
+              member_name, NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin,
+              deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
@@ -55,7 +55,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error, closed_ctor, closed_notes,
-                find_module_binding)
+                find_module_binding, find_of_type, declaring_type)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
                 expand_tagged, expand_holds)
@@ -245,6 +245,17 @@ type Maybe = { callee: Bytes, param: Option<Int>, span: Span }
 type Repeated = { var: Int, over: Option<Span>, maybe: List<Maybe> }
 /// A call of a function of the module being checked.
 type OwnCall = { callee: Bytes, span: Span }
+/// A call on a value, `base.name(args)`, that is a call of a function of the value's type: the
+/// expression at `span` calls `qualifier::name` with the value first, or the bare `name` where
+/// `qualifier` is empty. `callee` is the function's qualified name.
+pub type MemberSite = {
+  module: Int,
+  span: Span,
+  qualifier: Bytes,
+  name: Bytes,
+  callee: Bytes,
+  owner: Bytes,
+}
 /// A tagged literal whose tag's function `name` is one of the module being checked.
 type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
 type OpKey = { effect: Bytes, op: Bytes, resource: Resource }
@@ -577,6 +588,7 @@ type Checker = {
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
+  member_sites: List<MemberSite>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
@@ -1523,7 +1535,10 @@ fn unresolved_in_derived(checker: Checker, qname: QName, what: Bytes) -> Checker
 fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Checker / {abort.raise} =
   match qname.module {
     None -> checker,
-    Some(binder) -> {
+    Some(binder) -> if namespace == ValueSpace
+        && declaring_type(checker.resolved, checker.module, binder.name) != None {
+      no_function_of(checker, binder.name, qname.name)
+    } else {
       let scope = scope_of(checker);
       match fold(
           scope.modules,
@@ -4110,7 +4125,8 @@ fn field_hint(fields: List<Field>, name: Bytes, met: Meetings) -> Option<Hint> =
 /// call, which is the iteration its body repeats with. Each is expected at its parameter's type:
 /// `params` are the callee's, and `met` what its answer has met. `ranged` is the lambda called
 /// with each element of a `range`. `waits` is the callee where its counts are not in yet: each
-/// lambda may be one it repeats.
+/// lambda may be one it repeats. `first` is the callee's first argument where it is typed
+/// already, the value a call is made on: `exprs` are then the arguments after it.
 fn infer_args(
   checker: Checker,
   exprs: List<Expr>,
@@ -4120,12 +4136,22 @@ fn infer_args(
   params: List<Type>,
   met: Meetings,
   ranged: Option<Ranged>,
+  first: Option<Type> = None,
 ) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} = {
+  let before = match first { Some(_) -> 1, None -> 0 };
   let walked = fold(
-    range(0, len(exprs)),
-    { checker: checker, tys: [], row: row_empty(), met: met },
+    range(before, before + len(exprs)),
+    {
+      checker: checker,
+      tys: match first { Some(ty) -> [ty], None -> [] },
+      row: row_empty(),
+      met: match ((first, list_at(params, 0))) {
+        (Some(ty), Some(p)) -> Meeting({ expected: p, found: ty, before: met }),
+        _ -> met,
+      },
+    },
     |acc: { checker: Checker, tys: List<Type>, row: Row, met: Meetings }, i: Int| {
-      let x = at(exprs, i);
+      let x = at(exprs, i - before);
       let param = list_at(params, i);
       let hint = match param { Some(p) -> Some({ ty: p, met: acc.met }), None -> None };
       let lambda = match x { ELambda(_) -> true, _ -> false };
@@ -4651,7 +4677,19 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         row: items.row,
       }
     },
-    EPerform(p) -> infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args),
+    EPerform(p) -> if !on_a_local(checker, p.eff) {
+      infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args)
+    } else {
+      infer_dotted(
+        p.span,
+        infer_var(both_named(checker, p.eff), p.eff),
+        EVar({ span: p.eff.span, name: p.eff }),
+        p.op,
+        p.args,
+        match p.resource { Some(r) -> [r], None -> [] },
+        hint,
+      )
+    },
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
     EWithHold(c) ->
@@ -5536,8 +5574,141 @@ fn infer_app(
       None ->
         infer_app_general(operator_hidden(checker, func, args), span, func, args, labels, hint),
     },
+    EField(f) -> infer_dotted(span, infer(checker, f.base), f.base, f.field, args, labels, hint),
     _ -> infer_app_general(checker, span, func, args, labels, hint),
   }
+
+/// What `of`, the head of a receiver's type, has for a function `name`: the name a call of it is
+/// written with and what it is declared as.
+fn member_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} =
+  match find_of_type(checker.resolved, checker.module, of, name.name) {
+    Some(b) ->
+      Some({
+        qname: { module: Some({ name: of, span: name.span }), name: name, span: name.span },
+        callee: b.qualified,
+      }),
+    // A type of the language's: the prelude declares its functions under the type's name.
+    None -> {
+      let declared = member_name(of, name.name);
+      if env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) { None }
+      else {
+        Some({
+          qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+          callee: declared,
+        })
+      }
+    },
+  }
+
+/// Whether `of` is a type a module declares, which the prelude has no function of.
+fn module_declares(checker: Checker, of: Bytes) -> Bool =
+  map_contains(checker.types, of) || map_contains(checker.nominals, of)
+
+fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.raise} =
+  report_error_at(
+    checker,
+    b"E0101",
+    name.span,
+    bytes_concat_all([b"`", simple_name_of(of), b"` has no function `", name.name, b"`"]),
+    b"not a function of the type",
+    [
+      bytes_concat_all([
+        b"a function of a type is declared `fn ",
+        simple_name_of(of),
+        b"::",
+        name.name,
+        b"(..)` in the module that declares the type",
+      ]),
+    ],
+  )
+
+/// A call on a value, `base.name(args)`: the call of a function a record holds in its field
+/// `name`, or of the function `name` of the head of the value's type, with the value first. `b`
+/// is the value as its caller typed it and `base` as it is written, so nothing of it is walked
+/// twice.
+fn infer_dotted(
+  span: Span,
+  b: Inferred,
+  base: Expr,
+  name: Ident,
+  args: List<Expr>,
+  labels: List<Ident>,
+  hint: Option<Hint>,
+) -> Inferred / {abort.raise} = {
+  let ty = resolve(b.checker, b.ty);
+  let called = |o: Inferred, noted: Checker| {
+    let j: WithRow = join(noted, span, b.row, o.row);
+    { checker: j.checker, ty: o.ty, row: j.row }
+  };
+  let field = match record_fields(ty) { Some(fs) -> field_get(fs, name.name), None -> None };
+  match field {
+    Some(held) -> {
+      let o: Inferred = applied_call(
+        span,
+        EField({ span: span_to(expr_span(base), name.span), base: base, field: name }),
+        { checker: b.checker, ty: held, row: row_empty() },
+        None,
+        args,
+        labels,
+        hint,
+      );
+      called(o, o.checker)
+    },
+    None -> {
+      let head = match ty { TyCon(c) -> Some(c.name), TyNominal(n) -> Some(n.name), _ -> None };
+      match head {
+        None -> {
+          let o: WithTy = new_ty(
+            report_error_at(
+              b.checker,
+              b"E0201",
+              expr_span(base),
+              bytes_concat_all([b"cannot call `", name.name, b"` on this value"]),
+              bytes_concat_all([b"this has type `", type_text(ty), b"`"]),
+              [
+                b"`value.name(..)` calls the function `name` of the value's type, or a function a record holds in a field `name`: a type parameter, a function and a record with no such field have neither",
+                b"annotate the value where its type is not yet known",
+              ],
+            ),
+          );
+          { checker: o.checker, ty: o.ty, row: b.row }
+        },
+        Some(of) -> match member_function(b.checker, of, name) {
+          None -> {
+            let o: WithTy = new_ty(no_function_of(b.checker, of, name));
+            { checker: o.checker, ty: o.ty, row: b.row }
+          },
+          Some(m) -> {
+            let o: Inferred = applied_call(
+              span,
+              EVar({ span: name.span, name: m.qname }),
+              infer_var(b.checker, m.qname),
+              Some({ written: base, ty: b.ty }),
+              args,
+              labels,
+              hint,
+            );
+            called(o, {
+              ..o.checker,
+              member_sites: push(o.checker.member_sites, {
+                module: o.checker.module,
+                span: span,
+                qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
+                name: m.qname.name.name,
+                callee: m.callee,
+                owner: o.checker.walking,
+              }),
+            })
+          },
+        },
+      }
+    },
+  }
+}
 
 /// The prelude name a bare callee resolves to, or nothing for one the program declares.
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
@@ -6058,8 +6229,22 @@ fn infer_app_general(
   args: List<Expr>,
   labels: List<Ident>,
   hint: Option<Hint>,
+) -> Inferred / {abort.raise} =
+  applied_call(span, func, infer(checker, func), None, args, labels, hint)
+
+/// A call of a callee typed already, `f0`, which `func` only writes: `on` is the value a call is
+/// made on, the callee's first argument, typed already too, and `given` the arguments after it.
+fn applied_call(
+  span: Span,
+  func: Expr,
+  f0: Inferred,
+  on: Option<{ written: Expr, ty: Type }>,
+  given: List<Expr>,
+  labels: List<Ident>,
+  hint: Option<Hint>,
 ) -> Inferred / {abort.raise} = {
-  let f0: Inferred = infer(checker, func);
+  // Every argument as it is written, for what reads the arguments without typing them.
+  let args = match on { Some(x) -> concat([x.written], given), None -> given };
   // Before the arguments, so a written label is what an argument's row is checked against.
   let f: Inferred = {
     checker: fill_labels(
@@ -6092,13 +6277,14 @@ fn infer_app_general(
   let builtin = prelude_named(f.checker, func);
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     f.checker,
-    args,
+    given,
     span,
     repeats.params,
     repeats.waits,
     called.params,
     called.met,
     ranged_lambda(f.checker, builtin, args),
+    first: match on { Some(x) -> Some(x.ty), None -> None },
   );
   let j0: WithRow = join(as_.checker, span, f.row, as_.row);
   let c: Checker = j0.checker;
@@ -7554,6 +7740,27 @@ fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {ab
     _ -> panic("operation schemes are function types"),
   }
 }
+
+/// Whether `x` in `x.name(..)` is a local binding, so the call is one on its value and no perform.
+fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} =
+  is_bare(x) && (match env_depth_of(checker.env, x.name.name) { Some(d) -> d > 0, None -> false })
+
+/// A local and an effect of one name leave `x.name(..)` with two readings, which is refused.
+fn both_named(checker: Checker, x: QName) -> Checker / {abort.raise} =
+  match lookup(scope_of(checker).bound, EffectSpace, x.name.name) {
+    None -> checker,
+    Some(_) ->
+      report_error_at(
+        checker,
+        b"E0105",
+        x.span,
+        bytes_concat_all([b"`", x.name.name, b"` is a binding here and an effect"]),
+        b"a call on the binding, or a perform of the effect",
+        [
+          b"`x.name(..)` calls a function on the value `x` where `x` is a binding, and performs an operation of the effect `x` otherwise; give the binding another name",
+        ],
+      ),
+  }
 
 fn infer_perform(
   checker: Checker,
@@ -9391,14 +9598,20 @@ fn walked_fn(
         sig,
       );
       let walked: Checker = { ..o.checker, derived: None, walking: b"" };
-      // Typed, its operators and comparisons say which of the module's functions they call.
-      let calls = if map_len(stated) == 0 { [] } else {
-        stated_calls(walked, stated, answers, {
-          numerics: drop(walked.numerics, len(checker.numerics)),
-          comparisons: drop(walked.comparisons, len(checker.comparisons)),
-          map_keys: drop(walked.map_keys, len(checker.map_keys)),
-          constrained: drop(walked.constrained_uses, len(checker.constrained_uses)),
-        })
+      // Typed, its operators and comparisons say which of the module's functions they call, as
+      // its calls on values do.
+      let members = map(drop(walked.member_sites, len(checker.member_sites)), |m: MemberSite|
+        { callee: m.callee, span: m.span });
+      let calls = if map_len(stated) == 0 { members } else {
+        concat(
+          members,
+          stated_calls(walked, stated, answers, {
+            numerics: drop(walked.numerics, len(checker.numerics)),
+            comparisons: drop(walked.comparisons, len(checker.comparisons)),
+            map_keys: drop(walked.map_keys, len(checker.map_keys)),
+            constrained: drop(walked.constrained_uses, len(checker.constrained_uses)),
+          }),
+        )
       };
       let settled: Checker = settle_columns(
         settle_bit_ops(settle_numerics(settle_concats(settle_updates(walked)))),
@@ -14803,6 +15016,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     updates: [],
     update_shapes: [],
     try_sites: [],
+    member_sites: [],
     simulate_depth: 0,
     sim_scope: 0,
     crossings: [],
@@ -20180,4 +20394,28 @@ test "a body in a recursion through an operator performs everything again there"
     ),
   );
   assert_eq(check_codes(named), [b"E0465"])
+}
+
+/// A type `Stack` with a function `size` of it, and what follows.
+fn with_stack(rest: Bytes) -> Bytes =
+  bytes_concat(
+    b"type Stack = | Stack(List<Int>)\nfn Stack::size(s: Stack) -> Int = match s { Stack(xs) -> len(xs) }\nfn Stack::of(xs: List<Int>) -> Stack = Stack(xs)\n",
+    rest,
+  )
+
+test "a function of a type is declared `fn T::name` and named through the type" {
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack::size(Stack::of([1, 2]))")), []);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack::depth(Stack([1]))")), [b"E0101"]);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = size(Stack([1]))")), [b"E0101"])
+}
+
+test "a call on a value is a call of its type's function with the value first" {
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack([1, 2]).size()")), []);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = { let s = Stack([1, 2]); s.size() }")), []);
+  assert_eq(
+    check_codes(with_stack(b"fn f(s: Stack) -> Int = s.size() + Stack::of([3]).size()")),
+    [],
+  );
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.depth()")), [b"E0101"]);
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.size(1)")), [b"E0202"])
 }
