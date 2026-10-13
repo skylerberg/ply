@@ -399,7 +399,7 @@ module.exports = grammar({
     field_expression: $ => prec(PREC.field, seq(
       field('base', $._expression),
       '.',
-      field('field', choice($.identifier, $.tuple_field)),
+      field('field', choice($.qualified_name, $.identifier, $.tuple_field)),
     )),
     tuple_field: $ => token(/_[0-9]+/),
 

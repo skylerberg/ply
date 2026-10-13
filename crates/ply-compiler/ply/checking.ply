@@ -22,7 +22,7 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 hashes_bin, placed_bin, mention_bin, owner_read_bin, module_scope, owner_reads,
                 owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
                 mention_key, unplaced_imports, laid_items, checked_owner, needed_through, head_of,
-                Reach, called_of, of_any, reaching)
+                called_of, of_any, reaching)
 import owned
 import types (tables_joined)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
@@ -599,6 +599,8 @@ pub fn group_imports_query() -> Bytes = b"group imports"
 
 pub fn published_query() -> Bytes = b"published"
 
+pub fn sees_query() -> Bytes = b"sees"
+
 pub fn wants_query() -> Bytes = b"wants"
 
 pub fn declared_query() -> Bytes = b"declared"
@@ -790,6 +792,28 @@ pub fn owner_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     },
   }
 }
+
+/// The modules a module can see beside itself, read as `Named` says: each it imports, directly
+/// or through others, in the order of their names. A function of a type one of them declares, or
+/// the module itself, is what a call on a value in it may call.
+pub fn sees_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let named = decoded(input, named_bin(), "a module's name");
+  let context = decoded(memo.ask(context_query(), input), context_bin(), "a module's context");
+  let seen = fold(context.present, map_new(), |acc: Map<Bytes, Bool>, m: Bytes|
+    fold(
+      sees_of({ module: m, shipped: shipped_for(named.shipped, m), tested: false }),
+      map_insert(acc, m, true),
+      |a: Map<Bytes, Bool>, below: Bytes| map_insert(a, below, true),
+    ));
+  bin::encode(map_keys(seen), bin::list_bin(bin::bytes_bin()))
+}
+
+fn sees_of(named: Named) -> List<Bytes> / {memo.read, abort.raise} =
+  decoded(
+    memo.ask(sees_query(), bin::encode(named, named_bin())),
+    bin::list_bin(bin::bytes_bin()),
+    "the modules a module can see",
+  )
 
 /// What a module publishes for an `opaque` type an owner of it declares, read as `OwnerNamed` says:
 /// each function that answers one and each that takes one; none for any other owner.
@@ -1101,7 +1125,8 @@ pub fn whole_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   if read.found {
     let called = fold(read.wanted, [], |acc: List<Bytes>, m: Mention|
       if m.module == b"" { push(acc, m.name) } else { acc });
-    fold(concat(read.wanted, called_of(read.context.present, called)), (), |_: Unit, m: Mention|
+    let seen = if len(called) == 0 { [] } else { called_of(sees_of(named), called) };
+    fold(concat(read.wanted, seen), (), |_: Unit, m: Mention|
       if m.module == b"" { () } else {
         memo.head(
           entry_query(),
@@ -1123,22 +1148,9 @@ pub fn whole_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   b""
 }
 
-/// `modules` and each module the entries `found`, each encoded, hold an entry of; `modules` alone
-/// for a walk whose texts call nothing on a value.
-fn held_by(
-  modules: List<Bytes>,
-  called: List<Bytes>,
-  found: List<Bytes>,
-) -> List<Bytes> / {abort.raise} =
-  if len(called) == 0 { modules } else {
-    fold(found, modules, |acc: List<Bytes>, b: Bytes|
-      if bytes_len(b) == 0 { acc } else { concat(acc, entry_head(b).reach.modules) })
-  }
-
 /// What a check of the group `asked` stands on, read without checking it: what a group whose answer
 /// a check of its whole module offered reads. Each entry it names carries the digest of all the
-/// entry reaches, so the entries those name are not read: only the functions the group calls on a
-/// value, of each module those entries hold one of.
+/// entry reaches, so the entries those name are not read.
 fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
   let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
   memo.ask(setting_query(), bin::encode(named, named_bin()));
@@ -1155,55 +1167,40 @@ fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
     });
   let mentions = fold(asked.owners, selected, |acc: List<Mention>, o: Bytes|
     concat(acc, owner_facts(named, o).mentions));
+  // What the group calls on a value it reads of every module its own can see.
   let called = fold(mentions, [], |acc: List<Bytes>, m: Mention|
     if m.module == b"" && !contains(acc, m.name) { push(acc, m.name) } else { acc });
-  let read = fold(
-    mentions,
-    { modules: map_new(), held: [] },
-    |acc: { modules: Map<Bytes, Bool>, held: List<Bytes> }, m: Mention|
-      if m.module == b"" || (m.module == asked.module && contains(asked.owners, m.name)) { acc }
-      else if m.module == asked.module {
-        fold(
-          declared_of(m.module, asked.shipped, asked.tested, m.name),
-          acc,
-          |a: { modules: Map<Bytes, Bool>, held: List<Bytes> }, o: Bytes|
-            if contains(asked.owners, o) { a } else {
-              let b = memo.ask(
-                owner_entry_query(),
-                bin::encode(
-                  { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
-                  owner_named_bin(),
-                ),
-              );
-              { ..a, held: held_by(a.held, called, [b]) }
-            },
-        )
-      } else {
-        let found = entry_bytes_of(asked.shipped, m.module, m.name);
-        if len(found) == 0 && !contains(targets, m.module) {
-          entry_bytes_of(asked.shipped, m.module, b"");
-          ()
-        };
-        { modules: map_insert(acc.modules, m.module, true), held: held_by(acc.held, called, found) }
-      },
-  );
-  places_of(asked.shipped, map_keys(read.modules));
-  // Its own module's it names as any other mention.
-  iterate(
-    { seen: [asked.module], work: read.held },
-    1000000,
-    |s: { seen: List<Bytes>, work: List<Bytes> }|
-      match s.work {
-        [] -> Stop(()),
-        [m, ..rest] -> if contains(s.seen, m) { Continue({ ..s, work: rest }) } else {
-          Continue({
-            seen: push(s.seen, m),
-            work: fold(called, rest, |w: List<Bytes>, n: Bytes|
-              held_by(w, called, entry_bytes_of(asked.shipped, m, of_any(n)))),
+  let all = if len(called) == 0 { mentions }
+  else { concat(mentions, called_of(sees_of(named), called)) };
+  let modules = fold(all, map_new(), |acc: Map<Bytes, Bool>, m: Mention|
+    if m.module == b"" { acc } else if m.module == asked.module {
+      if !contains(asked.owners, m.name) {
+        fold(declared_of(m.module, asked.shipped, asked.tested, m.name), (), |_: Unit, o: Bytes|
+          if !contains(asked.owners, o) {
+            memo.ask(
+              owner_entry_query(),
+              bin::encode(
+                { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
+                owner_named_bin(),
+              ),
+            );
+            ()
           })
-        },
-      },
-  )
+      };
+      acc
+    } else {
+      let found = entry_bytes_of(asked.shipped, m.module, m.name);
+      // A name a module could declare for the functions of its types says nothing of whether
+      // the module is there.
+      if len(found) == 0 && !contains(targets, m.module) && !bytes_starts_with(m.name, b"::") {
+        entry_bytes_of(asked.shipped, m.module, b"");
+        ()
+      };
+      if len(found) == 0 && bytes_starts_with(m.name, b"::") { acc }
+      else { map_insert(acc, m.module, true) }
+    });
+  places_of(asked.shipped, map_keys(modules));
+  ()
 }
 
 /// What a check of a group of owners reads: the entries it needs, by module and owner, where each
@@ -1276,6 +1273,7 @@ fn owners_check(
     |module: Bytes, owner: Bytes|
       if !published || module == asked.module { [] }
       else { published_for(asked.shipped, asked.module, module, owner) },
+    || sees_of(named),
   );
   {
     needed: needed,
@@ -1332,44 +1330,30 @@ pub fn owner_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 
 /// A walk of what an entry reaches: the entries of its own group it reaches, by owner and each
 /// encoded, and the digest each other entry it names reaches, or whether a module it names that
-/// declares nothing so named declares anything at all; the names its texts call on a value, and the
-/// modules it holds an entry of, which answer them.
+/// declares nothing so named declares anything at all.
 type Reached = {
   local: Map<Bytes, Bytes>,
   outside: Map<Bytes, Bytes>,
   seen: Map<Bytes, Bool>,
   work: List<Mention>,
-  called: List<Bytes>,
-  modules: List<Bytes>,
 }
 
-/// `r` holding an entry of each of `modules`: one it held none of is read for each name its texts
-/// call on a value.
-fn holding(r: Reached, modules: List<Bytes>) -> Reached =
-  fold(modules, r, |acc: Reached, m: Bytes|
-    if contains(acc.modules, m) { acc } else {
-      { ..acc, modules: push(acc.modules, m), work: concat(acc.work, called_of([m], acc.called)) }
-    })
-
-/// What `alone`, the entry of `asked` in the group `g` whose answer shows `shown`, reaches through
-/// what it mentions: the digest of every entry there and of where its module stands, those of its
-/// own group as the answer shows them and each other one by its own `reach`, and the modules that
-/// hold one. An edit moves the digest exactly where it moves one of those entries, so a check that
-/// reads an entry need not read what the entry reaches.
+/// The digest of every entry `alone`, the entry of `asked` in the group `g` whose answer shows
+/// `shown`, reaches through what it mentions, and of where its module stands: those of its own group
+/// as the answer shows them, and each other one by its own `reach`. An edit moves it exactly where it
+/// moves one of those entries, so a check that reads an entry need not read what the entry reaches.
 fn reach_of(
   asked: OwnerNamed,
   g: GroupNamed,
   alone: Bytes,
   shown: Map<Bytes, Bytes>,
-) -> Reach / {memo.read, abort.raise} = {
+) -> Bytes / {memo.read, abort.raise} = {
   let walked = iterate(
     {
       local: map_insert(map_new(), asked.owner, alone),
       outside: map_new(),
       seen: map_new(),
       work: entry_head(alone).mentions,
-      called: [],
-      modules: [asked.module],
     },
     1000000,
     |s: Reached|
@@ -1379,10 +1363,13 @@ fn reach_of(
         else {
           let at = { ..s, seen: map_insert(s.seen, mention_key(m), true), work: rest };
           Continue(if m.module == b"" {
+            // What its text calls on a value, of each module its own can see.
             {
               ..at,
-              called: push(at.called, m.name),
-              work: concat(at.work, called_of(at.modules, [m.name])),
+              work: concat(
+                at.work,
+                called_of(push(sees_of(module_named(asked)), asked.module), [m.name]),
+              ),
             }
           } else if m.module == asked.module {
             fold(
@@ -1408,59 +1395,50 @@ fn reach_of(
                       owner_named_bin(),
                     ),
                   );
-                  if bytes_len(b) == 0 { acc } else {
-                    let reach = entry_head(b).reach;
-                    holding(
-                      { ..acc, outside: map_insert(acc.outside, o, reach.digest) },
-                      reach.modules,
-                    )
-                  }
+                  if bytes_len(b) == 0 { acc }
+                  else { { ..acc, outside: map_insert(acc.outside, o, entry_head(b).reach) } }
                 },
             )
           } else {
             let found = entry_bytes_of(asked.shipped, m.module, m.name);
             if len(found) == 0 {
-              let any = len(entry_bytes_of(asked.shipped, m.module, b"")) > 0;
-              {
-                ..at,
-                outside: map_insert(at.outside, bytes_concat(b"there ", m.module), if any { b"1" }
-                else { b"" }),
+              // No function of a type so named there is nothing reached, whatever else it holds.
+              if bytes_starts_with(m.name, b"::") { at } else {
+                let any = len(entry_bytes_of(asked.shipped, m.module, b"")) > 0;
+                {
+                  ..at,
+                  outside: map_insert(at.outside, bytes_concat(b"there ", m.module), if any { b"1" }
+                  else { b"" }),
+                }
               }
             } else {
               fold(found, at, |acc: Reached, b: Bytes| {
                 let h = entry_head(b);
-                holding(
-                  {
-                    ..acc,
-                    outside: map_insert(
-                      acc.outside,
-                      bytes_concat_all([m.module, b".", h.owner]),
-                      h.reach.digest,
-                    ),
-                  },
-                  push(h.reach.modules, m.module),
-                )
+                {
+                  ..acc,
+                  outside: map_insert(
+                    acc.outside,
+                    bytes_concat_all([m.module, b".", h.owner]),
+                    h.reach,
+                  ),
+                }
               })
             }
           })
         },
       },
   );
-  {
-    digest: blake3(
-      bin::encode(
-        [
-          if asked.shipped { b"" }
-          else { bin::encode(placed_by(placing_of(asked.module)), placed_bin()) },
-          bin::encode(walked.local, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
-          bin::encode(walked.outside, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
-        ],
-        bin::list_bin(bin::bytes_bin()),
-      ),
+  blake3(
+    bin::encode(
+      [
+        if asked.shipped { b"" }
+        else { bin::encode(placed_by(placing_of(asked.module)), placed_bin()) },
+        bin::encode(walked.local, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
+        bin::encode(walked.outside, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
+      ],
+      bin::list_bin(bin::bytes_bin()),
     ),
-    modules: sort_by(walked.modules, |a: Bytes, b: Bytes|
-      match compare_values(a, b) { Greater -> false, _ -> true }),
-  }
+  )
 }
 
 /// The entry an owner shows what reads it, read as `OwnerNamed` says: none for a test, a law, or an
@@ -1633,6 +1611,7 @@ fn checked_whole(
     |module: Bytes, owner: Bytes|
       if !published || module == named.module { [] }
       else { published_for(named.shipped, named.module, module, owner) },
+    || sees_of(named),
   );
   checked_against(
     { name: named.module, src: read.text },
@@ -1840,6 +1819,7 @@ pub fn header_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
             map(selections, |x: { module: Bytes, names: List<Bytes> }| x.module),
             |m: Bytes| contains(context.present, m),
           ),
+          || [],
         );
         let places = places_of(asked.shipped, map_keys(deps));
         let checked = checked_against(
@@ -2130,6 +2110,7 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
     { name: wants_query(), definition: b"checking.wants_answer", body: wants_answer },
     { name: whole_query(), definition: b"checking.whole_answer", body: whole_answer },
     { name: published_query(), definition: b"checking.published_answer", body: published_answer },
+    { name: sees_query(), definition: b"checking.sees_answer", body: sees_answer },
     {
       name: group_imports_query(),
       definition: b"checking.group_imports_answer",
