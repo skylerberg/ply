@@ -111,7 +111,7 @@ test "a fold accumulator appended in first position" {
 
 const EXPECTED_PAIRS: usize = 5;
 
-fn corpus() -> Vec<Pair> {
+fn all_pairs() -> Vec<Pair> {
     vec![
         Pair {
             name: "call argument",
@@ -146,13 +146,9 @@ fn digest(src: &str) -> String {
 }
 
 #[test]
-fn the_corpus_is_the_five_shapes_it_says_it_is() {
-    let pairs = corpus();
-    assert_eq!(
-        pairs.len(),
-        EXPECTED_PAIRS,
-        "the corpus lost or gained a pair"
-    );
+fn the_pairs_are_the_five_shapes_they_say_they_are() {
+    let pairs = all_pairs();
+    assert_eq!(pairs.len(), EXPECTED_PAIRS, "a pair was lost or gained");
 
     for pair in &pairs {
         assert_ne!(
@@ -209,7 +205,7 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
     assert_eq!(
         got.as_slice(),
         expected.as_slice(),
-        "a corpus member is not the program it was pinned as; re-pin it here if you edited it \
+        "a member of a pair is not the program it was pinned as; re-pin it here if you edited it \
          deliberately, and if you did not, a member moved under you — see this test's \
          documentation"
     );

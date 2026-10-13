@@ -11,7 +11,7 @@ language gains or drops fails a check here.
 | `queries/highlights.scm` | the highlight queries, in the captures every tree-sitter editor reads |
 | `queries/indents.scm` | the indent queries, laid out as `ply fmt` lays a program out |
 | `test/corpus/` | the cases `tree-sitter test` holds the tree to |
-| `scripts/parse-corpus.sh` | every Ply module in this tree, parsed with the grammar and refused on a syntax error |
+| `scripts/parse-modules.sh` | every Ply module in this tree, parsed with the grammar and refused on a syntax error |
 
 ## Working on it
 
@@ -19,7 +19,7 @@ language gains or drops fails a check here.
 npm install
 npx tree-sitter generate   # rewrites src/, which is committed
 npx tree-sitter test
-scripts/parse-corpus.sh    # needs no argument; finds the tree from its own path
+scripts/parse-modules.sh   # needs no argument; finds the tree from its own path
 ```
 
 `src/parser.c` is generated and committed, so a consumer needs no toolchain: a
