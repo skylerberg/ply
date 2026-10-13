@@ -15,14 +15,14 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, 
               deriver_text, deriver_tag, schema_of, SpecKind, SRequires, SEnsures, SCost, SSpace,
               SpecClause, Derived, DeriveDef, parse, TDNominal, test_run, test_listing, IInstance,
               InstanceDef, InstanceKind, NKey, NShow, instance_text, INumeric, NumericDef,
-              NumericOp, numeric_ops, numeric_by, is_pub, Opaque, spec_kind_bin, deriver_bin,
-              instance_kind_bin)
+              member_name, member_of, NumericOp, numeric_ops, numeric_by, is_pub, Opaque,
+              spec_kind_bin, deriver_bin, instance_kind_bin)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, RaiseName, Stmt, SLet, SLetElse, SExpr, Param,
               NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span, is_arithmetic,
               is_ordered, ETagged, Tagged, Hole, tagged_parser, tagged_filler, case_at,
-              case_identity, call_operator, written_operator)
+              case_identity, call_operator, written_operator, Slot, FromName, FromDefault)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit, LInt,
                  LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, pat_span, has_or)
 import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -48,17 +48,18 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               tables_joined, type_table_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
-                    summary_bin, ending_bin)
+                    summary_bin, ending_bin, unknown_summary)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, Declared,
                 ModuleEntry, Diag, Label, Edit, Fix, with_fix, insertion, Namespace, ValueSpace,
                 TypeSpace, EffectSpace, resolve_modules, ResolveSucceeded, ResolveFailed, Expanded,
                 find, lookup, lookup_declared, space, qualify, default_binder, dump_diags,
                 error_with_labels, error_at, error_at_and, label_at, backticked, describe_namespace,
                 private_name, pattern_binders, has_error, closed_ctor, closed_notes,
-                find_module_binding)
+                find_module_binding, find_of_type, declaring_type, of_binder, of_module, Parameters,
+                ParamInfo, filled_args)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, expand_holds)
+                expand_tagged, expand_holds, expand_member_calls, MemberCallee)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -234,7 +235,34 @@ type PerformSite = {
   span: Span,
   source: PerformSource,
   over: Option<Span>,
+  /// The iterations around it that wait on a callee's counts, innermost first: the first that
+  /// holds is the site's, before `over`.
+  maybe: List<Maybe>,
 }
+/// An iteration a call turns out to be once the definition `callee` is counted: it calls its parameter `param` a number of times that grows with its input, or, with
+/// no `param`, performs the site's own atom so.
+type Maybe = { callee: Bytes, param: Option<Int>, span: Span }
+/// A row variable performed under an iteration, as a `PerformSite` is.
+type Repeated = { var: Int, over: Option<Span>, maybe: List<Maybe> }
+/// A call of a function of the module being checked.
+type OwnCall = { callee: Bytes, span: Span }
+/// A use of a function of a type, or a call on a value, which the rewrite writes as later passes
+/// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
+/// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
+/// function the value holds in the field written. A name written `T::name` at `span` is
+/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
+/// `reaches` the modules the defaults the call copies name.
+pub type MemberSite = {
+  module: Int,
+  span: Span,
+  qualifier: Bytes,
+  name: Bytes,
+  callee: Bytes,
+  owner: Bytes,
+  reaches: List<Bytes>,
+}
+/// A tagged literal whose tag's function `name` is one of the module being checked.
+type TagUse = { owner: Bytes, name: Bytes, t: Tagged, callee: QName }
 type OpKey = { effect: Bytes, op: Bytes, resource: Resource }
 type Numeric = { span: Span, op: Bytes, ty: Type }
 /// A bit operator's or integer builtin's operand, kept until its type is known. `what` names the site in a diagnostic.
@@ -511,8 +539,18 @@ type Checker = {
   label_params: Map<Bytes, Int>,
   label_apps: List<LabelApplication>,
   label_sites: List<LabelSite>,
-  /// The group being walked.
+  /// The group being settled.
   group_defs: List<GroupDef>,
+  /// The functions of the module whose bodies are being walked, each by its qualified name: the
+  /// groups they form are read off what each body names and calls of them.
+  own_fns: Map<Bytes, Int>,
+  /// Those the body being walked names, the calls it makes of them, its tagged literals of them, and
+  /// (`group_fills`) the types it fills their parameters with.
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  tag_uses: List<TagUse>,
+  /// The parameters of each definition called so far whose types hold a function.
+  fn_holding: Map<Bytes, List<Int>>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -521,11 +559,13 @@ type Checker = {
   nominals: Map<Bytes, RecordDecl>,
   refused_atoms: List<Location>,
   performs: List<PerformSite>,
-  /// The iteration around the expression being inferred, as `PerformSite.over` reads.
+  /// The iteration around the expression being inferred, as `PerformSite.over` reads, and those
+  /// that wait on a callee's counts.
   over: Option<Span>,
+  maybe: List<Maybe>,
   /// Each row variable a body performs under an iteration.
-  repeated_vars: List<{ var: Int, over: Span }>,
-  /// The first call into the group being walked: a recursive body performs all it does again there.
+  repeated_vars: List<Repeated>,
+  /// The first call into the group being settled: a recursive body performs all it does again there.
   recursed: Option<Span>,
   /// The written row of the definition being checked; empty when it wrote none, or for a test or law.
   declared_atoms: List<Atom>,
@@ -553,6 +593,9 @@ type Checker = {
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
+  member_sites: List<MemberSite>,
+  /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
+  copied_defaults: List<{ expr: Expr, ty: Type }>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
@@ -602,14 +645,85 @@ type WithHit = { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }>
 type WithResource = { checker: Checker, resource: Option<Resource> }
 type WithBodyRow = { checker: Checker, row: Row }
 
-/// A group's bodies as its members are taken in turn: each one's row and counts, and the rows it was
-/// published from where its body was not walked.
-type Walked = {
+/// A module's functions as their signatures bind them, each for every body of the module to call.
+type Signed = { checker: Checker, sigs: List<Signature>, members: List<GroupDef> }
+
+/// A body's walk as it stands in the checker's substitution, before it is closed.
+type Walk = {
   checker: Checker,
-  rows: List<Row>,
-  counts: List<Count>,
-  filed: List<Option<KnownDef>>,
+  row: Row,
+  performs: List<PerformSite>,
+  repeated_vars: List<Repeated>,
+  raise_notes: List<RaiseNote>,
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  tag_uses: List<TagUse>,
+  fills: List<GroupFill>,
 }
+
+/// What a function's walk leaves for its group, closed: every type, atom and variable in it is as
+/// the walk settled it, so its group reads it without the walk's substitution. Its row; what its
+/// group reads of its signature (`params` and `tail` for what it performs through its parameters,
+/// what its row promises `bounded`, whether it says `diverges`, and `written`, what the signature
+/// alone says of its counts); what it performs and where; what it names and calls of its module's
+/// functions, `stated` those an operator, a comparison or a constraint calls because a type states
+/// them; and what each name it reads refers to. `filed` and `count` are the rows it was published
+/// from, where its body was not walked.
+type Body = {
+  row: Row,
+  filed: Option<KnownDef>,
+  count: Option<Count>,
+  params: List<Type>,
+  tail: Option<Int>,
+  bounded: List<{ atom: Atom, written: Bytes }>,
+  tail_bounded: Bool,
+  tail_name: Option<Bytes>,
+  says_diverges: Bool,
+  written: { scaling: List<Atom>, repeats: List<Int> },
+  performs: List<PerformSite>,
+  repeated_vars: List<Repeated>,
+  raise_notes: List<RaiseNote>,
+  refs: List<Bytes>,
+  calls: List<OwnCall>,
+  stated: List<OwnCall>,
+  tags: List<TagRefusal>,
+  fills: List<Fill>,
+  names: List<NamedCallee>,
+}
+
+/// A tagged literal whose tag's function `name` is of its own module: what to say if the two turn
+/// out to be in one recursion.
+type TagRefusal = { name: Bytes, refusal: Diag }
+
+/// A call that fills `callee`'s type parameters: those it fills with a type built from the
+/// caller's own, each as it prints.
+type Fill = { module: Int, span: Span, callee: Bytes, grows: List<{ param: Int, ty: Bytes }> }
+
+/// What a name a body reads refers to, `module` empty where it is written bare.
+type NamedCallee = { module: Bytes, name: Bytes, callee: Callee }
+
+/// A module's functions in the order it writes them, each with its qualified name, what its group
+/// reads of its generic list and its body.
+type ModuleFns = {
+  fns: List<FnDef>,
+  names: List<Bytes>,
+  members: List<GroupDef>,
+  bodies: List<Body>,
+}
+
+/// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.
+type TypedSites = {
+  numerics: List<Numeric>,
+  comparisons: List<{ module: Int, span: Span, ty: Type }>,
+  map_keys: List<MapKeySite>,
+  constrained: List<ConstraintSite>,
+}
+
+/// What a module's type states: its key, its show and its arithmetic in `numeric_ops`' order, each
+/// a function of the module by its qualified name.
+type StatedFns = { key: Option<Bytes>, show: Option<Bytes>, numeric: List<Bytes> }
+
+type Reached = { seen: List<Bytes>, fns: List<Bytes> }
 
 /// What a group member performs a number of times that grows with its input: its atoms, the sites a
 /// walk of its body found them at, and the parameters it calls so.
@@ -622,16 +736,6 @@ type Count = {
   raises: List<Raise>,
 }
 
-/// A body's row, and of its atoms and its parameters, what it performs or calls a number of times that
-/// grows with its input, each with the site and the iteration that make it so.
-type Counted = {
-  checker: Checker,
-  row: Row,
-  scaling: List<PerformSite>,
-  repeats: List<Int>,
-  tail_over: Option<Span>,
-  raises: List<Raise>,
-}
 type Generalized = { env: TypeEnv, scheme: Scheme }
 
 fn cell() -> Bytes = b"cell"
@@ -1438,7 +1542,10 @@ fn unresolved_in_derived(checker: Checker, qname: QName, what: Bytes) -> Checker
 fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Checker / {abort.raise} =
   match qname.module {
     None -> checker,
-    Some(binder) -> {
+    Some(binder) -> if namespace == ValueSpace
+        && declaring_type(checker.resolved, checker.module, binder.name) != None {
+      no_function_of(checker, binder.name, qname.name)
+    } else {
       let scope = scope_of(checker);
       match fold(
           scope.modules,
@@ -3241,7 +3348,7 @@ fn lit_type(literal: Lit) -> Type / {abort.raise} =
   }
 
 fn record_site(checker: Checker, atom: Atom, span: Span, source: PerformSource) -> Checker =
-  record_over(checker, atom, span, source, checker.over)
+  record_over(checker, atom, span, source, checker.over, checker.maybe)
 
 fn record_over(
   checker: Checker,
@@ -3249,6 +3356,7 @@ fn record_over(
   span: Span,
   source: PerformSource,
   over: Option<Span>,
+  maybe: List<Maybe>,
 ) -> Checker =
   if span.start == 0 && span.end == 0 { checker } else {
     {
@@ -3259,6 +3367,7 @@ fn record_over(
         span: span,
         source: source,
         over: over,
+        maybe: maybe,
       }),
     }
   }
@@ -4022,21 +4131,34 @@ fn field_hint(fields: List<Field>, name: Bytes, met: Meetings) -> Option<Hint> =
 /// A call's arguments; a lambda the callee calls once per element of its input is inferred under the
 /// call, which is the iteration its body repeats with. Each is expected at its parameter's type:
 /// `params` are the callee's, and `met` what its answer has met. `ranged` is the lambda called
-/// with each element of a `range`.
+/// with each element of a `range`. `waits` is the callee where its counts are not in yet: each
+/// lambda may be one it repeats. `first` is the callee's first argument where it is typed
+/// already, the value a call is made on: `exprs` are then the arguments after it.
 fn infer_args(
   checker: Checker,
   exprs: List<Expr>,
   span: Span,
   repeats: List<Int>,
+  waits: Option<Bytes>,
   params: List<Type>,
   met: Meetings,
   ranged: Option<Ranged>,
+  first: Option<Type> = None,
 ) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} = {
+  let before = match first { Some(_) -> 1, None -> 0 };
   let walked = fold(
-    range(0, len(exprs)),
-    { checker: checker, tys: [], row: row_empty(), met: met },
+    range(before, before + len(exprs)),
+    {
+      checker: checker,
+      tys: match first { Some(ty) -> [ty], None -> [] },
+      row: row_empty(),
+      met: match ((first, list_at(params, 0))) {
+        (Some(ty), Some(p)) -> Meeting({ expected: p, found: ty, before: met }),
+        _ -> met,
+      },
+    },
     |acc: { checker: Checker, tys: List<Type>, row: Row, met: Meetings }, i: Int| {
-      let x = at(exprs, i);
+      let x = at(exprs, i - before);
       let param = list_at(params, i);
       let hint = match param { Some(p) -> Some({ ty: p, met: acc.met }), None -> None };
       let lambda = match x { ELambda(_) -> true, _ -> false };
@@ -4051,9 +4173,24 @@ fn infer_args(
         None -> acc.checker,
       };
       let o: Inferred = if looped {
-        let inner: Inferred = infer({ ..ranging, over: Some(span) }, x, hint);
-        { ..inner, checker: { ..inner.checker, over: acc.checker.over } }
-      } else { infer(ranging, x, hint) };
+        let inner: Inferred = infer({ ..ranging, over: Some(span), maybe: [] }, x, hint);
+        { ..inner, checker: { ..inner.checker, over: acc.checker.over, maybe: acc.checker.maybe } }
+      } else {
+        match waits {
+          Some(g) -> if !lambda { infer(ranging, x, hint) } else {
+            let inner: Inferred = infer(
+              {
+                ..ranging,
+                maybe: concat([{ callee: g, param: Some(i), span: span }], ranging.maybe),
+              },
+              x,
+              hint,
+            );
+            { ..inner, checker: { ..inner.checker, maybe: acc.checker.maybe } }
+          },
+          None -> infer(ranging, x, hint),
+        }
+      };
       let j: WithRow = join(o.checker, span, acc.row, o.row);
       {
         checker: j.checker,
@@ -4069,25 +4206,77 @@ fn infer_args(
   { checker: walked.checker, tys: walked.tys, row: walked.row }
 }
 
+/// An expression nothing encloses, typed with each default its calls on values copied: a default
+/// is no part of the expression a walk reads, so it is typed where the walk ends.
+fn infer_whole(
+  checker: Checker,
+  expr: Expr,
+  hint: Option<Hint> = None,
+) -> Inferred / {abort.raise} = {
+  let o: Inferred = infer(checker, expr, hint);
+  {
+    ..o,
+    checker: fold(
+      o.checker.copied_defaults,
+      { ..o.checker, copied_defaults: [] },
+      |c: Checker, d: { expr: Expr, ty: Type }| {
+        let typed: Inferred = infer(c, d.expr, hint_of(d.ty));
+        expect_met(typed.checker, expr_span(d.expr), d.ty, typed.ty, b"a parameter's default")
+      },
+    ),
+  }
+}
+
 /// The parameters a callee calls a number of times that grows with its input. A builtin's count is
 /// fixed when the argument it iterates over is written out; a function value's is unknown, so each
-/// of its parameters is taken to.
-fn callee_repeats(checker: Checker, func: Expr, args: List<Expr>) -> List<Int> / {abort.raise} = {
+/// of its parameters is taken to. `waits` is the callee where it is a definition: its counts are
+/// read when the caller's group is settled, never by a walk.
+fn callee_repeats(
+  checker: Checker,
+  func: Expr,
+  args: List<Expr>,
+) -> { params: List<Int>, waits: Option<Bytes> } / {abort.raise} = {
   let builtin = prelude_named(checker, func);
   if builtin != b"" {
     let r = builtin_repeats(builtin);
-    match list_at(args, r.over) {
-      Some(x) -> if fixed_size(checker, x) { [] } else { r.params },
-      None -> r.params,
+    {
+      params: match list_at(args, r.over) {
+        Some(x) -> if fixed_size(checker, x) { [] } else { r.params },
+        None -> r.params,
+      },
+      waits: None,
     }
   } else {
     match callee_source(checker, func) {
-      PerformVia(name) -> match def_of(checker, name) { Some(d) -> d.repeats, None -> [] },
-      OpaquePerform -> range(0, len(args)),
-      _ -> [],
+      PerformVia(name) -> { params: [], waits: Some(name) },
+      OpaquePerform -> { params: range(0, len(args)), waits: None },
+      _ -> { params: [], waits: None },
     }
   }
 }
+
+/// The parameters of the definition `name` whose types hold a function, read off its signature
+/// the first time it is called.
+fn fn_holding(
+  checker: Checker,
+  name: Bytes,
+) -> { checker: Checker, params: List<Int> } / {abort.raise} =
+  match map_get(checker.fn_holding, name) {
+    Some(params) -> { checker: checker, params: params },
+    None -> {
+      let params = match env_lookup(checker.env, name) {
+        Some(scheme) -> match scheme.ty {
+          TyFn(f) -> filter(range(0, len(f.params)), |i: Int| holds_fn(at(f.params, i))),
+          _ -> [],
+        },
+        None -> [],
+      };
+      {
+        checker: { ..checker, fn_holding: map_insert(checker.fn_holding, name, params) },
+        params: params,
+      }
+    },
+  }
 
 /// The parameters a builtin calls once per element of its argument at `over`.
 fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
@@ -4162,15 +4351,28 @@ fn scales_like(scales: List<Atom>, a: Atom) -> Bool =
       && (s.resource == a.resource || (match s.resource { RVar(_) -> true, _ -> false }))))
 
 /// A row variable a call performs under an iteration: the callee's own, or the one around the call.
-fn repeat_tail(checker: Checker, tail: Option<Int>, vars: List<Int>, span: Span) -> Checker =
+/// `maybe` are the callee's own where its counts are not in yet.
+fn repeat_tail(
+  checker: Checker,
+  tail: Option<Int>,
+  vars: List<Int>,
+  maybe: List<Maybe>,
+  span: Span,
+) -> Checker =
   match tail {
     None -> checker,
     Some(v) -> if contains(vars, v) {
-      { ..checker, repeated_vars: push(checker.repeated_vars, { var: v, over: span }) }
+      {
+        ..checker,
+        repeated_vars: push(checker.repeated_vars, { var: v, over: Some(span), maybe: [] }),
+      }
     } else {
-      match checker.over {
-        Some(o) -> { ..checker, repeated_vars: push(checker.repeated_vars, { var: v, over: o }) },
-        None -> checker,
+      let waits = concat(maybe, checker.maybe);
+      if checker.over == None && len(waits) == 0 { checker } else {
+        {
+          ..checker,
+          repeated_vars: push(checker.repeated_vars, { var: v, over: checker.over, maybe: waits }),
+        }
       }
     },
   }
@@ -4229,7 +4431,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           checker: note_operand(
             {
               ..o.checker,
-              numerics: push(o.checker.numerics, { span: u.span, op: b"sub", ty: o.ty }),
+              numerics: push(o.checker.numerics, { span: u.span, op: b"neg", ty: o.ty }),
             },
             u.span,
             o.ty,
@@ -4261,6 +4463,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EBinary(b) -> infer_binary(checker, b.span, b.op, b.lhs, b.rhs),
     ELambda(l) -> {
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
+      let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = fold(
         l.params,
         { checker: pushed, tys: [] },
@@ -4270,7 +4473,14 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
               let o: WithTy = conv_type(acc.checker, te);
               { checker: hold_written(o.checker, te, o.ty, true), ty: o.ty }
             },
-            None -> new_ty(acc.checker),
+            // Unwritten, it is what the place expects there, where that is settled by now.
+            None -> match list_at(expected, len(acc.tys)) {
+              Some(e) -> match hinted(acc.checker, Some({ ty: e, met: met_of(hint) })) {
+                Some(settled) -> { checker: acc.checker, ty: settled },
+                None -> new_ty(acc.checker),
+              },
+              None -> new_ty(acc.checker),
+            },
           };
           {
             checker: { ..t.checker, env: env_bind(t.checker.env, p.name.name, monomorphic(t.ty)) },
@@ -4332,7 +4542,55 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         row: row_empty(),
       }
     },
-    EApp(a) -> infer_app(checker, a.span, a.func, a.args, a.labels, hint),
+    EApp(a) -> match a.func {
+      EField(f) -> {
+        let b: Inferred = infer(checker, f.base);
+        let d = dotted_callee(a.span, b, f.base, f.field, a.args, a.named, a.labels);
+        // A named value is typed as an argument is, expected at its parameter's type.
+        let taken: Took = fold(
+          range(0, len(d.rest)),
+          { checker: d.checker, rest: [], row: row_empty() },
+          |acc: Took, k: Int|
+            match at(d.rest, k) {
+              FromName(j) -> {
+                let x = at(a.named, j).value;
+                let i = d.before + len(a.args) + k;
+                let expected = match list_at(d.params, i) {
+                  Some(p) -> Some({ ty: p, met: d.met }),
+                  None -> None,
+                };
+                let o: Inferred = match ((d.waits, x)) {
+                  (Some(g), ELambda(_)) -> {
+                    let inner: Inferred = infer(
+                      {
+                        ..acc.checker,
+                        maybe: concat(
+                          [{ callee: g, param: Some(i), span: a.span }],
+                          acc.checker.maybe,
+                        ),
+                      },
+                      x,
+                      expected,
+                    );
+                    { ..inner, checker: { ..inner.checker, maybe: acc.checker.maybe } }
+                  },
+                  _ -> infer(acc.checker, x, expected),
+                };
+                let j1: WithRow = join(o.checker, a.span, acc.row, o.row);
+                {
+                  checker: j1.checker,
+                  rest: push(acc.rest, Settled({ written: x, ty: o.ty })),
+                  row: j1.row,
+                }
+              },
+              FromDefault(copied) -> { ..acc, rest: push(acc.rest, Copied(copied)) },
+              _ -> acc,
+            },
+        );
+        dotted(a.span, d, taken, b, f.base, f.field, a.args, a.labels, hint, false)
+      },
+      _ -> infer_app(checker, a.span, a.func, a.args, a.labels, hint),
+    },
     EIf(i) -> {
       let c: Inferred = infer(checker, i.cond);
       let cc: Checker = expect(
@@ -4503,7 +4761,17 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         row: items.row,
       }
     },
-    EPerform(p) -> infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args),
+    EPerform(p) -> if !on_a_local(checker, p.eff) {
+      infer_perform(checker, p.span, p.eff, p.op, p.resource, p.args)
+    } else if names_effect(checker, p.eff) {
+      infer_perform(both_named(checker, p.eff), p.span, p.eff, p.op, p.resource, p.args)
+    } else {
+      let b: Inferred = infer_var(checker, p.eff);
+      let on = EVar({ span: p.eff.span, name: p.eff });
+      let labels = match p.resource { Some(r) -> [r], None -> [] };
+      let d = dotted_callee(p.span, b, on, p.op, p.args, [], labels);
+      dotted(p.span, d, defaults_taken(d), b, on, p.op, p.args, labels, hint, true)
+    },
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, hint),
     EWithCell(c) -> infer_with_cell(checker, c.span, c.resource, c.init, c.binder, c.body, hint),
     EWithHold(c) ->
@@ -4563,51 +4831,55 @@ fn tag_fn(
   answers: Type,
 ) -> { checker: Checker, row: Row, name: Bytes } / {abort.raise} = {
   let f: Inferred = infer_var(checker, callee);
-  let c: Checker = called(f.checker, t.tag.span);
-  match declared_value(c, callee) {
+  let named: Checker = called(f.checker, t.tag.span);
+  match declared_value(named, callee) {
     // A name that names nothing is said by the lookup.
-    None -> { checker: c, row: row_empty(), name: b"" },
+    None -> { checker: named, row: row_empty(), name: b"" },
     Some(name) -> {
       let refused = |cc: Checker, message: Bytes, label: Bytes|
         { checker: not_a_tag(cc, t, callee, message, label), row: row_empty(), name: name };
-      let generic = match env_lookup(c.env, name) {
+      let generic = match env_lookup(named.env, name) {
         Some(sc) -> len(sc.ty_vars) + len(sc.row_vars) + len(sc.label_vars) > 0,
         None -> false,
       };
-      if group_member(c, name) {
-        refused(
-          c,
-          b"is in a recursion with what holds the literal",
-          b"a tag is whole before a literal of it is checked",
-        )
-      } else {
-        match resolve(c, f.ty) {
-          TyFn(fn_) -> {
-            let unified = unify(c.subst, c.fresh, fn_type(takes, answers, fn_.effects), f.ty);
-            let u: Checker = with_unified(c, unified);
-            let row = resolve_row_in(u, fn_.effects);
-            if generic { refused(u, b"takes parameters of its own", b"a literal gives it none") }
-            else if unified.error != None {
-              refused(
-                u,
-                bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
-                b"not what a tagged literal calls",
-              )
-            } else if !row_is_pure_but_raise(row) {
-              refused(
-                u,
-                bytes_concat_all([b"performs `", row_text(row), b"`"]),
-                b"a tag's function only raises",
-              )
-            } else { { checker: u, row: row, name: name } }
-          },
-          other ->
-            refused(
-              c,
-              bytes_concat_all([b"has type `", type_text(other), b"`"]),
-              b"not what a tagged literal calls",
-            ),
+      // Whether it is in a recursion with what holds the literal is its group's to say.
+      let c: Checker = if !map_contains(named.own_fns, name) { named } else {
+        {
+          ..named,
+          tag_uses: push(named.tag_uses, {
+            owner: named.walking,
+            name: name,
+            t: t,
+            callee: callee,
+          }),
         }
+      };
+      match resolve(c, f.ty) {
+        TyFn(fn_) -> {
+          let unified = unify(c.subst, c.fresh, fn_type(takes, answers, fn_.effects), f.ty);
+          let u: Checker = with_unified(c, unified);
+          let row = resolve_row_in(u, fn_.effects);
+          if generic { refused(u, b"takes parameters of its own", b"a literal gives it none") }
+          else if unified.error != None {
+            refused(
+              u,
+              bytes_concat_all([b"has type `", type_text(resolve(u, f.ty)), b"`"]),
+              b"not what a tagged literal calls",
+            )
+          } else if !row_is_pure_but_raise(row) {
+            refused(
+              u,
+              bytes_concat_all([b"performs `", row_text(row), b"`"]),
+              b"a tag's function only raises",
+            )
+          } else { { checker: u, row: row, name: name } }
+        },
+        other ->
+          refused(
+            c,
+            bytes_concat_all([b"has type `", type_text(other), b"`"]),
+            b"not what a tagged literal calls",
+          ),
       }
     },
   }
@@ -5004,13 +5276,36 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             key.name,
             inst.args,
           );
-          let noted: Checker = if len(inst.args) == 0 || !group_member(constrained, key.name) {
-            constrained
-          } else {
+          let own = map_contains(constrained.own_fns, key.name);
+          let through = match qname.module {
+            Some(binder) -> if of_module(binder.name) != None
+                || find_module_binding(scope_of(constrained).modules, binder.name) != None { None }
+            else { declaring_type(constrained.resolved, constrained.module, binder.name) },
+            None -> None,
+          };
+          let named: Checker = match through {
+            None -> constrained,
+            Some(t) ->
+              {
+                ..constrained,
+                member_sites: push(constrained.member_sites, {
+                  reaches: [],
+                  module: constrained.module,
+                  span: qname.span,
+                  qualifier: of_binder(at(constrained.resolved.scopes, t.owner).module),
+                  name: member_name(t.simple, qname.name.name),
+                  callee: b"",
+                  owner: constrained.walking,
+                }),
+              },
+          };
+          let referred: Checker = if !own { named }
+          else { { ..named, refs: push(named.refs, key.name) } };
+          let noted: Checker = if len(inst.args) == 0 || !own { referred } else {
             {
-              ..constrained,
-              group_fills: push(constrained.group_fills, {
-                module: constrained.module,
+              ..referred,
+              group_fills: push(referred.group_fills, {
+                module: referred.module,
                 span: qname.span,
                 callee: key.name,
                 args: inst.args,
@@ -5386,6 +5681,350 @@ fn infer_app(
     _ -> infer_app_general(checker, span, func, args, labels, hint),
   }
 
+/// The function a call on a value names in full, `value.m::f(..)`: `m::f`, whatever the value's
+/// type, or nothing where `name` is one name.
+fn written_function(name: Ident) -> Option<QName> / {abort.raise} =
+  match member_of(name.name) {
+    None -> None,
+    Some(m) ->
+      Some({
+        module: Some({ name: m.of, span: name.span }),
+        name: { name: m.member, span: name.span },
+        span: name.span,
+      }),
+  }
+
+/// `q` as later passes read it: a function named through its type is written through the binder
+/// of the type's module, as a call on a value of the type writes it.
+fn through_module(checker: Checker, q: QName) -> QName / {abort.raise} =
+  match q.module {
+    None -> q,
+    Some(binder) -> if of_module(binder.name) != None
+        || find_module_binding(scope_of(checker).modules, binder.name) != None { q } else {
+      match declaring_type(checker.resolved, checker.module, binder.name) {
+        None -> q,
+        Some(t) ->
+          {
+            module: Some({
+              name: of_binder(at(checker.resolved.scopes, t.owner).module),
+              span: binder.span,
+            }),
+            name: { name: member_name(t.simple, q.name.name), span: q.name.span },
+            span: q.span,
+          },
+      }
+    },
+  }
+
+/// What `of`, the head of a receiver's type, has for a function `name`: the name a call of it is
+/// written with and what it is declared as.
+fn member_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} =
+  match ((
+      find_of_type(checker.resolved, checker.module, of, name.name),
+      declaring_type(checker.resolved, checker.module, of),
+    )) {
+    (Some(b), Some(t)) ->
+      Some({
+        qname: {
+          module: Some({
+            name: of_binder(at(checker.resolved.scopes, t.owner).module),
+            span: name.span,
+          }),
+          name: { name: member_name(t.simple, name.name), span: name.span },
+          span: name.span,
+        },
+        callee: b.qualified,
+      }),
+    // A type of the language's: the prelude declares its functions under the type's name.
+    _ -> {
+      let declared = member_name(of, name.name);
+      if env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) { None }
+      else {
+        Some({
+          qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
+          callee: declared,
+        })
+      }
+    },
+  }
+
+/// Whether `of` is a type a module declares, which the prelude has no function of.
+fn module_declares(checker: Checker, of: Bytes) -> Bool =
+  map_contains(checker.types, of) || map_contains(checker.nominals, of)
+
+fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.raise} =
+  report_error_at(
+    checker,
+    b"E0101",
+    name.span,
+    bytes_concat_all([b"`", simple_name_of(of), b"` has no function `", name.name, b"`"]),
+    b"not a function of the type",
+    [
+      bytes_concat_all([
+        b"a function of a type is declared `fn ",
+        simple_name_of(of),
+        b"::",
+        name.name,
+        b"(..)` in the module that declares the type",
+      ]),
+    ],
+  )
+
+/// What each parameter of `callee` after those a call on a value fills with the value and `args`
+/// takes: one of `named`, or its default, as a call by name is filled; and the modules those
+/// defaults name. Nothing where the call is refused.
+fn member_args(
+  checker: Checker,
+  span: Span,
+  callee: Bytes,
+  base: Expr,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> { checker: Checker, rest: List<Slot>, reaches: List<Bytes> } / {abort.raise} =
+  match map_get(checker.resolved.signatures, callee) {
+    None -> { checker: unnamed(checker, named), rest: [], reaches: [] },
+    // Over-application is `E0202`'s to report, with the callee's own type in hand.
+    Some(signature) -> if 1 + len(args) > len(signature.params) {
+      { checker: checker, rest: [], reaches: [] }
+    } else {
+      let filled = filled_args(checker.module, span, signature, concat([base], args), named);
+      {
+        checker: fold(filled.diags, checker, report),
+        rest: drop(filled.slots, 1 + len(args)),
+        reaches: map(filled.imports, |b: ModuleBinding|
+          at(checker.resolved.scopes, b.target).module),
+      }
+    },
+  }
+
+/// A named argument where the callee is a value: it names no parameter.
+fn unnamed(checker: Checker, named: List<NamedArg>) -> Checker =
+  fold(named, checker, |c: Checker, arg: NamedArg|
+    report_error_at(
+      c,
+      b"E0123",
+      arg.name.span,
+      bytes_concat_all([b"`", arg.name.name, b"` names no parameter here"]),
+      b"no signature to match this against",
+      [
+        b"a named argument needs a callee reached by name or by the type of the value it is called on; a call through a value, a lambda or a constructor is positional",
+      ],
+    ))
+
+/// What a call on a value calls: a function its value holds in a field, a function of the value's
+/// type, typed, with its labels filled already where a named value is typed before the call is,
+/// or nothing, which is reported.
+type DottedCallee =
+  | HeldInField(Type)
+  | OfType({ qname: QName, callee: Bytes, ty: Type, row: Row, labelled: Bool })
+  | NoCallee(Type)
+
+/// A call on a value read as far as its callee: the callee's parameters, what the value met of
+/// them, the callee itself where a lambda handed it may be one it repeats, what each parameter
+/// after the written arguments takes, and the modules the defaults among those name.
+type Dotted = {
+  checker: Checker,
+  callee: DottedCallee,
+  params: List<Type>,
+  /// How many of `params` come before the call's written arguments: the value, for a function
+  /// of its type.
+  before: Int,
+  met: Meetings,
+  waits: Option<Bytes>,
+  rest: List<Slot>,
+  reaches: List<Bytes>,
+}
+
+/// What the parameters after a call's written arguments take, typed.
+type Took = { checker: Checker, rest: List<Taken>, row: Row }
+
+/// What `d` takes where no argument is named: each default.
+fn defaults_taken(d: Dotted) -> Took =
+  {
+    checker: d.checker,
+    rest: fold(d.rest, [], |acc: List<Taken>, slot: Slot|
+      match slot { FromDefault(copied) -> push(acc, Copied(copied)), _ -> acc }),
+    row: row_empty(),
+  }
+
+/// A call on a value, `base.name(args)`, as far as its callee: a function a record holds in its
+/// field `name`, or the function `name` of the head of the value's type; `base.m::f(args)` calls
+/// `m::f`. `b` is the value as its caller typed it and `base` as it is written.
+fn dotted_callee(
+  span: Span,
+  b: Inferred,
+  base: Expr,
+  name: Ident,
+  args: List<Expr>,
+  named: List<NamedArg>,
+  labels: List<Ident>,
+) -> Dotted / {abort.raise} = {
+  let ty = resolve(b.checker, b.ty);
+  let none = |c: Checker, callee: DottedCallee|
+    {
+      checker: c,
+      callee: callee,
+      params: [],
+      before: 0,
+      met: NothingMet,
+      waits: None,
+      rest: [],
+      reaches: [],
+    };
+  let of_type = |m: { qname: QName, callee: Bytes }| {
+    let filled = member_args(b.checker, span, m.callee, base, args, named);
+    let func = EVar({ span: name.span, name: m.qname });
+    let f0: Inferred = infer_var(filled.checker, m.qname);
+    let params = match shallow(f0.checker.subst, f0.ty) { TyFn(fn_) -> fn_.params, _ -> [] };
+    // A named value is typed after the callee's labels are filled, as any argument is, and
+    // before another use of a label-generic definition hides the callee's.
+    let names = fold(filled.rest, false, |any: Bool, slot: Slot|
+      any || (match slot { FromName(_) -> true, _ -> false }));
+    let ready: Checker = if !names { f0.checker } else {
+      fill_labels(called(f0.checker, name.span), span, labels, callee_labels(f0.checker, name.span))
+    };
+    {
+      checker: ready,
+      callee: OfType({ qname: m.qname, callee: m.callee, ty: f0.ty, row: f0.row, labelled: names }),
+      params: params,
+      before: 1,
+      met: match list_at(params, 0) {
+        Some(p) -> Meeting({ expected: p, found: b.ty, before: NothingMet }),
+        None -> NothingMet,
+      },
+      waits: if names { callee_repeats(ready, func, concat([base], args)).waits } else { None },
+      rest: filled.rest,
+      reaches: filled.reaches,
+    }
+  };
+  let field = match record_fields(ty) { Some(fs) -> field_get(fs, name.name), None -> None };
+  match ((written_function(name), field)) {
+    (Some(q), _) -> match find(b.checker.resolved, b.checker.module, ValueSpace, q) {
+      Some(found) -> of_type({ qname: through_module(b.checker, q), callee: found.qualified }),
+      // Nothing so named: the name is read as any other, which says so.
+      None -> {
+        let o: Inferred = infer_var(b.checker, q);
+        none(o.checker, NoCallee(o.ty))
+      },
+    },
+    // A function a field holds has no parameter to name: each named value is refused, and typed
+    // as the argument it would be after those written.
+    (None, Some(held)) ->
+      {
+        ..none(unnamed(b.checker, named), HeldInField(held)),
+        params: match shallow(b.checker.subst, held) { TyFn(fn_) -> fn_.params, _ -> [] },
+        rest: map(range(0, len(named)), |j: Int| FromName(j)),
+      },
+    (None, None) -> {
+      let head = match ty { TyCon(c) -> Some(c.name), TyNominal(n) -> Some(n.name), _ -> None };
+      match head {
+        None -> {
+          let o: WithTy = new_ty(
+            report_error_at(
+              b.checker,
+              b"E0201",
+              expr_span(base),
+              bytes_concat_all([b"cannot call `", name.name, b"` on this value"]),
+              bytes_concat_all([b"this has type `", type_text(ty), b"`"]),
+              [
+                b"`value.name(..)` calls the function `name` of the value's type, or a function a record holds in a field `name`: a type parameter, a function and a record with no such field have neither",
+                b"annotate the value where its type is not yet known",
+              ],
+            ),
+          );
+          none(o.checker, NoCallee(o.ty))
+        },
+        Some(of) -> match member_function(b.checker, of, name) {
+          None -> {
+            let o: WithTy = new_ty(no_function_of(b.checker, of, name));
+            none(o.checker, NoCallee(o.ty))
+          },
+          Some(m) -> of_type(m),
+        },
+      }
+    },
+  }
+}
+
+/// The call on a value `d` reads, typed: `taken` is what the parameters after its written
+/// arguments take, and `b` the value, so nothing of the call is walked twice.
+fn dotted(
+  span: Span,
+  d: Dotted,
+  taken: Took,
+  b: Inferred,
+  base: Expr,
+  name: Ident,
+  args: List<Expr>,
+  labels: List<Ident>,
+  hint: Option<Hint>,
+  performed: Bool,
+) -> Inferred / {abort.raise} = {
+  let answered = |o: Inferred, noted: Checker| {
+    let j: WithRow = join(noted, span, b.row, o.row);
+    let k: WithRow = join(j.checker, span, j.row, taken.row);
+    { checker: k.checker, ty: o.ty, row: k.row }
+  };
+  match d.callee {
+    NoCallee(ty) -> { checker: taken.checker, ty: ty, row: b.row },
+    HeldInField(held) -> {
+      let o: Inferred = applied_call(
+        span,
+        EField({ span: span_to(expr_span(base), name.span), base: base, field: name }),
+        { checker: taken.checker, ty: held, row: row_empty() },
+        None,
+        args,
+        labels,
+        hint,
+        rest: taken.rest,
+      );
+      // Written as a perform, it is filed for the rewrite to write as the call of a field.
+      answered(o, if !performed { o.checker } else {
+        {
+          ..o.checker,
+          member_sites: push(o.checker.member_sites, {
+            module: o.checker.module,
+            span: span,
+            qualifier: b"",
+            name: b"",
+            callee: b"",
+            owner: o.checker.walking,
+            reaches: [],
+          }),
+        }
+      })
+    },
+    OfType(m) -> {
+      let o: Inferred = applied_call(
+        span,
+        EVar({ span: name.span, name: m.qname }),
+        { checker: taken.checker, ty: m.ty, row: m.row },
+        Some({ written: base, ty: b.ty }),
+        args,
+        if m.labelled { [] } else { labels },
+        hint,
+        rest: taken.rest,
+      );
+      answered(o, {
+        ..o.checker,
+        member_sites: push(o.checker.member_sites, {
+          module: o.checker.module,
+          span: span,
+          qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
+          name: m.qname.name.name,
+          callee: m.callee,
+          owner: o.checker.walking,
+          reaches: d.reaches,
+        }),
+      })
+    },
+  }
+}
+
 /// The prelude name a bare callee resolves to, or nothing for one the program declares.
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
@@ -5637,13 +6276,6 @@ fn operator_hidden(checker: Checker, func: Expr, args: List<Expr>) -> Checker / 
     _ -> checker,
   }
 
-/// The member of the group being walked that a call names, when it names one.
-fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
-  match src {
-    PerformVia(name) -> if group_member(checker, name) { Some(name) } else { None },
-    _ -> None,
-  }
-
 type Met = { checker: Checker, tails: List<Int> }
 
 type Widened = { checker: Checker, ty: Type, tails: List<Int> }
@@ -5856,59 +6488,54 @@ fn expect_argument(
   match u.error { None -> c, Some(e) -> report_unify(c, e, span, b"argument type") }
 }
 
-/// Each call inside the group just walked, `members`, that fills a member's type parameter with a
-/// type built from a member's own: each round of the recursion would call for the member at a
-/// larger type, so no finite set of copies of it serves the group. A parameter passed along as it
-/// is, and a type that names none, do not grow.
-fn refuse_growth(checker: Checker, members: List<GroupDef>) -> Checker / {abort.raise} = {
-  let own = fold(members, [], |vs: List<Int>, g: GroupDef|
-    fold(g.types, vs, |acc: List<Int>, p: RigidParam| push(acc, p.var)));
-  let naming = fold(members, printer_new(), |acc: Printer, g: GroupDef|
-    fold(g.types, acc, |printer: Printer, p: RigidParam| printer_naming(printer, p.var, p.name)));
-  fold(checker.group_fills, { ..checker, group_fills: [] }, |c: Checker, f: GroupFill| {
-    let params = fold(members, [], |acc: List<RigidParam>, g: GroupDef|
-      if g.name == f.callee { g.types } else { acc });
-    fold(range(0, min(len(f.args), len(params))), c, |inner: Checker, i: Int| {
-      let ty = resolve(inner, at(f.args, i));
-      let grows = match ty {
-        TyVar(_) -> false,
-        _ ->
-          fold(free_vars(inner.subst, ty, { tys: [], rows: [] }).tys, false, |b: Bool, v: Int|
-            b || contains(own, v)),
-      };
-      if !grows { inner } else {
-        let name = simple_name_of(f.callee);
-        let param = at(params, i).name;
-        let refused = report_error_at(
-          { ..inner, module: f.module },
-          b"E0308",
-          f.span,
-          bytes_concat_all([
-            b"a call to `",
-            name,
-            b"` inside its own recursive group gives `",
-            param,
-            b"` a type that grows",
-          ]),
-          bytes_concat_all([b"`", param, b"` would be `", print_ty(naming, ty).text, b"` here"]),
-          [
-            bytes_concat_all([
-              b"each time round the recursion `",
-              name,
-              b"` would be called at a larger type, so no finite set of copies of it serves the group: that is polymorphic recursion",
-            ]),
-            bytes_concat_all([
-              b"pass a type parameter along as it is, or a type that names none; or break the cycle so `",
-              name,
-              b"` is checked on its own before this call",
-            ]),
-          ],
-        );
-        { ..refused, module: inner.module }
-      }
+/// Each of `fills`, calls a body makes, that fills a type parameter of a member of its own group
+/// `members` with a type built from the caller's own: each round of the recursion would call for
+/// the member at a larger type, so no finite set of copies of it serves the group. A parameter
+/// passed along as it is, and a type that names none, do not grow.
+fn refuse_growth(
+  checker: Checker,
+  members: List<GroupDef>,
+  fills: List<Fill>,
+) -> Checker / {abort.raise} =
+  fold(fills, checker, |c: Checker, f: Fill|
+    match fold(members, None, |acc: Option<List<RigidParam>>, g: GroupDef|
+        if g.name == f.callee { Some(g.types) } else { acc }) {
+      None -> c,
+      Some(params) ->
+        fold(f.grows, c, |inner: Checker, grown: { param: Int, ty: Bytes }|
+          match list_at(params, grown.param) {
+            None -> inner,
+            Some(p) -> {
+              let name = simple_name_of(f.callee);
+              let refused = report_error_at(
+                { ..inner, module: f.module },
+                b"E0308",
+                f.span,
+                bytes_concat_all([
+                  b"a call to `",
+                  name,
+                  b"` inside its own recursive group gives `",
+                  p.name,
+                  b"` a type that grows",
+                ]),
+                bytes_concat_all([b"`", p.name, b"` would be `", grown.ty, b"` here"]),
+                [
+                  bytes_concat_all([
+                    b"each time round the recursion `",
+                    name,
+                    b"` would be called at a larger type, so no finite set of copies of it serves the group: that is polymorphic recursion",
+                  ]),
+                  bytes_concat_all([
+                    b"pass a type parameter along as it is, or a type that names none; or break the cycle so `",
+                    name,
+                    b"` is checked on its own before this call",
+                  ]),
+                ],
+              );
+              { ..refused, module: inner.module }
+            },
+          }),
     })
-  })
-}
 
 fn infer_app_general(
   checker: Checker,
@@ -5917,8 +6544,31 @@ fn infer_app_general(
   args: List<Expr>,
   labels: List<Ident>,
   hint: Option<Hint>,
+) -> Inferred / {abort.raise} =
+  applied_call(span, func, infer(checker, func), None, args, labels, hint)
+
+/// What a parameter after a call's written arguments takes: a named value, typed already, or its
+/// default.
+type Taken = | Settled({ written: Expr, ty: Type }) | Copied(Expr)
+
+/// A call of a callee typed already, `f0`, which `func` only writes: `on` is the value a call is
+/// made on, the callee's first argument, typed already too, `given` the arguments after it, and
+/// `rest` what the parameters after those take.
+fn applied_call(
+  span: Span,
+  func: Expr,
+  f0: Inferred,
+  on: Option<{ written: Expr, ty: Type }>,
+  given: List<Expr>,
+  labels: List<Ident>,
+  hint: Option<Hint>,
+  rest: List<Taken> = [],
 ) -> Inferred / {abort.raise} = {
-  let f0: Inferred = infer(checker, func);
+  // Every argument in its parameter's place, for what reads the arguments without typing them.
+  let args = concat(
+    match on { Some(x) -> concat([x.written], given), None -> given },
+    map(rest, |t: Taken| match t { Settled(x) -> x.written, Copied(d) -> d }),
+  );
   // Before the arguments, so a written label is what an argument's row is checked against.
   let f: Inferred = {
     checker: fill_labels(
@@ -5949,14 +6599,35 @@ fn infer_app_general(
     _ -> { params: [], met: NothingMet },
   };
   let builtin = prelude_named(f.checker, func);
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
+  let written: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     f.checker,
-    args,
+    given,
     span,
-    repeats,
+    repeats.params,
+    repeats.waits,
     called.params,
     called.met,
     ranged_lambda(f.checker, builtin, args),
+    first: match on { Some(x) -> Some(x.ty), None -> None },
+  );
+  // A default is typed where the walk of the body ends: it is no part of the call.
+  let as_: { checker: Checker, tys: List<Type>, row: Row } = fold(
+    range(0, len(rest)),
+    written,
+    |acc: { checker: Checker, tys: List<Type>, row: Row }, k: Int|
+      match ((at(rest, k), list_at(called.params, len(written.tys) + k))) {
+        (Settled(x), _) -> { ..acc, tys: push(acc.tys, x.ty) },
+        (Copied(d), Some(p)) ->
+          {
+            ..acc,
+            checker: {
+              ..acc.checker,
+              copied_defaults: push(acc.checker.copied_defaults, { expr: d, ty: p }),
+            },
+            tys: push(acc.tys, p),
+          },
+        _ -> acc,
+      },
   );
   let j0: WithRow = join(as_.checker, span, f.row, as_.row);
   let c: Checker = j0.checker;
@@ -5989,7 +6660,6 @@ fn infer_app_general(
       { checker: j.checker, ty: fn_.ret, row: j.row }
     } else {
       let source = callee_source(c, func);
-      let callee: Option<Bytes> = group_callee(c, source);
       let handed: { checker: Checker, tys: List<Type> } = if builtin == b"bracket" {
         joined_callbacks(c, span, as_.tys)
       } else { { checker: c, tys: as_.tys } };
@@ -6019,29 +6689,57 @@ fn infer_app_general(
       let obliged: Checker = required.checker;
       let effects = if required.shown { { ..resolved, atoms: without_raises(resolved.atoms) } }
       else { resolved };
-      let scaled = repeated_rows(obliged, fn_.params, repeats);
-      let scales = match source {
-        PerformVia(name) -> match def_of(obliged, name) { Some(d) -> d.scaling, None -> [] },
-        _ -> [],
+      let scaled = repeated_rows(obliged, fn_.params, repeats.params);
+      // What each parameter's functions perform, for a callee whose counts are not in yet: read
+      // only where the call performs something a parameter could be the source of.
+      let holding: { checker: Checker, params: List<Int> } = match repeats.waits {
+        Some(g) -> if len(effects.atoms) == 0 && effects.tail == None {
+          { checker: obliged, params: [] }
+        } else { fn_holding(obliged, g) },
+        None -> { checker: obliged, params: [] },
       };
-      let entered: Checker = match callee {
-        Some(_) -> match obliged.recursed {
-          Some(_) -> obliged,
-          None -> { ..obliged, recursed: Some(span) },
+      let held = map(holding.params, |i: Int|
+        {
+          param: i,
+          rows: match list_at(fn_.params, i) {
+            Some(p) -> rows_in(holding.checker, p, { atoms: [], vars: [] }),
+            None -> { atoms: [], vars: [] },
+          },
+        });
+      let waiting = |g: Bytes, has: ({ atoms: List<Atom>, vars: List<Int> }) -> Bool|
+        fold(
+          held,
+          [],
+          |acc: List<Maybe>, h: { param: Int, rows: { atoms: List<Atom>, vars: List<Int> } }|
+            if has(h.rows) { push(acc, { callee: g, param: Some(h.param), span: span }) }
+            else { acc },
+        );
+      let entered: Checker = match repeats.waits {
+        Some(g) -> if !map_contains(holding.checker.own_fns, g) { holding.checker } else {
+          { ..holding.checker, calls: push(holding.checker.calls, { callee: g, span: span }) }
         },
-        None -> obliged,
+        None -> holding.checker,
       };
       let recorded: Checker = fold(effects.atoms, entered, |cc: Checker, atom: Atom|
-        record_over(
-          cc,
-          atom,
-          span,
-          source,
-          if contains(scaled.atoms, atom) || scales_like(scales, atom) { Some(span) }
-          else { cc.over },
-        ));
+        if contains(scaled.atoms, atom) { record_over(cc, atom, span, source, Some(span), []) }
+        else {
+          let own = match repeats.waits {
+            None -> [],
+            Some(g) ->
+              concat(
+                [{ callee: g, param: None, span: span }],
+                waiting(g, |h: { atoms: List<Atom>, vars: List<Int> }| contains(h.atoms, atom)),
+              ),
+          };
+          record_over(cc, atom, span, source, cc.over, concat(own, cc.maybe))
+        });
+      let tail_waits = match ((repeats.waits, effects.tail)) {
+        (Some(g), Some(v)) ->
+          waiting(g, |h: { atoms: List<Atom>, vars: List<Int> }| contains(h.vars, v)),
+        _ -> [],
+      };
       let j: WithRow = join(
-        repeat_tail(recorded, effects.tail, scaled.vars, span),
+        repeat_tail(recorded, effects.tail, scaled.vars, tail_waits, span),
         span,
         j0.row,
         effects,
@@ -6053,7 +6751,12 @@ fn infer_app_general(
       let eff: WithRow = new_row(ret.checker);
       let want = fn_type(as_.tys, ret.ty, eff.row);
       let x: Expected = expect(eff.checker, expr_span(func), want, f.ty, b"callee type");
-      let j: WithRow = join(repeat_tail(x.checker, eff.row.tail, [], span), span, j0.row, eff.row);
+      let j: WithRow = join(
+        repeat_tail(x.checker, eff.row.tail, [], [], span),
+        span,
+        j0.row,
+        eff.row,
+      );
       { checker: j.checker, ty: ret.ty, row: j.row }
     },
     other -> {
@@ -7381,6 +8084,27 @@ fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {ab
   }
 }
 
+/// Whether `x` in `x.name(..)` is a local binding, so the call is one on its value and no perform.
+fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} =
+  is_bare(x) && (match env_depth_of(checker.env, x.name.name) { Some(d) -> d > 0, None -> false })
+
+fn names_effect(checker: Checker, x: QName) -> Bool / {abort.raise} =
+  lookup(scope_of(checker).bound, EffectSpace, x.name.name) != None
+
+/// A local and an effect of one name leave `x.name(..)` with two readings, which is refused: the
+/// call is then read as the perform.
+fn both_named(checker: Checker, x: QName) -> Checker =
+  report_error_at(
+    checker,
+    b"E0105",
+    x.span,
+    bytes_concat_all([b"`", x.name.name, b"` is a binding here and an effect"]),
+    b"a call on the binding, or a perform of the effect",
+    [
+      b"`x.name(..)` calls a function on the value `x` where `x` is a binding, and performs an operation of the effect `x` otherwise; give the binding another name",
+    ],
+  )
+
 fn infer_perform(
   checker: Checker,
   span: Span,
@@ -7396,6 +8120,7 @@ fn infer_perform(
     args,
     span,
     [],
+    None,
     wanted,
     NothingMet,
     None,
@@ -8831,46 +9556,295 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
       },
   );
   let fns = map(collected.fns, |d: FnDef| carried(collected.checker, d));
-  // Components come callees first, so a callee is solved before its callers.
-  fold(fn_components(fns), collected.checker, |c: Checker, comp: List<Int>|
-    check_component(c, parsed, fns, comp))
+  let names = map(fns, |d: FnDef| qualify(parsed.name, d.name.name));
+  let placed: Checker = fold(fns, collected.checker, |c: Checker, d: FnDef|
+    member_declared(c, parsed, d));
+  let signed: Signed = fold(
+    range(0, len(fns)),
+    { checker: placed, sigs: [], members: [] },
+    |acc: Signed, i: Int| signed_fn(acc, parsed, at(fns, i), at(names, i)),
+  );
+  let own = fold(range(0, len(names)), map_new(), |m: Map<Bytes, Int>, i: Int|
+    map_insert(m, at(names, i), i));
+  let stated = stated_of(parsed);
+  // What a key answers is compared in its turn, so a comparison reads through it.
+  let answers = |f: Bytes|
+    match map_get(own, f) { Some(i) -> Some(at(signed.sigs, i).ret), None -> None };
+  let walked = fold(
+    walked_first(fns),
+    { checker: { ..signed.checker, own_fns: own }, bodies: map_new() },
+    |acc: { checker: Checker, bodies: Map<Int, Body> }, i: Int| {
+      let o = walked_fn(
+        acc.checker,
+        parsed,
+        at(fns, i),
+        at(names, i),
+        at(signed.sigs, i),
+        at(signed.members, i),
+        stated,
+        answers,
+      );
+      { checker: o.checker, bodies: map_insert(acc.bodies, i, o.body) }
+    },
+  );
+  let bodies = map(range(0, len(fns)), |i: Int|
+    match map_get(walked.bodies, i) {
+      Some(b) -> b,
+      None -> panic("a function of the module was not walked"),
+    });
+  let out = map(bodies, |b: Body|
+    fold(
+      concat(b.refs, map(concat(b.calls, b.stated), |c: OwnCall| c.callee)),
+      [],
+      |acc: List<Int>, n: Bytes|
+        match map_get(own, n) {
+          Some(i) -> if contains(acc, i) { acc } else { push(acc, i) },
+          None -> acc,
+        },
+    ));
+  let module: ModuleFns = { fns: fns, names: names, members: signed.members, bodies: bodies };
+  // Groups come callees first, so a callee is counted before its callers.
+  fold(
+    graph::components({ out: out }),
+    { ..walked.checker, own_fns: map_new() },
+    |c: Checker, comp: List<Int>| settle_group(c, module, comp),
+  )
 }
 
-/// `fns`, a module's functions each named once, in the groups a check solves them in: each group
-/// the functions that call one another round a cycle, a group after every group it calls.
-fn fn_components(fns: List<FnDef>) -> List<List<Int>> / {abort.raise} = {
-  let index = fold(range(0, len(fns)), map_new(), |acc: Map<Bytes, Int>, i: Int| {
-    let n = at(fns, i).name.name;
-    if map_contains(acc, n) { acc } else { map_insert(acc, n, i) }
-  });
-  let adj = map(fns, |d: FnDef| {
-    let refs = refs_of(d.body, param_names(d.params));
-    fold(refs.names, [], |acc: List<Int>, qname: QName|
+/// The module that declares the functions of the language's type `of` beside the prelude's.
+fn home_module(of: Bytes) -> Bytes / {abort.raise} =
+  bytes_concat(b"std.", bytes_of_string(ascii_lower(string_of_bytes(of))))
+
+/// A function of a type, `fn T::name`, is declared by the module that declares `T`, a sum or a
+/// `new` record, under no name a field of the record has: a call on a value finds it by the type
+/// alone, and reads a record's fields first.
+fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checker / {abort.raise} =
+  match member_of(def.name.name) {
+    None -> checker,
+    Some(m) -> {
+      let type_name = qualify(parsed.name, m.of);
+      match map_get(checker.types, type_name) {
+        None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name { checker }
+        else {
+          report_error_at(
+            checker,
+            b"E0208",
+            def.name.span,
+            bytes_concat_all([b"`", m.of, b"` is not a type this module declares"]),
+            b"declared in another module, or not at all",
+            [
+              b"a function of a type is found by the type alone, with no search, so only the module that declares the type declares one",
+            ],
+          )
+        },
+        Some(decl) -> match decl.declared {
+          DeclaredAlias(_) ->
+            report_error_at_and(
+              checker,
+              b"E0217",
+              def.name.span,
+              bytes_concat_all([
+                b"`",
+                m.of,
+                b"` is an alias, and a function of a type is of a sum or a `new` record",
+              ]),
+              b"no type of its own",
+              { module: decl.owner, span: decl.span },
+              b"declared here",
+              [
+                b"an alias is the type it names, so a function of one would be of every value of that type",
+              ],
+            ),
+          DeclaredRecord(_) -> match map_get(checker.nominals, type_name) {
+            Some(r) -> match record_fields(r.ty) {
+              Some(fs) -> if field_get(fs, m.member) == None { checker } else {
+                report_error_at_and(
+                  checker,
+                  b"E0105",
+                  def.name.span,
+                  bytes_concat_all([
+                    b"`",
+                    m.of,
+                    b"` has a field `",
+                    m.member,
+                    b"` and a function of that name",
+                  ]),
+                  b"declared again here",
+                  { module: decl.owner, span: decl.span },
+                  b"the field is declared here",
+                  [
+                    b"`value.name` reads a record's field and `value.name(..)` calls it, so a function of the record under the same name could never be called on a value; rename one",
+                  ],
+                )
+              },
+              None -> checker,
+            },
+            None -> checker,
+          },
+          DeclaredSum -> checker,
+        },
+      }
+    },
+  }
+
+/// The order a module's bodies are walked in: each after those its body names, where the names
+/// alone say. Nothing a module that checks means turns on it. A body that performs more than its
+/// unwritten row is read by the bodies walked after it as performing that, so one check names
+/// every row the program has to write.
+fn walked_first(fns: List<FnDef>) -> List<Int> / {abort.raise} = {
+  let index = fold(range(0, len(fns)), map_new(), |acc: Map<Bytes, Int>, i: Int|
+    map_insert(acc, at(fns, i).name.name, i));
+  let adj = map(fns, |d: FnDef|
+    fold(refs_of(d.body, param_names(d.params)).names, [], |acc: List<Int>, qname: QName|
       if !is_bare(qname) { acc } else {
         match map_get(index, qname.name.name) {
           Some(i) -> if contains(acc, i) { acc } else { push(acc, i) },
           None -> acc,
         }
-      })
-  });
-  graph::components({ out: adj })
+      }));
+  fold(graph::components({ out: adj }), [], |acc: List<Int>, comp: List<Int>| concat(acc, comp))
 }
 
-/// The functions of `parsed` a check walks, each by its program-wide name, in the order it walks
-/// them: a function named twice, or by a name a builtin holds, is refused rather than walked.
-pub fn walk_order(parsed: ParsedModule) -> List<Bytes> / {abort.raise} = {
-  let fns = fold(parsed.module.items, [], |acc: List<FnDef>, item: Item|
+/// The functions of `parsed` a check walks, each by its program-wide name, in the order it files
+/// them, which is the order they are written in: a function named twice, or by a name a builtin
+/// holds, is refused rather than walked.
+pub fn walk_order(parsed: ParsedModule) -> List<Bytes> =
+  fold(parsed.module.items, [], |acc: List<Bytes>, item: Item|
     match item {
-      IFn(def) -> if fold(acc, false, |b: Bool, f: FnDef| b || f.name.name == def.name.name)
+      IFn(def) -> if contains(acc, qualify(parsed.name, def.name.name))
           || is_cell_builtin(def.name.name)
           || def.name.name == compare_values_name()
           || call_operator(def.name.name) != None
           || def.name.name == b"map_of_entries" { acc }
-      else { push(acc, def) },
+      else { push(acc, qualify(parsed.name, def.name.name)) },
       _ -> acc,
-    });
-  fold(fn_components(fns), [], |acc: List<Bytes>, comp: List<Int>|
-    fold(comp, acc, |a: List<Bytes>, i: Int| push(a, qualify(parsed.name, at(fns, i).name.name))))
+    })
+
+/// What each type of `parsed` states, by the type's qualified name.
+fn stated_of(parsed: ParsedModule) -> Map<Bytes, StatedFns> = {
+  let none: StatedFns = { key: None, show: None, numeric: [] };
+  let of = |m: Map<Bytes, StatedFns>, target: Ident|
+    match map_get(m, qualify(parsed.name, target.name)) { Some(x) -> x, None -> none };
+  fold(parsed.module.items, map_new(), |acc: Map<Bytes, StatedFns>, item: Item|
+    match item {
+      IInstance(def) -> {
+        let by = Some(qualify(parsed.name, def.by.name));
+        let was = of(acc, def.target);
+        map_insert(acc, qualify(parsed.name, def.target.name), if is_key(def.kind) {
+          { ..was, key: by }
+        } else { { ..was, show: by } })
+      },
+      INumeric(def) ->
+        map_insert(acc, qualify(parsed.name, def.target.name), {
+          ..of(acc, def.target),
+          numeric: map(numeric_ops(), |op: Bytes|
+            match numeric_by(def, op) { Some(by) -> qualify(parsed.name, by.name), None -> b"" }),
+        }),
+      _ -> acc,
+    })
+}
+
+/// The functions `stated` names that comparing a value of `ty`, or with `key` false showing one,
+/// calls: a type that states one is read through it, a key's answer compared in its turn, and any
+/// other type through what it holds. `room` is how many more declarations the walk may enter.
+fn stated_in(
+  checker: Checker,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+  ty: Type,
+  key: Bool,
+  room: Int,
+  acc: Reached,
+) -> Reached / {abort.raise} =
+  match ty {
+    TyVar(_) -> acc,
+    TyFn(_) -> acc,
+    TyRecord(fs) ->
+      fold(fs, acc, |a: Reached, f: Field| stated_in(checker, stated, answers, f.ty, key, room, a)),
+    TyNominal(n) ->
+      fold(n.fields, acc, |a: Reached, f: Field|
+        stated_in(checker, stated, answers, f.ty, key, room, a)),
+    TyCon(c) -> {
+      let args = fold(c.args, acc, |a: Reached, x: Type|
+        stated_in(checker, stated, answers, x, key, room, a));
+      if room <= 0 || contains(args.seen, c.name) { args } else {
+        let within: Reached = { seen: push(args.seen, c.name), fns: args.fns };
+        let said = match map_get(stated, c.name) {
+          Some(x) -> if key { x.key } else { x.show },
+          None -> None,
+        };
+        match said {
+          Some(f) -> {
+            let called: Reached = {
+              seen: within.seen,
+              fns: if contains(within.fns, f) { within.fns } else { push(within.fns, f) },
+            };
+            match ((key, answers(f))) {
+              (true, Some(t)) ->
+                stated_in(checker, stated, answers, resolve(checker, t), key, room - 1, called),
+              _ -> called,
+            }
+          },
+          None ->
+            fold(
+              filter(checker.ctors, |k: CtorInfo| k.type_name == c.name),
+              within,
+              |a: Reached, k: CtorInfo|
+                fold(k.fields, a, |b: Reached, f: Type|
+                  stated_in(checker, stated, answers, f, key, room - 1, b)),
+            ),
+        }
+      }
+    },
+  }
+
+/// The calls `body` makes of what the module's types state, each at the expression that makes it:
+/// an operator at a type that states its arithmetic, and a comparison, a `Map` or a constrained
+/// parameter at a type that holds one stating a key or a show.
+fn stated_calls(
+  checker: Checker,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+  body: TypedSites,
+) -> List<OwnCall> / {abort.raise} = {
+  let reached = |ty: Type, key: Bool|
+    stated_in(checker, stated, answers, resolve(checker, ty), key, keyed_room(checker), {
+      seen: [],
+      fns: [],
+    }).fns;
+  let arithmetic = |ty: Type|
+    match resolve(checker, ty) {
+      TyCon(c) -> match map_get(stated, c.name) { Some(x) -> x.numeric, None -> [] },
+      _ -> [],
+    };
+  let at_ = |acc: List<OwnCall>, span: Span, fns: List<Bytes>|
+    fold(fns, acc, |a: List<OwnCall>, f: Bytes|
+      if f == b"" { a } else { push(a, { callee: f, span: span }) });
+  let operators = fold(body.numerics, [], |acc: List<OwnCall>, n: Numeric|
+    at_(acc, n.span, if is_ordered(n.op) { reached(n.ty, true) } else {
+      match numeric_slot(n.op) {
+        Some(i) -> match list_at(arithmetic(n.ty), i) { Some(f) -> [f], None -> [] },
+        None -> [],
+      }
+    }));
+  let compared = fold(
+    body.comparisons,
+    operators,
+    |acc: List<OwnCall>, x: { module: Int, span: Span, ty: Type }|
+      at_(acc, x.span, reached(x.ty, true)),
+  );
+  let keyed = fold(body.map_keys, compared, |acc: List<OwnCall>, x: MapKeySite|
+    at_(acc, x.span, reached(x.key, true)));
+  fold(body.constrained, keyed, |acc: List<OwnCall>, x: ConstraintSite|
+    at_(acc, x.span, match x.deriver {
+      DShow -> reached(x.ty, false),
+      DEq -> reached(x.ty, true),
+      DOrd -> reached(x.ty, true),
+      DHash -> reached(x.ty, true),
+      DNumeric -> concat(arithmetic(x.ty), reached(x.ty, true)),
+      DInteger -> concat(arithmetic(x.ty), reached(x.ty, true)),
+      _ -> [],
+    }))
 }
 
 /// An operation atom's mode is its declaration's; a row read back from text does not carry it.
@@ -8910,157 +9884,426 @@ fn group_callee_kind(
     }
   }
 
-fn check_component(
+/// Where `op` stands among the operations a `numeric` names.
+fn numeric_slot(op: Bytes) -> Option<Int> / {abort.raise} =
+  fold(range(0, len(numeric_ops())), None, |found: Option<Int>, i: Int|
+    match found {
+      Some(_) -> found,
+      None -> if at(numeric_ops(), i) == op { Some(i) } else { None },
+    })
+
+/// Binds `def` by what its signature writes, for every body of its module to call it by, and files
+/// what the signature alone says of it. The constraints it writes stand for each walk, so a call
+/// from its own module answers for them as a call from outside will.
+fn signed_fn(acc: Signed, parsed: ParsedModule, def: FnDef, name: Bytes) -> Signed / {abort.raise} = {
+  let s: WithSig = written_signature({ ..acc.checker, derived: derived_of(parsed, def) }, def);
+  let scheme = member_scheme(s.checker, def, s.sig);
+  let labels = fold(def.generics.labels, [], |vs: List<Int>, ident: Ident|
+    match map_get(s.sig.label_params, ident.name) { Some(v) -> push(vs, v), None -> vs });
+  let types = fold(def.generics.types, [], |ps: List<RigidParam>, ident: Ident|
+    match map_get(s.sig.ty_params, ident.name) {
+      Some(TyVar(v)) -> if contains(scheme.ty_vars, v) { push(ps, { name: ident.name, var: v }) }
+      else { ps },
+      _ -> ps,
+    });
+  let constraints = published_constraints({ ..s.checker, ty_params: s.sig.ty_params }, def, scheme);
+  let bound: Checker = {
+    ..s.checker,
+    derived: None,
+    env: env_bind_global(s.checker.env, name, scheme),
+    constraints: map_insert(s.checker.constraints, name, constraints),
+  };
+  {
+    checker: set_def(bound, {
+      name: name,
+      module: parsed.name,
+      simple_name: def.name.name,
+      scheme: scheme,
+      footprint: resolve_row_in(bound, s.sig.published_row).atoms,
+      performed: [],
+      scaling: [],
+      repeats: [],
+      bounded: map(s.sig.bounded, |a: Atom| resolve_atom(bound.subst, a)),
+      tail_bounded: s.sig.tail_bounded,
+      ending: Ends,
+      summary: unknown_summary(),
+      raises: [],
+      row_aliases: row_aliases(def),
+      constraints: constraints,
+      spec: [],
+      at: location_of(bound, def.span),
+    }),
+    sigs: push(acc.sigs, s.sig),
+    members: push(acc.members, { name: name, labels: labels, types: types }),
+  }
+}
+
+/// Walks `def`'s body against the signatures of its module, holds it to what its signature writes,
+/// publishes what no group decides of it, and closes what its group reads. A definition whose rows
+/// are handed in is published from its written signature and them instead. A row that will not
+/// unify is one the caller should never have filed, which is nothing this program's author can act
+/// on, so the body is walked: slower, and right whatever the row said. `stated` is what the
+/// module's types state, and `answers` what a function of the module answers.
+fn walked_fn(
   checker: Checker,
   parsed: ParsedModule,
-  fns: List<FnDef>,
-  comp: List<Int>,
-) -> Checker / {abort.raise} = {
-  let qualified = map(comp, |i: Int| qualify(parsed.name, at(fns, i).name.name));
-  // The constraints a member's signature writes stand for the walk, so a call inside the group
-  // answers for them as a call from outside will.
-  let sigs: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> } = fold(
-    range(0, len(comp)),
-    { checker: checker, sigs: [], schemes: [] },
-    |acc: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> }, slot: Int| {
-      let def = at(fns, at(comp, slot));
-      let s: WithSig = written_signature({ ..acc.checker, derived: derived_of(parsed, def) }, def);
-      let scheme = member_scheme(s.checker, def, s.sig);
-      {
-        checker: {
-          ..s.checker,
-          derived: None,
-          env: env_bind_global(s.checker.env, at(qualified, slot), scheme),
-          constraints: map_insert(
-            s.checker.constraints,
-            at(qualified, slot),
-            published_constraints({ ..s.checker, ty_params: s.sig.ty_params }, def, scheme),
-          ),
-        },
-        sigs: push(acc.sigs, s.sig),
-        schemes: push(acc.schemes, scheme),
-      }
-    },
-  );
-  let grouped: Checker = {
-    ..sigs.checker,
-    group_defs: fold(range(0, len(comp)), [], |acc: List<GroupDef>, slot: Int| {
-      let def = at(fns, at(comp, slot));
-      let sig = at(sigs.sigs, slot);
-      let labels = fold(def.generics.labels, [], |vs: List<Int>, ident: Ident|
-        match map_get(sig.label_params, ident.name) { Some(v) -> push(vs, v), None -> vs });
-      let filled = at(sigs.schemes, slot).ty_vars;
-      let types = fold(def.generics.types, [], |ps: List<RigidParam>, ident: Ident|
-        match map_get(sig.ty_params, ident.name) {
-          Some(TyVar(v)) -> if contains(filled, v) { push(ps, { name: ident.name, var: v }) }
-          else { ps },
-          _ -> ps,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  member: GroupDef,
+  stated: Map<Bytes, StatedFns>,
+  answers: (Bytes) -> Option<Type> / {abort.raise},
+) -> { checker: Checker, body: Body } / {abort.raise} = {
+  let handed = seeded_rows(checker, name);
+  let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
+    None -> None,
+    Some(rows) -> match ((
+        placed_labels(rows.footprint, member.labels),
+        placed_labels(rows.performed, member.labels),
+        placed_labels(rows.scaling, member.labels),
+      )) {
+      (Some(footprint), Some(performed), Some(scaling)) -> {
+        // The rows handed in carry atoms alone; a row ends in what the signature writes, the
+        // definition's own row parameter when it is generic over one.
+        let u = unify_row(checker.subst, checker.fresh, sig.published_row, {
+          ..settled_row(checker, footprint),
+          tail: resolve_row_in(checker, sig.published_row).tail,
         });
-      push(acc, { name: at(qualified, slot), labels: labels, types: types })
-    }),
-  };
-  // A definition whose rows are handed in is published from its written signature and them. A row that will not unify is one the caller should never have filed, which is
-  // nothing this program's author can act on, so the body is walked instead: slower, and right
-  // whatever the row said.
-  let bodies: Walked = fold(
-    range(0, len(comp)),
-    { checker: grouped, rows: [], counts: [], filed: [] },
-    |acc: Walked, slot: Int| {
-      let def = at(fns, at(comp, slot));
-      let sig = at(sigs.sigs, slot);
-      let handed = seeded_rows(acc.checker, at(qualified, slot));
-      let labels = at(grouped.group_defs, slot).labels;
-      let taken: Option<{ checker: Checker, row: Row, count: Count }> = match handed {
-        None -> None,
-        Some(rows) -> match ((
-            placed_labels(rows.footprint, labels),
-            placed_labels(rows.performed, labels),
-            placed_labels(rows.scaling, labels),
-          )) {
-          (Some(footprint), Some(performed), Some(scaling)) -> {
-            // The rows handed in carry atoms alone; a row ends in what the signature writes, the
-            // definition's own row parameter when it is generic over one.
-            let u = unify_row(acc.checker.subst, acc.checker.fresh, sig.published_row, {
-              ..settled_row(acc.checker, footprint),
-              tail: resolve_row_in(acc.checker, sig.published_row).tail,
-            });
-            // Left uninstalled when it failed, so a walk starts from the substitution it would have.
-            match u.error {
-              Some(_) -> None,
-              None -> {
-                let c: Checker = with_unified(acc.checker, u);
-                Some({
-                  checker: c,
-                  row: settled_row(c, performed),
-                  count: {
-                    scaling: settled_row(c, scaling).atoms,
-                    sites: [],
-                    repeats: rows.repeats,
-                    tail_over: None,
-                    recursed: None,
-                    raises: rows.raises,
-                  },
-                })
+        // Left uninstalled when it failed, so a walk starts from the substitution it would have.
+        match u.error {
+          Some(_) -> None,
+          None -> {
+            let c: Checker = with_unified(checker, u);
+            Some({
+              checker: c,
+              row: settled_row(c, performed),
+              count: {
+                scaling: settled_row(c, scaling).atoms,
+                sites: [],
+                repeats: rows.repeats,
+                tail_over: None,
+                recursed: None,
+                raises: rows.raises,
               },
-            }
+            })
           },
-          _ -> None,
-        },
+        }
+      },
+      _ -> None,
+    },
+  };
+  let stepped: { checker: Checker, body: Body } = match taken {
+    Some(x) -> {
+      let filed: Checker = {
+        ..x.checker,
+        seeded: push(x.checker.seeded, name),
+        kept: push(x.checker.kept, {
+          name: name,
+          facts: match handed { Some(rows) -> rows.facts, None -> b"" },
+        }),
       };
-      let stepped: { checker: Checker, row: Row, count: Count } = match taken {
-        Some(x) ->
-          {
-            checker: {
-              ..x.checker,
-              seeded: push(x.checker.seeded, at(qualified, slot)),
-              kept: push(x.checker.kept, {
-                name: at(qualified, slot),
-                facts: match handed { Some(rows) -> rows.facts, None -> b"" },
-              }),
-            },
-            row: x.row,
-            count: x.count,
-          },
-        None -> {
-          let o: Counted = check_fn_body(
-            { ..acc.checker, derived: derived_of(parsed, def), walking: at(qualified, slot) },
-            def,
-            sig,
-          );
-          {
-            checker: { ..o.checker, derived: None, recursed: None, walking: b"" },
-            row: o.row,
-            count: {
-              scaling: map(o.scaling, |s: PerformSite| s.atom),
-              sites: o.scaling,
-              repeats: o.repeats,
-              tail_over: o.tail_over,
-              recursed: o.checker.recursed,
-              raises: o.raises,
-            },
-          }
-        },
-      };
+      let p = published_fn(filed, parsed, def, name, sig, x.row);
       {
-        checker: record_spec_env(stepped.checker, def, at(qualified, slot), sig),
-        rows: push(acc.rows, stepped.row),
-        counts: push(acc.counts, stepped.count),
-        filed: push(acc.filed, match taken { Some(_) -> handed, None -> None }),
+        checker: p.checker,
+        body: {
+          ..signed_body(p.checker, sig, p.row, p.written),
+          filed: handed,
+          count: Some(x.count),
+        },
       }
     },
-  );
+    None -> {
+      let o: Walk = check_fn_body(
+        { ..checker, derived: derived_of(parsed, def), walking: name },
+        def,
+        sig,
+      );
+      let walked: Checker = { ..o.checker, derived: None, walking: b"" };
+      // Typed, its operators and comparisons say which of the module's functions they call, as
+      // its calls on values do.
+      let members = fold(
+        drop(walked.member_sites, len(checker.member_sites)),
+        [],
+        |acc: List<OwnCall>, m: MemberSite|
+          if bytes_len(m.callee) == 0 { acc }
+          else { push(acc, { callee: m.callee, span: m.span }) },
+      );
+      let calls = if map_len(stated) == 0 { members } else {
+        concat(
+          members,
+          stated_calls(walked, stated, answers, {
+            numerics: drop(walked.numerics, len(checker.numerics)),
+            comparisons: drop(walked.comparisons, len(checker.comparisons)),
+            map_keys: drop(walked.map_keys, len(checker.map_keys)),
+            constrained: drop(walked.constrained_uses, len(checker.constrained_uses)),
+          }),
+        )
+      };
+      let settled: Checker = settle_columns(
+        settle_bit_ops(settle_numerics(settle_concats(settle_updates(walked)))),
+      );
+      let judged: Checker = close_unreachable_row(
+        bounded_row(require_written_signature(settled, def, sig), def, sig),
+        sig,
+      );
+      let p = published_fn(judged, parsed, def, name, sig, o.row);
+      let c = p.checker;
+      let own = map(member.types, |t: RigidParam| t.var);
+      let naming = fold(member.types, printer_new(), |printer: Printer, t: RigidParam|
+        printer_naming(printer, t.var, t.name));
+      {
+        checker: c,
+        body: {
+          ..signed_body(c, sig, p.row, p.written),
+          performs: map(o.performs, |site: PerformSite|
+            { ..site, atom: resolve_atom(c.subst, site.atom) }),
+          repeated_vars: map(o.repeated_vars, |r: Repeated|
+            {
+              ..r,
+              var: match resolve_row_in(c, row_open(r.var)).tail { Some(v) -> v, None -> r.var },
+            }),
+          raise_notes: o.raise_notes,
+          refs: o.refs,
+          calls: o.calls,
+          stated: calls,
+          tags: map(o.tag_uses, |u: TagUse|
+            {
+              name: u.name,
+              refusal: error_at(
+                b"E0152",
+                c.module,
+                u.t.tag.span,
+                bytes_concat_all([
+                  b"`",
+                  u.t.tag.name,
+                  b"::",
+                  u.callee.name.name,
+                  b"` is in a recursion with what holds the literal",
+                ]),
+                b"a tag is whole before a literal of it is checked",
+                [tag_rule(u.t)],
+              ),
+            }),
+          fills: map(o.fills, |f: GroupFill|
+            {
+              module: f.module,
+              span: f.span,
+              callee: f.callee,
+              grows: fold(
+                range(0, len(f.args)),
+                [],
+                |acc: List<{ param: Int, ty: Bytes }>, i: Int| {
+                  let ty = resolve(c, at(f.args, i));
+                  let grows = match ty {
+                    TyVar(_) -> false,
+                    _ ->
+                      fold(
+                        free_vars(c.subst, ty, { tys: [], rows: [] }).tys,
+                        false,
+                        |b: Bool, v: Int| b || contains(own, v),
+                      ),
+                  };
+                  if grows { push(acc, { param: i, ty: print_ty(naming, ty).text }) } else { acc }
+                },
+              ),
+            }),
+          names: named_callees(c, def),
+        },
+      }
+    },
+  };
+  { checker: record_spec_env(stepped.checker, def, name, sig), body: stepped.body }
+}
+
+/// Publishes of `def` what no group decides: its scheme, the row a caller reads and what its
+/// signature alone says of its counts. `row` is what its body performs. An unwritten row the body
+/// overran is reported already; its callers are checked against what the body performs, so one
+/// check names every row the program has to write. A `const` publishes the empty row whatever its
+/// body raises: the build saw it raise nothing.
+fn published_fn(
+  checker: Checker,
+  parsed: ParsedModule,
+  def: FnDef,
+  name: Bytes,
+  sig: Signature,
+  row: Row,
+) -> { checker: Checker, row: Row, written: { scaling: List<Atom>, repeats: List<Int> } } / {abort.raise} = {
+  let c: Checker = { ..checker, env: env_remove_global(checker.env, name) };
+  let body_row = resolve_row_in(c, row);
+  let overran = match def.effects {
+    Some(_) -> false,
+    None -> def.baked == None && (len(body_row.atoms) > 0 || body_row.tail != None),
+  };
+  let fn_ty = if overran { fn_type(sig.params, sig.ret, body_row) } else { sig.fn_ty };
+  let g: Generalized = generalize(c.subst, c.env, fn_ty);
+  let sc: Scheme = split_labels(g.scheme, def, sig);
+  let footprint = if overran { body_row } else { resolve_row_in(c, sig.published_row) };
+  let bounded = map(sig.bounded, |a: Atom| resolve_atom(c.subst, a));
+  let bound: Checker = { ..c, env: env_bind_global(g.env, name, sc), ty_params: sig.ty_params };
+  let constraints = published_constraints(bound, def, sc);
+  let ordered: Checker = witness_order(bound, def, sc);
+  {
+    checker: set_def(
+      {
+        ..ordered,
+        ty_params: map_new(),
+        constraints: map_insert(ordered.constraints, name, constraints),
+      },
+      {
+        name: name,
+        module: parsed.name,
+        simple_name: def.name.name,
+        scheme: sc,
+        footprint: footprint.atoms,
+        performed: body_row.atoms,
+        scaling: [],
+        repeats: [],
+        bounded: bounded,
+        tail_bounded: sig.tail_bounded,
+        ending: Ends,
+        summary: unknown_summary(),
+        raises: [],
+        row_aliases: row_aliases(def),
+        constraints: constraints,
+        spec: [],
+        at: location_of(bound, def.span),
+      },
+    ),
+    row: body_row,
+    written: written_counts(fn_ty, footprint.atoms, bounded, sig.tail_bounded),
+  }
+}
+
+/// What a group reads of a function's signature, closed, around the row its body performs.
+fn signed_body(
+  checker: Checker,
+  sig: Signature,
+  row: Row,
+  written: { scaling: List<Atom>, repeats: List<Int> },
+) -> Body / {abort.raise} = {
+  let published = resolve_row_in(checker, sig.published_row);
+  {
+    row: row,
+    filed: None,
+    count: None,
+    params: map(sig.params, |ty: Type| resolve(checker, ty)),
+    tail: published.tail,
+    bounded: map(sig.bounded, |a: Atom| {
+      let atom = resolve_atom(checker.subst, a);
+      { atom: atom, written: atom_written(checker, atom) }
+    }),
+    tail_bounded: sig.tail_bounded,
+    tail_name: match published.tail {
+      Some(v) ->
+        map_fold(sig.row_params, None, |found: Option<Bytes>, n: Bytes, w: Int|
+          match found { Some(_) -> found, None -> if w == v { Some(n) } else { None } }),
+      None -> None,
+    },
+    says_diverges: fold(published.atoms, false, |found: Bool, a: Atom| found || is_diverges(a)),
+    written: written,
+    performs: [],
+    repeated_vars: [],
+    raise_notes: [],
+    refs: [],
+    calls: [],
+    stated: [],
+    tags: [],
+    fills: [],
+    names: [],
+  }
+}
+
+/// What each name `def` reads refers to, as the termination walk asks of a name it did not bind:
+/// read once here, where the module's scope is at hand.
+fn named_callees(checker: Checker, def: FnDef) -> List<NamedCallee> / {abort.raise} = {
+  let read = fold(def.params, refs_of(def.body, []).names, |acc: List<QName>, p: Param|
+    match p.default { Some(d) -> concat(acc, refs_of(d, []).names), None -> acc });
+  fold(
+    read,
+    { seen: map_new(), out: [] },
+    |acc: { seen: Map<Bytes, Bool>, out: List<NamedCallee> }, q: QName| {
+      let module = match q.module { Some(m) -> m.name, None -> b"" };
+      let key = name_key(module, q.name.name);
+      if map_contains(acc.seen, key) { acc } else {
+        {
+          seen: map_insert(acc.seen, key, true),
+          out: push(acc.out, {
+            module: module,
+            name: q.name.name,
+            callee: group_callee_kind(checker, [], q),
+          }),
+        }
+      }
+    },
+  ).out
+}
+
+/// The key a name a body reads is kept under: its module as written, empty where bare, and itself.
+fn name_key(module: Bytes, name: Bytes) -> Bytes = bytes_concat_all([module, b"::", name])
+
+/// `callee`, or the slot it has in the group `qualified` where it is a member.
+fn member_or(qualified: List<Bytes>, callee: Callee) -> Callee / {abort.raise} =
+  match callee {
+    DefinedCallee(n) ->
+      fold(range(0, len(qualified)), callee, |kind: Callee, i: Int|
+        if at(qualified, i) == n { GroupMember(i) } else { kind }),
+    other -> other,
+  }
+
+/// Settles one group of a module's functions, `comp`, whose bodies call one another round a cycle:
+/// what each performs and calls a number of times that grows, whether its calls end, where it can
+/// raise, and what its signature promised of those. It reads what each walk left closed and what
+/// the groups it calls, each settled before it, published; nothing of the walks' substitution.
+fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {abort.raise} = {
+  let qualified = map(comp, |i: Int| at(m.names, i));
+  let defs = map(comp, |i: Int| at(m.fns, i));
+  let members = map(comp, |i: Int| at(m.members, i));
+  let bodies = map(comp, |i: Int| at(m.bodies, i));
+  let grouped: Checker = { ..checker, group_defs: members };
+  let tagged: Checker = fold(bodies, grouped, |c: Checker, b: Body|
+    fold(b.tags, c, |cc: Checker, u: TagRefusal|
+      if contains(qualified, u.name) { report(cc, u.refusal) } else { cc }));
+  let counts = map(range(0, len(comp)), |slot: Int|
+    match at(bodies, slot).count {
+      Some(count) -> count,
+      None -> counted_body(tagged, at(defs, slot), at(bodies, slot)),
+    });
   // A definition published from its rows answers what they say. A group published wholly so has no
   // body walked to read an ending from.
-  let filed = bodies.filed;
+  let filed = map(bodies, |b: Body| b.filed);
   let walked = fold(filed, false, |any: Bool, k: Option<KnownDef>| any || k == None);
+  let names = fold(bodies, map_new(), |acc: Map<Bytes, Callee>, b: Body|
+    fold(b.names, acc, |held: Map<Bytes, Callee>, x: NamedCallee|
+      map_insert(held, name_key(x.module, x.name), member_or(qualified, x.callee))));
+  let named = |qname: QName|
+    match map_get(
+        names,
+        name_key(match qname.module { Some(x) -> x.name, None -> b"" }, qname.name.name),
+      ) {
+      Some(callee) -> callee,
+      None -> OtherCallee,
+    };
+  let stated = fold(bodies, map_new(), |acc: Map<Bytes, List<Callee>>, b: Body|
+    fold(b.stated, acc, |held: Map<Bytes, List<Callee>>, call: OwnCall| {
+      let key = span_key(call.span);
+      map_insert(
+        held,
+        key,
+        push(
+          match map_get(held, key) { Some(cs) -> cs, None -> [] },
+          member_or(qualified, DefinedCallee(call.callee)),
+        ),
+      )
+    }));
   let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
     verdict({
-      defs: map(comp, |i: Int| at(fns, i)),
+      defs: defs,
       names: qualified,
-      params: map(sigs.sigs, |s: Signature| map(s.params, |ty: Type| resolve(bodies.checker, ty))),
-      resolve: |qname: QName| group_callee_kind(bodies.checker, qualified, qname),
-      ending_of: |n: Bytes| match def_of(bodies.checker, n) { Some(d) -> d.ending, None -> Ends },
-      summary_of: |n: Bytes| map_get(bodies.checker.summaries, n),
+      params: map(bodies, |b: Body| b.params),
+      resolve: named,
+      stated: |span: Span| match map_get(stated, span_key(span)) { Some(cs) -> cs, None -> [] },
+      ending_of: |n: Bytes| match def_of(tagged, n) { Some(d) -> d.ending, None -> Ends },
+      summary_of: |n: Bytes| map_get(tagged.summaries, n),
     })
   };
   let ending_of = |slot: Int|
@@ -9068,113 +10311,58 @@ fn check_component(
   let summary_of = |slot: Int|
     match at(filed, slot) { Some(k) -> k.summary, None -> at(read.summaries, slot) };
   let summarized: Checker = {
-    ..bodies.checker,
-    summaries: fold(
-      range(0, len(comp)),
-      bodies.checker.summaries,
-      |m: Map<Bytes, Summary>, slot: Int| map_insert(m, at(qualified, slot), summary_of(slot)),
-    ),
+    ..tagged,
+    summaries: fold(range(0, len(comp)), tagged.summaries, |acc: Map<Bytes, Summary>, slot: Int|
+      map_insert(acc, at(qualified, slot), summary_of(slot))),
   };
-  let settled: Checker = settle_columns(
-    settle_bit_ops(
-      settle_numerics(settle_concats(settle_updates({ ..summarized, group_defs: [] }))),
-    ),
-  );
-  let grown: Checker = refuse_growth(settled, grouped.group_defs);
-  let required: Checker = fold(range(0, len(comp)), grown, |c: Checker, slot: Int|
-    require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
+  let grown: Checker = fold(bodies, summarized, |c: Checker, b: Body|
+    refuse_growth(c, members, b.fills));
   // Only the run's own definitions are counted off their bodies, so only they are held to `bounded`.
-  let kept: Checker = fold(range(0, len(comp)), required, |c: Checker, slot: Int|
+  let kept: Checker = fold(range(0, len(comp)), grown, |c: Checker, slot: Int|
     unwritten_divergence(
-      bounded_row(
-        if c.module >= c.known.root { c }
-        else { kept_promises(c, at(sigs.sigs, slot), at(bodies.counts, slot)) },
-        at(fns, at(comp, slot)),
-        at(sigs.sigs, slot),
-      ),
-      at(fns, at(comp, slot)),
-      at(sigs.sigs, slot),
+      if c.module >= c.known.root { c }
+      else { kept_promises(c, at(bodies, slot), at(counts, slot)) },
+      at(defs, slot),
+      at(bodies, slot).says_diverges,
       ending_of(slot),
       |caller: Bytes|
         fold(range(0, len(comp)), 0, |start: Int, k: Int|
-          if at(qualified, k) == caller { at(fns, at(comp, k)).span.start } else { start }),
+          if at(qualified, k) == caller { at(defs, k).span.start } else { start }),
     ));
-  let closed: Checker = fold(sigs.sigs, kept, |c: Checker, s: Signature|
-    close_unreachable_row(c, s));
-  let removed: Checker = fold(qualified, closed, |c: Checker, name: Bytes|
-    { ..c, env: env_remove_global(c.env, name) });
   // A group whose every raise is a call back into it has no place a raise starts.
-  let raised_inside = fold(bodies.counts, false, |any: Bool, count: Count|
-      any || len(count.raises) > 0)
-    && fold(bodies.counts, true, |inside: Bool, count: Count|
+  let raised_inside = fold(counts, false, |any: Bool, count: Count| any || len(count.raises) > 0)
+    && fold(counts, true, |inside: Bool, count: Count|
       inside && fold(count.raises, true, |ok: Bool, r: Raise| ok && raised_within(qualified, r)));
-  let published: Checker = fold(range(0, len(comp)), removed, |c: Checker, slot: Int| {
-    let def = at(fns, at(comp, slot));
-    let sig = at(sigs.sigs, slot);
-    let body_row = resolve_row_in(c, at(bodies.rows, slot));
-    // An unwritten row the body overran is reported already; its callers are checked against what
-    // the body performs, so one check names every row the program has to write.
-    // A `const` publishes the empty row whatever its body raises: the build saw it raise nothing.
-    let overran = match def.effects {
-      Some(_) -> false,
-      None -> def.baked == None && (len(body_row.atoms) > 0 || body_row.tail != None),
-    };
-    let fn_ty = if overran { fn_type(sig.params, sig.ret, body_row) } else { sig.fn_ty };
-    let g: Generalized = generalize(c.subst, c.env, fn_ty);
-    let sc: Scheme = split_labels(g.scheme, def, sig);
-    let row = if overran { body_row } else { resolve_row_in(c, sig.published_row) };
-    let count = at(bodies.counts, slot);
-    // A `const` raised nothing when the build evaluated it, so no place in it is one to guard.
-    let raises = if raised_inside || def.baked != None { [] } else { count.raises };
-    let bounded = map(sig.bounded, |a: Atom| resolve_atom(c.subst, a));
-    // Another package's definition is read by what its row writes, whatever its body does.
-    let counted = if c.module >= c.known.root {
-      written_counts(fn_ty, row.atoms, bounded, sig.tail_bounded)
-    } else {
-      {
-        scaling: fold(row.atoms, [], |acc: List<Atom>, w: Atom|
-          if fold(count.scaling, false, |b: Bool, a: Atom|
-              b || atoms_covered([w], resolve_atom(c.subst, a))) { push(acc, w) }
-          else { acc }),
-        repeats: count.repeats,
-      }
-    };
-    let bound: Checker = {
-      ..c,
-      env: env_bind_global(g.env, at(qualified, slot), sc),
-      ty_params: sig.ty_params,
-    };
-    let constraints = published_constraints(bound, def, sc);
-    let ordered: Checker = witness_order(bound, def, sc);
-    set_def(
-      {
-        ..ordered,
-        ty_params: map_new(),
-        constraints: map_insert(ordered.constraints, at(qualified, slot), constraints),
+  let published: Checker = fold(range(0, len(comp)), kept, |c: Checker, slot: Int|
+    match def_of(c, at(qualified, slot)) {
+      None -> c,
+      Some(info) -> {
+        let def = at(defs, slot);
+        let count = at(counts, slot);
+        // Another package's definition is read by what its row writes, whatever its body does.
+        let counted = if c.module >= c.known.root { at(bodies, slot).written } else {
+          {
+            scaling: fold(info.footprint, [], |acc: List<Atom>, w: Atom|
+              if fold(count.scaling, false, |b: Bool, a: Atom| b || atoms_covered([w], a)) {
+                push(acc, w)
+              } else { acc }),
+            repeats: count.repeats,
+          }
+        };
+        set_def(c, {
+          ..info,
+          performed: if raised_inside { filter(info.performed, |a: Atom| !is_abort(a)) }
+          else { info.performed },
+          scaling: counted.scaling,
+          repeats: counted.repeats,
+          ending: ending_of(slot),
+          summary: summary_of(slot),
+          // A `const` raised nothing when the build evaluated it, so no place in it is one to guard.
+          raises: if raised_inside || def.baked != None { [] } else { count.raises },
+        })
       },
-      {
-        name: at(qualified, slot),
-        module: parsed.name,
-        simple_name: def.name.name,
-        scheme: sc,
-        footprint: row.atoms,
-        performed: if raised_inside { filter(body_row.atoms, |a: Atom| !is_abort(a)) }
-        else { body_row.atoms },
-        scaling: counted.scaling,
-        repeats: counted.repeats,
-        bounded: bounded,
-        tail_bounded: sig.tail_bounded,
-        ending: ending_of(slot),
-        summary: summary_of(slot),
-        raises: raises,
-        row_aliases: row_aliases(def),
-        constraints: constraints,
-        spec: [],
-        at: location_of(bound, def.span),
-      },
-    )
-  });
-  published
+    });
+  { ..published, group_defs: [] }
 }
 
 /// The signature's label parameters generalize among the type variables; they belong in their own
@@ -9302,7 +10490,7 @@ fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> / {abort.ra
         && same_deriver(at(acc, len(acc) - 1).deriver, c.deriver) { acc }
     else { push(acc, c) })
 
-fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / {abort.raise} = {
+fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {abort.raise} = {
   let checker: Checker = {
     ..outer,
     scope: signature.scope,
@@ -9311,8 +10499,13 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     label_params: signature.label_params,
     performs: [],
     over: None,
+    maybe: [],
     repeated_vars: [],
     recursed: None,
+    refs: [],
+    calls: [],
+    tag_uses: [],
+    group_fills: [],
     declared_atoms: match signature.declared {
       Some(r) -> resolve_row_in(outer, r).atoms,
       None -> [],
@@ -9328,7 +10521,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     match at(def.params, i).default {
       None -> c,
       Some(d) -> {
-        let o: Inferred = infer(
+        let o: Inferred = infer_whole(
           { ..c, copied: is_pub(def.vis) },
           d,
           hint_of(at(signature.params, i)),
@@ -9348,7 +10541,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       ..c,
       env: env_bind(c.env, at(def.params, i).name.name, monomorphic(at(signature.params, i))),
     });
-  let body: Inferred = infer(bound, def.body, hint_of(signature.ret));
+  let body: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
   let checked: Checker = expect_met(
     body.checker,
     expr_span(def.body),
@@ -9377,7 +10570,6 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       }
     },
   };
-  let counted = counts_of(rowed, signature, left);
   {
     checker: {
       ..rowed,
@@ -9386,15 +10578,81 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       label_params: map_new(),
       assumed: [],
       over: None,
+      maybe: [],
       repeated_vars: [],
       guards: guards::none(),
       raise_notes: [],
+      refs: [],
+      calls: [],
+      tag_uses: [],
+      group_fills: [],
     },
     row: left,
-    scaling: counted.scaling,
+    performs: rowed.performs,
+    repeated_vars: rowed.repeated_vars,
+    raise_notes: rowed.raise_notes,
+    refs: rowed.refs,
+    calls: rowed.calls,
+    tag_uses: rowed.tag_uses,
+    fills: rowed.group_fills,
+  }
+}
+
+/// The iteration a site stands under now that every definition outside its group is counted:
+/// the innermost of `maybe` that holds, or else `over`. A callee of the site's own group is not
+/// asked: a body that calls into its group performs everything again there.
+fn iteration(
+  checker: Checker,
+  atom: Atom,
+  over: Option<Span>,
+  maybe: List<Maybe>,
+) -> Option<Span> / {abort.raise} =
+  match fold(maybe, None, |found: Option<Span>, m: Maybe|
+      match found {
+        Some(_) -> found,
+        None -> if group_member(checker, m.callee) { None } else {
+          match def_of(checker, m.callee) {
+            None -> None,
+            Some(d) -> if match m.param {
+                Some(i) -> contains(d.repeats, i),
+                None -> scales_like(d.scaling, atom),
+              } { Some(m.span) }
+            else { None },
+          }
+        },
+      }) {
+    Some(span) -> Some(span),
+    None -> over,
+  }
+
+/// What a walked body performs and calls a number of times that grows with its input, and where it
+/// can raise, read with its group `checker.group_defs` known.
+fn counted_body(checker: Checker, def: FnDef, body: Body) -> Count / {abort.raise} = {
+  let again = fold(concat(body.calls, body.stated), None, |acc: Option<Span>, call: OwnCall|
+    match acc {
+      Some(_) -> acc,
+      None -> if group_member(checker, call.callee) { Some(call.span) } else { None },
+    });
+  let view: Checker = {
+    ..checker,
+    performs: map(body.performs, |site: PerformSite|
+      { ..site, over: iteration(checker, site.atom, site.over, site.maybe), maybe: [] }),
+    repeated_vars: fold(body.repeated_vars, [], |acc: List<Repeated>, r: Repeated|
+      match iteration(checker, no_atom(), r.over, r.maybe) {
+        Some(o) -> push(acc, { var: r.var, over: Some(o), maybe: [] }),
+        None -> acc,
+      }),
+    raise_notes: body.raise_notes,
+    recursed: again,
+  };
+  let counted = counts_of(view, body.params, body.tail, body.row);
+  {
+    scaling: map(counted.scaling, |site: PerformSite| site.atom),
+    sites: counted.scaling,
     repeats: counted.repeats,
     tail_over: counted.tail_over,
-    raises: raises_of(rowed, def.span.start),
+    recursed: again,
+    raises: raises_of(view, def.span.start),
   }
 }
 
@@ -9468,7 +10726,8 @@ fn raised_within(names: List<Bytes>, raise: Raise) -> Bool =
 /// row variable its type holds is.
 fn counts_of(
   checker: Checker,
-  signature: Signature,
+  params: List<Type>,
+  tail: Option<Int>,
   body: Row,
 ) -> { scaling: List<PerformSite>, repeats: List<Int>, tail_over: Option<Span> } / {abort.raise} = {
   let row = resolve_row_in(checker, body);
@@ -9479,7 +10738,14 @@ fn counts_of(
         let s = match site_among(sites, atom) {
           Some(x) -> x,
           None ->
-            { atom: atom, module: checker.module, span: again, source: DirectPerform, over: None },
+            {
+              atom: atom,
+              module: checker.module,
+              span: again,
+              source: DirectPerform,
+              over: None,
+              maybe: [],
+            },
         };
         push(acc, { ..s, over: Some(again) })
       }),
@@ -9494,26 +10760,25 @@ fn counts_of(
           None -> acc,
         }),
   };
-  let vars = map(checker.repeated_vars, |r: { var: Int, over: Span }|
+  let vars = map(checker.repeated_vars, |r: Repeated|
     match resolve_row_in(checker, row_open(r.var)).tail { Some(v) -> v, None -> r.var });
-  let repeats = fold(range(0, len(signature.params)), [], |acc: List<Int>, i: Int| {
-    let held = rows_in(checker, at(signature.params, i), { atoms: [], vars: [] });
+  let repeats = fold(range(0, len(params)), [], |acc: List<Int>, i: Int| {
+    let held = rows_in(checker, at(params, i), { atoms: [], vars: [] });
     let called = match checker.recursed {
       Some(_) -> len(held.vars) > 0 || len(held.atoms) > 0,
       None -> fold(held.vars, false, |b: Bool, v: Int| b || contains(vars, v)),
     };
     if called { push(acc, i) } else { acc }
   });
-  let tail = resolve_row_in(checker, signature.published_row).tail;
   let tail_over = match tail {
     None -> None,
     Some(t) -> match checker.recursed {
       Some(again) -> Some(again),
       None ->
-        fold(checker.repeated_vars, None, |found: Option<Span>, r: { var: Int, over: Span }|
+        fold(checker.repeated_vars, None, |found: Option<Span>, r: Repeated|
           match found {
             Some(_) -> found,
-            None -> if resolve_row_in(checker, row_open(r.var)).tail == Some(t) { Some(r.over) }
+            None -> if resolve_row_in(checker, row_open(r.var)).tail == Some(t) { r.over }
             else { None },
           }),
     },
@@ -9523,30 +10788,27 @@ fn counts_of(
 
 /// A written row's `bounded` atoms and variable, held to what the body performs: an atom that grows
 /// with the input is refused where it is performed, naming the iteration that repeats it.
-fn kept_promises(checker: Checker, signature: Signature, count: Count) -> Checker / {abort.raise} = {
-  let bounded = map(signature.bounded, |a: Atom| resolve_atom(checker.subst, a));
-  let atoms: Checker = fold(bounded, checker, |c: Checker, w: Atom|
-    match fold(count.sites, None, |found: Option<PerformSite>, s: PerformSite|
-        match found {
-          Some(_) -> found,
-          None -> if atoms_covered([w], resolve_atom(c.subst, s.atom)) { Some(s) } else { None },
-        }) {
-      None -> c,
-      Some(s) -> broken_promise(c, backticked_text(atom_written(c, w)), s, count.recursed),
-    });
-  if !signature.tail_bounded { atoms } else {
+fn kept_promises(checker: Checker, body: Body, count: Count) -> Checker / {abort.raise} = {
+  let atoms: Checker = fold(
+    body.bounded,
+    checker,
+    |c: Checker, w: { atom: Atom, written: Bytes }|
+      match fold(count.sites, None, |found: Option<PerformSite>, s: PerformSite|
+          match found {
+            Some(_) -> found,
+            None -> if atoms_covered([w.atom], s.atom) { Some(s) } else { None },
+          }) {
+        None -> c,
+        Some(s) -> broken_promise(c, backticked_text(w.written), s, count.recursed),
+      },
+  );
+  if !body.tail_bounded { atoms } else {
     match count.tail_over {
       None -> atoms,
-      Some(over) -> {
-        let named = match resolve_row_in(atoms, signature.published_row).tail {
-          Some(v) ->
-            map_fold(signature.row_params, None, |found: Option<Bytes>, name: Bytes, w: Int|
-              match found { Some(_) -> found, None -> if w == v { Some(name) } else { None } }),
-          None -> None,
-        };
+      Some(over) ->
         broken_promise(
           atoms,
-          match named {
+          match body.tail_name {
             Some(n) -> bytes_concat(backticked_text(n), b"'s operations"),
             None -> b"the row variable",
           },
@@ -9556,10 +10818,10 @@ fn kept_promises(checker: Checker, signature: Signature, count: Count) -> Checke
             span: over,
             source: PerformThroughArgs,
             over: Some(over),
+            maybe: [],
           },
           count.recursed,
-        )
-      },
+        ),
     }
   }
 }
@@ -10147,14 +11409,12 @@ fn bounded_row(checker: Checker, def: FnDef, sig: Signature) -> Checker / {abort
 fn unwritten_divergence(
   checker: Checker,
   def: FnDef,
-  sig: Signature,
+  says_diverges: Bool,
   ending: Ending,
   start_of: (Bytes) -> Int / {abort.raise},
 ) -> Checker / {abort.raise} =
   match ending {
-    Diverges(d) -> if d.through != None
-        || fold(resolve_row_in(checker, sig.published_row).atoms, false, |found: Bool, a: Atom|
-          found || is_diverges(a)) { checker } else if def.baked != None {
+    Diverges(d) -> if d.through != None || says_diverges { checker } else if def.baked != None {
       const_refused(
         checker,
         def,
@@ -10405,8 +11665,9 @@ fn stated_operator(
   ty: Type,
   type_name: Bytes,
 ) -> Checker / {abort.raise} =
-  if entry.op == b"add" || entry.op == b"sub" || entry.op == b"mul" { checker }
-  else if is_ordered(entry.op) {
+  if entry.op == b"add" || entry.op == b"sub" || entry.op == b"mul" || entry.op == b"neg" {
+    checker
+  } else if is_ordered(entry.op) {
     if contains(checker.keyed_names, type_name) { checker } else {
       report_error_at(
         checker,
@@ -10442,7 +11703,7 @@ fn stated_operator(
 
 fn op_text(op: Bytes) -> Bytes =
   if op == b"add" { b"+" }
-  else if op == b"sub" { b"-" }
+  else if op == b"sub" || op == b"neg" { b"-" }
   else if op == b"mul" { b"*" }
   else if op == b"div" { b"/" }
   else if op == b"rem" { b"%" }
@@ -10609,7 +11870,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                     ),
                   },
               };
-              let o: Inferred = infer(entered, test_run(def), hint_of(unit_type()));
+              let o: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
               let answered: Checker = check_test_answer(o.checker, def, o.ty);
               let listed: Checker = match def.cases {
                 None -> answered,
@@ -10684,7 +11945,7 @@ fn tail_value(expr: Expr) -> Expr =
 /// A test's cases are listed before any of them runs, where nothing answers an effect: the table
 /// and the label may raise, and perform nothing else.
 fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
-  let o: Inferred = infer(checker, test_listing(cases), hint_of(listing_ty()));
+  let o: Inferred = infer_whole(checker, test_listing(cases), hint_of(listing_ty()));
   let c = o.checker;
   match list_at(run_needs(resolve_row_in(c, o.row).atoms), 0) {
     None -> c,
@@ -10892,7 +12153,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     });
   let guarded: Checker = match def.guard {
     Some(g) -> {
-      let o: Inferred = infer({ ..bound, performs: [] }, g);
+      let o: Inferred = infer_whole({ ..bound, performs: [] }, g);
       let c: Checker = unfilled(
         expect(
           o.checker,
@@ -10908,7 +12169,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     },
     None -> bound,
   };
-  let body: Inferred = infer({ ..guarded, performs: [] }, def.body);
+  let body: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
   let stated: Checker = expect(
     body.checker,
     expr_span(def.body),
@@ -11438,7 +12699,7 @@ fn check_measure(
   expr: Expr,
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
-  let o: Inferred = infer(spec_scope(checker, def, env), expr);
+  let o: Inferred = infer_whole(spec_scope(checker, def, env), expr);
   let popped: Checker = { ..o.checker, env: env_pop(o.checker.env) };
   let c1: Checker = expect(
     popped,
@@ -11476,7 +12737,7 @@ fn check_clause(
         }),
   };
   let outer = with_result.spec_kind;
-  let o: Inferred = infer(
+  let o: Inferred = infer_whole(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
@@ -14112,7 +15373,15 @@ fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort
 /// effects and its constructors, in that order.
 pub fn prelude_tables() -> { effects: List<EffectInfo>, ctors: List<CtorInfo> } / {abort.raise} = {
   let c = fresh_cx(
-    { names: [], scopes: [], declarations: [], declared: [], order: [], imports: [] },
+    {
+      names: [],
+      scopes: [],
+      declarations: [],
+      declared: [],
+      order: [],
+      imports: [],
+      signatures: map_new(),
+    },
     [],
     no_known(),
   );
@@ -14145,6 +15414,11 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     label_apps: [],
     label_sites: [],
     group_defs: [],
+    own_fns: map_new(),
+    refs: [],
+    calls: [],
+    tag_uses: [],
+    fn_holding: map_new(),
     auto_ty_params: false,
     alias_stack: [],
     aliases: map_new(),
@@ -14152,6 +15426,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     refused_atoms: [],
     performs: [],
     over: None,
+    maybe: [],
     repeated_vars: [],
     recursed: None,
     declared_atoms: [],
@@ -14175,6 +15450,8 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     updates: [],
     update_shapes: [],
     try_sites: [],
+    member_sites: [],
+    copied_defaults: [],
     simulate_depth: 0,
     sim_scope: 0,
     crossings: [],
@@ -14306,14 +15583,18 @@ pub type Elaboration = {
   refs: List<WitnessRef>,
   orders: List<WitnessOrder>,
   tries: List<TrySite>,
+  members: List<MemberSite>,
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
-  elaboration_in(lowered_only(checker))
+  if len(checker.copied_defaults) > 0 {
+    panic("a default a call on a value copied was left untyped")
+  } else { elaboration_in(lowered_only(checker)) }
 
 fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
   {
     tries: checker.try_sites,
+    members: checker.member_sites,
     updates: checker.update_shapes,
     ops: fold(checker.operands, [], |acc: List<WitnessOp>, o: OperandAt|
       match resolve(checker, o.ty) {
@@ -14331,6 +15612,7 @@ fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
 // name is each program's own, its index in its type is not.
 derive bin for UpdateShape
 derive bin for TrySite
+derive bin for MemberSite
 derive bin for LabelSite
 derive bin for OperandSite
 derive bin for TypedSite
@@ -14348,6 +15630,7 @@ pub type RootFacts = {
   refs: List<WitnessRef>,
   operands: List<OperandSite>,
   tries: List<TrySite>,
+  members: List<MemberSite>,
   typed: List<TypedSite>,
   types: TypeTable,
 }
@@ -14362,6 +15645,7 @@ pub fn no_root_facts() -> RootFacts =
     refs: [],
     operands: [],
     tries: [],
+    members: [],
     typed: [],
     types: map_new(),
   }
@@ -14407,7 +15691,11 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, tries: push(f.tries, x) })
   });
-  let operated = fold(facts.operands, tried, |m: Map<Bytes, RootFacts>, x: OperandSite| {
+  let called = fold(facts.elaboration.members, tried, |m: Map<Bytes, RootFacts>, x: MemberSite| {
+    let f = owned(m, x.owner);
+    map_insert(m, x.owner, { ..f, members: push(f.members, x) })
+  });
+  let operated = fold(facts.operands, called, |m: Map<Bytes, RootFacts>, x: OperandSite| {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, operands: push(f.operands, x) })
   });
@@ -14436,6 +15724,8 @@ fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFac
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     tries: map(facts.tries, |x: TrySite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    members: map(facts.members, |x: MemberSite|
+      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     typed: map(facts.typed, |x: TypedSite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     types: facts.types,
@@ -14450,6 +15740,7 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && fold(facts.refs, true, |b: Bool, x: WitnessRef| b && within(x.span, at))
     && fold(facts.operands, true, |b: Bool, x: OperandSite| b && within(x.span, at))
     && fold(facts.tries, true, |b: Bool, x: TrySite| b && within(x.span, at))
+    && fold(facts.members, true, |b: Bool, x: MemberSite| b && within(x.span, at))
     && fold(facts.typed, true, |b: Bool, x: TypedSite| b && within(x.span, at))
 
 /// One body's sites as its row files them, behind a byte that says how. Each span is counted from
@@ -14495,6 +15786,7 @@ fn lowered_only(checker: Checker) -> Checker = {
     ..checker,
     label_sites: filter(checker.label_sites, |x: LabelSite| kept(x.owner)),
     try_sites: filter(checker.try_sites, |x: TrySite| kept(x.owner)),
+    member_sites: filter(checker.member_sites, |x: MemberSite| kept(x.owner)),
     update_shapes: filter(checker.update_shapes, |x: UpdateShape| kept(x.owner)),
     operands: filter(checker.operands, |x: OperandAt| kept(x.owner)),
     witness_refs: filter(checker.witness_refs, |x: WitnessRef| kept(x.owner)),
@@ -14658,29 +15950,58 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
     if s.module != module { acc }
     else { map_insert(acc, span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
 
-/// A module with every tagged literal written out as the call it runs as, every record update as
-/// the literal it stands for, and every `try` as its `handle`. The tagged literals go first: they
-/// need nothing of the checker, and what they become is forms the other two already walk.
-fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
+/// One module's calls on values that call a function of the value's type, keyed by span, as
+/// `expand_member_calls` reads them, each with its callee's parameters out of `signatures`.
+fn members_in(
+  all: List<MemberSite>,
+  module: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Map<Bytes, MemberCallee> =
+  fold(all, map_new(), |acc: Map<Bytes, MemberCallee>, s: MemberSite|
+    if s.module != module { acc } else {
+      let params = match map_get(signatures, s.callee) { Some(g) -> g.params, None -> [] };
+      map_insert(acc, span_key(s.span), {
+        qualifier: s.qualifier,
+        name: s.name,
+        names: map(params, |p: ParamInfo| p.name),
+        defaults: map(params, |p: ParamInfo| p.default),
+      })
+    })
+
+/// A module with every tagged literal written out as the call it runs as, every call on a value
+/// as the call of its type's function, every record update as the literal it stands for, and
+/// every `try` as its `handle`. The tagged literals go first: they need nothing of the checker,
+/// and what they become is forms the others already walk.
+fn written_out(
+  module: Module,
+  elaboration: Elaboration,
+  i: Int,
+  signatures: Map<Bytes, Parameters>,
+) -> Module =
   expand_holds(
     expand_try_blocks(
-      expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
+      expand_record_updates(
+        expand_member_calls(expand_tagged(module), members_in(elaboration.members, i, signatures)),
+        shapes_in(elaboration.updates, i),
+      ),
       answered_in(elaboration.tries, i),
     ),
   )
 
 /// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
-/// what the emitter lowers, and what only the checker knows.
+/// what the emitter lowers, and what only the checker knows. `signatures` are the resolver's of
+/// these modules, which say what a call on a value fills.
 pub fn expanded_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
+  signatures: Map<Bytes, Parameters>,
 ) -> List<ParsedModule> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: ParsedModule = at(mods, i);
     {
       name: m.name,
       module: expand_witnesses(
-        written_out(m.module, elaboration, i),
+        written_out(m.module, elaboration, i, signatures),
         ops_in(elaboration.ops, i),
         refs_in(elaboration.refs, i),
         orders_in(elaboration.orders, i),
@@ -14694,10 +16015,11 @@ pub fn expanded_mods(
 pub fn updated_mods(
   mods: List<ParsedModule>,
   elaboration: Elaboration,
+  signatures: Map<Bytes, Parameters>,
 ) -> List<ParsedModule> / {abort.raise} =
   map(range(0, len(mods)), |i: Int| {
     let m: ParsedModule = at(mods, i);
-    { name: m.name, module: written_out(m.module, elaboration, i), derived: m.derived }
+    { name: m.name, module: written_out(m.module, elaboration, i, signatures), derived: m.derived }
   })
 
 fn ops_in(all: List<WitnessOp>, module: Int) -> Map<Bytes, Bytes> =
@@ -19477,5 +20799,229 @@ test "a `Columns` holds a record type of at least one field wherever its type se
   assert_eq(
     check_codes(bytes_concat(generic, b"fn g(xs: List<Int>) -> Int = columns_len(f(xs))\n")),
     [b"E0224"],
+  )
+}
+
+/// A type `N` whose `+`, `-` and `*` are `add`, written as `add`, and what follows it.
+fn stating_add(add: Bytes, rest: Bytes) -> Bytes =
+  bytes_concat_all([
+    b"type N = | Z | S(N)\nfn add(a: N, b: N) -> N = ",
+    add,
+    b"\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = Z\nnumeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n",
+    rest,
+  ])
+
+test "an operator at a type that states its arithmetic is a call of the function it states" {
+  // A recursion through `+` descends as one through the name does.
+  assert_eq(check_codes(stating_add(b"match a { Z -> b, S(m) -> S(m + b) }", b"")), []);
+  assert_eq(check_codes(stating_add(b"match a { Z -> b, S(m) -> S(add(m, b)) }", b"")), []);
+  assert(
+    refused_with(
+      stating_add(b"a + b", b""),
+      b"E0302",
+      b"`add` may not return, and its row does not say so",
+    ),
+  );
+  assert_eq(check_codes(stating_add(b"a - b", b"")), [b"E0302"]);
+  // `-a` is `neg`, which is another function and ends.
+  assert_eq(check_codes(stating_add(b"match a { Z -> -b, S(m) -> m }", b"")), [])
+}
+
+test "a comparison, a `Map` and a constrained parameter at a type that states a key or a show call it" {
+  let keyed = |k: Bytes|
+    check_codes(
+      bytes_concat_all([b"type T = | T(Int)\nfn k(t: T) -> Int = ", k, b"\nkey for T by k\n"]),
+    );
+  assert_eq(keyed(b"match t { T(n) -> n }"), []);
+  assert_eq(keyed(b"if t == t { 1 } else { 0 }"), [b"E0302"]);
+  // Through what holds one, and through a builtin that orders or keys by one.
+  assert_eq(keyed(b"if [t] == [t] { 1 } else { 0 }"), [b"E0302"]);
+  assert_eq(keyed(b"match compare(t, t) { Equal -> 1, _ -> 0 }"), [b"E0302"]);
+  assert_eq(keyed(b"map_len(map_insert(map_new(), t, 1))"), [b"E0302"]);
+  let shown = |s: Bytes|
+    check_codes(
+      bytes_concat_all([
+        b"type T = | T(Int)\nfn written<a>(x: a) -> String where derivable(show, a) = \"\"\nfn s(t: T) -> String = ",
+        s,
+        b"\nshow for T by s\n",
+      ]),
+    );
+  assert_eq(shown(b"match t { T(n) -> written(n) }"), []);
+  assert_eq(shown(b"written([t])"), [b"E0302"]);
+  // A definition that only uses the operator is in no recursion with what the type states.
+  assert_eq(
+    check_codes(
+      b"type T = | T(Int)\nfn k(t: T) -> Int = 0\nkey for T by k\nfn same(a: T, b: T) -> Bool = a == b\n",
+    ),
+    [],
+  )
+}
+
+test "a body in a recursion through an operator performs everything again there" {
+  // `add` answers `noted`'s query itself, and `noted` adds: the two call one another through `+`.
+  let through = db_source(
+    stating_add(
+      b"match a { Z -> b, S(m) -> handle { noted(m, b) } with { db.query[conn](sql) -> 0 } }",
+      b"fn noted(a: N, b: N) -> N / {db.query[conn] bounded} = { lookup(1); a + b }\n",
+    ),
+  );
+  assert_eq(check_codes(through), [b"E0465"]);
+  // Called by name the recursion is the same one.
+  let named = db_source(
+    stating_add(
+      b"match a { Z -> b, S(m) -> handle { noted(m, b) } with { db.query[conn](sql) -> 0 } }",
+      b"fn noted(a: N, b: N) -> N / {db.query[conn] bounded} = { lookup(1); add(a, b) }\n",
+    ),
+  );
+  assert_eq(check_codes(named), [b"E0465"])
+}
+
+/// A type `Stack` with a function `size` of it, and what follows.
+fn with_stack(rest: Bytes) -> Bytes =
+  bytes_concat(
+    b"type Stack = | Stack(List<Int>)\nfn Stack::size(s: Stack) -> Int = match s { Stack(xs) -> len(xs) }\nfn Stack::of(xs: List<Int>) -> Stack = Stack(xs)\n",
+    rest,
+  )
+
+test "a function of a type is declared `fn T::name` and named through the type" {
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack::size(Stack::of([1, 2]))")), []);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack::depth(Stack([1]))")), [b"E0101"]);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = size(Stack([1]))")), [b"E0101"])
+}
+
+test "a call on a value is a call of its type's function with the value first" {
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = Stack([1, 2]).size()")), []);
+  assert_eq(check_codes(with_stack(b"fn f() -> Int = { let s = Stack([1, 2]); s.size() }")), []);
+  assert_eq(
+    check_codes(with_stack(b"fn f(s: Stack) -> Int = s.size() + Stack::of([3]).size()")),
+    [],
+  );
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.depth()")), [b"E0101"]);
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.size(1)")), [b"E0202"])
+}
+
+test "a function of a type is declared by the type's module, for a sum or a `new` record" {
+  assert_eq(check_codes(b"fn Option::size(o: Option<Int>) -> Int = 0"), [b"E0208"]);
+  assert_eq(check_codes(b"fn Missing::size(n: Int) -> Int = n"), [b"E0208"]);
+  assert_eq(
+    check_codes(b"type Pair = { a: Int, b: Int }\nfn Pair::sum(p: Pair) -> Int = p.a + p.b"),
+    [b"E0217"],
+  );
+  let date = b"type Date = new { year: Int, day: Int }\n";
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        date,
+        b"fn Date::next(d: Date) -> Date = { year: d.year, day: d.day + 1 }\nfn f(d: Date) -> Int = d.next().day",
+      ),
+    ),
+    [],
+  );
+  // A field is read first, so a function under a field's name could never be called on a value.
+  assert(
+    refused_with(
+      bytes_concat(date, b"fn Date::year(d: Date) -> Int = d.year"),
+      b"E0105",
+      b"`Date` has a field `year` and a function of that name",
+    ),
+  )
+}
+
+test "a call on a value reads a record's field, a binding before an effect, and a known type" {
+  // A record that holds a function is called through its field.
+  assert_eq(check_codes(b"fn f(codec: { decode: (Int) -> Int }) -> Int = codec.decode(1)"), []);
+  // A binding and an effect of one name leave the call two readings.
+  assert(
+    refused_with(
+      with_stack(b"effect s { read size() -> Int }\nfn f(s: Stack) -> Int = s.size()"),
+      b"E0105",
+      b"`s` is a binding here and an effect",
+    ),
+  );
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"effect log { write say(n: Int) -> Unit }\nfn f(s: Stack) -> Unit / {log.say} = log.say(s.size())",
+      ),
+    ),
+    [],
+  );
+  // A type parameter has no function: the receiver's type is known where the call stands.
+  assert(
+    refused_with(
+      with_stack(b"fn f<a>(x: a) -> Int = x.size()"),
+      b"E0201",
+      b"cannot call `size` on this value",
+    ),
+  )
+}
+
+test "a call on a value names its arguments and leaves the rest to their defaults" {
+  let grown = |rest: Bytes|
+    check_codes(
+      with_stack(
+        bytes_concat(
+          b"type Mode = | Fast | Slow\nfn Stack::grown(s: Stack, by: Int = 1, mode: Mode = Fast) -> Stack = s\n",
+          rest,
+        ),
+      ),
+    );
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown().size() + s.grown(2).size()"), []);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(mode: Slow).size()"), []);
+  assert_eq(grown(b"fn f() -> Int = Stack([1]).grown(mode: Slow, by: 3).size()"), []);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(depth: 1).size()"), [b"E0123"]);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(2, by: 3).size()"), [b"E0123"]);
+  assert_eq(grown(b"fn f(s: Stack) -> Int = s.grown(by: true).size()"), [b"E0201"]);
+  // A function a record holds in a field has no parameter to name.
+  assert_eq(check_codes(b"fn f(codec: { decode: (Int) -> Int }) -> Int = codec.decode(from: 1)"), [
+    b"E0123",
+  ])
+}
+
+test "`value.m::f(..)` calls the function it names with the value first" {
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"fn deep(s: Stack, by: Int) -> Int = by\nfn f(s: Stack) -> Int = s.Stack::size() + Stack([1]).Stack::size()",
+      ),
+    ),
+    [],
+  );
+  assert_eq(check_codes(with_stack(b"fn f(s: Stack) -> Int = s.Stack::depth()")), [b"E0101"])
+}
+
+test "a lambda's unwritten parameter is what the arguments before it settle" {
+  assert_eq(
+    check_codes(
+      with_stack(
+        b"type P = { side: Int }\nfn sides(ps: List<P>) -> List<Int> = map(ps, |p| p.side)\nfn sizes(ss: List<Stack>) -> List<Int> = map(ss, |s| s.size())",
+      ),
+    ),
+    [],
+  );
+  // Nothing settles it where the lambda stands alone.
+  assert_eq(check_codes(b"type P = { side: Int }\nfn f() -> Int = { let g = |p| p.side; 1 }"), [
+    b"E0201",
+  ])
+}
+
+test "a recursion through a call on a value is a recursion, and a type states its own functions" {
+  let list = b"type Chain = | End | Link(Int, Chain)\nfn Chain::len(c: Chain) -> Int = match c { End -> 0, Link(_, rest) -> 1 + rest.len() }\n";
+  assert_eq(check_codes(list), []);
+  // It does not descend, so it may not return.
+  assert_eq(
+    check_codes(
+      b"type Chain = | End | Link(Int, Chain)\nfn Chain::len(c: Chain) -> Int = 1 + c.len()\n",
+    ),
+    [b"E0302"],
+  );
+  assert_eq(
+    check_codes(
+      bytes_concat(
+        list,
+        b"key for Chain by Chain::len\nfn same(a: Chain, b: Chain) -> Bool = a == b\n",
+      ),
+    ),
+    [],
   )
 }

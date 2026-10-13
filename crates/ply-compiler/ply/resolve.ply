@@ -9,11 +9,13 @@ import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSe
               TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, SCost, Binder, Vis, VPub, VPriv,
               ImportDecl, ImportKind, IModule, IAlias, INames, Derived, EffectSetDef, OpDef, LawDef,
               OfSchema, schema_named, schema_guard_name, parse, dump_module, is_pub, TDNominal,
-              Opaque)
+              member_name, Opaque)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, NamedArg,
-              MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole)
+              MatchArm, HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole, slotted,
+              slot_args, Slot, FromDefault, Unplaced, NoSuchParameter, FilledByPosition,
+              GivenByName)
 import patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad)
 import std.list (at, concat, contains, take, drop)
 import std.bin
@@ -96,6 +98,8 @@ pub type Resolved = {
   /// Each module's imports, one target module index per declaration, in source order: a
   /// dependency's sibling import and two selective imports sharing a binder both name exactly.
   imports: List<List<Int>>,
+  /// Each function's parameters as a call fills them, by its qualified name.
+  signatures: Map<Bytes, Parameters>,
 }
 
 fn no_decls() -> Decls =
@@ -1021,7 +1025,13 @@ pub fn find(
   match qname.module {
     None -> lookup(scope.bound, namespace, qname.name.name),
     Some(binder) -> match find_module_binding(scope.modules, binder.name) {
-      None -> None,
+      None -> match namespace {
+        ValueSpace -> match of_module(binder.name) {
+          Some(home) -> find_in_home(resolved, module, home, qname.name.name),
+          None -> find_of_type(resolved, module, binder.name, qname.name.name),
+        },
+        _ -> None,
+      },
       Some(mb) -> match lookup_declared(
           at(resolved.declarations, mb.target),
           namespace,
@@ -1031,6 +1041,95 @@ pub fn find(
         // Only a default copied back into its module binds that module, which sees what it keeps.
         Some(d) -> if !d.public && mb.target != module { None }
         else { lookup(at(resolved.declared, mb.target), namespace, qname.name.name) },
+      },
+    },
+  }
+}
+
+/// The binder a function of a type is written through once the checker has named it: its
+/// module's name behind a mark no source writes, so it reads from any module, imported or not.
+pub fn of_binder(home: Bytes) -> Bytes = bytes_concat(b"?of.", home)
+
+/// The module [`of_binder`] names.
+pub fn of_module(binder: Bytes) -> Option<Bytes> =
+  if bytes_len(binder) > 4 && bytes_slice(binder, 0, 4) == b"?of." {
+    Some(bytes_slice(binder, 4, bytes_len(binder)))
+  } else { None }
+
+/// The value `name` of the module named `home`, read from `module` through [`of_binder`].
+fn find_in_home(
+  resolved: Resolved,
+  module: Int,
+  home: Bytes,
+  name: Bytes,
+) -> Option<Binding> / {abort.raise} =
+  fold(range(0, len(resolved.scopes)), None, |found: Option<Binding>, k: Int|
+    match found {
+      Some(_) -> found,
+      None -> if at(resolved.scopes, k).module != home { None } else {
+        match lookup_declared(at(resolved.declarations, k), ValueSpace, name) {
+          None -> None,
+          Some(d) -> if !d.public && k != module { None }
+          else { lookup(at(resolved.declared, k), ValueSpace, name) },
+        }
+      },
+    })
+
+/// The function `name` of the type `of`, as `of::name` names it from `module`: `of` is a type in
+/// scope there, or a type's qualified name, which a call resolved by its receiver's type is
+/// written with. A function its type's module keeps private is found only there.
+pub fn find_of_type(
+  resolved: Resolved,
+  module: Int,
+  of: Bytes,
+  name: Bytes,
+) -> Option<Binding> / {abort.raise} =
+  match declaring_type(resolved, module, of) {
+    None -> None,
+    Some(t) -> {
+      let member = member_name(t.simple, name);
+      match lookup_declared(at(resolved.declarations, t.owner), ValueSpace, member) {
+        None -> None,
+        Some(d) -> if !d.public && t.owner != module { None }
+        else { lookup(at(resolved.declared, t.owner), ValueSpace, member) },
+      }
+    },
+  }
+
+/// The module that declares the type `of`, named as [`find_of_type`] reads it, and the type's
+/// name there.
+pub fn declaring_type(
+  resolved: Resolved,
+  module: Int,
+  of: Bytes,
+) -> Option<{ owner: Int, simple: Bytes }> / {abort.raise} = {
+  let split = |qualified: Bytes|
+    fold(range(0, bytes_len(qualified)), None, |last: Option<Int>, i: Int|
+      if bytes_at(qualified, i) == 46 { Some(i) } else { last });
+  match lookup(at(resolved.scopes, module).bound, TypeSpace, of) {
+    Some(b) ->
+      Some({
+        owner: b.owner,
+        simple: match split(b.qualified) {
+          Some(i) -> bytes_slice(b.qualified, i + 1, bytes_len(b.qualified)),
+          None -> b.qualified,
+        },
+      }),
+    None -> match split(of) {
+      None -> None,
+      Some(i) -> {
+        let home = bytes_slice(of, 0, i);
+        fold(
+          range(0, len(resolved.scopes)),
+          None,
+          |found: Option<{ owner: Int, simple: Bytes }>, k: Int|
+            match found {
+              Some(_) -> found,
+              None -> if at(resolved.scopes, k).module == home {
+                Some({ owner: k, simple: bytes_slice(of, i + 1, bytes_len(of)) })
+              } else { None },
+            },
+        )
       },
     },
   }
@@ -1236,7 +1335,7 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
             e: expr,
           }
         } else {
-          let module = at(resolved.scopes, b.owner).module;
+          let module = of_binder(at(resolved.scopes, b.owner).module);
           let imports = match find_module_binding(qualifier.imports, module) {
             Some(_) -> qualifier.imports,
             None ->
@@ -2681,10 +2780,12 @@ fn expand_sets(r: Resolved, mods: List<ParsedModule>) -> SetsExpanded / {abort.r
 
 // --- Defaults: the signatures ---------------------------------------------------------------
 
-type ParamInfo = { name: Bytes, default: Option<Expr>, imports: List<ModuleBinding> }
-type Signature = { name: Bytes, params: List<ParamInfo> }
+/// A parameter as a call fills it: the default a call that leaves it out copies, each name in it
+/// written through a binder of its module, and the modules those are.
+pub type ParamInfo = { name: Bytes, default: Option<Expr>, imports: List<ModuleBinding> }
+pub type Parameters = { name: Bytes, params: List<ParamInfo> }
 type Collected = {
-  sigs: List<Signature>,
+  sigs: List<Parameters>,
   owner_imports: List<{ module: Int, binder: Bytes, target: Int }>,
   diags: List<Diag>,
 }
@@ -2814,7 +2915,7 @@ fn reach(resolved: Resolved, module: Int, binder: Bytes, target: Int) -> Resolve
 }
 
 /// The builtins that carry a default: `assert(cond, message: None)`.
-fn builtin_signature(name: Bytes) -> Option<Signature> =
+fn builtin_signature(name: Bytes) -> Option<Parameters> =
   if name == b"assert" {
     Some({
       name: b"assert",
@@ -2842,7 +2943,7 @@ fn builtin_signature(name: Bytes) -> Option<Signature> =
 
 type Filler = { module: Int, scope: List<Bytes>, implicit: List<ModuleBinding>, diags: List<Diag> }
 type Filled = { filler: Filler, expr: Expr }
-type Filling = { r: Resolved, index: Map<Bytes, Signature> }
+type Filling = { r: Resolved, index: Map<Bytes, Parameters> }
 
 fn fill_expr(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.raise} = {
   // Children first, so a nested call is filled before the outer one copies it.
@@ -3135,7 +3236,7 @@ fn fill_fields(
     },
   )
 
-fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Signature> / {abort.raise} =
+fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Parameters> / {abort.raise} =
   match func {
     EVar(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
       if is_bare(v.name) && starts_upper(v.name.name.name) { None }
@@ -3150,7 +3251,55 @@ fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Signature> / {
 
 type Call = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, labels: List<Ident> }
 
+/// The perform `call` is, where it is written on a bare name nothing binds and names an
+/// argument: an operation takes none by name, so each is refused and dropped.
+fn performed(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<Filled> =
+  match on {
+    EVar(v) -> if len(call.named) == 0
+        || (is_bare(v.name) && contains(filler.scope, v.name.name.name)) { None } else {
+      let written = match v.name.module {
+        Some(m) -> bytes_concat_all([m.name, b"::", v.name.name.name]),
+        None -> v.name.name.name,
+      };
+      Some({
+        filler: {
+          ..filler,
+          diags: fold(call.named, filler.diags, |ds: List<Diag>, arg: NamedArg|
+            push(
+              ds,
+              error_at(
+                b"E0123",
+                filler.module,
+                arg.span,
+                bytes_concat_all([b"`", written, b".", op.name, b"` takes no named arguments"]),
+                b"named",
+                [b"an effect operation's arguments are positional"],
+              ),
+            )),
+        },
+        expr: EPerform({
+          span: call.span,
+          eff: v.name,
+          op: op,
+          resource: list_at(call.labels, 0),
+          args: call.args,
+        }),
+      })
+    },
+    _ -> None,
+  }
+
 fn fill(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} =
+  match call.func {
+    // A call on a value: the checker finds its callee by the value's type, and fills it then.
+    EField(on) -> match performed(filler, call, on.base, on.field) {
+      Some(p) -> p,
+      None -> { filler: filler, expr: EApp(call) },
+    },
+    _ -> fill_named(f, filler, call),
+  }
+
+fn fill_named(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} =
   match signature_of(f, filler, call.func) {
     None -> {
       // No signature: a call through a value, a constructor or an unresolved name, so a named argument names no parameter.
@@ -3175,119 +3324,113 @@ fn fill(f: Filling, filler: Filler, call: Call) -> Filled / {abort.raise} =
       else { fill_slots(filler, call, sig) },
   }
 
-fn fill_slots(filler: Filler, call: Call, signature: Signature) -> Filled / {abort.raise} = {
-  let was_named = len(call.named) > 0;
-  let filled_positionally = len(call.args);
-  let start = map(range(0, len(signature.params)), |i: Int| list_at(call.args, i));
-  let placed: { filler: Filler, slots: List<Option<Expr>> } = fold(
-    call.named,
-    { filler: filler, slots: start },
-    |acc: { filler: Filler, slots: List<Option<Expr>> }, arg: NamedArg|
-      match param_index(signature, arg.name.name) {
-        None ->
-          {
-            ..acc,
-            filler: {
-              ..acc.filler,
-              diags: push(
-                acc.filler.diags,
-                error_at(
-                  b"E0123",
-                  filler.module,
-                  arg.name.span,
-                  bytes_concat_all([b"`", arg.name.name, b"` names no parameter of this function"]),
-                  b"not a parameter",
-                  [
-                    bytes_concat(
-                      b"the parameters are ",
-                      list_names(map(signature.params, |p: ParamInfo| p.name)),
-                    ),
-                  ],
-                ),
-              ),
-            },
-          },
-        Some(i) -> match at(acc.slots, i) {
-          Some(_) -> {
-            let already = if i < filled_positionally { b"already filled by a positional argument" }
-            else { b"already given by name" };
-            {
-              ..acc,
-              filler: {
-                ..acc.filler,
-                diags: push(
-                  acc.filler.diags,
-                  error_at(
-                    b"E0123",
-                    filler.module,
-                    arg.name.span,
-                    bytes_concat_all([b"`", arg.name.name, b"` is ", already]),
-                    b"given twice",
-                    [],
-                  ),
-                ),
-              },
-            }
-          },
-          None -> { ..acc, slots: list_set(acc.slots, i, Some(arg.value)) },
-        },
-      },
-  );
-  let out: { filler: Filler, xs: List<Expr>, missing: List<Bytes> } = fold(
-    range(0, len(signature.params)),
-    { filler: placed.filler, xs: [], missing: [] },
-    |acc: { filler: Filler, xs: List<Expr>, missing: List<Bytes> }, i: Int|
-      match at(placed.slots, i) {
-        Some(written) -> { ..acc, xs: push(acc.xs, written) },
-        None -> {
-          let p = at(signature.params, i);
-          match p.default {
-            None -> { ..acc, missing: push(acc.missing, p.name) },
-            Some(d) -> {
-              // The default may name something in its own module, which this one may never have imported.
-              let implicit = fold(
-                p.imports,
-                acc.filler.implicit,
-                |im: List<ModuleBinding>, binding: ModuleBinding|
-                  match find_module_binding(im, binding.binder) {
-                    Some(_) -> im,
-                    None -> push(im, binding),
-                  },
-              );
-              { ..acc, filler: { ..acc.filler, implicit: implicit }, xs: push(acc.xs, d) }
-            },
-          }
-        },
-      },
-  );
-  if len(out.missing) > 0 {
-    // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
-    let cx2 = if was_named {
-      {
-        ..out.filler,
-        diags: push(
-          out.filler.diags,
-          error_at(
-            b"E0125",
-            filler.module,
-            call.span,
-            bytes_concat_all([b"this call leaves ", list_names(out.missing), b" unfilled"]),
-            b"no argument and no default",
-            [b"pass it positionally, or by name as `<parameter>: <value>`"],
-          ),
-        ),
-      }
-    } else { out.filler };
-    { filler: cx2, expr: EApp({ ..call, named: [] }) }
-  } else { { filler: out.filler, expr: EApp({ ..call, args: out.xs, named: [] }) } }
+/// What a call of `signature` at `span` in `module` passes, `args` and then `named` put where its
+/// parameters are: the arguments in order, as written where one is left unfilled, and where each
+/// comes from, nothing where one is; what the call gets wrong; and the modules the defaults it
+/// copied name.
+pub type FilledArgs = {
+  args: List<Expr>,
+  slots: List<Slot>,
+  diags: List<Diag>,
+  imports: List<ModuleBinding>,
 }
 
-fn param_index(signature: Signature, name: Bytes) -> Option<Int> / {abort.raise} =
-  fold(range(0, len(signature.params)), None, |acc: Option<Int>, i: Int|
-    match acc {
-      Some(_) -> acc,
-      None -> if at(signature.params, i).name == name { Some(i) } else { None },
-    })
+pub fn filled_args(
+  module: Int,
+  span: Span,
+  signature: Parameters,
+  args: List<Expr>,
+  named: List<NamedArg>,
+) -> FilledArgs / {abort.raise} = {
+  let s = slotted(
+    map(signature.params, |p: ParamInfo| p.name),
+    map(signature.params, |p: ParamInfo| p.default),
+    args,
+    named,
+  );
+  let unplaced = map(s.unplaced, |u: { arg: NamedArg, why: Unplaced }|
+    match u.why {
+      NoSuchParameter ->
+        error_at(
+          b"E0123",
+          module,
+          u.arg.name.span,
+          bytes_concat_all([b"`", u.arg.name.name, b"` names no parameter of this function"]),
+          b"not a parameter",
+          [
+            bytes_concat(
+              b"the parameters are ",
+              list_names(map(signature.params, |p: ParamInfo| p.name)),
+            ),
+          ],
+        ),
+      why ->
+        error_at(
+          b"E0123",
+          module,
+          u.arg.name.span,
+          bytes_concat_all([
+            b"`",
+            u.arg.name.name,
+            b"` is ",
+            if why == FilledByPosition { b"already filled by a positional argument" }
+            else { b"already given by name" },
+          ]),
+          b"given twice",
+          [],
+        ),
+    });
+  {
+    args: if len(s.missing) > 0 { args } else { slot_args(s.slots, args, named) },
+    slots: if len(s.missing) > 0 { [] } else { s.slots },
+    // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
+    diags: if len(s.missing) == 0 || len(named) == 0 { unplaced } else {
+      push(
+        unplaced,
+        error_at(
+          b"E0125",
+          module,
+          span,
+          bytes_concat_all([b"this call leaves ", list_names(s.missing), b" unfilled"]),
+          b"no argument and no default",
+          [b"pass it positionally, or by name as `<parameter>: <value>`"],
+        ),
+      )
+    },
+    // The default may name something in its own module, which this one may never have imported.
+    imports: fold(range(0, len(s.slots)), [], |im: List<ModuleBinding>, i: Int|
+      match at(s.slots, i) {
+        FromDefault(_) ->
+          fold(
+            at(signature.params, i).imports,
+            im,
+            |acc: List<ModuleBinding>, binding: ModuleBinding|
+              match find_module_binding(acc, binding.binder) {
+                Some(_) -> acc,
+                None -> push(acc, binding),
+              },
+          ),
+        _ -> im,
+      }),
+  }
+}
+
+fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> Filled / {abort.raise} = {
+  let filled = filled_args(filler.module, call.span, signature, call.args, call.named);
+  {
+    filler: {
+      ..filler,
+      diags: concat(filler.diags, filled.diags),
+      implicit: fold(
+        filled.imports,
+        filler.implicit,
+        |im: List<ModuleBinding>, b: ModuleBinding|
+          match find_module_binding(im, b.binder) { Some(_) -> im, None -> push(im, b) },
+      ),
+    },
+    expr: EApp({ ..call, args: filled.args, named: [] }),
+  }
+}
 
 fn fill_item(
   f: Filling,
@@ -3418,7 +3561,7 @@ fn expand(r: Resolved, mods: List<ParsedModule>, diags: List<Diag>) -> Expanded 
   // Indexed once: a list lookup per call is quadratic in the program. First writer wins.
   let f = {
     r: r2,
-    index: fold(c.sigs, map_new(), |acc: Map<Bytes, Signature>, signature: Signature|
+    index: fold(c.sigs, map_new(), |acc: Map<Bytes, Parameters>, signature: Parameters|
       match map_get(acc, signature.name) {
         Some(_) -> acc,
         None -> map_insert(acc, signature.name, signature),
@@ -3450,7 +3593,7 @@ fn expand(r: Resolved, mods: List<ParsedModule>, diags: List<Diag>) -> Expanded 
       }
     },
   );
-  walked
+  { ..walked, r: { ..walked.r, signatures: f.index } }
 }
 
 fn bytes_concat_diags(a: List<Diag>, b: List<Diag>) -> List<Diag> =
@@ -3551,6 +3694,7 @@ fn resolve_with(
       order: dfs.order,
       imports: map(edges, |es: List<{ from: Int, target: Int, span: Span }>|
         map(es, |e: { from: Int, target: Int, span: Span }| e.target)),
+      signatures: map_new(),
     };
     let made = instantiated(r, mods);
     let sets = expand_sets(made.r, made.mods);
@@ -3957,6 +4101,19 @@ test "a module imported whole and by name resolves both ways, its type bringing 
     ]),
     [],
   )
+}
+
+test "an operation takes no named argument, and a call on a binding may write one" {
+  assert_eq(
+    refused_codes([
+      {
+        name: b"m",
+        src: b"effect d { read op(k: Int) -> Int }\nfn f() -> Int / {d.op} = d.op(k: 1)",
+      },
+    ]),
+    [b"E0123"],
+  );
+  assert_eq(refused_codes([{ name: b"m", src: b"fn f(d: Int) -> Int = d.op(k: 1)" }]), [])
 }
 
 fn defaults_lib() -> Bytes =

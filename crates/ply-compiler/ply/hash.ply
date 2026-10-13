@@ -12,22 +12,23 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithHold,
               ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet, SLetElse, SExpr, Param, MatchArm,
               HandleClause, ReturnClause, RecField, ETagged, Tagged, Hole, tagged_parser,
-              tagged_filler)
+              tagged_filler, NamedArg)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
               Constraint, Deriver, deriver_tag, deriver_text, derivers, constraint_kinds,
               constraint_written, SpecKind, SRequires, SEnsures, SCost, SSpace, SpecClause,
               ReturnsFresh, ReturnsParam, Derived, Vis, VPub, VPriv, parse, is_pub, TDNominal,
               test_listing, test_run, case_params, schema_of, IInstance, InstanceDef, InstanceKind,
-              NKey, NShow, instance_text, INumeric, NumericDef, numeric_ops, numeric_by)
+              NKey, NShow, instance_text, INumeric, NumericDef, numeric_ops, numeric_by, member_of,
+              member_name)
 import rewrite (expand)
 import resolve (ParsedModule, Source, Resolved, Scope, Binding, Bindings, ModuleBinding, Diag,
                 ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_modules, error_at_and,
-                label_at, dump_diags, qualify, default_binder, backticked, diag_bin)
+                label_at, dump_diags, qualify, default_binder, backticked, diag_bin, of_module)
 import derive (Expansion, expand_derives)
 import std.bytes (u32_at, is_digit, replace, ascii_of_int, u32_le, u64_le)
 import std.hash (blake3)
-import std.list (at, concat, contains, take, push_unique, reverse)
+import std.list (at, concat, contains, take, push_unique, reverse, sort_by)
 import std.graph
 import std.bytes
 import std.string (ascii_lower)
@@ -123,6 +124,8 @@ type Target = { owner: Int, name: Bytes }
 pub type ValueTarget = | FnTarget(Int) | CtorTarget({ owner: Int, name: Bytes })
 type ModuleItems = {
   fns: Map<Bytes, Int>,
+  /// Its functions of types, `X::name`, under the name each has there.
+  members: Map<Bytes, List<Int>>,
   types: Map<Bytes, Int>,
   effects: Map<Bytes, Int>,
   ctors: Map<Bytes, Int>,
@@ -135,6 +138,9 @@ type ScopeIndex = {
   types: Map<Bytes, Target>,
   effects: Map<Bytes, Target>,
   modules: Map<Bytes, Int>,
+  /// The modules whose functions of types a call on a value here may call: itself, and each it
+  /// imports, directly or through others.
+  sees: List<Int>,
 }
 
 pub type Index = {
@@ -205,9 +211,30 @@ fn declare(d: Declaring, m: Int, name: Ident, id: Int, what: Bytes) -> Declaring
 
 fn no_declaring(diags: List<Diag>) -> Declaring = { map: map_new(), spans: map_new(), diags: diags }
 
+/// The modules `m` imports, directly or through others, and itself.
+fn seen_from(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.raise} =
+  iterate({ seen: [m], work: [m] }, 1000000, |s: { seen: List<Int>, work: List<Int> }|
+    match s.work {
+      [] -> Stop(s.seen),
+      [k, ..rest] ->
+        Continue(
+          fold(
+            match list_at(imports, k) { Some(ts) -> ts, None -> [] },
+            { seen: s.seen, work: rest },
+            |acc: { seen: List<Int>, work: List<Int> }, t: Int|
+              if contains(acc.seen, t) { acc }
+              else { { seen: push(acc.seen, t), work: push(acc.work, t) } },
+          ),
+        ),
+    })
+
+/// `checked` names the module a check against entries checks: every other module stands in for
+/// one it reads, holding what the check named of it, so it sees them all, though the imports
+/// their cut texts keep no longer say so.
 pub fn build_index(
   mods: List<ParsedModule>,
   resolved: Resolved,
+  checked: Option<Bytes> = None,
 ) -> { index: Index, diags: List<Diag> } / {abort.raise} = {
   let built = fold(
     range(0, len(mods)),
@@ -323,6 +350,20 @@ pub fn build_index(
         ..wb,
         items: push(wb.items, {
           fns: walked.fns.map,
+          members: map_fold(
+            walked.fns.map,
+            map_new(),
+            |acc: Map<Bytes, List<Int>>, name: Bytes, node: Int|
+              match member_of(name) {
+                Some(of) ->
+                  map_insert(
+                    acc,
+                    of.member,
+                    push(match map_get(acc, of.member) { Some(ns) -> ns, None -> [] }, node),
+                  ),
+                None -> acc,
+              },
+          ),
           types: walked.types.map,
           effects: walked.effects.map,
           ctors: walked.ctors.map,
@@ -351,6 +392,8 @@ pub fn build_index(
       effects: project(scope.bound.effects),
       modules: fold(scope.modules, map_new(), |acc: Map<Bytes, Int>, mb: ModuleBinding|
         map_insert(acc, mb.binder, mb.target)),
+      sees: if checked == Some(at(mods, m).name) { range(0, len(mods)) }
+      else { seen_from(resolved.imports, m) },
     }
   });
   let index: Index = {
@@ -413,7 +456,21 @@ fn target(
   match qual {
     Some(binder) -> match map_get(scope.modules, binder) {
       Some(owner) -> Some({ owner: owner, name: name }),
-      None -> None,
+      // A function of a type is written through a binder of its module that no import wrote,
+      // or through the type.
+      None -> match of_module(binder) {
+        None -> match ((ns, map_get(scope.types, binder))) {
+          (0, Some(of)) -> Some({ owner: of.owner, name: member_name(of.name, name) }),
+          _ -> None,
+        },
+        Some(home) ->
+          fold(range(0, len(index.mods)), None, |found: Option<Target>, k: Int|
+            match found {
+              Some(_) -> found,
+              None -> if at(index.mods, k).name == home { Some({ owner: k, name: name }) }
+              else { None },
+            }),
+      },
     },
     None ->
       map_get(
@@ -1480,6 +1537,35 @@ fn atom(encoder: Encoder, a: AtomExpr) -> Encoder / {abort.raise} = {
 fn atom_label(atom: AtomExpr) -> Option<Ident> =
   if atom.every { Some({ name: b"*", span: atom.span }) } else { atom.resource }
 
+/// What a call on a value written `.name(..)` may call: `m::f` where it names its function in
+/// full, and otherwise every function `X::name` of a module its own can see, in the order of
+/// their program-wide names. Which of them it is the value's type says, which no hash reads.
+fn on_value(encoder: Encoder, name: Ident) -> Encoder / {abort.raise} =
+  match member_of(name.name) {
+    Some(of) ->
+      value_ref(put_tag(encoder, tag_e_var()), {
+        module: Some({ name: of.of, span: name.span }),
+        name: { name: of.member, span: name.span },
+        span: name.span,
+      }),
+    None -> {
+      let index = encoder.index;
+      let found = sort_by(
+        fold(at(index.scopes, encoder.module).sees, [], |acc: List<Int>, k: Int|
+          match map_get(at(index.items, k).members, name.name) {
+            Some(nodes) -> concat(acc, nodes),
+            None -> acc,
+          }),
+        |a: Int, b: Int|
+          match compare_values(at(index.nodes, a).name, at(index.nodes, b).name) {
+            Greater -> false,
+            _ -> true,
+          },
+      );
+      fold(found, put_u32(encoder, len(found)), node_ref)
+    },
+  }
+
 fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
   match e {
     // `{ e }` and `e` are the same computation.
@@ -1510,7 +1596,18 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
         put_u32(expr(put_tag(encoder, tag_e_app()), a.func), len(a.args)),
         |acc: Encoder, x: Expr| expr(acc, x),
       );
-      fold(a.labels, put_u32(called, len(a.labels)), label_ref)
+      let labelled: Encoder = fold(a.labels, put_u32(called, len(a.labels)), label_ref);
+      match a.func {
+        // A call on a value: its named arguments are the call's to fill, and its callee the
+        // value's type's to say, so every function it may be is part of what the call is.
+        EField(f) ->
+          on_value(
+            fold(a.named, put_u32(labelled, len(a.named)), |acc: Encoder, n: NamedArg|
+              expr(put_text(acc, n.name.name), n.value)),
+            f.field,
+          ),
+        _ -> labelled,
+      }
     },
     EIf(i) -> expr(expr(expr(put_tag(encoder, tag_e_if()), i.cond), i.then_branch), i.else_branch),
     EMatch(m) ->
@@ -1546,18 +1643,40 @@ fn expr(encoder: Encoder, e: Expr) -> Encoder / {abort.raise} =
         put_u32(put_tag(encoder, tag_e_list()), len(l.items)),
         |acc: Encoder, x: Expr| expr(acc, x),
       ),
-    EPerform(p) ->
-      fold(
-        p.args,
-        put_u32(
-          opt_label(
-            put_text(effect_ref(put_tag(encoder, tag_e_perform()), p.eff), p.op.name),
-            p.resource,
+    EPerform(p) -> match if is_bare(p.eff) { bound_at(encoder.values, p.eff.name.name) }
+      else { None } {
+      None ->
+        fold(
+          p.args,
+          put_u32(
+            opt_label(
+              put_text(effect_ref(put_tag(encoder, tag_e_perform()), p.eff), p.op.name),
+              p.resource,
+            ),
+            len(p.args),
           ),
-          len(p.args),
+          |acc: Encoder, x: Expr| expr(acc, x),
         ),
-        |acc: Encoder, x: Expr| expr(acc, x),
-      ),
+      // On a binding it is a call on the value the binding holds.
+      Some(i) ->
+        on_value(
+          fold(
+            p.args,
+            put_u32(
+              opt_label(
+                put_text(
+                  put_level(put_tag(put_tag(encoder, tag_e_app()), tag_local()), i),
+                  p.op.name,
+                ),
+                p.resource,
+              ),
+              len(p.args),
+            ),
+            |acc: Encoder, x: Expr| expr(acc, x),
+          ),
+          p.op,
+        ),
+    },
     EHandle(h) -> {
       let clauses: Encoder = fold(
         h.clauses,
@@ -8069,6 +8188,40 @@ test "a definition's hash follows the name of the effect it performs" {
     map_get(by_name(named_hashes(one)), b"m.say")
       != map_get(by_name(named_hashes(other)), b"m.say"),
   )
+}
+
+test "a definition's hash follows each function a call on a value may be, of the modules its own can see" {
+  let said = |low: Bytes, side: Bytes|
+    map_get(
+      by_name(
+        named_hashes(
+          hash_index(
+            indexed([
+              {
+                name: b"low",
+                src: bytes_concat(
+                  b"pub type A = | A\npub fn made() -> A = A\npub fn A::go(a: A) -> Int = ",
+                  low,
+                ),
+              },
+              {
+                name: b"side",
+                src: bytes_concat(b"pub type B = | B\npub fn B::go(b: B) -> Int = ", side),
+              },
+              {
+                name: b"m",
+                src: b"import low\npub fn f() -> Int = low::made().go()\npub fn g() -> Int = low::A::go(low::made())",
+              },
+            ]),
+          ),
+        ),
+      ),
+      b"m.f",
+    );
+  assert(said(b"1", b"1") != None);
+  assert(said(b"1", b"1") != said(b"2", b"1"));
+  // A module it does not import is none it can see.
+  assert_eq(said(b"1", b"1"), said(b"1", b"2"))
 }
 
 // Pinned, so a framing change fails here rather than silently moving the digests a warm cache

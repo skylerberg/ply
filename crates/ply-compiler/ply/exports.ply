@@ -16,7 +16,7 @@ import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef, OpDef,
               Derived, DRow, parse, header, is_written, item_span, import_decl_bin, owner_of,
-              item_owner)
+              item_owner, member_of, member_name)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span)
 import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
@@ -31,8 +31,19 @@ import infer (DefInfo, Raise)
 import types (canonical_scheme, Scheme)
 
 /// A name another module's text says: `name` is declared by `module`, or every name it declares
-/// where `name` is empty.
+/// where `name` is empty. Under no module it is a name a text calls on a value, which a function of
+/// the value's type answers: a walk reads it of each module the text's own can see, itself and
+/// each it imports, directly or through others ([`called_of`]).
 pub type Mention = { module: Bytes, name: Bytes }
+
+/// The name a module declares each function `name` of a type of its own under, beside the
+/// function's own.
+pub fn of_any(name: Bytes) -> Bytes = bytes_concat(b"::", name)
+
+/// What a walk whose texts call each of `names` on a value reads of each of `modules`.
+pub fn called_of(modules: List<Bytes>, names: List<Bytes>) -> List<Mention> =
+  fold(modules, [], |acc: List<Mention>, m: Bytes|
+    fold(names, acc, |a: List<Mention>, n: Bytes| push(a, { module: m, name: of_any(n) })))
 
 /// The items of one owner as an importer reads them: `reach` the digest of every entry its text
 /// reaches through what it mentions, its own among them, where the memo store answers it (empty
@@ -205,11 +216,53 @@ fn tags(tokens: List<Token>, i: Int) -> Bool =
     _ -> false,
   }
 
+/// Each name `tokens` write where a binding of it can stand: not after a dot or a `::`, and not
+/// before a dot. Every pattern writes the names it binds so.
+fn standing(tokens: List<Token>) -> Map<Bytes, Bool> =
+  fold(range(0, len(tokens)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+    match ident_at(tokens, i) {
+      Some(n) -> if punct_at(tokens, i - 1, b"dot") || punct_at(tokens, i - 1, b"coloncolon")
+          || punct_at(tokens, i + 1, b"dot") { acc }
+      else { map_insert(acc, n, true) },
+      None -> acc,
+    })
+
+/// Whether the name at `i`, written after a dot, is called on a value: its arguments or its labels
+/// follow, and what it is written on is no bare name, or one of `bound`, which the text binds. A
+/// bare name a text never binds is an effect there, and the call a perform. A field read closed
+/// in parentheses and then called is a call on a value whatever it is read of.
+fn called_on_value(tokens: List<Token>, bound: Map<Bytes, Bool>, i: Int) -> Bool / {abort.raise} = {
+  let after = iterate(i + 1, len(tokens) + 1, |j: Int|
+    if punct_at(tokens, j, b"rparen") { Continue(j + 1) } else { Stop(j) });
+  (punct_at(tokens, after, b"lparen") || punct_at(tokens, after, b"lbracket"))
+    && (after > i + 1
+    || (match ident_at(tokens, i - 2) {
+      None -> true,
+      Some(base) ->
+        punct_at(tokens, i - 3, b"dot")
+          || (!punct_at(tokens, i - 3, b"coloncolon") && map_contains(bound, base)),
+    }))
+}
+
+/// The function `name` of the type written `of`, and the type: of the module itself where it
+/// declares `of`, and of each module a selection names `of` from.
+fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
+  let homes = concat(
+    if map_contains(scope.owners, of) { [scope.module] } else { [] },
+    match map_get(scope.selected, of) { Some(ms) -> ms, None -> [] },
+  );
+  fold(homes, [], |acc: List<Mention>, m: Bytes|
+    push(push(acc, { module: m, name: of }), { module: m, name: member_name(of, name) }))
+}
+
 /// What `text` names of other items, read off its tokens: a name after an import's binder and `::`
-/// is that module's, and a bare name the module selected or declares is the selected or declared
-/// one. It reads more than the text means wherever a local binder shares a declared name, never less.
+/// is that module's, one after a type and `::` that type's function, one called on a value a
+/// function of whichever type the value has, and a bare name the module selected or declares is the
+/// selected or declared one. It reads more than the text means wherever a local binder shares a
+/// declared name, never less.
 fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
   let tokens = lex(text).tokens;
+  let bound = standing(tokens);
   fold(range(0, len(tokens)), [], |acc: List<Mention>, i: Int|
     match ident_at(tokens, i) {
       None -> acc,
@@ -217,12 +270,18 @@ fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
         match ident_at(tokens, i - 2) {
           Some(b) -> match map_get(scope.binders, b) {
             Some(m) -> push(acc, { module: m, name: n }),
-            None -> acc,
+            None -> concat(acc, of_type(scope, b, n)),
           },
           None -> acc,
         }
-      } else if punct_at(tokens, i - 1, b"dot") || punct_at(tokens, i + 1, b"coloncolon") { acc }
-      else if tags(tokens, i) {
+      } else if punct_at(tokens, i - 1, b"dot") {
+        if !called_on_value(tokens, bound, i) { acc } else {
+          let any = push(acc, { module: b"", name: n });
+          if map_contains(scope.owners, of_any(n)) {
+            push(any, { module: scope.module, name: of_any(n) })
+          } else { any }
+        }
+      } else if punct_at(tokens, i + 1, b"coloncolon") { acc } else if tags(tokens, i) {
         match map_get(scope.binders, n) {
           Some(m) ->
             concat(acc, map([b"literal", b"compile", b"fill"], |f: Bytes| { module: m, name: f })),
@@ -378,6 +437,18 @@ fn owners_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> = {
     listed_under(acc, f, o))
 }
 
+/// [`owners_in`], with each function of a type also under [`of_any`] of its name there, which a
+/// call on a value reads it by.
+fn named_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  fold(raw.items, owners_in(raw, parsed), |acc: Map<Bytes, List<Bytes>>, item: Item|
+    match item {
+      IFn(d) -> match member_of(d.name.name) {
+        Some(m) -> listed_under(acc, of_any(m.member), d.name.name),
+        None -> acc,
+      },
+      _ -> acc,
+    })
+
 /// The functions an expansion generated into `parsed`, which `raw` does not write, by owner.
 fn generated_by_owner(
   raw: Module,
@@ -426,6 +497,27 @@ fn grouped<a>(
 fn alone(text: Bytes, items: List<Item>) -> Bytes / {abort.raise} =
   join(map(items, |item: Item| printed_alone(text, [], [item])), b"")
 
+/// The modules module `i` of `analysis` can see beside itself: each it imports, directly or
+/// through others.
+pub fn seen_by(analysis: Analysis, i: Int) -> List<Bytes> / {abort.raise} =
+  map(
+    iterate({ seen: [], work: [i] }, 1000000, |s: { seen: List<Int>, work: List<Int> }|
+      match s.work {
+        [] -> Stop(s.seen),
+        [k, ..rest] ->
+          Continue(
+            fold(
+              match list_at(analysis.r.imports, k) { Some(ts) -> ts, None -> [] },
+              { seen: s.seen, work: rest },
+              |acc: { seen: List<Int>, work: List<Int> }, t: Int|
+                if t == i || contains(acc.seen, t) { acc }
+                else { { seen: push(acc.seen, t), work: push(acc.work, t) } },
+            ),
+          ),
+      }),
+    |k: Int| at(analysis.mods, k).name,
+  )
+
 /// The modules each import of `parsed` names, in order, as `analysis` resolved them.
 pub fn import_targets(analysis: Analysis, i: Int) -> List<Bytes> / {abort.raise} =
   match list_at(analysis.r.imports, i) {
@@ -440,7 +532,7 @@ fn scopes(
   raw: Module,
   targets: List<Bytes>,
 ) -> { written: Scope, expanded: Scope } / {abort.raise} = {
-  let owners = owners_in(raw, parsed);
+  let owners = named_in(raw, parsed);
   let added = map(drop(parsed.module.imports, len(raw.imports)), dotted);
   {
     written: scope_of(parsed.name, raw.imports, targets, owners),
@@ -482,7 +574,7 @@ pub fn exports_of(
   let parsed = at(analysis.mods, i);
   let module = parsed.name;
   let raw = match read { Some(r) -> r, None -> parse(text).node };
-  let owners = owners_in(raw, parsed);
+  let owners = named_in(raw, parsed);
   let fns = fn_owners(raw, parsed);
   let targets = import_targets(analysis, i);
   let sc = scopes(parsed, raw, targets);
@@ -646,13 +738,16 @@ pub fn wanted_of(analysis: Analysis, i: Int, text: Bytes) -> List<Mention> / {ab
 
 /// Every entry `wanted` names, and every entry those mention, by module, as `entries` answers the
 /// entries of a module under a name (or under every name, asked for none), with every module of
-/// `imported` among them, which a check reads whether or not it names anything of one.
+/// `imported` among them, which a check reads whether or not it names anything of one. `sees`
+/// answers the modules beside its own that the text that wants them can see, which answer what
+/// it calls on a value; it is asked only where the text calls on one.
 pub fn needed_by<| e>(
   entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
   wanted: List<Mention>,
   imported: List<Bytes>,
+  sees: () -> List<Bytes> / {abort.raise | e},
 ) -> Map<Bytes, Map<Bytes, Entry>> / {abort.raise | e} =
-  needed_through(entries, head_of, wanted, imported, |_: Bytes, _: Bytes| [])
+  needed_through(entries, head_of, wanted, imported, |_: Bytes, _: Bytes| [], sees)
 
 /// [`needed_by`] over entries held as `head` reads them, each kept as `entries` answered it, also
 /// following what `publishing` says a module publishes for an owner of it (an `opaque` type's
@@ -663,6 +758,7 @@ pub fn needed_through<x | e>(
   wanted: List<Mention>,
   imported: List<Bytes>,
   publishing: (Bytes, Bytes) -> List<Mention> / {abort.raise | e},
+  sees: () -> List<Bytes> / {abort.raise | e},
 ) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} =
   iterate(
     {
@@ -676,7 +772,13 @@ pub fn needed_through<x | e>(
       match s.work {
         [] -> Stop(s.out),
         [m, ..rest] -> if map_contains(s.asked, mention_key(m)) { Continue({ ..s, work: rest }) }
-        else {
+        else if m.module == b"" {
+          Continue({
+            ..s,
+            asked: map_insert(s.asked, mention_key(m), true),
+            work: concat(rest, called_of(sees(), [m.name])),
+          })
+        } else {
           let have = match map_get(s.out, m.module) { Some(h) -> h, None -> map_new() };
           let fresh = fold(
             entries(m.module, m.name),
@@ -689,7 +791,10 @@ pub fn needed_through<x | e>(
           let asked = map_insert(s.asked, mention_key(m), true);
           if len(fresh) == 0 {
             Continue({
-              out: if map_contains(s.out, m.module) || len(entries(m.module, b"")) == 0 { s.out }
+              // The functions of its types a module could declare under a name say nothing of
+              // whether the module is there.
+              out: if map_contains(s.out, m.module) || bytes_starts_with(m.name, b"::")
+                  || len(entries(m.module, b"")) == 0 { s.out }
               else { map_insert(s.out, m.module, have) },
               asked: asked,
               work: rest,
@@ -886,6 +991,7 @@ fn staged_against(
       apart: placed == InRoot && is_std(source.name),
       given: reading.given,
       judged: reading.judged,
+      checked: Some(source.name),
     ),
     at: at,
   }
@@ -1079,19 +1185,30 @@ pub type OwnerSource = {
 /// `members`, owners of `module` that check together, each beside what it mentions in `mentions`:
 /// their items as their module writes them, beside the entries of their module that they mention,
 /// and the entries of other modules they read, as `entries` answers them by module and name.
-/// `imported` is what they read of their module's imports ([`group_imports`]).
+/// `imported` is what they read of their module's imports ([`group_imports`]), and `sees` the
+/// modules their module can see.
 pub fn group_source<| e>(
   module: Bytes,
   members: List<OwnerRead>,
   mentions: List<Mention>,
   imported: List<Imported>,
   entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
+  sees: () -> List<Bytes> / {abort.raise | e},
 ) -> OwnerSource / {abort.raise | e} =
   group_source_from(
     module,
     members,
     imported,
-    group_needs(module, members, mentions, imported, entries, head_of, |_: Bytes, _: Bytes| []),
+    group_needs(
+      module,
+      members,
+      mentions,
+      imported,
+      entries,
+      head_of,
+      |_: Bytes, _: Bytes| [],
+      sees,
+    ),
   )
 
 /// The entries a check of `members`, owners of `module` that check together, reads, as
@@ -1104,6 +1221,7 @@ pub fn group_needs<x | e>(
   entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
   head: (x) -> EntryHead,
   publishing: (Bytes, Bytes) -> List<Mention> / {abort.raise | e},
+  sees: () -> List<Bytes> / {abort.raise | e},
 ) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} = {
   let names = map(members, |o: OwnerRead| o.owner);
   // Each name an import it writes selects is read, as a module's check reads it: one a `derive`'s
@@ -1122,6 +1240,7 @@ pub fn group_needs<x | e>(
     ),
     push(map(imported, |x: Imported| x.target), module),
     publishing,
+    sees,
   )
 }
 
@@ -1187,6 +1306,7 @@ pub fn owner_source<| e>(
   targets: List<Bytes>,
   owner: Bytes,
   entries: (Bytes, Bytes) -> List<Entry> / {abort.raise | e},
+  sees: () -> List<Bytes> / {abort.raise | e},
 ) -> OwnerSource / {abort.raise | e} = {
   let scope = module_scope(parsed, raw, targets);
   let members = filter(owner_reads(parsed, raw, text), |o: OwnerRead| o.owner == owner);
@@ -1198,6 +1318,7 @@ pub fn owner_source<| e>(
     mentions,
     group_imports(parsed.name, members, mentions, unplaced_imports(raw), targets),
     entries,
+    sees,
   )
 }
 
@@ -1291,6 +1412,7 @@ fn per_module(
           |module: Bytes, n: Bytes| entries_in(exports, module, n),
           wanted_of(whole, i, text_at(i)),
           import_targets(whole, i),
+          || seen_by(whole, i),
         );
         let source = { name: name, src: text_at(i) };
         let apart = match checked_against(source, InRoot, deps, placing, reading).pulled.out {
@@ -1372,6 +1494,7 @@ fn per_owner(
             import_targets(whole, i),
             o,
             |module: Bytes, n: Bytes| entries_in(exports, module, n),
+            || seen_by(whole, i),
           );
           let apart = match checked_owner(source, InRoot, placing, reading).pulled.out {
             Refused(ds) -> refused_apart(bytes_concat_all([name, b".", o]), "checks", ds),
@@ -1495,3 +1618,58 @@ test "an entry's head reads back from its bytes alone, and its reach is written 
 
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
   fold(xs, (), |_: Unit, x: a| f(x))
+
+/// What `text` mentions, each as its module and its name, in a module `here` that binds `lib`,
+/// selects `Shape` from `shapes`, and declares `Stack`, `Stack::push` and `depth`.
+fn said_in(text: Bytes) -> List<Bytes> / {abort.raise} =
+  map(
+    distinct(
+      mentioned(
+        {
+          module: b"here",
+          binders: map_insert(map_new(), b"lib", b"deep.lib"),
+          selected: map_insert(map_new(), b"Shape", [b"shapes"]),
+          owners: fold(
+            [b"Stack", b"::push", b"depth"],
+            map_new(),
+            |acc: Map<Bytes, List<Bytes>>, n: Bytes| map_insert(acc, n, [n]),
+          ),
+        },
+        text,
+      ),
+    ),
+    |m: Mention| bytes_concat_all([m.module, b" ", m.name]),
+  )
+
+test "a call on a value is mentioned by its name alone, a function of a type with its type, and a perform not at all" {
+  assert_eq(
+    said_in(
+      b"fn f(xs: Stack) -> Int / {abort.raise} = { abort.raise(1); xs.push(2).depth() + lib::made().area() }",
+    ),
+    [b" area", b" depth", b" push", b"deep.lib made", b"here ::push", b"here Stack"],
+  );
+  assert_eq(said_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
+    b" area",
+    b"here Stack",
+    b"here Stack::depth",
+    b"here Stack::new",
+    b"shapes Shape",
+    b"shapes Shape::unit",
+  ])
+}
+
+test "a name a text binds, however it binds it, is one it may call on" {
+  for_all(
+    [
+      b"fn f(x: T) -> Int = x.go()",
+      b"fn f() -> Int = { let x = make(); x.go() }",
+      b"fn f(xs: List<T>) -> List<Int> = map(xs, |x| x.go())",
+      b"fn f(o: Option<T>) -> Int = match o { Some(x) -> x.go(), None -> 0 }",
+      b"fn f(p: P) -> Int = { let { x } = p; x.go() }",
+      b"fn f(l: List<T>) -> Int = match l { [x, ..rest] -> x.go[r](), [] -> 0 }",
+    ],
+    |text: Bytes| assert_eq(said_in(text), [b" go"]),
+  );
+  assert_eq(said_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b"deep.lib x"]);
+  assert_eq(said_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [b" go"])
+}
