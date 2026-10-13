@@ -9732,7 +9732,21 @@ fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
     ETryBlock(t) -> collect_refs(t.body, bound, out),
   }
 
-fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
+/// A module's functions as their signatures bind them, for the walk of its bodies.
+type SignedModule = {
+  fns: List<FnDef>,
+  names: List<Bytes>,
+  sigs: List<Signature>,
+  members: List<GroupDef>,
+}
+
+/// The module's functions bound by what they declare. Every module's are, before any body of
+/// the program is walked: a body calls a function of a type in whichever module declares it,
+/// which its own need not import.
+fn signed_fns(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> { checker: Checker, signed: SignedModule } / {abort.raise} = {
   let collected = fold(
     parsed.module.items,
     { checker: refuse_externs(checker, parsed), fns: [], names: [] },
@@ -9824,6 +9838,21 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     { checker: placed, sigs: [], members: [] },
     |acc: Signed, i: Int| signed_fn(acc, parsed, at(fns, i), at(names, i)),
   );
+  {
+    checker: signed.checker,
+    signed: { fns: fns, names: names, sigs: signed.sigs, members: signed.members },
+  }
+}
+
+/// The module's bodies walked against what every module's functions declare, and its groups
+/// settled.
+fn walked_fns(
+  checker: Checker,
+  parsed: ParsedModule,
+  signed: SignedModule,
+) -> Checker / {abort.raise} = {
+  let fns = signed.fns;
+  let names = signed.names;
   let own = fold(range(0, len(names)), map_new(), |m: Map<Bytes, Int>, i: Int|
     map_insert(m, at(names, i), i));
   let stated = stated_of(parsed);
@@ -9832,7 +9861,7 @@ fn check_fns(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} 
     match map_get(own, f) { Some(i) -> Some(at(signed.sigs, i).ret), None -> None };
   let walked = fold(
     walked_first(fns),
-    { checker: { ..signed.checker, own_fns: own }, bodies: map_new() },
+    { checker: { ..checker, own_fns: own }, bodies: map_new() },
     |acc: { checker: Checker, bodies: Map<Int, Body> }, i: Int| {
       let o = walked_fn(
         acc.checker,
@@ -16411,9 +16440,20 @@ pub fn check_program_with(
     let typed: Checker = collect_nominals(collect_effects(collect_types(c1, m), m), m);
     collect_stated(check_value_namespace(collect_ctors(typed, m), m), m)
   });
-  let checked: Checker = fold(resolved.order, declared, |checker: Checker, i: Int| {
+  let signed = fold(
+    resolved.order,
+    { checker: declared, by: map_new() },
+    |acc: { checker: Checker, by: Map<Int, SignedModule> }, i: Int| {
+      let o = signed_fns({ ..acc.checker, module: i }, at(mods, i));
+      { checker: o.checker, by: map_insert(acc.by, i, o.signed) }
+    },
+  );
+  let checked: Checker = fold(resolved.order, signed.checker, |checker: Checker, i: Int| {
     let m = at(mods, i);
-    check_specs(check_fns({ ..checker, module: i }, m), m)
+    match map_get(signed.by, i) {
+      Some(s) -> check_specs(walked_fns({ ..checker, module: i }, m, s), m),
+      None -> panic("a module of the program was not signed"),
+    }
   });
   let tested: Checker = fold(range(0, len(mods)), checked, |checker: Checker, i: Int|
     check_laws(
