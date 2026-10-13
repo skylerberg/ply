@@ -3815,7 +3815,121 @@ fn fused_fold(
   params: List<EmitParam>,
   span: Span,
 ) -> Option<WithValue> / {abort.raise} =
-  if name != b"fold" || len(args) != 3 { None } else {
+
+  // `map` or `filter` over a lambda of one parameter is a loop running the lambda's body for each
+  // element and pushing what it answers, or the element where it answers `true`, onto a list the
+  // loop holds alone.
+  if (name == b"map" || name == b"filter") && len(args) == 2 {
+    match list_at(args, 1) {
+      None -> None,
+      Some(f) -> match f.node {
+        NLambda(l) -> if l.params != 1 { None } else {
+          match list_at(args, 0) {
+            None -> None,
+            Some(xs) -> match expr(notail(emitter), xs, params) {
+              None -> None,
+              Some(lv) -> {
+                let lo = owned(lv.emitter, lv.value);
+                let cnt = line(lo.emitter, bytes_concat_all([b"ply_inc(", lo.value.expr, b");"]));
+                let raw = bind(cnt, KBoxed, builtin_call_over(b"len", [lo.value.expr]));
+                let n = bind(check(raw.emitter), KInt, as_int(raw.value));
+                let made = bind(
+                  n.emitter,
+                  KBoxed,
+                  bytes_concat_all([b"rt_list_room_p(ctx, ", n.value.expr, b")"]),
+                );
+                let out = made.value.expr;
+                let i = bind(builtin_of(check(made.emitter), b"push").emitter, KInt, b"0");
+                let head = line(
+                  i.emitter,
+                  bytes_concat_all([
+                    b"for (; ",
+                    i.value.expr,
+                    b" < ",
+                    n.value.expr,
+                    b"; ",
+                    i.value.expr,
+                    b" += 1) {",
+                  ]),
+                );
+                // Everything held outside the loop is pinned: the body reads it once per element.
+                let opened = line(pin_all(indent(head)), tick_line(leaving(emitter)));
+                match capture_window(opened, l.captures, params) {
+                  None -> Some(refused(emitter, b"a capture this port has not bound")),
+                  Some(window) -> {
+                    let at = bind(
+                      opened,
+                      KBoxed,
+                      bytes_concat_all([
+                        b"rt_list_at_p(ctx, ",
+                        lo.value.expr,
+                        b", ",
+                        i.value.expr,
+                        b")",
+                      ]),
+                    );
+                    let element = { ..at.value, ty: ty_at(lambda_param_tys(emitter, l), 0) };
+                    let bound = remember(
+                      with_reads(rescope(at.emitter, window), slots_read(l.body)),
+                      0,
+                      element,
+                    );
+                    // The element `filter` keeps is held before the body, which may move it out.
+                    let kept = if name == b"filter" { owned_word(bound, element) }
+                    else { { emitter: bound, value: element } };
+                    match expr(notail(kept.emitter), l.body, params) {
+                      None -> None,
+                      Some(r) -> {
+                        let pushed = if name == b"map" {
+                          let w = owned(r.emitter, r.value);
+                          line(
+                            w.emitter,
+                            bytes_concat_all([
+                              out,
+                              b" = ",
+                              builtin_call_over(b"push", [out, w.value.expr]),
+                              b";",
+                            ]),
+                          )
+                        } else {
+                          line(
+                            r.emitter,
+                            bytes_concat_all([
+                              b"if (",
+                              as_bool(r.value),
+                              b") { ",
+                              out,
+                              b" = ",
+                              builtin_call_over(b"push", [out, kept.value.expr]),
+                              b"; } else { ply_dec(ctx, ",
+                              kept.value.expr,
+                              b"); }",
+                            ]),
+                          )
+                        };
+                        let after = with_pinned(
+                          close(with_reads(rescope(check(pushed), opened.unboxed), emitter.reads)),
+                          emitter.pinned,
+                        );
+                        Some({
+                          emitter: line(
+                            after,
+                            bytes_concat_all([b"ply_dec(ctx, ", lo.value.expr, b");"]),
+                          ),
+                          value: made.value,
+                        })
+                      },
+                    }
+                  },
+                }
+              },
+            },
+          }
+        },
+        _ -> None,
+      },
+    }
+  } else if name != b"fold" || len(args) != 3 { None } else {
     match list_at(args, 2) {
       None -> None,
       Some(f) -> match f.node {
