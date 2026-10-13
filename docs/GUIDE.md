@@ -2505,11 +2505,12 @@ whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
 
 Congruence and injectivity read `==` as what a value's constructors and fields
-say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
-not, and arithmetic as the integers', which an operator at a type that states
-`numeric` is not. A claim that holds a value of any of them, at any depth, is
-proved only by a walk of every point of a finite domain. An `unproved` claim
-names each place the prover stopped, such as `float term` or `keyed term`.
+say, which a `Float` (`NaN != NaN`), a `Decimal` (`1.5m == 1.50m`, and they
+print apart) and a type that states a `key` (§4.4) are not, and arithmetic as
+the integers', which an operator at a type that states `numeric` is not. A claim
+that holds a value of any of them, at any depth, is proved only by a walk of
+every point of a finite domain. An `unproved` claim names each place the prover
+stopped, such as `float term`, `decimal term` or `keyed term`.
 
 A run proves a claim only where it covers all of it. A domain of at most 4096
 points is walked whole, and a law over a `simulate` region is searched at every
@@ -2521,15 +2522,15 @@ two literals: each end a comparison of the binder with a literal (`n > 0`,
 `where n > 0 && n <= 100` is a hundred points. Over any other domain a claim the
 prover left open is tried at a few small points: zero and its neighbours, each
 literal the claim and its guards are written with and that literal's
-neighbours, two texts, `NaN` among the floats, the empty list and lists of one
-and of two elements, a map of no entry and of one, each variant of a sum, a
-record with each field in turn at its second value, a type variable as an
-`Int`. Holding at them proves nothing. A point the claim is false at refutes
-it, a point it raises at is named, and a proof made of the claim under its
-guard stands once one of them is a value the guard admits. A value of a type
-another module declares `opaque` (§3.2) is one only that module builds, and no
-run makes a function, so a claim over either is proved by the prover or not at
-all.
+neighbours, two texts, `NaN` among the floats, one decimal at two scales, the
+empty list and lists of one and of two elements, a map of no entry and of one,
+each variant of a sum, a record with each field in turn at its second value, a
+type variable as an `Int`. Holding at them proves nothing. A point the claim is
+false at refutes it, a point it raises at is named, and a proof made of the
+claim under its guard stands once one of them is a value the guard admits. A
+value of a type another module declares `opaque` (§3.2) is one only that module
+builds, and no run makes a function, so a claim over either is proved by the
+prover or not at all.
 
 A law with no guard, once proved, is a lemma for every claim written below it
 in its module. Its trigger is the first call its body always makes whose

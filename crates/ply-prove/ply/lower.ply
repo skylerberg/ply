@@ -7,20 +7,21 @@ import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NInlined, NIf, NB
                       CodePatternField, irrefutable)
 import compiler.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit,
                           LBad)
-import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, is_pure, is_recursive,
-                unfoldable, self_recursive, reaches_float, reaches_key)
+import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, builtin_ty, is_pure,
+                is_recursive, unfoldable, self_recursive, reaches_float, reaches_decimal,
+                reaches_key)
 import domain (Ty, Var, Fn, Record, Con)
 import lemma (Lemma)
 import rules (RuleLog, Cited, note, unfolded)
 import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
              option_ty, record_of, substituted, field_ty)
-import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFixed, TUnit, TSym, TOpaque, TLin,
-             TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TIf, TMatch,
-             CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit, TestList, Undecidable,
-             true_id, false_id, new_terms, size, node, sort_of, force_int, mk, int_lit, boolean,
-             string, decimal, fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not,
-             and, or, cmp, eq, app, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
-             op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge)
+import term (Terms, Made, Node, TInt, TBool, TStr, TFixed, TUnit, TSym, TOpaque, TLin, TApp, TCtor,
+             TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TIf, TMatch, CmpOp, Lt, Le,
+             Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit, TestList, Undecidable, true_id,
+             false_id, new_terms, size, node, sort_of, force_int, mk, int_lit, boolean, string,
+             fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not, and, or, cmp, eq,
+             app, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or,
+             op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge)
 import std.list (concat, drop, take)
 import std.option (option_all)
 import std.string (ascii_upper)
@@ -120,9 +121,9 @@ pub type Blocker =
   | Concat
   | BitOperator
   | FloatTerm
+  | DecimalTerm
   // A value of a type that states a `key`, or that holds one.
   | KeyedTerm
-  | DecimalArithmetic
   /// `perform`, `handle`, `with_cell` or `simulate`.
   | Region
   | UndecidableMatchArm
@@ -146,8 +147,8 @@ pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
     Concat -> { kind: "concat", detail: None },
     BitOperator -> { kind: "bit_operator", detail: None },
     FloatTerm -> { kind: "float_term", detail: None },
+    DecimalTerm -> { kind: "decimal_term", detail: None },
     KeyedTerm -> { kind: "keyed_term", detail: None },
-    DecimalArithmetic -> { kind: "decimal_arithmetic", detail: None },
     Region -> { kind: "region", detail: None },
     UndecidableMatchArm -> { kind: "undecidable_match_arm", detail: None },
     DestructuringLet -> { kind: "destructuring_let", detail: None },
@@ -166,7 +167,9 @@ pub type Lowering = {
   requirements: List<Int>,
   /// Conditions assumed on the way to the expression being lowered.
   path: List<Int>,
-  float: Bool,
+  /// A value in the obligation is not equal to another as its constructors and fields say, so no
+  /// proof may be made of it.
+  refused: Bool,
   /// Recursive definitions shown to terminate, so a call of one is a value.
   total: Map<String, Bool>,
   /// Recursive definitions inlined to the depth, each unrolling recorded as an equation.
@@ -197,7 +200,7 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     blockers: [],
     requirements: [],
     path: [],
-    float: false,
+    refused: false,
     total: map_new(),
     unrolled: map_new(),
     equations: [],
@@ -217,19 +220,26 @@ fn with_terms(lowering: Lowering, terms: Terms) -> Lowering = { ..lowering, term
 fn blocked(lowering: Lowering, b: Blocker) -> Lowering =
   { ..lowering, blockers: push(lowering.blockers, b) }
 
-/// No proof survives a `Float` in the obligation.
-fn floated(lowering: Lowering) -> Lowering =
-  if lowering.float { lowering } else { { ..blocked(lowering, FloatTerm), float: true } }
+fn refused(lowering: Lowering, why: Blocker) -> Lowering =
+  if lowering.refused { lowering } else { { ..blocked(lowering, why), refused: true } }
 
-/// Nor a value read through what its type states, which no term here does: two are equal as its
-/// `key` says, and meet under an operator as its `numeric` says.
-fn keyed(lowering: Lowering) -> Lowering =
-  if lowering.float { lowering } else { { ..blocked(lowering, KeyedTerm), float: true } }
-
+/// Refuses a value of `ty` where congruence and injectivity do not hold of it: a `Float` is not
+/// equal to itself at `NaN`, two `Decimal`s are equal at different scales, and two values of a type
+/// that states a `key` are equal as it says and meet under an operator as its `numeric` says.
 fn unread(lowering: Lowering, context: Context, ty: Ty) -> Lowering =
-  if reaches_float(context, ty) { floated(lowering) }
-  else if reaches_key(context, ty) { keyed(lowering) }
+  if lowering.refused { lowering }
+  else if reaches_float(context, ty) { refused(lowering, FloatTerm) }
+  else if reaches_decimal(context, ty) { refused(lowering, DecimalTerm) }
+  else if reaches_key(context, ty) { refused(lowering, KeyedTerm) }
   else { lowering }
+
+/// `lowering`, refused where a term in it is of a sort `unread` refuses: a call's answer and a
+/// value a pattern took out carry their sort, and no binder or literal names it.
+pub fn unread_anywhere(lowering: Lowering, context: Context) -> Lowering =
+  if lowering.refused { lowering } else {
+    fold(range(0, size(lowering.terms)), lowering, |acc: Lowering, t: Int|
+      match sort_of(acc.terms, t) { Some(s) -> unread(acc, context, s), None -> acc })
+  }
 
 pub fn assume(lowering: Lowering, cond: Int) -> Lowering =
   { ..lowering, path: push(lowering.path, cond) }
@@ -543,10 +553,14 @@ fn literal(lowering: Lowering, l: Lit) -> L / {abort.raise} =
     LBytes(_) -> on(lowering, sym(lowering.terms, Some(bytes_ty()))),
     // No shared node: congruence needs a reflexive `==`, which `Float` lacks.
     LFloat(_) -> {
-      let lw2 = floated(lowering);
+      let lw2 = refused(lowering, FloatTerm);
       on(lw2, sym(lw2.terms, Some(float_ty())))
     },
-    LDec(raw) -> on(lowering, decimal(lowering.terms, decimal_of_raw(string_of_bytes_lossy(raw)))),
+    // Nor one for a `Decimal`: `1.5m` and `1.50m` are equal, and print apart.
+    LDec(_) -> {
+      let lw2 = refused(lowering, DecimalTerm);
+      on(lw2, sym(lw2.terms, Some(decimal_ty())))
+    },
     LFixed(width, bits) ->
       on(lowering, fixed(lowering.terms, ascii_upper(string_of_bytes_lossy(width)), 0, bits)),
     LWide(width, high, low) ->
@@ -556,29 +570,6 @@ fn literal(lowering: Lowering, l: Lit) -> L / {abort.raise} =
     LUnit -> on(lowering, unit(lowering.terms)),
     LBad -> on(lowering, unit(lowering.terms)),
   }
-
-/// `1.50m` is `1.50`; a pattern's `-` is part of its source, and negates it.
-fn decimal_of_raw(raw: String) -> Decimal / {abort.raise} = {
-  let b = bytes_of_string(raw);
-  let digits = |from: Int, to: Int|
-    bytes_concat_all(
-      map(range(from, to), |i: Int| {
-        let c = bytes_at(b, i);
-        if c >= 48 && c <= 57 { bytes_slice(b, i, i + 1) } else { b"" }
-      }),
-    );
-  let dot = match bytes_index_of(b, b".") { Some(i) -> i, None -> bytes_len(b) };
-  let whole = digits(0, dot);
-  let fraction = digits(dot, bytes_len(b));
-  let sign = if bytes_starts_with(b, b"-") { b"-" } else { b"" };
-  let spelled = bytes_concat_all([
-    sign,
-    if bytes_len(whole) == 0 { b"0" } else { whole },
-    if bytes_len(fraction) == 0 { b"" } else { b"." },
-    fraction,
-  ]);
-  match decimal_of_string(string_of_bytes(spelled)) { Some(d) -> d, None -> decimal_of_int(0) }
-}
 
 fn local(lowering: Lowering, slot: Int) -> L / {abort.raise} =
   match list_at(lowering.window, slot) {
@@ -601,8 +592,15 @@ fn global(lowering: Lowering, context: Context, name: String) -> L / {abort.rais
     } else { on(lowering, mk(lowering.terms, TOpaque(name), Some(ctor_sort(c)))) },
     None -> match signature(context, name) {
       Some(s) -> on(lowering, mk(lowering.terms, TOpaque(name), Some(s.ty))),
-      None -> if is_total_builtin(name) { on(lowering, opaque(lowering.terms, name, None)) }
-      else { on(lowering, sym(lowering.terms, None)) },
+      None -> {
+        // A builtin's answer is a term of no sort, so what it takes and answers is read here.
+        let lw2 = match builtin_ty(context, name) {
+          Some(ty) -> unread(lowering, context, ty),
+          None -> lowering,
+        };
+        if is_total_builtin(name) { on(lw2, opaque(lw2.terms, name, None)) }
+        else { on(lw2, sym(lw2.terms, None)) }
+      },
     },
   }
 
@@ -663,13 +661,10 @@ fn non_int_operator(
   numeric: Numeric,
 ) -> L / {abort.raise} = {
   let comparison = is_ordered(op);
-  let lw2 = match numeric {
-    FloatOperand -> floated(lowering),
-    DecimalOperand -> {
-      let b = blocked(lowering, DecimalArithmetic);
-      if comparison { b } else { undefined(b) }
-    },
-  };
+  let lw2 = refused(lowering, match numeric {
+    FloatOperand -> FloatTerm,
+    DecimalOperand -> DecimalTerm,
+  });
   let sort = if comparison { bool_ty() }
   else { match numeric { FloatOperand -> float_ty(), DecimalOperand -> decimal_ty() } };
   let head = opaque(lw2.terms, arith_symbol(op), None);
@@ -1389,7 +1384,6 @@ fn is_literal(terms: Terms, t: Int) -> Bool / {abort.raise} =
     TInt(_) -> true,
     TBool(_) -> true,
     TStr(_) -> true,
-    TDecimal(_) -> true,
     TFixed(_, _, _) -> true,
     TUnit -> true,
     _ -> false,

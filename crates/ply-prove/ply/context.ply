@@ -8,7 +8,7 @@ import compiler.code (Code, NLit, NVar, NUnary, NBinary, NApp, NInlined, NIf, NB
 import compiler.front (Claim, ClaimDef, ClaimSum, ClaimLaw, ClaimClause, Lowered)
 import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
 import sort (canonical, is_pure_fn)
-import world (Signature, World)
+import world (Signature, World, builtin_types)
 import std.graph
 
 /// A definition as the prover reads it: its body (`None` when the lowering did not take it), its
@@ -41,6 +41,8 @@ pub type Context = {
   decls: Map<String, Decl>,
   ctors: Map<String, Ctor>,
   signatures: Map<String, Signature>,
+  /// Each builtin's type, which no term of a call of one carries.
+  builtins: Map<String, Ty>,
   recursive: Map<String, Bool>,
   /// A component of one definition calling itself: the shape induction unrolls.
   self_recursive: Map<String, Bool>,
@@ -51,8 +53,10 @@ pub type Context = {
   /// The sum types a case split may range over.
   sums: Map<String, Bool>,
   inhabited: Map<String, Bool>,
-  /// Nominal types whose declaration reaches a `Float`.
+  /// `Float`, and the nominal types whose declaration reaches one.
   float_types: Map<String, Bool>,
+  /// `Decimal`, and the nominal types whose declaration reaches one.
+  decimal_types: Map<String, Bool>,
   // Nominal types that state a `key`, or whose declaration reaches one that does.
   keyed_types: Map<String, Bool>,
 }
@@ -166,38 +170,39 @@ pub fn context(claims: Claims, world: World) -> Context / {abort.raise} = {
     decls: by_name,
     ctors: ctors,
     signatures: map_merge(signatures, measures.signatures),
+    builtins: builtin_types(),
     recursive: rec.recursive,
     self_recursive: rec.alone,
     groups: rec.groups,
     measured: map_new(),
     sums: sums,
     inhabited: inhabited_sum_types(decls, sums),
-    float_types: reaching_types(decls, map_new(), true),
+    float_types: reaching_types(decls, set_of(["Float"])),
+    decimal_types: reaching_types(decls, set_of(["Decimal"])),
     keyed_types: if len(world.keyed) == 0 { map_new() }
-    else { reaching_types(decls, set_of(world.keyed), false) },
+    else { reaching_types(decls, set_of(world.keyed)) },
   }
 }
 
 /// Through its arguments, its fields, or its own declaration.
-pub fn reaches_float(cx: Context, ty: Ty) -> Bool = reaches(ty, cx.float_types, true)
+pub fn reaches_float(cx: Context, ty: Ty) -> Bool = reaches(ty, cx.float_types)
+
+/// Whether a value of `ty` holds a `Decimal`, which is equal to another of a different scale.
+pub fn reaches_decimal(cx: Context, ty: Ty) -> Bool = reaches(ty, cx.decimal_types)
 
 /// Whether a value of `ty` holds one of a type that states a `key` or a `numeric`, whose `==` or
 /// whose operators are not what its constructors and fields say.
 pub fn reaches_key(cx: Context, ty: Ty) -> Bool =
-  map_len(cx.keyed_types) > 0 && reaches(ty, cx.keyed_types, false)
+  map_len(cx.keyed_types) > 0 && reaches(ty, cx.keyed_types)
 
-/// `float` counts `Float` itself as reached.
-fn reaches(t: Ty, declared: Map<String, Bool>, float: Bool) -> Bool =
+fn reaches(t: Ty, found: Map<String, Bool>) -> Bool =
   match t {
     Con(name, args) ->
-      (float && name == "Float" && len(args) == 0) || map_contains(declared, name)
-        || fold(args, false, |f: Bool, a: Ty| f || reaches(a, declared, float)),
+      map_contains(found, name) || fold(args, false, |f: Bool, a: Ty| f || reaches(a, found)),
     Fn(params, ret, _) ->
-      fold(params, false, |f: Bool, p: Ty| f || reaches(p, declared, float))
-        || reaches(ret, declared, float),
+      fold(params, false, |f: Bool, p: Ty| f || reaches(p, found)) || reaches(ret, found),
     Record(fields) ->
-      fold(fields, false, |f: Bool, x: { name: String, ty: Ty }|
-        f || reaches(x.ty, declared, float)),
+      fold(fields, false, |f: Bool, x: { name: String, ty: Ty }| f || reaches(x.ty, found)),
     Var(_) -> false,
   }
 
@@ -218,6 +223,8 @@ pub fn variants(cx: Context, type_name: String) -> Option<Decl> =
   if map_contains(cx.sums, type_name) { map_get(cx.decls, type_name) } else { None }
 
 pub fn signature(cx: Context, name: String) -> Option<Signature> = map_get(cx.signatures, name)
+
+pub fn builtin_ty(cx: Context, name: String) -> Option<Ty> = map_get(cx.builtins, name)
 
 pub fn inhabited(cx: Context, ty: Ty) -> Bool =
   match ty {
@@ -257,18 +264,17 @@ fn reached_pure(cx: Context, name: String) -> Option<Def> =
     },
   }
 
-/// The types that reach `seeds`, those included, and `Float` when `float`. A least fixed point, so
-/// chains of declarations and recursive ones both settle.
+/// The types that reach `seeds`, those included. A least fixed point, so chains of declarations and
+/// recursive ones both settle.
 fn reaching_types(
   decls: List<Decl>,
   seeds: Map<String, Bool>,
-  float: Bool,
 ) -> Map<String, Bool> / {abort.raise} =
   iterate(seeds, len(decls) + 1, |found: Map<String, Bool>| {
     let grown = fold(decls, found, |acc: Map<String, Bool>, decl: Decl|
       if map_contains(acc, decl.name) { acc }
       else if fold(decl.variants, false, |f: Bool, variant: Variant|
-          f || fold(variant.fields, false, |g: Bool, ty: Ty| g || reaches(ty, found, float))) {
+          f || fold(variant.fields, false, |g: Bool, ty: Ty| g || reaches(ty, found))) {
         map_insert(acc, decl.name, true)
       } else { acc });
     if map_len(grown) == map_len(found) { Stop(found) } else { Continue(grown) }
