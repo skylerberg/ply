@@ -1791,10 +1791,17 @@ fn value_key(
   qname: QName,
 ) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} =
   if !is_bare(qname) {
-    let g: WithName = global(checker, ValueSpace, qname);
-    match g.name {
-      Some(n) -> { checker: g.checker, key: Some({ name: n, prelude: false }) },
-      None -> { checker: g.checker, key: None },
+    match of_language_type(checker, qname) {
+      Named(n) -> { checker: checker, key: Some({ name: n, prelude: true }) },
+      // A capital no import binds and no module declares is a type of the language's.
+      Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
+      Elsewise -> {
+        let g: WithName = global(checker, ValueSpace, qname);
+        match g.name {
+          Some(n) -> { checker: g.checker, key: Some({ name: n, prelude: false }) },
+          None -> { checker: g.checker, key: None },
+        }
+      },
     }
   } else {
     let name = qname.name.name;
@@ -1804,6 +1811,21 @@ fn value_key(
       } else { value_key_global(checker, qname) },
       None -> value_key_global(checker, qname),
     }
+  }
+
+/// What a name written `T::name` is where `T` is a type of the language's, one no import binds
+/// as a module and no module in scope declares: the prelude's name for it, or none it has.
+type OfLanguageType = | Named(Bytes) | Unnamed(Ident) | Elsewise
+
+fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.raise} =
+  match qname.module {
+    None -> Elsewise,
+    Some(of) -> if !starts_upper(of.name) || of_module(of.name) != None
+        || find_module_binding(scope_of(checker).modules, of.name) != None
+        || declaring_type(checker.resolved, checker.module, of.name) != None { Elsewise } else {
+      let declared = member_name(of.name, qname.name.name);
+      if env_depth_of(checker.env, declared) == Some(0) { Named(declared) } else { Unnamed(of) }
+    },
   }
 
 fn value_key_global(
@@ -5378,7 +5400,21 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             None -> None,
           };
           let named: Checker = match through {
-            None -> constrained,
+            // A builtin named through its type is written out as the builtin's own name.
+            None -> if !key.prelude || is_bare(qname) { constrained } else {
+              {
+                ..constrained,
+                member_sites: push(constrained.member_sites, {
+                  reaches: [],
+                  module: constrained.module,
+                  span: qname.span,
+                  qualifier: prelude_binder(),
+                  name: runtime_of(constrained, key.name),
+                  callee: b"",
+                  owner: constrained.walking,
+                }),
+              }
+            },
             Some(t) ->
               {
                 ..constrained,
@@ -21188,8 +21224,16 @@ test "a builtin is a function of the type it is named for, or of the type it fir
   assert_eq(check_codes(b"fn f(m: Map<Int, Int>) -> Option<Int> = m.get(1)"), []);
   assert_eq(check_codes(b"fn f(b: Bytes, s: String) -> Int = b.len() + s.trim().len()"), []);
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> List<Int> = xs.map(|x| x + 1)"), []);
-  // One named for a type it does not take is no call on a value of that type.
+  // One named for a type it does not take is no call on a value of that type, and is named
+  // through the type as any of its functions is.
   assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.of_string()"), [b"E0101"]);
+  assert_eq(
+    check_codes(
+      b"fn f(s: String) -> Int = Bytes::len(Bytes::of_string(s)) + Map::len(Map::insert(Map::new(), 1, s))",
+    ),
+    [],
+  );
+  assert_eq(check_codes(b"fn f(s: String) -> Int = Bytes::size(s)"), [b"E0101"]);
   // A builtin is compiled by its own name, which a module that binds it would answer.
   assert(
     refused_with(
