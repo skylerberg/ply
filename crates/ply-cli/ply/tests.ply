@@ -17,9 +17,8 @@ import loads (shipped_stamps)
 import results
 import std.random (entropy)
 import std.hash (blake3)
-import std.fs (fs, File, mem_kind, mem_list, mem_modified, mem_of, mem_size)
+import std.fs (fs, mem_kind, mem_list, mem_modified, mem_of, mem_size)
 import std.list (sort_by, all, at, at_or, concat, contains, dedup, flat_map)
-import std.path (parent)
 import std.time (time)
 import std.cli (Parsed, Run, has, parse, parse_nat, value, values_of)
 import config_schema
@@ -2078,13 +2077,13 @@ fn over_load(
     },
   }
 
-/// How the tree stamps now, one line per `.ply` file the paths name, or `None` when the walk could
-/// not read what it was given: a walk that failed has seen nothing, and a watcher told the tree is
-/// empty stops noticing saves to it.
+/// How the tree stamps now, one line per `.ply` file a load of the paths reads, or `None` when the
+/// walk could not read what it was given: a walk that failed has seen nothing, and a watcher told
+/// the tree is empty stops noticing saves to it.
 pub fn stamped(
   rs: List<paths::Resolved>,
 ) -> Option<List<String>> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs]} = {
-  let found = walk::sweep(rs);
+  let found = walk::loads(rs);
   if len(found.errors) > 0 { None } else {
     Some(
       map_fold(found.files, [], |acc: List<String>, shown: String, rooted: paths::Rooted|
@@ -2099,18 +2098,9 @@ pub fn stamped(
 
 fn stamp_part(n: Option<Int>) -> String = match n { Some(x) -> int_to_string(x), None -> "-" }
 
-/// The root a report names: the directory a path names, or the one holding the file it names.
-fn root_of(rs: List<paths::Resolved>) -> String / {fs.kind[cwd], fs.kind[abs]} =
-  match list_at(rs, 0) {
-    None -> ".",
-    Some(r) -> match paths::kind(paths::rooted(r)) {
-      File -> {
-        let dir = parent(r.machine);
-        if dir == "" { "." } else { dir }
-      },
-      _ -> r.machine,
-    },
-  }
+/// The root a report names.
+fn root_of(rs: List<paths::Resolved>) -> String =
+  match list_at(rs, 0) { None -> ".", Some(r) -> r.machine }
 
 // --- What the loaded tree tells a selector ------------------------------------
 
@@ -2226,8 +2216,22 @@ fn case_view(
 
 /// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
 /// and a standard library module's are in scope only under `--std`, the compiler's never — narrowed
-/// by `--filter` to the keys that contain one of its substrings, and by `--shard` to its part.
+/// by a path the line names in the package to the modules under it, by `--filter` to the keys that
+/// contain one of its substrings, and by `--shard` to its part.
 type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
+
+/// The modules a line narrows a run to: those of `files` it names or that are under a directory it
+/// names. `None` where it names each root whole.
+fn named_modules(paths: List<paths::Resolved>, files: List<File>) -> Option<List<String>> =
+  if all(paths, |r: paths::Resolved| r.inside == ".") { None } else {
+    Some(
+      map(
+        filter(files, |f: File|
+          fold(paths, false, |hit: Bool, r: paths::Resolved| hit || paths::names(r, f.path))),
+        |f: File| f.module,
+      ),
+    )
+  }
 
 fn root_modules(analysis: View) -> Map<String, Bool> =
   fold(range(0, len(analysis.frame.outlines)), map_new(), |acc: Map<String, Bool>, i: Int|
@@ -2237,7 +2241,11 @@ fn root_modules(analysis: View) -> Map<String, Bool> =
       _ -> acc,
     })
 
-fn scope_of(analysis: View, options: Options) -> Scope / {abort.raise} = {
+fn scope_of(
+  analysis: View,
+  options: Options,
+  named: Option<List<String>> = None,
+) -> Scope / {abort.raise} = {
   let packaged = len(analysis.frame.packages) > 0;
   let root = root_modules(analysis);
   let in_scope = |t: TestInfo|
@@ -2245,7 +2253,11 @@ fn scope_of(analysis: View, options: Options) -> Scope / {abort.raise} = {
       else { !is_shipped(string_of_bytes_lossy(t.module)) })
       || (options.std && is_std(string_of_bytes_lossy(t.module)));
   let matches = |t: TestInfo|
-    kept(options.filters, string_of_bytes_lossy(t.key)) && in_shard(options.shard, t.key);
+    kept(options.filters, string_of_bytes_lossy(t.key)) && in_shard(options.shard, t.key)
+      && (match named {
+        Some(modules) -> contains(modules, string_of_bytes_lossy(t.module)),
+        None -> true,
+      });
   fold(
     range(0, len(analysis.checked.tests)),
     { visible: [], out: [], filtered_out: 0 },
@@ -2510,7 +2522,7 @@ fn decided_run(
 ) -> Answer / {process.out[proc], fs.kind[cwd], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.pwd[sys], env.vars[sys], tester.unit[corpus], tester.bound[corpus], tester.hosted[corpus], tester.ended[corpus], tester.executed[corpus], tester.interleaved[corpus], tester.moved[corpus], tester.schema[corpus], ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[abs], fs.list_dir[abs], fs.write[abs], fs.read[cwd], fs.list_dir[cwd], fs.write[cwd], abort.raise, shipped.reached} = {
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
-  let scope = scope_of(analysis, options);
+  let scope = scope_of(analysis, options, named_modules(flags.paths, timed.program.files));
   let filed_under = if options.no_cache { None } else { Some(shipped_stamps().runtime) };
   let p = program_of(
     options,
@@ -5045,11 +5057,11 @@ fn a_store() -> String =
 
 fn precise() -> String =
   a_store()
-    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
+    ++ "fn list_items() -> Int / {store.read[items]} = store.all[items]()\nfn place_order() -> Int / {store.write[orders]} = { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
 
 fn aliased() -> String =
   a_store()
-    ++ "effect set Service = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Service} = store.all[items]()\nfn place_order() -> Int / {Service} { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
+    ++ "effect set Service = {store.read[items], store.write[orders]}\nfn list_items() -> Int / {Service} = store.all[items]()\nfn place_order() -> Int / {Service} = { store.save[orders](1); 2 }\ntest/nondet \"items\" { assert_eq(list_items(), 0) }\ntest/nondet \"orders\" { assert_eq(place_order(), 2) }\n"
 
 /// `src` with its effects and tests declared deterministic.
 fn deterministic(src: String) -> String =
