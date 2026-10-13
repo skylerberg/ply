@@ -2220,11 +2220,12 @@ fn maybe_owned(emitter: Emitter, value: CValue) -> WithValue =
     let w = owned_word(emitter, { ..value, kind: KBoxed });
     { emitter: w.emitter, value: { ..w.value, kind: KMaybe } }
   } else {
-    let w = word_of(emitter, value);
+    // The object is taken, so one this scope holds alone hands its payload over without a copy.
+    let w = owned(emitter, value);
     let opened = bind(
       w.emitter,
       KMaybe,
-      bytes_concat_all([b"rt_maybe_open_p(ctx, ", w.expr, b")"]),
+      bytes_concat_all([b"rt_maybe_open_p(ctx, ", w.value.expr, b")"]),
     );
     let o = owned_word(opened.emitter, { ..opened.value, kind: KBoxed });
     { emitter: o.emitter, value: { ..o.value, kind: KMaybe } }
@@ -8828,12 +8829,7 @@ fn assigned(
 fn as_kind(value: CValue, k: Kind) -> Bytes =
   match k {
     KBoxed -> as_word(value),
-    // From its object, the payload with a count of its own, the object keeping its.
-    KMaybe -> match value.kind {
-      KMaybe -> value.expr,
-      KBoxed -> bytes_concat_all([b"rt_maybe_open_p(ctx, ", value.expr, b")"]),
-      _ -> b"ply_maybe_unrouted",
-    },
+    KMaybe -> if value.kind == KMaybe { value.expr } else { b"ply_maybe_unrouted" },
     KInt -> as_int(value),
     KBool -> as_bool(value),
     KNum(w) -> as_num(value, w),
@@ -10847,6 +10843,21 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
         None -> acc,
         Some(p) -> match p.carrier {
           Whole(KBoxed) -> { ..acc, args: push(acc.args, arg) },
+          // The argument's object is taken, its payload handed on.
+          Whole(KMaybe) -> {
+            let local = bytes_concat(b"a", ascii_of_int(i));
+            {
+              text: bytes_concat_all([
+                acc.text,
+                b"  PlyMaybe ",
+                local,
+                b" = rt_maybe_open_p(ctx, ",
+                arg,
+                b");\n",
+              ]),
+              args: push(acc.args, local),
+            }
+          },
           Whole(k) -> {
             let local = bytes_concat(b"a", ascii_of_int(i));
             {
@@ -11273,6 +11284,12 @@ fn group_wrapper(
       if bytes_len(grown.prep) == 0 { b"" } else { bytes_concat_all([b"  ", grown.prep, b"\n"]) },
       match answer {
         Whole(KBoxed) -> bytes_concat_all([b"  return ", call, b";\n"]),
+        Whole(KMaybe) ->
+          bytes_concat_all([
+            b"  Word r = ",
+            call,
+            b";\n  if (ctx->failed) return 0;\n  return rt_maybe_open_p(ctx, r);\n",
+          ]),
         Whole(_) ->
           opened([
             {
@@ -11525,6 +11542,13 @@ fn grow_call(entry: Bytes, args: List<Bytes>, answer: Carrier) -> Bytes =
 fn grown_return(grown: Bytes, answer: Carrier) -> Bytes =
   match answer {
     Whole(KBoxed) -> bytes_concat_all([b"return ", grown, b";"]),
+    // The answer's object is taken, its payload handed back.
+    Whole(KMaybe) ->
+      bytes_concat_all([
+        b"Word ply_back = ",
+        grown,
+        b"; if (ctx->failed) return 0; return rt_maybe_open_p(ctx, ply_back);",
+      ]),
     _ -> {
       let k = returned_kind(answer);
       let fail = bytes_concat_all([b"if (ctx->failed) ", failing_return(k), b" "]);
