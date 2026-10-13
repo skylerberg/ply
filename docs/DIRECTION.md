@@ -22,5 +22,6 @@ A feature earns its place by one of these. Saving keystrokes does not count.
 
 ## Open
 
-- Loops and mutable variables, dispatch and method syntax: stay out unless generated code's
-  error rate says otherwise.
+- Loops and mutable variables, and dispatch at run time: stay out unless generated code's
+  error rate says otherwise. A call on a value is picked by the value's type where it is
+  written, so a type's functions come with it and nothing is dispatched.
