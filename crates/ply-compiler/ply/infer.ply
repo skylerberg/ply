@@ -1,7 +1,7 @@
 //! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
 import parsing (Span, Ident, QName, span_to, dummy_span, span_key, span_bin, is_bare, qname_text,
-                starts_upper)
+                starts_upper, prelude_binder)
 import std.bin
 import std.hash (blake3)
 import std.list (at, at_or, concat, contains, drop, push_unique, sort, sort_by, take, prepend)
@@ -5981,7 +5981,14 @@ fn dotted_callee(
       reaches: [],
     };
   let of_type = |m: { qname: QName, callee: Bytes }| {
-    let filled = member_args(b.checker, span, m.callee, base, args, named);
+    let filled = member_args(
+      if m.qname.module == None { reaching_builtin(b.checker, m.qname.name) } else { b.checker },
+      span,
+      m.callee,
+      base,
+      args,
+      named,
+    );
     let func = EVar({ span: name.span, name: m.qname });
     let f0: Inferred = infer_var(filled.checker, m.qname);
     let params = match shallow(f0.checker.subst, f0.ty) { TyFn(fn_) -> fn_.params, _ -> [] };
@@ -6119,18 +6126,22 @@ fn dotted(
         member_sites: push(o.checker.member_sites, {
           module: o.checker.module,
           span: span,
-          qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
-          name: m.qname.name.name,
+          // A function of a language type is a builtin: the call is written out as that
+          // builtin's, and what reads the call as it stands asks for it by name.
+          qualifier: match m.qname.module { Some(q) -> q.name, None -> prelude_binder() },
+          name: match m.qname.module {
+            Some(_) -> m.qname.name.name,
+            None -> runtime_of(o.checker, m.qname.name.name),
+          },
           callee: m.callee,
           owner: o.checker.walking,
           reaches: d.reaches,
         }),
-        // A function of a language type is a builtin, which what reads the call asks for by name.
         builtins_on: if m.qname.module != None { o.checker.builtins_on } else {
           map_insert(
             o.checker.builtins_on,
             span_key(span),
-            builtin_of(m.qname.name.name, |n: Bytes| env_depth_of(o.checker.env, n) == Some(0)),
+            runtime_of(o.checker, m.qname.name.name),
           )
         },
       })
@@ -6138,13 +6149,47 @@ fn dotted(
   }
 }
 
+/// A builtin is compiled by its own name, so a call on a value cannot reach one whose name the
+/// module binds to something of its own: refused until builtins are compiled by their types'
+/// names alone.
+fn reaching_builtin(checker: Checker, name: Ident) -> Checker / {abort.raise} = {
+  let builtin = runtime_of(checker, name.name);
+  match lookup(scope_of(checker).bound, ValueSpace, builtin) {
+    None -> checker,
+    Some(_) ->
+      report_error_at(
+        checker,
+        b"E0105",
+        name.span,
+        bytes_concat_all([
+          b"`",
+          name.name,
+          b"` is the builtin `",
+          builtin,
+          b"`, a name this module binds",
+        ]),
+        b"the module's own would be called here",
+        [
+          bytes_concat_all([
+            b"give the module's `",
+            builtin,
+            b"` another name, or import it through its module",
+          ]),
+        ],
+      ),
+  }
+}
+
+/// The builtin the prelude's function `name` is.
+fn runtime_of(checker: Checker, name: Bytes) -> Bytes / {abort.raise} =
+  builtin_of(name, |n: Bytes| env_depth_of(checker.env, n) == Some(0))
+
 /// The prelude name a bare callee resolves to, or nothing for one the program declares.
 fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
     EVar(v) -> if !is_bare(v.name) { b"" } else {
       match value_key(checker, v.name).key {
-        Some(k) -> if !k.prelude { b"" }
-        else { builtin_of(k.name, |n: Bytes| env_depth_of(checker.env, n) == Some(0)) },
+        Some(k) -> if !k.prelude { b"" } else { runtime_of(checker, k.name) },
         None -> b"",
       }
     },
@@ -21126,7 +21171,15 @@ test "a builtin is a function of the type it is named for, or of the type it fir
   assert_eq(check_codes(b"fn f(b: Bytes, s: String) -> Int = b.len() + s.trim().len()"), []);
   assert_eq(check_codes(b"fn f(xs: List<Int>) -> List<Int> = xs.map(|x| x + 1)"), []);
   // One named for a type it does not take is no call on a value of that type.
-  assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.of_string()"), [b"E0101"])
+  assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.of_string()"), [b"E0101"]);
+  // A builtin is compiled by its own name, which a module that binds it would answer.
+  assert(
+    refused_with(
+      b"fn len(n: Int) -> Int = n\nfn f(xs: List<Int>) -> Int = xs.len()",
+      b"E0105",
+      b"`List::len` is the builtin `len`, a name this module binds",
+    ),
+  )
 }
 
 test "a guard written on a value's own length lets a builtin that needs it raise nothing" {
