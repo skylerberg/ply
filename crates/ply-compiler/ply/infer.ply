@@ -2028,10 +2028,11 @@ fn conv_con(
         if len(over.labels) != 1 || len(over.rows) != 0 {
           new_ty(over_refused(c, span, name.name.name, 1, 0, over))
         } else {
-          {
-            checker: c,
-            ty: TyCon({ name: name.name.name, args: [at(over.labels, 0), at(converted.tys, 0)] }),
-          }
+          let label = match map_get(c.label_params, at(labels, 0).name) {
+            Some(v) -> TyVar(v),
+            None -> label_type(region_named(c, hold(), at(labels, 0).name)),
+          };
+          { checker: c, ty: TyCon({ name: name.name.name, args: [label, at(converted.tys, 0)] }) }
         }
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
@@ -2466,7 +2467,7 @@ fn conv_atom(
           match a.resource {
             Some(r) -> match map_get(checker.label_params, r.name) {
               Some(v) -> RVar(v),
-              None -> RNamed(r.name),
+              None -> RNamed(region_named(checker, eff, r.name)),
             },
             None -> RSingleton,
           }
@@ -8048,23 +8049,16 @@ fn region_reopened(checker: Checker, resource: Ident, outer: OpenRegion, form: B
 fn region_label(checker: Checker, name: Bytes) -> Bytes =
   bytes_concat_all([name, region_mark(), checker.walking])
 
-/// Opens the region `name` under `label`, the name standing for the label wherever the body writes it.
-fn open_region(
-  checker: Checker,
-  name: Bytes,
-  label: Bytes,
-  span: Span,
-  hold: Bool,
-) -> Checker / {abort.raise} = {
-  let named: WithVar = new_ty_var(checker);
-  let bound: Checker = with_unified(
-    named.checker,
-    unify(named.checker.subst, named.checker.fresh, TyVar(named.var), label_type(label)),
-  );
+/// What `name` stands for where an atom of the effect `eff` or a hold's type writes it: an open
+/// region's own label for its cells and holds, and for any other effect the resource of that name.
+fn region_named(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
+  if !is_region_effect(eff) { name }
+  else { match open_region_named(checker, name) { Some(region) -> region.label, None -> name } }
+
+fn open_region(checker: Checker, name: Bytes, label: Bytes, span: Span, hold: Bool) -> Checker =
   {
-    ..bound,
-    label_params: map_insert(bound.label_params, name, named.var),
-    open_regions: push(bound.open_regions, {
+    ..checker,
+    open_regions: push(checker.open_regions, {
       name: name,
       label: label,
       span: span,
@@ -8074,7 +8068,6 @@ fn open_region(
       handoffs: [],
     }),
   }
-}
 
 type ClosedRegion = { checker: Checker, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 
@@ -8239,11 +8232,7 @@ fn infer_with_cell(
       env: env_bind(env_push(opened.env), binder.name, monomorphic(cell_ty)),
     };
     let b: Inferred = infer(pushed, body, hint);
-    let closed: ClosedRegion = close_region({
-      ..b.checker,
-      env: env_pop(b.checker.env),
-      label_params: i.checker.label_params,
-    });
+    let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
     let handled = cell_atoms(label);
     let discharged: Checker = discharge(
       closed.checker,
@@ -8331,11 +8320,7 @@ fn infer_with_hold(
         body,
         hint,
       );
-      let closed: ClosedRegion = close_region({
-        ..b.checker,
-        env: env_pop(b.checker.env),
-        label_params: entering.checker.label_params,
-      });
+      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
       let handled = [hold_atom(RNamed(label))];
       let discharged: Checker = discharge(
         closed.checker,
@@ -15476,7 +15461,15 @@ test "a region's label is its own: a row another definition writes names no regi
     b"fn each<| e>(k: () -> Int / e) -> Int / e = with_cell[work](0) { d -> cell_get(d) + k() }\n",
     b"fn held() -> Int = with_cell[work](41) { c -> each(|| cell_get(c)) }",
   ]);
-  assert_eq(check_codes(generic), [])
+  assert_eq(check_codes(generic), []);
+  // The name is the region's for its cells alone: another effect's label of that name is the
+  // resource it always was, so a clause inside the region answers what a callee performs on it.
+  let other = bytes_concat_all([
+    b"effect tally { write note[r](n: Int) -> Unit }\n",
+    b"fn noted(n: Int) -> Unit / {tally.write[log]} = tally.note[log](n)\n",
+    b"fn held(n: Int) -> Int = with_cell[log](0) { c -> { handle { noted(n) } with { tally.note[log](what) -> cell_set(c, what) }; cell_get(c) } }",
+  ]);
+  assert_eq(check_codes(other), [])
 }
 
 test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
