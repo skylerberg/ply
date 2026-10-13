@@ -1,16 +1,12 @@
 //! What a compiled unit says about itself, embedded in its C so loading reads no source. Helpers
 //! bind by name, so a unit serves while the runtime has every helper its C calls.
 
-use super::encoding::{count, decode_tables, encode_tables, line, section};
-use super::load::Library;
+use super::descriptor::Descriptor;
+use super::encoding::{count, decode_pools, encode_pools, line, section};
 use super::prelude::helpers;
-use super::tables::Defined;
 use crate::heap::RecordLayout;
 use anyhow::{Result, anyhow};
 use ply_eval::{Symbol, Value};
-
-/// The symbol the table is read from.
-pub const SYMBOL: &str = "ply_exports";
 
 /// One runtime helper as a unit records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,28 +49,16 @@ impl std::fmt::Display for Unserved {
 
 impl std::error::Error for Unserved {}
 
-/// One function the unit holds: its Ply name, its arity, and the C the emitter wrote for it, so a
-/// reader of a unit binds and calls what that unit defines rather than a spelling of its own.
-#[derive(Clone)]
-pub struct Taken {
-    pub name: String,
-    pub arity: usize,
-    pub symbol: String,
-    pub entry: String,
-}
-
+/// What a unit's loader reads of it once. What it binds, the code table and each definition's
+/// entry, the unit lays out in its [`Descriptor`] instead.
 #[derive(Clone)]
 pub struct Exports {
     pub helpers: Vec<HelperShape>,
     /// The constructor table the C's tags index: each one's name, arity, and arguments as a shape
     /// spells them, `a000` first, none where it holds every argument as its word.
     pub ctors: Vec<(Symbol, usize, Vec<Symbol>)>,
-    /// Every function the unit holds, where it names them here for the loader to look up; a unit
-    /// that lays out a [`super::descriptor::Descriptor`] holds them there instead.
-    pub taken: Vec<Taken>,
-    /// The pure nullary functions, which the seam memoizes, each with its row of the code table;
-    /// a unit that names that table's rows says none.
-    pub constants: Vec<(String, Option<usize>)>,
+    /// The pure nullary functions, which the seam memoizes, each with its row of the code table.
+    pub constants: Vec<(String, usize)>,
     /// How many modules the unit was emitted from.
     pub modules: usize,
     /// What the fixpoint dropped and why.
@@ -83,11 +67,6 @@ pub struct Exports {
     pub fields: Vec<Symbol>,
     pub builtins: Vec<ply_eval::Builtin>,
     pub shapes: Vec<Vec<Symbol>>,
-    /// The code table's rows by name, in a unit that leaves them to the loader to look up.
-    pub lambdas: Vec<String>,
-    /// Each bucket's table by the bucket's id, in a unit that leaves them to the loader to fill:
-    /// the unit's position of every key its C names.
-    pub buckets: Vec<(u8, Vec<u32>)>,
     /// Each constructor whose type's module states a `key` or a `show`, with the function of
     /// each: `-` where it states none, `!` for one the unit does not take.
     pub instances: Vec<(Symbol, String, String)>,
@@ -109,10 +88,6 @@ pub const RAW_DECIMALS: &str = "decimals held raw";
 pub const BYTES_VIEWS: &str = "bytes slices are views";
 
 impl Exports {
-    pub fn names(&self) -> Vec<String> {
-        self.taken.iter().map(|t| t.name.clone()).collect()
-    }
-
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
     /// lacks, or has under another shape, is refused.
     pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, Unserved> {
@@ -166,44 +141,21 @@ impl Exports {
             }
             out.push('\n');
         }
-        if !self.taken.is_empty() {
-            out.push_str(&format!("taken {}\n", self.taken.len()));
-            for t in &self.taken {
-                out.push_str(&format!(
-                    "{} {} {} {}\n",
-                    t.name, t.arity, t.symbol, t.entry
-                ));
-            }
-        }
         out.push_str(&format!("constants {}\n", self.constants.len()));
         for (name, slot) in &self.constants {
-            match slot {
-                Some(slot) => out.push_str(&format!("{name} {slot}\n")),
-                None => out.push_str(&format!("{name}\n")),
-            }
+            out.push_str(&format!("{name} {slot}\n"));
         }
         out.push_str(&format!("modules {}\n", self.modules));
         out.push_str(&format!("refused {}\n", self.refusals.len()));
         for (function, construct) in &self.refusals {
             out.push_str(&format!("{function}\n{construct}\n"));
         }
-        out.push_str(&encode_tables(
+        out.push_str(&encode_pools(
             &self.consts,
             &self.builtins,
             &self.fields,
             &self.shapes,
-            &self.lambdas,
         ));
-        if !self.buckets.is_empty() {
-            out.push_str(&format!("buckets {}\n", self.buckets.len()));
-            for (id, places) in &self.buckets {
-                out.push_str(&id.to_string());
-                for place in places {
-                    out.push_str(&format!(" {place}"));
-                }
-                out.push('\n');
-            }
-        }
         // Written only by a unit one of whose types states a `key` or a `show`.
         if !self.instances.is_empty() {
             out.push_str(&format!("instances {}\n", self.instances.len()));
@@ -251,31 +203,11 @@ impl Exports {
             let arity = parts.next()?.parse().ok()?;
             ctors.push((name, arity, parts.map(Symbol::new).collect()));
         }
-        let n = section(s, &mut at, "taken")?;
-        let mut taken = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut parts = line(s, &mut at)?.split(' ');
-            let name = parts.next()?.to_string();
-            let arity = parts.next()?.parse().ok()?;
-            let published = Defined {
-                symbol: parts.next()?.to_string(),
-                entry: parts.next()?.to_string(),
-            };
-            taken.push(Taken {
-                name,
-                arity,
-                symbol: published.symbol,
-                entry: published.entry,
-            });
-        }
         let n = count(line(s, &mut at)?, "constants")?;
         let mut constants = Vec::with_capacity(n);
         for _ in 0..n {
-            let row = line(s, &mut at)?;
-            constants.push(match row.split_once(' ') {
-                Some((name, slot)) => (name.to_string(), Some(slot.parse().ok()?)),
-                None => (row.to_string(), None),
-            });
+            let (name, slot) = line(s, &mut at)?.split_once(' ')?;
+            constants.push((name.to_string(), slot.parse().ok()?));
         }
         let modules = count(line(s, &mut at)?, "modules")?;
         let n = count(line(s, &mut at)?, "refused")?;
@@ -285,18 +217,7 @@ impl Exports {
             let construct = line(s, &mut at)?.to_string();
             refusals.push((function, construct));
         }
-        let t = decode_tables(s, &mut at)?;
-        // A unit whose C lays its bucket tables out filled has none for the loader to fill.
-        let n = section(s, &mut at, "buckets")?;
-        let mut buckets = Vec::with_capacity(n);
-        for _ in 0..n {
-            let mut parts = line(s, &mut at)?.split(' ');
-            let id = parts.next()?.parse().ok()?;
-            let places = parts
-                .map(|p| p.parse().ok())
-                .collect::<Option<Vec<u32>>>()?;
-            buckets.push((id, places));
-        }
+        let t = decode_pools(s, &mut at)?;
         // A unit none of whose types states a `key` or a `show` has no such table.
         let n = section(s, &mut at, "instances")?;
         let mut instances = Vec::with_capacity(n);
@@ -330,7 +251,6 @@ impl Exports {
         Some(Exports {
             helpers,
             ctors,
-            taken,
             constants,
             modules,
             refusals,
@@ -338,31 +258,19 @@ impl Exports {
             fields: t.fields,
             builtins: t.builtins,
             shapes: t.shapes,
-            lambdas: t.lambdas,
-            buckets,
             instances,
             numerics,
             layout,
         })
     }
 
-    pub fn read(lib: &Library) -> Result<Exports> {
-        let text = match lib.descriptor() {
-            Some(unit) => unit.exports(),
-            None => {
-                let Some(p) = lib.symbol(SYMBOL) else {
-                    return Err(anyhow!(
-                        "the unit at {} carries no `{SYMBOL}`",
-                        lib.path().display()
-                    ));
-                };
-                unsafe { std::ffi::CStr::from_ptr(p as *const std::ffi::c_char) }
-                    .to_str()
-                    .ok()
-            }
-        };
-        let text = text.ok_or_else(|| anyhow!("the unit's `{SYMBOL}` is not UTF-8"))?;
-        Exports::decode(text)
-            .ok_or_else(|| anyhow!("the unit's `{SYMBOL}` does not decode as a unit's table"))
+    /// What `unit` says about itself.
+    pub fn read(unit: &Descriptor) -> Result<Exports> {
+        let text = unit
+            .exports()
+            .ok_or_else(|| anyhow!("what the unit says about itself is not UTF-8"))?;
+        Exports::decode(text).ok_or_else(|| {
+            anyhow!("what the unit says about itself does not read as a unit's table")
+        })
     }
 }

@@ -1,60 +1,15 @@
-//! What a body names of the unit around it, and the unit's tables those names resolve into. A
-//! unit is built with its tables sorted by content, so a body's resolved C is a function of what
-//! the unit holds and never of the order its definitions were taken in.
+//! The tables a loaded unit's C indexes: its constant pool, field names, builtins and layouts, each
+//! in the order the unit recorded it, which is the order its C was emitted against.
 
-use super::encoding::encode_const;
 use crate::heap::{Layouts, RecordLayout};
 use ply_eval::{Builtin, Symbol, Value};
-use std::collections::HashMap;
 
-/// What the emitter named one definition's C: the function its callers write and the entry the
-/// loader binds, which is also its memo slot. Published by the body that defines them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Defined {
-    pub symbol: String,
-    pub entry: String,
-}
-
-/// What one body names of the unit around it, by the positions its own text uses.
-#[derive(Default, Clone)]
-pub struct BodyTables {
-    pub consts: Vec<Value>,
-    pub builtins: Vec<Builtin>,
-    pub fields: Vec<Symbol>,
-    pub shapes: Vec<Vec<Symbol>>,
-    /// Every definition this body calls, so a cached body is checked against the fixpoint's set.
-    pub calls: Vec<String>,
-    /// The C symbols of the lambda entries this body defines, in the order it met them.
-    pub lambdas: Vec<String>,
-    /// Effects performed and handled, under their program-wide names.
-    pub performs: Vec<String>,
-    pub handles: Vec<String>,
-    /// The definitions this one body serves when it is a recursive group's, in case order; empty
-    /// for a body of its own.
-    pub members: Vec<String>,
-    /// The C this body defines for each definition it holds: one per entry of `members`, in that
-    /// order, or one for a body of its own.
-    pub symbols: Vec<Defined>,
-}
-
-/// What an emitted unit accumulates that is not code, with each entry's position. A unit being
-/// built sorts every table by content, so a position is a rank among what the unit holds; a unit
-/// read back keeps the order its C was emitted against, whatever that was.
+/// What a unit holds that is not code, each entry at the position its C names it by.
 pub struct UnitTables {
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
     pub builtins: Vec<Builtin>,
-    /// Each shape's field names sorted; a shape's id is its position.
-    pub shapes: Vec<Vec<Symbol>>,
     pub layouts: Layouts,
-    /// Lambda entry symbols; `rt_closure` and `rt_constant` take a position here.
-    pub lambdas: Vec<String>,
-}
-
-fn sorted(names: &[Symbol]) -> Vec<Symbol> {
-    let mut names = names.to_vec();
-    names.sort();
-    names
 }
 
 impl UnitTables {
@@ -65,15 +20,14 @@ impl UnitTables {
         consts: Vec<Value>,
         fields: Vec<Symbol>,
         builtins: Vec<Builtin>,
-        shapes: Vec<Vec<Symbol>>,
-        lambdas: Vec<String>,
+        shapes: &[Vec<Symbol>],
         layout: RecordLayout,
     ) -> Option<UnitTables> {
         let (table, args): (Vec<_>, Vec<_>) = ctors
             .into_iter()
             .map(|(name, arity, args)| ((name, arity), args))
             .unzip();
-        let mut layouts = Layouts::of(table, &shapes, layout);
+        let mut layouts = Layouts::of(table, shapes, layout);
         let placed = layouts.shape_count() >= shapes.len()
             && shapes
                 .iter()
@@ -87,65 +41,8 @@ impl UnitTables {
             consts,
             fields,
             builtins,
-            shapes,
             layouts,
-            lambdas,
         })
-    }
-
-    pub fn lambda(&self, symbol: &str) -> Option<usize> {
-        self.lambdas.iter().position(|l| l == symbol)
-    }
-
-    /// Every entry's position, for resolving bodies against this unit.
-    pub fn positions(&self) -> Positions<'_> {
-        Positions {
-            consts: index(self.consts.iter().map(encode_const)),
-            fields: index(self.fields.iter()),
-            builtins: index(self.builtins.iter().map(|b| b.name())),
-            shapes: index(self.shapes.iter().map(|names| sorted(names))),
-            lambdas: index(self.lambdas.iter().map(String::as_str)),
-        }
-    }
-}
-
-fn index<K: std::hash::Hash + Eq>(keys: impl IntoIterator<Item = K>) -> HashMap<K, usize> {
-    let mut at = HashMap::new();
-    for (i, k) in keys.into_iter().enumerate() {
-        at.entry(k).or_insert(i);
-    }
-    at
-}
-
-/// Where each entry of a unit's tables sits, by content; built once per unit resolved, never
-/// for a unit merely loaded.
-pub struct Positions<'a> {
-    consts: HashMap<String, usize>,
-    fields: HashMap<&'a Symbol, usize>,
-    builtins: HashMap<&'static str, usize>,
-    shapes: HashMap<Vec<Symbol>, usize>,
-    lambdas: HashMap<&'a str, usize>,
-}
-
-impl Positions<'_> {
-    pub fn constant(&self, v: &Value) -> Option<usize> {
-        self.consts.get(&encode_const(v)).copied()
-    }
-
-    pub fn field(&self, name: &Symbol) -> Option<usize> {
-        self.fields.get(name).copied()
-    }
-
-    pub fn builtin(&self, b: Builtin) -> Option<usize> {
-        self.builtins.get(b.name()).copied()
-    }
-
-    pub fn shape(&self, names: &[Symbol]) -> Option<u32> {
-        self.shapes.get(&sorted(names)).map(|id| *id as u32)
-    }
-
-    pub fn lambda(&self, symbol: &str) -> Option<usize> {
-        self.lambdas.get(symbol).copied()
     }
 }
 

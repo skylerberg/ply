@@ -2,28 +2,31 @@
 //! `abs` to the filesystem's root: a path that stays under the working directory is addressed
 //! under `cwd`, and one that leaves it is addressed under `abs`, root-relative, after a lexical
 //! normalize. `resolve` is where that is decided; everything after it carries the answer as a
-//! `Rooted` path. The program is the tool, and the tool reads where it is told.
+//! `Rooted` path. A command that loads a project finds its root: the nearest directory at or above
+//! what its line names, or the working directory where it names nothing, that holds a `ply.pkg`.
 
 import std.cli
 import env (env)
 import std.fs (fs, Kind, File, Dir, Symlink, Missing, MemFs, Written, mem_create_dir, mem_empty,
                mem_kind, mem_list, mem_of, mem_read, mem_resolved, mem_symlink, mem_write)
-import std.path (file_name, is_absolute, join, normalize, parent, strip_dot)
+import std.path (below_root, file_name, is_absolute, join, normalize, parent, strip_dot)
 import std.list (at_or)
 
 /// A command's path argument, resolved: the label its fs reads spell, the project root it reports
 /// and the machine loads by, and the path inside that root (`.` for the whole of it).
 pub type Resolved = {
-  /// `cwd` while the path stays under the working directory, else `abs`.
+  /// `cwd` while the root stays under the working directory, else `abs`.
   label: String,
   /// The project root, spelled for the label (`pwd`-relative, or root-relative under `abs`).
   spelling: String,
   /// The project root as reports print it: relative to the working directory when it can be.
   display: String,
+  /// What the line named inside the root. A command narrows to it, and a load reads it alone
+  /// only where the root holds no `ply.pkg`.
   inside: String,
   /// The project root, absolute: the key a package walk roots at and resolves dependencies against.
   absolute: String,
-  /// The spelling the machine loads by: the working-directory spelling while the path stays
+  /// The project root as the machine spells it: the working-directory spelling while it stays
   /// under it (so the spans a run reports read as given), the absolute form once it leaves.
   machine: String,
 }
@@ -56,62 +59,91 @@ fn display_of(pwd: String, full: String) -> String / {abort.raise} =
 fn absolute_of(pwd: String, label: String, spelling: String) -> String =
   normalize(if label == "cwd" { join(pwd, spelling) } else { "/" ++ spelling })
 
+/// How `full`, an absolute path, is addressed from the working directory `pwd`: its label, and its
+/// spelling under it.
+fn addressed(pwd: String, full: String) -> (String, String) / {abort.raise} =
+  match strip_prefix(full, pwd) {
+    Some(rest) -> ("cwd", if rest == "" { "." } else { rest }),
+    None -> ("abs", below_root(full)),
+  }
+
+/// The absolute directory `dir` as a project root, with `inside` named in it.
+fn root_at(pwd: String, dir: String, inside: String) -> Resolved / {abort.raise} = {
+  let (label, spelling) = addressed(pwd, dir);
+  {
+    label: label,
+    spelling: spelling,
+    display: display_of(pwd, dir),
+    inside: inside,
+    absolute: dir,
+    machine: if label == "cwd" { spelling } else { dir },
+  }
+}
+
+/// The path as it stands: a directory is a root, a file is in the root that holds it, and a name
+/// that names nothing is in the nearest directory above it.
 pub fn resolve(
   arg: String,
 ) -> Resolved / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], abort.raise} = {
   let pwd = env.pwd[sys]();
   let full = normalize(if is_absolute(strip_dot(arg)) { arg } else { join(pwd, strip_dot(arg)) });
-  let (label, spelling) = match strip_prefix(full, pwd) {
-    Some(rest) -> ("cwd", if rest == "" { "." } else { rest }),
-    None -> ("abs", string_slice(full, 1, string_len(full))),
-  };
-  // The machine takes the path as given: a file names the one module to load, a directory the
-  // walk under it.
-  let machine_spelling = if label == "cwd" { spelling } else { full };
+  let (label, spelling) = addressed(pwd, full);
   match kind_of(label, spelling) {
-    "dir" ->
-      {
-        label: label,
-        spelling: spelling,
-        display: display_of(pwd, full),
-        inside: ".",
-        absolute: full,
-        machine: machine_spelling,
-      },
-    "file" -> {
-      let dir = parent(full);
-      let (dlabel, dspelling) = match strip_prefix(dir, pwd) {
-        Some(rest) -> ("cwd", if rest == "" { "." } else { rest }),
-        None -> ("abs", string_slice(dir, 1, string_len(dir))),
-      };
-      {
-        label: dlabel,
-        spelling: dspelling,
-        display: display_of(pwd, dir),
-        inside: file_name(full),
-        absolute: dir,
-        machine: machine_spelling,
-      }
-    },
+    "dir" -> root_at(pwd, full, "."),
+    "file" -> root_at(pwd, parent(full), file_name(full)),
     _ -> {
       // Nothing there: the nearest directory above it is rooted, so the program reports the name.
       let dir = nearest_dir(label, spelling);
-      let root = absolute_of(pwd, label, dir);
-      {
-        label: label,
-        spelling: dir,
-        display: display_of(pwd, root),
-        inside: match strip_prefix(spelling, dir) { Some(rest) -> rest, None -> spelling },
-        absolute: root,
-        machine: machine_spelling,
-      }
+      root_at(pwd, absolute_of(pwd, label, dir), match strip_prefix(spelling, dir) {
+        Some(rest) -> rest,
+        None -> spelling,
+      })
     },
   }
 }
 
+/// The nearest directory at or above `dir`, an absolute path, that holds a `ply.pkg`: the root of
+/// the package `dir` is part of. `None` where no directory up to the filesystem's root holds one,
+/// and for a relative path.
+pub fn package_of(dir: String) -> Option<String> / {fs.resolved[abs], abort.raise} =
+  iterate(normalize(dir), string_len(dir) + 2, |at: String|
+    if !is_absolute(at) { Stop(None) }
+    else if fs.resolved[abs](below_root(join(at, "ply.pkg"))) == File { Stop(Some(at)) }
+    else if at == "/" { Stop(None) }
+    else { Continue(parent(at)) })
+
+/// `resolved` in the package that holds it: rooted at the nearest directory at or above its root
+/// that holds a `ply.pkg`, with what it named as the path inside. Itself where no package holds it,
+/// and where it names a file that is no module, which is read as it stands.
+pub fn in_package(resolved: Resolved) -> Resolved / {fs.resolved[abs], env.pwd[sys], abort.raise} =
+  if resolved.inside != "." && !string_ends_with(resolved.inside, ".ply") { resolved } else {
+    match package_of(resolved.absolute) {
+      None -> resolved,
+      Some(root) -> match strip_prefix(resolved.absolute, if root == "/" { "" } else { root }) {
+        None -> resolved,
+        Some(below) ->
+          root_at(env.pwd[sys](), root, if below == "" { resolved.inside }
+          else if resolved.inside == "." { below }
+          else { join(below, resolved.inside) }),
+      },
+    }
+  }
+
 /// The fs spelling of the whole resolved path (the root's spelling joined with the inside path).
 fn address(resolved: Resolved) -> String =
   if resolved.inside == "." { resolved.spelling } else { join(resolved.spelling, resolved.inside) }
+
+/// Whether `path`, a file's place below the root, is what the line named or is under it.
+pub fn names(resolved: Resolved, path: String) -> Bool =
+  resolved.inside == "." || path == resolved.inside
+    || string_starts_with(path, resolved.inside ++ "/")
+
+/// Whether a line that resolved to `resolved` names `path`: every path, where it resolved to none.
+pub fn names_any(resolved: List<Resolved>, path: String) -> Bool =
+  len(resolved) == 0 || fold(resolved, false, |hit: Bool, r: Resolved| hit || names(r, path))
+
+/// The whole resolved path as a report spells it.
+pub fn given(resolved: Resolved) -> String = displayed(rooted(resolved))
 
 /// A path as one root spells it, read and written through that root and no other.
 pub type Rooted = { label: String, path: String }
@@ -191,23 +223,39 @@ pub fn create_dir(p: Rooted) -> Bool / {fs.create_dir[cwd], fs.create_dir[abs]} 
 pub fn root_prefix(resolved: Resolved) -> String =
   if resolved.spelling == "." { "" } else { resolved.spelling }
 
-/// The command's path arguments, each resolved against the working directory. The name a query
-/// command looks up is not a path, nor is any word of a yank, `contracts`, `keygen` or `attest`; an empty list is the
-/// working directory.
+/// The paths a command's line names. The name a query command looks up is not a path, nor is any
+/// word of a command that loads no project.
+fn named_by(command: String, parsed: cli::Parsed) -> List<String> =
+  if command == "doc" || command == "show" || command == "callers" || command == "replace"
+      || command == "why" { drop_first(parsed.positionals) }
+  else if command == "cache" && at_or(parsed.path, 1, "") == "inspect" {
+    drop_first(parsed.positionals)
+  } else if loads_nothing(command) { [] }
+  else { parsed.positionals }
+
+/// The commands that load no project: what they act on is not found from where they run.
+fn loads_nothing(command: String) -> Bool =
+  command == "explain" || command == "std" || command == "yank" || command == "contracts"
+    || command == "keygen"
+    || command == "attest"
+
+/// The command's paths, resolved. One that loads a project acts on the package each path is part
+/// of, and on the package the working directory is part of where its line names no path: `Err`
+/// holds the working directory when no package holds it. `ply new` and `ply bootstrap` take their
+/// path as it stands, as `ply fmt` takes the ones it is given, and a command that loads no project
+/// is given the working directory.
 pub fn resolve_all(
   command: String,
   parsed: cli::Parsed,
-) -> List<Resolved> / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], abort.raise} = {
-  let paths = if command == "doc" || command == "show" || command == "callers"
-      || command == "replace"
-      || command == "why"
-      || command == "explain" { drop_first(parsed.positionals) }
-  else if command == "cache" && at_or(parsed.path, 1, "") == "inspect" {
-    drop_first(parsed.positionals)
-  } else if command == "yank" || command == "contracts" || command == "keygen"
-      || command == "attest" { [] }
-  else { parsed.positionals };
-  if len(paths) == 0 { [resolve(".")] } else { map(paths, |path: String| resolve(path)) }
+) -> Result<List<Resolved>, String> / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], abort.raise} = {
+  let named = named_by(command, parsed);
+  if loads_nothing(command) { Ok([resolve(".")]) }
+  else if command == "new" || command == "bootstrap" || (command == "fmt" && len(named) > 0) {
+    Ok(map(named, |path: String| resolve(path)))
+  } else if len(named) > 0 { Ok(map(named, |path: String| in_package(resolve(path)))) } else {
+    let pwd = env.pwd[sys]();
+    match package_of(pwd) { Some(root) -> Ok([root_at(pwd, root, ".")]), None -> Err(pwd) }
+  }
 }
 
 fn drop_first(xs: List<String>) -> List<String> = match xs { [] -> [], [_, ..rest] -> rest }
@@ -450,4 +498,57 @@ test "a path that names nothing yet is rooted at the nearest directory above it"
   let made = resolved_at(a_disk(), "/w", "store/orders");
   assert_eq(rooted(made), { label: "cwd", path: "store/orders" });
   assert_eq(made.absolute, "/w")
+}
+
+/// A package with a subdirectory and a package of its own below it, and a directory no package holds.
+fn packages() -> MemFs / {abort.raise} =
+  mem_of([
+    { path: "repo/app/ply.pkg", body: b"" },
+    { path: "repo/app/main.ply", body: b"fn main() -> Int = 1" },
+    { path: "repo/app/store/orders.ply", body: b"pub fn total() -> Int = 1" },
+    { path: "repo/app/tools/ply.pkg", body: b"" },
+    { path: "repo/app/tools/gen.ply", body: b"fn main() -> Int = 2" },
+    { path: "loose/a.ply", body: b"fn a() -> Int = 1" },
+  ])
+
+/// Each root a command's line resolves to over `packages` from `pwd`, with what it names inside.
+fn asked_at(
+  pwd: String,
+  command: String,
+  positionals: List<String>,
+) -> List<String> / {abort.raise} = {
+  let disk = packages();
+  let asked = handle {
+    resolve_all(command, { path: [command], flags: [], positionals: positionals, argv: [] })
+  } with {
+    env.pwd[sys]() -> pwd,
+    fs.resolved[cwd](p) -> mem_resolved(disk, normalize(join(below_root(pwd), p))),
+    fs.resolved[abs](p) -> mem_resolved(disk, p),
+  };
+  match asked {
+    Err(nowhere) -> ["no package holds " ++ nowhere],
+    Ok(rs) -> map(rs, |r: Resolved| r.machine ++ " " ++ r.inside),
+  }
+}
+
+test "a path is in the package that holds it, and stands as it is where none does" {
+  // Named from beside it: the root is above the working directory, so the machine spells it whole.
+  assert_eq(asked_at("/repo/app/store", "check", ["orders.ply"]), ["/repo/app store/orders.ply"]);
+  assert_eq(asked_at("/repo/app", "test", ["store"]), [". store"]);
+  assert_eq(asked_at("/repo", "run", ["app/main.ply"]), ["app main.ply"]);
+  // A package below another is its own: nothing of it is the outer one's.
+  assert_eq(asked_at("/repo/app", "run", ["tools/gen.ply"]), ["tools gen.ply"]);
+  assert_eq(asked_at("/repo", "check", ["../loose/a.ply"]), ["/loose a.ply"]);
+  assert_eq(asked_at("/loose", "check", ["."]), [". ."])
+}
+
+test "a line that names no path is the package the working directory is part of, or none" {
+  assert_eq(asked_at("/repo/app/store", "check", []), ["/repo/app ."]);
+  assert_eq(asked_at("/repo/app", "doc", ["total"]), [". ."]);
+  assert_eq(asked_at("/repo/app/tools", "fmt", []), [". ."]);
+  assert_eq(asked_at("/loose", "check", []), ["no package holds /loose"]);
+  assert_eq(asked_at("/loose", "doc", ["std.list"]), ["no package holds /loose"]);
+  // `ply fmt` rewrites the files it is given, whatever package holds them.
+  assert_eq(asked_at("/repo/app", "fmt", ["store"]), ["store ."]);
+  assert_eq(asked_at("/loose", "explain", ["E0302"]), [". ."])
 }
