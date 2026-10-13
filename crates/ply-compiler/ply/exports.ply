@@ -26,7 +26,7 @@ import diagnostics (ParsedSource, parse_at)
 import derive (dotted, runtime_module, same_deriver)
 import lexer (lex, Token, Identifier, Punctuation, StringLiteral, InterpolatedHead, LineString,
               is_ident_start)
-import parsing (Ident, Span)
+import parsing (Ident, Span, starts_upper)
 import infer (DefInfo, Raise)
 import types (canonical_scheme, Scheme)
 
@@ -244,15 +244,25 @@ fn called_on_value(tokens: List<Token>, bound: Map<Bytes, Bool>, i: Int) -> Bool
     }))
 }
 
+/// A function `name` of whichever type declares one among the modules `scope`'s can see: under
+/// no module, and the module's own.
+fn on_value(scope: Scope, name: Bytes) -> List<Mention> =
+  concat([{ module: b"", name: name }], if map_contains(scope.owners, of_any(name)) {
+    [{ module: scope.module, name: of_any(name) }]
+  } else { [] })
+
 /// The function `name` of the type written `of`, and the type: of the module itself where it
 /// declares `of`, and of each module a selection names `of` from.
-fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
-  let homes = concat(
-    if map_contains(scope.owners, of) { [scope.module] } else { [] },
-    match map_get(scope.selected, of) { Some(ms) -> ms, None -> [] },
-  );
-  fold(homes, [], |acc: List<Mention>, m: Bytes|
-    push(push(acc, { module: m, name: of }), { module: m, name: member_name(of, name) }))
+fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> / {abort.raise} = {
+  let selected = match map_get(scope.selected, of) { Some(ms) -> ms, None -> [] };
+  let homes = concat(if map_contains(scope.owners, of) { [scope.module] } else { [] }, selected);
+  let declared = fold(homes, [], |acc: List<Mention>, m: Bytes|
+    push(push(acc, { module: m, name: of }), { module: m, name: member_name(of, name) }));
+  // What no selection brings in may be the language's type, even where the module declares the
+  // name: a constructor called `Float` is no type. Its function is then its home module's where
+  // this module can see that one, which is what a call on a value reads.
+  if len(selected) == 0 && starts_upper(of) { concat(declared, on_value(scope, name)) }
+  else { declared }
 }
 
 /// What `text` names of other items, read off its tokens: a name after an import's binder and `::`
@@ -275,12 +285,7 @@ fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
           None -> acc,
         }
       } else if punct_at(tokens, i - 1, b"dot") {
-        if !called_on_value(tokens, bound, i) { acc } else {
-          let any = push(acc, { module: b"", name: n });
-          if map_contains(scope.owners, of_any(n)) {
-            push(any, { module: scope.module, name: of_any(n) })
-          } else { any }
-        }
+        if !called_on_value(tokens, bound, i) { acc } else { concat(acc, on_value(scope, n)) }
       } else if punct_at(tokens, i + 1, b"coloncolon") { acc } else if tags(tokens, i) {
         match map_get(scope.binders, n) {
           Some(m) ->
@@ -969,31 +974,38 @@ fn staged_against(
         - 1,
     ShippedModule -> len(rooted) + fold(supplied, 0, |n: Int, p: Supplied| n + len(p.modules)),
   };
+  let staged = staged_pulling_std_with(
+    match placed { InRoot -> push(rooted, source), _ -> rooted },
+    concat(concat(shipped, reading.whole), if own { [] } else { [source] }),
+    { ..reading.pkgs, supplied: supplied },
+    { nodes: fixed, tests: [], laws: [] },
+    reading.embeds,
+    tested: reading.tested,
+    reached: false,
+    data: reading.data,
+    unread: {
+      let staged = fold(
+        concat(shipped, reading.whole),
+        map_new(),
+        |acc: Map<Bytes, Bool>, s: Source| map_insert(acc, s.name, true),
+      );
+      filter(reading.unread, |n: Bytes| !map_contains(staged, n))
+    },
+    // A module stands in because the text reads it, which its imports, cut to what it names,
+    // may no longer say: a call on a value names no module.
+    asked: concat(map(shipped, |s: Source| s.name), if own { [] } else { [source.name] }),
+    apart: placed == InRoot && is_std(source.name),
+    given: reading.given,
+    judged: reading.judged,
+    checked: Some(source.name),
+  );
   {
-    staged: staged_pulling_std_with(
-      match placed { InRoot -> push(rooted, source), _ -> rooted },
-      concat(concat(shipped, reading.whole), if own { [] } else { [source] }),
-      { ..reading.pkgs, supplied: supplied },
-      { nodes: fixed, tests: [], laws: [] },
-      reading.embeds,
-      tested: reading.tested,
-      reached: false,
-      data: reading.data,
-      unread: {
-        let staged = fold(
-          concat(shipped, reading.whole),
-          map_new(),
-          |acc: Map<Bytes, Bool>, s: Source| map_insert(acc, s.name, true),
-        );
-        filter(reading.unread, |n: Bytes| !map_contains(staged, n))
-      },
-      asked: if own { [] } else { [source.name] },
-      apart: placed == InRoot && is_std(source.name),
-      given: reading.given,
-      judged: reading.judged,
-      checked: Some(source.name),
-    ),
-    at: at,
+    staged: staged,
+    // A shipped module stands where it was pulled, among the ones that stand in for what it reads.
+    at: if own { at } else {
+      fold(range(0, len(staged.pulled)), at, |found: Int, i: Int|
+        if list_at(staged.pulled, i) == Some(source.name) { at + i } else { found })
+    },
   }
 }
 
@@ -1650,11 +1662,19 @@ test "a call on a value is mentioned by its name alone, a function of a type wit
   );
   assert_eq(said_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
     b" area",
+    b" depth",
+    b" new",
     b"here Stack",
     b"here Stack::depth",
     b"here Stack::new",
     b"shapes Shape",
     b"shapes Shape::unit",
+  ]);
+  // A language type's function is a builtin, or its home module's where that module is seen.
+  assert_eq(said_in(b"fn h(b: Bytes) -> Bytes = Bytes::push(Bytes::trimmed(b), 0)"), [
+    b" push",
+    b" trimmed",
+    b"here ::push",
   ])
 }
 
