@@ -1793,6 +1793,7 @@ fn value_key(
   if !is_bare(qname) {
     match of_language_type(checker, qname) {
       Named(n) -> { checker: checker, key: Some({ name: n, prelude: true }) },
+      InHome(m) -> { checker: checker, key: Some({ name: m.callee, prelude: false }) },
       // A capital no import binds and no module declares is a type of the language's.
       Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
       Elsewise -> {
@@ -1815,7 +1816,11 @@ fn value_key(
 
 /// What a name written `T::name` is where `T` is a type of the language's, one no import binds
 /// as a module and no module in scope declares: the prelude's name for it, or none it has.
-type OfLanguageType = | Named(Bytes) | Unnamed(Ident) | Elsewise
+type OfLanguageType =
+  | Named(Bytes)
+  | InHome({ qname: QName, callee: Bytes })
+  | Unnamed(Ident)
+  | Elsewise
 
 fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.raise} =
   match qname.module {
@@ -1824,7 +1829,12 @@ fn of_language_type(checker: Checker, qname: QName) -> OfLanguageType / {abort.r
         || find_module_binding(scope_of(checker).modules, of.name) != None
         || declaring_type(checker.resolved, checker.module, of.name) != None { Elsewise } else {
       let declared = member_name(of.name, qname.name.name);
-      if env_depth_of(checker.env, declared) == Some(0) { Named(declared) } else { Unnamed(of) }
+      if env_depth_of(checker.env, declared) == Some(0) { Named(declared) } else {
+        match home_function(checker, of.name, qname.name) {
+          Some(m) -> InHome(m),
+          None -> Unnamed(of),
+        }
+      }
     },
   }
 
@@ -5400,8 +5410,26 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             None -> None,
           };
           let named: Checker = match through {
-            // A builtin named through its type is written out as the builtin's own name.
-            None -> if !key.prelude || is_bare(qname) { constrained } else {
+            // A language type's function named through the type is written out as what it is:
+            // its home module's, or a builtin under the builtin's own name.
+            None -> if is_bare(qname) { constrained } else if !key.prelude {
+              match of_language_type(constrained, qname) {
+                InHome(m) ->
+                  {
+                    ..constrained,
+                    member_sites: push(constrained.member_sites, {
+                      reaches: [],
+                      module: constrained.module,
+                      span: qname.span,
+                      qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
+                      name: m.qname.name.name,
+                      callee: b"",
+                      owner: constrained.walking,
+                    }),
+                  },
+                _ -> constrained,
+              }
+            } else {
               {
                 ..constrained,
                 member_sites: push(constrained.member_sites, {
@@ -5884,8 +5912,9 @@ fn member_function(
         },
         None -> false,
       };
-      if !takes || env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) {
-        None
+      if module_declares(checker, of) { None }
+      else if !takes || env_depth_of(checker.env, declared) != Some(0) {
+        home_function(checker, of, name)
       } else {
         Some({
           qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
@@ -5894,6 +5923,29 @@ fn member_function(
       }
     },
   }
+
+/// The function `name` the home module of the language's type `of` declares for it, where this
+/// module can see that module: itself, or one it imports, directly or through others.
+fn home_function(
+  checker: Checker,
+  of: Bytes,
+  name: Ident,
+) -> Option<{ qname: QName, callee: Bytes }> / {abort.raise} = {
+  let home = home_module(of);
+  let seen = match list_at(checker.resolved.sees, checker.module) { Some(ks) -> ks, None -> [] };
+  if !fold(seen, false, |found: Bool, k: Int|
+      found || at(checker.resolved.scopes, k).module == home) { None } else {
+    let qname = {
+      module: Some({ name: of_binder(home), span: name.span }),
+      name: { name: member_name(of, name.name), span: name.span },
+      span: name.span,
+    };
+    match find(checker.resolved, checker.module, ValueSpace, qname) {
+      Some(b) -> Some({ qname: qname, callee: b.qualified }),
+      None -> None,
+    }
+  }
+}
 
 /// Whether `of` is a type a module declares, which the prelude has no function of.
 fn module_declares(checker: Checker, of: Bytes) -> Bool =
@@ -5907,13 +5959,23 @@ fn no_function_of(checker: Checker, of: Bytes, name: Ident) -> Checker / {abort.
     bytes_concat_all([b"`", simple_name_of(of), b"` has no function `", name.name, b"`"]),
     b"not a function of the type",
     [
-      bytes_concat_all([
-        b"a function of a type is declared `fn ",
-        simple_name_of(of),
-        b"::",
-        name.name,
-        b"(..)` in the module that declares the type",
-      ]),
+      if module_declares(checker, of) {
+        bytes_concat_all([
+          b"a function of a type is declared `fn ",
+          simple_name_of(of),
+          b"::",
+          name.name,
+          b"(..)` in the module that declares the type",
+        ])
+      } else {
+        bytes_concat_all([
+          b"`",
+          of,
+          b"` has the builtins named for it, and the functions `",
+          home_module(of),
+          b"` declares for it where this module imports that one, itself or through another",
+        ])
+      },
     ],
   )
 
@@ -15594,6 +15656,7 @@ pub fn prelude_tables() -> { effects: List<EffectInfo>, ctors: List<CtorInfo> } 
       order: [],
       imports: [],
       signatures: map_new(),
+      sees: [],
     },
     [],
     no_known(),
@@ -21250,6 +21313,36 @@ test "a guard written on a value's own length lets a builtin that needs it raise
     [],
   );
   assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.slice(0, 1)"), [b"E0302"])
+}
+
+/// The codes a check of `sources` answers, each parsed as its own module.
+fn codes_of(sources: List<Source>) -> List<Bytes> / {abort.raise} =
+  match resolve_modules(
+      map(sources, |source: Source|
+        { name: source.name, module: parse(source.src).node, derived: [] }),
+    ) {
+    ResolveFailed(ds) -> map(ds, |diag: Diag| diag.code),
+    ResolveSucceeded(y) ->
+      map(dedup_diags(check_program(y.r, y.mods).checker.diags), |diag: Diag| diag.code),
+  }
+
+test "a language type's other functions are its home module's, where the caller's module sees it" {
+  let home = {
+    name: b"std.list",
+    src: b"pub fn List::second<a>(xs: List<a>) -> Option<a> = list_at(xs, 1)\n",
+  };
+  let calls = b"fn f(xs: List<Int>) -> Option<Int> = xs.second()\nfn g(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
+  assert_eq(codes_of([home, { name: b"m", src: bytes_concat(b"import std.list\n", calls) }]), []);
+  assert_eq(
+    codes_of([
+      home,
+      { name: b"mid", src: b"import std.list\npub fn one() -> Int = 1\n" },
+      { name: b"m", src: bytes_concat(b"import mid\n", calls) },
+    ]),
+    [],
+  );
+  // A module that imports it nowhere beneath itself does not see it.
+  assert_eq(codes_of([home, { name: b"m", src: calls }]), [b"E0101", b"E0101"])
 }
 
 test "a recursion a builtin called on a value bounds, or runs a lambda of, is seen to end" {
