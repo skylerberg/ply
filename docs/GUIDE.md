@@ -428,7 +428,7 @@ A function may be declared in a type's namespace: `fn Stack::size(s: Stack) -> I
 is the function `size` of `Stack`. It is named `Stack::size` wherever `Stack` is
 in scope, and called on a value as `s.size()` (§5.4). It is found by the type
 alone, with no search, so only the module that declares the type declares one
-(`E0208`); the type is a sum or a `new` record, since an alias is the type it
+(`E0208`), or for a type of the language's its home module (§13); the type is a sum or a `new` record, since an alias is the type it
 names (`E0217`); and a `new` record has none under the name of one of its
 fields, which a call on a value reads first (`E0105`). It is `pub` or private
 as any function is, and it need not take a value of the type: `Stack::empty()`
@@ -1272,7 +1272,8 @@ head of the value's type: `s.push(1).size()` is `Stack::size(Stack::push(s, 1))`
 The type alone finds the function, with no import, so the value's type is
 known where the call stands: a type parameter and a function have none to call
 (`E0201`), and a type with no function of the name is `E0101`. A label is
-written as on any call, `s.note[audit]()`.
+written as on any call, `s.note[audit]()`. A type of the language's has its
+builtins (§12) and what its home module declares (§13).
 
 `value.m::f(args)` is `m::f(value, args)`, whatever the value's type: a
 function that is no function of the type takes its place in a chain,
@@ -2855,6 +2856,10 @@ std.<name>`, a name having more segments where a module sits beneath another
 project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
 `--std`, which adds those of every
 module `ply std` lists, whichever of them the project imports.
+A module named for a type of the language's is that type's home: it alone
+declares functions of the type (`fn List::name` in `std.list`, §3.1), and a
+call on a value finds one where the caller's module imports the home module,
+itself or through another, with no name selected.
 Each module is documented in its source: `ply std` lists the modules, each with
 the summary of its doc; `ply doc std.json` documents a module and everything it
 publishes, `ply doc std.json.parse` one definition, `ply doc fs.read_at` one
@@ -3459,7 +3464,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0102` | unknown type |
 | `E0103` | unknown effect |
 | `E0104` | unknown operation |
-| `E0105` | duplicate definition, or a reserved name |
+| `E0105` | duplicate definition, a reserved name, a binding and an effect of one name at `x.name(..)`, or a builtin called on a value in a module that binds its name |
 | `E0106` | unknown module |
 | `E0107` | private name, or a constructor of an `opaque` type outside its module |
 | `E0108` | ambiguous import |
