@@ -58,7 +58,7 @@ import resolve (ParsedModule, Source, Resolved, Scope, Binding, ModuleBinding, D
                 find_module_binding, find_of_type, declaring_type)
 import rewrite (expand, expand_record_updates, expand_witnesses, expand_try_blocks, Answered,
                 NumericWitness, ConcreteWitness, ParamWitness, StatedWitness, numeric_witness_bin,
-                expand_tagged, expand_holds)
+                expand_tagged, expand_holds, expand_member_calls, MemberCallee)
 import embed (rewritten)
 import prelude_source
 import derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
@@ -15148,6 +15148,7 @@ pub type Elaboration = {
   refs: List<WitnessRef>,
   orders: List<WitnessOrder>,
   tries: List<TrySite>,
+  members: List<MemberSite>,
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
@@ -15156,6 +15157,7 @@ fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
 fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
   {
     tries: checker.try_sites,
+    members: checker.member_sites,
     updates: checker.update_shapes,
     ops: fold(checker.operands, [], |acc: List<WitnessOp>, o: OperandAt|
       match resolve(checker, o.ty) {
@@ -15173,6 +15175,7 @@ fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
 // name is each program's own, its index in its type is not.
 derive bin for UpdateShape
 derive bin for TrySite
+derive bin for MemberSite
 derive bin for LabelSite
 derive bin for OperandSite
 derive bin for TypedSite
@@ -15190,6 +15193,7 @@ pub type RootFacts = {
   refs: List<WitnessRef>,
   operands: List<OperandSite>,
   tries: List<TrySite>,
+  members: List<MemberSite>,
   typed: List<TypedSite>,
   types: TypeTable,
 }
@@ -15204,6 +15208,7 @@ pub fn no_root_facts() -> RootFacts =
     refs: [],
     operands: [],
     tries: [],
+    members: [],
     typed: [],
     types: map_new(),
   }
@@ -15249,7 +15254,11 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, tries: push(f.tries, x) })
   });
-  let operated = fold(facts.operands, tried, |m: Map<Bytes, RootFacts>, x: OperandSite| {
+  let called = fold(facts.elaboration.members, tried, |m: Map<Bytes, RootFacts>, x: MemberSite| {
+    let f = owned(m, x.owner);
+    map_insert(m, x.owner, { ..f, members: push(f.members, x) })
+  });
+  let operated = fold(facts.operands, called, |m: Map<Bytes, RootFacts>, x: OperandSite| {
     let f = owned(m, x.owner);
     map_insert(m, x.owner, { ..f, operands: push(f.operands, x) })
   });
@@ -15278,6 +15287,8 @@ fn placed_facts(facts: RootFacts, module: Int, by: Int, owner: Bytes) -> RootFac
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     tries: map(facts.tries, |x: TrySite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
+    members: map(facts.members, |x: MemberSite|
+      { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     typed: map(facts.typed, |x: TypedSite|
       { ..x, module: module, span: moved_span(x.span, by), owner: owner }),
     types: facts.types,
@@ -15292,6 +15303,7 @@ fn all_within(facts: RootFacts, at: Span) -> Bool =
     && fold(facts.refs, true, |b: Bool, x: WitnessRef| b && within(x.span, at))
     && fold(facts.operands, true, |b: Bool, x: OperandSite| b && within(x.span, at))
     && fold(facts.tries, true, |b: Bool, x: TrySite| b && within(x.span, at))
+    && fold(facts.members, true, |b: Bool, x: MemberSite| b && within(x.span, at))
     && fold(facts.typed, true, |b: Bool, x: TypedSite| b && within(x.span, at))
 
 /// One body's sites as its row files them, behind a byte that says how. Each span is counted from
@@ -15337,6 +15349,7 @@ fn lowered_only(checker: Checker) -> Checker = {
     ..checker,
     label_sites: filter(checker.label_sites, |x: LabelSite| kept(x.owner)),
     try_sites: filter(checker.try_sites, |x: TrySite| kept(x.owner)),
+    member_sites: filter(checker.member_sites, |x: MemberSite| kept(x.owner)),
     update_shapes: filter(checker.update_shapes, |x: UpdateShape| kept(x.owner)),
     operands: filter(checker.operands, |x: OperandAt| kept(x.owner)),
     witness_refs: filter(checker.witness_refs, |x: WitnessRef| kept(x.owner)),
@@ -15500,13 +15513,24 @@ fn answered_in(all: List<TrySite>, module: Int) -> Map<Bytes, Answered> =
     if s.module != module { acc }
     else { map_insert(acc, span_key(s.span), { effect: s.effect, op: s.op, arity: s.arity }) })
 
-/// A module with every tagged literal written out as the call it runs as, every record update as
-/// the literal it stands for, and every `try` as its `handle`. The tagged literals go first: they
-/// need nothing of the checker, and what they become is forms the other two already walk.
+/// One module's calls on values that call a function of the value's type, keyed by span, as
+/// `expand_member_calls` reads them.
+fn members_in(all: List<MemberSite>, module: Int) -> Map<Bytes, MemberCallee> =
+  fold(all, map_new(), |acc: Map<Bytes, MemberCallee>, s: MemberSite|
+    if s.module != module { acc }
+    else { map_insert(acc, span_key(s.span), { qualifier: s.qualifier, name: s.name }) })
+
+/// A module with every tagged literal written out as the call it runs as, every call on a value
+/// as the call of its type's function, every record update as the literal it stands for, and
+/// every `try` as its `handle`. The tagged literals go first: they need nothing of the checker,
+/// and what they become is forms the others already walk.
 fn written_out(module: Module, elaboration: Elaboration, i: Int) -> Module =
   expand_holds(
     expand_try_blocks(
-      expand_record_updates(expand_tagged(module), shapes_in(elaboration.updates, i)),
+      expand_record_updates(
+        expand_member_calls(expand_tagged(module), members_in(elaboration.members, i)),
+        shapes_in(elaboration.updates, i),
+      ),
       answered_in(elaboration.tries, i),
     ),
   )
