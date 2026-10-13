@@ -683,7 +683,7 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 /// Every `.ply` source of this checkout's packages and the prelude, which is production the same
-/// way `src/` is; the corpus and the `-tests` crates are not.
+/// way `src/` is; the `-tests` crates are not.
 fn ply_sources(root: &Path) -> Vec<Source> {
     fn ply_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).expect("a readable source directory") {
@@ -699,7 +699,7 @@ fn ply_sources(root: &Path) -> Vec<Source> {
     for entry in std::fs::read_dir(root.join("crates")).expect("a readable crates directory") {
         let dir = entry.expect("a directory entry").path();
         let name = dir.file_name().unwrap_or_default().to_string_lossy();
-        if name.ends_with("-tests") || name == "ply-corpus" || !dir.join("ply").is_dir() {
+        if name.ends_with("-tests") || !dir.join("ply").is_dir() {
             continue;
         }
         ply_files(&dir.join("ply"), &mut paths);
