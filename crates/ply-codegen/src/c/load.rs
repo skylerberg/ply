@@ -1,6 +1,7 @@
 //! Loading a unit: a library its C was compiled and linked into, opened with `dlopen`, or the
-//! program this executable was linked with, read through its symbol table.
+//! program this executable was linked with.
 
+use super::descriptor::{self, Descriptor};
 use anyhow::{Result, bail};
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -27,19 +28,22 @@ pub struct Library {
 
 enum Handle {
     Opened(*mut c_void),
-    /// The program this executable was linked with, read through its symbol table.
-    Linked(&'static super::linked::Symbols),
+    /// The program this executable was linked with, by the descriptor its `main` handed over.
+    Linked(&'static Descriptor),
 }
 
 impl Library {
-    pub fn symbol(&self, name: &str) -> Option<*mut c_void> {
+    /// What the unit's C lays out for its loader; `None` for a library that is no unit.
+    pub fn descriptor(&self) -> Option<&Descriptor> {
         match self.handle {
+            Handle::Linked(unit) => Some(unit),
             Handle::Opened(handle) => {
-                let c = CString::new(name).ok()?;
-                let p = unsafe { dlsym(handle, c.as_ptr()) };
-                (!p.is_null()).then_some(p)
+                let name = CString::new(descriptor::SYMBOL).ok()?;
+                let p = unsafe { dlsym(handle, name.as_ptr()) };
+                // SAFETY: a unit defines the symbol as its descriptor, which lives as long as
+                // the library is open.
+                unsafe { p.cast::<Descriptor>().as_ref() }
             }
-            Handle::Linked(symbols) => symbols.find(name),
         }
     }
 
@@ -50,7 +54,7 @@ impl Library {
     /// The program linked into this executable, where its `main` installed one.
     pub fn linked() -> Option<Library> {
         Some(Library {
-            handle: Handle::Linked(super::linked::installed()?),
+            handle: Handle::Linked(super::linked::unit()?),
             path: std::env::current_exe().unwrap_or_default(),
         })
     }

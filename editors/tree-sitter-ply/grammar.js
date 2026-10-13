@@ -97,10 +97,7 @@ module.exports = grammar({
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type), optional($.effect_row))),
       repeat($._spec_clause),
-      optional(choice(
-        seq('=', field('body', $._expression)),
-        field('body', $.block),
-      )),
+      optional(seq('=', field('body', $._expression))),
     ),
 
     extern_function: $ => seq(

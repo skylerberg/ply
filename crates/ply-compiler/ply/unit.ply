@@ -633,9 +633,12 @@ fn counted(label: Bytes, n: Int) -> Bytes = bytes_concat_all([label, b" ", ascii
 fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
   bytes_concat_all(concat([counted(label, len(xs))], map(xs, |x: Bytes| bytes_concat(x, b"\n"))))
 
-/// Each bucket's table as the loader fills it: the unit's position for each of the bucket's keys.
+/// A bucket's table: the unit's position for each of the bucket's keys.
 type BucketRow = { id: Int, places: List<Int> }
 
+/// What a unit says about itself for its loader to read: the helpers it binds, its constructors,
+/// each constant with its row of the code table, and the pools its positions index. What the loader
+/// takes by address, `laid` lays out instead.
 fn exports_text(
   helpers: List<Helper>,
   ctors: List<Ctor>,
@@ -644,7 +647,6 @@ fn exports_text(
   modules: Int,
   dropped: List<Dropped>,
   p: Pools,
-  buckets: List<BucketRow>,
   stated: List<Stated>,
 ) -> Bytes / {abort.raise} = {
   let held = fold(taken, map_new(), |acc: Map<Bytes, Bool>, t: Taken|
@@ -669,11 +671,6 @@ fn exports_text(
           ),
         )),
     ),
-    lines(
-      b"taken",
-      map(taken, |t: Taken|
-        bytes_concat_all([t.name, b" ", ascii_of_int(t.arity), b" ", t.symbol, b" ", t.entry])),
-    ),
     lines(b"constants", constants),
     counted(b"modules", modules),
     counted(b"refused", len(dropped)),
@@ -688,15 +685,6 @@ fn exports_text(
       map(p.shapes, |names: List<Bytes>|
         fold(range(0, len(names)), b"", |acc: Bytes, i: Int|
           if i == 0 { at(names, i) } else { bytes_concat_all([acc, b" ", at(names, i)]) })),
-    ),
-    lines(b"lambdas", p.lambdas),
-    lines(
-      b"buckets",
-      map(buckets, |r: BucketRow|
-        bytes_concat_all(
-          fold(r.places, [ascii_of_int(r.id)], |acc: List<Bytes>, n: Int|
-            push(push(acc, b" "), ascii_of_int(n))),
-        )),
     ),
     // Only a unit one of whose types states either says so, so any other reads as it always did.
     if len(stated) == 0 { b"" } else {
@@ -782,26 +770,59 @@ fn embedded(exports: Bytes) -> Bytes / {abort.raise} =
     b";\n",
   ])
 
-/// Every symbol the loader looks up, by name in byte order, with its address: what a native
-/// program's `main` hands the runtime, so the program exports nothing for `dlsym` to find. `own` are
-/// defined beside the table and `buckets` in the buckets' objects.
-fn symbol_table(own: List<Bytes>, buckets: List<Bytes>) -> Bytes = {
-  let names = ordered(concat(own, buckets));
+/// What the loader takes by address, so it looks no symbol up and fills no table: each bucket's
+/// table holding the unit's positions, the code table in the unit's order, each of `taken` by name
+/// in byte order with its entry and how many words it takes, and `ply_descriptor`, which holds
+/// those beside what the unit says about itself and its two binders. A native program's `main`
+/// hands the runtime the descriptor, so the program exports nothing for `dlsym` to find. The code
+/// and the entries are defined in the buckets' objects, and a table closes with a zero so that none
+/// is empty.
+fn laid(
+  taken: List<Taken>,
+  lambdas: List<Bytes>,
+  buckets: List<BucketRow>,
+) -> Bytes / {abort.raise} =
   bytes_concat_all([
-    b"\n/* --- the symbols the loader looks up --- */\n",
-    b"struct ply_symbol { const char *name; void *address; };\n",
+    b"\n/* --- what the loader takes by address --- */\n",
     bytes_concat_all(
-      map(ordered(buckets), |n: Bytes| bytes_concat_all([b"extern char ", n, b";\n"])),
+      map(buckets, |r: BucketRow|
+        bytes_concat_all([
+          b"const uint32_t ",
+          bucket_table(r.id),
+          b"[] = {",
+          bytes_concat_all(map(r.places, |n: Int| bytes_concat_all([b" ", ascii_of_int(n), b","]))),
+          b" };\n",
+        ])),
     ),
-    b"const struct ply_symbol ply_symbols[] = {\n",
     bytes_concat_all(
-      map(names, |n: Bytes| bytes_concat_all([b"  { \"", n, b"\", (void *)&", n, b" },\n"])),
+      map(ordered(concat(lambdas, map(taken, |t: Taken| t.entry))), |n: Bytes|
+        bytes_concat_all([b"extern char ", n, b";\n"])),
     ),
-    b"};\nconst unsigned long ply_symbols_count = ",
-    ascii_of_int(len(names)),
-    b";\n",
+    b"void *const ply_code[] = {\n",
+    bytes_concat_all(map(lambdas, |n: Bytes| bytes_concat_all([b"  (void *)&", n, b",\n"]))),
+    b"  0 };\n",
+    b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
+    b"const struct ply_taken ply_taken[] = {\n",
+    bytes_concat_all(
+      map(taken, |t: Taken|
+        bytes_concat_all([
+          b"  { \"",
+          escaped(t.name),
+          b"\", (void *)&",
+          t.entry,
+          b", ",
+          ascii_of_int(t.arity),
+          b" },\n",
+        ])),
+    ),
+    b"  { 0, 0, 0 } };\n",
+    b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
+    b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)ply_bind_singletons, ply_code, ",
+    ascii_of_int(len(lambdas)),
+    b", ply_taken, ",
+    ascii_of_int(len(taken)),
+    b" };\n",
   ])
-}
 
 // --- Placing it -----------------------------------------------------------------
 
@@ -827,16 +848,18 @@ fn prototype(symbol: Bytes, head: Head) -> Bytes =
 fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
   bytes_concat_all([hex_digit(p.bucket / 16), hex_digit(p.bucket % 16), b"\x00", p.name])
 
-/// The header, then a marked bucket per class of names opening with its table and the prototypes
-/// of what its bodies reach, then the runtime's definitions and the unit's own table: one
-/// translation unit that the loader also compiles in parts, cut on the marks.
+/// The header, then a marked bucket per class of names, which declares its table and the
+/// prototypes of what its bodies reach, then the runtime's definitions, what the unit says about
+/// itself and `tables`, what it lays out for its loader: one translation unit that the loader also
+/// compiles in parts, cut on the marks. A bucket declares its table and never defines it, so its C
+/// reads the same whatever positions the table holds.
 fn assembled(
   runtime: Runtime,
   bodies: List<Placing>,
   sizes: Map<Int, Int>,
   taken: Map<Bytes, Taken>,
   exports: Bytes,
-  symbols: Bytes,
+  tables: Bytes,
 ) -> Bytes / {abort.raise} = {
   let by_bucket = fold(bodies, map_new(), |acc: Map<Bytes, Placing>, p: Placing|
     map_insert(acc, bucket_key(p), p));
@@ -856,11 +879,9 @@ fn assembled(
           match map_get(sizes, at(group, 0).bucket) {
             Some(n) -> if n == 0 { b"" } else {
               bytes_concat_all([
-                b"uint32_t ",
+                b"extern const uint32_t ",
                 bucket_table(at(group, 0).bucket),
-                b"[",
-                ascii_of_int(n),
-                b"];\n",
+                b"[];\n",
               ])
             },
             None -> b"",
@@ -878,7 +899,7 @@ fn assembled(
     ),
     runtime.tail,
     embedded(exports),
-    symbols,
+    tables,
   ])
 }
 
@@ -989,28 +1010,24 @@ pub fn produce(
     runtime.helpers,
     ctors,
     taken,
-    constants,
+    map(constants, |n: Bytes|
+      bytes_concat_all([n, b" ", ascii_of_int(place(placed.lambdas, published(n).entry))])),
     modules,
     s.dropped,
     pools,
-    rows,
     stated,
   );
+  let by_name = fold(taken, map_new(), |acc: Map<Bytes, Taken>, t: Taken|
+    map_insert(acc, t.name, t));
   {
     text: assembled(
       runtime,
       bodies,
       map_fold(keyed, map_new(), |acc: Map<Int, Int>, b: Int, ks: Map<Bytes, Bool>|
         map_insert(acc, b, map_len(ks))),
-      fold(taken, map_new(), |acc: Map<Bytes, Taken>, t: Taken| map_insert(acc, t.name, t)),
+      by_name,
       exports,
-      symbol_table(
-        [b"ply_bind", b"ply_bind_singletons", b"ply_exports"],
-        concat(
-          concat(map(rows, |r: BucketRow| bucket_table(r.id)), pools.lambdas),
-          map(taken, |t: Taken| t.entry),
-        ),
-      ),
+      laid(map_values(by_name), pools.lambdas, rows),
     ),
     taken: s.taken,
     dropped: s.dropped,
@@ -2331,10 +2348,13 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
   let body = bytes_concat_all([b"{ return ", table, b"[1] + ", table, b"[0]; }"]);
   assert(bytes_index_of(alone, body) != None, None);
   assert(bytes_index_of(beside, body) != None, None);
-  let row = |places: Bytes|
-    bytes_concat_all([b"\"", ascii_of_int(bucket_of(b"m.f")), places, b"\\n\""]);
-  assert(bytes_index_of(alone, row(b" 0 2")) != None, None);
-  assert(bytes_index_of(beside, row(b" 0 4")) != None, None)
+  // The bucket declares the table, and the unit lays it out filled beside its descriptor.
+  let declared = bytes_concat_all([b"extern const uint32_t ", table, b"[];\n"]);
+  assert(bytes_index_of(bucket_part(alone, bucket_of(b"m.f")), declared) != None, None);
+  let filled = |places: Bytes|
+    bytes_concat_all([b"const uint32_t ", table, b"[] = {", places, b" };\n"]);
+  assert(bytes_index_of(alone, filled(b" 0, 2,")) != None, None);
+  assert(bytes_index_of(beside, filled(b" 0, 4,")) != None, None)
 }
 
 /// A bucket's part of a unit's C: from its mark to the next part's.
@@ -2840,13 +2860,57 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
     bytes_index_of(p.text, b"/* tail */\n\n/* --- what this unit says about itself") != None,
     None,
   );
+  // A constant says its row of the code table, and the loader takes that table and each
+  // definition's entry by address.
+  assert(bytes_index_of(p.text, b"\"constants 1\\n\"\n\"m.f 0\\n\"") != None, None);
+  assert(
+    bytes_index_of(p.text, b"\"taken ") == None && bytes_index_of(p.text, b"\"lambdas ") == None,
+    None,
+  );
+  assert(
+    bytes_index_of(p.text, b"void *const ply_code[] = {\n  (void *)&e_m.f,\n  0 };\n") != None,
+    None,
+  );
   assert(
     bytes_index_of(
         p.text,
-        b"\"taken 1\\n\"\n\"m.f 0 f_m.f e_m.f\\n\"\n\"constants 1\\n\"\n\"m.f\\n\"",
+        b"const struct ply_taken ply_taken[] = {\n  { \"m.f\", (void *)&e_m.f, 0 },\n  { 0, 0, 0 } };\n",
       )
       != None,
     None,
+  );
+  assert(
+    bytes_index_of(p.text, b"(void *)ply_bind_singletons, ply_code, 1, ply_taken, 1 };\n") != None,
+    None,
+  )
+}
+
+test "a unit lays its definitions out by name in byte order, each name as a C literal holds it" {
+  let names = [b"m.z", b"m.a#stored", b"m.B"];
+  let p = produce(
+    { head: b"", tail: b"", helpers: [], builtins: [], identity: b"r" },
+    [],
+    map(names, |n: Bytes| { name: n, arity: 2, constant: false }),
+    1,
+    fold(names, map_new(), |acc: Map<Bytes, Answer>, n: Bytes| map_insert(acc, n, one_body(n, []))),
+  );
+  assert(
+    bytes_index_of(
+        p.text,
+        b"ply_taken[] = {\n  { \"m.B\", (void *)&e_m.B, 2 },\n  { \"m.a#stored\", (void *)&e_m.a#stored, 2 },\n  { \"m.z\", (void *)&e_m.z, 2 },\n  { 0, 0, 0 } };\n",
+      )
+      != None,
+    Some(string_of_bytes_lossy(p.text)),
+  );
+  assert_eq(
+    laid([{ name: b"m.\"q\"", arity: 0, symbol: b"f", entry: b"e" }], [], []),
+    bytes_concat_all([
+      b"\n/* --- what the loader takes by address --- */\nextern char e;\nvoid *const ply_code[] = {\n  0 };\n",
+      b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
+      b"const struct ply_taken ply_taken[] = {\n  { \"m.\\\"q\\\"\", (void *)&e, 0 },\n  { 0, 0, 0 } };\n",
+      b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
+      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)ply_bind_singletons, ply_code, 0, ply_taken, 1 };\n",
+    ]),
   )
 }
 
