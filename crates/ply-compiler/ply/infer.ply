@@ -40,11 +40,12 @@ import types (Resource, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, 
               resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
               covariant_con, env_new, env_push, env_pop, env_bind, env_bind_global,
               env_remove_global, env_lookup, env_local, env_depth_of, env_locals, instantiate_with,
-              instantiate, rename_scheme, generalize, region_prefix, region_of, label_type,
-              label_of, resolve_atom, atom_text, atoms_text, resource_text, scheme_text, type_text,
-              row_text, Printer, printer_new, printer_naming, print_ty, print_row, applied_args,
-              at_arguments, over_arg, TyNominal, record_fields, arg_label, arg_row, atom_bin,
-              type_bin, scheme_bin, TypeTable, held_type, table_of, tables_joined, type_table_bin)
+              instantiate, rename_scheme, generalize, region_mark, written_label, leaving_row,
+              leaving_type, label_type, label_of, resolve_atom, atom_text, atoms_text,
+              resource_text, scheme_text, type_text, row_text, Printer, printer_new, printer_naming,
+              print_ty, print_row, applied_args, at_arguments, over_arg, TyNominal, record_fields,
+              arg_label, arg_row, atom_bin, type_bin, scheme_bin, TypeTable, held_type, table_of,
+              tables_joined, type_table_bin)
 import termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee, DefinedCallee,
                     OtherCallee, Ending, Ends, Stated, Diverges, Site, Summary, Verdict, verdict,
                     summary_bin, ending_bin)
@@ -299,8 +300,12 @@ type Signature = {
 type LabelApplication = {
   module: Int,
   span: Span,
+  /// Where the callee's name ends: where a call writes the labels it fills.
+  named: Int,
   callee: Bytes,
   vars: List<Int>,
+  /// Those of `vars` a call writes: the ones that name no region.
+  written: List<Int>,
   params: Map<Bytes, Int>,
   called: Bool,
   owner: Bytes,
@@ -329,6 +334,7 @@ type HandoffSite = { span: Span, ty: Type, op: Bytes }
 /// `hold`: a `with_hold` opened it, which no other region of its name may nest in.
 type OpenRegion = {
   name: Bytes,
+  label: Bytes,
   span: Span,
   hold: Bool,
   simulate_depth: Int,
@@ -339,6 +345,7 @@ type OuterBinding = { name: Bytes, ty: Type, site: Span }
 type RegionSite = {
   module: Int,
   name: Bytes,
+  label: Bytes,
   span: Span,
   hold: Bool,
   body_span: Span,
@@ -351,7 +358,7 @@ type RegionSite = {
 /// What may not outlive a region: a `with_cell[r]` region's cells, a `with_hold[r]` region's hold
 /// and every function that reads a hold, a `simulate` region's tasks.
 type Brand = | CellsOf(Bytes) | HoldsOf(Bytes) | Tasks
-type Opened = { name: Bytes, span: Span }
+type Opened = { name: Bytes, label: Bytes, span: Span }
 /// A local bound outside the innermost `simulate` region, named inside it.
 type Crossing = { name: Bytes, span: Span }
 type CellAccess = { span: Span, region: Bytes }
@@ -406,8 +413,6 @@ type SpecEnv = {
 /// A member of the recursive group being walked, with the variables its binders took: `types` are
 /// its own type parameters a call fills, in its scheme's order.
 type GroupDef = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
-/// The label and row variables one recursive group is checked with, taken by every member in order.
-type Shared = { labels: List<Int>, rows: List<Int> }
 
 /// The rows the driver hands in for a definition, which are taken as they are. The rest of a
 /// published interface is the written signature, which is on hand.
@@ -421,9 +426,6 @@ pub type KnownDef = {
   raises: List<Raise>,
   /// What the emitter reads of the body, as `root_facts` encoded it when the body was walked.
   facts: Bytes,
-  /// What its check gave it: a signature leaves the region of each cell it names open, which only
-  /// the body ties to another.
-  scheme: Scheme,
 }
 pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
 /// What the emitter reads of one body published from its rows: `name` is the definition, or a test
@@ -509,9 +511,8 @@ type Checker = {
   label_params: Map<Bytes, Int>,
   label_apps: List<LabelApplication>,
   label_sites: List<LabelSite>,
-  /// The group being walked: its labels and rows are one set, which a call inside it reuses.
+  /// The group being walked.
   group_defs: List<GroupDef>,
-  group_rows: List<Int>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -582,6 +583,9 @@ type Checker = {
   keyed_names: List<Bytes>,
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
   copied: Bool,
+  /// True while the first argument of `cell_get`, `cell_set` or `cell_update` is read, which is the
+  /// one place a cell's name stands.
+  cell_named: Bool,
 }
 
 type Inferred = { checker: Checker, ty: Type, row: Row }
@@ -635,7 +639,9 @@ fn cell() -> Bytes = b"cell"
 /// The effect of reading a hold, which a `with_hold` region answers.
 fn hold() -> Bytes = b"hold"
 
-fn hold_atom() -> Atom = { effect: hold(), resource: RSingleton, mode: MRead, op: None }
+/// A read of the hold a region labelled `resource` holds.
+fn hold_atom(resource: Resource) -> Atom =
+  { effect: hold(), resource: resource, mode: MRead, op: None }
 
 /// The effects a region answers and nothing declares.
 fn is_region_effect(name: Bytes) -> Bool = name == cell() || name == hold()
@@ -1067,6 +1073,7 @@ pub type Builtin = {
 type Declaring = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
+  labels: Map<Bytes, Type>,
   rows: Map<Bytes, Int>,
   imported: Map<Bytes, Bytes>,
 }
@@ -1119,6 +1126,15 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
             let args = declared_types(d, c.args);
             if builtin_type_arity(name) != Some(len(args.tys)) {
               panic(misdeclared(b"names a type that is not the language's own at that arity", name))
+            } else if name == b"Hold" {
+              match c.labels {
+                [l] -> match map_get(args.d.labels, l.name) {
+                  Some(label) ->
+                    { d: args.d, ty: TyCon({ name: name, args: [label, at(args.tys, 0)] }) },
+                  None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
+                },
+                _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+              }
             } else if is_region_type(name) {
               let region = fresh_ty(args.d.fresh);
               {
@@ -1132,7 +1148,7 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
     },
   }
 
-/// A declaration's row: `abort.raise`, `hold.read`, a row variable, or none of them.
+/// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1144,7 +1160,14 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
             atoms_insert(acc, abort_atom())
           } else if is_bare(a.eff) && a.eff.name.name == hold()
               && (match a.op { Some(_) -> false, None -> mode_eq(a.mode, MRead) }) {
-            atoms_insert(acc, hold_atom())
+            match a.resource {
+              Some(l) -> match map_get(d.labels, l.name) {
+                Some(TyVar(v)) -> atoms_insert(acc, hold_atom(RVar(v))),
+                _ ->
+                  panic(misdeclared(b"reads a hold under a label no generic list binds", l.name)),
+              },
+              None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
+            }
           } else {
             panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
           }),
@@ -1230,16 +1253,25 @@ fn declared(source: Bytes, imported: Map<Bytes, Bytes>, def: ExternDef) -> Built
       { fresh: o.fresh, tys: map_insert(acc.tys, p.name, o.ty) }
     },
   );
+  // A label a declaration binds is what an argument's type fixes, so it is a variable like the rest.
+  let labels = fold(
+    def.generics.labels,
+    { fresh: tys.fresh, tys: map_new() },
+    |acc: { fresh: Fresh, tys: Map<Bytes, Type> }, p: Ident| {
+      let o = fresh_ty(acc.fresh);
+      { fresh: o.fresh, tys: map_insert(acc.tys, p.name, o.ty) }
+    },
+  );
   let rows = fold(
     def.generics.effects,
-    { fresh: tys.fresh, rows: map_new() },
+    { fresh: labels.fresh, rows: map_new() },
     |acc: { fresh: Fresh, rows: Map<Bytes, Int> }, p: Ident| {
       let o = fresh_row_var(acc.fresh);
       { fresh: o.fresh, rows: map_insert(acc.rows, p.name, o.var) }
     },
   );
   let params = declared_types(
-    { fresh: rows.fresh, tys: tys.tys, rows: rows.rows, imported: imported },
+    { fresh: rows.fresh, tys: tys.tys, labels: labels.tys, rows: rows.rows, imported: imported },
     map(def.params, |p: Param|
       match p.ty {
         Some(t) -> t,
@@ -1993,14 +2025,30 @@ fn conv_con(
         new_ty(
           arity_error(c, span, name.name.name, arity, len(converted.tys), b"type arguments", []),
         )
+      } else if name.name.name == b"Hold" {
+        // A hold's type names its region's label, as its reads do.
+        if len(over.labels) != 1 || len(over.rows) != 0 {
+          new_ty(over_refused(c, span, name.name.name, 1, 0, over))
+        } else {
+          let label = match map_get(c.label_params, at(labels, 0).name) {
+            Some(v) -> TyVar(v),
+            None -> label_type(region_named(c, hold(), at(labels, 0).name)),
+          };
+          { checker: c, ty: TyCon({ name: name.name.name, args: [label, at(converted.tys, 0)] }) }
+        }
       } else if len(labels) > 0 || len(rows) > 0 {
         new_ty(over_refused(c, span, name.name.name, 0, 0, over))
-      } else if is_region_type(name.name.name) {
-        let region: WithTy = new_ty(c);
-        {
-          checker: region.checker,
-          ty: TyCon({ name: name.name.name, args: [region.ty, at(converted.tys, 0)] }),
-        }
+      } else if name.name.name == b"Cell" {
+        new_ty(
+          report_error_at(
+            c,
+            b"E0446",
+            span,
+            b"`Cell` is no type a program writes",
+            b"a cell is a name, not a value",
+            cell_is_a_name(),
+          ),
+        )
       } else {
         let built = TyCon({ name: name.name.name, args: converted.tys });
         { checker: note_map_keys(c, span, built), ty: built }
@@ -2426,7 +2474,7 @@ fn conv_atom(
           match a.resource {
             Some(r) -> match map_get(checker.label_params, r.name) {
               Some(v) -> RVar(v),
-              None -> RNamed(r.name),
+              None -> RNamed(region_named(checker, eff, r.name)),
             },
             None -> RSingleton,
           }
@@ -3068,27 +3116,30 @@ fn bind_ty_params(checker: Checker, names: List<Ident>) -> Checker =
   })
 
 /// A member of the group being walked as a call inside the group reads it: each call fills its own
-/// type parameters, as a call from outside does, and its rows and labels are the group's one set.
+/// type, row and label parameters, as a call from outside does.
 fn member_scheme(checker: Checker, def: FnDef, sig: Signature) -> Scheme / {abort.raise} = {
-  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] }).tys;
+  let free = free_vars(checker.subst, sig.fn_ty, { tys: [], rows: [] });
   {
     ty_vars: fold(def.generics.types, [], |vs: List<Int>, ident: Ident|
       match map_get(sig.ty_params, ident.name) {
-        Some(TyVar(v)) -> if contains(free, v) { push(vs, v) } else { vs },
+        Some(TyVar(v)) -> if contains(free.tys, v) { push(vs, v) } else { vs },
         _ -> vs,
       }),
-    row_vars: [],
-    label_vars: [],
+    row_vars: fold(def.generics.effects, [], |vs: List<Int>, ident: Ident|
+      match map_get(sig.row_params, ident.name) {
+        Some(v) -> if contains(free.rows, v) { push(vs, v) } else { vs },
+        None -> vs,
+      }),
+    label_vars: fold(def.generics.labels, [], |vs: List<Int>, ident: Ident|
+      match map_get(sig.label_params, ident.name) { Some(v) -> push(vs, v), None -> vs }),
     ty: sig.fn_ty,
   }
 }
 
-/// `shared` holds the label and row variables the recursive group is checked with: a member's
-/// binders take them in order, so a call inside the group passes the caller's along.
-fn signature_sharing(
+/// A definition's signature as it is written, each of its type, row and label parameters rigid.
+fn written_signature(
   outer: Checker,
   def: FnDef,
-  shared: Shared,
 ) -> { checker: Checker, sig: Signature } / {abort.raise} = {
   let checker: Checker = {
     ..outer,
@@ -3098,34 +3149,23 @@ fn signature_sharing(
     label_params: map_new(),
   };
   let tys: Checker = bind_ty_params(checker, def.generics.types);
-  let rows: Checker = fold(range(0, len(def.generics.effects)), tys, |c: Checker, i: Int| {
-    let p: Ident = at(def.generics.effects, i);
-    match list_at(shared.rows, i) {
-      Some(v) -> { ..c, row_params: map_insert(c.row_params, p.name, v) },
-      None -> {
-        let o: WithVar = new_row_var(c);
-        {
-          ..o.checker,
-          subst: mark_rigid_row(o.checker.subst, o.var),
-          row_params: map_insert(o.checker.row_params, p.name, o.var),
-        }
-      },
+  let rows: Checker = fold(def.generics.effects, tys, |c: Checker, p: Ident| {
+    let o: WithVar = new_row_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_row(o.checker.subst, o.var),
+      row_params: map_insert(o.checker.row_params, p.name, o.var),
     }
   });
   // A label parameter is a type variable, rigid in the body, that the row's atoms name.
-  let labels: Checker = fold(range(0, len(def.generics.labels)), rows, |c: Checker, i: Int|
-    match list_at(shared.labels, i) {
-      Some(v) ->
-        { ..c, label_params: map_insert(c.label_params, at(def.generics.labels, i).name, v) },
-      None -> {
-        let o: WithVar = new_ty_var(c);
-        {
-          ..o.checker,
-          subst: mark_rigid_ty(o.checker.subst, o.var),
-          label_params: map_insert(o.checker.label_params, at(def.generics.labels, i).name, o.var),
-        }
-      },
-    });
+  let labels: Checker = fold(def.generics.labels, rows, |c: Checker, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {
+      ..o.checker,
+      subst: mark_rigid_ty(o.checker.subst, o.var),
+      label_params: map_insert(o.checker.label_params, p.name, o.var),
+    }
+  });
   let assumed: Checker = witnessing(
     { ..labels, assumed: constraints_in_force(labels, def.constraints) },
     def.constraints,
@@ -3138,7 +3178,7 @@ fn signature_sharing(
       match p.ty {
         Some(t) -> {
           let o: WithTy = conv_type(acc.checker, t);
-          { checker: o.checker, tys: push(acc.tys, o.ty) }
+          { checker: hold_written(o.checker, t, o.ty, true), tys: push(acc.tys, o.ty) }
         },
         None -> {
           let o: WithTy = new_ty(acc.checker);
@@ -3146,8 +3186,11 @@ fn signature_sharing(
         },
       },
   );
-  let ret = match def.ret {
-    Some(t) -> conv_type(params.checker, t),
+  let ret: WithTy = match def.ret {
+    Some(t) -> {
+      let o: WithTy = conv_type(params.checker, t);
+      { checker: hold_written(o.checker, t, o.ty, false), ty: o.ty }
+    },
     None -> new_ty(params.checker),
   };
   // A function's row is what its signature writes: with no `/`, the empty one.
@@ -3501,10 +3544,52 @@ fn report_unify(
         bytes_concat_all([context, b"|", pe.text, b"|", pf.text]),
         bytes_concat(b"effect row mismatch: ", context),
         bytes_concat_all([b"expected ", pe.text, b", found ", pf.text]),
-        if len(extra) > 0 {
-          [bytes_concat(b"not permitted here: ", backticked(map(extra, atom_text), b", "))]
-        } else { [] },
+        concat(
+          if len(extra) > 0 {
+            [bytes_concat(b"not permitted here: ", backticked(map(extra, atom_text), b", "))]
+          } else { [] },
+          region_apart(expected, found),
+        ),
       )
+    },
+  }
+
+/// An atom of `row` that names a region where `other` names the resource the region is written as.
+fn region_twin(row: Row, other: Row) -> Option<Atom> / {abort.raise} =
+  fold(row.atoms, None, |acc: Option<Atom>, a: Atom|
+    match acc {
+      Some(_) -> acc,
+      None -> match a.resource {
+        RNamed(n) -> if written_label(n) != n
+            && contains(other.atoms, { ..a, resource: RNamed(written_label(n)) }) { Some(a) }
+        else { None },
+        _ -> None,
+      },
+    })
+
+/// Two rows that print alike and differ: one names a region, the other a resource of its name.
+fn region_apart(expected: Row, found: Row) -> List<Bytes> / {abort.raise} =
+  match match region_twin(found, expected) {
+      Some(a) -> Some(a),
+      None -> region_twin(expected, found),
+    } {
+    None -> [],
+    Some(a) -> {
+      let name = match a.resource { RNamed(n) -> written_label(n), _ -> b"" };
+      [
+        bytes_concat_all([
+          b"one `",
+          name,
+          b"` is the region `with_",
+          a.effect,
+          b"[",
+          name,
+          b"]` opens and the other is the resource of that name, which is all a row written outside the region names",
+        ]),
+        if a.effect == hold() {
+          b"take the hold with its region as a label parameter, `<[r]>(h: Hold<T, [r]>)`, or what reads it through a row parameter, `<| e>`"
+        } else { b"take what reads or writes the cell through a row parameter, `<| e>`" },
+      ]
     },
   }
 
@@ -4181,7 +4266,10 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         { checker: pushed, tys: [] },
         |acc: { checker: Checker, tys: List<Type> }, p: Param| {
           let t: WithTy = match p.ty {
-            Some(te) -> conv_type(acc.checker, te),
+            Some(te) -> {
+              let o: WithTy = conv_type(acc.checker, te);
+              { checker: hold_written(o.checker, te, o.ty, true), ty: o.ty }
+            },
             None -> new_ty(acc.checker),
           };
           {
@@ -4210,7 +4298,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let written: { checker: Checker, ty: Option<Type> } = match l.ret {
         Some(te) -> {
           let w: WithTy = conv_type(entered, te);
-          { checker: w.checker, ty: Some(w.ty) }
+          { checker: hold_written(w.checker, te, w.ty, false), ty: Some(w.ty) }
         },
         None -> { checker: entered, ty: None },
       };
@@ -4929,10 +5017,8 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
               }),
             }
           };
-          let group = group_label_vars(noted, key.name);
           // A constructor's labels are its type's arguments, which no call fills.
-          let ls = if len(group) > 0 { map(group, |v: Int| TyVar(v)) }
-          else if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
+          let ls = if len(inst.labels) > 0 && map_contains(noted.ctor_index, key.name) { [] }
           else { inst.labels };
           // Every `Columns` is made by a call that answers one, so its element is judged there.
           let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
@@ -4947,7 +5033,22 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             else { note_typed(columned, qname.span, inst.ty, inst.args) },
             None -> note_typed(columned, qname.span, inst.ty, inst.args),
           };
-          { checker: note_labels(typed, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
+          let named: Checker = if typed.cell_named || !is_cell(resolve(typed, inst.ty)) { typed }
+          else {
+            report_error_at(
+              typed,
+              b"E0446",
+              qname.span,
+              bytes_concat_all([b"the cell `", qname.name.name, b"` is used as a value"]),
+              b"a cell is a name, not a value",
+              cell_is_a_name(),
+            )
+          };
+          {
+            checker: note_labels(named, qname.span, key.name, ls, inst.ty),
+            ty: inst.ty,
+            row: row_empty(),
+          }
         },
         None -> {
           let o: WithTy = new_ty(unknown_name(k.checker, qname));
@@ -5252,7 +5353,7 @@ fn let_bound(
   let annotated: { checker: Checker, ty: Type, row: Row } = match annotation {
     Some(te) -> {
       let w: WithTy = conv_type(checker, te);
-      let v: Inferred = infer(w.checker, value, hint_of(w.ty));
+      let v: Inferred = infer(hold_written(w.checker, te, w.ty, false), value, hint_of(w.ty));
       {
         checker: expect_met(v.checker, expr_span(value), w.ty, v.ty, b"`let` annotation"),
         ty: w.ty,
@@ -5316,29 +5417,60 @@ fn joined_callbacks(
   }
 }
 
-fn group_label_vars(checker: Checker, name: Bytes) -> List<Int> =
-  fold(checker.group_defs, [], |acc: List<Int>, g: GroupDef|
-    if g.name == name { g.labels } else { acc })
-
 fn group_member(checker: Checker, name: Bytes) -> Bool =
   fold(checker.group_defs, false, |acc: Bool, g: GroupDef| acc || g.name == name)
 
 /// Every use of a label-generic definition, so a call can fill its labels and a settled component
 /// can say which ones it filled them with.
-fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) -> Checker =
+fn note_labels(
+  checker: Checker,
+  span: Span,
+  callee: Bytes,
+  labels: List<Type>,
+  ty: Type,
+) -> Checker / {abort.raise} =
   if len(labels) == 0 { checker } else {
+    let vars = map(labels, |l: Type| match l { TyVar(v) -> v, _ -> 0 - 1 });
+    let regions = region_labels(ty, []);
     {
       ..checker,
       label_apps: push(checker.label_apps, {
         module: checker.module,
         span: span,
+        named: span.end,
         callee: callee,
-        vars: map(labels, |ty: Type| match ty { TyVar(v) -> v, _ -> 0 - 1 }),
+        vars: vars,
+        written: filter(vars, |v: Int| !contains(regions, v)),
         params: checker.label_params,
         called: false,
         owner: checker.walking,
       }),
     }
+  }
+
+/// The label variables `ty` names a region by: a hold's, and those of the `cell` and `hold` atoms
+/// its rows write.
+fn region_labels(ty: Type, acc: List<Int>) -> List<Int> / {abort.raise} =
+  match ty {
+    TyVar(_) -> acc,
+    TyCon(c) -> {
+      let own = if c.name == b"Hold" {
+        match list_at(c.args, 0) { Some(TyVar(v)) -> ints_insert(acc, v), _ -> acc }
+      } else { acc };
+      fold(c.args, own, |a: List<Int>, x: Type| region_labels(x, a))
+    },
+    TyFn(f) ->
+      fold(
+        f.effects.atoms,
+        fold(f.params, region_labels(f.ret, acc), |a: List<Int>, p: Type| region_labels(p, a)),
+        |a: List<Int>, atom: Atom|
+          match atom.resource {
+            RVar(v) -> if is_region_effect(atom.effect) { ints_insert(a, v) } else { a },
+            _ -> a,
+          },
+      ),
+    TyRecord(fs) -> fold(fs, acc, |a: List<Int>, f: Field| region_labels(f.ty, a)),
+    TyNominal(n) -> fold(n.args, acc, |a: List<Int>, x: Type| region_labels(x, a)),
   }
 
 /// The use recorded for the name this call applies, when the callee is label-generic.
@@ -5348,7 +5480,8 @@ fn callee_labels(checker: Checker, span: Span) -> Option<LabelApplication> =
     None -> None,
   }
 
-/// The labels written at a call fill the callee's label parameters left to right.
+/// The labels written at a call fill, left to right, the callee's label parameters that name no
+/// region: a region's is filled by the argument that carries it.
 fn fill_labels(
   checker: Checker,
   span: Span,
@@ -5356,105 +5489,56 @@ fn fill_labels(
   app: Option<LabelApplication>,
 ) -> Checker / {abort.raise} =
   match app {
-    None -> if len(labels) == 0 { checker } else { wrong_labels(checker, labels, None, 0) },
+    None -> if len(labels) == 0 { checker } else { wrong_labels(checker, labels, None, 0, 0) },
     // A count that does not match is reported here, and the use dropped rather than reported twice.
-    Some(a) -> if len(labels) > 0 && len(labels) != len(a.vars) {
+    Some(a) -> if len(labels) > 0 && len(labels) != len(a.written) {
       wrong_labels(
         { ..checker, label_apps: take(checker.label_apps, len(checker.label_apps) - 1) },
         labels,
         Some(a.callee),
-        len(a.vars),
+        len(a.written),
+        len(a.vars) - len(a.written),
       )
     } else {
       let marked: Checker = {
         ..checker,
         label_apps: list_set(checker.label_apps, len(checker.label_apps) - 1, {
-          module: a.module,
+          ..a,
           span: span,
-          callee: a.callee,
-          vars: a.vars,
-          params: a.params,
           called: true,
-          owner: a.owner,
         }),
       };
-      if len(labels) > 0 && is_sibling(marked, a.callee) { group_labels_written(marked, a, labels) }
-      else {
-        // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
-        fold(range(0, len(labels)), marked, |c: Checker, i: Int| {
-          let want = match map_get(c.label_params, at(labels, i).name) {
-            Some(w) -> TyVar(w),
-            None -> label_type(at(labels, i).name),
-          };
-          with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
-        })
-      }
+      // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
+      fold(range(0, len(labels)), marked, |c: Checker, i: Int| {
+        let want = match map_get(c.label_params, at(labels, i).name) {
+          Some(w) -> TyVar(w),
+          None -> label_type(at(labels, i).name),
+        };
+        with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.written, i)), want))
+      })
     },
   }
 
-/// A callee checked in the same recursive group as the body calling it: its labels are the group's.
-fn is_sibling(checker: Checker, name: Bytes) -> Bool = len(group_label_vars(checker, name)) > 0
-
-/// A call inside a recursive group keeps the labels the group was called with, so a label written
-/// there names the caller's own binder in that place, and anything else is refused.
-fn group_labels_written(
-  checker: Checker,
-  a: LabelApplication,
-  labels: List<Ident>,
-) -> Checker / {abort.raise} =
-  fold(range(0, len(labels)), checker, |c: Checker, i: Int|
-    match map_get(c.label_params, at(labels, i).name) {
-      Some(v) -> if v == at(a.vars, i) { c } else { group_label_refused(c, a, at(labels, i)) },
-      None -> group_label_refused(c, a, at(labels, i)),
-    })
-
-fn group_label_refused(
-  checker: Checker,
-  a: LabelApplication,
-  written: Ident,
-) -> Checker / {abort.raise} = {
-  let own = fold(a.vars, [], |acc: List<Bytes>, v: Int|
-    match param_named(a.params, v) { Some(n) -> push(acc, n), None -> acc });
-  let callee = simple_name_of(a.callee);
-  let help = if len(own) < len(a.vars) {
-    b"a call inside a recursive group passes the caller's labels along, so it writes none of its own"
-  } else {
-    bytes_concat_all([
-      b"write `",
-      callee,
-      b"(..)`, or name this definition's own binders in order, as `",
-      callee,
-      b"[",
-      bytes::join(own, b", "),
-      b"](..)`",
-    ])
-  };
-  report_error_at(
-    checker,
-    b"E0306",
-    written.span,
-    bytes_concat_all([
-      b"a call to `",
-      callee,
-      b"` inside its own recursive group keeps the labels the group was called with",
-    ]),
-    bytes_concat_all([b"`", written.name, b"` is written here"]),
-    [help],
-  )
-}
-
+/// `want` is how many labels a call of the callee writes, and `regions` how many more it binds
+/// for a region.
 fn wrong_labels(
   checker: Checker,
   labels: List<Ident>,
   callee: Option<Bytes>,
   want: Int,
+  regions: Int,
 ) -> Checker / {abort.raise} = {
   let span = span_to(at(labels, 0).span, at(labels, len(labels) - 1).span);
   let who = match callee {
     Some(n) -> bytes_concat_all([b"`", simple_name_of(n), b"`"]),
     None -> b"this callee",
   };
-  let message = if want == 0 { bytes_concat_all([who, b" takes no label parameters"]) } else {
+  let message = if want == 0 {
+    bytes_concat_all([
+      who,
+      if regions == 0 { b" takes no label parameters" } else { b" takes no label a call writes" },
+    ])
+  } else {
     bytes_concat_all([
       who,
       b" takes ",
@@ -5468,9 +5552,16 @@ fn wrong_labels(
       b" written",
     ])
   };
-  let help = [
-    b"the labels at a call fill the `[l]` binders of the definition's generic list, left to right",
-  ];
+  let help = concat(
+    [
+      b"the labels at a call fill the `[l]` binders of the definition's generic list, left to right",
+    ],
+    if regions == 0 { [] } else {
+      [
+        b"a binder that names a hold's or a cell's region is filled by the argument that carries the region, and is not written",
+      ]
+    },
+  );
   match callee {
     Some(n) -> match def_of(checker, n) {
       Some(d) ->
@@ -5552,9 +5643,6 @@ fn group_callee(checker: Checker, src: PerformSource) -> Option<Bytes> =
     PerformVia(name) -> if group_member(checker, name) { Some(name) } else { None },
     _ -> None,
   }
-
-fn group_row_tail(checker: Checker, tail: Option<Int>) -> Bool =
-  match tail { Some(v) -> contains(checker.group_rows, v), None -> false }
 
 type Met = { checker: Checker, tails: List<Int> }
 
@@ -5757,70 +5845,15 @@ fn close_tail(checker: Checker, tail: Int) -> Checker / {abort.raise} =
     None -> checker,
   }
 
-/// An argument against its parameter, where a call inside the group being walked keeps the
-/// group's row: a mismatch on that row is refused as that.
 fn expect_argument(
   checker: Checker,
   span: Span,
   expected: Type,
   found: Type,
-  callee: Option<Bytes>,
 ) -> Checker / {abort.raise} = {
   let u = unify(checker.subst, checker.fresh, expected, found);
   let c: Checker = with_unified(checker, u);
-  match u.error {
-    None -> c,
-    Some(e) -> match callee {
-      Some(name) -> group_argument_refused(c, e, span, name),
-      None -> report_unify(c, e, span, b"argument type"),
-    },
-  }
-}
-
-fn group_argument_refused(
-  checker: Checker,
-  error: UnifyError,
-  span: Span,
-  callee: Bytes,
-) -> Checker / {abort.raise} =
-  match error {
-    // A tail that differs is the group's row itself being asked to become another; atoms that
-    // differ under one tail are an ordinary row mismatch.
-    RowMismatch(m) -> {
-      let want = resolve_row_in(checker, m.expected);
-      let got = resolve_row_in(checker, m.found);
-      if group_row_tail(checker, want.tail) && want.tail != got.tail {
-        group_row_refused(checker, span, callee, want, got)
-      } else { report_unify(checker, error, span, b"argument type") }
-    },
-    _ -> report_unify(checker, error, span, b"argument type"),
-  }
-
-/// The group's row binders are one allocation, so a call inside it cannot ask for another row.
-fn group_row_refused(
-  checker: Checker,
-  span: Span,
-  callee: Bytes,
-  want: Row,
-  got: Row,
-) -> Checker / {abort.raise} = {
-  let pe = print_row(printer_new(), want);
-  let pf = print_row(pe.printer, got);
-  report_error_at(
-    checker,
-    b"E0308",
-    span,
-    bytes_concat_all([
-      b"a call to `",
-      simple_name_of(callee),
-      b"` inside its own recursive group keeps the row the group was called with",
-    ]),
-    bytes_concat_all([b"the group's row here is ", pe.text, b", and this argument's is ", pf.text]),
-    [
-      b"the members of a recursive group are checked with one set of row parameters, taken in order, so a call inside it passes the caller's row along",
-      b"give this argument the group's row, or break the cycle so the callee is checked on its own",
-    ],
-  )
+  match u.error { None -> c, Some(e) -> report_unify(c, e, span, b"argument type") }
 }
 
 /// Each call inside the group just walked, `members`, that fills a member's type parameter with a
@@ -5965,7 +5998,7 @@ fn infer_app_general(
         fn_.params,
         handed.tys,
         |cc: Checker, i: Int|
-          expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i), callee),
+          expect_argument(cc, expr_span(at(args, i)), at(fn_.params, i), at(handed.tys, i)),
       );
       // `forall a.` alone would admit two `String`s, so the integer obligation goes on the instantiated variable here.
       let noted: Checker = if is_int_builtin(func) && len(fn_.params) > 0 {
@@ -6039,6 +6072,67 @@ fn infer_app_general(
   }
 }
 
+fn is_cell(ty: Type) -> Bool = match ty { TyCon(c) -> c.name == b"Cell", _ -> false }
+
+fn cell_is_a_name() -> List<Bytes> =
+  [
+    b"a cell is read and written where its `with_cell` binds it, by `cell_get`, `cell_set` and `cell_update`, and a closure may capture it",
+    b"to let other code reach it, pass a closure that reads or writes it, or declare an effect the region's handler answers",
+  ]
+
+/// The arguments of a cell builtin. The first names the cell, which is all a cell's name does.
+fn infer_cell_args(
+  checker: Checker,
+  args: List<Expr>,
+  span: Span,
+) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} =
+  fold(
+    range(0, len(args)),
+    { checker: checker, tys: [], row: row_empty() },
+    |acc: { checker: Checker, tys: List<Type>, row: Row }, i: Int| {
+      let names = i == 0 && (match at(args, i) { EVar(_) -> true, _ -> false });
+      let o: Inferred = infer({ ..acc.checker, cell_named: names }, at(args, i));
+      let j: WithRow = join({ ..o.checker, cell_named: false }, span, acc.row, o.row);
+      { checker: j.checker, tys: push(acc.tys, o.ty), row: j.row }
+    },
+  )
+
+/// Whether `ty` names a hold anywhere but as a parameter: its own, where `passed`, or one of a
+/// function type it holds.
+fn keeps_hold(ty: Type, passed: Bool) -> Bool =
+  match ty {
+    TyVar(_) -> false,
+    TyCon(c) ->
+      (c.name == b"Hold" && !passed)
+        || fold(c.args, false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+    TyFn(f) ->
+      fold(f.params, false, |b: Bool, p: Type| b || keeps_hold(p, true))
+        || keeps_hold(f.ret, false),
+    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || keeps_hold(f.ty, false)),
+    TyNominal(n) -> fold(n.args, false, |b: Bool, a: Type| b || keeps_hold(a, false)),
+  }
+
+/// A hold is passed down and never kept, so `Hold` is written only as a parameter's type.
+fn hold_written(
+  checker: Checker,
+  written: TypeExpr,
+  ty: Type,
+  passed: Bool,
+) -> Checker / {abort.raise} =
+  if !keeps_hold(resolve(checker, ty), passed) { checker } else {
+    report_error_at(
+      checker,
+      b"E0446",
+      ty_span(written),
+      b"a `Hold` is written where it would be kept",
+      b"a hold is passed down, never kept",
+      [
+        b"a hold is a parameter of a definition, a lambda or a function type: it is not answered, held in another value or bound by an annotation",
+        b"read it where it is passed, with `hold_get`, and keep what the read answers",
+      ],
+    )
+  }
+
 fn cell_form_name(form: CellForm) -> Bytes =
   match form { CellGet -> b"cell_get", CellSet -> b"cell_set", CellUpdate -> b"cell_update" }
 
@@ -6049,7 +6143,7 @@ fn infer_cell_op(
   form: CellForm,
 ) -> Inferred / {abort.raise} = {
   let expected = match form { CellGet -> 1, CellSet -> 2, CellUpdate -> 2 };
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_all(checker, args, span);
+  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_cell_args(checker, args, span);
   if len(args) != expected {
     let o: WithTy = new_ty(
       arity_error(as_.checker, span, cell_form_name(form), expected, len(args), b"arguments", []),
@@ -6094,7 +6188,7 @@ fn infer_cell_op(
       },
     };
     let ret = match form { CellGet -> elem.ty, _ -> unit_type() };
-    match region_of(resolve(after.checker, region.ty)) {
+    match label_of(resolve(after.checker, region.ty)) {
       None ->
         {
           checker: report_error_at(
@@ -8083,8 +8177,6 @@ fn note_universal_clause(
   }
 }
 
-fn region_type(name: Bytes) -> Type = named_type(bytes_concat(region_prefix(), name))
-
 fn cell_atoms(resource: Bytes) -> List<Atom> =
   [
     { effect: cell(), resource: RNamed(resource), mode: MRead, op: None },
@@ -8129,11 +8221,23 @@ fn region_reopened(checker: Checker, resource: Ident, outer: OpenRegion, form: B
     ],
   )
 
-fn open_region(checker: Checker, name: Bytes, span: Span, hold: Bool) -> Checker =
+/// The label a region's cells and atoms carry: its written name beside the definition that opens it.
+/// No source can write it, so no other definition's row or region names this one's.
+fn region_label(checker: Checker, name: Bytes) -> Bytes =
+  bytes_concat_all([name, region_mark(), checker.walking])
+
+/// What `name` stands for where an atom of the effect `eff` or a hold's type writes it: an open
+/// region's own label for its cells and holds, and for any other effect the resource of that name.
+fn region_named(checker: Checker, eff: Bytes, name: Bytes) -> Bytes =
+  if !is_region_effect(eff) { name }
+  else { match open_region_named(checker, name) { Some(region) -> region.label, None -> name } }
+
+fn open_region(checker: Checker, name: Bytes, label: Bytes, span: Span, hold: Bool) -> Checker =
   {
     ..checker,
     open_regions: push(checker.open_regions, {
       name: name,
+      label: label,
       span: span,
       hold: hold,
       simulate_depth: checker.simulate_depth,
@@ -8278,7 +8382,11 @@ fn infer_with_cell(
   hint: Option<Hint>,
 ) -> Inferred / {abort.raise} = {
   let i: Inferred = infer(checker, init);
-  let cell_ty = TyCon({ name: b"Cell", args: [region_type(resource.name), i.ty] });
+  let label = match open_region_named(i.checker, resource.name) {
+    Some(around) -> around.label,
+    None -> region_label(i.checker, resource.name),
+  };
+  let cell_ty = TyCon({ name: b"Cell", args: [label_type(label), i.ty] });
   if region_is_open(i.checker, resource.name) {
     let nested: Checker = match open_region_named(i.checker, resource.name) {
       Some(outer) -> if outer.hold { region_reopened(i.checker, resource, outer, b"with_cell") }
@@ -8294,7 +8402,7 @@ fn infer_with_cell(
     { checker: j.checker, ty: b.ty, row: j.row }
   } else {
     let outer = outer_bindings(i.checker, body);
-    let opened: Checker = open_region(i.checker, resource.name, resource.span, false);
+    let opened: Checker = open_region(i.checker, resource.name, label, resource.span, false);
     let mark = len(opened.performs);
     let pushed: Checker = {
       ..opened,
@@ -8302,7 +8410,7 @@ fn infer_with_cell(
     };
     let b: Inferred = infer(pushed, body, hint);
     let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
-    let handled = cell_atoms(resource.name);
+    let handled = cell_atoms(label);
     let discharged: Checker = discharge(
       closed.checker,
       mark,
@@ -8312,6 +8420,7 @@ fn infer_with_cell(
     let site: RegionSite = {
       module: discharged.module,
       name: resource.name,
+      label: label,
       span: resource.span,
       hold: false,
       body_span: expr_span(body),
@@ -8323,7 +8432,7 @@ fn infer_with_cell(
     };
     let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
-    { checker: j.checker, ty: b.ty, row: j.row }
+    { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
   }
 }
 
@@ -8355,7 +8464,8 @@ fn infer_with_hold(
     record_site(c, atom, expr_span(release), source));
   let before: WithRow = join(performed, span, a.row, r.row);
   let entering: WithRow = join(before.checker, span, before.row, let_go);
-  let hold_ty = TyCon({ name: b"Hold", args: [region_type(resource.name), a.ty] });
+  let label = region_label(entering.checker, resource.name);
+  let hold_ty = TyCon({ name: b"Hold", args: [label_type(label), a.ty] });
   match open_region_named(entering.checker, resource.name) {
     Some(around) -> {
       let refused: Checker = region_reopened(entering.checker, resource, around, b"with_hold");
@@ -8374,7 +8484,13 @@ fn infer_with_hold(
     },
     None -> {
       let outer = outer_bindings(entering.checker, body);
-      let opened: Checker = open_region(entering.checker, resource.name, resource.span, true);
+      let opened: Checker = open_region(
+        entering.checker,
+        resource.name,
+        label,
+        resource.span,
+        true,
+      );
       let mark = len(opened.performs);
       let b: Inferred = infer(
         { ..opened, env: env_bind(env_push(opened.env), binder.name, monomorphic(hold_ty)) },
@@ -8382,7 +8498,7 @@ fn infer_with_hold(
         hint,
       );
       let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
-      let handled = [hold_atom()];
+      let handled = [hold_atom(RNamed(label))];
       let discharged: Checker = discharge(
         closed.checker,
         mark,
@@ -8392,6 +8508,7 @@ fn infer_with_hold(
       let site: RegionSite = {
         module: discharged.module,
         name: resource.name,
+        label: label,
         span: resource.span,
         hold: true,
         body_span: expr_span(body),
@@ -8408,7 +8525,7 @@ fn infer_with_hold(
         entering.row,
         row_without_covered(resolve_row_in(recorded, b.row), handled),
       );
-      { checker: j.checker, ty: b.ty, row: j.row }
+      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
     },
   }
 }
@@ -8433,7 +8550,7 @@ fn older_cells(
     let a = resolve_atom(checker.subst, site.atom);
     match a.resource {
       RNamed(r) -> if a.effect == cell() && mode_eq(a.mode, mode)
-          && fold(older, false, |b: Bool, opened: Opened| b || opened.name == r) {
+          && fold(older, false, |b: Bool, opened: Opened| b || opened.label == r) {
         push(acc, { span: site.span, region: r })
       } else { acc },
       _ -> acc,
@@ -8486,7 +8603,7 @@ fn infer_simulate(
   let mark = len(checker.performs);
   let crossed_at = len(checker.crossings);
   let older = map(checker.open_regions, |region: OpenRegion|
-    { name: region.name, span: region.span });
+    { name: region.name, label: region.label, span: region.span });
   let cells = filter(
     map(env_locals(checker.env), |l: { name: Bytes, sc: Scheme }| { name: l.name, ty: l.sc.ty }),
     |l: { name: Bytes, ty: Type }| holds_cell(resolve(checker, l.ty)),
@@ -8772,125 +8889,9 @@ fn settled_atom(checker: Checker, atom: Atom) -> Atom / {abort.raise} =
 fn settled_row(checker: Checker, atoms: List<Atom>) -> Row / {abort.raise} =
   { atoms: atoms_sorted(map(atoms, |atom: Atom| settled_atom(checker, atom))), tail: None }
 
-/// `ty` with every row it holds, at any depth, empty: what its types say apart from what they do.
-fn rowless(ty: Type) -> Type =
-  match ty {
-    TyVar(_) -> ty,
-    TyCon(c) -> TyCon({ ..c, args: map(c.args, rowless) }),
-    TyFn(f) -> TyFn({ params: map(f.params, rowless), ret: rowless(f.ret), effects: row_empty() }),
-    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { ..f, ty: rowless(f.ty) })),
-    TyNominal(n) ->
-      TyNominal({
-        ..n,
-        args: map(n.args, rowless),
-        fields: map(n.fields, |f: Field| { ..f, ty: rowless(f.ty) }),
-      }),
-  }
-
 /// The rows handed in for a definition.
 fn seeded_rows(checker: Checker, name: Bytes) -> Option<KnownDef> =
   map_get(checker.known.defs, name)
-
-fn binders_text(n: Int, what: Bytes) -> Bytes =
-  if n == 0 { bytes_concat_all([b"binds no ", what, b" parameters"]) }
-  else { bytes_concat_all([b"binds ", ascii_of_int(n), b" ", what, b" parameter", plural(n)]) }
-
-fn binders_differ(
-  checker: Checker,
-  def: FnDef,
-  first: FnDef,
-  what: Bytes,
-  many: Bytes,
-  mine: Int,
-  theirs: Int,
-) -> Checker =
-  report_error_at_and(
-    checker,
-    b"E0307",
-    def.name.span,
-    bytes_concat_all([
-      b"`",
-      def.name.name,
-      b"` and `",
-      first.name.name,
-      b"` are mutually recursive, so they are checked with one set of ",
-      what,
-      b" parameters",
-    ]),
-    binders_text(mine, what),
-    location_of(checker, first.name.span),
-    binders_text(theirs, what),
-    [
-      bytes_concat_all([
-        b"a call inside a recursive group passes the caller's ",
-        many,
-        b" along, so every member binds the same number, in the same order",
-      ]),
-    ],
-  )
-
-/// The label and row variables a recursive group is checked with: the first member's binders, taken
-/// by every member in order. A member that binds another number of either is refused.
-fn component_params(
-  checker: Checker,
-  fns: List<FnDef>,
-  comp: List<Int>,
-) -> { checker: Checker, shared: Shared } / {abort.raise} = {
-  let first: FnDef = at(
-    fns,
-    fold(comp, at(comp, 0), |acc: Int, i: Int| if i < acc { i } else { acc }),
-  );
-  let judged: Checker = if len(comp) < 2 { checker } else {
-    fold(comp, checker, |c: Checker, i: Int| {
-      let def: FnDef = at(fns, i);
-      let labelled: Checker = if len(def.generics.labels) == len(first.generics.labels) { c } else {
-        binders_differ(
-          c,
-          def,
-          first,
-          b"label",
-          b"labels",
-          len(def.generics.labels),
-          len(first.generics.labels),
-        )
-      };
-      if len(def.generics.effects) == len(first.generics.effects) { labelled } else {
-        binders_differ(
-          labelled,
-          def,
-          first,
-          b"row",
-          b"rows",
-          len(def.generics.effects),
-          len(first.generics.effects),
-        )
-      }
-    })
-  };
-  let labels: { checker: Checker, vars: List<Int> } = fold(
-    first.generics.labels,
-    { checker: judged, vars: [] },
-    |acc: { checker: Checker, vars: List<Int> }, ident: Ident| {
-      let o: WithVar = new_ty_var(acc.checker);
-      {
-        checker: { ..o.checker, subst: mark_rigid_ty(o.checker.subst, o.var) },
-        vars: push(acc.vars, o.var),
-      }
-    },
-  );
-  let rows: { checker: Checker, vars: List<Int> } = fold(
-    first.generics.effects,
-    { checker: labels.checker, vars: [] },
-    |acc: { checker: Checker, vars: List<Int> }, ident: Ident| {
-      let o: WithVar = new_row_var(acc.checker);
-      {
-        checker: { ..o.checker, subst: mark_rigid_row(o.checker.subst, o.var) },
-        vars: push(acc.vars, o.var),
-      }
-    },
-  );
-  { checker: rows.checker, shared: { labels: labels.vars, rows: rows.vars } }
-}
 
 /// What a name the termination walk leaves free refers to.
 fn group_callee_kind(
@@ -8916,19 +8917,14 @@ fn check_component(
   comp: List<Int>,
 ) -> Checker / {abort.raise} = {
   let qualified = map(comp, |i: Int| qualify(parsed.name, at(fns, i).name.name));
-  let params: { checker: Checker, shared: Shared } = component_params(checker, fns, comp);
   // The constraints a member's signature writes stand for the walk, so a call inside the group
   // answers for them as a call from outside will.
   let sigs: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> } = fold(
     range(0, len(comp)),
-    { checker: params.checker, sigs: [], schemes: [] },
+    { checker: checker, sigs: [], schemes: [] },
     |acc: { checker: Checker, sigs: List<Signature>, schemes: List<Scheme> }, slot: Int| {
       let def = at(fns, at(comp, slot));
-      let s: WithSig = signature_sharing(
-        { ..acc.checker, derived: derived_of(parsed, def) },
-        def,
-        params.shared,
-      );
+      let s: WithSig = written_signature({ ..acc.checker, derived: derived_of(parsed, def) }, def);
       let scheme = member_scheme(s.checker, def, s.sig);
       {
         checker: {
@@ -8948,7 +8944,6 @@ fn check_component(
   );
   let grouped: Checker = {
     ..sigs.checker,
-    group_rows: params.shared.rows,
     group_defs: fold(range(0, len(comp)), [], |acc: List<GroupDef>, slot: Int| {
       let def = at(fns, at(comp, slot));
       let sig = at(sigs.sigs, slot);
@@ -8993,29 +8988,19 @@ fn check_component(
             match u.error {
               Some(_) -> None,
               None -> {
-                // Its check tied what its signature leaves open, the region of each cell it names:
-                // the types it gave tie them here, or the body is walked.
-                let c0: Checker = with_unified(acc.checker, u);
-                let given = instantiate(rows.scheme, c0.fresh);
-                let t = unify(c0.subst, given.fresh, rowless(sig.fn_ty), rowless(given.ty));
-                match t.error {
-                  Some(_) -> None,
-                  None -> {
-                    let c: Checker = with_unified(c0, t);
-                    Some({
-                      checker: c,
-                      row: settled_row(c, performed),
-                      count: {
-                        scaling: settled_row(c, scaling).atoms,
-                        sites: [],
-                        repeats: rows.repeats,
-                        tail_over: None,
-                        recursed: None,
-                        raises: rows.raises,
-                      },
-                    })
+                let c: Checker = with_unified(acc.checker, u);
+                Some({
+                  checker: c,
+                  row: settled_row(c, performed),
+                  count: {
+                    scaling: settled_row(c, scaling).atoms,
+                    sites: [],
+                    repeats: rows.repeats,
+                    tail_over: None,
+                    recursed: None,
+                    raises: rows.raises,
                   },
-                }
+                })
               },
             }
           },
@@ -9092,9 +9077,7 @@ fn check_component(
   };
   let settled: Checker = settle_columns(
     settle_bit_ops(
-      settle_numerics(
-        settle_concats(settle_updates({ ..summarized, group_defs: [], group_rows: [] })),
-      ),
+      settle_numerics(settle_concats(settle_updates({ ..summarized, group_defs: [] }))),
     ),
   );
   let grown: Checker = refuse_growth(settled, grouped.group_defs);
@@ -9382,10 +9365,11 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
     Some(at) -> check_const_shape(popped, def, at, signature),
     None -> popped,
   };
+  let left = leaving_row(resolve_row_in(shaped, body.row));
   let rowed: Checker = match signature.declared {
-    Some(declared) -> check_upper_bound(shaped, def, declared, body.row),
+    Some(declared) -> check_upper_bound(shaped, def, declared, left),
     None -> {
-      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, body.row);
+      let u = unify_row(shaped.subst, shaped.fresh, signature.published_row, left);
       let c = with_unified(shaped, u);
       match u.error {
         Some(e) -> report_unify(c, e, expr_span(def.body), b"inferred effect row"),
@@ -9393,7 +9377,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       }
     },
   };
-  let counted = counts_of(rowed, signature, body.row);
+  let counted = counts_of(rowed, signature, left);
   {
     checker: {
       ..rowed,
@@ -9406,7 +9390,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Counted / 
       guards: guards::none(),
       raise_notes: [],
     },
-    row: body.row,
+    row: left,
     scaling: counted.scaling,
     repeats: counted.repeats,
     tail_over: counted.tail_over,
@@ -10632,7 +10616,7 @@ fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise
                 Some(cases) -> check_listing(answered, def, cases),
               };
               let popped: Checker = { ..listed, env: env_pop(listed.env) };
-              let row = resolve_row_in(popped, o.row);
+              let row = leaving_row(resolve_row_in(popped, o.row));
               // A table refused for what it performs is not also held to the test's determinism.
               let unlisted = len(listed.diags) > len(answered.diags);
               {
@@ -13565,10 +13549,10 @@ fn check_entering(checker: Checker, site: Simulation) -> Checker / {abort.raise}
 /// A region that also writes the cell is refused for the write, whose remedy covers the read.
 fn check_older_reads(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
-    match first_access(site.reads, opened.name) {
+    match first_access(site.reads, opened.label) {
       None -> c,
-      Some(read_span) -> if first_access(site.writes, opened.name) != None { c } else {
-        match task_holder(c, site.cells, opened.name) {
+      Some(read_span) -> if first_access(site.writes, opened.label) != None { c } else {
+        match task_holder(c, site.cells, opened.label) {
           None -> c,
           Some(b) ->
             err_labels(
@@ -13645,9 +13629,9 @@ fn check_simulation_exits(checker: Checker, site: Simulation) -> Checker / {abor
 /// `Task` is written in types, so a store into a cell typed to hold one shows only as the write.
 fn check_older_writes(checker: Checker, site: Simulation) -> Checker / {abort.raise} =
   fold(site.older, checker, |c: Checker, opened: Opened|
-    match first_access(site.writes, opened.name) {
+    match first_access(site.writes, opened.label) {
       None -> c,
-      Some(write_span) -> match task_holder(c, site.cells, opened.name) {
+      Some(write_span) -> match task_holder(c, site.cells, opened.label) {
         None -> c,
         Some(b) ->
           err_labels(
@@ -13725,7 +13709,7 @@ fn task_holder(
 fn holds_tasks(t: Type, region: Bytes) -> Bool / {abort.raise} =
   match t {
     TyCon(c) ->
-      (c.name == b"Cell" && len(c.args) == 2 && region_of(at(c.args, 0)) == Some(region)
+      (c.name == b"Cell" && len(c.args) == 2 && label_of(at(c.args, 0)) == Some(region)
         && brand_in(at(c.args, 1), Tasks))
         || fold(c.args, false, |b: Bool, a: Type| b || holds_tasks(a, region)),
     TyRecord(fs) -> fold(fs, false, |b: Bool, field: Field| b || holds_tasks(field.ty, region)),
@@ -13795,8 +13779,9 @@ fn row_brands(row: Row, brand: Brand) -> Bool =
     CellsOf(r) ->
       fold(row.atoms, false, |b: Bool, atom: Atom|
         b || (atom.effect == cell() && atom.resource == RNamed(r))),
-    // A row does not say which hold it reads, so one that reads any may read this region's.
-    HoldsOf(_) -> fold(row.atoms, false, |b: Bool, atom: Atom| b || atom.effect == hold()),
+    HoldsOf(r) ->
+      fold(row.atoms, false, |b: Bool, atom: Atom|
+        b || (atom.effect == hold() && atom.resource == RNamed(r))),
     Tasks ->
       fold(
         concat([b"join", b"await", b"cancel"], channel_ops()),
@@ -13811,8 +13796,8 @@ fn brand_in(t: Type, brand: Brand) -> Bool / {abort.raise} =
     TyVar(_) -> false,
     TyCon(c) ->
       (match brand {
-          CellsOf(r) -> region_of(t) == Some(r),
-          HoldsOf(r) -> region_of(t) == Some(r),
+          CellsOf(r) -> label_of(t) == Some(r),
+          HoldsOf(r) -> label_of(t) == Some(r),
           Tasks -> scheduler_handle(c.name),
         })
         || fold(c.args, false, |b: Bool, a: Type| b || brand_in(a, brand)),
@@ -13846,7 +13831,7 @@ fn check_regions(checker: Checker) -> Checker / {abort.raise} =
     ))
 
 fn brand_of(site: RegionSite) -> Brand =
-  if site.hold { HoldsOf(site.name) } else { CellsOf(site.name) }
+  if site.hold { HoldsOf(site.label) } else { CellsOf(site.label) }
 
 fn region_form(site: RegionSite) -> Bytes = if site.hold { b"with_hold" } else { b"with_cell" }
 
@@ -13875,7 +13860,7 @@ fn check_region_exits(checker: Checker, site: RegionSite) -> Checker / {abort.ra
       },
     )
   } else {
-    let carries = if carries_brand_in_row(ty, CellsOf(n)) {
+    let carries = if carries_brand_in_row(ty, brand_of(site)) {
       [
         bytes_concat_all([
           b"the closure's row still carries `cell.read[",
@@ -14081,7 +14066,7 @@ fn check_region_handoffs(checker: Checker, site: RegionSite) -> Checker / {abort
             b"the closure's row still carries `hold.read`, so whoever handles the operation can read a hold the region has let go",
           ]
         } else { [] }
-      } else if carries_brand_in_row(ty, CellsOf(n)) {
+      } else if carries_brand_in_row(ty, brand_of(site)) {
         [
           bytes_concat_all([
             b"the closure's row still carries `cell.read[",
@@ -14160,7 +14145,6 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     label_apps: [],
     label_sites: [],
     group_defs: [],
-    group_rows: [],
     auto_ty_params: false,
     alias_stack: [],
     aliases: map_new(),
@@ -14213,6 +14197,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     numeric_types: [],
     keyed_names: [],
     copied: false,
+    cell_named: false,
   })
 
 /// `ok` is `false` when the program has an *error* in it. A warning is not one: the program
@@ -14752,12 +14737,13 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
         ],
       )
     } else {
+      // A region's label reaches a callee as the name its body writes, as its clauses name it.
       let names = fold(a.vars, [], |acc: List<Bytes>, v: Int|
-        match label_named(in_module, a, v) { Some(n) -> push(acc, n), None -> acc });
+        match label_named(in_module, a, v) { Some(n) -> push(acc, written_label(n)), None -> acc });
       if len(names) < len(a.vars) {
-        report_error_at(
-          in_module,
+        let unfilled = error_at(
           b"E0306",
+          a.module,
           a.span,
           bytes_concat_all([
             b"this call leaves a label of `",
@@ -14772,7 +14758,16 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
               b"[<label>](..)`, or pass an argument whose row or type names it",
             ]),
           ],
-        )
+        );
+        // One binder for one label is the only label this definition can pass along.
+        report(in_module, match ((map_keys(a.params), a.written)) {
+          ([own], [w]) -> if label_named(in_module, a, w) != None { unfilled } else {
+            with_fix(unfilled, bytes_concat_all([b"pass `", own, b"` along"]), [
+              insertion(a.module, a.named, bytes_concat_all([b"[", own, b"]"])),
+            ])
+          },
+          _ -> unfilled,
+        })
       } else {
         {
           ..in_module,
@@ -15013,7 +15008,6 @@ fn known_of(checker: Checker) -> Known = {
       summary: def_info.summary,
       raises: def_info.raises,
       facts: b"",
-      scheme: def_info.scheme,
     }));
   let tests = fold(checker.tests, map_new(), |acc: Map<Bytes, KnownTest>, t: TestInfo|
     map_insert(acc, t.key, { footprint: t.footprint, facts: b"" }));
@@ -15179,122 +15173,70 @@ test "two label parameters stay apart, and each names its own atom" {
   )
 }
 
-// The group's binders are positional, so `pong` takes `ping`'s first, whatever it calls it.
-test "mutually recursive definitions are checked with one set of label binders" {
-  let src = bytes_concat_all([
-    b"effect net { write send[r](Bytes) -> Unit }\n",
-    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
-    b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping(n - 1, b)\n",
-    b"fn go(b: Bytes) -> Unit / {net.send[conn]} = ping[conn](2, b)",
-  ]);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(
-    string_contains(
-      dump,
-      "F;m.ping;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];",
-    ),
-  );
-  assert(
-    string_contains(
-      dump,
-      "F;m.pong;<[l]>(Int, Bytes) -> Unit / {m.net.send[l]};<[l]>m.net.send[l];",
-    ),
-  );
-  assert(string_contains(dump, "F;m.go;(Bytes) -> Unit / {m.net.send[conn]};m.net.send[conn];"))
-}
-
-test "a call inside a recursive group writes no labels, or the caller's own binders" {
-  let pair = |call: Bytes|
+test "a call inside a recursive group fills its callee's labels as any call does" {
+  let alone = |call: Bytes, row: Bytes|
     bytes_concat_all([
       b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
-      call,
-      b" }\n",
-      b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
-    ]);
-  assert_eq(check_codes(pair(b"pong(n - 1, b)")), []);
-  assert_eq(check_codes(pair(b"pong[l](n - 1, b)")), []);
-  assert_eq(check_codes(pair(b"pong[conn](n - 1, b)")), [b"E0306"]);
-  let diags = check_diags(pair(b"pong[conn](n - 1, b)"));
-  assert_eq(map(diags, |diag: Diag| diag.message), [
-    b"a call to `pong` inside its own recursive group keeps the labels the group was called with",
-  ]);
-  assert_eq(map(diags, |diag: Diag| diag.notes_text), [
-    [b"write `pong(..)`, or name this definition's own binders in order, as `pong[l](..)`"],
-  ]);
-  // A self call is the same rule: its own binder, or nothing.
-  let alone = |call: Bytes|
-    bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ",
+      b"fn walk<[l]>(n: Int, b: Bytes) -> Unit / {",
+      row,
+      b"} = if n <= 0 { net.send[l](b) } else { ",
       call,
       b" }",
     ]);
-  assert_eq(check_codes(alone(b"walk(n - 1, b)")), []);
-  assert_eq(check_codes(alone(b"walk[l](n - 1, b)")), []);
-  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)")), [b"E0306"])
+  assert_eq(check_codes(alone(b"walk[l](n - 1, b)", b"net.send[l]")), []);
+  // Another label than its own is what the call performs, which the caller's row must hold.
+  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)", b"net.send[l], net.send[conn]")), []);
+  assert_eq(check_codes(alone(b"walk[conn](n - 1, b)", b"net.send[l]")), [b"E0302"]);
+  // No argument names the label, so the call writes it, and the one binder in scope is offered.
+  let bare = alone(b"walk(n - 1, b)", b"net.send[l]");
+  let unfilled = filter(check_diags(bare), |diag: Diag| diag.code == b"E0306");
+  assert_eq(map(unfilled, |diag: Diag| diag.message), [
+    b"this call leaves a label of `walk` unfilled",
+  ]);
+  assert_eq(map(fixes_of(unfilled), |fix: Fix| fix.title), [b"pass `l` along"]);
+  assert_eq(map(fixes_of(unfilled), |fix: Fix| fixed_by(bare, fix)), [
+    alone(b"walk[l](n - 1, b)", b"net.send[l]"),
+  ]);
+  // Each member keeps its own binder, whatever it calls it and however many it binds.
+  let pair = bytes_concat_all([
+    b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong[l](n - 1, b) }\n",
+    b"fn pong<[k]>(n: Int, b: Bytes) -> Unit / {net.send[k]} = ping[k](n - 1, b)",
+  ]);
+  assert_eq(check_codes(pair), []);
+  let uneven = bytes_concat_all([
+    b"effect net { write send[r](Bytes) -> Unit }\n",
+    b"fn ping<[l, k]>(n: Int, b: Bytes) -> Unit / {net.send[l], net.send[k]} = if n <= 0 { net.send[l](b) } else { pong[k](n - 1, b) }\n",
+    b"fn pong<[l]>(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { ping[l, l](n - 1, b) }",
+  ]);
+  assert_eq(check_codes(uneven), [])
 }
 
-test "the members of a recursive group bind the same label parameters" {
-  let group = |first: Bytes, second: Bytes|
+test "a call inside a recursive group fills its callee's row as any call does" {
+  let alone = |row: Bytes, handed: Bytes|
     bytes_concat_all([
-      b"effect net { write send[r](Bytes) -> Unit }\n",
-      b"fn ping",
-      first,
-      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = if n <= 0 { net.send[l](b) } else { pong(n - 1, b) }\n",
-      b"fn pong",
-      second,
-      b"(n: Int, b: Bytes) -> Unit / {net.send[l]} = ping(n - 1, b)",
+      b"effect tick { write now() -> Unit }\n",
+      b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / ",
+      row,
+      b" = if n <= 0 { f() } else { each(n - 1, ",
+      handed,
+      b") }",
     ]);
-  assert_eq(check_codes(group(b"<[l]>", b"<[l]>")), []);
-  assert(contains(check_codes(group(b"<[l]>", b"")), b"E0307"));
-  assert(contains(check_codes(group(b"<[l]>", b"<[l, k]>")), b"E0307"));
-  assert(contains(check_codes(group(b"", b"<[l]>")), b"E0307"));
-  let diags = check_diags(group(b"<[l]>", b""));
-  assert_eq(
-    at(map(diags, |diag: Diag| diag.message), 0),
-    b"`pong` and `ping` are mutually recursive, so they are checked with one set of label parameters",
-  );
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"binds no label parameters",
-    b"binds 1 label parameter",
-  ])
-}
-
-// The group's row binders are positional too, so `pong` takes `ping`'s first, whatever it calls it.
-test "mutually recursive definitions are checked with one set of row binders" {
-  let src = bytes_concat_all([
-    b"effect tick { write now() -> Unit }\n",
+  assert_eq(check_codes(alone(b"e", b"f")), []);
+  // A callback of another row is what the call performs, which the caller's row must hold.
+  assert_eq(check_codes(alone(b"{tick.now | e}", b"|| tick.now()")), []);
+  assert_eq(check_codes(alone(b"e", b"|| tick.now()")), [b"E0302"]);
+  // Each member keeps its own binder, and one that takes no row calls one that does.
+  let pair = bytes_concat_all([
     b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|t>(n: Int, f: () -> Unit / t) -> Unit / t = ping(n - 1, f)\n",
-    b"fn go() -> Unit / {tick.now} = ping(2, || tick.now())",
+    b"fn pong<|t>(n: Int, f: () -> Unit / t) -> Unit / t = ping(n - 1, f)",
   ]);
-  assert_eq(check_codes(src), []);
-  let dump = check_dump([{ name: b"m", src: src }]);
-  assert(string_contains(dump, "F;m.ping;<| e>(Int, () -> Unit / e) -> Unit / e;"));
-  assert(string_contains(dump, "F;m.pong;<| e>(Int, () -> Unit / e) -> Unit / e;"));
-  assert(string_contains(dump, "F;m.go;() -> Unit / {m.tick.now};"))
-}
-
-test "a call inside a recursive group keeps the row the group was called with" {
-  let src = bytes_concat_all([
-    b"effect tick { write now() -> Unit }\n",
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || tick.now())",
+  assert_eq(check_codes(pair), []);
+  let mixed = bytes_concat_all([
+    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { plain(n - 1) }\n",
+    b"fn plain(n: Int) -> Unit = if n <= 0 { () } else { each(n - 1, || ()) }",
   ]);
-  assert_eq(check_codes(src), [b"E0308"]);
-  let diags = check_diags(src);
-  assert_eq(map(diags, |diag: Diag| diag.message), [
-    b"a call to `ping` inside its own recursive group keeps the row the group was called with",
-  ]);
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"the group's row here is e, and this argument's is {m.tick.now}",
-  ]);
-  let quiet = bytes_concat_all([
-    b"fn ping<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-    b"fn pong<|e>(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, || ())",
-  ]);
-  assert_eq(check_codes(quiet), [])
+  assert_eq(check_codes(mixed), [])
 }
 
 test "two callbacks that perform different things fill one row variable with both" {
@@ -15401,35 +15343,6 @@ test "a function's parameter and a declared type hold their rows exactly" {
     b"fn go(f: () -> Unit / {net.send[x]}) -> Unit / {net.write[x]} = open(Box(f))",
   ]);
   assert_eq(check_codes(boxed), [b"E0302"])
-}
-
-test "the members of a recursive group bind the same row parameters" {
-  let group = |first: Bytes, second: Bytes|
-    bytes_concat_all([
-      b"fn ping",
-      first,
-      b"(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { pong(n - 1, f) }\n",
-      b"fn pong",
-      second,
-      b"(n: Int, f: () -> Unit / e) -> Unit / e = ping(n - 1, f)",
-    ]);
-  assert_eq(check_codes(group(b"<|e>", b"<|e>")), []);
-  assert(contains(check_codes(group(b"<|e>", b"")), b"E0307"));
-  let diags = check_diags(group(b"<|e>", b""));
-  assert_eq(
-    at(map(diags, |diag: Diag| diag.message), 0),
-    b"`pong` and `ping` are mutually recursive, so they are checked with one set of row parameters",
-  );
-  assert_eq(map(at(diags, 0).labels, |label: Label| label.text), [
-    b"binds no row parameters",
-    b"binds 1 row parameter",
-  ]);
-  // A group mixing a row-generic member with one that binds none is refused where they disagree.
-  let mixed = bytes_concat_all([
-    b"fn each<|e>(n: Int, f: () -> Unit / e) -> Unit / e = if n <= 0 { f() } else { plain(n - 1) }\n",
-    b"fn plain(n: Int) -> Unit = if n <= 0 { () } else { each(n - 1, || ()) }",
-  ]);
-  assert(contains(check_codes(mixed), b"E0307"))
 }
 
 test "a call inside a recursive group fills its callee's type parameters, and may not grow one" {
@@ -15593,16 +15506,78 @@ test "a hold is read inside its region, whose row is its acquire's, its release'
   ])
 }
 
-test "a function handed a hold reads it under `hold.read`, which the region answers" {
+test "a function handed a hold reads it under its region's label, which the region answers" {
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
   assert_eq(
     check_codes(
-      b"fn peek(h: Hold<Int>) -> Int / {hold.read} = hold_get(h)\nfn f() -> Int = with_hold[r](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+      bytes_concat(
+        peek,
+        b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek(h) + peek(h) }",
+      ),
     ),
     [],
   );
-  assert_eq(check_codes(b"fn peek(h: Hold<Int>) -> Int = hold_get(h)"), [b"E0302"]);
+  assert_eq(check_codes(b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int = hold_get(h)"), [b"E0302"]);
+  // A hold's type names its region's label, as its reads do.
+  assert_eq(check_codes(b"fn kept(h: Hold<Int>) -> Int = 0"), [b"E0202"]);
+  // A region answers the reads of its own hold and of no other: one inside a closure that reads an
+  // outer hold too leaves that read in the closure's row, where the outer region sees it leave.
+  assert_eq(
+    refusals(
+      b"fn f() -> Int = { let k = with_hold[outer](41, |x: Int| ()) { h -> || with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) } }; 0 }",
+    ),
+    [
+      [
+        b"E0446",
+        b"a hold escapes its `with_hold[outer]` region",
+        b"|| with_hold[inner](1, |x: Int| ()) { g -> hold_get(h) + hold_get(g) }",
+      ],
+    ],
+  );
   assert_eq(check_codes(b"fn f() -> Unit / {hold.read} = hold.read()"), [b"E0103"]);
   assert_eq(check_codes(b"effect hold { read get() -> Int }"), [b"E0105"])
+}
+
+test "the labels a call writes fill those that name no region, which the hold passed fills" {
+  let noted = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](hold_get(h))\n";
+  let inside = |call: Bytes|
+    bytes_concat_all([
+      noted,
+      b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> ",
+      call,
+      b" }",
+    ]);
+  assert_eq(check_codes(inside(b"noted[out](h)")), []);
+  assert(
+    refused_with(
+      inside(b"noted[out, file](h)"),
+      b"E0306",
+      b"`noted` takes 1 label parameter, but 2 are written",
+    ),
+  );
+  assert(
+    refused_with(inside(b"noted(h)"), b"E0306", b"this call leaves a label of `noted` unfilled"),
+  );
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
+  assert(
+    refused_with(
+      bytes_concat(peek, b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek[file](h) }"),
+      b"E0306",
+      b"`peek` takes no label a call writes",
+    ),
+  );
+  // A callback's row names the region as a hold's type does.
+  let through = b"fn through<[l], [r] | e>(k: () -> Int / {hold.read[r] | e}) -> Unit / {log.write[l], hold.read[r] | e} = log.say[l](k())\n";
+  assert_eq(
+    check_codes(
+      bytes_concat_all([
+        noted,
+        through,
+        b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> through[out](|| hold_get(h)) }",
+      ]),
+    ),
+    [],
+  )
 }
 
 test "a hold that leaves its region is refused where it leaves" {
@@ -15618,11 +15593,13 @@ test "a hold that leaves its region is refused where it leaves" {
   // A function that answers a closure over a hold says `hold.read` in the closure's row.
   assert_eq(
     check_codes(
-      b"fn later(h: Hold<Int>) -> () -> Int / {hold.read} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
+      b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int / {hold.read[l]} = || hold_get(h)\nfn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> later(h) }; 0 }",
     ),
     [b"E0446"],
   );
-  assert_eq(check_codes(b"fn later(h: Hold<Int>) -> () -> Int = || hold_get(h)"), [b"E0302"])
+  assert_eq(check_codes(b"fn later<[l]>(h: Hold<Int, [l]>) -> () -> Int = || hold_get(h)"), [
+    b"E0302",
+  ])
 }
 
 test "a hold kept in an older cell, handed to an operation, or given an older scheduler's task is refused" {
@@ -15664,12 +15641,60 @@ test "a hold's region is its own: neither it nor a cell's reuses a name that is 
   assert_eq(nested(b"with_cell[r](1)", b"with_cell[r](2)"), [])
 }
 
-test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
-  assert_eq(refusals(b"type Kept = Kept(Hold<Int>)"), [
-    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int>"],
+// A definition that opened a region of a caller's name used to answer for the caller's cell, and
+// hand back a closure whose row no longer said it read one.
+test "a region's label is its own: a row another definition writes names no region" {
+  let wrap = b"fn wrap(k: () -> Int / {cell.read[work]}) -> () -> Int = || with_cell[work](0) { d -> cell_get(d) + k() }\n";
+  let leak = b"fn leak() -> () -> Int = with_cell[work](41) { c -> wrap(|| cell_get(c)) }";
+  // Its region answers none of what `k` reads, so the closure it hands back still reads a cell.
+  assert(contains(check_codes(wrap), b"E0302"));
+  // And a closure over this region's cell is no `cell.read[work]` a parameter could ask for.
+  let asked = bytes_concat(b"fn wrap(k: () -> Int / {cell.read[work]}) -> Int = 0\n", leak);
+  // The two rows print alike, so the refusal says which `work` each is.
+  assert_eq(
+    map(filter(check_diags(asked), |diag: Diag| diag.code == b"E0302"), |diag: Diag|
+      list_at(diag.notes_text, 1)),
+    [
+      Some(
+        b"one `work` is the region `with_cell[work]` opens and the other is the resource of that name, which is all a row written outside the region names",
+      ),
+    ],
+  );
+  // A callee generic over the row takes the closure, and its own region answers none of it.
+  let generic = bytes_concat_all([
+    b"fn each<| e>(k: () -> Int / e) -> Int / e = with_cell[work](0) { d -> cell_get(d) + k() }\n",
+    b"fn held() -> Int = with_cell[work](41) { c -> each(|| cell_get(c)) }",
   ]);
-  assert_eq(check_codes(b"effect io { write put(h: Hold<Int>) -> Unit }"), [b"E0446"]);
-  assert_eq(check_codes(b"type Hidden = Hidden(() -> Int / {hold.read})"), [b"E0446"])
+  assert_eq(check_codes(generic), []);
+  // What reads an outer region leaves an inner one, and the outer region still answers it.
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_cell[a](40) { x -> { let k = with_cell[b](2) { y -> { let n = cell_get(y); || cell_get(x) + n } }; k() } }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_hold[a](40, |x: Int| ()) { h -> { let k = with_hold[b](2, |x: Int| ()) { g -> { let n = hold_get(g); || hold_get(h) + n } }; k() } }",
+    ),
+    [],
+  );
+  // The name is the region's for its cells alone: another effect's label of that name is the
+  // resource it always was, so a clause inside the region answers what a callee performs on it.
+  let other = bytes_concat_all([
+    b"effect tally { write note[r](n: Int) -> Unit }\n",
+    b"fn noted(n: Int) -> Unit / {tally.write[log]} = tally.note[log](n)\n",
+    b"fn held(n: Int) -> Int = with_cell[log](0) { c -> { handle { noted(n) } with { tally.note[log](what) -> cell_set(c, what) }; cell_get(c) } }",
+  ]);
+  assert_eq(check_codes(other), [])
+}
+
+test "a declaration that mentions a `Hold`, or a function that reads one, is refused" {
+  assert_eq(refusals(b"type Kept<[r]> = Kept(Hold<Int, [r]>)"), [
+    [b"E0446", b"`Kept`'s field 1 mentions a `Hold`", b"Hold<Int, [r]>"],
+  ]);
+  assert_eq(check_codes(b"effect io { write put[r](h: Hold<Int, [r]>) -> Unit }"), [b"E0446"]);
+  assert_eq(check_codes(b"type Hidden<[r]> = Hidden(() -> Int / {hold.read[r]})"), [b"E0446"])
 }
 
 // A cycle through a cell is the one leak reference counting accepts, so neither shape it needs is
@@ -15714,7 +15739,10 @@ test "a constructor does not launder a cell inside the closure it holds" {
 // A generator cannot inhabit a handle, so a law over a record that holds one is refused where the
 // law is written and no generated value can carry a cell.
 test "a law cannot quantify over a record that reaches a region" {
-  assert(contains(check_codes(b"law \"no\" forall (r: {c: Cell<Int>}) { true }\n"), b"E0418"), None)
+  assert(
+    contains(check_codes(b"law \"no\" forall (r: {h: Hold<Int, [x]>}) { true }\n"), b"E0418"),
+    None,
+  )
 }
 
 fn escapes(src: Bytes) -> Bool / {abort.raise} =
@@ -15869,38 +15897,23 @@ test "every carrier of a cell out of its region is refused before it can dangle"
   )
 }
 
-// An alias is the type it names, so it neither erases a cell's brand on the way out nor lets a
-// definition that only names `Cell<Int>` read one.
-test "a cell round-tripped through a type alias keeps its brand" {
-  let alias = b"type Held = Cell<Int>\nfn keep(c: Held) -> Held = c\n";
-  assert_eq(
-    check_codes(
-      bytes_concat(
-        alias,
-        b"pub fn read_it() -> Int = with_cell[k](42) { c -> cell_get(keep(c)) }\n",
-      ),
-    ),
-    [],
-  );
+test "a cell is a name: read and written where it is bound, captured by a closure, and no value" {
+  let bound = |body: Bytes|
+    check_codes(bytes_concat_all([b"fn f() -> Int = with_cell[k](1) { c -> ", body, b" }"]));
+  assert_eq(bound(b"{ cell_set(c, 2); cell_update(c, |n: Int| n + 1); cell_get(c) }"), []);
+  assert_eq(bound(b"{ let bump = || cell_set(c, cell_get(c) + 1); bump(); cell_get(c) }"), []);
+  assert(contains(bound(b"{ let x = c; 0 }"), b"E0446"));
+  assert(contains(bound(b"{ let x = [c]; 0 }"), b"E0446"));
+  assert(contains(bound(b"{ let x = Some(c); 0 }"), b"E0446"));
+  assert(contains(bound(b"cell_get(match 0 { _ -> c })"), b"E0446"));
   assert(
     refused_with(
-      bytes_concat(alias, b"pub fn leak() -> Held = with_cell[k](42) { c -> keep(c) }\n"),
-      b"E0201",
-      b"escapes its `with_cell[k]` region",
+      b"fn f() -> Int = with_cell[k](1) { c -> { let x = c; 0 } }",
+      b"E0446",
+      b"the cell `c` is used as a value",
     ),
-    Some("the alias erased the brand on the way out"),
   );
-  assert(
-    len(
-        filter(
-          check_diags(bytes_concat(alias, b"fn peek(c: Held) -> Int = cell_get(c)\n")),
-          |diag: Diag|
-            bytes_index_of(diag.message, b"cannot tell which `with_cell` region") != None,
-        ),
-      )
-      > 0,
-    Some("a definition holding a written `Cell<Int>` could read it"),
-  )
+  assert_eq(check_codes(b"fn peek(c: Cell<Int>) -> Int = 0"), [b"E0446"])
 }
 
 test "a region in a law's body reports its escape" {
@@ -16334,7 +16347,7 @@ test "a law binder naming a type nothing declares is refused, and a lowercase on
 test "an instantiation is checked where it is written: what it is given, and what its schema quantifies there" {
   let over = |law: Bytes|
     bytes_concat(
-      b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(c: Cell<Int>) -> Cell<Int> = c\nfn x(n: Int) -> Int = n\n",
+      b"law schema same<a>(f: (a) -> a) forall (x: a) where x == x { f(x) == x }\nfn id(n: Int) -> Int = n\nfn show(n: Int) -> String = int_to_string(n)\nfn held(t: Task<Int>) -> Task<Int> = t\nfn x(n: Int) -> Int = n\n",
       law,
     );
   assert_eq(check_codes(over(b"law \"l\" = same(id)")), []);
@@ -16379,7 +16392,7 @@ test "a schema's guard and body are a law's: pure but for a raise, over binders 
     ),
     [],
   );
-  assert_eq(check_codes(b"law schema s(f: (Int) -> Int) forall (c: Cell<Int>) { f(1) == 1 }"), [
+  assert_eq(check_codes(b"law schema s(f: (Int) -> Int) forall (t: Task<Int>) { f(1) == 1 }"), [
     b"E0418",
   ]);
   assert_eq(messages(b"law schema s(f: (Int) -> Int) forall (x: Int) { f(x) }"), [
@@ -17527,10 +17540,10 @@ test "functions cannot be compared and a Float cannot key a Map, judged once the
 }
 
 test "a cell leaving its region is reported at the exit, under the code its form has always used" {
-  let dump = check_dump([
-    { name: b"m", src: b"fn escape() -> Int = { let k = with_cell[r](1) { c -> c }; 0 }" },
-  ]);
-  assert_eq(dump, "K;1;X;D;1;!E0201:0:54:55:1:1;=0:54:55:1;")
+  assert_eq(
+    refusals(b"fn escape() -> Int = { let k = with_cell[r](1) { c -> || cell_get(c) }; 0 }"),
+    [[b"E0201", b"the cell escapes its `with_cell[r]` region", b"|| cell_get(c)"]],
+  )
 }
 
 test "a cell reaches a task only where the scheduler cannot outlive the region" {
@@ -17608,7 +17621,7 @@ test "a declaration that mentions a `Cell` or a `Task` is refused at the type th
     [b"E0446", b"`Held`'s field 1 mentions a `Task`", b"Task<Int>"],
   ]);
   assert_eq(refusals(b"type Held = Held(Cell<Int>)"), [
-    [b"E0446", b"`Held`'s field 1 mentions a `Cell`", b"Cell<Int>"],
+    [b"E0446", b"`Cell` is no type a program writes", b"Cell<Int>"],
   ]);
   assert_eq(refusals(b"type Pool = Idle | Busy(Int, List<Task<Unit>>)"), [
     [b"E0446", b"`Busy`'s field 2 mentions a `Task`", b"List<Task<Unit>>"],
@@ -19405,10 +19418,12 @@ test "a `forall` ranges over an opaque type another module declares" {
 }
 
 test "a `forall` never ranges over a `Hold`, alone or inside another type" {
-  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int>) { true }"), [b"E0418"]);
-  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int>>) { len(hs) >= 0 }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (h: Hold<Int, [r]>) { true }"), [b"E0418"]);
+  assert_eq(check_codes(b"law \"l\" forall (hs: List<Hold<Int, [r]>>) { len(hs) >= 0 }"), [
+    b"E0418",
+  ]);
   assert_eq(
-    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int>>) { true }"),
+    check_codes(b"type Kept<t> = | Kept(t)\nlaw \"l\" forall (k: Kept<Hold<Int, [r]>>) { true }"),
     [b"E0418"],
   )
 }
@@ -19426,7 +19441,10 @@ test "a hold of an opaque value is read where the value's module is called, and 
     over(b"fn spent(n: Int) -> Int = with_hold[t](mint(n), spend) { h -> worth(hold_get(h)) }"),
     [],
   );
-  assert_eq(over(b"fn peek(h: Hold<Token>) -> Int / {hold.read} = worth(hold_get(h))"), []);
+  assert_eq(
+    over(b"fn peek<[r]>(h: Hold<Token, [r]>) -> Int / {hold.read[r]} = worth(hold_get(h))"),
+    [],
+  );
   // Holding one opens nothing: its constructor is still its module's alone.
   assert_eq(
     over(
