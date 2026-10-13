@@ -225,6 +225,7 @@ helpers![
     (rt_record_has, 2, true),
     (rt_list_fits, 3, true),
     (rt_list_at, 2, true),
+    (rt_list_room, 1, true),
     (rt_list_rest, 2, true),
     (rt_alloc, 4, true),
     (rt_nullary, 1, true),
