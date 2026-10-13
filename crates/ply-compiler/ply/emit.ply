@@ -860,33 +860,32 @@ fn deferred_of(emitter: Emitter, name: Bytes) -> Option<Deferred> =
 /// Built at the first demand for its word; the guard stops a second demand building it twice. The
 /// word takes its counted fields' counts where `takes`, the record spent, and adds to them where not.
 fn materialise(emitter: Emitter, name: Bytes, takes: Bool) -> Emitter =
+  made(emitter, name, takes, true)
+
+/// As `materialise`, but where not `allocs` the record is made only in the cells of a record of its
+/// width this body let go, and otherwise stays held back.
+fn made(emitter: Emitter, name: Bytes, takes: Bool, allocs: Bool) -> Emitter =
   match deferred_of(emitter, name) {
     None -> emitter,
     Some(d) -> {
-      let o1 = line(note_tok(emitter, d.n), bytes_concat_all([b"if (!", name, b") {"]));
+      let tok = bytes_concat(b"tok", ascii_of_int(d.n));
       // A token takes a mixed record only where it was one, with room for the bitmap.
-      let o2 = line(
-        indent(o1),
-        bytes_concat_all([
-          b"if (tok",
-          ascii_of_int(d.n),
-          if has_tail(d.flags) {
-            bytes_concat_all([b" && (ply_obj(tok", ascii_of_int(d.n), b")->flags & PLY_MIXED)"])
-          } else { b"" },
-          b") {",
-        ]),
-      );
-      let o3 = line(
-        indent(o2),
-        bytes_concat_all([
-          name,
-          b" = tok",
-          ascii_of_int(d.n),
-          b"; tok",
-          ascii_of_int(d.n),
-          b" = 0;",
-        ]),
-      );
+      let fits = if has_tail(d.flags) {
+        bytes_concat_all([tok, b" && (ply_obj(", tok, b")->flags & PLY_MIXED)"])
+      } else { tok };
+      let opened = if allocs {
+        indent(
+          line(
+            indent(line(note_tok(emitter, d.n), bytes_concat_all([b"if (!", name, b") {"]))),
+            bytes_concat_all([b"if (", fits, b") {"]),
+          ),
+        )
+      } else {
+        indent(
+          line(note_tok(emitter, d.n), bytes_concat_all([b"if (!", name, b" && ", fits, b") {"])),
+        )
+      };
+      let o3 = line(opened, bytes_concat_all([name, b" = ", tok, b"; ", tok, b" = 0;"]));
       let o4 = line(
         o3,
         bytes_concat_all([
@@ -909,20 +908,22 @@ fn materialise(emitter: Emitter, name: Bytes, takes: Bool) -> Emitter =
           b"@@;",
         ]),
       );
-      let o5 = line(
-        indent(line(outdent(o4), b"} else {")),
-        bytes_concat_all([
-          name,
-          b" = rt_alloc_p(ctx, 3, ",
-          ascii_of_int(d.n),
-          b", @@s",
-          ascii_of_int(d.shape),
-          b"@@, ",
-          ascii_of_int(d.flags),
-          b");",
-        ]),
-      );
-      let o6 = line(outdent(check(o5)), b"}");
+      let o6 = if allocs {
+        let o5 = line(
+          indent(line(outdent(o4), b"} else {")),
+          bytes_concat_all([
+            name,
+            b" = rt_alloc_p(ctx, 3, ",
+            ascii_of_int(d.n),
+            b", @@s",
+            ascii_of_int(d.shape),
+            b"@@, ",
+            ascii_of_int(d.flags),
+            b");",
+          ]),
+        );
+        line(outdent(check(o5)), b"}")
+      } else { o4 };
       let o7 = fold(d.cells, o6, |acc: Emitter, c: { at: Int, expr: Bytes }|
         line(
           acc,
@@ -2583,33 +2584,7 @@ fn release_from(
             let emitter = note_released(emitter, root_of(emitter, value.expr));
             // A held-back record dies unbuilt; guarded, since another path may have built it.
             match deferred_of(emitter, value.expr) {
-              Some(d) ->
-                Some(
-                  line(
-                    note_tok(emitter, d.n),
-                    bytes_concat_all([
-                      b"if (",
-                      value.expr,
-                      b") { if (tok",
-                      ascii_of_int(d.n),
-                      b" == 0) { tok",
-                      ascii_of_int(d.n),
-                      b" = ply_reset_flat(",
-                      value.expr,
-                      b"); if (!tok",
-                      ascii_of_int(d.n),
-                      b") tok",
-                      ascii_of_int(d.n),
-                      b" = rt_reset_p(ctx, ",
-                      value.expr,
-                      b"); } else { ply_dec(ctx, ",
-                      value.expr,
-                      b"); } ",
-                      value.expr,
-                      b" = 0; }",
-                    ]),
-                  ),
-                ),
+              Some(d) -> Some(held_into_token(emitter, value.expr, d.n)),
               None -> match width_of(value.ty) {
                 None ->
                   Some(line(emitter, bytes_concat_all([b"ply_dec(ctx, ", value.expr, b");"]))),
@@ -2683,31 +2658,7 @@ fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
     line(emitter, bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]))
   } else {
     match deferred_of(emitter, value.expr) {
-      Some(d) ->
-        line(
-          note_tok(fold(d.counts, emitter, let_go_count), d.n),
-          bytes_concat_all([
-            b"if (",
-            value.expr,
-            b") { if (tok",
-            ascii_of_int(d.n),
-            b" == 0) { tok",
-            ascii_of_int(d.n),
-            b" = ply_reset_flat(",
-            value.expr,
-            b"); if (!tok",
-            ascii_of_int(d.n),
-            b") tok",
-            ascii_of_int(d.n),
-            b" = rt_reset_p(ctx, ",
-            value.expr,
-            b"); } else { ply_dec(ctx, ",
-            value.expr,
-            b"); } ",
-            value.expr,
-            b" = 0; }",
-          ]),
-        ),
+      Some(d) -> held_into_token(fold(d.counts, emitter, let_go_count), value.expr, d.n),
       None -> match width_of(value.ty) {
         None ->
           line(
@@ -2719,14 +2670,14 @@ fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
     }
   }
 
-/// The word of `name`, a record held back nothing asks for whole again, let go where it was made:
-/// its fields' locals hold counts of their own.
+/// The word of `name`, a record held back nothing asks for whole again, let go where it was made,
+/// into the token of its width: its fields' locals hold counts of their own.
 fn let_go_word(emitter: Emitter, name: Bytes) -> Emitter =
   if !emitter.release || is_pinned(emitter, name) { emitter } else {
-    line(
-      emitter,
-      bytes_concat_all([b"if (", name, b") { ply_dec(ctx, ", name, b"); ", name, b" = 0; }"]),
-    )
+    match deferred_of(emitter, name) {
+      Some(d) -> held_into_token(emitter, name, d.n),
+      None -> emitter,
+    }
   }
 
 /// The count the local `x` holds, a field of a record held back that dies here, let go.
@@ -2738,28 +2689,34 @@ fn let_go_count(emitter: Emitter, x: Bytes) -> Emitter =
 /// Releases the local `name`, a record or a constructor of `n` words, into the token of that width
 /// where it is unique and the token is empty, and nulls it.
 fn into_token(emitter: Emitter, name: Bytes, n: Int) -> Emitter =
-  line(
-    note_tok(emitter, n),
-    bytes_concat_all([
-      b"if (tok",
-      ascii_of_int(n),
-      b" == 0) { tok",
-      ascii_of_int(n),
-      b" = ply_reset_flat(",
-      name,
-      b"); if (!tok",
-      ascii_of_int(n),
-      b") tok",
-      ascii_of_int(n),
-      b" = rt_reset_p(ctx, ",
-      name,
-      b"); } else { ply_dec(ctx, ",
-      name,
-      b"); } ",
-      name,
-      b" = 0;",
-    ]),
-  )
+  line(note_tok(emitter, n), token_text(name, n))
+
+/// As `into_token`, for the local of a record held back, which holds a word only where it was made.
+fn held_into_token(emitter: Emitter, name: Bytes, n: Int) -> Emitter =
+  line(note_tok(emitter, n), bytes_concat_all([b"if (", name, b") { ", token_text(name, n), b" }"]))
+
+fn token_text(name: Bytes, n: Int) -> Bytes = {
+  let tok = bytes_concat(b"tok", ascii_of_int(n));
+  bytes_concat_all([
+    b"if (",
+    tok,
+    b" == 0) { ",
+    tok,
+    b" = ply_reset_flat(",
+    name,
+    b"); if (!",
+    tok,
+    b") ",
+    tok,
+    b" = rt_reset_p(ctx, ",
+    name,
+    b"); } else { ply_dec(ctx, ",
+    name,
+    b"); } ",
+    name,
+    b" = 0;",
+  ])
+}
 
 /// `v`, the local holding a counted field of `b`, a record held back, moved into a local of its own
 /// where the read is the `last` of the field or the record: nothing makes the record's word after.
@@ -11478,7 +11435,9 @@ fn answered(emitter: Emitter, value: CValue, answer: Carrier) -> { emitter: Emit
       { emitter: release_at(b.emitter, 0), expr: b.value.expr }
     },
     Fields(fs) -> {
-      let bound = handed_record(emitter, value, fs);
+      // A record never made is made in the cells of one this body let go, where it has them, so
+      // the caller is handed a word to keep rather than making one.
+      let bound = handed_record(made(emitter, value.expr, false, false), value, fs);
       let written = fold(range(1, len(bound.names)), bound.emitter, |acc: Emitter, k: Int|
         line(
           acc,
