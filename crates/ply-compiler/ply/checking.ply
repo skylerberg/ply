@@ -22,7 +22,7 @@ import exports (Entry, Exports, HashEntry, Hashes, Placed, InRoot, InPackage, Sh
                 hashes_bin, placed_bin, mention_bin, owner_read_bin, module_scope, owner_reads,
                 owner_mentions, owner_groups, group_needs, group_source_from, entry_head,
                 mention_key, unplaced_imports, laid_items, checked_owner, needed_through, head_of,
-                reaching)
+                Reach, called_of, of_any, reaching)
 import owned
 import types (tables_joined)
 import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, ShippedData, Rows,
@@ -1099,30 +1099,46 @@ pub fn whole_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let named = decoded(input, named_bin(), "a module's name");
   let read = owners_read(named);
   if read.found {
-    fold(read.wanted, (), |_: Unit, m: Mention| {
-      memo.head(
-        entry_query(),
-        bin::encode(
-          {
-            module: m.module,
-            shipped: shipped_for(named.shipped, m.module),
-            tested: false,
-            name: m.name,
-          },
-          entry_named_bin(),
-        ),
-      );
-      ()
-    });
+    let called = fold(read.wanted, [], |acc: List<Bytes>, m: Mention|
+      if m.module == b"" { push(acc, m.name) } else { acc });
+    fold(concat(read.wanted, called_of(read.context.present, called)), (), |_: Unit, m: Mention|
+      if m.module == b"" { () } else {
+        memo.head(
+          entry_query(),
+          bin::encode(
+            {
+              module: m.module,
+              shipped: shipped_for(named.shipped, m.module),
+              tested: false,
+              name: m.name,
+            },
+            entry_named_bin(),
+          ),
+        );
+        ()
+      });
     offered_whole(named, read, groups_named(named, read), false);
     ()
   };
   b""
 }
 
+/// `modules` and each module the entries `found`, each encoded, hold an entry of; `modules` alone
+/// for a walk whose texts call nothing on a value.
+fn held_by(
+  modules: List<Bytes>,
+  called: List<Bytes>,
+  found: List<Bytes>,
+) -> List<Bytes> / {abort.raise} =
+  if len(called) == 0 { modules } else {
+    fold(found, modules, |acc: List<Bytes>, b: Bytes|
+      if bytes_len(b) == 0 { acc } else { concat(acc, entry_head(b).reach.modules) })
+  }
+
 /// What a check of the group `asked` stands on, read without checking it: what a group whose answer
 /// a check of its whole module offered reads. Each entry it names carries the digest of all the
-/// entry reaches, so the entries those name are not read.
+/// entry reaches, so the entries those name are not read: only the functions the group calls on a
+/// value, of each module those entries hold one of.
 fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
   let named = { module: asked.module, shipped: asked.shipped, tested: asked.tested };
   memo.ask(setting_query(), bin::encode(named, named_bin()));
@@ -1139,31 +1155,55 @@ fn group_reads_of(asked: GroupNamed) -> Unit / {memo.read, abort.raise} = {
     });
   let mentions = fold(asked.owners, selected, |acc: List<Mention>, o: Bytes|
     concat(acc, owner_facts(named, o).mentions));
-  let modules = fold(mentions, map_new(), |acc: Map<Bytes, Bool>, m: Mention|
-    if m.module == asked.module {
-      if !contains(asked.owners, m.name) {
-        fold(declared_of(m.module, asked.shipped, asked.tested, m.name), (), |_: Unit, o: Bytes|
-          if !contains(asked.owners, o) {
-            memo.ask(
-              owner_entry_query(),
-              bin::encode(
-                { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
-                owner_named_bin(),
-              ),
-            );
-            ()
+  let called = fold(mentions, [], |acc: List<Bytes>, m: Mention|
+    if m.module == b"" && !contains(acc, m.name) { push(acc, m.name) } else { acc });
+  let read = fold(
+    mentions,
+    { modules: map_new(), held: [] },
+    |acc: { modules: Map<Bytes, Bool>, held: List<Bytes> }, m: Mention|
+      if m.module == b"" || (m.module == asked.module && contains(asked.owners, m.name)) { acc }
+      else if m.module == asked.module {
+        fold(
+          declared_of(m.module, asked.shipped, asked.tested, m.name),
+          acc,
+          |a: { modules: Map<Bytes, Bool>, held: List<Bytes> }, o: Bytes|
+            if contains(asked.owners, o) { a } else {
+              let b = memo.ask(
+                owner_entry_query(),
+                bin::encode(
+                  { module: m.module, shipped: asked.shipped, tested: asked.tested, owner: o },
+                  owner_named_bin(),
+                ),
+              );
+              { ..a, held: held_by(a.held, called, [b]) }
+            },
+        )
+      } else {
+        let found = entry_bytes_of(asked.shipped, m.module, m.name);
+        if len(found) == 0 && !contains(targets, m.module) {
+          entry_bytes_of(asked.shipped, m.module, b"");
+          ()
+        };
+        { modules: map_insert(acc.modules, m.module, true), held: held_by(acc.held, called, found) }
+      },
+  );
+  places_of(asked.shipped, map_keys(read.modules));
+  // Its own module's it names as any other mention.
+  iterate(
+    { seen: [asked.module], work: read.held },
+    1000000,
+    |s: { seen: List<Bytes>, work: List<Bytes> }|
+      match s.work {
+        [] -> Stop(()),
+        [m, ..rest] -> if contains(s.seen, m) { Continue({ ..s, work: rest }) } else {
+          Continue({
+            seen: push(s.seen, m),
+            work: fold(called, rest, |w: List<Bytes>, n: Bytes|
+              held_by(w, called, entry_bytes_of(asked.shipped, m, of_any(n)))),
           })
-      };
-      acc
-    } else {
-      if len(entry_bytes_of(asked.shipped, m.module, m.name)) == 0 && !contains(targets, m.module) {
-        entry_bytes_of(asked.shipped, m.module, b"");
-        ()
-      };
-      map_insert(acc, m.module, true)
-    });
-  places_of(asked.shipped, map_keys(modules));
-  ()
+        },
+      },
+  )
 }
 
 /// What a check of a group of owners reads: the entries it needs, by module and owner, where each
@@ -1292,30 +1332,44 @@ pub fn owner_entry_answer(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 
 /// A walk of what an entry reaches: the entries of its own group it reaches, by owner and each
 /// encoded, and the digest each other entry it names reaches, or whether a module it names that
-/// declares nothing so named declares anything at all.
+/// declares nothing so named declares anything at all; the names its texts call on a value, and the
+/// modules it holds an entry of, which answer them.
 type Reached = {
   local: Map<Bytes, Bytes>,
   outside: Map<Bytes, Bytes>,
   seen: Map<Bytes, Bool>,
   work: List<Mention>,
+  called: List<Bytes>,
+  modules: List<Bytes>,
 }
 
-/// The digest of every entry `alone`, the entry of `asked` in the group `g` whose answer shows
-/// `shown`, reaches through what it mentions, and of where its module stands: those of its own group
-/// as the answer shows them, and each other one by its own `reach`. An edit moves it exactly where it
-/// moves one of those entries, so a check that reads an entry need not read what the entry reaches.
+/// `r` holding an entry of each of `modules`: one it held none of is read for each name its texts
+/// call on a value.
+fn holding(r: Reached, modules: List<Bytes>) -> Reached =
+  fold(modules, r, |acc: Reached, m: Bytes|
+    if contains(acc.modules, m) { acc } else {
+      { ..acc, modules: push(acc.modules, m), work: concat(acc.work, called_of([m], acc.called)) }
+    })
+
+/// What `alone`, the entry of `asked` in the group `g` whose answer shows `shown`, reaches through
+/// what it mentions: the digest of every entry there and of where its module stands, those of its
+/// own group as the answer shows them and each other one by its own `reach`, and the modules that
+/// hold one. An edit moves the digest exactly where it moves one of those entries, so a check that
+/// reads an entry need not read what the entry reaches.
 fn reach_of(
   asked: OwnerNamed,
   g: GroupNamed,
   alone: Bytes,
   shown: Map<Bytes, Bytes>,
-) -> Bytes / {memo.read, abort.raise} = {
+) -> Reach / {memo.read, abort.raise} = {
   let walked = iterate(
     {
       local: map_insert(map_new(), asked.owner, alone),
       outside: map_new(),
       seen: map_new(),
       work: entry_head(alone).mentions,
+      called: [],
+      modules: [asked.module],
     },
     1000000,
     |s: Reached|
@@ -1324,7 +1378,13 @@ fn reach_of(
         [m, ..rest] -> if map_contains(s.seen, mention_key(m)) { Continue({ ..s, work: rest }) }
         else {
           let at = { ..s, seen: map_insert(s.seen, mention_key(m), true), work: rest };
-          Continue(if m.module == asked.module {
+          Continue(if m.module == b"" {
+            {
+              ..at,
+              called: push(at.called, m.name),
+              work: concat(at.work, called_of(at.modules, [m.name])),
+            }
+          } else if m.module == asked.module {
             fold(
               declared_of(m.module, asked.shipped, asked.tested, m.name),
               at,
@@ -1348,8 +1408,13 @@ fn reach_of(
                       owner_named_bin(),
                     ),
                   );
-                  if bytes_len(b) == 0 { acc }
-                  else { { ..acc, outside: map_insert(acc.outside, o, entry_head(b).reach) } }
+                  if bytes_len(b) == 0 { acc } else {
+                    let reach = entry_head(b).reach;
+                    holding(
+                      { ..acc, outside: map_insert(acc.outside, o, reach.digest) },
+                      reach.modules,
+                    )
+                  }
                 },
             )
           } else {
@@ -1364,31 +1429,38 @@ fn reach_of(
             } else {
               fold(found, at, |acc: Reached, b: Bytes| {
                 let h = entry_head(b);
-                {
-                  ..acc,
-                  outside: map_insert(
-                    acc.outside,
-                    bytes_concat_all([m.module, b".", h.owner]),
-                    h.reach,
-                  ),
-                }
+                holding(
+                  {
+                    ..acc,
+                    outside: map_insert(
+                      acc.outside,
+                      bytes_concat_all([m.module, b".", h.owner]),
+                      h.reach.digest,
+                    ),
+                  },
+                  push(h.reach.modules, m.module),
+                )
               })
             }
           })
         },
       },
   );
-  blake3(
-    bin::encode(
-      [
-        if asked.shipped { b"" }
-        else { bin::encode(placed_by(placing_of(asked.module)), placed_bin()) },
-        bin::encode(walked.local, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
-        bin::encode(walked.outside, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
-      ],
-      bin::list_bin(bin::bytes_bin()),
+  {
+    digest: blake3(
+      bin::encode(
+        [
+          if asked.shipped { b"" }
+          else { bin::encode(placed_by(placing_of(asked.module)), placed_bin()) },
+          bin::encode(walked.local, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
+          bin::encode(walked.outside, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
+        ],
+        bin::list_bin(bin::bytes_bin()),
+      ),
     ),
-  )
+    modules: sort_by(walked.modules, |a: Bytes, b: Bytes|
+      match compare_values(a, b) { Greater -> false, _ -> true }),
+  }
 }
 
 /// The entry an owner shows what reads it, read as `OwnerNamed` says: none for a test, a law, or an
@@ -4336,6 +4408,84 @@ test "a signature edit checks the definitions that read it again, and no other" 
   ]);
   assert_eq(ran_of(warm.run, module_query()), 2);
   assert_eq(said(warm.outcome), said(analyse(parse_all(layered(widened)))))
+}
+
+/// A type with a function of its own, a module that answers a value of it, and `app`, which
+/// imports that module alone.
+fn shaped(shapes: Bytes, app: Bytes) -> List<Source> =
+  [
+    { name: b"shapes", src: shapes },
+    { name: b"made", src: b"import shapes (Shape, Square)\npub fn made() -> Shape = Square(2)\n" },
+    { name: b"app", src: app },
+  ]
+
+fn shapes_src() -> Bytes =
+  b"pub type Shape = | Square(Int)\npub fn Shape::area(s: Shape) -> Int = match s { Square(n) -> n * n }\n"
+
+fn grown_src() -> Bytes =
+  b"pub fn Shape::grown(s: Shape, by: Int) -> Shape = match s { Square(n) -> Square(n + by) }\n"
+
+fn sized_src() -> Bytes =
+  b"import made\npub fn size() -> Int = made::made().area()\n\npub fn two() -> Int = len([made::made(), made::made()])\n"
+
+test "a function added to a type checks itself alone, and one re-signed the definitions that call it on a value" {
+  let cold = answered_over(nothing_held(), shaped(shapes_src(), sized_src()));
+  let added = answered_over(
+    cold.held,
+    shaped(bytes_concat(shapes_src(), grown_src()), sized_src()),
+  );
+  assert_eq(groups_ran(added.run, group_query()), [group_in(b"shapes", [b"Shape::grown"])]);
+  let resigned = edited(
+    shaped(bytes_concat(shapes_src(), grown_src()), sized_src()),
+    b"shapes",
+    b"area(s: Shape) -> Int = match s",
+    b"area(of: Shape) -> Int = match of",
+  );
+  let warm = answered_over(added.held, resigned);
+  assert_eq(groups_ran(warm.run, group_query()), [
+    group_in(b"shapes", [b"Shape::area"]),
+    group_in(b"app", [b"size"]),
+  ]);
+  assert_eq(said(warm.outcome), said(analyse(parse_all(resigned))));
+  assert(match warm.outcome { Analysed(_) -> true, Refused(_) -> false })
+}
+
+test "a call on a value leaves an answer through the store the fresh one as its type's functions come, change and go" {
+  let s0 = shaped(shapes_src(), sized_src());
+  let s1 = edited(s0, b"shapes", b"Square(n) -> n * n", b"Square(n) -> n * n + 0");
+  let s2 = edited(
+    s1,
+    b"shapes",
+    b"area(s: Shape) -> Int = match s",
+    b"area(of: Shape) -> Int = match of",
+  );
+  let s3 = edited(s2, b"app", b"made::made().area()", b"made::made().grown(1).area()");
+  let s4 = edited(
+    s3,
+    b"shapes",
+    b"pub fn Shape::area",
+    bytes_concat(grown_src(), b"pub fn Shape::area"),
+  );
+  let s5 = edited(s4, b"shapes", b"by: Int) -> Shape", b"by: Int) -> Int");
+  let s6 = with_module(
+    s4,
+    b"named",
+    b"import shapes (Shape, Square)\npub fn unit() -> Int = Shape::area(Shape::grown(Square(0), 1))\n",
+  );
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a body edit to a type's function", s1),
+      step(b"a type's function re-signed", s2),
+      step(b"a call of a function its type has not", s3),
+      step(b"the function added", s4),
+      step(b"the function answering another type", s5),
+      step(b"a module naming the functions through the type", s6),
+      step(b"the function gone again", edited(s6, b"shapes", grown_src(), b"")),
+      step(b"unchanged", edited(s6, b"shapes", grown_src(), b"")),
+    ]),
+    [],
+  )
 }
 
 fn tables_of(

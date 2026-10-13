@@ -16,7 +16,7 @@ import pkg (PackageSources, Supplied, Judged)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet, IExtern,
               IInstance, INumeric, TDSum, ImportDecl, IModule, IAlias, INames, VariantDef, OpDef,
               Derived, DRow, parse, header, is_written, item_span, import_decl_bin, owner_of,
-              item_owner)
+              item_owner, member_of, member_name)
 import fmt (printed_alone)
 import exprs (EBlock, expr_span)
 import hash (Fixed, Fixing, NodeRef, Index, HashOutput, fixed_nodes, fixing_of, module_forms,
@@ -31,19 +31,34 @@ import infer (DefInfo, Raise)
 import types (canonical_scheme, Scheme)
 
 /// A name another module's text says: `name` is declared by `module`, or every name it declares
-/// where `name` is empty.
+/// where `name` is empty. Under no module it is a name a text calls on a value, which a function of
+/// the value's type answers: a walk reads it of each module it takes an entry of ([`called_of`]).
 pub type Mention = { module: Bytes, name: Bytes }
 
-/// The items of one owner as an importer reads them: `reach` the digest of every entry its text
-/// reaches through what it mentions, its own among them, where the memo store answers it (empty
-/// elsewhere); `mentions` what their text names, `text` each printed alone, `imports` each import of
+/// The name a module declares each function `name` of a type of its own under, beside the
+/// function's own.
+pub fn of_any(name: Bytes) -> Bytes = bytes_concat(b"::", name)
+
+/// What a walk whose texts call each of `names` on a value reads of each of `modules`.
+pub fn called_of(modules: List<Bytes>, names: List<Bytes>) -> List<Mention> =
+  fold(modules, [], |acc: List<Mention>, m: Bytes|
+    fold(names, acc, |a: List<Mention>, n: Bytes| push(a, { module: m, name: of_any(n) })))
+
+/// What an entry reaches through what it mentions, its own among them: the digest of every entry
+/// there, and the modules that hold one.
+pub type Reach = { digest: Bytes, modules: List<Bytes> }
+
+pub fn no_reach() -> Reach = { digest: b"", modules: [] }
+
+/// The items of one owner as an importer reads them: `reach` what its text reaches, where the memo
+/// store answers it (nothing elsewhere); `mentions` what their text names, `text` each printed alone, `imports` each import of
 /// the module that text needs, placed nowhere, and `rows` and `fixed` what its functions' checks and
 /// hashing published, which an importer takes in place of the bodies `text` leaves out. A `derive`
 /// is in `text` as the functions it generates, their bodies left out like any other, so no reader
 /// of the entry expands it; a `derive row` stays a statement, which says the shape a statement run
 /// against the type reads. Its encoding starts with an [`EntryHead`].
 pub type Entry = {
-  reach: Bytes,
+  reach: Reach,
   owner: Bytes,
   mentions: List<Mention>,
   text: Bytes,
@@ -53,8 +68,9 @@ pub type Entry = {
 }
 
 /// What a walk of the entries a check needs reads of one: its owner and what it names.
-pub type EntryHead = { reach: Bytes, owner: Bytes, mentions: List<Mention> }
+pub type EntryHead = { reach: Reach, owner: Bytes, mentions: List<Mention> }
 
+derive bin for Reach
 derive bin for EntryHead
 
 /// The head of the entry `b` encodes, read without the rest of it.
@@ -65,9 +81,9 @@ pub fn entry_head(b: Bytes) -> EntryHead / {abort.raise} =
   }
 
 /// The entry `b` encodes with `reach` for what it reaches, the rest of it as it is written.
-pub fn reaching(b: Bytes, reach: Bytes) -> Bytes / {abort.raise} =
-  match bin::take_bytes(b, 0) {
-    Ok(t) -> bytes_concat(bin::encode(reach, bin::bytes_bin()), bytes_slice(b, t.at, bytes_len(b))),
+pub fn reaching(b: Bytes, reach: Reach) -> Bytes / {abort.raise} =
+  match reach_bin().take(b, 0) {
+    Ok(t) -> bytes_concat(bin::encode(reach, reach_bin()), bytes_slice(b, t.at, bytes_len(b))),
     Err(_) -> panic("an entry's bytes hold no head"),
   }
 
@@ -205,11 +221,48 @@ fn tags(tokens: List<Token>, i: Int) -> Bool =
     _ -> false,
   }
 
+/// Each name `tokens` write where a binding of it can stand: not after a dot or a `::`, and not
+/// before a dot. Every pattern writes the names it binds so.
+fn standing(tokens: List<Token>) -> Map<Bytes, Bool> =
+  fold(range(0, len(tokens)), map_new(), |acc: Map<Bytes, Bool>, i: Int|
+    match ident_at(tokens, i) {
+      Some(n) -> if punct_at(tokens, i - 1, b"dot") || punct_at(tokens, i - 1, b"coloncolon")
+          || punct_at(tokens, i + 1, b"dot") { acc }
+      else { map_insert(acc, n, true) },
+      None -> acc,
+    })
+
+/// Whether the name at `i`, written after a dot, is called on a value: its arguments or its labels
+/// follow, and what it is written on is no bare name, or one of `bound`, which the text binds. A
+/// bare name a text never binds is an effect there, and the call a perform.
+fn called_on_value(tokens: List<Token>, bound: Map<Bytes, Bool>, i: Int) -> Bool =
+  (punct_at(tokens, i + 1, b"lparen") || punct_at(tokens, i + 1, b"lbracket"))
+    && (match ident_at(tokens, i - 2) {
+      None -> true,
+      Some(base) ->
+        punct_at(tokens, i - 3, b"dot")
+          || (!punct_at(tokens, i - 3, b"coloncolon") && map_contains(bound, base)),
+    })
+
+/// The function `name` of the type written `of`, and the type: of the module itself where it
+/// declares `of`, and of each module a selection names `of` from.
+fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
+  let homes = concat(
+    if map_contains(scope.owners, of) { [scope.module] } else { [] },
+    match map_get(scope.selected, of) { Some(ms) -> ms, None -> [] },
+  );
+  fold(homes, [], |acc: List<Mention>, m: Bytes|
+    push(push(acc, { module: m, name: of }), { module: m, name: member_name(of, name) }))
+}
+
 /// What `text` names of other items, read off its tokens: a name after an import's binder and `::`
-/// is that module's, and a bare name the module selected or declares is the selected or declared
-/// one. It reads more than the text means wherever a local binder shares a declared name, never less.
+/// is that module's, one after a type and `::` that type's function, one called on a value a
+/// function of whichever type the value has, and a bare name the module selected or declares is the
+/// selected or declared one. It reads more than the text means wherever a local binder shares a
+/// declared name, never less.
 fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
   let tokens = lex(text).tokens;
+  let bound = standing(tokens);
   fold(range(0, len(tokens)), [], |acc: List<Mention>, i: Int|
     match ident_at(tokens, i) {
       None -> acc,
@@ -217,12 +270,18 @@ fn mentioned(scope: Scope, text: Bytes) -> List<Mention> / {abort.raise} = {
         match ident_at(tokens, i - 2) {
           Some(b) -> match map_get(scope.binders, b) {
             Some(m) -> push(acc, { module: m, name: n }),
-            None -> acc,
+            None -> concat(acc, of_type(scope, b, n)),
           },
           None -> acc,
         }
-      } else if punct_at(tokens, i - 1, b"dot") || punct_at(tokens, i + 1, b"coloncolon") { acc }
-      else if tags(tokens, i) {
+      } else if punct_at(tokens, i - 1, b"dot") {
+        if !called_on_value(tokens, bound, i) { acc } else {
+          let any = push(acc, { module: b"", name: n });
+          if map_contains(scope.owners, of_any(n)) {
+            push(any, { module: scope.module, name: of_any(n) })
+          } else { any }
+        }
+      } else if punct_at(tokens, i + 1, b"coloncolon") { acc } else if tags(tokens, i) {
         match map_get(scope.binders, n) {
           Some(m) ->
             concat(acc, map([b"literal", b"compile", b"fill"], |f: Bytes| { module: m, name: f })),
@@ -378,6 +437,18 @@ fn owners_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> = {
     listed_under(acc, f, o))
 }
 
+/// [`owners_in`], with each function of a type also under [`of_any`] of its name there, which a
+/// call on a value reads it by.
+fn named_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  fold(raw.items, owners_in(raw, parsed), |acc: Map<Bytes, List<Bytes>>, item: Item|
+    match item {
+      IFn(d) -> match member_of(d.name.name) {
+        Some(m) -> listed_under(acc, of_any(m.member), d.name.name),
+        None -> acc,
+      },
+      _ -> acc,
+    })
+
 /// The functions an expansion generated into `parsed`, which `raw` does not write, by owner.
 fn generated_by_owner(
   raw: Module,
@@ -440,7 +511,7 @@ fn scopes(
   raw: Module,
   targets: List<Bytes>,
 ) -> { written: Scope, expanded: Scope } / {abort.raise} = {
-  let owners = owners_in(raw, parsed);
+  let owners = named_in(raw, parsed);
   let added = map(drop(parsed.module.imports, len(raw.imports)), dotted);
   {
     written: scope_of(parsed.name, raw.imports, targets, owners),
@@ -482,7 +553,7 @@ pub fn exports_of(
   let parsed = at(analysis.mods, i);
   let module = parsed.name;
   let raw = match read { Some(r) -> r, None -> parse(text).node };
-  let owners = owners_in(raw, parsed);
+  let owners = named_in(raw, parsed);
   let fns = fn_owners(raw, parsed);
   let targets = import_targets(analysis, i);
   let sc = scopes(parsed, raw, targets);
@@ -539,7 +610,7 @@ pub fn exports_of(
       );
       let runtimes = runtimes_of(its);
       map_insert(acc, o, {
-        reach: b"",
+        reach: no_reach(),
         owner: o,
         text: printed,
         imports: map(
@@ -654,6 +725,16 @@ pub fn needed_by<| e>(
 ) -> Map<Bytes, Map<Bytes, Entry>> / {abort.raise | e} =
   needed_through(entries, head_of, wanted, imported, |_: Bytes, _: Bytes| [])
 
+/// A walk of the entries a check needs: those found, by module and owner, each mention asked, the
+/// names its texts call on a value and the modules it has taken an entry of, which answer them.
+type Needs<x> = {
+  out: Map<Bytes, Map<Bytes, x>>,
+  asked: Map<Bytes, Bool>,
+  work: List<Mention>,
+  called: List<Bytes>,
+  read: List<Bytes>,
+}
+
 /// [`needed_by`] over entries held as `head` reads them, each kept as `entries` answered it, also
 /// following what `publishing` says a module publishes for an owner of it (an `opaque` type's
 /// functions, which a check followed to say why it refuses).
@@ -670,13 +751,22 @@ pub fn needed_through<x | e>(
         map_insert(acc, m, map_new())),
       asked: map_new(),
       work: wanted,
+      called: [],
+      read: [],
     },
     1000000,
-    |s: { out: Map<Bytes, Map<Bytes, x>>, asked: Map<Bytes, Bool>, work: List<Mention> }|
+    |s: Needs<x>|
       match s.work {
         [] -> Stop(s.out),
         [m, ..rest] -> if map_contains(s.asked, mention_key(m)) { Continue({ ..s, work: rest }) }
-        else {
+        else if m.module == b"" {
+          Continue({
+            ..s,
+            asked: map_insert(s.asked, mention_key(m), true),
+            work: concat(rest, called_of(s.read, [m.name])),
+            called: push(s.called, m.name),
+          })
+        } else {
           let have = match map_get(s.out, m.module) { Some(h) -> h, None -> map_new() };
           let fresh = fold(
             entries(m.module, m.name),
@@ -689,12 +779,14 @@ pub fn needed_through<x | e>(
           let asked = map_insert(s.asked, mention_key(m), true);
           if len(fresh) == 0 {
             Continue({
+              ..s,
               out: if map_contains(s.out, m.module) || len(entries(m.module, b"")) == 0 { s.out }
               else { map_insert(s.out, m.module, have) },
               asked: asked,
               work: rest,
             })
           } else {
+            let first = !contains(s.read, m.module);
             Continue({
               out: map_insert(
                 s.out,
@@ -703,8 +795,14 @@ pub fn needed_through<x | e>(
                   map_insert(h, f.head.owner, f.x)),
               ),
               asked: asked,
-              work: fold(fresh, rest, |w: List<Mention>, f: { head: EntryHead, x: x }|
-                concat(w, concat(f.head.mentions, publishing(m.module, f.head.owner)))),
+              work: fold(
+                fresh,
+                if first { concat(rest, called_of([m.module], s.called)) } else { rest },
+                |w: List<Mention>, f: { head: EntryHead, x: x }|
+                  concat(w, concat(f.head.mentions, publishing(m.module, f.head.owner))),
+              ),
+              called: s.called,
+              read: if first { push(s.read, m.module) } else { s.read },
             })
           }
         },
@@ -1144,7 +1242,7 @@ pub fn group_source_from(
     b"",
     merged_imports(
       push(held, {
-        reach: b"",
+        reach: no_reach(),
         owner: b"",
         text: own,
         imports: map(imported, |x: Imported| x.decl),
@@ -1489,9 +1587,64 @@ test "an entry's head reads back from its bytes alone, and its reach is written 
   for_all(entries, |e: Entry| {
     let b = bin::encode(e, entry_bin());
     assert_eq(entry_head(b), head_of(e));
-    assert_eq(reaching(b, b"reached"), bin::encode({ ..e, reach: b"reached" }, entry_bin()))
+    let reached = { digest: b"reached", modules: [b"core", b"shop"] };
+    assert_eq(reaching(b, reached), bin::encode({ ..e, reach: reached }, entry_bin()))
   })
 }
 
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
   fold(xs, (), |_: Unit, x: a| f(x))
+
+/// What `text` mentions, each as its module and its name, in a module `here` that binds `lib`,
+/// selects `Shape` from `shapes`, and declares `Stack`, `Stack::push` and `depth`.
+fn said_in(text: Bytes) -> List<Bytes> / {abort.raise} =
+  map(
+    distinct(
+      mentioned(
+        {
+          module: b"here",
+          binders: map_insert(map_new(), b"lib", b"deep.lib"),
+          selected: map_insert(map_new(), b"Shape", [b"shapes"]),
+          owners: fold(
+            [b"Stack", b"::push", b"depth"],
+            map_new(),
+            |acc: Map<Bytes, List<Bytes>>, n: Bytes| map_insert(acc, n, [n]),
+          ),
+        },
+        text,
+      ),
+    ),
+    |m: Mention| bytes_concat_all([m.module, b" ", m.name]),
+  )
+
+test "a call on a value is mentioned by its name alone, a function of a type with its type, and a perform not at all" {
+  assert_eq(
+    said_in(
+      b"fn f(xs: Stack) -> Int / {abort.raise} = { abort.raise(1); xs.push(2).depth() + lib::made().area() }",
+    ),
+    [b" area", b" depth", b" push", b"deep.lib made", b"here ::push", b"here Stack"],
+  );
+  assert_eq(said_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
+    b" area",
+    b"here Stack",
+    b"here Stack::depth",
+    b"here Stack::new",
+    b"shapes Shape",
+    b"shapes Shape::unit",
+  ])
+}
+
+test "a name a text binds, however it binds it, is one it may call on" {
+  for_all(
+    [
+      b"fn f(x: T) -> Int = x.go()",
+      b"fn f() -> Int = { let x = make(); x.go() }",
+      b"fn f(xs: List<T>) -> List<Int> = map(xs, |x| x.go())",
+      b"fn f(o: Option<T>) -> Int = match o { Some(x) -> x.go(), None -> 0 }",
+      b"fn f(p: P) -> Int = { let { x } = p; x.go() }",
+      b"fn f(l: List<T>) -> Int = match l { [x, ..rest] -> x.go[r](), [] -> 0 }",
+    ],
+    |text: Bytes| assert_eq(said_in(text), [b" go"]),
+  );
+  assert_eq(said_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b"deep.lib x"])
+}
