@@ -34,11 +34,10 @@ of it next.
 | `crates/ply-registry` | the package registry `ply publish` and `ply resolve` talk to, as Ply source in `ply/`; not a cargo crate |
 | `crates/ply-launcher` | what enters a native program: its pack read, its roots and hosts lent, its entry called |
 | `crates/ply-native` | the runtime's static library a native program, `ply` among them, is linked with |
-| `crates/ply-corpus` | the benchmark corpus as a Ply program (`ply/`), the checks that run it end to end (`checks/`) and the programs it measures (`fixtures/`); not a cargo crate |
+| `crates/ply-std-tests` | the standard library's tests that read fixture files, as Ply source in `ply/` beside the files; not a cargo crate |
 | `crates/<crate>-tests` | that crate's tests |
 | `editors/` | the tree-sitter grammar editors read |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
-| `benches/` | benchmark scripts and their recorded output |
 | `probes/` | standalone C probes, each run by a CI job |
 | `.github/` | CI: `workflows/ci.yml`, the job tables in `ci-shards.sh`, and `ci-timings.sh` to read a run |
 
@@ -61,9 +60,8 @@ last release (`scripts/stage0.sh`). Cargo builds nothing after an edit to Ply so
 
 CI builds one `cargo nextest archive --locked --workspace` and runs it in shards.
 The Ply tests run as the runs `.github/ci-shards.sh` lists, each one `ply test` or `ply prove` of a
-package in a `corpus` job: the library's tests and its proofs, the corpus's checks
-(`crates/ply-corpus/checks`), the CLI's suite in parts, and the packages' own suites.
-`.github/ci-corpus.sh run <id>` runs one with the grants CI passes.
+package in a `runs` job: the library's tests and its proofs, the CLI's suite in parts, and the
+packages' own suites. `.github/ci-ply.sh run <id>` runs one with the grants CI passes.
 The postgres tests in `ply-host-tests` skip unless `PLY_PG_URL` and `PLY_TEST_DB`
 name a server.
 

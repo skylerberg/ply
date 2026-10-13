@@ -1,71 +1,67 @@
 #!/usr/bin/env bash
-# The Ply runs (`ci-shards.sh`'s), each one `ply test` of a package: over the corpus with the grants
-# `benches/corpus.sh` gives the program, over the CLI's suite with the grants its harness drives `ply`
-# with, from a scratch directory of the run's own, or a package's own suite as `ply test` runs it;
-# the proof runs, the standard library's (`proofs`) and each package's (`laws-<id>`), are a
+# The Ply runs (`ci-shards.sh`'s), each one `ply test` of a package: over the CLI's suite with the
+# grants its harness drives `ply` with, from a scratch directory of the run's own, over the standard
+# library's tests with every shipped module's beside them, or a package's own suite as `ply test`
+# runs it; the proof runs, the standard library's (`proofs`) and each package's (`laws-<id>`), are a
 # `ply prove` each. A run fails when a test fails or a claim does not hold, when the run refuses, and
 # when it selects no test or proves no claim, so a renamed test never stops being run quietly; a part
 # of the CLI's suite takes the tests whose keys hash to it, which may be none. It fails too when its
 # load ran a body again because a store had lost the answer its record names, which is a run made
 # cold by a defect and not by an edit.
 #
-#   ci-corpus.sh run ID [ARG...]
+#   ci-ply.sh run ID [ARG...]
 #       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
-#       of the corpus's checks (`<module>`) or of the CLI's suite (`cli-<module>`), with ARGs added
-#       to each `ply test` or `ply prove`. Every `ply` is stopped at PLY_CI_DEADLINE, the epoch
-#       second the job set its runs to end by, and none starts after it: the job then fails naming
-#       the run it stopped and the ones it never started, and the steps after it still keep what the
-#       runs wrote, so a re-run starts from there rather than cold.
-#   ci-corpus.sh nightly [MODULE...] [ARG...]
+#       of the CLI's suite (`cli-<module>`), with ARGs added to each `ply test` or `ply prove`. Every
+#       `ply` is stopped at PLY_CI_DEADLINE, the epoch second the job set its runs to end by, and
+#       none starts after it: the job then fails naming the run it stopped and the ones it never
+#       started, and the steps after it still keep what the runs wrote, so a re-run starts from
+#       there rather than cold.
+#   ci-ply.sh nightly [MODULE...] [ARG...]
 #       the modules of the CLI's suite no pull request runs (`ci-shards.sh`'s CLI_NIGHTLY), every
 #       MODULE in one `ply test` with the suite's grants and ARGs such as `--shard K/N` or a case's
 #       `--filter` added
-#   ci-corpus.sh mark                  the moment `keep` gathers from
-#   ci-corpus.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
-#                                      since `mark`, into DIR for a later run: a body is keyed by its
-#                                      definition, the emitter and the runtime's sources, and an answer
-#                                      by the emitter and its question, so another tree reuses what
-#                                      still applies. Objects stay out: one compiles from its bodies in
-#                                      seconds. The stages are build-ply's to ship, and the packages'
-#                                      stores are carried apart.
-#   ci-corpus.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
-#   ci-corpus.sh compact               each package's store a run since `mark` opened compacted, and
-#                                      every other removed, before a job saves them: a store only
-#                                      grows, and the job's next run restores what it saves, which is
-#                                      then the stores its own runs use and no other job's
-#   ci-corpus.sh hand FILE             the stores this job keeps, as one file: a pull request's cache
-#                                      reaches no other run, so a run of its toolchain on another
-#                                      branch, main's after the merge most of all, takes them as an
-#                                      artifact
-#   ci-corpus.sh handed NAME           the artifact NAME, which a run of this toolchain packed with
-#                                      `hand`, as this job's stores: unpacked aside and laid only when
-#                                      whole, since a load fails over a store that lost an answer. Sets
-#                                      the step's `found`. Nothing found, or a download that failed,
-#                                      leaves the job to what a cache holds
-#   ci-corpus.sh upstream-mark         the moment `upstream-new` gathers from
-#   ci-corpus.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
-#   ci-corpus.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
+#   ci-ply.sh mark                  the moment `keep` gathers from
+#   ci-ply.sh keep DIR              the bodies and the compiler's answers `ply` emitted or read
+#                                   since `mark`, into DIR for a later run: a body is keyed by its
+#                                   definition, the emitter and the runtime's sources, and an answer
+#                                   by the emitter and its question, so another tree reuses what
+#                                   still applies. Objects stay out: one compiles from its bodies in
+#                                   seconds. The stages are build-ply's to ship, and the packages'
+#                                   stores are carried apart.
+#   ci-ply.sh restore DIR           a kept DIR merged under what `ply` reads, keeping what is there
+#   ci-ply.sh compact               each package's store a run since `mark` opened compacted, and
+#                                   every other removed, before a job saves them: a store only
+#                                   grows, and the job's next run restores what it saves, which is
+#                                   then the stores its own runs use and no other job's
+#   ci-ply.sh hand FILE             the stores this job keeps, as one file: a pull request's cache
+#                                   reaches no other run, so a run of its toolchain on another
+#                                   branch, main's after the merge most of all, takes them as an
+#                                   artifact
+#   ci-ply.sh handed NAME           the artifact NAME, which a run of this toolchain packed with
+#                                   `hand`, as this job's stores: unpacked aside and laid only when
+#                                   whole, since a load fails over a store that lost an answer. Sets
+#                                   the step's `found`. Nothing found, or a download that failed,
+#                                   leaves the job to what a cache holds
+#   ci-ply.sh upstream-mark         the moment `upstream-new` gathers from
+#   ci-ply.sh upstream-new TAR      what this job published to `PLY_CACHE_UPSTREAM` since the mark
+#   ci-ply.sh upstream-merge DIR    every job's TAR under DIR merged, keeping this run's runtimes
 set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ply="$root/target/debug/ply"
 shards="$root/.github/ci-shards.sh"
 cli_suite=crates/ply-cli-tests/ply
-stdlib=crates/ply-corpus/stdlib
+std_tests=crates/ply-std-tests/ply
 TAB=$'\t'
 # The caches `ply` reads, where the workflow restores them.
 caches=/tmp
-mark=$caches/ply-c-corpus.mark
+mark=$caches/ply-c-runs.mark
 upstream=$caches/ply-upstream
 upstream_mark=$caches/ply-upstream.mark
 export PLY_CACHE_UPSTREAM=$upstream
 # `ms<TAB>package<TAB>key` per test this job ran, which the job uploads for the run's table of what
 # each test cost.
 durations=$caches/ply-test-durations.tsv
-
-# What a checks run is given after `ply test PATH`.
-grants=(--host --timeout 900000 --steps 0 --json
-  --exec "ply=$ply" --allow machine --allow claims --allow shipped --allow toolchain --fs work=. --fs "repo=$root")
 
 # The directory holding postgres and its tools, for the CLI suite's tests that start a cluster: the
 # first on PATH, else the newest of Debian's per-version directories, which are off PATH.
@@ -112,7 +108,8 @@ stopped_run() {
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker,
-# and the standard library's fixtures with every shipped module's tests, granted nothing.
+# the standard library's tests with every shipped module's beside them, and any other package as
+# `ply test` runs it, each of those granted nothing.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -121,10 +118,10 @@ tested() {
     touch "$dir/.ply-scratch"
     (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
     rm -rf "$dir"
-  elif [[ $path == "$stdlib" ]]; then
+  elif [[ $path == "$std_tests" ]]; then
     bounded "$ply" test --std "$path" --json "$@" || status=$?
   else
-    bounded "$ply" test "$path" "$@" "${grants[@]}" || status=$?
+    bounded "$ply" test "$path" --json "$@" || status=$?
   fi
   return "$status"
 }
@@ -177,7 +174,7 @@ spent() {
 # the caller's `path`, `picked` and `part`.
 placed() {
   local line rest filter
-  line=$("$shards" corpus-line "$1") || return 2
+  line=$("$shards" run-line "$1") || return 2
   path=${line%%"$TAB"*}
   rest=${line#*"$TAB"}
   part=${rest#*"$TAB"}
@@ -194,13 +191,7 @@ tests_of() {
   placed "$id" || return 2
   out=$(mktemp)
   started=$(date +%s%3N)
-  if [[ $id == package-* || $id == fixture-* ]]; then
-    # A package's own suite and a fixture run as `ply test` runs them: the corpus's grants are for
-    # the corpus.
-    bounded "$ply" test "$path" --json "$@" > "$out" || status=$?
-  else
-    tested "$path" ${picked[@]+"${picked[@]}"} ${part:+--shard "$part"} "$@" > "$out" || status=$?
-  fi
+  tested "$path" ${picked[@]+"${picked[@]}"} ${part:+--shard "$part"} "$@" > "$out" || status=$?
   if ((status == STOPPED)); then
     stopped_run "$started" "$id"
     rm -f "$out"
@@ -279,13 +270,13 @@ disproved() {
 }
 
 marked() {
-  [ -f "$mark" ] || { echo "nothing is marked: run 'ci-corpus.sh mark' before the runs" >&2; return 1; }
+  [ -f "$mark" ] || { echo "nothing is marked: run 'ci-ply.sh mark' before the runs" >&2; return 1; }
 }
 
 # Every directory a run keeps a store under, as the workflow's cache steps list them.
 store_dirs() {
   local dir
-  for dir in "$root"/crates/*/ply "$root"/crates/ply-corpus/checks "$root"/crates/ply-corpus/stdlib "$root"/examples "$root"/tests/lang; do
+  for dir in "$root"/crates/*/ply "$root"/examples "$root"/tests/lang; do
     printf '%s\n' "$dir"
   done
 }
@@ -340,7 +331,7 @@ case "${1:-}" in
       [[ $arg == -* ]] && given=1
       if ((given)); then args+=("$arg"); else args+=(--filter "$arg."); fi
     done
-    [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-corpus.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
+    [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
     tested "$cli_suite" "${args[@]}" > "$out" || status=$?
     listed "$out"
     selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
@@ -420,7 +411,7 @@ case "${1:-}" in
     ;;
   upstream-new)
     tar_out=${2:?a tar file}
-    [ -f "$upstream_mark" ] || { echo "nothing is marked: run 'ci-corpus.sh upstream-mark' first" >&2; exit 2; }
+    [ -f "$upstream_mark" ] || { echo "nothing is marked: run 'ci-ply.sh upstream-mark' first" >&2; exit 2; }
     mkdir -p "$upstream"
     (cd "$upstream" && find . -type f -newer "$upstream_mark" ! -name '*.tmp' -print0 |
       tar --null -T - -cf "$tar_out")
@@ -447,7 +438,7 @@ case "${1:-}" in
     find "$upstream" -type f | wc -l | sed 's/^ */upstream entries kept: /'
     ;;
   *)
-    echo "usage: ci-corpus.sh run ID [ARG...] | nightly [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
+    echo "usage: ci-ply.sh run ID [ARG...] | nightly [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | hand FILE | handed NAME | upstream-mark | upstream-new TAR | upstream-merge DIR" >&2
     exit 2
     ;;
 esac
