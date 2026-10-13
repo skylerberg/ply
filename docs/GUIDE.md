@@ -164,7 +164,8 @@ Each line's words follow the marker and one space; a bare `///` separates
 paragraphs, and the first sentence is the doc's summary. A doc says what the
 signature cannot — what an answer means, when the function raises, units, edge
 cases — and holds no examples: the tests and laws that name a definition are
-its examples, and `ply doc` lists them (§16). A blank line between a doc and its
+its examples, and `ply callers` lists them, as `ply doc` lists the laws (§16). A
+blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
 documents nothing — one inside a body, above an import, a `test`, a `law`, a
 `derive`, a `key`, a `show`, a `gen` or a `numeric`, or at the end of a file, or a `//!` line below
@@ -3104,7 +3105,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into the memo store at `DIR`, which then holds those answers and nothing else, writing only what `DIR` lacks, through the one kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads beside its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules, which are all there is to look in where no package holds the working directory |
+| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name under `std` is the toolchain's, and its page is the same wherever the command runs; any other name the program does not hold is looked up among the builtins, then the standard library, which are all there is to look in where no package holds the working directory. A page is read off what its module answers it documents, kept in the memo store for a project's modules and carried by the binary for the standard library's, so none is parsed to print one |
 | `ply fmt [paths]` | rewrite every `.ply` file under the paths, or under the package the working directory is part of where none is given, in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
@@ -3213,8 +3214,9 @@ what its check said of each definition apart from its outline, and a load reads 
 where its command does: `ply check` reads them for `--types` and `--json` alone. The program is analysed
 whole, each definition taken as its module answered it, only for what is read from its syntax: a
 `decreases` measure (`E0467`), a `reuse fn` or `returns` promise and `--costs`, a statement a
-call runs, `--verify-deps`, and the commands that read source (`ply doc`, `ply prove`,
-`ply review`).
+call runs, `--verify-deps`, and the commands that read source (`ply prove`, `ply review`).
+What a module documents is an answer of its own, read off its whole text, its check and its
+hashing: `ply doc` asks it of the one module a name is under.
 A load pulls each shipped module its modules' answers say they import, so a module that answers as
 it did pulls as it did, with no text read again to find what it pulls. Nor does the walk parse a
 module to find what it embeds: its check reads each embed, and the memo store notes the files as
