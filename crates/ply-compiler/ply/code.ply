@@ -38,8 +38,7 @@ pub type Node =
   /// One label argument of a call: the field-table entry of a resource named here.
   | NLabel(Bytes)
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
-  /// `at` is where the lambda is written, which names it among its owner's.
-  | NLambda({ params: Int, size: Int, captures: List<Capture>, body: Code, at: Span })
+  | NLambda(Lambda)
   | NSimulate({ size: Int, captures: List<Capture>, body: Code })
   /// Each branch a nullary `NLambda`, which the run calls on whichever thread it chooses. `rooted`
   /// is whether the block is in its definition's own barrier, none of a lambda's, a clause's or a
@@ -50,6 +49,14 @@ pub type Node =
   | NField({ base: Code, field: Bytes })
   /// `{..b, f: e}`, recognised in a plain literal where some field is `b.<its own name>` for one slot variable `b`.
   | NUpdate({ base: Code, copies: List<Bytes>, sets: List<CodeField> })
+  /// A call a specialisation runs in place of calling a function value: the `nth` lambda `owner`
+  /// wrote at the lambda's place, its parameters `args`, its captures read out of the value `func`.
+  /// Only the emitter makes one.
+  | NInlined({ func: Code, args: List<Code>, lambda: Lambda, owner: Bytes, nth: Int })
+
+/// A lambda as its owner lowered it: its parameters, its frame's size, what it copies in, and `at`,
+/// where it is written.
+pub type Lambda = { params: Int, size: Int, captures: List<Capture>, body: Code, at: Span }
 
 pub type CodeField = { name: Bytes, value: Code }
 
@@ -200,6 +207,17 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
         b"app(",
         dump(a.func),
         fold(a.args, b"", |acc: Bytes, code: Code| bytes_concat_all([acc, b",", dump(code)])),
+        b")",
+      ]),
+    NInlined(x) ->
+      bytes_concat_all([
+        b"inlined(",
+        x.owner,
+        b",",
+        dump(x.func),
+        fold(x.args, b"", |acc: Bytes, code: Code| bytes_concat_all([acc, b",", dump(code)])),
+        b",",
+        dump(x.lambda.body),
         b")",
       ]),
     NIf(i) ->
@@ -1553,6 +1571,7 @@ fn reads_in(code: Code, acc: Reads) -> Reads =
     NUnary(u) -> reads_in(u.operand, acc),
     NBinary(b) -> reads_in(b.rhs, reads_in(b.lhs, acc)),
     NApp(a) -> fold(a.args, reads_in(a.func, acc), |x: Reads, arg: Code| reads_in(arg, x)),
+    NInlined(n) -> fold(n.args, reads_in(n.func, acc), |x: Reads, arg: Code| reads_in(arg, x)),
     NIf(i) -> reads_in(i.else_branch, reads_in(i.then_branch, reads_in(i.cond, acc))),
     NBlock(b) -> {
       let stmts = fold(b.stmts, acc, |x: Reads, stmt: CodeStmt|
@@ -1895,6 +1914,18 @@ pub fn mark(c: Code, live: Live, mv: Moves) -> Marked =
         live: fu.live,
       }
     },
+    NInlined(x) -> {
+      let args = mark_seq(x.args, live, mv);
+      let fu = mark(x.func, args.live, mv);
+      {
+        code: {
+          own: Borrowed,
+          span: c.span,
+          node: NInlined({ ..x, func: fu.code, args: args.codes }),
+        },
+        live: fu.live,
+      }
+    },
     NBlock(b) -> {
       let after = match b.tail {
         None -> { code: unit_code(), live: live },
@@ -2025,6 +2056,8 @@ pub fn slots_read(code: Code) -> List<Int> =
     NBinary(b) -> concat(slots_read(b.lhs), slots_read(b.rhs)),
     NField(f) -> slots_read(f.base),
     NApp(a) -> concat(slots_read(a.func), all_read(a.args)),
+    // The lambda's own slots are its frame's; this frame reads the function value and the arguments.
+    NInlined(x) -> concat(slots_read(x.func), all_read(x.args)),
     NIf(i) ->
       concat(slots_read(i.cond), concat(slots_read(i.then_branch), slots_read(i.else_branch))),
     NBlock(b) ->

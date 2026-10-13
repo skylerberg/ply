@@ -8,8 +8,9 @@ import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBy
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, Head, Expect,
              word_head, no_generics, answer_bin, tables_bin, emit_roots_answer, symbol_of, entry_of,
              no_tables, without, literal_bits, specialisation_of, own_definition, digits,
-             ctor_layouts, spelled_field, GenericCall, Generics, Need, specialised, type_spelled,
-             unknown_type, laid_vars, has_vars, held_apart)
+             ctor_layouts, spelled_field, GenericCall, Generics, Need, FnArg, specialised,
+             specialised_with, Pass, root_id, type_spelled, unknown_type, laid_vars, has_vars,
+             held_apart)
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, Linked, ModuleRow, OrdinalRow, analyse,
               dump_of, module_of_root)
 import diagnostics (parse_all)
@@ -526,15 +527,6 @@ fn place(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
   }
 
 // --- Sites ----------------------------------------------------------------------
-
-/// The id a body's failure sites name their root by: a digest of its name, so a body's C does not
-/// depend on which other roots the unit holds. Non-negative, since the C stores it in an `int64_t`.
-pub fn root_id(name: Bytes) -> Int = {
-  let h = blake3(name);
-  let low = match u32_at(h, 0) { Some(v) -> v, None -> 0 };
-  let high = match u32_at(h, 4) { Some(v) -> v, None -> 0 };
-  high << 31 | low >>> 1
-}
 
 /// The bucket a body compiles in: the top bits of its root id, so it is a function of the name
 /// alone and an edit recompiles the one bucket holding the body.
@@ -1154,16 +1146,27 @@ fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort
 
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
-/// what its module embeds, which that text's calls are written out as. `None` for a root with no key
-/// or no place, which is asked again every time.
-/// What a root's answer is a function of: its definition's text, key and embeds, and for a
-/// specialisation the kinds it is at, which its name spells.
+/// what its module embeds, which that text's calls are written out as; for a specialisation, the
+/// kinds it is at and the definitions whose lambdas it runs. `None` for a root with no key or no
+/// place, which is asked again every time.
 fn root_material(program: Program, name: Bytes) -> Option<Bytes> / {abort.raise} =
   match specialisation_of(name) {
-    Some(s) -> match definition_material(program, s.base) {
-      Some(m) -> Some(bytes_concat_all([m, b"\x00", name])),
-      None -> None,
-    },
+    Some(s) ->
+      fold(
+        s.fns,
+        match definition_material(program, s.base) {
+          Some(m) -> Some(bytes_concat_all([m, b"\x00", name])),
+          None -> None,
+        },
+        |acc: Option<Bytes>, f: FnArg|
+          match acc {
+            None -> None,
+            Some(m) -> match definition_material(program, f.owner) {
+              Some(o) -> Some(bytes_concat_all([m, b"\x00", o])),
+              None -> None,
+            },
+          },
+      ),
     None -> definition_material(program, name),
   }
 
@@ -1320,8 +1323,8 @@ fn repacked(
     }
   })
 
-/// What the emitter answers for `missed`: entered once, over the modules those roots are in and the
-/// ones they import.
+/// What the emitter answers for `missed`: entered once, over the modules those roots are in, the
+/// ones whose lambdas they run, and the ones those import.
 fn emitter_answers(
   runtime: Runtime,
   dump: Dump,
@@ -1330,7 +1333,11 @@ fn emitter_answers(
   missed: List<Bytes>,
 ) -> List<RootAnswer> / {abort.raise} = {
   let lowered = fold(missed, map_new(), |acc: Map<Bytes, Bool>, n: Bytes|
-    map_insert(acc, module_of_root(n), true));
+    fold(
+      match specialisation_of(n) { Some(s) -> s.fns, None -> [] },
+      map_insert(acc, module_of_root(n), true),
+      |m: Map<Bytes, Bool>, f: FnArg| map_insert(m, module_of_root(f.owner), true),
+    ));
   let needed = imported(p, map_keys(lowered));
   let placed = filter(range(0, len(p.modules)), |i: Int|
     map_contains(needed, at(p.modules, i).name));
@@ -1727,11 +1734,12 @@ fn closed_rounds<| e>(
   // Only once every generic body is in are the needs closed, so no call settles on a part of them.
   let more = if map_len(named) > 0 { named } else {
     let needs = closed_needs(had.answers);
+    let called = closed_called(had.answers);
     map_fold(had.answers, map_new(), |acc: Map<Bytes, Bool>, _: Bytes, a: Answer|
       match a {
         Body(b) ->
           fold(b.tables.generics.calls, acc, |m: Map<Bytes, Bool>, g: GenericCall| {
-            let root = settled_root(g, needs);
+            let root = settled_root(g, needs, called);
             if map_contains(had.answers, root) { m } else { map_insert(m, root, true) }
           }),
         Refused(_) -> acc,
@@ -1801,6 +1809,34 @@ fn closed_needs(answers: Map<Bytes, Answer>) -> Map<Bytes, List<Need>> / {abort.
   })
 }
 
+/// Each body's parameters it calls as functions, closed over the calls it hands them on to: one
+/// handed on as a parameter its callee calls is called. A tail group's members call none, since a
+/// specialisation of one would leave its group's loop.
+fn closed_called(answers: Map<Bytes, Answer>) -> Map<Bytes, List<Int>> / {abort.raise} = {
+  let bodies = map_fold(answers, map_new(), |acc: Map<Bytes, Generics>, n: Bytes, a: Answer|
+    match a {
+      Body(b) -> if specialisation_of(n) == None && len(b.tables.members) <= 1 {
+        map_insert(acc, n, b.tables.generics)
+      } else { acc },
+      Refused(_) -> acc,
+    });
+  let start = map_fold(bodies, map_new(), |acc: Map<Bytes, List<Int>>, n: Bytes, g: Generics|
+    map_insert(acc, n, g.called));
+  // Each round adds a parameter or stops, and a body has as many to add as it hands on.
+  let most = map_fold(bodies, 1, |acc: Int, _: Bytes, g: Generics| acc + len(g.passes));
+  iterate(start, most, |called: Map<Bytes, List<Int>>| {
+    let next = map_fold(bodies, called, |acc: Map<Bytes, List<Int>>, n: Bytes, g: Generics|
+      fold(g.passes, acc, |a: Map<Bytes, List<Int>>, pass: Pass| {
+        let theirs = match map_get(called, pass.callee) { Some(cs) -> cs, None -> [] };
+        let mine = match map_get(a, n) { Some(cs) -> cs, None -> [] };
+        if contains(theirs, pass.at) && !contains(mine, pass.param) {
+          map_insert(a, n, push(mine, pass.param))
+        } else { a }
+      }));
+    if next == called { Stop(called) } else { Continue(next) }
+  })
+}
+
 /// `needs` with caller `n`'s needs of what `call` hands its callee.
 fn widened(
   acc: Map<Bytes, List<Need>>,
@@ -1831,7 +1867,11 @@ fn widened(
 /// callee's code needs and the call knows, its layout where the code needs that, a scalar where it
 /// does that scalar's operators in C; every other argument left as the callee's generic body has it. A callee in a tail group with
 /// others stays its group's body, whose tail calls loop where a specialisation's would nest.
-fn settled_root(call: GenericCall, needs: Map<Bytes, List<Need>>) -> Bytes / {abort.raise} = {
+fn settled_root(
+  call: GenericCall,
+  needs: Map<Bytes, List<Need>>,
+  called: Map<Bytes, List<Int>>,
+) -> Bytes / {abort.raise} = {
   let ns = match map_get(needs, call.callee) { Some(x) -> x, None -> [] };
   let args = map(range(0, len(call.args)), |j: Int| {
     let arg = match list_at(call.args, j) {
@@ -1844,8 +1884,12 @@ fn settled_root(call: GenericCall, needs: Map<Bytes, List<Need>>) -> Bytes / {ab
     else if contains(ns, { var: j, layout: false }) && held_apart(arg) { arg }
     else { unknown_type() }
   });
-  if fold(args, true, |none: Bool, a: Type| none && a == unknown_type()) { call.callee }
-  else { specialised(call.callee, args) }
+  // A lambda is run in place only by a callee that calls the parameter it is handed as.
+  let calls = match map_get(called, call.callee) { Some(cs) -> cs, None -> [] };
+  let fns = filter(call.fns, |f: FnArg| contains(calls, f.param));
+  if len(fns) == 0 && fold(args, true, |none: Bool, a: Type| none && a == unknown_type()) {
+    call.callee
+  } else { specialised_with(call.callee, args, fns) }
 }
 
 /// `answers` with every generic call settled: each placeholder of a body's C, and of the entries its
@@ -1855,16 +1899,24 @@ fn generics_settled(
   shared: Map<Bytes, Bytes>,
 ) -> Map<Bytes, Answer> / {abort.raise} = {
   let needs = closed_needs(answers);
+  let called = closed_called(answers);
   map_fold(answers, map_new(), |acc: Map<Bytes, Answer>, n: Bytes, a: Answer|
     map_insert(acc, n, match a {
       Body(b) -> if len(b.tables.generics.calls) == 0 { a } else {
         let roots = map(b.tables.generics.calls, |g: GenericCall| {
-          let settled = settled_root(g, needs);
+          let settled = settled_root(g, needs, called);
           let root = match map_get(shared, settled) { Some(r) -> r, None -> settled };
           // A specialisation the emitter refused leaves the call to the generic body, which takes
           // what the call hands it where it hands nothing raw.
           match map_get(answers, root) {
-            Some(Refused(_)) -> if len(g.carried) == 0 { g.callee } else { root },
+            Some(Refused(_)) -> {
+              // Refused with lambdas run in place: the root without them, where it was answered.
+              let plain = settled_root({ ..g, fns: [] }, needs, called);
+              if len(g.fns) > 0 && plain != root
+                  && (match map_get(answers, plain) { Some(Body(_)) -> true, _ -> false }) { plain }
+              else if len(g.carried) == 0 { g.callee }
+              else { root }
+            },
             _ -> root,
           }
         });
@@ -2052,7 +2104,7 @@ test "a generic call settles on each argument its callee's code needs, and leave
     { key: b"m.add", value: [{ var: 0, layout: false }] },
   ]);
   let call = |callee: Bytes, arg: Bytes|
-    settled_root({ callee: callee, args: [arg], carried: [] }, needs);
+    settled_root({ callee: callee, args: [arg], carried: [], fns: [] }, needs, map_new());
   // A layout the code reads is kept, a known word among them.
   assert_eq(call(b"m.lay", b"{x:Float}"), b"m.lay@{x:Float}");
   assert_eq(call(b"m.lay", b"_"), b"m.lay@_");
@@ -2064,6 +2116,37 @@ test "a generic call settles on each argument its callee's code needs, and leave
   assert_eq(call(b"m.none", b"Float"), b"m.none")
 }
 
+test "a lambda is run in place only by a callee that calls the parameter it is handed as" {
+  let body = |called: List<Int>, passes: List<Pass>|
+    Body({
+      text: b"",
+      tables: { ..no_tables(), generics: { ..no_generics(), called: called, passes: passes } },
+    });
+  let answers = map_of_entries([
+    { key: b"m.each", value: body([1], []) },
+    // `pass` hands its parameter on to `each`, which calls it; `keep` only holds it.
+    { key: b"m.pass", value: body([], [{ param: 0, callee: b"m.each", at: 1 }]) },
+    { key: b"m.keep", value: body([], []) },
+  ]);
+  let called = closed_called(answers);
+  assert_eq(map_get(called, b"m.pass"), Some([0]));
+  let call = |callee: Bytes, param: Int|
+    settled_root(
+      {
+        callee: callee,
+        args: [],
+        carried: [],
+        fns: [{ param: param, owner: b"m.main", at: 40, nth: 0 }],
+      },
+      map_new(),
+      called,
+    );
+  assert_eq(call(b"m.each", 1), b"m.each@|1=m.main:40:0");
+  assert_eq(call(b"m.pass", 0), b"m.pass@|0=m.main:40:0");
+  assert_eq(call(b"m.each", 0), b"m.each");
+  assert_eq(call(b"m.keep", 0), b"m.keep")
+}
+
 test "a generic body needs what its callees need of what it hands them, through its own variables" {
   let answers = map_of_entries([
     { key: b"m.add", value: generic_body([], [{ var: 0, layout: false }]) },
@@ -2073,8 +2156,8 @@ test "a generic body needs what its callees need of what it hands them, through 
       key: b"m.wrap",
       value: generic_body(
         [
-          { callee: b"m.add", args: [b"'0"], carried: [] },
-          { callee: b"m.lay", args: [b"{v:'1}"], carried: [] },
+          { callee: b"m.add", args: [b"'0"], carried: [], fns: [] },
+          { callee: b"m.lay", args: [b"{v:'1}"], carried: [], fns: [] },
         ],
         [],
       ),
@@ -2082,7 +2165,10 @@ test "a generic body needs what its callees need of what it hands them, through 
     // `outer` hands its variable inside a list, which no layout reads.
     {
       key: b"m.outer",
-      value: generic_body([{ callee: b"m.wrap", args: [b"List<_>", b"'0"], carried: [] }], []),
+      value: generic_body(
+        [{ callee: b"m.wrap", args: [b"List<_>", b"'0"], carried: [], fns: [] }],
+        [],
+      ),
     },
   ]);
   let closed = closed_needs(answers);

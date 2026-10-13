@@ -3,11 +3,11 @@
 
 import parsing (Ident, Span, dummy_span, span_key, ParseDiag, qname_text)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpdate,
-             NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange, PxCtor, PxRecord,
-             PxList, CodePatternField, NPerform, NLabel, NCell, NLambda, NSimulate, NParallel,
-             NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField, CodeArm, Capture,
-             CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit, irrefutable, slots_read,
-             all_read)
+             NInlined, Lambda, NApp, NRecord, NMatch, CodePattern, PxWild, PxVar, PxLit, PxRange,
+             PxCtor, PxRecord, PxList, CodePatternField, NPerform, NLabel, NCell, NLambda,
+             NSimulate, NParallel, NHandle, CodeStmt, CLet, CLetPat, CDo, pat_slots, CodeField,
+             CodeArm, Capture, CodeClause, CodeReturn, Own, Borrowed, Owned, lower_to_emit,
+             irrefutable, slots_read, all_read)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, parse, ImportDecl,
               ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, SCost,
               SSpace, FnDef, test_run, test_listing, IInstance, VariantDef, TDSum, INumeric,
@@ -40,7 +40,7 @@ import rewrite (expand, named_program_wide, stated_witness_name, map_expr, unwit
 import embed (EmbedAt, embed_tables, rewritten)
 import patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit, LBad)
 import std.list
-import std.bytes (ascii_of_int)
+import std.bytes (ascii_of_int, u32_at)
 import std.math (pow)
 
 /// `KBoxed` is a tagged word; `KInt` is the untagged 64 bits inside one.
@@ -302,6 +302,12 @@ pub type Emitter = {
   typed: Map<Bytes, Typed>,
   /// How this root hands back its answer; a failing exit returns its zero.
   answer: Kind,
+  /// The root a site is filed under where it is not this one's: a lambda of another root's run here.
+  site_root: Option<Bytes>,
+  /// The callers' lambdas this root runs in place of calls of the parameters they were handed as.
+  lent: List<BoundLambda>,
+  /// The lambdas the root's own code writes, which a callee names by their place among them.
+  written: List<Lambda>,
 }
 
 /// `ret_ty` keeps a record answer's fields so later reads get offsets; `pure` lets a nullary call come from the constant table.
@@ -349,7 +355,30 @@ pub type Unboxed = { slot: Int, kind: Kind, expr: Bytes, ty: Ty }
 
 /// A parameter as the body holds it, and its `carrier`: how it arrives, as a word the prologue
 /// opens to `kind`, as the value itself, or as a record's fields.
-pub type EmitParam = { name: Bytes, kind: Kind, ty: Ty, carrier: Carrier }
+pub type EmitParam = {
+  name: Bytes,
+  kind: Kind,
+  ty: Ty,
+  carrier: Carrier,
+  /// The caller's lambda this parameter is, which a call of it runs in place.
+  lambda: Option<BoundLambda>,
+}
+
+/// A caller's lambda a specialisation runs where it calls the parameter it was handed as: the
+/// lambda as its owner lowered it, and what the owner's body is emitted under.
+pub type BoundLambda = {
+  owner: Bytes,
+  at: Int,
+  nth: Int,
+  code: Lambda,
+  module: Bytes,
+  here: List<Def>,
+  imports: List<Imported>,
+  effects: List<EffectName>,
+  typed: Map<Bytes, Typed>,
+  operands: Map<Bytes, Bytes>,
+  base: Int,
+}
 
 /// How a value crosses a call between roots: whole, as its word or as its value in its own C type,
 /// or, a small flat record, as each of its fields in its own C type. A record answer returns its
@@ -407,6 +436,9 @@ fn line(emitter: Emitter, text: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
@@ -454,6 +486,9 @@ fn indent(emitter: Emitter) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn outdent(emitter: Emitter) -> Emitter =
@@ -499,6 +534,9 @@ fn outdent(emitter: Emitter) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 /// Restoring the node's own `tail` makes an arm a tail again after its scrutinee or condition.
@@ -546,6 +584,9 @@ fn withtail(emitter: Emitter, t: Bool) -> Emitter =
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     }
   }
 
@@ -593,6 +634,9 @@ fn notail(emitter: Emitter) -> Emitter =
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     }
   }
 
@@ -640,6 +684,9 @@ fn rescope(emitter: Emitter, conv: List<Unboxed>) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
@@ -686,6 +733,9 @@ fn fresh(emitter: Emitter) -> { emitter: Emitter, name: Bytes } =
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     },
     name: bytes_concat(b"t", ascii_of_int(emitter.temp_count + 1)),
   }
@@ -843,6 +893,9 @@ fn with_reads(emitter: Emitter, reads: List<Int>) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
@@ -888,6 +941,9 @@ fn with_out(emitter: Emitter, out: List<Bytes>) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
@@ -933,6 +989,9 @@ fn with_landing(emitter: Emitter, landing: Option<Bytes>) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -978,6 +1037,9 @@ fn note_performs(emitter: Emitter, eff: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
@@ -1023,6 +1085,9 @@ fn note_handles(emitter: Emitter, eff: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn note_deferred(emitter: Emitter, d: Deferred) -> Emitter =
@@ -1071,6 +1136,9 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 /// Whether a record holds a value of `kind` as its own words rather than as a word: a `Float`, a
@@ -1617,6 +1685,19 @@ fn is_local(e: Bytes) -> Bool =
     && fold(range(1, bytes_len(e)), true, |acc: Bool, i: Int|
       acc && bytes_at(e, i) >= 48 && bytes_at(e, i) <= 57)
 
+/// The parameter whose word `value` is, followed through renames and moves.
+fn param_of(emitter: Emitter, value: CValue, params: List<EmitParam>) -> Option<Int> = {
+  let root = root_of(emitter, value.expr);
+  if bytes_len(root) < 2 || bytes_at(root, 0) != 112
+      || !fold(range(1, bytes_len(root)), true, |ok: Bool, i: Int|
+        ok && bytes_at(root, i) >= 48 && bytes_at(root, i) <= 57) { None } else {
+    let i = digits(bytes_slice(root, 1, bytes_len(root)));
+    if i < len(params) { Some(i) } else { None }
+  }
+}
+
+fn note_generics(emitter: Emitter, g: Generics) -> Emitter = { ..emitter, generics: g }
+
 fn root_of(emitter: Emitter, local: Bytes) -> Bytes =
   fold(emitter.alias, local, |acc: Bytes, a: { local: Bytes, root: Bytes }|
     if a.local == local { a.root } else { acc })
@@ -1664,6 +1745,9 @@ fn note_alias(emitter: Emitter, local: Bytes, root: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 /// Charge a slot's reads to the object the local holds, once per (object, slot).
@@ -1717,6 +1801,9 @@ fn charge(emitter: Emitter, slot: Int, local: Bytes) -> Emitter = {
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     }
   }
 }
@@ -1799,6 +1886,9 @@ fn poison(emitter: Emitter, why: Bytes) -> Emitter =
         operands: emitter.operands,
         typed: emitter.typed,
         answer: emitter.answer,
+        site_root: emitter.site_root,
+        lent: emitter.lent,
+        written: emitter.written,
       },
   }
 
@@ -1857,6 +1947,9 @@ fn lambda_of(emitter: Emitter, sym: Bytes) -> { emitter: Emitter, i: Int } =
           operands: emitter.operands,
           typed: emitter.typed,
           answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
         },
         i: len(emitter.lambdas),
       },
@@ -1905,6 +1998,9 @@ fn note_call(emitter: Emitter, full: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn spend_made(emitter: Emitter, name: Bytes) -> Emitter =
@@ -2114,9 +2210,9 @@ fn site(emitter: Emitter, span: Span) -> Emitter =
     line(
       emitter,
       bytes_concat_all([
-        b"PLY_SITE(ctx, @@",
-        root_key(emitter),
-        b"@@, ",
+        b"PLY_SITE(ctx, ",
+        site_key(emitter),
+        b", ",
         ascii_of_int(span.start - emitter.base),
         b", ",
         ascii_of_int(span.end - emitter.base),
@@ -2131,6 +2227,23 @@ fn root_key(emitter: Emitter) -> Bytes =
     None -> b"r",
     Some(i) -> bytes_concat(b"r", ascii_of_int(i)),
   }
+
+/// The root id the sites of this body are filed under: the placeholder the unit resolves to this
+/// root's, or another root's id outright.
+fn site_key(emitter: Emitter) -> Bytes =
+  match emitter.site_root {
+    Some(r) -> ascii_of_int(root_id(r)),
+    None -> bytes_concat_all([b"@@", root_key(emitter), b"@@"]),
+  }
+
+/// The id a body's failure sites name their root by: a digest of its name, so a body's C does not
+/// depend on which other roots the unit holds. Non-negative, since the C stores it in an `int64_t`.
+pub fn root_id(name: Bytes) -> Int = {
+  let h = bytes_blake3(name);
+  let low = match u32_at(h, 0) { Some(v) -> v, None -> 0 };
+  let high = match u32_at(h, 4) { Some(v) -> v, None -> 0 };
+  high << 31 | low >>> 1
+}
 
 fn position_of(xs: List<Bytes>, x: Bytes) -> Option<Int> =
   fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int|
@@ -2428,6 +2541,9 @@ fn const_of(emitter: Emitter, literal: Lit) -> { emitter: Emitter, i: Int } =
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     },
     i: len(emitter.consts),
   }
@@ -2780,7 +2896,7 @@ fn iterate_call(
 fn fused_iterate(
   emitter: Emitter,
   args: List<Code>,
-  l: { params: Int, size: Int, captures: List<Capture>, body: Code, at: Span },
+  l: Lambda,
   params: List<EmitParam>,
   span: Span,
 ) -> Option<WithValue> / {abort.raise} =
@@ -2985,7 +3101,7 @@ fn named_step(emitter: Emitter, f: Code) -> Option<WithValue> / {abort.raise} =
         Some(acc) -> match conv_of(emitter, 1) {
           None -> None,
           Some(x) -> {
-            let target = call_target(emitter, d.full, Some(d.def), f.span);
+            let target = call_target(emitter, d.full, Some(d.def), f.span, []);
             let a0 = move_read(target.emitter, Owned, acc);
             let a1 = move_read(a0.emitter, Owned, x);
             let c1 = carried_arg(a1.emitter, a0.value, carrier_at(target.carriers.params, 0));
@@ -2997,6 +3113,192 @@ fn named_step(emitter: Emitter, f: Code) -> Option<WithValue> / {abort.raise} =
     },
     _ -> None,
   }
+
+/// The lambdas `params` are bound to.
+fn lent_of(params: List<EmitParam>) -> List<BoundLambda> =
+  fold(params, [], |acc: List<BoundLambda>, p: EmitParam|
+    match p.lambda { Some(bl) -> push(acc, bl), None -> acc })
+
+/// The lambda this root was handed that is `owner`'s `nth` written at `at`.
+fn lent_lambda(emitter: Emitter, owner: Bytes, at: Int, nth: Int) -> Option<BoundLambda> =
+  fold(emitter.lent, None, |acc: Option<BoundLambda>, bl: BoundLambda|
+    match acc {
+      Some(_) -> acc,
+      None -> if bl.owner == owner && bl.at == at && bl.nth == nth { Some(bl) } else { None },
+    })
+
+/// The frame a lambda run in place is emitted in: at its owner's names, types and sites, counting
+/// the call it replaces, its parameters the call's argument values `vals`, each held until the body
+/// is done, and its captures borrowed from the function value `func`, which keeps their counts.
+fn inlined_frame(
+  emitter: Emitter,
+  bl: BoundLambda,
+  func: CValue,
+  vals: List<CValue>,
+  lambda: Lambda,
+) -> Emitter / {abort.raise} = {
+  let opened = line(indent(emitter), tick_line(leaving(emitter)));
+  let held = fold(
+    vals,
+    { emitter: opened, vals: [] },
+    |acc: { emitter: Emitter, vals: List<CValue> }, v: CValue|
+      match v.kind {
+        KBoxed -> {
+          let o = owned(acc.emitter, v);
+          { emitter: note_holder(o.emitter, o.value.expr), vals: push(acc.vals, o.value) }
+        },
+        _ -> { emitter: acc.emitter, vals: push(acc.vals, v) },
+      },
+  );
+  let caps = fold(
+    range(0, len(lambda.captures)),
+    { emitter: held.emitter, window: [] },
+    |acc: { emitter: Emitter, window: List<Unboxed> }, ci: Int|
+      match list_at(lambda.captures, ci) {
+        None -> acc,
+        Some(c) -> {
+          let b = bind(
+            acc.emitter,
+            KBoxed,
+            bytes_concat_all([b"ply_words(", func.expr, b")[", ascii_of_int(ci + 1), b"]"]),
+          );
+          {
+            emitter: b.emitter,
+            window: push(acc.window, {
+              slot: c.dst,
+              kind: KBoxed,
+              expr: b.value.expr,
+              ty: TyOpen([]),
+            }),
+          }
+        },
+      },
+  );
+  let swapped = {
+    ..caps.emitter,
+    module: bl.module,
+    here: bl.here,
+    imports: bl.imports,
+    effects: bl.effects,
+    typed: bl.typed,
+    operands: bl.operands,
+    base: bl.base,
+    site_root: Some(bl.owner),
+  };
+  let framed = fold(
+    caps.window,
+    with_reads(rescope(swapped, caps.window), slots_read(lambda.body)),
+    |acc: Emitter, w: Unboxed| note_bound(charge(acc, w.slot, w.expr), w.expr),
+  );
+  fold(range(0, len(held.vals)), framed, |acc: Emitter, k: Int|
+    match list_at(held.vals, k) { Some(v) -> remember(acc, k, v), None -> acc })
+}
+
+/// What a lambda run in place answered, made the caller's of `emitter` before what the frame
+/// opened at depth `from` held is released.
+fn inlined_answer(emitter: Emitter, from: Int, r: WithValue) -> WithValue = {
+  let answered = match r.value.kind {
+    KBoxed -> owned(r.emitter, r.value),
+    k -> bind(r.emitter, k, r.value.expr),
+  };
+  let restored = {
+    ..answered.emitter,
+    module: emitter.module,
+    here: emitter.here,
+    imports: emitter.imports,
+    effects: emitter.effects,
+    typed: emitter.typed,
+    operands: emitter.operands,
+    base: emitter.base,
+    site_root: emitter.site_root,
+  };
+  let released = outdent(
+    release_at(with_reads(rescope(restored, emitter.unboxed), emitter.reads), from),
+  );
+  {
+    emitter: if answered.value.kind == KBoxed { note_holder(released, answered.value.expr) }
+    else { released },
+    value: { ..answered.value, ty: TyOpen([]) },
+  }
+}
+
+/// `c` with each call of a slot `bound` names written as the lambda it runs in place, through
+/// lambdas and barriers that capture the slot.
+fn inlined_calls(c: Code, bound: List<{ slot: Int, lent: BoundLambda }>) -> Code = {
+  let go = |x: Code| inlined_calls(x, bound);
+  let inside = |caps: List<Capture>|
+    fold(caps, [], |acc: List<{ slot: Int, lent: BoundLambda }>, cap: Capture|
+      match fold(
+          bound,
+          None,
+          |found: Option<{ slot: Int, lent: BoundLambda }>, b: { slot: Int, lent: BoundLambda }|
+            if b.slot == cap.src { Some(b) } else { found },
+        ) {
+        Some(b) -> push(acc, { ..b, slot: cap.dst }),
+        None -> acc,
+      });
+  let maybe = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
+  let node = match c.node {
+    NApp(a) -> match a.func.node {
+      NVar(v) -> match match v.slot {
+          Some(sl) ->
+            fold(
+              bound,
+              None,
+              |found: Option<{ slot: Int, lent: BoundLambda }>, b: { slot: Int, lent: BoundLambda }|
+                if b.slot == sl { Some(b) } else { found },
+            ),
+          None -> None,
+        } {
+        Some(b) ->
+          NInlined({
+            func: a.func,
+            args: map(a.args, go),
+            lambda: b.lent.code,
+            owner: b.lent.owner,
+            nth: b.lent.nth,
+          }),
+        None -> NApp({ func: a.func, args: map(a.args, go) }),
+      },
+      _ -> NApp({ func: go(a.func), args: map(a.args, go) }),
+    },
+    NUnary(u) -> NUnary({ ..u, operand: go(u.operand) }),
+    NBinary(b) -> NBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    NIf(i) ->
+      NIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
+    NBlock(b) ->
+      NBlock({
+        stmts: map(b.stmts, |stmt: CodeStmt|
+          match stmt {
+            CLet(l) -> CLet({ ..l, value: go(l.value) }),
+            CLetPat(l) -> CLetPat({ ..l, value: go(l.value) }),
+            CDo(d) -> CDo({ code: go(d.code) }),
+          }),
+        tail: maybe(b.tail),
+      }),
+    NList(l) -> NList({ items: map(l.items, go) }),
+    NRecord(r) -> NRecord({ fields: map(r.fields, |f: CodeField| { ..f, value: go(f.value) }) }),
+    NMatch(m) ->
+      NMatch({
+        scrutinee: go(m.scrutinee),
+        arms: map(m.arms, |a: CodeArm| { ..a, guard: maybe(a.guard), body: go(a.body) }),
+      }),
+    NPerform(x) -> NPerform({ ..x, label: maybe(x.label), args: map(x.args, go) }),
+    NCell(cl) -> NCell({ ..cl, init: go(cl.init), body: go(cl.body) }),
+    NLambda(l) -> NLambda({ ..l, body: inlined_calls(l.body, inside(l.captures)) }),
+    NSimulate(x) -> NSimulate({ ..x, body: inlined_calls(x.body, inside(x.captures)) }),
+    NParallel(pr) -> NParallel({ ..pr, branches: map(pr.branches, go) }),
+    NField(f) -> NField({ ..f, base: go(f.base) }),
+    NUpdate(u) ->
+      NUpdate({
+        ..u,
+        base: go(u.base),
+        sets: map(u.sets, |f: CodeField| { ..f, value: go(f.value) }),
+      }),
+    other -> other,
+  };
+  { ..c, node: node }
+}
 
 /// What each capture of a lambda whose body is emitted in place names: the enclosing slot's value,
 /// or a boxed parameter's word; `None` where a capture is neither.
@@ -3780,6 +4082,24 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
         base: go(u.base),
         sets: map(u.sets, |f: CodeField| { ..f, value: go(f.value) }),
       }),
+    // A lambda run in place is closed as its owner closes it, under the owner's names.
+    NInlined(x) ->
+      NInlined({
+        ..x,
+        func: go(x.func),
+        args: map(x.args, go),
+        lambda: {
+          ..x.lambda,
+          body: match lent_lambda(emitter, x.owner, x.lambda.at.start, x.nth) {
+            Some(bl) ->
+              widths_closed(
+                { ..emitter, module: bl.module, here: bl.here, imports: bl.imports },
+                x.lambda.body,
+              ),
+            None -> x.lambda.body,
+          },
+        },
+      }),
   };
   match c.node {
     NVar(v) -> if bare_width(emitter, v.name, v.slot) { width_closure(c, v.name) } else { c },
@@ -4408,6 +4728,9 @@ fn builtin_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           operands: emitter.operands,
           typed: emitter.typed,
           answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
         },
         i: len(emitter.called_builtins),
       },
@@ -4498,7 +4821,7 @@ fn call_value(
   match expr(notail(emitter), func, params) {
     None -> None,
     Some(f) -> {
-      let fo = owned(f.emitter, f.value);
+      let fo = owned(calling(f.emitter, f.value, params), f.value);
       match args_one_pass(fo.emitter, args, params, 0, []) {
         None -> None,
         Some(w) -> {
@@ -4530,6 +4853,17 @@ fn call_value(
         },
       }
     },
+  }
+
+/// The emitter noting that this body calls the parameter `value` is, where it is one.
+fn calling(emitter: Emitter, value: CValue, params: List<EmitParam>) -> Emitter =
+  match param_of(emitter, value, params) {
+    Some(i) -> {
+      let g = emitter.generics;
+      if contains(g.called, i) { emitter }
+      else { note_generics(emitter, { ..g, called: push(g.called, i) }) }
+    },
+    None -> emitter,
   }
 
 /// A parameter the prologue did not open is outside the window and read as its own word.
@@ -4573,7 +4907,7 @@ fn caps_owned(
 fn emit_lambda(
   emitter: Emitter,
   name: Bytes,
-  l: { params: Int, size: Int, captures: List<Capture>, body: Code, at: Span },
+  l: Lambda,
 ) -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, generics: Generics, performs: List<Bytes>, handles: List<Bytes>, refused: Option<Bytes> }> / {abort.raise} = {
   let n = len(l.captures) + l.params;
   let window = fold(
@@ -4641,6 +4975,9 @@ fn emit_lambda(
     operands: emitter.operands,
     typed: emitter.typed,
     answer: KBoxed,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   };
   let charged = fold(window, start, |acc: Emitter, w: Unboxed|
     note_bound(note_holder(charge(acc, w.slot, w.expr), w.expr), w.expr));
@@ -4954,6 +5291,9 @@ fn field_of(emitter: Emitter, name: Bytes) -> { emitter: Emitter, i: Int } =
           operands: emitter.operands,
           typed: emitter.typed,
           answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
         },
         i: len(emitter.fields),
       },
@@ -5017,6 +5357,9 @@ fn remember_built(
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int } =
@@ -5070,6 +5413,9 @@ fn shape_of(emitter: Emitter, names: List<Bytes>) -> { emitter: Emitter, i: Int 
           operands: emitter.operands,
           typed: emitter.typed,
           answer: emitter.answer,
+          site_root: emitter.site_root,
+          lent: emitter.lent,
+          written: emitter.written,
         },
         i: len(emitter.shapes),
       },
@@ -5137,6 +5483,9 @@ fn note_tok(emitter: Emitter, w: Int) -> Emitter =
       operands: emitter.operands,
       typed: emitter.typed,
       answer: emitter.answer,
+      site_root: emitter.site_root,
+      lent: emitter.lent,
+      written: emitter.written,
     }
   }
 
@@ -5183,6 +5532,9 @@ fn note_released(emitter: Emitter, root: Bytes) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 /// The words a record of `ty` holds, which is the reuse token its cells make.
@@ -5323,7 +5675,7 @@ fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 /// A lambda's closure: its body emitted as an entry of its own, and its captures copied in.
 fn closure_value(
   emitter: Emitter,
-  l: { params: Int, size: Int, captures: List<Capture>, body: Code, at: Span },
+  l: Lambda,
   params: List<EmitParam>,
 ) -> Option<WithValue> / {abort.raise} =
   match caps_owned(emitter, l.captures, params, 0, []) {
@@ -5393,6 +5745,9 @@ fn closure_value(
             operands: e.operands,
             typed: e.typed,
             answer: e.answer,
+            site_root: e.site_root,
+            lent: e.lent,
+            written: e.written,
           };
           let o = bind(
             grown,
@@ -5862,7 +6217,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
         match def_of(emitter, v.name) {
           // A definition used as a value is a closure over its entry, a nullary one too: calling it here would run its body before, and outside the handlers of, any call.
           Some(d) -> {
-            let named = named_ref(emitter, d.full, Some(d.def), c.span);
+            let named = named_ref(emitter, d.full, Some(d.def), c.span, []);
             let l = lambda_of(named.emitter, bytes_concat_all([named.symbol, b"_entry"]));
             let arr = fresh(l.emitter);
             let e = line(arr.emitter, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
@@ -6437,11 +6792,13 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               Some(imp) -> {
                 let callee = match qualified(fv.name) { Some(q) -> q.name, None -> fv.name };
                 {
+                  let full = bytes_concat_all([imp.module, b".", callee]);
                   let target = call_target(
-                    emitter,
-                    bytes_concat_all([imp.module, b".", callee]),
+                    passed_on(emitter, full, a.args, params),
+                    full,
                     def_named(imp.defs, callee),
                     a.func.span,
+                    fn_args(emitter, a.args, params),
                   );
                   match args_carried(target.emitter, a.args, params, target.carriers.params, 0, [
                     ]) {
@@ -6469,11 +6826,13 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             self_tail(note_call(emitter, emitter.owner), fv.name, a.args, params)
           } else {
             {
+              let full = qualify(emitter.module, fv.name);
               let target = call_target(
-                emitter,
-                qualify(emitter.module, fv.name),
+                passed_on(emitter, full, a.args, params),
+                full,
                 def_named(emitter.here, fv.name),
                 a.func.span,
+                fn_args(emitter, a.args, params),
               );
               match args_carried(target.emitter, a.args, params, target.carriers.params, 0, []) {
                 None -> None,
@@ -6485,6 +6844,24 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       },
       // Any other callee -- a field holding a function, a call's answer -- is a value too.
       _ -> call_value(emitter, a.func, a.args, params, c.span),
+    },
+    // A call a specialisation runs in place: the function value and arguments evaluated here, then
+    // the lambda's body in its own frame.
+    NInlined(x) -> match lent_lambda(emitter, x.owner, x.lambda.at.start, x.nth) {
+      None -> Some(refused(emitter, b"a lambda run in place that this root was not handed")),
+      Some(bl) -> match expr(notail(emitter), x.func, params) {
+        None -> None,
+        Some(f) -> match args_evaled(f.emitter, x.args, params, 0, []) {
+          None -> None,
+          Some(w) -> {
+            let inner = inlined_frame(w.emitter, bl, f.value, w.vals, x.lambda);
+            match expr(notail(inner), x.lambda.body, params) {
+              None -> None,
+              Some(r) -> Some(inlined_answer(emitter, inner.indent, r)),
+            }
+          },
+        },
+      },
     },
     NMatch(m) -> match match_subject(emitter, m.scrutinee, m.arms, params) {
       None -> None,
@@ -6616,6 +6993,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         operands: js.emitter.operands,
                         typed: js.emitter.typed,
                         answer: js.emitter.answer,
+                        site_root: js.emitter.site_root,
+                        lent: js.emitter.lent,
+                        written: js.emitter.written,
                       },
                       names,
                       js.names,
@@ -6666,6 +7046,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                         operands: e.emitter.operands,
                         typed: e.emitter.typed,
                         answer: e.emitter.answer,
+                        site_root: e.emitter.site_root,
+                        lent: e.emitter.lent,
+                        written: e.emitter.written,
                       },
                       bytes_concat_all([ctype(kt), b" ", j.name, b" = ", zero_of(kt), b";"]),
                     );
@@ -6736,6 +7119,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       operands: fin.operands,
                       typed: fin.typed,
                       answer: fin.answer,
+                      site_root: fin.site_root,
+                      lent: fin.lent,
+                      written: fin.written,
                     };
                     Some({
                       emitter: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
@@ -8463,6 +8849,9 @@ fn blank(emitter: Emitter) -> Emitter =
     operands: emitter.operands,
     typed: emitter.typed,
     answer: emitter.answer,
+    site_root: emitter.site_root,
+    lent: emitter.lent,
+    written: emitter.written,
   }
 
 /// The shape both arms answer when both built a record of the same shape; otherwise the join is one local.
@@ -9081,7 +9470,14 @@ fn self_tail_leaf(
       acc || (h.name == name && h.arity == len(args)))
     && (full == emitter.owner
     || (bytes_starts_with(emitter.owner, bytes_concat(full, b"@"))
-    && call_target(emitter, full, def_named(emitter.here, name), at).root == emitter.owner))
+    && call_target(
+      emitter,
+      full,
+      def_named(emitter.here, name),
+      at,
+      fn_args(emitter, args, params),
+    ).root
+    == emitter.owner))
 }
 
 /// Whether a body reaches a self call in tail position; the walk is the positions `tail` is kept into.
@@ -9482,16 +9878,72 @@ fn typed_kind(typed: Map<Bytes, Typed>, span: Span) -> { kind: Kind, ty: Ty } =
 pub fn specialised(full: Bytes, args: List<Type>) -> Bytes =
   bytes_concat_all([full, b"@", bytes_join(map(args, spelled_type), b",")])
 
+/// `specialised`, and then each lambda the root runs where it calls parameter `param`, as
+/// `|param=owner:at`.
+pub fn specialised_with(full: Bytes, args: List<Type>, fns: List<FnArg>) -> Bytes =
+  bytes_concat_all(
+    concat(
+      [specialised(full, args)],
+      map(fns, |f: FnArg|
+        bytes_concat_all([
+          b"|",
+          ascii_of_int(f.param),
+          b"=",
+          f.owner,
+          b":",
+          ascii_of_int(f.at),
+          b":",
+          ascii_of_int(f.nth),
+        ])),
+    ),
+  )
+
 /// The definition and layouts of the root `specialised` named; `None` for any other root.
-pub fn specialisation_of(root: Bytes) -> Option<{ base: Bytes, args: List<Type> }> / {abort.raise} =
+pub fn specialisation_of(
+  root: Bytes,
+) -> Option<{ base: Bytes, args: List<Type>, fns: List<FnArg> }> / {abort.raise} =
   if bytes_index_of(root, b"#") != None { None } else {
     match bytes_index_of(root, b"@") {
       None -> None,
-      Some(at) -> match read_types(root, at + 1, [], bytes_len(root)) {
-        Some(args) -> Some({ base: bytes_slice(root, 0, at), args: args }),
-        None -> None,
+      Some(at) -> {
+        let parts = bytes_split(bytes_slice(root, at + 1, bytes_len(root)), b"|");
+        let layouts = match list_at(parts, 0) { Some(x) -> x, None -> b"" };
+        let fns = fold(range(1, len(parts)), Some([]), |acc: Option<List<FnArg>>, k: Int|
+          match acc {
+            None -> None,
+            Some(fs) -> match fn_arg_of(match list_at(parts, k) { Some(x) -> x, None -> b"" }) {
+              Some(f) -> Some(push(fs, f)),
+              None -> None,
+            },
+          });
+        match fns {
+          None -> None,
+          Some(fs) -> match if bytes_len(layouts) == 0 { Some([]) }
+            else { read_types(layouts, 0, [], bytes_len(layouts)) } {
+            Some(args) -> Some({ base: bytes_slice(root, 0, at), args: args, fns: fs }),
+            None -> None,
+          },
+        }
       },
     }
+  }
+
+/// A lambda `specialised_with` spelled as `param=owner:at:nth`.
+fn fn_arg_of(spelled: Bytes) -> Option<FnArg> / {abort.raise} =
+  match bytes_index_of(spelled, b"=") {
+    None -> None,
+    Some(eq) -> {
+      let rest = bytes_slice(spelled, eq + 1, bytes_len(spelled));
+      let parts = bytes_split(rest, b":");
+      if eq == 0 || len(parts) != 3 { None } else {
+        Some({
+          param: digits(bytes_slice(spelled, 0, eq)),
+          owner: at(parts, 0),
+          at: digits(at(parts, 1)),
+          nth: digits(at(parts, 2)),
+        })
+      }
+    },
   }
 
 /// The definition a root runs: its own, or the one it specialises.
@@ -9698,20 +10150,28 @@ fn def_named(defs: List<Def>, name: Bytes) -> Option<Def> =
 /// the answer's type at the call's own type arguments.
 type Target = {
   emitter: Emitter,
+  full: Bytes,
   symbol: Bytes,
   root: Bytes,
   ret: { kind: Option<Kind>, ty: Ty },
   carriers: { params: List<Carrier>, answer: Carrier },
 }
 
-/// The target of a call of `full` through the reference at `at`, named as `named_ref` names it.
-fn call_target(emitter: Emitter, full: Bytes, d: Option<Def>, at: Span) -> Target / {abort.raise} = {
+/// The target of a call of `full` through the reference at `at`, named as `named_ref` names it,
+/// handed the lambdas `fns`.
+fn call_target(
+  emitter: Emitter,
+  full: Bytes,
+  d: Option<Def>,
+  at: Span,
+  fns: List<FnArg>,
+) -> Target / {abort.raise} = {
   let declared = match d {
     Some(x) -> { kind: x.ret, ty: x.ret_ty },
     None -> { kind: None, ty: TyOpen([]) },
   };
   let scheme = match d { Some(x) -> x.scheme, None -> None };
-  let named = named_ref(emitter, full, d, at);
+  let named = named_ref(emitter, full, d, at, fns);
   let ret = match scheme {
     Some(sc) -> if len(sc.ty_vars) == 0 { declared } else {
       match map_get(emitter.typed, span_key(at)) {
@@ -9731,6 +10191,7 @@ fn call_target(emitter: Emitter, full: Bytes, d: Option<Def>, at: Span) -> Targe
   };
   {
     emitter: named.emitter,
+    full: full,
     symbol: named.symbol,
     root: named.root,
     ret: ret,
@@ -9744,20 +10205,22 @@ fn call_target(emitter: Emitter, full: Bytes, d: Option<Def>, at: Span) -> Targe
 /// How a reference at `at` names definition `full`: its own symbol, or, for a generic definition the
 /// checker gave type arguments there, a placeholder the unit settles once it knows what the callee
 /// reads of each argument, which the body records. A definition's reference to itself at the type
-/// arguments of the root being emitted names that root; a specialisation's at other arguments names
-/// the definition as it stands, whose body restarts where a specialisation's cannot become another's.
+/// arguments of the root being emitted, handing the lambdas it runs, names that root; a
+/// specialisation's at other arguments or lambdas names the definition as it stands, whose body
+/// restarts where a specialisation's cannot become another's.
 fn named_ref(
   emitter: Emitter,
   full: Bytes,
   d: Option<Def>,
   at: Span,
+  fns: List<FnArg>,
 ) -> { emitter: Emitter, symbol: Bytes, root: Bytes, args: List<Type> } / {abort.raise} =
   if own_definition(emitter.owner) == full {
     let own = match specialisation_of(emitter.owner) {
       None -> true,
       Some(sp) -> {
         let given = reference_args(emitter, match d { Some(x) -> x.scheme, None -> None }, at);
-        len(given) == len(sp.args)
+        same_fns(sp.fns, fns) && len(given) == len(sp.args)
           && fold(range(0, len(sp.args)), true, |same: Bool, j: Int|
             same
               && (match list_at(sp.args, j) {
@@ -9782,32 +10245,31 @@ fn named_ref(
       root: full,
       args: [],
     };
-    match match d { Some(x) -> x.scheme, None -> None } {
-      None -> plain,
-      Some(sc) -> if len(sc.ty_vars) == 0 { plain } else {
-        match map_get(emitter.typed, span_key(at)) {
-          None -> plain,
-          Some(t) -> if len(t.args) != len(sc.ty_vars) { plain } else {
-            let k = len(emitter.generics.calls);
-            {
-              emitter: {
-                ..emitter,
-                generics: {
-                  ..emitter.generics,
-                  calls: push(emitter.generics.calls, {
-                    callee: full,
-                    args: map(t.args, |a: Type| spelled_type(erased(a))),
-                    carried: carried_vars(sc, t.args, match d { Some(x) -> x.arity, None -> 0 }),
-                  }),
-                },
+    let scheme = match d { Some(x) -> x.scheme, None -> None };
+    let given = reference_args(emitter, scheme, at);
+    if len(given) == 0 && len(fns) == 0 { plain } else {
+      let k = len(emitter.generics.calls);
+      let placeholder = bytes_concat_all([b"@@g", ascii_of_int(k), b"@@"]);
+      {
+        emitter: {
+          ..emitter,
+          generics: {
+            ..emitter.generics,
+            calls: push(emitter.generics.calls, {
+              callee: full,
+              args: map(given, |a: Type| spelled_type(erased(a))),
+              carried: match scheme {
+                Some(sc) -> carried_vars(sc, given, match d { Some(x) -> x.arity, None -> 0 }),
+                None -> [],
               },
-              symbol: bytes_concat_all([b"@@g", ascii_of_int(k), b"@@"]),
-              root: bytes_concat_all([b"@@g", ascii_of_int(k), b"@@"]),
-              args: t.args,
-            }
+              fns: fns,
+            }),
           },
-        }
-      },
+        },
+        symbol: placeholder,
+        root: placeholder,
+        args: given,
+      }
     }
   }
 
@@ -9886,13 +10348,13 @@ fn pairwise(written: List<TypeExpr>, tys: List<Type>, acc: Map<Bytes, Int>) -> M
 fn specialisations_wanted(
   wanted: Option<Map<Bytes, Bool>>,
   full: Bytes,
-) -> List<List<Type>> / {abort.raise} =
+) -> List<{ args: List<Type>, fns: List<FnArg> }> / {abort.raise} =
   match wanted {
     None -> [],
     Some(w) ->
-      map_fold(w, [], |acc: List<List<Type>>, root: Bytes, _: Bool|
+      map_fold(w, [], |acc: List<{ args: List<Type>, fns: List<FnArg> }>, root: Bytes, _: Bool|
         match specialisation_of(root) {
-          Some(s) -> if s.base == full { push(acc, s.args) } else { acc },
+          Some(s) -> if s.base == full { push(acc, { args: s.args, fns: s.fns }) } else { acc },
           None -> acc,
         }),
   }
@@ -9927,6 +10389,8 @@ fn specialised_emitted(
   module: Bytes,
   def: FnDef,
   args: List<Type>,
+  fns: List<FnArg>,
+  lambda_at: (Bytes, Int, Int) -> Option<BoundLambda> / {abort.raise},
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   sites: Map<Bytes, List<Bytes>>,
@@ -9978,26 +10442,71 @@ fn specialised_emitted(
   let all_names = fold(labels, names, |acc: List<Bytes>, n: Bytes| push(acc, n));
   let all_kinds = fold(labels, kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
     push(acc, Some({ kind: KInt, ty: TyOpen([]) })));
-  emitted_from(
-    module,
-    def.span.start,
-    here,
-    imports,
-    ctors,
-    builtins,
-    effects,
-    release,
-    settled,
-    typed_at(typed, args),
-    specialised(full, args),
-    params_carried(all_names, all_kinds, match def_named(here, def.name.name) {
-      Some(d) -> carriers_at(d, args).params,
-      None -> carriers_of(def, sig_of(schemes, full)).params,
-    }),
-    true,
-    body,
-    match lower_to_emit(names, labels, sites, body) { Some(l) -> Some(l.code), None -> None },
-  )
+  let root = specialised_with(full, args, fns);
+  let carried = params_carried(all_names, all_kinds, match def_named(here, def.name.name) {
+    Some(d) -> carriers_at(d, args).params,
+    None -> carriers_of(def, sig_of(schemes, full)).params,
+  });
+  // Each lambda the root runs, read where its owner lowered it.
+  let lent = fold(fns, Some(carried), |acc: Option<List<EmitParam>>, f: FnArg|
+    match acc {
+      None -> None,
+      Some(ps) -> match lambda_at(f.owner, f.at, f.nth) {
+        None -> None,
+        Some(bl) ->
+          Some(
+            map(range(0, len(ps)), |i: Int|
+              if i == f.param { { ..at(ps, i), lambda: Some(bl) } } else { at(ps, i) }),
+          ),
+      },
+    });
+  match lent {
+    None ->
+      {
+        name: root,
+        text: b"",
+        tables: no_tables(),
+        why: Some(b"a lambda this root runs in place of a call is not one its owner lowers"),
+        handles: [],
+      },
+    Some(ps) ->
+      emitted_from(
+        module,
+        def.span.start,
+        here,
+        imports,
+        ctors,
+        builtins,
+        effects,
+        release,
+        settled,
+        typed_at(typed, args),
+        root,
+        ps,
+        true,
+        body,
+        match lower_to_emit(names, labels, sites, body) {
+          Some(l) ->
+            Some(
+              inlined_calls(
+                l.code,
+                fold(
+                  range(0, len(ps)),
+                  [],
+                  |acc: List<{ slot: Int, lent: BoundLambda }>, i: Int|
+                    match at(ps, i).lambda {
+                      // A lambda holding a `handle` stays a closure: its handled operations are its owner's.
+                      Some(bl) -> if has_handle(bl.code.body) { acc }
+                      else { push(acc, { slot: i, lent: bl }) },
+                      None -> acc,
+                    },
+                ),
+              ),
+            ),
+          None -> None,
+        },
+      ),
+  }
 }
 
 pub fn emit_fn(
@@ -10090,6 +10599,9 @@ pub fn emit_fn_full(
     operands: operands,
     typed: typed,
     answer: returned_kind(answer),
+    site_root: None,
+    lent: lent_of(params),
+    written: lambdas_of(body),
   };
   match emit_body(start, params, body) {
     None -> None,
@@ -10426,6 +10938,9 @@ pub fn emit_fn_why(
     operands: operands,
     typed: typed,
     answer: returned_kind(answer),
+    site_root: None,
+    lent: lent_of(params),
+    written: lambdas_of(body),
   };
   match emit_body(start, params, body) {
     None -> Some(b"refused without a reason"),
@@ -10499,6 +11014,9 @@ pub fn emit_group_full(
     operands: operands,
     typed: typed,
     answer: answer,
+    site_root: None,
+    lent: [],
+    written: [],
   };
   match group_cases(start, members, 0) {
     None -> None,
@@ -10722,19 +11240,34 @@ fn head_of(params: List<EmitParam>, answer: Carrier) -> Head =
 /// `members` are a group's definitions in case order, and empty for a body of its own.
 /// A call of a generic definition: the callee, and each type argument as `spelled_type` spells its
 /// layout, a variable of the calling body spelled as itself (`'0`), which the unit settles the
-/// callee's root by; `carried` are the variables the call hands over raw, which it settles on.
-pub type GenericCall = { callee: Bytes, args: List<Bytes>, carried: List<Int> }
+/// callee's root by; `carried` are the variables the call hands over raw, which it settles on; and
+/// `fns` the lambdas it hands, which the root it settles on may run in place of its calls of them.
+pub type GenericCall = { callee: Bytes, args: List<Bytes>, carried: List<Int>, fns: List<FnArg> }
+
+/// A literal lambda handed as argument `param`: the `at`th byte of its owner root's module is where
+/// it is written.
+pub type FnArg = { param: Int, owner: Bytes, at: Int, nth: Int }
 
 /// Where a body's code took a slow path because type variable `var` was unknown: its layout, where
 /// `layout`, else only whether it is a scalar the code holds apart from a word.
 pub type Need = { var: Int, layout: Bool }
 
 /// A body's calls of generic definitions, numbered as their `@@gN@@` placeholders are, and its
-/// needs: what a specialisation at its type arguments would read of each; and the head each call
-/// of a root was written to, which the unit holds the callee's own to.
-pub type Generics = { calls: List<GenericCall>, needs: List<Need>, expects: List<Expect> }
+/// needs: what a specialisation at its type arguments would read of each; the head each call of a
+/// root was written to, which the unit holds the callee's own to; and the parameters it calls as
+/// functions, or hands on to calls, which the unit closes to know where a function argument is called.
+pub type Generics = {
+  calls: List<GenericCall>,
+  needs: List<Need>,
+  expects: List<Expect>,
+  called: List<Int>,
+  passes: List<Pass>,
+}
 
-pub fn no_generics() -> Generics = { calls: [], needs: [], expects: [] }
+/// A body's parameter `param` handed on as argument `at` of a call of definition `callee`.
+pub type Pass = { param: Int, callee: Bytes, at: Int }
+
+pub fn no_generics() -> Generics = { calls: [], needs: [], expects: [], called: [], passes: [] }
 
 pub type Tables = {
   consts: List<Const>,
@@ -11387,6 +11920,35 @@ test "a definition takes and answers a float as itself, and a call says the head
   assert_eq(map(at(out, 2).tables.symbols, |d: Defined| d.head), [word_head(1)])
 }
 
+test "a lambda handed to a definition that calls it is run in place by the root it settles on" {
+  let src = b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\n";
+  let at = match bytes_index_of(src, b"|x: Int|") { Some(i) -> i, None -> 0 - 1 };
+  let lent = [{ param: 1, owner: b"m.scaled", at: at, nth: 0 }];
+  let total = specialised_with(b"m.total", [], lent);
+  let each = specialised_with(b"m.each", [], lent);
+  let answers = answers_of([b"m"], [src], [], [b"m.each", b"m.total", b"m.scaled", total, each]);
+  let body = |name: Bytes|
+    fold(answers, None, |acc: Option<{ text: Bytes, tables: Tables }>, a: RootAnswer|
+      if a.name != name { acc } else {
+        match a.answer { Body(b) -> Some(b), Refused(r) -> panic(string_of_bytes_lossy(r.why)) }
+      });
+  let generics = |name: Bytes|
+    match body(name) { Some(b) -> b.tables.generics, None -> no_generics() };
+  // `each` calls its parameter; `total` hands its own on to `each`, which calls it.
+  assert_eq(generics(b"m.each").called, [1]);
+  assert_eq(generics(b"m.total").passes, [{ param: 1, callee: b"m.each", at: 1 }]);
+  assert_eq(map(generics(b"m.scaled").calls, |g: GenericCall| g.fns), [lent]);
+  assert_eq(map(generics(total).calls, |g: GenericCall| g.fns), [lent]);
+  // The lambda runs in `each`'s loop: no call through the runtime, its product written there.
+  match body(each) {
+    Some(b) -> {
+      assert(bytes_index_of(own_code(b.text), b"rt_call_p") == None, None);
+      assert(bytes_index_of(own_code(b.text), b"ply_loop") != None, None)
+    },
+    None -> panic("no body for the specialisation"),
+  }
+}
+
 test "a definition's call of itself is written to the head of the root it names" {
   let src = b"fn deepened<a>(x: a, n: Int) -> a where numeric(a) = if n <= 0 { x } else { deepened(x, n - 1) + x }\n";
   let answers = answers_of([b"m"], [src], [], [b"m.deepened", b"m.deepened@Float"]);
@@ -11721,6 +12283,85 @@ fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {ab
     _ -> [],
   }
 
+/// Whether two calls hand the same lambdas, each as the same parameter.
+fn same_fns(a: List<FnArg>, b: List<FnArg>) -> Bool =
+  len(a) == len(b) && fold(a, true, |ok: Bool, f: FnArg| ok && contains(b, f))
+
+/// The parameter of this body slot `slot` holds as itself: one the window holds, followed through
+/// renames, or one the prologue left as its word.
+fn slot_param(emitter: Emitter, slot: Int, params: List<EmitParam>) -> Option<Int> =
+  match conv_of(emitter, slot) {
+    Some(cv) -> param_of(emitter, cv, params),
+    None -> if slot < len(params) { Some(slot) } else { None },
+  }
+
+/// The emitter noting each of this body's parameters a call of `callee` hands on as itself, by the
+/// argument it is: where the callee calls that argument, this body calls the parameter.
+fn passed_on(
+  emitter: Emitter,
+  callee: Bytes,
+  codes: List<Code>,
+  params: List<EmitParam>,
+) -> Emitter =
+  fold(range(0, len(codes)), emitter, |acc: Emitter, i: Int|
+    match match list_at(codes, i) {
+        Some(c) -> match c.node {
+          NVar(v) -> match v.slot { Some(slot) -> slot_param(acc, slot, params), None -> None },
+          _ -> None,
+        },
+        None -> None,
+      } {
+      Some(j) -> {
+        let g = acc.generics;
+        note_generics(acc, { ..g, passes: push(g.passes, { param: j, callee: callee, at: i }) })
+      },
+      None -> acc,
+    })
+
+/// The literal lambdas among a call's `codes`, each by its argument's place, where this root is a
+/// plain definition at no type variable, whose lambdas a callee's specialisation reads and runs.
+fn fn_args(
+  emitter: Emitter,
+  codes: List<Code>,
+  params: List<EmitParam>,
+) -> List<FnArg> / {abort.raise} = {
+  let lends = lends_lambdas(emitter);
+  fold(range(0, len(codes)), [], |acc: List<FnArg>, j: Int|
+    match list_at(codes, j) {
+      Some(c) -> match c.node {
+        NLambda(l) -> if lends {
+          match position_in(written_at(emitter.written, l.at.start), l) {
+            Some(nth) -> push(acc, { param: j, owner: emitter.owner, at: l.at.start, nth: nth }),
+            None -> acc,
+          }
+        } else { acc },
+        // A parameter bound to a lambda, handed on: the callee runs the same lambda.
+        NVar(v) -> match match v.slot {
+            Some(slot) -> match slot_param(emitter, slot, params) {
+              Some(i) -> match list_at(params, i) { Some(p) -> p.lambda, None -> None },
+              None -> None,
+            },
+            None -> None,
+          } {
+          Some(bl) -> push(acc, { param: j, owner: bl.owner, at: bl.at, nth: bl.nth }),
+          None -> acc,
+        },
+        _ -> acc,
+      },
+      None -> acc,
+    })
+}
+
+/// Whether the root being emitted is a definition as it stands, of no type variable: one a
+/// lambda of can be read again where another root runs it.
+fn lends_lambdas(emitter: Emitter) -> Bool / {abort.raise} =
+  specialisation_of(emitter.owner) == None && bytes_index_of(emitter.owner, b"#") == None
+    && (match fold(emitter.here, None, |acc: Option<Def>, d: Def|
+        if qualify(emitter.module, d.name) == emitter.owner { Some(d) } else { acc }) {
+      Some(d) -> match d.scheme { Some(sc) -> len(sc.ty_vars) == 0, None -> true },
+      None -> false,
+    })
+
 /// The type arguments the checker gave a reference of a generic definition at `at`; none where it
 /// gave none or not one for each of the scheme's variables.
 fn reference_args(emitter: Emitter, scheme: Option<Scheme>, at: Span) -> List<Type> =
@@ -11965,10 +12606,10 @@ test "a generic definition reached at a type held apart from a word is emitted a
   // A call of a generic definition names a placeholder the unit settles, with its arguments' layouts.
   assert(has(b"m.go", b"@@g0@@"));
   assert_eq(body(b"m.go").tables.generics.calls, [
-    { callee: b"m.twice", args: [b"Float"], carried: [0] },
+    { callee: b"m.twice", args: [b"Float"], carried: [0], fns: [] },
   ]);
   assert_eq(body(b"m.same").tables.generics.calls, [
-    { callee: b"m.id", args: [b"_"], carried: [] },
+    { callee: b"m.id", args: [b"_"], carried: [], fns: [] },
   ]);
   // `twice` reads its witness, which a scalar argument does in C; `id` needs nothing of its argument.
   assert_eq(body(b"m.twice").tables.generics.needs, [{ var: 0, layout: false }]);
@@ -12005,8 +12646,8 @@ test "a specialisation hands its recursion on to the definitions as they stand w
     };
   let loops = |name: Bytes| bytes_index_of(body(name).text, b"goto ply_loop;") != None;
   assert_eq(body(b"m.go").tables.generics.calls, [
-    { callee: b"m.spin", args: [b"Float", b"Int"], carried: [0] },
-    { callee: b"m.ping", args: [b"Float"], carried: [0] },
+    { callee: b"m.spin", args: [b"Float", b"Int"], carried: [0], fns: [] },
+    { callee: b"m.ping", args: [b"Float"], carried: [0], fns: [] },
   ]);
   // The call hands `y` on as `x`: what is a `Float` here is an `Int` there, so the call is of the
   // definition as it stands, whose own body restarts.
@@ -12041,7 +12682,7 @@ test "a generic definition reached at a record type reads the record where its l
       None -> panic("no answer"),
     };
   assert_eq(tables(b"m.pick").generics.calls, [
-    { callee: b"m.first", args: [b"{x:Float,y:Float}", b"Int"], carried: [0] },
+    { callee: b"m.first", args: [b"{x:Float,y:Float}", b"Int"], carried: [0], fns: [] },
   ]);
   // Unspecialised, `p`'s fields may be anything, so `p.l` is read by name, which both its variables
   // cause; at the record, by place.
@@ -12071,7 +12712,7 @@ test "a long part of a name is its digest, so two long names alike at the start 
   assert(bytes_index_of(symbol_of(b"m.f@Float"), hex(b"f@Float")) != None)
 }
 
-test "a specialisation's root spells its layouts and reads back as them" {
+test "a specialisation's root spells its layouts and the lambdas it runs, and reads back as them" {
   let args = [
     TyRecord([
       {
@@ -12088,8 +12729,19 @@ test "a specialisation's root spells its layouts and reads back as them" {
   ];
   let root = specialised(b"m.f", args);
   assert_eq(root, b"m.f@{a:Array<{x:Float}>,b:_},List<_>,U32");
-  assert_eq(specialisation_of(root), Some({ base: b"m.f", args: args }));
+  assert_eq(specialisation_of(root), Some({ base: b"m.f", args: args, fns: [] }));
   assert_eq(specialisation_of(b"m.f@{a:"), None);
+  // A lambda a caller hands is spelled by the root that wrote it and where.
+  let fns = [
+    { param: 1, owner: b"app.main", at: 120, nth: 0 },
+    { param: 2, owner: b"lib.h", at: 7, nth: 3 },
+  ];
+  let lent = specialised_with(b"m.f", [TyCon({ name: b"U32", args: [] })], fns);
+  assert_eq(lent, b"m.f@U32|1=app.main:120:0|2=lib.h:7:3");
+  assert_eq(
+    specialisation_of(lent),
+    Some({ base: b"m.f", args: [TyCon({ name: b"U32", args: [] })], fns: fns }),
+  );
   // What a layout does not read is a word.
   assert_eq(
     erased(TyCon({ name: b"Option", args: [TyCon({ name: b"Float", args: [] })] })),
@@ -12256,6 +12908,10 @@ test "a root is in the module its owner is in" {
   assert_eq(module_of_root(b"app.cli.main#requires#0"), b"app.cli");
   assert_eq(module_of_root(test_owner(b"app", b"a.b c")), b"app");
   assert_eq(module_of_root(law_root(b"app", b"x.y", b"body")), b"app");
+  assert_eq(
+    module_of_root(specialised_with(b"app.g", [], [{ param: 1, owner: b"lib.h", at: 7, nth: 0 }])),
+    b"app",
+  );
   assert_eq(module_of_root(b"main"), b"")
 }
 
@@ -12508,13 +13164,18 @@ fn emit_program(
         ) {
         ResolveFailed(diags) -> refused_rather_than_emitted(sources, wanted, said(diags)),
         ResolveSucceeded(x) -> {
-          // A specialisation is lowered from its definition's facts.
+          // A specialisation is lowered from its definition's facts, and the lambdas it runs from
+          // their owners'.
           let reading = match wanted {
             None -> None,
             Some(w) ->
               Some(
                 map_fold(w, w, |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
-                  map_insert(acc, own_definition(root), true)),
+                  fold(
+                    match specialisation_of(root) { Some(s) -> s.fns, None -> [] },
+                    map_insert(acc, own_definition(root), true),
+                    |r: Map<Bytes, Bool>, f: FnArg| map_insert(r, f.owner, true),
+                  )),
               ),
           };
           let lowered = lowered_modules(reading);
@@ -12539,6 +13200,58 @@ fn emit_program(
               let program = map(mods, |m: ParsedModule|
                 { module: m.name, defs: defs_in(m.name, m.module, pure, schemes) });
               let stated = stated_by_tag(mods);
+              let defs_of = |path: Bytes|
+                fold(program, [], |acc: List<Def>, md: ModuleDefs|
+                  if md.module == path { md.defs } else { acc });
+              // A lambda a specialisation runs: read again where its owner, a plain definition, lowers it.
+              let lambda_at = |owner: Bytes, start: Int, nth: Int| {
+                let dot = fold(range(0, bytes_len(owner)), 0 - 1, |acc: Int, k: Int|
+                  if bytes_at(owner, k) == 46 { k } else { acc });
+                let module = bytes_slice(owner, 0, if dot < 0 { 0 } else { dot });
+                let short = bytes_slice(owner, dot + 1, bytes_len(owner));
+                match fold(range(0, len(mods)), None, |acc: Option<Int>, k: Int|
+                    match acc {
+                      Some(_) -> acc,
+                      None -> if at(mods, k).name == module { Some(k) } else { None },
+                    }) {
+                  None -> None,
+                  Some(i) -> {
+                    let m = at(mods, i);
+                    match fold(m.module.items, None, |acc: Option<FnDef>, item: Item|
+                        match item {
+                          IFn(d) -> if d.name.name == short { Some(d) } else { acc },
+                          _ -> acc,
+                        }) {
+                      None -> None,
+                      Some(d) -> match lower_to_emit(
+                          map(d.params, |param: Param| param.name.name),
+                          map(d.generics.labels, |ident: Ident| ident.name),
+                          sites_in(facts.label_sites, i),
+                          d.body,
+                        ) {
+                        None -> None,
+                        Some(l) -> match list_at(written_at(lambdas_of(l.code), start), nth) {
+                          None -> None,
+                          Some(code) ->
+                            Some({
+                              owner: owner,
+                              at: start,
+                              nth: nth,
+                              code: code,
+                              module: m.name,
+                              here: defs_in(m.name, m.module, pure, schemes),
+                              imports: resolved_imports(x.r, i, mods, m.module, defs_of),
+                              effects: effects_in(x.r, i, mods),
+                              typed: typed_in(facts, i),
+                              operands: operands_in(facts.operands, i),
+                              base: d.span.start,
+                            }),
+                        },
+                      },
+                    }
+                  },
+                }
+              };
               fold(range(0, len(mods)), [], |acc: List<Emitted>, i: Int|
                 match list_at(mods, i) {
                   None -> acc,
@@ -12564,6 +13277,7 @@ fn emit_program(
                         x.r,
                         i,
                         mods,
+                        lambda_at,
                       ),
                       acc,
                       |a: List<Emitted>, e: Emitted| push(a, calling_instances(stated, e)),
@@ -12794,6 +13508,7 @@ fn emit_module(
   resolved: Resolved,
   index: Int,
   mods: List<ParsedModule>,
+  lambda_at: (Bytes, Int, Int) -> Option<BoundLambda> / {abort.raise},
 ) -> List<Emitted> / {abort.raise} = {
   let sites = read.labels;
   let operands = read.operands;
@@ -12818,13 +13533,15 @@ fn emit_module(
         let specialisations = fold(
           specialisations_wanted(wanted, p.full),
           acc.out,
-          |a: List<Emitted>, args: List<Type>|
+          |a: List<Emitted>, sp: { args: List<Type>, fns: List<FnArg> }|
             push(
               a,
               specialised_emitted(
                 module,
                 d,
-                args,
+                sp.args,
+                sp.fns,
+                lambda_at,
                 schemes,
                 ops,
                 sites,
@@ -12912,8 +13629,14 @@ fn emit_module(
         let full = test_owner(module, t.name);
         let ps = if t.cases == None { [] } else {
           [
-            { name: case_at(), kind: KInt, ty: TyOpen([]), carrier: Whole(KBoxed) },
-            { name: case_identity(), kind: KBoxed, ty: TyBytes, carrier: Whole(KBoxed) },
+            { name: case_at(), kind: KInt, ty: TyOpen([]), carrier: Whole(KBoxed), lambda: None },
+            {
+              name: case_identity(),
+              kind: KBoxed,
+              ty: TyBytes,
+              carrier: Whole(KBoxed),
+              lambda: None,
+            },
           ]
         };
         let rooted = |name: Bytes, taken: List<EmitParam>, body: Expr|
@@ -13174,6 +13897,59 @@ fn tail_callees(here: List<Def>, code: Code, acc: List<Bytes>) -> List<Bytes> / 
     _ -> acc,
   }
 
+/// The lambdas `c` writes, at any depth, each before those its body writes, in one fixed order.
+fn lambdas_of(c: Code) -> List<Lambda> = {
+  let within = |codes: List<Code>|
+    fold(codes, [], |acc: List<Lambda>, x: Code| concat(acc, lambdas_of(x)));
+  match c.node {
+    NLambda(l) -> concat([l], lambdas_of(l.body)),
+    NUnary(u) -> lambdas_of(u.operand),
+    NBinary(b) -> within([b.lhs, b.rhs]),
+    NField(f) -> lambdas_of(f.base),
+    NApp(a) -> within(push(a.args, a.func)),
+    NIf(i) -> within([i.cond, i.then_branch, i.else_branch]),
+    NBlock(b) ->
+      within(
+        fold(
+          b.stmts,
+          match b.tail { Some(t) -> [t], None -> [] },
+          |acc: List<Code>, stmt: CodeStmt|
+            push(acc, match stmt { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code }),
+        ),
+      ),
+    NList(l) -> within(l.items),
+    NRecord(r) -> within(map(r.fields, |f: CodeField| f.value)),
+    NUpdate(u) -> within(push(map(u.sets, |f: CodeField| f.value), u.base)),
+    NMatch(m) ->
+      within(
+        fold(m.arms, [m.scrutinee], |acc: List<Code>, a: CodeArm|
+          push(match a.guard { Some(g) -> push(acc, g), None -> acc }, a.body)),
+      ),
+    NPerform(x) -> within(x.args),
+    NCell(x) -> within([x.init, x.body]),
+    NSimulate(x) -> lambdas_of(x.body),
+    NInlined(x) -> within(push(x.args, x.func)),
+    NParallel(x) -> within(x.branches),
+    NHandle(h) ->
+      within(
+        fold(
+          h.clauses,
+          match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+          |acc: List<Code>, cl: CodeClause| push(acc, cl.body),
+        ),
+      ),
+    _ -> [],
+  }
+}
+
+/// The lambdas of `ls` written at byte `at`, in their order.
+fn written_at(ls: List<Lambda>, at: Int) -> List<Lambda> = filter(ls, |l: Lambda| l.at.start == at)
+
+/// Where `l` first stands in `ls`.
+fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
+  fold(range(0, len(ls)), None, |acc: Option<Int>, k: Int|
+    match acc { Some(_) -> acc, None -> if list_at(ls, k) == Some(l) { Some(k) } else { None } })
+
 fn has_handle(c: Code) -> Bool = {
   let within = |codes: List<Code>| fold(codes, false, |acc: Bool, x: Code| acc || has_handle(x));
   match c.node {
@@ -13203,6 +13979,7 @@ fn has_handle(c: Code) -> Bool = {
     NCell(c2) -> within([c2.init, c2.body]),
     NLambda(l) -> has_handle(l.body),
     NSimulate(x) -> has_handle(x.body),
+    NInlined(x) -> within(push(x.args, x.func)) || has_handle(x.lambda.body),
     NParallel(pr) -> within(pr.branches),
     _ -> false,
   }
@@ -13269,6 +14046,7 @@ fn params_carried(
       kind: match list_at(kinds, i) { Some(Some(p)) -> p.kind, _ -> KInt },
       ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },
       carrier: match list_at(carriers, i) { Some(c) -> c, None -> Whole(KBoxed) },
+      lambda: None,
     })
 
 /// One root's emission, definition, test or proposition alike. An unlowered body's handled operations are read off its source, so the fixpoint still drops their performers.
@@ -13564,6 +14342,7 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> / {abort.rais
     NBinary(b) -> here(walk_handles(b.lhs, effects), b.rhs),
     NField(f) -> walk_handles(f.base, effects),
     NApp(a) -> fold(a.args, walk_handles(a.func, effects), here),
+    NInlined(x) -> fold(x.args, walk_handles(x.func, effects), here),
     NIf(i) -> here(here(walk_handles(i.cond, effects), i.then_branch), i.else_branch),
     NBlock(b) -> {
       let stmts = fold(b.stmts, [], |acc: List<Bytes>, stmt: CodeStmt|
@@ -13603,6 +14382,8 @@ derive bin for Const
 derive bin for Head
 derive bin for Defined
 derive bin for Expect
+derive bin for Pass
+derive bin for FnArg
 derive bin for GenericCall
 derive bin for Need
 derive bin for Generics
