@@ -392,7 +392,6 @@ pub type EmitParam = {
 /// lambda as its owner lowered it, and what the owner's body is emitted under.
 pub type BoundLambda = {
   owner: Bytes,
-  at: Int,
   nth: Int,
   code: Lambda,
   module: Bytes,
@@ -3392,12 +3391,12 @@ fn lent_of(params: List<EmitParam>) -> List<BoundLambda> =
   fold(params, [], |acc: List<BoundLambda>, p: EmitParam|
     match p.lambda { Some(bl) -> push(acc, bl), None -> acc })
 
-/// The lambda this root was handed that is `owner`'s `nth` written at `at`.
-fn lent_lambda(emitter: Emitter, owner: Bytes, at: Int, nth: Int) -> Option<BoundLambda> =
+/// The lambda this root was handed that is `owner`'s `nth`.
+fn lent_lambda(emitter: Emitter, owner: Bytes, nth: Int) -> Option<BoundLambda> =
   fold(emitter.lent, None, |acc: Option<BoundLambda>, bl: BoundLambda|
     match acc {
       Some(_) -> acc,
-      None -> if bl.owner == owner && bl.at == at && bl.nth == nth { Some(bl) } else { None },
+      None -> if bl.owner == owner && bl.nth == nth { Some(bl) } else { None },
     })
 
 /// The frame a lambda run in place is emitted in: at its owner's names, types and sites, counting
@@ -4366,7 +4365,7 @@ fn widths_closed(emitter: Emitter, c: Code) -> Code / {abort.raise} = {
         args: map(x.args, go),
         lambda: {
           ..x.lambda,
-          body: match lent_lambda(emitter, x.owner, x.lambda.at.start, x.nth) {
+          body: match lent_lambda(emitter, x.owner, x.nth) {
             Some(bl) ->
               widths_closed(
                 { ..emitter, module: bl.module, here: bl.here, imports: bl.imports },
@@ -7235,7 +7234,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     },
     // A call a specialisation runs in place: the function value and arguments evaluated here, then
     // the lambda's body in its own frame.
-    NInlined(x) -> match lent_lambda(emitter, x.owner, x.lambda.at.start, x.nth) {
+    NInlined(x) -> match lent_lambda(emitter, x.owner, x.nth) {
       None -> Some(refused(emitter, b"a lambda run in place that this root was not handed")),
       Some(bl) -> match expr(notail(emitter), x.func, params) {
         None -> None,
@@ -10388,22 +10387,13 @@ pub fn specialised(full: Bytes, args: List<Type>) -> Bytes =
   bytes_concat_all([full, b"@", bytes_join(map(args, spelled_type), b",")])
 
 /// `specialised`, and then each lambda the root runs where it calls parameter `param`, as
-/// `|param=owner:at`.
+/// `|param=owner:nth`.
 pub fn specialised_with(full: Bytes, args: List<Type>, fns: List<FnArg>) -> Bytes =
   bytes_concat_all(
     concat(
       [specialised(full, args)],
       map(fns, |f: FnArg|
-        bytes_concat_all([
-          b"|",
-          ascii_of_int(f.param),
-          b"=",
-          f.owner,
-          b":",
-          ascii_of_int(f.at),
-          b":",
-          ascii_of_int(f.nth),
-        ])),
+        bytes_concat_all([b"|", ascii_of_int(f.param), b"=", f.owner, b":", ascii_of_int(f.nth)])),
     ),
   )
 
@@ -10437,19 +10427,18 @@ pub fn specialisation_of(
     }
   }
 
-/// A lambda `specialised_with` spelled as `param=owner:at:nth`.
+/// A lambda `specialised_with` spelled as `param=owner:nth`.
 fn fn_arg_of(spelled: Bytes) -> Option<FnArg> / {abort.raise} =
   match bytes_index_of(spelled, b"=") {
     None -> None,
     Some(eq) -> {
       let rest = bytes_slice(spelled, eq + 1, bytes_len(spelled));
       let parts = bytes_split(rest, b":");
-      if eq == 0 || len(parts) != 3 { None } else {
+      if eq == 0 || len(parts) != 2 { None } else {
         Some({
           param: digits(bytes_slice(spelled, 0, eq)),
           owner: at(parts, 0),
-          at: digits(at(parts, 1)),
-          nth: digits(at(parts, 2)),
+          nth: digits(at(parts, 1)),
         })
       }
     },
@@ -10900,7 +10889,7 @@ fn specialised_emitted(
   def: FnDef,
   args: List<Type>,
   fns: List<FnArg>,
-  lambda_at: (Bytes, Int, Int) -> Option<BoundLambda> / {abort.raise},
+  lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
   schemes: Map<Bytes, Scheme>,
   ops: List<WitnessOp>,
   sites: Map<Bytes, List<Bytes>>,
@@ -10961,7 +10950,7 @@ fn specialised_emitted(
   let lent = fold(fns, Some(carried), |acc: Option<List<EmitParam>>, f: FnArg|
     match acc {
       None -> None,
-      Some(ps) -> match lambda_at(f.owner, f.at, f.nth) {
+      Some(ps) -> match lambda_at(f.owner, f.nth) {
         None -> None,
         Some(bl) ->
           Some(
@@ -11797,9 +11786,10 @@ fn head_of(params: List<EmitParam>, answer: Carrier) -> Head =
 /// `fns` the lambdas it hands, which the root it settles on may run in place of its calls of them.
 pub type GenericCall = { callee: Bytes, args: List<Bytes>, carried: List<Int>, fns: List<FnArg> }
 
-/// A literal lambda handed as argument `param`: the `at`th byte of its owner root's module is where
-/// it is written.
-pub type FnArg = { param: Int, owner: Bytes, at: Int, nth: Int }
+/// A literal lambda handed as argument `param`: the `nth` its owner root lowers. Where the owner
+/// stands in its module is no part of it, so a body kept for a definition names the same lambda
+/// wherever the definition moves.
+pub type FnArg = { param: Int, owner: Bytes, nth: Int }
 
 /// Where a body's code took a slow path because type variable `var` was unknown: its layout, where
 /// `layout`, else only whether it is a scalar the code holds apart from a word.
@@ -12505,13 +12495,21 @@ test "a lambda reads a field of its parameter or its capture where the record's 
   ])
 }
 
+/// `scaled` hands a lambda to `total`, which hands it on to `each`, which calls it.
+fn lending() -> Bytes =
+  b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\n"
+
 test "a lambda handed to a definition that calls it is run in place by the root it settles on" {
-  let src = b"fn each(n: Int, f: (Int) -> Int, i: Int, acc: Int) -> Int = if i >= n { acc } else { each(n, f, i + 1, acc + f(i)) }\nfn total(n: Int, f: (Int) -> Int) -> Int = each(n, f, 0, 0)\nfn scaled(n: Int, k: Int) -> Int = total(n, |x: Int| x * k)\n";
-  let at = match bytes_index_of(src, b"|x: Int|") { Some(i) -> i, None -> 0 - 1 };
-  let lent = [{ param: 1, owner: b"m.scaled", at: at, nth: 0 }];
+  let lent = [{ param: 1, owner: b"m.scaled", nth: 0 }];
   let total = specialised_with(b"m.total", [], lent);
   let each = specialised_with(b"m.each", [], lent);
-  let answers = answers_of([b"m"], [src], [], [b"m.each", b"m.total", b"m.scaled", total, each]);
+  let answers = answers_of([b"m"], [lending()], [], [
+    b"m.each",
+    b"m.total",
+    b"m.scaled",
+    total,
+    each,
+  ]);
   let body = |name: Bytes|
     fold(answers, None, |acc: Option<{ text: Bytes, tables: Tables }>, a: RootAnswer|
       if a.name != name { acc } else {
@@ -12532,6 +12530,26 @@ test "a lambda handed to a definition that calls it is run in place by the root 
     },
     None -> panic("no body for the specialisation"),
   }
+}
+
+test "a body that hands a lambda on is the same wherever its definition stands, and so are the roots it names" {
+  let lent = [{ param: 1, owner: b"m.scaled", nth: 0 }];
+  let wanted = [
+    b"m.scaled",
+    specialised_with(b"m.total", [], lent),
+    specialised_with(b"m.each", [], lent),
+  ];
+  let emitted = |above: Bytes|
+    map(answers_of([b"m"], [bytes_concat(above, lending())], [], wanted), |a: RootAnswer|
+      match a.answer {
+        Body(b) -> { name: a.name, text: b.text, calls: b.tables.calls },
+        Refused(r) -> panic(string_of_bytes_lossy(bytes_concat_all([a.name, b": ", r.why]))),
+      });
+  // A body is kept under its definition's hash, which an edit above the definition does not move.
+  assert_eq(
+    emitted(b"// a comment, and a definition, above them\nfn aside() -> Int = 7\n"),
+    emitted(b""),
+  )
 }
 
 test "a definition's call of itself is written to the head of the root it names" {
@@ -13030,8 +13048,8 @@ fn fn_args(
     match list_at(codes, j) {
       Some(c) -> match c.node {
         NLambda(l) -> if lends {
-          match position_in(written_at(emitter.written, l.at.start), l) {
-            Some(nth) -> push(acc, { param: j, owner: emitter.owner, at: l.at.start, nth: nth }),
+          match position_in(emitter.written, l) {
+            Some(nth) -> push(acc, { param: j, owner: emitter.owner, nth: nth }),
             None -> acc,
           }
         } else { acc },
@@ -13043,7 +13061,7 @@ fn fn_args(
             },
             None -> None,
           } {
-          Some(bl) -> push(acc, { param: j, owner: bl.owner, at: bl.at, nth: bl.nth }),
+          Some(bl) -> push(acc, { param: j, owner: bl.owner, nth: bl.nth }),
           None -> acc,
         },
         _ -> acc,
@@ -13456,13 +13474,10 @@ test "a specialisation's root spells its layouts and the lambdas it runs, and re
   assert_eq(root, b"m.f@{a:Array<{x:Float}>,b:_},List<_>,U32");
   assert_eq(specialisation_of(root), Some({ base: b"m.f", args: args, fns: [] }));
   assert_eq(specialisation_of(b"m.f@{a:"), None);
-  // A lambda a caller hands is spelled by the root that wrote it and where.
-  let fns = [
-    { param: 1, owner: b"app.main", at: 120, nth: 0 },
-    { param: 2, owner: b"lib.h", at: 7, nth: 3 },
-  ];
+  // A lambda a caller hands is spelled by the root that wrote it and which of its lambdas it is.
+  let fns = [{ param: 1, owner: b"app.main", nth: 0 }, { param: 2, owner: b"lib.h", nth: 3 }];
   let lent = specialised_with(b"m.f", [TyCon({ name: b"U32", args: [] })], fns);
-  assert_eq(lent, b"m.f@U32|1=app.main:120:0|2=lib.h:7:3");
+  assert_eq(lent, b"m.f@U32|1=app.main:0|2=lib.h:3");
   assert_eq(
     specialisation_of(lent),
     Some({ base: b"m.f", args: [TyCon({ name: b"U32", args: [] })], fns: fns }),
@@ -13634,7 +13649,7 @@ test "a root is in the module its owner is in" {
   assert_eq(module_of_root(test_owner(b"app", b"a.b c")), b"app");
   assert_eq(module_of_root(law_root(b"app", b"x.y", b"body")), b"app");
   assert_eq(
-    module_of_root(specialised_with(b"app.g", [], [{ param: 1, owner: b"lib.h", at: 7, nth: 0 }])),
+    module_of_root(specialised_with(b"app.g", [], [{ param: 1, owner: b"lib.h", nth: 0 }])),
     b"app",
   );
   assert_eq(module_of_root(b"main"), b"")
@@ -13933,7 +13948,7 @@ fn emit_program(
                 fold(program, [], |acc: List<Def>, md: ModuleDefs|
                   if md.module == path { md.defs } else { acc });
               // A lambda a specialisation runs: read again where its owner, a plain definition, lowers it.
-              let lambda_at = |owner: Bytes, start: Int, nth: Int| {
+              let lambda_at = |owner: Bytes, nth: Int| {
                 let dot = fold(range(0, bytes_len(owner)), 0 - 1, |acc: Int, k: Int|
                   if bytes_at(owner, k) == 46 { k } else { acc });
                 let module = bytes_slice(owner, 0, if dot < 0 { 0 } else { dot });
@@ -13959,12 +13974,11 @@ fn emit_program(
                           d.body,
                         ) {
                         None -> None,
-                        Some(l) -> match list_at(written_at(lambdas_of(l.code), start), nth) {
+                        Some(l) -> match list_at(lambdas_of(l.code), nth) {
                           None -> None,
                           Some(code) ->
                             Some({
                               owner: owner,
-                              at: start,
                               nth: nth,
                               code: code,
                               module: m.name,
@@ -14260,7 +14274,7 @@ fn emit_module(
   resolved: Resolved,
   index: Int,
   mods: List<ParsedModule>,
-  lambda_at: (Bytes, Int, Int) -> Option<BoundLambda> / {abort.raise},
+  lambda_at: (Bytes, Int) -> Option<BoundLambda> / {abort.raise},
 ) -> List<Emitted> / {abort.raise} = {
   let sites = read.labels;
   let operands = read.operands;
@@ -14693,9 +14707,6 @@ fn lambdas_of(c: Code) -> List<Lambda> = {
     _ -> [],
   }
 }
-
-/// The lambdas of `ls` written at byte `at`, in their order.
-fn written_at(ls: List<Lambda>, at: Int) -> List<Lambda> = filter(ls, |l: Lambda| l.at.start == at)
 
 /// Where `l` first stands in `ls`.
 fn position_in(ls: List<Lambda>, l: Lambda) -> Option<Int> =
