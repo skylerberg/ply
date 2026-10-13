@@ -90,6 +90,9 @@ STOPPED=124
 
 past_deadline() { [[ -n $deadline ]] && (($(date +%s) >= deadline)); }
 
+# Milliseconds since the epoch. `date +%s%3N` is GNU's: a Mac's `date` prints the `3N`.
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+
 # The command, ended when the deadline comes along with everything it started: STOPPED then, and
 # when the deadline had already come.
 bounded() {
@@ -103,7 +106,7 @@ bounded() {
 
 # What the run ID says once the deadline ended it, the milliseconds since STARTED into it.
 stopped_run() {
-  echo "::error::the run $2 was stopped at the job's deadline after $((($(date +%s%3N) - $1) / 1000))s: what it finished is kept, and a re-run of this job starts from it"
+  echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is kept, and a re-run of this job starts from it"
 }
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
@@ -190,7 +193,7 @@ tests_of() {
   shift
   placed "$id" || return 2
   out=$(mktemp)
-  started=$(date +%s%3N)
+  started=$(now_ms)
   tested "$path" ${picked[@]+"${picked[@]}"} ${part:+--shard "$part"} "$@" > "$out" || status=$?
   if ((status == STOPPED)); then
     stopped_run "$started" "$id"
@@ -199,7 +202,7 @@ tests_of() {
   fi
   listed "$out"
   timed "$out" "$path" >> "$durations"
-  spent "$out" "$(($(date +%s%3N) - started))"
+  spent "$out" "$(($(now_ms) - started))"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
   if [ "$selected" -eq 0 ] && [ -n "$part" ]; then
     echo "the run $id selected no test: every test of its suite is in another part"
@@ -227,7 +230,7 @@ proofs_of() {
   shift
   placed "$id" || return 2
   out=$(mktemp)
-  started=$(date +%s%3N)
+  started=$(now_ms)
   if [[ $id == proofs ]]; then
     bounded "$ply" prove --std "$path" "$@" --json > "$out" || status=$?
   else
@@ -241,7 +244,7 @@ proofs_of() {
   discharging=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
   cached=$(jq '.cached // 0' "$out" 2>/dev/null || echo 0)
-  echo "proved: $all claims, $cached from the cache, the rest discharged in $((discharging / 1000))s of the $((($(date +%s%3N) - started) / 1000))s the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
+  echo "proved: $all claims, $cached from the cache, the rest discharged in $((discharging / 1000))s of the $((($(now_ms) - started) / 1000))s the prove took$(jq -r "$answers" "$out" 2>/dev/null)"
   if [ "$all" -eq 0 ]; then
     echo "the run $id proved no claim" >&2
     status=1

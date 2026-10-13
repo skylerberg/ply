@@ -1190,6 +1190,21 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done
+  # A tree of maintained sources that declares a test is some run's package: one no run names is
+  # formatted and never tested.
+  local tested where
+  tested=$(
+    printf '%s\n' "$STD_TESTS" "$STD_LIBRARY" "$CLI_SUITE"
+    for entry in "${PACKAGE_SUITES[@]}"; do printf '%s\n' "${entry#*:}"; done
+  )
+  for where in "${FORMATTED_SOURCES[@]}"; do
+    [[ -d $root/$where ]] || continue
+    grep -rqE --include='*.ply' '^test(/[a-z]+)? "' "$root/$where" || continue
+    if ! grep -qxF -- "$where" <<< "$tested"; then
+      echo "FAIL: $where declares tests and no run takes it, so CI never runs them: name it in PACKAGE_SUITES" >&2
+      failures=$((failures + 1))
+    fi
+  done
   # A module's tests are picked out by `<module>.`, which no test of another module may hold.
   local module names keys outside
   keys=$(package_keys "$CLI_SUITE")
@@ -1218,7 +1233,7 @@ cmd_verify() {
   done
   # Every committed `.ply` is a maintained source or a fixture, so none is left out of the format
   # check by being forgotten.
-  local tracked under where
+  local tracked under
   while IFS= read -r tracked; do
     under=0
     for where in "${FORMATTED_SOURCES[@]}" "${FIXTURE_SOURCES[@]}"; do
