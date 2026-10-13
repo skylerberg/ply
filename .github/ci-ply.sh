@@ -129,13 +129,14 @@ tested() {
   return "$status"
 }
 
-# What a red run said: each failure's test and diagnostic, and a refused run's diagnostics. The report
-# itself is one line too long for a log to show.
+# What a red run said: each failure's test and diagnostic, and a refused run's diagnostics, each with
+# its notes, which name what refused. The report itself is one line too long for a log to show.
 red() {
   jq -r '
     (.failures[]? | ("FAILED \(.key // .name): \(.diagnostic.code // "") \(.diagnostic.message // "")",
       (.diagnostic.notes[]? | "  \(.)"))),
-    (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
+    (.diagnostics[]? | ("\(.severity // "error") \(.code // ""): \(.message // "")",
+      (.notes[]? | "  \(.)")))
   ' "$1" 2>/dev/null || cat "$1"
 }
 
@@ -268,7 +269,8 @@ disproved() {
     (.obligations[]? | select(.outcome != "proved")
       | "FAILED \(.owner) \(.label): \(.outcome)\(if .location then " at \(.location)" else "" end)",
         "  \(del(.key, .owner, .label, .kind, .guarded, .frame, .location, .outcome) | tojson)"),
-    (.diagnostics[]? | "\(.severity // "error") \(.code // ""): \(.message // "")")
+    (.diagnostics[]? | ("\(.severity // "error") \(.code // ""): \(.message // "")",
+      (.notes[]? | "  \(.)")))
   ' "$1" 2>/dev/null || cat "$1"
 }
 
