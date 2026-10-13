@@ -424,6 +424,17 @@ literal, a constructor over literals, a record or a list — and may not name
 another parameter (`E0121`) or, on a `pub fn`, anything its module does not
 export (`E0122`). Only a `fn` takes defaults (`E0120` elsewhere).
 
+A function may be declared in a type's namespace: `fn Stack::size(s: Stack) -> Int = ..`
+is the function `size` of `Stack`. It is named `Stack::size` wherever `Stack` is
+in scope, and called on a value as `s.size()` (§5.4). It is found by the type
+alone, with no search, so only the module that declares the type declares one
+(`E0208`); the type is a sum or a `new` record, since an alias is the type it
+names (`E0217`); and a `new` record has none under the name of one of its
+fields, which a call on a value reads first (`E0105`). It is `pub` or private
+as any function is, and it need not take a value of the type: `Stack::empty()`
+makes one. `key`, `show` and `numeric` (§4.4) may name one, `key for Stack by
+Stack::size`.
+
 `reuse fn` promises that every `push` in the body reuses its list (§5.6), and
 `transparent fn` puts the body into what another package reads of it (§10). The
 entry point is `main`, of any type and row: no `main` is `E0101`, several is
@@ -1251,16 +1262,27 @@ it.
 
 ### 5.4 Calls
 
-A bare variable followed by `.name(` is an effect perform, so a function in a
-record field is called as `(codec.decode)(json)`; `int_json().decode(j)` needs
-no parentheses because its base is a call.
+`value.name(args)` is a call on a value. Where the value is a record with a
+field `name` it calls the function the field holds, `codec.decode(json)`.
+Otherwise it is `T::name(value, args)`, the function `name` of `T` (§3.1), the
+head of the value's type: `s.push(1).size()` is `Stack::size(Stack::push(s, 1))`.
+The type alone finds the function, with no import, so the value's type is
+known where the call stands: a type parameter and a function have none to call
+(`E0201`), and a type with no function of the name is `E0101`. A label is
+written as on any call, `s.note[audit]()`.
+
+A bare name before the dot is read by what it names: a binding makes
+`x.name(..)` a call on its value, and anything else a perform of the effect `x`
+(§6.3). A binding and an effect of one name, in scope where such a call
+stands, is `E0105`.
 
 Positional arguments fill parameters left to right; the rest must be named
 (`greet("ada", greeting: "hey")`) or defaulted. A positional argument after a
 named one is `E0124`; an unknown or repeated name `E0123`; too few arguments
 `E0202`; a parameter left unfilled in a call that used names `E0125`. Only a
-callee reached by name takes named arguments. There is no partial application
-and no method syntax.
+callee reached by name takes named arguments and defaults, so a call on a
+value writes every argument by position, or is written `T::name(value, ..)`.
+There is no partial application.
 
 ### 5.5 Record update
 
@@ -3482,7 +3504,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0205` | non-exhaustive match |
 | `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver |
-| `E0208` | orphan `derive`, `key` or `show` |
+| `E0208` | orphan `derive`, `key` or `show`, or a function of a type another module declares |
 | `E0209` | `/` or `%` where no number has it: `/` on `Decimal`, either on a `numeric` type parameter |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
@@ -3491,7 +3513,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0214` | a `new` record whose fields reach the record itself |
 | `E0215` | a `numeric` that does not name each of `add`, `sub`, `mul`, `neg` and `of_int` once |
 | `E0216` | a `numeric` for a type that takes parameters |
-| `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum |
+| `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum, or a function of an alias |
 | `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, has a `where`, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0220` | a record literal or an update that would build an `opaque` record outside its module |
@@ -3590,7 +3612,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 
 * No loops, `break` or `return` (`?` is the only early exit, and a raise the
   only one past the caller, §6.8); no mutable variables; no exceptions
-  outside the row; no typeclasses, implicits or method syntax; no
+  outside the row; no typeclasses or implicits, and no dispatch at run time: a
+  call on a value (§5.4) is picked by its type where it is written; no
   modules-as-values or first-class effects; no `unsafe` or FFI: what a program
   reaches outside itself is an effect a handler answers, and the builtins are the
   only functions the runtime implements (§12).
