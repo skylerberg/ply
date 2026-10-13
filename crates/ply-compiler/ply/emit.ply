@@ -3062,7 +3062,7 @@ fn fused_iterate(
                       let held = bind_keeping(
                         with_reads(rescope(pin_all(guarded), window), slots_read(l.body)),
                         KBoxed,
-                        sv.value.ty,
+                        known_or(sv.value.ty, ty_at(lambda_param_tys(emitter, l), 0)),
                         state.name,
                       );
                       let inner = remember(
@@ -3292,8 +3292,12 @@ fn inlined_frame(
     with_reads(rescope(swapped, caps.window), slots_read(lambda.body)),
     |acc: Emitter, w: Unboxed| note_bound(charge(acc, w.slot, w.expr), w.expr),
   );
+  let tys = lambda_param_tys(swapped, lambda);
   fold(range(0, len(held.vals)), framed, |acc: Emitter, k: Int|
-    match list_at(held.vals, k) { Some(v) -> remember(acc, k, v), None -> acc })
+    match list_at(held.vals, k) {
+      Some(v) -> remember(acc, k, { ..v, ty: known_or(v.ty, ty_at(tys, k)) }),
+      None -> acc,
+    })
 }
 
 /// What a lambda run in place answered, made the caller's of `emitter` before what the frame
@@ -3765,6 +3769,7 @@ fn inlined_fold(
                 };
                 let captures = match f.node { NLambda(l) -> l.captures, _ -> [] };
                 let reads = match f.node { NLambda(l) -> slots_read(l.body), _ -> [0, 1] };
+                let tys = match f.node { NLambda(l) -> lambda_param_tys(emitter, l), _ -> [] };
                 match capture_window(opened, captures, params) {
                   None -> Some(refused(emitter, b"a capture this port has not bound")),
                   Some(window) -> {
@@ -3779,18 +3784,18 @@ fn inlined_fold(
                         b")",
                       ]),
                     );
+                    let held_ty = known_or(iv.value.ty, ty_at(tys, 0));
                     let holder = match k {
                       KBoxed -> {
-                        let h = bind_keeping(at.emitter, KBoxed, iv.value.ty, st.name);
+                        let h = bind_keeping(at.emitter, KBoxed, held_ty, st.name);
                         { emitter: note_holder(h.emitter, h.value.expr), value: h.value }
                       },
-                      _ ->
-                        { emitter: at.emitter, value: { kind: k, expr: st.name, ty: iv.value.ty } },
+                      _ -> { emitter: at.emitter, value: { kind: k, expr: st.name, ty: held_ty } },
                     };
                     let inner = remember(
                       remember(with_reads(rescope(holder.emitter, window), reads), 0, holder.value),
                       1,
-                      at.value,
+                      { ..at.value, ty: ty_at(tys, 1) },
                     );
                     match match f.node {
                         NLambda(l) -> expr(notail(inner), l.body, params),
@@ -4976,9 +4981,9 @@ fn caps_owned(
   captures: List<Capture>,
   params: List<EmitParam>,
   i: Int,
-  acc: List<Bytes>,
-) -> Option<{ emitter: Emitter, names: List<Bytes> }> =
-  if i >= len(captures) { Some({ emitter: emitter, names: acc }) } else {
+  acc: List<{ name: Bytes, ty: Ty }>,
+) -> Option<{ emitter: Emitter, caps: List<{ name: Bytes, ty: Ty }> }> =
+  if i >= len(captures) { Some({ emitter: emitter, caps: acc }) } else {
     match list_at(captures, i) {
       None -> None,
       Some(c) -> {
@@ -4993,16 +4998,41 @@ fn caps_owned(
         };
         match found {
           None ->
-            Some({ emitter: poison(emitter, b"a capture this port has not bound"), names: acc }),
+            Some({ emitter: poison(emitter, b"a capture this port has not bound"), caps: acc }),
           Some(v) -> {
             let mv = move_read(emitter, c.own, v);
             let w = owned(mv.emitter, mv.value);
-            caps_owned(w.emitter, captures, params, i + 1, push(acc, w.value.expr))
+            // The closure holds the capture as its word, laid out as the word was here.
+            let ty = if v.kind == KBoxed { v.ty } else { TyOpen([]) };
+            caps_owned(
+              w.emitter,
+              captures,
+              params,
+              i + 1,
+              push(acc, { name: w.value.expr, ty: ty }),
+            )
           },
         }
       },
     }
   }
+
+/// The layout of each of lambda `l`'s parameters at the type the checker gave the lambda, unknown
+/// where it filed none.
+fn lambda_param_tys(emitter: Emitter, l: Lambda) -> List<Ty> =
+  match map_get(emitter.typed, span_key(l.at)) {
+    Some(t) -> match t.ty {
+      TyFn(f) -> if len(f.params) == l.params { map(f.params, |p: Type| kind_of(p).ty) }
+      else { [] },
+      _ -> [],
+    },
+    None -> [],
+  }
+
+fn ty_at(tys: List<Ty>, j: Int) -> Ty = match list_at(tys, j) { Some(t) -> t, None -> TyOpen([]) }
+
+/// `ty` where it says something, else `fallback`.
+fn known_or(ty: Ty, fallback: Ty) -> Ty = match ty { TyOpen(_) -> fallback, _ -> ty }
 
 /// A lambda's C parameters are its captures then its own, all words, none opened at entry.
 /// It continues the unit's tables from its builder and hands additions back; a fresh copy would renumber from zero.
@@ -5010,8 +5040,10 @@ fn emit_lambda(
   emitter: Emitter,
   name: Bytes,
   l: Lambda,
+  cap_tys: List<Ty>,
 ) -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, generics: Generics, performs: List<Bytes>, handles: List<Bytes>, refused: Option<Bytes> }> / {abort.raise} = {
   let n = len(l.captures) + l.params;
+  let tys = lambda_param_tys(emitter, l);
   let window = fold(
     range(0, l.params),
     fold(range(0, len(l.captures)), [], |acc: List<Unboxed>, i: Int|
@@ -5021,7 +5053,7 @@ fn emit_lambda(
             slot: c.dst,
             kind: KBoxed,
             expr: bytes_concat(b"q", ascii_of_int(i)),
-            ty: TyOpen([]),
+            ty: ty_at(cap_tys, i),
           }),
         None -> acc,
       }),
@@ -5030,7 +5062,7 @@ fn emit_lambda(
         slot: j,
         kind: KBoxed,
         expr: bytes_concat(b"q", ascii_of_int(len(l.captures) + j)),
-        ty: TyOpen([]),
+        ty: ty_at(tys, j),
       }),
   );
   let reads = slots_read(l.body);
@@ -5798,7 +5830,7 @@ fn closure_value(
         } else { acc });
       let sub = bytes_concat(prefix, ascii_of_int(idx));
       let entry = lambda_of(w.emitter, bytes_concat(sub, b"_entry"));
-      match emit_lambda(entry.emitter, sub, l) {
+      match emit_lambda(entry.emitter, sub, l, map(w.caps, |c: { name: Bytes, ty: Ty }| c.ty)) {
         None -> None,
         Some(sub_out) -> {
           let arr = fresh(entry.emitter);
@@ -5808,7 +5840,8 @@ fn closure_value(
               b"Word ",
               arr.name,
               b"[] = {",
-              if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
+              if len(w.caps) == 0 { b"0" }
+              else { bytes_join(map(w.caps, |c: { name: Bytes, ty: Ty }| c.name), b", ") },
               b"};",
             ]),
           );
@@ -12095,6 +12128,29 @@ test "a definition takes and answers a float as itself, and a call says the head
   assert_eq(map(at(out, 1).tables.symbols, |d: Defined| d.head), [floats]);
   // An `Int` is a word whatever it is declared as, an immediate that costs no allocation.
   assert_eq(map(at(out, 2).tables.symbols, |d: Defined| d.head), [word_head(1)])
+}
+
+test "a lambda reads a field of its parameter or its capture where the record's type lays it" {
+  let src = bytes_concat_all([
+    b"type Fld = { name: Bytes, n: Int }\n",
+    b"fn mapped(fs: List<Fld>) -> List<Int> = map(fs, |f: Fld| f.n)\n",
+    b"fn folded(fs: List<Fld>) -> Int = fold(fs, 0, |acc: Int, f: Fld| acc + f.n)\n",
+    b"fn captured(f: Fld, xs: List<Int>) -> List<Int> = map(xs, |x: Int| x + f.n)\n",
+    b"fn stepped(f: Fld) -> Int / {abort.raise} = iterate(f, 9, |t: Fld| if t.n > 3 { Stop(t.n) } else { Continue({ ..t, n: t.n + 1 }) })\n",
+  ]);
+  let out = emit_all_program(
+    [{ name: b"m", src: src }],
+    [b"Stop", b"Continue"],
+    [b"map", b"fold"],
+    true,
+  );
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  assert_eq(map(out, |e: Emitted| bytes_index_of(e.text, b"rt_field_p") != None), [
+    false,
+    false,
+    false,
+    false,
+  ])
 }
 
 test "a lambda handed to a definition that calls it is run in place by the root it settles on" {
