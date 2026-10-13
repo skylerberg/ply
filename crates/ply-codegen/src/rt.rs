@@ -1626,7 +1626,7 @@ pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64
         tables.layouts.shape_offsets(shape)[k],
         tables.layouts.shape_slots(shape)[k],
     );
-    let w = heap::field_word(&mut c.heap, o, at, slot);
+    let w = heap::field_word(&mut c.heap, &tables.layouts, o, at, slot);
     heap::dec(r);
     w
 }
@@ -3188,13 +3188,25 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     let_go(pairs);
                     return None;
                 };
-                let k = heap::field_word(&mut ctx.heap, obj(e), ka, layouts.slot_at(shape, ka));
+                let k = heap::field_word(
+                    &mut ctx.heap,
+                    layouts,
+                    obj(e),
+                    ka,
+                    layouts.slot_at(shape, ka),
+                );
                 if !heap::native_key(layouts, k) {
                     heap::dec(k);
                     let_go(pairs);
                     return None;
                 }
-                let v = heap::field_word(&mut ctx.heap, obj(e), va, layouts.slot_at(shape, va));
+                let v = heap::field_word(
+                    &mut ctx.heap,
+                    layouts,
+                    obj(e),
+                    va,
+                    layouts.slot_at(shape, va),
+                );
                 pairs.push((k, v));
             }
             // Entries in key order, each key once, are the tree's leaves as they stand.
@@ -4710,7 +4722,8 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
     };
     let slot = ctx.tables.layouts.slot_at(shape, at);
     if slot != heap::Slot::Word {
-        let w = heap::field_word(&mut ctx.heap, o, at, slot);
+        let tables = Arc::clone(&ctx.tables);
+        let w = heap::field_word(&mut ctx.heap, &tables.layouts, o, at, slot);
         if own == 1 || own == 3 {
             heap::dec(base);
         }
