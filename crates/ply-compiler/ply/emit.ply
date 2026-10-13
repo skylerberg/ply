@@ -54,13 +54,28 @@ pub type Kind =
   | KFloat
   /// A `Decimal` in a `PlyDec`, the two words of its object, whose arithmetic is the runtime's.
   | KDec
-  /// An `Option` as its payload's word, `0` for `None`: no word of a value is zero. Counted as the
-  /// payload's word is, and made an `Option` object only where it leaves the code that knows it.
-  | KMaybe
+  /// A sum of known type as one word, as `SumSpec` says, counted as its argument's word is and made
+  /// the sum's object only where it leaves the code that knows it.
+  | KSum(SumSpec)
 
-/// Whether a value of kind `k` is a word that holds a count: a value's word, or an `Option`'s
-/// payload word, zero holding none.
-fn counted(k: Kind) -> Bool = k == KBoxed || k == KMaybe
+/// How a sum is one word. `Zeroed`: an `Option` is its payload's word, `0` for `None`; no word of a
+/// value is zero. `Tagged`: a `Result` whose error is always an object is its `Ok`'s argument's word,
+/// or its `Err`'s with the low bits `100`, which no value's word has.
+pub type SumSpec = | Zeroed | Tagged
+
+/// Whether a value of kind `k` is a word that holds a count: a value's word, or a sum's, zero or a
+/// tag holding none of its own.
+fn counted(k: Kind) -> Bool = match k { KBoxed -> true, KSum(_) -> true, _ -> false }
+
+fn is_sum(k: Kind) -> Bool = match k { KSum(_) -> true, _ -> false }
+
+/// The runtime's helper `what` for a sum held as `spec` says: `take` makes the object, taking the
+/// word's count; `box` makes it, adding one; `open` makes the word, taking the object.
+fn sum_helper(spec: SumSpec, what: Bytes) -> Bytes =
+  match spec {
+    Zeroed -> bytes_concat_all([b"rt_maybe_", what, b"_p"]),
+    Tagged -> bytes_concat_all([b"rt_tagged_", what, b"_p"]),
+  }
 
 pub type Width = { bits: Int, signed: Bool }
 
@@ -74,7 +89,8 @@ pub fn ctype(k: Kind) -> Bytes =
     } else { unsigned_ctype(w) },
     KFloat -> b"double",
     KDec -> b"PlyDec",
-    KMaybe -> b"PlyMaybe",
+    KSum(Zeroed) -> b"PlyMaybe",
+    KSum(Tagged) -> b"PlyTagged",
     _ -> b"int64_t",
   }
 
@@ -856,8 +872,12 @@ fn word_of(emitter: Emitter, value: CValue) -> { emitter: Emitter, expr: Bytes }
   match value.kind {
     KBoxed -> { emitter: materialise(emitter, value.expr), expr: value.expr },
     // A box of its own, which this scope lets go; the value keeps its count.
-    KMaybe -> {
-      let b = bind(emitter, KBoxed, bytes_concat_all([b"rt_maybe_box_p(ctx, ", value.expr, b")"]));
+    KSum(spec) -> {
+      let b = bind(
+        emitter,
+        KBoxed,
+        bytes_concat_all([sum_helper(spec, b"box"), b"(ctx, ", value.expr, b")"]),
+      );
       {
         emitter: if is_made(b.emitter, b.value.expr) { b.emitter }
         else { note_made(b.emitter, b.value.expr) },
@@ -1179,7 +1199,7 @@ fn raw_word(value: CValue) -> Bytes =
 /// The word a record holds `value` in where it holds it as a word: an `Option` held as its
 /// payload's word as that word.
 fn held_word(value: CValue) -> Bytes =
-  if value.kind == KMaybe { value.expr } else { as_word(value) }
+  if value.kind == KSum(Zeroed) { value.expr } else { as_word(value) }
 
 /// The field of `kind` that `base` holds as its own words from word `at` on, read as the kind.
 fn raw_at(base: Bytes, at: Bytes, kind: Kind) -> Bytes = {
@@ -1259,7 +1279,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
     _ -> match f.kind {
       KFloat -> bytes_concat(f.name, b"!f"),
       KDec -> bytes_concat(f.name, b"!d"),
-      KMaybe -> bytes_concat(f.name, b"!m"),
+      KSum(_) -> bytes_concat(f.name, b"!m"),
       KNum(w) -> if raw_slot(f.kind) {
         bytes_concat(f.name, if w.signed { b"!i64" } else { b"!u64" })
       } else { f.name },
@@ -1271,7 +1291,7 @@ pub fn spelled_field(f: FieldTy) -> Bytes =
 /// do, raw when it holds a `Float`'s bits or a record in place.
 fn record_flags(fs: List<FieldTy>, l: Laid) -> Int = {
   let raw = if fold(fs, false, |acc: Bool, f: FieldTy|
-      acc || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) { 4 }
+      acc || raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) { 4 }
   else { 0 };
   if l.width > 0 && leaves_uncounted(fs) { 1 + raw } else if l.tail > 0 { 2 + raw } else { raw }
 }
@@ -1365,9 +1385,70 @@ fn shape_of_fields(emitter: Emitter, fs: List<FieldTy>) -> { emitter: Emitter, i
   shape_of(nested, map(fs, spelled_field))
 }
 
-/// A word a record being built holds: written at `at`, or for a record held in place copied there
-/// whole, with `tail` the words its shape's bitmap takes.
-type WordAt = { at: Int, expr: Bytes, tail: Option<Int> }
+/// What a record or constructor being built holds at word `at`: a value written there, a record
+/// copied there whole with `tail` the words its shape's bitmap takes, or the header of a record whose
+/// words were written there as its fields. A record's header counts back to its holder's, which a
+/// copy of the holder keeps: `holder` is the word of the header of the record held in place that
+/// holds it, none where the object being built does.
+type WordAt =
+  | Put({ at: Int, expr: Bytes })
+  | Copied({ at: Int, expr: Bytes, tail: Int, holder: Option<Int> })
+  | Header({ at: Int, flags: Int, len: Int, shape: Int, holder: Option<Int> })
+
+/// A record argument written as a literal where its holder keeps a record in place: the cells of
+/// its fields, from its header's word on, which the holder writes at the argument's place.
+type Placed = { slot: Int, cells: List<WordAt> }
+
+/// `c` moved `by` words on; one the object held moves with its holder's words.
+fn shifted(c: WordAt, by: Int) -> WordAt =
+  match c {
+    Put(x) -> Put({ ..x, at: x.at + by }),
+    Copied(x) -> Copied({ ..x, at: x.at + by, holder: moved(x.holder, by) }),
+    Header(x) -> Header({ ..x, at: x.at + by, holder: moved(x.holder, by) }),
+  }
+
+fn moved(holder: Option<Int>, by: Int) -> Option<Int> =
+  match holder { Some(h) -> Some(h + by), None -> None }
+
+/// `c`, a cell of a record held in place whose header is at word 0, moved to its words from word 2:
+/// what the record held is held by its header there.
+fn held_inside(c: WordAt) -> WordAt =
+  match c {
+    Put(x) -> Put({ ..x, at: x.at + 2 }),
+    Copied(x) ->
+      Copied({
+        ..x,
+        at: x.at + 2,
+        holder: match x.holder { Some(h) -> Some(h + 2), None -> Some(0) },
+      }),
+    Header(x) ->
+      Header({
+        ..x,
+        at: x.at + 2,
+        holder: match x.holder { Some(h) -> Some(h + 2), None -> Some(0) },
+      }),
+  }
+
+/// The C word a cell's holder is, and the cell's word among its holder's.
+fn held_at(rec: Bytes, at: Int, holder: Option<Int>) -> { base: Bytes, at: Int } =
+  match holder {
+    None -> { base: rec, at: at },
+    Some(h) ->
+      {
+        base: bytes_concat_all([
+          b"((Word)(intptr_t)(ply_words(",
+          rec,
+          b") + ",
+          ascii_of_int(h),
+          b"))",
+        ]),
+        at: at - h - 2,
+      },
+  }
+
+fn put_cells(cells: List<WordAt>) -> List<{ at: Int, expr: Bytes }> =
+  fold(cells, [], |acc: List<{ at: Int, expr: Bytes }>, c: WordAt|
+    match c { Put(x) -> push(acc, x), _ -> acc })
 
 /// `words` are the record's, one per field in `fields`' order; where `raw_slot` holds of a field's
 /// kind its word is a `Float`'s bits, and where the field is held in place it is the record copied
@@ -1377,6 +1458,7 @@ fn build_record(
   emitter: Emitter,
   names: List<Bytes>,
   words: List<Bytes>,
+  placed: List<Placed>,
   fields: List<FieldTy>,
   vals: Option<List<CValue>>,
 ) -> WithValue = {
@@ -1385,7 +1467,7 @@ fn build_record(
   let l = laid_of(fields);
   let flags = record_flags(fields, l);
   let nests = fold(fields, false, |acc: Bool, f: FieldTy| acc || in_place(f) != None);
-  let cells = cells_of(fields, words, l, flags);
+  let cells = cells_of(fields, words, placed, l, flags);
   let ty = TyRec(fields);
   // What a field held in place was is copied and let go, so only the record's other fields are
   // remembered as values.
@@ -1416,7 +1498,7 @@ fn build_record(
           shape: sh.i,
           n: l.width,
           flags: flags,
-          cells: map(cells, |c: WordAt| { at: c.at, expr: c.expr }),
+          cells: put_cells(cells),
         }),
         bytes_concat_all([f.name, b" = 0;"]),
       );
@@ -1435,7 +1517,13 @@ fn build_record(
 /// The words an object laid out as a record of `fields` is holds: `words`, one per field, each at
 /// its offset, a `Decimal`'s local written as its two words, and the bitmap after them where
 /// `flags` says it is mixed.
-fn cells_of(fields: List<FieldTy>, words: List<Bytes>, l: Laid, flags: Int) -> List<WordAt> =
+fn cells_of(
+  fields: List<FieldTy>,
+  words: List<Bytes>,
+  placed: List<Placed>,
+  l: Laid,
+  flags: Int,
+) -> List<WordAt> =
   concat(
     fold(range(0, len(fields)), [], |acc: List<WordAt>, i: Int| {
       let f = match list_at(fields, i) {
@@ -1444,27 +1532,26 @@ fn cells_of(fields: List<FieldTy>, words: List<Bytes>, l: Laid, flags: Int) -> L
       };
       let at = match list_at(l.offsets, i) { Some(o) -> o, None -> i };
       let expr = match list_at(words, i) { Some(w) -> w, None -> b"0" };
-      if f.kind == KDec && in_place(f) == None {
-        concat(acc, [
-          { at: at, expr: bytes_concat(expr, b".lo"), tail: None },
-          { at: at + 1, expr: bytes_concat(expr, b".hi"), tail: None },
-        ])
-      } else {
-        push(acc, {
-          at: at,
-          expr: expr,
-          tail: match in_place(f) { Some(inner) -> Some(laid_of(inner).tail), None -> None },
-        })
+      match fold(placed, None, |found: Option<Placed>, p: Placed|
+          if p.slot == i { Some(p) } else { found }) {
+        Some(p) -> concat(acc, map(p.cells, |c: WordAt| shifted(c, at))),
+        None -> if f.kind == KDec && in_place(f) == None {
+          concat(acc, [
+            Put({ at: at, expr: bytes_concat(expr, b".lo") }),
+            Put({ at: at + 1, expr: bytes_concat(expr, b".hi") }),
+          ])
+        } else {
+          push(acc, match in_place(f) {
+            Some(inner) -> Copied({ at: at, expr: expr, tail: laid_of(inner).tail, holder: None }),
+            None -> Put({ at: at, expr: expr }),
+          })
+        },
       }
     }),
     if has_tail(flags) {
       let bits = tail_bits(l);
       map(range(0, len(bits)), |t: Int|
-        {
-          at: l.width + t,
-          expr: match list_at(bits, t) { Some(b) -> b, None -> b"0" },
-          tail: None,
-        })
+        Put({ at: l.width + t, expr: match list_at(bits, t) { Some(b) -> b, None -> b"0" } }))
     } else { [] },
   )
 
@@ -1549,33 +1636,52 @@ fn built_now(
   );
   let closed = line(outdent(made), b"}");
   // Words are written before a record is copied in place: copying lets the copied record go.
+  let copied = |c: WordAt| match c { Copied(_) -> true, _ -> false };
   let stored = fold(
-    concat(filter(cells, |c: WordAt| c.tail == None), filter(cells, |c: WordAt| c.tail != None)),
+    concat(filter(cells, |c: WordAt| !copied(c)), filter(cells, copied)),
     closed,
     |acc: Emitter, c: WordAt|
-      line(acc, match c.tail {
-        None ->
+      line(acc, match c {
+        Put(x) ->
           bytes_concat_all([
             b"ply_words(",
             rec.value.expr,
             b")[",
-            ascii_of_int(c.at),
+            ascii_of_int(x.at),
             b"] = ",
-            c.expr,
+            x.expr,
             b";",
           ]),
-        Some(t) ->
+        Copied(x) -> {
+          let h = held_at(rec.value.expr, x.at, x.holder);
           bytes_concat_all([
             b"ply_embed(ctx, ",
-            rec.value.expr,
+            h.base,
             b", ",
-            ascii_of_int(c.at),
+            ascii_of_int(h.at),
             b", ",
-            c.expr,
+            x.expr,
             b", ",
-            ascii_of_int(t),
+            ascii_of_int(x.tail),
             b");",
-          ]),
+          ])
+        },
+        Header(x) -> {
+          let h = held_at(rec.value.expr, x.at, x.holder);
+          bytes_concat_all([
+            b"ply_embedded(",
+            h.base,
+            b", ",
+            ascii_of_int(h.at),
+            b", ",
+            ascii_of_int(x.flags),
+            b", ",
+            ascii_of_int(x.len),
+            b", ",
+            shape_text(x.shape),
+            b");",
+          ])
+        },
       }),
   );
   let kept = match vals {
@@ -1669,13 +1775,14 @@ fn ctor_laid(
   tag: Int,
   fields: List<FieldTy>,
   words: List<Bytes>,
+  placed: List<Placed>,
 ) -> WithValue / {abort.raise} = {
   let l = laid_of(fields);
   let flags = record_flags(fields, l);
   built_now(
     emitter,
     [],
-    cells_of(fields, words, l, flags),
+    cells_of(fields, words, placed, l, flags),
     4,
     tag_text(emitter, tag),
     l.width,
@@ -2207,35 +2314,38 @@ fn bind_word(emitter: Emitter, value: CValue) -> WithValue = {
   }
 }
 
-/// Duplicate a word before a callee takes it; scalars are immediates and hold no count. An `Option`
-/// held as its payload's word is made the object it stands for, which takes that payload's count.
+/// Duplicate a word before a callee takes it; scalars are immediates and hold no count. A sum held
+/// as one word is made the object it stands for, which takes that word's count.
 fn owned(emitter: Emitter, value: CValue) -> WithValue =
-  if value.kind == KMaybe {
-    let payload = owned_word(emitter, { ..value, kind: KBoxed });
-    let boxed = bind(
-      payload.emitter,
-      KBoxed,
-      bytes_concat_all([b"rt_maybe_take_p(ctx, ", payload.value.expr, b")"]),
-    );
-    owned_word(boxed.emitter, boxed.value)
-  } else { owned_word(emitter, value) }
+  match value.kind {
+    KSum(spec) -> {
+      let word = owned_word(emitter, { ..value, kind: KBoxed });
+      let boxed = bind(
+        word.emitter,
+        KBoxed,
+        bytes_concat_all([sum_helper(spec, b"take"), b"(ctx, ", word.value.expr, b")"]),
+      );
+      owned_word(boxed.emitter, boxed.value)
+    },
+    _ -> owned_word(emitter, value),
+  }
 
-/// `value`, an `Option` as its object or as its payload's word, as its payload's word with a count
-/// this scope hands on.
-fn maybe_owned(emitter: Emitter, value: CValue) -> WithValue =
-  if value.kind == KMaybe {
+/// `value`, a sum as its object or as the word `spec` makes it, as that word with a count this
+/// scope hands on.
+fn sum_owned(emitter: Emitter, value: CValue, spec: SumSpec) -> WithValue =
+  if value.kind == KSum(spec) {
     let w = owned_word(emitter, { ..value, kind: KBoxed });
-    { emitter: w.emitter, value: { ..w.value, kind: KMaybe } }
+    { emitter: w.emitter, value: { ..w.value, kind: KSum(spec) } }
   } else {
-    // The object is taken, so one this scope holds alone hands its payload over without a copy.
+    // The object is taken, so one this scope holds alone hands its argument over without a copy.
     let w = owned(emitter, value);
     let opened = bind(
       w.emitter,
-      KMaybe,
-      bytes_concat_all([b"rt_maybe_open_p(ctx, ", w.value.expr, b")"]),
+      KSum(spec),
+      bytes_concat_all([sum_helper(spec, b"open"), b"(ctx, ", w.value.expr, b")"]),
     );
     let o = owned_word(opened.emitter, { ..opened.value, kind: KBoxed });
-    { emitter: o.emitter, value: { ..o.value, kind: KMaybe } }
+    { emitter: o.emitter, value: { ..o.value, kind: KSum(spec) } }
   }
 
 fn owned_word(emitter: Emitter, value: CValue) -> WithValue = {
@@ -2320,7 +2430,7 @@ fn failing_return(k: Kind) -> Bytes = bytes_concat_all([b"return ", zero_of(k), 
 fn as_int(value: CValue) -> Bytes =
   match value.kind {
     KInt -> value.expr,
-    KMaybe -> b"ply_maybe_unrouted",
+    KSum(_) -> b"ply_maybe_unrouted",
     KBool -> value.expr,
     KNum(_) -> bytes_concat_all([b"(int64_t)(", value.expr, b")"]),
     KFloat -> bytes_concat_all([b"rt_unbox_int_p(ctx, ", as_word(value), b")"]),
@@ -2452,7 +2562,7 @@ fn let_go(emitter: Emitter, subj: CValue, pattern: CodePattern) -> Emitter =
   if emitter.release && counted(subj.kind) && spendable(emitter, subj.expr) {
     let spent = spend_made(emitter, subj.expr);
     match pattern {
-      PxCtor(c) -> if len(c.args) == 0 || subj.kind == KMaybe { release_holder(spent, subj) } else {
+      PxCtor(c) -> if len(c.args) == 0 || is_sum(subj.kind) { release_holder(spent, subj) } else {
         match tag_of(emitter, c.name) {
           Some(tag) -> into_token(spent, subj.expr, ctor_width(emitter, tag, len(c.args))),
           None -> release_holder(spent, subj),
@@ -2464,40 +2574,46 @@ fn let_go(emitter: Emitter, subj: CValue, pattern: CodePattern) -> Emitter =
 
 /// Releases a holder's count, keeping its cells as a reuse token when the shape is known, and nulls the local.
 fn release_holder(emitter: Emitter, value: CValue) -> Emitter =
-  match deferred_of(emitter, value.expr) {
-    Some(d) ->
-      line(
-        note_tok(emitter, d.n),
-        bytes_concat_all([
-          b"if (",
-          value.expr,
-          b") { if (tok",
-          ascii_of_int(d.n),
-          b" == 0) { tok",
-          ascii_of_int(d.n),
-          b" = ply_reset_flat(",
-          value.expr,
-          b"); if (!tok",
-          ascii_of_int(d.n),
-          b") tok",
-          ascii_of_int(d.n),
-          b" = rt_reset_p(ctx, ",
-          value.expr,
-          b"); } else { ply_dec(ctx, ",
-          value.expr,
-          b"); } ",
-          value.expr,
-          b" = 0; }",
-        ]),
-      ),
-    None -> match width_of(value.ty) {
-      None ->
+
+  // A sum's word is no object's cells: zero, or tagged.
+  if is_sum(value.kind) {
+    line(emitter, bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]))
+  } else {
+    match deferred_of(emitter, value.expr) {
+      Some(d) ->
         line(
-          emitter,
-          bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]),
+          note_tok(emitter, d.n),
+          bytes_concat_all([
+            b"if (",
+            value.expr,
+            b") { if (tok",
+            ascii_of_int(d.n),
+            b" == 0) { tok",
+            ascii_of_int(d.n),
+            b" = ply_reset_flat(",
+            value.expr,
+            b"); if (!tok",
+            ascii_of_int(d.n),
+            b") tok",
+            ascii_of_int(d.n),
+            b" = rt_reset_p(ctx, ",
+            value.expr,
+            b"); } else { ply_dec(ctx, ",
+            value.expr,
+            b"); } ",
+            value.expr,
+            b" = 0; }",
+          ]),
         ),
-      Some(n) -> into_token(emitter, value.expr, n),
-    },
+      None -> match width_of(value.ty) {
+        None ->
+          line(
+            emitter,
+            bytes_concat_all([b"ply_dec(ctx, ", value.expr, b"); ", value.expr, b" = 0;"]),
+          ),
+        Some(n) -> into_token(emitter, value.expr, n),
+      },
+    }
   }
 
 /// Releases the local `name`, a record or a constructor of `n` words, into the token of that width
@@ -2629,16 +2745,73 @@ fn tag_of(emitter: Emitter, name: Bytes) -> Option<Int> = {
   }
 }
 
+/// Whether `t` is a `Result` whose error is always an object, which compiled code holds as one word.
+fn tagged_result(t: Type) -> Bool =
+  match t {
+    TyCon(c) ->
+      c.name == b"Result" && len(c.args) == 2
+        && (match list_at(c.args, 1) { Some(e) -> always_object(e), None -> false }),
+    _ -> false,
+  }
+
+/// Whether every value of `t` is an object's word: a record, a function, a list, map, array or
+/// columns, bytes or a string, a sum a module declares or a `Result`; never an immediate or zero.
+fn always_object(t: Type) -> Bool =
+  match t {
+    TyRecord(_) -> true,
+    TyNominal(_) -> true,
+    TyFn(_) -> true,
+    TyCon(c) ->
+      bytes_index_of(c.name, b".") != None || c.name == b"Result" || c.name == b"Bytes"
+        || c.name == b"String"
+        || c.name == b"List"
+        || c.name == b"Map"
+        || c.name == b"Array"
+        || c.name == b"Columns",
+    _ -> false,
+  }
+
 fn is_option_type(t: Type) -> Bool =
   match t { TyCon(c) -> c.name == b"Option" && len(c.args) == 1, _ -> false }
 
-/// Whether `tag` is the prelude's `Option` constructor `name`, which the table names bare.
+/// Constructor `name` of a sum held as `kind` says, over its word `w`: the test that `w` is it, and
+/// its argument's word.
+fn sum_case(emitter: Emitter, kind: Kind, name: Bytes, w: Bytes) -> { test: Bytes, arg: Bytes } = {
+  let bare = match tag_of(emitter, name) {
+    Some(tag) -> match list_at(emitter.ctors.names, tag) { Some(n) -> n, None -> name },
+    None -> name,
+  };
+  match kind {
+    KSum(Tagged) -> if bare == b"Err" {
+      {
+        test: bytes_concat_all([b"((", w, b" & 7) == 4)"]),
+        arg: bytes_concat_all([b"(", w, b" & ~(Word)7)"]),
+      }
+    } else { { test: bytes_concat_all([b"((", w, b" & 7) != 4)"]), arg: w } },
+    _ -> if bare == b"None" { { test: bytes_concat_all([b"(", w, b" == 0)"]), arg: w } }
+    else { { test: bytes_concat_all([b"(", w, b" != 0)"]), arg: w } },
+  }
+}
+
+/// `word`, a word this scope now holds, as a `Result` held as one word: itself for `Ok`, its
+/// object's address tagged `100` for `Err`.
+fn held_tagged(emitter: Emitter, word: Bytes, err: Bool) -> WithValue = {
+  let b = bind(emitter, KSum(Tagged), if err { bytes_concat_all([b"((Word)(", word, b") | 4)"]) }
+  else { word });
+  {
+    emitter: if is_made(b.emitter, b.value.expr) { b.emitter }
+    else { note_made(b.emitter, b.value.expr) },
+    value: b.value,
+  }
+}
+
+/// Whether `tag` is the prelude's constructor `name`, which the table names bare.
 fn is_option(emitter: Emitter, tag: Int, name: Bytes) -> Bool =
   list_at(emitter.ctors.names, tag) == Some(name)
 
 /// `payload`, a word this scope now holds, as an `Option` held as that word.
 fn held_maybe(emitter: Emitter, payload: Bytes, ty: Ty) -> WithValue = {
-  let b = bind(emitter, KMaybe, payload);
+  let b = bind(emitter, KSum(Zeroed), payload);
   {
     emitter: if is_made(b.emitter, b.value.expr) { b.emitter }
     else { note_made(b.emitter, b.value.expr) },
@@ -3740,7 +3913,7 @@ fn inlined_fold(
               None -> None,
               Some(iv) -> {
                 // An `Option` held as its payload's word is carried round the loop as its object.
-                let k = if iv.value.kind == KMaybe { KBoxed } else { iv.value.kind };
+                let k = if is_sum(iv.value.kind) { KBoxed } else { iv.value.kind };
                 // The accumulator holds its count between steps; a step's holder takes it over.
                 let seeded = match k {
                   KBoxed -> if iv.emitter.release { owned(iv.emitter, iv.value) }
@@ -4771,7 +4944,7 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
       {
         emitter: note_holder(loaded, r.name),
         value: {
-          kind: if element.kind == KMaybe { KMaybe } else { KBoxed },
+          kind: if element.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
           expr: r.name,
           ty: element.ty,
         },
@@ -5247,8 +5420,8 @@ fn carried_arg(
       let w = owned(emitter, value);
       { emitter: w.emitter, names: [w.value.expr] }
     },
-    Whole(KMaybe) -> {
-      let w = maybe_owned(emitter, value);
+    Whole(KSum(spec)) -> {
+      let w = sum_owned(emitter, value, spec);
       { emitter: w.emitter, names: [w.value.expr] }
     },
     Whole(k) -> {
@@ -5356,6 +5529,7 @@ fn held_record(emitter: Emitter, fs: List<FieldTy>, vals: List<CValue>) -> WithV
     emitter,
     map(fs, |f: FieldTy| f.name),
     map(vals, |v: CValue| if raw_slot(v.kind) { raw_word(v) } else { held_word(v) }),
+    [],
     fs,
     Some(vals),
   )
@@ -5725,7 +5899,7 @@ fn names_of(fs: List<FieldTy>) -> List<Bytes> = map(fs, |field: FieldTy| field.n
 fn as_bool(value: CValue) -> Bytes =
   match value.kind {
     KBool -> value.expr,
-    KMaybe -> b"ply_maybe_unrouted",
+    KSum(_) -> b"ply_maybe_unrouted",
     KNum(_) -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KInt -> bytes_concat_all([b"((", value.expr, b") != 0)"]),
     KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", value.expr, b")"]),
@@ -5754,7 +5928,7 @@ fn as_word(value: CValue) -> Bytes =
   match value.kind {
     KBoxed -> value.expr,
     // Made an object only by `owned` or `word_of`, which know whose its count is.
-    KMaybe -> b"ply_maybe_unrouted",
+    KSum(_) -> b"ply_maybe_unrouted",
     // The C type the value is held in decides sign or zero extension.
     KNum(w) -> if in_imm(w) { bytes_concat_all([b"ply_imm((int64_t)", value.expr, b")"]) } else {
       bytes_concat_all([
@@ -5948,9 +6122,10 @@ fn in_place_update(
         Some(v) -> {
           let nm = match list_at(sets, i) { Some(f) -> f.name, None -> b"" };
           let raw = fold(fs, None, |r: Option<Kind>, f: FieldTy|
-            if f.name == nm && (raw_slot(f.kind) || f.kind == KMaybe) { Some(f.kind) } else { r });
+            if f.name == nm && (raw_slot(f.kind) || f.kind == KSum(Zeroed)) { Some(f.kind) }
+            else { r });
           let w = match raw {
-            Some(KMaybe) -> maybe_owned(acc.emitter, v),
+            Some(KSum(spec)) -> sum_owned(acc.emitter, v, spec),
             Some(k) -> held_raw(acc.emitter, v, k),
             None -> owned(acc.emitter, v),
           };
@@ -6072,7 +6247,7 @@ fn read_field(
           Some(i) -> {
             let w = bind_keeping(
               held.emitter,
-              if i.kind == KMaybe { KMaybe } else { KBoxed },
+              if i.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
               i.ty,
               field_read(held.value.expr, i),
             );
@@ -6103,7 +6278,7 @@ fn read_field(
                       held.value.expr,
                       b")[",
                       ascii_of_int(i.at),
-                      if i.kind == KMaybe { b"] = 0; } else { ply_inc(" }
+                      if i.kind == KSum(Zeroed) { b"] = 0; } else { ply_inc(" }
                       else { b"] = ply_unit; } else { ply_inc(" },
                       w.value.expr,
                       b"); }",
@@ -6238,7 +6413,7 @@ fn columns_load(
   let otherwise = indent(line(outdent(fast), b"} else {"));
   let slow = if kind == KBoxed {
     check(line(otherwise, bytes_concat_all([out.name, b" = ", call, b";"])))
-  } else if kind == KMaybe {
+  } else if kind == KSum(Zeroed) {
     // The runtime answers the `Option`'s object, which opening takes.
     check(line(otherwise, bytes_concat_all([out.name, b" = rt_maybe_open_p(ctx, ", call, b");"])))
   } else {
@@ -6273,7 +6448,8 @@ fn column_read(column: Bytes, i: Bytes, f: FieldTy) -> Bytes = {
   match f.ty {
     TyRec(_) -> bytes_concat_all([b"((Word)(intptr_t)(ply_words(", column, b") + ", at, b"))"]),
     _ -> if raw_slot(f.kind) { raw_at(column, at, f.kind) }
-    else if f.kind == KMaybe { bytes_concat_all([b"ply_words(", column, b")[", i, b"]"]) } else {
+    else if f.kind == KSum(Zeroed) { bytes_concat_all([b"ply_words(", column, b")[", i, b"]"]) }
+    else {
       as_kind(
         {
           kind: KBoxed,
@@ -6359,8 +6535,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
       None -> if is_ctor_name(v.name) {
         match tag_of(emitter, v.name) {
           None -> Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", v.name))),
-          Some(tag) -> if is_option(emitter, tag, b"None") { Some(bind(emitter, KMaybe, b"0")) }
-          else {
+          Some(tag) -> if is_option(emitter, tag, b"None") {
+            Some(bind(emitter, KSum(Zeroed), b"0"))
+          } else {
             let o = bind(
               emitter,
               KBoxed,
@@ -6427,10 +6604,10 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   ty: p.ty,
                 }),
               ),
-            KMaybe ->
+            KSum(spec) ->
               Some(
                 move_read(emitter, c.own, {
-                  kind: KMaybe,
+                  kind: KSum(spec),
                   expr: bytes_concat(b"p", ascii_of_int(s)),
                   ty: p.ty,
                 }),
@@ -6649,7 +6826,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
                     match built_field(acc.emitter, held.value.expr, nm) {
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
-                        let o = if tk == KMaybe { maybe_owned(acc.emitter, v) }
+                        let o = if tk == KSum(Zeroed) { sum_owned(acc.emitter, v, Zeroed) }
                         else { owned(acc.emitter, v) };
                         {
                           emitter: o.emitter,
@@ -6723,8 +6900,8 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                           // The runtime answers the copy duplicated, and the record takes it, or keeps
                           // it until the block closes where the record holds the `Float` it is as bits.
                           if raw_slot(tk) { as_bits(acc, check(w.emitter), w.value, at) }
-                          else if tk == KMaybe {
-                            let o = maybe_owned(check(w.emitter), w.value);
+                          else if tk == KSum(Zeroed) {
+                            let o = sum_owned(check(w.emitter), w.value, Zeroed);
                             {
                               emitter: o.emitter,
                               ws: push(acc.ws, o.value.expr),
@@ -6757,7 +6934,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                       Some(v) -> if raw_slot(tk) { as_bits(acc, acc.emitter, v, at) } else {
                         // The written field's word is duplicated: the record being built takes it.
                         let w = if owned_already { { emitter: acc.emitter, value: v } }
-                        else if tk == KMaybe { maybe_owned(acc.emitter, v) }
+                        else if tk == KSum(Zeroed) { sum_owned(acc.emitter, v, Zeroed) }
                         else { owned(acc.emitter, v) };
                         {
                           emitter: w.emitter,
@@ -6778,8 +6955,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                   None -> Some(record_by_value(rel, names, filled.ws)),
                   Some(fs) ->
                     Some(
-                      build_record(rel, names, filled.ws, fs, if filled.known { Some(filled.vals) }
-                      else { None }),
+                      build_record(rel, names, filled.ws, [], fs, if filled.known {
+                        Some(filled.vals)
+                      } else { None }),
                     ),
                 },
               }
@@ -6820,7 +6998,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
             emitter,
             map(r.fields, |f: CodeField| f.value),
             params,
-            map(names, |nm: Bytes| kind_at(kinds_of(fields), rank_of(names, nm))),
+            map(names, |nm: Bytes| nth_field(fields, rank_of(names, nm))),
           ) {
           None -> None,
           Some(w) -> {
@@ -6838,6 +7016,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
                 w.emitter,
                 sorted,
                 map(range(0, len(sorted)), |at: Int| word_at_rank(names, w.names, at)),
+                ranked(names, w.placed),
                 fields,
                 Some(vals),
               ),
@@ -6855,7 +7034,19 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
           match tag_of(emitter, fv.name) {
             None ->
               Some(refused(emitter, bytes_concat(b"a constructor not in the table: ", fv.name))),
-            Some(tag) -> if is_option(emitter, tag, b"Some") && len(a.args) == 1 {
+            // A `Result` the root answers as one word is built as that word; anywhere else it is
+            // the object, which may take the cells of the one a match let go.
+            Some(tag) -> if (is_option(emitter, tag, b"Ok") || is_option(emitter, tag, b"Err"))
+                && len(a.args) == 1
+                && answers_sum(emitter) == Some(Tagged) {
+              match items(emitter, a.args, params, 0, []) {
+                None -> None,
+                Some(w) -> match list_at(w.names, 0) {
+                  None -> None,
+                  Some(word) -> Some(held_tagged(w.emitter, word, is_option(emitter, tag, b"Err"))),
+                },
+              }
+            } else if is_option(emitter, tag, b"Some") && len(a.args) == 1 {
               match items(emitter, a.args, params, 0, []) {
                 None -> None,
                 Some(w) -> match list_at(w.names, 0) {
@@ -6871,9 +7062,9 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
               }
             } else {
               match ctor_fields(emitter, tag) {
-                Some(fs) -> match items_laid(emitter, a.args, params, kinds_of(fs)) {
+                Some(fs) -> match items_laid(emitter, a.args, params, fs) {
                   None -> None,
-                  Some(w) -> Some(ctor_laid(w.emitter, tag, fs, w.names)),
+                  Some(w) -> Some(ctor_laid(w.emitter, tag, fs, w.names, w.placed)),
                 },
                 None -> match items(emitter, a.args, params, 0, []) {
                   None -> None,
@@ -7065,7 +7256,7 @@ fn expr(emitter: Emitter, c: Code, params: List<EmitParam>) -> Option<WithValue>
     NMatch(m) -> match match_subject(emitter, m.scrutinee, params) {
       None -> None,
       Some(s) -> {
-        let k = if answers_maybe(emitter) { KMaybe } else { KBoxed };
+        let k = match answers_sum(emitter) { Some(spec) -> KSum(spec), None -> KBoxed };
         let ans = fresh(s.emitter);
         let declared = line(ans.emitter, bytes_concat_all([ctype(k), b" ", ans.name, b" = 0;"]));
         match match_arms(
@@ -7937,55 +8128,157 @@ fn items(
   i: Int,
   acc: List<Bytes>,
 ) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
-  items_from(emitter, codes, params, i, acc, [], [])
+  match items_from(emitter, codes, params, i, { names: acc, vals: [], placed: [] }, []) {
+    Some(w) -> Some({ emitter: w.emitter, names: w.names, vals: w.vals }),
+    None -> None,
+  }
 
-/// A record's fields, each held as `kinds` says the record holds it: a word the record takes, or a
-/// `Float`'s bits.
+/// A record's fields or a constructor's arguments, each held as the field in `slots` it fills: a
+/// word the object takes, a `Float`'s bits, or, for a record literal where a record is held in
+/// place, its own fields written there.
 fn items_laid(
   emitter: Emitter,
   codes: List<Code>,
   params: List<EmitParam>,
-  kinds: List<Kind>,
-) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
-  items_from(emitter, codes, params, 0, [], [], kinds)
+  slots: List<FieldTy>,
+) -> Option<Items> / {abort.raise} =
+  items_from(emitter, codes, params, 0, { names: [], vals: [], placed: [] }, slots)
+
+type Items = { emitter: Emitter, names: List<Bytes>, vals: List<CValue>, placed: List<Placed> }
+
+/// `placed`, numbered by the argument written at each, numbered by its name's rank in `names`.
+fn ranked(names: List<Bytes>, placed: List<Placed>) -> List<Placed> =
+  map(placed, |p: Placed|
+    { ..p, slot: match list_at(names, p.slot) { Some(nm) -> rank_of(names, nm), None -> p.slot } })
+
+/// The fields of the record `slot` holds in place when `code` is a literal of exactly them.
+fn placeable(code: Code, slot: FieldTy) -> Option<List<FieldTy>> =
+  match code.node {
+    NRecord(r) -> match in_place(slot) {
+      Some(fs) -> if sorted_names(map(r.fields, |f: CodeField| f.name))
+          == map(fs, |f: FieldTy| f.name) { Some(fs) }
+      else { None },
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// The cells a literal of `inner` held in place takes from its header's word, its fields' words
+/// `words` in written order under `names` and the literals `placed` in it.
+fn placed_cells(
+  emitter: Emitter,
+  inner: List<FieldTy>,
+  names: List<Bytes>,
+  words: List<Bytes>,
+  placed: List<Placed>,
+) -> { emitter: Emitter, cells: List<WordAt> } = {
+  let sh = shape_of_fields(emitter, inner);
+  let l = laid_of(inner);
+  let flags = record_flags(inner, l);
+  let laid = map(range(0, len(inner)), |at: Int| word_at_rank(names, words, at));
+  {
+    emitter: sh.emitter,
+    cells: push(
+      map(cells_of(inner, laid, ranked(names, placed), l, flags), held_inside),
+      Header({ at: 0, flags: flags, len: l.width, shape: sh.i, holder: None }),
+    ),
+  }
+}
 
 fn items_from(
   emitter: Emitter,
   codes: List<Code>,
   params: List<EmitParam>,
   i: Int,
-  acc: List<Bytes>,
-  values: List<CValue>,
-  kinds: List<Kind>,
-) -> Option<{ emitter: Emitter, names: List<Bytes>, vals: List<CValue> }> / {abort.raise} =
-  if i >= len(codes) { Some({ emitter: emitter, names: acc, vals: values }) } else {
+  so_far: { names: List<Bytes>, vals: List<CValue>, placed: List<Placed> },
+  slots: List<FieldTy>,
+) -> Option<Items> / {abort.raise} =
+  if i >= len(codes) {
+    Some({ emitter: emitter, names: so_far.names, vals: so_far.vals, placed: so_far.placed })
+  } else {
+    let kinds = kinds_of(slots);
+    let acc = so_far.names;
+    let values = so_far.vals;
     match list_at(codes, i) {
       None -> None,
-      Some(x) -> match expr(notail(emitter), x, params) {
-        None -> None,
-        Some(o) -> {
-          let raw = raw_slot(kind_at(kinds, i)) && len(kinds) > i;
-          let d = if raw { held_raw(o.emitter, o.value, kind_at(kinds, i)) }
-          else { { emitter: o.emitter, value: o.value } };
-          let maybe = kind_at(kinds, i) == KMaybe && len(kinds) > i;
-          let w = if maybe { maybe_owned(o.emitter, o.value) }
-          else if !raw { owned(o.emitter, o.value) }
-          else if kind_at(kinds, i) == KDec { d }
-          else { bind(d.emitter, KInt, raw_word(d.value)) };
-          items_from(
-            w.emitter,
-            codes,
-            params,
-            i + 1,
-            push(acc, w.value.expr),
-            push(values, if raw || maybe { if raw { d.value } else { w.value } }
-            else { taken_as(w.emitter, o.value, w.value) }),
-            kinds,
-          )
+      Some(x) -> match match list_at(slots, i) { Some(f) -> placeable(x, f), None -> None } {
+        // A record literal where a record is held in place: its fields evaluated here, in written
+        // order, into words the holder writes in its place.
+        Some(inner) -> match x.node {
+          NRecord(r) -> {
+            let names = map(r.fields, |f: CodeField| f.name);
+            let evaluated = fold(
+              r.fields,
+              Some({ emitter: notail(emitter), words: [] }),
+              |got: Option<{ emitter: Emitter, words: List<Bytes> }>, f: CodeField|
+                match got {
+                  None -> None,
+                  Some(g) -> match expr(g.emitter, f.value, params) {
+                    None -> None,
+                    Some(o) -> {
+                      let h = held_item(o, nth_field(inner, rank_of(names, f.name)).kind);
+                      Some({ emitter: h.emitter, words: push(g.words, h.word) })
+                    },
+                  },
+                },
+            );
+            match evaluated {
+              None -> None,
+              Some(w) -> {
+                let p = placed_cells(w.emitter, inner, names, w.words, []);
+                items_from(
+                  p.emitter,
+                  codes,
+                  params,
+                  i + 1,
+                  {
+                    names: push(acc, b"0"),
+                    vals: push(values, { kind: KBoxed, expr: b"0", ty: TyOpen([]) }),
+                    placed: push(so_far.placed, { slot: i, cells: p.cells }),
+                  },
+                  slots,
+                )
+              },
+            }
+          },
+          _ -> None,
+        },
+        None -> match expr(notail(emitter), x, params) {
+          None -> None,
+          Some(o) -> {
+            let h = held_item(o, kind_at(kinds, i));
+            items_from(
+              h.emitter,
+              codes,
+              params,
+              i + 1,
+              { names: push(acc, h.word), vals: push(values, h.val), placed: so_far.placed },
+              slots,
+            )
+          },
         },
       },
     }
   }
+
+/// `o` held as a field of `kind`: the word the object takes or a `Float`'s bits, and the value the
+/// object is remembered to hold.
+fn held_item(o: WithValue, kind: Kind) -> { emitter: Emitter, word: Bytes, val: CValue } = {
+  let raw = raw_slot(kind);
+  let d = if raw { held_raw(o.emitter, o.value, kind) } else { o };
+  let maybe = kind == KSum(Zeroed);
+  let w = if maybe { sum_owned(o.emitter, o.value, Zeroed) }
+  else if !raw { owned(o.emitter, o.value) }
+  else if kind == KDec { d }
+  else { bind(d.emitter, KInt, raw_word(d.value)) };
+  {
+    emitter: w.emitter,
+    word: w.value.expr,
+    val: if raw { d.value }
+    else if maybe { w.value }
+    else { taken_as(w.emitter, o.value, w.value) },
+  }
+}
 
 /// Under release the temporary a field came from is null once the record takes it, so the held word is remembered instead.
 fn taken_as(emitter: Emitter, v: CValue, w: CValue) -> CValue =
@@ -8335,8 +8628,11 @@ fn arm_body(
   match sink {
     ToValue(ans) -> match expr(emitter, body, params) {
       None -> None,
-      Some(o) -> if ans.kind == KMaybe {
-        let w = maybe_owned(o.emitter, o.value);
+      Some(o) -> if is_sum(ans.kind) {
+        let w = match ans.kind {
+          KSum(spec) -> sum_owned(o.emitter, o.value, spec),
+          _ -> owned(o.emitter, o.value),
+        };
         Some(line(w.emitter, bytes_concat_all([ans.name, b" = ", w.value.expr, b";"])))
       } else {
         let w = word_of(o.emitter, o.value);
@@ -8360,8 +8656,8 @@ fn match_subject(
 ) -> Option<{ emitter: Emitter, subj: CValue }> / {abort.raise} =
   match expr(notail(emitter), scrutinee, params) {
     None -> None,
-    Some(sc) -> if sc.value.kind == KMaybe {
-      let subj = bind_keeping(sc.emitter, KMaybe, sc.value.ty, sc.value.expr);
+    Some(sc) -> if is_sum(sc.value.kind) {
+      let subj = bind_keeping(sc.emitter, sc.value.kind, sc.value.ty, sc.value.expr);
       Some({ emitter: subj.emitter, subj: subj.value })
     } else {
       let sw = word_of(sc.emitter, sc.value);
@@ -8541,25 +8837,22 @@ fn pat_test(
     },
     // A constructor tests its tag and width over an object; an argument with its own test is read into a local under the test so far.
     // A nested subject is zero when an enclosing test failed, and its header must not be read then.
-    // An `Option` held as its payload's word is `None` at zero and `Some` of that word otherwise.
-    PxCtor(c) -> if subj.kind == KMaybe {
-      if len(c.args) == 0 {
-        Some({ emitter: emitter, expr: bytes_concat_all([b"(", subj.expr, b" == 0)"]) })
-      } else {
-        let head = bytes_concat_all([b"(", subj.expr, b" != 0)"]);
-        match list_at(c.args, 0) {
-          None -> None,
-          Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: head }) } else {
-            match pat_test(sub, { kind: KBoxed, expr: subj.expr, ty: subj.ty }, emitter) {
-              None -> None,
-              Some(inner) ->
-                Some({
-                  emitter: inner.emitter,
-                  expr: bytes_concat_all([b"(", head, b" && ", inner.expr, b")"]),
-                }),
-            }
-          },
-        }
+    // A sum held as its word: `None` zero and `Some` that word otherwise; `Err` the word tagged
+    // `100` and `Ok` any other. The argument is the word, untagged for `Err`.
+    PxCtor(c) -> if is_sum(subj.kind) {
+      let case = sum_case(emitter, subj.kind, c.name, subj.expr);
+      match list_at(c.args, 0) {
+        None -> Some({ emitter: emitter, expr: case.test }),
+        Some(sub) -> if irrefutable(sub) { Some({ emitter: emitter, expr: case.test }) } else {
+          match pat_test(sub, { kind: KBoxed, expr: case.arg, ty: subj.ty }, emitter) {
+            None -> None,
+            Some(inner) ->
+              Some({
+                emitter: inner.emitter,
+                expr: bytes_concat_all([b"(", case.test, b" && ", inner.expr, b")"]),
+              }),
+          }
+        },
       }
     } else {
       match tag_of(emitter, c.name) {
@@ -8747,7 +9040,7 @@ fn arg_tested(
     } else {
       bind(
         emitter,
-        if f.kind == KMaybe { KMaybe } else { KBoxed },
+        if f.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
         bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]),
       )
     },
@@ -8779,14 +9072,26 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         remember(ensure_owned(b.emitter, b.value), s, b.value)
       },
     },
-    // The payload of an `Option` held as its word is that word; its binder takes the subject's count
-    // where the subject moves into it, and holds one of its own where it does not.
-    PxCtor(c) -> if subj.kind == KMaybe {
+    // The argument of a sum held as its word is that word, untagged for `Err`; its binder takes
+    // the subject's count where the subject moves into it, and holds one of its own where it does not.
+    PxCtor(c) -> if is_sum(subj.kind) {
       match list_at(c.args, 0) {
         None -> emitter,
         Some(sub) -> {
-          let w = bind_keeping(emitter, KBoxed, subj.ty, subj.expr);
-          pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
+          let case = sum_case(emitter, subj.kind, c.name, subj.expr);
+          if case.arg == subj.expr {
+            let w = bind_keeping(emitter, KBoxed, subj.ty, subj.expr);
+            pat_bind(ensure_owned(w.emitter, w.value), sub, w.value)
+          } else {
+            let w = bind_keeping(emitter, KBoxed, subj.ty, case.arg);
+            if emitter.release && spendable(w.emitter, subj.expr) {
+              let moved = line(
+                note_made(spend_made(w.emitter, subj.expr), w.value.expr),
+                bytes_concat_all([subj.expr, b" = 0;"]),
+              );
+              pat_bind(moved, sub, w.value)
+            } else { pat_bind(ensure_owned(w.emitter, w.value), sub, w.value) }
+          }
         },
       }
     } else {
@@ -8803,7 +9108,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
           } else {
             bind_keeping(
               acc,
-              if x.kind == KMaybe { KMaybe } else { KBoxed },
+              if x.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
               x.ty,
               field_read(subj.expr, x),
             )
@@ -8896,10 +9201,10 @@ fn assigned(
   join: Bytes,
 ) -> { emitter: Emitter, text: Bytes, made: List<CountLocal> } = {
   // The join takes the arm's value; the arm's own holders are released behind it.
-  let m2 = if k == KMaybe || value.kind == KMaybe {
-    // An `Option` joins as its payload's word where it does as one, and as its object elsewhere.
+  let m2 = if is_sum(k) || is_sum(value.kind) {
+    // A sum joins as its word where it does as one, and as its object elsewhere.
     let arm = with_made(indent(with_out(emitter, [])), arm_em.count_locals);
-    let o = if k == KMaybe { maybe_owned(arm, value) } else { owned(arm, value) };
+    let o = match k { KSum(spec) -> sum_owned(arm, value, spec), _ -> owned(arm, value) };
     line(o.emitter, bytes_concat_all([join, b" = ", o.value.expr, b";"]))
   } else {
     let m0 = match k {
@@ -8921,7 +9226,7 @@ fn assigned(
 fn as_kind(value: CValue, k: Kind) -> Bytes =
   match k {
     KBoxed -> as_word(value),
-    KMaybe -> if value.kind == KMaybe { value.expr } else { b"ply_maybe_unrouted" },
+    KSum(spec) -> if value.kind == KSum(spec) { value.expr } else { b"ply_maybe_unrouted" },
     KInt -> as_int(value),
     KBool -> as_bool(value),
     KNum(w) -> as_num(value, w),
@@ -9044,6 +9349,7 @@ fn rebuild(emitter: Emitter, names: List<Bytes>, values: List<CValue>) -> Option
           Some(value) -> if raw_slot(value.kind) { raw_word(value) } else { held_word(value) },
           None -> b"0",
         }),
+      [],
       map(range(0, len(values)), |at: Int|
         {
           name: match list_at(names, at) { Some(nm) -> nm, None -> b"" },
@@ -9100,15 +9406,20 @@ fn checked_mul(a: Int, b: Int) -> Option<Int> =
     if p / a == b && p % a == 0 { Some(p) } else { None }
   }
 
-/// The kind two arms of one type join as: an `Option` either arm holds as its payload's word joins
-/// as that word where it is the root's answer, handed back as one, and as its object elsewhere.
+/// The kind two arms of one type join as: a sum either arm holds as its word joins as that word
+/// where it is the root's answer, handed back as one, and as its object elsewhere.
 fn join_kind(emitter: Emitter, a: Kind, b: Kind) -> Kind =
-  if a == b { a }
-  else if answers_maybe(emitter) && (a == KMaybe || b == KMaybe) { KMaybe }
-  else { KBoxed }
+  if a == b { a } else {
+    match answers_sum(emitter) {
+      Some(spec) -> if a == KSum(spec) || b == KSum(spec) { KSum(spec) } else { KBoxed },
+      None -> KBoxed,
+    }
+  }
 
-/// Whether the value at hand is the root's answer, an `Option` it hands back as its payload's word.
-fn answers_maybe(emitter: Emitter) -> Bool = emitter.tail && emitter.answer == KMaybe
+/// How the value at hand, where it is the root's answer and the root hands back a sum as its word,
+/// is that word.
+fn answers_sum(emitter: Emitter) -> Option<SumSpec> =
+  if emitter.tail { match emitter.answer { KSum(spec) -> Some(spec), _ -> None } } else { None }
 
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
@@ -9708,8 +10019,8 @@ fn tail_args(
             );
             tail_args(held.emitter, codes, params, i + 1, push(acc, held.names))
           },
-          Whole(KMaybe) -> {
-            let t = maybe_owned(o.emitter, o.value);
+          Whole(KSum(spec)) -> {
+            let t = sum_owned(o.emitter, o.value, spec);
             tail_args(t.emitter, codes, params, i + 1, push(acc, [t.value.expr]))
           },
           Whole(_) -> {
@@ -9848,7 +10159,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
   fold(range(0, len(params)), emitter, |acc: Emitter, i: Int|
     match list_at(params, i) {
       None -> acc,
-      Some(p) -> if p.carrier != Whole(KBoxed) && p.carrier != Whole(KMaybe) {
+      Some(p) -> if p.carrier != Whole(KBoxed) && !is_sum(returned_kind(p.carrier)) {
         match p.carrier {
           Fields(fs) -> {
             let r = held_record(
@@ -9870,7 +10181,7 @@ fn prologue(emitter: Emitter, params: List<EmitParam>) -> Emitter =
         match p.kind {
           // A record arrives as its word and is never opened, but its reads are still charged, or the release rule sees nothing read it.
           KBoxed -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
-          KMaybe -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
+          KSum(_) -> charge(acc, i, bytes_concat(b"p", ascii_of_int(i))),
           KBool -> {
             let o = bind(
               acc,
@@ -9982,7 +10293,7 @@ pub fn ctor_layouts(ctors: List<CtorRow>) -> Map<Bytes, List<FieldTy>> =
       }
     });
     if fold(args, false, |laid: Bool, f: FieldTy|
-        laid || raw_slot(f.kind) || f.kind == KMaybe || in_place(f) != None) {
+        laid || raw_slot(f.kind) || f.kind == KSum(Zeroed) || in_place(f) != None) {
       map_insert(acc, c.name, args)
     } else { acc }
   })
@@ -10011,7 +10322,7 @@ fn open_fields(fs: List<Field>) -> Bool =
 fn field_ty(f: Field) -> FieldTy = {
   let k = kind_of(f.ty);
   // An `Option` is held as its payload's word, as the runtime holds one it lays out.
-  { name: f.name, kind: if is_option_type(f.ty) { KMaybe } else { k.kind }, ty: k.ty }
+  { name: f.name, kind: if is_option_type(f.ty) { KSum(Zeroed) } else { k.kind }, ty: k.ty }
 }
 
 /// What a definition's scheme says it takes and answers.
@@ -10826,8 +11137,8 @@ pub fn emit_fn_full(
 fn answered(emitter: Emitter, value: CValue, answer: Carrier) -> { emitter: Emitter, expr: Bytes } =
   match answer {
     Whole(KBoxed) -> returned(emitter, value),
-    Whole(KMaybe) -> {
-      let w = maybe_owned(emitter, value);
+    Whole(KSum(spec)) -> {
+      let w = sum_owned(emitter, value, spec);
       { emitter: release_at(w.emitter, 0), expr: w.value.expr }
     },
     Whole(k) -> {
@@ -10887,12 +11198,12 @@ fn grown_words(
       match list_at(params, i) {
         None -> acc,
         Some(p) -> match p.carrier {
-          Whole(KMaybe) ->
+          Whole(KSum(spec)) ->
             {
               ..acc,
               words: push(
                 acc.words,
-                bytes_concat_all([b"rt_maybe_take_p(ctx, p", ascii_of_int(i), b")"]),
+                bytes_concat_all([sum_helper(spec, b"take"), b"(ctx, p", ascii_of_int(i), b")"]),
               ),
             },
           Whole(k) ->
@@ -10945,14 +11256,18 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
         Some(p) -> match p.carrier {
           Whole(KBoxed) -> { ..acc, args: push(acc.args, arg) },
           // The argument's object is taken, its payload handed on.
-          Whole(KMaybe) -> {
+          Whole(KSum(spec)) -> {
             let local = bytes_concat(b"a", ascii_of_int(i));
             {
               text: bytes_concat_all([
                 acc.text,
-                b"  PlyMaybe ",
+                b"  ",
+                ctype(KSum(spec)),
+                b" ",
                 local,
-                b" = rt_maybe_open_p(ctx, ",
+                b" = ",
+                sum_helper(spec, b"open"),
+                b"(ctx, ",
                 arg,
                 b");\n",
               ]),
@@ -11029,8 +11344,10 @@ fn entry_text(name: Bytes, params: List<EmitParam>, answer: Carrier, shape: Int)
           b" r = ",
           call,
           b";\n  if (ctx->failed) return 0;\n  return ",
-          if k == KMaybe { b"rt_maybe_take_p(ctx, r)" }
-          else { as_word({ kind: k, expr: b"r", ty: TyOpen([]) }) },
+          match k {
+            KSum(spec) -> bytes_concat(sum_helper(spec, b"take"), b"(ctx, r)"),
+            _ -> as_word({ kind: k, expr: b"r", ty: TyOpen([]) }),
+          },
           b";\n",
         ]),
       Fields(fs) ->
@@ -11320,7 +11637,7 @@ fn group_cases(emitter: Emitter, members: List<Member>, i: Int) -> Option<Emitte
           base: m.base,
         };
         let words = map(m.params, |p: EmitParam|
-          { ..p, carrier: Whole(KBoxed), kind: if p.kind == KMaybe { KBoxed } else { p.kind } });
+          { ..p, carrier: Whole(KBoxed), kind: if is_sum(p.kind) { KBoxed } else { p.kind } });
         match expr(prologue(entered, words), widths_closed(entered, m.body), words) {
           None -> None,
           Some(o) -> {
@@ -11385,11 +11702,13 @@ fn group_wrapper(
       if bytes_len(grown.prep) == 0 { b"" } else { bytes_concat_all([b"  ", grown.prep, b"\n"]) },
       match answer {
         Whole(KBoxed) -> bytes_concat_all([b"  return ", call, b";\n"]),
-        Whole(KMaybe) ->
+        Whole(KSum(spec)) ->
           bytes_concat_all([
             b"  Word r = ",
             call,
-            b";\n  if (ctx->failed) return 0;\n  return rt_maybe_open_p(ctx, r);\n",
+            b";\n  if (ctx->failed) return 0;\n  return ",
+            sum_helper(spec, b"open"),
+            b"(ctx, r);\n",
           ]),
         Whole(_) ->
           opened([
@@ -11644,11 +11963,13 @@ fn grown_return(grown: Bytes, answer: Carrier) -> Bytes =
   match answer {
     Whole(KBoxed) -> bytes_concat_all([b"return ", grown, b";"]),
     // The answer's object is taken, its payload handed back.
-    Whole(KMaybe) ->
+    Whole(KSum(spec)) ->
       bytes_concat_all([
         b"Word ply_back = ",
         grown,
-        b"; if (ctx->failed) return 0; return rt_maybe_open_p(ctx, ply_back);",
+        b"; if (ctx->failed) return 0; return ",
+        sum_helper(spec, b"open"),
+        b"(ctx, ply_back);",
       ]),
     _ -> {
       let k = returned_kind(answer);
@@ -12354,6 +12675,25 @@ test "an Option is its payload's word in the code that knows it, and its object 
   assert_eq(at(out, 8).tables.generics.expects, [{ callee: b"m.kept", head: maybe }])
 }
 
+test "a Result whose error is an object is one word in the code that knows it" {
+  let src = bytes_concat_all([
+    b"type Bad = { why: Bytes }\n",
+    b"fn half(n: Int) -> Result<Int, Bad> = if n % 2 == 0 { Ok(n / 2) } else { Err({ why: b\"odd\" }) }\n",
+    b"fn quarter(n: Int) -> Result<Int, Bad> = { let h = half(n)?; half(h) }\n",
+    b"fn told(n: Int) -> Bytes = match quarter(n) { Ok(_) -> b\"\", Err(b) -> b.why }\n",
+    b"fn plain(n: Int) -> Result<Int, Int> = if n > 0 { Ok(n) } else { Err(n) }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"Ok", b"Err"], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None, None]);
+  // Built, answered, handed on by `?` and matched, no object is made; an error that may be an
+  // immediate leaves the `Result` an object.
+  assert_eq(has(b"rt_ctor_p"), [false, false, false, true]);
+  assert_eq(has(b"rt_tagged_"), [false, false, false, false]);
+  assert_eq(has(b") | 4)"), [true, true, false, false]);
+  assert_eq(has(b" & 7) "), [false, true, true, false])
+}
+
 test "a record holds an Option as its payload's word" {
   let src = bytes_concat_all([
     b"type Entry = { name: String, note: Option<String> }\n",
@@ -12404,6 +12744,24 @@ test "a constructor holds its arguments as its declaration types them" {
   assert_eq(has(b"rt_equal_p(ctx, "), [false, false, false, true, false]);
   // A label holds its word, as a constructor of no raw or record argument does.
   assert_eq(has(b"rt_ctor_p"), [false, false, false, false, true])
+}
+
+test "a record literal held in place is written there, with no record made first" {
+  let src = bytes_concat_all([
+    b"type T = | TyC({ name: Bytes, args: List<Int> }) | TyV(Int)\n",
+    b"type Counter = { next: Int, last: Int }\n",
+    b"fn made(n: Bytes, a: List<Int>) -> T = TyC({ name: n, args: a })\n",
+    b"fn stepped(v: Int) -> { counter: Counter, at: Int } = { counter: { next: v + 1, last: v }, at: v }\n",
+    b"fn copied(c: Counter, v: Int) -> { counter: Counter, at: Int } = { counter: c, at: v }\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [b"m.TyC", b"m.TyV"], [], true);
+  let has = |text: Bytes| map(out, |e: Emitted| bytes_index_of(own_code(e.text), text) != None);
+  assert_eq(map(out, |e: Emitted| e.why), [None, None, None]);
+  // The literal's fields are written in place under a header of their own; a record that is not a
+  // literal is copied in.
+  assert_eq(has(b"ply_embedded("), [true, true, false]);
+  assert_eq(has(b"ply_embed(ctx, "), [false, false, true]);
+  assert_eq(has(b"rt_alloc_p(ctx, 3, 2, "), [false, false, false])
 }
 
 test "a `Decimal` is held in registers as its two words, and in a record or an array as them" {
@@ -12591,7 +12949,7 @@ fn carried_vars(scheme: Scheme, args: List<Type>, arity: Int) -> List<Int> / {ab
       filter(range(0, len(args)), |j: Int|
         (contains(f.params, TyVar(j)) || (arity > 0 && f.ret == TyVar(j)))
           && carrier_of(at(args, j)) != Whole(KBoxed)
-          && carrier_of(at(args, j)) != Whole(KMaybe)),
+          && !is_sum(returned_kind(carrier_of(at(args, j))))),
     _ -> [],
   }
 
@@ -12692,7 +13050,8 @@ fn reference_args(emitter: Emitter, scheme: Option<Scheme>, at: Span) -> List<Ty
 /// fields; anything else as its word.
 fn carrier_of(t: Type) -> Carrier = {
   let k = kind_of(t);
-  if is_option_type(t) { Whole(KMaybe) } else {
+  if is_option_type(t) { Whole(KSum(Zeroed)) }
+  else if tagged_result(t) { Whole(KSum(Tagged)) } else {
     match k.ty {
       TyRec(fs) -> if carried_record(fs) { Fields(fs) } else { Whole(KBoxed) },
       _ -> match k.kind {
@@ -12811,17 +13170,21 @@ fn record_word_lines(
     ascii_of_int(flags),
     b"); if (ctx->failed) ",
     fail,
-    fold(cells_of(fs, words, l, flags), b"", |acc: Bytes, c: WordAt|
-      bytes_concat_all([
-        acc,
-        b" ply_words(",
-        name,
-        b")[",
-        ascii_of_int(c.at),
-        b"] = ",
-        c.expr,
-        b";",
-      ])),
+    fold(
+      put_cells(cells_of(fs, words, [], l, flags)),
+      b"",
+      |acc: Bytes, c: { at: Int, expr: Bytes }|
+        bytes_concat_all([
+          acc,
+          b" ply_words(",
+          name,
+          b")[",
+          ascii_of_int(c.at),
+          b"] = ",
+          c.expr,
+          b";",
+        ]),
+    ),
   ])
 }
 
@@ -14358,7 +14721,7 @@ fn params_carried(
     {
       name: match list_at(names, i) { Some(n) -> n, None -> b"" },
       kind: match list_at(carriers, i) {
-        Some(Whole(KMaybe)) -> KMaybe,
+        Some(Whole(KSum(spec))) -> KSum(spec),
         _ -> match list_at(kinds, i) { Some(Some(p)) -> p.kind, _ -> KInt },
       },
       ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },

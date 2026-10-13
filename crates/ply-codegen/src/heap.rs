@@ -829,6 +829,8 @@ pub struct Layouts {
     /// The prelude constructors the runtime builds itself, resolved once.
     pub some: Option<u32>,
     pub none: Option<u32>,
+    pub ok: Option<u32>,
+    pub err: Option<u32>,
     pub stop: Option<u32>,
     pub go: Option<u32>,
     pub less: Option<u32>,
@@ -908,6 +910,7 @@ impl Layouts {
             .collect();
         let by = |name: &str| ctor_ids.get(&Symbol::new(name)).copied();
         let (some, none, stop, go) = (by("Some"), by("None"), by("Stop"), by("Continue"));
+        let (ok, err) = (by("Ok"), by("Err"));
         let (less, equal, greater) = (by("Less"), by("Equal"), by("Greater"));
         let mut interned = Shapes::default();
         for names in shapes {
@@ -920,6 +923,8 @@ impl Layouts {
             ctor_ids,
             some,
             none,
+            ok,
+            err,
             stop,
             go,
             less,

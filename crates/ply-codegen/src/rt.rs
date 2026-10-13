@@ -4896,6 +4896,53 @@ pub unsafe extern "C" fn rt_maybe_box(ctx: *mut Ctx, w: i64) -> i64 {
     unsafe { rt_maybe_take(ctx, w) }
 }
 
+/// A `Result` compiled code held as one word, its `Ok`'s argument's word or its `Err`'s tagged `100`,
+/// as the object it stands for, which takes the argument's count.
+pub unsafe extern "C" fn rt_tagged_take(ctx: *mut Ctx, w: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let tables = Arc::clone(&ctx.tables);
+    let (ctor, arg) = if w & 7 == 4 {
+        (tables.layouts.err, w & !7)
+    } else {
+        (tables.layouts.ok, w)
+    };
+    match ctor {
+        Some(c) => ctx.heap.ctor(&tables.layouts, c, &[arg]),
+        None => ctx.fail(error(
+            "a `Result` held as one word in a program with no `Result`",
+        )),
+    }
+}
+
+/// As `rt_tagged_take`, holding one more count of the argument, which the caller keeps its own of.
+pub unsafe extern "C" fn rt_tagged_box(ctx: *mut Ctx, w: i64) -> i64 {
+    heap::inc(if w & 7 == 4 { w & !7 } else { w });
+    unsafe { rt_tagged_take(ctx, w) }
+}
+
+/// The `Result` object `w`, which it takes, as compiled code holds it: its argument's word with a
+/// count of its own, tagged `100` for an `Err`.
+pub unsafe extern "C" fn rt_tagged_open(ctx: *mut Ctx, w: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if ctx.failed != 0 {
+        return 0;
+    }
+    let o = obj(w);
+    let (layout, len) = unsafe { ((*o).layout, (*o).len) };
+    let arg = if len == 1 {
+        unsafe { word_at(o, 0) }
+    } else {
+        0
+    };
+    heap::inc(arg);
+    heap::dec(w);
+    if ctx.tables.layouts.err == Some(layout) {
+        arg | 4
+    } else {
+        arg
+    }
+}
+
 fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     if ctx.failed != 0 {
         return 0;
