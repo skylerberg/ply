@@ -144,7 +144,7 @@ fn a_second_process_iterates_in_the_same_order() {
 
 #[test]
 fn the_order_and_the_language_agree_except_on_float() {
-    let values = corpus();
+    let values = sample_values();
     for a in &values {
         for b in &values {
             let ordered = a.cmp(b) == Ordering::Equal;
@@ -203,7 +203,7 @@ fn float_peculiarity(a: &Value, b: &Value) -> bool {
     (x.is_nan() && y.is_nan()) || (*x == 0.0 && *y == 0.0)
 }
 
-fn corpus() -> Vec<Value> {
+fn sample_values() -> Vec<Value> {
     let mut out = vec![
         Value::Unit,
         Value::Bool(false),
@@ -256,7 +256,7 @@ fn corpus() -> Vec<Value> {
 
 #[test]
 fn the_order_is_total() {
-    let values = corpus();
+    let values = sample_values();
     for a in &values {
         assert_eq!(
             a.cmp(a),

@@ -45,7 +45,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 
 - Tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
   touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
-- The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-corpus.sh run
+- The CLI's tests are the Ply package `crates/ply-cli-tests/ply`; `.github/ci-ply.sh run
   cli-<module>` runs one module with the grants CI gives it.
 - CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and lists the Ply
   runs, each one `ply test` of a package, and the jobs that take them.
@@ -62,7 +62,7 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - A file below `crates/ply-std/ply` that is not a `.ply` is data a shipped module embeds by its
   path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
   load reads it whenever it pulls the module, so a test's fixtures stay in
-  `crates/ply-corpus/stdlib`.
+  `crates/ply-std-tests/ply`.
 - `crates/ply-cli` is the CLI as a Ply program; it is not a cargo crate. CI publishes each main
   `ply` to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
 - Rust tests test the Rust: none compiles Ply or reads the shipped modules. What a Ply program
