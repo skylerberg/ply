@@ -1441,6 +1441,14 @@ fn climb(a: Int, b: Int) -> Int
   = if a + b <= 0 { 0 } else { climb(a + 1, b - 2) }
 ```
 
+A recursive group is the definitions of a module whose bodies call one another
+round a cycle, by what each call is once its types are known: a call by name; a
+tagged literal's function (§2.3); and the function a type states (§4.4) where
+an operator, a comparison, a `Map` or a constrained parameter is at that type or
+at one that holds it, so `a + b` at a type that states `add` is a call of
+`add`, and `xs == ys` over a list of a type that states a `key` a call of the
+key.
+
 The checker reads each recursive group, mutual recursion included, for a
 measure that every loop of calls back into the group lowers (size-change
 termination): a part of an argument — a constructor's field, a record's field,

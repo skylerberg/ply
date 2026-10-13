@@ -95,12 +95,15 @@ pub type Passing =
   | Escapes
 
 /// A group's members in slot order, each with its qualified name and its parameters' types; how to
-/// read a free name; how a definition outside the group ends; and how it calls what it is handed.
+/// read a free name; what the expression at a span calls because a type states it, an operator's
+/// function or a comparison's key; how a definition outside the group ends; and how it calls what
+/// it is handed.
 pub type Group = {
   defs: List<FnDef>,
   names: List<Bytes>,
   params: List<List<Type>>,
   resolve: (QName) -> Callee / {abort.raise},
+  stated: (Span) -> List<Callee> / {abort.raise},
   ending_of: (Bytes) -> Ending / {abort.raise},
   summary_of: (Bytes) -> Option<Summary>,
 }
@@ -1702,20 +1705,45 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
       Some(FunctionParam(i)) -> used(acc, { param: i, args: None }),
       Some(LetLambda(f)) -> lambda_escapes(context, s, acc, f),
       Some(KnownTerm(_)) -> acc,
-      None -> match callee_of(context, s, v.name) {
-        GroupMember(t) -> called(acc, { callee: t, args: [], facts: [], span: v.span }),
-        DefinedCallee(n) -> reached(acc, n, v.span),
-        _ -> acc,
-      },
+      None ->
+        stated_called(
+          context,
+          s,
+          match callee_of(context, s, v.name) {
+            GroupMember(t) -> called(acc, { callee: t, args: [], facts: [], span: v.span }),
+            DefinedCallee(n) -> reached(acc, n, v.span),
+            _ -> acc,
+          },
+          v.name.span,
+          [],
+        ),
     },
     EBinary(b) -> if b.op == b"and" {
       walk(context, assume(context, s, b.lhs, true), walk(context, s, acc, b.lhs), b.rhs)
     } else if b.op == b"or" {
       walk(context, assume(context, s, b.lhs, false), walk(context, s, acc, b.lhs), b.rhs)
-    } else { walk(context, s, walk(context, s, acc, b.lhs), b.rhs) },
-    EUnary(u) -> walk(context, s, acc, u.operand),
+    } else {
+      stated_called(
+        context,
+        s,
+        walk(context, s, walk(context, s, acc, b.lhs), b.rhs),
+        expr_span(e),
+        [term(context, s, b.lhs), term(context, s, b.rhs)],
+      )
+    },
+    EUnary(u) ->
+      stated_called(context, s, walk(context, s, acc, u.operand), expr_span(e), [
+        term(context, s, u.operand),
+      ]),
     ELambda(l) -> walk(context, unknown_params(s, l.params), acc, l.body),
-    EApp(a) -> applied(context, s, acc, a.func, a.args, a.named, a.span),
+    EApp(a) ->
+      stated_called(
+        context,
+        s,
+        applied(context, s, acc, a.func, a.args, a.named, a.span),
+        match a.func { EVar(v) -> v.name.span, other -> expr_span(other) },
+        [],
+      ),
     EIf(i) -> {
       let cond = walk(context, s, acc, i.cond);
       walk(
@@ -1807,6 +1835,30 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
     EBad(_) -> acc,
     ETryBlock(t) -> walk(context, s, acc, t.body),
   }
+
+/// The calls the expression at `span` makes because a type states them, over its `operands`: a
+/// member of as many parameters takes them all, one of a single parameter each in its turn, and
+/// any other arguments nothing is known of.
+fn stated_called(
+  context: MemberContext,
+  s: Scope,
+  acc: Seen,
+  span: Span,
+  operands: List<Term>,
+) -> Seen / {abort.raise} =
+  fold(context.group.stated(span), acc, |seen: Seen, callee: Callee|
+    match callee {
+      GroupMember(m) -> {
+        let params = at(context.group.defs, m).params;
+        let calls = if len(params) == len(operands) { [operands] }
+        else if len(params) == 1 && len(operands) > 0 { map(operands, |t: Term| [t]) }
+        else { [map(params, |_: Param| UnknownTerm)] };
+        fold(calls, seen, |a: Seen, args: List<Term>|
+          called(a, { callee: m, args: args, facts: s.facts, span: span }))
+      },
+      DefinedCallee(n) -> reached(seen, n, span),
+      _ -> seen,
+    })
 
 fn tag_called(
   context: MemberContext,
