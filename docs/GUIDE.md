@@ -2168,7 +2168,10 @@ std.snapshot` has the rest.
 
 A definition's hash covers its normalized form: names, comments, formatting,
 imports, `pub`, specs and test labels are erased, and references are replaced by
-their referent's hash. A test runs exactly when neither its hash nor the code it compiles to has a
+their referent's hash. A call on a value (§5.4) is a reference to every function
+of its name the module can see, its own and those of each module it imports,
+directly or through others: which of them it calls the value's type says, and a
+hash is taken before any type is. A test runs exactly when neither its hash nor the code it compiles to has a
 recorded pass that still stands, so renames and comment edits run nothing, and neither does an edit
 or a new `ply` that compiles a test to the same code; the selection line counts those `by code`
 (`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json`
