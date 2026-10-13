@@ -6,7 +6,7 @@
 
 import std.bytes (hex_of, repeat)
 import std.hash (blake3)
-import std.list (at, concat, find)
+import std.list (at, concat, find, sort_by)
 import std.string (join)
 
 /// The C compilers by their labels: what each is, and each run of one. What a compiler makes is a
@@ -83,9 +83,11 @@ fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise
     }
   }
 
-/// `text` cut into its head, each bucket from its mark to the next, and the runtime from its mark,
-/// labelled by the bucket's hex id and `runtime`. A text with no marks is all head and an empty
-/// runtime part; the parts concatenate back to the text.
+/// `text` cut into its head and its parts, the largest first: each bucket from its mark to the
+/// next, labelled by its hex id, and the runtime from its mark, labelled `runtime`. A compile starts
+/// the parts in this order and waits for the oldest it started, so the long ones run beside one
+/// another and hold no short one's place. A text with no marks is all head and an empty runtime
+/// part.
 pub fn split(text: Bytes) -> Parts / {abort.raise} = {
   let tail_at = match line_start(text, runtime_mark(), 0) {
     Some(at) -> at,
@@ -112,7 +114,11 @@ pub fn split(text: Bytes) -> Parts / {abort.raise} = {
   });
   {
     head: bytes_slice(text, 0, match list_at(starts, 0) { Some(first) -> first, None -> tail_at }),
-    parts: push(buckets, { label: "runtime", text: bytes_slice(text, tail_at, bytes_len(text)) }),
+    parts: sort_by(
+      push(buckets, { label: "runtime", text: bytes_slice(text, tail_at, bytes_len(text)) }),
+      |a: { label: String, text: Bytes }, b: { label: String, text: Bytes }|
+        bytes_len(a.text) > bytes_len(b.text),
+    ),
   }
 }
 
@@ -477,18 +483,20 @@ pub fn executable<[c]>(
 fn unit_text() -> Bytes =
   b"#include <x>\n/* --- bucket 0a --- */\nint a;\n/* --- bucket 1f --- */\nint b;\n\n/* --- the runtime, bound at load --- */\nint r;\n"
 
-test "a unit cuts at its marks into a head, its buckets and the runtime, which join back to it" {
+test "a unit cuts at its marks into a head and its parts, the largest first, which hold all of it" {
   let p = split(unit_text());
   assert_eq(p.head, b"#include <x>\n");
-  assert_eq(map(p.parts, |x: { label: String, text: Bytes }| x.label), ["0a", "1f", "runtime"]);
+  assert_eq(map(p.parts, |x: { label: String, text: Bytes }| x.label), ["runtime", "1f", "0a"]);
   assert_eq(
-    bytes_concat(
-      p.head,
-      bytes_concat_all(map(p.parts, |x: { label: String, text: Bytes }| x.text)),
-    ),
+    bytes_concat_all([p.head, at(p.parts, 2).text, at(p.parts, 1).text, at(p.parts, 0).text]),
     unit_text(),
   );
-  assert_eq(at(p.parts, 2).text, b"/* --- the runtime, bound at load --- */\nint r;\n")
+  assert_eq(at(p.parts, 0).text, b"/* --- the runtime, bound at load --- */\nint r;\n")
+}
+
+test "parts of one size keep the unit's order" {
+  let p = split(b"/* --- bucket 1f --- */\nint b;\n/* --- bucket 0a --- */\nint a;\n");
+  assert_eq(map(p.parts, |x: { label: String, text: Bytes }| x.label), ["1f", "0a", "runtime"])
 }
 
 test "a text with no marks is all head, beside an empty runtime part" {
@@ -500,7 +508,7 @@ test "a text with no marks is all head, beside an empty runtime part" {
 test "a part's source is the digest of its C with the head before it" {
   let p = split(unit_text());
   let sources = sources_of(p);
-  assert_eq(map(sources, |s: Source| s.label), ["0a", "1f", "runtime"]);
+  assert_eq(map(sources, |s: Source| s.label), ["runtime", "1f", "0a"]);
   assert_eq(at(sources, 0).digest, hex_of(blake3(bytes_concat(p.head, at(p.parts, 0).text))));
   let moved = sources_of({ ..p, head: b"#include <y>\n" });
   assert(at(moved, 1).digest != at(sources, 1).digest, Some("the head is part of every source"))

@@ -2524,12 +2524,15 @@ fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
   }
 
 /// The queries whose answers of a shipped module the toolchain ships, which a load cannot cheaply
-/// make again: the module read for its owners, each group's check and hashing, the module's answer
-/// and hashing put together, what a module of the standard library documents, and which of them
-/// declare each name. What one owner or one name answers is read off those.
+/// make again: the module read for its owners, the check of it whole, which every group of it asks
+/// first and which checks the module for a load that holds none of its groups, each group's check
+/// and hashing, the module's answer and hashing put together, what a module of the standard library
+/// documents, and which of them declare each name. What one owner or one name answers is read off
+/// those.
 pub fn shipped_queries() -> List<Bytes> =
   [
     owners_query(),
+    whole_query(),
     group_query(),
     group_hash_query(),
     module_query(),
@@ -4194,6 +4197,15 @@ fn fixed_over(
   held: Held,
   sources: List<Source>,
   shipped: List<Source>,
+) -> { held: Held, run: Run, answers: List<Answered>, fixing: Fixing, warnings: List<Diag> } / {abort.raise} =
+  fixed_beside(held, map_new(), sources, shipped)
+
+/// [`fixed_over`] with the files of `packed` beside `held`, as a pack the load does not trust.
+fn fixed_beside(
+  held: Held,
+  packed: Map<String, Bytes>,
+  sources: List<Source>,
+  shipped: List<Source>,
 ) -> { held: Held, run: Run, answers: List<Answered>, fixing: Fixing, warnings: List<Diag> } / {abort.raise} = {
   let w = world_of(
     { root: b"", manifest: None, files: map(sources, |s: Source| { module: s.name, text: s.src }) },
@@ -4205,7 +4217,7 @@ fn fixed_over(
   let names = map(shipped, |s: Source| s.name);
   let done = over_decoding(
     held,
-    |path: String| None,
+    |path: String| map_get(packed, path),
     |kind: Bytes, at: Bytes| looked(w, held_text, held_text, || names, nothing_embedded, kind, at),
     || {
       let qs = fresh_registry();
@@ -4882,6 +4894,60 @@ test "a definition added to a shipped module checks and hashes no module that im
   assert_eq(ran_of(warm.run, module_query()), 1);
   assert_eq(ran_of(warm.run, hashes_query()), 1);
   assert_eq(warm.fixing, fixed_over(nothing_held(), user, added).fixing)
+}
+
+/// The pack of a toolchain that ships `shipped`: what each answers to the queries a pack carries.
+fn shipped_pack(shipped: List<Source>) -> Map<String, Bytes> / {abort.raise} = {
+  let texts = fold(shipped, map_new(), |acc: Map<Bytes, Bytes>, s: Source|
+    map_insert(acc, s.name, s.src));
+  let held_text = |name: Bytes| map_get(texts, name);
+  let names = map(shipped, |s: Source| s.name);
+  let nowhere = world_of({ root: b"", manifest: None, files: [] }, []);
+  let held = over_decoding(
+    nothing_held(),
+    |path: String| None,
+    |kind: Bytes, at: Bytes|
+      looked(nowhere, held_text, held_text, || names, nothing_embedded, kind, at),
+    || {
+      let qs = fresh_registry();
+      shipped_all(qs, names, started(qs));
+      ()
+    },
+  ).held;
+  memo::packed_files({
+    ..held,
+    records: map_fold(held.records, map_new(), |acc: Map<Bytes, Record>, k: Bytes, r: Record|
+      if contains(shipped_queries(), r.query) { map_insert(acc, k, r) } else { acc }),
+  })
+}
+
+// A bootstrap's builder is loaded so: over a checkout whose shipped modules are not all the pack's.
+test "a load over a pack it does not trust checks no shipped module the pack still answers for" {
+  let user = [
+    {
+      name: b"main",
+      src: b"import std.a (two)\npub fn main() -> Int = two()\n\npub fn more() -> Int = two() + 1\n",
+    },
+  ];
+  let shipped = |aside: Bytes|
+    [
+      {
+        name: b"std.a",
+        src: b"import std.b (one)\n\npub fn two() -> Int = one() + one()\n\npub fn three() -> Int = two() + one()\n",
+      },
+      { name: b"std.b", src: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
+      { name: b"std.aside", src: aside },
+    ];
+  let packed = shipped_pack(shipped(b"pub fn spare() -> Int = 3\n"));
+  let moved = shipped(b"pub fn spare() -> Int = 4\n");
+  let load = fixed_beside(nothing_held(), packed, user, moved);
+  assert_eq(
+    map(ran_for(load.run, whole_query()), |b: Bytes|
+      decoded(b, named_bin(), "a module's name").module),
+    [b"main"],
+  );
+  assert_eq(map(groups_ran(load.run, group_query()), |g: GroupNamed| g.module), [b"main", b"main"]);
+  assert_eq(load.answers, fixed_over(nothing_held(), user, moved).answers)
 }
 
 test "modules that import one another in a cycle are refused through the store as they are fresh" {
