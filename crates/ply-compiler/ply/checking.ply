@@ -34,8 +34,9 @@ import front (Analysis, AnalysisOutcome, Analysed, Refused, Pulled, Embedded, Sh
               answered_program, answered_load, pulled_next, view_of, functions_of, tests_of,
               view_over, view_dump, faceted, dump_of, walked_facts_bin, squats, embedded_bin,
               shipped_data_bin, read_outline, named_imports, Outlined, OTest, OLaw, ShippedWants,
-              shipped_wants_bin, is_std)
-import items (Module, Item, IType, ImportDecl, INames, header, parse, import_decl_bin, is_written)
+              shipped_wants_bin)
+import items (Module, Item, IType, ILaw, ImportDecl, INames, header, parse, import_decl_bin,
+              is_written)
 import derive (dotted)
 import diagnostics (ParsedSource, parse_all, parse_at, parse_from, placed)
 import interface (imported, blanked)
@@ -45,9 +46,9 @@ import resolve (Source, ParsedModule, Diag, Label, backticked, diag_bin, error_a
                 path_span, import_module_name, source_bin)
 import parsing (Ident, Span, ParseDiag, span_bin)
 import infer (DefInfo, TestInfo, walk_order)
-import hash (Fixed, FixedTest, FixedLaw, Fixing, Shapes, Shape, no_fixing, module_forms,
+import hash (Fixed, FixedTest, FixedLaw, Fixing, NodeRef, Shapes, Shape, no_fixing, module_forms,
              hashed_forms, fixing_bin, shapes_bin, fixed_bin, pin_key)
-import pages (Pages, documented, pages_bin)
+import pages (Page, Pages, documented, pages_bin)
 import std.gen
 
 /// Where a module of the load's own packages is: its package (0 the root, then each dependency in
@@ -2045,31 +2046,36 @@ pub fn hashes_query() -> Bytes = b"hashes"
 
 pub fn documented_query() -> Bytes = b"documented"
 
-/// The laws of a module whose text names a name the module declares, by that name.
-fn laws_naming(m: ModuleRead) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
-  let module = m.source.name;
-  let scope = module_scope(m.parsed, m.raw, m.names);
+/// The laws of the module `lawful` names that reference each definition, by its program-wide
+/// name: what hashing fixed of a law holds what its sentence references, once checked. A law that
+/// does not check references nothing.
+fn laws_referencing(lawful: Named) -> Map<Bytes, List<Bytes>> / {memo.read, abort.raise} = {
+  let read = owners_read(lawful);
   fold(
-    owner_reads(m.parsed, m.raw, m.source.src),
+    read.owners,
     map_new(),
-    |acc: Map<Bytes, List<Bytes>>, o: OwnerRead|
+    |acc: Map<Bytes, List<Bytes>>, o: { owner: Bytes, facts: Bytes, starts: List<Int> }|
       if !bytes_starts_with(o.owner, b"law ") { acc } else {
         let law = bytes_slice(o.owner, 4, bytes_len(o.owner));
-        fold(owner_mentions(module, scope, o), acc, |by: Map<Bytes, List<Bytes>>, said: Mention|
-          if said.module != module { by } else {
-            map_insert(
-              by,
-              said.name,
-              push(match map_get(by, said.name) { Some(laws) -> laws, None -> [] }, law),
-            )
-          })
+        let hashed = group_hashes_of({
+          module: lawful.module,
+          shipped: lawful.shipped,
+          tested: lawful.tested,
+          owners: group_holding(read, o.owner),
+        });
+        fold(hashed.fixing.laws, acc, |by: Map<Bytes, List<Bytes>>, l: FixedLaw|
+          fold(l.refs, by, |a: Map<Bytes, List<Bytes>>, r: NodeRef| {
+            let held = match map_get(a, r.name) { Some(laws) -> laws, None -> [] };
+            if r.decl || contains(held, law) { a } else { map_insert(a, r.name, push(held, law)) }
+          }))
       },
   )
 }
 
 /// What a module documents, read as `Named` says: a page for it and for each name it declares, read
-/// off its whole text, its laws among it, and off what its check and its hashing answered. A module
-/// there is none of documents nothing.
+/// off its whole text and off what its check and its hashing answered. A shipped module that writes
+/// a law is read with its tests for what its laws reference, which a module importing it never
+/// reads. A module there is none of documents nothing.
 pub fn documented_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
   let asked = decoded(input, named_bin(), "a module's name");
   bin::encode(
@@ -2090,13 +2096,58 @@ pub fn documented_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
           defs: tables_answered(checked).defs,
           hashes: fold(hashed.fixing.nodes, map_new(), |acc: Map<Bytes, Bytes>, f: Fixed|
             if f.decl { acc } else { map_insert(acc, f.name, f.hash) }),
-          laws: laws_naming(m),
+          // Only a module that writes a law is read with its tests for this.
+          laws: if fold(m.raw.items, false, |b: Bool, item: Item|
+              b || (match item { ILaw(_) -> true, _ -> false })) {
+            laws_referencing({ ..asked, tested: asked.tested || asked.shipped })
+          } else { map_new() },
         })
       },
     },
     pages_bin(),
   )
 }
+
+pub fn declaring_query() -> Bytes = b"declaring"
+
+/// The shipped modules under the package `input` names that document each simple name, by that
+/// name: where a name that leads with no module is looked for without asking every module of the
+/// package what it documents.
+pub fn declaring_answer(input: Bytes) -> Bytes / {Answering, abort.raise} = {
+  let shipped = match memo.world(shipped_names_kind(), b"") {
+    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
+    None -> [],
+  };
+  let under = bytes_concat(input, b".");
+  bin::encode(
+    fold(
+      filter(shipped, |m: Bytes| m == input || bytes_starts_with(m, under)),
+      map_new(),
+      |acc: Map<Bytes, List<Bytes>>, m: Bytes|
+        fold(
+          decoded(
+            memo.ask(
+              documented_query(),
+              bin::encode({ module: m, shipped: true, tested: false }, named_bin()),
+            ),
+            pages_bin(),
+            "a module's pages",
+          ).pages,
+          acc,
+          |by: Map<Bytes, List<Bytes>>, page: Page| {
+            let simple = bytes_of_string(page.simple);
+            let held = match map_get(by, simple) { Some(ms) -> ms, None -> [] };
+            if page.simple == "" || contains(held, m) { by }
+            else { map_insert(by, simple, push(held, m)) }
+          },
+        ),
+    ),
+    declaring_bin(),
+  )
+}
+
+fn declaring_bin() -> bin::BinCodec<Map<Bytes, List<Bytes>>> =
+  bin::map_bin(bin::bytes_bin(), bin::list_bin(bin::bytes_bin()))
 
 /// Each query a load asks, by its name, beside the definition that answers it, whose hash its records
 /// are kept under.
@@ -2154,6 +2205,7 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
       definition: b"checking.documented_answer",
       body: documented_answer,
     },
+    { name: declaring_query(), definition: b"checking.declaring_answer", body: declaring_answer },
   ]
 
 // --- Asking a program's modules -------------------------------------------------------------
@@ -2472,8 +2524,8 @@ fn shipped_listed() -> List<Bytes> / {memo_keep.read, abort.raise} =
 
 /// The queries whose answers of a shipped module the toolchain ships, which a load cannot cheaply
 /// make again: the module read for its owners, each group's check and hashing, the module's answer
-/// and hashing put together, and what a module of the standard library documents. What one owner
-/// or one name answers is read off those.
+/// and hashing put together, what a module of the standard library documents, and which of them
+/// declare each name. What one owner or one name answers is read off those.
 pub fn shipped_queries() -> List<Bytes> =
   [
     owners_query(),
@@ -2483,11 +2535,12 @@ pub fn shipped_queries() -> List<Bytes> =
     hashes_query(),
     wants_query(),
     documented_query(),
+    declaring_query(),
   ]
 
 /// What a load asks of each of `shipped`, the shipped modules, of `qs` over a run: its answer and its
-/// hashing, which ask all the rest, and of a module of the standard library what it documents, which
-/// `ply doc` reads wherever it runs.
+/// hashing, which ask all the rest, and of the standard library which of its modules declare each
+/// name, which asks each what it documents: what `ply doc` reads wherever it runs.
 pub fn shipped_all(
   qs: Map<Bytes, CheckQuery>,
   shipped: List<Bytes>,
@@ -2498,14 +2551,13 @@ pub fn shipped_all(
     run,
     map(shipped, |m: Bytes| { module: m, shipped: true, tested: false }),
   );
-  fold(ordered.order, ordered.run, |r: Run, named: Named|
-    fold(
-      concat([module_query(), hashes_query(), wants_query()], if is_std(named.module) {
-        [documented_query()]
-      } else { [] }),
-      r,
-      |at: Run, query: Bytes| answer(qs, at, query, bin::encode(named, named_bin())).run,
-    ))
+  declaring_in(
+    qs,
+    b"std",
+    fold(ordered.order, ordered.run, |r: Run, named: Named|
+      fold([module_query(), hashes_query(), wants_query()], r, |at: Run, query: Bytes|
+        answer(qs, at, query, bin::encode(named, named_bin())).run)),
+  ).run
 }
 
 /// What each of `pulled`, shipped modules a load pulled, read with their tests where `tested` says,
@@ -2543,6 +2595,17 @@ pub fn documented_all(
     let a = answer(qs, acc.run, documented_query(), bin::encode(named, named_bin()));
     { run: a.run, value: push(acc.value, decoded(a.output, pages_bin(), "a module's pages")) }
   })
+
+/// The shipped modules under the package `package` that declare each simple name, asked of `qs`
+/// over a run.
+pub fn declaring_in(
+  qs: Map<Bytes, CheckQuery>,
+  package: Bytes,
+  run: Run,
+) -> { run: Run, value: Map<Bytes, List<Bytes>> } / {Driving, abort.raise} = {
+  let a = answer(qs, run, declaring_query(), package);
+  { run: a.run, value: decoded(a.output, declaring_bin(), "the modules that declare each name") }
+}
 
 /// `modules` in an order that has each after those of them it imports, as each one's imports say,
 /// the rest in the order they came: a module answered before what reads it is checked whole, not a
