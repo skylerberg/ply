@@ -8,8 +8,8 @@
 //! Fourier-Motzkin elimination with each inequality tightened to the integers. Whatever is not
 //! read, or not found, answers that the clause is not shown: nothing here refuses a program.
 
-import parsing (QName, is_bare)
-import exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EField, EBlock)
+import parsing (QName, Span, is_bare)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EField, EBlock, EPerform)
 import patterns (Pattern, PLit, PRange, PCtor, PList, POr, LInt, LBool, LStr, LBytes)
 import types (Type, TyCon, record_fields, field_get)
 import std.bytes (ascii_of_int)
@@ -86,6 +86,8 @@ pub type Reader = {
   name: (QName) -> Named / {abort.raise},
   head: (Type) -> Type / {abort.raise},
   builtin: (Expr) -> Bytes / {abort.raise},
+  /// The builtin the call on a value written at a span calls, or nothing.
+  on_value: (Span) -> Bytes / {abort.raise},
   contract: (Bytes) -> Option<Contract> / {abort.raise},
 }
 
@@ -544,16 +546,7 @@ fn read_within(reader: Reader, g: Guards, e: Expr, room: Int) -> Read / {abort.r
       LBytes(b) -> written(g, b"b", b, b"bytes_len", bytes_len(b)),
       _ -> unread(g),
     },
-    EVar(v) -> match (reader.name)(v.name) {
-      Given(value) -> { g: g, value: value },
-      Local(b) -> match map_get(g.bound, b.stamp) {
-        // A generic builtin's answer is keyed whatever its type, and an `Int` under a key is a term.
-        Some(Keyed(key)) -> typed(reader, g, key, b.ty),
-        Some(value) -> { g: g, value: value },
-        None -> typed(reader, g, stamp_key(b.stamp), b.ty),
-      },
-      Elsewhere -> unread(g),
-    },
+    EVar(v) -> named(reader, g, v.name),
     EField(_) -> match place(reader, g, e) {
       Some(p) -> typed(reader, g, p.key, p.ty),
       None -> unread(g),
@@ -573,19 +566,19 @@ fn read_within(reader: Reader, g: Guards, e: Expr, room: Int) -> Read / {abort.r
       }
     },
     EApp(a) -> {
-      let name = (reader.builtin)(a.func);
-      if name == b"" { unread(g) } else {
-        match (reader.contract)(name) {
-          None -> unread(g),
-          Some(st) -> if !st.pure || len(a.args) != len(st.params) { unread(g) } else {
-            let args = fold(a.args, { g: g, values: [] }, |acc: Arguments, x: Expr| {
-              let r = read_within(reader, acc.g, x, room);
-              { g: r.g, values: push(acc.values, r.value) }
-            });
-            answered(reader, args.g, name, st, args.values, room)
-          },
-        }
-      }
+      // A call on a value hands its builtin the value first.
+      let on = match a.func {
+        EField(f) -> {
+          let r = read_within(reader, g, f.base, room);
+          { name: (reader.on_value)(a.span), first: { g: r.g, values: [r.value] } }
+        },
+        _ -> { name: (reader.builtin)(a.func), first: { g: g, values: [] } },
+      };
+      called(reader, on.name, on.first, a.args, room)
+    },
+    EPerform(p) -> {
+      let on = named(reader, g, p.eff);
+      called(reader, (reader.on_value)(p.span), { g: on.g, values: [on.value] }, p.args, room)
     },
     EBlock(b) -> if len(b.stmts) > 0 { unread(g) }
     else { match b.tail { Some(t) -> read_within(reader, g, t, room), None -> unread(g) } },
@@ -593,6 +586,42 @@ fn read_within(reader: Reader, g: Guards, e: Expr, room: Int) -> Read / {abort.r
   }
 
 type Arguments = { g: Guards, values: List<Reading> }
+
+/// What the value a name holds reads as.
+fn named(reader: Reader, g: Guards, name: QName) -> Read / {abort.raise} =
+  match (reader.name)(name) {
+    Given(value) -> { g: g, value: value },
+    Local(b) -> match map_get(g.bound, b.stamp) {
+      // A generic builtin's answer is keyed whatever its type, and an `Int` under a key is a term.
+      Some(Keyed(key)) -> typed(reader, g, key, b.ty),
+      Some(value) -> { g: g, value: value },
+      None -> typed(reader, g, stamp_key(b.stamp), b.ty),
+    },
+    Elsewhere -> unread(g),
+  }
+
+/// What a call of the builtin `name` reads as, `first` what is read of its arguments so far and
+/// `rest` those after them.
+fn called(
+  reader: Reader,
+  name: Bytes,
+  first: Arguments,
+  rest: List<Expr>,
+  room: Int,
+) -> Read / {abort.raise} =
+  if name == b"" { unread(first.g) } else {
+    match (reader.contract)(name) {
+      None -> unread(first.g),
+      Some(st) -> if !st.pure || len(first.values) + len(rest) != len(st.params) { unread(first.g) }
+      else {
+        let args = fold(rest, first, |acc: Arguments, x: Expr| {
+          let r = read_within(reader, acc.g, x, room);
+          { g: r.g, values: push(acc.values, r.value) }
+        });
+        answered(reader, args.g, name, st, args.values, room)
+      },
+    }
+  }
 
 fn arithmetic(op: Bytes) -> Bool =
   op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem" || op == b"bitand"
@@ -648,6 +677,7 @@ fn of_clause(reader: Reader, st: Contract, values: List<Reading>, result: Readin
     head: reader.head,
     builtin: |f: Expr|
       match f { EVar(v) -> if is_bare(v.name) { v.name.name.name } else { b"" }, _ -> b"" },
+    on_value: |_: Span| b"",
     contract: reader.contract,
   }
 
@@ -988,31 +1018,40 @@ fn indexed(
   scrutinee: Expr,
 ) -> { g: Guards, at: Option<{ length: Linear, index: Linear }> } / {abort.raise} =
   match scrutinee {
-    EApp(a) -> {
-      let name = (reader.builtin)(a.func);
-      let length = if name == b"list_at" { b"len" }
-      else if name == b"array_at" { b"array_len" }
-      else { b"" };
-      match a.args {
-        [xs, i] -> if length == b"" { { g: g, at: None } } else {
-          let held_in = read(reader, g, xs);
-          let index = read(reader, held_in.g, i);
-          match ((held_in.value, index.value)) {
-            (Keyed(key), Number(at)) -> {
-              let n = measured(reader, index.g, length, key);
-              {
-                g: n.g,
-                at: match n.value { Number(l) -> Some({ length: l, index: at }), _ -> None },
-              }
-            },
-            _ -> { g: index.g, at: None },
-          }
-        },
-        _ -> { g: g, at: None },
-      }
+    EApp(a) -> match ((a.func, a.args)) {
+      (EField(f), [i]) -> indexed_at(reader, (reader.on_value)(a.span), read(reader, g, f.base), i),
+      (EField(_), _) -> { g: g, at: None },
+      (_, [xs, i]) -> indexed_at(reader, (reader.builtin)(a.func), read(reader, g, xs), i),
+      _ -> { g: g, at: None },
+    },
+    EPerform(p) -> match p.args {
+      [i] -> indexed_at(reader, (reader.on_value)(p.span), named(reader, g, p.eff), i),
+      _ -> { g: g, at: None },
     },
     _ -> { g: g, at: None },
   }
+
+/// [`indexed`] of the builtin `name` over the list `held_in` reads as and the index `i`.
+fn indexed_at(
+  reader: Reader,
+  name: Bytes,
+  held_in: Read,
+  i: Expr,
+) -> { g: Guards, at: Option<{ length: Linear, index: Linear }> } / {abort.raise} = {
+  let length = if name == b"list_at" { b"len" }
+  else if name == b"array_at" { b"array_len" }
+  else { b"" };
+  if length == b"" { { g: held_in.g, at: None } } else {
+    let index = read(reader, held_in.g, i);
+    match ((held_in.value, index.value)) {
+      (Keyed(key), Number(at)) -> {
+        let n = measured(reader, index.g, length, key);
+        { g: n.g, at: match n.value { Number(l) -> Some({ length: l, index: at }), _ -> None } }
+      },
+      _ -> { g: index.g, at: None },
+    }
+  }
+}
 
 /// How long a list a pattern is matched against is, where it is read.
 fn length_of(

@@ -596,6 +596,8 @@ type Checker = {
   member_sites: List<MemberSite>,
   /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
   copied_defaults: List<{ expr: Expr, ty: Type }>,
+  /// The builtin each call on a value of a language type calls, by the call's span.
+  builtins_on: Map<Bytes, Bytes>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
   sim_scope: Int,
@@ -1422,22 +1424,105 @@ pub fn builtin_named(name: Bytes) -> Option<Builtin> / {abort.raise} =
   fold(builtins(), None, |acc: Option<Builtin>, b: Builtin|
     match acc { Some(_) -> acc, None -> if b.name == name { Some(b) } else { None } })
 
+/// The language's types a signature names, each under its name in lower case.
+fn types_in(ty: Type, acc: Map<Bytes, Bytes>) -> Map<Bytes, Bytes> / {abort.raise} =
+  match ty {
+    TyVar(_) -> acc,
+    TyCon(c) ->
+      fold(c.args, map_insert(acc, lowered(c.name), c.name), |a: Map<Bytes, Bytes>, x: Type|
+        types_in(x, a)),
+    TyFn(f) -> fold(f.params, types_in(f.ret, acc), |a: Map<Bytes, Bytes>, p: Type| types_in(p, a)),
+    TyRecord(fs) -> fold(fs, acc, |a: Map<Bytes, Bytes>, f: Field| types_in(f.ty, a)),
+    TyNominal(n) ->
+      fold(n.args, map_insert(acc, lowered(n.name), n.name), |a: Map<Bytes, Bytes>, x: Type|
+        types_in(x, a)),
+  }
+
+fn lowered(name: Bytes) -> Bytes / {abort.raise} =
+  bytes_of_string(ascii_lower(string_of_bytes(name)))
+
+/// The function of a language type each builtin is, by its own name, beside the builtin's name:
+/// `<type>_<name>` is `T::name` whatever it takes, and any other is a function of its first
+/// parameter's type. One named for a type comes first, so `T::name` is that one where two
+/// builtins would both be it. A cell is a name and no value, so its builtins are no type's.
+pub fn builtin_members(
+  all: List<Builtin>,
+) -> List<{ member: Bytes, builtin: Bytes }> / {abort.raise} = {
+  let types = fold(
+    all,
+    fold(prelude_adts(), map_new(), |acc: Map<Bytes, Bytes>, adt: AlgebraicType|
+      map_insert(acc, lowered(adt.name), adt.name)),
+    |acc: Map<Bytes, Bytes>, b: Builtin| types_in(b.scheme.ty, acc),
+  );
+  let prefixed = |b: Builtin|
+    match bytes_index_of(b.name, b"_") {
+      None -> None,
+      Some(i) -> match map_get(types, bytes_slice(b.name, 0, i)) {
+        Some(t) -> if i + 1 >= bytes_len(b.name) { None }
+        else { Some(member_name(t, bytes_slice(b.name, i + 1, bytes_len(b.name)))) },
+        None -> None,
+      },
+    };
+  let first = |b: Builtin|
+    match b.scheme.ty {
+      TyFn(f) -> match list_at(f.params, 0) {
+        Some(TyCon(c)) -> Some(member_name(c.name, b.name)),
+        Some(TyNominal(n)) -> Some(member_name(n.name, b.name)),
+        _ -> None,
+      },
+      _ -> None,
+    };
+  let values = filter(all, |b: Builtin| !is_cell_builtin(b.name));
+  let named = fold(values, [], |acc: List<{ member: Bytes, builtin: Bytes }>, b: Builtin|
+    match prefixed(b) { Some(m) -> push(acc, { member: m, builtin: b.name }), None -> acc });
+  fold(values, named, |acc: List<{ member: Bytes, builtin: Bytes }>, b: Builtin|
+    match ((prefixed(b), first(b))) {
+      (None, Some(m)) -> if fold(acc, false, |seen: Bool, x: { member: Bytes, builtin: Bytes }|
+          seen || x.member == m) { acc }
+      else { push(acc, { member: m, builtin: b.name }) },
+      _ -> acc,
+    })
+}
+
+/// The builtin a prelude name is: its own, or the one the function of a type it is written as
+/// (`List::len`) names. `declared` says whether a name is a builtin's.
+pub fn builtin_of(name: Bytes, declared: (Bytes) -> Bool / {abort.raise}) -> Bytes / {abort.raise} =
+  match member_of(name) {
+    None -> name,
+    Some(m) -> {
+      let named = bytes_concat_all([lowered(m.of), b"_", m.member]);
+      if declared(named) { named } else { m.member }
+    },
+  }
+
 /// A builtin's scheme is over variables numbered from zero, so `fresh` starts past every one.
+/// Each is bound under its own name and under the one it has as a function of a type.
 fn install_prelude(bare: Checker) -> Checker / {abort.raise} = {
   let checker = install_prelude_adts(bare);
-  let bound: Checker = fold(builtins(), checker, |c: Checker, b: Builtin|
+  let all = builtins();
+  let under = |c: Checker, b: Builtin, name: Bytes|
     {
       ..c,
-      env: env_bind_global(c.env, b.name, b.scheme),
+      env: env_bind_global(c.env, name, b.scheme),
       constraints: if len(b.constraints) == 0 { c.constraints }
-      else { map_insert(c.constraints, b.name, b.constraints) },
-      contracts: map_insert(c.contracts, b.name, b.contract),
+      else { map_insert(c.constraints, name, b.constraints) },
+      contracts: map_insert(c.contracts, name, b.contract),
       fresh: {
         next_ty: max(c.fresh.next_ty, len(b.scheme.ty_vars)),
         next_row: max(c.fresh.next_row, len(b.scheme.row_vars)),
       },
-    });
-  fold(prelude_effects(), bound, |c2: Checker, effect_info: EffectInfo| add_effect(c2, effect_info))
+    };
+  let bound: Checker = fold(all, checker, |c: Checker, b: Builtin| under(c, b, b.name));
+  let by_name = fold(all, map_new(), |acc: Map<Bytes, Builtin>, b: Builtin|
+    map_insert(acc, b.name, b));
+  let membered: Checker = fold(
+    builtin_members(all),
+    bound,
+    |c: Checker, x: { member: Bytes, builtin: Bytes }|
+      match map_get(by_name, x.builtin) { Some(b) -> under(c, b, x.member), None -> c },
+  );
+  fold(prelude_effects(), membered, |c2: Checker, effect_info: EffectInfo|
+    add_effect(c2, effect_info))
 }
 
 /// The name the shipped modules hold the prelude under, which no project's module can take.
@@ -3387,6 +3472,8 @@ fn reader_of(checker: Checker) -> Reader =
       },
     head: |ty: Type| shallow(checker.subst, ty),
     builtin: |f: Expr| prelude_named(checker, f),
+    on_value: |span: Span|
+      match map_get(checker.builtins_on, span_key(span)) { Some(name) -> name, None -> b"" },
     contract: |name: Bytes| map_get(checker.contracts, name),
   }
 
@@ -3402,7 +3489,12 @@ fn known_as(before: Checker, bound: Checker, pat: Pattern, value: Expr) -> Check
     PVar(v) -> match env_local(bound.env, v.name.name) {
       None -> bound,
       Some(b) -> {
-        let r = guards::read(reader_of(before), bound.guards, value);
+        // The names are those before the `let`, and the calls those its value made.
+        let r = guards::read(
+          { ..reader_of(before), on_value: reader_of(bound).on_value },
+          bound.guards,
+          value,
+        );
         { ..bound, guards: guards::bind(r.g, b.stamp, r.value) }
       },
     },
@@ -5739,11 +5831,24 @@ fn member_function(
         },
         callee: b.qualified,
       }),
-    // A type of the language's: the prelude declares its functions under the type's name.
+    // A type of the language's: the prelude binds each builtin under the type it is a function
+    // of, and a call on a value is one whose first parameter is that type.
     _ -> {
       let declared = member_name(of, name.name);
-      if env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) { None }
-      else {
+      let takes = match env_lookup(checker.env, declared) {
+        Some(scheme) -> match scheme.ty {
+          TyFn(f) -> match list_at(f.params, 0) {
+            Some(TyCon(c)) -> c.name == of,
+            Some(TyNominal(n)) -> n.name == of,
+            _ -> false,
+          },
+          _ -> false,
+        },
+        None -> false,
+      };
+      if !takes || env_depth_of(checker.env, declared) != Some(0) || module_declares(checker, of) {
+        None
+      } else {
         Some({
           qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
           callee: declared,
@@ -6020,6 +6125,14 @@ fn dotted(
           owner: o.checker.walking,
           reaches: d.reaches,
         }),
+        // A function of a language type is a builtin, which what reads the call asks for by name.
+        builtins_on: if m.qname.module != None { o.checker.builtins_on } else {
+          map_insert(
+            o.checker.builtins_on,
+            span_key(span),
+            builtin_of(m.qname.name.name, |n: Bytes| env_depth_of(o.checker.env, n) == Some(0)),
+          )
+        },
       })
     },
   }
@@ -6030,7 +6143,8 @@ fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
   match func {
     EVar(v) -> if !is_bare(v.name) { b"" } else {
       match value_key(checker, v.name).key {
-        Some(k) -> if k.prelude { k.name } else { b"" },
+        Some(k) -> if !k.prelude { b"" }
+        else { builtin_of(k.name, |n: Bytes| env_depth_of(checker.env, n) == Some(0)) },
         None -> b"",
       }
     },
@@ -15452,6 +15566,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     try_sites: [],
     member_sites: [],
     copied_defaults: [],
+    builtins_on: map_new(),
     simulate_depth: 0,
     sim_scope: 0,
     crossings: [],
@@ -21003,6 +21118,23 @@ test "a lambda's unwritten parameter is what the arguments before it settle" {
   assert_eq(check_codes(b"type P = { side: Int }\nfn f() -> Int = { let g = |p| p.side; 1 }"), [
     b"E0201",
   ])
+}
+
+test "a builtin is a function of the type it is named for, or of the type it first takes" {
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> Int = xs.len() + xs.push(1).len()"), []);
+  assert_eq(check_codes(b"fn f(m: Map<Int, Int>) -> Option<Int> = m.get(1)"), []);
+  assert_eq(check_codes(b"fn f(b: Bytes, s: String) -> Int = b.len() + s.trim().len()"), []);
+  assert_eq(check_codes(b"fn f(xs: List<Int>) -> List<Int> = xs.map(|x| x + 1)"), []);
+  // One named for a type it does not take is no call on a value of that type.
+  assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.of_string()"), [b"E0101"])
+}
+
+test "a guard written on a value's own length lets a builtin that needs it raise nothing" {
+  assert_eq(
+    check_codes(b"fn f(b: Bytes) -> Bytes = if b.len() >= 1 { b.slice(0, 1) } else { b }"),
+    [],
+  );
+  assert_eq(check_codes(b"fn f(b: Bytes) -> Bytes = b.slice(0, 1)"), [b"E0302"])
 }
 
 test "a recursion through a call on a value is a recursion, and a type states its own functions" {
