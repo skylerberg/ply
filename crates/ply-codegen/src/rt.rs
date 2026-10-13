@@ -4106,12 +4106,14 @@ impl Ctx {
     }
 }
 
-/// `metered(f)`: `f()` and what it cost, as `{allocations, bytes, performs, steps, value}` with
-/// each performed atom's count in `performs`, ordered by the atom.
+/// `metered(f)`: `f()` and what it cost, as `{allocations, bytes, live, performs, steps, value}`
+/// with each performed atom's count in `performs`, ordered by the atom.
 fn metered(ctx: &mut Ctx, f: Word) -> Word {
     let before = ctx.cost();
+    let held = ctx.heap.live();
     let performed = ctx.performed.len();
     let value = call_value(std::ptr::from_mut(ctx), f, &[]);
+    let live = ctx.heap.live() as i64 - held as i64;
     heap::dec(f);
     if ctx.failed != 0 {
         return 0;
@@ -4143,6 +4145,7 @@ fn metered(ctx: &mut Ctx, f: Word) -> Word {
         &[
             (Symbol::new("allocations"), heap::imm(spent.allocations)),
             (Symbol::new("bytes"), heap::imm(spent.bytes)),
+            (Symbol::new("live"), heap::imm(live)),
             (Symbol::new("performs"), performs),
             (Symbol::new("steps"), heap::imm(spent.steps)),
             (Symbol::new("value"), value),

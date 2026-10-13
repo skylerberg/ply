@@ -325,7 +325,7 @@ pub type Emitter = {
   operands: Map<Bytes, Bytes>,
   typed: Map<Bytes, Typed>,
   /// How this root hands back its answer; a failing exit returns its zero.
-  answer: Kind,
+  answer: Carrier,
   /// The root a site is filed under where it is not this one's: a lambda of another root's run here.
   site_root: Option<Bytes>,
   /// The callers' lambdas this root runs in place of calls of the parameters they were handed as.
@@ -771,14 +771,38 @@ fn conv_of(emitter: Emitter, slot: Int) -> Option<CValue> =
     if unboxed.slot == slot { Some({ kind: unboxed.kind, expr: unboxed.expr, ty: unboxed.ty }) }
     else { acc })
 
-fn remember(em0: Emitter, slot: Int, value: CValue) -> Emitter = {
-  let emitter = charge(em0, slot, value.expr);
+fn remember(em0: Emitter, slot: Int, given: CValue) -> Emitter = {
+  let own = held_copy(em0, given);
+  let value = own.value;
+  let emitter = charge(own.emitter, slot, value.expr);
   let em1: Emitter = if counted(value.kind) { note_bound(emitter, value.expr) } else { emitter };
   {
     ..em1,
     unboxed: push(em1.unboxed, { slot: slot, kind: value.kind, expr: value.expr, ty: value.ty }),
   }
 }
+
+/// `value`, a record held back that another slot holds already, as a held-back copy of its own:
+/// a read that moves one name then leaves the other whole.
+fn held_copy(emitter: Emitter, value: CValue) -> WithValue =
+  match deferred_of(emitter, value.expr) {
+    None -> { emitter: emitter, value: value },
+    Some(d) -> if !fold(emitter.unboxed, false, |seen: Bool, u: Unboxed|
+        seen || u.expr == value.expr) { { emitter: emitter, value: value } } else {
+      let f = fresh(emitter);
+      let held = line(
+        note_deferred(f.emitter, { ..d, name: f.name }),
+        bytes_concat_all([f.name, b" = 0;"]),
+      );
+      {
+        emitter: match built_of(held, value.expr) {
+          Some(b) -> remember_built(held, f.name, b.names, b.vals),
+          None -> held,
+        },
+        value: { ..value, expr: f.name },
+      }
+    },
+  }
 
 fn bind(emitter: Emitter, k: Kind, expr: Bytes) -> WithValue = {
   let f = fresh(emitter);
@@ -1194,6 +1218,9 @@ fn push_deferred(emitter: Emitter, d: Deferred) -> Emitter =
 /// 64-bit width or a `Decimal`.
 fn raw_slot(kind: Kind) -> Bool =
   match kind { KFloat -> true, KDec -> true, KNum(w) -> !in_imm(w), _ -> false }
+
+/// The kind a slot holding a value of `kind` as a word reads as: an `Option` its payload's word.
+fn word_kind(kind: Kind) -> Kind = if kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed }
 
 /// The words a record holds a field of `kind` in: a `Decimal`'s two, and one for any other.
 fn raw_words(kind: Kind) -> Int = match kind { KDec -> 2, _ -> 1 }
@@ -1836,11 +1863,13 @@ fn bind_keeping(emitter: Emitter, k: Kind, ty: Ty, expr: Bytes) -> WithValue = {
   { emitter: o.emitter, value: { kind: o.value.kind, expr: o.value.expr, ty: ty } }
 }
 
-/// A local name (`t12`, `p0`, `q1`) rather than an expression.
+/// A local name (`t12`, `p0`, a record parameter's field `p0_1`, `q1`) rather than an expression.
 fn is_local(e: Bytes) -> Bool =
   bytes_len(e) > 1 && (bytes_at(e, 0) == 116 || bytes_at(e, 0) == 112 || bytes_at(e, 0) == 113)
     && fold(range(1, bytes_len(e)), true, |acc: Bool, i: Int|
-      acc && bytes_at(e, i) >= 48 && bytes_at(e, i) <= 57)
+      acc
+        && ((bytes_at(e, i) >= 48 && bytes_at(e, i) <= 57)
+        || (bytes_at(e, 0) == 112 && bytes_at(e, i) == 95 && i > 1 && i + 1 < bytes_len(e))))
 
 /// The parameter whose word `value` is, followed through renames and moves.
 fn param_of(emitter: Emitter, value: CValue, params: List<EmitParam>) -> Option<Int> = {
@@ -2446,7 +2475,7 @@ fn check(emitter: Emitter) -> Emitter =
 /// which pops its frame and answers a raise bound for it; a `return` there would leave both undone.
 fn leaving(emitter: Emitter) -> Bytes =
   match emitter.landing {
-    None -> failing_return(emitter.answer),
+    None -> failing_return(returned_kind(emitter.answer)),
     Some(l) -> bytes_concat_all([b"goto ", l, b";"]),
   }
 
@@ -4969,11 +4998,7 @@ fn element_read(emitter: Emitter, a: Bytes, i: Bytes, element: FieldTy) -> WithV
       );
       {
         emitter: note_holder(loaded, r.name),
-        value: {
-          kind: if element.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
-          expr: r.name,
-          ty: element.ty,
-        },
+        value: { kind: word_kind(element.kind), expr: r.name, ty: element.ty },
       }
     },
   }
@@ -5309,7 +5334,7 @@ fn emit_lambda(
     group: emitter.group,
     operands: emitter.operands,
     typed: emitter.typed,
-    answer: KBoxed,
+    answer: Whole(KBoxed),
     site_root: emitter.site_root,
     lent: emitter.lent,
     written: emitter.written,
@@ -6273,7 +6298,7 @@ fn read_field(
           Some(i) -> {
             let w = bind_keeping(
               held.emitter,
-              if i.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
+              word_kind(i.kind),
               i.ty,
               field_read(held.value.expr, i),
             );
@@ -9141,7 +9166,7 @@ fn arg_tested(
     } else {
       bind(
         emitter,
-        if f.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
+        word_kind(f.kind),
         bytes_concat_all([b"(", so_far, b" ? ", field_read(subj, f), b" : 0)"]),
       )
     },
@@ -9206,14 +9231,7 @@ fn pat_bind(emitter: Emitter, pattern: CodePattern, subj: CValue) -> Emitter / {
         let w = match f {
           Some(x) -> if raw_slot(x.kind) {
             bind(acc, x.kind, raw_at(subj.expr, ascii_of_int(x.at), x.kind))
-          } else {
-            bind_keeping(
-              acc,
-              if x.kind == KSum(Zeroed) { KSum(Zeroed) } else { KBoxed },
-              x.ty,
-              field_read(subj.expr, x),
-            )
-          },
+          } else { bind_keeping(acc, word_kind(x.kind), x.ty, field_read(subj.expr, x)) },
           None ->
             bind(
               acc,
@@ -9520,7 +9538,8 @@ fn join_kind(emitter: Emitter, a: Kind, b: Kind) -> Kind =
 /// How the value at hand, where it is the root's answer and the root hands back a sum as its word,
 /// is that word.
 fn answers_sum(emitter: Emitter) -> Option<SumSpec> =
-  if emitter.tail { match emitter.answer { KSum(spec) -> Some(spec), _ -> None } } else { None }
+  if emitter.tail { match emitter.answer { Whole(KSum(spec)) -> Some(spec), _ -> None } }
+  else { None }
 
 fn is_bitop(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor"
 
@@ -10020,7 +10039,10 @@ fn emit_body(
   body: Code,
 ) -> Option<WithValue> / {abort.raise} = {
   let opened = prologue(start, params);
-  let looped = line(opened, bytes_concat(b"ply_loop: ", tick_line(failing_return(opened.answer))));
+  let looped = line(
+    opened,
+    bytes_concat(b"ply_loop: ", tick_line(failing_return(returned_kind(opened.answer)))),
+  );
   expr(
     if loops_to_self(opened, body, params) { looped } else { opened },
     widths_closed(start, body),
@@ -11180,7 +11202,7 @@ pub fn emit_fn_full(
     group: [],
     operands: operands,
     typed: typed,
-    answer: returned_kind(answer),
+    answer: answer,
     site_root: None,
     lent: lent_of(params),
     written: lambdas_of(body),
@@ -11553,7 +11575,7 @@ pub fn emit_fn_why(
     group: [],
     operands: operands,
     typed: typed,
-    answer: returned_kind(answer),
+    answer: answer,
     site_root: None,
     lent: lent_of(params),
     written: lambdas_of(body),
@@ -11585,7 +11607,6 @@ pub fn emit_group_full(
   let names = map(members, |m: Member| m.full);
   let first = match list_at(members, 0) { Some(m) -> m.full, None -> b"" };
   let gname = bytes_concat(symbol_of(first), b"_group");
-  let answer = KBoxed;
   let width = fold(members, 0, |acc: Int, m: Member|
     if len(m.params) > acc { len(m.params) } else { acc });
   let start: Emitter = {
@@ -11629,7 +11650,7 @@ pub fn emit_group_full(
     group: names,
     operands: operands,
     typed: typed,
-    answer: answer,
+    answer: Whole(KBoxed),
     site_root: None,
     lent: [],
     written: [],
@@ -13251,8 +13272,9 @@ fn field_loads(word: Bytes, fs: List<FieldTy>) -> List<CValue> =
       Some(i) ->
         {
           kind: f.kind,
-          expr: if raw_slot(i.kind) { raw_at(word, ascii_of_int(i.at), i.kind) }
-          else { as_kind({ kind: KBoxed, expr: field_read(word, i), ty: TyOpen([]) }, i.kind) },
+          expr: if raw_slot(i.kind) { raw_at(word, ascii_of_int(i.at), i.kind) } else {
+            as_kind({ kind: word_kind(i.kind), expr: field_read(word, i), ty: TyOpen([]) }, i.kind)
+          },
           ty: f.ty,
         },
       None -> { kind: f.kind, expr: zero_of(f.kind), ty: f.ty },
