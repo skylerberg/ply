@@ -2398,6 +2398,8 @@ type Scan = {
   depth: Int,
   prev: TokenKind,
   before: TokenKind,
+  base: TokenKind,
+  behind: TokenKind,
   starts: List<Int>,
   spelt: List<Spelt>,
   sighted: List<Int>,
@@ -2420,7 +2422,7 @@ type PieceKind = | Exercised | Private(List<Bytes>) | Imported(List<Bytes>) | He
 pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
   let s = start(src);
   let input = s.input;
-  let scan = scanned(input, s.parser);
+  let scan = scanned(input, s.parser, standing(input));
   let count = len(scan.starts);
   let firsts = array_of_list(scan.starts);
   let end = ending(input);
@@ -2456,10 +2458,50 @@ pub fn unimported(src: Bytes) -> List<Span> / {abort.raise} = {
   })
 }
 
-fn scanned(input: Input, parser: Parser) -> Scan =
+/// Each name `input` writes where a local binding of it can stand: not after a dot or a `::`, not
+/// before a dot, not in an `import`, and not as the effect an `effect` declares. A name written
+/// nowhere so is an effect's or a module's, and a call on it a perform.
+fn standing(input: Input) -> Map<Bytes, Bool> =
+  fold(
+    range(0, len(input.tokens)),
+    { names: map_new(), importing: false },
+    |s: { names: Map<Bytes, Bool>, importing: Bool }, i: Int| {
+      let k = token_at(input, i).kind;
+      let before = if i == 0 { EndOfInput } else { token_at(input, i - 1).kind };
+      // An import runs through its path and its selection, and ends at a name that follows a name.
+      let importing = k == keyword_import()
+        || (s.importing
+        && (match k {
+          Identifier(_) -> match before { Identifier(_) -> false, _ -> true },
+          _ -> k == token_dot() || k == token_lparen() || k == token_comma() || k == token_rparen(),
+        }));
+      {
+        importing: importing,
+        names: match k {
+          Identifier(n) -> if importing || before == token_dot() || before == token_coloncolon()
+              || before == keyword_effect()
+              || token_at(input, i + 1).kind == token_dot() { s.names }
+          else { map_insert(s.names, n, true) },
+          _ -> s.names,
+        },
+      }
+    },
+  ).names
+
+fn scanned(input: Input, parser: Parser, bound: Map<Bytes, Bool>) -> Scan =
   fold(
     input.tokens,
-    { at: 0, depth: 0, prev: EndOfInput, before: EndOfInput, starts: [], spelt: [], sighted: [] },
+    {
+      at: 0,
+      depth: 0,
+      prev: EndOfInput,
+      before: EndOfInput,
+      base: EndOfInput,
+      behind: EndOfInput,
+      starts: [],
+      spelt: [],
+      sighted: [],
+    },
     |s: Scan, t: Token| {
       let k = t.kind;
       let starts = if s.depth == 0 && may_start(k) && !modifies(s.prev)
@@ -2470,10 +2512,16 @@ fn scanned(input: Input, parser: Parser) -> Scan =
         else { push(s.spelt, { piece: len(starts) - 1, name: n }) },
         _ -> s.spelt,
       };
-      // `value.name(` and `value.name[`, and `Type::name`.
+      // `value.name(` and `value.name[`, where the value is no bare name the text never binds,
+      // and `Type::name`.
+      let on_a_value = match s.base {
+        Identifier(b) ->
+          s.behind == token_dot() || (s.behind != token_coloncolon() && map_contains(bound, b)),
+        _ -> true,
+      };
       let reads = match s.prev {
         Identifier(n) ->
-          ((k == token_lparen() || k == token_lbracket()) && s.before == token_dot())
+          ((k == token_lparen() || k == token_lbracket()) && s.before == token_dot() && on_a_value)
             || (k == token_coloncolon() && starts_upper(n)),
         _ -> false,
       };
@@ -2482,6 +2530,8 @@ fn scanned(input: Input, parser: Parser) -> Scan =
         depth: depth_after(s.depth, k),
         prev: k,
         before: s.prev,
+        base: s.before,
+        behind: s.base,
         starts: starts,
         spelt: spelt,
         sighted: if reads && len(starts) > 0 { push(s.sighted, len(starts) - 1) }
@@ -3583,6 +3633,8 @@ test "an importer reads no test or law, nor a private item or an import only the
     b"\n\nlaw \"pairs\" = agrees(|p: Pair| p.a, |p: Pair| p.a)",
   ]);
   // An item left that calls on a value, or through a type, reads every module the imports reach.
+  let performs = b"import std.list\nimport std.process (process)\n\npub fn stop(text: String) -> Int / {abort.raise, process.out[proc]} = { process.out[proc](text); abort.raise(1) }\n";
+  assert_eq(len(unimported(performs)), 1);
   let through = b"import std.list\nimport std.laws (agrees)\n\npub fn second(xs: List<Int>) -> Option<Int> = xs.second()\n";
   assert_eq(unimported(through), []);
   let named = b"import std.list\n\npub fn second(xs: List<Int>) -> Option<Int> = List::second(xs)\n";
