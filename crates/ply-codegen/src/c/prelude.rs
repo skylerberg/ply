@@ -95,6 +95,8 @@ static inline int ply_is_float(Word w) { return w != 0 && !ply_is_imm(w) && ply_
 
 /* A `Decimal` in registers: the two words of its object, as `rust_decimal` serializes it. */
 typedef struct { Word lo, hi; } PlyDec;
+/* An `Option` held as its payload's word, zero for `None`. */
+typedef Word PlyMaybe;
 static inline PlyDec ply_dec_at(Word base, int64_t at) { PlyDec d; d.lo = ply_words(base)[at]; d.hi = ply_words(base)[at + 1]; return d; }
 static inline PlyDec ply_dec_of(Word w) { return ply_dec_at(w, 0); }
 static inline void ply_set_dec(Word base, int64_t at, PlyDec d) { ply_words(base)[at] = d.lo; ply_words(base)[at + 1] = d.hi; }
@@ -234,6 +236,9 @@ helpers![
     (rt_region_close, 1, false),
     (rt_list_lookup, 2, true),
     (rt_map_lookup, 2, true),
+    (rt_maybe_take, 1, true),
+    (rt_maybe_box, 1, true),
+    (rt_maybe_open, 1, true),
     (rt_tick, 0, false),
     (rt_grow, 2, true),
     (rt_bitnot, 1, true),
