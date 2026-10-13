@@ -1,8 +1,8 @@
-//! The runtime a native Ply program is linked with. The program's `main` calls [`ply_native_main`]
-//! with the table of its own symbols; this binds the runtime to them and enters the program's
-//! entry with the command line, its pack's shipped modules and its environment lent.
+//! The runtime a native Ply program is linked with. The program's `main` calls [`ply_native_enter`]
+//! with its unit's descriptor; this binds the runtime to the unit and enters the program's entry
+//! with the command line, its pack's shipped modules and its environment lent.
 
-use ply_codegen::c::linked::Row;
+use ply_codegen::c::descriptor::Descriptor;
 use std::ffi::{c_char, c_int};
 
 /// Counts what the entry allocates; nothing but the entry is counted, and only when
@@ -26,28 +26,27 @@ pub extern "C" fn ply_runtime_describe() -> *const c_char {
         .as_ptr()
 }
 
-/// Runs the linked program and answers its exit code. The command line is read from the process,
-/// as Rust's own `main` reads it.
+/// Runs the linked program, whose unit lays `unit` out, and answers its exit code. The command
+/// line is read from the process, as Rust's own `main` reads it.
 ///
 /// # Safety
-/// `symbols` points at `count` rows, ascending by name, that live as long as the process.
+/// `unit` points at the unit's descriptor, which lives as long as the process.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn ply_native_main(
+pub unsafe extern "C" fn ply_native_enter(
     _argc: c_int,
     _argv: *const *const c_char,
-    symbols: *const Row,
-    count: usize,
+    unit: *const Descriptor,
 ) -> c_int {
     // An unwind may not cross into C, so a panic past the entry's own thread ends here.
-    std::panic::catch_unwind(|| unsafe { run(symbols, count) }).unwrap_or(PANICKED)
+    std::panic::catch_unwind(|| unsafe { run(unit) }).unwrap_or(PANICKED)
 }
 
-unsafe fn run(symbols: *const Row, count: usize) -> c_int {
+unsafe fn run(unit: *const Descriptor) -> c_int {
     ply_host::time::mark_start(std::time::Instant::now());
     // Rust's own `main` does this before any user code, so a write to a closed pipe is an error the
     // program answers rather than a signal that ends it; entered from C, the runtime does it here.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
-    if let Err(why) = unsafe { ply_codegen::c::linked::install(symbols, count) } {
+    if let Err(why) = unsafe { ply_codegen::c::linked::install(unit) } {
         eprintln!("ply: {why}");
         return 2;
     }

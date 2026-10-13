@@ -24,8 +24,8 @@ import walk (walk_room)
 import compiler.pkg (PackageSources, Supplied, wants)
 import paths
 import paths (Rooted, displayed, read_file)
-import walk (Failure, Found, named, nothing, is_ply)
-import std.list (at_or, concat)
+import walk (Failure, Found, loading, nothing, is_ply, package)
+import std.list (at_or, concat, contains)
 import compiler.parsing (no_module, Span)
 
 /// One module of the program: its place below the root, which names it, and its bytes.
@@ -92,7 +92,7 @@ fn unaddressable(m: Int, path: String, why: String) -> Diag =
 
 fn unreadable(path: String) -> Diag =
   nowhere(b"E0502", "could not read `" ++ path ++ "`", b"this path could not be loaded", [
-    b"pass a `.ply` file or a directory containing one; the default is `.`",
+    b"pass a `.ply` file or a directory containing one",
   ])
 
 pub fn nothing_here(path: String) -> Diag =
@@ -100,6 +100,18 @@ pub fn nothing_here(path: String) -> Diag =
     b"name a `.ply` file, or a directory that contains one",
     b"directories whose name starts with `.` are not searched",
   ])
+
+/// What a command that names no path says where no package holds the working directory `pwd`.
+pub fn no_package(pwd: String) -> Diag =
+  nowhere(
+    b"E0502",
+    "no `ply.pkg` in `" ++ pwd ++ "` or any directory above it",
+    b"no package to load",
+    [
+      b"name a `.ply` file or a directory to load it as it stands",
+      b"`ply new NAME` starts a package",
+    ],
+  )
 
 /// A refused file joins `files` so a label can point at it, and never joins `sources`.
 fn refused_file(project: Project, file: File, diag: Diag) -> Project =
@@ -156,19 +168,54 @@ fn read(
     { ..acc, diags: push(acc.diags, unreadable(e.path)) })
 }
 
-/// Every path a command was given, each found and read under the root it resolved to, and merged.
+/// What refuses a path a line names inside a package: nothing is there, or a symlink is.
+fn unnamed(resolved: paths::Resolved) -> List<Diag> / {fs.kind[cwd], fs.kind[abs]} = {
+  let at = paths::rooted(resolved);
+  match paths::kind(at) {
+    fs::Missing -> [unreadable(displayed(at))],
+    fs::Symlink -> [unreadable(displayed(at))],
+    _ -> [],
+  }
+}
+
+/// One path as a load reads it, with its root's manifest: a path a line names in a package must be
+/// there, though the package is read whole.
+fn loaded(
+  resolved: paths::Resolved,
+) -> Project / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
+  let own = read(loading(nothing(), resolved), paths::root_prefix(resolved));
+  match with_manifest(resolved, empty()).manifest {
+    None -> own,
+    Some(manifest) ->
+      { ..own, manifest: Some(manifest), diags: concat(own.diags, unnamed(resolved)) },
+  }
+}
+
+/// Every path a command was given, each read under the root it resolved to, and merged: a package
+/// two of them are part of is read once.
 pub fn load_resolved(
   rs: List<paths::Resolved>,
 ) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
   let rs = if len(rs) == 0 { [paths::here()] } else { rs };
-  let merged = fold(rs, empty(), |acc: Project, resolved: paths::Resolved|
-    merge(
-      acc,
-      with_manifest(
-        resolved,
-        read(named(nothing(), paths::rooted(resolved)), paths::root_prefix(resolved)),
-      ),
-    ));
+  let merged = fold(
+    rs,
+    { project: empty(), packages: [] },
+    |acc: { project: Project, packages: List<Rooted> }, resolved: paths::Resolved| {
+      let root: Rooted = { label: resolved.label, path: resolved.spelling };
+      if contains(acc.packages, root) {
+        { ..acc, project: { ..acc.project, diags: concat(acc.project.diags, unnamed(resolved)) } }
+      } else {
+        let one = loaded(resolved);
+        {
+          project: merge(acc.project, one),
+          packages: match one.manifest {
+            Some(_) -> push(acc.packages, root),
+            None -> acc.packages,
+          },
+        }
+      }
+    },
+  ).project;
   match list_at(rs, 0) {
     None -> merged,
     Some(first) ->
@@ -341,7 +388,7 @@ fn read_dep_modules(
   root: String,
 ) -> List<File> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let swept = at_abs(root);
-  let found = named(nothing(), swept);
+  let found = package(nothing(), swept);
   fold(map_values(found.files), [], |acc: List<File>, rooted: Rooted|
     match paths::strip_prefix(rooted.path, swept.path) {
       None -> acc,
@@ -831,7 +878,7 @@ test "the manifest is the one in the root's directory, whichever file in it the 
     display: "/srv/app",
     inside: "main.ply",
     absolute: "/srv/app",
-    machine: "/srv/app/main.ply",
+    machine: "/srv/app",
   };
   let p = handle {
     with_manifest(file, empty())

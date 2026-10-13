@@ -32,7 +32,8 @@ streams as an effect set, and `--host` binds them to the run's own console
 (`ply doc std.console`, §14); a run
 without it is hermetic and refuses them (`E0424`). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
-Each takes a `.ply` file or a project root, defaulting to `.`.
+Each takes a `.ply` file or a directory and acts on the project that holds it;
+with no path it acts on the package the working directory is part of.
 `ply check --types` prints every definition's inferred signature, each atom of
 its row marked with how many times a call performs it (§6.2), and, under one
 whose row says `diverges`, why its calls may not return (§5.10).
@@ -47,13 +48,26 @@ directory is not a name (`ply new lib-src --name core`), and `--lib` writes a
 package prefix can be — lower-case letters, digits and `_`, joined by dots —
 and a directory that is already there is refused rather than written into.
 
-**Projects.** Every `*.ply` file under the root, except inside directories whose
-name starts with `.`, is a module named by its relative path with `/` → `.` and
-`.ply` dropped: `store/orders/place.ply` is `store.orders.place`. Every
-directory name and file stem must be an identifier (`E0111`). `std` and
-`compiler` are the built-in packages, pre-seeded for every load: a module
-named under either collides with its prefix (`E0133`). Naming a single file
-makes its parent the root and loads only that file.
+**Projects.** A project's root is found, not assumed: it is the nearest directory
+at or above the path a command names that holds a `ply.pkg` (§3.3), and a
+command that names no path starts from the working directory. So `ply test`
+means the same package from its root and from any directory below it, and a
+path inside the package narrows the command and never moves the root:
+`ply test store` runs the tests of the modules under `store/`, and
+`ply run tools/gen.ply` enters that file's `main`. Where no directory up to the
+filesystem's root holds a `ply.pkg`, a directory a command names is a root as it
+stands and a file it names is a program of that one file; a command that names
+no path there loads nothing and says so (`E0502`), rather than take whatever is
+under the working directory for a program.
+
+Every `*.ply` file under the root is a module named by its relative path with
+`/` → `.` and `.ply` dropped: `store/orders/place.ply` is `store.orders.place`.
+Three kinds of directory are not searched: one whose name starts with `.`, one
+named `target`, and, under a root that holds a `ply.pkg`, one that holds a
+`ply.pkg` of its own, which is another package and reached only as a dependency
+(§3.3). Every directory name and file stem must be an identifier (`E0111`).
+`std` and `compiler` are the built-in packages, pre-seeded for every load: a
+module named under either collides with its prefix (`E0133`).
 
 **The cache.** `.ply-cache/` at the root holds the memo store (`memo/`), which
 keeps what each module of the project answered checked, the store — the tests'
@@ -390,14 +404,14 @@ Definitions may refer to each other and recurse across the whole program.
 ```ply
 type Account = { name: String, balance: Int }
 
-fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account {
+fn credit(a: Account, amount: Int, note: Option<String> = None) -> Account = {
   let moved = a.balance + amount;
   {name: a.name, balance: moved}
 }
 ```
 
-A body is `= expression`, or a block with no `=`. There is no `return`. A body
-that binds is written as a block: `fn f() -> Int = { let x = 1; x }`, never
+A body is `= expression`. There is no `return`. A body that binds is written
+as a block: `fn f() -> Int = { let x = 1; x }`, never
 `fn f() -> Int = let x = 1; x`, which does not parse — a `let` statement is not
 an expression. Every parameter and return type of a top-level `fn` must be
 written (`E0126`, which names the inferred type). A parameter the body never
@@ -412,7 +426,8 @@ export (`E0122`). Only a `fn` takes defaults (`E0120` elsewhere).
 `reuse fn` promises that every `push` in the body reuses its list (§5.6), and
 `transparent fn` puts the body into what another package reads of it (§10). The
 entry point is `main`, of any type and row: no `main` is `E0101`, several is
-`E0112` (name the file to pick one).
+`E0112` (name the file to pick one: `ply run tools/gen.ply` enters that file's
+`main`, in the package it is part of).
 
 ### 3.2 Imports, visibility and namespaces
 
@@ -592,7 +607,8 @@ but not the repository a fetch came from — plus `vendor/index`, one line per
 package saying which want that directory answers. A walk that finds the index
 reads those trees and asks for nothing else, so a vendored checkout builds with
 no cache, no network and no git; the lockfile still holds the sources to what
-was pinned. A registry dependency is vendored like any other, and
+was pinned. Each vendored tree holds its own `ply.pkg`, so it is the dependency's
+and no part of the package that vendored it (§1). A registry dependency is vendored like any other, and
 `ply resolve` in a vendored project writes the version it selects into the
 vendored copy as well as the cache, so the next walk reads what the lock pins. `ply why
 NAME` says how a package got here: the path from the root package to it through
@@ -3088,8 +3104,8 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into the memo store at `DIR`, which then holds those answers and nothing else, writing only what `DIR` lacks, through the one kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads beside its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
 | `ply explain CODE` | one line on what the code means; `--all` lists every code; no path |
-| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules |
-| `ply fmt [paths]` | rewrite every `.ply` file under the paths in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
+| `ply doc NAME [path]` | what a full or unique simple name names (§2.1): a definition's signature with the written parameter names, its doc, `returns` and specification clauses, place, hash, footprint, and the tests and laws that name it; a law schema as it is written, with the laws that instantiate it; a type with its fields or variants (an `opaque` sum's are its module's, and are not listed), an effect with its operations (one is `effect.op`), an effect set, or a module with what it publishes, each with its doc; a builtin as the prelude declares it, and `prelude` every builtin. A name the program does not hold is looked up among the builtins, then the shipped modules, which are all there is to look in where no package holds the working directory |
+| `ply fmt [paths]` | rewrite every `.ply` file under the paths, or under the package the working directory is part of where none is given, in the canonical layout; `--check` writes nothing and exits 1 naming the files that would change, and `--json` is a report of exactly that, so it requires `--check` |
 | `ply show NAME [path]` | one `fn` or `type` as its file holds it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line; `--json` adds the byte range |
 | `ply replace NAME [path]` | rewrite one `fn` or `type` from `--with FILE` or stdin, formatted, every other byte of the file kept; refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash moves; `--check` writes nothing |
 | `ply resolve [path]` | write `ply.lock` from this project's manifest closure, listing every dependency's name and version and the source digest of each the checkout does not hold (`in the checkout` for the rest, `"digest": null` in `--json`), with no module parsed or checked; the one command that fetches registry dependencies, from `PLY_REGISTRY`, each with the interface and the attestation published for it under this `ply`'s semantics when there are (`interface` and `attestation` in `--json`, the attestation believed only as `PLY_ATTESTERS` says; §15.1) |
@@ -3113,7 +3129,12 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 `ply std`, `ply explain`, `ply hosts`, `ply cache` and `ply bootstrap` are one
 Ply program (`crates/ply-cli/ply`, entered at `ply.main`). The program itself parses the command line, prints help and
 refusals, and resolves the paths it is given against the working directory — a
-relative path reads under it, an absolute one reads where it points. The binary
+relative path reads under it, an absolute one reads where it points — and then
+finds the root each is part of (§1): `[path]` in the table above is a `.ply`
+file or a directory, and left off it is the package the working directory is
+part of. `ply fmt` rewrites the paths it is given as they stand, `ply new` and
+`ply bootstrap` take theirs as written, and `ply doc` answers for a builtin or a
+shipped module where no package holds the working directory. The binary
 answers with the code the program asked to exit with. What a command needs of
 the machine is lent to the program as an effect: `ply run`, `ply test` and
 `ply prove` drive a nested program on a machine of their own, `ply hosts` and
