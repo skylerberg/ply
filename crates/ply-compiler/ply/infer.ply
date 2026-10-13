@@ -533,6 +533,8 @@ type Checker = {
   refs: List<Bytes>,
   calls: List<OwnCall>,
   tag_uses: List<TagUse>,
+  /// The parameters of each definition called so far whose types hold a function.
+  fn_holding: Map<Bytes, List<Int>>,
   auto_ty_params: Bool,
   alias_stack: List<Bytes>,
   /// Each parameterless alias as an expansion made it, and the `Map` keys that expansion noted.
@@ -4199,6 +4201,29 @@ fn callee_repeats(
   }
 }
 
+/// The parameters of the definition `name` whose types hold a function, read off its signature
+/// the first time it is called.
+fn fn_holding(
+  checker: Checker,
+  name: Bytes,
+) -> { checker: Checker, params: List<Int> } / {abort.raise} =
+  match map_get(checker.fn_holding, name) {
+    Some(params) -> { checker: checker, params: params },
+    None -> {
+      let params = match env_lookup(checker.env, name) {
+        Some(scheme) -> match scheme.ty {
+          TyFn(f) -> filter(range(0, len(f.params)), |i: Int| holds_fn(at(f.params, i))),
+          _ -> [],
+        },
+        None -> [],
+      };
+      {
+        checker: { ..checker, fn_holding: map_insert(checker.fn_holding, name, params) },
+        params: params,
+      }
+    },
+  }
+
 /// The parameters a builtin calls once per element of its argument at `over`.
 fn builtin_repeats(name: Bytes) -> { params: List<Int>, over: Int } =
   if name == b"map" || name == b"filter" { { params: [1], over: 0 } }
@@ -6136,19 +6161,35 @@ fn infer_app_general(
       let effects = if required.shown { { ..resolved, atoms: without_raises(resolved.atoms) } }
       else { resolved };
       let scaled = repeated_rows(obliged, fn_.params, repeats.params);
-      // What each parameter's functions perform, for a callee whose counts are not in yet.
-      let held = match repeats.waits {
-        None -> [],
-        Some(_) -> map(fn_.params, |p: Type| rows_in(obliged, p, { atoms: [], vars: [] })),
+      // What each parameter's functions perform, for a callee whose counts are not in yet: read
+      // only where the call performs something a parameter could be the source of.
+      let holding: { checker: Checker, params: List<Int> } = match repeats.waits {
+        Some(g) -> if len(effects.atoms) == 0 && effects.tail == None {
+          { checker: obliged, params: [] }
+        } else { fn_holding(obliged, g) },
+        None -> { checker: obliged, params: [] },
       };
+      let held = map(holding.params, |i: Int|
+        {
+          param: i,
+          rows: match list_at(fn_.params, i) {
+            Some(p) -> rows_in(holding.checker, p, { atoms: [], vars: [] }),
+            None -> { atoms: [], vars: [] },
+          },
+        });
       let waiting = |g: Bytes, has: ({ atoms: List<Atom>, vars: List<Int> }) -> Bool|
-        fold(range(0, len(held)), [], |acc: List<Maybe>, i: Int|
-          if has(at(held, i)) { push(acc, { callee: g, param: Some(i), span: span }) }
-          else { acc });
+        fold(
+          held,
+          [],
+          |acc: List<Maybe>, h: { param: Int, rows: { atoms: List<Atom>, vars: List<Int> } }|
+            if has(h.rows) { push(acc, { callee: g, param: Some(h.param), span: span }) }
+            else { acc },
+        );
       let entered: Checker = match repeats.waits {
-        Some(g) -> if !map_contains(obliged.own_fns, g) { obliged }
-        else { { ..obliged, calls: push(obliged.calls, { callee: g, span: span }) } },
-        None -> obliged,
+        Some(g) -> if !map_contains(holding.checker.own_fns, g) { holding.checker } else {
+          { ..holding.checker, calls: push(holding.checker.calls, { callee: g, span: span }) }
+        },
+        None -> holding.checker,
       };
       let recorded: Checker = fold(effects.atoms, entered, |cc: Checker, atom: Atom|
         if contains(scaled.atoms, atom) { record_over(cc, atom, span, source, Some(span), []) }
@@ -9538,26 +9579,28 @@ fn signed_body(
 fn named_callees(checker: Checker, def: FnDef) -> List<NamedCallee> / {abort.raise} = {
   let read = fold(def.params, refs_of(def.body, []).names, |acc: List<QName>, p: Param|
     match p.default { Some(d) -> concat(acc, refs_of(d, []).names), None -> acc });
-  fold(read, [], |acc: List<NamedCallee>, q: QName| {
-    let module = match q.module { Some(m) -> m.name, None -> b"" };
-    if fold(acc, false, |b: Bool, x: NamedCallee|
-        b || (x.module == module && x.name == q.name.name)) { acc } else {
-      push(acc, { module: module, name: q.name.name, callee: group_callee_kind(checker, [], q) })
-    }
-  })
+  fold(
+    read,
+    { seen: map_new(), out: [] },
+    |acc: { seen: Map<Bytes, Bool>, out: List<NamedCallee> }, q: QName| {
+      let module = match q.module { Some(m) -> m.name, None -> b"" };
+      let key = name_key(module, q.name.name);
+      if map_contains(acc.seen, key) { acc } else {
+        {
+          seen: map_insert(acc.seen, key, true),
+          out: push(acc.out, {
+            module: module,
+            name: q.name.name,
+            callee: group_callee_kind(checker, [], q),
+          }),
+        }
+      }
+    },
+  ).out
 }
 
-/// What the expression at `span` calls of the group `qualified` and beyond it because a type
-/// states it, as the termination walk reads a free name.
-fn stated_at(
-  bodies: List<Body>,
-  qualified: List<Bytes>,
-  span: Span,
-) -> List<Callee> / {abort.raise} =
-  fold(bodies, [], |acc: List<Callee>, b: Body|
-    fold(b.stated, acc, |found: List<Callee>, call: OwnCall|
-      if call.span != span { found }
-      else { push(found, member_or(qualified, DefinedCallee(call.callee))) }))
+/// The key a name a body reads is kept under: its module as written, empty where bare, and itself.
+fn name_key(module: Bytes, name: Bytes) -> Bytes = bytes_concat_all([module, b"::", name])
 
 /// `callee`, or the slot it has in the group `qualified` where it is a member.
 fn member_or(qualified: List<Bytes>, callee: Callee) -> Callee / {abort.raise} =
@@ -9590,20 +9633,36 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
   // body walked to read an ending from.
   let filed = map(bodies, |b: Body| b.filed);
   let walked = fold(filed, false, |any: Bool, k: Option<KnownDef>| any || k == None);
-  let named = |qname: QName| {
-    let module = match qname.module { Some(x) -> x.name, None -> b"" };
-    fold(bodies, OtherCallee, |found: Callee, b: Body|
-      fold(b.names, found, |kind: Callee, x: NamedCallee|
-        if x.module == module && x.name == qname.name.name { member_or(qualified, x.callee) }
-        else { kind }))
-  };
+  let names = fold(bodies, map_new(), |acc: Map<Bytes, Callee>, b: Body|
+    fold(b.names, acc, |held: Map<Bytes, Callee>, x: NamedCallee|
+      map_insert(held, name_key(x.module, x.name), member_or(qualified, x.callee))));
+  let named = |qname: QName|
+    match map_get(
+        names,
+        name_key(match qname.module { Some(x) -> x.name, None -> b"" }, qname.name.name),
+      ) {
+      Some(callee) -> callee,
+      None -> OtherCallee,
+    };
+  let stated = fold(bodies, map_new(), |acc: Map<Bytes, List<Callee>>, b: Body|
+    fold(b.stated, acc, |held: Map<Bytes, List<Callee>>, call: OwnCall| {
+      let key = span_key(call.span);
+      map_insert(
+        held,
+        key,
+        push(
+          match map_get(held, key) { Some(cs) -> cs, None -> [] },
+          member_or(qualified, DefinedCallee(call.callee)),
+        ),
+      )
+    }));
   let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
     verdict({
       defs: defs,
       names: qualified,
       params: map(bodies, |b: Body| b.params),
       resolve: named,
-      stated: |span: Span| stated_at(bodies, qualified, span),
+      stated: |span: Span| match map_get(stated, span_key(span)) { Some(cs) -> cs, None -> [] },
       ending_of: |n: Bytes| match def_of(tagged, n) { Some(d) -> d.ending, None -> Ends },
       summary_of: |n: Bytes| map_get(tagged.summaries, n),
     })
@@ -14712,6 +14771,7 @@ fn fresh_cx(resolved: Resolved, mods: List<ParsedModule>, known: Known) -> Check
     refs: [],
     calls: [],
     tag_uses: [],
+    fn_holding: map_new(),
     auto_ty_params: false,
     alias_stack: [],
     aliases: map_new(),
