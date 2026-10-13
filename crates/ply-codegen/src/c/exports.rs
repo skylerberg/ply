@@ -73,8 +73,8 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// How the unit's C reads a `Decimal` and a bytes slice, as its [`RAW_DECIMALS`] and
-    /// [`BYTES_VIEWS`] lines say.
+    /// How the unit's C reads a `Decimal`, a bytes slice and an `Option`, as its [`RAW_DECIMALS`],
+    /// [`BYTES_VIEWS`] and [`OPTION_WORDS`] lines say.
     pub layout: RecordLayout,
 }
 
@@ -86,6 +86,10 @@ pub const RAW_DECIMALS: &str = "decimals held raw";
 /// A line after a unit's tables, where its C reads a bytes value's bytes through `ply_bytes`, which
 /// follows a view to the value it views; a unit without it reads them in place.
 pub const BYTES_VIEWS: &str = "bytes slices are views";
+
+/// A line after a unit's tables, where its C reads an `Option` a record, an array or a constructor
+/// holds as its payload's word, zero for `None`; a unit without it reads the `Option`'s word.
+pub const OPTION_WORDS: &str = "options held as their payload's word";
 
 impl Exports {
     /// The address of each helper the unit binds, in its order; a unit recording one this runtime
@@ -173,6 +177,9 @@ impl Exports {
         if self.layout.bytes_views {
             out.push_str(&format!("{BYTES_VIEWS}\n"));
         }
+        if self.layout.option_words {
+            out.push_str(&format!("{OPTION_WORDS}\n"));
+        }
         out
     }
 
@@ -240,11 +247,13 @@ impl Exports {
         let mut layout = RecordLayout {
             raw_decimals: false,
             bytes_views: false,
+            option_words: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
                 RAW_DECIMALS => layout.raw_decimals = true,
                 BYTES_VIEWS => layout.bytes_views = true,
+                OPTION_WORDS => layout.option_words = true,
                 _ => {}
             }
         }

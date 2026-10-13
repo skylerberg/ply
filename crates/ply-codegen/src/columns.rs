@@ -59,7 +59,7 @@ impl Heap {
             .map(|k| {
                 let values: Vec<Word> = items
                     .iter()
-                    .map(|w| field_word(self, obj(*w), offsets[k], slots[k]))
+                    .map(|w| field_word(self, layouts, obj(*w), offsets[k], slots[k]))
                     .collect();
                 self.array_of(layouts, &values)
             })
@@ -99,7 +99,7 @@ impl Heap {
         let shape = unsafe { (*o).layout };
         let (offsets, slots) = (layouts.shape_offsets(shape), layouts.shape_slots(shape));
         for k in 0..slots.len() {
-            let x = field_word(self, obj(v), offsets[k], slots[k]);
+            let x = field_word(self, layouts, obj(v), offsets[k], slots[k]);
             let set = self.array_set(layouts, unsafe { word_at(o, k) }, i, x);
             unsafe { set_word(o, k, set) };
         }
