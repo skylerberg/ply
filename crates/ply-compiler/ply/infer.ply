@@ -304,6 +304,8 @@ type LabelApplication = {
   named: Int,
   callee: Bytes,
   vars: List<Int>,
+  /// Those of `vars` a call writes: the ones that name no region.
+  written: List<Int>,
   params: Map<Bytes, Int>,
   called: Bool,
   owner: Bytes,
@@ -3542,10 +3544,52 @@ fn report_unify(
         bytes_concat_all([context, b"|", pe.text, b"|", pf.text]),
         bytes_concat(b"effect row mismatch: ", context),
         bytes_concat_all([b"expected ", pe.text, b", found ", pf.text]),
-        if len(extra) > 0 {
-          [bytes_concat(b"not permitted here: ", backticked(map(extra, atom_text), b", "))]
-        } else { [] },
+        concat(
+          if len(extra) > 0 {
+            [bytes_concat(b"not permitted here: ", backticked(map(extra, atom_text), b", "))]
+          } else { [] },
+          region_apart(expected, found),
+        ),
       )
+    },
+  }
+
+/// An atom of `row` that names a region where `other` names the resource the region is written as.
+fn region_twin(row: Row, other: Row) -> Option<Atom> / {abort.raise} =
+  fold(row.atoms, None, |acc: Option<Atom>, a: Atom|
+    match acc {
+      Some(_) -> acc,
+      None -> match a.resource {
+        RNamed(n) -> if written_label(n) != n
+            && contains(other.atoms, { ..a, resource: RNamed(written_label(n)) }) { Some(a) }
+        else { None },
+        _ -> None,
+      },
+    })
+
+/// Two rows that print alike and differ: one names a region, the other a resource of its name.
+fn region_apart(expected: Row, found: Row) -> List<Bytes> / {abort.raise} =
+  match match region_twin(found, expected) {
+      Some(a) -> Some(a),
+      None -> region_twin(expected, found),
+    } {
+    None -> [],
+    Some(a) -> {
+      let name = match a.resource { RNamed(n) -> written_label(n), _ -> b"" };
+      [
+        bytes_concat_all([
+          b"one `",
+          name,
+          b"` is the region `with_",
+          a.effect,
+          b"[",
+          name,
+          b"]` opens and the other is the resource of that name, which is all a row written outside the region names",
+        ]),
+        if a.effect == hold() {
+          b"take the hold with its region as a label parameter, `<[r]>(h: Hold<T, [r]>)`, or what reads it through a row parameter, `<| e>`"
+        } else { b"take what reads or writes the cell through a row parameter, `<| e>`" },
+      ]
     },
   }
 
@@ -5000,7 +5044,11 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
               cell_is_a_name(),
             )
           };
-          { checker: note_labels(named, qname.span, key.name, ls), ty: inst.ty, row: row_empty() }
+          {
+            checker: note_labels(named, qname.span, key.name, ls, inst.ty),
+            ty: inst.ty,
+            row: row_empty(),
+          }
         },
         None -> {
           let o: WithTy = new_ty(unknown_name(k.checker, qname));
@@ -5374,8 +5422,16 @@ fn group_member(checker: Checker, name: Bytes) -> Bool =
 
 /// Every use of a label-generic definition, so a call can fill its labels and a settled component
 /// can say which ones it filled them with.
-fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) -> Checker =
+fn note_labels(
+  checker: Checker,
+  span: Span,
+  callee: Bytes,
+  labels: List<Type>,
+  ty: Type,
+) -> Checker / {abort.raise} =
   if len(labels) == 0 { checker } else {
+    let vars = map(labels, |l: Type| match l { TyVar(v) -> v, _ -> 0 - 1 });
+    let regions = region_labels(ty, []);
     {
       ..checker,
       label_apps: push(checker.label_apps, {
@@ -5383,12 +5439,38 @@ fn note_labels(checker: Checker, span: Span, callee: Bytes, labels: List<Type>) 
         span: span,
         named: span.end,
         callee: callee,
-        vars: map(labels, |ty: Type| match ty { TyVar(v) -> v, _ -> 0 - 1 }),
+        vars: vars,
+        written: filter(vars, |v: Int| !contains(regions, v)),
         params: checker.label_params,
         called: false,
         owner: checker.walking,
       }),
     }
+  }
+
+/// The label variables `ty` names a region by: a hold's, and those of the `cell` and `hold` atoms
+/// its rows write.
+fn region_labels(ty: Type, acc: List<Int>) -> List<Int> / {abort.raise} =
+  match ty {
+    TyVar(_) -> acc,
+    TyCon(c) -> {
+      let own = if c.name == b"Hold" {
+        match list_at(c.args, 0) { Some(TyVar(v)) -> ints_insert(acc, v), _ -> acc }
+      } else { acc };
+      fold(c.args, own, |a: List<Int>, x: Type| region_labels(x, a))
+    },
+    TyFn(f) ->
+      fold(
+        f.effects.atoms,
+        fold(f.params, region_labels(f.ret, acc), |a: List<Int>, p: Type| region_labels(p, a)),
+        |a: List<Int>, atom: Atom|
+          match atom.resource {
+            RVar(v) -> if is_region_effect(atom.effect) { ints_insert(a, v) } else { a },
+            _ -> a,
+          },
+      ),
+    TyRecord(fs) -> fold(fs, acc, |a: List<Int>, f: Field| region_labels(f.ty, a)),
+    TyNominal(n) -> fold(n.args, acc, |a: List<Int>, x: Type| region_labels(x, a)),
   }
 
 /// The use recorded for the name this call applies, when the callee is label-generic.
@@ -5398,7 +5480,8 @@ fn callee_labels(checker: Checker, span: Span) -> Option<LabelApplication> =
     None -> None,
   }
 
-/// The labels written at a call fill the callee's label parameters left to right.
+/// The labels written at a call fill, left to right, the callee's label parameters that name no
+/// region: a region's is filled by the argument that carries it.
 fn fill_labels(
   checker: Checker,
   span: Span,
@@ -5406,27 +5489,23 @@ fn fill_labels(
   app: Option<LabelApplication>,
 ) -> Checker / {abort.raise} =
   match app {
-    None -> if len(labels) == 0 { checker } else { wrong_labels(checker, labels, None, 0) },
+    None -> if len(labels) == 0 { checker } else { wrong_labels(checker, labels, None, 0, 0) },
     // A count that does not match is reported here, and the use dropped rather than reported twice.
-    Some(a) -> if len(labels) > 0 && len(labels) != len(a.vars) {
+    Some(a) -> if len(labels) > 0 && len(labels) != len(a.written) {
       wrong_labels(
         { ..checker, label_apps: take(checker.label_apps, len(checker.label_apps) - 1) },
         labels,
         Some(a.callee),
-        len(a.vars),
+        len(a.written),
+        len(a.vars) - len(a.written),
       )
     } else {
       let marked: Checker = {
         ..checker,
         label_apps: list_set(checker.label_apps, len(checker.label_apps) - 1, {
-          module: a.module,
+          ..a,
           span: span,
-          named: a.named,
-          callee: a.callee,
-          vars: a.vars,
-          params: a.params,
           called: true,
-          owner: a.owner,
         }),
       };
       // A name a binder holds is that label parameter, as it is inside a row; anything else is a resource.
@@ -5435,23 +5514,31 @@ fn fill_labels(
           Some(w) -> TyVar(w),
           None -> label_type(at(labels, i).name),
         };
-        with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.vars, i)), want))
+        with_unified(c, unify(c.subst, c.fresh, TyVar(at(a.written, i)), want))
       })
     },
   }
 
+/// `want` is how many labels a call of the callee writes, and `regions` how many more it binds
+/// for a region.
 fn wrong_labels(
   checker: Checker,
   labels: List<Ident>,
   callee: Option<Bytes>,
   want: Int,
+  regions: Int,
 ) -> Checker / {abort.raise} = {
   let span = span_to(at(labels, 0).span, at(labels, len(labels) - 1).span);
   let who = match callee {
     Some(n) -> bytes_concat_all([b"`", simple_name_of(n), b"`"]),
     None -> b"this callee",
   };
-  let message = if want == 0 { bytes_concat_all([who, b" takes no label parameters"]) } else {
+  let message = if want == 0 {
+    bytes_concat_all([
+      who,
+      if regions == 0 { b" takes no label parameters" } else { b" takes no label a call writes" },
+    ])
+  } else {
     bytes_concat_all([
       who,
       b" takes ",
@@ -5465,9 +5552,16 @@ fn wrong_labels(
       b" written",
     ])
   };
-  let help = [
-    b"the labels at a call fill the `[l]` binders of the definition's generic list, left to right",
-  ];
+  let help = concat(
+    [
+      b"the labels at a call fill the `[l]` binders of the definition's generic list, left to right",
+    ],
+    if regions == 0 { [] } else {
+      [
+        b"a binder that names a hold's or a cell's region is filled by the argument that carries the region, and is not written",
+      ]
+    },
+  );
   match callee {
     Some(n) -> match def_of(checker, n) {
       Some(d) ->
@@ -8338,7 +8432,7 @@ fn infer_with_cell(
     };
     let recorded: Checker = { ..discharged, regions: push(discharged.regions, site) };
     let j: WithRow = join(recorded, span, i.row, row_without(b.row, handled));
-    { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty)), row: j.row }
+    { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
   }
 }
 
@@ -8431,7 +8525,7 @@ fn infer_with_hold(
         entering.row,
         row_without_covered(resolve_row_in(recorded, b.row), handled),
       );
-      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty)), row: j.row }
+      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
     },
   }
 }
@@ -14666,11 +14760,12 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
           ],
         );
         // One binder for one label is the only label this definition can pass along.
-        report(in_module, match ((map_keys(a.params), a.vars)) {
-          ([own], [_]) ->
+        report(in_module, match ((map_keys(a.params), a.written)) {
+          ([own], [w]) -> if label_named(in_module, a, w) != None { unfilled } else {
             with_fix(unfilled, bytes_concat_all([b"pass `", own, b"` along"]), [
               insertion(a.module, a.named, bytes_concat_all([b"[", own, b"]"])),
-            ]),
+            ])
+          },
           _ -> unfilled,
         })
       } else {
@@ -15443,6 +15538,48 @@ test "a function handed a hold reads it under its region's label, which the regi
   assert_eq(check_codes(b"effect hold { read get() -> Int }"), [b"E0105"])
 }
 
+test "the labels a call writes fill those that name no region, which the hold passed fills" {
+  let noted = b"effect log { write say[l](n: Int) -> Unit }\nfn noted<[l], [r]>(h: Hold<Int, [r]>) -> Unit / {log.write[l], hold.read[r]} = log.say[l](hold_get(h))\n";
+  let inside = |call: Bytes|
+    bytes_concat_all([
+      noted,
+      b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> ",
+      call,
+      b" }",
+    ]);
+  assert_eq(check_codes(inside(b"noted[out](h)")), []);
+  assert(
+    refused_with(
+      inside(b"noted[out, file](h)"),
+      b"E0306",
+      b"`noted` takes 1 label parameter, but 2 are written",
+    ),
+  );
+  assert(
+    refused_with(inside(b"noted(h)"), b"E0306", b"this call leaves a label of `noted` unfilled"),
+  );
+  let peek = b"fn peek<[r]>(h: Hold<Int, [r]>) -> Int / {hold.read[r]} = hold_get(h)\n";
+  assert(
+    refused_with(
+      bytes_concat(peek, b"fn f() -> Int = with_hold[file](1, |x: Int| ()) { h -> peek[file](h) }"),
+      b"E0306",
+      b"`peek` takes no label a call writes",
+    ),
+  );
+  // A callback's row names the region as a hold's type does.
+  let through = b"fn through<[l], [r] | e>(k: () -> Int / {hold.read[r] | e}) -> Unit / {log.write[l], hold.read[r] | e} = log.say[l](k())\n";
+  assert_eq(
+    check_codes(
+      bytes_concat_all([
+        noted,
+        through,
+        b"fn f() -> Unit / {log.write[out]} = with_hold[file](1, |x: Int| ()) { h -> through[out](|| hold_get(h)) }",
+      ]),
+    ),
+    [],
+  )
+}
+
 test "a hold that leaves its region is refused where it leaves" {
   assert_eq(refusals(b"fn f() -> Int = { let k = with_hold[r](1, |x: Int| ()) { h -> h }; 0 }"), [
     [b"E0446", b"a hold escapes its `with_hold[r]` region", b"h"],
@@ -15513,13 +15650,35 @@ test "a region's label is its own: a row another definition writes names no regi
   assert(contains(check_codes(wrap), b"E0302"));
   // And a closure over this region's cell is no `cell.read[work]` a parameter could ask for.
   let asked = bytes_concat(b"fn wrap(k: () -> Int / {cell.read[work]}) -> Int = 0\n", leak);
-  assert(contains(check_codes(asked), b"E0302"));
+  // The two rows print alike, so the refusal says which `work` each is.
+  assert_eq(
+    map(filter(check_diags(asked), |diag: Diag| diag.code == b"E0302"), |diag: Diag|
+      list_at(diag.notes_text, 1)),
+    [
+      Some(
+        b"one `work` is the region `with_cell[work]` opens and the other is the resource of that name, which is all a row written outside the region names",
+      ),
+    ],
+  );
   // A callee generic over the row takes the closure, and its own region answers none of it.
   let generic = bytes_concat_all([
     b"fn each<| e>(k: () -> Int / e) -> Int / e = with_cell[work](0) { d -> cell_get(d) + k() }\n",
     b"fn held() -> Int = with_cell[work](41) { c -> each(|| cell_get(c)) }",
   ]);
   assert_eq(check_codes(generic), []);
+  // What reads an outer region leaves an inner one, and the outer region still answers it.
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_cell[a](40) { x -> { let k = with_cell[b](2) { y -> { let n = cell_get(y); || cell_get(x) + n } }; k() } }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"fn f() -> Int = with_hold[a](40, |x: Int| ()) { h -> { let k = with_hold[b](2, |x: Int| ()) { g -> { let n = hold_get(g); || hold_get(h) + n } }; k() } }",
+    ),
+    [],
+  );
   // The name is the region's for its cells alone: another effect's label of that name is the
   // resource it always was, so a clause inside the region answers what a callee performs on it.
   let other = bytes_concat_all([

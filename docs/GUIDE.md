@@ -231,7 +231,7 @@ An interpolated string `f"a {x} b"` is the concatenation `"a " ++ display(x) ++ 
 `std.show`'s `display`: a `String` or a `Char` goes in as itself and any other value as `show`
 writes it (`std.show`). The two spellings are one definition with one hash. A hole is any expression,
 strings and braces included, and `{{` and `}}` are braces of the text; a lone `}` is `E0001`. A
-hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Cell`, a `Task` or a `Chan` in one
+hole's type must be `derivable(show, ·)`, so a `Secret`, a function, a `Task` or a `Chan` in one
 is `E0206`. A module that interpolates imports `std.show` itself, under a name no source can
 write, so `std.show` and the modules it imports cannot interpolate.
 
@@ -638,8 +638,8 @@ A `const fn` is a definition a build evaluates once and keeps the value of: a
 table made from a data file is made when the program is built, and a run reads
 it. It takes no parameter, binds no type, label or row, and writes no row; its
 body may raise and performs nothing else, a call that may not return included
-(§5.10); and it answers a value that is data, so no function, `Cell`, `Task`,
-`Chan` or `Secret` at any depth. Anything else is `E0156`. Its row is empty
+(§5.10); and it answers a value that is data, so no function, `Task`, `Chan`
+or `Secret` at any depth. Anything else is `E0156`. Its row is empty
 whatever its body could raise, as a tagged literal's is (§2.3): the build saw it
 raise nothing. `pub const fn` publishes it; `const` goes with neither
 `transparent` nor `reuse`.
@@ -786,7 +786,7 @@ Such a literal names every field (`E0201`) and no other (`E0101`). A record
 bound without its type is a plain record wherever it goes next.
 
 The declaration is closed, and judged where it is written: a field names only
-the declaration's own type, label and row parameters (§4.5), holds no `Cell`,
+the declaration's own type, label and row parameters (§4.5), holds no `Hold`,
 `Task` or `Chan` (`E0446`, §4.6), and does not reach the record itself except
 through a sum (`E0214`), since whatever reads a record's shape reads its fields
 whole. A `Map` key it leaves to a parameter is promised where a value is built,
@@ -818,8 +818,8 @@ the array of its records, built with `columns_new` or `columns_of_list`, and
 its element type is a record of at least one field (`E0224`). `Map<k, v>`
 is an immutable sorted map, written `#{k: v}` or built with `map_new`,
 `map_insert` or `map_of_entries`. It iterates in `compare` order. Its key type
-must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Cell`,
-`Task` and `Chan` are refused (`E0206`).
+must be ordered (`derivable(ord, k)`): `Float`, `Secret`, functions, `Task`
+and `Chan` are refused (`E0206`).
 
 `#[a, b]` is a set, `std.set`'s `Set<a>`, each element once in `compare`
 order, which `show` writes back as the literal (`ply doc std.set`). It is no
@@ -941,7 +941,11 @@ A bracketed name binds a resource label:
 among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
-row or type names one (§6.2). A printed signature shows
+row or type names one (§6.2). A binder that names a region (§7), in a `Hold`'s
+type or in a `cell` or `hold` atom, is filled by the argument that carries the
+region and is never written: the labels a call writes fill the others, so
+`fn log_first<[l], [r]>(h: Hold<Bytes, [r]>) -> Unit / {log.write[l], hold.read[r]}`
+is called `log_first[audit](h)`. A printed signature shows
 the binders, `<[l]>(Bytes) -> Unit / {net.send[l]}` and
 `<a, [l] | e>(a) -> Unit / {net.send[l] | e}`, naming label variables `l`, `m`,
 `n`, then `l1` — stepping past any of those a resource in the same signature
@@ -1079,21 +1083,26 @@ given the frame, it answers the secret a file holds inside it, never a plain
 value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
 `ply build --sign` reads it, without the key ever being a plain value.
 
-**`Cell<a>`**, **`Hold<a>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) are
-branded by their region and cannot outlive it; the brand prints as
-`Cell[users]<Int>`. A `Hold` is not data: it is not compared or ordered
+**`Hold<a, [r]>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) belong to a
+region and cannot outlive it. A hold's type names its region, and it is written
+only where a hold is passed: as the type of a parameter of a definition, a
+lambda or a function type. As a result, a `let` annotation or a type argument
+it is `E0446`. A cell (§7) is a name and no value, so `Cell` is no type a
+program writes (`E0446`). A `Hold` is not data: it is not compared or ordered
 (`E0201`), nor hashed, derived over or made a `Map` key (`E0206`), and `reflect`
 answers the cell it is (`VCell`), never what it holds. A
 declaration is outside every region, so a variant's field, a `new` record's
-field or an operation's parameter or result that mentions any of them, at any
-depth, is `E0446`. Take it as a type parameter instead,
-`type Held<t> = Held(t)`: the type argument carries the brand where the escape
+field or an operation's parameter or result that mentions a `Hold`, a `Task` or
+a `Chan`, at any depth, is `E0446`. Take it as a type parameter instead,
+`type Held<t> = Held(t)`: the type argument carries the region where the escape
 checks see it. A sum hides the rows its fields write, so a field whose function
 names `cell` or `hold`, or joins a task or works a channel, in its row is `E0446` as well:
 take the row as a row parameter, `type Held<| e> = Held(() -> Int / e)`, and a
 closure that reaches a region is seen leaving it in the row the type is given.
-A `new` record's fields are read wherever it goes, so a row one of them writes
-is seen leaving a region as a plain record's is.
+A `new` record's fields are read wherever it goes, so one may write such a row;
+a row a declaration writes names no region (§7), though, so a closure over a
+cell or a hold is held through a row parameter there too, and the row the type
+is given is seen leaving the region as a plain record's is.
 
 ### 4.7 Function types, and what is written
 
@@ -1555,7 +1564,7 @@ their rows: given `fn both<| e>(f: () -> Unit / e, g: () -> Unit / e) -> Unit / 
 `both(|| a.x(), || b.y())` performs exactly `{a.x, b.y}`, and
 `[|| a.x(), || b.y()]` is a `List<() -> Unit / {a.x, b.y}>`.
 
-Inside a function's parameter, a `Cell`, a `Task`, a `Chan` or a sum type the
+Inside a function's parameter, a cell, a `Task`, a `Chan` or a sum type the
 program declares, rows must match exactly, because a function held there can be
 handed what its own type does not admit: a parameter typed
 `() -> Unit / {net.send[conn]}` is not one typed `() -> Unit / {net.write[conn]}`,
@@ -1883,10 +1892,29 @@ fn counted(n: Int) -> Int =
 ```
 
 `with_cell[r](init) { c -> body }` allocates a cell for the duration of `body`,
-in an allocation scope named `r` that closes at the body's `}`. `cell_get`,
-`cell_set` and `cell_update` are builtins whose atoms never leave the region.
-Nest `with_cell`s for several cells; reusing the name allocates into the region
+in an allocation scope named `r` that closes at the body's `}`. Nest
+`with_cell`s for several cells; reusing the name allocates into the region
 already open.
+
+`c` is the cell's name and no value. It stands as the first argument of
+`cell_get`, `cell_set` and `cell_update` and nowhere else: a cell is not bound
+to another name, passed, answered or put in a value, and `Cell` is no type a
+program writes (`E0446`). What reaches a cell from elsewhere is a closure that
+names it. `|| cell_get(c)` is a `() -> Int / {cell.read[r]}`; `cell_set` puts
+`cell.write[r]` in a row and `cell_update` both. The region answers both atoms
+for its own cells, and a closure whose row carries one may not leave it
+(`E0201`). A cell builtin given anything but a cell's name is `E0304`.
+
+Inside the region, `r` in a `cell` atom is the region. Anywhere else it is the
+resource of that name (§6.2), and so it is under every other effect inside the
+region too. A row written outside the region therefore does not name it: a
+parameter typed `() -> Int / {cell.read[r]}` does not take a closure over the
+cell (`E0302`), and a `with_cell[r]` does not answer the `cell.read[r]` of a
+function it calls. A function is handed such a closure through a row parameter,
+`fn twice<| e>(f: () -> Int / e) -> Int / e`. A definition's own row says
+`cell.read[r]` only where a clause that binds `resume` (§6.6) ran the rest of a
+region's body past the region; no region answers that atom, so it is in the
+row of every caller.
 
 The scheduler that runs a spawned task must be younger than the region whose
 cell the task can reach: open it inside the region,
@@ -1917,7 +1945,7 @@ fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.c
 
 `with_hold[r](acquire, release) { h -> body }` is the bracket of a resource:
 `body` runs with `h` bound to a **hold** on what `acquire` answered, a
-`Hold[r]<a>`, and at the region's `}` `release` is called on what was acquired.
+`Hold<a, [r]>`, and at the region's `}` `release` is called on what was acquired.
 `release` is any function of it, `(a) -> Unit / e`, read when the hold is let
 go, so one form serves every resource a library can open and close: a library
 exports the pair (`std.io`'s `reading` and `shut`), and no resource has a form
@@ -1932,15 +1960,21 @@ is released; a `release` that raises replaces what was unwinding; holds nested
 in one another are let go innermost first; a runtime failure ends the run and
 releases nothing.
 
-`hold_get(h)` reads what a hold holds, and puts `hold.read` in the row of
-whatever calls it: a function handed a hold says `/ {hold.read}`, a closure that
-reads one carries it in its type, and a `with_hold` answers it for its body, as
-`with_cell` answers `cell.read[r]`. `hold` is the language's effect, as `cell`
-is (`E0105`, `E0103`). So a hold passes to functions and into the closures of
-`map`, `fold` and `iterate`, and the checker still sees every way out of the
-region: the hold itself by its type, and a closure that could read one by its
-row. A row does not say which hold it reads, so a closure that reads any hold
-may not leave any `with_hold` (`E0446`). A hold is let go at the `}` of its own
+`hold_get(h)` reads what a hold holds, and puts `hold.read[r]` in the row of
+whatever calls it, `r` the region of the hold it is handed. A function that
+takes a hold binds the region as a label (§4.5),
+`fn first<[r]>(h: Hold<Bytes, [r]>) -> Int / {hold.read[r]}`, and a call fills
+it from the hold it passes and never writes it; a closure that reads a hold
+carries the atom in its type; and a `with_hold[r]` answers `hold.read[r]` for
+its own hold and no other, as `with_cell` answers its cells' atoms. `hold` is
+the language's effect, as `cell` is (`E0105`, `E0103`). A hold is passed and
+never kept:
+`Hold` is written only as the type of a parameter, of a definition, a lambda or
+a function type, and anywhere else is `E0446` (§4.6). So a hold passes to
+functions and into the closures of `map`, `fold` and `iterate`, and the checker
+still sees every way out of the region: the hold itself by its type, and a
+closure that reads it by its row, each naming the region, so what reads one
+hold may leave the region of another. A hold is let go at the `}` of its own
 region, so that region is the hold's alone: a `with_hold[r]` inside a region
 named `r`, or a `with_cell[r]` inside a `with_hold[r]`, is `E0330`.
 
@@ -1948,8 +1982,8 @@ What `hold_get` answers is a value like any other, and a copy of it may leave
 the region the hold may not. So a library keeps what is held useless without
 its hold: its functions take the `Hold`, and what they find released they
 refuse, as a `std.io` source pulled after its close raises `io.closed`. A lazy
-`Seq` (`std.seq`) whose steps read a hold carries `hold.read` in its row, so it
-is built and consumed inside the region and is `E0446` leaving it.
+`Seq` (`std.seq`) whose steps read a hold carries `hold.read[r]` in its row, so
+it is built and consumed inside the region and is `E0446` leaving it.
 
 A continuation captured inside a `with_hold` body and resumed after the hold was
 let go (a clause that resumes twice, §6.6) finds the hold gone: its first
@@ -1960,19 +1994,21 @@ at-most-once operation on it refuses the second resumption first (`E0426`).
 At run time a hold is a cell of its region, so `E0449` and a failure that names
 its type call it a `Cell`.
 
-* `E0201`: the cell escapes its `with_cell[r]` region.
+* `E0201`: a closure that reads or writes a cell escapes its `with_cell[r]`
+  region.
 * `E0330`: a `with_hold` names a region that is open, or a `with_cell` a
   `with_hold`'s.
 * `E0331`: a hold is read or let go after its region released what it held (at
   run time).
-* `E0446`: a hold, or a closure whose row reads one, escapes its `with_hold[r]`
-  region, at the expression that would carry it out; a value branded by a
-  region outlives it (stored in an older binding, handed to an operation, or
-  reached by a task whose scheduler is older than the region, through the
-  closure it runs or a handler around its spawn), a task is stored in a cell
-  older than its `simulate` region, a declared type's field or an operation's
-  signature mentions a `Cell`, a `Hold`, a `Task` or a `Chan`, or a variant's
-  field holds a function whose written row reaches one (§4.6).
+* `E0446`: a cell's name is used as a value, or `Cell` is written as a type;
+  `Hold` is written where a hold would be kept; a hold, or a closure whose row
+  reads it, escapes its `with_hold[r]` region, at the expression that would
+  carry it out; a value of a region outlives it (stored in an older binding,
+  handed to an operation, or reached by a task whose scheduler is older than
+  the region, through the closure it runs or a handler around its spawn), a
+  task is stored in a cell older than its `simulate` region, a declared type's
+  field or an operation's signature mentions a `Hold`, a `Task` or a `Chan`, or
+  a variant's field holds a function whose written row reaches one (§4.6).
 * `E0449`: a region handle (a cell, a task, a channel, or the continuation a clause's
   `resume` binds) reaches a host operation, a host answer, or an entry point's
   argument or answer (at run time). A continuation's type is an ordinary
@@ -2039,7 +2075,7 @@ fits a table of one case. A case is told from
 another by its value as it was built, which is finer than `==`: `1.5m` and
 `1.50m` are two cases, as are two values of a type whose `key` (§4.4) answers
 the same, so no case's pass stands for a case its body can tell from it. A case's type is `derivable(hash, ·)` read through
-no `key` (`E0206`): it holds no `Float`, function, `Cell`, `Task`, `Chan` or
+no `key` (`E0206`): it holds no `Float`, function, `Task`, `Chan` or
 `Secret`, and neither does a keyed type in it. The cases
 are listed before any test runs, so
 the table and the label may raise, by any `raise` operation (§6.8), and perform
@@ -2681,8 +2717,8 @@ level makes a codec; `tree_bin()` hands each to its definition at
 `json`'s bound is 128 levels, as deep as `parse` reads, and `bin`'s is 10,000, as
 deep as calls nest (§5.7).
 
-`E0206` names the field that blocks a derivation: function types, `Cell`, `Task`
-and `Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
+`E0206` names the field that blocks a derivation: function types, `Task` and
+`Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
 `bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
 and `bin` need their module imported (`import std.json`, `import std.bin`), or
 the `derive` is `E0206`; `show` imports `std.show` itself. A type that binds a
@@ -3478,7 +3514,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0443` | artifact does not verify |
 | `E0444` | artifact built by another compiler or for another runtime |
 | `E0445` | `trace.exit` of a span not open on this task |
-| `E0446` | value outlives its region |
+| `E0446` | cell or hold kept as a value, or a value that outlives its region |
 | `E0447` | a statement checked against the schema that answers `*` |
 | `E0448` | definition the C backend cannot compile |
 | `E0449` | region handle or continuation reaching a runtime boundary |
