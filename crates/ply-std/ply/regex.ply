@@ -2313,7 +2313,7 @@ fn threads_add(
 /// `starts` holds the state a search starts in for each of the four things that can stand
 /// before it, `-1` for one not yet made. `room` is how many states fit, and `base` where the
 /// automaton's rows start in the table every automaton of a call shares.
-type Shelf = {
+type States = {
   ids: Map<List<Int>, Int>,
   keys: List<List<Int>>,
   starts: List<Int>,
@@ -2325,15 +2325,15 @@ type Shelf = {
 /// leftmost match ends, the one that reads it back to its start, and the one that stretches it
 /// to the longest. `stamp` is a number no walk of a program has yet marked its places with, and
 /// `spent` whether a search ran out of room, after which the call follows every state at once.
-type Book = { stamp: Int, ahead: Shelf, back: Shelf, stretch: Shelf, spent: Bool }
+type Explored = { stamp: Int, ahead: States, back: States, stretch: States, spent: Bool }
 
-fn shelf(room: Int, base: Int) -> Shelf =
+fn states(room: Int, base: Int) -> States =
   { ids: map_new(), keys: [[], []], starts: [-1, -1, -1, -1], room: room + 2, base: base }
 
-/// A book no search has opened: its shelves are made with the table, by the first search that
-/// goes one state at a time.
-fn closed_book() -> Book =
-  { stamp: 1, ahead: shelf(0, 0), back: shelf(0, 0), stretch: shelf(0, 0), spent: false }
+/// What no search has explored: each automaton's states are made with the table, by the first
+/// search that goes one state at a time.
+fn unexplored() -> Explored =
+  { stamp: 1, ahead: states(0, 0), back: states(0, 0), stretch: states(0, 0), spent: false }
 
 /// What following places without taking a byte reached: the places that take one, ask a look or
 /// match, in order; every look asked; and whether a match ended the walk.
@@ -2514,31 +2514,31 @@ fn advance(
     },
   }
 
-/// A shelf, and a state on it: twice its number, and one more where a match ended on the way
-/// in. `0` is a state not yet made, `2` the one nothing leaves, and `-1` one the shelf has no
+/// The states, and one of them: twice its number, and one more where a match ended on the way
+/// in. `0` is a state not yet made, `2` the one nothing leaves, and `-1` one there is no
 /// room for.
-type Shelved = { shelf: Shelf, to: Int }
+type Numbered = { states: States, to: Int }
 
-/// The state for these places, made if the shelf has not met them and has room.
-fn state_of(a: Automaton, s: Shelf, flags: Int, needs: Int, places: List<Int>) -> Shelved =
-  if len(places) == 0 { { shelf: s, to: 2 } } else {
+/// The state for these places, made if no search has met them and there is room.
+fn state_of(a: Automaton, s: States, flags: Int, needs: Int, places: List<Int>) -> Numbered =
+  if len(places) == 0 { { states: s, to: 2 } } else {
     let key = fold(
       if a.first_wins { places } else { sort(places) },
       [if needs == 0 { 0 } else { flags }, needs],
       |k: List<Int>, pc: Int| push(k, pc),
     );
     match map_get(s.ids, key) {
-      Some(id) -> { shelf: s, to: id * 2 },
-      None -> if len(s.keys) >= s.room { { shelf: s, to: -1 } } else {
+      Some(id) -> { states: s, to: id * 2 },
+      None -> if len(s.keys) >= s.room { { states: s, to: -1 } } else {
         let id = len(s.keys);
-        { shelf: { ..s, ids: map_insert(s.ids, key, id), keys: push(s.keys, key) }, to: id * 2 }
+        { states: { ..s, ids: map_insert(s.ids, key, id), keys: push(s.keys, key) }, to: id * 2 }
       },
     }
   }
 
 /// What making a state leaves: the table every state's row is in, the two arrays a walk of a
-/// program marks and stacks its places in, the shelf, and the state.
-type Made = { table: Array<Int>, seen: Array<Int>, stack: Array<Int>, shelf: Shelf, to: Int }
+/// program marks and stacks its places in, the states, and the state.
+type Made = { table: Array<Int>, seen: Array<Int>, stack: Array<Int>, states: States, to: Int }
 
 /// Where state `h` goes on the byte `b`, or on the subject's end for 256, entered in the table.
 /// The walks it makes mark places with `stamp` and the number after it.
@@ -2547,14 +2547,14 @@ fn transition(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  s: Shelf,
+  s: States,
   stamp: Int,
   h: Int,
   b: Int,
 ) -> Made / {abort.raise} = {
   let key = match list_at(s.keys, h >> 1) {
     Some(k) -> k,
-    None -> panic("a state is one the shelf holds"),
+    None -> panic("a state is one a search made"),
   };
   let flags = at_or(key, 0, 0);
   let needs = at_or(key, 1, 0);
@@ -2579,24 +2579,24 @@ fn transition(
     false,
   );
   let bit = if moved.matched { 1 } else { 0 };
-  let made = if b == 256 { { shelf: s, to: 2 } }
+  let made = if b == 256 { { states: s, to: 2 } }
   else { state_of(a, s, after | (if word && a.words { 64 } else { 0 }), moved.needs, moved.out) };
   if made.to < 0 {
-    { table: table, seen: moved.seen, stack: moved.stack, shelf: made.shelf, to: -1 }
+    { table: table, seen: moved.seen, stack: moved.stack, states: made.states, to: -1 }
   } else {
     let class = if b == 256 { a.stride - 1 } else { bytes_at(a.classes, b) };
     {
       table: array_set(table, s.base + (h >> 1) * a.stride + class, made.to | bit),
       seen: moved.seen,
       stack: moved.stack,
-      shelf: made.shelf,
+      states: made.states,
       to: made.to | bit,
     }
   }
 }
 
 /// What finding the state a search starts in leaves.
-type Started = { seen: Array<Int>, stack: Array<Int>, shelf: Shelf, to: Int }
+type Started = { seen: Array<Int>, stack: Array<Int>, states: States, to: Int }
 
 /// The state a search entering at `at` starts in, which what stands before `at` decides: the
 /// subject's end, a line feed, a word's byte or any other. A search read backwards has what
@@ -2605,7 +2605,7 @@ fn start_state(
   a: Automaton,
   seen: Array<Int>,
   stack: Array<Int>,
-  s: Shelf,
+  s: States,
   stamp: Int,
   hay: Bytes,
   at: Int,
@@ -2619,7 +2619,7 @@ fn start_state(
   else if a.words && is_word(before) { 2 }
   else { 3 };
   let known = at_or(s.starts, kind, -1);
-  if known >= 0 { { seen: seen, stack: stack, shelf: s, to: known } } else {
+  if known >= 0 { { seen: seen, stack: stack, states: s, to: known } } else {
     let have = match kind { 0 -> 5, 1 -> 1, _ -> 0 };
     let walked = close(
       a.insts,
@@ -2637,8 +2637,8 @@ fn start_state(
     {
       seen: walked.seen,
       stack: walked.stack,
-      shelf: if made.to < 0 { made.shelf }
-      else { { ..made.shelf, starts: list_set(made.shelf.starts, kind, made.to) } },
+      states: if made.to < 0 { made.states }
+      else { { ..made.states, starts: list_set(made.states.starts, kind, made.to) } },
       to: made.to,
     }
   }
@@ -2735,12 +2735,12 @@ fn scan_back(
   }
 
 /// What a search by states leaves, and where it ended: the position the match it found ends
-/// at, `-1` for no match, and `-2` where the shelf ran out of room before the search could tell.
+/// at, `-1` for no match, and `-2` where the states ran out of room before the search could tell.
 type Sought = {
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  shelf: Shelf,
+  states: States,
   stamp: Int,
   at: Int,
 }
@@ -2752,7 +2752,7 @@ fn search_ahead(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  s: Shelf,
+  s: States,
   stamp: Int,
   hay: Bytes,
   i: Int,
@@ -2781,8 +2781,8 @@ fn search_ahead(
     n - i + 1,
   );
   match read.hit {
-    2 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.last },
-    3 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.at },
+    2 -> { table: table, seen: seen, stack: stack, states: s, stamp: stamp, at: read.last },
+    3 -> { table: table, seen: seen, stack: stack, states: s, stamp: stamp, at: read.at },
     1 -> {
       let known = array_get(table, s.base + (read.state >> 1) * a.stride + a.stride - 1);
       if known != 0 {
@@ -2790,7 +2790,7 @@ fn search_ahead(
           table: table,
           seen: seen,
           stack: stack,
-          shelf: s,
+          states: s,
           stamp: stamp,
           at: if known & 1 == 1 { n } else { read.last },
         }
@@ -2800,7 +2800,7 @@ fn search_ahead(
           table: ended.table,
           seen: ended.seen,
           stack: ended.stack,
-          shelf: ended.shelf,
+          states: ended.states,
           stamp: stamp + 2,
           at: if ended.to & 1 == 1 { n } else { read.last },
         }
@@ -2813,7 +2813,7 @@ fn search_ahead(
           table: made.table,
           seen: made.seen,
           stack: made.stack,
-          shelf: made.shelf,
+          states: made.states,
           stamp: stamp + 2,
           at: -2,
         }
@@ -2823,7 +2823,7 @@ fn search_ahead(
           made.table,
           made.seen,
           made.stack,
-          made.shelf,
+          made.states,
           stamp + 2,
           hay,
           read.at,
@@ -2845,7 +2845,7 @@ fn search_back(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  s: Shelf,
+  s: States,
   stamp: Int,
   hay: Bytes,
   i: Int,
@@ -2856,8 +2856,8 @@ fn search_back(
 ) -> Sought / {abort.raise} = {
   let read = scan_back(table, a.classes, hay, a.stride, s.base, i, stop, h, last);
   match read.hit {
-    2 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.last },
-    3 -> { table: table, seen: seen, stack: stack, shelf: s, stamp: stamp, at: read.at },
+    2 -> { table: table, seen: seen, stack: stack, states: s, stamp: stamp, at: read.last },
+    3 -> { table: table, seen: seen, stack: stack, states: s, stamp: stamp, at: read.at },
     1 -> {
       let b = if stop > 0 { bytes_at(hay, stop - 1) } else { 256 };
       let class = if b == 256 { a.stride - 1 } else { bytes_at(a.classes, b) };
@@ -2867,7 +2867,7 @@ fn search_back(
           table: table,
           seen: seen,
           stack: stack,
-          shelf: s,
+          states: s,
           stamp: stamp,
           at: if known & 1 == 1 { stop } else { read.last },
         }
@@ -2877,7 +2877,7 @@ fn search_back(
           table: ended.table,
           seen: ended.seen,
           stack: ended.stack,
-          shelf: ended.shelf,
+          states: ended.states,
           stamp: stamp + 2,
           at: if ended.to < 0 { -2 } else if ended.to & 1 == 1 { stop } else { read.last },
         }
@@ -2899,7 +2899,7 @@ fn search_back(
           table: made.table,
           seen: made.seen,
           stack: made.stack,
-          shelf: made.shelf,
+          states: made.states,
           stamp: stamp + 2,
           at: -2,
         }
@@ -2909,7 +2909,7 @@ fn search_back(
           made.table,
           made.seen,
           made.stack,
-          made.shelf,
+          made.states,
           stamp + 2,
           hay,
           read.at,
@@ -2925,9 +2925,15 @@ fn search_back(
 
 // --- A search --------------------------------------------------------------------------
 
-/// What a search leaves and what it found: the table, the two arrays a walk uses, the book,
+/// What a search leaves and what it found: the table, the two arrays a walk uses, what it explored,
 /// and the match's slots, or none at all where there is no match.
-type Hit = { table: Array<Int>, seen: Array<Int>, stack: Array<Int>, book: Book, slots: Array<Int> }
+type Hit = {
+  table: Array<Int>,
+  seen: Array<Int>,
+  stack: Array<Int>,
+  explored: Explored,
+  slots: Array<Int>,
+}
 
 /// The leftmost match at or after `from`, with `want` slots kept: 2 for where it starts and
 /// ends, and two more for each group.
@@ -2938,7 +2944,7 @@ fn search(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} =
   if re.opening.exact {
@@ -2946,15 +2952,17 @@ fn search(
     else { bytes_index_of_from(hay, re.opening.lead, from) };
     match found {
       Some(at) ->
-        pinned(re, hay, at, at + bytes_len(re.opening.lead), table, seen, stack, book, want),
-      None -> { table: table, seen: seen, stack: stack, book: book, slots: array_of_list([]) },
+        pinned(re, hay, at, at + bytes_len(re.opening.lead), table, seen, stack, explored, want),
+      None ->
+        { table: table, seen: seen, stack: stack, explored: explored, slots: array_of_list([]) },
     }
   } else if unheld(re, hay, from) {
-    { table: table, seen: seen, stack: stack, book: book, slots: array_of_list([]) }
-  } else if book.spent || re.wide || re.options.state_limit <= 0
+    { table: table, seen: seen, stack: stack, explored: explored, slots: array_of_list([]) }
+  } else if explored.spent || re.wide || re.options.state_limit <= 0
       || bytes_len(hay) - from <= re.options.short {
-    by_threads(re, hay, from, table, seen, stack, book, want)
-  } else if array_len(table) > 0 { by_states(re, hay, from, table, seen, stack, book, want) } else {
+    by_threads(re, hay, from, table, seen, stack, explored, want)
+  } else if array_len(table) > 0 { by_states(re, hay, from, table, seen, stack, explored, want) }
+  else {
     let rows = room_for(re, hay) + 2;
     let most = max(array_len(re.finder.insts), array_len(re.tracer.insts));
     by_states(
@@ -2966,9 +2974,9 @@ fn search(
       array_new(2 * most + 2, 0),
       {
         stamp: 1,
-        ahead: shelf(rows - 2, 0),
-        back: shelf(rows - 2, rows * re.finder.stride),
-        stretch: shelf(rows - 2, 2 * rows * re.finder.stride),
+        ahead: states(rows - 2, 0),
+        back: states(rows - 2, rows * re.finder.stride),
+        stretch: states(rows - 2, 2 * rows * re.finder.stride),
         spent: false,
       },
       want,
@@ -2992,14 +3000,14 @@ fn by_threads(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} =
   {
     table: table,
     seen: seen,
     stack: stack,
-    book: book,
+    explored: explored,
     slots: run(
       {
         insts: re.insts,
@@ -3024,14 +3032,14 @@ fn pinned(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} =
   {
     table: table,
     seen: seen,
     stack: stack,
-    book: book,
+    explored: explored,
     slots: if want <= 2 || len(re.names) == 1 { array_of_list([start, end]) } else {
       run(
         {
@@ -3057,10 +3065,10 @@ fn by_states(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} = {
-  let first = start_state(re.finder, seen, stack, book.ahead, book.stamp, hay, from, false);
+  let first = start_state(re.finder, seen, stack, explored.ahead, explored.stamp, hay, from, false);
   if first.to < 0 {
     by_threads(
       re,
@@ -3069,7 +3077,7 @@ fn by_states(
       table,
       first.seen,
       first.stack,
-      { ..book, stamp: book.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, spent: true },
       want,
     )
   } else {
@@ -3080,8 +3088,8 @@ fn by_states(
       table,
       first.seen,
       first.stack,
-      first.shelf,
-      book.stamp + 1,
+      first.states,
+      explored.stamp + 1,
       hay,
       from,
       first.to,
@@ -3091,11 +3099,17 @@ fn by_states(
       re.opening,
       bytes_len(hay) - from + 3,
     );
-    let kept = { ..book, stamp: end.stamp, ahead: end.shelf };
+    let kept = { ..explored, stamp: end.stamp, ahead: end.states };
     if end.at == -2 {
       by_threads(re, hay, from, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
     } else if end.at < 0 {
-      { table: end.table, seen: end.seen, stack: end.stack, book: kept, slots: array_of_list([]) }
+      {
+        table: end.table,
+        seen: end.seen,
+        stack: end.stack,
+        explored: kept,
+        slots: array_of_list([]),
+      }
     } else { traced(re, hay, from, end.at, end.table, end.seen, end.stack, kept, want) }
   }
 }
@@ -3109,10 +3123,10 @@ fn traced(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} = {
-  let first = start_state(re.tracer, seen, stack, book.back, book.stamp, hay, end, true);
+  let first = start_state(re.tracer, seen, stack, explored.back, explored.stamp, hay, end, true);
   if first.to < 0 {
     by_threads(
       re,
@@ -3121,7 +3135,7 @@ fn traced(
       table,
       first.seen,
       first.stack,
-      { ..book, stamp: book.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, spent: true },
       want,
     )
   } else {
@@ -3130,8 +3144,8 @@ fn traced(
       table,
       first.seen,
       first.stack,
-      first.shelf,
-      book.stamp + 1,
+      first.states,
+      explored.stamp + 1,
       hay,
       end,
       from,
@@ -3139,7 +3153,7 @@ fn traced(
       -1,
       end - from + 3,
     );
-    let kept = { ..book, stamp: start.stamp, back: start.shelf };
+    let kept = { ..explored, stamp: start.stamp, back: start.states };
     if start.at == -2 {
       by_threads(re, hay, from, start.table, start.seen, start.stack, { ..kept, spent: true }, want)
     } else if start.at < 0 { panic("a match read backwards from its end has a start") }
@@ -3157,10 +3171,19 @@ fn stretched(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   want: Int,
 ) -> Hit / {abort.raise} = {
-  let first = start_state(re.stretcher, seen, stack, book.stretch, book.stamp, hay, start, false);
+  let first = start_state(
+    re.stretcher,
+    seen,
+    stack,
+    explored.stretch,
+    explored.stamp,
+    hay,
+    start,
+    false,
+  );
   if first.to < 0 {
     by_threads(
       re,
@@ -3169,7 +3192,7 @@ fn stretched(
       table,
       first.seen,
       first.stack,
-      { ..book, stamp: book.stamp + 1, spent: true },
+      { ..explored, stamp: explored.stamp + 1, spent: true },
       want,
     )
   } else {
@@ -3178,8 +3201,8 @@ fn stretched(
       table,
       first.seen,
       first.stack,
-      first.shelf,
-      book.stamp + 1,
+      first.states,
+      explored.stamp + 1,
       hay,
       start,
       first.to,
@@ -3189,7 +3212,7 @@ fn stretched(
       re.opening,
       bytes_len(hay) - start + 3,
     );
-    let kept = { ..book, stamp: end.stamp, stretch: end.shelf };
+    let kept = { ..explored, stamp: end.stamp, stretch: end.states };
     if end.at == -2 {
       by_threads(re, hay, start, end.table, end.seen, end.stack, { ..kept, spent: true }, want)
     } else if end.at < 0 { panic("a match stretched from its start has an end") }
@@ -3216,7 +3239,7 @@ fn read_through(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
       a,
       array_new(array_len(a.insts), 0),
       array_new(2 * array_len(a.insts) + 2, 0),
-      shelf(room, 0),
+      states(room, 0),
       1,
       hay,
       0,
@@ -3230,7 +3253,7 @@ fn read_through(re: Compiled, hay: Bytes) -> Bool / {abort.raise} =
         array_new((room + 2) * a.stride, 0),
         first.seen,
         first.stack,
-        first.shelf,
+        first.states,
         2,
         hay,
         0,
@@ -3286,7 +3309,7 @@ fn matches(re: Compiled, hay: Bytes, want: Int, most: Int) -> List<Array<Int>> /
     array_of_list([]),
     array_of_list([]),
     array_of_list([]),
-    closed_book(),
+    unexplored(),
     [],
     bytes_len(hay) + 2,
   )
@@ -3304,12 +3327,12 @@ fn matches_from(
   table: Array<Int>,
   seen: Array<Int>,
   stack: Array<Int>,
-  book: Book,
+  explored: Explored,
   found: List<Array<Int>>,
   left: Int,
 ) -> List<Array<Int>> / {abort.raise} =
   if from > bytes_len(hay) || len(found) == most || left <= 0 { found } else {
-    let hit = search(re, hay, from, table, seen, stack, book, want);
+    let hit = search(re, hay, from, table, seen, stack, explored, want);
     if array_len(hit.slots) == 0 { found } else {
       let start = array_get(hit.slots, 0);
       let end = array_get(hit.slots, 1);
@@ -3324,7 +3347,7 @@ fn matches_from(
           hit.table,
           hit.seen,
           hit.stack,
-          hit.book,
+          hit.explored,
           found,
           left - 1,
         )
@@ -3339,7 +3362,7 @@ fn matches_from(
           hit.table,
           hit.seen,
           hit.stack,
-          hit.book,
+          hit.explored,
           push(found, hit.slots),
           left - 1,
         )

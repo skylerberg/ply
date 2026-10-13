@@ -2,6 +2,7 @@
 //! `PLY_C_*`, `PLY_CC*` and `PLY_HEAP_*` knobs never change a program's meaning.
 
 mod build;
+pub mod descriptor;
 pub mod dump;
 mod encoding;
 pub mod exports;
