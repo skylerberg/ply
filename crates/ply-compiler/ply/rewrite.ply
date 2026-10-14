@@ -3,7 +3,7 @@
 //! so run after the check; and the tagged literal, written out with those two.
 
 import std.bin
-import std.list (at, concat, contains, drop, take)
+import std.list
 import parsing (Span, Ident, ParseDiag, Label, span_to, bare, span_key, error_at, error_at_and,
                 parse_diag, parse_label, dump_diags, is_bare, positional, starts_upper,
                 span_between)
@@ -27,14 +27,14 @@ fn max_alias_depth() -> Int = 16
 
 /// This module's own `type` items; the first declaration of a name wins.
 fn collect_types(module: Module) -> List<TypeDef> =
-  fold(module.items, [], |acc: List<TypeDef>, item: Item|
+  module.items.fold([], |acc: List<TypeDef>, item: Item|
     match item {
-      IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> push(acc, d) },
+      IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
       _ -> acc,
     })
 
 pub fn find_type(ts: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
-  fold(ts, None, |acc: Option<TypeDef>, type_def: TypeDef|
+  ts.fold(None, |acc: Option<TypeDef>, type_def: TypeDef|
     match acc {
       Some(_) -> acc,
       None -> if type_def.name.name == name { Some(type_def) } else { None },
@@ -49,11 +49,11 @@ pub fn is_pure(e: Expr) -> Bool =
     EWithCell(_) -> false,
     EWithHold(_) -> false,
     ESimulate(_) -> false,
-    EParallel(v) -> fold(v.branches, true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    EParallel(v) -> v.branches.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
     ETry(_) -> false,
     ETryBlock(_) -> false,
     ELit(_) -> true,
-    ETagged(t) -> len(t.holes) == 0,
+    ETagged(t) -> t.holes.len() == 0,
     EVar(_) -> true,
     EBad(_) -> true,
     EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
@@ -62,10 +62,10 @@ pub fn is_pure(e: Expr) -> Bool =
     EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
     EMatch(m) ->
       is_pure(m.scrutinee)
-        && fold(m.arms, true, |acc: Bool, arm: MatchArm|
+        && m.arms.fold(true, |acc: Bool, arm: MatchArm|
           acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
     EBlock(b) ->
-      fold(b.stmts, true, |acc: Bool, stmt: Stmt|
+      b.stmts.fold(true, |acc: Bool, stmt: Stmt|
           acc
             && (match stmt {
               SLet(l) -> is_pure(l.value),
@@ -73,11 +73,11 @@ pub fn is_pure(e: Expr) -> Bool =
               SExpr(x) -> is_pure(x),
             }))
         && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
-    ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
     ERecordUpdate(r) ->
-      is_pure(r.base) && fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+      is_pure(r.base) && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
     EField(f) -> is_pure(f.base),
-    EList(l) -> fold(l.items, true, |acc: Bool, x: Expr| acc && is_pure(x)),
+    EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
   }
 
 // --- Record update -----------------------------------------------------------------------
@@ -85,24 +85,24 @@ pub fn is_pure(e: Expr) -> Bool =
 // base, keyed by the update's span, so this runs after the check and not with the other rewrites.
 
 fn too_deep() -> Bytes =
-  bytes_concat_all([b"more than ", ascii_of_int(max_alias_depth()), b" type aliases deep"])
+  Bytes::concat_all([b"more than ", ascii_of_int(max_alias_depth()), b" type aliases deep"])
 
 /// The literal an update stands for: the base's other fields, in the record's own order, then the
 /// written ones. A call is bound to a name first, so it runs once however many fields are copied.
 fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<Bytes>) -> Expr = {
   let base_span = expr_span(base);
   let bound: Option<Ident> = match base {
-    EApp(_) -> Some({ name: bytes_concat(b"?u", ascii_of_int(base_span.start)), span: base_span }),
+    EApp(_) -> Some({ name: b"?u".concat(ascii_of_int(base_span.start)), span: base_span }),
     _ -> None,
   };
   let source = match bound { Some(b) -> EVar({ span: base_span, name: bare(b) }), None -> base };
-  let copies = filter(names, |n: Bytes|
-    !fold(written, false, |seen: Bool, w: RecField| seen || w.name.name == n));
-  let copied = map(copies, |n: Bytes| {
+  let copies = names.filter(|n: Bytes|
+    !written.fold(false, |seen: Bool, w: RecField| seen || w.name.name == n));
+  let copied = copies.map(|n: Bytes| {
     let field = { name: n, span: base_span };
     { name: field, value: EField({ span: base_span, base: source, field: field }) }
   });
-  let literal = ERecord({ span: span, fields: concat(copied, written) });
+  let literal = ERecord({ span: span, fields: copied.concat(written) });
   match bound {
     Some(b) ->
       EBlock({
@@ -121,7 +121,7 @@ fn expand_update(span: Span, base: Expr, written: List<RecField>, names: List<By
 pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
   let go = |x: Expr| map_expr(x, f);
   let opt = |x: Option<Expr>| match x { None -> None, Some(y) -> Some(map_expr(y, f)) };
-  let fields = |fs: List<RecField>| map(fs, |fl: RecField| { name: fl.name, value: go(fl.value) });
+  let fields = |fs: List<RecField>| fs.map(|fl: RecField| { name: fl.name, value: go(fl.value) });
   f(match e {
     EBinary(b) -> EBinary({ span: b.span, op: b.op, lhs: go(b.lhs), rhs: go(b.rhs) }),
     EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: go(u.operand) }),
@@ -130,9 +130,9 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
       EApp({
         span: a.span,
         func: go(a.func),
-        named: map(a.named, |arg: NamedArg|
+        named: a.named.map(|arg: NamedArg|
           { name: arg.name, value: go(arg.value), span: arg.span }),
-        args: map(a.args, go),
+        args: a.args.map(go),
         labels: a.labels,
       }),
     EIf(i) ->
@@ -146,14 +146,14 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
       EMatch({
         span: m.span,
         scrutinee: go(m.scrutinee),
-        arms: map(m.arms, |arm: MatchArm|
+        arms: m.arms.map(|arm: MatchArm|
           { pat: arm.pat, guard: opt(arm.guard), body: go(arm.body), span: arm.span }),
       }),
     EBlock(b) ->
       EBlock({
         span: b.span,
         tail: opt(b.tail),
-        stmts: map(b.stmts, |stmt: Stmt|
+        stmts: b.stmts.map(|stmt: Stmt|
           match stmt {
             SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: go(l.value) }),
             SLetElse(l) ->
@@ -171,9 +171,9 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
     ERecordUpdate(r) -> ERecordUpdate({ span: r.span, base: go(r.base), fields: fields(r.fields) }),
     EField(fl) -> EField({ span: fl.span, base: go(fl.base), field: fl.field }),
     ETry(t) -> ETry({ span: t.span, operand: go(t.operand) }),
-    EList(l) -> EList({ span: l.span, items: map(l.items, go) }),
+    EList(l) -> EList({ span: l.span, items: l.items.map(go) }),
     EPerform(x) ->
-      EPerform({ span: x.span, eff: x.eff, op: x.op, resource: x.resource, args: map(x.args, go) }),
+      EPerform({ span: x.span, eff: x.eff, op: x.op, resource: x.resource, args: x.args.map(go) }),
     EHandle(h) ->
       EHandle({
         span: h.span,
@@ -182,7 +182,7 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
           None -> None,
           Some(rc) -> Some({ binder: rc.binder, body: go(rc.body), span: rc.span }),
         },
-        clauses: map(h.clauses, |c: HandleClause|
+        clauses: h.clauses.map(|c: HandleClause|
           {
             eff: c.eff,
             op: c.op,
@@ -206,9 +206,9 @@ pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
     EWithHold(c) ->
       EWithHold({ ..c, acquire: go(c.acquire), release: go(c.release), body: go(c.body) }),
     ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
-    EParallel(x) -> EParallel({ span: x.span, branches: map(x.branches, go) }),
+    EParallel(x) -> EParallel({ span: x.span, branches: x.branches.map(go) }),
     ETryBlock(t) -> ETryBlock({ ..t, body: go(t.body) }),
-    ETagged(t) -> ETagged({ ..t, holes: map(t.holes, |h: Hole| { ..h, value: go(h.value) }) }),
+    ETagged(t) -> ETagged({ ..t, holes: t.holes.map(|h: Hole| { ..h, value: go(h.value) }) }),
     _ -> e,
   })
 }
@@ -220,9 +220,9 @@ pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
     IFn(d) ->
       IFn({
         ..d,
-        params: map(d.params, |param: Param|
+        params: d.params.map(|param: Param|
           { ..param, default: match param.default { None -> None, Some(x) -> Some(go(x)) } }),
-        spec: map(d.spec, |clause: SpecClause|
+        spec: d.spec.map(|clause: SpecClause|
           { kind: clause.kind, expr: go(clause.expr), span: clause.span }),
         body: go(d.body),
       }),
@@ -248,7 +248,7 @@ pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
 /// A span the table does not hold belongs to a program that did not check; the lowering declines it.
 fn expanded_update(sh: Map<Bytes, List<Bytes>>, expr: Expr) -> Expr =
   match expr {
-    ERecordUpdate(r) -> match map_get(sh, span_key(r.span)) {
+    ERecordUpdate(r) -> match sh.get(span_key(r.span)) {
       None -> expr,
       Some(names) -> expand_update(r.span, r.base, r.fields, names),
     },
@@ -260,7 +260,7 @@ pub fn expand_record_updates(module: Module, shapes: Map<Bytes, List<Bytes>>) ->
   if !has_update(module) { module } else {
     {
       ..module,
-      items: map(module.items, |item: Item|
+      items: module.items.map(|item: Item|
         map_item(item, |expr: Expr| expanded_update(shapes, expr))),
     }
   }
@@ -281,10 +281,10 @@ pub type MemberCallee = {
 /// The arguments the call of `m` on `on` passes, `args` and then `named` put where its
 /// parameters are; as written where the checker refused the call.
 fn member_passed(m: MemberCallee, on: Expr, args: List<Expr>, named: List<NamedArg>) -> List<Expr> = {
-  let written = concat([on], args);
-  if len(written) > len(m.names) { written } else {
+  let written = [on].concat(args);
+  if written.len() > m.names.len() { written } else {
     let s = slotted(m.names, m.defaults, written, named);
-    if len(s.missing) > 0 { written } else { slot_args(s.slots, written, named) }
+    if s.missing.len() > 0 { written } else { slot_args(s.slots, written, named) }
   }
 }
 
@@ -292,8 +292,7 @@ fn member_var(m: MemberCallee, span: Span) -> Expr =
   EVar({
     span: span,
     name: {
-      module: if bytes_len(m.qualifier) == 0 { None }
-      else { Some({ name: m.qualifier, span: span }) },
+      module: if m.qualifier.len() == 0 { None } else { Some({ name: m.qualifier, span: span }) },
       name: { name: m.name, span: span },
       span: span,
     },
@@ -306,15 +305,15 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
     EVar(v) -> match v.name.module {
       None -> expr,
       Some(of) -> if !starts_upper(of.name) { expr } else {
-        match map_get(sites, span_key(v.name.span)) {
-          Some(m) -> if bytes_len(m.name) == 0 { expr } else { member_var(m, v.span) },
+        match sites.get(span_key(v.name.span)) {
+          Some(m) -> if m.name.len() == 0 { expr } else { member_var(m, v.span) },
           None -> expr,
         }
       },
     },
     EApp(a) -> match a.func {
-      EField(f) -> match map_get(sites, span_key(a.span)) {
-        Some(m) -> if bytes_len(m.name) == 0 { expr } else {
+      EField(f) -> match sites.get(span_key(a.span)) {
+        Some(m) -> if m.name.len() == 0 { expr } else {
           EApp({
             span: a.span,
             func: member_var(m, f.field.span),
@@ -327,12 +326,12 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
       },
       _ -> expr,
     },
-    EPerform(p) -> match map_get(sites, span_key(p.span)) {
+    EPerform(p) -> match sites.get(span_key(p.span)) {
       Some(m) -> {
         let on = EVar({ span: p.eff.span, name: p.eff });
         let labels = match p.resource { Some(r) -> [r], None -> [] };
         // With no name it is the call of what the binding holds in its field.
-        if bytes_len(m.name) == 0 {
+        if m.name.len() == 0 {
           EApp({
             span: p.span,
             func: EField({ span: span_to(p.eff.span, p.op.span), base: on, field: p.op }),
@@ -357,18 +356,17 @@ fn member_called(sites: Map<Bytes, MemberCallee>, expr: Expr) -> Expr =
 
 /// `def` with each call on a value in `sites`, by span, written as the call it is.
 pub fn with_member_calls(def: FnDef, sites: Map<Bytes, MemberCallee>) -> FnDef =
-  if map_len(sites) == 0 { def } else {
+  if sites.len() == 0 { def } else {
     match map_item(IFn(def), |expr: Expr| member_called(sites, expr)) { IFn(d) -> d, _ -> def }
   }
 
 /// `module` with each call on a value in `sites`, by span, written as the call of the function
 /// of the value's type it is.
 pub fn expand_member_calls(module: Module, sites: Map<Bytes, MemberCallee>) -> Module =
-  if map_len(sites) == 0 { module } else {
+  if sites.len() == 0 { module } else {
     {
       ..module,
-      items: map(module.items, |item: Item|
-        map_item(item, |expr: Expr| member_called(sites, expr))),
+      items: module.items.map(|item: Item| map_item(item, |expr: Expr| member_called(sites, expr))),
     }
   }
 
@@ -382,7 +380,7 @@ fn settled(expr: Expr) -> Expr =
       let held = { name: b"?literal", span: t.span };
       EBlock({
         span: t.span,
-        tail: Some(if len(t.holes) == 0 { var_of(held) } else { tagged_fill(t, var_of(held)) }),
+        tail: Some(if t.holes.len() == 0 { var_of(held) } else { tagged_fill(t, var_of(held)) }),
         stmts: [
           SLet({
             span: t.span,
@@ -398,20 +396,20 @@ fn settled(expr: Expr) -> Expr =
 
 fn is_tagged(expr: Expr) -> Bool = match expr { ETagged(_) -> true, _ -> false }
 
-pub fn has_tagged(module: Module) -> Bool = len(picked_in(module, is_tagged)) > 0
+pub fn has_tagged(module: Module) -> Bool = picked_in(module, is_tagged).len() > 0
 
 /// Every tagged literal a module's definitions, tests and laws hold, in the order they are written.
 pub fn tagged_in(module: Module) -> List<Tagged> =
-  fold(picked_in(module, is_tagged), [], |acc: List<Tagged>, e: Expr|
-    match e { ETagged(t) -> push(acc, t), _ -> acc })
+  picked_in(module, is_tagged).fold([], |acc: List<Tagged>, e: Expr|
+    match e { ETagged(t) -> acc.push(t), _ -> acc })
 
 /// Every expression `wanted` picks among those a module's definitions, tests and laws hold, in the
 /// order they are written, one that holds another before it.
 pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
-  fold(module.items, [], |acc: List<Expr>, item: Item|
+  module.items.fold([], |acc: List<Expr>, item: Item|
     match item {
       IFn(d) ->
-        fold(d.spec, picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
+        d.spec.fold(picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
           picked(clause.expr, wanted, out)),
       // Over cases, the label and the table are written before the body.
       ITest(d) ->
@@ -431,29 +429,29 @@ pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
     })
 
 fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
-  let out = if wanted(e) { push(found, e) } else { found };
+  let out = if wanted(e) { found.push(e) } else { found };
   let all = |es: List<Expr>, acc: List<Expr>|
-    fold(es, acc, |a: List<Expr>, x: Expr| picked(x, wanted, a));
+    es.fold(acc, |a: List<Expr>, x: Expr| picked(x, wanted, a));
   let maybe = |o: Option<Expr>, acc: List<Expr>|
     match o { None -> acc, Some(x) -> picked(x, wanted, acc) };
   let fields = |fs: List<RecField>, acc: List<Expr>|
-    fold(fs, acc, |a: List<Expr>, f: RecField| picked(f.value, wanted, a));
+    fs.fold(acc, |a: List<Expr>, f: RecField| picked(f.value, wanted, a));
   match e {
     EBinary(b) -> picked(b.rhs, wanted, picked(b.lhs, wanted, out)),
     EUnary(u) -> picked(u.operand, wanted, out),
     ELambda(l) -> picked(l.body, wanted, out),
     EApp(a) ->
-      fold(a.named, all(a.args, picked(a.func, wanted, out)), |acc: List<Expr>, arg: NamedArg|
+      a.named.fold(all(a.args, picked(a.func, wanted, out)), |acc: List<Expr>, arg: NamedArg|
         picked(arg.value, wanted, acc)),
     EIf(i) ->
       picked(i.else_branch, wanted, picked(i.then_branch, wanted, picked(i.cond, wanted, out))),
     EMatch(m) ->
-      fold(m.arms, picked(m.scrutinee, wanted, out), |acc: List<Expr>, arm: MatchArm|
+      m.arms.fold(picked(m.scrutinee, wanted, out), |acc: List<Expr>, arm: MatchArm|
         picked(arm.body, wanted, maybe(arm.guard, acc))),
     EBlock(b) ->
       maybe(
         b.tail,
-        fold(b.stmts, out, |acc: List<Expr>, stmt: Stmt|
+        b.stmts.fold(out, |acc: List<Expr>, stmt: Stmt|
           match stmt {
             SLet(l) -> picked(l.value, wanted, acc),
             SLetElse(l) -> picked(l.fallback, wanted, picked(l.value, wanted, acc)),
@@ -467,8 +465,7 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
     EList(l) -> all(l.items, out),
     EPerform(x) -> all(x.args, out),
     EHandle(h) -> {
-      let clauses = fold(
-        h.clauses,
+      let clauses = h.clauses.fold(
         picked(h.body, wanted, out),
         |acc: List<Expr>, c: HandleClause| picked(c.body, wanted, acc),
       );
@@ -480,7 +477,7 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
     ESimulate(x) -> picked(x.body, wanted, out),
     EParallel(x) -> all(x.branches, out),
     ETryBlock(t) -> picked(t.body, wanted, out),
-    ETagged(t) -> fold(t.holes, out, |acc: List<Expr>, h: Hole| picked(h.value, wanted, acc)),
+    ETagged(t) -> t.holes.fold(out, |acc: List<Expr>, h: Hole| picked(h.value, wanted, acc)),
     ELit(_) -> out,
     EVar(_) -> out,
     EBad(_) -> out,
@@ -490,7 +487,7 @@ fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
 /// Every tagged literal of a checked module replaced by what it runs as.
 pub fn expand_tagged(module: Module) -> Module =
   if !has_tagged(module) { module }
-  else { { ..module, items: map(module.items, |item: Item| map_item(item, settled)) } }
+  else { { ..module, items: module.items.map(|item: Item| map_item(item, settled)) } }
 
 // --- Witnesses -----------------------------------------------------------------------------
 // A definition with `numeric(a)` or `integer(a)` takes, ahead of its written parameters, an `Int`
@@ -505,29 +502,28 @@ pub type NumericWitness = | ConcreteWitness(Bytes) | ParamWitness(Bytes) | State
 derive bin for NumericWitness
 
 /// No source can spell it, so it never collides with a binder the program wrote.
-pub fn witness_param(param: Bytes) -> Bytes = bytes_concat(b"?w_", param)
+pub fn witness_param(param: Bytes) -> Bytes = b"?w_".concat(param)
 
 /// The runtime's numbering: its ten widths in order, then `Int`, `Float` and `Decimal`.
 pub fn witness_code(name: Bytes) -> Int =
-  match fold(range(0, 13), None, |acc: Option<Int>, i: Int|
+  match range(0, 13).fold(None, |acc: Option<Int>, i: Int|
       match acc {
         Some(_) -> acc,
-        None -> match list_at(
-            [
-              b"U8",
-              b"U16",
-              b"U32",
-              b"U64",
-              b"I8",
-              b"I16",
-              b"I32",
-              b"I64",
-              b"U128",
-              b"I128",
-              b"Int",
-              b"Float",
-              b"Decimal",
-            ],
+        None -> match [
+            b"U8",
+            b"U16",
+            b"U32",
+            b"U64",
+            b"I8",
+            b"I16",
+            b"I32",
+            b"I64",
+            b"U128",
+            b"I128",
+            b"Int",
+            b"Float",
+            b"Decimal",
+          ].at(
             i,
           ) {
           Some(n) -> if n == name { Some(i) } else { None },
@@ -573,8 +569,8 @@ fn numeric_ops_numbered() -> List<Bytes> =
 /// The runtime's numbering of the operators a witnessed parameter takes; `-` and `~` are 0 and 1.
 fn numeric_op_code(op: Bytes) -> Int = {
   let ops = numeric_ops_numbered();
-  fold(range(0, len(ops)), 0 - 1, |acc: Int, i: Int|
-    if acc >= 0 { acc } else if list_at(ops, i) == Some(op) { i } else { acc })
+  range(0, ops.len()).fold(0 - 1, |acc: Int, i: Int|
+    if acc >= 0 { acc } else if ops.at(i) == Some(op) { i } else { acc })
 }
 
 /// The expression a witnessed operator was elaborated from where its witness is a parameter of the
@@ -585,7 +581,7 @@ pub fn unwitnessed(e: Expr, concrete: (Bytes) -> Bool) -> Expr =
       EVar(v) -> if v.name.name.name == b"?numeric_binary" {
         match a.args {
           [ELit(code), EVar(w), lhs, rhs] -> match code.lit {
-            LInt(k) -> match list_at(numeric_ops_numbered(), k) {
+            LInt(k) -> match numeric_ops_numbered().at(k) {
               Some(op) -> if concrete(w.name.name.name) {
                 EBinary({ span: a.span, op: op, lhs: lhs, rhs: rhs })
               } else { e },
@@ -626,7 +622,7 @@ fn hidden_call(span: Span, name: Bytes, args: List<Expr>) -> Expr =
 
 fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: Expr) -> Expr =
   match e {
-    EBinary(b) -> match map_get(ops, span_key(b.span)) {
+    EBinary(b) -> match ops.get(span_key(b.span)) {
       Some(p) -> if b.op == b"eq" || b.op == b"ne" { e } else {
         hidden_call(b.span, b"?numeric_binary", [
           ELit({ span: b.span, lit: LInt(numeric_op_code(b.op)) }),
@@ -637,7 +633,7 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: 
       },
       None -> e,
     },
-    EUnary(u) -> match map_get(ops, span_key(u.span)) {
+    EUnary(u) -> match ops.get(span_key(u.span)) {
       Some(p) ->
         hidden_call(u.span, b"?numeric_unary", [
           ELit({ span: u.span, lit: LInt(if u.op == b"bitnot" { 1 } else { 0 }) }),
@@ -647,14 +643,13 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: 
       None -> e,
     },
     EApp(a) -> match a.func {
-      EVar(v) -> match map_get(refs, span_key(v.span)) {
+      EVar(v) -> match refs.get(span_key(v.span)) {
         Some(ws) ->
           EApp({
             ..a,
-            args: fold(
-              a.args,
-              map(ws, |w: NumericWitness| witness_expr(w, v.span)),
-              |acc: List<Expr>, x: Expr| push(acc, x),
+            args: a.args.fold(
+              ws.map(|w: NumericWitness| witness_expr(w, v.span)),
+              |acc: List<Expr>, x: Expr| acc.push(x),
             ),
           }),
         None -> e,
@@ -666,14 +661,13 @@ fn witnessed(ops: Map<Bytes, Bytes>, refs: Map<Bytes, List<NumericWitness>>, e: 
 
 fn witness_params(orders: Map<Bytes, List<Bytes>>, item: Item) -> Item =
   match item {
-    IFn(d) -> match map_get(orders, d.name.name) {
+    IFn(d) -> match orders.get(d.name.name) {
       None -> item,
       Some(ws) ->
         IFn({
           ..d,
-          params: fold(
-            d.params,
-            map(ws, |w: Bytes|
+          params: d.params.fold(
+            ws.map(|w: Bytes|
               {
                 name: { name: witness_param(w), span: d.name.span },
                 ty: Some(nullary(bare({ name: b"Int", span: d.name.span }))),
@@ -681,7 +675,7 @@ fn witness_params(orders: Map<Bytes, List<Bytes>>, item: Item) -> Item =
                 default: None,
                 span: d.name.span,
               }),
-            |acc: List<Param>, param: Param| push(acc, param),
+            |acc: List<Param>, param: Param| acc.push(param),
           ),
         }),
     },
@@ -695,10 +689,10 @@ pub fn expand_witnesses(
   refs: Map<Bytes, List<NumericWitness>>,
   orders: Map<Bytes, List<Bytes>>,
 ) -> Module =
-  if map_len(ops) == 0 && map_len(refs) == 0 && map_len(orders) == 0 { module } else {
+  if ops.len() == 0 && refs.len() == 0 && orders.len() == 0 { module } else {
     {
       ..module,
-      items: map(module.items, |item: Item|
+      items: module.items.map(|item: Item|
         witness_params(orders, map_item(item, |expr: Expr| witnessed(ops, refs, expr)))),
     }
   }
@@ -713,12 +707,11 @@ pub type Answered = { effect: Bytes, op: Bytes, arity: Int }
 
 /// An effect's program-wide name as a clause the lowering writes names it. No source can spell it,
 /// so it names the effect the same in every module.
-pub fn program_wide(name: Bytes) -> Bytes = bytes_concat(b"?", name)
+pub fn program_wide(name: Bytes) -> Bytes = b"?".concat(name)
 
 /// The effect a clause names program-wide, for a name `program_wide` wrote; `None` for any other.
 pub fn named_program_wide(written: Bytes) -> Option<Bytes> / {abort.raise} =
-  if bytes_starts_with(written, b"?") { Some(bytes_slice(written, 1, bytes_len(written))) }
-  else { None }
+  if written.starts_with(b"?") { Some(written.slice(1, written.len())) } else { None }
 
 fn carried(binders: List<Ident>, span: Span) -> Expr =
   match binders {
@@ -727,8 +720,8 @@ fn carried(binders: List<Ident>, span: Span) -> Expr =
     _ ->
       ERecord({
         span: span,
-        fields: map(range(0, len(binders)), |i: Int|
-          match list_at(binders, i) {
+        fields: range(0, binders.len()).map(|i: Int|
+          match binders.at(i) {
             Some(b) -> { name: positional(i, span), value: var_of(b) },
             None -> { name: positional(i, span), value: ELit({ span: span, lit: LUnit }) },
           }),
@@ -747,11 +740,11 @@ fn answer(ctor: Bytes, value: Expr, span: Span) -> Expr =
 /// A span the table does not hold belongs to a program that did not check; the lowering declines it.
 fn expanded_try(answered: Map<Bytes, Answered>, expr: Expr) -> Expr =
   match expr {
-    ETryBlock(t) -> match map_get(answered, span_key(t.span)) {
+    ETryBlock(t) -> match answered.get(span_key(t.span)) {
       None -> expr,
       Some(a) -> {
-        let binders = map(range(0, a.arity), |i: Int|
-          { name: bytes_concat(b"?r", ascii_of_int(i)), span: t.span });
+        let binders = range(0, a.arity).map(|i: Int|
+          { name: b"?r".concat(ascii_of_int(i)), span: t.span });
         let returned = { name: b"?v", span: t.span };
         EHandle({
           span: t.span,
@@ -787,7 +780,7 @@ pub fn expand_try_blocks(module: Module, answered: Map<Bytes, Answered>) -> Modu
   if !any_expr(module, is_try_block) { module } else {
     {
       ..module,
-      items: map(module.items, |item: Item|
+      items: module.items.map(|item: Item|
         map_item(item, |expr: Expr| expanded_try(answered, expr))),
     }
   }
@@ -859,7 +852,7 @@ fn is_hold(expr: Expr) -> Bool = match expr { EWithHold(_) -> true, _ -> false }
 /// Every `with_hold` of a module replaced by the cell and the bracket it stands for.
 pub fn expand_holds(module: Module) -> Module =
   if !any_expr(module, is_hold) { module }
-  else { { ..module, items: map(module.items, |item: Item| map_item(item, expanded_hold)) } }
+  else { { ..module, items: module.items.map(|item: Item| map_item(item, expanded_hold)) } }
 
 // --- What `Ok` and `Err` name ----------------------------------------------------------------
 // A `try` is written out as a `handle` that answers `Ok` and `Err`, a tagged literal as a `let`
@@ -872,15 +865,15 @@ type Rebound = { name: Bytes, imported: Bool }
 /// The first of `names` the module binds for itself: one it imports by name, else a variant or a
 /// function it declares.
 fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
-  let imported = fold(module.imports, None, |acc: Option<Rebound>, d: ImportDecl|
+  let imported = module.imports.fold(None, |acc: Option<Rebound>, d: ImportDecl|
     match acc {
       Some(_) -> acc,
       None -> match d.kind {
         INames(ns) ->
-          fold(ns, None, |b: Option<Rebound>, ident: Ident|
+          ns.fold(None, |b: Option<Rebound>, ident: Ident|
             match b {
               Some(_) -> b,
-              None -> if contains(names, ident.name) { Some({ name: ident.name, imported: true }) }
+              None -> if names.contains(ident.name) { Some({ name: ident.name, imported: true }) }
               else { None },
             }),
         _ -> None,
@@ -889,22 +882,22 @@ fn bound_among(module: Module, names: List<Bytes>) -> Option<Rebound> = {
   match imported {
     Some(_) -> imported,
     None ->
-      fold(module.items, None, |acc: Option<Rebound>, item: Item|
+      module.items.fold(None, |acc: Option<Rebound>, item: Item|
         match acc {
           Some(_) -> acc,
           None -> match item {
             IType(d) -> match d.body {
               TDSum(vs) ->
-                fold(vs, None, |b: Option<Rebound>, variant: VariantDef|
+                vs.fold(None, |b: Option<Rebound>, variant: VariantDef|
                   match b {
                     Some(_) -> b,
-                    None -> if contains(names, variant.name.name) {
+                    None -> if names.contains(variant.name.name) {
                       Some({ name: variant.name.name, imported: false })
                     } else { None },
                   }),
               _ -> None,
             },
-            IFn(d) -> if contains(names, d.name.name) {
+            IFn(d) -> if names.contains(d.name.name) {
               Some({ name: d.name.name, imported: false })
             } else { None },
             _ -> None,
@@ -917,10 +910,10 @@ fn uncaptured(span: Span, form: Bytes, lacks: Bytes, own: Rebound, answers: Byte
   error_at(
     b"E0118",
     span,
-    bytes_concat_all([b"this file gives ", form, b" no meaning here"]),
+    Bytes::concat_all([b"this file gives ", form, b" no meaning here"]),
     lacks,
     [
-      bytes_concat_all([
+      Bytes::concat_all([
         b"this module binds its own `",
         own.name,
         b"`, which would capture ",
@@ -935,9 +928,8 @@ fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
   let tried = match bound_among(module, [b"Ok", b"Err"]) {
     None -> diags,
     Some(own) ->
-      fold(picked_in(module, is_try_block), diags, |acc: List<ParseDiag>, e: Expr|
-        push(
-          acc,
+      picked_in(module, is_try_block).fold(diags, |acc: List<ParseDiag>, e: Expr|
+        acc.push(
           uncaptured(
             expr_span(e),
             b"`try`",
@@ -950,9 +942,8 @@ fn rebound(module: Module, diags: List<ParseDiag>) -> List<ParseDiag> = {
   match bound_among(module, [b"Ok"]) {
     None -> tried,
     Some(own) ->
-      fold(tagged_in(module), tried, |acc: List<ParseDiag>, t: Tagged|
-        push(
-          acc,
+      tagged_in(module).fold(tried, |acc: List<ParseDiag>, t: Tagged|
+        acc.push(
           uncaptured(
             t.span,
             b"a tagged literal",
@@ -987,13 +978,13 @@ fn shadowing_ctor(module: Module) -> Option<Bytes> =
     None -> None,
     Some(own) ->
       Some(if own.imported {
-        bytes_concat_all([
+        Bytes::concat_all([
           b"this module imports `",
           own.name,
           b"` unqualified, which would capture the `match` `?` expands to; import the module instead and qualify the name, or write the `match` out",
         ])
       } else {
-        bytes_concat_all([
+        Bytes::concat_all([
           b"this module declares its own `",
           own.name,
           b"`, which would capture the `match` `?` expands to; rename it, or write the `match` out",
@@ -1005,7 +996,7 @@ fn unreadable() -> Bytes =
   b"the return type has no head constructor this file can read: a type parameter and a generic alias have none until they are applied"
 
 fn not_result_or_option(head: Bytes) -> Bytes =
-  bytes_concat_all([
+  Bytes::concat_all([
     b"this function returns `",
     head,
     b"`; `?` binds a `Result` inside a function returning `Result`, or an `Option` inside one returning `Option`, because those are the constructors it expands to",
@@ -1015,7 +1006,7 @@ fn no_return_type() -> Bytes =
   b"this function writes no `->`, and `?` reads which constructors to name off the written return type; write one"
 
 fn not_in_a_function(what: Bytes) -> Bytes =
-  bytes_concat(what, b" has no written return type, and `?` needs one")
+  what.concat(b" has no written return type, and `?` needs one")
 
 fn mode_of(state: TryState, ty: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
   if depth > max_alias_depth() { Err(too_deep()) } else {
@@ -1055,7 +1046,7 @@ fn under(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
 fn fresh_binder(state: TryState, span: Span) -> { state: TryState, binder: Ident } =
   {
     state: { ..state, fresh: state.fresh + 1 },
-    binder: { name: bytes_concat(b"?", bytes_of_string(int_to_string(state.fresh))), span: span },
+    binder: { name: b"?".concat(Bytes::of_string(state.fresh.to_string())), span: span },
   }
 
 fn var_of(name: Ident) -> Expr = EVar({ span: name.span, name: bare(name) })
@@ -1128,13 +1119,13 @@ fn sequence(state: TryState, parts: List<Expr>) -> Sequenced / {abort.raise} =
 
 /// `sequence` going on from where one over the sub-expressions before `parts` stopped.
 fn sequence_on(before: Sequenced, parts: List<Expr>) -> Sequenced / {abort.raise} =
-  fold(parts, before, |acc: Sequenced, expr: Expr|
+  parts.fold(before, |acc: Sequenced, expr: Expr|
     match acc.scan {
       ScanPure -> {
         let o = scan(acc.state, expr);
-        { state: o.state, scan: o.scan, exprs: push(acc.exprs, o.expr) }
+        { state: o.state, scan: o.scan, exprs: acc.exprs.push(o.expr) }
       },
-      _ -> { ..acc, exprs: push(acc.exprs, expr) },
+      _ -> { ..acc, exprs: acc.exprs.push(expr) },
     })
 
 /// Lifts the first `?` reachable in evaluation order, leaving its binder in its place.
@@ -1190,14 +1181,14 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
     EApp(a) -> {
       let o = sequence_on(
         sequence_on(sequence(state, [a.func]), a.args),
-        map(a.named, |n: NamedArg| n.value),
+        a.named.map(|n: NamedArg| n.value),
       );
-      let func = at(o.exprs, 0);
-      let args = take(drop(o.exprs, 1), len(a.args));
-      let nvals = drop(o.exprs, 1 + len(a.args));
-      let named = map(range(0, len(a.named)), |i: Int| {
-        let n = at(a.named, i);
-        { name: n.name, value: at(nvals, i), span: n.span }
+      let func = o.exprs.get(0);
+      let args = o.exprs.drop(1).take(a.args.len());
+      let nvals = o.exprs.drop(1 + a.args.len());
+      let named = range(0, a.named.len()).map(|i: Int| {
+        let n = a.named.get(i);
+        { name: n.name, value: nvals.get(i), span: n.span }
       });
       let rebuilt = EApp({ span: a.span, func: func, named: named, args: args, labels: a.labels });
       match o.scan {
@@ -1220,14 +1211,14 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       }
     },
     ERecord(r) -> {
-      let o = sequence(state, map(r.fields, |f: RecField| f.value));
+      let o = sequence(state, r.fields.map(|f: RecField| f.value));
       {
         state: o.state,
         scan: o.scan,
         expr: ERecord({
           span: r.span,
-          fields: map(range(0, len(r.fields)), |i: Int|
-            { name: at(r.fields, i).name, value: at(o.exprs, i) }),
+          fields: range(0, r.fields.len()).map(|i: Int|
+            { name: r.fields.get(i).name, value: o.exprs.get(i) }),
         }),
       }
     },
@@ -1240,15 +1231,15 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       { state: o.state, scan: o.scan, expr: EField({ span: f.span, base: o.expr, field: f.field }) }
     },
     ERecordUpdate(r) -> {
-      let o = sequence_on(sequence(state, [r.base]), map(r.fields, |f: RecField| f.value));
+      let o = sequence_on(sequence(state, [r.base]), r.fields.map(|f: RecField| f.value));
       {
         state: o.state,
         scan: o.scan,
         expr: ERecordUpdate({
           span: r.span,
-          base: at(o.exprs, 0),
-          fields: map(range(0, len(r.fields)), |i: Int|
-            { name: at(r.fields, i).name, value: at(o.exprs, i + 1) }),
+          base: o.exprs.get(0),
+          fields: range(0, r.fields.len()).map(|i: Int|
+            { name: r.fields.get(i).name, value: o.exprs.get(i + 1) }),
         }),
       }
     },
@@ -1281,7 +1272,7 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
           {
             state: sc.state,
             scan: purity(
-              fold(m.arms, true, |acc: Bool, arm: MatchArm|
+              m.arms.fold(true, |acc: Bool, arm: MatchArm|
                 acc && is_pure(arm.body)
                   && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
             ),
@@ -1290,11 +1281,11 @@ fn scan(state: TryState, expr: Expr) -> Scanned / {abort.raise} =
       }
     },
     ETagged(t) -> {
-      let o = sequence(state, map(t.holes, |h: Hole| h.value));
+      let o = sequence(state, t.holes.map(|h: Hole| h.value));
       let rebuilt = ETagged(with_hole_values(t, o.exprs));
       match o.scan {
         ScanFound(_) -> { state: o.state, scan: o.scan, expr: rebuilt },
-        _ -> { state: o.state, scan: purity(len(t.holes) == 0), expr: rebuilt },
+        _ -> { state: o.state, scan: purity(t.holes.len() == 0), expr: rebuilt },
       }
     },
     // A nested block is not entered; a lambda, handler, cell, region, `simulate` or `parallel` is a
@@ -1311,7 +1302,7 @@ fn region_cond(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise}
       let w = wrap(found.state, l.operand, l.at, var_pattern(l.binder), found.expr);
       match w.expr {
         EMatch(m) -> {
-          let success = at(m.arms, 1);
+          let success = m.arms.get(1);
           let inner = if room <= 0 { panic(lifted_past()) }
           else { region_cond(w.state, success.body, room - 1) };
           {
@@ -1320,7 +1311,7 @@ fn region_cond(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise}
               span: m.span,
               scrutinee: m.scrutinee,
               arms: [
-                at(m.arms, 0),
+                m.arms.get(0),
                 { pat: success.pat, guard: None, body: inner.expr, span: success.span },
               ],
             }),
@@ -1375,14 +1366,13 @@ fn ret(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
       )
     },
     EMatch(m) -> {
-      let arms = fold(
-        m.arms,
+      let arms = m.arms.fold(
         { state: state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let b = ret(acc.state, arm.body, room);
           {
             state: b.state,
-            arms: push(acc.arms, { pat: arm.pat, guard: arm.guard, body: b.expr, span: arm.span }),
+            arms: acc.arms.push({ pat: arm.pat, guard: arm.guard, body: b.expr, span: arm.span }),
           }
         },
       );
@@ -1399,15 +1389,14 @@ fn ret(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
 fn block(state: TryState, expr: Expr, room: Int) -> TryOut / {abort.raise} =
   match expr {
     EBlock(b) -> {
-      let split = fold(
-        range(0, len(b.stmts)),
+      let split = range(0, b.stmts.len()).fold(
         { state: state, stmts: b.stmts, tail: b.tail, done: false },
         |acc: { state: TryState, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
           if acc.done { acc } else {
-            let o = split_at(acc.state, acc.stmts, acc.tail, i, at(b.stmts, i), room);
+            let o = split_at(acc.state, acc.stmts, acc.tail, i, b.stmts.get(i), room);
             match o.split {
               None -> { state: o.state, stmts: o.stmts, tail: acc.tail, done: false },
-              Some(t) -> { state: o.state, stmts: take(o.stmts, i), tail: Some(t), done: true },
+              Some(t) -> { state: o.state, stmts: o.stmts.take(i), tail: Some(t), done: true },
             }
           },
       );
@@ -1447,10 +1436,10 @@ fn split_at(
 ) -> { state: TryState, stmts: List<Stmt>, split: Option<Expr> } / {abort.raise} = {
   let taken = take_stmt(state, st, room);
   match taken.take {
-    None -> { state: taken.state, stmts: list_set(stmts, i, taken.stmt), split: None },
+    None -> { state: taken.state, stmts: stmts.set(i, taken.stmt), split: None },
     Some(t) -> {
-      let kept = list_set(stmts, i, taken.stmt);
-      let rest = drop(kept, if t.consumes { i + 1 } else { i });
+      let kept = stmts.set(i, taken.stmt);
+      let rest = kept.drop(if t.consumes { i + 1 } else { i });
       // A consumed statement goes: its binder is now the success arm's pattern.
       let body0 = EBlock({ span: t.at, tail: tail, stmts: rest });
       let body = if room <= 0 { panic(lifted_past()) } else { block(taken.state, body0, room - 1) };
@@ -1661,7 +1650,7 @@ fn sweep_within(
             b"this file gives `?` no meaning here",
             b"no `Result` or `Option` to expand this into",
             [
-              bytes_concat_all([
+              Bytes::concat_all([
                 b"this `?` is inside ",
                 what,
                 b", which has no written return type of its own. `?` exits the expression it is written in and never a lambda, a handler or a region: name a function with a written `->` and call it",
@@ -1689,7 +1678,7 @@ fn sweep_within(
             ),
         },
       };
-      sweep_inner({ ..state, diags: push(state.diags, d) }, t.operand, scope, barrier, room)
+      sweep_inner({ ..state, diags: state.diags.push(d) }, t.operand, scope, barrier, room)
     },
     _ -> sweep_inner(state, expr, scope, barrier, room),
   }
@@ -1746,15 +1735,11 @@ fn sweep_inner(
     EApp(a) -> {
       let f = sweep_within(state, a.func, scope, barrier, room);
       let args = sweep_all(f.state, a.args, scope, barrier, room);
-      let named = fold(
-        a.named,
+      let named = a.named.fold(
         { state: args.state, args: [] },
         |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
           let o = sweep_within(acc.state, arg.value, scope, barrier, room);
-          {
-            state: o.state,
-            args: push(acc.args, { name: arg.name, value: o.expr, span: arg.span }),
-          }
+          { state: o.state, args: acc.args.push({ name: arg.name, value: o.expr, span: arg.span }) }
         },
       );
       {
@@ -1779,8 +1764,7 @@ fn sweep_inner(
     },
     EMatch(m) -> {
       let sc = sweep_within(state, m.scrutinee, scope, barrier, room);
-      let arms = fold(
-        m.arms,
+      let arms = m.arms.fold(
         { state: sc.state, arms: [] },
         |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
           let g = match arm.guard {
@@ -1793,15 +1777,14 @@ fn sweep_inner(
           let b = sweep_within(g.state, arm.body, scope, barrier, room);
           {
             state: b.state,
-            arms: push(acc.arms, { pat: arm.pat, guard: g.expr, body: b.expr, span: arm.span }),
+            arms: acc.arms.push({ pat: arm.pat, guard: g.expr, body: b.expr, span: arm.span }),
           }
         },
       );
       { state: arms.state, expr: EMatch({ span: m.span, scrutinee: sc.expr, arms: arms.arms }) }
     },
     EBlock(b) -> {
-      let stmts = fold(
-        b.stmts,
+      let stmts = b.stmts.fold(
         { state: state, stmts: [] },
         |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
           match stmt {
@@ -1809,7 +1792,7 @@ fn sweep_inner(
               let o = sweep_within(acc.state, l.value, scope, barrier, room);
               {
                 state: o.state,
-                stmts: push(acc.stmts, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
+                stmts: acc.stmts.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
               }
             },
             SLetElse(l) -> {
@@ -1817,12 +1800,12 @@ fn sweep_inner(
               let f = sweep_within(v.state, l.fallback, scope, barrier, room);
               {
                 state: f.state,
-                stmts: push(acc.stmts, SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+                stmts: acc.stmts.push(SLetElse({ ..l, value: v.expr, fallback: f.expr })),
               }
             },
             SExpr(x) -> {
               let o = sweep_within(acc.state, x, scope, barrier, room);
-              { state: o.state, stmts: push(acc.stmts, SExpr(o.expr)) }
+              { state: o.state, stmts: acc.stmts.push(SExpr(o.expr)) }
             },
           },
       );
@@ -1861,8 +1844,7 @@ fn sweep_inner(
     },
     EHandle(h) -> {
       let b = sweep_within(state, h.body, scope, under(barrier, b"a `handle` body"), room);
-      let cs = fold(
-        h.clauses,
+      let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
           let o = sweep_within(
@@ -1874,7 +1856,7 @@ fn sweep_inner(
           );
           {
             state: o.state,
-            clauses: push(acc.clauses, {
+            clauses: acc.clauses.push({
               eff: c.eff,
               op: c.op,
               resource: c.resource,
@@ -1945,12 +1927,11 @@ fn sweep_inner(
       { state: o.state, expr: ETryBlock({ ..x, body: o.expr }) }
     },
     ETagged(t) -> {
-      let filled = fold(
-        t.holes,
+      let filled = t.holes.fold(
         { state: state, holes: [] },
         |acc: { state: TryState, holes: List<Hole> }, h: Hole| {
           let o = sweep_within(acc.state, h.value, scope, barrier, room);
-          { state: o.state, holes: push(acc.holes, { ..h, value: o.expr }) }
+          { state: o.state, holes: acc.holes.push({ ..h, value: o.expr }) }
         },
       );
       { state: filled.state, expr: ETagged({ ..t, holes: filled.holes }) }
@@ -1965,12 +1946,11 @@ fn sweep_all(
   barrier: Option<Bytes>,
   room: Int,
 ) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
-  fold(
-    exprs,
+  exprs.fold(
     { state: state, exprs: [] },
     |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
       let o = sweep_within(acc.state, expr, scope, barrier, room);
-      { state: o.state, exprs: push(acc.exprs, o.expr) }
+      { state: o.state, exprs: acc.exprs.push(o.expr) }
     },
   )
 
@@ -1981,12 +1961,11 @@ fn sweep_fields(
   barrier: Option<Bytes>,
   room: Int,
 ) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
-  fold(
-    fields,
+  fields.fold(
     { state: state, fields: [] },
     |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
       let o = sweep_within(acc.state, field.value, scope, barrier, room);
-      { state: o.state, fields: push(acc.fields, { name: field.name, value: o.expr }) }
+      { state: o.state, fields: acc.fields.push({ name: field.name, value: o.expr }) }
     },
   )
 
@@ -1994,8 +1973,7 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
   let state = { ..outer, fresh: 0, mode: None };
   match item {
     IFn(d) -> {
-      let spec: { state: TryState, clauses: List<SpecClause> } = fold(
-        d.spec,
+      let spec: { state: TryState, clauses: List<SpecClause> } = d.spec.fold(
         { state: state, clauses: [] },
         |acc: { state: TryState, clauses: List<SpecClause> }, clause: SpecClause| {
           let what = match clause.kind {
@@ -2007,7 +1985,7 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
           let o = sweep(acc.state, clause.expr, Some(not_in_a_function(what)), None);
           {
             state: o.state,
-            clauses: push(acc.clauses, { kind: clause.kind, expr: o.expr, span: clause.span }),
+            clauses: acc.clauses.push({ kind: clause.kind, expr: o.expr, span: clause.span }),
           }
         },
       );
@@ -2111,12 +2089,11 @@ pub fn expand_try(
     mode: None,
     fresh: 0,
   };
-  let walked = fold(
-    module.items,
+  let walked = module.items.fold(
     { state: start, items: [] },
     |acc: { state: TryState, items: List<Item> }, item: Item| {
       let o = try_item(acc.state, item);
-      { state: o.state, items: push(acc.items, o.item) }
+      { state: o.state, items: acc.items.push(o.item) }
     },
   );
   { module: { ..module, items: walked.items }, diags: walked.state.diags }
@@ -2135,13 +2112,13 @@ pub fn fn_has_update(def: FnDef) -> Bool =
 fn has_try(m: Module) -> Bool = any_expr(m, |expr: Expr| match expr { ETry(_) -> true, _ -> false })
 
 fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
-  fold(module.items, false, |acc: Bool, item: Item|
+  module.items.fold(false, |acc: Bool, item: Item|
     acc
       || (match item {
         IFn(d) ->
           count_in(d.body, p) > 0
-            || fold(d.spec, false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
-            || fold(d.params, false, |b: Bool, param: Param|
+            || d.spec.fold(false, |b: Bool, clause: SpecClause| b || count_in(clause.expr, p) > 0)
+            || d.params.fold(false, |b: Bool, param: Param|
               b || (match param.default { None -> false, Some(v) -> count_in(v, p) > 0 })),
         ITest(d) ->
           count_in(d.body, p) > 0
@@ -2160,23 +2137,22 @@ fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
 
 /// How many expressions within `e`, itself included, `p` holds for.
 fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
-  let all = |es: List<Expr>| fold(es, 0, |n: Int, x: Expr| n + count_in(x, p));
+  let all = |es: List<Expr>| es.fold(0, |n: Int, x: Expr| n + count_in(x, p));
   let maybe = |o: Option<Expr>| match o { None -> 0, Some(x) -> count_in(x, p) };
   (if p(e) { 1 } else { 0 })
     + (match e {
       EBinary(b) -> count_in(b.lhs, p) + count_in(b.rhs, p),
       EUnary(u) -> count_in(u.operand, p),
-      ELambda(l) ->
-        count_in(l.body, p) + fold(l.params, 0, |n: Int, x: Param| n + maybe(x.default)),
+      ELambda(l) -> count_in(l.body, p) + l.params.fold(0, |n: Int, x: Param| n + maybe(x.default)),
       EApp(a) ->
         count_in(a.func, p) + all(a.args)
-          + fold(a.named, 0, |n: Int, arg: NamedArg| n + count_in(arg.value, p)),
+          + a.named.fold(0, |n: Int, arg: NamedArg| n + count_in(arg.value, p)),
       EIf(i) -> count_in(i.cond, p) + count_in(i.then_branch, p) + count_in(i.else_branch, p),
       EMatch(m) ->
         count_in(m.scrutinee, p)
-          + fold(m.arms, 0, |n: Int, arm: MatchArm| n + count_in(arm.body, p) + maybe(arm.guard)),
+          + m.arms.fold(0, |n: Int, arm: MatchArm| n + count_in(arm.body, p) + maybe(arm.guard)),
       EBlock(b) ->
-        fold(b.stmts, 0, |n: Int, stmt: Stmt|
+        b.stmts.fold(0, |n: Int, stmt: Stmt|
             n
               + (match stmt {
                 SLet(l) -> count_in(l.value, p),
@@ -2184,22 +2160,22 @@ fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
                 SExpr(x) -> count_in(x, p),
               }))
           + maybe(b.tail),
-      ERecord(r) -> fold(r.fields, 0, |n: Int, f: RecField| n + count_in(f.value, p)),
+      ERecord(r) -> r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
       ERecordUpdate(r) ->
-        count_in(r.base, p) + fold(r.fields, 0, |n: Int, f: RecField| n + count_in(f.value, p)),
+        count_in(r.base, p) + r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
       ETry(t) -> count_in(t.operand, p),
       EField(f) -> count_in(f.base, p),
       EList(l) -> all(l.items),
       EPerform(x) -> all(x.args),
       EHandle(h) ->
-        count_in(h.body, p) + fold(h.clauses, 0, |n: Int, c: HandleClause| n + count_in(c.body, p))
+        count_in(h.body, p) + h.clauses.fold(0, |n: Int, c: HandleClause| n + count_in(c.body, p))
           + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) }),
       EWithCell(c) -> count_in(c.init, p) + count_in(c.body, p),
       EWithHold(c) -> count_in(c.acquire, p) + count_in(c.release, p) + count_in(c.body, p),
       ESimulate(x) -> count_in(x.body, p),
       EParallel(x) -> all(x.branches),
       ETryBlock(x) -> count_in(x.body, p),
-      ETagged(t) -> fold(t.holes, 0, |n: Int, h: Hole| n + count_in(h.value, p)),
+      ETagged(t) -> t.holes.fold(0, |n: Int, h: Hole| n + count_in(h.value, p)),
       _ -> 0,
     })
 }
@@ -2227,7 +2203,7 @@ pub fn expand(
 fn schema_fns(d: SchemaDef) -> List<Item> = {
   let at = d.name.span;
   let ident = |t: Bytes| { name: t, span: at };
-  let params = map(concat(d.params, d.binders), |b: Binder|
+  let params = d.params.concat(d.binders).map(|b: Binder|
     { name: b.name, ty: Some(b.ty), cost: None, default: None, span: b.span });
   let row = {
     atoms: [
@@ -2243,7 +2219,7 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
       },
     ],
     aliases: [bare(ident(b"diverges"))],
-    tail: list_at(d.generics.effects, 0),
+    tail: d.generics.effects.at(0),
     tail_bounded: false,
     span: at,
   };
@@ -2274,19 +2250,19 @@ fn schema_fns(d: SchemaDef) -> List<Item> = {
 }
 
 fn with_schema_fns(module: Module) -> Module =
-  if !fold(module.items, false, |found: Bool, item: Item|
+  if !module.items.fold(false, |found: Bool, item: Item|
       found || (match item { ISchema(_) -> true, _ -> false })) { module } else {
     {
       ..module,
-      items: fold(module.items, [], |acc: List<Item>, item: Item|
-        match item { ISchema(d) -> concat(push(acc, item), schema_fns(d)), _ -> push(acc, item) }),
+      items: module.items.fold([], |acc: List<Item>, item: Item|
+        match item { ISchema(d) -> acc.push(item).concat(schema_fns(d)), _ -> acc.push(item) }),
     }
   }
 
 pub fn dump_expanded(src: Bytes) -> String / {abort.raise} = {
   let r = parse(src);
   let x = expand(r.node, r.parser.diags);
-  string_of_bytes(bytes_concat(dump_module(x.module), dump_diags(x.diags)))
+  String::of_bytes(dump_module(x.module).concat(dump_diags(x.diags)))
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -2314,24 +2290,24 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
 
 test "a `?` inside a `try` is refused, as one inside a `handle` is" {
   let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
-  assert(string_contains(out, "!E0118"))
+  assert(out.contains("!E0118"))
 }
 
 test "a `try` and a tagged literal are refused where the module binds what they are written out with" {
-  let refused = |src: Bytes| string_contains(dump_expanded(src), "!E0118");
+  let refused = |src: Bytes| dump_expanded(src).contains("!E0118");
   let tried = b"fn f(b: Int) -> Int = match try { digit(b) } { _ -> 1 }";
   let tagged = b"fn f() -> Int = hex\"00\"";
   assert(!refused(tried));
   assert(!refused(tagged));
-  assert(refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tried)));
-  assert(refused(bytes_concat(b"import m (Ok)\n", tried)));
-  assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", tagged)));
-  assert(refused(bytes_concat(b"import m (Ok)\n", tagged)));
-  assert(refused(bytes_concat(b"fn Ok(n: Int) -> Int = n\n", tagged)));
+  assert(refused(b"type Mine = | Err(Int) | Fine\n".concat(tried)));
+  assert(refused(b"import m (Ok)\n".concat(tried)));
+  assert(refused(b"type Mine = | Ok(Int) | Fine\n".concat(tagged)));
+  assert(refused(b"import m (Ok)\n".concat(tagged)));
+  assert(refused(b"fn Ok(n: Int) -> Int = n\n".concat(tagged)));
   // A tagged literal is read through `Ok` alone.
-  assert(!refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tagged)));
+  assert(!refused(b"type Mine = | Err(Int) | Fine\n".concat(tagged)));
   // A type imported by name brings no constructor with it.
-  assert(!refused(bytes_concat(b"import m (Mine)\n", tried)))
+  assert(!refused(b"import m (Mine)\n".concat(tried)))
 }
 
 test "a tagged literal and a `try` in a test's label or its table are read as those in its body are" {
@@ -2339,48 +2315,48 @@ test "a tagged literal and a `try` in a test's label or its table are read as th
     b"test \"t {hex\"01\"}\" for n: Int in [hex\"02\"] { assert(n > hex\"03\") }",
   ).node;
   assert(has_tagged(over));
-  assert_eq(map(tagged_in(over), |t: Tagged| t.text), [b"01", b"02", b"03"]);
-  let refused = |src: Bytes| string_contains(dump_expanded(src), "!E0118");
+  assert_eq(tagged_in(over).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
+  let refused = |src: Bytes| dump_expanded(src).contains("!E0118");
   let labelled = b"test \"t {hex\"01\"}\" for n: Int in [1] { () }";
   let tabled = b"test \"t {n}\" for n: Int in [try { g(1) }] { () }";
   assert(!refused(labelled) && !refused(tabled));
-  assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", labelled)));
-  assert(refused(bytes_concat(b"type Mine = | Err(Int) | Fine\n", tabled)))
+  assert(refused(b"type Mine = | Ok(Int) | Fine\n".concat(labelled)));
+  assert(refused(b"type Mine = | Err(Int) | Fine\n".concat(tabled)))
 }
 
 test "a tagged literal's holes are read as a call's arguments are, and it runs as its tag's `fill`" {
   let holding = b"fn f(n: Int) -> Result<Int, Bytes> = Ok(len(sh\"a {g(n)?} {sh\"b\"} {try { sh\"c {n}\" }}\"))";
   // One that holds another is read before it.
-  assert_eq(map(tagged_in(parse(holding).node), |t: Tagged| t.text), [b"a ", b"b", b"c "]);
+  assert_eq(tagged_in(parse(holding).node).map(|t: Tagged| t.text), [b"a ", b"b", b"c "]);
   // A `?` in a hole is lifted to the head of what holds the literal.
   let out = dump_expanded(holding);
-  assert(!string_contains(out, ":etry;") && string_contains(out, ":emat;"));
-  assert(!string_contains(out, "!E0118") && !string_contains(out, "!E0119"));
+  assert(!out.contains(":etry;") && out.contains(":emat;"));
+  assert(!out.contains("!E0118") && !out.contains("!E0119"));
   // Each is read through `Ok`, one inside a hole included.
   let nested = b"type Mine = | Ok(Int) | Fine\nfn f(n: Int) -> Int = sh\"a {sh\"b {n}\"}\"";
-  assert_eq(len(string_split(dump_expanded(nested), "!E0118")), 3);
+  assert_eq(dump_expanded(nested).split("!E0118").len(), 3);
   // Written out, its texts go to `compile`, and what that answers to `fill` with the holes.
-  let written = string_of_bytes(
+  let written = String::of_bytes(
     dump_module(expand_tagged(parse(b"fn f(n: Int) -> Int = sh\"a {sh\"b\"}\"").node)),
   );
-  assert(!string_contains(written, ":etag;"));
-  assert(string_contains(written, "@636f6d70696c65;") && string_contains(written, "@66696c6c;"));
-  assert(string_contains(written, "@6c69746572616c;"))
+  assert(!written.contains(":etag;"));
+  assert(written.contains("@636f6d70696c65;") && written.contains("@66696c6c;"));
+  assert(written.contains("@6c69746572616c;"))
 }
 
 test "a `try` the checker read is written out as its `handle`, and one it did not is left" {
   let module = parse(b"fn f(n: Int) -> Int = try { g(n) }").node;
   let written = |answered: Map<Bytes, Answered>|
-    string_of_bytes(dump_module(expand_try_blocks(module, answered)));
-  let left = written(map_new());
-  assert(string_contains(left, "22:34:etrb;"));
+    String::of_bytes(dump_module(expand_try_blocks(module, answered)));
+  let left = written(Map::new());
+  assert(left.contains("22:34:etrb;"));
   let out = written(
-    map_insert(map_new(), span_key(span_between(22, 34)), { effect: b"m.p", op: b"bad", arity: 2 }),
+    Map::new().insert(span_key(span_between(22, 34)), { effect: b"m.p", op: b"bad", arity: 2 }),
   );
-  assert(string_contains(out, "22:34:ehnd;"));
+  assert(out.contains("22:34:ehnd;"));
   // The clause names its effect program-wide, as `?m.p`, and answers the tuple of what it binds.
-  assert(string_contains(out, "@3f6d2e70;"));
-  assert(string_contains(out, "@5f31;"));
+  assert(out.contains("@3f6d2e70;"));
+  assert(out.contains("@5f31;"));
   assert_eq(named_program_wide(program_wide(b"m.p")), Some(b"m.p"));
   assert_eq(named_program_wide(b"p"), None)
 }
@@ -2389,8 +2365,8 @@ test "a `?` on a `let` with a written type keeps the annotation" {
   let out = dump_expanded(
     b"fn f(n: Int) -> Result<Int, Bytes> = { let x: Int = g(n)?; Ok(x + 1) }",
   );
-  assert(!string_contains(out, "!E0119"));
-  assert(string_contains(out, "@3f30"))
+  assert(!out.contains("!E0119"));
+  assert(out.contains("@3f30"))
 }
 
 test "a schema is also the definitions its instantiations call, `transparent` and under its doc" {
@@ -2400,15 +2376,14 @@ test "a schema is also the definitions its instantiations call, `transparent` an
     ).node,
     [],
   );
-  let made = fold(
-    x.module.items,
+  let made = x.module.items.fold(
     [],
     |acc: List<{ name: Bytes, params: Int, read: Bool, doc: Bool }>, item: Item|
       match item {
         IFn(d) ->
-          push(acc, {
+          acc.push({
             name: d.name.name,
-            params: len(d.params),
+            params: d.params.len(),
             read: d.transparent != None,
             doc: d.doc != None,
           }),
@@ -2424,19 +2399,18 @@ test "a schema is also the definitions its instantiations call, `transparent` an
 test "a tagged literal and a `try` in a schema or in what a law instantiates one with are read once" {
   let schema = b"law schema s(f: (Int) -> Int) forall (x: Int) where x > hex\"01\" { f(x) == hex\"02\" }\n";
   let made = b"law \"l\" = s(|n: Int| n + hex\"03\")\n";
-  let over = expand(parse(bytes_concat(schema, made)).node, []).module;
-  assert_eq(map(tagged_in(over), |t: Tagged| t.text), [b"01", b"02", b"03"]);
+  let over = expand(parse(schema.concat(made)).node, []).module;
+  assert_eq(tagged_in(over).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
   // Once resolved, an instantiation's guard holds the arguments its body does.
-  let resolved = map(over.items, |item: Item|
+  let resolved = over.items.map(|item: Item|
     match item { ILaw(d) -> ILaw({ ..d, guard: Some(d.body) }), _ -> item });
-  assert_eq(map(tagged_in({ ..over, items: resolved }), |t: Tagged| t.text), [b"01", b"02", b"03"]);
-  let refused = |src: Bytes| string_contains(dump_expanded(src), "!E0118");
-  assert(!refused(schema) && !refused(bytes_concat(schema, made)));
-  assert(refused(bytes_concat(b"type Mine = | Ok(Int) | Fine\n", schema)));
+  assert_eq(tagged_in({ ..over, items: resolved }).map(|t: Tagged| t.text), [b"01", b"02", b"03"]);
+  let refused = |src: Bytes| dump_expanded(src).contains("!E0118");
+  assert(!refused(schema) && !refused(schema.concat(made)));
+  assert(refused(b"type Mine = | Ok(Int) | Fine\n".concat(schema)));
   assert(
     refused(
-      bytes_concat(
-        b"type Mine = | Ok(Int) | Fine\nlaw schema s(f: (Int) -> Int) forall (x: Int) { f(x) == x }\n",
+      b"type Mine = | Ok(Int) | Fine\nlaw schema s(f: (Int) -> Int) forall (x: Int) { f(x) == x }\n".concat(
         made,
       ),
     ),

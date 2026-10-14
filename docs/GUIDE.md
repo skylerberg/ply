@@ -854,7 +854,7 @@ and `Chan` are refused (`E0206`).
 
 `#[a, b]` is a set, `std.set`'s `Set<a>`, each element once in `compare`
 order, which `show` writes back as the literal (`ply doc std.set`). It is no
-`Map`, and is built by `std.set`'s `of_list`: a module that writes one imports
+`Map`, and is built by `std.set`'s `Set::of_list`: a module that writes one imports
 `std.set` itself, under a name no source can write, so `std.set` writes none.
 
 ### 4.4 Sum types
@@ -1858,7 +1858,7 @@ one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
 recursive group with one in a member's body nests (§5.7), a `?` inside one is
 `E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
 own. An `Err` goes back to its raise through a function:
-`result_unwrap_or_else(r, |e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
+`r.unwrap_or_else(|e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
 
 The prelude declares `effect abort { raise raise(message: String) }`.
 `abort.raise(m)` is that raise, and so is everything else that can fail on a
