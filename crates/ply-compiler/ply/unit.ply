@@ -10,7 +10,7 @@ import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBy
              no_tables, without, literal_bits, specialisation_of, own_definition, digits,
              ctor_layouts, spelled_field, GenericCall, Generics, Need, FnArg, specialised,
              specialised_with, Pass, root_id, type_spelled, laid_vars, has_vars, held_apart,
-             ctor_sums, equality_of)
+             ctor_sums, derived_of, Reads, Scalar, Layout, Exact, type_vars, erased)
 import front (Dump, EmitterRoot, EmitterCtor, KeyRow, Linked, ModuleRow, OrdinalRow, analyse,
               dump_of, module_of_root)
 import typing (unknown_type)
@@ -660,8 +660,9 @@ fn exports_text(
           )),
       )
     },
-    // The runtime lays a `Decimal`, a bytes slice and an `Option` out as this unit's C reads them:
-    // `RAW_DECIMALS`, `BYTES_VIEWS` and `OPTION_WORDS` in `exports.rs`.
+    // The runtime lays an `Int`, a `Decimal`, a bytes slice and an `Option` out as this unit's C
+    // reads them: `RAW_INTS`, `RAW_DECIMALS`, `BYTES_VIEWS` and `OPTION_WORDS` in `exports.rs`.
+    b"ints held raw\n",
     b"decimals held raw\n",
     b"bytes slices are views\n",
     b"options held as their payload's word\n",
@@ -1390,7 +1391,9 @@ fn emitter_answers(
     {
       names: ctors.map(|c: Ctor| c.name),
       laid: ctor_layouts(dump.ctors),
-      keyed: [],
+      // Program-wide: a specialisation is emitted where its definition is, which may not import
+      // the module stating a `key` for the type it is at.
+      keyed: dump.emitter_ctors.filter(|c: EmitterCtor| c.key != None).map(|c: EmitterCtor| c.name),
       sums: ctor_sums(dump.ctors),
     },
     runtime.builtins,
@@ -1752,7 +1755,7 @@ fn closed_rounds<| e>(
     match a {
       Body(b) -> {
         let specialised_calls = b.tables.calls.fold(acc, |m: Map<Bytes, Bool>, c: Bytes|
-          if (specialisation_of(c) != None || equality_of(c) != None) && !had.answers.contains(c) {
+          if (specialisation_of(c) != None || derived_of(c) != None) && !had.answers.contains(c) {
             m.insert(c, true)
           } else { m });
         b.tables.generics.calls.fold(specialised_calls, |m: Map<Bytes, Bool>, g: GenericCall|
@@ -1874,11 +1877,14 @@ fn widened(
       Some(spelled) -> match type_spelled(spelled) {
         None -> a,
         Some(arg) -> {
-          let vars = if need.layout { laid_vars(arg) }
-          else { match arg { TyVar(v) -> if v >= 0 { [v] } else { [] }, _ -> [] } };
+          let vars = match need.reads {
+            Exact -> type_vars(arg),
+            Layout -> laid_vars(arg),
+            Scalar -> match arg { TyVar(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
+          };
           vars.fold(a, |m: Map<Bytes, List<Need>>, v: Int| {
             let had = match m.get(n) { Some(ns) -> ns, None -> [] };
-            let more = { var: v, layout: need.layout };
+            let more = { var: v, reads: need.reads };
             if had.contains(more) { m } else { m.insert(n, had.push(more)) }
           })
         },
@@ -1901,10 +1907,11 @@ fn settled_root(
       Some(spelled) -> match type_spelled(spelled) { Some(t) -> t, None -> unknown_type() },
       None -> unknown_type(),
     };
-    if call.carried.contains(j) { arg }
+    if call.carried.contains(j) { erased(arg) }
     else if has_vars(arg) { unknown_type() }
-    else if ns.contains({ var: j, layout: true }) { arg }
-    else if ns.contains({ var: j, layout: false }) && held_apart(arg) { arg }
+    else if ns.contains({ var: j, reads: Exact }) { arg }
+    else if ns.contains({ var: j, reads: Layout }) { erased(arg) }
+    else if ns.contains({ var: j, reads: Scalar }) && held_apart(arg) { erased(arg) }
     else { unknown_type() }
   });
   // A lambda is run in place only by a callee that calls the parameter it is handed as.
@@ -2108,17 +2115,22 @@ fn generic_body(calls: List<GenericCall>, needs: List<Need>) -> Answer =
 
 test "a generic call settles on each argument its callee's code needs, and leaves the rest" {
   let needs = Map::of_entries([
-    { key: b"m.lay", value: [{ var: 0, layout: true }] },
-    { key: b"m.add", value: [{ var: 0, layout: false }] },
+    { key: b"m.lay", value: [{ var: 0, reads: Layout }] },
+    { key: b"m.add", value: [{ var: 0, reads: Scalar }] },
+    { key: b"m.same", value: [{ var: 0, reads: Exact }] },
   ]);
   let call = |callee: Bytes, arg: Bytes|
     settled_root({ callee: callee, args: [arg], carried: [], fns: [] }, needs, Map::new());
-  // A layout the code reads is kept, a known word among them.
+  // A layout the code reads is kept, a known word among them; a type it reads is kept whole.
   assert_eq(call(b"m.lay", b"{x:Float}"), b"m.lay@{x:Float}");
   assert_eq(call(b"m.lay", b"_"), b"m.lay@_");
+  assert_eq(call(b"m.lay", b"{x:m.Shape}"), b"m.lay@{x:_}");
+  assert_eq(call(b"m.same", b"List<m.Shape>"), b"m.same@List<m.Shape>");
+  assert_eq(call(b"m.same", b"m.Date{day:Int}"), b"m.same@m.Date{day:Int}");
   // A scalar its operators read is kept; a record they do not read is not.
   assert_eq(call(b"m.add", b"Float"), b"m.add@Float");
   assert_eq(call(b"m.add", b"{x:Float}"), b"m.add");
+  assert_eq(call(b"m.add", b"m.Shape"), b"m.add");
   // An argument the caller does not know yet, or a callee that needs nothing, is the generic body.
   assert_eq(call(b"m.lay", b"{x:'0}"), b"m.lay");
   assert_eq(call(b"m.none", b"Float"), b"m.none")
@@ -2152,8 +2164,8 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
 
 test "a generic body needs what its callees need of what it hands them, through its own variables" {
   let answers = Map::of_entries([
-    { key: b"m.add", value: generic_body([], [{ var: 0, layout: false }]) },
-    { key: b"m.lay", value: generic_body([], [{ var: 0, layout: true }]) },
+    { key: b"m.add", value: generic_body([], [{ var: 0, reads: Scalar }]) },
+    { key: b"m.lay", value: generic_body([], [{ var: 0, reads: Layout }]) },
     // `wrap` hands its variable to `add` bare and to `lay` inside a record.
     {
       key: b"m.wrap",
@@ -2173,10 +2185,17 @@ test "a generic body needs what its callees need of what it hands them, through 
         [],
       ),
     },
+    { key: b"m.same", value: generic_body([], [{ var: 0, reads: Exact }]) },
+    // `each` hands its variable inside a list to `same`, which reads the whole of it.
+    {
+      key: b"m.each",
+      value: generic_body([{ callee: b"m.same", args: [b"List<'0>"], carried: [], fns: [] }], []),
+    },
   ]);
   let closed = closed_needs(answers);
-  assert_eq(closed.get(b"m.wrap"), Some([{ var: 0, layout: false }, { var: 1, layout: true }]));
-  assert_eq(closed.get(b"m.outer"), Some([{ var: 0, layout: true }]))
+  assert_eq(closed.get(b"m.wrap"), Some([{ var: 0, reads: Scalar }, { var: 1, reads: Layout }]));
+  assert_eq(closed.get(b"m.outer"), Some([{ var: 0, reads: Layout }]));
+  assert_eq(closed.get(b"m.each"), Some([{ var: 0, reads: Exact }]))
 }
 
 test "a definition's hash is read under its own name, or under `compiler.` where the program ships the compiler" {

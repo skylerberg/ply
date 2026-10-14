@@ -328,9 +328,11 @@ impl<'l> Writer<'l> {
         Ok(())
     }
 
-    /// A scalar as the object of it is written: its tag, a width's place, and its words.
+    /// A scalar as the object of it is written: its tag, a width's place, and its words. An `Int`
+    /// held as its 64 bits is written as the object that boxes it.
     fn scalar(&mut self, slot: Slot, words: &[Word]) {
         match slot {
+            Slot::Int => self.out.push(INT),
             Slot::Float => self.out.push(FLOAT),
             Slot::Wide(t) => {
                 self.out.push(FIXED);
@@ -607,14 +609,7 @@ impl<'a> Reader<'a> {
                     heap::inc(*part);
                 }
                 self.held.extend(done.parts.iter().copied());
-                let fields: Vec<(Symbol, Word)> = self
-                    .layouts
-                    .shape_names(shape)
-                    .iter()
-                    .cloned()
-                    .zip(done.parts)
-                    .collect();
-                self.heap.record(self.layouts, &fields)
+                self.heap.record_shaped(self.layouts, shape, &done.parts)
             }
             Make::Ctor { index } => {
                 for part in &done.parts {

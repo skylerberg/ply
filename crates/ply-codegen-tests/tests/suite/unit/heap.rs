@@ -345,8 +345,8 @@ fn a_record_is_laid_out_in_sorted_field_order_whatever_order_it_was_written_in()
     let shape = unsafe { (*o).layout };
     assert_eq!(l.offset(shape, &Symbol::new("a")), Some(0));
     assert_eq!(l.offset(shape, &Symbol::new("z")), Some(1));
-    assert_eq!(as_int(unsafe { word_at(o, 0) }), Some(1));
-    assert_eq!(as_int(unsafe { word_at(o, 1) }), Some(26));
+    assert_eq!(unsafe { word_at(o, 0) } as i64, 1);
+    assert_eq!(unsafe { word_at(o, 1) } as i64, 26);
 }
 
 #[test]

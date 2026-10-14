@@ -73,10 +73,14 @@ pub struct Exports {
     /// Each constructor whose type's module states a `numeric`, with its functions in the
     /// order of [`ply_eval::instances`]' roles, spelled as the others are. Each has a row above.
     pub numerics: Vec<(Symbol, [String; 5])>,
-    /// How the unit's C reads a `Decimal`, a bytes slice and an `Option`, as its [`RAW_DECIMALS`],
-    /// [`BYTES_VIEWS`] and [`OPTION_WORDS`] lines say.
+    /// How the unit's C reads an `Int`, a `Decimal`, a bytes slice and an `Option`, as its
+    /// [`RAW_INTS`], [`RAW_DECIMALS`], [`BYTES_VIEWS`] and [`OPTION_WORDS`] lines say.
     pub layout: RecordLayout,
 }
+
+/// A line after a unit's tables, where its C reads an `Int`, or a width below 64 bits, that a record,
+/// an array or a constructor holds as its own 64 bits; a unit without it reads the word.
+pub const RAW_INTS: &str = "ints held raw";
 
 /// A line after a unit's tables, where its C reads a `Decimal` a record, an array or a constructor
 /// holds as its two words. A unit without it was emitted by a `ply` that reads the `Decimal`'s word,
@@ -171,6 +175,9 @@ impl Exports {
                 out.push('\n');
             }
         }
+        if self.layout.raw_ints {
+            out.push_str(&format!("{RAW_INTS}\n"));
+        }
         if self.layout.raw_decimals {
             out.push_str(&format!("{RAW_DECIMALS}\n"));
         }
@@ -245,12 +252,14 @@ impl Exports {
         // What layout its C reads, a line each, in any order; one this runtime does not know reads
         // as nothing.
         let mut layout = RecordLayout {
+            raw_ints: false,
             raw_decimals: false,
             bytes_views: false,
             option_words: false,
         };
         while at < s.len() {
             match line(s, &mut at)? {
+                RAW_INTS => layout.raw_ints = true,
                 RAW_DECIMALS => layout.raw_decimals = true,
                 BYTES_VIEWS => layout.bytes_views = true,
                 OPTION_WORDS => layout.option_words = true,

@@ -8,7 +8,6 @@ use crate::heap::{
     self, Heap, KIND_COLUMNS, KIND_RECORD, Layouts, Obj, Word, dec, field_word, inc, is_unique,
     obj, set_word, word_at,
 };
-use ply_eval::Symbol;
 
 /// How many records it holds.
 pub fn len(o: *mut Obj) -> usize {
@@ -22,13 +21,11 @@ pub fn column(o: *mut Obj, k: usize) -> *mut Obj {
 
 /// Record `i`, made of each field's element `i`.
 pub fn record(heap: &mut Heap, layouts: &Layouts, o: *mut Obj, i: usize) -> Word {
-    let names = layouts.shape_names(unsafe { (*o).layout });
-    let fields: Vec<(Symbol, Word)> = names
-        .iter()
-        .enumerate()
-        .map(|(k, name)| (name.clone(), array::element(heap, layouts, column(o, k), i)))
+    let shape = unsafe { (*o).layout };
+    let words: Vec<Word> = (0..layouts.shape_names(shape).len())
+        .map(|k| array::element(heap, layouts, column(o, k), i))
         .collect();
-    heap.record(layouts, &fields)
+    heap.record_shaped(layouts, shape, &words)
 }
 
 /// Every record, each made of its fields' elements.
