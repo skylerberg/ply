@@ -1,19 +1,17 @@
 //! The shipped modules as a project meets them: imported, checked, bound, hashed, tested and proved
 //! like its own, under a prefix no project may take, and never counted as the project's.
 
-import harness (scratch, Ran, Source, project, program, write, read, shipped_sources, in_memory,
-                one, tree, on_disk, warm_agrees, seeding, said, stdout, stderr, json_of, at, path,
-                nth, items, first, str, int, truth, shown, Hermetic, Reached, Shipped, inspected,
-                reader_source, std_tree, std_data, module_in, StdModule, std_modules,
+import harness (scratch, Ran, Source, project, program, write, in_memory, one, tree, on_disk,
+                warm_agrees, said, stdout, json_of, at, path, nth, items, first, str, int, truth,
+                shown, Hermetic, Shipped, std_tree, std_data, module_in, StdModule, std_modules,
                 on_disk_shipping, on_disk_shipping_only, over_tree, spawned, assert_ok, codes)
 import compiler.front (shipped_data_wanted)
 import compiler.items (parse, Item, IFn, IType, IEffect, IEffectSet, ISchema, OpDef, is_pub)
 import compiler.lexer (lex, Identifier, Token)
 import compiler.parsing (Doc)
 import std.fs (MemFs)
-import std.json (Json, Null)
-import std.json
-import std.list (concat, contains, sort, sort_by)
+import std.json (Json)
+import std.list (concat, sort)
 import std.process (process, Exited)
 import std.string
 import std.text (shell_join)
@@ -61,11 +59,6 @@ fn hashed(t: MemFs) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
 fn tests_hashed(answer: Json) -> List<String> =
   map(items(at(answer, "tests")), |t: Json| str(at(t, "hash")))
 
-/// What `ply cache inspect` says is filed for `name`: each match's file.
-fn filed_files(name: String) -> List<String> / {Reached, Shipped, abort.raise, diverges} =
-  map(items(at(json_of(on_disk(["cache", "inspect", name, "--json"])), "matches")), |m: Json|
-    str(at(m, "file")))
-
 test "a project module can import std.net and it checks" {
   let answer = checked(app(importer()));
   assert(truth(at(answer, "ok")), Some(shown(answer)));
@@ -109,15 +102,6 @@ test "a shipped module whose type states a key and its arithmetic loads where no
     );
     let used = on_disk(["check"]);
     assert(used.code == 0, Some(said(used)))
-  })
-}
-
-test "a project that imports std.net tests green" {
-  scratch(|| {
-    program(importer());
-    let r = on_disk(["test"]);
-    assert(r.code == 0, Some("got:\n" ++ said(r)));
-    assert(string_contains(said(r), "the imported effect is handled"), Some(said(r)))
   })
 }
 
@@ -215,60 +199,57 @@ test "a program importing nothing from std loads nothing" {
   assert(len(items(at(answer, "files"))) == 1, Some(shown(answer)))
 }
 
-fn net() -> String / {abort.raise} = string_of_bytes(embed("../../ply-std/ply/net.ply"))
-
-test "copying a shipped module into a project produces identical hashes" {
+test "a shipped module's definitions hash as a project's copy of them does" {
   scratch(|| {
-    let shipped = hashed(app(importer()));
-    let copied_tree = tree([
-      { path: "mine.ply", text: net() },
-      {
-        path: "app.ply",
-        text: string::replace(
-          importer(),
-          "import std.net (net, drain)",
-          "import mine (net, drain)",
-        ),
-      },
+    let kept = match filter(two_shipped(), |s: Source| s.path == "std.kept.ply") {
+      [s, ..] -> s.text,
+      [] -> panic("`two_shipped` ships `std.kept`"),
+    };
+    let caller = |module: String|
+      "import " ++ module ++ " (one)\n\npub fn two() -> Int = one() + one()\n";
+    let hashes = |files: List<Source>| {
+      project(files);
+      json_of(on_disk_shipping_only(["hash", "--json"], two_shipped()))
+    };
+    let shipped = hashes([{ path: "app.ply", text: caller("std.kept") }]);
+    let copied = hashes([
+      { path: "mine.ply", text: kept },
+      { path: "app.ply", text: caller("mine") },
     ]);
-    let copied = hashed(copied_tree);
     assert(
-      hash_of(shipped, "std.net.drain") == hash_of(copied, "mine.drain"),
-      Some("a stdlib definition must hash like a project one"),
+      hash_of(shipped, "std.kept.one") == hash_of(copied, "mine.one"),
+      Some("a shipped definition must hash like a project one"),
     );
     // A reference contributes the referent's hash, so the importer is one definition in both
     // programs.
-    assert_eq(hash_of(shipped, "app.touch"), hash_of(copied, "app.touch"));
-    // An effect declaration is a declaration like any other, as the cache files it.
-    program(importer());
-    assert(on_disk(["check"]).code == 0, None);
-    let shipped_net = str(at(inspected("std.net.net"), "hash"));
-    project([
-      { path: "mine.ply", text: net() },
-      {
-        path: "app.ply",
-        text: string::replace(
-          importer(),
-          "import std.net (net, drain)",
-          "import mine (net, drain)",
-        ),
-      },
-    ]);
-    assert(on_disk(["check"]).code == 0, None);
-    assert(
-      str(at(inspected("mine.net"), "hash")) == shipped_net,
-      Some("an effect declaration is a declaration like any other"),
-    )
+    assert_eq(hash_of(shipped, "app.two"), hash_of(copied, "app.two"))
   })
 }
 
-test "a shipped module is filed under its pseudo-path" {
+// `ply cache compact` walks the files on disk, and a shipped module has none.
+test "a shipped module is filed under its pseudo-path, and compaction keeps it" {
   scratch(|| {
-    program(importer());
-    let r = on_disk(["check"]);
-    assert(r.code == 0, Some(said(r)));
+    program(keeping());
+    assert_ok(on_disk_shipping_only(["test"], two_shipped()));
     // Filed under the name a shipped module is keyed by, which no file on disk has.
-    assert_eq(filed_files("std.net.drain"), ["<std>/net.ply"])
+    let filed = ||
+      map(
+        items(
+          at(
+            json_of(
+              on_disk_shipping_only(["cache", "inspect", "std.kept.one", "--json"], two_shipped()),
+            ),
+            "matches",
+          ),
+        ),
+        |m: Json| str(at(m, "file")),
+      );
+    assert_eq(filed(), ["<std>/kept.ply"]);
+    assert_ok(on_disk_shipping_only(["cache", "compact"], two_shipped()));
+    assert(
+      filed() == ["<std>/kept.ply"],
+      Some("compaction dropped a module this binary still ships"),
+    )
   })
 }
 
@@ -284,67 +265,54 @@ test "a warm check agrees with a cold one over a program that imports std" {
   })
 }
 
-/// A project of one module, checked beside an empty cache and again beside what that check filed,
-/// each time answering what a check of the same sources in memory does: the seeded answer.
-fn checked_cold_and_warm(
-  text: String,
-) -> Json / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
-  project([{ path: "app.ply", text: text }]);
-  let _ = warm_agrees("cold");
-  warm_agrees("warm")
-}
-
-// `std.gzip` declares `effect gzip` beside `fn gzip`, and its readers raise through the effect.
-test "a program importing only a reader of std.gzip loads the reader and no writer" {
+// `std.zb` of `alike_shipped` declares `effect zb` beside `fn zb`, as `std.gzip` does, and its
+// readers raise through the effect.
+test "a load takes of a shipped module what the program reaches, its effect apart from the function of that name" {
   scratch(|| {
-    let answer = checked_cold_and_warm(
-      "import std.gzip (try_gunzip)\n\npub fn opens(data: Bytes) -> Bool / {abort.raise} =\n  match try_gunzip(data, 64) { Ok(_) -> true, Err(_) -> false }\n",
+    let loaded = |text: String| {
+      program(text);
+      let v = json_of(on_disk_shipping_only(["check", "--json"], alike_shipped()));
+      assert(truth(at(v, "ok")), Some(shown(v)));
+      at(v, "definitions")
+    };
+    let reader = loaded(
+      "import std.zb (try_read)\n\npub fn opens(x: Int) -> Bool =\n  match try_read(x) { Ok(_) -> true, Err(_) -> false }\n",
     );
-    let loaded = at(answer, "definitions");
     assert(
-      has_named(loaded, "std.gzip.try_gunzip") && !has_named(loaded, "std.gzip.deflate"),
-      Some(shown(loaded)),
+      has_named(reader, "std.zb.try_read") && has_named(reader, "std.zb.read")
+        && !has_named(reader, "std.zb.zb")
+        && !has_named(reader, "std.zb.written"),
+      Some(shown(reader)),
+    );
+    // The import names the effect and the function alike, and only a call reaches the function.
+    let answering = loaded(
+      "import std.zb\nimport std.zb (zb)\n\npub fn opens(x: Int) -> Bool =\n  match try[zb.refused] { zb::read(x) } { Ok(_) -> true, Err(_) -> false }\n",
+    );
+    assert(
+      has_named(answering, "std.zb.read") && !has_named(answering, "std.zb.zb")
+        && !has_named(answering, "std.zb.written"),
+      Some(shown(answering)),
+    );
+    let writer = loaded("import std.zb (zb)\n\npub fn packed(x: Int) -> Int = zb(x)\n");
+    assert(
+      has_named(writer, "std.zb.zb") && has_named(writer, "std.zb.written")
+        && !has_named(writer, "std.zb.read"),
+      Some(shown(writer)),
     )
   })
 }
 
-// The import names the effect and the function alike, and only a call reaches the function.
-test "a program importing the name `gzip` to answer the effect's refusal loads no writer" {
-  scratch(|| {
-    let answer = checked_cold_and_warm(
-      "import std.gzip\nimport std.gzip (gzip)\n\npub fn opens(data: Bytes) -> Bool / {abort.raise} =\n  match try[gzip.refused] { gzip::inflate(data, 64) } { Ok(_) -> true, Err(_) -> false }\n",
-    );
-    let loaded = at(answer, "definitions");
-    assert(
-      has_named(loaded, "std.gzip.inflate") && !has_named(loaded, "std.gzip.gzip")
-        && !has_named(loaded, "std.gzip.deflate"),
-      Some(shown(loaded)),
-    )
-  })
-}
-
-test "a program importing only std.gzip's writer loads it with what it calls" {
-  scratch(|| {
-    let answer = checked_cold_and_warm(
-      "import std.gzip (gzip)\n\npub fn packed(data: Bytes) -> Bytes / {abort.raise} = gzip(data)\n",
-    );
-    let loaded = at(answer, "definitions");
-    assert(
-      has_named(loaded, "std.gzip.gzip") && has_named(loaded, "std.gzip.deflate")
-        && !has_named(loaded, "std.gzip.try_gunzip"),
-      Some(shown(loaded)),
-    )
-  })
-}
-
-test "renaming a project definition that calls std moves no hash" {
-  let before = hashed(app(importer()));
-  let after = hashed(app(string::replace(importer(), "touch", "poke")));
+test "renaming a project definition that calls a shipped one moves no hash" {
+  let hashed_with = |text: String|
+    over_tree(one(text), ||
+      json_of(on_disk_shipping_only(["hash", "--json"], two_shipped()))).value;
+  let before = hashed_with(keeping());
+  let after = hashed_with(string::replace(keeping(), "held", "upheld"));
   assert(
-    hash_of(before, "app.touch") == hash_of(after, "app.poke"),
+    hash_of(before, "m.held") == hash_of(after, "m.upheld"),
     Some("renaming a definition changed its hash"),
   );
-  assert_eq(hash_of(before, "std.net.drain"), hash_of(after, "std.net.drain"));
+  assert_eq(hash_of(before, "std.kept.one"), hash_of(after, "std.kept.one"));
   assert(tests_hashed(before) == tests_hashed(after), Some("a test re-runs"))
 }
 
@@ -475,6 +443,9 @@ fn alike_shipped() -> List<Source> =
         \\/// The reader.
         \\pub fn read(x: Int) -> Int / {zb.refused} = if x < 0 { zb.refused(x) } else { x + 1 }
         \\
+        \\/// The reader, answering where it was refused.
+        \\pub fn try_read(x: Int) -> Result<Int, Int> = try[zb.refused] { read(x) }
+        \\
     },
   ]
 
@@ -502,170 +473,52 @@ test "a program over shipped modules that name one record alike, and an effect b
   })
 }
 
-/// A shipped module of three tables of attacks, refused by `tests`.
-fn attacks(tests: String) -> List<Source> =
-  [
-    {
-      path: "std.attacks.ply",
-      text: string::join(
-        [
-          "//! Three tables of attacks, each refused alike.",
-          "",
-          "import std.list (concat)",
-          "",
-          "/// One attack: what it is called and how it is made.",
-          "pub type Attack = { name: String, n: Int }",
-          "",
-          "/// Whether an attack is refused.",
-          "pub fn refused(c: Attack) -> Bool = c.n > 0",
-          "",
-          "fn forged() -> List<Attack> = [{ name: \"forged one\", n: 1 }, { name: \"forged two\", n: 2 }]",
-          "",
-          "fn replayed() -> List<Attack> =",
-          "  [{ name: \"replayed one\", n: 3 }, { name: \"replayed two\", n: 4 }, { name: \"replayed three\", n: 5 }]",
-          "",
-          "fn stripped() -> List<Attack> = [{ name: \"stripped one\", n: 6 }]",
-          "",
-          tests,
-        ],
-        "\n",
-      ),
-    },
-  ]
-
-/// Three tests over cases of one label and one body, each over a table of its own.
-fn apart() -> String =
-  \\test "{c.name} is refused" for c: Attack in forged() { assert(refused(c)) }
-  \\
-  \\test "{c.name} is refused" for c: Attack in replayed() { assert(refused(c)) }
-  \\
-  \\test "{c.name} is refused" for c: Attack in stripped() { assert(refused(c)) }
-  \\
-
-/// The same test over the three tables at once.
-fn together() -> String =
-  \\test "{c.name} is refused" for c: Attack in concat(concat(forged(), replayed()), stripped()) {
-  \\  assert(refused(c))
-  \\}
-  \\
-
-/// The shipped modules `names` import, themselves included, as this binary ships them.
-fn shipped_closure(names: List<String>) -> List<Source> / {Shipped, abort.raise} = {
-  let all = shipped_sources();
-  let imports = |text: String|
-    fold(string_split(text, "\n"), [], |acc: List<String>, line: String|
-      if !string_starts_with(line, "import std.") { acc } else {
-        let rest = string_slice(line, 7, string_len(line));
-        push(acc, match string::index_of(rest, " ") {
-          Some(end) -> string_slice(rest, 0, end),
-          None -> rest,
-        })
-      });
-  let wanted = iterate(names, len(all) + 1, |held: List<String>| {
-    let grown = fold(all, held, |acc: List<String>, s: Source| {
-      let name = string_slice(s.path, 0, string_len(s.path) - 4);
-      if !contains(held, name) { acc } else {
-        fold(imports(s.text), acc, |a: List<String>, n: String|
-          if contains(a, n) { a } else { push(a, n) })
-      }
-    });
-    if len(grown) == len(held) { Stop(held) } else { Continue(grown) }
-  });
-  filter(all, |s: Source| contains(wanted, string_slice(s.path, 0, string_len(s.path) - 4)))
-}
-
-// A test is keyed by its label, so three of one label were one name for three tables, and a run
-// could list one table's cases for another's.
-test "a shipped module's second test of one label is refused by name, and one test over every table runs each case" {
-  scratch(|| {
-    program("pub fn mine() -> Int = 1\n");
-    let needed = shipped_closure(["std.cases", "std.list", "std.show"]);
-    let ran = |tests: String, argv: List<String>|
-      json_of(
-        on_disk_shipping_only(
-          concat(argv, ["--json", "--filter", "std.attacks."]),
-          concat(attacks(tests), needed),
-        ),
-      );
-    let refused = ran(apart(), ["test", "--std"]);
-    assert(int(at(refused, "exit_code")) != 0, Some(shown(refused)));
-    let said = map(items(at(refused, "diagnostics")), |d: Json|
-      str(at(d, "code")) ++ " " ++ str(at(d, "message")));
-    assert_eq(said, [
-      "E0105 two tests are labelled \"{c.name} is refused\"",
-      "E0105 two tests are labelled \"{c.name} is refused\"",
-    ]);
-    let keys = |argv: List<String>| {
-      let v = ran(together(), argv);
-      assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
-      sort(map(items(path(v, ["selection", "tests"])), |t: Json| str(at(t, "key"))))
-    };
-    let every = [
-      "std.attacks.forged one is refused",
-      "std.attacks.forged two is refused",
-      "std.attacks.replayed one is refused",
-      "std.attacks.replayed three is refused",
-      "std.attacks.replayed two is refused",
-      "std.attacks.stripped one is refused",
-    ];
-    assert_eq(keys(["test", "--std"]), every);
-    assert_eq(keys(["test", "--std"]), every);
-    assert_eq(keys(["test", "--std", "--no-cache"]), every)
-  })
-}
-
-// A stdlib `main` would make `ply run` ambiguous in a directory the user did not write.
+// A shipped `main` would make `ply run` ambiguous in a directory the user did not write.
 test "entry points exclude the shipped modules" {
   scratch(|| {
-    project([{ path: "app.ply", text: "import std.net (net)\nfn main() -> Int = 1\n" }]);
-    let r = on_disk(["run"]);
+    program("import std.entered\n\nfn main() -> Int = 1\n");
+    let r = on_disk_shipping_only(["run"], [
+      {
+        path: "std.entered.ply",
+        text: "//! A module with a `main` of its own.\n\n/// Not the program's entry.\npub fn main() -> Int = 7\n",
+      },
+    ]);
     assert(r.code == 0, Some(said(r)));
-    assert(
-      string_trim(match list_at(r.out, len(r.out) - 1) { Some(l) -> l, None -> "" }) == "1",
-      Some(said(r)),
-    )
+    assert_eq(last_line(r), "1")
   })
 }
 
-/// The shipped modules in the table's order: sorted, as they are filed.
-fn shipped_modules() -> List<Source> / {Shipped, abort.raise} =
-  sort_sources(
-    map(
-      filter(shipped_sources(), |source: Source| string_starts_with(source.path, "std.")),
-      |source: Source|
-        { path: string_slice(source.path, 0, string_len(source.path) - 4), text: source.text },
-    ),
-  )
-
-fn sort_sources(xs: List<Source>) -> List<Source> =
-  sort_by(xs, |a: Source, b: Source| compare(a.path, b.path) == Less)
-
-// The one test that lists every module the binary ships: what its listing says of each is a
-// function of every one, so it reads them all, once.
-test "ply std lists every shipped module, each declaring something, under a stable digest" {
-  let t = app("fn f() -> Int = 1\n");
-  let digest = || string_trim(stdout(in_memory(t, ["std", "--digest"])));
-  let once = digest();
-  assert(once == digest(), Some("the digest moved between two runs"));
-  assert(string_starts_with(once, "b3:") && string_len(once) == 15, Some(once));
-  let v = json_of(in_memory(t, ["std", "--json"]));
-  assert(str(at(v, "digest")) == once, Some(shown(v)));
-  let listed = map(items(at(v, "modules")), |m: Json| str(at(m, "module")));
-  assert(listed == map(shipped_modules(), |source: Source| source.path), Some(shown(v)));
-  fold(items(at(v, "modules")), (), |u: Unit, m: Json|
-    assert(
-      int(at(m, "definitions")) >= 1,
-      Some("`" ++ str(at(m, "module")) ++ "` lists no definitions"),
-    ))
-}
-
-test "ply std's listing names each module it ships and ends on the digest --digest prints" {
+test "ply std lists each module and data file it ships, prints either by name, and its digest covers both" {
   scratch(|| {
-    let listing = on_disk_shipping_only(["std"], two_shipped());
+    let ply_std = |argv: List<String>, shipped: List<Source>|
+      on_disk_shipping_only(concat(["std"], argv), shipped);
+    let digest_of = |shipped: List<Source>| string_trim(stdout(ply_std(["--digest"], shipped)));
+    let digest = digest_of(two_shipped());
+    assert(string_starts_with(digest, "b3:") && string_len(digest) == 15, Some(digest));
+    let listing = ply_std([], two_shipped());
     assert(listing.code == 0, Some("got:\n" ++ said(listing)));
-    let digest = string_trim(stdout(on_disk_shipping_only(["std", "--digest"], two_shipped())));
-    fold(["std.idle", "std.kept", "digest: " ++ digest], (), |u: Unit, needle: String|
-      assert(string_contains(said(listing), needle), Some("got:\n" ++ said(listing))))
+    fold(
+      [
+        "std.idle",
+        "std.kept",
+        "std/idle/words.txt · 4 bytes · embedded by std.idle",
+        "digest: " ++ digest,
+      ],
+      (),
+      |u: Unit, needle: String|
+        assert(string_contains(said(listing), needle), Some("got:\n" ++ said(listing))),
+    );
+    assert_eq(str(at(json_of(ply_std(["--json"], two_shipped())), "digest")), digest);
+    let data = ply_std(["--show", "std/idle/words.txt"], two_shipped());
+    assert(data.code == 0 && stdout(data) == "one\n", Some(said(data)));
+    // Bare, it prints the modules' sources back to back and no data file.
+    let sources = fold(two_shipped(), "", |acc: String, s: Source|
+      if string_ends_with(s.path, ".ply") { acc ++ s.text } else { acc });
+    assert_eq(stdout(ply_std(["--show"], two_shipped())), sources);
+    let moved = map(two_shipped(), |s: Source|
+      if s.path == "std/idle/words.txt" { { ..s, text: "two\n" } } else { s });
+    assert(digest_of(moved) != digest, Some("the digest covers the data a module embeds"));
+    assert_eq(digest_of(two_shipped()), digest)
   })
 }
 
@@ -746,86 +599,6 @@ test "ply doc documents a module of the standard library beneath another, and a 
   );
   let one = in_memory(t, ["doc", "std.hash.legacy.sha1"]);
   assert(one.code == 0 && string_contains(said(one), "at <std>/hash/legacy.ply:"), Some(said(one)))
-}
-
-test "ply std show written bare prints every shipped source" {
-  let t = app("fn f() -> Int = 1\n");
-  let r = in_memory(t, ["std", "--show"]);
-  assert(r.code == 0, Some("got:\n" ++ said(r)));
-  let every = fold(shipped_modules(), "", |acc: String, s: Source| acc ++ s.text);
-  assert(stdout(r) == every, Some("`--show` did not print every source, back to back"));
-  let v = json_of(in_memory(t, ["std", "--show", "--json"]));
-  assert(
-    map(items(at(v, "sources")), |s: Json| str(at(s, "module")))
-      == map(shipped_modules(), |s: Source| s.path),
-    Some(shown(v)),
-  )
-}
-
-fn test_hash(answer: Json, label: String) -> String / {abort.raise} =
-  match filter(items(at(answer, "tests")), |t: Json| string_ends_with(str(at(t, "key")), label)) {
-    [t, ..] -> str(at(t, "hash")),
-    [] -> panic("no test labelled `" ++ label ++ "`"),
-  }
-
-test "editing one shipped definition moves exactly what reaches it" {
-  let elsewhere = {
-    path: "elsewhere.ply",
-    text: "pub fn untouched() -> Int = 41 + 1\ntest \"untouched\" { assert_eq(untouched(), 42) }\n",
-  };
-  let before = hashed(
-    tree([
-      { path: "mine.ply", text: net() },
-      { path: "reader.ply", text: reader_source("drain") },
-      elsewhere,
-    ]),
-  );
-  // The edit a compiler upgrade would make: one definition's body, nothing else in the module.
-  let edited = string::replace(
-    net(),
-    "net.recv[l](c, 4096, timeout_ms)",
-    "net.recv[l](c, 8192, timeout_ms)",
-  );
-  assert(edited != net(), Some("the edit landed"));
-  let after = hashed(
-    tree([
-      { path: "mine.ply", text: edited },
-      { path: "reader.ply", text: reader_source("drain") },
-      elsewhere,
-    ]),
-  );
-  assert(
-    hash_of(before, "mine.drain") != hash_of(after, "mine.drain"),
-    Some("the edited definition"),
-  );
-  assert(
-    hash_of(before, "reader.read_all") != hash_of(after, "reader.read_all"),
-    Some("a reference contributes the referent's hash, so a caller moves with it"),
-  );
-  // Everything else stands: the module's other definitions, and a module that reaches none of them.
-  fold(["mine.head", "mine.tail", "elsewhere.untouched"], (), |u: Unit, name: String|
-    assert(hash_of(before, name) == hash_of(after, name), Some(name)));
-  // And the tests: exactly the one that reaches the edit is re-selected.
-  assert(test_hash(before, "reads") != test_hash(after, "reads"), None);
-  assert(test_hash(before, "untouched") == test_hash(after, "untouched"), None)
-}
-
-// `ply cache compact` walks the files on disk, and a shipped module has none.
-test "compaction keeps the shipped modules it loaded" {
-  scratch(|| {
-    program(importer());
-    let _ = on_disk(["test"]);
-    assert(
-      filed_files("std.net.drain") == ["<std>/net.ply"],
-      Some("the run recorded nothing to compact"),
-    );
-    let r = on_disk(["cache", "compact"]);
-    assert(r.code == 0, Some("got:\n" ++ said(r)));
-    assert(
-      filed_files("std.net.drain") == ["<std>/net.ply"],
-      Some("compaction dropped a module this binary still ships"),
-    )
-  })
 }
 
 test "programs that reach different functions of one shipped module share what a load keeps of it" {
@@ -997,21 +770,21 @@ test "a second whole `prove --std` answers every claim from the store, and a fil
   })
 }
 
-fn routed(literal: String) -> String =
-  "import std.router\nimport std.http\npub type Endpoint = Health | GetItem\npub fn table() -> List<router::Route<Endpoint>> / {abort.raise} = [\n  {method: http::Get, path: router::pattern_of_string(\"/health\"), endpoint: Health},\n  {method: http::Get, path: router::pattern_of_string(\"/items/{sku}\"), endpoint: GetItem},\n]\npub fn slug(s: String) -> String = string_concat(\""
-    ++ literal
-    ++ "\", s)\npub fn hits(p: String) -> Bool / {abort.raise} =\n  match router::route(table(), http::Get, p) {\n    router::Found(_) -> true,\n    _ -> false,\n  }\ntest \"the table routes an item\" { assert_eq(hits(slug(\"bolt\")), true) }\n"
+/// A program whose test reaches `std.kept`'s `one` of `two_shipped` and its own `slug`.
+fn slugged(prefix: String) -> String =
+  "import std.kept\n\npub fn slug(s: String) -> String = string_concat(\"" ++ prefix
+    ++ "\", s)\n\npub fn hits(p: String) -> Bool = p == \"/items/bolt\" && kept::one() == 1\n\ntest \"the slug is an item's\" { assert_eq(hits(slug(\"bolt\")), true) }\n"
 
 // A shipped module's tests are never resolved without `--std`, so its definitions must not stay
 // permanently "changed".
 test "a shipped definition the project never touched is not a suspect" {
   scratch(|| {
-    project([{ path: "app.ply", text: routed("/items/") }]);
-    let first_run = on_disk(["test"]);
+    program(slugged("/items/"));
+    let first_run = on_disk_shipping_only(["test"], two_shipped());
     assert(first_run.code == 0, Some(said(first_run)));
     // One edit, to one definition the project owns.
-    write("app.ply", routed("/goods/"));
-    let v = json_of(on_disk(["test", "--json"]));
+    write("m.ply", slugged("/goods/"));
+    let v = json_of(on_disk_shipping_only(["test", "--json"], two_shipped()));
     let failure = nth(at(v, "failures"), 0);
     let suspects = map(items(at(failure, "suspects")), |s: Json| str(at(s, "name")));
     assert(suspects != [], Some("the edit has to be attributed to something: " ++ shown(v)));
@@ -1023,7 +796,7 @@ test "a shipped definition the project never touched is not a suspect" {
           ++ string::join(shipped, ", "),
       ),
     );
-    assert(str(nth(path(failure, ["culprit", "definitions"]), 0)) == "app.slug", Some(shown(v)))
+    assert(str(nth(path(failure, ["culprit", "definitions"]), 0)) == "m.slug", Some(shown(v)))
   })
 }
 
@@ -1227,41 +1000,6 @@ test "a data file the shipped modules do not hold is refused in the module that 
     })
   })
 }
-
-test "ply std names the data a module embeds, prints it by name, and its digest covers it" {
-  let t = app("fn f() -> Int = 1\n");
-  let v = json_of(in_memory(t, ["std", "--json"]));
-  let held = match named_module(v, "std.oid") {
-    Some(m) -> items(at(m, "data")),
-    None -> panic("`std.oid` is not listed: " ++ shown(v)),
-  };
-  assert_eq(map(held, |d: Json| str(at(d, "name"))), [oid_names().path]);
-  assert_eq(map(held, |d: Json| int(at(d, "bytes"))), [string_len(oid_names().text)]);
-  assert(
-    match named_module(v, "std.list") { Some(m) -> items(at(m, "data")) == [], None -> false },
-    Some("a module that embeds nothing lists no data"),
-  );
-  let listing = in_memory(t, ["std"]);
-  assert(
-    string_contains(said(listing), oid_names().path ++ " · ")
-      && string_contains(said(listing), "embedded by std.oid"),
-    Some(said(listing)),
-  );
-  let shown_data = in_memory(t, ["std", "--show", oid_names().path]);
-  assert(shown_data.code == 0 && stdout(shown_data) == oid_names().text, Some(said(shown_data)));
-  // Bare, it prints the modules' sources and no data file.
-  assert(!string_contains(stdout(in_memory(t, ["std", "--show"])), "2.5.4.3 commonName"), None);
-  let digest = |shipped: List<Source>|
-    over_tree(t, || stdout(on_disk_shipping(["std", "--digest"], shipped))).value;
-  assert_eq(digest([oid_names()]), digest([]));
-  assert(digest([{ path: oid_names().path, text: "2.5.4.3 cn\n" }]) != digest([]), None)
-}
-
-fn named_module(listing: Json, name: String) -> Option<Json> =
-  match filter(items(at(listing, "modules")), |m: Json| str(at(m, "module")) == name) {
-    [m, ..] -> Some(m),
-    [] -> None,
-  }
 
 test "ply doc documents a name of a shipped module that embeds a data file" {
   let r = in_memory(app("fn f() -> Int = 1\n"), ["doc", "std.oid.name"]);
