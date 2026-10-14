@@ -72,55 +72,6 @@ macro_rules! builtins {
     (@raises ends) => { false };
 }
 
-/// The builtins a unit of the last release names by the function's name alone.
-const BARE_TO_THE_RELEASE: &[&str] = &[
-    "Float::acos",
-    "Float::asin",
-    "Float::atan",
-    "Float::atan2",
-    "Float::ceil",
-    "Float::cos",
-    "Float::exp",
-    "List::filter",
-    "Float::floor",
-    "List::fold",
-    "Float::hypot",
-    "List::len",
-    "Float::ln",
-    "Float::log10",
-    "Float::log2",
-    "List::map",
-    "Float::pow",
-    "List::push",
-    "Float::round",
-    "Float::sin",
-    "Float::sqrt",
-    "Float::tan",
-];
-
-impl Builtin {
-    /// The name a unit of the last release has for the builtin, where it differs: `Map::get` for
-    /// `Map::get`.
-    pub fn to_the_release(self) -> Option<String> {
-        let (of, name) = self.name().split_once("::")?;
-        Some(if BARE_TO_THE_RELEASE.contains(&self.name()) {
-            name.to_string()
-        } else {
-            format!("{}_{name}", of.to_ascii_lowercase())
-        })
-    }
-
-    /// The builtin `name` names, to this runtime or to the last release.
-    pub fn named(name: &str) -> Option<Builtin> {
-        Builtin::from_name(name).or_else(|| {
-            Builtin::all()
-                .iter()
-                .copied()
-                .find(|b| b.to_the_release().as_deref() == Some(name))
-        })
-    }
-}
-
 builtins! { $
     Assert = "assert", 2, raises;
     AssertEq = "assert_eq", 2, raises;
