@@ -3,7 +3,7 @@
 //! and its helper table are the runtime's to say, and are handed in.
 
 import hash (hex)
-import types (Type, TyVar)
+import types (Type, TyVar, type_text)
 import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBytes, ConstFixed,
              ConstWide, ConstFloat, ConstDecimal, ConstChar, ConstUnit, Defined, Head, Expect,
              word_head, no_generics, answer_bin, tables_bin, emit_roots_answer, symbol_of, entry_of,
@@ -11,8 +11,8 @@ import emit (Answer, Body, Refused, RootAnswer, Tables, Const, ConstStr, ConstBy
              ctor_layouts, spelled_field, GenericCall, Generics, Need, FnArg, specialised,
              specialised_with, Pass, root_id, type_spelled, laid_vars, has_vars, held_apart,
              ctor_sums, derived_of, Reads, Scalar, Layout, Exact, type_vars, erased)
-import front (Dump, EmitterRoot, EmitterCtor, KeyRow, Linked, ModuleRow, OrdinalRow, analyse,
-              dump_of, module_of_root)
+import front (Dump, EmitterRoot, EmitterCtor, CtorRow, KeyRow, Linked, ModuleRow, OrdinalRow,
+              analyse, dump_of, module_of_root)
 import typing (unknown_type)
 import diagnostics (parse_all)
 import infer (dump_flag)
@@ -1191,27 +1191,69 @@ fn imported(program: Program, modules: List<Bytes>) -> Map<Bytes, Bool> / {abort
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
 /// what its module embeds, which that text's calls are written out as; for a specialisation, the
-/// kinds it is at and the definitions whose lambdas it runs. `None` for a root with no key or no
-/// place, which is asked again every time.
-fn root_material(program: Program, name: Bytes) -> Option<Bytes> / {abort.raise} =
-  match specialisation_of(name) {
-    Some(s) ->
-      s.fns.fold(
-        match definition_material(program, s.base) {
-          Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
-          None -> None,
-        },
-        |acc: Option<Bytes>, f: FnArg|
-          match acc {
+/// kinds it is at and the definitions whose lambdas it runs; for a root written from a type, its
+/// module's text and the program's `types`, which together say how it is written. `None` for a root
+/// with no key or no place, which is asked again every time.
+fn root_material(program: Program, types: Bytes, name: Bytes) -> Option<Bytes> / {abort.raise} =
+  if derived_of(name) != None {
+    let home = module_of_root(name);
+    match program.modules.fold(None, |acc: Option<Int>, m: ModuleRow|
+        if m.name == home { Some(m.index) } else { acc }) {
+      None -> None,
+      Some(i) -> match text_at(program, i) {
+        None -> None,
+        Some(text) -> Some(Bytes::concat_all([name, b"\x00", types, b"\x00", blake3(text)])),
+      },
+    }
+  } else {
+    match specialisation_of(name) {
+      Some(s) ->
+        s.fns.fold(
+          match definition_material(program, s.base) {
+            Some(m) -> Some(Bytes::concat_all([m, b"\x00", name])),
             None -> None,
-            Some(m) -> match definition_material(program, own_definition(f.owner)) {
-              Some(o) -> Some(Bytes::concat_all([m, b"\x00", o])),
-              None -> None,
-            },
           },
-      ),
-    None -> definition_material(program, name),
+          |acc: Option<Bytes>, f: FnArg|
+            match acc {
+              None -> None,
+              Some(m) -> match definition_material(program, own_definition(f.owner)) {
+                Some(o) -> Some(Bytes::concat_all([m, b"\x00", o])),
+                None -> None,
+              },
+            },
+        ),
+      None -> definition_material(program, name),
+    }
   }
+
+/// What a root written from a type reads of the program beyond its module: each constructor, the
+/// type it makes of its arguments' types, and what each type states.
+fn types_material(dump: Dump) -> Bytes / {abort.raise} =
+  blake3(
+    Bytes::concat_all(
+      dump.ctors.map(|c: CtorRow|
+        Bytes::concat_all([
+          c.name,
+          b"\x00",
+          ascii_of_int(c.index),
+          b"\x00",
+          type_text(c.scheme.ty),
+          b"\x01",
+        ])).concat(
+        dump.emitter_ctors.map(|c: EmitterCtor|
+          Bytes::concat_all([
+            c.name,
+            b"\x00",
+            match c.key { Some(k) -> k, None -> b"" },
+            b"\x00",
+            match c.show { Some(s) -> s, None -> b"" },
+            b"\x00",
+            Bytes::concat_all(c.numeric.map(|f: Bytes| f.concat(b","))),
+            b"\x01",
+          ])),
+      ),
+    ),
+  )
 
 fn definition_material(program: Program, name: Bytes) -> Option<Bytes> =
   match program.keys.get(name) {
@@ -1681,9 +1723,10 @@ fn answered_round<| e>(
   write: (Bytes, Bytes) -> Unit / e,
 ) -> Result<Answered, Bytes> / {abort.raise | e} = {
   let asked = names.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let types = types_material(dump);
   let body_key = |m: Bytes| kept_key(common.concat([b"body", m]));
   let materials = names.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes|
-    match root_material(p, n) { Some(m) -> acc.insert(n, m), None -> acc });
+    match root_material(p, types, n) { Some(m) -> acc.insert(n, m), None -> acc });
   let buckets = bucketed(materials.keys());
   let pack_key = |ns: List<Bytes>|
     kept_key(
@@ -1718,7 +1761,7 @@ fn answered_round<| e>(
   } else {
     let answered = answers_of(fresh);
     answered.fold((), |_: Unit, n: Bytes, a: Answer|
-      match root_material(p, n) {
+      match root_material(p, types, n) {
         None -> (),
         Some(m) -> match a {
           Body(_) -> write(body_key(m), bin::encode(kept_of(p.keys, a), kept_bin())),
@@ -2791,13 +2834,36 @@ test "a root's kept answer moves with what its module embeds, and with no other 
       },
       three_modules(),
     );
-  let one = root_material(embedding(b"one"), b"c.h");
+  let one = root_material(embedding(b"one"), b"", b"c.h");
   assert(one != None, None);
-  assert(one != root_material(embedding(b"two"), b"c.h"), None);
+  assert(one != root_material(embedding(b"two"), b"", b"c.h"), None);
   assert_eq(
-    root_material(embedding(b"one"), b"a.f"),
-    root_material(program_of(dump, three_modules()), b"a.f"),
+    root_material(embedding(b"one"), b"", b"a.f"),
+    root_material(program_of(dump, three_modules()), b"", b"a.f"),
   )
+}
+
+test "a root written from a type is kept under its module's text and the program's types" {
+  let dump = three_modules_dump();
+  let p = program_of(dump, three_modules());
+  let types = types_material(dump);
+  let reflected = b"a.reflect#{x:Int}";
+  let kept = root_material(p, types, reflected);
+  assert(kept != None, None);
+  assert(kept == root_material(p, types, reflected), None);
+  // Another constructor anywhere, or another text of its module, moves it; a root of no module's
+  // text has none.
+  assert(kept != root_material(p, types_material({ ..dump, ctors: [] }), reflected), None);
+  assert(
+    kept
+      != root_material(
+        program_of(dump, three_modules().map(|s: Bytes| s.concat(b"\n"))),
+        types,
+        reflected,
+      ),
+    None,
+  );
+  assert_eq(root_material(p, types, b"nowhere.reflect#{x:Int}"), None)
 }
 
 test "the emitter answers roots dealt over calls as it answers them in one" {
