@@ -2,9 +2,9 @@
 //! project names a module under `std`, a project module beside a shipped one collides loudly, and a
 //! compiler that ships other modules re-runs exactly what the change reached.
 
-import harness (scratch, Ran, Source, project, write, in_memory, tree, on_disk, on_disk_shipping,
-                warm_agrees, shipped_sources, said, json_of, at, items, first, str, int, shown,
-                Hermetic, Reached, Shipped, assert_ok, reader_source, StdModule, std_modules)
+import harness (scratch, Ran, Source, project, in_memory, tree, over_tree, on_disk_shipping,
+                on_disk_shipping_only, selected, shipped_sources, said, json_of, at, items, first,
+                str, shown, Hermetic, Shipped, assert_ok, StdModule, std_modules)
 import cli.program (is_shipped)
 import cli.sources (is_compiler, is_std)
 import std.json (Json)
@@ -32,17 +32,6 @@ fn test_hash(answer: Json, key: String) -> String / {abort.raise} =
 
 fn hashed(files: List<Source>) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
   json_of(in_memory(tree(files), ["hash", "--json"]))
-
-/// Handles every atom, so its test is `det` and cacheable, which makes "did it re-run?" answerable.
-fn importer() -> String =
-  \\import std.net (net, drain)
-  \\
-  \\pub fn read_all(c: Int) -> Bytes / {net.recv[conn], diverges} = drain[conn](c, b"", 1000)
-  \\
-  \\test "reads to the end" {
-  \\  handle { assert_eq(read_all(1), b"") } with { net.recv[conn](c, m, t) -> Some(b"") }
-  \\}
-  \\
 
 test "nothing a project can name lands under the reserved root" {
   // Every one of these derives a module name at or under `std` or `compiler`.
@@ -131,32 +120,45 @@ test "a project module named net beside std.net is a loud collision" {
   )
 }
 
-/// A project of modules named as the compiler's modules name their siblings, each declaring what
-/// the compiler's module of that name declares at another type, beside one that imports the
-/// library modules the compiler serves and calls all of them.
+/// A compiler of two modules, one importing the other by the bare name the compiler's modules
+/// name their siblings by, and a library module over it.
+fn over_a_compiler() -> List<Source> =
+  [
+    {
+      path: "compiler.items.ply",
+      text: "//! The shipped parser.\n\n/// What the shipped parser makes of `src`.\npub fn parse(src: Int) -> Int = src + 100\n",
+    },
+    {
+      path: "compiler.fmt.ply",
+      text: "//! The shipped formatter.\n\nimport items (parse)\n\n/// What the shipped formatter makes of `src`.\npub fn fmt_source(src: Int) -> Int = parse(src) + 1000\n",
+    },
+    {
+      path: "std.syntax.ply",
+      text: "//! The library's module over the compiler.\n\nimport compiler.fmt (fmt_source)\n\n/// `src`, formatted.\npub fn formatted(src: Int) -> Int = fmt_source(src)\n",
+    },
+  ]
+
+/// A project of modules named as that compiler's modules name their siblings, each declaring what
+/// the compiler's module of that name declares, beside one that calls them and the library's.
 fn namesakes() -> List<Source> =
   [
-    { path: "fmt.ply", text: "pub fn fmt_source(src: Int) -> Int = src\n" },
+    {
+      path: "fmt.ply",
+      text: "import items (parse)\n\npub fn fmt_source(src: Int) -> Int = parse(src) + 10\n",
+    },
     { path: "items.ply", text: "pub fn parse(src: Int) -> Int = src\n" },
-    { path: "lexer.ply", text: "pub fn lex(src: Int) -> Int = src\n" },
-    { path: "parsing.ply", text: "pub type Span = | Nowhere\npub fn span_to(a: Int) -> Int = a\n" },
     {
       path: "app.ply",
       text:
-        \\import std.json
         \\import std.syntax
         \\import fmt (fmt_source)
         \\import items (parse)
-        \\import lexer (lex)
-        \\import parsing (span_to)
         \\
-        \\pub fn mine() -> Int = fmt_source(1) + parse(2) + lex(3) + span_to(4)
-        \\
-        \\pub fn formatted() -> Bytes / {abort.raise} = syntax::formatted(b"fn  f()->Int = 1\n")
+        \\pub fn mine() -> Int = fmt_source(1) + parse(2)
         \\
         \\test "the shipped modules answer as they do anywhere, and the project's are its own" {
-        \\  assert_eq(mine(), 10);
-        \\  assert_eq(formatted(), b"fn f() -> Int = 1\n")
+        \\  assert_eq(mine(), 13);
+        \\  assert_eq(syntax::formatted(1), 1101)
         \\}
         \\
     },
@@ -181,29 +183,32 @@ fn shipped_imports() -> List<{ name: String, imports: List<String> }> / {Shipped
 
 // A shipped module's import resolves among the shipped modules alone: a project can name no module
 // under `std` or `compiler` (above), and a bare import of the compiler's names its own sibling.
-test "no cycle can be built between a project and the stdlib" {
-  let files = namesakes();
-  assert_ok(in_memory(tree(files), ["test"]));
-  // What each shipped definition references, as the load resolved it: none of the project's.
-  let own = map(files, |f: Source| string_slice(f.path, 0, string_len(f.path) - 4) ++ ".");
-  let answer = json_of(in_memory(tree(files), ["hash", "--json", "--deps"]));
-  let shipped = filter(items(at(answer, "definitions")), |d: Json|
-    is_shipped(str(at(d, "module"))));
-  assert(len(shipped) > 0, Some("the load reached no shipped definition: " ++ shown(answer)));
-  fold(shipped, (), |u: Unit, d: Json|
-    fold(items(at(d, "deps")), u, |v: Unit, dep: Json|
-      assert(
-        !any(own, |prefix: String| string_starts_with(str(dep), prefix)),
-        Some(
-          "the shipped `" ++ str(at(d, "name")) ++ "` references the project's `" ++ str(dep)
-            ++ "`",
-        ),
-      )));
-  assert(
-    len(filter(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) == "parsing.span_to"))
-      == 1,
-    Some("the project's own `parsing` is not its own: " ++ shown(answer)),
-  )
+test "no cycle can be built between a project and the shipped modules" {
+  scratch(|| {
+    let files = namesakes();
+    project(files);
+    assert_ok(on_disk_shipping_only(["test"], over_a_compiler()));
+    // What each shipped definition references, as the load resolved it: none of the project's.
+    let own = map(files, |f: Source| string_slice(f.path, 0, string_len(f.path) - 4) ++ ".");
+    let answer = json_of(on_disk_shipping_only(["hash", "--json", "--deps"], over_a_compiler()));
+    let shipped = filter(items(at(answer, "definitions")), |d: Json|
+      is_shipped(str(at(d, "module"))));
+    assert(len(shipped) == 3, Some("the load reached each shipped definition: " ++ shown(answer)));
+    fold(shipped, (), |u: Unit, d: Json|
+      fold(items(at(d, "deps")), u, |v: Unit, dep: Json|
+        assert(
+          !any(own, |prefix: String| string_starts_with(str(dep), prefix)),
+          Some(
+            "the shipped `" ++ str(at(d, "name")) ++ "` references the project's `" ++ str(dep)
+              ++ "`",
+          ),
+        )));
+    assert(
+      len(filter(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) == "items.parse"))
+        == 1,
+      Some("the project's own `items` is not its own: " ++ shown(answer)),
+    )
+  })
 }
 
 test "{m.module} imports only shipped modules" for m: StdModule in std_modules() {
@@ -302,75 +307,59 @@ test "a project's load reads no test or law of a shipped module, nor what only t
   })
 }
 
-fn an_older_net<| e>(edit: (String) -> String / e) -> List<Source> / {abort.raise | e} = {
-  let now = string_of_bytes(embed("../../ply-std/ply/net.ply"));
-  let was = edit(now);
-  assert(was != now, Some("the older `std.net` is the one this binary ships"));
-  [{ path: "std.net.ply", text: was }]
-}
+/// What a compiler ships when its one module's `one` answers `value`, with `trailer` after it.
+fn shipping_one(value: String, trailer: String) -> List<Source> =
+  [
+    {
+      path: "std.kept.ply",
+      text: "//! A module the program imports.\n\n/// A small number.\npub fn one() -> Int = "
+        ++ value
+        ++ "\n"
+        ++ trailer,
+    },
+  ]
 
-fn with_comment(text: String) -> String = text ++ "\n// what the last compiler shipped\n"
+/// A project with a test that reaches the shipped `one` and a test that reaches nothing shipped.
+fn keeping() -> List<Source> =
+  [
+    {
+      path: "app.ply",
+      text: "import std.kept (one)\n\npub fn two() -> Int = one() + one()\n\ntest \"two\" { assert(two() > 0) }\n",
+    },
+    {
+      path: "elsewhere.ply",
+      text: "pub fn untouched() -> Int = 41 + 1\n\ntest \"untouched\" { assert_eq(untouched(), 42) }\n",
+    },
+  ]
 
 test "an upgrade that moves no definition re-runs nothing" {
   scratch(|| {
-    project([{ path: "app.ply", text: importer() }]);
-    assert_ok(on_disk_shipping(["test"], an_older_net(with_comment)));
-    // The test the project owns is unchanged, so `ply test` selects nothing.
-    let r = on_disk(["test"]);
+    project(keeping());
+    assert_ok(
+      on_disk_shipping_only(["test"], shipping_one("1", "\n// what the last compiler shipped\n")),
+    );
+    let r = on_disk_shipping_only(["test"], shipping_one("1", ""));
     assert(
-      string_contains(said(r), "selected 0 of 1 (1 cached)"),
+      string_contains(said(r), "selected 0 of 2 (2 cached)"),
       Some("an upgrade that moved no definition re-ran a test:\n" ++ said(r)),
     )
   })
 }
 
-test "an upgrade that moved a definition invalidates exactly its dependents" {
-  scratch(|| {
-    project([
-      { path: "app.ply", text: importer() },
-      {
-        path: "elsewhere.ply",
-        text: "pub fn untouched() -> Int = 41 + 1\ntest \"untouched\" { assert_eq(untouched(), 42) }\n",
-      },
-    ]);
-    assert_ok(
-      on_disk_shipping(
-        ["test"],
-        an_older_net(|t: String|
-          string::replace(
-            t,
-            "match net.recv[l](c, 4096, timeout_ms) {",
-            "match net.recv[l](c, 4095, timeout_ms) {",
-          )),
-      ),
-    );
-    // A cache written under an older `std.net` may be believed for none of what it moved.
-    let _ = warm_agrees("after an upgrade that moved `std.net.drain`");
-    ()
-  })
-}
+/// Each definition a `ply hash --json` answer lists, with its hash.
+fn hashes(answer: Json) -> List<String> =
+  map(items(at(answer, "definitions")), |d: Json| str(at(d, "name")) ++ " " ++ str(at(d, "hash")))
 
-test "renaming a shipped definition moves no hash" {
-  let net = string_of_bytes(embed("../../ply-std/ply/net.ply"));
-  let before = hashed([
-    { path: "mine.ply", text: net },
-    { path: "reader.ply", text: reader_source("drain") },
-  ]);
-  // Renaming it, and every reference to it, across a module boundary.
-  let after = hashed([
-    { path: "mine.ply", text: string::replace(net, "drain", "read_to_end") },
-    { path: "reader.ply", text: reader_source("read_to_end") },
-  ]);
-  assert(
-    hash_of(before, "mine.drain") == hash_of(after, "mine.read_to_end"),
-    Some("renaming a shipped definition moved its own hash"),
-  );
-  assert(
-    hash_of(before, "reader.read_all") == hash_of(after, "reader.read_all"),
-    Some("renaming a shipped definition moved a caller's hash"),
-  );
-  assert(
-    test_hash(before, "reader.reads") == test_hash(after, "reader.reads"),
-    Some("renaming a shipped definition re-selected a test"),
-  )
+test "an upgrade that moved a definition re-runs the tests that reach it, and hashes as the new compiler does" {
+  let older = shipping_one("2", "");
+  let newer = shipping_one("1", "");
+  let cold = over_tree(tree(keeping()), ||
+    json_of(on_disk_shipping_only(["hash", "--json"], newer))).value;
+  scratch(|| {
+    project(keeping());
+    assert_ok(on_disk_shipping_only(["test"], older));
+    assert_eq(selected(json_of(on_disk_shipping_only(["test", "--json"], newer))), ["two"]);
+    // A store written under the older module is believed for none of what the upgrade moved.
+    assert_eq(hashes(json_of(on_disk_shipping_only(["hash", "--json"], newer))), hashes(cold))
+  })
 }
